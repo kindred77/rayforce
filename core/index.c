@@ -1956,6 +1956,58 @@ obj_p index_group_i8(obj_p obj, obj_p filter) {
     return index_group_build(INDEX_TYPE_IDS, j, vals, i64(NULL_I64), NULL_OBJ, clone_obj(filter), NULL_OBJ);
 }
 
+obj_p index_group_i16(obj_p obj, obj_p filter) {
+    i64_t i, len, total, g;
+    i64_t *out, *indices, *keys;
+    i16_t *values;
+    obj_p vals, key_obj;
+
+    total = obj->len;
+    values = AS_I16(obj);
+    indices = is_null(filter) ? NULL : AS_I64(filter);
+    len = indices ? filter->len : total;
+
+    key_obj = I64(total);
+    keys = AS_I64(key_obj);
+    for (i = 0; i < total; i++)
+        keys[i] = (i64_t)values[i];
+
+    vals = I64(len);
+    out = AS_I64(vals);
+
+    g = index_group_distribute(keys, indices, out, len, &hash_fnv1a, &hash_cmp_i64);
+
+    drop_obj(key_obj);
+
+    return index_group_build(INDEX_TYPE_IDS, g, vals, i64(NULL_I64), NULL_OBJ, clone_obj(filter), NULL_OBJ);
+}
+
+obj_p index_group_i32(obj_p obj, obj_p filter) {
+    i64_t i, len, total, g;
+    i64_t *out, *indices, *keys;
+    i32_t *values;
+    obj_p vals, key_obj;
+
+    total = obj->len;
+    values = AS_I32(obj);
+    indices = is_null(filter) ? NULL : AS_I64(filter);
+    len = indices ? filter->len : total;
+
+    key_obj = I64(total);
+    keys = AS_I64(key_obj);
+    for (i = 0; i < total; i++)
+        keys[i] = (i64_t)values[i];
+
+    vals = I64(len);
+    out = AS_I64(vals);
+
+    g = index_group_distribute(keys, indices, out, len, &hash_fnv1a, &hash_cmp_i64);
+
+    drop_obj(key_obj);
+
+    return index_group_build(INDEX_TYPE_IDS, g, vals, i64(NULL_I64), NULL_OBJ, clone_obj(filter), NULL_OBJ);
+}
+
 obj_p index_group_i64_unscoped(obj_p obj, obj_p filter) {
     i64_t len;
     i64_t *out, *values, *indices, g;
@@ -2179,6 +2231,12 @@ obj_p index_group(obj_p val, obj_p filter) {
         case TYPE_U8:
         case TYPE_C8:
             return index_group_i8(val, filter);
+        case TYPE_I16:
+            return index_group_i16(val, filter);
+        case TYPE_I32:
+        case TYPE_DATE:
+        case TYPE_TIME:
+            return index_group_i32(val, filter);
         case TYPE_I64:
         case TYPE_SYMBOL:
         case TYPE_TIMESTAMP:
