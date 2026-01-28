@@ -271,7 +271,7 @@ obj_p ray_xasc(obj_p x, obj_p y) {
                 return clone_obj(x);
             }
 
-            i64_t nrow = AS_LIST(AS_LIST(x)[1])[0]->len;
+            i64_t nrow = ops_count(AS_LIST(AS_LIST(x)[1])[0]);
             obj_p idx = I64(nrow);
             i64_t* indices = AS_I64(idx);
             for (i64_t i = 0; i < nrow; i++)
@@ -359,7 +359,7 @@ obj_p ray_xdesc(obj_p x, obj_p y) {
                 return clone_obj(x);
             }
 
-            i64_t nrow = AS_LIST(AS_LIST(x)[1])[0]->len;
+            i64_t nrow = ops_count(AS_LIST(AS_LIST(x)[1])[0]);
             obj_p idx = I64(nrow);
             i64_t* indices = AS_I64(idx);
             for (i64_t i = 0; i < nrow; i++)
