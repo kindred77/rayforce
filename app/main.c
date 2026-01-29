@@ -104,10 +104,15 @@ i32_t main(i32_t argc, str_p argv[]) {
     }
 
     // Create REPL for interactive mode (handles both TTY and piped input)
+    repl_p repl = NULL;
     if (runtime->poll)
-        repl_create(runtime->poll);
+        repl = repl_create(runtime->poll);
 
     code = runtime_run();
+
+    if (repl)
+        repl_destroy(repl);
+
     runtime_destroy();
 
     return code;

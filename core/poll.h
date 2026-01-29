@@ -34,13 +34,8 @@
 #include "chrono.h"
 #include "option.h"
 
-// Forward declarations (defined in app/)
-struct term_t;
-struct repl_t;
-typedef struct term_t *term_p;
-typedef struct repl_t *repl_p;
-
 // Constants
+#define STDIN_WAKER_ID (~0ull)
 #define MAX_EVENTS 1024
 #define BUF_SIZE 2048
 #define TX_QUEUE_SIZE 16
@@ -64,6 +59,7 @@ typedef i64_t (*poll_io_fn)(i64_t, u8_t *, i64_t);                              
 typedef option_t (*poll_rdwr_fn)(struct poll_t *, struct selector_t *);         // High level IO
 typedef option_t (*poll_data_fn)(struct poll_t *, struct selector_t *, raw_p);  // Data callback
 typedef nil_t (*poll_evts_fn)(struct poll_t *, struct selector_t *);            // Event callbacks
+typedef nil_t (*poll_stdin_fn)(struct poll_t *, raw_p data);                    // Stdin event callback
 
 // Buffer structure (32-byte aligned for cache efficiency)
 typedef struct poll_buffer_t {
@@ -137,10 +133,9 @@ typedef struct poll_t {
     i64_t poll_fd;         // IOCP handle
     i64_t ipc_fd;          // IPC socket fd
     i64_t code;            // exit code
-    obj_p replfile;        // REPL file name
     obj_p ipcfile;         // IPC file name
-    struct term_t *term;   // terminal
-    struct repl_t *repl;   // REPL (for cleanup)
+    poll_stdin_fn stdin_fn;   // stdin event callback (set by repl)
+    raw_p stdin_data;         // stdin callback user data
     freelist_p selectors;  // freelist of selectors
     timers_p timers;       // timers heap
 } *poll_p;
@@ -242,6 +237,7 @@ poll_p poll_init(i64_t port);
 i64_t poll_listen(poll_p poll, i64_t port);
 i64_t poll_register(poll_p poll, i64_t fd, u8_t version);
 nil_t poll_deregister(poll_p poll, i64_t id);
+nil_t poll_set_stdin(poll_p poll, poll_stdin_fn fn, raw_p data);
 #define poll_create() poll_init(0)
 #else
 poll_p poll_create();

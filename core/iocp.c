@@ -52,7 +52,6 @@
 #include "chrono.h"
 #include "binary.h"
 #include "ipc.h"
-#include "../app/repl.h"
 
 // Link with Ws2_32.lib
 #pragma comment(lib, "Ws2_32.lib")
@@ -111,7 +110,6 @@ raw_p queue_pop(queue_p queue) {
 HANDLE g_iocp = INVALID_HANDLE_VALUE;
 
 // Definitions and globals
-#define STDIN_WAKER_ID ~0ull
 #define MAX_IOCP_RESULTS 64
 
 typedef struct listener_t {
@@ -121,15 +119,7 @@ typedef struct listener_t {
     SOCKET hAccepted;
 } *listener_p;
 
-typedef struct stdin_thread_ctx_t {
-    HANDLE h_cp;
-    term_p term;
-    volatile LONG stop;
-} *stdin_thread_ctx_p;
-
 listener_p __LISTENER = NULL;
-stdin_thread_ctx_p __STDIN_THREAD_CTX = NULL;
-HANDLE __STDIN_THREAD_HANDLE = NULL;
 
 #define _RECV_OP(poll, selector)                                                                               \
     {                                                                                                          \
@@ -160,34 +150,6 @@ HANDLE __STDIN_THREAD_HANDLE = NULL;
             return POLL_ERROR;                                                                                \
         }                                                                                                     \
     }
-
-DWORD WINAPI StdinThread(LPVOID prm) {
-    stdin_thread_ctx_p ctx = (stdin_thread_ctx_p)prm;
-    term_p term = ctx->term;
-    HANDLE h_cp = ctx->h_cp;
-    DWORD bytes;
-
-    for (;;) {
-        // Check if we should stop before blocking on stdin
-        if (InterlockedCompareExchange(&ctx->stop, 0, 0) != 0)
-            break;
-
-        bytes = (DWORD)term_getc(term);
-
-        // Check if we should stop after returning from blocking call
-        if (InterlockedCompareExchange(&ctx->stop, 0, 0) != 0)
-            break;
-
-        if (bytes == 0)
-            break;
-
-        PostQueuedCompletionStatus(h_cp, bytes, STDIN_WAKER_ID, NULL);
-    }
-
-    PostQueuedCompletionStatus(h_cp, 0, STDIN_WAKER_ID, NULL);
-
-    return 0;
-}
 
 nil_t exit_werror() {
     obj_p fmt, err;
@@ -289,10 +251,9 @@ poll_p poll_init(i64_t port) {
     poll->code = NULL_I64;
     poll->poll_fd = (i64_t)g_iocp;
     poll->ipc_fd = -1;
-    poll->replfile = string_from_str("repl", 4);
     poll->ipcfile = string_from_str("ipc", 3);
-    poll->term = term_create();
-    poll->repl = NULL;  // Will be set by repl_create
+    poll->stdin_fn = NULL;
+    poll->stdin_data = NULL;
     poll->selectors = freelist_create(128);
     poll->timers = timers_create(16);
 
@@ -315,16 +276,12 @@ poll_p poll_init(i64_t port) {
         }
     }
 
-    // Create stdin thread for REPL input
-    __STDIN_THREAD_CTX = (stdin_thread_ctx_p)heap_alloc(sizeof(struct stdin_thread_ctx_t));
-    __STDIN_THREAD_CTX->h_cp = (HANDLE)poll->poll_fd;
-    __STDIN_THREAD_CTX->term = poll->term;
-    __STDIN_THREAD_CTX->stop = 0;
-
-    // Create a thread to read from stdin
-    __STDIN_THREAD_HANDLE = CreateThread(NULL, 0, StdinThread, (LPVOID)__STDIN_THREAD_CTX, 0, NULL);
-
     return poll;
+}
+
+nil_t poll_set_stdin(poll_p poll, poll_stdin_fn fn, raw_p data) {
+    poll->stdin_fn = fn;
+    poll->stdin_data = data;
 }
 
 /**
@@ -414,30 +371,6 @@ nil_t poll_destroy(poll_p poll) {
     if (poll == NULL)
         return;
 
-    // Signal stdin thread to stop and wait for it to terminate
-    if (__STDIN_THREAD_HANDLE != NULL && __STDIN_THREAD_CTX != NULL) {
-        DWORD wait_result;
-
-        // Set stop flag
-        InterlockedExchange(&__STDIN_THREAD_CTX->stop, 1);
-
-        // Cancel any pending synchronous I/O on the stdin thread
-        CancelSynchronousIo(__STDIN_THREAD_HANDLE);
-
-        // Wait for the thread to terminate (with timeout)
-        wait_result = WaitForSingleObject(__STDIN_THREAD_HANDLE, 100);
-
-        // If thread didn't exit, forcefully terminate it
-        // (This is necessary because ReadFile on console handles can't be cancelled)
-        if (wait_result == WAIT_TIMEOUT) {
-            TerminateThread(__STDIN_THREAD_HANDLE, 0);
-        }
-
-        // Close thread handle
-        CloseHandle(__STDIN_THREAD_HANDLE);
-        __STDIN_THREAD_HANDLE = NULL;
-    }
-
     if (poll->ipc_fd != -1)
         closesocket((SOCKET)poll->ipc_fd);
 
@@ -448,14 +381,7 @@ nil_t poll_destroy(poll_p poll) {
             poll_deregister(poll, i + SELECTOR_ID_OFFSET);
     }
 
-    drop_obj(poll->replfile);
     drop_obj(poll->ipcfile);
-
-    // Destroy REPL before term (repl uses poll->term on Windows)
-    if (poll->repl)
-        repl_destroy(poll->repl);
-
-    term_destroy(poll->term);
 
     freelist_free(poll->selectors);
     timers_destroy(poll->timers);
@@ -470,8 +396,6 @@ nil_t poll_destroy(poll_p poll) {
 
     heap_free(__LISTENER);
     __LISTENER = NULL;
-    heap_free(__STDIN_THREAD_CTX);
-    __STDIN_THREAD_CTX = NULL;
 }
 
 nil_t poll_deregister(poll_p poll, i64_t id) {
@@ -821,9 +745,9 @@ i64_t poll_run(poll_p poll) {
     HANDLE hPollFd = (HANDLE)poll->poll_fd;
     SOCKET hAccepted;
     OVERLAPPED_ENTRY events[MAX_EVENTS];
-    b8_t success, error;
+    b8_t success;
     i64_t key, poll_result, idx;
-    obj_p str, fmt, res;
+    obj_p fmt, res;
     selector_p selector;
 
     LOG_DEBUG("Entering poll loop, ipc_fd=%lld", poll->ipc_fd);
@@ -852,6 +776,17 @@ i64_t poll_run(poll_p poll) {
                 size = events[i].dwNumberOfBytesTransferred;
                 overlapped = events[i].lpOverlapped;
 
+                // Handle stdin events (STDIN_WAKER_ID is ~0ull, not a valid pointer)
+                if (key == (i64_t)STDIN_WAKER_ID) {
+                    if (size == 0) {
+                        poll->code = 0;
+                        break;
+                    }
+                    if (poll->stdin_fn)
+                        poll->stdin_fn(poll, poll->stdin_data);
+                    continue;
+                }
+
                 // Check if this is a waker event (by checking magic number)
                 {
                     poll_waker_p waker = (poll_waker_p)key;
@@ -863,100 +798,72 @@ i64_t poll_run(poll_p poll) {
                     }
                 }
 
-                switch (key) {
-                    case STDIN_WAKER_ID:
-                        if (size == 0) {
-                            poll->code = 0;
-                            break;
+                LOG_TRACE("IOCP event: key=%lld ipc_fd=%lld size=%lu",
+                        key, poll->ipc_fd, (unsigned long)size);
+
+                // Accept new connection
+                if (key == poll->ipc_fd) {
+                    LOG_DEBUG("Accept event! hAccepted=%lld", (i64_t)__LISTENER->hAccepted);
+                    hAccepted = __LISTENER->hAccepted;
+
+                    if (hAccepted != INVALID_SOCKET) {
+                        idx = poll_register(poll, hAccepted, 0);
+                        LOG_DEBUG("Registered, idx=%lld", idx);
+                        selector = (selector_p)freelist_get(poll->selectors, idx - SELECTOR_ID_OFFSET);
+                        poll_result = _recv_initiate(poll, selector);
+                        LOG_DEBUG("_recv_initiate returned %lld", poll_result);
+
+                        if (poll_result == POLL_ERROR)
+                            poll_deregister(poll, selector->id);
+                    }
+
+                    poll_accept(poll);
+                } else {
+                    selector = (selector_p)key;
+
+                    // Connection closed
+                    if (size == 0) {
+                        poll_deregister(poll, selector->id);
+                        continue;
+                    }
+
+                    // recv
+                    if (overlapped == &(selector->rx.overlapped)) {
+                        if (selector->rx.ignore) {
+                            selector->rx.ignore = B8_FALSE;
+                            selector->rx.size = 0;
+                        } else
+                            selector->rx.size = size;
+                    recv:
+                        poll_result = _recv(poll, selector);
+
+                        if (poll_result == POLL_ERROR) {
+                            poll_deregister(poll, selector->id);
+                            continue;
                         }
 
-                        str = term_read(poll->term);
-                        if (str != NULL) {
-                            if (IS_ERR(str))
-                                io_write(STDOUT_FILENO, MSG_TYPE_RESP, str);
-                            else if (str != NULL_OBJ) {
-                                res = ray_eval_str(str, poll->replfile);
-                                drop_obj(str);
-                                io_write(STDOUT_FILENO, MSG_TYPE_RESP, res);
-                                error = IS_ERR(res);
-                                drop_obj(res);
-                                if (!error)
-                                    timeit_print();
-                            }
-
-                            term_prompt(poll->term);
+                        if (poll_result == POLL_DONE) {
+                            process_request(poll, selector);
+                            // setup next recv
+                            goto recv;
                         }
+                    }
 
-                        break;
+                    // send
+                    if (overlapped == &(selector->tx.overlapped)) {
+                        if (selector->tx.ignore) {
+                            selector->tx.ignore = B8_FALSE;
+                            selector->tx.size = 0;
+                        } else
+                            selector->tx.size = size;
 
-                    default:
-                        LOG_TRACE("IOCP event: key=%lld ipc_fd=%lld size=%lu", 
-                                key, poll->ipc_fd, (unsigned long)size);
-                        // Accept new connection
-                        if (key == poll->ipc_fd) {
-                            LOG_DEBUG("Accept event! hAccepted=%lld", (i64_t)__LISTENER->hAccepted);
-                            hAccepted = __LISTENER->hAccepted;
+                        // setup next send
+                        poll_result = _send(poll, selector);
 
-                            if (hAccepted != INVALID_SOCKET) {
-                                idx = poll_register(poll, hAccepted, 0);
-                                LOG_DEBUG("Registered, idx=%lld", idx);
-                                selector = (selector_p)freelist_get(poll->selectors, idx - SELECTOR_ID_OFFSET);
-                                poll_result = _recv_initiate(poll, selector);
-                                LOG_DEBUG("_recv_initiate returned %lld", poll_result);
-
-                                if (poll_result == POLL_ERROR)
-                                    poll_deregister(poll, selector->id);
-                            }
-
-                            poll_accept(poll);
-                        } else {
-                            selector = (selector_p)key;
-
-                            // Connection closed
-                            if (size == 0) {
-                                poll_deregister(poll, selector->id);
-                                break;
-                            }
-
-                            // recv
-                            if (overlapped == &(selector->rx.overlapped)) {
-                                if (selector->rx.ignore) {
-                                    selector->rx.ignore = B8_FALSE;
-                                    selector->rx.size = 0;
-                                } else
-                                    selector->rx.size = size;
-                            recv:
-                                poll_result = _recv(poll, selector);
-
-                                if (poll_result == POLL_ERROR) {
-                                    poll_deregister(poll, selector->id);
-                                    break;
-                                }
-
-                                if (poll_result == POLL_DONE) {
-                                    process_request(poll, selector);
-                                    // setup next recv
-                                    goto recv;
-                                }
-                            }
-
-                            // send
-                            if (overlapped == &(selector->tx.overlapped)) {
-                                if (selector->tx.ignore) {
-                                    selector->tx.ignore = B8_FALSE;
-                                    selector->tx.size = 0;
-                                } else
-                                    selector->tx.size = size;
-
-                                // setup next send
-                                poll_result = _send(poll, selector);
-
-                                if (poll_result == POLL_ERROR)
-                                    poll_deregister(poll, selector->id);
-                            }
-                        }
-
-                }  // switch
+                        if (poll_result == POLL_ERROR)
+                            poll_deregister(poll, selector->id);
+                    }
+                }
             }  // for
         } else {
             res = err_os();

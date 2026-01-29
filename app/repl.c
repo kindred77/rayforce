@@ -24,6 +24,8 @@
 #include <stdio.h>
 #if defined(OS_WINDOWS)
 #include <io.h>
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #define read _read
 #ifndef STDIN_FILENO
 #define STDIN_FILENO 0
@@ -46,6 +48,88 @@
 #include "../core/str.h"
 #include "../core/log.h"
 #include "../core/error.h"
+
+#if defined(OS_WINDOWS)
+// Stdin thread context and globals (owned by repl on Windows)
+typedef struct stdin_thread_ctx_t {
+    HANDLE h_cp;
+    term_p term;
+    volatile LONG stop;
+} *stdin_thread_ctx_p;
+
+static stdin_thread_ctx_p __STDIN_THREAD_CTX = NULL;
+static HANDLE __STDIN_THREAD_HANDLE = NULL;
+
+static DWORD WINAPI StdinThread(LPVOID prm) {
+    stdin_thread_ctx_p ctx = (stdin_thread_ctx_p)prm;
+    term_p term = ctx->term;
+    HANDLE h_cp = ctx->h_cp;
+    DWORD bytes;
+
+    for (;;) {
+        if (InterlockedCompareExchange(&ctx->stop, 0, 0) != 0)
+            break;
+
+        bytes = (DWORD)term_getc(term);
+
+        if (InterlockedCompareExchange(&ctx->stop, 0, 0) != 0)
+            break;
+
+        if (bytes == 0)
+            break;
+
+        PostQueuedCompletionStatus(h_cp, bytes, STDIN_WAKER_ID, NULL);
+    }
+
+    PostQueuedCompletionStatus(h_cp, 0, STDIN_WAKER_ID, NULL);
+    return 0;
+}
+
+static nil_t repl_stdin_handler(poll_p poll, raw_p data) {
+    repl_p repl = (repl_p)data;
+    b8_t error;
+    obj_p str, res;
+
+    str = term_read(repl->term);
+    if (str != NULL) {
+        if (IS_ERR(str))
+            io_write(STDERR_FILENO, 2, str);
+        else if (str != NULL_OBJ) {
+            i64_t line = repl->term ? term_last_input_line(repl->term) : 0;
+            res = ray_eval_str_line(str, repl->name, line);
+            drop_obj(str);
+            error = IS_ERR(res);
+            if (error)
+                io_write(STDERR_FILENO, 2, res);
+            else
+                io_write(STDOUT_FILENO, 2, res);
+            drop_obj(res);
+            if (!error)
+                timeit_print();
+        }
+
+        if (repl->term->multiline_len == 0 && poll->code == NULL_I64)
+            term_prompt(repl->term);
+    }
+}
+
+static nil_t repl_stop_stdin_thread(nil_t) {
+    if (__STDIN_THREAD_HANDLE != NULL && __STDIN_THREAD_CTX != NULL) {
+        DWORD wait_result;
+        InterlockedExchange(&__STDIN_THREAD_CTX->stop, 1);
+        CancelSynchronousIo(__STDIN_THREAD_HANDLE);
+        wait_result = WaitForSingleObject(__STDIN_THREAD_HANDLE, 100);
+        if (wait_result == WAIT_TIMEOUT)
+            TerminateThread(__STDIN_THREAD_HANDLE, 0);
+        CloseHandle(__STDIN_THREAD_HANDLE);
+        __STDIN_THREAD_HANDLE = NULL;
+    }
+    if (__STDIN_THREAD_CTX) {
+        heap_free(__STDIN_THREAD_CTX);
+        __STDIN_THREAD_CTX = NULL;
+    }
+}
+#endif
 
 option_t repl_on_data(poll_p poll, selector_p selector, raw_p data) {
     UNUSED(poll);
@@ -114,12 +198,21 @@ repl_p repl_create(poll_p poll) {
     repl->name = string_from_str("repl", 4);
 
 #if defined(OS_WINDOWS)
-    // On Windows, STDIN is handled by iocp.c's StdinThread
-    // The poll_init() function sets up STDIN handling internally
-    // Use poll->term instead of creating a separate one
-    repl->term = poll->term;
-    repl->id = 0;       // Placeholder ID for Windows
-    poll->repl = repl;  // Store repl pointer for cleanup
+    // On Windows, repl owns the terminal and stdin thread
+    repl->term = term_create();
+    repl->id = 0;
+
+    if (repl->term != NULL) {
+        // Register stdin callback with poll
+        poll_set_stdin(poll, repl_stdin_handler, repl);
+
+        // Create stdin thread to post IOCP events on keypress
+        __STDIN_THREAD_CTX = (stdin_thread_ctx_p)heap_alloc(sizeof(struct stdin_thread_ctx_t));
+        __STDIN_THREAD_CTX->h_cp = (HANDLE)poll->poll_fd;
+        __STDIN_THREAD_CTX->term = repl->term;
+        __STDIN_THREAD_CTX->stop = 0;
+        __STDIN_THREAD_HANDLE = CreateThread(NULL, 0, StdinThread, (LPVOID)__STDIN_THREAD_CTX, 0, NULL);
+    }
 #else
     // Only register stdin if it's a TTY (epoll doesn't work on regular files/pipes)
     if (isatty(STDIN_FILENO)) {
@@ -181,12 +274,12 @@ repl_p repl_create(poll_p poll) {
 }
 
 nil_t repl_destroy(repl_p repl) {
+#if defined(OS_WINDOWS)
+    repl_stop_stdin_thread();
+#endif
     drop_obj(repl->name);
-#if !defined(OS_WINDOWS)
-    // On Windows, term is shared with poll->term, so don't destroy here
     if (repl->term)
         term_destroy(repl->term);
-#endif
     heap_free(repl);
 }
 
