@@ -753,15 +753,18 @@ i64_t poll_run(poll_p poll) {
     LOG_DEBUG("Entering poll loop, ipc_fd=%lld", poll->ipc_fd);
 
     while (poll->code == NULL_I64) {
-        success = GetQueuedCompletionStatusEx(hPollFd, events, MAX_IOCP_RESULTS, &num, INFINITE,
+        i64_t timeout = timer_next_timeout(poll->timers);
+        DWORD timeout_ms = (timeout == TIMEOUT_INFINITY) ? INFINITE : (DWORD)timeout;
+
+        success = GetQueuedCompletionStatusEx(hPollFd, events, MAX_IOCP_RESULTS, &num, timeout_ms,
                                               B8_TRUE  // set this to B8_TRUE if you want to return on alertable wait
         );
         
         if (!success) {
             DWORD err = GetLastError();
             LOG_DEBUG("GetQueuedCompletionStatusEx failed: %lu", err);
-            if (err == WAIT_IO_COMPLETION) {
-                continue;  // alertable wait interrupted, just continue
+            if (err == WAIT_IO_COMPLETION || err == WAIT_TIMEOUT) {
+                continue;  // alertable wait or timer timeout, process timers at top
             }
         }
         
