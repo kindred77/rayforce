@@ -24,7 +24,7 @@
 #include "os.h"
 #include "error.h"
 #include "log.h"
-#include "string.h"
+#include "str.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

@@ -27,7 +27,7 @@
 #include "binary.h"
 #include "vary.h"
 #include "heap.h"
-#include "string.h"
+#include "str.h"
 #include "format.h"
 #include "util.h"
 #include "runtime.h"

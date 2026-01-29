@@ -23,7 +23,7 @@
 
 #include "serde.h"
 #include "symbols.h"
-#include "string.h"
+#include "str.h"
 #include "lambda.h"
 #include "env.h"
 #include "error.h"

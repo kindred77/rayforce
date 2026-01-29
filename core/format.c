@@ -23,7 +23,7 @@
 
 #include <stdio.h>
 #include <math.h>
-#include "string.h"
+#include "str.h"
 #include "format.h"
 #include "rayforce.h"
 #include "heap.h"

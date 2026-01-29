@@ -36,7 +36,7 @@
 #include <unistd.h>
 #endif
 #include "sock.h"
-#include "string.h"
+#include "str.h"
 #include "log.h"
 #include "ops.h"
 

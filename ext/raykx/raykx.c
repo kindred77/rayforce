@@ -32,7 +32,7 @@
 #include "../../core/sock.h"
 #include "../../core/error.h"
 #include "../../core/log.h"
-#include "../../core/string.h"
+#include "../../core/str.h"
 #include "../../core/runtime.h"
 #include "raykx.h"
 #include "serde.h"

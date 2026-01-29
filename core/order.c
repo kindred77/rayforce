@@ -26,7 +26,7 @@
 #include "sort.h"
 #include "error.h"
 #include "compose.h"
-#include "string.h"
+#include "str.h"
 #include "pool.h"
 
 obj_p ray_iasc(obj_p x) {

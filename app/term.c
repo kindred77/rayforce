@@ -41,7 +41,7 @@
 #include "term.h"
 #include "../core/chrono.h"
 #include "../core/heap.h"
-#include "../core/string.h"
+#include "../core/str.h"
 #include "../core/error.h"
 #include "../core/ops.h"
 #include "../core/runtime.h"

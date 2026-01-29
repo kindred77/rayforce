@@ -31,7 +31,7 @@
 #include "serde.h"
 #include "compose.h"
 #include "error.h"
-#include "string.h"
+#include "str.h"
 #include "fdmap.h"
 #include "iter.h"
 

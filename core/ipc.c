@@ -25,7 +25,7 @@
 #include "eval.h"
 #include "symbols.h"
 #include "poll.h"
-#include "string.h"
+#include "str.h"
 #include "util.h"
 #include "log.h"
 #include "heap.h"

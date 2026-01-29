@@ -33,7 +33,7 @@
 #include "ops.h"
 #include "runtime.h"
 #include "serde.h"
-#include "string.h"
+#include "str.h"
 #include "unary.h"
 #include "util.h"
 #include "fdmap.h"

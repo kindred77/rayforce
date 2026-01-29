@@ -22,7 +22,7 @@
  */
 
 #include "sort.h"
-#include "string.h"
+#include "str.h"
 #include "ops.h"
 #include "error.h"
 #include "symbols.h"

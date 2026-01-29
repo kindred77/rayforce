@@ -38,7 +38,7 @@
 
 #include "rayforce.h"
 #include "poll.h"
-#include "string.h"
+#include "str.h"
 #include "hash.h"
 #include "format.h"
 #include "util.h"

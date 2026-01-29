@@ -41,7 +41,7 @@
 #include "query.h"
 #include "time.h"
 #include "runtime.h"
-#include "string.h"
+#include "str.h"
 #include "chrono.h"
 #include "date.h"
 #include "timestamp.h"

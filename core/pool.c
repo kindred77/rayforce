@@ -29,7 +29,7 @@
 #include "util.h"
 #include "heap.h"
 #include "eval.h"
-#include "string.h"
+#include "str.h"
 #include "log.h"
 
 #define DEFAULT_MPMC_SIZE 2048

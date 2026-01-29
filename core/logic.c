@@ -24,7 +24,7 @@
 #include "logic.h"
 #include "ops.h"
 #include "error.h"
-#include "string.h"
+#include "str.h"
 #include "eval.h"
 #include "runtime.h"
 

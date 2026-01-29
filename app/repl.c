@@ -43,7 +43,7 @@
 #include "../core/eval.h"
 #include "../core/heap.h"
 #include "../core/poll.h"
-#include "../core/string.h"
+#include "../core/str.h"
 #include "../core/log.h"
 #include "../core/error.h"
 

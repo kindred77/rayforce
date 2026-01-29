@@ -23,7 +23,7 @@
 
 #include <stdio.h>
 #include "error.h"
-#include "string.h"
+#include "str.h"
 #include "dynlib.h"
 #include "heap.h"
 #include "runtime.h"

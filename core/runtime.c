@@ -24,7 +24,7 @@
 #include "runtime.h"
 #include "util.h"
 #include "io.h"
-#include "string.h"
+#include "str.h"
 #include "ipc.h"
 #include "dynlib.h"
 #include "heap.h"

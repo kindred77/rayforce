@@ -32,7 +32,7 @@
 #include "error.h"
 #include "aggr.h"
 #include "index.h"
-#include "string.h"
+#include "str.h"
 #include "pool.h"
 #include "cmp.h"
 #include "iter.h"

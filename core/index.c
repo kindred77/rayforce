@@ -29,7 +29,7 @@
 #include "error.h"
 #include "items.h"
 #include "unary.h"
-#include "string.h"
+#include "str.h"
 #include "pool.h"
 #include "def.h"
 

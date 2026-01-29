@@ -26,7 +26,7 @@
 #include "timestamp.h"
 #include "util.h"
 #include "error.h"
-#include "string.h"
+#include "str.h"
 #include "parse.h"
 #include "temporal.h"
 

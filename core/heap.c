@@ -29,7 +29,7 @@
 #include "mmap.h"
 #include "fs.h"
 #include "util.h"
-#include "string.h"
+#include "str.h"
 #include "os.h"
 #include "log.h"
 #include "eval.h"

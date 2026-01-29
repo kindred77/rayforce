@@ -25,7 +25,7 @@
 #include "../core/runtime.h"
 #include "../core/format.h"
 #include "../core/sys.h"
-#include "../core/string.h"
+#include "../core/str.h"
 #include "../core/io.h"
 #include "../core/chrono.h"
 #include "repl.h"

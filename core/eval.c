@@ -29,7 +29,7 @@
 #include "lambda.h"
 #include "error.h"
 #include "filter.h"
-#include "string.h"
+#include "str.h"
 #include "aggr.h"
 #include "cc.h"
 #include "env.h"

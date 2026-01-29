@@ -30,7 +30,7 @@
 #include "util.h"
 #include "items.h"
 #include "unary.h"
-#include "string.h"
+#include "str.h"
 #include "runtime.h"
 #include "index.h"
 #include "pool.h"
