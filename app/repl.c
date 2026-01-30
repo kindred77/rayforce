@@ -224,7 +224,8 @@ repl_p repl_create(poll_p poll) {
         registry.events = POLL_EVENT_READ | POLL_EVENT_ERROR | POLL_EVENT_HUP;
         registry.recv_fn = NULL;
         registry.read_fn = repl_read;
-        registry.close_fn = repl_on_close;
+        // epoll poll_destroy already calls close_fn on shutdown; main owns repl lifetime
+        registry.close_fn = NULL;
         registry.error_fn = repl_on_error;
         registry.data_fn = repl_on_data;
         registry.data = repl;
