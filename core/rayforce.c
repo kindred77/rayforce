@@ -2966,6 +2966,8 @@ obj_p copy_obj(obj_p obj) {
     obj_p res;
 
     switch (obj->type) {
+        case TYPE_NULL:
+            return NULL_OBJ;
         case -TYPE_B8:
             return b8(obj->b8);
         case -TYPE_C8:

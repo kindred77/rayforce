@@ -838,8 +838,9 @@ static inline obj_p eval_sym(obj_p sym) {
 
 // Evaluate list (function call)
 static obj_p eval_list(obj_p obj) {
-    obj_p car, *val, *args;
+    obj_p car, *val, *args, res;
     i64_t len, id;
+    b8_t drop_car = B8_FALSE;
 
     if (obj->len == 0)
         return NULL_OBJ;
@@ -850,32 +851,57 @@ static obj_p eval_list(obj_p obj) {
     args++;
     id = (i64_t)obj;
 
+    if (car->type == TYPE_LIST) {
+        car = eval(car);
+        if (IS_ERR(car))
+            return car;
+        drop_car = B8_TRUE;
+    }
+
 dispatch:
     switch (car->type) {
         case TYPE_UNARY:
             if (len != 1)
                 return unwrap(err_arity(1, len, 0), id);
-            return eval_unary(car, args, id);
+            res = eval_unary(car, args, id);
+            if (drop_car)
+                drop_obj(car);
+            return res;
 
         case TYPE_BINARY:
             if (len != 2)
                 return unwrap(err_arity(2, len, 0), id);
-            return eval_binary(car, args, id);
+            res = eval_binary(car, args, id);
+            if (drop_car)
+                drop_obj(car);
+            return res;
 
         case TYPE_VARY:
-            return eval_vary(car, args, len, id);
+            res = eval_vary(car, args, len, id);
+            if (drop_car)
+                drop_obj(car);
+            return res;
 
         case TYPE_LAMBDA:
-            return eval_lambda(car, args, len, id);
+            res = eval_lambda(car, args, len, id);
+            if (drop_car)
+                drop_obj(car);
+            return res;
 
         case -TYPE_SYMBOL:
             val = resolve(car->i64);
+            if (drop_car) {
+                drop_obj(car);
+                drop_car = B8_FALSE;
+            }
             if (val == NULL)
                 return unwrap(err_value(car->i64), id);
             car = *val;
             goto dispatch;
 
         default:
+            if (drop_car)
+                drop_obj(car);
             return unwrap(err_type(TYPE_LAMBDA, car->type, 0, 0), id);  // not callable
     }
 }

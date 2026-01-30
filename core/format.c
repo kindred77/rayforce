@@ -1362,9 +1362,10 @@ i64_t internal_fmt_into(obj_p* dst, i64_t limit, obj_p obj) {
 i64_t lambda_fmt_into(obj_p* dst, i64_t limit, obj_p obj) {
     i64_t n;
 
-    if (AS_LAMBDA(obj)->name)
-        n = str_fmt_into(dst, limit, "@%s", str_from_symbol((AS_LAMBDA(obj)->name)->i64));
-    else {
+    obj_p name = AS_LAMBDA(obj)->name;
+    if (name != NULL_OBJ && name->type == -TYPE_SYMBOL) {
+        n = str_fmt_into(dst, limit, "@%s", str_from_symbol(name->i64));
+    } else {
         n = str_fmt_into(dst, 4, "(fn ");
         n += obj_fmt_into(dst, 0, limit, B8_FALSE, AS_LAMBDA(obj)->args);
         n += str_fmt_into(dst, 2, " ");
