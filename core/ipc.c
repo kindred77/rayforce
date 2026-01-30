@@ -23,6 +23,7 @@
 
 #include "ipc.h"
 #include "eval.h"
+#include "vary.h"
 #include "symbols.h"
 #include "poll.h"
 #include "str.h"
@@ -383,6 +384,23 @@ obj_p ipc_process_msg(poll_p poll, selector_p selector, obj_p msg) {
     else if (msg->type == TYPE_C8) {
         LOG_TRACE("Evaluating string message: %.*s", (i32_t)msg->len, AS_C8(msg));
         res = ray_eval_str(msg, ctx->name);
+        drop_obj(msg);
+    } else if (msg->type == TYPE_LIST && msg->len > 0) {
+        // IPC apply semantics (like kdb+): resolve car, apply to rest as values
+        obj_p *elems = AS_LIST(msg);
+        i64_t n = msg->len;
+        obj_p args[n];
+        args[0] = eval(elems[0]);
+        if (IS_ERR(args[0])) {
+            drop_obj(msg);
+            return args[0];
+        }
+        for (i64_t i = 1; i < n; i++)
+            args[i] = clone_obj(elems[i]);
+        res = ray_apply(args, n);
+        drop_obj(args[0]);
+        for (i64_t i = 1; i < n; i++)
+            drop_obj(args[i]);
         drop_obj(msg);
     } else {
         LOG_TRACE("Evaluating object message");
