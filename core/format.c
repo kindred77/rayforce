@@ -39,6 +39,7 @@
 #include "env.h"
 #include "eval.h"
 #include "error.h"
+#include "runtime.h"
 #include "chrono.h"
 
 #define FORMAT_TRAILER_SIZE 4
@@ -470,9 +471,23 @@ i64_t error_frame_fmt_into(obj_p* dst, obj_p obj, str_p msg, i32_t msg_len, b8_t
     u32_t line_len, fname_len, remaining_len;
     u16_t line_number = 0, gutter_width;
     lit_p filename, source, function, start, end;
-    obj_p* frame = AS_LIST(obj);
+    obj_p* frame;
     span_t span = (span_t){0};
     b8_t done = 0;
+
+    if (obj == NULL_OBJ || obj->type != TYPE_LIST || obj->len < 4)
+        return 0;
+
+    frame = AS_LIST(obj);
+
+    if (frame[0] == NULL_OBJ || frame[0]->type != -TYPE_I64)
+        return 0;
+    if (frame[1] != NULL_OBJ && frame[1]->type != TYPE_C8)
+        return 0;
+    if (frame[2] != NULL_OBJ && frame[2]->type != -TYPE_SYMBOL)
+        return 0;
+    if (frame[3] == NULL_OBJ || frame[3]->type != TYPE_C8)
+        return 0;
 
     // Extract frame data
     span.id = frame[0]->i64;
@@ -686,7 +701,8 @@ static i64_t error_ctx_fmt_into_new(obj_p* dst, obj_p err) {
             break;
 
         case EC_VALUE:
-            if (e->value.sym) {
+            if (e->value.sym && e->value.sym != NULL_I64 &&
+                e->value.sym >= 0 && e->value.sym < symbols_count(runtime_get()->symbols)) {
                 name = str_from_symbol(e->value.sym);
                 if (name && name[0])
                     n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s '%s%s%s' not found\n", GRAY, RESET, GREEN, name,
@@ -750,6 +766,14 @@ i64_t error_fmt_into(obj_p* dst, i64_t limit, obj_p obj) {
 
     // Format with locations if available
     if (locs != NULL_OBJ) {
+        if (locs->type != TYPE_LIST) {
+            if (vm) {
+                drop_obj(vm->trace);
+                vm->trace = NULL_OBJ;
+            }
+            return n;
+        }
+
         n += str_fmt_into(dst, MAX_ERROR_LEN, "\n");
 
         l = locs->len;

@@ -272,9 +272,10 @@ obj_p ray_internal_command(obj_p cmd) {
     remaining_len = cmd_len;
     argc = 0;
 
-    // Make a copy of the command string
-    strncpy(cmd_buf, current, sizeof(cmd_buf) - 1);
-    cmd_buf[sizeof(cmd_buf) - 1] = '\0';
+    // Make a copy of the command string (not null-terminated, use cmd_len)
+    i32_t copy_len = cmd_len < (i32_t)(sizeof(cmd_buf) - 1) ? cmd_len : (i32_t)(sizeof(cmd_buf) - 1);
+    memcpy(cmd_buf, current, copy_len);
+    cmd_buf[copy_len] = '\0';
 
     cmd_str = cmd_buf;
     current = cmd_buf;  // Use the copy for parsing

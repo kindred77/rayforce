@@ -1762,6 +1762,8 @@ obj_p set_dict_obj(obj_p* obj, obj_p idx, obj_p val) {
             }
             // Key found, update it
             else {
+                // COW the values list if shared (e.g. by (value dict))
+                AS_LIST(*obj)[1] = cow_obj(AS_LIST(*obj)[1]);
                 res = set_idx(&AS_LIST(*obj)[1], i, val);
                 if (IS_ERR(res))
                     return res;
@@ -2858,7 +2860,8 @@ obj_p __attribute__((hot)) clone_obj(obj_p obj) {
 }
 
 nil_t __attribute__((hot)) drop_obj(obj_p obj) {
-    DEBUG_ASSERT(is_valid(obj), "invalid object type: %d", obj->type);
+    if (UNLIKELY((u64_t)obj < 0x1000000 || ((u64_t)obj & 7)))
+        return;
 
     u32_t rc;
     i64_t i, l;

@@ -783,8 +783,12 @@ static obj_p eval_vary(obj_p fn, obj_p *args, i64_t len, i64_t id) {
 
     for (i = 0; i < len; i++) {
         x = eval_arg(args[i], is_aggr);
-        if (IS_ERR(x))
+        if (IS_ERR(x)) {
+            // Clean up already-pushed args before returning error
+            while (i-- > 0)
+                drop_obj(vm_stack_pop());
             return x;
+        }
         vm_stack_push(x);
     }
 
@@ -810,12 +814,18 @@ static obj_p eval_lambda(obj_p fn, obj_p *args, i64_t len, i64_t id) {
 
     for (i = 0; i < len; i++) {
         x = eval(args[i]);
-        if (IS_ERR(x))
+        if (IS_ERR(x)) {
+            while (i-- > 0)
+                drop_obj(vm_stack_pop());
             return x;
+        }
         // Materialize lazy values (MAPGROUP/MAPFILTER) for lambda arguments
         x = collect_lazy(x);
-        if (IS_ERR(x))
+        if (IS_ERR(x)) {
+            while (i-- > 0)
+                drop_obj(vm_stack_pop());
             return x;
+        }
         vm_stack_push(x);
     }
 
