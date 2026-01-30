@@ -257,6 +257,7 @@ i64_t ipc_open(poll_p poll, sock_addr_t *addr, i64_t timeout) {
     registry.recv_fn = sock_recv;
     registry.send_fn = sock_send;
     registry.read_fn = ipc_read_header;
+    registry.data_fn = ipc_on_data;
     registry.close_fn = ipc_on_close;
     registry.error_fn = ipc_on_error;
     registry.data = ctx;
