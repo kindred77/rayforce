@@ -578,6 +578,15 @@ OP_CALLD:
             push(r);
             break;
         case TYPE_LAMBDA:
+            if (UNLIKELY(n != AS_LAMBDA(x)->args->len)) {
+                i64_t expected = AS_LAMBDA(x)->args->len;
+                for (i64_t i = 0; i < n; ++i)
+                    drop_obj(pop());
+                drop_obj(x);
+                r = err_arity(expected, n, 0);
+                bc_error_add_loc(r, vm->fn, ip - 1);
+                return vm_error_unwind(vm, r);
+            }
             goto callf;
         default: {
             i8_t got = x->type;
