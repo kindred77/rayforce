@@ -48,6 +48,7 @@
 #include "error.h"
 #include "symbols.h"
 #include "eval.h"
+#include "vary.h"
 #include "sys.h"
 #include "chrono.h"
 #include "binary.h"
@@ -57,6 +58,10 @@
 #pragma comment(lib, "Ws2_32.lib")
 // Link with Mswsock.lib
 #pragma comment(lib, "Mswsock.lib")
+
+// Forward declarations
+poll_result_t _recv_initiate(poll_p poll, selector_p selector);
+
 
 // ============================================================================
 // Simple circular queue implementation for async message handling
@@ -226,6 +231,8 @@ poll_p poll_init(i64_t port) {
     WSADATA wsaData;
     int result;
 
+
+
     // Initialize Winsock
     result = WSAStartup(MAKEWORD(2, 2), &wsaData);
     if (result != 0) {
@@ -258,21 +265,13 @@ poll_p poll_init(i64_t port) {
     poll->timers = timers_create(16);
 
     // Add server socket if port is specified
+    // poll_listen already creates __LISTENER and starts accepting
     if (port) {
         listen_fd = poll_listen(poll, port);
         if (listen_fd == -1) {
             LOG_ERROR("Failed to listen on port %lld", port);
             poll_destroy(poll);
             return NULL;
-        }
-
-        __LISTENER = (listener_p)heap_alloc(sizeof(struct listener_t));
-        memset(__LISTENER, 0, sizeof(struct listener_t));
-
-        // Start accepting connections
-        if (poll_accept(poll) == -1) {
-            heap_free(poll);
-            exit_werror();
         }
     }
 
@@ -466,12 +465,10 @@ poll_result_t _recv(poll_p poll, selector_p selector) {
 
     // wait for handshake
     while (selector->version == 0) {
-        LOG_TRACE("_recv: handshake loop: rx.size=%lu", (unsigned long)selector->rx.size);
-        
+
         // malformed handshake
         if ((selector->rx.size == 0) ||
             (selector->rx.wsa_buf.len == sizeof(struct ipc_header_t) && selector->rx.size == 1)) {
-            LOG_DEBUG("_recv: malformed handshake");
             return POLL_ERROR;
         }
 
@@ -513,7 +510,6 @@ poll_result_t _recv(poll_p poll, selector_p selector) {
         size = 0;
         while (size < (i64_t)sizeof(handshake)) {
             sz = sock_send(selector->fd, &handshake[size], sizeof(handshake) - size);
-            LOG_TRACE("_recv: sock_send returned %lld", sz);
 
             if (sz == -1)
                 return POLL_ERROR;
@@ -708,26 +704,41 @@ nil_t process_request(poll_p poll, selector_p selector) {
     poll_result_t poll_result;
 
     res = read_obj(selector);
-    LOG_TRACE("process_request: read_obj returned res=%p type=%d", (void*)res, res ? res->type : -1);
+
+    // Set the current connection handle (.z.w) for Rayfall code
+    poll_set_usr_fd(selector->id);
 
     if (IS_ERR(res) || is_null(res)) {
         v = res;
     } else if (res->type == TYPE_C8) {
-        LOG_TRACE("process_request: evaluating string: len=%lld content='%.*s'", 
-                res->len, (int)(res->len < 100 ? res->len : 100), (char*)AS_C8(res));
-        v = ray_eval_str(res, poll->ipcfile);  // Fixed: str first, then file
-        if (v && v->type == TYPE_ERR) {
-            obj_p errfmt = obj_fmt(v, B8_FALSE);
-            LOG_DEBUG("process_request: eval ERROR: %.*s", (int)errfmt->len, (char*)AS_C8(errfmt));
-            drop_obj(errfmt);
-        } else {
-            LOG_TRACE("process_request: eval result: %p type=%d", (void*)v, v ? v->type : -1);
+        v = ray_eval_str(res, poll->ipcfile);
+        drop_obj(res);
+    } else if (res->type == TYPE_LIST && res->len > 0) {
+        // IPC apply semantics (like kdb+): resolve car, apply to rest as values
+        obj_p *elems = AS_LIST(res);
+        i64_t n = res->len;
+        obj_p args[n];
+        args[0] = eval(elems[0]);
+        if (IS_ERR(args[0])) {
+            drop_obj(res);
+            poll_set_usr_fd(0);
+            v = args[0];
+            goto respond;
         }
+        for (i64_t i = 1; i < n; i++)
+            args[i] = clone_obj(elems[i]);
+        v = ray_apply(args, n);
+        drop_obj(args[0]);
+        for (i64_t i = 1; i < n; i++)
+            drop_obj(args[i]);
         drop_obj(res);
     } else {
         v = eval_obj(res);
     }
 
+    poll_set_usr_fd(0);
+
+respond:
     // sync request
     if (selector->rx.msgtype == MSG_TYPE_SYNC) {
         queue_push(selector->tx.queue, (nil_t *)((i64_t)v | ((i64_t)MSG_TYPE_RESP << 61)));
@@ -759,7 +770,6 @@ i64_t poll_run(poll_p poll) {
         success = GetQueuedCompletionStatusEx(hPollFd, events, MAX_IOCP_RESULTS, &num, timeout_ms,
                                               B8_TRUE  // set this to B8_TRUE if you want to return on alertable wait
         );
-        
         if (!success) {
             DWORD err = GetLastError();
             LOG_DEBUG("GetQueuedCompletionStatusEx failed: %lu", err);
@@ -767,7 +777,7 @@ i64_t poll_run(poll_p poll) {
                 continue;  // alertable wait or timer timeout, process timers at top
             }
         }
-        
+
         LOG_TRACE("Got %lu IOCP events, success=%d", (unsigned long)num, success);
         
         // Handle IOCP events
@@ -790,37 +800,32 @@ i64_t poll_run(poll_p poll) {
                     continue;
                 }
 
-                // Check if this is a waker event (by checking magic number)
-                {
-                    poll_waker_p waker = (poll_waker_p)key;
-                    if (waker != NULL && waker->magic == POLL_WAKER_MAGIC) {
-                        LOG_TRACE("Waker event received, calling callback");
-                        if (waker->callback != NULL)
-                            waker->callback(waker->data);
-                        continue;
-                    }
-                }
-
-                LOG_TRACE("IOCP event: key=%lld ipc_fd=%lld size=%lu",
-                        key, poll->ipc_fd, (unsigned long)size);
-
-                // Accept new connection
+                // Accept new connection (check BEFORE waker to avoid
+                // dereferencing the listen socket handle as a pointer)
                 if (key == poll->ipc_fd) {
                     LOG_DEBUG("Accept event! hAccepted=%lld", (i64_t)__LISTENER->hAccepted);
                     hAccepted = __LISTENER->hAccepted;
 
                     if (hAccepted != INVALID_SOCKET) {
+                        // AcceptEx sockets require SO_UPDATE_ACCEPT_CONTEXT
+                        // before they can be used for send/recv operations.
+                        setsockopt(hAccepted, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
+                                   (char *)&poll->ipc_fd, sizeof(poll->ipc_fd));
                         idx = poll_register(poll, hAccepted, 0);
-                        LOG_DEBUG("Registered, idx=%lld", idx);
                         selector = (selector_p)freelist_get(poll->selectors, idx - SELECTOR_ID_OFFSET);
                         poll_result = _recv_initiate(poll, selector);
-                        LOG_DEBUG("_recv_initiate returned %lld", poll_result);
 
                         if (poll_result == POLL_ERROR)
                             poll_deregister(poll, selector->id);
                     }
 
                     poll_accept(poll);
+                } else if (((poll_waker_p)key)->magic == POLL_WAKER_MAGIC) {
+                    // Waker event
+                    poll_waker_p waker = (poll_waker_p)key;
+                    LOG_TRACE("Waker event received, calling callback");
+                    if (waker->callback != NULL)
+                        waker->callback(waker->data);
                 } else {
                     selector = (selector_p)key;
 
@@ -897,41 +902,47 @@ obj_p ipc_send_sync(poll_p poll, i64_t id, obj_p msg) {
     selector = (selector_p)idx;
     LOG_TRACE("ipc_send_sync: selector=%p fd=%lld", (void*)selector, selector->fd);
 
+    // Suppress IOCP notifications during blocking send/recv.
+    // Setting the low bit of hEvent tells Windows to signal the event
+    // but NOT post a completion to the IOCP queue. This prevents stale
+    // completions from confusing poll_run when it starts later.
+    HANDLE origRxEvent = selector->rx.overlapped.hEvent;
+    HANDLE origTxEvent = selector->tx.overlapped.hEvent;
+    selector->rx.overlapped.hEvent = (HANDLE)((ULONG_PTR)origRxEvent | 1);
+    selector->tx.overlapped.hEvent = (HANDLE)((ULONG_PTR)origTxEvent | 1);
+
     queue_push(selector->tx.queue, (nil_t *)((i64_t)msg | ((i64_t)MSG_TYPE_SYNC << 61)));
 
     // set ignore flag to tx
     selector->tx.ignore = B8_TRUE;
 
-    LOG_TRACE("ipc_send_sync: starting send loop");
     while (poll_result == POLL_OK) {
         poll_result = _send(poll, selector);
-        LOG_TRACE("ipc_send_sync: _send returned %d", poll_result);
 
         if (poll_result != POLL_OK)
             break;
 
-        dwResult = WaitForSingleObject(selector->tx.overlapped.hEvent, INFINITE);
+        dwResult = WaitForSingleObject(origTxEvent, INFINITE);
 
-        if (dwResult == WAIT_FAILED)
-            return err_os();
+        if (dwResult == WAIT_FAILED) {
+            res = err_os(); goto cleanup;
+        }
 
-        if (!GetOverlappedResult((HANDLE)selector->fd, &selector->tx.overlapped, &selector->tx.size, B8_FALSE))
-            return err_os();
+        if (!GetOverlappedResult((HANDLE)selector->fd, &selector->tx.overlapped, &selector->tx.size, B8_FALSE)) {
+            res = err_os(); goto cleanup;
+        }
     }
 
     if (poll_result == POLL_ERROR) {
         poll_deregister(poll, selector->id);
-        return err_os();
+        res = err_os(); goto cleanup;
     }
 
     poll_result = POLL_OK;
 
-    // set ignore flag to rx
-    selector->rx.ignore = B8_TRUE;
-
     if (selector->rx.buf == NULL) {
         selector->rx.buf = heap_alloc(sizeof(struct ipc_header_t));
-        selector->rx.size = 0;  // No bytes received yet
+        selector->rx.size = 0;
         selector->rx.wsa_buf.buf = (str_p)selector->rx.buf;
         selector->rx.wsa_buf.len = sizeof(struct ipc_header_t);
         poll_result = _recv(poll, selector);
@@ -939,20 +950,22 @@ obj_p ipc_send_sync(poll_p poll, i64_t id, obj_p msg) {
 
 recv:
     while (poll_result == POLL_OK) {
-        dwResult = WaitForSingleObject(selector->rx.overlapped.hEvent, INFINITE);
+        dwResult = WaitForSingleObject(origRxEvent, INFINITE);
 
-        if (dwResult == WAIT_FAILED)
-            return err_os();
+        if (dwResult == WAIT_FAILED) {
+            res = err_os(); goto cleanup;
+        }
 
-        if (!GetOverlappedResult((HANDLE)selector->fd, &selector->rx.overlapped, &selector->rx.size, B8_FALSE))
-            return err_os();
+        if (!GetOverlappedResult((HANDLE)selector->fd, &selector->rx.overlapped, &selector->rx.size, B8_FALSE)) {
+            res = err_os(); goto cleanup;
+        }
 
         poll_result = _recv(poll, selector);
     }
 
     if (poll_result == POLL_ERROR) {
         poll_deregister(poll, selector->id);
-        return err_os();
+        res = err_os(); goto cleanup;
     }
 
     // recv until we get response
@@ -969,7 +982,30 @@ recv:
             goto recv;
     }
 
-    LOG_TRACE("ipc_send_sync: returning res=%p type=%d", (void*)res, res ? res->type : -1);
+cleanup:
+    // Restore original hEvent handles (clear IOCP-suppression low bit)
+    // so that subsequent async I/O from poll_run posts to IOCP normally.
+    selector->rx.overlapped.hEvent = origRxEvent;
+    selector->tx.overlapped.hEvent = origTxEvent;
+
+    // Queue an async receive so poll_run can pick up future incoming data
+    // (only on success path — res is not an error)
+    if (!IS_ERR(res)) {
+        selector->rx.ignore = B8_FALSE;
+        selector->rx.header = B8_FALSE;
+        selector->rx.buf = heap_alloc(sizeof(struct ipc_header_t));
+        selector->rx.size = 0;
+        selector->rx.wsa_buf.buf = (str_p)selector->rx.buf;
+        selector->rx.wsa_buf.len = sizeof(struct ipc_header_t);
+
+        i32_t rc = WSARecv(selector->fd, &selector->rx.wsa_buf, 1,
+                           &selector->rx.size, &selector->rx.flags,
+                           &selector->rx.overlapped, NULL);
+        if (rc == SOCKET_ERROR && WSAGetLastError() != ERROR_IO_PENDING) {
+            heap_free(selector->rx.buf);
+            selector->rx.buf = NULL;
+        }
+    }
     return res;
 }
 
