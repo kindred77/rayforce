@@ -695,15 +695,19 @@ obj_p call(obj_p fn, i64_t arity) {
     vm->rs[vm->rp].fn = saved_fn;
     vm->rs[vm->rp].fp = saved_fp;
     vm->rs[vm->rp].ip = -1;  // External call marker
+    i64_t saved_rp = vm->rp;
     vm->rp++;
 
     // Execute bytecode
     res = vm_eval(fn);
 
     // Pop frame and restore context
-    vm->rp--;
-    vm->fn = saved_fn;
-    vm->fp = saved_fp;
+    // Only pop if vm_error_unwind hasn't already unwound past our frame
+    if (vm->rp > saved_rp) {
+        vm->rp--;
+        vm->fn = saved_fn;
+        vm->fp = saved_fp;
+    }
 
     return res;
 }
