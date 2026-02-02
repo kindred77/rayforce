@@ -34,6 +34,7 @@
 #include "../../core/log.h"
 #include "../../core/str.h"
 #include "../../core/runtime.h"
+#include "../../core/vary.h"
 #include "raykx.h"
 #include "serde.h"
 
@@ -182,6 +183,7 @@ obj_p raykx_hopen(obj_p addr) {
     registry.read_fn = raykx_read_header;
     registry.close_fn = raykx_on_close;
     registry.error_fn = raykx_on_error;
+    registry.data_fn = raykx_on_data;
     registry.data = ctx;
 
     LOG_DEBUG("Registering connection in poll registry");
@@ -418,6 +420,23 @@ obj_p raykx_process_msg(poll_p poll, selector_p selector, obj_p msg) {
         LOG_TRACE("Evaluating string message: %.*s", (i32_t)msg->len, AS_C8(msg));
         res = ray_eval_str(msg, ctx->name);
         drop_obj(msg);
+    } else if (msg->type == TYPE_LIST && msg->len > 0) {
+        // KDB+ apply semantics: resolve car, apply to rest as values
+        obj_p *elems = AS_LIST(msg);
+        i64_t n = msg->len;
+        obj_p args[n];
+        args[0] = eval(elems[0]);
+        if (IS_ERR(args[0])) {
+            drop_obj(msg);
+            return args[0];
+        }
+        for (i64_t i = 1; i < n; i++)
+            args[i] = clone_obj(elems[i]);
+        res = ray_apply(args, n);
+        drop_obj(args[0]);
+        for (i64_t i = 1; i < n; i++)
+            drop_obj(args[i]);
+        drop_obj(msg);
     } else {
         LOG_TRACE("Evaluating object message");
         res = eval_obj(msg);
@@ -440,7 +459,9 @@ option_t raykx_on_data(poll_p poll, selector_p selector, raw_p data) {
     ctx = (raykx_ctx_p)selector->data;
     res = (obj_p)data;
 
+    poll_set_usr_fd(selector->id);
     v = raykx_process_msg(poll, selector, res);
+    poll_set_usr_fd(0);
 
     // Send a response if the message is a synchronous request
     if (ctx->msgtype == KDB_MSG_SYNC)
