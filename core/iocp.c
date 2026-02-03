@@ -416,7 +416,8 @@ nil_t poll_deregister(poll_p poll, i64_t id) {
     heap_free(selector);
 }
 
-i64_t poll_register(poll_p poll, i64_t fd, u8_t version) {
+// Internal helper for simple registration (for internal IPC use)
+i64_t poll_register_fd(poll_p poll, i64_t fd, u8_t version) {
     i64_t id;
     selector_p selector;
 
@@ -425,6 +426,11 @@ i64_t poll_register(poll_p poll, i64_t fd, u8_t version) {
     selector->id = id;
     selector->version = version;
     selector->fd = fd;
+    selector->data = NULL;
+    selector->open_fn = NULL;
+    selector->close_fn = NULL;
+    selector->error_fn = NULL;
+    selector->data_fn = NULL;
     selector->rx.flags = 0;
     selector->rx.ignore = B8_FALSE;
     selector->rx.header = B8_FALSE;
@@ -433,21 +439,75 @@ i64_t poll_register(poll_p poll, i64_t fd, u8_t version) {
     selector->rx.wsa_buf.buf = NULL;
     selector->rx.wsa_buf.len = 0;
     selector->rx.overlapped.hEvent = CreateEvent(NULL, B8_TRUE, B8_FALSE, NULL);
-    selector->rx.size = 0;
+    selector->rx.recv_fn = NULL;
+    selector->rx.read_fn = NULL;
     selector->tx.flags = 0;
     selector->tx.ignore = B8_FALSE;
     selector->tx.buf = NULL;
     selector->tx.size = 0;
     selector->tx.wsa_buf.buf = NULL;
     selector->tx.wsa_buf.len = 0;
-    selector->tx.size = 0;
     selector->tx.overlapped.hEvent = CreateEvent(NULL, B8_TRUE, B8_FALSE, NULL);
     selector->tx.queue = queue_create(TX_QUEUE_SIZE);
+    selector->tx.send_fn = NULL;
+    selector->tx.write_fn = NULL;
 
     CreateIoCompletionPort((HANDLE)fd, (HANDLE)poll->poll_fd, (ULONG_PTR)selector, 0);
 
     // prevent the IOCP mechanism from getting signaled on synchronous completions
     SetFileCompletionNotificationModes((HANDLE)fd, FILE_SKIP_COMPLETION_PORT_ON_SUCCESS);
+
+    return id;
+}
+
+// Public registration with callback support
+i64_t poll_register(poll_p poll, poll_registry_p registry) {
+    i64_t id;
+    selector_p selector;
+
+    selector = heap_alloc(sizeof(struct selector_t));
+    id = freelist_push(poll->selectors, (i64_t)selector) + SELECTOR_ID_OFFSET;
+    selector->id = id;
+    selector->version = 0;  // Will be set during handshake
+    selector->fd = registry->fd;
+    selector->data = registry->data;
+
+    // Copy callbacks from registry
+    selector->open_fn = registry->open_fn;
+    selector->close_fn = registry->close_fn;
+    selector->error_fn = registry->error_fn;
+    selector->data_fn = registry->data_fn;
+
+    selector->rx.flags = 0;
+    selector->rx.ignore = B8_FALSE;
+    selector->rx.header = B8_FALSE;
+    selector->rx.buf = NULL;
+    selector->rx.size = 0;
+    selector->rx.wsa_buf.buf = NULL;
+    selector->rx.wsa_buf.len = 0;
+    selector->rx.overlapped.hEvent = CreateEvent(NULL, B8_TRUE, B8_FALSE, NULL);
+    selector->rx.recv_fn = registry->recv_fn;
+    selector->rx.read_fn = registry->read_fn;
+
+    selector->tx.flags = 0;
+    selector->tx.ignore = B8_FALSE;
+    selector->tx.buf = NULL;
+    selector->tx.size = 0;
+    selector->tx.wsa_buf.buf = NULL;
+    selector->tx.wsa_buf.len = 0;
+    selector->tx.overlapped.hEvent = CreateEvent(NULL, B8_TRUE, B8_FALSE, NULL);
+    selector->tx.queue = queue_create(TX_QUEUE_SIZE);
+    selector->tx.send_fn = registry->send_fn;
+    selector->tx.write_fn = registry->write_fn;
+
+    CreateIoCompletionPort((HANDLE)registry->fd, (HANDLE)poll->poll_fd, (ULONG_PTR)selector, 0);
+
+    // prevent the IOCP mechanism from getting signaled on synchronous completions
+    SetFileCompletionNotificationModes((HANDLE)registry->fd, FILE_SKIP_COMPLETION_PORT_ON_SUCCESS);
+
+    // Call open callback if defined
+    if (selector->open_fn)
+        selector->open_fn(poll, selector);
 
     return id;
 }
@@ -811,7 +871,7 @@ i64_t poll_run(poll_p poll) {
                         // before they can be used for send/recv operations.
                         setsockopt(hAccepted, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
                                    (char *)&poll->ipc_fd, sizeof(poll->ipc_fd));
-                        idx = poll_register(poll, hAccepted, 0);
+                        idx = poll_register_fd(poll, hAccepted, 0);
                         selector = (selector_p)freelist_get(poll->selectors, idx - SELECTOR_ID_OFFSET);
                         poll_result = _recv_initiate(poll, selector);
 
@@ -1072,4 +1132,165 @@ nil_t poll_waker_wake(poll_waker_p waker) {
 nil_t poll_waker_destroy(poll_waker_p waker) {
     LOG_DEBUG("Destroying poll waker");
     heap_free(waker);
+}
+
+// ============================================================================
+// Buffer management for custom protocols
+// Note: poll_buf_create, poll_buf_destroy, poll_get_selector are defined in poll.c
+// ============================================================================
+
+i64_t poll_rx_buf_request(poll_p poll, selector_p selector, i64_t size) {
+    UNUSED(poll);
+
+    LOG_TRACE("poll_rx_buf_request: size=%lld", size);
+
+    // Allocate or reallocate receive buffer (as poll_buffer_p format for compatibility)
+    if (selector->rx.buf == NULL) {
+        selector->rx.buf = heap_alloc(ISIZEOF(struct poll_buffer_t) + size);
+    } else {
+        selector->rx.buf = heap_realloc(selector->rx.buf, ISIZEOF(struct poll_buffer_t) + size);
+    }
+
+    if (selector->rx.buf == NULL)
+        return -1;
+
+    // Set up the poll_buffer_t header
+    poll_buffer_p pbuf = (poll_buffer_p)selector->rx.buf;
+    pbuf->size = size;
+    pbuf->offset = 0;
+    pbuf->next = NULL;
+
+    // Set up WSABUF to point to the data area after the header
+    selector->rx.wsa_buf.buf = (str_p)(((u8_t*)selector->rx.buf) + ISIZEOF(struct poll_buffer_t));
+    selector->rx.wsa_buf.len = (ULONG)size;
+
+    return 0;
+}
+
+i64_t poll_rx_buf_extend(poll_p poll, selector_p selector, i64_t size) {
+    UNUSED(poll);
+    poll_buffer_p pbuf = (poll_buffer_p)selector->rx.buf;
+
+    if (pbuf == NULL)
+        return -1;
+
+    i64_t new_size = pbuf->size + size;
+    selector->rx.buf = heap_realloc(selector->rx.buf, ISIZEOF(struct poll_buffer_t) + new_size);
+
+    if (selector->rx.buf == NULL)
+        return -1;
+
+    pbuf = (poll_buffer_p)selector->rx.buf;
+    pbuf->size = new_size;
+
+    return 0;
+}
+
+i64_t poll_rx_buf_release(poll_p poll, selector_p selector) {
+    UNUSED(poll);
+
+    if (selector->rx.buf != NULL) {
+        heap_free(selector->rx.buf);
+        selector->rx.buf = NULL;
+    }
+    selector->rx.wsa_buf.buf = NULL;
+    selector->rx.wsa_buf.len = 0;
+
+    return 0;
+}
+
+i64_t poll_rx_buf_reset(poll_p poll, selector_p selector) {
+    UNUSED(poll);
+
+    if (selector->rx.buf != NULL) {
+        poll_buffer_p pbuf = (poll_buffer_p)selector->rx.buf;
+        pbuf->offset = 0;
+    }
+
+    return 0;
+}
+
+i64_t poll_send_buf(poll_p poll, selector_p selector, poll_buffer_p buf) {
+    UNUSED(poll);
+
+    // For Windows, we use a simpler approach: queue the data and send
+    // This is a simplified implementation that sends immediately (blocking)
+    i64_t total = 0;
+    i64_t size = buf->size;
+    u8_t *data = buf->data;
+
+    while (total < size) {
+        i64_t n = send((SOCKET)selector->fd, (const char*)(data + total), (int)(size - total), 0);
+        if (n <= 0) {
+            if (n == 0) {
+                poll_buf_destroy(buf);
+                return -1;
+            }
+            i32_t err = WSAGetLastError();
+            if (err == WSAEWOULDBLOCK || err == WSAEINPROGRESS) {
+                Sleep(1);
+                continue;
+            }
+            poll_buf_destroy(buf);
+            return -1;
+        }
+        total += n;
+    }
+
+    poll_buf_destroy(buf);
+    return total;
+}
+
+// Blocking wait for data on a selector (for custom protocol sync operations)
+option_t poll_block_on(poll_p poll, selector_p selector) {
+    UNUSED(poll);
+
+    poll_buffer_p pbuf;
+    option_t result;
+
+    // If there's a custom read function, use it
+    if (selector->rx.read_fn != NULL) {
+        // Ensure we have a buffer
+        if (selector->rx.buf == NULL) {
+            LOG_ERROR("poll_block_on: no buffer allocated");
+            return option_error(err_os());
+        }
+
+        pbuf = (poll_buffer_p)selector->rx.buf;
+
+        // Blocking receive
+        while (pbuf->offset < pbuf->size) {
+            i64_t n = recv((SOCKET)selector->fd,
+                          (char*)(pbuf->data + pbuf->offset),
+                          (int)(pbuf->size - pbuf->offset), 0);
+            if (n <= 0) {
+                if (n == 0) {
+                    LOG_DEBUG("poll_block_on: connection closed");
+                    return option_error(err_os());
+                }
+                i32_t err = WSAGetLastError();
+                if (err == WSAEWOULDBLOCK || err == WSAEINPROGRESS) {
+                    Sleep(1);
+                    continue;
+                }
+                LOG_ERROR("poll_block_on: recv failed: %d", err);
+                return option_error(err_os());
+            }
+            pbuf->offset += n;
+        }
+
+        // Call the read callback
+        result = selector->rx.read_fn(poll, selector);
+
+        // If data callback is defined and we have data, call it
+        if (option_is_some(&result) && result.value != NULL && selector->data_fn != NULL) {
+            result = selector->data_fn(poll, selector, result.value);
+        }
+
+        return result;
+    }
+
+    // No custom read function - this shouldn't happen for custom protocols
+    LOG_ERROR("poll_block_on: no read_fn defined");
+    return option_error(err_os());
 }

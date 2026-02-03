@@ -101,11 +101,23 @@ nil_t queue_free(queue_p queue);
 nil_t queue_push(queue_p queue, raw_p item);
 raw_p queue_pop(queue_p queue);
 
+// Function type definitions for Windows callback-based protocol handling
+typedef option_t (*poll_rdwr_fn)(struct poll_t *, struct selector_t *);         // High level IO
+typedef option_t (*poll_data_fn)(struct poll_t *, struct selector_t *, raw_p);  // Data callback
+typedef nil_t (*poll_evts_fn)(struct poll_t *, struct selector_t *);            // Event callbacks
+typedef i64_t (*poll_io_fn)(i64_t, u8_t *, i64_t);                              // Low level IO
+
 typedef struct selector_t {
     i64_t fd;  // socket fd
     i64_t id;  // selector id
     u8_t version;
     raw_p data;  // user-defined data
+
+    // Protocol callbacks (optional, NULL for built-in rayforce IPC)
+    poll_evts_fn open_fn;
+    poll_evts_fn close_fn;
+    poll_evts_fn error_fn;
+    poll_data_fn data_fn;
 
     struct {
         b8_t ignore;
@@ -116,6 +128,8 @@ typedef struct selector_t {
         DWORD size;
         u8_t *buf;
         WSABUF wsa_buf;
+        poll_io_fn recv_fn;    // Low level recv (optional)
+        poll_rdwr_fn read_fn;  // High level read callback (optional)
     } rx;
 
     struct {
@@ -126,6 +140,8 @@ typedef struct selector_t {
         u8_t *buf;
         WSABUF wsa_buf;
         queue_p queue;  // queue for async messages waiting to be sent
+        poll_io_fn send_fn;    // Low level send (optional)
+        poll_rdwr_fn write_fn; // High level write callback (optional)
     } tx;
 } *selector_p;
 
@@ -140,12 +156,20 @@ typedef struct poll_t {
     timers_p timers;       // timers heap
 } *poll_p;
 
-// Registry not used on Windows, but define for API compatibility
+// Registry structure for Windows
 typedef struct poll_registry_t {
-    i64_t fd;
-    selector_type_t type;
-    poll_events_t events;
-    raw_p data;
+    i64_t fd;               // The file descriptor to register
+    selector_type_t type;   // Type of the file descriptor
+    poll_events_t events;   // Events (for compatibility, not used in IOCP)
+    poll_evts_fn open_fn;   // Called upon registration
+    poll_evts_fn close_fn;  // Called upon deregistration
+    poll_evts_fn error_fn;  // Handles errors
+    poll_io_fn recv_fn;     // Low level recv function
+    poll_io_fn send_fn;     // Low level send function
+    poll_rdwr_fn read_fn;   // Processes received data
+    poll_rdwr_fn write_fn;  // Processes data to be sent
+    poll_data_fn data_fn;   // Processes retrieved data
+    raw_p data;             // User-defined data
 } *poll_registry_p;
 
 #else
@@ -232,10 +256,11 @@ typedef struct poll_registry_t {
 
 // Function declarations
 #if defined(OS_WINDOWS)
-// Windows uses IOCP with different initialization and registration
+// Windows uses IOCP with callback-based registration
 poll_p poll_init(i64_t port);
 i64_t poll_listen(poll_p poll, i64_t port);
-i64_t poll_register(poll_p poll, i64_t fd, u8_t version);
+i64_t poll_register(poll_p poll, poll_registry_p registry);
+i64_t poll_register_fd(poll_p poll, i64_t fd, u8_t version);  // Internal helper for IPC
 nil_t poll_deregister(poll_p poll, i64_t id);
 nil_t poll_set_stdin(poll_p poll, poll_stdin_fn fn, raw_p data);
 #define poll_create() poll_init(0)

@@ -96,7 +96,7 @@ i64_t ipc_open(poll_p poll, sock_addr_t *addr, i64_t timeout) {
     sock_set_nonblocking(fd, B8_TRUE);
 
     // Register the socket with IOCP - pass the received version
-    id = poll_register(poll, fd, buf[0]);
+    id = poll_register_fd(poll, fd, buf[0]);
     if (id == -1) {
         LOG_DEBUG("ipc_open: poll_register failed");
         sock_close(fd);
