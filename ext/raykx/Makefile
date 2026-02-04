@@ -14,9 +14,11 @@ ifneq (,$(IS_WINDOWS))
     TARGET = raykx.dll
     # On Windows, link against rayforce.lib import library and export functions via .def
     # lld requires TEMP for temp files, but make doesn't pass env vars by default
+    # MSYS2_ARG_CONV_EXCL prevents path conversion for /DEF: argument
     TEMP ?= /tmp
     export TEMP
-    LDFLAGS = -shared -fuse-ld=lld -Wl,//DEF:raykx.def
+    export MSYS2_ARG_CONV_EXCL = /DEF:
+    LDFLAGS = -shared -fuse-ld=lld -Wl,/DEF:raykx.def
     LIBS = -lws2_32 -lmswsock ../../rayforce.lib
     DEBUG_CFLAGS = $(CFLAGS) -g -O0 -DDEBUG -D_CRT_SECURE_NO_WARNINGS
     RELEASE_CFLAGS = $(CFLAGS) -O3 -D_CRT_SECURE_NO_WARNINGS
