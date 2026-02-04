@@ -13,12 +13,10 @@ CFLAGS = -Wall -Wextra -std=c17 -fsigned-char -m64 -I. -I../../core
 ifneq (,$(IS_WINDOWS))
     TARGET = raykx.dll
     # On Windows, link against rayforce.lib import library
-    # Convert MSYS path to Windows path: /c/foo -> C:/foo, /d/foo -> D:/foo (case insensitive)
+    # Requires MSYS2_ARG_CONV_EXCL='/DEF:' to prevent path conversion
     TEMP ?= /tmp
     export TEMP
-    WIN_CURDIR := $(subst /c/,C:/,$(subst /C/,C:/,$(subst /d/,D:/,$(subst /D/,D:/,$(CURDIR)))))
-    $(info CURDIR=$(CURDIR) WIN_CURDIR=$(WIN_CURDIR))
-    LDFLAGS = -shared -fuse-ld=lld -Wl,/DEF:$(WIN_CURDIR)/raykx.def
+    LDFLAGS = -shared -fuse-ld=lld -Wl,/DEF:raykx.def
     LIBS = -lws2_32 -lmswsock ../../rayforce.lib
     DEBUG_CFLAGS = $(CFLAGS) -g -O0 -DDEBUG -D_CRT_SECURE_NO_WARNINGS
     RELEASE_CFLAGS = $(CFLAGS) -O3 -D_CRT_SECURE_NO_WARNINGS
