@@ -13,10 +13,9 @@ CFLAGS = -Wall -Wextra -std=c17 -fsigned-char -m64 -I. -I../../core
 ifneq (,$(IS_WINDOWS))
     TARGET = raykx.dll
     # On Windows, link against rayforce.lib import library
-    # Requires MSYS2_ARG_CONV_EXCL='/DEF:' to prevent path conversion
     TEMP ?= /tmp
     export TEMP
-    LDFLAGS = -shared -fuse-ld=lld -Wl,/DEF:raykx.def
+    LDFLAGS = -shared -fuse-ld=lld
     LIBS = -lws2_32 -lmswsock ../../rayforce.lib
     DEBUG_CFLAGS = $(CFLAGS) -g -O0 -DDEBUG -D_CRT_SECURE_NO_WARNINGS
     RELEASE_CFLAGS = $(CFLAGS) -O3 -D_CRT_SECURE_NO_WARNINGS
@@ -37,10 +36,18 @@ endif
 default: debug
 
 debug:
+ifneq (,$(IS_WINDOWS))
+	$(CC) -include ../../core/def.h $(DEBUG_CFLAGS) $(LDFLAGS) -Wl,/DEF:$(shell cygpath -w raykx.def) -o $(TARGET) $(SRCS) $(LIBS)
+else
 	$(CC) -include ../../core/def.h $(DEBUG_CFLAGS) $(LDFLAGS) -o $(TARGET) $(SRCS) $(LIBS)
+endif
 
 release:
+ifneq (,$(IS_WINDOWS))
+	$(CC) -include ../../core/def.h $(RELEASE_CFLAGS) $(LDFLAGS) -Wl,/DEF:$(shell cygpath -w raykx.def) -o $(TARGET) $(SRCS) $(LIBS)
+else
 	$(CC) -include ../../core/def.h $(RELEASE_CFLAGS) $(LDFLAGS) -o $(TARGET) $(SRCS) $(LIBS)
+endif
 
 clean:
 	rm -f $(TARGET) libraykx.so libraykx.dylib raykx.dll
