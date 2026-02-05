@@ -293,6 +293,11 @@ extern nil_t ray_clean(nil_t);
 // Error
 extern obj_p ray_err(lit_p msg);
 
+// Custom thread context — call ON the custom thread
+typedef struct ray_ctx_t *ray_ctx_p;
+extern ray_ctx_p ray_ctx_create(nil_t);
+extern nil_t ray_ctx_destroy(ray_ctx_p ctx);
+
 #ifdef __cplusplus
 }
 #endif

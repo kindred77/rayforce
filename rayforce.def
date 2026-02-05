@@ -187,3 +187,7 @@ EXPORTS
     freelist_push
     freelist_pop
     freelist_get
+
+    ; Custom thread context
+    ray_ctx_create
+    ray_ctx_destroy

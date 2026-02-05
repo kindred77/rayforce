@@ -45,4 +45,5 @@
     poll_*;
     sock_*;
     log_*;
+    ray_ctx_*;
 };

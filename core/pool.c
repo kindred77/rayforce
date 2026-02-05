@@ -236,9 +236,9 @@ pool_p pool_create(i64_t thread_count) {
     pool->done = cond_create();
 
     // Executor[0] is the main thread - create VM directly here
-    pool->executors[0].id = 0;
+    pool->executors[0].id = heap_next_id();
     pool->executors[0].pool = pool;
-    vm = vm_create(0, pool);
+    vm = vm_create(pool->executors[0].id, pool);
     pool->executors[0].vm = vm;
     pool->executors[0].heap = vm->heap;
     pool->executors[0].handle = thread_self();
@@ -249,7 +249,7 @@ pool_p pool_create(i64_t thread_count) {
     // Create worker threads for executor[1..n-1]
     mutex_lock(&pool->mutex);
     for (i = 1; i < thread_count; i++) {
-        pool->executors[i].id = i;
+        pool->executors[i].id = heap_next_id();
         pool->executors[i].pool = pool;
         pool->executors[i].heap = NULL;
         pool->executors[i].vm = NULL;

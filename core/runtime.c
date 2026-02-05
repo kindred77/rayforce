@@ -28,6 +28,7 @@
 #include "ipc.h"
 #include "dynlib.h"
 #include "heap.h"
+#include "ctx.h"
 
 // Global runtime reference
 runtime_p __RUNTIME = NULL;
@@ -144,6 +145,8 @@ runtime_p runtime_create(i32_t argc, str_p argv[]) {
     // Pool is always created; executor[0] is main thread with its VM/heap
     pool_p pool = pool_create(n);
 
+    ctx_registry_init();
+
     symbols = symbols_create();
 
     __RUNTIME = (runtime_p)heap_mmap(sizeof(struct runtime_t));
@@ -228,6 +231,8 @@ nil_t runtime_destroy(nil_t) {
         dynlib_close(dl);
     }
     drop_obj(__RUNTIME->dynlibs);
+    // Clean up any leaked custom thread contexts before destroying pool
+    ctx_registry_destroy();
     // Pool always exists and contains main VM as executor[0]
     // Save runtime pointer before destroying pool (which destroys heap)
     runtime_p rt = __RUNTIME;
