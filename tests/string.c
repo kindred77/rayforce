@@ -32,9 +32,9 @@ test_result_t test_str_match() {
     TEST_ASSERT(!str_match("brown", 5, "br[?*]wn", 8), "brown\", \"br[?*]wn");
 
     // FIX protocol message tests - previously caused infinite loop
-    TEST_ASSERT(!str_match("8=FIX.4.29=004835=049=TR56=CL134=252=20250225-16:15:36.31410=157", 67, "*35=A*", 6),
+    TEST_ASSERT(!str_match("8=FIX.4.29=004835=049=TR56=CL134=252=20250225-16:15:36.31410=157", 64, "*35=A*", 6),
                 "FIX message with 35=0 tag should not match *35=A* pattern");
-    TEST_ASSERT(str_match("8=FIX.4.29=004835=049=TR56=CL134=252=20250225-16:15:36.31410=157", 67, "*35=0*", 6),
+    TEST_ASSERT(str_match("8=FIX.4.29=004835=049=TR56=CL134=252=20250225-16:15:36.31410=157", 64, "*35=0*", 6),
                 "FIX message with 35=0 tag should match *35=0* pattern");
 
     // Additional edge cases for backtracking

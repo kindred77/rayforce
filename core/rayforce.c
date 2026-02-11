@@ -2423,7 +2423,7 @@ obj_p cast_obj(i8_t type, obj_p obj) {
         case MTYPE2(-TYPE_I16, -TYPE_TIMESTAMP):
             return i16(obj->i64);
         case MTYPE2(-TYPE_I16, -TYPE_F64):
-            return i16((i16_t)obj->f64);
+            return ISNANF64(obj->f64) ? i16(NULL_I16) : i16((i16_t)obj->f64);
 
         // I32 atom conversions
         case MTYPE2(-TYPE_I32, -TYPE_B8):
@@ -2439,7 +2439,7 @@ obj_p cast_obj(i8_t type, obj_p obj) {
         case MTYPE2(-TYPE_I32, -TYPE_DATE):
             return i32(obj->i32);
         case MTYPE2(-TYPE_I32, -TYPE_F64):
-            return i32((i32_t)obj->f64);
+            return ISNANF64(obj->f64) ? i32(NULL_I32) : i32((i32_t)obj->f64);
 
         // I64 atom conversions
         case MTYPE2(-TYPE_I64, -TYPE_B8):
@@ -2455,7 +2455,7 @@ obj_p cast_obj(i8_t type, obj_p obj) {
         case MTYPE2(-TYPE_I64, -TYPE_TIMESTAMP):
             return i64(obj->i64);
         case MTYPE2(-TYPE_I64, -TYPE_F64):
-            return i64((i64_t)obj->f64);
+            return ISNANF64(obj->f64) ? i64(NULL_I64) : i64((i64_t)obj->f64);
 
         // F64 atom conversions
         case MTYPE2(-TYPE_F64, -TYPE_B8):

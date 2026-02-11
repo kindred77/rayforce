@@ -336,7 +336,7 @@ test_result_t test_cast_nulls() {
     // Null f64 cast - 0Nf is NaN, cast to int gives min values
     TEST_ASSERT_EQ("(as 'i64 0Nf)", "0Nl");
     TEST_ASSERT_EQ("(as 'i32 0Nf)", "0Ni");
-    TEST_ASSERT_EQ("(as 'i16 0Nf)", "0");
+    TEST_ASSERT_EQ("(as 'i16 0Nf)", "0Nh");
 
     // Null date cast - date is internally i32, null = -2147483648
     TEST_ASSERT_EQ("(as 'i64 0Nd)", "-2147483648");

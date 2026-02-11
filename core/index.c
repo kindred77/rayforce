@@ -2492,7 +2492,7 @@ obj_p index_group_list_perfect(obj_p obj, obj_p filter) {
             obj_p meta = clone_obj(AS_LIST(res)[6]);
             obj_p ids = I64(flen);
             i64_t *ids_data = AS_I64(ids);
-            for (i = 0; i < flen; i++)
+            for (i = 0; i < (u64_t)flen; i++)
                 ids_data[i] = keys[src[i] - shift_val];
             drop_obj(res);
             res = index_group_build(INDEX_TYPE_IDS, gc, ids, i64(NULL_I64), NULL_OBJ, clone_obj(filter), meta);
