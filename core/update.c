@@ -633,7 +633,27 @@ obj_p ray_upsert(obj_p *x, i64_t n) {
                     k2 = clone_obj(AS_LIST(lst)[0]);
                 } else {
                     k1 = ray_take(AS_LIST(obj)[1], x[1]);
-                    k2 = ray_take(lst, x[1]);
+                    // Single-record atoms must be wrapped in single-element vectors
+                    // because index_upsert_obj compares via AS_I64(col)[row], which
+                    // reads past the struct header for atoms (garbage data).
+                    i64_t nkeys = x[1]->i64;
+                    k2 = LIST(nkeys);
+                    if (IS_ERR(k2)) {
+                        drop_obj(k1);
+                        UPSERT_ERROR(k2);
+                    }
+                    for (i64_t j = 0; j < nkeys; j++) {
+                        obj_p atom = AS_LIST(lst)[j];
+                        obj_p vec = vector(atom->type, 1);
+                        if (IS_ERR(vec)) {
+                            k2->len = j;
+                            drop_obj(k2);
+                            drop_obj(k1);
+                            UPSERT_ERROR(vec);
+                        }
+                        ins_obj(&vec, 0, clone_obj(atom));
+                        AS_LIST(k2)[j] = vec;
+                    }
                 }
 
                 idx = index_upsert_obj(k2, k1, x[1]->i64);

@@ -2873,6 +2873,7 @@ obj_p aggr_dev(obj_p val, obj_p index) {
 
     n = index_group_count(index);
 
+
     switch (val->type) {
         case TYPE_I16:
         case TYPE_I32:

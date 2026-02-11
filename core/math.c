@@ -2622,6 +2622,30 @@ obj_p ray_avg(obj_p x) {
 
 // TODO: Refactoring with out sort and with parallel execution
 obj_p ray_med(obj_p x) {
+    // Handle MAPGROUP/MAPFILTER before ray_cnt, since ops_count(MAPGROUP)
+    // returns the index_type enum, not the actual row count
+    switch (x->type) {
+        case TYPE_MAPGROUP:
+            return aggr_med(AS_LIST(x)[0], AS_LIST(x)[1]);
+        case TYPE_MAPFILTER: {
+            obj_p val = AS_LIST(x)[0];
+            obj_p filter = AS_LIST(x)[1];
+            if (val->type >= TYPE_PARTEDLIST && val->type <= TYPE_PARTEDGUID && filter->type == TYPE_PARTEDI64) {
+                obj_p index = vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ,
+                                      clone_obj(filter), NULL_OBJ);
+                obj_p res = aggr_med(val, index);
+                drop_obj(index);
+                return res;
+            }
+            obj_p collected = filter_collect(val, filter);
+            obj_p res = ray_med(collected);
+            drop_obj(collected);
+            return res;
+        }
+        default:
+            break;
+    }
+
     i64_t l = ray_cnt(x)->i64;
     if (l == 0)
         return f64(NULL_F64);
@@ -2685,23 +2709,6 @@ obj_p ray_med(obj_p x) {
 
             //     return f64(med);
 
-        case TYPE_MAPGROUP:
-            return aggr_med(AS_LIST(x)[0], AS_LIST(x)[1]);
-        case TYPE_MAPFILTER: {
-            obj_p val = AS_LIST(x)[0];
-            obj_p filter = AS_LIST(x)[1];
-            if (val->type >= TYPE_PARTEDLIST && val->type <= TYPE_PARTEDGUID && filter->type == TYPE_PARTEDI64) {
-                obj_p index = vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ,
-                                      clone_obj(filter), NULL_OBJ);
-                obj_p res = aggr_med(val, index);
-                drop_obj(index);
-                return res;
-            }
-            obj_p collected = filter_collect(val, filter);
-            obj_p res = ray_med(collected);
-            drop_obj(collected);
-            return res;
-        }
         case TYPE_PARTEDI16:
         case TYPE_PARTEDI32:
         case TYPE_PARTEDI64:
@@ -2721,6 +2728,30 @@ obj_p ray_med(obj_p x) {
 }
 
 obj_p ray_dev(obj_p x) {
+    // Handle MAPGROUP/MAPFILTER before ray_cnt, since ops_count(MAPGROUP)
+    // returns the index_type enum, not the actual row count
+    switch (x->type) {
+        case TYPE_MAPGROUP:
+            return aggr_dev(AS_LIST(x)[0], AS_LIST(x)[1]);
+        case TYPE_MAPFILTER: {
+            obj_p val = AS_LIST(x)[0];
+            obj_p filter = AS_LIST(x)[1];
+            if (val->type >= TYPE_PARTEDLIST && val->type <= TYPE_PARTEDGUID && filter->type == TYPE_PARTEDI64) {
+                obj_p index = vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ,
+                                      clone_obj(filter), NULL_OBJ);
+                obj_p res = aggr_dev(val, index);
+                drop_obj(index);
+                return res;
+            }
+            obj_p collected = filter_collect(val, filter);
+            obj_p res = ray_dev(collected);
+            drop_obj(collected);
+            return res;
+        }
+        default:
+            break;
+    }
+
     obj_p cnt_obj = ray_cnt(x);
     i64_t l = cnt_obj->i64;
     drop_obj(cnt_obj);
@@ -2757,23 +2788,6 @@ obj_p ray_dev(obj_p x) {
             favg = (sum_obj->f64) / (f64_t)l;
             drop_obj(sum_obj);
             break;
-        case TYPE_MAPGROUP:
-            return aggr_dev(AS_LIST(x)[0], AS_LIST(x)[1]);
-        case TYPE_MAPFILTER: {
-            obj_p val = AS_LIST(x)[0];
-            obj_p filter = AS_LIST(x)[1];
-            if (val->type >= TYPE_PARTEDLIST && val->type <= TYPE_PARTEDGUID && filter->type == TYPE_PARTEDI64) {
-                obj_p index = vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ,
-                                      clone_obj(filter), NULL_OBJ);
-                obj_p res = aggr_dev(val, index);
-                drop_obj(index);
-                return res;
-            }
-            obj_p collected = filter_collect(val, filter);
-            obj_p res = ray_dev(collected);
-            drop_obj(collected);
-            return res;
-        }
         case TYPE_PARTEDI16:
         case TYPE_PARTEDI32:
         case TYPE_PARTEDI64:

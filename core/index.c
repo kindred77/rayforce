@@ -2478,6 +2478,31 @@ obj_p index_group_list_perfect(obj_p obj, obj_p filter) {
     res = index_group_i64_scoped(ht, NULL_OBJ, scope);
     drop_obj(ht);
 
+    // If there's a filter, the index maps dense positions [0..filter->len) to groups.
+    // Inject the filter so aggregation reads val[filter[i]] instead of val[i].
+    if (!is_null(filter) && !is_null(res)) {
+        if (index_group_type(res) == INDEX_TYPE_SHIFT) {
+            // SHIFT uses source[x] which is densely indexed — incompatible with filter.
+            // Convert to IDS: build explicit group_ids array.
+            i64_t *src = AS_I64(AS_LIST(res)[4]);
+            i64_t *keys = AS_I64(AS_LIST(res)[2]);
+            i64_t shift_val = AS_LIST(res)[3]->i64;
+            i64_t flen = filter->len;
+            i64_t gc = index_group_count(res);
+            obj_p meta = clone_obj(AS_LIST(res)[6]);
+            obj_p ids = I64(flen);
+            i64_t *ids_data = AS_I64(ids);
+            for (i = 0; i < flen; i++)
+                ids_data[i] = keys[src[i] - shift_val];
+            drop_obj(res);
+            res = index_group_build(INDEX_TYPE_IDS, gc, ids, i64(NULL_I64), NULL_OBJ, clone_obj(filter), meta);
+        } else {
+            // IDS type: just inject the filter
+            drop_obj(AS_LIST(res)[5]);
+            AS_LIST(res)[5] = clone_obj(filter);
+        }
+    }
+
     return res;
 }
 
