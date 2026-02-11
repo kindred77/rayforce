@@ -1929,6 +1929,7 @@ obj_p ray_cnt_partial(obj_p x, i64_t len, i64_t offset) {
 
 obj_p ray_sum_partial(obj_p x, i64_t len, i64_t offset) {
     switch (x->type) {
+        case -TYPE_B8:
         case -TYPE_U8:
             return i64((i64_t)x->u8);
         case -TYPE_I16:
@@ -1940,6 +1941,7 @@ obj_p ray_sum_partial(obj_p x, i64_t len, i64_t offset) {
         case -TYPE_TIME:
         case -TYPE_TIMESTAMP:
             return clone_obj(x);
+        case TYPE_B8:
         case TYPE_U8: {
             u8_t *lhs = AS_U8(x) + offset;
             i64_t out = 0;
