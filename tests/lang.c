@@ -3662,6 +3662,32 @@ test_result_t test_lang_cmp() {
     TEST_ASSERT_EQ("(== [1i 2i -3i] [1i 2i 3i])", "[true true false]");
     TEST_ASSERT_EQ("(!= [1i -2i] [1i 2i])", "[false true]");
 
+    // B8 atom vs B8 vector
+    TEST_ASSERT_EQ("(== true [true false])", "[true false]");
+    TEST_ASSERT_EQ("(== false [true false])", "[false true]");
+    TEST_ASSERT_EQ("(!= true [true false])", "[false true]");
+    TEST_ASSERT_EQ("(< false [true false])", "[true false]");
+    TEST_ASSERT_EQ("(> true [true false])", "[false true]");
+    TEST_ASSERT_EQ("(<= true [true false])", "[true false]");
+    TEST_ASSERT_EQ("(>= true [true false])", "[true true]");
+    // B8 vector vs B8 atom
+    TEST_ASSERT_EQ("(== [true false] true)", "[true false]");
+    TEST_ASSERT_EQ("(!= [true false] false)", "[true false]");
+    // B8 vector vs B8 vector
+    TEST_ASSERT_EQ("(== [true false true] [true true false])", "[true false false]");
+    TEST_ASSERT_EQ("(!= [true false] [false true])", "[true true]");
+    // B8 atom vs numeric scalar
+    TEST_ASSERT_EQ("(== true 1)", "true");
+    TEST_ASSERT_EQ("(== false 0)", "true");
+    TEST_ASSERT_EQ("(== true 1.0)", "true");
+    TEST_ASSERT_EQ("(!= true 0)", "true");
+    // B8 atom vs numeric vector
+    TEST_ASSERT_EQ("(== true [1 0 1])", "[true false true]");
+    TEST_ASSERT_EQ("(== false [0 1 0])", "[true false true]");
+    // Numeric atom vs B8 vector
+    TEST_ASSERT_EQ("(== 1 [true false])", "[true false]");
+    TEST_ASSERT_EQ("(== 0 [true false])", "[false true]");
+
     TEST_ASSERT_EQ("(< 2024.01.01 [2024.01.02 2023.12.31])", "[true false]");
     TEST_ASSERT_EQ("(> [2024.01.02 2024.01.05] 2024.01.03)", "[false true]");
     TEST_ASSERT_EQ("(< 10:00:01.100 [10:00:00.200 10:00:02.000])", "[false true]");
