@@ -8,10 +8,9 @@
 
 [![License](https://img.shields.io/badge/License-MIT-yellow?style=flat)](LICENSE)
 [![Language](https://img.shields.io/badge/Language-C-blue?logo=c&style=flat)](https://en.wikipedia.org/wiki/C_(programming_language))
-[![Tests](https://img.shields.io/badge/Tests-passing-success?logo=github&style=flat)](https://singaraiona.github.io/rayforce/tests_report/)
-[![Coverage](https://img.shields.io/badge/Coverage-passing-brightgreen?logo=github&style=flat)](https://singaraiona.github.io/rayforce/coverage_report/)
-[![Release](https://img.shields.io/badge/Release-latest-blue?logo=github&style=flat)](https://github.com/singaraiona/rayforce/releases)
-[![Documentation](https://img.shields.io/badge/Documentation-latest-blue?logo=github&style=flat)](https://singaraiona.github.io/rayforce/)
+[![Tests](https://img.shields.io/badge/Tests-passing-success?logo=github&style=flat)](https://RayforceDB.github.io/rayforce/tests_report/)
+[![Release](https://img.shields.io/badge/Release-latest-blue?logo=github&style=flat)](https://github.com/RayforceDB/rayforce/releases)
+[![Documentation](https://img.shields.io/badge/Documentation-latest-blue?logo=github&style=flat)](https://RayforceDB.github.io/rayforce/)
 [![Linux](https://img.shields.io/badge/Linux-supported-green?logo=linux&logoColor=white&style=flat)]()
 [![macOS](https://img.shields.io/badge/macOS-supported-green?logo=apple&style=flat)]()
 [![Windows](https://img.shields.io/badge/Windows-supported-green?logo=microsoft&style=flat)]()
@@ -30,7 +29,7 @@ A high-performance columnar vector database written in pure C. RayforceDB combin
 ## Quick Start
 
 ```bash
-git clone https://github.com/singaraiona/rayforce.git
+git clone https://github.com/RayforceDB/rayforce.git
 cd rayforce
 make release
 ./rayforce
@@ -56,9 +55,8 @@ make bench      # Run benchmark suite
 
 ## Documentation
 
-- [Full Documentation](https://singaraiona.github.io/rayforce/)
-- [Test Reports](https://singaraiona.github.io/rayforce/tests_report/)
-- [Coverage Reports](https://singaraiona.github.io/rayforce/coverage_report/)
+- [Full Documentation](https://RayforceDB.github.io/rayforce/)
+- [Test Reports](https://RayforceDB.github.io/rayforce/tests_report/)
 
 ## Python bindings
 
@@ -68,7 +66,7 @@ Rayforce has powerful [Python bindings](https://github.com/RayforceDB/rayforce-p
 
 Contributions are welcome! You can help by:
 
-- Reporting bugs and requesting features via [GitHub Issues](https://github.com/singaraiona/rayforce/issues)
+- Reporting bugs and requesting features via [GitHub Issues](https://github.com/RayforceDB/rayforce/issues)
 - Submitting pull requests
 - Creating example scripts and use cases
 - Improving documentation
