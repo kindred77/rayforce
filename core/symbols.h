@@ -30,7 +30,8 @@
 #define SYMBOLS_HT_SIZE RAY_PAGE_SIZE * 1024
 #define STRING_NODE_SIZE RAY_PAGE_SIZE
 #define STRING_POOL_SIZE (RAY_PAGE_SIZE * 1024ull * 1024ull)
-#define SYMBOLS_MAX_COUNT (1024ull * 1024ull * 16ull)  // Max 16M unique symbols
+#define SYMBOLS_MAX_COUNT (1024ull * 1024ull * 1024ull)  // 1B symbols (virtual reserve only, ~8GB address space)
+#define SYMBOLS_COMMIT_SIZE RAY_PAGE_SIZE              // Commit granularity for strings array
 
 // Get string length from compact symbol ID (defined in symbols.c)
 i64_t symbol_strlen(i64_t compact_id);
@@ -51,7 +52,8 @@ typedef struct symbols_t {
     str_p string_pool;  // string pool
     str_p string_node;  // string pool current node
     str_p string_curr;  // string pool cursor
-    str_p *strings;     // compact_id -> string pointer array
+    str_p *strings;     // compact_id -> string pointer array (reserve/commit)
+    raw_p strings_node; // committed boundary for strings array
 } *symbols_p;
 
 i64_t symbols_intern(lit_p s, i64_t len);

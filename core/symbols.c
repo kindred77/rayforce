@@ -126,9 +126,8 @@ load:
 
     // Allocate new compact ID atomically
     compact_id = __atomic_fetch_add(&symbols->count, 1, __ATOMIC_RELAXED);
-    
+
     if (compact_id >= (i64_t)SYMBOLS_MAX_COUNT) {
-        // Too many symbols - this is a fatal error
         fprintf(stderr, "Error: exceeded maximum symbol count (%llu)\n", (unsigned long long)SYMBOLS_MAX_COUNT);
         exit(1);
     }
@@ -141,6 +140,34 @@ load:
     new_bucket->str = intr;
     new_bucket->compact_id = compact_id;
     new_bucket->next = current_bucket;
+
+    // Ensure strings array has committed pages for this compact_id
+    {
+        raw_p slot_end = (raw_p)&symbols->strings[compact_id + 1];
+        raw_p node = __atomic_load_n(&symbols->strings_node, __ATOMIC_ACQUIRE);
+        i64_t rounds2 = 0;
+
+        while (slot_end > node) {
+            if ((i64_t)node == NULL_I64) {
+                backoff_spin(&rounds2);
+                node = __atomic_load_n(&symbols->strings_node, __ATOMIC_ACQUIRE);
+                continue;
+            }
+
+            if (__atomic_compare_exchange_n(&symbols->strings_node, &node, (raw_p)NULL_I64, 1,
+                                             __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+                if (mmap_commit(node, SYMBOLS_COMMIT_SIZE) != 0) {
+                    perror("symbols strings mmap_commit");
+                    exit(1);
+                }
+                node += SYMBOLS_COMMIT_SIZE;
+                __atomic_store_n(&symbols->strings_node, node, __ATOMIC_RELEASE);
+            } else {
+                backoff_spin(&rounds2);
+                node = __atomic_load_n(&symbols->strings_node, __ATOMIC_ACQUIRE);
+            }
+        }
+    }
 
     // Store string pointer in the lookup array
     symbols->strings[compact_id] = intr;
@@ -178,12 +205,20 @@ symbols_p symbols_create(nil_t) {
     symbols->string_curr = symbols->string_pool;
     symbols->string_node = symbols->string_pool + STRING_NODE_SIZE;
 
-    // Allocate compact_id -> string pointer lookup array
-    symbols->strings = (str_p *)heap_mmap(SYMBOLS_MAX_COUNT * sizeof(str_p));
+    // Reserve virtual address space for compact_id -> string pointer lookup array
+    // Only commit pages incrementally as symbols are created
+    symbols->strings = (str_p *)mmap_reserve(NULL, SYMBOLS_MAX_COUNT * sizeof(str_p));
     if (symbols->strings == NULL) {
-        perror("symbols->strings mmap");
+        perror("symbols->strings mmap_reserve");
         exit(1);
     }
+
+    // Commit initial page
+    if (mmap_commit(symbols->strings, SYMBOLS_COMMIT_SIZE) != 0) {
+        perror("symbols->strings mmap_commit");
+        exit(1);
+    }
+    symbols->strings_node = (raw_p)symbols->strings + SYMBOLS_COMMIT_SIZE;
 
     if (mmap_commit(symbols->string_pool, STRING_NODE_SIZE) == -1) {
         perror("string_pool mmap_commit");
@@ -208,7 +243,7 @@ nil_t symbols_destroy(symbols_p symbols) {
     }
 
     mmap_free(symbols->syms, symbols->size * sizeof(symbol_p));
-    mmap_free(symbols->strings, SYMBOLS_MAX_COUNT * sizeof(str_p));
+    mmap_free((raw_p)symbols->strings, SYMBOLS_MAX_COUNT * sizeof(str_p));
     mmap_free(symbols->string_pool, STRING_POOL_SIZE);
     heap_unmap(symbols, sizeof(struct symbols_t));
 }
