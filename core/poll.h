@@ -181,7 +181,7 @@ typedef enum poll_events_t {
     POLL_EVENT_ERROR = EPOLLERR,
     POLL_EVENT_HUP = EPOLLHUP,
     POLL_EVENT_RDHUP = EPOLLRDHUP,
-    POLL_EVENT_EDGE = EPOLLET,
+    POLL_EVENT_EDGE = (int)EPOLLET,
 } poll_events_t;
 #elif defined(OS_MACOS)
 #include <sys/event.h>
