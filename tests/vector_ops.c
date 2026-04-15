@@ -172,8 +172,8 @@ test_result_t test_vec_distinct() {
                    "[2024.01.01D10:00:00.000000000]");
     // Byte distinct
     TEST_ASSERT_EQ("(distinct [0x12 0x12 0x10])", "[0x10 0x12]");
-    // With null - null is dropped
-    TEST_ASSERT_EQ("(distinct [1i 0Ni 1i])", "[1i]");
+    // With null - null is its own distinct value (ANSI SQL-style)
+    TEST_ASSERT_EQ("(distinct [1i 0Ni 1i])", "[1i 0Ni]");
     // Count after distinct
     TEST_ASSERT_EQ("(count (distinct [1 1 2 2 3 3 4 4 5 5]))", "5");
     // List distinct

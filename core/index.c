@@ -495,22 +495,59 @@ obj_p index_distinct_i32(i32_t values[], i64_t len) {
     i64_t i, j, l;
     i32_t *out;
     i64_t p, *keys;
+    i64_t min, max, range;
+    b8_t has_null, has_nonnull;
     obj_p vec, set;
-    const index_scope_t scope = index_scope_i32(values, NULL, len);
 
-    if (scope.range <= len || scope.range <= MAX_RANGE) {
-        vec = I32(scope.range);
+    // Null-aware scope over non-null values. NULL_I32 would otherwise poison
+    // min/max and overflow range in the scoped fast path.
+    has_null = B8_FALSE;
+    has_nonnull = B8_FALSE;
+    min = max = 0;
+    for (i = 0; i < len; i++) {
+        i32_t v_i = values[i];
+        if (v_i == NULL_I32) {
+            has_null = B8_TRUE;
+            continue;
+        }
+        if (!has_nonnull) {
+            min = max = (i64_t)v_i;
+            has_nonnull = B8_TRUE;
+        } else {
+            if ((i64_t)v_i < min) min = v_i;
+            if ((i64_t)v_i > max) max = v_i;
+        }
+    }
+
+    if (!has_nonnull) {
+        vec = I32(has_null ? 1 : 0);
+        if (has_null)
+            AS_I32(vec)[0] = NULL_I32;
+        vec->attrs |= ATTR_DISTINCT;
+        return vec;
+    }
+
+    range = max - min + 1;
+
+    if (range <= len || range <= MAX_RANGE) {
+        vec = I32(range + (has_null ? 1 : 0));
         out = AS_I32(vec);
-        memset(out, 0, sizeof(i32_t) * scope.range);
+        memset(out, 0, sizeof(i32_t) * range);
 
-        for (i = 0; i < len; i++)
-            out[values[i] - scope.min] = 1;
+        for (i = 0; i < len; i++) {
+            i32_t v_i = values[i];
+            if (v_i == NULL_I32)
+                continue;
+            out[v_i - min] = 1;
+        }
 
         // compact values
-        for (i = 0, j = 0; i < scope.range; i++) {
+        for (i = 0, j = 0; i < range; i++) {
             if (out[i])
-                out[j++] = i + scope.min;
+                out[j++] = (i32_t)(i + min);
         }
+        if (has_null)
+            out[j++] = NULL_I32;
 
         resize_obj(&vec, j);
         vec->attrs |= ATTR_DISTINCT;
@@ -518,7 +555,7 @@ obj_p index_distinct_i32(i32_t values[], i64_t len) {
         return vec;
     }
 
-    // otherwise, use a hash table
+    // otherwise, use a hash table (nulls excluded from the set and re-added explicitly)
     set = ht_oa_create(len, -1);
 
     for (i = 0, j = 0; i < len; i++) {
@@ -532,7 +569,7 @@ obj_p index_distinct_i32(i32_t values[], i64_t len) {
         }
     }
 
-    vec = I32(j);
+    vec = I32(j + (has_null ? 1 : 0));
     out = AS_I32(vec);
 
     keys = AS_I64(AS_LIST(set)[0]);
@@ -542,6 +579,8 @@ obj_p index_distinct_i32(i32_t values[], i64_t len) {
         if (keys[i] != NULL_I64)
             out[j++] = (i32_t)keys[i];
     }
+    if (has_null)
+        out[j++] = NULL_I32;
 
     drop_obj(set);
     vec->attrs |= ATTR_DISTINCT;
@@ -551,24 +590,61 @@ obj_p index_distinct_i32(i32_t values[], i64_t len) {
 obj_p index_distinct_i64(i64_t values[], i64_t len) {
     i64_t i, l, j = 0;
     i64_t p, *out, *keys;
+    i64_t min, max, range;
+    b8_t has_null, has_nonnull;
     obj_p vec, set;
-    const index_scope_t scope = index_scope_i64(values, NULL, len);
+
+    // Null-aware scope over non-null values. NULL_I64 in the input would
+    // otherwise poison min/max and overflow range in the scoped fast path.
+    has_null = B8_FALSE;
+    has_nonnull = B8_FALSE;
+    min = max = 0;
+    for (i = 0; i < len; i++) {
+        i64_t v_i = values[i];
+        if (v_i == NULL_I64) {
+            has_null = B8_TRUE;
+            continue;
+        }
+        if (!has_nonnull) {
+            min = max = v_i;
+            has_nonnull = B8_TRUE;
+        } else {
+            if (v_i < min) min = v_i;
+            if (v_i > max) max = v_i;
+        }
+    }
+
+    // All-null (or empty) input: emit a single 0Nl if any null was seen, else empty.
+    if (!has_nonnull) {
+        vec = I64(has_null ? 1 : 0);
+        if (has_null)
+            AS_I64(vec)[0] = NULL_I64;
+        vec->attrs |= ATTR_DISTINCT;
+        return vec;
+    }
+
+    range = max - min + 1;
 
     // use open addressing if range is small
-    if (scope.range <= len || scope.range <= MAX_RANGE) {
-        vec = I64(scope.range);
+    if (range <= len || range <= MAX_RANGE) {
+        vec = I64(range + (has_null ? 1 : 0));
         out = AS_I64(vec);
-        memset(out, 0, sizeof(i64_t) * scope.range);
+        memset(out, 0, sizeof(i64_t) * range);
 
-        for (i = 0; i < len; i++)
-            // TODO need bench // if (out[values[i] - scope.min] == 0)
-            out[values[i] - scope.min] = 1;
+        for (i = 0; i < len; i++) {
+            i64_t v_i = values[i];
+            if (v_i == NULL_I64)
+                continue;
+            out[v_i - min] = 1;
+        }
 
         // compact keys
-        for (i = 0, j = 0; i < scope.range; i++) {
+        for (i = 0, j = 0; i < range; i++) {
             if (out[i])
-                out[j++] = i + scope.min;
+                out[j++] = i + min;
         }
+        if (has_null)
+            out[j++] = NULL_I64;
 
         resize_obj(&vec, j);
         vec->attrs |= ATTR_DISTINCT;
@@ -576,7 +652,7 @@ obj_p index_distinct_i64(i64_t values[], i64_t len) {
         return vec;
     }
 
-    // otherwise, use a hash table
+    // otherwise, use a hash table (nulls are excluded from the set and re-added explicitly)
     set = ht_oa_create(len, -1);
 
     for (i = 0; i < len; i++) {
@@ -590,7 +666,7 @@ obj_p index_distinct_i64(i64_t values[], i64_t len) {
         }
     }
 
-    vec = I64(j);
+    vec = I64(j + (has_null ? 1 : 0));
     out = AS_I64(vec);
 
     keys = AS_I64(AS_LIST(set)[0]);
@@ -600,6 +676,8 @@ obj_p index_distinct_i64(i64_t values[], i64_t len) {
         if (keys[i] != NULL_I64)
             out[j++] = keys[i];
     }
+    if (has_null)
+        out[j++] = NULL_I64;
 
     drop_obj(set);
     vec->attrs |= ATTR_DISTINCT;
@@ -2048,8 +2126,9 @@ obj_p index_group_i32(obj_p obj, obj_p filter) {
 }
 
 obj_p index_group_i64_unscoped(obj_p obj, obj_p filter) {
-    i64_t len;
+    i64_t len, i;
     i64_t *out, *values, *indices, g;
+    b8_t has_null;
     obj_p vals;
 
     values = AS_I64(obj);
@@ -2061,6 +2140,38 @@ obj_p index_group_i64_unscoped(obj_p obj, obj_p filter) {
     out = AS_I64(vals);
 
     g = index_group_distribute(values, indices, out, len, &hash_fnv1a, &hash_cmp_i64);
+
+    // index_group_distribute uses NULL_I64 as its empty-slot sentinel, so real
+    // NULL_I64 keys never collide and each null row gets its own spurious group.
+    // Detect nulls and, if present, remap: merge all null-row groups into one
+    // canonical null group and compact non-null groups.
+    has_null = B8_FALSE;
+    for (i = 0; i < len; i++) {
+        if ((indices ? values[indices[i]] : values[i]) == NULL_I64) {
+            has_null = B8_TRUE;
+            break;
+        }
+    }
+
+    if (has_null) {
+        obj_p remap_obj = I64(g);
+        i64_t *remap = AS_I64(remap_obj);
+        i64_t new_g = 0, null_g = -1;
+        for (i = 0; i < g; i++) remap[i] = -1;
+        for (i = 0; i < len; i++) {
+            i64_t v_i = indices ? values[indices[i]] : values[i];
+            i64_t old = out[i];
+            if (v_i == NULL_I64) {
+                if (null_g == -1) null_g = new_g++;
+                out[i] = null_g;
+            } else {
+                if (remap[old] == -1) remap[old] = new_g++;
+                out[i] = remap[old];
+            }
+        }
+        drop_obj(remap_obj);
+        g = new_g;
+    }
 
     timeit_tick("index group unscoped");
 
@@ -2093,54 +2204,102 @@ obj_p index_group_i64_scoped_partial(i64_t input[], i64_t filter[], i64_t group_
 obj_p index_group_i64_scoped(obj_p obj, obj_p filter, const index_scope_t scope) {
     i64_t i, n, len, groups, chunks, base_chunk;
     i64_t *hk, *hv, *hf, *values, *indices;
+    i64_t min, max, range, null_group;
+    b8_t has_null, has_nonnull;
     obj_p keys, vals, firsts, v;
     pool_p pool;
+
+    (void)scope;  // Recomputed below: passed scope can overflow if NULL_I64 is present.
 
     values = AS_I64(obj);
     indices = is_null(filter) ? NULL : AS_I64(filter);
     len = indices ? filter->len : obj->len;
 
+    // Null-aware scope: compute min/max over non-null values and detect any null.
+    // GROUP BY treats NULL as its own group (ANSI/Postgres/DuckDB semantics).
+    has_null = B8_FALSE;
+    has_nonnull = B8_FALSE;
+    min = max = 0;
+    for (i = 0; i < len; i++) {
+        i64_t v_i = indices ? values[indices[i]] : values[i];
+        if (v_i == NULL_I64) {
+            has_null = B8_TRUE;
+            continue;
+        }
+        if (!has_nonnull) {
+            min = max = v_i;
+            has_nonnull = B8_TRUE;
+        } else {
+            if (v_i < min) min = v_i;
+            if (v_i > max) max = v_i;
+        }
+    }
+
+    // Degenerate cases: empty input or all nulls. Delegate to the hash-based
+    // unscoped path which handles NULL_I64 as an ordinary key value.
+    if (!has_nonnull)
+        return index_group_i64_unscoped(obj, filter);
+
+    range = max - min + 1;
+
     // perfect hash
-    if (scope.range <= len) {
-        keys = I64(scope.range);
+    if (range <= len) {
+        keys = I64(range);
         hk = AS_I64(keys);
         // Initialize keys array in parallel
         pool = pool_get();
-        chunks = pool_split_by(pool, scope.range, 0);
+        chunks = pool_split_by(pool, range, 0);
         if (chunks == 1) {
-            for (i = 0; i < scope.range; i++)
+            for (i = 0; i < range; i++)
                 hk[i] = NULL_I64;
         } else {
-            base_chunk = pool_chunk_aligned(scope.range, chunks, sizeof(i64_t));
+            base_chunk = pool_chunk_aligned(range, chunks, sizeof(i64_t));
             pool_prepare(pool);
             for (i = 0; i < chunks - 1; i++)
                 pool_add_task(pool, (raw_p)fill_null_i64, 3, hk, base_chunk, i * base_chunk);
-            pool_add_task(pool, (raw_p)fill_null_i64, 3, hk, scope.range - (chunks - 1) * base_chunk,
+            pool_add_task(pool, (raw_p)fill_null_i64, 3, hk, range - (chunks - 1) * base_chunk,
                           (chunks - 1) * base_chunk);
             v = pool_run(pool);
             drop_obj(v);
         }
 
-        // Pre-allocate firsts array (we'll resize if needed, but usually groups < scope.range)
-        firsts = I64(len);  // Worst case: every row is a new group
+        // Pre-allocate firsts array (we'll resize if needed, but usually groups < range).
+        // Reserve one extra slot for a possible null group.
+        firsts = I64(len);
         hf = AS_I64(firsts);
 
+        null_group = -1;
+        groups = 0;
         if (indices) {
-            for (i = 0, groups = 0; i < len; i++) {
-                n = values[indices[i]] - scope.min;
+            for (i = 0; i < len; i++) {
+                i64_t v_i = values[indices[i]];
+                if (v_i == NULL_I64) {
+                    if (null_group == -1) {
+                        null_group = groups;
+                        hf[groups++] = i;
+                    }
+                    continue;
+                }
+                n = v_i - min;
                 if (hk[n] == NULL_I64) {
                     hk[n] = groups;
-                    hf[groups] = i;  // Track first row index directly by group ID
-                    groups++;
+                    hf[groups++] = i;
                 }
             }
         } else {
-            for (i = 0, groups = 0; i < len; i++) {
-                n = values[i] - scope.min;
+            for (i = 0; i < len; i++) {
+                i64_t v_i = values[i];
+                if (v_i == NULL_I64) {
+                    if (null_group == -1) {
+                        null_group = groups;
+                        hf[groups++] = i;
+                    }
+                    continue;
+                }
+                n = v_i - min;
                 if (hk[n] == NULL_I64) {
                     hk[n] = groups;
-                    hf[groups] = i;  // Track first row index directly by group ID
-                    groups++;
+                    hf[groups++] = i;
                 }
             }
         }
@@ -2149,31 +2308,47 @@ obj_p index_group_i64_scoped(obj_p obj, obj_p filter, const index_scope_t scope)
         resize_obj(&firsts, groups);
         hf = AS_I64(firsts);
 
-        // For small scope.range, use SHIFT (no group_ids array needed)
-        // For large scope.range, use IDS (better cache locality in aggregation)
-        if (scope.range <= INDEX_SCOPE_LIMIT) {
+        // SHIFT layout looks up group_ids via source[x] - shift during aggregation.
+        // It has no way to special-case null rows, so fall back to IDS when nulls are present.
+        if (!has_null && range <= INDEX_SCOPE_LIMIT) {
             timeit_tick("index group scoped perfect simple");
-            return index_group_build(INDEX_TYPE_SHIFT, groups, keys, i64(scope.min), clone_obj(obj), clone_obj(filter),
+            return index_group_build(INDEX_TYPE_SHIFT, groups, keys, i64(min), clone_obj(obj), clone_obj(filter),
                                      firsts);
         }
 
         // Build group_ids array for better aggregation performance
         vals = I64(len);
         hv = AS_I64(vals);
-        pool = pool_get();
-        chunks = pool_split_by(pool, len, 0);
-        base_chunk = pool_chunk_aligned(len, chunks, sizeof(i64_t));
-        if (chunks == 1)
-            index_group_i64_scoped_partial(values, indices, hk, len, 0, scope.min, hv);
-        else {
-            pool_prepare(pool);
-            for (i = 0; i < chunks - 1; i++)
-                pool_add_task(pool, (raw_p)index_group_i64_scoped_partial, 7, values, indices, hk, base_chunk,
-                              i * base_chunk, scope.min, hv);
-            pool_add_task(pool, (raw_p)index_group_i64_scoped_partial, 7, values, indices, hk,
-                          len - (chunks - 1) * base_chunk, (chunks - 1) * base_chunk, scope.min, hv);
-            v = pool_run(pool);
-            drop_obj(v);
+
+        if (has_null) {
+            // Serial null-aware scatter: map NULL_I64 rows to null_group explicitly.
+            if (indices) {
+                for (i = 0; i < len; i++) {
+                    i64_t v_i = values[indices[i]];
+                    hv[i] = (v_i == NULL_I64) ? null_group : hk[v_i - min];
+                }
+            } else {
+                for (i = 0; i < len; i++) {
+                    i64_t v_i = values[i];
+                    hv[i] = (v_i == NULL_I64) ? null_group : hk[v_i - min];
+                }
+            }
+        } else {
+            pool = pool_get();
+            chunks = pool_split_by(pool, len, 0);
+            base_chunk = pool_chunk_aligned(len, chunks, sizeof(i64_t));
+            if (chunks == 1)
+                index_group_i64_scoped_partial(values, indices, hk, len, 0, min, hv);
+            else {
+                pool_prepare(pool);
+                for (i = 0; i < chunks - 1; i++)
+                    pool_add_task(pool, (raw_p)index_group_i64_scoped_partial, 7, values, indices, hk, base_chunk,
+                                  i * base_chunk, min, hv);
+                pool_add_task(pool, (raw_p)index_group_i64_scoped_partial, 7, values, indices, hk,
+                              len - (chunks - 1) * base_chunk, (chunks - 1) * base_chunk, min, hv);
+                v = pool_run(pool);
+                drop_obj(v);
+            }
         }
         drop_obj(keys);
         timeit_tick("index group scoped perfect");

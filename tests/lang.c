@@ -3753,7 +3753,7 @@ test_result_t test_lang_distinct() {
     TEST_ASSERT_EQ("(distinct \"test\")", "\"est\"");
     TEST_ASSERT_EQ("(distinct \"\")", "\"\"");
     TEST_ASSERT_EQ("(distinct [1h 2h 2h])", "[1 2]");
-    TEST_ASSERT_EQ("(distinct [1i 0Ni 1i])", "[1i]");
+    TEST_ASSERT_EQ("(distinct [1i 0Ni 1i])", "[1i 0Ni]");
     TEST_ASSERT_EQ("(distinct [2012.12.12 2012.12.12])", "[2012.12.12]");
     TEST_ASSERT_EQ("(distinct [10:00:00.000 20:10:10.500 10:00:00.000])", "[10:00:00.000 20:10:10.500]");
     TEST_ASSERT_EQ("(distinct [1 1 1 2 3 4 2 3 4 2 3 4])", "[1 2 3 4]");
