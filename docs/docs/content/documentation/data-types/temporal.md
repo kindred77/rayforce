@@ -15,9 +15,12 @@ RayforceDB offers 3 types of temporal types: Date, Time and Timestamp
 date
 ↪ (type [2025.01.01 2025.01.02])  ;; Vector
 DATE
-↪ (date 'local)  ;; local date
+```
+
+```clj
+(date 'local)  ;; local date
 2025.12.10
-↪ (date 'global)  ;; UTC date
+(date 'global)  ;; UTC date
 2025.12.10
 ```
 
@@ -34,9 +37,12 @@ DATE
 time
 ↪ (type [20:00:00 21:00:00])  ;; Vector
 TIME
-↪ (time 'local)  ;; Get local time
+```
+
+```clj
+(time 'local)  ;; Get local time
 14:15:56.273
-↪ (time 'global)  ;; Get UTC time
+(time 'global)  ;; Get UTC time
 12:16:10.426
 ```
 
@@ -52,8 +58,11 @@ TIME
 timestamp
 ↪ (type [2025.12.10D15:10:24.058948000 2025.12.10D15:10:24.058948000])  ;; Vector
 TIMESTAMP
-↪ (timestamp 'local)  ;; Get local timestamp
+```
+
+```clj
+(timestamp 'local)  ;; Get local timestamp
 2025.12.10D15:11:50.908518000
-↪ (timestamp 'global)  ;; Get UTC timestamp
+(timestamp 'global)  ;; Get UTC timestamp
 2025.12.10D15:12:00.695995000
 ```

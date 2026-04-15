@@ -271,8 +271,11 @@ The answer lies in understanding what a symbol actually **is** at runtime:
 ;; What you see:
 ↪ ['AAPL 'GOOG]
 [AAPL GOOG]
+```
 
-;; What's actually stored (simplified):
+What's actually stored (simplified):
+
+```
 [0x7fff80001000, 0x7fff80001008]  ← Raw memory pointers!
 ```
 

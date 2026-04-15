@@ -7,7 +7,7 @@ set timeout 10
 
 # Start rayforce
 spawn ./rayforce
-expect "↪"
+expect "‣"
 
 # Read expressions from stdin
 set input [read stdin]
@@ -31,10 +31,10 @@ foreach expr $expressions {
     send "$expr\r"
 
     # Wait for the result - look for newline followed by prompt
-    # The output pattern is: [echo of input]\n[result lines]\n↪
+    # The output pattern is: [echo of input]\n[result lines]\n‣
     set result ""
     expect {
-        -re "\r\n(.+)\r\n\[^\r\n\]*↪ " {
+        -re "\r\n(.+)\r\n\[^\r\n\]*‣ " {
             set raw $expect_out(1,string)
 
             # Clean ANSI codes
@@ -50,7 +50,7 @@ foreach expr $expressions {
                 set trimmed [string trim $line]
                 if {$trimmed eq ""} continue
                 # Skip lines containing the prompt character sequence
-                if {[string match "*↪*" $trimmed]} continue
+                if {[string match "*‣*" $trimmed]} continue
                 lappend output_lines $trimmed
             }
 

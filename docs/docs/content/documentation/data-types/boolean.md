@@ -10,9 +10,9 @@ Represents a boolean value. Can be used in boolean contexts.
 b8
 ↪ (type false) ;; Scalar
 b8
-(type [true true]) ;; Vector
+↪ (type [true true]) ;; Vector
 B8
-(type [false false]) ;; Vector
+↪ (type [false false]) ;; Vector
 B8
 ```
 
