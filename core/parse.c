@@ -805,6 +805,17 @@ obj_p parse_vector(parser_t *parser) {
             return err;
         }
 
+        // Once we've switched to call-form mode (heterogeneous / contains non-scalars),
+        // every subsequent token becomes another argument to (list ...).
+        if (vec->type == TYPE_LIST) {
+            push_obj(&vec, tok);
+            span_extend(parser, &span);
+            parser->replace_symbols = B8_FALSE;
+            tok = parser_advance(parser);
+            parser->replace_symbols = B8_TRUE;
+            continue;
+        }
+
         if (tok->type == -TYPE_B8) {
             if (vec->len > 0 && vec->type != TYPE_B8) {
                 err = parse_error(parser, (i64_t)tok, EC_DOMAIN);
@@ -913,6 +924,22 @@ obj_p parse_vector(parser_t *parser) {
                 drop_obj(tok);
                 return err;
             }
+        } else if (tok->type > 0) {
+            // Non-scalar element (e.g. string TYPE_C8): the literal is heterogeneous,
+            // so rewrite it into a call form `(list <elements...>)`. The eval will
+            // invoke the `list` builtin at runtime to produce the data list.
+            obj_p list_fn = env_get_internal_function_by_id(symbols_intern("list", 4));
+            obj_p call = vn_list(1, list_fn ? list_fn : symbol("list", 4));
+            for (i = 0; i < (i64_t)vec->len; i++)
+                push_obj(&call, at_idx(vec, i));
+            drop_obj(vec);
+            vec = call;
+            push_obj(&vec, tok);
+            span_extend(parser, &span);
+            parser->replace_symbols = B8_FALSE;
+            tok = parser_advance(parser);
+            parser->replace_symbols = B8_TRUE;
+            continue;
         } else {
             err = parse_error(parser, (i64_t)tok, EC_DOMAIN);
             drop_obj(vec);
