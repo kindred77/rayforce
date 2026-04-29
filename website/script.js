@@ -2,25 +2,55 @@ document.addEventListener('DOMContentLoaded', () => {
   'use strict';
 
   // ── Scroll-triggered fade-in ──────────────────
-  const animatedEls = document.querySelectorAll('.feature-card, .why-card, .why-card-small');
+  // Cards have `opacity: 0; transform: translateY(...)` in CSS so they
+  // can fade-in when they scroll into view. The catch: anything already
+  // in the viewport at first paint *also* runs that animation, which
+  // reads as the page "stretching itself in" on hard reload. Snap those
+  // to visible instantly; only animate elements that scroll into view
+  // *after* the initial paint.
+  const animatedSel = '.feature-card, .why-card, .why-card-small, .usecase-item';
+  const animatedEls = document.querySelectorAll(animatedSel);
   if (animatedEls.length > 0) {
+    const inViewportNow = (el) => {
+      const r = el.getBoundingClientRect();
+      return r.bottom > 0 && r.top < (window.innerHeight || document.documentElement.clientHeight);
+    };
+
+    const snap = (el) => {
+      // Disable transition for one frame so adding .visible doesn't animate.
+      const prev = el.style.transition;
+      el.style.transition = 'none';
+      el.classList.add('visible');
+      // Force the browser to commit the no-transition paint, then restore so
+      // future state changes (hover etc.) still animate.
+      // eslint-disable-next-line no-unused-expressions
+      el.offsetHeight;
+      requestAnimationFrame(() => { el.style.transition = prev; });
+    };
+
     const observer = new IntersectionObserver((entries) => {
       entries.forEach((entry) => {
-        if (entry.isIntersecting) {
-          const parent = entry.target.parentElement;
-          if (parent) {
-            const siblings = parent.querySelectorAll('.feature-card, .why-card, .why-card-small');
-            const index = Array.prototype.indexOf.call(siblings, entry.target);
-            if (index > 0) {
-              entry.target.style.transitionDelay = (index * 0.12) + 's';
-            }
+        if (!entry.isIntersecting) return;
+        const parent = entry.target.parentElement;
+        if (parent) {
+          const siblings = parent.querySelectorAll(animatedSel);
+          const index = Array.prototype.indexOf.call(siblings, entry.target);
+          if (index > 0) {
+            entry.target.style.transitionDelay = (index * 0.12) + 's';
           }
-          entry.target.classList.add('visible');
-          observer.unobserve(entry.target);
         }
+        entry.target.classList.add('visible');
+        observer.unobserve(entry.target);
       });
     }, { threshold: 0.15 });
-    animatedEls.forEach((el) => observer.observe(el));
+
+    animatedEls.forEach((el) => {
+      if (inViewportNow(el)) {
+        snap(el);
+      } else {
+        observer.observe(el);
+      }
+    });
   }
 
   // ── Mobile nav toggle ─────────────────────────
