@@ -184,7 +184,7 @@
 
       <p>Rayforce offers two approaches to graph work. The <strong>C API</strong> gives direct control over CSR construction, persistence, and DAG-based graph algorithms &mdash; use it for performance-critical workloads, weighted shortest paths, PageRank, and HNSW vector search. <strong>Rayfall</strong> models graphs as EAV triples in the built-in Datalog engine &mdash; use it for interactive exploration, pattern matching, and recursive reachability queries from the REPL. See the <a href="tutorial-graph.html">Graph Queries Tutorial</a> for a complete Rayfall walkthrough.</p>
 
-      <h2>CSR Format</h2>
+      <h2 id="csr-format">CSR Format</h2>
       <p>Rayforce stores graph edges in <strong>Compressed Sparse Row (CSR)</strong> format &mdash; a compact, cache-friendly representation that enables O(1) neighbor lookups and sequential scan of adjacency lists. CSR is the standard format for high-performance graph engines because it stores edges contiguously in memory, maximizing prefetch efficiency.</p>
 
       <p>A CSR index consists of two arrays:</p>
@@ -197,7 +197,7 @@
         <strong>O(1) degree lookup.</strong> The degree of any node is simply <code>offsets[i+1] - offsets[i]</code>. No iteration required.
       </div>
 
-      <h3>Visual Layout</h3>
+      <h3 id="visual-layout">Visual Layout</h3>
       <p>Consider a graph with 4 nodes and 5 edges:</p>
       <pre><code><span class="hl-comment">; Edges: 0->1, 0->2, 1->2, 2->3, 3->0</span>
 
@@ -209,10 +209,10 @@ Node 1: targets[2..3) = [2]     <span class="hl-comment">; neighbors of node 1</
 Node 2: targets[3..4) = [3]     <span class="hl-comment">; neighbors of node 2</span>
 Node 3: targets[4..5) = [0]     <span class="hl-comment">; neighbors of node 3</span></code></pre>
 
-      <h3>Sorted Adjacency Lists</h3>
+      <h3 id="sorted-adjacency-lists">Sorted Adjacency Lists</h3>
       <p>When <code>sorted == true</code>, the targets within each adjacency list are stored in ascending order. This is <strong>required</strong> for <code>OP_WCO_JOIN</code> (Leapfrog TrieJoin), which relies on sorted lists for its O(N^{1/2}) intersection algorithm. Sorting is enabled by passing <code>sort_targets = true</code> when building the relationship.</p>
 
-      <h2>The ray_csr_t Structure</h2>
+      <h2 id="the-ray-csr-t-structure">The ray_csr_t Structure</h2>
       <p>The internal CSR representation is defined as:</p>
       <pre><code><span class="hl-kw">typedef struct</span> <span class="hl-type">ray_csr</span> {
     <span class="hl-type">ray_t</span>*    offsets;      <span class="hl-comment">/* I64 vec, length = n_nodes + 1                 */</span>
@@ -231,7 +231,7 @@ Node 3: targets[4..5) = [0]     <span class="hl-comment">; neighbors of node 3</
         <li><strong><code>props</code></strong> is an optional <code>RAY_TABLE</code> holding edge properties (weight, label, timestamp, etc.).</li>
       </ul>
 
-      <h2>Double-Indexed CSR: ray_rel_t</h2>
+      <h2 id="double-indexed-csr-ray-rel-t">Double-Indexed CSR: ray_rel_t</h2>
       <p>A <strong>relationship</strong> (<code>ray_rel_t</code>) wraps two CSR indices &mdash; one for forward traversal (src &rarr; dst) and one for reverse (dst &rarr; src):</p>
       <pre><code><span class="hl-kw">typedef struct</span> <span class="hl-type">ray_rel</span> {
     <span class="hl-type">uint16_t</span>    from_table;   <span class="hl-comment">/* source table ID                */</span>
@@ -248,7 +248,7 @@ Node 3: targets[4..5) = [0]     <span class="hl-comment">; neighbors of node 3</
         <li><code>2</code> &mdash; both directions (union of forward and reverse neighbors)</li>
       </ul>
 
-      <h2>Building a Graph from Edge Lists</h2>
+      <h2 id="building-a-graph-from-edge-lists">Building a Graph from Edge Lists</h2>
       <p>The primary API for constructing a relationship from a table of edges:</p>
       <pre><code><span class="hl-type">ray_rel_t</span>* <span class="hl-fn">ray_rel_from_edges</span>(
     <span class="hl-type">ray_t</span>*       edge_table,     <span class="hl-comment">/* table with src and dst columns */</span>
@@ -267,7 +267,7 @@ Node 3: targets[4..5) = [0]     <span class="hl-comment">; neighbors of node 3</
     <span class="hl-type">bool</span>        sort_targets    <span class="hl-comment">/* sort adjacency lists?          */</span>
 );</code></pre>
 
-      <h3>Complete C Example</h3>
+      <h3 id="complete-c-example">Complete C Example</h3>
       <p>Build a small social graph with 4 users and query neighbors:</p>
       <pre><code><span class="hl-comment">/* Build an edge table: Alice(0)->Bob(1), Alice(0)->Carol(2),
  * Bob(1)->Carol(2), Carol(2)->Dave(3) */</span>
@@ -335,43 +335,43 @@ edges = <span class="hl-fn">ray_table_add_col</span>(edges, dst_sym, dst);
   (<span class="hl-kw">where</span> (?src <span class="hl-sym">:follows</span> <span class="hl-num">2</span>)))
 <span class="hl-comment">; => ?src: 0, 1 (Alice and Bob)</span></code></pre>
 
-      <h2>Neighbor Lookup API</h2>
+      <h2 id="neighbor-lookup-api">Neighbor Lookup API</h2>
       <p>Two inline functions provide fast neighbor access without going through the DAG pipeline:</p>
 
-      <h3>ray_csr_degree</h3>
+      <h3 id="ray-csr-degree">ray_csr_degree</h3>
       <pre><code><span class="hl-kw">static inline</span> <span class="hl-type">int64_t</span> <span class="hl-fn">ray_csr_degree</span>(<span class="hl-type">ray_csr_t</span>* csr, <span class="hl-type">int64_t</span> node);</code></pre>
       <p>Returns the degree (number of outgoing edges) of the given node in O(1) time.</p>
 
-      <h3>ray_csr_neighbors</h3>
+      <h3 id="ray-csr-neighbors">ray_csr_neighbors</h3>
       <pre><code><span class="hl-kw">static inline</span> <span class="hl-type">int64_t</span>* <span class="hl-fn">ray_csr_neighbors</span>(
     <span class="hl-type">ray_csr_t</span>* csr, <span class="hl-type">int64_t</span> node, <span class="hl-type">int64_t</span>* out_count);</code></pre>
       <p>Returns a pointer directly into the targets array for the given node's adjacency list. The pointer is valid as long as the CSR is alive. Writes the neighbor count to <code>out_count</code>.</p>
 
-      <h3>ray_rel_neighbors</h3>
+      <h3 id="ray-rel-neighbors">ray_rel_neighbors</h3>
       <pre><code><span class="hl-kw">const</span> <span class="hl-type">int64_t</span>* <span class="hl-fn">ray_rel_neighbors</span>(
     <span class="hl-type">ray_rel_t</span>* rel, <span class="hl-type">int64_t</span> node,
     <span class="hl-type">uint8_t</span> direction, <span class="hl-type">int64_t</span>* out_count);</code></pre>
       <p>Higher-level API that selects the forward or reverse CSR based on <code>direction</code> (0=forward, 1=reverse).</p>
 
-      <h2>Edge Properties</h2>
+      <h2 id="edge-properties">Edge Properties</h2>
       <p>Edge properties (weights, labels, timestamps) are stored in a standard <code>RAY_TABLE</code> attached to the CSR via <code>ray_rel_set_props</code>:</p>
       <pre><code><span class="hl-type">ray_t</span>* props = <span class="hl-fn">ray_table_new</span>(<span class="hl-num">1</span>);
 <span class="hl-comment">/* ... add a "weight" column with F64 values ... */</span>
 <span class="hl-fn">ray_rel_set_props</span>(rel, props);</code></pre>
       <p>The <code>rowmap</code> vector in each CSR maps edge positions back to property table rows, so graph algorithms like Dijkstra and A* can look up edge weights during traversal.</p>
 
-      <h2>Persistence</h2>
+      <h2 id="persistence">Persistence</h2>
       <p>Relationships can be saved to disk and loaded back, supporting both eager loading and memory-mapped I/O.</p>
 
-      <h3>Save</h3>
+      <h3 id="save">Save</h3>
       <pre><code><span class="hl-type">ray_err_t</span> <span class="hl-fn">ray_rel_save</span>(<span class="hl-type">ray_rel_t</span>* rel, <span class="hl-kw">const char</span>* dir);</code></pre>
       <p>Writes the forward and reverse CSR arrays (offsets, targets, rowmap) as column files in the given directory. Returns <code>RAY_OK</code> on success.</p>
 
-      <h3>Load (eager)</h3>
+      <h3 id="load-eager">Load (eager)</h3>
       <pre><code><span class="hl-type">ray_rel_t</span>* <span class="hl-fn">ray_rel_load</span>(<span class="hl-kw">const char</span>* dir);</code></pre>
       <p>Reads the column files into memory and reconstructs the <code>ray_rel_t</code>. The loaded vectors use the standard Rayforce allocator and participate in COW ref counting.</p>
 
-      <h3>Memory-mapped Load</h3>
+      <h3 id="memory-mapped-load">Memory-mapped Load</h3>
       <pre><code><span class="hl-type">ray_rel_t</span>* <span class="hl-fn">ray_rel_mmap</span>(<span class="hl-kw">const char</span>* dir);</code></pre>
       <p>Maps the column files directly into the address space without copying. The vectors are marked as <code>mmod=1</code> (file-mmap), making them read-only. This is ideal for large graphs that exceed available RAM &mdash; the OS page cache handles eviction transparently.</p>
 
@@ -379,11 +379,11 @@ edges = <span class="hl-fn">ray_table_add_col</span>(edges, dst_sym, dst);
         <strong>mmap vs. eager load.</strong> Use <code>ray_rel_mmap</code> for graphs that are larger than available memory or when startup time matters. Use <code>ray_rel_load</code> when you need to mutate the graph or want predictable query latency without page faults.
       </div>
 
-      <h3>Cleanup</h3>
+      <h3 id="cleanup">Cleanup</h3>
       <pre><code><span class="hl-kw">void</span> <span class="hl-fn">ray_rel_free</span>(<span class="hl-type">ray_rel_t</span>* rel);</code></pre>
       <p>Releases all vectors in both the forward and reverse CSR, then frees the <code>ray_rel_t</code> itself.</p>
 
-      <h2>Memory Layout</h2>
+      <h2 id="memory-layout">Memory Layout</h2>
       <p>Since CSR arrays are standard <code>ray_t</code> vectors, they benefit from the same infrastructure as all other Rayforce data:</p>
       <ul>
         <li><strong>Buddy allocator</strong> &mdash; vectors are allocated from thread-local heaps with order-based block sizing</li>
@@ -399,7 +399,7 @@ rowmap:   E * 8 bytes        +  32 bytes header  <span class="hl-comment">(if pr
 
 Total (without props): ~16E + 8N + 96 bytes</code></pre>
 
-      <h2>Integration with the DAG Pipeline</h2>
+      <h2 id="integration-with-the-dag-pipeline">Integration with the DAG Pipeline</h2>
       <p>Once a <code>ray_rel_t</code> is built, it feeds into the operation graph for query execution. Graph opcodes like <code>OP_EXPAND</code>, <code>OP_DIJKSTRA</code>, and <code>OP_PAGERANK</code> receive the relationship as a parameter and operate directly on the CSR arrays during morsel-driven execution.</p>
       <pre><code><span class="hl-comment">/* Build a DAG that expands neighbors of filtered nodes */</span>
 <span class="hl-type">ray_graph_t</span>* g = <span class="hl-fn">ray_graph_new</span>(nodes_table);

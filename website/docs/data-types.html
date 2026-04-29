@@ -338,7 +338,7 @@
       <h2 id="ray-t-header">The ray_t Header</h2>
       <p>Every Rayforce object begins with a 32-byte <code>ray_t</code> header. This is the fundamental building block &mdash; atoms, vectors, lists, tables, and functions all start with this structure.</p>
 
-      <h3>Byte Layout</h3>
+      <h3 id="byte-layout">Byte Layout</h3>
       <pre><code><span class="hl-comment">/*
  * ray_t — 32-byte block header (union)
  *
@@ -363,7 +363,7 @@
  * Byte  32+:    data[] — element storage (flexible array member)
  */</span></code></pre>
 
-      <h3>Attribute Flags</h3>
+      <h3 id="attribute-flags">Attribute Flags</h3>
       <p>The <code>attrs</code> byte carries bit flags that modify behavior:</p>
 
       <table>
@@ -422,7 +422,7 @@
 <span class="hl-comment">ray&gt;</span> (<span class="hl-fn">as</span> <span class="hl-sym">'DATE</span> <span class="hl-str">"2024.01.15"</span>)
 2024.01.15</code></pre>
 
-      <h3>Supported Casts</h3>
+      <h3 id="supported-casts">Supported Casts</h3>
       <table>
         <thead>
           <tr>
@@ -447,7 +447,7 @@
       <h2 id="temporal-types">Temporal Types</h2>
       <p>Rayforce has three temporal types with different precision and epoch conventions:</p>
 
-      <h3>RAY_DATE</h3>
+      <h3 id="ray-date">RAY_DATE</h3>
       <p>Stored as a 32-bit signed integer counting <strong>days since 2000.01.01</strong>. This gives a range of roughly 5.8 million years in either direction.</p>
       <pre><code><span class="hl-comment">ray&gt;</span> <span class="hl-num">2024.01.15</span>
 2024.01.15
@@ -456,7 +456,7 @@
 <span class="hl-comment">ray&gt;</span> (<span class="hl-fn">+</span> <span class="hl-num">2024.01.15</span> <span class="hl-num">30</span>)
 2024.02.14</code></pre>
 
-      <h3>RAY_TIME</h3>
+      <h3 id="ray-time">RAY_TIME</h3>
       <p>Stored as a 32-bit signed integer counting <strong>milliseconds since midnight</strong>. Range covers a full day (0 to 86,399,999 ms).</p>
       <pre><code><span class="hl-comment">ray&gt;</span> <span class="hl-num">09:30:00.000</span>
 09:30:00.000
@@ -465,7 +465,7 @@
 <span class="hl-comment">ray&gt;</span> (<span class="hl-fn">+</span> <span class="hl-num">09:30:00.000</span> <span class="hl-num">60000</span>)
 09:31:00.000</code></pre>
 
-      <h3>RAY_TIMESTAMP</h3>
+      <h3 id="ray-timestamp">RAY_TIMESTAMP</h3>
       <p>Stored as a 64-bit signed integer counting <strong>nanoseconds since 2000-01-01</strong> (the Rayforce epoch — matches the CSV loader.s parser and the runtime.s arithmetic lifts). Nanosecond precision covers roughly the range 1707 &ndash; 2292.</p>
       <pre><code><span class="hl-comment">ray&gt;</span> <span class="hl-num">2024.01.15D09:30:00.000000000</span>
 2024.01.15D09:30:00.000000000</code></pre>
@@ -473,7 +473,7 @@
       <h2 id="sym-type">Symbols (RAY_SYM)</h2>
       <p>Symbols are dictionary-encoded strings. Each unique string is interned once in a global symbol table and assigned an integer ID. Vectors of symbols store only these compact IDs, making them extremely space-efficient for categorical data.</p>
 
-      <h3>Adaptive Width</h3>
+      <h3 id="adaptive-width">Adaptive Width</h3>
       <p>Symbol vectors automatically choose the narrowest integer width needed:</p>
       <ul>
         <li><strong>8-bit</strong> &mdash; up to 255 unique symbols</li>
@@ -493,7 +493,7 @@
       <h2 id="str-type">Strings (RAY_STR)</h2>
       <p>Variable-length strings use a 16-byte <code>ray_str_t</code> element per row. Short strings (12 bytes or fewer) are stored inline. Longer strings are stored in a per-vector pool with a 4-byte prefix cached inline for fast comparison rejection.</p>
 
-      <h3>Inline vs Pool Storage</h3>
+      <h3 id="inline-vs-pool-storage">Inline vs Pool Storage</h3>
       <table>
         <thead>
           <tr>

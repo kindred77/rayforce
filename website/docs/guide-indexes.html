@@ -217,16 +217,16 @@
       <h2 id="choose">2. Choosing an accelerator kind</h2>
       <p>The four <code>.idx.*</code> kinds occupy the same per-column slot today &mdash; you pick one. <strong>Important framing:</strong> the four subsections below describe the query shape each kind is <em>structurally suited</em> to accelerate. None of them is consulted by query operators today &mdash; <code>filter</code> / <code>in</code> / <code>find</code> / <code>distinct</code> still scan linearly, and the SIP pass does not consume bloom. Treat the &ldquo;suited for&rdquo; phrasings as a guide to which kind to build now in preparation for the routing pass; the observable speedup arrives with that pass, not with the build.</p>
 
-      <h3>Equality probes &mdash; <code>.idx.hash</code></h3>
+      <h3 id="equality-probes-idxhash">Equality probes &mdash; <code>.idx.hash</code></h3>
       <p>Structurally suited to &ldquo;does this value exist in the column&rdquo; / &ldquo;which row(s) hold this value&rdquo; queries. Build cost O(n); space O(n). Handles duplicates via chained open-addressing &mdash; equally happy on a unique-key column or one with heavy repetition. Today: built and inspectable; not yet consulted by any query.</p>
 
-      <h3>Range queries / sorted access &mdash; <code>.idx.sort</code></h3>
+      <h3 id="range-queries-sorted-access-idxsort">Range queries / sorted access &mdash; <code>.idx.sort</code></h3>
       <p>Structurally suited to &ldquo;values between A and B&rdquo;, &ldquo;top-N&rdquo;, and ordered-output queries. Build cost O(n log n); space O(n) for the row-id permutation. The original column stays in original order &mdash; the sort lives in the permutation, not the values. Today: built and inspectable; not yet consulted by any query.</p>
 
-      <h3>Whole-column / segment pruning &mdash; <code>.idx.zone</code></h3>
+      <h3 id="whole-column-segment-pruning-idxzone">Whole-column / segment pruning &mdash; <code>.idx.zone</code></h3>
       <p>Structurally suited to filter predicates that may fall outside the column's value range. Cheap to build, cheap to keep &mdash; effectively three numbers (min, max, null count) per column. Conceptually a column-level analogue of the optimizer's separate <a href="architecture-pipeline.html">partition-pruning pass</a>; the two are not yet integrated. Today: built and inspectable; not yet consulted by any query.</p>
 
-      <h3>Membership rejection &mdash; <code>.idx.bloom</code></h3>
+      <h3 id="membership-rejection-idxbloom">Membership rejection &mdash; <code>.idx.bloom</code></h3>
       <p>Structurally suited to cheap &ldquo;definitely not in this set&rdquo; rejection, accepting some false positives that fall back to the real check. The 64-bit default is sized for small-to-mid columns; build cost O(n &middot; k) with k = 3 hashes. Once consumed by the SIP pass, it would serve as a sideways-information-passing bitmap into a join's probe side &mdash; that integration is not yet wired. Today: built and inspectable; not yet consulted by any query.</p>
 
       <!-- ============================================================ -->

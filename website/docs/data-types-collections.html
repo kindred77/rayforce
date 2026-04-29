@@ -301,7 +301,7 @@ sym  price  qty
 AAPL 150.0  100
 MSFT 380.0   50</code></pre>
 
-      <h3>Internal Structure</h3>
+      <h3 id="internal-structure">Internal Structure</h3>
       <p>A table is a <code>ray_t</code> with <code>type = RAY_TABLE</code> (98). Internally it contains:</p>
       <ul>
         <li><strong>Schema</strong> &mdash; an I64 vector of symbol IDs, one per column name</li>
@@ -319,7 +319,7 @@ MSFT 380.0   50</code></pre>
 <span class="hl-type">int64_t</span> nc = <span class="hl-fn">ray_table_ncols</span>(tbl);           <span class="hl-comment">// column count</span>
 <span class="hl-type">ray_t</span>* sch = <span class="hl-fn">ray_table_schema</span>(tbl);          <span class="hl-comment">// I64 vec of col name IDs</span></code></pre>
 
-      <h3>Column Name Management</h3>
+      <h3 id="column-name-management">Column Name Management</h3>
       <table>
         <thead>
           <tr>
@@ -373,7 +373,7 @@ MSFT 380.0   50</code></pre>
       <h2 id="selections">Selection Bitmaps (RAY_SEL)</h2>
       <p>A selection bitmap is a lazy filter representation used internally by the query optimizer and executor. Instead of materializing filtered rows into a new vector, Rayforce tracks which rows pass the filter as a compact bitmap.</p>
 
-      <h3>Segment Flags</h3>
+      <h3 id="segment-flags">Segment Flags</h3>
       <p>Selections are organized in segments matching the morsel size (1024 elements). Each segment carries a flag that enables fast short-circuiting:</p>
 
       <table>
@@ -407,7 +407,7 @@ MSFT 380.0   50</code></pre>
         <strong>Why lazy?</strong> Selection bitmaps avoid materializing intermediate results during predicate evaluation. The optimizer can push selections backward through <code>OP_EXPAND</code> chains (sideways information passing) and compose multiple predicates by ANDing bitmaps &mdash; all without copying data.
       </div>
 
-      <h3>Block Layout</h3>
+      <h3 id="block-layout">Block Layout</h3>
       <p>A <code>RAY_SEL</code> object has <code>type = 14</code> and a variable-size layout in its <code>data[]</code> region:</p>
       <ul>
         <li><strong>Segment flags</strong> &mdash; one <code>uint8_t</code> per morsel (NONE/ALL/MIX)</li>
@@ -426,7 +426,7 @@ MSFT 380.0   50</code></pre>
       <h2 id="parted-types">Partitioned Columns</h2>
       <p>Partitioned tables split data across multiple segments (typically by date). Each column in a partitioned table uses a <strong>parted type</strong> that wraps multiple memory-mapped vector segments into a single logical column.</p>
 
-      <h3>Type Encoding</h3>
+      <h3 id="type-encoding">Type Encoding</h3>
       <p>Parted types are encoded as <code>RAY_PARTED_BASE + base_type</code>. For example, a partitioned I64 column has type <code>32 + 5 = 37</code>. The base type is recovered with <code>RAY_PARTED_BASETYPE(t)</code>.</p>
 
       <table>
@@ -443,7 +443,7 @@ MSFT 380.0   50</code></pre>
         </tbody>
       </table>
 
-      <h3>MAPCOMMON</h3>
+      <h3 id="mapcommon">MAPCOMMON</h3>
       <p>When loading a date-partitioned table, Rayforce creates a virtual <code>RAY_MAPCOMMON</code> column. This column does not store actual data &mdash; it derives values from the partition directory names (e.g., <code>2024.01.15/</code>). Each row in a partition shares the same date value, so the MAPCOMMON column can represent millions of rows with zero per-row storage.</p>
 
       <pre><code><span class="hl-comment">// C API: load a date-partitioned table</span>

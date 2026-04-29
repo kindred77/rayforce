@@ -183,7 +183,7 @@
       <p class="page-subtitle">The three-phase execution model: lazy DAG construction, multi-pass optimization, and morsel-driven fused execution.</p>
 
       <!-- ====== OVERVIEW ====== -->
-      <h2>Three-Phase Pipeline</h2>
+      <h2 id="three-phase-pipeline">Three-Phase Pipeline</h2>
       <p>Every Rayforce query goes through three phases:</p>
       <ol>
         <li><strong>Build</strong> &mdash; Construct a lazy DAG of operations using the C API or Rayfall <code>select</code>/<code>update</code> builtins. No data is processed at this stage.</li>
@@ -205,9 +205,9 @@
 <span class="hl-fn">ray_graph_free</span>(g);</code></pre>
 
       <!-- ====== DAG NODES ====== -->
-      <h2>DAG Node Structure</h2>
+      <h2 id="dag-node-structure">DAG Node Structure</h2>
 
-      <h3>ray_op_t &mdash; Base Node (32 bytes)</h3>
+      <h3 id="ray-op-t-base-node-32-bytes">ray_op_t &mdash; Base Node (32 bytes)</h3>
       <p>Every operation in the DAG is represented by a 32-byte <code>ray_op_t</code> that fits in a single cache line:</p>
       <pre><code><span class="hl-kw">typedef struct</span> <span class="hl-type">ray_op</span> {
     <span class="hl-type">uint16_t</span>       opcode;     <span class="hl-comment">/* OP_ADD, OP_SCAN, OP_FILTER, etc.  */</span>
@@ -228,7 +228,7 @@
         <li><strong>est_rows</strong> &mdash; populated by the type inference pass and used by filter reorder and join planning.</li>
       </ul>
 
-      <h3>ray_op_ext_t &mdash; Extended Node</h3>
+      <h3 id="ray-op-ext-t-extended-node">ray_op_ext_t &mdash; Extended Node</h3>
       <p>Operations that need more state (GROUP, SORT, JOIN, WINDOW, PIVOT, and all graph ops) use an extended node that embeds <code>ray_op_t</code> as its first field, followed by a union of operation-specific data:</p>
       <ul>
         <li><strong>GROUP</strong>: key columns, aggregation ops and inputs, key/agg counts</li>
@@ -241,7 +241,7 @@
         <li><strong>Vector similarity</strong>: query vector, dimension, k, ef_search (HNSW)</li>
       </ul>
 
-      <h3>ray_graph_t &mdash; Operation Graph</h3>
+      <h3 id="ray-graph-t-operation-graph">ray_graph_t &mdash; Operation Graph</h3>
       <pre><code><span class="hl-kw">typedef struct</span> <span class="hl-type">ray_graph</span> {
     <span class="hl-type">ray_op_t</span>*       nodes;       <span class="hl-comment">/* contiguous array of op nodes       */</span>
     <span class="hl-type">uint32_t</span>       node_count;  <span class="hl-comment">/* number of nodes                   */</span>
@@ -256,34 +256,34 @@
 } <span class="hl-type">ray_graph_t</span>;</code></pre>
 
       <!-- ====== OPTIMIZER ====== -->
-      <h2>Optimizer Passes</h2>
+      <h2 id="optimizer-passes">Optimizer Passes</h2>
       <p>The optimizer runs multiple passes in a fixed order. Each pass walks the DAG and rewrites it in-place.</p>
 
-      <h3>1. Type Inference</h3>
+      <h3 id="1-type-inference">1. Type Inference</h3>
       <p>Bottom-up pass that propagates types from leaf nodes (SCAN, CONST) through the DAG. Determines the <code>out_type</code> of every node and populates <code>est_rows</code> estimates. This information drives all subsequent passes.</p>
 
-      <h3>2. Constant Folding</h3>
+      <h3 id="2-constant-folding">2. Constant Folding</h3>
       <p>Evaluates operations on constant inputs at optimization time. For example, <code>ray_add(const(2), const(3))</code> is replaced with <code>const(5)</code>. Applies to all element-wise arithmetic, comparisons, and logical operations.</p>
 
-      <h3>3. Sideways Information Passing (SIP)</h3>
+      <h3 id="3-sideways-information-passing-sip">3. Sideways Information Passing (SIP)</h3>
       <p>Propagates selection bitmaps backward through <code>OP_EXPAND</code> chains. When a filter follows a graph expansion, SIP creates a <code>RAY_SEL</code> bitmap on the source side that allows the executor to skip source nodes whose neighbors would all fail the downstream filter. See <a href="graph-algorithms.html#sip">SIP Optimization</a> for details.</p>
 
-      <h3>4. Factorize</h3>
+      <h3 id="4-factorize">4. Factorize</h3>
       <p>Marks multi-hop graph expansions for factorized execution. Sets the <code>factorized</code> flag on EXPAND/VAR_EXPAND nodes, enabling output as <code>ray_fvec_t</code> / <code>ray_ftable_t</code> instead of flat vectors. Avoids cross-product materialization in multi-join graph patterns.</p>
 
-      <h3>5. Predicate Pushdown</h3>
+      <h3 id="5-predicate-pushdown">5. Predicate Pushdown</h3>
       <p>Pushes filter predicates as close to the data source as possible. A filter above a join is split into components that can be evaluated on individual join inputs, reducing the number of rows entering the join. Filters above scans are pushed directly onto the scan, eliminating rows before any computation.</p>
 
-      <h3>6. Filter Reorder</h3>
+      <h3 id="6-filter-reorder">6. Filter Reorder</h3>
       <p>When multiple filter predicates are chained, reorders them by estimated selectivity (most selective first). Uses the <code>est_rows</code> from type inference to estimate selectivity. More selective filters run first, reducing the number of rows processed by subsequent filters.</p>
 
-      <h3>7. Projection Pushdown</h3>
+      <h3 id="7-projection-pushdown">7. Projection Pushdown</h3>
       <p>Identifies which columns are actually needed by the query and pushes projection below joins and group-by operations. Columns that are never referenced after a certain point are dropped early, reducing memory bandwidth and intermediate result sizes.</p>
 
-      <h3>8. Partition Pruning</h3>
+      <h3 id="8-partition-pruning">8. Partition Pruning</h3>
       <p>For partitioned tables, analyzes filter predicates to determine which partitions can be skipped entirely. A predicate like <code>date &gt; '2024-01-01'</code> on a date-partitioned table eliminates all partition directories before that date without scanning them. The pruning pass produces a <code>seg_mask</code> bitmap that the executor uses during <a href="architecture-offloading.html">block offloading</a> to skip pruned segments entirely.</p>
 
-      <h3>9. Fusion</h3>
+      <h3 id="9-fusion">9. Fusion</h3>
       <p>The most impactful optimization. Merges chains of element-wise operations (arithmetic, comparisons, logical ops, string ops) into a single fused pass. A chain like <code>SCAN &rarr; ADD &rarr; MUL &rarr; GT &rarr; FILTER</code> becomes a single bytecode program that processes each morsel in one pass without materializing intermediate vectors.</p>
 
       <div class="info-box">
@@ -292,13 +292,13 @@
 
       <p>Fused nodes are marked with <code>OP_FLAG_FUSED</code>. The lead node (the last in the chain) consumes all fused predecessors and executes them as inlined bytecode.</p>
 
-      <h3>10. Dead Code Elimination (DCE)</h3>
+      <h3 id="10-dead-code-elimination-dce">10. Dead Code Elimination (DCE)</h3>
       <p>Removes nodes marked <code>OP_FLAG_DEAD</code> or <code>OP_FLAG_FUSED</code> (absorbed by fusion) that have no live consumers. Cleans up the DAG after all other passes.</p>
 
       <!-- ====== EXECUTION ====== -->
-      <h2>Morsel-Driven Execution</h2>
+      <h2 id="morsel-driven-execution">Morsel-Driven Execution</h2>
 
-      <h3>Morsel Processing</h3>
+      <h3 id="morsel-processing">Morsel Processing</h3>
       <p>All vector processing in Rayforce is chunked into <strong>morsels</strong> of 1024 elements (<code>RAY_MORSEL_ELEMS</code>). This constant is tuned to fit in L1 cache across all supported architectures.</p>
 
       <pre><code><span class="hl-kw">typedef struct</span> {
@@ -317,10 +317,10 @@
     <span class="hl-comment">/* process m.morsel_ptr[0..m.morsel_len) */</span>
 }</code></pre>
 
-      <h3>Computed-Goto Dispatch</h3>
+      <h3 id="computed-goto-dispatch">Computed-Goto Dispatch</h3>
       <p>Fused operation chains compile to a bytecode program that the executor runs using computed-goto dispatch (GCC/Clang <code>__attribute__((computed_goto))</code>). Each opcode is a label in a jump table, eliminating branch prediction overhead from a traditional switch/case loop. The executor processes one morsel at a time through the entire fused chain before advancing.</p>
 
-      <h3>Register Slots</h3>
+      <h3 id="register-slots">Register Slots</h3>
       <p>During execution, intermediate morsel results are stored in register slots on the executor's pipeline (<code>ray_pipe_t</code>). Each fused node reads from and writes to specific register slots, avoiding heap allocation for intermediate results within a morsel.</p>
 
       <pre><code><span class="hl-kw">typedef struct</span> <span class="hl-type">ray_pipe</span> {
@@ -332,7 +332,7 @@
 } <span class="hl-type">ray_pipe_t</span>;</code></pre>
 
       <!-- ====== SELECTION ====== -->
-      <h2>Selection Bitmaps</h2>
+      <h2 id="selection-bitmaps">Selection Bitmaps</h2>
       <p>Filters in Rayforce produce <code>RAY_SEL</code> bitmaps instead of materializing filtered vectors. A selection bitmap is a compact bit-vector with per-morsel metadata that enables three-tier processing:</p>
 
       <table>
@@ -354,12 +354,12 @@
       <p>This three-tier scheme means that fully-passing or fully-failing morsels (which are common in practice) incur no per-row overhead. Only the <code>MIX</code> segments require bitmap checking.</p>
 
       <!-- ====== PARALLELISM ====== -->
-      <h2>Parallelism</h2>
+      <h2 id="parallelism">Parallelism</h2>
 
-      <h3>Thread Pool</h3>
+      <h3 id="thread-pool">Thread Pool</h3>
       <p>Rayforce uses a global thread pool (<code>ray_pool_t</code>) for parallel execution. Queries with more than <code>RAY_PARALLEL_THRESHOLD</code> (64 * 1024 = 65,536) elements are dispatched across worker threads. Each thread processes <code>RAY_DISPATCH_MORSELS</code> (8) morsels at a time to amortize scheduling overhead.</p>
 
-      <h3>Radix-Partitioned Hash Join</h3>
+      <h3 id="radix-partitioned-hash-join">Radix-Partitioned Hash Join</h3>
       <p>Hash joins use adaptive radix partitioning to ensure each partition's hash table fits in L2 cache. The number of radix bits adapts between <code>RAY_JOIN_MIN_RADIX</code> (2, producing 4 partitions) and <code>RAY_JOIN_MAX_RADIX</code> (14, producing 16K partitions) based on input size, targeting a per-partition working set of <code>RAY_JOIN_L2_TARGET</code> (256 KB).</p>
 
       <p>The join pipeline:</p>
@@ -369,11 +369,11 @@
         <li><strong>Probe</strong> &mdash; Probe partitions in parallel across worker threads</li>
       </ol>
 
-      <h3>Per-Thread Heaps</h3>
+      <h3 id="per-thread-heaps">Per-Thread Heaps</h3>
       <p>Each worker thread has its own heap (<code>heap_id</code> in the pool header). Vectors allocated during parallel execution are tagged with their owning heap via the pool they reside in. Cross-heap frees are deferred to a lock-free LIFO and reclaimed when the owning heap flushes. See <a href="architecture-memory.html">Memory Model</a> for details.</p>
 
       <!-- ====== FULL EXAMPLE ====== -->
-      <h2>Full Pipeline Example</h2>
+      <h2 id="full-pipeline-example">Full Pipeline Example</h2>
       <p>A complete example showing all three phases for a filtered aggregation query:</p>
       <pre><code><span class="hl-comment">/* Table: trades with columns price (F64), qty (I64), sym (SYM) */</span>
 <span class="hl-type">ray_graph_t</span>* g = <span class="hl-fn">ray_graph_new</span>(trades);

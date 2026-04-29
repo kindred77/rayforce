@@ -186,56 +186,56 @@
       <h2 id="atoms">Atoms</h2>
       <p>Atoms are scalar values. Rayfall supports a wide range of types, each with a distinct literal syntax.</p>
 
-      <h3>Integers</h3>
+      <h3 id="integers">Integers</h3>
       <p>64-bit signed integers by default. Suffixed variants available for narrower types.</p>
       <pre><code><span class="hl-num">42</span>          <span class="hl-comment">; i64 (default)</span>
 <span class="hl-num">-17</span>         <span class="hl-comment">; negative</span>
 <span class="hl-num">0</span>           <span class="hl-comment">; zero</span>
 <span class="hl-num">1000000</span>     <span class="hl-comment">; no separators needed</span></code></pre>
 
-      <h3>Floats</h3>
+      <h3 id="floats">Floats</h3>
       <p>64-bit IEEE 754 double-precision floating point.</p>
       <pre><code><span class="hl-num">3.14</span>        <span class="hl-comment">; standard float</span>
 <span class="hl-num">-0.5</span>        <span class="hl-comment">; negative float</span>
 <span class="hl-num">1e6</span>         <span class="hl-comment">; scientific notation</span>
 <span class="hl-num">2.5e-3</span>      <span class="hl-comment">; small value</span></code></pre>
 
-      <h3>Booleans</h3>
+      <h3 id="booleans">Booleans</h3>
       <pre><code><span class="hl-bool">true</span>        <span class="hl-comment">; boolean true (1b)</span>
 <span class="hl-bool">false</span>       <span class="hl-comment">; boolean false (0b)</span></code></pre>
 
-      <h3>Symbols</h3>
+      <h3 id="symbols">Symbols</h3>
       <p>Symbols are interned identifiers used for column names, dictionary keys, and categorical data. Prefix with a single quote to create a literal symbol.</p>
       <pre><code><span class="hl-sym">'AAPL</span>       <span class="hl-comment">; symbol atom</span>
 <span class="hl-sym">'price</span>      <span class="hl-comment">; used as column reference</span>
 <span class="hl-sym">'hello</span>      <span class="hl-comment">; any alphanumeric + hyphens</span></code></pre>
 
-      <h3>Strings</h3>
+      <h3 id="strings">Strings</h3>
       <p>Double-quoted character sequences. Two internal representations: short strings (up to 12 bytes) stored inline, longer strings in a per-vector pool.</p>
       <pre><code><span class="hl-str">"hello"</span>             <span class="hl-comment">; inline short string</span>
 <span class="hl-str">"hello world!"</span>      <span class="hl-comment">; still inline (12 bytes)</span>
 <span class="hl-str">"a longer string"</span>   <span class="hl-comment">; pool-allocated</span></code></pre>
 
-      <h3>Dates</h3>
+      <h3 id="dates">Dates</h3>
       <p>Date literals use dot-separated year.month.day format. Stored as days since 2000-01-01 (i32).</p>
       <pre><code><span class="hl-num">2024.01.15</span>  <span class="hl-comment">; January 15, 2024</span>
 <span class="hl-num">2023.12.31</span>  <span class="hl-comment">; December 31, 2023</span></code></pre>
 
-      <h3>Times</h3>
+      <h3 id="times">Times</h3>
       <p>Time-of-day literals in HH:MM:SS.mmm format. Stored as milliseconds since midnight (i32).</p>
       <pre><code><span class="hl-num">09:30:00.000</span>  <span class="hl-comment">; 9:30 AM</span>
 <span class="hl-num">14:15:30.500</span>  <span class="hl-comment">; 2:15:30.5 PM</span></code></pre>
 
-      <h3>Timestamps</h3>
+      <h3 id="timestamps">Timestamps</h3>
       <p>Full date+time with nanosecond precision. Stored as nanoseconds since 2000-01-01 (i64). Literal form uses <code>D</code> as the date/time separator and requires a fractional-seconds suffix:</p>
       <pre><code><span class="hl-num">2024.01.15D09:30:00.000</span>            <span class="hl-comment">; date + time (ms)</span>
 <span class="hl-num">2024.01.15D09:30:00.000000000</span>      <span class="hl-comment">; date + time (ns)</span></code></pre>
 
-      <h3>GUIDs</h3>
+      <h3 id="guids">GUIDs</h3>
       <p>128-bit globally unique identifiers.</p>
       <pre><code>(<span class="hl-fn">guid</span> <span class="hl-num">0</span>)   <span class="hl-comment">; generate a new GUID</span></code></pre>
 
-      <h3>Null Values</h3>
+      <h3 id="null-values">Null Values</h3>
       <p>Nulls are tracked via a per-element bitmap, not sentinel values. Typed null literals create atoms with the null bit set:</p>
       <pre><code><span class="hl-num">0Nl</span>   <span class="hl-comment">; i64 null</span>
 <span class="hl-num">0Ni</span>   <span class="hl-comment">; i32 null</span>
@@ -257,7 +257,7 @@
 
       <p>Vector operations are morsel-driven, processing 1024 elements at a time for cache efficiency.</p>
 
-      <h3>Vector Arithmetic</h3>
+      <h3 id="vector-arithmetic">Vector Arithmetic</h3>
       <p>All arithmetic operators auto-map over vectors (marked <code>FN_ATOMIC</code>):</p>
       <pre><code>(<span class="hl-fn">+</span> [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span>] [<span class="hl-num">10</span> <span class="hl-num">20</span> <span class="hl-num">30</span>])   <span class="hl-comment">; [11 22 33]</span>
 (<span class="hl-fn">*</span> [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span>] <span class="hl-num">10</span>)            <span class="hl-comment">; [10 20 30] — scalar broadcast</span></code></pre>
@@ -300,7 +300,7 @@
 (<span class="hl-fn">sum</span> [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span>])     <span class="hl-comment">; 6</span>
 (<span class="hl-fn">count</span> [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span>])   <span class="hl-comment">; 3</span></code></pre>
 
-      <h3>Function Types</h3>
+      <h3 id="function-types">Function Types</h3>
       <p>Built-in functions fall into three arity categories:</p>
       <table>
         <thead>
@@ -313,7 +313,7 @@
         </tbody>
       </table>
 
-      <h3>Function Flags</h3>
+      <h3 id="function-flags">Function Flags</h3>
       <table>
         <thead>
           <tr><th>Flag</th><th>Behavior</th></tr>
@@ -340,7 +340,7 @@
       <!-- ── Control Flow ── -->
       <h2 id="control-flow">Control Flow</h2>
 
-      <h3>Conditional: <code>if</code></h3>
+      <h3 id="conditional-if">Conditional: <code>if</code></h3>
       <p>Evaluates the condition and returns the true or false branch. Supports <code>if/then/else</code> chaining:</p>
       <pre><code>(<span class="hl-kw">if</span> (<span class="hl-fn">&gt;</span> x <span class="hl-num">0</span>) <span class="hl-str">"positive"</span> <span class="hl-str">"non-positive"</span>)
 
@@ -349,14 +349,14 @@
     (<span class="hl-fn">&gt;</span> x <span class="hl-num">50</span>)  <span class="hl-str">"mid"</span>
               <span class="hl-str">"low"</span>)</code></pre>
 
-      <h3>Sequential Execution: <code>do</code></h3>
+      <h3 id="sequential-execution-do">Sequential Execution: <code>do</code></h3>
       <p>Evaluates multiple expressions in order, returning the last result:</p>
       <pre><code>(<span class="hl-kw">do</span>
   (<span class="hl-kw">set</span> x <span class="hl-num">10</span>)
   (<span class="hl-kw">set</span> y <span class="hl-num">20</span>)
   (<span class="hl-fn">+</span> x y))    <span class="hl-comment">; 30</span></code></pre>
 
-      <h3>Variable Binding: <code>set</code> and <code>let</code></h3>
+      <h3 id="variable-binding-set-and-let">Variable Binding: <code>set</code> and <code>let</code></h3>
       <pre><code>(<span class="hl-kw">set</span> x <span class="hl-num">42</span>)        <span class="hl-comment">; global binding</span>
 (<span class="hl-kw">let</span> y (<span class="hl-fn">+</span> x <span class="hl-num">1</span>))   <span class="hl-comment">; local binding</span></code></pre>
 
@@ -407,7 +407,7 @@ ds.doy           <span class="hl-comment">; [1 167 366]</span>
 ((<span class="hl-kw">fn</span> [.sys.gc] .sys.gc) <span class="hl-num">7</span>)  <span class="hl-comment">; error: reserve (lambda parameter name)</span>
 (<span class="hl-fn">del</span> .sys.gc)          <span class="hl-comment">; error: reserve: cannot delete reserved binding</span></code></pre>
 
-      <h3>Error Handling: <code>try</code> / <code>raise</code></h3>
+      <h3 id="error-handling-try-raise">Error Handling: <code>try</code> / <code>raise</code></h3>
       <pre><code>(<span class="hl-kw">try</span>
   (<span class="hl-fn">raise</span> <span class="hl-str">"oops"</span>)     <span class="hl-comment">; throws an error</span>
   (<span class="hl-kw">fn</span> [e] <span class="hl-str">"caught"</span>)) <span class="hl-comment">; handler receives error → "caught"</span>
@@ -436,7 +436,7 @@ ds.doy           <span class="hl-comment">; [1 167 366]</span>
       <h2 id="select-update">Select &amp; Update</h2>
       <p>The <code>select</code> and <code>update</code> builtins bridge to the Rayforce DAG executor. They accept a dictionary of options:</p>
 
-      <h3>select</h3>
+      <h3 id="select">select</h3>
       <pre><code><span class="hl-comment">; Basic filter</span>
 (<span class="hl-kw">select</span> {<span class="hl-sym">from:</span> trades  <span class="hl-sym">where:</span> (<span class="hl-fn">&gt;</span> price <span class="hl-num">100</span>)})
 
@@ -450,12 +450,12 @@ ds.doy           <span class="hl-comment">; [1 167 366]</span>
          <span class="hl-sym">cols:</span> {<span class="hl-sym">avg_price:</span> (<span class="hl-fn">avg</span> price)
                 <span class="hl-sym">total_size:</span> (<span class="hl-fn">sum</span> size)}})</code></pre>
 
-      <h3>update</h3>
+      <h3 id="update">update</h3>
       <pre><code><span class="hl-comment">; Add a computed column</span>
 (<span class="hl-kw">update</span> {<span class="hl-sym">from:</span> trades
           <span class="hl-sym">cols:</span> {<span class="hl-sym">notional:</span> (<span class="hl-fn">*</span> price size)}})</code></pre>
 
-      <h3>insert / upsert</h3>
+      <h3 id="insert-upsert">insert / upsert</h3>
       <pre><code><span class="hl-comment">; Insert new rows</span>
 (<span class="hl-kw">insert</span> {<span class="hl-sym">into:</span> trades
           <span class="hl-sym">values:</span> (<span class="hl-fn">table</span> [sym price size]
@@ -465,7 +465,7 @@ ds.doy           <span class="hl-comment">; [1 167 366]</span>
       <h2 id="c-api">C API</h2>
       <p>Rayforce exposes a single public header: <code>include/rayforce.h</code>. The core abstraction is <code>ray_t</code> &mdash; a 32-byte block header. Every object (atom, vector, list, table) is a <code>ray_t</code> with data following at byte 32.</p>
 
-      <h3>Key Types</h3>
+      <h3 id="key-types">Key Types</h3>
       <table>
         <thead>
           <tr><th>Type</th><th>Description</th></tr>
@@ -481,14 +481,14 @@ ds.doy           <span class="hl-comment">; [1 167 366]</span>
         </tbody>
       </table>
 
-      <h3>Error Handling</h3>
+      <h3 id="error-handling">Error Handling</h3>
       <pre><code><span class="hl-type">ray_t</span>* result = ray_eval_str(<span class="hl-str">"(+ 1 2)"</span>);
 <span class="hl-kw">if</span> (RAY_IS_ERR(result)) {
     <span class="hl-comment">// handle error</span>
 }
 <span class="hl-comment">// RAY_ERR_PTR() to create error pointers</span></code></pre>
 
-      <h3>Memory Management</h3>
+      <h3 id="memory-management">Memory Management</h3>
       <p>Never use <code>malloc</code>/<code>free</code>. Use the Rayforce allocator:</p>
       <pre><code><span class="hl-type">ray_t</span>* obj = ray_alloc(size);    <span class="hl-comment">// general allocation</span>
 ray_release(obj);                 <span class="hl-comment">// decrement refcount, free if zero</span>
@@ -506,7 +506,7 @@ ray_retain(obj);                  <span class="hl-comment">// increment refcount
 <span class="hl-comment">// 2. Execute (optimizer runs automatically)</span>
 <span class="hl-type">ray_t</span>* result = ray_execute(g, projected);</code></pre>
 
-      <h3>Optimizer Passes</h3>
+      <h3 id="optimizer-passes">Optimizer Passes</h3>
       <ol>
         <li><strong>Type inference</strong> &mdash; propagate types through the DAG</li>
         <li><strong>Constant folding</strong> &mdash; evaluate compile-time-known expressions</li>

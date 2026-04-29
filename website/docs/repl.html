@@ -182,7 +182,7 @@
       <h1>REPL Reference</h1>
       <p class="page-subtitle">Commands, profiling, keyboard shortcuts, and script mode for the Rayfall REPL.</p>
 
-      <h2>Starting the REPL</h2>
+      <h2 id="starting-the-repl">Starting the REPL</h2>
       <p>The <code>rayforce</code> binary operates in three modes depending on how it is invoked:</p>
       <pre><code><span class="hl-comment"># Interactive mode &mdash; full line editing, highlighting, completion</span>
 ./rayforce
@@ -194,7 +194,7 @@
 echo '(+ 1 2)' | ./rayforce</code></pre>
       <p>Interactive mode is detected automatically when stdin is a terminal. On startup the REPL prints a banner with the version, CPU, memory, and core count, then shows the <code>&#x2023;</code> prompt.</p>
 
-      <h2>REPL Commands</h2>
+      <h2 id="repl-commands">REPL Commands</h2>
       <p>All commands start with <code>:</code> and are handled before expression evaluation.</p>
       <table>
         <thead>
@@ -214,7 +214,7 @@ echo '(+ 1 2)' | ./rayforce</code></pre>
       </table>
       <p>You can also exit with <code>\\</code>, <code>exit</code>, or <strong>Ctrl-D</strong> on an empty line.</p>
 
-      <h2>Profiling with :t</h2>
+      <h2 id="profiling-with-t">Profiling with :t</h2>
       <p>Toggle profiling with <code>:t</code>. When active, every evaluation emits a nested span tree showing where time was spent:</p>
       <pre><code>&#x2023; :t
 . Timeit is on.
@@ -231,7 +231,7 @@ echo '(+ 1 2)' | ./rayforce</code></pre>
       <pre><code>(<span class="hl-fn">timeit</span> (+ <span class="hl-num">1</span> <span class="hl-num">2</span>))
 <span class="hl-comment">;; =&gt; 0.003</span></code></pre>
 
-      <h2>Multi-Line Input</h2>
+      <h2 id="multi-line-input">Multi-Line Input</h2>
       <p>The REPL auto-detects incomplete expressions by tracking unmatched brackets <code>( [ {</code>. When the current input has unmatched openers, pressing Enter starts a continuation line instead of evaluating:</p>
       <pre><code><span class="hl-comment">&#x2023;</span> (set double
     (fn [x]
@@ -239,7 +239,7 @@ echo '(+ 1 2)' | ./rayforce</code></pre>
 <span class="hl-comment">; evaluated after the closing ) balances all openers</span></code></pre>
       <p>The parser is aware of string literals and <code>;</code> comments, so brackets inside strings or comments do not affect the count.</p>
 
-      <h2>Keyboard Shortcuts</h2>
+      <h2 id="keyboard-shortcuts">Keyboard Shortcuts</h2>
       <table>
         <thead>
           <tr>
@@ -266,7 +266,7 @@ echo '(+ 1 2)' | ./rayforce</code></pre>
         </tbody>
       </table>
 
-      <h2>Syntax Highlighting</h2>
+      <h2 id="syntax-highlighting">Syntax Highlighting</h2>
       <p>The REPL highlights input in real time as you type:</p>
       <ul>
         <li><strong>Keywords</strong> and special forms (<code>set</code>, <code>fn</code>, <code>select</code>, <code>if</code>, ...)</li>
@@ -277,7 +277,7 @@ echo '(+ 1 2)' | ./rayforce</code></pre>
       </ul>
       <p>Highlighting is stripped from the final submitted text so it does not interfere with parsing.</p>
 
-      <h2>Autocomplete</h2>
+      <h2 id="autocomplete">Autocomplete</h2>
       <p>Press <strong>Tab</strong> to complete the current token. Candidates are drawn from four sources:</p>
       <ul>
         <li>Built-in function names</li>
@@ -287,7 +287,7 @@ echo '(+ 1 2)' | ./rayforce</code></pre>
       </ul>
       <p>Press <strong>Tab</strong> repeatedly to cycle through matches. Press <strong>Esc</strong> to cancel.</p>
 
-      <h2>Script Mode</h2>
+      <h2 id="script-mode">Script Mode</h2>
       <p>Pass a <code>.rfl</code> file path to run it non-interactively:</p>
       <pre><code>./rayforce analysis.rfl</code></pre>
       <p>The entire file is read into memory and evaluated as a single Rayfall program via <code>ray_eval_str()</code>. The last expression's value is printed to stdout. If evaluation produces an error, it is printed to stderr and the process exits with code <strong>1</strong>; otherwise the exit code is <strong>0</strong>.</p>

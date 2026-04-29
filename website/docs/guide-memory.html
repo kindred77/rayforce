@@ -235,7 +235,7 @@
         </tbody>
       </table>
 
-      <h3>Basic Usage</h3>
+      <h3 id="basic-usage">Basic Usage</h3>
       <pre><code><span class="hl-comment">;; Check current memory stats</span>
 (<span class="hl-fn">.sys.mem</span>)</code></pre>
       <pre><code>alloc-count     | 14523
@@ -244,7 +244,7 @@ peak-bytes      | 5242880
 slab-hits       | 9870
 sys-current     | 8388608</code></pre>
 
-      <h3>Checking Memory Before and After an Operation</h3>
+      <h3 id="checking-memory-before-and-after-an-operation">Checking Memory Before and After an Operation</h3>
       <pre><code><span class="hl-comment">;; Snapshot before</span>
 (<span class="hl-kw">set</span> before (<span class="hl-fn">.sys.mem</span>))
 
@@ -306,7 +306,7 @@ total-mem | 16777216000</code></pre>
       <h2 id="progress">5. Progress Monitoring</h2>
       <p>Long-running queries display a progress bar automatically in the REPL. The bar appears after approximately 2 seconds of execution and shows real-time feedback.</p>
 
-      <h3>Progress Bar Format</h3>
+      <h3 id="progress-bar-format">Progress Bar Format</h3>
       <pre><code>[████████░░░░░░░░]  52% · group: hash · 3.2s · 1.2G/12.8G</code></pre>
       <p>The bar displays:</p>
       <ul>
@@ -316,7 +316,7 @@ total-mem | 16777216000</code></pre>
         <li><strong>Memory usage</strong> &mdash; Current heap usage vs. the memory budget</li>
       </ul>
 
-      <h3>Example Session</h3>
+      <h3 id="example-session">Example Session</h3>
       <pre><code><span class="hl-comment">;; This query processes 50 million rows -- progress bar appears automatically</span>
 (<span class="hl-fn">select</span> {<span class="hl-sym">from</span>: trades
          <span class="hl-sym">by</span>: {<span class="hl-sym">sym</span>: sym}
@@ -357,7 +357,7 @@ total-mem | 16777216000</code></pre>
       <h2 id="repl-timeit">7. Profiling with <code>:t</code></h2>
       <p>The REPL command <code>:t</code> (or <code>:timeit</code>) toggles profiling mode. When active, every expression displays a detailed timing span tree showing where time was spent.</p>
 
-      <h3>Example Session</h3>
+      <h3 id="example-session-2">Example Session</h3>
       <pre><code><span class="hl-comment">;; Toggle profiling on</span>
 :t</code></pre>
       <pre><code>. Timeit is on.</code></pre>
@@ -374,7 +374,7 @@ total-mem | 16777216000</code></pre>
       <h2 id="memory-budget">8. Memory Budget and Pressure</h2>
       <p>Rayforce auto-detects the memory budget at startup as 80% of physical RAM. This budget governs when the runtime begins applying back-pressure to avoid exhausting system memory.</p>
 
-      <h3>Checking the Budget</h3>
+      <h3 id="checking-the-budget">Checking the Budget</h3>
       <pre><code><span class="hl-comment">;; The total-mem field shows total physical RAM</span>
 (<span class="hl-fn">.sys.info</span>)</code></pre>
       <pre><code>cores     | 16
@@ -382,7 +382,7 @@ page-size | 4096
 total-mem | 16777216000</code></pre>
       <p>On this machine with 16 GB of RAM, the memory budget (80%) is approximately 12.5 GB.</p>
 
-      <h3>How Pressure Works</h3>
+      <h3 id="how-pressure-works">How Pressure Works</h3>
       <p>When heap usage exceeds the memory budget:</p>
       <ul>
         <li>The executor may switch to streaming/morsel-at-a-time processing for large intermediate results</li>
@@ -400,7 +400,7 @@ total-mem | 16777216000</code></pre>
       <!-- 9. Practical Patterns -->
       <h2 id="practical-patterns">9. Practical Patterns</h2>
 
-      <h3>Pattern 1: Monitor Memory During CSV Loading</h3>
+      <h3 id="pattern-1-monitor-memory-during-csv-loading">Pattern 1: Monitor Memory During CSV Loading</h3>
       <pre><code><span class="hl-comment">;; Check baseline</span>
 (<span class="hl-kw">set</span> m0 (<span class="hl-fn">.sys.mem</span>))
 
@@ -414,7 +414,7 @@ total-mem | 16777216000</code></pre>
   (m1 <span class="hl-sym">peak-bytes</span>)))</code></pre>
       <pre><code>Loaded: 4194304000 bytes, peak: 4831838208 bytes</code></pre>
 
-      <h3>Pattern 2: GC Between Independent Queries</h3>
+      <h3 id="pattern-2-gc-between-independent-queries">Pattern 2: GC Between Independent Queries</h3>
       <pre><code><span class="hl-comment">;; First analysis pass</span>
 (<span class="hl-kw">set</span> result1 (<span class="hl-fn">select</span> {<span class="hl-sym">from</span>: trades
                        <span class="hl-sym">by</span>: {<span class="hl-sym">date</span>: date}
@@ -430,7 +430,7 @@ total-mem | 16777216000</code></pre>
                        <span class="hl-sym">by</span>: {<span class="hl-sym">sym</span>: sym}
                        <span class="hl-sym">cols</span>: {<span class="hl-sym">vwap</span>: (<span class="hl-fn">/</span> (<span class="hl-fn">sum</span> (<span class="hl-fn">*</span> price qty)) (<span class="hl-fn">sum</span> qty))}}))</code></pre>
 
-      <h3>Pattern 3: Profile a Slow Query</h3>
+      <h3 id="pattern-3-profile-a-slow-query">Pattern 3: Profile a Slow Query</h3>
       <pre><code><span class="hl-comment">;; Enable REPL profiling</span>
 :timeit
 
@@ -447,7 +447,7 @@ total-mem | 16777216000</code></pre>
       <pre><code><span class="hl-comment">;; The group-by at 204ms is the bottleneck, not the filter (42ms) or sort (&lt;1ms)</span>
 :timeit</code></pre>
 
-      <h3>Pattern 4: Check Peak Memory After a Join</h3>
+      <h3 id="pattern-4-check-peak-memory-after-a-join">Pattern 4: Check Peak Memory After a Join</h3>
       <pre><code><span class="hl-comment">;; Reset peak tracking with .sys.gc</span>
 (<span class="hl-fn">.sys.gc</span>)
 (<span class="hl-kw">set</span> before-peak ((.sys.mem 0) <span class="hl-sym">peak-bytes</span>))

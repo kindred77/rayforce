@@ -228,7 +228,7 @@
       <h2 id="querying-facts">3. Querying Facts</h2>
       <p>Use <code>query</code> with <code>find</code>/<code>where</code> clauses to pattern-match over the triple store. Variables start with <code>?</code>. The <code>eav</code> predicate matches entity-attribute-value triples:</p>
 
-      <h3>Find all employees</h3>
+      <h3 id="find-all-employees">Find all employees</h3>
       <pre><code>(<span class="hl-fn">query</span> db (<span class="hl-kw">find</span> <span class="hl-sym">?e</span> <span class="hl-sym">?name</span>) (<span class="hl-kw">where</span> (<span class="hl-fn">eav</span> <span class="hl-sym">?e</span> <span class="hl-sym">'name</span> <span class="hl-sym">?name</span>)))</code></pre>
       <pre><code>┌─────┬───────────────────────────────┐
 │ ?e  │             ?name             │
@@ -242,7 +242,7 @@
 └─────────────────────────────────────┘</code></pre>
       <p>The query finds every entity <code>?e</code> that has a <code>name</code> attribute. The <code>?name</code> column contains the intern IDs for the symbol values.</p>
 
-      <h3>Find employees in Engineering</h3>
+      <h3 id="find-employees-in-engineering">Find employees in Engineering</h3>
       <p>Add a second pattern to filter by department. Constants (like <code>'Engineering</code>) constrain the match:</p>
       <pre><code>(<span class="hl-fn">query</span> db
   (<span class="hl-kw">find</span> <span class="hl-sym">?e</span> <span class="hl-sym">?name</span>)
@@ -260,7 +260,7 @@
 └─────────────────────────────────────┘</code></pre>
       <p>Only Alice (100) and Carol (102) are returned &mdash; Bob is in Sales.</p>
 
-      <h3>Find who reports to whom</h3>
+      <h3 id="find-who-reports-to-whom">Find who reports to whom</h3>
       <p>Query the <code>boss</code> attribute to find reporting relationships. Since <code>boss</code> stores integer entity IDs, the values are directly readable:</p>
       <pre><code>(<span class="hl-fn">query</span> db
   (<span class="hl-kw">find</span> <span class="hl-sym">?e</span> <span class="hl-sym">?boss</span>)

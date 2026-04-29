@@ -185,7 +185,7 @@
       <h2 id="col-files">Columnar Files</h2>
       <p>Rayforce's native binary format stores a single vector per file. Each file contains a 32-byte header followed by the raw element data and an optional null bitmap. The format is designed for direct memory mapping &mdash; no deserialization needed.</p>
 
-      <h3>File Structure</h3>
+      <h3 id="file-structure">File Structure</h3>
       <pre><code><span class="hl-comment">/*
  * Column file layout:
  *
@@ -195,7 +195,7 @@
  *                  — (len + 7) / 8 bytes
  */</span></code></pre>
 
-      <h3>C API</h3>
+      <h3 id="c-api">C API</h3>
       <table>
         <thead>
           <tr>
@@ -237,7 +237,7 @@
       <h2 id="splayed-tables">Splayed Tables</h2>
       <p>A splayed table stores each column as a separate file in a directory. This is the standard on-disk representation for a Rayforce table. The schema (column names) is stored in a <code>.d</code> file alongside the data files.</p>
 
-      <h3>Directory Layout</h3>
+      <h3 id="directory-layout">Directory Layout</h3>
       <pre><code><span class="hl-comment">db/trades/
   .d                 — I64 vector of column name symbol IDs
   sym                — SYM column (stock tickers)
@@ -245,7 +245,7 @@
   qty                — I64 column (quantities)
   time               — TIMESTAMP column</span></code></pre>
 
-      <h3>C API</h3>
+      <h3 id="c-api-2">C API</h3>
       <table>
         <thead>
           <tr>
@@ -278,7 +278,7 @@
       <h2 id="partitioned-tables">Date-Partitioned Tables</h2>
       <p>For large time-series datasets, Rayforce supports date-partitioned storage. Data is split into directories named by date, each containing a splayed table for that day's data.</p>
 
-      <h3>Directory Layout</h3>
+      <h3 id="directory-layout-2">Directory Layout</h3>
       <pre><code><span class="hl-comment">db/trades/
   sym                 — shared symbol table
   2024.01.15/
@@ -294,7 +294,7 @@
   2024.01.17/
     ...</span></code></pre>
 
-      <h3>Loading Partitioned Data</h3>
+      <h3 id="loading-partitioned-data">Loading Partitioned Data</h3>
       <p>The <code>ray_part_load()</code> function scans all partition directories, memory-maps every column file, and assembles them into a single logical table with <a href="data-types-collections.html#parted-types">parted columns</a> and a virtual <code>MAPCOMMON</code> date column.</p>
 
       <pre><code><span class="hl-comment">// C API: load all partitions</span>
@@ -309,13 +309,13 @@
         <strong>Rayfall builtin:</strong> Use <code>get-parted</code> from Rayfall to load partitioned tables: <code>(get-parted "db" 'trades)</code>. See the <a href="#rayfall-storage">Rayfall Storage Builtins</a> section below.
       </div>
 
-      <h3>Partition Pruning</h3>
+      <h3 id="partition-pruning">Partition Pruning</h3>
       <p>The query optimizer recognizes predicates on the <code>MAPCOMMON</code> column and eliminates entire partitions from the scan plan. This means a query filtering on a single date in a year of data only touches 1/365th of the files on disk &mdash; with zero per-row cost for the pruned partitions.</p>
 
       <h2 id="symbol-persistence">Symbol Table Persistence</h2>
       <p>The global symbol intern table maps strings to integer IDs. When saving data to disk, the symbol table must be persisted so that symbol vectors can be correctly interpreted when reloaded.</p>
 
-      <h3>Append-Only .sym Files</h3>
+      <h3 id="append-only-sym-files">Append-Only .sym Files</h3>
       <p>Symbol files use an append-only format. New symbols are appended to the end of the file without rewriting existing entries. This makes concurrent writes safe and enables incremental updates.</p>
 
       <table>
@@ -355,7 +355,7 @@
 <span class="hl-comment">// On startup, load symbols before loading data</span>
 <span class="hl-fn">ray_sym_load</span>(<span class="hl-str">"db/sym"</span>);</code></pre>
 
-      <h3>Concurrency and Integrity</h3>
+      <h3 id="concurrency-and-integrity">Concurrency and Integrity</h3>
       <ul>
         <li><strong>File locking</strong> &mdash; <code>flock()</code> on POSIX, <code>LockFileEx()</code> on Windows. Multiple processes can safely read the symbol file; writes acquire an exclusive lock.</li>
         <li><strong>Corruption detection</strong> &mdash; symbol files include checksums. If a file is truncated or corrupted, <code>ray_sym_load()</code> returns <code>RAY_ERR_CORRUPT</code> and leaves the in-memory table unchanged.</li>
@@ -365,7 +365,7 @@
       <h2 id="csv">CSV Import and Export</h2>
       <p>Rayforce includes a high-performance CSV loader with parallel parsing, automatic type inference, and null handling. No external libraries are used &mdash; the parser operates directly on memory-mapped file contents.</p>
 
-      <h3>Reading CSV Files</h3>
+      <h3 id="reading-csv-files">Reading CSV Files</h3>
 
       <pre><code><span class="hl-comment">; Basic CSV load — auto-detect types, comma delimiter, header row</span>
 <span class="hl-comment">ray&gt;</span> (<span class="hl-kw">set</span> data (<span class="hl-fn">.csv.read</span> <span class="hl-str">"trades.csv"</span>))
@@ -375,7 +375,7 @@ AAPL 150.25  100  2024.01.15
 GOOG 140.50  200  2024.01.15
 MSFT 380.00   50  2024.01.15</code></pre>
 
-      <h3>C API</h3>
+      <h3 id="c-api-3">C API</h3>
       <table>
         <thead>
           <tr>
@@ -408,7 +408,7 @@ MSFT 380.00   50  2024.01.15</code></pre>
 <span class="hl-comment">// Write results back</span>
 <span class="hl-fn">ray_write_csv</span>(result, <span class="hl-str">"output.csv"</span>);</code></pre>
 
-      <h3>Type Inference</h3>
+      <h3 id="type-inference">Type Inference</h3>
       <p>The CSV loader samples values in each column and infers types in priority order:</p>
       <ol>
         <li><strong>BOOL</strong> &mdash; <code>true</code>/<code>false</code>, <code>1</code>/<code>0</code></li>
@@ -420,13 +420,13 @@ MSFT 380.00   50  2024.01.15</code></pre>
         <li><strong>STR</strong> &mdash; fallback for everything else</li>
       </ol>
 
-      <h3>Parallel Parsing</h3>
+      <h3 id="parallel-parsing">Parallel Parsing</h3>
       <p>The CSV file is memory-mapped and split into chunks. Multiple threads parse chunks in parallel, with a merge step that reconciles column types and combines partial results. For large files (100 MB+), this delivers near-linear speedup with core count.</p>
 
-      <h3>Null Handling</h3>
+      <h3 id="null-handling">Null Handling</h3>
       <p>Empty fields and fields matching the null string (default: <code>""</code>) are recognized as null values. The loader sets the appropriate null bitmap bits on the resulting vectors and marks them with <code>RAY_ATTR_HAS_NULLS</code>.</p>
 
-      <h3>Symbol Merge</h3>
+      <h3 id="symbol-merge">Symbol Merge</h3>
       <p>When loading CSV data with symbol columns, the loader interns all unique strings into the global symbol table. If a symbol table was previously loaded from disk, existing IDs are preserved and new symbols are appended.</p>
 
       <h2 id="cross-platform">Cross-Platform File I/O</h2>
@@ -455,7 +455,7 @@ MSFT 380.00   50  2024.01.15</code></pre>
       <h2 id="rayfall-storage">Rayfall Storage Builtins</h2>
       <p>Rayfall provides three builtins for working with on-disk storage directly from the REPL or scripts.</p>
 
-      <h3><code>set-splayed</code> &mdash; Save a Splayed Table</h3>
+      <h3 id="set-splayed-save-a-splayed-table"><code>set-splayed</code> &mdash; Save a Splayed Table</h3>
       <p>Writes a table as column files to a directory. A symbol table file is saved automatically alongside the data.</p>
       <pre><code>(<span class="hl-kw">set</span> t (<span class="hl-fn">table</span> [<span class="hl-sym">City</span> <span class="hl-sym">Temp</span> <span class="hl-sym">Rain</span>]
   (<span class="hl-fn">list</span> [<span class="hl-sym">London</span> <span class="hl-sym">Paris</span> <span class="hl-sym">Tokyo</span>]
@@ -466,7 +466,7 @@ MSFT 380.00   50  2024.01.15</code></pre>
 (<span class="hl-fn">set-splayed</span> <span class="hl-str">"/tmp/weather"</span> t)</code></pre>
       <p>An optional third argument specifies a custom symbol table path: <code>(set-splayed "/tmp/weather" t "/tmp/my_sym")</code>. Without it, a <code>sym</code> file is created in the table directory.</p>
 
-      <h3><code>get-splayed</code> &mdash; Load a Splayed Table</h3>
+      <h3 id="get-splayed-load-a-splayed-table"><code>get-splayed</code> &mdash; Load a Splayed Table</h3>
       <p>Loads a splayed table from a directory. Columns are memory-mapped for zero-copy access.</p>
       <pre><code>(<span class="hl-fn">get-splayed</span> <span class="hl-str">"/tmp/weather"</span>)</code></pre>
       <pre><code>&#x250C;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x252C;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x252C;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2510;
@@ -479,7 +479,7 @@ MSFT 380.00   50  2024.01.15</code></pre>
 &#x2514;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2534;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2534;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2518;</code></pre>
       <p>An optional second argument specifies the symbol table path: <code>(get-splayed "/tmp/weather" "/tmp/my_sym")</code>.</p>
 
-      <h3><code>get-parted</code> &mdash; Load a Partitioned Table</h3>
+      <h3 id="get-parted-load-a-partitioned-table"><code>get-parted</code> &mdash; Load a Partitioned Table</h3>
       <p>Loads a date-partitioned table. The first argument is the database root directory, the second is the table name as a quoted symbol.</p>
       <pre><code><span class="hl-comment">; Load the "trades" partitioned table from db/</span>
 (<span class="hl-fn">get-parted</span> <span class="hl-str">"db"</span> <span class="hl-sym">'trades</span>)</code></pre>

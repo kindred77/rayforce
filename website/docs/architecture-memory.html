@@ -186,7 +186,7 @@
       </div>
 
       <!-- ====== RAY_T ====== -->
-      <h2>The ray_t Block Header</h2>
+      <h2 id="the-ray-t-block-header">The ray_t Block Header</h2>
       <p>Every object in Rayforce &mdash; atoms, vectors, lists, tables &mdash; begins with a 32-byte <code>ray_t</code> header. Data follows immediately at byte 32 via a flexible array member (<code>data[]</code>).</p>
 
       <pre><code><span class="hl-kw">typedef union</span> <span class="hl-type">ray_t</span> {
@@ -221,7 +221,7 @@
     };
 } <span class="hl-type">ray_t</span>;</code></pre>
 
-      <h3>Field Details</h3>
+      <h3 id="field-details">Field Details</h3>
       <table>
         <thead><tr><th>Bytes</th><th>Field</th><th>Purpose</th></tr></thead>
         <tbody>
@@ -244,7 +244,7 @@
       <h2 id="buddy-allocator">Buddy Allocator</h2>
       <p>The primary allocator uses a classic buddy system with order-based free lists. Block sizes are powers of two, ranging from order 6 (64 bytes, enough for a <code>ray_t</code> header + 32 bytes of data) to order 30 (1 GB).</p>
 
-      <h3>Allocation</h3>
+      <h3 id="allocation">Allocation</h3>
       <ol>
         <li>Compute the minimum order that fits the requested size + 32-byte header</li>
         <li>Search the free list for that order</li>
@@ -252,7 +252,7 @@
         <li>Repeat until a block is found or allocation fails</li>
       </ol>
 
-      <h3>Deallocation</h3>
+      <h3 id="deallocation">Deallocation</h3>
       <ol>
         <li>Check if the buddy block (the other half of the parent) is also free</li>
         <li>If so, remove the buddy from its free list and coalesce both halves into a single block of order+1</li>
@@ -264,7 +264,7 @@
       <pre><code><span class="hl-kw">#define</span> <span class="hl-num">RAY_ORDER_MIN</span>  <span class="hl-num">6</span>   <span class="hl-comment">/* minimum block: 64 bytes  */</span>
 <span class="hl-kw">#define</span> <span class="hl-num">RAY_ORDER_MAX</span>  <span class="hl-num">30</span>  <span class="hl-comment">/* maximum block: 1 GB      */</span></code></pre>
 
-      <h3>File-Backed Pool Fallback</h3>
+      <h3 id="file-backed-pool-fallback">File-Backed Pool Fallback</h3>
       <p>Pools are normally backed by anonymous <code>mmap</code> &mdash; fast, lazy-committed by the kernel, bounded by RAM + swap. When the OS refuses an anon allocation (typically because RAM + swap can&rsquo;t cover the requested chunk right now), the buddy allocator falls back to a <strong>file-backed</strong> mmap pointed at a tempfile in the heap&rsquo;s configured swap directory. Dirty pages flush to the backing file on page-out, so fresh in-memory allocations &mdash; including a single huge vector like <code>(til 10000000000)</code> &mdash; can grow beyond physical RAM as long as the swap filesystem has room.</p>
 
       <p>The fallback is transparent to every <code>ray_alloc</code> caller. Pages never written stay as holes in the sparse backing file, so the over-allocate-and-trim alignment trick costs zero real disk space; only the pages you actually touch consume disk pages. On heap teardown the fd is closed and the tempfile is unlinked, so the swap directory doesn&rsquo;t accumulate orphans.</p>
@@ -277,7 +277,7 @@
       </ul>
 
       <!-- ====== SLAB ====== -->
-      <h2>Slab Cache</h2>
+      <h2 id="slab-cache">Slab Cache</h2>
       <p>For the most common allocation sizes, a slab cache provides O(1) allocation and deallocation by maintaining per-order stacks of pre-split blocks.</p>
 
       <pre><code><span class="hl-kw">#define</span> <span class="hl-num">RAY_SLAB_CACHE_SIZE</span>  <span class="hl-num">64</span>   <span class="hl-comment">/* max blocks cached per order */</span>
@@ -286,13 +286,13 @@
       <p>The slab cache covers orders 6 through 10 (64 bytes to 1 KB), which account for the vast majority of allocations: scalar atoms, short vectors, list nodes, and string pool chunks. When a slab is empty, it refills from the buddy allocator. When full, freed blocks fall through to buddy deallocation.</p>
 
       <!-- ====== HEAPS ====== -->
-      <h2>Thread-Local Heaps</h2>
+      <h2 id="thread-local-heaps">Thread-Local Heaps</h2>
       <p>Each thread has its own heap, identified by a <code>heap_id</code> (u16). Heap IDs are allocated from an atomic bitmap, ensuring no two threads share a heap.</p>
 
-      <h3>Why Per-Thread Heaps?</h3>
+      <h3 id="why-per-thread-heaps">Why Per-Thread Heaps?</h3>
       <p>The buddy allocator's free lists are not thread-safe by design. Rather than adding locks (which would destroy performance for the most common allocation path), each thread operates on its own set of free lists. This eliminates all contention on the fast path.</p>
 
-      <h3>Cross-Heap Free</h3>
+      <h3 id="cross-heap-free">Cross-Heap Free</h3>
       <p>When thread A allocates a block and thread B needs to free it (common in parallel query execution), the free is deferred:</p>
       <ol>
         <li>Thread B pushes the block onto a <strong>lock-free LIFO</strong> (compare-and-swap linked list) associated with thread A's heap</li>
@@ -307,7 +307,7 @@
       <p>This design means the common case (thread-local alloc/free) is completely lock-free, and the uncommon case (cross-thread free) uses a single atomic CAS per block.</p>
 
       <!-- ====== ARENA ====== -->
-      <h2>Arena Allocator</h2>
+      <h2 id="arena-allocator">Arena Allocator</h2>
       <p>For bulk short-lived allocations (e.g., the symbol intern table, temporary parse trees), Rayforce provides an arena (bump) allocator.</p>
 
       <pre><code><span class="hl-comment">/* Create an arena */</span>
@@ -325,7 +325,7 @@
 
       <p>Blocks allocated from an arena carry the <code>RAY_ATTR_ARENA</code> flag in their <code>attrs</code> field. This flag makes <code>ray_retain</code> and <code>ray_release</code> no-ops, since arena blocks are freed all at once when the arena is destroyed. This eliminates reference counting overhead for temporary objects.</p>
 
-      <h3>Use Cases</h3>
+      <h3 id="use-cases">Use Cases</h3>
       <ul>
         <li><strong>Symbol intern table</strong> &mdash; String atoms are arena-allocated since they live for the duration of the process</li>
         <li><strong>Parse trees</strong> &mdash; Rayfall parser allocates AST nodes from a per-parse arena, freed after compilation</li>
@@ -333,10 +333,10 @@
       </ul>
 
       <!-- ====== COW ====== -->
-      <h2>COW Ref Counting</h2>
+      <h2 id="cow-ref-counting">COW Ref Counting</h2>
       <p>Rayforce uses <strong>copy-on-write (COW)</strong> semantics to allow safe sharing of data between multiple consumers without copying.</p>
 
-      <h3>API</h3>
+      <h3 id="api">API</h3>
       <table>
         <thead><tr><th>Function</th><th>Behavior</th></tr></thead>
         <tbody>
@@ -346,7 +346,7 @@
         </tbody>
       </table>
 
-      <h3>COW Cleanup Pattern</h3>
+      <h3 id="cow-cleanup-pattern">COW Cleanup Pattern</h3>
       <p>After <code>ray_cow</code> returns a new copy, all error paths must release it to prevent leaks. The standard pattern uses <code>goto fail</code>:</p>
       <pre><code><span class="hl-type">ray_t</span>* original = vec;
 vec = <span class="hl-fn">ray_cow</span>(vec);
@@ -361,7 +361,7 @@ fail:
     <span class="hl-kw">if</span> (vec != original) <span class="hl-fn">ray_release</span>(vec);
     <span class="hl-kw">return</span> <span class="hl-fn">RAY_ERR_PTR</span>(err);</code></pre>
 
-      <h3>How COW Enables Zero-Copy Operations</h3>
+      <h3 id="how-cow-enables-zero-copy-operations">How COW Enables Zero-Copy Operations</h3>
       <ul>
         <li><strong>Slices</strong> &mdash; <code>ray_vec_slice</code> creates a new header pointing into the parent's data, incrementing the parent's refcount. No data is copied.</li>
         <li><strong>Table projections</strong> &mdash; Selecting a subset of columns creates new table headers that share the underlying column vectors via retain.</li>
@@ -370,7 +370,7 @@ fail:
       </ul>
 
       <!-- ====== ALLOCATION API ====== -->
-      <h2>Allocation API Summary</h2>
+      <h2 id="allocation-api-summary">Allocation API Summary</h2>
       <table>
         <thead><tr><th>Function</th><th>Purpose</th><th>Thread Safety</th></tr></thead>
         <tbody>
@@ -388,7 +388,7 @@ fail:
       </table>
 
       <!-- ====== MEMORY LAYOUT ====== -->
-      <h2>Memory Layout Visualization</h2>
+      <h2 id="memory-layout-visualization">Memory Layout Visualization</h2>
       <p>A complete picture of how a vector looks in memory:</p>
       <pre><code><span class="hl-comment">/* ray_t* vec = ray_vec_new(RAY_I64, 4); with values [10, 20, 30, 40] */</span>
 

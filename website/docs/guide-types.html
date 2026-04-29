@@ -475,7 +475,7 @@
       <!-- 10. Practical Examples -->
       <h2 id="practical-examples">10. Practical Examples</h2>
 
-      <h3>CSV Type Fixing</h3>
+      <h3 id="csv-type-fixing">CSV Type Fixing</h3>
       <p>After loading a CSV, columns often arrive as strings. Cast them to proper types:</p>
       <pre><code><span class="hl-comment">; Load CSV (all columns as strings by default)</span>
 (<span class="hl-kw">set</span> raw (<span class="hl-fn">.csv.read</span> <span class="hl-str">"trades.csv"</span>))
@@ -488,14 +488,14 @@
            <span class="hl-sym">date:</span>   (<span class="hl-fn">as</span> <span class="hl-sym">'date</span> date)
            <span class="hl-sym">sym:</span>    (<span class="hl-fn">as</span> <span class="hl-sym">'sym</span> sym)}}))</code></pre>
 
-      <h3>Date Arithmetic for Analytics</h3>
+      <h3 id="date-arithmetic-for-analytics">Date Arithmetic for Analytics</h3>
       <pre><code><span class="hl-comment">; Find records in the last 30 days</span>
 (<span class="hl-kw">set</span> today <span class="hl-num">2024.03.15</span>)
 (<span class="hl-kw">set</span> cutoff (<span class="hl-fn">-</span> today <span class="hl-num">30</span>))
 
 (<span class="hl-kw">select</span> {<span class="hl-sym">from:</span> trades <span class="hl-sym">where:</span> (<span class="hl-fn">&gt;=</span> <span class="hl-sym">date</span> cutoff)})</code></pre>
 
-      <h3>Building Typed Vectors</h3>
+      <h3 id="building-typed-vectors">Building Typed Vectors</h3>
       <pre><code><span class="hl-comment">; Build a date vector from strings</span>
 (<span class="hl-kw">set</span> dates (<span class="hl-fn">as</span> <span class="hl-sym">'date</span> [<span class="hl-str">"2024.01.01"</span> <span class="hl-str">"2024.02.01"</span> <span class="hl-str">"2024.03.01"</span>]))
 <span class="hl-comment">; [2024.01.01 2024.02.01 2024.03.01]</span>
@@ -504,7 +504,7 @@
 (<span class="hl-kw">set</span> categories (<span class="hl-fn">as</span> <span class="hl-sym">'sym</span> [<span class="hl-str">"A"</span> <span class="hl-str">"B"</span> <span class="hl-str">"A"</span> <span class="hl-str">"C"</span>]))
 <span class="hl-comment">; ['A 'B 'A 'C]</span></code></pre>
 
-      <h3>Type-Safe Table Construction</h3>
+      <h3 id="type-safe-table-construction">Type-Safe Table Construction</h3>
       <pre><code><span class="hl-comment">; Construct a well-typed table</span>
 (<span class="hl-kw">set</span> orders (<span class="hl-fn">table</span>
   [<span class="hl-sym">id</span> <span class="hl-sym">product</span> <span class="hl-sym">price</span> <span class="hl-sym">date</span>]

@@ -206,29 +206,29 @@
       <!-- ============================================================ -->
       <h2 id="kinds">The five index-like structures</h2>
 
-      <h3>1. Per-column accelerators &mdash; <code>.idx.zone</code> / <code>.idx.hash</code> / <code>.idx.sort</code> / <code>.idx.bloom</code></h3>
+      <h3 id="1-per-column-accelerators-idxzone-idxhash-idxsort-idxbloom">1. Per-column accelerators &mdash; <code>.idx.zone</code> / <code>.idx.hash</code> / <code>.idx.sort</code> / <code>.idx.bloom</code></h3>
       <p>Attach one of four kinds to a numeric vector. Each kind builds a structure suited to a different query shape: hash for equality lookups, sort for binary search and ordered access, zone for column-level min/max/null pruning, bloom for cheap probabilistic membership rejection. All four occupy the same per-column slot &mdash; one kind at a time today.</p>
       <p><strong>Today's status:</strong> all four <em>build correctly</em> and are <em>inspectable</em> via <code>(.idx.info)</code>, but no query operator consults them. Building one does not change <code>filter</code> / <code>in</code> / <code>find</code> / <code>distinct</code> / SIP behavior; the optimizer routing pass that wires the consumers up is the next phase. See the <a href="#status">status section</a> below.</p>
       <p><strong>Surface:</strong> <code>(.idx.zone v)</code>, <code>(.idx.hash v)</code>, <code>(.idx.sort v)</code>, <code>(.idx.bloom v)</code>, <code>(.idx.drop v)</code>, <code>(.idx.has? v)</code>, <code>(.idx.info v)</code>. Numeric only in v1 (<code>RAY_BOOL</code> through <code>RAY_TIMESTAMP</code> at the C level; integer / float / date / time / timestamp vectors are the practical reach from Rayfall); <code>RAY_SYM</code> / <code>RAY_STR</code> are deferred.</p>
       <p><strong>See:</strong> <a href="queries-indexes.html">Accelerator Indexes (reference)</a> &middot; <a href="guide-indexes.html#choose">Indexes Guide: choosing a kind</a>.</p>
 
-      <h3>2. Vector ANN index &mdash; HNSW</h3>
+      <h3 id="2-vector-ann-index-hnsw">2. Vector ANN index &mdash; HNSW</h3>
       <p>Hierarchical Navigable Small World multi-layer proximity graph for approximate nearest neighbor search over float embedding vectors. Three distance metrics &mdash; cosine, L2, inner product. Built once with <code>hnsw-build</code>, queried with <code>ann</code>, optionally persisted to a directory with <code>hnsw-save</code> / <code>hnsw-load</code>.</p>
       <p><strong>Surface:</strong> <code>(hnsw-build col [metric] [M] [ef_c])</code>, <code>(ann handle query k [ef_search])</code>, <code>(knn col query k [metric])</code>, <code>(hnsw-save handle dir)</code>, <code>(hnsw-load dir)</code>, <code>(hnsw-free handle)</code>, <code>(hnsw-info handle)</code>. Brute-force <code>knn</code> needs no index and exists alongside.</p>
       <p><strong>See:</strong> <a href="vector-search.html">Vector Search &amp; HNSW</a> &middot; <a href="guide-indexes.html#workflow-ann">Indexes Guide: ANN workflow</a>.</p>
 
-      <h3>3. Linked columns</h3>
+      <h3 id="3-linked-columns">3. Linked columns</h3>
       <p>A column whose values are row-id references into another table. Functions as a row-level index: dereferencing follows the link and resolves the target row at query time, similar in spirit to a foreign-key relationship but maintained at the column level.</p>
       <p><strong>Surface:</strong> <code>(.col.link col target-table)</code>, <code>(.col.unlink col)</code>, <code>(.col.link? col)</code>, <code>(.col.target col)</code>.</p>
       <p><strong>Parted-table interaction:</strong> a parted fact can carry a linked column targeting a non-parted dim (in-memory or splayed); per-segment <code>HAS_LINK</code> is preserved through <code>ray_read_parted</code> and segment streaming. Targets with any parted column are rejected at attach time. See <a href="queries-links.html#parted">Linked Columns: Parted-Table Interaction</a>.</p>
       <p><strong>See:</strong> <a href="queries-links.html">Linked Columns</a>.</p>
 
-      <h3>4. Partition pruning</h3>
+      <h3 id="4-partition-pruning">4. Partition pruning</h3>
       <p>A storage layout, not a column-level index, but it functions as a coarse zone-map at the table level: the partition discriminator (date, integer, or symbol) selects whole sub-tables to load. Filters that target the partition column let the optimizer skip entire partitions before any scan begins.</p>
       <p><strong>Surface:</strong> implicit &mdash; the directory layout under your database root drives partition selection. The C API loader (<code>ray_part_load</code>) infers the partition type (<code>date</code> / <code>int</code> / <code>sym</code>) from the directory names.</p>
       <p><strong>See:</strong> <a href="storage.html">Columnar Storage</a> &middot; <a href="guide-storage.html#partitioned-tables">Storage Guide: partitioned tables</a> &middot; <a href="architecture-offloading.html">Block Offloading</a>.</p>
 
-      <h3>5. CSR graph index</h3>
+      <h3 id="5-csr-graph-index">5. CSR graph index</h3>
       <p>A double-indexed Compressed Sparse Row adjacency structure (forward + reverse) attached to graph relationships. Used transparently by every graph opcode &mdash; <code>OP_EXPAND</code>, <code>OP_VAR_EXPAND</code>, <code>OP_SHORTEST_PATH</code>, <code>OP_WCO_JOIN</code> &mdash; and by Leapfrog Triejoin for worst-case optimal joins.</p>
       <p><strong>Surface:</strong> none directly &mdash; the CSR is built when a relationship is loaded and consulted automatically by graph queries. There is no <code>(.csr.*)</code> Rayfall surface today.</p>
       <p><strong>See:</strong> <a href="graph-storage.html">Graph Storage</a> &middot; <a href="graph-algorithms.html">Graph Algorithms</a>.</p>

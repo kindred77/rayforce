@@ -468,3 +468,195 @@ code {
 @media (prefers-reduced-motion: reduce) {
   html { scroll-behavior: auto; }
 }
+
+/* ──────────────────────────────────────────────
+   Foldable sidebar sections
+   ────────────────────────────────────────────── */
+.sidebar-section-toggle {
+  display: flex; align-items: center; gap: 6px;
+  cursor: pointer; user-select: none;
+  margin-bottom: 8px;
+  padding: 4px 8px 4px 12px;
+  border-radius: 6px;
+  transition: background .15s, color .15s;
+}
+.sidebar-section-toggle:hover { background: rgba(233, 160, 51, 0.06); color: var(--text); }
+.sidebar-section-toggle:focus-visible { outline: 2px solid var(--primary-light); outline-offset: 2px; }
+.sidebar-chevron {
+  width: 12px; height: 12px;
+  flex-shrink: 0;
+  transition: transform .18s ease;
+  color: var(--text-dim);
+}
+.sidebar-section.collapsed .sidebar-chevron { transform: rotate(-90deg); }
+.sidebar-section-items {
+  overflow: hidden;
+  max-height: 1000px;
+  transition: max-height .25s ease, opacity .15s;
+  opacity: 1;
+}
+.sidebar-section.collapsed .sidebar-section-items {
+  max-height: 0;
+  opacity: 0;
+}
+
+/* ──────────────────────────────────────────────
+   Mobile sidebar drawer backdrop
+   ────────────────────────────────────────────── */
+.docs-sidebar-backdrop {
+  position: fixed; inset: 0;
+  background: rgba(4, 7, 10, 0.6);
+  backdrop-filter: blur(2px);
+  z-index: 98;
+  opacity: 0; pointer-events: none;
+  transition: opacity .2s;
+}
+.docs-sidebar-backdrop.open { opacity: 1; pointer-events: auto; }
+@media (min-width: 769px) {
+  .docs-sidebar-backdrop { display: none !important; }
+}
+
+/* ──────────────────────────────────────────────
+   On-this-page TOC (right rail)
+   ────────────────────────────────────────────── */
+.docs-toc {
+  position: fixed;
+  top: 88px; right: 24px; bottom: 16px;
+  width: 220px;
+  padding: 12px 8px;
+  font-size: .82rem;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(233, 160, 51, 0.1) transparent;
+}
+.docs-toc::-webkit-scrollbar { width: 4px; }
+.docs-toc::-webkit-scrollbar-thumb { background: rgba(233, 160, 51, 0.15); border-radius: 3px; }
+.docs-toc-label {
+  font-family: var(--mono); font-size: .65rem; font-weight: 600;
+  text-transform: uppercase; letter-spacing: .14em;
+  color: var(--primary);
+  margin: 4px 8px 12px;
+}
+.docs-toc ul { list-style: none; padding: 0; margin: 0; }
+.docs-toc-item { margin: 2px 0; }
+.docs-toc-item a {
+  display: block;
+  padding: 4px 10px;
+  border-left: 2px solid transparent;
+  color: var(--text-muted);
+  text-decoration: none;
+  line-height: 1.45;
+  transition: color .15s, border-color .15s, background .15s;
+}
+.docs-toc-item a:hover { color: var(--text); }
+.docs-toc-item.docs-toc-h3 a { padding-left: 22px; font-size: .78rem; }
+.docs-toc-item a.active {
+  color: var(--primary);
+  border-left-color: var(--primary);
+  background: rgba(233, 160, 51, 0.06);
+}
+@media (max-width: 1280px) { .docs-toc { display: none; } }
+
+/* ──────────────────────────────────────────────
+   Heading anchor links (hover #)
+   ────────────────────────────────────────────── */
+.docs-content h2,
+.docs-content h3,
+.docs-content h4 {
+  position: relative;
+  scroll-margin-top: 88px;
+}
+.heading-anchor {
+  position: absolute;
+  left: -1.6em;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 1.4em; height: 1.4em;
+  display: inline-flex; align-items: center; justify-content: center;
+  color: var(--text-dim);
+  opacity: 0;
+  transition: opacity .15s, color .15s, transform .15s;
+  text-decoration: none;
+}
+.heading-anchor svg { width: 16px; height: 16px; }
+.docs-content h2:hover .heading-anchor,
+.docs-content h3:hover .heading-anchor,
+.docs-content h4:hover .heading-anchor,
+.heading-anchor:focus-visible {
+  opacity: 1;
+}
+.heading-anchor:hover { color: var(--primary); }
+.heading-anchor.copied { color: var(--accent, #5eead4); transform: translateY(-50%) scale(1.1); }
+@media (max-width: 1024px) {
+  .heading-anchor { position: static; display: inline-flex; transform: none; margin-left: 6px; opacity: 0.4; }
+  .docs-content h2:hover .heading-anchor,
+  .docs-content h3:hover .heading-anchor,
+  .docs-content h4:hover .heading-anchor { transform: none; opacity: 1; }
+}
+
+/* ──────────────────────────────────────────────
+   Code block copy button
+   ────────────────────────────────────────────── */
+.docs-content pre { padding-right: 64px; }
+.code-copy-btn {
+  position: absolute;
+  top: 10px; right: 10px;
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 5px 10px;
+  font-family: var(--mono); font-size: .72rem;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity .15s, background .15s, color .15s, border-color .15s;
+}
+.code-copy-btn svg { width: 13px; height: 13px; }
+.docs-content pre:hover .code-copy-btn,
+.code-copy-btn:focus-visible { opacity: 1; }
+.code-copy-btn:hover {
+  background: rgba(233, 160, 51, 0.1);
+  color: var(--primary);
+  border-color: rgba(233, 160, 51, 0.3);
+}
+.code-copy-btn.copied {
+  color: var(--accent, #5eead4);
+  border-color: rgba(94, 234, 212, 0.4);
+  background: rgba(94, 234, 212, 0.1);
+}
+@media (max-width: 1024px) {
+  .code-copy-btn { opacity: 0.6; }
+}
+
+/* ──────────────────────────────────────────────
+   Edit-on-GitHub + last updated footer
+   ────────────────────────────────────────────── */
+.docs-page-meta {
+  display: flex; flex-wrap: wrap; gap: 16px;
+  align-items: center; justify-content: space-between;
+  margin: 56px 0 24px;
+  padding: 14px 0;
+  border-top: 1px solid var(--border);
+  font-size: .82rem;
+  color: var(--text-muted);
+}
+.docs-edit-link {
+  display: inline-flex; align-items: center; gap: 8px;
+  color: var(--text-muted); text-decoration: none;
+  padding: 4px 10px; border-radius: 6px;
+  transition: color .15s, background .15s;
+}
+.docs-edit-link:hover {
+  color: var(--text);
+  background: rgba(233, 160, 51, 0.08);
+}
+.docs-edit-link svg { width: 14px; height: 14px; }
+.docs-updated time { color: var(--text-dim); }
+
+/* ──────────────────────────────────────────────
+   Layout: reserve space for the right TOC at wide viewports
+   ────────────────────────────────────────────── */
+@media (min-width: 1281px) {
+  .docs-content { margin-right: 248px; }
+}

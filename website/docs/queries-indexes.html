@@ -246,7 +246,7 @@
       <h2 id="construct">Constructing an Index</h2>
       <p>Each kind has a one-arg attach builtin.  Attaching is idempotent &mdash; if a different kind is already attached, it's dropped first; mutation invalidates and clears it implicitly.</p>
 
-      <h3>Signature</h3>
+      <h3 id="signature">Signature</h3>
       <div class="fn-card">
         <div class="fn-card-header">
           <span class="fn-name">(.idx.zone v)   (.idx.hash v)   (.idx.sort v)   (.idx.bloom v)</span>
@@ -254,7 +254,7 @@
         <div class="fn-desc">Attach an index of the named kind to a numeric vector <code>v</code>.  Returns the column with the new index attached (the underlying values are unchanged).  Type errors out for non-numeric columns &mdash; <code>RAY_BOOL</code>, <code>RAY_U8</code>, <code>RAY_I16</code>, <code>RAY_I32</code>, <code>RAY_I64</code>, <code>RAY_F32</code>, <code>RAY_F64</code>, <code>RAY_DATE</code>, <code>RAY_TIME</code>, <code>RAY_TIMESTAMP</code>.  <code>RAY_SYM</code> / <code>RAY_STR</code> targets are deferred to v2.</div>
       </div>
 
-      <h3>Examples</h3>
+      <h3 id="examples">Examples</h3>
       <pre><code>(<span class="hl-kw">set</span> v [<span class="hl-num">5</span> <span class="hl-num">1</span> <span class="hl-num">9</span> <span class="hl-num">3</span> <span class="hl-num">7</span>])
 
 <span class="hl-comment">; Zonemap: min, max, null count.</span>
@@ -308,7 +308,7 @@
         </tbody>
       </table>
 
-      <h3>Mutation Drops the Index</h3>
+      <h3 id="mutation-drops-the-index">Mutation Drops the Index</h3>
       <p>The Rayfall in-place mutators &mdash; <code>(insert 'v val)</code> for append and <code>(alter 'v set i val)</code> / <code>(alter 'v concat val)</code> for set / append &mdash; invalidate the attached index.  The mutator paths drop the index transparently, restore the original nullmap bytes, and proceed with the write.  Subsequent <code>(.idx.has?)</code> calls return false; reattach the index after the write if you want the structure available again (today it's still only inspectable through <code>(.idx.info)</code>; query consumers land with the routing pass).</p>
 
       <pre><code>(<span class="hl-kw">set</span> v [<span class="hl-num">5</span> <span class="hl-num">1</span> <span class="hl-num">9</span> <span class="hl-num">3</span> <span class="hl-num">7</span>])
@@ -317,27 +317,27 @@
 (<span class="hl-fn">alter</span> <span class="hl-sym">'vz</span> <span class="hl-sym">set</span> <span class="hl-num">0</span> <span class="hl-num">100</span>)
 (<span class="hl-fn">.idx.has?</span> vz)              <span class="hl-comment">; ⇒ false</span></code></pre>
 
-      <h3>Coexistence with Linked Columns</h3>
+      <h3 id="coexistence-with-linked-columns">Coexistence with Linked Columns</h3>
       <p>An accelerator index uses bytes 0&ndash;7 of the column's <a href="https://github.com/RayforceDB/rayforce/blob/master/include/rayforce.h">nullmap union</a>; a <a href="queries-links.html">linked column</a> uses bytes 8&ndash;15.  The two flags &mdash; <code>RAY_ATTR_HAS_INDEX = 0x08</code> and <code>RAY_ATTR_HAS_LINK = 0x04</code> &mdash; are independent and a column can carry both.  Dereferencing through a link still works on an indexed column; dropping the index leaves the link intact and vice versa.</p>
 
       <!-- ============================================================ -->
       <h2 id="workflows">Common Workflows</h2>
 
-      <h3>Hot column, repeated point lookups</h3>
+      <h3 id="hot-column-repeated-point-lookups">Hot column, repeated point lookups</h3>
       <pre><code>(<span class="hl-kw">set</span> v (* <span class="hl-num">7</span> (<span class="hl-fn">til</span> <span class="hl-num">1000</span>)))   <span class="hl-comment">; 0, 7, 14, ..., 6993</span>
 (<span class="hl-kw">set</span> v (<span class="hl-fn">.idx.hash</span> v))
 (<span class="hl-fn">in</span> <span class="hl-num">700</span> v)                   <span class="hl-comment">; ⇒ true   (700 = 7 × 100)</span>
 (<span class="hl-fn">in</span> <span class="hl-num">701</span> v)                   <span class="hl-comment">; ⇒ false</span>
 (<span class="hl-kw">set</span> v (<span class="hl-fn">.idx.drop</span> v))         <span class="hl-comment">; optional early release; mutators auto-drop</span></code></pre>
 
-      <h3>Range scans on a stable column</h3>
+      <h3 id="range-scans-on-a-stable-column">Range scans on a stable column</h3>
       <pre><code>(<span class="hl-kw">set</span> prices [<span class="hl-num">102</span> <span class="hl-num">98</span> <span class="hl-num">105</span> <span class="hl-num">101</span> <span class="hl-num">99</span> <span class="hl-num">103</span>])
 (<span class="hl-kw">set</span> prices (<span class="hl-fn">.idx.sort</span> prices))
 (<span class="hl-fn">.idx.info</span> prices)
 <span class="hl-comment">; ⇒ {kind:sort length:6 parent_type:5 saved_attrs:0 perm_len:6}</span></code></pre>
       <p>The original column is unchanged; the sort lives in a row-id permutation alongside it. Once the optimizer routing pass lands, range queries against this column will be able to read that permutation instead of full-scanning &mdash; today it's just inspectable structure (<code>(.idx.info)</code>), and range queries still scan linearly.</p>
 
-      <h3>Whole-column pruning</h3>
+      <h3 id="whole-column-pruning">Whole-column pruning</h3>
       <pre><code>(<span class="hl-kw">set</span> ages [<span class="hl-num">21</span> <span class="hl-num">34</span> <span class="hl-num">29</span> <span class="hl-num">42</span> <span class="hl-num">37</span>])
 (<span class="hl-kw">set</span> ages (<span class="hl-fn">.idx.zone</span> ages))
 (<span class="hl-fn">.idx.info</span> ages)

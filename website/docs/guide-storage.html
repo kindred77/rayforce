@@ -188,7 +188,7 @@
       <h2 id="csv-io">1. CSV I/O</h2>
       <p>The simplest way to persist and exchange data. Available directly from Rayfall.</p>
 
-      <h3>Reading CSV</h3>
+      <h3 id="reading-csv">Reading CSV</h3>
       <pre><code>(<span class="hl-kw">set</span> data (<span class="hl-fn">.csv.read</span> <span class="hl-str">"path/to/data.csv"</span>))</code></pre>
       <p>The reader:</p>
       <ul>
@@ -198,10 +198,10 @@
         <li>Handles null values (empty cells)</li>
       </ul>
 
-      <h3>Writing CSV</h3>
+      <h3 id="writing-csv">Writing CSV</h3>
       <pre><code>(<span class="hl-fn">.csv.write</span> table <span class="hl-str">"path/to/output.csv"</span>)</code></pre>
 
-      <h3>Example: Round-Trip</h3>
+      <h3 id="example-round-trip">Example: Round-Trip</h3>
       <pre><code>(<span class="hl-kw">set</span> data (<span class="hl-fn">table</span> [<span class="hl-sym">Name</span> <span class="hl-sym">Score</span> <span class="hl-sym">Grade</span>]
   (<span class="hl-fn">list</span> [<span class="hl-sym">Alice</span> <span class="hl-sym">Bob</span> <span class="hl-sym">Charlie</span>]
         [<span class="hl-num">95</span> <span class="hl-num">87</span> <span class="hl-num">92</span>]
@@ -328,20 +328,20 @@ ray_t* ray_part_load(<span class="hl-kw">const</span> <span class="hl-kw">char</
       <h2 id="mmap">6. Memory-Mapped I/O</h2>
       <p>Memory-mapped I/O (<code>mmap</code>) lets Rayforce access on-disk data without copying it into memory. The operating system pages data in on demand as it is accessed.</p>
 
-      <h3>Benefits</h3>
+      <h3 id="benefits">Benefits</h3>
       <ul>
         <li><strong>Zero startup cost</strong> &mdash; opening a 10 GB file is instant; only accessed pages are loaded</li>
         <li><strong>Shared memory</strong> &mdash; multiple processes can mmap the same file without duplicating data in RAM</li>
         <li><strong>OS-managed caching</strong> &mdash; the kernel manages which pages stay in memory vs. on disk</li>
       </ul>
 
-      <h3>Trade-offs</h3>
+      <h3 id="trade-offs">Trade-offs</h3>
       <ul>
         <li><strong>Read-only</strong> &mdash; mmap vectors cannot be modified (COW will copy if you try)</li>
         <li><strong>Random I/O</strong> &mdash; if access patterns are truly random across a large file, performance can be worse than sequential reads</li>
       </ul>
 
-      <h3>Usage</h3>
+      <h3 id="usage">Usage</h3>
       <p>Use <code>ray_col_mmap</code> for individual columns:</p>
       <pre><code>ray_t* prices = ray_col_mmap(<span class="hl-str">"db/2024.01.01/trades/Price"</span>);</code></pre>
       <p>Splayed table loading can also use mmap internally. For most analytics workloads &mdash; scans, filters, aggregations &mdash; mmap provides the best combination of startup time and throughput.</p>

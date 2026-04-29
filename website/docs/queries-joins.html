@@ -186,7 +186,7 @@
       <h2 id="inner-join">Inner Join</h2>
       <p>The <code>inner-join</code> function performs an equi-join on one or more key columns. Only rows with matching keys in both tables appear in the result.</p>
 
-      <h3>Signature</h3>
+      <h3 id="signature">Signature</h3>
       <div class="fn-card">
         <div class="fn-card-header">
           <span class="fn-name">(inner-join [keys] left right)</span>
@@ -194,7 +194,7 @@
         <div class="fn-desc">Join two tables on shared key columns. Returns a table with all columns from both sides (key columns appear once).</div>
       </div>
 
-      <h3>Examples</h3>
+      <h3 id="examples">Examples</h3>
       <pre><code>(<span class="hl-kw">set</span> orders (<span class="hl-fn">table</span> [<span class="hl-sym">id</span> <span class="hl-sym">sym</span> <span class="hl-sym">qty</span>]
     (<span class="hl-fn">list</span> [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span> <span class="hl-num">4</span>] [<span class="hl-str">AAPL</span> <span class="hl-str">GOOG</span> <span class="hl-str">MSFT</span> <span class="hl-str">AAPL</span>] [<span class="hl-num">100</span> <span class="hl-num">200</span> <span class="hl-num">50</span> <span class="hl-num">150</span>])))
 
@@ -227,7 +227,7 @@
       <h2 id="left-join">Left Join</h2>
       <p>The <code>left-join</code> function keeps all rows from the left table. Unmatched rows have null in the right-side columns.</p>
 
-      <h3>Signature</h3>
+      <h3 id="signature-2">Signature</h3>
       <div class="fn-card">
         <div class="fn-card-header">
           <span class="fn-name">(left-join [keys] left right)</span>
@@ -235,7 +235,7 @@
         <div class="fn-desc">Left outer join. All left rows are preserved; unmatched right columns are null.</div>
       </div>
 
-      <h3>Examples</h3>
+      <h3 id="examples-2">Examples</h3>
       <pre><code>(<span class="hl-fn">left-join</span> [<span class="hl-sym">sym</span>] orders prices)
 <span class="hl-comment">; id sym  qty price</span>
 <span class="hl-comment">; -- ---  --- -----</span>
@@ -251,7 +251,7 @@
       <h2 id="asof-join">As-of Join</h2>
       <p>The <code>asof-join</code> function is designed for time-series data. For each row in the left table, it finds the most recent matching row in the right table where the time column is less than or equal to the left's time value. Key columns must match exactly; the last column in the key list is the temporal column.</p>
 
-      <h3>Signature</h3>
+      <h3 id="signature-3">Signature</h3>
       <div class="fn-card">
         <div class="fn-card-header">
           <span class="fn-name">(asof-join [keys time-col] left right)</span>
@@ -259,7 +259,7 @@
         <div class="fn-desc">As-of join for time-series alignment. The last key is the temporal column; preceding keys are exact-match. For each left row, returns the most recent right row where <code>right.time &lt;= left.time</code>.</div>
       </div>
 
-      <h3>Examples</h3>
+      <h3 id="examples-3">Examples</h3>
       <pre><code><span class="hl-comment">; Trades and quotes for time-series alignment</span>
 (<span class="hl-kw">set</span> trades (<span class="hl-fn">table</span> [<span class="hl-sym">Sym</span> <span class="hl-sym">Ts</span> <span class="hl-sym">Price</span>]
     (<span class="hl-fn">list</span> [<span class="hl-str">AAPL</span> <span class="hl-str">AAPL</span> <span class="hl-str">MSFT</span>]
@@ -280,7 +280,7 @@
 <span class="hl-comment">; AAPL 10:00:05  190.1 190   190.2   &larr; quote from 10:00:03</span>
 <span class="hl-comment">; MSFT 10:00:04 410.25 410.1 410.3   &larr; quote from 10:00:02</span></code></pre>
 
-      <h3>Large-scale Usage</h3>
+      <h3 id="large-scale-usage">Large-scale Usage</h3>
       <pre><code><span class="hl-comment">; 10 million row as-of join</span>
 (<span class="hl-kw">set</span> n <span class="hl-num">10000000</span>)
 (<span class="hl-kw">set</span> tsym (<span class="hl-fn">take</span> (<span class="hl-fn">concat</span> (<span class="hl-fn">take</span> <span class="hl-str">'AAPL</span> <span class="hl-num">99</span>) (<span class="hl-fn">take</span> <span class="hl-str">'MSFT</span> <span class="hl-num">1</span>)) n))
@@ -289,7 +289,7 @@
 <span class="hl-comment">; ... build quotes similarly ...</span>
 (<span class="hl-fn">asof-join</span> [<span class="hl-sym">Sym</span> <span class="hl-sym">Ts</span>] trades quotes)</code></pre>
 
-      <h3>Null-key semantics</h3>
+      <h3 id="null-key-semantics">Null-key semantics</h3>
       <p>As-of-join treats <strong>NULL keys as never matching</strong>:</p>
       <ul>
         <li>A left row with a null in any equality key or in the time column is kept in the output (left-outer behaviour) but the right-side columns are explicitly null.</li>
@@ -302,7 +302,7 @@
       <h2 id="window-join">Window Join</h2>
       <p>The <code>window-join</code> function extends the as-of join with a time window. For each left row, it finds all right rows within a time interval and applies aggregation functions to the matched rows.</p>
 
-      <h3>Signature</h3>
+      <h3 id="signature-4">Signature</h3>
       <div class="fn-card">
         <div class="fn-card-header">
           <span class="fn-name">(window-join [keys time-col] intervals left right {col: (agg expr) ...})</span>
@@ -310,7 +310,7 @@
         <div class="fn-desc">Window join with per-row time intervals. <code>intervals</code> is a list of two vectors <code>[lo hi]</code> defining the time window for each left row. Aggregation functions are applied to all right rows falling within each window.</div>
       </div>
 
-      <h3>Examples</h3>
+      <h3 id="examples-4">Examples</h3>
       <pre><code>(<span class="hl-kw">set</span> trades (<span class="hl-fn">table</span> [<span class="hl-sym">Sym</span> <span class="hl-sym">Time</span> <span class="hl-sym">Price</span>]
     (<span class="hl-fn">list</span> [<span class="hl-str">x</span> <span class="hl-str">x</span> <span class="hl-str">x</span>]
           [<span class="hl-num">12:00:01</span> <span class="hl-num">12:00:04</span> <span class="hl-num">12:00:06</span>]
@@ -329,7 +329,7 @@
 (<span class="hl-fn">window-join</span> [<span class="hl-sym">Sym</span> <span class="hl-sym">Time</span>] intervals trades quotes
     {<span class="hl-sym">size_min:</span> (<span class="hl-fn">min</span> Size) <span class="hl-sym">size_max:</span> (<span class="hl-fn">max</span> Size)})</code></pre>
 
-      <h3>Large-scale Window Join</h3>
+      <h3 id="large-scale-window-join">Large-scale Window Join</h3>
       <pre><code>(<span class="hl-kw">set</span> n <span class="hl-num">100000</span>)
 (<span class="hl-kw">set</span> trades (<span class="hl-fn">table</span> [<span class="hl-sym">Sym</span> <span class="hl-sym">Ts</span> <span class="hl-sym">Price</span>]
     (<span class="hl-fn">list</span> tsym ttime (<span class="hl-fn">+</span> <span class="hl-num">10</span> (<span class="hl-fn">til</span> n)))))

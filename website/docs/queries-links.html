@@ -199,7 +199,7 @@
       <h2 id="construct">Linking a Column in a Table</h2>
       <p>The realistic shape: you have two tables and want a foreign-key-style relationship between them.  Build a row-id column on the dependent side, attach the link, and stash it back into the table.  All subsequent queries through that table automatically dereference through the link.</p>
 
-      <h3>Signature</h3>
+      <h3 id="signature">Signature</h3>
       <div class="fn-card">
         <div class="fn-card-header">
           <span class="fn-name">(.col.link target int-vec)</span>
@@ -207,7 +207,7 @@
         <div class="fn-desc">Attach the column as a link to the table named by <code>target</code> (a sym).  Validates that <code>target</code> resolves to a <code>RAY_TABLE</code> in the current environment and that the input is a numeric int column.  Returns a new column with <code>HAS_LINK</code> set; the underlying integer values are unchanged.</div>
       </div>
 
-      <h3>Worked Example: orders → customers</h3>
+      <h3 id="worked-example-orders-customers">Worked Example: orders → customers</h3>
       <p>Two tables: <code>customers</code> with <code>id</code>, <code>name</code>, <code>city</code>; <code>orders</code> with <code>oid</code>, <code>qty</code>, and a <code>cust</code> column holding row indices into <code>customers</code>.</p>
 
       <pre><code><span class="hl-comment">; Set up the target ('customers' must be bound in env before linking).</span>
@@ -251,7 +251,7 @@ orders.cust.id         <span class="hl-comment">; ⇒ [100 300 200 100]</span></
         <strong>Dotted access inside <code>select</code> / <code>update</code> clauses is not yet supported.</strong>  Using <code>cust.name</code> directly in a projection (<code>(select {from: orders n: cust.name})</code>), a <code>by:</code> clause, or a <code>where:</code> predicate currently errors out at compile time.  Today's workflow is to resolve the linked column at the top level &mdash; <code>(set names orders.cust.name)</code> &mdash; and pass the bound name into the query: <code>(select {from: orders n: names})</code> works, as does <code>(select {from: orders qty: (sum qty) by: names})</code>.  Wiring dotted-deref through the query compiler is a follow-up.
       </div>
 
-      <h3>Null Propagation</h3>
+      <h3 id="null-propagation">Null Propagation</h3>
       <p>Two sources of nulls in the result:</p>
       <ul>
         <li>If <code>linked[i]</code> is itself null (the row-id column has a null bit at row <code>i</code>), the result row is null.</li>
@@ -259,7 +259,7 @@ orders.cust.id         <span class="hl-comment">; ⇒ [100 300 200 100]</span></
         <li>Out-of-range row IDs (<code>rid &lt; 0</code> or <code>rid &gt;= target.len</code>) silently become null in the result.  This matches the prior column-store convention &mdash; safer than erroring out mid-query.</li>
       </ul>
 
-      <h3>Bind to a Local Then Aggregate</h3>
+      <h3 id="bind-to-a-local-then-aggregate">Bind to a Local Then Aggregate</h3>
       <p>To run aggregations against a derived field, resolve the dotted access at the top level, bind the result, and pass it to ordinary collection / aggregate operators:</p>
 
       <pre><code>(<span class="hl-kw">set</span> cities <span class="hl-sym">orders.cust.city</span>)   <span class="hl-comment">; ⇒ ["NYC" "SF" "LA" "NYC"]</span>
@@ -310,14 +310,14 @@ orders.cust.id         <span class="hl-comment">; ⇒ [100 300 200 100]</span></
       <p>Linked columns work with <a href="storage.html">parted (partitioned) tables</a> in one direction only: a parted <strong>fact</strong> table may carry a linked column that points at a <em>non-parted</em> dim table (in-memory or splayed). The reverse &mdash; a link whose target is itself parted &mdash; is rejected with <code>error: nyi: target table has a parted column</code>. Today's deref math (<code>target_col[linkcol[i]]</code>) is straight indexing with no notion of which segment a global rowid lives in; pointing a link at a parted target would need a partition-locator pass that v1 doesn't provide.</p>
       <p>The check fires at <strong>two points</strong>: at attach time (<code>(.col.link 'parted_dim ...)</code> errors immediately) and at deref time (when the linked sym was bound to a non-parted table at attach but later rebound to a parted one, or when a link reattached from a <code>.link</code> sidecar resolves to a parted target). Without the deref-time check, lazy rebinds and disk-loaded links would slip past the attach guard and produce a silent wrong-answer bug.</p>
 
-      <h3>Supported shape</h3>
+      <h3 id="supported-shape">Supported shape</h3>
       <ul>
         <li>Many parted segments (e.g. <code>2024.01.01/facts/</code>, <code>2024.01.02/facts/</code>) all hold their own copy of the link sidecar pointing to the same dim sym name.</li>
         <li><code>ray_read_splayed</code> (used internally by <code>ray_read_parted</code>) re-attaches <code>HAS_LINK</code> on every per-segment column via <code>try_load_link_sidecar</code>; the per-VM-segment vectors that come out the other end carry <code>HAS_LINK</code> + <code>link_target</code> exactly as a non-parted load would.</li>
         <li>Segment streaming (<code>build_segment_table</code>) extracts <code>segs[seg_idx]</code> by retain, so each per-segment view in the streamed flat table inherits the link without any extra plumbing.  Deref against the (unchanging, non-parted) dim is the standard <code>ray_link_deref</code> path.</li>
       </ul>
 
-      <h3>Why not parted dims?</h3>
+      <h3 id="why-not-parted-dims">Why not parted dims?</h3>
       <p>Two design forks would need to be settled before parted-target links could ship: (1) global rowids (link payload offsets into the conceptual concatenation of all dim partitions, requiring an O(log p) partition-locator search per deref), or (2) per-partition rowids (the link is local to its own partition; the dim must be partitioned the same way as the fact). Both have legitimate use cases &mdash; the design is deferred until a real workload picks one. For now, keep dim tables unpartitioned (a small splayed directory or in-memory table fits all common workloads), or fall back to a regular hash join inside the streamed query.</p>
 
       <!-- ============================================================ -->

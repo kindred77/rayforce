@@ -182,7 +182,7 @@
       <h1>Quick Start</h1>
       <p class="page-subtitle">Build Rayforce from source, start the Rayfall REPL, and run your first query in under 5 minutes.</p>
 
-      <h2>Prerequisites</h2>
+      <h2 id="prerequisites">Prerequisites</h2>
       <p>Rayforce is a pure C17 library with zero external dependencies. You need:</p>
       <ul>
         <li>A <strong>C17-compatible compiler</strong> &mdash; GCC 7+ or Clang 6+</li>
@@ -190,20 +190,20 @@
         <li><strong>POSIX environment</strong> (Linux, macOS, WSL)</li>
       </ul>
 
-      <h2>Build from Source</h2>
+      <h2 id="build-from-source">Build from Source</h2>
       <p>Clone the repository and build:</p>
       <pre><code>git clone https://github.com/RayforceDB/rayforce.git
 cd rayforce</code></pre>
 
-      <h3>Debug Build (default)</h3>
+      <h3 id="debug-build-default">Debug Build (default)</h3>
       <p>The default build enables AddressSanitizer (ASan) and UndefinedBehaviorSanitizer (UBSan) for maximum safety during development:</p>
       <pre><code>make</code></pre>
 
-      <h3>Release Build</h3>
+      <h3 id="release-build">Release Build</h3>
       <p>Optimized build with <code>-O3</code> and no sanitizers:</p>
       <pre><code>make release</code></pre>
 
-      <h3>Run Tests</h3>
+      <h3 id="run-tests">Run Tests</h3>
       <p>Rayforce ships with a comprehensive test suite covering every subsystem:</p>
       <pre><code><span class="hl-comment"># Run all tests</span>
 make test
@@ -214,13 +214,13 @@ make test
 <span class="hl-comment"># Run tests matching a pattern</span>
 ./rayforce.test --suite /lang</code></pre>
 
-      <h2>Start the REPL</h2>
+      <h2 id="start-the-repl">Start the REPL</h2>
       <p>The Rayfall REPL provides an interactive environment with syntax highlighting, bracket matching, tab completion, and multi-line input:</p>
       <pre><code>./rayforce</code></pre>
       <p>You will see the <code>‣</code> prompt (a green triangle bullet):</p>
       <pre><code><span class="hl-comment">‣</span></code></pre>
 
-      <h2>Your First Table</h2>
+      <h2 id="your-first-table">Your First Table</h2>
       <p>Create a table with two columns using the <code>table</code> function. Column names are symbols (quoted identifiers), and column data are vectors:</p>
       <pre><code><span class="hl-comment">‣</span> (<span class="hl-kw">set</span> t (<span class="hl-fn">table</span> [<span class="hl-sym">x</span> <span class="hl-sym">y</span>] (<span class="hl-fn">list</span> [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span>] [<span class="hl-str">A</span> <span class="hl-str">B</span> <span class="hl-str">C</span>])))
 ┌─────┬───────────────────────────────┐
@@ -234,7 +234,7 @@ make test
 │ 3 rows (3 shown) 2 columns (2 shown)│
 └─────────────────────────────────────┘</code></pre>
 
-      <h2>Your First Query</h2>
+      <h2 id="your-first-query">Your First Query</h2>
       <p>Use <code>select</code> to query the table. The <code>where:</code> clause filters rows, and you can project specific columns:</p>
       <pre><code><span class="hl-comment">‣</span> (<span class="hl-kw">select</span> {<span class="hl-sym">from:</span>t <span class="hl-sym">where:</span> (<span class="hl-fn">&gt;</span> <span class="hl-sym">x</span> <span class="hl-num">1</span>)})
 ┌─────┬───────────────────────────────┐
@@ -274,12 +274,12 @@ make test
 │ 3 rows (3 shown) 2 columns (2 shown)│
 └─────────────────────────────────────┘</code></pre>
 
-      <h2>Load a CSV File</h2>
+      <h2 id="load-a-csv-file">Load a CSV File</h2>
       <p>Load data from CSV files with automatic type inference, parallel parsing, and null handling:</p>
       <pre><code><span class="hl-comment">‣</span> (<span class="hl-kw">set</span> data (<span class="hl-fn">.csv.read</span> <span class="hl-str">"trades.csv"</span>))
 <span class="hl-comment">‣</span> (<span class="hl-kw">select</span> {<span class="hl-sym">from:</span>data <span class="hl-sym">where:</span> (<span class="hl-fn">&gt;</span> price <span class="hl-num">100</span>)})</code></pre>
 
-      <h2>Run a Script</h2>
+      <h2 id="run-a-script">Run a Script</h2>
       <p>Rayfall scripts use the <code>.rfl</code> extension. Run them directly from the command line:</p>
       <pre><code><span class="hl-comment"># Run an example script</span>
 ./rayforce examples/rfl/pivot.rfl
@@ -287,7 +287,7 @@ make test
 <span class="hl-comment"># Run your own script</span>
 ./rayforce my-analysis.rfl</code></pre>
 
-      <h2>REPL Commands</h2>
+      <h2 id="repl-commands">REPL Commands</h2>
       <p>The REPL supports several built-in commands:</p>
       <table>
         <thead>
@@ -305,7 +305,7 @@ make test
         </tbody>
       </table>
 
-      <h2>What's Next</h2>
+      <h2 id="whats-next">What's Next</h2>
       <ul>
         <li><a href="rayfall-syntax.html"><strong>Syntax &amp; Types</strong></a> &mdash; Learn the full Rayfall language</li>
         <li><a href="rayfall-functions.html"><strong>Functions Reference</strong></a> &mdash; Browse all 120+ built-in functions</li>

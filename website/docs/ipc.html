@@ -186,7 +186,7 @@
         <strong>New to IPC?</strong> Start with the <a href="guide-ipc.html">IPC Guide</a> for a hands-on walkthrough of server setup, remote queries, authentication, and multi-process patterns. This page is a technical reference.
       </div>
 
-      <h2>Overview</h2>
+      <h2 id="overview">Overview</h2>
       <p>Rayforce provides a complete IPC system for client-server communication. A server listens on a TCP port, accepts connections, and evaluates queries sent by clients. The wire format uses the same compact binary serialization for all Rayforce types, with automatic delta/RLE compression for large payloads.</p>
 
       <h2 id="server-mode">Server Mode</h2>
@@ -211,7 +211,7 @@
       <h2 id="authentication">Authentication</h2>
       <p>The <code>-u</code> and <code>-U</code> flags enable password authentication for IPC connections. Clients must provide valid credentials during the handshake or the connection is rejected.</p>
 
-      <h3>-u (password required)</h3>
+      <h3 id="-u-password-required">-u (password required)</h3>
       <pre><code><span class="hl-comment"># Server: require password</span>
 ./rayforce -p 5000 -u secret123
 
@@ -222,7 +222,7 @@
 
       <p>All clients must authenticate. The username field is transmitted but not validated &mdash; only the password is checked.</p>
 
-      <h3>-U (password + restricted mode)</h3>
+      <h3 id="-u-password-restricted-mode">-U (password + restricted mode)</h3>
       <pre><code><span class="hl-comment"># Server: require password, restrict IPC to read-only</span>
 ./rayforce -p 5000 -U secret123</code></pre>
 
@@ -260,7 +260,7 @@
       <h2 id="client-builtins">Client Builtins</h2>
       <p>Connect to a running server and send queries from Rayfall:</p>
 
-      <h3>.ipc.open</h3>
+      <h3 id="ipcopen">.ipc.open</h3>
       <pre><code><span class="hl-comment">;; Connect to a server (no auth)</span>
 (<span class="hl-kw">set</span> h (<span class="hl-fn">.ipc.open</span> <span class="hl-str">"127.0.0.1:5000"</span>))
 <span class="hl-comment">;; =&gt; 0  (connection handle)</span>
@@ -270,7 +270,7 @@
 <span class="hl-comment">;; =&gt; 0  (connection handle)</span></code></pre>
       <p>The format is <code>"host:port"</code> for unauthenticated connections, or <code>"host:port:user:password"</code> when the server requires authentication. If the server requires auth and no credentials are provided, <code>.ipc.open</code> returns an <code>"access"</code> error.</p>
 
-      <h3>.ipc.send</h3>
+      <h3 id="ipcsend">.ipc.send</h3>
       <p><code>.ipc.send</code> sends any serializable value to the server and returns the result. The server&rsquo;s behavior depends on the payload type:</p>
 
       <table>
@@ -323,7 +323,7 @@
 (<span class="hl-fn">.ipc.send</span> h (<span class="hl-fn">list</span> select {<span class="hl-sym">from:</span> trades <span class="hl-sym">where:</span> (<span class="hl-fn">list</span> &gt; (quote price) threshold)}))
 <span class="hl-comment">;; =&gt; trades where price &gt; 200</span></code></pre>
 
-      <h3>.ipc.close</h3>
+      <h3 id="ipcclose">.ipc.close</h3>
       <pre><code><span class="hl-comment">;; Close the connection</span>
 (<span class="hl-fn">.ipc.close</span> h)</code></pre>
 
@@ -331,7 +331,7 @@
         <strong>Message types.</strong> <code>.ipc.send</code> uses synchronous messaging &mdash; it blocks until the server returns a result. Asynchronous (fire-and-forget) messaging is available via the C API (<code>ray_ipc_send_async</code>).
       </div>
 
-      <h2>Serialization with <code>ser</code></h2>
+      <h2 id="serialization-with-ser">Serialization with <code>ser</code></h2>
       <p>The <code>ser</code> builtin converts any value to a binary buffer (a <code>U8</code> vector). Pass it any Rayforce value &mdash; atom, vector, list, or table:</p>
 
       <pre><code><span class="hl-comment">;; Serialize an integer</span>
@@ -350,7 +350,7 @@
 
       <p>The result is always a <code>U8</code> byte vector containing the IPC header followed by the serialized payload.</p>
 
-      <h2>Deserialization with <code>de</code></h2>
+      <h2 id="deserialization-with-de">Deserialization with <code>de</code></h2>
       <p>The <code>de</code> builtin reconstructs a value from its binary representation. Compose it with <code>ser</code> for a perfect round-trip:</p>
 
       <pre><code><span class="hl-comment">;; Round-trip an integer</span>
@@ -382,7 +382,7 @@
 (<span class="hl-fn">de</span> (<span class="hl-fn">ser</span> t))
 <span class="hl-comment">;; =&gt; the same 3-row table with columns x (i64) and y (sym)</span></code></pre>
 
-      <h2>Wire Format</h2>
+      <h2 id="wire-format">Wire Format</h2>
       <p>Every serialized payload begins with a 16-byte <code>ray_ipc_header_t</code> header, followed by the serialized object bytes. The header layout:</p>
 
       <table>
@@ -432,7 +432,7 @@
       </ul>
       <p>If compression doesn&rsquo;t reduce the payload size, the data is sent uncompressed.</p>
 
-      <h2>Supported Types</h2>
+      <h2 id="supported-types">Supported Types</h2>
       <p>All core Rayforce types serialize and deserialize faithfully:</p>
 
       <table>
@@ -454,7 +454,7 @@
         </tbody>
       </table>
 
-      <h2>C API</h2>
+      <h2 id="c-api">C API</h2>
       <p>The serialization functions are declared in <code>src/store/serde.h</code>:</p>
 
       <table>

@@ -319,7 +319,7 @@ true
         </tbody>
       </table>
 
-      <h3>C API Example</h3>
+      <h3 id="c-api-example">C API Example</h3>
       <pre><code><span class="hl-comment">/* Filter rows where upper(name) LIKE "A*" and compute strlen */</span>
 <span class="hl-type">ray_graph_t</span>* g = <span class="hl-fn">ray_graph_new</span>(table);
 
@@ -337,7 +337,7 @@ true
       <h2 id="internals">String Pool Internals</h2>
       <p>Understanding the internal layout helps explain performance characteristics of string operations.</p>
 
-      <h3>ray_str_t Element Layout (16 bytes)</h3>
+      <h3 id="ray-str-t-element-layout-16-bytes">ray_str_t Element Layout (16 bytes)</h3>
       <table>
         <thead>
           <tr>
@@ -358,10 +358,10 @@ true
         <strong>SSO threshold:</strong> Strings of 12 bytes or fewer are stored entirely within the 16-byte element &mdash; no heap allocation, no pointer chase. The majority of real-world strings (tickers, codes, short names) benefit from this optimization. Access via <code>ray_str_vec_get()</code> returns a pointer to the inline data or pool data transparently.
       </div>
 
-      <h3>Hash and Comparison</h3>
+      <h3 id="hash-and-comparison">Hash and Comparison</h3>
       <p>String hashing uses <code>ray_str_t_hash()</code> which operates directly on the element bytes. Comparison via <code>ray_str_t_cmp()</code> / <code>ray_str_t_eq()</code> first compares the 4-byte prefix for fast rejection, then falls through to a full byte comparison only when prefixes match. This makes hash joins and group-by on string columns significantly faster than naive approaches.</p>
 
-      <h3>Dictionary-Encoded Symbol Width</h3>
+      <h3 id="dictionary-encoded-symbol-width">Dictionary-Encoded Symbol Width</h3>
       <p><code>RAY_SYM</code> columns use adaptive-width integer indices to minimize memory:</p>
       <table>
         <thead>
