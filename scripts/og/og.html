@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>OG image source</title>
+
+  <style>
+    /* ── Self-hosted fonts (mirrors website/style.css) ─────────────── */
+    @font-face {
+      font-family: 'Inter';
+      font-style: normal; font-weight: 400; font-display: block;
+      src: url('../../website/assets/fonts/inter-400.woff2') format('woff2');
+    }
+    @font-face {
+      font-family: 'Inter';
+      font-style: normal; font-weight: 700; font-display: block;
+      src: url('../../website/assets/fonts/inter-700.woff2') format('woff2');
+    }
+    @font-face {
+      font-family: 'Oswald';
+      font-style: normal; font-weight: 700; font-display: block;
+      src: url('../../website/assets/fonts/oswald-700.woff2') format('woff2');
+    }
+
+    /* ── Tokens (verbatim from website/style.css :root) ────────────── */
+    :root {
+      --bg: #0a0e13;
+      --primary: #e9a033;
+      --accent: #5eead4;
+      --accent-blue: #60a5fa;
+      --text: #f1f5f9;
+      --text-muted: #7b8fa0;
+    }
+
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+    html, body {
+      margin: 0; padding: 0;
+      width: 1200px; height: 630px;
+      position: relative;
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Inter', sans-serif;
+      overflow: hidden;
+    }
+
+    /* ── Hero bg layers (verbatim from website/style.css:188-203) ──── */
+    .hero-bg { position: absolute; inset: 0; pointer-events: none; }
+
+    .hero-gradient {
+      position: absolute; inset: 0;
+      background:
+        radial-gradient(ellipse 100% 80% at 30% 20%, rgba(233, 160, 51, 0.15), transparent 60%),
+        radial-gradient(ellipse 80% 60% at 70% 80%, rgba(94, 234, 212, 0.06), transparent 50%),
+        radial-gradient(ellipse 50% 40% at 80% 20%, rgba(96, 165, 250, 0.06), transparent 50%);
+    }
+
+    .hero-grid-lines {
+      position: absolute; inset: 0;
+      background-image:
+        linear-gradient(rgba(233, 160, 51, 0.04) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(233, 160, 51, 0.04) 1px, transparent 1px);
+      background-size: 80px 80px;
+      mask-image: radial-gradient(ellipse 80% 80% at 50% 50%, black 30%, transparent 70%);
+      -webkit-mask-image: radial-gradient(ellipse 80% 80% at 50% 50%, black 30%, transparent 70%);
+    }
+
+    /* ── OG composition (logo + tagline + footer) ──────────────────── */
+    .og {
+      position: absolute; top: 0; left: 0; z-index: 1;
+      width: 1200px; height: 630px;
+      text-align: center;
+    }
+
+    .og-logo {
+      position: absolute;
+      top: 96px; left: 50%;
+      transform: translateX(-50%);
+      height: 220px; width: auto;
+    }
+
+    .og-tagline {
+      position: absolute;
+      top: 380px; left: 0; right: 0;
+      font-family: 'Inter', sans-serif;
+      font-weight: 700;
+      font-size: 44px;
+      line-height: 1.2;
+      letter-spacing: -0.01em;
+    }
+    .og-tagline .accent { color: var(--primary); }
+    .og-tagline .rest   { color: var(--text-muted); display: block; margin-top: 8px; font-weight: 400; }
+
+    .og-meta {
+      position: absolute;
+      bottom: 56px; left: 0; right: 0;
+      font-family: 'Inter', sans-serif;
+      font-weight: 400;
+      font-size: 26px;
+      color: var(--text-muted);
+      letter-spacing: 0.02em;
+    }
+    .og-meta .dot { color: var(--text-muted); opacity: 0.5; margin: 0 14px; }
+  </style>
+</head>
+<body>
+  <div class="hero-bg">
+    <div class="hero-gradient"></div>
+    <div class="hero-grid-lines"></div>
+  </div>
+
+  <div class="og">
+    <img class="og-logo" src="../../website/assets/logo-light-full.svg" alt="RayforceDB">
+
+    <p class="og-tagline">
+      <span class="accent">Columnar analytics + graph traversal</span>
+      <span class="rest">in one pipeline</span>
+    </p>
+
+    <p class="og-meta">
+      Pure C17 <span class="dot">&middot;</span> Zero deps <span class="dot">&middot;</span> MIT
+    </p>
+  </div>
+</body>
+</html>
