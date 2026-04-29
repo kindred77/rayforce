@@ -787,75 +787,115 @@ body.about-page .promo-frame {
 }
 
 /* ──────────────────────────────────────────────
-   Hero: Live Demo button + Bindings strip
+   Python API section
    ────────────────────────────────────────────── */
-.btn-hero-demo {
-  display: inline-flex; align-items: center; gap: 8px;
-  padding: 14px 24px;
-  background: rgba(94, 234, 212, 0.08);
-  color: var(--accent, #5eead4);
-  border: 1px solid rgba(94, 234, 212, 0.3);
-  border-radius: 100px;
-  font-weight: 600; font-size: .95rem;
-  text-decoration: none;
-  transition: background .15s, border-color .15s, transform .15s;
-}
-.btn-hero-demo:hover {
-  background: rgba(94, 234, 212, 0.16);
-  border-color: rgba(94, 234, 212, 0.5);
-  transform: translateY(-1px);
-}
-.btn-hero-demo svg { color: currentColor; }
-
-.hero-bindings {
-  display: flex; flex-wrap: wrap; align-items: center;
-  gap: 12px;
-  margin-top: 28px;
-  padding-top: 20px;
+.python-section {
+  position: relative;
+  padding: 120px 0;
+  background:
+    radial-gradient(ellipse 70% 50% at 80% 20%, rgba(96, 165, 250, 0.07), transparent 60%),
+    var(--bg-section);
   border-top: 1px solid var(--border);
-  font-size: .85rem;
+  border-bottom: 1px solid var(--border);
+  overflow: hidden;
 }
-.hero-bindings-label {
-  font-family: var(--mono);
-  font-size: .68rem;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: .14em;
-  color: var(--primary);
-  margin-right: 4px;
+.python-grid {
+  display: grid; grid-template-columns: 1fr 1fr;
+  gap: 64px; align-items: center;
 }
-.hero-bindings a {
-  display: inline-flex; flex-direction: column; align-items: flex-start;
-  padding: 8px 14px;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: rgba(255, 255, 255, 0.02);
+.python-content {
+  max-width: 480px;
+}
+.python-title {
+  font-family: var(--font-heading);
+  font-size: 3rem; font-weight: 700;
+  line-height: 1.1; letter-spacing: -.01em;
+  margin: 16px 0 20px;
   color: var(--text);
-  text-decoration: none;
-  font-weight: 600;
-  transition: border-color .15s, background .15s;
 }
-.hero-bindings a:hover {
-  border-color: rgba(233, 160, 51, 0.35);
+.python-lede {
+  font-size: 1.05rem; line-height: 1.65;
+  color: var(--text-muted);
+  margin: 0 0 28px;
+}
+.python-actions {
+  display: flex; flex-wrap: wrap; gap: 12px;
+}
+.python-link {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 10px 18px;
+  border: 1px solid var(--border);
+  border-radius: 100px;
+  background: rgba(255, 255, 255, 0.02);
+  color: var(--text-muted);
+  font-weight: 600; font-size: .9rem;
+  text-decoration: none;
+  transition: border-color .15s, color .15s, background .15s;
+}
+.python-link:hover {
+  color: var(--text);
+  border-color: var(--border-hover);
   background: rgba(233, 160, 51, 0.05);
 }
-.hero-bindings-sub {
-  display: block;
-  font-family: var(--mono);
-  font-size: .68rem;
-  font-weight: 400;
-  color: var(--text-muted);
-  margin-top: 2px;
-  letter-spacing: .04em;
+.python-link-primary {
+  background: linear-gradient(135deg, var(--primary), var(--primary-light));
+  color: var(--text) !important;
+  border-color: transparent;
+  box-shadow: 0 2px 12px rgba(233, 160, 51, 0.3);
+}
+.python-link-primary:hover {
+  background: linear-gradient(135deg, var(--primary-light), var(--primary));
+  box-shadow: 0 4px 20px rgba(233, 160, 51, 0.45);
+  border-color: transparent;
 }
 
-/* Mobile: stack and shrink the new nav items */
+.python-code-stack {
+  display: flex; flex-direction: column; gap: 14px;
+}
+.python-code-block {
+  position: relative;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+}
+.python-code-label {
+  position: absolute;
+  top: 10px; right: 14px;
+  font-family: var(--mono); font-size: .68rem;
+  font-weight: 600; letter-spacing: .14em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.python-code-block pre {
+  margin: 0;
+  padding: 22px 24px;
+  font-family: var(--mono);
+  font-size: .85rem;
+  line-height: 1.65;
+  color: var(--text);
+  background: none;
+  overflow-x: auto;
+}
+.python-code-block code { background: none; padding: 0; color: inherit; }
+.python-code-block .hl-kw { color: var(--primary-light); font-weight: 600; }
+.python-code-block .hl-fn { color: var(--accent-blue); }
+.python-code-block .hl-str { color: #4ade80; }
+.python-code-block .hl-num { color: #f59e0b; }
+.python-code-block .hl-comment { color: var(--text-dim); }
+
+@media (max-width: 1024px) {
+  .python-grid { grid-template-columns: 1fr; gap: 40px; }
+  .python-title { font-size: 2.4rem; }
+}
+
+/* Mobile alignment for nav widgets */
 @media (max-width: 768px) {
   .github-widget {
     margin-left: 0;
     align-self: flex-start;
   }
   .nav-link-demo { width: fit-content; }
-  .hero-bindings { gap: 8px; }
-  .hero-bindings a { padding: 6px 10px; font-size: .8rem; }
+  .python-section { padding: 80px 0; }
+  .python-title { font-size: 2rem; }
 }
