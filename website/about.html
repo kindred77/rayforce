@@ -4,12 +4,45 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>About — Rayforce</title>
-  <meta name="description" content="A 36-second animated tour of Rayforce: columnar analytics, graph traversal, and a fused morsel-driven execution pipeline in a single C17 engine.">
+  <meta name="description" content="About Rayforce — an embeddable analytics and graph engine in pure C17 by Anton Kundenko. Project background, design principles, license, and community.">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Oswald:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="style.css">
   <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+  <link rel="canonical" href="https://core.rayforcedb.com/about.html">
+  <meta name="author" content="Anton Kundenko">
+  <meta property="og:type" content="profile">
+  <meta property="og:site_name" content="Rayforce">
+  <meta property="og:title" content="About — Rayforce">
+  <meta property="og:description" content="About Rayforce — an embeddable analytics and graph engine in pure C17 by Anton Kundenko. Project background, design principles, license, and community.">
+  <meta property="og:url" content="https://core.rayforcedb.com/about.html">
+  <meta property="og:image" content="https://core.rayforcedb.com/assets/og-image.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="About — Rayforce">
+  <meta name="twitter:description" content="About Rayforce — an embeddable analytics and graph engine in pure C17 by Anton Kundenko. Project background, design principles, license, and community.">
+  <meta name="twitter:image" content="https://core.rayforcedb.com/assets/og-image.png">
+  <script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "AboutPage",
+  "url": "https://core.rayforcedb.com/about.html",
+  "mainEntity": {
+    "@type": "Person",
+    "@id": "https://core.rayforcedb.com/#author",
+    "name": "Anton Kundenko",
+    "url": "https://github.com/RayforceDB",
+    "jobTitle": "Software Engineer",
+    "knowsAbout": [
+      "Database engines",
+      "Columnar analytics",
+      "Graph algorithms",
+      "Query optimization",
+      "Systems programming in C"
+    ]
+  }
+}
+  </script>
 </head>
 <body class="about-page">
 
@@ -17,7 +50,7 @@
   <nav class="nav">
     <div class="nav-inner">
       <a href="index.html" class="nav-brand">
-        <img src="assets/logo-light-full.svg" alt="Rayforce" height="20">
+        <img src="assets/logo-light-full.svg" alt="Rayforce" width="120" height="20">
       </a>
       <button class="nav-toggle" aria-label="Toggle navigation" aria-expanded="false">
         <span></span><span></span><span></span>
@@ -36,6 +69,35 @@
   </nav>
 
   <iframe class="promo-frame" src="promo.html" title="Rayforce — animated introduction" allow="autoplay" loading="eager"></iframe>
+
+  <section class="about-content">
+    <div class="container">
+
+      <header>
+        <h1>About Rayforce</h1>
+        <p class="about-lede">Rayforce is an embeddable analytics and graph engine written in pure C17 with zero external dependencies. It was built to close the gap between systems that excel at columnar analytics and systems that excel at graph traversal — by treating both as operations on the same query DAG.</p>
+      </header>
+
+      <h2>Why it exists</h2>
+      <p>The typical analytics stack splits work across two runtimes: a columnar engine for tabular aggregation and a separate library or service for graph traversal. Each has its own data model, query language, and memory layout. Joining them means serializing data between processes, paying that cost on every step, and accepting that the optimizer can never see the full pipeline. Rayforce was built on the bet that one engine — one optimizer, one execution model, one memory allocator — can do both faster than the seam between two.</p>
+
+      <h2>Design principles</h2>
+      <ul>
+        <li><strong>Zero external dependencies.</strong> The whole engine is pure C17 with the standard library only. No third-party allocator, no Boost, no Arrow. The single header <code>rayforce.h</code> is the entire public API.</li>
+        <li><strong>One DAG for everything.</strong> Filters, joins, aggregations, window functions, and graph traversals all build into the same lazy operation DAG. The optimizer rewrites the full graph before execution begins.</li>
+        <li><strong>Morsel-driven execution.</strong> Element-wise operations fuse into single-pass pipelines that operate on 1024-element morsels and stay L1-resident. Pipeline breakers — joins, sort, group-by, window — materialize once and hand off cleanly.</li>
+        <li><strong>Custom memory model.</strong> A buddy allocator with slab caches replaces malloc; per-thread heaps remove allocator contention; deferred cross-heap merge handles worker-thread results without locks on the hot path.</li>
+        <li><strong>Embeddable first.</strong> Rayforce is a library you link, not a server you deploy. The C API is small enough to wrap from any language with an FFI.</li>
+      </ul>
+
+      <h2>The author</h2>
+      <p>Rayforce is built by <strong><a href="https://www.linkedin.com/in/anton-kundenko-a22a3667" rel="author">Anton Kundenko</a></strong>, a software engineer with a background in database internals, systems programming, and query optimization. The project is developed in the open under the MIT license — issues, pull requests, and design discussion are welcome on <a href="https://github.com/RayforceDB/rayforce" target="_blank" rel="noopener">GitHub</a> and the project's <a href="https://rayforcedb.zulipchat.com/" target="_blank" rel="noopener">Zulip community</a>.</p>
+
+      <h2>License</h2>
+      <p>Rayforce is open source under the <a href="https://github.com/RayforceDB/rayforce/blob/master/LICENSE" target="_blank" rel="noopener">MIT License</a>. You may use, modify, and distribute it freely, including in commercial products. Source and releases are on <a href="https://github.com/RayforceDB/rayforce" target="_blank" rel="noopener">GitHub</a>.</p>
+
+    </div>
+  </section>
 
   <script>
     // Embedded promo: hide the dev playback bar. Keep the Stage's own scaling

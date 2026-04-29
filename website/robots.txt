@@ -1,0 +1,45 @@
+# Rayforce — robots.txt
+# https://core.rayforcedb.com/
+
+User-agent: *
+Allow: /
+
+# AI crawlers — explicitly allowed (open-source project, citations welcome)
+User-agent: GPTBot
+Allow: /
+
+User-agent: OAI-SearchBot
+Allow: /
+
+User-agent: ChatGPT-User
+Allow: /
+
+User-agent: ClaudeBot
+Allow: /
+
+User-agent: Claude-Web
+Allow: /
+
+User-agent: anthropic-ai
+Allow: /
+
+User-agent: PerplexityBot
+Allow: /
+
+User-agent: Perplexity-User
+Allow: /
+
+User-agent: Google-Extended
+Allow: /
+
+User-agent: Applebot-Extended
+Allow: /
+
+User-agent: Bytespider
+Allow: /
+
+# Common Crawl — bulk training data scraper, opt out
+User-agent: CCBot
+Disallow: /
+
+Sitemap: https://core.rayforcedb.com/sitemap.xml
