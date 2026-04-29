@@ -556,6 +556,7 @@ code {
 /* ── CTA ─────────────────────────────────────── */
 .cta-section {
   padding: 120px 0;
+  background: var(--bg-section);
   border-top: 1px solid var(--border);
 }
 .cta-content {
