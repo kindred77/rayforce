@@ -149,7 +149,7 @@ code {
 .nav-links a {
   color: var(--text-muted); font-size: .85rem; font-weight: 500;
   padding: 6px 14px; border-radius: 100px;
-  transition: all .2s; text-decoration: none;
+  transition: color .2s, background .2s; text-decoration: none;
 }
 .nav-links a:hover {
   color: var(--text); background: rgba(233, 160, 51, 0.08);
@@ -235,7 +235,7 @@ code {
   background: linear-gradient(135deg, var(--primary), var(--primary-light));
   color: var(--text); border-radius: 100px;
   font-size: .95rem; font-weight: 600;
-  transition: all .2s;
+  transition: transform .2s, box-shadow .2s, background .2s;
   box-shadow: 0 4px 20px rgba(233, 160, 51, 0.35);
 }
 .btn-hero:hover {
@@ -247,7 +247,8 @@ code {
   display: inline-flex; align-items: center; gap: 8px;
   padding: 14px 32px; color: var(--text-muted);
   border: 1.5px solid var(--border); border-radius: 100px;
-  font-size: .95rem; font-weight: 600; transition: all .2s;
+  font-size: .95rem; font-weight: 600;
+  transition: color .2s, border-color .2s, background .2s;
 }
 .btn-hero-ghost:hover {
   color: var(--text); border-color: var(--border-hover);
@@ -261,7 +262,8 @@ code {
 .hero-number {
   background: rgba(17, 24, 32, 0.6); border: 1px solid var(--border);
   border-radius: 16px; padding: 28px;
-  backdrop-filter: blur(8px); transition: all .3s;
+  backdrop-filter: blur(8px);
+  transition: transform .3s, border-color .3s, box-shadow .3s;
 }
 .hero-number:hover {
   border-color: var(--border-hover);
@@ -316,7 +318,7 @@ code {
   background: var(--bg-card); border: 1px solid var(--border);
   border-radius: 16px; padding: 28px;
   opacity: 0; transform: translateY(24px);
-  transition: all .5s ease;
+  transition: opacity .5s ease, transform .5s ease, border-color .2s, box-shadow .3s;
 }
 .why-card-small.visible { opacity: 1; transform: translateY(0); }
 .why-card-small:hover { border-color: var(--border-hover); box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2); }
@@ -328,7 +330,7 @@ code {
   background: var(--bg-card); border: 1px solid var(--border);
   border-radius: 16px; padding: 28px;
   opacity: 0; transform: translateY(24px);
-  transition: all .5s ease;
+  transition: opacity .5s ease, transform .5s ease, border-color .2s, box-shadow .3s;
 }
 .why-card.visible { opacity: 1; transform: translateY(0); }
 .why-card:hover { border-color: var(--border-hover); box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2); }
@@ -367,7 +369,7 @@ code {
   background: var(--bg-card); border: 1px solid var(--border);
   border-radius: 16px; padding: 28px;
   opacity: 0; transform: translateY(24px);
-  transition: all .5s ease;
+  transition: opacity .5s ease, transform .5s ease, border-color .2s, box-shadow .3s;
 }
 .feature-card.visible { opacity: 1; transform: translateY(0); }
 .feature-card:hover {
@@ -536,7 +538,7 @@ code {
 .usecase-item {
   flex: 1; padding: 36px;
   opacity: 0; transform: translateY(20px);
-  transition: all .5s ease;
+  transition: opacity .5s ease, transform .5s ease, background .2s;
 }
 .usecase-item.visible { opacity: 1; transform: translateY(0); }
 .usecase-item:hover { background: rgba(233, 160, 51, 0.04); }
