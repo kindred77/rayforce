@@ -124,7 +124,10 @@ code {
   border: 1px solid var(--border);
   border-radius: 100px;
   padding: 0 8px;
-  transition: all .3s;
+  /* Don't transition `all` — width changes inside the nav (e.g. the
+     count-up GitHub widget) would otherwise animate the centered bar
+     sliding sideways. Restrict to scroll-state visuals only. */
+  transition: background .3s, border-color .3s, box-shadow .3s;
 }
 .nav.nav-scrolled {
   box-shadow: 0 4px 30px rgba(0, 0, 0, 0.4);
@@ -743,6 +746,8 @@ body.about-page { margin: 0; overflow: auto; }
   color: var(--accent, #5eead4) !important;
   border: 1px solid rgba(94, 234, 212, 0.25);
   font-weight: 600 !important;
+  white-space: nowrap;
+  flex-shrink: 0;
   transition: background .15s, border-color .15s, color .15s;
 }
 .nav-link-demo:hover {
@@ -758,6 +763,7 @@ body.about-page { margin: 0; overflow: auto; }
   border-radius: 8px;
   background: rgba(255, 255, 255, 0.02);
   overflow: hidden;
+  flex-shrink: 0;
   font-family: var(--mono);
   font-size: .78rem;
   line-height: 1;
@@ -778,10 +784,13 @@ body.about-page { margin: 0; overflow: auto; }
 .github-widget-icon { padding: 6px 9px !important; }
 .github-widget-icon svg { color: var(--text); }
 .github-widget [data-gh-stat] {
+  display: inline-block;
   font-feature-settings: 'tnum' on;
+  font-variant-numeric: tabular-nums;
   font-weight: 600;
   color: var(--text);
-  min-width: 1.5ch;
+  min-width: 3.5ch;
+  text-align: center;
 }
 
 /* ──────────────────────────────────────────────

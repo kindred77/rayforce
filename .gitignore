@@ -31,3 +31,4 @@ docs/plans/
 coverage*.info
 coverage_html/
 rayforce.cov
+.playwright-mcp/
