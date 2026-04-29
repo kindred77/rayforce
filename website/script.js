@@ -238,3 +238,30 @@ document.addEventListener('DOMContentLoaded', () => {
     termObserver.observe(terminalOutput);
   }
 });
+
+/* GitHub widget: fetch live stars/forks counts.
+ * Falls back silently if the API is rate-limited or unreachable. */
+(function () {
+  const targets = document.querySelectorAll('[data-gh-stat]');
+  if (targets.length === 0) return;
+
+  function fmt(n) {
+    if (typeof n !== 'number' || isNaN(n)) return '—';
+    if (n >= 10000) return (n / 1000).toFixed(1).replace(/\.0$/, '') + 'k';
+    if (n >= 1000)  return (n / 1000).toFixed(1) + 'k';
+    return String(n);
+  }
+
+  fetch('https://api.github.com/repos/RayforceDB/rayforce', { headers: { Accept: 'application/vnd.github+json' } })
+    .then(r => r.ok ? r.json() : Promise.reject(new Error('gh ' + r.status)))
+    .then(d => {
+      targets.forEach(el => {
+        const which = el.getAttribute('data-gh-stat');
+        if (which === 'stars') el.textContent = fmt(d.stargazers_count);
+        else if (which === 'forks') el.textContent = fmt(d.forks_count);
+      });
+    })
+    .catch(() => {
+      // Leave the static "—" placeholders. Users still get a working link.
+    });
+})();

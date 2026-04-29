@@ -1,259 +1,259 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
   <url>
-    <loc>https://core.rayforcedb.com/</loc>
+    <loc>https://rayforcedb.com/</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>weekly</changefreq>
     <priority>1.0</priority>
   </url>
   <url>
-    <loc>https://core.rayforcedb.com/about.html</loc>
+    <loc>https://rayforcedb.com/about.html</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>yearly</changefreq>
     <priority>0.4</priority>
   </url>
   <url>
-    <loc>https://core.rayforcedb.com/docs/index.html</loc>
+    <loc>https://rayforcedb.com/docs/index.html</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.8</priority>
   </url>
   <url>
-    <loc>https://core.rayforcedb.com/docs/quick-start.html</loc>
+    <loc>https://rayforcedb.com/docs/quick-start.html</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
-    <loc>https://core.rayforcedb.com/docs/tutorial.html</loc>
+    <loc>https://rayforcedb.com/docs/tutorial.html</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
-    <loc>https://core.rayforcedb.com/docs/tutorial-analytics.html</loc>
+    <loc>https://rayforcedb.com/docs/tutorial-analytics.html</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
-    <loc>https://core.rayforcedb.com/docs/tutorial-datalog.html</loc>
+    <loc>https://rayforcedb.com/docs/tutorial-datalog.html</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
-    <loc>https://core.rayforcedb.com/docs/tutorial-graph.html</loc>
+    <loc>https://rayforcedb.com/docs/tutorial-graph.html</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
-    <loc>https://core.rayforcedb.com/docs/tutorial-storage.html</loc>
+    <loc>https://rayforcedb.com/docs/tutorial-storage.html</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
-    <loc>https://core.rayforcedb.com/docs/reference.html</loc>
+    <loc>https://rayforcedb.com/docs/reference.html</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
-    <loc>https://core.rayforcedb.com/docs/data-types.html</loc>
+    <loc>https://rayforcedb.com/docs/data-types.html</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
-    <loc>https://core.rayforcedb.com/docs/data-types-collections.html</loc>
+    <loc>https://rayforcedb.com/docs/data-types-collections.html</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
-    <loc>https://core.rayforcedb.com/docs/control-flow.html</loc>
+    <loc>https://rayforcedb.com/docs/control-flow.html</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
-    <loc>https://core.rayforcedb.com/docs/operations-math.html</loc>
+    <loc>https://rayforcedb.com/docs/operations-math.html</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
-    <loc>https://core.rayforcedb.com/docs/operations-string.html</loc>
+    <loc>https://rayforcedb.com/docs/operations-string.html</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
-    <loc>https://core.rayforcedb.com/docs/queries-select.html</loc>
+    <loc>https://rayforcedb.com/docs/queries-select.html</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
-    <loc>https://core.rayforcedb.com/docs/queries-joins.html</loc>
+    <loc>https://rayforcedb.com/docs/queries-joins.html</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
-    <loc>https://core.rayforcedb.com/docs/queries-indexes.html</loc>
+    <loc>https://rayforcedb.com/docs/queries-indexes.html</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
-    <loc>https://core.rayforcedb.com/docs/queries-links.html</loc>
+    <loc>https://rayforcedb.com/docs/queries-links.html</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
-    <loc>https://core.rayforcedb.com/docs/queries-pivot.html</loc>
+    <loc>https://rayforcedb.com/docs/queries-pivot.html</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
-    <loc>https://core.rayforcedb.com/docs/indexes-overview.html</loc>
+    <loc>https://rayforcedb.com/docs/indexes-overview.html</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
-    <loc>https://core.rayforcedb.com/docs/storage.html</loc>
+    <loc>https://rayforcedb.com/docs/storage.html</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
-    <loc>https://core.rayforcedb.com/docs/ipc.html</loc>
+    <loc>https://rayforcedb.com/docs/ipc.html</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
-    <loc>https://core.rayforcedb.com/docs/repl.html</loc>
+    <loc>https://rayforcedb.com/docs/repl.html</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
-    <loc>https://core.rayforcedb.com/docs/rayfall-syntax.html</loc>
+    <loc>https://rayforcedb.com/docs/rayfall-syntax.html</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
-    <loc>https://core.rayforcedb.com/docs/rayfall-functions.html</loc>
+    <loc>https://rayforcedb.com/docs/rayfall-functions.html</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
-    <loc>https://core.rayforcedb.com/docs/datalog.html</loc>
+    <loc>https://rayforcedb.com/docs/datalog.html</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
-    <loc>https://core.rayforcedb.com/docs/graph-storage.html</loc>
+    <loc>https://rayforcedb.com/docs/graph-storage.html</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
-    <loc>https://core.rayforcedb.com/docs/graph-algorithms.html</loc>
+    <loc>https://rayforcedb.com/docs/graph-algorithms.html</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
-    <loc>https://core.rayforcedb.com/docs/vector-search.html</loc>
+    <loc>https://rayforcedb.com/docs/vector-search.html</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
-    <loc>https://core.rayforcedb.com/docs/architecture-pipeline.html</loc>
+    <loc>https://rayforcedb.com/docs/architecture-pipeline.html</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
-    <loc>https://core.rayforcedb.com/docs/architecture-memory.html</loc>
+    <loc>https://rayforcedb.com/docs/architecture-memory.html</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
-    <loc>https://core.rayforcedb.com/docs/architecture-offloading.html</loc>
+    <loc>https://rayforcedb.com/docs/architecture-offloading.html</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
-    <loc>https://core.rayforcedb.com/docs/c-api-core.html</loc>
+    <loc>https://rayforcedb.com/docs/c-api-core.html</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
-    <loc>https://core.rayforcedb.com/docs/c-api-dag.html</loc>
+    <loc>https://rayforcedb.com/docs/c-api-dag.html</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
-    <loc>https://core.rayforcedb.com/docs/guide-types.html</loc>
+    <loc>https://rayforcedb.com/docs/guide-types.html</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
-    <loc>https://core.rayforcedb.com/docs/guide-analytics.html</loc>
+    <loc>https://rayforcedb.com/docs/guide-analytics.html</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
-    <loc>https://core.rayforcedb.com/docs/guide-indexes.html</loc>
+    <loc>https://rayforcedb.com/docs/guide-indexes.html</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
-    <loc>https://core.rayforcedb.com/docs/guide-storage.html</loc>
+    <loc>https://rayforcedb.com/docs/guide-storage.html</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
-    <loc>https://core.rayforcedb.com/docs/guide-memory.html</loc>
+    <loc>https://rayforcedb.com/docs/guide-memory.html</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
-    <loc>https://core.rayforcedb.com/docs/guide-ipc.html</loc>
+    <loc>https://rayforcedb.com/docs/guide-ipc.html</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
-    <loc>https://core.rayforcedb.com/docs/guide-errors.html</loc>
+    <loc>https://rayforcedb.com/docs/guide-errors.html</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
   <url>
-    <loc>https://core.rayforcedb.com/docs/guide-datalog.html</loc>
+    <loc>https://rayforcedb.com/docs/guide-datalog.html</loc>
     <lastmod>2026-04-29</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>

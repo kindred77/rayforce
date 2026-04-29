@@ -6,67 +6,67 @@ License: MIT. Author: Anton Kundenko. Source: https://github.com/RayforceDB/rayf
 
 ## Getting Started
 
-- [Quick Start](https://core.rayforcedb.com/docs/quick-start.html): Build from source, start the REPL, create a table, and run a first query.
-- [Tutorial](https://core.rayforcedb.com/docs/tutorial.html): Guided walkthrough of core capabilities.
-- [Analytics Tutorial](https://core.rayforcedb.com/docs/tutorial-analytics.html)
-- [Graph Tutorial](https://core.rayforcedb.com/docs/tutorial-graph.html)
-- [Datalog Tutorial](https://core.rayforcedb.com/docs/tutorial-datalog.html)
-- [Storage Tutorial](https://core.rayforcedb.com/docs/tutorial-storage.html)
+- [Quick Start](https://rayforcedb.com/docs/quick-start.html): Build from source, start the REPL, create a table, and run a first query.
+- [Tutorial](https://rayforcedb.com/docs/tutorial.html): Guided walkthrough of core capabilities.
+- [Analytics Tutorial](https://rayforcedb.com/docs/tutorial-analytics.html)
+- [Graph Tutorial](https://rayforcedb.com/docs/tutorial-graph.html)
+- [Datalog Tutorial](https://rayforcedb.com/docs/tutorial-datalog.html)
+- [Storage Tutorial](https://rayforcedb.com/docs/tutorial-storage.html)
 
 ## Rayfall Language
 
-- [Syntax](https://core.rayforcedb.com/docs/rayfall-syntax.html): Functional query language with S-expression syntax.
-- [Functions Reference](https://core.rayforcedb.com/docs/rayfall-functions.html): All built-in functions.
-- [Math Operations](https://core.rayforcedb.com/docs/operations-math.html)
-- [String Operations](https://core.rayforcedb.com/docs/operations-string.html)
-- [Control Flow](https://core.rayforcedb.com/docs/control-flow.html)
-- [REPL Reference](https://core.rayforcedb.com/docs/repl.html)
-- [All Functions Reference](https://core.rayforcedb.com/docs/reference.html)
+- [Syntax](https://rayforcedb.com/docs/rayfall-syntax.html): Functional query language with S-expression syntax.
+- [Functions Reference](https://rayforcedb.com/docs/rayfall-functions.html): All built-in functions.
+- [Math Operations](https://rayforcedb.com/docs/operations-math.html)
+- [String Operations](https://rayforcedb.com/docs/operations-string.html)
+- [Control Flow](https://rayforcedb.com/docs/control-flow.html)
+- [REPL Reference](https://rayforcedb.com/docs/repl.html)
+- [All Functions Reference](https://rayforcedb.com/docs/reference.html)
 
 ## Data and Types
 
-- [Data Types](https://core.rayforcedb.com/docs/data-types.html)
-- [Collections](https://core.rayforcedb.com/docs/data-types-collections.html)
+- [Data Types](https://rayforcedb.com/docs/data-types.html)
+- [Collections](https://rayforcedb.com/docs/data-types-collections.html)
 
 ## Queries
 
-- [Select Queries](https://core.rayforcedb.com/docs/queries-select.html)
-- [Joins](https://core.rayforcedb.com/docs/queries-joins.html)
-- [Linked Columns](https://core.rayforcedb.com/docs/queries-links.html)
-- [Indexes Overview](https://core.rayforcedb.com/docs/indexes-overview.html)
-- [Accelerator Indexes](https://core.rayforcedb.com/docs/queries-indexes.html)
-- [Pivot](https://core.rayforcedb.com/docs/queries-pivot.html)
-- [Vector Search](https://core.rayforcedb.com/docs/vector-search.html)
+- [Select Queries](https://rayforcedb.com/docs/queries-select.html)
+- [Joins](https://rayforcedb.com/docs/queries-joins.html)
+- [Linked Columns](https://rayforcedb.com/docs/queries-links.html)
+- [Indexes Overview](https://rayforcedb.com/docs/indexes-overview.html)
+- [Accelerator Indexes](https://rayforcedb.com/docs/queries-indexes.html)
+- [Pivot](https://rayforcedb.com/docs/queries-pivot.html)
+- [Vector Search](https://rayforcedb.com/docs/vector-search.html)
 
 ## Storage and IPC
 
-- [Columnar Storage](https://core.rayforcedb.com/docs/storage.html)
-- [IPC and Serialization](https://core.rayforcedb.com/docs/ipc.html)
+- [Columnar Storage](https://rayforcedb.com/docs/storage.html)
+- [IPC and Serialization](https://rayforcedb.com/docs/ipc.html)
 
 ## Graph Engine
 
-- [Graph Storage](https://core.rayforcedb.com/docs/graph-storage.html)
-- [Graph Algorithms](https://core.rayforcedb.com/docs/graph-algorithms.html): BFS, DFS, Dijkstra, A*, PageRank, Louvain, betweenness, worst-case optimal joins.
+- [Graph Storage](https://rayforcedb.com/docs/graph-storage.html)
+- [Graph Algorithms](https://rayforcedb.com/docs/graph-algorithms.html): BFS, DFS, Dijkstra, A*, PageRank, Louvain, betweenness, worst-case optimal joins.
 
 ## Architecture
 
-- [Pipeline and Optimizer](https://core.rayforcedb.com/docs/architecture-pipeline.html): Three-phase pipeline — DAG construction, multi-pass optimization, morsel-driven execution.
-- [Memory Model](https://core.rayforcedb.com/docs/architecture-memory.html): Custom buddy allocator with slab caches, per-thread heaps, zero-malloc query execution.
-- [Block Offloading](https://core.rayforcedb.com/docs/architecture-offloading.html)
+- [Pipeline and Optimizer](https://rayforcedb.com/docs/architecture-pipeline.html): Three-phase pipeline — DAG construction, multi-pass optimization, morsel-driven execution.
+- [Memory Model](https://rayforcedb.com/docs/architecture-memory.html): Custom buddy allocator with slab caches, per-thread heaps, zero-malloc query execution.
+- [Block Offloading](https://rayforcedb.com/docs/architecture-offloading.html)
 
 ## C API
 
-- [Core API](https://core.rayforcedb.com/docs/c-api-core.html): Embed Rayforce in C applications via the single header `rayforce.h`.
-- [DAG API](https://core.rayforcedb.com/docs/c-api-dag.html): Programmatic query graph construction.
+- [Core API](https://rayforcedb.com/docs/c-api-core.html): Embed Rayforce in C applications via the single header `rayforce.h`.
+- [DAG API](https://rayforcedb.com/docs/c-api-dag.html): Programmatic query graph construction.
 
 ## Guides
 
-- [Indexes Guide](https://core.rayforcedb.com/docs/guide-indexes.html)
-- [Analytics Guide](https://core.rayforcedb.com/docs/guide-analytics.html)
-- [Datalog Guide](https://core.rayforcedb.com/docs/guide-datalog.html)
-- [Datalog Reference](https://core.rayforcedb.com/docs/datalog.html)
-- [Storage Guide](https://core.rayforcedb.com/docs/guide-storage.html)
-- [IPC Guide](https://core.rayforcedb.com/docs/guide-ipc.html)
-- [Error Handling](https://core.rayforcedb.com/docs/guide-errors.html)
-- [Memory and Monitoring](https://core.rayforcedb.com/docs/guide-memory.html)
-- [Type Casting](https://core.rayforcedb.com/docs/guide-types.html)
+- [Indexes Guide](https://rayforcedb.com/docs/guide-indexes.html)
+- [Analytics Guide](https://rayforcedb.com/docs/guide-analytics.html)
+- [Datalog Guide](https://rayforcedb.com/docs/guide-datalog.html)
+- [Datalog Reference](https://rayforcedb.com/docs/datalog.html)
+- [Storage Guide](https://rayforcedb.com/docs/guide-storage.html)
+- [IPC Guide](https://rayforcedb.com/docs/guide-ipc.html)
+- [Error Handling](https://rayforcedb.com/docs/guide-errors.html)
+- [Memory and Monitoring](https://rayforcedb.com/docs/guide-memory.html)
+- [Type Casting](https://rayforcedb.com/docs/guide-types.html)

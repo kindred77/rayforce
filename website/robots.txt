@@ -1,5 +1,5 @@
 # Rayforce — robots.txt
-# https://core.rayforcedb.com/
+# https://rayforcedb.com/
 
 User-agent: *
 Allow: /
@@ -42,4 +42,4 @@ Allow: /
 User-agent: CCBot
 Disallow: /
 
-Sitemap: https://core.rayforcedb.com/sitemap.xml
+Sitemap: https://rayforcedb.com/sitemap.xml

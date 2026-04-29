@@ -734,3 +734,128 @@ body.about-page .promo-frame {
   width: 100vw; height: 100vh;
   border: 0; background: #0a0a0a;
 }
+
+/* ──────────────────────────────────────────────
+   Nav: Live Demo highlight + GitHub widget
+   ────────────────────────────────────────────── */
+.nav-link-demo {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 6px 10px; border-radius: 100px;
+  background: rgba(94, 234, 212, 0.08);
+  color: var(--accent, #5eead4) !important;
+  border: 1px solid rgba(94, 234, 212, 0.25);
+  font-weight: 600 !important;
+  transition: background .15s, border-color .15s, color .15s;
+}
+.nav-link-demo:hover {
+  background: rgba(94, 234, 212, 0.16);
+  border-color: rgba(94, 234, 212, 0.4);
+}
+.nav-link-demo svg { color: currentColor; }
+
+.github-widget {
+  display: inline-flex; align-items: stretch;
+  margin-left: 4px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.02);
+  overflow: hidden;
+  font-family: var(--mono);
+  font-size: .78rem;
+  line-height: 1;
+}
+.github-widget a {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 6px 10px;
+  color: var(--text-muted) !important;
+  text-decoration: none;
+  background: none;
+  transition: background .15s, color .15s;
+}
+.github-widget a + a { border-left: 1px solid var(--border); }
+.github-widget a:hover {
+  color: var(--text) !important;
+  background: rgba(233, 160, 51, 0.08);
+}
+.github-widget-icon { padding: 6px 9px !important; }
+.github-widget-icon svg { color: var(--text); }
+.github-widget [data-gh-stat] {
+  font-feature-settings: 'tnum' on;
+  font-weight: 600;
+  color: var(--text);
+  min-width: 1.5ch;
+}
+
+/* ──────────────────────────────────────────────
+   Hero: Live Demo button + Bindings strip
+   ────────────────────────────────────────────── */
+.btn-hero-demo {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 14px 24px;
+  background: rgba(94, 234, 212, 0.08);
+  color: var(--accent, #5eead4);
+  border: 1px solid rgba(94, 234, 212, 0.3);
+  border-radius: 100px;
+  font-weight: 600; font-size: .95rem;
+  text-decoration: none;
+  transition: background .15s, border-color .15s, transform .15s;
+}
+.btn-hero-demo:hover {
+  background: rgba(94, 234, 212, 0.16);
+  border-color: rgba(94, 234, 212, 0.5);
+  transform: translateY(-1px);
+}
+.btn-hero-demo svg { color: currentColor; }
+
+.hero-bindings {
+  display: flex; flex-wrap: wrap; align-items: center;
+  gap: 12px;
+  margin-top: 28px;
+  padding-top: 20px;
+  border-top: 1px solid var(--border);
+  font-size: .85rem;
+}
+.hero-bindings-label {
+  font-family: var(--mono);
+  font-size: .68rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .14em;
+  color: var(--primary);
+  margin-right: 4px;
+}
+.hero-bindings a {
+  display: inline-flex; flex-direction: column; align-items: flex-start;
+  padding: 8px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.02);
+  color: var(--text);
+  text-decoration: none;
+  font-weight: 600;
+  transition: border-color .15s, background .15s;
+}
+.hero-bindings a:hover {
+  border-color: rgba(233, 160, 51, 0.35);
+  background: rgba(233, 160, 51, 0.05);
+}
+.hero-bindings-sub {
+  display: block;
+  font-family: var(--mono);
+  font-size: .68rem;
+  font-weight: 400;
+  color: var(--text-muted);
+  margin-top: 2px;
+  letter-spacing: .04em;
+}
+
+/* Mobile: stack and shrink the new nav items */
+@media (max-width: 768px) {
+  .github-widget {
+    margin-left: 0;
+    align-self: flex-start;
+  }
+  .nav-link-demo { width: fit-content; }
+  .hero-bindings { gap: 8px; }
+  .hero-bindings a { padding: 6px 10px; font-size: .8rem; }
+}
