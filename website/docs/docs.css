@@ -144,7 +144,7 @@ code {
   display: flex; align-items: center;
   color: var(--text);
 }
-.docs-brand img { display: block; height: 22px; width: auto; }
+.docs-brand img { display: block; height: 32px; width: auto; }
 
 /* ── Docs GitHub Button ──────────────────────── */
 .nav-github {
