@@ -239,11 +239,17 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 });
 
-/* GitHub widget: fetch live stars/forks counts and count up smoothly.
- * Falls back silently if the API is rate-limited or unreachable. */
+/* GitHub widget: fetch live stars/forks via ungh.cc (CDN-cached proxy
+ * without GitHub's 60/hour unauthenticated rate limit) with a 1-hour
+ * localStorage cache so repeat visits don't refetch. Falls back silently
+ * if every source is unreachable. */
 (function () {
   const targets = document.querySelectorAll('[data-gh-stat]');
   if (targets.length === 0) return;
+
+  const REPO = 'RayforceDB/rayforce';
+  const CACHE_KEY = 'gh-stats:' + REPO;
+  const CACHE_TTL = 60 * 60 * 1000; /* 1 hour */
 
   function fmt(n) {
     if (typeof n !== 'number' || isNaN(n)) return '—';
@@ -267,16 +273,52 @@ document.addEventListener('DOMContentLoaded', () => {
     requestAnimationFrame(tick);
   }
 
-  fetch('https://api.github.com/repos/RayforceDB/rayforce', { headers: { Accept: 'application/vnd.github+json' } })
-    .then(r => r.ok ? r.json() : Promise.reject(new Error('gh ' + r.status)))
+  function paint(stars, forks) {
+    targets.forEach(el => {
+      const which = el.getAttribute('data-gh-stat');
+      const target = which === 'stars' ? stars
+                   : which === 'forks' ? forks
+                   : NaN;
+      animateCount(el, target, 900);
+    });
+  }
+
+  function readCache() {
+    try {
+      const raw = localStorage.getItem(CACHE_KEY);
+      if (!raw) return null;
+      const v = JSON.parse(raw);
+      if (!v || (Date.now() - v.t) > CACHE_TTL) return null;
+      return v;
+    } catch (e) { return null; }
+  }
+
+  function writeCache(stars, forks) {
+    try { localStorage.setItem(CACHE_KEY, JSON.stringify({ t: Date.now(), stars, forks })); } catch (e) {}
+  }
+
+  /* If we have a fresh cached value, paint it instantly without a network roundtrip. */
+  const cached = readCache();
+  if (cached) { paint(cached.stars, cached.forks); return; }
+
+  /* Primary: ungh.cc (CDN-cached, no rate limit). Response shape: { repo: { stars, forks, ... } } */
+  fetch('https://ungh.cc/repos/' + REPO)
+    .then(r => r.ok ? r.json() : Promise.reject(new Error('ungh ' + r.status)))
     .then(d => {
-      targets.forEach(el => {
-        const which = el.getAttribute('data-gh-stat');
-        const target = which === 'stars' ? d.stargazers_count
-                     : which === 'forks' ? d.forks_count
-                     : NaN;
-        animateCount(el, target, 900);
-      });
+      const stars = d && d.repo && d.repo.stars;
+      const forks = d && d.repo && d.repo.forks;
+      if (typeof stars !== 'number' || typeof forks !== 'number') throw new Error('ungh shape');
+      writeCache(stars, forks);
+      paint(stars, forks);
+    })
+    .catch(() => {
+      /* Fallback: direct GitHub API. Often 403s on busy IPs but free when it works. */
+      return fetch('https://api.github.com/repos/' + REPO, { headers: { Accept: 'application/vnd.github+json' } })
+        .then(r => r.ok ? r.json() : Promise.reject(new Error('gh ' + r.status)))
+        .then(d => {
+          writeCache(d.stargazers_count, d.forks_count);
+          paint(d.stargazers_count, d.forks_count);
+        });
     })
     .catch(() => {
       /* Leave the static "—" placeholders. Users still get a working link. */
