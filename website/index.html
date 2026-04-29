@@ -111,17 +111,41 @@
       <div class="hero-grid-lines"></div>
     </div>
     <div class="container">
-      <div class="hero-content">
-        <div class="hero-eyebrow">PURE C17 &middot; ZERO DEPS &middot; GRAPH + ANALYTICS</div>
-        <h1>Columnar analytics and<br>graph traversal in <span class="highlight">one pipeline</span></h1>
-        <p class="hero-desc">Rayforce is a zero-dependency embeddable engine where columnar analytics and graph operations share a single operation DAG, pass through a multi-pass optimizer, and execute as fused morsel-driven bytecode. Pure C17. No malloc.</p>
-        <div class="hero-actions">
-          <a href="docs/quick-start.html" class="btn-hero">
-            Get Started
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
-          </a>
-          <a href="https://github.com/RayforceDB/rayforce" class="btn-hero-ghost" target="_blank" rel="noopener">View on GitHub</a>
+      <div class="hero-top">
+        <div class="hero-content">
+          <div class="hero-eyebrow">PURE C17 &middot; ZERO DEPS &middot; GRAPH + ANALYTICS</div>
+          <h1>Columnar analytics and<br>graph traversal in <span class="highlight">one pipeline</span></h1>
+          <p class="hero-desc">Rayforce is a zero-dependency embeddable engine where columnar analytics and graph operations share a single operation DAG, pass through a multi-pass optimizer, and execute as fused morsel-driven bytecode. Pure C17. No malloc.</p>
+          <div class="hero-actions">
+            <a href="docs/quick-start.html" class="btn-hero">
+              Get Started
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+            </a>
+            <a href="https://github.com/RayforceDB/rayforce" class="btn-hero-ghost" target="_blank" rel="noopener">View on GitHub</a>
+          </div>
         </div>
+
+        <aside class="hero-python" aria-labelledby="hero-python-label">
+          <div class="hero-python-head">
+            <span class="hero-python-tag" id="hero-python-label">Python</span>
+            <a class="hero-python-link" href="https://py.rayforcedb.com/" target="_blank" rel="noopener">
+              py.rayforcedb.com
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+            </a>
+          </div>
+<pre class="hero-python-code"><code><span class="hl-comment">$</span> pip install rayforce
+
+<span class="hl-kw">import</span> rayforce <span class="hl-kw">as</span> rf
+
+t = rf.read_csv(<span class="hl-str">"trades.csv"</span>)
+out = (t.where(rf.col(<span class="hl-str">"price"</span>) &gt; <span class="hl-num">100</span>)
+        .group_by(<span class="hl-str">"symbol"</span>)
+        .agg(rf.col(<span class="hl-str">"qty"</span>).sum()))</code></pre>
+          <div class="hero-python-foot">
+            <a class="hero-python-cta" href="https://py.rayforcedb.com/" target="_blank" rel="noopener">Python docs &rarr;</a>
+            <a class="hero-python-pypi" href="https://pypi.org/project/rayforce/" target="_blank" rel="noopener">PyPI</a>
+          </div>
+        </aside>
       </div>
 
       <div class="hero-numbers">
@@ -258,47 +282,6 @@
             <h3>Zero Dependencies</h3>
           </div>
           <p>Pure C17, single public header. Builds with <code>make</code>. ~16K lines of engine code. Embeds into any C/C++ project.</p>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- Python API -->
-  <section id="python" class="python-section">
-    <div class="container">
-      <div class="python-grid">
-        <div class="python-content">
-          <span class="section-tag">PYTHON API</span>
-          <h2 class="python-title">First-class <span class="text-gradient">Python</span> from day one</h2>
-          <p class="python-lede">Use Rayforce from Python with a DataFrame-like API. Install with pip, import, query. Same engine, same DAG optimizer, same morsel pipeline &mdash; just a different surface.</p>
-          <div class="python-actions">
-            <a href="https://py.rayforcedb.com/" target="_blank" rel="noopener" class="python-link python-link-primary">
-              Python docs
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
-            </a>
-            <a href="https://pypi.org/project/rayforce/" target="_blank" rel="noopener" class="python-link">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M21 16V8a2 2 0 00-1-1.73l-7-4a2 2 0 00-2 0l-7 4A2 2 0 003 8v8a2 2 0 001 1.73l7 4a2 2 0 002 0l7-4A2 2 0 0021 16z"/></svg>
-              PyPI
-            </a>
-          </div>
-        </div>
-        <div class="python-code-stack">
-          <div class="python-code-block">
-            <div class="python-code-label">install</div>
-            <pre><code><span class="hl-comment">$</span> pip install rayforce</code></pre>
-          </div>
-          <div class="python-code-block">
-            <div class="python-code-label">use</div>
-<pre><code><span class="hl-kw">import</span> rayforce <span class="hl-kw">as</span> rf
-
-t = rf.read_csv(<span class="hl-str">"trades.csv"</span>)
-out = (
-    t.where(rf.col(<span class="hl-str">"price"</span>) &gt; <span class="hl-num">100</span>)
-     .group_by(<span class="hl-str">"symbol"</span>)
-     .agg(rf.col(<span class="hl-str">"qty"</span>).sum())
-)
-<span class="hl-fn">print</span>(out)</code></pre>
-          </div>
         </div>
       </div>
     </div>

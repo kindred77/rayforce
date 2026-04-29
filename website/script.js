@@ -239,7 +239,7 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 });
 
-/* GitHub widget: fetch live stars/forks counts.
+/* GitHub widget: fetch live stars/forks counts and count up smoothly.
  * Falls back silently if the API is rate-limited or unreachable. */
 (function () {
   const targets = document.querySelectorAll('[data-gh-stat]');
@@ -252,16 +252,33 @@ document.addEventListener('DOMContentLoaded', () => {
     return String(n);
   }
 
+  function animateCount(el, target, duration) {
+    if (typeof target !== 'number' || isNaN(target)) return;
+    const reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (reduce) { el.textContent = fmt(target); return; }
+    const start = performance.now();
+    function tick(now) {
+      const t = Math.min(1, (now - start) / duration);
+      const eased = 1 - Math.pow(1 - t, 3); /* easeOutCubic */
+      el.textContent = fmt(Math.round(target * eased));
+      if (t < 1) requestAnimationFrame(tick);
+      else el.textContent = fmt(target);
+    }
+    requestAnimationFrame(tick);
+  }
+
   fetch('https://api.github.com/repos/RayforceDB/rayforce', { headers: { Accept: 'application/vnd.github+json' } })
     .then(r => r.ok ? r.json() : Promise.reject(new Error('gh ' + r.status)))
     .then(d => {
       targets.forEach(el => {
         const which = el.getAttribute('data-gh-stat');
-        if (which === 'stars') el.textContent = fmt(d.stargazers_count);
-        else if (which === 'forks') el.textContent = fmt(d.forks_count);
+        const target = which === 'stars' ? d.stargazers_count
+                     : which === 'forks' ? d.forks_count
+                     : NaN;
+        animateCount(el, target, 900);
       });
     })
     .catch(() => {
-      // Leave the static "—" placeholders. Users still get a working link.
+      /* Leave the static "—" placeholders. Users still get a working link. */
     });
 })();
