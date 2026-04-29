@@ -687,9 +687,8 @@ code {
 
 /* ── About page content ──────────────────────── */
 .about-content {
-  background: var(--bg-section); color: var(--text);
+  background: var(--bg); color: var(--text);
   padding: 64px 0 96px;
-  border-top: 1px solid var(--border);
 }
 .about-content .container { max-width: 760px; }
 .about-content h1 {
