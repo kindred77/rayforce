@@ -4,7 +4,7 @@
 (find [10 20 30] 10) -- 0
 (find [10 20 30] 30) -- 2
 
-;; missing element → typed null (rayforce2 behaviour)
+;; missing element → typed null (rayforce behaviour)
 (find [10 20 30] 99) -- 0Nl
 
 ;; roundtrip: (at V (find V x)) == x when x is present

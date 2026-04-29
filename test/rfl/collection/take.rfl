@@ -100,7 +100,7 @@
 (set l (guid 4)) (take l -4) -- l
 (set l (guid 4)) (first (take l 5)) -- (first l)
 (set l (guid 4)) (first (take l -5)) -- (last l)
-;; enum tests removed — teide uses symbols directly, no enum type
+;; enum tests removed — symbols are used directly, no enum type
 (take (list 1h 2i 3 "4") 0h) -- (list )
 (type (take (list 1h 2i 3 "4") 0i)) -- 'LIST
 (take (list 1h 2i 3 "4") 3) -- (list 1h 2i 3)

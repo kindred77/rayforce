@@ -13,11 +13,11 @@
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
   <a href="include/rayforce.h"><img src="https://img.shields.io/badge/header-rayforce.h-informational" alt="Single Header"></a>
-  <a href="https://rayforcedb.github.io/rayforce2/"><img src="https://img.shields.io/badge/docs-website-e9a033" alt="Docs"></a>
+  <a href="https://rayforcedb.github.io/rayforce/"><img src="https://img.shields.io/badge/docs-website-e9a033" alt="Docs"></a>
   <img src="https://img.shields.io/badge/lang-C17-blue" alt="C17">
   <img src="https://img.shields.io/badge/deps-zero-brightgreen" alt="Zero Dependencies">
   <img src="https://img.shields.io/badge/allocator-custom-purple" alt="Custom Allocator">
-  <a href="https://github.com/RayforceDB/rayforce2"><img src="https://img.shields.io/github/stars/RayforceDB/rayforce2?style=social" alt="GitHub Stars"></a>
+  <a href="https://github.com/RayforceDB/rayforce"><img src="https://img.shields.io/github/stars/RayforceDB/rayforce?style=social" alt="GitHub Stars"></a>
 </p>
 
 ---
@@ -117,21 +117,19 @@ int main(void) {
 
 ## Capabilities
 
-|                              | Rayforce | DuckDB | Polars |
-|------------------------------|:--------:|:------:|:------:|
-| Native graph engine (CSR)    |    ✓     |        |        |
-| Graph algorithms             |    ✓     |        |        |
-| Worst-case optimal joins     |    ✓     |        |        |
-| Factorized execution         |    ✓     |        |        |
-| SIP optimizer                |    ✓     |        |        |
-| Embeddable (single header)   |    ✓     |        |        |
-| Zero external dependencies   |    ✓     |        |        |
-| Built-in query language      |    ✓     |        |        |
-| Fused morsel pipelines       |    ✓     |   ✓    |   ✓    |
-| Multi-pass query optimizer   |    ✓     |   ✓    |        |
-| COW ref counting             |    ✓     |        |   ✓    |
-| Custom memory allocator      |    ✓     |   ✓    |        |
-| Window functions & ASOF join |    ✓     |   ✓    |   ✓    |
+- Native graph engine (CSR)
+- Graph algorithms
+- Worst-case optimal joins
+- Factorized execution
+- SIP optimizer
+- Embeddable (single header)
+- Zero external dependencies
+- Built-in query language
+- Fused morsel pipelines
+- Multi-pass query optimizer
+- COW ref counting
+- Custom memory allocator
+- Window functions & ASOF join
 
 ## How It Works
 
@@ -205,15 +203,15 @@ website/                    Documentation site (GitHub Pages)
 
 ## Documentation
 
-Full docs: **[rayforcedb.github.io/rayforce2](https://rayforcedb.github.io/rayforce2/)**
+Full docs: **[rayforcedb.github.io/rayforce](https://rayforcedb.github.io/rayforce/)**
 
-- [Quick Start](https://rayforcedb.github.io/rayforce2/docs/quick-start.html) — build, REPL, first query
-- [Rayfall Language](https://rayforcedb.github.io/rayforce2/docs/rayfall-syntax.html) — syntax and builtins
-- [Data Types](https://rayforcedb.github.io/rayforce2/docs/data-types.html) — types and collections
-- [Queries](https://rayforcedb.github.io/rayforce2/docs/queries-select.html) — select, joins, pivot, window
-- [C API](https://rayforcedb.github.io/rayforce2/docs/c-api-core.html) — full API reference
-- [Graph Engine](https://rayforcedb.github.io/rayforce2/docs/graph-algorithms.html) — algorithms
-- [Architecture](https://rayforcedb.github.io/rayforce2/docs/architecture-pipeline.html) — DAG, optimizer, memory
+- [Quick Start](https://rayforcedb.github.io/rayforce/docs/quick-start.html) — build, REPL, first query
+- [Rayfall Language](https://rayforcedb.github.io/rayforce/docs/rayfall-syntax.html) — syntax and builtins
+- [Data Types](https://rayforcedb.github.io/rayforce/docs/data-types.html) — types and collections
+- [Queries](https://rayforcedb.github.io/rayforce/docs/queries-select.html) — select, joins, pivot, window
+- [C API](https://rayforcedb.github.io/rayforce/docs/c-api-core.html) — full API reference
+- [Graph Engine](https://rayforcedb.github.io/rayforce/docs/graph-algorithms.html) — algorithms
+- [Architecture](https://rayforcedb.github.io/rayforce/docs/architecture-pipeline.html) — DAG, optimizer, memory
 
 ## License
 

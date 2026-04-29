@@ -975,7 +975,7 @@ static test_result_t test_agg_parse_reject_non_var_target(void) {
 }
 
 /* =====================================================================
- * Head-constant rules (Phase B dep: rayforce2 rule heads may contain
+ * Head-constant rules (Phase B dep: rayforce rule heads may contain
  * RAY_SYM / RAY_I64 / RAY_F64 literals alongside variables).  These
  * tests exist to prevent regression of a previously-reverted attempt
  * that corrupted memory across IDB boundaries.

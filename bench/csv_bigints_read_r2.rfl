@@ -1,2 +1,0 @@
-(set t (.csv.read [I64 I64 I64 I64] "/tmp/bigints_bench.csv"))
-(println "rows: %" (count t))
