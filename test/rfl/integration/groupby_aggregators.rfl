@@ -31,10 +31,11 @@
 (count (select {d: (stddev_pop v) from: T by: g}))              -- 50
 
 ;; ────────────── median ──────────────
-;; KNOWN: (med v) works standalone but raises "length" inside select-by.
-;; Verify standalone path; pin the group-by error.
+;; (med v) is RAY_FN_AGGR but not in the planner's streaming-agg whitelist;
+;; it goes through the non-streaming per-group fallback, producing one
+;; scalar per group → a typed F64 column of 50 medians.
 (med [1 2 3 4 5]) -- 3.0
-(count (select {m: (med v) from: T by: g})) !- length
+(count (select {m: (med v) from: T by: g})) -- 50
 
 ;; ────────────── multi-aggregator: 7 aggs in one select ──────────────
 (set Many (select {c: (count v) s: (sum v) mn: (min v) mx: (max v) av: (avg v) f: (first v) l: (last v) from: T by: g}))
