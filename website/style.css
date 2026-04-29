@@ -685,21 +685,6 @@ body.about-page { margin: 0; overflow: hidden; }
   background: #0a0a0a;
 }
 
-/* ── Footer byline ───────────────────────────── */
-.footer-brand {
-  flex-direction: column; align-items: flex-start; gap: 10px;
-}
-.footer-byline {
-  font-family: var(--font-body, sans-serif);
-  font-size: .82rem; font-weight: 400;
-  color: var(--text-muted); margin: 0;
-  text-transform: none; letter-spacing: 0;
-}
-.footer-byline a {
-  color: var(--text-dim); border-bottom: 1px solid rgba(255,255,255,.18);
-}
-.footer-byline a:hover { color: var(--text); border-bottom-color: currentColor; }
-
 /* ── About page content ──────────────────────── */
 .about-content {
   background: #04233b; color: #d8e4ec;
