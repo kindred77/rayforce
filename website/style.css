@@ -792,7 +792,7 @@ body.about-page { margin: 0; overflow: auto; }
   font-weight: 600;
   color: var(--text);
   min-width: 3.5ch;
-  text-align: center;
+  text-align: left;
 }
 
 /* ──────────────────────────────────────────────
