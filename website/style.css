@@ -677,45 +677,47 @@ code {
 }
 
 /* ── About page: fullscreen promo iframe with floating pill nav on top ─── */
-body.about-page { margin: 0; overflow: hidden; }
 .promo-frame {
   display: block;
   width: 100vw;
   height: 100vh;
   border: 0;
-  background: #0a0a0a;
+  background: var(--bg);
 }
 
 /* ── About page content ──────────────────────── */
 .about-content {
-  background: #04233b; color: #d8e4ec;
+  background: var(--bg-section); color: var(--text);
   padding: 64px 0 96px;
+  border-top: 1px solid var(--border);
 }
 .about-content .container { max-width: 760px; }
 .about-content h1 {
-  font-family: var(--font-heading, "Oswald", sans-serif);
+  font-family: var(--font-heading);
   font-size: 2.4rem; font-weight: 600; letter-spacing: -.01em;
-  color: #fff; margin: 0 0 16px;
+  color: var(--text); margin: 0 0 16px;
 }
 .about-content h2 {
-  font-family: var(--font-heading, "Oswald", sans-serif);
-  font-size: 1.4rem; font-weight: 600; color: #fff;
+  font-family: var(--font-heading);
+  font-size: 1.4rem; font-weight: 600; color: var(--text);
   margin: 40px 0 12px; text-transform: uppercase; letter-spacing: .04em;
 }
 .about-content .about-lede {
-  font-size: 1.15rem; line-height: 1.6; color: #c9d6e0;
+  font-size: 1.15rem; line-height: 1.6; color: var(--text-muted);
   margin: 0 0 24px;
 }
-.about-content p { line-height: 1.65; margin: 0 0 16px; }
+.about-content p { line-height: 1.65; color: var(--text-muted); margin: 0 0 16px; }
 .about-content ul { padding-left: 20px; margin: 0 0 16px; }
-.about-content li { line-height: 1.65; margin-bottom: 10px; }
+.about-content li { line-height: 1.65; color: var(--text-muted); margin-bottom: 10px; }
+.about-content strong { color: var(--text); }
 .about-content a {
-  color: #79b8ff; border-bottom: 1px solid rgba(121,184,255,.35);
+  color: var(--primary-light); border-bottom: 1px solid rgba(233, 160, 51, 0.25);
 }
-.about-content a:hover { color: #a5cfff; border-bottom-color: currentColor; }
+.about-content a:hover { color: var(--accent); border-bottom-color: currentColor; }
 .about-content code {
-  font-family: var(--font-mono, "JetBrains Mono", monospace);
-  font-size: .92em; background: rgba(255,255,255,.06);
+  font-family: var(--mono);
+  font-size: .92em; background: rgba(233, 160, 51, 0.1);
+  color: var(--primary-lighter);
   padding: 1px 6px; border-radius: 3px;
 }
 
@@ -730,11 +732,6 @@ body.about-page { margin: 0; overflow: hidden; }
 
 /* ── About page: allow scrolling so content below the iframe is reachable ─── */
 body.about-page { margin: 0; overflow: auto; }
-body.about-page .promo-frame {
-  display: block;
-  width: 100vw; height: 100vh;
-  border: 0; background: #0a0a0a;
-}
 
 /* ──────────────────────────────────────────────
    Nav: Live Demo highlight + GitHub widget

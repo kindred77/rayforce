@@ -132,9 +132,9 @@
         const style = doc.createElement('style');
         style.textContent =
           '#root > div > div:last-child { display: none !important; }' +
-          // Stage outer defaults to #0a0a0a. Matching the scenes' own
-          // #04233b hides the tiny letterbox bars from contain-mode scaling.
-          '#root > div { background: #04233b !important; }';
+          // Match the Stage outer to the site bg (#0a0e13) so letterbox
+          // bars from contain-mode scaling blend into the page.
+          '#root > div { background: #0a0e13 !important; }';
         doc.head.appendChild(style);
         return true;
       }
