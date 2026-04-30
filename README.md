@@ -117,19 +117,21 @@ int main(void) {
 
 ## Capabilities
 
-- Native graph engine (CSR)
-- Graph algorithms
-- Worst-case optimal joins
-- Factorized execution
-- SIP optimizer
-- Embeddable (single header)
-- Zero external dependencies
-- Built-in query language
-- Fused morsel pipelines
-- Multi-pass query optimizer
-- COW ref counting
-- Custom memory allocator
-- Window functions & ASOF join
+|                              | Rayforce | DuckDB | Polars |
+|------------------------------|:--------:|:------:|:------:|
+| Native graph engine (CSR)    |    ✓     |        |        |
+| Graph algorithms             |    ✓     |        |        |
+| Worst-case optimal joins     |    ✓     |        |        |
+| Factorized execution         |    ✓     |        |        |
+| SIP optimizer                |    ✓     |        |        |
+| Embeddable (single header)   |    ✓     |        |        |
+| Zero external dependencies   |    ✓     |        |        |
+| Built-in query language      |    ✓     |        |        |
+| Fused morsel pipelines       |    ✓     |   ✓    |   ✓    |
+| Multi-pass query optimizer   |    ✓     |   ✓    |        |
+| COW ref counting             |    ✓     |        |   ✓    |
+| Custom memory allocator      |    ✓     |   ✓    |        |
+| Window functions & ASOF join |    ✓     |   ✓    |   ✓    |
 
 ## How It Works
 
@@ -212,6 +214,28 @@ Full docs: **[rayforcedb.github.io/rayforce](https://rayforcedb.github.io/rayfor
 - [C API](https://rayforcedb.github.io/rayforce/docs/c-api-core.html) — full API reference
 - [Graph Engine](https://rayforcedb.github.io/rayforce/docs/graph-algorithms.html) — algorithms
 - [Architecture](https://rayforcedb.github.io/rayforce/docs/architecture-pipeline.html) — DAG, optimizer, memory
+
+## Python bindings
+
+Rayforce has Python bindings at **[rayforce-py](https://github.com/RayforceDB/rayforce-py)** — contributions welcome.
+
+## Contributing
+
+Contributions are welcome. You can help by:
+
+- Reporting bugs and requesting features via [GitHub Issues](https://github.com/RayforceDB/rayforce/issues)
+- Submitting pull requests
+- Creating example scripts and use cases
+- Improving documentation
+
+## Development Partnership
+
+Rayforce is jointly developed with and sponsored by **[Lynx](https://www.lynxtrading.com/)**.
+
+This partnership has been instrumental in making Rayforce a mature,
+production-ready engine. Lynx's active involvement in development and their
+commitment to innovative open-source technologies in the financial sector has
+enabled Rayforce to reach its full potential.
 
 ## License
 
