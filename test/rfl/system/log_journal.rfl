@@ -1,0 +1,123 @@
+;; Journal end-to-end — q/kdb's -l/-L feature, ported.
+;;
+;; Two named processes are spawned in sequence under -l <base>; this
+;; test asserts that user mutations survive process death + restart
+;; via .log replay, that .log.snapshot collapses replay state into
+;; .qdb, and that a corrupted .log triggers the badtail exit (rc=2)
+;; with a recoverable hint.
+;;
+;; Port: 19990 (fixed, picked to avoid collision with ipc_diff at
+;; 19999 — `make test` is sequential so two server processes cannot
+;; coexist on the same port anyway).
+;;
+;; Base path: /tmp/rftest_journal — anything starting with that prefix
+;; is fair game for cleanup; we wipe it before AND after the run.
+;;
+;; Coverage: src/store/journal.c (open / write / replay / validate /
+;; roll / snapshot / close), src/ops/journal.c, src/lang/env.c
+;; (user-flag tracking), src/app/main.c -l/-L flag handling, and the
+;; ray_journal_write_bytes hook in src/core/ipc.c eval_payload.
+;;
+;; Server lifecycle: SIGTERM from outside (not (exit 0) over IPC) —
+;; .ipc.send sends as SYNC, which our hook journals.  A logged
+;; (exit 0) would be replayed in phase 2 and kill the freshly-spawned
+;; server before we can ask it anything.  This matches what real
+;; operators do anyway: kill -TERM <pid>, not a chat-loop shutdown.
+
+;; ── pre-flight: kill any stragglers, clear log files ────────────────
+(.sys.exec "pkill -KILL -f '[r]ayforce -l /tmp/rftest_journal' 2>/dev/null; true")
+(.sys.exec "sleep 0.2; rm -f /tmp/rftest_journal*")
+
+;; ── phase 1: spawn server with -l, send mutations, kill ─────────────
+(.sys.exec "./rayforce -l /tmp/rftest_journal -p 19990 </dev/null >/dev/null 2>&1 &")
+(.sys.exec "for i in $(seq 30); do bash -c '(echo > /dev/tcp/127.0.0.1/19990) 2>/dev/null' && exit 0; sleep 0.1; done; exit 1") -- 0
+
+(set h (.ipc.open "127.0.0.1:19990"))
+(>= h 0) -- true
+
+;; Plain user globals — assert each set returns the bound value.
+(.ipc.send h "(set a 100)")        -- 100
+(.ipc.send h "(set b \"hello\")")  -- "hello"
+(.ipc.send h "(set c [1 2 3])")    -- [1 2 3]
+
+;; Computation derived from above — exercises a logged eval that
+;; does real work, not just a literal store.
+(.ipc.send h "(set d (+ a 1))")    -- 101
+
+(.ipc.close h)
+;; SIGTERM the server externally.  We don't .ipc.send "(exit 0)"
+;; because that message itself would be journaled and re-run on
+;; replay, killing server 2.  Wait for the process to actually exit
+;; (`pgrep -f` returns rc=1 when nothing matches) before continuing.
+(.sys.exec "pkill -TERM -f '[r]ayforce -l /tmp/rftest_journal -p 19990' 2>/dev/null; true")
+(.sys.exec "for i in $(seq 30); do pgrep -f '[r]ayforce -l /tmp/rftest_journal -p 19990' >/dev/null || exit 0; sleep 0.1; done; exit 1") -- 0
+
+;; The log file must contain the four entries we sent.  We don't pin
+;; an exact byte count (depends on serde encoding) — just assert
+;; non-zero.  `test -s` returns 0 iff the file exists and is
+;; non-empty.
+(.sys.exec "test -s /tmp/rftest_journal.log") -- 0
+
+;; ── phase 2: restart, assert replay restored a/b/c/d ────────────────
+(.sys.exec "./rayforce -l /tmp/rftest_journal -p 19990 </dev/null >/dev/null 2>&1 &")
+(.sys.exec "for i in $(seq 30); do bash -c '(echo > /dev/tcp/127.0.0.1/19990) 2>/dev/null' && exit 0; sleep 0.1; done; exit 1") -- 0
+
+(set h2 (.ipc.open "127.0.0.1:19990"))
+(>= h2 0) -- true
+
+;; All four user globals must be restored from the replayed log.
+(.ipc.send h2 "a") -- 100
+(.ipc.send h2 "b") -- "hello"
+(.ipc.send h2 "c") -- [1 2 3]
+(.ipc.send h2 "d") -- 101
+
+;; ── phase 2.5: snapshot collapses log into .qdb ─────────────────────
+;; .log.snapshot writes user globals to <base>.qdb and rolls the log
+;; (renames the existing .log to <base>.<UTC>.log, opens a fresh empty
+;; one).  Returns null on success; bare invocation is enough — the
+;; observable contract is the file artefacts produced.  An error
+;; (e.g. "no journal open") would format as a non-null and so fail
+;; one of the file existence checks below.
+(.ipc.send h2 "(.log.snapshot)")
+(.sys.exec "test -s /tmp/rftest_journal.qdb") -- 0
+;; Count rolled archives.  .sys.exec returns the shell exit code, so
+;; we wrap the count check in `[ N -eq 1 ]` to make the result a
+;; boolean: 0 if exactly one archive exists, 1 otherwise.  find with
+;; -name avoids any glob-expansion surprises if /tmp has unrelated
+;; entries.
+(.sys.exec "[ $(find /tmp -maxdepth 1 -name 'rftest_journal.*.log' | wc -l) -eq 1 ]") -- 0
+
+;; .log.validate parses the log without evaluating; the post-snapshot
+;; log only contains the validate IPC call itself.  Loose assertion:
+;; chunks >= 1, valid_bytes > 0.
+(set v (.ipc.send h2 "(.log.validate \"/tmp/rftest_journal.log\")"))
+(>= (first v) 1) -- true
+
+(.ipc.close h2)
+(.sys.exec "pkill -TERM -f '[r]ayforce -l /tmp/rftest_journal -p 19990' 2>/dev/null; true")
+(.sys.exec "for i in $(seq 30); do pgrep -f '[r]ayforce -l /tmp/rftest_journal -p 19990' >/dev/null || exit 0; sleep 0.1; done; exit 1") -- 0
+
+;; ── phase 3: restart, assert state survived via .qdb (not .log) ─────
+(.sys.exec "./rayforce -l /tmp/rftest_journal -p 19990 </dev/null >/dev/null 2>&1 &")
+(.sys.exec "for i in $(seq 30); do bash -c '(echo > /dev/tcp/127.0.0.1/19990) 2>/dev/null' && exit 0; sleep 0.1; done; exit 1") -- 0
+
+(set h3 (.ipc.open "127.0.0.1:19990"))
+(.ipc.send h3 "a") -- 100
+(.ipc.send h3 "d") -- 101
+
+(.ipc.close h3)
+(.sys.exec "pkill -TERM -f '[r]ayforce -l /tmp/rftest_journal -p 19990' 2>/dev/null; true")
+(.sys.exec "for i in $(seq 30); do pgrep -f '[r]ayforce -l /tmp/rftest_journal -p 19990' >/dev/null || exit 0; sleep 0.1; done; exit 1") -- 0
+
+;; ── phase 4: corruption is fatal (rc=2 with badtail message) ────────
+;; The post-snapshot fresh log holds at least one frame from phase 2.5
+;; (the validate call) plus whatever phase 3 added before exit; cut
+;; the last 4 bytes to leave the trailing frame mid-payload.  Restart
+;; must exit with rc=2 — main.c special-cases badtail with that code
+;; so a supervisor can distinguish it from any other startup failure.
+(.sys.exec "truncate -s -4 /tmp/rftest_journal.log")
+(.sys.exec "./rayforce -l /tmp/rftest_journal -p 19990 </dev/null >/dev/null 2>&1; test $? -eq 2") -- 0
+
+;; ── teardown ────────────────────────────────────────────────────────
+(.sys.exec "pkill -KILL -f '[r]ayforce -l /tmp/rftest_journal' 2>/dev/null; true")
+(.sys.exec "rm -f /tmp/rftest_journal*")
