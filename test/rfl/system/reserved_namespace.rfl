@@ -22,8 +22,8 @@
 (type .csv) -- 'DICT
 (count .sys) -- 9
 ;; gc, exec, build, mem, info, cmd, timeit, listen, env
-(count .os) -- 2
-;; getenv, setenv
+(count .os) -- 4
+;; getenv, setenv, size, list
 (count .ipc) -- 3
 ;; open, close, send
 (count .csv) -- 2
