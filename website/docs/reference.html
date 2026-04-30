@@ -715,19 +715,19 @@
       <table>
         <thead><tr><th>Function</th><th>Type</th><th>Flags</th><th>Description</th><th>Example</th></tr></thead>
         <tbody>
-          <tr><td><code>set-splayed</code></td><td>variadic</td><td>restricted</td><td>Save table as splayed columns to a directory</td><td><code>(set-splayed "db/trades" trades)</code></td></tr>
-          <tr><td><code>get-splayed</code></td><td>variadic</td><td>&mdash;</td><td>Load splayed table from a directory</td><td><code>(get-splayed "db/trades")</code></td></tr>
-          <tr><td><code>get-parted</code></td><td>variadic</td><td>&mdash;</td><td>Load partitioned table from root directory</td><td><code>(get-parted "db" 'trades)</code></td></tr>
+          <tr><td><code>.db.splayed.set</code></td><td>variadic</td><td>restricted</td><td>Save table as splayed columns to a directory</td><td><code>(.db.splayed.set "db/trades" trades)</code></td></tr>
+          <tr><td><code>.db.splayed.get</code></td><td>variadic</td><td>&mdash;</td><td>Load splayed table from a directory</td><td><code>(.db.splayed.get "db/trades")</code></td></tr>
+          <tr><td><code>.db.parted.get</code></td><td>variadic</td><td>&mdash;</td><td>Load partitioned table from root directory</td><td><code>(.db.parted.get "db" 'trades)</code></td></tr>
         </tbody>
       </table>
 
       <pre><code><span class="hl-comment">; Save and reload a splayed table</span>
-(<span class="hl-fn">set-splayed</span> <span class="hl-str">"db/trades"</span> trades)
-(<span class="hl-kw">set</span> t (<span class="hl-fn">get-splayed</span> <span class="hl-str">"db/trades"</span>))
+(<span class="hl-fn">.db.splayed.set</span> <span class="hl-str">"db/trades"</span> trades)
+(<span class="hl-kw">set</span> t (<span class="hl-fn">.db.splayed.get</span> <span class="hl-str">"db/trades"</span>))
 (<span class="hl-fn">show</span> t)
 
 <span class="hl-comment">; Load a date-partitioned table</span>
-(<span class="hl-kw">set</span> hist (<span class="hl-fn">get-parted</span> <span class="hl-str">"db"</span> <span class="hl-sym">'trades</span>))</code></pre>
+(<span class="hl-kw">set</span> hist (<span class="hl-fn">.db.parted.get</span> <span class="hl-str">"db"</span> <span class="hl-sym">'trades</span>))</code></pre>
 
       <!-- ════════════════════════════════════════ -->
       <h2 id="ipc">IPC (Inter-Process Communication)</h2>

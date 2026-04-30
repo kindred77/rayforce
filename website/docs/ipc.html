@@ -233,7 +233,7 @@
         </thead>
         <tbody>
           <tr><td>Mutation</td><td><code>set</code>, <code>del</code>, <code>update</code>, <code>insert</code>, <code>upsert</code>, <code>modify</code></td></tr>
-          <tr><td>File writes</td><td><code>write</code>, <code>.csv.write</code>, <code>load</code>, <code>set-splayed</code></td></tr>
+          <tr><td>File writes</td><td><code>write</code>, <code>.csv.write</code>, <code>load</code>, <code>.db.splayed.set</code></td></tr>
           <tr><td>File reads</td><td><code>read</code>, <code>.csv.read</code></td></tr>
           <tr><td>System</td><td><code>.sys.exec</code>, <code>.os.getenv</code>, <code>.os.setenv</code>, <code>exit</code></td></tr>
           <tr><td>IPC chaining</td><td><code>.ipc.open</code>, <code>.ipc.close</code>, <code>.ipc.send</code></td></tr>
@@ -241,7 +241,7 @@
       </table>
 
       <div class="info-box">
-        <strong>Scope.</strong> Restricted mode blocks the builtins listed above. It does not provide full sandboxing &mdash; <code>select</code>, <code>get-splayed</code>, <code>get-parted</code>, and other read operations on already-loaded data or splayed tables remain available.
+        <strong>Scope.</strong> Restricted mode blocks the builtins listed above. It does not provide full sandboxing &mdash; <code>select</code>, <code>.db.splayed.get</code>, <code>.db.parted.get</code>, and other read operations on already-loaded data or splayed tables remain available.
       </div>
 
       <p>Attempting a restricted operation returns an <code>"access"</code> error:</p>

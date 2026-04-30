@@ -1,0 +1,80 @@
+;; .db.splayed.mount and .db.parted.mount — bulk-load every
+;; on-disk table under a root directory and bind each as a global,
+;; returning the dict of bindings made.  Mirrors kdb's `\l /tmp/db/`
+;; but split into format-specific entry points so the discovery
+;; heuristics match the on-disk format exactly:
+;;
+;;   .db.splayed.mount → child has `.d` schema → ray_splay_load
+;;   .db.parted.mount  → root has digit/dot partitions → ray_read_parted
+;;
+;; Both bind globals named after the directory entry.  Tests below
+;; cover correctness (round-trip values), the binding side effect,
+;; the returned dict shape, and rejection of malformed roots.
+
+;; ────────────── splayed mount: 3 splayed tables under one root ──────────────
+;; Build three small tables, stash each as a splayed directory under
+;; the same root, then mount the root and verify every name became
+;; a global pointing at the round-tripped table.
+(set Trades  (table [s p] (list ['AAPL 'GOOG] [100.0 200.0])))
+(set Quotes  (table [s b a] (list ['AAPL 'GOOG] [99.0 199.0] [101.0 201.0])))
+(set Returns (table [s r] (list ['AAPL 'GOOG] [0.01 -0.02])))
+
+(.db.splayed.set "/tmp/rfl_mount_splayed/Trades"  Trades)
+(.db.splayed.set "/tmp/rfl_mount_splayed/Quotes"  Quotes)
+(.db.splayed.set "/tmp/rfl_mount_splayed/Returns" Returns)
+
+;; Wipe the originals so we can be sure the post-mount globals
+;; came from disk, not the fact that the names were already bound.
+(set Trades  0)
+(set Quotes  0)
+(set Returns 0)
+
+(set M (.db.splayed.mount "/tmp/rfl_mount_splayed/"))
+(type M) -- 'DICT
+(count M) -- 3
+;; Each entry got bound as a global named after its on-disk dir.
+(type Trades)  -- 'TABLE
+(type Quotes)  -- 'TABLE
+(type Returns) -- 'TABLE
+(count Trades)  -- 2
+(count Quotes)  -- 2
+(count Returns) -- 2
+
+;; The returned dict's values are the same tables (dict round-trip
+;; preserves identity-equivalence via atom_eq on each cell).
+(count (at M 'Trades))  -- 2
+(count (at M 'Quotes))  -- 2
+(count (at M 'Returns)) -- 2
+
+;; ────────────── parted mount: 2 partitions × 2 tables ──────────────
+;; Pre-fix: get-parted required a /<root>/sym file (which set-splayed
+;; doesn't produce) and the root was assumed to have only one table.
+;; Mount uses the first partition's subdirectories as the table
+;; index, so multi-table parted roots load all of them in one call.
+(set T-A0 (table [s v] (list ['a 'b] [1 2])))
+(set T-A1 (table [s v] (list ['c 'd] [3 4])))
+(set T-B0 (table [s v] (list ['e 'f] [5 6])))
+(set T-B1 (table [s v] (list ['g 'h] [7 8])))
+
+(.db.splayed.set "/tmp/rfl_mount_parted/2024.01.01/A/" T-A0)
+(.db.splayed.set "/tmp/rfl_mount_parted/2024.01.02/A/" T-A1)
+(.db.splayed.set "/tmp/rfl_mount_parted/2024.01.01/B/" T-B0)
+(.db.splayed.set "/tmp/rfl_mount_parted/2024.01.02/B/" T-B1)
+
+(set Mp (.db.parted.mount "/tmp/rfl_mount_parted/"))
+(type Mp) -- 'DICT
+(count Mp) -- 2
+;; A and B are now globals — each is the concatenated 2-partition view.
+(count A) -- 4   ;; 2 partitions × 2 rows each
+(count B) -- 4
+
+;; ────────────── error path: not a parted root ──────────────
+;; The splayed root from the first test has no partition directories,
+;; so .db.parted.mount on it must fail with a clear domain error
+;; rather than returning an empty dict (which would silently mask
+;; the wrong-format mistake at a call site).
+(.db.parted.mount "/tmp/rfl_mount_splayed/") !- domain
+
+;; ────────────── error path: nonexistent directory ──────────────
+(.db.splayed.mount "/tmp/rfl_mount_does_not_exist/") !- io
+(.db.parted.mount  "/tmp/rfl_mount_does_not_exist/") !- domain

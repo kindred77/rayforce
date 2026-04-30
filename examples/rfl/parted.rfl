@@ -15,7 +15,7 @@
                   (as 'TIMESTAMP (til n)) 
             )
         ))
-        (set-splayed p t "/tmp/db/sym")
+        (.db.splayed.set p t "/tmp/db/sym")
         (println "Table created")
     )
 )
@@ -25,4 +25,4 @@
 (println "Done.")
 (exit 0)
 
-;; (set t (get-parted "/tmp/db/" 'a))
+;; (set t (.db.parted.get "/tmp/db/" 'a))

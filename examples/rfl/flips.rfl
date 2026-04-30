@@ -1,7 +1,7 @@
 ;; Usage: 
 ;; unzip -oq ~/Downloads/flips.zip -d /tmp
 ;; rayforce examples/flips.rfl
-;; (set t (get-parted "/tmp/db/" 'a))
+;; (set t (.db.parted.get "/tmp/db/" 'a))
 
 (set csvpath "/tmp/flips.csv")
 (set tabname "a")
@@ -28,7 +28,7 @@
     (fn [x]
         (let p (format "%/%/%/" dbpath (+ 2024.01.01 (* 24 (* 3600 (* x 1000000000)))) tabname))
         (println "Creating table: %" p)
-        (set-splayed p flips "/tmp/db/sym")
+        (.db.splayed.set p flips "/tmp/db/sym")
         (println "%" "Table created")
     )
 )
