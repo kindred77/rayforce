@@ -80,12 +80,14 @@
 ;; one of the file existence checks below.
 (.ipc.send h2 "(.log.snapshot)")
 (.sys.exec "test -s /tmp/rftest_journal.qdb") -- 0
-;; Count rolled archives.  .sys.exec returns the shell exit code, so
-;; we wrap the count check in `[ N -eq 1 ]` to make the result a
-;; boolean: 0 if exactly one archive exists, 1 otherwise.  find with
-;; -name avoids any glob-expansion surprises if /tmp has unrelated
-;; entries.
-(.sys.exec "[ $(find /tmp -maxdepth 1 -name 'rftest_journal.*.log' | wc -l) -eq 1 ]") -- 0
+;; Assert that at least one rolled archive exists.  Use a bash glob
+;; (expanded by /bin/sh inside .sys.exec) rather than find — `find
+;; /tmp` on macOS resolves through the /tmp -> /private/tmp symlink
+;; and combined with BSD-find quirks the count was off in CI on
+;; macos-latest.  `ls /pattern.log >/dev/null 2>&1` returns 0 iff
+;; the shell expanded at least one match (otherwise the literal
+;; pattern is passed to ls which fails non-zero).
+(.sys.exec "ls /tmp/rftest_journal.*.log >/dev/null 2>&1") -- 0
 
 ;; .log.validate parses the log without evaluating; the post-snapshot
 ;; log only contains the validate IPC call itself.  Loose assertion:
