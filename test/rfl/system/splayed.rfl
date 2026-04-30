@@ -3,8 +3,9 @@
 ;;
 ;; Tests use unique /tmp/ paths because the overwrite path is a known
 ;; bug (`error: corrupt`); these only exercise the fresh-write path.
-;; Stale data from prior runs would also flip these to "corrupt", so
-;; CI environments should clean /tmp/rfl_splayed_* between runs.
+;; Stale data from prior runs flips these to "corrupt" — wipe /tmp
+;; siblings up front so the test is self-contained and re-runnable.
+(.sys.exec "rm -rf /tmp/rfl_splayed_* /tmp/rfl_parted")
 
 ;; ────────────── small table ──────────────
 (set T-Small (table [a b] (list [1 2 3 4 5] [10.0 20.0 30.0 40.0 50.0])))

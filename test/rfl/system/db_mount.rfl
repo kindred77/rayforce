@@ -11,6 +11,11 @@
 ;; cover correctness (round-trip values), the binding side effect,
 ;; the returned dict shape, and rejection of malformed roots.
 
+;; Stale /tmp dirs from a prior run flip .db.splayed.set to "corrupt"
+;; (overwrite path is a known bug — see splayed.rfl notes).  Wipe up
+;; front so the test is self-contained and re-runnable.
+(.sys.exec "rm -rf /tmp/rfl_mount_splayed /tmp/rfl_mount_parted")
+
 ;; ────────────── splayed mount: 3 splayed tables under one root ──────────────
 ;; Build three small tables, stash each as a splayed directory under
 ;; the same root, then mount the root and verify every name became
