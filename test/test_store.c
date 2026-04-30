@@ -324,6 +324,73 @@ static test_result_t test_splay_open_roundtrip(void) {
     PASS();
 }
 
+/* ---- test_splay_str_column_roundtrip ----------------------------------- */
+
+static test_result_t test_splay_str_column_roundtrip(void) {
+    (void)!system("rm -rf " TMP_SPLAY_DIR);
+
+    ray_t* tbl = ray_table_new(2);
+    TEST_ASSERT_NOT_NULL(tbl);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+
+    int64_t id_id = ray_sym_intern("id", 2);
+    int64_t id_name = ray_sym_intern("name", 4);
+
+    int64_t raw_ids[] = {1, 2, 3};
+    ray_t* ids = ray_vec_from_raw(RAY_I64, raw_ids, 3);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ids));
+
+    ray_t* names = ray_vec_new(RAY_STR, 3);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(names));
+    names = ray_str_vec_append(names, "alpha", 5);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(names));
+    names = ray_str_vec_append(names, "a pooled string value", 21);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(names));
+    names = ray_str_vec_append(names, "", 0);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(names));
+    ray_vec_set_null(names, 2, true);
+
+    tbl = ray_table_add_col(tbl, id_id, ids);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    tbl = ray_table_add_col(tbl, id_name, names);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+
+    ray_err_t err = ray_splay_save(tbl, TMP_SPLAY_DIR, NULL);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    ray_t* loaded = ray_read_splayed(TMP_SPLAY_DIR, NULL);
+    TEST_ASSERT_NOT_NULL(loaded);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    TEST_ASSERT_EQ_I(ray_table_ncols(loaded), 2);
+    TEST_ASSERT_EQ_I(ray_table_nrows(loaded), 3);
+
+    ray_t* loaded_ids = ray_table_get_col(loaded, id_id);
+    ray_t* loaded_names = ray_table_get_col(loaded, id_name);
+    TEST_ASSERT_NOT_NULL(loaded_ids);
+    TEST_ASSERT_NOT_NULL(loaded_names);
+    TEST_ASSERT_EQ_U(loaded_ids->mmod, 1);
+    TEST_ASSERT_EQ_U(loaded_names->mmod, 0);
+    TEST_ASSERT_EQ_I(loaded_names->type, RAY_STR);
+    TEST_ASSERT_TRUE(loaded_names->attrs & RAY_ATTR_HAS_NULLS);
+    TEST_ASSERT_TRUE(ray_vec_is_null(loaded_names, 2));
+
+    size_t slen = 0;
+    const char* s0 = ray_str_vec_get(loaded_names, 0, &slen);
+    TEST_ASSERT_EQ_U(slen, 5);
+    TEST_ASSERT_MEM_EQ(5, s0, "alpha");
+    const char* s1 = ray_str_vec_get(loaded_names, 1, &slen);
+    TEST_ASSERT_EQ_U(slen, 21);
+    TEST_ASSERT_MEM_EQ(21, s1, "a pooled string value");
+
+    ray_release(loaded);
+    ray_release(ids);
+    ray_release(names);
+    ray_release(tbl);
+
+    (void)!system("rm -rf " TMP_SPLAY_DIR);
+    PASS();
+}
+
 /* ---- test_parted_nrows ------------------------------------------------- */
 
 static test_result_t test_parted_nrows(void) {
@@ -2076,6 +2143,7 @@ const test_entry_t store_entries[] = {
     { "store/col_mmap_corrupt", test_col_mmap_corrupt, store_setup, store_teardown },
     { "store/col_mmap_nofile", test_col_mmap_nofile, store_setup, store_teardown },
     { "store/splay_open_roundtrip", test_splay_open_roundtrip, store_setup, store_teardown },
+    { "store/splay_str_column_roundtrip", test_splay_str_column_roundtrip, store_setup, store_teardown },
     { "store/parted_nrows", test_parted_nrows, store_setup, store_teardown },
     { "store/table_nrows_parted", test_table_nrows_parted, store_setup, store_teardown },
     { "store/parted_release", test_parted_release, store_setup, store_teardown },
@@ -2114,5 +2182,4 @@ const test_entry_t store_entries[] = {
     { "store/ipc/handshake_version_mismatch", test_ipc_handshake_version_mismatch, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
-
 
