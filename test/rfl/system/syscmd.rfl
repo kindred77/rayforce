@@ -1,0 +1,67 @@
+;; .sys.cmd — kdb-style system command entry point.
+;;
+;; Every command is registered once in lang/syscmd.c and reachable
+;; through three surfaces:
+;;
+;;   .sys.cmd "name args"   — string-dispatched, with shell fallback
+;;   .sys.<name> arg        — direct typed builtin per entry
+;;   :name args             — REPL terminal command (covered separately)
+;;
+;; This file exercises the first two surfaces.  REPL coverage relies
+;; on terminal interaction and is verified manually via :? / :t.
+
+;; ────────────── timeit (.sys.cmd "timeit N" / .sys.timeit N) ──────────────
+;; toggling profiling on/off via either entry point converges on the
+;; same flag.  Direct call: integer arg.  String dispatch: parses int.
+(.sys.cmd "timeit 1") -- 1
+(.sys.cmd "timeit 0") -- 0
+(.sys.timeit 1)       -- 1
+(.sys.timeit 0)       -- 0
+
+;; alias: `t` is short for `timeit` on both surfaces
+(.sys.cmd "t 1") -- 1
+(.sys.cmd "t 0") -- 0
+
+;; non-numeric arg surfaces a clean type error
+(.sys.cmd "timeit foo") !- type
+
+;; ────────────── env (.sys.cmd "env" / .sys.env) ──────────────
+;; .sys.env returns the count of globals.  We don't pin an exact
+;; number (test order affects it) — just assert it's positive.
+(> (.sys.env) 0)        -- true
+(> (.sys.cmd "env") 0)  -- true
+
+;; ────────────── shell fallback ──────────────
+;; Unknown command names fall through to system(2) and return the
+;; host shell's exit code.  `true(1)` always returns 0; this also
+;; proves the pass-through is wired.
+(.sys.cmd "true") -- 0
+
+;; The shell fallback gets the entire string verbatim, so quoting
+;; and arg passing survive the round-trip.
+(.sys.cmd "test 1 -eq 1") -- 0
+;; Failed shell command returns nonzero (exact code is shell-encoded
+;; via WEXITSTATUS so we don't pin the value, only that it's not 0).
+(== 0 (.sys.cmd "false")) -- false
+
+;; ────────────── REPL-only commands rejected from .sys.cmd ──────────────
+;; clear/help/q only make sense at the terminal — calling them via
+;; .sys.cmd (i.e. from rfl code, no repl context) errors instead of
+;; silently accepting.
+(.sys.cmd "clear") !- domain
+(.sys.cmd "help")  !- domain
+;; (.sys.cmd "q") would exit the test process — covered by inspection.
+
+;; ────────────── empty / whitespace input ──────────────
+(.sys.cmd "")    !- domain
+(.sys.cmd "   ") !- domain
+
+;; ────────────── listen needs an integer port ──────────────
+;; The runtime `make test` doesn't expose a main poll, so listen
+;; reports "nyi" — exactly what we want for a non-server test
+;; binary.  This proves the registry-side argument validation runs
+;; before the runtime check (port out of range still errors with
+;; domain even when no poll is available).
+(.sys.cmd "listen 0")     !- domain
+(.sys.cmd "listen 99999") !- domain
+(.sys.cmd "listen abc")   !- type
