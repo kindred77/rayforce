@@ -391,6 +391,71 @@ static test_result_t test_splay_str_column_roundtrip(void) {
     PASS();
 }
 
+/* ---- test_splay_short_strv_roundtrip ----------------------------------
+ * Regression: 0-row STRV columns serialize to 14 bytes and 1-row STRV
+ * columns with content < 10 bytes serialize under 32 bytes total.  The
+ * splay reader uses ray_col_mmap which falls through col_validate_mapped;
+ * before the magic-aware fix, mapped_size < 32 returned "corrupt" and
+ * the splay loader's "nyi" fallback to ray_col_load never fired,
+ * making short STRV tables unreadable via ray_read_splayed.
+ * ---------------------------------------------------------------------- */
+
+static test_result_t test_splay_short_strv_roundtrip(void) {
+    (void)!system("rm -rf " TMP_SPLAY_DIR);
+
+    ray_t* tbl = ray_table_new(2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+
+    int64_t id_short = ray_sym_intern("short", 5);
+    int64_t id_empty = ray_sym_intern("empty", 5);
+
+    /* 1-row STRV with 2-byte content -- file ends up at 4 (magic) + 1
+     * (type) + 1 (attrs) + 8 (count) + 8 (slen) + 2 (content) = 24 bytes */
+    ray_t* shorts = ray_vec_new(RAY_STR, 1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(shorts));
+    shorts = ray_str_vec_append(shorts, "hi", 2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(shorts));
+
+    /* 0-row STRV -- 14 bytes on disk */
+    ray_t* empty = ray_vec_new(RAY_STR, 0);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(empty));
+
+    tbl = ray_table_add_col(tbl, id_short, shorts);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    tbl = ray_table_add_col(tbl, id_empty, empty);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+
+    ray_err_t err = ray_splay_save(tbl, TMP_SPLAY_DIR, NULL);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    ray_t* loaded = ray_read_splayed(TMP_SPLAY_DIR, NULL);
+    TEST_ASSERT_NOT_NULL(loaded);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    TEST_ASSERT_EQ_I(ray_table_ncols(loaded), 2);
+
+    ray_t* loaded_shorts = ray_table_get_col(loaded, id_short);
+    ray_t* loaded_empty  = ray_table_get_col(loaded, id_empty);
+    TEST_ASSERT_NOT_NULL(loaded_shorts);
+    TEST_ASSERT_NOT_NULL(loaded_empty);
+    TEST_ASSERT_EQ_I(loaded_shorts->type, RAY_STR);
+    TEST_ASSERT_EQ_I(loaded_shorts->len, 1);
+    TEST_ASSERT_EQ_I(loaded_empty->type, RAY_STR);
+    TEST_ASSERT_EQ_I(loaded_empty->len, 0);
+
+    size_t slen = 0;
+    const char* s0 = ray_str_vec_get(loaded_shorts, 0, &slen);
+    TEST_ASSERT_EQ_U(slen, 2);
+    TEST_ASSERT_MEM_EQ(2, s0, "hi");
+
+    ray_release(loaded);
+    ray_release(shorts);
+    ray_release(empty);
+    ray_release(tbl);
+
+    (void)!system("rm -rf " TMP_SPLAY_DIR);
+    PASS();
+}
+
 /* ---- test_parted_nrows ------------------------------------------------- */
 
 static test_result_t test_parted_nrows(void) {
@@ -2144,6 +2209,7 @@ const test_entry_t store_entries[] = {
     { "store/col_mmap_nofile", test_col_mmap_nofile, store_setup, store_teardown },
     { "store/splay_open_roundtrip", test_splay_open_roundtrip, store_setup, store_teardown },
     { "store/splay_str_column_roundtrip", test_splay_str_column_roundtrip, store_setup, store_teardown },
+    { "store/splay_short_strv_roundtrip", test_splay_short_strv_roundtrip, store_setup, store_teardown },
     { "store/parted_nrows", test_parted_nrows, store_setup, store_teardown },
     { "store/table_nrows_parted", test_table_nrows_parted, store_setup, store_teardown },
     { "store/parted_release", test_parted_release, store_setup, store_teardown },
