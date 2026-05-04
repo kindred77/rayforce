@@ -1,0 +1,8 @@
+;; Lazy chain — sum builds a single-op chain, materialises at REPL.
+(set V [1 2 3 4 5])
+(sum V) -- 15
+
+;; sum + count over a stored vector — verifies the lazy infrastructure
+;; doesn't perturb behaviour.
+(count V) -- 5
+(avg V) -- 3.0
