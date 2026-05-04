@@ -21,3 +21,17 @@
 
 ;; with nulls — asc/desc/reverse preserve nulls; count includes them
 (count (asc [1 0Nl 2])) -- 3
+
+;; (first (asc v)) on null-free input — should equal (min v)
+(first (asc [3 1 4 1 5 9 2 6])) -- 1
+(last  (asc [3 1 4 1 5 9 2 6])) -- 9
+
+;; (first (asc v)) on null-bearing input — in this codebase, both
+;; first and min skip nulls, so semantics match.  The precondition
+;; fires false for null-bearing OP_CONST (conservative), so the
+;; slow path runs and must still produce the correct answer.
+(first (asc [1 0Nl 2])) -- 1
+
+;; (last (asc v)) on null-bearing input — last after asc is the
+;; largest non-null in this case (nulls at the start).
+(last (asc [1 0Nl 2])) -- 2
