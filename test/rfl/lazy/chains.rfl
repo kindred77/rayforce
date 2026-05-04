@@ -44,3 +44,9 @@
 
 ;; asc preserves order semantics through the chain.
 (first (asc [3 1 4 1 5 9 2 6])) -- 1
+
+;; desc returns lazy — chain extends through count.
+(count (desc V)) -- 5
+
+;; desc reverses sort order; first(desc) = max element.
+(first (desc [3 1 4 1 5 9 2 6])) -- 9
