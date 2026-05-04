@@ -3614,7 +3614,8 @@ static test_result_t test_expr_scalar_null_propagation(void) {
     ray_release(null_scalar);
 
     /* x + ns: ns is scalar-null (len=1 w/ null) → set_all_null path
-     * in propagate_nulls_binary when r_scalar && scalar_is_null(rhs) */
+     * in propagate_nulls_binary when r_scalar && scalar_is_null(rhs).
+     * Rayforce count = length (q-style); verify null-ness separately. */
     ray_graph_t* g = ray_graph_new(tbl);
     ray_op_t* x  = ray_scan(g, "x");
     ray_op_t* ns = ray_scan(g, "ns");
@@ -3622,8 +3623,22 @@ static test_result_t test_expr_scalar_null_propagation(void) {
     ray_op_t* cnt = ray_count(g, add);
     ray_t* result = ray_execute(g, cnt);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    TEST_ASSERT_EQ_I(result->i64, 0);  /* all null due to null scalar */
+    /* count = length = 3, not 0 (q-style: count includes nulls) */
+    TEST_ASSERT_EQ_I(result->i64, 3);
     ray_release(result);
+    ray_graph_free(g);
+
+    /* Verify all 3 elements are null (the actual null-propagation check) */
+    g = ray_graph_new(tbl);
+    x  = ray_scan(g, "x");
+    ns = ray_scan(g, "ns");
+    add = ray_add(g, x, ns);
+    ray_t* add_vec = ray_execute(g, add);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(add_vec));
+    TEST_ASSERT_TRUE(ray_vec_is_null(add_vec, 0));
+    TEST_ASSERT_TRUE(ray_vec_is_null(add_vec, 1));
+    TEST_ASSERT_TRUE(ray_vec_is_null(add_vec, 2));
+    ray_release(add_vec);
     ray_graph_free(g);
 
     /* ns + x: null scalar as lhs → set_all_null path */
@@ -3634,8 +3649,22 @@ static test_result_t test_expr_scalar_null_propagation(void) {
     cnt = ray_count(g, add2);
     result = ray_execute(g, cnt);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    TEST_ASSERT_EQ_I(result->i64, 0);
+    /* count = length = 3, not 0 (q-style: count includes nulls) */
+    TEST_ASSERT_EQ_I(result->i64, 3);
     ray_release(result);
+    ray_graph_free(g);
+
+    /* Verify all 3 elements are null for ns+x path */
+    g = ray_graph_new(tbl);
+    x  = ray_scan(g, "x");
+    ns = ray_scan(g, "ns");
+    add2 = ray_add(g, ns, x);
+    ray_t* add2_vec = ray_execute(g, add2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(add2_vec));
+    TEST_ASSERT_TRUE(ray_vec_is_null(add2_vec, 0));
+    TEST_ASSERT_TRUE(ray_vec_is_null(add2_vec, 1));
+    TEST_ASSERT_TRUE(ray_vec_is_null(add2_vec, 2));
+    ray_release(add2_vec);
     ray_graph_free(g);
 
     ray_release(tbl);
@@ -4318,15 +4347,31 @@ static test_result_t test_expr_unary_null_propagation(void) {
     ray_release(result);
     ray_graph_free(g);
 
-    /* neg(x): null propagation via propagate_nulls → count should be 4 */
+    /* neg(x): null propagation via propagate_nulls.
+     * Rayforce count = length (q-style); verify null-ness separately. */
     g = ray_graph_new(tbl);
     x = ray_scan(g, "x");
     ray_op_t* neg = ray_neg(g, x);
     ray_op_t* cnt = ray_count(g, neg);
     result = ray_execute(g, cnt);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    TEST_ASSERT_EQ_I(result->i64, 4);
+    /* count = length = 5, not 4 (q-style: count includes nulls) */
+    TEST_ASSERT_EQ_I(result->i64, 5);
     ray_release(result);
+    ray_graph_free(g);
+
+    /* Verify only element 2 is null (null propagated from x[2]) */
+    g = ray_graph_new(tbl);
+    x = ray_scan(g, "x");
+    neg = ray_neg(g, x);
+    ray_t* neg_vec = ray_execute(g, neg);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(neg_vec));
+    TEST_ASSERT_FALSE(ray_vec_is_null(neg_vec, 0));
+    TEST_ASSERT_FALSE(ray_vec_is_null(neg_vec, 1));
+    TEST_ASSERT_TRUE(ray_vec_is_null(neg_vec, 2));
+    TEST_ASSERT_FALSE(ray_vec_is_null(neg_vec, 3));
+    TEST_ASSERT_FALSE(ray_vec_is_null(neg_vec, 4));
+    ray_release(neg_vec);
     ray_graph_free(g);
 
     ray_release(tbl);
@@ -4354,7 +4399,8 @@ static test_result_t test_expr_binary_null_propagation(void) {
     tbl = ray_table_add_col(tbl, nb, vb);
     ray_release(va); ray_release(vb);
 
-    /* a + b: nulls at positions 1,3 → count non-null = 3 */
+    /* a + b: nulls at positions 1,3 propagate into result.
+     * Rayforce count = length (q-style); verify null-ness separately. */
     ray_graph_t* g = ray_graph_new(tbl);
     ray_op_t* a_op = ray_scan(g, "a");
     ray_op_t* b_op = ray_scan(g, "b");
@@ -4362,8 +4408,24 @@ static test_result_t test_expr_binary_null_propagation(void) {
     ray_op_t* cnt = ray_count(g, add);
     ray_t* result = ray_execute(g, cnt);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    TEST_ASSERT_EQ_I(result->i64, 3);
+    /* count = length = 5, not 3 (q-style: count includes nulls) */
+    TEST_ASSERT_EQ_I(result->i64, 5);
     ray_release(result);
+    ray_graph_free(g);
+
+    /* Verify null propagation: positions 1 and 3 are null, others are not */
+    g = ray_graph_new(tbl);
+    a_op = ray_scan(g, "a");
+    b_op = ray_scan(g, "b");
+    add = ray_add(g, a_op, b_op);
+    ray_t* add_vec = ray_execute(g, add);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(add_vec));
+    TEST_ASSERT_FALSE(ray_vec_is_null(add_vec, 0));
+    TEST_ASSERT_TRUE(ray_vec_is_null(add_vec, 1));
+    TEST_ASSERT_FALSE(ray_vec_is_null(add_vec, 2));
+    TEST_ASSERT_TRUE(ray_vec_is_null(add_vec, 3));
+    TEST_ASSERT_FALSE(ray_vec_is_null(add_vec, 4));
+    ray_release(add_vec);
     ray_graph_free(g);
 
     ray_release(tbl);
@@ -5118,7 +5180,8 @@ static test_result_t test_expr_set_all_null_large(void) {
     tbl = ray_table_add_col(tbl, nns, ns);
     ray_release(vec); ray_release(ns);
 
-    /* v + ns (len=1 null scalar) → all 200 results null → exercises set_all_null with len>128 */
+    /* v + ns (len=1 null scalar) → all 200 results null → exercises set_all_null with len>128.
+     * Rayforce count = length (q-style); verify null-ness separately. */
     ray_graph_t* g = ray_graph_new(tbl);
     ray_op_t* v_op = ray_scan(g, "v");
     ray_op_t* ns_op = ray_scan(g, "ns");
@@ -5126,8 +5189,22 @@ static test_result_t test_expr_set_all_null_large(void) {
     ray_op_t* cnt = ray_count(g, add);
     ray_t* result = ray_execute(g, cnt);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    TEST_ASSERT_EQ_I(result->i64, 0);  /* all null → count = 0 */
+    /* count = length = 200, not 0 (q-style: count includes nulls) */
+    TEST_ASSERT_EQ_I(result->i64, 200);
     ray_release(result);
+    ray_graph_free(g);
+
+    /* Verify all 200 elements are null (the actual set_all_null coverage check) */
+    g = ray_graph_new(tbl);
+    v_op = ray_scan(g, "v");
+    ns_op = ray_scan(g, "ns");
+    add = ray_add(g, v_op, ns_op);
+    ray_t* add_vec = ray_execute(g, add);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(add_vec));
+    for (int i = 0; i < 200; i++) {
+        TEST_ASSERT_TRUE(ray_vec_is_null(add_vec, i));
+    }
+    ray_release(add_vec);
     ray_graph_free(g);
 
     ray_release(tbl);
@@ -5161,7 +5238,8 @@ static test_result_t test_expr_propagate_nulls_slice(void) {
     tbl = ray_table_add_col(tbl, nb, vb);
     ray_release(vec); ray_release(sl); ray_release(vb);
 
-    /* s + b: slice with null at offset 1 (which is position 2 of original = position 1 of slice) */
+    /* s + b: slice [20, 30(null), 40] + b=[100,200,300] → null propagates at pos 1.
+     * Rayforce count = length (q-style); verify null-ness separately. */
     ray_graph_t* g = ray_graph_new(tbl);
     ray_op_t* s_op = ray_scan(g, "s");
     ray_op_t* b_op = ray_scan(g, "b");
@@ -5169,9 +5247,22 @@ static test_result_t test_expr_propagate_nulls_slice(void) {
     ray_op_t* cnt = ray_count(g, add);
     ray_t* result = ray_execute(g, cnt);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    /* slice is [20, 30(null), 40], b=[100,200,300]. null at pos1 → count=2 */
-    TEST_ASSERT_EQ_I(result->i64, 2);
+    /* count = length = 3, not 2 (q-style: count includes nulls) */
+    TEST_ASSERT_EQ_I(result->i64, 3);
     ray_release(result);
+    ray_graph_free(g);
+
+    /* Verify null propagation from slice: only position 1 is null */
+    g = ray_graph_new(tbl);
+    s_op = ray_scan(g, "s");
+    b_op = ray_scan(g, "b");
+    add = ray_add(g, s_op, b_op);
+    ray_t* add_vec = ray_execute(g, add);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(add_vec));
+    TEST_ASSERT_FALSE(ray_vec_is_null(add_vec, 0));
+    TEST_ASSERT_TRUE(ray_vec_is_null(add_vec, 1));
+    TEST_ASSERT_FALSE(ray_vec_is_null(add_vec, 2));
+    ray_release(add_vec);
     ray_graph_free(g);
 
     ray_release(tbl);
@@ -5977,17 +6068,32 @@ static test_result_t test_expr_f64_div_zero_scalar(void) {
     tbl = ray_table_add_col(tbl, na, v);
     ray_release(v);
 
-    /* a / 0.0 — scalar divisor = 0 → exercises line 1765 */
+    /* a / 0.0 — scalar divisor = 0 → exercises line 1765.
+     * Rayforce count = length (q-style); verify null-ness separately. */
     ray_graph_t* g = ray_graph_new(tbl);
     ray_op_t* col = ray_scan(g, "a");
     ray_op_t* zero = ray_const_f64(g, 0.0);
     ray_op_t* dv = ray_div(g, col, zero);
-    ray_op_t* cnt = ray_count(g, dv);  /* count non-null (all nulled out) */
+    ray_op_t* cnt = ray_count(g, dv);
     ray_t* result = ray_execute(g, cnt);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    /* all elements become null when dividing by zero */
-    TEST_ASSERT_EQ_I(result->i64, 0);
+    /* count = length = 4, not 0 (q-style: count includes nulls) */
+    TEST_ASSERT_EQ_I(result->i64, 4);
     ray_release(result);
+    ray_graph_free(g);
+
+    /* Verify all 4 elements are null when dividing by zero */
+    g = ray_graph_new(tbl);
+    col = ray_scan(g, "a");
+    zero = ray_const_f64(g, 0.0);
+    dv = ray_div(g, col, zero);
+    ray_t* dv_vec = ray_execute(g, dv);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(dv_vec));
+    TEST_ASSERT_TRUE(ray_vec_is_null(dv_vec, 0));
+    TEST_ASSERT_TRUE(ray_vec_is_null(dv_vec, 1));
+    TEST_ASSERT_TRUE(ray_vec_is_null(dv_vec, 2));
+    TEST_ASSERT_TRUE(ray_vec_is_null(dv_vec, 3));
+    ray_release(dv_vec);
     ray_graph_free(g);
 
     ray_release(tbl);
@@ -6747,7 +6853,11 @@ static test_result_t test_expr_sym_w32_rhs(void) {
     tbl = ray_table_add_col(tbl, nb, v2);
     ray_release(v1); ray_release(v2);
 
-    /* s == t — exercises lp_u32 (lhs W32) and rp_u32 (rhs W32) */
+    /* s == t — exercises lp_u32 (lhs W32) and rp_u32 (rhs W32).
+     * q-style null semantics: null == null evaluates to true (fix_null_comparisons).
+     * row 0: alpha==alpha → true; row 1: beta!=alpha → false;
+     * row 2: alpha!=beta → false; row 3: null==null → true (q-style).
+     * filter(s, eq) passes rows 0 and 3 → 2 elements. */
     ray_graph_t* g = ray_graph_new(tbl);
     ray_op_t* s_op = ray_scan(g, "s");
     ray_op_t* t_op = ray_scan(g, "t");
@@ -6756,8 +6866,8 @@ static test_result_t test_expr_sym_w32_rhs(void) {
     ray_op_t* cnt  = ray_count(g, flt);
     ray_t* result  = ray_execute(g, cnt);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    /* row 0: alpha==alpha (1), row 1: beta!=alpha (0), row 2: alpha!=beta (0): 1 match */
-    TEST_ASSERT_EQ_I(result->i64, 1);
+    /* 2 matches: row 0 (alpha==alpha) and row 3 (null==null under q-style) */
+    TEST_ASSERT_EQ_I(result->i64, 2);
     ray_release(result);
     ray_graph_free(g);
 
@@ -6795,7 +6905,10 @@ static test_result_t test_expr_sym_w8_rhs(void) {
     tbl = ray_table_add_col(tbl, nb, v2);
     ray_release(v1); ray_release(v2);
 
-    /* s == t — exercises lsym_buf (lhs narrow) and rsym_buf (rhs narrow) */
+    /* s == t — exercises lsym_buf (lhs narrow) and rsym_buf (rhs narrow).
+     * q-style null semantics: null == null evaluates to true (fix_null_comparisons).
+     * row 0: p==p → true; row 1: q!=p → false; row 2: null==null → true (q-style).
+     * filter(s, eq) passes rows 0 and 2 → 2 elements. */
     ray_graph_t* g = ray_graph_new(tbl);
     ray_op_t* s_op = ray_scan(g, "s");
     ray_op_t* t_op = ray_scan(g, "t");
@@ -6804,8 +6917,8 @@ static test_result_t test_expr_sym_w8_rhs(void) {
     ray_op_t* cnt  = ray_count(g, flt);
     ray_t* result  = ray_execute(g, cnt);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    /* row 0: p==p (1), row 1: q!=p (0): 1 match */
-    TEST_ASSERT_EQ_I(result->i64, 1);
+    /* 2 matches: row 0 (p==p) and row 2 (null==null under q-style) */
+    TEST_ASSERT_EQ_I(result->i64, 2);
     ray_release(result);
     ray_graph_free(g);
 
