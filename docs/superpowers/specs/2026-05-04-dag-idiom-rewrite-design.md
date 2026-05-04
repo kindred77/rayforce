@@ -1,96 +1,249 @@
-# DAG Idiom Rewrite Pass — Design
+# Universal DAG VM — Lazy-Chain Discipline & Idiom Rewriter
 
-**Status:** Draft
+**Status:** Draft (revision 2 — universal-DAG framing)
 **Date:** 2026-05-04
 **Author:** Anton (with Claude)
-**Scope:** Main DAG only (group/sort/window/select/join sub-DAGs out of scope for v1)
+**Supersedes:** revision 1 (single-pass DAG idiom rewriter, 2026-05-04)
 
 ---
 
-## Problem
+## The principle
 
-Several Rayforce expressions decompose at the DAG level into shapes whose
-optimal evaluation is already implemented as a single primitive opcode, but
-the planner emits the unfused form. The canonical example:
+**One universal DAG VM. Call site is invisible.**
 
-```rfl
-(count (distinct V))
-```
+Whether the user writes `(count V)` at the REPL, `(count (distinct V))`
+in a chain, or `(select count(distinct v) from T)` in a query — every
+expression that *can* be expressed in the DAG vocabulary builds the
+same DAG, runs through the same optimizer, executes on the same
+`ray_execute` codepath. The eager `*_fn` surface functions are not a
+parallel evaluator; they are the **entry points** that decide whether
+to extend an existing lazy chain or start a fresh one. They never
+materialise unless they are the materialisation boundary themselves.
 
-Today this evaluates as:
+## Why revision 2
 
-1. `OP_DISTINCT` — runs `ray_distinct_fn` (`src/ops/collection.c:700`),
-   which materialises a deduplicated vector via a hash set, then sorts the
-   surviving indices, then gathers them into a fresh column.
-2. `OP_COUNT` — reads `len` of that column.
+Revision 1 designed a DAG idiom-rewrite pass under the assumption
+that shapes like `(count (distinct V))` already form chains that the
+optimizer sees. They don't. An audit of the `ray_lazy_*` machinery
+showed:
 
-A dedicated opcode `OP_COUNT_DISTINCT` already exists
-(`src/ops/ops.h:170`), is wired through the DAG builder
-(`ray_count_distinct` at `src/ops/graph.c:671`), executor
-(`exec_count_distinct` at `src/ops/group.c:158`), and lazy chain
-(`ray_lazy_append` at `src/ops/graph.c:1685`) — but no surface
-construction path produces it. The fast path is unreachable from
-Rayfall today.
+- **`ray_lazy_wrap` is called in 3 places, all in `agg.c`, and each
+  is immediately followed by `ray_lazy_materialize` on the same line**
+  (`agg.c:90, 225, 254`). No producer ever actually returns lazy.
+- **`ray_lazy_append` is called in 7 places**, all in `agg.c` (lines
+  110/177/194/217/246/275/314), correctly shaped — but they're dead
+  code in practice because no producer upstream emits lazy.
+- **`distinct`, `asc`, `desc`, `reverse` lack DAG opcodes entirely**
+  (`grep "OP_DISTINCT\|OP_ASC\|OP_DESC\|OP_REVERSE" src/ops/ops.h`
+  returns zero hits). Their `*_fn` surface functions
+  (`collection.c:701, 1710`, `sort.c:3347, 3358`) eagerly materialise
+  any lazy input and operate on raw bytes.
+- **`ray_lazy_materialize` does not call `ray_optimize`**
+  (`graph.c:1711` jumps straight to `ray_execute`). The optimizer
+  runs only inside `query.c`'s select compiler — not on REPL chains.
+- **IPC, journal, and serde paths have no `ray_lazy_materialize`
+  calls**. They work today only because no producer ever returns
+  lazy.
 
-The same applies to a small family of related shapes
-(see §4 — Day-1 catalog).
+So the original "Phase 1 = lift four ops; Phase 2 = idiom rewriter"
+framing was incomplete. The honest framing is one principle with three
+mechanical consequences. This revision restructures around that.
 
 ## Non-goals
 
-- **Grouped aggregation rewrites.** `OP_GROUP`'s `agg_ins[a]` sub-DAGs are
-  out of scope; group is already optimised on its own path.
-- **Surface-language sugar.** This pass operates on the post-construction
-  DAG. Adding `count_distinct` / `countd` as a Rayfall-callable function
-  is a separate, future concern.
-- **A pattern DSL or e-graph.** A static C table is sufficient for the
-  catalog size we anticipate (≤ ~30 idioms).
+- **Surface-language sugar.** Adding `count_distinct` / `countd` as a
+  Rayfall-callable name is out of scope. The whole point is that the
+  user keeps writing `(count (distinct V))` and the system gets fast.
+- **Grouped aggregation rewrites.** `OP_GROUP`'s `agg_ins[a]`
+  sub-DAGs are out of scope; group has its own optimised path.
+- **A pattern DSL or e-graph.** A static C table is sufficient at
+  the catalog size we anticipate (≤ ~30 idioms).
+- **Lifting every quietly-eager `*_fn`.** Only the four with concrete
+  rewrite payoff in the day-1 idiom catalog (`distinct/asc/desc/
+  reverse`). The wider audit informs follow-up work but isn't part
+  of v1.
 
 ## Architecture
 
-### Pipeline insertion
+The change has three layers. They land together; partial landings
+leave the codebase in a worse state than today (a producer that
+returns lazy with no boundary materialisation downstream would
+crash any consumer that reads raw bytes).
 
-A new pass `pass_idiom_rewrite` is inserted as **Pass 3** in
-`ray_optimize` (`src/ops/opt.c:2013`), between constant folding and SIP:
+### Layer A — Producers return lazy
+
+Every supported `*_fn` follows this template:
+
+```c
+ray_t* ray_X_fn(ray_t* x) {
+    /* Validate without forcing materialisation. ray_is_lazy()
+       and the type tag are concrete bits on the lazy header. */
+    if (!x || RAY_IS_ERR(x)) return x;
+    if (ray_is_atom(x)) { /* op-specific atom handling */ }
+
+    /* Extend an existing chain. */
+    if (ray_is_lazy(x)) return ray_lazy_append(x, OP_X);
+
+    /* Start a fresh chain. Wrap the input as a const-vec node,
+       chain OP_X on top, return lazy. Do NOT materialize. */
+    ray_graph_t* g  = ray_graph_new();
+    ray_op_t*    in = ray_const_vec(g, x);
+    ray_op_t*    op = ray_X_op(g, in);
+    return ray_lazy_wrap(g, op);
+}
+```
+
+**Rule:** an `*_fn` only materialises if it itself sits at a
+materialisation boundary (Layer B), or if it needs raw bytes for an
+op the DAG can't yet express. The `wrap-and-materialize-immediately`
+shorthand currently in `agg.c:90, 225, 254` is the bug; it becomes
+`wrap-and-return-lazy`.
+
+**Atoms stay concrete.** Negative-type-tag values (atoms) are scalar
+literals. They never enter chains. The `ray_is_atom(x)` early-exit
+in each `*_fn` covers that case.
+
+**Existing aggregation `*_fn`s already extend correctly** (`agg.c:110,
+177, 194, 217, 246, 275, 314`). They just need their leaf-case
+branches changed from `wrap+materialize` to `wrap+return_lazy`.
+
+### Layer B — Boundaries materialise (and optimise)
+
+A lazy value transitions to a concrete vector at exactly the points
+where bytes leave the universal VM. Each of these sites must call
+`ray_lazy_materialize` on any lazy input. They split into two groups:
+
+**Already wired (no change needed):**
+
+| Site                          | File:line                                |
+|-------------------------------|------------------------------------------|
+| REPL output                   | `src/app/repl.c:731, 1226`               |
+| Format / print                | `src/lang/format.c:1053`                 |
+| `set` (global env bind)       | `src/lang/eval.c:1119`                   |
+| `let` (local env bind)        | `src/lang/eval.c:1137`                   |
+| `if` truthiness test          | `src/lang/eval.c:1151`                   |
+| Comparison kernels            | `src/ops/cmp.c:271`                      |
+| Builtins arg coercion         | `src/ops/builtins.c:81, 167, 232, 261, 288, 310, 347` |
+| Collection-op arg coercion    | `src/ops/collection.c:340, 406, 454, 494, 495, 609, 800, 801, 978, 1058, 1120, 1178, 1496, 1619, 1970, 2024` |
+
+**Missing — must be added in v1:**
+
+| Site                          | Where                                     | Reason                                                              |
+|-------------------------------|-------------------------------------------|---------------------------------------------------------------------|
+| IPC send (sync + async)       | `src/core/ipc.c:1027` (sync), `:1091` (async) | Wire frame must contain concrete bytes.                             |
+| Journal write                 | `src/store/journal.c` (`ray_journal_write_bytes` callers) | Persisted log must be replayable; can't store deferred computations. |
+| Splay/serde write             | `src/store/serde.c` (top-level write entry points)        | Same as journal.                                                    |
+
+**Materialise also runs the optimiser.** Today
+`ray_lazy_materialize` (`graph.c:1706-1719`) calls `ray_execute`
+directly, skipping the optimizer. Change:
+
+```c
+ray_t* ray_lazy_materialize(ray_t* val) {
+    if (!ray_is_lazy(val)) return val;
+    ray_graph_t* g  = RAY_LAZY_GRAPH(val);
+    ray_op_t*    op = RAY_LAZY_OP(val);
+    op              = ray_optimize(g, op);    /* NEW LINE */
+    ray_t* result   = ray_execute(g, op);
+    ray_graph_free(g);
+    RAY_LAZY_GRAPH(val) = NULL;
+    ray_release(val);
+    return result;
+}
+```
+
+Without this, even with chains forming correctly, the optimizer
+(and our new idiom pass) would never run on REPL-built chains —
+they'd execute as written.
+
+### Layer C — Lift four ops into the DAG
+
+`distinct`, `asc`, `desc`, `reverse` join the universal VM. Each
+gets:
+
+1. **A new opcode** in `src/ops/ops.h`.
+2. **A DAG builder** `ray_X_op(g, in)` in `src/ops/graph.c` (the
+   `_op` suffix avoids colliding with the existing `*_fn` surface
+   names).
+3. **An executor case** in `src/ops/exec.c`'s opcode dispatch,
+   delegating to a refactored core (`exec_distinct`, `exec_asc`,
+   `exec_desc`, `exec_reverse`) that takes a `ray_op_t* + ray_t*` and
+   returns `ray_t*`. The implementation reuses the existing
+   `ray_*_fn` body; only the entry-point shape changes.
+4. **A dump entry** in `src/ops/dump.c`'s `ray_opcode_name`.
+5. **A lazy-append type rule** in `ray_lazy_append`
+   (`src/ops/graph.c:1677`): all four preserve input type.
+6. **The `*_fn` surface function** rewritten to follow the Layer A
+   template — extend if lazy, wrap-lazy if concrete.
+
+This expands the DAG vocabulary by 4 opcodes
+(highest currently used = `OP_KNN_RERANK = 103`; the new ones
+slot into the next free range).
+
+### Layer D — Idiom rewriter (the original spec, unchanged design)
+
+A new pass `pass_idiom_rewrite` inserted as **Pass 3** in
+`ray_optimize` (`src/ops/opt.c:2013`), between constant folding and
+SIP. New files `src/ops/idiom.{c,h}`. Table-driven, ~6 rows on day
+one, no new opcodes (every replacement maps to an existing `OP_*`
+including the four added in Layer C).
+
+This layer is unchanged from revision 1 and is documented in detail
+below (§Idiom rewriter — design retained from rev 1).
+
+### Why all four layers must land together
+
+- **A without B:** producers emit lazy, consumers read raw bytes
+  without materialising → segfault.
+- **A + B without optimiser-in-materialise:** chains form, optimizer
+  never runs, no win except what the executor extracts incidentally
+  from chained execution. The whole architectural pivot delivers
+  nothing observable.
+- **A + B + opt without C:** `(count (distinct V))` still doesn't
+  chain because `distinct` materialises. The headline rewrite never
+  fires.
+- **A + B + opt + C without D:** chain is fully visible to the
+  optimizer, but no rewrite recognises the count-distinct shape →
+  executor runs `OP_DISTINCT` (materialises a deduped vector) then
+  `OP_COUNT` (reads len). Functionally correct, no perf win.
+
+So the project is a single coherent change. It can be staged across
+multiple PRs internally, but the spec/plan treats it as one unit.
+
+## Idiom rewriter — design retained from rev 1
+
+### Insertion
+
+`pass_idiom_rewrite` becomes Pass 3:
 
 ```
-Pass 1: type inference
-Pass 2: constant folding
-Pass 3: idiom rewrite           ← NEW
-Pass 4: SIP
-Pass 5: factorize
-Pass 6: predicate pushdown
-Pass 7: filter reorder
-Pass 8: projection pushdown
-Pass 9: partition pruning
+Pass 1:  type inference
+Pass 2:  constant folding
+Pass 3:  idiom rewrite           ← NEW
+Pass 4:  SIP
+Pass 5:  factorize
+Pass 6:  predicate pushdown
+Pass 7:  filter reorder
+Pass 8:  projection pushdown
+Pass 9:  partition pruning
 Pass 10: fusion
 Pass 11: DCE
 ```
 
-Rationale:
+After const-fold so the matcher never has to handle a partially
+folded `OP_ASC` over a literal vector. Before everything else so
+later passes see the simplified shape. DCE at the end sweeps any
+node the rewriter marks `OP_FLAG_DEAD`.
 
-- **After const-fold** — folded literals can collapse some inputs (e.g.
-  `(asc [3 1 2])`) to a constant vector, which the rewriter would
-  otherwise see as a real `OP_ASC` and try (harmlessly) to match.
-  Running after const-fold removes this concern.
-- **Before SIP and everything downstream** — subsequent passes see the
-  simplified shape. Projection-pushdown's reachability walk is shorter,
-  fusion has fewer chains to inspect, DCE has fewer dead nodes.
-- DCE at the end already sweeps anything the rewriter marks
-  `OP_FLAG_DEAD`. No new cleanup pass needed.
-
-### File layout
-
-New files:
+### Files
 
 - `src/ops/idiom.h` — public interface (`ray_idiom_pass`, `ray_idiom_t`).
-- `src/ops/idiom.c` — pass implementation, dispatch index, idiom table,
-  per-row predicate and rewrite functions.
+- `src/ops/idiom.c` — pass body, dispatch index, idiom table,
+  per-row predicates and rewrites.
 
-Both compile automatically — `Makefile` uses `wildcard src/*/*.c`
-(verified per the layout memo) and there is no `CORE_OBJECTS` list to
-edit.
+Both compile via `Makefile`'s `wildcard src/*/*.c`. No manifest edit.
 
-## Data structures
+### Data structures
 
 ```c
 /* src/ops/idiom.h */
@@ -98,11 +251,11 @@ typedef bool      (*ray_idiom_pre_t)(ray_graph_t* g, ray_op_t* node);
 typedef ray_op_t* (*ray_idiom_rw_t) (ray_graph_t* g, ray_op_t* node);
 
 typedef struct {
-    uint16_t          root_op;     /* matches if node->opcode == root_op       */
-    uint16_t          child0_op;   /* matches if node->inputs[0]->opcode == .. */
-    ray_idiom_pre_t   pre;         /* optional precondition; NULL = always     */
-    ray_idiom_rw_t    rewrite;     /* returns replacement node, or NULL        */
-    const char*       name;        /* "count(distinct) -> count_distinct"      */
+    uint16_t          root_op;
+    uint16_t          child0_op;
+    ray_idiom_pre_t   pre;       /* NULL = always */
+    ray_idiom_rw_t    rewrite;   /* returns replacement node, or NULL */
+    const char*       name;
 } ray_idiom_t;
 
 extern const ray_idiom_t ray_idioms[];
@@ -111,21 +264,15 @@ extern const int         ray_idioms_count;
 void ray_idiom_pass(ray_graph_t* g, ray_op_t* root);
 ```
 
-The table itself is `static const ray_idiom_t ray_idioms[] = { … };`
-in `idiom.c`. Adding an idiom is a one-line addition to that array
-plus (in the typical case) a small `static` rewrite function above it.
-There is no registration API — patterns are baked in at build time.
+Static table in `idiom.c`. No registration API.
 
 ### Dispatch index
 
-A naive matcher would scan the full table for every node. Instead, on
-first call the pass builds a per-opcode bucket index:
-
 ```c
 /* Sized generously above the highest currently-defined opcode
- * (OP_KNN_RERANK = 103 in src/ops/ops.h as of writing). A
+ * (OP_KNN_RERANK = 103, plus 4 new opcodes from Layer C). A
  * _Static_assert in idiom.c guards against silent overflow if
- * a new opcode pushes past the cap. */
+ * a future opcode pushes past the cap. */
 #define RAY_IDIOM_OPCODE_CAP 128
 #define RAY_IDIOM_MAX_ROWS    64
 
@@ -137,188 +284,109 @@ _Static_assert(/* highest used root_op */ < RAY_IDIOM_OPCODE_CAP,
                "idiom dispatch index too small");
 ```
 
-Build cost: O(N) where N = `ray_idioms_count`. Per-node lookup: O(1)
-bucket head + chain walk over only those rows whose `root_op` matches.
-With 6 rows in v1 across 3 distinct root ops (`OP_COUNT`, `OP_FIRST`,
-`OP_LAST`), average chain length is 2.
+Built once per process, ~192 bytes BSS. Per-node lookup is O(1)
+bucket head + chain walk.
 
-Index is process-static — built once, never freed. 192 bytes of BSS
-total (`128 + 64` int8s).
+### Walk + replacement
 
-If the catalog ever exceeds 127 rows or 127 opcodes, widen both
-arrays to `int16_t`. The static-assert keeps this honest.
+Single post-order traversal (no fixpoint — none of v1's idioms
+cascade). For each live node: bucket-lookup by `node->opcode`, walk
+the chain, check `inputs[0]->opcode == row->child0_op`, run
+`row->pre` if present, call `row->rewrite`. On success:
 
-## Matcher mechanics
+1. Allocate the replacement via `graph_alloc_node_opt`
+   (`opt.c:1027`).
+2. `redirect_consumers(g, n->id, replacement->id)` (`opt.c:1312`).
+3. `n->flags |= OP_FLAG_DEAD`.
 
-### Walk order
+Same convention as `factorize_pass` / `pass_predicate_pushdown`.
+Never mutate `node->opcode` in place. The orphaned child becomes
+unreferenced and `pass_dce` (Pass 11) sweeps it.
 
-Single post-order traversal of the live graph rooted at `root`,
-children-before-parents. Implementation reuses the visited/stack
-machinery already present in `count_refs` (`src/ops/fuse.c:59`) —
-**not** a fixpoint loop. None of the day-1 idioms produce shapes
-that re-match.
+Ext-bearing nodes (`OP_GROUP/OP_SORT/OP_JOIN/OP_WINDOW/
+OP_WINDOW_JOIN/OP_SELECT`) are skipped as roots in v1.
 
-If we later add cascading idioms, we wrap the body in
-`do { changed = false; … } while (changed && iter++ < CAP);` with a
-small iteration cap (8 is more than enough for any realistic chain).
-The cap exists strictly to bound pathological cases — the DCE pass
-already protects against unbounded graph growth via the dead-marking
-convention.
-
-### Per-node match
-
-For a node `n`:
-
-1. Look up the bucket head: `idx = first_idiom[n->opcode]`.
-   If `< 0`, skip.
-2. Walk the chain. For each candidate row:
-   - Check `n->inputs[0]->opcode == row->child0_op` (and
-     `n->inputs[0] != NULL`, defensive).
-   - If `row->pre`, call it. If it returns false, continue chain.
-   - Call `row->rewrite(g, n)`. If it returns `NULL`, continue chain.
-   - On success: install the replacement (see below) and break out
-     of the chain.
-
-Day-1 patterns are all unary-over-unary, so only `inputs[0]` is
-inspected. The schema permits future expansion to `child1_op` if a
-binary-rooted idiom needs it; for now that field is implicit (any).
-
-### Replacement protocol
-
-`rewrite` returns the node that should take the original's place. The
-matcher then:
-
-1. `redirect_consumers(g, n->id, replacement->id)` — already in
-   `src/ops/opt.c:1312`. Walks the graph, repoints any node whose
-   `inputs[i] == &g->nodes[n->id]` to the replacement.
-2. `n->flags |= OP_FLAG_DEAD` — same convention every other rewrite
-   pass uses (`factorize_pass`, `pass_predicate_pushdown`, etc.).
-3. The original's child (e.g. the `OP_DISTINCT` node) becomes
-   reference-orphaned and will be marked dead by `pass_dce` at Pass 11.
-
-The matcher does **not** mutate `n->opcode` in place. In-place mutation
-would invalidate any other node's input pointer to `n` — a hazard
-sidestepped entirely by always producing a fresh node and using
-`redirect_consumers`.
-
-### Fresh-node allocation
-
-Rewrite callbacks allocate via `graph_alloc_node_opt` (`opt.c:1027`),
-not the public `graph_alloc_node`, so they participate in the
-optimizer's existing extension-tracking discipline. The new node's
-`out_type` is set explicitly per opcode (e.g. `RAY_I64` for
-`OP_COUNT_DISTINCT`).
-
-### Ext-bearing nodes
-
-Any node whose `opcode` is one of `OP_GROUP`, `OP_SORT`, `OP_JOIN`,
-`OP_WINDOW`, `OP_WINDOW_JOIN`, `OP_SELECT` is **skipped as a root**
-in v1 — those carry sub-DAGs in `ext` data. Per-scope, the idiom
-catalog targets only top-level main-DAG shapes.
-
-A future extension would teach the matcher to recurse into ext sub-DAGs
-(the `count_refs` enumeration in `fuse.c:111-167` already shows the
-exact set of ext children to traverse). That recursion is not
-implemented in v1.
-
-## Day-1 catalog
-
-Six rows. No new opcodes needed — every replacement maps to an
-already-defined `OP_*`.
+### Day-1 catalog (6 rows)
 
 | # | Pattern                  | Replacement              | Precondition                                  | Notes                                                                                            |
 |---|--------------------------|--------------------------|-----------------------------------------------|--------------------------------------------------------------------------------------------------|
-| 1 | `(count (distinct v))`   | `OP_COUNT_DISTINCT(v)`   | none                                          | Headline rewrite. Hash-set executor at `group.c:158` normalises null/NaN explicitly — sound.     |
-| 2 | `(count (asc v))`        | `OP_COUNT(v)`            | none                                          | Sort doesn't change cardinality; `count` returns `len` either way (including null-bearing rows). |
+| 1 | `(count (distinct v))`   | `OP_COUNT_DISTINCT(v)`   | none                                          | Hash-set executor at `group.c:158`. Headline rewrite.                                            |
+| 2 | `(count (asc v))`        | `OP_COUNT(v)`            | none                                          | Sort doesn't change cardinality.                                                                 |
 | 3 | `(count (desc v))`       | `OP_COUNT(v)`            | none                                          | Same.                                                                                            |
 | 4 | `(count (reverse v))`    | `OP_COUNT(v)`            | none                                          | Same.                                                                                            |
-| 5 | `(first (asc v))`        | `OP_MIN(v)`              | `!(v->attrs & RAY_ATTR_HAS_NULLS)` statically | Without the gate, semantics diverge: `(first (asc v))` returns null on null-bearing input (asc places nulls first per `xasc`); `OP_MIN` skips nulls. |
+| 5 | `(first (asc v))`        | `OP_MIN(v)`              | `!(v->attrs & RAY_ATTR_HAS_NULLS)` statically | Without gate, semantics diverge under nulls. `xasc` puts nulls first; `OP_MIN` skips nulls.      |
 | 6 | `(last (asc v))`         | `OP_MAX(v)`              | `!(v->attrs & RAY_ATTR_HAS_NULLS)` statically | Same nulls reasoning.                                                                            |
 
-### Precondition for rows 5 & 6
+The precondition for rows 5 & 6 returns true only when the input's
+null state is statically known clean (e.g. `OP_SCAN` of a column
+header with `RAY_ATTR_HAS_NULLS == 0`, or a constant vector with no
+nulls). For lazy/computed inputs whose null state isn't tracked,
+return false → slow form runs. False negatives are acceptable; false
+positives are not.
 
-The precondition reads the input vector's `attrs` bitfield. It returns
-`true` only when the input's null-state is **statically known** to be
-clean. Specifically:
+### Tests
 
-- For an `OP_SCAN` whose source column carries `RAY_ATTR_HAS_NULLS == 0`
-  on its column header — return `true`.
-- For a constant vector with no `RAY_ATTR_HAS_NULLS` bit — return
-  `true`.
-- For any other input (lazy, computed, transformed by an op whose null
-  propagation isn't tracked) — return `false`. The slow form runs.
+- `test/rfl/ops/idiom.rfl` — behavioural equivalence per row (empty,
+  single, all-equal, mixed, null-bearing for 5/6, boundaries).
+- No structural-shape test in v1 — dump-string assertions are too
+  brittle for opcode renames.
 
-This is the safe-default discipline: we only fire the rewrite when
-we can prove the precondition holds; otherwise we leave the original
-shape alone. False negatives (missed rewrites) are acceptable; false
-positives (incorrect results) are not.
+Test harness: per the layout memo, `.rfl` files auto-discovered by
+`test/main.c`. Run `make test` or `./rayforce.test -f idiom`.
 
-## Tests
+### Profiling
 
-### Behavioural-equivalence tests
+```c
+ray_profile_span_start("idiom");
+/* pass body */
+ray_profile_span_end("idiom");
+ray_profile_tick("idiom rewrite");
+```
 
-A new file `test/rfl/ops/idiom.rfl` covers each row with the standard
-`expr -- expected` DSL. For each idiom:
-
-- Empty input.
-- Single-element input.
-- All-equal input.
-- Mixed input.
-- **Null-bearing input** for rows 5–6 (must verify the slow form
-  still runs — i.e. the result equals `(first (asc v))` not
-  `OP_MIN(v)`).
-- Negative-numbers / boundary values where applicable.
-
-Per the test-harness memo, `.rfl` files are auto-discovered by
-`test/main.c`. Run via `make test` or
-`./rayforce.test -f idiom`.
-
-### No structural-shape tests in v1
-
-Asserting "the rewriter actually fired" via dump-string comparison is
-brittle (any future opcode rename breaks the test). If we want firing
-assertions later, the precedent is per-pass `ray_profile_tick` plus a
-counter — out of scope for v1.
-
-## Profiling & observability
-
-- `ray_profile_span_start("idiom")` / `ray_profile_span_end("idiom")`
-  around the pass body.
-- `ray_profile_tick("idiom rewrite")` after the pass.
-
-Both follow the convention every other pass in `ray_optimize` uses
-(`opt.c:2018-2059`). The `name` field on each idiom row is reserved
-for future `--debug-opt` style output; v1 does not consume it but the
-field is part of the schema so we don't have to expand it later.
+Same convention every other pass uses (`opt.c:2018-2059`). The
+`name` field on each row is reserved for future `--debug-opt` output.
 
 ## Edge cases & failure modes
 
 | Case                                        | Behaviour                                                                                              |
 |---------------------------------------------|--------------------------------------------------------------------------------------------------------|
-| `node->inputs[0] == NULL`                   | Skip the row (defensive; should never happen on a well-formed graph).                                  |
-| Rewrite callback returns `NULL`             | Treat as "doesn't apply"; continue chain. Used for guard-via-callback rather than precondition-field.  |
-| `graph_alloc_node_opt` returns `NULL` (OOM) | Rewrite callback returns `NULL`; original shape executes. Optimization is best-effort, never required. |
-| Multiple rows match (shouldn't happen)      | First-match-wins (chain order). Document by ordering rows from most-specific to least-specific.        |
-| `node` already `OP_FLAG_DEAD`               | Walk skips dead nodes — same convention as other passes.                                               |
-| Cyclic graph (shouldn't happen)             | Visited-set guards the post-order walk against re-entry.                                               |
+| `node->inputs[0] == NULL`                   | Skip the row.                                                                                          |
+| Rewrite callback returns `NULL`             | Treat as "doesn't apply"; continue chain.                                                              |
+| `graph_alloc_node_opt` returns `NULL` (OOM) | Rewrite returns `NULL`; original shape executes. Optimisation is best-effort.                          |
+| Multiple rows match                         | First-match-wins. Document by ordering rows most-specific to least-specific.                           |
+| Node already `OP_FLAG_DEAD`                 | Walk skips dead nodes.                                                                                 |
+| Lazy materialisation under OOM              | Standard error propagation; lazy header is freed in `ray_lazy_materialize`'s release branch as today.  |
+| Lazy chain refers to a freed graph          | Cannot happen — `ray_lazy_wrap` retains the graph; `ray_lazy_materialize` frees it after execute.      |
+| `ray_optimize` mutates `op` (e.g. predicate pushdown changes root) | `ray_optimize` already returns the new root; we re-assign `op` before passing to `ray_execute`. Existing call sites in `query.c:322` etc. follow the same pattern. |
 
-## Out of scope (explicitly deferred)
+## Audit deliverables (v1 includes the audit; cleanup beyond the four ops is follow-up)
 
-- **Grouped form.** Rewrites inside `OP_GROUP`'s `agg_ins[]`. Group has
-  its own optimised path.
-- **Multi-input / binary idioms.** The schema supports a `child1_op`
-  field but v1 only matches on `child0_op` (left-deep unary chains).
-- **Fixpoint iteration.** Day-1 idioms don't cascade; matcher is
-  single-shot.
-- **New executor opcodes.** Every day-1 row maps to an existing
-  `OP_*`. The next obvious wave (`count(where …) → OP_COUNT_WHERE`,
-  algebraic reductions like `sum(c*v) → c*sum(v)`) needs new executor
-  surface and is its own design.
-- **Surface-language exposure.** `count_distinct` / `countd` as a
-  Rayfall function is a separate concern.
-- **Pattern DSL.** Static C table is sufficient at our catalog size.
+- **Producer audit** — list every `*_fn` in `eval.c`'s
+  `register_unary` / `register_binary` table that does eager work on
+  vector inputs. Categorise: (a) lazy-correct (already extends),
+  (b) needs lift (DAG opcode missing — v1 lifts 4 of these),
+  (c) intentionally eager (special form, side-effecting, or no
+  meaningful DAG representation — keep eager).
+- **Consumer audit** — `grep ray_data\|->len\|AS_I64\|AS_F64` for
+  call sites that read raw bytes without a preceding
+  `ray_lazy_materialize` or `ray_is_lazy` guard. Most are inside
+  executors (running on already-materialised data — fine); flag any
+  in `*_fn` surface paths.
+- **Boundary audit** — confirm IPC, journal, serde top-level write
+  paths gain `ray_lazy_materialize` calls in v1.
+
+## Out of scope (deferred)
+
+- Lifting more `*_fn`s into the DAG (the audit names them; the work
+  is mechanical follow-up).
+- New executor opcodes for richer rewrites (e.g.
+  `(count (where pred …)) → OP_COUNT_WHERE`,
+  `(sum (* c v)) → c * sum(v)`).
+- Pattern DSL.
+- Surface-language sugar for `count_distinct`.
+- Grouped-form rewrites inside `OP_GROUP`'s `agg_ins[]`.
 
 ## Open questions
 
-None at design time. All four design forks (matcher style, scope, catalog
-size, null-handling) were closed during brainstorming.
+None at design time. Layered framing closes the original spec's
+implicit assumption gap.
