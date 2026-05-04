@@ -3281,13 +3281,13 @@ static test_result_t test_exec_reduce_i64_nulls(void) {
     ray_release(result);
     ray_graph_free(g);
 
-    /* COUNT — only non-null elements */
+    /* COUNT — total length including nulls (Rayforce semantics: count = len) */
     g = ray_graph_new(tbl);
     x = ray_scan(g, "x");
     op = ray_count(g, x);
     result = ray_execute(g, op);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    TEST_ASSERT_EQ_I(result->i64, 3);
+    TEST_ASSERT_EQ_I(result->i64, 5);
     ray_release(result);
     ray_graph_free(g);
 
@@ -3340,13 +3340,13 @@ static test_result_t test_exec_reduce_f64_nulls(void) {
     ray_release(result);
     ray_graph_free(g);
 
-    /* COUNT */
+    /* COUNT — total length including nulls (Rayforce semantics: count = len) */
     g = ray_graph_new(tbl);
     x = ray_scan(g, "x");
     op = ray_count(g, x);
     result = ray_execute(g, op);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    TEST_ASSERT_EQ_I(result->i64, 2);
+    TEST_ASSERT_EQ_I(result->i64, 3);
     ray_release(result);
     ray_graph_free(g);
 
