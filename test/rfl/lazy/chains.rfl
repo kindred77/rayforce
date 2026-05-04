@@ -50,3 +50,10 @@
 
 ;; desc reverses sort order; first(desc) = max element.
 (first (desc [3 1 4 1 5 9 2 6])) -- 9
+
+;; reverse returns lazy — chain extends through count.
+(count (reverse V)) -- 5
+
+;; reverse swaps endpoints; first(reverse) = original last element.
+(first (reverse [1 2 3 4 5])) -- 5
+(last  (reverse [1 2 3 4 5])) -- 1
