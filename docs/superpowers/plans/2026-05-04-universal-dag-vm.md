@@ -615,15 +615,71 @@ void ray_idiom_pass(ray_graph_t* g, ray_op_t* root) {
     if (!g || !root || g->node_count == 0) return;
     build_index();
 
-    /* Post-order walk over the live graph. Reuses the same iterative
-       stack pattern as count_refs in fuse.c — see fuse.c:59-172 for
-       the canonical shape (visited-bit guards re-entry; ext children
-       enumerated for ext-bearing opcodes — but we skip ext roots above
-       so that's only for traversing past them, not into them). */
+    /* Iterative post-order walk: children rewritten before parents so
+       a parent match sees the latest shape of its children. Two-stack
+       pattern — push roots onto stack1, drain into stack2 (reverse),
+       pop stack2 to get post-order. */
+    uint32_t nc = g->node_count;
+    if (nc > UINT32_MAX / 4) return;  /* overflow guard, mirrors fuse.c */
 
-    /* … traversal body — copy the structure from fuse.c's count_refs,
-       but instead of incrementing ref counts, call try_rewrite(g, n)
-       in post-order (children before parents). … */
+    uint32_t cap = nc * 2;
+    uint32_t stk1_local[256], stk2_local[256];
+    uint32_t* stk1 = cap <= 256 ? stk1_local : (uint32_t*)ray_sys_alloc(cap * sizeof(uint32_t));
+    uint32_t* stk2 = cap <= 256 ? stk2_local : (uint32_t*)ray_sys_alloc(cap * sizeof(uint32_t));
+    if (!stk1 || !stk2) {
+        if (stk1 && stk1 != stk1_local) ray_sys_free(stk1);
+        if (stk2 && stk2 != stk2_local) ray_sys_free(stk2);
+        return;
+    }
+
+    /* Visited-bit guard against re-entry on shared subgraphs.
+       Allocated on the heap because ext_ids can also push onto the
+       walk; mirror fuse.c:59-172's defensive sizing. */
+    uint8_t visited_local[256];
+    uint8_t* visited = nc <= 256 ? visited_local : (uint8_t*)ray_sys_alloc(nc);
+    if (!visited) {
+        if (stk1 != stk1_local) ray_sys_free(stk1);
+        if (stk2 != stk2_local) ray_sys_free(stk2);
+        return;
+    }
+    memset(visited, 0, nc);
+
+    int sp1 = 0, sp2 = 0;
+    stk1[sp1++] = root->id;
+    while (sp1 > 0) {
+        uint32_t nid = stk1[--sp1];
+        if (nid >= nc || visited[nid]) continue;
+        visited[nid] = 1;
+        stk2[sp2++] = nid;
+
+        ray_op_t* n = &g->nodes[nid];
+        if (n->flags & OP_FLAG_DEAD) continue;
+        for (int i = 0; i < n->arity && i < 2; i++) {
+            if (n->inputs[i] && sp1 < (int)cap)
+                stk1[sp1++] = n->inputs[i]->id;
+        }
+        /* Ext children for ext-bearing opcodes follow the exact same
+           enumeration as fuse.c's count_refs (lines 111-167). For v1
+           we skip ext roots in try_rewrite anyway (is_ext_root), so
+           here we only traverse PAST them — children of an OP_GROUP's
+           ext fields might themselves be rewriteable if exposed by a
+           future row that does inspect ext data. For now this loop is
+           a forward-looking placeholder; if you only handle main-DAG
+           rewrites (the v1 catalog), you may omit it. */
+    }
+
+    /* Post-order: pop stk2 from top, call try_rewrite. Children were
+       pushed onto stk2 first (because they were popped from stk1
+       last in the parent's input loop), so popping stk2 yields
+       parents-after-children, which is what we want. */
+    while (sp2 > 0) {
+        uint32_t nid = stk2[--sp2];
+        try_rewrite(g, &g->nodes[nid]);
+    }
+
+    if (visited != visited_local) ray_sys_free(visited);
+    if (stk1 != stk1_local) ray_sys_free(stk1);
+    if (stk2 != stk2_local) ray_sys_free(stk2);
 }
 ```
 
