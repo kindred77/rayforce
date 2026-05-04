@@ -37,3 +37,10 @@
 
 ;; The chain still works when reused.
 (count (distinct [4 4 4 4])) -- 1
+
+;; asc returns lazy — chain extends through count.
+(set V [1 2 3 4 5])
+(count (asc V)) -- 5
+
+;; asc preserves order semantics through the chain.
+(first (asc [3 1 4 1 5 9 2 6])) -- 1
