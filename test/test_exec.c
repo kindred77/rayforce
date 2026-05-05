@@ -3459,6 +3459,33 @@ static test_result_t test_lazy_chain(void) {
     PASS();
 }
 
+static test_result_t test_exec_count_atom_input(void) {
+    ray_heap_init();
+
+    int64_t raw[] = {1, 2, 3};
+    ray_t* vec = ray_vec_from_raw(RAY_I64, raw, 3);
+    ray_graph_t* g_sum = ray_graph_new(NULL);
+    ray_op_t* count_sum = ray_count(g_sum,
+        ray_sum(g_sum, ray_graph_input_vec(g_sum, vec)));
+    ray_t* r_sum = ray_execute(g_sum, count_sum);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r_sum));
+    TEST_ASSERT_EQ_I(r_sum->i64, 1);
+    ray_release(r_sum);
+    ray_graph_free(g_sum);
+    ray_release(vec);
+
+    ray_graph_t* g_str = ray_graph_new(NULL);
+    ray_op_t* count_str = ray_count(g_str, ray_const_str(g_str, "hello", 5));
+    ray_t* r_str = ray_execute(g_str, count_str);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r_str));
+    TEST_ASSERT_EQ_I(r_str->i64, 5);
+    ray_release(r_str);
+    ray_graph_free(g_str);
+
+    ray_heap_destroy();
+    PASS();
+}
+
 static test_result_t test_lazy_min_max_produce_typed_atoms(void) {
     ray_heap_init();
 
@@ -9473,6 +9500,7 @@ const test_entry_t exec_entries[] = {
     { "exec/str_eq_slice_scalar", test_exec_str_eq_slice_scalar, NULL, NULL },
     { "exec/lazy_wrap_materialize", test_lazy_wrap_materialize, NULL, NULL },
     { "exec/lazy_chain", test_lazy_chain, NULL, NULL },
+    { "exec/count_atom_input", test_exec_count_atom_input, NULL, NULL },
     { "exec/lazy_min_max_produce_typed_atoms", test_lazy_min_max_produce_typed_atoms, NULL, NULL },
     { "exec/lazy_materialize_passthrough", test_lazy_materialize_passthrough, NULL, NULL },
     { "exec/lazy_release_no_materialize", test_lazy_release_no_materialize, NULL, NULL },
