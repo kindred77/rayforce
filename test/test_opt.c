@@ -1892,6 +1892,67 @@ static test_result_t test_filter_const_f64_zero_pred(void) {
     PASS();
 }
 
+static test_result_t test_idiom_first_last_asc_scan_no_nulls(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t data[] = { 4, 1, 7, 3 };
+    ray_t* vec = ray_vec_from_raw(RAY_I64, data, 4);
+    ray_t* tbl = ray_table_new(1);
+    int64_t name_v = ray_sym_intern("v", 1);
+    tbl = ray_table_add_col(tbl, name_v, vec);
+    ray_release(vec);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_first = ray_scan(g, "v");
+    ray_op_t* first = ray_first(g, ray_asc_op(g, scan_first));
+    ray_op_t* scan_last = ray_scan(g, "v");
+    ray_op_t* last = ray_last(g, ray_asc_op(g, scan_last));
+    ray_op_t* root = ray_add(g, first, last);
+
+    ray_op_t* opt = ray_optimize(g, root);
+    TEST_ASSERT_NOT_NULL(opt);
+    TEST_ASSERT_EQ_I(opt->opcode, OP_ADD);
+    TEST_ASSERT_EQ_I(opt->inputs[0]->opcode, OP_MIN);
+    TEST_ASSERT_EQ_I(opt->inputs[1]->opcode, OP_MAX);
+
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+static test_result_t test_idiom_first_asc_scan_with_nulls_stays_safe(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t data[] = { 4, 1, 7, 3 };
+    ray_t* vec = ray_vec_from_raw(RAY_I64, data, 4);
+    ray_vec_set_null(vec, 1, true);
+
+    ray_t* tbl = ray_table_new(1);
+    int64_t name_v = ray_sym_intern("v", 1);
+    tbl = ray_table_add_col(tbl, name_v, vec);
+    ray_release(vec);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* first = ray_first(g, ray_asc_op(g, ray_scan(g, "v")));
+    ray_op_t* root = ray_add(g, first, ray_const_i64(g, 0));
+
+    ray_op_t* opt = ray_optimize(g, root);
+    TEST_ASSERT_NOT_NULL(opt);
+    TEST_ASSERT_EQ_I(opt->opcode, OP_ADD);
+    TEST_ASSERT_EQ_I(opt->inputs[0]->opcode, OP_FIRST);
+    TEST_ASSERT_EQ_I(opt->inputs[0]->inputs[0]->opcode, OP_ASC);
+
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t opt_entries[] = {
     { "opt/filter_reorder_type", test_filter_reorder_by_type, NULL, NULL },
     { "opt/filter_and_split", test_filter_and_split, NULL, NULL },
@@ -1936,7 +1997,8 @@ const test_entry_t opt_entries[] = {
     { "opt/factorize_expand_group_src", test_factorize_expand_group_src, NULL, NULL },
     { "opt/filter_const_false_pred", test_filter_const_false_pred, NULL, NULL },
     { "opt/filter_const_f64_zero_pred", test_filter_const_f64_zero_pred, NULL, NULL },
+    { "opt/idiom_first_last_asc_scan_no_nulls", test_idiom_first_last_asc_scan_no_nulls, NULL, NULL },
+    { "opt/idiom_first_asc_scan_with_nulls_stays_safe", test_idiom_first_asc_scan_with_nulls_stays_safe, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
-
 
