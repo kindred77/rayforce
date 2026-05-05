@@ -59,10 +59,11 @@
 (count (select {s: (sum v) from: T by: g where: (< v 500)})) -- 50
 
 ;; ────────────── group-by no `by` clause: aggregate over whole table ──────────────
-;; pure aggregations without grouping
+;; pure aggregations without grouping → ONE row, not nrows broadcast.
 (set Whole (select {tot: (sum v) ct: (count v) avg_v: (avg v) from: T}))
-(count Whole) -- 1000
+(count Whole) -- 1
 (at (at Whole 'tot) 0) -- 499500
+(at (at Whole 'ct) 0) -- 1000
 
 ;; ────────────── group-by SYM key ──────────────
 (set Tsym (table [k v] (list (take ['A 'B 'C 'D 'E] N) (til N))))
