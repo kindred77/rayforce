@@ -26,6 +26,7 @@
 #include <rayforce.h>
 #include "mem/heap.h"
 #include "ops/ops.h"
+#include "lang/eval.h"
 #include "table/sym.h"
 #include "core/profile.h"
 #include <string.h>
@@ -3454,6 +3455,37 @@ static test_result_t test_lazy_chain(void) {
     ray_release(r2);
     ray_release(vec1);
     ray_release(vec2);
+    ray_heap_destroy();
+    PASS();
+}
+
+static test_result_t test_lazy_min_max_produce_typed_atoms(void) {
+    ray_heap_init();
+
+    int16_t i16_raw[] = {5, 1, 3};
+    ray_t* i16_vec = ray_vec_from_raw(RAY_I16, i16_raw, 3);
+    ray_t* min_i16 = ray_min_fn(i16_vec);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(min_i16));
+    TEST_ASSERT_TRUE(ray_is_lazy(min_i16));
+    min_i16 = ray_lazy_materialize(min_i16);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(min_i16));
+    TEST_ASSERT_EQ_I(min_i16->type, -RAY_I16);
+    TEST_ASSERT_EQ_I(min_i16->i64, 1);
+    ray_release(min_i16);
+    ray_release(i16_vec);
+
+    int32_t date_raw[] = {30, 10, 20};
+    ray_t* date_vec = ray_vec_from_raw(RAY_DATE, date_raw, 3);
+    ray_t* max_date = ray_max_fn(date_vec);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(max_date));
+    TEST_ASSERT_TRUE(ray_is_lazy(max_date));
+    max_date = ray_lazy_materialize(max_date);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(max_date));
+    TEST_ASSERT_EQ_I(max_date->type, -RAY_DATE);
+    TEST_ASSERT_EQ_I(max_date->i64, 30);
+    ray_release(max_date);
+    ray_release(date_vec);
+
     ray_heap_destroy();
     PASS();
 }
@@ -9441,6 +9473,7 @@ const test_entry_t exec_entries[] = {
     { "exec/str_eq_slice_scalar", test_exec_str_eq_slice_scalar, NULL, NULL },
     { "exec/lazy_wrap_materialize", test_lazy_wrap_materialize, NULL, NULL },
     { "exec/lazy_chain", test_lazy_chain, NULL, NULL },
+    { "exec/lazy_min_max_produce_typed_atoms", test_lazy_min_max_produce_typed_atoms, NULL, NULL },
     { "exec/lazy_materialize_passthrough", test_lazy_materialize_passthrough, NULL, NULL },
     { "exec/lazy_release_no_materialize", test_lazy_release_no_materialize, NULL, NULL },
     /* expr.c coverage extension */
@@ -9547,5 +9580,3 @@ const test_entry_t exec_entries[] = {
     { "exec/streaming_mapcommon_list_kv_type",   test_exec_streaming_mapcommon_list_kv_type,   NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
-
-
