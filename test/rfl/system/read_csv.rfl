@@ -15,5 +15,6 @@
 (.sys.exec "awk 'BEGIN{print \"id,sym\"; for(i=0;i<20000;i++) printf(\"%d,s%d\\n\",i,i)}' > rf_test_syms.csv") -- 0
 
 (count (.csv.read [I64 SYMBOL] "rf_test_syms.csv")) -- 20000
+(count (read-csv [I64 SYMBOL] "rf_test_syms.csv")) -- 20000
 
 (.sys.exec "rm -f rf_test_syms.csv") -- 0

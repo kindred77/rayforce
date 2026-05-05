@@ -26,6 +26,7 @@
 #include <rayforce.h>
 #include "mem/heap.h"
 #include "io/csv.h"
+#include "table/sym.h"
 #include <stdio.h>
 #include <unistd.h>
 
@@ -1101,6 +1102,8 @@ static test_result_t test_csv_sym_narrowing(void) {
     ray_t* col = ray_table_get_col_idx(loaded, 0);
     TEST_ASSERT_EQ_I(col->type, RAY_SYM);
     /* Width is encoded in the lower 2 bits of attrs (RAY_SYM_W8 == 0). */
+    TEST_ASSERT_EQ_I((int)(col->attrs & RAY_SYM_W_MASK), RAY_SYM_W8);
+    TEST_ASSERT_FALSE(col->attrs & RAY_ATTR_HAS_NULLS);
     /* Just sanity: rows exist and aren't null. */
     TEST_ASSERT_EQ_I(ray_table_nrows(loaded), 200);
     TEST_ASSERT_FALSE(ray_vec_is_null(col, 0));
@@ -1151,5 +1154,3 @@ const test_entry_t csv_entries[] = {
     { "csv/sym_narrowing", test_csv_sym_narrowing, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
-
-

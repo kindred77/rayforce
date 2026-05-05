@@ -68,6 +68,9 @@
 (nil? .ipc.send) -- false
 (nil? .csv.read) -- false
 (nil? .csv.write) -- false
+;; Python compatibility aliases resolve to the same CSV builtins.
+(nil? read-csv) -- false
+(nil? write-csv) -- false
 ;; Old names must NOT resolve — we committed to no backward compat.
 gc !- name
 getenv !- name
@@ -75,7 +78,6 @@ system !- name
 sysinfo !- name
 memstat !- name
 internals !- name
-read-csv !- name
 ;; Negative: writes to `.*` are refused with `reserve`.
 (set .os.foo 1) !- reserve
 (set .sys.gc 0) !- reserve

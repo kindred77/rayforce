@@ -199,6 +199,7 @@
 ;; "corrupt" path with SYM that's tracked separately.  Use only
 ;; numeric columns here.
 (set Tplain (table [id price qty] (list (at T 'id) (at T 'price) (at T 'qty))))
+(.sys.exec "rm -rf /tmp/cross_type_workout_splayed")
 (.db.splayed.set "/tmp/cross_type_workout_splayed/" Tplain)
 (set Sp (.db.splayed.get "/tmp/cross_type_workout_splayed/"))
 (count Sp)                       -- 200
