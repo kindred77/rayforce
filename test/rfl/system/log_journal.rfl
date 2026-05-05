@@ -189,13 +189,15 @@
 (nil? (.log.write 1))            -- true
 (nil? (.log.write 42))           -- true
 (nil? (.log.write [1 2 3 4 5]))  -- true
+;; Lazy scalar values materialise before journal serialization.
+(nil? (.log.write (sum [1 2 3]))) -- true
 ;; .log.sync on an async journal flushes + fsyncs — returns null.
 (nil? (.log.sync)) -- true
-;; The on-disk log file must be non-empty after three writes.
+;; The on-disk log file must be non-empty after four writes.
 (.sys.exec "test -s /tmp/rfl_log_inproc.log") -- 0
-;; .log.validate parses without evaluating; chunks ≥ 3, valid_bytes > 0.
+;; .log.validate parses without evaluating; chunks ≥ 4, valid_bytes > 0.
 (set vA (.log.validate "/tmp/rfl_log_inproc.log"))
-(>= (first vA) 3) -- true
+(>= (first vA) 4) -- true
 (>  (last  vA) 0) -- true
 ;; .log.close releases the journal; subsequent state-modifying verbs
 ;; revert to no-journal-open behaviour.
@@ -205,11 +207,11 @@
 (.log.write 99) !- noopen
 
 ;; ── stage F: replay the file we just wrote (single-shot) ───────────
-;; Replay returns the chunk count.  The three .log.write entries
+;; Replay returns the chunk count.  The four .log.write entries
 ;; above each serialised an integer / string / vector literal whose
 ;; eval is itself — no side effects, so replay is safe.
 (set repA (.log.replay "/tmp/rfl_log_inproc.log"))
-(>= repA 3) -- true
+(>= repA 4) -- true
 
 ;; ── stage G: sync mode + roll ──────────────────────────────────────
 ;; Re-open under `sync mode (RAY_JOURNAL_SYNC).  We wipe the existing

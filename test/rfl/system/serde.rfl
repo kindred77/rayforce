@@ -15,6 +15,8 @@
 (de (ser 'hello)) -- 'hello
 (de (ser "world")) -- "world"
 (de (ser true)) -- true
+;; Lazy scalar values materialise at the serialization boundary.
+(de (ser (sum [1 2 3]))) -- 6
 
 ;; ────────────── homogeneous vectors round-trip ──────────────
 (de (ser [1 2 3]))     -- [1 2 3]
