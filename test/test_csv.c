@@ -277,6 +277,12 @@ static test_result_t test_csv_null_bool(void) {
 }
 
 static test_result_t test_csv_null_sym(void) {
+    /* CSV format conflates "empty field" and "missing field" — both
+     * appear as a zero-length cell.  The Rayforce loader interns empty
+     * SYM cells as the empty SYM (not the null sentinel) so SQL-style
+     * `(!= col "")` filters work the way users expect.  See R6 in
+     * ClickBench/rayforce/REMAINING_FIXES.md.  RAY_STR columns and
+     * non-string types preserve the null distinction. */
     ray_heap_init();
     (void)ray_sym_init();
 
@@ -289,8 +295,16 @@ static test_result_t test_csv_null_sym(void) {
 
     ray_t* col = ray_table_get_col_idx(loaded, 0);
     TEST_ASSERT_FALSE(ray_vec_is_null(col, 0));
-    TEST_ASSERT_TRUE(ray_vec_is_null(col, 1));  /* empty → NULL */
+    TEST_ASSERT_FALSE(ray_vec_is_null(col, 1));  /* empty → empty SYM, not null */
     TEST_ASSERT_FALSE(ray_vec_is_null(col, 2));
+
+    /* Row 1's SYM ID resolves to a zero-length string — the empty SYM.
+     * The CSV loader narrows SYM columns to W8/W16/W32 based on max ID,
+     * so use ray_read_sym instead of a fixed-width cast. */
+    int64_t id1 = ray_read_sym(ray_data(col), 1, col->type, col->attrs);
+    ray_t* s = ray_sym_str(id1);
+    TEST_ASSERT_FALSE(s == NULL);
+    TEST_ASSERT_EQ_I((int64_t)ray_str_len(s), 0);
 
     ray_release(loaded);
     unlink(TMP_CSV);
@@ -348,9 +362,10 @@ static test_result_t test_csv_null_mixed_columns(void) {
     TEST_ASSERT_FALSE(ray_vec_is_null(val_col, 1));
     TEST_ASSERT_TRUE(ray_vec_is_null(val_col, 2));
 
-    /* name column: alice, NULL, bob */
+    /* name column: alice, "", bob — empty SYM cell becomes the empty
+     * SYM (not null).  See test_csv_null_sym for the rationale. */
     TEST_ASSERT_FALSE(ray_vec_is_null(name_col, 0));
-    TEST_ASSERT_TRUE(ray_vec_is_null(name_col, 1));
+    TEST_ASSERT_FALSE(ray_vec_is_null(name_col, 1));
     TEST_ASSERT_FALSE(ray_vec_is_null(name_col, 2));
 
     ray_release(loaded);

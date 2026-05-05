@@ -18,3 +18,16 @@
 (count (read-csv [I64 SYMBOL] "rf_test_syms.csv")) -- 20000
 
 (.sys.exec "rm -f rf_test_syms.csv") -- 0
+
+;; ── R6 regression: empty TSV/CSV fields → empty SYM (not null sentinel) ──
+;; CSV format conflates "missing" and "empty"; the loader treats empty
+;; SYM cells as the interned empty string so SQL-style `(!= col "")`
+;; filters work the way DuckDB / polars / Spark already handle it.
+(.sys.exec "rm -f rf_test_empty.csv") -- 0
+(.sys.exec "printf 'name\\nalice\\n\\nbob\\n\\ncarol\\n' > rf_test_empty.csv") -- 0
+(set _t (.csv.read [SYMBOL] "rf_test_empty.csv"))
+(count _t)                                                            -- 5
+;; Three rows have a value, two are empty — neither side counts as null.
+(count (select {x: name from: _t where: (!= name "")}))               -- 3
+(count (select {x: name from: _t where: (== name "")}))               -- 2
+(.sys.exec "rm -f rf_test_empty.csv") -- 0
