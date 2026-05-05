@@ -149,6 +149,26 @@
 (set TStr (table [Name v] (list (list "alpha" "beta" "alpha" "gamma" "beta") [10 20 30 40 50])))
 (count (select {from: TStr by: Name})) -- 3
 
+;; COUNT(DISTINCT col) per group is a real aggregate, but `distinct`
+;; must run on each group's slice rather than on the full column before
+;; OP_GROUP.  Numeric keys take the DAG group-boundary + per-group eval path.
+(set TCD (table [g u] (list [1 1 2 2 2] [10 10 20 21 20])))
+(sum (at (select {u: (count (distinct u)) from: TCD by: g}) 'u)) -- 3
+
+;; STR keys force the eval-level group fallback; the same count-distinct
+;; expression must still be evaluated per group, not broadcast from the
+;; whole table.
+(set TCDS (table [k u] (list (as 'STR ["a" "a" "b" "b" ""]) [1 2 2 2 3])))
+(sum (at (select {u: (count (distinct u)) from: TCDS by: k}) 'u)) -- 4
+
+;; Multi-key group-by with a materialised computed key plus a STR key:
+;; by-dict pre-eval rewrites `{m: (...) s: S}` to a SYM-vector key list.
+;; The DAG group path can't handle STR keys, so this takes the eval-level
+;; composite-key fallback.
+(set TG2S (table [ts s u] (list (as 'TIMESTAMP [0 60000000000 60000000000 120000000000]) (as 'STR ["a" "a" "b" "b"]) [10 11 12 13])))
+(count (select {c: (count u) from: TG2S by: {m: (minute ts) s: s}})) -- 4
+(sum (at (select {c: (count u) from: TG2S by: {m: (minute ts) s: s}}) 'c)) -- 4
+
 ;; ====================================================================
 ;; GUID first-of-group fast path — query.c:1945-2099.  Pure
 ;; `(select {from: t by: G})` with no agg/non-agg expressions takes
