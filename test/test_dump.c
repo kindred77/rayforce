@@ -106,7 +106,7 @@ static test_result_t test_dump_opcode_name_all(void) {
         { OP_CEIL, "CEIL" }, { OP_FLOOR,"FLOOR"}, { OP_ISNULL,"ISNULL"},
         { OP_CAST, "CAST" },
         { OP_ADD,  "ADD"  }, { OP_SUB,  "SUB"  }, { OP_MUL,  "MUL"  },
-        { OP_DIV,  "DIV"  }, { OP_MOD,  "MOD"  },
+        { OP_DIV,  "DIV"  }, { OP_IDIV, "IDIV" }, { OP_MOD,  "MOD"  },
         { OP_EQ,   "EQ"   }, { OP_NE,   "NE"   }, { OP_LT,   "LT"   },
         { OP_LE,   "LE"   }, { OP_GT,   "GT"   }, { OP_GE,   "GE"   },
         { OP_AND,  "AND"  }, { OP_OR,   "OR"   },

@@ -185,9 +185,9 @@ static test_result_t test_compile_try_inside_fn_err(void) {
 }
 
 static test_result_t test_compile_try_div_zero(void) {
-    /* Division by zero caught inside compiled lambda. */
+    /* Errors are caught inside compiled lambdas. */
     EVAL_I64(
-        "(do (set f (fn [x] (try (/ 10 x) (fn [e] 0)))) (f 0))",
+        "(do (set f (fn [x] (try (raise \"oops\") (fn [e] 0)))) (f 0))",
         0);
     PASS();
 }

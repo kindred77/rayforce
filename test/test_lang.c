@@ -326,7 +326,8 @@ static test_result_t test_eval_sub(void) {
 static test_result_t test_eval_div(void) {
     ray_t* result = ray_eval_str("(/ 10 3)");
     TEST_ASSERT_NOT_NULL(result);
-    TEST_ASSERT_EQ_I(result->i64, 3);
+    TEST_ASSERT_EQ_I(result->type, -RAY_F64);
+    TEST_ASSERT_TRUE(result->f64 > 3.333 && result->f64 < 3.334);
     ray_release(result);
     PASS();
 }
@@ -465,9 +466,9 @@ static test_result_t test_vm_loop(void) {
     PASS();
 }
 
-/* ---- Test: try catches division by zero ---- */
+/* ---- Test: try catches raised errors ---- */
 static test_result_t test_eval_try(void) {
-    ray_t* result = ray_eval_str("(try (/ 10 0) (fn [e] 0))");
+    ray_t* result = ray_eval_str("(try (raise \"oops\") (fn [e] 0))");
     TEST_ASSERT_NOT_NULL(result);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
     TEST_ASSERT_EQ_I(result->type, -RAY_I64);
@@ -4773,7 +4774,7 @@ static test_result_t test_eval_vm_try_nested(void) {
         "  (set safe_div (fn [a b] (try (/ a b) (fn [e] 0)))) "
         "  (safe_div 10 2)"
         ")",
-        "5"
+        "5.0"
     );
     PASS();
 }
@@ -6063,17 +6064,17 @@ static test_result_t test_builtin_within_fn(void) {
     PASS();
 }
 
-/* ── builtins.c coverage: ray_fdiv_fn ───────────────────────────────────────
- * ray_fdiv_fn always returns F64, handles zero-div and nulls. */
-static test_result_t test_builtin_fdiv_fn(void) {
-    /* Normal division: 7.0 / 2.0 = 3.5 */
+/* ── builtins.c coverage: ray_idiv_fn ───────────────────────────────────────
+ * ray_idiv_fn always returns I64, handles zero-div and nulls. */
+static test_result_t test_builtin_idiv_fn(void) {
+    /* Normal division: floor(7.0 / 2.0) = 3 */
     ray_t* a = ray_f64(7.0);
     ray_t* b = ray_f64(2.0);
-    ray_t* r = ray_fdiv_fn(a, b);
+    ray_t* r = ray_idiv_fn(a, b);
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
-    TEST_ASSERT_EQ_I(r->type, -RAY_F64);
-    TEST_ASSERT_TRUE(r->f64 == 3.5);
+    TEST_ASSERT_EQ_I(r->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(r->i64, 3);
     ray_release(r);
     ray_release(a);
     ray_release(b);
@@ -6081,9 +6082,10 @@ static test_result_t test_builtin_fdiv_fn(void) {
     /* Division by zero → typed null */
     ray_t* c = ray_f64(5.0);
     ray_t* z = ray_f64(0.0);
-    ray_t* r2 = ray_fdiv_fn(c, z);
+    ray_t* r2 = ray_idiv_fn(c, z);
     TEST_ASSERT_NOT_NULL(r2);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r2));
+    TEST_ASSERT_EQ_I(r2->type, -RAY_I64);
     TEST_ASSERT_TRUE(RAY_ATOM_IS_NULL(r2));
     ray_release(r2);
     ray_release(c);
@@ -6092,9 +6094,10 @@ static test_result_t test_builtin_fdiv_fn(void) {
     /* Null propagation: null / 2.0 → null */
     ray_t* tn = ray_typed_null(-RAY_F64);
     ray_t* d  = ray_f64(2.0);
-    ray_t* r3 = ray_fdiv_fn(tn, d);
+    ray_t* r3 = ray_idiv_fn(tn, d);
     TEST_ASSERT_NOT_NULL(r3);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r3));
+    TEST_ASSERT_EQ_I(r3->type, -RAY_I64);
     TEST_ASSERT_TRUE(RAY_ATOM_IS_NULL(r3));
     ray_release(r3);
     ray_release(tn);
@@ -6104,7 +6107,7 @@ static test_result_t test_builtin_fdiv_fn(void) {
     ray_t* va = ray_vec_new(RAY_I64, 1);
     int64_t tmp = 1;
     va = ray_vec_append(va, &tmp);
-    ray_t* er = ray_fdiv_fn(va, va);
+    ray_t* er = ray_idiv_fn(va, va);
     TEST_ASSERT_TRUE(RAY_IS_ERR(er));
     ray_error_free(er);
     ray_release(va);
@@ -6303,10 +6306,10 @@ static test_result_t test_builtin_within_rfl(void) {
     PASS();
 }
 
-/* ── builtins.c coverage: ray_fdiv_fn via rfl ───────────────────────────────
- * Covers the div builtin (float division). */
-static test_result_t test_builtin_fdiv_rfl(void) {
-    ASSERT_EQ("(div 7.0 2.0)", "3.5");
+/* ── builtins.c coverage: ray_idiv_fn via rfl ───────────────────────────────
+ * Covers the div builtin (integer floor division). */
+static test_result_t test_builtin_idiv_rfl(void) {
+    ASSERT_EQ("(div 7.0 2.0)", "3");
     PASS();
 }
 
@@ -6898,14 +6901,14 @@ const test_entry_t lang_entries[] = {
     { "lang/builtin/format_fn",           test_builtin_format_fn,           lang_setup, lang_teardown },
     { "lang/builtin/raze_fn",             test_builtin_raze_fn,             lang_setup, lang_teardown },
     { "lang/builtin/within_fn",           test_builtin_within_fn,           lang_setup, lang_teardown },
-    { "lang/builtin/fdiv_fn",             test_builtin_fdiv_fn,             lang_setup, lang_teardown },
+    { "lang/builtin/idiv_fn",             test_builtin_idiv_fn,             lang_setup, lang_teardown },
     { "lang/builtin/concat_fn",           test_builtin_concat_fn,           lang_setup, lang_teardown },
     { "lang/builtin/enlist_fn",           test_builtin_enlist_fn,           lang_setup, lang_teardown },
     { "lang/builtin/resolve_fn",          test_builtin_resolve_fn,          lang_setup, lang_teardown },
     { "lang/builtin/nil_rfl",             test_builtin_nil_rfl,             lang_setup, lang_teardown },
     { "lang/builtin/where_rfl",           test_builtin_where_rfl,           lang_setup, lang_teardown },
     { "lang/builtin/within_rfl",          test_builtin_within_rfl,          lang_setup, lang_teardown },
-    { "lang/builtin/fdiv_rfl",            test_builtin_fdiv_rfl,            lang_setup, lang_teardown },
+    { "lang/builtin/idiv_rfl",            test_builtin_idiv_rfl,            lang_setup, lang_teardown },
     { "lang/builtin/group_guid_rfl",      test_builtin_group_guid_rfl,      lang_setup, lang_teardown },
     { "lang/builtin/group_empty_list",    test_builtin_group_empty_and_list, lang_setup, lang_teardown },
     { "lang/temporal/extract_builtins_fn",      test_temporal_extract_builtins_fn,      lang_setup, lang_teardown },

@@ -9,8 +9,10 @@
 (sum (at (select {x: (+ a b) from: Ti}) 'x)) -- 165
 (sum (at (select {x: (- b a) from: Ti}) 'x)) -- 135
 (sum (at (select {x: (* a b) from: Ti}) 'x)) -- 550
-;; DAG promotes int/int division to f64 (unlike eval-path floor div)
+;; DAG promotes `/` int/int division to f64.
 (sum (at (select {x: (/ b a) from: Ti}) 'x)) -- 50.0
+(sum (at (select {x: (div b 3) from: Ti}) 'x)) -- 48
+(type (at (select {x: (div b 3) from: Ti}) 'x)) -- 'I64
 (sum (at (select {x: (% b a) from: Ti}) 'x)) -- 0
 
 ;; with scalar broadcast on RHS
