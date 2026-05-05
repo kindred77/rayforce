@@ -38,6 +38,17 @@
 (at (at (select {m: (min size) from: trades where: (> price 200.0)}) 'm) 0) -- 40
 (at (at (select {a: (avg size) from: trades where: (== sym 'AAPL)}) 'a) 0) -- 115.0
 
+;; ── scalar aggregation (no `by:`) collapses to ONE row, NOT N broadcast
+;; copies of the same value.  Regression test for the projection path
+;; that used to compile `(sum c)` as a column expression and broadcast
+;; the resulting scalar across the input row count.
+(count (select {s: (sum size) from: trades})) -- 1
+(count (select {s: (sum size) from: trades where: (== sym 'AAPL)})) -- 1
+(count (select {s: (sum size) c: (count size) from: trades})) -- 1
+(count (select {a: (avg price) m: (max size) from: trades where: (> price 200)})) -- 1
+(at (at (select {s: (sum size) from: trades}) 's) 0) -- 1240
+(at (at (select {c: (count size) from: trades}) 'c) 0) -- 10
+
 ;; Larger fixture (>= RAY_PARALLEL_THRESHOLD) to exercise the parallel
 ;; reduction worker path of exec_reduction.
 (set big-T (table [v] (list (til 100000))))
