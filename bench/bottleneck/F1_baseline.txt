@@ -1,0 +1,18 @@
+| 9 | group-by + count distinct | 32.283 | 15.617 | 1.65 |
+| 10 | group-by + count distinct | 41.245 | 28.874 | 1.32 |
+| 11 | group-by + count distinct | 31.228 | 5.710 | 2.62 |
+| 13 | group-by single key | 26.320 | 16.164 | 1.39 |
+| 14 | group-by + count distinct | 51.157 | 25.159 | 1.74 |
+| 15 | group-by + count distinct | 26.794 | 15.457 | 1.45 |
+| 22 | LIKE filter | 37.979 | 16.738 | 1.79 |
+| 23 | LIKE filter | 58.852 | 25.398 | 1.95 |
+| 25 | ORDER BY + LIMIT | 25.843 | 3.385 | 2.68 |
+| 26 | ORDER BY + LIMIT | 47.890 | 2.812 | 4.52 |
+| 27 | ORDER BY + LIMIT | 31.662 | 3.068 | 3.19 |
+| 31 | group-by + filter | 29.385 | 13.043 | 1.71 |
+| 32 | group-by + filter | 30.656 | 15.277 | 1.61 |
+| 37 | filtered group with date range | 24.385 | 8.963 | 1.81 |
+| 38 | filtered group + OFFSET | 24.703 | 3.415 | 2.59 |
+| 41 | filtered group + OFFSET | 6.820 | 2.439 | 1.35 |
+| 42 | filtered group + OFFSET | 6.963 | 3.067 | 1.30 |
+| 43 | minute-bucket time series | 16.525 | 3.465 | 1.97 |
