@@ -6,8 +6,8 @@
 (count A) -- (sum (>= (% A M) 0))
 (count A) -- (sum (< (% A M) M))
 
-;; Euclidean identity:  a == (+ (* m (/ a m)) (% a m))
-(count A) -- (sum (== A (+ (* M (/ A M)) (% A M))))
+;; Euclidean identity:  a == (+ (* m (div a m)) (% a m))
+(count A) -- (sum (== A (+ (* M (div A M)) (% A M))))
 
 ;; concrete
 (% 7 3) -- 1

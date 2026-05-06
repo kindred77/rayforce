@@ -3,7 +3,7 @@
 ;; (e.g. someone widening `+` to i64 unconditionally) breaks loudly.
 ;;
 ;; Documented rules:
-;;   1. Same-width binary +/-/*/// preserve type.
+;;   1. Same-width binary +/-/* preserve type; / always returns f64.
 ;;        (+ 5h 3h) → i16,  (+ 5i 3i) → i32,  (+ 5 3) → i64,  (+ 5.0 3.0) → f64
 ;;   2. Cross-width binary: wider wins.
 ;;        (+ i16 i32) → i32,  (+ i16 i64) → i64,  (+ i16 f64) → f64
@@ -12,19 +12,19 @@
 ;;   5. Unary abs preserves type (same as neg/floor/ceil).
 ;;   6. Math fns (round, sqrt, log, exp) always produce f64.
 
-;; ── (1) Same-width preservation: + - * /
+;; ── (1) Same-width preservation: + - *
 (type (+ 5h 3h)) -- 'i16
 (type (- 5h 3h)) -- 'i16
 (type (* 5h 3h)) -- 'i16
-(type (/ 6h 3h)) -- 'i16
+(type (/ 6h 3h)) -- 'f64
 (type (+ 5i 3i)) -- 'i32
 (type (- 5i 3i)) -- 'i32
 (type (* 5i 3i)) -- 'i32
-(type (/ 6i 3i)) -- 'i32
+(type (/ 6i 3i)) -- 'f64
 (type (+ 5 3))   -- 'i64
 (type (- 5 3))   -- 'i64
 (type (* 5 3))   -- 'i64
-(type (/ 6 3))   -- 'i64
+(type (/ 6 3))   -- 'f64
 (type (+ 5.0 3.0)) -- 'f64
 (type (- 5.0 3.0)) -- 'f64
 (type (* 5.0 3.0)) -- 'f64

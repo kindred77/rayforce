@@ -1,38 +1,35 @@
-;; Invariants for `/` (integer division, floor).
+;; Invariants for `/` (true division; always f64 result).
 
 ;; identity: (/ a 1) == a
-(set A (- (rand 256 200000) 100000))
+(set A (as 'F64 (- (rand 256 200000) 100000)))
 (count A) -- (sum (== (/ A 1) A))
 
 ;; (/ (* a b) b) == a  for non-zero b
-(set A (- (rand 256 200) 100))
-(set B (+ (rand 256 10) 1))
+(set A (as 'F64 (- (rand 256 200) 100)))
+(set B (as 'F64 (+ (rand 256 10) 1)))
 (count A) -- (sum (== (/ (* A B) B) A))
 
-;; floor semantic: 7/2 == 3
-(/ 7 2) -- 3
-(/ 10 3) -- 3
+;; true division
+(/ 7 2) -- 3.5
+(/ 10.0 3.0) -- 3.3333333333333335
 
-;; floor with negative — toward -inf, not toward 0
-(/ -10 3)  -- -4
-(/ 10 -3)  -- -4
-(/ -10 -3) -- 3
+;; negative operands keep true division semantics
+(/ -10 4)  -- -2.5
+(/ 10 -4)  -- -2.5
+(/ -10 -4) -- 2.5
 
 ;; divide-by-zero yields typed null
-(/ 5 0)  -- 0Nl
-(/ 10 0) -- 0Nl
+(/ 5 0)  -- 0Nf
+(/ 10 0) -- 0Nf
 
 ;; floats — Rayforce folds IEEE +Inf / NaN outcomes back to typed null
 (nil? (/ 1.0 0.0)) -- true
 (nil? (/ 0.0 0.0)) -- true
-(nil? (div 1.0 0.0)) -- true
-(nil? (div 0.0 0.0)) -- true
 
 ;; const-fold of div-by-zero must agree with the runtime path
 ;; (regression for the optimizer doing the fold at compile time)
 (set X 1.0)
 (nil? (/ X 0.0)) -- true
-(nil? (div X 0.0)) -- true
 (== (nil? (/ 1 0)) (nil? (/ X 0))) -- true
 (== (nil? (/ 1.0 0.0)) (nil? (/ X 0.0))) -- true
 
@@ -40,13 +37,13 @@
 ;; Type sweep — narrow ints / float / cross-width
 ;; ──────────────────────────────────────────────────────────────────
 
-(/ 6h 2h) -- 3
-(type (/ 6h 2h)) -- 'i16
-(/ 6i 2i) -- 3
-(type (/ 6i 2i)) -- 'i32
-(/ 10.0 4.0) -- 2.0
+(/ 6h 2h) -- 3.0
+(type (/ 6h 2h)) -- 'f64
+(/ 6i 2i) -- 3.0
+(type (/ 6i 2i)) -- 'f64
+(/ 10.0 4.0) -- 2.5
 (type (/ 6.0 2.0)) -- 'f64
-(/ [12 15 18] 3) -- [4 5 6]
+(/ [12 15 18] 3) -- [4.0 5.0 6.0]
 
 ;; ──────────────────────────────────────────────────────────────────
 ;; Null propagation

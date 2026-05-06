@@ -27,9 +27,8 @@
 (at L 2) -- 3.0
 
 ;; (count (sum V)) — lazy-aware-to-lazy-aware composition exercises
-;; ray_lazy_append's binary-op support, which is currently restricted
-;; to vector-producing chains. Skip until OP_COUNT supports atom results
-;; in the executor (separate cleanup tracked in the follow-up list).
+;; OP_COUNT over a scalar atom produced by the lazy chain.
+(count (sum V)) -- 1
 
 ;; distinct returns lazy — chain extends through count.
 (set V [1 1 2 2 3 3])
