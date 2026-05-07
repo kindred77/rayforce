@@ -146,3 +146,24 @@
 (at (at (select {v: v p: p from: Ttn where: (>= p 0) asc: v take: 3}) 'v) 0) -- -100
 (at (at (select {v: v p: p from: Ttn where: (>= p 0) asc: v take: 3}) 'v) 1) -- -50
 (at (at (select {v: v p: p from: Ttn where: (>= p 0) asc: v take: 3}) 'v) 2) -- 0
+
+;; ────────────── Top-K nullmap propagation (review #2) ─────────────
+;; Output columns with nulls must round-trip the null bit through
+;; the fused gather.  Previously the planner gate refused fused for
+;; nullable output columns; the materialiser now propagates the
+;; source nullmap via ray_vec_set_null per gathered row, so the
+;; fused path handles them and the top-3 result preserves the null
+;; in the second output row.
+(set Tn2 (table [k v] (list [1 2 3 4 5] [10 0N 30 0N 50])))
+(at (at (select {k: k v: v from: Tn2 where: (>= k 0) asc: k take: 3}) 'v) 0) -- 10
+(nil? (at (at (select {k: k v: v from: Tn2 where: (>= k 0) asc: k take: 3}) 'v) 1)) -- true
+(at (at (select {k: k v: v from: Tn2 where: (>= k 0) asc: k take: 3}) 'v) 2) -- 30
+
+;; ────────────── Top-K alias propagation (review #1) ──────────────
+;; Aliased output columns must surface under the alias name now that
+;; out_alias_syms[] is plumbed through to ray_fused_topk_select.
+;; The round-1 gate forced these queries onto the unfused path; the
+;; fused exec now publishes columns under their alias.
+(set Ta (table [a b] (list [10 20 30 40 50] [1 2 3 4 5])))
+(at (at (select {renamed: a b: b from: Ta where: (>= b 0) asc: a take: 3}) 'renamed) 0) -- 10
+(at (at (select {renamed: a b: b from: Ta where: (>= b 0) asc: a take: 3}) 'renamed) 1) -- 20
