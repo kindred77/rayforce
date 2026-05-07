@@ -48,8 +48,14 @@ static void sym_teardown(void) {
 /* ---- sym_init_destroy -------------------------------------------------- */
 
 static test_result_t test_sym_init_destroy(void) {
-    /* After init, count should be 0 */
-    TEST_ASSERT_EQ_U(ray_sym_count(), 0);
+    /* After init, count is 1 — sym 0 is reserved for the empty
+     * string ("" interned at startup as the canonical "missing"
+     * value for SYM columns). */
+    TEST_ASSERT_EQ_U(ray_sym_count(), 1);
+    /* Sym 0 must resolve to the empty string. */
+    ray_t* s = ray_sym_str(0);
+    TEST_ASSERT_NOT_NULL(s);
+    TEST_ASSERT_EQ_U(ray_str_len(s), 0);
 
     PASS();
 }
@@ -58,8 +64,8 @@ static test_result_t test_sym_init_destroy(void) {
 
 static test_result_t test_sym_intern_basic(void) {
     int64_t id = ray_sym_intern("hello", 5);
-    TEST_ASSERT((id) >= (0), "id >= 0");
-    TEST_ASSERT_EQ_U(ray_sym_count(), 1);
+    TEST_ASSERT((id) >= (1), "id >= 1 (sym 0 is reserved for empty)");
+    TEST_ASSERT_EQ_U(ray_sym_count(), 2);
 
     PASS();
 }
@@ -70,7 +76,7 @@ static test_result_t test_sym_intern_duplicate(void) {
     int64_t id1 = ray_sym_intern("hello", 5);
     int64_t id2 = ray_sym_intern("hello", 5);
     TEST_ASSERT_EQ_I(id1, id2);
-    TEST_ASSERT_EQ_U(ray_sym_count(), 1);
+    TEST_ASSERT_EQ_U(ray_sym_count(), 2);  /* "" + "hello" */
 
     PASS();
 }
@@ -111,20 +117,21 @@ static test_result_t test_sym_str_roundtrip(void) {
 /* ---- sym_count --------------------------------------------------------- */
 
 static test_result_t test_sym_count(void) {
-    TEST_ASSERT_EQ_U(ray_sym_count(), 0);
-
-    ray_sym_intern("a", 1);
+    /* Init reserves sym 0 for the empty string, so count starts at 1. */
     TEST_ASSERT_EQ_U(ray_sym_count(), 1);
 
-    ray_sym_intern("b", 1);
+    ray_sym_intern("a", 1);
     TEST_ASSERT_EQ_U(ray_sym_count(), 2);
 
-    ray_sym_intern("c", 1);
+    ray_sym_intern("b", 1);
     TEST_ASSERT_EQ_U(ray_sym_count(), 3);
+
+    ray_sym_intern("c", 1);
+    TEST_ASSERT_EQ_U(ray_sym_count(), 4);
 
     /* Duplicate should not increase count */
     ray_sym_intern("a", 1);
-    TEST_ASSERT_EQ_U(ray_sym_count(), 3);
+    TEST_ASSERT_EQ_U(ray_sym_count(), 4);
 
     PASS();
 }
@@ -141,7 +148,7 @@ static test_result_t test_sym_many(void) {
         TEST_ASSERT((ids[i]) >= (0), "ids[i] >= 0");
     }
 
-    TEST_ASSERT_EQ_U(ray_sym_count(), 1000);
+    TEST_ASSERT_EQ_U(ray_sym_count(), 1001);  /* "" + 1000 */
 
     /* Verify all are distinct IDs */
     for (int i = 0; i < 1000; i++) {
@@ -166,7 +173,7 @@ static test_result_t test_sym_many(void) {
         TEST_ASSERT_EQ_I(id2, ids[i]);
     }
 
-    TEST_ASSERT_EQ_U(ray_sym_count(), 1000);
+    TEST_ASSERT_EQ_U(ray_sym_count(), 1001);  /* "" + 1000 */
 
     PASS();
 }
@@ -188,7 +195,7 @@ static test_result_t test_sym_bulk(void) {
         TEST_ASSERT((id) >= (0), "id >= 0");
     }
 
-    TEST_ASSERT_EQ_U(ray_sym_count(), BULK_N);
+    TEST_ASSERT_EQ_U(ray_sym_count(), BULK_N + 1);  /* "" + BULK_N */
 
     /* Verify every symbol is retrievable with correct string */
     for (int i = 0; i < BULK_N; i++) {
@@ -209,7 +216,7 @@ static test_result_t test_sym_bulk(void) {
         TEST_ASSERT_EQ_I(id1, id2);
     }
 
-    TEST_ASSERT_EQ_U(ray_sym_count(), BULK_N);
+    TEST_ASSERT_EQ_U(ray_sym_count(), BULK_N + 1);  /* "" + BULK_N */
 
     #undef BULK_N
     PASS();
@@ -227,7 +234,7 @@ static test_result_t test_sym_save_load_roundtrip(void) {
     TEST_ASSERT((id_hello) >= (0), "id_hello >= 0");
     TEST_ASSERT((id_world) >= (0), "id_world >= 0");
     TEST_ASSERT((id_foo) >= (0), "id_foo >= 0");
-    TEST_ASSERT_EQ_U(ray_sym_count(), 3);
+    TEST_ASSERT_EQ_U(ray_sym_count(), 4);  /* "" + hello + world + foo */
 
     /* Save */
     ray_err_t err = ray_sym_save(sym_path);
@@ -236,12 +243,12 @@ static test_result_t test_sym_save_load_roundtrip(void) {
     /* Destroy and re-init sym table */
     ray_sym_destroy();
     (void)ray_sym_init();
-    TEST_ASSERT_EQ_U(ray_sym_count(), 0);
+    TEST_ASSERT_EQ_U(ray_sym_count(), 1);  /* fresh init: just "" */
 
     /* Load */
     err = ray_sym_load(sym_path);
     TEST_ASSERT_EQ_I(err, RAY_OK);
-    TEST_ASSERT_EQ_U(ray_sym_count(), 3);
+    TEST_ASSERT_EQ_U(ray_sym_count(), 4);
 
     /* Verify all strings match */
     ray_t* s0 = ray_sym_str(id_hello);
@@ -302,7 +309,7 @@ static test_result_t test_sym_save_append_only(void) {
     (void)ray_sym_init();
     err = ray_sym_load(sym_path);
     TEST_ASSERT_EQ_I(err, RAY_OK);
-    TEST_ASSERT_EQ_U(ray_sym_count(), 4);
+    TEST_ASSERT_EQ_U(ray_sym_count(), 5);  /* "" + alpha + beta + gamma + delta */
 
     /* Verify old IDs are stable */
     ray_t* sa = ray_sym_str(id_a);
@@ -348,7 +355,7 @@ static test_result_t test_sym_load_corrupt(void) {
     TEST_ASSERT((err) != (RAY_OK), "err != RAY_OK");
 
     /* Count unchanged */
-    TEST_ASSERT_EQ_U(ray_sym_count(), 0);
+    TEST_ASSERT_EQ_U(ray_sym_count(), 1);  /* "" only */
 
     /* Cleanup */
     remove(sym_path);
@@ -383,7 +390,7 @@ static test_result_t test_sym_load_truncated(void) {
     /* Load should fail */
     err = ray_sym_load(sym_path);
     TEST_ASSERT((err) != (RAY_OK), "err != RAY_OK");
-    TEST_ASSERT_EQ_U(ray_sym_count(), 0);
+    TEST_ASSERT_EQ_U(ray_sym_count(), 1);  /* "" only */
 
     /* Cleanup */
     remove(sym_path);
@@ -728,15 +735,17 @@ static test_result_t test_sym_load_legacy_dotted(void) {
     snprintf(lk_path, sizeof(lk_path), "%s.lk", sym_path);
     remove(lk_path);
 
-    /* Build a file-on-disk that only contains ["alice", "user.name",
-     * "charlie"] — no "user" or "name" entries following the dotted name.
-     * Temporarily disable segment caching by interning the dotted name
-     * with a fake name first, then renaming via direct RAY_LIST build. */
-    ray_t* list = ray_list_new(3);
+    /* Build a file-on-disk that contains ["", "alice", "user.name",
+     * "charlie"] — id 0 is the reserved empty sym; the dotted name has
+     * no "user" or "name" entries following it.  Temporarily disable
+     * segment caching by interning via direct RAY_LIST build. */
+    ray_t* list = ray_list_new(4);
     TEST_ASSERT_NOT_NULL(list);
+    ray_t* se = ray_str("", 0);
     ray_t* s0 = ray_str("alice", 5);
     ray_t* s1 = ray_str("user.name", 9);
     ray_t* s2 = ray_str("charlie", 7);
+    list = ray_list_append(list, se); ray_release(se);
     list = ray_list_append(list, s0); ray_release(s0);
     list = ray_list_append(list, s1); ray_release(s1);
     list = ray_list_append(list, s2); ray_release(s2);
@@ -747,19 +756,21 @@ static test_result_t test_sym_load_legacy_dotted(void) {
     ray_release(list);
 
     /* Load must succeed even though the file has a dotted name but no
-     * segment entries.  The load should re-intern the three disk entries
-     * at ids 0,1,2; then separately cache segment info for "user.name",
-     * placing "user" and "name" at whatever transient ids follow. */
+     * segment entries.  The load should re-intern the four disk entries
+     * at ids 0,1,2,3; then separately cache segment info for
+     * "user.name", placing "user" and "name" at whatever transient ids
+     * follow. */
     err = ray_sym_load(sym_path);
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
-    TEST_ASSERT_EQ_I(ray_sym_find("alice",     5), 0);
-    TEST_ASSERT_EQ_I(ray_sym_find("user.name", 9), 1);
-    TEST_ASSERT_EQ_I(ray_sym_find("charlie",   7), 2);
-    TEST_ASSERT_TRUE(ray_sym_is_dotted(1));
+    TEST_ASSERT_EQ_I(ray_sym_find("",          0), 0);
+    TEST_ASSERT_EQ_I(ray_sym_find("alice",     5), 1);
+    TEST_ASSERT_EQ_I(ray_sym_find("user.name", 9), 2);
+    TEST_ASSERT_EQ_I(ray_sym_find("charlie",   7), 3);
+    TEST_ASSERT_TRUE(ray_sym_is_dotted(2));
 
     const int64_t* segs = NULL;
-    int n = ray_sym_segs(1, &segs);
+    int n = ray_sym_segs(2, &segs);
     TEST_ASSERT_EQ_I(n, 2);
     TEST_ASSERT_EQ_I(ray_sym_find("user", 4), segs[0]);
     TEST_ASSERT_EQ_I(ray_sym_find("name", 4), segs[1]);
@@ -798,7 +809,7 @@ static test_result_t test_sym_save_load_dotted(void) {
     /* Tear down and reload from disk */
     ray_sym_destroy();
     (void)ray_sym_init();
-    TEST_ASSERT_EQ_U(ray_sym_count(), 0);
+    TEST_ASSERT_EQ_U(ray_sym_count(), 1);  /* "" only */
 
     err = ray_sym_load(sym_path);
     TEST_ASSERT_EQ_I(err, RAY_OK);
@@ -842,7 +853,7 @@ static test_result_t test_sym_save_load_dotted(void) {
 static test_result_t test_sym_load_missing(void) {
     ray_err_t err = ray_sym_load("/tmp/nonexistent_sym_file_xyz.sym");
     TEST_ASSERT((err) != (RAY_OK), "err != RAY_OK");
-    TEST_ASSERT_EQ_U(ray_sym_count(), 0);
+    TEST_ASSERT_EQ_U(ray_sym_count(), 1);  /* "" only */
 
     PASS();
 }
@@ -1120,7 +1131,7 @@ static test_result_t test_sym_load_non_list(void) {
     /* Loading must fail because type != RAY_LIST. */
     err = ray_sym_load(sym_path);
     TEST_ASSERT((err) != (RAY_OK), "load non-list should fail");
-    TEST_ASSERT_EQ_U(ray_sym_count(), 0);
+    TEST_ASSERT_EQ_U(ray_sym_count(), 1);  /* "" only */
 
     remove(sym_path);
     char lk_path[4096];
@@ -1226,9 +1237,13 @@ static test_result_t test_sym_load_id_mismatch(void) {
     snprintf(lk_path, sizeof(lk_path), "%s.lk", sym_path);
     remove(lk_path);
 
-    /* Write a file that contains just one entry: "zebra". */
-    ray_t* file_list = ray_list_new(1);
+    /* Write a file that has "" at id=0 (matches the runtime-reserved
+     * empty sym) and "zebra" at id=1 — the file expects "zebra" to
+     * land at id 1 in memory. */
+    ray_t* file_list = ray_list_new(2);
     TEST_ASSERT_NOT_NULL(file_list);
+    ray_t* s_empty = ray_str("", 0);
+    file_list = ray_list_append(file_list, s_empty); ray_release(s_empty);
     ray_t* s0 = ray_str("zebra", 5);
     file_list = ray_list_append(file_list, s0); ray_release(s0);
     TEST_ASSERT_NOT_NULL(file_list);
@@ -1236,11 +1251,11 @@ static test_result_t test_sym_load_id_mismatch(void) {
     ray_release(file_list);
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
-    /* Intern a different symbol first — it occupies id=0. */
+    /* Intern a different symbol — it occupies id=1 (id=0 is reserved). */
     int64_t transient_id = ray_sym_intern("apple", 5);
-    TEST_ASSERT_EQ_I(transient_id, 0);
+    TEST_ASSERT_EQ_I(transient_id, 1);
 
-    /* Now load the file: "zebra" would need id=0 but "apple" is already there. */
+    /* Now load the file: "zebra" would need id=1 but "apple" is already there. */
     err = ray_sym_load(sym_path);
     TEST_ASSERT((err) != (RAY_OK), "id mismatch should be rejected");
 
@@ -1310,18 +1325,20 @@ static test_result_t test_sym_intern_prehashed_basic(void) {
 
 /* ray_sym_str with out-of-range id should return NULL. */
 static test_result_t test_sym_str_invalid_id(void) {
-    /* No syms interned yet. */
+    /* After init, id 0 is reserved for "" — it's always valid. */
     ray_t* s = ray_sym_str(-1);
     TEST_ASSERT_NULL(s);
 
     ray_t* s2 = ray_sym_str(9999);
     TEST_ASSERT_NULL(s2);
 
-    /* After one intern, id=0 is valid but id=1 is not. */
+    /* After one user intern, ids 0 ("") and 1 are valid but id 2 is not. */
     ray_sym_intern("x", 1);
     ray_t* s3 = ray_sym_str(0);
-    TEST_ASSERT_NOT_NULL(s3);
-    ray_t* s4 = ray_sym_str(1);
+    TEST_ASSERT_NOT_NULL(s3);  /* "" */
+    ray_t* s3b = ray_sym_str(1);
+    TEST_ASSERT_NOT_NULL(s3b); /* "x" */
+    ray_t* s4 = ray_sym_str(2);
     TEST_ASSERT_NULL(s4);
 
     PASS();
@@ -1387,7 +1404,7 @@ static test_result_t test_sym_ensure_cap_large(void) {
         int64_t id = ray_sym_intern(buf, (size_t)len);
         TEST_ASSERT((id) >= (0), "id >= 0");
     }
-    TEST_ASSERT_EQ_U(ray_sym_count(), 2000);
+    TEST_ASSERT_EQ_U(ray_sym_count(), 2001);  /* "" + 2000 */
     PASS();
 }
 

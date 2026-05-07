@@ -1394,7 +1394,7 @@ static test_result_t test_splay_load_with_sym(void) {
     /* Reset sym table, then load via ray_splay_load with sym_path */
     ray_sym_destroy();
     (void)ray_sym_init();
-    TEST_ASSERT_EQ_U(ray_sym_count(), 0);
+    TEST_ASSERT_EQ_U(ray_sym_count(), 1);  /* "" reserved */
 
     ray_t* loaded = ray_splay_load(TMP_SPLAY_SYM_DIR, TMP_SYM_PATH);
     TEST_ASSERT_NOT_NULL(loaded);
@@ -1441,7 +1441,7 @@ static test_result_t test_splay_load_sym_missing_corrupt(void) {
     /* Reset sym table — simulate loading without sym */
     ray_sym_destroy();
     (void)ray_sym_init();
-    TEST_ASSERT_EQ_U(ray_sym_count(), 0);
+    TEST_ASSERT_EQ_U(ray_sym_count(), 1);  /* "" reserved */
 
     /* Load with NULL sym_path — should fail because RAY_SYM column exists
      * but sym table is empty. Note: col.c bounds check catches this first

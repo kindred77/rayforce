@@ -279,7 +279,7 @@ static test_result_t test_validate_sym_no_sym_cols(void) {
     /* Reset sym table — now ray_sym_count() == 0 */
     ray_sym_destroy();
     (void)ray_sym_init();
-    TEST_ASSERT_EQ_U(ray_sym_count(), 0);
+    TEST_ASSERT_EQ_U(ray_sym_count(), 1);  /* "" reserved */
 
     /* Load WITHOUT sym_path so sym table stays empty.
      * validate_sym_columns: sym_count==0, nc==1, no RAY_SYM col → RAY_OK */
@@ -351,7 +351,7 @@ static test_result_t test_validate_sym_corrupt(void) {
      * first to confirm it works, then load without to hit validate path. */
     ray_sym_destroy();
     (void)ray_sym_init();
-    TEST_ASSERT_EQ_U(ray_sym_count(), 0);
+    TEST_ASSERT_EQ_U(ray_sym_count(), 1);  /* "" reserved */
 
     /* Load with sym_path — should succeed and re-populate sym table */
     ray_t* ok = ray_splay_load(dir, sym_path);
@@ -365,7 +365,7 @@ static test_result_t test_validate_sym_corrupt(void) {
      * This is also a useful coverage path (lines 161-163 of splay.c). */
     ray_sym_destroy();
     (void)ray_sym_init();
-    TEST_ASSERT_EQ_U(ray_sym_count(), 0);
+    TEST_ASSERT_EQ_U(ray_sym_count(), 1);  /* "" reserved */
 
     ray_t* bad = ray_splay_load(dir, NULL);
     TEST_ASSERT_TRUE(!bad || RAY_IS_ERR(bad));
@@ -674,7 +674,7 @@ static test_result_t test_validate_sym_zero_col_table(void) {
     /* Reset sym table — sym_count() == 0 */
     ray_sym_destroy();
     (void)ray_sym_init();
-    TEST_ASSERT_EQ_U(ray_sym_count(), 0);
+    TEST_ASSERT_EQ_U(ray_sym_count(), 1);  /* "" reserved */
 
     /* Load: schema_ncols=0, loop skips, validate_sym_columns runs with
      * sym_count==0, nc==0 → hits lines 46,49,50,52,53,54 and returns OK */
