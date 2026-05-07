@@ -220,11 +220,9 @@
 ;; result is whatever the unfused path produces" — it does NOT
 ;; distinguish raw-fused-result from a hypothetical normalised
 ;; result, because no such normalised result exists in the engine
-;; today.  A stronger regression here would require either an
-;; engine-side fix that adds proper temporal normalisation in
-;; cmp.c, or a parity harness that runs each query under both
-;; RAYFORCE_DISABLE_FUSED_GROUP=0 and =1 and checks equality.
-;; Both are out of scope for this branch and tracked separately.
+;; today.  A stronger regression here would require an engine-side
+;; fix that adds proper temporal normalisation in cmp.c, which is
+;; out of scope for this branch and tracked separately.
 (set Tts (table [t v] (list (as 'TIMESTAMP [2013.07.01D00:00:00.000000 2013.07.15D00:00:00.000000 2013.07.31D00:00:00.000000]) [1 2 3])))
 ;; The shape compiles and runs — that's what we're verifying here.
 ;; The exact count (3) reflects current engine semantics for a
