@@ -181,25 +181,47 @@
 (at (at (select {s: s n: n from: Ts where: (>= n 0) asc: n take: 2}) 's) 0) -- "apple"
 (at (at (select {s: s n: n from: Ts where: (>= n 0) asc: n take: 2}) 's) 1) -- "cherry"
 
-;; ────────────── Mixed-temporal compare must NOT fire fused ───────
-;; A DATE column compared to a TIMESTAMP constant has different
-;; storage units (days vs nanoseconds).  The fused predicate gate
-;; refuses this combination so the unfused engine handles the
-;; conversion (or surfaces a domain error if no conversion exists).
-;; Whatever the unfused result is, it must NOT be a silent raw-unit
-;; compare via the fused fast path — which would have returned 3
-;; rows here for `(>= d <tiny-ts-int>)`.
+;; ────────────── Top-K SYM column with per-vector sym_dict ────────
+;; CSV-loaded SYM columns carry a local sym_dict; raw IDs index into
+;; that LOCAL dictionary, not the global sym table.  The fused
+;; comparator resolves IDs through the global snapshot, and the
+;; materialiser doesn't propagate sym_dict — both would corrupt the
+;; result if a local-dict SYM column reached the fused path.  The
+;; gates at ray_fused_topk_select / query.c reject this shape and
+;; fall back to the unfused FILTER + SORT + TAKE which gathers via
+;; sort.c:3642-3660 / rerank.c:174-188 (both propagate sym_dict).
 ;;
-;; A timestamp literal like `2013.07.15D00:00:00.000000` decodes as
-;; an int64 nanosecond count from the epoch — far larger than any
-;; valid DATE-as-int32-days value, so a raw-unit `>=` against the
-;; date column would compare against a huge int and match nothing.
-;; That's exactly what the fused path would do.  The current
-;; `RAYFORCE_DISABLE_FUSED_GROUP=0` (default) result is 0 because
-;; the unfused engine reports a type domain error — we accept that
-;; (correctness > performance for unsupported shapes).
+;; Fixture writes SYMs in insertion order "zebra,apple,mango"; the
+;; local dict assigns IDs 0,1,2 in that order, but lexicographic
+;; ASC must return apple, mango, zebra regardless.  Without the
+;; gate, the fused path would compare local IDs against unrelated
+;; global-dict strings and the answer would be non-deterministic.
+(.sys.exec "rm -f rf_test_local_dict_sym.csv") -- 0
+(.sys.exec "printf 'name,n\\nzebra,3\\napple,1\\nmango,2\\n' > rf_test_local_dict_sym.csv") -- 0
+(set Tld (.csv.read [SYMBOL I64] "rf_test_local_dict_sym.csv"))
+(at (at (select {name: name n: n from: Tld where: (>= n 0) asc: name take: 3}) 'name) 0) -- 'apple
+(at (at (select {name: name n: n from: Tld where: (>= n 0) asc: name take: 3}) 'name) 1) -- 'mango
+(at (at (select {name: name n: n from: Tld where: (>= n 0) asc: name take: 3}) 'name) 2) -- 'zebra
+(.sys.exec "rm -f rf_test_local_dict_sym.csv") -- 0
+
+;; ────────────── Mixed-temporal compare must NOT fire fused ───────
+;; DATE storage is int32 days-from-epoch; TIMESTAMP is int64 ns.
+;; A raw-unit `(>= date-col timestamp-const)` would compare the
+;; date's day count against the timestamp's nanosecond count —
+;; which is meaningless and would falsely match (or falsely miss)
+;; depending on epoch sign.  The fused predicate gate refuses
+;; type-mismatched compares so the unfused engine handles them
+;; (typically by raising a type/domain error).
 (set Tdt (table [d v] (list (as 'date [2013.07.01 2013.07.15 2013.07.31]) [1 2 3])))
-;; Same-typed DATE compare works through fused — verifies the gate
-;; allows the supported shape.
+;; Actual DATE-vs-TIMESTAMP compare — the unfused path resolves
+;; this to zero rows (no DATE row's day-int is >= the timestamp's
+;; ns-int).  The fused path would have raw-compared the int32 days
+;; vs int64 ns and matched all 3 (the day count is always less
+;; than the ns count, so `>=` reverses), which is wrong.  The
+;; mismatch therefore manifests as count 0 (correct) vs 3 (fused
+;; fast path bug); we assert the correct count.
+(count (select {c: (count v) from: Tdt where: (>= d 2013.07.15D00:00:00.000000) by: d})) -- 0
+;; Same-typed DATE compare works — verifies the gate allows the
+;; supported shape and didn't over-reject.
 (count (select {c: (count v) from: Tdt where: (>= d 2013.07.15) by: d})) -- 2
 (count (select {c: (count v) from: Tdt where: (== d 2013.07.01) by: d})) -- 1
