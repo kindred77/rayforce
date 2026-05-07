@@ -2226,22 +2226,28 @@ static test_result_t test_serde_vec_null_bitmaps(void) {
         TEST_ASSERT_TRUE(ray_vec_is_null(b, 2));
         ray_release(b); ray_release(w); ray_release(v);
     }
-    /* SYM vector with null bitmap */
+    /* SYM vector: null state is represented by sym 0 (the empty
+     * string), not a nullmap.  This stanza verifies the round-trip
+     * preserves the values intact — there is no HAS_NULLS attribute
+     * to assert on. */
     {
-        int64_t id1 = ray_sym_intern("p", 1);
-        int64_t id2 = ray_sym_intern("q", 1);
+        int64_t id_empty = 0;  /* reserved by ray_sym_init */
+        int64_t id_q     = ray_sym_intern("q", 1);
         ray_t* v = ray_vec_new(RAY_SYM, 2);
         v->len = 2;
         int64_t* ids = (int64_t*)ray_data(v);
-        ids[0] = id1; ids[1] = id2;
-        ray_vec_set_null(v, 0, true);
+        ids[0] = id_empty;  /* "missing" represented as sym 0 */
+        ids[1] = id_q;
 
         ray_t* w = ray_ser(v);
         TEST_ASSERT_NOT_NULL(w); TEST_ASSERT_FALSE(RAY_IS_ERR(w));
         ray_t* b = ray_de(w);
         TEST_ASSERT_NOT_NULL(b); TEST_ASSERT_FALSE(RAY_IS_ERR(b));
         TEST_ASSERT_EQ_I(b->type, RAY_SYM);
-        TEST_ASSERT_TRUE(b->attrs & RAY_ATTR_HAS_NULLS);
+        TEST_ASSERT_FALSE(b->attrs & RAY_ATTR_HAS_NULLS);
+        const int64_t* rids = (const int64_t*)ray_data(b);
+        TEST_ASSERT_EQ_I(rids[0], 0);
+        TEST_ASSERT_EQ_I(rids[1], id_q);
         ray_release(b); ray_release(w); ray_release(v);
     }
     PASS();

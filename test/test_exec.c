@@ -5888,60 +5888,6 @@ static test_result_t test_expr_propagate_nulls_large(void) {
 }
 
 /* ---- binary_range: nullable SYM column vs STR constant — covers lines 1671-1680 ---- */
-static test_result_t test_expr_sym_vs_str_nullable(void) {
-    ray_heap_init();
-    (void)ray_sym_init();
-
-    /* Create SYM column with a null entry */
-    int64_t id1 = ray_sym_intern("foo", 3);
-    int64_t id2 = ray_sym_intern("bar", 3);
-    ray_t* vsym = ray_sym_vec_new(RAY_SYM_W64, 4);
-    vsym->len = 4;
-    int64_t* sdata = (int64_t*)ray_data(vsym);
-    sdata[0] = id1;
-    sdata[1] = id2;
-    sdata[2] = id1;
-    sdata[3] = id2;
-    ray_vec_set_null(vsym, 3, true);  /* force non-fused path */
-    int64_t na = ray_sym_intern("s", 1);
-    ray_t* tbl = ray_table_new(1);
-    tbl = ray_table_add_col(tbl, na, vsym);
-    ray_release(vsym);
-
-    /* s == "foo" — exercises binary_range SYM-vs-STR path (lines 1671-1674) */
-    ray_graph_t* g = ray_graph_new(tbl);
-    ray_op_t* sc = ray_scan(g, "s");
-    ray_op_t* lit = ray_const_str(g, "foo", 3);
-    ray_op_t* eq = ray_eq(g, sc, lit);
-    ray_op_t* flt = ray_filter(g, sc, eq);
-    ray_op_t* cnt = ray_count(g, flt);
-    ray_t* result = ray_execute(g, cnt);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    /* positions 0,2 are "foo" (pos1="bar", pos3=null): 2 matches */
-    TEST_ASSERT_EQ_I(result->i64, 2);
-    ray_release(result);
-    ray_graph_free(g);
-
-    /* "bar" == s — exercises binary_range STR-vs-SYM path (lines 1677-1680) */
-    g = ray_graph_new(tbl);
-    sc = ray_scan(g, "s");
-    lit = ray_const_str(g, "bar", 3);
-    eq = ray_eq(g, lit, sc);
-    flt = ray_filter(g, sc, eq);
-    cnt = ray_count(g, flt);
-    result = ray_execute(g, cnt);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    /* position 1 is "bar": 1 match */
-    TEST_ASSERT_EQ_I(result->i64, 1);
-    ray_release(result);
-    ray_graph_free(g);
-
-    ray_release(tbl);
-    ray_sym_destroy();
-    ray_heap_destroy();
-    PASS();
-}
-
 /* ---- binary_range: I32 atom as scalar left operand (line 1691) ---- */
 static test_result_t test_expr_i32_scalar_left(void) {
     ray_heap_init();
@@ -6065,47 +6011,6 @@ static test_result_t test_expr_sym_w32_cmp(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
     /* positions 0,2 are "alpha": 2 matches */
     TEST_ASSERT_EQ_I(result->i64, 2);
-    ray_release(result);
-    ray_graph_free(g);
-
-    ray_release(tbl);
-    ray_sym_destroy();
-    ray_heap_destroy();
-    PASS();
-}
-
-/* ---- binary_range: SYM W8 narrow column (lsym_buf path) comparison (line 1413) ---- */
-static test_result_t test_expr_sym_w8_cmp(void) {
-    ray_heap_init();
-    (void)ray_sym_init();
-
-    int64_t id1 = ray_sym_intern("x", 1);
-    int64_t id2 = ray_sym_intern("y", 1);
-    /* W8 SYM vector */
-    ray_t* vs = ray_sym_vec_new(RAY_SYM_W8, 4);
-    vs->len = 4;
-    uint8_t* sd = (uint8_t*)ray_data(vs);
-    sd[0] = (uint8_t)id1;
-    sd[1] = (uint8_t)id2;
-    sd[2] = (uint8_t)id1;
-    sd[3] = (uint8_t)id2;
-    ray_vec_set_null(vs, 2, true);  /* force non-fused path */
-    int64_t na = ray_sym_intern("c", 1);
-    ray_t* tbl = ray_table_new(1);
-    tbl = ray_table_add_col(tbl, na, vs);
-    ray_release(vs);
-
-    /* c == "x" — exercises lsym_buf narrow path (line 1413) */
-    ray_graph_t* g = ray_graph_new(tbl);
-    ray_op_t* sc = ray_scan(g, "c");
-    ray_op_t* lit = ray_const_str(g, "x", 1);
-    ray_op_t* eq = ray_eq(g, sc, lit);
-    ray_op_t* flt = ray_filter(g, sc, eq);
-    ray_op_t* cnt = ray_count(g, flt);
-    ray_t* result = ray_execute(g, cnt);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    /* position 0 is "x" (pos2 null, pos3 null excluded): 1 match */
-    TEST_ASSERT_EQ_I(result->i64, 1);
     ray_release(result);
     ray_graph_free(g);
 
@@ -6874,111 +6779,6 @@ static test_result_t test_expr_ceil_i64_nullable(void) {
     result = ray_execute(g, s);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
     TEST_ASSERT_EQ_I(result->i64, 21);
-    ray_release(result);
-    ray_graph_free(g);
-
-    ray_release(tbl);
-    ray_sym_destroy();
-    ray_heap_destroy();
-    PASS();
-}
-
-/* ---- binary_range: SYM W32 column on RHS (rp_u32, line 1428) ---- */
-static test_result_t test_expr_sym_w32_rhs(void) {
-    ray_heap_init();
-    (void)ray_sym_init();
-
-    int64_t id1 = ray_sym_intern("alpha", 5);
-    int64_t id2 = ray_sym_intern("beta",  4);
-
-    /* Two W32 SYM columns: exercises rp_u32 path (line 1428) */
-    ray_t* v1 = ray_sym_vec_new(RAY_SYM_W32, 4);
-    v1->len = 4;
-    uint32_t* d1 = (uint32_t*)ray_data(v1);
-    d1[0] = (uint32_t)id1; d1[1] = (uint32_t)id2;
-    d1[2] = (uint32_t)id1; d1[3] = (uint32_t)id2;
-    ray_vec_set_null(v1, 3, true);  /* force non-fused */
-
-    ray_t* v2 = ray_sym_vec_new(RAY_SYM_W32, 4);
-    v2->len = 4;
-    uint32_t* d2 = (uint32_t*)ray_data(v2);
-    d2[0] = (uint32_t)id1; d2[1] = (uint32_t)id1;
-    d2[2] = (uint32_t)id2; d2[3] = (uint32_t)id1;
-    ray_vec_set_null(v2, 3, true);
-
-    int64_t na = ray_sym_intern("s", 1);
-    int64_t nb = ray_sym_intern("t", 1);
-    ray_t* tbl = ray_table_new(2);
-    tbl = ray_table_add_col(tbl, na, v1);
-    tbl = ray_table_add_col(tbl, nb, v2);
-    ray_release(v1); ray_release(v2);
-
-    /* s == t — exercises lp_u32 (lhs W32) and rp_u32 (rhs W32).
-     * q-style null semantics: null == null evaluates to true (fix_null_comparisons).
-     * row 0: alpha==alpha → true; row 1: beta!=alpha → false;
-     * row 2: alpha!=beta → false; row 3: null==null → true (q-style).
-     * filter(s, eq) passes rows 0 and 3 → 2 elements. */
-    ray_graph_t* g = ray_graph_new(tbl);
-    ray_op_t* s_op = ray_scan(g, "s");
-    ray_op_t* t_op = ray_scan(g, "t");
-    ray_op_t* eq   = ray_eq(g, s_op, t_op);
-    ray_op_t* flt  = ray_filter(g, s_op, eq);
-    ray_op_t* cnt  = ray_count(g, flt);
-    ray_t* result  = ray_execute(g, cnt);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    /* 2 matches: row 0 (alpha==alpha) and row 3 (null==null under q-style) */
-    TEST_ASSERT_EQ_I(result->i64, 2);
-    ray_release(result);
-    ray_graph_free(g);
-
-    ray_release(tbl);
-    ray_sym_destroy();
-    ray_heap_destroy();
-    PASS();
-}
-
-/* ---- binary_range: SYM W8 narrow column on RHS (rsym_buf, line 1429) ---- */
-static test_result_t test_expr_sym_w8_rhs(void) {
-    ray_heap_init();
-    (void)ray_sym_init();
-
-    int64_t id1 = ray_sym_intern("p", 1);
-    int64_t id2 = ray_sym_intern("q", 1);
-
-    /* Two W8 SYM columns */
-    ray_t* v1 = ray_sym_vec_new(RAY_SYM_W8, 3);
-    v1->len = 3;
-    uint8_t* d1 = (uint8_t*)ray_data(v1);
-    d1[0] = (uint8_t)id1; d1[1] = (uint8_t)id2; d1[2] = (uint8_t)id1;
-    ray_vec_set_null(v1, 2, true);
-
-    ray_t* v2 = ray_sym_vec_new(RAY_SYM_W8, 3);
-    v2->len = 3;
-    uint8_t* d2 = (uint8_t*)ray_data(v2);
-    d2[0] = (uint8_t)id1; d2[1] = (uint8_t)id1; d2[2] = (uint8_t)id2;
-    ray_vec_set_null(v2, 2, true);
-
-    int64_t na = ray_sym_intern("s", 1);
-    int64_t nb = ray_sym_intern("t", 1);
-    ray_t* tbl = ray_table_new(2);
-    tbl = ray_table_add_col(tbl, na, v1);
-    tbl = ray_table_add_col(tbl, nb, v2);
-    ray_release(v1); ray_release(v2);
-
-    /* s == t — exercises lsym_buf (lhs narrow) and rsym_buf (rhs narrow).
-     * q-style null semantics: null == null evaluates to true (fix_null_comparisons).
-     * row 0: p==p → true; row 1: q!=p → false; row 2: null==null → true (q-style).
-     * filter(s, eq) passes rows 0 and 2 → 2 elements. */
-    ray_graph_t* g = ray_graph_new(tbl);
-    ray_op_t* s_op = ray_scan(g, "s");
-    ray_op_t* t_op = ray_scan(g, "t");
-    ray_op_t* eq   = ray_eq(g, s_op, t_op);
-    ray_op_t* flt  = ray_filter(g, s_op, eq);
-    ray_op_t* cnt  = ray_count(g, flt);
-    ray_t* result  = ray_execute(g, cnt);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    /* 2 matches: row 0 (p==p) and row 2 (null==null under q-style) */
-    TEST_ASSERT_EQ_I(result->i64, 2);
     ray_release(result);
     ray_graph_free(g);
 
@@ -9543,11 +9343,9 @@ const test_entry_t exec_entries[] = {
     { "exec/expr_group_linear_mul", test_expr_group_linear_mul, NULL, NULL },
     { "exec/expr_binary_bool_nullable", test_expr_binary_bool_nullable, NULL, NULL },
     { "exec/expr_propagate_nulls_large", test_expr_propagate_nulls_large, NULL, NULL },
-    { "exec/expr_sym_vs_str_nullable", test_expr_sym_vs_str_nullable, NULL, NULL },
     { "exec/expr_i32_scalar_left", test_expr_i32_scalar_left, NULL, NULL },
     { "exec/expr_str_scalar_left", test_expr_str_scalar_left, NULL, NULL },
     { "exec/expr_sym_w32_cmp", test_expr_sym_w32_cmp, NULL, NULL },
-    { "exec/expr_sym_w8_cmp", test_expr_sym_w8_cmp, NULL, NULL },
     { "exec/expr_f64_div_zero_scalar", test_expr_f64_div_zero_scalar, NULL, NULL },
     { "exec/expr_group_linear_f64_const", test_expr_group_linear_f64_const, NULL, NULL },
     { "exec/expr_group_linear_cancel", test_expr_group_linear_cancel, NULL, NULL },
@@ -9561,8 +9359,6 @@ const test_entry_t exec_entries[] = {
     { "exec/expr_group_affine_const_ops", test_expr_group_affine_const_ops, NULL, NULL },
     { "exec/expr_group_affine_date_col", test_expr_group_affine_date_col, NULL, NULL },
     { "exec/expr_fused_f64_ne", test_expr_fused_f64_ne, NULL, NULL },
-    { "exec/expr_sym_w32_rhs", test_expr_sym_w32_rhs, NULL, NULL },
-    { "exec/expr_sym_w8_rhs", test_expr_sym_w8_rhs, NULL, NULL },
     { "exec/expr_group_linear_max_terms", test_expr_group_linear_max_terms, NULL, NULL },
     { "exec/expr_ceil_i64_nullable", test_expr_ceil_i64_nullable, NULL, NULL },
     { "exec/expr_and_i64_nullable", test_expr_and_i64_nullable, NULL, NULL },

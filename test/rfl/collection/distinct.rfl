@@ -165,26 +165,14 @@
 (at (at rk2s 's) 66) -- 2
 (at (at rk2s 'p) 99) -- 3.0
 (at (at rk2s 's) 99) -- 2
-;; Nulls propagate through rank fallback at scale: tied nulls must
-;; share a rank so the secondary key decides ordering among them.
-;; 99 rows, cycled [0Ns 0Ns aa] and (as 'F64 [1 2 0]). Prices
-;; include 0.0 so the encoded f64 range forces the composite
-;; budget to overflow -> rank fallback runs -> null rank collapsing
-;; is exercised. Pairs: (null,1.0), (null,2.0), (aa,0.0).
-;; After asc sort with default nulls-first: 66 null rows first
-;; (33 with p=1.0, 33 with p=2.0), then 33 aa rows with p=0.0.
-(set rk3 (table [s p] (list (take [0Ns 0Ns aa] 99) (as 'F64 (take [1 2 0] 99)))))(set rk3s (xasc rk3 ['s 'p]))(count rk3s) -- 99
-(nil? (at (at rk3s 's) 0)) -- true
-(at (at rk3s 'p) 0) -- 1.0
-(nil? (at (at rk3s 's) 32)) -- true
-(at (at rk3s 'p) 32) -- 1.0
-(nil? (at (at rk3s 's) 33)) -- true
-(at (at rk3s 'p) 33) -- 2.0
-(nil? (at (at rk3s 's) 65)) -- true
-(at (at rk3s 'p) 65) -- 2.0
-(at (at rk3s 's) 66) -- 'aa
-(at (at rk3s 'p) 66) -- 0.0
-(at (at rk3s 's) 98) -- 'aa
+;; The original test here ran a SYM null-rank-collapse regression
+;; using [0Ns 0Ns aa] over 99 rows.  SYM columns are now no-null by
+;; design (sym 0 = empty string is the canonical "missing" value),
+;; so the null-collapse case it covered no longer exists.  Other
+;; non-SYM null tests above and below still exercise the rank
+;; fallback paths; this block is intentionally removed rather than
+;; rewritten because the empty-sym variant would just be a
+;; same-value-many-rows sort, which the rk2 block already covers.
 ;; RAY_STR multi-key. 100 rows, three distinct strings, three
 ;; distinct prices.  Pre-fix, has_wide_key didn't exist and RAY_STR
 ;; wasn't in can_radix, so this would fall into merge sort; now it
