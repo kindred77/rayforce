@@ -39,7 +39,31 @@ static test_result_t test_public_ipc_client_symbols(void) {
     PASS();
 }
 
+static test_result_t test_public_query_and_format_symbols(void) {
+    ray_t* (*select_fn)(ray_t**, int64_t) = ray_select;
+    ray_t* (*update_fn)(ray_t**, int64_t) = ray_update;
+    ray_t* (*insert_fn)(ray_t**, int64_t) = ray_insert;
+    ray_t* (*upsert_fn)(ray_t**, int64_t) = ray_upsert;
+    ray_t* (*fmt_fn)(ray_t*, int) = ray_fmt;
+
+    TEST_ASSERT_NOT_NULL((void*)select_fn);
+    TEST_ASSERT_NOT_NULL((void*)update_fn);
+    TEST_ASSERT_NOT_NULL((void*)insert_fn);
+    TEST_ASSERT_NOT_NULL((void*)upsert_fn);
+    TEST_ASSERT_NOT_NULL((void*)fmt_fn);
+
+    ray_t* s = ray_fmt(ray_i64(42), 0);
+    TEST_ASSERT_NOT_NULL(s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(s));
+    TEST_ASSERT_EQ_I(s->type, -RAY_STR);
+    TEST_ASSERT_EQ_I(ray_str_len(s), 2);
+    TEST_ASSERT_MEM_EQ(2, ray_str_ptr(s), "42");
+    ray_release(s);
+    PASS();
+}
+
 const test_entry_t public_api_entries[] = {
     { "public/ipc_client_symbols", test_public_ipc_client_symbols, NULL, NULL },
+    { "public/query_and_format_symbols", test_public_query_and_format_symbols, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };

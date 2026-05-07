@@ -346,7 +346,7 @@ static test_result_t test_dump_sort_select_and_flags(void) {
 
     /* SELECT with one column */
     ray_op_t* sel_cols[1] = { tbl_node };
-    ray_op_t* sl = ray_select(g, tbl_node, sel_cols, 1);
+    ray_op_t* sl = ray_select_op(g, tbl_node, sel_cols, 1);
 
     /* est_rows and OP_FLAG_FUSED branches: set them on the SELECT node. */
     sl->est_rows = 99;

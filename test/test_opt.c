@@ -221,7 +221,7 @@ static test_result_t test_pushdown_past_select(void) {
     ray_op_t* pred = ray_eq(g, id1, c1);
 
     ray_op_t* sel_cols[] = { id1, v1 };
-    ray_op_t* sel = ray_select(g, v1, sel_cols, 2);
+    ray_op_t* sel = ray_select_op(g, v1, sel_cols, 2);
     uint32_t sel_id = sel->id;
     ray_op_t* filt = ray_filter(g, sel, pred);
 
@@ -1023,7 +1023,7 @@ static test_result_t test_opt_realloc_during_split(void) {
         ray_op_t* sel_v1 = ray_scan(g, "v1");
         ray_op_t* sel_id1 = ray_scan(g, "id1");
         ray_op_t* sel_cols[] = { sel_v1, sel_id1 };
-        (void)ray_select(g, sel_v1, sel_cols, 2);
+        (void)ray_select_op(g, sel_v1, sel_cols, 2);
 
         /* OP_WINDOW with part/order/func keys */
         ray_op_t* tbl_op = ray_const_table(g, tbl);

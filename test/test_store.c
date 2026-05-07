@@ -2012,6 +2012,9 @@ static test_result_t test_serde_table_roundtrip(void) {
 
     ray_t* w = ray_ser(tbl);
     TEST_ASSERT_NOT_NULL(w); TEST_ASSERT_FALSE(RAY_IS_ERR(w));
+    uint8_t* wire = (uint8_t*)ray_data(w);
+    TEST_ASSERT_EQ_I((int8_t)wire[sizeof(ray_ipc_header_t)], RAY_TABLE);
+    TEST_ASSERT_EQ_I((int8_t)wire[sizeof(ray_ipc_header_t) + 2], RAY_SYM);
 
     ray_t* b = ray_de(w);
     TEST_ASSERT_NOT_NULL(b); TEST_ASSERT_FALSE(RAY_IS_ERR(b));
@@ -4087,4 +4090,3 @@ const test_entry_t store_entries[] = {
     { "store/ipc/handshake_version_mismatch", test_ipc_handshake_version_mismatch, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
-

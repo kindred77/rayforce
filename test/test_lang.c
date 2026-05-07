@@ -1144,6 +1144,27 @@ static test_result_t test_eval_select_named_lambda(void) {
     PASS();
 }
 
+static test_result_t test_eval_select_recursive_self_lambda(void) {
+    ray_t* r = ray_eval_str(
+        "(do (set fib (fn [x] (if (< x 2) 1 (+ (self (- x 1)) (self (- x 2)))))) "
+        "    (set t (table [n] (list (til 6)))) "
+        "    (select {from: t m: (fib n)}))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_t* m = ray_table_get_col(r, ray_sym_intern("m", 1));
+    TEST_ASSERT_NOT_NULL(m);
+    TEST_ASSERT_EQ_I(m->type, RAY_I64);
+    int64_t* md = (int64_t*)ray_data(m);
+    TEST_ASSERT_EQ_I(md[0], 1);
+    TEST_ASSERT_EQ_I(md[1], 1);
+    TEST_ASSERT_EQ_I(md[2], 2);
+    TEST_ASSERT_EQ_I(md[3], 3);
+    TEST_ASSERT_EQ_I(md[4], 5);
+    TEST_ASSERT_EQ_I(md[5], 8);
+    ray_release(r);
+    PASS();
+}
+
 /* Global scalar binding used inside a WHERE clause — the
  * compile-time name resolver folds `threshold` to a const node. */
 static test_result_t test_eval_select_global_scalar(void) {
@@ -6600,6 +6621,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/select_where_eq_null_literal", test_eval_select_where_eq_null_literal, lang_setup, lang_teardown },
     { "lang/eval/pivot_multi_index", test_eval_pivot_multi_index, lang_setup, lang_teardown },
     { "lang/eval/select_named_lambda", test_eval_select_named_lambda, lang_setup, lang_teardown },
+    { "lang/eval/select_recursive_self_lambda", test_eval_select_recursive_self_lambda, lang_setup, lang_teardown },
     { "lang/eval/select_global_scalar", test_eval_select_global_scalar, lang_setup, lang_teardown },
     { "lang/eval/select_lambda_nonagg", test_eval_select_lambda_nonagg, lang_setup, lang_teardown },
     { "lang/eval/select_lambda_where", test_eval_select_lambda_where, lang_setup, lang_teardown },

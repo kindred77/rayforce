@@ -1414,7 +1414,7 @@ static test_result_t test_exec_select(void) {
     ray_op_t* v1 = ray_scan(g, "v1");
     ray_op_t* id1 = ray_scan(g, "id1");
     ray_op_t* cols[] = { v1, id1 };
-    ray_op_t* sel = ray_select(g, tbl_op, cols, 2);
+    ray_op_t* sel = ray_select_op(g, tbl_op, cols, 2);
 
     ray_t* result = ray_execute(g, sel);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
@@ -7329,7 +7329,7 @@ static test_result_t test_exec_broadcast_scalar_empty_f64(void) {
     ray_op_t* sc  = ray_scan(g, "x");
     ray_op_t* cst = ray_const_f64(g, 3.14);
     ray_op_t* cols[] = { sc, cst };
-    ray_op_t* sel = ray_select(g, ray_const_table(g, tbl), cols, 2);
+    ray_op_t* sel = ray_select_op(g, ray_const_table(g, tbl), cols, 2);
 
     ray_t* result = ray_execute(g, sel);
     TEST_ASSERT_NOT_NULL(result);
@@ -7362,7 +7362,7 @@ static test_result_t test_exec_broadcast_scalar_empty_bool(void) {
     ray_graph_t* g = ray_graph_new(tbl);
     ray_op_t* cst = ray_const_bool(g, true); /* returns -RAY_BOOL atom */
     ray_op_t* cols[] = { cst };
-    ray_op_t* sel = ray_select(g, ray_const_table(g, tbl), cols, 1);
+    ray_op_t* sel = ray_select_op(g, ray_const_table(g, tbl), cols, 1);
 
     ray_t* result = ray_execute(g, sel);
     TEST_ASSERT_NOT_NULL(result);
@@ -7398,7 +7398,7 @@ static test_result_t test_exec_broadcast_scalar_empty_sym(void) {
     ray_graph_t* g = ray_graph_new(tbl);
     ray_op_t* cst = ray_const_atom(g, sym_atom);
     ray_op_t* cols[] = { cst };
-    ray_op_t* sel = ray_select(g, ray_const_table(g, tbl), cols, 1);
+    ray_op_t* sel = ray_select_op(g, ray_const_table(g, tbl), cols, 1);
 
     ray_t* result = ray_execute(g, sel);
     TEST_ASSERT_NOT_NULL(result);
@@ -7475,7 +7475,7 @@ static test_result_t test_exec_broadcast_scalar_empty_unknown_type(void) {
     ray_graph_t* g = ray_graph_new(tbl);
     ray_op_t* cst = ray_const_atom(g, date_atom);
     ray_op_t* cols[] = { cst };
-    ray_op_t* sel = ray_select(g, ray_const_table(g, tbl), cols, 1);
+    ray_op_t* sel = ray_select_op(g, ray_const_table(g, tbl), cols, 1);
 
     ray_t* result = ray_execute(g, sel);
     /* Should be an error: broadcast_scalar returns error for unknown type */
@@ -7506,7 +7506,7 @@ static test_result_t test_exec_broadcast_scalar_nonzero_unknown_type(void) {
     ray_op_t* cst = ray_const_atom(g, date_atom);
     ray_op_t* v1  = ray_scan(g, "v1");
     ray_op_t* cols[] = { v1, cst };
-    ray_op_t* sel = ray_select(g, ray_const_table(g, tbl), cols, 2);
+    ray_op_t* sel = ray_select_op(g, ray_const_table(g, tbl), cols, 2);
 
     ray_t* result = ray_execute(g, sel);
     /* broadcast_scalar returns error for unknown atom type → error propagates */
@@ -7543,7 +7543,7 @@ static test_result_t test_exec_select_10_expr_cols(void) {
     ray_op_t* cols[11];
     for (int i = 0; i < 11; i++)
         cols[i] = ray_const_i64(g, (int64_t)i);
-    ray_op_t* sel = ray_select(g, tnode, cols, 11);
+    ray_op_t* sel = ray_select_op(g, tnode, cols, 11);
 
     ray_t* result = ray_execute(g, sel);
     TEST_ASSERT_NOT_NULL(result);
@@ -7896,7 +7896,7 @@ static test_result_t test_exec_antijoin_with_selection(void) {
  * OP_SELECT branch (exec.c L2001-2004).
  *
  * Build a 2-segment parted table {grp: MAPCOMMON, v: parted_I64}.
- * root = ray_select(g, scan_v, [scan_v2], 1): SELECT with two SCAN ops
+ * root = ray_select_op(g, scan_v, [scan_v2], 1): SELECT with two SCAN ops
  * (one as "input" key and one in the projection ext column list).
  * dag_can_stream → subtree_has_default_scan(select_op) → opc==OP_SELECT
  * → enters line 2001, walks ext->sort.columns → covers 2001-2004.
@@ -7944,7 +7944,7 @@ static test_result_t test_exec_streaming_select_root(void) {
     ray_op_t* scan_v  = ray_scan(g, "v");
     ray_op_t* scan_v2 = ray_scan(g, "v");
     ray_op_t* cols[1] = { scan_v2 };
-    ray_op_t* sel = ray_select(g, scan_v, cols, 1);
+    ray_op_t* sel = ray_select_op(g, scan_v, cols, 1);
 
     /* Execute — dag_can_stream fires, covering L2001-2004.
      * Streaming then runs; SELECT's input is a column vec (not TABLE)
@@ -8551,7 +8551,7 @@ static test_result_t test_exec_select_expr_col_error(void) {
     ray_op_t* scan_bad = ray_scan(g, "bad");
     ray_op_t* neg_bad  = ray_neg(g, scan_bad);
     ray_op_t* cols[1]  = { neg_bad };
-    ray_op_t* sel      = ray_select(g, const_tbl, cols, 1);
+    ray_op_t* sel      = ray_select_op(g, const_tbl, cols, 1);
 
     ray_t* result = ray_execute(g, sel);
     TEST_ASSERT_NOT_NULL(result);
