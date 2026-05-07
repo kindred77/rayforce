@@ -115,24 +115,6 @@ int main(void) {
 }
 ```
 
-## Capabilities
-
-|                              | Rayforce | DuckDB | Polars |
-|------------------------------|:--------:|:------:|:------:|
-| Native graph engine (CSR)    |    ✓     |        |        |
-| Graph algorithms             |    ✓     |        |        |
-| Worst-case optimal joins     |    ✓     |        |        |
-| Factorized execution         |    ✓     |        |        |
-| SIP optimizer                |    ✓     |        |        |
-| Embeddable (single header)   |    ✓     |        |        |
-| Zero external dependencies   |    ✓     |        |        |
-| Built-in query language      |    ✓     |        |        |
-| Fused morsel pipelines       |    ✓     |   ✓    |   ✓    |
-| Multi-pass query optimizer   |    ✓     |   ✓    |        |
-| COW ref counting             |    ✓     |        |   ✓    |
-| Custom memory allocator      |    ✓     |   ✓    |        |
-| Window functions & ASOF join |    ✓     |   ✓    |   ✓    |
-
 ## How It Works
 
 **Build** — Construct a lazy DAG: scans, filters, joins, aggregations, window
