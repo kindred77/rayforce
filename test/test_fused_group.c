@@ -297,6 +297,134 @@ static test_result_t test_sum_negative_i16(void) {
     PASS();
 }
 
+/* Forced-fallback regression (review blocker #1).  Build a fused-group
+ * node whose agg input column is nullable — mk_compile rejects this
+ * shape, so exec_filtered_group falls through to the unfused
+ * FILTER + GROUP path.  The earlier fallback discarded the filter
+ * predicate (root variable was overwritten by ray_group), so this
+ * test would have returned an unfiltered SUM.  After the fix the
+ * fallback runs OP_FILTER first to install g->selection, then
+ * OP_GROUP consumes that selection and the SUM is properly scoped.
+ *
+ *   g  = [0 0 0 1 1]
+ *   v  = [10 20 30 40 50] with row 4 set null (forces fallback)
+ *   pred (== g 0) selects rows {0,1,2}
+ *   expected: sum(v) over filtered rows = 60
+ *
+ * Pre-fix: filter ignored ⇒ sum = 10+20+30+40 = 100 (row 4 null
+ * skipped by SUM but rows 3 was included). */
+static test_result_t test_fallback_filter_honored(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    ray_t* g_col = ray_vec_new(RAY_I64, 5);
+    g_col->len = 5;
+    int64_t gv[] = {0, 0, 0, 1, 1};
+    memcpy(ray_data(g_col), gv, sizeof(gv));
+
+    ray_t* v_col = ray_vec_new(RAY_I64, 5);
+    v_col->len = 5;
+    int64_t vv[] = {10, 20, 30, 40, 50};
+    memcpy(ray_data(v_col), vv, sizeof(vv));
+    /* Mark row 4 null so mk_compile rejects this agg input and the
+     * dispatcher falls through to the unfused fallback. */
+    ray_vec_set_null(v_col, 4, true);
+
+    int64_t g_sym = ray_sym_intern("g", 1);
+    int64_t v_sym = ray_sym_intern("v", 1);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, g_sym, g_col); ray_release(g_col);
+    tbl = ray_table_add_col(tbl, v_sym, v_col); ray_release(v_col);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_g    = ray_scan(g, "g");
+    ray_op_t* scan_v    = ray_scan(g, "v");
+    ray_op_t* scan_g2   = ray_scan(g, "g");
+    ray_op_t* zero      = ray_const_i64(g, 0);
+    ray_op_t* pred      = ray_binop(g, OP_EQ, scan_g2, zero);
+    uint16_t  agg_ops[] = { OP_SUM };
+    ray_op_t* agg_ins[] = { scan_v };
+    ray_op_t* keys[]    = { scan_g };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 1, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_t* res = ray_execute(g, fused);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    /* Result must have one row (single g=0 bucket).  If the filter
+     * were silently dropped, we'd see two rows (g=0 and g=1). */
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 1);
+    /* Find the SUM column by walking the result schema — ray_group
+     * via the C API doesn't pick up alias names from a select dict,
+     * so the column name is derived (typically the input col sym
+     * or "sum").  Walk the columns and find the int64 agg result. */
+    int64_t got_sum = -1;
+    int64_t ncols = ray_table_ncols(res);
+    for (int64_t c = 0; c < ncols; c++) {
+        ray_t* col = ray_table_get_col_idx(res, c);
+        if (col && col->type == RAY_I64 && col->len == 1) {
+            int64_t v = ((int64_t*)ray_data(col))[0];
+            /* Distinguish key column (= 0) from sum column (= 60). */
+            if (v == 60) { got_sum = v; break; }
+        }
+    }
+    TEST_ASSERT_EQ_I(got_sum, 60);
+
+    ray_release(res);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* Direct-API count1 must reject nullable group keys (review blocker
+ * #2).  The planner rejects this shape, but a C-API caller bypasses
+ * the planner — count1's executor must reject too, otherwise the
+ * per-row HT probe would bucket null sentinels as real key values. */
+static test_result_t test_count1_rejects_nullable_key(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    ray_t* k_col = ray_vec_new(RAY_I64, 4);
+    k_col->len = 4;
+    int64_t kv[] = {1, 2, 3, 4};
+    memcpy(ray_data(k_col), kv, sizeof(kv));
+    ray_vec_set_null(k_col, 1, true);  /* row 1 has null key */
+
+    int64_t k_sym = ray_sym_intern("k", 1);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, k_sym, k_col); ray_release(k_col);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k    = ray_scan(g, "k");
+    ray_op_t* scan_kp   = ray_scan(g, "k");
+    ray_op_t* zero      = ray_const_i64(g, 0);
+    ray_op_t* pred      = ray_binop(g, OP_GE, scan_kp, zero);
+    uint16_t  agg_ops[] = { OP_COUNT };
+    ray_op_t* agg_ins[] = { scan_k };
+    ray_op_t* keys[]    = { scan_k };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 1, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    /* count1's nullable-key gate forces fallback, which materialises
+     * the filtered table first.  The filter `(>= k 0)` evaluates
+     * null compares to false, dropping the null-key row, so the
+     * unfused group sees only k = {1, 3, 4} — 3 distinct buckets.
+     * (If the count1 executor had not rejected, the per-row HT
+     * probe would have read the null sentinel as a real key value
+     * and produced a fourth bogus bucket.) */
+    ray_t* res = ray_execute(g, fused);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 3);
+
+    ray_release(res);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 /* (== AdvEngineID 99) → no rows pass → empty result. */
 static test_result_t test_eq_no_match(void) {
     ray_heap_init();
@@ -335,5 +463,7 @@ const test_entry_t fused_group_entries[] = {
     { "fused_group/eq_const_out_of_range_u8",    test_eq_const_out_of_range_u8,    NULL, NULL },
     { "fused_group/ne_const_out_of_range_u8",    test_ne_const_out_of_range_u8,    NULL, NULL },
     { "fused_group/sum_negative_i16",            test_sum_negative_i16,            NULL, NULL },
+    { "fused_group/fallback_filter_honored",     test_fallback_filter_honored,     NULL, NULL },
+    { "fused_group/count1_rejects_nullable_key", test_count1_rejects_nullable_key, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };

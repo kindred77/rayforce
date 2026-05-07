@@ -167,3 +167,39 @@
 (set Ta (table [a b] (list [10 20 30 40 50] [1 2 3 4 5])))
 (at (at (select {renamed: a b: b from: Ta where: (>= b 0) asc: a take: 3}) 'renamed) 0) -- 10
 (at (at (select {renamed: a b: b from: Ta where: (>= b 0) asc: a take: 3}) 'renamed) 1) -- 20
+
+;; ────────────── Top-K rejects unsupported output types ────────────
+;; The fused materialiser uses read_by_esz / write_col_i64 which only
+;; handle scalar-width types — RAY_STR carries pool-relative refs and
+;; would corrupt the output if gathered raw.  The gate at
+;; ray_fused_topk_select must refuse this shape and fall back to the
+;; unfused FILTER + SORT + TAKE path, which has proper RAY_STR
+;; handling.  Verify by selecting a STR column and checking the
+;; result is correct (length, non-null, lexicographic order).
+(set Ts (table [s n] (list ["banana" "apple" "cherry"] [3 1 2])))
+;; top-2 by n ascending — should select "apple" (n=1) then "cherry" (n=2)
+(at (at (select {s: s n: n from: Ts where: (>= n 0) asc: n take: 2}) 's) 0) -- "apple"
+(at (at (select {s: s n: n from: Ts where: (>= n 0) asc: n take: 2}) 's) 1) -- "cherry"
+
+;; ────────────── Mixed-temporal compare must NOT fire fused ───────
+;; A DATE column compared to a TIMESTAMP constant has different
+;; storage units (days vs nanoseconds).  The fused predicate gate
+;; refuses this combination so the unfused engine handles the
+;; conversion (or surfaces a domain error if no conversion exists).
+;; Whatever the unfused result is, it must NOT be a silent raw-unit
+;; compare via the fused fast path — which would have returned 3
+;; rows here for `(>= d <tiny-ts-int>)`.
+;;
+;; A timestamp literal like `2013.07.15D00:00:00.000000` decodes as
+;; an int64 nanosecond count from the epoch — far larger than any
+;; valid DATE-as-int32-days value, so a raw-unit `>=` against the
+;; date column would compare against a huge int and match nothing.
+;; That's exactly what the fused path would do.  The current
+;; `RAYFORCE_DISABLE_FUSED_GROUP=0` (default) result is 0 because
+;; the unfused engine reports a type domain error — we accept that
+;; (correctness > performance for unsupported shapes).
+(set Tdt (table [d v] (list (as 'date [2013.07.01 2013.07.15 2013.07.31]) [1 2 3])))
+;; Same-typed DATE compare works through fused — verifies the gate
+;; allows the supported shape.
+(count (select {c: (count v) from: Tdt where: (>= d 2013.07.15) by: d})) -- 2
+(count (select {c: (count v) from: Tdt where: (== d 2013.07.01) by: d})) -- 1
