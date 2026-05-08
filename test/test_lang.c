@@ -1902,12 +1902,13 @@ static test_result_t test_eval_select_by_take_clamps(void) {
     PASS();
 }
 
-/* ---- Test: agg sub-calls inside non-agg expressions broadcast ----
- * Regression: the classifier that decides "row-aligned required vs
- * broadcast OK" looked at column refs but didn't account for
- * aggregation subexpressions that collapse column refs into scalars.
- * `(+ 1 (sum p))` references p but (sum p) reduces it to a scalar,
- * so the overall result is 1-wide and must broadcast. */
+/* ---- Test: agg sub-calls inside non-agg expressions are per-group ----
+ * Standard SQL/k semantic: aggregates inside a projection of a
+ * GROUP BY query reduce within each group, not globally.
+ * `(+ 1 (sum p))` therefore yields (1 + sum-of-this-group's-p).
+ * Previously this expression broadcast a globally-reduced scalar to
+ * every cell because the classifier's full-table eval collapsed the
+ * inner agg before scatter could route per group. */
 static test_result_t test_eval_select_by_nonagg_with_agg_subexpr(void) {
     ray_t* result = ray_eval_str(
         "(do (set t (table ['s 'p] "
@@ -1920,12 +1921,13 @@ static test_result_t test_eval_select_by_nonagg_with_agg_subexpr(void) {
     int64_t m_id = ray_sym_intern("m", 1);
     ray_t* m_col = ray_table_get_col(result, m_id);
     TEST_ASSERT_NOT_NULL(m_col);
-    TEST_ASSERT_EQ_I(m_col->type, RAY_LIST);
-    ray_t** mi = (ray_t**)ray_data(m_col);
-    /* Full-table sum of p is 210; (+ 1 210) = 211.  Broadcast into
-     * every group cell — NOT gathered or errored. */
-    TEST_ASSERT((mi[0]->f64) == (211.0), "double == failed");
-    TEST_ASSERT((mi[1]->f64) == (211.0), "double == failed");
+    /* Group A: p=[10,30,50], sum=90, (+ 1 90)=91.
+     * Group B: p=[20,40,60], sum=120, (+ 1 120)=121.
+     * The kernel collapses homogeneous F64 cells to a typed F64 vec. */
+    TEST_ASSERT_EQ_I(m_col->type, RAY_F64);
+    double* mi = (double*)ray_data(m_col);
+    TEST_ASSERT(mi[0] == 91.0, "group A: (+ 1 sum(p))");
+    TEST_ASSERT(mi[1] == 121.0, "group B: (+ 1 sum(p))");
     ray_release(result);
     PASS();
 }

@@ -41,11 +41,24 @@
 ;; Multi-key, multiple aggs in one query.
 (count (select {m: (med v3) sd: (stddev v3) by: [id4 id5] from: Tq6})) -- 4
 
-;; ─── q7: arith-of-aggregates per-group (multi-key shape) ───────────
+;; ─── q7: arith-of-aggregates per-group ────────────────────────────
 ;;
-;; Single-key (- (max v1) (min v2)) by id3 still broadcasts global —
-;; tracked as a follow-up.  Multi-key shape now routes through
-;; eval-level group and computes per-group correctly.
+;; (- (max v1) (min v2)) inside a `by:` projection must reduce each
+;; nested aggregate within its group, not globally.  Previously the
+;; post-DAG scatter ran one full-table eval (collapsing max/min to a
+;; scalar) and broadcast 55 to every group; now the dispatcher
+;; recognises "non-agg expression containing aggregates" and routes
+;; through nonagg_eval_per_group_buf.
+
+;; Single-key q7 — the canonical polars shape.
+(set Tq7s (table [id3 v1 v2] (list [A A B B C C] [10 20 30 40 50 60] [5 15 25 35 45 55])))
+(count (select {r: (- (max v1) (min v2)) by: id3 from: Tq7s})) -- 3
+;; (A) max=20 min=5  → 15
+;; (B) max=40 min=25 → 15
+;; (C) max=60 min=45 → 15
+(sum (at (select {r: (- (max v1) (min v2)) by: id3 from: Tq7s}) 'r)) -- 45
+
+;; Multi-key shape (eval-level path).
 (set Tq7 (table [id3 id5 v1 v2] (list [A A B B C C] [X Y X Y X Y] [10 20 30 40 50 60] [5 15 25 35 45 55])))
 
 ;; 6 distinct (id3,id5) pairs — each has 1 row, so max(v1) - min(v2)
