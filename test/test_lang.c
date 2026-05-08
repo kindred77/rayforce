@@ -2192,14 +2192,26 @@ static test_result_t test_eval_select_by_vec_str_key(void) {
     PASS();
 }
 
-/* ---- Test: multi-key by + non-agg returns nyi error ---- */
-static test_result_t test_eval_select_by_multi_nonagg_nyi(void) {
+/* ---- Test: multi-key by + non-agg routes through eval-level group ---- */
+static test_result_t test_eval_select_by_multi_nonagg(void) {
+    /* Was previously asserted to error with "nyi: non-agg expression
+     * with multi-key or computed group key".  Now routes through the
+     * eval-level multi-key path and produces a per-group LIST column
+     * for the non-agg expression. */
     ray_t* result = ray_eval_str(
         "(do (set t (table ['a 'b 'p] "
         "(list [X X Y] [1 2 1] [10.0 20.0 30.0]))) "
         "(select {from: t by: [a b] m: (+ p p)}))");
     TEST_ASSERT_NOT_NULL(result);
-    TEST_ASSERT_TRUE(RAY_IS_ERR(result));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
+    /* (X,1), (X,2), (Y,1) — three distinct (a,b) groups. */
+    TEST_ASSERT_EQ_I(ray_table_nrows(result), 3);
+    int64_t m_id = ray_sym_intern("m", 1);
+    ray_t* m_col = ray_table_get_col(result, m_id);
+    TEST_ASSERT_NOT_NULL(m_col);
+    /* Each group has 1 row (each (a,b) pair is unique here), so each
+     * cell holds a 1-element list with 2*p[i]. */
     ray_release(result);
     PASS();
 }
@@ -6661,7 +6673,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/select_by_take_clamps", test_eval_select_by_take_clamps, lang_setup, lang_teardown },
     { "lang/eval/select_by_vec_bool_order", test_eval_select_by_vec_bool_order, lang_setup, lang_teardown },
     { "lang/eval/select_by_vec_str_key", test_eval_select_by_vec_str_key, lang_setup, lang_teardown },
-    { "lang/eval/select_by_multi_nonagg_nyi", test_eval_select_by_multi_nonagg_nyi, lang_setup, lang_teardown },
+    { "lang/eval/select_by_multi_nonagg", test_eval_select_by_multi_nonagg, lang_setup, lang_teardown },
     { "lang/eval/update", test_eval_update, lang_setup, lang_teardown },
     { "lang/eval/update_no_where", test_eval_update_no_where, lang_setup, lang_teardown },
     { "lang/eval/update_str_masked", test_eval_update_str_masked, lang_setup, lang_teardown },
