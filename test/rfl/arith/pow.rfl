@@ -1,0 +1,74 @@
+;; Invariants for `pow` — binary atomic, returns f64.
+
+;; ─── concrete atoms ─────────────────────────────────────────────────
+(pow 2 3) -- 8.0
+(pow 5 2) -- 25.0
+(pow 2 0) -- 1.0
+(pow 0 5) -- 0.0
+(pow 1 1000000) -- 1.0
+(pow 10 -1) -- 0.1
+
+;; ─── float base / exponent ─────────────────────────────────────────
+(pow 4.0 0.5) -- 2.0
+(pow 2.0 -2) -- 0.25
+(pow 9.0 0.5) -- 3.0
+
+;; result is always F64 even when both operands are integer atoms
+(type (pow 2 3)) -- 'f64
+(type (pow 2.0 3)) -- 'f64
+(type (pow 2 3.0)) -- 'f64
+
+;; ─── algebraic identities ──────────────────────────────────────────
+;; x^0 == 1 for any x
+(pow 7 0) -- 1.0
+(pow -3 0) -- 1.0
+(pow 0.5 0) -- 1.0
+;; x^1 == x
+(pow 42 1) -- 42.0
+(pow -5 1) -- -5.0
+;; (pow x 2) == (* x x)  for finite x
+(== (pow 6 2) (* 6.0 6.0)) -- true
+(== (pow 7.5 2) (* 7.5 7.5)) -- true
+
+;; ─── nulls propagate to F64 null ───────────────────────────────────
+(nil? (pow 0Nl 2)) -- true
+(nil? (pow 2 0Nl)) -- true
+(nil? (pow 0Nf 2.0)) -- true
+(type (pow 0Nl 2)) -- 'f64
+
+;; ─── atomic broadcast over a vector — left ─────────────────────────
+;; (pow [1 2 3 4] 2) → [1.0 4.0 9.0 16.0]
+(at (pow [1 2 3 4] 2) 0) -- 1.0
+(at (pow [1 2 3 4] 2) 1) -- 4.0
+(at (pow [1 2 3 4] 2) 2) -- 9.0
+(at (pow [1 2 3 4] 2) 3) -- 16.0
+
+;; ─── atomic broadcast over a vector — right ────────────────────────
+;; (pow 2 [0 1 2 3]) → [1.0 2.0 4.0 8.0]
+(at (pow 2 [0 1 2 3]) 0) -- 1.0
+(at (pow 2 [0 1 2 3]) 1) -- 2.0
+(at (pow 2 [0 1 2 3]) 2) -- 4.0
+(at (pow 2 [0 1 2 3]) 3) -- 8.0
+
+;; ─── element-wise vector × vector ──────────────────────────────────
+;; (pow [2 3 4] [3 2 1]) → [8.0 9.0 4.0]
+(at (pow [2 3 4] [3 2 1]) 0) -- 8.0
+(at (pow [2 3 4] [3 2 1]) 1) -- 9.0
+(at (pow [2 3 4] [3 2 1]) 2) -- 4.0
+
+;; ─── round-trip: (pow (pow x 2) 0.5) ≈ |x|  for finite x ≥ 0 ──────
+(set A (as 'F64 (+ 1 (til 50))))
+(count A) -- (sum (< (abs (- (pow (pow A 2) 0.5) A)) 0.001))
+
+;; ─── usage with column expressions inside select ──────────────────
+;; Per-row pow inside a select projection (covers DAG vec atomic
+;; broadcast through the eval-level path).
+(set Tp (table [v] (list [1.0 2.0 3.0 4.0])))
+(at (at (select {sq: (pow v 2) from: Tp}) 'sq) 0) -- 1.0
+(at (at (select {sq: (pow v 2) from: Tp}) 'sq) 3) -- 16.0
+
+;; ─── type errors ───────────────────────────────────────────────────
+;; non-numeric base
+(pow "a" 2)  !- type
+;; non-numeric exponent
+(pow 2 "x")  !- type
