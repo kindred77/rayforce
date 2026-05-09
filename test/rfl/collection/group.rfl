@@ -146,3 +146,22 @@
 (set t (table [Category Amount] (list (list "cat1" "cat2" "cat3" "cat1" "cat2" "cat3" "cat1" "cat2") [10 20 30 40 50 60 70 80])))(select {from: t Sum: (sum Amount) by: Category}) -- (table [Category Sum] (list (list "cat1" "cat2" "cat3") [120 150 90]))
 ;; Update with group by string
 (set t (table [Type Value] (list (list "A" "B" "A" "B") [10 20 30 40])))(update {from: 't TypeSum: (sum Value) by: Type})t -- (table [Type Value TypeSum] (list (list "A" "B" "A" "B") [10 20 30 40] [40 60 40 60]))
+;; ========== GROUP LIST PATH — HIGH CARDINALITY ==========
+;; The LIST path (heterogeneous atom-pointer keys, atom_eq compare)
+;; historically capped unique groups at the initial 1024-slot kblock
+;; with no resizing — once `ngroups >= max_groups` it returned
+;; `error: limit`.  Multi-key non-agg `select-by` builds a composite
+;; LIST of LISTs and routes through this path; on H2O K=100 datasets
+;; the cartesian product of two 100-cardinality keys reaches up to
+;; 10k groups, so the cap fires on real workloads.  Verify that
+;; >1024 unique LIST keys group correctly.
+(set Klst (map (fn [i] (list i i)) (til 2000)))
+(count (key (group Klst))) -- 2000
+(count (value (group Klst))) -- 2000
+;; Every key is unique → every bucket size is 1, total rows = N.
+(sum (map count (value (group Klst)))) -- 2000
+;; And the analogous shape-failure for `select` with multi-key non-agg
+;; on a 1500-row table whose (k1, k2) pairs are all unique.  Pre-fix:
+;; `error: limit`.  Post-fix: 1500 distinct groups, one row each.
+(set Tmk (table [k1 k2 v] (list (til 1500) (til 1500) (til 1500))))
+(count (select {from: Tmk r: (* v 2) by: {k1: k1 k2: k2}})) -- 1500
