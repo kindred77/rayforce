@@ -25,6 +25,8 @@
 #include <rayforce.h>
 #include <rayforce.h>
 #include "mem/heap.h"
+#include "lang/internal.h"   /* atom_eq */
+#include "table/sym.h"
 #include <stdatomic.h>
 #include <string.h>
 
@@ -292,6 +294,168 @@ static test_result_t test_is_atom(void) {
     PASS();
 }
 
+/* ---- atom_eq RAY_LIST structural compare -------------------------------
+ *
+ * atom_eq for RAY_LIST previously fell through to the default branch's
+ * memcmp on the element pointer array, comparing pointer identity
+ * instead of structural equality.  Two structurally-identical lists
+ * with different element pointers (the common case after construction)
+ * compared not-equal, breaking ray_group_fn / ray_dict / distinct
+ * fallback for any code that built composite-list keys (e.g. multi-key
+ * group-by via the eval-level path).
+ * --------------------------------------------------------------------- */
+
+/* Helper: build a list of the given i64 atoms.  Caller releases. */
+static ray_t* mk_i64_list(const int64_t* vals, int64_t n) {
+    ray_t* l = ray_list_new(n);
+    for (int64_t i = 0; i < n; i++) {
+        ray_t* a = ray_i64(vals[i]);
+        l = ray_list_append(l, a);
+        ray_release(a);
+    }
+    return l;
+}
+
+static test_result_t test_atom_eq_list_basic(void) {
+    int64_t va[] = {1, 2}, vb[] = {1, 2}, vc[] = {3, 4}, vd[] = {1, 2, 3};
+    ray_t* a = mk_i64_list(va, 2);
+    ray_t* b = mk_i64_list(vb, 2);
+    ray_t* c = mk_i64_list(vc, 2);
+    ray_t* d = mk_i64_list(vd, 3);
+
+    /* Same shape, same values, different pointers — must compare equal. */
+    TEST_ASSERT_TRUE(atom_eq(a, b));
+    /* Same shape, different values — not equal. */
+    TEST_ASSERT_FALSE(atom_eq(a, c));
+    /* Same prefix, different lengths — not equal. */
+    TEST_ASSERT_FALSE(atom_eq(a, d));
+    /* Reflexive. */
+    TEST_ASSERT_TRUE(atom_eq(a, a));
+
+    ray_release(a); ray_release(b); ray_release(c); ray_release(d);
+    PASS();
+}
+
+static test_result_t test_atom_eq_list_mixed_types(void) {
+    /* Lists holding heterogeneous atom types — recursive compare must
+     * dispatch on each element's own type. */
+    ray_t* a = ray_list_new(3);
+    a = ray_list_append(a, ray_i64(7));
+    a = ray_list_append(a, ray_f64(3.14));
+    a = ray_list_append(a, ray_str("hi", 2));
+
+    ray_t* b = ray_list_new(3);
+    b = ray_list_append(b, ray_i64(7));
+    b = ray_list_append(b, ray_f64(3.14));
+    b = ray_list_append(b, ray_str("hi", 2));
+
+    ray_t* c = ray_list_new(3);
+    c = ray_list_append(c, ray_i64(7));
+    c = ray_list_append(c, ray_f64(3.14));
+    c = ray_list_append(c, ray_str("HI", 2));
+
+    TEST_ASSERT_TRUE(atom_eq(a, b));
+    TEST_ASSERT_FALSE(atom_eq(a, c));   /* differs only in str case */
+
+    /* Releasing each list also releases the appended atoms. */
+    ray_release(a); ray_release(b); ray_release(c);
+    PASS();
+}
+
+static test_result_t test_atom_eq_list_nested(void) {
+    /* (list (list 1) (list 2 3)) vs (list (list 1) (list 2 3)) — must
+     * recurse through the outer LIST into each inner LIST. */
+    int64_t in1[] = {1};
+    int64_t in23[] = {2, 3};
+    int64_t in24[] = {2, 4};
+    ray_t* inner_a1 = mk_i64_list(in1,  1);
+    ray_t* inner_a2 = mk_i64_list(in23, 2);
+    ray_t* inner_b1 = mk_i64_list(in1,  1);
+    ray_t* inner_b2 = mk_i64_list(in23, 2);
+    ray_t* inner_c2 = mk_i64_list(in24, 2);
+
+    ray_t* a = ray_list_new(2);
+    a = ray_list_append(a, inner_a1);
+    a = ray_list_append(a, inner_a2);
+
+    ray_t* b = ray_list_new(2);
+    b = ray_list_append(b, inner_b1);
+    b = ray_list_append(b, inner_b2);
+
+    ray_t* c = ray_list_new(2);
+    c = ray_list_append(c, inner_a1);
+    c = ray_list_append(c, inner_c2);
+
+    TEST_ASSERT_TRUE(atom_eq(a, b));
+    TEST_ASSERT_FALSE(atom_eq(a, c));
+
+    ray_release(inner_a1); ray_release(inner_a2);
+    ray_release(inner_b1); ray_release(inner_b2);
+    ray_release(inner_c2);
+    ray_release(a); ray_release(b); ray_release(c);
+    PASS();
+}
+
+static test_result_t test_atom_eq_list_with_nulls(void) {
+    /* atom_eq's null short-circuit must apply per element when the
+     * element is itself a null atom (typed null SYM, etc.). */
+    ray_t* a = ray_list_new(2);
+    a = ray_list_append(a, ray_i64(1));
+    a = ray_list_append(a, ray_typed_null(-RAY_I64));
+
+    ray_t* b = ray_list_new(2);
+    b = ray_list_append(b, ray_i64(1));
+    b = ray_list_append(b, ray_typed_null(-RAY_I64));
+
+    ray_t* c = ray_list_new(2);
+    c = ray_list_append(c, ray_i64(1));
+    c = ray_list_append(c, ray_i64(0));      /* 0 is NOT null */
+
+    TEST_ASSERT_TRUE(atom_eq(a, b));
+    TEST_ASSERT_FALSE(atom_eq(a, c));
+
+    ray_release(a); ray_release(b); ray_release(c);
+    PASS();
+}
+
+static test_result_t test_atom_eq_list_empty(void) {
+    /* Two empty lists are equal regardless of identity. */
+    ray_t* a = ray_list_new(0);
+    ray_t* b = ray_list_new(0);
+    TEST_ASSERT_TRUE(atom_eq(a, b));
+    ray_release(a); ray_release(b);
+    PASS();
+}
+
+static test_result_t test_atom_eq_list_sym_atoms(void) {
+    /* Composite group-by keys land here: each row's key is a fresh list
+     * containing fresh sym atoms with the same interned id.  This was
+     * exactly the q6 multi-key bug — different pointers, same id, must
+     * compare equal. */
+    ray_sym_init();
+    int64_t s_a = ray_sym_intern("A", 1);
+    int64_t s_b = ray_sym_intern("B", 1);
+
+    ray_t* row1 = ray_list_new(2);
+    row1 = ray_list_append(row1, ray_sym(s_a));
+    row1 = ray_list_append(row1, ray_sym(s_b));
+
+    ray_t* row2 = ray_list_new(2);
+    row2 = ray_list_append(row2, ray_sym(s_a));
+    row2 = ray_list_append(row2, ray_sym(s_b));
+
+    ray_t* row3 = ray_list_new(2);
+    row3 = ray_list_append(row3, ray_sym(s_b));
+    row3 = ray_list_append(row3, ray_sym(s_a));   /* swapped */
+
+    TEST_ASSERT_TRUE(atom_eq(row1, row2));
+    TEST_ASSERT_FALSE(atom_eq(row1, row3));
+
+    ray_release(row1); ray_release(row2); ray_release(row3);
+    ray_sym_destroy();
+    PASS();
+}
+
 /* ---- Suite definition -------------------------------------------------- */
 
 const test_entry_t atom_entries[] = {
@@ -310,6 +474,12 @@ const test_entry_t atom_entries[] = {
     { "atom/timestamp", test_atom_timestamp, atom_setup, atom_teardown },
     { "atom/guid", test_atom_guid, atom_setup, atom_teardown },
     { "atom/is_atom", test_is_atom, atom_setup, atom_teardown },
+    { "atom/eq_list_basic",       test_atom_eq_list_basic,       atom_setup, atom_teardown },
+    { "atom/eq_list_mixed_types", test_atom_eq_list_mixed_types, atom_setup, atom_teardown },
+    { "atom/eq_list_nested",      test_atom_eq_list_nested,      atom_setup, atom_teardown },
+    { "atom/eq_list_with_nulls",  test_atom_eq_list_with_nulls,  atom_setup, atom_teardown },
+    { "atom/eq_list_empty",       test_atom_eq_list_empty,       atom_setup, atom_teardown },
+    { "atom/eq_list_sym_atoms",   test_atom_eq_list_sym_atoms,   atom_setup, atom_teardown },
     { NULL, NULL, NULL, NULL },
 };
 

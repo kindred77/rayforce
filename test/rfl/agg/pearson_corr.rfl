@@ -1,0 +1,72 @@
+;; Invariants for `pearson_corr` — Pearson correlation coefficient
+;; between two numeric vectors of equal length.  Single-pass
+;; formulation; nulls in either vector skip the row from BOTH sums
+;; (pairwise complete-case deletion).
+
+;; ─── perfect correlation cases ─────────────────────────────────────
+;; y = 2x + 0  → r = 1.0
+(pearson_corr [1.0 2.0 3.0 4.0 5.0] [2.0 4.0 6.0 8.0 10.0]) -- 1.0
+;; y = -x + 6  → r = -1.0
+(pearson_corr [1.0 2.0 3.0 4.0 5.0] [5.0 4.0 3.0 2.0 1.0]) -- -1.0
+;; y = x + 7   → r = 1.0 (translation doesn't change correlation)
+(pearson_corr [1.0 2.0 3.0 4.0] [8.0 9.0 10.0 11.0]) -- 1.0
+
+;; ─── return type is F64 ────────────────────────────────────────────
+(type (pearson_corr [1 2 3] [3 2 1])) -- 'f64
+
+;; ─── narrow integer types coerce to F64 sums ─────────────────────
+(pearson_corr (as 'I32 [1 2 3 4 5]) (as 'I32 [2 4 6 8 10])) -- 1.0
+(pearson_corr (as 'I16 [1 2 3 4 5]) (as 'I16 [5 4 3 2 1])) -- -1.0
+(pearson_corr (as 'U8  [1 2 3 4]) (as 'U8 [4 3 2 1])) -- -1.0
+
+;; ─── undefined cases → NaN ────────────────────────────────────────
+;; n < 2 → NaN (single-row variance undefined).
+(!= (pearson_corr [1.0] [2.0]) (pearson_corr [1.0] [2.0])) -- true
+;; Constant left column → variance 0 → NaN.
+(set Rc1 (pearson_corr [1.0 1.0 1.0] [2.0 4.0 6.0]))
+(!= Rc1 Rc1) -- true
+;; Constant right column → variance 0 → NaN.
+(set Rc2 (pearson_corr [1.0 2.0 3.0] [5.0 5.0 5.0]))
+(!= Rc2 Rc2) -- true
+
+;; ─── algebraic invariants ─────────────────────────────────────────
+;; Symmetry: r(x,y) == r(y,x).
+(set Rs1 (pearson_corr [1.0 2.0 3.0 4.5 7.0] [2.0 3.5 5.0 6.0 9.0]))
+(set Rs2 (pearson_corr [2.0 3.5 5.0 6.0 9.0] [1.0 2.0 3.0 4.5 7.0]))
+(== Rs1 Rs2) -- true
+;; Self-correlation == 1.0 for any non-constant vector.
+(pearson_corr [1.0 2.0 3.0 4.0 5.0] [1.0 2.0 3.0 4.0 5.0]) -- 1.0
+;; Bounded in [-1, 1].
+(set V1 [3.0 1.0 4.0 1.0 5.0 9.0 2.0 6.0])
+(set V2 [2.0 7.0 1.0 8.0 2.0 8.0 1.0 8.0])
+(<= (abs (pearson_corr V1 V2)) 1.0) -- true
+
+;; ─── error paths ──────────────────────────────────────────────────
+;; Different lengths → length error.
+(pearson_corr [1.0 2.0 3.0] [4.0 5.0])  !- length
+;; Non-vector args → type error.
+(pearson_corr 1.0 2.0)                  !- type
+;; Non-numeric vectors → type error.
+(pearson_corr ["a" "b"] [1 2])          !- type
+
+;; ─── q9 canonical: pearson² per group (regression metric) ─────────
+;;
+;; Polars canonical:
+;;   df.groupby(["id2","id4"]).agg((pl.pearson_corr("v1","v2")**2).alias("r2"))
+;; Engine equivalent: routes through eval-level scatter for the
+;; per-group computation (the planner sees a non-agg expression with
+;; column refs that collapses to a scalar; the non-row-aligned
+;; fallback re-runs per group).
+(set Tq9 (table [g x y] (list [A A A A A B B B B B] [1.0 2.0 3.0 4.0 5.0 1.0 2.0 3.0 4.0 5.0] [2.0 4.0 6.0 8.0 10.0 5.0 4.0 3.0 2.0 1.0])))
+;; Group A: y = 2x → r = 1.0,  r² = 1.0
+;; Group B: y = 6-x → r = -1.0, r² = 1.0
+(at (at (select {r2: (pow (pearson_corr x y) 2) by: g from: Tq9}) 'r2) 0) -- 1.0
+(at (at (select {r2: (pow (pearson_corr x y) 2) by: g from: Tq9}) 'r2) 1) -- 1.0
+
+;; Multi-key q9 — by [id2 id4].
+(set Tq9b (table [id2 id4 v1 v2] (list [P P Q Q] [X Y X Y] [1.0 2.0 3.0 4.0] [2.0 4.0 9.0 8.0])))
+;; Each group has 2 elements → r is well-defined.  We don't pin
+;; specific r values across all 4 groups (single-row groups collapse
+;; to NaN since variance is zero with only 2 colinear points), just
+;; confirm that the kernel runs end-to-end through the multi-key path.
+(count (select {r: (pearson_corr v1 v2) by: [id2 id4] from: Tq9b})) -- 4

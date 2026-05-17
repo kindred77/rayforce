@@ -1,0 +1,73 @@
+;; Invariants for `top` / `bot` — partial top-N / bottom-N over a
+;; numeric vector.  O(N log K) bounded-heap fast path via the same
+;; topk infrastructure that powers `(select … sort take)` fusion;
+;; falls back to full sort for STR / GUID / SYM / LIST inputs.
+
+;; ─── basics ────────────────────────────────────────────────────────
+(top [3 1 5 2 7 4 9 6 8] 3) -- [9 8 7]
+(bot [3 1 5 2 7 4 9 6 8] 3) -- [1 2 3]
+(top [3 1 5 2 7 4 9 6 8] 1) -- [9]
+(bot [3 1 5 2 7 4 9 6 8] 1) -- [1]
+
+;; F64
+(top [1.5 2.5 0.5 3.5] 2) -- [3.5 2.5]
+(bot [1.5 2.5 0.5 3.5] 2) -- [0.5 1.5]
+
+;; Negative values (signed sort).
+(top [-5 -1 -3 -2 -4] 2) -- [-1 -2]
+(bot [-5 -1 -3 -2 -4] 2) -- [-5 -4]
+
+;; ─── narrow types ──────────────────────────────────────────────────
+(top (as 'I32 [3 1 4 1 5 9 2 6]) 3) -- (as 'I32 [9 6 5])
+(top (as 'I16 [3 1 4 1 5 9 2 6]) 3) -- (as 'I16 [9 6 5])
+(top (as 'U8  [3 1 4 1 5 9 2 6]) 3) -- (as 'U8  [9 6 5])
+
+;; Output type matches input type.
+(type (top [1 2 3] 2)) -- 'I64
+(type (top (as 'F64 [1 2 3]) 2)) -- 'F64
+(type (top (as 'I32 [1 2 3]) 2)) -- 'I32
+
+;; ─── n bounds ──────────────────────────────────────────────────────
+;; n == 0 → empty vec, same type as input.
+(count (top [3 1 5] 0)) -- 0
+(type (top (as 'F64 [1 2 3]) 0)) -- 'F64
+;; n < 0 → empty (clamped to 0).
+(count (top [3 1 5] -3)) -- 0
+;; n > len → returns full sorted view (desc for top, asc for bot).
+(top [3 1 5] 10) -- [5 3 1]
+(bot [3 1 5] 10) -- [1 3 5]
+;; n == len → identical to full sort.
+(top [3 1 5] 3) -- [5 3 1]
+(bot [3 1 5] 3) -- [1 3 5]
+
+;; ─── algebraic identities ──────────────────────────────────────────
+;; (top v 1) == (max v) wrapped as 1-element vec.
+(at (top [3 1 5 2 7 4 9 6 8] 1) 0) -- (max [3 1 5 2 7 4 9 6 8])
+;; (bot v 1) == (min v).
+(at (bot [3 1 5 2 7 4 9 6 8] 1) 0) -- (min [3 1 5 2 7 4 9 6 8])
+;; (top v len) reverses (asc v).
+(set V [3 1 5 2 7 4 9 6 8])
+(top V (count V)) -- (desc V)
+(bot V (count V)) -- (asc V)
+
+;; (top v k) returns the k largest in descending order — the prefix
+;; of (desc v).
+(set Vbig (rand 256 1000))
+(top Vbig 5) -- (take (desc Vbig) 5)
+(bot Vbig 5) -- (take (asc  Vbig) 5)
+
+;; ─── per-group inside select ───────────────────────────────────────
+;; Closes q8: top-N per group via the eval-level scatter.
+(set Tg (table [g v] (list [A A A B B C C C C] [3 1 5 2 7 4 9 6 8])))
+;; Group A → top 2 = [5 3]; B → [7 2]; C → [9 8].
+(at (at (select {top2: (top v 2) by: g from: Tg}) 'top2) 0) -- [5 3]
+(at (at (select {top2: (top v 2) by: g from: Tg}) 'top2) 1) -- [7 2]
+(at (at (select {top2: (top v 2) by: g from: Tg}) 'top2) 2) -- [9 8]
+
+;; Multi-key per-group bot.
+(set Tg2 (table [g h v] (list [A A A B B B] [X Y X X Y Y] [1 2 3 4 5 6])))
+(count (select {b1: (bot v 1) by: [g h] from: Tg2})) -- 4
+
+;; ─── type errors ───────────────────────────────────────────────────
+(top [1 2 3] "x")  !- type
+(bot 5 2)          !- type

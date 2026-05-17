@@ -1,0 +1,128 @@
+;; Canonical H2O groupby query coverage.
+;;
+;; H2O canonical (h2oai/db-benchmark) groupby suite covers q1..q10.
+;; This file pins regression tests for the engine-level shapes that
+;; previously failed:
+;;
+;;   q6: median + multi-key by         — was nyi error
+;;   q7: arith-of-aggregates by group  — was global broadcast
+;;   q8: per-group top-N (head N)      — composes from existing prims
+;;
+;; q9 (pearson_corr) needs a new aggregate; tracked separately.
+
+;; ─── q6: median + multi-key group-by ───────────────────────────────
+;;
+;; Previously: error "nyi: non-agg expression with multi-key or
+;; computed group key".  Root cause was twofold —
+;;   (a) atom_eq on RAY_LIST did identity (memcmp on pointers) instead
+;;       of structural compare, so composite-list keys never matched;
+;;   (b) the planner had a guard rejecting multi-key non-agg expressions
+;;       outright instead of routing them through eval-level group.
+(set Tq6 (table [id4 id5 v3] (list [A A B B B A] [X Y X Y X Y] [10.0 20.0 30.0 40.0 50.0 60.0])))
+
+;; Single-key median — DAG fast path (existed before, still works).
+(count (select {m: (med v3) by: id4 from: Tq6})) -- 2
+
+;; Multi-key median — q6.  4 distinct (id4,id5) pairs.
+(count (select {m: (med v3) by: [id4 id5] from: Tq6})) -- 4
+
+;; Spot-check the actual medians:
+;;   (A,X) → [10]      → 10
+;;   (A,Y) → [20, 60]  → 40
+;;   (B,X) → [30, 50]  → 40
+;;   (B,Y) → [40]      → 40
+(sum (at (select {m: (med v3) by: [id4 id5] from: Tq6}) 'm)) -- 130.0
+
+;; ─── q6 with stat aggs that exist in engine ────────────────────────
+;; Engine has: stddev / var / dev — exposed under those names.
+(count (select {sd: (stddev v3) by: [id4 id5] from: Tq6})) -- 4
+(count (select {vr: (var    v3) by: [id4 id5] from: Tq6})) -- 4
+
+;; Multi-key, multiple aggs in one query.
+(count (select {m: (med v3) sd: (stddev v3) by: [id4 id5] from: Tq6})) -- 4
+
+;; ─── q7: arith-of-aggregates per-group ────────────────────────────
+;;
+;; (- (max v1) (min v2)) inside a `by:` projection must reduce each
+;; nested aggregate within its group, not globally.  Previously the
+;; post-DAG scatter ran one full-table eval (collapsing max/min to a
+;; scalar) and broadcast 55 to every group; now the dispatcher
+;; recognises "non-agg expression containing aggregates" and routes
+;; through nonagg_eval_per_group_buf.
+
+;; Single-key q7 — the canonical polars shape.
+(set Tq7s (table [id3 v1 v2] (list [A A B B C C] [10 20 30 40 50 60] [5 15 25 35 45 55])))
+(count (select {r: (- (max v1) (min v2)) by: id3 from: Tq7s})) -- 3
+;; (A) max=20 min=5  → 15
+;; (B) max=40 min=25 → 15
+;; (C) max=60 min=45 → 15
+(sum (at (select {r: (- (max v1) (min v2)) by: id3 from: Tq7s}) 'r)) -- 45
+
+;; Multi-key shape (eval-level path).
+(set Tq7 (table [id3 id5 v1 v2] (list [A A B B C C] [X Y X Y X Y] [10 20 30 40 50 60] [5 15 25 35 45 55])))
+
+;; 6 distinct (id3,id5) pairs — each has 1 row, so max(v1) - min(v2)
+;; = v1 - v2 = 5 per row.
+(count (select {r: (- (max v1) (min v2)) by: [id3 id5] from: Tq7})) -- 6
+(sum (at (select {r: (- (max v1) (min v2)) by: [id3 id5] from: Tq7}) 'r)) -- 30
+
+;; Genuinely multi-row groups: 2-key by-clause forces eval-multi-key
+;; path.  (Single-key list-of-1 still routes to the DAG fast scatter
+;; whose arith-of-aggregates remains broken — tracked as q7-followup.)
+(set Tq7b (table [g h v1 v2] (list [0 0 0 0 1 1 1 1] [X Y X Y X Y X Y] [10 20 30 40 50 60 70 80] [1 2 3 4 5 6 7 8])))
+;; (0,X) v1=[10,30] max=30; v2=[1,3] min=1 → 29.
+;; (0,Y) v1=[20,40] max=40; v2=[2,4] min=2 → 38.
+;; (1,X) v1=[50,70] max=70; v2=[5,7] min=5 → 65.
+;; (1,Y) v1=[60,80] max=80; v2=[6,8] min=6 → 74.
+;; sum = 29+38+65+74 = 206
+(count (select {r: (- (max v1) (min v2)) by: [g h] from: Tq7b})) -- 4
+(sum   (at (select {r: (- (max v1) (min v2)) by: [g h] from: Tq7b}) 'r)) -- 206
+
+;; ─── q8: per-group top-N via existing primitives ──────────────────
+;;
+;; Polars canonical:
+;;   df.sort("v3", reverse=True).groupby("id6").agg(Col("v3").head(2))
+;; Engine equivalent — express as nonagg:
+;;   (select {top2: (take (desc v3) 2) by: id6 from: t})
+(set Tq8 (table [id6 v3] (list [A A A B B C C C C] [3 1 5 2 7 4 9 6 8])))
+;; Per group descending top-2:
+;;   A → [5 3]
+;;   B → [7 2]
+;;   C → [9 8]
+(count (select {top2: (take (desc v3) 2) by: id6 from: Tq8})) -- 3
+
+;; Multi-key q8 — top-1 per (g,h).
+(set Tq8b (table [g h v] (list [A A A B B B] [X Y X X Y Y] [1 2 3 4 5 6])))
+;; (A,X) max = 3, (A,Y) max = 2, (B,X) max = 4, (B,Y) max = 6
+(count (select {top: (take (desc v) 1) by: [g h] from: Tq8b})) -- 4
+
+;; ─── q8 native: (top col K) / (bot col K) aggregators ──────────────
+;;
+;; The OP_TOP_N / OP_BOT_N DAG-route — same canonical Tq8 as above
+;; but using the native bounded-heap aggregator instead of the
+;; (take (desc v) K) composition.  Result is a LIST<vec> per group.
+;;   A → [5 3] (top-2 of {3,1,5}), B → [7 2], C → [9 8]
+(count (select {top2: (top v3 2) by: id6 from: Tq8})) -- 3
+;; sum of (count of each list) == total kept across groups
+;;   A: min(3,2)=2, B: min(2,2)=2, C: min(4,2)=2 → 6
+(sum (map count (at (select {top2: (top v3 2) by: id6 from: Tq8}) 'top2))) -- 6
+;; Symmetric for bot: A→[1 3], B→[2 7], C→[4 6]
+(count (select {bot2: (bot v3 2) by: id6 from: Tq8})) -- 3
+;; F64 source preserves cell type: each cell is a vec of doubles
+(set Tq8f (table [id v] (list [A A A B B C C C C] [3.0 1.0 5.0 2.0 7.0 4.0 9.0 6.0 8.0])))
+(type (at (at (select {t: (top v 2) by: id from: Tq8f}) 't) 0)) -- 'F64
+;; K > grp_cnt → cell shorter than K (matches standalone topk_take_vec)
+;; Tq8 group B has 2 rows {2,7}; K=3 → cell length 2
+(count (at (at (select {t: (top v3 3) by: id6 from: Tq8}) 't) 1)) -- 2
+;; K=1 → 1-element cell, equivalent to (max v3) wrapped in a vec
+(at (at (select {t: (top v3 1) by: id6 from: Tq8}) 't) 0) -- [5]
+
+;; ─── Composite-key correctness regression for the atom_eq fix ─────
+;;
+;; The exact shape that exposed the atom_eq RAY_LIST bug — confirms
+;; that ray_group_fn now collapses structurally-equal LIST keys.
+(count (group (list (list 1 2) (list 1 2) (list 3 4)))) -- 2
+;; Three distinct compositions when truly distinct:
+(count (group (list (list 1 2) (list 2 1) (list 1 2)))) -- 2
+;; All-same-value composite keys → single bucket.
+(count (group (list (list 'a 'b) (list 'a 'b) (list 'a 'b)))) -- 1
