@@ -472,12 +472,67 @@ static test_result_t test_atom_typed_null_f64(void) {
 }
 
 static test_result_t test_atom_typed_null_i64(void) {
-    /* Phase 2 control: non-F64 typed nulls still use i64 = 0 + bitmap bit. */
+    /* Phase 3a: integer typed nulls now use INT_MIN sentinel + bitmap bit. */
     ray_t* v = ray_typed_null(-RAY_I64);
     TEST_ASSERT_NOT_NULL(v);
     TEST_ASSERT_FALSE(RAY_IS_ERR(v));
     TEST_ASSERT_EQ_I(v->type, -RAY_I64);
-    TEST_ASSERT_EQ_I(v->i64, 0);
+    TEST_ASSERT_EQ_I(v->i64, NULL_I64);
+    TEST_ASSERT_TRUE((v->nullmap[0] & 1) != 0);
+    ray_release(v);
+    PASS();
+}
+
+static test_result_t test_atom_typed_null_i16(void) {
+    ray_t* v = ray_typed_null(-RAY_I16);
+    TEST_ASSERT_NOT_NULL(v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    TEST_ASSERT_EQ_I(v->type, -RAY_I16);
+    TEST_ASSERT_EQ_I(v->i16, NULL_I16);
+    TEST_ASSERT_TRUE((v->nullmap[0] & 1) != 0);
+    ray_release(v);
+    PASS();
+}
+
+static test_result_t test_atom_typed_null_i32(void) {
+    ray_t* v = ray_typed_null(-RAY_I32);
+    TEST_ASSERT_NOT_NULL(v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    TEST_ASSERT_EQ_I(v->type, -RAY_I32);
+    TEST_ASSERT_EQ_I(v->i32, NULL_I32);
+    TEST_ASSERT_TRUE((v->nullmap[0] & 1) != 0);
+    ray_release(v);
+    PASS();
+}
+
+static test_result_t test_atom_typed_null_date(void) {
+    ray_t* v = ray_typed_null(-RAY_DATE);
+    TEST_ASSERT_NOT_NULL(v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    TEST_ASSERT_EQ_I(v->type, -RAY_DATE);
+    TEST_ASSERT_EQ_I(v->i32, NULL_I32);
+    TEST_ASSERT_TRUE((v->nullmap[0] & 1) != 0);
+    ray_release(v);
+    PASS();
+}
+
+static test_result_t test_atom_typed_null_time(void) {
+    ray_t* v = ray_typed_null(-RAY_TIME);
+    TEST_ASSERT_NOT_NULL(v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    TEST_ASSERT_EQ_I(v->type, -RAY_TIME);
+    TEST_ASSERT_EQ_I(v->i32, NULL_I32);
+    TEST_ASSERT_TRUE((v->nullmap[0] & 1) != 0);
+    ray_release(v);
+    PASS();
+}
+
+static test_result_t test_atom_typed_null_timestamp(void) {
+    ray_t* v = ray_typed_null(-RAY_TIMESTAMP);
+    TEST_ASSERT_NOT_NULL(v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    TEST_ASSERT_EQ_I(v->type, -RAY_TIMESTAMP);
+    TEST_ASSERT_EQ_I(v->i64, NULL_I64);
     TEST_ASSERT_TRUE((v->nullmap[0] & 1) != 0);
     ray_release(v);
     PASS();
@@ -507,8 +562,13 @@ const test_entry_t atom_entries[] = {
     { "atom/eq_list_with_nulls",  test_atom_eq_list_with_nulls,  atom_setup, atom_teardown },
     { "atom/eq_list_empty",       test_atom_eq_list_empty,       atom_setup, atom_teardown },
     { "atom/eq_list_sym_atoms",   test_atom_eq_list_sym_atoms,   atom_setup, atom_teardown },
-    { "atom/typed_null_f64",      test_atom_typed_null_f64,      atom_setup, atom_teardown },
-    { "atom/typed_null_i64",      test_atom_typed_null_i64,      atom_setup, atom_teardown },
+    { "atom/typed_null_f64",       test_atom_typed_null_f64,       atom_setup, atom_teardown },
+    { "atom/typed_null_i64",       test_atom_typed_null_i64,       atom_setup, atom_teardown },
+    { "atom/typed_null_i16",       test_atom_typed_null_i16,       atom_setup, atom_teardown },
+    { "atom/typed_null_i32",       test_atom_typed_null_i32,       atom_setup, atom_teardown },
+    { "atom/typed_null_date",      test_atom_typed_null_date,      atom_setup, atom_teardown },
+    { "atom/typed_null_time",      test_atom_typed_null_time,      atom_setup, atom_teardown },
+    { "atom/typed_null_timestamp", test_atom_typed_null_timestamp, atom_setup, atom_teardown },
     { NULL, NULL, NULL, NULL },
 };
 
