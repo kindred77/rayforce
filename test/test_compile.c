@@ -496,6 +496,31 @@ static test_result_t test_compile_group_by_i64_null_key_slot_is_sentinel(void) {
     PASS();
 }
 
+static test_result_t test_compile_pivot_i64_null_key_slot_is_sentinel(void) {
+    /* Phase 3a-8: pivot on a nullable I64 key column with null rows must
+     * fill NULL_I64 into the result index-column's null slot, not 0. */
+    ray_t* r = ray_eval_str(
+        "(do (set t (table [k v c] (list [1 0Nl 2 0Nl 3] [10 20 30 40 50] ['a 'b 'a 'b 'c])))"
+        "    (set p (pivot t 'k 'c 'v sum))"
+        "    (at p 'k))");
+    TEST_ASSERT_NOT_NULL(r);
+    if (RAY_IS_ERR(r)) { ray_error_free(r); FAIL("eval error on pivot i64 null key"); }
+    TEST_ASSERT(ray_is_vec(r), "expected vector");
+    TEST_ASSERT(r->type == RAY_I64, "expected I64 vector");
+    int64_t n = r->len;
+    bool found_null_slot = false;
+    int64_t* d = (int64_t*)ray_data(r);
+    for (int64_t i = 0; i < n; i++) {
+        if (ray_vec_is_null(r, i)) {
+            TEST_ASSERT_EQ_I(d[i], NULL_I64);   /* slot also holds sentinel */
+            found_null_slot = true;
+        }
+    }
+    TEST_ASSERT_TRUE(found_null_slot);
+    ray_release(r);
+    PASS();
+}
+
 /* ════════════════════════════════════════════════════════════════════
  * 9. let with invalid (non-symbol) name — compile error path (line 244)
  *    Triggers c->error = true in the let handler.
@@ -883,6 +908,9 @@ const test_entry_t compile_entries[] = {
                                                                        compile_setup, compile_teardown },
     { "compile/group_by_i64_null_key_slot_is_sentinel",
                                      test_compile_group_by_i64_null_key_slot_is_sentinel,
+                                                                       compile_setup, compile_teardown },
+    { "compile/pivot_i64_null_key_slot_is_sentinel",
+                                     test_compile_pivot_i64_null_key_slot_is_sentinel,
                                                                        compile_setup, compile_teardown },
     { "compile/let_reserved_name",   test_compile_let_reserved_name,   compile_setup, compile_teardown },
     { "compile/unary_wrong_arity",   test_compile_unary_wrong_arity,   compile_setup, compile_teardown },
