@@ -1,0 +1,59 @@
+;; Phase 3a dual-encoding contract: integer/temporal nulls hold the
+;; INT_MIN sentinel in the payload AND have the nullmap bit set.
+
+;; ----- 1. Atom construction -----
+
+(nil? 0Nh) -- true
+(nil? 0Ni) -- true
+(nil? 0Nl) -- true
+
+;; ----- 2. CSV ingest (I64) -----
+
+(.sys.exec "rm -f /tmp/rfl_phase3a_int_dual.csv")
+(.sys.exec "printf 'x\\n10\\n\\n30\\n' > /tmp/rfl_phase3a_int_dual.csv")
+(set P3I (.csv.read [I64] "/tmp/rfl_phase3a_int_dual.csv"))
+(count P3I)                  -- 3
+(nil? (at (at P3I 'x) 1))    -- true
+(at (at P3I 'x) 0)           -- 10
+(at (at P3I 'x) 2)           -- 30
+
+;; ----- 3. Aggregations exclude nulls -----
+
+(sum (at P3I 'x))   -- 40
+(min (at P3I 'x))   -- 10
+(max (at P3I 'x))   -- 30
+
+;; ----- 4. Sort places nulls per policy -----
+
+(at (asc [3 0N 1 2]) 0)  -- 0Nl
+(at (desc [3 0N 1 2]) 3) -- 0Nl
+
+;; ----- 5. Distinct collapses null rows -----
+
+(count (distinct [1 0N 2 0N 1]))     -- 3
+(nil? (at (distinct [0N 0N 0N]) 0))  -- true
+(count (distinct [0N 0N 0N]))        -- 1
+
+;; ----- 6. Group-by SUM on nullable I64 (consumer NaN/sentinel-skip) -----
+
+(set Tn (table [v g] (list [1 2 0N 4 5] [0 0 1 1 1])))
+(sum (at (select {s: (sum v) from: Tn where: (>= g 0) by: g}) 's)) -- 12
+
+;; ----- 7. UPDATE with typed-null broadcast preserves sentinel encoding -----
+
+(set Tc (table [a] (list [10 20 30])))
+(set Tu (update {a: 0Nl from: Tc}))
+(nil? (at (at Tu 'a) 0)) -- true
+(nil? (at (at Tu 'a) 1)) -- true
+(nil? (at (at Tu 'a) 2)) -- true
+
+;; ----- 8. Group-by with null I64 keys buckets nulls together -----
+
+(set Tk (table [k v] (list [1 0N 1 0N 2] [10 20 30 40 50])))
+(count (select {c: (count v) from: Tk where: (>= v 0) by: k})) -- 3
+
+;; ----- 9. Cast preserves null encoding across widths -----
+
+(nil? (at (as 'I32 [1 0N 3]) 1))  -- true
+(nil? (at (as 'I16 [1 0N 3]) 1))  -- true
+(nil? (at (as 'I64 (as 'I16 [1 0N 3])) 1)) -- true
