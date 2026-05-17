@@ -428,6 +428,49 @@ static test_result_t test_compile_update_promo_i64_to_f64_null_slot_is_sentinel(
     PASS();
 }
 
+static test_result_t test_compile_update_atom_broadcast_i64_null_slot_is_sentinel(void) {
+    /* Phase 3a-6: UPDATE that broadcasts an I64 typed-null atom into an
+     * I64 column should fill NULL_I64 into the destination payload, not 0. */
+    ray_t* r = ray_eval_str(
+        "(do (set t (table [a] (list [10 20 30])))"
+        "    (set u (update {a: 0Nl from: t}))"
+        "    (at u 'a))");
+    TEST_ASSERT_NOT_NULL(r);
+    if (RAY_IS_ERR(r)) { ray_error_free(r); FAIL("eval error on update atom broadcast i64"); }
+    TEST_ASSERT(ray_is_vec(r), "expected vector");
+    TEST_ASSERT(r->type == RAY_I64, "expected I64 vector");
+    TEST_ASSERT(r->len == 3, "expected len 3");
+    int64_t* d = (int64_t*)ray_data(r);
+    TEST_ASSERT_EQ_I(d[0], NULL_I64);
+    TEST_ASSERT_EQ_I(d[1], NULL_I64);
+    TEST_ASSERT_EQ_I(d[2], NULL_I64);
+    TEST_ASSERT_TRUE(ray_vec_is_null(r, 0));
+    ray_release(r);
+    PASS();
+}
+
+static test_result_t test_compile_update_atom_broadcast_where_i64_null_slot_is_sentinel(void) {
+    /* Phase 3a-6: UPDATE-WHERE that broadcasts an I64 typed-null atom into
+     * an I64 column should fill NULL_I64 into masked slots only. */
+    ray_t* r = ray_eval_str(
+        "(do (set t (table [a b] (list [10 20 30] [1 2 3])))"
+        "    (set u (update {a: 0Nl where: (> b 1) from: t}))"
+        "    (at u 'a))");
+    TEST_ASSERT_NOT_NULL(r);
+    if (RAY_IS_ERR(r)) { ray_error_free(r); FAIL("eval error on update-where atom broadcast i64"); }
+    TEST_ASSERT(ray_is_vec(r), "expected vector");
+    TEST_ASSERT(r->type == RAY_I64, "expected I64 vector");
+    TEST_ASSERT(r->len == 3, "expected len 3");
+    int64_t* d = (int64_t*)ray_data(r);
+    TEST_ASSERT_EQ_I(d[0], 10);          /* unmasked — unchanged */
+    TEST_ASSERT_EQ_I(d[1], NULL_I64);    /* masked + null broadcast */
+    TEST_ASSERT_EQ_I(d[2], NULL_I64);
+    TEST_ASSERT_TRUE(ray_vec_is_null(r, 1));
+    TEST_ASSERT_TRUE(ray_vec_is_null(r, 2));
+    ray_release(r);
+    PASS();
+}
+
 /* ════════════════════════════════════════════════════════════════════
  * 9. let with invalid (non-symbol) name — compile error path (line 244)
  *    Triggers c->error = true in the let handler.
@@ -806,6 +849,12 @@ const test_entry_t compile_entries[] = {
                                                                        compile_setup, compile_teardown },
     { "compile/update_promo_i64_to_f64_null_slot_is_sentinel",
                                      test_compile_update_promo_i64_to_f64_null_slot_is_sentinel,
+                                                                       compile_setup, compile_teardown },
+    { "compile/update_atom_broadcast_i64_null_slot_is_sentinel",
+                                     test_compile_update_atom_broadcast_i64_null_slot_is_sentinel,
+                                                                       compile_setup, compile_teardown },
+    { "compile/update_atom_broadcast_where_i64_null_slot_is_sentinel",
+                                     test_compile_update_atom_broadcast_where_i64_null_slot_is_sentinel,
                                                                        compile_setup, compile_teardown },
     { "compile/let_reserved_name",   test_compile_let_reserved_name,   compile_setup, compile_teardown },
     { "compile/unary_wrong_arity",   test_compile_unary_wrong_arity,   compile_setup, compile_teardown },
