@@ -258,6 +258,366 @@ static test_result_t test_compile_vector_literal(void) {
 }
 
 /* ════════════════════════════════════════════════════════════════════
+ * Phase 2e: F64 dual-encoding regression tests.
+ *
+ * Each consumer of an F64 vector with a null bit MUST see NULL_F64
+ * (= NaN) in the raw `double` payload as well — kernels are allowed to
+ * read the slot without consulting the bitmap.  These tests assert the
+ * payload, not the bitmap, by reading `((double*)ray_data(v))[idx]` and
+ * checking `x != x` (NaN's defining property).
+ * ════════════════════════════════════════════════════════════════════ */
+
+static test_result_t test_compile_f64_mixed_literal_null_slot_is_nan(void) {
+    /* Mixed numeric literal [1.0 0N 3.0] promotes to F64 in parse.c.
+     * The integer null 0N (typed I64 null with i64=0) used to write 0.0
+     * into the f64 slot, breaking the dual-encoding contract. */
+    ray_t* r = ray_eval_str("[1.0 0N 3.0]");
+    TEST_ASSERT_NOT_NULL(r);
+    if (RAY_IS_ERR(r)) { ray_error_free(r); FAIL("eval error on mixed F64 literal"); }
+    TEST_ASSERT(ray_is_vec(r), "expected vector");
+    TEST_ASSERT(r->type == RAY_F64, "expected F64 vector");
+    TEST_ASSERT(r->len == 3, "expected len 3");
+    double* d = (double*)ray_data(r);
+    TEST_ASSERT(d[0] == 1.0, "slot 0 should be 1.0");
+    TEST_ASSERT(d[1] != d[1], "slot 1 (null) must be NaN");
+    TEST_ASSERT(d[2] == 3.0, "slot 2 should be 3.0");
+    ray_release(r);
+    PASS();
+}
+
+static test_result_t test_compile_f64_cast_i64_null_slot_is_nan(void) {
+    /* (as 'F64 [1 0N 3]) — cast an I64 vector with a null slot to F64.
+     * The cast loop writes (double)src[i] regardless of null status,
+     * which used to leave 0.0 in the null F64 slot.  Phase 2e routes
+     * the post-cast nullmap copy through a per-slot NULL_F64 fill. */
+    ray_t* r = ray_eval_str("(as 'F64 [1 0N 3])");
+    TEST_ASSERT_NOT_NULL(r);
+    if (RAY_IS_ERR(r)) { ray_error_free(r); FAIL("eval error on cast"); }
+    TEST_ASSERT(ray_is_vec(r), "expected vector");
+    TEST_ASSERT(r->type == RAY_F64, "expected F64 vector");
+    TEST_ASSERT(r->len == 3, "expected len 3");
+    double* d = (double*)ray_data(r);
+    TEST_ASSERT(d[0] == 1.0, "slot 0 should be 1.0");
+    TEST_ASSERT(d[1] != d[1], "slot 1 (null) must be NaN");
+    TEST_ASSERT(d[2] == 3.0, "slot 2 should be 3.0");
+    ray_release(r);
+    PASS();
+}
+
+static test_result_t test_compile_i32_cast_i64_null_slot_is_sentinel(void) {
+    /* Phase 3a: (as 'I32 [1 0N 3]) — narrowing I64→I32 cast over a vector
+     * with a null slot must leave NULL_I32 (INT32_MIN) in the payload, not
+     * the cast result (int32_t)NULL_I64 = 0.  Mirror of the Phase 2e F64
+     * post-cast NaN fill for integer destinations. */
+    ray_t* r = ray_eval_str("(as 'I32 [1 0N 3])");
+    TEST_ASSERT_NOT_NULL(r);
+    if (RAY_IS_ERR(r)) { ray_error_free(r); FAIL("eval error on cast"); }
+    TEST_ASSERT(ray_is_vec(r), "expected vector");
+    TEST_ASSERT(r->type == RAY_I32, "expected I32 vector");
+    TEST_ASSERT(r->len == 3, "expected len 3");
+    int32_t* d = (int32_t*)ray_data(r);
+    TEST_ASSERT_EQ_I(d[0], 1);
+    TEST_ASSERT_EQ_I(d[1], NULL_I32);
+    TEST_ASSERT_EQ_I(d[2], 3);
+    TEST_ASSERT_TRUE(ray_vec_is_null(r, 1));
+    ray_release(r);
+    PASS();
+}
+
+static test_result_t test_compile_i16_cast_i32_null_slot_is_sentinel(void) {
+    /* Phase 3a Hazard 3: chained narrowing I64→I32→I16 cast over a vector
+     * with a null slot must leave NULL_I16 (INT16_MIN) in the I16 payload,
+     * NOT (int16_t)NULL_I32 = 0.  The destination-width sentinel must be
+     * written post-cast directly — propagating through the cast macro
+     * truncates the sentinel. */
+    ray_t* r = ray_eval_str("(as 'I16 (as 'I32 [1 0N 3]))");
+    TEST_ASSERT_NOT_NULL(r);
+    if (RAY_IS_ERR(r)) { ray_error_free(r); FAIL("eval error on cast"); }
+    TEST_ASSERT(ray_is_vec(r), "expected vector");
+    TEST_ASSERT(r->type == RAY_I16, "expected I16 vector");
+    TEST_ASSERT(r->len == 3, "expected len 3");
+    int16_t* d = (int16_t*)ray_data(r);
+    TEST_ASSERT_EQ_I(d[0], 1);
+    TEST_ASSERT_EQ_I(d[1], NULL_I16);
+    TEST_ASSERT_EQ_I(d[2], 3);
+    TEST_ASSERT_TRUE(ray_vec_is_null(r, 1));
+    ray_release(r);
+    PASS();
+}
+
+static test_result_t test_compile_i64_cast_i32_null_slot_is_sentinel(void) {
+    /* Phase 3a: widening I32→I64 cast must still fill NULL_I64 in the
+     * null payload slot — the cast macro would write (int64_t)NULL_I32
+     * = -2147483648, which collides with a legitimate I64 value. */
+    ray_t* r = ray_eval_str("(as 'I64 (as 'I32 [1 0N 3]))");
+    TEST_ASSERT_NOT_NULL(r);
+    if (RAY_IS_ERR(r)) { ray_error_free(r); FAIL("eval error on cast"); }
+    TEST_ASSERT(ray_is_vec(r), "expected vector");
+    TEST_ASSERT(r->type == RAY_I64, "expected I64 vector");
+    TEST_ASSERT(r->len == 3, "expected len 3");
+    int64_t* d = (int64_t*)ray_data(r);
+    TEST_ASSERT_EQ_I(d[0], 1);
+    TEST_ASSERT_EQ_I(d[1], NULL_I64);
+    TEST_ASSERT_EQ_I(d[2], 3);
+    TEST_ASSERT_TRUE(ray_vec_is_null(r, 1));
+    ray_release(r);
+    PASS();
+}
+
+static test_result_t test_compile_i64_scalar_null_propagation_slot_is_sentinel(void) {
+    /* Phase 3a-4: a binary op with a scalar-null I64 operand should fill the
+     * I64 result payload with NULL_I64, not leave it as the kernel's output.
+     * `(+ 0Nl [1 2 3])` — scalar-null left operand triggers set_all_null
+     * with an I64 result vector.  Mirror of the Phase 2e F64 NaN-fill. */
+    ray_t* r = ray_eval_str("(+ 0Nl [1 2 3])");
+    TEST_ASSERT_NOT_NULL(r);
+    if (RAY_IS_ERR(r)) { ray_error_free(r); FAIL("eval error on scalar-null add"); }
+    TEST_ASSERT(ray_is_vec(r), "expected vector");
+    TEST_ASSERT(r->type == RAY_I64, "expected I64 vector");
+    TEST_ASSERT(r->len == 3, "expected len 3");
+    int64_t* d = (int64_t*)ray_data(r);
+    TEST_ASSERT_EQ_I(d[0], NULL_I64);
+    TEST_ASSERT_EQ_I(d[1], NULL_I64);
+    TEST_ASSERT_EQ_I(d[2], NULL_I64);
+    TEST_ASSERT_TRUE(ray_vec_is_null(r, 0));
+    TEST_ASSERT_TRUE(ray_vec_is_null(r, 1));
+    TEST_ASSERT_TRUE(ray_vec_is_null(r, 2));
+    ray_release(r);
+    PASS();
+}
+
+static test_result_t test_compile_update_promo_f64_to_i64_null_slot_is_sentinel(void) {
+    /* Phase 3a-5: UPDATE-WHERE that promotes an F64 expression with nulls into
+     * an I64 column must fill NULL_I64 in the destination payload, not the
+     * implementation-defined garbage from (int64_t)NaN. */
+    ray_t* r = ray_eval_str(
+        "(do "
+          "(set t (table [a b] (list [10 20 30] [1 2 3]))) "
+          "(set u (update {a: [1.5 0Nf 3.5] where: (> b 0) from: t})) "
+          "(at u 'a))");
+    TEST_ASSERT_NOT_NULL(r);
+    if (RAY_IS_ERR(r)) { ray_error_free(r); FAIL("eval error on update promo f64->i64"); }
+    TEST_ASSERT(ray_is_vec(r), "expected vector");
+    TEST_ASSERT(r->type == RAY_I64, "expected I64 vector");
+    TEST_ASSERT(r->len == 3, "expected len 3");
+    int64_t* d = (int64_t*)ray_data(r);
+    TEST_ASSERT_EQ_I(d[1], NULL_I64);   /* not (int64_t)NaN */
+    TEST_ASSERT_TRUE(ray_vec_is_null(r, 1));
+    ray_release(r);
+    PASS();
+}
+
+static test_result_t test_compile_update_promo_i64_to_f64_null_slot_is_sentinel(void) {
+    /* Phase 3a-5: UPDATE-WHERE that promotes an I64 expression with nulls into
+     * an F64 column must fill NULL_F64 in the destination payload, not
+     * (double)NULL_I64 (a large finite value). */
+    ray_t* r = ray_eval_str(
+        "(do "
+          "(set t (table [a b] (list [1.0 2.0 3.0] [1 2 3]))) "
+          "(set u (update {a: [10 0Nl 30] where: (> b 0) from: t})) "
+          "(at u 'a))");
+    TEST_ASSERT_NOT_NULL(r);
+    if (RAY_IS_ERR(r)) { ray_error_free(r); FAIL("eval error on update promo i64->f64"); }
+    TEST_ASSERT(ray_is_vec(r), "expected vector");
+    TEST_ASSERT(r->type == RAY_F64, "expected F64 vector");
+    TEST_ASSERT(r->len == 3, "expected len 3");
+    double* d = (double*)ray_data(r);
+    TEST_ASSERT(d[1] != d[1], "slot 1 (null) must be NaN");
+    TEST_ASSERT_TRUE(ray_vec_is_null(r, 1));
+    ray_release(r);
+    PASS();
+}
+
+static test_result_t test_compile_update_atom_broadcast_i64_null_slot_is_sentinel(void) {
+    /* Phase 3a-6: UPDATE that broadcasts an I64 typed-null atom into an
+     * I64 column should fill NULL_I64 into the destination payload, not 0. */
+    ray_t* r = ray_eval_str(
+        "(do (set t (table [a] (list [10 20 30])))"
+        "    (set u (update {a: 0Nl from: t}))"
+        "    (at u 'a))");
+    TEST_ASSERT_NOT_NULL(r);
+    if (RAY_IS_ERR(r)) { ray_error_free(r); FAIL("eval error on update atom broadcast i64"); }
+    TEST_ASSERT(ray_is_vec(r), "expected vector");
+    TEST_ASSERT(r->type == RAY_I64, "expected I64 vector");
+    TEST_ASSERT(r->len == 3, "expected len 3");
+    int64_t* d = (int64_t*)ray_data(r);
+    TEST_ASSERT_EQ_I(d[0], NULL_I64);
+    TEST_ASSERT_EQ_I(d[1], NULL_I64);
+    TEST_ASSERT_EQ_I(d[2], NULL_I64);
+    TEST_ASSERT_TRUE(ray_vec_is_null(r, 0));
+    ray_release(r);
+    PASS();
+}
+
+static test_result_t test_compile_update_atom_broadcast_where_i64_null_slot_is_sentinel(void) {
+    /* Phase 3a-6: UPDATE-WHERE that broadcasts an I64 typed-null atom into
+     * an I64 column should fill NULL_I64 into masked slots only. */
+    ray_t* r = ray_eval_str(
+        "(do (set t (table [a b] (list [10 20 30] [1 2 3])))"
+        "    (set u (update {a: 0Nl where: (> b 1) from: t}))"
+        "    (at u 'a))");
+    TEST_ASSERT_NOT_NULL(r);
+    if (RAY_IS_ERR(r)) { ray_error_free(r); FAIL("eval error on update-where atom broadcast i64"); }
+    TEST_ASSERT(ray_is_vec(r), "expected vector");
+    TEST_ASSERT(r->type == RAY_I64, "expected I64 vector");
+    TEST_ASSERT(r->len == 3, "expected len 3");
+    int64_t* d = (int64_t*)ray_data(r);
+    TEST_ASSERT_EQ_I(d[0], 10);          /* unmasked — unchanged */
+    TEST_ASSERT_EQ_I(d[1], NULL_I64);    /* masked + null broadcast */
+    TEST_ASSERT_EQ_I(d[2], NULL_I64);
+    TEST_ASSERT_TRUE(ray_vec_is_null(r, 1));
+    TEST_ASSERT_TRUE(ray_vec_is_null(r, 2));
+    ray_release(r);
+    PASS();
+}
+
+static test_result_t test_compile_group_by_i64_null_key_slot_is_sentinel(void) {
+    /* Phase 3a-7: group-by on a nullable I64 column with a null row must
+     * write NULL_I64 into the result column's null slot, not 0. */
+    ray_t* r = ray_eval_str(
+        "(do (set t (table [k v] (list [1 0Nl 2 0Nl 3] [10 20 30 40 50])))"
+        "    (set r (select {c: (count v) from: t by: k}))"
+        "    (at r 'k))");
+    TEST_ASSERT_NOT_NULL(r);
+    if (RAY_IS_ERR(r)) { ray_error_free(r); FAIL("eval error on group-by i64 null key"); }
+    TEST_ASSERT(ray_is_vec(r), "expected vector");
+    TEST_ASSERT(r->type == RAY_I64, "expected I64 vector");
+    int64_t n = r->len;
+    bool found_null_slot = false;
+    int64_t* d = (int64_t*)ray_data(r);
+    for (int64_t i = 0; i < n; i++) {
+        if (ray_vec_is_null(r, i)) {
+            TEST_ASSERT_EQ_I(d[i], NULL_I64);   /* slot also holds sentinel */
+            found_null_slot = true;
+        }
+    }
+    TEST_ASSERT_TRUE(found_null_slot);
+    ray_release(r);
+    PASS();
+}
+
+static test_result_t test_compile_pivot_i64_null_key_slot_is_sentinel(void) {
+    /* Phase 3a-8: pivot on a nullable I64 key column with null rows must
+     * fill NULL_I64 into the result index-column's null slot, not 0. */
+    ray_t* r = ray_eval_str(
+        "(do (set t (table [k v c] (list [1 0Nl 2 0Nl 3] [10 20 30 40 50] ['a 'b 'a 'b 'c])))"
+        "    (set p (pivot t 'k 'c 'v sum))"
+        "    (at p 'k))");
+    TEST_ASSERT_NOT_NULL(r);
+    if (RAY_IS_ERR(r)) { ray_error_free(r); FAIL("eval error on pivot i64 null key"); }
+    TEST_ASSERT(ray_is_vec(r), "expected vector");
+    TEST_ASSERT(r->type == RAY_I64, "expected I64 vector");
+    int64_t n = r->len;
+    bool found_null_slot = false;
+    int64_t* d = (int64_t*)ray_data(r);
+    for (int64_t i = 0; i < n; i++) {
+        if (ray_vec_is_null(r, i)) {
+            TEST_ASSERT_EQ_I(d[i], NULL_I64);   /* slot also holds sentinel */
+            found_null_slot = true;
+        }
+    }
+    TEST_ASSERT_TRUE(found_null_slot);
+    ray_release(r);
+    PASS();
+}
+
+/* ════════════════════════════════════════════════════════════════════
+ * Phase 3a-13 regressions — producer-side dual-encoding gaps that
+ * surfaced from the cross-cut integration review (temporal extract,
+ * strlen, mark_i64_overflow_as_null, median_per_group).
+ * Each previously wrote 0 / 0.0 to the payload while flipping the null
+ * bitmap bit — bitmap-only nulls that violate the dual-encoding
+ * contract.  After the fix the slot must carry the width-correct
+ * sentinel (NULL_I64 / NULL_F64) in addition to the bitmap bit.
+ * ════════════════════════════════════════════════════════════════════ */
+static test_result_t test_compile_temporal_extract_null_slot_is_sentinel(void) {
+    /* Phase 3a-13 (C1): extract over a nullable TIMESTAMP column must
+     * fill NULL_I64 in the result I64 payload — the kernel previously
+     * wrote 0 with a bitmap bit, which sentinel-aware readers see as a
+     * legitimate zero. */
+    ray_t* r = ray_eval_str(
+        "(do (set __t13 (as 'TIMESTAMP (list 1000000000 0Np 2000000000)))"
+        "    (yyyy __t13))");
+    TEST_ASSERT_NOT_NULL(r);
+    if (RAY_IS_ERR(r)) { ray_error_free(r); FAIL("eval error on temporal extract null"); }
+    TEST_ASSERT(ray_is_vec(r), "expected vector");
+    TEST_ASSERT(r->type == RAY_I64, "expected I64 vector");
+    TEST_ASSERT(r->len == 3, "expected len 3");
+    int64_t* d = (int64_t*)ray_data(r);
+    TEST_ASSERT_EQ_I(d[1], NULL_I64);
+    TEST_ASSERT_TRUE(ray_vec_is_null(r, 1));
+    TEST_ASSERT_FALSE(ray_vec_is_null(r, 0));
+    TEST_ASSERT_FALSE(ray_vec_is_null(r, 2));
+    ray_release(r);
+    PASS();
+}
+
+static test_result_t test_compile_strlen_null_slot_is_sentinel(void) {
+    /* Phase 3a-13 (C2): strlen over a nullable STR vector must fill
+     * NULL_I64 in the I64 payload, not 0.  Mixed string-vec literal
+     * `[\"hello\" 0N \"x\"]` parses as a LIST; cast to STR to get a
+     * proper typed nullable STR vector. */
+    ray_t* r = ray_eval_str("(strlen (as 'STR (concat \"hello\" (concat 0N \"x\"))))");
+    TEST_ASSERT_NOT_NULL(r);
+    if (RAY_IS_ERR(r)) { ray_error_free(r); FAIL("eval error on strlen null"); }
+    TEST_ASSERT(ray_is_vec(r), "expected vector");
+    TEST_ASSERT(r->type == RAY_I64, "expected I64 vector");
+    TEST_ASSERT(r->len == 3, "expected len 3");
+    int64_t* d = (int64_t*)ray_data(r);
+    TEST_ASSERT_EQ_I(d[0], 5);
+    TEST_ASSERT_EQ_I(d[1], NULL_I64);
+    TEST_ASSERT_EQ_I(d[2], 1);
+    TEST_ASSERT_TRUE(ray_vec_is_null(r, 1));
+    ray_release(r);
+    PASS();
+}
+
+static test_result_t test_compile_overflow_neg_int64_min_slot_is_null_i64(void) {
+    /* Phase 3a-13 (C3): negating INT64_MIN over an i64 column produces
+     * INT64_MIN (k/q convention surfaces this as typed null).  After
+     * Phase 3a-1 INT64_MIN IS NULL_I64 — mark_i64_overflow_as_null must
+     * leave the sentinel in place, not overwrite with 0. */
+    ray_t* r = ray_eval_str(
+        "(do (set Vneg (concat -9223372036854775808 (concat -5 (concat 5 0))))"
+        "    (set Tneg (table [v] (list Vneg)))"
+        "    (at (select {x: (neg v) from: Tneg}) 'x))");
+    TEST_ASSERT_NOT_NULL(r);
+    if (RAY_IS_ERR(r)) { ray_error_free(r); FAIL("eval error on neg-overflow"); }
+    TEST_ASSERT(ray_is_vec(r), "expected vector");
+    TEST_ASSERT(r->type == RAY_I64, "expected I64 vector");
+    TEST_ASSERT(r->len == 4, "expected len 4");
+    int64_t* d = (int64_t*)ray_data(r);
+    TEST_ASSERT_EQ_I(d[0], NULL_I64);    /* overflow row holds sentinel */
+    TEST_ASSERT_TRUE(ray_vec_is_null(r, 0));
+    ray_release(r);
+    PASS();
+}
+
+static test_result_t test_compile_median_per_group_all_null_slot_is_nan(void) {
+    /* Phase 3a-13 (C4 — closes Phase 2 gap): median over a per-group
+     * all-null F64 input must fill NULL_F64 in the result slot, not
+     * leave it as 0.0. */
+    ray_t* r = ray_eval_str(
+        "(do (set __tm13 (table [k v] (list [1 1 2 2] [0Nf 0Nf 1.0 2.0])))"
+        "    (set __rm13 (select {m: (med v) by: k from: __tm13}))"
+        "    (at __rm13 'm))");
+    TEST_ASSERT_NOT_NULL(r);
+    if (RAY_IS_ERR(r)) { ray_error_free(r); FAIL("eval error on median per-group"); }
+    TEST_ASSERT(ray_is_vec(r), "expected vector");
+    TEST_ASSERT(r->type == RAY_F64, "expected F64 vector");
+    TEST_ASSERT(r->len == 2, "expected len 2 (two groups)");
+    double* d = (double*)ray_data(r);
+    /* Group k=1 is all-null → slot must be NaN with bitmap bit set. */
+    TEST_ASSERT(d[0] != d[0], "all-null group slot must be NaN");
+    TEST_ASSERT_TRUE(ray_vec_is_null(r, 0));
+    /* Group k=2 has 1.0 and 2.0 → median 1.5. */
+    TEST_ASSERT(d[1] == 1.5, "k=2 group median should be 1.5");
+    TEST_ASSERT_FALSE(ray_vec_is_null(r, 1));
+    ray_release(r);
+    PASS();
+}
+
+/* ════════════════════════════════════════════════════════════════════
  * 9. let with invalid (non-symbol) name — compile error path (line 244)
  *    Triggers c->error = true in the let handler.
  * ════════════════════════════════════════════════════════════════════ */
@@ -612,6 +972,54 @@ const test_entry_t compile_entries[] = {
     { "compile/and_special_form",    test_compile_and_special_form,    compile_setup, compile_teardown },
     { "compile/or_special_form",     test_compile_or_special_form,     compile_setup, compile_teardown },
     { "compile/vector_literal",      test_compile_vector_literal,      compile_setup, compile_teardown },
+    { "compile/f64_mixed_literal_null_slot_is_nan",
+                                     test_compile_f64_mixed_literal_null_slot_is_nan,
+                                                                       compile_setup, compile_teardown },
+    { "compile/f64_cast_i64_null_slot_is_nan",
+                                     test_compile_f64_cast_i64_null_slot_is_nan,
+                                                                       compile_setup, compile_teardown },
+    { "compile/i32_cast_i64_null_slot_is_sentinel",
+                                     test_compile_i32_cast_i64_null_slot_is_sentinel,
+                                                                       compile_setup, compile_teardown },
+    { "compile/i16_cast_i32_null_slot_is_sentinel",
+                                     test_compile_i16_cast_i32_null_slot_is_sentinel,
+                                                                       compile_setup, compile_teardown },
+    { "compile/i64_cast_i32_null_slot_is_sentinel",
+                                     test_compile_i64_cast_i32_null_slot_is_sentinel,
+                                                                       compile_setup, compile_teardown },
+    { "compile/i64_scalar_null_propagation_slot_is_sentinel",
+                                     test_compile_i64_scalar_null_propagation_slot_is_sentinel,
+                                                                       compile_setup, compile_teardown },
+    { "compile/update_promo_f64_to_i64_null_slot_is_sentinel",
+                                     test_compile_update_promo_f64_to_i64_null_slot_is_sentinel,
+                                                                       compile_setup, compile_teardown },
+    { "compile/update_promo_i64_to_f64_null_slot_is_sentinel",
+                                     test_compile_update_promo_i64_to_f64_null_slot_is_sentinel,
+                                                                       compile_setup, compile_teardown },
+    { "compile/update_atom_broadcast_i64_null_slot_is_sentinel",
+                                     test_compile_update_atom_broadcast_i64_null_slot_is_sentinel,
+                                                                       compile_setup, compile_teardown },
+    { "compile/update_atom_broadcast_where_i64_null_slot_is_sentinel",
+                                     test_compile_update_atom_broadcast_where_i64_null_slot_is_sentinel,
+                                                                       compile_setup, compile_teardown },
+    { "compile/group_by_i64_null_key_slot_is_sentinel",
+                                     test_compile_group_by_i64_null_key_slot_is_sentinel,
+                                                                       compile_setup, compile_teardown },
+    { "compile/pivot_i64_null_key_slot_is_sentinel",
+                                     test_compile_pivot_i64_null_key_slot_is_sentinel,
+                                                                       compile_setup, compile_teardown },
+    { "compile/temporal_extract_null_slot_is_sentinel",
+                                     test_compile_temporal_extract_null_slot_is_sentinel,
+                                                                       compile_setup, compile_teardown },
+    { "compile/strlen_null_slot_is_sentinel",
+                                     test_compile_strlen_null_slot_is_sentinel,
+                                                                       compile_setup, compile_teardown },
+    { "compile/overflow_neg_int64_min_slot_is_null_i64",
+                                     test_compile_overflow_neg_int64_min_slot_is_null_i64,
+                                                                       compile_setup, compile_teardown },
+    { "compile/median_per_group_all_null_slot_is_nan",
+                                     test_compile_median_per_group_all_null_slot_is_nan,
+                                                                       compile_setup, compile_teardown },
     { "compile/let_reserved_name",   test_compile_let_reserved_name,   compile_setup, compile_teardown },
     { "compile/unary_wrong_arity",   test_compile_unary_wrong_arity,   compile_setup, compile_teardown },
     { "compile/binary_wrong_arity",  test_compile_binary_wrong_arity,  compile_setup, compile_teardown },

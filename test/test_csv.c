@@ -190,7 +190,11 @@ static test_result_t test_csv_null_i64(void) {
 
     TEST_ASSERT_FALSE(ray_vec_is_null(col, 0));
     TEST_ASSERT_EQ_I(((int64_t*)ray_data(col))[0], 10);
+
+    /* Phase 3a: empty I64 cell must be both bitmap-null AND NULL_I64-in-slot. */
     TEST_ASSERT_TRUE(ray_vec_is_null(col, 1));
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(col))[1], NULL_I64);
+
     TEST_ASSERT_FALSE(ray_vec_is_null(col, 2));
     TEST_ASSERT_EQ_I(((int64_t*)ray_data(col))[2], 30);
 
@@ -215,7 +219,11 @@ static test_result_t test_csv_null_i64_unparseable(void) {
     ray_t* col = ray_table_get_col_idx(loaded, 0);
     TEST_ASSERT_FALSE(ray_vec_is_null(col, 0));
     TEST_ASSERT_EQ_I(((int64_t*)ray_data(col))[0], 10);
+
+    /* Phase 3a: unparseable I64 cell must be both bitmap-null AND NULL_I64-in-slot. */
     TEST_ASSERT_TRUE(ray_vec_is_null(col, 1));
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(col))[1], NULL_I64);
+
     TEST_ASSERT_FALSE(ray_vec_is_null(col, 2));
     TEST_ASSERT_EQ_I(((int64_t*)ray_data(col))[2], 30);
 
@@ -240,7 +248,12 @@ static test_result_t test_csv_null_f64(void) {
     ray_t* col = ray_table_get_col_idx(loaded, 0);
     TEST_ASSERT_FALSE(ray_vec_is_null(col, 0));
     TEST_ASSERT_EQ_F(((double*)ray_data(col))[0], 1.5, 1e-6);
+
+    /* Phase 2: empty F64 cell must be both bitmap-null AND NaN-in-slot. */
     TEST_ASSERT_TRUE(ray_vec_is_null(col, 1));
+    double slot1 = ((double*)ray_data(col))[1];
+    TEST_ASSERT_TRUE(slot1 != slot1);            /* NaN check */
+
     TEST_ASSERT_FALSE(ray_vec_is_null(col, 2));
     TEST_ASSERT_EQ_F(((double*)ray_data(col))[2], 3.5, 1e-6);
 
@@ -251,7 +264,159 @@ static test_result_t test_csv_null_f64(void) {
     PASS();
 }
 
+/* Phase 3a: empty I16 cell must be both bitmap-null AND NULL_I16-in-slot. */
+static test_result_t test_csv_null_i16(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    FILE* f = fopen(TMP_CSV, "w");
+    fprintf(f, "x\n10\n\n30\n");
+    fclose(f);
+
+    int8_t schema[1] = { RAY_I16 };
+    ray_t* loaded = ray_read_csv_opts(TMP_CSV, 0, true, schema, 1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+
+    ray_t* col = ray_table_get_col_idx(loaded, 0);
+    TEST_ASSERT_EQ_I(col->type, RAY_I16);
+    TEST_ASSERT_FALSE(ray_vec_is_null(col, 0));
+    TEST_ASSERT_EQ_I(((int16_t*)ray_data(col))[0], 10);
+
+    TEST_ASSERT_TRUE(ray_vec_is_null(col, 1));
+    TEST_ASSERT_EQ_I(((int16_t*)ray_data(col))[1], NULL_I16);
+
+    TEST_ASSERT_FALSE(ray_vec_is_null(col, 2));
+    TEST_ASSERT_EQ_I(((int16_t*)ray_data(col))[2], 30);
+
+    ray_release(loaded);
+    unlink(TMP_CSV);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* Phase 3a: empty I32 cell must be both bitmap-null AND NULL_I32-in-slot. */
+static test_result_t test_csv_null_i32(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    FILE* f = fopen(TMP_CSV, "w");
+    fprintf(f, "x\n10\n\n30\n");
+    fclose(f);
+
+    int8_t schema[1] = { RAY_I32 };
+    ray_t* loaded = ray_read_csv_opts(TMP_CSV, 0, true, schema, 1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+
+    ray_t* col = ray_table_get_col_idx(loaded, 0);
+    TEST_ASSERT_EQ_I(col->type, RAY_I32);
+    TEST_ASSERT_FALSE(ray_vec_is_null(col, 0));
+    TEST_ASSERT_EQ_I(((int32_t*)ray_data(col))[0], 10);
+
+    TEST_ASSERT_TRUE(ray_vec_is_null(col, 1));
+    TEST_ASSERT_EQ_I(((int32_t*)ray_data(col))[1], NULL_I32);
+
+    TEST_ASSERT_FALSE(ray_vec_is_null(col, 2));
+    TEST_ASSERT_EQ_I(((int32_t*)ray_data(col))[2], 30);
+
+    ray_release(loaded);
+    unlink(TMP_CSV);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* Phase 3a: empty DATE cell must be both bitmap-null AND NULL_I32-in-slot. */
+static test_result_t test_csv_null_date(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    FILE* f = fopen(TMP_CSV, "w");
+    fprintf(f, "d\n2025-01-02\n\n2026-12-31\n");
+    fclose(f);
+
+    int8_t schema[1] = { RAY_DATE };
+    ray_t* loaded = ray_read_csv_opts(TMP_CSV, 0, true, schema, 1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+
+    ray_t* col = ray_table_get_col_idx(loaded, 0);
+    TEST_ASSERT_EQ_I(col->type, RAY_DATE);
+    TEST_ASSERT_FALSE(ray_vec_is_null(col, 0));
+
+    TEST_ASSERT_TRUE(ray_vec_is_null(col, 1));
+    TEST_ASSERT_EQ_I(((int32_t*)ray_data(col))[1], NULL_I32);
+
+    TEST_ASSERT_FALSE(ray_vec_is_null(col, 2));
+
+    ray_release(loaded);
+    unlink(TMP_CSV);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* Phase 3a: empty TIME cell must be both bitmap-null AND NULL_I32-in-slot. */
+static test_result_t test_csv_null_time(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    FILE* f = fopen(TMP_CSV, "w");
+    fprintf(f, "t\n12:34:56\n\n23:59:59\n");
+    fclose(f);
+
+    int8_t schema[1] = { RAY_TIME };
+    ray_t* loaded = ray_read_csv_opts(TMP_CSV, 0, true, schema, 1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+
+    ray_t* col = ray_table_get_col_idx(loaded, 0);
+    TEST_ASSERT_EQ_I(col->type, RAY_TIME);
+    TEST_ASSERT_FALSE(ray_vec_is_null(col, 0));
+
+    TEST_ASSERT_TRUE(ray_vec_is_null(col, 1));
+    TEST_ASSERT_EQ_I(((int32_t*)ray_data(col))[1], NULL_I32);
+
+    TEST_ASSERT_FALSE(ray_vec_is_null(col, 2));
+
+    ray_release(loaded);
+    unlink(TMP_CSV);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* Phase 3a: empty TIMESTAMP cell must be both bitmap-null AND NULL_I64-in-slot. */
+static test_result_t test_csv_null_timestamp(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    FILE* f = fopen(TMP_CSV, "w");
+    fprintf(f, "ts\n2025-01-02T03:04:05\n\n2026-12-31T23:59:59\n");
+    fclose(f);
+
+    int8_t schema[1] = { RAY_TIMESTAMP };
+    ray_t* loaded = ray_read_csv_opts(TMP_CSV, 0, true, schema, 1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+
+    ray_t* col = ray_table_get_col_idx(loaded, 0);
+    TEST_ASSERT_EQ_I(col->type, RAY_TIMESTAMP);
+    TEST_ASSERT_FALSE(ray_vec_is_null(col, 0));
+
+    TEST_ASSERT_TRUE(ray_vec_is_null(col, 1));
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(col))[1], NULL_I64);
+
+    TEST_ASSERT_FALSE(ray_vec_is_null(col, 2));
+
+    ray_release(loaded);
+    unlink(TMP_CSV);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 static test_result_t test_csv_null_bool(void) {
+    /* v4 contract (Phase 1 lockdown): BOOL is non-nullable.  Empty cells
+     * materialize as `false`, not as a null bit — the BOOL column has
+     * neither HAS_NULLS nor any set bitmap bits. */
     ray_heap_init();
     (void)ray_sym_init();
 
@@ -265,9 +430,11 @@ static test_result_t test_csv_null_bool(void) {
     ray_t* col = ray_table_get_col_idx(loaded, 0);
     TEST_ASSERT_FALSE(ray_vec_is_null(col, 0));
     TEST_ASSERT_EQ_I((int)((uint8_t*)ray_data(col))[0], 1);
-    TEST_ASSERT_TRUE(ray_vec_is_null(col, 1));  /* empty */
+    TEST_ASSERT_FALSE(ray_vec_is_null(col, 1));         /* empty → false */
+    TEST_ASSERT_EQ_I((int)((uint8_t*)ray_data(col))[1], 0);
     TEST_ASSERT_FALSE(ray_vec_is_null(col, 2));
     TEST_ASSERT_EQ_I((int)((uint8_t*)ray_data(col))[2], 0);
+    TEST_ASSERT_FALSE(col->attrs & RAY_ATTR_HAS_NULLS);
 
     ray_release(loaded);
     unlink(TMP_CSV);
@@ -1251,8 +1418,10 @@ static test_result_t test_csv_explicit_i32_schema(void) {
 }
 
 static test_result_t test_csv_explicit_u8_schema_serial(void) {
-    /* Force the serial parse path (n_rows ≤ 8192) and exercise truncated-row
-     * fill defaults plus null-column path. */
+    /* v4 contract (Phase 1 lockdown): U8 is non-nullable.  Truncated rows
+     * still fill defaults (0), but no null bit is set and HAS_NULLS is
+     * stripped post-parse.  Exercises the serial parse path
+     * (n_rows ≤ 8192) plus the past-row-boundary fill branch. */
     ray_heap_init();
     (void)ray_sym_init();
 
@@ -1275,17 +1444,15 @@ static test_result_t test_csv_explicit_u8_schema_serial(void) {
     ray_t* b = ray_table_get_col_idx(loaded, 1);
     TEST_ASSERT_EQ_I(a->type, RAY_U8);
     TEST_ASSERT_EQ_I(b->type, RAY_U8);
-    TEST_ASSERT_TRUE(b->attrs & RAY_ATTR_HAS_NULLS);
+    TEST_ASSERT_FALSE(b->attrs & RAY_ATTR_HAS_NULLS);
 
     const uint8_t* ad = (const uint8_t*)ray_data(a);
     const uint8_t* bd = (const uint8_t*)ray_data(b);
     for (int i = 0; i < 200; i++) {
         TEST_ASSERT_EQ_I((int)ad[i], i % 256);
-        if (i % 50 == 0) TEST_ASSERT_TRUE(ray_vec_is_null(b, i));
-        else {
-            TEST_ASSERT_FALSE(ray_vec_is_null(b, i));
-            TEST_ASSERT_EQ_I((int)bd[i], (i + 1) % 256);
-        }
+        TEST_ASSERT_FALSE(ray_vec_is_null(b, i));
+        int expected_b = (i % 50 == 0) ? 0 : ((i + 1) % 256);
+        TEST_ASSERT_EQ_I((int)bd[i], expected_b);
     }
 
     ray_release(loaded);
@@ -1328,6 +1495,11 @@ const test_entry_t csv_entries[] = {
     { "csv/null_i64", test_csv_null_i64, NULL, NULL },
     { "csv/null_i64_unparseable", test_csv_null_i64_unparseable, NULL, NULL },
     { "csv/null_f64", test_csv_null_f64, NULL, NULL },
+    { "csv/null_i16", test_csv_null_i16, NULL, NULL },
+    { "csv/null_i32", test_csv_null_i32, NULL, NULL },
+    { "csv/null_date", test_csv_null_date, NULL, NULL },
+    { "csv/null_time", test_csv_null_time, NULL, NULL },
+    { "csv/null_timestamp", test_csv_null_timestamp, NULL, NULL },
     { "csv/null_bool", test_csv_null_bool, NULL, NULL },
     { "csv/null_sym", test_csv_null_sym, NULL, NULL },
     { "csv/no_nulls_no_nullmap", test_csv_no_nulls_no_nullmap, NULL, NULL },

@@ -1,0 +1,22 @@
+;; Phase 1: BOOL and U8 are non-nullable.
+;;
+;; Empty cells in CSV ingest must materialize as false / 0 with no null mark.
+;; All other nullable types still produce typed nulls as before.
+
+;; Sanity: typed nulls for the nullable types still parse and report null.
+(nil? 0Nh) -- true
+(nil? 0Ni) -- true
+(nil? 0Nl) -- true
+(nil? 0Nf) -- true
+
+;; CSV ingest: empty BOOL / U8 cells coerce to false / 0, not null.
+(.sys.exec "rm -f /tmp/rfl_phase1_bool_u8_unique_path.csv")
+(.sys.exec "printf 'b,u\\ntrue,1\\n,\\nfalse,3\\n' > /tmp/rfl_phase1_bool_u8_unique_path.csv")
+(set P1Lockdown (.csv.read [B8 U8] "/tmp/rfl_phase1_bool_u8_unique_path.csv"))
+(count P1Lockdown)                            -- 3
+(at P1Lockdown 'b)                            -- [true false false]
+(at P1Lockdown 'u)                            -- [0x01 0x00 0x03]
+(map nil? (at P1Lockdown 'b))                 -- [false false false]
+(map nil? (at P1Lockdown 'u))                 -- [false false false]
+(sum (map nil? (at P1Lockdown 'b)))           -- 0
+(sum (map nil? (at P1Lockdown 'u)))           -- 0
