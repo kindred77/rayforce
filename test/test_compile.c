@@ -304,6 +304,66 @@ static test_result_t test_compile_f64_cast_i64_null_slot_is_nan(void) {
     PASS();
 }
 
+static test_result_t test_compile_i32_cast_i64_null_slot_is_sentinel(void) {
+    /* Phase 3a: (as 'I32 [1 0N 3]) — narrowing I64→I32 cast over a vector
+     * with a null slot must leave NULL_I32 (INT32_MIN) in the payload, not
+     * the cast result (int32_t)NULL_I64 = 0.  Mirror of the Phase 2e F64
+     * post-cast NaN fill for integer destinations. */
+    ray_t* r = ray_eval_str("(as 'I32 [1 0N 3])");
+    TEST_ASSERT_NOT_NULL(r);
+    if (RAY_IS_ERR(r)) { ray_error_free(r); FAIL("eval error on cast"); }
+    TEST_ASSERT(ray_is_vec(r), "expected vector");
+    TEST_ASSERT(r->type == RAY_I32, "expected I32 vector");
+    TEST_ASSERT(r->len == 3, "expected len 3");
+    int32_t* d = (int32_t*)ray_data(r);
+    TEST_ASSERT_EQ_I(d[0], 1);
+    TEST_ASSERT_EQ_I(d[1], NULL_I32);
+    TEST_ASSERT_EQ_I(d[2], 3);
+    TEST_ASSERT_TRUE(ray_vec_is_null(r, 1));
+    ray_release(r);
+    PASS();
+}
+
+static test_result_t test_compile_i16_cast_i32_null_slot_is_sentinel(void) {
+    /* Phase 3a Hazard 3: chained narrowing I64→I32→I16 cast over a vector
+     * with a null slot must leave NULL_I16 (INT16_MIN) in the I16 payload,
+     * NOT (int16_t)NULL_I32 = 0.  The destination-width sentinel must be
+     * written post-cast directly — propagating through the cast macro
+     * truncates the sentinel. */
+    ray_t* r = ray_eval_str("(as 'I16 (as 'I32 [1 0N 3]))");
+    TEST_ASSERT_NOT_NULL(r);
+    if (RAY_IS_ERR(r)) { ray_error_free(r); FAIL("eval error on cast"); }
+    TEST_ASSERT(ray_is_vec(r), "expected vector");
+    TEST_ASSERT(r->type == RAY_I16, "expected I16 vector");
+    TEST_ASSERT(r->len == 3, "expected len 3");
+    int16_t* d = (int16_t*)ray_data(r);
+    TEST_ASSERT_EQ_I(d[0], 1);
+    TEST_ASSERT_EQ_I(d[1], NULL_I16);
+    TEST_ASSERT_EQ_I(d[2], 3);
+    TEST_ASSERT_TRUE(ray_vec_is_null(r, 1));
+    ray_release(r);
+    PASS();
+}
+
+static test_result_t test_compile_i64_cast_i32_null_slot_is_sentinel(void) {
+    /* Phase 3a: widening I32→I64 cast must still fill NULL_I64 in the
+     * null payload slot — the cast macro would write (int64_t)NULL_I32
+     * = -2147483648, which collides with a legitimate I64 value. */
+    ray_t* r = ray_eval_str("(as 'I64 (as 'I32 [1 0N 3]))");
+    TEST_ASSERT_NOT_NULL(r);
+    if (RAY_IS_ERR(r)) { ray_error_free(r); FAIL("eval error on cast"); }
+    TEST_ASSERT(ray_is_vec(r), "expected vector");
+    TEST_ASSERT(r->type == RAY_I64, "expected I64 vector");
+    TEST_ASSERT(r->len == 3, "expected len 3");
+    int64_t* d = (int64_t*)ray_data(r);
+    TEST_ASSERT_EQ_I(d[0], 1);
+    TEST_ASSERT_EQ_I(d[1], NULL_I64);
+    TEST_ASSERT_EQ_I(d[2], 3);
+    TEST_ASSERT_TRUE(ray_vec_is_null(r, 1));
+    ray_release(r);
+    PASS();
+}
+
 /* ════════════════════════════════════════════════════════════════════
  * 9. let with invalid (non-symbol) name — compile error path (line 244)
  *    Triggers c->error = true in the let handler.
@@ -664,6 +724,15 @@ const test_entry_t compile_entries[] = {
                                                                        compile_setup, compile_teardown },
     { "compile/f64_cast_i64_null_slot_is_nan",
                                      test_compile_f64_cast_i64_null_slot_is_nan,
+                                                                       compile_setup, compile_teardown },
+    { "compile/i32_cast_i64_null_slot_is_sentinel",
+                                     test_compile_i32_cast_i64_null_slot_is_sentinel,
+                                                                       compile_setup, compile_teardown },
+    { "compile/i16_cast_i32_null_slot_is_sentinel",
+                                     test_compile_i16_cast_i32_null_slot_is_sentinel,
+                                                                       compile_setup, compile_teardown },
+    { "compile/i64_cast_i32_null_slot_is_sentinel",
+                                     test_compile_i64_cast_i32_null_slot_is_sentinel,
                                                                        compile_setup, compile_teardown },
     { "compile/let_reserved_name",   test_compile_let_reserved_name,   compile_setup, compile_teardown },
     { "compile/unary_wrong_arity",   test_compile_unary_wrong_arity,   compile_setup, compile_teardown },
