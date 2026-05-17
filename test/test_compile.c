@@ -522,6 +522,102 @@ static test_result_t test_compile_pivot_i64_null_key_slot_is_sentinel(void) {
 }
 
 /* ════════════════════════════════════════════════════════════════════
+ * Phase 3a-13 regressions — producer-side dual-encoding gaps that
+ * surfaced from the cross-cut integration review (temporal extract,
+ * strlen, mark_i64_overflow_as_null, median_per_group).
+ * Each previously wrote 0 / 0.0 to the payload while flipping the null
+ * bitmap bit — bitmap-only nulls that violate the dual-encoding
+ * contract.  After the fix the slot must carry the width-correct
+ * sentinel (NULL_I64 / NULL_F64) in addition to the bitmap bit.
+ * ════════════════════════════════════════════════════════════════════ */
+static test_result_t test_compile_temporal_extract_null_slot_is_sentinel(void) {
+    /* Phase 3a-13 (C1): extract over a nullable TIMESTAMP column must
+     * fill NULL_I64 in the result I64 payload — the kernel previously
+     * wrote 0 with a bitmap bit, which sentinel-aware readers see as a
+     * legitimate zero. */
+    ray_t* r = ray_eval_str(
+        "(do (set __t13 (as 'TIMESTAMP (list 1000000000 0Np 2000000000)))"
+        "    (yyyy __t13))");
+    TEST_ASSERT_NOT_NULL(r);
+    if (RAY_IS_ERR(r)) { ray_error_free(r); FAIL("eval error on temporal extract null"); }
+    TEST_ASSERT(ray_is_vec(r), "expected vector");
+    TEST_ASSERT(r->type == RAY_I64, "expected I64 vector");
+    TEST_ASSERT(r->len == 3, "expected len 3");
+    int64_t* d = (int64_t*)ray_data(r);
+    TEST_ASSERT_EQ_I(d[1], NULL_I64);
+    TEST_ASSERT_TRUE(ray_vec_is_null(r, 1));
+    TEST_ASSERT_FALSE(ray_vec_is_null(r, 0));
+    TEST_ASSERT_FALSE(ray_vec_is_null(r, 2));
+    ray_release(r);
+    PASS();
+}
+
+static test_result_t test_compile_strlen_null_slot_is_sentinel(void) {
+    /* Phase 3a-13 (C2): strlen over a nullable STR vector must fill
+     * NULL_I64 in the I64 payload, not 0.  Mixed string-vec literal
+     * `[\"hello\" 0N \"x\"]` parses as a LIST; cast to STR to get a
+     * proper typed nullable STR vector. */
+    ray_t* r = ray_eval_str("(strlen (as 'STR (concat \"hello\" (concat 0N \"x\"))))");
+    TEST_ASSERT_NOT_NULL(r);
+    if (RAY_IS_ERR(r)) { ray_error_free(r); FAIL("eval error on strlen null"); }
+    TEST_ASSERT(ray_is_vec(r), "expected vector");
+    TEST_ASSERT(r->type == RAY_I64, "expected I64 vector");
+    TEST_ASSERT(r->len == 3, "expected len 3");
+    int64_t* d = (int64_t*)ray_data(r);
+    TEST_ASSERT_EQ_I(d[0], 5);
+    TEST_ASSERT_EQ_I(d[1], NULL_I64);
+    TEST_ASSERT_EQ_I(d[2], 1);
+    TEST_ASSERT_TRUE(ray_vec_is_null(r, 1));
+    ray_release(r);
+    PASS();
+}
+
+static test_result_t test_compile_overflow_neg_int64_min_slot_is_null_i64(void) {
+    /* Phase 3a-13 (C3): negating INT64_MIN over an i64 column produces
+     * INT64_MIN (k/q convention surfaces this as typed null).  After
+     * Phase 3a-1 INT64_MIN IS NULL_I64 — mark_i64_overflow_as_null must
+     * leave the sentinel in place, not overwrite with 0. */
+    ray_t* r = ray_eval_str(
+        "(do (set Vneg (concat -9223372036854775808 (concat -5 (concat 5 0))))"
+        "    (set Tneg (table [v] (list Vneg)))"
+        "    (at (select {x: (neg v) from: Tneg}) 'x))");
+    TEST_ASSERT_NOT_NULL(r);
+    if (RAY_IS_ERR(r)) { ray_error_free(r); FAIL("eval error on neg-overflow"); }
+    TEST_ASSERT(ray_is_vec(r), "expected vector");
+    TEST_ASSERT(r->type == RAY_I64, "expected I64 vector");
+    TEST_ASSERT(r->len == 4, "expected len 4");
+    int64_t* d = (int64_t*)ray_data(r);
+    TEST_ASSERT_EQ_I(d[0], NULL_I64);    /* overflow row holds sentinel */
+    TEST_ASSERT_TRUE(ray_vec_is_null(r, 0));
+    ray_release(r);
+    PASS();
+}
+
+static test_result_t test_compile_median_per_group_all_null_slot_is_nan(void) {
+    /* Phase 3a-13 (C4 — closes Phase 2 gap): median over a per-group
+     * all-null F64 input must fill NULL_F64 in the result slot, not
+     * leave it as 0.0. */
+    ray_t* r = ray_eval_str(
+        "(do (set __tm13 (table [k v] (list [1 1 2 2] [0Nf 0Nf 1.0 2.0])))"
+        "    (set __rm13 (select {m: (med v) by: k from: __tm13}))"
+        "    (at __rm13 'm))");
+    TEST_ASSERT_NOT_NULL(r);
+    if (RAY_IS_ERR(r)) { ray_error_free(r); FAIL("eval error on median per-group"); }
+    TEST_ASSERT(ray_is_vec(r), "expected vector");
+    TEST_ASSERT(r->type == RAY_F64, "expected F64 vector");
+    TEST_ASSERT(r->len == 2, "expected len 2 (two groups)");
+    double* d = (double*)ray_data(r);
+    /* Group k=1 is all-null → slot must be NaN with bitmap bit set. */
+    TEST_ASSERT(d[0] != d[0], "all-null group slot must be NaN");
+    TEST_ASSERT_TRUE(ray_vec_is_null(r, 0));
+    /* Group k=2 has 1.0 and 2.0 → median 1.5. */
+    TEST_ASSERT(d[1] == 1.5, "k=2 group median should be 1.5");
+    TEST_ASSERT_FALSE(ray_vec_is_null(r, 1));
+    ray_release(r);
+    PASS();
+}
+
+/* ════════════════════════════════════════════════════════════════════
  * 9. let with invalid (non-symbol) name — compile error path (line 244)
  *    Triggers c->error = true in the let handler.
  * ════════════════════════════════════════════════════════════════════ */
@@ -911,6 +1007,18 @@ const test_entry_t compile_entries[] = {
                                                                        compile_setup, compile_teardown },
     { "compile/pivot_i64_null_key_slot_is_sentinel",
                                      test_compile_pivot_i64_null_key_slot_is_sentinel,
+                                                                       compile_setup, compile_teardown },
+    { "compile/temporal_extract_null_slot_is_sentinel",
+                                     test_compile_temporal_extract_null_slot_is_sentinel,
+                                                                       compile_setup, compile_teardown },
+    { "compile/strlen_null_slot_is_sentinel",
+                                     test_compile_strlen_null_slot_is_sentinel,
+                                                                       compile_setup, compile_teardown },
+    { "compile/overflow_neg_int64_min_slot_is_null_i64",
+                                     test_compile_overflow_neg_int64_min_slot_is_null_i64,
+                                                                       compile_setup, compile_teardown },
+    { "compile/median_per_group_all_null_slot_is_nan",
+                                     test_compile_median_per_group_all_null_slot_is_nan,
                                                                        compile_setup, compile_teardown },
     { "compile/let_reserved_name",   test_compile_let_reserved_name,   compile_setup, compile_teardown },
     { "compile/unary_wrong_arity",   test_compile_unary_wrong_arity,   compile_setup, compile_teardown },
