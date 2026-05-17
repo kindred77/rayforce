@@ -240,7 +240,12 @@ static test_result_t test_csv_null_f64(void) {
     ray_t* col = ray_table_get_col_idx(loaded, 0);
     TEST_ASSERT_FALSE(ray_vec_is_null(col, 0));
     TEST_ASSERT_EQ_F(((double*)ray_data(col))[0], 1.5, 1e-6);
+
+    /* Phase 2: empty F64 cell must be both bitmap-null AND NaN-in-slot. */
     TEST_ASSERT_TRUE(ray_vec_is_null(col, 1));
+    double slot1 = ((double*)ray_data(col))[1];
+    TEST_ASSERT_TRUE(slot1 != slot1);            /* NaN check */
+
     TEST_ASSERT_FALSE(ray_vec_is_null(col, 2));
     TEST_ASSERT_EQ_F(((double*)ray_data(col))[2], 3.5, 1e-6);
 
