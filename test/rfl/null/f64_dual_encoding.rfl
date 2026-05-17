@@ -1,0 +1,52 @@
+;; Phase 2 dual-encoding contract: F64 nulls are NaN in the payload AND
+;; have the nullmap bit set.  Every consumer must agree on null-ness.
+
+;; ----- 1. Atom construction -----
+
+(nil? 0Nf) -- true
+
+;; ----- 2. CSV ingest -----
+
+(.sys.exec "rm -f /tmp/rfl_phase2_f64_dual.csv")
+(.sys.exec "printf 'x\\n1.5\\n\\n3.5\\n' > /tmp/rfl_phase2_f64_dual.csv")
+(set P2F (.csv.read [F64] "/tmp/rfl_phase2_f64_dual.csv"))
+(count P2F)                  -- 3
+(nil? (at (at P2F 'x) 1))    -- true
+(at (at P2F 'x) 0)           -- 1.5
+(at (at P2F 'x) 2)           -- 3.5
+
+;; ----- 3. Aggregations exclude nulls -----
+
+(sum (at P2F 'x))   -- 5.0
+(avg (at P2F 'x))   -- 2.5
+(min (at P2F 'x))   -- 1.5
+(max (at P2F 'x))   -- 3.5
+
+;; ----- 4. Sort places nulls per policy -----
+
+(at (asc (as 'F64 [3.0 0N 1.0 2.0])) 0)  -- 0Nf
+(at (desc (as 'F64 [3.0 0N 1.0 2.0])) 3) -- 0Nf
+
+;; ----- 5. Distinct collapses null rows -----
+
+(count (distinct (as 'F64 [1.0 0N 2.0 0N 1.0])))  -- 3
+(nil? (at (distinct (as 'F64 [0N 0N 0N])) 0))     -- true
+(count (distinct (as 'F64 [0N 0N 0N])))           -- 1
+
+;; ----- 6. Group-by buckets non-null F64 rows correctly -----
+
+(set Tg (table [v g] (list (as 'F64 [1.0 0N 2.0 0N 3.0]) [10 20 10 20 30])))
+(set Rg (select {c: (count v) from: Tg by: g}))
+(count Rg)                                  -- 3
+
+;; ----- 7. UPDATE cast preserves null encoding -----
+
+(set Tc (table [v] (list (as 'F64 [10.0 20.0 30.0]))))
+(set Tu (update {from: Tc v: [1 0N 3]}))
+(nil? (at (at Tu 'v) 1)) -- true
+(sum (at Tu 'v))         -- 4.0
+
+;; ----- 8. Fused-group parity: nullable F64 stays out of fused path -----
+
+(set Tn (table [v g] (list (as 'F64 [1.0 2.0 0N 4.0 5.0]) [0 0 1 1 1])))
+(sum (at (select {s: (sum v) from: Tn where: (>= g 0) by: g}) 's)) -- 12.0
