@@ -240,7 +240,12 @@ static test_result_t test_csv_null_f64(void) {
     ray_t* col = ray_table_get_col_idx(loaded, 0);
     TEST_ASSERT_FALSE(ray_vec_is_null(col, 0));
     TEST_ASSERT_EQ_F(((double*)ray_data(col))[0], 1.5, 1e-6);
+
+    /* Phase 2: empty F64 cell must be both bitmap-null AND NaN-in-slot. */
     TEST_ASSERT_TRUE(ray_vec_is_null(col, 1));
+    double slot1 = ((double*)ray_data(col))[1];
+    TEST_ASSERT_TRUE(slot1 != slot1);            /* NaN check */
+
     TEST_ASSERT_FALSE(ray_vec_is_null(col, 2));
     TEST_ASSERT_EQ_F(((double*)ray_data(col))[2], 3.5, 1e-6);
 
@@ -252,6 +257,9 @@ static test_result_t test_csv_null_f64(void) {
 }
 
 static test_result_t test_csv_null_bool(void) {
+    /* v4 contract (Phase 1 lockdown): BOOL is non-nullable.  Empty cells
+     * materialize as `false`, not as a null bit — the BOOL column has
+     * neither HAS_NULLS nor any set bitmap bits. */
     ray_heap_init();
     (void)ray_sym_init();
 
@@ -265,9 +273,11 @@ static test_result_t test_csv_null_bool(void) {
     ray_t* col = ray_table_get_col_idx(loaded, 0);
     TEST_ASSERT_FALSE(ray_vec_is_null(col, 0));
     TEST_ASSERT_EQ_I((int)((uint8_t*)ray_data(col))[0], 1);
-    TEST_ASSERT_TRUE(ray_vec_is_null(col, 1));  /* empty */
+    TEST_ASSERT_FALSE(ray_vec_is_null(col, 1));         /* empty → false */
+    TEST_ASSERT_EQ_I((int)((uint8_t*)ray_data(col))[1], 0);
     TEST_ASSERT_FALSE(ray_vec_is_null(col, 2));
     TEST_ASSERT_EQ_I((int)((uint8_t*)ray_data(col))[2], 0);
+    TEST_ASSERT_FALSE(col->attrs & RAY_ATTR_HAS_NULLS);
 
     ray_release(loaded);
     unlink(TMP_CSV);
@@ -1251,8 +1261,10 @@ static test_result_t test_csv_explicit_i32_schema(void) {
 }
 
 static test_result_t test_csv_explicit_u8_schema_serial(void) {
-    /* Force the serial parse path (n_rows ≤ 8192) and exercise truncated-row
-     * fill defaults plus null-column path. */
+    /* v4 contract (Phase 1 lockdown): U8 is non-nullable.  Truncated rows
+     * still fill defaults (0), but no null bit is set and HAS_NULLS is
+     * stripped post-parse.  Exercises the serial parse path
+     * (n_rows ≤ 8192) plus the past-row-boundary fill branch. */
     ray_heap_init();
     (void)ray_sym_init();
 
@@ -1275,17 +1287,15 @@ static test_result_t test_csv_explicit_u8_schema_serial(void) {
     ray_t* b = ray_table_get_col_idx(loaded, 1);
     TEST_ASSERT_EQ_I(a->type, RAY_U8);
     TEST_ASSERT_EQ_I(b->type, RAY_U8);
-    TEST_ASSERT_TRUE(b->attrs & RAY_ATTR_HAS_NULLS);
+    TEST_ASSERT_FALSE(b->attrs & RAY_ATTR_HAS_NULLS);
 
     const uint8_t* ad = (const uint8_t*)ray_data(a);
     const uint8_t* bd = (const uint8_t*)ray_data(b);
     for (int i = 0; i < 200; i++) {
         TEST_ASSERT_EQ_I((int)ad[i], i % 256);
-        if (i % 50 == 0) TEST_ASSERT_TRUE(ray_vec_is_null(b, i));
-        else {
-            TEST_ASSERT_FALSE(ray_vec_is_null(b, i));
-            TEST_ASSERT_EQ_I((int)bd[i], (i + 1) % 256);
-        }
+        TEST_ASSERT_FALSE(ray_vec_is_null(b, i));
+        int expected_b = (i % 50 == 0) ? 0 : ((i + 1) % 256);
+        TEST_ASSERT_EQ_I((int)bd[i], expected_b);
     }
 
     ray_release(loaded);

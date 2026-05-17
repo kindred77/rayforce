@@ -258,6 +258,53 @@ static test_result_t test_compile_vector_literal(void) {
 }
 
 /* ════════════════════════════════════════════════════════════════════
+ * Phase 2e: F64 dual-encoding regression tests.
+ *
+ * Each consumer of an F64 vector with a null bit MUST see NULL_F64
+ * (= NaN) in the raw `double` payload as well — kernels are allowed to
+ * read the slot without consulting the bitmap.  These tests assert the
+ * payload, not the bitmap, by reading `((double*)ray_data(v))[idx]` and
+ * checking `x != x` (NaN's defining property).
+ * ════════════════════════════════════════════════════════════════════ */
+
+static test_result_t test_compile_f64_mixed_literal_null_slot_is_nan(void) {
+    /* Mixed numeric literal [1.0 0N 3.0] promotes to F64 in parse.c.
+     * The integer null 0N (typed I64 null with i64=0) used to write 0.0
+     * into the f64 slot, breaking the dual-encoding contract. */
+    ray_t* r = ray_eval_str("[1.0 0N 3.0]");
+    TEST_ASSERT_NOT_NULL(r);
+    if (RAY_IS_ERR(r)) { ray_error_free(r); FAIL("eval error on mixed F64 literal"); }
+    TEST_ASSERT(ray_is_vec(r), "expected vector");
+    TEST_ASSERT(r->type == RAY_F64, "expected F64 vector");
+    TEST_ASSERT(r->len == 3, "expected len 3");
+    double* d = (double*)ray_data(r);
+    TEST_ASSERT(d[0] == 1.0, "slot 0 should be 1.0");
+    TEST_ASSERT(d[1] != d[1], "slot 1 (null) must be NaN");
+    TEST_ASSERT(d[2] == 3.0, "slot 2 should be 3.0");
+    ray_release(r);
+    PASS();
+}
+
+static test_result_t test_compile_f64_cast_i64_null_slot_is_nan(void) {
+    /* (as 'F64 [1 0N 3]) — cast an I64 vector with a null slot to F64.
+     * The cast loop writes (double)src[i] regardless of null status,
+     * which used to leave 0.0 in the null F64 slot.  Phase 2e routes
+     * the post-cast nullmap copy through a per-slot NULL_F64 fill. */
+    ray_t* r = ray_eval_str("(as 'F64 [1 0N 3])");
+    TEST_ASSERT_NOT_NULL(r);
+    if (RAY_IS_ERR(r)) { ray_error_free(r); FAIL("eval error on cast"); }
+    TEST_ASSERT(ray_is_vec(r), "expected vector");
+    TEST_ASSERT(r->type == RAY_F64, "expected F64 vector");
+    TEST_ASSERT(r->len == 3, "expected len 3");
+    double* d = (double*)ray_data(r);
+    TEST_ASSERT(d[0] == 1.0, "slot 0 should be 1.0");
+    TEST_ASSERT(d[1] != d[1], "slot 1 (null) must be NaN");
+    TEST_ASSERT(d[2] == 3.0, "slot 2 should be 3.0");
+    ray_release(r);
+    PASS();
+}
+
+/* ════════════════════════════════════════════════════════════════════
  * 9. let with invalid (non-symbol) name — compile error path (line 244)
  *    Triggers c->error = true in the let handler.
  * ════════════════════════════════════════════════════════════════════ */
@@ -612,6 +659,12 @@ const test_entry_t compile_entries[] = {
     { "compile/and_special_form",    test_compile_and_special_form,    compile_setup, compile_teardown },
     { "compile/or_special_form",     test_compile_or_special_form,     compile_setup, compile_teardown },
     { "compile/vector_literal",      test_compile_vector_literal,      compile_setup, compile_teardown },
+    { "compile/f64_mixed_literal_null_slot_is_nan",
+                                     test_compile_f64_mixed_literal_null_slot_is_nan,
+                                                                       compile_setup, compile_teardown },
+    { "compile/f64_cast_i64_null_slot_is_nan",
+                                     test_compile_f64_cast_i64_null_slot_is_nan,
+                                                                       compile_setup, compile_teardown },
     { "compile/let_reserved_name",   test_compile_let_reserved_name,   compile_setup, compile_teardown },
     { "compile/unary_wrong_arity",   test_compile_unary_wrong_arity,   compile_setup, compile_teardown },
     { "compile/binary_wrong_arity",  test_compile_binary_wrong_arity,  compile_setup, compile_teardown },

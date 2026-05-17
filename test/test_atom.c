@@ -456,6 +456,33 @@ static test_result_t test_atom_eq_list_sym_atoms(void) {
     PASS();
 }
 
+static test_result_t test_atom_typed_null_f64(void) {
+    /* Phase 2 dual-encoding: ray_typed_null(-RAY_F64) must store NaN in
+     * the f64 payload AND set nullmap[0]&1.  Downstream kernels that
+     * read the slot raw (without consulting the bitmap) then see NaN. */
+    ray_t* v = ray_typed_null(-RAY_F64);
+    TEST_ASSERT_NOT_NULL(v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    TEST_ASSERT_TRUE(ray_is_atom(v));
+    TEST_ASSERT_EQ_I(v->type, -RAY_F64);
+    TEST_ASSERT_TRUE(v->f64 != v->f64);          /* NaN by IEEE-754 */
+    TEST_ASSERT_TRUE((v->nullmap[0] & 1) != 0);  /* bitmap bit also set */
+    ray_release(v);
+    PASS();
+}
+
+static test_result_t test_atom_typed_null_i64(void) {
+    /* Phase 2 control: non-F64 typed nulls still use i64 = 0 + bitmap bit. */
+    ray_t* v = ray_typed_null(-RAY_I64);
+    TEST_ASSERT_NOT_NULL(v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    TEST_ASSERT_EQ_I(v->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(v->i64, 0);
+    TEST_ASSERT_TRUE((v->nullmap[0] & 1) != 0);
+    ray_release(v);
+    PASS();
+}
+
 /* ---- Suite definition -------------------------------------------------- */
 
 const test_entry_t atom_entries[] = {
@@ -480,6 +507,8 @@ const test_entry_t atom_entries[] = {
     { "atom/eq_list_with_nulls",  test_atom_eq_list_with_nulls,  atom_setup, atom_teardown },
     { "atom/eq_list_empty",       test_atom_eq_list_empty,       atom_setup, atom_teardown },
     { "atom/eq_list_sym_atoms",   test_atom_eq_list_sym_atoms,   atom_setup, atom_teardown },
+    { "atom/typed_null_f64",      test_atom_typed_null_f64,      atom_setup, atom_teardown },
+    { "atom/typed_null_i64",      test_atom_typed_null_i64,      atom_setup, atom_teardown },
     { NULL, NULL, NULL, NULL },
 };
 
