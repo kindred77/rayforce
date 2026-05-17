@@ -364,6 +364,28 @@ static test_result_t test_compile_i64_cast_i32_null_slot_is_sentinel(void) {
     PASS();
 }
 
+static test_result_t test_compile_i64_scalar_null_propagation_slot_is_sentinel(void) {
+    /* Phase 3a-4: a binary op with a scalar-null I64 operand should fill the
+     * I64 result payload with NULL_I64, not leave it as the kernel's output.
+     * `(+ 0Nl [1 2 3])` — scalar-null left operand triggers set_all_null
+     * with an I64 result vector.  Mirror of the Phase 2e F64 NaN-fill. */
+    ray_t* r = ray_eval_str("(+ 0Nl [1 2 3])");
+    TEST_ASSERT_NOT_NULL(r);
+    if (RAY_IS_ERR(r)) { ray_error_free(r); FAIL("eval error on scalar-null add"); }
+    TEST_ASSERT(ray_is_vec(r), "expected vector");
+    TEST_ASSERT(r->type == RAY_I64, "expected I64 vector");
+    TEST_ASSERT(r->len == 3, "expected len 3");
+    int64_t* d = (int64_t*)ray_data(r);
+    TEST_ASSERT_EQ_I(d[0], NULL_I64);
+    TEST_ASSERT_EQ_I(d[1], NULL_I64);
+    TEST_ASSERT_EQ_I(d[2], NULL_I64);
+    TEST_ASSERT_TRUE(ray_vec_is_null(r, 0));
+    TEST_ASSERT_TRUE(ray_vec_is_null(r, 1));
+    TEST_ASSERT_TRUE(ray_vec_is_null(r, 2));
+    ray_release(r);
+    PASS();
+}
+
 /* ════════════════════════════════════════════════════════════════════
  * 9. let with invalid (non-symbol) name — compile error path (line 244)
  *    Triggers c->error = true in the let handler.
@@ -733,6 +755,9 @@ const test_entry_t compile_entries[] = {
                                                                        compile_setup, compile_teardown },
     { "compile/i64_cast_i32_null_slot_is_sentinel",
                                      test_compile_i64_cast_i32_null_slot_is_sentinel,
+                                                                       compile_setup, compile_teardown },
+    { "compile/i64_scalar_null_propagation_slot_is_sentinel",
+                                     test_compile_i64_scalar_null_propagation_slot_is_sentinel,
                                                                        compile_setup, compile_teardown },
     { "compile/let_reserved_name",   test_compile_let_reserved_name,   compile_setup, compile_teardown },
     { "compile/unary_wrong_arity",   test_compile_unary_wrong_arity,   compile_setup, compile_teardown },
