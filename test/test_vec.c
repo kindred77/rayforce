@@ -244,7 +244,11 @@ static test_result_t test_vec_null_inline(void) {
     TEST_ASSERT_FALSE(ray_vec_is_null(v, 0));
     TEST_ASSERT_FALSE(ray_vec_is_null(v, 4));
 
-    /* Clear a null */
+    /* Clear a null.  Post-sentinel-migration the caller must restore
+     * a real payload value before clearing the bitmap — the stale
+     * NULL_I64 sentinel from the prior set-null would otherwise still
+     * read back as null under sentinel-as-truth semantics. */
+    ((int64_t*)ray_data(v))[3] = 30;  /* restore vals[3] = 3 * 10 */
     ray_vec_set_null(v, 3, false);
     TEST_ASSERT_FALSE(ray_vec_is_null(v, 3));
 
