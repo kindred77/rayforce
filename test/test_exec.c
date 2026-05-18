@@ -1686,11 +1686,13 @@ static test_result_t test_exec_asof_left_join(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
     /* Left outer: all 3 left rows preserved */
     TEST_ASSERT_EQ_I(ray_table_nrows(result), 3);
-    /* Verify: time=50 has no match (before any right row), bid should be 0 (NULL fill) */
+    /* Verify: time=50 has no match (before any right row), bid is null.
+     * Check via ray_vec_is_null, not raw payload == 0.0 — post-sentinel-
+     * migration the null fill is NULL_F64 (NaN), not 0.0. */
     ray_t* bid_col = ray_table_get_col(result, n_bid);
     TEST_ASSERT_NOT_NULL(bid_col);
     double* bid_data = (double*)ray_data(bid_col);
-    TEST_ASSERT((bid_data[0]) == (0.0), "double == failed");   /* t=50: no match */
+    TEST_ASSERT(ray_vec_is_null(bid_col, 0), "slot 0 should be null (no match)");
     TEST_ASSERT((bid_data[1]) == (0.8), "double == failed");   /* t=100: right t=80 */
     TEST_ASSERT((bid_data[2]) == (1.5), "double == failed");   /* t=200: right t=150 */
 
