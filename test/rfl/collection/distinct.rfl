@@ -43,9 +43,10 @@
 (nil? (at (as 'I32 [1 0Nl 3]) 1)) -- true
 (at (as 'F64 [1 0Nl 3]) 0) -- 1.0
 (at (as 'F64 [1 0Nl 3]) 2) -- 3.0
-;; cast to I16/U8/BOOL preserves nulls
+;; cast to I16 preserves nulls; U8/BOOL are non-nullable per Phase 1
+;; so the null collapses to u8-zero (no NULL_U8 sentinel).
 (nil? (at (as 'I16 [1 0Nl 3]) 1)) -- true
-(nil? (at (as 'U8 [1 0Nl 3]) 1)) -- true
+(nil? (at (as 'U8 [1 0Nl 3]) 1)) -- false
 ;; cast non-null values survive
 (at (as 'I32 [10 0Nl 30]) 0) -- 10i
 (at (as 'I32 [10 0Nl 30]) 2) -- 30i

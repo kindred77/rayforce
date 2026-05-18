@@ -259,25 +259,31 @@ static test_result_t test_vec_null_inline(void) {
 /* ---- null_external (>128 elements) ------------------------------------- */
 
 static test_result_t test_vec_null_external(void) {
-    ray_t* v = ray_vec_new(RAY_U8, 200);
+    /* Post-sentinel-migration: U8 is non-nullable per Phase 1.  The
+     * test now uses I16 to exercise the >128-element null path.  No
+     * ext_nullmap allocation either — sentinel lives in the payload. */
+    ray_t* v = ray_vec_new(RAY_I16, 200);
 
-    /* Append 200 elements */
     for (int i = 0; i < 200; i++) {
-        uint8_t val = (uint8_t)(i & 0xFF);
+        int16_t val = (int16_t)i;
         v = ray_vec_append(v, &val);
         TEST_ASSERT_FALSE(RAY_IS_ERR(v));
     }
     TEST_ASSERT_EQ_I(v->len, 200);
 
-    /* Set null at index 150 (forces external nullmap) */
     ray_vec_set_null(v, 150, true);
-    TEST_ASSERT_TRUE(v->attrs & RAY_ATTR_NULLMAP_EXT);
     TEST_ASSERT_TRUE(v->attrs & RAY_ATTR_HAS_NULLS);
     TEST_ASSERT_TRUE(ray_vec_is_null(v, 150));
     TEST_ASSERT_FALSE(ray_vec_is_null(v, 0));
     TEST_ASSERT_FALSE(ray_vec_is_null(v, 149));
 
-    /* External nullmap is owned by the vector and released with it. */
+    /* U8 set-null is now rejected (Phase 1 lockdown). */
+    ray_t* u = ray_vec_new(RAY_U8, 4);
+    uint8_t z = 0;
+    for (int i = 0; i < 4; i++) u = ray_vec_append(u, &z);
+    TEST_ASSERT_EQ_I(ray_vec_set_null_checked(u, 1, true), RAY_ERR_TYPE);
+    ray_release(u);
+
     ray_release(v);
     PASS();
 }
@@ -308,27 +314,23 @@ static test_result_t test_vec_slice_release_parent_ref(void) {
 /* ---- null_external_release_ext_ref -------------------------------------- */
 
 static test_result_t test_vec_null_external_release_ext_ref(void) {
-    ray_t* v = ray_vec_new(RAY_U8, 200);
+    /* Post-sentinel-migration: ext_nullmap allocation is gone for
+     * sentinel types.  Test reduces to a release-without-leak smoke
+     * test on a large nullable vec (ASAN is the gate). */
+    ray_t* v = ray_vec_new(RAY_I16, 200);
     TEST_ASSERT_NOT_NULL(v);
 
     for (int i = 0; i < 200; i++) {
-        uint8_t val = (uint8_t)(i & 0xFF);
+        int16_t val = (int16_t)i;
         v = ray_vec_append(v, &val);
         TEST_ASSERT_FALSE(RAY_IS_ERR(v));
     }
 
     ray_vec_set_null(v, 150, true);
-    TEST_ASSERT_TRUE(v->attrs & RAY_ATTR_NULLMAP_EXT);
-    ray_t* ext = v->ext_nullmap;
-    TEST_ASSERT_NOT_NULL(ext);
-
-    ray_retain(ext); /* guard ref */
-    TEST_ASSERT_EQ_U(ext->rc, 2);
+    TEST_ASSERT_TRUE(v->attrs & RAY_ATTR_HAS_NULLS);
+    TEST_ASSERT_TRUE(ray_vec_is_null(v, 150));
 
     ray_release(v);
-    TEST_ASSERT_EQ_U(ext->rc, 1);
-
-    ray_release(ext);
     PASS();
 }
 

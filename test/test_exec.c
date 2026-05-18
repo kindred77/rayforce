@@ -5087,10 +5087,12 @@ static test_result_t test_expr_unary_cast_narrow_nullable(void) {
     ray_release(tbl);
     ray_sym_destroy();
 
-    /* U8 nullable → I64 */
+    /* U8 → I64.  Post-Phase-1: U8 is non-nullable; set_null is rejected
+     * by ray_vec_set_null_checked (the void wrapper discards the error),
+     * so the cell stays at its raw value.  Sum becomes 1+2+3 = 6. */
     uint8_t raw8[] = {1, 2, 3};
     ray_t* v8 = ray_vec_from_raw(RAY_U8, raw8, 3);
-    ray_vec_set_null(v8, 1, true);
+    ray_vec_set_null(v8, 1, true);  /* no-op for U8 post-lockdown */
     (void)ray_sym_init();
     int64_t n8 = ray_sym_intern("c8", 2);
     tbl = ray_table_new(1);
@@ -5103,18 +5105,18 @@ static test_result_t test_expr_unary_cast_narrow_nullable(void) {
     s = ray_sum(g, c);
     result = ray_execute(g, s);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    TEST_ASSERT_EQ_I(result->i64, 4);  /* 1+3=4, pos1=null */
+    TEST_ASSERT_EQ_I(result->i64, 6);
     ray_release(result);
     ray_graph_free(g);
 
-    /* BOOL nullable → I64 */
-    g = ray_graph_new(tbl);  /* reuse tbl - actually we need BOOL */
+    /* BOOL → I64.  Same Phase 1 non-nullable rule as U8.  Sum = 1+0+1 = 2. */
+    g = ray_graph_new(tbl);
     ray_release(tbl);
     ray_sym_destroy();
 
     uint8_t rawb[] = {1, 0, 1};
     ray_t* vbool = ray_vec_from_raw(RAY_BOOL, rawb, 3);
-    ray_vec_set_null(vbool, 2, true);
+    ray_vec_set_null(vbool, 2, true);  /* no-op for BOOL post-lockdown */
     (void)ray_sym_init();
     int64_t nb = ray_sym_intern("cb", 2);
     tbl = ray_table_new(1);
@@ -5127,7 +5129,7 @@ static test_result_t test_expr_unary_cast_narrow_nullable(void) {
     s = ray_sum(g, c);
     result = ray_execute(g, s);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    TEST_ASSERT_EQ_I(result->i64, 1);  /* 1+0=1, pos2=null */
+    TEST_ASSERT_EQ_I(result->i64, 2);
     ray_release(result);
     ray_graph_free(g);
 
@@ -5664,7 +5666,11 @@ static test_result_t test_expr_binary_i16_nullable(void) {
     PASS();
 }
 
-/* ---- binary_range: U8 nullable — covers MIN2/MAX2/DIV/MOD ---- */
+/* ---- binary_range: U8 — covers MIN2/MAX2/MOD ----
+ * Post-Phase-1: U8 is non-nullable; the original test marked va[3]
+ * null to force the non-fused path — that's a no-op now.  The
+ * computations still exercise binary_range U8 kernels; only the
+ * expected sums change (no null masks). */
 static test_result_t test_expr_binary_u8_nullable(void) {
     ray_heap_init();
     (void)ray_sym_init();
@@ -5673,8 +5679,6 @@ static test_result_t test_expr_binary_u8_nullable(void) {
     uint8_t rawb[] = {15,  5, 25,  8};
     ray_t* va = ray_vec_from_raw(RAY_U8, rawa, 4);
     ray_t* vb = ray_vec_from_raw(RAY_U8, rawb, 4);
-    /* Make nullable to force non-fused path */
-    ray_vec_set_null(va, 3, true);
     int64_t na = ray_sym_intern("a", 1);
     int64_t nb = ray_sym_intern("b", 1);
     ray_t* tbl = ray_table_new(2);
@@ -5682,7 +5686,7 @@ static test_result_t test_expr_binary_u8_nullable(void) {
     tbl = ray_table_add_col(tbl, nb, vb);
     ray_release(va); ray_release(vb);
 
-    /* MIN2 — exercises binary_range U8 MIN2 */
+    /* MIN2 */
     ray_graph_t* g = ray_graph_new(tbl);
     ray_op_t* a_op = ray_scan(g, "a");
     ray_op_t* b_op = ray_scan(g, "b");
@@ -5690,12 +5694,12 @@ static test_result_t test_expr_binary_u8_nullable(void) {
     ray_op_t* s  = ray_sum(g, mn);
     ray_t* result = ray_execute(g, s);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    /* min(10,15)+min(20,5)+min(30,25)+null = 10+5+25=40 */
-    TEST_ASSERT_EQ_I(result->i64, 40);
+    /* min(10,15)+min(20,5)+min(30,25)+min(40,8) = 10+5+25+8 = 48 */
+    TEST_ASSERT_EQ_I(result->i64, 48);
     ray_release(result);
     ray_graph_free(g);
 
-    /* MAX2 — exercises binary_range U8 MAX2 */
+    /* MAX2 */
     g = ray_graph_new(tbl);
     a_op = ray_scan(g, "a");
     b_op = ray_scan(g, "b");
@@ -5703,12 +5707,12 @@ static test_result_t test_expr_binary_u8_nullable(void) {
     s  = ray_sum(g, mx);
     result = ray_execute(g, s);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    /* max(10,15)+max(20,5)+max(30,25)+null = 15+20+30=65 */
-    TEST_ASSERT_EQ_I(result->i64, 65);
+    /* max(10,15)+max(20,5)+max(30,25)+max(40,8) = 15+20+30+40 = 105 */
+    TEST_ASSERT_EQ_I(result->i64, 105);
     ray_release(result);
     ray_graph_free(g);
 
-    /* MOD — exercises binary_range U8 MOD */
+    /* MOD */
     g = ray_graph_new(tbl);
     a_op = ray_scan(g, "a");
     b_op = ray_scan(g, "b");
@@ -5716,7 +5720,7 @@ static test_result_t test_expr_binary_u8_nullable(void) {
     s  = ray_sum(g, md);
     result = ray_execute(g, s);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    /* 10%15=10, 20%5=0, 30%25=5, null: sum=15 */
+    /* 10%15=10, 20%5=0, 30%25=5, 40%8=0  -> sum = 15 */
     TEST_ASSERT_EQ_I(result->i64, 15);
     ray_release(result);
     ray_graph_free(g);
@@ -5802,7 +5806,9 @@ static test_result_t test_expr_group_linear_mul(void) {
     PASS();
 }
 
-/* ---- binary_range BOOL AND/OR: nullable BOOL columns (non-fused path) ---- */
+/* ---- binary_range BOOL AND/OR: non-fused path coverage ----
+ * Post-Phase-1: BOOL is non-nullable; set_null on BOOL is a no-op
+ * (returns RAY_ERR_TYPE).  AND / OR sums recomputed accordingly. */
 static test_result_t test_expr_binary_bool_nullable(void) {
     ray_heap_init();
     (void)ray_sym_init();
@@ -5811,8 +5817,6 @@ static test_result_t test_expr_binary_bool_nullable(void) {
     uint8_t rawb[] = {1, 1, 0, 0, 1};
     ray_t* va = ray_vec_from_raw(RAY_BOOL, rawa, 5);
     ray_t* vb = ray_vec_from_raw(RAY_BOOL, rawb, 5);
-    /* Make nullable to force non-fused path */
-    ray_vec_set_null(va, 4, true);
     int64_t na = ray_sym_intern("p", 1);
     int64_t nb = ray_sym_intern("q", 1);
     ray_t* tbl = ray_table_new(2);
@@ -5820,21 +5824,20 @@ static test_result_t test_expr_binary_bool_nullable(void) {
     tbl = ray_table_add_col(tbl, nb, vb);
     ray_release(va); ray_release(vb);
 
-    /* AND — exercises binary_range BOOL AND (src_is_i64=0, F64 path) */
+    /* AND */
     ray_graph_t* g = ray_graph_new(tbl);
     ray_op_t* p = ray_scan(g, "p");
     ray_op_t* q = ray_scan(g, "q");
     ray_op_t* an = ray_and(g, p, q);
-    /* Count true values */
     ray_op_t* s = ray_sum(g, ray_cast(g, an, RAY_I64));
     ray_t* result = ray_execute(g, s);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    /* AND: 1&&1=1, 0&&1=0, 1&&0=0, 0&&0=0, null: only pos0=1, sum=1 */
-    TEST_ASSERT_EQ_I(result->i64, 1);
+    /* AND: 1&&1=1, 0&&1=0, 1&&0=0, 0&&0=0, 1&&1=1  -> sum = 2 */
+    TEST_ASSERT_EQ_I(result->i64, 2);
     ray_release(result);
     ray_graph_free(g);
 
-    /* OR — exercises binary_range BOOL OR */
+    /* OR */
     g = ray_graph_new(tbl);
     p = ray_scan(g, "p");
     q = ray_scan(g, "q");
@@ -5842,8 +5845,8 @@ static test_result_t test_expr_binary_bool_nullable(void) {
     s = ray_sum(g, ray_cast(g, or_op, RAY_I64));
     result = ray_execute(g, s);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    /* OR: 1||1=1, 0||1=1, 1||0=1, 0||0=0, null: 3 non-null true, sum=3 */
-    TEST_ASSERT_EQ_I(result->i64, 3);
+    /* OR: 1||1=1, 0||1=1, 1||0=1, 0||0=0, 1||1=1  -> sum = 4 */
+    TEST_ASSERT_EQ_I(result->i64, 4);
     ray_release(result);
     ray_graph_free(g);
 

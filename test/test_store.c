@@ -2177,23 +2177,25 @@ static test_result_t test_serde_obj_save_error(void) {
  * covering lines 586-656 (the RAY_BOOL/U8/I16/I32/DATE/TIME/F32 vector
  * deserialization with HAS_NULLS). */
 static test_result_t test_serde_vec_null_bitmaps(void) {
-    /* BOOL vector with null at index 1 */
+    /* BOOL non-nullable per Phase 1 — set_null rejects.  Round-trip
+     * a non-null BOOL vec to keep the serde path covered. */
     {
         ray_t* v = ray_vec_new(RAY_BOOL, 3);
         TEST_ASSERT_NOT_NULL(v); TEST_ASSERT_FALSE(RAY_IS_ERR(v));
         v->len = 3;
         uint8_t* d = (uint8_t*)ray_data(v);
         d[0] = 1; d[1] = 0; d[2] = 1;
-        ray_vec_set_null(v, 1, true);
+        TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 1, true), RAY_ERR_TYPE);
 
         ray_t* w = ray_ser(v);
         TEST_ASSERT_NOT_NULL(w); TEST_ASSERT_FALSE(RAY_IS_ERR(w));
         ray_t* b = ray_de(w);
         TEST_ASSERT_NOT_NULL(b); TEST_ASSERT_FALSE(RAY_IS_ERR(b));
         TEST_ASSERT_EQ_I(b->type, RAY_BOOL);
-        TEST_ASSERT_TRUE(b->attrs & RAY_ATTR_HAS_NULLS);
-        TEST_ASSERT_TRUE(ray_vec_is_null(b, 1));
-        TEST_ASSERT_FALSE(ray_vec_is_null(b, 0));
+        uint8_t* bd = (uint8_t*)ray_data(b);
+        TEST_ASSERT_EQ_I(bd[0], 1);
+        TEST_ASSERT_EQ_I(bd[1], 0);
+        TEST_ASSERT_EQ_I(bd[2], 1);
         ray_release(b); ray_release(w); ray_release(v);
     }
     /* I32 vector with null at index 0 */
