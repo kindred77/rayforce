@@ -1,0 +1,74 @@
+;; Sentinel-only baseline (Stage A1 gate).
+;;
+;; Pins the end-state contract: for every nullable numeric/temporal type,
+;; the NULL_* sentinel value in a vec payload is the SOLE truth that
+;; consumers (count, sum/avg, format, sort, distinct) need.  No assertion
+;; here reads or depends on a nullmap bit, so this test must keep passing
+;; after the bitmap is stripped in later A-stage steps.
+;;
+;; Every check builds a real vec containing a sentinel (via `as` cast or
+;; CSV ingest) and exercises a consumer — never just `(nil? 0Nl)` on a
+;; literal, which would only test the parser.
+
+;; ----- 1. F64 (NaN-encoded null) -----
+(set Vf (as 'F64 [1.0 0N 3.0 0N 5.0]))
+(nil? (at Vf 1))                       -- true
+(- (count Vf) (sum (map nil? Vf)))     -- 3
+(sum Vf)                               -- 9.0
+(avg Vf)                               -- 3.0
+(format "%" (at Vf 1))                 -- "0Nf"
+(at (asc Vf) 0)                        -- 0Nf
+(at (desc Vf) 4)                       -- 0Nf
+(count (distinct Vf))                  -- 4
+
+;; ----- 2. I16 (INT16_MIN sentinel) -----
+(set V16 (as 'I16 [1 0N 2 0N 3]))
+(nil? (at V16 1))                      -- true
+(- (count V16) (sum (map nil? V16)))   -- 3
+(sum V16)                              -- 6
+(format "%" (at V16 1))                -- "0Nh"
+(at (asc V16) 0)                       -- 0Nh
+(at (desc V16) 4)                      -- 0Nh
+(count (distinct V16))                 -- 4
+
+;; ----- 3. I32 (INT32_MIN sentinel) -----
+(set V32 (as 'I32 [10 0N 20 0N 30]))
+(nil? (at V32 1))                      -- true
+(- (count V32) (sum (map nil? V32)))   -- 3
+(sum V32)                              -- 60
+(format "%" (at V32 1))                -- "0Ni"
+(at (asc V32) 0)                       -- 0Ni
+(count (distinct V32))                 -- 4
+
+;; ----- 4. I64 (INT64_MIN sentinel) via CSV ingest -----
+;; CSV reader writes the sentinel into the payload; consumers must read it.
+(.sys.exec "rm -f /tmp/rfl_sentinel_baseline_i64.csv")
+(.sys.exec "printf 'x\\n100\\n\\n300\\n\\n500\\n' > /tmp/rfl_sentinel_baseline_i64.csv")
+(set Ti (.csv.read [I64] "/tmp/rfl_sentinel_baseline_i64.csv"))
+(set Vi (at Ti 'x))
+(count Vi)                             -- 5
+(nil? (at Vi 1))                       -- true
+(nil? (at Vi 3))                       -- true
+(- (count Vi) (sum (map nil? Vi)))     -- 3
+(sum Vi)                               -- 900
+(avg Vi)                               -- 300.0
+(format "%" (at Vi 1))                 -- "0Nl"
+(at (asc Vi) 0)                        -- 0Nl
+(at (desc Vi) 4)                       -- 0Nl
+(count (distinct Vi))                  -- 4
+
+;; ----- 5. DATE temporal (NULL_DATE sentinel) -----
+(set Vd (as 'DATE [7305 0N 7306 0N 7307]))
+(nil? (at Vd 1))                       -- true
+(- (count Vd) (sum (map nil? Vd)))     -- 3
+(format "%" (at Vd 1))                 -- "0Nd"
+(at (asc Vd) 0)                        -- 0Nd
+(count (distinct Vd))                  -- 4
+
+;; ----- 6. TIMESTAMP temporal (NULL_TIMESTAMP sentinel) -----
+(set Vp (as 'TIMESTAMP [1000 0N 2000 0N 3000]))
+(nil? (at Vp 1))                       -- true
+(- (count Vp) (sum (map nil? Vp)))     -- 3
+(format "%" (at Vp 1))                 -- "0Np"
+(at (asc Vp) 0)                        -- 0Np
+(count (distinct Vp))                  -- 4
