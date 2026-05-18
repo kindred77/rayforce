@@ -76,7 +76,65 @@ Storage (changed):
   ray_vec_nullmap_bytes()      REMOVED. No callers post-migration.
 ```
 
-## Work plan (high level)
+## Revised strategy (after first execution attempt — 2026-05-18)
+
+**What the first attempt revealed.** The original Stage A plan flipped `ray_vec_is_null` to sentinel-based on the assumption that Phase 2 / 3a / 3a-13 had already closed all producer-side dual-encoding gaps (per the language in `include/rayforce.h:309-346`). The flip produced ~40 test failures + 1 ASAN SEGV across 9 test files and ~17 operator source files; reverted at commit `f8a2e9c0`. **The doc's claim was overstated** — many producers (cast_vec_copy_nulls, csv_write_cell consumer side, sort sentinel reorder, window lag/lead, str ops, etc.) still write the bitmap without writing the type-correct sentinel into the payload, or read the bitmap to drive subsequent sentinel-fill loops.
+
+**Refined order:** instrument the consumer side first, run the suite under the instrumentation to enumerate the divergent producers, fix each producer one-at-a-time, then flip the source of truth.
+
+### Stage 0 — Consistency-check instrumentation (NEW, completed 2026-05-18)
+
+- `ray_vec_is_null` cross-checks the bitmap answer against `sentinel_is_null` when built with `-DRAYFORCE_NULL_AUDIT`. On divergence, the call site's return address is recorded and a one-shot stack trace is dumped to stderr (deduplicated by caller, max 128 unique sites).
+- New `make audit` target builds + runs the full suite with the audit enabled.
+- Baseline audit (master `717feba8` + branch through commit `45661964`): **142 unique divergent call sites** across `src/ops/{window,sort,string,idxop,join,expr,builtins,fused_topk,filter,linkop,query}.c`, `src/io/csv.c`, `src/table/dict.c`, `src/lang/{format,eval}.c`, plus test fixtures that exercise those operators. Distribution captured at audit time:
+  ```
+  18 src/ops/window.c          5 src/vec/vec.c          2 src/lang/internal.h
+  18 test/test_window.c        5 src/ops/string.c        2 src/ops/internal.h
+  13 test/test_index.c         5 src/ops/idxop.c         2 src/ops/fused_topk.c
+   9 test/test_exec.c          4 src/ops/join.c          2 src/ops/filter.c
+   8 test/test_store.c         4 src/ops/expr.c          2 src/table/dict.c
+   8 test/test_sort.c          4 src/ops/builtins.c      2 src/ops/linkop.c
+   6 src/ops/sort.c            3 test/test_str.c         1 src/ops/query.c
+   6 test/test_vec.c           3 test/test_lang.c        1 src/lang/format.c
+   5 test/test_fused_topk.c                              1 src/lang/eval.c
+                                                        1 src/io/csv.c
+                                                        1 test/test_partition_exec.c
+                                                        1 test/test_link.c
+  ```
+- All divergences are `bitmap=1 sentinel=0` (bitmap claims null, sentinel disagrees). Direction confirms the gap is on the producer side: bitmap was set without a corresponding sentinel write.
+
+### Stage 1 — Producer-gap closure (revised — runs BEFORE the flip)
+
+For each `make audit` divergence: trace the offending consumer call back through the test scenario or production caller to identify the upstream producer that set the bitmap bit without writing the sentinel. Fix the producer to dual-write (sentinel + bitmap). Re-run `make audit`; the divergence count strictly decreases.
+
+Order of attack (by leverage — fix producers that account for the most divergences first):
+1. `cast_vec_copy_nulls` in `src/ops/builtins.c:748` — accounts for the `(as 'T [...])` cast paths.
+2. Window kernels in `src/ops/window.c` (lag/lead/first/last/running aggregates) — 18 divergence sites concentrated here.
+3. Sort sentinel reorder in `src/ops/sort.c` — null-position policies must write the dest sentinel.
+4. Join window/asof null-key handling in `src/ops/join.c`.
+5. Index attach paths in `src/ops/idxop.c` (zone_scan_int/float, attach_hash, attach_bloom).
+6. String ops in `src/ops/string.c` and `src/ops/strop.c`.
+7. Misc lower-volume sites in `expr.c`, `linkop.c`, `filter.c`, `fused_topk.c`, `dict.c`, `query.c`, `csv.c`, `format.c`, `eval.c`.
+
+Each producer fix is one commit. The `test/rfl/null/sentinel_only_baseline` test plus any new per-producer regression test gates the fix. The Stage 1 exit gate is: `make audit` reports zero divergences across the full suite (including the existing `test/rfl/null/*` and the new `sentinel_only_baseline`).
+
+### Stage 2 — Flip source of truth (formerly Stage A3/A4)
+
+Once Stage 1 is clean, `ray_vec_is_null` and `RAY_ATOM_IS_NULL` switch their definitions to sentinel-based. The audit instrumentation can stay in place as a regression net for the remaining stages; remove it in Stage 5.
+
+### Stage 3 — Drop bitmap writes (formerly Stage C)
+
+### Stage 4 — Remove bitmap storage (formerly Stage D)
+
+### Stage 5 — Cleanup (formerly Stage E)
+
+Remove the audit instrumentation, the `make audit` target, and `RAYFORCE_NULL_AUDIT` references.
+
+### Stage 6 — Verify + completion PR (formerly Stage F)
+
+---
+
+## Original work plan (high level, superseded by the Revised Strategy above for stage ordering)
 
 All work happens on `sentinel-migration-finish`. Commits are structured for review; the final PR squashes/merges as a single completion against master.
 
