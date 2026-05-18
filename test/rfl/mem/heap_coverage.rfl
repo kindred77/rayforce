@@ -233,13 +233,12 @@ FV1 -- [1.5 2.5 3.5]
 (.sys.timeit 0) -- 0
 
 ;; ════════════════════════════════════════════════════════════════════════════
-;; 7. NULLMAP_EXT release/retain (heap.c:560-562, 658-660, 753-755).
-;;    A vector with > 128 elements where any are null spills the inline
-;;    nullmap into an external bitmap vec.
+;; 7. Large nullable vec release/retain.
+;;    A vector with > 128 elements where any are null exercises the
+;;    sentinel-encoded null path (no external bitmap child).
 ;; ════════════════════════════════════════════════════════════════════════════
 
-;; 200-element vec with nulls scattered — exceeds 128-bit inline cap
-;; so ext_nullmap is allocated.
+;; 203-element vec with sentinel-encoded nulls scattered.
 (set NV (concat (til 100) (concat [0Nl 0Nl 0Nl] (til 100))))
 (count NV) -- 203
 (set NV2 NV)

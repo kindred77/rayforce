@@ -259,9 +259,8 @@ static test_result_t test_vec_null_inline(void) {
 /* ---- null_external (>128 elements) ------------------------------------- */
 
 static test_result_t test_vec_null_external(void) {
-    /* Post-sentinel-migration: U8 is non-nullable per Phase 1.  The
-     * test now uses I16 to exercise the >128-element null path.  No
-     * ext_nullmap allocation either — sentinel lives in the payload. */
+    /* >128-element nullable vec.  U8 is non-nullable so the test uses
+     * I16, whose null state lives as NULL_I16 in the payload. */
     ray_t* v = ray_vec_new(RAY_I16, 200);
 
     for (int i = 0; i < 200; i++) {
@@ -314,9 +313,8 @@ static test_result_t test_vec_slice_release_parent_ref(void) {
 /* ---- null_external_release_ext_ref -------------------------------------- */
 
 static test_result_t test_vec_null_external_release_ext_ref(void) {
-    /* Post-sentinel-migration: ext_nullmap allocation is gone for
-     * sentinel types.  Test reduces to a release-without-leak smoke
-     * test on a large nullable vec (ASAN is the gate). */
+    /* Release-without-leak smoke test on a large nullable vec.  No
+     * external bitmap child to track; ASAN is the gate. */
     ray_t* v = ray_vec_new(RAY_I16, 200);
     TEST_ASSERT_NOT_NULL(v);
 

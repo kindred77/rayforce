@@ -335,8 +335,9 @@ static test_result_t test_morsel_init_range_multi(void) {
     PASS();
 }
 
-/* Inline-nullmap path in ray_morsel_next: vec with HAS_NULLS, offset<128,
- * no NULLMAP_EXT.  Drives line 96-100 (the inline-bitmap branch). */
+/* ray_morsel_next exposes null_bits for a HAS_NULLS vec — verify the
+ * morsel iteration surfaces a non-NULL bitmap pointer derived from the
+ * sentinel-encoded payload. */
 static test_result_t test_morsel_nulls_inline(void) {
     int64_t raw[32];
     for (int i = 0; i < 32; i++) raw[i] = (int64_t)i;
@@ -353,8 +354,8 @@ static test_result_t test_morsel_nulls_inline(void) {
     PASS();
 }
 
-/* External-nullmap path: vec with >128 elements + HAS_NULLS forces
- * RAY_ATTR_NULLMAP_EXT, exercising line 92-95 of morsel.c. */
+/* >128-element nullable vec: morsel iteration must surface null_bits
+ * derived from the sentinel-encoded payload at every step. */
 static test_result_t test_morsel_nulls_external(void) {
     ray_t* v = ray_vec_new(RAY_I64, 200);
     int64_t* raw = (int64_t*)ray_data(v);
@@ -463,12 +464,9 @@ static test_result_t test_morsel_has_index_ext_nulls(void) {
     }
     TEST_ASSERT_EQ_I(v->len, n);
 
-    /* Post-sentinel-migration: NULLMAP_EXT allocation is gone for
-     * sentinel-supporting I64.  The null state is preserved on the
-     * vec via the payload sentinel and on the morsel via the
-     * synthesized null_bits_buf (filled by ray_morsel_next from
-     * sentinel reads).  The test still covers the
-     * HAS_INDEX + >128-element path; just no bitmap-flag assertions. */
+    /* Null state lives in the payload via the I64 sentinel and is
+     * surfaced on the morsel via null_bits_buf (filled by ray_morsel_next
+     * from sentinel reads).  Verify the HAS_INDEX + >128-element path. */
     TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 150, true), RAY_OK);
     TEST_ASSERT_TRUE(v->attrs & RAY_ATTR_HAS_NULLS);
 

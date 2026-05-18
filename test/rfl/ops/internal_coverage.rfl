@@ -334,15 +334,12 @@
 (at (at (select {s: (sum v) from: BN by: k asc: k}) 's) 199) -- 198
 
 ;; ── 9. Large parallel GROUP BY with STDDEV + singleton groups ──────────────
-;; Covers par_set_null (lines 954-956): parallel radix GROUP BY (nrows >= 65536),
-;; > 128 output groups (200 groups), singleton groups at indices >= 128 (keys
-;; 128.0..199.0 have 1 row each).  STDDEV of 1 row → cnt=1 → insuf=true → null.
-;; F64 keys are NOT eligible for the DA path → radix HT path is used.
-;;   1. par_prepare_nullmap: vec->len=200>128 → inline bit-0 set+clear (no EXT yet)
-;;   2. radix_phase3: singleton group at di>=128 → par_set_null(di>=128)
-;;      → !(NULLMAP_EXT) && idx>=128 → ray_vec_set_null promotes inline→EXT
-;;      → lines 954-956 covered
-;;   3. par_finalize_nulls: vec now has EXT → lines 983-989 (EXT scan) covered
+;; Covers par_set_null on a parallel radix GROUP BY (nrows >= 65536) with
+;; > 128 output groups (200 groups) and singleton groups at indices >= 128
+;; (keys 128.0..199.0 have 1 row each).  STDDEV of 1 row → cnt=1 → insuf=true
+;; → null, which goes through par_set_null on output rows past the legacy
+;; 128-inline boundary.  F64 keys are NOT eligible for the DA path → radix
+;; HT path is used.
 ;; Keys 0.0..127.0 each have 512 rows (65536 total), 128.0..199.0 have 1 row each.
 ;; Total = 65608 rows ≥ RAY_PARALLEL_THRESHOLD (65536) → parallel radix path.
 (set PN_keys (concat (as 'F64 (% (til 65536) 128)) (as 'F64 (+ 128 (til 72)))))

@@ -791,19 +791,21 @@ static test_result_t test_group_parted(void) {
     PASS();
 }
 
-/* ---- test_col_ext_nullmap_roundtrip ------------------------------------- */
+/* ---- test_col_large_nullable_roundtrip ---------------------------------- */
 
-#define EXT_NM_LEN 256  /* >128 to trigger ext_nullmap */
+#define LARGE_NULL_LEN 256  /* >128 — past the legacy inline-bitmap boundary */
 
-static test_result_t test_col_ext_nullmap_roundtrip(void) {
-    /* Create a 256-element I64 vector with nulls at various positions */
-    ray_t* vec = ray_vec_new(RAY_I64, EXT_NM_LEN);
+static test_result_t test_col_large_nullable_roundtrip(void) {
+    /* Create a 256-element I64 vector with sentinel-encoded nulls at
+     * various positions and round-trip through ray_col_save +
+     * ray_col_load / ray_col_mmap. */
+    ray_t* vec = ray_vec_new(RAY_I64, LARGE_NULL_LEN);
     TEST_ASSERT_NOT_NULL(vec);
     TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
-    vec->len = EXT_NM_LEN;
+    vec->len = LARGE_NULL_LEN;
 
     int64_t* data = (int64_t*)ray_data(vec);
-    for (int i = 0; i < EXT_NM_LEN; i++) data[i] = i * 10;
+    for (int i = 0; i < LARGE_NULL_LEN; i++) data[i] = i * 10;
 
     /* Set nulls at positions: 0, 5, 127, 128, 200, 255 */
     int null_positions[] = { 0, 5, 127, 128, 200, 255 };
@@ -811,10 +813,6 @@ static test_result_t test_col_ext_nullmap_roundtrip(void) {
     for (int i = 0; i < n_nulls; i++)
         ray_vec_set_null(vec, null_positions[i], true);
 
-    /* Post-sentinel-migration: NULLMAP_EXT allocation is gone for
-     * sentinel-supporting I64.  Null state lives in the payload
-     * sentinel (NULL_I64) and is detected via ray_vec_is_null; the
-     * roundtrip preserves it without the bitmap segment. */
     TEST_ASSERT_TRUE((vec->attrs & RAY_ATTR_HAS_NULLS) != 0);
 
     /* --- Round-trip via ray_col_load --- */
@@ -826,7 +824,7 @@ static test_result_t test_col_ext_nullmap_roundtrip(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
 
     TEST_ASSERT_EQ_I(loaded->type, RAY_I64);
-    TEST_ASSERT_EQ_I(loaded->len, EXT_NM_LEN);
+    TEST_ASSERT_EQ_I(loaded->len, LARGE_NULL_LEN);
     TEST_ASSERT_TRUE((loaded->attrs & RAY_ATTR_HAS_NULLS) != 0);
 
     /* Verify null positions preserved */
@@ -853,7 +851,7 @@ static test_result_t test_col_ext_nullmap_roundtrip(void) {
 
     TEST_ASSERT_EQ_U(mapped->mmod, 1);
     TEST_ASSERT_EQ_I(mapped->type, RAY_I64);
-    TEST_ASSERT_EQ_I(mapped->len, EXT_NM_LEN);
+    TEST_ASSERT_EQ_I(mapped->len, LARGE_NULL_LEN);
     TEST_ASSERT_TRUE((mapped->attrs & RAY_ATTR_HAS_NULLS) != 0);
 
     /* Verify null positions preserved in mmap path */
@@ -2423,11 +2421,10 @@ static test_result_t test_serde_error_roundtrip(void) {
     PASS();
 }
 
-/* ---- serde coverage: large null vector (>128 elems, ext nullmap path) ---- */
+/* ---- serde coverage: large null vector (>128 elems) --------------------- */
 
-/* When a vector has more than 128 elements and HAS_NULLS, de_null_bitmap
- * allocates an external nullmap (RAY_ATTR_NULLMAP_EXT).  This covers
- * lines 117-122 in serde.c. */
+/* Round-trip a >128-element nullable vec through ser/de — verifies the
+ * sentinel-encoded null state survives. */
 static test_result_t test_serde_large_null_vec(void) {
     int64_t n = 200;
     ray_t* v = ray_vec_new(RAY_I64, n);
@@ -3924,29 +3921,31 @@ static test_result_t test_col_recursive_sym_in_list(void) {
     PASS();
 }
 
-/* ---- test_col_validate_mapped_bitmap_truncated --------------------------- */
-/* Covers col_validate_mapped: ext_nullmap bitmap extends beyond file => corrupt. */
-static test_result_t test_col_validate_mapped_bitmap_truncated(void) {
-    /* Write a valid-looking I64 header claiming HAS_NULLS + NULLMAP_EXT,
-     * with len=16 (bitmap = 2 bytes needed) but only write 1 byte of bitmap. */
+/* ---- test_col_validate_mapped_legacy_ext_bitmap_rejected ---------------- */
+/* Pre-sentinel-migration columns persisted an external-bitmap segment
+ * marked by attrs bit 0x20.  That arm is gone; col_validate_mapped must
+ * reject such headers up front rather than try to interpret them. */
+static test_result_t test_col_validate_mapped_legacy_ext_bitmap_rejected(void) {
     FILE* f = fopen(TMP_COL_PATH, "wb");
     TEST_ASSERT_NOT_NULL(f);
 
     uint8_t hdr[32];
     memset(hdr, 0, 32);
     hdr[18] = RAY_I64;                               /* type */
-    hdr[19] = RAY_ATTR_HAS_NULLS | RAY_ATTR_NULLMAP_EXT; /* attrs */
+    /* attrs = HAS_NULLS | legacy ext-bitmap bit (0x40 | 0x20). */
+    hdr[19] = RAY_ATTR_HAS_NULLS | 0x20;
     hdr[20] = 1;                                     /* rc = 1 */
     int64_t len = 16;
     memcpy(hdr + 24, &len, 8);
 
-    /* Write header + data (16 * 8 = 128 bytes) + 1 byte bitmap (need 2) */
+    /* Write header + data (16 * 8 = 128 bytes) + 2 trailing bytes
+     * (the bitmap segment the legacy format would expect). */
     fwrite(hdr, 1, 32, f);
     uint8_t data[128];
     memset(data, 0, 128);
     fwrite(data, 1, 128, f);
-    uint8_t bitmap_byte = 0xFF;
-    fwrite(&bitmap_byte, 1, 1, f);  /* write only 1 of the 2 needed bitmap bytes */
+    uint8_t bitmap[2] = { 0xFF, 0x00 };
+    fwrite(bitmap, 1, 2, f);
     fclose(f);
 
     ray_t* result = ray_col_mmap(TMP_COL_PATH);
@@ -4023,7 +4022,7 @@ const test_entry_t store_entries[] = {
     { "store/parted_release", test_parted_release, store_setup, store_teardown },
     { "store/part_open", test_part_open, store_setup, store_teardown },
     { "store/group_parted", test_group_parted, store_setup, store_teardown },
-    { "store/col_ext_nullmap_roundtrip", test_col_ext_nullmap_roundtrip, store_setup, store_teardown },
+    { "store/col_large_nullable_roundtrip", test_col_large_nullable_roundtrip, store_setup, store_teardown },
     { "store/col_save_load_str", test_col_save_load_str, store_setup, store_teardown },
     { "store/col_save_load_list", test_col_save_load_list, store_setup, store_teardown },
     { "store/col_save_load_table", test_col_save_load_table, store_setup, store_teardown },
@@ -4037,7 +4036,7 @@ const test_entry_t store_entries[] = {
     { "store/col_mmap_size_mismatch", test_col_mmap_size_mismatch, store_setup, store_teardown },
     { "store/col_recursive_atoms", test_col_recursive_atoms, store_setup, store_teardown },
     { "store/col_recursive_sym_in_list", test_col_recursive_sym_in_list, store_setup, store_teardown },
-    { "store/col_validate_bitmap_trunc", test_col_validate_mapped_bitmap_truncated, store_setup, store_teardown },
+    { "store/col_validate_legacy_ext_bitmap_rejected", test_col_validate_mapped_legacy_ext_bitmap_rejected, store_setup, store_teardown },
     { "store/col_sym_w64_neg_index", test_col_sym_w64_negative_index, store_setup, store_teardown },
     { "store/file_open_close", test_file_open_close, store_setup, store_teardown },
     { "store/file_lock_unlock", test_file_lock_unlock, store_setup, store_teardown },

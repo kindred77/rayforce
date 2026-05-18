@@ -28,7 +28,7 @@
  * over multiple types, scratch-arena bump allocator, ray_heap_release_pages,
  * GC under both serial and parallel flags, ray_heap_merge with rich source
  * heaps, and the owned-ref retain/release fan-out for compound types
- * (LIST / TABLE / DICT / parted / NULLMAP_EXT / SLICE / STR with str_pool).
+ * (LIST / TABLE / DICT / parted / SLICE / STR with str_pool).
  */
 
 /* MAP_ANONYMOUS is a Linux/glibc extension; needs _GNU_SOURCE before
@@ -522,28 +522,31 @@ static test_result_t test_str_pool_owned_ref(void) {
     PASS();
 }
 
-/* ---- Owned-ref: NULLMAP_EXT child -------------------------------------- *
+/* ---- Sentinel-encoded null release ------------------------------------- *
  *
- * A vec with RAY_ATTR_NULLMAP_EXT carries an owning ref to ext_nullmap.
- * ray_release_owned_refs must release that child.  Construct one
- * manually and free it. */
+ * Post-sentinel-migration a nullable vec carries no external bitmap child;
+ * null state lives entirely in the payload via the type-correct NULL_*
+ * sentinel.  This test exercises release of a >128-element nullable vec
+ * and verifies the heap remains sane afterwards. */
 
-static test_result_t test_nullmap_ext_owned_ref(void) {
-    ray_t* vec = ray_alloc(8 * sizeof(int64_t));
+static test_result_t test_sentinel_null_release(void) {
+    int64_t n = 200;
+    ray_t* vec = ray_vec_new(RAY_I64, n);
     TEST_ASSERT_NOT_NULL(vec);
-    vec->type = RAY_I64;
-    vec->len  = 8;
+    for (int64_t i = 0; i < n; i++) {
+        vec = ray_vec_append(vec, &i);
+        TEST_ASSERT_NOT_NULL(vec);
+    }
 
-    ray_t* nm = ray_alloc(8);
-    TEST_ASSERT_NOT_NULL(nm);
-    nm->type = RAY_U8;
-    nm->len  = 8;
+    /* Mark a few rows null — sentinel writes into payload only. */
+    TEST_ASSERT_EQ_I(ray_vec_set_null_checked(vec, 5, true), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_vec_set_null_checked(vec, 150, true), RAY_OK);
+    TEST_ASSERT_TRUE(vec->attrs & RAY_ATTR_HAS_NULLS);
+    TEST_ASSERT_TRUE(ray_vec_is_null(vec, 5));
+    TEST_ASSERT_TRUE(ray_vec_is_null(vec, 150));
+    TEST_ASSERT_FALSE(ray_vec_is_null(vec, 0));
 
-    /* Attach extended nullmap.  vec now owns nm. */
-    vec->ext_nullmap = nm;
-    vec->attrs |= RAY_ATTR_NULLMAP_EXT;
-
-    /* Drop vec — nm must be released as well via the NULLMAP_EXT branch. */
+    /* Drop vec — no external bitmap child to release, just the payload. */
     ray_release(vec);
 
     /* Heap remains sane. */
@@ -1368,42 +1371,35 @@ static test_result_t test_scratch_realloc_slice(void) {
     PASS();
 }
 
-/* ---- ray_scratch_realloc with NULLMAP_EXT --------------------------------
+/* ---- ray_scratch_realloc preserves sentinel-encoded nulls ----------------
  *
- * A block with RAY_ATTR_NULLMAP_EXT causes ray_detach_owned_refs to clear
- * ext_nullmap (lines 782-785) before freeing the old block.  This also
- * covers the ray_detach_owned_refs NULLMAP_EXT branch. */
+ * ray_scratch_realloc copies the header bytes into the new block and runs
+ * ray_detach_owned_refs on the old one.  Post-sentinel-migration the
+ * null state lives in the payload, so a HAS_NULLS vec realloced this way
+ * must keep its HAS_NULLS bit and its sentinel-encoded null rows. */
 
-static test_result_t test_scratch_realloc_nullmap_ext(void) {
-    ray_t* vec = ray_alloc(4 * sizeof(int64_t));
+static test_result_t test_scratch_realloc_sentinel_nulls(void) {
+    int64_t n = 200;
+    ray_t* vec = ray_vec_new(RAY_I64, n);
     TEST_ASSERT_NOT_NULL(vec);
-    vec->type = RAY_I64;
-    vec->len  = 4;
+    for (int64_t i = 0; i < n; i++) {
+        vec = ray_vec_append(vec, &i);
+        TEST_ASSERT_NOT_NULL(vec);
+    }
+    TEST_ASSERT_EQ_I(ray_vec_set_null_checked(vec, 42, true), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_vec_set_null_checked(vec, 175, true), RAY_OK);
+    TEST_ASSERT_TRUE(vec->attrs & RAY_ATTR_HAS_NULLS);
 
-    ray_t* nm = ray_alloc(1);
-    TEST_ASSERT_NOT_NULL(nm);
-    nm->type = RAY_U8;
-    nm->len  = 1;
-
-    vec->ext_nullmap = nm;
-    vec->attrs |= RAY_ATTR_NULLMAP_EXT;
-
-    /* ray_scratch_realloc transfers ownership via memcpy then calls
-     * ray_detach_owned_refs(old) which just nulls pointers (no release).
-     * So nm->rc stays at 1 and the ref is now owned by vec2. */
-    uint32_t nm_rc = nm->rc;  /* should be 1 */
-
-    /* Realloc: exercises NULLMAP_EXT branch of ray_detach_owned_refs. */
-    ray_t* vec2 = ray_scratch_realloc(vec, 4 * sizeof(int64_t));
+    /* Realloc to a slightly larger payload — exercises the
+     * ray_detach_owned_refs path on the old block. */
+    ray_t* vec2 = ray_scratch_realloc(vec, (size_t)(n + 4) * sizeof(int64_t));
     TEST_ASSERT_NOT_NULL(vec2);
-    /* Ownership transferred; rc unchanged. */
-    TEST_ASSERT_EQ_U(nm->rc, nm_rc);
-    TEST_ASSERT_TRUE(vec2->attrs & RAY_ATTR_NULLMAP_EXT);
-    TEST_ASSERT_EQ_PTR(vec2->ext_nullmap, nm);
+    TEST_ASSERT_TRUE(vec2->attrs & RAY_ATTR_HAS_NULLS);
+    TEST_ASSERT_TRUE(ray_vec_is_null(vec2, 42));
+    TEST_ASSERT_TRUE(ray_vec_is_null(vec2, 175));
+    TEST_ASSERT_FALSE(ray_vec_is_null(vec2, 0));
 
-    /* Release vec2 — release_owned_refs drops nm ref. */
     ray_release(vec2);
-    /* nm should now have rc = 0 and be freed.  Don't touch nm after this. */
     PASS();
 }
 
@@ -1538,7 +1534,7 @@ const test_entry_t heap_entries[] = {
     { "heap/flush_foreign_parallel",   test_flush_foreign_during_parallel, heap_setup, heap_teardown },
     { "heap/alloc_copy_list",          test_alloc_copy_list_retains,     heap_setup, heap_teardown },
     { "heap/str_pool_owned_ref",       test_str_pool_owned_ref,          heap_setup, heap_teardown },
-    { "heap/nullmap_ext_owned_ref",    test_nullmap_ext_owned_ref,       heap_setup, heap_teardown },
+    { "heap/sentinel_null_release",    test_sentinel_null_release,       heap_setup, heap_teardown },
     { "heap/slice_owned_ref",          test_slice_owned_ref,             heap_setup, heap_teardown },
     { "heap/parted_owned_ref",         test_parted_owned_ref,            heap_setup, heap_teardown },
     { "heap/mapcommon_owned_ref",      test_mapcommon_owned_ref,         heap_setup, heap_teardown },
@@ -1561,7 +1557,7 @@ const test_entry_t heap_entries[] = {
     { "heap/free_mmod1_atom",          test_free_mmod1_atom,             heap_setup, heap_teardown },
     { "heap/order_for_size_pow2",      test_order_for_size_pow2,         heap_setup, heap_teardown },
     { "heap/scratch_realloc_slice",    test_scratch_realloc_slice,       heap_setup, heap_teardown },
-    { "heap/scratch_realloc_nullmap",  test_scratch_realloc_nullmap_ext, heap_setup, heap_teardown },
+    { "heap/scratch_realloc_sentinel_nulls", test_scratch_realloc_sentinel_nulls, heap_setup, heap_teardown },
     { "heap/scratch_realloc_parted",   test_scratch_realloc_parted,      heap_setup, heap_teardown },
     { "heap/merge_foreign_fallback",   test_merge_foreign_pool_fallback, heap_setup, heap_teardown },
     { NULL, NULL, NULL, NULL },
