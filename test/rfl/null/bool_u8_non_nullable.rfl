@@ -1,0 +1,22 @@
+;; BOOL and U8 are non-nullable.
+;;
+;; Empty cells in CSV ingest must materialize as false / 0 with no null mark.
+;; All other nullable types still produce typed nulls.
+
+;; Sanity: typed nulls for the nullable types still parse and report null.
+(nil? 0Nh) -- true
+(nil? 0Ni) -- true
+(nil? 0Nl) -- true
+(nil? 0Nf) -- true
+
+;; CSV ingest: empty BOOL / U8 cells coerce to false / 0, not null.
+(.sys.exec "rm -f /tmp/rfl_bool_u8_non_nullable.csv")
+(.sys.exec "printf 'b,u\\ntrue,1\\n,\\nfalse,3\\n' > /tmp/rfl_bool_u8_non_nullable.csv")
+(set BU (.csv.read [B8 U8] "/tmp/rfl_bool_u8_non_nullable.csv"))
+(count BU)                            -- 3
+(at BU 'b)                            -- [true false false]
+(at BU 'u)                            -- [0x01 0x00 0x03]
+(map nil? (at BU 'b))                 -- [false false false]
+(map nil? (at BU 'u))                 -- [false false false]
+(sum (map nil? (at BU 'b)))           -- 0
+(sum (map nil? (at BU 'u)))           -- 0

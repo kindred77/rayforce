@@ -1174,9 +1174,11 @@ static test_result_t test_dict_find_idx_str_with_nulls(void) {
     TEST_ASSERT_EQ_I(ray_dict_find_idx(d, ka), 2);
     ray_release(ka);
 
-    /* An empty-string lookup must skip the null slot. */
+    /* Empty string IS a null STR atom.  An empty-string lookup is
+     * therefore a null lookup and resolves to the first null slot
+     * (index 1) — STR null = empty string is a deliberate conflation. */
     ka = ray_str("", 0);
-    TEST_ASSERT_EQ_I(ray_dict_find_idx(d, ka), -1);
+    TEST_ASSERT_EQ_I(ray_dict_find_idx(d, ka), 1);
     ray_release(ka);
 
     ray_release(d);
@@ -1207,9 +1209,11 @@ static test_result_t test_dict_find_idx_guid_with_nulls(void) {
     TEST_ASSERT_EQ_I(ray_dict_find_idx(d, ka), 2);
     ray_release(ka);
 
-    /* All-zero query: would match slot 1 if not null-aware. */
+    /* NULL_GUID = 16 all-zero bytes.  An all-zero GUID lookup IS a null
+     * lookup and resolves to the first null slot (index 1) — same
+     * conflation as STR null = empty string. */
     ka = ray_guid(g1);
-    TEST_ASSERT_EQ_I(ray_dict_find_idx(d, ka), -1);
+    TEST_ASSERT_EQ_I(ray_dict_find_idx(d, ka), 1);
     ray_release(ka);
 
     ray_release(d);

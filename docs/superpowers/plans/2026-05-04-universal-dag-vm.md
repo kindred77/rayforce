@@ -35,9 +35,9 @@
 
 ---
 
-## Phase 1 — Boundary materialisation (Layer B)
+## Pass 1 — Boundary materialisation (Layer B)
 
-These tasks make it safe for producers to return lazy. After Phase 1 the codebase still produces no lazy values, so behaviour is unchanged — but the safety net is in place.
+These tasks make it safe for producers to return lazy. After Pass 1 the codebase still produces no lazy values, so behaviour is unchanged — but the safety net is in place.
 
 ### Task 1: `ray_lazy_materialize` runs `ray_optimize`
 
@@ -180,11 +180,11 @@ computation."
 
 - [ ] **Step 2: If any gaps found, add materialise prelude per the same pattern as Tasks 2–3**
 
-  Otherwise, no commit — Phase 1 is complete.
+  Otherwise, no commit — Pass 1 is complete.
 
 ---
 
-## Phase 2 — Flip producers to return lazy (Layer A, partial)
+## Pass 2 — Flip producers to return lazy (Layer A, partial)
 
 Only the `AGG_VEC_VIA_DAG` macro flip in this phase. The single-op leaf cases in `ray_min_fn` / `ray_max_fn` (`agg.c:225, 254`) keep their `wrap+materialize` because they need `recast_i64_to_orig` post-processing that depends on a concrete result. That recast is a separate executor cleanup, deferred.
 
@@ -255,7 +255,7 @@ agg.c that were dormant code until now."
 
 ---
 
-## Phase 3 — Lift four ops into the DAG (Layer C)
+## Pass 3 — Lift four ops into the DAG (Layer C)
 
 Each task is one op and is fully self-contained: opcode + builder + executor + dump entry + lazy-append type rule + `*_fn` refactor. Land in any order.
 
@@ -488,7 +488,7 @@ Same shape. `OP_REVERSE = 107`. Refactors `ray_reverse_fn` (`collection.c:1710`)
 
 ---
 
-## Phase 4 — Idiom rewrite pass (Layer D)
+## Pass 4 — Idiom rewrite pass (Layer D)
 
 ### Task 10: Skeleton — `idiom.h` + `idiom.c` with empty table, wired into `ray_optimize`
 

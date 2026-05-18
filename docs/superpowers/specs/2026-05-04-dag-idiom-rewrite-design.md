@@ -45,7 +45,7 @@ showed:
   calls**. They work today only because no producer ever returns
   lazy.
 
-So the original "Phase 1 = lift four ops; Phase 2 = idiom rewriter"
+So the original "Pass 1 = lift four ops; Pass 2 = idiom rewriter"
 framing was incomplete. The honest framing is one principle with three
 mechanical consequences. This revision restructures around that.
 

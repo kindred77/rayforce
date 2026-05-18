@@ -8,8 +8,8 @@
 ;; Hit (with rationale):
 ;;   - partitioned_gather phases (exec.c:275-473): single-key sort over
 ;;     >= PG_MIN (=131072) rows.  No existing test crosses this size for
-;;     the OP_SORT path.  Phase 1 (pg_hist_fn), phase 2 (pg_route_fn),
-;;     phase 3 (pg_block_fn) all run; pg_block_fn covers e==4 and e==8
+;;     the OP_SORT path.  Pass 1 (pg_hist_fn), pass 2 (pg_route_fn),
+;;     pass 3 (pg_block_fn) all run; pg_block_fn covers e==4 and e==8
 ;;     element-size arms when the table mixes I32 and I64 columns.
 ;;   - OP_TRIM in select projection (exec.c:1548): no rfl fixture
 ;;     currently invokes (trim col) — string.c's exec_string_unary
@@ -69,7 +69,7 @@
 ;; ====================================================================
 ;; OP_SORT — partitioned_gather (exec.c:275-473).  Single-key sort over
 ;; >= PG_MIN (=131072) rows triggers the partitioned routing path.
-;; Phase 1 (pg_hist_fn @275), phase 2 (pg_route_fn @304), phase 3
+;; Pass 1 (pg_hist_fn @275), pass 2 (pg_route_fn @304), pass 3
 ;; (pg_block_fn @338) all run.  Mixing I64 and I32 columns drives
 ;; pg_block_fn's e==8 (line 358) and e==4 (line 363) element-size arms.
 ;; ====================================================================

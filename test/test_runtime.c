@@ -162,14 +162,14 @@ static test_result_t test_create_with_sym_load_preserves_user_ids(void) {
     char path[256];
     snprintf(path, sizeof(path), "%s/ids.sym", dir);
 
-    /* Phase 1: intern a name then persist the sym table. */
+    /* Pass 1: intern a name then persist the sym table. */
     ray_runtime_t* rt1 = ray_runtime_create(0, NULL);
     TEST_ASSERT_NOT_NULL(rt1);
     int64_t id_before = ray_sym_intern("rayforce-user-marker", 20);
     TEST_ASSERT_EQ_I((int)ray_sym_save(path), (int)RAY_OK);
     ray_runtime_destroy(rt1);
 
-    /* Phase 2: bring up a fresh runtime via the _with_sym variant so the
+    /* Pass 2: bring up a fresh runtime via the _with_sym variant so the
      * persisted table is loaded before builtins register. */
     ray_err_t err = RAY_ERR_OOM;
     ray_runtime_t* rt2 = ray_runtime_create_with_sym_err(path, &err);

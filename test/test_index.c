@@ -53,13 +53,13 @@ static ray_t* make_f64_vec(const double* xs, int64_t n) {
 /* Snapshot the 16-byte nullmap union and attrs bits we care about. */
 typedef struct {
     uint8_t bytes[16];
-    uint8_t attrs;  /* HAS_NULLS | NULLMAP_EXT */
+    uint8_t attrs;  /* HAS_NULLS */
 } nullmap_snap_t;
 
 static nullmap_snap_t snap_take(const ray_t* v) {
     nullmap_snap_t s;
     memcpy(s.bytes, v->nullmap, 16);
-    s.attrs = v->attrs & (RAY_ATTR_HAS_NULLS | RAY_ATTR_NULLMAP_EXT);
+    s.attrs = v->attrs & RAY_ATTR_HAS_NULLS;
     return s;
 }
 
@@ -143,35 +143,34 @@ static test_result_t test_index_attach_drop_with_inline_nulls(void) {
     PASS();
 }
 
-static test_result_t test_index_attach_drop_with_ext_nullmap(void) {
+static test_result_t test_index_attach_drop_large_sentinel_nulls(void) {
+    /* Attach + drop on a vec with sentinel-encoded nulls past the
+     * 128-element boundary.  Verifies null state survives the round-trip
+     * via ray_vec_is_null. */
     ray_heap_init();
-    int64_t n = 200;  /* > 128 forces external nullmap */
+    int64_t n = 200;
     ray_t* v = ray_vec_new(RAY_I32, n);
     int32_t z = 0;
     for (int64_t i = 0; i < n; i++) v = ray_vec_append(v, &z);
-    /* Set a few nulls past the 128-element inline boundary. */
     TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 130, true), RAY_OK);
     TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 199, true), RAY_OK);
-    TEST_ASSERT_TRUE(v->attrs & RAY_ATTR_NULLMAP_EXT);
-
-    nullmap_snap_t before = snap_take(v);
+    TEST_ASSERT_TRUE(v->attrs & RAY_ATTR_HAS_NULLS);
 
     ray_t* w = v;
     ray_t* r = ray_index_attach_zone(&w);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     TEST_ASSERT_TRUE(w->attrs & RAY_ATTR_HAS_INDEX);
-    TEST_ASSERT_FALSE(w->attrs & RAY_ATTR_NULLMAP_EXT);  /* moved into index */
 
-    /* is_null still returns true for the marked rows. */
+    /* is_null still returns true for the marked rows under HAS_INDEX. */
     TEST_ASSERT_TRUE (ray_vec_is_null(w, 130));
     TEST_ASSERT_TRUE (ray_vec_is_null(w, 199));
     TEST_ASSERT_FALSE(ray_vec_is_null(w, 0));
 
     ray_index_drop(&w);
-    nullmap_snap_t after = snap_take(w);
-    TEST_ASSERT_TRUE(snap_eq(&before, &after));
-    TEST_ASSERT_TRUE(w->attrs & RAY_ATTR_NULLMAP_EXT);
+    TEST_ASSERT_TRUE(w->attrs & RAY_ATTR_HAS_NULLS);
     TEST_ASSERT_TRUE (ray_vec_is_null(w, 130));
+    TEST_ASSERT_TRUE (ray_vec_is_null(w, 199));
+    TEST_ASSERT_FALSE(ray_vec_is_null(w, 0));
 
     ray_release(w);
     ray_heap_destroy();
@@ -459,7 +458,7 @@ static test_result_t test_index_drop_under_shared_cow(void) {
 
 static test_result_t test_index_persistence_roundtrip(void) {
     ray_heap_init();
-    /* 200 elements forces ext_nullmap. */
+    /* 200 elements is past the legacy 128-inline-bitmap boundary. */
     int64_t n = 200;
     ray_t* v = ray_vec_new(RAY_I64, n);
     for (int64_t i = 0; i < n; i++) {
@@ -468,7 +467,7 @@ static test_result_t test_index_persistence_roundtrip(void) {
     }
     TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 7, true), RAY_OK);
     TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 150, true), RAY_OK);
-    TEST_ASSERT_TRUE(v->attrs & RAY_ATTR_NULLMAP_EXT);
+    TEST_ASSERT_TRUE(v->attrs & RAY_ATTR_HAS_NULLS);
 
     ray_t* w = v;
     TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_zone(&w)));
@@ -511,36 +510,22 @@ static test_result_t test_index_persistence_roundtrip(void) {
     PASS();
 }
 
-/* ─── Slice handling in ray_vec_nullmap_bytes ─────────────────────── */
+/* ─── Slice null detection on indexed/parent vec ───────────────────── */
 
 static test_result_t test_index_nullmap_helper_slice(void) {
+    /* Slice-relative null detection via ray_vec_is_null delegates to
+     * the parent's sentinel payload at the translated index. */
     ray_heap_init();
-    /* Build a parent with nulls at row 1 and row 4. */
     int64_t xs[] = { 100, 200, 300, 400, 500, 600 };
     ray_t* v = make_i64_vec(xs, 6);
     TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 1, true), RAY_OK);
     TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 4, true), RAY_OK);
     TEST_ASSERT_TRUE(v->attrs & RAY_ATTR_HAS_NULLS);
 
-    /* Slice [2..6) — rows 2,3,4,5 in the parent, with row 4 (parent
-     * index) being null — slice-local index 2. */
     ray_t* s = ray_vec_slice(v, 2, 4);
     TEST_ASSERT_FALSE(RAY_IS_ERR(s));
     TEST_ASSERT_TRUE(s->attrs & RAY_ATTR_SLICE);
-    /* Slice itself does NOT carry HAS_NULLS — that's the codebase invariant. */
     TEST_ASSERT_FALSE(s->attrs & RAY_ATTR_HAS_NULLS);
-
-    /* The helper must still resolve to the parent's bitmap and return
-     * the correct bit_offset (= slice_offset = 2). */
-    int64_t off = -1, lb = -1;
-    const uint8_t* bits = ray_vec_nullmap_bytes(s, &off, &lb);
-    TEST_ASSERT_NOT_NULL(bits);
-    TEST_ASSERT_EQ_I(off, 2);
-    TEST_ASSERT_TRUE(lb >= 8);
-    /* Parent bit 4 must be set in the buffer (bit 4 = byte 0 bit 4). */
-    TEST_ASSERT_TRUE((bits[(off + 2) / 8] >> ((off + 2) % 8)) & 1);
-    /* And parent bit 1 must also be set (parent has it). */
-    TEST_ASSERT_TRUE((bits[1 / 8] >> (1 % 8)) & 1);
 
     /* ray_vec_is_null still works correctly on the slice. */
     TEST_ASSERT_FALSE(ray_vec_is_null(s, 0));   /* parent row 2 — not null */
@@ -584,35 +569,25 @@ static test_result_t test_index_insert_at_drops_index(void) {
 /* ─── Null-aware reader correctness on indexed vec ─────────────────── */
 
 static test_result_t test_index_null_readers_through_helper(void) {
+    /* Verify the sentinel-based null reader invariant: ray_vec_is_null
+     * returns the same answer before and after an index attach, even
+     * though w->nullmap[0..7] holds the index pointer after attach. */
     ray_heap_init();
-    /* 5-element vec with one null in the middle. */
     int64_t xs[] = { 100, 200, 300, 400, 500 };
     ray_t* v = make_i64_vec(xs, 5);
     TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 2, true), RAY_OK);
 
-    /* Snapshot the bitmap pointer/contents before attach. */
-    int64_t pre_off = -1, pre_len = -1;
-    const uint8_t* pre = ray_vec_nullmap_bytes(v, &pre_off, &pre_len);
-    TEST_ASSERT_NOT_NULL(pre);
-    TEST_ASSERT_EQ_I(pre_off, 0);
-    TEST_ASSERT_TRUE(pre_len >= 8);
-    /* Bit 2 must be set in the pre-snapshot. */
-    TEST_ASSERT_TRUE((pre[0] >> 2) & 1);
+    TEST_ASSERT_TRUE (ray_vec_is_null(v, 2));
+    TEST_ASSERT_FALSE(ray_vec_is_null(v, 0));
 
     ray_t* w = v;
     TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_zone(&w)));
 
-    /* After attach, the helper must still report bit 2 as set, even
-     * though w->nullmap[] is now the index pointer. */
-    int64_t post_off = -1, post_len = -1;
-    const uint8_t* post = ray_vec_nullmap_bytes(w, &post_off, &post_len);
-    TEST_ASSERT_NOT_NULL(post);
-    TEST_ASSERT_EQ_I(post_off, 0);
-    TEST_ASSERT_TRUE((post[0] >> 2) & 1);
-
-    /* The helper must NOT return the parent's now-clobbered nullmap[]
-     * (which holds an index pointer in its first 8 bytes). */
-    TEST_ASSERT_TRUE(post != w->nullmap);
+    /* After attach the index pointer overlays bytes 0-7 of the union;
+     * sentinel-based readers must still see the null at row 2. */
+    TEST_ASSERT_TRUE (ray_vec_is_null(w, 2));
+    TEST_ASSERT_FALSE(ray_vec_is_null(w, 0));
+    TEST_ASSERT_FALSE(ray_vec_is_null(w, 4));
 
     ray_release(w);
     ray_heap_destroy();
@@ -1105,121 +1080,71 @@ static test_result_t test_index_retain_payload_direct(void) {
     PASS();
 }
 
-/* ─── ray_index_release_saved with RAY_STR/RAY_SYM (covers saved_hi paths) ── */
+/* ─── ray_index_release_saved / retain_saved are no-ops ────────────── *
+ *
+ * Index attachment is restricted to numeric vector types (see
+ * prepare_attach), so saved_nullmap never carries owned ray_t* refs.
+ * The functions are kept for call-site symmetry but do nothing.  These
+ * tests verify the no-op contract: calling them on a fully populated
+ * ix struct must not touch refcounts on whatever pointers happen to
+ * sit in the saved bytes. */
 
-static test_result_t test_index_release_saved_str_sym(void) {
+static test_result_t test_index_release_saved_noop(void) {
     ray_heap_init();
 
-    /* Test RAY_STR parent_type in ray_index_release_saved.
-     * This covers the `if (ix->parent_type == RAY_STR)` true branch (lines 150-153)
-     * and saved_hi_ptr/saved_hi_clear. */
-    {
-        ray_index_t ix;
-        memset(&ix, 0, sizeof(ix));
-        ix.kind = RAY_IDX_ZONE;
-        ix.parent_type = RAY_STR;
-        ix.saved_attrs = 0;  /* no NULLMAP_EXT, so saved_lo_ptr not called */
-        /* saved_nullmap[8..15] = 0 (NULL pointer), so saved_hi_ptr returns NULL,
-         * and `if (hi && ...)` is false - safe to release. */
-        ray_index_release_saved(&ix);
-    }
+    int64_t dummy[] = { 1 };
+    ray_t* victim = make_i64_vec(dummy, 1);
+    uint32_t rc_before = victim->rc;
 
-    /* Test RAY_STR with non-null hi pointer (retained). */
-    {
-        /* Build a dummy ray_t to use as a fake "str_pool" saved pointer. */
-        int64_t dummy[] = { 1 };
-        ray_t* fake_pool = make_i64_vec(dummy, 1);
-        ray_retain(fake_pool);  /* bump to rc=2 so release brings it to 1 */
+    ray_index_t ix;
+    memset(&ix, 0, sizeof(ix));
+    ix.kind = RAY_IDX_ZONE;
+    ix.parent_type = RAY_I64;
+    ix.saved_attrs = 0;
+    /* Put a real pointer into saved_nullmap[8..15] — if the function
+     * were not a no-op it would try to release it and drop the rc. */
+    memcpy(&ix.saved_nullmap[8], &victim, sizeof(victim));
 
-        ray_index_t ix;
-        memset(&ix, 0, sizeof(ix));
-        ix.kind = RAY_IDX_ZONE;
-        ix.parent_type = RAY_STR;
-        ix.saved_attrs = 0;
-        /* Store fake_pool into saved_nullmap[8..15]. */
-        memcpy(&ix.saved_nullmap[8], &fake_pool, sizeof(fake_pool));
-        /* This calls saved_hi_ptr which reads the pointer and releases it. */
-        ray_index_release_saved(&ix);
-        /* fake_pool rc is now 1 again (was 2, released by release_saved). */
-        ray_release(fake_pool);
-    }
+    ray_index_release_saved(&ix);
+    TEST_ASSERT_EQ_U(victim->rc, rc_before);
 
-    /* Test RAY_SYM with NULLMAP_EXT — covers the SYM+ext branch (lines 154-162). */
-    {
-        int64_t dummy[] = { 1 };
-        ray_t* fake_dict = make_i64_vec(dummy, 1);
-        ray_retain(fake_dict);  /* rc=2 */
-
-        ray_index_t ix;
-        memset(&ix, 0, sizeof(ix));
-        ix.kind = RAY_IDX_ZONE;
-        ix.parent_type = RAY_SYM;
-        ix.saved_attrs = RAY_ATTR_NULLMAP_EXT;
-        /* lo (saved_nullmap[0..7]) = NULL — so lo release is skipped. */
-        /* hi (saved_nullmap[8..15]) = fake_dict pointer. */
-        memcpy(&ix.saved_nullmap[8], &fake_dict, sizeof(fake_dict));
-        ray_index_release_saved(&ix);
-        /* fake_dict rc back to 1. */
-        ray_release(fake_dict);
-    }
-
+    ray_release(victim);
     ray_heap_destroy();
     PASS();
 }
 
-/* ─── ray_index_retain_saved with RAY_STR/RAY_SYM ───────────────────────── */
-
-static test_result_t test_index_retain_saved_str_sym(void) {
+static test_result_t test_index_retain_saved_noop(void) {
     ray_heap_init();
 
-    /* RAY_STR parent_type — covers `if (ix->parent_type == RAY_STR)` true branch
-     * in ray_index_retain_saved (lines 170-172). */
-    {
-        int64_t dummy[] = { 1 };
-        ray_t* fake_pool = make_i64_vec(dummy, 1);
-        /* rc=1 initially; retain_saved will bump to rc=2. */
+    int64_t dummy[] = { 1 };
+    ray_t* victim = make_i64_vec(dummy, 1);
+    uint32_t rc_before = victim->rc;
 
-        ray_index_t ix;
-        memset(&ix, 0, sizeof(ix));
-        ix.kind = RAY_IDX_ZONE;
-        ix.parent_type = RAY_STR;
-        ix.saved_attrs = 0;  /* no NULLMAP_EXT */
-        memcpy(&ix.saved_nullmap[8], &fake_pool, sizeof(fake_pool));
-        ray_index_retain_saved(&ix);
-        /* rc is now 2 — release twice. */
-        ray_release(fake_pool);
-        ray_release(fake_pool);
-    }
+    ray_index_t ix;
+    memset(&ix, 0, sizeof(ix));
+    ix.kind = RAY_IDX_ZONE;
+    ix.parent_type = RAY_I64;
+    ix.saved_attrs = 0;
+    memcpy(&ix.saved_nullmap[8], &victim, sizeof(victim));
 
-    /* RAY_SYM with NULLMAP_EXT — covers the SYM+ext branch in retain_saved
-     * (lines 173-177). */
-    {
-        int64_t dummy[] = { 1 };
-        ray_t* fake_dict = make_i64_vec(dummy, 1);
-        /* rc=1. */
+    ray_index_retain_saved(&ix);
+    TEST_ASSERT_EQ_U(victim->rc, rc_before);
 
-        ray_index_t ix;
-        memset(&ix, 0, sizeof(ix));
-        ix.kind = RAY_IDX_ZONE;
-        ix.parent_type = RAY_SYM;
-        ix.saved_attrs = RAY_ATTR_NULLMAP_EXT;
-        /* lo (saved_nullmap[0..7]) = NULL so lo retain is skipped. */
-        memcpy(&ix.saved_nullmap[8], &fake_dict, sizeof(fake_dict));
-        ray_index_retain_saved(&ix);
-        /* rc is now 2 — release twice. */
-        ray_release(fake_dict);
-        ray_release(fake_dict);
-    }
-
+    ray_release(victim);
     ray_heap_destroy();
     PASS();
 }
 
-/* ─── ray_index_retain_saved with ext-nullmap (covers saved_lo branch) ───── */
+/* ─── Shared-index drop preserves sentinel nulls across COW ─────────────── *
+ *
+ * When a vec with HAS_INDEX is shared (rc > 1) and then dropped, the
+ * drop path takes the shared branch (ray_index_retain_saved + memcpy of
+ * saved bytes).  This test verifies the round-trip on a >128-element
+ * vec with sentinel-encoded nulls — both copies must still see the nulls
+ * via ray_vec_is_null after the drop. */
 
-static test_result_t test_index_retain_saved_ext_nullmap(void) {
+static test_result_t test_index_drop_shared_with_large_nulls(void) {
     ray_heap_init();
-    /* Build a vector with ext-nullmap (>128 elements). */
     int64_t n = 150;
     ray_t* v = ray_vec_new(RAY_I64, n);
     for (int64_t i = 0; i < n; i++) {
@@ -1227,27 +1152,28 @@ static test_result_t test_index_retain_saved_ext_nullmap(void) {
         v = ray_vec_append(v, &x);
     }
     TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 140, true), RAY_OK);
-    TEST_ASSERT_TRUE(v->attrs & RAY_ATTR_NULLMAP_EXT);
+    TEST_ASSERT_TRUE(v->attrs & RAY_ATTR_HAS_NULLS);
 
     ray_t* w = v;
     ray_t* r = ray_index_attach_zone(&w);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     TEST_ASSERT_TRUE(w->attrs & RAY_ATTR_HAS_INDEX);
 
-    /* Share the index (rc >= 2) so ray_index_drop triggers retain_saved. */
+    /* Share the index (rc >= 2) so ray_index_drop hits the shared branch. */
     ray_retain(w);
     ray_retain(w);
     ray_t* b = ray_cow(w);
     TEST_ASSERT_TRUE(b != w);
     TEST_ASSERT_TRUE(b->index == w->index);
 
-    /* Drop from w - shared path calls ray_index_retain_saved. */
+    /* Drop from w — shared path. */
     ray_t* w2 = w;
     ray_index_drop(&w2);
     TEST_ASSERT_FALSE(w2->attrs & RAY_ATTR_HAS_INDEX);
     TEST_ASSERT_TRUE(b->attrs & RAY_ATTR_HAS_INDEX);
 
-    /* b still reads nulls correctly. */
+    /* Both copies still see the null via the payload sentinel. */
+    TEST_ASSERT_TRUE(ray_vec_is_null(w2, 140));
     TEST_ASSERT_TRUE(ray_vec_is_null(b, 140));
 
     ray_release(w2);
@@ -1395,7 +1321,7 @@ static test_result_t test_index_builtin_fns(void) {
 const test_entry_t index_entries[] = {
     { "index/attach_drop_no_nulls",          test_index_attach_drop_no_nulls,          NULL, NULL },
     { "index/attach_drop_with_inline_nulls", test_index_attach_drop_with_inline_nulls, NULL, NULL },
-    { "index/attach_drop_with_ext_nullmap",  test_index_attach_drop_with_ext_nullmap,  NULL, NULL },
+    { "index/attach_drop_large_sentinel_nulls", test_index_attach_drop_large_sentinel_nulls, NULL, NULL },
     { "index/replace_existing",              test_index_replace_existing,              NULL, NULL },
     { "index/mutation_drops",                test_index_mutation_drops,                NULL, NULL },
     { "index/float_zone",                    test_index_float_zone,                    NULL, NULL },
@@ -1422,9 +1348,9 @@ const test_entry_t index_entries[] = {
     { "index/hash_f64_nan",                  test_index_hash_f64_nan,                  NULL, NULL },
     { "index/attach_slice_error",            test_index_attach_slice_error,            NULL, NULL },
     { "index/retain_payload_direct",         test_index_retain_payload_direct,         NULL, NULL },
-    { "index/release_saved_str_sym",         test_index_release_saved_str_sym,         NULL, NULL },
-    { "index/retain_saved_str_sym",          test_index_retain_saved_str_sym,          NULL, NULL },
-    { "index/retain_saved_ext_nullmap",      test_index_retain_saved_ext_nullmap,      NULL, NULL },
+    { "index/release_saved_noop",            test_index_release_saved_noop,            NULL, NULL },
+    { "index/retain_saved_noop",             test_index_retain_saved_noop,             NULL, NULL },
+    { "index/drop_shared_with_large_nulls",  test_index_drop_shared_with_large_nulls,  NULL, NULL },
     { "index/info_no_index",                 test_index_info_no_index,                 NULL, NULL },
     { "index/bloom_with_nulls",              test_index_bloom_with_nulls,              NULL, NULL },
     { "index/guid_unsupported",              test_index_guid_unsupported,              NULL, NULL },
