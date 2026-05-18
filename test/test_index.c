@@ -144,34 +144,36 @@ static test_result_t test_index_attach_drop_with_inline_nulls(void) {
 }
 
 static test_result_t test_index_attach_drop_with_ext_nullmap(void) {
+    /* Post-sentinel-migration: NULLMAP_EXT / ext_nullmap allocation is
+     * gone for sentinel-supporting types (I32 here).  The test still
+     * exercises attach + drop on a vec with nulls past the 128-element
+     * inline boundary, but the assertions now verify what survives the
+     * round-trip — null state — rather than the bitmap-internal flags
+     * and snapshot bytes. */
     ray_heap_init();
-    int64_t n = 200;  /* > 128 forces external nullmap */
+    int64_t n = 200;
     ray_t* v = ray_vec_new(RAY_I32, n);
     int32_t z = 0;
     for (int64_t i = 0; i < n; i++) v = ray_vec_append(v, &z);
-    /* Set a few nulls past the 128-element inline boundary. */
     TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 130, true), RAY_OK);
     TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 199, true), RAY_OK);
-    TEST_ASSERT_TRUE(v->attrs & RAY_ATTR_NULLMAP_EXT);
-
-    nullmap_snap_t before = snap_take(v);
+    TEST_ASSERT_TRUE(v->attrs & RAY_ATTR_HAS_NULLS);
 
     ray_t* w = v;
     ray_t* r = ray_index_attach_zone(&w);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     TEST_ASSERT_TRUE(w->attrs & RAY_ATTR_HAS_INDEX);
-    TEST_ASSERT_FALSE(w->attrs & RAY_ATTR_NULLMAP_EXT);  /* moved into index */
 
-    /* is_null still returns true for the marked rows. */
+    /* is_null still returns true for the marked rows under HAS_INDEX. */
     TEST_ASSERT_TRUE (ray_vec_is_null(w, 130));
     TEST_ASSERT_TRUE (ray_vec_is_null(w, 199));
     TEST_ASSERT_FALSE(ray_vec_is_null(w, 0));
 
     ray_index_drop(&w);
-    nullmap_snap_t after = snap_take(w);
-    TEST_ASSERT_TRUE(snap_eq(&before, &after));
-    TEST_ASSERT_TRUE(w->attrs & RAY_ATTR_NULLMAP_EXT);
+    TEST_ASSERT_TRUE(w->attrs & RAY_ATTR_HAS_NULLS);
     TEST_ASSERT_TRUE (ray_vec_is_null(w, 130));
+    TEST_ASSERT_TRUE (ray_vec_is_null(w, 199));
+    TEST_ASSERT_FALSE(ray_vec_is_null(w, 0));
 
     ray_release(w);
     ray_heap_destroy();
@@ -468,7 +470,7 @@ static test_result_t test_index_persistence_roundtrip(void) {
     }
     TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 7, true), RAY_OK);
     TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 150, true), RAY_OK);
-    TEST_ASSERT_TRUE(v->attrs & RAY_ATTR_NULLMAP_EXT);
+    TEST_ASSERT_TRUE(v->attrs & RAY_ATTR_HAS_NULLS);
 
     ray_t* w = v;
     TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_zone(&w)));
@@ -511,36 +513,25 @@ static test_result_t test_index_persistence_roundtrip(void) {
     PASS();
 }
 
-/* ─── Slice handling in ray_vec_nullmap_bytes ─────────────────────── */
+/* ─── Slice null detection on indexed/parent vec ───────────────────── */
 
 static test_result_t test_index_nullmap_helper_slice(void) {
+    /* Post-sentinel-migration: ray_vec_nullmap_bytes is on its way out
+     * (Stage 5 removes it).  The bitmap-byte assertions are gone; the
+     * test still covers what matters — slice-relative null detection
+     * via ray_vec_is_null, which delegates to the parent's sentinel
+     * payload at the translated index. */
     ray_heap_init();
-    /* Build a parent with nulls at row 1 and row 4. */
     int64_t xs[] = { 100, 200, 300, 400, 500, 600 };
     ray_t* v = make_i64_vec(xs, 6);
     TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 1, true), RAY_OK);
     TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 4, true), RAY_OK);
     TEST_ASSERT_TRUE(v->attrs & RAY_ATTR_HAS_NULLS);
 
-    /* Slice [2..6) — rows 2,3,4,5 in the parent, with row 4 (parent
-     * index) being null — slice-local index 2. */
     ray_t* s = ray_vec_slice(v, 2, 4);
     TEST_ASSERT_FALSE(RAY_IS_ERR(s));
     TEST_ASSERT_TRUE(s->attrs & RAY_ATTR_SLICE);
-    /* Slice itself does NOT carry HAS_NULLS — that's the codebase invariant. */
     TEST_ASSERT_FALSE(s->attrs & RAY_ATTR_HAS_NULLS);
-
-    /* The helper must still resolve to the parent's bitmap and return
-     * the correct bit_offset (= slice_offset = 2). */
-    int64_t off = -1, lb = -1;
-    const uint8_t* bits = ray_vec_nullmap_bytes(s, &off, &lb);
-    TEST_ASSERT_NOT_NULL(bits);
-    TEST_ASSERT_EQ_I(off, 2);
-    TEST_ASSERT_TRUE(lb >= 8);
-    /* Parent bit 4 must be set in the buffer (bit 4 = byte 0 bit 4). */
-    TEST_ASSERT_TRUE((bits[(off + 2) / 8] >> ((off + 2) % 8)) & 1);
-    /* And parent bit 1 must also be set (parent has it). */
-    TEST_ASSERT_TRUE((bits[1 / 8] >> (1 % 8)) & 1);
 
     /* ray_vec_is_null still works correctly on the slice. */
     TEST_ASSERT_FALSE(ray_vec_is_null(s, 0));   /* parent row 2 — not null */
@@ -584,35 +575,28 @@ static test_result_t test_index_insert_at_drops_index(void) {
 /* ─── Null-aware reader correctness on indexed vec ─────────────────── */
 
 static test_result_t test_index_null_readers_through_helper(void) {
+    /* Post-sentinel-migration: ray_vec_nullmap_bytes is going away in
+     * Stage 5 — the bitmap-pointer assertions are dropped.  This test
+     * now verifies the equivalent invariant via sentinel-based reads:
+     * ray_vec_is_null returns the same answer before and after an
+     * index attach, even though w->nullmap[0..7] holds the index
+     * pointer after attach. */
     ray_heap_init();
-    /* 5-element vec with one null in the middle. */
     int64_t xs[] = { 100, 200, 300, 400, 500 };
     ray_t* v = make_i64_vec(xs, 5);
     TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 2, true), RAY_OK);
 
-    /* Snapshot the bitmap pointer/contents before attach. */
-    int64_t pre_off = -1, pre_len = -1;
-    const uint8_t* pre = ray_vec_nullmap_bytes(v, &pre_off, &pre_len);
-    TEST_ASSERT_NOT_NULL(pre);
-    TEST_ASSERT_EQ_I(pre_off, 0);
-    TEST_ASSERT_TRUE(pre_len >= 8);
-    /* Bit 2 must be set in the pre-snapshot. */
-    TEST_ASSERT_TRUE((pre[0] >> 2) & 1);
+    TEST_ASSERT_TRUE (ray_vec_is_null(v, 2));
+    TEST_ASSERT_FALSE(ray_vec_is_null(v, 0));
 
     ray_t* w = v;
     TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_zone(&w)));
 
-    /* After attach, the helper must still report bit 2 as set, even
-     * though w->nullmap[] is now the index pointer. */
-    int64_t post_off = -1, post_len = -1;
-    const uint8_t* post = ray_vec_nullmap_bytes(w, &post_off, &post_len);
-    TEST_ASSERT_NOT_NULL(post);
-    TEST_ASSERT_EQ_I(post_off, 0);
-    TEST_ASSERT_TRUE((post[0] >> 2) & 1);
-
-    /* The helper must NOT return the parent's now-clobbered nullmap[]
-     * (which holds an index pointer in its first 8 bytes). */
-    TEST_ASSERT_TRUE(post != w->nullmap);
+    /* After attach the index pointer overlays bytes 0-7 of the union;
+     * sentinel-based readers must still see the null at row 2. */
+    TEST_ASSERT_TRUE (ray_vec_is_null(w, 2));
+    TEST_ASSERT_FALSE(ray_vec_is_null(w, 0));
+    TEST_ASSERT_FALSE(ray_vec_is_null(w, 4));
 
     ray_release(w);
     ray_heap_destroy();
@@ -1227,7 +1211,7 @@ static test_result_t test_index_retain_saved_ext_nullmap(void) {
         v = ray_vec_append(v, &x);
     }
     TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 140, true), RAY_OK);
-    TEST_ASSERT_TRUE(v->attrs & RAY_ATTR_NULLMAP_EXT);
+    TEST_ASSERT_TRUE(v->attrs & RAY_ATTR_HAS_NULLS);
 
     ray_t* w = v;
     ray_t* r = ray_index_attach_zone(&w);

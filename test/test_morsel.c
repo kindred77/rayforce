@@ -463,28 +463,28 @@ static test_result_t test_morsel_has_index_ext_nulls(void) {
     }
     TEST_ASSERT_EQ_I(v->len, n);
 
-    /* null at 150 -> forces NULLMAP_EXT */
+    /* Post-sentinel-migration: NULLMAP_EXT allocation is gone for
+     * sentinel-supporting I64.  The null state is preserved on the
+     * vec via the payload sentinel and on the morsel via the
+     * synthesized null_bits_buf (filled by ray_morsel_next from
+     * sentinel reads).  The test still covers the
+     * HAS_INDEX + >128-element path; just no bitmap-flag assertions. */
     TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 150, true), RAY_OK);
-    TEST_ASSERT_TRUE(v->attrs & RAY_ATTR_NULLMAP_EXT);
+    TEST_ASSERT_TRUE(v->attrs & RAY_ATTR_HAS_NULLS);
 
     ray_t* w = v;
     ray_t* r = ray_index_attach_zone(&w);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     TEST_ASSERT_TRUE(w->attrs & RAY_ATTR_HAS_INDEX);
-    /* NULLMAP_EXT cleared in parent; stored in ix->saved_attrs */
-    TEST_ASSERT_FALSE(w->attrs & RAY_ATTR_NULLMAP_EXT);
-
-    ray_index_t* ix = ray_index_payload(w->index);
-    TEST_ASSERT_TRUE(ix->saved_attrs & RAY_ATTR_NULLMAP_EXT);
 
     ray_morsel_t m;
     ray_morsel_init(&m, w);
 
-    /* First morsel: hits HAS_INDEX + saved_attrs NULLMAP_EXT (lines 85-88) */
     TEST_ASSERT_TRUE(ray_morsel_next(&m));
     TEST_ASSERT_NOT_NULL(m.null_bits);
 
-    /* Bit 150 should be set */
+    /* Bit 150 should be set (morsel-local index == source index for
+     * the first morsel at offset 0). */
     int bit150 = (m.null_bits[150 / 8] >> (150 % 8)) & 1;
     TEST_ASSERT_EQ_I(bit150, 1);
 

@@ -811,10 +811,11 @@ static test_result_t test_col_ext_nullmap_roundtrip(void) {
     for (int i = 0; i < n_nulls; i++)
         ray_vec_set_null(vec, null_positions[i], true);
 
-    /* Verify ext_nullmap was created (>128 elements forces external) */
+    /* Post-sentinel-migration: NULLMAP_EXT allocation is gone for
+     * sentinel-supporting I64.  Null state lives in the payload
+     * sentinel (NULL_I64) and is detected via ray_vec_is_null; the
+     * roundtrip preserves it without the bitmap segment. */
     TEST_ASSERT_TRUE((vec->attrs & RAY_ATTR_HAS_NULLS) != 0);
-    TEST_ASSERT_TRUE((vec->attrs & RAY_ATTR_NULLMAP_EXT) != 0);
-    TEST_ASSERT_NOT_NULL(vec->ext_nullmap);
 
     /* --- Round-trip via ray_col_load --- */
     ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
@@ -827,8 +828,6 @@ static test_result_t test_col_ext_nullmap_roundtrip(void) {
     TEST_ASSERT_EQ_I(loaded->type, RAY_I64);
     TEST_ASSERT_EQ_I(loaded->len, EXT_NM_LEN);
     TEST_ASSERT_TRUE((loaded->attrs & RAY_ATTR_HAS_NULLS) != 0);
-    TEST_ASSERT_TRUE((loaded->attrs & RAY_ATTR_NULLMAP_EXT) != 0);
-    TEST_ASSERT_NOT_NULL(loaded->ext_nullmap);
 
     /* Verify null positions preserved */
     for (int i = 0; i < n_nulls; i++)
@@ -856,8 +855,6 @@ static test_result_t test_col_ext_nullmap_roundtrip(void) {
     TEST_ASSERT_EQ_I(mapped->type, RAY_I64);
     TEST_ASSERT_EQ_I(mapped->len, EXT_NM_LEN);
     TEST_ASSERT_TRUE((mapped->attrs & RAY_ATTR_HAS_NULLS) != 0);
-    TEST_ASSERT_TRUE((mapped->attrs & RAY_ATTR_NULLMAP_EXT) != 0);
-    TEST_ASSERT_NOT_NULL(mapped->ext_nullmap);
 
     /* Verify null positions preserved in mmap path */
     for (int i = 0; i < n_nulls; i++)
