@@ -1,5 +1,5 @@
-;; Phase 2 dual-encoding contract: F64 nulls are NaN in the payload AND
-;; have the nullmap bit set.  Every consumer must agree on null-ness.
+;; F64 null encoding: nulls are NaN in the payload.  Every consumer
+;; must agree on null-ness via the NaN sentinel.
 
 ;; ----- 1. Atom construction -----
 
@@ -7,20 +7,20 @@
 
 ;; ----- 2. CSV ingest -----
 
-(.sys.exec "rm -f /tmp/rfl_phase2_f64_dual.csv")
-(.sys.exec "printf 'x\\n1.5\\n\\n3.5\\n' > /tmp/rfl_phase2_f64_dual.csv")
-(set P2F (.csv.read [F64] "/tmp/rfl_phase2_f64_dual.csv"))
-(count P2F)                  -- 3
-(nil? (at (at P2F 'x) 1))    -- true
-(at (at P2F 'x) 0)           -- 1.5
-(at (at P2F 'x) 2)           -- 3.5
+(.sys.exec "rm -f /tmp/rfl_f64_nan.csv")
+(.sys.exec "printf 'x\\n1.5\\n\\n3.5\\n' > /tmp/rfl_f64_nan.csv")
+(set Pf (.csv.read [F64] "/tmp/rfl_f64_nan.csv"))
+(count Pf)                  -- 3
+(nil? (at (at Pf 'x) 1))    -- true
+(at (at Pf 'x) 0)           -- 1.5
+(at (at Pf 'x) 2)           -- 3.5
 
 ;; ----- 3. Aggregations exclude nulls -----
 
-(sum (at P2F 'x))   -- 5.0
-(avg (at P2F 'x))   -- 2.5
-(min (at P2F 'x))   -- 1.5
-(max (at P2F 'x))   -- 3.5
+(sum (at Pf 'x))   -- 5.0
+(avg (at Pf 'x))   -- 2.5
+(min (at Pf 'x))   -- 1.5
+(max (at Pf 'x))   -- 3.5
 
 ;; ----- 4. Sort places nulls per policy -----
 

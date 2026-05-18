@@ -244,10 +244,9 @@ static test_result_t test_vec_null_inline(void) {
     TEST_ASSERT_FALSE(ray_vec_is_null(v, 0));
     TEST_ASSERT_FALSE(ray_vec_is_null(v, 4));
 
-    /* Clear a null.  Post-sentinel-migration the caller must restore
-     * a real payload value before clearing the bitmap — the stale
-     * NULL_I64 sentinel from the prior set-null would otherwise still
-     * read back as null under sentinel-as-truth semantics. */
+    /* Clear a null.  The caller must restore a real payload value
+     * before clearing HAS_NULLS — the stale NULL_I64 sentinel from the
+     * prior set-null would otherwise still read back as null. */
     ((int64_t*)ray_data(v))[3] = 30;  /* restore vals[3] = 3 * 10 */
     ray_vec_set_null(v, 3, false);
     TEST_ASSERT_FALSE(ray_vec_is_null(v, 3));
@@ -276,7 +275,7 @@ static test_result_t test_vec_null_external(void) {
     TEST_ASSERT_FALSE(ray_vec_is_null(v, 0));
     TEST_ASSERT_FALSE(ray_vec_is_null(v, 149));
 
-    /* U8 set-null is now rejected (Phase 1 lockdown). */
+    /* U8 set-null is rejected (U8 is non-nullable). */
     ray_t* u = ray_vec_new(RAY_U8, 4);
     uint8_t z = 0;
     for (int i = 0; i < 4; i++) u = ray_vec_append(u, &z);
@@ -310,11 +309,11 @@ static test_result_t test_vec_slice_release_parent_ref(void) {
     PASS();
 }
 
-/* ---- null_external_release_ext_ref -------------------------------------- */
+/* ---- null_large_release ------------------------------------------------- */
 
-static test_result_t test_vec_null_external_release_ext_ref(void) {
-    /* Release-without-leak smoke test on a large nullable vec.  No
-     * external bitmap child to track; ASAN is the gate. */
+static test_result_t test_vec_null_large_release(void) {
+    /* Release-without-leak smoke test on a large nullable vec.  ASAN
+     * is the gate. */
     ray_t* v = ray_vec_new(RAY_I16, 200);
     TEST_ASSERT_NOT_NULL(v);
 
@@ -562,7 +561,7 @@ const test_entry_t vec_entries[] = {
     { "vec/null_inline", test_vec_null_inline, vec_setup, vec_teardown },
     { "vec/null_external", test_vec_null_external, vec_setup, vec_teardown },
     { "vec/slice_release_parent_ref", test_vec_slice_release_parent_ref, vec_setup, vec_teardown },
-    { "vec/null_external_release_ext_ref", test_vec_null_external_release_ext_ref, vec_setup, vec_teardown },
+    { "vec/null_large_release", test_vec_null_large_release, vec_setup, vec_teardown },
     { "vec/append_grow", test_vec_append_grow, vec_setup, vec_teardown },
     { "vec/type_correctness", test_vec_type_correctness, vec_setup, vec_teardown },
     { "vec/empty", test_vec_empty, vec_setup, vec_teardown },

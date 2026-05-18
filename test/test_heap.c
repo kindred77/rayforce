@@ -524,10 +524,10 @@ static test_result_t test_str_pool_owned_ref(void) {
 
 /* ---- Sentinel-encoded null release ------------------------------------- *
  *
- * Post-sentinel-migration a nullable vec carries no external bitmap child;
- * null state lives entirely in the payload via the type-correct NULL_*
- * sentinel.  This test exercises release of a >128-element nullable vec
- * and verifies the heap remains sane afterwards. */
+ * A nullable vec carries no auxiliary bitmap child; null state lives
+ * entirely in the payload via the type-correct NULL_* sentinel.  This
+ * test exercises release of a >128-element nullable vec and verifies
+ * the heap remains sane afterwards. */
 
 static test_result_t test_sentinel_null_release(void) {
     int64_t n = 200;
@@ -1374,9 +1374,9 @@ static test_result_t test_scratch_realloc_slice(void) {
 /* ---- ray_scratch_realloc preserves sentinel-encoded nulls ----------------
  *
  * ray_scratch_realloc copies the header bytes into the new block and runs
- * ray_detach_owned_refs on the old one.  Post-sentinel-migration the
- * null state lives in the payload, so a HAS_NULLS vec realloced this way
- * must keep its HAS_NULLS bit and its sentinel-encoded null rows. */
+ * ray_detach_owned_refs on the old one.  Null state lives in the payload,
+ * so a HAS_NULLS vec realloced this way must keep its HAS_NULLS bit and
+ * its sentinel-encoded null rows. */
 
 static test_result_t test_scratch_realloc_sentinel_nulls(void) {
     int64_t n = 200;

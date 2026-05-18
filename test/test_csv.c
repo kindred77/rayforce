@@ -191,7 +191,7 @@ static test_result_t test_csv_null_i64(void) {
     TEST_ASSERT_FALSE(ray_vec_is_null(col, 0));
     TEST_ASSERT_EQ_I(((int64_t*)ray_data(col))[0], 10);
 
-    /* Phase 3a: empty I64 cell must be both bitmap-null AND NULL_I64-in-slot. */
+    /* Empty I64 cell must report null and carry NULL_I64 in the slot. */
     TEST_ASSERT_TRUE(ray_vec_is_null(col, 1));
     TEST_ASSERT_EQ_I(((int64_t*)ray_data(col))[1], NULL_I64);
 
@@ -220,7 +220,7 @@ static test_result_t test_csv_null_i64_unparseable(void) {
     TEST_ASSERT_FALSE(ray_vec_is_null(col, 0));
     TEST_ASSERT_EQ_I(((int64_t*)ray_data(col))[0], 10);
 
-    /* Phase 3a: unparseable I64 cell must be both bitmap-null AND NULL_I64-in-slot. */
+    /* Unparseable I64 cell must report null and carry NULL_I64 in the slot. */
     TEST_ASSERT_TRUE(ray_vec_is_null(col, 1));
     TEST_ASSERT_EQ_I(((int64_t*)ray_data(col))[1], NULL_I64);
 
@@ -249,7 +249,7 @@ static test_result_t test_csv_null_f64(void) {
     TEST_ASSERT_FALSE(ray_vec_is_null(col, 0));
     TEST_ASSERT_EQ_F(((double*)ray_data(col))[0], 1.5, 1e-6);
 
-    /* Phase 2: empty F64 cell must be both bitmap-null AND NaN-in-slot. */
+    /* Empty F64 cell must report null and carry NaN in the slot. */
     TEST_ASSERT_TRUE(ray_vec_is_null(col, 1));
     double slot1 = ((double*)ray_data(col))[1];
     TEST_ASSERT_TRUE(slot1 != slot1);            /* NaN check */
@@ -264,7 +264,7 @@ static test_result_t test_csv_null_f64(void) {
     PASS();
 }
 
-/* Phase 3a: empty I16 cell must be both bitmap-null AND NULL_I16-in-slot. */
+/* Empty I16 cell must report null and carry NULL_I16 in the slot. */
 static test_result_t test_csv_null_i16(void) {
     ray_heap_init();
     (void)ray_sym_init();
@@ -295,7 +295,7 @@ static test_result_t test_csv_null_i16(void) {
     PASS();
 }
 
-/* Phase 3a: empty I32 cell must be both bitmap-null AND NULL_I32-in-slot. */
+/* Empty I32 cell must report null and carry NULL_I32 in the slot. */
 static test_result_t test_csv_null_i32(void) {
     ray_heap_init();
     (void)ray_sym_init();
@@ -326,7 +326,7 @@ static test_result_t test_csv_null_i32(void) {
     PASS();
 }
 
-/* Phase 3a: empty DATE cell must be both bitmap-null AND NULL_I32-in-slot. */
+/* Empty DATE cell must report null and carry NULL_I32 in the slot. */
 static test_result_t test_csv_null_date(void) {
     ray_heap_init();
     (void)ray_sym_init();
@@ -355,7 +355,7 @@ static test_result_t test_csv_null_date(void) {
     PASS();
 }
 
-/* Phase 3a: empty TIME cell must be both bitmap-null AND NULL_I32-in-slot. */
+/* Empty TIME cell must report null and carry NULL_I32 in the slot. */
 static test_result_t test_csv_null_time(void) {
     ray_heap_init();
     (void)ray_sym_init();
@@ -384,7 +384,7 @@ static test_result_t test_csv_null_time(void) {
     PASS();
 }
 
-/* Phase 3a: empty TIMESTAMP cell must be both bitmap-null AND NULL_I64-in-slot. */
+/* Empty TIMESTAMP cell must report null and carry NULL_I64 in the slot. */
 static test_result_t test_csv_null_timestamp(void) {
     ray_heap_init();
     (void)ray_sym_init();
@@ -414,9 +414,8 @@ static test_result_t test_csv_null_timestamp(void) {
 }
 
 static test_result_t test_csv_null_bool(void) {
-    /* v4 contract (Phase 1 lockdown): BOOL is non-nullable.  Empty cells
-     * materialize as `false`, not as a null bit — the BOOL column has
-     * neither HAS_NULLS nor any set bitmap bits. */
+    /* BOOL is non-nullable.  Empty cells materialize as `false`, not
+     * as a null — the BOOL column has no HAS_NULLS attribute. */
     ray_heap_init();
     (void)ray_sym_init();
 
@@ -1418,10 +1417,10 @@ static test_result_t test_csv_explicit_i32_schema(void) {
 }
 
 static test_result_t test_csv_explicit_u8_schema_serial(void) {
-    /* v4 contract (Phase 1 lockdown): U8 is non-nullable.  Truncated rows
-     * still fill defaults (0), but no null bit is set and HAS_NULLS is
-     * stripped post-parse.  Exercises the serial parse path
-     * (n_rows ≤ 8192) plus the past-row-boundary fill branch. */
+    /* U8 is non-nullable.  Truncated rows still fill defaults (0), but
+     * no null is set and HAS_NULLS is stripped post-parse.  Exercises
+     * the serial parse path (n_rows ≤ 8192) plus the past-row-boundary
+     * fill branch. */
     ray_heap_init();
     (void)ray_sym_init();
 

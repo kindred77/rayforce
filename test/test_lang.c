@@ -2483,9 +2483,9 @@ static test_result_t test_eval_insert_guid(void) {
 
     ray_t* null_atom = ray_typed_null(-RAY_GUID);
     TEST_ASSERT_FALSE(RAY_IS_ERR(null_atom));
-    /* Post-sentinel-migration: NULL_GUID = 16 all-zero bytes in obj's
-     * U8 buffer.  ray_typed_null allocates that buffer rather than
-     * leaving obj as NULL, so consumers can ray_data(obj) unconditionally. */
+    /* NULL_GUID = 16 all-zero bytes in obj's U8 buffer.  ray_typed_null
+     * allocates that buffer rather than leaving obj as NULL, so
+     * consumers can ray_data(obj) unconditionally. */
     TEST_ASSERT_NOT_NULL(null_atom->obj);
     const uint8_t* nb = (const uint8_t*)ray_data(null_atom->obj);
     for (int i = 0; i < 16; i++)

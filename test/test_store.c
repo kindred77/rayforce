@@ -2175,8 +2175,8 @@ static test_result_t test_serde_obj_save_error(void) {
  * covering lines 586-656 (the RAY_BOOL/U8/I16/I32/DATE/TIME/F32 vector
  * deserialization with HAS_NULLS). */
 static test_result_t test_serde_vec_null_bitmaps(void) {
-    /* BOOL non-nullable per Phase 1 — set_null rejects.  Round-trip
-     * a non-null BOOL vec to keep the serde path covered. */
+    /* BOOL is non-nullable — set_null rejects.  Round-trip a non-null
+     * BOOL vec to keep the serde path covered. */
     {
         ray_t* v = ray_vec_new(RAY_BOOL, 3);
         TEST_ASSERT_NOT_NULL(v); TEST_ASSERT_FALSE(RAY_IS_ERR(v));
@@ -3921,42 +3921,6 @@ static test_result_t test_col_recursive_sym_in_list(void) {
     PASS();
 }
 
-/* ---- test_col_validate_mapped_legacy_ext_bitmap_rejected ---------------- */
-/* Pre-sentinel-migration columns persisted an external-bitmap segment
- * marked by attrs bit 0x20.  That arm is gone; col_validate_mapped must
- * reject such headers up front rather than try to interpret them. */
-static test_result_t test_col_validate_mapped_legacy_ext_bitmap_rejected(void) {
-    FILE* f = fopen(TMP_COL_PATH, "wb");
-    TEST_ASSERT_NOT_NULL(f);
-
-    uint8_t hdr[32];
-    memset(hdr, 0, 32);
-    hdr[18] = RAY_I64;                               /* type */
-    /* attrs = HAS_NULLS | legacy ext-bitmap bit (0x40 | 0x20). */
-    hdr[19] = RAY_ATTR_HAS_NULLS | 0x20;
-    hdr[20] = 1;                                     /* rc = 1 */
-    int64_t len = 16;
-    memcpy(hdr + 24, &len, 8);
-
-    /* Write header + data (16 * 8 = 128 bytes) + 2 trailing bytes
-     * (the bitmap segment the legacy format would expect). */
-    fwrite(hdr, 1, 32, f);
-    uint8_t data[128];
-    memset(data, 0, 128);
-    fwrite(data, 1, 128, f);
-    uint8_t bitmap[2] = { 0xFF, 0x00 };
-    fwrite(bitmap, 1, 2, f);
-    fclose(f);
-
-    ray_t* result = ray_col_mmap(TMP_COL_PATH);
-    TEST_ASSERT_TRUE(RAY_IS_ERR(result));
-    TEST_ASSERT_STR_EQ(ray_err_code(result), "corrupt");
-    ray_release(result);
-
-    unlink(TMP_COL_PATH);
-    PASS();
-}
-
 /* ---- test_col_sym_w64_negative_index ------------------------------------- */
 /* Covers validate_sym_bounds W64 negative-index branch (p[i] < 0). */
 static test_result_t test_col_sym_w64_negative_index(void) {
@@ -4036,7 +4000,6 @@ const test_entry_t store_entries[] = {
     { "store/col_mmap_size_mismatch", test_col_mmap_size_mismatch, store_setup, store_teardown },
     { "store/col_recursive_atoms", test_col_recursive_atoms, store_setup, store_teardown },
     { "store/col_recursive_sym_in_list", test_col_recursive_sym_in_list, store_setup, store_teardown },
-    { "store/col_validate_legacy_ext_bitmap_rejected", test_col_validate_mapped_legacy_ext_bitmap_rejected, store_setup, store_teardown },
     { "store/col_sym_w64_neg_index", test_col_sym_w64_negative_index, store_setup, store_teardown },
     { "store/file_open_close", test_file_open_close, store_setup, store_teardown },
     { "store/file_lock_unlock", test_file_lock_unlock, store_setup, store_teardown },

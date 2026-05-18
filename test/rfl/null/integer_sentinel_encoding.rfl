@@ -1,5 +1,5 @@
-;; Phase 3a dual-encoding contract: integer/temporal nulls hold the
-;; INT_MIN sentinel in the payload AND have the nullmap bit set.
+;; Integer / temporal null encoding: nulls hold the type-correct INT_MIN
+;; sentinel (NULL_I16 / NULL_I32 / NULL_I64) in the payload.
 
 ;; ----- 1. Atom construction -----
 
@@ -9,19 +9,19 @@
 
 ;; ----- 2. CSV ingest (I64) -----
 
-(.sys.exec "rm -f /tmp/rfl_phase3a_int_dual.csv")
-(.sys.exec "printf 'x\\n10\\n\\n30\\n' > /tmp/rfl_phase3a_int_dual.csv")
-(set P3I (.csv.read [I64] "/tmp/rfl_phase3a_int_dual.csv"))
-(count P3I)                  -- 3
-(nil? (at (at P3I 'x) 1))    -- true
-(at (at P3I 'x) 0)           -- 10
-(at (at P3I 'x) 2)           -- 30
+(.sys.exec "rm -f /tmp/rfl_int_sentinel.csv")
+(.sys.exec "printf 'x\\n10\\n\\n30\\n' > /tmp/rfl_int_sentinel.csv")
+(set Pi (.csv.read [I64] "/tmp/rfl_int_sentinel.csv"))
+(count Pi)                  -- 3
+(nil? (at (at Pi 'x) 1))    -- true
+(at (at Pi 'x) 0)           -- 10
+(at (at Pi 'x) 2)           -- 30
 
 ;; ----- 3. Aggregations exclude nulls -----
 
-(sum (at P3I 'x))   -- 40
-(min (at P3I 'x))   -- 10
-(max (at P3I 'x))   -- 30
+(sum (at Pi 'x))   -- 40
+(min (at Pi 'x))   -- 10
+(max (at Pi 'x))   -- 30
 
 ;; ----- 4. Sort places nulls per policy -----
 
@@ -34,7 +34,7 @@
 (nil? (at (distinct [0N 0N 0N]) 0))  -- true
 (count (distinct [0N 0N 0N]))        -- 1
 
-;; ----- 6. Group-by SUM on nullable I64 (consumer NaN/sentinel-skip) -----
+;; ----- 6. Group-by SUM on nullable I64 (consumer sentinel-skip) -----
 
 (set Tn (table [v g] (list [1 2 0N 4 5] [0 0 1 1 1])))
 (sum (at (select {s: (sum v) from: Tn where: (>= g 0) by: g}) 's)) -- 12

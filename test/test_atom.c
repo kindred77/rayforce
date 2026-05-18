@@ -457,9 +457,8 @@ static test_result_t test_atom_eq_list_sym_atoms(void) {
 }
 
 static test_result_t test_atom_typed_null_f64(void) {
-    /* Phase 2 dual-encoding: ray_typed_null(-RAY_F64) must store NaN in
-     * the f64 payload AND set nullmap[0]&1.  Downstream kernels that
-     * read the slot raw (without consulting the bitmap) then see NaN. */
+    /* ray_typed_null(-RAY_F64) stores NaN in the f64 payload AND sets
+     * nullmap[0]&1.  Downstream kernels reading the slot raw see NaN. */
     ray_t* v = ray_typed_null(-RAY_F64);
     TEST_ASSERT_NOT_NULL(v);
     TEST_ASSERT_FALSE(RAY_IS_ERR(v));
@@ -472,7 +471,7 @@ static test_result_t test_atom_typed_null_f64(void) {
 }
 
 static test_result_t test_atom_typed_null_i64(void) {
-    /* Phase 3a: integer typed nulls now use INT_MIN sentinel + bitmap bit. */
+    /* Integer typed nulls use the INT_MIN sentinel and set nullmap[0]&1. */
     ray_t* v = ray_typed_null(-RAY_I64);
     TEST_ASSERT_NOT_NULL(v);
     TEST_ASSERT_FALSE(RAY_IS_ERR(v));

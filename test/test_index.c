@@ -1080,7 +1080,7 @@ static test_result_t test_index_retain_payload_direct(void) {
     PASS();
 }
 
-/* ─── ray_index_release_saved / retain_saved are post-migration no-ops ──── *
+/* ─── ray_index_release_saved / retain_saved are no-ops ────────────── *
  *
  * Index attachment is restricted to numeric vector types (see
  * prepare_attach), so saved_nullmap never carries owned ray_t* refs.

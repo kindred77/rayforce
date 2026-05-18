@@ -5087,12 +5087,12 @@ static test_result_t test_expr_unary_cast_narrow_nullable(void) {
     ray_release(tbl);
     ray_sym_destroy();
 
-    /* U8 → I64.  Post-Phase-1: U8 is non-nullable; set_null is rejected
-     * by ray_vec_set_null_checked (the void wrapper discards the error),
+    /* U8 → I64.  U8 is non-nullable; set_null is rejected by
+     * ray_vec_set_null_checked (the void wrapper discards the error),
      * so the cell stays at its raw value.  Sum becomes 1+2+3 = 6. */
     uint8_t raw8[] = {1, 2, 3};
     ray_t* v8 = ray_vec_from_raw(RAY_U8, raw8, 3);
-    ray_vec_set_null(v8, 1, true);  /* no-op for U8 post-lockdown */
+    ray_vec_set_null(v8, 1, true);  /* no-op for non-nullable U8 */
     (void)ray_sym_init();
     int64_t n8 = ray_sym_intern("c8", 2);
     tbl = ray_table_new(1);
@@ -5109,14 +5109,14 @@ static test_result_t test_expr_unary_cast_narrow_nullable(void) {
     ray_release(result);
     ray_graph_free(g);
 
-    /* BOOL → I64.  Same Phase 1 non-nullable rule as U8.  Sum = 1+0+1 = 2. */
+    /* BOOL → I64.  BOOL is non-nullable, same as U8.  Sum = 1+0+1 = 2. */
     g = ray_graph_new(tbl);
     ray_release(tbl);
     ray_sym_destroy();
 
     uint8_t rawb[] = {1, 0, 1};
     ray_t* vbool = ray_vec_from_raw(RAY_BOOL, rawb, 3);
-    ray_vec_set_null(vbool, 2, true);  /* no-op for BOOL post-lockdown */
+    ray_vec_set_null(vbool, 2, true);  /* no-op for non-nullable BOOL */
     (void)ray_sym_init();
     int64_t nb = ray_sym_intern("cb", 2);
     tbl = ray_table_new(1);

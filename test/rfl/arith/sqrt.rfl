@@ -7,11 +7,10 @@
 (sqrt 9.0) -- 3.0
 (sqrt 25.0) -- 5.0
 
-;; sqrt of a negative produces IEEE NaN.  Post-sentinel-migration NaN
-;; IS the F64 null sentinel (NULL_F64 = __builtin_nan("")), so the
-;; result is recognised as null.  NaN remains its own type — type
-;; stays 'f64.  IEEE-NaN != NaN no longer "leaks through" cmp.c
-;; because two null atoms compare as equal under the migration's
+;; sqrt of a negative produces IEEE NaN.  NaN IS the F64 null sentinel
+;; (NULL_F64 = __builtin_nan("")), so the result is recognised as null.
+;; NaN remains its own type — type stays 'f64.  IEEE-NaN != NaN does
+;; not leak through cmp.c because two null atoms compare as equal under
 ;; null-handling at cmp.c:188-189.
 (type (sqrt -1.0)) -- 'f64
 (nil? (sqrt -1.0)) -- true

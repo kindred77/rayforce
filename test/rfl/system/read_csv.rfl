@@ -67,12 +67,11 @@
 (.sys.exec "printf 'name\\nalice\\n\\nbob\\n\\ncarol\\n' > rf_test_empty.csv") -- 0
 (set _t (.csv.read [SYMBOL] "rf_test_empty.csv"))
 (count _t)                                                            -- 5
-;; Post-sentinel-migration: empty string IS a null STR atom and empty
-;; SYM cell IS null (sym id 0).  The SYM vec vs null STR atom
-;; comparison short-circuits null differently than the old bitmap-blind
-;; path — every cell now passes `!= ""` and none passes `== ""`.
-;; Documented tension; revisit if SQL-style null-aware filtering on
-;; SYM columns becomes a requirement.
+;; Empty string IS a null STR atom and empty SYM cell IS null (sym
+;; id 0).  The SYM vec vs null STR atom comparison short-circuits null:
+;; every cell passes `!= ""` and none passes `== ""`.  Documented
+;; tension; revisit if SQL-style null-aware filtering on SYM columns
+;; becomes a requirement.
 (count (select {x: name from: _t where: (!= name "")}))               -- 5
 (count (select {x: name from: _t where: (== name "")}))               -- 0
 (.sys.exec "rm -f rf_test_empty.csv") -- 0

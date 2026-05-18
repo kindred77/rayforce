@@ -1,10 +1,8 @@
-;; Sentinel-only baseline (Stage A1 gate).
+;; Sentinel-only baseline.
 ;;
-;; Pins the end-state contract: for every nullable numeric/temporal type,
-;; the NULL_* sentinel value in a vec payload is the SOLE truth that
-;; consumers (count, sum/avg, format, sort, distinct) need.  No assertion
-;; here reads or depends on a nullmap bit, so this test must keep passing
-;; after the bitmap is stripped in later A-stage steps.
+;; Pins the null contract: for every nullable numeric/temporal type, the
+;; NULL_* sentinel value in a vec payload is the SOLE truth that consumers
+;; (count, sum/avg, format, sort, distinct) need.
 ;;
 ;; Every check builds a real vec containing a sentinel (via `as` cast or
 ;; CSV ingest) and exercises a consumer — never just `(nil? 0Nl)` on a

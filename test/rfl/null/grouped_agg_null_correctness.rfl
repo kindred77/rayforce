@@ -1,8 +1,8 @@
-;; Phase 3 follow-up: per-(group, agg) non-null counts drive AVG/VAR/
-;; STDDEV divisors, and result-side null finalization replaces
-;; accumulator seeds (DBL_MAX / -DBL_MAX / 0 / NaN product) for
-;; MIN/MAX/PROD/FIRST/LAST on all-null groups.  See
-;; include/rayforce.h NULL_* paragraph.
+;; Grouped aggregates exclude nulls correctly: per-(group, agg) non-null
+;; counts drive AVG/VAR/STDDEV divisors, and result-side null finalization
+;; produces a typed null (rather than leaking the accumulator seed —
+;; DBL_MAX / -DBL_MAX / 0 / NaN product) for MIN/MAX/PROD/FIRST/LAST on
+;; all-null groups.
 
 ;; ----- AVG divisor excludes nulls -----
 ;; Group g=0 has v in [1, 2, 0N, 4] — non-null sum = 7, non-null count = 3.

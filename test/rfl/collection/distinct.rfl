@@ -38,13 +38,13 @@
 (nil? (at (concat [1 0Nl 3] [0Nl 5 6]) 3)) -- true
 (nil? (at (concat [1 0Nl 3] [0Nl 5 6]) 0)) -- false
 (nil? (at (concat [1 0Nl 3] [0Nl 5 6]) 4)) -- false
-;; cast preserves null bitmaps
+;; cast preserves null state
 (nil? (at (as 'F64 [1 0Nl 3]) 1)) -- true
 (nil? (at (as 'I32 [1 0Nl 3]) 1)) -- true
 (at (as 'F64 [1 0Nl 3]) 0) -- 1.0
 (at (as 'F64 [1 0Nl 3]) 2) -- 3.0
-;; cast to I16 preserves nulls; U8/BOOL are non-nullable per Phase 1
-;; so the null collapses to u8-zero (no NULL_U8 sentinel).
+;; cast to I16 preserves nulls; U8/BOOL are non-nullable so the null
+;; collapses to u8-zero (no NULL_U8 sentinel).
 (nil? (at (as 'I16 [1 0Nl 3]) 1)) -- true
 (nil? (at (as 'U8 [1 0Nl 3]) 1)) -- false
 ;; cast non-null values survive

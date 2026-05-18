@@ -5,7 +5,7 @@
 (nil? 0Nl) -- true
 (nil? 0) -- false
 (nil? 1) -- false
-;; Post-sentinel-migration: STR null = empty string (len 0).
+;; STR null = empty string (len 0).
 (nil? "") -- true
 ;; nil? distinguishes typed nulls from zero-valued atoms across types
 (nil? 0Ni)   -- true

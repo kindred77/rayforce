@@ -12,7 +12,7 @@
 (last V)  -- 5
 
 ;; Compose lazy producer with non-lazy-aware consumer — the dispatcher
-;; (Phase 1.5) must materialise (sum U) and (sum V) before passing to +.
+;; must materialise (sum U) and (sum V) before passing to +.
 ;; Regression test for the bug that originally blocked Plan Task 5.
 (set U [10 20 30])
 (+ (sum U) (sum V)) -- 75

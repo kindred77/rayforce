@@ -99,7 +99,7 @@ static ray_t* build_target_table(const char* name) {
     return tab;
 }
 
-/* ─── Phase 1: storage round-trip ──────────────────────────────────── */
+/* ─── Pass 1: storage round-trip ──────────────────────────────────── */
 
 static test_result_t test_link_attach_basic(void) {
     int64_t rids[] = { 0, 1, 2, 1, 0 };
@@ -177,9 +177,9 @@ static test_result_t test_link_with_inline_nulls_promotes(void) {
     ray_t* w = v;
     ray_t* r = ray_link_attach(&w, custs_sym);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
-    /* Post-sentinel-migration: nulls live as NULL_I64 in the payload
-     * and don't consume the union arm, so link_attach is unconditional
-     * and the column stays nullable. */
+    /* Nulls live as NULL_I64 in the payload and don't consume the
+     * union arm, so link_attach is unconditional and the column stays
+     * nullable. */
     TEST_ASSERT_TRUE(w->attrs & RAY_ATTR_HAS_LINK);
     TEST_ASSERT_TRUE(w->attrs & RAY_ATTR_HAS_NULLS);
     TEST_ASSERT_TRUE(ray_vec_is_null(w, 1));
@@ -213,7 +213,7 @@ static test_result_t test_link_mutation_preserves_link(void) {
     PASS();
 }
 
-/* ─── Phase 2: deref ──────────────────────────────────────────────── */
+/* ─── Pass 2: deref ──────────────────────────────────────────────── */
 
 static test_result_t test_link_deref_basic(void) {
     int64_t rids[] = { 2, 0, 1, 2 };
@@ -297,7 +297,7 @@ static test_result_t test_link_deref_oob_yields_null(void) {
     PASS();
 }
 
-/* ─── Phase 3: persistence round-trip ─────────────────────────────── */
+/* ─── Pass 3: persistence round-trip ─────────────────────────────── */
 
 static test_result_t test_link_persistence_roundtrip(void) {
     int64_t rids[] = { 0, 1, 2, 1, 0 };
@@ -815,7 +815,7 @@ static test_result_t test_link_deref_sym_slice_w8(void) {
     PASS();
 }
 
-/* ─── Phase 4: coexistence with HAS_INDEX ─────────────────────────── */
+/* ─── Pass 4: coexistence with HAS_INDEX ─────────────────────────── */
 
 static test_result_t test_link_coexists_with_index(void) {
     int64_t rids[] = { 0, 1, 2, 1, 0 };
@@ -858,7 +858,7 @@ static test_result_t test_link_coexists_with_index(void) {
     PASS();
 }
 
-/* ─── Phase 5: parted-table interaction ────────────────────────────── */
+/* ─── Pass 5: parted-table interaction ────────────────────────────── */
 
 #define TMP_LINK_PART_DB    "/tmp/rayforce_test_link_parted_db"
 #define TMP_LINK_PART_TBL   "facts"

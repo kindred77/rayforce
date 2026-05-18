@@ -445,7 +445,7 @@ static test_result_t test_hnsw_handle_cow(void) {
     PASS();
 }
 
-/* ============ select ... nearest ... take — Phase 2 integration ============ */
+/* ============ select ... nearest ... take — Pass 2 integration ============ */
 
 /* Helper: build a 5-row test table with id / score / emb columns.  Runs
  * in the Rayfall env, then returns nothing.  The subsequent eval_* calls
