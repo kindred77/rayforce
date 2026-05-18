@@ -19,15 +19,17 @@
 (pearson_corr (as 'I16 [1 2 3 4 5]) (as 'I16 [5 4 3 2 1])) -- -1.0
 (pearson_corr (as 'U8  [1 2 3 4]) (as 'U8 [4 3 2 1])) -- -1.0
 
-;; ─── undefined cases → NaN ────────────────────────────────────────
-;; n < 2 → NaN (single-row variance undefined).
-(!= (pearson_corr [1.0] [2.0]) (pearson_corr [1.0] [2.0])) -- true
-;; Constant left column → variance 0 → NaN.
+;; ─── undefined cases → NaN (= F64 null sentinel post-migration) ──
+;; n < 2 → NaN (single-row variance undefined).  NaN IS NULL_F64 under
+;; sentinel-as-truth, so detect via nil? rather than IEEE NaN != NaN
+;; (which now collapses to "both nulls are equal" in cmp.c null-handling).
+(nil? (pearson_corr [1.0] [2.0])) -- true
+;; Constant left column → variance 0 → NaN/null.
 (set Rc1 (pearson_corr [1.0 1.0 1.0] [2.0 4.0 6.0]))
-(!= Rc1 Rc1) -- true
-;; Constant right column → variance 0 → NaN.
+(nil? Rc1) -- true
+;; Constant right column → variance 0 → NaN/null.
 (set Rc2 (pearson_corr [1.0 2.0 3.0] [5.0 5.0 5.0]))
-(!= Rc2 Rc2) -- true
+(nil? Rc2) -- true
 
 ;; ─── algebraic invariants ─────────────────────────────────────────
 ;; Symmetry: r(x,y) == r(y,x).

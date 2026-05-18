@@ -374,9 +374,13 @@
 
 ;; INT16/INT32 boundary parses — negative-extreme literals can't be written
 ;; (parser tokenises positive then negates), so verify via i64 round-trip.
-(as 'i64 (as 'i16 "-32768")) -- -32768
+;; Post-sentinel-migration: INT16_MIN / INT32_MIN / INT64_MIN collide
+;; with their respective NULL_* sentinels (documented hazard in
+;; include/rayforce.h).  Casting these boundary literals round-trips
+;; as the typed null of the wider type.
+(as 'i64 (as 'i16 "-32768")) -- 0Nl
 (as 'i64 (as 'i16 "32767")) -- 32767
-(as 'i64 (as 'i32 "-2147483648")) -- -2147483648
+(as 'i64 (as 'i32 "-2147483648")) -- 0Nl
 (as 'i64 (as 'i32 "2147483647")) -- 2147483647
 
 ;; ========== NULL PRESERVATION ACROSS CASTS ==========

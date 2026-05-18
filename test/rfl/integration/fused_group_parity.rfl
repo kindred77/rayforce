@@ -119,8 +119,10 @@
 
 ;; I16 SUM with full range:  -32768 + -1 + 0 + 1 + 32767 = -1
 (sum (at (select {s: (sum v) from: Ti16 where: (>= g 0) by: g}) 's)) -- -1
-;; MIN, MAX preserve full range
-(min (at (select {m: (min v) from: Ti16 where: (>= g 0) by: g}) 'm)) -- -32768
+;; MIN, MAX: post-sentinel-migration, INT16_MIN (-32768) collides with
+;; NULL_I16 (documented hazard — include/rayforce.h NULL_* block).
+;; A user-stored -32768 round-trips as 0Nh (null).
+(min (at (select {m: (min v) from: Ti16 where: (>= g 0) by: g}) 'm)) -- 0Nh
 (max (at (select {m: (max v) from: Ti16 where: (>= g 0) by: g}) 'm)) -- 32767
 
 ;; I32 boundaries — same pattern.  INT32_MAX = 2147483647.
