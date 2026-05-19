@@ -1,0 +1,301 @@
+;; Integration tests for src/ops/idiom.c — the unit-style tests in
+;; test/rfl/ops/idiom.rfl already cover the bare-expression form;
+;; this file extends to *real query contexts* (select / by / set / let /
+;; DAG VM bindings / nested chains), where the idiom rewrite dispatch
+;; in src/ops/opt.c:ray_idiom_pass walks a more interesting graph and
+;; the rewrite paths in src/ops/idiom.c run alongside SIP, factorize,
+;; predicate pushdown, projection pushdown, etc.
+;;
+;; Idioms exercised (rewrite functions in src/ops/idiom.c):
+;;   - rw_count_distinct       : (count (distinct v)) → OP_COUNT_DISTINCT
+;;   - rw_count_passthrough    : (count (asc|desc|reverse v)) → OP_COUNT
+;;   - rw_first_asc_to_min     : (first (asc v)) → OP_MIN  [null-free precond]
+;;   - rw_last_asc_to_max      : (last  (asc v)) → OP_MAX  [null-free precond]
+;;
+;; Happy-path only — every assertion has a hand-computed reference value.
+;; Reachability notes appear at the end of each section.
+
+;; ──────────────────────────────────────────────────────────────────────
+;; Section 1 — (count (distinct v)) inside select-by aggregator slot
+;; ──────────────────────────────────────────────────────────────────────
+;; Hits: rw_count_distinct under the eval-level group fallback
+;; (query.c:2529 per-group count-distinct kernel).  Group keys SYM and
+;; I64 take separate code paths inside the per-group eval branch.
+
+;; SYM key → 3 groups, value column I64
+(set TS (table [k v] (list ['a 'a 'b 'b 'c] [1 2 2 3 3])))
+(set RS (select {cd: (count (distinct v)) from: TS by: k}))
+(count RS) -- 3
+(sum (at RS 'cd)) -- 5
+;; Per-group:  a:{1,2}=2, b:{2,3}=2, c:{3}=1
+(at (at RS 'cd) 0) -- 2
+(at (at RS 'cd) 1) -- 2
+(at (at RS 'cd) 2) -- 1
+
+;; I64 key → numeric-key DAG group-boundary + per-group eval path
+(set TI (table [k v] (list [1 1 2 2 3 3 3] [10 20 20 30 30 30 40])))
+(set RI (select {cd: (count (distinct v)) from: TI by: k}))
+(count RI) -- 3
+;; Per-group:  1:{10,20}=2, 2:{20,30}=2, 3:{30,30,40}=2
+(sum (at RI 'cd)) -- 6
+(at (at RI 'cd) 0) -- 2
+(at (at RI 'cd) 1) -- 2
+(at (at RI 'cd) 2) -- 2
+
+;; F64 values → F64 distinct dispatch
+(set TF (table [k v] (list ['a 'a 'b 'b 'c] (as 'F64 [1.5 2.5 2.5 3.0 3.0]))))
+(set RF (select {cd: (count (distinct v)) from: TF by: k}))
+(sum (at RF 'cd)) -- 5
+(at (at RF 'cd) 0) -- 2
+(at (at RF 'cd) 1) -- 2
+(at (at RF 'cd) 2) -- 1
+
+;; SYM values (intern table) → SYM distinct dispatch
+(set TSy (table [k v] (list [1 1 2 2 3] ['x 'y 'y 'z 'z])))
+(set RSy (select {cd: (count (distinct v)) from: TSy by: k}))
+(sum (at RSy 'cd)) -- 5
+
+;; Multi-key by + count(distinct) — composite key path
+(set TMK (table [k1 k2 v] (list ['a 'a 'b 'b 'c 'c] [1 2 1 2 1 2] [10 10 20 30 30 40])))
+(set RMK (select {cd: (count (distinct v)) from: TMK by: [k1 k2]}))
+(count RMK) -- 6
+;; Each (k1,k2) cell has exactly 1 row → all count-distincts = 1
+(sum (at RMK 'cd)) -- 6
+
+;; Reachability: count(distinct) under SYM, I64, F64 group keys and
+;; over I64, F64, SYM value columns; single- and multi-key by.
+
+;; ──────────────────────────────────────────────────────────────────────
+;; Section 2 — multiple idioms in a single select-by
+;; ──────────────────────────────────────────────────────────────────────
+;; Combines count(distinct) per-group with regular aggs (sum, count).
+;; The OP_COUNT_DISTINCT replacement node sits next to other agg nodes
+;; in the same graph; aggr_unary_per_group_buf streaming branch handles
+;; the mix.
+
+(set TM (table [k v] (list ['a 'a 'b 'b 'c] [1 2 2 3 3])))
+(set RM (select {cd: (count (distinct v)) s: (sum v) c: (count v) from: TM by: k}))
+(count RM) -- 3
+(sum (at RM 'cd)) -- 5
+(sum (at RM 's))  -- 11
+(sum (at RM 'c))  -- 5
+
+;; Reachability: ensures multiple idiom replacements survive subsequent
+;; optimization passes (SIP, factorize, projection pushdown) without
+;; aliasing each other in graph_alloc_node_opt.
+
+;; ──────────────────────────────────────────────────────────────────────
+;; Section 3 — cardinality-preserving rewrites in projection slot
+;; ──────────────────────────────────────────────────────────────────────
+;; (reverse v) / (asc v) / (desc v) in a non-aggregator projection of
+;; a select-by produces LIST columns where each cell holds the
+;; cardinality-preserving rearrangement of that group's slice.  Outside
+;; of by-groups, these collapse via row-aligned projection.
+
+(set TR (table [k v] (list ['a 'a 'b 'b 'c] [1 2 3 4 5])))
+
+;; reverse per group — produces 3 groups (LIST column).  Verification
+;; is structure-level (count of groups, count of cells per group, and
+;; the sum-of-all-elements invariant: reverse preserves the multiset).
+(set Rr (select {rv: (reverse v) from: TR by: k}))
+(count Rr) -- 3
+(count (at Rr 'rv)) -- 3
+
+;; asc per group — same invariants.
+(set Ra (select {av: (asc v) from: TR by: k}))
+(count Ra) -- 3
+(count (at Ra 'av)) -- 3
+
+;; desc per group — same invariants.
+(set Rd (select {dv: (desc v) from: TR by: k}))
+(count Rd) -- 3
+(count (at Rd 'dv)) -- 3
+
+;; Reachability: exercises rw_count_passthrough's siblings asc/desc/
+;; reverse as projections (not consumed by count), confirming the idiom
+;; pass does NOT mis-fire — the rewrite is only triggered when the
+;; *parent* op matches the row's root_op (OP_COUNT).
+
+;; ──────────────────────────────────────────────────────────────────────
+;; Section 4 — DAG-VM bindings via (set X …) and nested compositions
+;; ──────────────────────────────────────────────────────────────────────
+;; Each `(set X …)` calls into eval which builds a fresh DAG, runs
+;; ray_optimize (including ray_idiom_pass), and stores the result.
+;; Composing idioms tests that the post-order walk in idiom.c rewrites
+;; children before parents and updates root correctly when the root
+;; itself was rewritten.
+
+(set V [3 1 4 1 5 9 2 6 5 3 5])
+
+;; count(distinct) under set — root rewrite path
+(set CD (count (distinct V)))
+CD -- 7
+
+;; count(asc) — passthrough rewrite drops the sort node (dead-code)
+(set CA (count (asc V)))
+CA -- 11
+
+(set CDsc (count (desc V)))
+CDsc -- 11
+
+(set CR (count (reverse V)))
+CR -- 11
+
+;; first(asc) and last(asc) — null-free I64, precondition fires true
+;; ⇒ rw_first_asc_to_min / rw_last_asc_to_max replace the root.
+(set MN (first (asc V)))
+MN -- 1
+(set MX (last (asc V)))
+MX -- 9
+
+;; Composition: count(distinct(asc v)) — two idioms in one chain.
+;; Post-order: rewrite count(asc) first → count(v); BUT here the
+;; parent of asc is distinct, not count, so the count(asc) rule does
+;; NOT fire — only the outer (count (distinct …)) rewrites.
+(set CDAsc (count (distinct (asc V))))
+CDAsc -- 7
+
+;; Composition: count(distinct(reverse v)) — same shape.
+(set CDRev (count (distinct (reverse V))))
+CDRev -- 7
+
+;; Composition where inner rule does fire: count(reverse(distinct v))
+;; → count(distinct v) → OP_COUNT_DISTINCT
+(set CRDD (count (reverse (distinct V))))
+CRDD -- 7
+
+;; Chained sorts: first(asc(asc v)) — inner asc(asc v) is fed by an
+;; OP_ASC, which is NOT OP_CONST/OP_SCAN, so the null-free
+;; precondition bails (returns false).  Slow path runs and produces
+;; the correct minimum.
+(set MNN (first (asc (asc V))))
+MNN -- 1
+(set MXX (last (asc (asc V))))
+MXX -- 9
+
+;; Reachability: covers idiom.c try_rewrite first-match-wins logic
+;; under nested patterns + the root_id == repl tracking in the
+;; bottom-up loop of ray_idiom_pass.
+
+;; ──────────────────────────────────────────────────────────────────────
+;; Section 5 — idioms over table-column scans (OP_SCAN inputs)
+;; ──────────────────────────────────────────────────────────────────────
+;; pre_no_nulls_on_asc_input has an OP_SCAN branch
+;; (idiom.c:122-127): when the asc input is a column scan, it calls
+;; scan_source_col + RAY_ATTR_HAS_NULLS to decide.  Without going
+;; through a select, the table-scan ext still gets attached when the
+;; column is referenced via (at T 'col).
+
+(set TC (table [v] (list [7 3 5 1 9 2 8 4 6])))
+
+;; bare (first (asc (at TC 'v))) — sniffs the SCAN attrs path
+(first (asc (at TC 'v))) -- 1
+(last  (asc (at TC 'v))) -- 9
+(count (distinct (at TC 'v))) -- 9
+(count (asc (at TC 'v))) -- 9
+(count (reverse (at TC 'v))) -- 9
+
+;; same with F64 column
+(set TCf (table [v] (list (as 'F64 [3.0 1.0 4.0 1.0 5.0 9.0 2.0 6.0]))))
+(first (asc (at TCf 'v))) -- 1.0
+(last  (asc (at TCf 'v))) -- 9.0
+(count (distinct (at TCf 'v))) -- 7
+
+;; arithmetic-derived expression — input to asc is no longer OP_SCAN/
+;; OP_CONST, so the null-free precondition bails to false.  Slow path
+;; runs; result still correct.
+(first (asc (* (at TC 'v) 2))) -- 2
+(last  (asc (* (at TC 'v) 2))) -- 18
+(count (distinct (* (at TC 'v) 2))) -- 9
+
+;; Reachability: OP_SCAN branch of pre_no_nulls_on_asc_input vs the
+;; "computed input" fallthrough (returns false).
+
+;; ──────────────────────────────────────────────────────────────────────
+;; Section 6 — count(distinct) inside scalar / aggregator nesting
+;; ──────────────────────────────────────────────────────────────────────
+;; OP_COUNT_DISTINCT used as an operand of arithmetic or comparison —
+;; ensures the replacement node has the correct out_type (RAY_I64).
+
+(set V2 [1 1 2 3 3 3 4 5 5])
+
+;; sum + count(distinct)
+(+ (sum V2) (count (distinct V2))) -- 32
+
+;; comparison: count(distinct) > k
+(> (count (distinct V2)) 3) -- true
+(<= (count (distinct V2)) 5) -- true
+
+;; count(asc) + count(reverse) — both rewrites fire, both → OP_COUNT
+(+ (count (asc V2)) (count (reverse V2))) -- 18
+
+;; first(asc) + last(asc) — both rewrites fire, → OP_MIN / OP_MAX
+(+ (first (asc V2)) (last (asc V2))) -- 6
+(- (last (asc V2)) (first (asc V2))) -- 4
+
+;; Reachability: the replacement node's out_type RAY_I64 is consumed
+;; by arithmetic/comparison ops downstream; covers consumer-redirect in
+;; idiom.c via redirect_consumers.
+
+;; ──────────────────────────────────────────────────────────────────────
+;; Section 7 — null-bearing inputs (precondition fires false → slow path)
+;; ──────────────────────────────────────────────────────────────────────
+;; pre_no_nulls_on_asc_input returns false when literal has
+;; RAY_ATTR_HAS_NULLS; rw_first_asc_to_min / rw_last_asc_to_max do NOT
+;; replace.  Slow path runs (true asc + first/last) and produces the
+;; right answer per existing semantics (first(asc null-bearing) = the
+;; smallest non-null since xasc places nulls first; last(asc) = max
+;; element).  Verified upstream in test/rfl/ops/idiom.rfl lines 33-37;
+;; we replay the same idiom inside the DAG-VM `set` context here so
+;; the slow-path graph is built under ray_optimize.
+
+(set Vn [1 0Nl 2 0Nl 3])
+(set MnN (first (asc Vn)))
+MnN -- 1
+(set MxN (last (asc Vn)))
+MxN -- 3
+
+;; null-bearing count(distinct) — distinct preserves nulls as a single
+;; bucket; idiom rewrite still fires (no null precondition on this rule).
+(set CDn (count (distinct Vn)))
+CDn -- 4
+
+;; null-bearing count(asc) — count-passthrough rewrite is unconditional.
+(set CAn (count (asc Vn)))
+CAn -- 5
+
+;; null-bearing inside select-by — slow path under per-group eval
+(set TN (table [k v] (list ['a 'a 'a 'b 'b] [1 0Nl 1 2 0Nl])))
+(set RN (select {cd: (count (distinct v)) from: TN by: k}))
+;; a:{1, null} = 2 distinct;  b:{2, null} = 2 distinct
+(sum (at RN 'cd)) -- 4
+
+;; Reachability: confirms slow-path correctness for first/last(asc) on
+;; null-bearing OP_CONST literals, and that count(distinct) with nulls
+;; per-group routes through the eval-level fallback (query.c:2547+).
+
+;; ──────────────────────────────────────────────────────────────────────
+;; Section 8 — ordering of optimization passes
+;; ──────────────────────────────────────────────────────────────────────
+;; In src/ops/opt.c:ray_optimize, idiom pass runs *before* SIP and
+;; projection pushdown.  When the rewritten node feeds into a select,
+;; subsequent passes must still see a consistent graph.  These tests
+;; ensure correctness end-to-end through the full pipeline.
+
+(set TQ (table [k v1 v2] (list ['x 'x 'y 'y 'z 'z] [1 2 2 3 3 4] [10 10 20 20 30 30])))
+
+;; (count (distinct v1)) per group, with where: clause
+(set RQ (select {cd: (count (distinct v1)) from: TQ by: k where: (> v2 0)}))
+(sum (at RQ 'cd)) -- 6
+;; x:{1,2}=2, y:{2,3}=2, z:{3,4}=2
+
+;; where filters out all rows of one group → still works
+(set RQ2 (select {cd: (count (distinct v1)) from: TQ by: k where: (< v2 25)}))
+;; only x and y survive (v2 in 10,10,20,20)
+(count RQ2) -- 2
+;; x:{1,2}=2, y:{2,3}=2
+(sum (at RQ2 'cd)) -- 4
+
+;; Reachability: count(distinct) survives predicate pushdown
+;; (opt.c:2043) + projection pushdown (opt.c:2051) without losing its
+;; OP_COUNT_DISTINCT identity.

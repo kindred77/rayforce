@@ -1,0 +1,374 @@
+;; Typed fast paths in src/ops/expr.c — binary_range, binary_range_str,
+;; par_binary_fn, par_binary_str_fn.
+;;
+;; Targets recent perf commits:
+;;   325db211 binary_range: typed fast path for int-vec vs int scalar arith
+;;   c866c781 binary_range: typed fast path for int-vec vs int scalar BOOL cmp
+;;   573516d7 binary_range: thread g->selection through par_binary_fn
+;;   7396a516 SIMD-friendly (== SYM-vec SYM-atom) fast path
+;;
+;; Constants:
+;;   RAY_MORSEL_ELEMS      = 1024
+;;   RAY_PARALLEL_THRESHOLD= 64 * 1024 = 65536
+;;
+;; We build large typed vectors (>= 70000 rows) so dispatch crosses the
+;; pool threshold and runs par_binary_fn / par_binary_str_fn.  Smaller
+;; (e.g. 1024-row) vectors hit the sequential path.  Both are exercised
+;; per opcode so the typed-fast-path body executes under both callers.
+;;
+;; Hand-computed references:
+;;   `(til N)` = [0,1,...,N-1]; sum = N*(N-1)/2; sum_sq = N*(N-1)*(2N-1)/6.
+;;   For (- v c) over til N: sum = sum(til N) - N*c = N*(N-1)/2 - N*c.
+;;   For (+ v c) over til N: sum = N*(N-1)/2 + N*c.
+;;   For (* v c) over til N: sum = c * N*(N-1)/2.
+;;
+;; All assertions are happy-path: well-typed inputs, finite scalars,
+;; no null sentinels.  No probes; standard mainline pipeline.
+
+;; ────────────────────────────────────────────────────────────────────
+;; Sizes
+;; ────────────────────────────────────────────────────────────────────
+(set NB 70000)  ;; > RAY_PARALLEL_THRESHOLD — drives par_binary_fn
+(set NS 2048)   ;; < threshold; sequential binary_range
+
+;; ════════════════════════════════════════════════════════════════════
+;; 1. ARITHMETIC FAST PATH — int-vec × int-scalar, type matches out_type
+;;    Drives BR_AR_FAST (expr.c:1613-1629) for l_esz=8/4/2 arms.
+;; ════════════════════════════════════════════════════════════════════
+
+;; ──── I64-vec × I64-scalar (BR_AR_FAST(int64_t), l_esz=8) ────
+(set VI64B (til NB))
+(set VI64S (til NS))
+
+;; OP_ADD: sum(v+5) = sum(v) + 5*N.  sum(til 70000) = 2449965000.
+(sum (+ VI64B 5)) -- 2450315000
+(sum (+ VI64S 5)) -- 2106368
+
+;; OP_SUB: sum(v-3) = sum(v) - 3*N
+(sum (- VI64B 3)) -- 2449755000
+(sum (- VI64S 3)) -- 2089984
+
+;; OP_MUL: sum(v*2) = 2*sum(v)
+(sum (* VI64B 2)) -- 4899930000
+(sum (* VI64S 2)) -- 4192256
+
+;; Endpoint spot-checks confirm the fast-path inner loop writes the
+;; correct element, not a typed-promotion artefact.
+(at (+ VI64B 100) 0)     -- 100
+(at (+ VI64B 100) 69999) -- 70099
+(at (- VI64B 1)   0)     -- -1
+(at (- VI64B 1)   69999) -- 69998
+(at (* VI64B 3)   1)     -- 3
+(at (* VI64B 3)   69998) -- 209994
+
+;; ──── I32-vec × scalar (BR_AR_FAST(int32_t), l_esz=4) ────
+;; Result type must match input type — `(- col scalar)` over I32 col
+;; preserves I32 (no narrowing required, fast path is engaged).
+(set VI32B (as 'I32 (til NB)))
+(set VI32S (as 'I32 (til NS)))
+
+(sum (+ VI32B 7i)) -- 2450455000
+(sum (+ VI32S 7i)) -- 2110464
+(sum (- VI32B 4i)) -- 2449685000
+(sum (- VI32S 4i)) -- 2087936
+
+;; Confirm output stays I32: small multiplier keeps within INT32_MAX.
+(at (+ VI32B 1i) 5)  -- 6i
+(at (- VI32B 2i) 10) -- 8i
+(at (* VI32B 2i) 7)  -- 14i
+
+;; ──── I16-vec × scalar (BR_AR_FAST(int16_t), l_esz=2) ────
+;; Keep values inside [-32768, 32767] so neither op wraps modulo 2^16.
+;; (% (til NB) 256) is a benign 0..255 column and a 70k-row I16 vec.
+(set VI16B (as 'I16 (% (til NB) 256)))
+(set VI16S (as 'I16 (% (til NS) 256)))
+
+;; sum((til NB) mod 256) computed: 273 full cycles of 0..255 (sum 32640
+;; each) + tail [0..(70000 mod 256)-1] = 273*32640 + sum(0..111)
+;; = 8910720 + 6216 = 8916936.
+(sum (+ VI16B 0h)) -- 8916936
+
+;; OP_ADD/SUB stays within range when adding small constants.
+(at (+ VI16B 1h) 0)  -- 1h
+(at (+ VI16B 1h) 5)  -- 6h
+(at (- VI16B 1h) 10) -- 9h
+(at (* VI16B 0h) 1)  -- 0h
+
+;; ──── TIMESTAMP-vec × scalar (l_esz=8, type==RAY_TIMESTAMP) ────
+;; Cast a small I64 til-range to TIMESTAMP nanoseconds.  Arithmetic
+;; preserves TIMESTAMP — the lhs->type == out_type guard fires.
+(set VTSS (as 'TIMESTAMP (til NS)))
+;; (+ ts c) preserves TIMESTAMP element type & is the BR_AR_FAST(int64_t) arm.
+;; sum(til NS) + 1000*NS = 2096128 + 2048000 = 4144128.
+(sum (as 'I64 (+ VTSS 1000))) -- 4144128
+
+;; ──── DATE-vec × scalar (l_esz=4, type==RAY_DATE) ────
+(set VDS (as 'DATE (til NS)))
+(at (as 'I32 (+ VDS 1000i)) 0)    -- 1000i
+(at (as 'I32 (+ VDS 1000i)) 100)  -- 1100i
+(at (as 'I32 (- VDS 5i)) 10)      -- 5i
+
+;; ──── F64-vec × F64-scalar (no fast-path arith — generic out_type==RAY_F64) ────
+;; Drives the F64 arm of binary_range (expr.c:1688-1700) over both
+;; sequential & parallel sizes.
+(set VF64B (as 'F64 (til NB)))
+(set VF64S (as 'F64 (til NS)))
+
+;; (+ vF c) returns F64.  sum = sum(til N) + c*N.
+;; 2449965000 + 0.5*70000 = 2450000000.0
+(sum (+ VF64B 0.5))  -- 2450000000.0
+;; 2096128 + 0.25*2048 = 2096640.0
+(sum (+ VF64S 0.25)) -- 2096640.0
+
+;; OP_SUB, OP_MUL, OP_DIV
+(at (+ VF64B 2.5) 100)  -- 102.5
+(at (- VF64B 1.5) 200)  -- 198.5
+(at (* VF64B 0.5) 6)    -- 3.0
+(at (/ VF64B 2.0) 8)    -- 4.0
+
+;; OP_DIV: scalar 2.0 produces F64 with exact half values.
+;; sum(til 2048)/2 = 2096128/2 = 1048064.0
+(sum (/ VF64S 2.0)) -- 1048064.0
+
+;; ════════════════════════════════════════════════════════════════════
+;; 2. BOOL COMPARISON FAST PATH — out_type=RAY_BOOL, !l_scalar, r_scalar
+;;    Drives BR_FAST (expr.c:1533-1586) for each width arm.
+;; ════════════════════════════════════════════════════════════════════
+
+;; ──── I64-vec cmp I64-scalar (BR_FAST int64_t, l_esz=8) ────
+(sum (as 'I64 (== VI64B 12345))) -- 1
+(sum (as 'I64 (!= VI64B 0)))     -- 69999
+;; (< v c): count of v in [0..c-1] = c (for c<=N).
+(sum (as 'I64 (< VI64B 1000)))   -- 1000
+(sum (as 'I64 (<= VI64B 1000)))  -- 1001
+;; (> v c): count of v in [c+1..N-1] = N-1-c.
+(sum (as 'I64 (> VI64B 50000)))  -- 19999
+(sum (as 'I64 (>= VI64B 50000))) -- 20000
+
+;; Endpoint masks confirm the boolean writeback.
+(at (== VI64B 0)     0)     -- true
+(at (== VI64B 69999) 69999) -- true
+(at (!= VI64B 5)     5)     -- false
+(at (< VI64B 10)     9)     -- true
+(at (< VI64B 10)     10)    -- false
+
+;; Sequential-size mirror to drive BR_FAST under direct binary_range
+;; (no pool dispatch).
+(sum (as 'I64 (== VI64S 7)))    -- 1
+(sum (as 'I64 (< VI64S 100)))   -- 100
+(sum (as 'I64 (>= VI64S 2000))) -- 48
+
+;; ──── I32-vec cmp I64-scalar (BR_FAST int32_t, l_esz=4) ────
+;; The fast path reads i32 lhs and compares signed-promoted to r_i64.
+(sum (as 'I64 (== VI32B 100i))) -- 1
+(sum (as 'I64 (< VI32B 500i)))  -- 500
+(sum (as 'I64 (>= VI32B 69998i))) -- 2
+(at (== VI32B 0i)     0)     -- true
+(at (>  VI32B 69997i) 69998) -- true
+(at (>  VI32B 69997i) 69997) -- false
+
+;; Sequential.
+(sum (as 'I64 (!= VI32S 0i))) -- 2047
+
+;; ──── I16-vec cmp scalar (BR_FAST int16_t, l_esz=2) ────
+;; VI16B = (til NB) % 256.  Count of (== col 0) = ceil(NB/256) = 274.
+(sum (as 'I64 (== VI16B 0h))) -- 274
+;; Count of (< col 10) = 10 * ceil(NB/256) = 2735+? — compute directly:
+;;   full 256-cycles in 70000: 273*10 = 2730 from [0..9]
+;;   tail [0..NB%256-1] = [0..143]; 144 covers all of [0..9] -> +10.
+;; Total = 2740.
+(sum (as 'I64 (< VI16B 10h))) -- 2740
+
+;; ──── BOOL-vec cmp BOOL-scalar (BR_FAST uint8_t, l_esz=1) ────
+;; `(> col c)` where col is BOOL, c is BOOL scalar → reaches the
+;; l_esz==1 fast-path arm.
+(set VBB (> (til NB) 34999))
+(sum (as 'I64 VBB))             -- 35000
+;; (== boolvec true) = boolvec; sum = 35000.
+(sum (as 'I64 (== VBB true)))   -- 35000
+;; (!= boolvec false) = boolvec.
+(sum (as 'I64 (!= VBB false)))  -- 35000
+;; (< boolvec true) = !boolvec → 35000 false (NB - 35000).
+(sum (as 'I64 (< VBB true)))    -- 35000
+
+;; ──── SYM-vec cmp SYM atom — exercises SYM W8/W16/W32 width arms ────
+;; SYM column built from `(as 'SYMBOL ...)` over a many-distinct-value
+;; pattern goes to W16 (256 ≤ count) or W32 (≥65k); a small-cardinality
+;; column stays W8 (≤255).
+;;
+;; Small-card SYM column (W8): take 3 distinct sym atoms × 70000.
+(set VSYM3 (take ['a 'b 'c] NB))
+;; (== sym-vec 'a) — drives SIMD-friendly EQ for SYM (commit 7396a516).
+;; Pattern is round-robin, so 'a appears at positions 0,3,6,... — total
+;; = ceil(NB/3) = 23334 (NB=70000, 23333*3 + 1).
+(sum (as 'I64 (== VSYM3 'a))) -- 23334
+(sum (as 'I64 (== VSYM3 'b))) -- 23333
+(sum (as 'I64 (== VSYM3 'c))) -- 23333
+(sum (as 'I64 (!= VSYM3 'a))) -- 46666
+(at (== VSYM3 'a) 0) -- true
+(at (== VSYM3 'a) 1) -- false
+(at (== VSYM3 'a) 3) -- true
+
+;; Sequential (NS=2048) SYM EQ mirror.
+(set VSYM3S (take ['x 'y 'z] NS))
+(sum (as 'I64 (== VSYM3S 'x))) -- 683
+(sum (as 'I64 (!= VSYM3S 'x))) -- 1365
+
+;; ════════════════════════════════════════════════════════════════════
+;; 3. ATOM-VEC MIRROR — l_scalar=true, !r_scalar.
+;;    The integer-vec-vs-integer-scalar fast paths only fire when the
+;;    VECTOR is on the LEFT.  Scalar-on-left routes through the
+;;    generic LV_READ / RV_READ kernel.  Drive that branch explicitly
+;;    (expr.c:1691 / 1709 referenced in the test_exec_expr_i32_scalar_left
+;;    C-level fixture) so par_binary_fn covers the !fast-path arm too.
+;; ════════════════════════════════════════════════════════════════════
+
+;; ──── I64 scalar on left, I64 vec on right ────
+;; sum(5 - v) = 5*N - sum(v) = 5*70000 - 2449965000 = -2449615000
+(sum (- 5 VI64B)) -- -2449615000
+;; 5*2048 - 2096128 = 10240 - 2096128 = -2085888
+(sum (- 5 VI64S)) -- -2085888
+(at (- 10 VI64B) 0)     -- 10
+(at (- 10 VI64B) 5)     -- 5
+(at (* 3 VI64B) 7)      -- 21
+;; 2096128 + 1*2048 = 2098176
+(sum (+ 1 VI64S))       -- 2098176
+
+;; ──── I32 scalar on left, I32 vec on right ────
+(at (- 100i VI32B) 0)  -- 100i
+(at (- 100i VI32B) 50) -- 50i
+
+;; ──── F64 scalar on left, F64 vec on right ────
+(at (- 5.0 VF64B) 0)   -- 5.0
+(at (- 5.0 VF64B) 5)   -- 0.0
+(at (+ 0.5 VF64B) 100) -- 100.5
+
+;; ──── Scalar-left BOOL comparison: doesn't hit the (lhs typed) BOOL
+;; fast path either (its `!l_scalar && r_scalar` guard is reversed),
+;; so this also covers the generic BOOL arm at expr.c:1753.
+;; (< 10 v) = count of v in [11..NB-1] = NB - 11 = 69989
+(sum (as 'I64 (< 10 VI64B))) -- 69989
+(sum (as 'I64 (== 7 VI64B))) -- 1
+
+;; ════════════════════════════════════════════════════════════════════
+;; 4. PARALLEL STR EQ — par_binary_str_fn over RAY_STR vec ≥ threshold.
+;;    binary_range_str at expr.c:1420; par dispatch at expr.c:1886.
+;; ════════════════════════════════════════════════════════════════════
+
+;; Build a 70000-row STR vec with 3 distinct values.  RAY_STR (uppercase
+;; literal "..." inside list) is the per-row string type that drives
+;; par_binary_str_fn, distinct from interned SYM.
+(set VSTR (take (list "alpha" "beta" "gamma") NB))
+
+(sum (as 'I64 (== VSTR "alpha"))) -- 23334
+(sum (as 'I64 (== VSTR "beta")))  -- 23333
+(sum (as 'I64 (== VSTR "gamma"))) -- 23333
+(sum (as 'I64 (!= VSTR "alpha"))) -- 46666
+(at (== VSTR "alpha") 0) -- true
+(at (== VSTR "alpha") 1) -- false
+(at (== VSTR "alpha") 3) -- true
+
+;; STR ordering: lexicographic — alpha < beta < gamma.
+;; (< vec "beta") = positions where elem == "alpha".
+(sum (as 'I64 (< VSTR "beta")))  -- 23334
+(sum (as 'I64 (<= VSTR "beta"))) -- 46667
+;; (> "alpha") = positions where elem in {"beta","gamma"} = 46666.
+(sum (as 'I64 (> VSTR "alpha"))) -- 46666
+(sum (as 'I64 (>= VSTR "alpha"))) -- 70000
+
+;; Sequential STR (NS < threshold): drives the direct binary_range_str
+;; call at expr.c:1895, not via the pool.
+(set VSTRS (take (list "a" "b" "c") NS))
+(sum (as 'I64 (== VSTRS "a"))) -- 683
+(sum (as 'I64 (!= VSTRS "a"))) -- 1365
+(sum (as 'I64 (< VSTRS "b")))  -- 683
+
+;; ════════════════════════════════════════════════════════════════════
+;; 5. SELECTION-AWARE par_binary_fn — exec.c sets g->selection inside
+;;    a nested (select v from T where pred-with-binop). The first
+;;    predicate writes a row-selection bitmap; the second binary op
+;;    runs with sel_flg / sel_offs / sel_idx populated, hitting
+;;    par_binary_fn's selection branch at expr.c:1819-1836.
+;;
+;;    For the selection threading to be visible at the par level the
+;;    table must be ≥ RAY_PARALLEL_THRESHOLD rows (else exec_binary
+;;    drops to the sequential path).
+;; ════════════════════════════════════════════════════════════════════
+
+(set TBig (table [a b c] (list (til NB) (- NB (til NB)) (as 'I32 (% (til NB) 1000)))))
+
+;; Two-conjunct WHERE: first conjunct produces selection; second is a
+;; binary op evaluated with g->selection set.  Both conjuncts route
+;; through binary_range / par_binary_fn.
+(count (select {from: TBig where: (and (> a 1000) (< a 2000))})) -- 999
+;; sum(1001..1999) = sum(0..1999) - sum(0..1000) = 1999000 - 500500 = 1498500
+(sum (at (select {from: TBig where: (and (> a 1000) (< a 2000))}) 'a)) -- 1498500
+
+;; Chained nested select: outer predicate runs over the post-filter
+;; selection — outer par_binary_fn sees a non-NULL g->selection.
+(count (select {from: (select {from: TBig where: (> a 100)}) where: (< a 200)})) -- 99
+(sum (at (select {from: (select {from: TBig where: (> a 100)}) where: (< a 200)}) 'a)) -- 14850
+
+;; Derived-column with binary op runs through par_binary_fn whose
+;; segments may be RAY_SEL_NONE for far-out rows; the selection-aware
+;; loop skips them.  Verify the projection result equals the manual
+;; computation:
+;;   (- a 5) on the 999 rows where a in (1001..1999) → sum = 1499500 - 999*5 = 1494505.
+;; sum((1001..1999) - 5) = sum(1001..1999) - 5*999 = 1498500 - 4995 = 1493505.
+(sum (at (select {x: (- a 5) from: TBig where: (and (> a 1000) (< a 2000))}) 'x)) -- 1493505
+
+;; ════════════════════════════════════════════════════════════════════
+;; 6. DIV / IDIV / MOD on I64-vec × I64-scalar.
+;;    These ops don't take the BR_AR_FAST path (it only handles
+;;    ADD/SUB/MUL/MIN2/MAX2); they fall through to the generic
+;;    I64-arm switch at expr.c:1707-1709 — which is part of the same
+;;    par_binary_fn region we're growing coverage on.
+;; ════════════════════════════════════════════════════════════════════
+
+(at (% VI64B 7)  0)   -- 0
+(at (% VI64B 7)  10)  -- 3
+;; `/` is float division → F64 result; element 10 = 10/2 = 5.0.
+(at (/ VI64B 2)  10)  -- 5.0
+(at (/ VI64B 2)  11)  -- 5.5
+;; `div` is integer floor-division (OP_IDIV) — non-negative input = truncation.
+(at (div VI64B 3) 7)  -- 2
+(at (div VI64B 3) 8)  -- 2
+(at (div VI64B 3) 9)  -- 3
+
+;; Sequential mirror.
+(at (% VI64S 5)  0)  -- 0
+(at (% VI64S 5)  4)  -- 4
+(at (/ VI64S 4)  16) -- 4.0
+
+;; ════════════════════════════════════════════════════════════════════
+;; 7. CHAR / U8 narrow path coverage.
+;;    BR_AR_FAST doesn't cover l_esz==1 (only 8/4/2), so U8 arith is
+;;    NOT in the fast path.  We still drive it through the generic
+;;    U8 arm at expr.c:1740-1751 for completeness on the parallel
+;;    boundary — output type RAY_U8 with U8 vec input.
+;;
+;; Note: building a U8 column ≥70000 is straightforward via `as 'U8`.
+;; Arithmetic on it stays U8 when scalar is small enough not to wrap.
+;; ════════════════════════════════════════════════════════════════════
+
+(set VU8S (as 'U8 (% (til NS) 64)))
+;; Sum of (til NS) % 64 over 2048 rows = 32*64*63/2 = 32*2016 = 64512.
+;; Check sum after `(+ col 0x00)` matches (0x00 is a U8 atom literal).
+(sum (as 'I64 (+ VU8S 0x00))) -- 64512
+
+;; ────────────────────────────────────────────────────────────────────
+;; Reachability notes (intentionally NOT exercised):
+;;   - SYM W64 storage: only produced when interned sym ID count exceeds
+;;     ~4 billion. Not RFL-reachable.
+;;   - F64 BOOL fast path: BOOL comparison fast path at 1515 gates on
+;;     integer-family LHS only; F64 cmp goes through the generic float
+;;     BOOL arm at 1768-1781, already covered above via (cmp F64-vec
+;;     F64-scalar) chains in arith/cmp tests.
+;;   - I32-vec × I64-scalar arith with auto-promotion to I64: when the
+;;     scalar literal forces out_type=I64 the lhs->type != out_type
+;;     guard fails, so BR_AR_FAST is skipped. The fast path requires
+;;     same-type input/output (the by-design narrow case for autovec).
+;;   - lhs is a vector but len==1: l_scalar=true branch — same kernel,
+;;     redundant.
+;;   - Null inputs / wrong types / div-by-zero ERR branches: per spec,
+;;     happy path only.

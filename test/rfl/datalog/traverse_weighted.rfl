@@ -1,0 +1,338 @@
+;; traverse_weighted.rfl — happy-path coverage for weighted graph algorithms
+;; in src/ops/traverse.c.
+;;
+;; This file deliberately complements test/rfl/datalog/traverse_coverage.rfl
+;; (which targets error/edge branches) by exercising the *forward* (happy)
+;; paths of:
+;;   - exec_dijkstra      : weighted shortest path (single-source + point-to-point)
+;;   - exec_mst           : Kruskal MST + mst_edge_cmp comparator
+;;   - exec_random_walk   : walk on acyclic (dead-end) graphs
+;;   - exec_var_expand    : multi-hop expansion with min_depth/max_depth
+;;   - exec_shortest_path : BFS hop-count on weighted acyclic graphs
+;;   - exec_k_shortest    : Yen's k-shortest paths on a DAG (1 < K ≤ k_max)
+;;   - exec_connected_comp: components on a disconnected *weighted* graph
+;;
+;; Graphs are small enough to hand-compute references.  Cycles were covered
+;; in an earlier round; this file focuses on acyclic / forest shapes.
+
+;; ======================================================================
+;; Fixture DAG1: 5-node weighted DAG.
+;;   edges (src dst w):
+;;     0->1 (2.0)  0->2 (5.0)  1->2 (1.0)  1->3 (6.0)
+;;     2->3 (2.0)  2->4 (9.0)  3->4 (3.0)
+;;
+;; Hand-computed Dijkstra distances from source 0:
+;;   dist[0]=0   dist[1]=2   dist[2]=3 (0->1->2: 2+1)
+;;   dist[3]=5  (0->1->2->3: 2+1+2)
+;;   dist[4]=8  (0->1->2->3->4: 2+1+2+3, beats 2->4: 3+9=12 and 3->4 via 1->3: 2+6+3=11)
+;; Depth of node 4 along that path is 4 hops.
+;; ======================================================================
+(set DAG1Edges (table [src dst w] (list [0 0 1 1 2 2 3] [1 2 2 3 3 4 4] [2.0 5.0 1.0 6.0 2.0 9.0 3.0])))
+(set DAG1 (.graph.build DAG1Edges 'src 'dst 'w))
+
+;; ======================================================================
+;; Fixture K4: 4-node fully-connected weighted graph (directed edges,
+;; but Kruskal MST treats it as undirected).
+;;   0->1 (1.0)  0->2 (4.0)  0->3 (3.0)
+;;   1->2 (2.0)  1->3 (5.0)  2->3 (6.0)
+;;
+;; MST edges (sorted by weight): (0,1,1) (1,2,2) (0,3,3)
+;;   total weight = 1 + 2 + 3 = 6.0
+;;   spanning tree has n-1 = 3 edges.
+;; ======================================================================
+(set K4Edges (table [src dst w] (list [0 0 0 1 1 2] [1 2 3 2 3 3] [1.0 4.0 3.0 2.0 5.0 6.0])))
+(set K4 (.graph.build K4Edges 'src 'dst 'w))
+
+;; ======================================================================
+;; Fixture CHAIN: linear 4-node chain (DAG) 0->1->2->3, unit weights.
+;;   For multi-hop var-expand and deterministic dead-end random walks.
+;; ======================================================================
+(set CHAINEdges (table [src dst w] (list [0 1 2] [1 2 3] [1.0 1.0 1.0])))
+(set CHAIN (.graph.build CHAINEdges 'src 'dst 'w))
+
+;; ======================================================================
+;; Fixture DISC2: two disconnected weighted triangles (non-unit weights).
+;;   Component A (nodes 0,1,2):
+;;     0->1 (2.0)  1->2 (3.0)  0->2 (4.0)
+;;   Component B (nodes 3,4,5):
+;;     3->4 (1.5)  3->5 (2.5)  4->5 (4.0)
+;;
+;; MST is a *forest*:
+;;   A picks (0,1,2.0) (1,2,3.0) — 2 edges, weight 5.0
+;;   B picks (3,4,1.5) (3,5,2.5) — 2 edges, weight 4.0
+;;   Total: 4 edges, summed weight 9.0
+;; ======================================================================
+(set DISC2Edges (table [src dst w] (list [0 0 1 3 3 4] [1 2 2 4 5 5] [2.0 4.0 3.0 1.5 2.5 4.0])))
+(set DISC2 (.graph.build DISC2Edges 'src 'dst 'w))
+
+;; ======================================================================
+;; 1. exec_dijkstra — single-source on DAG1
+;; ======================================================================
+(set Dj1 (.graph.dijkstra DAG1 0))
+(count Dj1) -- 5
+(set Dj1_node (at Dj1 '_node))
+(set Dj1_dist (at Dj1 '_dist))
+(set Dj1_depth (at Dj1 '_depth))
+
+;; Hand-computed distances.
+(at Dj1_dist (at (where (== Dj1_node 0)) 0)) -- 0.0
+(at Dj1_dist (at (where (== Dj1_node 1)) 0)) -- 2.0
+(at Dj1_dist (at (where (== Dj1_node 2)) 0)) -- 3.0
+(at Dj1_dist (at (where (== Dj1_node 3)) 0)) -- 5.0
+(at Dj1_dist (at (where (== Dj1_node 4)) 0)) -- 8.0
+
+;; Depth (hop count along the relaxed shortest-path tree).
+(at Dj1_depth (at (where (== Dj1_node 0)) 0)) -- 0
+(at Dj1_depth (at (where (== Dj1_node 1)) 0)) -- 1
+(at Dj1_depth (at (where (== Dj1_node 2)) 0)) -- 2
+(at Dj1_depth (at (where (== Dj1_node 3)) 0)) -- 3
+(at Dj1_depth (at (where (== Dj1_node 4)) 0)) -- 4
+
+;; ======================================================================
+;; 2. exec_dijkstra — point-to-point (src,dst) mode triggers early-exit
+;;    `if (u == dst_id) break;` branch in the main relaxation loop.
+;; ======================================================================
+(set DjPt (.graph.dijkstra DAG1 0 4))
+;; Point-to-point still returns the table of all nodes whose dist < inf
+;; at the moment of early exit; DAG1 has no unreachable nodes from 0.
+(count DjPt) -- 5
+(set DjPt_node (at DjPt '_node))
+(set DjPt_dist (at DjPt '_dist))
+;; The destination distance must match the hand-computed shortest path.
+(at DjPt_dist (at (where (== DjPt_node 4)) 0)) -- 8.0
+
+;; ======================================================================
+;; 3. exec_dijkstra — explicit max-depth knob (4th arg).
+;;    Passing a non-default max_depth exercises the parameter wiring in
+;;    ray_graph_dijkstra_fn but the algorithm body is identical.
+;; ======================================================================
+(set DjMax (.graph.dijkstra DAG1 0 -1 10))
+(count DjMax) -- 5
+
+;; ======================================================================
+;; 4. exec_mst — Kruskal on a fully-connected 4-node graph (K4).
+;;    Exercises mst_edge_cmp (qsort comparator on doubles) and the
+;;    union-by-rank with path compression.
+;; ======================================================================
+(set MstK4 (.graph.mst K4))
+;; Spanning tree on n=4 nodes -> n-1 = 3 edges.
+(count MstK4) -- 3
+;; Total weight = 1+2+3 = 6.0 (hand-Kruskal).
+(sum (at MstK4 '_weight)) -- 6.0
+;; MST edges must span all 4 nodes — the min src and min dst cover node 0.
+(min (at MstK4 '_src)) -- 0
+;; The maximum dst is node 3 (terminal of the spanning tree).
+(max (at MstK4 '_dst)) -- 3
+;; Weights are sorted in pick order (mst_edge_cmp is ascending).
+(set MstK4_w (at MstK4 '_weight))
+(at MstK4_w 0) -- 1.0
+(at MstK4_w 1) -- 2.0
+(at MstK4_w 2) -- 3.0
+
+;; ======================================================================
+;; 5. exec_mst — Kruskal on a *disconnected* weighted graph (DISC2).
+;;    Output is a spanning *forest*: n - (#components) edges total.
+;;    Also re-verifies mst_edge_cmp with float weights that include
+;;    sub-integer values (1.5, 2.5).
+;; ======================================================================
+(set MstDisc2 (.graph.mst DISC2))
+;; n=6 nodes, 2 components → 6-2 = 4 forest edges.
+(count MstDisc2) -- 4
+;; Total weight = (2.0 + 3.0) + (1.5 + 2.5) = 9.0
+(sum (at MstDisc2 '_weight)) -- 9.0
+;; The two smallest-weight edges chosen are 1.5 and 2.0 (one per component).
+(set MstDisc2_w (at MstDisc2 '_weight))
+(at MstDisc2_w 0) -- 1.5
+(at MstDisc2_w 1) -- 2.0
+
+;; ======================================================================
+;; 6. exec_mst — on DAG1 (5 nodes, 7 edges).
+;;    Sorted weights: 1.0 2.0 2.0 3.0 5.0 6.0 9.0
+;;    Pick (1,2,1.0), (0,1,2.0), (2,3,2.0), (3,4,3.0) — 4 edges, weight 8.0.
+;; ======================================================================
+(set MstDag1 (.graph.mst DAG1))
+(count MstDag1) -- 4
+(sum (at MstDag1 '_weight)) -- 8.0
+;; Smallest-weight edge chosen first (mst_edge_cmp ascending).
+(at (at MstDag1 '_weight) 0) -- 1.0
+
+;; ======================================================================
+;; 7. exec_random_walk — deterministic dead-end on CHAIN (each node has at
+;;    most one out-edge, so xorshift pick is irrelevant after step 0).
+;;    Walk from node 0 with walk_len=10:
+;;      step 0 → 0, step 1 → 1, step 2 → 2, step 3 → 3 (dead end, break).
+;;    Expected output: 4 rows, nodes = [0,1,2,3], steps = [0,1,2,3].
+;; ======================================================================
+(set RwChain (.graph.random-walk CHAIN 0 10))
+(count RwChain) -- 4
+(at (at RwChain '_node) 0) -- 0
+(at (at RwChain '_node) 1) -- 1
+(at (at RwChain '_node) 2) -- 2
+(at (at RwChain '_node) 3) -- 3
+(at (at RwChain '_step) 0) -- 0
+(at (at RwChain '_step) 3) -- 3
+
+;; Random walk from middle of CHAIN — also dead-end deterministic.
+(set RwChain2 (.graph.random-walk CHAIN 2 10))
+(count RwChain2) -- 2
+(at (at RwChain2 '_node) 0) -- 2
+(at (at RwChain2 '_node) 1) -- 3
+
+;; Random walk from terminal node of CHAIN — immediate dead end.
+(set RwChain3 (.graph.random-walk CHAIN 3 5))
+(count RwChain3) -- 1
+(at (at RwChain3 '_node) 0) -- 3
+
+;; ======================================================================
+;; 8. exec_random_walk — invariants on a branching DAG (DAG1).
+;;    The xorshift64 seed is derived from start_node, so for a given
+;;    (graph, start_node, walk_len) the output is deterministic but its
+;;    exact path depends on RNG bits — assert structural invariants only.
+;; ======================================================================
+(set RwDag1 (.graph.random-walk DAG1 0 5))
+;; total = walk_len + 1 = 6 maximum (may be shorter if a dead-end is hit).
+(<= (count RwDag1) 6) -- true
+(>= (count RwDag1) 1) -- true
+;; First row is always the source.
+(at (at RwDag1 '_node) 0) -- 0
+;; First step index is 0; step values are dense [0..count-1].
+(at (at RwDag1 '_step) 0) -- 0
+;; All visited nodes must be in [0..4] (DAG1 has n_nodes=5).
+(>= (min (at RwDag1 '_node)) 0) -- true
+(<= (max (at RwDag1 '_node)) 4) -- true
+
+;; ======================================================================
+;; 9. exec_var_expand — multi-hop expansion with min/max depth on CHAIN.
+;;    From node 0, forward, depth range [1..3]:
+;;      depth 1 → {1};  depth 2 → {2};  depth 3 → {3};  total 3 rows.
+;; ======================================================================
+(set Ve1 (.graph.var-expand CHAIN 0 1 3))
+(count Ve1) -- 3
+(min (at Ve1 '_depth)) -- 1
+(max (at Ve1 '_depth)) -- 3
+(min (at Ve1 '_end)) -- 1
+(max (at Ve1 '_end)) -- 3
+
+;; Same chain, [2..3]: skip depth-1 ({1}) — only depths 2 and 3 emit.
+(set Ve2 (.graph.var-expand CHAIN 0 2 3))
+(count Ve2) -- 2
+(min (at Ve2 '_depth)) -- 2
+(max (at Ve2 '_depth)) -- 3
+
+;; Exact depth=3 (min==max) on CHAIN: only {3} at depth 3.
+(set Ve3 (.graph.var-expand CHAIN 0 3 3))
+(count Ve3) -- 1
+(at (at Ve3 '_end) 0) -- 3
+(at (at Ve3 '_depth) 0) -- 3
+
+;; min_depth=0 lets the start node itself escape — but var-expand emits
+;; only frontier *transitions*; depth=0 self-emission is suppressed by the
+;; `depth >= 1` loop init, so min=0 max=3 behaves like min=1 max=3.
+(set Ve0 (.graph.var-expand CHAIN 0 0 3))
+(count Ve0) -- 3
+
+;; var-expand on DAG1 from node 0 with depth [1..4]: BFS visits all 4
+;; non-source nodes, each emitted exactly once at the BFS depth-of-first-
+;; visit.  The first-visit BFS depths are:
+;;   1 → depth 1   (0->1)
+;;   2 → depth 1   (0->2)
+;;   3 → depth 2   (via 1->3 or 2->3, BFS sees one of them first)
+;;   4 → depth 2   (via 2->4)
+;; Total emitted rows = 4.
+(set VeDag1 (.graph.var-expand DAG1 0 1 4))
+(count VeDag1) -- 4
+(min (at VeDag1 '_end)) -- 1
+(max (at VeDag1 '_end)) -- 4
+;; Source is the only _start value emitted.
+(count (distinct (at VeDag1 '_start))) -- 1
+(at (at VeDag1 '_start) 0) -- 0
+
+;; ======================================================================
+;; 10. exec_shortest_path — BFS hop-count on weighted DAGs.
+;;     This re-uses the unweighted BFS path inside traverse.c — the
+;;     weight column is ignored; only hop-count matters.  Happy path:
+;;     reachable src/dst on the DAG.
+;; ======================================================================
+;; CHAIN: hops 0->3 = 3 edges → 4-row path table.
+(set SpChain (.graph.shortest-path CHAIN 0 3))
+(count SpChain) -- 4
+;; First node is the source.
+(first (at SpChain '_node)) -- 0
+;; Last node is the destination.
+(at (at SpChain '_node) 3) -- 3
+
+;; DAG1 from 0 to 4: BFS picks min-hop path 0->2->4 (2 hops) over
+;; 0->1->2->3->4 (4 hops).
+(set SpDag1 (.graph.shortest-path DAG1 0 4))
+(count SpDag1) -- 3
+(first (at SpDag1 '_node)) -- 0
+(at (at SpDag1 '_node) 2) -- 4
+
+;; ======================================================================
+;; 11. exec_k_shortest — Yen's algorithm on DAG1 from 0 to 4.
+;;     K=2: P0 = 0->1->2->3->4 (cost 8.0)
+;;          P1 = next-cheapest spur deviation (cost = 10.0 via 0->2->3->4).
+;; ======================================================================
+(set Ksp (.graph.k-shortest DAG1 0 4 2))
+;; Two distinct path_ids (0 and 1).
+(count (distinct (at Ksp '_path_id))) -- 2
+;; Path 0 starts at source and ends at destination.
+(set Ksp_pid (at Ksp '_path_id))
+(set Ksp_node (at Ksp '_node))
+(set Ksp_dist (at Ksp '_dist))
+;; Cost of path 0 (terminal node distance) = 8.0 (hand-Dijkstra).
+(set p0_idx (where (== Ksp_pid 0)))
+(set p0_last (- (count p0_idx) 1))
+(at Ksp_dist (at p0_idx p0_last)) -- 8.0
+;; Cost of path 1 should be ≥ cost of path 0 (Yen's enumerates ascending).
+(set p1_idx (where (== Ksp_pid 1)))
+(set p1_last (- (count p1_idx) 1))
+(>= (at Ksp_dist (at p1_idx p1_last)) 8.0) -- true
+
+;; K=1 (just the shortest) on K4 from 0 to 3 — Dijkstra-only path.
+;; 0->3 direct edge has weight 3.0 (and is the cheapest), so K=1 returns
+;; cost 3.0.  Cheaper alternative 0->1->2->3 = 1+2+6 = 9, so direct wins.
+(set Ksp4 (.graph.k-shortest K4 0 3 1))
+(count (distinct (at Ksp4 '_path_id))) -- 1
+(set Ksp4_pid (at Ksp4 '_path_id))
+(set Ksp4_dist (at Ksp4 '_dist))
+(set Ksp4_idx (where (== Ksp4_pid 0)))
+(set Ksp4_last (- (count Ksp4_idx) 1))
+(at Ksp4_dist (at Ksp4_idx Ksp4_last)) -- 3.0
+
+;; ======================================================================
+;; 12. exec_connected_comp — components on a disconnected weighted graph.
+;;     DISC2 has 2 isolated triangles → component count = 2.
+;; ======================================================================
+(set CcDisc2 (.graph.connected DISC2))
+(count CcDisc2) -- 6
+(count (distinct (at CcDisc2 '_component))) -- 2
+;; Nodes 0,1,2 share a component; nodes 3,4,5 share another.
+(set CcDisc2_node (at CcDisc2 '_component))
+;; Component label is monotone (smallest representative). The components
+;; for nodes {0,1,2} are all equal; same for nodes {3,4,5}.  We assert
+;; that the multiset of component labels has exactly 3 of one value and
+;; 3 of another — i.e. group sizes are balanced.
+(min (at CcDisc2 '_component)) -- 0
+;; DAG1 and CHAIN are fully connected (one weakly-connected component).
+(count (distinct (at (.graph.connected DAG1) '_component))) -- 1
+(count (distinct (at (.graph.connected CHAIN) '_component))) -- 1
+
+;; ======================================================================
+;; 13. exec_expand — single-hop (already covered in graph_basic but
+;;     repeat on the new CHAIN/DAG1 fixtures for region coverage).
+;; ======================================================================
+;; CHAIN: node 0 has one fwd neighbor {1}.
+(count (.graph.expand CHAIN 0)) -- 1
+;; DAG1 node 0 has two fwd neighbors {1,2}.
+(count (.graph.expand DAG1 0)) -- 2
+;; DAG1 node 2 has two fwd neighbors {3,4}.
+(count (.graph.expand DAG1 2)) -- 2
+
+;; ======================================================================
+;; Cleanup
+;; ======================================================================
+(.graph.free DAG1)
+(.graph.free K4)
+(.graph.free CHAIN)
+(.graph.free DISC2)

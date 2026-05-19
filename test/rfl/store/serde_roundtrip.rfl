@@ -1,0 +1,540 @@
+;; Coverage for src/store/serde.c — happy-path roundtrip via (ser X)/(de X).
+;;
+;; Why this file exists:
+;;   serde.c sits at 87 % region / 72 % branch coverage on master.  The
+;;   under-tested branches are the type-dispatch arms in ray_serde_size,
+;;   ray_ser_raw, and ray_de_raw — each of {BOOL, U8, I16, I32, F32, F64,
+;;   I64, DATE, TIME, TIMESTAMP, GUID, SYM, STR} × {atom, vec, vec+null}
+;;   has its own case label.  The existing rfl/system/serde.rfl covers I64
+;;   + F64 + SYM + STR atoms and i64 vectors only; this file fills in the
+;;   remaining {DATE, TIME, TIMESTAMP, GUID, BOOL, U8, I16, I32} atom and
+;;   vector arms, the slice/lazy materialise paths, the LIST/DICT/TABLE
+;;   compound recursive arms, sentinel-null vectors, and the file-backed
+;;   .db.splayed.set / .db.splayed.get path that re-enters serde for
+;;   on-disk persistence.
+;;
+;; Reachability map (RFL surface vs. the C dispatch):
+;;
+;;   serde.c ser_raw / de_raw arm           how this file reaches it
+;;   ───────────────────────────────────    ─────────────────────────
+;;   atom -RAY_BOOL                         (de (ser true))
+;;   atom -RAY_U8                           (de (ser (as 'U8 200)))
+;;   atom -RAY_I16                          (de (ser 1234h))
+;;   atom -RAY_I32                          (de (ser 987654i))
+;;   atom -RAY_I64                          (de (ser 42)) (already covered)
+;;   atom -RAY_F64                          (de (ser 3.14)) (already covered)
+;;   atom -RAY_DATE                         (de (ser 2024.06.15))
+;;   atom -RAY_TIME                         (de (ser 12:30:45.000))
+;;   atom -RAY_TIMESTAMP                    (de (ser 2024.06.15D...))
+;;   atom -RAY_GUID                         (set G (first (guid 1))) ; (de (ser G))
+;;   atom -RAY_SYM                          (de (ser 'hello)) (already covered)
+;;   atom -RAY_STR                          (de (ser "world")) (already covered)
+;;   typed null atoms                       (de (ser 0Nh)) / 0Ni / etc.
+;;
+;;   vec RAY_BOOL                           (as 'BOOL [1 0 1])
+;;   vec RAY_U8                             (as 'U8 [1 2 3])
+;;   vec RAY_I16                            (as 'I16 [1 2 3])
+;;   vec RAY_I32                            (as 'I32 [1 2 3])
+;;   vec RAY_I64                            [1 2 3] (already covered)
+;;   vec RAY_F64                            [1.5 2.5] (already covered)
+;;   vec RAY_DATE                           (as 'DATE [7305 7306])
+;;   vec RAY_TIME                           (as 'TIME [3723000])
+;;   vec RAY_TIMESTAMP                      (as 'TIMESTAMP [123456789])
+;;   vec RAY_GUID                           (guid N)
+;;   vec RAY_SYM                            ['a 'b 'c]
+;;   vec RAY_STR                            ["a" "b"]
+;;   vec with HAS_NULLS                     [1 0N 3] / (as 'F64 [1.0 0N 2.0])
+;;
+;;   compound RAY_LIST                      (list ...) recursive ser/de
+;;   compound RAY_DICT                      (dict K V) — slot pair recurses
+;;   compound RAY_TABLE                     (table ...) — schema (SYM via I64)
+;;                                          + cols (RAY_LIST) recurse
+;;
+;;   lazy materialise in ray_ser            (set X (asc V)) ; (ser X)
+;;                                          (commit f1c143b0 — fix(serde):
+;;                                          materialise lazy objects before
+;;                                          persisting)
+;;
+;;   file path (ray_obj_save indirectly)    .db.splayed.set / .db.splayed.get
+;;                                          uses ray_col_save/_load which
+;;                                          bypass serde.c — note at end.
+;;
+;; Skipped (per task brief — happy path only):
+;;   - malformed wire bytes / wire version mismatch / size overflow:
+;;     covered in test/test_store.c::test_serde_wire_version_mismatch
+;;     and test_serde_de_error_paths (C-level).
+;;   - F32 atom/vec arm: ray_cast_fn has no 'F32 target (see
+;;     src/ops/builtins.c::ray_cast_fn), so an F32 vector can't be
+;;     produced from rfl source.  C-level test_serde_f32_atom_and_edge_cases
+;;     covers ser_raw F32 atom (memcpy of (float)obj->f64 narrow).
+;;
+;; Cleanup: rf_test_serde_* matches the Makefile clean rule and is removed
+;; at file end.
+
+;; ════════════════════════════════════════════════════════════════
+;; 1. Atom roundtrip — every supported atom type.
+;;
+;; Hits the atom arms in ray_serde_size (lines 127-149), ray_ser_raw
+;; (lines 257-322), and ray_de_raw (lines 491-565).  Format-compare
+;; the deserialized value against the source literal — proves the
+;; flags byte (typed-null bit) is 0 on these and the value-bytes
+;; survive bit-exact.
+;; ════════════════════════════════════════════════════════════════
+
+;; BOOL atom
+(de (ser true))  -- true
+(de (ser false)) -- false
+(type (de (ser true))) -- 'b8
+
+;; U8 atom — value preserved, type tag preserved
+(type (de (ser (as 'U8 200)))) -- 'u8
+(de (ser (as 'U8 200))) -- 0xc8
+(de (ser (as 'U8 0))) -- 0x00
+
+;; I16 atom
+(de (ser 1234h)) -- 1234h
+(de (ser -1234h)) -- -1234h
+(de (ser 0h)) -- 0h
+(type (de (ser 1234h))) -- 'i16
+
+;; I32 atom
+(de (ser 987654i)) -- 987654i
+(de (ser -987654i)) -- -987654i
+(de (ser 0i)) -- 0i
+(type (de (ser 987654i))) -- 'i32
+
+;; I64 atom — large value (sign bit set), zero, negative
+(de (ser 9223372036854775806)) -- 9223372036854775806
+(de (ser -9223372036854775807)) -- -9223372036854775807
+(de (ser 0)) -- 0
+
+;; F64 atom — negative + zero
+(de (ser -3.14)) -- -3.14
+(de (ser 0.0)) -- 0.0
+
+;; DATE atom
+(de (ser 2024.06.15)) -- 2024.06.15
+(de (ser 2000.01.01)) -- 2000.01.01
+(type (de (ser 2024.06.15))) -- 'date
+
+;; TIME atom
+(de (ser 12:30:45.000)) -- 12:30:45.000
+(de (ser 00:00:00.000)) -- 00:00:00.000
+(type (de (ser 12:30:45.000))) -- 'time
+
+;; TIMESTAMP atom
+(de (ser 2024.06.15D12:30:45.123456789)) -- 2024.06.15D12:30:45.123456789
+(de (ser 2000.01.01D00:00:00.000000000)) -- 2000.01.01D00:00:00.000000000
+(type (de (ser 2024.06.15D12:30:45.123456789))) -- 'timestamp
+
+;; GUID atom — non-deterministic byte pattern, so capture and compare
+;; format-equality.  Exercises ray_ser_raw GUID arm (line 294-300) +
+;; ray_de_raw GUID arm (line 540-542): both need an obj->obj pointer
+;; to a 16-byte buffer to round-trip the underlying bytes.
+(set G (first (guid 1))) (de (ser G)) -- G
+(type G) -- 'guid
+
+;; SYM atom — already covered in serde.rfl, add a long-ish one for the
+;; safe_strlen path in ray_de_raw line 544.
+(de (ser 'supercalifragilisticexpialidocious))   -- 'supercalifragilisticexpialidocious
+
+;; STR atom — empty + multibyte-content (covers slen=0 + slen>0 in
+;; ray_ser_raw STR arm line 312-319 and ray_de_raw line 554-561).
+(de (ser "")) -- ""
+(de (ser "hello world with spaces and punctuation!")) -- "hello world with spaces and punctuation!"
+
+;; ════════════════════════════════════════════════════════════════
+;; 2. Typed-null atoms — flags byte bit 0 carries the typed-null
+;; marker.  Regression for the v3 wire format (commit
+;; S3'.1: serde ser_null_bitmap derives bits from sentinel reads).
+;;
+;; Hits ray_typed_null branches in ray_de_raw (line 501-542).  The
+;; ser side packs nullmap[0]&1 into the flags byte (line 258); the de
+;; side reads flags, returns ray_typed_null(type) when bit 0 is set.
+;; ════════════════════════════════════════════════════════════════
+
+(de (ser 0Nh)) -- 0Nh
+(de (ser 0Ni)) -- 0Ni
+(de (ser 0Nl)) -- 0Nl
+(de (ser 0Nf)) -- 0Nf
+
+;; Type tag survives the null round-trip — proves we don't fall back
+;; to ray_i64(0) like the v2 wire format did.
+(type (de (ser 0Nh))) -- 'i16
+(type (de (ser 0Ni))) -- 'i32
+(type (de (ser 0Nl))) -- 'i64
+(type (de (ser 0Nf))) -- 'f64
+
+;; ════════════════════════════════════════════════════════════════
+;; 3. Vector roundtrip — every supported element-type arm.
+;;
+;; Hits the vector switch in ray_serde_size (line 160-220), ray_ser_raw
+;; (line 331-410), and ray_de_raw (line 571-663).
+;;
+;; The wire format for fixed-width vec types is identical (just elem
+;; size differs), but each type has its own case label so we touch
+;; every region.  For each arm: type preserved, length preserved,
+;; values preserved.
+;; ════════════════════════════════════════════════════════════════
+
+;; BOOL vec (RAY_BOOL → type tag 'B8 on output)
+(type (de (ser (as 'BOOL [1 0 1 1 0])))) -- 'B8
+(count (de (ser (as 'BOOL [1 0 1 1 0])))) -- 5
+(at (de (ser (as 'BOOL [1 0 1 1 0]))) 0) -- true
+(at (de (ser (as 'BOOL [1 0 1 1 0]))) 1) -- false
+(at (de (ser (as 'BOOL [1 0 1 1 0]))) 2) -- true
+
+;; U8 vec — exercise the same 1-byte/elem branch as BOOL but distinct
+;; type tag dispatch.
+(type (de (ser (as 'U8 [1 2 3 255 0])))) -- 'U8
+(count (de (ser (as 'U8 [1 2 3 255 0])))) -- 5
+(sum (de (ser (as 'U8 [1 2 3 255 0])))) -- 261
+
+;; I16 vec — 2-byte/elem branch
+(type (de (ser (as 'I16 [1 -2 3 -4 5])))) -- 'I16
+(sum (de (ser (as 'I16 [1 -2 3 -4 5])))) -- 3
+(count (de (ser (as 'I16 [1 -2 3 -4 5])))) -- 5
+
+;; I32 vec — 4-byte/elem branch
+(type (de (ser (as 'I32 [10 20 30])))) -- 'I32
+(sum (de (ser (as 'I32 [10 20 30])))) -- 60
+
+;; I64 vec — already covered (in serde.rfl), add a wider one for the
+;; null-bit pack/unpack path (>8 elems crosses a byte boundary).
+(count (de (ser [1 2 3 4 5 6 7 8 9 10]))) -- 10
+(sum (de (ser [1 2 3 4 5 6 7 8 9 10]))) -- 55
+
+;; F64 vec — already covered (in serde.rfl), add a negative + zero
+;; mix for the float bit-pattern preservation.
+(sum (de (ser [-1.5 0.0 2.5]))) -- 1.0
+(at (de (ser [-1.5 0.0 2.5])) 0) -- -1.5
+
+;; DATE vec — 4-byte/elem branch shared with I32 + TIME + F32
+(type (de (ser (as 'DATE [7305 7306 7307])))) -- 'DATE
+(count (de (ser (as 'DATE [7305 7306 7307])))) -- 3
+;; DATE epoch is 2000.01.01 (= day 0); 7305 days ≈ 2020-01-02.  We
+;; assert via type+count above and use the round-trip equality below
+;; — proves bit-exact day index preservation.
+(at (de (ser (as 'DATE [7305 7306 7307]))) 0) -- (at (as 'DATE [7305 7306 7307]) 0)
+
+;; TIME vec
+(type (de (ser (as 'TIME [3723000 7200000])))) -- 'TIME
+(count (de (ser (as 'TIME [3723000 7200000])))) -- 2
+
+;; TIMESTAMP vec — 8-byte/elem branch shared with I64 + F64
+(type (de (ser (as 'TIMESTAMP [123456789 987654321])))) -- 'TIMESTAMP
+(count (de (ser (as 'TIMESTAMP [123456789 987654321])))) -- 2
+
+;; GUID vec — 16-byte/elem branch, unique to GUID
+;; (guid N) generates N random GUIDs; capture in a variable so the LHS
+;; deserialized form has a stable reference for comparison.
+(set Gv (guid 3))
+(type (de (ser Gv))) -- 'GUID
+(count (de (ser Gv))) -- 3
+(de (ser Gv)) -- Gv
+
+;; SYM vec — variable-length-per-elem branch (line 377-393 / 605-633).
+;; Includes a long sym to exercise safe_strlen across multiple
+;; iterations (line 620-628).
+(set Sv ['alpha 'beta 'gamma 'supercalifragilisticexpialidocious])
+(count (de (ser Sv))) -- 4
+(at (de (ser Sv)) 0) -- 'alpha
+(at (de (ser Sv)) 3) -- 'supercalifragilisticexpialidocious
+(type (de (ser Sv))) -- 'SYM
+
+;; STR vec — variable-length-per-elem branch (line 395-410 / 635-663).
+;; Mixed lengths drive the per-elem len-prefix + raw-bytes path.
+(set Stv ["x" "yy" "" "longer string here" "z"])
+(count (de (ser Stv))) -- 5
+(at (de (ser Stv)) 0) -- "x"
+(at (de (ser Stv)) 2) -- ""
+(at (de (ser Stv)) 3) -- "longer string here"
+(type (de (ser Stv))) -- 'STR
+
+;; ════════════════════════════════════════════════════════════════
+;; 4. Vectors with embedded nulls — sentinel-encoded after the recent
+;; null-bitmap-to-sentinel migration.
+;;
+;; The wire format keeps a HAS_NULLS attrs bit (line 329 / 601) but
+;; the actual null bits are derived from sentinel reads of the value
+;; payload.  Roundtripping a null-containing vec must preserve:
+;;   (a) the value bits for non-null positions
+;;   (b) the null marker (so (nil? (at v i)) reports the same result)
+;; ════════════════════════════════════════════════════════════════
+
+;; I64 nulls — uses INT64_MIN sentinel
+(count (de (ser [1 0N 3 0N 5]))) -- 5
+(sum (de (ser [1 0N 3 0N 5]))) -- 9
+(nil? (at (de (ser [1 0N 3])) 1)) -- true
+
+;; F64 nulls — uses NaN sentinel
+(count (de (ser (as 'F64 [1.0 0N 2.0 0N 3.0])))) -- 5
+(sum (de (ser (as 'F64 [1.0 0N 2.0 0N 3.0])))) -- 6.0
+(nil? (at (de (ser (as 'F64 [1.0 0N 2.0]))) 1)) -- true
+
+;; I32 nulls — uses INT32_MIN sentinel
+(count (de (ser (as 'I32 [1 0N 3])))) -- 3
+(type (de (ser (as 'I32 [1 0N 3])))) -- 'I32
+(nil? (at (de (ser (as 'I32 [1 0N 3]))) 1)) -- true
+
+;; I16 nulls — uses INT16_MIN sentinel
+(count (de (ser (as 'I16 [1 0N 3])))) -- 3
+(type (de (ser (as 'I16 [1 0N 3])))) -- 'I16
+(nil? (at (de (ser (as 'I16 [1 0N 3]))) 1)) -- true
+
+;; DATE/TIME/TIMESTAMP nulls share the I32/I64 sentinels.
+(count (de (ser (as 'DATE [7305 0N 7307])))) -- 3
+(nil? (at (de (ser (as 'DATE [7305 0N 7307]))) 1)) -- true
+(count (de (ser (as 'TIMESTAMP [123 0N 789])))) -- 3
+(nil? (at (de (ser (as 'TIMESTAMP [123 0N 789]))) 1)) -- true
+
+;; Long null-mask span: 10 elems alternating value/null forces the
+;; HAS_NULLS attrs bit to propagate across a multi-byte payload.
+(count (de (ser [1 0N 3 0N 5 0N 7 0N 9 0N]))) -- 10
+(sum (de (ser [1 0N 3 0N 5 0N 7 0N 9 0N]))) -- 25
+
+;; ════════════════════════════════════════════════════════════════
+;; 5. Slice vectors — slice of a larger backing vec.  In RAM these
+;; carry RAY_ATTR_SLICE (with an offset + len < backing->len), but the
+;; wire format never includes the slice attr (cleared at line 329 in
+;; ser_raw).  Round-tripping a slice should produce a self-owned vec
+;; with the same values.
+;; ════════════════════════════════════════════════════════════════
+
+;; take N from front
+(count (de (ser (take [1 2 3 4 5 6 7 8] 3)))) -- 3
+(sum (de (ser (take [1 2 3 4 5 6 7 8] 3)))) -- 6
+
+;; take -N from back
+(de (ser (take [10 20 30 40 50] -3))) -- [30 40 50]
+
+;; slice of a typed-narrow vec — proves the elem-size dispatch on the
+;; backing vec's type (not its parent's).
+(type (de (ser (take (as 'I16 [1 2 3 4 5 6]) 4)))) -- 'I16
+(count (de (ser (take (as 'I16 [1 2 3 4 5 6]) 4)))) -- 4
+
+;; slice of a DATE vec — exercises the 4-byte/elem arm
+(type (de (ser (take (as 'DATE [7305 7306 7307 7308]) 2)))) -- 'DATE
+
+;; slice of SYM vec (variable-length-per-elem)
+(count (de (ser (take ['a 'b 'c 'd 'e] 3)))) -- 3
+(at (de (ser (take ['a 'b 'c 'd 'e] 3))) 0) -- 'a
+
+;; ════════════════════════════════════════════════════════════════
+;; 6. Compound types — recursive serialize / deserialize.
+;;
+;; Each compound (LIST/DICT/TABLE) wraps recursive calls into
+;; ray_ser_raw / ray_de_raw for the inner objects.  Hits lines
+;; 412-470 (ser) + 665-824 (de).
+;; ════════════════════════════════════════════════════════════════
+
+;; LIST — heterogeneous, exercises element-by-element recursion
+(count (de (ser (list 1 "two" 'three 4.5)))) -- 4
+(at (de (ser (list 1 "two" 'three 4.5))) 0) -- 1
+(at (de (ser (list 1 "two" 'three 4.5))) 1) -- "two"
+(at (de (ser (list 1 "two" 'three 4.5))) 2) -- 'three
+(at (de (ser (list 1 "two" 'three 4.5))) 3) -- 4.5
+
+;; LIST of vectors — each inner vec recurses through its own arm
+(at (at (de (ser (list [1 2 3] [4 5 6]))) 0) 1) -- 2
+(at (at (de (ser (list [1 2 3] [4 5 6]))) 1) 2) -- 6
+
+;; LIST of SYM vecs (variable-length-per-elem inside variable-length-
+;; recursive)
+(at (at (de (ser (list ['a 'b] ['c 'd 'e]))) 0) 0) -- 'a
+(at (at (de (ser (list ['a 'b] ['c 'd 'e]))) 1) 2) -- 'e
+
+;; Nested LIST of LIST
+(at (at (de (ser (list (list 1 2) (list 3 4)))) 0) 1) -- 2
+(at (at (de (ser (list (list 1 2) (list 3 4)))) 1) 0) -- 3
+
+;; DICT — slot-pair recursion (keys vec + values vec).  Hits the
+;; RAY_DICT arm in serde_size (line 200-204), ser_raw (line 434-441),
+;; de_raw (line 763-792).
+(set D (dict [a b c] [10 20 30]))
+(de (ser D)) -- D
+(key (de (ser D))) -- [a b c]
+(value (de (ser D))) -- [10 20 30]
+(count (de (ser D))) -- 3
+(at (de (ser D)) 'b) -- 20
+
+;; Empty DICT — zero-length keys + values arms exercise the len=0 fast
+;; paths in vec deserialize.
+(count (de (ser (dict [] [])))) -- 0
+
+;; DICT with string values
+(set Ds (dict [k1 k2] ["v1" "v2"]))
+(at (de (ser Ds)) 'k1) -- "v1"
+(at (de (ser Ds)) 'k2) -- "v2"
+
+;; TABLE — schema (RAY_I64 of sym IDs) + columns (RAY_LIST).  Hits the
+;; RAY_TABLE arm in serde_size (line 195-199), ser_raw (line 424-432),
+;; de_raw (line 708-761) + the schema_names helpers (line 82-110, 93-110)
+;; that write/read the per-column sym names.
+(set T (table [a b c] (list [1 2 3] [4 5 6] [7 8 9])))
+(de (ser T)) -- T
+(count (de (ser T))) -- 3
+(key (de (ser T))) -- [a b c]
+(at (de (ser T)) 'a) -- [1 2 3]
+(at (de (ser T)) 'b) -- [4 5 6]
+(at (de (ser T)) 'c) -- [7 8 9]
+
+;; TABLE with mixed-type columns — each column recurses through its
+;; own type arm.
+(set Tm (table [i s f] (list [1 2 3] ["a" "b" "c"] [1.5 2.5 3.5])))
+(at (de (ser Tm)) 's) -- ["a" "b" "c"]
+(at (de (ser Tm)) 'f) -- [1.5 2.5 3.5]
+
+;; TABLE with a SYM column (narrows the schema sym IDs path further)
+(set Tsym (table [tag v] (list ['AAPL 'GOOG 'MSFT] [100 200 300])))
+(at (de (ser Tsym)) 'tag) -- ['AAPL 'GOOG 'MSFT]
+(at (de (ser Tsym)) 'v) -- [100 200 300]
+
+;; TABLE with null-containing columns — combines the HAS_NULLS attr
+;; flow with the recursive deserialize.
+(set Tn (table [a b] (list [1 0N 3] (as 'F64 [1.0 0N 3.0]))))
+(count (de (ser Tn))) -- 3
+(sum (at (de (ser Tn)) 'a)) -- 4
+(sum (at (de (ser Tn)) 'b)) -- 4.0
+
+;; ════════════════════════════════════════════════════════════════
+;; 7. Lazy materialise — ray_ser/ray_obj_save call ray_lazy_materialize
+;; before serialize (commit f1c143b0).  An (asc V) / (desc V) /
+;; (reverse V) / (distinct V) result is lazy; serializing it must
+;; materialise to a concrete vec first.
+;;
+;; Hits ray_ser line 858-864 (lazy detect + materialise) and the
+;; flushed value's normal vec arm.
+;; ════════════════════════════════════════════════════════════════
+
+;; asc — produces lazy
+(de (ser (asc [3 1 4 1 5]))) -- [1 1 3 4 5]
+
+;; bound lazy then ser
+(set La (asc [9 8 7 6 5])) (de (ser La)) -- [5 6 7 8 9]
+
+;; desc
+(de (ser (desc [1 2 3 4 5]))) -- [5 4 3 2 1]
+
+;; reverse
+(de (ser (reverse [1 2 3 4 5]))) -- [5 4 3 2 1]
+
+;; distinct
+(count (de (ser (distinct [1 1 2 2 3 3 4])))) -- 4
+
+;; Lazy scalar (sum) already covered in serde.rfl; add an avg too.
+(de (ser (avg [1 2 3 4 5]))) -- 3.0
+(de (ser (min [3 1 4 1 5 9 2 6]))) -- 1
+
+;; Nested lazy: asc inside list
+(at (de (ser (list (asc [3 1 2]) (asc [6 5 4])))) 0) -- [1 2 3]
+(at (de (ser (list (asc [3 1 2]) (asc [6 5 4])))) 1) -- [4 5 6]
+
+;; ════════════════════════════════════════════════════════════════
+;; 8. Empty + minimal — edge cases of length=0 and length=1 across
+;; the dispatch arms.  Each empty-vec hits the len==0 fast-paths in
+;; ray_ser_raw / ray_de_raw which would otherwise be skipped.
+;; ════════════════════════════════════════════════════════════════
+
+;; Empty I64 vec — note: empty [] roundtrips as 'I64 of length 0
+;; (the parser types [] as I64 by default).
+(type (de (ser []))) -- 'I64
+(count (de (ser []))) -- 0
+
+;; Empty I16 vec via cast
+(count (de (ser (as 'I16 [])))) -- 0
+(type (de (ser (as 'I16 [])))) -- 'I16
+
+;; Single-element vecs across narrow widths
+(count (de (ser [42]))) -- 1
+(at (de (ser [42])) 0) -- 42
+(count (de (ser (as 'U8 [200])))) -- 1
+(count (de (ser (as 'I16 [1234])))) -- 1
+(at (de (ser ['only])) 0) -- 'only
+
+;; ════════════════════════════════════════════════════════════════
+;; 9. Header invariants — (ser X) emits a U8 vec with the 16-byte
+;; ray_ipc_header_t prefix + payload.  Validates ray_ser packing the
+;; header (line 880-886) and ray_de validating it (line 914-925).
+;;
+;; The exact size for an atom is header (16) + 1 (type) + 1 (flags)
+;; + value-bytes; for an I64 atom that's 16+1+1+8 = 26.
+;; ════════════════════════════════════════════════════════════════
+
+(type (ser 42)) -- 'U8
+(count (ser 42)) -- 26
+(count (ser true)) -- 19
+(count (ser 1234h)) -- 20
+(count (ser 987654i)) -- 22
+;; Header must round-trip cleanly: de(ser X) = X
+(de (ser 999)) -- 999
+
+;; ════════════════════════════════════════════════════════════════
+;; 10. File-backed roundtrip via .db.splayed.set / .db.splayed.get.
+;;
+;; Note: .db.splayed.{set,get} go through src/store/splay.c + col.c,
+;; NOT through serde.c — column files use a different on-disk format
+;; per (type, attrs).  Including this path here keeps the regression
+;; safety net wide enough to catch cross-cutting changes to "save and
+;; reload my table" expectations users would attribute to serde.  The
+;; serde.c persistence call is ray_obj_save, used internally by
+;; src/store/journal.c — not exposed as a top-level rfl builtin in
+;; this tree.  See reachability notes below.
+;; ════════════════════════════════════════════════════════════════
+
+(.sys.exec "rm -rf rf_test_serde_splay") -- 0
+
+(set Tsp (table [id v s] (list [1 2 3 4 5] (as 'F64 [1.5 2.5 3.5 4.5 5.5]) ['a 'b 'c 'd 'e])))
+(.db.splayed.set "rf_test_serde_splay" Tsp) -- Tsp
+
+(set Rsp (.db.splayed.get "rf_test_serde_splay"))
+(count Rsp) -- 5
+(at Rsp 'id) -- [1 2 3 4 5]
+(at Rsp 'v) -- (as 'F64 [1.5 2.5 3.5 4.5 5.5])
+(at Rsp 's) -- ['a 'b 'c 'd 'e]
+(key Rsp) -- [id v s]
+
+(.sys.exec "rm -rf rf_test_serde_splay") -- 0
+
+;; ════════════════════════════════════════════════════════════════
+;; reachability notes
+;; ════════════════════════════════════════════════════════════════
+;;
+;; Reached above but worth calling out: the GUID atom arm
+;; (ser_raw line 294-300, de_raw line 540-542) was previously only
+;; exercised by C-level tests because (guid N) returns a *vec* — the
+;; (first ...) extraction here unwraps to a scalar that flows through
+;; the atom dispatch.
+;;
+;; NOT reached from rfl source (covered at the C level in
+;; test/test_store.c):
+;;
+;; F32 atom + F32 vec arms (ser_raw line 277-286, 351-358; de_raw
+;;   line 522-526, 571-603 for the RAY_F32 case):
+;;   ray_cast_fn (src/ops/builtins.c) has no 'F32 / 'f32 target, so
+;;   we can't construct an F32 value from the rfl surface.  Covered
+;;   by test_serde_f32_atom_and_edge_cases + test_serde_atom_types.
+;;
+;; ERROR (RAY_ERROR) arm (ser_raw line 233-238 / 463-466, de_raw line
+;;   841-846):  errors aren't first-class values in rfl source — an
+;;   error always aborts the eval before reaching (ser ...).  Covered
+;;   by test_serde_error_roundtrip in C.
+;;
+;; LAMBDA / UNARY / BINARY / VARY arms (ser_raw line 443-461, de_raw
+;;   line 794-839):  user-defined fns + builtin handles aren't
+;;   serializable directly via the (ser X)/(de X) path used here.
+;;   Covered by test_serde_function_types in C.
+;;
+;; ray_obj_save / ray_obj_load file path (line 932-1013): not exposed
+;;   as an rfl builtin in this tree; only used by the journal snapshot
+;;   code via .log.snapshot.  test_serde_obj_save_load + the
+;;   log_journal_advanced.rfl regression exercise it through the
+;;   journal surface.
+;;
+;; SERDE_NULL marker bare (when (ser obj) sees obj == NULL pointer):
+;;   the eval layer normalises null literals to RAY_NULL_OBJ before
+;;   they reach (ser ...), so the !obj branch at line 229 is only
+;;   reachable from C callers passing a raw NULL.  Covered by
+;;   test_serde_list_with_null_elem indirectly (the inline NULL
+;;   produced inside a LIST round-trips via the substitution at
+;;   line 695-696).
