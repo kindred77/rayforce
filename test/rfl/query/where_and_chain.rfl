@@ -279,12 +279,13 @@
 ;; (and X) shape returns NULL → the WHERE-not-supported "domain"
 ;; error at L4189-4195.
 ;;
-;; XFAIL: single-conjunct (and X) is rejected at compile time instead
-;; of being folded to X.  The cheap fix is to detect ray_len == 2 in
-;; the WHERE compiler and unwrap before compile_expr_dag.
+;; Bug 4 (now fixed): single-conjunct (and X) collapses to X per the
+;; monoid identity rule.  compile_expr_dag handles n==2 case explicitly
+;; (src/ops/query.c) and the eval-level ray_and_vary_fn / ray_or_vary_fn
+;; accept n==1 as identity (src/ops/cmp.c).  See and_or_identity.rfl.
 ;; ====================================================================
-(count (select {from: T0 where: (and (> v 100))})) !- domain
-(sum (at (select {from: T0 where: (and (> v 100))}) 'v)) !- domain
+(count (select {from: T0 where: (and (> v 100))}))       -- 49899
+(sum (at (select {from: T0 where: (and (> v 100))}) 'v)) -- 1249969950
 ;; Sanity: the un-wrapped form works as expected.  Rows {101..49999},
 ;; n=49899, sum = (101+49999)*49899/2 = 50100*49899/2 = 1,249,969,950.
 (count (select {from: T0 where: (> v 100)})) -- 49899

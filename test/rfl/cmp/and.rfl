@@ -33,8 +33,14 @@
 (and true true true true false) -- false
 
 ;; ── arity boundaries ──
+;; 0 args still rejected (no vacuous-truth element exposed); 1 arg is
+;; identity per monoid rule (Scheme/Haskell): (and X) == X.  Enables
+;; programmatic AST construction like `(cons 'and preds)` where preds
+;; may have length 1.  See test/rfl/cmp/and_or_identity.rfl for the
+;; happy-path identity matrix.
 (and)        !- arity
-(and true)   !- arity
+(and true)   -- true
+(and false)  -- false
 
 ;; ── short-circuit semantics (matches v1 FN_SPECIAL_FORM) ──
 ;; PR #8 dropped FN_SPECIAL_FORM, breaking v1's contract.  Restored:

@@ -1,0 +1,37 @@
+;; Bug 4 (Option C): single-arg `and`/`or` is identity — `(and X) == X`,
+;; `(or X) == X`.  Mirrors monoid identity from Scheme/Haskell.
+;;
+;; Before fix: `(and X)` and `(or X)` returned `error: arity`. The
+;; companion `and.rfl` / `or.rfl` tests pinning that behavior were
+;; the contract.  Now relaxed: 0 args still arity-rejected, 1 arg
+;; flows through as the value itself.
+;;
+;; Why we changed it: WHERE clauses built programmatically via
+;;   (set query (cons 'and preds))
+;; previously broke when `preds` happened to have length 1 — the
+;; planner returned `error: domain` for `where: (and (> v 100))`.
+
+;; ─── Atom bool ───────────────────────────────────────────────────
+(and true)  -- true
+(and false) -- false
+(or  true)  -- true
+(or  false) -- false
+
+;; ─── Vector bool — identity, no broadcast change ────────────────
+(and [true false true])  -- [true false true]
+(or  [true false true])  -- [true false true]
+
+;; ─── Truthy non-bool atom — identity passes the value through ───
+(and 42)   -- 42
+(and 'x)   -- 'x
+(or  42)   -- 42
+(or  'x)   -- 'x
+
+;; ─── WHERE-clause programmatic use (was Bug 4) ──────────────────
+(set T (table [v] (list [50 150 200])))
+(count (select {from: T where: (and (> v 100))})) -- 2
+(count (select {from: T where: (or  (> v 100))})) -- 2
+
+;; ─── Nested: (and (and X)) flattens to X ────────────────────────
+(and (and 42))     -- 42
+(and (or  'sym))   -- 'sym
