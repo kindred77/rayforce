@@ -253,12 +253,33 @@ static test_result_t test_public_vec_get_i64_bool(void) {
     PASS();
 }
 
-/* NOTE: RAY_DATE / RAY_TIME branches of ray_vec_get_i64 are intentionally
- * NOT covered here.  Their on-disk element width is 4 bytes (see
- * ray_type_sizes in src/core/types.c), but ray_vec_get_i64 dispatches
- * them through the same 8-byte cast as RAY_I64 / RAY_TIMESTAMP — reading
- * past the row boundary.  Reported separately; do not write a "happy
- * path" test that locks in the broken behaviour. */
+/* RAY_DATE / RAY_TIME branches — element width is 4 bytes (int32) per
+ * ray_type_sizes in src/core/types.c.  ray_vec_get_i64 must read them as
+ * int32, not int64. */
+
+static test_result_t test_public_vec_get_i64_date(void) {
+    ray_t* v = ray_vec_new(RAY_DATE, 3);
+    /* Pick three distinct int32 day values that differ in both halves so
+     * a wrong-width read would catch obviously-wrong adjacent bytes. */
+    int32_t xs[] = { 0, 8766, 19724 };  /* 1970.01.01, 1994.01.01, 2024.01.01 */
+    for (int i = 0; i < 3; i++) v = ray_vec_append(v, &xs[i]);
+    TEST_ASSERT_EQ_I(ray_vec_get_i64(v, 0), xs[0]);
+    TEST_ASSERT_EQ_I(ray_vec_get_i64(v, 1), xs[1]);
+    TEST_ASSERT_EQ_I(ray_vec_get_i64(v, 2), xs[2]);
+    ray_release(v);
+    PASS();
+}
+
+static test_result_t test_public_vec_get_i64_time(void) {
+    ray_t* v = ray_vec_new(RAY_TIME, 3);
+    int32_t xs[] = { 0, 43200000, 86399000 };  /* 00:00:00.000, 12:00:00.000, 23:59:59.000 */
+    for (int i = 0; i < 3; i++) v = ray_vec_append(v, &xs[i]);
+    TEST_ASSERT_EQ_I(ray_vec_get_i64(v, 0), xs[0]);
+    TEST_ASSERT_EQ_I(ray_vec_get_i64(v, 1), xs[1]);
+    TEST_ASSERT_EQ_I(ray_vec_get_i64(v, 2), xs[2]);
+    ray_release(v);
+    PASS();
+}
 
 static test_result_t test_public_vec_get_i64_timestamp(void) {
     ray_t* v = ray_vec_new(RAY_TIMESTAMP, 3);
@@ -611,6 +632,8 @@ const test_entry_t public_api_entries[] = {
     { "public/vec_get_i64_i16",        test_public_vec_get_i64_i16,        public_api_setup, public_api_teardown },
     { "public/vec_get_i64_u8",         test_public_vec_get_i64_u8,         public_api_setup, public_api_teardown },
     { "public/vec_get_i64_bool",       test_public_vec_get_i64_bool,       public_api_setup, public_api_teardown },
+    { "public/vec_get_i64_date",       test_public_vec_get_i64_date,       public_api_setup, public_api_teardown },
+    { "public/vec_get_i64_time",       test_public_vec_get_i64_time,       public_api_setup, public_api_teardown },
     { "public/vec_get_i64_timestamp",  test_public_vec_get_i64_timestamp,  public_api_setup, public_api_teardown },
 
     { "public/vec_get_f64_f64",   test_public_vec_get_f64_f64,   public_api_setup, public_api_teardown },
