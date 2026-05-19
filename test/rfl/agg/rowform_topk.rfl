@@ -1,0 +1,125 @@
+;; ════════════════════════════════════════════════════════════════════
+;; ROWFORM per-group top-K / bot-K (src/ops/group.c: exec_group_topk_rowform)
+;;
+;; Planner gate (src/ops/query.c:5885) routes
+;;   (select {alias: (top|bot col K) by: <single key col> from: T})
+;; to OP_GROUP_TOPK_ROWFORM / OP_GROUP_BOTK_ROWFORM when:
+;;   - single key, single agg, no where, no non-agg
+;;   - K in [1, 255]
+;;   - key & val columns are simple OP_SCAN, types in
+;;     {I64, I32, I16, U8, BOOL, DATE, TIME, TIMESTAMP, F64}
+;;     (SYM keys fall through to the LIST-cell OP_TOP_N path)
+;;
+;; ROWFORM emits one row per kept value: result has columns
+;; [key_col, val_col] with K * n_groups rows (or fewer if a group has
+;; < K elements).  Within each group, top-K is descending; bot-K is
+;; ascending.  Order across groups is partition-induced (8-bit radix)
+;; so tests use sum / membership rather than positional assertions.
+;;
+;; Parallel threshold: nrows >= 16384 (src/ops/group.c:9436).
+;; ════════════════════════════════════════════════════════════════════
+
+;; ─── basic shape: I64 key, I64 val, K=2, 2 groups ───────────────────
+(set T (table [k v] (list (as 'I64 [0 0 0 1 1 1]) (as 'I64 [10 20 30 40 50 60]))))
+;; Top-2 per group: g=0 -> {30,20}, g=1 -> {60,50}; total 4 rows.
+(count (select {t: (top v 2) by: k from: T})) -- 4
+;; Sum of top-2 values: 30+20+60+50 = 160.
+(sum (at (select {t: (top v 2) by: k from: T}) 't)) -- 160
+;; ROWFORM keeps the source vector type (not LIST).
+(type (at (select {t: (top v 2) by: k from: T}) 't)) -- 'I64
+;; Bot-2 per group: g=0 -> {10,20}, g=1 -> {40,50}; total 4 rows, sum 120.
+(count (select {b: (bot v 2) by: k from: T})) -- 4
+(sum (at (select {b: (bot v 2) by: k from: T}) 'b)) -- 120
+
+;; ─── K=1: degenerate to per-group max / min ─────────────────────────
+;; K=1 top = max per group; total rows = n_groups.
+(count (select {t: (top v 1) by: k from: T})) -- 2
+(sum (at (select {t: (top v 1) by: k from: T}) 't)) -- 90
+(sum (at (select {b: (bot v 1) by: k from: T}) 'b)) -- 50
+
+;; ─── K equals group size: full group emitted ────────────────────────
+(count (select {t: (top v 3) by: k from: T})) -- 6
+;; Sum equals total of all source v's (10..60) = 210.
+(sum (at (select {t: (top v 3) by: k from: T}) 't)) -- 210
+
+;; ─── K > group size: capped at group size (no padding) ──────────────
+(count (select {t: (top v 5) by: k from: T})) -- 6
+(sum (at (select {t: (top v 5) by: k from: T}) 't)) -- 210
+
+;; ─── narrow integer key types (I32 / I16 / U8 / BOOL) ──────────────
+(set Ti32 (table [k v] (list (as 'I32 [0 0 1 1]) (as 'I64 [5 7 11 13]))))
+(sum (at (select {t: (top v 1) by: k from: Ti32}) 't)) -- 20
+(type (at (select {t: (top v 1) by: k from: Ti32}) 'k)) -- 'I32
+(set Ti16 (table [k v] (list (as 'I16 [0 0 1 1]) (as 'I64 [100 200 300 400]))))
+(sum (at (select {t: (top v 1) by: k from: Ti16}) 't)) -- 600
+(set Tu8 (table [k v] (list (as 'U8 [0 0 1 1]) (as 'I64 [1 2 3 4]))))
+(sum (at (select {b: (bot v 1) by: k from: Tu8}) 'b)) -- 4
+(set Tbool (table [k v] (list [false false true true] (as 'I64 [9 8 7 6]))))
+(sum (at (select {t: (top v 1) by: k from: Tbool}) 't)) -- 16
+
+;; ─── F64 key and F64 value ──────────────────────────────────────────
+(set Tf (table [k v] (list (as 'F64 [0.0 0.0 0.0 1.0 1.0 1.0]) (as 'F64 [1.5 2.5 0.5 4.5 3.5 5.5]))))
+(count (select {t: (top v 2) by: k from: Tf})) -- 4
+;; Top-2 per group: g=0 -> {2.5,1.5}=4.0; g=1 -> {5.5,4.5}=10.0; sum 14.0.
+(sum (at (select {t: (top v 2) by: k from: Tf}) 't)) -- 14.0
+(type (at (select {t: (top v 2) by: k from: Tf}) 't)) -- 'F64
+;; Bot-1 per group: g=0 -> 0.5; g=1 -> 3.5; sum 4.0.
+(sum (at (select {b: (bot v 1) by: k from: Tf}) 'b)) -- 4.0
+
+;; ─── F64 key with I64 value (mixed) ─────────────────────────────────
+(set Tfi (table [k v] (list (as 'F64 [0.0 0.0 1.0 1.0]) (as 'I64 [10 20 30 40]))))
+(sum (at (select {t: (top v 1) by: k from: Tfi}) 't)) -- 60
+(type (at (select {t: (top v 1) by: k from: Tfi}) 'k)) -- 'F64
+(type (at (select {t: (top v 1) by: k from: Tfi}) 't)) -- 'I64
+
+;; ─── single group: all rows share one key ───────────────────────────
+(set T1 (table [k v] (list (as 'I64 [0 0 0 0 0 0]) (as 'I64 [3 1 5 2 7 4]))))
+(count (select {t: (top v 3) by: k from: T1})) -- 3
+;; Top-3 of {3,1,5,2,7,4} = {7,5,4}; sum 16.
+(sum (at (select {t: (top v 3) by: k from: T1}) 't)) -- 16
+(sum (at (select {b: (bot v 3) by: k from: T1}) 'b)) -- 6
+
+;; ─── ties: top-3 of [5 5 5 1] = [5 5 5] regardless of which 5 wins ──
+(set Tt (table [k v] (list (as 'I64 [0 0 0 0]) (as 'I64 [5 5 5 1]))))
+(sum (at (select {t: (top v 3) by: k from: Tt}) 't)) -- 15
+
+;; ─── many groups, small per group; total kept = K * n_groups ────────
+(set Tm (table [k v] (list (as 'I64 [0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9]) (as 'I64 [10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29]))))
+;; 10 groups × K=1 = 10 rows; max per group is (k+20).
+(count (select {t: (top v 1) by: k from: Tm})) -- 10
+;; Sum of maxes: 20+21+...+29 = 245.
+(sum (at (select {t: (top v 1) by: k from: Tm}) 't)) -- 245
+;; Bot per group: k+10; sum 10+11+...+19 = 145.
+(sum (at (select {b: (bot v 1) by: k from: Tm}) 'b)) -- 145
+;; K=2 -> 20 rows; each group keeps {k+10, k+20}; total sum = 245+145 = 390.
+(count (select {t: (top v 2) by: k from: Tm})) -- 20
+(sum (at (select {t: (top v 2) by: k from: Tm}) 't)) -- 390
+
+;; ─── parallel path: nrows >= 16384 (radix dispatch) ─────────────────
+;; 20000 rows, 10 groups (mod 10). Each group has 2000 elements equal
+;; to {j, j+10, j+20, ..., j+19990}. Top-1 = j+19990 -> sum 10*19990+45.
+(set N 20000)
+(set Tbig (table [k v] (list (% (til N) 10) (til N))))
+(count (select {t: (top v 1) by: k from: Tbig})) -- 10
+(sum (at (select {t: (top v 1) by: k from: Tbig}) 't)) -- 199945
+;; Bot-1 sum = sum of j over j=0..9 = 45.
+(sum (at (select {b: (bot v 1) by: k from: Tbig}) 'b)) -- 45
+;; Top-2: each group keeps {j+19990, j+19980}; sum = 10*(19990+19980) + 2*45 = 399790.
+(count (select {t: (top v 2) by: k from: Tbig})) -- 20
+(sum (at (select {t: (top v 2) by: k from: Tbig}) 't)) -- 399790
+;; Bot-2: {j, j+10}; sum = 10*10 + 2*45 = 190.
+(sum (at (select {b: (bot v 2) by: k from: Tbig}) 'b)) -- 190
+
+;; Parallel path, 1000 distinct keys (high cardinality stress).
+(set Mbig (table [k v] (list (% (til N) 1000) (til N))))
+;; 1000 groups × K=1 = 1000 rows.
+(count (select {t: (top v 1) by: k from: Mbig})) -- 1000
+;; Each group j has 20 values: j, j+1000, ..., j+19000. Top-1 = j+19000.
+;; Sum = 1000*19000 + (0+1+..+999) = 19000000 + 499500 = 19499500.
+(sum (at (select {t: (top v 1) by: k from: Mbig}) 't)) -- 19499500
+(sum (at (select {b: (bot v 1) by: k from: Mbig}) 'b)) -- 499500
+
+;; ─── F64 value parallel ─────────────────────────────────────────────
+(set Mf (table [k v] (list (% (til N) 10) (as 'F64 (til N)))))
+(sum (at (select {t: (top v 1) by: k from: Mf}) 't)) -- 199945.0
+(sum (at (select {b: (bot v 1) by: k from: Mf}) 'b)) -- 45.0

@@ -1,0 +1,103 @@
+;; ════════════════════════════════════════════════════════════════════
+;; ROWFORM per-group max(x) + min(y) (src/ops/group.c: exec_group_maxmin_rowform)
+;;
+;; Planner gate (src/ops/query.c:5985) routes
+;;   (select {a: (max x) b: (min y) by: <single key col> from: T})
+;; to OP_GROUP_MAXMIN_ROWFORM when:
+;;   - exactly 2 aggs, the first OP_MAX and second OP_MIN
+;;   - 1 key, no where, no non-agg
+;;   - key, x, y all simple OP_SCAN
+;;   - key type in {I64,I32,I16,U8,BOOL,DATE,TIME,TIMESTAMP,SYM}
+;;   - x, y types in {I64,I32,I16,U8,BOOL}  (integer only — F64 falls back)
+;;
+;; ROWFORM emits one row per group with columns [key, x, y] where x
+;; holds per-group max and y per-group min.  Group order is partition-
+;; induced, so tests use sum / membership rather than positional checks.
+;;
+;; Parallel threshold: nrows >= 16384 (src/ops/group.c:10482).
+;; ════════════════════════════════════════════════════════════════════
+
+;; ─── basic shape: I64 key, I64 x, I64 y ─────────────────────────────
+(set T (table [k x y] (list (as 'I64 [0 0 0 1 1 1]) (as 'I64 [3 1 5 2 7 4]) (as 'I64 [50 30 70 20 60 10]))))
+;; g=0: x={3,1,5} max=5; y={50,30,70} min=30
+;; g=1: x={2,7,4} max=7; y={20,60,10} min=10
+(count (select {mx: (max x) mn: (min y) by: k from: T})) -- 2
+(sum (at (select {mx: (max x) mn: (min y) by: k from: T}) 'mx)) -- 12
+(sum (at (select {mx: (max x) mn: (min y) by: k from: T}) 'mn)) -- 40
+;; Output column types match source: I64 throughout.
+(type (at (select {mx: (max x) mn: (min y) by: k from: T}) 'mx)) -- 'I64
+(type (at (select {mx: (max x) mn: (min y) by: k from: T}) 'mn)) -- 'I64
+(type (at (select {mx: (max x) mn: (min y) by: k from: T}) 'k)) -- 'I64
+
+;; ─── SYM key (gate allows it) ───────────────────────────────────────
+(set Ts (table [k x y] (list [A A A B B] (as 'I64 [1 5 3 2 4]) (as 'I64 [9 2 8 7 6]))))
+;; g=A: max x=5, min y=2; g=B: max x=4, min y=6
+(count (select {mx: (max x) mn: (min y) by: k from: Ts})) -- 2
+(sum (at (select {mx: (max x) mn: (min y) by: k from: Ts}) 'mx)) -- 9
+(sum (at (select {mx: (max x) mn: (min y) by: k from: Ts}) 'mn)) -- 8
+(type (at (select {mx: (max x) mn: (min y) by: k from: Ts}) 'k)) -- 'SYM
+
+;; ─── narrow integer key + narrow integer values ─────────────────────
+(set Ti32 (table [k x y] (list (as 'I32 [0 0 1 1]) (as 'I32 [5 7 11 13]) (as 'I32 [20 10 50 40]))))
+;; g=0: max=7, min=10; g=1: max=13, min=40
+(sum (at (select {mx: (max x) mn: (min y) by: k from: Ti32}) 'mx)) -- 20
+(sum (at (select {mx: (max x) mn: (min y) by: k from: Ti32}) 'mn)) -- 50
+(type (at (select {mx: (max x) mn: (min y) by: k from: Ti32}) 'mx)) -- 'I32
+(type (at (select {mx: (max x) mn: (min y) by: k from: Ti32}) 'mn)) -- 'I32
+
+(set Ti16 (table [k x y] (list (as 'I16 [0 0 1 1]) (as 'I16 [10 20 30 40]) (as 'I16 [-1 -2 3 -4]))))
+;; g=0: max=20, min=-2; g=1: max=40, min=-4. Sums: 60, -6.
+(sum (at (select {mx: (max x) mn: (min y) by: k from: Ti16}) 'mx)) -- 60
+(sum (at (select {mx: (max x) mn: (min y) by: k from: Ti16}) 'mn)) -- -6
+
+(set Tu8 (table [k x y] (list (as 'U8 [0 0 1 1]) (as 'U8 [10 30 5 7]) (as 'U8 [40 60 20 80]))))
+;; g=0: max=30, min=40; g=1: max=7, min=20. Sums: 37, 60.
+(sum (at (select {mx: (max x) mn: (min y) by: k from: Tu8}) 'mx)) -- 37
+(sum (at (select {mx: (max x) mn: (min y) by: k from: Tu8}) 'mn)) -- 60
+
+;; ─── BOOL x, BOOL y (degenerate but supported) ──────────────────────
+(set Tb (table [k x y] (list [A A B B] [false true true false] [true false true true])))
+;; g=A: max x = true; min y = false.  g=B: max x = true; min y = true.
+(count (select {mx: (max x) mn: (min y) by: k from: Tb})) -- 2
+;; sum of BOOL coerces to I64: true=1, false=0. mx: 1+1=2, mn: 0+1=1.
+(sum (as 'I64 (at (select {mx: (max x) mn: (min y) by: k from: Tb}) 'mx))) -- 2
+(sum (as 'I64 (at (select {mx: (max x) mn: (min y) by: k from: Tb}) 'mn))) -- 1
+
+;; ─── single group ───────────────────────────────────────────────────
+(set T1 (table [k x y] (list (as 'I64 [0 0 0 0 0]) (as 'I64 [3 1 5 2 7]) (as 'I64 [50 30 70 20 60]))))
+(count (select {mx: (max x) mn: (min y) by: k from: T1})) -- 1
+;; max x = 7, min y = 20
+(at (at (select {mx: (max x) mn: (min y) by: k from: T1}) 'mx) 0) -- 7
+(at (at (select {mx: (max x) mn: (min y) by: k from: T1}) 'mn) 0) -- 20
+
+;; ─── many small groups ──────────────────────────────────────────────
+(set Tm (table [k x y] (list (as 'I64 [0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9]) (as 'I64 [10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29]) (as 'I64 [50 51 52 53 54 55 56 57 58 59 40 41 42 43 44 45 46 47 48 49]))))
+;; group j has x={j+10, j+20} -> max = j+20; y={j+50, j+40} -> min = j+40.
+;; sum of maxes: (0+20)+(1+20)+...+(9+20) = 45+200 = 245.
+;; sum of mins:  (0+40)+(1+40)+...+(9+40) = 45+400 = 445.
+(count (select {mx: (max x) mn: (min y) by: k from: Tm})) -- 10
+(sum (at (select {mx: (max x) mn: (min y) by: k from: Tm}) 'mx)) -- 245
+(sum (at (select {mx: (max x) mn: (min y) by: k from: Tm}) 'mn)) -- 445
+
+;; ─── parallel path: nrows >= 16384 ──────────────────────────────────
+;; 20000 rows. x = i, y = 2N-i.  10 groups (mod 10).
+(set N 20000)
+(set Tbig (table [k x y] (list (% (til N) 10) (til N) (- (* 2 N) (til N)))))
+;; Group j: x = {j, j+10, ..., j+19990}; max x = j+19990.
+;;         y = {2N-j, 2N-j-10, ..., 2N-j-19990}; min y = 2N-j-19990 = 20010-j.
+;; sum of max x: 10*19990 + 45 = 199945
+;; sum of min y: 10*20010 - 45 = 200055
+(count (select {mx: (max x) mn: (min y) by: k from: Tbig})) -- 10
+(sum (at (select {mx: (max x) mn: (min y) by: k from: Tbig}) 'mx)) -- 199945
+(sum (at (select {mx: (max x) mn: (min y) by: k from: Tbig}) 'mn)) -- 200055
+
+;; ─── parallel with SYM key (high-cardinality H2O id3 shape) ─────────
+(set Tsbig (table [k x y] (list (as 'SYMBOL (% (til N) 100)) (til N) (- (* 2 N) (til N)))))
+;; 100 groups. Group of key idj contains rows i where i % 100 = j.
+;; x values: {j, j+100, ..., j+19900}; max x = j+19900.
+;; y = 2N - i where N=20000: y values: {40000-j, ..., 40000-j-19900}; min y = 20100-j.
+;; sum of max x: 100*19900 + (0+..+99) = 1990000 + 4950 = 1994950.
+;; sum of min y: 100*20100 - (0+..+99) = 2010000 - 4950 = 2005050.
+(count (select {mx: (max x) mn: (min y) by: k from: Tsbig})) -- 100
+(sum (at (select {mx: (max x) mn: (min y) by: k from: Tsbig}) 'mx)) -- 1994950
+(sum (at (select {mx: (max x) mn: (min y) by: k from: Tsbig}) 'mn)) -- 2005050

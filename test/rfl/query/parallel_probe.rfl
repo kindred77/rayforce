@@ -1,0 +1,107 @@
+;; Coverage for the parallel row→gid probe path in `src/ops/query.c`:
+;; `idxbuf_hist_fn` + `idxbuf_scat_fn`.  Activated by the post-DAG
+;; non-agg scatter when:
+;;   - `select` has a non-agg projection (a column ref, not a
+;;     reduction), so n_nonaggs > 0;
+;;   - the by-clause is a single scalar key (single-key scatter path);
+;;   - nrows >= 200_000  (the dispatch-overhead amortisation gate);
+;;   - 0 < n_groups <= 65_536  (per-task histogram sizing).
+;;
+;; The path also requires >= 2 worker threads.  Single-worker dev
+;; boxes fall through to the serial histogram below; the asserts here
+;; are correctness-only (totals, per-group sizes), so both branches
+;; return the same results.
+;;
+;; Shape:
+;;   `(select {v: v by: k from: T})`
+;; produces a keyed table with one LIST-column row per group, each cell
+;; holding the per-group slice of `v`.  Compare to a reference computed
+;; via `(group k)` + per-group sum / count.
+;;
+;; History: commit 774ce68f "perf(query): parallel row→gid probe for
+;; non-agg scatter".
+
+;; ─── Fixture 1: 200_000 rows, 100 groups (well under the 65_536 cap)
+(set Nbig 200000)
+(set Ngrp 100)
+(set Tbig (table [k v] (list (% (til Nbig) Ngrp) (til Nbig))))
+
+;; Result shape: keyed table with `k` key column + `v` LIST column.
+(set Rbig (select {v: v by: k from: Tbig}))
+(count Rbig) -- 100
+
+;; Per-group count = Nbig / Ngrp = 2000 for every group.
+(count (at Rbig 'v)) -- 100
+(count (at (at Rbig 'v) 0))  -- 2000
+(count (at (at Rbig 'v) 50)) -- 2000
+(count (at (at Rbig 'v) 99)) -- 2000
+
+;; Sum of per-group counts equals total row count.
+(fold + 0 (map count (at Rbig 'v))) -- 200000
+
+;; Total of all values across groups equals sum(til Nbig)
+;; = 200000 * 199999 / 2 = 19_999_900_000.
+(fold + 0 (map sum (at Rbig 'v))) -- 19999900000
+
+;; Group 0 holds rows {0, 100, 200, ..., 199900}.
+;; AP sum: 2000 * (0 + 199900) / 2 = 199_900_000.
+(sum (at (at Rbig 'v) 0)) -- 199900000
+
+;; Group 99 holds rows {99, 199, 299, ..., 199999}.
+;; AP sum: 2000 * (99 + 199999) / 2 = 200_098_000.
+(sum (at (at Rbig 'v) 99)) -- 200098000
+
+;; First-cell value in the per-group LIST: group `g` starts at row `g`.
+(at (at (at Rbig 'v) 0)  0) -- 0
+(at (at (at Rbig 'v) 1)  0) -- 1
+(at (at (at Rbig 'v) 99) 0) -- 99
+
+;; ─── Fixture 2: SYM key, same gating
+;; SYM keys flow through KEY_READ's SYM branch and remain in the parallel
+;; scatter (key not LIST/STR/GUID, so no eval-group force-out).
+(set Nsym 200000)
+(set syms ['AAA 'BBB 'CCC 'DDD 'EEE])
+(set Tsym (table [k v] (list (take syms Nsym) (til Nsym))))
+(set Rsym (select {v: v by: k from: Tsym}))
+(count Rsym) -- 5
+;; Even partition across 5 syms in round-robin order → 40_000 per group.
+(count (at (at Rsym 'v) 0)) -- 40000
+(count (at (at Rsym 'v) 4)) -- 40000
+(fold + 0 (map count (at Rsym 'v))) -- 200000
+;; Total sum unchanged from total til.
+(fold + 0 (map sum (at Rsym 'v))) -- 19999900000
+
+;; ─── Fixture 3: with WHERE filter — the rowsel-masking applied to
+;; row_gid before scatter, so dropped rows must not appear in any
+;; per-group LIST.  Survives the parallel idx_buf scatter via the
+;; rgid_did_mask path (per-segment masking inside the probe).
+(set Twh (table [k v] (list (% (til Nbig) Ngrp) (til Nbig))))
+(set Rwh (select {v: v by: k from: Twh where: (< v 100000)}))
+(count Rwh) -- 100
+;; First half kept → per-group size = 100_000 / 100 = 1000.
+(count (at (at Rwh 'v) 0))  -- 1000
+(count (at (at Rwh 'v) 50)) -- 1000
+;; Total surviving rows = 100_000; sum = 100_000 * 99_999 / 2 = 4_999_950_000.
+(fold + 0 (map count (at Rwh 'v))) -- 100000
+(fold + 0 (map sum (at Rwh 'v))) -- 4999950000
+
+;; ─── Fixture 4: non-agg projection alongside aggs — exercises the
+;; same scatter index for the agg result AND the non-agg LIST column.
+;; The `idx_buf` is shared by both downstream consumers.
+(set Rmix (select {c: (count v) v: v by: k from: Tbig}))
+(count Rmix) -- 100
+(at (at Rmix 'c) 0) -- 2000
+(sum (at Rmix 'c)) -- 200000
+(count (at (at Rmix 'v) 0)) -- 2000
+
+;; ─── Fixture 5: just above the parallel-dispatch threshold (200_001).
+;; The +1 row goes to the first surviving group; total row count must
+;; still match.
+(set Nedge 200001)
+(set Tedge (table [k v] (list (% (til Nedge) Ngrp) (til Nedge))))
+(set Redge (select {v: v by: k from: Tedge}))
+(count Redge) -- 100
+(fold + 0 (map count (at Redge 'v))) -- 200001
+;; Group 0 gets the extra row (row 200_000 → k = 200_000 % 100 = 0).
+(count (at (at Redge 'v) 0)) -- 2001
+(count (at (at Redge 'v) 1)) -- 2000

@@ -1,0 +1,181 @@
+;; Coverage for src/io/csv.c splayed-writer paths, src/store/col.c str-pool
+;; copy on load, and the GUID column writer.
+;;
+;; Reachability map (per llvm-cov, 0% on master):
+;;
+;;   csv_splayed_writer_open     — opens per-column tmp file
+;;   csv_splayed_writer_append   — per-chunk col append
+;;   csv_splayed_writer_close    — finalizes header + nullmap, atomic rename
+;;   csv_splayed_writer_null_bit — per-row null-bit accumulator
+;;   csv_splayed_writer_zero_nulls — backfill / pad helpers (count=0 fast path
+;;                                   reached here; the inner loop requires
+;;                                   multi-chunk input which needs >1M rows —
+;;                                   see "Reachability notes" at end)
+;;
+;; All paths above are exercised through the `.csv.splayed` builtin
+;; (src/ops/builtins.c::ray_read_csv_splayed_fn), which writes a CSV into
+;; a directory as one file per column via ray_csv_save_splayed_named_opts.
+;;
+;; col_copy_str_pool / col_load_str_vec are reached via the standard
+;; ray_col_load path when the saved column carries a STR str_pool.
+;;
+;; Every assertion is deterministic — no rand on the LHS, no timestamps.
+;; Splayed dirs and CSV fixtures use the `rf_test_splayed_*` prefix so the
+;; Makefile-side `rm -f rf_test_*.csv` keeps fixtures bounded; the splayed
+;; *directories* themselves are cleaned by the test header below.
+
+;; ────────────── scrub stale state from a prior run ──────────────
+;; `.csv.splayed` errors out if the destination dir already has stale
+;; column files from a previous interrupted run.  A leftover sym file
+;; with stale IDs would also flip the load-back path to "corrupt".
+(.sys.exec "rm -rf rf_test_splayed_basic rf_test_splayed_nulls rf_test_splayed_str rf_test_splayed_sym rf_test_splayed_guid rf_test_splayed_*.csv") -- 0
+
+;; ════════════════════════════════════════════════════════════════
+;; 1. Basic mixed-column round trip — no nulls.
+;;
+;; Hits csv_splayed_writer_open + _append + _close for each column.
+;; Three columns ⇒ three open/close pairs, exercising the SYM_W32 attr
+;; branch in writer_open (the `s` column) and the non-SYM branch (`id`
+;; and `px`).
+;; ════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'id,s,px\\n1,aa,1.5\\n2,bb,2.5\\n3,aa,3.5\\n4,cc,4.5\\n5,aa,5.5\\n' > rf_test_splayed_basic.csv") -- 0
+(set Tbasic (.csv.splayed "rf_test_splayed_basic.csv" "rf_test_splayed_basic/"))
+
+(count Tbasic) -- 5
+(sum (at Tbasic 'id)) -- 15
+(sum (at Tbasic 'px)) -- 17.5
+;; SYM column survives — duplicates intern to the same id.
+(count (at Tbasic 's)) -- 5
+;; Header was parsed → column names match.
+(key Tbasic) -- ['id 's 'px]
+
+;; Round-trip load via .db.splayed.get exercises ray_read_splayed which
+;; walks every column file and validates the writer's on-disk format.
+(set Rbasic (.db.splayed.get "rf_test_splayed_basic/"))
+(count Rbasic) -- 5
+(sum (at Rbasic 'id)) -- 15
+(sum (at Rbasic 'px)) -- 17.5
+(key Rbasic) -- ['id 's 'px]
+;; Values match position-by-position — proves writer + reader agree on
+;; row order and width-narrowed SYM widths.
+(at Rbasic 'id) -- (at Tbasic 'id)
+(at Rbasic 'px) -- (at Tbasic 'px)
+(at Rbasic 's)  -- (at Tbasic 's)
+
+;; ════════════════════════════════════════════════════════════════
+;; 2. Null rows — empty CSV fields produce typed nulls.
+;;
+;; Materialized columns carry RAY_ATTR_HAS_NULLS, which routes through
+;; csv_splayed_writer_null_bit for every row (14 regions) and the
+;; count=0 early-return in csv_splayed_writer_zero_nulls (1 region).
+;; The bit accumulator flushes when null_bits reaches 8, so 9+ rows
+;; force at least one full-byte fwrite of null_acc and exercise the
+;; flush-then-reset path inside null_bit.
+;; ════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'a,b\\n1,1.5\\n,2.5\\n3,\\n,\\n5,5.5\\n6,6.5\\n,7.5\\n8,\\n9,9.5\\n10,10.5\\n,11.5\\n12,12.5\\n' > rf_test_splayed_nulls.csv") -- 0
+(set Tnull (.csv.splayed "rf_test_splayed_nulls.csv" "rf_test_splayed_nulls/"))
+
+(count Tnull) -- 12
+(key Tnull) -- ['a 'b]
+;; Sum skips nulls — only the non-null `a` cells contribute.
+(sum (at Tnull 'a)) -- 54
+;; F64 sum of non-null `b` cells: 1.5+2.5+5.5+6.5+7.5+9.5+10.5+11.5+12.5 = 67.5
+(sum (at Tnull 'b)) -- 67.5
+
+;; Round-trip load: the saved column file carries an external nullmap
+;; bitmap (RAY_ATTR_NULLMAP_EXT in writer_close), and ray_col_load
+;; restores it.  Re-loaded sums match the original.
+(set Rnull (.db.splayed.get "rf_test_splayed_nulls/"))
+(count Rnull) -- 12
+(sum (at Rnull 'a)) -- 54
+(sum (at Rnull 'b)) -- 67.5
+(at Rnull 'a) -- (at Tnull 'a)
+(at Rnull 'b) -- (at Tnull 'b)
+
+;; ════════════════════════════════════════════════════════════════
+;; 3. STR column via explicit schema — exercises ray_splay_save_bulk
+;; fallback inside ray_csv_save_splayed_named_opts (col.c writes the
+;; STR + adjacent str_pool inline), and col_copy_str_pool on load.
+;;
+;; The schema-overridden form takes (.csv.splayed [names] [types] csv dir),
+;; same dispatcher as ray_read_csv_splayed_fn.
+;; ════════════════════════════════════════════════════════════════
+(.sys.exec "printf '1,alpha\\n2,beta\\n3,gamma\\n4,delta\\n5,epsilon\\n' > rf_test_splayed_str.csv") -- 0
+(set Tstr (.csv.splayed [id name] [I64 STR] "rf_test_splayed_str.csv" "rf_test_splayed_str/"))
+(count Tstr) -- 5
+(sum (at Tstr 'id)) -- 15
+;; STR column round-trips via the str_pool copy in col_copy_str_pool.
+(at (at Tstr 'name) 0) -- "alpha"
+(at (at Tstr 'name) 4) -- "epsilon"
+
+;; Re-load from disk also hits col_copy_str_pool — fresh STR + pool.
+(set Rstr (.db.splayed.get "rf_test_splayed_str/"))
+(count Rstr) -- 5
+(at (at Rstr 'name) 0) -- "alpha"
+(at (at Rstr 'name) 2) -- "gamma"
+(at (at Rstr 'name) 4) -- "epsilon"
+(at Rstr 'id) -- (at Tstr 'id)
+
+;; ════════════════════════════════════════════════════════════════
+;; 4. SYM column round-trip — drives the writer's SYM_W32 branch
+;; (uint32_t fwrite per chunk) and the on-load sym validation.
+;; Multiple distinct symbol values + duplicates exercise the intern
+;; table and the saved-sym-count footer.
+;; ════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'tag,v\\nAAPL,100\\nGOOG,200\\nMSFT,300\\nAAPL,400\\nGOOG,500\\nMSFT,600\\nAAPL,700\\n' > rf_test_splayed_sym.csv") -- 0
+(set Tsym (.csv.splayed "rf_test_splayed_sym.csv" "rf_test_splayed_sym/"))
+(count Tsym) -- 7
+(sum (at Tsym 'v)) -- 2800
+(count (at Tsym 'tag)) -- 7
+
+;; Round-trip — re-loading hits ray_sym_load via the splayed/sym file.
+(set Rsym (.db.splayed.get "rf_test_splayed_sym/"))
+(count Rsym) -- 7
+(sum (at Rsym 'v)) -- 2800
+(at Rsym 'tag) -- (at Tsym 'tag)
+
+;; ════════════════════════════════════════════════════════════════
+;; 5. GUID column via .csv.write — exercises csv_write_guid (8-4-4-4-12).
+;; (.csv.splayed has no GUID type inference path from text input, so
+;; the writer is reached via the row-formatted .csv.write builtin.)
+;;
+;; The exact bytes depend on `guid` codegen, so the assertion pins the
+;; structural invariant: 36-char canonical form, dashes at offsets
+;; 8/13/18/23.
+;; ════════════════════════════════════════════════════════════════
+(set Tguid (table [g] (list (guid 3))))
+(.csv.write Tguid "rf_test_splayed_guid.csv") -- 0
+(set rawg (read "rf_test_splayed_guid.csv"))
+(set linesg (split rawg "\n"))
+(count linesg) -- 5
+(at linesg 0) -- "g"
+;; Each data row is a 36-char canonical GUID string.
+(count (at linesg 1)) -- 36
+(count (at linesg 2)) -- 36
+(count (at linesg 3)) -- 36
+;; Dashes appear at the canonical offsets (8, 13, 18, 23).
+(at (at linesg 1) 8)  -- "-"
+(at (at linesg 1) 13) -- "-"
+(at (at linesg 1) 18) -- "-"
+(at (at linesg 1) 23) -- "-"
+
+;; ────────────── cleanup ──────────────
+;; CSV files match the Makefile's `rf_test_*.csv` clean rule; splayed
+;; dirs we created need explicit removal.
+(.sys.exec "rm -rf rf_test_splayed_basic rf_test_splayed_nulls rf_test_splayed_str rf_test_splayed_sym rf_test_splayed_*.csv") -- 0
+
+;; ────────────── reachability notes ──────────────
+;; csv_splayed_writer_zero_nulls — only the count<=0 early-return is
+;; hit here.  The inner loop requires either (a) a chunked write where
+;; one chunk has a null-bearing column and a later chunk doesn't, or
+;; (b) the reverse, both of which need >1M rows to cross the default
+;; CSV_PART_ROWS_DEFAULT chunk boundary.  Reachable but not regression-
+;; sized — would need a C-level test that passes a smaller rows_per_chunk.
+;;
+;; csv_splayed_writer_abort — only the err-path in writer_open's caller
+;; loop and the post-close abort exercise it.  Requires open() or
+;; fwrite() failure mid-flight; not reachable from a happy-path test.
+;;
+;; sym_lazy_materialize_to_locked / sym_lazy_unmap_locked — gated by
+;; SYM_LAZY_LOAD_MIN_BYTES = 64 MiB.  Out of reach for a regression
+;; test; covered by larger benchmarks.

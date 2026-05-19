@@ -1,0 +1,132 @@
+;; ════════════════════════════════════════════════════════════════════
+;; ROWFORM multi-key per-group sum(v) + count(v)
+;; (src/ops/group.c: exec_group_sum_count_rowform)
+;;
+;; Planner gate (src/ops/query.c:6082) routes
+;;   (select {tot: (sum v) cnt: (count v) by: [k1 k2 ... kN] from: T})
+;; to OP_GROUP_SUM_COUNT_ROWFORM when:
+;;   - N keys with 3 <= N <= 8 (all simple OP_SCAN)
+;;   - exactly 2 aggs: (sum v) then (count v), same value column
+;;   - no where, no non-agg expressions
+;;   - all keys non-nullable, types in
+;;     {I64,I32,I16,U8,BOOL,DATE,TIME,TIMESTAMP,SYM}
+;;   - v non-nullable, type in {I64,I32,I16,U8,BOOL,F64}
+;;
+;; ROWFORM emits one row per distinct key tuple with columns
+;; [k1..kN, sum, count].  Sum is always F64 (executor casts integer
+;; v -> double); count is I64.  Group order is partition-induced; tests
+;; verify via aggregate sums / counts, not positional checks.
+;;
+;; Aliases avoid colliding with key names (the result schema is
+;; [keys..., tot, cnt] and a name collision lets `at` pick the wrong
+;; column).  We use `tot` and `cnt` throughout.
+;;
+;; Parallel threshold: nrows >= 16384 (src/ops/group.c:11656).
+;; Closes canonical H2O q10.
+;; ════════════════════════════════════════════════════════════════════
+
+;; ─── basic 3-key shape: I64 keys, I64 v ─────────────────────────────
+(set T (table [k1 k2 k3 v] (list (as 'I64 [0 0 1 1]) (as 'I64 [0 1 0 1]) (as 'I64 [0 0 0 0]) (as 'I64 [10 20 30 40]))))
+;; All 4 rows have unique (k1,k2,k3) tuples, so 4 groups each of size 1.
+(count (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: T})) -- 4
+;; Sum across all groups = sum of v = 100; count total = 4.
+(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: T}) 'tot)) -- 100.0
+(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: T}) 'cnt)) -- 4
+;; Sum column is F64 (executor always emits F64 sum); count is I64.
+(type (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: T}) 'tot)) -- 'F64
+(type (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: T}) 'cnt)) -- 'I64
+
+;; ─── 3 keys with collapses: distinct group count < n_rows ───────────
+(set Tg (table [k1 k2 k3 v] (list (as 'I64 [0 0 0 1 1]) (as 'I64 [0 0 1 0 0]) (as 'I64 [0 0 0 0 0]) (as 'I64 [10 20 30 40 50]))))
+;; Distinct (k1,k2,k3): (0,0,0)->v={10,20}=30, (0,1,0)->v=30, (1,0,0)->v={40,50}=90.
+(count (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tg})) -- 3
+(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tg}) 'tot)) -- 150.0
+(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tg}) 'cnt)) -- 5
+;; Verify max per-group sum is 90 (from (1,0,0)) and min 30 (from one of the singletons).
+(max (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tg}) 'tot)) -- 90.0
+(min (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tg}) 'tot)) -- 30.0
+(max (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tg}) 'cnt)) -- 2
+(min (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tg}) 'cnt)) -- 1
+
+;; ─── 4 keys ─────────────────────────────────────────────────────────
+(set T4 (table [k1 k2 k3 k4 v] (list (as 'I64 [0 0 1 1]) (as 'I64 [0 1 0 1]) (as 'I64 [0 0 0 0]) (as 'I64 [0 0 0 0]) (as 'I64 [1 2 3 4]))))
+(count (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4] from: T4})) -- 4
+(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4] from: T4}) 'tot)) -- 10.0
+(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4] from: T4}) 'cnt)) -- 4
+
+;; ─── 5 keys ─────────────────────────────────────────────────────────
+(set T5 (table [k1 k2 k3 k4 k5 v] (list (as 'I64 [0 0 1 1 0]) (as 'I64 [0 1 0 1 0]) (as 'I64 [0 0 0 0 0]) (as 'I64 [0 0 0 0 0]) (as 'I64 [0 0 0 0 0]) (as 'I64 [10 20 30 40 100]))))
+;; (0,0,0,0,0) seen twice (rows 0 and 4) -> sum 110, count 2.  Three other singletons.
+(count (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4 k5] from: T5})) -- 4
+(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4 k5] from: T5}) 'tot)) -- 200.0
+(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4 k5] from: T5}) 'cnt)) -- 5
+(max (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4 k5] from: T5}) 'cnt)) -- 2
+
+;; ─── 6 keys ─────────────────────────────────────────────────────────
+(set T6 (table [k1 k2 k3 k4 k5 k6 v] (list (as 'I64 [0 0 1 1]) (as 'I64 [0 1 0 1]) (as 'I64 [0 0 0 0]) (as 'I64 [0 0 0 0]) (as 'I64 [0 0 0 0]) (as 'I64 [0 0 0 0]) (as 'I64 [11 22 33 44]))))
+(count (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4 k5 k6] from: T6})) -- 4
+(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4 k5 k6] from: T6}) 'tot)) -- 110.0
+(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4 k5 k6] from: T6}) 'cnt)) -- 4
+
+;; ─── 7 keys ─────────────────────────────────────────────────────────
+(set T7 (table [k1 k2 k3 k4 k5 k6 k7 v] (list (as 'I64 [0 0 1 1]) (as 'I64 [0 1 0 1]) (as 'I64 [0 0 0 0]) (as 'I64 [0 0 0 0]) (as 'I64 [0 0 0 0]) (as 'I64 [0 0 0 0]) (as 'I64 [0 0 0 0]) (as 'I64 [5 6 7 8]))))
+(count (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4 k5 k6 k7] from: T7})) -- 4
+(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4 k5 k6 k7] from: T7}) 'tot)) -- 26.0
+(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4 k5 k6 k7] from: T7}) 'cnt)) -- 4
+
+;; ─── 8 keys (gate upper bound) ──────────────────────────────────────
+(set T8 (table [k1 k2 k3 k4 k5 k6 k7 k8 v] (list (as 'I64 [0 0 1 1]) (as 'I64 [0 1 0 1]) (as 'I64 [0 0 0 0]) (as 'I64 [0 0 0 0]) (as 'I64 [0 0 0 0]) (as 'I64 [0 0 0 0]) (as 'I64 [0 0 0 0]) (as 'I64 [0 0 0 0]) (as 'I64 [10 20 30 40]))))
+(count (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4 k5 k6 k7 k8] from: T8})) -- 4
+(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4 k5 k6 k7 k8] from: T8}) 'tot)) -- 100.0
+(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4 k5 k6 k7 k8] from: T8}) 'cnt)) -- 4
+
+;; ─── F64 v column ───────────────────────────────────────────────────
+(set Tf (table [k1 k2 k3 v] (list (as 'I64 [0 0 1 1]) (as 'I64 [0 1 0 1]) (as 'I64 [0 0 0 0]) (as 'F64 [1.5 2.5 3.5 4.5]))))
+(count (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tf})) -- 4
+(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tf}) 'tot)) -- 12.0
+(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tf}) 'cnt)) -- 4
+
+;; ─── narrow integer v (I32 / I16 / U8) ──────────────────────────────
+(set Ti32 (table [k1 k2 k3 v] (list (as 'I64 [0 0 1 1]) (as 'I64 [0 1 0 1]) (as 'I64 [0 0 0 0]) (as 'I32 [10 20 30 40]))))
+(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Ti32}) 'tot)) -- 100.0
+(set Tu8 (table [k1 k2 k3 v] (list (as 'I64 [0 0 1 1]) (as 'I64 [0 1 0 1]) (as 'I64 [0 0 0 0]) (as 'U8 [1 2 3 4]))))
+(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tu8}) 'tot)) -- 10.0
+
+;; ─── SYM keys (canonical H2O q10 shape) ─────────────────────────────
+(set Ts (table [k1 k2 k3 v] (list [A A B B] [X Y X Y] [P P P P] (as 'I64 [10 20 30 40]))))
+(count (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Ts})) -- 4
+(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Ts}) 'tot)) -- 100.0
+(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Ts}) 'cnt)) -- 4
+
+;; SYM keys with collapses
+(set Tsc (table [k1 k2 k3 v] (list [A A A B] [X X Y Y] [P P P P] (as 'I64 [10 20 30 40]))))
+;; Distinct: (A,X,P) -> {10,20}=30, (A,Y,P) -> 30, (B,Y,P) -> 40.
+(count (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tsc})) -- 3
+(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tsc}) 'tot)) -- 100.0
+(max (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tsc}) 'cnt)) -- 2
+
+;; ─── mixed key types: I64 + SYM + I32 ───────────────────────────────
+(set Tmix (table [k1 k2 k3 v] (list (as 'I64 [0 0 1 1]) [A B A B] (as 'I32 [0 0 0 0]) (as 'I64 [10 20 30 40]))))
+(count (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tmix})) -- 4
+(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tmix}) 'tot)) -- 100.0
+
+;; ─── parallel path: nrows >= 16384 ──────────────────────────────────
+;; 20000 rows; 3 keys whose product cardinalities are 5 * 4 * 3 = 60 groups.
+(set N 20000)
+(set Tbig (table [k1 k2 k3 v] (list (% (til N) 5) (% (til N) 4) (% (til N) 3) (til N))))
+(count (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tbig})) -- 60
+;; Total sum of v across all groups = N*(N-1)/2 = 199990000.
+(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tbig}) 'tot)) -- 199990000.0
+(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tbig}) 'cnt)) -- 20000
+
+;; ─── parallel + SYM key ─────────────────────────────────────────────
+(set Tsbig (table [k1 k2 k3 v] (list (as 'SYMBOL (% (til N) 5)) (as 'SYMBOL (% (til N) 4)) (% (til N) 3) (til N))))
+(count (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tsbig})) -- 60
+(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tsbig}) 'tot)) -- 199990000.0
+(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tsbig}) 'cnt)) -- 20000
+
+;; ─── parallel + 6 keys + F64 v ──────────────────────────────────────
+(set Tf6 (table [k1 k2 k3 k4 k5 k6 v] (list (% (til N) 5) (% (til N) 4) (% (til N) 3) (% (til N) 2) (% (til N) 2) (% (til N) 2) (as 'F64 (til N)))))
+;; Group count depends on coprime products, but total sum/count are stable.
+(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4 k5 k6] from: Tf6}) 'tot)) -- 199990000.0
+(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4 k5 k6] from: Tf6}) 'cnt)) -- 20000

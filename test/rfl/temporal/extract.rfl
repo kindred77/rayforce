@@ -1,0 +1,142 @@
+;; Happy-path coverage for the temporal extract helpers in src/ops/temporal.c:
+;;   ray_extract_yyyy_fn / mm / dd / hh / minute / ss / dow / doy
+;;
+;; Each helper is a thin wrapper around ray_temporal_extract; reached from
+;; RFL via the unary builtins registered in src/lang/eval.c.  Atom and
+;; vector input paths are exercised here.  Null / wrong-type / OOB branches
+;; are out of scope (P2).
+
+;; ───────────────────────────── yyyy (year) ─────────────────────────────
+;; date atom
+(yyyy 2024.03.15) -- 2024
+(yyyy 2000.01.01) -- 2000
+;; leap-year boundary (29 Feb of a leap year decodes to year 2024)
+(yyyy 2024.02.29) -- 2024
+;; year-end → next-year boundary
+(yyyy 2024.12.31) -- 2024
+(yyyy 2025.01.01) -- 2025
+;; pre-epoch date (days_since_2000 < 0) still decomposes correctly
+(yyyy 1999.12.31) -- 1999
+;; timestamp atom
+(yyyy 2024.07.04D09:15:30.000000000) -- 2024
+;; vector
+(yyyy [2024.01.01 2024.07.04]) -- [2024 2024]
+(yyyy [1999.12.31 2000.01.01 2025.01.01]) -- [1999 2000 2025]
+
+;; ───────────────────────────── mm (month) ──────────────────────────────
+(mm 2024.03.15) -- 3
+(mm 2024.01.01) -- 1
+(mm 2024.12.31) -- 12
+;; leap-year Feb
+(mm 2024.02.29) -- 2
+;; pre-epoch
+(mm 1999.12.31) -- 12
+;; timestamp atom
+(mm 2024.07.04D09:15:30.000000000) -- 7
+;; vector covering every month
+(mm [2024.01.10 2024.02.10 2024.03.10 2024.04.10 2024.05.10 2024.06.10]) -- [1 2 3 4 5 6]
+(mm [2024.07.10 2024.08.10 2024.09.10 2024.10.10 2024.11.10 2024.12.10]) -- [7 8 9 10 11 12]
+
+;; ─────────────────────────── dd (day-of-month) ─────────────────────────
+(dd 2024.03.15) -- 15
+(dd 2024.01.01) -- 1
+(dd 2024.01.31) -- 31
+;; leap-day
+(dd 2024.02.29) -- 29
+;; year-end
+(dd 2024.12.31) -- 31
+;; timestamp atom
+(dd 2024.07.04D09:15:30.000000000) -- 4
+;; vector at month boundaries
+(dd [2024.01.01 2024.01.31 2024.02.29 2024.12.31]) -- [1 31 29 31]
+
+;; ───────────────────────────── hh (hour) ───────────────────────────────
+;; time atom
+(hh 00:00:00.000) -- 0
+(hh 12:34:56.000) -- 12
+(hh 23:59:59.999) -- 23
+;; timestamp atom
+(hh 2024.03.15D00:00:00.000000000) -- 0
+(hh 2024.03.15D12:34:56.000000000) -- 12
+(hh 2024.03.15D23:59:59.999999999) -- 23
+;; pure-date timestamp boundary (date atom decodes to midnight UTC)
+(hh 2024.03.15) -- 0
+;; vector of times
+(hh [00:00:00.000 06:30:00.000 12:00:00.000 18:45:00.000 23:59:59.000]) -- [0 6 12 18 23]
+;; vector of timestamps
+(hh [2024.03.15D01:00:00.000000000 2024.03.15D13:00:00.000000000]) -- [1 13]
+
+;; ──────────────────────────── minute ───────────────────────────────────
+(minute 00:00:00.000) -- 0
+(minute 12:34:56.000) -- 34
+(minute 12:59:00.000) -- 59
+(minute 2024.03.15D12:34:56.000000000) -- 34
+(minute 2024.03.15D08:00:00.000000000) -- 0
+;; vector
+(minute [00:00:00.000 00:15:00.000 00:30:00.000 00:45:00.000 00:59:00.000]) -- [0 15 30 45 59]
+
+;; ──────────────────────────── ss (second) ──────────────────────────────
+(ss 00:00:00.000) -- 0
+(ss 12:34:56.000) -- 56
+(ss 12:30:59.999) -- 59
+(ss 2024.03.15D12:34:56.000000000) -- 56
+(ss 2024.03.15D12:34:00.000000000) -- 0
+;; vector
+(ss [00:00:00.000 00:00:01.000 00:00:30.000 00:00:59.000]) -- [0 1 30 59]
+
+;; ───────────────────────────── dow (day-of-week) ───────────────────────
+;; rayforce's `dow` returns 1..7 with Mon=1 .. Sun=7
+;; (formula: ((days_since_2000 % 7) + 7 + 5) % 7 + 1)
+;; Verified by hand against the Gregorian calendar:
+;;   2024-01-01 = Mon, 2024-03-15 = Fri, 2024-07-04 = Thu,
+;;   2024-12-31 = Tue, 2000-01-01 = Sat, 2023-12-31 = Sun.
+(dow 2024.01.01) -- 1
+(dow 2024.03.15) -- 5
+(dow 2024.07.04) -- 4
+(dow 2024.12.31) -- 2
+(dow 2000.01.01) -- 6
+(dow 2023.12.31) -- 7
+;; timestamp atom takes the same path
+(dow 2024.03.15D12:34:56.000000000) -- 5
+;; vector — one of each weekday code
+;; (2024.01.01 Mon, 2024.01.02 Tue, 2024.01.03 Wed, 2024.01.04 Thu,
+;;  2024.01.05 Fri, 2024.01.06 Sat, 2024.01.07 Sun)
+(dow [2024.01.01 2024.01.02 2024.01.03 2024.01.04 2024.01.05 2024.01.06 2024.01.07]) -- [1 2 3 4 5 6 7]
+
+;; ───────────────────────────── doy (day-of-year) ───────────────────────
+;; non-leap baseline
+(doy 2023.01.01) -- 1
+(doy 2023.03.01) -- 60
+(doy 2023.12.31) -- 365
+;; leap year shifts everything from Mar 1 onward by +1
+(doy 2024.01.01) -- 1
+(doy 2024.02.29) -- 60
+(doy 2024.03.01) -- 61
+(doy 2024.07.04) -- 186
+(doy 2024.12.31) -- 366
+;; century rules: 2000 is leap (div 400), 1900 was not (div 100, not 400)
+(doy 2000.12.31) -- 366
+;; timestamp atom
+(doy 2024.03.15D12:34:56.000000000) -- 75
+;; vector across the year
+(doy [2024.01.01 2024.02.29 2024.03.01 2024.07.04 2024.12.31]) -- [1 60 61 186 366]
+
+;; ───────────────────── combined extractor round-trip ───────────────────
+;; A single timestamp decomposes consistently across every helper.
+(set TS 2024.03.15D12:34:56.000000000)
+(yyyy   TS) -- 2024
+(mm     TS) -- 3
+(dd     TS) -- 15
+(hh     TS) -- 12
+(minute TS) -- 34
+(ss     TS) -- 56
+(dow    TS) -- 5
+(doy    TS) -- 75
+
+;; Same idea on a vector — each helper produces a parallel column.
+(set DS [2024.01.01 2024.07.04 2024.12.31])
+(yyyy DS) -- [2024 2024 2024]
+(mm   DS) -- [1 7 12]
+(dd   DS) -- [1 4 31]
+(dow  DS) -- [1 4 2]
+(doy  DS) -- [1 186 366]
