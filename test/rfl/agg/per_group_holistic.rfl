@@ -124,17 +124,17 @@
 ;; Population variance / stddev — exact integer answers.
 (sum (at (select {v: (var_pop v) by: g from: Tvar}) 'v))    -- 8.0
 (sum (at (select {v: (stddev_pop v) by: g from: Tvar}) 'v)) -- 4.0
-;; Asymmetry: scalar `dev` aliases stddev_pop (ray_stddev_pop_fn at
-;; agg.c:625-628), but in a select-by, query.c:316 maps `dev` →
-;; OP_STDDEV (sample), NOT OP_STDDEV_POP.  Per-group `dev` therefore
-;; equals per-group sample stddev — sum across 2 groups = 2 * √(32/7).
-;; (Locking this in: changing the planner mapping would surface as a
-;; failing assertion here.)
-(< (abs (- (sum (at (select {v: (dev v) by: g from: Tvar}) 'v)) (* 2.0 2.138089935299395))) 0.000001) -- true
+;; Bug 5 (now fixed): `dev` in select-by used to map to OP_STDDEV
+;; (sample) while scalar `dev` is OP_STDDEV_POP (population).  The
+;; one-line fix at src/ops/query.c:316 aligns the planner mapping so
+;; per-group `dev` is also population — `dev` is now an alias of
+;; `stddev_pop` (and `dev_pop`) in every context, matching Q/K
+;; convention (`dev` = pop, `sdev` would be sample).
+(sum (at (select {v: (dev v) by: g from: Tvar}) 'v))        -- 4.0
 ;; Sanity: stddev_pop (explicit) sums to 4.0 (= 2 * 2.0).
 (sum (at (select {v: (stddev_pop v) by: g from: Tvar}) 'v)) -- 4.0
-;; Per-group dev != per-group stddev_pop (because of the asymmetry):
-(< (abs (- (sum (at (select {v: (dev v) by: g from: Tvar}) 'v)) (sum (at (select {v: (stddev_pop v) by: g from: Tvar}) 'v)))) 0.001) -- false
+;; Per-group dev == per-group stddev_pop after the fix:
+(< (abs (- (sum (at (select {v: (dev v) by: g from: Tvar}) 'v)) (sum (at (select {v: (stddev_pop v) by: g from: Tvar}) 'v)))) 0.001) -- true
 
 ;; Sample variance / stddev — fp tolerance.
 (< (abs (- (sum (at (select {v: (var v) by: g from: Tvar}) 'v)) (* 2.0 4.571428571428571))) 0.000001) -- true
