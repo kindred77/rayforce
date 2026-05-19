@@ -1,0 +1,136 @@
+;; Coverage for the per-group buffer aggregators and helpers in
+;; `src/ops/query.c`:
+;;   - `typed_vec_to_list`        — demote a partly-typed result to a
+;;                                  LIST when a mid-loop cell type
+;;                                  doesn't fit the initial typed vec.
+;;   - `const_str_expr_copy`      — constant-fold `(concat str ...)`
+;;                                  expressions inside select dict
+;;                                  projections.
+;;   - eval-level / DAG fast-path scatter for non-agg projections that
+;;     compute per group (`nonagg_eval_per_group_core` /
+;;     `nonagg_eval_per_group_buf`).
+;;
+;; Note on `aggr_unary_per_group_buf` / `aggr_med_per_group_buf`
+;; (also targeted in this file's scope): the dispatch gate at
+;; `query.c:7684` requires `is_streaming_aggr_unary_call(expr)` to fire
+;; AND that the expr was bucketed into `nonagg_exprs` (i.e. NOT
+;; `is_group_dag_agg_expr`).  As of `resolve_agg_opcode` covering all
+;; RAY_FN_AGGR unaries (sum/avg/min/max/med/dev/var/stddev/...), every
+;; `(agg col)` shape now satisfies `is_agg_expr` → `is_group_dag_agg_expr`
+;; → buckets into `n_aggs`, never reaches the non-agg scatter.  These
+;; two helpers are therefore not reachable from RFL today; see the
+;; reachability note in the task report.
+
+;; ────────────────────────────────────────────────────────────────────
+;; const_str_expr_copy via `(concat <strlit>...)` constant folding in
+;; a select projection.  The DAG compiler `compile_const_str_expr`
+;; walks the expression with `const_str_expr_len` and emits a single
+;; folded `ray_const_str` op.  Stays on the stack buffer (≤ 256 B) for
+;; the small cases and heap-allocates for the longer one.
+;; ────────────────────────────────────────────────────────────────────
+(set Tcs (table [k v] (list ['a 'b 'c] [1 2 3])))
+
+;; Two-piece concat — small, stack buffer (< 256 B).
+(at (at (select {s: (concat "hello" "-world") from: Tcs}) 's) 0) -- "hello-world"
+(count (at (select {s: (concat "hello" "-world") from: Tcs}) 's)) -- 3
+
+;; Three-piece concat — recurses through const_str_expr_copy.
+(at (at (select {s: (concat "a" "b" "c") from: Tcs}) 's) 0) -- "abc"
+
+;; Nested concat — const_str_expr_len recognises the inner (concat ...)
+;; head and recurses, const_str_expr_copy follows the same walk.
+(at (at (select {s: (concat "x" (concat "y" "z")) from: Tcs}) 's) 0) -- "xyz"
+(at (at (select {s: (concat (concat "ab" "cd") (concat "ef" "gh")) from: Tcs}) 's) 0) -- "abcdefgh"
+
+;; Longer folded result that overflows the 256-byte stack buffer →
+;; heap path inside `compile_const_str_expr`.  Folded length is
+;; 26 * 12 = 312 bytes.  Verify the projection emits 3 rows and the
+;; first cell holds the full folded string.
+(count (at (select {s: (concat "abcdefghijklmnopqrstuvwxyz" "abcdefghijklmnopqrstuvwxyz" "abcdefghijklmnopqrstuvwxyz" "abcdefghijklmnopqrstuvwxyz" "abcdefghijklmnopqrstuvwxyz" "abcdefghijklmnopqrstuvwxyz" "abcdefghijklmnopqrstuvwxyz" "abcdefghijklmnopqrstuvwxyz" "abcdefghijklmnopqrstuvwxyz" "abcdefghijklmnopqrstuvwxyz" "abcdefghijklmnopqrstuvwxyz" "abcdefghijklmnopqrstuvwxyz") from: Tcs}) 's)) -- 3
+(at (at (select {s: (concat "abcdefghijklmnopqrstuvwxyz" "abcdefghijklmnopqrstuvwxyz" "abcdefghijklmnopqrstuvwxyz" "abcdefghijklmnopqrstuvwxyz" "abcdefghijklmnopqrstuvwxyz" "abcdefghijklmnopqrstuvwxyz" "abcdefghijklmnopqrstuvwxyz" "abcdefghijklmnopqrstuvwxyz" "abcdefghijklmnopqrstuvwxyz" "abcdefghijklmnopqrstuvwxyz" "abcdefghijklmnopqrstuvwxyz" "abcdefghijklmnopqrstuvwxyz") from: Tcs}) 's) 0) -- "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz"
+
+;; ────────────────────────────────────────────────────────────────────
+;; Multi-key by + non-agg-with-inner-agg → eval-level group path that
+;; runs `nonagg_eval_per_group` over a LIST<(key,idx_list)> layout.
+;; First-of-group cell decides the typed-vec storage type; subsequent
+;; cells must match or the result demotes via typed_vec_to_list.
+;;
+;; Happy path: homogeneous numeric output → stays on the typed-vec
+;; path, no demotion.  Confirms the per-group eval correctness and
+;; the typed-direct (collapsable) branch in nonagg_eval_per_group_core.
+;; ────────────────────────────────────────────────────────────────────
+
+;; Single-key q7 shape — non-agg outer, inner aggs reduce per-group.
+;; Routes through the DAG fast scatter (`nonagg_eval_per_group_buf`).
+(set Ta (table [k v1 v2] (list ['A 'A 'B 'B 'C 'C] [10 20 30 40 50 60] [5 15 25 35 45 55])))
+(count (select {r: (- (max v1) (min v2)) by: k from: Ta})) -- 3
+;; A: max(v1)=20 min(v2)=5  → 15
+;; B: max(v1)=40 min(v2)=25 → 15
+;; C: max(v1)=60 min(v2)=45 → 15
+(sum (at (select {r: (- (max v1) (min v2)) by: k from: Ta}) 'r)) -- 45
+
+;; Multi-key by — forces use_eval_group → `nonagg_eval_per_group`
+;; over the LIST<groups> layout.
+(set Tb (table [g h v1 v2] (list ['A 'A 'B 'B 'A 'A 'B 'B] ['X 'Y 'X 'Y 'X 'Y 'X 'Y] [10 20 30 40 50 60 70 80] [1 2 3 4 5 6 7 8])))
+(count (select {r: (- (max v1) (min v2)) by: [g h] from: Tb})) -- 4
+;; (A,X): v1=[10,50] max=50; v2=[1,5] min=1 → 49
+;; (A,Y): v1=[20,60] max=60; v2=[2,6] min=2 → 58
+;; (B,X): v1=[30,70] max=70; v2=[3,7] min=3 → 67
+;; (B,Y): v1=[40,80] max=80; v2=[4,8] min=4 → 76
+;; Sum = 49+58+67+76 = 250
+(sum (at (select {r: (- (max v1) (min v2)) by: [g h] from: Tb}) 'r)) -- 250
+
+;; F64 arithmetic-of-aggregates per group — same routing, F64 typed
+;; vec result.
+(set Tf (table [k x y] (list ['A 'A 'B 'B 'C 'C] [1.0 2.0 3.0 4.0 5.0 6.0] [2.0 4.0 6.0 8.0 10.0 12.0])))
+(count (select {r: (- (max y) (min x)) by: k from: Tf})) -- 3
+;; A: max(y)=4, min(x)=1 → 3
+;; B: max(y)=8, min(x)=3 → 5
+;; C: max(y)=12, min(x)=5 → 7
+(sum (at (select {r: (- (max y) (min x)) by: k from: Tf}) 'r)) -- 15.0
+
+;; Integer key (non-symbol) — same row→gid + per-group eval.
+(set Ti (table [k v] (list [1 1 2 2 3 3] [10 20 30 40 50 60])))
+;; (+ (max v) (min v)) per group:
+;;   k=1: max=20, min=10 → 30
+;;   k=2: max=40, min=30 → 70
+;;   k=3: max=60, min=50 → 110
+(sum (at (select {r: (+ (max v) (min v)) by: k from: Ti}) 'r)) -- 210
+(count (select {r: (+ (max v) (min v)) by: k from: Ti})) -- 3
+
+;; Two-key with integer keys — eval-level multi-key, typed-direct.
+(set Tk (table [k1 k2 v] (list [1 1 2 2 1 2] [10 20 10 20 10 20] [100 200 300 400 500 600])))
+;; Groups (k1, k2) — 4 distinct pairs:
+;;   (1, 10) v=[100, 500] → max=500, min=100 → diff=400
+;;   (1, 20) v=[200]      → max=200, min=200 → diff=0
+;;   (2, 10) v=[300]      → max=300, min=300 → diff=0
+;;   (2, 20) v=[400, 600] → max=600, min=400 → diff=200
+(count (select {r: (- (max v) (min v)) by: [k1 k2] from: Tk})) -- 4
+(sum (at (select {r: (- (max v) (min v)) by: [k1 k2] from: Tk}) 'r)) -- 600
+
+;; ────────────────────────────────────────────────────────────────────
+;; typed-direct happy path inside `nonagg_eval_per_group_core`.
+;; First-group cell is a collapsable primitive (F64 scalar after
+;; column-level type coercion of the mixed I64/F64 list), so the
+;; result emerges as a typed F64 vec without invoking
+;; `typed_vec_to_list` demotion.  Confirms the row→gid scatter +
+;; per-group eval produces a row-aligned typed column.
+;;
+;; (See reachability note in the task report: constructing a true
+;; typed_vec_to_list demotion from RFL requires a per-group eval
+;; whose cell type GENUINELY varies across groups — table column
+;; coercion collapses mixed-I64/F64 literal lists to a single F64
+;; vector before the eval ever runs, so the cells are homogeneous
+;; F64.  The demotion line is exercised via internal callers; the
+;; happy-path typed-direct branch is what RFL surfaces.)
+;; ────────────────────────────────────────────────────────────────────
+(set Tlist (table [k v] (list ['A 'B 'C 'D] (list 1 2.5 3 4.5))))
+(set Rlist (select {r: (+ 0 (first v)) by: k from: Tlist}))
+(count Rlist) -- 4
+;; Column v is coerced to F64; per-group first-of-slice yields
+;; F64 atoms → all result cells are F64.
+(at (at Rlist 'r) 0) -- 1.0
+(at (at Rlist 'r) 1) -- 2.5
+(at (at Rlist 'r) 2) -- 3.0
+(at (at Rlist 'r) 3) -- 4.5
+(type (at Rlist 'r)) -- 'F64

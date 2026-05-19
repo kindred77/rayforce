@@ -1029,6 +1029,413 @@ static test_result_t test_sort_bool_nulls_first(void) {
     PASS();
 }
 
+/* ══════════════════════════════════════════════════════════════════
+ * top / bot (partial top-N / bottom-N) — happy path
+ *
+ * Targets ray_top_fn / ray_bot_fn (sort.c:3448, 3453) which dispatch
+ * through topk_take_vec → topk_indices_single → either the radix-
+ * encoded heap path (numeric types) or topk_indices_cmp_single +
+ * topk_indices_cmp + topk_cmp_sift_down (SYM type, sort.c:3173).
+ *
+ * Happy-path only: correct-type / correct-shape inputs.  Null /
+ * wrong-type / K-edge cases are covered elsewhere (top_bot.rfl).
+ * ══════════════════════════════════════════════════════════════════ */
+
+/* (top vec K) over an I64 vec with K < N — exercises the numeric
+ * radix-encoded bounded-heap path inside topk_indices_single. */
+static test_result_t test_top_i64_k_lt_n(void) {
+    ray_heap_init();
+    ray_sym_init();
+
+    int64_t data[] = {3, 1, 5, 2, 7, 4, 9, 6, 8};
+    ray_t* v = ray_vec_from_raw(RAY_I64, data, 9);
+    TEST_ASSERT_NOT_NULL(v);
+
+    ray_t* k = ray_i64(3);
+    ray_t* res = ray_top_fn(v, k);
+    TEST_ASSERT_NOT_NULL(res);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_len(res), 3);
+    TEST_ASSERT_EQ_I(res->type, RAY_I64);
+
+    /* Top 3 of {3,1,5,2,7,4,9,6,8} desc = {9,8,7}. */
+    const int64_t* r = (const int64_t*)ray_data(res);
+    TEST_ASSERT_EQ_I(r[0], 9);
+    TEST_ASSERT_EQ_I(r[1], 8);
+    TEST_ASSERT_EQ_I(r[2], 7);
+
+    ray_release(res); ray_release(k); ray_release(v);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* (top vec 1) — degenerate K=1 path: heap-of-one == max. */
+static test_result_t test_top_i64_k_eq_one(void) {
+    ray_heap_init();
+    ray_sym_init();
+
+    int64_t data[] = {3, 1, 5, 2, 7, 4, 9, 6, 8};
+    ray_t* v = ray_vec_from_raw(RAY_I64, data, 9);
+    ray_t* k = ray_i64(1);
+    ray_t* res = ray_top_fn(v, k);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_len(res), 1);
+    TEST_ASSERT_EQ_I(((const int64_t*)ray_data(res))[0], 9);
+
+    ray_release(res); ray_release(k); ray_release(v);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* (bot vec K) — mirror path with desc=0; verifies bot's heap orientation. */
+static test_result_t test_bot_i64_k_lt_n(void) {
+    ray_heap_init();
+    ray_sym_init();
+
+    int64_t data[] = {3, 1, 5, 2, 7, 4, 9, 6, 8};
+    ray_t* v = ray_vec_from_raw(RAY_I64, data, 9);
+    ray_t* k = ray_i64(3);
+    ray_t* res = ray_bot_fn(v, k);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_len(res), 3);
+
+    /* Bot 3 asc = {1,2,3}. */
+    const int64_t* r = (const int64_t*)ray_data(res);
+    TEST_ASSERT_EQ_I(r[0], 1);
+    TEST_ASSERT_EQ_I(r[1], 2);
+    TEST_ASSERT_EQ_I(r[2], 3);
+
+    ray_release(res); ray_release(k); ray_release(v);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* (top vec K) over F64 — exercises the F64 branch of the radix encode
+ * inside the bounded-heap path. */
+static test_result_t test_top_f64_k_lt_n(void) {
+    ray_heap_init();
+    ray_sym_init();
+
+    double data[] = {1.5, 2.5, 0.5, 3.5, -1.0, 4.5, 2.0};
+    ray_t* v = ray_vec_from_raw(RAY_F64, data, 7);
+    ray_t* k = ray_i64(3);
+    ray_t* res = ray_top_fn(v, k);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_len(res), 3);
+    TEST_ASSERT_EQ_I(res->type, RAY_F64);
+
+    /* Top 3 desc of {1.5,2.5,0.5,3.5,-1.0,4.5,2.0} = {4.5, 3.5, 2.5}. */
+    const double* r = (const double*)ray_data(res);
+    TEST_ASSERT_EQ_F(r[0], 4.5, 1e-9);
+    TEST_ASSERT_EQ_F(r[1], 3.5, 1e-9);
+    TEST_ASSERT_EQ_F(r[2], 2.5, 1e-9);
+
+    ray_release(res); ray_release(k); ray_release(v);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* (bot vec K) over F64 — F64 branch with desc=0. */
+static test_result_t test_bot_f64_k_lt_n(void) {
+    ray_heap_init();
+    ray_sym_init();
+
+    double data[] = {1.5, 2.5, 0.5, 3.5, -1.0, 4.5, 2.0};
+    ray_t* v = ray_vec_from_raw(RAY_F64, data, 7);
+    ray_t* k = ray_i64(2);
+    ray_t* res = ray_bot_fn(v, k);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_len(res), 2);
+
+    const double* r = (const double*)ray_data(res);
+    TEST_ASSERT_EQ_F(r[0], -1.0, 1e-9);
+    TEST_ASSERT_EQ_F(r[1], 0.5, 1e-9);
+
+    ray_release(res); ray_release(k); ray_release(v);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* (top vec K=N) — k>=len → falls through to ray_desc_fn (full sort),
+ * which returns a lazy chain that must be materialized.  Exercises
+ * the K==N short-circuit in topk_take_vec. */
+static test_result_t test_top_i64_k_eq_n(void) {
+    ray_heap_init();
+    ray_sym_init();
+
+    int64_t data[] = {3, 1, 5, 2, 7};
+    ray_t* v = ray_vec_from_raw(RAY_I64, data, 5);
+    ray_t* k = ray_i64(5);
+    ray_t* res = ray_top_fn(v, k);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    if (ray_is_lazy(res)) res = ray_lazy_materialize(res);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_len(res), 5);
+
+    /* Full desc = {7,5,3,2,1}. */
+    const int64_t* r = (const int64_t*)ray_data(res);
+    TEST_ASSERT_EQ_I(r[0], 7);
+    TEST_ASSERT_EQ_I(r[4], 1);
+    for (int64_t i = 1; i < 5; i++)
+        TEST_ASSERT_FMT(r[i] <= r[i-1],
+                        "top k==n not desc-sorted at %lld", (long long)i);
+
+    ray_release(res); ray_release(k); ray_release(v);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* (bot vec K=N) mirror. */
+static test_result_t test_bot_i64_k_eq_n(void) {
+    ray_heap_init();
+    ray_sym_init();
+
+    int64_t data[] = {3, 1, 5, 2, 7};
+    ray_t* v = ray_vec_from_raw(RAY_I64, data, 5);
+    ray_t* k = ray_i64(5);
+    ray_t* res = ray_bot_fn(v, k);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    if (ray_is_lazy(res)) res = ray_lazy_materialize(res);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_len(res), 5);
+
+    const int64_t* r = (const int64_t*)ray_data(res);
+    TEST_ASSERT_EQ_I(r[0], 1);
+    TEST_ASSERT_EQ_I(r[4], 7);
+
+    ray_release(res); ray_release(k); ray_release(v);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* (top symvec K) — RAY_SYM dispatches to topk_indices_cmp_single
+ * (sort.c:3173), which calls topk_indices_cmp + topk_cmp_sift_down.
+ * Exercises the comparator-heap branch of the top-K fast path that
+ * the numeric radix encoding doesn't cover. */
+static test_result_t test_top_sym_k_lt_n(void) {
+    ray_heap_init();
+    ray_sym_init();
+
+    int64_t s_apple  = ray_sym_intern("apple",  5);
+    int64_t s_banana = ray_sym_intern("banana", 6);
+    int64_t s_cherry = ray_sym_intern("cherry", 6);
+    int64_t s_date   = ray_sym_intern("date",   4);
+    int64_t s_elder  = ray_sym_intern("elder",  5);
+    int64_t s_fig    = ray_sym_intern("fig",    3);
+
+    /* SYM_W64 width: index slot is int64_t */
+    int64_t N = 12;
+    ray_t* sv = ray_sym_vec_new(RAY_SYM_W64, N);
+    TEST_ASSERT_NOT_NULL(sv);
+    sv->len = N;
+    int64_t syms[6] = { s_apple, s_banana, s_cherry, s_date, s_elder, s_fig };
+    int64_t* sd = (int64_t*)ray_data(sv);
+    for (int64_t i = 0; i < N; i++) sd[i] = syms[i % 6];
+
+    /* (top sv 3) → top 3 lex-desc symbols.  Lex order:
+     *   apple < banana < cherry < date < elder < fig
+     * Each symbol appears twice (N=12, 6 syms), so the desc top 3 must
+     * draw from the {fig, fig, elder} multiset (two fig + one elder)
+     * since fig and elder are the two highest symbols. */
+    ray_t* k = ray_i64(3);
+    ray_t* res = ray_top_fn(sv, k);
+    TEST_ASSERT_NOT_NULL(res);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_len(res), 3);
+    TEST_ASSERT_TRUE(RAY_IS_SYM(res->type));
+
+    /* Read all three sym ids — the result is desc-sorted so r0 ≥ r1 ≥ r2
+     * in lex order.  Expected (with stable tie-break): fig, fig, elder. */
+    const int64_t r0 = ray_read_sym(ray_data(res), 0, res->type, res->attrs);
+    const int64_t r1 = ray_read_sym(ray_data(res), 1, res->type, res->attrs);
+    const int64_t r2 = ray_read_sym(ray_data(res), 2, res->type, res->attrs);
+    TEST_ASSERT_EQ_I(r0, s_fig);
+    TEST_ASSERT_EQ_I(r1, s_fig);
+    TEST_ASSERT_EQ_I(r2, s_elder);
+
+    ray_release(res); ray_release(k); ray_release(sv);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* (bot symvec K) — mirror direction over SYM, exercising
+ * topk_indices_cmp_single with desc=0. */
+static test_result_t test_bot_sym_k_lt_n(void) {
+    ray_heap_init();
+    ray_sym_init();
+
+    int64_t s_apple  = ray_sym_intern("apple",  5);
+    int64_t s_banana = ray_sym_intern("banana", 6);
+    int64_t s_cherry = ray_sym_intern("cherry", 6);
+    int64_t s_date   = ray_sym_intern("date",   4);
+    int64_t s_elder  = ray_sym_intern("elder",  5);
+
+    int64_t N = 10;
+    ray_t* sv = ray_sym_vec_new(RAY_SYM_W64, N);
+    sv->len = N;
+    int64_t syms[5] = { s_apple, s_banana, s_cherry, s_date, s_elder };
+    int64_t* sd = (int64_t*)ray_data(sv);
+    for (int64_t i = 0; i < N; i++) sd[i] = syms[i % 5];
+
+    ray_t* k = ray_i64(2);
+    ray_t* res = ray_bot_fn(sv, k);
+    TEST_ASSERT_NOT_NULL(res);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_len(res), 2);
+
+    /* Bot 2 asc = {apple, apple}: 'apple' appears at rows 0 and 5. */
+    const int64_t r0 = ray_read_sym(ray_data(res), 0, res->type, res->attrs);
+    const int64_t r1 = ray_read_sym(ray_data(res), 1, res->type, res->attrs);
+    TEST_ASSERT_EQ_I(r0, s_apple);
+    TEST_ASSERT_EQ_I(r1, s_apple);
+
+    ray_release(res); ray_release(k); ray_release(sv);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* (top symvec K=N) — K==N → falls through to ray_desc_fn (full sort
+ * over SYM), still a happy-path traverse. */
+static test_result_t test_top_sym_k_eq_n(void) {
+    ray_heap_init();
+    ray_sym_init();
+
+    int64_t s_a = ray_sym_intern("aa", 2);
+    int64_t s_b = ray_sym_intern("bb", 2);
+    int64_t s_c = ray_sym_intern("cc", 2);
+
+    int64_t N = 3;
+    ray_t* sv = ray_sym_vec_new(RAY_SYM_W64, N);
+    sv->len = N;
+    int64_t* sd = (int64_t*)ray_data(sv);
+    sd[0] = s_b; sd[1] = s_a; sd[2] = s_c;
+
+    ray_t* k = ray_i64(3);
+    ray_t* res = ray_top_fn(sv, k);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    if (ray_is_lazy(res)) res = ray_lazy_materialize(res);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_len(res), 3);
+    /* desc lex: cc, bb, aa */
+    TEST_ASSERT_EQ_I(ray_read_sym(ray_data(res), 0, res->type, res->attrs), s_c);
+    TEST_ASSERT_EQ_I(ray_read_sym(ray_data(res), 1, res->type, res->attrs), s_b);
+    TEST_ASSERT_EQ_I(ray_read_sym(ray_data(res), 2, res->type, res->attrs), s_a);
+
+    ray_release(res); ray_release(k); ray_release(sv);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ * MSD bucket sort — msd_radix_sort_run dispatches to
+ * msd_bucket_sort_fn + bucket_lsb_sort only when both
+ *   nrows  > 1,000,000   AND
+ *   key_nbytes > 5       (range needs ≥6 bytes)
+ * apply (sort.c:810).  Build a 1.1M-row I64 vec with a 56-bit value
+ * range that ensures compute_key_nbytes returns ≥6, so we drop into
+ * the MSD path with 256 buckets and per-bucket LSB radix.
+ * ══════════════════════════════════════════════════════════════════ */
+
+static test_result_t test_sort_msd_bucket_i64(void) {
+    ray_heap_init();
+    ray_sym_init();
+
+    /* Just over 1M rows so we exceed the `n > 1000000` gate. */
+    const int64_t N = 1000001;
+    ray_t* vec = ray_vec_new(RAY_I64, N);
+    TEST_ASSERT_NOT_NULL(vec);
+    int64_t* d = (int64_t*)ray_data(vec);
+
+    /* Spread values across ~2^56 so the encoded key_nbytes is 7,
+     * tripping the n_bytes > 5 gate.  Use a simple deterministic
+     * pseudo-random pattern that's neither sorted nor reverse-sorted. */
+    const int64_t big = (int64_t)1 << 56;
+    for (int64_t i = 0; i < N; i++) {
+        /* Mix bits in the upper 7 bytes so every key_nbytes byte is
+         * non-uniform → no MSD-uniform fallback. */
+        uint64_t m = (uint64_t)(i * 2654435761ULL);
+        d[i] = (int64_t)(m % (uint64_t)big);
+    }
+    vec->len = N;
+
+    uint8_t desc = 0;
+    ray_t* result = ray_sort(&vec, &desc, NULL, 1, N);
+    TEST_ASSERT_NOT_NULL(result);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(ray_len(result), N);
+
+    /* Verify ascending order at sparse checkpoints; full O(n) scan is
+     * also fine but costly.  Walk every 137th element (coprime with
+     * 64 / 128 / 256) so we land on every bucket boundary class. */
+    const int64_t* r = (const int64_t*)ray_data(result);
+    int64_t prev = r[0];
+    for (int64_t i = 137; i < N; i += 137) {
+        TEST_ASSERT_FMT(r[i] >= prev,
+                        "msd asc out of order at %lld: %lld < %lld",
+                        (long long)i, (long long)r[i], (long long)prev);
+        prev = r[i];
+    }
+    /* Sanity: adjacent pairs at start and end. */
+    TEST_ASSERT_TRUE(r[1] >= r[0]);
+    TEST_ASSERT_TRUE(r[N-1] >= r[N-2]);
+
+    ray_release(result);
+    ray_release(vec);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* MSD bucket sort, descending — same path, exercises the desc branch
+ * of radix_encode_fn that feeds the bucketed sort.  Smaller checks
+ * keep runtime moderate. */
+static test_result_t test_sort_msd_bucket_i64_desc(void) {
+    ray_heap_init();
+    ray_sym_init();
+
+    const int64_t N = 1000001;
+    ray_t* vec = ray_vec_new(RAY_I64, N);
+    int64_t* d = (int64_t*)ray_data(vec);
+
+    /* Same big spread as asc test, different seed. */
+    const int64_t big = (int64_t)1 << 56;
+    for (int64_t i = 0; i < N; i++) {
+        uint64_t m = (uint64_t)((i + 17) * 2246822519ULL);
+        d[i] = (int64_t)(m % (uint64_t)big);
+    }
+    vec->len = N;
+
+    uint8_t desc = 1;
+    ray_t* result = ray_sort(&vec, &desc, NULL, 1, N);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(ray_len(result), N);
+
+    const int64_t* r = (const int64_t*)ray_data(result);
+    int64_t prev = r[0];
+    for (int64_t i = 211; i < N; i += 211) {
+        TEST_ASSERT_FMT(r[i] <= prev,
+                        "msd desc out of order at %lld: %lld > %lld",
+                        (long long)i, (long long)r[i], (long long)prev);
+        prev = r[i];
+    }
+
+    ray_release(result);
+    ray_release(vec);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 /* ─── Entry table ────────────────────────────────────────────────── */
 
 const test_entry_t sort_entries[] = {
@@ -1073,5 +1480,23 @@ const test_entry_t sort_entries[] = {
     { "sort/u8_nulls_last_asc",         test_sort_u8_nulls_last_asc,    NULL, NULL },
     { "sort/u8_nulls_first_desc",       test_sort_u8_nulls_first_desc,  NULL, NULL },
     { "sort/bool_nulls_first",          test_sort_bool_nulls_first,     NULL, NULL },
+    /* top / bot — partial top-N / bottom-N happy paths.  Drive
+     * ray_top_fn / ray_bot_fn over numeric and SYM vectors with
+     * K<N, K=1, K=N to cover topk_indices_single (radix path) and
+     * topk_indices_cmp_single (SYM comparator-heap path). */
+    { "sort/top_i64_k_lt_n",            test_top_i64_k_lt_n,            NULL, NULL },
+    { "sort/top_i64_k_eq_one",          test_top_i64_k_eq_one,          NULL, NULL },
+    { "sort/bot_i64_k_lt_n",            test_bot_i64_k_lt_n,            NULL, NULL },
+    { "sort/top_f64_k_lt_n",            test_top_f64_k_lt_n,            NULL, NULL },
+    { "sort/bot_f64_k_lt_n",            test_bot_f64_k_lt_n,            NULL, NULL },
+    { "sort/top_i64_k_eq_n",            test_top_i64_k_eq_n,            NULL, NULL },
+    { "sort/bot_i64_k_eq_n",            test_bot_i64_k_eq_n,            NULL, NULL },
+    { "sort/top_sym_k_lt_n",            test_top_sym_k_lt_n,            NULL, NULL },
+    { "sort/bot_sym_k_lt_n",            test_bot_sym_k_lt_n,            NULL, NULL },
+    { "sort/top_sym_k_eq_n",            test_top_sym_k_eq_n,            NULL, NULL },
+    /* MSD bucket sort — 1M+ rows × 7-byte key range triggers the
+     * msd_bucket_sort_fn / bucket_lsb_sort path in msd_radix_sort_run. */
+    { "sort/msd_bucket_i64_asc",        test_sort_msd_bucket_i64,       NULL, NULL },
+    { "sort/msd_bucket_i64_desc",       test_sort_msd_bucket_i64_desc,  NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };

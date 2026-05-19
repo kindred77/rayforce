@@ -1,0 +1,129 @@
+;; Happy-path coverage for the HOF wrapper dispatchers in
+;; src/ops/collection.c:
+;;     ray_pmap_fn       → forwards to ray_map_fn
+;;     ray_fold_left_fn  → forwards to ray_fold_fn
+;;     ray_scan_left_fn  → forwards to ray_scan_fn
+;;
+;; Existing test/rfl/hof/{pmap,fold,scan,right,map,filter,apply,lambda}.rfl
+;; exercise the inner ops directly.  This file specifically drives each
+;; *public-API wrapper* across I64 / F64 / mixed-type inputs and verifies
+;; result values, lengths, and the wrapper-equals-inner-op invariant.
+
+;; ─────────────────────────────────────────────────────────────────
+;; pmap — parallel map wrapper (ray_pmap_fn)
+;; ─────────────────────────────────────────────────────────────────
+
+;; I64 happy path — small list, lambda
+(pmap (fn [x] (* x 2)) [1 2 3 4 5]) -- [2 4 6 8 10]
+(pmap (fn [x] (+ x 1)) [10 20 30]) -- [11 21 31]
+
+;; I64 happy path — builtin verbs as fn
+(pmap neg [1 2 3 4]) -- [-1 -2 -3 -4]
+(pmap abs [-3 -2 -1 0 1 2 3]) -- [3 2 1 0 1 2 3]
+
+;; F64 happy path
+(pmap (fn [x] (* x 2.0)) [1.5 2.5 3.5]) -- [3.0 5.0 7.0]
+(pmap (fn [x] (+ x 0.5)) [1.0 2.0 3.0]) -- [1.5 2.5 3.5]
+
+;; Mixed-type coercion — I64 list with F64 lambda promotes result
+(pmap (fn [x] (* x 1.5)) [2 4 6]) -- [3.0 6.0 9.0]
+
+;; Large list — force the parallel-dispatch path (if thresholded)
+(set BIG (til 1000))
+(count (pmap (fn [x] (+ x 1)) BIG)) -- 1000
+(sum (pmap (fn [x] (+ x 1)) BIG)) -- (+ 1000 (sum BIG))
+
+;; Wrapper equivalence: pmap == map on the same input
+(set L (rand 200 500))
+(pmap (fn [x] (* x 2)) L) -- (map (fn [x] (* x 2)) L)
+(pmap neg L) -- (map neg L)
+
+;; Result type/count invariants
+(count (pmap (fn [x] x) [1 2 3 4 5])) -- 5
+(count (pmap (fn [x] (* x x)) (til 50))) -- 50
+
+;; ─────────────────────────────────────────────────────────────────
+;; fold-left — left-associative fold wrapper (ray_fold_left_fn)
+;; ─────────────────────────────────────────────────────────────────
+
+;; I64 happy path — + with seed 0 (sum)
+(fold-left + 0 [1 2 3 4 5]) -- 15
+(fold-left + 0 [10 20 30 40]) -- 100
+
+;; I64 happy path — * with seed 1 (product)
+(fold-left * 1 [1 2 3 4]) -- 24
+(fold-left * 1 [2 3 5]) -- 30
+
+;; F64 happy path — sum and product
+(fold-left + 0.0 [1.5 2.5 3.0]) -- 7.0
+(fold-left * 1.0 [2.0 0.5 4.0]) -- 4.0
+
+;; Mixed-type coercion — I64 seed + F64 list
+(fold-left + 0 [1.5 2.5 3.0]) -- 7.0
+
+;; Lambda fn — explicit binary lambda
+(fold-left (fn [a b] (+ a b)) 0 [1 2 3 4]) -- 10
+(fold-left (fn [a b] (* a b)) 1 [2 3 4]) -- 24
+
+;; Non-associative op (subtraction) — left-fold is well-defined:
+;; (((0-1)-2)-3)-4 = -10
+(fold-left - 0 [1 2 3 4]) -- -10
+
+;; Empty list + seed returns seed unchanged
+(fold-left + 42 []) -- 42
+(fold-left + 0.0 []) -- 0.0
+
+;; 2-arg form (no seed) uses first element as initial accumulator
+(fold-left + [1 2 3 4 5]) -- 15
+(fold-left * [1 2 3 4]) -- 24
+(fold-left + [10]) -- 10
+
+;; Wrapper equivalence: fold-left == fold on same inputs
+(set V (rand 50 100))
+(fold-left + 0 V) -- (fold + 0 V)
+(fold-left + V) -- (fold + V)
+(fold-left * 1 [2 3 4 5]) -- (fold * 1 [2 3 4 5])
+
+;; fold-left + 0 V equals (sum V)
+(fold-left + 0 V) -- (sum V)
+
+;; ─────────────────────────────────────────────────────────────────
+;; scan-left — left-prefix scan wrapper (ray_scan_left_fn)
+;; ─────────────────────────────────────────────────────────────────
+
+;; I64 happy path — prefix sums
+(scan-left + [1 2 3 4]) -- [1 3 6 10]
+(scan-left + [1 2 3 4 5]) -- [1 3 6 10 15]
+
+;; I64 happy path — prefix products
+(scan-left * [1 2 3 4]) -- [1 2 6 24]
+(scan-left * [2 3 4]) -- [2 6 24]
+
+;; F64 happy path
+(scan-left + [1.0 2.0 3.0]) -- [1.0 3.0 6.0]
+(scan-left * [1.0 2.0 3.0 4.0]) -- [1.0 2.0 6.0 24.0]
+
+;; Singleton — scan of one element is itself
+(scan-left + [42]) -- [42]
+(scan-left * [7]) -- [7]
+
+;; Lambda fn
+(scan-left (fn [a b] (+ a b)) [1 2 3 4]) -- [1 3 6 10]
+
+;; Length preserved (count invariant)
+(set W (rand 50 100))
+(count W) -- (count (scan-left + W))
+(count (scan-left * [1 2 3 4 5])) -- 5
+
+;; last(scan-left + v) equals (fold + 0 v) when v non-empty
+(last (scan-left + [1 2 3 4 5])) -- 15
+(last (scan-left + W)) -- (fold + 0 W)
+
+;; first(scan-left f v) equals v[0]
+(first (scan-left + [7 1 2 3])) -- 7
+(first (scan-left * [9 2 3])) -- 9
+
+;; Wrapper equivalence: scan-left == scan on same inputs
+(scan-left + [1 2 3 4 5]) -- (scan + [1 2 3 4 5])
+(scan-left * [1 2 3 4]) -- (scan * [1 2 3 4])
+(scan-left + W) -- (scan + W)
