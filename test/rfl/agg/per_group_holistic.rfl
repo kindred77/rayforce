@@ -1,0 +1,316 @@
+;; ════════════════════════════════════════════════════════════════════
+;; Per-group holistic aggregators in src/ops/group.c.
+;;
+;; Holistic aggregators (med/median, top/bot K, var/var_pop/stddev/
+;; stddev_pop) cannot be merged from a partial-row layout the way
+;; sum/count/min/max can — each group's full payload must be visible
+;; before the answer materialises.  The kernels under test:
+;;
+;;   - ray_median_per_group_buf : bucket-scatter + quickselect per group
+;;   - ray_topk_per_group_buf   : bounded heap per group (K parameter)
+;;   - OP_VAR / OP_STDDEV (and _pop) per-group : single-pass sum + sumsq
+;;     accumulator, finalised post-radix from off_sumsq slot
+;;
+;; Existing tests already cover the row-form (top/bot K with a single
+;; OP_SCAN key + agg, no where) and the count_distinct / pearson_corr
+;; paths.  This file targets the *generic per-group* code path —
+;; specifically the eval-level scatter that runs when:
+;;
+;;   - the agg is med/var/stddev/stddev_pop/var_pop (any per-group),
+;;   - multiple aggregators in one select share the same group key,
+;;   - top/bot K against a SYM key (falls through to OP_TOP_N path).
+;;
+;; All assertions are happy-path; any genuine wrong-output or domain
+;; error is left visible (per CRITICAL RULE) — none observed in this
+;; round.
+;; ════════════════════════════════════════════════════════════════════
+
+
+;; ─── median per group: I64 value, I64 key ───────────────────────────
+;;   g=0 → [10 30 20 50 40] → median 30.0
+;;   g=1 → [5 15]           → median 10.0  (avg of 5, 15)
+;;   g=2 → [100]            → median 100.0  (1-element group)
+(set Tmed (table [g v] (list (as 'I64 [0 0 0 0 0 1 1 2]) (as 'I64 [10 30 20 50 40 5 15 100]))))
+(count (select {m: (med v) by: g from: Tmed})) -- 3
+(sum (at (select {m: (med v) by: g from: Tmed}) 'm)) -- 140.0
+(type (at (select {m: (med v) by: g from: Tmed}) 'm)) -- 'F64
+
+
+;; ─── median per group: F64 value ────────────────────────────────────
+;;   g=0 → [1.5 2.5 3.5 4.5]  → 3.0
+;;   g=1 → [10.0 20.0 30.0]   → 20.0
+;;   g=2 → [7.5 7.5 7.5 7.5]  → 7.5
+(set Tmedf (table [g v] (list (as 'I64 [0 0 0 0 1 1 1 2 2 2 2]) (as 'F64 [1.5 2.5 3.5 4.5 10.0 20.0 30.0 7.5 7.5 7.5 7.5]))))
+(count (select {m: (med v) by: g from: Tmedf})) -- 3
+(sum (at (select {m: (med v) by: g from: Tmedf}) 'm)) -- 30.5
+(type (at (select {m: (med v) by: g from: Tmedf}) 'm)) -- 'F64
+
+
+;; ─── median per group: narrow integer (I32) ─────────────────────────
+;;   g=0 → [1 2 3 4 5]   → 3.0
+;;   g=1 → [10 20 30]    → 20.0
+(set Tmedi32 (table [g v] (list (as 'I64 [0 0 0 0 0 1 1 1]) (as 'I32 [1 2 3 4 5 10 20 30]))))
+(count (select {m: (med v) by: g from: Tmedi32})) -- 2
+(sum (at (select {m: (med v) by: g from: Tmedi32}) 'm)) -- 23.0
+
+
+;; ─── median per group: multi-key SYM ────────────────────────────────
+;;
+;; Multi-key by-clause forces the eval-level group path (DAG fast
+;; scatter is single-key).  Mirrors canonical_h2o q6:
+;;   (A,X) → [10]      → 10
+;;   (A,Y) → [20, 60]  → 40
+;;   (B,X) → [30, 50]  → 40
+;;   (B,Y) → [40]      → 40
+;;   sum 130.0
+(set Tmm (table [id1 id2 v] (list [A A B B B A] [X Y X Y X Y] (as 'F64 [10.0 20.0 30.0 40.0 50.0 60.0]))))
+(count (select {m: (med v) by: [id1 id2] from: Tmm})) -- 4
+(sum (at (select {m: (med v) by: [id1 id2] from: Tmm}) 'm)) -- 130.0
+
+
+;; ─── top-K / bot-K per group via SYM key (LIST-cell path) ───────────
+;;
+;; SYM keys fall through the row-form gate (rowform_topk owns the
+;; non-SYM path); this exercises the OP_TOP_N per-group cell path
+;; backed by ray_topk_per_group_buf.  Result is a LIST<vec> column.
+;;
+;;   A → v={3,1,5}      top-2 = [5,3], bot-2 = [1,3]
+;;   B → v={2,7}        top-2 = [7,2], bot-2 = [2,7]
+;;   C → v={4,9,6,8}    top-2 = [9,8], bot-2 = [4,6]
+(set Ttop (table [k v] (list [A A A B B C C C C] (as 'I64 [3 1 5 2 7 4 9 6 8]))))
+(count (select {t: (top v 2) by: k from: Ttop})) -- 3
+(count (select {b: (bot v 2) by: k from: Ttop})) -- 3
+;; cell-wise counts: top-2 cell sizes = min(3,2)+min(2,2)+min(4,2) = 6
+(sum (map count (at (select {t: (top v 2) by: k from: Ttop}) 't))) -- 6
+;; total of all top-2 elements across cells (flatten via raze, then sum):
+;; (5+3)+(7+2)+(9+8) = 34
+(sum (raze (at (select {t: (top v 2) by: k from: Ttop}) 't))) -- 34
+;; bot-2 sum across all cells = (1+3)+(2+7)+(4+6) = 23
+(sum (raze (at (select {b: (bot v 2) by: k from: Ttop}) 'b))) -- 23
+
+
+;; ─── top-K=1 per group (degenerates to per-group max via LIST-cell) ──
+;; sum across cells == sum of per-group max = 5 + 7 + 9 = 21; bot = 1 + 2 + 4 = 7.
+(sum (raze (at (select {t: (top v 1) by: k from: Ttop}) 't))) -- 21
+(sum (raze (at (select {b: (bot v 1) by: k from: Ttop}) 'b))) -- 7
+
+
+;; ─── top-K=N (K >= group size): cells cap at group size, no padding ──
+;; K=4: group A 3 elts, group B 2 elts, group C 4 elts; total 9; sum 45.
+(sum (map count (at (select {t: (top v 4) by: k from: Ttop}) 't))) -- 9
+(sum (raze (at (select {t: (top v 4) by: k from: Ttop}) 't))) -- 45
+
+
+;; ─── top-K per group with F64 value (cell preserves type) ───────────
+(set Ttopf (table [k v] (list [A A A B B C C C C] (as 'F64 [3.5 1.5 5.5 2.5 7.5 4.5 9.5 6.5 8.5]))))
+(count (select {t: (top v 2) by: k from: Ttopf})) -- 3
+(type (at (at (select {t: (top v 2) by: k from: Ttopf}) 't) 0)) -- 'F64
+;; top-2 sum = (5.5+3.5) + (7.5+2.5) + (9.5+8.5) = 9 + 10 + 18 = 37.0
+(sum (raze (at (select {t: (top v 2) by: k from: Ttopf}) 't))) -- 37.0
+
+
+;; ─── variance / stddev per group: canonical Wikipedia fixture ───────
+;; Two copies of [2 4 4 4 5 5 7 9] under two group keys.  Per-group:
+;;   pop_var      = 4.0   → sum_g 8.0
+;;   pop_stddev   = 2.0   → sum_g 4.0
+;;   sample_var   = 32/7  → sum_g 64/7 ≈ 9.142857
+;;   sample_stddev= √(32/7) → sum_g 2 * √(32/7) ≈ 4.276179
+(set Tvar (table [g v] (list (as 'I64 [0 0 0 0 0 0 0 0 1 1 1 1 1 1 1 1]) (as 'I64 [2 4 4 4 5 5 7 9 2 4 4 4 5 5 7 9]))))
+(count (select {v: (var_pop v) by: g from: Tvar})) -- 2
+(count (select {v: (stddev_pop v) by: g from: Tvar})) -- 2
+(count (select {v: (var v) by: g from: Tvar})) -- 2
+(count (select {v: (stddev v) by: g from: Tvar})) -- 2
+
+;; Population variance / stddev — exact integer answers.
+(sum (at (select {v: (var_pop v) by: g from: Tvar}) 'v))    -- 8.0
+(sum (at (select {v: (stddev_pop v) by: g from: Tvar}) 'v)) -- 4.0
+;; Asymmetry: scalar `dev` aliases stddev_pop (ray_stddev_pop_fn at
+;; agg.c:625-628), but in a select-by, query.c:316 maps `dev` →
+;; OP_STDDEV (sample), NOT OP_STDDEV_POP.  Per-group `dev` therefore
+;; equals per-group sample stddev — sum across 2 groups = 2 * √(32/7).
+;; (Locking this in: changing the planner mapping would surface as a
+;; failing assertion here.)
+(< (abs (- (sum (at (select {v: (dev v) by: g from: Tvar}) 'v)) (* 2.0 2.138089935299395))) 0.000001) -- true
+;; Sanity: stddev_pop (explicit) sums to 4.0 (= 2 * 2.0).
+(sum (at (select {v: (stddev_pop v) by: g from: Tvar}) 'v)) -- 4.0
+;; Per-group dev != per-group stddev_pop (because of the asymmetry):
+(< (abs (- (sum (at (select {v: (dev v) by: g from: Tvar}) 'v)) (sum (at (select {v: (stddev_pop v) by: g from: Tvar}) 'v)))) 0.001) -- false
+
+;; Sample variance / stddev — fp tolerance.
+(< (abs (- (sum (at (select {v: (var v) by: g from: Tvar}) 'v)) (* 2.0 4.571428571428571))) 0.000001) -- true
+(< (abs (- (sum (at (select {v: (stddev v) by: g from: Tvar}) 'v)) (* 2.0 2.138089935299395))) 0.000001) -- true
+
+;; Result column type is F64 for every variant.
+(type (at (select {v: (var v) by: g from: Tvar}) 'v))        -- 'F64
+(type (at (select {v: (var_pop v) by: g from: Tvar}) 'v))    -- 'F64
+(type (at (select {v: (stddev v) by: g from: Tvar}) 'v))     -- 'F64
+(type (at (select {v: (stddev_pop v) by: g from: Tvar}) 'v)) -- 'F64
+
+
+;; ─── variance / stddev per group: F64 source ────────────────────────
+(set TvarF (table [g v] (list (as 'I64 [0 0 0 0 0 0 0 0 1 1 1 1 1 1 1 1]) (as 'F64 [2.0 4.0 4.0 4.0 5.0 5.0 7.0 9.0 2.0 4.0 4.0 4.0 5.0 5.0 7.0 9.0]))))
+(sum (at (select {v: (var_pop v) by: g from: TvarF}) 'v))    -- 8.0
+(sum (at (select {v: (stddev_pop v) by: g from: TvarF}) 'v)) -- 4.0
+
+
+;; ─── variance per group: constant group → 0.0 ───────────────────────
+(set Tconst (table [g v] (list (as 'I64 [0 0 0 0 1 1 1 1]) (as 'I64 [7 7 7 7 13 13 13 13]))))
+(sum (at (select {v: (var_pop v) by: g from: Tconst}) 'v))    -- 0.0
+(sum (at (select {v: (var v) by: g from: Tconst}) 'v))        -- 0.0
+(sum (at (select {v: (stddev_pop v) by: g from: Tconst}) 'v)) -- 0.0
+(sum (at (select {v: (stddev v) by: g from: Tconst}) 'v))     -- 0.0
+
+
+;; ─── variance per group: 1-element groups (pop_* = 0, sample_* = null) ──
+;;
+;; The finaliser branches on cnt <= 1 for OP_VAR/OP_STDDEV (sample)
+;; and cnt <= 0 for the _pop variants.  A single-element group thus
+;; produces 0.0 for pop_* and NULL_F64 for sample.  sum-with-nulls
+;; folds nulls to identity (0.0).
+(set T1 (table [g v] (list (as 'I64 [0 1 2]) (as 'I64 [10 20 30]))))
+(count (select {v: (var_pop v) by: g from: T1})) -- 3
+(sum (at (select {v: (var_pop v) by: g from: T1}) 'v))    -- 0.0
+(sum (at (select {v: (stddev_pop v) by: g from: T1}) 'v)) -- 0.0
+(sum (at (select {v: (var v) by: g from: T1}) 'v))    -- 0.0
+(sum (at (select {v: (stddev v) by: g from: T1}) 'v)) -- 0.0
+
+
+;; ─── multi-agg in one query: med + var_pop + count ──────────────────
+;;
+;; per group (same Tvar fixture):
+;;   med([2,4,4,4,5,5,7,9]) = 4.5 (avg of 4,5)
+;;   var_pop = 4.0
+;;   count = 8
+(set Tmany (select {m: (med v) v: (var_pop v) c: (count v) by: g from: Tvar}))
+(count Tmany) -- 2
+(sum (at Tmany 'm)) -- 9.0
+(sum (at Tmany 'v)) -- 8.0
+(sum (at Tmany 'c)) -- 16
+
+
+;; ─── multi-agg: med + stddev (single key, generic eval path) ────────
+(set Tms (select {m: (med v) s: (stddev v) by: g from: Tvar}))
+(count Tms) -- 2
+(sum (at Tms 'm)) -- 9.0
+(< (abs (- (sum (at Tms 's)) (* 2.0 2.138089935299395))) 0.000001) -- true
+
+
+;; ─── multi-agg: med + stddev with 2-key SYM by-clause (fast path) ───
+;;
+;; Hits the query.c:6032 (med, stddev) 2-key gate.  Each cell holds 4
+;; values offset by group:
+;;   (A,X) → 10 20 30 40   median = 25  pop_var = 125 pop_stddev = √125
+;;   (A,Y) → 11 21 31 41   median = 26  pop_var = 125 pop_stddev = √125
+;;   (B,X) → 12 22 32 42   median = 27  pop_var = 125 pop_stddev = √125
+;;   (B,Y) → 13 23 33 43   median = 28  pop_var = 125 pop_stddev = √125
+;; sum of medians = 25+26+27+28 = 106.0
+;; sample stddev per cell = sqrt(2000/12) ≈ 12.909944; sum = 4 * that.
+(set Tms2 (table [id1 id2 v] (list [A A A A A A A A B B B B B B B B] [X X X X Y Y Y Y X X X X Y Y Y Y] (as 'F64 [10.0 20.0 30.0 40.0 11.0 21.0 31.0 41.0 12.0 22.0 32.0 42.0 13.0 23.0 33.0 43.0]))))
+(set Tms2r (select {m: (med v) s: (stddev v) by: [id1 id2] from: Tms2}))
+(count Tms2r) -- 4
+(sum (at Tms2r 'm)) -- 106.0
+(< (abs (- (sum (at Tms2r 's)) (* 4.0 12.909944487358056))) 0.000001) -- true
+
+
+;; ─── multi-agg 3-way: med + stddev + count (ms_with_count path) ─────
+(set Tms3 (select {m: (med v) s: (stddev v) c: (count v) by: [id1 id2] from: Tms2}))
+(count Tms3) -- 4
+(sum (at Tms3 'm)) -- 106.0
+(sum (at Tms3 'c)) -- 16
+
+
+;; ─── narrow-int median per group preserves accuracy ─────────────────
+;; I16 path:
+;;   g=0 → [100 200 300 400 500] → 300
+;;   g=1 → [10 20]               → 15
+;;   sum 315.0
+(set Tmedi16 (table [g v] (list (as 'I64 [0 0 0 0 0 1 1]) (as 'I16 [100 200 300 400 500 10 20]))))
+(sum (at (select {m: (med v) by: g from: Tmedi16}) 'm)) -- 315.0
+
+;; U8 path:
+;;   g=0 → [10 20 30] → 20; g=1 → [40 50 60] → 50; sum 70.
+(set Tmedu8 (table [g v] (list (as 'I64 [0 0 0 1 1 1]) (as 'U8 [10 20 30 40 50 60]))))
+(sum (at (select {m: (med v) by: g from: Tmedu8}) 'm)) -- 70.0
+
+
+;; ─── parallel threshold: ray_median_per_group_buf ───────────────────
+;;
+;; Threshold (group.c:1377): par=true iff n_groups>=8 AND total>=4096.
+;; N=8192 rows with 16 groups (each 512 elements).  For group g in
+;; [0..15] values are { g, g+16, g+32, …, g+511*16 } — arithmetic
+;; progression.  Median per cell = (first+last)/2 = g + 511*8 = g + 4088.
+;; sum over 16 groups: 16*4088 + (0+1+…+15) = 65408 + 120 = 65528.
+(set Nbig 8192)
+(set Tbig (table [g v] (list (% (til Nbig) 16) (til Nbig))))
+(count (select {m: (med v) by: g from: Tbig})) -- 16
+(sum (at (select {m: (med v) by: g from: Tbig}) 'm)) -- 65528.0
+
+
+;; ─── parallel threshold: var_pop / stddev_pop ───────────────────────
+;;
+;; Same Tbig.  Group g is AP { g, g+16, …, g+511*16 }, n=512, d=16.
+;; var_pop = d² (n² - 1) / 12 = 256 * 262143 / 12 = 5,592,384.
+;; Sum over 16 groups = 16 * 5592384 = 89,478,144.
+(< (abs (- (sum (at (select {v: (var_pop v) by: g from: Tbig}) 'v)) 89478144.0)) 1.0) -- true
+;; Pop stddev = sqrt(5592384); * 16.
+(< (abs (- (sum (at (select {v: (stddev_pop v) by: g from: Tbig}) 'v)) (* 16.0 (sqrt 5592384.0)))) 0.001) -- true
+
+
+;; ─── empty-input edge case: degenerate group (after WHERE) ──────────
+;;
+;; WHERE clause filters out ALL rows of group 1; group 0 keeps
+;; [10 20 30 40 50] → med=30, var_pop=200.
+(set Twh (table [g v] (list (as 'I64 [0 0 0 0 0 1 1 1]) (as 'I64 [10 20 30 40 50 999 999 999]))))
+(count (select {m: (med v) by: g from: Twh where: (< v 100)})) -- 1
+(sum (at (select {m: (med v) by: g from: Twh where: (< v 100)}) 'm))    -- 30.0
+(sum (at (select {v: (var_pop v) by: g from: Twh where: (< v 100)}) 'v)) -- 200.0
+
+
+;; ─── multi-key holistic, non-SYM I64 keys (generic eval path) ───────
+;;
+;; Forces the eval-level multi-key group path with numeric (non-SYM)
+;; keys and multi-agg holistic shapes.
+;;   (0,0) → [5 5]          → med 5,   pop_var 0
+;;   (0,1) → [10]           → med 10,  pop_var 0
+;;   (1,0) → [20 40]        → med 30,  pop_var 100   (Σ(x-30)²/2)
+;;   (1,1) → [60 80 100 60] → med 70   (avg of 60,80 after sort 60,60,80,100)
+;;                            mean = 75, pop_var = (225+25+625+225)/4 = 275
+;;   sum med = 5 + 10 + 30 + 70 = 115; sum pop_var = 0+0+100+275 = 375
+(set Tmmi (table [g h v] (list (as 'I64 [0 0 0 1 1 1 1 1 1]) (as 'I64 [0 0 1 0 0 1 1 1 1]) (as 'I64 [5 5 10 20 40 60 80 100 60]))))
+(count (select {m: (med v) by: [g h] from: Tmmi})) -- 4
+(sum (at (select {m: (med v) by: [g h] from: Tmmi}) 'm)) -- 115.0
+(sum (at (select {v: (var_pop v) by: [g h] from: Tmmi}) 'v)) -- 375.0
+
+
+;; ─── ties: median of duplicate-only group equals that value ─────────
+(set Ttie (table [g v] (list (as 'I64 [0 0 0 0 1 1 1 1]) (as 'I64 [7 7 7 7 13 13 13 13]))))
+(sum (at (select {m: (med v) by: g from: Ttie}) 'm)) -- 20.0
+
+
+;; ─── median of mixed-sign values ────────────────────────────────────
+;; g=0 → [-5 -1 0 1 5] → 0; g=1 → [-10 -5 0 5 10] → 0; sum 0.
+(set Tneg (table [g v] (list (as 'I64 [0 0 0 0 0 1 1 1 1 1]) (as 'I64 [-5 -1 0 1 5 -10 -5 0 5 10]))))
+(sum (at (select {m: (med v) by: g from: Tneg}) 'm)) -- 0.0
+
+
+;; ─── top-K per group: K=1 with many small SYM groups (LIST-cell) ────
+;; 5 groups; each 2 elements.  Max per group = idx*10 + 1.
+;; Sum of maxes = 1+11+21+31+41 = 105; sum of mins = 0+10+20+30+40 = 100.
+(set Tk1 (table [k v] (list [A A B B C C D D E E] (as 'I64 [0 1 10 11 20 21 30 31 40 41]))))
+(count (select {t: (top v 1) by: k from: Tk1})) -- 5
+(sum (raze (at (select {t: (top v 1) by: k from: Tk1}) 't))) -- 105
+(sum (raze (at (select {b: (bot v 1) by: k from: Tk1}) 'b))) -- 100
+
+
+;; ─── algebraic invariants: positivity + var >= var_pop ──────────────
+(set Trn (table [g v] (list (% (til 800) 8) (til 800))))
+(set Vp   (sum (at (select {v: (var v) by: g from: Trn}) 'v)))
+(set Sp   (sum (at (select {s: (stddev v) by: g from: Trn}) 's)))
+(set Vpop (sum (at (select {v: (var_pop v) by: g from: Trn}) 'v)))
+(set Spop (sum (at (select {s: (stddev_pop v) by: g from: Trn}) 's)))
+(> Vp 0.0) -- true
+(> Sp 0.0) -- true
+(>= Vpop 0.0) -- true
+(>= Spop 0.0) -- true
+;; sample variance >= pop variance per group (for n>=2) → sums obey too.
+(>= Vp Vpop) -- true
