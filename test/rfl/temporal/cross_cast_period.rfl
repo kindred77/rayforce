@@ -1,0 +1,226 @@
+;; Happy-path coverage for non-extract paths in src/ops/temporal.c:
+;;   - ray_temporal_truncate (atom + vector) reached via (date X) / (time X)
+;;     where X is a DATE / TIME / TIMESTAMP value or vector.  These are the
+;;     overloaded `date` / `time` unary builtins registered in src/lang/eval.c
+;;     -> src/ops/temporal.c:ray_date_clock_fn / ray_time_clock_fn.
+;;   - Cross-temporal type casts via (as 'TYPE x): DATE <-> TIME <-> TIMESTAMP.
+;;     These exercise the temporal-unit logic in src/ops/builtins.c (the
+;;     ts_days_floor / ts_ns_in_day helpers above the cast-vector worker)
+;;     plus the day/sub-day projection used by ray_temporal_truncate.
+;;   - Day-of-week / day-of-year for reference dates spanning leap and
+;;     non-leap years, century rules, and the pre-2000 (negative
+;;     days_since_2000) branch.  Sister coverage to extract.rfl but with a
+;;     fuller weekly+yearly grid pinned to known Gregorian calendar values.
+;;
+;; Prior rounds (extract.rfl, arith.rfl, date.rfl, ...) cover extract
+;; helpers and DATE arithmetic; this file fills the truncate / cross-cast
+;; / boundary-DOW gap.
+;;
+;; NB: rfl runner requires each `lhs -- rhs` assertion to fit on one line
+;; (test/main.c:203-205).  Long vector cases below are intentionally wide.
+
+;; ─────────────────────────── ray_temporal_truncate — atom paths ───────────
+;; (date <ts>)  → RAY_TIMESTAMP truncated to day boundary.
+;;   us = ns/1000 floor; bucket = USEC_PER_DAY; r = us % bucket; out_us = us - r
+(date 2024.03.15D12:34:56.789000000) -- 2024.03.15D00:00:00.000000000
+(date 2024.03.15D00:00:00.000000001) -- 2024.03.15D00:00:00.000000000
+(date 2024.03.15D23:59:59.999999999) -- 2024.03.15D00:00:00.000000000
+;; epoch boundary
+(date 2000.01.01D00:00:00.000000000) -- 2000.01.01D00:00:00.000000000
+(date 2000.01.01D12:00:00.000000000) -- 2000.01.01D00:00:00.000000000
+;; pre-epoch — floor toward -infinity, NOT truncate toward zero
+(date 1999.12.31D12:00:00.000000000) -- 1999.12.31D00:00:00.000000000
+(date 1999.12.31D00:00:00.000000001) -- 1999.12.31D00:00:00.000000000
+;; leap day
+(date 2024.02.29D08:30:15.500000000) -- 2024.02.29D00:00:00.000000000
+;; Y2K boundary (2000 is leap, div 400)
+(date 2000.02.29D23:59:59.000000000) -- 2000.02.29D00:00:00.000000000
+
+;; (date <date>) — DATE atom routes through truncate; bucket=DAY, r=0.
+;; Result is a TIMESTAMP at midnight (semantic equivalence with input day).
+(date 2024.07.04) -- 2024.07.04D00:00:00.000000000
+(date 1970.01.01) -- 1970.01.01D00:00:00.000000000
+(date 1999.12.31) -- 1999.12.31D00:00:00.000000000
+
+;; (date <time>) — TIME atom => stored ms since midnight => us within day,
+;; floor to day boundary => 0 us => 2000.01.01D00:00:00.
+(date 00:00:00.000) -- 2000.01.01D00:00:00.000000000
+(date 12:34:56.789) -- 2000.01.01D00:00:00.000000000
+(date 23:59:59.999) -- 2000.01.01D00:00:00.000000000
+
+;; ─────────────────────── (time X) — second-bucket truncate ────────────────
+;; (time <ts>) — strip sub-second, keep day component.
+(time 2024.03.15D12:34:56.789000000) -- 2024.03.15D12:34:56.000000000
+(time 2024.03.15D00:00:00.999999999) -- 2024.03.15D00:00:00.000000000
+(time 2024.03.15D23:59:59.000000001) -- 2024.03.15D23:59:59.000000000
+;; epoch boundary
+(time 2000.01.01D00:00:00.000000000) -- 2000.01.01D00:00:00.000000000
+;; pre-epoch — second-bucket floor toward -infinity
+(time 1999.12.31D23:59:59.999999999) -- 1999.12.31D23:59:59.000000000
+
+;; (time <date>) — DATE atom => midnight => already at second boundary.
+(time 2024.07.04) -- 2024.07.04D00:00:00.000000000
+(time 1999.12.31) -- 1999.12.31D00:00:00.000000000
+
+;; (time <time>) — TIME atom (ms since midnight) => truncate to second.
+;;   ms→us = ms*1000, % SEC=1e6 us, floor.
+(time 12:34:56.000) -- 2000.01.01D12:34:56.000000000
+(time 12:34:56.789) -- 2000.01.01D12:34:56.000000000
+(time 00:00:00.000) -- 2000.01.01D00:00:00.000000000
+(time 23:59:59.999) -- 2000.01.01D23:59:59.000000000
+
+;; ─────────────────────── truncate — vector paths ──────────────────────────
+;; TIMESTAMP vector → (date V) hits the int64 vector branch of
+;; ray_temporal_truncate (t == RAY_TIMESTAMP, !src_has_nulls).
+(date [2024.03.15D12:34:56.000000000 2024.07.04D08:00:00.000000000 2024.12.31D23:59:59.999999999]) -- [2024.03.15D00:00:00.000000000 2024.07.04D00:00:00.000000000 2024.12.31D00:00:00.000000000]
+
+;; DATE vector → (date V) hits the int32 branch (t == RAY_DATE).
+(date [2024.01.01 2024.02.29 2024.12.31 1999.12.31]) -- [2024.01.01D00:00:00.000000000 2024.02.29D00:00:00.000000000 2024.12.31D00:00:00.000000000 1999.12.31D00:00:00.000000000]
+
+;; TIME vector → (date V) hits the int32 branch (t == RAY_TIME).  All entries
+;; floor to the 2000-01-01 midnight (the rayforce epoch).
+(date [00:00:00.000 12:34:56.789 23:59:59.999]) -- [2000.01.01D00:00:00.000000000 2000.01.01D00:00:00.000000000 2000.01.01D00:00:00.000000000]
+
+;; TIMESTAMP vector → (time V) — second-bucket variant of the int64 branch.
+(time [2024.03.15D12:34:56.789000000 2024.07.04D08:00:00.000000001 1999.12.31D23:59:59.999999999]) -- [2024.03.15D12:34:56.000000000 2024.07.04D08:00:00.000000000 1999.12.31D23:59:59.000000000]
+
+;; TIME vector → (time V) — int32 branch, second-bucket.
+(time [00:00:00.000 12:00:00.123 23:59:59.999]) -- [2000.01.01D00:00:00.000000000 2000.01.01D12:00:00.000000000 2000.01.01D23:59:59.000000000]
+
+;; ───────────────────── (as 'TYPE x) cross-temporal casts — atoms ──────────
+;; DATE → TIMESTAMP : days * NS_PER_DAY  (builtins.c:1512-1515).
+(as 'timestamp 2024.07.04) -- 2024.07.04D00:00:00.000000000
+(as 'timestamp 2000.01.01) -- 2000.01.01D00:00:00.000000000
+(as 'timestamp 1970.01.01) -- 1970.01.01D00:00:00.000000000
+(as 'timestamp 1999.12.31) -- 1999.12.31D00:00:00.000000000
+(as 'timestamp 2024.02.29) -- 2024.02.29D00:00:00.000000000
+
+;; TIMESTAMP → DATE : ts_days_floor (floor-div by NS_PER_DAY).
+(as 'date 2024.07.04D12:34:56.789000000) -- 2024.07.04
+(as 'date 2024.07.04D00:00:00.000000000) -- 2024.07.04
+(as 'date 1999.12.31D12:00:00.000000000) -- 1999.12.31
+(as 'date 2000.01.01D00:00:00.000000000) -- 2000.01.01
+;; Leap day round-trip via TIMESTAMP.
+(as 'date (as 'timestamp 2024.02.29)) -- 2024.02.29
+
+;; TIMESTAMP → TIME : ts_ns_in_day(ns) / 1_000_000 ms  (floor-mod within day).
+(as 'time 2024.07.04D12:34:56.000000000) -- 12:34:56.000
+(as 'time 2024.07.04D00:00:00.000000000) -- 00:00:00.000
+(as 'time 2024.07.04D23:59:59.999000000) -- 23:59:59.999
+;; Pre-2000 timestamp: floor-mod gives time-of-day, NOT a negative wrap.
+(as 'time 1999.12.31D23:59:59.999000000) -- 23:59:59.999
+(as 'time 1999.12.31D00:00:00.000000000) -- 00:00:00.000
+
+;; DATE → TIME : raw int32 (days) reinterpreted as TIME (ms-of-day).
+;; Documented direct passthrough in builtins.c:1472.
+;; epoch (days=0) survives as 0 ms / midnight.
+(as 'time 2000.01.01) -- 00:00:00.000
+
+;; TIME → DATE : raw int32 (ms) reinterpreted as DATE (days).
+;; 0 ms → 2000.01.01 (epoch day).
+(as 'date 00:00:00.000) -- 2000.01.01
+
+;; Identity casts — should return the same value via the "type already
+;; matches" fast paths (builtins.c:1431/1465/1504).
+(as 'date 2024.07.04) -- 2024.07.04
+(as 'time 12:34:56.789) -- 12:34:56.789
+(as 'timestamp 2024.07.04D12:34:56.789000000) -- 2024.07.04D12:34:56.789000000
+
+;; ───────────────────── (as 'TYPE x) cross-temporal casts — vectors ────────
+;; DATE vec → TIMESTAMP vec via cast_vec_numeric_fast (RAY_DATE→RAY_TIMESTAMP
+;; branch in cast_range_worker, builtins.c:869-872).
+(as 'timestamp [2024.01.01 2024.07.04 1999.12.31]) -- [2024.01.01D00:00:00.000000000 2024.07.04D00:00:00.000000000 1999.12.31D00:00:00.000000000]
+
+;; TIMESTAMP vec → DATE vec via cast_range_worker (builtins.c:873-878).
+(as 'date [2024.01.01D12:34:56.000000000 2024.07.04D00:00:00.000000000 1999.12.31D23:59:59.999000000]) -- [2024.01.01 2024.07.04 1999.12.31]
+
+;; TIMESTAMP vec → TIME vec via cast_range_worker (builtins.c:879-884) —
+;; ts_ns_in_day floor-mod / 1e6.
+(as 'time [2024.01.01D00:00:00.000000000 2024.07.04D12:34:56.789000000 1999.12.31D23:59:59.999000000]) -- [00:00:00.000 12:34:56.789 23:59:59.999]
+
+;; ───────────────────── (as 'TYPE str) string-form casts ───────────────────
+;; Catches builtins.c:1440-1456 (DATE string parser) and 1479-1495 (TIME
+;; string parser).  Already widely covered for TIMESTAMP in timestamp.rfl.
+(as 'date "2024.07.04")     -- 2024.07.04
+(as 'date "1999.12.31")     -- 1999.12.31
+(as 'date "2000.01.01")     -- 2000.01.01
+(as 'date "2024.02.29")     -- 2024.02.29
+(as 'time "12:34:56")       -- 12:34:56.000
+(as 'time "00:00:00")       -- 00:00:00.000
+(as 'time "23:59:59")       -- 23:59:59.000
+(as 'time "12:34:56.789")   -- 12:34:56.789
+
+;; ───────────────────── DOW reference grid ─────────────────────────────────
+;; rayforce convention: Mon=1 .. Sun=7  (temporal.c rte_extract_one DOW arm).
+;; Pinned against the Gregorian calendar by hand:
+;;   1970.01.01 = Thu, 2000.01.01 = Sat, 2024.02.29 = Thu, 2025.01.01 = Wed,
+;;   2099.12.31 = Thu, 2100.03.01 = Mon (2100 is NOT leap — century non-400).
+(dow 1970.01.01) -- 4
+(dow 2000.01.01) -- 6
+(dow 2024.02.29) -- 4
+(dow 2025.01.01) -- 3
+(dow 2099.12.31) -- 4
+(dow 2100.03.01) -- 1
+
+;; A full Mon→Sun cycle starting on 2024-01-08 (Mon).
+(dow [2024.01.08 2024.01.09 2024.01.10 2024.01.11 2024.01.12 2024.01.13 2024.01.14]) -- [1 2 3 4 5 6 7]
+
+;; Pre-epoch DOW — days_since_2000 < 0 path in ((days % 7) + 7 + 5) % 7 + 1.
+;; 1999.12.31 = Fri, 1999.12.27 = Mon, 1999.01.01 = Fri.
+(dow 1999.12.31) -- 5
+(dow 1999.12.27) -- 1
+(dow 1999.01.01) -- 5
+
+;; ───────────────────── DOY reference grid ─────────────────────────────────
+;; Non-leap (1999, 2025): Mar 1 = day 60, Dec 31 = day 365.
+;; Leap (2000, 2024): Mar 1 = day 61, Dec 31 = day 366.
+;; Century rule: 2100 is NOT leap — DOY 2100.03.01 = 60, 2100.12.31 = 365.
+(doy 1999.01.01) -- 1
+(doy 1999.03.01) -- 60
+(doy 1999.12.31) -- 365
+(doy 2000.01.01) -- 1
+(doy 2000.02.29) -- 60
+(doy 2000.03.01) -- 61
+(doy 2000.12.31) -- 366
+(doy 2025.03.01) -- 60
+(doy 2100.03.01) -- 60
+(doy 2100.12.31) -- 365
+
+;; ───────────────────── Cross-temporal compare ─────────────────────────────
+;; DATE atom == DATE atom, TIME atom == TIME atom, TIMESTAMP == TIMESTAMP.
+(== 2024.07.04 2024.07.04) -- true
+(== 12:34:56.000 12:34:56.000) -- true
+(== 2024.07.04D12:34:56.000000000 2024.07.04D12:34:56.000000000) -- true
+(< 1999.12.31 2000.01.01) -- true
+(< 1999.12.31D23:59:59.000000000 2000.01.01D00:00:00.000000000) -- true
+(> 23:59:59.999 00:00:00.000) -- true
+;; Ordering across an epoch boundary in vectors.
+(< [1999.12.31 2000.01.01 2024.07.04] [2000.01.01 2000.01.02 2024.07.05]) -- [true true true]
+
+;; ───────────────────── Round-trip invariants ──────────────────────────────
+;; DATE → TIMESTAMP → DATE is identity (no time-of-day component lost).
+(as 'date (as 'timestamp 2024.07.04)) -- 2024.07.04
+(as 'date (as 'timestamp 1999.12.31)) -- 1999.12.31
+(as 'date (as 'timestamp 2000.01.01)) -- 2000.01.01
+(as 'date (as 'timestamp 1970.01.01)) -- 1970.01.01
+
+;; TIMESTAMP → DATE drops time-of-day; re-casting to TIMESTAMP gives midnight.
+(as 'timestamp (as 'date 2024.07.04D12:34:56.789000000)) -- 2024.07.04D00:00:00.000000000
+(as 'timestamp (as 'date 1999.12.31D23:59:59.999000000)) -- 1999.12.31D00:00:00.000000000
+
+;; (date X) where X is already a midnight-aligned TIMESTAMP is identity.
+(date (as 'timestamp 2024.07.04)) -- 2024.07.04D00:00:00.000000000
+
+;; Day-component round trip — extracting after a date trunc reproduces
+;; the original calendar fields (truncate preserves them).
+(yyyy (date 2024.03.15D12:34:56.000000000)) -- 2024
+(mm   (date 2024.03.15D12:34:56.000000000)) -- 3
+(dd   (date 2024.03.15D12:34:56.000000000)) -- 15
+(hh   (date 2024.03.15D12:34:56.000000000)) -- 0
+(minute (date 2024.03.15D12:34:56.000000000)) -- 0
+(ss   (date 2024.03.15D12:34:56.000000000)) -- 0
+
+;; Time-component round trip — second truncation keeps hh/mm/ss, drops sub-s.
+(hh     (time 2024.03.15D12:34:56.789000000)) -- 12
+(minute (time 2024.03.15D12:34:56.789000000)) -- 34
+(ss     (time 2024.03.15D12:34:56.789000000)) -- 56
