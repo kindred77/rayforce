@@ -1,0 +1,116 @@
+;; Targeted parallel SYM-LIKE coverage for like_seen_fn / like_proj_fn.
+;;
+;; Both kernels are the worker bodies dispatched by ray_pool_dispatch
+;; when (a) N >= LIKE_PAR_MIN_ROWS_SYM (100_000) and (b) the SYM column
+;; type-attrs encode a particular width (RAY_SYM_W8/W16/W32/W64).
+;;
+;; Prior tests only exercised the W64 arm (dense) + W64 MIX rowsel
+;; branch.  This file targets the cold arms:
+;;
+;;   * W16 dense arm (string.c:160-167 / 281-288) — load CSV with <65k
+;;     unique syms; the post-load narrowing in csv.c:1395 rewrites the
+;;     column from W32 to W16 when max_id <= 65535.  Fresh runtime
+;;     starts with ~300 builtin syms, so a fixture with say 50 unique
+;;     syms keeps max_id well under 65535.
+;;   * W32 dense arm (string.c:168-175 / 289-296) — load CSV with
+;;     >65535 unique syms; max_id > 65535 keeps the column at W32 (no
+;;     narrowing below W32 — see csv.c:1394 short-circuit).
+;;   * RAY_SEL_ALL branch (string.c:129-132 / 251-254) — chain an
+;;     always-true conjunct (>= idx 0) before LIKE.  Conjunct sort
+;;     promotes the cheap (>=) ahead of LIKE; resulting rowsel marks
+;;     every 1024-row morsel as SEL_ALL.  Exercised on the W64 in-RFL
+;;     column for simplicity (already supported by `take`).
+;;
+;; W8 (max_id <= 255) is unreachable from RFL: the runtime registers
+;; ~250 builtin sym names at startup so max_id is already above 255
+;; before any user-defined sym is interned.  Documented for posterity.
+
+;; ─── Fixture A: W16-narrow SYM column, dense parallel path ───
+;; 200k rows, ~50 unique syms → max_id < 65535 → narrowed to W16.
+;; awk loop emits round-robin 50-sym cycle "s00..s49" for each row.
+(.sys.exec "rm -f rfl_strop_w16.csv") -- 0
+(.sys.exec "awk 'BEGIN{print \"id,sym\"; for(i=0;i<200000;i++) printf(\"%d,s%02d\\n\",i,i%50)}' > rfl_strop_w16.csv") -- 0
+(set TW16 (.csv.read [I64 SYMBOL] "rfl_strop_w16.csv"))
+(count TW16) -- 200000
+
+;; (like sym "...") on the SYM column triggers the 3-phase parallel
+;; pipeline (seen → resolve → proj).  Each call exercises:
+;;   - like_seen_fn dense W16 arm (lines 160-167)
+;;   - like_proj_fn dense W16 arm (lines 281-288)
+;;
+;; Pattern "s0*" matches s00..s09 — 10 of 50 syms, ~20% of 200k rows.
+(count (select {from: TW16 where: (like sym "s0*")})) -- 40000
+;; Pattern "s4*" matches s40..s49 — 10 of 50 syms, same 40000 rows.
+(count (select {from: TW16 where: (like sym "s4*")})) -- 40000
+;; Suffix pattern "*5" matches s05,s15,s25,s35,s45 — 5 syms, 20000 rows.
+(count (select {from: TW16 where: (like sym "*5")})) -- 20000
+;; Class pattern "s[12]*" — 20 of 50 syms, 80000 rows.  Forces the
+;; SHAPE_NONE general matcher per dict entry but the seen/proj kernels
+;; are the same width-typed loops.
+(count (select {from: TW16 where: (like sym "s[12]*")})) -- 80000
+
+;; ─── Fixture A2: W16 + selection-aware (SEL_ALL+MIX+NONE) ───
+;; ray_rowsel_init returns NULL for always-true predicates
+;; (rowsel.c:177-181), so always-true conjuncts collapse to no
+;; selection.  A partial conjunct retains a real rowsel with mixed
+;; segment flags: (< id 100000) splits at row 100000 → morsels 0..97
+;; SEL_ALL (line 130 + W16 MARK), morsel 98 SEL_MIX (line 141-145
+;; bitmap walk + line 144 W16 MARK), morsels 99..195 SEL_NONE
+;; (line 128 continue).  Exercises every selection-aware path on W16.
+(count (select {from: TW16 where: (and (< id 100000) (like sym "s3*"))})) -- 20000
+
+;; Mid-range slice (250 < id < 750) — entirely inside a single morsel
+;; pair → exclusively MIX morsels with a few SEL_NONE.  Probes the MIX
+;; width-typed inner loop on W16.
+(count (select {from: TW16 where: (and (and (> id 250) (< id 750)) (like sym "s?5"))})) -- 50
+
+(.sys.exec "rm -f rfl_strop_w16.csv") -- 0
+
+;; ─── Fixture B: W32 SYM column, dense parallel path ───
+;; 200k rows with 70k unique syms — max_id > 65535 keeps the column at
+;; W32 (csv.c:1394 short-circuit "if new_w >= RAY_SYM_W32 continue").
+;; This is the only way to hit the W32 arm from RFL.
+(.sys.exec "rm -f rfl_strop_w32.csv") -- 0
+(.sys.exec "awk 'BEGIN{print \"id,sym\"; for(i=0;i<200000;i++) printf(\"%d,s%05d\\n\",i,i%70000)}' > rfl_strop_w32.csv") -- 0
+(set TW32 (.csv.read [I64 SYMBOL] "rfl_strop_w32.csv"))
+(count TW32) -- 200000
+
+;; "s00000*" matches exactly sym "s00000" (our format is %05d so each
+;; integer maps to a single 6-char sym, and trailing '*' has nothing to
+;; match in this fixed-width fixture).  s00000 appears at i=0, 70000,
+;; 140000 → 3 rows.
+(count (select {from: TW32 where: (like sym "s00000*")})) -- 3
+;; "*9" matches every s with id divisible-by-10-...-9 in last digit.
+;; Out of 70000 unique syms, 7000 end in '9'.  In 200000 rows, 7000 *
+;; (200000 / 70000 ≈ 2.857) → exact count: rows i where (i%70000)%10==9
+;; In 0..199999 there are floor(200000/10) = 20000 such rows.
+(count (select {from: TW32 where: (like sym "*9")})) -- 20000
+
+;; Selection-aware on W32 — partial conjunct creates SEL_ALL +
+;; SEL_NONE + SEL_MIX morsels; the SEL_MIX morsel runs the W32
+;; LIKE_SEEN_MARK_ROW arm in like_seen_fn:144 (and the proj
+;; counterpart at like_proj_fn:266).  ray_rowsel_init drops
+;; always-true preds (returns NULL — see rowsel.c:177-181) so we use
+;; a partial filter to retain a non-NULL g->selection.
+;; (< id 100000) keeps morsels 0..97 SEL_ALL, 98 MIX, 99..195 NONE.
+;; "*9" matches 10000 syms (those ending in 9) in row id range
+;; [0..99999]: i mod 70000 ⇒ rows 0..69999 give 7000 hits, rows
+;; 70000..99999 give 3000 hits (s00000..s29999 segment) → 10000.
+(count (select {from: TW32 where: (and (< id 100000) (like sym "*9"))})) -- 10000
+
+(.sys.exec "rm -f rfl_strop_w32.csv") -- 0
+
+;; ─── Fixture C: W64 selection-aware (SEL_ALL+MIX+NONE) ───
+;; in-RFL constructed SYM is W64.  (take 200000) cycles 5 syms.
+;; ray_rowsel_init returns NULL for always-true predicates
+;; (rowsel.c:177-181), so we use a partial filter to keep a non-NULL
+;; g->selection.  Morsels 0..97 are fully in (SEL_ALL → string.c:130
+;; W64 MARK + string.c:252 W64 SET); morsel 98 is MIX; morsels
+;; 99..195 are NONE.
+(set syms ['AAA 'BBB 'CCC 'DDD 'EEE])
+(set Nrow 200000)
+(set TW64 (table [s v] (list (take syms Nrow) (til Nrow))))
+;; (< v 100000) keeps first 100k rows.  AAA cycle pos 0 → 20000 rows.
+(count (select {from: TW64 where: (and (< v 100000) (like s "AAA"))})) -- 20000
+;; Wildcard "*" matches every sym; constrained to v<100000 → 100000.
+(count (select {from: TW64 where: (and (< v 100000) (like s "*"))})) -- 100000

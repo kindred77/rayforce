@@ -1,0 +1,125 @@
+;; Targeted coverage for three low-coverage helpers in src/ops/expr.c:
+;;
+;;   1. set_all_null (expr.c:1180-1219) — scalar-null broadcast fill.
+;;      Fired from propagate_nulls_binary (1224-1227) when a binary op
+;;      whose op_propagates_null=true has a null scalar on either side.
+;;      The expr_compile fast path rejects null constants
+;;      (RAY_ATOM_IS_NULL check at expr.c:491), so a select projection
+;;      `(+ col 0N...)` falls through to exec_elementwise_binary which
+;;      is exactly where set_all_null lives.  The type arms targeted
+;;      by this file are F64, I32/DATE/TIME, and I16 (the I64/TIMESTAMP
+;;      arm is already exercised by null/arith.rfl at 114 invocations).
+;;
+;;   2. par_binary_str_fn (expr.c:1490-1495) — parallel STR comparison
+;;      worker thunk.  Only fires when `len >= RAY_PARALLEL_THRESHOLD`
+;;      (= 64 * 1024 = 65536) inside exec_elementwise_binary's RAY_STR
+;;      branch (1885-1894).  A 70k-row STR column compared to a STR
+;;      literal triggers ray_pool_dispatch on this fn.
+;;
+;;   3. expr_load_f64 (expr.c:619-647) — reachability finding.  The
+;;      single callsite (expr.c:889) only fires when a REG_SCAN
+;;      register has type RAY_F64 with col_type != RAY_F64.  But the
+;;      compiler sets `regs[r].type = (col->type == RAY_F64) ? RAY_F64
+;;      : RAY_I64` (expr.c:486) — so REG_SCAN F64 implies col->type
+;;      F64, which short-circuits to the direct-pointer branch at
+;;      expr.c:879-880.  Promotion via expr_ensure_type (409-421)
+;;      always inserts a CAST instruction into a REG_SCRATCH (not a
+;;      REG_SCAN), so it never re-types the SCAN reg.  The function
+;;      is therefore unreachable under the current compile rules.
+;;      Documented here; assertions exercise the would-be drivers
+;;      so they pin the analysis.
+
+;; --------------------------------------------------------------------
+;; SETUP
+;; --------------------------------------------------------------------
+;; A small mixed-type table — the expr_compile fast path WILL try to
+;; fuse `(+ i f)`, but the null-scalar arithmetic projections below
+;; force the per-node fallback.
+(set T (table [i f] (list [1 2 3 4 5] [0.5 1.5 2.5 3.5 4.5])))
+
+;; --------------------------------------------------------------------
+;; SECTION 1 — set_all_null F64 branch
+;; --------------------------------------------------------------------
+;; (+ f64col 0Nf) — op_propagates_null=true on OP_ADD; rhs is a null
+;; F64 atom (r_scalar=true, scalar_is_null=true).  expr_compile bails
+;; on null literal → exec_elementwise_binary → propagate_nulls_binary
+;; → set_all_null(result, len) where result->type = RAY_F64 (promoted
+;; from F64+F64).  Result must be an all-null F64 vector.
+(count (at (select {x: (+ f 0Nf) from: T}) 'x)) -- 5
+(sum (map nil? (at (select {x: (+ f 0Nf) from: T}) 'x))) -- 5
+(type (at (select {x: (+ f 0Nf) from: T}) 'x)) -- 'F64
+
+;; Symmetric: null on the LHS — exercises the `if (l_scalar &&
+;; scalar_is_null(lhs))` arm (expr.c:1224).  Same F64 set_all_null fill.
+(sum (map nil? (at (select {x: (+ 0Nf f) from: T}) 'x))) -- 5
+
+;; --------------------------------------------------------------------
+;; SECTION 2 — set_all_null I64/TIMESTAMP branch (already 114 hits,
+;; bumping with a new shape — TIMESTAMP col promotion to I64).
+;; --------------------------------------------------------------------
+;; Promoted type for I64+I64+null → I64.  Adds defensive coverage on
+;; a shape (vec col + null I64 scalar inside select) that today only
+;; fires via REPL-level atomic_map_binary.
+(sum (map nil? (at (select {x: (+ i 0Nl) from: T}) 'x))) -- 5
+
+;; --------------------------------------------------------------------
+;; SECTION 3 — set_all_null I32/DATE/TIME branch
+;; --------------------------------------------------------------------
+;; I32 col + I32 null atom → promote_type(I32, I32) = I32 (opt.c:62).
+;; result vec is RAY_I32 → set_all_null hits the I32 arm
+;; (expr.c:1199-1203).
+(set TI32 (table [a b] (list (as 'I32 [10 20 30 40]) [100 200 300 400])))
+(count (at (select {x: (+ a 0Ni) from: TI32}) 'x)) -- 4
+(sum (map nil? (at (select {x: (+ a 0Ni) from: TI32}) 'x))) -- 4
+
+;; DATE col + I32 null atom shares the I32 path (DATE is in the same
+;; promote_type bucket; opt.c:62).  Result vec type is DATE — still
+;; routed through the I32-width arm of set_all_null.
+(set TD (table [d v] (list [2024.01.01 2024.06.15 2024.12.31] [1 2 3])))
+(sum (map nil? (at (select {x: (+ d 0Ni) from: TD}) 'x))) -- 3
+
+;; --------------------------------------------------------------------
+;; SECTION 4 — set_all_null I16 branch
+;; --------------------------------------------------------------------
+;; I16 col + I16 null atom → promote_type(I16, I16) = I16 (opt.c:63).
+;; result vec is RAY_I16 → set_all_null hits the I16 arm
+;; (expr.c:1204-1208).
+(set TI16 (table [h] (list (as 'I16 [1 2 3 4 5 6 7]))))
+(count (at (select {x: (+ h 0Nh) from: TI16}) 'x)) -- 7
+(sum (map nil? (at (select {x: (+ h 0Nh) from: TI16}) 'x))) -- 7
+
+;; --------------------------------------------------------------------
+;; SECTION 5 — par_binary_str_fn parallel dispatch
+;; --------------------------------------------------------------------
+;; Build a 70k-row STR column.  RAY_PARALLEL_THRESHOLD = 64*1024 =
+;; 65536, so 70000 crosses the parallel cut-off.  expr_compile rejects
+;; RAY_STR cols (line 469); STR-eq path at expr.c:1873 dispatches
+;; par_binary_str_fn via the pool.  Each worker calls binary_range_str
+;; over its shard; the cycling input means every 3 rows is one match.
+(set N_PAR 70000)
+(set TSTR (table [s n] (list (map (fn [x] (as 'STR x)) (take ['aa 'bb 'cc] N_PAR)) (til N_PAR))))
+
+;; STR col == STR atom → parallel dispatch on par_binary_str_fn.
+;; 70000 / 3 = 23334 rows where s == "aa" (rounds up; first row 'aa).
+(count (select {from: TSTR where: (== s "aa")})) -- 23334
+;; '!= "aa"' → complement; 70000 - 23334 = 46666.
+(count (select {from: TSTR where: (!= s "aa")})) -- 46666
+
+;; STR col == STR col via concat — two STR columns of the same length
+;; comparing one another.  Hits par_binary_str_fn with both sides
+;; non-scalar (l_scalar=false, r_scalar=false).
+(set TSTR2 (table [s t] (list (map (fn [x] (as 'STR x)) (take ['aa 'bb 'cc] N_PAR)) (map (fn [x] (as 'STR x)) (take ['aa 'bb 'cc] N_PAR)))))
+(count (select {from: TSTR2 where: (== s t)})) -- 70000
+
+;; --------------------------------------------------------------------
+;; SECTION 6 — expr_load_f64 reachability probe (documentary)
+;; --------------------------------------------------------------------
+;; Mixed I64/F64 column arithmetic — the canonical case where one
+;; might expect expr_load_f64 to fire.  In practice the optimizer
+;; inserts an explicit CAST instruction on the SCRATCH register so
+;; the SCAN load stays on the integer-direct branch.  Result still
+;; F64; the test pins this expected output and documents that no
+;; expr_load_f64 hits should appear (verified via llvm-cov: the
+;; function remains 0% after this file runs).
+(sum (at (select {x: (+ i f) from: T}) 'x)) -- 27.5
+(type (at (select {x: (+ i f) from: T}) 'x)) -- 'F64
