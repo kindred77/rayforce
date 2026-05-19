@@ -36,6 +36,7 @@
 #include "ops/internal.h"
 #include "ops/ops.h"
 #include "ops/fused_group.h"
+#include "lang/parse.h"
 #include "table/sym.h"
 #include <string.h>
 
@@ -1380,6 +1381,568 @@ static test_result_t test_eq_no_match(void) {
     PASS();
 }
 
+/* ──────────────────────────────────────────────────────────────────────
+ * Coverage extensions: multi-key parallel combine (mk_combine_hist_fn /
+ * mk_combine_scat_fn / mk_combine_dedup_fn), fused TOP-N count heap
+ * (fp_count_heap_* + fp_count_emit_keep_min), and Phase-3 const-string
+ * predicate gate (fp_expr_const_str).
+ * ────────────────────────────────────────────────────────────────────── */
+
+/* mk_combine_parallel path: 2 wide I64 keys (16 bytes total → wide=1).
+ * Drive enough distinct (k1,k2) pairs past FP_COMBINE_PAR_MIN (50,000)
+ * across all worker shards so the 3-pass radix scatter activates.  Each
+ * worker sees its row range and shards into a private HT — with all-
+ * distinct rows the shard fills equal nrows/nw, summing past 50K across
+ * the pool. */
+static test_result_t test_mk_combine_2i64_parallel_wide(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 80000;
+    ray_t* k1c = ray_vec_new(RAY_I64, N); k1c->len = N;
+    ray_t* k2c = ray_vec_new(RAY_I64, N); k2c->len = N;
+    ray_t* vc  = ray_vec_new(RAY_I64, N); vc->len  = N;
+    int64_t* k1 = (int64_t*)ray_data(k1c);
+    int64_t* k2 = (int64_t*)ray_data(k2c);
+    int64_t* v  = (int64_t*)ray_data(vc);
+    /* All (k1, k2) pairs distinct so per-shard n_filled = rows/nw and
+     * total_local = N — comfortably above FP_COMBINE_PAR_MIN (50K). */
+    for (int64_t i = 0; i < N; i++) {
+        k1[i] = i;
+        k2[i] = i * 3 + 7;
+        v[i]  = i + 1;
+    }
+
+    int64_t s_k1 = ray_sym_intern("k1", 2);
+    int64_t s_k2 = ray_sym_intern("k2", 2);
+    int64_t s_v  = ray_sym_intern("v",  1);
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, s_k1, k1c); ray_release(k1c);
+    tbl = ray_table_add_col(tbl, s_k2, k2c); ray_release(k2c);
+    tbl = ray_table_add_col(tbl, s_v,  vc);  ray_release(vc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k1 = ray_scan(g, "k1");
+    ray_op_t* scan_k2 = ray_scan(g, "k2");
+    ray_op_t* scan_v  = ray_scan(g, "v");
+    ray_op_t* scan_vp = ray_scan(g, "v");
+    ray_op_t* zero    = ray_const_i64(g, 0);
+    /* Non-trivial WHERE that passes everything. */
+    ray_op_t* pred    = ray_binop(g, OP_GE, scan_vp, zero);
+
+    uint16_t  agg_ops[] = { OP_COUNT };
+    ray_op_t* agg_ins[] = { scan_v };
+    ray_op_t* keys[]    = { scan_k1, scan_k2 };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 2, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_t* res = ray_execute(g, fused);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    /* All pairs distinct → N output rows. */
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), N);
+
+    int64_t cnt_sym = ray_sym_intern("count", 5);
+    ray_t* cnt_col = ray_table_get_col(res, cnt_sym);
+    TEST_ASSERT_NOT_NULL(cnt_col);
+    int64_t total = 0;
+    for (int64_t i = 0; i < ray_table_nrows(res); i++)
+        total += ((int64_t*)ray_data(cnt_col))[i];
+    TEST_ASSERT_EQ_I(total, N);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* mk_combine narrow branch: 2 I32 keys → 8 bytes total → wide=0.  All
+ * (k1, k2) pairs distinct so total_local hits the parallel threshold.
+ * Exercises the !wide branches of mk_combine_hist_fn / scat_fn / dedup_fn. */
+static test_result_t test_mk_combine_2i32_parallel_narrow(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 80000;
+    ray_t* k1c = ray_vec_new(RAY_I32, N); k1c->len = N;
+    ray_t* k2c = ray_vec_new(RAY_I32, N); k2c->len = N;
+    ray_t* vc  = ray_vec_new(RAY_I64, N); vc->len  = N;
+    int32_t* k1 = (int32_t*)ray_data(k1c);
+    int32_t* k2 = (int32_t*)ray_data(k2c);
+    int64_t* v  = (int64_t*)ray_data(vc);
+    /* k1 = i / 4, k2 = i % 4 → all (k1,k2) distinct because i = k1*4 + k2. */
+    for (int64_t i = 0; i < N; i++) {
+        k1[i] = (int32_t)(i / 4);
+        k2[i] = (int32_t)(i % 4);
+        v[i]  = i + 1;
+    }
+
+    int64_t s_k1 = ray_sym_intern("k1", 2);
+    int64_t s_k2 = ray_sym_intern("k2", 2);
+    int64_t s_v  = ray_sym_intern("v",  1);
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, s_k1, k1c); ray_release(k1c);
+    tbl = ray_table_add_col(tbl, s_k2, k2c); ray_release(k2c);
+    tbl = ray_table_add_col(tbl, s_v,  vc);  ray_release(vc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k1 = ray_scan(g, "k1");
+    ray_op_t* scan_k2 = ray_scan(g, "k2");
+    ray_op_t* scan_v  = ray_scan(g, "v");
+    ray_op_t* scan_vp = ray_scan(g, "v");
+    ray_op_t* zero    = ray_const_i64(g, 0);
+    ray_op_t* pred    = ray_binop(g, OP_GE, scan_vp, zero);
+
+    uint16_t  agg_ops[] = { OP_COUNT };
+    ray_op_t* agg_ins[] = { scan_v };
+    ray_op_t* keys[]    = { scan_k1, scan_k2 };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 2, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_t* res = ray_execute(g, fused);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), N);
+
+    int64_t cnt_sym = ray_sym_intern("count", 5);
+    ray_t* cnt_col = ray_table_get_col(res, cnt_sym);
+    int64_t total = 0;
+    for (int64_t i = 0; i < ray_table_nrows(res); i++)
+        total += ((int64_t*)ray_data(cnt_col))[i];
+    TEST_ASSERT_EQ_I(total, N);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* mk_combine 2 SYM keys with W32 width.  Total = 4+4 = 8 bytes → wide=0.
+ * Each row carries a distinct (s1, s2) pair so total_local exceeds
+ * FP_COMBINE_PAR_MIN. */
+static test_result_t test_mk_combine_2sym_parallel(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 80000;
+    ray_t* s1c = ray_sym_vec_new(RAY_SYM_W32, N); s1c->len = N;
+    ray_t* s2c = ray_sym_vec_new(RAY_SYM_W32, N); s2c->len = N;
+    ray_t* vc  = ray_vec_new(RAY_I64, N);         vc->len  = N;
+    int32_t* s1 = (int32_t*)ray_data(s1c);
+    int32_t* s2 = (int32_t*)ray_data(s2c);
+    int64_t* v  = (int64_t*)ray_data(vc);
+    /* Intern N distinct symbols up front so we can index into them. */
+    int64_t pool[400];
+    char  nm[16];
+    for (int j = 0; j < 400; j++) {
+        int l = snprintf(nm, sizeof(nm), "sym_%04d", j);
+        pool[j] = ray_sym_intern(nm, (size_t)l);
+    }
+    /* (s1[i], s2[i]) = (pool[i / 400], pool[i % 400]) — 400 × 400 = 160K
+     * possible pairs; with N=80K rows all pairs distinct (i runs 0..N). */
+    for (int64_t i = 0; i < N; i++) {
+        s1[i] = (int32_t)pool[i / 400];
+        s2[i] = (int32_t)pool[i % 400];
+        v[i]  = i + 1;
+    }
+    int64_t s_a = ray_sym_intern("a", 1);
+    int64_t s_b = ray_sym_intern("b", 1);
+    int64_t s_v = ray_sym_intern("v", 1);
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, s_a, s1c); ray_release(s1c);
+    tbl = ray_table_add_col(tbl, s_b, s2c); ray_release(s2c);
+    tbl = ray_table_add_col(tbl, s_v, vc);  ray_release(vc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_a  = ray_scan(g, "a");
+    ray_op_t* scan_b  = ray_scan(g, "b");
+    ray_op_t* scan_v  = ray_scan(g, "v");
+    ray_op_t* scan_vp = ray_scan(g, "v");
+    ray_op_t* zero    = ray_const_i64(g, 0);
+    ray_op_t* pred    = ray_binop(g, OP_GE, scan_vp, zero);
+    uint16_t  agg_ops[] = { OP_COUNT };
+    ray_op_t* agg_ins[] = { scan_v };
+    ray_op_t* keys[]    = { scan_a, scan_b };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 2, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_t* res = ray_execute(g, fused);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    /* All pairs distinct. */
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), N);
+
+    int64_t cnt_sym = ray_sym_intern("count", 5);
+    ray_t* cnt_col = ray_table_get_col(res, cnt_sym);
+    int64_t total = 0;
+    for (int64_t i = 0; i < ray_table_nrows(res); i++)
+        total += ((int64_t*)ray_data(cnt_col))[i];
+    TEST_ASSERT_EQ_I(total, N);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* mk_combine mixed: SYM_W32 (4 bytes) + I64 (8 bytes) = 12 bytes → wide=1.
+ * Exercises the wide branch with a SYM-bearing decompose at materialize. */
+static test_result_t test_mk_combine_sym_i64_parallel(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 80000;
+    ray_t* sc = ray_sym_vec_new(RAY_SYM_W32, N); sc->len = N;
+    ray_t* kc = ray_vec_new(RAY_I64, N);         kc->len = N;
+    ray_t* vc = ray_vec_new(RAY_I64, N);         vc->len = N;
+    int32_t* s = (int32_t*)ray_data(sc);
+    int64_t* k = (int64_t*)ray_data(kc);
+    int64_t* v = (int64_t*)ray_data(vc);
+    int64_t pool[400];
+    char nm[16];
+    for (int j = 0; j < 400; j++) {
+        int l = snprintf(nm, sizeof(nm), "msy_%04d", j);
+        pool[j] = ray_sym_intern(nm, (size_t)l);
+    }
+    /* (s[i], k[i]) = (pool[i % 400], i) — N distinct pairs (k unique). */
+    for (int64_t i = 0; i < N; i++) {
+        s[i] = (int32_t)pool[i % 400];
+        k[i] = i;
+        v[i] = i + 1;
+    }
+    int64_t s_s = ray_sym_intern("s", 1);
+    int64_t s_k = ray_sym_intern("k", 1);
+    int64_t s_v = ray_sym_intern("v", 1);
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, s_s, sc); ray_release(sc);
+    tbl = ray_table_add_col(tbl, s_k, kc); ray_release(kc);
+    tbl = ray_table_add_col(tbl, s_v, vc); ray_release(vc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_s  = ray_scan(g, "s");
+    ray_op_t* scan_k  = ray_scan(g, "k");
+    ray_op_t* scan_v  = ray_scan(g, "v");
+    ray_op_t* scan_vp = ray_scan(g, "v");
+    ray_op_t* zero    = ray_const_i64(g, 0);
+    ray_op_t* pred    = ray_binop(g, OP_GE, scan_vp, zero);
+    uint16_t  agg_ops[] = { OP_COUNT };
+    ray_op_t* agg_ins[] = { scan_v };
+    ray_op_t* keys[]    = { scan_s, scan_k };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 2, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_t* res = ray_execute(g, fused);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), N);
+
+    int64_t cnt_sym = ray_sym_intern("count", 5);
+    ray_t* cnt_col = ray_table_get_col(res, cnt_sym);
+    int64_t total = 0;
+    for (int64_t i = 0; i < ray_table_nrows(res); i++)
+        total += ((int64_t*)ray_data(cnt_col))[i];
+    TEST_ASSERT_EQ_I(total, N);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* Forward-declare the runtime API for fp_expr_const_str tests.  Mirrors
+ * test_fused_topk.c pattern — fp_expr_const_str is called only from
+ * fp_check_like inside ray_fused_group_supported, which needs a parsed
+ * AST.  ray_parse requires a live runtime for its symbol-table state. */
+struct ray_runtime_s;
+typedef struct ray_runtime_s ray_runtime_t;
+extern ray_runtime_t* ray_runtime_create(int argc, char** argv);
+extern void           ray_runtime_destroy(ray_runtime_t* rt);
+extern ray_runtime_t* __RUNTIME;
+
+/* fp_expr_const_str: LIKE on a SYM column with a string-literal pattern
+ * should be recognised by the planner gate (returns 1).  Exercises the
+ * `expr->type == -RAY_STR && !RAY_ATTR_NAME` base case of the recursive
+ * walker. */
+static test_result_t test_fp_expr_const_str_simple_like(void) {
+    ray_runtime_create(0, NULL);
+
+    /* Tiny SYM table — fp_check_like requires the column to exist and be
+     * STR/SYM type. */
+    ray_t* sc = ray_sym_vec_new(RAY_SYM_W32, 3); sc->len = 3;
+    int32_t* sd = (int32_t*)ray_data(sc);
+    int64_t s_a = ray_sym_intern("apple", 5);
+    int64_t s_b = ray_sym_intern("banana", 6);
+    int64_t s_c = ray_sym_intern("cherry", 6);
+    sd[0] = (int32_t)s_a; sd[1] = (int32_t)s_b; sd[2] = (int32_t)s_c;
+    int64_t s_name = ray_sym_intern("name", 4);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, s_name, sc); ray_release(sc);
+
+    ray_t* expr = ray_parse("(like name \"app*\")");
+    TEST_ASSERT_NOT_NULL(expr);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(expr));
+
+    /* Predicate gate must accept (like sym_col "literal") — this recurses
+     * through fp_check_like → fp_expr_const_str on the literal. */
+    int ok = ray_fused_group_supported(expr, tbl);
+    TEST_ASSERT_EQ_I(ok, 1);
+
+    ray_release(expr);
+    ray_release(tbl);
+    ray_runtime_destroy(__RUNTIME);
+    PASS();
+}
+
+/* fp_expr_const_str: nested (concat str str) pattern.  Exercises the
+ * "is_concat" branch + recursion into each child. */
+static test_result_t test_fp_expr_const_str_concat_like(void) {
+    ray_runtime_create(0, NULL);
+
+    ray_t* sc = ray_sym_vec_new(RAY_SYM_W32, 2); sc->len = 2;
+    int32_t* sd = (int32_t*)ray_data(sc);
+    int64_t s_x = ray_sym_intern("foo_x", 5);
+    int64_t s_y = ray_sym_intern("foo_y", 5);
+    sd[0] = (int32_t)s_x; sd[1] = (int32_t)s_y;
+    int64_t s_n = ray_sym_intern("name", 4);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, s_n, sc); ray_release(sc);
+
+    /* Pattern is (concat "foo" "*") — a nested-list const-string. */
+    ray_t* expr = ray_parse("(like name (concat \"foo\" \"*\"))");
+    TEST_ASSERT_NOT_NULL(expr);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(expr));
+
+    int ok = ray_fused_group_supported(expr, tbl);
+    TEST_ASSERT_EQ_I(ok, 1);
+
+    ray_release(expr);
+    ray_release(tbl);
+    ray_runtime_destroy(__RUNTIME);
+    PASS();
+}
+
+/* fp_expr_const_str: deeply-nested (concat (concat str str) str) — drives
+ * the recursive fp_expr_const_str over a tree, not just a flat list. */
+static test_result_t test_fp_expr_const_str_nested_concat(void) {
+    ray_runtime_create(0, NULL);
+
+    ray_t* sc = ray_sym_vec_new(RAY_SYM_W32, 1); sc->len = 1;
+    int32_t* sd = (int32_t*)ray_data(sc);
+    int64_t s_q = ray_sym_intern("abcdefg", 7);
+    sd[0] = (int32_t)s_q;
+    int64_t s_n = ray_sym_intern("name", 4);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, s_n, sc); ray_release(sc);
+
+    ray_t* expr = ray_parse("(like name (concat (concat \"a\" \"b\") \"*\"))");
+    TEST_ASSERT_NOT_NULL(expr);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(expr));
+    int ok = ray_fused_group_supported(expr, tbl);
+    TEST_ASSERT_EQ_I(ok, 1);
+
+    ray_release(expr);
+    ray_release(tbl);
+    ray_runtime_destroy(__RUNTIME);
+    PASS();
+}
+
+/* fp_count_heap_*: U8 column → fp_try_direct_count1 fires (256 slots);
+ * with emit_filter.top_count_take = 3 and many distinct keys, the
+ * fp_count_emit_keep_min path runs the heap (n_slots ≫ k_take). */
+static test_result_t test_fp_count_heap_u8_top3(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* 20 distinct U8 keys with sharply different counts so the top-3 is
+     * unambiguous: key i appears (i+1) times — total rows = 1+2+...+20
+     * = 210. */
+    int64_t total_rows = 0;
+    for (int64_t i = 1; i <= 20; i++) total_rows += i;
+    ray_t* kc = ray_vec_new(RAY_U8, total_rows); kc->len = total_rows;
+    uint8_t* k = (uint8_t*)ray_data(kc);
+    int64_t pos = 0;
+    for (int64_t key = 1; key <= 20; key++) {
+        for (int64_t r = 0; r < key; r++) k[pos++] = (uint8_t)key;
+    }
+    int64_t s_k = ray_sym_intern("k", 1);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, s_k, kc); ray_release(kc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k    = ray_scan(g, "k");
+    ray_op_t* scan_pred = ray_scan(g, "k");
+    ray_op_t* zero      = ray_const_i64(g, 0);
+    ray_op_t* pred      = ray_binop(g, OP_GE, scan_pred, zero);
+    uint16_t  agg_ops[] = { OP_COUNT };
+    ray_op_t* agg_ins[] = { scan_k };
+    ray_op_t* keys[]    = { scan_k };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 1, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_group_emit_filter_t prev = ray_group_emit_filter_get();
+    ray_group_emit_filter_t filter = {0};
+    filter.enabled = 1;
+    filter.agg_index = 0;
+    filter.top_count_take = 3;
+    ray_group_emit_filter_set(filter);
+    ray_t* res = ray_execute(g, fused);
+    ray_group_emit_filter_set(prev);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    /* Top-3 counts: keys 20, 19, 18 with counts 20, 19, 18 respectively.
+     * fp_count_emit_keep_min returns heap[0] = 18 — every group with
+     * count >= 18 is retained, so exactly 3 rows. */
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 3);
+
+    int64_t cnt_sym = ray_sym_intern("count", 5);
+    ray_t* k_col = ray_table_get_col(res, s_k);
+    ray_t* c_col = ray_table_get_col(res, cnt_sym);
+    TEST_ASSERT_NOT_NULL(k_col);
+    TEST_ASSERT_NOT_NULL(c_col);
+    int seen_18 = 0, seen_19 = 0, seen_20 = 0;
+    for (int64_t i = 0; i < ray_table_nrows(res); i++) {
+        int64_t key = (int64_t)((uint8_t*)ray_data(k_col))[i];
+        int64_t cnt = ((int64_t*)ray_data(c_col))[i];
+        if (key == 18) { TEST_ASSERT_EQ_I(cnt, 18); seen_18 = 1; }
+        if (key == 19) { TEST_ASSERT_EQ_I(cnt, 19); seen_19 = 1; }
+        if (key == 20) { TEST_ASSERT_EQ_I(cnt, 20); seen_20 = 1; }
+    }
+    TEST_ASSERT_TRUE(seen_18 && seen_19 && seen_20);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* fp_count_heap_*: I16 key → fp_try_direct_count1 with 65536 slots; with
+ * a small top-K the heap_up / heap_down branches both fire as the heap
+ * gets pushed past capacity and then sees rows that displace heap[0]. */
+static test_result_t test_fp_count_heap_i16_top5(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* 12 distinct I16 keys, counts decreasing as the key increases.  The
+     * key sequence (intentionally not sorted) drives both the up-heap
+     * (initial fill) and down-heap (replace heap[0] when a bigger count
+     * appears later in the slot walk) paths. */
+    int64_t per_key[12] = { 5, 11, 3, 17, 2, 9, 13, 21, 1, 7, 19, 4 };
+    int64_t total_rows = 0;
+    for (int i = 0; i < 12; i++) total_rows += per_key[i];
+    ray_t* kc = ray_vec_new(RAY_I16, total_rows); kc->len = total_rows;
+    int16_t* k = (int16_t*)ray_data(kc);
+    int64_t pos = 0;
+    for (int i = 0; i < 12; i++)
+        for (int64_t r = 0; r < per_key[i]; r++)
+            k[pos++] = (int16_t)(i + 100);  /* keys 100..111 */
+    int64_t s_k = ray_sym_intern("k", 1);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, s_k, kc); ray_release(kc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k    = ray_scan(g, "k");
+    ray_op_t* scan_pred = ray_scan(g, "k");
+    ray_op_t* zero      = ray_const_i64(g, 0);
+    ray_op_t* pred      = ray_binop(g, OP_GE, scan_pred, zero);
+    uint16_t  agg_ops[] = { OP_COUNT };
+    ray_op_t* agg_ins[] = { scan_k };
+    ray_op_t* keys[]    = { scan_k };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 1, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_group_emit_filter_t prev = ray_group_emit_filter_get();
+    ray_group_emit_filter_t filter = {0};
+    filter.enabled = 1;
+    filter.agg_index = 0;
+    filter.top_count_take = 5;
+    ray_group_emit_filter_set(filter);
+    ray_t* res = ray_execute(g, fused);
+    ray_group_emit_filter_set(prev);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    /* Top-5 counts: sorted descending = 21, 19, 17, 13, 11.  keep_min = 11.
+     * Result rows: every key whose count >= 11.  Counts 21,19,17,13,11 →
+     * 5 rows. */
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 5);
+
+    /* Verify the result counts are exactly {21,19,17,13,11}. */
+    int64_t cnt_sym = ray_sym_intern("count", 5);
+    ray_t* c_col = ray_table_get_col(res, cnt_sym);
+    TEST_ASSERT_NOT_NULL(c_col);
+    int64_t expect[5] = { 11, 13, 17, 19, 21 };
+    int seen[5] = {0, 0, 0, 0, 0};
+    for (int64_t i = 0; i < ray_table_nrows(res); i++) {
+        int64_t c = ((int64_t*)ray_data(c_col))[i];
+        for (int j = 0; j < 5; j++)
+            if (c == expect[j] && !seen[j]) { seen[j] = 1; break; }
+    }
+    for (int j = 0; j < 5; j++) TEST_ASSERT_TRUE(seen[j]);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* fp_count_emit_keep_min via the serial-combine path of count1 with a
+ * wide-key I64 column.  fp_try_direct_count1 rejects (kt != BOOL/U8/I16)
+ * so the code falls through to fp_combine_and_materialize.  With
+ * use_emit_filter on, the parallel-combine branch is skipped (line 1343)
+ * and the serial combine + fp_count_emit_keep_min path runs.  The
+ * used_key_slots parameter is non-NULL in this branch, exercising the
+ * `used_key_slots && !used_key_slots[s * 2]` skip. */
+static test_result_t test_fp_count_emit_keep_min_i64_serial(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* 15 distinct I64 keys with monotone counts 1..15.  Big enough that
+     * after the serial HT-build the open-addressed table has many empty
+     * slots interspersed with filled ones, exercising the
+     * used_key_slots-skip branch. */
+    int64_t per_key[15];
+    int64_t total_rows = 0;
+    for (int i = 0; i < 15; i++) { per_key[i] = i + 1; total_rows += per_key[i]; }
+    ray_t* kc = ray_vec_new(RAY_I64, total_rows); kc->len = total_rows;
+    int64_t* k = (int64_t*)ray_data(kc);
+    int64_t pos = 0;
+    for (int i = 0; i < 15; i++)
+        for (int64_t r = 0; r < per_key[i]; r++)
+            k[pos++] = (int64_t)(1000 + i);
+    int64_t s_k = ray_sym_intern("k", 1);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, s_k, kc); ray_release(kc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k    = ray_scan(g, "k");
+    ray_op_t* scan_pred = ray_scan(g, "k");
+    ray_op_t* zero      = ray_const_i64(g, 0);
+    ray_op_t* pred      = ray_binop(g, OP_GE, scan_pred, zero);
+    uint16_t  agg_ops[] = { OP_COUNT };
+    ray_op_t* agg_ins[] = { scan_k };
+    ray_op_t* keys[]    = { scan_k };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 1, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_group_emit_filter_t prev = ray_group_emit_filter_get();
+    ray_group_emit_filter_t filter = {0};
+    filter.enabled = 1;
+    filter.agg_index = 0;
+    filter.top_count_take = 4;
+    ray_group_emit_filter_set(filter);
+    ray_t* res = ray_execute(g, fused);
+    ray_group_emit_filter_set(prev);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    /* Top-4 counts = 15, 14, 13, 12. keep_min = 12 → 4 rows. */
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 4);
+
+    int64_t cnt_sym = ray_sym_intern("count", 5);
+    ray_t* c_col = ray_table_get_col(res, cnt_sym);
+    TEST_ASSERT_NOT_NULL(c_col);
+    int64_t expect[4] = { 12, 13, 14, 15 };
+    int seen[4] = { 0, 0, 0, 0 };
+    for (int64_t i = 0; i < ray_table_nrows(res); i++) {
+        int64_t c = ((int64_t*)ray_data(c_col))[i];
+        for (int j = 0; j < 4; j++)
+            if (c == expect[j] && !seen[j]) { seen[j] = 1; break; }
+    }
+    for (int j = 0; j < 4; j++) TEST_ASSERT_TRUE(seen[j]);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t fused_group_entries[] = {
     { "fused_group/eq_count",                    test_eq_count,                    NULL, NULL },
     { "fused_group/ne_two_groups",               test_ne_two_groups,               NULL, NULL },
@@ -1408,5 +1971,17 @@ const test_entry_t fused_group_entries[] = {
     { "fused_group/multi_agg_and_pred",          test_multi_agg_and_pred,          NULL, NULL },
     { "fused_group/multi_agg_unsigned_inputs",   test_multi_agg_unsigned_inputs,   NULL, NULL },
     { "fused_group/count1_sym_key_w32",          test_count1_sym_key_w32,          NULL, NULL },
+    /* mk_combine_* (multi-key parallel 3-pass radix scatter) + fused
+     * TOP-N count heap + Phase-3 const-string LIKE gate. */
+    { "fused_group/mk_combine_2i64_parallel_wide",  test_mk_combine_2i64_parallel_wide,  NULL, NULL },
+    { "fused_group/mk_combine_2i32_parallel_narrow",test_mk_combine_2i32_parallel_narrow,NULL, NULL },
+    { "fused_group/mk_combine_2sym_parallel",       test_mk_combine_2sym_parallel,       NULL, NULL },
+    { "fused_group/mk_combine_sym_i64_parallel",    test_mk_combine_sym_i64_parallel,    NULL, NULL },
+    { "fused_group/fp_expr_const_str_simple_like",  test_fp_expr_const_str_simple_like,  NULL, NULL },
+    { "fused_group/fp_expr_const_str_concat_like",  test_fp_expr_const_str_concat_like,  NULL, NULL },
+    { "fused_group/fp_expr_const_str_nested_concat",test_fp_expr_const_str_nested_concat,NULL, NULL },
+    { "fused_group/fp_count_heap_u8_top3",          test_fp_count_heap_u8_top3,          NULL, NULL },
+    { "fused_group/fp_count_heap_i16_top5",         test_fp_count_heap_i16_top5,         NULL, NULL },
+    { "fused_group/fp_count_emit_keep_min_i64_serial", test_fp_count_emit_keep_min_i64_serial, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
