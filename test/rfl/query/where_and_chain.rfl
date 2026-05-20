@@ -1,0 +1,300 @@
+;; Coverage for the WHERE-AND chained-filter compile path + planner
+;; branches that hang off it in `src/ops/query.c`:
+;;
+;;   - `query.c:4058..4202` — `and_chained` path that splits a variadic
+;;     `(and a b c ...)` WHERE into K independent OP_FILTER chains so
+;;     each surviving conjunct is evaluated under a progressively
+;;     refined rowsel (selection-aware exec_like / IN / range cmp).
+;;   - Conjunct cost estimator + cost-based reorder (selection sort
+;;     by `cost[]`) — verifies result correctness when the selective
+;;     predicate is written last (planner reorders cheap-first
+;;     silently; user sees identical data).
+;;   - `reorder_safe = 0` guard — when a conjunct uses an op the
+;;     planner can't prove safe to reorder (the `default:` arm sets
+;;     `reorder_safe = 0`), the chain preserves user order so a
+;;     short-circuit guard like `(!= y 0)` keeps protecting a later
+;;     division.  Happy-path: verify the result is still correct.
+;;   - Fallback path (`and_chained=0`): variadic OR, mixed AND/OR, and
+;;     the `> 64 conjuncts` bail — fall through to the OP_AND tree
+;;     compiled by `compile_expr_dag` directly.
+;;   - WHERE + by-group: chained filter feeds the group-by executor.
+;;     Per-group sum/count must match the manual filter-then-group
+;;     formulation (the predicate-pushdown oracle).
+;;   - Mixed agg + non-agg projection with a WHERE — confirms the
+;;     filtered rowsel reaches both projection paths consistently.
+;;   - `(in col …)` semijoin-style filter inside an AND chain — IN
+;;     has cost 20, the column compare has cost 5, so the reorder
+;;     puts the IN second.
+;;   - Predicate pushdown past projection — `(select … where: pred
+;;     from: (select … from: T))` must equal the filter-first form
+;;     (the optimizer's `pass_predicate_pushdown` swaps FILTER below
+;;     OP_SELECT/OP_ALIAS when the child is single-consumer).
+;;
+;; Fixture sizing: 50_000 rows ensures we cross the >= 200_000 *parallel*
+;; probe threshold from `parallel_probe.rfl`'s scope without overlap; the
+;; chained-filter compile path triggers regardless of row count, while
+;; reduction-style aggs at 50k still measure something non-trivial.
+
+;; ====================================================================
+;; Fixture T0 — 50_000-row table, round-robin SYM key over {A,B,C}.
+;; v = (til Nrow), so row index = v.  k cycles A,B,C,A,B,C,…
+;; Hand-computed reference values (see comments inline).
+;; ====================================================================
+(set Nrow 50000)
+(set T0 (table [k v] (list (take ['A 'B 'C] Nrow) (til Nrow))))
+
+;; Sanity pin on the fixture itself — these numbers anchor the
+;; oracles below.
+(count T0) -- 50000
+;; k='A': r%3==0 → rows {0,3,…,49998}, count = 16667.
+(count (select {from: T0 where: (== k 'A)})) -- 16667
+;; k='B': r%3==1 → rows {1,4,…,49999}, count = 16667.
+(count (select {from: T0 where: (== k 'B)})) -- 16667
+;; k='C': r%3==2 → rows {2,5,…,49997}, count = 16666.
+(count (select {from: T0 where: (== k 'C)})) -- 16666
+
+;; ====================================================================
+;; 3-conjunct AND — exercises the `and_chained` compile path.
+;; Predicate: (and (> v 100) (< v 500) (!= k 'C))
+;;   v in {101..499}  → 399 rows.  Excluding r%3==2:
+;;     r%3==0 in [101,499]: {102,105,…,498}, n=133, sum=133*300=39900
+;;     r%3==1 in [101,499]: {103,106,…,499}, n=133, sum=133*301=40033
+;;   Total: 266 rows, sum=79933.
+;; ====================================================================
+(count (select {from: T0 where: (and (> v 100) (< v 500) (!= k 'C))})) -- 266
+(sum (at (select {from: T0 where: (and (> v 100) (< v 500) (!= k 'C))}) 'v)) -- 79933
+
+;; Same predicate, conjuncts in different user orders — chained filter
+;; semantics are commutative under refinement (each predicate must
+;; just be VALID on surviving rows, which a fully-evaluated bool
+;; column is).  All four orderings must agree on the same row set.
+(count (select {from: T0 where: (and (!= k 'C) (< v 500) (> v 100))})) -- 266
+(count (select {from: T0 where: (and (< v 500) (!= k 'C) (> v 100))})) -- 266
+(sum (at (select {from: T0 where: (and (< v 500) (> v 100) (!= k 'C))}) 'v)) -- 79933
+
+;; ====================================================================
+;; 4-conjunct AND — beyond pairwise nesting; still well under the
+;; k <= 64 cap.  Adds an extra non-trivial range to confirm the
+;; selection-sort over `cost[]` doesn't lose conjuncts.
+;; Predicate: (and (> v 100) (< v 500) (!= k 'C) (>= v 200))
+;;   v in {200..499} excluding r%3==2:
+;;     r%3==0 in [200,499]: {201,204,…,498}, n=100, sum=100*(201+498)/2=34950
+;;     r%3==1 in [200,499]: {202,205,…,499}, n=100, sum=100*(202+499)/2=35050
+;;   Total: 200 rows, sum=70000.
+;; ====================================================================
+(count (select {from: T0 where: (and (> v 100) (< v 500) (!= k 'C) (>= v 200))})) -- 200
+(sum (at (select {from: T0 where: (and (> v 100) (< v 500) (!= k 'C) (>= v 200))}) 'v)) -- 70000
+
+;; ====================================================================
+;; Cost-based reorder — selective predicate written LAST.
+;; The optimizer's selection-sort runs over compile_expr_dag's coarse
+;; cost map (EQ/NE/LT/.. = 5, IN = 20, LIKE = 50).  All three
+;; conjuncts here are cmp-cost-5, so the sort is stable wrt user
+;; order; semantics are unchanged because rowsel refinement is
+;; commutative on side-effect-free bool predicates.
+;; Predicate: (and (> v 0) (< v 50000) (== v 12345))
+;;   The first two pass nearly every row; the last keeps exactly one.
+;;   r=12345 has k='?' for 12345%3=0 → 'A'.  Sum = 12345.
+;; ====================================================================
+(count (select {from: T0 where: (and (> v 0) (< v 50000) (== v 12345))})) -- 1
+(sum (at (select {from: T0 where: (and (> v 0) (< v 50000) (== v 12345))}) 'v)) -- 12345
+;; Reverse user order — same answer.
+(count (select {from: T0 where: (and (== v 12345) (< v 50000) (> v 0))})) -- 1
+(sum (at (select {from: T0 where: (and (== v 12345) (< v 50000) (> v 0))}) 'v)) -- 12345
+
+;; ====================================================================
+;; IN inside AND — exercises the OP_IN cost-20 arm of the estimator
+;; (compile_expr_dag → planner.cost_estimate switch L4124-4126).
+;; Predicate: (and (> v 100) (in v [200 300 400 500]) (!= k 'C))
+;;   v ∈ {200,300,400,500} surviving >100: all four.
+;;   r%3 for 200=2(C), 300=0(A), 400=1(B), 500=2(C).
+;;   Drop C: keep {300, 400} → 2 rows, sum = 700.
+;; ====================================================================
+(count (select {from: T0 where: (and (> v 100) (in v [200 300 400 500]) (!= k 'C))})) -- 2
+(sum (at (select {from: T0 where: (and (> v 100) (in v [200 300 400 500]) (!= k 'C))}) 'v)) -- 700
+
+;; ====================================================================
+;; LIKE inside AND — exercises the OP_LIKE cost-50 arm.  LIKE is
+;; expensive enough that the planner forces it LAST after every cheap
+;; cmp regardless of user order.  Use a STR column to feed exec_like.
+;; Fixture T1: 1200 rows with a STR column whose values cycle three
+;; literals "alpha", "beta", "gamma".
+;; ====================================================================
+(set Nl 1200)
+(set T1 (table [s v] (list (take ["alpha" "beta" "gamma"] Nl) (til Nl))))
+;; Sanity:
+(count T1) -- 1200
+;; Predicate: (and (> v 100) (< v 500) (like s "a*"))
+;;   v in {101..499}, 399 rows.  s[r] = ["alpha","beta","gamma"][r%3].
+;;   "a*" matches only "alpha", i.e. r%3==0.
+;;   r%3==0 in [101,499]: {102,…,498}, 133 rows.  sum = 39900.
+(count (select {from: T1 where: (and (> v 100) (< v 500) (like s "a*"))})) -- 133
+(sum (at (select {from: T1 where: (and (> v 100) (< v 500) (like s "a*"))}) 'v)) -- 39900
+;; LIKE written first — planner sorts it to last.  Same answer.
+(count (select {from: T1 where: (and (like s "a*") (> v 100) (< v 500))})) -- 133
+
+;; ====================================================================
+;; `reorder_safe = 0` guard — a conjunct containing an op the cost
+;; estimator's switch doesn't have an explicit arm for (here:
+;; multiplication) lands in the `default:` case at L4136-4148, which
+;; pessimistically sets `reorder_safe = 0`.  The chain is still
+;; emitted, but the user's order is preserved — so a guard like
+;; `(!= v 0)` that precedes a division of `(/ 100 v)` keeps
+;; short-circuiting.  Happy path: the result is correct.
+;;
+;; We construct a predicate where the guard is necessary (v=0 would
+;; trip divide-by-zero behaviour) and verify the row count.  T0 has
+;; row 0 with v=0; the guard's job is to keep that row from reaching
+;; the division.
+;; Predicate: (and (!= v 0) (> (/ 1000 v) 5))
+;;   v != 0 keeps 49999 rows.
+;;   1000/v > 5  ⇔  v < 200  (and v > 0).
+;;   So result is v ∈ {1..199}: 199 rows.  sum = 199*200/2 = 19900.
+;; ====================================================================
+(count (select {from: T0 where: (and (!= v 0) (> (/ 1000 v) 5))})) -- 199
+(sum (at (select {from: T0 where: (and (!= v 0) (> (/ 1000 v) 5))}) 'v)) -- 19900
+
+;; ====================================================================
+;; Fallback: OR doesn't get chained — must hit the OP_AND-tree
+;; compile path (the `and_chained = 0` arm at L4186-4202).  Happy
+;; path: variadic OR works just as well via compile_expr_dag.
+;; Predicate: (or (== v 50) (== v 100) (== v 150))
+;;   3 rows.  Sum = 300.
+;; ====================================================================
+(count (select {from: T0 where: (or (== v 50) (== v 100) (== v 150))})) -- 3
+(sum (at (select {from: T0 where: (or (== v 50) (== v 100) (== v 150))}) 'v)) -- 300
+
+;; Nested AND-of-ORs — chained-filter still applies to the outer AND;
+;; each conjunct is an OR (single OP_OR vec), which compiles to one
+;; OP_FILTER per outer conjunct.
+;; Predicate: (and (or (== v 100) (== v 200)) (or (== k 'A) (== k 'B)))
+;;   v ∈ {100,200}, both rows: r=100 (k='B', 100%3=1), r=200 (k='C', 200%3=2).
+;;   Keep r=100 only (k!='C').  1 row, sum=100.
+(count (select {from: T0 where: (and (or (== v 100) (== v 200)) (or (== k 'A) (== k 'B)))})) -- 1
+(sum (at (select {from: T0 where: (and (or (== v 100) (== v 200)) (or (== k 'A) (== k 'B)))}) 'v)) -- 100
+
+;; ====================================================================
+;; WHERE + by-group — chained predicates feed the group-by executor.
+;; Per-group sum must match the manual filter-then-group oracle.
+;; Predicate: (and (> v 100) (< v 500))
+;;   v in {101..499} = 399 rows.  Group by k:
+;;     k='A' (r%3==0): {102,…,498}, 133 rows, sum = 133*300 = 39900.
+;;     k='B' (r%3==1): {103,…,499}, 133 rows, sum = 133*301 = 40033.
+;;     k='C' (r%3==2): {101,104,…,497}, 133 rows, sum = 133*299 = 39767.
+;;   Total: 119700.
+;; ====================================================================
+(set Rw0 (select {s: (sum v) c: (count v) by: k from: T0 where: (and (> v 100) (< v 500))}))
+(count Rw0) -- 3
+(sum (at Rw0 's)) -- 119700
+(sum (at Rw0 'c)) -- 399
+;; Order of SYM group keys is implementation-dependent (hash bucket
+;; order, not first-occurrence — first-occurrence reorder fires only
+;; for BOOL keys, see query.c:6971).  Pin per-group totals by
+;; re-filtering the result table by key, so the assertion is order-
+;; agnostic.
+;;   k='A' (r%3==0) ∩ {101..499}: 133 rows, sum=39900
+;;   k='B' (r%3==1) ∩ {101..499}: 133 rows, sum=40033
+;;   k='C' (r%3==2) ∩ {101..499}: 133 rows, sum=39767
+(at (at (select {from: Rw0 where: (== k 'A)}) 's) 0) -- 39900
+(at (at (select {from: Rw0 where: (== k 'B)}) 's) 0) -- 40033
+(at (at (select {from: Rw0 where: (== k 'C)}) 's) 0) -- 39767
+(at (at (select {from: Rw0 where: (== k 'A)}) 'c) 0) -- 133
+(at (at (select {from: Rw0 where: (== k 'B)}) 'c) 0) -- 133
+(at (at (select {from: Rw0 where: (== k 'C)}) 'c) 0) -- 133
+
+;; Predicate-pushdown oracle: filter-then-group must equal
+;; group-with-WHERE.  This pins the chained-filter rowsel onto the
+;; group-by executor (the `where:` clause's selection survives into
+;; the group's scatter via g->selection).
+(set Manual (select {s: (sum v) c: (count v) by: k from: (select {from: T0 where: (and (> v 100) (< v 500))})}))
+(count Manual) -- 3
+(sum (at Manual 's)) -- 119700
+(sum (at Manual 'c)) -- 399
+
+;; ====================================================================
+;; Mixed agg + non-agg projection — exercises both the streaming
+;; aggregator dispatch AND the row-aligned column projection under
+;; the same WHERE rowsel.
+;; (select {tot: (sum v) avg_v: (avg v) from: T0 where: ...})
+;;   For v in {101..499}: 399 rows, sum=119700, avg=119700/399=300.0.
+;; ====================================================================
+(set Rmix (select {tot: (sum v) avg_v: (avg v) from: T0 where: (and (> v 100) (< v 500))}))
+(count Rmix) -- 1
+(at (at Rmix 'tot) 0) -- 119700
+(at (at Rmix 'avg_v) 0) -- 300.0
+
+;; Non-agg-with-inner-agg + WHERE + by — fires `nonagg_eval_per_group`
+;; over the post-filter rowsel.  Per-group (max v - min v) across the
+;; surviving rows.
+;;   k='A': rows {102,…,498}, max=498, min=102 → 396.
+;;   k='B': rows {103,…,499}, max=499, min=103 → 396.
+;;   k='C': rows {101,…,497}, max=497, min=101 → 396.
+(set Rng (select {r: (- (max v) (min v)) by: k from: T0 where: (and (> v 100) (< v 500))}))
+(count Rng) -- 3
+(sum (at Rng 'r)) -- 1188
+
+;; ====================================================================
+;; Predicate pushdown past projection — the optimizer's
+;; `pass_predicate_pushdown` swaps FILTER below OP_SELECT/OP_ALIAS
+;; when the child is single-consumer.  Verify the answer doesn't
+;; depend on whether the user wrote it nested or flat.
+;; ====================================================================
+;; v ∈ {49001..49499}, n=499, sum = 499 * (49001+49499)/2 = 499 * 49250
+;; = 24,575,750.
+(set Pre  (select {from: T0 where: (and (> v 49000) (< v 49500))}))
+(set Post (select {from: (select {v: v k: k from: T0}) where: (and (> v 49000) (< v 49500))}))
+(count Pre)  -- 499
+(count Post) -- 499
+(sum (at Pre 'v))  -- 24575750
+(sum (at Post 'v)) -- 24575750
+(sum (at Post 'v)) -- (sum (at Pre 'v))
+
+;; ====================================================================
+;; `(in col …)` semijoin-style filter — `col in (other-table-col)`.
+;; Build a small "lookup" set, then a WHERE that exercises the
+;; membership test.  Combined with an AND so the chained-filter path
+;; fires (single-conjunct WHEREs bypass the and_chained branch).
+;; ====================================================================
+(set Lookup [100 200 300 400 500])
+;; (and (in v Lookup) (!= k 'C)):
+;;   r ∈ {100,200,300,400,500} surviving the !=C filter.
+;;   k for these: 100→B, 200→C, 300→A, 400→B, 500→C.
+;;   Keep {100,300,400}: 3 rows, sum=800.
+(count (select {from: T0 where: (and (in v Lookup) (!= k 'C))})) -- 3
+(sum (at (select {from: T0 where: (and (in v Lookup) (!= k 'C))}) 'v)) -- 800
+
+;; "In a derived column": Lookup pulled from another table's column.
+;; Predicate-pushdown still applies because both compile to the same
+;; OP_IN over a materialized literal-vec input.
+(set Tlk (table [x] (list [100 200 300 400 500])))
+(set LookupCol (at Tlk 'x))
+(count (select {from: T0 where: (and (in v LookupCol) (!= k 'C))})) -- 3
+(sum (at (select {from: T0 where: (and (in v LookupCol) (!= k 'C))}) 'v)) -- 800
+
+;; ====================================================================
+;; Edge: single-conjunct AND — `(and (> v 100))` is rejected by the
+;; chained-filter branch (`ray_len(where_expr) >= 3` requires AT
+;; LEAST 2 conjuncts plus the head sym at query.c:4060).  It falls
+;; through to `compile_expr_dag(where_expr)` at L4187, which on a
+;; (and X) shape returns NULL → the WHERE-not-supported "domain"
+;; error at L4189-4195.
+;;
+;; Bug 4 (now fixed): single-conjunct (and X) collapses to X per the
+;; monoid identity rule.  compile_expr_dag handles n==2 case explicitly
+;; (src/ops/query.c) and the eval-level ray_and_vary_fn / ray_or_vary_fn
+;; accept n==1 as identity (src/ops/cmp.c).  See and_or_identity.rfl.
+;; ====================================================================
+(count (select {from: T0 where: (and (> v 100))}))       -- 49899
+(sum (at (select {from: T0 where: (and (> v 100))}) 'v)) -- 1249969950
+;; Sanity: the un-wrapped form works as expected.  Rows {101..49999},
+;; n=49899, sum = (101+49999)*49899/2 = 50100*49899/2 = 1,249,969,950.
+(count (select {from: T0 where: (> v 100)})) -- 49899
+(sum (at (select {from: T0 where: (> v 100)}) 'v)) -- 1249969950
+
+;; ====================================================================
+;; Edge: 2-conjunct AND — the smallest k for which the chained path
+;; actually fires (ray_len(where_expr) = 3: 'and head + 2 conjuncts).
+;; Predicate: (and (> v 100) (< v 500)) — 399 rows, sum 119700.
+;; ====================================================================
+(count (select {from: T0 where: (and (> v 100) (< v 500))})) -- 399
+(sum (at (select {from: T0 where: (and (> v 100) (< v 500))}) 'v)) -- 119700

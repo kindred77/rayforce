@@ -1,0 +1,32 @@
+;; Bug 1: (min SYM_vec) / (max SYM_vec) must return a SYM atom.
+;;
+;; Before fix: returned int64 (the internal sym id) — type lost.
+;; After fix: returns SYM atom; type preserved.
+;;
+;; Root cause: src/ops/group.c:reduction_i64_result switch had no
+;; case for RAY_SYM, so SYM out_type fell through to ray_i64(val).
+
+;; ─── Singleton: trivially min == max == only element ──────────────
+(min ['x]) -- 'x
+(max ['x]) -- 'x
+(type (min ['x])) -- 'sym
+(type (max ['x])) -- 'sym
+
+;; ─── Two elements ────────────────────────────────────────────────
+;; min/max over SYM uses internal id order (insertion order in this
+;; case). Whatever the first-interned wins for min, last-interned for
+;; max — but type must be SYM in both cases.
+(type (min ['alpha 'beta])) -- 'sym
+(type (max ['alpha 'beta])) -- 'sym
+
+;; ─── Identity round-trip: min of repeated single sym is that sym ──
+(min ['foo 'foo 'foo 'foo]) -- 'foo
+(max ['foo 'foo 'foo 'foo]) -- 'foo
+(type (min ['foo 'foo 'foo 'foo])) -- 'sym
+(type (max ['foo 'foo 'foo 'foo])) -- 'sym
+
+;; ─── Comparison round-trip ────────────────────────────────────────
+;; (== (min v) <some-sym>) must work — verifies SYM atom equality
+;; survives the reduction
+(== (min ['z 'z 'z]) 'z) -- true
+(== (max ['z 'z 'z]) 'z) -- true

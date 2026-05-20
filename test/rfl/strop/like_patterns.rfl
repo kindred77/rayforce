@@ -1,0 +1,230 @@
+;; like_patterns.rfl — happy-path RFL coverage for the compiled-shape
+;; branches in src/ops/string.c exec_like / exec_ilike.
+;;
+;; Prior round Q covered the parallel SYM/STR backbone at large N.
+;; This round walks every compiled glob shape (EXACT / PREFIX / SUFFIX /
+;; CONTAINS / ANY / GLOB) over small ~10-row vectors of both STR and
+;; SYM input, exercising the in-memory (non-parted) vec branches of
+;; exec_like (src/ops/string.c:566-704) and exec_ilike (string.c:712-784).
+;;
+;; Pattern shape is classified once by ray_glob_compile (src/ops/glob.c);
+;; the comment after each query lists the shape that branch should hit.
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; STR-vector inputs — exec_like RAY_STR branch (string.c:566-588)
+;; ════════════════════════════════════════════════════════════════════════════
+
+;; 10-row STR vector with a mix of plausible literals + boundary content
+;; (empty string, short and long entries) so every compiled shape has a
+;; mix of hits & misses to count.
+(set TS (table [s] (list (list "abc" "abcdef" "xyzabc" "axc" "" "ABC" "abcabc" "abx" "zabc" "abc?"))))
+
+;; SHAPE_EXACT — pure literal, no meta.  "abc" matches itself (1).
+(count (select {from: TS where: (like s "abc")})) -- 1
+;; SHAPE_EXACT miss — pattern with no rows that match.
+(count (select {from: TS where: (like s "nope")})) -- 0
+
+;; SHAPE_PREFIX — "<lit>*".  Rows starting with "abc": "abc","abcdef",
+;; "abcabc","abc?" → 4.
+(count (select {from: TS where: (like s "abc*")})) -- 4
+;; SHAPE_PREFIX miss
+(count (select {from: TS where: (like s "qq*")})) -- 0
+
+;; SHAPE_SUFFIX — "*<lit>".  Rows ending in "abc": "abc","xyzabc",
+;; "ABC"-not (case-sensitive), "abcabc","zabc" → 4.
+(count (select {from: TS where: (like s "*abc")})) -- 4
+
+;; SHAPE_CONTAINS — "*<lit>*" memmem path.  "abc" substring appears in:
+;; "abc","abcdef","xyzabc","abcabc","zabc","abc?" → 6.
+(count (select {from: TS where: (like s "*abc*")})) -- 6
+
+;; SHAPE_ANY — single "*" — must match every row including "".
+(count (select {from: TS where: (like s "*")})) -- 10
+
+;; SHAPE_NONE general matcher — `?` single-char wildcard.  "abc","ABC",
+;; "abx" match "a?c"? "abc" yes, "ABC" no (case-sens.), "abx" no.
+;; Wait — "a?c" is 3 chars; "axc","abc","ABC" each 3 chars.  Hits:
+;; "axc" (a-x-c yes), "abc" (a-b-c yes), "ABC" (A != a — no) → 2.
+(count (select {from: TS where: (like s "a?c")})) -- 2
+
+;; SHAPE_NONE — character class.  "[aA]bc" matches first char a/A then
+;; literal "bc"; "ABC" has "BC" so fails — only "abc" → 1.
+(count (select {from: TS where: (like s "[aA]bc")})) -- 1
+
+;; SHAPE_NONE — multiple stars / mixed meta.  "a*c*" matches strings
+;; starting with 'a' that contain a 'c' afterwards: "abc","abcdef",
+;; "axc","abcabc","abc?" → 5.
+(count (select {from: TS where: (like s "a*c*")})) -- 5
+
+;; Empty pattern "" — SHAPE_EXACT vs empty literal: only matches the
+;; empty input row.
+(count (select {from: TS where: (like s "")})) -- 1
+
+;; Mixed shape: "a?c*" — '?' forces SHAPE_NONE; needs len>=3, first 'a',
+;; third 'c'.  Hits: "abc","abcdef","axc","abcabc","abc?" → 5.
+(count (select {from: TS where: (like s "a?c*")})) -- 5
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; SYM-vector inputs — exec_like RAY_IS_SYM dict-cache branch (string.c:589-701)
+;; ════════════════════════════════════════════════════════════════════════════
+
+;; Hand-built SYM column.  Same shape mix as TS, with repeated sym_ids
+;; to exercise the seen[]/lut[] dictionary cache (string.c:618-682).
+(set TY (table [s] (list ['abc 'abcdef 'xyzabc 'axc 'ABC 'abcabc 'abx 'zabc 'abc 'abcdef])))
+
+;; SHAPE_EXACT — 'abc appears twice; case-sensitive so 'ABC is excluded.
+(count (select {from: TY where: (like s "abc")})) -- 2
+
+;; SHAPE_PREFIX — sym_ids starting with "abc": 'abc(×2), 'abcdef(×2),
+;; 'abcabc → 5.
+(count (select {from: TY where: (like s "abc*")})) -- 5
+
+;; SHAPE_SUFFIX — ends with "abc": 'abc(×2), 'xyzabc, 'abcabc, 'zabc → 5.
+(count (select {from: TY where: (like s "*abc")})) -- 5
+
+;; SHAPE_CONTAINS — contains "abc": 'abc(×2), 'abcdef(×2), 'xyzabc,
+;; 'abcabc, 'zabc → 7.
+(count (select {from: TY where: (like s "*abc*")})) -- 7
+
+;; SHAPE_ANY — every row.
+(count (select {from: TY where: (like s "*")})) -- 10
+
+;; SHAPE_NONE — `?` wildcard.  3-char syms matching a?c: 'abc(×2),
+;; 'axc → 3.  'ABC fails (case-sens).
+(count (select {from: TY where: (like s "a?c")})) -- 3
+
+;; SHAPE_NONE — char class [aA]bc, literal "bc" after — only 'abc(×2);
+;; 'ABC needs "BC" which is not literal "bc" → 2.
+(count (select {from: TY where: (like s "[aA]bc")})) -- 2
+
+;; SHAPE_NONE — multi-star: 'a*c*' → starts with 'a', has 'c' later.
+;; 'abc(×2), 'abcdef(×2), 'axc, 'abcabc → 6.
+(count (select {from: TY where: (like s "a*c*")})) -- 6
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; ILIKE on STR — exec_ilike RAY_STR branch (string.c:731-738)
+;; ════════════════════════════════════════════════════════════════════════════
+
+;; Same TS rows; ilike folds ASCII case.
+
+;; SHAPE_EXACT ci: matches "abc","ABC" → 2.
+(count (select {from: TS where: (ilike s "abc")})) -- 2
+;; SHAPE_EXACT ci: pattern upper-case folds to lower-case lit.
+(count (select {from: TS where: (ilike s "ABC")})) -- 2
+
+;; SHAPE_PREFIX ci: "abc*" hits "abc","abcdef","ABC","abcabc","abc?" → 5.
+(count (select {from: TS where: (ilike s "abc*")})) -- 5
+(count (select {from: TS where: (ilike s "ABC*")})) -- 5
+
+;; SHAPE_SUFFIX ci: "*abc" hits "abc","xyzabc","ABC","abcabc","zabc" → 5.
+(count (select {from: TS where: (ilike s "*abc")})) -- 5
+(count (select {from: TS where: (ilike s "*ABC")})) -- 5
+
+;; SHAPE_CONTAINS ci: "*abc*" — all rows containing abc/ABC → 7.
+(count (select {from: TS where: (ilike s "*abc*")})) -- 7
+(count (select {from: TS where: (ilike s "*ABC*")})) -- 7
+
+;; SHAPE_ANY ci: always 10.
+(count (select {from: TS where: (ilike s "*")})) -- 10
+
+;; SHAPE_NONE ci '?': "a?c" matches "abc","ABC","axc" → 3.
+(count (select {from: TS where: (ilike s "a?c")})) -- 3
+
+;; SHAPE_NONE ci char class: "[a]bc" same as "abc" ci → 2.
+(count (select {from: TS where: (ilike s "[a]bc")})) -- 2
+
+;; SHAPE_NONE ci multi-star: "a*c*" ci → "abc","abcdef","axc","ABC",
+;; "abcabc","abc?" → 6.
+(count (select {from: TS where: (ilike s "a*c*")})) -- 6
+
+;; Empty pattern ilike — same as like, only "" row.
+(count (select {from: TS where: (ilike s "")})) -- 1
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; ILIKE on SYM — exec_ilike RAY_IS_SYM dict-cache branch (string.c:739-777)
+;; ════════════════════════════════════════════════════════════════════════════
+
+(set TYi (table [s] (list ['Apple 'apple 'APPLE 'banana 'BANANA 'cherry 'Berry 'BERRY 'apricot 'APRICOT])))
+
+;; SHAPE_EXACT ci: "apple" matches 'Apple,'apple,'APPLE → 3.
+(count (select {from: TYi where: (ilike s "apple")})) -- 3
+
+;; SHAPE_PREFIX ci: "ap*" hits 'Apple,'apple,'APPLE,'apricot,'APRICOT → 5.
+(count (select {from: TYi where: (ilike s "ap*")})) -- 5
+(count (select {from: TYi where: (ilike s "AP*")})) -- 5
+
+;; SHAPE_SUFFIX ci: "*RY" hits 'cherry,'Berry,'BERRY → 3.
+(count (select {from: TYi where: (ilike s "*RY")})) -- 3
+(count (select {from: TYi where: (ilike s "*ry")})) -- 3
+
+;; SHAPE_CONTAINS ci: "*an*" hits 'banana,'BANANA → 2.
+(count (select {from: TYi where: (ilike s "*an*")})) -- 2
+(count (select {from: TYi where: (ilike s "*AN*")})) -- 2
+
+;; SHAPE_ANY ci: all 10.
+(count (select {from: TYi where: (ilike s "*")})) -- 10
+
+;; SHAPE_NONE ci '?': "?pple" matches 5-char syms ending in "pple":
+;; 'Apple,'apple,'APPLE → 3.
+(count (select {from: TYi where: (ilike s "?pple")})) -- 3
+
+;; SHAPE_NONE ci char class: "[Aa]pple" — ci folds, hits 'Apple,'apple,
+;; 'APPLE → 3.
+(count (select {from: TYi where: (ilike s "[Aa]pple")})) -- 3
+
+;; SHAPE_NONE ci range: "[a-z]*" — ci, every row starts with a letter → 10.
+(count (select {from: TYi where: (ilike s "[a-z]*")})) -- 10
+(count (select {from: TYi where: (ilike s "[A-Z]*")})) -- 10
+
+;; SHAPE_NONE ci multi-meta: "a*e" — ci, starts with a/A, ends with e/E.
+;; 'Apple,'apple,'APPLE → 3.
+(count (select {from: TYi where: (ilike s "a*e")})) -- 3
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; Edge: pattern longer than every input — every row fails SHAPE_EXACT/
+;; PREFIX/SUFFIX/CONTAINS literal-length check (string.c shape branches
+;; short-circuit when lit_len > sn).
+;; ════════════════════════════════════════════════════════════════════════════
+
+(set TShort (table [s] (list (list "a" "bb" "ccc"))))
+(count (select {from: TShort where: (like s "longliteral")})) -- 0      ;; EXACT
+(count (select {from: TShort where: (like s "longliteral*")})) -- 0     ;; PREFIX
+(count (select {from: TShort where: (like s "*longliteral")})) -- 0     ;; SUFFIX
+(count (select {from: TShort where: (like s "*longliteral*")})) -- 0    ;; CONTAINS
+(count (select {from: TShort where: (like s "*")})) -- 3                ;; ANY
+;; '?' requires exactly N chars — "??" matches 2-char rows only.
+(count (select {from: TShort where: (like s "??")})) -- 1               ;; GLOB '?'
+
+;; Same edge over SYM.
+(set TYShort (table [s] (list ['a 'bb 'ccc])))
+(count (select {from: TYShort where: (like s "longliteral")})) -- 0
+(count (select {from: TYShort where: (like s "longliteral*")})) -- 0
+(count (select {from: TYShort where: (like s "*longliteral")})) -- 0
+(count (select {from: TYShort where: (like s "*longliteral*")})) -- 0
+(count (select {from: TYShort where: (like s "*")})) -- 3
+(count (select {from: TYShort where: (like s "??")})) -- 1
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; Scalar sanity (atom × atom) — re-asserts the compiled-shape paths
+;; via the eval-on-atom form so the same shape dispatch is exercised
+;; once with sn=0 input (empty operand) for each shape.
+;; ════════════════════════════════════════════════════════════════════════════
+
+;; Empty input row against every shape — explicit shape-empty matrix.
+(like "" "")        -- true   ;; SHAPE_EXACT, lit_len==0
+(like "" "abc")     -- false  ;; SHAPE_EXACT, sn=0 < lit_len
+(like "" "abc*")    -- false  ;; SHAPE_PREFIX, lit_len>0
+(like "" "*abc")    -- false  ;; SHAPE_SUFFIX, lit_len>0
+(like "" "*abc*")   -- false  ;; SHAPE_CONTAINS, lit_len>0
+(like "" "*")       -- true   ;; SHAPE_ANY
+(like "" "?")       -- false  ;; GLOB ? needs one char
+
+;; ILIKE is registered only as a DAG/query op (see like.rfl chunk 9),
+;; so the empty-input ci matrix is surfaced via single-row select.
+(set TEmpty (table [s] (list (list ""))))
+(count (select {from: TEmpty where: (ilike s "")}))       -- 1   ;; SHAPE_EXACT ci
+(count (select {from: TEmpty where: (ilike s "abc")}))    -- 0
+(count (select {from: TEmpty where: (ilike s "abc*")}))   -- 0
+(count (select {from: TEmpty where: (ilike s "*abc")}))   -- 0
+(count (select {from: TEmpty where: (ilike s "*abc*")}))  -- 0
+(count (select {from: TEmpty where: (ilike s "*")}))      -- 1   ;; SHAPE_ANY ci

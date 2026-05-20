@@ -1,0 +1,55 @@
+;; Bug 3: extracting a LIST column from a select-by-result table via
+;; `(at Rr 'col)` returned `[error: nyi × N]` even though the same
+;; column displayed correctly when the whole table was printed.
+;;
+;; Root cause: nonagg_eval_per_group_core stored per-group cells as
+;; RAY_LAZY values directly. The first fmt_obj of the table called
+;; ray_lazy_materialize, which frees the lazy's graph — leaving the
+;; LIST cell pointing at a half-dead lazy. Subsequent reads (e.g.
+;; (at table 'col)) returned the dead cell, and any access on it
+;; failed with "nyi" inside execute.
+;;
+;; Fix: materialise lazy cells eagerly in nonagg_eval_per_group_core
+;; before storing them in the result LIST.  Each cell is now a
+;; concrete typed-vec / atom — safe to re-read any number of times.
+
+;; ─── Reverse per group ─────────────────────────────────────────
+(set TR (table [k v] (list ['a 'a 'b 'b 'c] [1 2 3 4 5])))
+(set Rr (select {rv: (reverse v) from: TR by: k}))
+
+;; (a) Full-table display materialises cells — the original happy
+;; path that was already working.
+(count Rr) -- 3
+(count (at Rr 'rv)) -- 3
+
+;; (b) Column extraction must give concrete per-group vecs, not
+;; half-dead lazies.  This was the failing read.
+(set Crv (at Rr 'rv))
+(at Crv 0) -- [2 1]
+(at Crv 1) -- [4 3]
+(at Crv 2) -- [5]
+
+;; (c) Repeated reads of the same cell — must stay valid (lazy
+;; cells would fail the second time after fmt_obj stole the graph).
+(at (at Rr 'rv) 0) -- [2 1]
+(at (at Rr 'rv) 1) -- [4 3]
+(at (at Rr 'rv) 0) -- [2 1]
+(at (at Rr 'rv) 0) -- [2 1]
+
+;; ─── asc per group ────────────────────────────────────────────
+(set TA (table [k v] (list ['a 'a 'a 'b 'b] [3 1 2 5 4])))
+(set Ra (select {av: (asc v) from: TA by: k}))
+(at (at Ra 'av) 0) -- [1 2 3]
+(at (at Ra 'av) 1) -- [4 5]
+(at (at Ra 'av) 1) -- [4 5]
+
+;; ─── desc per group ───────────────────────────────────────────
+(set Rd (select {dv: (desc v) from: TA by: k}))
+(at (at Rd 'dv) 0) -- [3 2 1]
+(at (at Rd 'dv) 1) -- [5 4]
+
+;; ─── F64 ──────────────────────────────────────────────────────
+(set TF (table [k v] (list ['a 'a 'b 'b] [1.5 2.5 3.5 4.5])))
+(set Rf (select {rv: (reverse v) from: TF by: k}))
+(at (at Rf 'rv) 0) -- [2.5 1.5]
+(at (at Rf 'rv) 1) -- [4.5 3.5]

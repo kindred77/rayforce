@@ -1,0 +1,174 @@
+;; ════════════════════════════════════════════════════════════════════
+;; Reprobe / per-group dispatch stress for n_groups > 65536
+;; (src/ops/group.c).
+;;
+;; Targets four 0%-coverage functions activated only above the
+;; ray_pool_dispatch_n task-ring cap (MAX_RING_CAP = 1<<16 = 65536):
+;;
+;;   - ray_median_per_group_buf / ray_topk_per_group_buf
+;;       fix 91531da8 added an `n_groups < (1 << 16)` branch that
+;;       falls back to ray_pool_dispatch (elements-based) above the
+;;       cap.  Below 65536 stays on dispatch_n.  Both branches must
+;;       cover all groups — a multi-key holistic agg over 65536+
+;;       distinct groups previously dropped the tail (returned 65536
+;;       cells instead of n_groups).
+;;
+;;   - reprobe_rows_fn  (group.c:4329)
+;;       Post-radix re-probe: holistic aggs need a per-group row slice
+;;       so the executor re-hashes each source row against the
+;;       partitioned HTs to recover global gids.  Always runs when
+;;       `ght_layout.agg_is_holistic` is set; queries below force a
+;;       multi-key holistic dispatch over a high-cardinality table so
+;;       both the reprobe scan and the subsequent dispatch_n /
+;;       dispatch fallback are exercised.
+;;
+;;   - group_ht_insert_empty_group  (group.c:2337)
+;;   - group_rows_range_existing    (group.c:2529)
+;;   - group_probe_existing_entry   (group.c:2364)
+;;       Top-count emit-filter path: planner converts
+;;         (select {c:(count k) by:[k1 k2] desc:c take:N})
+;;       into a runtime emit filter; group.c at 6700 / 6900 / 7160
+;;       pre-populates a result HT with the heavy keys via
+;;       group_ht_insert_empty_group, then re-scans every source row
+;;       via group_rows_range_existing → group_probe_existing_entry
+;;       to fold matching rows into the kept groups.  Only multi-key
+;;       (n_keys >= 2 && n_keys <= 5) routes here; single key uses a
+;;       different fused path.  HT-grow path is reached when the
+;;       initial ht_cap (256, grown to fit heavy_count*2 worst case)
+;;       fills past load factor 0.5 across the re-scan.
+;;
+;; Trigger conditions in this file:
+;;   - 70_000 unique I64 keys → n_groups > 1<<16 (65536) cap
+;;   - holistic agg via (med v) or (top v K) under by: [k1 k2]
+;;   - top-count filter via desc:c take:N over multi-key by:
+;;
+;; Sub-threshold baseline (50_000 groups) verifies the dispatch_n
+;; branch still works — i.e. the gate's "<" boundary stays correct.
+;;
+;; Sizing: 70_000 rows / groups is just above
+;;   - RAY_PARALLEL_THRESHOLD (64*1024 = 65536, ops.h:92) → radix path
+;;   - the new 1<<16 dispatch_n cap in the per-group buf kernels.
+;; ════════════════════════════════════════════════════════════════════
+
+;; ── 1. Multi-key median over 70k distinct (k1, k2) groups ───────────
+;; 70k rows, k1 ∈ [0..69999], k2 = 0 — uniqueness of (k1, k2) is
+;; driven by k1.  Holistic agg + multi-key forces the post-radix
+;; reprobe_rows_fn + ray_median_per_group_buf with n_groups = 70000
+;; > 65536, hitting the new ray_pool_dispatch elements-based branch.
+;; v is row index so per-group median is the value at the single row.
+(set N 70000)
+(set Tmed (table [k1 k2 v] (list (as 'I64 (til N)) (as 'I64 (% (til N) 1)) (as 'I64 (til N)))))
+(set Rmed (select {m: (med v) by: [k1 k2] from: Tmed}))
+(count Rmed) -- 70000
+;; Each group has exactly one row, so med == v == k1.
+;; Sum of medians = sum of (til 70000) = 70000*69999/2 = 2449965000.
+(sum (at Rmed 'm)) -- 2449965000.0
+;; med returns F64.
+(type (at Rmed 'm)) -- 'F64
+
+;; ── 2. Multi-key median with multi-row groups (n_groups > 65536) ────
+;; 140k rows, 70k distinct (k1, k2) pairs — every group sees exactly
+;; 2 rows (row i and row i+N).  Per-group median = (v_i + v_{i+N}) / 2
+;; = (i + (i+N)) / 2 = i + N/2 = i + 35000.  Sum of medians = sum
+;; over i of (i + 35000) = 2449965000 + 70000*35000 = 4899965000.0
+(set N2 140000)
+(set Tmed2 (table [k1 k2 v] (list (as 'I64 (% (til N2) N)) (as 'I64 (% (til N2) 1)) (as 'I64 (til N2)))))
+(set Rmed2 (select {m: (med v) by: [k1 k2] from: Tmed2}))
+(count Rmed2) -- 70000
+(sum (at Rmed2 'm)) -- 4899965000.0
+;; min median is for k1=0: (0 + 70000) / 2 = 35000.0
+(min (at Rmed2 'm)) -- 35000.0
+;; max median is for k1=69999: (69999 + 139999) / 2 = 104999.0
+(max (at Rmed2 'm)) -- 104999.0
+
+;; ── 3. Multi-key top-K with n_groups > 65536 ────────────────────────
+;; Same Tmed2 (140k rows, 70k groups, 2 rows per group).
+;; (top v 1) per group = max of the two rows = i + N = i + 70000.
+;; Result cells are LIST<I64>, one elem each.
+(set Rtop1 (select {t: (top v 1) by: [k1 k2] from: Tmed2}))
+(count Rtop1) -- 70000
+;; Each cell holds 1 element → total kept = 70000.
+(fold + 0 (map count (at Rtop1 't))) -- 70000
+;; Sum of all (single-element) cells = sum over i of (i + N)
+;;   = (N*(N-1)/2) + N*N = 2449965000 + 70000*70000 = 7349965000.
+(fold + 0 (map sum (at Rtop1 't))) -- 7349965000
+;; Symmetric: (bot v 1) keeps the lower of the two = i; sum = 2449965000.
+(fold + 0 (map sum (at (select {t: (bot v 1) by: [k1 k2] from: Tmed2}) 't))) -- 2449965000
+
+;; (top v 2) per group: both elements kept; group sum = 2i + N.
+;; Each cell has length 2.  Total kept = 140000.  Sum across all cells
+;; = sum over groups of (i + (i + N)) = 2 * 2449965000 + 70000*70000
+;; = 4899930000 + 4900000000 = 9799930000.
+(set Rtop2 (select {t: (top v 2) by: [k1 k2] from: Tmed2}))
+(fold + 0 (map count (at Rtop2 't))) -- 140000
+(fold + 0 (map sum   (at Rtop2 't))) -- 9799930000
+
+;; ── 4. Top-count filter: desc:c take:N over 70k multi-key groups ────
+;; (count v) with by:[k1 k2] + desc:c + take:K triggers the emit
+;; filter `top_count_take` path; n_keys=2 routes through the
+;; group_ht_insert_empty_group / group_rows_range_existing /
+;; group_probe_existing_entry block at group.c:6700-7060.
+;;
+;; Tcc has 70k rows, 35000 distinct (k1, k2) pairs, each with count
+;; 2.  Top-K is deterministic over count, ties broken by partition
+;; order.  We assert exact row count and the heavy-count sum.
+(set Ncc 70000)
+(set Tcc (table [k1 k2 v] (list (as 'I64 (% (til Ncc) 35000)) (as 'I64 (% (til Ncc) 1)) (as 'I64 (til Ncc)))))
+(set Rcc (select {c: (count v) from: Tcc by: [k1 k2] desc: c take: 100}))
+(count Rcc) -- 100
+;; Each surviving group has count 2.
+(sum (at Rcc 'c)) -- 200
+(max (at Rcc 'c)) -- 2
+(min (at Rcc 'c)) -- 2
+
+;; ── 5. Top-count filter at the 70k-group level (heavy-key promote) ──
+;; Imbalanced counts so the heap selects identifiable winners.  Tcc2
+;; has 70_010 rows: 70_000 unique k1 values with one row each, then
+;; 10 extra rows duplicating k1=0..9.  k1=0..9 have count 2; the
+;; rest have count 1.  Top-5 by count must keep 5 of those 10 ties,
+;; all with c == 2.
+(set Nbase 70000)
+(set Tcc2 (table [k1 k2 v] (list (as 'I64 (concat (til Nbase) (til 10))) (as 'I64 (% (til (+ Nbase 10)) 1)) (as 'I64 (til (+ Nbase 10))))))
+(set Rcc2 (select {c: (count v) from: Tcc2 by: [k1 k2] desc: c take: 5}))
+(count Rcc2) -- 5
+(sum (at Rcc2 'c)) -- 10
+(min (at Rcc2 'c)) -- 2
+(max (at Rcc2 'c)) -- 2
+
+;; ── 6. Three-key top-count filter, 70k groups ───────────────────────
+;; n_keys=3 still routes through the multi-key emit-filter block
+;; (range 2..5 inclusive).  Re-uses N2 (140k rows, 70k unique
+;; (k1, k2, k3=k2) triples).  desc:c take:50 keeps 50 groups, each
+;; with count 2.
+(set Tcc3 (table [k1 k2 k3 v] (list (as 'I64 (% (til N2) N)) (as 'I64 (% (til N2) 1)) (as 'I64 (% (til N2) 1)) (as 'I64 (til N2)))))
+(set Rcc3 (select {c: (count v) from: Tcc3 by: [k1 k2 k3] desc: c take: 50}))
+(count Rcc3) -- 50
+(sum (at Rcc3 'c)) -- 100
+(min (at Rcc3 'c)) -- 2
+
+;; ── 7. Sub-threshold baseline: 50_000 groups (stays on dispatch_n) ──
+;; n_groups < 1<<16 → ray_pool_dispatch_n branch (original path).
+;; Verifies the gate boundary did not regress.  50k rows, 50k unique
+;; (k1, k2) groups, multi-key holistic median.
+(set Nbase2 50000)
+(set Tlow (table [k1 k2 v] (list (as 'I64 (til Nbase2)) (as 'I64 (% (til Nbase2) 1)) (as 'I64 (til Nbase2)))))
+(set Rlow (select {m: (med v) by: [k1 k2] from: Tlow}))
+(count Rlow) -- 50000
+;; Each group is a single row, sum(med) = sum(v) = 50000*49999/2 = 1249975000.0.
+(sum (at Rlow 'm)) -- 1249975000.0
+
+;; ── 8. F64 value column with n_groups > 65536 holistic median ───────
+;; Reaches the F64 arm of med_read_as_f64 + the >65536 dispatch.
+(set Tfmed (table [k1 k2 v] (list (as 'I64 (% (til N2) N)) (as 'I64 (% (til N2) 1)) (as 'F64 (til N2)))))
+(set Rfmed (select {m: (med v) by: [k1 k2] from: Tfmed}))
+(count Rfmed) -- 70000
+(sum (at Rfmed 'm)) -- 4899965000.0
+
+;; ── 9. SYM keys with n_groups > 65536 holistic median ───────────────
+;; Wide-key (SYM) path through reprobe_rows_fn.  70k distinct
+;; symbol keys → 70k groups.  (as 'SYMBOL (til N)) interns N
+;; distinct symbols.
+(set Tsmed (table [k1 k2 v] (list (as 'SYMBOL (til N)) (as 'SYMBOL (% (til N) 1)) (as 'I64 (til N)))))
+(set Rsmed (select {m: (med v) by: [k1 k2] from: Tsmed}))
+(count Rsmed) -- 70000
+(sum (at Rsmed 'm)) -- 2449965000.0

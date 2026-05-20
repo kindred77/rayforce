@@ -1,0 +1,198 @@
+;; src/ops/strop.c — happy-path coverage for strlen on partitioned columns.
+;;
+;; ray_strlen_fn dispatches on x->type after the atom + vec checks:
+;;   • x->type == RAY_MAPCOMMON          → strlen_mapcommon  (61 regions)
+;;   • RAY_IS_PARTED(x->type)            → strlen_parted     (50 regions)
+;;
+;; A MAPCOMMON column is the partition-key column produced by
+;; .db.parted.get when the partition directory names are NOT all
+;; date-shaped and NOT all integer-shaped — collect_part_dirs accepts
+;; any digit/dot sequence, so dirs like "1.2.3" pass the filter,
+;; fail is_date_dir (length != 10) and is_integer_str (contains dots),
+;; and infer_mc_type falls through to RAY_MC_SYM.  ray_sym_intern
+;; stores the literal directory name as the sym; (strlen sym) is then
+;; the literal name length.
+;;
+;; A PARTED column is the data column shape (RAY_PARTED_BASE + RAY_SYM
+;; or + RAY_STR): one segment per partition, each segment a flat SYM /
+;; STR vector.  strlen_parted iterates segments and per-row reads each
+;; segment via strlen_vec_value.
+;;
+;; Fixture dirs use the rf_test_* prefix so the Makefile's
+;; `rm -f rf_test_*.csv` rule is consistent with the convention; the
+;; partition directories themselves are cleaned explicitly below.
+
+;; ────────────── pre-flight cleanup ──────────────
+(.sys.exec "rm -rf rf_test_strlen_mc_sym rf_test_strlen_mc_long rf_test_strlen_parted_sym rf_test_strlen_parted_date rf_test_strlen_parted_int")
+
+;; ════════════════════════════════════════════════════════════════
+;; 1. strlen on RAY_MAPCOMMON (RAY_MC_SYM partition key).
+;;
+;; Two partition dirs "1.2.3" (len 5) and "4.5.67" (len 6).  Each has
+;; a splayed table with 3 + 2 rows.  The partition-key column is named
+;; 'part and has type RAY_MAPCOMMON / attrs=RAY_MC_SYM.  strlen_mapcommon
+;; walks keys/counts and emits an I64 vector of length total_rows
+;; where each row in partition p has value strlen(part_dirs[p]).
+;; Expected: 3×5 + 2×6 = 27.
+;; ════════════════════════════════════════════════════════════════
+(set MC-A (table [v] (list ['alpha 'beta 'gamma])))
+(set MC-B (table [v] (list ['x 'yz])))
+(.db.splayed.set "rf_test_strlen_mc_sym/1.2.3/t/" MC-A)
+(.db.splayed.set "rf_test_strlen_mc_sym/4.5.67/t/" MC-B)
+
+(set Pmc (.db.parted.get "rf_test_strlen_mc_sym/" 't))
+(count Pmc) -- 5
+(first (key Pmc)) -- 'part
+
+;; strlen on the MAPCOMMON column itself — exercises strlen_mapcommon.
+;; Result has one entry per row: 3 rows in "1.2.3" (len 5) +
+;; 2 rows in "4.5.67" (len 6) → [5 5 5 6 6].
+(count (strlen (at Pmc 'part))) -- 5
+(sum (strlen (at Pmc 'part))) -- 27
+(at (strlen (at Pmc 'part)) 0) -- 5
+(at (strlen (at Pmc 'part)) 2) -- 5
+(at (strlen (at Pmc 'part)) 3) -- 6
+(at (strlen (at Pmc 'part)) 4) -- 6
+
+;; ════════════════════════════════════════════════════════════════
+;; 2. strlen on RAY_MAPCOMMON with mixed-length dir names.
+;;
+;; Three partitions whose names sort lexically (bubble sort in
+;; collect_part_dirs is the same one exercised in part.rfl) into
+;; "1.2.3" (5), "12.3" (4), "9.87" (4).  Row counts 1 + 2 + 3.
+;; Expected strlen sum: 1*5 + 2*4 + 3*4 = 5 + 8 + 12 = 25.
+;;
+;; This case proves strlen_mapcommon's inner expansion loop runs the
+;; counts[p] iterations correctly across more than two partitions
+;; and that each partition's per-row value is the right sym's length.
+;; ════════════════════════════════════════════════════════════════
+(set ML-A (table [v] (list ['a])))
+(set ML-B (table [v] (list ['p 'q])))
+(set ML-C (table [v] (list ['x 'y 'z])))
+(.db.splayed.set "rf_test_strlen_mc_long/1.2.3/t/" ML-A)
+(.db.splayed.set "rf_test_strlen_mc_long/12.3/t/"  ML-B)
+(.db.splayed.set "rf_test_strlen_mc_long/9.87/t/"  ML-C)
+
+(set Pml (.db.parted.get "rf_test_strlen_mc_long/" 't))
+(count Pml) -- 6
+(first (key Pml)) -- 'part
+
+(count (strlen (at Pml 'part))) -- 6
+(sum (strlen (at Pml 'part))) -- 25
+;; Sorted dir order is ["1.2.3", "12.3", "9.87"].
+(at (strlen (at Pml 'part)) 0) -- 5
+(at (strlen (at Pml 'part)) 1) -- 4
+(at (strlen (at Pml 'part)) 2) -- 4
+(at (strlen (at Pml 'part)) 3) -- 4
+(at (strlen (at Pml 'part)) 4) -- 4
+(at (strlen (at Pml 'part)) 5) -- 4
+
+;; ════════════════════════════════════════════════════════════════
+;; 3. strlen on RAY_PARTED + RAY_SYM (the SYM data column shape).
+;;
+;; Two partitions, each with a SYM column 'tag.  After load the 'tag
+;; column has type RAY_PARTED_BASE + RAY_SYM and len = part_count.
+;; strlen_parted walks each segment and produces a flat I64 vec of
+;; length total_rows.
+;;
+;; Symbols and their lengths:
+;;   part 0 (2024.01.01): ['alpha 'beta]        → [5 4]
+;;   part 1 (2024.01.02): ['gamma 'delta 'eps]  → [5 5 3]
+;; Sum: 5+4+5+5+3 = 22.
+;; ════════════════════════════════════════════════════════════════
+(set PS-A (table [tag v] (list ['alpha 'beta] [10 20])))
+(set PS-B (table [tag v] (list ['gamma 'delta 'eps] [30 40 50])))
+(.db.splayed.set "rf_test_strlen_parted_sym/2024.01.01/t/" PS-A)
+(.db.splayed.set "rf_test_strlen_parted_sym/2024.01.02/t/" PS-B)
+
+(set Pps (.db.parted.get "rf_test_strlen_parted_sym/" 't))
+(count Pps) -- 5
+(key Pps) -- ['date 'tag 'v]
+
+;; strlen on the parted SYM column — exercises strlen_parted.
+(count (strlen (at Pps 'tag))) -- 5
+(sum (strlen (at Pps 'tag))) -- 22
+(at (strlen (at Pps 'tag)) 0) -- 5
+(at (strlen (at Pps 'tag)) 1) -- 4
+(at (strlen (at Pps 'tag)) 2) -- 5
+(at (strlen (at Pps 'tag)) 3) -- 5
+(at (strlen (at Pps 'tag)) 4) -- 3
+
+;; ════════════════════════════════════════════════════════════════
+;; 4. strlen on RAY_PARTED + RAY_SYM, single-symbol-name partition.
+;;
+;; Edge case for the per-segment inner loop in strlen_parted: a
+;; partition with exactly one row exercises seg->len == 1.  Also
+;; uses a date-shaped partition key for variety (so the MAPCOMMON
+;; sub-type is RAY_MC_DATE; we don't strlen the date column here —
+;; strlen on int/date MAPCOMMON keys would be a separate code path
+;; gated by the keys->type != RAY_STR && != RAY_SYM check at
+;; strlen_mapcommon's top).
+;; ════════════════════════════════════════════════════════════════
+(set PD-A (table [tag] (list ['onesym])))
+(set PD-B (table [tag] (list ['ab 'cdefgh])))
+(.db.splayed.set "rf_test_strlen_parted_date/2024.05.01/t/" PD-A)
+(.db.splayed.set "rf_test_strlen_parted_date/2024.05.02/t/" PD-B)
+
+(set Ppd (.db.parted.get "rf_test_strlen_parted_date/" 't))
+(count Ppd) -- 3
+;; 'tag is the parted SYM column.
+(count (strlen (at Ppd 'tag))) -- 3
+(sum (strlen (at Ppd 'tag))) -- 14
+(at (strlen (at Ppd 'tag)) 0) -- 6
+(at (strlen (at Ppd 'tag)) 1) -- 2
+(at (strlen (at Ppd 'tag)) 2) -- 6
+
+;; ════════════════════════════════════════════════════════════════
+;; 5. strlen on RAY_PARTED + RAY_SYM with int-partitioned root.
+;;
+;; Pure-integer partition names yield RAY_MC_I64 for the key column
+;; (we don't strlen the key here — see note above) but the parted
+;; data column is unchanged: still RAY_PARTED_BASE + RAY_SYM.  This
+;; cross-checks that strlen_parted is independent of the MAPCOMMON
+;; sub-type carried alongside it in the same table.
+;; ════════════════════════════════════════════════════════════════
+(set PI-A (table [tag] (list ['hi 'bye])))
+(set PI-B (table [tag] (list ['hello])))
+(set PI-C (table [tag] (list ['x 'yy 'zzz])))
+(.db.splayed.set "rf_test_strlen_parted_int/10/t/"  PI-A)
+(.db.splayed.set "rf_test_strlen_parted_int/200/t/" PI-B)
+(.db.splayed.set "rf_test_strlen_parted_int/300/t/" PI-C)
+
+(set Ppi (.db.parted.get "rf_test_strlen_parted_int/" 't))
+(count Ppi) -- 6
+(first (key Ppi)) -- 'part
+
+(count (strlen (at Ppi 'tag))) -- 6
+;; Lexical sort: "10", "200", "300" → ['hi 'bye 'hello 'x 'yy 'zzz]
+;; Lengths: [2 3 5 1 2 3], sum = 16.
+(sum (strlen (at Ppi 'tag))) -- 16
+(at (strlen (at Ppi 'tag)) 0) -- 2
+(at (strlen (at Ppi 'tag)) 1) -- 3
+(at (strlen (at Ppi 'tag)) 2) -- 5
+(at (strlen (at Ppi 'tag)) 3) -- 1
+(at (strlen (at Ppi 'tag)) 4) -- 2
+(at (strlen (at Ppi 'tag)) 5) -- 3
+
+;; ────────────── teardown ──────────────
+(.sys.exec "rm -rf rf_test_strlen_mc_sym rf_test_strlen_mc_long rf_test_strlen_parted_sym rf_test_strlen_parted_date rf_test_strlen_parted_int")
+
+;; ────────────── reachability notes ──────────────
+;; strlen_mapcommon has an inner null-handling branch
+;;   bool is_null = (keys->attrs & RAY_ATTR_HAS_NULLS) && ray_vec_is_null(keys, p);
+;; which fires only when the partition-key vector itself carries
+;; HAS_NULLS.  ray_read_parted populates kv_data directly from the
+;; directory name (parse_date_dir / parse_int_dir / ray_sym_intern)
+;; and never sets RAY_ATTR_HAS_NULLS on key_values, so this branch
+;; is not reachable from RFL fixtures: there is no public API to
+;; produce a MAPCOMMON column with a null partition key.  Same for
+;; the RAY_STR keys->type branch (sym dirs always intern as SYM,
+;; never STR).  Both are guarded internal-state paths.
+;;
+;; strlen_parted's null-handling branch fires per-segment when a
+;; segment carries HAS_NULLS.  SYM vectors built via .db.splayed.set
+;; from list literals do not carry null bits unless a NULL_I64 sym
+;; id appears, which RFL has no syntax for; reaching this requires
+;; CSV input with empty SYM fields and is covered in csv_splayed.rfl
+;; only for the flat-SYM (non-parted) shape.  Not a happy-path
+;; concern.

@@ -1,0 +1,481 @@
+;; string_manipulation.rfl — happy-path coverage for the per-element
+;; transform paths in src/ops/string.c:
+;;
+;;   exec_string_unary (OP_UPPER / OP_LOWER / OP_TRIM)  (string.c:795-874)
+;;   exec_strlen                                         (string.c:877-912)
+;;   exec_substr                                         (string.c:914-1019)
+;;   exec_replace                                        (string.c:1022-1124)
+;;   exec_concat (variadic 2..6 args)                    (string.c:1127-1267)
+;;
+;; Prior rounds (test/rfl/strop/strlen.rfl, like_patterns.rfl,
+;; string_par.rfl) already covered:
+;;   * the parallel LIKE / ILIKE shapes,
+;;   * the parallel binary STR/SYM comparison kernel,
+;;   * the 100k+ row dispatch through the worker pool,
+;;   * the basic 3-row functional shape for upper/lower/trim/substr/replace.
+;;
+;; This round goes wider on small (~10-row) deterministic vectors and
+;; walks the body of each op against the dimensions called out in the
+;; planning brief:
+;;
+;;   * concat   — 2/3/4/5/6 args, SYM-only / STR-only / mixed-SYM-STR
+;;                + STR atom interleaved into a SYM column
+;;   * substr   — scalar I64 / scalar F64 / single-elem vec / per-row vec
+;;                offsets that cross the RAY_STR_INLINE_MAX = 12-byte SSO
+;;                boundary in src/vec/str.h (lines 39-45)
+;;   * replace  — exact-match (same length), shrinking, expanding,
+;;                no-match, whole-string match, multi-occurrence;
+;;                SYM + STR; pooled-output rows
+;;   * upper/lower/trim — ASCII; SYM + STR; trim covers leading/trailing/
+;;                both/interior/all-whitespace/empty/no-pad
+;;   * strlen   — empty, single, 7, 12 (old/new SSO), 13, 20, 40, 44 bytes;
+;;                SYM + STR
+;;
+;; Verification idiom: build a small deterministic source column, run
+;; the op via (select {col: (op ...) from: T}) — that's the only
+;; surface that calls exec_concat/substr/replace/upper/lower/trim on
+;; a vec (see src/ops/query.c:282-1050).  Compare the result column
+;; element-wise via (at result i) or vector equality (== R E) reduced
+;; via (sum (== R E)) == nrows.
+;;
+;; Test runner is strictly line-based (test/main.c:191-209), so each
+;; expression and its `-- expected` is kept on a single line.
+
+;; ════════════════════════════════════════════════════════════════════
+;; 1. exec_concat — 2-arg, SYM × SYM column → SYM output
+;; ════════════════════════════════════════════════════════════════════
+(set Tcc (table [a b] (list ['ax 'bx 'cx 'dx 'ex 'fx 'gx 'hx 'ix 'jx] ['Ay 'By 'Cy 'Dy 'Ey 'Fy 'Gy 'Hy 'Iy 'Jy])))
+(count Tcc) -- 10
+(set R1 (at (select {r: (concat a b) from: Tcc}) 'r))
+(count R1) -- 10
+(at R1 0) -- 'axAy
+(at R1 4) -- 'exEy
+(at R1 9) -- 'jxJy
+(sum (== R1 ['axAy 'bxBy 'cxCy 'dxDy 'exEy 'fxFy 'gxGy 'hxHy 'ixIy 'jxJy])) -- 10
+
+;; ════════════════════════════════════════════════════════════════════
+;; 2. exec_concat — 2-arg, STR × STR column → STR output
+;; ════════════════════════════════════════════════════════════════════
+;; STR side flips out_str = true (line 1166); result is RAY_STR.
+(set Tcs (table [a b] (list ["alpha" "bravo" "charlie" "delta" "echo" "foxtrot" "golf" "hotel" "india" "juliet"] ["-1" "-2" "-3" "-4" "-5" "-6" "-7" "-8" "-9" "-10"])))
+(set R2 (at (select {r: (concat a b) from: Tcs}) 'r))
+(count R2) -- 10
+(at R2 0) -- "alpha-1"
+(at R2 5) -- "foxtrot-6"
+(at R2 9) -- "juliet-10"
+(sum (== R2 ["alpha-1" "bravo-2" "charlie-3" "delta-4" "echo-5" "foxtrot-6" "golf-7" "hotel-8" "india-9" "juliet-10"])) -- 10
+
+;; ════════════════════════════════════════════════════════════════════
+;; 3. exec_concat — mixed: SYM column + STR atom → SYM output
+;; ════════════════════════════════════════════════════════════════════
+;; -RAY_STR scalar alone does NOT flip out_str (line 1166 only flips on
+;; vec or +RAY_STR atom).  Output is SYM.
+(set R3 (at (select {r: (concat a "_z") from: Tcc}) 'r))
+(at R3 0) -- 'ax_z
+(at R3 9) -- 'jx_z
+(sum (== R3 ['ax_z 'bx_z 'cx_z 'dx_z 'ex_z 'fx_z 'gx_z 'hx_z 'ix_z 'jx_z])) -- 10
+
+(set R4 (at (select {r: (concat "p_" a) from: Tcc}) 'r))
+(at R4 0) -- 'p_ax
+(at R4 9) -- 'p_jx
+(sum (== R4 ['p_ax 'p_bx 'p_cx 'p_dx 'p_ex 'p_fx 'p_gx 'p_hx 'p_ix 'p_jx])) -- 10
+
+;; ════════════════════════════════════════════════════════════════════
+;; 4. exec_concat — 3 args (trail[] expansion, string.c:1145-1148)
+;; ════════════════════════════════════════════════════════════════════
+(set R5 (at (select {r: (concat a "+" b) from: Tcs}) 'r))
+(at R5 0) -- "alpha+-1"
+(at R5 9) -- "juliet+-10"
+(sum (== R5 ["alpha+-1" "bravo+-2" "charlie+-3" "delta+-4" "echo+-5" "foxtrot+-6" "golf+-7" "hotel+-8" "india+-9" "juliet+-10"])) -- 10
+
+(set R6 (at (select {r: (concat a b "!") from: Tcc}) 'r))
+(at R6 0) -- 'axAy!
+(at R6 9) -- 'jxJy!
+
+;; ════════════════════════════════════════════════════════════════════
+;; 5. exec_concat — 4 args
+;; ════════════════════════════════════════════════════════════════════
+(set R7 (at (select {r: (concat "[" a "|" b) from: Tcs}) 'r))
+(at R7 0) -- "[alpha|-1"
+(at R7 9) -- "[juliet|-10"
+
+;; ════════════════════════════════════════════════════════════════════
+;; 6. exec_concat — 5 args
+;; ════════════════════════════════════════════════════════════════════
+(set R8 (at (select {r: (concat "<" a "|" b ">") from: Tcs}) 'r))
+(at R8 0) -- "<alpha|-1>"
+(at R8 4) -- "<echo|-5>"
+(at R8 9) -- "<juliet|-10>"
+
+;; ════════════════════════════════════════════════════════════════════
+;; 7. exec_concat — 6 args (full width)
+;; ════════════════════════════════════════════════════════════════════
+(set R9 (at (select {r: (concat "(" a "," b "," "end" ")") from: Tcs}) 'r))
+(at R9 0) -- "(alpha,-1,end)"
+(at R9 5) -- "(foxtrot,-6,end)"
+(at R9 9) -- "(juliet,-10,end)"
+
+;; ════════════════════════════════════════════════════════════════════
+;; 8. exec_string_unary — UPPER over a 10-row STR column
+;; ════════════════════════════════════════════════════════════════════
+;; Mix of all-lower / mixed-case / all-upper / digits+punct / empty /
+;; whitespace-bearing — exercises the toupper loop (line 851) across a
+;; representative ASCII set, including the empty-row branch (line 819).
+(set TStrU (table [s] (list ["alpha" "Bravo" "CHARLIE" "delta42" "Echo!" "" "Foxtrot" "golfING" "HoTeL" "  india  "])))
+(set RUpStr (at (select {r: (upper s) from: TStrU}) 'r))
+(count RUpStr) -- 10
+(at RUpStr 0) -- "ALPHA"
+(at RUpStr 1) -- "BRAVO"
+(at RUpStr 2) -- "CHARLIE"
+(at RUpStr 3) -- "DELTA42"
+(at RUpStr 4) -- "ECHO!"
+(at RUpStr 5) -- ""
+(at RUpStr 6) -- "FOXTROT"
+(at RUpStr 7) -- "GOLFING"
+(at RUpStr 8) -- "HOTEL"
+(at RUpStr 9) -- "  INDIA  "
+(sum (== RUpStr ["ALPHA" "BRAVO" "CHARLIE" "DELTA42" "ECHO!" "" "FOXTROT" "GOLFING" "HOTEL" "  INDIA  "])) -- 10
+
+;; ════════════════════════════════════════════════════════════════════
+;; 9. exec_string_unary — UPPER over a 10-row SYM column
+;; ════════════════════════════════════════════════════════════════════
+;; SYM path takes the sym_dst branch (line 868) and re-interns via
+;; ray_sym_intern.  SYM literals cannot carry whitespace at the parser
+;; level, so the row-5 fixture uses 'x to keep row count at 10.
+(set TSymU (table [s] (list ['alpha 'Bravo 'CHARLIE 'delta42 'Echo 'x 'Foxtrot 'golfING 'HoTeL 'india])))
+(set RUpSym (at (select {r: (upper s) from: TSymU}) 'r))
+(count RUpSym) -- 10
+(at RUpSym 0) -- 'ALPHA
+(at RUpSym 1) -- 'BRAVO
+(at RUpSym 2) -- 'CHARLIE
+(at RUpSym 3) -- 'DELTA42
+(at RUpSym 4) -- 'ECHO
+(at RUpSym 5) -- 'X
+(at RUpSym 7) -- 'GOLFING
+(at RUpSym 9) -- 'INDIA
+(sum (== RUpSym ['ALPHA 'BRAVO 'CHARLIE 'DELTA42 'ECHO 'X 'FOXTROT 'GOLFING 'HOTEL 'INDIA])) -- 10
+
+;; ════════════════════════════════════════════════════════════════════
+;; 10. exec_string_unary — LOWER over STR and SYM columns
+;; ════════════════════════════════════════════════════════════════════
+(set RLoStr (at (select {r: (lower s) from: TStrU}) 'r))
+(at RLoStr 0) -- "alpha"
+(at RLoStr 2) -- "charlie"
+(at RLoStr 3) -- "delta42"
+(at RLoStr 8) -- "hotel"
+(at RLoStr 9) -- "  india  "
+(sum (== RLoStr ["alpha" "bravo" "charlie" "delta42" "echo!" "" "foxtrot" "golfing" "hotel" "  india  "])) -- 10
+
+(set RLoSym (at (select {r: (lower s) from: TSymU}) 'r))
+(at RLoSym 1) -- 'bravo
+(at RLoSym 2) -- 'charlie
+(at RLoSym 7) -- 'golfing
+(sum (== RLoSym ['alpha 'bravo 'charlie 'delta42 'echo 'x 'foxtrot 'golfing 'hotel 'india])) -- 10
+
+;; Round-trip: upper-then-lower of an already-lower SYM column.
+(set TRT (table [s] (list ['alpha 'bravo 'charlie])))
+(set RRT (at (select {r: (lower (upper s)) from: TRT}) 'r))
+(sum (== RRT ['alpha 'bravo 'charlie])) -- 3
+
+;; ════════════════════════════════════════════════════════════════════
+;; 11. exec_string_unary — TRIM over STR column
+;; ════════════════════════════════════════════════════════════════════
+;; TRIM walks both ends with isspace (lines 856-857), preserves middle.
+;; Rows exercise: leading-only, trailing-only, both ends, interior
+;; whitespace preserved, tab/newline as whitespace, all-whitespace,
+;; empty, no-whitespace, single char.
+(set TTrim (table [s] (list ["  leading" "trailing  " "  both  " "in side" "no_pad" "" "   " "\ttabbed\t" "\nnl\n" "x"])))
+(set RTrim (at (select {r: (trim s) from: TTrim}) 'r))
+(count RTrim) -- 10
+(at RTrim 0) -- "leading"
+(at RTrim 1) -- "trailing"
+(at RTrim 2) -- "both"
+(at RTrim 3) -- "in side"
+(at RTrim 4) -- "no_pad"
+(at RTrim 5) -- ""
+(at RTrim 6) -- ""
+(at RTrim 7) -- "tabbed"
+(at RTrim 8) -- "nl"
+(at RTrim 9) -- "x"
+
+;; trim is idempotent.
+(set RTrim2 (at (select {r: (trim (trim s)) from: TTrim}) 'r))
+(sum (== RTrim RTrim2)) -- 10
+
+;; ════════════════════════════════════════════════════════════════════
+;; 12. exec_strlen — STR column with lengths straddling the SSO boundary
+;; ════════════════════════════════════════════════════════════════════
+;; RAY_STR_INLINE_MAX = 12 (src/vec/str.h:45).  Lengths chosen:
+;;   0, 1, 7, 12 (inline)
+;;   13, 20, 40, 44 (pooled)
+;;   2, 4 (inline)
+(set TLen (table [s] (list ["" "a" "abcdefg" "abcdefghijkl" "abcdefghijklm" "abcdefghijklmnopqrst" "aaaaabbbbbcccccdddddeeeeefffffggggghhhhh" "aaaaabbbbbcccccdddddeeeeefffffggggghhhhhiiii" "xy" "wxyz"])))
+(set RLen (at (select {r: (strlen s) from: TLen}) 'r))
+(count RLen) -- 10
+(at RLen 0) -- 0
+(at RLen 1) -- 1
+(at RLen 2) -- 7
+(at RLen 3) -- 12
+(at RLen 4) -- 13
+(at RLen 5) -- 20
+(at RLen 6) -- 40
+(at RLen 7) -- 44
+(at RLen 8) -- 2
+(at RLen 9) -- 4
+(sum (== RLen [0 1 7 12 13 20 40 44 2 4])) -- 10
+(sum RLen) -- 143
+
+;; ════════════════════════════════════════════════════════════════════
+;; 13. exec_strlen — SYM column with varied lengths
+;; ════════════════════════════════════════════════════════════════════
+;; RFL doesn't allow an empty sym literal, so row 0 uses 'x (len 1).
+(set TSL (table [s] (list ['x 'ab 'abcdefg 'abcdefghijkl 'abcdefghijklm 'abcdefghijklmnopqrst 'aaaaabbbbbcccccdddddeeeeefffffggggghhhhh 'aaaaabbbbbcccccdddddeeeeefffffggggghhhhhiiii 'a 'wxyz])))
+(set RSL (at (select {r: (strlen s) from: TSL}) 'r))
+(count RSL) -- 10
+(sum (== RSL [1 2 7 12 13 20 40 44 1 4])) -- 10
+(sum RSL) -- 144
+
+;; ════════════════════════════════════════════════════════════════════
+;; 14. exec_substr — scalar I64 start/length over STR (inline output)
+;; ════════════════════════════════════════════════════════════════════
+;; Output strings <= 12 bytes ⇒ result stays inline.  Source rows span
+;; inline (<=12) and pooled (>12) so the substr loop (string.c:976-1016)
+;; reads from both layouts.
+(set TSubS (table [s] (list ["alphabet" "bravocharlie" "this_is_long_enough" "ABCDEFGHIJKLMNOP" "x" "" "alphabetagamma" "delta" "echofoxtrot" "0123456789abcdef"])))
+
+;; start=1 (1-based ⇒ 0-based 0), len=3.
+(set RSub1 (at (select {r: (substr s 1 3) from: TSubS}) 'r))
+(at RSub1 0) -- "alp"
+(at RSub1 1) -- "bra"
+(at RSub1 2) -- "thi"
+(at RSub1 3) -- "ABC"
+(at RSub1 4) -- "x"
+(at RSub1 5) -- ""
+(at RSub1 6) -- "alp"
+(at RSub1 7) -- "del"
+(at RSub1 8) -- "ech"
+(at RSub1 9) -- "012"
+(sum (== RSub1 ["alp" "bra" "thi" "ABC" "x" "" "alp" "del" "ech" "012"])) -- 10
+
+;; start=5, len=4 — middle window; "x" past end ⇒ "" (string.c:1001).
+(set RSub2 (at (select {r: (substr s 5 4) from: TSubS}) 'r))
+;; start=5 (1-based) ⇒ 0-based 4, len=4.
+(at RSub2 0) -- "abet"      ;; "alphabet"[4..7]
+(at RSub2 1) -- "ocha"      ;; "bravocharlie"[4..7]
+(at RSub2 2) -- "_is_"      ;; "this_is_long_enough"[4..7]
+(at RSub2 3) -- "EFGH"
+(at RSub2 4) -- ""
+(at RSub2 5) -- ""
+(at RSub2 6) -- "abet"
+(at RSub2 9) -- "4567"
+
+;; start=1, len=-1 — full-string take (line 1009).  Pooled rows yield
+;; pooled output.
+(set RSub3 (at (select {r: (substr s 1 -1) from: TSubS}) 'r))
+(at RSub3 0) -- "alphabet"
+(at RSub3 1) -- "bravocharlie"
+(at RSub3 2) -- "this_is_long_enough"
+(at RSub3 3) -- "ABCDEFGHIJKLMNOP"
+(at RSub3 4) -- "x"
+(at RSub3 5) -- ""
+(at RSub3 9) -- "0123456789abcdef"
+
+;; start=1, len=999 — len > remaining ⇒ capped to remaining (line 1009).
+(set RSub4 (at (select {r: (substr s 1 999) from: TSubS}) 'r))
+(sum (== RSub4 RSub3)) -- 10
+
+;; start=0 (1-based; clamped to 0 ⇒ st=-1 ⇒ st=0, line 1000), len=3.
+(set RSub5 (at (select {r: (substr s 0 3) from: TSubS}) 'r))
+(sum (== RSub5 RSub1)) -- 10
+
+;; ════════════════════════════════════════════════════════════════════
+;; 15. exec_substr — scalar F64 path (start_v->type == -RAY_F64,
+;; line 952; same for len_v at line 964)
+;; ════════════════════════════════════════════════════════════════════
+(set RSubF (at (select {r: (substr s 1.0 3.0) from: TSubS}) 'r))
+(sum (== RSubF RSub1)) -- 10
+
+;; ════════════════════════════════════════════════════════════════════
+;; 16. exec_substr — single-element vec path (start_v->len == 1,
+;; lines 953-960)
+;; ════════════════════════════════════════════════════════════════════
+(set RSubV (at (select {r: (substr s [1] [3]) from: TSubS}) 'r))
+(sum (== RSubV RSub1)) -- 10
+(set RSubVS (at (select {r: (substr s [1] 3) from: TSubS}) 'r))
+(sum (== RSubVS RSub1)) -- 10
+
+;; ════════════════════════════════════════════════════════════════════
+;; 17. exec_substr — per-row I64 vector start+len (s_data, l_data
+;; populated at lines 962 / 974)
+;; ════════════════════════════════════════════════════════════════════
+(set TSubR (table [s start lenc] (list ["alphabet" "bravocharlie" "this_is_long_enough" "ABCDEFGHIJKLMNOP" "echo" "x" "ww" "delta" "alphabetagamma" "0123456789abcdef"] [1 2 3 4 1 1 1 2 3 5] [3 4 5 6 4 1 2 3 4 7])))
+(set RSubR (at (select {r: (substr s start lenc) from: TSubR}) 'r))
+(count RSubR) -- 10
+;; Per-row start/lenc (1-based start ⇒ 0-based start-1):
+;; row 0  "alphabet"           [0..2]  = "alp"
+;; row 1  "bravocharlie"        [1..4]  = "ravo"
+;; row 2  "this_is_long_enough" [2..6]  = "is_is"
+;; row 3  "ABCDEFGHIJKLMNOP"    [3..8]  = "DEFGHI"
+;; row 4  "echo"                [0..3]  = "echo"
+;; row 5  "x"                   [0..0]  = "x"
+;; row 6  "ww"                  [0..1]  = "ww"
+;; row 7  "delta"               [1..3]  = "elt"
+;; row 8  "alphabetagamma"      [2..5]  = "phab"
+;; row 9  "0123456789abcdef"    [4..10] = "456789a"
+(at RSubR 0) -- "alp"
+(at RSubR 1) -- "ravo"
+(at RSubR 2) -- "is_is"
+(at RSubR 3) -- "DEFGHI"
+(at RSubR 4) -- "echo"
+(at RSubR 5) -- "x"
+(at RSubR 6) -- "ww"
+(at RSubR 7) -- "elt"
+(at RSubR 8) -- "phab"
+(at RSubR 9) -- "456789a"
+(sum (== RSubR ["alp" "ravo" "is_is" "DEFGHI" "echo" "x" "ww" "elt" "phab" "456789a"])) -- 10
+
+;; ════════════════════════════════════════════════════════════════════
+;; 18. exec_substr — SYM column variant (sym_dst branch, line 1014)
+;; ════════════════════════════════════════════════════════════════════
+(set TSubY (table [s] (list ['alphabet 'bravocharlie 'thisislongenough 'ABCDEFGHIJKLMNOP 'x 'q 'alphabetagamma 'delta 'echofoxtrot 'gamma])))
+(set RSubY (at (select {r: (substr s 1 3) from: TSubY}) 'r))
+(at RSubY 0) -- 'alp
+(at RSubY 1) -- 'bra
+(at RSubY 2) -- 'thi
+(at RSubY 3) -- 'ABC
+(at RSubY 4) -- 'x
+(at RSubY 5) -- 'q
+(at RSubY 9) -- 'gam
+(sum (== RSubY ['alp 'bra 'thi 'ABC 'x 'q 'alp 'del 'ech 'gam])) -- 10
+
+;; ════════════════════════════════════════════════════════════════════
+;; 19. exec_replace — STR column, single-char from→to (same length)
+;; ════════════════════════════════════════════════════════════════════
+;; Multi-occurrence rows exercise the resume-after-match j += from_len
+;; (line 1106).  Same-length keeps worst = sl+1 (line 1088).
+(set TRep (table [s] (list ["apple" "banana" "cherry" "delta" "echo" "foxtrot" "golf" "hotel" "india" "juliet"])))
+(set RRep1 (at (select {r: (replace s "a" "A") from: TRep}) 'r))
+(at RRep1 0) -- "Apple"
+(at RRep1 1) -- "bAnAnA"
+(at RRep1 3) -- "deltA"
+(at RRep1 8) -- "indiA"
+(sum (== RRep1 ["Apple" "bAnAnA" "cherry" "deltA" "echo" "foxtrot" "golf" "hotel" "indiA" "juliet"])) -- 10
+
+;; ════════════════════════════════════════════════════════════════════
+;; 20. exec_replace — shrinking (to_len < from_len)
+;; ════════════════════════════════════════════════════════════════════
+;; Row 5 "no_lone" — no "ll" substring ⇒ unchanged passthrough branch.
+;; Row 6 "lll" (3 l's) — first "ll" at j=0 matches ⇒ "L", trailing 'l'
+;;       at j=2 falls into the pass-through branch (line 1108) ⇒ "Ll".
+;; Row 8 "alllllo" (5 l's): "ll" at j=1, "ll" at j=3, lone 'l' at j=5,
+;;       'o' at j=6 ⇒ "a" + "L" + "L" + "l" + "o" = "aLLlo".
+(set TRepShrink (table [s] (list ["hello" "yellow" "callable" "balloon" "stallion" "no_lone" "lll" "" "alllllo" "a"])))
+(set RRepSh (at (select {r: (replace s "ll" "L") from: TRepShrink}) 'r))
+(at RRepSh 0) -- "heLo"
+(at RRepSh 1) -- "yeLow"
+(at RRepSh 2) -- "caLable"
+(at RRepSh 3) -- "baLoon"
+(at RRepSh 4) -- "staLion"
+(at RRepSh 5) -- "no_lone"
+(at RRepSh 6) -- "Ll"
+(at RRepSh 7) -- ""
+;; Row 8 ("alllllo", 5 l's): match "ll" at j=1, then j=3, then lone 'l'
+;; at j=5 (not "ll"), then 'o' ⇒ "a" + "L" + "L" + "l" + "o" = "aLLlo".
+(at RRepSh 8) -- "aLLlo"
+(at RRepSh 9) -- "a"
+
+;; ════════════════════════════════════════════════════════════════════
+;; 21. exec_replace — expanding (to_len > from_len)
+;; ════════════════════════════════════════════════════════════════════
+;; worst = n_matches * to_len + (sl % from_len) + 1 (line 1085).  Some
+;; rows cross the 12-byte SSO boundary ⇒ pooled output.
+(set TRepExp (table [s] (list ["alpha" "abracadabra" "banana" "" "noamatch" "aaa" "aA" "happy" "a" "AaAaA"])))
+(set RRepEx (at (select {r: (replace s "a" "XYZ") from: TRepExp}) 'r))
+(at RRepEx 0) -- "XYZlphXYZ"
+(at RRepEx 1) -- "XYZbrXYZcXYZdXYZbrXYZ"
+(at RRepEx 2) -- "bXYZnXYZnXYZ"
+(at RRepEx 3) -- ""
+(at RRepEx 4) -- "noXYZmXYZtch"
+(at RRepEx 5) -- "XYZXYZXYZ"
+(at RRepEx 6) -- "XYZA"
+(at RRepEx 7) -- "hXYZppy"
+(at RRepEx 8) -- "XYZ"
+;; Row 9 "AaAaA" (case-sensitive): 'a' at pos 1, 3 ⇒ "AXYZAXYZA".
+(at RRepEx 9) -- "AXYZAXYZA"
+;; total strlen = 9+21+12+0+12+9+4+7+3+9 = 86
+(sum (strlen RRepEx)) -- 86
+
+;; ════════════════════════════════════════════════════════════════════
+;; 22. exec_replace — no-match (from absent from every row)
+;; ════════════════════════════════════════════════════════════════════
+(set RRepNo (at (select {r: (replace s "ZZZ" "XYZ") from: TRep}) 'r))
+(sum (== RRepNo ["apple" "banana" "cherry" "delta" "echo" "foxtrot" "golf" "hotel" "india" "juliet"])) -- 10
+
+;; ════════════════════════════════════════════════════════════════════
+;; 23. exec_replace — whole-string match
+;; ════════════════════════════════════════════════════════════════════
+(set RRepWh (at (select {r: (replace s "apple" "FRUIT") from: TRep}) 'r))
+(at RRepWh 0) -- "FRUIT"
+(at RRepWh 1) -- "banana"
+(at RRepWh 9) -- "juliet"
+
+;; ════════════════════════════════════════════════════════════════════
+;; 24. exec_replace — pooled-output path (>12-byte result)
+;; ════════════════════════════════════════════════════════════════════
+(set TRepP (table [s] (list (list "abcabcabc"))))
+(set RRepP (at (select {r: (replace s "a" "XX") from: TRepP}) 'r))
+(at RRepP 0) -- "XXbcXXbcXXbc"
+(strlen (at RRepP 0)) -- 12
+(set TRepP2 (table [s] (list (list "abcabcabc"))))
+(set RRepP2 (at (select {r: (replace s "a" "XYZ") from: TRepP2}) 'r))
+(at RRepP2 0) -- "XYZbcXYZbcXYZbc"
+(strlen (at RRepP2 0)) -- 15
+
+;; ════════════════════════════════════════════════════════════════════
+;; 25. exec_replace — SYM column variant (line 1117)
+;; ════════════════════════════════════════════════════════════════════
+(set TRepY (table [s] (list ['hello 'yellow 'callable 'balloon 'stallion 'noLL 'lll 'q 'alllllo 'a])))
+(set RRepY (at (select {r: (replace s "ll" "L") from: TRepY}) 'r))
+(at RRepY 0) -- 'heLo
+(at RRepY 1) -- 'yeLow
+(at RRepY 2) -- 'caLable
+(at RRepY 3) -- 'baLoon
+(at RRepY 4) -- 'staLion
+(at RRepY 5) -- 'noLL
+(at RRepY 6) -- 'Ll
+(at RRepY 7) -- 'q
+(at RRepY 8) -- 'aLLlo
+(at RRepY 9) -- 'a
+
+(set RRepYE (at (select {r: (replace s "a" "XYZ") from: TRepY}) 'r))
+(at RRepYE 0) -- 'hello
+(at RRepYE 1) -- 'yellow
+(at RRepYE 2) -- 'cXYZllXYZble
+(at RRepYE 9) -- 'XYZ
+
+;; ════════════════════════════════════════════════════════════════════
+;; 26. Pipeline — concat + substr + upper in one projection
+;; ════════════════════════════════════════════════════════════════════
+;; Stresses re-entry into the same exec_string_* helpers as inner
+;; result columns get rebuilt across op nodes.
+(set Tpipe (table [s] (list ["alpha" "bravo" "charlie" "delta" "echo" "foxtrot" "golf" "hotel" "india" "juliet"])))
+(set Rpipe (at (select {r: (concat (substr (upper s) 1 3) "_END") from: Tpipe}) 'r))
+(at Rpipe 0) -- "ALP_END"
+(at Rpipe 5) -- "FOX_END"
+(at Rpipe 9) -- "JUL_END"
+(sum (== Rpipe ["ALP_END" "BRA_END" "CHA_END" "DEL_END" "ECH_END" "FOX_END" "GOL_END" "HOT_END" "IND_END" "JUL_END"])) -- 10
+
+;; ════════════════════════════════════════════════════════════════════
+;; 27. Atom-only forms (eval-fallback / RFL builtin path)
+;; ════════════════════════════════════════════════════════════════════
+;; The eval-level builtin `concat` (lang/eval.c:2620, ray_concat_fn) is
+;; a different code path from exec_concat — it's binary-only at the
+;; bare-call site (register_binary).  Use nesting to chain.  Strlen on
+;; atoms exercises byte-counts on inline + pooled atom strings.
+(concat "hello" "world") -- "helloworld"
+(concat (concat "hello" " ") "world") -- "hello world"
+(strlen "abcdefghijkl") -- 12
+(strlen "abcdefghijklm") -- 13
+(strlen "") -- 0
+(strlen 'abcdefghijkl) -- 12
+(strlen 'abcdefghijklm) -- 13

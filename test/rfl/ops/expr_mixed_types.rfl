@@ -1,0 +1,444 @@
+;; Mixed-type binary expressions in src/ops/expr.c — combinations NOT
+;; covered by expr_typed_fast.rfl.  Drives the generic LV_READ / RV_READ
+;; arms of binary_range (expr.c:1632-1782) and binary_range_str
+;; (expr.c:1420-1478), focusing on:
+;;
+;;   - Cross-width / cross-family integer arithmetic where the fast
+;;     paths BR_AR_FAST / BR_FAST are skipped (lhs->type != out_type,
+;;     or out_type is RAY_F64 / RAY_U8 / RAY_BOOL).
+;;   - F64 arms: out_type=F64 with at least one integer-family operand
+;;     (LV_READ / RV_READ does the int→double cast).
+;;   - Vec-vec dispatch (both !l_scalar && !r_scalar).
+;;   - Temporal arithmetic: DATE+I64, TIME+I64, TIMESTAMP+I64.
+;;   - SYM-vec × SYM-vec compare, STR-vec × STR-vec compare, BOOL ops
+;;     on vec-vec inputs (out_type=BOOL float-family branch).
+;;
+;; All sizes here are deliberately small (≤ 2048) — the fast paths
+;; and the parallel pool dispatch are already covered by
+;; expr_typed_fast.rfl.  These tests target the sequential, generic
+;; element-wise arms.
+;;
+;; Happy path: no nulls, no div-by-zero, no overflow / type errors.
+
+;; ════════════════════════════════════════════════════════════════════
+;; 1. INT-VEC × F64-SCALAR  (out_type=F64; BR_AR_FAST skipped because
+;;    lhs->type != out_type → generic F64 arm at expr.c:1688-1700)
+;; ════════════════════════════════════════════════════════════════════
+
+(set VI16 (as 'I16 [1h 2h 3h 4h 5h]))
+(set VI32 [1i 2i 3i 4i 5i])
+(set VI64 [1 2 3 4 5])
+
+;; I64-vec + F64-scalar → F64 vec
+(+ VI64 0.5)            -- [1.5 2.5 3.5 4.5 5.5]
+(- VI64 0.25)           -- [0.75 1.75 2.75 3.75 4.75]
+(* VI64 2.0)            -- [2.0 4.0 6.0 8.0 10.0]
+(/ VI64 2.0)            -- [0.5 1.0 1.5 2.0 2.5]
+(type (+ VI64 0.5))     -- 'F64
+
+;; I32-vec + F64-scalar → F64 vec (lhs is read via lp_i32 → cast to double)
+(+ VI32 0.5)            -- [1.5 2.5 3.5 4.5 5.5]
+(* VI32 0.5)            -- [0.5 1.0 1.5 2.0 2.5]
+(type (+ VI32 0.5))     -- 'F64
+
+;; I16-vec + F64-scalar → F64 vec (lhs read via lp_i16)
+(+ VI16 0.5)            -- [1.5 2.5 3.5 4.5 5.5]
+(* VI16 2.5)            -- [2.5 5.0 7.5 10.0 12.5]
+(type (+ VI16 0.5))     -- 'F64
+
+;; ════════════════════════════════════════════════════════════════════
+;; 2. F64-VEC × INT-SCALAR  (out_type=F64; r_scalar=true, lp_f64 set,
+;;    integer scalar read via r_i64 cast to double in RV_READ)
+;; ════════════════════════════════════════════════════════════════════
+
+(set VF64 [1.0 2.0 3.0 4.0 5.0])
+
+(+ VF64 1)              -- [2.0 3.0 4.0 5.0 6.0]
+(- VF64 1)              -- [0.0 1.0 2.0 3.0 4.0]
+(* VF64 2)              -- [2.0 4.0 6.0 8.0 10.0]
+(/ VF64 2)              -- [0.5 1.0 1.5 2.0 2.5]
+(+ VF64 1h)             -- [2.0 3.0 4.0 5.0 6.0]
+(+ VF64 1i)             -- [2.0 3.0 4.0 5.0 6.0]
+(type (+ VF64 1))       -- 'F64
+
+;; ════════════════════════════════════════════════════════════════════
+;; 3. INT-VEC × INT-SCALAR with type promotion to wider type
+;;    (lhs->type != out_type → BR_AR_FAST skipped; generic out_type arm)
+;; ════════════════════════════════════════════════════════════════════
+
+;; I32-vec + I64-scalar → I64 vec
+(+ VI32 100)            -- [101 102 103 104 105]
+(- VI32 1)              -- [0 1 2 3 4]
+(* VI32 10)             -- [10 20 30 40 50]
+(type (+ VI32 100))     -- 'I64
+
+;; I16-vec + I64-scalar → I64 vec
+(+ VI16 1000)           -- [1001 1002 1003 1004 1005]
+(* VI16 100)            -- [100 200 300 400 500]
+(type (+ VI16 1000))    -- 'I64
+
+;; I16-vec + I32-scalar → I32 vec (BR_AR_FAST l_esz=2 path — lhs->type
+;; differs from out_type=I32 → skipped → generic I32 arm at expr.c:1714)
+(+ VI16 100i)           -- [101i 102i 103i 104i 105i]
+(- VI16 1i)             -- [0i 1i 2i 3i 4i]
+(* VI16 10i)            -- [10i 20i 30i 40i 50i]
+(type (+ VI16 100i))    -- 'I32
+
+;; ════════════════════════════════════════════════════════════════════
+;; 4. VEC-VEC ARITHMETIC  (both !l_scalar && !r_scalar; covers the
+;;    branches where BOTH lhs and rhs are typed pointer reads)
+;; ════════════════════════════════════════════════════════════════════
+
+;; I64-vec + I64-vec → I64
+(+ VI64 [10 20 30 40 50])      -- [11 22 33 44 55]
+(- VI64 [1 1 1 1 1])           -- [0 1 2 3 4]
+(* VI64 [2 2 2 2 2])           -- [2 4 6 8 10]
+(% [10 20 30 40 50] [3 3 3 3 3]) -- [1 2 0 1 2]
+
+;; I32-vec + I32-vec → I32
+(+ VI32 [10i 20i 30i 40i 50i]) -- [11i 22i 33i 44i 55i]
+(type (+ VI32 VI32))           -- 'I32
+
+;; I16-vec + I16-vec → I16
+(+ VI16 (as 'I16 [10h 20h 30h 40h 50h]))   -- [11h 22h 33h 44h 55h]
+(type (+ VI16 VI16))           -- 'I16
+
+;; F64-vec + F64-vec → F64
+(+ VF64 [10.0 20.0 30.0 40.0 50.0])  -- [11.0 22.0 33.0 44.0 55.0]
+(* VF64 [2.0 2.0 2.0 2.0 2.0])       -- [2.0 4.0 6.0 8.0 10.0]
+(/ VF64 [2.0 4.0 6.0 8.0 10.0])      -- [0.5 0.5 0.5 0.5 0.5]
+
+;; I32-vec + I64-vec → I64 (mixed-width vec-vec)
+(+ VI32 VI64)            -- [2 4 6 8 10]
+(type (+ VI32 VI64))     -- 'I64
+
+;; I16-vec + I64-vec → I64
+(+ VI16 VI64)            -- [2 4 6 8 10]
+(type (+ VI16 VI64))     -- 'I64
+
+;; I16-vec + I32-vec → I32
+(+ VI16 VI32)            -- [2i 4i 6i 8i 10i]
+(type (+ VI16 VI32))     -- 'I32
+
+;; I64-vec + F64-vec → F64 (int read via lp_i64, float read via rp_f64)
+(+ VI64 VF64)            -- [2.0 4.0 6.0 8.0 10.0]
+(type (+ VI64 VF64))     -- 'F64
+
+;; I32-vec + F64-vec → F64
+(+ VI32 VF64)            -- [2.0 4.0 6.0 8.0 10.0]
+
+;; ════════════════════════════════════════════════════════════════════
+;; 5. VEC-VEC COMPARISONS  (out_type=BOOL, src_is_i64_all branch at
+;;    expr.c:1755-1767 OR float-family branch at 1768-1781)
+;; ════════════════════════════════════════════════════════════════════
+
+;; I64 × I64 vec-vec → BOOL
+(== VI64 [1 2 99 4 5])    -- [true true false true true]
+(!= VI64 [1 2 99 4 5])    -- [false false true false false]
+(<  VI64 [2 2 4 4 6])     -- [true false true false true]
+(>= VI64 [1 3 3 5 5])     -- [true false true false true]
+
+;; Mixed-width int vec-vec → BOOL (both operands integer-family)
+(== VI32 [1 2 3 4 5])              -- [true true true true true]
+(== VI16 VI32)                     -- [true true true true true]
+(<  VI16 VI64)                     -- [false false false false false]
+
+;; F64 × F64 vec-vec → BOOL (float-family arm; NaN handling not exercised
+;; on happy path, all-finite inputs → ln/rn both 0).
+(== VF64 [1.0 2.0 99.0 4.0 5.0])   -- [true true false true true]
+(<  VF64 [2.0 2.0 4.0 4.0 6.0])    -- [true false true false true]
+(>  [5.0 5.0 5.0 5.0 5.0] VF64)    -- [true true true true false]
+
+;; F64 × I64 vec-vec → BOOL (mixed-family; takes the float-family arm
+;; because at least one side is F64).
+(== VF64 VI64)                      -- [true true true true true]
+(<  VF64 [10 10 10 10 10])          -- [true true true true true]
+
+;; ════════════════════════════════════════════════════════════════════
+;; 6. BOOL OPS — vec-vec AND / OR  (out_type=BOOL, op=OP_AND/OP_OR;
+;;    src_is_i64_all branch when both inputs integer-family).
+;; ════════════════════════════════════════════════════════════════════
+
+(set VB1 [true false true false true])
+(set VB2 [true true false false true])
+
+(and VB1 VB2)   -- [true false false false true]
+(or  VB1 VB2)   -- [true true true false true]
+
+;; AND/OR over derived BOOL vectors (predicate combinator pattern).
+(set GT  (> VI64 2))             ;; [false false true true true]
+(set LT  (< VI64 5))             ;; [true true true true false]
+(and GT LT)                      -- [false false true true false]
+(or  GT LT)                      -- [true true true true true]
+
+;; AND/OR with scalar BOOL on the right.
+(and VB1 true)   -- [true false true false true]
+(and VB1 false)  -- [false false false false false]
+(or  VB1 false)  -- [true false true false true]
+(or  VB1 true)   -- [true true true true true]
+
+;; ════════════════════════════════════════════════════════════════════
+;; 7. TEMPORAL ARITHMETIC — DATE/TIME/TIMESTAMP + INT-SCALAR
+;;    Same-type arith → BR_AR_FAST l_esz=4 (DATE/TIME) or l_esz=8
+;;    (TIMESTAMP) when scalar matches the column's underlying int type.
+;; ════════════════════════════════════════════════════════════════════
+
+;; DATE + I32-scalar → DATE  (BR_AR_FAST l_esz=4, lhs->type==RAY_DATE)
+;; DATE epoch = 2000.01.01 (Rayforce convention; see src/store/part.c:78).
+;; 2024.01.01 = 8766 days since 2000.01.01.
+(set VD (as 'DATE [2024.01.01 2024.01.02 2024.01.03 2024.01.04 2024.01.05]))
+
+;; Spot-check the underlying I32 element value (epoch days).
+(at (as 'I32 VD) 0)             -- 8766i
+(at (as 'I32 VD) 4)             -- 8770i
+(at (as 'I32 (+ VD 10i)) 0)     -- 8776i
+(at (as 'I32 (+ VD 10i)) 4)     -- 8780i
+(at (as 'I32 (- VD 5i)) 0)      -- 8761i
+
+;; (+ DATE DATE) and (- DATE DATE) are explicit type errors at the
+;; lang level — date arithmetic only accepts a date and an integer
+;; offset.  Vec-vec arith is therefore not reachable for DATE.
+
+;; TIME + I32-scalar → TIME (BR_AR_FAST l_esz=4)
+(set VT (as 'TIME [00:00:00.000 00:00:01.000 00:00:02.000]))
+(at (as 'I32 VT) 0)             -- 0i
+(at (as 'I32 VT) 1)             -- 1000i
+(at (as 'I32 (+ VT 500i)) 0)    -- 500i
+(at (as 'I32 (+ VT 500i)) 1)    -- 1500i
+(at (as 'I32 (- VT 100i)) 1)    -- 900i
+
+;; TIMESTAMP + I64-scalar → TIMESTAMP (BR_AR_FAST l_esz=8)
+(set VTS (as 'TIMESTAMP [1000 2000 3000 4000 5000]))
+(at (as 'I64 (+ VTS 500)) 0)    -- 1500
+(at (as 'I64 (+ VTS 500)) 4)    -- 5500
+(at (as 'I64 (- VTS 100)) 0)    -- 900
+
+;; TIMESTAMP comparison (BR_FAST l_esz=8, RAY_TIMESTAMP arm at expr.c:1550)
+;; Comparison against a TIMESTAMP atom (must be same type — lang rejects
+;; bare-int compare against TIMESTAMP-vec with a `type` error).
+(== VTS (as 'TIMESTAMP 3000))   -- [false false true false false]
+(<  VTS (as 'TIMESTAMP 3000))   -- [true true false false false]
+(>= VTS (as 'TIMESTAMP 2000))   -- [false true true true true]
+
+;; DATE comparison: BR_FAST l_esz=4, lhs->type=RAY_DATE arm at 1572.
+(== VD 2024.01.03)              -- [false false true false false]
+(<  VD 2024.01.03)              -- [true true false false false]
+(>= VD 2024.01.04)              -- [false false false true true]
+
+;; TIME comparison: BR_FAST l_esz=4 arm
+(== VT 00:00:01.000)            -- [false true false]
+(<  VT 00:00:02.000)            -- [true true false]
+
+;; ════════════════════════════════════════════════════════════════════
+;; 8. SYM-vec × SYM-vec COMPARE  (out_type=BOOL; lp_u32/lp_i64 set on
+;;    both sides → falls to the generic BOOL arm at expr.c:1755 with
+;;    src_is_i64_all=1 because both classify as integer-family).
+;;    The W8 fast-eq path (lhs SYM, rhs scalar) is NOT taken for vec-vec.
+;; ════════════════════════════════════════════════════════════════════
+
+(set VS1 ['a 'b 'c 'd 'e])
+(set VS2 ['a 'b 'X 'd 'Y])
+
+;; Element-wise SYM compare
+(== VS1 VS2)   -- [true true false true false]
+(!= VS1 VS2)   -- [false false true false true]
+
+;; SYM-vec == SYM-vec (same).
+(== VS1 VS1)   -- [true true true true true]
+(sum (as 'I64 (== VS1 VS1)))  -- 5
+
+;; SYM-vec compare with SYM-atom — uses the SIMD fast-eq for atom case
+;; (already covered by expr_typed_fast.rfl; here we add a non-scalar mix
+;; via length-1 atom literal).
+(== VS1 'a)    -- [true false false false false]
+
+;; SYM-vec compared to RAY_STR scalar — the str_resolved branch in
+;; exec_elementwise_binary (expr.c:1906-1918) only fires when control
+;; reaches expr.c via the DAG executor.  The slow-path frontend
+;; (eval.c) excludes SYM from IS_NUM_TYPE, so `(== sym-vec "a")` at the
+;; REPL falls through to a per-element loop and currently emits a
+;; `type` error.  That path IS used inside select() / where clauses
+;; where columns are typed RAY_SYM and literals are RAY_STR, so the
+;; expr.c branch is reachable through the table fixture below.
+(set TSym (table [k v] (list ['a 'b 'c 'a 'b] [10 20 30 40 50])))
+(sum (at (select {from: TSym where: (== k "a")}) 'v))   -- 50
+(sum (at (select {from: TSym where: (!= k "a")}) 'v))   -- 100
+(sum (at (select {from: TSym where: (== k "b")}) 'v))   -- 70
+
+;; SYM × SYM ordering: comparison by intern ID — relies on insertion
+;; order.  Test with == and != only (ordering of intern IDs isn't
+;; semantic).  Skip < / > between distinct syms here.
+
+;; ════════════════════════════════════════════════════════════════════
+;; 9. STR-vec × STR-vec COMPARE  (binary_range_str at expr.c:1420)
+;;    Drives the !l_scalar && !r_scalar branch — both sides are STR
+;;    vectors so step_l=step_r=1 advances through both ray_str_t arrays.
+;; ════════════════════════════════════════════════════════════════════
+
+(set VSTR1 (list "apple" "banana" "cherry" "date" "elderberry"))
+(set VSTR2 (list "apple" "BANANA" "cherry" "date" "fig"))
+
+;; STR vec-vec EQ → BOOL (uses ray_str_t_eq via STR_CMP_LOOP)
+(== VSTR1 VSTR2)   -- [true false true true false]
+(!= VSTR1 VSTR2)   -- [false true false false true]
+
+;; Lexicographic ordering: "BANANA" < "banana" (uppercase < lowercase).
+;; "cherry" == "cherry" (both equal → < is false, <= is true).
+(<  VSTR1 VSTR2)   -- [false false false false true]
+(<= VSTR1 VSTR2)   -- [true false true true true]
+(>  VSTR1 VSTR2)   -- [false true false false false]
+(>= VSTR1 VSTR2)   -- [true true true true false]
+
+;; STR-vec × STR-scalar (already covered by expr_typed_fast.rfl, but
+;; mirror at the small-sequential size to confirm the generic
+;; binary_range_str arm at expr.c:1895 with r_scalar=true).
+;; "apple" "banana" "cherry" "date" "elderberry" vs "cherry":
+;;   a<c, b<c, c==c, d>c, e>c
+(== VSTR1 "cherry")  -- [false false true false false]
+(<  VSTR1 "cherry")  -- [true true false false false]
+(>  VSTR1 "cherry")  -- [false false false true true]
+
+;; STR-scalar × STR-vec (l_scalar=true) — atom_to_str_t path at
+;; expr.c:1438-1441 with step_l=0.
+(== "cherry" VSTR1)  -- [false false true false false]
+(<  "cherry" VSTR1)  -- [false false false true true]
+(>  "cherry" VSTR1)  -- [true true false false false]
+
+;; ════════════════════════════════════════════════════════════════════
+;; 10. IN — membership tests at multiple type widths.
+;;     exec_in lives in exec.c, but the BOOL-output mixed-type paths
+;;     it routes through call exec_elementwise_binary helpers and
+;;     overlap with the expr.c reachability set.
+;; ════════════════════════════════════════════════════════════════════
+
+;; I64-vec IN I64-vec literal
+(in VI64 [2 4 6])           -- [false true false true false]
+(in VI64 [1 3 5])           -- [true false true false true]
+
+;; SYM-vec IN SYM-vec literal
+(in VS1 ['a 'c 'e])         -- [true false true false true]
+(in VS1 ['x 'y])            -- [false false false false false]
+
+;; F64 vec IN F64 vec literal (use_double path in exec_in)
+(in VF64 [2.0 4.0])         -- [false true false true false]
+
+;; Scalar IN vec
+(in 3 VI64)                 -- true
+(in 99 VI64)                -- false
+
+;; not-in: same combinations, inverted
+(in [1 2 3] [2 3 4])        -- [false true true]   ;; sanity
+(in VI64 [99 100])          -- [false false false false false]
+
+;; NOTE: mixed-family IN at the standalone-`in` primitive (eval.c
+;; ray_in_fn) does NOT promote int → double — e.g.
+;;   (in [1 2 3 4 5] [2.0 4.0]) → [false false false false false]
+;; even though exec_in's float-promoted path (exec.c:737) would match.
+;; The path through exec_in is only taken when OP_IN is constructed
+;; from a query; that's exercised below via select() / where:.
+(set TInMix (table [v] (list [1 2 3 4 5])))
+(count (select {from: TInMix where: (in v [2.0 4.0])}))  -- 2
+(count (select {from: TInMix where: (in v [1 3 5])}))    -- 3
+
+;; ════════════════════════════════════════════════════════════════════
+;; 11. DIV / IDIV / MOD with mixed-type vec-vec (out_type arms).
+;;     `(/ I64 I64)` → F64; `(div I64 I64)` → I64; `(% I64 I64)` → I64.
+;; ════════════════════════════════════════════════════════════════════
+
+(/ [10 20 30 40 50] [2 4 6 8 10])   -- [5.0 5.0 5.0 5.0 5.0]
+(/ [10 20 30 40 50] [1 2 3 4 5])    -- [10.0 10.0 10.0 10.0 10.0]
+(% [10 20 30 40 50] [3 3 3 3 3])    -- [1 2 0 1 2]
+(div [10 20 30 40 50] [3 3 3 3 3])  -- [3 6 10 13 16]
+
+;; F64-vec / F64-vec → F64
+(/ VF64 VF64)               -- [1.0 1.0 1.0 1.0 1.0]
+(/ [10.0 20.0 30.0] [4.0 4.0 4.0]) -- [2.5 5.0 7.5]
+
+;; F64-vec % F64-vec → F64 (uses fmod with sign-fix; happy path: positive
+;; dividend & divisor → matches fmod directly).
+(% [10.0 20.0 30.0] [3.0 3.0 3.0])  -- [1.0 2.0 0.0]
+
+;; ════════════════════════════════════════════════════════════════════
+;; 12. MIN2 / MAX2 — element-wise min/max are OP_MIN2 / OP_MAX2 inside
+;;     expr.c (BR_AR_FAST handles them) but are not registered as
+;;     RFL primitives.  Reachable only via the DAG executor inside
+;;     compiled queries; not driven from this happy-path file.
+;;
+;; ════════════════════════════════════════════════════════════════════
+;; 13. U8-vec arithmetic / comparison (out_type=RAY_U8 arm at
+;;     expr.c:1740-1751; out_type=RAY_BOOL with U8 inputs at the
+;;     src_is_i64_all branch).
+;; ════════════════════════════════════════════════════════════════════
+
+(set VU8 (as 'U8 [0x01 0x02 0x03 0x04 0x05]))
+
+;; U8 + U8-scalar → U8 (BR_AR_FAST doesn't fire for l_esz=1)
+(+ VU8 0x02)        -- [0x03 0x04 0x05 0x06 0x07]
+(type (+ VU8 0x02)) -- 'U8
+
+;; U8 vec-vec
+(+ VU8 VU8)         -- [0x02 0x04 0x06 0x08 0x0a]
+
+;; U8 compare → BOOL
+(== VU8 0x03)       -- [false false true false false]
+(<  VU8 0x03)       -- [true true false false false]
+(== VU8 VU8)        -- [true true true true true]
+
+;; ════════════════════════════════════════════════════════════════════
+;; 14. BOOL × U8 / BOOL × I64 — promote() rules:
+;;     bool < u8 < i16 < i32 < i64 — mixed produces wider type.
+;; ════════════════════════════════════════════════════════════════════
+
+(set VBOOL [true false true false true])
+
+;; BOOL + I64-scalar → I64 (out_type from promote(BOOL, I64) = I64)
+(+ VBOOL 10)        -- [11 10 11 10 11]
+(type (+ VBOOL 10)) -- 'I64
+
+;; BOOL + U8-vec — the eval.c slow path widens to I64 (boolean coerce
+;; to int, then I64 arithmetic) rather than the DAG promote(BOOL,U8)=U8.
+;; Pin the observed behavior; the underlying values are correct.
+(+ VBOOL VU8)       -- [2 2 4 4 6]
+(type (+ VBOOL VU8)) -- 'I64
+
+;; BOOL compare BOOL → BOOL
+(== VBOOL [true true false false true])  -- [true false false true true]
+(!= VBOOL [true true false false true])  -- [false true true false false]
+
+;; ════════════════════════════════════════════════════════════════════
+;; 15. SCALAR-ON-LEFT mixed-type — covers !l_scalar=false / r_scalar=
+;;     false branch for non-fast-path types.
+;; ════════════════════════════════════════════════════════════════════
+
+;; F64-scalar - I64-vec  → F64 vec (lp_f64 NULL but l_scalar=true with
+;; l_f64 set; rp_i64 set → RV_READ casts int to double).
+(- 10.0 VI64)              -- [9.0 8.0 7.0 6.0 5.0]
+(- 100 VI32)               -- [99 98 97 96 95]
+(- 100i VI16)              -- [99i 98i 97i 96i 95i]
+
+;; SYM-atom compare SYM-vec
+(== 'a VS1)                 -- [true false false false false]
+(!= 'a VS1)                 -- [false true true true true]
+
+;; STR-scalar compare STR-vec mirror (already in section 9 but here under
+;; ordering for the BR_FAST coverage table).
+
+;; ════════════════════════════════════════════════════════════════════
+;; 16. LENGTH MISMATCH — eval.c routes lists of different lengths
+;;     through a per-element loop that truncates to the shorter side
+;;     (q/k atomic semantics).  The expr.c-level length guard at
+;;     expr.c:1848 is only reached when both sides are typed numeric
+;;     vectors of equal type that take the DAG path.  Pin the
+;;     observed truncation here.
+(+ [1 2 3] [1 2 3 4])      -- [2 4 6]
+(+ [1 2 3 4] [1 2 3])      -- [2 4 6]
+
+;; Reachability notes:
+;;   - F32 cannot be constructed from RFL source (idxop_coverage.rfl
+;;     comment) — F32 lp_f32 arm not exercised.
+;;   - SYM W64: only ≥4 G interned syms — not RFL-reachable.
+;;   - Selection-aware par_binary_fn: covered by section 5 of
+;;     expr_typed_fast.rfl (TBig fixture ≥ RAY_PARALLEL_THRESHOLD).
+;;   - LIKE: handled by ops/string.c, not src/ops/expr.c — out of scope.
+;;   - Null sentinels in mixed-type binary: covered by null/arith.rfl.
+;;   - Div-by-zero: not happy-path; covered by null/arith.rfl error tests.

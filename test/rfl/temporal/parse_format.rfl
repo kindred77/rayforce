@@ -1,0 +1,265 @@
+;; Happy-path coverage for the still-uncovered paths in
+;; src/ops/temporal.c:
+;;
+;;   • ray_temporal_truncate    — atom + vector, all three input types,
+;;                                null-atom branches, DAY / SECOND bucket
+;;   • ray_temporal_trunc_from_sym  — "date" / "time" sym lookups
+;;   • exec_date_trunc          — DAG path with RAY_DATE / RAY_TIME /
+;;                                RAY_TIMESTAMP input vectors, exercised
+;;                                from `select s: col.date` / `col.time`
+;;   • ray_{date,time,timestamp}_clock_fn  — overloaded forms with a
+;;                                temporal argument that route to
+;;                                ray_temporal_truncate
+;;
+;; Reachability notes:
+;;   The DAG-level YEAR/MONTH/HOUR/MINUTE cases of exec_date_trunc are
+;;   not directly callable from rfl: ray_temporal_trunc_from_sym only
+;;   maps "date" → DAY and "time" → SECOND, so DAY+SECOND are the only
+;;   buckets reachable through `.date` / `.time` desugaring.  The other
+;;   field codes inside the switch are dead code from the rfl surface
+;;   and stay covered by direct C unit tests instead.
+;;
+;;   Parsing (string → date / time / timestamp) lives in src/lang/parse.c
+;;   and src/runtime/cast.c, not in temporal.c — the `(as 'timestamp …)`
+;;   probes here only re-enter temporal.c via the subsequent `.date` or
+;;   `(date …)` calls.  See test/rfl/temporal/timestamp.rfl for the
+;;   full string-parse matrix.
+;;
+;;   The `(date 'local)` / `(timestamp 'global)` clock branches return
+;;   wall-clock dependent values; we exercise the call shape and only
+;;   assert on the result type so the test is deterministic.
+
+;; ═══════════════════════════════════════════════════════════════════
+;;                  1.  (date X) — atom overload
+;; ═══════════════════════════════════════════════════════════════════
+;; A temporal atom argument routes through ray_temporal_truncate with
+;; kind=RAY_EXTRACT_DAY and the result is a TIMESTAMP atom at the day
+;; boundary.
+
+;; DATE atom: already day-aligned, so truncating to day is idempotent
+;; in value-space but switches the type to TIMESTAMP.
+(type (date 2024.03.15))                      -- 'timestamp
+(date 2024.03.15)                              -- 2024.03.15D00:00:00.000000000
+(date 2000.01.01)                              -- 2000.01.01D00:00:00.000000000
+(date 1999.12.31)                              -- 1999.12.31D00:00:00.000000000
+(date 2024.02.29)                              -- 2024.02.29D00:00:00.000000000
+
+;; TIMESTAMP atom: truncate to midnight (drops the time-of-day).
+(type (date 2024.03.15D12:34:56.789000000))   -- 'timestamp
+(date 2024.03.15D12:34:56.789000000)          -- 2024.03.15D00:00:00.000000000
+(date 2024.07.04D23:59:59.999999999)          -- 2024.07.04D00:00:00.000000000
+(date 2024.01.01D00:00:00.000000000)          -- 2024.01.01D00:00:00.000000000
+;; Pre-epoch (us < 0): the floor-toward -inf branch in
+;; ray_temporal_truncate (`r < 0 ? bucket : 0`) trims to the prior
+;; midnight, not toward zero.
+(date 1999.12.31D12:00:00.000000000)          -- 1999.12.31D00:00:00.000000000
+
+;; TIME atom: ms since midnight has no date component, so it
+;; truncates to the 2000-01-01 epoch midnight.
+(type (date 12:34:56.789))                     -- 'timestamp
+(date 12:34:56.789)                            -- 2000.01.01D00:00:00.000000000
+(date 00:00:00.000)                            -- 2000.01.01D00:00:00.000000000
+
+;; ═══════════════════════════════════════════════════════════════════
+;;                  2.  (time X) — atom overload
+;; ═══════════════════════════════════════════════════════════════════
+;; Same atom path, kind=RAY_EXTRACT_SECOND.  Sub-second fractions
+;; drop; the result is TIMESTAMP at the second boundary.
+
+(type (time 2024.03.15D12:34:56.789123456))   -- 'timestamp
+(time 2024.03.15D12:34:56.789123456)          -- 2024.03.15D12:34:56.000000000
+(time 2024.03.15D00:00:00.000000000)          -- 2024.03.15D00:00:00.000000000
+(time 2024.03.15D23:59:59.999999999)          -- 2024.03.15D23:59:59.000000000
+
+;; TIME atom: sub-second fraction trims.  12:34:56.789 ms → 12:34:56 at
+;; epoch.
+(type (time 12:34:56.789))                     -- 'timestamp
+(time 12:34:56.789)                            -- 2000.01.01D12:34:56.000000000
+(time 00:00:00.000)                            -- 2000.01.01D00:00:00.000000000
+
+;; DATE atom: no sub-day component to trim, result lands on midnight.
+(time 2024.03.15)                              -- 2024.03.15D00:00:00.000000000
+
+;; ═══════════════════════════════════════════════════════════════════
+;;                  3.  Null atom branches
+;; ═══════════════════════════════════════════════════════════════════
+;; RAY_ATOM_IS_NULL on a typed-null temporal atom routes to
+;; ray_typed_null(-RAY_TIMESTAMP) → 0Np.
+
+(type (date 0Nd))                              -- 'timestamp
+(date 0Nd)                                     -- 0Np
+(date 0Nt)                                     -- 0Np
+(date 0Np)                                     -- 0Np
+(type (time 0Nd))                              -- 'timestamp
+(time 0Nd)                                     -- 0Np
+(time 0Nt)                                     -- 0Np
+(time 0Np)                                     -- 0Np
+
+;; ═══════════════════════════════════════════════════════════════════
+;;                  4.  Vector path — ray_temporal_truncate
+;; ═══════════════════════════════════════════════════════════════════
+;; The non-DAG vector path runs when (date V) / (time V) is invoked
+;; on a temporal vector (the registered unary builtin sees a vector
+;; arg and the ray_temporal_truncate vector branch handles it).  The
+;; result type is RAY_TIMESTAMP regardless of input element type.
+
+;; DATE vector → TIMESTAMP vector at each day's midnight.
+(set DV  [2024.01.01 2024.06.15 2024.12.31])
+(type (date DV))                               -- 'TIMESTAMP
+(count (date DV))                              -- 3
+(at (date DV) 0)                               -- 2024.01.01D00:00:00.000000000
+(at (date DV) 1)                               -- 2024.06.15D00:00:00.000000000
+(at (date DV) 2)                               -- 2024.12.31D00:00:00.000000000
+
+;; TIMESTAMP vector → trim time-of-day.
+(set TV [2024.03.15D12:34:56.789000000 2024.07.04D23:59:59.999999999 2024.01.01D00:00:00.000000000])
+(count (date TV))                              -- 3
+(at (date TV) 0)                               -- 2024.03.15D00:00:00.000000000
+(at (date TV) 1)                               -- 2024.07.04D00:00:00.000000000
+(at (date TV) 2)                               -- 2024.01.01D00:00:00.000000000
+
+;; (time TV) → trim sub-second.
+(count (time TV))                              -- 3
+(at (time TV) 0)                               -- 2024.03.15D12:34:56.000000000
+(at (time TV) 1)                               -- 2024.07.04D23:59:59.000000000
+(at (time TV) 2)                               -- 2024.01.01D00:00:00.000000000
+
+;; TIME vector via (date V) → all rows collapse to epoch midnight
+;; because TIME has no date component.
+(set TmV [00:00:00.000 12:34:56.789 23:59:59.999])
+(count (date TmV))                             -- 3
+(at (date TmV) 0)                              -- 2000.01.01D00:00:00.000000000
+(at (date TmV) 1)                              -- 2000.01.01D00:00:00.000000000
+(at (date TmV) 2)                              -- 2000.01.01D00:00:00.000000000
+
+;; (time TmV) → trim ms → seconds at epoch.
+(at (time TmV) 0)                              -- 2000.01.01D00:00:00.000000000
+(at (time TmV) 1)                              -- 2000.01.01D12:34:56.000000000
+(at (time TmV) 2)                              -- 2000.01.01D23:59:59.000000000
+
+;; ═══════════════════════════════════════════════════════════════════
+;;       5.  DAG path — exec_date_trunc via dotted .date / .time
+;; ═══════════════════════════════════════════════════════════════════
+;; A `select s: col.date` desugars (in src/ops/query.c at compile
+;; time) to scan(col) → date_trunc(DAY), so exec_date_trunc runs
+;; over a real column.  This exercises ray_temporal_trunc_from_sym
+;; ("date" / "time" → field code) and the DAG-level switch case for
+;; RAY_EXTRACT_DAY / RAY_EXTRACT_SECOND.
+
+;; TIMESTAMP source column.
+(set Tts (table [Ts] (list [2024.03.15D12:34:56.789000000 2024.07.04D23:59:59.999999999 2024.01.01D00:00:00.000000000])))
+
+(set Rts_date (select {from: Tts s: Ts.date}))
+(count Rts_date)                               -- 3
+(at (at Rts_date 's) 0)                        -- 2024.03.15D00:00:00.000000000
+(at (at Rts_date 's) 1)                        -- 2024.07.04D00:00:00.000000000
+(at (at Rts_date 's) 2)                        -- 2024.01.01D00:00:00.000000000
+(type (at Rts_date 's))                        -- 'TIMESTAMP
+
+(set Rts_time (select {from: Tts s: Ts.time}))
+(count Rts_time)                               -- 3
+(at (at Rts_time 's) 0)                        -- 2024.03.15D12:34:56.000000000
+(at (at Rts_time 's) 1)                        -- 2024.07.04D23:59:59.000000000
+(at (at Rts_time 's) 2)                        -- 2024.01.01D00:00:00.000000000
+
+;; DATE source column.  exec_date_trunc's int32-path with
+;; RAY_EXTRACT_DAY bucket — already day-aligned, so values
+;; round-trip in TIMESTAMP space.
+(set Tdt (table [D] (list [2024.01.01 2024.06.15 2024.12.31])))
+(set Rdt (select {from: Tdt s: D.date}))
+(count Rdt)                                    -- 3
+(at (at Rdt 's) 0)                             -- 2024.01.01D00:00:00.000000000
+(at (at Rdt 's) 1)                             -- 2024.06.15D00:00:00.000000000
+(at (at Rdt 's) 2)                             -- 2024.12.31D00:00:00.000000000
+
+;; TIME source column.  exec_date_trunc int32-path with
+;; RAY_EXTRACT_SECOND bucket — ms granularity trims to whole seconds.
+(set Ttm (table [T] (list [00:00:00.500 12:34:56.789 23:59:59.999])))
+(set Rtm (select {from: Ttm s: T.time}))
+(count Rtm)                                    -- 3
+(at (at Rtm 's) 0)                             -- 2000.01.01D00:00:00.000000000
+(at (at Rtm 's) 1)                             -- 2000.01.01D12:34:56.000000000
+(at (at Rtm 's) 2)                             -- 2000.01.01D23:59:59.000000000
+
+;; ═══════════════════════════════════════════════════════════════════
+;;       6.  Group-by .date — produces day buckets
+;; ═══════════════════════════════════════════════════════════════════
+;; Two timestamps on 2024-03-15 plus one on 2024-03-16 collapse to
+;; exactly 2 groups, confirming exec_date_trunc emits identical
+;; bucket values for same-day inputs.
+(set Tgb (table [Ts Px] (list [2024.03.15D09:00:00.000000000 2024.03.15D17:30:00.000000000 2024.03.16D12:00:00.000000000] [1.0 2.0 3.0])))
+(count (select {from: Tgb by: Ts.date}))      -- 2
+
+;; ═══════════════════════════════════════════════════════════════════
+;;       7.  Clock builtins — type-only assertions (wall-clock)
+;; ═══════════════════════════════════════════════════════════════════
+;; (date 'local) / (date 'global) — argument is a symbol (non-temporal),
+;; so the clock branch fires.  Result values are time-dependent so we
+;; only check the result type.  'local routes through localtime() and
+;; 'global through gmtime(); both produce DATE / TIME / TIMESTAMP atoms.
+;; The is_global_arg helper inspects the sym text to pick the branch.
+(type (date 'local))                           -- 'date
+(type (time 'local))                           -- 'time
+(type (timestamp 'local))                      -- 'timestamp
+(type (date 'global))                          -- 'date
+(type (time 'global))                          -- 'time
+(type (timestamp 'global))                     -- 'timestamp
+
+;; ═══════════════════════════════════════════════════════════════════
+;;       8.  Duration arithmetic — DATE / TIMESTAMP differences
+;; ═══════════════════════════════════════════════════════════════════
+;; DATE - DATE returns days as an integer (verified type below).
+;; This routes through the binary subtraction kernel, not temporal.c
+;; directly, but the surrounding test suite leaves the exact unit
+;; ambiguous so we lock it in here.
+(- 2024.01.10 2024.01.01)                      -- 9
+(- 2024.03.01 2024.02.01)                      -- 29
+(- 2023.03.01 2023.02.01)                      -- 28
+(- 2000.01.01 1999.12.31)                      -- 1
+
+;; Crossing year boundary (full leap year 2024).
+(- 2025.01.01 2024.01.01)                      -- 366
+
+;; date + days / date - days stays in DATE space.
+(type (+ 2024.01.01 1))                        -- 'date
+(type (- 2024.01.01 1))                        -- 'date
+(+ 2024.02.28 1)                               -- 2024.02.29
+(- 2024.03.01 1)                               -- 2024.02.29
+
+;; Negative-shift sanity: subtracting more than 1 day still produces
+;; a DATE.
+(- 2024.03.01 31)                              -- 2024.01.30
+
+;; ═══════════════════════════════════════════════════════════════════
+;;       9.  Round-trip — (date (date ts)) is idempotent on day-aligned
+;; ═══════════════════════════════════════════════════════════════════
+;; Re-truncating a value that's already on the day boundary returns
+;; the same TIMESTAMP.
+(date (date 2024.03.15D12:34:56.789000000))   -- 2024.03.15D00:00:00.000000000
+(time (time 2024.03.15D12:34:56.789000000))   -- 2024.03.15D12:34:56.000000000
+
+;; (date ∘ time) on a TIMESTAMP still yields the day-boundary because
+;; trimming sub-seconds keeps the date intact, then `(date …)` drops
+;; the hours.
+(date (time 2024.03.15D12:34:56.789000000))   -- 2024.03.15D00:00:00.000000000
+
+;; ═══════════════════════════════════════════════════════════════════
+;;       10. Combined extract → truncate consistency
+;; ═══════════════════════════════════════════════════════════════════
+;; Year/month/day extracted from a TIMESTAMP and from its `(date …)`
+;; truncate must agree.
+(set TSF 2024.07.04D14:25:36.123456789)
+(yyyy TSF)                                     -- 2024
+(yyyy (date TSF))                              -- 2024
+(mm   TSF)                                     -- 7
+(mm   (date TSF))                              -- 7
+(dd   TSF)                                     -- 4
+(dd   (date TSF))                              -- 4
+;; After (date …) the hh/minute/ss are all zero.
+(hh   (date TSF))                              -- 0
+(minute (date TSF))                            -- 0
+(ss   (date TSF))                              -- 0
+;; After (time …) the calendar fields stay intact, only sub-second drops.
+(hh   (time TSF))                              -- 14
+(minute (time TSF))                            -- 25
+(ss   (time TSF))                              -- 36

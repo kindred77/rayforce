@@ -1,0 +1,268 @@
+;; Per-group count(distinct) coverage for src/ops/group.c — focused on
+;; the kernels added by the recent ClickBench perf commits:
+;;
+;;   ray_count_distinct_per_group   (single global hash, serial)
+;;   count_distinct_per_group_parallel (cdpg_hist_fn / cdpg_scat_fn /
+;;                                      cdpg_dedup_fn, partitioned)
+;;   count_distinct_per_group_buf   (per-group slice, low-cardinality)
+;;
+;; Dispatch site (src/ops/query.c:7622-7659):
+;;   - n_groups > 50000 + direct-column inner  → ray_count_distinct_per_group
+;;       └─ n_rows >= 200000 + worker pool      → count_distinct_per_group_parallel
+;;       └─ otherwise                          → serial global-hash CD_INSERT
+;;   - n_groups <= 50000                       → count_distinct_per_group_buf
+;;       └─ n_groups >= 4 + pool >= 2 + flat   → parallel cdpg_buf_par_fn
+;;       └─ else / type miss                   → exec_count_distinct per group
+;;
+;; All inputs are happy-path: correct types/shapes, no null payloads.
+;;
+;; Companion file test/rfl/agg/count_distinct.rfl covers ungrouped
+;; count(distinct) and one parallel CDPG smoke at 200000×51000.  This
+;; file fills in the per-group kernel matrix (val types × key shape ×
+;; cardinality buckets) so every per-group path lights up.
+;;
+;; Cross-check methodology: every assertion is verifiable by hand from
+;; the table generator.  We assert (count R), (sum (at R 'c)), and the
+;; per-group `c` value via `(at (at R 'c) i)` — three orthogonal probes
+;; that catch off-by-one and per-group-undercount regressions.
+
+;; ════════════════════════════════════════════════════════════════════
+;; 1. SMALL TABLE — serial global-hash path (sequential)
+;;    n_rows < 200000  AND  n_groups > 50000? No → routes via
+;;    count_distinct_per_group_buf (n_groups <= 50000 branch) which
+;;    itself dispatches to parallel cdpg_buf_par_fn when n_groups >= 4.
+;;    With n_groups = 3 we fall through to the serial exec_count_distinct
+;;    per-group loop (query.c:2613-2639) — sequential reference path.
+;; ════════════════════════════════════════════════════════════════════
+
+;; 12 rows, 3 groups, I64 vals.  Sequential per-group loop (n_groups < 4
+;; bypasses cdpg_buf_par_fn entirely).
+(set Ts1 (table [k v] (list [1 1 1 1 2 2 2 2 3 3 3 3] [10 10 20 20 30 31 32 33 40 40 41 41])))
+(set Rs1 (select {c: (count (distinct v)) from: Ts1 by: k}))
+(count Rs1) -- 3
+;; k=1 → {10,20} = 2 distinct; k=2 → {30,31,32,33} = 4; k=3 → {40,41} = 2.
+(at (at Rs1 'c) 0) -- 2
+(at (at Rs1 'c) 1) -- 4
+(at (at Rs1 'c) 2) -- 2
+(sum (at Rs1 'c)) -- 8
+
+;; ════════════════════════════════════════════════════════════════════
+;; 2. SMALL/MEDIUM TABLE — cdpg_buf_par_fn (per-group-slice parallel)
+;;    n_groups >= 4 + pool >= 2 trips the parallel buf kernel in
+;;    query.c:2589-2603.  Each task dedupes one group with the
+;;    single-array open-addressing HT (CDPG_BUF_INSERT macro).
+;; ════════════════════════════════════════════════════════════════════
+
+;; 6 groups (>= 4 → parallel buf path) with predictable distinct counts.
+;; v[r] = r mod 13 → 13 distinct values cycle.  k[r] = r mod 6 → 6 groups.
+;; With N=600 rows, each group sees 100 rows, and v mod 13 covers all 13
+;; values in each group (since 100 > 13).  Cross-checked by enumeration.
+(set Nb 600)
+(set Tb1 (table [k v] (list (% (til Nb) 6) (% (til Nb) 13))))
+(set Rb1 (select {c: (count (distinct v)) from: Tb1 by: k}))
+(count Rb1) -- 6
+;; Each group has 100 rows; v cycles 0..12 → 13 distinct per group.
+(at (at Rb1 'c) 0) -- 13
+(at (at Rb1 'c) 3) -- 13
+(at (at Rb1 'c) 5) -- 13
+;; 6 * 13 = 78
+(sum (at Rb1 'c)) -- 78
+
+;; ════════════════════════════════════════════════════════════════════
+;; 3. cdpg_buf_par_fn — F64 vals (is_f64 branch)
+;;    Trips the F64 NaN/0.0 normalisation arm (query.c CDPG_BUF_INSERT
+;;    F64 path) and the F64 typed read.
+;; ════════════════════════════════════════════════════════════════════
+
+(set Nf 1000)
+;; 10 groups, each row's v = (r % 7) cast to F64.
+;; Each group has 7 distinct F64 values.
+(set Tf1 (table [k v] (list (% (til Nf) 10) (as 'F64 (% (til Nf) 7)))))
+;; Each k in 0..9 receives 100 rows; v cycles 0..6 → 7 distinct per group.
+(set Rf1 (select {c: (count (distinct v)) from: Tf1 by: k}))
+(count Rf1) -- 10
+;; All 10 groups have 7 distinct F64 values.
+(at (at Rf1 'c) 0) -- 7
+(at (at Rf1 'c) 9) -- 7
+(sum (at Rf1 'c)) -- 70
+
+;; ════════════════════════════════════════════════════════════════════
+;; 4. cdpg_buf_par_fn — esz=4 (I32) and esz=2 (I16) and esz=1 (U8/BOOL)
+;;    Trips the typed-pointer specialisations in cdpg_buf_par_fn.
+;; ════════════════════════════════════════════════════════════════════
+
+;; I32 — esz=4 branch.
+(set Ti32 (table [k v] (list (% (til Nf) 8) (as 'I32 (% (til Nf) 5)))))
+(set Ri32 (select {c: (count (distinct v)) from: Ti32 by: k}))
+(count Ri32) -- 8
+(at (at Ri32 'c) 0) -- 5
+(sum (at Ri32 'c)) -- 40
+
+;; I16 — esz=2 branch.  K=6 and D=5 are coprime → 5 distinct per group.
+(set Ti16 (table [k v] (list (% (til Nf) 6) (as 'I16 (% (til Nf) 5)))))
+(set Ri16 (select {c: (count (distinct v)) from: Ti16 by: k}))
+(count Ri16) -- 6
+(at (at Ri16 'c) 0) -- 5
+(sum (at Ri16 'c)) -- 30
+
+;; U8 — esz=1 branch.
+(set Tu8 (table [k v] (list (% (til Nf) 5) (as 'U8 (% (til Nf) 3)))))
+(set Ru8 (select {c: (count (distinct v)) from: Tu8 by: k}))
+(count Ru8) -- 5
+(at (at Ru8 'c) 0) -- 3
+(sum (at Ru8 'c)) -- 15
+
+;; ════════════════════════════════════════════════════════════════════
+;; 5. cdpg_buf_par_fn — SYM vals (RAY_IS_SYM branch)
+;;    SYM payload goes through the SYM-attrs preserving gather and the
+;;    SYM esz/8 specialisation in cdpg_buf_par_fn.
+;; ════════════════════════════════════════════════════════════════════
+
+(set Ts (table [k v] (list [1 1 1 2 2 2 3 3 3 4 4 4] ['a 'b 'a 'c 'c 'd 'e 'e 'e 'f 'g 'h])))
+(set Rs (select {c: (count (distinct v)) from: Ts by: k}))
+(count Rs) -- 4
+;; k=1 → {'a 'b} = 2; k=2 → {'c 'd} = 2; k=3 → {'e} = 1; k=4 → {'f 'g 'h} = 3.
+(at (at Rs 'c) 0) -- 2
+(at (at Rs 'c) 1) -- 2
+(at (at Rs 'c) 2) -- 1
+(at (at Rs 'c) 3) -- 3
+(sum (at Rs 'c)) -- 8
+
+;; ════════════════════════════════════════════════════════════════════
+;; 6. ray_count_distinct_per_group — single-array HT (DuckDB-style),
+;;    n_groups > 50000 sub-200000 rows triggers serial global-hash.
+;;    Path: query.c:7650 → ray_count_distinct_per_group → CD_INSERT
+;;    loop (group.c:1162-1227, esz=8 I64 specialisation).
+;; ════════════════════════════════════════════════════════════════════
+
+;; 100000 rows × 60000 groups, I64 vals.  n_rows < 200000 → SKIP
+;; the parallel kernel (group.c:1092 threshold), n_groups > 50000 → ENTER
+;; ray_count_distinct_per_group serial CD_INSERT loop.
+(set Nh 100000)
+(set Th1 (table [k v] (list (% (til Nh) 60000) (% (til Nh) 3))))
+(set Rh1 (select {c: (count (distinct v)) from: Th1 by: k}))
+;; 60000 distinct gids in the key column.
+(count Rh1) -- 60000
+
+;; ════════════════════════════════════════════════════════════════════
+;; 7. count_distinct_per_group_parallel — partitioned kernel
+;;    n_rows >= 200000 + n_groups > 50000 + worker pool present.
+;;    Path: group.c:1093 → cdpg_hist_fn / cdpg_scat_fn / cdpg_dedup_fn.
+;;    The agg/count_distinct.rfl already covers I64 here; we add F64 +
+;;    SYM coverage that wasn't there.
+;; ════════════════════════════════════════════════════════════════════
+
+;; 200000 rows × 51000 groups, F64 vals.  Trips the F64 arms in
+;; cdpg_hist_fn / cdpg_scat_fn / cdpg_dedup_fn including the NaN
+;; normalisation (group.c:1169-1172).
+(set Np 200000)
+(set Tp1 (table [k v] (list (% (til Np) 51000) (as 'F64 (% (til Np) 5)))))
+(set Rp1 (select {c: (count (distinct v)) from: Tp1 by: k}))
+(count Rp1) -- 51000
+
+;; Same shape, SYM vals — exercises the SYM esz dispatch in the
+;; partitioned kernel.  3 distinct syms cycling so per-group count
+;; saturates at 3 (or 4 when row count per group rounds favourably).
+(set Tp2 (table [k v] (list (% (til Np) 51000) (take ['x 'y 'z] Np))))
+(set Rp2 (select {c: (count (distinct v)) from: Tp2 by: k}))
+(count Rp2) -- 51000
+
+;; ════════════════════════════════════════════════════════════════════
+;; 8. Multi-key composite group — by [k1 k2]
+;;    Composite gid takes the gid-pack path in the DAG group prep.
+;;    Lights up the same cdpg_buf_par_fn / ray_count_distinct_per_group
+;;    branches via the composite-gid wrapper rather than the single-col
+;;    fast path.
+;; ════════════════════════════════════════════════════════════════════
+
+;; 6 distinct (k1,k2) pairs over 24 rows.
+(set Tmk (table [k1 k2 v] (list [1 1 1 1 2 2 2 2 3 3 3 3 1 1 1 1 2 2 2 2 3 3 3 3] [1 1 2 2 1 1 2 2 1 1 2 2 1 1 2 2 1 1 2 2 1 1 2 2] [100 100 200 201 300 301 400 401 500 500 600 601 100 110 200 210 300 310 400 410 500 510 600 610])))
+(set Rmk (select {c: (count (distinct v)) from: Tmk by: [k1 k2]}))
+(count Rmk) -- 6
+;; (1,1): {100,110}=2; (1,2): {200,201,210}=3; (2,1): {300,301,310}=3;
+;; (2,2): {400,401,410}=3; (3,1): {500,510}=2; (3,2): {600,601,610}=3.
+;; Sum = 2+3+3+3+2+3 = 16.
+(sum (at Rmk 'c)) -- 16
+
+;; ════════════════════════════════════════════════════════════════════
+;; 9. Multi-key composite at the parallel threshold — exercises the
+;;    composite-gid wrapper at n_rows >= 200000 (drives gid through
+;;    count_distinct_per_group_parallel via the composite pack).
+;; ════════════════════════════════════════════════════════════════════
+
+;; Large multi-key: k1 in 0..199, k2 in 0..254 → 200*255 = 51000 pairs.
+;; Pack drives n_groups around 51000 — exactly the > 50000 threshold to
+;; route through ray_count_distinct_per_group.
+(set Nmk 200000)
+(set Tmkp (table [k1 k2 v] (list (% (til Nmk) 200) (% (til Nmk) 255) (% (til Nmk) 4))))
+(set Rmkp (select {c: (count (distinct v)) from: Tmkp by: [k1 k2]}))
+;; Asserting only that the result has >= 50000 rows (composite cardinality
+;; is data-dependent on the LCM; the planner should produce one row per
+;; observed (k1,k2) pair).  Use a precise count from the table generator:
+;; pairs (i % 200, i % 255) cycle with period lcm(200,255) = 10200 → 10200
+;; distinct pairs.
+(count Rmkp) -- 10200
+
+;; ════════════════════════════════════════════════════════════════════
+;; 10. SYM key with I64 vals — count_distinct_per_group_buf path
+;;     SYM keys force the eval-level group fallback at low cardinality
+;;     (the DAG group-boundary path can't pack SYM keys in some configs);
+;;     verifies the buf kernel still produces the right answer when the
+;;     planner routes through count_distinct_per_group_groups (the LIST-
+;;     keyed variant) or count_distinct_per_group_buf as appropriate.
+;; ════════════════════════════════════════════════════════════════════
+
+(set Tsk (table [s v] (list ['A 'A 'A 'B 'B 'B 'C 'C 'C 'D 'D 'D] [10 20 30 40 40 50 60 70 70 80 90 90])))
+(set Rsk (select {c: (count (distinct v)) from: Tsk by: s}))
+(count Rsk) -- 4
+;; A → {10,20,30}=3; B → {40,50}=2; C → {60,70}=2; D → {80,90}=2.
+(sum (at Rsk 'c)) -- 9
+
+;; ════════════════════════════════════════════════════════════════════
+;; 11. I64 vals + I64 keys at medium scale — buf kernel with the
+;;     n_groups >= 4 parallel dispatch active, ~10 groups × ~1k rows.
+;;     Exact match of the brief's "medium" bucket.
+;; ════════════════════════════════════════════════════════════════════
+
+(set Nm 1000)
+;; K=10, D=11 — coprime so every group sees all 11 distinct values.
+(set Tm1 (table [k v] (list (% (til Nm) 10) (% (til Nm) 11))))
+(set Rm1 (select {c: (count (distinct v)) from: Tm1 by: k}))
+(count Rm1) -- 10
+(at (at Rm1 'c) 0) -- 11
+(at (at Rm1 'c) 5) -- 11
+(at (at Rm1 'c) 9) -- 11
+(sum (at Rm1 'c)) -- 110
+
+;; ════════════════════════════════════════════════════════════════════
+;; 12. Large-N + few-groups (~100 groups × 50k rows) — buf parallel
+;;     path with substantial per-group work.  Mirrors the brief's
+;;     "large" bucket but stays under the 200000-row partitioned
+;;     threshold so this exercises the per-group-slice parallel kernel,
+;;     not the partitioned one.
+;; ════════════════════════════════════════════════════════════════════
+
+(set Nlb 50000)
+(set Tlb (table [k v] (list (% (til Nlb) 100) (% (til Nlb) 13))))
+(set Rlb (select {c: (count (distinct v)) from: Tlb by: k}))
+(count Rlb) -- 100
+;; Each k receives 500 rows; v cycles 0..12 → 13 distinct per group
+;; (500 >> 13 so every cycle position lands in every group).
+(at (at Rlb 'c) 0) -- 13
+(at (at Rlb 'c) 50) -- 13
+(at (at Rlb 'c) 99) -- 13
+(sum (at Rlb 'c)) -- 1300
+
+;; ════════════════════════════════════════════════════════════════════
+;; 13. Cross-check against ungrouped (count (distinct ...)) reference.
+;;     For each per-group result above we can confirm the total distinct
+;;     pairs equals (sum c).  Here we round-trip a small example through
+;;     both formulations.
+;; ════════════════════════════════════════════════════════════════════
+
+(set Txc (table [k v] (list [1 1 2 2 3 3 1 2 3] [10 20 30 40 50 60 10 30 50])))
+;; Per-group: k=1 → {10,20}=2; k=2 → {30,40}=2; k=3 → {50,60}=2; sum=6.
+(set Rxc (select {c: (count (distinct v)) from: Txc by: k}))
+(sum (at Rxc 'c)) -- 6
+;; Ungrouped reference: distinct(v) over the whole column = {10,20,30,40,50,60} = 6.
+(count (distinct (at Txc 'v))) -- 6

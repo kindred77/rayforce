@@ -1,0 +1,214 @@
+;; graph_algos_advanced.rfl — happy-path regression for advanced graph algos
+;; in src/ops/traverse.c.  Complements traverse_coverage.rfl (which targets
+;; error / domain branches) and traverse_weighted.rfl with deeper correctness
+;; invariants for the *successful* execution paths.
+;;
+;; Algorithms covered:
+;;   PageRank   (exec_pagerank)          — hub-graph ranking
+;;   Louvain    (exec_louvain)           — community detection on a 2-cluster
+;;                                          graph
+;;   var-expand realloc                  — frontier (cap=256) + output buffer
+;;                                          (cap=1024) growth paths
+;;
+;; Algorithms NOT covered, and why:
+;;   A* (exec_a_star / exec_astar) — implementation lives in traverse.c but
+;;     is NOT exposed via any .graph.* builtin in src/ops/graph_builtin.c,
+;;     and no register_vary(".graph.astar", ...) call exists in
+;;     src/lang/eval.c.  See graph_advanced.rfl line ~241 for the existing
+;;     SKIPPED note.  Per "CRITICAL RULE — DO NOT ROUTE AROUND BUGS" the
+;;     correct response when the surface is unreachable is to document and
+;;     skip, not to invent a binding.
+;;   SCC (strongly-connected components) — no implementation exists.  No
+;;     exec_scc / ray_graph_scc / "tarjan" / "kosaraju" symbol in src/ or
+;;     include/.  The feature is unimplemented at the C level.
+
+;; ======================================================================
+;; Fixture HUB5: 5-node in-hub graph.  Nodes 1..4 each have a single
+;; out-edge → 0.  Node 0 is a dangling sink.  An extra edge 1→2 gives
+;; node 1 an additional out-degree (out-deg 2) so the rank distribution
+;; isn't uniform across the spokes.
+;;
+;;     1 ─→ 0 ←─ 2
+;;     │    ↑    ↑
+;;     ↓    │    │
+;;     2    3    4
+;;
+;; Expected: rank[0] is the largest; sum of ranks is ≈ 1.
+;; ======================================================================
+(set HUB5Edges (table [src dst] (list [1 2 3 4 1] [0 0 0 0 2])))
+(set HUB5 (.graph.build HUB5Edges 'src 'dst))
+
+(set PrHub (.graph.pagerank HUB5 50 0.85))
+(count PrHub) -- 5
+;; ranks sum to ≈ 1.0
+(>= (sum (at PrHub '_rank)) 0.99) -- true
+(<= (sum (at PrHub '_rank)) 1.01) -- true
+;; all ranks positive
+(> (min (at PrHub '_rank)) 0.0) -- true
+
+;; the hub (node 0) holds the largest rank
+(set PrHub_node (at PrHub '_node))
+(set PrHub_rank (at PrHub '_rank))
+(set PrHub_max  (max PrHub_rank))
+;; rank of node 0 == max rank
+(set PrHub_r0 (at PrHub_rank (at (where (== PrHub_node 0)) 0)))
+(== PrHub_r0 PrHub_max) -- true
+;; node 0 strictly dominates each spoke (1,2,3,4)
+(> PrHub_r0 (at PrHub_rank (at (where (== PrHub_node 1)) 0))) -- true
+(> PrHub_r0 (at PrHub_rank (at (where (== PrHub_node 2)) 0))) -- true
+(> PrHub_r0 (at PrHub_rank (at (where (== PrHub_node 3)) 0))) -- true
+(> PrHub_r0 (at PrHub_rank (at (where (== PrHub_node 4)) 0))) -- true
+
+;; default damping (0.85) path: same hub-dominance invariant must hold
+;; with the default-arg branch of ray_graph_pagerank_fn (n==2, no damping).
+(set PrHub2 (.graph.pagerank HUB5 25))
+(count PrHub2) -- 5
+(set PrHub2_node (at PrHub2 '_node))
+(set PrHub2_rank (at PrHub2 '_rank))
+(> (at PrHub2_rank (at (where (== PrHub2_node 0)) 0)) (at PrHub2_rank (at (where (== PrHub2_node 1)) 0))) -- true
+
+;; default iters + damping (n==1 path)
+(set PrHub3 (.graph.pagerank HUB5))
+(count PrHub3) -- 5
+(>= (sum (at PrHub3 '_rank)) 0.99) -- true
+(<= (sum (at PrHub3 '_rank)) 1.01) -- true
+
+;; ======================================================================
+;; Fixture LOUV2: 8-node graph with two clearly separated clusters.
+;; Cluster A: nodes 0..3, full quadrilateral with diagonals (every pair
+;; connected, bidirectional) — i.e. K4 modelled as directed edges.
+;; Cluster B: nodes 4..7, same structure.
+;; Bridge: a single edge 0 → 4 connecting the two halves.
+;;
+;; Louvain treats the graph as undirected; with 6 directed edges per K4
+;; (= 6 undirected edges, since each undirected edge appears as both
+;; (u,v) and (v,u) in the CSR via the rev-CSR), the bridge is dwarfed
+;; by intra-cluster connectivity, so Louvain phase-1 separates A from B.
+;;
+;; Cluster A directed edges (u<v then v<u, 6 undirected → 12 directed):
+;;   0-1, 0-2, 0-3, 1-2, 1-3, 2-3  → 12 directed rows
+;; Same for cluster B with nodes 4..7.
+;; Bridge: 0→4.
+;; ======================================================================
+(set LOUV2Edges (table [src dst] (list [0 1 0 2 0 3 1 2 1 3 2 3 4 5 4 6 4 7 5 6 5 7 6 7 0] [1 0 2 0 3 0 2 1 3 1 3 2 5 4 6 4 7 4 6 5 7 5 7 6 4])))
+(set LOUV2 (.graph.build LOUV2Edges 'src 'dst))
+
+(set Lou (.graph.louvain LOUV2 200))
+(count Lou) -- 8
+;; community IDs are normalised to [0..k-1]
+(min (at Lou '_community)) -- 0
+;; observation: this Louvain phase-1 implementation produces 4 communities
+;; on a K4+K4+bridge graph rather than the 2 a multi-pass Louvain would
+;; find.  This is consistent with the comment in src/ops/traverse.c:1166
+;; ("Pass 1 only (no graph contraction)") — Louvain's second pass is
+;; what consolidates greedy phase-1 sub-clusters into the natural global
+;; partition.  Keeping the assertion as-observed so a future second-pass
+;; addition will trip it and force a re-evaluation.
+(count (distinct (at Lou '_community))) -- 4
+;; every node assigned (no gaps)
+(count (distinct (at Lou '_node))) -- 8
+(min (at Lou '_node)) -- 0
+(max (at Lou '_node)) -- 7
+
+;; Partition observation (phase-1 only): on the K4+K4+bridge fixture the
+;; algorithm fragments each K4 into a pair of 2-node sub-communities,
+;; producing 4 communities total of size 2 each.  The boundary between
+;; the two halves (nodes 0..3 vs 4..7) is still respected — node 0 and
+;; node 4 are never in the same community — but the further intra-half
+;; fragmentation is suboptimal vs canonical multi-pass Louvain.
+(set Lou_node (at Lou '_node))
+(set Lou_comm (at Lou '_community))
+(set CommOf0 (at Lou_comm (at (where (== Lou_node 0)) 0)))
+(set CommOf4 (at Lou_comm (at (where (== Lou_node 4)) 0)))
+;; Cross-cluster invariant must hold even with phase-1 fragmentation:
+;; a node in cluster A and a node in cluster B never share a community
+;; (the bridge 0→4 is too weak to merge them).
+(!= CommOf0 CommOf4) -- true
+(!= (at Lou_comm (at (where (== Lou_node 1)) 0)) CommOf4) -- true
+(!= (at Lou_comm (at (where (== Lou_node 2)) 0)) CommOf4) -- true
+(!= (at Lou_comm (at (where (== Lou_node 3)) 0)) CommOf4) -- true
+;; Each community contains exactly 2 nodes (the phase-1 fragmentation
+;; produces uniform pairs — direct observation of this implementation's
+;; greedy convergence on K4-cliques).
+(== (count (where (== Lou_comm 0))) 2) -- true
+(== (count (where (== Lou_comm 1))) 2) -- true
+(== (count (where (== Lou_comm 2))) 2) -- true
+(== (count (where (== Lou_comm 3))) 2) -- true
+
+;; default max-iter (n==1 path: iters defaults to 100) — same partition.
+(set Lou2 (.graph.louvain LOUV2))
+(count Lou2) -- 8
+(== (count (distinct (at Lou2 '_community))) 4) -- true
+
+;; ======================================================================
+;; Fixture REALLOC: large star graph to force exec_var_expand realloc.
+;;
+;; Buffers in exec_var_expand grow as power-of-two from initial capacities:
+;;   - frontier (per-source): front_cap = 256 → 512, 1024, …
+;;   - output table:          out_cap   = 1024 → 2048, 4096, …
+;;
+;; A star with hub=0 and 1500 leaves (1..1500) produces:
+;;   - 1500 depth-1 neighbours from a single source → next_len passes 256,
+;;     exercising the frontier scratch_realloc path.
+;;   - 1500 emitted (start, end, depth=1) rows → out_count passes 1024,
+;;     exercising the atomic 3-buffer grow path (the "alloc 3 new copies,
+;;     commit only if all succeed" branch).
+;;
+;; Total nodes = 1501; edges = 1500.
+;; ======================================================================
+(set N 1500)
+;; src column: hub=0 repeated 1500 times.  dst column: 1..N.
+;; (% (til N) 1) is always 0; we want a constant 0 vector of length N.
+;; Build via (& (til N) 0) ? simpler: (* 0 (til N)).
+(set REALLOCEdges (table [src dst] (list (* 0 (til N)) (+ 1 (til N)))))
+(set REALLOC (.graph.build REALLOCEdges 'src 'dst))
+;; sanity: 1501 nodes total, 1500 edges
+(at (.graph.info REALLOC) 'n_nodes) -- 1501
+(at (.graph.info REALLOC) 'n_edges) -- 1500
+
+;; var-expand from hub=0 with min=1 max=1 (one hop, forward) — emits
+;; 1500 rows, blasting through both the 256-frontier and the 1024-out
+;; realloc thresholds.
+(set ReBlast (.graph.var-expand REALLOC 0 1 1 0))
+(count ReBlast) -- 1500
+;; every emitted row starts at the hub
+(count (distinct (at ReBlast '_start))) -- 1
+(first (at ReBlast '_start)) -- 0
+;; every emitted depth is 1 (single hop)
+(count (distinct (at ReBlast '_depth))) -- 1
+(first (at ReBlast '_depth)) -- 1
+;; the destination nodes are exactly leaves 1..1500
+(count (distinct (at ReBlast '_end))) -- 1500
+(min (at ReBlast '_end)) -- 1
+(max (at ReBlast '_end)) -- 1500
+
+;; max=2 still gives 1500 rows (leaves have no further out-edges, so
+;; depth 2 frontier is empty).  This re-exercises the same realloc
+;; paths plus the "depth>max with non-empty frontier exit" branch.
+(set ReBlast2 (.graph.var-expand REALLOC 0 1 2 0))
+(count ReBlast2) -- 1500
+(== (count (distinct (at ReBlast2 '_depth))) 1) -- true
+(first (at ReBlast2 '_depth)) -- 1
+
+;; direction=2 (both fwd+rev) from the hub: same 1500 fwd-leaves, no
+;; rev neighbours, so still 1500 rows — exercises the realloc paths
+;; via the direction==2 dual-CSR walk.
+(set ReBlastBoth (.graph.var-expand REALLOC 0 1 1 2))
+(count ReBlastBoth) -- 1500
+(min (at ReBlastBoth '_end)) -- 1
+(max (at ReBlastBoth '_end)) -- 1500
+
+;; reverse direction from a leaf: depth-1 fwd-neighbours of a leaf via
+;; the reverse CSR is exactly the hub (1 row).  This isn't itself a
+;; realloc trigger, but it verifies the dir=1 branch still works on the
+;; large fixture (the rev CSR n_nodes equals fwd's, 1501).
+(set ReRevLeaf (.graph.var-expand REALLOC 1500 1 1 1))
+(count ReRevLeaf) -- 1
+(first (at ReRevLeaf '_end)) -- 0
+
+;; ======================================================================
+;; Cleanup
+;; ======================================================================
+(.graph.free HUB5)
+(.graph.free LOUV2)
+(.graph.free REALLOC)

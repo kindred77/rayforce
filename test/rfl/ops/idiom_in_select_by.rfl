@@ -1,0 +1,50 @@
+;; Bug 2: idiom rewrites inside select-by aggregator slot.
+;;
+;; (first (asc v)) → OP_MIN(v) idiom (and last/asc → max) must work
+;; when the expression is the aggregator inside select{by:}, not just
+;; at the bare-expression top level.
+;;
+;; Before fix: returned `error: domain` because redirect_consumers in
+;;   src/ops/opt.c did not update OP_GROUP's ext->agg_ins[] when the
+;;   rewrite replaced the OP_FIRST node with OP_MIN — the group node
+;;   kept pointing to the dead OP_FIRST node.
+;;
+;; After fix: returns the per-group min/max value just like
+;;   (select {from: T m: (min v) by: k}) does.
+
+(set T (table [v k] (list [3 1 4 1 5 9 2 6] [1 1 1 1 2 2 2 2])))
+
+;; Per-group reference: bare (min v) / (max v) — already works.
+(set Rmin (select {from: T m: (min v) by: k}))
+(set Rmax (select {from: T m: (max v) by: k}))
+
+;; Idiom form: (first (asc v)) / (last (asc v)) — must produce the
+;; same per-group min/max values.
+(set Rfa (select {from: T m: (first (asc v)) by: k}))
+(set Rla (select {from: T m: (last (asc v)) by: k}))
+
+;; Parity: cell-level checks (no table-to-table ==).
+;; Per-group min/max of [3 1 4 1 5 9 2 6] grouped by [1 1 1 1 2 2 2 2]:
+;;   group1 = {3,1,4,1} -> min=1, max=4
+;;   group2 = {5,9,2,6} -> min=2, max=9
+(at (at Rfa 'm) 0) -- 1
+(at (at Rfa 'm) 1) -- 2
+(at (at Rla 'm) 0) -- 4
+(at (at Rla 'm) 1) -- 9
+;; Spot-parity with the (min v) / (max v) references built above.
+(== (at (at Rfa 'm) 0) (at (at Rmin 'm) 0)) -- true
+(== (at (at Rfa 'm) 1) (at (at Rmin 'm) 1)) -- true
+(== (at (at Rla 'm) 0) (at (at Rmax 'm) 0)) -- true
+(== (at (at Rla 'm) 1) (at (at Rmax 'm) 1)) -- true
+
+;; F64 column — same idiom shape.
+(set Tf (table [v k] (list [3.5 1.5 4.5 1.5 5.5 9.5 2.5 6.5] [1 1 1 1 2 2 2 2])))
+(set RfaF (select {from: Tf m: (first (asc v)) by: k}))
+(at (at RfaF 'm) 0) -- 1.5
+(at (at RfaF 'm) 1) -- 2.5
+
+;; Multi-key by — exercises the same redirect path through multi-key
+;; group construction.
+(set Tm (table [v k1 k2] (list [3 1 4 1] [1 1 2 2] ['a 'a 'b 'b])))
+(set RfaM (select {from: Tm m: (first (asc v)) by: [k1 k2]}))
+(count RfaM) -- 2
