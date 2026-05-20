@@ -1,0 +1,140 @@
+;; Coverage for src/store/col.c: col_load_str_vec (STRV-magic legacy reader)
+;; and col_copy_str_pool (deep-copy of the STR byte pool on non-mmap load).
+;;
+;; Reachability map (per llvm-cov, both 0% on master before this test):
+;;
+;;   col_copy_str_pool  — reached via ray_col_load on a STR column file
+;;                        written by ray_col_save (no magic, raw header).
+;;                        `.db.splayed.get` uses the mmap loader, so it
+;;                        bypasses copy_str_pool entirely.  `.db.splayed.mount`
+;;                        calls ray_splay_load → ray_col_load (no mmap),
+;;                        which hits col_copy_str_pool for every STR column.
+;;
+;;   col_load_str_vec   — reached when ray_col_load sees the legacy STRV
+;;                        magic (0x53 0x54 0x52 0x56 = "STRV").  Newer
+;;                        files don't carry this magic, so we plant the
+;;                        bytes by hand via .sys.exec + printf and load
+;;                        the surrounding splayed dir.  `.db.splayed.get`
+;;                        routes through ray_col_mmap_splayed which sees
+;;                        STRV magic, returns "nyi", and falls back to
+;;                        ray_col_load (splay.c:212-219) — that is the
+;;                        path that lands inside col_load_str_vec.
+;;
+;; Fixtures use the `rf_test_str_io_*` prefix; the Makefile clean rule
+;; only catches *.csv, so this file removes its own directories at the
+;; top and bottom (matches csv_splayed.rfl convention).
+
+;; ────────────── scrub stale state from a prior run ──────────────
+(.sys.exec "rm -rf rf_test_str_io_*") -- 0
+
+;; ════════════════════════════════════════════════════════════════
+;; 1. col_copy_str_pool main path — STR column with long strings
+;;    (>12 bytes = RAY_STR_INLINE_MAX) so str_pool->len > 0.
+;;
+;;    .db.splayed.set writes a 32-byte STR header + str_pool header
+;;    + bytes (no magic).  .db.splayed.mount uses ray_splay_load
+;;    (non-mmap) → ray_col_load → col_copy_str_pool's main branch:
+;;    ray_alloc + memcpy of 32 + pool_size bytes, then rc/attr fixup.
+;;
+;; 2. col_copy_str_pool empty-pool branch — STR column whose strings
+;;    all fit inline (≤12 bytes) so str_pool->len == 0.  Validation
+;;    still sets has_str_pool=true, but col_copy_str_pool returns
+;;    NULL at line 745 ("if (cm->str_pool_size == 0)") — the early
+;;    exit that the long-strings path can't hit.
+;; ════════════════════════════════════════════════════════════════
+(set Tpool (table [id name] (list [1 2 3] ["a-very-long-pooled-string" "another-pooled-string-too" "third-pooled-string-here"])))
+(set Tinl  (table [id name] (list [10 20]  ["aa" "bb"])))
+
+(.db.splayed.set "rf_test_str_io_mount/pool"   Tpool)
+(.db.splayed.set "rf_test_str_io_mount/inline" Tinl)
+
+;; Drop the local bindings so the mount must reconstruct the tables
+;; from disk — proves col_copy_str_pool actually rebuilt the pools.
+(set Tpool 0)
+(set Tinl  0)
+
+(.db.splayed.mount "rf_test_str_io_mount/")
+
+;; `pool` and `inline` are now globals bound by the mount.  Every
+;; assertion below is a byte-exact value read from the deep-copied
+;; pool/inline column — the only way they can match is if
+;; col_copy_str_pool preserved both the 32-byte ray_t header and
+;; the payload bytes.
+(count pool) -- 3
+(at (at pool 'name) 0) -- "a-very-long-pooled-string"
+(at (at pool 'name) 2) -- "third-pooled-string-here"
+;; Inline branch — pool_size == 0, early NULL return; the STR values
+;; sit entirely in the 16-byte ray_str_t descriptor.
+(count inline) -- 2
+(at (at inline 'name) 1) -- "bb"
+
+;; ════════════════════════════════════════════════════════════════
+;; 3. col_load_str_vec happy path — plant a hand-crafted STRV file.
+;;
+;;    Layout (matches ray_de_raw's RAY_STR vector case, serde.c:635):
+;;      4 bytes "STRV" magic           — \123\124\122\126
+;;      1 byte  type = RAY_STR (13)    — \015
+;;      1 byte  attrs = 0              — \000
+;;      8 bytes count                  — LE 64-bit
+;;      per string: 8 bytes slen + slen bytes content.
+;;
+;;    We need a `.d` schema for the splayed loader to walk this
+;;    column, so first save a placeholder STR table normally
+;;    (gives a valid `.d` referencing the `s` column), then
+;;    overwrite the column file with the STRV byte stream.
+;;
+;; 4. type-mismatch branch — STRV magic + RAY_I64 vec payload
+;;    (type 5).  Hits col.c lines 202-205: result->type != RAY_STR
+;;    ⇒ ray_release + ray_error("type").
+;;
+;; 5. truncated-payload branch — STRV + STR header claiming slen=99
+;;    but only 3 content bytes.  ray_de_raw returns "domain", and
+;;    col_load_str_vec propagates via the RAY_IS_ERR(result) check
+;;    at line 201.
+;;
+;; 6. zero-row STRV — STR vector with count=0.  Confirms the happy
+;;    branch handles len=0 cleanly (no release / no error).
+;; ════════════════════════════════════════════════════════════════
+(set Tph (table [s] (list ["placeholder"])))
+(.db.splayed.set "rf_test_str_io_strv"       Tph)
+(.db.splayed.set "rf_test_str_io_strv_bad"   Tph)
+(.db.splayed.set "rf_test_str_io_strv_trunc" Tph)
+(.db.splayed.set "rf_test_str_io_strv_empty" Tph)
+
+;; STRV + STR + attrs=0 + count=2 + "hi" (2) + "world" (5)
+(.sys.exec "printf '\\123\\124\\122\\126\\015\\000\\002\\000\\000\\000\\000\\000\\000\\000\\002\\000\\000\\000\\000\\000\\000\\000hi\\005\\000\\000\\000\\000\\000\\000\\000world' > rf_test_str_io_strv/s")
+;; STRV + I64 vec hdr + count=1 + 8 zero bytes (1 I64 value=0)
+(.sys.exec "printf '\\123\\124\\122\\126\\005\\000\\001\\000\\000\\000\\000\\000\\000\\000\\000\\000\\000\\000\\000\\000\\000\\000' > rf_test_str_io_strv_bad/s")
+;; STRV + STR + count=1 + slen=99 (0x63=\143) + only "abc"
+(.sys.exec "printf '\\123\\124\\122\\126\\015\\000\\001\\000\\000\\000\\000\\000\\000\\000\\143\\000\\000\\000\\000\\000\\000\\000abc' > rf_test_str_io_strv_trunc/s")
+;; STRV + STR + attrs=0 + count=0
+(.sys.exec "printf '\\123\\124\\122\\126\\015\\000\\000\\000\\000\\000\\000\\000\\000\\000' > rf_test_str_io_strv_empty/s")
+
+(set Rstrv (.db.splayed.get "rf_test_str_io_strv/"))
+(count Rstrv) -- 2
+(at (at Rstrv 's) 0) -- "hi"
+(at (at Rstrv 's) 1) -- "world"
+
+;; Error branches — different errors prove different regions of
+;; col_load_str_vec fire (type-check at line 202 vs RAY_IS_ERR at
+;; line 201).
+(.db.splayed.get "rf_test_str_io_strv_bad/")   !- type
+(.db.splayed.get "rf_test_str_io_strv_trunc/") !- domain
+
+(set Rempty (.db.splayed.get "rf_test_str_io_strv_empty/"))
+(count Rempty) -- 0
+
+;; ────────────── cleanup ──────────────
+(.sys.exec "rm -rf rf_test_str_io_*") -- 0
+
+;; ────────────── reachability notes ──────────────
+;; col_load_str_vec line 198 `if (remaining > INT64_MAX)` — only
+;; reachable on systems where size_t > int64_t (e.g. 128-bit size_t
+;; or a 32-bit size_t with intentionally crafted huge file).  Not
+;; testable from RFL on the platforms we ship; covered by the
+;; defensive bound, not by a regression assertion.
+;;
+;; col_copy_str_pool line 748 `if (!pool || RAY_IS_ERR(pool))` — the
+;; OOM branch.  ray_alloc returns NULL only when the buddy allocator
+;; is fully exhausted; reaching that from RFL requires a multi-GB
+;; allocation, which is out of scope for a regression test.
