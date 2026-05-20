@@ -1,0 +1,73 @@
+;; ════════════════════════════════════════════════════════════════════
+;; Targeted coverage push: src/ops/group.c
+;;
+;;  - group_strlen_at_cached  (~3641)
+;;      per-row strlen agg with a borrowed SYM-dict cache.  Fires from
+;;      the sparse/dense int-key group paths when the agg input is
+;;      (strlen sym_col) or (strlen str_col).
+;;
+;;  - grpt_ht_grow_slots      (~8956)
+;;      rowform per-group top-K hash-table slot resize.  Per-partition
+;;      HT init_cap = 8192, entry_cap = 4096; grow fires once one
+;;      partition accumulates >= 4096 distinct keys, which requires a
+;;      large distinct-key population spread by the 8-bit radix.
+;; ════════════════════════════════════════════════════════════════════
+
+;; ────────────────────────────────────────────────────────────────────
+;; group_strlen_at_cached — SYM agg through cached dict (sparse-HT path)
+;; ────────────────────────────────────────────────────────────────────
+;; Force the sparse_i64 group-by path (line 6447 in group.c) by giving
+;; the key column a wide range so the dense-array path's
+;; DA_MAX_COMPOSITE_SLOTS (262144) gate fails.  Keys are 1000 spaced 1000
+;; apart → key_range = 999001 ≫ 262144.  300 distinct syms supplied via
+;; (as 'SYM (til 300)) exercise the borrowed dict cache: each row reads
+;; the SYM id, indexes into the borrowed strings[] array, returns the
+;; atom's byte length.
+(set NS 1000)
+(set KS 1000)
+(set Tss (table [k s] (list (* KS (til NS)) (as 'SYM (% (til NS) 300)))))
+;; 1000 groups (one per key).  Each group has 1 row.  The sym at row i
+;; is the decimal of (i % 300):
+;;   '0..'9  : 1 char  (10 syms)
+;;   '10..'99: 2 chars (90 syms)
+;;   '100..'299: 3 chars (200 syms)
+;; Per-300 block sum = 10*1 + 90*2 + 200*3 = 10 + 180 + 600 = 790.
+;; 1000 rows = 3 full blocks of 300 (sum 2370) + 100 remainder rows
+;; i ∈ {900..999} → (i % 300) ∈ {0..99}: 10 one-char + 90 two-char = 190.
+;; Total sum strlen = 3*790 + 190 = 2560.
+(count (select {l: (sum (strlen s)) by: k from: Tss})) -- 1000
+(sum (at (select {l: (sum (strlen s)) by: k from: Tss}) 'l)) -- 2560
+;; AVG: same as sum since each group has one row.
+(sum (at (select {l: (avg (strlen s)) by: k from: Tss}) 'l)) -- 2560.0
+
+;; ────────────────────────────────────────────────────────────────────
+;; group_strlen_at_cached — STR column path (not SYM) via sparse HT
+;; ────────────────────────────────────────────────────────────────────
+;; Wide key spacing forces DA fallback to sparse for the STR branch
+;; (line 3645 in group.c).  Each pair {k, u} contributes strlen(u) once.
+(set Tstr (table [k u] (list (* 1000000 (til 4)) (list "" "x" "yz" "abcd"))))
+;; 4 groups, 1 row each.  Total strlen = 0+1+2+4 = 7.
+(count (select {l: (sum (strlen u)) by: k from: Tstr})) -- 4
+(sum (at (select {l: (sum (strlen u)) by: k from: Tstr}) 'l)) -- 7
+
+;; ────────────────────────────────────────────────────────────────────
+;; grpt_ht_grow_slots — exec_group_topk_rowform partition HT grow
+;; ────────────────────────────────────────────────────────────────────
+;; Per-partition HT initial cap = 8192, entry_cap = 4096, grow trigger
+;; at (count+1)*2 > cap (i.e. count >= 4096).  256 radix partitions on
+;; bits[16..23] of wyhash.  With N=1.2M distinct integer keys spread
+;; uniformly, expected per-partition load ≈ 4687 — comfortably above
+;; 4096, so the slot doubling fires across most partitions.
+;;
+;; K=1 (top-1 per group) keeps each entry at HEAD_SZ + 8 = ~24 bytes,
+;; minimising memory pressure under ASan.
+(set NG 1200000)
+(set Ttk (table [k v] (list (til NG) (til NG))))
+;; Single-key, single-agg, no where, K in [1,255], int64 key & val,
+;; OP_SCAN columns — meets the rowform_ok gate at query.c:5885.  Each
+;; group has exactly one row, so top-1 == bot-1 == that row's value.
+(count (select {t: (top v 1) by: k from: Ttk})) -- 1200000
+;; Sum of top-1 per group = sum of all v = N*(N-1)/2 = 1200000*1199999/2.
+(sum (at (select {t: (top v 1) by: k from: Ttk}) 't)) -- 719999400000
+;; Bot-1 sum identical (group size 1).
+(sum (at (select {b: (bot v 1) by: k from: Ttk}) 'b)) -- 719999400000

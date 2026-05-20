@@ -1,0 +1,143 @@
+;; Coverage for the width-agnostic key reader and the parallel row→gid
+;; probe in `src/ops/query.c`:
+;;
+;;   - `key_read_i64`           (line ~2828): width-typed read of one
+;;                              key cell — BOOL, U8, I16, I32, I64,
+;;                              DATE, TIME, TIMESTAMP, SYM, F64.
+;;                              Prior tests covered only I64 / SYM
+;;                              arms; the others were ≤ 0%.
+;;
+;;   - `rgid_probe_fn`          (line ~2882): parallel probe worker.
+;;                              The selection-aware branch
+;;                              (`if (x->selection)`) was never reached
+;;                              by prior tests because it requires the
+;;                              path-A fused WHERE + n_nonaggs > 0
+;;                              shape, and the only n_nonagg shape that
+;;                              keeps the fused path is `(count
+;;                              (distinct col))`.
+;;
+;;   - `query_key_reader_init`  (line 164): per-key reader setup for
+;;                              the multi-key-by + take ≤ 1024 +
+;;                              count-only path (line 4593).  Prior
+;;                              tests covered only the flat-column
+;;                              branch with 2 calls; this file adds the
+;;                              same branch with mixed key widths and
+;;                              null-bearing keys to exercise the
+;;                              null-check arm of the downstream reader
+;;                              loop.
+;;
+;; Gating for the parallel probe:
+;;   nrows ≥ 200_000          (dispatch-amortisation threshold)
+;;   1 ≤ n_groups ≤ 65_536    (per-task histogram sizing)
+;;   1 scalar key in by:      (single-key scatter path)
+;;   pool worker count ≥ 2    (already true on test runners)
+;;
+;; All assertions correctness-only — the serial fallback returns
+;; identical results so a single-worker box passes the same checks.
+
+;; ─── 1. key_read_i64: I32 key arm (line 2836) ──────────────────────
+;; (% (til N) 100) is I64; cast forces a real RAY_I32 column so the
+;; scan reads the int32_t * cast in key_read_i64.
+(set N32 200000)
+(set Ng32 100)
+(set Ti32 (table [k v] (list (as 'I32 (% (til N32) Ng32)) (til N32))))
+(set Ri32 (select {v: v by: k from: Ti32}))
+(count Ri32) -- 100
+(fold + 0 (map count (at Ri32 'v))) -- 200000
+
+;; ─── 2. key_read_i64: I16 key arm (line 2833) ──────────────────────
+(set Ti16 (table [k v] (list (as 'I16 (% (til N32) Ng32)) (til N32))))
+(set Ri16 (select {v: v by: k from: Ti16}))
+(count Ri16) -- 100
+(fold + 0 (map count (at Ri16 'v))) -- 200000
+
+;; ─── 3. key_read_i64: U8 key arm (line 2832, shared with BOOL) ─────
+;; Keep n_groups <= 256 so U8 doesn't lose distinct values.
+(set Tu8 (table [k v] (list (as 'U8 (% (til N32) Ng32)) (til N32))))
+(set Ru8 (select {v: v by: k from: Tu8}))
+(count Ru8) -- 100
+(fold + 0 (map count (at Ru8 'v))) -- 200000
+
+;; ─── 4. key_read_i64: BOOL key arm (line 2831) ─────────────────────
+;; n_groups = 2; the BOOL path shares the U8 read but exercises a
+;; distinct okt switch arm inside key_read_i64.
+(set Tbo (table [k v] (list (as 'BOOL (% (til N32) 2)) (til N32))))
+(set Rbo (select {v: v by: k from: Tbo}))
+(count Rbo) -- 2
+(fold + 0 (map count (at Rbo 'v))) -- 200000
+
+;; ─── 5. key_read_i64: DATE key arm (line 2835, shared with I32) ────
+;; Distinct RAY_DATE okt — line 7216 reads via the int32_t arm but
+;; the okt switch in key_read_i64 has separate case labels.
+(set Tdt (table [k v] (list (as 'DATE (% (til N32) Ng32)) (til N32))))
+(set Rdt (select {v: v by: k from: Tdt}))
+(count Rdt) -- 100
+(fold + 0 (map count (at Rdt 'v))) -- 200000
+
+;; ─── 6. key_read_i64: TIMESTAMP key arm (line 2838, shared I64) ────
+;; Distinct RAY_TIMESTAMP okt — case label in key_read_i64.
+(set Tts (table [k v] (list (as 'TIMESTAMP (% (til N32) Ng32)) (til N32))))
+(set Rts (select {v: v by: k from: Tts}))
+(count Rts) -- 100
+(fold + 0 (map count (at Rts 'v))) -- 200000
+
+;; ─── 7. key_read_i64: F64 key arm (line 2843) ──────────────────────
+;; F64 keys go through the bitcast memcpy path (NaN/-0 equality).
+(set Tf64 (table [k v] (list (as 'F64 (% (til N32) Ng32)) (til N32))))
+(set Rf64 (select {v: v by: k from: Tf64}))
+(count Rf64) -- 100
+(fold + 0 (map count (at Rf64 'v))) -- 200000
+
+;; ─── 8. rgid_probe_fn selection path: (count (distinct ...)) + WHERE
+;; Shape: single non-agg is `(count (distinct v))`, which is the only
+;; non-agg form that does NOT set `has_nonagg_needing_flat`.  Combined
+;; with a flat (non-parted) table, this takes the path-A fused WHERE
+;; that populates `saved_selection`; the L7115 scatter then dispatches
+;; the parallel rgid_probe_fn with the selection threaded through,
+;; exercising the `if (x->selection)` branch at line 2896.
+;; Design: k = i / 2000 so each of the 100 groups holds 2000
+;; contiguous rows, and v = i % 10 cycles within each group.  This
+;; way every group has rows for every v value, so the WHERE filter
+;; keeps every group alive while dropping a fraction of each group's
+;; rows — exactly the shape the selection-threaded probe was built
+;; for.
+(set Tcd (table [k v] (list (div (til N32) 2000) (% (til N32) 10))))
+(set Rcd (select {c: (count (distinct v)) by: k where: (< v 7) from: Tcd}))
+(count Rcd) -- 100
+;; Every group sees v cycling 0..9 — surviving (v<7) distinct values
+;; per group = 7.  100 groups * 7 = 700.
+(sum (at Rcd 'c)) -- 700
+
+;; ─── 9. rgid_probe_fn selection path — RAY_SEL_NONE / RAY_SEL_ALL.
+;; Filter on the contiguous k range (k = i/2000), so rows 0..99_999
+;; (k<50) all fail and rows 100_000..199_999 all pass.  Most morsels
+;; land entirely on one side → flagged RAY_SEL_NONE or RAY_SEL_ALL.
+;; The transition morsel near i=99_999..100_000 lands SEL_MIX, but
+;; the bulk hit the all-pass / all-fail bypass arms.
+(set Rsa (select {c: (count (distinct v)) by: k where: (>= k 50) from: Tcd}))
+(count Rsa) -- 50
+;; Surviving 50 groups each see v cycling 0..9 → 10 distinct each.
+(sum (at Rsa 'c)) -- 500
+
+;; ─── 10. query_key_reader_init: multi-key by + take ≤ 1024 + count
+;; Activates the line 4593 init loop for each key column.  Keys are
+;; I64 + SYM — covers `r->base_type = col->type` arm.  pre_take_groups
+;; is set from the take literal; we use take: 50 ≤ 1024.
+(set Tmk (table [g1 g2 v] (list [1 1 2 2 3 3 4 4 5 5] ['A 'B 'A 'B 'A 'B 'A 'B 'A 'B] [10 20 30 40 50 60 70 80 90 100])))
+(count (select {c: (count v) by: [g1 g2] take: 50 from: Tmk})) -- 10
+(sum (at (select {c: (count v) by: [g1 g2] take: 50 from: Tmk}) 'c)) -- 10
+
+;; ─── 11. query_key_reader_init: multi-key with mixed widths
+;; I16 + I32 keys — each reader's `r->base_type = col->type` reads the
+;; respective width.  Downstream query_key_reader_read uses
+;; read_col_i64 to widen.  Confirms multi-key path under cast types.
+(set Tmw (table [k16 k32 v] (list (as 'I16 [1 1 2 2 3 3]) (as 'I32 [10 20 10 20 10 20]) [100 200 300 400 500 600])))
+(count (select {c: (count v) by: [k16 k32] take: 20 from: Tmw})) -- 6
+(sum (at (select {c: (count v) by: [k16 k32] take: 20 from: Tmw}) 'c)) -- 6
+
+;; ─── 12. query_key_reader_init with null-bearing key — exercises
+;; the HAS_NULLS attr arm of query_key_reader_read (line 198) downstream.
+;; The pre-take path is the only multi-key path that uses the reader.
+(set Tnk (table [k1 k2 v] (list [1 0N 2 0N 3 0N] ['A 'A 'B 'B 'C 'C] [10 20 30 40 50 60])))
+(count (select {c: (count v) by: [k1 k2] take: 30 from: Tnk})) -- 6
+(sum (at (select {c: (count v) by: [k1 k2] take: 30 from: Tnk}) 'c)) -- 6

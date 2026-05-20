@@ -1,0 +1,122 @@
+;; ════════════════════════════════════════════════════════════════════
+;; Targeted coverage push for src/ops/group.c hash-table builders that
+;; are reached only via the top-N count-emit filter on multi-key
+;; group-by, plus the single-key sparse_i64 rehash path.
+;;
+;; Functions under test:
+;;   - group_ht_insert_empty_group  (src/ops/group.c:2337)
+;;   - group_rows_range_existing    (src/ops/group.c:2529)
+;;   - group_probe_existing_entry   (src/ops/group.c:2364)
+;;   - sparse_i64_rehash            (src/ops/group.c:3545)
+;;
+;; Dispatch conditions:
+;;   * Multi-key path (n_keys ≥ 2, i64-family keys, non-null) with
+;;     desc:count take:N and at least one non-count/sum/avg aggregator
+;;     (e.g. min) forces direct_ok=false → the heavy-key set is built
+;;     via group_ht_insert_empty_group (group.c:6902) and the per-row
+;;     pass uses group_rows_range_existing (group.c:7047) which in turn
+;;     calls group_probe_existing_entry (group.c:2606).
+;;
+;;   * A multi-key shape where path A bails (here: F64 key disables
+;;     the fast path's `supported` guard) reroutes through the
+;;     pivot_ingest fallback at group.c:7077 which calls
+;;     group_ht_insert_empty_group at line 7160 and
+;;     group_rows_range_existing at line 7166.
+;;
+;;   * Single-key i64 with > 2867 distinct keys spanning a range
+;;     wider than 262 144 slots (so the DA-dense fast path declines)
+;;     and no emit-filter reaches the sparse_i64 hash table; the
+;;     2868-th unique key triggers sparse_i64_rehash (capacity grows
+;;     from 4096 → 8192).
+;; ════════════════════════════════════════════════════════════════════
+
+;; ─── multi-key top-N with min agg → path A (line 6902 / 7047) ──────
+;; 200 rows, (k1,k2) ∈ {(i%5, i%7) : i ∈ [0,200)} → 35 distinct groups.
+;; Each group's row count is either 5 or 6 (200/35 ≈ 5.7); k=3 most
+;; popular groups keeps heavy_count = 3 (≤ 64) but the `min` agg
+;; flips direct_ok to false (only count/sum/avg keep it true) so the
+;; per-row aggregation goes through group_rows_range_existing.
+(set Ta (table [k1 k2 v] (list (% (til 200) 5) (% (til 200) 7) (til 200))))
+(set Ra (select {c: (count k1) m: (min v) from: Ta by: [k1 k2] desc: c take: 3}))
+(count Ra) -- 3
+(count (key Ra)) -- 4
+;; Top-3 groups all have count=6 (the (k1,k2) cells where 200 % lcm(5,7)
+;; falls into the first 200/35 partition residues with one extra row).
+(max (at Ra 'c)) -- 6
+(min (at Ra 'c)) -- 6
+;; min(v) over each heavy group is the smallest row-index whose
+;; (i%5, i%7) lands in that cell; for cells visited 6 times, the
+;; first index is in [0,35).  Their min must be < 35.
+(< (max (at Ra 'm)) 35) -- true
+
+;; ─── multi-key top-N with sum agg + larger take → exercises the
+;;     direct_ok=true branch's twin code paths (count-only short-circuit
+;;     at line 6917 vs. direct_ok at 6935).  This ALSO inserts into
+;;     top_ht via group_ht_insert_empty_group at line 6902.
+(set Rb (select {c: (count k1) from: Ta by: [k1 k2] desc: c take: 5}))
+(count Rb) -- 5
+(sum (at Rb 'c)) -- 30
+
+;; ─── force path A to bail → pivot_ingest fallback (lines 7160/7166) ──
+;; F64 first key disables the `supported` guard at 6707 so the fast
+;; n_keys=2 block is skipped; control falls through to the multi-key
+;; pivot_ingest_run path that builds top_ht from cnt_ingest's part
+;; rows and calls group_rows_range_existing for per-row aggregation.
+(set Tf (table [k1 k2 v] (list (as 'F64 (% (til 200) 5)) (% (til 200) 7) (til 200))))
+(set Rf (select {c: (count k1) m: (min v) from: Tf by: [k1 k2] desc: c take: 3}))
+(count Rf) -- 3
+(max (at Rf 'c)) -- 6
+
+;; ─── 3-key shape exercises hash_keys_inline's n_keys=3 fan-out
+;;     inside group_ht_insert_empty_group + the entry-pack loop in
+;;     group_rows_range_existing.
+(set T3 (table [k1 k2 k3 v] (list (% (til 210) 5) (% (til 210) 6) (% (til 210) 7) (til 210))))
+(set R3 (select {c: (count k1) m: (min v) from: T3 by: [k1 k2 k3] desc: c take: 4}))
+(count R3) -- 4
+(< (max (at R3 'm)) 210) -- true
+
+;; ─── single-key sparse_i64 with > 2867 distinct keys → rehash ──────
+;; sparse_i64_ht_t starts at cap=4096; rehash fires when size+1
+;; >= 0.7*cap = 2867.2, i.e. when the 2868-th unique key is added.
+;; 3000 distinct i64 keys spaced by 1000 produces a 3 000 000-wide
+;; key range — far past the 262 144-slot dense-array budget — so
+;; the DA fast path declines and execution reaches the sparse_i64
+;; hash builder at group.c:6422 (no emit-filter branch).
+(set Th (table [k] (list (* (til 3000) 1000))))
+(set Rh (select {c: (count k) from: Th by: k}))
+(count Rh) -- 3000
+(sum (at Rh 'c)) -- 3000
+(min (at Rh 'c)) -- 1
+(max (at Rh 'c)) -- 1
+;; The 3000 distinct keys are {0, 1000, ..., 2999000}; their sum is
+;; 1000 * (0+1+...+2999) = 1000 * 2999 * 3000 / 2 = 4 498 500 000.
+(sum (at Rh 'k)) -- 4498500000
+
+;; ─── sparse_i64 + sum agg (sp_need_sum=true) exercises the
+;;     need_sum branch of sparse_i64_rehash (memcpy of per-(slot,agg)
+;;     da_val_t sums during the cap doubling).
+(set Ths (table [k v] (list (* (til 3000) 1000) (til 3000))))
+(set Rhs (select {c: (count k) s: (sum v) from: Ths by: k}))
+(count Rhs) -- 3000
+;; Sum over all v = 0+1+...+2999 = 4 498 500.
+(sum (at Rhs 's)) -- 4498500
+
+;; ─── wide-key (GUID) + first agg → exercises group_rows_range_existing
+;;     wide branch (line 2569-2573) AND has_fl tail-slot write (2603-2604)
+;;     reached through the pivot_ingest fallback (GUID disables `supported`
+;;     in path A just like F64 above).
+(set Tg (table [g s v] (list (take (guid 5) 200) (% (til 200) 7) (til 200))))
+(set Rg (select {c: (count g) f: (first v) from: Tg by: [g s] desc: c take: 3}))
+(count Rg) -- 3
+
+;; ─── sparse_i64 + emit_filter top_count branch (group.c:6426) on
+;;     > 2867 distinct keys.  The first sp_ht in that branch is
+;;     count-only (need_sum=false) so its rehash takes the same
+;;     non-need_sum path as the regular sp_ht but reached via the
+;;     emit-filter top-N entry.  All keys appear once → take:5
+;;     selects 5 arbitrary "heavy" keys via the threshold-1 tie
+;;     break; the threshold-≤1 short-circuit at 6500-ish returns
+;;     all groups when none are heavier than 1, so verify the
+;;     result count is >= take_n's worth of distinct keys.
+(set Re (select {c: (count k) from: Th by: k desc: c take: 5}))
+(>= (count Re) 5) -- true

@@ -1,0 +1,146 @@
+;; Targeted coverage for two functions in src/ops/exec.c:
+;;
+;;   exec_in_worker  — typed-column membership worker
+;;   ray_result_merge — concatenation merge of per-segment partials
+;;
+;; The existing exec_coverage.rfl already exercises the integer-/
+;; float-family inner loops with vector columns at every common width.
+;; The arms that remain uncovered are:
+;;   * the float-path with vec_has_nulls=true at non-trivial scale
+;;     (exec.c L618-628) — only one in.rfl regression touches it,
+;;     and never at parallel-pool size,
+;;   * the symbol-side parallel dispatch (RAY_SYM read inside the
+;;     IN_READ_I64 switch, L590),
+;;   * the empty-set fast path (set vector reduced to sv_len=0 after
+;;     null pruning) over a long parallel column,
+;;   * the TIMESTAMP / DATE / TIME arm of IN_READ_I64 at scale.
+;;
+;; ray_result_merge is called once per segment of a parted table in
+;; the streaming executor.  The existing system/part.rfl tests run
+;; SELECT with by:/count(distinct) — which is NOT streamable, so
+;; they all fall through to ray_execute_inner's non-streaming path.
+;; To hit the table-table concat arm (L1903-1923) we need a parted
+;; default table feeding a fully streamable DAG (FILTER+SCAN, plain
+;; SELECT, element-wise expressions).
+;;
+;; ====================================================================
+;; pre-flight cleanup so the partitioned fixtures don't inherit stale
+;; sym.lk / .d files from a previous run (matches the convention used
+;; by system/splayed.rfl, system/part.rfl).
+;; ====================================================================
+(.sys.exec "rm -rf /tmp/rfl_exec_wm_int /tmp/rfl_exec_wm_sym /tmp/rfl_exec_wm_date /tmp/rfl_exec_wm_str")
+
+;; ====================================================================
+;; exec_in_worker — float-path with HAS_NULLS over a parallel column
+;; ====================================================================
+;; Build a 70k-row F64 column with explicit nulls via `(take [...] N)`
+;; — the pattern preserves the null bits across replication, so the
+;; result vector carries RAY_ATTR_HAS_NULLS.  At col_len=70000 the
+;; pool dispatch path fires; the vec_has_nulls branch (L618) is taken
+;; in the use_double=1 arm.
+(set N1 70000)
+(set TFN (table [f] (list (take [1.0 0Nf 2.0 0Nf 3.0 0Nf 4.0 5.0] N1))))
+;; pattern: 8 elems × 8750 = 70000 rows.  null rows: 3/8 → 26250.
+;; non-null with values in [1.0 2.0 3.0]: 3/8 → 26250.
+(count (select {from: TFN where: (in f [1.0 2.0 3.0])})) -- 26250
+(count (select {from: TFN where: (not-in f [1.0 2.0 3.0])})) -- 17500
+
+;; ====================================================================
+;; exec_in_worker — RAY_SYM parallel dispatch (L590, IN_READ_I64 sym
+;; arm).  The existing tests cover SYM only at small scale.  Pump a
+;; 70k-row SYM column so the worker_id != 0 branches execute.
+;; ====================================================================
+(set TS (table [s] (list (take ['AAPL 'GOOG 'MSFT 'TSLA] N1))))
+;; AAPL appears at indices 0, 4, 8, ...  → N1/4 = 17500 matches.
+(count (select {from: TS where: (in s ['AAPL])})) -- 17500
+(count (select {from: TS where: (in s ['AAPL 'TSLA])})) -- 35000
+;; not-in negation in parallel sym mode.
+(count (select {from: TS where: (not-in s ['AAPL])})) -- 52500
+
+;; ====================================================================
+;; exec_in_worker — DATE / TIMESTAMP arms of IN_READ_I64 (L586-589).
+;; The existing exec_coverage.rfl test for these uses a 50-row fixture
+;; (sequential dispatch); add a 70k-row parallel-dispatch invocation
+;; so the morsel-walk through the int-family branch executes.
+;; ====================================================================
+(set TD (table [d] (list (take [2024.01.01 2024.01.02 2024.01.03] N1))))
+(count (select {from: TD where: (in d [2024.01.01])})) -- 23334
+(count (select {from: TD where: (in d [2024.01.01 2024.01.03])})) -- 46667
+
+;; ====================================================================
+;; exec_in_worker — integer path with HAS_NULLS at parallel-pool size.
+;; Existing TNul fixture is 5 rows (sequential dispatch only); this
+;; ensures the !use_double + vec_has_nulls branch (L644) also runs
+;; under pool dispatch.
+;; ====================================================================
+(set TIN (table [v] (list (take [1 0Nl 2 0Nl 3 0Nl 4 5] N1))))
+;; 8 elems × 8750 = 70000.  null rows: 3/8 → 26250.
+;; non-null rows in [1 2 3]: 3/8 → 26250.
+(count (select {from: TIN where: (in v [1 2 3])})) -- 26250
+(count (select {from: TIN where: (not-in v [1 2 3])})) -- 17500
+;; not-in with a set that contains nulls — set null is dropped from
+;; probe buffer (set_has_nulls path); non-null rows compared against
+;; the compacted probe.
+(count (select {from: TIN where: (in v [1 0Nl 2 3])})) -- 26250
+
+;; ====================================================================
+;; NOTE — exec_in_worker col_is_atom branches (L622/632/648/658) are
+;; provably dead via static analysis: L612 sets
+;; `vec_has_nulls = c->col_has_nulls && !c->col_is_atom`, so within the
+;; vec_has_nulls arm col_is_atom can only be false (L622/648).  In the
+;; "else" arm (L630/656) col_is_atom IS possible in theory, but the
+;; only call sites that produce OP_IN with an atom LHS go through
+;; eval-layer `ray_in_fn` (collection.c), not the DAG OP_IN.  Reaching
+;; them from RFL requires a path that materializes an atom as the
+;; result of a DAG node inside a SELECT expression; currently the
+;; optimizer constant-folds or rewrites those shapes away.  Documented
+;; here so a future code change that exposes a new atom-LHS DAG path
+;; can drop in a matching assertion without rediscovering this.
+
+;; ====================================================================
+;; ray_result_merge — table-table concatenation across parted segments
+;; ====================================================================
+;; Build a 3-partition disk-backed parted table whose DAG path is
+;; fully streamable: SCAN columns -> FILTER on a constant predicate
+;; -> SELECT a subset of columns.  Each segment returns a TABLE
+;; partial; ray_result_merge concatenates segments 0..2 into the final
+;; result and exercises L1903-1922.
+(set P0 (table [id v] (list [1 2 3] [10 20 30])))
+(set P1 (table [id v] (list [4 5 6 7] [40 50 60 70])))
+(set P2 (table [id v] (list [8 9] [80 90])))
+(.db.splayed.set "/tmp/rfl_exec_wm_int/100/t/" P0)
+(.db.splayed.set "/tmp/rfl_exec_wm_int/200/t/" P1)
+(.db.splayed.set "/tmp/rfl_exec_wm_int/300/t/" P2)
+(set PT (.db.parted.get "/tmp/rfl_exec_wm_int/" 't))
+;; sanity: 3+4+2 = 9 total rows across segments
+(count PT) -- 9
+;; Streamable select: where: clause uses an element-wise predicate
+;; on a parted column.  Per-segment partials are flat tables; merge
+;; concatenates them.  Expected: rows with v >= 50 → 5 rows.
+(count (select {from: PT where: (>= v 50)})) -- 5
+;; Streamable projection over filtered parted table — also concat-
+;; merged segment by segment.
+(sum (at (select {from: PT where: (>= v 50)}) 'v)) -- 350
+;; All-pass predicate: every row from every segment survives → 9.
+(count (select {from: PT where: (>= v 0)})) -- 9
+
+;; ====================================================================
+;; ray_result_merge — vector-vector concat over a parted column
+;; ====================================================================
+;; (at PT 'v) reads a parted column directly.  Each segment yields a
+;; flat I64 vector; ray_result_merge's vector-merge branch (L1926)
+;; was already hit by existing tests, but include here so the test
+;; file is self-contained as a coverage sentinel.
+(sum (at PT 'v)) -- 450
+
+;; ====================================================================
+;; ray_result_merge — type mismatch path (L1930 returns ray_error
+;; "type" when one side is a table and the other isn't).  This is
+;; defense-in-depth and currently unreachable from a streamable DAG
+;; — each segment's output type is fixed by the root op shape — so
+;; we don't attempt to provoke it.  Documented for posterity.
+
+;; ====================================================================
+;; cleanup — leave /tmp tidy for re-runs
+;; ====================================================================
+(.sys.exec "rm -rf /tmp/rfl_exec_wm_int /tmp/rfl_exec_wm_sym /tmp/rfl_exec_wm_date /tmp/rfl_exec_wm_str")

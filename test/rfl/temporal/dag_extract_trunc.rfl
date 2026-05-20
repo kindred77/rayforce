@@ -1,0 +1,81 @@
+;; DAG-path coverage for src/ops/temporal.c:
+;;   • exec_extract     — HAS_NULLS = 1 paths over RAY_TIMESTAMP / RAY_DATE /
+;;                        RAY_TIME column inputs, and the TIME (IN32=1, in_type
+;;                        != RAY_DATE) inner-ternary branch that previously
+;;                        ran 0 hits.  Reached from rfl via `select` with the
+;;                        long-form (year / month / hour / minute / second /
+;;                        dayofweek / dayofyear) extractors over TABLE columns.
+;;   • exec_date_trunc  — HAS_NULLS = 1 paths over RAY_TIMESTAMP / RAY_DATE /
+;;                        RAY_TIME columns via the dotted `.date` / `.time`
+;;                        desugaring (DAY / SECOND bucket).  Atom + no-null
+;;                        flavours are covered by parse_format.rfl already,
+;;                        so this file focuses strictly on the null-bearing
+;;                        column path.
+;;
+;; Reachability notes:
+;;   The HOUR / MINUTE / MONTH / YEAR / EPOCH cases of exec_date_trunc are
+;;   unreachable from rfl: ray_temporal_trunc_from_sym only maps "date" → DAY
+;;   and "time" → SECOND, and there's no other entry point.  Same story for
+;;   RAY_EXTRACT_EPOCH in exec_extract — no rfl symbol resolves to it.
+;;   Those branches stay as dead-code-from-rfl regions.
+
+;; ───────────────────────── exec_extract (HAS_NULLS=1) ───────────────────────
+;; TIMESTAMP column with embedded null.  IN32=0, HAS_NULLS=1 — drives the
+;; `if (HAS_NULLS && ray_vec_is_null(input, off+i))` branch of the
+;; (0,0)→(1,0) dispatch in src/ops/temporal.c.  Nulls in the I64 result
+;; flow through as 0Nl.
+(set TPn (table [ts] (list (as 'TIMESTAMP [86400000000000 0N 172800000000000]))))
+(at (at (select {y: (year ts) from: TPn}) 'y) 0)        -- 2000
+(at (at (select {y: (year ts) from: TPn}) 'y) 1)        -- 0Nl
+(at (at (select {m: (month ts) from: TPn}) 'm) 1)       -- 0Nl
+(at (at (select {h: (hour ts) from: TPn}) 'h) 1)        -- 0Nl
+(at (at (select {n: (minute ts) from: TPn}) 'n) 1)      -- 0Nl
+(at (at (select {s: (second ts) from: TPn}) 's) 1)      -- 0Nl
+
+;; DATE column with embedded null.  IN32=1, HAS_NULLS=1 dispatch path.
+;; Days since 2000-01-01 = 8766 → 2024-01-01; the null slot at index 1
+;; remains null in the I64 output.
+(set TDn (table [d] (list (as 'DATE [8766 0N 8767]))))
+(at (at (select {y: (year d) from: TDn}) 'y) 0)         -- 2024
+(at (at (select {y: (year d) from: TDn}) 'y) 1)         -- 0Nl
+(at (at (select {dd: (day d) from: TDn}) 'dd) 1)        -- 0Nl
+(at (at (select {dy: (dayofyear d) from: TDn}) 'dy) 1)  -- 0Nl
+
+;; TIME column with embedded null.  IN32=1, HAS_NULLS=1, in_type=RAY_TIME so
+;; the IN32 ternary picks the `raw32 * 1000` arm (vs DATE's `* USEC_PER_DAY`).
+;; Previously this entire combination ran 0 hits.
+(set TTn (table [t] (list (as 'TIME [3723000 0N 86399000]))))
+(at (at (select {h: (hour t) from: TTn}) 'h) 0)         -- 1
+(at (at (select {h: (hour t) from: TTn}) 'h) 1)         -- 0Nl
+(at (at (select {h: (hour t) from: TTn}) 'h) 2)         -- 23
+(at (at (select {n: (minute t) from: TTn}) 'n) 0)       -- 2
+(at (at (select {s: (second t) from: TTn}) 's) 0)       -- 3
+
+;; ──────────────────────── exec_date_trunc (HAS_NULLS=1) ─────────────────────
+;; TIMESTAMP column with embedded null routed through `.date` (DAY bucket).
+;; Drives DATE_TRUNC_INNER(1, 0).
+(set Tts (table [ts] (list (as 'TIMESTAMP [86400000000000 0N 172800000000000]))))
+(at (at (select {s: ts.date from: Tts}) 's) 0)          -- 2000.01.02D00:00:00.000000000
+(at (at (select {s: ts.date from: Tts}) 's) 1)          -- 0Np
+(at (at (select {s: ts.time from: Tts}) 's) 1)          -- 0Np
+
+;; DATE column with embedded null routed through `.date`.  IN32=1,
+;; HAS_NULLS=1; DAY bucket trivially preserves day-aligned input.
+(set Tdd (table [d] (list (as 'DATE [8766 0N 8767]))))
+(at (at (select {s: d.date from: Tdd}) 's) 0)           -- 2024.01.01D00:00:00.000000000
+(at (at (select {s: d.date from: Tdd}) 's) 1)           -- 0Np
+
+;; TIME column with embedded null routed through `.time` (SECOND bucket).
+;; IN32=1, HAS_NULLS=1, in_type=RAY_TIME — drives the `* 1000` arm of the
+;; DATE_TRUNC_INNER ternary that was previously dark.
+(set Ttt (table [t] (list (as 'TIME [3723000 0N 86399999]))))
+(at (at (select {s: t.time from: Ttt}) 's) 0)           -- 2000.01.01D01:02:03.000000000
+(at (at (select {s: t.time from: Ttt}) 's) 1)           -- 0Np
+(at (at (select {s: t.time from: Ttt}) 's) 2)           -- 2000.01.01D23:59:59.000000000
+
+;; Pre-epoch DATE inside a select to exercise the `us < 0` correction
+;; in EXTRACT_INNER's `days_since_2000` block (year-decompose branch).
+;; 1999-12-31 = -1 day relative to the 2000 epoch.
+(set TPre (table [d] (list (as 'DATE [1999.12.31 2000.01.01]))))
+(at (at (select {y: (year d) from: TPre}) 'y) 0)        -- 1999
+(at (at (select {y: (year d) from: TPre}) 'y) 1)        -- 2000

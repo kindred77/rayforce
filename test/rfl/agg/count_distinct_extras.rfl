@@ -1,0 +1,149 @@
+;; Coverage extras for count(distinct ...) per-group kernels —
+;;   - src/ops/group.c:ray_count_distinct_per_group  (serial global-hash arm)
+;;   - src/ops/query.c:count_distinct_per_group_groups (eval-fallback path
+;;     reached when the by-key is LIST/STR so use_eval_group=1).
+;;
+;; Routing:
+;;   - DAG path (numeric by-key, n_groups > 50000):
+;;       query.c:7647-7651 picks ray_count_distinct_per_group;
+;;       group.c:1092 splits: n_rows >= 200000 → parallel kernel,
+;;       n_rows <  200000 → the SERIAL global-hash code below it.
+;;     The existing count_distinct.rfl covers the I64 / parallel arms.
+;;     This file targets the remaining serial type-specialised arms
+;;     (esz==1/2/4, F64, has_nulls) by keeping n_rows < 200000.
+;;   - Eval-fallback path (LIST or STR by-key → use_eval_group=1):
+;;       query.c:4836 / 5260 call count_distinct_per_group_groups,
+;;       which gathers each group's row indices and runs
+;;       exec_count_distinct on the slice.
+;;
+;; Shared scaffolding (one ~60K-row table, 51000 groups → forces the
+;; serial global-hash arm in ray_count_distinct_per_group on each cast
+;; of `v` to a different base type).
+(set Nser 60000)
+(set Ggrp (% (til Nser) 51000))
+(set Tcd-i32  (table [g v] (list Ggrp (as 'I32 (% (til Nser) 7)))))
+(set Tcd-i16  (table [g v] (list Ggrp (as 'I16 (% (til Nser) 5)))))
+(set Tcd-u8   (table [g v] (list Ggrp (as 'U8  (% (til Nser) 4)))))
+(set Tcd-bool (table [g v] (list Ggrp (== 0 (% (til Nser) 2)))))
+(set Tcd-f64  (table [g v] (list Ggrp (as 'F64 (% (til Nser) 6)))))
+(set Tcd-date (table [g v] (list Ggrp (as 'DATE (% (til Nser) 5)))))
+(set Tcd-time (table [g v] (list Ggrp (as 'TIME (% (til Nser) 5)))))
+(set Tcd-ts   (table [g v] (list Ggrp (as 'TIMESTAMP (% (til Nser) 5)))))
+
+;; ────────── ray_count_distinct_per_group serial arms ──────────
+;; 1) I32 data — hits group.c esz==4 specialised loop (DATE/TIME share).
+(count (select {n: (count (distinct v)) from: Tcd-i32 by: g})) -- 51000
+
+;; 2) I16 data — hits group.c esz==2 specialised loop.
+(count (select {n: (count (distinct v)) from: Tcd-i16 by: g})) -- 51000
+
+;; 3) U8 data — hits group.c esz==1 specialised loop (BOOL shares).
+(count (select {n: (count (distinct v)) from: Tcd-u8 by: g})) -- 51000
+
+;; 4) BOOL data — same esz==1 arm but type==BOOL switches the
+;;    in_type dispatch through `case RAY_BOOL` in the switch at L1071.
+(count (select {n: (count (distinct v)) from: Tcd-bool by: g})) -- 51000
+
+;; 5) F64 data — hits group.c `if (in_type == RAY_F64)` serial branch
+;;    including the NaN / -0.0 normalisation lines.
+(count (select {n: (count (distinct v)) from: Tcd-f64 by: g})) -- 51000
+
+;; 6) DATE data — esz==4 arm via `case RAY_DATE`.
+(count (select {n: (count (distinct v)) from: Tcd-date by: g})) -- 51000
+
+;; 7) TIME data — esz==4 arm via `case RAY_TIME`.
+(count (select {n: (count (distinct v)) from: Tcd-time by: g})) -- 51000
+
+;; 8) TIMESTAMP data — esz==8 arm via `case RAY_TIMESTAMP` (different
+;;    in_type from I64 even though width matches).
+(count (select {n: (count (distinct v)) from: Tcd-ts by: g})) -- 51000
+
+;; 9) Spot-check a single-group count to confirm distinct-counting
+;;    semantics on the I32 serial arm (not just row count).
+;;    Group 0 sees rows 0 and 51000 → v = 0 and 51000%7 = 5 → 2 distinct.
+(at (at (select {n: (count (distinct v)) from: Tcd-i32 by: g}) 'n) 0) -- 2
+
+;; 10) Spot-check the F64 arm — group 0 sees rows 0 & 51000; both v=0.0
+;;     (51000 % 6 == 0), so a single distinct value.  Confirms the F64
+;;     arm's NaN / -0.0 normalisation doesn't blow up on plain 0.0.
+(at (at (select {n: (count (distinct v)) from: Tcd-f64 by: g}) 'n) 0) -- 1
+
+;; ────────── has_nulls fallback (group.c L1204-1227) ──────────
+;; Build a null-bearing I64 column: cast a small null-bearing prefix
+;; and concat with a plain-I64 tail.  `[1 0Nl 2 0Nl 3]` is an I64 vec
+;; with HAS_NULLS attr (see distinct.rfl L22); concat preserves the
+;; null bitmap into the merged vector (see distinct.rfl L37-40).
+(set Vnull (concat [0Nl 1 0Nl 2 0Nl] (% (til (- Nser 5)) 7)))
+(set Tcd-null (table [g v] (list Ggrp Vnull)))
+;; 11) has_nulls arm with I64 data — exercises the read_col_i64 fallback
+;;     at L1223 inside the has_nulls block (esz==8, in_type==RAY_I64).
+(count (select {n: (count (distinct v)) from: Tcd-null by: g})) -- 51000
+
+;; 12) has_nulls arm with F64 data — exercises the F64 NaN / -0.0
+;;     normalisation inside the has_nulls block.
+(set Vnullf (as 'F64 Vnull))
+(set Tcd-fnull (table [g v] (list Ggrp Vnullf)))
+(count (select {n: (count (distinct v)) from: Tcd-fnull by: g})) -- 51000
+
+;; ────────── count_distinct_per_group_groups (eval-fallback) ──────────
+;; STR or LIST by-key flips use_eval_group=1 at query.c:4498, which
+;; routes through ray_group_fn → groups list, then the per-group
+;; count(distinct) helper at L2648.
+
+;; 13) STR by-key + I64 distinct column.  Column ref → src is bound
+;;     directly (the `inner_expr->type == -RAY_SYM && RAY_ATTR_NAME`
+;;     fast path inside count_distinct_per_group_groups).
+(set Tstr (table [Name v] (list (list "a" "b" "a" "b" "a" "c") [1 2 1 3 2 5])))
+(set Rstr (select {Name: Name n: (count (distinct v)) from: Tstr by: Name}))
+(count Rstr) -- 3
+
+;; 14) STR by-key + SYM distinct column — exec_count_distinct's SYM arm.
+(set Tstr2 (table [Name s] (list (list "a" "b" "a" "b" "a") ['x 'y 'x 'z 'x])))
+(set Rstr2 (select {Name: Name n: (count (distinct s)) from: Tstr2 by: Name}))
+(count Rstr2) -- 2
+
+;; 15) STR by-key + F64 distinct — exec_count_distinct's F64 arm.
+(set Tstr3 (table [Name v] (list (list "a" "b" "a" "b" "a") (as 'F64 [1.5 2.5 1.5 2.5 3.5]))))
+(set Rstr3 (select {Name: Name n: (count (distinct v)) from: Tstr3 by: Name}))
+(count Rstr3) -- 2
+
+;; 16) STR by-key + computed inner expr.  inner_expr is NOT a column
+;;     ref → count_distinct_per_group_groups falls into the
+;;     `ray_eval(inner_expr)` branch at query.c:2657 (the `!src` block).
+;;     `(* v 2)` evaluates to a per-row vector under the table scope.
+(set Tstr4 (table [Name v] (list (list "a" "b" "a" "b" "a") [1 2 3 4 5])))
+(set Rstr4 (select {Name: Name n: (count (distinct (* v 2))) from: Tstr4 by: Name}))
+(count Rstr4) -- 2
+
+;; 17) Multi-key by-clause with one STR key + one I64 key — STR key
+;;     triggers use_eval_group=1 (query.c:4523), multi-key drives the
+;;     composite-key branch that builds a LIST of row keys (query.c:4759)
+;;     and routes count(distinct) through the L4836 call site of
+;;     count_distinct_per_group_groups (distinct from the single-key
+;;     L5260 site already exercised above).
+(set Tmk (table [Name id v] (list (list "a" "a" "b" "b" "a" "b") [1 1 2 2 2 1] [10 20 30 40 50 60])))
+(set Rmk (select {n: (count (distinct v)) from: Tmk by: [Name id]}))
+(count Rmk) -- 4
+
+;; 18) Per-group cardinalities for assertion 13 — confirms each group
+;;     gets its distinct count, not just row count.  Groups are returned
+;;     in first-occurrence order: "a", "b", "c".
+(at Rstr 'n) -- [2 2 1]
+
+;; 19) STR by-key + null-bearing column — exercises exec_count_distinct
+;;     on a per-group slice that contains 0Nl rows (the gather_by_idx
+;;     produced subset keeps the HAS_NULLS attr).
+(set Tstrnull (table [Name v] (list (list "a" "a" "b" "b" "b") (concat (list 0Nl 1) [2 0Nl 2]))))
+(set Rsn (select {Name: Name n: (count (distinct v)) from: Tstrnull by: Name}))
+(at Rsn 'n) -- [2 2]
+
+;; ────────── PARTED-source branch in count_distinct_per_group_groups ──────────
+;; The `RAY_IS_PARTED(src->type)` flatten branch at query.c:2663-2667
+;; is reached only when the source column happens to be parted AND
+;; the by-key is LIST/STR (eval-fallback).  Existing parted DB
+;; persistence in this repo doesn't round-trip STR columns through
+;; .db.splayed.set in a way that survives the SYM-key DAG-vs-eval
+;; routing test, so the PARTED-flatten arm is left to a dedicated
+;; integration test (see system/part.rfl for the DAG-side count-distinct
+;; parted coverage).  Calling out the gap here so the next coverage
+;; sweep knows where to look.

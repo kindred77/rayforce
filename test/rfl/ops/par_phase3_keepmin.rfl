@@ -1,0 +1,185 @@
+;; ════════════════════════════════════════════════════════════════════
+;; Targeted coverage for three small low-cov helpers in src/ops:
+;;
+;;   1. par_binary_fn               (src/ops/expr.c:1809)
+;;      Selection-aware morsel loop body (lines 1827-1835) — requires
+;;      a chained AND-conjunct WHERE where the prior conjunct set
+;;      g->selection (non-NULL) and the current binary op falls out of
+;;      the fused expr_compile path (nullable column → reject) AND the
+;;      row count is >= RAY_PARALLEL_THRESHOLD (65536).
+;;
+;;   2. grpt_phase3_fn              (src/ops/group.c:9352)
+;;      Already covers the bulk of the function on the F64/I64 value
+;;      arms (heapsort drain + key/value write).  The has_null_key=1
+;;      branch (lines 9392-9422) is reachable only via grpt_ht_get
+;;      with has_null=true — which phase2 never sets (phase1 skips
+;;      null-key rows at group.c:9228).  That branch is therefore
+;;      dead code from the current planner; we exercise the live
+;;      arms (I64 desc, I64 asc, F64 desc, F64 asc, K>1 with multi-
+;;      entry heap drain) to keep regions hot.
+;;
+;;   3. da_count_emit_keep_min_u32  (src/ops/group.c:3466)
+;;      TOP-N-by-count min-heap.  Triggered by
+;;        (select {n: (count v) by: k from: T desc: n take: K})
+;;      with non-SYM key and a dense key range (key_range <= 1<<26).
+;;      Distinct branches:
+;;       a) k_take >= group_count       → early return (line 3475)
+;;       b) heap-fill (heap_n < k_take) with sift-up swap (3494-3495)
+;;       c) heap-replace (cnt > heap[0]) with sift-down (3497-3508)
+;;       d) final keep_min = heap[0]                    (line 3512)
+;;
+;; All assertions are `expected --` form.  Wrong outputs trip the
+;; check; the test must build green.
+;; ════════════════════════════════════════════════════════════════════
+
+;; ─── 1. par_binary_fn (selection-aware loop body) ──────────────────
+;; Build a 70000-row table.  Column a is nullable (first row 0Nl, then
+;; til 69999) so expr_compile rejects (HAS_NULLS) for any binary op
+;; touching a.  Column g is dense mod 1000, no nulls.
+;;
+;; The two-conjunct WHERE compiles as a chain of OP_FILTER nodes:
+;;   c1: (< g 100)           — fused path (g has no nulls); narrows
+;;                              selection to ~7000 rows.  Sets
+;;                              g->selection (mix of NONE / MIX / ALL
+;;                              morsel segments).
+;;   c2: (< a 50000)         — expr_compile rejects (a HAS_NULLS),
+;;                              exec_elementwise_binary → par_binary_fn
+;;                              with sel_flg set → loop body hit.
+;;
+;; The cheap-first selection-sort in query.c keeps comparison-cost
+;; equal conjuncts in user order (stable for ties), so c1 always
+;; runs before c2.
+;;
+;; Sanity: 70000 rows, g=row%1000.  c1 keeps rows with g<100 →
+;; row%1000<100 → 7000 rows.  c2 (< a 50000) further keeps rows
+;; with a<50000.  rayforce uses null-as-minimum compare semantics:
+;; (< null x) → true for any x, so row 0 (a=null) PASSES c2.
+;; Rows 1..49999 have a=row-1 in 0..49998 → all pass.  Row 50000
+;; (a=49999) passes.  Rows 50001..69999 (a in 50000..69998) fail.
+;; Within c1 (i%1000<100): blocks 0..49 each contribute 100 rows
+;; passing c1, plus row 50000 (i%1000=0).  Block 0 row 0 also
+;; passes c2 (null-as-min) → 100 rows.  Blocks 1..49: 100 each.
+;; Row 50000: 1.  Total = 50*100 + 1 = 5001.
+(set N70 70000)
+(set Ga (% (til N70) 1000))
+(set Aa (concat [0Nl] (til 69999)))
+(set Tpa (table [g a] (list Ga Aa)))
+(count (select {from: Tpa where: (and (< g 100) (< a 50000))})) -- 5001
+;; Reversed conjunct order — same final cardinality.  c1 now becomes
+;; (< a 50000), which is the nullable-column conjunct.  It runs first,
+;; sets g->selection to ~50001 rows (rows 0..50000 pass null-as-min).
+;; Then (< g 100) runs as second filter with selection set, fused
+;; expr_compile succeeds for g (no nulls).  Same cardinality.
+(count (select {from: Tpa where: (and (< a 50000) (< g 100))})) -- 5001
+;; OP_GT on the nullable column.  null > 60000 → false (null-as-min
+;; loses on >).  Rows 60001..69998 have a=row-1 in 60000..69997.
+;; Filter (> a 60000): only a > 60000 passes, i.e., a in 60001..69997,
+;; rows 60002..69998.  Within c1 (i%1000<100): rows 60002..69998 with
+;; i%1000 in [0,99].  Block 60: i=60002..60099 → 98 rows.  Blocks
+;; 61..69: 100 each, 9 blocks → 900.  Total = 98 + 900 = 998.
+(count (select {from: Tpa where: (and (< g 100) (> a 60000))})) -- 998
+;; OP_EQ — exercises another binary_range type arm under selection.
+;; (== a 12345): exactly one row (index 12346 has a=12345); g for that
+;; row is 12346%1000=346 → fails (< g 100).  Result 0.
+(count (select {from: Tpa where: (and (< g 100) (== a 12345))})) -- 0
+;; Wider c1 — covers MIX/ALL morsel segments more broadly.
+;; (< g 500): half each block passes; row 0 passes too.
+;; (< a 35000): rows 0..35000 (null + a in 0..34999).
+;; Intersect: rows 0..35000 with i%1000<500.
+;; Blocks 0..34 (rows 0..34999): 500 each → 17500. Row 35000
+;; (a=34999<35000, g=0<500) → +1.  Total = 17501.
+(count (select {from: Tpa where: (and (< g 500) (< a 35000))})) -- 17501
+
+;; ─── 2. grpt_phase3_fn (existing live arms — keep hot) ──────────────
+;; Parallel threshold for rowform topk is nrows >= 16384 (group.c:9494).
+;; Use 17000 rows for the radix path.  K=1 already covered by the
+;; existing suite; cover K=2 (multi-entry heap drain loop) for both
+;; I64 and F64 value types.
+;;
+;; 17000 rows, 2 groups by k%2.  k=0 holds even row indices, k=1 odd.
+;; Top-2 of each: max two even (16998, 16996) and max two odd
+;; (16999, 16997).  Sum = 16998+16996+16999+16997 = 67990.
+(set Tg2 (table [k v] (list (% (til 17000) 2) (til 17000))))
+(count (select {t: (top v 2) by: k from: Tg2})) -- 4
+(sum (at (select {t: (top v 2) by: k from: Tg2}) 't)) -- 67990
+;; F64 values — exercise the val_is_f64 heapsort arm.
+(set Tg2f (table [k v] (list (% (til 17000) 2) (as 'F64 (til 17000)))))
+(sum (at (select {t: (top v 2) by: k from: Tg2f}) 't)) -- 67990.0
+;; Bot-K with F64 — covers desc=0 (min-heap drain) on F64 arm.
+;; Bot-2 of k=0: 0,2; k=1: 1,3 → sum 6.0.
+(sum (at (select {b: (bot v 2) by: k from: Tg2f}) 'b)) -- 6.0
+;; Larger K (3) with I64 → deeper heap drain (3-element heapsort).
+;; Top-3 of k=0 even: 16998,16996,16994; k=1 odd: 16999,16997,16995
+;; Sum = (16998+16996+16994) + (16999+16997+16995) = 50988 + 50991 = 101979
+(sum (at (select {t: (top v 3) by: k from: Tg2}) 't)) -- 101979
+
+;; ─── 3. da_count_emit_keep_min_u32 ─────────────────────────────────
+;; Trigger: dense-range count-by-key with `desc: <count-alias> take: K`.
+;; Need non-SYM keys, key_range <= 1<<26.  Use I64 keys 0..99.
+;;
+;; Layout: 30 rows on keys 0..4 with counts {10, 8, 6, 4, 2}, PLUS one
+;; row at key 300000 (count 1).  The 300001-wide key range exceeds the
+;; DA path's DA_MAX_COMPOSITE_SLOTS=262144 budget, forcing the single-
+;; key sparse (dynamic-dense) path which calls da_count_emit_keep_min_u32.
+;;
+;; take=2 → da_count_emit_keep_min_u32 walks slots 0..max_seen:
+;;   slot 0 (cnt 10): insert, heap=[10]
+;;   slot 1 (cnt 8):  insert at j=1, parent=10>8 SWAP → heap=[8,10]
+;;                    (covers sift-up branch lines 3494-3495)
+;;   slot 2 (cnt 6):  6 > heap[0]=8?  NO → skip
+;;   slot 3 (cnt 4):  skip
+;;   slot 4 (cnt 2):  skip
+;;   slot 300000 (cnt 1): 1 > 8? NO → skip
+;; heap_n == k_take, heap[0]=8 > keep_min(=1) → keep_min=8 (line 3512).
+;; Keys with cnt >= 8 → 2 keys (slots 0, 1).
+(set Kd (concat (concat (concat (concat (concat (% (til 10) 1) (+ 1 (% (til 8) 1))) (+ 2 (% (til 6) 1))) (+ 3 (% (til 4) 1))) (+ 4 (% (til 2) 1))) [300000]))
+;; Sanity: 10+8+6+4+2+1 = 31 rows, 6 keys.
+(count Kd) -- 31
+(set Tdc (table [k v] (list Kd Kd)))
+(count (select {n: (count v) by: k from: Tdc})) -- 6
+;; take=2: top-2 by count → keys 0,1 with counts 10,8.  Two output rows.
+(count (select {n: (count v) by: k from: Tdc desc: n take: 2})) -- 2
+;; Sum of the two top counts = 10 + 8 = 18.
+(sum (at (select {n: (count v) by: k from: Tdc desc: n take: 2}) 'n)) -- 18
+
+;; Heap-replace path (cnt > heap[0] when heap full).  K=2, counts in
+;; INCREASING slot order: slot 0 → 2, slot 1 → 4, slot 2 → 6, slot 3
+;; → 8, slot 4 → 10, slot 300000 → 1 (kept-out-of-DA helper).
+;;   slot 0 (cnt 2): insert, heap=[2]
+;;   slot 1 (cnt 4): insert at j=1, parent=2≤4 → no swap, heap=[2,4]
+;;   slot 2 (cnt 6): 6 > heap[0]=2 → REPLACE (sift-down loop).
+;;                   heap[0]=6, sift: l=1 (heap[1]=4), 4<6 → swap.
+;;                   heap=[4,6].  j=1, no children → done.
+;;   slot 3 (cnt 8): 8 > heap[0]=4 → REPLACE, heap=[6,8].
+;;   slot 4 (cnt 10): 10 > heap[0]=6 → REPLACE, heap=[8,10].
+;;   slot 300000 (cnt 1): 1 > 8? NO → skip.
+;; heap[0]=8, keep_min=8.  Keys with cnt>=8 → slots 3,4 (counts 8,10).
+(set Kinc (concat (concat (concat (concat (concat (% (til 2) 1) (+ 1 (% (til 4) 1))) (+ 2 (% (til 6) 1))) (+ 3 (% (til 8) 1))) (+ 4 (% (til 10) 1))) [300000]))
+(set Tinc (table [k v] (list Kinc Kinc)))
+(count Tinc) -- 31
+(count (select {n: (count v) by: k from: Tinc desc: n take: 2})) -- 2
+(sum (at (select {n: (count v) by: k from: Tinc desc: n take: 2}) 'n)) -- 18
+
+;; Early-return path: k_take >= group_count → returns initial keep_min
+;; without touching the heap (lines 3474-3475).  6 distinct groups,
+;; take=6 → equals group_count → early return → ALL groups emitted.
+(count (select {n: (count v) by: k from: Tinc desc: n take: 6})) -- 6
+;; And take > group_count → same path.
+(count (select {n: (count v) by: k from: Tinc desc: n take: 10})) -- 6
+
+;; Deeper heap-replace (sift-down two levels).  K=4, 6 base groups
+;; with INCREASING counts 1,2,3,4,5,6 + sentinel key 300000 (cnt 1).
+;; After fill: heap = [1,2,3,4] (min-heap; ascending inserts → no
+;; sift-up swap).  slot 4 cnt 5 > 1: replace, heap=[5,2,3,4].
+;; sift-down j=0: l=1 (2), r=2 (3), m=1 (2<5).  swap.  heap=[2,5,3,4].
+;; j=1: l=3 (4), 4<5 → swap.  heap=[2,4,3,5].  j=3: no children.
+;; slot 5 cnt 6 > 2: heap=[6,4,3,5]. sift-down: l=1(4), r=2(3), m=2
+;; (3<6).  swap.  heap=[3,4,6,5].  j=2: no children.  Done.
+;; slot 300000 cnt 1: 1 > 3? NO → skip.
+;; heap[0]=3, keep_min=3.  Groups with cnt>=3 → slots 2,3,4,5 with
+;; counts 3,4,5,6.  4 groups, sum = 3+4+5+6 = 18.
+(set Kw (concat (concat (concat (concat (concat (concat (% (til 1) 1) (+ 1 (% (til 2) 1))) (+ 2 (% (til 3) 1))) (+ 3 (% (til 4) 1))) (+ 4 (% (til 5) 1))) (+ 5 (% (til 6) 1))) [300000]))
+(set Tw (table [k v] (list Kw Kw)))
+(count Tw) -- 22
+(count (select {n: (count v) by: k from: Tw desc: n take: 4})) -- 4
+(sum (at (select {n: (count v) by: k from: Tw desc: n take: 4}) 'n)) -- 18

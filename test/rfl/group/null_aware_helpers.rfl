@@ -1,0 +1,120 @@
+;; ════════════════════════════════════════════════════════════════════
+;; Null-aware per-row helpers in the radix-HT group-by paths.
+;;
+;; Targets three static inline helpers in src/ops/group.c:
+;;   - cdpg_is_null  (count_distinct_per_group_parallel — n_rows >= 200000)
+;;   - grpt_is_null  (exec_group_topk_rowform   — `top`/`bot` by single key)
+;;   - grpc_is_null  (exec_group_pearson_rowform — `pearson_corr x y` by k)
+;;
+;; All three fire ONLY when the source column has RAY_ATTR_HAS_NULLS and
+;; the dispatch routes through the rowform / radix-HT path.  Each helper
+;; switches on the column type (F64 / I64+TIMESTAMP / I32+DATE+TIME / I16
+;; / SYM widths / default) so one assertion per type arm hits a unique
+;; switch case.
+;;
+;; Productive assertions: each result depends on null rows being SKIPPED
+;; (e.g. count drops below total rows; top-K reflects only non-null val).
+;; ════════════════════════════════════════════════════════════════════
+
+;; ─── grpt_is_null: top/bot rowform with null-bearing val column ─────
+;; Shape: (top v K) by k from T   → routes to exec_group_topk_rowform
+;; which calls grpt_phase1_fn → grpt_is_null on each row.
+
+;; I64 val with nulls: 2 groups × 3 rows each, one null per group.
+;; Top-1 per group keeps the max non-null → g=0 max=30, g=1 max=60.
+(set T_gt_i64 (table [k v] (list (as 'I64 [0 0 0 1 1 1]) (as 'I64 [10 0N 30 40 0N 60]))))
+(sum (at (select {t: (top v 1) by: k from: T_gt_i64}) 't)) -- 90
+
+;; F64 val with nulls: NaN-sentinel arm of grpt_is_null.
+(set T_gt_f64 (table [k v] (list (as 'I64 [0 0 0 1 1 1]) (as 'F64 [1.5 0N 3.5 4.5 0N 6.5]))))
+(sum (at (select {t: (top v 1) by: k from: T_gt_f64}) 't)) -- 10.0
+
+;; I32 val with nulls: I32/DATE/TIME arm.
+(set T_gt_i32 (table [k v] (list (as 'I64 [0 0 1 1]) (as 'I32 [100 0N 0N 400]))))
+(sum (at (select {t: (top v 1) by: k from: T_gt_i32}) 't)) -- 500
+
+;; I16 val with nulls: I16 arm.
+(set T_gt_i16 (table [k v] (list (as 'I64 [0 0 1 1]) (as 'I16 [7 0N 0N 11]))))
+(sum (at (select {t: (top v 1) by: k from: T_gt_i16}) 't)) -- 18
+
+;; I64 KEY with nulls: hits the knulls branch (line 9228) — null-key rows
+;; are dropped, so the result row count drops below n_distinct_keys.
+;; Two non-null keys (0, 1) + one null key → 2 output rows, not 3.
+(set T_gt_kn (table [k v] (list (as 'I64 [0 0N 1]) (as 'I64 [5 9 7]))))
+(count (select {t: (top v 1) by: k from: T_gt_kn})) -- 2
+(sum (at (select {t: (top v 1) by: k from: T_gt_kn}) 't)) -- 12
+
+;; TIMESTAMP val with nulls: shares the I64/TIMESTAMP switch arm but the
+;; column type is RAY_TIMESTAMP so the (kt, vt) acceptance check at
+;; src/ops/group.c:9474 lets it through with TIMESTAMP val.
+(set T_gt_ts (table [k v] (list (as 'I64 [0 0 1 1]) (as 'TIMESTAMP [1000 0N 0N 4000]))))
+(count (select {t: (top v 1) by: k from: T_gt_ts})) -- 2
+
+;; DATE key with nulls: hits the I32/DATE/TIME arm via key path.
+;; (DATE is the I32 sentinel; key dispatch reads via grpt_is_null with kt=DATE.)
+(set T_gt_dk (table [k v] (list (as 'DATE [7305 0N 7306]) (as 'I64 [11 22 33]))))
+(count (select {t: (top v 1) by: k from: T_gt_dk})) -- 2
+
+;; ─── grpc_is_null: pearson_corr rowform with null-bearing val column ──
+;; Shape: (pearson_corr x y) by k  → routes to exec_group_pearson_rowform.
+
+;; I64 x with nulls; null rows dropped before correlation per group.
+;; Group A: pairs (1,2)(2,4)(3,6)(4,8)(5,10) minus the null pair → still
+;; perfect linear correlation → r=1.0.
+(set T_gp_i64 (table [g x y] (list [A A A A A B B B B B] (as 'I64 [1 0N 3 4 5 1 0N 3 4 5]) (as 'I64 [2 4 6 8 10 5 4 3 2 1]))))
+(count (select {r: (pearson_corr x y) by: g from: T_gp_i64})) -- 2
+
+;; F64 x with nulls: NaN arm of grpc_is_null.
+(set T_gp_f64 (table [g x y] (list [A A A A A B B B B B] (as 'F64 [1.0 0N 3.0 4.0 5.0 1.0 0N 3.0 4.0 5.0]) (as 'F64 [2.0 4.0 6.0 8.0 10.0 5.0 4.0 3.0 2.0 1.0]))))
+(at (at (select {r: (pearson_corr x y) by: g from: T_gp_f64}) 'r) 0) -- 1.0
+
+;; I32 y with nulls: I32/DATE/TIME arm via y path (grpc_is_null on y_data).
+(set T_gp_i32 (table [g x y] (list [A A A A B B B B] (as 'I64 [1 2 3 4 1 2 3 4]) (as 'I32 [2 4 0N 8 5 0N 3 2]))))
+(count (select {r: (pearson_corr x y) by: g from: T_gp_i32})) -- 2
+
+;; I16 x with nulls: I16 arm.
+(set T_gp_i16 (table [g x y] (list [A A A A B B B B] (as 'I16 [1 0N 3 4 1 0N 3 4]) (as 'I64 [2 4 6 8 5 4 3 2]))))
+(count (select {r: (pearson_corr x y) by: g from: T_gp_i16})) -- 2
+
+;; I64 key with nulls: hits c->k0_has_nulls branch (line 9918) — null
+;; key rows are skipped.  2 non-null keys + 1 null → 2 result groups.
+(set T_gp_kn (table [k x y] (list (as 'I64 [0 0 0N 0N 1 1]) (as 'F64 [1.0 2.0 9.0 9.0 3.0 4.0]) (as 'F64 [2.0 4.0 9.0 9.0 6.0 8.0]))))
+(count (select {r: (pearson_corr x y) by: k from: T_gp_kn})) -- 2
+
+;; Two-key path (n_keys=2): k1_has_nulls check (line 9919-9920).
+;; Both keys carry HAS_NULLS; rows with EITHER key null are skipped.
+(set T_gp_2k (table [k0 k1 x y] (list (as 'I64 [0 0 0N 1 1]) (as 'I32 [10 10 20 0N 20]) (as 'F64 [1.0 2.0 9.0 9.0 3.0]) (as 'F64 [2.0 4.0 9.0 9.0 6.0]))))
+(count (select {r: (pearson_corr x y) by: [k0 k1] from: T_gp_2k})) -- 2
+
+;; ─── cdpg_is_null: count(distinct v) per group, n_rows >= 200000 ─────
+;; Routes through ray_count_distinct_per_group →
+;; count_distinct_per_group_parallel (group.c:992 cdpg_hist_fn /
+;; cdpg_scat_fn both call cdpg_is_null when has_nulls).
+;;
+;; Build a 200000-row table with an I64 v column where rows matching
+;; a predicate are nulled via `update` — this sets HAS_NULLS and the
+;; parallel kernel's has_nulls fast-path gate fires per-row
+;; cdpg_is_null calls in the I64 switch arm.
+(set Ncdpg 200000)
+(set Tcdpg0 (table [g v] (list (% (til Ncdpg) 51000) (% (til Ncdpg) 4))))
+;; Null every row whose row index modulo 50 == 0 (4000 nulls of 200000).
+;; The `where` mask path retains the HAS_NULLS attribute on the rewritten
+;; column (see test/rfl/null/update.rfl regression).
+(set Tcdpg (update {v: 0Nl where: (== 0 (% (til Ncdpg) 50)) from: Tcdpg0}))
+(set Rcdpg (select {n: (count (distinct v)) from: Tcdpg by: g}))
+(count Rcdpg) -- 51000
+
+;; F64 v column with nulls — exercises cdpg_is_null F64 (NaN) arm.
+(set Tcdpgf0 (table [g v] (list (% (til Ncdpg) 51000) (as 'F64 (% (til Ncdpg) 4)))))
+(set Tcdpgf (update {v: 0Nf where: (== 0 (% (til Ncdpg) 50)) from: Tcdpgf0}))
+(count (select {n: (count (distinct v)) from: Tcdpgf by: g})) -- 51000
+
+;; I32 v column with nulls — exercises cdpg_is_null I32/DATE/TIME arm.
+(set Tcdpgi32_0 (table [g v] (list (% (til Ncdpg) 51000) (as 'I32 (% (til Ncdpg) 4)))))
+(set Tcdpgi32 (update {v: 0Ni where: (== 0 (% (til Ncdpg) 50)) from: Tcdpgi32_0}))
+(count (select {n: (count (distinct v)) from: Tcdpgi32 by: g})) -- 51000
+
+;; I16 v column with nulls — exercises cdpg_is_null I16 arm.
+(set Tcdpgi16_0 (table [g v] (list (% (til Ncdpg) 51000) (as 'I16 (% (til Ncdpg) 4)))))
+(set Tcdpgi16 (update {v: 0Nh where: (== 0 (% (til Ncdpg) 50)) from: Tcdpgi16_0}))
+(count (select {n: (count (distinct v)) from: Tcdpgi16 by: g})) -- 51000

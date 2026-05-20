@@ -1,0 +1,116 @@
+;; Coverage for src/ops/builtins.c:
+;;   - ray_lang_print  (println dispatcher across all type tags)
+;;   - ray_resolve_fn  (symbol + table column resolution)
+;;
+;; Strategy:
+;;   1. Drive every case of the switch in ray_lang_print via single-arg
+;;      (println X) — the function returns null, and we assert `(nil? ...)`
+;;      to confirm the call succeeded.  Each call exercises one distinct
+;;      0|-region recorded by llvm-cov:
+;;         -RAY_I64, -RAY_F64, -RAY_BOOL, -RAY_SYM, -RAY_STR,
+;;         RAY_LIST (heterogeneous), RAY_TABLE,
+;;         RAY_UNARY/BINARY/VARY (function handle),
+;;         default (ray_fmt fallback for vec/i16/i32/dict),
+;;         RAY_ATOM_IS_NULL (typed-null literal branch),
+;;         null-singleton fast path.
+;;   2. Drive every reachable branch in ray_resolve_fn:
+;;         (resolve 'unbound)        -> NULL  (env_get miss)
+;;         (resolve 'name)           -> bound value (-RAY_SYM env-hit)
+;;         (resolve 5)               -> 5     (non-table, non-sym return)
+;;         (resolve db tbl)          -> 2-arg form (db arg ignored)
+;;         (resolve tbl-with-entity-col)  -> I64 col kept as I64
+;;                                          (slen<2 / operator-char reject)
+;;         (resolve tbl-with-negative-id) -> data[r] <= 0 reject
+;;         (resolve empty-table)          -> nrows==0 guard (loop skipped)
+;;
+;; Two ray_resolve_fn regions remain uncovered from rfl:
+;;   - lazy-materialize branch (lines 350-355): rfl-visible APIs always
+;;     return materialized tables by the time they reach resolve.
+;;   - all_user_sym=true SYM-conversion (lines 405-414): requires an I64
+;;     vec whose elements are valid multi-char user-sym IDs; the only path
+;;     to construct one is ray_sym_intern in C — `(as 'I64 ['foo])` errors
+;;     because ray_cast_fn at builtins.c:1215-1236 has no -RAY_SYM->I64
+;;     atom case.
+
+;; ──────────────────────────────────────────────────────────────────────
+;; 1.  ray_lang_print — atom dispatch
+;; ──────────────────────────────────────────────────────────────────────
+
+;; -RAY_I64 atom (line 91)
+(nil? (println 42)) -- true
+
+;; -RAY_F64 atom (lines 92-97) — includes the signbit(-0.0) normalisation
+(nil? (println 1.5)) -- true
+
+;; -RAY_BOOL atom — both true and false paths in the ternary (line 98)
+(nil? (println true)) -- true
+
+;; -RAY_SYM atom (lines 99-104) — bound, so ray_sym_str hits
+(nil? (println 'foo_user_sym)) -- true
+
+;; -RAY_STR atom (lines 105-110)
+(nil? (println "hello")) -- true
+
+;; RAY_LIST heterogeneous (lines 111-121) — both i==0 and i>0 branches
+(nil? (println (list 1 "two" 'three))) -- true
+
+;; RAY_TABLE (lines 122-125) — prints "<table NxM>" summary
+(nil? (println (table [a b] (list [1 2 3] [4 5 6])))) -- true
+
+;; RAY_UNARY / RAY_BINARY / RAY_VARY (lines 126-130) — function handle
+;; `count` is a unary builtin; `+` is a binary builtin.
+(nil? (println count)) -- true
+(nil? (println +)) -- true
+
+;; default: ray_fmt fallback (lines 131-145) — vec, i32 atom, dict
+(nil? (println [1 2 3])) -- true
+(nil? (println 5i)) -- true
+(nil? (println (dict [a b] (list 1 2)))) -- true
+
+;; RAY_ATOM_IS_NULL branch (lines 86-88) — typed null atom
+;; (null_literal_str dispatch for "0Nl")
+(nil? (println 0Nl)) -- true
+
+;; ──────────────────────────────────────────────────────────────────────
+;; 2.  ray_resolve_fn — branch coverage
+;; ──────────────────────────────────────────────────────────────────────
+
+;; (resolve 'unbound) — env_get returns NULL, function returns NULL
+;; (line 362).  Test with `nil?` since `resolve` of an unbound returns the
+;; null singleton.
+(nil? (resolve 'totally_unbound_xyz_qq)) -- true
+
+;; (resolve 'bound) — env_get hits, retain+return val (lines 360-364)
+(set _resolve_target 99)
+(resolve '_resolve_target) -- 99
+
+;; (resolve <non-sym non-table>) — branch at line 366 returns tbl as-is
+(resolve 7) -- 7
+
+;; (resolve db tbl) — 2-arg form (lines 342-346): db arg evaluated & released
+(count (resolve "ignored_db_arg" (table [c] (list [10 20 30])))) -- 3
+
+;; (resolve table-with-entity-ID-column) — all_user_sym=false path.
+;; Small I64 values like 1,2,3 collide with single-char sym IDs (operators
+;; interned early in startup) or are unmapped; the slen<2 / operator-char
+;; guard at lines 397-403 rejects each, so the column stays I64 via the
+;; `else` branch (lines 415-418).  This drives the loop at 391-404 plus
+;; the keep-I64 fall-through.
+(set _Tent (table [e] (list [1 2 3])))
+(type (at (resolve _Tent) 'e)) -- 'I64
+
+;; (resolve table-with-negative-id) — `data[r] <= 0` early reject (line 392)
+(set _Tneg (table [x] (list [-1 -2 -3])))
+(type (at (resolve _Tneg) 'x)) -- 'I64
+
+;; (resolve empty-table) — nrows==0 means `all_user_sym = (nrows > 0)` is
+;; false from the start (line 387); the loop body at 391-404 never
+;; executes, falling straight through to the else branch.
+(set _Tempty (table [k] (list (as 'I64 []))))
+(count (resolve _Tempty)) -- 0
+
+;; Non-I64 column path (lines 419-421) — STR + F64 cols kept as-is.
+;; Combine the row-count check with the column-type check.
+(set _Tmix (table [s f] (list (list "a" "b" "c") [1.0 2.0 3.0])))
+(count (resolve _Tmix)) -- 3
+(type (at (resolve _Tmix) 'f)) -- 'F64

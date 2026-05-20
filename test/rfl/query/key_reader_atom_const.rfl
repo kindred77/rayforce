@@ -1,0 +1,102 @@
+;; Coverage for two helpers in `src/ops/query.c`:
+;;
+;;   - `atom_i64_const`         (line 1422) — narrows a typed scalar
+;;     atom literal to int64.  Switch on -RAY_BOOL / -RAY_U8 /
+;;     -RAY_I16 / -RAY_I32 / -RAY_DATE / -RAY_TIME / -RAY_I64 /
+;;     -RAY_TIMESTAMP.  Reached from `expr_affine_of_sym` (line 1439)
+;;     when the by-dict has a dependent key of shape
+;;     `(+ base_sym <typed_atom>)` or `(- base_sym <typed_atom>)`.
+;;     The dict path emits a synthetic column = `base_col[i] + bias`.
+;;
+;;   - `query_key_reader_read`  (line 191) — wide-key reader.  Reached
+;;     from the eval-level multi-key groupby fast path (line 4567)
+;;     when `by:` is a 2+ symbol vector, `take:` is a small positive
+;;     int (<= 1024), and every non-by dict-value is `(count …)`.
+;;     Each row reads one int64 per key column, dispatching on
+;;     `base_type` for I16 / I32 / DATE / TIME / I64 / TIMESTAMP /
+;;     F64 / BOOL/U8 and honouring the per-row null bit.
+
+;; ============================================================
+;; Part A — atom_i64_const via by-dict dep key
+;; ============================================================
+;;
+;; Base column `k` has 4 distinct integer keys.  Each by-dict
+;; below routes through expr_affine_of_sym → atom_i64_const,
+;; emitting an aliased dep-key column = k + bias.  We assert on
+;; the sum of the dep column to confirm the bias propagated.
+;;
+;; Base sum of k = 1+2+3+4 = 10.
+
+(set Ta (table [k v] (list [1 2 3 4 1 2 3 4] [10 20 30 40 50 60 70 80])))
+
+;; -RAY_BOOL / -RAY_U8 share the case body in atom_i64_const, and
+;; neither has a direct arithmetic literal form in RFL that flows
+;; through expr_affine_of_sym without prior coercion to I64 —
+;; (+ k true) errors at type-check.  These arms remain unreachable
+;; via the by-dict dep path; the i16/i32/i64/date arms below are
+;; the surfaces that RFL actually exercises.
+;;
+;; The by-dict alone (no projection echo of the dep alias) is
+;; enough: the dep-key column is added to the result table at
+;; line 7878.  We sum-of-column to verify the bias was wired up
+;; correctly.
+
+;; -RAY_I64 atom literal sanity check.  Dep a = k + 100.
+;; (Same case body as -RAY_TIMESTAMP.)
+(sum (at (select {c: (count v) from: Ta by: {k: k a: (+ k 100)}}) 'a)) -- 410
+
+;; -RAY_I16 atom literal: 5h.  Dep alias `a` = k + 5 over distinct
+;; group keys {1,2,3,4} → sum(a) = sum(k)+4*5 = 10 + 20 = 30.
+(sum (at (select {c: (count v) from: Ta by: {k: k a: (+ k 5h)}}) 'a)) -- 30
+
+;; -RAY_I32 atom literal: 7i.  Dep a = k + 7 → sum = 10 + 28 = 38.
+(sum (at (select {c: (count v) from: Ta by: {k: k a: (+ k 7i)}}) 'a)) -- 38
+
+;; '-' operator — atom_i64_const negates the bias.  Dep a = k - 1.
+;; sum(k - 1) = 10 - 4 = 6.
+(sum (at (select {c: (count v) from: Ta by: {k: k a: (- k 1)}}) 'a)) -- 6
+
+;; -RAY_DATE atom literal: 2024.01.03 = 8768 days since epoch.
+;; Internally the int32 value is added as bias.
+;; sum(k + 8768) = 10 + 4*8768 = 35082.
+(sum (at (select {c: (count v) from: Ta by: {k: k a: (+ k 2024.01.03)}}) 'a)) -- 35082
+
+;; -RAY_TIME atom literal: 09:00:00.000 = 32_400_000 ms after midnight.
+;; sum(k + 32400000) = 10 + 4*32400000 = 129600010.
+(sum (at (select {c: (count v) from: Ta by: {k: k a: (+ k 09:00:00.000)}}) 'a)) -- 129600010
+
+;; ============================================================
+;; Part B — query_key_reader_read via eval-level multi-key + take
+;; ============================================================
+;;
+;; Routing: 2-key `by:` vector + small positive `take:` + only
+;; count aggs (no other agg) + nrows*nk small.  Each row pulls
+;; one int64 from each key column via query_key_reader_read.
+
+;; ----- Fixture: 16 rows × 2 narrow-typed key columns (I16, I32) -----
+;; 4 × 4 = 16 distinct (k16, k32) groups; take >= 16 keeps all.
+(set Tw (table [k16 k32 v] (list [10h 20h 30h 40h 10h 20h 30h 40h 10h 20h 30h 40h 10h 20h 30h 40h] [100i 100i 100i 100i 200i 200i 200i 200i 300i 300i 300i 300i 400i 400i 400i 400i] [1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16])))
+(count (select {c: (count v) by: [k16 k32] from: Tw take: 100})) -- 16
+(sum (at (select {c: (count v) by: [k16 k32] from: Tw take: 100}) 'c)) -- 16
+
+;; ----- Date + Time key columns (I32-backed RAY_DATE / RAY_TIME) -----
+(set Tdt (table [d t v] (list [2024.01.01 2024.01.01 2024.01.02 2024.01.02 2024.01.01 2024.01.01 2024.01.02 2024.01.02] [09:00:00.000 10:00:00.000 09:00:00.000 10:00:00.000 09:00:00.000 10:00:00.000 09:00:00.000 10:00:00.000] [1 2 3 4 5 6 7 8])))
+;; 2 dates × 2 times = 4 groups, each twice.
+(count (select {c: (count v) by: [d t] from: Tdt take: 50})) -- 4
+(sum (at (select {c: (count v) by: [d t] from: Tdt take: 50}) 'c)) -- 8
+
+;; ----- I64 + TIMESTAMP key columns -----
+(set Tts (table [g ts v] (list [100 100 200 200 100 100 200 200] [2024.01.01D00:00:00.000000000 2024.01.02D00:00:00.000000000 2024.01.01D00:00:00.000000000 2024.01.02D00:00:00.000000000 2024.01.01D00:00:00.000000000 2024.01.02D00:00:00.000000000 2024.01.01D00:00:00.000000000 2024.01.02D00:00:00.000000000] [1 2 3 4 5 6 7 8])))
+(count (select {c: (count v) by: [g ts] from: Tts take: 100})) -- 4
+(sum (at (select {c: (count v) by: [g ts] from: Tts take: 100}) 'c)) -- 8
+
+;; ----- I64 + F64 key columns (F64 → memcpy branch in reader) -----
+(set Tf (table [g f v] (list [1 1 2 2 1 1 2 2] [1.5 2.5 1.5 2.5 1.5 2.5 1.5 2.5] [1 2 3 4 5 6 7 8])))
+(count (select {c: (count v) by: [g f] from: Tf take: 100})) -- 4
+(sum (at (select {c: (count v) by: [g f] from: Tf take: 100}) 'c)) -- 8
+
+;; ----- Nullable I64 column — HAS_NULLS branch in the reader -----
+(set Tnu (table [a b v] (list [1 0Nl 1 0Nl 1 0Nl] [10 10 20 20 10 10] [1 2 3 4 5 6])))
+;; Distinct (a,b) pairs: (1,10), (NULL,10), (1,20), (NULL,20) = 4.
+(count (select {c: (count v) by: [a b] from: Tnu take: 50})) -- 4
+(sum (at (select {c: (count v) by: [a b] from: Tnu take: 50}) 'c)) -- 6
