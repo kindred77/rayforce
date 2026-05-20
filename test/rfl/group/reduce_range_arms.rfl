@@ -1,0 +1,102 @@
+;; ════════════════════════════════════════════════════════════════════
+;; reduce_range type x null specialisations (src/ops/group.c).
+;;
+;; reduce_range is the inner reduction kernel for direct (raw-vec)
+;; sum/min/max/avg/first/last/var/stddev calls.  It dispatches per
+;; `input->type` (BOOL/U8, I16, I32, I64, F64, DATE, TIME, TIMESTAMP,
+;; SYM), then each integer/float arm goes through DISPATCH_I/F which
+;; macro-expands into four (HAS_NULLS x HAS_IDX) loop bodies so the
+;; compiler can DCE the inner per-row branches.
+;;
+;; ARCHITECTURE NOTE on missed regions: the HAS_IDX=1 specialisations
+;; in DISPATCH_I/F (and the corresponding `idx ? idx[i] : i` branch in
+;; BOOL/U8 + SYM arms) are reached only when reduce_range is called
+;; with a non-NULL sel_idx — i.e. when `g->selection` is alive at the
+;; OP_SUM/OP_MIN/OP_MAX dispatch in exec.c.  However, the canonical
+;; user-facing entry point for scalar aggs *inside* a select-with-where
+;; clause (e.g. `(select {s: (sum v) from: T where: pred})`) is routed
+;; through `exec_group` → `scalar_accum_fn` / `scalar_sum_i64_fn` /
+;; `scalar_sum_f64_fn` (group.c:5198..5213) — NOT reduce_range.  The
+;; sel_idx path of reduce_range is therefore only reachable from a
+;; direct `(sum vec)` call where `g->selection` happens to be set,
+;; which the RFL test interface does not expose.  Those regions are
+;; effectively dead at the RFL test boundary; covering them requires a
+;; C-level harness that builds a graph with a pre-installed selection.
+;;
+;; This file focuses on the reachable specialisations: narrow-int and
+;; temporal type arms (I16, I32, DATE, TIME, TIMESTAMP) and the
+;; per-row NULL_SENT skip path in REDUCE_LOOP_I (HAS_NULLS=1,
+;; HAS_IDX=0), plus the SYM type arm of reduce_range that handles
+;; (sum/min/max sym_vec).
+;;
+;; All assertions are happy-path; any wrong-output or domain error is
+;; left visible (per CRITICAL RULE).
+;; ════════════════════════════════════════════════════════════════════
+
+
+;; ─── DISPATCH_I  I16  HAS_NULLS=0 / HAS_NULLS=1 ─────────────────────
+;; Scalar sum/min/max on plain I16 and I16-with-nulls vectors trigger
+;; the I16 arm of reduce_range's switch (group.c:146-147).  HAS_NULLS=1
+;; takes the per-row `raw == NULL_I16` skip branch in REDUCE_LOOP_I.
+(sum (as 'I16 [10 20 30 40 50])) -- 150
+(sum (as 'I16 [10 0N 20 0N 30])) -- 60
+(min (as 'I16 [50 0N 10 0N 30])) -- (as 'I16 10)
+(max (as 'I16 [0N 10 0N 90 50])) -- (as 'I16 90)
+
+
+;; ─── DISPATCH_I  I32 / DATE / TIME (32-bit arm) ─────────────────────
+;; All three types share the I32 dispatch macro (group.c:148-149) but
+;; exercise distinct case labels in reduce_range's switch.
+(sum (as 'I32 [1 2 3 4 5])) -- 15
+(sum (as 'I32 [10 0N 20 30 0N])) -- 60
+(min (as 'I32 [0N 7 0N 3 5])) -- (as 'I32 3)
+(max (as 'I32 [0N 1 0N 9 5])) -- (as 'I32 9)
+
+;; DATE arm: min/max preserve the temporal type and the per-row null
+;; skip (NULL_I32 sentinel) fires for 0N elements.
+(min (as 'DATE [7305 0N 7306 7300])) -- (as 'DATE 7300)
+(max (as 'DATE [0N 7305 7310 0N])) -- (as 'DATE 7310)
+
+;; TIME arm: same DISPATCH_I(int32_t, NULL_I32) macro, distinct label.
+(min (as 'TIME [3723000 0N 1000])) -- (as 'TIME 1000)
+(max (as 'TIME [3723000 0N 86399000 1000])) -- (as 'TIME 86399000)
+
+
+;; ─── DISPATCH_I  I64 / TIMESTAMP (64-bit arm) — null-path coverage ──
+;; I64 happy path is heavily covered by existing tests; here we focus
+;; on the HAS_NULLS=1 specialisation (per-row NULL_I64 sentinel skip)
+;; and the TIMESTAMP case label (group.c:150-151).
+(sum (as 'I64 [10 0N 20 0N 30])) -- 60
+(min (as 'TIMESTAMP [1000 0N 4000 2000])) -- (as 'TIMESTAMP 1000)
+(max (as 'TIMESTAMP [0N 2000 4000 0N 3000])) -- (as 'TIMESTAMP 4000)
+
+
+;; ─── DISPATCH_F  F64  HAS_NULLS=1 ───────────────────────────────────
+;; F64 nulls use a NaN sentinel (NULL_F64); REDUCE_LOOP_F detects via
+;; `v != v` (only NaN fails self-equality).
+(sum (as 'F64 [1.0 0N 2.0 0N 3.0])) -- 6.0
+(min (as 'F64 [0N 1.5 0N 0.5 2.5])) -- 0.5
+(max (as 'F64 [0N 1.5 0N 9.5 2.5])) -- 9.5
+
+
+;; ─── RAY_SYM arm of reduce_range (read_col_i64 + !has_nulls && !idx) ─
+;; The SYM branch (group.c:154-204) reads adaptive-width sym IDs via
+;; read_col_i64 and reduces over them.  min/max preserve SYM type
+;; (cf. test/rfl/agg/min_max_sym.rfl).  This drives the !has_nulls &&
+;; !idx specialisation of the SYM arm.
+(type (min ['alpha 'beta 'gamma])) -- 'sym
+(type (max ['alpha 'beta 'gamma])) -- 'sym
+(== (min ['z 'z 'z]) 'z) -- true
+
+
+;; ─── avg / var_pop / stddev over narrow-int with nulls ──────────────
+;; Drives the OP_AVG / OP_VAR_POP / OP_STDDEV finaliser branches in
+;; exec_reduction (group.c:1856-1878) on top of the narrow-int + nulls
+;; reduction (per-row sentinel skip path).
+(avg (as 'I16 [10 0N 20 0N 30])) -- 20.0
+(< (abs (- (var_pop (as 'I32 [2 0N 4 0N 4 0N 4 5 5 7 9])) 4.0)) 0.0001) -- true
+(< (abs (- (stddev_pop (as 'I16 [2 0N 4 0N 4 0N 4 5 5 7 9])) 2.0)) 0.0001) -- true
+
+;; F64 + nulls + avg: F64 reduce_range HAS_NULLS=1 plus the OP_AVG
+;; finaliser's null-aware divisor (uses non-null count).
+(avg (as 'F64 [10.0 0N 20.0 0N 30.0])) -- 20.0

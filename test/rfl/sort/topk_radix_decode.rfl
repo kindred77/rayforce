@@ -1,0 +1,83 @@
+;; topk_radix_decode.rfl — drive sort.c::radix_decode_into for DATE/TIME
+;; type predicates and exercise topk_gather_rows over multi-column tables
+;; with mixed-width sort keys.
+;;
+;; Coverage focus:
+;;   - radix_decode_into (sort.c:2372): predicate counters at
+;;       L2392 `type == RAY_DATE`, `type == RAY_TIME`.
+;;     Reaching these requires:
+;;       (a) single-key sort returning the sorted vector (asc / desc via
+;;           ray_sort, sort.c:3463 path or exec_sort decode-gather at
+;;           sort.c:3717), so radix_decode_into is invoked, AND
+;;       (b) the non-packed radix branch (sort.c:2553-2688), which sets
+;;           sorted_keys; non-packed fires when key_nbytes > 3 (i.e. data
+;;           range > 2^24 for the 4-byte DATE/TIME encoding), AND
+;;       (c) nrows > RADIX_SORT_THRESHOLD = 4096, so the small-N introsort
+;;           branch (which never extracts sorted_keys) is skipped.
+;;     Note: I16, BOOL, U8 decode arms (L2400-L2413) are structurally
+;;     unreachable in the current call graph — key_bytes_max <= 2 forces
+;;     use_packed=true, and the introsort small-N path never publishes
+;;     sorted_keys.  They are not driven here.
+;;   - topk_gather_rows (sort.c:3315): multi-column table top-K paths
+;;     exercise the per-column for-loop body across DATE/TIME columns.
+
+;; ============================================================
+;; DATE single-key decode: > 4096 rows, range > 2^24 days
+;; ============================================================
+;; Encoded values span > 2^24, so compute_key_nbytes returns 4 →
+;; use_packed=false → sort_indices_ex publishes sorted_keys →
+;; ray_sort (sort.c:3485) calls radix_decode_into with type=DATE.
+;; (as 'DATE I) accepts integer days-since-epoch.
+(set Dwide (as 'DATE (take [0 16777217 100 16777000 50 16700000 200 16777216 75] 4097)))
+(at (asc Dwide) 0)                       -- (as 'DATE 0)
+(at (take (asc Dwide) -1) 0)             -- (as 'DATE 16777217)
+(at (desc Dwide) 0)                      -- (as 'DATE 16777217)
+(at (take (desc Dwide) -1) 0)            -- (as 'DATE 0)
+
+;; ============================================================
+;; TIME single-key decode: > 4096 rows, range > 2^24 ms
+;; ============================================================
+;; A full-day TIME range (0 .. 86_399_999) naturally exceeds 2^24 ms
+;; (16_777_216), forcing the non-packed branch and the DATE/TIME decode
+;; arm at sort.c:2392-2399.
+(set Twide (as 'TIME (take [0 86399999 1 86000000 12345 70000000 67890 50000000 99999] 4097)))
+(at (asc Twide) 0)                       -- (as 'TIME 0)
+(at (take (asc Twide) -1) 0)             -- (as 'TIME 86399999)
+(at (desc Twide) 0)                      -- (as 'TIME 86399999)
+(at (take (desc Twide) -1) 0)            -- (as 'TIME 0)
+
+;; ============================================================
+;; exec_sort decode-gather path (sort.c:3717) — DATE table key
+;; ============================================================
+;; Select with asc/desc on a wide-range DATE key column.  exec_sort's
+;; sort_indices_ex returns sorted_keys (non-packed); decode_col_idx is
+;; set and radix_decode_into is called for the sort key column.
+(set Td (table [d v] (list (take (as 'DATE [0 16777217 50 16700000 100 16777000 200]) 4097) (take [1 2 3 4 5 6 7] 4097))))
+(at (at (select {from: Td asc: d}) 'd) 0)                  -- (as 'DATE 0)
+(at (at (select {from: Td desc: d}) 'd) 0)                 -- (as 'DATE 16777217)
+
+;; ============================================================
+;; exec_sort decode-gather path (sort.c:3717) — TIME table key
+;; ============================================================
+(set Tt (table [t v] (list (take (as 'TIME [0 86399999 1000 70000000 500 50000000 12345]) 4097) (take [1 2 3 4 5 6 7] 4097))))
+(at (at (select {from: Tt asc: t}) 't) 0)                  -- (as 'TIME 0)
+(at (at (select {from: Tt desc: t}) 't) 0)                 -- (as 'TIME 86399999)
+
+;; ============================================================
+;; Multi-column top-K — drives topk_gather_rows' per-column loop
+;; across a mix of column types (DATE, TIME, I64).  The HEAD limit
+;; pushes exec_sort into ray_topk_table_multi → topk_gather_rows.
+;; ============================================================
+(set Tmix (table [d t v] (list (take (as 'DATE [2024.06.15 2024.01.01 2024.03.10 2024.12.31 2024.07.04]) 200) (take (as 'TIME [12:00:00.000 09:00:00.000 18:30:00.000 06:15:00.000 23:00:00.000]) 200) (til 200))))
+;; SORT+TAKE fusion → topk_gather_rows over 3 columns; the 'v column
+;; must round-trip with the expected first row count.
+(count (select {from: Tmix asc: d take: 5}))    -- 5
+(count (select {from: Tmix desc: t take: 7}))   -- 7
+
+;; ============================================================
+;; Combined: DATE asc preserves the multiset (sum invariant) over
+;; > 4096 rows.  Re-confirms the DATE decode path round-trips
+;; through ray_sort without integer corruption.
+;; ============================================================
+(sum (as 'I64 (asc Dwide)))              -- (sum (as 'I64 Dwide))
+(sum (as 'I64 (asc Twide)))              -- (sum (as 'I64 Twide))
