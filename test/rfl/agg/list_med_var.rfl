@@ -1,0 +1,98 @@
+;; list_med_var.rfl — coverage for ray_med_fn and var_stddev_core
+;; when invoked on a heterogeneous list rather than a vec.
+;;
+;; Lines targeted in src/ops/agg.c:
+;;   ray_med_fn  list branch : 503-519 (is_list path with scratch alloc)
+;;   ray_med_fn  type error  : 519     (else: return type error)
+;;   var_stddev_core list    : 593-607 (is_list path with ray_vec_new scratch)
+;;   var_stddev_core type err: 606     (else: return type error)
+;;
+;; Also covers:
+;;   ray_avg_fn non-numeric atom (line 309): ray_retain(x); return x
+;;   vec_to_f64_scratch type error (475-476): non-numeric vec type
+;;   ray_sum_fn TIMESTAMP vec path (257-261): else branch of RAY_TIME
+;;   ray_sum_fn TIME vec path (251-255): sum on TIME vec
+;;
+;; High density: each assertion exercises ≥3 regions:
+;;   1. is_list / ray_is_atom dispatch
+;;   2. element iteration + value accumulation
+;;   3. null-skip / type check + return
+
+;; ─── med on list (is_list branch, lines 503-519) ─────────────────────
+;; Odd count: median = middle element after sort.
+(med (list 5 3 1 4 2)) -- 3.0
+;; Even count: average of two middle elements.
+(med (list 1.0 4.0 2.0 3.0)) -- 2.5
+;; Single non-null element.
+(med (list 7)) -- 7.0
+;; Null-skip in list: 0Ni is a typed null for integer.
+(med (list 1 0Ni 5)) -- 3.0
+;; All-null list → typed-null F64 (cnt==0 branch, line 524).
+(nil? (med (list 0Ni 0Ni))) -- true
+;; Empty list → typed-null F64.
+(nil? (med (list))) -- true
+;; Mixed integer + float in list.
+(med (list 1 2.0 3)) -- 2.0
+;; Return type always f64.
+(type (med (list 10 20 30))) -- 'f64
+
+;; ─── med type error on list with non-numeric (line 514) ──────────────
+(med (list 1.0 "hello" 3.0)) !- type
+(med (list 1 'foo 3)) !- type
+
+;; ─── med type error on non-list non-vec (line 519) ───────────────────
+(med 'some_sym) !- type
+
+;; ─── var/stddev on list (var_stddev_core list branch: lines 593-607) ──
+;; Basic: list [1 2 3 4 5], pop_var = 2.0, sample_var = 2.5
+(var_pop  (list 1 2 3 4 5)) -- 2.0
+(stddev_pop (list 1 2 3 4 5)) -- 1.4142135623730951
+;; Sample variance on the same list.
+(< (abs (- (var (list 2 4 4 4 5 5 7 9)) 4.571428571428571)) 0.000001) -- true
+;; Null skipping in list: 0Ni is skipped.
+(var_pop  (list 1 0Ni 3 0Ni 5)) -- 2.6666666666666665
+;; verify with tolerance
+(< (abs (- (var_pop (list 1 0Ni 3 0Ni 5)) 2.6666666666666665)) 0.000001) -- true
+;; Empty list → typed null (cnt==0).
+(nil? (var   (list))) -- true
+(nil? (var_pop (list))) -- true
+;; Single-element list for sample: → null (sample & cnt<=1).
+(nil? (var    (list 42.0))) -- true
+(nil? (stddev (list 42.0))) -- true
+;; Single-element list for pop: → 0.0.
+(var_pop   (list 42.0)) -- 0.0
+(stddev_pop (list 42.0)) -- 0.0
+;; Return type f64.
+(type (var (list 1.0 2.0 3.0))) -- 'f64
+
+;; ─── var type error on list with non-numeric (line 601) ──────────────
+(var (list 1.0 'bad 3.0)) !- type
+(stddev (list 1.0 "bad" 3.0)) !- type
+
+;; ─── var type error on non-list non-vec (line 606) ───────────────────
+(var_pop 'sym_input) !- type
+(dev     'sym_input) !- type
+
+;; ─── vec_to_f64_scratch type error path (lines 475-476) ─────────────
+;; SYM vec is not numeric → error from vec_to_f64_scratch.
+(med (as 'SYM ['a 'b 'c])) !- type
+(dev (as 'SYM ['a 'b 'c])) !- type
+(var (as 'SYM ['a 'b 'c])) !- type
+
+;; ─── avg non-numeric atom return path (line 309) ─────────────────────
+;; When ray_is_atom(x) and !is_numeric and !is_null: ray_retain(x); return x
+;; SYM atom is non-numeric → passes through unchanged.
+(type (avg 'hello)) -- 'sym
+(type (avg 'world)) -- 'sym
+
+;; ─── sum TIMESTAMP vec (lines 257-261 in ray_sum_fn) ─────────────────
+;; TIMESTAMP scalars as vec via `as`; sum returns a TIMESTAMP atom.
+(type (as 'TIMESTAMP [1000 2000 3000])) -- 'TIMESTAMP
+(sum (as 'TIMESTAMP [1000 2000 3000])) -- (as 'TIMESTAMP 6000)
+;; Null-aware: null is skipped; result = 1000 + 3000 = 4000.
+(sum (as 'TIMESTAMP [1000 0N 3000])) -- (as 'TIMESTAMP 4000)
+
+;; ─── sum TIME vec (lines 251-255 in ray_sum_fn) ──────────────────────
+;; TIME vec; result type TIME.
+(type (sum (as 'TIME [100 200 300]))) -- 'time
+(sum (as 'TIME [100 200 300])) -- (as 'TIME 600)
