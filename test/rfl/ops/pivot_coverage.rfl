@@ -462,3 +462,164 @@
 (set T1I64StrB (table [cond s1 n2] (list [false] (list "hellov") [0])))
 (count (at (select {s: (if cond s1 n2) from: T1I64StrB}) 's)) -- 1
 (at (at (select {s: (if cond s1 n2) from: T1I64StrB}) 's) 0) -- ""
+
+;; ====================================================================
+;; Section 23: exec_if — STR output, SYM *atom* then-branch
+;;             Regression for prior bug: SYM atom (-RAY_SYM) reached the
+;;             `else { sp=""; sl=0; }` fallback at line 116 because the
+;;             RAY_IS_SYM check matched only positive RAY_SYM (vec types).
+;;             SYM-atom then-branches silently produced empty strings.
+;;             Fix in pivot.c: extend the SYM check to also match
+;;             -RAY_SYM, route through sym_scalar_id().
+;; ====================================================================
+
+;; (if cond 'A s1): then is a SYM atom (-RAY_SYM), else is STR column.
+;; promote(SYM, STR) = STR → exec_if STR branch.
+;; cond=true rows: then_v is SYM atom 'A → string "A".
+;; cond=false rows: pick from STR column s1.
+(set TSym23 (table [cond s1] (list [true false true false] (list "alpha" "beta" "gamma" "delta"))))
+(set R23 (at (select {s: (if cond 'A s1) from: TSym23}) 's))
+(count R23) -- 4
+(at R23 0) -- "A"
+(at R23 1) -- "beta"
+(at R23 2) -- "A"
+(at R23 3) -- "delta"
+
+;; Section 23b: 1-element SYM *vector* as then-branch (type=+RAY_SYM, len=1)
+;;              → then_scalar=true via (then_v->type>0 && then_v->len==1)
+;;              → RAY_IS_SYM(then_v->type) = true → lines 113-115 path.
+;; Regression for prior bug: ray_t->i64 aliases ray_t->len, so
+;; `ray_sym_str(then_v->i64)` returned ray_sym_str(1) = "+" instead of
+;; the element value.  Fix in pivot.c: read sym ID via sym_scalar_id()
+;; which dispatches atom/vec correctly.
+(set TSym23b (table [cond s1] (list [true false true] (list "alpha" "beta" "gamma"))))
+(set sym1vec (take ['X] 1))
+(set R23b (at (select {s: (if cond sym1vec s1) from: TSym23b}) 's))
+(count R23b) -- 3
+(at R23b 0) -- "X"
+(at R23b 1) -- "beta"
+(at R23b 2) -- "X"
+
+;; ====================================================================
+;; Section 24: exec_if — STR output, SYM *atom* else-branch
+;;             Regression for the mirror of Section 23: SYM atom in the
+;;             else-branch also produced empty strings.  Same fix.
+;; ====================================================================
+
+;; (if cond s1 'B): then is STR column, else is SYM atom (-RAY_SYM).
+;; promote(STR, SYM) = STR → exec_if STR branch.
+;; cond=true rows: pick from STR column s1.
+;; cond=false rows: else_v is SYM atom 'B → string "B".
+(set R24 (at (select {s: (if cond s1 'B) from: TSym23}) 's))
+(count R24) -- 4
+(at R24 0) -- "alpha"
+(at R24 1) -- "B"
+(at R24 2) -- "gamma"
+(at R24 3) -- "B"
+
+;; Section 24b: exec_if — SYM output, SYM atom then-branch + SYM column else.
+;;              Exercises the SYM-output path at pivot.c:158-163 which
+;;              now routes through sym_scalar_id() instead of bare i64.
+(set TSym24b (table [cond s] (list [true false true false] (as 'SYM ["w" "x" "y" "z"]))))
+(set R24b (at (select {r: (if cond 'A s) from: TSym24b}) 'r))
+(count R24b) -- 4
+(at R24b 0) -- 'A
+(at R24b 1) -- 'x
+(at R24b 2) -- 'A
+(at R24b 3) -- 'z
+
+;; Section 24c: SYM output, 1-elem SYM vec then + SYM column else.
+(set R24c (at (select {r: (if cond sym1vec s) from: TSym24b}) 'r))
+(count R24c) -- 4
+(at R24c 0) -- 'X
+(at R24c 1) -- 'x
+(at R24c 2) -- 'X
+(at R24c 3) -- 'z
+
+;; Section 24b: 1-element SYM *vector* as else-branch → lines 136-138 path.
+;; BUG: else_v->i64 reads len field (=1) as sym ID.
+(set R24b (at (select {s: (if cond s1 sym1vec) from: TSym23b}) 's))
+(count R24b) -- 3
+;; cond=true rows come from STR column s1 (line 118 path)
+(at R24b 0) -- "alpha"
+
+;; ====================================================================
+;; Section 25: exec_pivot — null pivot-key rows are dropped
+;;             Covers lines 406-410: nmask & pvt_null_bit → skip row
+;;             (grp_ix[gi]=UINT32_MAX, grp_pv[gi]=UINT32_MAX).
+;; ====================================================================
+
+;; Row (A, 0Nl, 10) has null pivot column → must be dropped.
+;; Only rows with non-null pivot keys contribute output columns.
+;; Result: 2 groups (A and B), 2 pivot values (1 and 2) → 3 cols total.
+(set TNullPvt (table [k c v] (list ['A 'A 'B 'B] [0N 2 1 2] [10 20 30 40])))
+(count (pivot TNullPvt 'k 'c 'v sum)) -- 2
+(count (key (pivot TNullPvt 'k 'c 'v sum))) -- 3
+
+;; ====================================================================
+;; Section 26: exec_pivot — null in F64 index column
+;;             Covers line 527-528: case RAY_F64 sentinel fill
+;;             (NULL_F64 written to output index column for null group key).
+;; ====================================================================
+
+;; Table with F64 index key where one row has null (0Nf).
+;; The null index key group gets NULL_F64 sentinel in the output index column.
+(set TNullF64 (table [k c v] (list (as 'F64 [1.0 0Nf 2.0 2.0]) ['x 'y 'x 'y] [10 20 30 40])))
+(set PNullF64 (pivot TNullF64 'k 'c 'v sum))
+;; 3 distinct index groups: {1.0, 0Nf, 2.0} → 3 rows
+(count PNullF64) -- 3
+;; The null-key row exists in output (with null sentinel in k col)
+(count (key PNullF64)) -- 3
+;; Non-null groups produce correct aggregates
+(at (at PNullF64 'x) 0) -- 10
+(at (at PNullF64 'x) 2) -- 30
+
+;; ====================================================================
+;; Section 27: exec_pivot — null in I32 index column
+;;             Covers lines 531-532: case RAY_I32/DATE/TIME sentinel fill.
+;; ====================================================================
+
+;; Table with I32 index key where one row has null (0Ni).
+(set TNullI32 (table [k c v] (list (as 'I32 [1 0N 2 2]) ['x 'y 'x 'y] [10 20 30 40])))
+(set PNullI32 (pivot TNullI32 'k 'c 'v sum))
+(count PNullI32) -- 3
+(count (key PNullI32)) -- 3
+(at (at PNullI32 'x) 0) -- 10
+(at (at PNullI32 'y) 2) -- 40
+
+;; ====================================================================
+;; Section 28: exec_pivot — null in I16 index column
+;;             Covers lines 533-534: case RAY_I16 sentinel fill.
+;; ====================================================================
+
+;; Table with I16 index key where one row has null (0Nh).
+(set TNullI16 (table [k c v] (list (as 'I16 [1 0N 2 2]) ['x 'y 'x 'y] [10 20 30 40])))
+(set PNullI16 (pivot TNullI16 'k 'c 'v sum))
+(count PNullI16) -- 3
+(count (key PNullI16)) -- 3
+(at (at PNullI16 'x) 0) -- 10
+(at (at PNullI16 'y) 2) -- 40
+
+;; ====================================================================
+;; Section 29: exec_if — TIMESTAMP/DATE/TIME output branches
+;;             BUG: These branches (lines 189-209) are UNREACHABLE.
+;;             promote(RAY_TIMESTAMP, RAY_TIMESTAMP) returns RAY_I64
+;;             promote(RAY_DATE, RAY_DATE) returns RAY_I32
+;;             promote(RAY_TIME, RAY_TIME) returns RAY_I32
+;;             so exec_if never enters the TIMESTAMP/DATE/TIME arms.
+;;             These arms handle correct temporal semantics but are dead.
+;;
+;; Verify the current (demoted) behavior:
+;; ====================================================================
+
+;; TIMESTAMP if → actually produces I64 (not TIMESTAMP)
+(set TTSdead (table [x ts1 ts2] (list [true false] (as 'TIMESTAMP [100 200]) (as 'TIMESTAMP [10 20]))))
+(count (at (select {t: (if x ts1 ts2) from: TTSdead}) 't)) -- 2
+
+;; DATE if → actually produces I32 (not DATE)
+(set TDatedead (table [x d1 d2] (list [true false] [2024.01.01 2024.01.02] [2023.01.01 2023.01.02])))
+(count (at (select {d: (if x d1 d2) from: TDatedead}) 'd)) -- 2
+
+;; TIME if → actually produces I32 (not TIME)
+(set TTimedead (table [x t1 t2] (list [true false] [09:30:00.000 10:00:00.000] [08:00:00.000 11:00:00.000])))
+(count (at (select {t: (if x t1 t2) from: TTimedead}) 't)) -- 2
