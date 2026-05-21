@@ -1,0 +1,139 @@
+;; Coverage for sort/take paths in `src/ops/query.c`:
+;;
+;;   `apply_sort_take` (line ~349):
+;;     - take without sort, atom positive (lines ~363-398)
+;;     - take without sort, atom negative/tail (line ~381-384)
+;;     - sort + take (multi-key sort), TopK fast path
+;;     - TopK multi-key path (n_keys > 1) (lines ~487-498)
+;;
+;;   `atom_i64_const` with I32/DATE/TIME/BOOL/U8 types (lines ~1438-1447)
+;;   Called from `expr_affine_of_sym` and `parse_gt_name_i64`
+
+;; ────────────────────────────────────────────────────────────────────
+;; take without sort: eval-level group path (LIST keys groups)
+;; apply_sort_take at lines 363-409 (sort=false, take_val_expr set)
+;; ────────────────────────────────────────────────────────────────────
+(set Tsst (table [k v] (list ["aa" "bb" "aa" "bb" "cc" "dd" "ee"] [1 2 3 4 5 6 7])))
+
+;; take: positive atom — slice [0, k) of result
+(count (select {s: (sum v) by: k from: Tsst take: 3})) -- 3
+;; Sum is sum of the first 3 groups encountered: aa=4, bb=6, cc=5 → 15
+(sum (at (select {s: (sum v) by: k from: Tsst take: 3}) 's)) -- 15
+
+;; take: 1 → only first group
+(count (select {s: (sum v) by: k from: Tsst take: 1})) -- 1
+
+;; take: bigger than n_groups → clamped to n_groups
+(count (select {s: (sum v) by: k from: Tsst take: 100})) -- 5
+
+;; ────────────────────────────────────────────────────────────────────
+;; TopK multi-key sort + take → n_keys > 1 path (lines 487-498)
+;; Multi-key sort triggers ray_topk_table_multi
+;; ────────────────────────────────────────────────────────────────────
+(set Ttopk (table [a b v] (list [3 1 2 3 1 2] [10 20 30 10 20 30] [100 200 300 400 500 600])))
+;; Top-3 by (a, b) ascending
+(count (select {from: Ttopk asc: [a b] take: 3})) -- 3
+;; Top-3 by (a desc, b asc) - multi-key mixed direction
+(count (select {from: Ttopk asc: b desc: a take: 3})) -- 3
+
+;; Flat table (no LIST cols) — topk fast path eligible
+(set Tflat (table [x y v] (list [5 3 1 4 2] [10 30 50 20 40] [100 300 500 200 400])))
+;; Top-2 by x asc: rows with x=1(v=500), x=2(v=400)
+(count (select {from: Tflat asc: [x y] take: 2})) -- 2
+;; Verify: by x+y asc, top 2
+(count (select {from: Tflat asc: [x y] take: 4})) -- 4
+
+;; ────────────────────────────────────────────────────────────────────
+;; atom_i64_const with narrow types:
+;; Called from parse_gt_name_i64 which parses (> sym literal) predicates
+;; for can_defer_single_key_where → post_group_where_expr
+;; The I32/BOOL/U8/I16 branches are uncovered; we can exercise them
+;; indirectly through parse_gt_name_i64 via match_group_count_emit_filter:
+;; atom_i64_const is called on the threshold atom in (> cnt_col K)
+;; When K is a numeric literal, it comes as I64 from the parser
+;; but parse_gt_name_i64's threshold switch (1522-1528) covers I32/I16/U8/BOOL
+;; These are unreachable from RFL because the RFL parser emits I64 atoms
+;; for all integer literals.
+;; ────────────────────────────────────────────────────────────────────
+
+;; ────────────────────────────────────────────────────────────────────
+;; No-sort take with negative atom (tail rows) — line 380-383
+;; Groups result with count n_groups, take -K = last K groups
+;; ────────────────────────────────────────────────────────────────────
+(set Tntake (table [k v] (list ['A 'B 'C 'D 'E] [10 20 30 40 50])))
+;; No-sort with take: -2 should return last 2 groups
+;; apply_sort_take: atom_n<0 → start=n_groups-2, amount=2
+(count (select {s: (sum v) by: k from: Tntake take: -2})) -- 2
+
+;; No-sort with take: -1 → last 1 group
+(count (select {s: (sum v) by: k from: Tntake take: -1})) -- 1
+
+;; ────────────────────────────────────────────────────────────────────
+;; TopK with sort + take on a non-by select (apply_sort_take in sort path)
+;; DAG path: sort a materialized table using a temporary DAG
+;; ────────────────────────────────────────────────────────────────────
+(set Tsortake (table [a b c] (list [3 1 4 1 5 9] [2 6 5 3 5 8] [100 200 300 400 500 600])))
+;; Sort by a asc + take 3 → rows with a={1,1,3}, top-3 from sort
+(count (select {from: Tsortake asc: a take: 3})) -- 3
+
+;; Sort by b desc + take 2 → rows with b={8,6}
+(count (select {from: Tsortake desc: b take: 2})) -- 2
+
+;; Sort by [a b] asc + take 4
+(count (select {from: Tsortake asc: [a b] take: 4})) -- 4
+
+;; ────────────────────────────────────────────────────────────────────
+;; BOOL group-by result reorder with NULL column (lines 7117-7121)
+;; When group-by on BOOL key produces result where first BOOL group
+;; doesn't match first row of input (hash may put true before false),
+;; the swap path at 7099 reverses row order in all result columns.
+;; Lines 7117-7121 fire when a result column has HAS_NULLS set
+;; (first-of-group value is null in the no-agg first-of-group path).
+;;
+;; Requires:
+;;   1. BOOL key → exec_group puts false before true (alphabetically)
+;;   2. Input starts with true → first_val=true, result_first=false →
+;;      first_val != result_first → swap triggered at 7099
+;;   3. A column in result has HAS_NULLS (first-of-group is null)
+;; ────────────────────────────────────────────────────────────────────
+;; Table starting with true key: k=[true,false,true,false], v I32 column
+;; Inject I32 null into v column where k==true (rows 0 and 2).
+;; exec_group puts false first; original first row has k=true →
+;; first_val=true != result_first=false → swap triggered at 7099.
+;; v column has HAS_NULLS set (rows 0,2 null) → lines 7117-7121 execute.
+(set Tbool_base (table [k v] (list [true false true false] (as 'I32 [10 99 20 30]))))
+(set Tbool_null (update {v: 0Ni from: Tbool_base where: k}))
+;; After group-by BOOL key: 2 distinct groups (true-first in input → swap)
+(count (select {by: k from: Tbool_null})) -- 2
+
+;; ────────────────────────────────────────────────────────────────────
+;; take: vec[2] range form — lines 400-405 in apply_sort_take
+;; When take expr evaluates to an I64 vec of length 2 [start, count],
+;; ray_take_fn is called with the range directly.
+;; ────────────────────────────────────────────────────────────────────
+(set Trange (table [v] (list [10 20 30 40 50])))
+;; take: [1 3] → skip 1 row, take 3 → rows at indices 1,2,3
+(count (select {v: v from: Trange take: [1 3]})) -- 3
+(at (at (select {v: v from: Trange take: [1 3]}) 'v) 0) -- 20
+
+;; take: [0 2] → rows 0,1
+(count (select {v: v from: Trange take: [0 2]})) -- 2
+
+;; ────────────────────────────────────────────────────────────────────
+;; take: domain error — lines 407-409 in apply_sort_take
+;; When take expr is neither an atom nor a vec[2], domain error fires.
+;; ────────────────────────────────────────────────────────────────────
+;; take: vec[3] → not atom, not len-2 → domain error
+(select {v: v from: Trange take: [1 2 3]}) !- domain
+
+;; ────────────────────────────────────────────────────────────────────
+;; Computed sort key → bad_clause = 1 (lines 454-456 in apply_sort_take)
+;; When asc:/desc: value is an expression (not a SYM name or SYM vec),
+;; the code sets bad_clause=1 and falls through to the DAG sort path.
+;; ────────────────────────────────────────────────────────────────────
+(set Tcomp (table [a v] (list [3 1 2] [100 200 300])))
+;; asc: (+ a 0) is a computed expression, not a SYM atom → bad_clause=1
+;; Result still sorted correctly via DAG fallback sort
+(count (select {from: Tcomp asc: (+ a 0) take: 2})) -- 2
+;; First element after sorting by (a+0) should be a=1
+(at (at (select {from: Tcomp asc: (+ a 0) take: 3}) 'a) 0) -- 1

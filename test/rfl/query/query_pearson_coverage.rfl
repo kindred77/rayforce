@@ -1,0 +1,54 @@
+;; Coverage for pearson_corr binary-agg paths in `src/ops/query.c`:
+;;
+;;   Non-by scalar reduction with pearson_corr (lines ~6854-6916):
+;;     `(select {r: (pearson_corr x y) from: T})`
+;;     Lines 6878-6909: iterate dict, op=OP_PEARSON_CORR → compile second input,
+;;     set s_has_binary, lines 6912-6914: call ray_group2 with s_has_binary.
+;;
+;;   By-group pearson_corr (lines ~5904-5929):
+;;     Lines 5925-5929: op==OP_PEARSON_CORR in agg compilation loop.
+;;     Handled via exec_group_pearson_rowform fast path.
+
+;; ────────────────────────────────────────────────────────────────────
+;; Non-by scalar reduction: pearson_corr
+;; Lines 6896-6909: op==OP_PEARSON_CORR → compile second input + s_has_binary=1
+;; Lines 6912-6914: ray_group2 called (s_has_binary branch)
+;; ────────────────────────────────────────────────────────────────────
+(set Tp1 (table [x y] (list [1 2 3 4 5] [2 4 6 8 10])))
+;; Non-by select with pearson_corr → returns 1-row table
+(count (select {r: (pearson_corr x y) from: Tp1})) -- 1
+
+;; Anti-correlated pair
+(set Tp2 (table [x y] (list [1 2 3 4 5] [-1 -2 -3 -4 -5])))
+(count (select {r: (pearson_corr x y) from: Tp2})) -- 1
+
+;; pearson_corr with WHERE predicate
+(set Tp4 (table [x y z] (list [1 2 3 4] [2 4 6 8] ['A 'B 'A 'B])))
+(count (select {r: (pearson_corr x y) from: Tp4 where: (== z 'A)})) -- 1
+
+;; ────────────────────────────────────────────────────────────────────
+;; By-group pearson_corr: fused group with binary agg
+;; Lines 5925-5929: op==OP_PEARSON_CORR in group agg compilation loop
+;; ────────────────────────────────────────────────────────────────────
+(set Tp5 (table [k x y] (list ['A 'A 'B 'B] [1 2 3 4] [2 4 6 8])))
+;; Each group: A → x=[1,2], y=[2,4] → corr=1; B → x=[3,4], y=[6,8] → corr=1
+(count (select {r: (pearson_corr x y) by: k from: Tp5})) -- 2
+(sum (at (select {r: (pearson_corr x y) by: k from: Tp5}) 'r)) -- 2.0
+
+;; By-group pearson_corr combined with count
+(count (select {n: (count x) r: (pearson_corr x y) by: k from: Tp5})) -- 2
+(sum (at (select {n: (count x) r: (pearson_corr x y) by: k from: Tp5}) 'n)) -- 4
+
+;; By-group with 2 keys (exercises n_keys==2 path in ray_group_pearson_rowform)
+(set Tp6 (table [k1 k2 x y] (list ['A 'A 'B 'B] [1 1 1 1] [1 2 3 4] [2 4 6 8])))
+(count (select {r: (pearson_corr x y) by: [k1 k2] from: Tp6})) -- 2
+
+;; ────────────────────────────────────────────────────────────────────
+;; pearson_corr in eval-group path (STR key) — lines 5473-5484
+;; STR key → use_eval_group=1 → eval-group path.
+;; pearson_corr: is_streaming_aggr_unary_call=false, is_agg_expr=true
+;; → nonagg_eval_per_group called at line 5473
+;; ────────────────────────────────────────────────────────────────────
+(set Tp7 (table [k x y] (list (list "A" "A" "B" "B") [1 2 3 4] [2 4 6 8])))
+;; A: x=[1,2], y=[2,4] → corr=1.0; B: x=[3,4], y=[6,8] → corr=1.0
+(count (select {r: (pearson_corr x y) by: k from: Tp7})) -- 2

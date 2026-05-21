@@ -1,0 +1,111 @@
+;; Coverage for group emit-filter fast paths in `src/ops/query.c`:
+;;
+;;   `match_group_count_emit_filter` (~line 1613):
+;;     Recognizes `(select {from: (select {n: (count v) by: k from: T}) where: (> n K)})`
+;;     Sets ray_group_emit_filter to skip groups with count <= K during emission.
+;;     Exercises lines 1644-1663 including the `out->enabled = 1` path at line 1656.
+;;
+;;   `match_group_desc_count_take` (~line 1680):
+;;     Recognizes `(select {n: (count v) by: k from: T desc: n take: K})`
+;;     Sets top_count_take to emit only top-K groups by count (highest first).
+;;     Exercises lines 1699-1718.
+;;
+;;   `positive_take_i64` with I32 take value (~line 1673).
+
+;; ────────────────────────────────────────────────────────────────────
+;; match_group_count_emit_filter:
+;; outer WHERE on count col of inner group-by select
+;; ────────────────────────────────────────────────────────────────────
+(set Tmce (table [k v] (list ['A 'B 'C 'A 'B 'A 'C 'A] [1 2 3 4 5 6 7 8])))
+;; A: count=4, B: count=2, C: count=2
+;; Outer WHERE (> n 2) keeps only A
+(count (select {from: (select {n: (count v) by: k from: Tmce}) where: (> n 2)})) -- 1
+(at (at (select {from: (select {n: (count v) by: k from: Tmce}) where: (> n 2)}) 'n) 0) -- 4
+
+;; Outer WHERE (> n 1) keeps A and either B or C
+(count (select {from: (select {n: (count v) by: k from: Tmce}) where: (> n 1)})) -- 3
+
+;; Outer WHERE (> n 3) keeps only A
+(count (select {from: (select {n: (count v) by: k from: Tmce}) where: (> n 3)})) -- 1
+
+;; With additional aggregates in the inner select:
+;; The emit filter matches on the count field regardless of other aggs
+(count (select {from: (select {n: (count v) s: (sum v) by: k from: Tmce}) where: (> n 2)})) -- 1
+(at (at (select {from: (select {n: (count v) s: (sum v) by: k from: Tmce}) where: (> n 2)}) 's) 0) -- 19
+
+;; Count field not first — agg_index should skip non-count aggs
+(count (select {from: (select {s: (sum v) n: (count v) by: k from: Tmce}) where: (> n 1)})) -- 3
+
+;; Larger table to stress the fast path
+(set Tstress (table [k v] (list (take ['A 'B 'C 'D 'E] 100) (til 100))))
+;; A:count=20, B:20, C:20, D:20, E:20 → (> n 15) keeps all 5
+(count (select {from: (select {n: (count v) by: k from: Tstress}) where: (> n 15)})) -- 5
+;; (> n 20) keeps none (count=20, not > 20)
+(count (select {from: (select {n: (count v) by: k from: Tstress}) where: (> n 20)})) -- 0
+
+;; ────────────────────────────────────────────────────────────────────
+;; match_group_desc_count_take:
+;; desc: + take: with count field = top-K by frequency
+;; ────────────────────────────────────────────────────────────────────
+(set Tmdt (table [k v] (list ['A 'B 'C 'A 'B 'A 'B 'C] [1 2 3 4 5 6 7 8])))
+;; A: count=3, B: count=3, C: count=2
+;; Top-2 by count desc: A and B (sum of counts = 6)
+(count (select {n: (count v) by: k from: Tmdt desc: n take: 2})) -- 2
+(sum (at (select {n: (count v) by: k from: Tmdt desc: n take: 2}) 'n)) -- 6
+
+;; Top-1 by count desc
+(count (select {n: (count v) by: k from: Tmdt desc: n take: 1})) -- 1
+
+;; Top-3 by count desc: all groups
+(count (select {n: (count v) by: k from: Tmdt desc: n take: 3})) -- 3
+(sum (at (select {n: (count v) by: k from: Tmdt desc: n take: 3}) 'n)) -- 8
+
+;; Different key distribution
+(set Tmdt2 (table [k v] (list ['X 'Y 'Z 'X 'X 'X 'Y 'Y] [1 2 3 4 5 6 7 8])))
+;; X:count=4, Y:count=3, Z:count=1
+;; Top-2 by count desc: X(4) + Y(3) = 7
+(count (select {n: (count v) by: k from: Tmdt2 desc: n take: 2})) -- 2
+(sum (at (select {n: (count v) by: k from: Tmdt2 desc: n take: 2}) 'n)) -- 7
+
+;; Combined with additional sum aggregate
+(count (select {n: (count v) s: (sum v) by: k from: Tmdt2 desc: n take: 2})) -- 2
+
+;; ────────────────────────────────────────────────────────────────────
+;; positive_take_i64 with I32 take value (line 1673 in query.c)
+;; match_group_desc_count_take calls positive_take_i64(take_expr).
+;; When take value is I32 atom (e.g. 2i), line 1673 executes.
+;; ────────────────────────────────────────────────────────────────────
+(set Tpi32 (table [k v] (list ['A 'B 'C 'A 'B 'A 'B 'C] [1 2 3 4 5 6 7 8])))
+;; A:3, B:3, C:2 — take: 2i (I32 atom instead of I64)
+;; → positive_take_i64 hits -RAY_I32 branch at line 1673
+(count (select {n: (count v) by: k from: Tpi32 desc: n take: 2i})) -- 2
+
+;; ────────────────────────────────────────────────────────────────────
+;; prefilter_computed_by path (lines ~3830-3859):
+;; Activated when by-clause is a dict ({key: computed_expr}),
+;; has_computed_by_val=true (key != computed_expr), AND
+;; match_group_desc_count_take matches (count + desc: + take:), AND
+;; where_expr is non-null.
+;;
+;; Prereqs:
+;;   1. by: {g: k} → by-dict, dep_candidate fails (g≠k), has_computed_by_val=true
+;;   2. where: (> v 10) → where_expr non-null
+;;   3. n: (count v) + desc: n + take: 2 → match_group_desc_count_take returns true
+;;
+;; After prefilter at 3844: WHERE applied first to get filtered table,
+;; then the by-dict is evaluated and groups computed on filtered rows.
+;; ────────────────────────────────────────────────────────────────────
+(set Tpf (table [k v] (list [1 2 3 1 2 3] [5 15 25 8 18 28])))
+;; WHERE v>10 filters: rows (k=2,v=15),(k=3,v=25),(k=2,v=18),(k=3,v=28) remain
+;; Groups by g=k: k=2 has 2 rows, k=3 has 2 rows, k=1 filtered out
+;; desc: n take: 2 → both groups have n=2 → result has 2 groups
+(count (select {n: (count v) by: {g: k} from: Tpf where: (> v 10) desc: n take: 2})) -- 2
+(sum (at (select {n: (count v) by: {g: k} from: Tpf where: (> v 10) desc: n take: 2}) 'n)) -- 4
+
+;; Single-group result: only k=3 has count > 1 among highly filtered rows
+(set Tpf2 (table [k v] (list [1 2 3 3 3] [5 15 25 30 35])))
+;; WHERE v>20: rows (k=3,v=25),(k=3,v=30),(k=3,v=35) remain
+;; Groups: k=3 has count=3, others filtered
+;; desc: n take: 1 → top group by count
+(count (select {n: (count v) by: {g: k} from: Tpf2 where: (> v 20) desc: n take: 1})) -- 1
+(at (at (select {n: (count v) by: {g: k} from: Tpf2 where: (> v 20) desc: n take: 1}) 'n) 0) -- 3

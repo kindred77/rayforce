@@ -100,3 +100,33 @@
 ;; Distinct (a,b) pairs: (1,10), (NULL,10), (1,20), (NULL,20) = 4.
 (count (select {c: (count v) by: [a b] from: Tnu take: 50})) -- 4
 (sum (at (select {c: (count v) by: [a b] from: Tnu take: 50}) 'c)) -- 6
+
+;; ============================================================
+;; Part C — expr_affine_of_sym with reversed operand order
+;; (+ constant sym) — covers lines 1473-1476 in query.c
+;; ============================================================
+;; Standard form is (+ sym constant); reversed is (+ constant sym).
+;; Both should produce the same dep bias.
+;; sum(k) = 10 (keys 1,2,3,4). Dep a = k + 100 → sum(a) = 410.
+(sum (at (select {c: (count v) from: Ta by: {k: k a: (+ 100 k)}}) 'a)) -- 410
+
+;; Reversed subtraction: (- constant sym) is NOT affine (bias = const-sym, not sym-const).
+;; Only (+ const sym) is covered. Check with I16 constant reversed:
+;; Dep a = k + 5 → sum(a) = 30 (using 5h on left).
+(sum (at (select {c: (count v) from: Ta by: {k: k a: (+ 5h k)}}) 'a)) -- 30
+
+;; ============================================================
+;; Part D — key_col_read_i64 with I16/I32/DATE/TIME base key
+;; (lines 1495-1500 in query.c)
+;; dep_candidate path reads base_col[i] via key_col_read_i64 at
+;; line 7986. With I16/I32 base keys these arms fire.
+;; ============================================================
+(set Td16 (table [k v] (list (as 'I16 [1 2 3 4 1 2 3 4]) [10 20 30 40 50 60 70 80])))
+;; I16 base key: key_col_read_i64 I16 branch (line 1497)
+;; Dep a = k + 10 → sum(a) over groups {1,2,3,4} = (1+2+3+4)+4*10 = 50
+(sum (at (select {c: (count v) from: Td16 by: {k: k a: (+ k 10)}}) 'a)) -- 50
+
+(set Td32 (table [k v] (list (as 'I32 [1 2 3 4 1 2 3 4]) [10 20 30 40 50 60 70 80])))
+;; I32 base key: key_col_read_i64 I32 branch (line 1498-1500)
+;; Dep a = k + 7 → sum(a) over groups {1,2,3,4} = 10 + 28 = 38
+(sum (at (select {c: (count v) from: Td32 by: {k: k a: (+ k 7)}}) 'a)) -- 38
