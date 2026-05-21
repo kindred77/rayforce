@@ -1,0 +1,168 @@
+;; Coverage extension for src/store/splay.c.
+;;
+;; src/store/splay.c is exercised by:
+;;   test/rfl/system/splayed.rfl      — happy-path round-trips
+;;   test/rfl/io/csv_splayed.rfl      — CSV → splay writer (uses splay_save_bulk)
+;;   test/rfl/store/serde_roundtrip.rfl — .db.splayed.set / .db.splayed.get
+;;   test/test_splay.c                — C-level error paths
+;;   test/test_store.c                — SYM column round-trips + validate_sym_columns
+;;
+;; This file adds the one reachable RFL path not covered above:
+;;
+;;   splay_save_impl line 74 — mkdir_p failure (true branch of
+;;     `if (mkdir_err != RAY_OK) return mkdir_err`).
+;;     Reached by trying to .db.splayed.set into an unwritable directory
+;;     such as /proc/ (read-only on Linux) or /nonexistent/deep/path/.
+;;
+;; Unreachable from RFL (documented):
+;;
+;;   splay_save_impl line 74 true   — mkdir_p failure — REACHABLE (covered
+;;                                    below via /proc/ path).
+;;
+;;   splay_save_impl line 78        — ray_sym_save_bulk: called only from
+;;                                    splay_save_impl with durable=false AND
+;;                                    sym_path != NULL.  The only callers
+;;                                    that set durable=false are in csv.c,
+;;                                    which always pass sym_path=NULL.  No
+;;                                    RFL builtin exposes this combination.
+;;
+;;   splay_save_impl line 79 true   — sym_save error: requires durable=true +
+;;                                    sym_path in an unwritable directory.
+;;                                    Reachable in principle but the same
+;;                                    unwritable path fails at mkdir_p first
+;;                                    (line 74), so line 79 never fires
+;;                                    independently from RFL.
+;;
+;;   splay_save_impl lines 89,115   — snprintf overflow guards: the path
+;;                                    buffer is 1024 bytes; column names and
+;;                                    dir paths are bounded by the OS (4096)
+;;                                    and the str_to_cpath check (1024),
+;;                                    so neither overflow can occur for any
+;;                                    valid RFL argument.
+;;
+;;   splay_save_impl lines 91,120   — col/schema save I/O error: requires
+;;                                    the directory to become unwritable after
+;;                                    mkdir_p succeeds, which is a TOCTOU
+;;                                    condition not reproducible from RFL.
+;;
+;;   splay_save_impl lines 98,102   — !col / !name_atom continue: ray_t* is
+;;                                    never NULL for a column returned by
+;;                                    ray_table_get_col_idx for a valid table,
+;;                                    and ray_sym_str never returns NULL for a
+;;                                    valid sym ID from a live sym table.
+;;
+;;   splay_load_impl line 146       — trace fprintf: only runs when the
+;;                                    RAY_CSV_TRACE env-var is set before the
+;;                                    test binary starts.  Setting env vars
+;;                                    from RFL is not possible without the
+;;                                    .sys.exec subprocess exiting first.
+;;
+;;   splay_load_impl lines 162-163  — trace on schema-load failure (same env
+;;                                    constraint as line 146).
+;;
+;;   splay_load_impl lines 172-174  — OOM in ray_table_new: allocating an
+;;                                    empty table frame never fails in
+;;                                    practice; triggering buddy OOM from RFL
+;;                                    would require consuming all of the
+;;                                    process heap first.
+;;
+;;   splay_load_impl lines 184-185  — trace on missing schema symbol (same
+;;                                    env constraint as line 146).
+;;
+;;   splay_load_impl lines 222-223  — trace on col-load failure (same env
+;;                                    constraint).
+;;
+;;   splay_load_impl lines 231-235  — OOM in ray_table_add_col (same OOM
+;;                                    argument as lines 172-174).
+;;
+;;   validate_sym_columns lines 55-57 — RAY_SYM column found with empty sym
+;;                                    table: to reach the loop body, ALL
+;;                                    column names must resolve via the
+;;                                    symbol table (so name_atom != NULL at
+;;                                    line 179).  With ray_sym_count()==1
+;;                                    only sym ID 0 ("") resolves, but the
+;;                                    path-safety guard at line 196 rejects
+;;                                    any column name with name_len==0 before
+;;                                    the column can be added to the table.
+;;                                    The loop is therefore unreachable from
+;;                                    RFL.
+;;
+;;   validate_sym_columns lines 244-246 — same argument; RAY_ERR_CORRUPT
+;;                                    from validate cannot be returned after
+;;                                    a fully successful column load from an
+;;                                    RFL-produced .d file.
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 1. splay_save_impl line 74 — mkdir_p returns non-OK.
+;;
+;; /proc/ is a Linux kernel pseudo-filesystem mounted read-only; any attempt
+;; to create a directory beneath it fails with EACCES / EROFS.
+;; ray_mkdir_p → mkdir fails → returns RAY_ERR_IO → splay_save_impl line 74
+;; returns that error → ray_splay_save propagates it → .db.splayed.set
+;; surfaces it as error("io").
+;;
+;; Four assertions touch this region three times (three distinct paths
+;; through splay_save_impl: arg validation OK, mkdir_p call, error return).
+;; ════════════════════════════════════════════════════════════════════════
+(set T-Save (table [a b] (list [1 2 3] (as 'F64 [1.0 2.0 3.0]))))
+
+;; Save to /proc/ (unwritable) — must return io error.
+(.db.splayed.set "/proc/rfl_splay_cov_write_fail/" T-Save) !- io
+
+;; Save to a deeply nested non-existent path under a read-only root.
+(.db.splayed.set "/proc/nested/rfl_splay_cov/" T-Save) !- io
+
+;; Confirm the table itself is intact after the failed saves.
+(count T-Save) -- 3
+(sum (at T-Save 'a)) -- 6
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 2. splay_load_impl: happy-path round-trip exercising both use_mmap
+;;    branches (ray_splay_load with use_mmap=false, ray_read_splayed with
+;;    use_mmap=true).
+;;
+;; .db.splayed.set → ray_splay_save (durable=true)
+;; .db.splayed.get → ray_read_splayed (use_mmap=true)
+;; ray_splay_load  → use_mmap=false (not exposed as an RFL builtin but
+;;                   covered by system/splayed.rfl and test_store.c)
+;;
+;; Multi-column, multi-type table to exercise the per-column loop in both
+;; splay_save_impl and splay_load_impl, hitting each branch multiple times.
+;; ════════════════════════════════════════════════════════════════════════
+(.sys.exec "rm -rf /tmp/rfl_splay_cov")
+
+(set T-Multi (table [id val flag] (list [10 20 30 40 50] (as 'F64 [1.1 2.2 3.3 4.4 5.5]) (as 'BOOL [1 0 1 0 1]))))
+(.db.splayed.set "/tmp/rfl_splay_cov/" T-Multi) -- T-Multi
+
+(set R-Multi (.db.splayed.get "/tmp/rfl_splay_cov/"))
+(count R-Multi) -- 5
+(sum (at R-Multi 'id)) -- 150
+(sum (at R-Multi 'val)) -- 16.5
+(key R-Multi) -- ['id 'val 'flag]
+(at R-Multi 'id) -- (at T-Multi 'id)
+(at R-Multi 'val) -- (at T-Multi 'val)
+(at R-Multi 'flag) -- (at T-Multi 'flag)
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 3. splay_load_impl: bad sym_path causes early return.
+;;
+;; When the sym file at the given path cannot be loaded, splay_load_impl
+;; returns the error from ray_sym_load immediately (line 151).
+;; This is also covered by test/test_store.c::test_read_splayed_bad_sym and
+;; test/test_splay.c::test_load_bad_sym_path, but exercising it from RFL
+;; via the full .db.splayed.get dispatch chain confirms the ops/system.c
+;; wrapper also propagates the error rather than swallowing it.
+;;
+;; Note: splay_default_sym in ops/system.c checks access(buf, F_OK) before
+;; passing sym_path; when the file does not exist, sym_path is set to NULL
+;; and ray_sym_load is never called.  An explicit nonexistent path string
+;; as the second argument bypasses this check.
+;; ════════════════════════════════════════════════════════════════════════
+(.sys.exec "rm -f /tmp/rfl_splay_cov_badsym")
+
+;; Second argument to .db.splayed.get is an explicit sym path that does not
+;; exist — should fail with an I/O or corrupt error from ray_sym_load.
+(.db.splayed.get "/tmp/rfl_splay_cov/" "/tmp/rfl_splay_cov_badsym") !- io
+
+;; ── teardown ──────────────────────────────────────────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_splay_cov")
