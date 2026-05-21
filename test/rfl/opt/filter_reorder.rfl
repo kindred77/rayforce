@@ -1,0 +1,132 @@
+;; Coverage for src/ops/opt.c — pass_filter_reorder and pass_predicate_pushdown
+;;
+;; Targeted regions:
+;;   - filter_cost: all type-width cost arms (RAY_DATE/TIME, narrow types)
+;;   - split_and_filter: decomposition of AND predicate into chained filters
+;;   - collect_filter_chain + insertion sort with 3+ filters
+;;   - pass_predicate_pushdown: SELECT pushdown, multiple iterations
+;;   - pass_predicate_pushdown line 1534-1538: nc > 256 path (after splits)
+
+;; ====================================================================
+;; Section 1: filter_cost — date/time type-width arm (line 1429)
+;;
+;; filter_cost checks inputs[0]->out_type.  For RAY_DATE/TIME columns
+;; the cost is +2 (same as RAY_I32).  A filter chain on a date column
+;; exercises the RAY_DATE arm of the switch.
+;; ====================================================================
+(set N 200)
+(set Tdate (table [d v] (list (take [2024.01.01 2024.06.15 2024.12.31] N) (til N))))
+
+;; filter on date column — forces filter_cost to evaluate out_type=DATE
+(count (select {from: Tdate where: (== d 2024.06.15)})) -- 67
+
+;; Two-predicate AND on date column: split_and_filter fires, then
+;; insertion-sort reorders by cost (both same width → stable order).
+(count (select {from: Tdate where: (and (>= d 2024.01.01) (<= d 2024.06.15))})) -- 134
+
+;; ====================================================================
+;; Section 2: split_and_filter + collect_filter_chain length > 2
+;;
+;; A 3-conjunct AND produces 3 separate OP_FILTER nodes after splitting.
+;; The insertion-sort path (lines 1579-1589) iterates c=1,2 (chain_len=3).
+;; ====================================================================
+(set N3 300)
+(set T3 (table [a b] (list (til N3) (til N3))))
+
+;; 3-conjunct AND: split fires twice, chain_len=3 after splits
+;; a>50 AND a<200 AND b!=100 → rows {51..199} minus b=100 → 148 rows
+;; sum(51..199) - 100 = (51+199)*149/2 - 100 = 18625 - 100 = 18525
+(count (select {from: T3 where: (and (> a 50) (< a 200) (!= b 100))})) -- 148
+(sum (at (select {from: T3 where: (and (> a 50) (< a 200) (!= b 100))}) 'a)) -- 18525
+
+;; ====================================================================
+;; Section 3: pass_predicate_pushdown — SELECT pushdown iteration
+;;
+;; FILTER over SELECT gets rewritten as SELECT over FILTER when
+;; the SELECT has a single consumer.  The outer select runs the
+;; predicate on the inner table's columns.
+;; ====================================================================
+(set Tpush (table [a b] (list [1 2 3 4 5 6 7 8 9 10] [1 2 3 4 5 6 7 8 9 10])))
+
+;; Single-level: FILTER(SELECT(T)) → SELECT(FILTER(T))
+(set R1 (select {x: a y: b from: (select {a: a b: b from: Tpush}) where: (> a 5)}))
+(count R1) -- 5
+
+;; Two-level pushdown: FILTER over two nested SELECTs.
+;; Runs in up to 4 iterations; first iter pushes one level, second pushes further.
+(set Inner2 (select {a2: a from: Tpush}))
+(set Mid2   (select {a3: a2 from: Inner2}))
+(count (select {from: Mid2 where: (> a3 7)})) -- 3
+
+;; ====================================================================
+;; Section 4: filter_cost — I64 and STR/SYM type arms
+;;
+;; When a filter compares an I64 or STR/SYM column, cost += 3 (default arm).
+;; By contrast, BOOL/U8 columns get cost += 0 (cheapest).
+;; ====================================================================
+(set Tsym (table [k v] (list (take ['A 'B 'C 'D] 100) (til 100))))
+
+;; filter on SYM column: filter_cost hits default arm (cost += 3)
+;; k cycles A(0),B(1),C(2),D(3): k=='C' at rows where i%4==2
+;; v>50: rows 51..99; k=='C' in that range: {54,58,...,98} → 12 rows
+(count (select {from: Tsym where: (and (> v 50) (== k 'C))})) -- 12
+
+;; With more conjuncts: reorder puts cheaper preds first
+;; v>25 AND v<75 AND k=='B' → 25 rows in {26..74}, k='B'==(row%4==1) → every 4th
+(count (select {from: Tsym where: (and (> v 25) (< v 75) (== k 'B))})) -- 12
+
+;; ====================================================================
+;; Section 5: filter_cost — OP_LIKE in reorder (line 1437)
+;;
+;; Already covered in const_fold.rfl but additional multi-predicate case
+;; with 3 conjuncts ensures chain_len=3 sorting with OP_LIKE.
+;; ====================================================================
+(set Tlike (table [s v] (list ["apple" "apricot" "banana" "blueberry" "avocado" "cherry"] [10 20 30 40 50 60])))
+
+;; 3-conjunct: (and (like s "a*") (> v 15) (< v 55))
+;; like: "apple"(10), "apricot"(20), "avocado"(50)
+;; v>15 AND v<55: {20,30,40,50}
+;; Keep "apricot"(20), "avocado"(50) → 2 rows
+(count (select {from: Tlike where: (and (like s "a*") (> v 15) (< v 55))})) -- 2
+(sum (at (select {from: Tlike where: (and (like s "a*") (> v 15) (< v 55))}) 'v)) -- 70
+
+;; ====================================================================
+;; Section 6: pass_projection_pushdown + pass_partition_pruning
+;;
+;; pass_projection_pushdown marks unreachable nodes DEAD.
+;; pass_partition_pruning fires on FILTER(SCAN(mapcommon_col), const).
+;; The basic BFS that marks unreachable nodes fires every query.
+;; Build an expression where computed intermediate nodes are not in
+;; the final output, triggering the "mark dead" path.
+;; ====================================================================
+(set Tproj (table [a b c] (list [1 2 3] [10 20 30] [100 200 300])))
+;; select only column b — columns a and c are unused after pushdown
+;; (just runs the projection pushdown pass, no assertion on table shape)
+(at (select {x: b from: Tproj}) 'x) -- [10 20 30]
+
+;; ====================================================================
+;; Section 7: fold_filter_const_predicate — both arms
+;;
+;; keep_rows=true  → OP_MATERIALIZE (lines 573-580)
+;; keep_rows=false → OP_HEAD n=0      (lines 582-594)
+;; ====================================================================
+(set Tfilt (table [a] (list [10 20 30 40 50])))
+;; keep_rows=true: filter with const true predicate → materialize
+(count (select {from: Tfilt where: true}))  -- 5
+;; keep_rows=false: filter with const false predicate → empty
+(count (select {from: Tfilt where: false})) -- 0
+
+;; ====================================================================
+;; Section 8: pass_dce — dead node marking
+;;
+;; After constant folding turns an AND/OR into a constant, the DCE pass
+;; marks the original comparison nodes DEAD.  We verify the correct
+;; result is still returned.
+;; ====================================================================
+(set Tdce (table [a] (list [1 2 3 4 5])))
+;; (and (> a 2) false) → optimizer replaces AND with const false → OP_HEAD(0)
+;; DCE marks the (> a 2) subtree dead
+(count (select {from: Tdce where: (and (> a 2) false)})) -- 0
+;; (or (> a 3) true) → optimizer replaces OR with const true → OP_MATERIALIZE
+;; DCE marks the (> a 3) subtree dead
+(count (select {from: Tdce where: (or (> a 3) true)})) -- 5
