@@ -1,0 +1,56 @@
+;; Regression: (as 'NARROW expr) inside select{}.
+;;
+;; Before fix: DAG OP_CAST with narrow output type (I32/I16/U8) was
+;; silently broken — fused expr_exec_unary had no dt=I32/I16/U8 branch
+;; (scratch stayed uninitialised → memcpy copied garbage to result),
+;; and exec_elementwise_unary handled only widening (narrow→I64/F64)
+;; with no in_type=I64/F64 → narrow_out case.  Result: zeros (or
+;; garbage if the non-fused path was reached).
+;;
+;; After fix: both paths handle I64/F64 → I32/I16/U8/BOOL narrowing
+;; via truncating cast (BOOL uses truthy semantics, not low-byte
+;; truncation).
+
+(set T (table [s] (list ["x"])))
+
+;; ── const → narrow ───────────────────────────────────────────────
+(at (at (select {x: (as 'I32 5)   from: T}) 'x) 0)  -- 5
+(at (at (select {x: (as 'I32 99)  from: T}) 'x) 0)  -- 99
+(at (at (select {x: (as 'I32 -42) from: T}) 'x) 0)  -- -42
+(at (at (select {x: (as 'I16 5)   from: T}) 'x) 0)  -- 5
+(at (at (select {x: (as 'I16 -42) from: T}) 'x) 0)  -- -42
+(at (at (select {x: (as 'U8  5)   from: T}) 'x) 0)  -- 0x05
+(at (at (select {x: (as 'U8  255) from: T}) 'x) 0)  -- 0xFF
+
+;; ── BOOL — truthy, not low-byte truncation ──────────────────────
+(at (at (select {x: (as 'BOOL 0) from: T}) 'x) 0)  -- false
+(at (at (select {x: (as 'BOOL 1) from: T}) 'x) 0)  -- true
+(at (at (select {x: (as 'BOOL 7) from: T}) 'x) 0)  -- true
+;; 256 is non-zero — truthy.  Low byte = 0, but BOOL cast uses
+;; truthy semantics, so result is true (not 0).
+(at (at (select {x: (as 'BOOL 256) from: T}) 'x) 0)  -- true
+
+;; ── column → narrow (vector path) ───────────────────────────────
+(set Tc (table [v] (list [1 0 5 100000 0])))
+(set Rb (at (select {b: (as 'BOOL v) from: Tc}) 'b))
+(at Rb 0) -- true
+(at Rb 1) -- false
+(at Rb 2) -- true
+(at Rb 3) -- true
+(at Rb 4) -- false
+(set Ri (at (select {b: (as 'I32 v) from: Tc}) 'b))
+(at Ri 0) -- 1
+(at Ri 1) -- 0
+(at Ri 2) -- 5
+(at Ri 3) -- 100000
+(at Ri 4) -- 0
+
+;; ── F64 → narrow (truncation) ───────────────────────────────────
+(at (at (select {x: (as 'I32 3.7)  from: T}) 'x) 0)  -- 3
+(at (at (select {x: (as 'I32 -2.5) from: T}) 'x) 0)  -- -2
+(at (at (select {x: (as 'BOOL 0.0) from: T}) 'x) 0)  -- false
+(at (at (select {x: (as 'BOOL 3.14) from: T}) 'x) 0)  -- true
+
+;; ── narrow → narrow (no-op same type) ───────────────────────────
+(set Tn (table [v] (list (as 'I32 [1 2 3]))))
+(at (at (select {x: (as 'I32 v) from: Tn}) 'x) 0) -- 1
