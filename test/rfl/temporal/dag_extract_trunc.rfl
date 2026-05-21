@@ -79,3 +79,74 @@
 (set TPre (table [d] (list (as 'DATE [1999.12.31 2000.01.01]))))
 (at (at (select {y: (year d) from: TPre}) 'y) 0)        -- 1999
 (at (at (select {y: (year d) from: TPre}) 'y) 1)        -- 2000
+
+;; ─────────── pre-epoch TIMESTAMP in DAG (EXTRACT_INNER negative ns) ──────────
+;; 1999-12-31T23:30:45 stored as negative ns relative to 2000-01-01.
+;; Exercises:
+;;   • EXTRACT_INNER line 383-384: ns < 0 → us = -(((-ns)+999)/1000)
+;;   • EXTRACT_INNER line 389-391: day_us < 0 for HOUR field
+;;   • EXTRACT_INNER line 393-395: day_us < 0 for MINUTE field
+;;   • EXTRACT_INNER line 397-399: day_us < 0 for SECOND field
+(set TpreTS (table [ts] (list [1999.12.31D23:30:45.000000000 1999.12.30D00:00:00.000000000])))
+(at (at (select {h: (hour ts) from: TpreTS}) 'h) 0)     -- 23
+(at (at (select {h: (hour ts) from: TpreTS}) 'h) 1)     -- 0
+(at (at (select {mi: (minute ts) from: TpreTS}) 'mi) 0) -- 30
+(at (at (select {s: (second ts) from: TpreTS}) 's) 0)   -- 45
+(at (at (select {y: (year ts) from: TpreTS}) 'y) 0)     -- 1999
+(at (at (select {m: (month ts) from: TpreTS}) 'm) 0)    -- 12
+
+;; ─────── leap year DOY in exec_extract (doy_jan++ branch, line 429) ──────────
+;; 2024 is a leap year.  Dates in months > 2 must add 1 to doy_jan.
+;; Exercises: EXTRACT_INNER line 429: mo > 2 && leap → doy_jan++
+(set TleapTS (table [ts] (list [2024.02.29D12:00:00.000000000 2024.03.01D00:00:00.000000000 2024.12.31D00:00:00.000000000])))
+(at (at (select {dy: (dayofyear ts) from: TleapTS}) 'dy) 0) -- 60
+(at (at (select {dy: (dayofyear ts) from: TleapTS}) 'dy) 1) -- 61
+(at (at (select {dy: (dayofyear ts) from: TleapTS}) 'dy) 2) -- 366
+
+;; ─────── DATE+HAS_NULLS with dd/dw/dy/minute (EXTRACT_INNER(1,1)) ────────────
+;; DATE column bearing a null slot.  IN32=1, HAS_NULLS=1 dispatch (line 450).
+;; Previously tested only with year/month/hour/second; here we extend to
+;; day / dayofweek / dayofyear / minute to cover remaining EXTRACT_INNER arms.
+;; 8766 = 2024-01-01 (Mon=1), 8767 = 2024-01-02.
+(set TDn2 (table [d] (list (as 'DATE [8766 0N 8767]))))
+(at (at (select {dd: (day d) from: TDn2}) 'dd) 0)           -- 1
+(at (at (select {dd: (day d) from: TDn2}) 'dd) 1)           -- 0Nl
+(at (at (select {dw: (dayofweek d) from: TDn2}) 'dw) 0)     -- 1
+(at (at (select {dw: (dayofweek d) from: TDn2}) 'dw) 1)     -- 0Nl
+(at (at (select {dy: (dayofyear d) from: TDn2}) 'dy) 0)     -- 1
+(at (at (select {dy: (dayofyear d) from: TDn2}) 'dy) 1)     -- 0Nl
+(at (at (select {mi: (minute d) from: TDn2}) 'mi) 0)        -- 0
+(at (at (select {mi: (minute d) from: TDn2}) 'mi) 1)        -- 0Nl
+
+;; TIME+HAS_NULLS with dd/dw/dy/minute — IN32=1, HAS_NULLS=1, in_type=RAY_TIME.
+;; 3723000 ms = 01:02:03.000 (epoch day → day=1 dow=6 doy=1 from time zero).
+(set TTn2 (table [t] (list (as 'TIME [3723000 0N 86399000]))))
+(at (at (select {dd: (day t) from: TTn2}) 'dd) 0)           -- 1
+(at (at (select {dd: (day t) from: TTn2}) 'dd) 1)           -- 0Nl
+(at (at (select {dw: (dayofweek t) from: TTn2}) 'dw) 0)     -- 6
+(at (at (select {dw: (dayofweek t) from: TTn2}) 'dw) 1)     -- 0Nl
+(at (at (select {dy: (dayofyear t) from: TTn2}) 'dy) 0)     -- 1
+(at (at (select {dy: (dayofyear t) from: TTn2}) 'dy) 1)     -- 0Nl
+(at (at (select {mi: (minute t) from: TTn2}) 'mi) 0)        -- 2
+(at (at (select {mi: (minute t) from: TTn2}) 'mi) 1)        -- 0Nl
+
+;; ─────── Dotted paths: ray_temporal_field_from_sym dd/minute/dow/doy ────────
+;; When a temporal column is accessed via col.dd / col.minute / col.dow /
+;; col.doy the query compiler calls ray_temporal_field_from_sym to resolve
+;; the field code.  The previous coverage only exercised yyyy/mm/hh/ss.
+(set Tdot (table [d] (list [2024.03.15 2024.07.04 2000.01.01])))
+(at (at (select {v: d.dd from: Tdot}) 'v) 0)               -- 15
+(at (at (select {v: d.dd from: Tdot}) 'v) 1)               -- 4
+(at (at (select {v: d.minute from: Tdot}) 'v) 0)           -- 0
+(at (at (select {v: d.dow from: Tdot}) 'v) 0)              -- 5
+(at (at (select {v: d.dow from: Tdot}) 'v) 2)              -- 6
+(at (at (select {v: d.doy from: Tdot}) 'v) 0)              -- 75
+(at (at (select {v: d.doy from: Tdot}) 'v) 1)              -- 186
+
+;; ─────── Pre-epoch TIMESTAMP in exec_date_trunc: r < 0 branch ────────────
+;; Negative us modulo bucket gives r < 0 → out_us = us - r - bucket
+;; (DATE_TRUNC_INNER line 555 for DAY bucket, line 540 for SECOND bucket).
+(set TpreT2 (table [ts] (list [1999.12.31D12:30:45.000000000 1999.12.31D00:00:00.000000000])))
+(at (at (select {s: ts.date from: TpreT2}) 's) 0)          -- 1999.12.31D00:00:00.000000000
+(at (at (select {s: ts.date from: TpreT2}) 's) 1)          -- 1999.12.31D00:00:00.000000000
+(at (at (select {s: ts.time from: TpreT2}) 's) 0)          -- 1999.12.31D12:30:45.000000000
