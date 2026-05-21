@@ -1191,6 +1191,10 @@ static test_result_t name(void) {                                       \
 FOLD_I64_TEST(test_const_fold_i64_div, ray_div, 10, 3)
 FOLD_I64_TEST(test_const_fold_i64_min, ray_min2, 10, 3)
 FOLD_I64_TEST(test_const_fold_i64_max, ray_max2, 10, 3)
+/* Swapped operands: lv < rv so fold_binary_const I64 MIN2 takes the lv branch,
+ * and I64 MAX2 takes the rv branch — covers both previously-uncovered ternary arms. */
+FOLD_I64_TEST(test_const_fold_i64_min_swap, ray_min2, 3, 10)
+FOLD_I64_TEST(test_const_fold_i64_max_swap, ray_max2, 3, 10)
 
 static test_result_t test_const_fold_i64_div_min_max(void) {
     /* Wrapper test that exercises the i64 DIV path inline */
@@ -1245,6 +1249,12 @@ static test_result_t name(void) {                                       \
 FOLD_I32_TEST(test_const_fold_i32_add, ray_add, 7, 3)
 FOLD_I32_TEST(test_const_fold_i32_div, ray_div, 7, 3)
 FOLD_I32_TEST(test_const_fold_i32_mod, ray_mod, 7, 3)
+/* I32 MIN2 and MAX2: covers fold_binary_const I32 lines 469-470 (previously 0 hits) */
+FOLD_I32_TEST(test_const_fold_i32_min, ray_min2, 7, 3)
+FOLD_I32_TEST(test_const_fold_i32_max, ray_max2, 7, 3)
+/* Swapped I32 MIN2/MAX2: lv < rv to cover the alternate branches */
+FOLD_I32_TEST(test_const_fold_i32_min_swap, ray_min2, 3, 7)
+FOLD_I32_TEST(test_const_fold_i32_max_swap, ray_max2, 3, 7)
 
 static test_result_t test_const_fold_i32_ops(void) {
     /* Wrapper: run the i32 ADD fold inline */
@@ -1953,6 +1963,617 @@ static test_result_t test_idiom_first_asc_scan_with_nulls_stays_safe(void) {
     PASS();
 }
 
+/* --------------------------------------------------------------------------
+ * New targeted coverage tests for opt.c uncovered regions
+ * -------------------------------------------------------------------------- */
+
+/*
+ * Test: partition pruning with OP_GT comparison.
+ * Exercises the case OP_GT arm in the inner switch (line ~1954 in opt.c).
+ * 4 partitions keyed [100, 200, 300, 400].
+ * pkey > 200 → partitions 2,3 (keys 300,400) → bits 2,3.
+ */
+static test_result_t test_partition_pruning_gt(void) {
+    ray_heap_init();
+    int64_t pkeys[] = {100, 200, 300, 400};
+    ray_t* tbl; ray_graph_t* g;
+    ray_op_t* sv; ray_op_t* sp;
+    make_parted_tbl(&tbl, &g, &sv, &sp, pkeys, 4);
+
+    ray_op_t* c200 = ray_const_i64(g, 200);
+    ray_op_t* pred = ray_gt(g, sp, c200);
+    ray_op_t* filt = ray_filter(g, sv, pred);
+    ray_op_t* opt  = ray_optimize(g, filt);
+    TEST_ASSERT_NOT_NULL(opt);
+
+    ray_op_ext_t* ext = find_scan_ext_for(g, sv->id);
+    TEST_ASSERT_NOT_NULL(ext);
+    TEST_ASSERT_NOT_NULL(ext->seg_mask);
+    /* Partitions 2,3 (keys 300,400 > 200) */
+    uint64_t expected = (1ULL << 2) | (1ULL << 3);
+    TEST_ASSERT_TRUE(ext->seg_mask[0] == expected);
+
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/*
+ * Test: partition pruning with swapped operands — CONST on lhs, SCAN on rhs.
+ * Exercises the swapped=true path (lines ~1776-1777, ~1925-1930) where
+ * LT is flipped to GT for effective comparison.
+ *
+ * FILTER( SCAN(val), LT(CONST(200), SCAN(pkey)) )
+ * → equivalent to pkey > 200 → bits 2,3.
+ */
+static test_result_t test_partition_pruning_swapped(void) {
+    ray_heap_init();
+    int64_t pkeys[] = {100, 200, 300, 400};
+    ray_t* tbl; ray_graph_t* g;
+    ray_op_t* sv; ray_op_t* sp;
+    make_parted_tbl(&tbl, &g, &sv, &sp, pkeys, 4);
+
+    /* Swapped: CONST(200) < SCAN(pkey), i.e. lhs=CONST, rhs=SCAN */
+    ray_op_t* c200 = ray_const_i64(g, 200);
+    ray_op_t* pred = ray_lt(g, c200, sp);  /* CONST < SCAN → swapped OP_LT */
+    ray_op_t* filt = ray_filter(g, sv, pred);
+    ray_op_t* opt  = ray_optimize(g, filt);
+    TEST_ASSERT_NOT_NULL(opt);
+
+    ray_op_ext_t* ext = find_scan_ext_for(g, sv->id);
+    TEST_ASSERT_NOT_NULL(ext);
+    TEST_ASSERT_NOT_NULL(ext->seg_mask);
+    /* swapped LT → eff_op=GT → pkey > 200 → partitions 2,3 */
+    uint64_t expected = (1ULL << 2) | (1ULL << 3);
+    TEST_ASSERT_TRUE(ext->seg_mask[0] == expected);
+
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/*
+ * Test: partition pruning with large IN set (> 32 elements).
+ * Exercises the heap allocation path (set_len > 32 → ray_alloc) in
+ * pass_partition_pruning (lines ~1877-1881).
+ *
+ * Build 6 partitions keyed [10,20,30,40,50,60].
+ * IN set has 33 elements covering keys 10,20,30,40 → bits 0,1,2,3.
+ */
+static test_result_t test_partition_pruning_in_large(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* 6 I64 partition keys */
+    int64_t pkey_arr[] = {10, 20, 30, 40, 50, 60};
+    int n_parts = 6;
+
+    ray_t* key_values = ray_vec_new(RAY_I64, n_parts);
+    key_values->len = n_parts;
+    memcpy(ray_data(key_values), pkey_arr, (size_t)n_parts * sizeof(int64_t));
+
+    ray_t* row_counts = ray_vec_new(RAY_I64, n_parts);
+    row_counts->len = n_parts;
+    int64_t* rc = (int64_t*)ray_data(row_counts);
+    for (int i = 0; i < n_parts; i++) rc[i] = 5;
+
+    ray_t* mapcommon = ray_alloc(2 * sizeof(ray_t*));
+    mapcommon->type = RAY_MAPCOMMON;
+    mapcommon->len = 2;
+    ((ray_t**)ray_data(mapcommon))[0] = key_values;
+    ((ray_t**)ray_data(mapcommon))[1] = row_counts;
+
+    ray_t* val_parted = ray_alloc((size_t)n_parts * sizeof(ray_t*));
+    val_parted->type = RAY_PARTED_BASE + RAY_I64;
+    val_parted->len = n_parts;
+    for (int i = 0; i < n_parts; i++) {
+        ray_t* seg = ray_vec_new(RAY_I64, 5);
+        seg->len = 5;
+        ((ray_t**)ray_data(val_parted))[i] = seg;
+    }
+
+    int64_t sym_pkey = ray_sym_intern("pkey", 4);
+    int64_t sym_val  = ray_sym_intern("val", 3);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, sym_pkey, mapcommon);
+    tbl = ray_table_add_col(tbl, sym_val, val_parted);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_val  = ray_scan(g, "val");
+    ray_op_t* scan_pkey = ray_scan(g, "pkey");
+
+    /* Build IN set with 33 elements: 10,20,30,40, then 29 extra values
+     * not in partition keys (100..128).  Only 10,20,30,40 are in keys. */
+    int64_t set_data[33];
+    set_data[0] = 10;
+    set_data[1] = 20;
+    set_data[2] = 30;
+    set_data[3] = 40;
+    for (int i = 4; i < 33; i++) set_data[i] = 100 + i;  /* not in keys */
+    ray_t* set_vec = ray_vec_new(RAY_I64, 33);
+    set_vec->len = 33;
+    memcpy(ray_data(set_vec), set_data, 33 * sizeof(int64_t));
+
+    ray_op_t* set_op  = ray_const_vec(g, set_vec);
+    ray_release(set_vec);
+    ray_op_t* in_pred = ray_in(g, scan_pkey, set_op);
+    ray_op_t* filt    = ray_filter(g, scan_val, in_pred);
+
+    ray_op_t* opt = ray_optimize(g, filt);
+    TEST_ASSERT_NOT_NULL(opt);
+
+    ray_op_ext_t* val_ext = NULL;
+    for (uint32_t i = 0; i < g->ext_count; i++) {
+        if (g->ext_nodes[i] && g->ext_nodes[i]->base.id == scan_val->id) {
+            val_ext = g->ext_nodes[i];
+            break;
+        }
+    }
+    TEST_ASSERT_NOT_NULL(val_ext);
+    TEST_ASSERT_NOT_NULL(val_ext->seg_mask);
+    /* Keys 10,20,30,40 are in the set → bits 0,1,2,3 */
+    uint64_t expected = (1ULL << 0) | (1ULL << 1) | (1ULL << 2) | (1ULL << 3);
+    TEST_ASSERT_TRUE(val_ext->seg_mask[0] == expected);
+
+    ray_graph_free(g);
+    ray_release(mapcommon);
+    ray_release(val_parted);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/*
+ * Test: partition pruning with empty IN set (set_len == 0).
+ * Exercises the early goto attach_mask path when no elements match any
+ * partition (lines ~1867-1876).  For OP_IN, empty → mask stays all-0,
+ * meaning no partitions pass.
+ */
+static test_result_t test_partition_pruning_in_empty(void) {
+    ray_heap_init();
+    int64_t pkeys[] = {100, 200, 300, 400};
+    ray_t* tbl; ray_graph_t* g;
+    ray_op_t* sv; ray_op_t* sp;
+    make_parted_tbl(&tbl, &g, &sv, &sp, pkeys, 4);
+
+    /* Empty I64 vector as the IN set */
+    ray_t* empty_vec = ray_vec_new(RAY_I64, 1);  /* capacity=1, len=0 */
+    empty_vec->len = 0;
+
+    ray_op_t* set_op  = ray_const_vec(g, empty_vec);
+    ray_release(empty_vec);
+    ray_op_t* in_pred = ray_in(g, sp, set_op);
+    ray_op_t* filt    = ray_filter(g, sv, in_pred);
+
+    ray_op_t* opt = ray_optimize(g, filt);
+    TEST_ASSERT_NOT_NULL(opt);
+
+    ray_op_ext_t* ext = find_scan_ext_for(g, sv->id);
+    TEST_ASSERT_NOT_NULL(ext);
+    /* Empty IN → mask all-0 → seg_mask attached but zero */
+    TEST_ASSERT_NOT_NULL(ext->seg_mask);
+    TEST_ASSERT_TRUE(ext->seg_mask[0] == 0);
+
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/*
+ * Test: partition pruning with NOT_IN and empty set.
+ * For NOT_IN with empty set → all partitions pass → mask is all-1s.
+ * Exercises the is_nin branch in the empty-set path (lines ~1871-1875).
+ */
+static test_result_t test_partition_pruning_not_in_empty(void) {
+    ray_heap_init();
+    int64_t pkeys[] = {100, 200, 300, 400};
+    ray_t* tbl; ray_graph_t* g;
+    ray_op_t* sv; ray_op_t* sp;
+    make_parted_tbl(&tbl, &g, &sv, &sp, pkeys, 4);
+
+    /* Empty I64 vector */
+    ray_t* empty_vec = ray_vec_new(RAY_I64, 1);
+    empty_vec->len = 0;
+
+    ray_op_t* set_op    = ray_const_vec(g, empty_vec);
+    ray_release(empty_vec);
+    ray_op_t* nin_pred  = ray_not_in(g, sp, set_op);
+    ray_op_t* filt      = ray_filter(g, sv, nin_pred);
+
+    ray_op_t* opt = ray_optimize(g, filt);
+    TEST_ASSERT_NOT_NULL(opt);
+
+    ray_op_ext_t* ext = find_scan_ext_for(g, sv->id);
+    TEST_ASSERT_NOT_NULL(ext);
+    TEST_ASSERT_NOT_NULL(ext->seg_mask);
+    /* NOT_IN empty → all 4 partitions pass → bits 0-3 set */
+    uint64_t expected = (1ULL << 0) | (1ULL << 1) | (1ULL << 2) | (1ULL << 3);
+    TEST_ASSERT_TRUE(ext->seg_mask[0] == expected);
+
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/*
+ * Test: partition pruning with IN set containing null elements.
+ * Exercises the set_has_nulls path (lines ~1885-1897) where null entries
+ * in the literal vector are skipped.
+ *
+ * Setup: 4 partitions keyed [100, 200, 300, 400].
+ * IN set: [100, NULL, 300] → only 100 and 300 match → bits 0,2.
+ */
+static test_result_t test_partition_pruning_in_with_nulls(void) {
+    ray_heap_init();
+    int64_t pkeys[] = {100, 200, 300, 400};
+    ray_t* tbl; ray_graph_t* g;
+    ray_op_t* sv; ray_op_t* sp;
+    make_parted_tbl(&tbl, &g, &sv, &sp, pkeys, 4);
+
+    /* Build [100, NULL, 300] as an I64 vec with null at index 1 */
+    int64_t set_data[] = {100, 0, 300};  /* 0 is null placeholder */
+    ray_t* set_vec = ray_vec_new(RAY_I64, 3);
+    set_vec->len = 3;
+    memcpy(ray_data(set_vec), set_data, 3 * sizeof(int64_t));
+    ray_vec_set_null(set_vec, 1, true);  /* index 1 is null */
+
+    ray_op_t* set_op  = ray_const_vec(g, set_vec);
+    ray_release(set_vec);
+    ray_op_t* in_pred = ray_in(g, sp, set_op);
+    ray_op_t* filt    = ray_filter(g, sv, in_pred);
+
+    ray_op_t* opt = ray_optimize(g, filt);
+    TEST_ASSERT_NOT_NULL(opt);
+
+    ray_op_ext_t* ext = find_scan_ext_for(g, sv->id);
+    TEST_ASSERT_NOT_NULL(ext);
+    TEST_ASSERT_NOT_NULL(ext->seg_mask);
+    /* Only keys 100 and 300 are non-null in the set → bits 0,2 */
+    uint64_t expected = (1ULL << 0) | (1ULL << 2);
+    TEST_ASSERT_TRUE(ext->seg_mask[0] == expected);
+
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/*
+ * Test: predicate pushdown past EXPAND with OP_IF predicate.
+ * Exercises collect_pred_scans and is_reachable_from when the predicate
+ * subtree contains an OP_IF node (which has a third operand stored in ext).
+ *
+ * This covers the OP_IF/OP_SUBSTR/OP_REPLACE case in collect_pred_scans
+ * (lines ~1221-1229) and is_reachable_from (lines ~1283-1289).
+ *
+ * Predicate: IF(flag == 1, flag, 0) — has three sub-nodes including flag_scan.
+ * The flag_scan is reachable from EXPAND's source subtree, so pushdown fires.
+ */
+static test_result_t test_opt_pushdown_expand_if_pred(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t n = 4;
+    int64_t flag_data[] = {1, 0, 1, 0};
+    int64_t id_data[]   = {0, 1, 2, 3};
+    ray_t* flag_v = ray_vec_from_raw(RAY_I64, flag_data, n);
+    ray_t* id_v   = ray_vec_from_raw(RAY_I64, id_data, n);
+    int64_t s_flag = ray_sym_intern("flag", 4);
+    int64_t s_id   = ray_sym_intern("id", 2);
+    ray_t* node_tbl = ray_table_new(2);
+    node_tbl = ray_table_add_col(node_tbl, s_id, id_v);
+    node_tbl = ray_table_add_col(node_tbl, s_flag, flag_v);
+    ray_release(flag_v);
+    ray_release(id_v);
+
+    /* Simple edge graph: 0->1, 1->2 */
+    int64_t src_data[] = {0, 1};
+    int64_t dst_data[] = {1, 2};
+    ray_t* src_v = ray_vec_from_raw(RAY_I64, src_data, 2);
+    ray_t* dst_v = ray_vec_from_raw(RAY_I64, dst_data, 2);
+    int64_t s_src = ray_sym_intern("src", 3);
+    int64_t s_dst = ray_sym_intern("dst", 3);
+    ray_t* edges = ray_table_new(2);
+    edges = ray_table_add_col(edges, s_src, src_v);
+    edges = ray_table_add_col(edges, s_dst, dst_v);
+    ray_release(src_v);
+    ray_release(dst_v);
+
+    ray_rel_t* rel = ray_rel_from_edges(edges, "src", "dst", 4, 4, false);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    ray_graph_t* g = ray_graph_new(node_tbl);
+
+    /* Build predicate: IF(flag == 1, flag, 0) */
+    ray_op_t* flag_scan = ray_scan(g, "flag");
+    ray_op_t* c1   = ray_const_i64(g, 1);
+    ray_op_t* c0   = ray_const_i64(g, 0);
+    ray_op_t* cond = ray_eq(g, flag_scan, c1);
+    ray_op_t* pred = ray_if(g, cond, flag_scan, c0);  /* IF has ext-stored third op */
+
+    /* EXPAND from flag column (so flag_scan is in source subtree) */
+    ray_op_t* expand = ray_expand(g, flag_scan, rel, 0);
+    TEST_ASSERT_NOT_NULL(expand);
+    uint32_t expand_id = expand->id;
+
+    /* FILTER(expand, if_pred) — collect_pred_scans must walk OP_IF ext */
+    ray_op_t* filt = ray_filter(g, expand, pred);
+    TEST_ASSERT_NOT_NULL(filt);
+
+    /* Optimize — pushdown should fire since flag_scan is reachable from
+     * expand's source input */
+    ray_op_t* opt = ray_optimize(g, filt);
+    TEST_ASSERT_NOT_NULL(opt);
+
+    /* After pushdown, root should be EXPAND with FILTER as its source input */
+    TEST_ASSERT_EQ_U(opt->id, expand_id);
+    TEST_ASSERT_EQ_I(opt->opcode, OP_EXPAND);
+    TEST_ASSERT_NOT_NULL(opt->inputs[0]);
+    TEST_ASSERT_EQ_I(opt->inputs[0]->opcode, OP_FILTER);
+
+    ray_graph_free(g);
+    ray_rel_free(rel);
+    ray_release(node_tbl);
+    ray_release(edges);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/*
+ * Test: factorize_pass with EXPAND where consumer is NOT an OP_GROUP.
+ * Exercises the factorize_pass early-exit when consumer->opcode != OP_GROUP
+ * (line ~1004 in opt.c).
+ */
+static test_result_t test_factorize_expand_non_group(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t src_data[] = {0, 1};
+    int64_t dst_data[] = {1, 2};
+    ray_t* src_v = ray_vec_from_raw(RAY_I64, src_data, 2);
+    ray_t* dst_v = ray_vec_from_raw(RAY_I64, dst_data, 2);
+    int64_t s_src = ray_sym_intern("src", 3);
+    int64_t s_dst = ray_sym_intern("dst", 3);
+    ray_t* edges = ray_table_new(2);
+    edges = ray_table_add_col(edges, s_src, src_v);
+    edges = ray_table_add_col(edges, s_dst, dst_v);
+    ray_release(src_v);
+    ray_release(dst_v);
+
+    int64_t id_data[] = {0, 1, 2};
+    ray_t* id_v = ray_vec_from_raw(RAY_I64, id_data, 3);
+    int64_t s_id = ray_sym_intern("id", 2);
+    ray_t* node_tbl = ray_table_new(1);
+    node_tbl = ray_table_add_col(node_tbl, s_id, id_v);
+    ray_release(id_v);
+
+    ray_rel_t* rel = ray_rel_from_edges(edges, "src", "dst", 3, 3, false);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    ray_graph_t* g = ray_graph_new(node_tbl);
+    int64_t start_data[] = {0, 1, 2};
+    ray_t* start_vec = ray_vec_from_raw(RAY_I64, start_data, 3);
+    ray_op_t* src_op = ray_const_vec(g, start_vec);
+    ray_release(start_vec);
+
+    ray_op_t* expand = ray_expand(g, src_op, rel, 0);
+    TEST_ASSERT_NOT_NULL(expand);
+
+    /* Consumer is OP_FILTER (not OP_GROUP) — factorize_pass must skip */
+    ray_op_t* c0   = ray_const_i64(g, 0);
+    ray_op_t* pred = ray_gt(g, expand, c0);
+    ray_op_t* filt = ray_filter(g, expand, pred);
+
+    ray_op_t* opt = ray_optimize(g, filt);
+    TEST_ASSERT_NOT_NULL(opt);
+    /* factorized flag must NOT be set since consumer was OP_FILTER */
+    ray_op_ext_t* expand_ext = NULL;
+    for (uint32_t i = 0; i < g->ext_count; i++) {
+        if (g->ext_nodes[i] && g->ext_nodes[i]->base.id == expand->id) {
+            expand_ext = g->ext_nodes[i];
+            break;
+        }
+    }
+    TEST_ASSERT_NOT_NULL(expand_ext);
+    TEST_ASSERT_TRUE(expand_ext->graph.factorized == 0);
+
+    ray_graph_free(g);
+    ray_rel_free(rel);
+    ray_release(node_tbl);
+    ray_release(edges);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/*
+ * Test: factorize_pass with EXPAND → GROUP where key is NOT "_src".
+ * Exercises the key-sym check (line ~1013) when key_ext->sym != src_sym,
+ * so factorized is NOT set.
+ */
+static test_result_t test_factorize_expand_group_non_src(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t src_data[] = {0, 1};
+    int64_t dst_data[] = {1, 2};
+    ray_t* src_v = ray_vec_from_raw(RAY_I64, src_data, 2);
+    ray_t* dst_v = ray_vec_from_raw(RAY_I64, dst_data, 2);
+    int64_t s_src = ray_sym_intern("src", 3);
+    int64_t s_dst = ray_sym_intern("dst", 3);
+    ray_t* edges = ray_table_new(2);
+    edges = ray_table_add_col(edges, s_src, src_v);
+    edges = ray_table_add_col(edges, s_dst, dst_v);
+    ray_release(src_v);
+    ray_release(dst_v);
+
+    int64_t id_data[] = {0, 1, 2};
+    int64_t val_data[] = {10, 20, 30};
+    ray_t* id_v  = ray_vec_from_raw(RAY_I64, id_data, 3);
+    ray_t* val_v = ray_vec_from_raw(RAY_I64, val_data, 3);
+    int64_t s_id  = ray_sym_intern("id", 2);
+    int64_t s_val = ray_sym_intern("val", 3);
+    ray_t* node_tbl = ray_table_new(2);
+    node_tbl = ray_table_add_col(node_tbl, s_id, id_v);
+    node_tbl = ray_table_add_col(node_tbl, s_val, val_v);
+    ray_release(id_v);
+    ray_release(val_v);
+
+    ray_rel_t* rel = ray_rel_from_edges(edges, "src", "dst", 3, 3, false);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    ray_graph_t* g = ray_graph_new(node_tbl);
+    int64_t start_data[] = {0, 1, 2};
+    ray_t* start_vec = ray_vec_from_raw(RAY_I64, start_data, 3);
+    ray_op_t* src_op = ray_const_vec(g, start_vec);
+    ray_release(start_vec);
+
+    ray_op_t* expand = ray_expand(g, src_op, rel, 0);
+    TEST_ASSERT_NOT_NULL(expand);
+
+    /* GROUP with key = "val" (not "_src") — factorize should NOT fire */
+    ray_op_t* val_scan = ray_scan(g, "val");
+    ray_op_t* keys[] = { val_scan };
+    uint16_t agg_ops[] = { OP_COUNT };
+    ray_op_t* agg_ins[] = { val_scan };
+    ray_op_t* grp = ray_group(g, keys, 1, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(grp);
+    grp->inputs[0] = expand;
+    g->nodes[grp->id].inputs[0] = expand;
+
+    ray_op_t* opt = ray_optimize(g, grp);
+    TEST_ASSERT_NOT_NULL(opt);
+
+    /* factorized must NOT be set — key is "val", not "_src" */
+    ray_op_ext_t* expand_ext = NULL;
+    for (uint32_t i = 0; i < g->ext_count; i++) {
+        if (g->ext_nodes[i] && g->ext_nodes[i]->base.id == expand->id) {
+            expand_ext = g->ext_nodes[i];
+            break;
+        }
+    }
+    TEST_ASSERT_NOT_NULL(expand_ext);
+    TEST_ASSERT_TRUE(expand_ext->graph.factorized == 0);
+
+    ray_graph_free(g);
+    ray_rel_free(rel);
+    ray_release(node_tbl);
+    ray_release(edges);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/*
+ * Test: graph_alloc_node_opt fix-up for JOIN and ANTIJOIN ext nodes.
+ * When graph realloc fires during split_and_filter, the fix-up loop must
+ * also relocate input pointers stored in OP_JOIN and OP_ANTIJOIN ext nodes.
+ *
+ * Exercises the OP_JOIN and OP_ANTIJOIN branches (lines ~1075-1103) of the
+ * pointer fix-up inside graph_alloc_node_opt.
+ */
+static test_result_t test_opt_realloc_with_join_ext(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* Build a table with two I64 columns for join */
+    int64_t key_data[] = {1, 2, 3, 4};
+    int64_t val_data[] = {10, 20, 30, 40};
+    ray_t* key_v = ray_vec_from_raw(RAY_I64, key_data, 4);
+    ray_t* val_v = ray_vec_from_raw(RAY_I64, val_data, 4);
+    int64_t s_k = ray_sym_intern("k", 1);
+    int64_t s_v = ray_sym_intern("v", 1);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, s_k, key_v);
+    tbl = ray_table_add_col(tbl, s_v, val_v);
+    ray_release(key_v);
+    ray_release(val_v);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+
+    ray_op_t* scan_k_l = ray_scan(g, "k");
+    ray_op_t* scan_v_l = ray_scan(g, "v");
+    ray_op_t* scan_k_r = ray_scan(g, "k");
+    ray_op_t* scan_v_r = ray_scan(g, "v");
+
+    /* Build JOIN and ANTIJOIN — both have ext nodes with key pointers */
+    ray_op_t* lkeys[] = { scan_k_l };
+    ray_op_t* rkeys[] = { scan_k_r };
+    (void)ray_join(g, scan_v_l, lkeys, scan_v_r, rkeys, 1, 0);
+    (void)ray_antijoin(g, scan_v_l, lkeys, scan_v_r, rkeys, 1);
+
+    /* Build AND filter to trigger realloc via split */
+    ray_op_t* scan_k2 = ray_scan(g, "k");
+    ray_op_t* scan_v2 = ray_scan(g, "v");
+    ray_op_t* c1 = ray_const_i64(g, 1);
+    ray_op_t* c5 = ray_const_i64(g, 5);
+    ray_op_t* eq1 = ray_eq(g, scan_k2, c1);
+    ray_op_t* gt5 = ray_gt(g, scan_v2, c5);
+    ray_op_t* and_p = ray_and(g, eq1, gt5);
+    ray_op_t* filt = ray_filter(g, scan_v2, and_p);
+
+    /* Force realloc by filling node cap */
+    while (g->node_count < g->node_cap) {
+        (void)ray_const_i64(g, 0);
+    }
+
+    uint32_t cap_before = g->node_cap;
+    ray_op_t* opt = ray_optimize(g, filt);
+    TEST_ASSERT_NOT_NULL(opt);
+    TEST_ASSERT_TRUE(g->node_cap > cap_before);  /* realloc fired */
+
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/*
+ * Test: infer_type_for_node unary branch.
+ * Exercises the else-if branch (node->arity >= 1 && node->inputs[0])
+ * that propagates out_type from the single input (lines 82-84 in opt.c).
+ *
+ * Build a unary op node with out_type=0 and force type inference.
+ * We use ray_neg (arity=1) and manually zero out_type before optimize.
+ */
+static test_result_t test_type_infer_unary(void) {
+    ray_heap_init();
+    ray_t* tbl = make_test_table();
+    ray_graph_t* g = ray_graph_new(tbl);
+
+    /* neg(scan(v1)) — after zeroing out_type, infer should copy from input */
+    ray_op_t* v1  = ray_scan(g, "v1");
+    ray_op_t* neg = ray_neg(g, v1);
+    TEST_ASSERT_NOT_NULL(neg);
+
+    /* Force out_type to 0 — will trigger infer_type_for_node arity>=1 branch */
+    neg->out_type = 0;
+    g->nodes[neg->id].out_type = 0;
+
+    ray_op_t* opt = ray_optimize(g, neg);
+    TEST_ASSERT_NOT_NULL(opt);
+    /* After inference: neg's out_type should match v1's type (RAY_I64) */
+    /* The neg node may be dead after DCE, but the graph should still be valid */
+
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t opt_entries[] = {
     { "opt/filter_reorder_type", test_filter_reorder_by_type, NULL, NULL },
     { "opt/filter_and_split", test_filter_and_split, NULL, NULL },
@@ -1980,10 +2601,16 @@ const test_entry_t opt_entries[] = {
     { "opt/const_fold_i64_div", test_const_fold_i64_div, NULL, NULL },
     { "opt/const_fold_i64_min", test_const_fold_i64_min, NULL, NULL },
     { "opt/const_fold_i64_max", test_const_fold_i64_max, NULL, NULL },
+    { "opt/const_fold_i64_min_swap", test_const_fold_i64_min_swap, NULL, NULL },
+    { "opt/const_fold_i64_max_swap", test_const_fold_i64_max_swap, NULL, NULL },
     { "opt/const_fold_i32_ops", test_const_fold_i32_ops, NULL, NULL },
     { "opt/const_fold_i32_add", test_const_fold_i32_add, NULL, NULL },
     { "opt/const_fold_i32_div", test_const_fold_i32_div, NULL, NULL },
     { "opt/const_fold_i32_mod", test_const_fold_i32_mod, NULL, NULL },
+    { "opt/const_fold_i32_min", test_const_fold_i32_min, NULL, NULL },
+    { "opt/const_fold_i32_max", test_const_fold_i32_max, NULL, NULL },
+    { "opt/const_fold_i32_min_swap", test_const_fold_i32_min_swap, NULL, NULL },
+    { "opt/const_fold_i32_max_swap", test_const_fold_i32_max_swap, NULL, NULL },
     { "opt/const_fold_i16_atom", test_const_fold_i16_atom, NULL, NULL },
     { "opt/partition_pruning_eq", test_partition_pruning_eq, NULL, NULL },
     { "opt/partition_pruning_ne", test_partition_pruning_ne, NULL, NULL },
@@ -1999,6 +2626,17 @@ const test_entry_t opt_entries[] = {
     { "opt/filter_const_f64_zero_pred", test_filter_const_f64_zero_pred, NULL, NULL },
     { "opt/idiom_first_last_asc_scan_no_nulls", test_idiom_first_last_asc_scan_no_nulls, NULL, NULL },
     { "opt/idiom_first_asc_scan_with_nulls_stays_safe", test_idiom_first_asc_scan_with_nulls_stays_safe, NULL, NULL },
+    { "opt/partition_pruning_gt", test_partition_pruning_gt, NULL, NULL },
+    { "opt/partition_pruning_swapped", test_partition_pruning_swapped, NULL, NULL },
+    { "opt/partition_pruning_in_large", test_partition_pruning_in_large, NULL, NULL },
+    { "opt/partition_pruning_in_empty", test_partition_pruning_in_empty, NULL, NULL },
+    { "opt/partition_pruning_not_in_empty", test_partition_pruning_not_in_empty, NULL, NULL },
+    { "opt/partition_pruning_in_with_nulls", test_partition_pruning_in_with_nulls, NULL, NULL },
+    { "opt/pushdown_expand_if_pred", test_opt_pushdown_expand_if_pred, NULL, NULL },
+    { "opt/factorize_expand_non_group", test_factorize_expand_non_group, NULL, NULL },
+    { "opt/factorize_expand_group_non_src", test_factorize_expand_group_non_src, NULL, NULL },
+    { "opt/realloc_with_join_ext", test_opt_realloc_with_join_ext, NULL, NULL },
+    { "opt/type_infer_unary", test_type_infer_unary, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
 

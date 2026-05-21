@@ -1,0 +1,76 @@
+;; Affine-sum fast path and cache coverage.
+;; Exercises numeric_atom_i64 branches, affine_sum_cache_lookup hit, and
+;; try_sum_affine_expr various paths.
+
+;; ── basic I64: (sum (+ v c)) = sum(v) + c*len(v) ────────────────────────────
+(set v64 [1 2 3 4 5])
+(sum (+ v64 10)) -- 65
+(sum (+ 10 v64)) -- 65    ;; lhs-const path: e[1] is numeric → lines 191-192
+
+;; ── cache hit: nested (+ (sum (+ v c)) (sum (+ v c))) in one eval ───────────
+;; affine_sum_cache_clear is called only at eval_depth==0 (line 2880).
+;; Two (sum (+ v c)) inside a single outer expression share the same depth,
+;; so the second call finds the stored entry → lines 162-167 hit.
+(+ (sum (+ v64 10)) (sum (+ v64 10))) -- 130
+
+;; ── else branch: neither arg is a numeric atom → lines 196-198 ───────────────
+;; (+ va vb) has both e[1] and e[2] as SYM refs, not numeric atoms.
+(set va [4 5 6 7 8])
+(sum (+ v64 va)) -- 45    ;; triggers else → return NULL in try_sum_affine_expr
+
+;; ── F64 constant triggers f64 output ────────────────────────────────────────
+(sum (+ v64 1.0)) -- 20.0
+(sum (+ 1.0 v64)) -- 20.0
+
+;; ── I16 vector: exercises numeric_atom_i64 -RAY_I16 branch (line 143) ───────
+(set v16 [1h 2h 3h])
+(sum (+ v16 2h)) -- 12
+(sum (+ 2h v16)) -- 12
+(+ (sum (+ v16 2h)) (sum (+ v16 2h))) -- 24   ;; cache hit for I16 vec
+
+;; ── I32 constant: numeric_atom_i64 -RAY_I32 branch (line 139) ───────────────
+;; 1i is a RAY_I32 literal; numeric_atom_i64 hits case -RAY_I32 at line 139.
+(set v3 [1 2 3])
+(sum (+ v3 1i)) -- 9
+(sum (+ 1i v3)) -- 9
+(+ (sum (+ v3 1i)) (sum (+ v3 1i))) -- 18   ;; cache hit for I32 constant
+
+;; ── F64 vector: is_f64 path ──────────────────────────────────────────────────
+(set vf [1.0 2.0 3.0])
+(sum (+ vf 0.5)) -- 7.5
+(sum (+ 0.5 vf)) -- 7.5
+(+ (sum (+ vf 0.5)) (sum (+ vf 0.5))) -- 15.0   ;; cache hit for F64 vec
+
+;; ── BOOL constant: numeric_atom_i64 -RAY_BOOL branch (line 146) ─────────────
+(sum (+ v3 true))  -- 9
+(sum (+ v3 false)) -- 6
+(sum (+ true v3))  -- 9
+(+ (sum (+ v3 true)) (sum (+ v3 true))) -- 18   ;; cache hit for BOOL constant
+
+;; ── NOTE: -RAY_U8 branch (line 145) is structurally unreachable from RFL ────
+;; There is no U8 literal syntax in RFL. (as 'U8 2) is a list-form expression
+;; in the AST, not a literal atom, so try_sum_affine_expr never sees a U8 c_expr.
+;; The sum of a U8 vec returns I64, so the sum result is never U8 either.
+
+;; ── error propagation: bad expr in vec position ───────────────────────────────
+;; undefined_sym → ray_eval fails → lines 201-202 covered
+(try (sum (+ undefined_sym 1)) (fn [e] -1)) -- -1
+
+;; ── null-bearing vector: affine fast path must NOT be taken ──────────────────
+;; (nulls propagate through + correctly)
+(sum [0Nl 1 2]) -- 3
+
+;; ── null-bearing vec in affine expr: HAS_NULLS bail at lines 211-215 ─────────
+;; vec = (as I64 [1 0Nl 3]) has HAS_NULLS set → affine path aborted, falls
+;; through to normal (sum (+ ...)) which sums only non-null elements.
+(set vnull (as 'I64 [1 0Nl 3]))
+(sum (+ vnull 1)) -- 6
+
+;; ── vec expr evaluates to atom (not vec): handled=0 path (lines 206-209) ──────
+;; sum(+ scalar c) where scalar is a single value: not a vec, handled=0
+(sum (+ 5 1)) -- 6
+
+;; ── non-SYM head in + expr: line 183 in try_sum_affine_expr ─────────────────
+;; Anonymous lambda in head position: e[0]->type == RAY_LAMBDA (not -RAY_SYM)
+;; → try_sum_affine_expr returns NULL at line 183; sum falls back to normal path
+(sum ((fn [a b] (+ a b)) [1 2 3] 10)) -- 36

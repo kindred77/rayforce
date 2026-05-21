@@ -1,0 +1,79 @@
+;; Coverage for multi-key group-by paths in `src/ops/query.c`:
+;;   `groups_to_pair_list` (line ~110): typed key switch (I32/I16/BOOL/F64 branches)
+;;   `bounded_multikey_count_take_candidate` (line ~1759): multi-key + count-only + take
+;;   `count(distinct)` per-group with multi-key by
+;;   `positive_take_i64` with I32 take expression (line ~1673)
+;;
+;; These paths are reached when the by-clause is a list of 2+ column names
+;; (composite key path), not the fused DAG single-key fast path.
+
+;; ────────────────────────────────────────────────────────────────────
+;; I32 composite key — groups_to_pair_list RAY_I32 branch
+;; ────────────────────────────────────────────────────────────────────
+(set Ti32m (table [k1 k2 v] (list (as 'I32 [1 2 1 2 3]) (as 'I32 [10 10 20 20 10]) [100 200 300 400 500])))
+;; Groups: (1,10)=100, (2,10)=200, (1,20)=300, (2,20)=400, (3,10)=500
+(count (select {s: (sum v) by: [k1 k2] from: Ti32m})) -- 5
+(sum (at (select {s: (sum v) by: [k1 k2] from: Ti32m}) 's)) -- 1500
+
+;; ────────────────────────────────────────────────────────────────────
+;; I16 composite key — groups_to_pair_list RAY_I16 branch
+;; ────────────────────────────────────────────────────────────────────
+(set Ti16m (table [k1 k2 v] (list (as 'I16 [1 2 1 2]) (as 'I16 [10 10 20 20]) [5 10 15 20])))
+(count (select {s: (sum v) by: [k1 k2] from: Ti16m})) -- 4
+(sum (at (select {s: (sum v) by: [k1 k2] from: Ti16m}) 's)) -- 50
+(count (select {n: (count v) by: [k1 k2] from: Ti16m})) -- 4
+(sum (at (select {n: (count v) by: [k1 k2] from: Ti16m}) 'n)) -- 4
+
+;; ────────────────────────────────────────────────────────────────────
+;; BOOL composite key — groups_to_pair_list RAY_BOOL/RAY_U8 branch
+;; ────────────────────────────────────────────────────────────────────
+(set Tbm (table [k1 k2 v] (list [true false true false true] [true true false false true] [1 2 3 4 5])))
+;; Groups: (T,T)=[1,5], (F,T)=[2], (T,F)=[3], (F,F)=[4]
+(count (select {s: (sum v) by: [k1 k2] from: Tbm})) -- 4
+(sum (at (select {s: (sum v) by: [k1 k2] from: Tbm}) 's)) -- 15
+(count (select {n: (count v) by: [k1 k2] from: Tbm})) -- 4
+
+;; ────────────────────────────────────────────────────────────────────
+;; F64 composite key — groups_to_pair_list RAY_F64 branch
+;; ────────────────────────────────────────────────────────────────────
+(set Tf64m (table [k1 k2 v] (list [1.0 2.0 1.0 2.0 3.0] [10.0 10.0 20.0 20.0 10.0] [1 2 3 4 5])))
+(count (select {s: (sum v) by: [k1 k2] from: Tf64m})) -- 5
+(sum (at (select {s: (sum v) by: [k1 k2] from: Tf64m}) 's)) -- 15
+
+;; ────────────────────────────────────────────────────────────────────
+;; bounded_multikey_count_take_candidate:
+;; multi-key + count-only + take (no sort) + limit <= max_groups
+;; ────────────────────────────────────────────────────────────────────
+(set Tbtc (table [g1 g2 v] (list ['A 'A 'B 'B 'B 'C 'C 'A] ['X 'X 'Y 'Y 'Z 'X 'Y 'Z] [1 2 3 4 5 6 7 8])))
+;; 6 groups total: (A,X)=2, (B,Y)=2, (B,Z)=1, (C,X)=1, (C,Y)=1, (A,Z)=1
+;; take: 3 → returns first 3 groups encountered
+(count (select {n: (count v) by: [g1 g2] from: Tbtc take: 3})) -- 3
+(sum (at (select {n: (count v) by: [g1 g2] from: Tbtc take: 3}) 'n)) -- 5
+
+;; take: 1 → only the first group
+(count (select {n: (count v) by: [g1 g2] from: Tbtc take: 1})) -- 1
+
+;; ────────────────────────────────────────────────────────────────────
+;; count(distinct) with multi-key by-group → count_distinct_per_group_groups path
+;; Uses groups_to_pair_list (via the LIST groups path)
+;; ────────────────────────────────────────────────────────────────────
+(set Tcd2 (table [g1 g2 v] (list ['A 'A 'B 'B 'A 'B] ['X 'X 'Y 'Y 'X 'Y] [1 2 3 4 5 6])))
+;; (A,X): distinct v = {1,2,5} = 3; (B,Y): distinct v = {3,4,6} = 3
+(count (select {cd: (count (distinct v)) by: [g1 g2] from: Tcd2})) -- 2
+(sum (at (select {cd: (count (distinct v)) by: [g1 g2] from: Tcd2}) 'cd)) -- 6
+
+;; count(distinct) with duplicate values within group
+(set Tcd3 (table [g1 g2 v] (list ['A 'A 'B 'B 'A 'A 'B] ['X 'X 'Y 'Y 'X 'X 'Y] [1 1 2 2 3 1 2])))
+;; (A,X): v={1,1,3,1} → distinct={1,3} = 2; (B,Y): v={2,2,2} → distinct={2} = 1
+(count (select {cd: (count (distinct v)) by: [g1 g2] from: Tcd3})) -- 2
+(sum (at (select {cd: (count (distinct v)) by: [g1 g2] from: Tcd3}) 'cd)) -- 3
+
+;; ────────────────────────────────────────────────────────────────────
+;; Multi-key + non-agg projection with inner-agg (nonagg_eval_per_group)
+;; with I32 keys — exercises groups_to_pair_list + nonagg path
+;; ────────────────────────────────────────────────────────────────────
+(set Tna32 (table [k1 k2 v] (list (as 'I32 [1 2 1 2 1]) (as 'I32 [10 20 10 20 10]) [5 10 15 20 25])))
+;; (1,10): v=[5,15,25] → max=25, min=5 → diff=20
+;; (2,20): v=[10,20]   → max=20, min=10 → diff=10
+(count (select {r: (- (max v) (min v)) by: [k1 k2] from: Tna32})) -- 2
+(sum (at (select {r: (- (max v) (min v)) by: [k1 k2] from: Tna32}) 'r)) -- 30

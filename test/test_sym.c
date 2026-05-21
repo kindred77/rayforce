@@ -1433,6 +1433,340 @@ static test_result_t test_sym_dotted_leading_dot(void) {
 }
 
 /* ══════════════════════════════════════════
+ * Additional ray_sym_load / sym_cache_segments coverage
+ * Targets the remaining zero-hit regions in sym.c:
+ *   — disk_count < 0 or > UINT32_MAX (lines 1327-1332)
+ *   — slen > remaining in entry loop (lines 1418-1423)
+ *   — prefix mismatch in validation loop (lines 1428-1434)
+ *   — remaining != 0 after all entries parsed (lines 1455-1460)
+ *   — lock_path snprintf overflow in ray_sym_load (lines 1284-1285)
+ *   — lock_path snprintf overflow in ray_sym_save (lines 1057-1058)
+ *   — sep_dots + 1 > 255 guard in sym_cache_segments (lines 417-420)
+ * ══════════════════════════════════════════ */
+
+/* Helper: write a raw STRL binary file.
+ * STRL layout: [4B magic LE][8B count LE][for each: 4B len LE + data]
+ * SYM_STRL_MAGIC = 0x4C525453 ("STRL" in memory on LE machines). */
+static bool write_strl_raw(const char* path,
+                            const uint8_t* data, size_t data_len) {
+    FILE* f = fopen(path, "wb");
+    if (!f) return false;
+    bool ok = (fwrite(data, 1, data_len, f) == data_len);
+    fclose(f);
+    return ok;
+}
+
+/* ---- sym_load_neg_disk_count ------------------------------------------- */
+
+/* ray_sym_load rejects a STRL file whose 8-byte count field is negative
+ * (disk_count < 0 check at sym.c line 1327).  Covers lines 1328-1332. */
+static test_result_t test_sym_load_neg_disk_count(void) {
+    const char* sym_path = "/tmp/test_sym_negcnt.sym";
+    char lk_path[4096];
+    snprintf(lk_path, sizeof(lk_path), "%s.lk", sym_path);
+    remove(sym_path); remove(lk_path);
+
+    /* STRL magic (4B LE: 53 54 52 4C) + disk_count = -1 (8B LE: all 0xFF) */
+    static const uint8_t buf[] = {
+        0x53, 0x54, 0x52, 0x4C,              /* magic = "STRL" */
+        0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF               /* int64_t -1 in LE */
+    };
+    TEST_ASSERT_TRUE(write_strl_raw(sym_path, buf, sizeof(buf)));
+
+    ray_err_t err = ray_sym_load(sym_path);
+    TEST_ASSERT((err) != (RAY_OK), "negative disk_count must be rejected");
+
+    remove(sym_path); remove(lk_path);
+    PASS();
+}
+
+/* ---- sym_load_slen_overflow -------------------------------------------- */
+
+/* ray_sym_load rejects a STRL file where a declared entry length (slen)
+ * exceeds the bytes remaining after the length prefix.
+ * Covers sym.c lines 1418-1423.
+ *
+ * File layout: magic + count=1 + slen=99 + 0 bytes of string data.
+ * After reading slen=99: remaining==0, which is < 99 → error. */
+static test_result_t test_sym_load_slen_overflow(void) {
+    const char* sym_path = "/tmp/test_sym_slen_ovf.sym";
+    char lk_path[4096];
+    snprintf(lk_path, sizeof(lk_path), "%s.lk", sym_path);
+    remove(sym_path); remove(lk_path);
+
+    static const uint8_t buf[] = {
+        0x53, 0x54, 0x52, 0x4C,              /* magic "STRL" */
+        0x01, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,              /* disk_count = 1 */
+        0x63, 0x00, 0x00, 0x00               /* entry 0: slen = 99, no data */
+    };
+    TEST_ASSERT_TRUE(write_strl_raw(sym_path, buf, sizeof(buf)));
+
+    ray_err_t err = ray_sym_load(sym_path);
+    TEST_ASSERT((err) != (RAY_OK), "slen > remaining must be rejected");
+
+    remove(sym_path); remove(lk_path);
+    PASS();
+}
+
+/* ---- sym_load_prefix_mismatch_strl ------------------------------------- */
+
+/* ray_sym_load rejects a reload where a previously-loaded (persisted) entry
+ * has a different string content in the new file.
+ * Covers sym.c lines 1428-1434.
+ *
+ * Strategy:
+ *   1. Intern "" (id=0), "aaa" (id=1), "bbb" (id=2) and save → persisted=3.
+ *   2. Load the file so persisted_count = 3.
+ *   3. Build a STRL with the same 3 entries but entry 1 changed ("zzz").
+ *   4. Load again → prefix check at i=1 fails (memory has "aaa", file has "zzz"). */
+static test_result_t test_sym_load_prefix_mismatch_strl(void) {
+    const char* sym_path = "/tmp/test_sym_pfx_mm.sym";
+    char lk_path[4096];
+    snprintf(lk_path, sizeof(lk_path), "%s.lk", sym_path);
+    remove(sym_path); remove(lk_path);
+
+    /* Step 1: intern and save. */
+    ray_sym_intern("aaa", 3);
+    ray_sym_intern("bbb", 3);
+    ray_err_t err = ray_sym_save(sym_path);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    /* Step 2: load → persisted_count = 3 ("", "aaa", "bbb"). */
+    err = ray_sym_load(sym_path);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+    TEST_ASSERT_EQ_U(ray_sym_count(), 3);
+
+    /* Step 3: craft a STRL with 3 entries where entry 1 is "zzz".
+     * STRL format:  magic(4) + count=3(8) + [len=0 + ""][len=3 + "zzz"][len=3 + "bbb"] */
+    static const uint8_t bad_strl[] = {
+        0x53, 0x54, 0x52, 0x4C,              /* magic "STRL" */
+        0x03, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,              /* disk_count = 3 */
+        /* entry 0: "" (len=0) */
+        0x00, 0x00, 0x00, 0x00,
+        /* entry 1: "zzz" (len=3) — was "aaa" in memory */
+        0x03, 0x00, 0x00, 0x00, 'z', 'z', 'z',
+        /* entry 2: "bbb" (len=3) */
+        0x03, 0x00, 0x00, 0x00, 'b', 'b', 'b'
+    };
+    TEST_ASSERT_TRUE(write_strl_raw(sym_path, bad_strl, sizeof(bad_strl)));
+
+    /* Step 4: load → prefix mismatch at entry 1. */
+    err = ray_sym_load(sym_path);
+    TEST_ASSERT((err) != (RAY_OK), "prefix mismatch must be rejected");
+
+    remove(sym_path); remove(lk_path);
+    PASS();
+}
+
+/* ---- sym_load_trailing_junk -------------------------------------------- */
+
+/* ray_sym_load rejects a STRL file that has extra bytes after all declared
+ * entries have been parsed (remaining != 0 check, sym.c lines 1455-1460).
+ *
+ * File: magic + count=1 + entry[0]="" + one extra 0x00 byte at the end. */
+static test_result_t test_sym_load_trailing_junk(void) {
+    const char* sym_path = "/tmp/test_sym_trail.sym";
+    char lk_path[4096];
+    snprintf(lk_path, sizeof(lk_path), "%s.lk", sym_path);
+    remove(sym_path); remove(lk_path);
+
+    static const uint8_t buf[] = {
+        0x53, 0x54, 0x52, 0x4C,              /* magic "STRL" */
+        0x01, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,              /* disk_count = 1 */
+        0x00, 0x00, 0x00, 0x00,              /* entry 0: slen=0, "" */
+        0x42                                 /* trailing junk byte */
+    };
+    TEST_ASSERT_TRUE(write_strl_raw(sym_path, buf, sizeof(buf)));
+
+    ray_err_t err = ray_sym_load(sym_path);
+    TEST_ASSERT((err) != (RAY_OK), "trailing junk must be rejected");
+
+    remove(sym_path); remove(lk_path);
+    PASS();
+}
+
+/* ---- sym_load_long_path ------------------------------------------------ */
+
+/* ray_sym_load rejects a path so long that appending ".lk" overflows the
+ * 1024-byte lock_path buffer (sym.c lines 1284-1285). */
+static test_result_t test_sym_load_long_path(void) {
+    /* The buffer is char lock_path[1024]; snprintf(lock_path, 1024, "%s.lk", path).
+     * Overflow when strlen(path) + 3 >= 1024, i.e. strlen(path) >= 1021. */
+    char long_path[2048];
+    memset(long_path, 'a', 1021);
+    long_path[1021] = '\0';
+
+    ray_err_t err = ray_sym_load(long_path);
+    TEST_ASSERT_EQ_I(err, RAY_ERR_IO);
+    PASS();
+}
+
+/* ---- sym_save_long_path ------------------------------------------------ */
+
+/* ray_sym_save similarly rejects an overlong path (sym.c lines 1057-1058).
+ * Intern one sym first so persisted_count != str_count (otherwise save
+ * returns RAY_OK immediately without reaching the path-length check). */
+static test_result_t test_sym_save_long_path(void) {
+    ray_sym_intern("save_long_path_test", 19);
+
+    char long_path[2048];
+    memset(long_path, 'b', 1021);
+    long_path[1021] = '\0';
+
+    ray_err_t err = ray_sym_save(long_path);
+    TEST_ASSERT_EQ_I(err, RAY_ERR_IO);
+    PASS();
+}
+
+/* ---- sym_cache_segs_many_dots ------------------------------------------ */
+
+/* sym_cache_segments rejects names with 256+ dot-separated segments
+ * (sep_dots + 1 > 255, sym.c lines 417-420).
+ * Build a name with exactly 255 dots (256 segments) using no-split intern,
+ * then trigger rebuild_segments which calls sym_cache_segments. */
+static test_result_t test_sym_cache_segs_many_dots(void) {
+    /* Build a string like "a.a.a....a" with 255 dots (256 'a' segments).
+     * Total length = 256 * 1 + 255 = 511 characters. */
+    char name[512];
+    for (int i = 0; i < 511; i++)
+        name[i] = (i % 2 == 0) ? 'a' : '.';
+    name[511] = '\0';
+    size_t name_len = 511;
+
+    /* Intern via no-split so segment caching is deferred. */
+    int64_t id = ray_sym_intern_no_split(name, name_len);
+    TEST_ASSERT((id) >= (0), "id >= 0");
+
+    /* Not yet scanned. */
+    TEST_ASSERT_FALSE(ray_sym_is_dotted(id));
+
+    /* Rebuild triggers sym_cache_segments which detects 256 segments
+     * (sep_dots + 1 = 256 > 255) and marks the sym as plain (not dotted). */
+    ray_err_t err = ray_sym_rebuild_segments();
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    /* Must NOT be marked dotted — the 256-segment name is treated as plain. */
+    TEST_ASSERT_FALSE(ray_sym_is_dotted(id));
+
+    PASS();
+}
+
+/* ---- sym_load_no_parent_dir -------------------------------------------- */
+
+/* ray_sym_load with a path in a non-existent directory covers the inner
+ * EROFS fallback in sym.c (lines 1294-1296).
+ *
+ * When the parent directory does not exist:
+ *   - ray_file_open(path, READ) fails → errno = ENOENT → saved_errno = ENOENT
+ *   - ray_file_open(path, READ|WRITE|CREATE) also fails → errno = ENOENT
+ *   - saved_errno != EROFS && errno != EROFS is TRUE → returns RAY_ERR_IO
+ */
+static test_result_t test_sym_load_no_parent_dir(void) {
+    ray_err_t err = ray_sym_load("/tmp/no_such_dir_sym_xq7/sym.sym");
+    TEST_ASSERT_EQ_I(err, RAY_ERR_IO);
+    PASS();
+}
+
+/* ---- sym_save_bad_slot_type -------------------------------------------- */
+
+/* sym_save_impl merge loop rejects a slot from the disk file that is not
+ * a -RAY_STR atom (sym.c lines 1089-1093: `s->type != -RAY_STR` check).
+ *
+ * Write a LSTG (generic list) file with one -RAY_I64 (integer) atom entry.
+ * ray_col_load will deserialise this as a RAY_LIST, and sym_save_impl will
+ * see `s->type == -RAY_I64 != -RAY_STR` → RAY_ERR_CORRUPT.
+ *
+ * LSTG format (col.c LIST_MAGIC = 0x4754534CU, LE = 4C 53 54 47):
+ *   [4B magic][1B outer-type RAY_LIST=0][8B count][1B elem-type -RAY_I64=0xFB][8B value]
+ */
+static test_result_t test_sym_save_bad_slot_type(void) {
+    static const uint8_t lstg_buf[] = {
+        0x4C, 0x53, 0x54, 0x47,              /* LIST_MAGIC "LSTG" LE */
+        0x00,                                /* outer type = RAY_LIST = 0 */
+        0x01, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,              /* count = 1 */
+        0xFB,                                /* elem type = -RAY_I64 = -5 = 0xFB */
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00               /* i64 value = 0 */
+    };
+    const char* path = "/tmp/sym_test_bad_slot.sym";
+    bool ok = write_strl_raw(path, lstg_buf, sizeof(lstg_buf));
+    TEST_ASSERT_TRUE(ok);
+
+    /* Intern one sym so persisted_count != str_count (skip early return). */
+    ray_sym_intern("bad_slot_sym", 12);
+
+    ray_err_t err = ray_sym_save(path);
+    TEST_ASSERT_EQ_I(err, RAY_ERR_CORRUPT);
+    remove(path);
+    PASS();
+}
+
+/* ---- sym_save_tmppath_overflow ----------------------------------------- */
+
+/* ray_sym_save rejects a path that would overflow the internal tmp_path[]
+ * buffer (sym.c line 1060-1061: "%s.tmp" overflow).
+ * The lock_path[] buffer uses "%s.lk" (3-char suffix), which overflows at
+ * strlen >= 1021.  The tmp_path[] buffer uses "%s.tmp" (4-char suffix),
+ * which overflows at strlen >= 1020.  So a path of exactly 1020 chars
+ * passes the lock_path check but fails the tmp_path check.
+ * Intern one sym first so persisted_count != str_count to skip the
+ * early-return optimisation. */
+static test_result_t test_sym_save_tmppath_overflow(void) {
+    ray_sym_intern("tmppath_overflow_test", 21);
+
+    char long_path[2048];
+    memset(long_path, 'c', 1020);
+    long_path[1020] = '\0';
+
+    ray_err_t err = ray_sym_save(long_path);
+    TEST_ASSERT_EQ_I(err, RAY_ERR_IO);
+    PASS();
+}
+
+/* ---- sym_save_diverge_id ----------------------------------------------- */
+
+/* sym_save_impl merge path rejects divergent symbol tables where a symbol
+ * from the disk file interns to a different ID than its disk position
+ * (sym.c lines 1104-1113: `id != i` check).
+ *
+ * Setup:
+ *   1. Write a two-entry STRL file: ["", "apple"] to a tmp path.
+ *   2. Intern "banana" in memory — gets id=1 (since "" is always id=0).
+ *   3. Call ray_sym_save to the same path.
+ *   4. sym_save_impl finds the existing file, tries to merge:
+ *      - entry[0]="" → ray_sym_intern_no_split("",0) → id=0 == 0 ✓
+ *      - entry[1]="apple" → but "banana" already holds id=1,
+ *        so "apple" gets id=2 ≠ 1 → RAY_ERR_CORRUPT ✓
+ */
+static test_result_t test_sym_save_diverge_id(void) {
+    static const uint8_t strl_buf[] = {
+        0x53, 0x54, 0x52, 0x4C,              /* magic "STRL" */
+        0x02, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,              /* disk_count = 2 */
+        0x00, 0x00, 0x00, 0x00,              /* entry 0: slen=0 "" */
+        0x05, 0x00, 0x00, 0x00,              /* entry 1: slen=5 */
+        'a', 'p', 'p', 'l', 'e'             /* "apple" */
+    };
+    const char* path = "/tmp/sym_test_diverge_id.sym";
+    bool ok = write_strl_raw(path, strl_buf, sizeof(strl_buf));
+    TEST_ASSERT_TRUE(ok);
+
+    /* Intern "banana" — takes id=1, displacing the expected "apple" slot. */
+    int64_t banana_id = ray_sym_intern("banana", 6);
+    TEST_ASSERT_EQ_I(banana_id, 1);
+
+    ray_err_t err = ray_sym_save(path);
+    TEST_ASSERT_EQ_I(err, RAY_ERR_CORRUPT);
+    remove(path);
+    PASS();
+}
+
+/* ══════════════════════════════════════════
  * ray_like_fn (src/ops/strop.c) coverage
  * ══════════════════════════════════════════ */
 
@@ -2189,6 +2523,19 @@ const test_entry_t sym_entries[] = {
     { "sym/ensure_cap_zero",            test_sym_ensure_cap_zero,          sym_setup, sym_teardown },
     { "sym/ensure_cap_large",           test_sym_ensure_cap_large,         sym_setup, sym_teardown },
     { "sym/dotted_leading_dot",         test_sym_dotted_leading_dot,       sym_setup, sym_teardown },
+
+    /* Additional sym.c coverage: load/save edge cases */
+    { "sym/load_neg_disk_count",        test_sym_load_neg_disk_count,      sym_setup, sym_teardown },
+    { "sym/load_slen_overflow",         test_sym_load_slen_overflow,       sym_setup, sym_teardown },
+    { "sym/load_prefix_mismatch_strl",  test_sym_load_prefix_mismatch_strl,sym_setup, sym_teardown },
+    { "sym/load_trailing_junk",         test_sym_load_trailing_junk,       sym_setup, sym_teardown },
+    { "sym/load_long_path",             test_sym_load_long_path,           sym_setup, sym_teardown },
+    { "sym/save_long_path",             test_sym_save_long_path,           sym_setup, sym_teardown },
+    { "sym/cache_segs_many_dots",       test_sym_cache_segs_many_dots,     sym_setup, sym_teardown },
+    { "sym/load_no_parent_dir",          test_sym_load_no_parent_dir,       sym_setup, sym_teardown },
+    { "sym/save_bad_slot_type",          test_sym_save_bad_slot_type,       sym_setup, sym_teardown },
+    { "sym/save_tmppath_overflow",      test_sym_save_tmppath_overflow,    sym_setup, sym_teardown },
+    { "sym/save_diverge_id",            test_sym_save_diverge_id,          sym_setup, sym_teardown },
 
     /* ray_like_fn (src/ops/strop.c) — vector and sym-atom paths */
     { "sym/like_fn/bad_pattern_type",  test_like_fn_bad_pattern_type,    sym_setup, sym_teardown },

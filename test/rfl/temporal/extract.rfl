@@ -65,6 +65,13 @@
 (hh [00:00:00.000 06:30:00.000 12:00:00.000 18:45:00.000 23:59:59.000]) -- [0 6 12 18 23]
 ;; vector of timestamps
 (hh [2024.03.15D01:00:00.000000000 2024.03.15D13:00:00.000000000]) -- [1 13]
+;; pre-epoch timestamp atom — day_us < 0 in rte_extract_one (standalone path):
+;; 1999-12-31T23:30:00 → ns = -86400e9 + 84600e9 = -1800000000000 < 0 → us < 0
+;; day_us = us % 86400e6 → negative, then += USEC_PER_DAY to normalise → hour=23
+(hh 1999.12.31D23:30:00.000000000) -- 23
+(hh 1999.12.31D01:00:00.000000000) -- 1
+;; pre-epoch vector
+(hh [1999.12.31D06:00:00.000000000 1999.12.30D18:00:00.000000000]) -- [6 18]
 
 ;; ──────────────────────────── minute ───────────────────────────────────
 (minute 00:00:00.000) -- 0
@@ -74,6 +81,11 @@
 (minute 2024.03.15D08:00:00.000000000) -- 0
 ;; vector
 (minute [00:00:00.000 00:15:00.000 00:30:00.000 00:45:00.000 00:59:00.000]) -- [0 15 30 45 59]
+;; pre-epoch timestamp atom — day_us < 0 in rte_extract_one (MINUTE arm)
+(minute 1999.12.31D23:30:45.000000000) -- 30
+(minute 1999.12.31D00:15:00.000000000) -- 15
+;; pre-epoch vector
+(minute [1999.12.31D01:02:00.000000000 1999.12.30D00:45:00.000000000]) -- [2 45]
 
 ;; ──────────────────────────── ss (second) ──────────────────────────────
 (ss 00:00:00.000) -- 0
@@ -83,6 +95,11 @@
 (ss 2024.03.15D12:34:00.000000000) -- 0
 ;; vector
 (ss [00:00:00.000 00:00:01.000 00:00:30.000 00:00:59.000]) -- [0 1 30 59]
+;; pre-epoch timestamp atom — day_us < 0 in rte_extract_one (SECOND arm)
+(ss 1999.12.31D23:30:45.000000000) -- 45
+(ss 1999.12.31D00:00:59.000000000) -- 59
+;; pre-epoch vector
+(ss [1999.12.31D01:02:03.000000000 1999.12.30D00:00:30.000000000]) -- [3 30]
 
 ;; ───────────────────────────── dow (day-of-week) ───────────────────────
 ;; rayforce's `dow` returns 1..7 with Mon=1 .. Sun=7
@@ -140,3 +157,20 @@
 (dd   DS) -- [1 4 31]
 (dow  DS) -- [1 4 2]
 (doy  DS) -- [1 186 366]
+
+;; ─────────────── null temporal atoms (RAY_ATOM_IS_NULL branch) ────────────
+;; ray_temporal_extract line 125: null atom → 0Nl regardless of field.
+(yyyy 0Nd)   -- 0Nl
+(mm   0Nd)   -- 0Nl
+(dd   0Nd)   -- 0Nl
+(hh   0Nt)   -- 0Nl
+(minute 0Nt) -- 0Nl
+(ss   0Nt)   -- 0Nl
+(doy  0Np)   -- 0Nl
+(dow  0Np)   -- 0Nl
+
+;; pre-epoch TIMESTAMP atoms for year/month/day — exercises rte_to_us
+;; negative branch (ns < 0 → us = -((-ns+999)/1000)) in the standalone path
+(yyyy 1999.12.31D23:59:59.000000000) -- 1999
+(mm   1999.12.31D23:59:59.000000000) -- 12
+(dd   1999.12.31D23:59:59.000000000) -- 31

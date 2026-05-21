@@ -1,0 +1,110 @@
+;; Coverage for CAST paths and unary ops in expr.c:
+;;   exec_elementwise_unary CAST branches (lines 1336-1393)
+;;   exec_elementwise_unary F64 OP_ROUND (line 1270)
+;;   exec_elementwise_unary I64->BOOL ISNULL (lines 1320-1327)
+;;   exec_elementwise_unary I64 ABS (line 1301)
+;;   mark_i64_overflow_as_null (line 967): -INT64_MIN and |INT64_MIN| → null
+;;   OP_NOT over BOOL vec (line 857 in expr_exec_unary)
+
+;; ===================================================================
+;; CAST I16 → F64  (exec_elementwise_unary line 1367, else branch)
+;; ===================================================================
+(as 'F64 [1h 2h 3h])       -- [1.0 2.0 3.0]
+(type (as 'F64 [1h 2h 3h])) -- 'F64
+(as 'F64 [-5h 0h 10h])     -- [-5.0 0.0 10.0]
+
+;; ===================================================================
+;; CAST U8/BOOL → I64  (exec_elementwise_unary lines 1376-1383)
+;; ===================================================================
+(as 'I64 [true false true false]) -- [1 0 1 0]
+(type (as 'I64 [true false true false])) -- 'I64
+
+;; ===================================================================
+;; CAST U8/BOOL → F64  (exec_elementwise_unary lines 1385-1391)
+;; ===================================================================
+(as 'F64 [true false true]) -- [1.0 0.0 1.0]
+(type (as 'F64 [true false true])) -- 'F64
+(as 'F64 (as 'U8 [3 7 255])) -- [3.0 7.0 255.0]
+(type (as 'F64 (as 'U8 [1 2 3]))) -- 'F64
+
+;; ===================================================================
+;; CAST I32/DATE/TIME → I64  (line 1340-1347)
+;; ===================================================================
+(as 'I64 [1i 2i 3i])       -- [1 2 3]
+(type (as 'I64 [1i 2i 3i])) -- 'I64
+
+;; CAST I32 → F64  (line 1348-1355)
+(as 'F64 [1i 2i 3i])       -- [1.0 2.0 3.0]
+(type (as 'F64 [1i 2i 3i])) -- 'F64
+
+;; CAST I16 → I64  (line 1358-1365)
+(as 'I64 [1h 2h 3h])       -- [1 2 3]
+(type (as 'I64 [1h 2h 3h])) -- 'I64
+
+;; ===================================================================
+;; OP_ROUND on F64 vector (exec_elementwise_unary line 1270)
+;; ===================================================================
+(round [1.1 2.5 3.9 -1.5 -2.7]) -- [1.0 3.0 4.0 -2.0 -3.0]
+(type (round [1.1 2.5 3.9])) -- 'F64
+;; round of integer types (round is identity for exact integers)
+(round [1h 2h 3h]) -- [1.0 2.0 3.0]
+(round [1i 2i 3i]) -- [1.0 2.0 3.0]
+(round [1 2 3])    -- [1.0 2.0 3.0]
+
+;; ===================================================================
+;; ISNULL over I64 vec (exec_elementwise_unary lines 1320-1327)
+;; Non-null vec: result is all false
+;; ===================================================================
+(nil? (til 5))   -- false
+(map nil? (til 3)) -- [false false false]
+
+;; ISNULL on nullable vector detects null positions
+(sum (map nil? [0Nl 1 2 0Nl 3])) -- 2
+(map nil? [0Nl 1 2 0Nl 3]) -- [true false false true false]
+
+;; ===================================================================
+;; ABS on I64 (line 1301)
+;; ===================================================================
+(abs [-3 -1 0 1 3]) -- [3 1 0 1 3]
+(type (abs [-3 -1 0 1 3])) -- 'I64
+
+;; abs of mixed signs
+(abs [-9 5 -0 0 100]) -- [9 5 0 0 100]
+
+;; ===================================================================
+;; NEG/ABS overflow: -INT64_MIN → null (mark_i64_overflow_as_null)
+;; INT64_MIN = -9223372036854775808; unsigned wrap gives INT64_MIN = null sentinel
+;; ===================================================================
+(nil? (neg -9223372036854775808)) -- true
+(nil? (abs -9223372036854775808)) -- true
+
+;; Vector with INT64_MIN: overflow position becomes null
+(neg [-9223372036854775808 1 -2]) -- [0Nl -1 2]
+(nil? (at (neg [-9223372036854775808 1 -2]) 0)) -- true
+
+(abs [-9223372036854775808 -1 2]) -- [0Nl 1 2]
+(nil? (at (abs [-9223372036854775808 -1 2]) 0)) -- true
+
+;; Non-overflow positions are correct
+(at (neg [-9223372036854775808 1 -2]) 1) -- -1
+(at (abs [-9223372036854775808 -1 2]) 2) -- 2
+
+;; ===================================================================
+;; OP_NOT on BOOL vec (expr_exec_unary line 857)
+;; In fused evaluator path for table columns
+;; ===================================================================
+(not true)  -- false
+(not false) -- true
+(not [true false true false]) -- [false true false true]
+(not [true true true]) -- [false false false]
+
+;; NOT preserves type
+(type (not [true false])) -- 'B8
+
+;; ===================================================================
+;; F64 OP_ROUND via fused path (expr_exec_unary line 816 in expr_compile)
+;; Table context forces fused evaluator
+;; ===================================================================
+(set T (table [x] (list [1.1 2.5 3.7 4.2 -1.5])))
+(at (select {r: (round x) from: T}) 'r) -- [1.0 3.0 4.0 4.0 -2.0]
+(type (at (select {r: (round x) from: T}) 'r)) -- 'F64

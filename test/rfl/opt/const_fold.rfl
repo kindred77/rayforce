@@ -1,0 +1,313 @@
+;; Coverage for src/ops/opt.c optimizer passes:
+;;   - promote_type: integer-family type promotion (i64, i32, i16, u8, bool)
+;;   - fold_unary_const: NEG/ABS/NOT/SQRT/LOG/EXP/CEIL/FLOOR with f64 and int atoms
+;;   - fold_binary_const: I64/I32/BOOL paths including edge cases
+;;   - simplify_and_or_const: partial AND/OR fold with one const operand
+;;   - filter_cost/pass_filter_reorder: ILIKE cost path
+;;   - pass_predicate_pushdown: ALIAS pushdown
+
+;; ====================================================================
+;; Section 1: promote_type — integer-family paths (lines 59-65 in opt.c)
+;;
+;; infer_type_for_node calls promote_type(a->out_type, b->out_type) for
+;; binary nodes whose out_type is still 0 after graph construction.
+;; Table columns have typed arrays so SCAN nodes carry concrete types;
+;; a binary OP node built by the compiler starts with out_type=0.
+;; ====================================================================
+;; I64 + I16 -> I64 (promote_type line 59: a==RAY_I64 || b==RAY_I64)
+(set T16_64 (table [a b] (list [1h 2h 3h] [100 200 300])))
+(at (select {c: (+ a b) from: T16_64}) 'c) -- [101 202 303]
+
+;; I32 + I16 -> I32 (promote_type line 61-62: a==RAY_I32 arm)
+(set T32_16 (table [a b] (list [1i 2i 3i] [10h 20h 30h])))
+(at (select {c: (+ a b) from: T32_16}) 'c) -- [11 22 33]
+
+;; I16 + I16 — promoted to I64 (binary fast paths emit I64 outputs;
+;; narrow-output is reserved for explicit casts).
+(set T16_16 (table [a b] (list [1h 2h 3h] [10h 20h 30h])))
+(at (select {c: (+ a b) from: T16_16}) 'c) -- [11 22 33]
+(type (at (select {c: (+ a b) from: T16_16}) 'c)) -- 'I64
+
+;; BOOL + I16 -> I16 (promote_type line 61-62: via DATE/TIME/I32 arm? or default)
+;; atom_to_numeric line 290-295: RAY_U8 fallthrough arm (bool value as u8)
+(set T_bool (table [a b] (list [true false true] [1h 2h 3h])))
+(at (select {c: (+ a b) from: T_bool}) 'c) -- [2 2 4]
+
+;; ====================================================================
+;; Section 2: fold_unary_const — uncovered branches
+;;
+;; All inputs are scalar atoms so constant folding fires during
+;; pass_constant_fold (post-order walk, children before parents).
+;; ====================================================================
+
+;; NEG(f64): fold_unary_const line 339 — if (is_f64) branch taken
+(neg 3.0)   -- -3.0
+(neg -2.5)  -- 2.5
+
+;; ABS: fold_unary_const lines 343-348
+;; Integer path with vi < 0 (line 347 ternary left branch covered)
+(abs -7)    -- 7
+(abs 7)     -- 7
+;; Float path
+(abs -2.5)  -- 2.5
+(abs 2.5)   -- 2.5
+
+;; NOT: fold_unary_const line 350
+;; Integer path (vi == 0 or vi != 0)
+(not 0)     -- true
+(not 1)     -- false
+(not 2)     -- false
+;; Float path: is_f64 branch (line 350 left of ternary)
+(not 0.0)   -- true
+(not 1.5)   -- false
+
+;; SQRT: line 352-354 — is_f64 path (^0 on false branch)
+;; sqrt(4.0) uses vf; sqrt(4) uses (double)vi
+(sqrt 4.0)  -- 2.0
+(sqrt 9)    -- 3.0
+
+;; LOG: line 355-357 — is_f64 path (^0 for false branch)
+(log 1.0)   -- 0.0
+(log 1)     -- 0.0
+
+;; EXP: line 358-360 — is_f64 path (^0 for false branch)
+(exp 0.0)   -- 1.0
+(exp 0)     -- 1.0
+
+;; CEIL: line 361-363 — both is_f64=true and is_f64=false
+(ceil 1.5)  -- 2.0
+(ceil 2)    -- 2
+
+;; FLOOR: line 364-366 — both paths
+(floor 1.5) -- 1.0
+(floor 2)   -- 2
+
+;; ====================================================================
+;; Section 2b: fold_unary_const — in query context (SELECT forces optimizer)
+;;
+;; Top-level expressions above go through the eval path, not the
+;; optimizer's constant-folding pass.  Embedding them in SELECT forces
+;; ray_optimize → pass_constant_fold → fold_unary_const.
+;; Each query result is a 3-row vector with a broadcast constant column.
+;; ====================================================================
+(set Tbase (table [x] (list [1 2 3])))
+
+;; NEG(f64) in SELECT — fold_unary_const line 339: is_f64=true, uses -vf
+(at (select {c: (neg 3.0) from: Tbase}) 'c) -- [-3.0 -3.0 -3.0]
+
+;; NEG(i64) in SELECT — line 341: uses -vi (vi != INT64_MIN)
+(at (select {c: (neg 5) from: Tbase}) 'c) -- [-5 -5 -5]
+
+;; ABS(f64) in SELECT — line 345: is_f64=true, fabs(vf)
+(at (select {c: (abs -2.5) from: Tbase}) 'c) -- [2.5 2.5 2.5]
+
+;; ABS(i64) negative — line 347: vi < 0, result = -vi
+(at (select {c: (abs -7) from: Tbase}) 'c) -- [7 7 7]
+
+;; ABS(i64) positive — line 347: vi >= 0, result = vi (the 'vi' arm of ternary)
+(at (select {c: (abs 7) from: Tbase}) 'c) -- [7 7 7]
+
+;; NOT(i64) zero — fold_unary_const line 350: vi==0 → true
+(at (select {c: (not 0) from: Tbase}) 'c) -- [true true true]
+
+;; NOT(i64) nonzero — line 350: vi!=0 → false
+(at (select {c: (not 1) from: Tbase}) 'c) -- [false false false]
+
+;; SQRT(f64) in SELECT — line 353: is_f64=true, uses vf
+(at (select {c: (sqrt 4.0) from: Tbase}) 'c) -- [2.0 2.0 2.0]
+
+;; SQRT(i64) in SELECT — line 353: is_f64=false, uses (double)vi
+(at (select {c: (sqrt 9) from: Tbase}) 'c) -- [3.0 3.0 3.0]
+
+;; LOG(f64) in SELECT — line 356: is_f64=true, uses vf
+(at (select {c: (log 1.0) from: Tbase}) 'c) -- [0.0 0.0 0.0]
+
+;; LOG(i64) in SELECT — line 356: is_f64=false, uses (double)vi
+(at (select {c: (log 1) from: Tbase}) 'c) -- [0.0 0.0 0.0]
+
+;; EXP(f64) in SELECT — line 359: is_f64=true
+(at (select {c: (exp 0.0) from: Tbase}) 'c) -- [1.0 1.0 1.0]
+
+;; EXP(i64) in SELECT — line 359: is_f64=false
+(at (select {c: (exp 0) from: Tbase}) 'c) -- [1.0 1.0 1.0]
+
+;; CEIL(f64) in SELECT — line 362: is_f64=true
+(at (select {c: (ceil 1.5) from: Tbase}) 'c) -- [2.0 2.0 2.0]
+
+;; CEIL(i64) in SELECT — line 362: is_f64=false, result = vi
+(at (select {c: (ceil 2) from: Tbase}) 'c) -- [2 2 2]
+
+;; FLOOR(f64) in SELECT — line 365: is_f64=true
+(at (select {c: (floor 1.5) from: Tbase}) 'c) -- [1.0 1.0 1.0]
+
+;; FLOOR(i64) in SELECT — line 365: is_f64=false
+(at (select {c: (floor 2) from: Tbase}) 'c) -- [2 2 2]
+
+;; NEG(u8) in SELECT — atom_to_numeric case -RAY_U8 (line 290, falls through to U8/BOOL code)
+;; 0x42 = 66 (U8 hex literal), neg → -66 (stored as i64 after fold)
+(at (select {c: (neg 0x42) from: Tbase}) 'c) -- [-66 -66 -66]
+
+;; ====================================================================
+;; Section 3: fold_binary_const — I64 arithmetic edge cases
+;;
+;; The I64 case (lines 414-433) is triggered when out_type==RAY_I64 AND
+;; opcode is in [OP_ADD..OP_MAX2].  For scalar i64 constants, ADD/SUB/MUL
+;; already covered; the remaining gaps are:
+;;   - MOD (line 425-427): only one call currently; edge case vi%rv with
+;;     trivial remainder forces the (rv != 0) guard to evaluate rv > 0
+;;   - i64 MIN2/MAX2 (lines 428-429): triggered via element-wise min/max
+;;     in projection (OP_MIN2/OP_MAX2 with two i64 const inputs)
+;; ====================================================================
+;; I64 MOD — covers line 426 with a different pair (lv and rv)
+;; RFL uses floored division: -20 mod 7 = 1 (not -6)
+(% 9223372036854775807 1000000000) -- 854775807
+(% 20 7)                           -- 6
+(% -20 7)                          -- 1
+
+;; I64 SUB and MUL (already covered but add more const-fold chains
+;; to increase branch hit counts on adjacent code)
+(- 9000000000000 1000000000000) -- 8000000000000
+(* 3000000000 4)                -- 12000000000
+
+;; ====================================================================
+;; Section 4: fold_binary_const — BOOL case (line 435-453)
+;;
+;; Comparison between two consts with out_type=RAY_BOOL (lines 438-439):
+;; is_f64 arms.  Currently all calls hit integer path (li,ri);
+;; to trigger the l_is_f64/r_is_f64 branch we need one or both
+;; inputs to be f64 consts.
+;; ====================================================================
+;; EQ between two f64 consts: lhs is f64, rhs is f64 → both l_is_f64=true, r_is_f64=true
+(== 3.0 3.0) -- true
+(== 3.0 4.0) -- false
+;; NE with f64 pair
+(!= 1.5 2.5) -- true
+;; LT, GT with f64 pair
+(< 1.0 2.0)  -- true
+(> 2.0 1.0)  -- true
+;; LE, GE
+(<= 2.0 2.0) -- true
+(>= 3.0 2.0) -- true
+
+;; AND/OR with two bool consts via bool folding (line 448-449)
+;; These are in the BOOL case of fold_binary_const
+;; (and false false) -> false,  (and true false) -> false
+(and true true)   -- true
+(and true false)  -- false
+(and false true)  -- false
+(or false false)  -- false
+(or true false)   -- true
+
+;; ====================================================================
+;; Section 5: fold_binary_const — I32 MIN2/MAX2 (lines 469-470) -- UNREACHABLE NOTE
+;; and I64 DIV (lines 422-424) -- UNREACHABLE NOTE
+;;
+;; OP_MIN2/OP_MAX2 with i32 consts: the query compiler (query.c) never
+;; calls ray_min2/ray_max2 directly; there is no RFL surface syntax that
+;; compiles to OP_MIN2 with two const i32 inputs. Unreachable via RFL.
+;;
+;; I64 OP_DIV: (/ i64 i64) always produces RAY_F64 out_type because the
+;; type inferencer (promote_type) returns F64 for the / opcode when both
+;; inputs are i64. Unreachable via normal RFL.
+;; ====================================================================
+
+;; ====================================================================
+;; Section 6: simplify_and_or_const — mixed const + non-const AND/OR
+;;
+;; The function fires when exactly one operand is a const scalar bool.
+;; Identity: AND-with-true, OR-with-false → alias the non-const operand.
+;; Dominant: AND-with-false → false, OR-with-true → true.
+;; Covers lines 516-559 in opt.c.
+;; ====================================================================
+(set T (table [a] (list [1 2 3 4 5])))
+
+;; const on RHS (rhs_const=true, lhs_const=false at line 526)
+;; AND identity: (and (> a 2) true)  → keeps rows where a>2  (3 rows: 3,4,5)
+(count (select {from: T where: (and (> a 2) true)}))   -- 3
+;; AND dominant: (and (> a 2) false) → zero rows
+(count (select {from: T where: (and (> a 2) false)}))  -- 0
+;; OR identity: (or (> a 2) false)   → same as (> a 2) → 3 rows
+(count (select {from: T where: (or (> a 2) false)}))   -- 3
+;; OR dominant: (or (> a 2) true)    → all rows
+(count (select {from: T where: (or (> a 2) true)}))    -- 5
+
+;; const on LHS (lhs_const=true at line 528 — lhs_const branch)
+;; AND identity: (and true (> a 2))
+(count (select {from: T where: (and true (> a 2))}))   -- 3
+;; AND dominant: (and false (> a 2))
+(count (select {from: T where: (and false (> a 2))}))  -- 0
+;; OR identity: (or false (> a 2))
+(count (select {from: T where: (or false (> a 2))}))   -- 3
+;; OR dominant: (or true (> a 2))
+(count (select {from: T where: (or true (> a 2))}))    -- 5
+
+;; atom_to_bool is_f64 path (line 493-494): const is float
+;; atom_to_bool(0.0) → is_f64=true, *out = 0.0!=0.0 = false
+;; (and (> a 2) 0.0) → AND-with-false → dominant → 0 rows
+(count (select {from: T where: (and (> a 2) 0.0)})) -- 0
+;; atom_to_bool(1.0) → is_f64=true, *out = 1.0!=0.0 = true
+;; (and (> a 2) 1.0) → AND-with-true → identity → 3 rows
+(count (select {from: T where: (and (> a 2) 1.0)})) -- 3
+
+;; ====================================================================
+;; Section 7: filter_cost — ILIKE branch (line 1438)
+;;
+;; filter_cost returns cost += 4 for OP_ILIKE (case OP_LIKE/OP_ILIKE).
+;; When (and ilike_pred cheap_pred) is in a WHERE, the reorder pass
+;; puts the cheap predicate at the inner filter (runs first).
+;; ====================================================================
+(set Tstr (table [s v] (list ["Apple" "Banana" "avocado" "blueberry" "APRICOT" "cherry"] [10 20 30 40 50 60])))
+
+;; ilike with * wildcard (case-insensitive): matches "Apple", "avocado", "APRICOT" → 3 rows
+(count (select {from: Tstr where: (ilike s "a*")})) -- 3
+
+;; ilike inside AND chain — filter_cost reorders ilike to run last
+;; (and (> v 25) (ilike s "a*")): v>25 keeps rows {30,40,50,60};
+;; ilike filters to rows with s starting with a/A: {avocado=30, APRICOT=50}
+;; → 2 rows
+(count (select {from: Tstr where: (and (> v 25) (ilike s "a*"))})) -- 2
+(sum (at (select {from: Tstr where: (and (> v 25) (ilike s "a*"))}) 'v)) -- 80
+
+;; reverse order: same result after reorder
+(count (select {from: Tstr where: (and (ilike s "a*") (> v 25))})) -- 2
+(sum (at (select {from: Tstr where: (and (ilike s "a*") (> v 25))}) 'v)) -- 80
+
+;; ====================================================================
+;; Section 8: pass_predicate_pushdown — ALIAS pushdown (line 1358)
+;;
+;; When FILTER's child is OP_ALIAS, the predicate is pushed below the alias.
+;; This fires when the child has a single consumer (count_node_consumers == 1).
+;; ====================================================================
+;; A negation creates an OP_NEG (alias-like), and a filter on top should push down
+;; This is tested via a nested select with an expression column
+(set Tpp (table [a] (list [1 2 3 4 5])))
+;; nested select: outer select on an inner select with computed column
+;; b = (* a 2) = [2,4,6,8,10]; b>6 → {8,10} → 2 rows
+(set Inner (select {b: (* a 2) from: Tpp}))
+(count (select {from: Inner where: (> b 6)})) -- 2
+
+;; Predicate pushdown through OP_ALIAS (created by SELECT with renamed col)
+;; inner has OP_SELECT with alias; outer WHERE pushes through
+(set Pre  (select {from: Tpp where: (> a 3)}))
+(set Post (select {from: (select {x: a from: Tpp}) where: (> x 3)}))
+(count Pre)  -- 2
+(count Post) -- 2
+
+;; ====================================================================
+;; Section 9: fold_binary_const — I32 case (lines 455-474)
+;;
+;; I32 case fires when out_type == RAY_I32.  For (+ i32_const i32_const),
+;; promote_type gives RAY_I32 so fold_binary_const I32 arm runs.
+;; ====================================================================
+;; I32 ADD, SUB, MUL already have coverage from existing tests.
+;; I32 MOD edge case: line 467 with the INT32_MIN guard
+;; RFL uses floored division for integers
+(% 1000i 7i)  -- 6
+(% -1000i 7i) -- 1
+;; I32 add to get larger values
+(+ 2000000i 3000000i)  -- 5000000
+(- 10000000i 3000000i) -- 7000000
+
+;; I64 add/sub with large values hitting different BOOL folding branches
+(+ 9000000000 1)   -- 9000000001
+(- 5000000000 1)   -- 4999999999

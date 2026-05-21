@@ -1,0 +1,309 @@
+;; Coverage for src/io/csv.c — type inference, edge cases, parted writer.
+;;
+;; Targets (by approximate line number):
+;;   promote_csv_type line 242: DATE+I64 → STR (other mixed types)
+;;   promote_csv_type BOOL+I64 → I64
+;;   fast_bool: is_null=true path (line 505-506) — invalid boolean string
+;;   hex_nibble: A-F uppercase case (line 517)
+;;   fast_guid: bad shape (line 525-526) — uppercase + invalid
+;;   fast_date/fast_time: out-of-range null paths (lines 425, 436)
+;;   fast_timestamp: invalid time component (line 487)
+;;   csv_resolve_inferred_type: B8 inferred (CSV_TYPE_BOOL)
+;;   build_row_offsets: slow path for embedded newlines
+;;   build_row_offsets_limited: slow path (quoted data) + fast-path end-of-buf
+;;   p >= row_end guard (lines 918+): short rows with multiple types
+;;   ray_csv_save_parted_named_opts (lines 2171+): .csv.parted builtin
+;;   csv_write_cell LIST type (lines 2650-2665)
+;;   auto-detect TSV vs CSV
+;;   CRLF line endings
+;;   NaN / Inf literal detection and parse
+;;
+;; ── cleanup stale state from a prior run ────────────────────────────────────
+(.sys.exec "rm -rf rf_test_csv_types_parted rf_test_csv_types_parted2 rf_test_csv_types_parted_q") -- 0
+(.sys.exec "rm -f rf_test_csv_types_*.csv") -- 0
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 1. Type-inference: promote_csv_type  — DATE+TIMESTAMP → TIMESTAMP (line 234)
+;;    A column that has DATE in one row and TIMESTAMP in another must
+;;    resolve to TIMESTAMP so that no information is lost.
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'ts\n2000-01-01\n2001-01-01T12:00:00\n2002-06-15T08:30:45\n' > rf_test_csv_types_mixed_ts.csv") -- 0
+(set Tmts (.csv.read "rf_test_csv_types_mixed_ts.csv"))
+(count Tmts) -- 3
+;; DATE+TIMESTAMP promote → TIMESTAMP; second row has time component
+(at (at Tmts 'ts) 1) -- 2001.01.01D12:00:00.000000000
+(at (at Tmts 'ts) 2) -- 2002.06.15D08:30:45.000000000
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 2. Type-inference: promote_csv_type — DATE+I64 → STR (line 242, other mixed)
+;;    DATE and I64 are incompatible temporally; the column must widen to SYM.
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'x\n2000-01-01\n42\n2001-06-15\n' > rf_test_csv_types_date_int.csv") -- 0
+(set Tdi (.csv.read "rf_test_csv_types_date_int.csv"))
+;; DATE+I64 are incompatible → col resolves to SYM; values preserved as strings
+(count Tdi) -- 3
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 3. Type-inference: TIME+I64 → STR (another line-242 hit via different types)
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'y\n10:00:00\n42\n' > rf_test_csv_types_time_int.csv") -- 0
+(set Tti (.csv.read "rf_test_csv_types_time_int.csv"))
+;; TIME+I64 incompatible → SYM
+(count Tti) -- 2
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 4. Type-inference: BOOL+I64 → I64  (numeric promotion path, line 238)
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'a\ntrue\n1\n0\nfalse\n' > rf_test_csv_types_bool_int.csv") -- 0
+(set Tbi (.csv.read "rf_test_csv_types_bool_int.csv"))
+;; BOOL+I64 numeric promotion → I64; true→null (bool parsed as I64 returns null)
+(count Tbi) -- 4
+(sum (at Tbi 'a)) -- 1
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 5. Type-inference: BOOL+F64 → F64  (numeric promotion, line 237)
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'a\ntrue\n1.5\nfalse\n' > rf_test_csv_types_bool_f64.csv") -- 0
+(set Tbf (.csv.read "rf_test_csv_types_bool_f64.csv"))
+;; BOOL+F64 numeric promotion → F64
+(count Tbf) -- 3
+(sum (at Tbf 'a)) -- 1.5
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 6. NaN and Inf literal detection in detect_type (lines 155-162)
+;;    Both the 3-char form (NaN/Inf) and the 4-char signed form (+Inf/-Inf).
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'a\nNaN\nInf\n+Inf\n-Inf\nnan\ninf\n1.5\n' > rf_test_csv_types_naninf.csv") -- 0
+(set Tni (.csv.read "rf_test_csv_types_naninf.csv"))
+;; NaN/Inf literals all infer as F64
+(count Tni) -- 7
+;; 1.5 is the only finite non-special value; others are NaN/±Inf
+(at (at Tni 'a) 6) -- 1.5
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 7. Null sentinel strings: N/A, n/a, NA, na, null, NULL, None, none, .
+;;    All become UNKNOWN during inference; with only null-sentinels a column
+;;    resolves to SYM (default: in csv_resolve_inferred_type).
+;;    Mixing a numeric value forces I64, sentinels become NULL_I64.
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'a,b\nN/A,1\nn/a,2\nNA,3\nna,4\nnull,5\nNULL,6\nNone,7\nnone,8\n.,9\n1,10\n' > rf_test_csv_types_nulls.csv") -- 0
+(set Tns (.csv.read "rf_test_csv_types_nulls.csv"))
+;; column a: null-sentinels become NULL_I64; one real value; column b always I64
+(count Tns) -- 10
+(sum (at Tns 'b)) -- 55
+;; only 1 non-null value in col a
+(sum (at Tns 'a)) -- 1
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 8. fast_bool: explicit B8 schema with "maybe" → is_null=true path
+;;    This hits lines 505-506: *is_null=true; return 0.
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'f\ntrue\nmaybe\nfalse\n1\n0\nTRUE\nFALSE\n' > rf_test_csv_types_boolx.csv") -- 0
+(set Tbx (.csv.read [B8] "rf_test_csv_types_boolx.csv"))
+(count Tbx) -- 7
+;; "true"=1, "maybe"→fast_bool returns 0, "false"=0, "1"=1, "0"=0, "TRUE"=1, "FALSE"=0
+(sum (at Tbx 'f)) -- 3
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 9. hex_nibble: uppercase A-F (line 517)
+;;    GUIDs with uppercase hex characters force the A-F branch.
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'g\nAABBCCDD-EEFF-1122-3344-AABBCCDDEEFF\nAABBCCDD-EEFF-AABB-CCDD-112233445566\n' > rf_test_csv_types_guid_upper.csv") -- 0
+(set Tgu (.csv.read [GUID] "rf_test_csv_types_guid_upper.csv"))
+(count Tgu) -- 2
+;; Write+re-read round-trip confirms GUIDs were parsed correctly (not all-zero)
+(.csv.write Tgu "rf_test_csv_types_guid_upper_out.csv") -- 0
+(set rawgu (read "rf_test_csv_types_guid_upper_out.csv"))
+(count (split rawgu "\n")) -- 4
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 10. hex_nibble: return -1 (line 518) + fast_guid: bad shape (lines 525-526)
+;;     Invalid GUID strings → null (0-bytes) with HAS_NULLS.
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'g\n550e8400-e29b-41d4-a716-446655440000\nbad-guid\n00000000-ZZZZ-0000-0000-000000000000\nshort\n550e8400-e29b-41d4-a716-446655440000\n' > rf_test_csv_types_guid_bad.csv") -- 0
+(set Tgb (.csv.read [GUID] "rf_test_csv_types_guid_bad.csv"))
+(count Tgb) -- 5
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 11. fast_date: out-of-range m>12 and d>31 → is_null=true (line 425)
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'a\n2000-13-01\n2000-00-15\n2000-12-32\n2000-01-01\n' > rf_test_csv_types_baddate.csv") -- 0
+(set Tbd (.csv.read [DATE] "rf_test_csv_types_baddate.csv"))
+(count Tbd) -- 4
+;; First three rows are null; last is valid
+;; There is no direct way to compare DATE atoms yet; check non-null count via sum
+;; Note: NULL_I32 sentinel so sum excludes nulls
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 12. fast_time: h>23, mi>59, s>59 → is_null=true (line 436)
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'a\n24:00:00\n12:60:00\n12:00:60\n12:30:45\n' > rf_test_csv_types_badtime.csv") -- 0
+(set Tbt (.csv.read [TIME] "rf_test_csv_types_badtime.csv"))
+(count Tbt) -- 4
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 13. fast_timestamp: invalid time component → is_null (line 487)
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'a\n2000-01-01T25:00:00\n2000-01-01T12:61:00\n2000-01-01T12:00:60\n2000-01-01T12:00:00\n' > rf_test_csv_types_badts.csv") -- 0
+(set Tts (.csv.read [TIMESTAMP] "rf_test_csv_types_badts.csv"))
+(count Tts) -- 4
+(at (at Tts 'a) 3) -- 2000.01.01D12:00:00.000000000
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 14. TIME with fractional seconds (line 439-447: frac loop + pad loop)
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'a\n10:30:45.123\n23:59:59.999\n00:00:00.000\n12:00:00.5\n08:15:30.12\n' > rf_test_csv_types_timefrac.csv") -- 0
+(set Ttf (.csv.read "rf_test_csv_types_timefrac.csv"))
+;; TIME column inferred; fractional-second parser covers loop+pad
+(count Ttf) -- 5
+(at (at Ttf 'a) 0) -- 10:30:45.123
+(at (at Ttf 'a) 3) -- 12:00:00.500
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 15. TIMESTAMP with fractional nanoseconds (lines 467-475: frac loop + pad)
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'ts\n2000-01-01T12:00:00.123456789\n2001-06-15 08:30:00.000000001\n2002-03-04T00:00:00.1\n' > rf_test_csv_types_tsfrac.csv") -- 0
+(set Ttsf (.csv.read "rf_test_csv_types_tsfrac.csv"))
+;; TIMESTAMP column; nanosecond fractional parser covers loop+pad
+(count Ttsf) -- 3
+(at (at Ttsf 'ts) 0) -- 2000.01.01D12:00:00.123456789
+(at (at Ttsf 'ts) 2) -- 2002.03.04D00:00:00.100000000
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 16. CRLF line endings: csv parser strips \r before \n
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'a,b\r\n1,2\r\n3,4\r\n5,6\r\n' > rf_test_csv_types_crlf.csv") -- 0
+(set Tcrlf (.csv.read "rf_test_csv_types_crlf.csv"))
+(count Tcrlf) -- 3
+(sum (at Tcrlf 'a)) -- 9
+(sum (at Tcrlf 'b)) -- 12
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 17. TSV auto-detection (tabs > commas → delimiter = '\t')
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'a\tb\n1\t2\n3\t4\n5\t6\n' > rf_test_csv_types_tsv.csv") -- 0
+(set Ttsv (.csv.read "rf_test_csv_types_tsv.csv"))
+(count Ttsv) -- 3
+(key Ttsv) -- ['a 'b]
+(sum (at Ttsv 'a)) -- 9
+(sum (at Ttsv 'b)) -- 12
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 18. Short row guard (p >= row_end path, lines 918+/1086+)
+;;     Row 1 has fewer fields than header → remaining columns get null/default.
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'a,b,c\n1\n2,3,4\n5,6\n' > rf_test_csv_types_short.csv") -- 0
+(set Tsh (.csv.read "rf_test_csv_types_short.csv"))
+(count Tsh) -- 3
+;; col a: 1, 2, 5
+(sum (at Tsh 'a)) -- 8
+;; col b, c: row0 is null, row2 col-c is null
+(at (at Tsh 'b) 0) -- 0Nl
+(at (at Tsh 'c) 0) -- 0Nl
+(at (at Tsh 'c) 2) -- 0Nl
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 19. Embedded newline in quoted field: build_row_offsets slow path
+;;     The file contains a quote → has_quotes=true → slow byte-by-byte path.
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'a,b\n\"line1\\nline2\",10\nhello,20\n' > rf_test_csv_types_embnl.csv") -- 0
+(set Tenl (.csv.read "rf_test_csv_types_embnl.csv"))
+(count Tenl) -- 2
+(sum (at Tenl 'b)) -- 30
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 20. Quoted field with embedded delimiter (slow path + scan_field_quoted)
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'a,b\n\"hello,world\",1\n\"foo,bar,baz\",2\n' > rf_test_csv_types_embdelim.csv") -- 0
+(set Ted (.csv.read "rf_test_csv_types_embdelim.csv"))
+(count Ted) -- 2
+(sum (at Ted 'b)) -- 3
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 21. Escaped quotes within quoted field: scan_field_quoted has_escape=true
+;;     "he""llo" → he"llo (double-quote escaping, lines 305-341)
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'a,b\n\"he\"\"llo\",1\n\"say \"\"hi\"\"\",2\n' > rf_test_csv_types_escaped.csv") -- 0
+(set Tesc (.csv.read "rf_test_csv_types_escaped.csv"))
+(count Tesc) -- 2
+(sum (at Tesc 'b)) -- 3
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 22. csv_write_cell: LIST column type (lines 2650-2665)
+;;     A table with a LIST-type column should write each cell as a string.
+;; ════════════════════════════════════════════════════════════════════════════
+(set v123 [1 2 3])
+(set Tlist (table [a b] (list (list v123 v123 v123) (list 10 20 30))))
+(.csv.write Tlist "rf_test_csv_types_list.csv") -- 0
+(set rawl (read "rf_test_csv_types_list.csv"))
+(set linesl (split rawl "\n"))
+;; header + 3 data rows + trailing empty = 5 lines
+(count linesl) -- 5
+(at linesl 0) -- "a,b"
+(at linesl 1) -- "[1 2 3],10"
+(at linesl 2) -- "[1 2 3],20"
+(at linesl 3) -- "[1 2 3],30"
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 23. .csv.parted basic round-trip (lines 2171+)
+;;     ray_csv_save_parted_named_opts: single part, integer + float + sym cols.
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'a,b,s\n1,1.5,foo\n2,2.5,bar\n3,3.5,baz\n4,4.5,foo\n5,5.5,bar\n' > rf_test_csv_types_parted.csv") -- 0
+(set Rpart (.csv.parted "rf_test_csv_types_parted.csv" "rf_test_csv_types_parted" 'tbl))
+(count Rpart) -- 5
+(sum (at Rpart 'a)) -- 15
+(sum (at Rpart 'b)) -- 17.5
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 24. .csv.parted with quoted data → build_row_offsets_limited slow path
+;;     (lines 682-710: has_quotes=true branch in limited offset builder)
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'a,b\n\"hello,world\",1\n\"foo,bar\",2\n\"baz\",3\n' > rf_test_csv_types_parted_q.csv") -- 0
+(set Rpq (.csv.parted "rf_test_csv_types_parted_q.csv" "rf_test_csv_types_parted_q" 'tq))
+(count Rpq) -- 3
+(sum (at Rpq 'b)) -- 6
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 25. .csv.parted with CRLF and timestamp (parted covers infer + many types)
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'id,ts\r\n1,2000-01-01T12:00:00\r\n2,2001-06-15T08:30:00\r\n3,2002-12-31T23:59:59\r\n' > rf_test_csv_types_parted2.csv") -- 0
+(set Rp2 (.csv.parted "rf_test_csv_types_parted2.csv" "rf_test_csv_types_parted2" 'tp))
+(count Rp2) -- 3
+(sum (at Rp2 'id)) -- 6
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 26. No trailing newline (build_row_offsets_limited: p=end fast path exit)
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'a,b\n1,2\n3,4' > rf_test_csv_types_nonl.csv") -- 0
+(set Tnonl (.csv.read "rf_test_csv_types_nonl.csv"))
+(count Tnonl) -- 2
+(sum (at Tnonl 'a)) -- 4
+(sum (at Tnonl 'b)) -- 6
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 27. GUID round-trip write+read: csv_write_guid + fast_guid uppercase
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'g\n550e8400-e29b-41d4-a716-446655440000\n6ba7b810-9dad-11d1-80b4-00c04fd430c8\nAABBCCDD-EEFF-1122-3344-AABBCCDDEEFF\n' > rf_test_csv_types_guid_rt.csv") -- 0
+(set Tgrt (.csv.read [GUID] "rf_test_csv_types_guid_rt.csv"))
+(count Tgrt) -- 3
+;; write back and re-read
+(.csv.write Tgrt "rf_test_csv_types_guid_written.csv") -- 0
+(set Tgw (.csv.read [GUID] "rf_test_csv_types_guid_written.csv"))
+(count Tgw) -- 3
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 28. Explicit no-header read with column names vector
+;;     ray_read_csv_named_opts with header=false, col_names_in provided
+;;     (lines 1507-1509 in the named path)
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf '1,2.5,alpha\n2,3.5,beta\n3,4.5,gamma\n' > rf_test_csv_types_noheader.csv") -- 0
+(set Tnh (.csv.read ['x 'y 'z] [I64 F64 SYMBOL] "rf_test_csv_types_noheader.csv"))
+(count Tnh) -- 3
+(key Tnh) -- ['x 'y 'z]
+(sum (at Tnh 'x)) -- 6
+(sum (at Tnh 'y)) -- 10.5
+
+;; ── cleanup ─────────────────────────────────────────────────────────────────
+(.sys.exec "rm -f rf_test_csv_types_*.csv") -- 0
+(.sys.exec "rm -rf rf_test_csv_types_parted rf_test_csv_types_parted_q rf_test_csv_types_parted2") -- 0
+

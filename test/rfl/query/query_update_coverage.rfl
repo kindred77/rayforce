@@ -1,0 +1,284 @@
+;; Coverage for update paths in `src/ops/query.c`:
+;;
+;;   WHERE-branch update — I32 null propagation (lines ~8553-8555):
+;;     Cross-type update (I32 col with F64 expr) with null values in
+;;     orig column. The null-propagation switch covers I32/DATE/TIME case.
+;;
+;;   WHERE-branch update — I64→F64 vector promotion (lines ~8658-8678):
+;;     expr_vec->type==RAY_I64 && ct==RAY_F64 path. When the update expression
+;;     returns an I64 vector but the column is F64, each element is promoted.
+;;
+;;   No-WHERE update — LIST column with SYM atom (lines ~8813-8824):
+;;     ct==RAY_LIST && expr_vec->type==-RAY_SYM. Broadcasts SYM atom as
+;;     boxed list across all rows of a LIST column.
+;;
+;;   No-WHERE update — I32 null of new column (lines ~8987-8997):
+;;     Adding a new I32-null column in no-where update broadcast path.
+;;
+;;   NOTE: WHERE-branch LIST+SYM path (lines 8579-8595) is unreachable from
+;;     RFL because ray_vec_new(RAY_LIST, n) at line 8482 returns an error —
+;;     RAY_LIST is a container type not supported by ray_vec_new.
+
+;; ────────────────────────────────────────────────────────────────────
+;; WHERE-branch update: eval fallback when DAG compilation fails (lines 8500-8509)
+;; (pow val 2) is NOT in resolve_binary_dag → compile_expr_dag returns NULL
+;; → fallback at 8499: push table cols to scope, ray_eval((pow val 2))
+;; Result is F64 (pow returns float) → cross-type I64←F64 update at 8517
+;; ────────────────────────────────────────────────────────────────────
+(set Tu_pow (table [id val] (list [1 2 3 4] [2 3 4 5])))
+;; WHERE id>1 masks rows 1,2,3; pow([2,3,4,5], 2) = [4.0,9.0,16.0,25.0]
+;; Row 0 (id=1): unchanged val=2; rows 1-3: val = trunc(pow) = 9,16,25
+(count (update {val: (pow val 2) from: Tu_pow where: (> id 1)})) -- 4
+(at (at (update {val: (pow val 2) from: Tu_pow where: (> id 1)}) 'val) 0) -- 2
+(at (at (update {val: (pow val 2) from: Tu_pow where: (> id 1)}) 'val) 1) -- 9
+
+;; ────────────────────────────────────────────────────────────────────
+;; WHERE-branch update: I32 column update with F64 promotion + nulls
+;; Lines 8553-8555: null propagation switch — I32 case
+;; Need: cross-type vector update (ct==I32, expr_type==F64) AND null in orig col
+;; ────────────────────────────────────────────────────────────────────
+(set Ti32 (table [id val] (list [1i 2i 3i] [100i 200i 300i])))
+;; First inject a null into the I32 val column at row id=1
+(set Ti32n (update {val: 0Ni from: Ti32 where: (== id 1i)}))
+;; Now do cross-type F64 update on the I32-with-null column
+;; Update where id==3i so row 2 is masked, rows 0,1 are unmasked
+;; Row 0 (id=1,val=0Ni) is unmasked → null prop fires → switch case RAY_I32
+(set Ti32_u (update {val: (* val 1.5) from: Ti32n where: (== id 3i)}))
+;; Count should be 3 (table size unchanged)
+(count Ti32_u) -- 3
+;; Row 0 has null (propagated) — nil? should return true
+(nil? (at (at Ti32_u 'val) 0)) -- true
+
+;; ────────────────────────────────────────────────────────────────────
+;; WHERE-branch update: I64 expr → F64 column promotion (lines 8658-8678)
+;; expr_vec->type==RAY_I64 (whole column) && ct==RAY_F64
+;; Triggered when an I64-typed expression result updates an F64 column
+;; ────────────────────────────────────────────────────────────────────
+(set Tf64 (table [id val] (list [1 2 3 4] [10.0 20.0 30.0 40.0])))
+;; Update val (F64) where id > 2 with expression that returns I64 vec
+;; The I64→F64 promotion at 8657-8678 fires here
+(set Tf64_u (update {val: (+ (as 'I64 val) 5) from: Tf64 where: (> id 2)}))
+(count Tf64_u) -- 4
+(at (at Tf64_u 'val) 0) -- 10.0
+(at (at Tf64_u 'val) 2) -- 35.0
+
+;; ────────────────────────────────────────────────────────────────────
+;; No-WHERE update: LIST column with SYM atom broadcast (lines 8813-8824)
+;; ct==RAY_LIST, expr_vec==-SYM atom → broadcast boxed list to all rows
+;; ────────────────────────────────────────────────────────────────────
+(set Tlst2 (table [k lst] (list ['A 'B 'C] (list [1 2] [3 4] [5 6]))))
+;; Update all rows: lst becomes 'broadcast_sym everywhere
+(set Tlst2_u (update {lst: 'broadcast_sym from: Tlst2}))
+(count Tlst2_u) -- 3
+(count (at Tlst2_u 'lst)) -- 3
+
+;; ────────────────────────────────────────────────────────────────────
+;; No-WHERE update: I32 null of EXISTING column broadcast (lines 8866-8876)
+;; ct = orig_col->type = RAY_I32, expr = 0Ni → switch case RAY_I32
+;; ────────────────────────────────────────────────────────────────────
+(set Ti32b (table [id val] (list [1i 2i 3i] [10i 20i 30i])))
+;; Update existing I32 val column with 0Ni (null) — no-WHERE broadcast
+;; Lines 8851-8877: RAY_ATOM_IS_NULL(expr_vec)=true, ct=RAY_I32 → case 8866
+(set Ti32b_u (update {val: 0Ni from: Ti32b}))
+(count Ti32b_u) -- 3
+(nil? (at (at Ti32b_u 'val) 0)) -- true
+(nil? (at (at Ti32b_u 'val) 1)) -- true
+
+;; ────────────────────────────────────────────────────────────────────
+;; No-WHERE update: F64 null of EXISTING F64 column (lines 8856-8860)
+;; ct = orig_col->type = RAY_F64, expr = 0Nf → switch case RAY_F64
+;; ────────────────────────────────────────────────────────────────────
+(set Tf64b (table [id val] (list [1 2 3] [10.0 20.0 30.0])))
+;; Update existing F64 val column with 0Nf → null broadcast to all rows
+(set Tf64b_u (update {val: 0Nf from: Tf64b}))
+(count Tf64b_u) -- 3
+(nil? (at (at Tf64b_u 'val) 0)) -- true
+(nil? (at (at Tf64b_u 'val) 1)) -- true
+
+;; ────────────────────────────────────────────────────────────────────
+;; No-WHERE update: I16 null broadcast (lines 8871-8874)
+;; ct = RAY_I16, expr = 0Nh (type -RAY_I16) → ok=1 → null switch case I16
+;; ────────────────────────────────────────────────────────────────────
+(set Ti16b (table [id val] (list [1i 2i 3i] (as 'I16 [10 20 30]))))
+;; Update I16 val column with 0Nh (I16 null atom) → null broadcast
+(set Ti16b_u (update {val: 0Nh from: Ti16b}))
+(count Ti16b_u) -- 3
+(nil? (at (at Ti16b_u 'val) 0)) -- true
+(nil? (at (at Ti16b_u 'val) 1)) -- true
+
+;; NOTE: Lines 8876 default (BOOL/U8/SYM null broadcast) are unreachable:
+;;   No BOOL/U8/SYM null literal syntax exists (no 0Nb suffix in the parser).
+;;   For BOOL columns, ct=RAY_BOOL: ok=(expr_vec->type==-RAY_BOOL) requires a
+;;   -RAY_BOOL atom, which the parser cannot produce.
+
+;; ────────────────────────────────────────────────────────────────────
+;; No-WHERE update: F64 null of NEW column broadcast (lines 8977-8981)
+;; Adding a NEW F64-null column in no-where update
+;; ct = -expr_vec->type = RAY_F64, RAY_ATOM_IS_NULL=true → case 8977
+;; ────────────────────────────────────────────────────────────────────
+(set Tnewf (table [id val] (list [1 2 3] [10 20 30])))
+;; Add new F64 null column (0Nf)
+(set Tnewf_u (update {fval: 0Nf from: Tnewf}))
+(count Tnewf_u) -- 3
+(nil? (at (at Tnewf_u 'fval) 0)) -- true
+
+;; ────────────────────────────────────────────────────────────────────
+;; No-WHERE update: I32 null of new-column broadcast (lines 8987-8997)
+;; Adding a NEW I32-null column in no-where update
+;; ────────────────────────────────────────────────────────────────────
+(set Tnew (table [id val] (list [1 2 3] [10 20 30])))
+;; Add new I32 column with null value (0Ni)
+;; Lines 8976-8997: new column broadcast with 0Ni → switch case RAY_I32
+(set Tnew_u (update {extra: 0Ni from: Tnew}))
+(count Tnew_u) -- 3
+(nil? (at (at Tnew_u 'extra) 0)) -- true
+
+;; ────────────────────────────────────────────────────────────────────
+;; append_atom_to_col type error paths (lines 8204, 8209, 8214, 8219, 8227)
+;; Wrong-type atoms inserted into typed columns.
+;; ────────────────────────────────────────────────────────────────────
+;; Line 8204: I64 column, non-I64 atom (SYM atom) → "error: type"
+(insert (table [k] (list [1 2])) (list 'bad)) !- type
+;; Line 8209: SYM column, non-SYM atom (I64) → "error: type"
+(insert (table [k] (list ['a 'b])) (list 123)) !- type
+;; Line 8214: F64 column, non-F64/I64 atom (SYM) → "error: type"
+(insert (table [k] (list [1.0 2.0])) (list 'bad)) !- type
+;; Line 8219: BOOL column, non-BOOL atom (I64) → "error: type"
+(insert (table [k v] (list [1 2] [true false])) (list 3 123)) !- type
+;; Line 8227: STR column, non-STR atom (I64) → "error: type"
+(insert (table [k] (list ["a" "b"])) (list 123)) !- type
+
+;; ────────────────────────────────────────────────────────────────────
+;; No-WHERE update: I64 atom into F64 col broadcast (lines 8838-8840)
+;; ct==RAY_F64, expr_vec==−RAY_I64 atom (integer literal)
+;; The F64←I64 promotion fires in the scalar broadcast path
+;; ────────────────────────────────────────────────────────────────────
+(set Tf64atom (table [id val] (list [1 2 3] [1.0 2.0 3.0])))
+;; Update F64 val column with integer 42 → I64 atom promoted to F64
+(set Tf64atom_u (update {val: 42 from: Tf64atom}))
+(count Tf64atom_u) -- 3
+(at (at Tf64atom_u 'val) 0) -- 42.0
+(at (at Tf64atom_u 'val) 1) -- 42.0
+
+;; ────────────────────────────────────────────────────────────────────
+;; No-WHERE update: fallback eval when DAG compilation fails (lines 8787-8796)
+;; (pow val 2) NOT in resolve_binary_dag → expr_vec=NULL → fallback eval
+;; ────────────────────────────────────────────────────────────────────
+(set Tpow_nw (table [id val] (list [1 2 3] [2.0 3.0 4.0])))
+;; Update val (F64) with pow(val,2) — forces eval fallback in no-WHERE path
+(set Tpow_nw_u (update {val: (pow val 2) from: Tpow_nw}))
+(count Tpow_nw_u) -- 3
+(at (at Tpow_nw_u 'val) 0) -- 4.0
+(at (at Tpow_nw_u 'val) 2) -- 16.0
+
+;; ────────────────────────────────────────────────────────────────────
+;; No-WHERE update: type error for incompatible vectors (lines 8922-8924)
+;; expr_vec is a vector (type>0) and not numeric/SYM/LIST interop → error
+;; e.g. updating I64 column with a STR vector → "error: type"
+;; ────────────────────────────────────────────────────────────────────
+;; (update {id: (as 'STR id) from: T}) — can't update I64 col with STR vec
+;; NOTE: this requires the dag compiler to fail and produce an STR vec,
+;; but in practice any STR expression on an I64 column errors first at
+;; the DAG type check level. The path at 8922-8924 is unreachable because
+;; no-WHERE DAG path with type mismatch is caught before we reach there.
+
+;; ────────────────────────────────────────────────────────────────────
+;; Insert into table with BOOL column (append_atom_to_col line 8217)
+;; append_atom_to_col has ct==RAY_BOOL branch; covered via insert row.
+;; ────────────────────────────────────────────────────────────────────
+(set Tbool_ins (table [k v] (list [1 2] [true false])))
+;; Insert a new row with BOOL value → append_atom_to_col ct==RAY_BOOL branch
+(count (insert Tbool_ins (list 3 true))) -- 3
+(at (at (insert Tbool_ins (list 3 false)) 'v) 2) -- false
+
+;; ────────────────────────────────────────────────────────────────────
+;; Upsert with SYM key name (line 9495 in query.c)
+;; key_sym->type == -RAY_SYM branch in the upsert partial-update path
+;; Only triggered when row is a TABLE (not dict/list), because lines
+;; 9492-9516 are inside the `if (row->type == RAY_TABLE)` block.
+;; ────────────────────────────────────────────────────────────────────
+(set Tups (table [id val] (list [1 2 3] [10 20 30])))
+;; Upsert with TABLE row and SYM key_sym → hits line 9494 (-RAY_SYM)
+(count (upsert Tups 'id (table [id val] (list [4] [40])))) -- 4
+(at (at (upsert Tups 'id (table [id val] (list [2] [99]))) 'val) 1) -- 99
+
+;; ────────────────────────────────────────────────────────────────────
+;; xbar on I16 column (lines 8059-8068 in query.c)
+;; ray_xbar_fn dispatches on out_type; I16 branch at line 8058
+;; ────────────────────────────────────────────────────────────────────
+;; I16 xbar: (xbar I16_vec bucket) → I16 floor-division loop
+(xbar (as 'I16 [10 20 30 40 50]) 10) -- (as 'I16 [10 20 30 40 50])
+(xbar (as 'I16 [13 27 35 44 51]) 10) -- (as 'I16 [10 20 30 40 50])
+;; Mixed: some negative values (floor-div behaviour)
+(at (xbar (as 'I16 [7]) 5) 0) -- 5h
+
+;; ────────────────────────────────────────────────────────────────────
+;; insert into non-TABLE objects — lines 9057-9079, 9121-9194
+;; ────────────────────────────────────────────────────────────────────
+
+;; Lines 9073-9075: insert into non-list, non-vec type → type error
+(insert (dict [a] (list 1)) 2) !- type
+
+;; Lines 9077-9079: insert vec with n=4 args → domain error
+(insert [1 2 3] 1 2 3) !- domain
+
+;; Lines 9121-9124: insert into vec with type mismatch — 2-arg append
+;; F64 atom into I64 vec, or F64 vec into I64 vec → type error
+(insert [1 2 3] 1.0) !- type
+(insert [1 2 3] [1.0 2.0]) !- type
+
+;; Lines 9130-9132: 3-arg insert, idx eval returns error
+;; raise "domain" as idx → propagates error
+(insert [1 2 3] (raise "domain") 5) !- domain
+
+;; Lines 9135-9138: 3-arg insert, val eval returns error
+(insert [1 2 3] 1 (raise "domain")) !- domain
+
+;; Lines 9152-9154: 3-arg insert into LIST with non-I64 idx type
+;; float idx → type error
+(insert (list 1 2) 1.0 3) !- type
+
+;; Lines 9183-9184: 3-arg insert into vec, idx=atom, val type mismatch
+;; I64 vec, atom idx=1, F64 val → type error
+(insert [1 2 3] 1 1.0) !- type
+
+;; Lines 9188-9189: 3-arg insert into STR vec with multi-idx → type error
+;; Multi-index insert (idx_arg=RAY_I64 vec) on a STR column is not supported
+(insert ["a" "b"] [0 1] "c") !- type
+
+;; Lines 9191-9194: multi-index insert vec, val type mismatch
+;; I64 vec, multi-idx, F64 val → type error
+(insert [1 2 3] [0 1] 1.0) !- type
+
+;; ────────────────────────────────────────────────────────────────────
+;; upsert error paths: invalid key types and values
+;; ────────────────────────────────────────────────────────────────────
+
+(set Tups2 (table [id val] (list [1 2 3] [10 20 30])))
+
+;; Lines 9499-9501: upsert TABLE row with k=0 (k<=0 → domain error)
+(upsert Tups2 0 (table [id val] (list [4] [40]))) !- domain
+
+;; Lines 9505-9507: upsert TABLE row with non-SYM, non-I64 key type → type error
+(upsert Tups2 1.0 (table [id val] (list [4] [40]))) !- type
+
+;; Lines 9636-9638: upsert list/dict row with non-SYM, non-I64 key_sym → type error
+(upsert Tups2 1.0 (list 4 40)) !- type
+
+;; Lines 9690-9692: upsert with SYM key col but non-SYM key atom in row → type error
+(set Tsymkey (table [k v] (list [alice bob] [10 20])))
+(upsert Tsymkey 1 (list 123 30)) !- type
+
+;; Lines 9708: upsert with SYM key col matching existing row
+;; alice matches row 0 → update val to 99
+(at (at (upsert Tsymkey 1 (list 'alice 99)) 'v) 0) -- 99
+
+;; Lines 9720-9722: upsert with I32 key col (tests the I32 match branch)
+;; The I32 key match branch (kt==RAY_I32) exercises lines 9720-9722.
+;; Key 2 not found in table (I32 col) → inserts. append_atom_to_col fails for I32 col.
+;; NOTE: apply_sort_take error paths and match for I32 are covered by match loop
+;; execution even when the subsequent update fails with type error.
+(set Ti32key (table [k v] (list (as 'I32 [1 2 3]) [10 20 30])))
+;; I32 key col, key=2i (I32 atom), list row: match loop at lines 9717-9722 runs
+;; (match for k=2 found), but update via append_atom_to_col fails for I32 col
+(upsert Ti32key 1 (list 2i 99)) !- type

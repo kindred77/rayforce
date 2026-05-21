@@ -1,0 +1,124 @@
+;; Coverage for the fused expression evaluator (expr_compile + expr_eval_full)
+;; in expr.c, targeting paths in:
+;;   expr_exec_unary (lines 803-861): F64→F64, I64→I64 with OP_ROUND/ABS/NEG/CAST
+;;   expr_exec_binary: OP_AND/OR I64 path (line 785-786)
+;;   exec_elementwise_binary for F64 columns in table context
+;;   binary_range for I64 idiv (line 1708)
+;;   OP_CAST F64→F64 in fused path (line 818)
+;;
+;; All tests below use (select {...} from: T) to force the table context
+;; so expr_compile fires and the fused morsel evaluator runs.
+
+;; ===================================================================
+;; Setup: tables for fused expression tests
+;; ===================================================================
+(set Tf (table [x y] (list [1.0 2.0 3.0 4.0 5.0] [5.0 4.0 3.0 2.0 1.0])))
+(set Ti (table [a b] (list [10 20 30 40 50] [3 4 5 6 7])))
+(set Tb (table [p q] (list [true false true false] [true true false false])))
+
+;; ===================================================================
+;; F64 unary ops via fused path
+;; ===================================================================
+
+;; ROUND (line 816 in expr_exec_unary)
+(set Tround (table [x] (list [1.1 2.5 3.7 -1.5 -2.7])))
+(at (select {r: (round x) from: Tround}) 'r) -- [1.0 3.0 4.0 -2.0 -3.0]
+
+;; CAST F64→F64 is identity (line 818): (as 'F64 f64_col) in fused path
+;; The CAST op compiles and a memcpy is used in expr_exec_unary dt=F64 t1=F64
+(at (select {r: (as 'F64 x) from: Tf}) 'r) -- [1.0 2.0 3.0 4.0 5.0]
+
+;; ===================================================================
+;; F64 binary arithmetic via fused path
+;; ===================================================================
+
+;; F64 col + F64 col
+(at (select {s: (+ x y) from: Tf}) 's) -- [6.0 6.0 6.0 6.0 6.0]
+
+;; F64 col - F64 col
+(at (select {d: (- x y) from: Tf}) 'd) -- [-4.0 -2.0 0.0 2.0 4.0]
+
+;; F64 col * F64 col
+(at (select {p: (* x y) from: Tf}) 'p) -- [5.0 8.0 9.0 8.0 5.0]
+
+;; F64 div (line 663 in expr_exec_binary via fused path)
+(at (select {q: (/ x y) from: Tf}) 'q) -- [0.2 0.5 1.0 2.0 5.0]
+
+;; F64 mod (line 664-668 in expr_exec_binary)
+(set Tmod (table [a b] (list [7.0 -7.0 7.0 -7.0] [3.0 3.0 -3.0 -3.0])))
+(at (select {r: (% a b) from: Tmod}) 'r) -- [1.0 2.0 -2.0 -1.0]
+
+;; F64 min2/max2: OP_MIN2 and OP_MAX2 are only generated via graph API (ray_min2/ray_max2),
+;; not through any RFL surface.  The expr_exec_binary OP_MIN2/MAX2 branches in the fused
+;; evaluator (lines 669-670) and binary_range BR_AR_FAST (lines 1621-1622) are unreachable
+;; from RFL.  Documented as dead code in test report.
+
+;; ===================================================================
+;; I64 binary via fused path: AND/OR on boolean columns (lines 695-696)
+;; When dt=I64 but opcode=AND/OR — hits the i64 branch
+;; NOTE: In practice the fused eval produces dt=BOOL for AND/OR ops (RAY_BOOL),
+;; so the dt==I64 AND/OR path in expr_exec_binary is dead code.
+;; The bool branch (lines 785-786) is the live path.
+;; ===================================================================
+
+;; AND/OR over BOOL columns: dt=BOOL path (line 785-786)
+(at (select {r: (and p q) from: Tb}) 'r) -- [true false false false]
+(at (select {r: (or p q) from: Tb}) 'r)  -- [true true true false]
+
+;; ===================================================================
+;; I64 idiv via binary_range line 1708 (floor div via double path)
+;; div maps to OP_IDIV; sign-correct floor division
+;; ===================================================================
+(at (select {r: (div a b) from: Ti}) 'r) -- [3 5 6 6 7]
+
+;; Floor div semantics: rounds toward -infinity
+(set Tdiv (table [a b] (list [7 -7 7 -7 0] [2 2 -2 -2 3])))
+(at (select {r: (div a b) from: Tdiv}) 'r) -- [3 -4 -4 3 0]
+
+;; ===================================================================
+;; I64 add, sub, mul via fused path on table columns
+;; ===================================================================
+(at (select {r: (+ a b) from: Ti}) 'r) -- [13 24 35 46 57]
+(at (select {r: (- a b) from: Ti}) 'r) -- [7 16 25 34 43]
+(at (select {r: (* a b) from: Ti}) 'r) -- [30 80 150 240 350]
+(at (select {r: (% a b) from: Ti}) 'r) -- [1 0 0 4 1]
+
+;; ===================================================================
+;; F64 comparisons via fused path (line 759-766 in expr_exec_binary)
+;; These hit the NaN-null-aware comparison path
+;; ===================================================================
+(set Tcmp (table [x y] (list [1.0 2.0 3.0] [3.0 2.0 1.0])))
+(at (select {r: (== x y) from: Tcmp}) 'r) -- [false true false]
+(at (select {r: (!= x y) from: Tcmp}) 'r) -- [true false true]
+(at (select {r: (< x y) from: Tcmp}) 'r)  -- [true false false]
+(at (select {r: (> x y) from: Tcmp}) 'r)  -- [false false true]
+(at (select {r: (<= x y) from: Tcmp}) 'r) -- [true true false]
+(at (select {r: (>= x y) from: Tcmp}) 'r) -- [false true true]
+
+;; ===================================================================
+;; Chained fused expr: multiple ops compiled into one pass
+;; ===================================================================
+;; (a + b) * 2 — compiled as one expression tree
+(at (select {r: (* (+ a b) 2) from: Ti}) 'r) -- [26 48 70 92 114]
+
+;; (x * y) + 0.5
+(at (select {r: (+ (* x y) 0.5) from: Tf}) 'r) -- [5.5 8.5 9.5 8.5 5.5]
+
+;; Nested arithmetic fused over I64 columns
+(set Tdeep (table [a b c] (list [1 2 3 4 5] [10 20 30 40 50] [100 200 300 400 500])))
+(at (select {r: (+ a (+ b c)) from: Tdeep}) 'r) -- [111 222 333 444 555]
+(at (select {r: (- (* a b) c) from: Tdeep}) 'r) -- [-90 -160 -210 -240 -250]
+
+;; ===================================================================
+;; Type promotion in fused: I64 col in F64 context (CAST I64→F64 inserted)
+;; Exercises expr_ensure_type which inserts OP_CAST into the compiled expr
+;; ===================================================================
+(set Tmix (table [i f] (list [1 2 3 4 5] [0.1 0.2 0.3 0.4 0.5])))
+(at (select {r: (+ i f) from: Tmix}) 'r) -- [1.1 2.2 3.3 4.4 5.5]
+(type (at (select {r: (+ i f) from: Tmix}) 'r)) -- 'F64
+
+;; I64 col / F64 col (OP_DIV forces F64 output, CAST inserted for i)
+(at (select {r: (/ i f) from: Tmix}) 'r) -- [10.0 10.0 10.0 10.0 10.0]
+
+;; Comparison mixed: I64 col vs F64 value triggers type promotion
+(at (select {r: (> i 2.5) from: Tmix}) 'r) -- [false false true true true]

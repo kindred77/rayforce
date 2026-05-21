@@ -1092,3 +1092,17 @@
 (set TGwhere (table [G v lst] (list (take (guid 3) 9) [10 20 30 40 50 60 70 80 90] (list (list 1) (list 2) (list 3) (list 4) (list 5) (list 6) (list 7) (list 8) (list 9)))))
 ;; WHERE keeps subset; first-of-group + LIST gather still works.
 (count (select {from: TGwhere by: G where: (> v 30)})) -- 3
+
+;; ====================================================================
+;; gather_by_idx STR null path (eval.c lines 1121-1123)
+;;
+;; Triggered when:
+;;   1. GROUP BY query has both an agg and a non-agg STR column
+;;   2. The STR column has HAS_NULLS set (via (as 'STR ...))
+;;   3. The numeric group key forces the DAG scatter path
+;;   4. gather_by_idx(str_col, idx, n) is called per group
+;;   5. has_nulls=true → ray_vec_is_null check → null rows hit lines 1122-1123
+;; ====================================================================
+(set Tnull_str (table [g s v] (list [1 2 1 2 1] (as 'STR [1 0Nl 3 1 0Nl]) [10 20 30 40 50])))
+;; Mixed agg + null STR non-agg: gather_by_idx called with null-bearing STR
+(count (at (select {sv: (sum v) s_out: s from: Tnull_str by: g}) 's_out)) -- 2

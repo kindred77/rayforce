@@ -1,0 +1,69 @@
+;; Coverage for AST-level idiom rewrites in `src/ops/query.c`:
+;;   `simplify_agg_idiom` (lines ~1817-1865):
+;;     (first (asc col))    → (min col)   if col is null-free
+;;     (last  (asc col))    → (max col)   if col is null-free
+;;     (count (asc col))    → (count col)
+;;     (count (desc col))   → (count col)
+;;     (count (reverse col))→ (count col)
+;;
+;; These are called from the OP_GROUP planning block at ~5914 for both
+;; single-key and multi-key by-group paths.
+
+;; ────────────────────────────────────────────────────────────────────
+;; Single-key by-group: simplify_agg_idiom via DAG fast path
+;; ────────────────────────────────────────────────────────────────────
+(set Tsi (table [k v] (list ['A 'B 'C 'A 'B 'C] [3 1 4 1 5 2])))
+
+;; (first (asc v)) → (min v): A=1, B=1, C=2
+(count (select {m: (first (asc v)) by: k from: Tsi})) -- 3
+(sum (at (select {m: (first (asc v)) by: k from: Tsi}) 'm)) -- 4
+
+;; (last (asc v)) → (max v): A=3, B=5, C=4
+(count (select {m: (last (asc v)) by: k from: Tsi})) -- 3
+(sum (at (select {m: (last (asc v)) by: k from: Tsi}) 'm)) -- 12
+
+;; (count (asc v)) → (count v): 2 per group, total 6
+(count (select {n: (count (asc v)) by: k from: Tsi})) -- 3
+(sum (at (select {n: (count (asc v)) by: k from: Tsi}) 'n)) -- 6
+
+;; (count (desc v)) → (count v): same result
+(count (select {n: (count (desc v)) by: k from: Tsi})) -- 3
+(sum (at (select {n: (count (desc v)) by: k from: Tsi}) 'n)) -- 6
+
+;; (count (reverse v)) → (count v): same result
+(count (select {n: (count (reverse v)) by: k from: Tsi})) -- 3
+(sum (at (select {n: (count (reverse v)) by: k from: Tsi}) 'n)) -- 6
+
+;; ────────────────────────────────────────────────────────────────────
+;; Multi-key by-group: idiom rewrite goes through the same path
+;; ────────────────────────────────────────────────────────────────────
+(set Tmi (table [g h v] (list ['A 'B 'A 'B 'A] ['X 'X 'Y 'Y 'X] [1 2 3 4 5])))
+;; Groups: (A,X)=[1,5], (B,X)=[2], (A,Y)=[3], (B,Y)=[4]
+
+;; (first (asc v)): A,X=1; B,X=2; A,Y=3; B,Y=4 → sum=10
+(count (select {m: (first (asc v)) by: [g h] from: Tmi})) -- 4
+(sum (at (select {m: (first (asc v)) by: [g h] from: Tmi}) 'm)) -- 10
+
+;; (last (asc v)): A,X=5; B,X=2; A,Y=3; B,Y=4 → sum=14
+(count (select {m: (last (asc v)) by: [g h] from: Tmi})) -- 4
+(sum (at (select {m: (last (asc v)) by: [g h] from: Tmi}) 'm)) -- 14
+
+;; (count (desc v)): A,X=2; B,X=1; A,Y=1; B,Y=1 → sum=5
+(count (select {n: (count (desc v)) by: [g h] from: Tmi})) -- 4
+(sum (at (select {n: (count (desc v)) by: [g h] from: Tmi}) 'n)) -- 5
+
+;; ────────────────────────────────────────────────────────────────────
+;; Idiom rewrites combined with other aggregates in same select
+;; ────────────────────────────────────────────────────────────────────
+(set Tcomb (table [k v1 v2] (list ['A 'B 'A 'B 'A] [1 2 3 4 5] [10 20 30 40 50])))
+;; Mix: (first (asc v1)) + (sum v2) per group
+;; A: min(v1)=1, sum(v2)=90; B: min(v1)=2, sum(v2)=60
+(count (select {mn: (first (asc v1)) s: (sum v2) by: k from: Tcomb})) -- 2
+(sum (at (select {mn: (first (asc v1)) s: (sum v2) by: k from: Tcomb}) 'mn)) -- 3
+(sum (at (select {mn: (first (asc v1)) s: (sum v2) by: k from: Tcomb}) 's)) -- 150
+
+;; (last (asc v1)) + (count (desc v2)):
+;; A: max(v1)=5, count(v2)=3; B: max(v1)=4, count(v2)=2
+(count (select {mx: (last (asc v1)) n: (count (desc v2)) by: k from: Tcomb})) -- 2
+(sum (at (select {mx: (last (asc v1)) n: (count (desc v2)) by: k from: Tcomb}) 'mx)) -- 9
+(sum (at (select {mx: (last (asc v1)) n: (count (desc v2)) by: k from: Tcomb}) 'n)) -- 5

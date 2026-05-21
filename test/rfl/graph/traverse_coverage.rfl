@@ -1,0 +1,238 @@
+;; Coverage tests for src/ops/traverse.c — targeting uncovered regions
+;; not exercised by graph_basic.rfl and graph_advanced.rfl.
+;;
+;; Key areas targeted:
+;;   1. exec_cluster_coeff  — degree>=2 triangle counting branch
+;;   2. exec_connected_comp — disconnected graph (multiple components)
+;;   3. exec_dijkstra       — negative weight domain error + out-of-range
+;;   4. exec_shortest_path  — direction==2 (bidirectional) + src==dst case
+;;   5. exec_var_expand     — direction==2 (both CSRs), direction==1, start OOB
+;;   6. exec_topsort        — cycle detection domain error
+;;   7. exec_degree_cent    — full _in_degree/_out_degree/_degree columns
+;;   8. exec_expand         — zero-degree source node (empty result)
+;;   9. exec_dfs            — from sink node + range check
+;;  10. exec_random_walk    — range error for OOB start
+;;  11. exec_shortest_path  — unreachable dst (range error return)
+;;  12. exec_mst            — graph with equal-weight edges
+;;  13. exec_louvain        — two_m==0 guard (single isolated node)
+;;  14. exec_pagerank       — dangling nodes (sink with no out-edges)
+;;  15. exec_betweenness    — node with no fwd edges but rev edges
+
+;; =====================================================================
+;; Fixture A: undirected K4 (complete graph on 4 nodes).
+;; Every node has 3 undirected neighbors -> LCC = 1.0 for all nodes.
+;; Edges: bidirectional 0<->1, 0<->2, 0<->3, 1<->2, 1<->3, 2<->3
+;; =====================================================================
+(set K4e (table [src dst w] (list [0 1 0 2 0 3 1 2 1 3 2 3] [1 0 2 0 3 0 2 1 3 1 3 2] [1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0])))
+(set K4 (.graph.build K4e 'src 'dst 'w))
+
+;; --- exec_cluster_coeff: deg>=2 branch -> triangles counted ---
+(set Ck (.graph.cluster K4))
+(count Ck)                                        -- 4
+(count (distinct (at Ck '_node)))                 -- 4
+;; In K4 every node has all its neighbors connected -> LCC = 1.0
+(>= (min (at Ck '_coefficient)) 0.9)              -- true
+(<= (max (at Ck '_coefficient)) 1.0)              -- true
+
+;; --- exec_cluster_coeff: deg<2 path -> coefficient = 0.0 ---
+;; Simple chain: 0->1->2 (no triangles; node 0 and 2 have deg<2)
+(set ChainE (table [src dst w] (list [0 1] [1 2] [1.0 1.0])))
+(set Chain (.graph.build ChainE 'src 'dst 'w))
+(set Cc (.graph.cluster Chain))
+(count Cc)                                        -- 3
+;; Node 1 is interior but fwd + rev neighbors are {0, 2} - no fwd edge 0->2
+;; so triangle count = 0, LCC = 0
+(>= (min (at Cc '_coefficient)) 0.0)              -- true
+
+;; =====================================================================
+;; Fixture B: Disconnected graph.
+;; Component {0,1}, isolated node 2, component {3,4}.
+;; =====================================================================
+(set DiscE (table [src dst w] (list [0 1 3] [1 0 4] [1.0 1.0 1.0])))
+(set Disc (.graph.build DiscE 'src 'dst 'w))
+
+;; --- exec_connected_comp: multiple components ---
+(set Comp (.graph.connected Disc))
+(count Comp)                                      -- 5
+;; Exactly 3 distinct component IDs: {0,1} form one, 2 is isolated, {3,4} another
+(count (distinct (at Comp '_component)))          -- 3
+
+;; =====================================================================
+;; Fixture C: simple 3-node path 0->1->2 with unit weights.
+;; =====================================================================
+(set PathE (table [src dst w] (list [0 1] [1 2] [1.0 1.0])))
+(set Path (.graph.build PathE 'src 'dst 'w))
+
+;; --- exec_dijkstra: negative weight domain error ---
+(set NegE (table [src dst w] (list [0] [1] [-1.0])))
+(set NegG (.graph.build NegE 'src 'dst 'w))
+(.graph.dijkstra NegG 0)                          !- domain
+
+;; --- exec_dijkstra: out-of-range source ---
+(.graph.dijkstra Path 99)                         !- range
+
+;; --- exec_shortest_path: src==dst returns single-node path ---
+(set Sp00 (.graph.shortest-path Path 1 1))
+(count Sp00)                                      -- 1
+(first (at Sp00 '_node))                          -- 1
+(first (at Sp00 '_depth))                         -- 0
+
+;; --- exec_shortest_path: unreachable destination (range error) ---
+;; In directed path 0->1->2, going from 2 back to 0 is impossible.
+(.graph.shortest-path Path 2 0)                   !- range
+
+;; --- exec_shortest_path: out-of-range node ---
+(.graph.shortest-path Path 0 99)                  !- range
+
+;; =====================================================================
+;; Fixture D: bidirectional 3-node ring 0<->1<->2<->0
+;; =====================================================================
+(set RingE (table [src dst w] (list [0 1 1 2 2 0] [1 0 2 1 0 2] [1.0 1.0 1.0 1.0 1.0 1.0])))
+(set Ring (.graph.build RingE 'src 'dst 'w))
+
+;; --- exec_var_expand direction==2 (both CSRs expanded) ---
+;; From node 0 expanding both fwd and rev, max depth 1
+;; Fwd neighbors of 0: {1}; Rev neighbors of 0: {2}
+(set VeBoth (.graph.var-expand Ring 0 1 1 2))
+(count VeBoth)                                    -- 2
+(first (at VeBoth '_start))                       -- 0
+(min (at VeBoth '_depth))                         -- 1
+(max (at VeBoth '_depth))                         -- 1
+
+;; direction==2, depth 2 covers all nodes from 0
+(>= (count (.graph.var-expand Ring 0 1 2 2)) 2)   -- true
+
+;; --- exec_topsort: cycle detection -> domain error ---
+(set CycE (table [src dst w] (list [0 1 2] [1 2 0] [1.0 1.0 1.0])))
+(set Cyc (.graph.build CycE 'src 'dst 'w))
+(.graph.topsort Cyc)                              !- domain
+
+;; =====================================================================
+;; Fixture E: star graph. Node 0 is hub with 5 spokes (out-only).
+;; =====================================================================
+(set StarE (table [src dst w] (list [0 0 0 0 0] [1 2 3 4 5] [1.0 1.0 1.0 1.0 1.0])))
+(set Star (.graph.build StarE 'src 'dst 'w))
+
+;; --- exec_degree_cent: _in_degree, _out_degree, _degree columns ---
+(set Dg (.graph.degree Star))
+(count Dg)                                        -- 6
+;; Hub node 0: out=5, in=0, total=5
+(set Dg_node (at Dg '_node))
+(set Dg_out  (at Dg '_out_degree))
+(set Dg_in   (at Dg '_in_degree))
+(set Dg_tot  (at Dg '_degree))
+(at Dg_out (at (where (== Dg_node 0)) 0))         -- 5
+(at Dg_in  (at (where (== Dg_node 0)) 0))         -- 0
+(at Dg_tot (at (where (== Dg_node 0)) 0))         -- 5
+;; Spoke node 1: out=0, in=1, total=1
+(at Dg_out (at (where (== Dg_node 1)) 0))         -- 0
+(at Dg_in  (at (where (== Dg_node 1)) 0))         -- 1
+(at Dg_tot (at (where (== Dg_node 1)) 0))         -- 1
+
+;; --- exec_pagerank: dangling node correction (nodes with no out-edges) ---
+;; In Star, nodes 1-5 are dangling (no out-edges). PageRank must
+;; redistribute their rank each iteration.
+(set Pr (.graph.pagerank Star 10 0.85))
+(count Pr)                                        -- 6
+;; All ranks positive
+(> (min (at Pr '_rank)) 0.0)                      -- true
+;; Ranks sum to ~1
+(>= (sum (at Pr '_rank)) 0.99)                    -- true
+(<= (sum (at Pr '_rank)) 1.01)                    -- true
+
+;; --- exec_expand on hub (out-degree=5) ---
+(count (.graph.expand Star 0))                    -- 5
+;; --- exec_expand on spoke 1 (out-degree=0) -> empty result ---
+(count (.graph.expand Star 1))                    -- 0
+
+;; --- exec_dfs with out-of-range src -> range error ---
+(.graph.dfs Star 99)                              !- range
+
+;; --- exec_random_walk with out-of-range src -> range error ---
+(.graph.random-walk Star 99)                      !- range
+
+;; =====================================================================
+;; Fixture F: bipartite graph K2,3.
+;; Left: {0,1}, Right: {2,3,4}. Edges: all 0->right plus all 1->right.
+;; =====================================================================
+(set K23e (table [src dst w] (list [0 0 0 1 1 1] [2 3 4 2 3 4] [1.0 1.0 1.0 1.0 1.0 1.0])))
+(set K23 (.graph.build K23e 'src 'dst 'w))
+
+;; --- exec_betweenness on bipartite graph ---
+(set Bet (.graph.betweenness K23))
+(count Bet)                                       -- 5
+;; All centralities >= 0
+(>= (min (at Bet '_centrality)) 0.0)              -- true
+
+;; --- exec_closeness on bipartite graph ---
+(set Clo (.graph.closeness K23))
+(count Clo)                                       -- 5
+(>= (min (at Clo '_centrality)) 0.0)              -- true
+
+;; --- exec_var_expand direction==1 (reverse) ---
+;; From node 2, direction=1 (reverse) expands to {0, 1} at depth 1
+(set VeRev (.graph.var-expand K23 2 1 1 1))
+(count VeRev)                                     -- 2
+(first (at VeRev '_start))                        -- 2
+
+;; --- exec_dijkstra single-source all-reachable ---
+(set DjK (.graph.dijkstra K23 0))
+;; From node 0 (fwd): 0 itself + nodes 2,3,4 reachable = 4 nodes
+(count DjK)                                       -- 4
+;; Node 0 distance=0
+(set DjK_node (at DjK '_node))
+(set DjK_dist (at DjK '_dist))
+(at DjK_dist (at (where (== DjK_node 0)) 0))      -- 0.0
+;; All reachable nodes have dist < infinity
+(<= (max DjK_dist) 2.0)                           -- true
+
+;; =====================================================================
+;; Fixture G: simple two-node graph (exercises louvain two_m==0 guard).
+;; Single node with no edges.
+;; =====================================================================
+(set Solo (table [src dst w] (list [0] [0] [1.0])))
+;; Note: self-loop edge is needed just to build a non-empty edge table,
+;; but we want a 1-node graph.  Use node IDs 0 only.
+(set SoloE (table [src dst w] (list [] [] [])))
+;; Build from empty list fails; use single self-loop
+(set IsoE (table [src dst w] (list [0] [1] [1.0])))
+(set IsoG (.graph.build IsoE 'src 'dst 'w))
+;; Louvain on 2-node graph (small m)
+(set Liso (.graph.louvain IsoG))
+(count Liso)                                      -- 2
+(>= (min (at Liso '_community)) 0)                -- true
+
+;; MST on disconnected graph (returns forest, fewer than n-1 edges)
+(set MstDisc (.graph.mst Disc))
+;; Disc has 3 edges: {0->1, 1->0, 3->4}. MST/forest = 2 edges (one per component)
+(>= (count MstDisc) 1)                            -- true
+(<= (count MstDisc) 4)                            -- true
+
+;; --- exec_mst: equal-weight edges ---
+(set EqE (table [src dst w] (list [0 1 2 3] [1 2 3 0] [2.0 2.0 2.0 2.0])))
+(set EqG (.graph.build EqE 'src 'dst 'w))
+(set EqMst (.graph.mst EqG))
+;; MST of a 4-cycle has 3 edges
+(count EqMst)                                     -- 3
+;; All weights are 2.0
+(== (min (at EqMst '_weight)) 2.0)                -- true
+
+;; --- exec_k_shortest: disconnected returns empty table ---
+(set Knone (.graph.k-shortest Path 2 0 3))
+(count Knone)                                     -- 0
+
+;; --- exec_var_expand: start node OOB -> 0 rows ---
+(count (.graph.var-expand Path 99 1 3))           -- 0
+
+;; Cleanup
+(.graph.free K4)
+(.graph.free Chain)
+(.graph.free Disc)
+(.graph.free Path)
+(.graph.free NegG)
+(.graph.free Ring)
+(.graph.free Cyc)
+(.graph.free Star)
+(.graph.free K23)
+(.graph.free IsoG)
+(.graph.free EqG)

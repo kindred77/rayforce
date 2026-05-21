@@ -1,0 +1,39 @@
+;; try / raise coverage — exercises ray_try_fn and related error-handling paths
+;; in eval.c.
+
+;; ── basic: no error → result returned directly ──────────────────────────────
+(try (+ 1 2) (fn [e] -1)) -- 3
+(try (sum [1 2 3]) (fn [e] -1)) -- 6
+(try 42 neg) -- 42
+
+;; ── raise + lambda handler ───────────────────────────────────────────────────
+(try (raise 99) (fn [e] e)) -- 99
+(try (raise 10) (fn [e] (+ e 1))) -- 11
+(try (raise 5) (fn [e] (* e 2))) -- 10
+
+;; ── raise + unary fn handler (RAY_UNARY handler branch) ─────────────────────
+(try (raise 42) neg) -- -42
+(try (raise 7) abs) -- 7
+(try (raise -3) abs) -- 3
+
+;; ── runtime error (no raise) → err_val defaults to 0 ────────────────────────
+(try (/ 1 "x") (fn [e] -1)) -- -1
+(try (sum null) (fn [e] -99)) -- -99
+(try (neg null) (fn [e] -2)) -- -2
+
+;; ── undefined name error trapped ────────────────────────────────────────────
+(try undefined_name_xyz (fn [e] 0)) -- 0
+
+;; ── handler expression itself fails → propagates that error ─────────────────
+(try (raise 1) no_such_fn) !- name
+
+;; ── type error handler: invalid handler type ────────────────────────────────
+(try (raise 1) "not-a-fn") !- type
+
+;; ── nested try ──────────────────────────────────────────────────────────────
+(try (try (raise 5) (fn [e] (raise (+ e 10)))) (fn [e] e)) -- 15
+
+;; ── raise inside a lambda called from try ────────────────────────────────────
+(set err_fn (fn [x] (if (< x 0) (raise x) x)))
+(try (err_fn -7) (fn [e] (neg e))) -- 7
+(try (err_fn  3) (fn [e] (neg e))) -- 3

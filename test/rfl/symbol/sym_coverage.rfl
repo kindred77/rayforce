@@ -1,0 +1,198 @@
+;; Coverage extension for src/table/sym.c.
+;;
+;; src/table/sym.c is exercised by many existing tests via CSV/splayed I/O.
+;; This file targets the remaining uncovered regions:
+;;
+;;   sym_cache_segments trailing-dot branch (line 404-407)
+;;     — `str[len-1] == '.'` guard; reached via no-split intern + rebuild.
+;;     — Triggered via .csv.splayed → sym_save_bulk → sym_load
+;;       → ray_sym_rebuild_segments → sym_cache_segments("abc.", 4).
+;;
+;;   sym_cache_segments leading-dot-alone branch (line 412)
+;;     — `.foo` with no second dot: plain name, not dotted.
+;;
+;;   sym_intern_nolock leading-dot-only valid=false (line 693-695)
+;;     — Intern ".onlydot" directly → leading_dot=true, !second → valid=false.
+;;
+;;   sym_intern_nolock seg_len==0 (line 713)
+;;     — Adjacent dots "a..b": empty segment → valid=false, not dotted.
+;;
+;;   sym_save_impl durable=false branch (line 1208 false arm)
+;;     — ray_sym_save_bulk called from .csv.splayed.
+;;
+;;   ray_sym_load STRL magic mismatch (line 1318-1322)
+;;     — Load a 12-byte file with wrong magic word.
+;;
+;;   ray_sym_load file too small (line 1310-1314)
+;;     — Load a file with < 12 bytes.
+;;
+;;   ray_sym_load prefix truncated (line 1408-1413)
+;;     — Load a corrupt STRL file truncated mid-entry.
+;;
+;; Unreachable from RFL (documented):
+;;
+;;   sym_lazy_unmap_locked / sym_lazy_materialize_to_locked (lines 595-638)
+;;     — Only triggered when sym file size >= SYM_LAZY_LOAD_MIN_BYTES
+;;       (64 * 1024 * 1024 = 64MB). Impractical in RFL tests.
+;;
+;;   Lazy-load path in ray_sym_load (lines 1335-1385)
+;;     — Same 64MB threshold. Unreachable from RFL.
+;;
+;;   OOM error paths in ray_sym_init, sym_commit_new (lines 162-209, 520-523)
+;;     — Require malloc injection; unreachable without memory pressure.
+;;
+;;   sep_dots+1 > 255 guard (line 418-420)
+;;     — Would require a sym with 255+ dots interned via no-split path.
+;;
+;;   slen > remaining corrupt guard (line 1418-1423)
+;;     — Requires crafting a binary STRL file where declared length
+;;       overflows the mapped region. Binary construction not available.
+;;
+;;   id != i mismatch during load (line 1445-1450)
+;;     — Requires pre-populating the sym table before load. Covered at
+;;       C level: test_sym.c::test_sym_load_id_mismatch.
+;;
+;;   remaining != 0 after load (line 1455-1460)
+;;     — Requires appending junk bytes after valid STRL entries.
+;;
+
+;; ─── Scrub stale state ───────────────────────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_sym_cov_edge /tmp/rfl_sym_cov_bulk /tmp/rfl_sym_cov_lts /tmp/rfl_sym_cov_lmag /tmp/rfl_sym_cov_ltr /tmp/rfl_sym_cov_plain /tmp/rfl_sym_cov_dotted /tmp/rfl_sym_cov_w16 /tmp/rfl_sym_cov_edge2 /tmp/rfl_sym_cov.csv /tmp/rfl_sym_cov_w16.csv") -- 0
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 1. Edge-case sym strings via .db.splayed.set / .db.splayed.get
+;;
+;;    Strings interned cover several sym_cache_segments branches:
+;;      "abc."      → trailing dot (line 404-407 in sym_cache_segments)
+;;      ".foo"      → leading dot alone, no second dot (line 412)
+;;      ".foo.bar"  → leading dot + inner dot → dotted, 2 segs
+;;      "a..b"      → adjacent dots → seg_len==0 in sym_intern_nolock
+;;      "x.y.z"     → standard dotted with 3 segments
+;;
+;;    .db.splayed.set uses sym_save (durable=true), then .db.splayed.get
+;;    calls sym_load + ray_sym_rebuild_segments, which calls
+;;    sym_cache_segments on each interned name.
+;; ═══════════════════════════════════════════════════════════════════
+(set _T1 (table ['id 's] (list [1 2 3 4 5] (as 'SYMBOL ["abc." ".foo" ".foo.bar" "a..b" "x.y.z"]))))
+(.db.splayed.set "/tmp/rfl_sym_cov_edge/" _T1)
+(set _R1 (.db.splayed.get "/tmp/rfl_sym_cov_edge/"))
+(count _R1) -- 5
+(at _R1 's) -- (at _T1 's)
+(type (at _R1 's)) -- 'SYM
+(at (at _R1 's) 0) -- 'abc.
+(at (at _R1 's) 1) -- '.foo
+(at (at _R1 's) 2) -- '.foo.bar
+(at (at _R1 's) 3) -- 'a..b
+(at (at _R1 's) 4) -- 'x.y.z
+(.sys.exec "rm -rf /tmp/rfl_sym_cov_edge") -- 0
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 2. sym_save_bulk (durable=false) via .csv.splayed
+;;    Exercises sym_save_impl with durable=false (line 1208 false arm).
+;; ═══════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'id,s\\n1,abc.\\n2,.foo\\n3,.foo.bar\\n4,a..b\\n5,x.y.z\\n' > /tmp/rfl_sym_cov.csv") -- 0
+(set _T2 (.csv.splayed "/tmp/rfl_sym_cov.csv" "/tmp/rfl_sym_cov_bulk/"))
+(count _T2) -- 5
+(type (at _T2 's)) -- 'SYM
+(set _R2 (.db.splayed.get "/tmp/rfl_sym_cov_bulk/"))
+(count _R2) -- 5
+(at _R2 's) -- (at _T2 's)
+(.sys.exec "rm -f /tmp/rfl_sym_cov.csv; rm -rf /tmp/rfl_sym_cov_bulk") -- 0
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 3. Plain sym vector — W8 width, deduplication, sym atom equality.
+;; ═══════════════════════════════════════════════════════════════════
+(set _v3 (as 'SYMBOL ["alpha" "beta" "gamma" "alpha" "beta"]))
+(count _v3) -- 5
+(type _v3) -- 'SYM
+(at _v3 0) -- 'alpha
+(at _v3 3) -- 'alpha
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 4. Dotted sym round-trip via .db.splayed.set / .db.splayed.get
+;; ═══════════════════════════════════════════════════════════════════
+(set _T4 (table ['id 's] (list [1 2 3] (as 'SYMBOL ["ns.leaf" "a.b.c" "plain"]))))
+(.db.splayed.set "/tmp/rfl_sym_cov_dotted/" _T4)
+(set _R4 (.db.splayed.get "/tmp/rfl_sym_cov_dotted/"))
+(count _R4) -- 3
+(at (at _R4 's) 0) -- 'ns.leaf
+(at (at _R4 's) 1) -- 'a.b.c
+(at (at _R4 's) 2) -- 'plain
+(.sys.exec "rm -rf /tmp/rfl_sym_cov_dotted") -- 0
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 5. ray_sym_load with wrong STRL magic (line 1318-1322).
+;; ═══════════════════════════════════════════════════════════════════
+(set _T5 (table ['id 's] (list [1] (as 'SYMBOL ["x"]))))
+(.db.splayed.set "/tmp/rfl_sym_cov_lmag/" _T5)
+(.sys.exec "printf '\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00' > /tmp/rfl_sym_cov_lmag/sym") -- 0
+(.db.splayed.get "/tmp/rfl_sym_cov_lmag/") !- corrupt
+(.sys.exec "rm -rf /tmp/rfl_sym_cov_lmag") -- 0
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 6. ray_sym_load with file too small (< 12 bytes, line 1310-1314).
+;; ═══════════════════════════════════════════════════════════════════
+(set _T6 (table ['id 's] (list [1] (as 'SYMBOL ["y"]))))
+(.db.splayed.set "/tmp/rfl_sym_cov_lts/" _T6)
+(.sys.exec "printf 'STRL' > /tmp/rfl_sym_cov_lts/sym") -- 0
+(.db.splayed.get "/tmp/rfl_sym_cov_lts/") !- corrupt
+(.sys.exec "rm -rf /tmp/rfl_sym_cov_lts") -- 0
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 7. ray_sym_load truncated entry data (line 1408-1413).
+;;    STRL header with count=1, but only 3 bytes of entry data
+;;    (need >=4 for the u32 length prefix) → RAY_ERR_CORRUPT.
+;;    Bytes: "STRL" magic (LE 0x4C525453) + n=1 (8-byte LE) + 3 junk bytes
+;;    = 15 bytes total; parser sees remaining=3 < 4 at first entry.
+;; ═══════════════════════════════════════════════════════════════════
+(set _T7 (table ['id 's] (list [1] (as 'SYMBOL ["z"]))))
+(.db.splayed.set "/tmp/rfl_sym_cov_ltr/" _T7)
+(.sys.exec "printf '\\x53\\x54\\x52\\x4c\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\xAA\\xBB\\xCC' > /tmp/rfl_sym_cov_ltr/sym") -- 0
+(.db.splayed.get "/tmp/rfl_sym_cov_ltr/") !- corrupt
+(.sys.exec "rm -rf /tmp/rfl_sym_cov_ltr") -- 0
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 8. Large sym count (260 unique syms) to stress hash-grow and
+;;    str-cap-grow paths in sym_commit_new / sym_reserve_capacity.
+;; ═══════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'n,s' > /tmp/rfl_sym_cov_w16.csv") -- 0
+(.sys.exec "seq 1 260 | awk '{printf \"\\n%d,sym%d\",$1,$1}' >> /tmp/rfl_sym_cov_w16.csv") -- 0
+(set _T8 (.csv.read [I64 SYMBOL] "/tmp/rfl_sym_cov_w16.csv"))
+(count _T8) -- 260
+(type (at _T8 's)) -- 'SYM
+(.sys.exec "rm -f /tmp/rfl_sym_cov_w16.csv") -- 0
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 9. Re-intern existing sym — scanned-bit fast path (line 390).
+;;    Second intern of the same dotted name hits the scanned bit and
+;;    skips re-examination.
+;; ═══════════════════════════════════════════════════════════════════
+(set _s9a (as 'SYMBOL ["already.cached"]))
+(set _s9b (as 'SYMBOL ["already.cached"]))
+(at _s9a 0) -- 'already.cached
+(at _s9b 0) -- 'already.cached
+(at _s9a 0) -- (at _s9b 0)
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 10. sym_save_impl "already up to date" path (line 1048-1051).
+;;     Second .db.splayed.set with no new syms: persisted_count == str_count
+;;     → sym_save_impl returns RAY_OK immediately without writing.
+;; ═══════════════════════════════════════════════════════════════════
+(set _T10 (table ['id 's] (list [1 2] (as 'SYMBOL ["pa" "pb"]))))
+(.db.splayed.set "/tmp/rfl_sym_cov_plain/" _T10)
+(.db.splayed.set "/tmp/rfl_sym_cov_plain/" _T10)
+(set _R10 (.db.splayed.get "/tmp/rfl_sym_cov_plain/"))
+(count _R10) -- 2
+(at _R10 's) -- (at _T10 's)
+(.sys.exec "rm -rf /tmp/rfl_sym_cov_plain") -- 0
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 11. Deep 5-segment dotted sym — exercises segment loop in both
+;;     sym_intern_nolock and sym_cache_segments.
+;; ═══════════════════════════════════════════════════════════════════
+(set _T11 (table ['id 's] (list [1] (as 'SYMBOL ["a.b.c.d.e"]))))
+(.db.splayed.set "/tmp/rfl_sym_cov_edge2/" _T11)
+(set _R11 (.db.splayed.get "/tmp/rfl_sym_cov_edge2/"))
+(count _R11) -- 1
+(at (at _R11 's) 0) -- 'a.b.c.d.e
+(.sys.exec "rm -rf /tmp/rfl_sym_cov_edge2") -- 0

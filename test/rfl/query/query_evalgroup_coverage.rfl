@@ -1,0 +1,101 @@
+;; Coverage for eval-level group paths in `src/ops/query.c`:
+;;
+;;   Median per-group-buf fast path, single-key STR (lines ~5371-5443):
+;;     Reached when by: k is a STR key → use_eval_group=1 → single-key
+;;     path at ~5304. is_med_call returns true → flatten groups into
+;;     (ix_buf, off, cnt) and call ray_median_per_group_buf kernel.
+;;
+;;   Median per-group-buf fast path, multi-key with STR (lines ~4946-5009):
+;;     Reached when by: [k1 k2] with STR key → use_eval_group=1 → composite
+;;     key path at ~4856. Same is_med_call fast path with out_groups slicing.
+;;
+;;   apply_sort_take SYM-vector asc/desc clause (lines ~443-456):
+;;     Reached when asc: [col1 col2] (vector form) is used in a by-group
+;;     select that routes through apply_sort_take (eval-level group result).
+;;     Each vec element is added to n_keys.
+;;
+;;   apply_sort_take multi-key TopK (lines ~487-499):
+;;     Reached when n_keys > 1 in apply_sort_take fast path.
+;;     Calls ray_topk_table_multi for bounded-heap multi-key selection.
+
+;; ────────────────────────────────────────────────────────────────────
+;; Median by-group with single STR key (lines 5404-5443)
+;; STR key forces use_eval_group → single-key eval path → 5304+
+;; ────────────────────────────────────────────────────────────────────
+(set Tms1 (table [k v] (list (list "aa" "bb" "aa" "bb" "cc" "aa") [1 3 5 7 9 11])))
+;; aa: rows 0,2,5 → v=[1,5,11] → median = 5.0
+;; bb: rows 1,3 → v=[3,7] → median = 5.0
+;; cc: row 4 → v=[9] → median = 9.0
+(count (select {m: (med v) by: k from: Tms1})) -- 3
+
+;; Verify median value for first group (aa in insertion order) = 5.0
+(at (at (select {m: (med v) by: k from: Tms1}) 'm) 0) -- 5.0
+
+;; Sum of medians: aa=5.0 + bb=5.0 + cc=9.0 = 19.0
+(sum (at (select {m: (med v) by: k from: Tms1}) 'm)) -- 19.0
+
+;; F64 values with STR key
+(set Tms2 (table [k v] (list (list "x" "y" "x" "y" "x") [1.0 3.0 5.0 7.0 9.0])))
+;; x: v=[1.0,5.0,9.0] → median = 5.0; y: v=[3.0,7.0] → median = 5.0
+(count (select {m: (med v) by: k from: Tms2})) -- 2
+(sum (at (select {m: (med v) by: k from: Tms2}) 'm)) -- 10.0
+
+;; Median combined with another aggregate in same STR-key query
+(set Tms3 (table [k v] (list (list "p" "q" "p" "q" "p") [10 20 30 40 50])))
+;; p: v=[10,30,50] → med=30, sum=90; q: v=[20,40] → med=30, sum=60
+(count (select {m: (med v) s: (sum v) by: k from: Tms3})) -- 2
+(sum (at (select {m: (med v) s: (sum v) by: k from: Tms3}) 's)) -- 150
+
+;; ────────────────────────────────────────────────────────────────────
+;; Median by-group with multi-key (one STR key) (lines 4978-5009)
+;; STR key in multi-key forces use_eval_group → composite-key path at ~4856
+;; ────────────────────────────────────────────────────────────────────
+(set Tmm1 (table [k1 k2 v] (list (list "aa" "bb" "aa" "bb") [1 1 2 2] [10 20 30 40])))
+;; Groups: (aa,1)=[10]→med=10.0, (bb,1)=[20]→med=20.0, (aa,2)=[30]→med=30.0, (bb,2)=[40]→med=40.0
+(count (select {m: (med v) by: [k1 k2] from: Tmm1})) -- 4
+
+;; Another multi-key case: STR+SYM keys
+(set Tmm2 (table [k1 k2 v] (list (list "a" "b" "a" "b" "a") ['X 'X 'Y 'Y 'X] [1 2 3 4 5])))
+;; (a,X)=[1,5]→med=3.0, (b,X)=[2]→med=2.0, (a,Y)=[3]→med=3.0, (b,Y)=[4]→med=4.0
+(count (select {m: (med v) by: [k1 k2] from: Tmm2})) -- 4
+
+;; ────────────────────────────────────────────────────────────────────
+;; apply_sort_take: vector-form asc/desc clause (lines 444-456)
+;; and multi-key TopK fast path (lines 487-499)
+;;
+;; STR by-key → eval_group result → apply_sort_take called.
+;; asc: [s m] uses a SYM VECTOR → lines 444-450 parse each sym.
+;; With 2 sort keys: n_keys=2 → lines 487-499 call ray_topk_table_multi.
+;; ────────────────────────────────────────────────────────────────────
+
+;; Build a fixture with STR key and multiple aggregation output columns
+;; that we can use as sort keys:
+(set Tst1 (table [k v w] (list (list "aa" "bb" "cc" "dd" "ee" "ff" "gg" "hh") [5 3 1 7 2 8 4 6] [80 60 40 20 10 30 70 50])))
+;; by: k (STR) → eval_group → result has columns k, s, t
+;; asc: [s t] → SYM vector form with 2 elements → n_keys=2 → multi-key TopK
+(count (select {s: (sum v) t: (sum w) by: k from: Tst1 asc: [s t] take: 3})) -- 3
+
+;; Top-5 by (s asc, t asc)
+(count (select {s: (sum v) t: (sum w) by: k from: Tst1 asc: [s t] take: 5})) -- 5
+
+;; Single-element vector form [s] → n_keys=1 → single-key TopK (still exercises lines 444-450)
+(count (select {s: (sum v) t: (sum w) by: k from: Tst1 asc: [s] take: 4})) -- 4
+
+;; desc: [t s] → n_keys=2 → multi-key TopK descending
+(count (select {s: (sum v) t: (sum w) by: k from: Tst1 desc: [t s] take: 2})) -- 2
+
+
+;; ────────────────────────────────────────────────────────────────────
+;; NOTE: Lines 5389-5394 (ray_eval fallback for computed agg arg)
+;; Requires agg_col_expr to be a non-direct-ref expression like (+ v 1),
+;; BUT v must be in scope for ray_eval to succeed. The eval_group path
+;; does not push table columns to scope before the aggregation loop,
+;; so ray_eval(agg_col_expr) on a table column reference would fail
+;; with "error: name". Unreachable from basic RFL.
+;;
+;; NOTE: Lines 5653-5663 (STR column with nulls in first-of-group)
+;; require a table with a null-marked STR column. There is no direct
+;; RFL literal for null STR atoms (0Ns is a null SYM, not STR).
+;; This path requires constructing a STR column via I/O or internal
+;; operations — left as unreachable from basic RFL.
+;; ────────────────────────────────────────────────────────────────────

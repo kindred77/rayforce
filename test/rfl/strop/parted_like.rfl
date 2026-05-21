@@ -1,0 +1,63 @@
+;; parted_like.rfl — coverage for exec_like_parted_str and exec_like_parted_sym.
+;;
+;; Lines targeted in src/ops/string.c:
+;;   exec_like_parted_str  : 388-393 (str_like_par_fn dispatch per segment)
+;;   exec_like_parted_sym  : 433, 445, 468 (seen/resolve/proj dispatch)
+;;   exec_like             : 562-565 (in_parted && STR / SYM dispatch)
+;;   exec_like_input       : 523-528 (parted STR/SYM col fast-return)
+;;
+;; Two-partition splayed tables — one STR column, one SYM column.
+;; Each assertion exercises ≥3 regions: parted dispatch, segment loop,
+;; pattern match per element.
+
+;; ─── pre-flight cleanup ──────────────────────────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_pl_str /tmp/rfl_pl_sym")
+
+;; ─── Fixture A: parted STR column — exec_like_parted_str path ────────
+(set PA1 (table [s] (list ["apple" "banana" "cherry"])))
+(set PA2 (table [s] (list ["date" "elderberry" "fig"])))
+(.db.splayed.set "/tmp/rfl_pl_str/1/t/" PA1)
+(.db.splayed.set "/tmp/rfl_pl_str/2/t/" PA2)
+(set PStr (.db.parted.get "/tmp/rfl_pl_str/" 't))
+(count PStr) -- 6
+
+;; Prefix pattern — hits SHAPE_PREFIX fast path in each seg.
+(count (select {from: PStr where: (like s "a*")})) -- 1
+;; Suffix pattern — hits SHAPE_SUFFIX.  apple+date end in 'e'.
+(count (select {from: PStr where: (like s "*e")})) -- 2
+;; Contains pattern — hits SHAPE_CONTAINS (memmem).
+(count (select {from: PStr where: (like s "*err*")})) -- 2
+;; Exact pattern — hits SHAPE_EXACT.
+(count (select {from: PStr where: (like s "fig")})) -- 1
+;; Wildcard — SHAPE_ANY, matches all.
+(count (select {from: PStr where: (like s "*")})) -- 6
+;; No-match pattern.
+(count (select {from: PStr where: (like s "xyz*")})) -- 0
+;; Character class — forces SHAPE_NONE general matcher.
+(count (select {from: PStr where: (like s "[ab]*")})) -- 2
+
+;; ─── Fixture B: parted SYM column — exec_like_parted_sym path ────────
+(set PB1 (table [s] (list ['apple 'banana 'cherry])))
+(set PB2 (table [s] (list ['date 'elderberry 'fig])))
+(.db.splayed.set "/tmp/rfl_pl_sym/1/t/" PB1)
+(.db.splayed.set "/tmp/rfl_pl_sym/2/t/" PB2)
+(set PSym (.db.parted.get "/tmp/rfl_pl_sym/" 't))
+(count PSym) -- 6
+
+;; Prefix pattern over parted SYM.
+(count (select {from: PSym where: (like s "a*")})) -- 1
+;; Suffix pattern.  apple+date end in 'e'.
+(count (select {from: PSym where: (like s "*e")})) -- 2
+;; Contains pattern.
+(count (select {from: PSym where: (like s "*err*")})) -- 2
+;; Exact match.
+(count (select {from: PSym where: (like s "fig")})) -- 1
+;; Universal wildcard.
+(count (select {from: PSym where: (like s "*")})) -- 6
+;; No-match.
+(count (select {from: PSym where: (like s "zzz*")})) -- 0
+;; Class pattern.
+(count (select {from: PSym where: (like s "[de]*")})) -- 2
+
+;; ─── cleanup ─────────────────────────────────────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_pl_str /tmp/rfl_pl_sym")

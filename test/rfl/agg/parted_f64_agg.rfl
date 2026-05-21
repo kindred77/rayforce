@@ -1,0 +1,90 @@
+;; parted_f64_agg.rfl — coverage for agg_parted_sum / agg_parted_avg /
+;; agg_parted_minmax with a F64 base type.
+;;
+;; Lines targeted in src/ops/agg.c:
+;;   agg_parted_sum  F64 branch  : 132-142 (parted sum on F64 segs)
+;;   agg_parted_avg  F64 branch  : 173-177 (non-F64 int inner loop is NOT
+;;                                          exercised here — see parted I64 test)
+;;   agg_parted_minmax F64 branch: 195-202 (want_max ? v>best_f : v<best_f)
+;;
+;; A two-partition table is written to /tmp via .db.splayed.set and loaded
+;; with .db.parted.get.  Each probe hits the parted dispatch in
+;; ray_sum_fn / ray_avg_fn / ray_min_fn / ray_max_fn (line 220/305/329/351).
+;;
+;; Each assertion covers ≥3 regions:
+;;   1. RAY_IS_PARTED branch check
+;;   2. agg_parted_* dispatch
+;;   3. segment loop + accumulator update + return
+
+;; ─── fixture setup ───────────────────────────────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_agg_pf64")
+(set TA (table [v] (list (as 'F64 [1.0 2.0 3.0]))))
+(set TB (table [v] (list (as 'F64 [4.0 5.0]))))
+(.db.splayed.set "/tmp/rfl_agg_pf64/1/t/" TA)
+(.db.splayed.set "/tmp/rfl_agg_pf64/2/t/" TB)
+(set Pf (.db.parted.get "/tmp/rfl_agg_pf64/" 't))
+
+;; Parted F64 sum (agg_parted_sum F64 branch: lines 132-142)
+(sum (at Pf 'v)) -- 15.0
+
+;; Parted F64 avg (agg_parted_avg F64 inner branch for non-integer path, line 166-171)
+(avg (at Pf 'v)) -- 3.0
+
+;; Parted F64 min (agg_parted_minmax F64 branch: lines 195-202, want_max=0)
+(min (at Pf 'v)) -- 1.0
+
+;; Parted F64 max (agg_parted_minmax F64 branch: lines 195-202, want_max=1)
+(max (at Pf 'v)) -- 5.0
+
+;; Return types must be f64
+(type (sum (at Pf 'v))) -- 'f64
+(type (avg (at Pf 'v))) -- 'f64
+(type (min (at Pf 'v))) -- 'f64
+(type (max (at Pf 'v))) -- 'f64
+
+;; ─── larger fixture: three partitions, verify accumulator across segs ──
+(.sys.exec "rm -rf /tmp/rfl_agg_pf64b")
+(set TC (table [v] (list (as 'F64 [10.0 20.0 30.0]))))
+(set TD (table [v] (list (as 'F64 [40.0 50.0 60.0]))))
+(set TE (table [v] (list (as 'F64 [70.0 80.0 90.0]))))
+(.db.splayed.set "/tmp/rfl_agg_pf64b/1/t/" TC)
+(.db.splayed.set "/tmp/rfl_agg_pf64b/2/t/" TD)
+(.db.splayed.set "/tmp/rfl_agg_pf64b/3/t/" TE)
+(set Pf2 (.db.parted.get "/tmp/rfl_agg_pf64b/" 't))
+
+;; sum = 10+20+...+90 = 450
+(sum (at Pf2 'v)) -- 450.0
+;; avg = 450/9 = 50.0
+(avg (at Pf2 'v)) -- 50.0
+;; min first seg (10), max last seg (90)
+(min (at Pf2 'v)) -- 10.0
+(max (at Pf2 'v)) -- 90.0
+
+;; ─── parted I64 avg (non-F64 inner loop: lines 173-177) ─────────────
+;; When base is I64 (not F64), agg_parted_avg takes the else branch
+;; at line 172 and uses agg_read_i64 to coerce each element to double.
+(.sys.exec "rm -rf /tmp/rfl_agg_pi64")
+(set Ti1 (table [v] (list (as 'I64 [10 20 30]))))
+(set Ti2 (table [v] (list (as 'I64 [40 50]))))
+(.db.splayed.set "/tmp/rfl_agg_pi64/1/t/" Ti1)
+(.db.splayed.set "/tmp/rfl_agg_pi64/2/t/" Ti2)
+(set Pi (.db.parted.get "/tmp/rfl_agg_pi64/" 't))
+;; avg = (10+20+30+40+50)/5 = 30
+(avg (at Pi 'v)) -- 30.0
+(sum (at Pi 'v)) -- 150
+(min (at Pi 'v)) -- 10
+(max (at Pi 'v)) -- 50
+
+;; ─── parted DATE sum type error (agg_parted_sum line 129) ────────────
+;; DATE base type is explicitly excluded from sum — hits the type error path.
+(.sys.exec "rm -rf /tmp/rfl_agg_pdate")
+(set Td1 (table [d] (list (list 2024.01.01 2024.01.02 2024.01.03))))
+(set Td2 (table [d] (list (list 2024.01.04 2024.01.05))))
+(.db.splayed.set "/tmp/rfl_agg_pdate/1/t/" Td1)
+(.db.splayed.set "/tmp/rfl_agg_pdate/2/t/" Td2)
+(set Pd (.db.parted.get "/tmp/rfl_agg_pdate/" 't))
+;; sum on parted DATE → type error (agg_parted_sum line 129)
+(sum (at Pd 'd)) !- type
+
+;; ─── cleanup ─────────────────────────────────────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_agg_pf64 /tmp/rfl_agg_pf64b /tmp/rfl_agg_pi64 /tmp/rfl_agg_pdate")
