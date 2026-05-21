@@ -1,0 +1,227 @@
+;; VM-level coverage: OP_TRAP, OP_CALLS (self-recursion), OP_CALLF paths,
+;; OP_JMP backward (interrupt check), and call_fn1/call_fn2 error paths.
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 1. OP_TRAP / OP_TRAP_END via compiled try inside lambda
+;;    Note: (raise x) inside compiled lambda has a bug — vm_err_obj
+;;    shadows __raise_val so the user value is lost.  Use runtime
+;;    errors (type/name errors) instead of raise to test trap path.
+;; ═══════════════════════════════════════════════════════════════════
+(set trap_fn (fn [x] (try (if (< x 0) (+ x "y") x) (fn [e] -1))))
+(trap_fn 5)   -- 5
+(trap_fn -3)  -- -1
+
+;; No-error path: OP_TRAP_END executed (trap frame popped on success)
+(set trap_noop (fn [] (try (+ 1 2) (fn [e] -1))))
+(trap_noop)   -- 3
+
+;; Type error caught inside lambda
+(set trap_type (fn [] (try (+ 1 "x") (fn [e] -1))))
+(trap_type)   -- -1
+
+;; Name error caught inside lambda
+(set trap_name (fn [] (try really_undefined_xyz_abc (fn [e] 0))))
+(trap_name)   -- 0
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 2. BUG: (raise x) inside compiled lambda ignores __raise_val
+;;    because vm_err_obj (the domain error from ray_raise_fn) takes
+;;    priority in vm_error_cleanup.  Mark xfail until fixed.
+;; ═══════════════════════════════════════════════════════════════════
+;; xfail BUG: raise inside compiled lambda loses user value
+;; (set f_raise (fn [x] (try (raise x) (fn [e] e))))
+;; (f_raise 99) -- 99
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 3. OP_CALLS (self-recursive call)
+;; ═══════════════════════════════════════════════════════════════════
+(set fib (fn [n] (if (<= n 1) n (+ (fib (- n 1)) (fib (- n 2))))))
+(fib 0) -- 0
+(fib 1) -- 1
+(fib 7) -- 13
+
+;; Tail-style recursion with accumulator
+(set sum_r (fn [n acc] (if (<= n 0) acc (sum_r (- n 1) (+ acc n)))))
+(sum_r 10 0) -- 55
+(sum_r 100 0) -- 5050
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 4. OP_CALLF with stored non-lambda fn objects
+;; ═══════════════════════════════════════════════════════════════════
+;; Stored unary fn called via OP_CALLF RAY_UNARY path
+(set my_neg neg)
+(set f_neg (fn [x] (my_neg x)))
+(f_neg 5) -- -5
+(f_neg -3) -- 3
+
+;; ── arity error for stored UNARY fn via OP_CALLF ─────────────────
+(set my_abs abs)
+(set f_arity (fn [x y] (my_abs x y)))
+(try (f_arity 5 10) (fn [e] -1)) -- -1
+
+;; Stored binary fn
+(set my_add +)
+(set f_add (fn [a b] (my_add a b)))
+(f_add 3 4) -- 7
+(f_add 100 200) -- 300
+
+;; ── arity error for stored BINARY fn via OP_CALLF ─────────────────
+(set my_sub -)
+(set f_sub3 (fn [a b c] (my_sub a b c)))
+(try (f_sub3 1 2 3) (fn [e] -1)) -- -1
+
+;; Stored vary fn
+(set my_list list)
+(set f_list (fn [a b c] (count (my_list a b c))))
+(f_list 1 2 3) -- 3
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 5. call_fn1 and call_fn2 via HOF
+;; ═══════════════════════════════════════════════════════════════════
+(fold + 0 [1 2 3 4 5]) -- 15
+(fold * 1 [1 2 3 4])   -- 24
+(scan + [1 2 3 4])     -- [1 3 6 10]
+(map neg [1 2 3])      -- [-1 -2 -3]
+
+;; ── call_fn1 with non-unary/non-lambda → type error ──────────────
+(try (map 42 [1 2 3]) (fn [e] -1)) -- -1
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 6. call_lambda arity guard (via call_fn or direct call)
+;; ═══════════════════════════════════════════════════════════════════
+(set f2 (fn [a b] (+ a b)))
+(try (f2 1) (fn [e] -1))     -- -1
+(try (f2 1 2 3) (fn [e] -1)) -- -1
+(f2 10 20) -- 30
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 7. VM arity errors for stored fn called via OP_CALLF
+;; ═══════════════════════════════════════════════════════════════════
+(set u_fn (fn [x] (* x 2)))
+(u_fn 7) -- 14
+(try (u_fn) (fn [e] -1))     -- -1
+(try (u_fn 1 2) (fn [e] -1)) -- -1
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 8. VM name resolution error inside lambda
+;; ═══════════════════════════════════════════════════════════════════
+(set resolve_fn (fn [] really_undefined_name_xyz))
+(try (resolve_fn) (fn [e] 999)) -- 999
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 9. Error propagation out of lambda with eval error frame
+;; ═══════════════════════════════════════════════════════════════════
+(set err_from_fn (fn [x] (+ x "not-a-num")))
+(try (err_from_fn 5) (fn [e] -1)) -- -1
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 10. OP_CALL1 null arg handling
+;;     NOTE: op_call1 null paths (lines 1892-1894) check fn pointer
+;;     equality against ray_nil_fn / ray_type_fn.  Passing `null` to
+;;     a lambda from the tree-walk evaluator hits !args[0] check
+;;     (eval.c:3089-3090) before the lambda runs, so the VM null
+;;     path is unreachable from plain RFL.  Cover non-null paths:
+;; ═══════════════════════════════════════════════════════════════════
+;; non-null arg via op_call1: compiled UNARY call with scalar → else branch
+(set call1_neg (fn [x] (neg x)))
+(call1_neg 5) -- -5
+(call1_neg -3) -- 3
+
+;; op_call1 ATOMIC path: arg is a vec → atomic_map_unary branch
+(set call1_neg_v (fn [x] (neg x)))
+(at (call1_neg_v [1 2 3]) 0) -- -1
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 11. OP_CALL2 non-null paths (compiled lambda calling BINARY fn)
+;; ═══════════════════════════════════════════════════════════════════
+;; op_call2 with scalars → else branch
+(set call2_add (fn [x y] (+ x y)))
+(call2_add 3 4) -- 7
+
+;; op_call2 ATOMIC path: vec arg → atomic_map_binary_op branch
+(set call2_mul (fn [x y] (* x y)))
+(at (call2_mul [1 2 3] 2) 1) -- 4
+
+;; op_call2 error → vm_error path
+(set call2_div (fn [x y] (/ x y)))
+(try (call2_div 1 "bad") (fn [e] -1)) -- -1
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 12. OP_DUP via (let) inside compiled lambda
+;;     (let x val) compiles to: eval val, OP_DUP, OP_STOREENV slot
+;; ═══════════════════════════════════════════════════════════════════
+(set dup_fn (fn [x] (let y (* x 2)) (+ y 1)))
+(dup_fn 5)  -- 11
+(dup_fn -3) -- -5
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 13. call_fn2 RAY_UNARY fallback (line 1094-1097)
+;;     fold calls call_fn2(fn, acc, elem); if fn is UNARY, only acc is used
+;; ═══════════════════════════════════════════════════════════════════
+;; (fold neg 5 [1 2 3]): call_fn2(neg, 5, 1) → neg(5)=-5
+;;                        call_fn2(neg, -5, 2) → neg(-5)=5
+;;                        call_fn2(neg, 5, 3) → neg(5)=-5  → result -5
+(fold neg 5 [1 2 3]) -- -5
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 14. call_lambda tree-walk fallback (eval.c lines 1668-1704)
+;;     NOTE: lines 1703-1704 (success path) are structurally
+;;     unreachable from RFL:
+;;     - dot-reserved names (compile.c:244) also fail in tree-walk
+;;     - jump overflow (compile.c:188) requires > 32767 byte body
+;;     - >256 locals (compile.c:251) also fails at FRAME_CAP=64 in
+;;       tree-walk (env.c)
+;;     - OOM paths (lines 105, 144) cannot be triggered from RFL
+;;     All non-OOM compilation failures also fail in tree-walk.
+;;     Coverage of error-path lines 1697-1700 is covered via
+;;     existing error propagation tests above.
+;; ═══════════════════════════════════════════════════════════════════
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 15. OP_CALLF VM stack overflow (eval.c lines 1989-1994)
+;;     A compiled lambda with many locals (large callee_locals) triggers
+;;     vm.sp + callee_locals >= VM_STACK_SIZE before PUSH can fire.
+;;     The cleanup loop releases fn_args before goto vm_error_limit.
+;; ═══════════════════════════════════════════════════════════════════
+;; Lambda with 50 let bindings → callee_locals=51 → fills VM stack in ~20 calls
+(set g_deep (fn [n] (let _a1 1) (let _a2 2) (let _a3 3) (let _a4 4) (let _a5 5) (let _a6 6) (let _a7 7) (let _a8 8) (let _a9 9) (let _a10 10) (let _a11 11) (let _a12 12) (let _a13 13) (let _a14 14) (let _a15 15) (let _a16 16) (let _a17 17) (let _a18 18) (let _a19 19) (let _a20 20) (let _a21 21) (let _a22 22) (let _a23 23) (let _a24 24) (let _a25 25) (let _a26 26) (let _a27 27) (let _a28 28) (let _a29 29) (let _a30 30) (let _a31 31) (let _a32 32) (let _a33 33) (let _a34 34) (let _a35 35) (let _a36 36) (let _a37 37) (let _a38 38) (let _a39 39) (let _a40 40) (let _a41 41) (let _a42 42) (let _a43 43) (let _a44 44) (let _a45 45) (let _a46 46) (let _a47 47) (let _a48 48) (let _a49 49) (let _a50 50) (if (<= n 0) _a1 (g_deep (- n 1)))))
+(try (g_deep 100) (fn [e] -1)) -- -1
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 16. OP_CALL1 lazy arg materialization (eval.c lines 1885-1891)
+;;     When a compiled lambda calls a non-lazy-aware UNARY fn (e.g. neg)
+;;     on a lazy value (e.g. sum result), op_call1 materializes it.
+;;     Note: lines 1886-1890 (materialization failure) require OOM —
+;;     only line 1885 (successful materialization) is coverable from RFL.
+;; ═══════════════════════════════════════════════════════════════════
+;; (neg (sum v)): compiled to LOADCONST neg, LOADCONST sum, RESOLVE v, OP_CALL1, OP_CALL1
+;; The inner OP_CALL1 pushes a lazy result; the outer OP_CALL1 gets lazy arg → line 1885
+(set lazy_neg_fn (fn [v] (neg (sum v))))
+(lazy_neg_fn [1 2 3 4 5]) -- -15
+(lazy_neg_fn [10 20]) -- -30
+
+;; OP_CALL2 lazy arg materialization (eval.c lines 1919-1930):
+;; When a compiled lambda calls a BINARY fn with a lazy left or right arg.
+;; (+ (sum v) 1): outer OP_CALL2 receives lazy left arg from sum → line 1916-1922
+(set lazy_add_fn (fn [v] (+ (sum v) 1)))
+(lazy_add_fn [1 2 3]) -- 7
+;; (+ 1 (sum v)): outer OP_CALL2 receives lazy right arg → line 1924-1930
+(set lazy_add_fn2 (fn [v] (+ 1 (sum v))))
+(lazy_add_fn2 [1 2 3]) -- 7
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 17. OP_CALLF lazy arg materialization (eval.c lines 2043-2062)
+;;     When a compiled lambda calls a stored UNARY or BINARY fn via
+;;     OP_CALLF (fn not resolved at compile time), lazy args are
+;;     materialized in op_callf before dispatch.
+;; ═══════════════════════════════════════════════════════════════════
+;; f is compiled BEFORE my_cf_neg is defined → my_cf_neg unresolved at compile time
+;; → OP_CALLF is emitted for (my_cf_neg (sum v)) → lines 2043-2044 fire
+(set _callf_f (fn [v] (my_cf_neg (sum v))))
+(set my_cf_neg neg)
+(_callf_f [1 2 3]) -- -6
+;; OP_CALLF with lazy left arg for stored BINARY fn
+;; _callf_add compiled before my_cf_add → OP_CALLF → lines 2055-2062 fire
+(set _callf_add (fn [v] (my_cf_add (sum v) 1)))
+(set my_cf_add +)
+(_callf_add [1 2 3]) -- 7

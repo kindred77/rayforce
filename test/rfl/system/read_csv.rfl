@@ -17,6 +17,14 @@
 (count (.csv.read [I64 SYMBOL] "rf_test_syms.csv")) -- 20000
 (count (read-csv [I64 SYMBOL] "rf_test_syms.csv")) -- 20000
 
+;; W16 SYM comparison: 20000 distinct syms → max_id > 255 → W16 compaction.
+;; Load again and compare sym column against a SYM atom → lines 822-825 in eval.c.
+(set _tsyms (.csv.read [I64 SYMBOL] "rf_test_syms.csv"))
+(sum (== (at _tsyms 'sym) 's0)) -- 1
+(sum (!= (at _tsyms 'sym) 's0)) -- 19999
+;; Sort W16 SYM column → gather_by_idx W16 path (eval.c line 1145, case 2)
+(count (asc (at _tsyms 'sym))) -- 20000
+
 (.sys.exec "rm -f rf_test_syms.csv") -- 0
 
 ;; Explicit names + types loads a no-header CSV and binds user names.

@@ -1436,6 +1436,55 @@ static test_result_t test_sort_msd_bucket_i64_desc(void) {
     PASS();
 }
 
+/* gather_by_idx W8 SYM path (eval.c line 1146, case 1)
+ * A RAY_SYM_W8 vec (IDs stored as uint8_t) sorted via ray_sort forces
+ * the SYM branch of gather_by_idx to take the esz==1 / case-1 path.
+ * A fresh sym table keeps all IDs ≤ 3 so ray_sym_dict_width returns W8. */
+static test_result_t test_sort_sym_w8_gather(void) {
+    ray_heap_init();
+    ray_sym_init();
+
+    int64_t s_a = ray_sym_intern("ga", 2);
+    int64_t s_b = ray_sym_intern("gb", 2);
+    int64_t s_c = ray_sym_intern("gc", 2);
+
+    /* IDs 1, 2, 3 — all ≤ 255 → W8 storage */
+    const int64_t N = 6;
+    ray_t* sv = ray_sym_vec_new(RAY_SYM_W8, N);
+    TEST_ASSERT_NOT_NULL(sv);
+    sv->len = N;
+    uint8_t* d = (uint8_t*)ray_data(sv);
+    /* Unsorted: c, a, b, c, a, b */
+    d[0] = (uint8_t)s_c;
+    d[1] = (uint8_t)s_a;
+    d[2] = (uint8_t)s_b;
+    d[3] = (uint8_t)s_c;
+    d[4] = (uint8_t)s_a;
+    d[5] = (uint8_t)s_b;
+
+    uint8_t asc_flag = 0;
+    ray_t* result = ray_sort(&sv, &asc_flag, NULL, 1, N);
+    TEST_ASSERT_NOT_NULL(result);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(ray_len(result), N);
+    TEST_ASSERT_TRUE(RAY_IS_SYM(result->type));
+
+    /* Sorted asc: a, a, b, b, c, c */
+    const uint8_t* r = (const uint8_t*)ray_data(result);
+    TEST_ASSERT_EQ_I(r[0], (uint8_t)s_a);
+    TEST_ASSERT_EQ_I(r[1], (uint8_t)s_a);
+    TEST_ASSERT_EQ_I(r[2], (uint8_t)s_b);
+    TEST_ASSERT_EQ_I(r[3], (uint8_t)s_b);
+    TEST_ASSERT_EQ_I(r[4], (uint8_t)s_c);
+    TEST_ASSERT_EQ_I(r[5], (uint8_t)s_c);
+
+    ray_release(result);
+    ray_release(sv);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 /* ─── Entry table ────────────────────────────────────────────────── */
 
 const test_entry_t sort_entries[] = {
@@ -1498,5 +1547,7 @@ const test_entry_t sort_entries[] = {
      * msd_bucket_sort_fn / bucket_lsb_sort path in msd_radix_sort_run. */
     { "sort/msd_bucket_i64_asc",        test_sort_msd_bucket_i64,       NULL, NULL },
     { "sort/msd_bucket_i64_desc",       test_sort_msd_bucket_i64_desc,  NULL, NULL },
+    /* gather_by_idx W8 SYM path (eval.c line 1146) */
+    { "sort/sym_w8_gather",             test_sort_sym_w8_gather,        NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
