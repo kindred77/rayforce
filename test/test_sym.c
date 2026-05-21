@@ -1655,6 +1655,57 @@ static test_result_t test_sym_cache_segs_many_dots(void) {
     PASS();
 }
 
+/* ---- sym_load_no_parent_dir -------------------------------------------- */
+
+/* ray_sym_load with a path in a non-existent directory covers the inner
+ * EROFS fallback in sym.c (lines 1294-1296).
+ *
+ * When the parent directory does not exist:
+ *   - ray_file_open(path, READ) fails → errno = ENOENT → saved_errno = ENOENT
+ *   - ray_file_open(path, READ|WRITE|CREATE) also fails → errno = ENOENT
+ *   - saved_errno != EROFS && errno != EROFS is TRUE → returns RAY_ERR_IO
+ */
+static test_result_t test_sym_load_no_parent_dir(void) {
+    ray_err_t err = ray_sym_load("/tmp/no_such_dir_sym_xq7/sym.sym");
+    TEST_ASSERT_EQ_I(err, RAY_ERR_IO);
+    PASS();
+}
+
+/* ---- sym_save_bad_slot_type -------------------------------------------- */
+
+/* sym_save_impl merge loop rejects a slot from the disk file that is not
+ * a -RAY_STR atom (sym.c lines 1089-1093: `s->type != -RAY_STR` check).
+ *
+ * Write a LSTG (generic list) file with one -RAY_I64 (integer) atom entry.
+ * ray_col_load will deserialise this as a RAY_LIST, and sym_save_impl will
+ * see `s->type == -RAY_I64 != -RAY_STR` → RAY_ERR_CORRUPT.
+ *
+ * LSTG format (col.c LIST_MAGIC = 0x4754534CU, LE = 4C 53 54 47):
+ *   [4B magic][1B outer-type RAY_LIST=0][8B count][1B elem-type -RAY_I64=0xFB][8B value]
+ */
+static test_result_t test_sym_save_bad_slot_type(void) {
+    static const uint8_t lstg_buf[] = {
+        0x4C, 0x53, 0x54, 0x47,              /* LIST_MAGIC "LSTG" LE */
+        0x00,                                /* outer type = RAY_LIST = 0 */
+        0x01, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,              /* count = 1 */
+        0xFB,                                /* elem type = -RAY_I64 = -5 = 0xFB */
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00               /* i64 value = 0 */
+    };
+    const char* path = "/tmp/sym_test_bad_slot.sym";
+    bool ok = write_strl_raw(path, lstg_buf, sizeof(lstg_buf));
+    TEST_ASSERT_TRUE(ok);
+
+    /* Intern one sym so persisted_count != str_count (skip early return). */
+    ray_sym_intern("bad_slot_sym", 12);
+
+    ray_err_t err = ray_sym_save(path);
+    TEST_ASSERT_EQ_I(err, RAY_ERR_CORRUPT);
+    remove(path);
+    PASS();
+}
+
 /* ---- sym_save_tmppath_overflow ----------------------------------------- */
 
 /* ray_sym_save rejects a path that would overflow the internal tmp_path[]
@@ -2481,6 +2532,8 @@ const test_entry_t sym_entries[] = {
     { "sym/load_long_path",             test_sym_load_long_path,           sym_setup, sym_teardown },
     { "sym/save_long_path",             test_sym_save_long_path,           sym_setup, sym_teardown },
     { "sym/cache_segs_many_dots",       test_sym_cache_segs_many_dots,     sym_setup, sym_teardown },
+    { "sym/load_no_parent_dir",          test_sym_load_no_parent_dir,       sym_setup, sym_teardown },
+    { "sym/save_bad_slot_type",          test_sym_save_bad_slot_type,       sym_setup, sym_teardown },
     { "sym/save_tmppath_overflow",      test_sym_save_tmppath_overflow,    sym_setup, sym_teardown },
     { "sym/save_diverge_id",            test_sym_save_diverge_id,          sym_setup, sym_teardown },
 

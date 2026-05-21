@@ -211,3 +211,74 @@
 (xbar (as 'I16 [13 27 35 44 51]) 10) -- (as 'I16 [10 20 30 40 50])
 ;; Mixed: some negative values (floor-div behaviour)
 (at (xbar (as 'I16 [7]) 5) 0) -- 5h
+
+;; ────────────────────────────────────────────────────────────────────
+;; insert into non-TABLE objects — lines 9057-9079, 9121-9194
+;; ────────────────────────────────────────────────────────────────────
+
+;; Lines 9073-9075: insert into non-list, non-vec type → type error
+(insert (dict [a] (list 1)) 2) !- type
+
+;; Lines 9077-9079: insert vec with n=4 args → domain error
+(insert [1 2 3] 1 2 3) !- domain
+
+;; Lines 9121-9124: insert into vec with type mismatch — 2-arg append
+;; F64 atom into I64 vec, or F64 vec into I64 vec → type error
+(insert [1 2 3] 1.0) !- type
+(insert [1 2 3] [1.0 2.0]) !- type
+
+;; Lines 9130-9132: 3-arg insert, idx eval returns error
+;; raise "domain" as idx → propagates error
+(insert [1 2 3] (raise "domain") 5) !- domain
+
+;; Lines 9135-9138: 3-arg insert, val eval returns error
+(insert [1 2 3] 1 (raise "domain")) !- domain
+
+;; Lines 9152-9154: 3-arg insert into LIST with non-I64 idx type
+;; float idx → type error
+(insert (list 1 2) 1.0 3) !- type
+
+;; Lines 9183-9184: 3-arg insert into vec, idx=atom, val type mismatch
+;; I64 vec, atom idx=1, F64 val → type error
+(insert [1 2 3] 1 1.0) !- type
+
+;; Lines 9188-9189: 3-arg insert into STR vec with multi-idx → type error
+;; Multi-index insert (idx_arg=RAY_I64 vec) on a STR column is not supported
+(insert ["a" "b"] [0 1] "c") !- type
+
+;; Lines 9191-9194: multi-index insert vec, val type mismatch
+;; I64 vec, multi-idx, F64 val → type error
+(insert [1 2 3] [0 1] 1.0) !- type
+
+;; ────────────────────────────────────────────────────────────────────
+;; upsert error paths: invalid key types and values
+;; ────────────────────────────────────────────────────────────────────
+
+(set Tups2 (table [id val] (list [1 2 3] [10 20 30])))
+
+;; Lines 9499-9501: upsert TABLE row with k=0 (k<=0 → domain error)
+(upsert Tups2 0 (table [id val] (list [4] [40]))) !- domain
+
+;; Lines 9505-9507: upsert TABLE row with non-SYM, non-I64 key type → type error
+(upsert Tups2 1.0 (table [id val] (list [4] [40]))) !- type
+
+;; Lines 9636-9638: upsert list/dict row with non-SYM, non-I64 key_sym → type error
+(upsert Tups2 1.0 (list 4 40)) !- type
+
+;; Lines 9690-9692: upsert with SYM key col but non-SYM key atom in row → type error
+(set Tsymkey (table [k v] (list [alice bob] [10 20])))
+(upsert Tsymkey 1 (list 123 30)) !- type
+
+;; Lines 9708: upsert with SYM key col matching existing row
+;; alice matches row 0 → update val to 99
+(at (at (upsert Tsymkey 1 (list 'alice 99)) 'v) 0) -- 99
+
+;; Lines 9720-9722: upsert with I32 key col (tests the I32 match branch)
+;; The I32 key match branch (kt==RAY_I32) exercises lines 9720-9722.
+;; Key 2 not found in table (I32 col) → inserts. append_atom_to_col fails for I32 col.
+;; NOTE: apply_sort_take error paths and match for I32 are covered by match loop
+;; execution even when the subsequent update fails with type error.
+(set Ti32key (table [k v] (list (as 'I32 [1 2 3]) [10 20 30])))
+;; I32 key col, key=2i (I32 atom), list row: match loop at lines 9717-9722 runs
+;; (match for k=2 found), but update via append_atom_to_col fails for I32 col
+(upsert Ti32key 1 (list 2i 99)) !- type
