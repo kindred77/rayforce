@@ -1,0 +1,135 @@
+;; Coverage for null propagation through element-wise ops in expr.c:
+;;   propagate_nulls (line 1092): called when source vector has nulls
+;;   propagate_nulls_binary (line 1222): binary ops, both vec and scalar inputs
+;;   exec_elementwise_unary null propagation (line 1398-1406)
+;;   div/mod zero-divisor null marking (lines 1999-2022)
+
+;; ===================================================================
+;; Arithmetic: null in lhs/rhs propagates to result
+;; ===================================================================
+
+;; lhs vec null → result null at that position
+(+ [1 0Nl 3] 10)   -- [11 0Nl 13]
+(nil? (at (+ [1 0Nl 3] 10) 1)) -- true
+
+;; rhs vec null propagates
+(+ 10 [1 0Nl 3])   -- [11 0Nl 13]
+(nil? (at (+ 10 [1 0Nl 3]) 1)) -- true
+
+;; Both vectors with nulls at different positions
+(+ [0Nl 1 2] [3 0Nl 5]) -- [0Nl 0Nl 7]
+(sum (map nil? (+ [0Nl 1 2] [3 0Nl 5]))) -- 2
+
+;; Null propagates through mul/sub/mod
+(* [1 0Nl 3] 2) -- [2 0Nl 6]
+(nil? (at (* [1 0Nl 3] 2) 1)) -- true
+
+(- [0Nl 5 10] [1 2 3]) -- [0Nl 3 7]
+(nil? (at (- [0Nl 5 10] [1 2 3]) 0)) -- true
+
+(% [10 0Nl 12] 3) -- [1 0Nl 0]
+(nil? (at (% [10 0Nl 12] 3) 1)) -- true
+
+;; ===================================================================
+;; Unary ops with null input: propagate_nulls called (line 1398-1406)
+;; ===================================================================
+
+;; neg with null
+(neg [0Nl 1 -2]) -- [0Nl -1 2]
+(nil? (at (neg [0Nl 1 -2]) 0)) -- true
+
+;; abs with null
+(abs [0Nl -1 2]) -- [0Nl 1 2]
+(nil? (at (abs [0Nl -1 2]) 0)) -- true
+
+;; sqrt with null
+(sqrt [0Nl 4.0 9.0]) -- [0Nf 2.0 3.0]
+(nil? (at (sqrt [0Nl 4.0 9.0]) 0)) -- true
+
+;; log with null
+(log [0Nl 1.0]) -- [0Nf 0.0]
+(nil? (at (log [0Nl 1.0]) 0)) -- true
+
+;; exp with null
+(exp [0Nl 0.0]) -- [0Nf 1.0]
+(nil? (at (exp [0Nl 0.0]) 0)) -- true
+
+;; ceil/floor with null
+(ceil [0Nl 1.2 2.8]) -- [0Nf 2.0 3.0]
+(nil? (at (ceil [0Nl 1.2 2.8]) 0)) -- true
+
+(floor [0Nl 1.2 2.8]) -- [0Nf 1.0 2.0]
+(nil? (at (floor [0Nl 1.2 2.8]) 0)) -- true
+
+;; ===================================================================
+;; ISNULL: special case — flip null to 1 (line 1399-1403)
+;; ===================================================================
+
+;; isnull over nullable vector
+(map nil? [0Nl 1 2 0Nl 3]) -- [true false false true false]
+
+;; sum of nulls
+(sum (map nil? [0Nl 1 2 0Nl 3])) -- 2
+
+;; isnull over non-null vector: all false
+(map nil? [1 2 3 4 5]) -- [false false false false false]
+
+;; ===================================================================
+;; div/mod zero-divisor null marking (line 1999-2022)
+;; ===================================================================
+
+;; I64 vec divisor with zeros (line 2001-2004)
+(div [10 11 12 13] [3 0 5 0]) -- [3 0Nl 2 0Nl]
+(nil? (at (div [10 11 12 13] [3 0 5 0]) 1)) -- true
+(nil? (at (div [10 11 12 13] [3 0 5 0]) 3)) -- true
+
+;; I64 vec mod with zero (same null-marking)
+(% [10 11 12] [3 0 5]) -- [1 0Nl 2]
+(nil? (at (% [10 11 12] [3 0 5]) 1)) -- true
+
+;; I32 vec divisor with zero (line 2005-2008)
+(nil? (at (div [10i 11i 12i] [3i 0i 5i]) 1)) -- true
+(at (div [10i 11i 12i] [3i 0i 5i]) 0) -- 3
+(at (div [10i 11i 12i] [3i 0i 5i]) 2) -- 2
+(sum (map nil? (div [10i 11i 12i] [3i 0i 5i]))) -- 1
+
+;; I32 vec mod with zero
+(nil? (at (% [10i 11i 12i] [3i 0i 5i]) 1)) -- true
+(at (% [10i 11i 12i] [3i 0i 5i]) 0) -- 1
+(at (% [10i 11i 12i] [3i 0i 5i]) 2) -- 2
+(sum (map nil? (% [10i 11i 12i] [3i 0i 5i]))) -- 1
+
+;; Scalar zero divisor — all results become null (line 2011-2021)
+;; Integer scalar divisor zero
+(div [10 11 12] 0) -- [0Nl 0Nl 0Nl]
+(sum (map nil? (div [10 11 12] 0))) -- 3
+
+(% [10 11 12] 0) -- [0Nl 0Nl 0Nl]
+(sum (map nil? (% [10 11 12] 0))) -- 3
+
+;; F64 scalar divisor zero
+(/ [1.0 2.0 3.0] 0.0) -- [0Nf 0Nf 0Nf]
+(sum (map nil? (/ [1.0 2.0 3.0] 0.0))) -- 3
+
+;; Atom div by zero
+(div 10 0) -- 0Nl
+(nil? (div 10 0)) -- true
+
+(% 10 0) -- 0Nl
+(nil? (% 10 0)) -- true
+
+(/ 5 0) -- 0Nf
+(nil? (/ 5 0)) -- true
+
+;; ===================================================================
+;; Null propagation through comparisons: no-propagate for EQ..OR
+;; (op_propagates_null returns false for comparison/logical ops)
+;; ===================================================================
+
+;; Comparison: null in vector does NOT propagate — instead fix_null_comparisons applies
+(count (== [0Nl 1 2] 1)) -- 3
+(count (!= [0Nl 1 2] 1)) -- 3
+
+;; Arithmetic: null DOES propagate
+(count (+ [0Nl 1 2] 1)) -- 3
+(sum (map nil? (+ [0Nl 1 2] 1))) -- 1

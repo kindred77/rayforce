@@ -1,0 +1,130 @@
+;; Coverage for null-comparison semantics in expr.c:
+;;   fix_null_comparisons (line 1132): null-as-minimum convention
+;;   set_all_null (line 1180): broadcast null when one operand is a null scalar
+;;   propagate_nulls_binary (line 1222): null propagation from vec inputs
+;;
+;; Null semantics: null is treated as minimum-value (less than everything).
+;;   null == null → true
+;;   null < x    → true  (for any non-null x)
+;;   x > null    → true
+;;   null != x   → true  (for any non-null x)
+
+;; ===================================================================
+;; Scalar vs scalar null comparisons (fix_null_comparisons ln_s && rn_s path)
+;; ===================================================================
+
+;; Both null (line 1163-1165)
+(== 0Nl 0Nl) -- true
+(<= 0Nl 0Nl) -- true
+(>= 0Nl 0Nl) -- true
+(!= 0Nl 0Nl) -- false
+(< 0Nl 0Nl)  -- false
+(> 0Nl 0Nl)  -- false
+
+;; Left null only (line 1168-1170)
+(< 0Nl 5)    -- true
+(<= 0Nl 5)   -- true
+(!= 0Nl 5)   -- true
+(== 0Nl 5)   -- false
+(> 0Nl 5)    -- false
+(>= 0Nl 5)   -- false
+
+;; Right null only (line 1172-1173)
+(> 5 0Nl)    -- true
+(>= 5 0Nl)   -- true
+(!= 5 0Nl)   -- true
+(== 5 0Nl)   -- false
+(< 5 0Nl)    -- false
+(<= 5 0Nl)   -- false
+
+;; ===================================================================
+;; Null scalar vs vector (set_all_null path in propagate_nulls_binary)
+;; All elements get the null-semantics fill
+;; ===================================================================
+
+;; rhs null scalar: all results from null semantics
+(== [1 2 3] 0Nl) -- [false false false]
+(!= [1 2 3] 0Nl) -- [true true true]
+(< [1 2 3] 0Nl)  -- [false false false]
+(> [1 2 3] 0Nl)  -- [true true true]
+(<= [1 2 3] 0Nl) -- [false false false]
+(>= [1 2 3] 0Nl) -- [true true true]
+
+;; lhs null scalar: null < anything
+(== 0Nl [1 2 3]) -- [false false false]
+(!= 0Nl [1 2 3]) -- [true true true]
+(< 0Nl [1 2 3])  -- [true true true]
+(> 0Nl [1 2 3])  -- [false false false]
+(<= 0Nl [1 2 3]) -- [true true true]
+(>= 0Nl [1 2 3]) -- [false false false]
+
+;; ===================================================================
+;; One-sided null vector (fix_null_comparisons fast path ln 1146-1155)
+;; Exactly one side has nulls, the other is non-null scalar
+;; ===================================================================
+
+;; lhs vector has nulls, rhs is a non-null scalar (l_has ^ r_has = true)
+(== [0Nl 1 2 3] 2)  -- [false false true false]
+(!= [0Nl 1 2 3] 2)  -- [true true false true]
+(< [0Nl 1 2 3] 2)   -- [true true false false]
+(> [0Nl 1 2 3] 2)   -- [false false false true]
+(<= [0Nl 1 2 3] 2)  -- [true true true false]
+(>= [0Nl 1 2 3] 2)  -- [false false true true]
+
+;; rhs vector has nulls, lhs is a non-null scalar
+(== 2 [0Nl 1 2 3])  -- [false false true false]
+(!= 2 [0Nl 1 2 3])  -- [true true false true]
+(< 2 [0Nl 1 2 3])   -- [false false false true]
+(> 2 [0Nl 1 2 3])   -- [true true false false]
+
+;; ===================================================================
+;; Two-sided null vectors (general loop line 1158+)
+;; Both lhs and rhs vectors have nulls at different positions
+;; ===================================================================
+
+;; Nulls on different sides
+;; pos 0: lhs=null, rhs=1 -> null==1 = false, null!=1 = true, null<1 = true, null>1 = false
+;; pos 1: lhs=1, rhs=null -> 1==null = false, 1!=null = true, 1<null = false, 1>null = true
+;; pos 2: both non-null
+(== [0Nl 1 2] [1 0Nl 2]) -- [false false true]
+(!= [0Nl 1 2] [1 0Nl 2]) -- [true true false]
+(< [0Nl 1 2] [1 0Nl 2])  -- [true false false]
+(> [0Nl 1 2] [1 0Nl 2])  -- [false true false]
+
+;; Both null at same position (both-null branch)
+(== [0Nl 1 2] [0Nl 1 2]) -- [true true true]
+(<= [0Nl 1 2] [0Nl 1 2]) -- [true true true]
+(>= [0Nl 1 2] [0Nl 1 2]) -- [true true true]
+(!= [0Nl 1 2] [0Nl 1 2]) -- [false false false]
+(< [0Nl 1 2] [0Nl 1 2])  -- [false false false]
+(> [0Nl 1 2] [0Nl 1 2])  -- [false false false]
+
+;; Mix: one both-null position, one left-null, one right-null
+;; pos 0: lhs=null, rhs=1 -> null<1 = true;  null>=1 = false
+;; pos 1: lhs=1, rhs=null -> 1<null = false;  1>=null = true
+;; pos 2: both null -> null<null = false;  null>=null = true
+(< [0Nl 1 0Nl] [1 0Nl 0Nl]) -- [true false false]
+(>= [0Nl 1 0Nl] [1 0Nl 0Nl]) -- [false true true]
+
+;; ===================================================================
+;; set_all_null for different result types:
+;; F64 null scalar in arithmetic forces all-null result (line 1184-1187)
+;; ===================================================================
+
+;; F64 null propagates through arithmetic
+(+ [1.0 2.0 3.0] 0Nf) -- [0Nf 0Nf 0Nf]
+(sum (map nil? (+ [1.0 2.0 3.0] 0Nf))) -- 3
+(sum (map nil? (* [1.0 2.0] 0Nf))) -- 2
+
+;; I32 null propagates through arithmetic (set_all_null I32 path, line 1199)
+(+ [1i 2i 3i] 0Ni) -- [0Ni 0Ni 0Ni]
+(sum (map nil? (+ [1i 2i 3i] 0Ni))) -- 3
+(sum (map nil? (* [1i 2i 3i] 0Ni))) -- 3
+(sum (map nil? (- [1i 2i 3i] 0Ni))) -- 3
+
+;; I16 null propagates through arithmetic (set_all_null I16 path, line 1204)
+(sum (map nil? (+ [1h 2h 3h] 0Nh))) -- 3
+(sum (map nil? (- [1h 2h 3h] 0Nh))) -- 3
+
+;; I64 null propagates (confirmed working baseline)
+(sum (map nil? (+ [1 2 3] 0Nl))) -- 3

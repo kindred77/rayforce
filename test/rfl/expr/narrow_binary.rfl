@@ -1,0 +1,140 @@
+;; Coverage for exec_elementwise_binary with narrow integer output types:
+;;   I32 (RAY_I32/DATE/TIME), I16, U8 paths in binary_range (expr.c ~1714-1752).
+;;
+;; All operations here use direct vector-vs-vector or vector-vs-scalar forms
+;; (no table context) so the fused expr_compile path is bypassed and
+;; exec_elementwise_binary → binary_range is called directly.
+
+;; ===================================================================
+;; I32 arithmetic: +, -, *, %, div, and null propagation
+;; ===================================================================
+
+;; I32 vec + I32 vec
+(+ [1i 2i 3i] [4i 5i 6i]) -- [5 7 9]
+(type (+ [1i 2i 3i] [4i 5i 6i])) -- 'I32
+
+;; I32 vec - I32 vec
+(- [4i 5i 6i] [1i 2i 3i]) -- [3 3 3]
+(type (- [4i 5i 6i] [1i 2i 3i])) -- 'I32
+
+;; I32 vec * I32 vec
+(* [2i 3i 4i] [3i 4i 5i]) -- [6 12 20]
+(type (* [2i 3i 4i] [3i 4i 5i])) -- 'I32
+
+;; I32 floor mod — sign follows divisor (Python semantics)
+(% [10i 11i 12i] [3i 4i 5i]) -- [1 3 2]
+(type (% [10i 11i 12i] [3i 4i 5i])) -- 'I32
+
+;; I32 mod sign correction: negative dividend / positive divisor
+(% [10i -10i 10i -10i] [3i 3i -3i -3i]) -- [1 2 -2 -1]
+
+;; I32 floor div (integer path)
+(div [10i 11i 12i] [3i 4i 5i]) -- [3 2 2]
+(type (div [10i 11i 12i] [3i 4i 5i])) -- 'I32
+
+;; I32 floor div rounds toward -infinity
+(div [-7i 7i -7i] [2i -2i -2i]) -- [-4 -4 3]
+
+;; I32 div by zero yields null
+(nil? (at (div [10i 11i 12i] [3i 0i 5i]) 1)) -- true
+(at (div [10i 11i 12i] [3i 0i 5i]) 0) -- 3
+(at (div [10i 11i 12i] [3i 0i 5i]) 2) -- 2
+(sum (map nil? (div [10i 11i 12i] [3i 0i 5i]))) -- 1
+
+;; I32 mod by zero yields null
+(nil? (at (% [10i 11i 12i] [3i 0i 5i]) 1)) -- true
+(at (% [10i 11i 12i] [3i 0i 5i]) 0) -- 1
+(at (% [10i 11i 12i] [3i 0i 5i]) 2) -- 2
+(sum (map nil? (% [10i 11i 12i] [3i 0i 5i]))) -- 1
+
+;; I32 null propagates through +/-/*
+(+ [1i 2i 3i] 0Ni) -- [0Ni 0Ni 0Ni]
+(sum (map nil? (+ [1i 2i 3i] 0Ni))) -- 3
+(sum (map nil? (- [1i 2i 3i] 0Ni))) -- 3
+(sum (map nil? (* [1i 2i 3i] 0Ni))) -- 3
+
+;; ===================================================================
+;; I16 arithmetic: +, -, *, %, div
+;; ===================================================================
+
+;; I16 vec + I16 vec
+(+ [1h 2h 3h] [4h 5h 6h]) -- [5 7 9]
+(type (+ [1h 2h 3h] [4h 5h 6h])) -- 'I16
+
+;; I16 vec - I16 vec
+(- [4h 5h 6h] [1h 2h 3h]) -- [3 3 3]
+(type (- [4h 5h 6h] [1h 2h 3h])) -- 'I16
+
+;; I16 vec * I16 vec
+(* [2h 3h 4h] [3h 4h 5h]) -- [6 12 20]
+(type (* [2h 3h 4h] [3h 4h 5h])) -- 'I16
+
+;; I16 floor mod
+(% [10h 11h 12h] [3h 4h 5h]) -- [1 3 2]
+(type (% [10h 11h 12h] [3h 4h 5h])) -- 'I16
+
+;; I16 floor div
+(div [10h 11h 12h] [3h 4h 5h]) -- [3 2 2]
+(type (div [10h 11h 12h] [3h 4h 5h])) -- 'I16
+
+;; I16 div by zero yields null
+(nil? (at (div [10h 11h 12h] [3h 0h 5h]) 1)) -- true
+(at (div [10h 11h 12h] [3h 0h 5h]) 0) -- 3
+(at (div [10h 11h 12h] [3h 0h 5h]) 2) -- 2
+(sum (map nil? (div [10h 11h 12h] [3h 0h 5h]))) -- 1
+
+;; I16 mod by zero yields null
+(nil? (at (% [10h 11h 12h] [3h 0h 5h]) 1)) -- true
+(at (% [10h 11h 12h] [3h 0h 5h]) 0) -- 1
+(at (% [10h 11h 12h] [3h 0h 5h]) 2) -- 2
+(sum (map nil? (% [10h 11h 12h] [3h 0h 5h]))) -- 1
+
+;; I16 null propagates through +
+(sum (map nil? (+ [1h 2h 0Nh] 1h))) -- 1
+(sum (map nil? (- [1h 2h 0Nh] [10h 20h 30h]))) -- 1
+
+;; ===================================================================
+;; U8 arithmetic: +, -, *, %, div
+;; ===================================================================
+
+;; U8 vec + U8 vec
+(+ (as 'U8 [1 2 3]) (as 'U8 [4 5 6])) -- [0x05 0x07 0x09]
+(type (+ (as 'U8 [1 2 3]) (as 'U8 [4 5 6]))) -- 'U8
+
+;; U8 vec - U8 vec
+(- (as 'U8 [10 20 30]) (as 'U8 [1 2 3])) -- [0x09 0x12 0x1b]
+(type (- (as 'U8 [10 20 30]) (as 'U8 [1 2 3]))) -- 'U8
+
+;; U8 vec * U8 vec
+(* (as 'U8 [2 3 4]) (as 'U8 [3 4 5])) -- [0x06 0x0c 0x14]
+(type (* (as 'U8 [2 3 4]) (as 'U8 [3 4 5]))) -- 'U8
+
+;; U8 floor mod
+(% (as 'U8 [10 11 12]) (as 'U8 [3 4 5])) -- [0x01 0x03 0x02]
+(type (% (as 'U8 [10 11 12]) (as 'U8 [3 4 5]))) -- 'U8
+
+;; U8 floor div
+(div (as 'U8 [10 11 12]) (as 'U8 [3 4 5])) -- [0x03 0x02 0x02]
+(type (div (as 'U8 [10 11 12]) (as 'U8 [3 4 5]))) -- 'U8
+
+;; ===================================================================
+;; I32/I16 comparison ops (lines 699 region, through binary_range)
+;; ===================================================================
+
+;; I32 comparisons — vec vs vec
+(== [1i 2i 3i] [2i 2i 2i]) -- [false true false]
+(!= [1i 2i 3i] [2i 2i 2i]) -- [true false true]
+(< [1i 2i 3i] [2i 2i 2i])  -- [true false false]
+(<= [1i 2i 3i] [2i 2i 2i]) -- [true true false]
+(> [1i 2i 3i] [2i 2i 2i])  -- [false false true]
+(>= [1i 2i 3i] [2i 2i 2i]) -- [false true true]
+
+;; I16 comparisons — vec vs vec
+(== [1h 2h 3h] [2h 2h 2h]) -- [false true false]
+(< [1h 2h 3h] [2h 2h 2h])  -- [true false false]
+(> [1h 2h 3h] [2h 2h 2h])  -- [false false true]
+
+;; U8 comparisons
+(== (as 'U8 [1 2 3]) (as 'U8 [2 2 2])) -- [false true false]
+(< (as 'U8 [1 2 3]) (as 'U8 [2 2 2]))  -- [true false false]
+(> (as 'U8 [1 2 3]) (as 'U8 [2 2 2]))  -- [false false true]
