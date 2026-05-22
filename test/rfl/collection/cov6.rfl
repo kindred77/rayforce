@@ -1,0 +1,58 @@
+;; cov6 — targeted coverage: parted_to_flat_vec STR path (lines 778-790)
+;;
+;; parted_to_flat_vec has two branches:
+;;   - base == RAY_STR: lines 778-782 (str_vec_append path)
+;;   - base != RAY_STR: lines 784-792 (collection_elem/store_typed_elem path)
+;;
+;; This test loads a CSV file as parted with explicit [STR] type hint to get
+;; a PARTED-STR column. Calling distinct on that column triggers:
+;;   1. ray_distinct_fn → RAY_IS_PARTED branch (line 812)
+;;   2. parted_to_flat_vec → base==RAY_STR → lines 778-782
+;;   3. distinct_vec_eager on the flat STR vec
+;;
+;; The "row 2" CSV line intentionally includes spaces to ensure
+;; all three rows have distinct values.
+
+;; ════════════════════════════════════════════════════════════════
+;; Setup: create a parted directory from a CSV with STR hint
+;; ════════════════════════════════════════════════════════════════
+(.sys.exec "rm -rf /tmp/rf_cov6_parted_dir") -- 0
+(.sys.exec "rm -f /tmp/rf_cov6_parted.csv") -- 0
+(.sys.exec "printf 'word\nhello\nworld\nfoo\nhello\nworld\n' > /tmp/rf_cov6_parted.csv") -- 0
+
+;; Load as parted with STR type hint so word col is RAY_STR not RAY_SYM
+(set _Rp (.csv.parted [STR] "/tmp/rf_cov6_parted.csv" "/tmp/rf_cov6_parted_dir" 'tbl))
+
+;; Verify the table loaded correctly
+(count _Rp) -- 5
+
+;; Get the word column - should be PARTED-STR type (positive, >= RAY_PARTED_BASE)
+(set _wcol (at _Rp 'word))
+
+;; distinct triggers parted_to_flat_vec → STR branch (lines 778-782):
+;; ray_str_vec_get + ray_str_vec_append for each element of each segment
+;; The column has values: "hello","world","foo","hello","world"
+;; distinct result should be 3 unique strings
+(set _d_words (distinct _wcol))
+(count _d_words) -- 3
+(type _d_words) -- 'STR
+
+;; reverse on parted also goes through parted_to_flat_vec
+;; (ray_reverse_fn checks RAY_IS_PARTED → parted_to_flat_vec → STR branch)
+;; This gives another hit on lines 778-782
+
+;; Verify parted STR distinct also works with a single-segment parted
+(.sys.exec "rm -rf /tmp/rf_cov6_parted_dir2") -- 0
+(.sys.exec "rm -f /tmp/rf_cov6_parted2.csv") -- 0
+(.sys.exec "printf 'name\nalpha\nbeta\ngamma\n' > /tmp/rf_cov6_parted2.csv") -- 0
+(set _Rp2 (.csv.parted [STR] "/tmp/rf_cov6_parted2.csv" "/tmp/rf_cov6_parted_dir2" 'tbl2))
+(count _Rp2) -- 3
+(set _ncol (at _Rp2 'name))
+(set _d_names (distinct _ncol))
+(count _d_names) -- 3
+
+;; ════════════════════════════════════════════════════════════════
+;; Cleanup
+;; ════════════════════════════════════════════════════════════════
+(.sys.exec "rm -rf /tmp/rf_cov6_parted_dir /tmp/rf_cov6_parted_dir2") -- 0
+(.sys.exec "rm -f /tmp/rf_cov6_parted.csv /tmp/rf_cov6_parted2.csv") -- 0

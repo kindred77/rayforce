@@ -1,0 +1,55 @@
+;; cov5 — targeted coverage: distinct_sort_cmp default branch (lines 282-291)
+;;
+;; F32 (type=6) is not in hs_hash_row switch → hashes by index (all "distinct").
+;; F32 is not in distinct_sort_cmp switch → fires the default branch.
+;; F32 is not in collection_elem switch → returns error; used as garbage f64.
+;;
+;; CSV with [F32] hint: parse_types=CSV_TYPE_STR, resolved_types=F32.
+;; csv_intern_strings writes sym IDs into the F32 vec's 4-byte data slots.
+;; col_vec->type stays RAY_F32 but data holds sym IDs (not float values).
+;;
+;; NOTE: (count (distinct x)) triggers the count_distinct idiom rewrite in
+;; exec_count_distinct which returns error:type for F32 (not in its switch).
+;; Workaround: (set _d (distinct x)) materialises via OP_DISTINCT, then
+;; (count _d) calls ray_count_fn on the already-materialised F32 vec.
+;;
+;; NOTE: exec_count_distinct is a known bug (F32 not in its whitelist switch).
+;; The test below uses separate set+count to route around the idiom rewriter
+;; and exercise the actual distinct/sort code path.
+
+;; ════════════════════════════════════════════════════════════════
+;; 1. F32 vec via CSV [F32] hint — distinct triggers sort default branch
+;;    Lines 282-291: distinct_sort_cmp default case fires for F32 type
+;;    Since F32 not in hs_hash_row, hash is by index → all "distinct"
+;; ════════════════════════════════════════════════════════════════
+(.sys.exec "rm -f rf_cov5_f32.csv") -- 0
+(.sys.exec "printf 'val\n3.0\n1.0\n2.0\n' > rf_cov5_f32.csv") -- 0
+(set _t_f32 (.csv.read [F32] "rf_cov5_f32.csv"))
+(type (at _t_f32 'val)) -- 'F32
+(set _f32_col (at _t_f32 'val))
+;; distinct: hash-by-index → all "distinct" → count = 3
+;; Materialise via set (not count(distinct)) to avoid count_distinct idiom
+;; rewriter which hits F32-unhandled exec_count_distinct → error:type bug.
+;; distinct_sort_indices called (count=3 > 1, type=F32 not excluded)
+;; → distinct_sort_cmp default fires for each comparison (lines 282-291)
+(count _f32_col) -- 3
+(set _d_f32 (distinct _f32_col))
+(count _d_f32) -- 3
+;; except vec vec: build hashset hashes by index, probe also by index →
+;; same-index probe matches same-index stored → all elements found in set
+;; → result is empty (0 elements pass the "not in set" filter)
+(count (except _f32_col _f32_col)) -- 0
+(.sys.exec "rm -f rf_cov5_f32.csv") -- 0
+
+;; ════════════════════════════════════════════════════════════════
+;; 2. F32 via larger CSV to exercise sort default with more comparisons
+;; ════════════════════════════════════════════════════════════════
+(.sys.exec "rm -f rf_cov5_f32b.csv") -- 0
+(.sys.exec "printf 'x\n1.0\n2.0\n3.0\n4.0\n5.0\n' > rf_cov5_f32b.csv") -- 0
+(set _f32b_col (at (.csv.read [F32] "rf_cov5_f32b.csv") 'x))
+(type _f32b_col) -- 'F32
+(count _f32b_col) -- 5
+;; distinct with 5 elements → sort default branch called multiple times
+(set _d_f32b (distinct _f32b_col))
+(count _d_f32b) -- 5
+(.sys.exec "rm -f rf_cov5_f32b.csv") -- 0

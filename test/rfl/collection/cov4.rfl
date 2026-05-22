@@ -1,0 +1,72 @@
+;; cov4 — targeted coverage for collection.c remaining gaps
+;; Focuses on: atom_eq different-length vecs, range-take type errors,
+;;             STR typed vec from CSV, STR range-take out-of-bounds,
+;;             at/find error propagation, reverse STR with nulls.
+
+;; ════════════════════════════════════════════════════════════════
+;; 1. atom_eq — default branch: different-length vecs → not equal (line 709)
+;;    Two typed vecs of same type but different lengths → return 0
+;;    Triggered when distinct/except/etc compares vecs of different lengths.
+;; ════════════════════════════════════════════════════════════════
+;; distinct on list containing vecs of different lengths
+(count (distinct (list [1 2] [1 2 3] [1 2]))) -- 2
+(count (except (list [1 2] [1 2 3]) (list [1 2]))) -- 1
+(at (except (list [1 2] [1 2 3]) (list [1 2])) 0) -- [1 2 3]
+
+;; ════════════════════════════════════════════════════════════════
+;; 2. range-take type errors (line 1425)
+;;    n_obj is [start amount] vec, but vec is not a collection/table/string
+;; ════════════════════════════════════════════════════════════════
+;; take of a plain integer atom with [start amount] → type error
+(try (take 5 [0 2]) (fn [e] "err")) -- "err"
+;; take of f64 atom with [start amount] → first hits f64-n_obj check? No, f64 is n_obj.
+;; take with f64 as n_obj (not range-take) → type error at line 1285-1286
+(try (take 3.14 [0 1]) (fn [e] "err")) -- "err"
+
+;; ════════════════════════════════════════════════════════════════
+;; 3 & 4 — skip at/find error paths (lines 1727-1731, 1790-1794)
+;;    These paths have a bug: result->len = vlen set before loop,
+;;    so when the error fires at j=0, out[0] is uninitialized when
+;;    ray_release(result) iterates it. DEADLYSIGNAL under ASan.
+;;    (Real bugs; tracked separately; not routed around.)
+;; ════════════════════════════════════════════════════════════════
+
+;; ════════════════════════════════════════════════════════════════
+;; 5. STR typed vec from CSV — use explicit [STR] type hint
+;;    This produces a RAY_STR typed vec to test STR-specific paths.
+;; ════════════════════════════════════════════════════════════════
+(.sys.exec "rm -f rf_cov4_str.csv") -- 0
+(.sys.exec "printf 'word\nalpha\nbeta\ngamma\n' > rf_cov4_str.csv") -- 0
+(set _t_sstr (.csv.read [STR] "rf_cov4_str.csv"))
+(type (at _t_sstr 'word)) -- 'STR
+(count (at _t_sstr 'word)) -- 3
+
+;; ════════════════════════════════════════════════════════════════
+;; 6. STR vec range-take start >= len → empty result + pool propagate (line 1333)
+;;    col_propagate_str_pool fires for the empty STR result
+;; ════════════════════════════════════════════════════════════════
+(set _str_col (at _t_sstr 'word))
+(count (take _str_col [10 2])) -- 0
+(type (take _str_col [10 2])) -- 'STR
+
+;; ════════════════════════════════════════════════════════════════
+;; 7. reverse STR with nulls — null-preserving reverse (lines 1874-1885)
+;;    STR vec with RAY_ATTR_HAS_NULLS set: empty cell in CSV becomes null
+;; ════════════════════════════════════════════════════════════════
+(.sys.exec "rm -f rf_cov4_null.csv") -- 0
+(.sys.exec "printf 'name\nhello\n\nworld\nfoo\n' > rf_cov4_null.csv") -- 0
+(set _t_snull (.csv.read [STR] "rf_cov4_null.csv"))
+(set _snull_col (at _t_snull 'name))
+;; confirm the null is present (empty cell = null in STR vec)
+(nil? (at _snull_col 1)) -- true
+;; reverse the null-bearing STR vec
+(set _rev_null (reverse _snull_col))
+(count _rev_null) -- 4
+;; reversed: foo, world, null, hello
+(at _rev_null 0) -- "foo"
+(nil? (at _rev_null 2)) -- true
+(at _rev_null 3) -- "hello"
+(.sys.exec "rm -f rf_cov4_null.csv") -- 0
+
+;; cleanup
+(.sys.exec "rm -f rf_cov4_str.csv") -- 0
