@@ -224,3 +224,27 @@
 (hh     (time 2024.03.15D12:34:56.789000000)) -- 12
 (minute (time 2024.03.15D12:34:56.789000000)) -- 34
 (ss     (time 2024.03.15D12:34:56.789000000)) -- 56
+
+;; ─── null-bearing DATE vector — standalone truncate (lines 281-288) ─────────
+;; ray_temporal_truncate HAS_NULLS=1, IN32=1 path reached via (date v) / (time v)
+;; where v is a DATE vector with embedded nulls (not via select/exec_date_trunc).
+;; DAY-bucket truncate: null slot → 0Np, valid slot → midnight TIMESTAMP.
+(date (as 'DATE [8766 0N 8767])) -- [2024.01.01D00:00:00.000000000 0Np 2024.01.02D00:00:00.000000000]
+(time (as 'DATE [8766 0N 8767])) -- [2024.01.01D00:00:00.000000000 0Np 2024.01.02D00:00:00.000000000]
+
+;; null-bearing TIME vector — same path, in_type=RAY_TIME (ms*1000 arm).
+;; 3723000 ms = 01:02:03 (within 2000-01-01); SECOND-bucket truncate strips sub-s.
+(time (as 'TIME [3723000 0N 86399000])) -- [2000.01.01D01:02:03.000000000 0Np 2000.01.01D23:59:59.000000000]
+(date (as 'TIME [3723000 0N 86399000])) -- [2000.01.01D00:00:00.000000000 0Np 2000.01.01D00:00:00.000000000]
+
+;; null-bearing TIMESTAMP vector — standalone truncate (HAS_NULLS=1, IN32=0).
+(date (as 'TIMESTAMP [86400000000000 0N 172800000000000])) -- [2000.01.02D00:00:00.000000000 0Np 2000.01.03D00:00:00.000000000]
+(time (as 'TIMESTAMP [86400000000000 0N 172800000000000])) -- [2000.01.02D00:00:00.000000000 0Np 2000.01.03D00:00:00.000000000]
+
+;; null-bearing TIMESTAMP vector + pre-epoch: r < 0 branch in standalone truncate.
+;; -41354500000000 ns = 1999-12-31T12:30:45.500000000 (sub-second precision).
+;; us = -41354500000 µs; SECOND r=-500000 (< 0) → floor 1999-12-31T12:30:45.
+;; DAY: r=-41354500000 (< 0) → floor 1999-12-31T00:00:00.
+;; Exercises DT_USEC_PER_SEC true arm in standalone ray_temporal_truncate (HAS_NULLS=1).
+(date (as 'TIMESTAMP [-41354500000000 0N 86400000000000])) -- [1999.12.31D00:00:00.000000000 0Np 2000.01.02D00:00:00.000000000]
+(time (as 'TIMESTAMP [-41354500000000 0N 86400000000000])) -- [1999.12.31D12:30:45.000000000 0Np 2000.01.02D00:00:00.000000000]

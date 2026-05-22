@@ -174,3 +174,34 @@
 (yyyy 1999.12.31D23:59:59.000000000) -- 1999
 (mm   1999.12.31D23:59:59.000000000) -- 12
 (dd   1999.12.31D23:59:59.000000000) -- 31
+
+;; ─── wrong-type atom: ray_temporal_extract line 124 → "type" error ────────
+;; An atom that is not DATE / TIME / TIMESTAMP must trigger ray_error("type").
+(yyyy 42)          !- type
+(mm   "hello")     !- type
+(hh   true)        !- type
+
+;; ─── wrong-type vector: ray_temporal_extract line 134 → "type" error ───────
+;; A non-temporal vector must also reject with a type error.
+(yyyy [1 2 3])     !- type
+(ss   [1.0 2.0])   !- type
+
+;; ─── null-bearing DATE vector — standalone extract (lines 159-166) ─────────
+;; ray_temporal_extract HAS_NULLS=1, IN32=1 path reached via unary builtins
+;; (not via select/exec_extract).  0N inside an as-DATE vector → null slot.
+;; year extraction: null slot becomes 0Nl in the output.
+(yyyy (as 'DATE [8766 0N 8767])) -- [2024 0Nl 2024]
+(mm   (as 'DATE [8766 0N 8767])) -- [1 0Nl 1]
+(dd   (as 'DATE [8766 0N 8767])) -- [1 0Nl 2]
+(dow  (as 'DATE [8766 0N 8767])) -- [1 0Nl 2]
+(doy  (as 'DATE [8766 0N 8767])) -- [1 0Nl 2]
+(hh   (as 'DATE [8766 0N 8767])) -- [0 0Nl 0]
+(minute (as 'DATE [8766 0N 8767])) -- [0 0Nl 0]
+(ss   (as 'DATE [8766 0N 8767])) -- [0 0Nl 0]
+
+;; null-bearing TIME vector — same path, in_type=RAY_TIME (ms*1000 arm)
+(hh   (as 'TIME [3723000 0N 86399000])) -- [1 0Nl 23]
+(ss   (as 'TIME [3723000 0N 86399000])) -- [3 0Nl 59]
+(minute (as 'TIME [3723000 0N 86399000])) -- [2 0Nl 59]
+(yyyy (as 'TIME [3723000 0N 86399000])) -- [2000 0Nl 2000]
+(dd   (as 'TIME [3723000 0N 86399000])) -- [1 0Nl 1]
