@@ -224,6 +224,107 @@
 ;; --- exec_var_expand: start node OOB -> 0 rows ---
 (count (.graph.var-expand Path 99 1 3))           -- 0
 
+;; =====================================================================
+;; Section 2: exec_expand direction==1 (reverse) and direction==2 (both)
+;; =====================================================================
+;; Ring fixture: 0<->1<->2<->0 (bidirectional).
+;; Forward CSR from ring: 0->1, 1->2, 2->0.
+;; Reverse CSR from ring: 0->2, 1->0, 2->1.
+
+;; --- exec_expand direction==1 (reverse neighbors of node 0) ---
+;; Ring is bidirectional: edges 0->1, 1->0, 1->2, 2->1, 2->0, 0->2.
+;; Reverse CSR of node 0: nodes that have fwd edge ->0: {1, 2} = 2 rows.
+(set ExpRev (.graph.expand Ring 0 1))
+(count ExpRev)                                    -- 2
+(== (min (at ExpRev '_src)) 0)                    -- true
+(== (max (at ExpRev '_src)) 0)                    -- true
+
+;; --- exec_expand direction==2 (both: fwd + rev of node 1) ---
+;; Ring is bidirectional: fwd(1)={0,2}, rev(1)={0,2}.
+;; Direction==2 concatenates without dedup: 2+2=4 rows, all src==1.
+(set ExpBoth (.graph.expand Ring 1 2))
+(count ExpBoth)                                   -- 4
+(== (min (at ExpBoth '_src)) 1)                   -- true
+(== (max (at ExpBoth '_src)) 1)                   -- true
+
+;; --- exec_expand direction==0 on K4 hub node 0 ---
+;; K4 node 0: fwd edges are 0->1, 0->2, 0->3 = 3 forward neighbors
+(count (.graph.expand K4 0))                      -- 3
+;; reverse of K4 node 2: nodes with edge ->2: {0,1,3} = 3 rows
+(count (.graph.expand K4 2 1))                    -- 3
+;; both directions for K4 node 1: fwd {0,2,3} + rev {0,2,3} = 6 rows (no dedup)
+(count (.graph.expand K4 1 2))                    -- 6
+
+;; =====================================================================
+;; Section 3: exec_dijkstra with explicit destination argument
+;; (exercises early-exit break at dst_id branch)
+;; =====================================================================
+;; 4-cycle with unique weights: 0->1 w=1, 1->2 w=2, 2->3 w=3, 3->0 w=4
+;; Plus shortcut 0->2 w=10 (longer, not on shortest path to 2).
+(set Dij4E (table [src dst w] (list [0 0 1 2 3] [1 2 2 3 0] [1.0 10.0 2.0 3.0 4.0])))
+(set Dij4 (.graph.build Dij4E 'src 'dst 'w))
+
+;; Dijkstra from 0 to 3 (dst specified): early-exit at node 3.
+;; Shortest: 0->1->2->3, dist=6.
+(set Dij4r (.graph.dijkstra Dij4 0 3))
+(count Dij4r)                                     -- 4
+(set Dij4_node (at Dij4r '_node))
+(set Dij4_dist (at Dij4r '_dist))
+(at Dij4_dist (at (where (== Dij4_node 0)) 0))    -- 0.0
+(at Dij4_dist (at (where (== Dij4_node 3)) 0))    -- 6.0
+
+;; Dijkstra with dst == src: only src row emitted.
+(set DijSS (.graph.dijkstra Dij4 2 2))
+(count DijSS)                                     -- 1
+(first (at DijSS '_node))                         -- 2
+(first (at DijSS '_dist))                         -- 0.0
+
+;; =====================================================================
+;; Section 4: exec_k_shortest — duplicate candidate detection path
+;; Fixture: diamond graph 0->1->3 (w=2), 0->2->3 (w=2), 0->1->2->3 (via 1->2 w=1).
+;; Edges: 0->1 w=1, 0->2 w=2, 1->2 w=1, 1->3 w=2, 2->3 w=1
+;; =====================================================================
+(set DiamE (table [src dst w] (list [0 0 1 1 2] [1 2 2 3 3] [1.0 2.0 1.0 2.0 1.0])))
+(set Diam (.graph.build DiamE 'src 'dst 'w))
+
+;; 3 distinct paths from 0 to 3:
+;;   P0: 0->1->2->3 = 3.0
+;;   P1: 0->1->3    = 3.0
+;;   P2: 0->2->3    = 3.0
+(set Dk3 (.graph.k-shortest Diam 0 3 3))
+;; Should find 3 distinct paths
+(count (distinct (at Dk3 '_path_id)))             -- 3
+
+;; K=5 on diamond: only 3 paths exist, stops at 3
+(set Dk5 (.graph.k-shortest Diam 0 3 5))
+(<= (count (distinct (at Dk5 '_path_id))) 3)      -- true
+(>= (count (distinct (at Dk5 '_path_id))) 3)      -- true
+
+;; Yen's with k=2: exercises candidate-swap (best < num_cand - 1)
+;; First path: P0 (0->1->2->3=3), second path: P1 or P2
+(set Dk2 (.graph.k-shortest Diam 0 3 2))
+(count (distinct (at Dk2 '_path_id)))             -- 2
+
+;; =====================================================================
+;; Section 5: exec_var_expand direction==2 on asymmetric graph
+;; Uses K4 which has both fwd and rev edges so direction==2 explores both.
+;; =====================================================================
+;; From node 0 in K4 (direction 2, depth 1): both fwd + rev neighbors
+;; K4 is complete undirected: fwd(0)={1,2,3}, rev(0)={1,2,3} => same nodes, deduped by visited bitmap
+(set Ve2 (.graph.var-expand K4 0 1 1 2))
+(count Ve2)                                       -- 3
+(min (at Ve2 '_depth))                            -- 1
+(max (at Ve2 '_depth))                            -- 1
+
+;; Star graph direction==2 from hub (node 0): fwd={1,2,3,4,5}, rev={}
+(set VeStar2 (.graph.var-expand Star 0 1 1 2))
+(count VeStar2)                                   -- 5
+
+;; Star graph direction==2 from spoke (node 1): fwd={}, rev={0}
+(set VeSpoke2 (.graph.var-expand Star 1 1 1 2))
+(count VeSpoke2)                                  -- 1
+(first (at VeSpoke2 '_end))                       -- 0
+
 ;; Cleanup
 (.graph.free K4)
 (.graph.free Chain)
@@ -236,3 +337,5 @@
 (.graph.free K23)
 (.graph.free IsoG)
 (.graph.free EqG)
+(.graph.free Dij4)
+(.graph.free Diam)
