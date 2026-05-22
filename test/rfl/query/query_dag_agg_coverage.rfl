@@ -1,8 +1,12 @@
 ;; Coverage for DAG aggregation opcode paths in `src/ops/query.c`:
 ;;   `compile_expr_dag` agg switch (lines ~1249-1264):
 ;;     OP_COUNT, OP_FIRST, OP_LAST, OP_PROD, OP_STDDEV, OP_VAR, OP_MEDIAN
-;;   These are generated when an aggregation appears in a no-by select
-;;   (the DAG compiler builds an OP_AGG node for the whole table).
+;;   These are generated when compile_expr_dag is called on a full
+;;   aggregation expression as a SUB-EXPRESSION of an arithmetic op
+;;   (e.g. `(+ (count v) 0)` — the binary `+` compiles elems[1]=(count v)
+;;   which hits the agg opcode switch at line 1254).
+;;   Note: the no-by path at 6884 extracts `agg_elems[1]` and compiles
+;;   only the argument, so direct no-by agg selects do NOT reach 1254.
 ;;
 ;;   Also exercises:
 ;;   `groups_to_pair_list` with SYM/STR keys (single-element key vector)
@@ -89,6 +93,50 @@
 (sum (at (select {s: (sum v) by: [g1 g2] from: Tstr2}) 's)) -- 150
 
 ;; ────────────────────────────────────────────────────────────────────
+;; compile_expr_dag agg opcode switch lines 1254-1263:
+;; Reached when an aggregation appears as a sub-expression inside
+;; arithmetic in a no-by projection select.
+;;
+;; (+ (count v) 0): binary `+` compiles each operand; the left operand
+;; `(count v)` is a LIST expression whose head resolves to OP_COUNT →
+;; compile_expr_dag hits line 1254. Same pattern for first/last/prod/
+;; stddev/var/median.
+;;
+;; The `(+ agg 0)` wrapper bypasses the no-by scalar-reduction path
+;; (6854: `has_agg && !has_nonagg_out` requires ALL outputs to be agg
+;; expressions — `(+ (count v) 0)` has head `+`, so `is_agg_expr`=false,
+;; `has_nonagg_out=1`) → falls through to projection path (6917) →
+;; compile_expr_dag called on the full expression (6926).
+;; ────────────────────────────────────────────────────────────────────
+(set Tagg_arith (table [v] (list [2 4 6 8 10])))
+
+;; OP_COUNT (line 1254): (+ (count v) 0) — aggregate+arith → 1-row result
+;; OP_GROUP reduces the 5-row table to 1 aggregate row; result is 1 row.
+(count (at (select {r: (+ (count v) 0) from: Tagg_arith}) 'r)) -- 1
+(at (at (select {r: (+ (count v) 0) from: Tagg_arith}) 'r) 0) -- 5
+
+;; OP_FIRST (line 1255): (+ (first v) 0) → first=2 → 2
+(count (at (select {r: (+ (first v) 0) from: Tagg_arith}) 'r)) -- 1
+(at (at (select {r: (+ (first v) 0) from: Tagg_arith}) 'r) 0) -- 2
+
+;; OP_LAST (line 1256): (+ (last v) 0) → last=10 → 10
+(at (at (select {r: (+ (last v) 0) from: Tagg_arith}) 'r) 0) -- 10
+
+;; OP_PROD (line 1257): (+ (prod v) 0) → 2*4*6*8*10=3840
+(at (at (select {r: (+ (prod v) 0) from: Tagg_arith}) 'r) 0) -- 3840
+
+;; OP_STDDEV (line 1258): (+ (stddev v) 0) → ~3.162
+(at (at (select {r: (+ (stddev v) 0) from: Tagg_arith}) 'r) 0) -- 3.16
+
+;; OP_VAR (line 1260): (+ (var v) 0) → 10.0
+(at (at (select {r: (+ (var v) 0) from: Tagg_arith}) 'r) 0) -- 10.0
+
+;; OP_MEDIAN (line 1262): (+ (med v) 0) → compile succeeds, but OP_MEDIAN
+;; is holistic (post-radix pass) and fails at DAG execution with "nyi".
+;; The compile path through line 1262 is still exercised.
+(select {r: (+ (med v) 0) from: Tagg_arith}) !- nyi
+
+;; ────────────────────────────────────────────────────────────────────
 ;; No-agg multi-key by-group with WHERE (lines 6265-6275)
 ;; select with no output expressions, multi-key SYM vector by:, and where:
 ;; → hits lines 6266-6271: rebuilds key ops from SYM vector after filtering
@@ -140,3 +188,40 @@
 ;; Group A: v=[1,3] → distinct=[1,3] → +1=[2,4] → sum=6
 ;; Group B: v=[2,4] → distinct=[2,4] → +1=[3,5] → sum=8
 (sum (at (select {s: (sum (+ (distinct v) 1)) by: k from: Tecdist}) 's)) -- 14
+
+;; ────────────────────────────────────────────────────────────────────
+;; compile_expr_dag agg switch default (line 1263):
+;; Reached when an agg with opcode not in the switch is compiled as a
+;; 2-element sub-expression.
+;;
+;; pearson_corr is a binary aggregation registered with resolve_agg_opcode
+;; returning OP_PEARSON_CORR, which is NOT in the switch at 1249-1263.
+;; When `(pearson_corr x)` (with only 1 arg) appears as elems[1] of a
+;; binary `+`, compile_expr_dag processes it:
+;;   n==2 → resolve_unary_dag(pearson_corr)=NULL → resolve_agg_opcode=OP_PEARSON_CORR
+;;   switch(OP_PEARSON_CORR) → default: return NULL (line 1263)
+;; The outer compile_expr_dag returns NULL → use_eval_fallback=1.
+;; eval_expr_per_row then calls ray_eval((pearson_corr x)) per row, which
+;; fails (wrong arity) → select returns domain error.
+;; ────────────────────────────────────────────────────────────────────
+(set Tpcorr (table [x y] (list [1 2 3] [4 5 6])))
+;; (+ (pearson_corr x) 0): pearson_corr with 1 arg → compile default case
+;; → falls back to eval_expr_per_row → arity fail in ray_eval → arity error
+(select {r: (+ (pearson_corr x) 0) from: Tpcorr}) !- arity
+
+;; ────────────────────────────────────────────────────────────────────
+;; Scalar reduction with compile_expr_dag NULL for agg input (lines 6889-6895):
+;; In the scalar reduction path (n_out>0, no by:, all outputs are aggs),
+;; compile_expr_dag is called for each agg's argument at line 6886.
+;; If the argument cannot be compiled (e.g. pow not in resolve_binary_dag),
+;; compile_expr_dag returns NULL and lines 6889-6895 execute.
+;;
+;; (select {r: (sum (pow v 2)) from: T}):
+;;   is_agg_expr((sum (pow v 2))) = true (resolve_agg_opcode(sum) != 0)
+;;   → has_agg=1, has_nonagg_out=0 → scalar reduction path (6854)
+;;   → agg_elems[1] = (pow v 2), compile_expr_dag((pow v 2)) = NULL
+;;     (pow not in resolve_binary_dag at 238-271)
+;;   → lines 6889-6895: releases selection if set, returns domain error
+;; ────────────────────────────────────────────────────────────────────
+(set Tscalar (table [v] (list [1 2 3 4])))
+(select {r: (sum (pow v 2)) from: Tscalar}) !- domain
