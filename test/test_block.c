@@ -26,6 +26,7 @@
 #include <rayforce.h>
 #include "core/block.h"
 #include "table/sym.h"
+#include "ops/ops.h"
 
 /* ---- Accessor macro tests ---------------------------------------------- */
 
@@ -143,6 +144,144 @@ static test_result_t test_ray_t_size(void) {
     PASS();
 }
 
+/* ---- ray_block_size: RAY_LIST branch ------------------------------------ */
+
+static test_result_t test_block_size_list(void) {
+    ray_t list;
+    memset(&list, 0, sizeof(list));
+    list.type = RAY_LIST;
+    list.len  = 3;
+
+    size_t sz = ray_block_size(&list);
+    /* 32 header + 3 * sizeof(ray_t*) = 32 + 24 = 56 */
+    TEST_ASSERT_EQ_U(sz, 32 + (size_t)3 * sizeof(ray_t*));
+
+    /* Empty list: still goes through the LIST branch */
+    list.len = 0;
+    TEST_ASSERT_EQ_U(ray_block_size(&list), 32);
+
+    PASS();
+}
+
+/* ---- ray_block_size: RAY_DICT branch ------------------------------------ */
+
+static test_result_t test_block_size_dict(void) {
+    ray_t d;
+    memset(&d, 0, sizeof(d));
+    d.type = RAY_DICT;
+    d.len  = 2;
+
+    size_t sz = ray_block_size(&d);
+    /* 32 header + 2 * sizeof(ray_t*) = 32 + 16 = 48 */
+    TEST_ASSERT_EQ_U(sz, 32 + 2 * sizeof(ray_t*));
+
+    PASS();
+}
+
+/* ---- ray_block_size: RAY_SEL branch ------------------------------------- */
+
+static test_result_t test_block_size_sel(void) {
+    /* Use ray_sel_new to get a properly-typed block, then measure it. */
+    ray_t* sel = ray_sel_new(1024);
+    TEST_ASSERT_NOT_NULL(sel);
+    TEST_ASSERT_FMT(!RAY_IS_ERR(sel), "ray_sel_new failed");
+
+    size_t sz = ray_block_size(sel);
+    /* nrows=1024: n_segs=1, n_words=16
+     * dsz = sizeof(ray_sel_meta_t)=16
+     *      + align8(1)=8          (seg_flags)
+     *      + align8(2)=8          (seg_popcnt)
+     *      + 16*8=128             (bits)
+     *      = 160
+     * total = 32 + 160 = 192 */
+    TEST_ASSERT_EQ_U(sz, 192);
+
+    ray_free(sel);
+    PASS();
+}
+
+static test_result_t test_block_size_sel_zero(void) {
+    /* nrows=0: n_segs=0, n_words=0
+     * dsz = sizeof(ray_sel_meta_t)=16 + 0 + 0 + 0 = 16
+     * total = 32 + 16 = 48 */
+    ray_t* sel = ray_sel_new(0);
+    TEST_ASSERT_NOT_NULL(sel);
+    TEST_ASSERT_FMT(!RAY_IS_ERR(sel), "ray_sel_new(0) failed");
+
+    size_t sz = ray_block_size(sel);
+    TEST_ASSERT_EQ_U(sz, 32 + sizeof(ray_sel_meta_t));
+
+    ray_free(sel);
+    PASS();
+}
+
+static test_result_t test_block_size_sel_negative(void) {
+    /* nrows < 0: defensive path — returns 32 */
+    ray_t fake_sel;
+    memset(&fake_sel, 0, sizeof(fake_sel));
+    fake_sel.type = RAY_SEL;
+    fake_sel.len  = -1;   /* negative */
+
+    size_t sz = ray_block_size(&fake_sel);
+    TEST_ASSERT_EQ_U(sz, 32);
+
+    PASS();
+}
+
+/* ---- ray_block_size: out-of-range type guard ---------------------------- */
+
+static test_result_t test_block_size_bad_type(void) {
+    /* type=0 is RAY_LIST, handled above; type < 0 is atom, handled above.
+     * type >= RAY_TYPE_COUNT is out-of-range for a non-atom, non-special block. */
+    ray_t v;
+    memset(&v, 0, sizeof(v));
+    v.type = RAY_TYPE_COUNT;   /* == 15, out-of-range */
+    v.len  = 10;
+
+    size_t sz = ray_block_size(&v);
+    TEST_ASSERT_EQ_U(sz, 32);
+
+    PASS();
+}
+
+/* ---- ray_block_copy: LIST and SEL --------------------------------------- */
+
+static test_result_t test_block_copy_list(void) {
+    /* Allocate a small list, copy it, verify independence */
+    ray_t* src = ray_list_new(2);
+    TEST_ASSERT_NOT_NULL(src);
+    TEST_ASSERT_FMT(!RAY_IS_ERR(src), "ray_list_new failed");
+
+    ray_t* dst = ray_block_copy(src);
+    TEST_ASSERT_NOT_NULL(dst);
+    TEST_ASSERT_FMT(!RAY_IS_ERR(dst), "ray_block_copy failed");
+
+    TEST_ASSERT_EQ_I(dst->type, src->type);
+    TEST_ASSERT_EQ_I(dst->len,  src->len);
+
+    ray_release(dst);
+    ray_release(src);
+    PASS();
+}
+
+static test_result_t test_block_copy_sel(void) {
+    ray_t* src = ray_sel_new(64);
+    TEST_ASSERT_NOT_NULL(src);
+    TEST_ASSERT_FMT(!RAY_IS_ERR(src), "ray_sel_new failed");
+
+    ray_t* dst = ray_block_copy(src);
+    TEST_ASSERT_NOT_NULL(dst);
+    TEST_ASSERT_FMT(!RAY_IS_ERR(dst), "ray_block_copy(sel) failed");
+
+    TEST_ASSERT_EQ_I(dst->type, RAY_SEL);
+    TEST_ASSERT_EQ_I(dst->len,  src->len);
+    TEST_ASSERT_EQ_U(ray_block_size(dst), ray_block_size(src));
+
+    ray_free(dst);
+    ray_free(src);
+    PASS();
+}
+
 /* ---- Suite definition -------------------------------------------------- */
 
 const test_entry_t block_entries[] = {
@@ -154,6 +293,14 @@ const test_entry_t block_entries[] = {
     { "block/block_size_bool", test_block_size_vec_bool, NULL, NULL },
     { "block/block_size_empty", test_block_size_empty_vec, NULL, NULL },
     { "block/ray_t_size", test_ray_t_size, NULL, NULL },
+    { "block/block_size_list", test_block_size_list, NULL, NULL },
+    { "block/block_size_dict", test_block_size_dict, NULL, NULL },
+    { "block/block_size_sel", test_block_size_sel, NULL, NULL },
+    { "block/block_size_sel_zero", test_block_size_sel_zero, NULL, NULL },
+    { "block/block_size_sel_negative", test_block_size_sel_negative, NULL, NULL },
+    { "block/block_size_bad_type", test_block_size_bad_type, NULL, NULL },
+    { "block/block_copy_list", test_block_copy_list, NULL, NULL },
+    { "block/block_copy_sel", test_block_copy_sel, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
 

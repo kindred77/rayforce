@@ -162,3 +162,15 @@
 ;; asc: (+ s 0) on group result: s = sum(v) per group.
 ;; apply_sort_take gets this expression → bad_clause=1 → unsorted take.
 (count (select {s: (sum v) from: Tcomp by: k asc: (+ s 0) take: 2})) -- 2
+
+;; ────────────────────────────────────────────────────────────────────
+;; simplify_agg_idiom: col_expr is not a name ref (line 1858)
+;; `(first (asc col_expr))` where col_expr = (+ v 1) (not a name ref)
+;; → col_expr->type == RAY_LIST, not -RAY_SYM → return false at 1858.
+;; dep_candidate optimization not applied → falls back to per-group eval.
+;; (+ v 1) is not compilable as an agg DAG node → domain error.
+;; ────────────────────────────────────────────────────────────────────
+(set T1858 (table [k v] (list ['a 'a 'b 'b] [1 2 3 4])))
+;; (first (asc (+ v 1))): inner col_expr = (+ v 1) is LIST → line 1858
+;; simplify_agg_idiom returns false → compilation fails → domain error
+(select {m: (first (asc (+ v 1))) by: k from: T1858}) !- domain

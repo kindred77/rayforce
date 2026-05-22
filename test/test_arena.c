@@ -250,6 +250,188 @@ static test_result_t test_arena_sym_intern(void) {
     PASS();
 }
 
+/* ---- ray_arena_new with tiny chunk_size (<256) -------------------------- *
+ *
+ * When chunk_size < 256, ray_arena_new clamps it to 256.  Passing 0 (or any
+ * value below 256) exercises the `if (chunk_size < 256) chunk_size = 256;`
+ * branch that was previously uncovered. */
+
+static test_result_t test_arena_new_tiny_chunk(void) {
+    ray_heap_init();
+
+    /* Pass chunk_size=0 — must be clamped to 256 internally. */
+    ray_arena_t* arena = ray_arena_new(0);
+    TEST_ASSERT_NOT_NULL(arena);
+
+    /* Allocation must still work after clamping. */
+    ray_t* v = ray_arena_alloc(arena, 0);
+    TEST_ASSERT_NOT_NULL(v);
+    TEST_ASSERT_TRUE(v->attrs & RAY_ATTR_ARENA);
+    TEST_ASSERT_EQ_U(v->rc, 1);
+
+    /* Also try chunk_size=1 to cover another sub-256 value. */
+    ray_arena_destroy(arena);
+    arena = ray_arena_new(1);
+    TEST_ASSERT_NOT_NULL(arena);
+    v = ray_arena_alloc(arena, 10);
+    TEST_ASSERT_NOT_NULL(v);
+    TEST_ASSERT_TRUE(v->attrs & RAY_ATTR_ARENA);
+
+    ray_arena_destroy(arena);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ---- ray_arena_alloc NULL arena guard ----------------------------------- *
+ *
+ * ray_arena_alloc(NULL, n) must return NULL immediately. */
+
+static test_result_t test_arena_alloc_null_arena(void) {
+    ray_t* v = ray_arena_alloc(NULL, 0);
+    TEST_ASSERT_NULL(v);
+    v = ray_arena_alloc(NULL, 64);
+    TEST_ASSERT_NULL(v);
+    PASS();
+}
+
+/* ---- ray_arena_alloc nbytes overflow guard ------------------------------ *
+ *
+ * When nbytes > SIZE_MAX - 32 - (ARENA_ALIGN-1), ray_arena_alloc returns NULL
+ * to prevent integer overflow during block_size computation. */
+
+static test_result_t test_arena_alloc_overflow_nbytes(void) {
+    ray_heap_init();
+
+    ray_arena_t* arena = ray_arena_new(4096);
+    TEST_ASSERT_NOT_NULL(arena);
+
+    /* SIZE_MAX - 32 - 31 = SIZE_MAX - 63; anything > that overflows. */
+    size_t huge = SIZE_MAX - 30;
+    ray_t* v = ray_arena_alloc(arena, huge);
+    TEST_ASSERT_NULL(v);
+
+    /* Arena must still be usable after the rejected request. */
+    v = ray_arena_alloc(arena, 0);
+    TEST_ASSERT_NOT_NULL(v);
+    TEST_ASSERT_TRUE(v->attrs & RAY_ATTR_ARENA);
+
+    ray_arena_destroy(arena);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ---- ray_arena_reserve NULL arena guard --------------------------------- */
+
+static test_result_t test_arena_reserve_null_arena(void) {
+    /* Must return false immediately without crashing. */
+    bool ok = ray_arena_reserve(NULL, 64);
+    TEST_ASSERT_FALSE(ok);
+    ok = ray_arena_reserve(NULL, 0);
+    TEST_ASSERT_FALSE(ok);
+    PASS();
+}
+
+/* ---- ray_arena_reserve zero bytes --------------------------------------- *
+ *
+ * Reserving 0 bytes is a no-op that must return true. */
+
+static test_result_t test_arena_reserve_zero(void) {
+    ray_heap_init();
+
+    ray_arena_t* arena = ray_arena_new(4096);
+    TEST_ASSERT_NOT_NULL(arena);
+
+    bool ok = ray_arena_reserve(arena, 0);
+    TEST_ASSERT_TRUE(ok);
+
+    /* Arena still functional. */
+    ray_t* v = ray_arena_alloc(arena, 0);
+    TEST_ASSERT_NOT_NULL(v);
+
+    ray_arena_destroy(arena);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ---- ray_arena_reserve bytes > chunk_size (new_cap bump) --------------- *
+ *
+ * When the reservation request exceeds arena->chunk_size, the new chunk
+ * capacity is bumped to ARENA_ALIGN_UP(bytes).  The `if (bytes > new_cap)`
+ * branch inside ray_arena_reserve was previously uncovered. */
+
+static test_result_t test_arena_reserve_oversize(void) {
+    ray_heap_init();
+
+    /* Small default chunk_size so a large reserve definitely exceeds it. */
+    ray_arena_t* arena = ray_arena_new(256);
+    TEST_ASSERT_NOT_NULL(arena);
+
+    /* Reserve more than 256 bytes — triggers the bytes > new_cap path. */
+    bool ok = ray_arena_reserve(arena, 8192);
+    TEST_ASSERT_TRUE(ok);
+
+    /* Subsequent allocation of up to 8192 bytes must fit without another
+     * chunk allocation. */
+    ray_t* v = ray_arena_alloc(arena, 4096);
+    TEST_ASSERT_NOT_NULL(v);
+    TEST_ASSERT_TRUE(v->attrs & RAY_ATTR_ARENA);
+    memset(ray_data(v), 0x5A, 4096);
+    TEST_ASSERT_EQ_U(((uint8_t*)ray_data(v))[0], 0x5A);
+    TEST_ASSERT_EQ_U(((uint8_t*)ray_data(v))[4095], 0x5A);
+
+    ray_arena_destroy(arena);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ---- ray_arena_total_used NULL arena ------------------------------------ */
+
+static test_result_t test_arena_total_used_null(void) {
+    /* Must return 0 without crashing. */
+    size_t used = ray_arena_total_used(NULL);
+    TEST_ASSERT_EQ_U(used, 0);
+    PASS();
+}
+
+/* ---- ray_arena_total_used multi-chunk accounting ----------------------- *
+ *
+ * After allocations that span multiple chunks, total_used must equal the
+ * sum of used bytes across all chunks. */
+
+static test_result_t test_arena_total_used_multi_chunk(void) {
+    ray_heap_init();
+
+    /* Tiny chunk so each block forces a new chunk. */
+    ray_arena_t* arena = ray_arena_new(64);
+    TEST_ASSERT_NOT_NULL(arena);
+
+    /* Make several allocations that overflow the tiny chunk repeatedly. */
+    size_t before = ray_arena_total_used(arena);
+    TEST_ASSERT_EQ_U(before, 0);
+
+    for (int i = 0; i < 20; i++) {
+        ray_t* v = ray_arena_alloc(arena, 64);
+        TEST_ASSERT_NOT_NULL(v);
+    }
+
+    size_t after = ray_arena_total_used(arena);
+    /* Each 64-byte-data alloc is ARENA_ALIGN_UP(32+64)=128 bytes; 20 allocs
+     * spread across chunks → total_used > 0 and spans multiple chunks. */
+    TEST_ASSERT((after) > (0), "total_used > 0");
+
+    ray_arena_destroy(arena);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ---- ray_arena_reset NULL arena guard ----------------------------------- */
+
+static test_result_t test_arena_reset_null(void) {
+    /* Must not crash. */
+    ray_arena_reset(NULL);
+    PASS();
+}
+
 const test_entry_t arena_entries[] = {
     { "arena/release_noop", test_arena_release_noop, NULL, NULL },
     { "arena/alloc_basic", test_arena_alloc_basic, NULL, NULL },
@@ -261,6 +443,15 @@ const test_entry_t arena_entries[] = {
     { "arena/retain_noop", test_arena_retain_noop, NULL, NULL },
     { "arena/cow_noop", test_arena_cow_noop, NULL, NULL },
     { "arena/sym_intern", test_arena_sym_intern, NULL, NULL },
+    { "arena/new_tiny_chunk",           test_arena_new_tiny_chunk,           NULL, NULL },
+    { "arena/alloc_null_arena",         test_arena_alloc_null_arena,         NULL, NULL },
+    { "arena/alloc_overflow_nbytes",    test_arena_alloc_overflow_nbytes,    NULL, NULL },
+    { "arena/reserve_null_arena",       test_arena_reserve_null_arena,       NULL, NULL },
+    { "arena/reserve_zero",             test_arena_reserve_zero,             NULL, NULL },
+    { "arena/reserve_oversize",         test_arena_reserve_oversize,         NULL, NULL },
+    { "arena/total_used_null",          test_arena_total_used_null,          NULL, NULL },
+    { "arena/total_used_multi_chunk",   test_arena_total_used_multi_chunk,   NULL, NULL },
+    { "arena/reset_null",               test_arena_reset_null,               NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
 

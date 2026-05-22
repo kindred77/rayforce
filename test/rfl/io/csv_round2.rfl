@@ -1,0 +1,93 @@
+;; csv.c round 2 — paths not covered by csv_types.rfl (round 1) or
+;; system/write_csv.rfl / read_csv.rfl baselines.
+;;
+;; Targets (from llvm-cov inspection of round-1 leftovers):
+;;   - csv_parse_fn parallel dispatch (>8192 rows)
+;;   - build_row_offsets / build_row_offsets_limited realloc paths
+;;   - csv_write_cell remaining type arms (GUID, F32)
+;;   - .csv.splayed save + read-back
+;;   - quoted-field embedded newlines forcing slow path through scanner
+
+;; ────────────────────────────────────────────────────────────────────
+;; 1. Parallel parse — write a large CSV (>8192 rows) and read it.
+;; ────────────────────────────────────────────────────────────────────
+;; Build a 10000-row table with mixed types so the parallel-parse
+;; path (csv.c:902 csv_parse_fn worker dispatch) is taken.
+(set Big (table [i f s] (list (til 10000) (as 'F64 (til 10000)) (take ['x 'y 'z 'w] 10000))))
+(count Big) -- 10000
+(.csv.write Big "rf_test_csv_r2_big.csv") -- 0
+(set BigR (.csv.read [I64 F64 SYMBOL] "rf_test_csv_r2_big.csv"))
+(count BigR) -- 10000
+(at (at BigR 'i) 0) -- 0
+(at (at BigR 'i) 9999) -- 9999
+(at (at BigR 's) 0) -- 'x
+(.sys.exec "rm -f rf_test_csv_r2_big.csv") -- 0
+
+;; ────────────────────────────────────────────────────────────────────
+;; 2. Quoted fields with embedded newline — forces the slow path in
+;;    build_row_offsets and scan_field_quoted.
+;; ────────────────────────────────────────────────────────────────────
+(.sys.exec "printf 'a,b\\n\"line1\\nline2\",10\\n\"single\",20\\n' > rf_test_csv_r2_qnl.csv") -- 0
+(set Qnl (.csv.read [STR I64] "rf_test_csv_r2_qnl.csv"))
+(count Qnl) -- 2
+(at (at Qnl 'a) 1) -- "single"
+(at (at Qnl 'b) 0) -- 10
+(at (at Qnl 'b) 1) -- 20
+(.sys.exec "rm -f rf_test_csv_r2_qnl.csv") -- 0
+
+;; ────────────────────────────────────────────────────────────────────
+;; 3. GUID write → read round-trip (csv_write_guid + fast_guid).
+;; ────────────────────────────────────────────────────────────────────
+(set Tg (table [g] (list (guid 3))))
+(.csv.write Tg "rf_test_csv_r2_guid.csv") -- 0
+(set Tgr (.csv.read [GUID] "rf_test_csv_r2_guid.csv"))
+(count Tgr) -- 3
+(.sys.exec "rm -f rf_test_csv_r2_guid.csv") -- 0
+
+;; ────────────────────────────────────────────────────────────────────
+;; 4. .csv.splayed: load CSV → splayed dir (covers the read+materialize
+;;    splayed path csv_splayed_writer_open/append/close at csv.c:1834+).
+;; ────────────────────────────────────────────────────────────────────
+(.sys.exec "printf 'a,b,c\\n1,1.5,alpha\\n2,2.5,beta\\n3,3.5,gamma\\n' > rf_test_csv_r2_sp.csv") -- 0
+(set Tsp (.csv.splayed "rf_test_csv_r2_sp.csv" "rf_test_csv_r2_splayed/"))
+(count Tsp) -- 3
+(.sys.exec "rm -rf rf_test_csv_r2_splayed/ rf_test_csv_r2_sp.csv") -- 0
+
+;; ────────────────────────────────────────────────────────────────────
+;; 5. Trailing comma / no trailing newline — boundary cases for the
+;;    row scanner (csv_parse_serial + build_row_offsets_limited).
+;; ────────────────────────────────────────────────────────────────────
+(.sys.exec "printf 'a,b,c\\n1,2,3\\n4,5,6' > rf_test_csv_r2_notrail.csv") -- 0
+(set Tnt (.csv.read [I64 I64 I64] "rf_test_csv_r2_notrail.csv"))
+(count Tnt) -- 2
+(at (at Tnt 'c) 1) -- 6
+(.sys.exec "rm -f rf_test_csv_r2_notrail.csv") -- 0
+
+;; Empty cells in the middle of a row.
+(.sys.exec "printf 'a,b,c\\n1,,3\\n4,5,\\n' > rf_test_csv_r2_empty.csv") -- 0
+(set Tem (.csv.read [I64 I64 I64] "rf_test_csv_r2_empty.csv"))
+(count Tem) -- 2
+;; Empty integer cells → null (NULL_I64).
+(nil? (at (at Tem 'b) 0)) -- true
+(nil? (at (at Tem 'c) 1)) -- true
+(.sys.exec "rm -f rf_test_csv_r2_empty.csv") -- 0
+
+;; ────────────────────────────────────────────────────────────────────
+;; 6. Round-trip with all temporal types — exercises csv_write_date,
+;;    csv_write_time, csv_write_timestamp.
+;; ────────────────────────────────────────────────────────────────────
+(set Tt (table [d t ts] (list (as 'DATE [7305 7306 7307]) (as 'TIME [3723000 7200000 0]) (as 'TIMESTAMP [86400000000000 172800000000000 0]))))
+(.csv.write Tt "rf_test_csv_r2_temp.csv") -- 0
+(set Ttr (.csv.read [DATE TIME TIMESTAMP] "rf_test_csv_r2_temp.csv"))
+(count Ttr) -- 3
+(at (at Ttr 'd) 0) -- 2020.01.01
+(.sys.exec "rm -f rf_test_csv_r2_temp.csv") -- 0
+
+;; ────────────────────────────────────────────────────────────────────
+;; 7. Long string fields (force string pool growth in csv_intern_strings).
+;; ────────────────────────────────────────────────────────────────────
+(set LongStr (table [s] (list (list "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz" "another_very_long_string_field_for_csv_round_trip_testing_purposes" "yet_another_one_just_to_be_sure"))))
+(.csv.write LongStr "rf_test_csv_r2_long.csv") -- 0
+(set LongR (.csv.read [STR] "rf_test_csv_r2_long.csv"))
+(count LongR) -- 3
+(.sys.exec "rm -f rf_test_csv_r2_long.csv") -- 0

@@ -63,6 +63,22 @@
 (at (at Tf64_u 'val) 2) -- 35.0
 
 ;; ────────────────────────────────────────────────────────────────────
+;; WHERE-branch update: I64→F64 null propagation (lines 8671-8675)
+;; Same code path as above but expr_vec (I64) has a null bit set.
+;; The null propagation loop fires when ray_vec_is_null(expr_vec, r)=true.
+;; Create I64 column with null via prior update, then update F64 col.
+;; ────────────────────────────────────────────────────────────────────
+(set Tnp_base (table [k v f] (list [1 2 3] [10 20 30] [100.0 200.0 300.0])))
+;; Set v=null (I64 null) at k=1 (row 0) via no-where broadcast:
+(set Tnp_null (update {v: 0Nl from: Tnp_base}))
+;; Tnp_null: all rows have v=0Nl, f unchanged
+;; Now update f (F64) with (+ v 0) — I64 result has null bits
+;; WHERE k>0 masks all 3 rows; expr_vec = I64 vec with all nulls
+;; → null propagation at lines 8671-8675 fires
+(count (update {f: (+ v 0) from: Tnp_null where: (> k 0)})) -- 3
+(nil? (at (at (update {f: (+ v 0) from: Tnp_null where: (> k 0)}) 'f) 0)) -- true
+
+;; ────────────────────────────────────────────────────────────────────
 ;; No-WHERE update: LIST column with SYM atom broadcast (lines 8813-8824)
 ;; ct==RAY_LIST, expr_vec==-SYM atom → broadcast boxed list to all rows
 ;; ────────────────────────────────────────────────────────────────────
@@ -251,6 +267,21 @@
 (insert [1 2 3] [0 1] 1.0) !- type
 
 ;; ────────────────────────────────────────────────────────────────────
+;; Insert TABLE row with wrong column count (lines 9304, 9310-9311)
+;; ray_len(row) != ncols → domain error
+;; TABLE row with different ncols checked at 9230 (returns domain early).
+;; LIST row with wrong count reaches line 9304 check.
+;; ────────────────────────────────────────────────────────────────────
+
+;; Lines 9310-9311: LIST row with fewer columns than table
+;; 3-column table, 2-element list row → ray_len(row)=2 != ncols=3 → domain
+(insert (table [a b c] (list [1] [2] [3])) (list 10 20)) !- domain
+
+;; TABLE row with wrong ncols (line 9230 early check)
+;; 3-column table, 2-column row table → src_ncols=2 != ncols=3 → domain
+(insert (table [a b c] (list [1] [2] [3])) (table [a b] (list [10] [20]))) !- domain
+
+;; ────────────────────────────────────────────────────────────────────
 ;; upsert error paths: invalid key types and values
 ;; ────────────────────────────────────────────────────────────────────
 
@@ -282,3 +313,211 @@
 ;; I32 key col, key=2i (I32 atom), list row: match loop at lines 9717-9722 runs
 ;; (match for k=2 found), but update via append_atom_to_col fails for I32 col
 (upsert Ti32key 1 (list 2i 99)) !- type
+
+;; ────────────────────────────────────────────────────────────────────
+;; window-join malformed intervals (lines 10615-10622)
+;; In exec_window_join, each entry in `intervals` must have ≥2 elements
+;; (lo and hi bounds). If an entry has fewer than 2 elements, the loop
+;; at line 10614 detects it and returns domain error.
+;;
+;; Pass a 1-element vector [100] as the interval for 1 left row —
+;; collection_elem(intervals, 0) = [100], ray_len([100])=1 < 2 → domain.
+;; ────────────────────────────────────────────────────────────────────
+(set wjl_err (table [Sym Time] (list ['a] [10:00:01.000])))
+(set wjr_err (table [Sym Time Price] (list ['a] [10:00:00.000] [100])))
+;; Malformed intervals: one-element vector instead of [lo hi] pair
+(window-join [Sym Time] (list [100]) wjl_err wjr_err {total: (sum Price)}) !- domain
+
+;; ────────────────────────────────────────────────────────────────────
+;; window-join sorted aggregation null-branch (lines 10059-10125,
+;;   10171-10206):
+;; When the aggregated column has null values, exec_window_join uses a
+;; null-marking array (nn != NULL). This activates the `if (nn)` paths
+;; in the per-agg tight-scan switch for F64 (sum/var/stddev/min/max/
+;; first/last) and I64 (max/first/last) types.
+;;
+;; Setup: single trade row; right table quotes has F64 Price column
+;; with nulls mixed in. Interval [-3s, +3s] from trade time captures
+;; all quote rows. The null-skipping path accumulates only non-null.
+;; ────────────────────────────────────────────────────────────────────
+(set wjt_null (table [Sym Time] (list ['a] [10:00:03.000])))
+(set wjq_f64null (table [Sym Time Price] (list ['a 'a 'a 'a] [10:00:00.000 10:00:01.000 10:00:02.000 10:00:04.000] [0Nf 2.0 0Nf 4.0])))
+(set wji_null (map-left + [-3000 3000] (at wjt_null 'Time)))
+
+;; F64 null sum (line 10059): nn != NULL → sum skips nulls → 2+4=6
+(at (window-join [Sym Time] wji_null wjt_null wjq_f64null {s: (sum Price)}) 's) -- [6.0]
+
+;; F64 null min (lines 10076-10079): nn path → min of non-null [2,4] = 2
+(at (window-join [Sym Time] wji_null wjt_null wjq_f64null {m: (min Price)}) 'm) -- [2.0]
+
+;; F64 null max (lines 10090-10093): nn path → max of non-null [2,4] = 4
+(at (window-join [Sym Time] wji_null wjt_null wjq_f64null {m: (max Price)}) 'm) -- [4.0]
+
+;; F64 null first (lines 10103-10108): nn path → first non-null = 2
+(at (window-join [Sym Time] wji_null wjt_null wjq_f64null {f: (first Price)}) 'f) -- [2.0]
+
+;; F64 null last (lines 10116-10119): nn path → last non-null = 4
+(at (window-join [Sym Time] wji_null wjt_null wjq_f64null {l: (last Price)}) 'l) -- [4.0]
+
+;; F64 null var (lines 10058-10065): nn path → var of [2.0, 4.0] = 2.0
+(at (window-join [Sym Time] wji_null wjt_null wjq_f64null {v: (var Price)}) 'v) -- [2.0]
+
+;; I64 null max/first/last (lines 10171-10200):
+(set wjq_i64null (table [Sym Time Price] (list ['a 'a 'a 'a] [10:00:00.000 10:00:01.000 10:00:02.000 10:00:04.000] [0Nl 200 0Nl 400])))
+(at (window-join [Sym Time] wji_null wjt_null wjq_i64null {m: (max Price)}) 'm) -- [400]
+(at (window-join [Sym Time] wji_null wjt_null wjq_i64null {f: (first Price)}) 'f) -- [200]
+(at (window-join [Sym Time] wji_null wjt_null wjq_i64null {l: (last Price)}) 'l) -- [400]
+
+;; ────────────────────────────────────────────────────────────────────
+;; update by: with vector-returning expression (line 8376):
+;; When agg_result from exec (sub-table expression) is a vector (not atom),
+;; ray_is_vec(agg_result) = true at line 8376.
+;; The sub-table expression (* v 2) on each group returns a vector,
+;; so line 8376 fires for the first group's result.
+;; NOTE: the by-group vector result path has no broadcast logic (only
+;; atoms are broadcast at 8387-8388), so new_v fills with zeros.
+;; This is observable behavior, not an error.
+;; ────────────────────────────────────────────────────────────────────
+(set Tupd_by_vec (table [k v] (list (list "a" "b" "a" "b") [10 20 30 40])))
+;; update by: k where expression (* v 2) returns a vector per group
+;; line 8376 fires: ray_is_vec(agg_result) = true for first group
+;; (vector result has no broadcast → new_v column filled with 0)
+(count (update {new_v: (* v 2) by: k from: Tupd_by_vec})) -- 4
+
+;; ────────────────────────────────────────────────────────────────────
+;; update WHERE with LIST-type expression → type error (lines 8682-8684):
+;; When expr_vec is a LIST (container type, not typed vector), it is not
+;; handled by any of the numeric or atom paths → line 8681:
+;; expr_vec->type != ct (LIST != F64) → type error.
+;;
+;; Expression (list 9.0 8.0 7.0) returns RAY_LIST, not RAY_F64 vector.
+;; With WHERE, compile_expr_dag fails → fallback eval → returns LIST.
+;; ────────────────────────────────────────────────────────────────────
+(set Tupd_where_list (table [k v] (list [1 2 3] [1.0 2.0 3.0])))
+;; LIST expression updating F64 col with WHERE → type error at line 8682
+(update {v: (list 9.0 8.0 7.0) from: Tupd_where_list where: (> k 1)}) !- type
+
+;; ────────────────────────────────────────────────────────────────────
+;; window-join sorted aggregation with I32 result type (lines 10273-10274):
+;; When the aggregated column is I32, result type for first/max/min/last
+;; is I32 → rty == RAY_I32 branch at line 10273 fires.
+;;
+;; window-join sorted aggregation type error (lines 10422-10425):
+;; When an aggregated column is a non-numeric type (e.g., STR), the
+;; switch at 10417 falls to default → error at 10423.
+;;
+;; window-join sorted aggregation with I64/I32 null var/stddev
+;; (lines 10139-10141):
+;; I64 column with null values + var/stddev → if(nn) branch fires.
+;; ────────────────────────────────────────────────────────────────────
+(set wjt_i32 (table [Sym Time] (list ['a] [10:00:01.000])))
+(set wjq_i32 (table [Sym Time Price] (list ['a 'a] [10:00:00.000 10:00:02.000] (as 'I32 [10 20]))))
+(set wji_i32 (map-left + [-2000 2000] (at wjt_i32 'Time)))
+
+;; I32 result type (lines 10273-10274): first/max on I32 col → I32 output
+;; Element at [0] of result is I32 atom 10i (first Price = 10i, max Price = 20i)
+(at (at (window-join [Sym Time] wji_i32 wjt_i32 wjq_i32 {f: (first Price)}) 'f) 0) -- 10i
+(at (at (window-join [Sym Time] wji_i32 wjt_i32 wjq_i32 {m: (max Price)}) 'm) 0) -- 20i
+
+;; STR column type error (lines 10422-10425): (sum Name) on STR col → type error
+(set wjq_str (table [Sym Time Name] (list ['a 'a] [10:00:00.000 10:00:02.000] (list "x" "y"))))
+(window-join [Sym Time] wji_i32 wjt_i32 wjq_str {s: (sum Name)}) !- type
+
+;; I64 null var/stddev (lines 10140-10141): null in I64 col + var → nn != NULL
+(set wjt_nullv (table [Sym Time] (list ['a] [10:00:03.000])))
+(set wjq_i64nv (table [Sym Time Price] (list ['a 'a 'a 'a] [10:00:00.000 10:00:01.000 10:00:02.000 10:00:04.000] [0Nl 2 0Nl 4])))
+(set wji_nullv (map-left + [-3000 3000] (at wjt_nullv 'Time)))
+;; var of non-null [2, 4] = 2.0 (sample variance)
+(at (window-join [Sym Time] wji_nullv wjt_nullv wjq_i64nv {v: (var Price)}) 'v) -- [2.0]
+;; stddev of non-null [2, 4] = sqrt(2.0) ≈ 1.41
+(count (at (window-join [Sym Time] wji_nullv wjt_nullv wjq_i64nv {d: (stddev Price)}) 'd)) -- 1
+
+;; ────────────────────────────────────────────────────────────────────
+;; groups_to_pair_list: I32/BOOL/F64 key types (lines 131-137)
+;; via update {agg by: key}: ray_group_fn called on I32/BOOL/F64 column
+;; returns dict with keys_vec of that type → groups_to_pair_list hits
+;; the corresponding switch case at lines 131-133 (I32), 135-136 (BOOL),
+;; 137 (F64).
+;; ────────────────────────────────────────────────────────────────────
+;; I32 key: case RAY_I32 at lines 131-133
+(set Tupd_i32by (table [k v] (list (as 'I32 [1 2 1 2 3]) [10 20 30 40 50])))
+;; update by: scatters aggregate back to original 5 rows (count unchanged)
+;; Groups: k=1→sum=40, k=2→sum=60, k=3→sum=50.
+;; Scatter fills only first occurrence per group; others remain 0.
+;; Row values: [40, 60, 0, 0, 50] → sum = 150
+(count (update {v: (sum v) by: k from: Tupd_i32by})) -- 5
+(sum (at (update {v: (sum v) by: k from: Tupd_i32by}) 'v)) -- 150
+
+;; BOOL key: case RAY_BOOL (RAY_U8) at lines 135-136
+(set Tupd_boolby (table [k v] (list [true false true false] [10 20 30 40])))
+;; Groups: k=true→sum=40, k=false→sum=60.
+;; Scatter fills first occurrence; others remain 0: [40, 60, 0, 0] → sum = 100
+(count (update {v: (sum v) by: k from: Tupd_boolby})) -- 4
+(sum (at (update {v: (sum v) by: k from: Tupd_boolby}) 'v)) -- 100
+
+;; F64 key: case RAY_F64 at line 137
+(set Tupd_f64by (table [k v] (list [1.0 2.0 1.0 2.0] [10 20 30 40])))
+;; Groups: k=1.0→sum=40, k=2.0→sum=60. [40, 60, 0, 0] → sum = 100
+(count (update {v: (sum v) by: k from: Tupd_f64by})) -- 4
+(sum (at (update {v: (sum v) by: k from: Tupd_f64by}) 'v)) -- 100
+
+;; ────────────────────────────────────────────────────────────────────
+;; WHERE-update SYM column with null in expr_vec (line 8707)
+;; When ct==RAY_SYM and expr_vec has null at masked row r,
+;; ray_vec_is_null(src_vec, r) fires → line 8707: ray_vec_set_null.
+;; Create SYM column with null via prior update, then update using that as expr.
+;; ────────────────────────────────────────────────────────────────────
+(set Tsym_wh (table [k sym] (list [1 2 3] ['a 'b 'c])))
+;; Create null SYM at row 0 (k=1) via a prior update
+(set Tsymwhn (update {sym: 0Ns from: Tsym_wh where: (== k 1)}))
+;; Tsymwhn: sym = [null, 'b, 'c] (null at row 0)
+;; Now update sym WHERE k>0 using the sym column as expression → sym copies itself
+;; BUT: WHERE k>0 masks rows 1,2 (k=2 and k=3); expr_vec=sym=[null,'b,'c]
+;; Row 1 (k=2): mask=true, src_vec=expr_vec, expr_vec[1]='b (not null)
+;; Row 2 (k=3): mask=true, src_vec=expr_vec, expr_vec[2]='c (not null)
+;; Row 0 (k=1): mask=false (k=1 is NOT > 0? wait k=1>0 is true!)
+;; WHERE k>0: k=[1,2,3] all>0, so all rows are masked.
+;; Row 0: src_vec=expr_vec, expr_vec[0]=null SYM → line 8707 fires!
+(count (update {sym: sym from: Tsymwhn where: (> k 0)})) -- 3
+(nil? (at (at (update {sym: sym from: Tsymwhn where: (> k 0)}) 'sym) 0)) -- true
+
+;; ────────────────────────────────────────────────────────────────────
+;; WHERE-update STR column with null in expr_vec (line 8698)
+;; When expr_vec is a STR vector with null bits set and mask[r]=true,
+;; ray_vec_is_null(expr_vec, r) fires → line 8698: ray_vec_set_null.
+;;
+;; Construct a STR vector with null at index 1 via:
+;;   (as 'STR (list "x" 0Ni "z")) → cast_vec_copy_nulls sets null at 1
+;; Then use it in an update where rows 1,2 are masked (WHERE k > 0).
+;; Row 1 is masked, src_vec=strnv, ray_vec_is_null(strnv, 1)=true → 8698.
+;; ────────────────────────────────────────────────────────────────────
+(set Tupd_str3 (table [k name] (list [0 1 2] (list "a" "b" "c"))))
+(set strnv (as 'STR (list "x" 0Ni "z")))
+;; WHERE k>0 masks rows 1,2; strnv[1]=null → line 8698 fires for row 1
+(count (update {name: strnv from: Tupd_str3 where: (> k 0)})) -- 3
+(nil? (at (at (update {name: strnv from: Tupd_str3 where: (> k 0)}) 'name) 1)) -- true
+
+;; ────────────────────────────────────────────────────────────────────
+;; insert into table with null STR column (lines 9333-9335)
+;; When orig_col has HAS_NULLS and ct=RAY_STR, null rows use the null-copy
+;; path at line 9333: ray_str_vec_append("") + ray_vec_set_null.
+;; ────────────────────────────────────────────────────────────────────
+(set Tstr_null_ins (table [k name] (list [1 2 3] (as 'STR (list "a" 0Ni "c")))))
+;; name column has null at row 1 (HAS_NULLS set)
+;; Insert new row (k=4, name="d"): copies existing rows including null
+;; → line 9333 fires for row 1 (null STR element)
+(count (insert Tstr_null_ins (list 4 "d"))) -- 4
+(nil? (at (at (insert Tstr_null_ins (list 4 "d")) 'name) 1)) -- true
+
+;; ────────────────────────────────────────────────────────────────────
+;; insert into table with null SYM column (line 9349)
+;; When orig_col has HAS_NULLS and ct=RAY_SYM, null rows set null bit
+;; at line 9349: ray_vec_set_null.
+;; ────────────────────────────────────────────────────────────────────
+(set Tsym_ins (table [k sym] (list [1 2] ['a 'b])))
+;; Create null SYM at row 0 (k=1) via no-WHERE update
+(set Tsym_n_ins (update {sym: 0Ns from: Tsym_ins where: (== k 1)}))
+;; Insert new row: copies existing rows; row 0 has null SYM
+;; → line 9349 fires when copying row 0 (null SYM)
+(count (insert Tsym_n_ins (list 3 'c))) -- 3
+(nil? (at (at (insert Tsym_n_ins (list 3 'c)) 'sym) 0)) -- true

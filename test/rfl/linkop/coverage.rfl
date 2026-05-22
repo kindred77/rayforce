@@ -1,0 +1,242 @@
+;; Coverage workout for src/ops/linkop.c
+;; Targets the regions NOT exercised by test/test_link.c:
+;;   - ray_col_link_fn error paths (lines 291, 293)
+;;   - ray_link_attach: null/error-vec guard (line 42)
+;;   - ray_link_attach: HAS_INDEX branch (lines 90-92)
+;;   - ray_link_detach: HAS_INDEX branch (lines 113-115)
+;;   - ray_link_deref: I32 link column path (lines 216-218)
+;;   - ray_link_deref: negative rid -> null (lines 227-229)
+;;   - ray_link_deref: RAY_F64 null sentinel (lines 240-244)
+;;   - ray_link_deref: RAY_I32 / RAY_DATE / RAY_TIME null sentinel (252-257)
+;;   - ray_link_deref: RAY_I16 null sentinel (lines 258-263)
+;;   - ray_link_deref: sym_dict propagation (lines 278-280)
+;;
+;; NOTE: target_sym_id < 0 guard (line 51) is unreachable from RFL because
+;; sym IDs produced by interning are always >= 0.  Covered via C API
+;; in test_link.c.  The slice-attach guard (line 49) is also unreachable
+;; from RFL since no public RFL surface produces a RAY_ATTR_SLICE vector.
+
+(.sys.exec "rm -f /tmp/rfl_linkop_*.csv")
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; ERROR PATHS in ray_col_link_fn (lines 291 and 293)
+;; ════════════════════════════════════════════════════════════════════════════
+
+;; line 291: target must be a sym — pass an integer as target
+(.col.link 42 [1 2 3])          !- type
+
+;; line 293: int_vec is a non-vec value; ray_link_attach will detect it's
+;; not a vec and return a type error; the null_v branch is exercised when
+;; int_vec evaluates to an error-tagged value (e.g. a str, which is
+;; not a vec and not an error object so the first branch fires)
+(.col.link 'no_such_table "x") !- type
+
+;; null/error-vec guard (line 42): pass a non-vec atom to trigger
+;; !ray_is_vec || (type != I32 && type != I64) — float literal is not a vec
+(.col.link 'no_such_table 3.14)     !- type
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; ray_link_attach: HAS_INDEX branch (lines 90-92)
+;; Attach a link to a column that ALREADY has an accelerator index.
+;; The HAS_INDEX branch memcpy's target_sym_id into ix->saved_nullmap[8]
+;; so that a future index-drop restores the link metadata correctly.
+;; ════════════════════════════════════════════════════════════════════════════
+
+(set dim_ai (table [id age] (list [100 200 300] [18 25 42])))
+
+;; Build index first, then attach link — exercises the HAS_INDEX branch.
+(set rids_ai [2 0 1 2])
+(set indexed_ai (.idx.zone rids_ai))
+(.idx.has? indexed_ai)          -- true
+(set both_ai (.col.link 'dim_ai indexed_ai))
+(.col.link? both_ai)            -- true
+(.idx.has? both_ai)             -- true
+both_ai.age                     -- [42 18 25 42]
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; ray_link_detach: HAS_INDEX branch (lines 113-115)
+;; Detach the link while an index is still attached.
+;; The HAS_INDEX branch memset-clears saved_nullmap[8..15].
+;; Index must survive; link must be gone.
+;; ════════════════════════════════════════════════════════════════════════════
+
+(set unlinked_ai (.col.unlink both_ai))
+(.col.link? unlinked_ai)        -- false
+(.idx.has? unlinked_ai)         -- true
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; ray_link_deref: I32 link column (lines 216-218)
+;; link_esz == 4 path: memcpy 4 bytes then sign-extend to int64_t.
+;; ════════════════════════════════════════════════════════════════════════════
+
+(set dim_i32 (table [id age] (list [100 200 300] [18 25 42])))
+(set rids_i32 (as 'I32 [2 0 1 2]))
+(set linked_i32 (.col.link 'dim_i32 rids_i32))
+(.col.link? linked_i32)         -- true
+linked_i32.age                  -- [42 18 25 42]
+
+;; I32 link column with a null link row (null row propagates to result)
+(set rids_i32n (as 'I32 [0 1 2 0]))
+(set rids_i32n (alter 'rids_i32n set 1 0Ni))
+(set linked_i32n (.col.link 'dim_i32 rids_i32n))
+(set res_i32n linked_i32n.age)
+(nil? (at res_i32n 1))          -- true
+(at res_i32n 0)                 -- 18
+(at res_i32n 2)                 -- 42
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; ray_link_deref: negative rid -> null (lines 227-229 rid<0 sub-branch)
+;; A negative rid (e.g. -1) in I64 link column triggers the rid < 0 branch.
+;; ════════════════════════════════════════════════════════════════════════════
+
+(set dim_neg (table [id age] (list [100 200 300] [18 25 42])))
+(set rids_neg [0 -1 2])
+(set linked_neg (.col.link 'dim_neg rids_neg))
+(set res_neg linked_neg.age)
+(nil? (at res_neg 1))           -- true
+(at res_neg 0)                  -- 18
+(at res_neg 2)                  -- 42
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; ray_link_deref: null in TARGET column (lines 227-229 target_col null branch)
+;; When the target column itself has a null at the dereffed row, the result
+;; must propagate null.  ray_vec_is_null(target_col, rid) fires here.
+;; ════════════════════════════════════════════════════════════════════════════
+
+(set dim_tnull (table [id age] (list [100 200 300] [18 25 42])))
+(set dim_tnull (update {age: 0Nl where: (== 1 (til 3)) from: dim_tnull}))
+(set rids_tnull [0 1 2])
+(set linked_tnull (.col.link 'dim_tnull rids_tnull))
+(set res_tnull linked_tnull.age)
+;; row 1 is null in the target column -> must propagate null into result
+(nil? (at res_tnull 1))         -- true
+(at res_tnull 0)                -- 18
+(at res_tnull 2)                -- 42
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; ray_link_deref: RAY_F64 null sentinel (lines 240-244)
+;; Target column is F64; null rows must write NULL_F64 into the result.
+;; ════════════════════════════════════════════════════════════════════════════
+
+(set dim_f64 (table [id score] (list [100 200 300] (as 'F64 [1.5 2.5 3.5]))))
+(set rids_f64 [0 1 2 0])
+(set rids_f64n (alter 'rids_f64 set 1 0Nl))
+(set linked_f64 (.col.link 'dim_f64 rids_f64n))
+(set res_f64 linked_f64.score)
+(nil? (at res_f64 1))           -- true
+(at res_f64 0)                  -- 1.5
+(at res_f64 2)                  -- 3.5
+(at res_f64 3)                  -- 1.5
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; ray_link_deref: RAY_I32 null sentinel (lines 252-257)
+;; Target column is I32; null rows must write NULL_I32.
+;; ════════════════════════════════════════════════════════════════════════════
+
+(set dim_i32t (table [id score32] (list [100 200 300] (as 'I32 [10 20 30]))))
+(set rids_i32t [0 1 2 0])
+(set rids_i32tn (alter 'rids_i32t set 1 0Nl))
+(set linked_i32t (.col.link 'dim_i32t rids_i32tn))
+(set res_i32t linked_i32t.score32)
+(nil? (at res_i32t 1))          -- true
+(at res_i32t 0)                 -- 10
+(at res_i32t 2)                 -- 30
+(at res_i32t 3)                 -- 10
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; ray_link_deref: RAY_DATE null sentinel (lines 252-257 DATE arm)
+;; ════════════════════════════════════════════════════════════════════════════
+
+(set dim_dt (table [id dt] (list [100 200 300] [2024.01.01 2024.06.15 2024.12.31])))
+(set rids_dt [0 1 2 0])
+(set rids_dtn (alter 'rids_dt set 2 0Nl))
+(set linked_dt (.col.link 'dim_dt rids_dtn))
+(set res_dt linked_dt.dt)
+(nil? (at res_dt 2))            -- true
+(at res_dt 0)                   -- 2024.01.01
+(at res_dt 1)                   -- 2024.06.15
+(at res_dt 3)                   -- 2024.01.01
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; ray_link_deref: RAY_TIME null sentinel (lines 252-257 TIME arm)
+;; ════════════════════════════════════════════════════════════════════════════
+
+(set dim_tm (table [id tm] (list [100 200 300] (as 'TIME [3600000000000 7200000000000 10800000000000]))))
+(set rids_tm [0 1 2 1])
+(set rids_tmn (alter 'rids_tm set 0 0Nl))
+(set linked_tm (.col.link 'dim_tm rids_tmn))
+(set res_tm linked_tm.tm)
+;; row 0 is null link -> null TIME
+(nil? (at res_tm 0))            -- true
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; ray_link_deref: RAY_I16 null sentinel (lines 258-263)
+;; Target column is I16; null rows must write NULL_I16.
+;; ════════════════════════════════════════════════════════════════════════════
+
+(set dim_i16 (table [id val16] (list [100 200 300] (as 'I16 [10 20 30]))))
+(set rids_i16 [0 1 2 0])
+(set rids_i16n (alter 'rids_i16 set 1 0Nl))
+(set linked_i16 (.col.link 'dim_i16 rids_i16n))
+(set res_i16 linked_i16.val16)
+(nil? (at res_i16 1))           -- true
+(at res_i16 0)                  -- 10
+(at res_i16 2)                  -- 30
+(at res_i16 3)                  -- 10
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; ray_link_deref: sym_dict propagation (lines 278-280)
+;; A CSV-loaded table uses a local sym_dict for its SYM column.
+;; When col_owner->sym_dict is non-null, the result inherits it via retain.
+;; ════════════════════════════════════════════════════════════════════════════
+
+(.sys.exec "printf 'id,name\n1,alice\n2,bob\n3,carol\n' > /tmp/rfl_linkop_sd.csv")
+(set dim_sd (.csv.read "/tmp/rfl_linkop_sd.csv"))
+(set rids_sd [2 0 1 0])
+(set linked_sd (.col.link 'dim_sd rids_sd))
+(.col.link? linked_sd)          -- true
+linked_sd.name                  -- (list 'carol 'alice 'bob 'alice)
+
+;; sym_dict propagation: null in link -> null SYM in result
+(set rids_sdn [2 0 1 0])
+(set rids_sdn (alter 'rids_sdn set 1 0Nl))
+(set linked_sdn (.col.link 'dim_sd rids_sdn))
+(set res_sdn linked_sdn.name)
+(.col.link? linked_sdn)         -- true
+(nil? (at res_sdn 1))           -- true
+(at res_sdn 0)                  -- 'carol
+(at res_sdn 2)                  -- 'bob
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; ROUND-TRIP: multi-column-type deref in one shot to saturate the switch arms
+;; ════════════════════════════════════════════════════════════════════════════
+
+(set dim_multi (table [id age score32 val16 score64] (list [100 200 300] [18 25 42] (as 'I32 [10 20 30]) (as 'I16 [1 2 3]) (as 'F64 [1.5 2.5 3.5]))))
+
+(set rids_multi [0 1 2 0 2])
+(set linked_multi (.col.link 'dim_multi rids_multi))
+linked_multi.age                -- [18 25 42 18 42]
+
+(set res_multi_i32 linked_multi.score32)
+(at res_multi_i32 0)            -- 10
+(at res_multi_i32 1)            -- 20
+(at res_multi_i32 2)            -- 30
+
+(set res_multi_i16 linked_multi.val16)
+(at res_multi_i16 0)            -- 1
+(at res_multi_i16 1)            -- 2
+(at res_multi_i16 2)            -- 3
+
+(set res_multi_f64 linked_multi.score64)
+(at res_multi_f64 0)            -- 1.5
+(at res_multi_f64 2)            -- 3.5
+
+;; Unlink restores plain I64
+(set unlinked_multi (.col.unlink linked_multi))
+(.col.link? unlinked_multi)     -- false
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; Cleanup
+;; ════════════════════════════════════════════════════════════════════════════
+
+(.sys.exec "rm -f /tmp/rfl_linkop_*.csv")

@@ -109,3 +109,66 @@
 ;; desc: n take: 1 → top group by count
 (count (select {n: (count v) by: {g: k} from: Tpf2 where: (> v 20) desc: n take: 1})) -- 1
 (at (at (select {n: (count v) by: {g: k} from: Tpf2 where: (> v 20) desc: n take: 1}) 'n) 0) -- 3
+
+;; ────────────────────────────────────────────────────────────────────
+;; match_group_count_emit_filter: non-agg output col (line 1652):
+;; When inner select has a non-agg column (e.g. x: (+ v 1)), the loop
+;; at 1651 sees is_group_dag_agg_expr = false → continue at 1652.
+;; The filter still works because count is also present (agg_index tracks
+;; only agg cols). Line 1652 fires for the non-agg column.
+;; ────────────────────────────────────────────────────────────────────
+(set Tmce3 (table [k v] (list [1 2 3 1 2 1] [10 20 30 40 50 60])))
+;; Inner select has n: (count v) [agg] AND x: (+ v 1) [non-agg → line 1652]
+;; Outer WHERE (> n 1) → 2 groups (k=1 count=3, k=2 count=2)
+(count (select {from: (select {n: (count v) x: (+ v 1) by: k from: Tmce3}) where: (> n 1)})) -- 2
+
+;; ────────────────────────────────────────────────────────────────────
+;; parse_gt_name_i64 with I32/TIME threshold (lines 1523-1525):
+;; `(> n K)` where K is I32 atom → case -RAY_I32 in threshold switch.
+;; ────────────────────────────────────────────────────────────────────
+(set Tmce_i32 (table [k v] (list ['A 'B 'C 'A 'B 'A 'C 'A] [1 2 3 4 5 6 7 8])))
+;; A:4, B:2, C:2 → (> n 2i) keeps only A (count > 2 using I32 threshold)
+(count (select {from: (select {n: (count v) by: k from: Tmce_i32}) where: (> n 2i)})) -- 1
+;; (> n 1i) keeps A, B, C (all 3 groups)
+(count (select {from: (select {n: (count v) by: k from: Tmce_i32}) where: (> n 1i)})) -- 3
+
+;; ────────────────────────────────────────────────────────────────────
+;; expr_affine_of_sym returning false for non-affine expression (line 1483):
+;; When by-dict contains {k: k2 derived: (* Time 2)}, the dep_candidate
+;; check calls expr_affine_of_sym((* Time 2), k2_id, &bias) which returns 0
+;; (line 1483) since '*' is neither '+' nor '-'.
+;; dep_candidate set to false → falls back to normal by-dict path.
+;;
+;; Also covers atom_i64_const returning false for null atom (line 1436):
+;; When by-dict contains {k: k2 derived: (+ Time 0Nl)}, atom_i64_const(0Nl)
+;; returns 0 (line 1436: RAY_ATOM_IS_NULL), so expr_affine_of_sym returns 0.
+;; ────────────────────────────────────────────────────────────────────
+(set TGt (table [ts u] (list [09:00:00 09:30:00 10:00:00 10:30:00] [1 2 3 4])))
+;; Non-affine: (* ts 2) → line 1483 fires in expr_affine_of_sym
+;; dep_candidate = false → normal by-dict used → 4 distinct groups
+(count (select {c: (count u) from: TGt by: {ts: ts m: (* ts 2)}})) -- 4
+
+;; Null-constant: (+ ts 0Nl) → line 1436 fires in atom_i64_const
+;; dep_candidate = false → normal by-dict used → 4 distinct groups
+(count (select {c: (count u) from: TGt by: {ts: ts m: (+ ts 0Nl)}})) -- 4
+
+;; ────────────────────────────────────────────────────────────────────
+;; atom_i64_const BOOL case (lines 1438-1439):
+;; When by-dict contains {ts: ts m: (+ ts true)}, expr_affine_of_sym
+;; calls atom_i64_const(true) → case -RAY_BOOL → *out=1; return 1
+;; dep_candidate = true (bias=1), dep rewrite applied → 4 groups
+;;
+;; atom_i64_const default case (line 1446):
+;; When by-dict contains {ts: ts m: (+ ts 1.0)}, atom_i64_const(1.0)
+;; hits default: return 0 → expr_affine_of_sym returns 0
+;; dep_candidate = false → normal by-dict path → 4 distinct groups
+;; ────────────────────────────────────────────────────────────────────
+;; BOOL constant: (+ ts true) → atom_i64_const hits -RAY_BOOL case (line 1438)
+;; bias=1 → dep_candidate stays true → dep rewrite applied
+(count (select {c: (count u) from: TGt by: {ts: ts m: (+ ts true)}})) -- 4
+
+;; F64 constant: atom_i64_const hits default (line 1446)
+;; Use I64 column k with F64 constant 1.0: (+ k 1.0) → atom_i64_const(1.0)
+;; return 0 → expr_affine_of_sym returns 0 → dep_candidate=false
+(set TGt2 (table [k u] (list [1 2 3 4] [10 20 30 40])))
+(count (select {c: (count u) from: TGt2 by: {k: k m: (+ k 1.0)}})) -- 4

@@ -1,0 +1,191 @@
+;; Weighted graph algorithm coverage tests for src/ops/traverse.c
+;;
+;; Focus areas:
+;;   1. exec_dijkstra — with explicit dst (early-exit branch), heap sift paths
+;;   2. exec_k_shortest — yen's inner loops, dup detection, num_cand==0 path
+;;   3. exec_mst — kruskal with rank-union promotion, path compression
+;;   4. exec_random_walk — full walk-len, dead-end early termination
+;;   5. exec_expand — SIP bitmap path (large src vector with filter_hint)
+;;   6. exec_var_expand — direction==2 on unequal fwd/rev sizes
+;;   7. exec_dijkstra — single-node graph (n=1, m=0)
+
+;; ====================================================================
+;; Fixture W1: linear chain with variable weights
+;; 0 -1.0-> 1 -3.0-> 2 -2.0-> 3 -5.0-> 4
+;; Shortest path 0->4: total 11.0
+;; ====================================================================
+(set W1E (table [src dst w] (list [0 1 2 3] [1 2 3 4] [1.0 3.0 2.0 5.0])))
+(set W1 (.graph.build W1E 'src 'dst 'w))
+
+;; --- dijkstra single-source from 0 ---
+(set D1 (.graph.dijkstra W1 0))
+(count D1)                                        -- 5
+(set D1n (at D1 '_node))
+(set D1d (at D1 '_dist))
+(at D1d (at (where (== D1n 4)) 0))               -- 11.0
+(at D1d (at (where (== D1n 2)) 0))               -- 4.0
+
+;; --- dijkstra with explicit dst -> exercises early-exit branch ---
+(set D1dst (.graph.dijkstra W1 0 4))
+(count D1dst)                                     -- 5
+;; node 4 distance is 11
+(at (at D1dst '_dist) (at (where (== (at D1dst '_node) 4)) 0)) -- 11.0
+
+;; --- dijkstra from middle node with dst beyond (partial) ---
+(set D1mid (.graph.dijkstra W1 2 4))
+(count D1mid)                                     -- 3
+;; from node 2 only nodes 2,3,4 reachable
+(min (at D1mid '_node))                           -- 2
+
+;; --- dijkstra dst==src (single-source, stops immediately) ---
+(set D1ss (.graph.dijkstra W1 3 3))
+;; node 3 distance is 0, nodes 4 reachable = 2 rows
+(>= (count D1ss) 1)                               -- true
+(at (at D1ss '_dist) (at (where (== (at D1ss '_node) 3)) 0))  -- 0.0
+
+;; ====================================================================
+;; Fixture W2: graph with multiple equal-cost paths for k-shortest
+;; Trigger dup detection + candidate swap
+;;
+;;   0 -> 1 (w=1)
+;;   0 -> 2 (w=1)
+;;   1 -> 3 (w=1)
+;;   2 -> 3 (w=1)
+;;   1 -> 2 (w=1)
+;;   2 -> 1 (w=1)   <- creates symmetric paths
+;;
+;; Paths 0->3: {0->1->3, 0->2->3, 0->1->2->3, 0->2->1->3}
+;; ====================================================================
+(set W2E (table [src dst w] (list [0 0 1 2 1 2] [1 2 3 3 2 1] [1.0 1.0 1.0 1.0 1.0 1.0])))
+(set W2 (.graph.build W2E 'src 'dst 'w))
+
+;; k=1: single shortest path
+(set K1p (.graph.k-shortest W2 0 3 1))
+(count (distinct (at K1p '_path_id)))             -- 1
+
+;; k=4: exercises dup detection and best-swap when multiple candidates exist
+(set K4p (.graph.k-shortest W2 0 3 4))
+;; At most 4 paths, at least 2
+(>= (count (distinct (at K4p '_path_id))) 2)      -- true
+(<= (count (distinct (at K4p '_path_id))) 4)      -- true
+
+;; All distances are non-negative
+(>= (min (at K4p '_dist)) 0.0)                    -- true
+
+;; k=2 on disconnected (src and dst in different components): returns empty
+(set W2disc (table [src dst w] (list [0 2] [1 3] [1.0 1.0])))
+(set W2g (.graph.build W2disc 'src 'dst 'w))
+(set Kdisc (.graph.k-shortest W2g 0 2 3))
+(count Kdisc)                                     -- 0
+
+;; --- dijkstra with OOB dst raises range error ---
+(.graph.dijkstra W1 0 99)                         !- range
+
+;; ====================================================================
+;; Fixture W3: star with one long and one short path
+;; Test num_cand==0 path (k > number of actual paths)
+;; Graph: 0->1 w=1 (only path from 0 to 1)
+;; ====================================================================
+(set W3E (table [src dst w] (list [0] [1] [1.0])))
+(set W3 (.graph.build W3E 'src 'dst 'w))
+
+;; Only 1 path exists; k=3 returns just 1 path, triggers num_cand==0 break
+(set K3p (.graph.k-shortest W3 0 1 3))
+(count (distinct (at K3p '_path_id)))             -- 1
+
+;; ====================================================================
+;; Fixture W4: larger graph for MST rank union path
+;; 5-node graph with varied weights — exercises rank promotion in uf_union
+;;   0-1 w=1, 0-2 w=4, 1-2 w=2, 1-3 w=5, 2-3 w=1, 2-4 w=3, 3-4 w=4
+;; ====================================================================
+(set W4E (table [src dst w] (list [0 0 1 1 2 2 3] [1 2 2 3 3 4 4] [1.0 4.0 2.0 5.0 1.0 3.0 4.0])))
+(set W4 (.graph.build W4E 'src 'dst 'w))
+
+;; MST on 5-node graph: 4 edges, sum of weights 1+1+2+3 = 7
+(set M4 (.graph.mst W4))
+(count M4)                                        -- 4
+;; All weights in MST are <= 3 (max weight picked by Kruskal)
+(<= (max (at M4 '_weight)) 3.0)                   -- true
+(>= (min (at M4 '_weight)) 0.5)                   -- true
+
+;; ====================================================================
+;; Fixture W5: random walk — complete the full walk length
+;; Graph: cycle 0->1->2->3->0 (no dead ends) -> walk always reaches walk_len
+;; ====================================================================
+(set W5E (table [src dst w] (list [0 1 2 3] [1 2 3 0] [1.0 1.0 1.0 1.0])))
+(set W5 (.graph.build W5E 'src 'dst 'w))
+
+;; walk_len=5 -> 6 rows (all steps reachable since cycle)
+(set Rw5 (.graph.random-walk W5 0 5))
+(count Rw5)                                       -- 6
+(first (at Rw5 '_step))                           -- 0
+(first (at Rw5 '_node))                           -- 0
+
+;; From node 2: walk of length 3 always completes
+(set Rw5b (.graph.random-walk W5 2 3))
+(count Rw5b)                                      -- 4
+
+;; ====================================================================
+;; Fixture W6: expand with multiple source nodes via var_expand
+;; Tests var_expand direction==2 where rev.n_nodes == fwd.n_nodes
+;; Chain: 0->1->2, 1->3, 2->4 (rev edges are 1->0, 2->1, 3->1, 4->2)
+;; ====================================================================
+(set W6E (table [src dst w] (list [0 1 1 2] [1 2 3 4] [1.0 1.0 1.0 1.0])))
+(set W6 (.graph.build W6E 'src 'dst 'w))
+
+;; var_expand direction==2 from node 1: fwd={2,3}, rev={0} => 3 at depth 1
+(set Ve6 (.graph.var-expand W6 1 1 1 2))
+(count Ve6)                                       -- 3
+(== (first (at Ve6 '_start)) 1)                   -- true
+
+;; var_expand direction==2 from node 0: fwd={1}, rev={} => 1 at depth 1
+(set Ve6b (.graph.var-expand W6 0 1 1 2))
+(count Ve6b)                                      -- 1
+(first (at Ve6b '_end))                           -- 1
+
+;; var_expand direction==2 from node 2: fwd={4}, rev={1} => 2 at depth 1
+(set Ve6c (.graph.var-expand W6 2 1 1 2))
+(count Ve6c)                                      -- 2
+
+;; var_expand direction==1 (reverse) from node 4: rev={2} => 1 at depth 1
+(set Ve6d (.graph.var-expand W6 4 1 1 1))
+(count Ve6d)                                      -- 1
+(first (at Ve6d '_end))                           -- 2
+
+;; ====================================================================
+;; Fixture W7: exec_expand reverse on chain — exercises direction==1 path
+;; Chain: 0->1->2->3->4
+;; Rev neighbors of node 4: {3}
+;; Rev neighbors of node 0: {} (empty result)
+;; ====================================================================
+(set W7E (table [src dst w] (list [0 1 2 3] [1 2 3 4] [1.0 1.0 1.0 1.0])))
+(set W7 (.graph.build W7E 'src 'dst 'w))
+
+;; direction==1: reverse expand of node 4 -> {3}
+(set Exp1a (.graph.expand W7 4 1))
+(count Exp1a)                                     -- 1
+(first (at Exp1a '_src))                          -- 4
+(first (at Exp1a '_dst))                          -- 3
+
+;; direction==1: reverse expand of node 0 -> {} (no in-edges to node 0)
+(set Exp1b (.graph.expand W7 0 1))
+(count Exp1b)                                     -- 0
+
+;; direction==2: both expand of node 2 -> fwd={3}, rev={1} = 2 rows
+(set Exp2 (.graph.expand W7 2 2))
+(count Exp2)                                      -- 2
+
+;; direction==0: forward expand of node 3 -> {4}
+(count (.graph.expand W7 3 0))                    -- 1
+
+;; ====================================================================
+;; Cleanup
+;; ====================================================================
+(.graph.free W1)
+(.graph.free W2)
+(.graph.free W2g)
+(.graph.free W3)
+(.graph.free W4)
+(.graph.free W5)
+(.graph.free W6)
+(.graph.free W7)

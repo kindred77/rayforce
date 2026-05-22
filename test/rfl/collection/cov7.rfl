@@ -1,0 +1,35 @@
+;; cov7 — targeted coverage: ray_find_fn collection-val error path (lines 1791-1794)
+;;
+;; ray_find_fn has a "vector val" path at line 1775: when val is a collection,
+;; iterate val elements and recursively call ray_find_fn(vec, element).
+;; If the recursive call returns an error (e.g. vec is a TABLE, not
+;; a vec/list), error-cleanup fires at lines 1791-1794:
+;;
+;;   if (RAY_IS_ERR(out[j])) {
+;;       for (k=0; k<j; k++) ray_release(out[k]);   // line 1791
+;;       ray_release(result);                         // line 1792
+;;       return out[j];                               // line 1793
+;;   }                                                // line 1794
+;;
+;; When j=0 (first element triggers error), k-loop is a no-op and
+;; result->len = 1 so ray_release(result) safely iterates only out[0]
+;; which is the error obj → RAY_IS_ERR check → skipped.
+;;
+;; Safe to run: vlen=1 (single-element val) ensures no uninitialised
+;; out[1..] pointers are accessed by ray_release(result).
+
+;; ════════════════════════════════════════════════════════════════
+;; 1. find table [scalar] — table is not a vec/list → recursive
+;;    ray_find_fn returns error:type → fires lines 1791-1794
+;; ════════════════════════════════════════════════════════════════
+(set _ft (table [x] (list [1 2 3])))
+;; find(table, [val]) → val is collection → iterate → find(table, val[0])
+;;   recursive: table is not vec/list → error:type
+;; Outer: out[0]=error, release result (len=1), return error
+(try (find _ft [1]) (fn [e] "err")) -- "err"
+
+;; ════════════════════════════════════════════════════════════════
+;; 2. find dict [scalar] — dict is not vec/list → same path
+;; ════════════════════════════════════════════════════════════════
+(set _fd (dict ['a 'b 'c] [1 2 3]))
+(try (find _fd [1]) (fn [e] "err")) -- "err"

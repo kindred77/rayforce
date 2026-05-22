@@ -86,16 +86,154 @@
 
 
 ;; ────────────────────────────────────────────────────────────────────
-;; NOTE: Lines 5389-5394 (ray_eval fallback for computed agg arg)
-;; Requires agg_col_expr to be a non-direct-ref expression like (+ v 1),
-;; BUT v must be in scope for ray_eval to succeed. The eval_group path
-;; does not push table columns to scope before the aggregation loop,
-;; so ray_eval(agg_col_expr) on a table column reference would fail
-;; with "error: name". Unreachable from basic RFL.
-;;
-;; NOTE: Lines 5653-5663 (STR column with nulls in first-of-group)
-;; require a table with a null-marked STR column. There is no direct
-;; RFL literal for null STR atoms (0Ns is a null SYM, not STR).
-;; This path requires constructing a STR column via I/O or internal
-;; operations — left as unreachable from basic RFL.
 ;; ────────────────────────────────────────────────────────────────────
+;; eval_expr_per_row non-collapsable path (lines 2200-2232)
+;;
+;; Triggered when compile_expr_dag returns NULL for a column expression
+;; → use_eval_fallback=1 → eval_expr_per_row(expr, tbl, nrows) called.
+;;
+;; The `(type val)` function is not in compile_expr_dag, so compile
+;; returns NULL. eval_expr_per_row evaluates per-row: each cell is a
+;; SYM atom (e.g. 'I64 or 'F64). SYM atom has type=-RAY_SYM, which is
+;; non-collapsable (line 2180: t!=-RAY_SYM required for collapsable).
+;;
+;; Row 0: !collapsable → lines 2200-2209 (allocate RAY_LIST result, len=1)
+;; Row 1+: direct_typed=0 → lines 2229-2231 (append cell to LIST)
+;; ────────────────────────────────────────────────────────────────────
+(set Ttype1 (table [val] (list [1 2 3])))
+;; (type val) returns SYM atom per row → non-collapsable → LIST column
+;; Each val is an I64 atom → (type val) returns 'i64 (lowercase for atoms)
+(count (at (select {t: (type val) from: Ttype1}) 't)) -- 3
+(at (at (select {t: (type val) from: Ttype1}) 't) 0) -- 'i64
+(at (at (select {t: (type val) from: Ttype1}) 't) 1) -- 'i64
+(at (at (select {t: (type val) from: Ttype1}) 't) 2) -- 'i64
+
+;; Multiple rows — each row is a separate cell appended to LIST (lines 2229-2231)
+(set Ttype2 (table [id val] (list [1 2 3] [10.0 20.0 30.0])))
+;; (type val) on F64 column: each atom is f64 → returns 'f64
+(count (at (select {t: (type val) from: Ttype2}) 't)) -- 3
+(at (at (select {t: (type val) from: Ttype2}) 't) 0) -- 'f64
+
+;; ────────────────────────────────────────────────────────────────────
+;; eval_expr_per_row type-switch path (lines 2213-2228):
+;; Reached when direct_typed=1 (started as typed I64 vec) but a later
+;; row returns a different type (F64) → typed_vec_to_list fallback.
+;;
+;; Expression: (at mixlist id) — `at` not in compile_expr_dag → fallback.
+;; Row 0: (at mixlist 0) = 1 (I64 atom) → direct_typed=1, typed_t=-RAY_I64
+;; Row 1: (at mixlist 1) = 1.0 (F64 atom) → type mismatch → lines 2217-2228
+;; typed_vec_to_list converts the partial I64 vec + appends 1.0 as LIST
+;; ────────────────────────────────────────────────────────────────────
+(set mixlist (list 1 1.0))
+(set Tmix (table [id] (list [0 1])))
+;; result column 'r' = LIST [1, 1.0] (mixed type → must be LIST)
+(count (at (select {r: (at mixlist id) from: Tmix}) 'r)) -- 2
+(at (at (select {r: (at mixlist id) from: Tmix}) 'r) 0) -- 1
+(at (at (select {r: (at mixlist id) from: Tmix}) 'r) 1) -- 1.0
+
+;; ────────────────────────────────────────────────────────────────────
+;; atom_broadcast_vec I16 / I32 cases (lines 3050-3063)
+;; Reached when non-agg group-by contains literal I16 or I32 atoms.
+;;
+;; In (select {extra: 5h by: k from: T}):
+;;   - `extra: 5h` is a -RAY_I16 atom, not a name ref
+;;   - can_atom_broadcast(5h) = true (I16 is in the switch at 2997)
+;;   - atom_broadcast_vec(5h, n_groups) → switch case RAY_I16 (line 3050)
+;;     fills n_groups slots with (int16_t)5
+;;
+;; In (select {extra: 5i by: k from: T}):
+;;   - `extra: 5i` is a -RAY_I32 atom
+;;   - atom_broadcast_vec(5i, n_groups) → switch case RAY_I32 (line 3056)
+;; ────────────────────────────────────────────────────────────────────
+(set Tbroadcast (table [k v] (list ['A 'B 'C 'A 'B] [1 2 3 4 5])))
+
+;; I16 atom broadcast in group-by: extra: 5h
+;; 3 groups (A, B, C) → column extra=[5h, 5h, 5h]
+(count (select {s: (sum v) extra: 5h by: k from: Tbroadcast})) -- 3
+(at (at (select {s: (sum v) extra: 5h by: k from: Tbroadcast}) 'extra) 0) -- 5h
+(at (at (select {s: (sum v) extra: 5h by: k from: Tbroadcast}) 'extra) 1) -- 5h
+
+;; I32 atom broadcast in group-by: extra: 7i
+(count (select {s: (sum v) extra: 7i by: k from: Tbroadcast})) -- 3
+(at (at (select {s: (sum v) extra: 7i by: k from: Tbroadcast}) 'extra) 0) -- 7i
+(at (at (select {s: (sum v) extra: 7i by: k from: Tbroadcast}) 'extra) 1) -- 7i
+
+;; ────────────────────────────────────────────────────────────────────
+;; atom_broadcast_vec: null SYM atom (0Ns, id=0 ≤ 0xFF) → W8 path (line 3081)
+;; AND null-atom propagation → lines 3105-3108
+;;
+;; 0Ns has sym id=0 → sym_w = RAY_SYM_W8 (id ≤ 0xFF)
+;;   → line 3081: memset(dst, 0, n) for W8
+;; RAY_ATOM_IS_NULL(0Ns) → case RAY_SYM: i64==0 → true
+;;   → line 3106: v->attrs |= RAY_ATTR_HAS_NULLS
+;;   → line 3107: memset(v->nullmap, 0xFF, 16)
+;; ────────────────────────────────────────────────────────────────────
+(set Tbcast_null (table [k v] (list ['X 'Y 'Z] [10 20 30])))
+;; extra: 0Ns (null SYM, id=0) → W8 memset + null propagation
+;; can_atom_broadcast(0Ns)=1 → atom_broadcast_vec(0Ns, 3)
+;; After broadcast: all 3 cells are sym-id=0 with HAS_NULLS set
+(count (select {s: (sum v) extra: 0Ns by: k from: Tbcast_null})) -- 3
+(nil? (at (at (select {s: (sum v) extra: 0Ns by: k from: Tbcast_null}) 'extra) 0)) -- true
+
+;; ────────────────────────────────────────────────────────────────────
+;; ray_eval fallback for computed agg arg (lines 5388-5394 single-key,
+;; lines 4955-4962 multi-key):
+;; Reached when agg_col_expr is a name NOT found in the eval table.
+;; ray_table_get_col(eval_tbl, agg_col_expr->i64) returns NULL when the
+;; column name is not a table column but IS a global binding.
+;; ray_eval(agg_col_expr) then returns the global value.
+;;
+;; Single-key path (lines 5388-5394):
+;; STR key → eval_group → single-key path at 5304+. `(sum ext_v)` uses
+;; a globally-bound name `ext_v` not in the table — falls to ray_eval.
+;; Multi-key path (lines 4955-4962):
+;; [k1 k2] with STR k1 → multi-key eval path at 4664. Same fallback.
+;; ────────────────────────────────────────────────────────────────────
+(set ext_v [1 2 3 4])
+
+;; Single-key STR path (lines 5388-5394):
+;; Table has STR key only; ext_v is not a column → ray_eval returns global
+;; group "a": rows [0,2] → ray_at_fn([1,2,3,4],[0,2])=[1,3] → sum=4
+;; group "b": rows [1,3] → ray_at_fn([1,2,3,4],[1,3])=[2,4] → sum=6
+;; total sum = 10
+(set Teg_sk (table [k] (list (list "a" "b" "a" "b"))))
+(sum (at (select {r: (sum ext_v) by: k from: Teg_sk}) 'r)) -- 10
+
+;; Multi-key eval path (lines 4955-4962):
+;; [k1 k2] with k1=STR → use_eval_group=1 → multi-key path (len>1)
+;; ext_v is not a column in Teg_mk → ray_eval returns global
+(set Teg_mk (table [k1 k2] (list (list "a" "b" "a" "b") ['X 'X 'Y 'Y])))
+;; 4 groups: (a,X) row0→sum=1, (b,X) row1→sum=2, (a,Y) row2→sum=3, (b,Y) row3→sum=4
+(sum (at (select {r: (sum ext_v) by: [k1 k2] from: Teg_mk}) 'r)) -- 10
+
+;; ────────────────────────────────────────────────────────────────────
+;; STR column with HAS_NULLS in single-key eval_group first-of-group
+;; (lines 5653-5663 in query.c):
+;; Triggered when n_agg_out==0 and a non-key column is RAY_STR with
+;; RAY_ATTR_HAS_NULLS set. cast_vec_copy_nulls propagates null from
+;; a LIST with a null element (0Ni → RAY_ATOM_IS_NULL=true) to STR vec.
+;;
+;; (as 'STR (list "x" 0Ni "z" "w")) produces a 4-element STR vector
+;; with element 1 having the null bit set (HAS_NULLS).
+;;
+;; Group by SYM key (STR key would also work but SYM avoids the
+;; nested eval_group path for clarity). By using a SYM key we stay in
+;; the single-key eval_group path when use_eval_group fires from
+;; another condition. Actually SYM key alone does not trigger
+;; use_eval_group=1 — we need a STR key to force that path.
+;;
+;; Use STR key column to force eval_group, then the non-key column
+;; is the null-STR vector — lines 5649-5663 execute.
+;; ────────────────────────────────────────────────────────────────────
+(set str_null_col (as 'STR (list "x" 0Ni "z" "w")))
+(set Tstr_null_grp (table [k name] (list (list "a" "b" "a" "b") str_null_col)))
+;; Group by STR key (forces use_eval_group=1 via kct==RAY_STR at line 4595)
+;; n_agg_out=0 → first-of-group path at line 5626
+;; sc->type==RAY_STR, src_has_nulls=true (element 1 null) → lines 5653-5663
+;; Group a: first row=0 name="x" (not null); group b: first row=1 name=null
+(count (select {by: k from: Tstr_null_grp})) -- 2
+
+;; NOTE: aggr_unary_per_group_buf (lines 2256-2337) is unreachable from RFL:
+;; It requires n_aggs >= 16 for a streaming-aggr-unary to overflow into
+;; nonagg_exprs[], but ray_group() at line 4863 in group.c rejects
+;; n_aggs > 8 with "nyi" before the nonagg scatter runs.
