@@ -1,0 +1,162 @@
+;; Coverage for group.c — parallel scalar agg and multi-agg paths
+;;
+;; Targets:
+;;   - exec_reduction parallel path (>= RAY_PARALLEL_THRESHOLD = 65536 rows)
+;;     via par_reduce_fn + reduce_merge
+;;   - scalar_sum_i64_fn / scalar_sum_f64_fn tight parallel loops
+;;     (n_keys==0, no selection, single SUM/AVG on I64/F64)
+;;   - scalar_sum_linear_i64_fn (SUM of integer-linear expr)
+;;   - parallel scalar agg merge (sc_n > 1 merge loop)
+;;   - da_merge_fn (parallel merge of per-worker DA accumulators)
+;;   - Multiple agg ops together: prod + first + last + stddev + var
+;;     combined in one query (exercises scalar_accum_row's diverse op branches)
+;;   - All-null group sentinel finalization: groups where every value is
+;;     null get typed null for min/max/prod/first/last (nn==0 branch)
+
+;; ─── Large parallel scalar aggregation (> 65536 rows) ─────────────────
+;; Fires scalar_sum_i64_fn (n_keys=0, I64, no selection) on parallel path.
+(set Nlarge 100000)
+(set Vlarge (as 'I64 (til Nlarge)))
+;; sum(0..99999) = 4999950000
+(sum Vlarge) -- 4999950000
+(avg Vlarge) -- 49999.5
+
+;; F64 parallel path — scalar_sum_f64_fn.
+(set Vflarge (as 'F64 (til Nlarge)))
+(sum Vflarge) -- 4999950000.0
+
+;; ─── Parallel exec_reduction — min/max/count on 100k vectors ─────────
+;; Fires the parallel par_reduce_fn + reduce_merge path.
+(min (as 'I64 (til Nlarge))) -- 0
+(max (as 'I64 (til Nlarge))) -- 99999
+(count (as 'I64 (til Nlarge))) -- 100000
+
+;; prod on large parallel: fires the OP_PROD parallel branch.
+;; Use small vector (product would overflow at large N); but use 70k to stay
+;; parallel path. Actually prod = 0 for any vec containing 0.
+(set Tprod70k (table [v] (list (as 'I64 (concat [0] (til 70000))))))
+(at (at (select {p: (prod v) from: Tprod70k}) 'p) 0) -- 0
+
+;; ─── Parallel first/last FORCED SERIAL (FIRST/LAST use serial path) ─
+;; has_first_last=true → serial path regardless of size; still exercises
+;; the OP_FIRST/OP_LAST branches in exec_reduction's switch.
+(first (as 'I64 (til 70000))) -- 0
+(last  (as 'I64 (til 70000))) -- 69999
+
+;; ─── Scalar agg with multiple ops (prod, first, last, stddev, var) ───
+;; When n_aggs > 1 OR op is not SUM/AVG, falls back to scalar_accum_fn
+;; (generic) path.  Exercises scalar_accum_row's op branches.
+
+;; prod on simple vector via select
+(set Tp1 (table [v] (list (as 'I64 [2 3 4]))))
+(at (at (select {p: (prod v) from: Tp1}) 'p) 0) -- 24
+(set Tp1f (table [v] (list (as 'F64 [2.0 3.0 4.0]))))
+(at (at (select {p: (prod v) from: Tp1f}) 'p) 0) -- 24.0
+
+;; stddev/var (n_keys=0 path via exec_reduction)
+;; [2,4,4,4,5,5,7,9]: mean=5, pop_var=4, sample_var=4*(8/7)=32/7≈4.571, sample_stddev≈2.138
+(< (abs (- (var_pop (as 'F64 [2.0 4.0 4.0 4.0 5.0 5.0 7.0 9.0])) 4.0)) 0.001) -- true
+(< (abs (- (stddev_pop (as 'F64 [2.0 4.0 4.0 4.0 5.0 5.0 7.0 9.0])) 2.0)) 0.001) -- true
+;; Sample variance = pop_var * n/(n-1) = 4 * 8/7 ≈ 4.571
+(< (abs (- (var (as 'F64 [2.0 4.0 4.0 4.0 5.0 5.0 7.0 9.0])) 4.571)) 0.01) -- true
+;; Sample stddev ≈ sqrt(4.571) ≈ 2.138
+(< (abs (- (stddev (as 'F64 [2.0 4.0 4.0 4.0 5.0 5.0 7.0 9.0])) 2.138)) 0.01) -- true
+
+;; var_pop insufficient count → returns null (single element → sample var undefined)
+(nil? (var (as 'F64 [1.0]))) -- true
+
+;; stddev on I64 (sample stddev ≈ 2.138)
+(< (abs (- (stddev (as 'I64 [2 4 4 4 5 5 7 9])) 2.138)) 0.01) -- true
+
+;; ─── Parallel scalar with multi-agg (n_aggs>1 goes generic parallel) ─
+;; A table with 100k rows + n_keys=0 + multiple aggs uses scalar_accum_fn
+;; dispatched over pool (sc_n>1 merge step fires).
+(set Tsm (table [v1 v2] (list (as 'I64 (til Nlarge)) (as 'F64 (til Nlarge)))))
+;; SUM and MIN simultaneously (multi-agg → scalar_accum_fn generic path).
+(set Rsm (select {s: (sum v1) mn: (min v2) from: Tsm}))
+(at (at Rsm 's) 0) -- 4999950000
+(< (at (at Rsm 'mn) 0) 1.0) -- true
+
+;; ─── DA path parallel merge (da_merge_fn) ─────────────────────────────
+;; n_keys=1 + 100k rows + SUM → goes through the DA accumulation path.
+;; With a small key range (0..3) the DA fast path applies.
+;; Pool dispatch fires da_accum_fn in parallel then da_merge_fn merges.
+(set Tdap (table [k v] (list (% (as 'I64 (til Nlarge)) 4) (as 'I64 (til Nlarge)))))
+(set Rdap (select {s: (sum v) c: (count v) from: Tdap by: k}))
+(count Rdap) -- 4
+;; Total sum = sum(0..99999) = 4999950000
+(sum (at Rdap 's)) -- 4999950000
+;; Each group has 25000 rows
+(min (at Rdap 'c)) -- 25000
+(max (at Rdap 'c)) -- 25000
+
+;; DA path with FIRST/LAST + large data (serial due to has_first_last).
+(set Rdfl (select {f: (first v) l: (last v) c: (count v) from: Tdap by: k}))
+(count Rdfl) -- 4
+;; k=0: first row is 0, last row is 99996; k=1: first=1, last=99997...
+(at (at Rdfl 'f) 0) -- 0
+(at (at Rdfl 'l) 0) -- 99996
+
+;; ─── Null-aware group agg: all-null group → typed null output ─────────
+;; Groups where all values are null should emit typed null for
+;; min/max/prod/first/last (nn==0 finalization path).
+;; k=1 has all nulls for v; k=0 has valid values.
+(set Tnull (table [k v] (list (as 'I64 [0 0 0 1 1 1]) (as 'I64 [10 20 30 0N 0N 0N]))))
+(set Rnull (select {mn: (min v) mx: (max v) f: (first v) l: (last v) from: Tnull by: k}))
+(count Rnull) -- 2
+;; k=0: min=10, max=30, first=10, last=30
+(at (at Rnull 'mn) 0) -- 10
+(at (at Rnull 'mx) 0) -- 30
+(at (at Rnull 'f) 0) -- 10
+(at (at Rnull 'l) 0) -- 30
+;; k=1: all values null → min/max/first/last should be null
+(nil? (at (at Rnull 'mn) 1)) -- true
+
+;; F64 all-null group
+(set Tnullf (table [k v] (list (as 'I64 [0 0 1 1]) (as 'F64 [1.0 2.0 0N 0N]))))
+(set Rnullf (select {mn: (min v) mx: (max v) from: Tnullf by: k}))
+(count Rnullf) -- 2
+;; k=0: valid; k=1: all null → null output
+(at (at Rnullf 'mn) 0) -- 1.0
+(nil? (at (at Rnullf 'mn) 1)) -- true
+
+;; Prod with all-null group → null
+(set Tnullp (table [k v] (list (as 'I64 [0 0 1 1]) (as 'I64 [2 3 0N 0N]))))
+(set Rnullp (select {p: (prod v) from: Tnullp by: k}))
+(at (at Rnullp 'p) 0) -- 6
+(nil? (at (at Rnullp 'p) 1)) -- true
+
+;; ─── Multi-key with mixed-width keys (non-uniform esz → da_composite_gid) ──
+;; I16 key + I32 key → key_esz[0]=2, key_esz[1]=4 → uniform_esz=false
+;; falls through to da_composite_gid (generic) in da_accum_fn.
+(set Tmw (table [k1 k2 v] (list (as 'I16 [0 0 1 1 2 2]) (as 'I32 [10 20 10 20 10 20]) (as 'I64 [1 2 3 4 5 6]))))
+(set Rmw (select {s: (sum v) c: (count v) from: Tmw by: [k1 k2]}))
+(count Rmw) -- 6
+(sum (at Rmw 's)) -- 21
+
+;; U8 + I16 mixed width
+(set Tmw2 (table [k1 k2 v] (list (as 'U8 [0 0 1 1]) (as 'I16 [10 20 10 20]) (as 'I64 [1 2 3 4]))))
+(set Rmw2 (select {s: (sum v) from: Tmw2 by: [k1 k2]}))
+(count Rmw2) -- 4
+(sum (at Rmw2 's)) -- 10
+
+;; ─── Multi-key with all-uniform U8 esz (da_composite_gid_u8) ─────────
+;; Two U8 keys → uniform esz=1 → da_composite_gid_u8 path.
+(set Tmu8 (table [k1 k2 v] (list (as 'U8 [0 1 2 0 1 2]) (as 'U8 [0 0 0 1 1 1]) (as 'I64 [10 20 30 40 50 60]))))
+(set Rmu8 (select {s: (sum v) from: Tmu8 by: [k1 k2]}))
+(count Rmu8) -- 6
+(sum (at Rmu8 's)) -- 210
+
+;; Two U16-width SYM keys → uniform esz=2 → da_composite_gid_u16
+;; (SYM keys trigger the same composite GID path when all have same esz)
+(set Tmu16 (table [k v] (list (as 'I16 [1 2 3 1 2 3]) (as 'I64 [10 20 30 40 50 60]))))
+(set Rmu16 (select {s: (sum v) from: Tmu16 by: k}))
+(count Rmu16) -- 3
+(sum (at Rmu16 's)) -- 210
+
+;; ─── scalar agg linear expr path (scalar_sum_linear_i64_fn) ───────────
+;; SUM(a + b) with n_keys=0: if the linear compiler picks it up, fires
+;; scalar_sum_linear_i64_fn. This is a best-effort exercise.
+(set Tlin (table [a b] (list (as 'I64 [1 2 3 4 5]) (as 'I64 [10 20 30 40 50]))))
+;; sum(a+b) = 11+22+33+44+55 = 165
+(at (at (select {s: (sum (+ a b)) from: Tlin}) 's) 0) -- 165

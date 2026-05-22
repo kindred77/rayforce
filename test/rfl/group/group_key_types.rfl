@@ -1,0 +1,150 @@
+;; Coverage for group.c — key type diversity paths
+;;
+;; Targets:
+;;   - BOOL key group-by (RAY_BOOL/RAY_U8 arm of minmax_scan_fn, da_accum_fn)
+;;   - I16 key group-by  (I16 arm of minmax_scan_fn)
+;;   - U8  key group-by  (U8/BOOL arm of minmax_scan_fn)
+;;   - DATE key group-by (I32/DATE/TIME arm)
+;;   - TIME key group-by
+;;   - TIMESTAMP key group-by (I64/TIMESTAMP arm)
+;;   - reduction_i64_result DATE/TIME/TIMESTAMP/I32/I16/U8/SYM cases
+;;     (hit via min/max on typed vectors without group-by)
+;;   - OP_FIRST / OP_LAST short-circuit on I16/DATE/TIME/TIMESTAMP types
+;;   - exec_count_distinct on STR type (distinct_vec_eager fallback)
+
+;; ─── BOOL key ──────────────────────────────────────────────────────────
+;; Two groups (true/false); v=I64.
+(set Tb (table [k v] (list [false true false true false true] (as 'I64 [1 10 2 20 3 30]))))
+(set Rb (select {c: (count v) s: (sum v) from: Tb by: k}))
+(count Rb) -- 2
+(sum (at Rb 's)) -- 66
+(at (at Rb 'c) 0) -- 3
+(at (at Rb 'c) 1) -- 3
+
+;; ─── U8 key ────────────────────────────────────────────────────────────
+;; Small-range U8 keys (0,1,2) with sum agg.
+(set Tu8k (table [k v] (list (as 'U8 [0 1 2 0 1 2 0 1 2]) (as 'I64 [1 2 3 4 5 6 7 8 9]))))
+(set Ru8k (select {c: (count v) s: (sum v) from: Tu8k by: k}))
+(count Ru8k) -- 3
+;; k=0: 1+4+7=12, k=1: 2+5+8=15, k=2: 3+6+9=18
+(sum (at Ru8k 's)) -- 45
+(at (at Ru8k 's) 0) -- 12
+(at (at Ru8k 's) 1) -- 15
+(at (at Ru8k 's) 2) -- 18
+
+;; ─── I16 key ───────────────────────────────────────────────────────────
+;; I16 keys, small range (10,20,30), sum/min/max agg.
+(set Ti16k (table [k v] (list (as 'I16 [10 20 30 10 20 30]) (as 'I64 [100 200 300 400 500 600]))))
+(set Ri16k (select {s: (sum v) mn: (min v) mx: (max v) from: Ti16k by: k}))
+(count Ri16k) -- 3
+;; k=10: 100+400=500; k=20: 200+500=700; k=30: 300+600=900
+(sum (at Ri16k 's)) -- 2100
+(at (at Ri16k 'mn) 0) -- 100
+(at (at Ri16k 'mx) 0) -- 400
+
+;; ─── DATE key ──────────────────────────────────────────────────────────
+;; DATE keys (days since epoch). Three distinct dates.
+(set Tdk (table [k v] (list (as 'DATE [7305 7306 7307 7305 7306 7307]) (as 'I64 [1 2 3 4 5 6]))))
+(set Rdk (select {c: (count v) s: (sum v) from: Tdk by: k}))
+(count Rdk) -- 3
+(sum (at Rdk 's)) -- 21
+
+;; ─── TIME key ──────────────────────────────────────────────────────────
+;; TIME keys in milliseconds. Two groups.
+(set Ttk (table [k v] (list (as 'TIME [3600000 7200000 3600000 7200000]) (as 'I64 [10 20 30 40]))))
+(set Rtk (select {c: (count v) s: (sum v) from: Ttk by: k}))
+(count Rtk) -- 2
+(sum (at Rtk 's)) -- 100
+(at (at Rtk 's) 0) -- 40
+(at (at Rtk 's) 1) -- 60
+
+;; ─── TIMESTAMP key ────────────────────────────────────────────────────
+;; TIMESTAMP keys (int64 ms). Three groups.
+(set Ttsk (table [k v] (list (as 'TIMESTAMP [1000 2000 3000 1000 2000 3000]) (as 'I64 [1 2 3 4 5 6]))))
+(set Rtsk (select {c: (count v) s: (sum v) from: Ttsk by: k}))
+(count Rtsk) -- 3
+(sum (at Rtsk 's)) -- 21
+
+;; ─── reduction_i64_result: min/max/first/last on typed vecs ───────────
+;; These hit the switch cases in reduction_i64_result for DATE/TIME/
+;; TIMESTAMP/I16/U8 paths, and the OP_FIRST/OP_LAST O(1) short-circuit.
+
+;; DATE min/max
+(type (min (as 'DATE [7305 7306 7300 7310]))) -- 'date
+(min (as 'DATE [7305 7306 7300 7310])) -- (as 'DATE 7300)
+(max (as 'DATE [7305 7306 7300 7310])) -- (as 'DATE 7310)
+
+;; TIME min/max
+(type (min (as 'TIME [3600000 1000 7200000]))) -- 'time
+(min (as 'TIME [3600000 1000 7200000])) -- (as 'TIME 1000)
+(max (as 'TIME [3600000 1000 7200000])) -- (as 'TIME 7200000)
+
+;; TIMESTAMP min/max
+(type (min (as 'TIMESTAMP [1000 2000 500 3000]))) -- 'timestamp
+(min (as 'TIMESTAMP [1000 2000 500 3000])) -- (as 'TIMESTAMP 500)
+(max (as 'TIMESTAMP [1000 2000 500 3000])) -- (as 'TIMESTAMP 3000)
+
+;; I16 min/max (already in reduce_range_arms but these go via reduction_i64_result's I16 branch)
+(type (min (as 'I16 [5 1 8 3]))) -- 'i16
+(min (as 'I16 [5 1 8 3])) -- (as 'I16 1)
+(max (as 'I16 [5 1 8 3])) -- (as 'I16 8)
+
+;; U8 min/max
+(type (min (as 'U8 [5 1 8 3]))) -- 'u8
+(min (as 'U8 [5 1 8 3])) -- (as 'U8 1)
+(max (as 'U8 [5 1 8 3])) -- (as 'U8 8)
+
+;; SYM min/max go through reduction_i64_result's SYM branch (reduce_range.c SYM arm)
+;; SYM has_nulls=false, no-idx path.
+(type (min ['alpha 'beta 'gamma])) -- 'sym
+(type (max ['alpha 'beta 'gamma])) -- 'sym
+
+;; ─── OP_FIRST / OP_LAST O(1) short-circuit ───────────────────────────
+;; OP_FIRST/OP_LAST on DATE, TIME, TIMESTAMP, I16, U8, SYM
+;; fire the short-circuit block (group.c:1750).
+
+;; Verify values match (not type — typed nulls/non-nulls checked separately)
+(== (first (as 'DATE [7305 7306 7307])) (as 'DATE 7305)) -- true
+(== (last  (as 'DATE [7305 7306 7307])) (as 'DATE 7307)) -- true
+
+(== (first (as 'TIME [1000 2000 3000])) (as 'TIME 1000)) -- true
+(== (last  (as 'TIME [1000 2000 3000])) (as 'TIME 3000)) -- true
+
+(== (first (as 'TIMESTAMP [100 200 300])) (as 'TIMESTAMP 100)) -- true
+(== (last  (as 'TIMESTAMP [100 200 300])) (as 'TIMESTAMP 300)) -- true
+
+(== (first (as 'I16 [5 10 15])) (as 'I16 5)) -- true
+(== (last  (as 'I16 [5 10 15])) (as 'I16 15)) -- true
+
+(== (first (as 'U8 [1 2 3])) (as 'U8 1)) -- true
+(== (last  (as 'U8 [1 2 3])) (as 'U8 3)) -- true
+
+(== (first ['alpha 'beta 'gamma]) 'alpha) -- true
+(== (last  ['alpha 'beta 'gamma]) 'gamma) -- true
+
+;; ─── OP_FIRST / OP_LAST on null-bearing vectors (short-circuit + null skip) ──
+;; OP_FIRST on vec with leading null skips it; hits the `has_nulls` check.
+(first (as 'I64 [0N 2 3])) -- 2
+(last  (as 'I64 [1 2 0N])) -- 2
+(first (as 'F64 [0N 2.5 3.5])) -- 2.5
+(last  (as 'F64 [1.5 2.5 0N])) -- 2.5
+
+;; ─── OP_FIRST / OP_LAST on all-null vector (returns typed null) ───────
+;; The short-circuit inner loop finds no valid row → returns typed null.
+(nil? (first (as 'I64 [0N 0N 0N]))) -- true
+(nil? (last  (as 'F64 [0N 0N 0N]))) -- true
+
+;; ─── exec_count_distinct on STR type → distinct_vec_eager fallback ───
+;; STR type goes through the {case RAY_STR: distinct_vec_eager()} branch
+;; at group.c:565-576.
+(count (distinct ["a" "b" "a" "c" "b" "d"])) -- 4
+(count (distinct ["hello" "world" "hello"])) -- 2
+(count (distinct ["x"])) -- 1
+
+;; ─── DATE/TIME key group-by with min/max agg ─────────────────────────
+;; Exercises reduction_i64_result DATE/TIME cases via per-group emit path.
+(set Tdkm (table [k v] (list (as 'DATE [7305 7305 7306 7306]) (as 'I64 [10 20 30 40]))))
+(set Rdkm (select {mn: (min v) mx: (max v) from: Tdkm by: k}))
+(count Rdkm) -- 2
+(at (at Rdkm 'mn) 0) -- 10
+(at (at Rdkm 'mx) 1) -- 40
