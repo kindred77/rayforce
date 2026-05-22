@@ -129,7 +129,7 @@
 (sum (at Rs 'c)) -- 8
 
 ;; ════════════════════════════════════════════════════════════════════
-;; 6. ray_count_distinct_per_group — single-array HT (DuckDB-style),
+;; 6. ray_count_distinct_per_group — single-array HT,
 ;;    n_groups > 50000 sub-200000 rows triggers serial global-hash.
 ;;    Path: query.c:7650 → ray_count_distinct_per_group → CD_INSERT
 ;;    loop (group.c:1162-1227, esz=8 I64 specialisation).

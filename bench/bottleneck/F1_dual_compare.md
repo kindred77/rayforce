@@ -1,8 +1,8 @@
-# Rayforce vs DuckDB — ClickBench, hot run
+# Rayforce vs baseline — ClickBench, hot run
 
-Ratio = (rayforce_hot + 10ms) / (duckdb_hot + 10ms). >1 means Rayforce is slower.
+Ratio = (rayforce_hot + 10ms) / (baseline_hot + 10ms). >1 means Rayforce is slower.
 
-| Q | Cluster | Rayforce ms | DuckDB ms | Ratio |
+| Q | Cluster | Rayforce ms | Baseline ms | Ratio |
 | --: | --- | --: | --: | --: |
 | 1 | scalar agg | 0.000 | 0.587 | 0.94 |
 | 2 | scalar agg | 2.368 | 0.539 | 1.17 |
@@ -67,5 +67,5 @@ Ratio = (rayforce_hot + 10ms) / (duckdb_hot + 10ms). >1 means Rayforce is slower
 
 ## Hard outliers (ratio ≥ 5.0)
 
-| Q | Cluster | Rayforce ms | DuckDB ms | Ratio |
+| Q | Cluster | Rayforce ms | Baseline ms | Ratio |
 | --: | --- | --: | --: | --: |
