@@ -2023,6 +2023,541 @@ static test_result_t test_var_expand_oob_start(void) {
 }
 
 /* --------------------------------------------------------------------------
+ * Test: algorithms on zero-node graph return "length" error
+ * Hits: the n <= 0 guard in exec_pagerank (653), exec_connected_comp (754),
+ *       exec_degree_cent (1333), exec_topsort (1399), exec_cluster_coeff (1491),
+ *       exec_betweenness (1594), exec_closeness (1780), exec_mst (1928),
+ *       exec_dfs (2099), exec_random_walk (2028).
+ * Each of these has an `if (n <= 0) return ray_error("length", NULL)` region
+ * that's never triggered by existing tests.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_algorithms_zero_node_graph(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* Build relation with 0 nodes, 0 edges.
+     * Pass empty (length-0) vectors rather than NULL to avoid memcpy(NULL, ...) UB. */
+    int64_t no_src[1] = {0};  /* dummy array, n=0 so nothing is actually read */
+    int64_t no_dst[1] = {0};
+    double  no_wts[1] = {0.0};
+    ray_rel_t* rel = make_rel_simple(no_src, no_dst, 0, 0);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    /* Build a weighted zero-node relation for algorithms that need props */
+    ray_rel_t* wrel = make_weighted_rel(no_src, no_dst, no_wts, 0, 0, NULL);
+    TEST_ASSERT_NOT_NULL(wrel);
+
+    /* exec_pagerank: n <= 0 */
+    {
+        ray_graph_t* g = ray_graph_new(NULL);
+        ray_op_t* op = ray_pagerank(g, rel, 5, 0.85);
+        TEST_ASSERT_NOT_NULL(op);
+        ray_t* r = ray_execute(g, op);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+        ray_release(r);
+        ray_graph_free(g);
+    }
+
+    /* exec_connected_comp: n <= 0 */
+    {
+        ray_graph_t* g = ray_graph_new(NULL);
+        ray_op_t* op = ray_connected_comp(g, rel);
+        TEST_ASSERT_NOT_NULL(op);
+        ray_t* r = ray_execute(g, op);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+        ray_release(r);
+        ray_graph_free(g);
+    }
+
+    /* exec_degree_cent: n <= 0 */
+    {
+        ray_graph_t* g = ray_graph_new(NULL);
+        ray_op_t* op = ray_degree_cent(g, rel);
+        TEST_ASSERT_NOT_NULL(op);
+        ray_t* r = ray_execute(g, op);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+        ray_release(r);
+        ray_graph_free(g);
+    }
+
+    /* exec_topsort: n <= 0 */
+    {
+        ray_graph_t* g = ray_graph_new(NULL);
+        ray_op_t* op = ray_topsort(g, rel);
+        TEST_ASSERT_NOT_NULL(op);
+        ray_t* r = ray_execute(g, op);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+        ray_release(r);
+        ray_graph_free(g);
+    }
+
+    /* exec_cluster_coeff: n <= 0 */
+    {
+        ray_graph_t* g = ray_graph_new(NULL);
+        ray_op_t* op = ray_cluster_coeff(g, rel);
+        TEST_ASSERT_NOT_NULL(op);
+        ray_t* r = ray_execute(g, op);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+        ray_release(r);
+        ray_graph_free(g);
+    }
+
+    /* exec_betweenness: n <= 0 */
+    {
+        ray_graph_t* g = ray_graph_new(NULL);
+        ray_op_t* op = ray_betweenness(g, rel, 0);
+        TEST_ASSERT_NOT_NULL(op);
+        ray_t* r = ray_execute(g, op);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+        ray_release(r);
+        ray_graph_free(g);
+    }
+
+    /* exec_closeness: n <= 0 */
+    {
+        ray_graph_t* g = ray_graph_new(NULL);
+        ray_op_t* op = ray_closeness(g, rel, 0);
+        TEST_ASSERT_NOT_NULL(op);
+        ray_t* r = ray_execute(g, op);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+        ray_release(r);
+        ray_graph_free(g);
+    }
+
+    /* exec_mst: n <= 0 */
+    {
+        ray_graph_t* g = ray_graph_new(NULL);
+        ray_op_t* op = ray_mst(g, wrel, "weight");
+        TEST_ASSERT_NOT_NULL(op);
+        ray_t* r = ray_execute(g, op);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+        ray_release(r);
+        ray_graph_free(g);
+    }
+
+    /* exec_dfs: n <= 0 */
+    {
+        ray_graph_t* g = ray_graph_new(NULL);
+        ray_t* src_atom = ray_i64(0);
+        ray_op_t* src_op = ray_const_atom(g, src_atom);
+        ray_release(src_atom);
+        ray_op_t* op = ray_dfs(g, src_op, rel, 5);
+        TEST_ASSERT_NOT_NULL(op);
+        ray_t* r = ray_execute(g, op);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+        ray_release(r);
+        ray_graph_free(g);
+    }
+
+    /* exec_random_walk: n <= 0 */
+    {
+        ray_graph_t* g = ray_graph_new(NULL);
+        ray_t* src_atom = ray_i64(0);
+        ray_op_t* src_op = ray_const_atom(g, src_atom);
+        ray_release(src_atom);
+        ray_op_t* op = ray_random_walk(g, src_op, rel, 5);
+        TEST_ASSERT_NOT_NULL(op);
+        ray_t* r = ray_execute(g, op);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+        ray_release(r);
+        ray_graph_free(g);
+    }
+
+    /* exec_louvain: n <= 0 — louvain uses a different guard (checked earlier) */
+    {
+        ray_graph_t* g = ray_graph_new(NULL);
+        ray_op_t* op = ray_louvain(g, rel, 5);
+        TEST_ASSERT_NOT_NULL(op);
+        ray_t* r = ray_execute(g, op);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+        ray_release(r);
+        ray_graph_free(g);
+    }
+
+    ray_rel_free(rel);
+    ray_rel_free(wrel);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: exec_shortest_path with zero-length vec src/dst returns range error
+ * Hits: line 487 — src_val->len == 0 guard inside the non-atom else branch
+ * -------------------------------------------------------------------------- */
+static test_result_t test_shortest_path_empty_vec_src(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t src[] = {0, 1};
+    int64_t dst[] = {1, 2};
+    ray_rel_t* rel = make_rel_simple(src, dst, 2, 3);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    ray_graph_t* g = ray_graph_new(NULL);
+
+    /* Zero-length vec for src: triggers the len==0 guard */
+    ray_t* sv = ray_vec_new(RAY_I64, 1);
+    sv->len = 0;
+    ray_t* dv = ray_vec_new(RAY_I64, 1);
+    ((int64_t*)ray_data(dv))[0] = 2;
+    dv->len = 1;
+
+    ray_op_t* src_op = ray_const_vec(g, sv);
+    ray_op_t* dst_op = ray_const_vec(g, dv);
+    ray_release(sv);
+    ray_release(dv);
+
+    ray_op_t* sp_op = ray_shortest_path(g, src_op, dst_op, rel, 5);
+    TEST_ASSERT_NOT_NULL(sp_op);
+
+    ray_t* result = ray_execute(g, sp_op);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(result));
+    ray_release(result);
+
+    ray_graph_free(g);
+    ray_rel_free(rel);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: exec_shortest_path with zero-length vec dst returns range error
+ * Hits: line 493 — dst_val->len == 0 guard inside the non-atom else branch
+ * -------------------------------------------------------------------------- */
+static test_result_t test_shortest_path_empty_vec_dst(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t src[] = {0, 1};
+    int64_t dst[] = {1, 2};
+    ray_rel_t* rel = make_rel_simple(src, dst, 2, 3);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    ray_graph_t* g = ray_graph_new(NULL);
+
+    /* Valid src, zero-length dst vec: triggers line 493 guard */
+    ray_t* sv = ray_vec_new(RAY_I64, 1);
+    ((int64_t*)ray_data(sv))[0] = 0;
+    sv->len = 1;
+    ray_t* dv = ray_vec_new(RAY_I64, 1);
+    dv->len = 0;
+
+    ray_op_t* src_op = ray_const_vec(g, sv);
+    ray_op_t* dst_op = ray_const_vec(g, dv);
+    ray_release(sv);
+    ray_release(dv);
+
+    ray_op_t* sp_op = ray_shortest_path(g, src_op, dst_op, rel, 5);
+    TEST_ASSERT_NOT_NULL(sp_op);
+
+    ray_t* result = ray_execute(g, sp_op);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(result));
+    ray_release(result);
+
+    ray_graph_free(g);
+    ray_rel_free(rel);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: exec_expand_factorized with direction==1 (reverse)
+ * Hits: line 57 — if (direction == 1 || direction == 2) body
+ * The existing factorized test only uses direction==0.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_expand_factorized_reverse(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* Directed chain: 0->1, 1->2, 2->3
+     * Reverse degrees: node 1 has rev degree 1 (from 0),
+     *                  node 2 has rev degree 1 (from 1),
+     *                  node 3 has rev degree 1 (from 2).
+     * Source: {1, 2, 3, 99} — node 99 OOB, node 1-3 have rev degree > 0 */
+    int64_t src[] = {0, 1, 2};
+    int64_t dst[] = {1, 2, 3};
+    ray_rel_t* rel = make_rel_simple(src, dst, 3, 4);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    int64_t start_data[] = {1, 2, 3, 99};
+    ray_t* start_vec = ray_vec_from_raw(RAY_I64, start_data, 4);
+
+    ray_graph_t* g = ray_graph_new(NULL);
+    ray_op_t* src_op = ray_const_vec(g, start_vec);
+    /* direction=1: reverse */
+    ray_op_t* expand = ray_expand(g, src_op, rel, 1);
+    TEST_ASSERT_NOT_NULL(expand);
+
+    /* Set factorized flag directly on ext node */
+    ray_op_ext_t* ext = NULL;
+    uint32_t expand_id = expand->id;
+    for (uint32_t i = 0; i < g->ext_count; i++) {
+        if (g->ext_nodes[i] && g->ext_nodes[i]->base.id == expand_id) {
+            ext = g->ext_nodes[i];
+            break;
+        }
+    }
+    TEST_ASSERT_NOT_NULL(ext);
+    ext->graph.factorized = 1;
+
+    ray_t* result = ray_execute(g, expand);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
+    /* Nodes 1,2,3 each have rev degree 1 in a chain.
+     * Node 99 is out-of-range so it contributes 0.
+     * Factorized output: 3 rows */
+    ray_t* src_col = ray_table_get_col(result, ray_sym_intern("_src", 4));
+    TEST_ASSERT_NOT_NULL(src_col);
+    TEST_ASSERT_EQ_I(src_col->len, 3);
+
+    ray_release(result);
+    ray_graph_free(g);
+    ray_release(start_vec);
+    ray_rel_free(rel);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: exec_wco_join with n_vars > LFTJ_MAX_VARS (17 > 16)
+ * Hits: line 1080 — n_vars > LFTJ_MAX_VARS guard returning "nyi"
+ * This is distinct from the unsupported-plan test (which uses n_vars=5).
+ * -------------------------------------------------------------------------- */
+static test_result_t test_wco_join_too_many_vars(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* Build a simple sorted relation */
+    int64_t srce[] = {0, 1};
+    int64_t dste[] = {1, 2};
+    ray_t* sv = ray_vec_from_raw(RAY_I64, srce, 2);
+    ray_t* dv = ray_vec_from_raw(RAY_I64, dste, 2);
+    ray_t* edges = ray_table_new(2);
+    edges = ray_table_add_col(edges, ray_sym_intern("src", 3), sv); ray_release(sv);
+    edges = ray_table_add_col(edges, ray_sym_intern("dst", 3), dv); ray_release(dv);
+    ray_rel_t* rel = ray_rel_from_edges(edges, "src", "dst", 3, 3, true);
+    ray_release(edges);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    /* n_vars=17 > LFTJ_MAX_VARS=16 must trigger the guard at line 1080 */
+    ray_rel_t* rels[1] = {rel};
+    ray_graph_t* g = ray_graph_new(NULL);
+    ray_op_t* wco = ray_wco_join(g, rels, 1, 17);
+    TEST_ASSERT_NOT_NULL(wco);
+
+    ray_t* result = ray_execute(g, wco);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(result));
+
+    ray_graph_free(g);
+    ray_rel_free(rel);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: exec_expand direction==2 with SIP bitmap active
+ * Hits: lines 213-214, 222-223, 245-246, 257-258 — SIP skip branches inside
+ * the direction==2 code path in exec_expand.
+ * Requires: direction==2 AND sip_sel != NULL (filter_hint > 0, n_src > 64).
+ * Isolated nodes (no fwd or rev edges) trigger the `continue` path.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_expand_sip_both_direction(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* 100 nodes total; only 0->1, 1->2, ..., 48->49 are edges.
+     * Nodes 50-99 have no edges in either direction.
+     * The source table scans all 100 node ids.
+     * With filter_hint=1 and n_src=100>64, SIP bitmap is built:
+     *   fwd: marks nodes 0-48 (have fwd degree>0)
+     *   rev: marks nodes 1-49 (have rev degree>0)
+     * Combined bitmap marks nodes 0-49; nodes 50-99 are NOT marked.
+     * Those 50 nodes trigger the `continue` branch at lines 213-214 etc. */
+    int64_t n_nodes = 100;
+    int64_t n_edges = 49;  /* 0->1, ..., 48->49 */
+
+    ray_t* sv = ray_vec_new(RAY_I64, n_edges);
+    ray_t* dv = ray_vec_new(RAY_I64, n_edges);
+    int64_t* sdata = (int64_t*)ray_data(sv);
+    int64_t* ddata = (int64_t*)ray_data(dv);
+    for (int64_t i = 0; i < n_edges; i++) {
+        sdata[i] = i;
+        ddata[i] = i + 1;
+    }
+    sv->len = n_edges; dv->len = n_edges;
+
+    ray_t* edges = ray_table_new(2);
+    edges = ray_table_add_col(edges, ray_sym_intern("src", 3), sv); ray_release(sv);
+    edges = ray_table_add_col(edges, ray_sym_intern("dst", 3), dv); ray_release(dv);
+    ray_rel_t* rel = ray_rel_from_edges(edges, "src", "dst", n_nodes, n_nodes, false);
+    ray_release(edges);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    /* Node table with id column: 0..99 */
+    ray_t* id_vec = ray_vec_new(RAY_I64, n_nodes);
+    int64_t* idata = (int64_t*)ray_data(id_vec);
+    for (int64_t i = 0; i < n_nodes; i++) idata[i] = i;
+    id_vec->len = n_nodes;
+
+    ray_t* node_tbl = ray_table_new(1);
+    node_tbl = ray_table_add_col(node_tbl, ray_sym_intern("id", 2), id_vec);
+    ray_release(id_vec);
+
+    /* Build expand op with direction=2 (both fwd and rev) */
+    ray_graph_t* g = ray_graph_new(node_tbl);
+    ray_op_t* id_scan = ray_scan(g, "id");
+    ray_op_t* expand_op = ray_expand(g, id_scan, rel, 2);
+    TEST_ASSERT_NOT_NULL(expand_op);
+
+    /* Set pad[2]=1 (filter_hint) directly on the ext node to trigger SIP build.
+     * Must set on g->ext_nodes[], not the g->nodes[] op copy. */
+    uint32_t expand_id = expand_op->id;
+    for (uint32_t i = 0; i < g->ext_count; i++) {
+        if (g->ext_nodes[i] && g->ext_nodes[i]->base.id == expand_id) {
+            g->ext_nodes[i]->base.pad[2] = 1;
+            break;
+        }
+    }
+
+    ray_t* result = ray_execute(g, expand_op);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
+    /* Direction 2: fwd + rev neighbors of nodes 0-49 (nodes 50-99 filtered by SIP)
+     * fwd: nodes 0-48 each expand to one neighbor = 49 pairs
+     * rev: nodes 1-49 each expand to one neighbor = 49 pairs
+     * Total: 98 pairs */
+    TEST_ASSERT_TRUE(ray_table_nrows(result) >= 49);
+
+    ray_release(result);
+    ray_graph_free(g);
+    ray_release(node_tbl);
+    ray_rel_free(rel);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: exec_shortest_path direction==2 with asymmetric rel (rev > fwd nodes)
+ * Hits: line 479 — bfs_n_nodes = csr_rev->n_nodes when rev has more nodes
+ * The public ray_shortest_path API hardcodes direction=0; we override the ext
+ * node's graph.direction field directly (same technique as SIP tests).
+ * -------------------------------------------------------------------------- */
+static test_result_t test_shortest_path_direction2_asym(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* Edges: 0->10, 1->11, 2->12
+     * n_src_nodes=3 (fwd.n_nodes=3), n_dst_nodes=13 (rev.n_nodes=13)
+     * With direction==2: csr=&rel->fwd, bfs_n_nodes starts at 3 then gets
+     * updated to 13 at line 479 because rev.n_nodes(13) > fwd.n_nodes(3).
+     * src_node=0, dst_node=10 are both < 13, so BFS proceeds. */
+    int64_t src[] = {0, 1, 2};
+    int64_t dst[] = {10, 11, 12};
+    ray_rel_t* rel = make_rel_asym(src, dst, 3, 3, 13);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    ray_graph_t* g = ray_graph_new(NULL);
+
+    ray_t* src_atom = ray_i64(0);
+    ray_t* dst_atom = ray_i64(10);
+    ray_op_t* src_op = ray_const_atom(g, src_atom);
+    ray_op_t* dst_op = ray_const_atom(g, dst_atom);
+    ray_release(src_atom);
+    ray_release(dst_atom);
+
+    ray_op_t* sp_op = ray_shortest_path(g, src_op, dst_op, rel, 5);
+    TEST_ASSERT_NOT_NULL(sp_op);
+
+    /* Override direction to 2 (both) on the ext node — public API sets 0 */
+    uint32_t sp_id = sp_op->id;
+    for (uint32_t i = 0; i < g->ext_count; i++) {
+        if (g->ext_nodes[i] && g->ext_nodes[i]->base.id == sp_id) {
+            g->ext_nodes[i]->graph.direction = 2;
+            break;
+        }
+    }
+
+    ray_t* result = ray_execute(g, sp_op);
+    /* With direction==2 and an edge 0->10, BFS finds path in 1 hop */
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
+    /* Path: 0 -> 10, so 2 nodes */
+    TEST_ASSERT_EQ_I(ray_table_nrows(result), 2);
+    ray_release(result);
+
+    ray_graph_free(g);
+    ray_rel_free(rel);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: exec_shortest_path direction==1 (reverse-only BFS)
+ * Hits: direction==1 arm where csr = &rel->rev, reaching dst via reverse edge
+ * -------------------------------------------------------------------------- */
+static test_result_t test_shortest_path_reverse(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* Chain: 0->1->2->3
+     * Reverse BFS from node 3 as src to node 0 as dst:
+     * direction==1 means we traverse rev edges (3<-2<-1<-0 in fwd = 0->1->2->3).
+     * With direction==1, csr=&rel->rev.
+     * src=3 has rev edges to 2, then 2->1, then 1->0.
+     * But the BFS is still looking for dst=0 as a specific node ID.
+     * Actually with direction==1 and src=3, dst=0: BFS from 3 using rev CSR
+     * finds path 3->rev->2->rev->1->rev->0 = 4 nodes. */
+    int64_t src[] = {0, 1, 2};
+    int64_t dst[] = {1, 2, 3};
+    ray_rel_t* rel = make_rel_simple(src, dst, 3, 4);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    ray_graph_t* g = ray_graph_new(NULL);
+
+    /* src=3 (has rev edges), dst=0 (reachable via rev BFS) */
+    ray_t* src_atom = ray_i64(3);
+    ray_t* dst_atom = ray_i64(0);
+    ray_op_t* src_op = ray_const_atom(g, src_atom);
+    ray_op_t* dst_op = ray_const_atom(g, dst_atom);
+    ray_release(src_atom);
+    ray_release(dst_atom);
+
+    /* direction=1 is passed directly to ray_shortest_path */
+    ray_op_t* sp_op = ray_shortest_path(g, src_op, dst_op, rel, 5);
+    TEST_ASSERT_NOT_NULL(sp_op);
+
+    /* Override direction to 1 (reverse) */
+    uint32_t sp_id = sp_op->id;
+    for (uint32_t i = 0; i < g->ext_count; i++) {
+        if (g->ext_nodes[i] && g->ext_nodes[i]->base.id == sp_id) {
+            g->ext_nodes[i]->graph.direction = 1;
+            break;
+        }
+    }
+
+    ray_t* result = ray_execute(g, sp_op);
+    /* Reverse BFS from 3: traverses rev edges 3<-2<-1<-0, finds dst=0 in 3 hops */
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
+    /* Path has 4 nodes: 3, 2, 1, 0 */
+    TEST_ASSERT_EQ_I(ray_table_nrows(result), 4);
+    ray_release(result);
+
+    ray_graph_free(g);
+    ray_rel_free(rel);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
  * Suite
  * -------------------------------------------------------------------------- */
 
@@ -2076,5 +2611,13 @@ const test_entry_t traverse_entries[] = {
     { "traverse/mst_cyclic",                 test_mst_cyclic,                     NULL, NULL },
     { "traverse/wco_join_unsupported_plan",  test_wco_join_unsupported_plan,      NULL, NULL },
     { "traverse/var_expand_oob_start",       test_var_expand_oob_start,           NULL, NULL },
+    { "traverse/expand_sip_both_direction",  test_expand_sip_both_direction,      NULL, NULL },
+    { "traverse/wco_join_too_many_vars",     test_wco_join_too_many_vars,         NULL, NULL },
+    { "traverse/expand_factorized_reverse",  test_expand_factorized_reverse,      NULL, NULL },
+    { "traverse/shortest_path_empty_vec_src", test_shortest_path_empty_vec_src,  NULL, NULL },
+    { "traverse/shortest_path_empty_vec_dst", test_shortest_path_empty_vec_dst,  NULL, NULL },
+    { "traverse/algorithms_zero_node_graph",  test_algorithms_zero_node_graph,   NULL, NULL },
+    { "traverse/shortest_path_direction2_asym", test_shortest_path_direction2_asym, NULL, NULL },
+    { "traverse/shortest_path_reverse",      test_shortest_path_reverse,          NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };

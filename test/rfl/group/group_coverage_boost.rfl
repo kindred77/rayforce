@@ -1,0 +1,196 @@
+;; ════════════════════════════════════════════════════════════════════
+;; group_coverage_boost.rfl — targeted coverage additions for group.c
+;;
+;; Targets (previously uncovered):
+;;   1. nullable multi-key GROUP BY (null_mask hash path: lines 2649, 2667-2669)
+;;   2. cd_sym_dense_count esz=1,2,4 branches (lines 605-607)
+;;   3. reduce_cache_put/get (lines 1907, 1862-1868)
+;;   4. exec_group_pearson_rowform 2-key shape
+;;   5. exec_group_maxmin_rowform parallel path
+;;   6. exec_group_sum_count_rowform 5-8 key shapes
+;;   7. grpsc_ht_grow_* — 3-key group HT growth
+;;   8. Pearson F64 agg y-side accum in HT path (lines 2329-2334)
+;;   9. wide-key scatter (GUID key in multi-key GROUP BY)
+;;  10. finalize-nulls: null agg output in multi-key GROUP BY
+;;  11. group_ht_grow + group_ht_rehash (lines 2442, 2459)
+;;  12. da_count_emit_keep_min early-return path
+;; ════════════════════════════════════════════════════════════════════
+
+;; ─── 1a. Multi-key nullable GROUP BY — null_mask hash path ─────────────
+;; Two I64 keys where first key can be null → nullable_mask bit 0 set
+;; → null_mask fires → h = hash_combine(h, hash(null_mask)) path
+(set Tnk2 (table [k1 k2 v] (list (as 'I64 [1 0N 2 1 0N 2 0N 3]) (as 'I64 [0 0 0 0 0 0 0 0]) (as 'I64 [10 20 30 40 50 60 70 80]))))
+(set Rnk2 (select {s: (sum v) c: (count v) from: Tnk2 by: [k1 k2]}))
+;; Groups: (1,0)=50, (null,0)=140, (2,0)=90, (3,0)=80
+(count Rnk2) -- 4
+(sum (at Rnk2 's)) -- 360
+(min (at Rnk2 'c)) -- 1
+
+;; 1b. Both keys nullable
+(set Tnk2b (table [k1 k2 v] (list (as 'I64 [1 0N 1 0N]) (as 'I64 [0N 5 0N 5]) (as 'I64 [10 20 30 40]))))
+(set Rnk2b (select {s: (sum v) from: Tnk2b by: [k1 k2]}))
+;; (1,null): 10+30=40, (null,5): 20+40=60
+(count Rnk2b) -- 2
+(sum (at Rnk2b 's)) -- 100
+
+;; ─── 2. cd_sym_dense_count with various SYM widths ──────────────────────
+;; count(distinct) on SYM triggers cd_sym_dense_count which dispatches
+;; on element size (esz=1 uint8_t, esz=2 uint16_t, esz=4 uint32_t).
+;; The esz depends on how many symbols are interned globally.
+(count (distinct (as 'SYM ['a 'b 'c 'd 'a 'b]))) -- 4
+(count (distinct (as 'SYM (% (til 10000) 50)))) -- 50
+(count (distinct (as 'SYM (% (til 5000) 200)))) -- 200
+
+;; ─── 3. reduce_cache_put/get ────────────────────────────────────────────
+;; reduce_cache_put fires on min/max with mutable-mod parallel vectors.
+;; Second call on same vector hits reduce_cache_get (lines 262-273, 1907).
+;; Use >= 65536 rows to ensure parallel path triggers cache put.
+(set Vcache (as 'I64 (til 70000)))
+(min Vcache) -- 0
+(min Vcache) -- 0
+(max Vcache) -- 69999
+(max Vcache) -- 69999
+;; F64 cache path
+(set Vcachef (as 'F64 (til 70000)))
+(min Vcachef) -- 0.0
+(min Vcachef) -- 0.0
+(max Vcachef) -- 69999.0
+(max Vcachef) -- 69999.0
+
+;; ─── 4. exec_group_pearson_rowform — 2-key shape ───────────────────────
+;; n_keys=2 exercises the 2-key code path in exec_group_pearson_rowform
+(set Tprf_2 (table [k1 k2 x y] (list (as 'I64 [1 1 1 2 2 2]) (as 'I64 [0 0 0 0 0 0]) (as 'F64 [1.0 2.0 3.0 4.0 5.0 6.0]) (as 'F64 [2.0 4.0 6.0 8.0 10.0 12.0]))))
+(set Rprf_2 (select {r: (pearson_corr x y) by: [k1 k2] from: Tprf_2}))
+(count Rprf_2) -- 2
+(< (abs (- (min (at Rprf_2 'r)) 1.0)) 0.001) -- true
+
+;; 2-key Pearson parallel path (>= 16384 rows)
+;; k1 in [0..99], k2 in [0..127] — lcm(100,128)=3200 → 3200 distinct pairs max
+;; but actual distinct pairs = lcm(100,128)=3200 (coprime-ish)
+(set Tprf_p2 (table [k1 k2 x y] (list (as 'I64 (% (til 20000) 100)) (as 'I64 (% (til 20000) 127)) (as 'F64 (% (til 20000) 50)) (* 2.0 (as 'F64 (% (til 20000) 50))))))
+(set Rprf_p2 (select {r: (pearson_corr x y) by: [k1 k2] from: Tprf_p2}))
+;; lcm(100,127)=12700 but we only have 20000 rows cycling 12700 pairs
+(> (count Rprf_p2) 100) -- true
+
+;; ─── 5. exec_group_maxmin_rowform — parallel path ───────────────────────
+;; group_maxmin_rowform goes parallel when nrows >= 16384.
+(set Tmm_p (table [k x y] (list (as 'I64 (% (til 30000) 1000)) (as 'I64 (til 30000)) (as 'I64 (til 30000)))))
+(set Rmm_p (select {mx: (max x) mn: (min y) by: k from: Tmm_p}))
+(count Rmm_p) -- 1000
+(> (sum (at Rmm_p 'mx)) 0) -- true
+(>= (min (at Rmm_p 'mn)) 0) -- true
+
+;; ─── 6. exec_group_sum_count_rowform — 5,6,7,8 key shapes ──────────────
+;; n_keys=5..8 exercises additional key-packing paths in sum_count_rowform.
+
+;; 5-key sum+count
+(set Tsc_5 (table [k1 k2 k3 k4 k5 v] (list (as 'I64 [1 1 2 2]) (as 'I64 [0 0 0 0]) (as 'I64 [1 1 2 2]) (as 'I64 [0 0 0 0]) (as 'I64 [0 0 0 0]) (as 'I64 [100 200 300 400]))))
+(set Rsc_5 (select {s: (sum v) c: (count v) by: [k1 k2 k3 k4 k5] from: Tsc_5}))
+(count Rsc_5) -- 2
+(< (abs (- (sum (at Rsc_5 's)) 1000.0)) 0.01) -- true
+
+;; 6-key sum+count
+(set Tsc_6 (table [k1 k2 k3 k4 k5 k6 v] (list (as 'I64 [1 1 2 2]) (as 'I64 [0 0 0 0]) (as 'I64 [1 1 2 2]) (as 'I64 [0 0 0 0]) (as 'I64 [0 0 0 0]) (as 'I64 [0 0 0 0]) (as 'I64 [10 20 30 40]))))
+(set Rsc_6 (select {s: (sum v) c: (count v) by: [k1 k2 k3 k4 k5 k6] from: Tsc_6}))
+(count Rsc_6) -- 2
+(< (abs (- (sum (at Rsc_6 's)) 100.0)) 0.01) -- true
+
+;; 7-key sum+count
+(set Tsc_7 (table [k1 k2 k3 k4 k5 k6 k7 v] (list (as 'I64 [1 1 2 2]) (as 'I64 [0 0 0 0]) (as 'I64 [1 1 2 2]) (as 'I64 [0 0 0 0]) (as 'I64 [0 0 0 0]) (as 'I64 [0 0 0 0]) (as 'I64 [0 0 0 0]) (as 'I64 [5 10 15 20]))))
+(set Rsc_7 (select {s: (sum v) c: (count v) by: [k1 k2 k3 k4 k5 k6 k7] from: Tsc_7}))
+(count Rsc_7) -- 2
+(< (abs (- (sum (at Rsc_7 's)) 50.0)) 0.01) -- true
+
+;; 8-key sum+count
+(set Tsc_8 (table [k1 k2 k3 k4 k5 k6 k7 k8 v] (list (as 'I64 [1 1 2 2]) (as 'I64 [0 0 0 0]) (as 'I64 [1 1 2 2]) (as 'I64 [0 0 0 0]) (as 'I64 [0 0 0 0]) (as 'I64 [0 0 0 0]) (as 'I64 [0 0 0 0]) (as 'I64 [0 0 0 0]) (as 'I64 [1 2 3 4]))))
+(set Rsc_8 (select {s: (sum v) c: (count v) by: [k1 k2 k3 k4 k5 k6 k7 k8] from: Tsc_8}))
+(count Rsc_8) -- 2
+(< (abs (- (sum (at Rsc_8 's)) 10.0)) 0.01) -- true
+
+;; 5-key parallel path (>= 16384 rows)
+(set Tsc_5p (table [k1 k2 k3 k4 k5 v] (list (as 'I64 (% (til 20000) 100)) (as 'I64 (% (til 20000) 50)) (as 'I64 (% (til 20000) 20)) (as 'I64 (% (til 20000) 10)) (as 'I64 (% (til 20000) 5)) (as 'I64 (til 20000)))))
+(set Rsc_5p (select {s: (sum v) c: (count v) by: [k1 k2 k3 k4 k5] from: Tsc_5p}))
+(> (count Rsc_5p) 0) -- true
+(< (abs (- (sum (at Rsc_5p 's)) 199990000.0)) 1.0) -- true
+
+;; ─── 7. grpsc_ht_grow_* — force HT growth in 3-key group ──────────────
+;; High group density (many distinct 3-key combos per radix partition)
+;; forces grpsc_ht_grow_slots / grpsc_ht_grow_entries.
+;; lcm(1000,200,50)=1000 → at most 1000 distinct (k1,k2,k3) groups from 100k rows
+(set Tsc_g2 (table [k1 k2 k3 v] (list (as 'I64 (% (til 100000) 1000)) (as 'I64 (% (til 100000) 200)) (as 'I64 (% (til 100000) 50)) (as 'I64 (til 100000)))))
+(set Rsc_g2 (select {s: (sum v) c: (count v) by: [k1 k2 k3] from: Tsc_g2}))
+(> (count Rsc_g2) 100) -- true
+(< (abs (- (sum (at Rsc_g2 's)) 4999950000.0)) 1.0) -- true
+
+;; ─── 8. Pearson F64 y-side accumulation in HT path (lines 2329-2334) ────
+;; 3-key GROUP BY Pearson forces exec_group HT path (rowform requires n_keys<=2).
+;; Multiple rows per group triggers accum_from_entry's PEARSON y-side update.
+(set Tpht (table [k1 k2 k3 x y] (list (as 'I64 [1 1 1 2 2 2 3 3 3]) (as 'I64 [0 0 0 0 0 0 0 0 0]) (as 'I64 [0 0 0 0 0 0 0 0 0]) (as 'F64 [1.0 2.0 3.0 4.0 5.0 6.0 7.0 8.0 9.0]) (as 'F64 [2.0 4.0 6.0 8.0 10.0 12.0 14.0 16.0 18.0]))))
+(set Rpht (select {r: (pearson_corr x y) by: [k1 k2 k3] from: Tpht}))
+(count Rpht) -- 3
+(< (abs (- (min (at Rpht 'r)) 1.0)) 0.001) -- true
+
+;; 4-key Pearson HT path (i64 binary agg branch, lines 2349-2352)
+(set Tpht4 (table [k1 k2 k3 k4 x y] (list (as 'I64 [1 1 1 2 2 2]) (as 'I64 [0 0 0 0 0 0]) (as 'I64 [0 0 0 0 0 0]) (as 'I64 [0 0 0 0 0 0]) (as 'I64 [1 2 3 4 5 6]) (as 'I64 [2 4 6 8 10 12]))))
+(set Rpht4 (select {r: (pearson_corr x y) by: [k1 k2 k3 k4] from: Tpht4}))
+(count Rpht4) -- 2
+(< (abs (- (min (at Rpht4 'r)) 1.0)) 0.001) -- true
+
+;; ─── 9. Wide-key scatter path (GUID key in multi-key GROUP BY) ─────────
+;; GUID keys force wide_key_mask != 0 in the scatter (lines 2821-2824, 2994-2995).
+(set Tguid (table [g k v] (list (take (guid 5) 20) (as 'I64 (% (til 20) 5)) (as 'I64 (til 20)))))
+(set Rguid (select {tot: (sum v) c: (count v) by: [g k] from: Tguid}))
+(> (count Rguid) 0) -- true
+(== (sum (at Rguid 'tot)) 190) -- true
+
+;; ─── 10. Finalize-nulls in multi-key GROUP BY (lines 2970-2982) ─────────
+;; 3-key GROUP BY where some groups produce all-null agg output.
+;; Exercises the finalize step that writes F64 and I64 null sentinels.
+(set Tnull3 (table [k1 k2 k3 v] (list (as 'I64 [1 1 2 2 3 3]) (as 'I64 [0 0 0 0 0 0]) (as 'I64 [0 0 0 0 0 0]) (as 'I64 [10 20 0N 0N 30 40]))))
+(set Rnull3 (select {mn: (min v) mx: (max v) from: Tnull3 by: [k1 k2 k3]}))
+(count Rnull3) -- 3
+(at (at Rnull3 'mn) 0) -- 10
+(nil? (at (at Rnull3 'mn) 1)) -- true
+(at (at Rnull3 'mn) 2) -- 30
+
+;; F64 column finalize-nulls (RAY_F64 sentinel in finalize, line 2971)
+(set Tnull3f (table [k1 k2 k3 v] (list (as 'I64 [1 1 2 2 3 3]) (as 'I64 [0 0 0 0 0 0]) (as 'I64 [0 0 0 0 0 0]) (as 'F64 [1.0 2.0 0N 0N 3.0 4.0]))))
+(set Rnull3f (select {mn: (min v) mx: (max v) from: Tnull3f by: [k1 k2 k3]}))
+(count Rnull3f) -- 3
+(< (abs (- (at (at Rnull3f 'mn) 0) 1.0)) 0.001) -- true
+(nil? (at (at Rnull3f 'mn) 1)) -- true
+(< (abs (- (at (at Rnull3f 'mn) 2) 3.0)) 0.001) -- true
+
+;; ─── 11. group_ht_grow + group_ht_rehash (lines 2442, 2459) ────────────
+;; F64 keys force HT path (not DA); 5000 distinct F64 keys cause per-partition
+;; HT growth → group_ht_rehash fires.
+(set N_htg 5000)
+(set T_htg (table [k v] (list (as 'F64 (* 0.001 (as 'F64 (til N_htg)))) (as 'I64 (til N_htg)))))
+(set R_htg (select {s: (sum v) c: (count v) from: T_htg by: k}))
+(count R_htg) -- 5000
+(sum (at R_htg 's)) -- 12497500
+(min (at R_htg 'c)) -- 1
+
+;; ─── 12. da_count_emit_keep_min early-return (lines 3526-3527, 3576-3577) ─
+;; Returns early when k_take >= group_count (keep_min = filter + 1).
+(set Tkm (table [k v] (list (as 'I64 [1 2 3]) (as 'I64 [10 20 30]))))
+(set Rkm (select {c: (count k) from: Tkm by: k desc: c take: 10}))
+(count Rkm) -- 3
+(sum (at Rkm 'c)) -- 3
+
+;; ─── 13. exec_group_pearson_rowform — F64 + parallel, large ──────────────
+;; Large-scale Pearson rowform with F64 vals to exercise parallel phases.
+;; x and 2*x per group → perfect correlation = 1.0.
+(set Tprf_lg (table [k x y] (list (as 'I64 (% (til 30000) 500)) (as 'F64 (% (til 30000) 100)) (* 2.0 (as 'F64 (% (til 30000) 100))))))
+(set Rprf_lg (select {r: (pearson_corr x y) by: k from: Tprf_lg}))
+(count Rprf_lg) -- 500
+;; Each group has x=2*x, correlation should be 1.0 → sum = 500.0
+(< (abs (- (sum (at Rprf_lg 'r)) 500.0)) 1.0) -- true
+
+;; ─── 14. exec_group_maxmin_rowform with SYM key ─────────────────────────
+;; SYM key forces the grpmm I64-key HT path for max/min rowform.
+(set Tmm_s (table [k x y] (list ['a 'a 'b 'b 'c 'c] (as 'I64 [10 20 30 40 50 60]) (as 'I64 [15 5 35 25 55 45]))))
+(set Rmm_s (select {mx: (max x) mn: (min y) by: k from: Tmm_s}))
+(count Rmm_s) -- 3
+(sum (at Rmm_s 'mx)) -- 120
+(sum (at Rmm_s 'mn)) -- 75

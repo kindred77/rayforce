@@ -138,3 +138,14 @@
 (== (as 'U8 [1 2 3]) (as 'U8 [2 2 2])) -- [false true false]
 (< (as 'U8 [1 2 3]) (as 'U8 [2 2 2]))  -- [true false false]
 (> (as 'U8 [1 2 3]) (as 'U8 [2 2 2]))  -- [false false true]
+
+;; ===================================================================
+;; Notes on dead code in binary_range (documented, not tested):
+;;   I32/I16/U8 OP_DIV paths: require out_type==I32/I16/U8 but
+;;     ray_div always sets out_type=RAY_F64 → unreachable from RFL
+;;   F64 OP_IDIV: requires out_type=RAY_F64+OP_IDIV but
+;;     ray_idiv always sets out_type=RAY_I64 → unreachable from RFL
+;;   I64 OP_DIV (line 1808): requires out_type=I64+OP_DIV but
+;;     ray_div sets out_type=RAY_F64 → unreachable from RFL
+;;   OP_MIN2/MAX2: not exposed in RFL (only via C API ray_min2/ray_max2)
+;; ===================================================================

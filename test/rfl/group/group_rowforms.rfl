@@ -1,0 +1,114 @@
+;; Coverage for group.c — new rowform functions and related paths
+;;
+;; Targets:
+;;   - exec_group_median_stddev_rowform (lines 11077+):
+;;       2-key med(v)+stddev(v), optional count(v); serial and parallel paths
+;;   - exec_group_sum_count_rowform (lines 11653+):
+;;       3-8 key sum(v)+count(v) rowform; serial and parallel paths
+;;   - exec_group_pearson_rowform empty-table path (line 10062)
+;;   - exec_group_median_stddev_rowform empty-table path (line 11130)
+;;   - exec_group_sum_count_rowform empty-table path (line 11710)
+;;   - grpms_ht_grow_slots/grow_entries (lines 10780+): many 2-key groups
+;;   - grpsc_ht_grow_slots/grow_entries (lines 11425+): many 3-key groups
+;;   - exec_group_maxmin_rowform (lines ~10272+): 1-key max(x)+min(y)
+
+;; ─── exec_group_median_stddev_rowform — serial (small) path ────────────
+;; Query: (select {m: (med v) s: (stddev v) by: [k0 k1] from: T})
+;; Requires n_keys==2, agg_ops=[MEDIAN,STDDEV], no nulls.
+(set Tms_s (table [k0 k1 v] (list (as 'I64 [1 1 1 1 1 2 2 2 2 2 3 3 3 3 3]) (as 'I64 [0 0 0 0 0 0 0 0 0 0 0 0 0 0 0]) (as 'I64 [1 2 3 4 5 6 7 8 9 10 11 12 13 14 15]))))
+(set Rms_s (select {m: (med v) s: (stddev v) by: [k0 k1] from: Tms_s}))
+;; 3 groups: (1,0), (2,0), (3,0)
+(count Rms_s) -- 3
+;; medians: 3.0, 8.0, 13.0 → sum = 24.0
+(< (abs (- (sum (at Rms_s 'm)) 24.0)) 0.01) -- true
+
+;; 2-key with count agg (with_count=true path, lines 11141-11145)
+(set Tms_c (table [k0 k1 v] (list (as 'I64 [1 1 1 2 2 2]) (as 'I64 [10 10 10 20 20 20]) (as 'F64 [1.0 2.0 3.0 4.0 5.0 6.0]))))
+(set Rms_c (select {m: (med v) s: (stddev v) c: (count v) by: [k0 k1] from: Tms_c}))
+(count Rms_c) -- 2
+;; medians: 2.0 and 5.0 → sum = 7.0
+(< (abs (- (sum (at Rms_c 'm)) 7.0)) 0.01) -- true
+;; total count = 3 + 3 = 6
+(sum (at Rms_c 'c)) -- 6
+
+;; ─── exec_group_median_stddev_rowform — empty table path (line 11130) ────
+(set Tms_e (table [k0 k1 v] (list (as 'I64 []) (as 'I64 []) (as 'I64 []))))
+(set Rms_e (select {m: (med v) s: (stddev v) by: [k0 k1] from: Tms_e}))
+(count Rms_e) -- 0
+
+;; ─── exec_group_median_stddev_rowform — parallel path (nrows >= 16384) ──
+;; N=20000 forces pool dispatch in phase1/phase2/phase3 (grpms_phase*_fn)
+;; k0 = i%100, k1 = (i/100)%10 gives independent keys: 100*10=1000 distinct pairs
+(set Tms_p (table [k0 k1 v] (list (as 'I64 (% (til 20000) 100)) (as 'I64 (% (/ (til 20000) 100) 10)) (as 'I64 (til 20000)))))
+(set Rms_p (select {m: (med v) s: (stddev v) by: [k0 k1] from: Tms_p}))
+;; k0 in [0..99], k1 in [0..9]; 100*10=1000 distinct (k0,k1) groups
+(count Rms_p) -- 1000
+(> (sum (at Rms_p 'm)) 0.0) -- true
+
+;; ─── grpms_ht_grow_* via high-density partition (lines 10780+) ────────────
+;; 50k rows with 500*200=many possible groups; high partition density
+;; forces grpms_ht_grow_slots/grow_entries in at least one partition.
+(set Tms_g (table [k0 k1 v] (list (as 'I64 (% (til 50000) 500)) (as 'I64 (% (til 50000) 200)) (as 'I64 (til 50000)))))
+(set Rms_g (select {m: (med v) s: (stddev v) by: [k0 k1] from: Tms_g}))
+(> (count Rms_g) 100) -- true
+(> (sum (at Rms_g 'm)) 0.0) -- true
+
+;; ─── exec_group_sum_count_rowform — 3-key (serial) path ─────────────────
+;; n_keys=3, agg_ops=[SUM,COUNT], no nulls → sum+count rowform
+(set Tsc_3 (table [k1 k2 k3 v] (list (as 'I64 [1 1 1 2 2 2 3 3 3]) (as 'I64 [0 0 0 0 0 0 0 0 0]) (as 'I64 [1 1 1 2 2 2 3 3 3]) (as 'I64 [10 20 30 40 50 60 70 80 90]))))
+(set Rsc_3 (select {s: (sum v) c: (count v) by: [k1 k2 k3] from: Tsc_3}))
+(count Rsc_3) -- 3
+(< (abs (- (sum (at Rsc_3 's)) 450.0)) 0.01) -- true
+
+;; ─── exec_group_sum_count_rowform — empty table path (line 11710) ────────
+(set Tsc_e (table [k1 k2 k3 v] (list (as 'I64 []) (as 'I64 []) (as 'I64 []) (as 'I64 []))))
+(set Rsc_e (select {s: (sum v) c: (count v) by: [k1 k2 k3] from: Tsc_e}))
+(count Rsc_e) -- 0
+
+;; ─── exec_group_sum_count_rowform — 4-key shape ──────────────────────────
+(set Tsc_4 (table [k1 k2 k3 k4 v] (list (as 'I64 [1 1 1 2 2 2]) (as 'I64 [0 0 0 0 0 0]) (as 'I64 [1 1 1 2 2 2]) (as 'I64 [0 0 0 0 0 0]) (as 'I64 [100 200 300 400 500 600]))))
+(set Rsc_4 (select {s: (sum v) c: (count v) by: [k1 k2 k3 k4] from: Tsc_4}))
+(count Rsc_4) -- 2
+(< (abs (- (sum (at Rsc_4 's)) 2100.0)) 0.01) -- true
+
+;; ─── exec_group_sum_count_rowform — parallel path (nrows >= 16384) ───────
+(set Tsc_p (table [k1 k2 k3 v] (list (as 'I64 (% (til 20000) 100)) (as 'I64 (% (til 20000) 50)) (as 'I64 (% (til 20000) 20)) (as 'I64 (til 20000)))))
+(set Rsc_p (select {s: (sum v) c: (count v) by: [k1 k2 k3] from: Tsc_p}))
+(> (count Rsc_p) 0) -- true
+;; sum of all v = 0+1+...+19999 = 199990000
+(< (abs (- (sum (at Rsc_p 's)) 199990000.0)) 1.0) -- true
+
+;; ─── grpsc_ht_grow_* via high-density partition (lines 11425+) ────────────
+;; 50k rows with many 3-key combos; forces grpsc_ht_grow_slots/grow_entries.
+(set Tsc_g (table [k1 k2 k3 v] (list (as 'I64 (% (til 50000) 1000)) (as 'I64 (% (til 50000) 500)) (as 'I64 (% (til 50000) 100)) (as 'I64 (til 50000)))))
+(set Rsc_g (select {s: (sum v) c: (count v) by: [k1 k2 k3] from: Tsc_g}))
+(> (count Rsc_g) 100) -- true
+;; sum of all v = 0+1+...+49999 = 1249975000
+(< (abs (- (sum (at Rsc_g 's)) 1249975000.0)) 1.0) -- true
+
+;; ─── exec_group_pearson_rowform — empty table path (line 10062) ──────────
+(set Tprf_e (table [k x y] (list (as 'I64 []) (as 'F64 []) (as 'F64 []))))
+(set Rprf_e (select {r: (pearson_corr x y) by: k from: Tprf_e}))
+(count Rprf_e) -- 0
+
+;; ─── exec_group_pearson_rowform — 1-key shape ────────────────────────────
+;; Single I64 key + F64 x/y → perfect correlation per group
+(set Tprf_1 (table [k x y] (list (as 'I64 [1 1 1 2 2 2 3 3 3]) (as 'F64 [1.0 2.0 3.0 4.0 5.0 6.0 7.0 8.0 9.0]) (as 'F64 [2.0 4.0 6.0 8.0 10.0 12.0 14.0 16.0 18.0]))))
+(set Rprf_1 (select {r: (pearson_corr x y) by: k from: Tprf_1}))
+(count Rprf_1) -- 3
+;; All correlations should be near 1.0 (perfect linear)
+(< (abs (- (min (at Rprf_1 'r)) 1.0)) 0.001) -- true
+
+;; ─── exec_group_maxmin_rowform — 1-key max(x)+min(y) ────────────────────
+;; Query shape: (select {mx: (max x) mn: (min y) by: k from: T})
+(set Tmm (table [k x y] (list (as 'I64 [1 1 2 2 3 3]) (as 'I64 [10 20 30 40 50 60]) (as 'I64 [15 5 35 25 55 45]))))
+(set Rmm (select {mx: (max x) mn: (min y) by: k from: Tmm}))
+(count Rmm) -- 3
+(sum (at Rmm 'mx)) -- 120
+(sum (at Rmm 'mn)) -- 75
+
+;; grpmm with many distinct keys (forces grpmm_ht_grow_* lines 10333+)
+;; 10000 distinct keys in a single-key max+min query
+(set Tmm_g (table [k x y] (list (as 'I64 (% (til 50000) 10000)) (as 'I64 (til 50000)) (as 'I64 (til 50000)))))
+(set Rmm_g (select {mx: (max x) mn: (min y) by: k from: Tmm_g}))
+(count Rmm_g) -- 10000

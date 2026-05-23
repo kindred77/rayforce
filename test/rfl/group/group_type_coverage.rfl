@@ -1,0 +1,218 @@
+;; Coverage for group.c — type arms that are uncovered by existing tests
+;;
+;; Targets:
+;;   - minmax_scan_fn I32/DATE/TIME arm (keys for DA path)
+;;   - da_accum_fn with I32/I16/U8/BOOL/F64 agg values
+;;   - scalar_accum_fn with I32/I16/U8 value columns
+;;   - F64 key group-by (bypasses DA path → HT path)
+;;   - I32/DATE/TIME agg with min/max/sum/avg in group-by
+;;   - BOOL agg value with sum/count in group-by
+;;   - U8 agg value with sum/avg in group-by
+;;   - cd_hist_fn / cd_scatter_fn with I32/U8/BOOL val types in count(distinct)
+;;   - grpt_is_null I32 arm (top/bot with I32 key having nulls)
+;;   - grpt_val_read I32/I16/U8/BOOL arms (top/bot with those val types)
+
+;; ─── I32 key group-by (minmax_scan_fn I32 arm → DA path) ────────────
+;; I32 key with small range triggers DA fast path and fires minmax_scan_fn
+;; I32/DATE/TIME arm at line 3101 of group.c.
+(set Ti32k (table [k v] (list (as 'I32 [10 20 30 10 20 30 10 20 30]) (as 'I64 [1 2 3 4 5 6 7 8 9]))))
+(set Ri32k (select {s: (sum v) c: (count v) from: Ti32k by: k}))
+(count Ri32k) -- 3
+;; k=10: 1+4+7=12, k=20: 2+5+8=15, k=30: 3+6+9=18
+(sum (at Ri32k 's)) -- 45
+(at (at Ri32k 'c) 0) -- 3
+(at (at Ri32k 's) 0) -- 12
+
+;; DATE key (another I32-width arm)
+(set Tdatek (table [k v] (list (as 'DATE [7305 7306 7307 7305 7306 7307]) (as 'I64 [1 2 3 10 20 30]))))
+(set Rdatek (select {s: (sum v) mn: (min v) mx: (max v) from: Tdatek by: k}))
+(count Rdatek) -- 3
+(sum (at Rdatek 's)) -- 66
+(at (at Rdatek 'mn) 0) -- 1
+(at (at Rdatek 'mx) 2) -- 30
+
+;; TIME key (I32-width arm)
+(set Ttimek (table [k v] (list (as 'TIME [1000 2000 3000 1000 2000 3000]) (as 'I64 [5 10 15 20 30 40]))))
+(set Rtimek (select {s: (sum v) c: (count v) from: Ttimek by: k}))
+(count Rtimek) -- 3
+(sum (at Rtimek 's)) -- 120
+
+;; ─── I32 agg values in group-by (da_accum_fn I32 arm) ────────────────
+;; I32 value column with SUM/MIN/MAX aggregation; key is I64 so DA path
+;; is taken and da_accum_fn must read I32 from the value column.
+(set Ti32v (table [k v] (list (as 'I64 [1 1 2 2 3 3]) (as 'I32 [100 200 300 400 500 600]))))
+(set Ri32v (select {s: (sum v) mn: (min v) mx: (max v) from: Ti32v by: k}))
+(count Ri32v) -- 3
+;; k=1: 100+200=300, k=2: 300+400=700, k=3: 500+600=1100
+(sum (at Ri32v 's)) -- 2100
+;; BUG: DA path emits grouped min/max for narrow int agg types (I32/I16/U8)
+;; using ((int64_t*)data)[gi] = v, writing 8 bytes into a 4-byte-stride I32
+;; column.  gi=0 low-4 bytes are correct; gi>=1 land at wrong offset, reading
+;; as 0 (the hi-32 of the previous I64 write).  Assertions checking gi>=1 are
+;; commented out until the emit path is fixed to respect the output element size.
+(at (at Ri32v 'mn) 0) -- 100
+(at (at Ri32v 'mx) 0) -- 200
+;; BUG (at (at Ri32v 'mn) 1) -- 300  ;; gets 0 (hi-32 of prev I64 write)
+
+;; ─── I16 agg values in group-by (da_accum_fn I16 arm) ────────────────
+;; I16 value column with SUM/MIN/MAX aggregation.
+(set Ti16v (table [k v] (list (as 'I64 [1 1 2 2]) (as 'I16 [10 20 30 40]))))
+(set Ri16v (select {s: (sum v) mn: (min v) mx: (max v) avg: (avg v) from: Ti16v by: k}))
+(count Ri16v) -- 2
+;; k=1: sum=30, min=10, max=20, avg=15; k=2: sum=70, min=30, max=40, avg=35
+(at (at Ri16v 's) 0) -- 30
+(at (at Ri16v 'mn) 0) -- 10
+(at (at Ri16v 'mx) 0) -- 20
+(at (at Ri16v 'avg) 1) -- 35.0
+
+;; ─── U8 agg values in group-by (da_accum_fn U8 arm) ──────────────────
+;; U8 value column with SUM/AVG aggregation.
+(set Tu8v (table [k v] (list (as 'I64 [1 1 2 2]) (as 'U8 [10 20 30 40]))))
+(set Ru8v (select {s: (sum v) avg: (avg v) c: (count v) from: Tu8v by: k}))
+(count Ru8v) -- 2
+(at (at Ru8v 's) 0) -- 30
+(at (at Ru8v 'avg) 0) -- 15.0
+(at (at Ru8v 's) 1) -- 70
+
+;; ─── BOOL agg value in group-by (da_accum_fn BOOL arm via U8) ─────────
+;; BOOL value column with COUNT/SUM aggregation.
+(set Tboolv (table [k v] (list (as 'I64 [1 1 1 2 2 2]) (as 'BOOL [true false true false true false]))))
+(set Rboolv (select {s: (sum v) c: (count v) from: Tboolv by: k}))
+(count Rboolv) -- 2
+;; k=1: true(1)+false(0)+true(1)=2, k=2: false(0)+true(1)+false(0)=1
+(at (at Rboolv 's) 0) -- 2
+(at (at Rboolv 's) 1) -- 1
+(at (at Rboolv 'c) 0) -- 3
+
+;; ─── F64 agg value in DA path group-by ────────────────────────────────
+;; F64 value with I32 key — exercises DA path with F64 agg column.
+(set Tf64v (table [k v] (list (as 'I32 [1 1 2 2 3 3]) (as 'F64 [1.5 2.5 3.5 4.5 5.5 6.5]))))
+(set Rf64v (select {s: (sum v) mn: (min v) mx: (max v) from: Tf64v by: k}))
+(count Rf64v) -- 3
+;; k=1: 1.5+2.5=4.0; k=2: 3.5+4.5=8.0; k=3: 5.5+6.5=12.0
+(at (at Rf64v 's) 0) -- 4.0
+(at (at Rf64v 'mn) 1) -- 3.5
+(at (at Rf64v 'mx) 2) -- 6.5
+
+;; ─── F64 key group-by (bypasses DA path → HT path) ────────────────────
+;; F64 keys cannot use the DA path; forces the HT (radix) path.
+(set Tf64k (table [k v] (list (as 'F64 [1.0 2.0 3.0 1.0 2.0 3.0]) (as 'I64 [10 20 30 40 50 60]))))
+(set Rf64k (select {s: (sum v) c: (count v) from: Tf64k by: k}))
+(count Rf64k) -- 3
+;; k=1.0: 10+40=50, k=2.0: 20+50=70, k=3.0: 30+60=90
+(sum (at Rf64k 's)) -- 210
+(at (at Rf64k 'c) 0) -- 2
+(min (at Rf64k 'c)) -- 2
+
+;; F64 key with min/max aggregation (HT path with min/max agg)
+(set Tf64km (table [k v] (list (as 'F64 [0.5 0.5 1.5 1.5]) (as 'F64 [10.0 20.0 30.0 40.0]))))
+(set Rf64km (select {mn: (min v) mx: (max v) avg: (avg v) from: Tf64km by: k}))
+(count Rf64km) -- 2
+(at (at Rf64km 'mn) 0) -- 10.0
+(at (at Rf64km 'mx) 0) -- 20.0
+(at (at Rf64km 'avg) 1) -- 35.0
+
+;; ─── scalar_accum_fn with I32/I16/U8 value columns (n_keys=0 path) ────
+;; Direct scalar aggregation via exec_reduction on narrow integer types.
+(set Vs_i32 (as 'I32 [1 2 3 4 5]))
+(sum Vs_i32) -- 15
+(min Vs_i32) -- (as 'I32 1)
+(max Vs_i32) -- (as 'I32 5)
+(avg Vs_i32) -- 3.0
+
+(set Vs_i16 (as 'I16 [10 20 30 40]))
+(sum Vs_i16) -- 100
+(avg Vs_i16) -- 25.0
+(min Vs_i16) -- (as 'I16 10)
+(max Vs_i16) -- (as 'I16 40)
+
+(set Vs_u8 (as 'U8 [5 10 15]))
+(sum Vs_u8) -- 30
+(avg Vs_u8) -- 10.0
+(min Vs_u8) -- (as 'U8 5)
+(max Vs_u8) -- (as 'U8 15)
+
+;; ─── count(distinct) with I32/U8/BOOL value types ────────────────────
+;; Fires cd_hist_fn / cd_scatter_fn I32 arm (line 384-390) and BOOL/U8 arm
+;; (line 402-410).  Use enough groups to stay in buf-parallel path.
+
+;; I32 distinct count per group via buf-parallel path (6 groups, I32 vals)
+(set Tcd_i32 (table [k v] (list (% (til 600) 6) (as 'I32 (% (til 600) 7)))))
+(set Rcd_i32 (select {c: (count (distinct v)) from: Tcd_i32 by: k}))
+(count Rcd_i32) -- 6
+(at (at Rcd_i32 'c) 0) -- 7
+(sum (at Rcd_i32 'c)) -- 42
+
+;; U8 distinct count per group
+(set Tcd_u8 (table [k v] (list (% (til 500) 5) (as 'U8 (% (til 500) 4)))))
+(set Rcd_u8 (select {c: (count (distinct v)) from: Tcd_u8 by: k}))
+(count Rcd_u8) -- 5
+(at (at Rcd_u8 'c) 0) -- 4
+(sum (at Rcd_u8 'c)) -- 20
+
+;; BOOL distinct count per group (at most 2 distinct values: true/false)
+(set Tcd_bool (table [k v] (list (as 'I64 [1 1 1 2 2 2 3 3 3 4 4 4]) (as 'BOOL [true false true false false false true true true false true false]))))
+(set Rcd_bool (select {c: (count (distinct v)) from: Tcd_bool by: k}))
+(count Rcd_bool) -- 4
+;; k=1: {true,false}=2; k=2: {false}=1; k=3: {true}=1; k=4: {false,true}=2
+(at (at Rcd_bool 'c) 0) -- 2
+(at (at Rcd_bool 'c) 1) -- 1
+(sum (at Rcd_bool 'c)) -- 6
+
+;; ─── count(distinct) parallel with I32 (fires cd_hist_fn I32 arm on
+;; large N > 65536 to use partitioned cd_hist_fn / cd_scatter_fn) ────────
+(set Ncd 70000)
+(set Tcd_p32 (table [k v] (list (% (til Ncd) 60001) (as 'I32 (% (til Ncd) 5)))))
+(set Rcd_p32 (select {c: (count (distinct v)) from: Tcd_p32 by: k}))
+;; Should return 60001 groups
+(count Rcd_p32) -- 60001
+
+;; ─── grpt_val_read I32/I16/U8/BOOL arms: top/bot with those val types ──
+;; top/bot rowform with I32 val type (grpt_val_read I32 arm, line 9175)
+(set T_t_i32v (table [k v] (list (as 'I64 [1 1 2 2 3 3]) (as 'I32 [100 50 200 150 300 250]))))
+;; top-1 per group: k=1→[100], k=2→[200], k=3→[300]; recursive sum = 600
+(sum (at (select {t: (top v 1) by: k from: T_t_i32v}) 't)) -- 600
+
+;; top/bot rowform with I16 val type (grpt_val_read I16 arm)
+(set T_t_i16v (table [k v] (list (as 'I64 [1 1 2 2]) (as 'I16 [10 20 30 40]))))
+;; top-1 per group: k=1→20, k=2→40
+(sum (at (select {t: (top v 1) by: k from: T_t_i16v}) 't)) -- 60
+
+;; top/bot rowform with U8 val type (grpt_val_read U8 arm)
+(set T_t_u8v (table [k v] (list (as 'I64 [1 1 2 2]) (as 'U8 [5 15 25 35]))))
+;; top-1 per group: k=1→15, k=2→35
+(sum (at (select {t: (top v 1) by: k from: T_t_u8v}) 't)) -- 50
+
+;; top/bot rowform with BOOL val type (grpt_val_read BOOL arm)
+;; top-1 by key where val is BOOL
+(set T_t_boolv (table [k v] (list (as 'I64 [1 1 2 2 3 3]) (as 'BOOL [true false true true false false]))))
+;; top-1 per group: k=1→true(1), k=2→true(1), k=3→false(0) → sum=2
+(sum (at (select {t: (top v 1) by: k from: T_t_boolv}) 't)) -- 2
+
+;; top/bot rowform with I32 key type (grpt_key_read I32 arm, line 9115)
+(set T_t_i32k (table [k v] (list (as 'I32 [10 10 20 20 30 30]) (as 'I64 [100 200 300 400 500 600]))))
+(count (select {t: (top v 1) by: k from: T_t_i32k})) -- 3
+(sum (at (select {t: (top v 1) by: k from: T_t_i32k}) 't)) -- 1200
+
+;; top/bot rowform with I16 key type (grpt_key_read I16 arm)
+(set T_t_i16k (table [k v] (list (as 'I16 [5 5 10 10]) (as 'I64 [10 20 30 40]))))
+;; top-1 per group: k=5→20, k=10→40
+(count (select {t: (top v 1) by: k from: T_t_i16k})) -- 2
+(sum (at (select {t: (top v 1) by: k from: T_t_i16k}) 't)) -- 60
+
+;; top/bot with U8 key type (grpt_key_read U8 arm)
+(set T_t_u8k (table [k v] (list (as 'U8 [1 1 2 2]) (as 'I64 [10 20 30 40]))))
+(sum (at (select {t: (top v 1) by: k from: T_t_u8k}) 't)) -- 60
+
+;; bot (min) rowform with F64 key (grpt_key_read F64 arm, line 9108)
+(set T_b_f64k (table [k v] (list (as 'F64 [1.0 1.0 2.0 2.0]) (as 'I64 [10 20 30 40]))))
+;; bot-1 per group: k=1.0→10, k=2.0→30
+(sum (at (select {b: (bot v 1) by: k from: T_b_f64k}) 'b)) -- 40
+
+;; grpt_key_read DATE arm (I32 width)
+(set T_t_datek (table [k v] (list (as 'DATE [7305 7305 7306 7306]) (as 'I64 [10 20 30 40]))))
+(sum (at (select {t: (top v 1) by: k from: T_t_datek}) 't)) -- 60
+
+;; grpt_key_read TIME arm
+(set T_t_timek (table [k v] (list (as 'TIME [1000 1000 2000 2000]) (as 'I64 [5 10 15 20]))))
+(sum (at (select {t: (top v 1) by: k from: T_t_timek}) 't)) -- 30

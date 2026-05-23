@@ -1,0 +1,321 @@
+;; Coverage for PR #212 clickbench-flavoured fast-path SELECT specialisations
+;; in src/ops/query.c:
+;;   try_xbar_count_select          — TIMESTAMP bucket-group + count + WHERE + asc + take
+;;   try_i16_ne0_count_desc_select  — I16 key ≠ 0, count desc, take
+;;   try_i32_i64_count_distinct_select — I32 group + (count (distinct I64)) desc take
+;;   try_i16x2_count_desc_select    — two I16 key columns, count desc, take
+;;   select_cache_get / select_cache_put / select_expr_cache_* — profiling cache
+;;   apply_sort_take: no-sort take-only branch, take-with-sort full DAG
+;;   unsorted_positive_take_limit
+;;   ray_select_fn wrapper
+;;   ray_update_fn wrapper
+;;   ray_xbar_fn I32/DATE/TIME pow-2 and non-pow-2 branches
+
+;; ──────────────────────────────────────────────────────────────────────────────
+;; §1  try_xbar_count_select
+;; Shape: (select {c: (count alias) from: T where: (<cmp> col val)
+;;                 by: {alias: (xbar ts_col bucket)}
+;;                 asc: alias take: N})
+;; Note: NO explicit alias key in outer dict — fast path infers key col from asc:.
+;; Requires: TIMESTAMP key column, WHERE clause with integer comparisons.
+;; ──────────────────────────────────────────────────────────────────────────────
+
+;; Table: 8 rows across 3 time buckets of 1 000 000 000 ns, region filter
+(set Txbc (table [ts region] (list (as 'TIMESTAMP [1000000000 1100000000 2000000000 2100000000 3000000000 3100000000 1050000000 2050000000]) (as 'I32 [1 1 2 2 3 3 1 2]))))
+
+;; Basic: where (>= region 1) → all 8 rows → 3 distinct buckets → take 3
+(count (select {c: (count b) from: Txbc by: {b: (xbar ts 1000000000)} where: (>= region 1) asc: b take: 3})) -- 3
+
+;; Verify sorted asc order and counts: bucket 1e9=3 rows, 2e9=3 rows, 3e9=2 rows
+(at (at (select {c: (count b) from: Txbc by: {b: (xbar ts 1000000000)} where: (>= region 1) asc: b take: 3}) 'c) 0) -- 3
+(at (at (select {c: (count b) from: Txbc by: {b: (xbar ts 1000000000)} where: (>= region 1) asc: b take: 3}) 'c) 1) -- 3
+
+;; take 2 → only first 2 buckets
+(count (select {c: (count b) from: Txbc by: {b: (xbar ts 1000000000)} where: (>= region 1) asc: b take: 2})) -- 2
+
+;; WHERE with == filter: only region=1 rows (indices 0,1,6 → all in bucket 1e9 → 1 bucket)
+(count (select {c: (count b) from: Txbc by: {b: (xbar ts 1000000000)} where: (== region 1) asc: b take: 5})) -- 1
+
+;; WHERE with AND: region>=1 AND <=2 → rows with region 1 or 2 → 2 distinct buckets
+(count (select {c: (count b) from: Txbc by: {b: (xbar ts 1000000000)} where: (and (>= region 1) (<= region 2)) asc: b take: 5})) -- 2
+
+;; Cache path: repeat exact same query on same table pointer → cache hit
+(count (select {c: (count b) from: Txbc by: {b: (xbar ts 1000000000)} where: (>= region 1) asc: b take: 3})) -- 3
+
+;; ──────────────────────────────────────────────────────────────────────────────
+;; §2  try_i16_ne0_count_desc_select
+;; Shape: (select {k: k c: (count k) from: T by: k where: (!= k 0) desc: c take: N})
+;; Requires: I16 key column, no nulls, where (!= key 0), desc+take, plus key projection
+;; ──────────────────────────────────────────────────────────────────────────────
+
+;; 8 rows: keys 10(×3), 20(×2), 0(×2, filtered), 30(×1)
+(set Ti16ne0 (table [k v] (list (as 'I16 [10 20 0 10 20 30 0 10]) [1 2 3 4 5 6 7 8])))
+
+;; Expect top-3 by count desc: k=10(3), k=20(2), k=30(1)
+(count (select {k: k c: (count k) from: Ti16ne0 by: k where: (!= k 0) desc: c take: 3})) -- 3
+(at (at (select {k: k c: (count k) from: Ti16ne0 by: k where: (!= k 0) desc: c take: 3}) 'k) 0) -- 10h
+(at (at (select {k: k c: (count k) from: Ti16ne0 by: k where: (!= k 0) desc: c take: 3}) 'c) 0) -- 3
+
+;; take 2 → only top 2
+(count (select {k: k c: (count k) from: Ti16ne0 by: k where: (!= k 0) desc: c take: 2})) -- 2
+
+;; Cache hit: same table, same params
+(count (select {k: k c: (count k) from: Ti16ne0 by: k where: (!= k 0) desc: c take: 3})) -- 3
+
+;; Different table with same schema — cache miss, fresh compute
+(set Ti16ne0b (table [k v] (list (as 'I16 [5 5 5 7 7 0]) [1 2 3 4 5 6])))
+(count (select {k: k c: (count k) from: Ti16ne0b by: k where: (!= k 0) desc: c take: 5})) -- 2
+
+;; ──────────────────────────────────────────────────────────────────────────────
+;; §3  try_i32_i64_count_distinct_select
+;; Shape: (select {region: region c: (count (distinct url)) from: T by: region desc: c take: N})
+;; Requires: I32 group col, I64 distinct col, NO where, desc+take+identity projection
+;; ──────────────────────────────────────────────────────────────────────────────
+
+;; 6 rows: region(I32) 1=3 rows (urls 100,200,100 → 2 distinct), 2=2 rows (100,300→2), 3=1 row
+(set Tcd32 (table [region url] (list (as 'I32 [1 1 2 2 1 3]) [100 200 100 300 100 400])))
+
+;; Expect: sorted by count(distinct url) desc: region=1→2, region=2→2, region=3→1
+(count (select {region: region c: (count (distinct url)) from: Tcd32 by: region desc: c take: 3})) -- 3
+(at (at (select {region: region c: (count (distinct url)) from: Tcd32 by: region desc: c take: 3}) 'region) 2) -- 3i
+
+;; take 2 → only top 2
+(count (select {region: region c: (count (distinct url)) from: Tcd32 by: region desc: c take: 2})) -- 2
+
+;; Cache hit: same params
+(count (select {region: region c: (count (distinct url)) from: Tcd32 by: region desc: c take: 3})) -- 3
+
+;; ──────────────────────────────────────────────────────────────────────────────
+;; §3b  count_distinct_per_group_groups — generic single-key path
+;; Adding a WHERE clause forces the query past the i32_i64 fast path
+;; into the generic group-by route, triggering count_distinct_per_group_groups.
+;; ──────────────────────────────────────────────────────────────────────────────
+
+;; region>0 (all rows pass) — forces generic group-by path
+;; Tcd32: region=[1,1,2,2,1,3], url=[100,200,100,300,100,400]
+;; Region 1→2 distinct urls, region 2→2, region 3→1
+(count (select {region: region c: (count (distinct url)) from: Tcd32 by: region where: (> region 0) desc: c take: 3})) -- 3
+(at (at (select {region: region c: (count (distinct url)) from: Tcd32 by: region where: (> region 0) desc: c take: 3}) 'region) 2) -- 3i
+
+;; ──────────────────────────────────────────────────────────────────────────────
+;; §4  try_i16x2_count_desc_select
+;; Shape: (select {c: (count k0) from: T by: {k0: k0 k1: k1}
+;;                 where: (<cmp> int_col val) desc: c take: N})
+;; Note: NO explicit k0/k1 keys in outer dict — fast path infers key cols from by:.
+;; Requires: two I16 cols, no nulls, WHERE, desc+take, count of first key
+;; ──────────────────────────────────────────────────────────────────────────────
+
+;; 6 rows: (10,1)×3, (20,2)×2, (30,3)×1; all region>=100
+(set Ti16x2 (table [k0 k1 region] (list (as 'I16 [10 10 20 20 10 30]) (as 'I16 [1 1 2 2 1 3]) (as 'I32 [100 100 200 200 100 300]))))
+
+;; Expect: sorted desc by count: (10,1)→3, (20,2)→2, (30,3)→1
+(count (select {c: (count k0) from: Ti16x2 by: {k0: k0 k1: k1} where: (>= region 100) desc: c take: 3})) -- 3
+(at (at (select {c: (count k0) from: Ti16x2 by: {k0: k0 k1: k1} where: (>= region 100) desc: c take: 3}) 'c) 0) -- 3
+
+;; take 2 → only top 2
+(count (select {c: (count k0) from: Ti16x2 by: {k0: k0 k1: k1} where: (>= region 100) desc: c take: 2})) -- 2
+
+;; WHERE == filter: only region=100 → 3 rows with (10,1)
+(count (select {c: (count k0) from: Ti16x2 by: {k0: k0 k1: k1} where: (== region 100) desc: c take: 5})) -- 1
+(at (at (select {c: (count k0) from: Ti16x2 by: {k0: k0 k1: k1} where: (== region 100) desc: c take: 5}) 'c) 0) -- 3
+
+;; Cache hit: same table, same params
+(count (select {c: (count k0) from: Ti16x2 by: {k0: k0 k1: k1} where: (>= region 100) desc: c take: 3})) -- 3
+
+;; ──────────────────────────────────────────────────────────────────────────────
+;; §5  select_cache_get / select_cache_put / select_expr_cache_*
+;; Activate via .sys.timeit 1 then run same group-by query twice.
+;; The group-by path calls select_cache_put; repeat with same table ptr → hit.
+;; ──────────────────────────────────────────────────────────────────────────────
+
+(.sys.timeit 1) -- 1
+
+(set Tcache (table [k v] (list (as 'I32 [1 1 2 2 3]) [10 20 30 40 50])))
+
+;; First run — goes through ray_select group-by path → calls select_cache_put
+(count (select {k: k s: (sum v) from: Tcache by: k})) -- 3
+
+;; Second run — select_cache_get hit AND select_expr_cache_get hit
+(count (select {k: k s: (sum v) from: Tcache by: k})) -- 3
+
+;; Verify result correctness after cache hit (total sum = 30+70+50 = 150)
+(sum (at (select {k: k s: (sum v) from: Tcache by: k}) 's)) -- 150
+
+;; Different query on same table — expr_cache miss (different hash), tbl_cache miss
+(count (select {k: k s: (sum v) from: Tcache by: k asc: s})) -- 3
+
+(.sys.timeit 0) -- 0
+
+;; ──────────────────────────────────────────────────────────────────────────────
+;; §6  apply_sort_take — no-sort + take-only branch
+;; Covers lines ~535-582: has_sort=false, take_val_expr set → direct slice
+;; ──────────────────────────────────────────────────────────────────────────────
+
+(set Tst5 (table [k v] (list ['A 'B 'C 'D 'E] [5 4 3 2 1])))
+
+;; take-only, no sort: select by agg with take but no asc/desc
+;; The by-group select result is materialized then apply_sort_take called
+;; with has_sort=false, take_val_expr set.
+(count (select {k: k s: (sum v) from: Tst5 by: k take: 3})) -- 3
+
+;; Negative take: last 2 rows
+(count (select {k: k s: (sum v) from: Tst5 by: k take: -2})) -- 2
+
+;; ──────────────────────────────────────────────────────────────────────────────
+;; §7  apply_sort_take — sort + take top-K path via DAG
+;; Covers lines ~593-684: has_sort=true, take set → top-K fast path attempt
+;; ──────────────────────────────────────────────────────────────────────────────
+
+(set Ttopk (table [k v] (list ['A 'B 'C 'D 'E 'F] [10 30 20 50 40 5])))
+
+;; Sort asc by sum(v) + take 3 → top-3 ascending: A(10), F(5)→but sorted so F(5), A(10), C(20)
+(count (select {k: k s: (sum v) from: Ttopk by: k asc: s take: 3})) -- 3
+(at (at (select {k: k s: (sum v) from: Ttopk by: k asc: s take: 3}) 's) 0) -- 5
+
+;; Sort desc by sum(v) + take 3 → top-3 descending: D(50), E(40), B(30)
+(count (select {k: k s: (sum v) from: Ttopk by: k desc: s take: 3})) -- 3
+(at (at (select {k: k s: (sum v) from: Ttopk by: k desc: s take: 3}) 's) 0) -- 50
+
+;; ──────────────────────────────────────────────────────────────────────────────
+;; §8  ray_update_fn (wrapper that calls ray_update)
+;; Just needs to exercise the fn wrapper — already covered by update tests
+;; but we call (update ...) here to confirm ray_update_fn entry point
+;; ──────────────────────────────────────────────────────────────────────────────
+
+(set Tupd5 (table [k v] (list [1 2 3] [10 20 30])))
+(count (update {v: (* v 2) from: Tupd5})) -- 3
+(at (at (update {v: (* v 2) from: Tupd5}) 'v) 0) -- 20
+
+;; ──────────────────────────────────────────────────────────────────────────────
+;; §9  ray_xbar_fn I32 / DATE / TIME vector branches
+;; Covers lines ~8020-8070: out_type == RAY_I32 / RAY_DATE / RAY_TIME
+;; ──────────────────────────────────────────────────────────────────────────────
+
+;; I32 vector xbar (non-power-of-2 bucket → q*b loop)
+(xbar (as 'I32 [10 17 23 30 37]) 10i) -- (as 'I32 [10 10 20 30 30])
+(xbar (as 'I32 [7 14 21 28]) 7i) -- (as 'I32 [7 14 21 28])
+;; I32 negative values
+(at (xbar (as 'I32 [-3]) 4i) 0) -- -4i
+
+;; I32 vector xbar with power-of-2 bucket (mask path)
+(xbar (as 'I32 [0 4 7 8 15 16]) 4i) -- (as 'I32 [0 4 4 8 12 16])
+
+;; DATE vector xbar (floor-div by 7 days)
+(xbar [2024.01.01 2024.01.05 2024.01.10 2024.01.15] 7) -- [2023.12.30 2023.12.30 2024.01.06 2024.01.13]
+
+;; TIME vector xbar (milliseconds)
+(xbar [09:00:01.000 09:00:03.500 09:00:07.999 09:00:10.000] 5000) -- [09:00:00.000 09:00:00.000 09:00:05.000 09:00:10.000]
+
+;; Null propagation for I32 xbar
+(set Txn (update {v: 0Ni from: (table [v] (list (as 'I32 [10 20 30]))) where: (== v 20i)}))
+(nil? (at (xbar (at Txn 'v) 10i) 1)) -- true
+
+;; ──────────────────────────────────────────────────────────────────────────────
+;; §10  parse_xbar_count_clause — multi-clause AND / multiple operators
+;; Exercises parse_xbar_count_clause via try_xbar_count_select and also
+;; try_i16x2 with (== col val) single-clause shape.
+;; order_count_clauses runs when n_clauses > 1 (sorts by score: == is cheapest).
+;; count_clause_score: eq+small→0, eq+big→1, range→2
+;; ──────────────────────────────────────────────────────────────────────────────
+
+;; Multi-clause WHERE with three conditions → order_count_clauses sorts them
+(set Txbc2 (table [ts region country] (list (as 'TIMESTAMP [1000000000 1100000000 2000000000 2100000000 3000000000 1050000000]) (as 'I32 [1 1 2 2 3 1]) (as 'I16 [10 10 20 20 30 10]))))
+
+;; Three-clause AND: region>=1, region<=3, country==10 → rows 0,1,5 in bucket 1e9 → 1 bucket
+(count (select {c: (count b) from: Txbc2 by: {b: (xbar ts 1000000000)} where: (and (>= region 1) (and (<= region 3) (== country 10))) asc: b take: 5})) -- 1
+;; count of the 3 matching rows: c=3
+(at (at (select {c: (count b) from: Txbc2 by: {b: (xbar ts 1000000000)} where: (and (>= region 1) (and (<= region 3) (== country 10))) asc: b take: 5}) 'c) 0) -- 3
+
+;; ──────────────────────────────────────────────────────────────────────────────
+;; §11  xbar_clause_cache_eq — cache equality check on clause arrays
+;; Exercises the static cache path in try_xbar_count_select when called
+;; with same clauses twice (cache_clauses must equal new clauses).
+;; Already triggered by §1 cache-hit test above; this confirms multi-clause eq.
+;; ──────────────────────────────────────────────────────────────────────────────
+
+;; Repeat three-clause query → xbar_clause_cache_eq runs and matches
+(count (select {c: (count b) from: Txbc2 by: {b: (xbar ts 1000000000)} where: (and (>= region 1) (and (<= region 3) (== country 10))) asc: b take: 5})) -- 1
+
+;; ──────────────────────────────────────────────────────────────────────────────
+;; §12  resolve_binary_dag — cover remaining arms (in / not-in / or / ilike)
+;; compile_expr_dag dispatches through resolve_binary_dag
+;; ──────────────────────────────────────────────────────────────────────────────
+
+(set Tdag5 (table [v s] (list [1 2 3 4 5] ['a 'b 'c 'd 'e])))
+
+;; or: at least one condition
+(count (select {from: Tdag5 where: (or (== v 1) (== v 5))})) -- 2
+
+;; not-in
+(count (select {from: Tdag5 where: (not-in v [3 4 5])})) -- 2
+
+;; ──────────────────────────────────────────────────────────────────────────────
+;; §13  compile_expr_dag: lambda inline, let, cond, do, xbar, if, substr, replace
+;; compile_expr_dag paths: cexpr_env_push/lookup/pop for lambda beta-reduction
+;; ──────────────────────────────────────────────────────────────────────────────
+
+(set Tlam (table [v] (list [1 2 3 4 5])))
+
+;; lambda inline in DAG (cexpr_env_push/lookup/pop)
+;; select with a lambda applied to a column
+(set double_fn (fn [x] (* x 2)))
+(sum (at (select {dv: (double_fn v) from: Tlam}) 'dv)) -- 30
+
+;; let binding in compile_expr_dag
+(sum (at (select {r: (let x v (* x x)) from: Tlam}) 'r)) -- 55
+
+;; if in DAG: (if cond then else)
+(sum (at (select {r: (if (> v 3) 10 0) from: Tlam}) 'r)) -- 20
+
+;; do in DAG: evaluates last expression
+(sum (at (select {r: (do 99 v) from: Tlam}) 'r)) -- 15
+
+;; ──────────────────────────────────────────────────────────────────────────────
+;; §14  compile_expr_dag: as cast, temporal extract, substr, concat, replace
+;; ──────────────────────────────────────────────────────────────────────────────
+
+(set Tstr5 (table [name] (list (list "hello" "world" "foo" "bar" "baz"))))
+
+;; substr in DAG
+(count (select {s: (substr name 0 3) from: Tstr5})) -- 5
+
+;; concat in DAG (folds non-const multi-arg concat)
+(count (select {c: (concat name "!") from: Tstr5})) -- 5
+
+;; replace in DAG
+(count (select {r: (replace name "o" "0") from: Tstr5})) -- 5
+
+;; as cast I64→F64 in DAG
+(set Tint5 (table [v] (list [1 2 3 4 5])))
+(at (at (select {f: (as 'F64 v) from: Tint5}) 'f) 0) -- 1.0
+
+;; as cast I64→I32 in DAG
+(at (at (select {i: (as 'I32 v) from: Tint5}) 'i) 0) -- 1i
+
+;; ──────────────────────────────────────────────────────────────────────────────
+;; §15  compile_expr_dag: cond expression
+;; ──────────────────────────────────────────────────────────────────────────────
+
+(set Tcond5 (table [v] (list [1 2 3 4 5])))
+;; v=[1,2,3,4,5]: 1→100, 2→200, 3→200, 4→300, 5→300 = 1100
+(sum (at (select {r: (cond ((< v 2) 100) ((< v 4) 200) (else 300)) from: Tcond5}) 'r)) -- 1100
+
+;; ──────────────────────────────────────────────────────────────────────────────
+;; §16  unsorted_positive_take_limit
+;; Covers the helper that checks for take-only (no sort) with positive limit.
+;; Called from the count-select fast-path and from the main select loop.
+;; ──────────────────────────────────────────────────────────────────────────────
+
+;; count(select ...) with take but no sort — unsorted_positive_take_limit fires
+(set Tutl (table [v] (list [1 2 3 4 5 6 7 8 9 10])))
+(count (select {from: Tutl take: 4})) -- 4
+(count (select {from: Tutl take: 10})) -- 10
+(count (select {from: Tutl take: 20})) -- 10
+
+;; ──────────────────────────────────────────────────────────────────────────────
+;; §17  apply_sort_take — sort-only, no take (covers sort-only path)
+;; ──────────────────────────────────────────────────────────────────────────────
+
+(set Tsor5 (table [k v] (list ['A 'B 'C 'D 'E] [5 3 4 1 2])))
+(at (at (select {k: k s: (sum v) from: Tsor5 by: k asc: s}) 's) 0) -- 1
+(at (at (select {k: k s: (sum v) from: Tsor5 by: k desc: s}) 's) 0) -- 5

@@ -1,0 +1,159 @@
+;; Coverage for group.c — null key HT path and median with narrow types
+;;
+;; Targets:
+;;   - null key → HT path (DA path rejects null keys; nullable_mask bit set
+;;     in group_scatter_fn → lines 2861-2885 null key sentinel write)
+;;   - F64 key with nulls in HT path
+;;   - I32 key with nulls in HT path
+;;   - med_read_as_f64 I32/I16/U8 arms (median on I32/I16/U8 value cols)
+;;   - med_is_null I32/I16 arms (median with nulls on I32/I16 columns)
+;;   - median serial path (small group count < 8, serial not parallel)
+;;   - topk_per_group_buf > 65536 groups (dispatch branch)
+;;   - Pearson with multi-key HT path (cnt<2 null emit case)
+;;   - cd_hist_fn SYM arm for large count(distinct) on SYM column without groups
+
+;; ─── Null I64 key → HT path null sentinel scatter ─────────────────────
+;; Keys with HAS_NULLS → DA path declined → HT path; null keys form their
+;; own group OR are dropped (depends on semantics).  By default, NULL keys
+;; in GROUP BY form a separate NULL group.
+;; Two non-null keys + one null key → 3 output groups.
+(set Tnk_i64 (table [k v] (list (as 'I64 [1 0N 2 1 0N 2]) (as 'I64 [10 20 30 40 50 60]))))
+(set Rnk_i64 (select {s: (sum v) c: (count v) from: Tnk_i64 by: k}))
+(count Rnk_i64) -- 3
+;; k=1: 10+40=50, k=2: 30+60=90, null: 20+50=70
+(sum (at Rnk_i64 's)) -- 210
+(min (at Rnk_i64 'c)) -- 2
+
+;; F64 key with nulls → HT path null sentinel (F64 null = NaN)
+(set Tnk_f64 (table [k v] (list (as 'F64 [1.5 0N 2.5 1.5 0N]) (as 'I64 [10 20 30 40 50]))))
+(set Rnk_f64 (select {s: (sum v) c: (count v) from: Tnk_f64 by: k}))
+;; k=1.5: 10+40=50; null: 20+50=70; k=2.5: 30
+(count Rnk_f64) -- 3
+(sum (at Rnk_f64 's)) -- 150
+
+;; I32 key with nulls
+(set Tnk_i32 (table [k v] (list (as 'I32 [10 0N 20 10 20 0N]) (as 'I64 [1 2 3 4 5 6]))))
+(set Rnk_i32 (select {s: (sum v) c: (count v) from: Tnk_i32 by: k}))
+;; k=10: 1+4=5; null: 2+6=8; k=20: 3+5=8
+(count Rnk_i32) -- 3
+(sum (at Rnk_i32 's)) -- 21
+
+;; I16 key with nulls
+(set Tnk_i16 (table [k v] (list (as 'I16 [5 0N 10 5 10 0N]) (as 'I64 [1 2 3 4 5 6]))))
+(set Rnk_i16 (select {s: (sum v) from: Tnk_i16 by: k}))
+;; k=5: 1+4=5; null: 2+6=8; k=10: 3+5=8
+(count Rnk_i16) -- 3
+(sum (at Rnk_i16 's)) -- 21
+
+;; DATE key with nulls (I32-width null key sentinel at line 2877)
+(set Tnk_date (table [k v] (list (as 'DATE [7305 0N 7306 7305]) (as 'I64 [10 20 30 40]))))
+(set Rnk_date (select {s: (sum v) from: Tnk_date by: k}))
+;; k=7305: 10+40=50; null: 20; k=7306: 30
+(count Rnk_date) -- 3
+(sum (at Rnk_date 's)) -- 100
+
+;; ─── Pearson HT path with multi-key (exercises HT emit Pearson case) ──
+;; Multi-key Pearson goes through exec_group (HT path), not the rowform.
+;; n_keys=2 → exec_group HT path → OP_PEARSON_CORR in scatter/emit.
+(set Tpc (table [k1 k2 x y] (list (as 'I64 [1 1 1 2 2 2]) (as 'I64 [0 0 0 0 0 0]) (as 'F64 [1.0 2.0 3.0 4.0 5.0 6.0]) (as 'F64 [2.0 4.0 6.0 8.0 10.0 12.0]))))
+;; k1=1,k2=0: (1,2)(2,4)(3,6) → perfect r=1.0
+;; k1=2,k2=0: (4,8)(5,10)(6,12) → perfect r=1.0
+(set Rpc (select {r: (pearson_corr x y) by: [k1 k2] from: Tpc}))
+(count Rpc) -- 2
+;; Both groups should have correlation 1.0
+(< (abs (- (at (at Rpc 'r) 0) 1.0)) 0.001) -- true
+
+;; cnt < 2 case for Pearson in HT path (single row per group → correlation undefined)
+(set Tpc1 (table [k1 k2 x y] (list (as 'I64 [1 2 3]) (as 'I64 [0 0 0]) (as 'F64 [1.0 2.0 3.0]) (as 'F64 [1.0 2.0 3.0]))))
+;; Each (k1,k2) pair has only 1 row → Pearson is undefined → null
+(set Rpc1 (select {r: (pearson_corr x y) by: [k1 k2] from: Tpc1}))
+(count Rpc1) -- 3
+
+;; ─── Median on I32 value column (med_read_as_f64 I32 arm, line 1288) ──
+;; Grouped median with I32 value column; forces med_read_as_f64 I32 branch.
+;; 3 groups, each with 5 rows.
+(set Tmed_i32 (table [k v] (list (as 'I64 [1 1 1 1 1 2 2 2 2 2 3 3 3 3 3]) (as 'I32 [10 20 30 40 50 60 70 80 90 100 110 120 130 140 150]))))
+(set Rmed_i32 (select {m: (med v) by: k from: Tmed_i32}))
+(count Rmed_i32) -- 3
+;; k=1: median of 10,20,30,40,50 = 30.0
+(at (at Rmed_i32 'm) 0) -- 30.0
+;; k=2: median of 60..100 = 80.0
+(at (at Rmed_i32 'm) 1) -- 80.0
+;; k=3: median of 110..150 = 130.0
+(at (at Rmed_i32 'm) 2) -- 130.0
+
+;; Median on I16 value column (med_read_as_f64 I16 arm, line 1289)
+(set Tmed_i16 (table [k v] (list (as 'I64 [1 1 1 2 2 2]) (as 'I16 [10 20 30 40 50 60]))))
+(set Rmed_i16 (select {m: (med v) by: k from: Tmed_i16}))
+(count Rmed_i16) -- 2
+;; k=1: median of 10,20,30 = 20.0
+(at (at Rmed_i16 'm) 0) -- 20.0
+;; k=2: median of 40,50,60 = 50.0
+(at (at Rmed_i16 'm) 1) -- 50.0
+
+;; Median on U8 value column (med_read_as_f64 U8 arm, line 1290)
+(set Tmed_u8 (table [k v] (list (as 'I64 [1 1 1 2 2 2]) (as 'U8 [5 10 15 20 25 30]))))
+(set Rmed_u8 (select {m: (med v) by: k from: Tmed_u8}))
+(count Rmed_u8) -- 2
+;; k=1: median of 5,10,15 = 10.0
+(at (at Rmed_u8 'm) 0) -- 10.0
+;; k=2: median of 20,25,30 = 25.0
+(at (at Rmed_u8 'm) 1) -- 25.0
+
+;; Median serial path (< 8 groups stays on serial path)
+;; med_par_ctx_t with par=false (n_groups < 8 OR total < 4096)
+;; Use 2 groups with few rows each — serial path fires.
+(set Tmed_ser (table [k v] (list (as 'I64 [1 1 1 2 2 2]) (as 'I64 [10 20 30 40 50 60]))))
+(set Rmed_ser (select {m: (med v) by: k from: Tmed_ser}))
+(count Rmed_ser) -- 2
+(at (at Rmed_ser 'm) 0) -- 20.0
+(at (at Rmed_ser 'm) 1) -- 50.0
+
+;; Median with I32 nulls (med_is_null I32 arm, line 1302)
+;; Groups with some I32 nulls: median skips nulls.
+(set Tmed_nuli32 (table [k v] (list (as 'I64 [1 1 1 2 2 2]) (as 'I32 [10 0N 30 0N 50 60]))))
+(set Rmed_nuli32 (select {m: (med v) by: k from: Tmed_nuli32}))
+(count Rmed_nuli32) -- 2
+;; k=1: non-null values 10, 30 → median = 20.0
+(at (at Rmed_nuli32 'm) 0) -- 20.0
+;; k=2: non-null values 50, 60 → median = 55.0
+(at (at Rmed_nuli32 'm) 1) -- 55.0
+
+;; Median with I16 nulls (med_is_null I16 arm, line 1303)
+(set Tmed_nuli16 (table [k v] (list (as 'I64 [1 1 1 2 2]) (as 'I16 [10 0N 30 0N 50]))))
+(set Rmed_nuli16 (select {m: (med v) by: k from: Tmed_nuli16}))
+(count Rmed_nuli16) -- 2
+;; k=1: non-null 10, 30 → median = 20.0
+(at (at Rmed_nuli16 'm) 0) -- 20.0
+;; k=2: non-null 50 → median = 50.0
+(at (at Rmed_nuli16 'm) 1) -- 50.0
+
+;; Median all-null group → null (med_per_group_fn actual==0 path)
+;; k=1 has all I32 nulls → median should be null.
+(set Tmed_allnul (table [k v] (list (as 'I64 [1 1 2 2]) (as 'I32 [0N 0N 10 20]))))
+(set Rmed_allnul (select {m: (med v) by: k from: Tmed_allnul}))
+(count Rmed_allnul) -- 2
+;; k=1: all null → median is null
+(nil? (at (at Rmed_allnul 'm) 0)) -- true
+;; k=2: median of 10, 20 = 15.0
+(at (at Rmed_allnul 'm) 1) -- 15.0
+
+;; ─── SYM-column count(distinct) large N (cd_hist_fn SYM arm) ─────────
+;; The ungrouped exec_count_distinct on a SYM column with n >= 65536 fires
+;; cd_hist_fn / cd_scatter_fn SYM arm.
+(set Nsym_cd 70000)
+;; SYM column: distinct count should be 300 (cycling 0..299)
+(set Vsym_cd (as 'SYM (% (til Nsym_cd) 300)))
+(count (distinct Vsym_cd)) -- 300
+
+;; ─── topk_per_group_buf > 65536 groups dispatch branch ────────────────
+;; ray_topk_per_group_buf: when n_groups >= (1<<16), falls back to
+;; ray_pool_dispatch (elements-based) rather than ray_pool_dispatch_n.
+;; 70k distinct (k1,k2) groups (from reprobe_stress.rfl), each with
+;; 2 rows → topk fires the >65536 dispatch branch.
+(set N_tk 70000)
+(set Ttkbig (table [k1 k2 v] (list (as 'I64 (% (til (* 2 N_tk)) N_tk)) (as 'I64 (% (til (* 2 N_tk)) 1)) (as 'I64 (til (* 2 N_tk))))))
+(set Rtkbig (select {t: (bot v 1) by: [k1 k2] from: Ttkbig}))
+(count Rtkbig) -- 70000
+;; bot-1 per group = min of the 2 rows = i (for i in [0, N_tk))
+(fold + 0 (map sum (at Rtkbig 't))) -- 2449965000
