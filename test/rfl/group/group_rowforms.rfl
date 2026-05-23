@@ -112,3 +112,11 @@
 (set Tmm_g (table [k x y] (list (as 'I64 (% (til 50000) 10000)) (as 'I64 (til 50000)) (as 'I64 (til 50000)))))
 (set Rmm_g (select {mx: (max x) mn: (min y) by: k from: Tmm_g}))
 (count Rmm_g) -- 10000
+
+;; ─── exec_group_median_stddev_rowform — empty table + with_count=true path ──
+;; (lines 11272-11275): cnv allocated only when with_count is true.
+;; Empty table with count(v) in 2-key med+stddev query exercises the
+;; with_count=true early-return branch on empty input.
+(set Tms_ec (table [k0 k1 v] (list (as 'I64 []) (as 'I64 []) (as 'I64 []))))
+(set Rms_ec (select {m: (med v) s: (stddev v) c: (count v) by: [k0 k1] from: Tms_ec}))
+(count Rms_ec) -- 0
