@@ -742,6 +742,13 @@ static test_result_t test_save_bulk_with_sym_path(void) {
  *     Actually: 18 + 19*51 + 50 = 18 + 969 + 50 = 1037 ≥ 1021. Good.
  * ========================================================================= */
 static test_result_t test_save_dir_path_too_long(void) {
+#ifdef __APPLE__
+    /* macOS PATH_MAX = 1024; mkdir -p stops short of the 1021-char
+     * tree this test needs.  ray_splay_save's path-overflow guard
+     * fires under the same condition on Linux PATH_MAX = 4096.  Skip
+     * on Darwin — the Linux runner covers the regression. */
+    SKIP("PATH_MAX=1024 on macOS — deep-mkdir fixture not portable");
+#endif
     /* Construct the nested path in a buffer */
     char long_dir[2048];
     const char* base   = "/tmp/rft_deep_save";  /* 18 chars */
