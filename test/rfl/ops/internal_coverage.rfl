@@ -353,5 +353,68 @@
 ;; key 0.0 has 512 rows → stddev is defined (non-null)
 (nil? (at (at (select {sd: (stddev v) from: TPN by: k asc: k}) 'sd) 0)) -- false
 
+;; ======================================================================
+;; 10. Large parallel GROUP BY with I32 key — write_col_i64 I32 arm,
+;;     par_set_null I32 arm, par_finalize_nulls I32/DATE/TIME branch.
+;; ======================================================================
+;; 200 groups, 330 rows each = 66000 rows >= RAY_PARALLEL_THRESHOLD (65536).
+;; One extra row with null I32 key → par_set_null with I32 type in radix_phase3_fn.
+;; F64 key was covered already; I32 key forces write_col_i64 I32/DATE/TIME arm
+;; in radix_phase3_fn and grp_finalize_nulls(key_cols[k]) with I32 type at
+;; the emit phase (line 7611 group.c).
+(set LI32_keys (concat (as 'I32 (% (til 66000) 200)) (as 'I32 [0N])))
+(set LI32_vals (concat (as 'I64 (% (til 66000) 7)) [1]))
+(set TLI32 (table [k v] (list LI32_keys LI32_vals)))
+(set RLI32 (select {s: (sum v) c: (count v) from: TLI32 by: k}))
+;; 200 non-null groups + 1 null group = 201
+(count RLI32) -- 201
+;; Total sum of v = sum(% (til 66000) 7) + sum(% (til 72000) 7) [within 66000+1 rows]
+;; Verify result is non-trivial (count of the null-key group = 1)
+(sum (at RLI32 'c)) -- 66001
+
+;; DATE key: exercises par_finalize_nulls DATE arm (DATE is RAY_I32 width)
+;; 200 groups of DATE values 7305..7504, 330 rows each.
+(set LDATE_keys (concat (as 'DATE (+ 7305 (% (til 66000) 200))) (as 'DATE [0N])))
+(set LDATE_vals (as 'I64 (concat (til 66000) [1])))
+(set TLDATE (table [k v] (list LDATE_keys LDATE_vals)))
+(set RLDATE (select {s: (sum v) c: (count v) from: TLDATE by: k}))
+(count RLDATE) -- 201
+(sum (at RLDATE 'c)) -- 66001
+
+;; ======================================================================
+;; 11. Large parallel GROUP BY with I16 key — write_col_i64 I16 arm,
+;;     par_set_null I16 arm, par_finalize_nulls I16 branch.
+;; ======================================================================
+;; 200 groups, 330 rows each = 66000 rows, plus 1 null key row.
+(set LI16_keys (concat (as 'I16 (% (til 66000) 200)) (as 'I16 [0N])))
+(set LI16_vals (concat (as 'I64 (% (til 66000) 7)) [1]))
+(set TLI16 (table [k v] (list LI16_keys LI16_vals)))
+(set RLI16 (select {s: (sum v) c: (count v) from: TLI16 by: k}))
+;; 200 non-null groups + 1 null group = 201
+(count RLI16) -- 201
+(sum (at RLI16 'c)) -- 66001
+
+;; ======================================================================
+;; 12. read_col_i64 narrow-type branches via join.c
+;;     — I16 key column → read_col_i64 RAY_I16 arm
+;;     — U8 key column  → read_col_i64 default (RAY_U8) arm
+;; ======================================================================
+;; Inner join on I16 key: hash_row_keys → read_col_i64 with type=RAY_I16.
+;; Also exercises join_keys_eq → read_col_i64 with type=RAY_I16.
+(set JI16_L (table [k v] (list (as 'I16 [1 2 3 4 5]) [10 20 30 40 50])))
+(set JI16_R (table [k w] (list (as 'I16 [3 4 5 6 7]) [300 400 500 600 700])))
+(set JI16_result (inner-join [k] JI16_L JI16_R))
+;; Matching k values: 3, 4, 5 → 3 rows
+(count JI16_result) -- 3
+(sum (at JI16_result 'v)) -- 120
+
+;; Inner join on U8 key: hash_row_keys → read_col_i64 with type=RAY_U8 (default arm).
+(set JU8_L (table [k v] (list (as 'U8 [10 20 30 40 50]) [1 2 3 4 5])))
+(set JU8_R (table [k w] (list (as 'U8 [30 40 50 60 70]) [300 400 500 600 700])))
+(set JU8_result (inner-join [k] JU8_L JU8_R))
+;; Matching k values: 30, 40, 50 → 3 rows
+(count JU8_result) -- 3
+(sum (at JU8_result 'v)) -- 12
+
 ;; Teardown.
 (.sys.exec "rm -rf /tmp/rfl_int_cov_parted /tmp/rfl_int_cov_sym /tmp/rfl_int_cov_narrow.csv /tmp/rfl_int_cov_null /tmp/rfl_int_cov_null_str.csv /tmp/rfl_int_cov_null_seg /tmp/rfl_int_cov_65seg")

@@ -33,6 +33,8 @@
 #include "ops/glob.h"
 #include <string.h>
 #include <stdio.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 /* ---- Setup / Teardown -------------------------------------------------- */
 
@@ -1767,6 +1769,173 @@ static test_result_t test_sym_save_diverge_id(void) {
 }
 
 /* ══════════════════════════════════════════
+ * Lazy-load path coverage (sym.c lines 595-638, 248-254, 918-923, 974-975,
+ * 1334-1385)
+ * ══════════════════════════════════════════ */
+
+/* Helper: write a 64MB sparse STRL file with two entries: ["", "abc"].
+ * The file is sparse — only the first ~23 bytes and the last byte are
+ * written; the rest is a hole. mapped_size will be SYM_LAZY_LOAD_MIN_BYTES
+ * (64 MB), which triggers the lazy-load path in ray_sym_load.
+ *
+ * STRL layout used here:
+ *   [4B magic=0x4C525453][8B disk_count=2][4B slen=0][4B slen=3][3B "abc"]
+ */
+static bool write_lazy_strl_64mb(const char* path) {
+    FILE* f = fopen(path, "wb");
+    if (!f) return false;
+    /* STRL magic "STRL" (LE) */
+    static const uint8_t hdr[] = {
+        0x53, 0x54, 0x52, 0x4C,              /* magic */
+        0x02, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,              /* disk_count = 2 */
+        0x00, 0x00, 0x00, 0x00,              /* entry 0: slen=0 "" */
+        0x03, 0x00, 0x00, 0x00,              /* entry 1: slen=3 */
+        0x61, 0x62, 0x63                     /* "abc" */
+    };
+    if (fwrite(hdr, 1, sizeof(hdr), f) != sizeof(hdr)) { fclose(f); return false; }
+    /* Extend to 64MB so mapped_size >= SYM_LAZY_LOAD_MIN_BYTES */
+    long target = 64L * 1024L * 1024L - 1L;
+    if (fseek(f, target, SEEK_SET) != 0) { fclose(f); return false; }
+    uint8_t z = 0;
+    if (fwrite(&z, 1, 1, f) != 1) { fclose(f); return false; }
+    fclose(f);
+    return true;
+}
+
+/* ---- sym_lazy_load_basic ------------------------------------------------
+ * Exercises the lazy-load path in ray_sym_load (sym.c lines 1334-1384),
+ * sym_lazy_unmap_locked (lines 595-603), sym_lazy_materialize_to_locked
+ * (lines 605-637), ray_sym_str lazy-materialise path (lines 918-923),
+ * ray_sym_strings_borrow lazy path (lines 973-975), and on teardown the
+ * ray_sym_destroy lazy-unmap block (lines 248-254).
+ *
+ * Two loads are performed in the same test:
+ *   - First load sets g_sym.lazy_map; sym_lazy_unmap_locked takes its early
+ *     return (lazy_map was NULL before the call, line 596).
+ *   - ray_sym_str(1) triggers lazy materialisation of "abc" (else branch at
+ *     line 625 where strings[1] is NULL).
+ *   - ray_sym_strings_borrow calls sym_lazy_materialize_to_locked for an
+ *     already-materialised id, taking the fast-return path (line 608).
+ *   - Second load calls sym_lazy_unmap_locked with a non-NULL lazy_map,
+ *     executing the full unmap body (lines 597-603).
+ *   - sym_teardown's ray_sym_destroy() sees lazy_map != NULL, covering
+ *     lines 248-254.
+ * ----------------------------------------------------------------------- */
+static test_result_t test_sym_lazy_load_basic(void) {
+    /* skip if running as root: 64MB sparse files need a writable /tmp */
+    const char* path1 = "/tmp/test_sym_lazy1.sym";
+    const char* path2 = "/tmp/test_sym_lazy2.sym";
+    char lk1[4096], lk2[4096];
+    snprintf(lk1, sizeof(lk1), "%s.lk", path1);
+    snprintf(lk2, sizeof(lk2), "%s.lk", path2);
+    remove(path1); remove(lk1);
+    remove(path2); remove(lk2);
+
+    TEST_ASSERT_TRUE(write_lazy_strl_64mb(path1));
+    TEST_ASSERT_TRUE(write_lazy_strl_64mb(path2));
+
+    /* First load: sym_lazy_unmap_locked is called with lazy_map==NULL (early
+     * return at line 596), then lazy_map is set.  Materialises entry 0 ("")
+     * during validation; strings[1] stays NULL (lazy). */
+    ray_err_t err = ray_sym_load(path1);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+    TEST_ASSERT_EQ_U(ray_sym_count(), 2);
+
+    /* ray_sym_str(1): strings[1]==NULL and id < persisted_count → triggers
+     * sym_lazy_materialize_to_locked (lines 919, else branch at 625). */
+    ray_t* s = ray_sym_str(1);
+    TEST_ASSERT_NOT_NULL(s);
+    TEST_ASSERT_EQ_U(ray_str_len(s), 3);
+
+    /* ray_sym_strings_borrow: lazy_map!=NULL && persisted_count>0 → calls
+     * sym_lazy_materialize_to_locked(1) on an already-materialised sym,
+     * taking the fast-return path (line 608). */
+    ray_t** out_strings = NULL;
+    uint32_t out_count = 0;
+    ray_sym_strings_borrow(&out_strings, &out_count);
+    TEST_ASSERT(out_count >= 2, "sym table should have at least 2 entries");
+    TEST_ASSERT_NOT_NULL(out_strings);
+
+    /* Second load: sym_lazy_unmap_locked is called with lazy_map!=NULL,
+     * executing the full unmap body (lines 597-603). */
+    err = ray_sym_load(path2);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    /* Cleanup files; sym_teardown will call ray_sym_destroy() which covers
+     * the lazy-map block in ray_sym_destroy (lines 248-254). */
+    remove(path1); remove(lk1);
+    remove(path2); remove(lk2);
+    PASS();
+}
+
+/* ---- sym_save_unreadable_file -------------------------------------------
+ * sym_save_impl: when ray_col_load(path) fails AND ray_file_open(path, READ)
+ * also fails with errno != ENOENT (e.g. EACCES from a mode-000 file), the
+ * function returns RAY_ERR_IO (sym.c lines 1144-1147).
+ *
+ * Creates a file at path with mode 000, then calls ray_sym_save.
+ * Skipped when running as root (root can read mode-000 files).
+ * ----------------------------------------------------------------------- */
+static test_result_t test_sym_save_unreadable_file(void) {
+    if (geteuid() == 0) PASS(); /* root bypasses file permissions */
+
+    const char* path = "/tmp/test_sym_unreadable.sym";
+    char lk_path[4096];
+    snprintf(lk_path, sizeof(lk_path), "%s.lk", path);
+    remove(path); remove(lk_path);
+
+    /* Create a non-empty file at path with mode 000 so that ray_col_load
+     * fails and the subsequent probe open also fails with EACCES. */
+    FILE* f = fopen(path, "wb");
+    TEST_ASSERT_NOT_NULL(f);
+    fwrite("x", 1, 1, f);
+    fclose(f);
+    chmod(path, 0000);
+
+    /* persisted_count (0) != str_count (1) → save proceeds past early exit */
+    ray_err_t err = ray_sym_save(path);
+    TEST_ASSERT_EQ_I(err, RAY_ERR_IO);
+
+    chmod(path, 0644); /* restore so remove works */
+    remove(path); remove(lk_path);
+    PASS();
+}
+
+/* ---- sym_save_tmp_blocked -----------------------------------------------
+ * sym_save_impl: when ray_col_load(path) fails with ENOENT (file absent) and
+ * fopen(tmp_path, "wb") then fails (e.g. because {path}.tmp exists with mode
+ * 000), the function returns RAY_ERR_IO (sym.c lines 1172-1176).
+ *
+ * Skipped when running as root.
+ * ----------------------------------------------------------------------- */
+static test_result_t test_sym_save_tmp_blocked(void) {
+    if (geteuid() == 0) PASS(); /* root bypasses file permissions */
+
+    const char* path = "/tmp/test_sym_tmpblk.sym";
+    char tmp_path[4096], lk_path[4096];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+    snprintf(lk_path, sizeof(lk_path), "%s.lk", path);
+    remove(path); remove(tmp_path); remove(lk_path);
+
+    /* path itself does not exist (ENOENT → no probe error, falls through).
+     * Pre-create {path}.tmp with mode 000 so fopen("wb") fails. */
+    FILE* f = fopen(tmp_path, "wb");
+    TEST_ASSERT_NOT_NULL(f);
+    fwrite("x", 1, 1, f);
+    fclose(f);
+    chmod(tmp_path, 0000);
+
+    /* persisted_count (0) != str_count (1) → save proceeds */
+    ray_err_t err = ray_sym_save(path);
+    TEST_ASSERT_EQ_I(err, RAY_ERR_IO);
+
+    chmod(tmp_path, 0644); /* restore so remove works */
+    remove(path); remove(tmp_path); remove(lk_path);
+    PASS();
+}
+
+/* ══════════════════════════════════════════
  * ray_like_fn (src/ops/strop.c) coverage
  * ══════════════════════════════════════════ */
 
@@ -2536,6 +2705,11 @@ const test_entry_t sym_entries[] = {
     { "sym/save_bad_slot_type",          test_sym_save_bad_slot_type,       sym_setup, sym_teardown },
     { "sym/save_tmppath_overflow",      test_sym_save_tmppath_overflow,    sym_setup, sym_teardown },
     { "sym/save_diverge_id",            test_sym_save_diverge_id,          sym_setup, sym_teardown },
+
+    /* Lazy-load path + save error paths */
+    { "sym/lazy_load_basic",            test_sym_lazy_load_basic,          sym_setup, sym_teardown },
+    { "sym/save_unreadable_file",       test_sym_save_unreadable_file,     sym_setup, sym_teardown },
+    { "sym/save_tmp_blocked",           test_sym_save_tmp_blocked,         sym_setup, sym_teardown },
 
     /* ray_like_fn (src/ops/strop.c) — vector and sym-atom paths */
     { "sym/like_fn/bad_pattern_type",  test_like_fn_bad_pattern_type,    sym_setup, sym_teardown },
