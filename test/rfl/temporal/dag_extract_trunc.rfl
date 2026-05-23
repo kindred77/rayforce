@@ -213,3 +213,33 @@
 (at (at (select {s: ts.date from: TpreT3}) 's) 1)   -- 0Np
 (at (at (select {s: ts.time from: TpreT3}) 's) 0)   -- 1999.12.31D12:30:45.000000000
 (at (at (select {s: ts.time from: TpreT3}) 's) 1)   -- 0Np
+
+;; ──────────────── New trunc fields: .year .month .hour ─────────────────────
+;; Three new RFL bindings (ray_temporal_trunc_from_sym):
+;;   .year  → RAY_EXTRACT_YEAR  (DATE_TRUNC_INNER YEAR  case)
+;;   .month → RAY_EXTRACT_MONTH (DATE_TRUNC_INNER MONTH case)
+;;   .hour  → RAY_EXTRACT_HOUR  (DATE_TRUNC_INNER HOUR  case)
+;; Previously these `case` arms were unreachable from RFL — they sat as dead
+;; object code (4 macro instantiations × ~10 lines each).  Now live.
+;;
+;; "minute" intentionally NOT bound: collides with the extract resolver
+;; (`.minute` → RAY_EXTRACT_MINUTE int), which query.c tries first.
+(set TyearMH (table [ts] (list (as 'TIMESTAMP [2024.03.15D14:27:31.123456789 2024.07.04D09:15:30.500000000]))))
+
+;; .year — truncates to Jan 1 00:00:00 of the year.
+(at (at (select {y: ts.year from: TyearMH}) 'y) 0) -- 2024.01.01D00:00:00.000000000
+(at (at (select {y: ts.year from: TyearMH}) 'y) 1) -- 2024.01.01D00:00:00.000000000
+
+;; .month — truncates to the 1st of the month at 00:00:00.
+(at (at (select {m: ts.month from: TyearMH}) 'm) 0) -- 2024.03.01D00:00:00.000000000
+(at (at (select {m: ts.month from: TyearMH}) 'm) 1) -- 2024.07.01D00:00:00.000000000
+
+;; .hour — truncates to the start of the hour.
+(at (at (select {h: ts.hour from: TyearMH}) 'h) 0) -- 2024.03.15D14:00:00.000000000
+(at (at (select {h: ts.hour from: TyearMH}) 'h) 1) -- 2024.07.04D09:00:00.000000000
+
+;; HAS_NULLS path: null timestamp passes through as 0Np for all three.
+(set TyMHn (table [ts] (list (as 'TIMESTAMP [1710513451000000000 0N]))))
+(at (at (select {y: ts.year from: TyMHn}) 'y) 1)  -- 0Np
+(at (at (select {m: ts.month from: TyMHn}) 'm) 1) -- 0Np
+(at (at (select {h: ts.hour from: TyMHn}) 'h) 1)  -- 0Np
