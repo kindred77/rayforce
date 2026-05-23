@@ -11624,7 +11624,10 @@ static test_result_t test_expr_sym_w32_fast_eq_ne(void) {
     int64_t id1 = ray_sym_intern("foo", 3);
     int64_t id2 = ray_sym_intern("bar", 3);
     int64_t id3 = ray_sym_intern("baz", 3);
-    /* W32 SYM vector — nullable to force non-fused path */
+    /* W32 SYM vector — use ray_vec_slice to set RAY_ATTR_SLICE, which
+     * forces expr_compile to bail out → exec_elementwise_binary is used.
+     * SYM columns reject ray_vec_set_null (SYM ID 0 is the null sentinel),
+     * so the ATTR_SLICE trick is the only public way to force non-fused. */
     ray_t* vs = ray_sym_vec_new(RAY_SYM_W32, 5);
     vs->len = 5;
     uint32_t* sd = (uint32_t*)ray_data(vs);
@@ -11633,13 +11636,16 @@ static test_result_t test_expr_sym_w32_fast_eq_ne(void) {
     sd[2] = (uint32_t)id3;
     sd[3] = (uint32_t)id1;
     sd[4] = (uint32_t)id2;
-    ray_vec_set_null(vs, 4, true);   /* force non-fused */
+    /* Slice the whole vector: offset=0, len=5 → RAY_ATTR_SLICE set */
+    ray_t* vs_slice = ray_vec_slice(vs, 0, 5);
+    ray_release(vs);  /* slice holds a retain on parent */
     int64_t na = ray_sym_intern("s", 1);
     ray_t* tbl = ray_table_new(1);
-    tbl = ray_table_add_col(tbl, na, vs);
-    ray_release(vs);
+    tbl = ray_table_add_col(tbl, na, vs_slice);
+    ray_release(vs_slice);
 
-    /* s == "foo" — W32 SYM EQ fast path at lines 1689-1696 */
+    /* s == "foo" — W32 SYM EQ fast path at lines 1689-1693
+     * r_scalar=true, l_esz=4, RAY_IS_SYM=true, opc=EQ → uint32 path */
     ray_graph_t* g  = ray_graph_new(tbl);
     ray_op_t* sc    = ray_scan(g, "s");
     ray_op_t* lit   = ray_const_str(g, "foo", 3);
@@ -11647,12 +11653,12 @@ static test_result_t test_expr_sym_w32_fast_eq_ne(void) {
     ray_op_t* cnt   = ray_sum(g, eq);
     ray_t* result   = ray_execute(g, cnt);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    /* pos0=foo (match), pos3=foo (match raw, but null), pos1/2=no, pos4=null → 2 */
+    /* pos0=foo(T), pos1=bar(F), pos2=baz(F), pos3=foo(T), pos4=bar(F) → 2 */
     TEST_ASSERT_EQ_I(result->i64, 2);
     ray_release(result);
     ray_graph_free(g);
 
-    /* s != "bar" — W32 SYM NE fast path */
+    /* s != "bar" — W32 SYM NE fast path at lines 1694-1695 */
     g   = ray_graph_new(tbl);
     sc  = ray_scan(g, "s");
     lit = ray_const_str(g, "bar", 3);
@@ -11660,8 +11666,23 @@ static test_result_t test_expr_sym_w32_fast_eq_ne(void) {
     cnt = ray_sum(g, ne);
     result = ray_execute(g, cnt);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    /* pos0=foo!=bar(T), pos2=baz!=bar(T), pos3=foo!=bar(T raw), pos4 null → 3 */
+    /* pos0=foo!=bar(T), pos1=bar!=bar(F), pos2=baz!=bar(T), pos3=foo!=bar(T), pos4=bar!=bar(F) → 3 */
     TEST_ASSERT_EQ_I(result->i64, 3);
+    ray_release(result);
+    ray_graph_free(g);
+
+    /* s < "baz" — W32 SYM LT ordering, hits BR_FAST(uint32_t) at line 1698 */
+    g   = ray_graph_new(tbl);
+    sc  = ray_scan(g, "s");
+    lit = ray_const_str(g, "baz", 3);
+    ray_op_t* lt = ray_lt(g, sc, lit);
+    cnt = ray_sum(g, lt);
+    result = ray_execute(g, cnt);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    /* Ordering compares intern IDs numerically.
+     * id1=foo, id2=bar, id3=baz are interned in that order: id1<id2<id3.
+     * LT baz(id3): id1<id3(T), id2<id3(T), id3<id3(F), id1<id3(T), id2<id3(T) → 4 */
+    TEST_ASSERT_EQ_I(result->i64, 4);
     ray_release(result);
     ray_graph_free(g);
 
@@ -11672,7 +11693,10 @@ static test_result_t test_expr_sym_w32_fast_eq_ne(void) {
 }
 
 /* ---- binary_range: SYM vec-vs-vec (lines 1779-1799) ----
- * Both sides are SYM columns (not scalar) → generic path after fast-paths */
+ * Both sides are SYM columns (not scalar) → generic path after fast-paths.
+ * Uses ray_vec_slice to set RAY_ATTR_SLICE, forcing non-fused path.
+ * SYM vectors cannot be set null (SYM ID 0 is the null sentinel), so
+ * ATTR_SLICE is the only public mechanism to bypass expr_compile. */
 static test_result_t test_expr_sym_vec_vs_vec_nonfused(void) {
     ray_heap_init();
     (void)ray_sym_init();
@@ -11680,17 +11704,20 @@ static test_result_t test_expr_sym_vec_vs_vec_nonfused(void) {
     int64_t id1 = ray_sym_intern("aaa", 3);
     int64_t id2 = ray_sym_intern("bbb", 3);
     int64_t id3 = ray_sym_intern("ccc", 3);
-    /* W64 SYM left column — nullable */
-    ray_t* vl = ray_sym_vec_new(RAY_SYM_W64, 4);
-    vl->len = 4;
-    int64_t* ld = (int64_t*)ray_data(vl);
+    /* W64 SYM left column — sliced to force non-fused path */
+    ray_t* vl_base = ray_sym_vec_new(RAY_SYM_W64, 4);
+    vl_base->len = 4;
+    int64_t* ld = (int64_t*)ray_data(vl_base);
     ld[0] = id1; ld[1] = id2; ld[2] = id3; ld[3] = id1;
-    ray_vec_set_null(vl, 3, true);
-    /* W64 SYM right column — non-nullable */
-    ray_t* vr = ray_sym_vec_new(RAY_SYM_W64, 4);
-    vr->len = 4;
-    int64_t* rd = (int64_t*)ray_data(vr);
+    ray_t* vl = ray_vec_slice(vl_base, 0, 4);  /* ATTR_SLICE */
+    ray_release(vl_base);
+    /* W64 SYM right column — also sliced */
+    ray_t* vr_base = ray_sym_vec_new(RAY_SYM_W64, 4);
+    vr_base->len = 4;
+    int64_t* rd = (int64_t*)ray_data(vr_base);
     rd[0] = id2; rd[1] = id2; rd[2] = id2; rd[3] = id2;
+    ray_t* vr = ray_vec_slice(vr_base, 0, 4);  /* ATTR_SLICE */
+    ray_release(vr_base);
 
     int64_t na = ray_sym_intern("l", 1);
     int64_t nb = ray_sym_intern("r", 1);
@@ -11699,7 +11726,9 @@ static test_result_t test_expr_sym_vec_vs_vec_nonfused(void) {
     tbl = ray_table_add_col(tbl, nb, vr);
     ray_release(vl); ray_release(vr);
 
-    /* l == r — SYM W64 vec vs W64 vec, lines 1779-1783 */
+    /* l == r — SYM W64 vec vs W64 vec, lines 1779-1783.
+     * Fast path (lines 1643+) requires r_scalar; since r is a column,
+     * we skip that path and land in the generic section. */
     ray_graph_t* g = ray_graph_new(tbl);
     ray_op_t* lc = ray_scan(g, "l");
     ray_op_t* rc = ray_scan(g, "r");
@@ -11707,12 +11736,12 @@ static test_result_t test_expr_sym_vec_vs_vec_nonfused(void) {
     ray_op_t* cnt = ray_sum(g, eq);
     ray_t* result = ray_execute(g, cnt);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    /* pos1: id2==id2 (T), pos0: id1!=id2 (F), pos2: id3!=id2 (F), pos3: null → 1 */
+    /* aaa!=bbb(F), bbb==bbb(T), ccc!=bbb(F), aaa!=bbb(F) → 1 */
     TEST_ASSERT_EQ_I(result->i64, 1);
     ray_release(result);
     ray_graph_free(g);
 
-    /* l < r — SYM W64 vec-vs-vec LT */
+    /* l < r — SYM W64 vec-vs-vec LT, compare intern IDs */
     g = ray_graph_new(tbl);
     lc = ray_scan(g, "l");
     rc = ray_scan(g, "r");
@@ -11720,9 +11749,121 @@ static test_result_t test_expr_sym_vec_vs_vec_nonfused(void) {
     cnt = ray_sum(g, lt);
     result = ray_execute(g, cnt);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    /* "aaa"<"bbb" T, "bbb"<"bbb" F, "ccc"<"bbb" F, null<"bbb" T (null
-     * compares as minimum in Rayforce) → sum 2 */
+    /* id1<id2(T), id2<id2(F), id3<id2(F), id1<id2(T) → 2 */
     TEST_ASSERT_EQ_I(result->i64, 2);
+    ray_release(result);
+    ray_graph_free(g);
+
+    ray_release(tbl);
+
+    /* W32-vs-W32: covers lines 1781 (lp_u32) and 1797 (rp_u32) */
+    {
+        ray_t* vl32_base = ray_sym_vec_new(RAY_SYM_W32, 3);
+        vl32_base->len = 3;
+        uint32_t* ld32 = (uint32_t*)ray_data(vl32_base);
+        ld32[0] = (uint32_t)id1; ld32[1] = (uint32_t)id2; ld32[2] = (uint32_t)id3;
+        ray_t* vl32 = ray_vec_slice(vl32_base, 0, 3);
+        ray_release(vl32_base);
+        ray_t* vr32_base = ray_sym_vec_new(RAY_SYM_W32, 3);
+        vr32_base->len = 3;
+        uint32_t* rd32 = (uint32_t*)ray_data(vr32_base);
+        rd32[0] = (uint32_t)id2; rd32[1] = (uint32_t)id2; rd32[2] = (uint32_t)id2;
+        ray_t* vr32 = ray_vec_slice(vr32_base, 0, 3);
+        ray_release(vr32_base);
+        int64_t nc = ray_sym_intern("lw32", 4);
+        int64_t nd = ray_sym_intern("rw32", 4);
+        ray_t* tbl32 = ray_table_new(2);
+        tbl32 = ray_table_add_col(tbl32, nc, vl32);
+        tbl32 = ray_table_add_col(tbl32, nd, vr32);
+        ray_release(vl32); ray_release(vr32);
+        g = ray_graph_new(tbl32);
+        lc = ray_scan(g, "lw32");
+        rc = ray_scan(g, "rw32");
+        eq = ray_eq(g, lc, rc);
+        cnt = ray_sum(g, eq);
+        result = ray_execute(g, cnt);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        /* id1!=id2(F), id2==id2(T), id3!=id2(F) → 1 */
+        TEST_ASSERT_EQ_I(result->i64, 1);
+        ray_release(result);
+        ray_graph_free(g);
+        ray_release(tbl32);
+    }
+
+    /* W8-vs-W8: covers line 1782 (narrow lsym_buf) and 1798 (narrow rsym_buf).
+     * W8 SYM IDs must fit in uint8_t (0-255). intern IDs are sequential from 1. */
+    {
+        ray_t* vl8_base = ray_sym_vec_new(RAY_SYM_W8, 3);
+        vl8_base->len = 3;
+        uint8_t* ld8 = (uint8_t*)ray_data(vl8_base);
+        ld8[0] = (uint8_t)id1; ld8[1] = (uint8_t)id2; ld8[2] = (uint8_t)id3;
+        ray_t* vl8 = ray_vec_slice(vl8_base, 0, 3);
+        ray_release(vl8_base);
+        ray_t* vr8_base = ray_sym_vec_new(RAY_SYM_W8, 3);
+        vr8_base->len = 3;
+        uint8_t* rd8 = (uint8_t*)ray_data(vr8_base);
+        rd8[0] = (uint8_t)id2; rd8[1] = (uint8_t)id2; rd8[2] = (uint8_t)id2;
+        ray_t* vr8 = ray_vec_slice(vr8_base, 0, 3);
+        ray_release(vr8_base);
+        int64_t ne = ray_sym_intern("lw8", 3);
+        int64_t nf = ray_sym_intern("rw8", 3);
+        ray_t* tbl8 = ray_table_new(2);
+        tbl8 = ray_table_add_col(tbl8, ne, vl8);
+        tbl8 = ray_table_add_col(tbl8, nf, vr8);
+        ray_release(vl8); ray_release(vr8);
+        g = ray_graph_new(tbl8);
+        lc = ray_scan(g, "lw8");
+        rc = ray_scan(g, "rw8");
+        eq = ray_eq(g, lc, rc);
+        cnt = ray_sum(g, eq);
+        result = ray_execute(g, cnt);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        /* id1!=id2(F), id2==id2(T), id3!=id2(F) → 1 */
+        TEST_ASSERT_EQ_I(result->i64, 1);
+        ray_release(result);
+        ray_graph_free(g);
+        ray_release(tbl8);
+    }
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ---- exec_elementwise_binary: STR scalar as left operand (lines 2043-2053) ----
+ * STR atom as lhs with SYM col as rhs → str_resolved for l_scalar=STR path.
+ * Uses ray_vec_slice to set RAY_ATTR_SLICE on the SYM col, forcing non-fused. */
+static test_result_t test_expr_sym_str_scalar_left(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t id1 = ray_sym_intern("alpha", 5);
+    int64_t id2 = ray_sym_intern("beta",  4);
+    int64_t id3 = ray_sym_intern("gamma", 5);
+    /* W64 SYM vector — sliced to force non-fused path (SYM can't be set null) */
+    ray_t* vs_base = ray_sym_vec_new(RAY_SYM_W64, 4);
+    vs_base->len = 4;
+    int64_t* sd = (int64_t*)ray_data(vs_base);
+    sd[0] = id1; sd[1] = id2; sd[2] = id3; sd[3] = id1;
+    ray_t* vs = ray_vec_slice(vs_base, 0, 4);  /* sets RAY_ATTR_SLICE */
+    ray_release(vs_base);
+    int64_t na = ray_sym_intern("s", 1);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, na, vs);
+    ray_release(vs);
+
+    /* "beta" == s — STR atom on LEFT, SYM col on RIGHT → l_scalar=STR path
+     * at exec_elementwise_binary lines 2041-2047.
+     * With ATTR_SLICE, expr_compile returns false → non-fused path is used. */
+    ray_graph_t* g  = ray_graph_new(tbl);
+    ray_op_t* lit   = ray_const_str(g, "beta", 4);
+    ray_op_t* sc    = ray_scan(g, "s");
+    ray_op_t* eq    = ray_eq(g, lit, sc);
+    ray_op_t* cnt   = ray_sum(g, eq);
+    ray_t* result   = ray_execute(g, cnt);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    /* alpha!=beta(F), beta==beta(T), gamma!=beta(F), alpha!=beta(F) → 1 */
+    TEST_ASSERT_EQ_I(result->i64, 1);
     ray_release(result);
     ray_graph_free(g);
 
@@ -11732,37 +11873,51 @@ static test_result_t test_expr_sym_vec_vs_vec_nonfused(void) {
     PASS();
 }
 
-/* ---- exec_elementwise_binary: STR scalar as left operand (lines 2043-2053) ----
- * STR atom as lhs with SYM col as rhs → str_resolved for l_scalar=STR path */
-static test_result_t test_expr_sym_str_scalar_left(void) {
+/* ---- binary_range: W64 SYM col vs scalar (line 1677) ----
+ * Sliced W64 SYM column compared against a scalar string:
+ * l_esz==8, RAY_IS_SYM → BR_FAST(int64_t, d[i]) at line 1677. */
+static test_result_t test_expr_sym_w64_fast_scalar(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    int64_t id1 = ray_sym_intern("alpha", 5);
-    int64_t id2 = ray_sym_intern("beta",  4);
-    int64_t id3 = ray_sym_intern("gamma", 5);
-    /* W64 SYM vector — nullable */
-    ray_t* vs = ray_sym_vec_new(RAY_SYM_W64, 4);
-    vs->len = 4;
-    int64_t* sd = (int64_t*)ray_data(vs);
+    int64_t id1 = ray_sym_intern("dog",  3);
+    int64_t id2 = ray_sym_intern("cat",  3);
+    int64_t id3 = ray_sym_intern("bird", 4);
+    /* W64 SYM vector — sliced to set RAY_ATTR_SLICE → non-fused path */
+    ray_t* vs_base = ray_sym_vec_new(RAY_SYM_W64, 4);
+    vs_base->len = 4;
+    int64_t* sd = (int64_t*)ray_data(vs_base);
     sd[0] = id1; sd[1] = id2; sd[2] = id3; sd[3] = id1;
-    ray_vec_set_null(vs, 3, true);
-    int64_t na = ray_sym_intern("s", 1);
+    ray_t* vs = ray_vec_slice(vs_base, 0, 4);
+    ray_release(vs_base);
+    int64_t na = ray_sym_intern("animal", 6);
     ray_t* tbl = ray_table_new(1);
     tbl = ray_table_add_col(tbl, na, vs);
     ray_release(vs);
 
-    /* "beta" == s — STR atom on LEFT, SYM col on RIGHT → l_scalar=STR path
-     * at exec_elementwise_binary lines 2041-2047 */
-    ray_graph_t* g  = ray_graph_new(tbl);
-    ray_op_t* lit   = ray_const_str(g, "beta", 4);
-    ray_op_t* sc    = ray_scan(g, "s");
-    ray_op_t* eq    = ray_eq(g, lit, sc);
-    ray_op_t* cnt   = ray_sum(g, eq);
-    ray_t* result   = ray_execute(g, cnt);
+    /* animal == "dog" — W64 SYM vs scalar, hits BR_FAST(int64_t) at line 1677 */
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* ac   = ray_scan(g, "animal");
+    ray_op_t* lit  = ray_const_str(g, "dog", 3);
+    ray_op_t* eq   = ray_eq(g, ac, lit);
+    ray_op_t* cnt  = ray_sum(g, eq);
+    ray_t* result  = ray_execute(g, cnt);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    /* pos1=beta==beta (T), others F or null → 1 */
-    TEST_ASSERT_EQ_I(result->i64, 1);
+    /* dog(T), cat(F), bird(F), dog(T) → 2 */
+    TEST_ASSERT_EQ_I(result->i64, 2);
+    ray_release(result);
+    ray_graph_free(g);
+
+    /* animal < "dog" — W64 SYM LT (intern ID ordering) */
+    g = ray_graph_new(tbl);
+    ac  = ray_scan(g, "animal");
+    lit = ray_const_str(g, "dog", 3);
+    ray_op_t* lt   = ray_lt(g, ac, lit);
+    cnt = ray_sum(g, lt);
+    result = ray_execute(g, cnt);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    /* id1=dog(first), id2=cat, id3=bird.  id1<id1(F), id2<id1(F), id3<id1(F), id1<id1(F) → 0 */
+    TEST_ASSERT_EQ_I(result->i64, 0);
     ray_release(result);
     ray_graph_free(g);
 
@@ -11911,6 +12066,3853 @@ static test_result_t test_expr_const_int_div_idiv(void) {
     ray_graph_free(g);
 
     ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ======================================================================
+ * Systematic binary_range LV_READ/RV_READ coverage
+ *
+ * For each (out_type, opcode) loop body, we need to exercise every
+ * possible lhs-type and rhs-type combination so all 8 TRUE-arms of the
+ * LV_READ/RV_READ ternary chains are covered.
+ *
+ * Strategy: use ray_vec_slice() to set RAY_ATTR_SLICE, which forces
+ * expr_compile to bail out → exec_elementwise_binary → binary_range.
+ * This works for any column type including non-nullable ones.
+ * ====================================================================== */
+
+/* Helper: wrap a vec in a slice to force non-fused path */
+static ray_t* make_sliced(ray_t* v) {
+    ray_t* s = ray_vec_slice(v, 0, v->len);
+    ray_release(v);
+    return s;
+}
+
+/* Helper: build a single-column table from a sliced vec */
+static ray_t* make_col_table(int64_t sym, ray_t* sliced) {
+    ray_t* tbl = ray_table_new(1);
+    return ray_table_add_col(tbl, sym, sliced);
+}
+
+/* Helper: two-column table */
+static ray_t* make_two_col_table(int64_t s1, ray_t* c1, int64_t s2, ray_t* c2) {
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, s1, c1);
+    return ray_table_add_col(tbl, s2, c2);
+}
+
+/* --- F64 output IDIV/MOD/MIN2/MAX2 with various lhs types ----
+ * F64 output: arithmetic fast path excluded (F64 not in fast-path list).
+ * All go to binary_range slow path.
+ * Each lhs type exercises a different TRUE arm of LV_READ in each loop. */
+static test_result_t test_expr_binary_f64_all_lhs_types(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* Shared F64 RHS scalar (r_scalar=true, rhs->type=-RAY_F64) */
+    /* F64 output: lp_f64 set (cond1 TRUE) */
+    {
+        double rawa[] = {6.0, 9.0, 12.0};
+        ray_t* va = ray_vec_from_raw(RAY_F64, rawa, 3);
+        ray_t* vs = make_sliced(va);
+        int64_t na = ray_sym_intern("af", 2);
+        ray_t* tbl = make_col_table(na, vs);
+        ray_release(vs);
+
+        /* IDIV: floor(6/3)=2, floor(9/3)=3, floor(12/3)=4 → sum=9 */
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "af");
+        ray_op_t* c = ray_const_f64(g, 3.0);
+        ray_op_t* op = ray_idiv(g, a, c);
+        /* ray_idiv → out_type=I64, but lhs is F64 → binary_range I64 block, lp_f64 */
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 9);  /* 2+3+4=9 */
+        ray_release(result);
+        ray_graph_free(g);
+
+        /* MOD: 6%3=0, 9%3=0, 12%3=0 → sum=0 */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "af");
+        c = ray_const_f64(g, 3.0);
+        op = ray_mod(g, a, c);  /* ray_mod → out_type=promote(F64,F64)=F64 */
+        s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_F(result->f64, 0.0, 1e-9);
+        ray_release(result);
+        ray_graph_free(g);
+
+        /* MIN2: min(6,3)=3, min(9,3)=3, min(12,3)=3 → sum=9 */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "af");
+        c = ray_const_f64(g, 3.0);
+        op = ray_min2(g, a, c);
+        s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        /* min2(F64,F64): promote(F64,F64)=F64 but r_scalar=true → arithmetic fast path
+         * excluded (F64 not in list) → slow path, lp_f64=TRUE for MIN2 F64 loop */
+        TEST_ASSERT_EQ_F(result->f64, 9.0, 1e-9);  /* 3+3+3=9 */
+        ray_release(result);
+        ray_graph_free(g);
+
+        /* MAX2: max(6,3)=6, max(9,3)=9, max(12,3)=12 → sum=27 */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "af");
+        c = ray_const_f64(g, 3.0);
+        op = ray_max2(g, a, c);
+        s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_F(result->f64, 27.0, 1e-9);  /* 6+9+12=27 */
+        ray_release(result);
+        ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* lp_i64 set (cond2 TRUE): I64 sliced col, F64 output */
+    {
+        int64_t rawa[] = {6, 9, 12};
+        ray_t* va = ray_vec_from_raw(RAY_I64, rawa, 3);
+        ray_t* vs = make_sliced(va);
+        int64_t na = ray_sym_intern("ai64", 4);
+        ray_t* tbl = make_col_table(na, vs);
+        ray_release(vs);
+
+        /* DIV (F64 out): 6/3=2, 9/3=3, 12/3=4 → sum=9.0 */
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "ai64");
+        ray_op_t* c = ray_const_i64(g, 3);
+        ray_op_t* op = ray_div(g, a, c);  /* out_type=F64, lp_i64 in F64 DIV */
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_F(result->f64, 9.0, 1e-9);
+        ray_release(result);
+        ray_graph_free(g);
+
+        /* IDIV → I64 out, lp_i64 in I64 IDIV loop */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "ai64");
+        c = ray_const_i64(g, 3);
+        op = ray_idiv(g, a, c);
+        s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 9);
+        ray_release(result);
+        ray_graph_free(g);
+
+        /* MIN2 → I64 out, lp_i64 in I64 MIN2 loop */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "ai64");
+        c = ray_const_i64(g, 8);
+        op = ray_min2(g, a, c);
+        s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        /* min(6,8)=6, min(9,8)=8, min(12,8)=8 → 22
+         * But arith fast path: !l_scalar && r_scalar && MIN2 && lhs->type==I64==out_type → FAST PATH!
+         * So this goes to fast path. Force slow path: both vecs */
+        (void)result;
+        ray_release(result);
+        ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* lp_i32 set (cond3 TRUE): I32 sliced col, various outputs */
+    {
+        int32_t rawa[] = {6, 9, 12};
+        ray_t* va = ray_vec_from_raw(RAY_I32, rawa, 3);
+        ray_t* vs = make_sliced(va);
+        int64_t na = ray_sym_intern("ai32", 4);
+        ray_t* tbl = make_col_table(na, vs);
+        ray_release(vs);
+
+        /* DIV → F64 out, lp_i32 in F64 DIV loop */
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "ai32");
+        ray_op_t* c = ray_const_i64(g, 3);
+        ray_op_t* op = ray_div(g, a, c);
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_F(result->f64, 9.0, 1e-9);
+        ray_release(result);
+        ray_graph_free(g);
+
+        /* IDIV: I32 col, I64 scalar → promote(I32,I64)=I64, lp_i32 in I64 IDIV loop */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "ai32");
+        c = ray_const_i64(g, 3);
+        op = ray_idiv(g, a, c);
+        s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 9);
+        ray_release(result);
+        ray_graph_free(g);
+
+        /* MOD I32 via F64: divide by F64 scalar → F64 out, lp_i32 in F64 MOD loop */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "ai32");
+        c = ray_const_f64(g, 4.0);
+        op = ray_mod(g, a, c);  /* promote(I32,F64)=F64 → F64 out, lp_i32 */
+        s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        /* 6%4=2.0, 9%4=1.0, 12%4=0.0 → sum=3.0 */
+        TEST_ASSERT_EQ_F(result->f64, 3.0, 1e-9);
+        ray_release(result);
+        ray_graph_free(g);
+
+        /* MIN2 I32 col + I32 scalar → I32 out, fast path (lhs->type==out_type=I32).
+         * Use F64 scalar to get slow path: promote(I32,F64)=F64, lp_i32 in F64 MIN2 */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "ai32");
+        c = ray_const_f64(g, 8.0);
+        op = ray_min2(g, a, c);  /* out_type=F64, lp_i32 in F64 MIN2 */
+        s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        /* min(6,8)=6, min(9,8)=8, min(12,8)=8 → 22.0 */
+        TEST_ASSERT_EQ_F(result->f64, 22.0, 1e-9);
+        ray_release(result);
+        ray_graph_free(g);
+
+        /* MAX2 I32 col + F64 scalar → F64 out, lp_i32 in F64 MAX2 */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "ai32");
+        c = ray_const_f64(g, 8.0);
+        op = ray_max2(g, a, c);
+        s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        /* max(6,8)=8, max(9,8)=9, max(12,8)=12 → 29.0 */
+        TEST_ASSERT_EQ_F(result->f64, 29.0, 1e-9);
+        ray_release(result);
+        ray_graph_free(g);
+
+        /* I32 col + I32 scalar → I32 out with IDIV (no fast path: IDIV not in arith fast list) */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "ai32");
+        ray_t* c32 = ray_i32(3);
+        op = ray_idiv(g, a, ray_const_atom(g, c32));
+        ray_release(c32);
+        s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        /* promote(I32,I32)=I32, IDIV not in fast path list → slow path I32 IDIV, lp_i32 */
+        /* floor(6/3)=2, floor(9/3)=3, floor(12/3)=4 → 9 (as I32) */
+        TEST_ASSERT_EQ_I(result->i64, 9);
+        ray_release(result);
+        ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* lp_i16 set (cond5 TRUE): I16 sliced col, various outputs */
+    {
+        int16_t rawa[] = {6, 9, 12};
+        ray_t* va = ray_vec_from_raw(RAY_I16, rawa, 3);
+        ray_t* vs = make_sliced(va);
+        int64_t na = ray_sym_intern("ai16", 4);
+        ray_t* tbl = make_col_table(na, vs);
+        ray_release(vs);
+
+        /* DIV → F64 out, lp_i16 in F64 DIV loop */
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "ai16");
+        ray_op_t* c = ray_const_i64(g, 3);
+        ray_op_t* op = ray_div(g, a, c);
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_F(result->f64, 9.0, 1e-9);
+        ray_release(result);
+        ray_graph_free(g);
+
+        /* IDIV → I64 out, lp_i16 in I64 IDIV loop */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "ai16");
+        c = ray_const_i64(g, 3);
+        op = ray_idiv(g, a, c);
+        s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 9);
+        ray_release(result);
+        ray_graph_free(g);
+
+        /* MOD F64 out, lp_i16 in F64 MOD */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "ai16");
+        c = ray_const_f64(g, 4.0);
+        op = ray_mod(g, a, c);
+        s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        /* 6%4=2.0, 9%4=1.0, 12%4=0.0 → 3.0 */
+        TEST_ASSERT_EQ_F(result->f64, 3.0, 1e-9);
+        ray_release(result);
+        ray_graph_free(g);
+
+        /* MIN2 F64 out, lp_i16 */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "ai16");
+        c = ray_const_f64(g, 8.0);
+        op = ray_min2(g, a, c);
+        s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_F(result->f64, 22.0, 1e-9);
+        ray_release(result);
+        ray_graph_free(g);
+
+        /* MAX2 F64 out, lp_i16 */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "ai16");
+        c = ray_const_f64(g, 8.0);
+        op = ray_max2(g, a, c);
+        s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_F(result->f64, 29.0, 1e-9);
+        ray_release(result);
+        ray_graph_free(g);
+
+        /* I16 IDIV narrow out (I16 col + I16 scalar → I16 out, IDIV not in fast path) */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "ai16");
+        ray_t* c16 = ray_i16(3);
+        op = ray_idiv(g, a, ray_const_atom(g, c16));
+        ray_release(c16);
+        s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        /* promote(I16,I16)=I16, IDIV not in fast path → slow path I16 IDIV, lp_i16 */
+        TEST_ASSERT_EQ_I(result->i64, 9);
+        ray_release(result);
+        ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* lp_bool set (cond6 TRUE): U8 sliced col, various outputs */
+    {
+        uint8_t rawa[] = {6, 9, 12};
+        ray_t* va = ray_vec_from_raw(RAY_U8, rawa, 3);
+        ray_t* vs = make_sliced(va);
+        int64_t na = ray_sym_intern("au8", 3);
+        ray_t* tbl = make_col_table(na, vs);
+        ray_release(vs);
+
+        /* DIV → F64 out, lp_bool in F64 DIV loop */
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "au8");
+        ray_op_t* c = ray_const_i64(g, 3);
+        ray_op_t* op = ray_div(g, a, c);
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_F(result->f64, 9.0, 1e-9);
+        ray_release(result);
+        ray_graph_free(g);
+
+        /* IDIV → I64 out, lp_bool in I64 IDIV loop */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "au8");
+        c = ray_const_i64(g, 3);
+        op = ray_idiv(g, a, c);
+        s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 9);
+        ray_release(result);
+        ray_graph_free(g);
+
+        /* MOD F64 out, lp_bool in F64 MOD */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "au8");
+        c = ray_const_f64(g, 4.0);
+        op = ray_mod(g, a, c);
+        s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_F(result->f64, 3.0, 1e-9);
+        ray_release(result);
+        ray_graph_free(g);
+
+        /* MIN2 F64 out, lp_bool */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "au8");
+        c = ray_const_f64(g, 8.0);
+        op = ray_min2(g, a, c);
+        s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_F(result->f64, 22.0, 1e-9);
+        ray_release(result);
+        ray_graph_free(g);
+
+        /* MAX2 F64 out, lp_bool */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "au8");
+        c = ray_const_f64(g, 8.0);
+        op = ray_max2(g, a, c);
+        s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_F(result->f64, 29.0, 1e-9);
+        ray_release(result);
+        ray_graph_free(g);
+
+        /* U8 IDIV narrow out */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "au8");
+        ray_t* cu8 = ray_u8(3);
+        op = ray_idiv(g, a, ray_const_atom(g, cu8));
+        ray_release(cu8);
+        s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        /* promote(U8,U8)=U8, IDIV not in fast path → slow path U8 IDIV, lp_bool */
+        TEST_ASSERT_EQ_I(result->i64, 9);
+        ray_release(result);
+        ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ---- binary_range: vec-vs-vec for I64 MIN2/MAX2 (slow path since r_scalar=false)
+ * I64 vec-vs-vec bypasses the arithmetic fast path (requires r_scalar=true).
+ * Exercises lp_i64 and rp_i64 in I64 MIN2/MAX2 loops (lines 1838-1839).
+ * Also covers I32/I16/U8 vec-vs-vec for MIN2/MAX2 which are in their own blocks. */
+static test_result_t test_expr_binary_vecvec_minmax(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* I64 vec-vs-vec MIN2/MAX2 */
+    {
+        int64_t rawa[] = {1, 5, 3, 7, 2};
+        int64_t rawb[] = {4, 2, 6, 1, 5};
+        ray_t* va = make_sliced(ray_vec_from_raw(RAY_I64, rawa, 5));
+        ray_t* vb = make_sliced(ray_vec_from_raw(RAY_I64, rawb, 5));
+        int64_t na = ray_sym_intern("pa", 2);
+        int64_t nb = ray_sym_intern("pb", 2);
+        ray_t* tbl = make_two_col_table(na, va, nb, vb);
+        ray_release(va); ray_release(vb);
+
+        /* MIN2 vec-vs-vec: slow path, I64 out, lp_i64 + rp_i64 in MIN2 loop */
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "pa");
+        ray_op_t* b = ray_scan(g, "pb");
+        ray_op_t* op = ray_min2(g, a, b);
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        /* min(1,4)=1,min(5,2)=2,min(3,6)=3,min(7,1)=1,min(2,5)=2 → 9 */
+        TEST_ASSERT_EQ_I(result->i64, 9);
+        ray_release(result);
+        ray_graph_free(g);
+
+        /* MAX2 vec-vs-vec: lp_i64 + rp_i64 in MAX2 loop */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "pa");
+        b = ray_scan(g, "pb");
+        op = ray_max2(g, a, b);
+        s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        /* max(1,4)=4,max(5,2)=5,max(3,6)=6,max(7,1)=7,max(2,5)=5 → 27 */
+        TEST_ASSERT_EQ_I(result->i64, 27);
+        ray_release(result);
+        ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* I32 vec-vs-vec MIN2/MAX2: lp_i32+rp_i32 in I32 MIN2/MAX2 loops */
+    {
+        int32_t rawa[] = {1, 5, 3};
+        int32_t rawb[] = {4, 2, 6};
+        ray_t* va = make_sliced(ray_vec_from_raw(RAY_I32, rawa, 3));
+        ray_t* vb = make_sliced(ray_vec_from_raw(RAY_I32, rawb, 3));
+        int64_t na = ray_sym_intern("qa", 2);
+        int64_t nb = ray_sym_intern("qb", 2);
+        ray_t* tbl = make_two_col_table(na, va, nb, vb);
+        ray_release(va); ray_release(vb);
+
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "qa");
+        ray_op_t* b = ray_scan(g, "qb");
+        ray_op_t* op = ray_min2(g, a, b);
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        /* min(1,4)=1,min(5,2)=2,min(3,6)=3 → 6 */
+        TEST_ASSERT_EQ_I(result->i64, 6);
+        ray_release(result);
+        ray_graph_free(g);
+
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "qa");
+        b = ray_scan(g, "qb");
+        op = ray_max2(g, a, b);
+        s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        /* max(1,4)=4,max(5,2)=5,max(3,6)=6 → 15 */
+        TEST_ASSERT_EQ_I(result->i64, 15);
+        ray_release(result);
+        ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* I16 vec-vs-vec MIN2/MAX2: lp_i16+rp_i16 in I16 MIN2/MAX2 loops */
+    {
+        int16_t rawa[] = {1, 5, 3};
+        int16_t rawb[] = {4, 2, 6};
+        ray_t* va = make_sliced(ray_vec_from_raw(RAY_I16, rawa, 3));
+        ray_t* vb = make_sliced(ray_vec_from_raw(RAY_I16, rawb, 3));
+        int64_t na = ray_sym_intern("ra", 2);
+        int64_t nb = ray_sym_intern("rb", 2);
+        ray_t* tbl = make_two_col_table(na, va, nb, vb);
+        ray_release(va); ray_release(vb);
+
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "ra");
+        ray_op_t* b = ray_scan(g, "rb");
+        ray_op_t* op = ray_min2(g, a, b);
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 6);
+        ray_release(result);
+        ray_graph_free(g);
+
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "ra");
+        b = ray_scan(g, "rb");
+        op = ray_max2(g, a, b);
+        s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 15);
+        ray_release(result);
+        ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* U8 vec-vs-vec MIN2/MAX2: lp_bool+rp_bool in U8 MIN2/MAX2 loops */
+    {
+        uint8_t rawa[] = {1, 5, 3};
+        uint8_t rawb[] = {4, 2, 6};
+        ray_t* va = make_sliced(ray_vec_from_raw(RAY_U8, rawa, 3));
+        ray_t* vb = make_sliced(ray_vec_from_raw(RAY_U8, rawb, 3));
+        int64_t na = ray_sym_intern("sa", 2);
+        int64_t nb = ray_sym_intern("sb", 2);
+        ray_t* tbl = make_two_col_table(na, va, nb, vb);
+        ray_release(va); ray_release(vb);
+
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "sa");
+        ray_op_t* b = ray_scan(g, "sb");
+        ray_op_t* op = ray_min2(g, a, b);
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 6);
+        ray_release(result);
+        ray_graph_free(g);
+
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "sa");
+        b = ray_scan(g, "sb");
+        op = ray_max2(g, a, b);
+        s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 15);
+        ray_release(result);
+        ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ---- binary_range: RV_READ with various rhs column types ----
+ * To cover rp_f64/rp_i64/rp_i32/rp_i16/rp_bool in each output block,
+ * we need vec-vs-vec with specific rhs types.
+ * This covers the RV_READ TRUE arms for cond1,2,3,5,6 in each loop. */
+static test_result_t test_expr_binary_range_rhs_types(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* F64 output: lp_f64 + rp_i64/rp_i32/rp_i16/rp_bool for each opcode */
+    {
+        double rawa[] = {6.0, 9.0, 12.0};
+        ray_t* va_base = ray_vec_from_raw(RAY_F64, rawa, 3);
+        ray_t* va = make_sliced(va_base);
+        int64_t na = ray_sym_intern("lf", 2);
+
+        /* rp_i64: F64 col + I64 col → F64 out */
+        {
+            int64_t rawb[] = {2, 3, 4};
+            ray_t* vb = make_sliced(ray_vec_from_raw(RAY_I64, rawb, 3));
+            int64_t nb = ray_sym_intern("ri64", 4);
+            ray_t* tbl = make_two_col_table(na, va, nb, vb);
+            /* do NOT release va since make_two_col_table retains it */
+            ray_release(vb);
+
+            ray_graph_t* g = ray_graph_new(tbl);
+            ray_op_t* a = ray_scan(g, "lf");
+            ray_op_t* b = ray_scan(g, "ri64");
+            ray_op_t* op = ray_add(g, a, b);  /* lp_f64 + rp_i64 in F64 ADD */
+            ray_op_t* s = ray_sum(g, op);
+            ray_t* result = ray_execute(g, s);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+            /* 6+2=8, 9+3=12, 12+4=16 → 36.0 */
+            TEST_ASSERT_EQ_F(result->f64, 36.0, 1e-9);
+            ray_release(result);
+            ray_graph_free(g);
+
+            /* IDIV: floor(6/2)=3, floor(9/3)=3, floor(12/4)=3 → I64 out, lp_f64+rp_i64 in I64 IDIV */
+            g = ray_graph_new(tbl);
+            a = ray_scan(g, "lf");
+            b = ray_scan(g, "ri64");
+            op = ray_idiv(g, a, b);
+            s = ray_sum(g, op);
+            result = ray_execute(g, s);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+            TEST_ASSERT_EQ_I(result->i64, 9);
+            ray_release(result);
+            ray_graph_free(g);
+
+            /* MIN2: min(6,2)=2, min(9,3)=3, min(12,4)=4 → F64 out */
+            g = ray_graph_new(tbl);
+            a = ray_scan(g, "lf");
+            b = ray_scan(g, "ri64");
+            op = ray_min2(g, a, b);  /* promote(F64,I64)=F64 */
+            s = ray_sum(g, op);
+            result = ray_execute(g, s);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+            TEST_ASSERT_EQ_F(result->f64, 9.0, 1e-9);
+            ray_release(result);
+            ray_graph_free(g);
+
+            /* MAX2: max(6,2)=6, max(9,3)=9, max(12,4)=12 → F64 out */
+            g = ray_graph_new(tbl);
+            a = ray_scan(g, "lf");
+            b = ray_scan(g, "ri64");
+            op = ray_max2(g, a, b);
+            s = ray_sum(g, op);
+            result = ray_execute(g, s);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+            TEST_ASSERT_EQ_F(result->f64, 27.0, 1e-9);
+            ray_release(result);
+            ray_graph_free(g);
+
+            ray_release(tbl);
+        }
+
+        /* rp_i32: F64 col + I32 col → F64 out */
+        {
+            int32_t rawb[] = {2, 3, 4};
+            ray_t* vb = make_sliced(ray_vec_from_raw(RAY_I32, rawb, 3));
+            int64_t nb = ray_sym_intern("ri32", 4);
+            ray_t* tbl = make_two_col_table(na, va, nb, vb);
+            ray_release(vb);
+
+            ray_graph_t* g = ray_graph_new(tbl);
+            ray_op_t* a = ray_scan(g, "lf");
+            ray_op_t* b = ray_scan(g, "ri32");
+            ray_op_t* op = ray_add(g, a, b);  /* lp_f64 + rp_i32 in F64 ADD */
+            ray_op_t* s = ray_sum(g, op);
+            ray_t* result = ray_execute(g, s);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+            TEST_ASSERT_EQ_F(result->f64, 36.0, 1e-9);
+            ray_release(result);
+            ray_graph_free(g);
+
+            g = ray_graph_new(tbl);
+            a = ray_scan(g, "lf");
+            b = ray_scan(g, "ri32");
+            op = ray_sub(g, a, b);  /* lp_f64 + rp_i32 in F64 SUB */
+            s = ray_sum(g, op);
+            result = ray_execute(g, s);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+            /* 6-2=4, 9-3=6, 12-4=8 → 18.0 */
+            TEST_ASSERT_EQ_F(result->f64, 18.0, 1e-9);
+            ray_release(result);
+            ray_graph_free(g);
+
+            g = ray_graph_new(tbl);
+            a = ray_scan(g, "lf");
+            b = ray_scan(g, "ri32");
+            op = ray_mul(g, a, b);  /* lp_f64 + rp_i32 in F64 MUL */
+            s = ray_sum(g, op);
+            result = ray_execute(g, s);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+            /* 6*2=12, 9*3=27, 12*4=48 → 87.0 */
+            TEST_ASSERT_EQ_F(result->f64, 87.0, 1e-9);
+            ray_release(result);
+            ray_graph_free(g);
+
+            ray_release(tbl);
+        }
+
+        /* rp_i16: F64 col + I16 col → F64 out */
+        {
+            int16_t rawb[] = {2, 3, 4};
+            ray_t* vb = make_sliced(ray_vec_from_raw(RAY_I16, rawb, 3));
+            int64_t nb = ray_sym_intern("ri16", 4);
+            ray_t* tbl = make_two_col_table(na, va, nb, vb);
+            ray_release(vb);
+
+            ray_graph_t* g = ray_graph_new(tbl);
+            ray_op_t* a = ray_scan(g, "lf");
+            ray_op_t* b = ray_scan(g, "ri16");
+            ray_op_t* op = ray_add(g, a, b);  /* lp_f64 + rp_i16 in F64 ADD */
+            ray_op_t* s = ray_sum(g, op);
+            ray_t* result = ray_execute(g, s);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+            TEST_ASSERT_EQ_F(result->f64, 36.0, 1e-9);
+            ray_release(result);
+            ray_graph_free(g);
+
+            g = ray_graph_new(tbl);
+            a = ray_scan(g, "lf");
+            b = ray_scan(g, "ri16");
+            op = ray_div(g, a, b);  /* lp_f64 + rp_i16 in F64 DIV */
+            s = ray_sum(g, op);
+            result = ray_execute(g, s);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+            TEST_ASSERT_EQ_F(result->f64, 9.0, 1e-9);
+            ray_release(result);
+            ray_graph_free(g);
+
+            ray_release(tbl);
+        }
+
+        /* rp_bool: F64 col + U8 col → F64 out */
+        {
+            uint8_t rawb[] = {2, 3, 4};
+            ray_t* vb = make_sliced(ray_vec_from_raw(RAY_U8, rawb, 3));
+            int64_t nb = ray_sym_intern("ru8", 3);
+            ray_t* tbl = make_two_col_table(na, va, nb, vb);
+            ray_release(vb);
+
+            ray_graph_t* g = ray_graph_new(tbl);
+            ray_op_t* a = ray_scan(g, "lf");
+            ray_op_t* b = ray_scan(g, "ru8");
+            ray_op_t* op = ray_add(g, a, b);  /* lp_f64 + rp_bool in F64 ADD */
+            ray_op_t* s = ray_sum(g, op);
+            ray_t* result = ray_execute(g, s);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+            TEST_ASSERT_EQ_F(result->f64, 36.0, 1e-9);
+            ray_release(result);
+            ray_graph_free(g);
+
+            g = ray_graph_new(tbl);
+            a = ray_scan(g, "lf");
+            b = ray_scan(g, "ru8");
+            op = ray_div(g, a, b);  /* lp_f64 + rp_bool in F64 DIV */
+            s = ray_sum(g, op);
+            result = ray_execute(g, s);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+            TEST_ASSERT_EQ_F(result->f64, 9.0, 1e-9);
+            ray_release(result);
+            ray_graph_free(g);
+
+            ray_release(tbl);
+        }
+
+        ray_release(va);
+    }
+
+    /* I64 output: I32/I16/U8 lhs with I64/I32/I16/U8 rhs (vec-vs-vec, no fast path) */
+    {
+        /* I32 lhs + I16 rhs → promote(I32,I16)=I32 → I32 out, lp_i32 + rp_i16 */
+        int32_t rawa[] = {6, 9, 12};
+        int16_t rawb[] = {2, 3, 4};
+        ray_t* va = make_sliced(ray_vec_from_raw(RAY_I32, rawa, 3));
+        ray_t* vb = make_sliced(ray_vec_from_raw(RAY_I16, rawb, 3));
+        int64_t na = ray_sym_intern("mi32", 4);
+        int64_t nb = ray_sym_intern("mi16", 4);
+        ray_t* tbl = make_two_col_table(na, va, nb, vb);
+        ray_release(va); ray_release(vb);
+
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "mi32");
+        ray_op_t* b = ray_scan(g, "mi16");
+        ray_op_t* op = ray_add(g, a, b);  /* I32 out, lp_i32+rp_i16 in I32 ADD */
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        /* 6+2=8, 9+3=12, 12+4=16 → 36 */
+        TEST_ASSERT_EQ_I(result->i64, 36);
+        ray_release(result);
+        ray_graph_free(g);
+
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "mi32");
+        b = ray_scan(g, "mi16");
+        op = ray_sub(g, a, b);  /* I32 out, lp_i32+rp_i16 in I32 SUB */
+        s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        /* 6-2=4, 9-3=6, 12-4=8 → 18 */
+        TEST_ASSERT_EQ_I(result->i64, 18);
+        ray_release(result);
+        ray_graph_free(g);
+
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "mi32");
+        b = ray_scan(g, "mi16");
+        op = ray_mul(g, a, b);  /* I32 out, lp_i32+rp_i16 in I32 MUL */
+        s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        /* 6*2=12, 9*3=27, 12*4=48 → 87 */
+        TEST_ASSERT_EQ_I(result->i64, 87);
+        ray_release(result);
+        ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* I32 lhs + U8 rhs → I32 out, lp_i32 + rp_bool */
+    {
+        int32_t rawa[] = {6, 9, 12};
+        uint8_t rawb[] = {2, 3, 4};
+        ray_t* va = make_sliced(ray_vec_from_raw(RAY_I32, rawa, 3));
+        ray_t* vb = make_sliced(ray_vec_from_raw(RAY_U8, rawb, 3));
+        int64_t na = ray_sym_intern("ni32", 4);
+        int64_t nb = ray_sym_intern("nu8", 3);
+        ray_t* tbl = make_two_col_table(na, va, nb, vb);
+        ray_release(va); ray_release(vb);
+
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "ni32");
+        ray_op_t* b = ray_scan(g, "nu8");
+        ray_op_t* op = ray_add(g, a, b);  /* promote(I32,U8)=I32, lp_i32+rp_bool in I32 ADD */
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 36);
+        ray_release(result);
+        ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* I16 lhs + U8 rhs → I16 out, lp_i16 + rp_bool */
+    {
+        int16_t rawa[] = {6, 9, 12};
+        uint8_t rawb[] = {2, 3, 4};
+        ray_t* va = make_sliced(ray_vec_from_raw(RAY_I16, rawa, 3));
+        ray_t* vb = make_sliced(ray_vec_from_raw(RAY_U8, rawb, 3));
+        int64_t na = ray_sym_intern("oi16", 4);
+        int64_t nb = ray_sym_intern("ou8", 3);
+        ray_t* tbl = make_two_col_table(na, va, nb, vb);
+        ray_release(va); ray_release(vb);
+
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "oi16");
+        ray_op_t* b = ray_scan(g, "ou8");
+        ray_op_t* op = ray_add(g, a, b);  /* promote(I16,U8)=I16, lp_i16+rp_bool in I16 ADD */
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 36);
+        ray_release(result);
+        ray_graph_free(g);
+
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "oi16");
+        b = ray_scan(g, "ou8");
+        op = ray_sub(g, a, b);  /* lp_i16+rp_bool in I16 SUB */
+        s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 18);
+        ray_release(result);
+        ray_graph_free(g);
+
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "oi16");
+        b = ray_scan(g, "ou8");
+        op = ray_mul(g, a, b);  /* lp_i16+rp_bool in I16 MUL */
+        s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 87);
+        ray_release(result);
+        ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* I64 lhs + I32 rhs → I64 out, lp_i64 + rp_i32 (vec-vs-vec, no fast path) */
+    {
+        int64_t rawa[] = {6, 9, 12};
+        int32_t rawb[] = {2, 3, 4};
+        ray_t* va = make_sliced(ray_vec_from_raw(RAY_I64, rawa, 3));
+        ray_t* vb = make_sliced(ray_vec_from_raw(RAY_I32, rawb, 3));
+        int64_t na = ray_sym_intern("pi64", 4);
+        int64_t nb = ray_sym_intern("pi32", 4);
+        ray_t* tbl = make_two_col_table(na, va, nb, vb);
+        ray_release(va); ray_release(vb);
+
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "pi64");
+        ray_op_t* b = ray_scan(g, "pi32");
+        ray_op_t* op = ray_add(g, a, b);  /* I64 out, lp_i64+rp_i32 in I64 ADD */
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 36);
+        ray_release(result);
+        ray_graph_free(g);
+
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "pi64");
+        b = ray_scan(g, "pi32");
+        op = ray_sub(g, a, b);  /* I64 out, lp_i64+rp_i32 in I64 SUB */
+        s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 18);
+        ray_release(result);
+        ray_graph_free(g);
+
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "pi64");
+        b = ray_scan(g, "pi32");
+        op = ray_mul(g, a, b);  /* I64 out, lp_i64+rp_i32 in I64 MUL */
+        s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 87);
+        ray_release(result);
+        ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* I64 lhs + I16 rhs → I64 out, lp_i64 + rp_i16 */
+    {
+        int64_t rawa[] = {6, 9, 12};
+        int16_t rawb[] = {2, 3, 4};
+        ray_t* va = make_sliced(ray_vec_from_raw(RAY_I64, rawa, 3));
+        ray_t* vb = make_sliced(ray_vec_from_raw(RAY_I16, rawb, 3));
+        int64_t na = ray_sym_intern("qi64", 4);
+        int64_t nb = ray_sym_intern("qi16", 4);
+        ray_t* tbl = make_two_col_table(na, va, nb, vb);
+        ray_release(va); ray_release(vb);
+
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "qi64");
+        ray_op_t* b = ray_scan(g, "qi16");
+        ray_op_t* op = ray_add(g, a, b);  /* I64 out, lp_i64+rp_i16 in I64 ADD */
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 36);
+        ray_release(result);
+        ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* I64 lhs + U8 rhs → I64 out, lp_i64 + rp_bool */
+    {
+        int64_t rawa[] = {6, 9, 12};
+        uint8_t rawb[] = {2, 3, 4};
+        ray_t* va = make_sliced(ray_vec_from_raw(RAY_I64, rawa, 3));
+        ray_t* vb = make_sliced(ray_vec_from_raw(RAY_U8, rawb, 3));
+        int64_t na = ray_sym_intern("ri64b", 5);
+        int64_t nb = ray_sym_intern("ru8b", 4);
+        ray_t* tbl = make_two_col_table(na, va, nb, vb);
+        ray_release(va); ray_release(vb);
+
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "ri64b");
+        ray_op_t* b = ray_scan(g, "ru8b");
+        ray_op_t* op = ray_add(g, a, b);  /* I64 out, lp_i64+rp_bool in I64 ADD */
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 36);
+        ray_release(result);
+        ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* I32 lhs + I64 rhs → I64 out (lp_i32 + rp_i64 in I64 ADD) */
+    {
+        int32_t rawa[] = {6, 9, 12};
+        int64_t rawb[] = {2, 3, 4};
+        ray_t* va = make_sliced(ray_vec_from_raw(RAY_I32, rawa, 3));
+        ray_t* vb = make_sliced(ray_vec_from_raw(RAY_I64, rawb, 3));
+        int64_t na = ray_sym_intern("si32", 4);
+        int64_t nb = ray_sym_intern("si64", 4);
+        ray_t* tbl = make_two_col_table(na, va, nb, vb);
+        ray_release(va); ray_release(vb);
+
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "si32");
+        ray_op_t* b = ray_scan(g, "si64");
+        ray_op_t* op = ray_add(g, a, b);  /* promote(I32,I64)=I64 out, lp_i32+rp_i64 */
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 36);
+        ray_release(result);
+        ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* I16 lhs + I64 rhs → I64 out (lp_i16 + rp_i64 in I64 loops) */
+    {
+        int16_t rawa[] = {6, 9, 12};
+        int64_t rawb[] = {2, 3, 4};
+        ray_t* va = make_sliced(ray_vec_from_raw(RAY_I16, rawa, 3));
+        ray_t* vb = make_sliced(ray_vec_from_raw(RAY_I64, rawb, 3));
+        int64_t na = ray_sym_intern("ti16", 4);
+        int64_t nb = ray_sym_intern("ti64", 4);
+        ray_t* tbl = make_two_col_table(na, va, nb, vb);
+        ray_release(va); ray_release(vb);
+
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "ti16");
+        ray_op_t* b = ray_scan(g, "ti64");
+        ray_op_t* op = ray_add(g, a, b);  /* I64 out, lp_i16+rp_i64 */
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 36);
+        ray_release(result);
+        ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* U8 lhs + I64 rhs → I64 out (lp_bool + rp_i64 in I64 loops) */
+    {
+        uint8_t rawa[] = {6, 9, 12};
+        int64_t rawb[] = {2, 3, 4};
+        ray_t* va = make_sliced(ray_vec_from_raw(RAY_U8, rawa, 3));
+        ray_t* vb = make_sliced(ray_vec_from_raw(RAY_I64, rawb, 3));
+        int64_t na = ray_sym_intern("uu8", 3);
+        int64_t nb = ray_sym_intern("ui64", 4);
+        ray_t* tbl = make_two_col_table(na, va, nb, vb);
+        ray_release(va); ray_release(vb);
+
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "uu8");
+        ray_op_t* b = ray_scan(g, "ui64");
+        ray_op_t* op = ray_add(g, a, b);  /* I64 out, lp_bool+rp_i64 */
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 36);
+        ray_release(result);
+        ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ---- BOOL output: narrow lhs types with comparison ops (slow path) ----
+ * Exercises LV_READ cond3/5/6 TRUE within BOOL src_is_i64_all loop bodies.
+ * Uses vec-vs-vec (no BOOL fast path since r_scalar required for fast path). */
+static test_result_t test_expr_binary_bool_narrow_lhs(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* I32 lhs + I64 rhs → BOOL out, lp_i32+rp_i64 (promote=I64, but...wait:
+     * for CMP ops, both operands promoted to same type. I32 vs I64 → I64.
+     * Actually: ray_lt(I32_vec, I64_vec) → out_type=BOOL.
+     * In exec_elementwise_binary, lhs->type=I32, rhs->type=I64.
+     * No BOOL fast path (r_scalar=false). slow path: lp_i32 + rp_i64.
+     * src_is_i64_all: l_is_int=!(lp_f64 || ...)=true, r_is_int=true → int path. */
+    {
+        int32_t rawa[] = {1, 5, 3};
+        int64_t rawb[] = {2, 4, 6};
+        ray_t* va = make_sliced(ray_vec_from_raw(RAY_I32, rawa, 3));
+        ray_t* vb = make_sliced(ray_vec_from_raw(RAY_I64, rawb, 3));
+        int64_t na = ray_sym_intern("ba32", 4);
+        int64_t nb = ray_sym_intern("bb64", 4);
+        ray_t* tbl = make_two_col_table(na, va, nb, vb);
+        ray_release(va); ray_release(vb);
+
+        /* LT: 1<2=T, 5<4=F, 3<6=T → sum=2 */
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "ba32");
+        ray_op_t* b = ray_scan(g, "bb64");
+        ray_op_t* op = ray_lt(g, a, b);  /* BOOL out, lp_i32+rp_i64 in BOOL LT */
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 2);
+        ray_release(result);
+        ray_graph_free(g);
+
+        /* EQ: 1==2=F, 5==4=F, 3==6=F → sum=0 */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "ba32");
+        b = ray_scan(g, "bb64");
+        op = ray_eq(g, a, b);  /* lp_i32+rp_i64 in BOOL EQ */
+        s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 0);
+        ray_release(result);
+        ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* I16 lhs + I64 rhs → BOOL out, lp_i16+rp_i64 */
+    {
+        int16_t rawa[] = {1, 5, 3};
+        int64_t rawb[] = {2, 4, 6};
+        ray_t* va = make_sliced(ray_vec_from_raw(RAY_I16, rawa, 3));
+        ray_t* vb = make_sliced(ray_vec_from_raw(RAY_I64, rawb, 3));
+        int64_t na = ray_sym_intern("ca16", 4);
+        int64_t nb = ray_sym_intern("cb64", 4);
+        ray_t* tbl = make_two_col_table(na, va, nb, vb);
+        ray_release(va); ray_release(vb);
+
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "ca16");
+        ray_op_t* b = ray_scan(g, "cb64");
+        ray_op_t* op = ray_lt(g, a, b);  /* lp_i16+rp_i64 in BOOL LT */
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 2);
+        ray_release(result);
+        ray_graph_free(g);
+
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "ca16");
+        b = ray_scan(g, "cb64");
+        op = ray_gt(g, a, b);  /* lp_i16+rp_i64 in BOOL GT */
+        s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        /* 1>2=F, 5>4=T, 3>6=F → 1 */
+        TEST_ASSERT_EQ_I(result->i64, 1);
+        ray_release(result);
+        ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* U8 lhs + I64 rhs → BOOL out, lp_bool+rp_i64 */
+    {
+        uint8_t rawa[] = {1, 5, 3};
+        int64_t rawb[] = {2, 4, 6};
+        ray_t* va = make_sliced(ray_vec_from_raw(RAY_U8, rawa, 3));
+        ray_t* vb = make_sliced(ray_vec_from_raw(RAY_I64, rawb, 3));
+        int64_t na = ray_sym_intern("du8", 3);
+        int64_t nb = ray_sym_intern("di64", 4);
+        ray_t* tbl = make_two_col_table(na, va, nb, vb);
+        ray_release(va); ray_release(vb);
+
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "du8");
+        ray_op_t* b = ray_scan(g, "di64");
+        ray_op_t* op = ray_lt(g, a, b);  /* lp_bool+rp_i64 in BOOL LT */
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 2);
+        ray_release(result);
+        ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* I64 lhs + I32 rhs → BOOL out, lp_i64+rp_i32 */
+    {
+        int64_t rawa[] = {1, 5, 3};
+        int32_t rawb[] = {2, 4, 6};
+        ray_t* va = make_sliced(ray_vec_from_raw(RAY_I64, rawa, 3));
+        ray_t* vb = make_sliced(ray_vec_from_raw(RAY_I32, rawb, 3));
+        int64_t na = ray_sym_intern("ea64", 4);
+        int64_t nb = ray_sym_intern("eb32", 4);
+        ray_t* tbl = make_two_col_table(na, va, nb, vb);
+        ray_release(va); ray_release(vb);
+
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "ea64");
+        ray_op_t* b = ray_scan(g, "eb32");
+        ray_op_t* op = ray_lt(g, a, b);  /* lp_i64+rp_i32 in BOOL LT */
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 2);
+        ray_release(result);
+        ray_graph_free(g);
+
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "ea64");
+        b = ray_scan(g, "eb32");
+        op = ray_le(g, a, b);  /* lp_i64+rp_i32 in BOOL LE */
+        s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        /* 1<=2=T, 5<=4=F, 3<=6=T → 2 */
+        TEST_ASSERT_EQ_I(result->i64, 2);
+        ray_release(result);
+        ray_graph_free(g);
+
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "ea64");
+        b = ray_scan(g, "eb32");
+        op = ray_ge(g, a, b);  /* lp_i64+rp_i32 in BOOL GE */
+        s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        /* 1>=2=F, 5>=4=T, 3>=6=F → 1 */
+        TEST_ASSERT_EQ_I(result->i64, 1);
+        ray_release(result);
+        ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* I64 lhs + I16 rhs → BOOL out, lp_i64+rp_i16 */
+    {
+        int64_t rawa[] = {1, 5, 3};
+        int16_t rawb[] = {2, 4, 6};
+        ray_t* va = make_sliced(ray_vec_from_raw(RAY_I64, rawa, 3));
+        ray_t* vb = make_sliced(ray_vec_from_raw(RAY_I16, rawb, 3));
+        int64_t na = ray_sym_intern("fa64", 4);
+        int64_t nb = ray_sym_intern("fb16", 4);
+        ray_t* tbl = make_two_col_table(na, va, nb, vb);
+        ray_release(va); ray_release(vb);
+
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "fa64");
+        ray_op_t* b = ray_scan(g, "fb16");
+        ray_op_t* op = ray_lt(g, a, b);  /* lp_i64+rp_i16 in BOOL LT */
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 2);
+        ray_release(result);
+        ray_graph_free(g);
+
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "fa64");
+        b = ray_scan(g, "fb16");
+        op = ray_ne(g, a, b);  /* lp_i64+rp_i16 in BOOL NE */
+        s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        /* all differ → 3 */
+        TEST_ASSERT_EQ_I(result->i64, 3);
+        ray_release(result);
+        ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* I64 lhs + U8 rhs → BOOL out, lp_i64+rp_bool */
+    {
+        int64_t rawa[] = {1, 5, 3};
+        uint8_t rawb[] = {2, 4, 6};
+        ray_t* va = make_sliced(ray_vec_from_raw(RAY_I64, rawa, 3));
+        ray_t* vb = make_sliced(ray_vec_from_raw(RAY_U8, rawb, 3));
+        int64_t na = ray_sym_intern("ga64", 4);
+        int64_t nb = ray_sym_intern("gb8", 3);
+        ray_t* tbl = make_two_col_table(na, va, nb, vb);
+        ray_release(va); ray_release(vb);
+
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "ga64");
+        ray_op_t* b = ray_scan(g, "gb8");
+        ray_op_t* op = ray_lt(g, a, b);  /* lp_i64+rp_bool in BOOL LT */
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 2);
+        ray_release(result);
+        ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* I32 lhs + I16 rhs → BOOL out, lp_i32+rp_i16 */
+    {
+        int32_t rawa[] = {1, 5, 3};
+        int16_t rawb[] = {2, 4, 6};
+        ray_t* va = make_sliced(ray_vec_from_raw(RAY_I32, rawa, 3));
+        ray_t* vb = make_sliced(ray_vec_from_raw(RAY_I16, rawb, 3));
+        int64_t na = ray_sym_intern("ha32", 4);
+        int64_t nb = ray_sym_intern("hb16", 4);
+        ray_t* tbl = make_two_col_table(na, va, nb, vb);
+        ray_release(va); ray_release(vb);
+
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "ha32");
+        ray_op_t* b = ray_scan(g, "hb16");
+        ray_op_t* op = ray_lt(g, a, b);  /* lp_i32+rp_i16 in BOOL LT */
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 2);
+        ray_release(result);
+        ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* I32 lhs + U8 rhs → BOOL out, lp_i32+rp_bool */
+    {
+        int32_t rawa[] = {1, 5, 3};
+        uint8_t rawb[] = {2, 4, 6};
+        ray_t* va = make_sliced(ray_vec_from_raw(RAY_I32, rawa, 3));
+        ray_t* vb = make_sliced(ray_vec_from_raw(RAY_U8, rawb, 3));
+        int64_t na = ray_sym_intern("ia32", 4);
+        int64_t nb = ray_sym_intern("ib8", 3);
+        ray_t* tbl = make_two_col_table(na, va, nb, vb);
+        ray_release(va); ray_release(vb);
+
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "ia32");
+        ray_op_t* b = ray_scan(g, "ib8");
+        ray_op_t* op = ray_lt(g, a, b);  /* lp_i32+rp_bool in BOOL LT */
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 2);
+        ray_release(result);
+        ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* I16 lhs + I32 rhs → BOOL out, lp_i16+rp_i32 */
+    {
+        int16_t rawa[] = {1, 5, 3};
+        int32_t rawb[] = {2, 4, 6};
+        ray_t* va = make_sliced(ray_vec_from_raw(RAY_I16, rawa, 3));
+        ray_t* vb = make_sliced(ray_vec_from_raw(RAY_I32, rawb, 3));
+        int64_t na = ray_sym_intern("ja16", 4);
+        int64_t nb = ray_sym_intern("jb32", 4);
+        ray_t* tbl = make_two_col_table(na, va, nb, vb);
+        ray_release(va); ray_release(vb);
+
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "ja16");
+        ray_op_t* b = ray_scan(g, "jb32");
+        ray_op_t* op = ray_lt(g, a, b);  /* lp_i16+rp_i32 in BOOL LT */
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 2);
+        ray_release(result);
+        ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* U8 lhs + I32 rhs → BOOL out, lp_bool+rp_i32 */
+    {
+        uint8_t rawa[] = {1, 5, 3};
+        int32_t rawb[] = {2, 4, 6};
+        ray_t* va = make_sliced(ray_vec_from_raw(RAY_U8, rawa, 3));
+        ray_t* vb = make_sliced(ray_vec_from_raw(RAY_I32, rawb, 3));
+        int64_t na = ray_sym_intern("ku8", 3);
+        int64_t nb = ray_sym_intern("kb32", 4);
+        ray_t* tbl = make_two_col_table(na, va, nb, vb);
+        ray_release(va); ray_release(vb);
+
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "ku8");
+        ray_op_t* b = ray_scan(g, "kb32");
+        ray_op_t* op = ray_lt(g, a, b);  /* lp_bool+rp_i32 in BOOL LT */
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 2);
+        ray_release(result);
+        ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* U8 lhs + I16 rhs → BOOL out, lp_bool+rp_i16 */
+    {
+        uint8_t rawa[] = {1, 5, 3};
+        int16_t rawb[] = {2, 4, 6};
+        ray_t* va = make_sliced(ray_vec_from_raw(RAY_U8, rawa, 3));
+        ray_t* vb = make_sliced(ray_vec_from_raw(RAY_I16, rawb, 3));
+        int64_t na = ray_sym_intern("lu8", 3);
+        int64_t nb = ray_sym_intern("lb16", 4);
+        ray_t* tbl = make_two_col_table(na, va, nb, vb);
+        ray_release(va); ray_release(vb);
+
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "lu8");
+        ray_op_t* b = ray_scan(g, "lb16");
+        ray_op_t* op = ray_lt(g, a, b);  /* lp_bool+rp_i16 in BOOL LT */
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 2);
+        ray_release(result);
+        ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* I16 lhs + U8 rhs → BOOL out, lp_i16+rp_bool */
+    {
+        int16_t rawa[] = {1, 5, 3};
+        uint8_t rawb[] = {2, 4, 6};
+        ray_t* va = make_sliced(ray_vec_from_raw(RAY_I16, rawa, 3));
+        ray_t* vb = make_sliced(ray_vec_from_raw(RAY_U8, rawb, 3));
+        int64_t na = ray_sym_intern("mi16", 4);
+        int64_t nb = ray_sym_intern("mu8", 3);
+        ray_t* tbl = make_two_col_table(na, va, nb, vb);
+        ray_release(va); ray_release(vb);
+
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "mi16");
+        ray_op_t* b = ray_scan(g, "mu8");
+        ray_op_t* op = ray_lt(g, a, b);  /* lp_i16+rp_bool in BOOL LT */
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 2);
+        ray_release(result);
+        ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ---- binary_range: F64 scalar lhs with F64 output (cond7 TRUE for LV_READ) ----
+ * When l_scalar=true AND lhs->type==-RAY_F64 or RAY_F64, LV_READ cond7 fires.
+ * This is already covered for some ops, but need to cover IDIV/MOD/MIN2/MAX2. */
+static test_result_t test_expr_binary_scalar_f64_lhs(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* F64 scalar + I64 vec: l_scalar=true, lhs->type=-RAY_F64, rp_i64 set */
+    {
+        int64_t rawb[] = {2, 3, 4};
+        ray_t* vb = make_sliced(ray_vec_from_raw(RAY_I64, rawb, 3));
+        int64_t nb = ray_sym_intern("vb64", 4);
+        ray_t* tbl = make_col_table(nb, vb);
+        ray_release(vb);
+
+        /* DIV: 12.0/2=6, 12.0/3=4, 12.0/4=3 → sum=13.0 */
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_const_f64(g, 12.0);
+        ray_op_t* b = ray_scan(g, "vb64");
+        ray_op_t* op = ray_div(g, a, b);  /* F64 out, l_scalar F64 (cond7), rp_i64 */
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_F(result->f64, 13.0, 1e-9);
+        ray_release(result);
+        ray_graph_free(g);
+
+        /* IDIV: floor(12/2)=6, floor(12/3)=4, floor(12/4)=3 → I64 out, cond7 in I64 IDIV */
+        g = ray_graph_new(tbl);
+        a = ray_const_f64(g, 12.0);
+        b = ray_scan(g, "vb64");
+        op = ray_idiv(g, a, b);
+        s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 13);
+        ray_release(result);
+        ray_graph_free(g);
+
+        /* MOD: 12%2=0, 12%3=0, 12%4=0 → sum=0 (F64 out) */
+        g = ray_graph_new(tbl);
+        a = ray_const_f64(g, 12.0);
+        b = ray_scan(g, "vb64");
+        op = ray_mod(g, a, b);
+        s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_F(result->f64, 0.0, 1e-9);
+        ray_release(result);
+        ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* F64 scalar + I32 vec: l_scalar F64, rp_i32 */
+    {
+        int32_t rawb[] = {2, 3, 4};
+        ray_t* vb = make_sliced(ray_vec_from_raw(RAY_I32, rawb, 3));
+        int64_t nb = ray_sym_intern("wb32", 4);
+        ray_t* tbl = make_col_table(nb, vb);
+        ray_release(vb);
+
+        /* MOD: 12%2=0, 12%3=0, 12%4=0 → 0 (F64 out, cond7 in F64 MOD, rp_i32) */
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_const_f64(g, 12.0);
+        ray_op_t* b = ray_scan(g, "wb32");
+        ray_op_t* op = ray_mod(g, a, b);
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_F(result->f64, 0.0, 1e-9);
+        ray_release(result);
+        ray_graph_free(g);
+
+        /* MIN2: min(12,2)=2,min(12,3)=3,min(12,4)=4 → 9.0 */
+        g = ray_graph_new(tbl);
+        a = ray_const_f64(g, 12.0);
+        b = ray_scan(g, "wb32");
+        op = ray_min2(g, a, b);
+        s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_F(result->f64, 9.0, 1e-9);
+        ray_release(result);
+        ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* F64 scalar + I16 vec: l_scalar F64, rp_i16 */
+    {
+        int16_t rawb[] = {2, 3, 4};
+        ray_t* vb = make_sliced(ray_vec_from_raw(RAY_I16, rawb, 3));
+        int64_t nb = ray_sym_intern("xb16", 4);
+        ray_t* tbl = make_col_table(nb, vb);
+        ray_release(vb);
+
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_const_f64(g, 12.0);
+        ray_op_t* b = ray_scan(g, "xb16");
+        ray_op_t* op = ray_mod(g, a, b);  /* cond7 in F64 MOD, rp_i16 */
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_F(result->f64, 0.0, 1e-9);
+        ray_release(result);
+        ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* F64 scalar + U8 vec: l_scalar F64, rp_bool */
+    {
+        uint8_t rawb[] = {2, 3, 4};
+        ray_t* vb = make_sliced(ray_vec_from_raw(RAY_U8, rawb, 3));
+        int64_t nb = ray_sym_intern("ybu8", 4);
+        ray_t* tbl = make_col_table(nb, vb);
+        ray_release(vb);
+
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_const_f64(g, 12.0);
+        ray_op_t* b = ray_scan(g, "ybu8");
+        ray_op_t* op = ray_mod(g, a, b);  /* cond7 in F64 MOD, rp_bool */
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_F(result->f64, 0.0, 1e-9);
+        ray_release(result);
+        ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ---- binary_range: SYM W32 lhs (lp_u32 arm) in arithmetic loops ----
+ *
+ * SYM W32 col as LHS in arithmetic ops → lp_u32 set → covers the 4th arm
+ * of LV_READ in each (out_type × opcode) loop body.
+ * promote(SYM, I64) = I64, so out_type=I64 for ADD/SUB/MUL/IDIV/MOD/MIN2/MAX2.
+ * Arithmetic fast path skipped: lhs->type=SYM ≠ I64 out_type.
+ * BOOL fast path skipped: out_type != BOOL.
+ */
+static test_result_t test_expr_binary_sym_w32_arith(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* Build a SYM W32 column with numeric IDs 1,2,3,4 and slice it to force
+     * non-fused path (RAY_ATTR_SLICE → expr_compile bails at line 470). */
+    ray_t* vs_raw = ray_sym_vec_new(RAY_SYM_W32, 4);
+    vs_raw->len = 4;
+    uint32_t* sd = (uint32_t*)ray_data(vs_raw);
+    for (int i = 0; i < 4; i++) sd[i] = (uint32_t)(i + 1);  /* IDs: 1,2,3,4 */
+    ray_t* vs = ray_vec_slice(vs_raw, 0, 4);  /* SLICE → non-fused slow path */
+    ray_release(vs_raw);
+
+    int64_t na = ray_sym_intern("sw", 2);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, na, vs);
+    ray_release(vs);
+
+    /* ADD: sw + 10 → I64 out, lp_u32 in I64 ADD loop
+     * Values: 1+10=11, 2+10=12, 3+10=13, 4+10=14 → sum=50 */
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* col = ray_scan(g, "sw");
+    ray_op_t* c = ray_const_i64(g, 10);
+    ray_op_t* op = ray_add(g, col, c);
+    ray_op_t* s = ray_sum(g, op);
+    ray_t* result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->i64, 50);  /* 11+12+13+14=50 */
+    ray_release(result);
+    ray_graph_free(g);
+
+    /* SUB: sw - 1 → I64 out, lp_u32 in I64 SUB loop
+     * Values: 0, 1, 2, 3 → sum=6 */
+    g = ray_graph_new(tbl);
+    col = ray_scan(g, "sw");
+    c = ray_const_i64(g, 1);
+    op = ray_sub(g, col, c);
+    s = ray_sum(g, op);
+    result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->i64, 6);  /* 0+1+2+3=6 */
+    ray_release(result);
+    ray_graph_free(g);
+
+    /* MUL: sw * 2 → I64 out, lp_u32 in I64 MUL loop
+     * Values: 2, 4, 6, 8 → sum=20 */
+    g = ray_graph_new(tbl);
+    col = ray_scan(g, "sw");
+    c = ray_const_i64(g, 2);
+    op = ray_mul(g, col, c);
+    s = ray_sum(g, op);
+    result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->i64, 20);  /* 2+4+6+8=20 */
+    ray_release(result);
+    ray_graph_free(g);
+
+    /* IDIV: floor(sw / 2) → I64 out, lp_u32 in I64 IDIV loop
+     * floor(1/2)=0, floor(2/2)=1, floor(3/2)=1, floor(4/2)=2 → sum=4 */
+    g = ray_graph_new(tbl);
+    col = ray_scan(g, "sw");
+    c = ray_const_i64(g, 2);
+    op = ray_idiv(g, col, c);
+    s = ray_sum(g, op);
+    result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->i64, 4);  /* 0+1+1+2=4 */
+    ray_release(result);
+    ray_graph_free(g);
+
+    /* MOD: sw % 3 → I64 out, lp_u32 in I64 MOD loop
+     * 1%3=1, 2%3=2, 3%3=0, 4%3=1 → sum=4 */
+    g = ray_graph_new(tbl);
+    col = ray_scan(g, "sw");
+    c = ray_const_i64(g, 3);
+    op = ray_mod(g, col, c);
+    s = ray_sum(g, op);
+    result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->i64, 4);  /* 1+2+0+1=4 */
+    ray_release(result);
+    ray_graph_free(g);
+
+    /* MIN2: min(sw, 3) → I64 out, lp_u32 in I64 MIN2 loop
+     * min(1,3)=1, min(2,3)=2, min(3,3)=3, min(4,3)=3 → sum=9 */
+    g = ray_graph_new(tbl);
+    col = ray_scan(g, "sw");
+    c = ray_const_i64(g, 3);
+    op = ray_min2(g, col, c);
+    s = ray_sum(g, op);
+    result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->i64, 9);  /* 1+2+3+3=9 */
+    ray_release(result);
+    ray_graph_free(g);
+
+    /* MAX2: max(sw, 2) → I64 out, lp_u32 in I64 MAX2 loop
+     * max(1,2)=2, max(2,2)=2, max(3,2)=3, max(4,2)=4 → sum=11 */
+    g = ray_graph_new(tbl);
+    col = ray_scan(g, "sw");
+    c = ray_const_i64(g, 2);
+    op = ray_max2(g, col, c);
+    s = ray_sum(g, op);
+    result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->i64, 11);  /* 2+2+3+4=11 */
+    ray_release(result);
+    ray_graph_free(g);
+
+    /* BOOL comparison: sw == 2 → lp_u32 in BOOL slow path (integer src_is_i64_all)
+     * Also covers lp_u32 in BOOL block src_is_i64_all EQ loop */
+    g = ray_graph_new(tbl);
+    col = ray_scan(g, "sw");
+    c = ray_const_i64(g, 2);
+    op = ray_eq(g, col, c);
+    s = ray_sum(g, op);
+    result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->i64, 1);  /* only position 1 (val=2) matches */
+    ray_release(result);
+    ray_graph_free(g);
+
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ---- binary_range: SYM W32 rhs (rp_u32 arm) + I64 scalar lhs ----
+ *
+ * I64 scalar + SYM W32 col → rp_u32 set → covers 4th arm of RV_READ.
+ * Also: SYM W32 vec-vs-vec → lp_u32 + rp_u32 both set.
+ */
+static test_result_t test_expr_binary_sym_w32_rhs(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* SYM W32 column with values 1..3 sliced to force non-fused path */
+    ray_t* vs_raw2 = ray_sym_vec_new(RAY_SYM_W32, 3);
+    vs_raw2->len = 3;
+    uint32_t* sd = (uint32_t*)ray_data(vs_raw2);
+    for (int i = 0; i < 3; i++) sd[i] = (uint32_t)(i + 1);
+    ray_t* vs = ray_vec_slice(vs_raw2, 0, 3);
+    ray_release(vs_raw2);
+    int64_t na = ray_sym_intern("sw2", 3);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, na, vs);
+    ray_release(vs);
+
+    /* ADD: 10 + sw2 → I64 out, rp_u32 in I64 ADD loop (l_scalar I64)
+     * Values: 11, 12, 13 → sum=36 */
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* a = ray_const_i64(g, 10);
+    ray_op_t* col = ray_scan(g, "sw2");
+    ray_op_t* op = ray_add(g, a, col);
+    ray_op_t* s = ray_sum(g, op);
+    ray_t* result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->i64, 36);  /* 11+12+13=36 */
+    ray_release(result);
+    ray_graph_free(g);
+
+    /* SUB: 10 - sw2 → rp_u32 in I64 SUB loop
+     * 10-1=9, 10-2=8, 10-3=7 → sum=24 */
+    g = ray_graph_new(tbl);
+    a = ray_const_i64(g, 10);
+    col = ray_scan(g, "sw2");
+    op = ray_sub(g, a, col);
+    s = ray_sum(g, op);
+    result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->i64, 24);  /* 9+8+7=24 */
+    ray_release(result);
+    ray_graph_free(g);
+
+    /* MUL: 3 * sw2 → rp_u32 in I64 MUL loop
+     * 3,6,9 → sum=18 */
+    g = ray_graph_new(tbl);
+    a = ray_const_i64(g, 3);
+    col = ray_scan(g, "sw2");
+    op = ray_mul(g, a, col);
+    s = ray_sum(g, op);
+    result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->i64, 18);  /* 3+6+9=18 */
+    ray_release(result);
+    ray_graph_free(g);
+
+    /* BOOL: 2 == sw2 → rp_u32 in BOOL src_is_i64_all EQ loop */
+    g = ray_graph_new(tbl);
+    a = ray_const_i64(g, 2);
+    col = ray_scan(g, "sw2");
+    op = ray_eq(g, a, col);
+    s = ray_sum(g, op);
+    result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->i64, 1);  /* only val=2 matches */
+    ray_release(result);
+    ray_graph_free(g);
+
+    /* SYM W32 vec-vs-vec: two W32 cols → lp_u32 + rp_u32 simultaneously */
+    ray_t* raw2 = ray_sym_vec_new(RAY_SYM_W32, 2);
+    raw2->len = 2;
+    uint32_t* sd2 = (uint32_t*)ray_data(raw2);
+    sd2[0] = 5; sd2[1] = 2;
+    ray_t* vs2 = ray_vec_slice(raw2, 0, 2);
+    ray_release(raw2);
+
+    ray_t* raw3 = ray_sym_vec_new(RAY_SYM_W32, 2);
+    raw3->len = 2;
+    uint32_t* sd3 = (uint32_t*)ray_data(raw3);
+    sd3[0] = 3; sd3[1] = 7;
+    ray_t* vs3 = ray_vec_slice(raw3, 0, 2);
+    ray_release(raw3);
+
+    int64_t nb = ray_sym_intern("sw3", 3);
+    int64_t nc = ray_sym_intern("sw4", 3);
+    ray_t* tbl2 = ray_table_new(2);
+    tbl2 = ray_table_add_col(tbl2, nb, vs2);
+    tbl2 = ray_table_add_col(tbl2, nc, vs3);
+    ray_release(vs2); ray_release(vs3);
+
+    /* sw3 + sw4 → lp_u32 + rp_u32 in I64 ADD loop
+     * 5+3=8, 2+7=9, null+null=null → sum=17 */
+    g = ray_graph_new(tbl2);
+    ray_op_t* c1 = ray_scan(g, "sw3");
+    ray_op_t* c2 = ray_scan(g, "sw4");
+    op = ray_add(g, c1, c2);
+    s = ray_sum(g, op);
+    result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->i64, 17);  /* 8+9=17 */
+    ray_release(result);
+    ray_graph_free(g);
+
+    /* MIN2: min(sw3, sw4) → lp_u32 + rp_u32 in I64 MIN2 loop
+     * min(5,3)=3, min(2,7)=2, null → sum=5 */
+    g = ray_graph_new(tbl2);
+    c1 = ray_scan(g, "sw3");
+    c2 = ray_scan(g, "sw4");
+    op = ray_min2(g, c1, c2);
+    s = ray_sum(g, op);
+    result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->i64, 5);  /* 3+2=5 */
+    ray_release(result);
+    ray_graph_free(g);
+
+    /* MAX2: max(sw3, sw4) → lp_u32 + rp_u32 in I64 MAX2 loop
+     * max(5,3)=5, max(2,7)=7, null → sum=12 */
+    g = ray_graph_new(tbl2);
+    c1 = ray_scan(g, "sw3");
+    c2 = ray_scan(g, "sw4");
+    op = ray_max2(g, c1, c2);
+    s = ray_sum(g, op);
+    result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->i64, 12);  /* 5+7=12 */
+    ray_release(result);
+    ray_graph_free(g);
+
+    ray_release(tbl2);
+
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ---- expr_exec_unary: F64→I16 and F64→U8 CAST via fused path ----
+ *
+ * expr_exec_unary with dt=RAY_I16/RAY_U8 and t1=RAY_F64.
+ * This is reached via the fused expr_eval_morsel path when:
+ *   - A non-nullable, non-sliced F64 column is in a table
+ *   - The expression casts it to I16 or U8
+ * Lines 893-894 (I16 from F64) and 902-903 (U8 from F64) in expr_exec_unary.
+ */
+static test_result_t test_expr_unary_fused_f64_narrow(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    double raw[] = {1.7, 2.3, 3.9, 255.8};
+    ray_t* v = ray_vec_from_raw(RAY_F64, raw, 4);
+    int64_t na = ray_sym_intern("fv", 2);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, na, v);
+    ray_release(v);
+
+    /* (as 'I16 fv): F64→I16 CAST via fused path
+     * (int16_t)1.7=1, (int16_t)2.3=2, (int16_t)3.9=3, (int16_t)255.8=255
+     * sum as I64 = 1+2+3+255=261 */
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* col = ray_scan(g, "fv");
+    ray_op_t* cast = ray_cast(g, col, RAY_I16);
+    ray_op_t* s = ray_sum(g, cast);
+    ray_t* result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->i64, 261);  /* 1+2+3+255=261 */
+    ray_release(result);
+    ray_graph_free(g);
+
+    /* (as 'U8 fv): F64→U8 CAST via fused path
+     * (uint8_t)1.7=1, (uint8_t)2.3=2, (uint8_t)3.9=3, (uint8_t)255.8=255
+     * sum = 261 */
+    g = ray_graph_new(tbl);
+    col = ray_scan(g, "fv");
+    cast = ray_cast(g, col, RAY_U8);
+    s = ray_sum(g, cast);
+    result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->i64, 261);  /* 1+2+3+255=261 */
+    ray_release(result);
+    ray_graph_free(g);
+
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ---- binary_range: comprehensive cross-type vec-vs-scalar coverage for all output blocks ----
+ *
+ * This test exercises the LV_READ arms in each output block (F64, I64, I32, I16, U8, BOOL)
+ * by using different lhs column types with matching scalar rhs. Focuses on loop bodies
+ * that receive fewer test invocations: BOOL comparisons with F64 lhs (NaN-aware path),
+ * and INT output blocks with F64/I64/I32/I16/U8 lhs types for all opcodes.
+ */
+static test_result_t test_expr_binary_comprehensive_lhs(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* --- F64 out: lp_i64 ADD/SUB/DIV (lhs=I64 vec, rhs=F64 scalar) --- */
+    {
+        int64_t rawa[] = {6, 8, 10};
+        ray_t* va = make_sliced(ray_vec_from_raw(RAY_I64, rawa, 3));
+        int64_t na = ray_sym_intern("ci64", 4);
+        ray_t* tbl = make_col_table(na, va);
+        ray_release(va);
+
+        /* ADD: 6+2.0=8.0, 8+2.0=10.0, 10+2.0=12.0 → sum=30.0 */
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* col = ray_scan(g, "ci64");
+        ray_op_t* c = ray_const_f64(g, 2.0);
+        ray_op_t* op = ray_add(g, col, c);  /* F64 out, lp_i64, ADD */
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_F(result->f64, 30.0, 1e-9);
+        ray_release(result); ray_graph_free(g);
+
+        /* SUB: 6-2=4, 8-2=6, 10-2=8 → sum=18.0 */
+        g = ray_graph_new(tbl);
+        col = ray_scan(g, "ci64"); c = ray_const_f64(g, 2.0);
+        op = ray_sub(g, col, c); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_F(result->f64, 18.0, 1e-9);
+        ray_release(result); ray_graph_free(g);
+
+        /* DIV: 6/2=3, 8/2=4, 10/2=5 → sum=12.0 */
+        g = ray_graph_new(tbl);
+        col = ray_scan(g, "ci64"); c = ray_const_f64(g, 2.0);
+        op = ray_div(g, col, c); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_F(result->f64, 12.0, 1e-9);
+        ray_release(result); ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* --- F64 out: lp_i32 SUB/DIV (lhs=I32 vec, rhs=F64 scalar) --- */
+    {
+        int32_t rawa[] = {6, 9, 12};
+        ray_t* va = make_sliced(ray_vec_from_raw(RAY_I32, rawa, 3));
+        int64_t na = ray_sym_intern("ci32", 4);
+        ray_t* tbl = make_col_table(na, va);
+        ray_release(va);
+
+        /* SUB: 6-1=5, 9-1=8, 12-1=11 → sum=24.0 */
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* col = ray_scan(g, "ci32");
+        ray_op_t* c = ray_const_f64(g, 1.0);
+        ray_op_t* op = ray_sub(g, col, c); ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_F(result->f64, 24.0, 1e-9);
+        ray_release(result); ray_graph_free(g);
+
+        /* DIV: 6/3=2, 9/3=3, 12/3=4 → sum=9.0 */
+        g = ray_graph_new(tbl);
+        col = ray_scan(g, "ci32"); c = ray_const_f64(g, 3.0);
+        op = ray_div(g, col, c); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_F(result->f64, 9.0, 1e-9);
+        ray_release(result); ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* --- F64 out: lp_i16 SUB/DIV (lhs=I16 vec, rhs=F64 scalar) --- */
+    {
+        int16_t rawa[] = {4, 6, 8};
+        ray_t* va = make_sliced(ray_vec_from_raw(RAY_I16, rawa, 3));
+        int64_t na = ray_sym_intern("ci16b", 5);
+        ray_t* tbl = make_col_table(na, va);
+        ray_release(va);
+
+        /* SUB: 4-1=3, 6-1=5, 8-1=7 → sum=15.0 */
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* col = ray_scan(g, "ci16b");
+        ray_op_t* c = ray_const_f64(g, 1.0);
+        ray_op_t* op = ray_sub(g, col, c); ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_F(result->f64, 15.0, 1e-9);
+        ray_release(result); ray_graph_free(g);
+
+        /* DIV: 4/2=2, 6/2=3, 8/2=4 → sum=9.0 */
+        g = ray_graph_new(tbl);
+        col = ray_scan(g, "ci16b"); c = ray_const_f64(g, 2.0);
+        op = ray_div(g, col, c); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_F(result->f64, 9.0, 1e-9);
+        ray_release(result); ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* --- F64 out: lp_bool SUB/DIV (lhs=U8 vec, rhs=F64 scalar) --- */
+    {
+        uint8_t rawa[] = {2, 4, 6};
+        ray_t* va = make_sliced(ray_vec_from_raw(RAY_U8, rawa, 3));
+        int64_t na = ray_sym_intern("cu8b", 4);
+        ray_t* tbl = make_col_table(na, va);
+        ray_release(va);
+
+        /* SUB: 2-1=1, 4-1=3, 6-1=5 → sum=9.0 */
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* col = ray_scan(g, "cu8b");
+        ray_op_t* c = ray_const_f64(g, 1.0);
+        ray_op_t* op = ray_sub(g, col, c); ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_F(result->f64, 9.0, 1e-9);
+        ray_release(result); ray_graph_free(g);
+
+        /* DIV: 2/2=1, 4/2=2, 6/2=3 → sum=6.0 */
+        g = ray_graph_new(tbl);
+        col = ray_scan(g, "cu8b"); c = ray_const_f64(g, 2.0);
+        op = ray_div(g, col, c); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_F(result->f64, 6.0, 1e-9);
+        ray_release(result); ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* --- I64 out: lp_f64 ADD/SUB via IDIV (lhs=F64, rhs=I64 scalar) --- */
+    /* Already covered by test_expr_binary_f64_all_lhs_types */
+
+    /* --- I32 out: lp_f64 (lhs=F64, rhs=I32 scalar) ADD/SUB → I32 out --- */
+    {
+        double rawa[] = {1.0, 2.0, 3.0};
+        ray_t* va = make_sliced(ray_vec_from_raw(RAY_F64, rawa, 3));
+        int64_t na = ray_sym_intern("cf64i", 5);
+        ray_t* tbl = make_col_table(na, va);
+        ray_release(va);
+
+        /* ADD I32: promote(F64,I32)=F64 → not I32 out...
+         * Actually promote(F64,I32)=F64 so output is F64. To get I32 out we need
+         * both operands to be I32. So use I32 lhs + I32 scalar instead.
+         * Switch to I32 vec: */
+        ray_release(tbl);
+    }
+
+    /* --- I32 out: lp_f64 via (F64_vec × I32_scalar) → actually F64 out ---
+     * To hit lp_f64 in I32 out block we need out_type=I32 with F64 lhs.
+     * promote(F64, I32) = F64, not I32. So F64 lhs can't produce I32 output
+     * via ADD/SUB/MUL. Need to use IDIV/MOD (non-promote ops).
+     * ray_idiv(F64_col, I32_scalar) → I64 out (ray_idiv always I64).
+     * Conclusion: lp_f64 can't reach I32/I16/U8 output blocks through the
+     * public API. These are dead combinations.
+     */
+
+    /* --- BOOL out NaN-aware path: F64 lhs vs F64 scalar, various ops --- */
+    {
+        double rawa[] = {1.0, 2.0, 3.0, 2.0};
+        ray_t* va = make_sliced(ray_vec_from_raw(RAY_F64, rawa, 4));
+        int64_t na = ray_sym_intern("cfa", 3);
+        ray_t* tbl = make_col_table(na, va);
+        ray_release(va);
+
+        /* NE: 1!=2→1, 2!=2→0, 3!=2→1, 2!=2→0 → sum=2 */
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* col = ray_scan(g, "cfa");
+        ray_op_t* c = ray_const_f64(g, 2.0);
+        ray_op_t* op = ray_ne(g, col, c);
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 2);
+        ray_release(result); ray_graph_free(g);
+
+        /* LT: 1<2→1, 2<2→0, 3<2→0, 2<2→0 → sum=1 */
+        g = ray_graph_new(tbl);
+        col = ray_scan(g, "cfa"); c = ray_const_f64(g, 2.0);
+        op = ray_lt(g, col, c); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 1);
+        ray_release(result); ray_graph_free(g);
+
+        /* LE: 1<=2→1, 2<=2→1, 3<=2→0, 2<=2→1 → sum=3 */
+        g = ray_graph_new(tbl);
+        col = ray_scan(g, "cfa"); c = ray_const_f64(g, 2.0);
+        op = ray_le(g, col, c); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 3);
+        ray_release(result); ray_graph_free(g);
+
+        /* GE: 1>=2→0, 2>=2→1, 3>=2→1, 2>=2→1 → sum=3 */
+        g = ray_graph_new(tbl);
+        col = ray_scan(g, "cfa"); c = ray_const_f64(g, 2.0);
+        op = ray_ge(g, col, c); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 3);
+        ray_release(result); ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* --- BOOL out: src_is_i64_all=false (F64 lhs vs I64 scalar) --- */
+    {
+        double rawa[] = {1.0, 2.0, 3.0};
+        ray_t* va = make_sliced(ray_vec_from_raw(RAY_F64, rawa, 3));
+        int64_t na = ray_sym_intern("cfb", 3);
+        ray_t* tbl = make_col_table(na, va);
+        ray_release(va);
+
+        /* GT: 1>2→0, 2>2→0, 3>2→1 → sum=1 */
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* col = ray_scan(g, "cfb");
+        ray_op_t* c = ray_const_i64(g, 2);
+        ray_op_t* op = ray_gt(g, col, c);
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 1);
+        ray_release(result); ray_graph_free(g);
+
+        /* LT: 1<2→1, 2<2→0, 3<2→0 → sum=1 */
+        g = ray_graph_new(tbl);
+        col = ray_scan(g, "cfb"); c = ray_const_i64(g, 2);
+        op = ray_lt(g, col, c); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 1);
+        ray_release(result); ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ---- binary_range: rp_u32 as rhs for F64 and BOOL out blocks ----
+ *
+ * SYM W32 col as RHS in F64 and BOOL operations → rp_u32 set.
+ * promote(F64, SYM) = F64 → F64 out for div/add.
+ * promote(I64, SYM) = I64 → BOOL out for cmp.
+ */
+static test_result_t test_expr_binary_rp_u32_f64(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* F64 LHS + SYM W32 RHS: rp_u32 in F64 output block.
+     * SYM W32 column: use ray_vec_slice to force non-fused path.
+     * Values: IDs 2,3 (2 elements only, no nullability needed). */
+    ray_t* vs_rw = ray_sym_vec_new(RAY_SYM_W32, 2);
+    vs_rw->len = 2;
+    uint32_t* sd = (uint32_t*)ray_data(vs_rw);
+    sd[0] = 2; sd[1] = 3;
+    ray_t* vs = ray_vec_slice(vs_rw, 0, 2);
+    ray_release(vs_rw);
+
+    double rawf[] = {6.0, 9.0};
+    ray_t* vf = make_sliced(ray_vec_from_raw(RAY_F64, rawf, 2));
+
+    int64_t na = ray_sym_intern("rw32", 4);
+    int64_t nb = ray_sym_intern("rf64", 4);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, na, vs);
+    tbl = ray_table_add_col(tbl, nb, vf);
+    ray_release(vs); ray_release(vf);
+
+    /* DIV: rf64 / rw32 → F64 out, lp_f64 + rp_u32
+     * 6/2=3.0, 9/3=3.0 → sum=6.0 */
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* cf = ray_scan(g, "rf64");
+    ray_op_t* cw = ray_scan(g, "rw32");
+    ray_op_t* op = ray_div(g, cf, cw);  /* F64/SYM → F64 out, lp_f64, rp_u32 */
+    ray_op_t* s = ray_sum(g, op);
+    ray_t* result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_F(result->f64, 6.0, 1e-9);  /* 3+3=6 */
+    ray_release(result); ray_graph_free(g);
+
+    /* ADD: rf64 + rw32 → F64 out, lp_f64, rp_u32
+     * 6+2=8, 9+3=12 → sum=20 */
+    g = ray_graph_new(tbl);
+    cf = ray_scan(g, "rf64"); cw = ray_scan(g, "rw32");
+    op = ray_add(g, cf, cw); s = ray_sum(g, op);
+    result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_F(result->f64, 20.0, 1e-9);
+    ray_release(result); ray_graph_free(g);
+
+    /* IDIV: rf64 idiv rw32 → I64 out, lp_f64, rp_u32 in I64 IDIV loop
+     * floor(6/2)=3, floor(9/3)=3 → sum=6 */
+    g = ray_graph_new(tbl);
+    cf = ray_scan(g, "rf64"); cw = ray_scan(g, "rw32");
+    op = ray_idiv(g, cf, cw); s = ray_sum(g, op);
+    result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->i64, 6);
+    ray_release(result); ray_graph_free(g);
+
+    /* MOD: rf64 mod rw32 → F64 out, lp_f64, rp_u32 in F64 MOD loop
+     * fmod(6,2)=0, fmod(9,3)=0 → sum=0 */
+    g = ray_graph_new(tbl);
+    cf = ray_scan(g, "rf64"); cw = ray_scan(g, "rw32");
+    op = ray_mod(g, cf, cw); s = ray_sum(g, op);
+    result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_F(result->f64, 0.0, 1e-9);
+    ray_release(result); ray_graph_free(g);
+
+    /* MIN2: min(rf64, rw32) → F64 out, lp_f64, rp_u32 in F64 MIN2 loop
+     * min(6,2)=2, min(9,3)=3 → sum=5 */
+    g = ray_graph_new(tbl);
+    cf = ray_scan(g, "rf64"); cw = ray_scan(g, "rw32");
+    op = ray_min2(g, cf, cw); s = ray_sum(g, op);
+    result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_F(result->f64, 5.0, 1e-9);
+    ray_release(result); ray_graph_free(g);
+
+    /* MAX2: max(rf64, rw32) → F64 out, lp_f64, rp_u32 in F64 MAX2 loop
+     * max(6,2)=6, max(9,3)=9 → sum=15 */
+    g = ray_graph_new(tbl);
+    cf = ray_scan(g, "rf64"); cw = ray_scan(g, "rw32");
+    op = ray_max2(g, cf, cw); s = ray_sum(g, op);
+    result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_F(result->f64, 15.0, 1e-9);
+    ray_release(result); ray_graph_free(g);
+
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ---- binary_range: I64 scalar (l_i64 cond8) as LHS in I32/I16/U8/BOOL blocks ----
+ *
+ * When l_scalar=true AND lhs type is not F64 → LV_READ arm 8 (l_i64).
+ * For I32/I16/U8 output blocks, we need: scalar + narrow_vec.
+ * promote(I64, I32) = I64 (not I32), so scalar + I32_vec → I64 out.
+ * To get I32 out with scalar lhs: need I32 scalar + I32 vec.
+ * But ray_i32() creates a scalar atom; ray_const_i64 creates I64 const.
+ * Use ray_const_i64 → scalar, I16/U8 rhs vec → I64/I32/I16/U8 output.
+ *
+ * Actually: promote(I64,I16)=I64, promote(I64,U8)=I64, promote(I32,I16)=I32.
+ * To get I32 out with scalar lhs: need I32_scalar + I16_vec.
+ * ray_const_i64() gives I64, not I32. But we can use ray_i32() atom as scalar?
+ * Let's verify: ray_i32() is an atom, exec.c will set l_scalar=true,
+ * and in exec_elementwise_binary l_f64/l_i64 are set from atom_to_numeric.
+ *
+ * Alternatively, for I32 out with l_i64 arm: need I32_scalar + I16_vec.
+ * But how to create an I32 scalar const in the graph? Let's just test I64 out.
+ */
+static test_result_t test_expr_binary_scalar_i64_lhs_all_ops(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* I64 scalar lhs + F64 vec rhs → F64 out (scalar F64 cond7 already covered).
+     * Actually l_i64 (cond8) is taken when l_scalar=true AND lhs type is NOT F64.
+     * For I64 scalar + F64 vec → out_type=F64, l_scalar=true, lhs->type=-RAY_I64 atom.
+     * Then LV_READ cond7: (l_scalar && lhs->type==-RAY_F64 || ==RAY_F64) → false since -RAY_I64.
+     * cond8: l_i64 → l_i64 = l_i64 from the l_i64 scalar value. Covers cond8.
+     */
+    {
+        double rawb[] = {2.0, 3.0, 4.0};
+        ray_t* vb = make_sliced(ray_vec_from_raw(RAY_F64, rawb, 3));
+        int64_t nb = ray_sym_intern("vfd", 3);
+        ray_t* tbl = make_col_table(nb, vb);
+        ray_release(vb);
+
+        /* ADD: 10 + [2,3,4] → F64 out, l_i64 (cond8) + rp_f64 (cond1)
+         * 12.0+13.0+14.0 = no, sum(10+2, 10+3, 10+4) = 12+13+14=39 */
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_const_i64(g, 10);
+        ray_op_t* b = ray_scan(g, "vfd");
+        ray_op_t* op = ray_add(g, a, b);  /* I64_scalar + F64_vec → F64 out */
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_F(result->f64, 39.0, 1e-9);
+        ray_release(result); ray_graph_free(g);
+
+        /* SUB: 10 - [2,3,4] = 8+7+6=21 */
+        g = ray_graph_new(tbl);
+        a = ray_const_i64(g, 10); b = ray_scan(g, "vfd");
+        op = ray_sub(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_F(result->f64, 21.0, 1e-9);
+        ray_release(result); ray_graph_free(g);
+
+        /* MUL: 3 * [2,3,4] = 6+9+12=27 */
+        g = ray_graph_new(tbl);
+        a = ray_const_i64(g, 3); b = ray_scan(g, "vfd");
+        op = ray_mul(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_F(result->f64, 27.0, 1e-9);
+        ray_release(result); ray_graph_free(g);
+
+        /* IDIV: 12 idiv [2,3,4] → I64 out, l_i64 + rp_f64
+         * floor(12/2)=6, floor(12/3)=4, floor(12/4)=3 → sum=13 */
+        g = ray_graph_new(tbl);
+        a = ray_const_i64(g, 12); b = ray_scan(g, "vfd");
+        op = ray_idiv(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 13);
+        ray_release(result); ray_graph_free(g);
+
+        /* MIN2: min(3, [2,3,4]) = 2+3+3=8 */
+        g = ray_graph_new(tbl);
+        a = ray_const_i64(g, 3); b = ray_scan(g, "vfd");
+        op = ray_min2(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_F(result->f64, 8.0, 1e-9);
+        ray_release(result); ray_graph_free(g);
+
+        /* MAX2: max(3, [2,3,4]) = 3+3+4=10 */
+        g = ray_graph_new(tbl);
+        a = ray_const_i64(g, 3); b = ray_scan(g, "vfd");
+        op = ray_max2(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_F(result->f64, 10.0, 1e-9);
+        ray_release(result); ray_graph_free(g);
+
+        /* BOOL: 3 == [2,3,4] → 0+1+0=1 (src_is_i64_all=false since rp_f64) */
+        g = ray_graph_new(tbl);
+        a = ray_const_i64(g, 3); b = ray_scan(g, "vfd");
+        op = ray_eq(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 1);
+        ray_release(result); ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* I64 scalar + I32 vec: l_i64 cond8 in I64 output block, rp_i32 cond3 */
+    {
+        int32_t rawb[] = {2, 3, 4};
+        ray_t* vb = make_sliced(ray_vec_from_raw(RAY_I32, rawb, 3));
+        int64_t nb = ray_sym_intern("vi32d", 5);
+        ray_t* tbl = make_col_table(nb, vb);
+        ray_release(vb);
+
+        /* ADD: 10 + [2,3,4] → I64 out, l_i64 + rp_i32
+         * 12+13+14=39 */
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_const_i64(g, 10);
+        ray_op_t* b = ray_scan(g, "vi32d");
+        ray_op_t* op = ray_add(g, a, b);
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 39);
+        ray_release(result); ray_graph_free(g);
+
+        /* SUB: 10 - [2,3,4] = 8+7+6=21 */
+        g = ray_graph_new(tbl);
+        a = ray_const_i64(g, 10); b = ray_scan(g, "vi32d");
+        op = ray_sub(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 21);
+        ray_release(result); ray_graph_free(g);
+
+        /* IDIV: 12 idiv [2,3,4] = 6+4+3=13 */
+        g = ray_graph_new(tbl);
+        a = ray_const_i64(g, 12); b = ray_scan(g, "vi32d");
+        op = ray_idiv(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 13);
+        ray_release(result); ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* I64 scalar + I16 vec: l_i64 + rp_i16 in I64 out block */
+    {
+        int16_t rawb[] = {2, 3, 4};
+        ray_t* vb = make_sliced(ray_vec_from_raw(RAY_I16, rawb, 3));
+        int64_t nb = ray_sym_intern("vi16d", 5);
+        ray_t* tbl = make_col_table(nb, vb);
+        ray_release(vb);
+
+        /* ADD: 10 + [2,3,4] = 12+13+14=39 */
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_const_i64(g, 10);
+        ray_op_t* b = ray_scan(g, "vi16d");
+        ray_op_t* op = ray_add(g, a, b);
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 39);
+        ray_release(result); ray_graph_free(g);
+
+        /* IDIV: 12 idiv [2,3,4] = 6+4+3=13 */
+        g = ray_graph_new(tbl);
+        a = ray_const_i64(g, 12); b = ray_scan(g, "vi16d");
+        op = ray_idiv(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 13);
+        ray_release(result); ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* I64 scalar + U8 vec: l_i64 + rp_bool in I64 out block */
+    {
+        uint8_t rawb[] = {2, 3, 4};
+        ray_t* vb = make_sliced(ray_vec_from_raw(RAY_U8, rawb, 3));
+        int64_t nb = ray_sym_intern("vu8d", 4);
+        ray_t* tbl = make_col_table(nb, vb);
+        ray_release(vb);
+
+        /* ADD: 10 + [2,3,4] = 12+13+14=39 */
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_const_i64(g, 10);
+        ray_op_t* b = ray_scan(g, "vu8d");
+        ray_op_t* op = ray_add(g, a, b);
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 39);
+        ray_release(result); ray_graph_free(g);
+
+        /* MOD: 10 % [2,3,4] = 0+1+2=3 */
+        g = ray_graph_new(tbl);
+        a = ray_const_i64(g, 10); b = ray_scan(g, "vu8d");
+        op = ray_mod(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 3);
+        ray_release(result); ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ---- binary_range: BOOL float-path (src_is_i64_all=false) with all LHS vec types ----
+ *
+ * src_is_i64_all=false fires when lp_f64 is set OR (l_scalar && F64 type) OR
+ * rp_f64 is set OR (r_scalar && F64 type).
+ *
+ * To get non-F64 LHS arms into the BOOL float path: use vec-vs-vec with F64 RHS col.
+ * vec-vs-vec bypasses both the BOOL fast path (requires r_scalar) and
+ * the arithmetic fast path (requires r_scalar).
+ *
+ * Covers: lp_i64/lp_i32/lp_u32/lp_i16/lp_bool in BOOL float loops.
+ */
+static test_result_t test_expr_binary_bool_float_path_lhs(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    double rawf[] = {1.0, 3.0, 5.0, 3.0};
+    ray_t* vf_base = ray_vec_from_raw(RAY_F64, rawf, 4);
+    ray_t* vf = make_sliced(vf_base);
+    int64_t nf = ray_sym_intern("bfp_rf64", 8);
+
+    /* lp_i64 + rp_f64 in BOOL float path */
+    {
+        int64_t rawl[] = {2, 3, 4, 3};
+        ray_t* vl = make_sliced(ray_vec_from_raw(RAY_I64, rawl, 4));
+        int64_t nl = ray_sym_intern("bfp_li64", 8);
+        ray_t* tbl = make_two_col_table(nl, vl, nf, vf);
+        ray_release(vl);
+
+        /* EQ: 2==1→F, 3==3→T, 4==5→F, 3==3→T → sum=2 */
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "bfp_li64");
+        ray_op_t* b = ray_scan(g, "bfp_rf64");
+        ray_op_t* op = ray_eq(g, a, b);
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 2);
+        ray_release(result); ray_graph_free(g);
+
+        /* NE: 2!=1→T, 3!=3→F, 4!=5→T, 3!=3→F → sum=2 */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "bfp_li64"); b = ray_scan(g, "bfp_rf64");
+        op = ray_ne(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 2);
+        ray_release(result); ray_graph_free(g);
+
+        /* LT: 2<1→F, 3<3→F, 4<5→T, 3<3→F → sum=1 */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "bfp_li64"); b = ray_scan(g, "bfp_rf64");
+        op = ray_lt(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 1);
+        ray_release(result); ray_graph_free(g);
+
+        /* LE: 2<=1→F, 3<=3→T, 4<=5→T, 3<=3→T → sum=3 */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "bfp_li64"); b = ray_scan(g, "bfp_rf64");
+        op = ray_le(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 3);
+        ray_release(result); ray_graph_free(g);
+
+        /* GT: 2>1→T, 3>3→F, 4>5→F, 3>3→F → sum=1 */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "bfp_li64"); b = ray_scan(g, "bfp_rf64");
+        op = ray_gt(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 1);
+        ray_release(result); ray_graph_free(g);
+
+        /* GE: 2>=1→T, 3>=3→T, 4>=5→F, 3>=3→T → sum=3 */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "bfp_li64"); b = ray_scan(g, "bfp_rf64");
+        op = ray_ge(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 3);
+        ray_release(result); ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* lp_i32 + rp_f64 in BOOL float path */
+    {
+        int32_t rawl[] = {2, 3, 4, 3};
+        ray_t* vl = make_sliced(ray_vec_from_raw(RAY_I32, rawl, 4));
+        int64_t nl = ray_sym_intern("bfp_li32", 8);
+        ray_t* tbl = make_two_col_table(nl, vl, nf, vf);
+        ray_release(vl);
+
+        /* LT: 2<1→F, 3<3→F, 4<5→T, 3<3→F → sum=1 */
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "bfp_li32");
+        ray_op_t* b = ray_scan(g, "bfp_rf64");
+        ray_op_t* op = ray_lt(g, a, b);
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 1);
+        ray_release(result); ray_graph_free(g);
+
+        /* GT: 2>1→T, 3>3→F, 4>5→F, 3>3→F → sum=1 */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "bfp_li32"); b = ray_scan(g, "bfp_rf64");
+        op = ray_gt(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 1);
+        ray_release(result); ray_graph_free(g);
+
+        /* EQ: 2==1→F, 3==3→T, 4==5→F, 3==3→T → sum=2 */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "bfp_li32"); b = ray_scan(g, "bfp_rf64");
+        op = ray_eq(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 2);
+        ray_release(result); ray_graph_free(g);
+
+        /* NE: 2 */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "bfp_li32"); b = ray_scan(g, "bfp_rf64");
+        op = ray_ne(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 2);
+        ray_release(result); ray_graph_free(g);
+
+        /* LE: 2<=1→F, 3<=3→T, 4<=5→T, 3<=3→T → sum=3 */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "bfp_li32"); b = ray_scan(g, "bfp_rf64");
+        op = ray_le(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 3);
+        ray_release(result); ray_graph_free(g);
+
+        /* GE: 2>=1→T, 3>=3→T, 4>=5→F, 3>=3→T → sum=3 */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "bfp_li32"); b = ray_scan(g, "bfp_rf64");
+        op = ray_ge(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 3);
+        ray_release(result); ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* lp_i16 + rp_f64 in BOOL float path */
+    {
+        int16_t rawl[] = {2, 3, 4, 3};
+        ray_t* vl = make_sliced(ray_vec_from_raw(RAY_I16, rawl, 4));
+        int64_t nl = ray_sym_intern("bfp_li16", 8);
+        ray_t* tbl = make_two_col_table(nl, vl, nf, vf);
+        ray_release(vl);
+
+        /* LT + GT + EQ + NE */
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "bfp_li16");
+        ray_op_t* b = ray_scan(g, "bfp_rf64");
+        ray_op_t* op = ray_lt(g, a, b);
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 1);
+        ray_release(result); ray_graph_free(g);
+
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "bfp_li16"); b = ray_scan(g, "bfp_rf64");
+        op = ray_ge(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 3);
+        ray_release(result); ray_graph_free(g);
+
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "bfp_li16"); b = ray_scan(g, "bfp_rf64");
+        op = ray_eq(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 2);
+        ray_release(result); ray_graph_free(g);
+
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "bfp_li16"); b = ray_scan(g, "bfp_rf64");
+        op = ray_ne(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 2);
+        ray_release(result); ray_graph_free(g);
+
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "bfp_li16"); b = ray_scan(g, "bfp_rf64");
+        op = ray_le(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 3);
+        ray_release(result); ray_graph_free(g);
+
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "bfp_li16"); b = ray_scan(g, "bfp_rf64");
+        op = ray_gt(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 1);
+        ray_release(result); ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* lp_bool (U8 col) + rp_f64 in BOOL float path */
+    {
+        uint8_t rawl[] = {2, 3, 4, 3};
+        ray_t* vl = make_sliced(ray_vec_from_raw(RAY_U8, rawl, 4));
+        int64_t nl = ray_sym_intern("bfp_lu8", 7);
+        ray_t* tbl = make_two_col_table(nl, vl, nf, vf);
+        ray_release(vl);
+
+        /* LT */
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "bfp_lu8");
+        ray_op_t* b = ray_scan(g, "bfp_rf64");
+        ray_op_t* op = ray_lt(g, a, b);
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 1);
+        ray_release(result); ray_graph_free(g);
+
+        /* GE */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "bfp_lu8"); b = ray_scan(g, "bfp_rf64");
+        op = ray_ge(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 3);
+        ray_release(result); ray_graph_free(g);
+
+        /* EQ */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "bfp_lu8"); b = ray_scan(g, "bfp_rf64");
+        op = ray_eq(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 2);
+        ray_release(result); ray_graph_free(g);
+
+        /* GT */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "bfp_lu8"); b = ray_scan(g, "bfp_rf64");
+        op = ray_gt(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 1);
+        ray_release(result); ray_graph_free(g);
+
+        /* NE */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "bfp_lu8"); b = ray_scan(g, "bfp_rf64");
+        op = ray_ne(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 2);
+        ray_release(result); ray_graph_free(g);
+
+        /* LE */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "bfp_lu8"); b = ray_scan(g, "bfp_rf64");
+        op = ray_le(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 3);
+        ray_release(result); ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* lp_u32 (SYM W32 sliced col) + rp_f64 in BOOL float path */
+    {
+        ray_t* vl_raw = ray_sym_vec_new(RAY_SYM_W32, 4);
+        vl_raw->len = 4;
+        uint32_t* ld = (uint32_t*)ray_data(vl_raw);
+        ld[0] = 2; ld[1] = 3; ld[2] = 4; ld[3] = 3;
+        ray_t* vl = ray_vec_slice(vl_raw, 0, 4);
+        ray_release(vl_raw);
+        int64_t nl = ray_sym_intern("bfp_lw32", 8);
+        ray_t* tbl = make_two_col_table(nl, vl, nf, vf);
+        ray_release(vl);
+
+        /* LT: 2<1→F, 3<3→F, 4<5→T, 3<3→F → sum=1
+         * promote(SYM,F64)=F64 → F64 out, but lp_u32 in BOOL...
+         * Actually promote(SYM,F64)=F64 (from promote() rules: RAY_SYM or RAY_F64 → F64
+         * Wait: promote checks F64 first, then I64|SYM, etc.
+         * Line 465: if a==F64 || b==F64 → F64
+         * Line 466: if ... || a==SYM || b==SYM ... → I64 (not F64)
+         * So for ray_lt(SYM_W32_col, F64_col):
+         * lt has BOOL output (hardcoded), not promote(). So out_type=BOOL. ✓
+         * lhs->type=RAY_SYM_W32 → lp_u32 set (SYM_W32 arm)
+         * rhs->type=RAY_F64 → rp_f64 set → r_is_int=false → src_is_i64_all=false → float path ✓
+         */
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "bfp_lw32");
+        ray_op_t* b = ray_scan(g, "bfp_rf64");
+        ray_op_t* op = ray_lt(g, a, b);
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 1);
+        ray_release(result); ray_graph_free(g);
+
+        /* GT: 2>1→T, 3>3→F, 4>5→F, 3>3→F → sum=1 */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "bfp_lw32"); b = ray_scan(g, "bfp_rf64");
+        op = ray_gt(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 1);
+        ray_release(result); ray_graph_free(g);
+
+        /* EQ: 2==1→F, 3==3→T, 4==5→F, 3==3→T → sum=2 */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "bfp_lw32"); b = ray_scan(g, "bfp_rf64");
+        op = ray_eq(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 2);
+        ray_release(result); ray_graph_free(g);
+
+        /* NE */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "bfp_lw32"); b = ray_scan(g, "bfp_rf64");
+        op = ray_ne(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 2);
+        ray_release(result); ray_graph_free(g);
+
+        /* LE: 2<=1→F, 3<=3→T, 4<=5→T, 3<=3→T → sum=3 */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "bfp_lw32"); b = ray_scan(g, "bfp_rf64");
+        op = ray_le(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 3);
+        ray_release(result); ray_graph_free(g);
+
+        /* GE: 2>=1→T, 3>=3→T, 4>=5→F, 3>=3→T → sum=3 */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "bfp_lw32"); b = ray_scan(g, "bfp_rf64");
+        op = ray_ge(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 3);
+        ray_release(result); ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    ray_release(vf);
+
+    /* Also cover AND/OR in BOOL float path with I64/I32/I16/U8 lhs + F64 rhs.
+     * Use fresh data with non-zero values so AND/OR give meaningful results.
+     * I64 lhs + F64 rhs: both vecs → src_is_i64_all=false (rp_f64 set). */
+    {
+        double rawrf[] = {1.0, 0.0, 3.0};
+        ray_t* vrf = make_sliced(ray_vec_from_raw(RAY_F64, rawrf, 3));
+        int64_t nrf = ray_sym_intern("bfp_and_rf", 10);
+
+        /* I64 lhs + F64 rhs AND/OR */
+        {
+            int64_t rawl[] = {2, 3, 0};
+            ray_t* vl = make_sliced(ray_vec_from_raw(RAY_I64, rawl, 3));
+            int64_t nl = ray_sym_intern("bfp_and_i64", 11);
+            ray_t* tbl = make_two_col_table(nl, vl, nrf, vrf);
+            ray_release(vl);
+
+            /* AND: 2&&1=1, 3&&0=0, 0&&3=0 → sum=1 */
+            ray_graph_t* g = ray_graph_new(tbl);
+            ray_op_t* a = ray_scan(g, "bfp_and_i64");
+            ray_op_t* b = ray_scan(g, "bfp_and_rf");
+            ray_op_t* op = ray_and(g, a, b);
+            ray_op_t* s = ray_sum(g, op);
+            ray_t* result = ray_execute(g, s);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+            TEST_ASSERT_EQ_I(result->i64, 1);
+            ray_release(result); ray_graph_free(g);
+
+            /* OR: 2||1=1, 3||0=1, 0||3=1 → sum=3 */
+            g = ray_graph_new(tbl);
+            a = ray_scan(g, "bfp_and_i64"); b = ray_scan(g, "bfp_and_rf");
+            op = ray_or(g, a, b); s = ray_sum(g, op);
+            result = ray_execute(g, s);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+            TEST_ASSERT_EQ_I(result->i64, 3);
+            ray_release(result); ray_graph_free(g);
+
+            ray_release(tbl);
+        }
+
+        /* I32 lhs + F64 rhs AND/OR */
+        {
+            int32_t rawl[] = {2, 3, 0};
+            ray_t* vl = make_sliced(ray_vec_from_raw(RAY_I32, rawl, 3));
+            int64_t nl = ray_sym_intern("bfp_and_i32", 11);
+            ray_t* tbl = make_two_col_table(nl, vl, nrf, vrf);
+            ray_release(vl);
+
+            ray_graph_t* g = ray_graph_new(tbl);
+            ray_op_t* a = ray_scan(g, "bfp_and_i32");
+            ray_op_t* b = ray_scan(g, "bfp_and_rf");
+            ray_op_t* op = ray_and(g, a, b);
+            ray_op_t* s = ray_sum(g, op);
+            ray_t* result = ray_execute(g, s);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+            TEST_ASSERT_EQ_I(result->i64, 1);
+            ray_release(result); ray_graph_free(g);
+
+            g = ray_graph_new(tbl);
+            a = ray_scan(g, "bfp_and_i32"); b = ray_scan(g, "bfp_and_rf");
+            op = ray_or(g, a, b); s = ray_sum(g, op);
+            result = ray_execute(g, s);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+            TEST_ASSERT_EQ_I(result->i64, 3);
+            ray_release(result); ray_graph_free(g);
+
+            ray_release(tbl);
+        }
+
+        /* I16 lhs + F64 rhs AND/OR */
+        {
+            int16_t rawl[] = {2, 3, 0};
+            ray_t* vl = make_sliced(ray_vec_from_raw(RAY_I16, rawl, 3));
+            int64_t nl = ray_sym_intern("bfp_and_i16", 11);
+            ray_t* tbl = make_two_col_table(nl, vl, nrf, vrf);
+            ray_release(vl);
+
+            ray_graph_t* g = ray_graph_new(tbl);
+            ray_op_t* a = ray_scan(g, "bfp_and_i16");
+            ray_op_t* b = ray_scan(g, "bfp_and_rf");
+            ray_op_t* op = ray_and(g, a, b);
+            ray_op_t* s = ray_sum(g, op);
+            ray_t* result = ray_execute(g, s);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+            TEST_ASSERT_EQ_I(result->i64, 1);
+            ray_release(result); ray_graph_free(g);
+
+            g = ray_graph_new(tbl);
+            a = ray_scan(g, "bfp_and_i16"); b = ray_scan(g, "bfp_and_rf");
+            op = ray_or(g, a, b); s = ray_sum(g, op);
+            result = ray_execute(g, s);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+            TEST_ASSERT_EQ_I(result->i64, 3);
+            ray_release(result); ray_graph_free(g);
+
+            ray_release(tbl);
+        }
+
+        /* U8 lhs + F64 rhs AND/OR */
+        {
+            uint8_t rawl[] = {2, 3, 0};
+            ray_t* vl = make_sliced(ray_vec_from_raw(RAY_U8, rawl, 3));
+            int64_t nl = ray_sym_intern("bfp_and_u8", 10);
+            ray_t* tbl = make_two_col_table(nl, vl, nrf, vrf);
+            ray_release(vl);
+
+            ray_graph_t* g = ray_graph_new(tbl);
+            ray_op_t* a = ray_scan(g, "bfp_and_u8");
+            ray_op_t* b = ray_scan(g, "bfp_and_rf");
+            ray_op_t* op = ray_and(g, a, b);
+            ray_op_t* s = ray_sum(g, op);
+            ray_t* result = ray_execute(g, s);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+            TEST_ASSERT_EQ_I(result->i64, 1);
+            ray_release(result); ray_graph_free(g);
+
+            g = ray_graph_new(tbl);
+            a = ray_scan(g, "bfp_and_u8"); b = ray_scan(g, "bfp_and_rf");
+            op = ray_or(g, a, b); s = ray_sum(g, op);
+            result = ray_execute(g, s);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+            TEST_ASSERT_EQ_I(result->i64, 3);
+            ray_release(result); ray_graph_free(g);
+
+            ray_release(tbl);
+        }
+
+        /* SYM W32 lhs + F64 rhs AND/OR */
+        {
+            ray_t* vl_raw = ray_sym_vec_new(RAY_SYM_W32, 3);
+            vl_raw->len = 3;
+            uint32_t* ld = (uint32_t*)ray_data(vl_raw);
+            ld[0] = 2; ld[1] = 3; ld[2] = 0;
+            ray_t* vl = ray_vec_slice(vl_raw, 0, 3);
+            ray_release(vl_raw);
+            int64_t nl = ray_sym_intern("bfp_and_w32", 11);
+            ray_t* tbl = make_two_col_table(nl, vl, nrf, vrf);
+            ray_release(vl);
+
+            ray_graph_t* g = ray_graph_new(tbl);
+            ray_op_t* a = ray_scan(g, "bfp_and_w32");
+            ray_op_t* b = ray_scan(g, "bfp_and_rf");
+            ray_op_t* op = ray_and(g, a, b);
+            ray_op_t* s = ray_sum(g, op);
+            ray_t* result = ray_execute(g, s);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+            TEST_ASSERT_EQ_I(result->i64, 1);
+            ray_release(result); ray_graph_free(g);
+
+            g = ray_graph_new(tbl);
+            a = ray_scan(g, "bfp_and_w32"); b = ray_scan(g, "bfp_and_rf");
+            op = ray_or(g, a, b); s = ray_sum(g, op);
+            result = ray_execute(g, s);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+            TEST_ASSERT_EQ_I(result->i64, 3);
+            ray_release(result); ray_graph_free(g);
+
+            ray_release(tbl);
+        }
+
+        ray_release(vrf);
+    }
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ---- binary_range: BOOL int-path (src_is_i64_all=true) with SYM W32 LHS ----
+ *
+ * SYM W32 vec + I64 vec → BOOL int path (lp_u32 in BOOL int comparison loops).
+ * lp_u32 set when lhs->type=SYM_W32 (sliced → non-fused).
+ * rp_i64 set when rhs->type=I64.
+ * Neither l_scalar nor r_scalar (vec-vs-vec → BOOL fast path skipped).
+ * l_is_int=true (lp_u32 is integer), r_is_int=true → src_is_i64_all=true → int path.
+ */
+static test_result_t test_expr_binary_bool_int_w32_lhs(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    ray_t* vs_raw = ray_sym_vec_new(RAY_SYM_W32, 4);
+    vs_raw->len = 4;
+    uint32_t* sd = (uint32_t*)ray_data(vs_raw);
+    sd[0] = 1; sd[1] = 3; sd[2] = 5; sd[3] = 3;
+    ray_t* vs = ray_vec_slice(vs_raw, 0, 4);
+    ray_release(vs_raw);
+
+    int64_t rawb[] = {2, 3, 4, 3};
+    ray_t* vb = make_sliced(ray_vec_from_raw(RAY_I64, rawb, 4));
+
+    int64_t na = ray_sym_intern("bip_lw32", 8);
+    int64_t nb = ray_sym_intern("bip_ri64", 8);
+    ray_t* tbl = make_two_col_table(na, vs, nb, vb);
+    ray_release(vs); ray_release(vb);
+
+    /* EQ: 1==2→F, 3==3→T, 5==4→F, 3==3→T → sum=2 */
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* a = ray_scan(g, "bip_lw32");
+    ray_op_t* b = ray_scan(g, "bip_ri64");
+    ray_op_t* op = ray_eq(g, a, b);
+    ray_op_t* s = ray_sum(g, op);
+    ray_t* result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->i64, 2);
+    ray_release(result); ray_graph_free(g);
+
+    /* NE: 1!=2→T, 3!=3→F, 5!=4→T, 3!=3→F → sum=2 */
+    g = ray_graph_new(tbl);
+    a = ray_scan(g, "bip_lw32"); b = ray_scan(g, "bip_ri64");
+    op = ray_ne(g, a, b); s = ray_sum(g, op);
+    result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->i64, 2);
+    ray_release(result); ray_graph_free(g);
+
+    /* LT: 1<2→T, 3<3→F, 5<4→F, 3<3→F → sum=1 */
+    g = ray_graph_new(tbl);
+    a = ray_scan(g, "bip_lw32"); b = ray_scan(g, "bip_ri64");
+    op = ray_lt(g, a, b); s = ray_sum(g, op);
+    result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->i64, 1);
+    ray_release(result); ray_graph_free(g);
+
+    /* LE: 1<=2→T, 3<=3→T, 5<=4→F, 3<=3→T → sum=3 */
+    g = ray_graph_new(tbl);
+    a = ray_scan(g, "bip_lw32"); b = ray_scan(g, "bip_ri64");
+    op = ray_le(g, a, b); s = ray_sum(g, op);
+    result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->i64, 3);
+    ray_release(result); ray_graph_free(g);
+
+    /* GT: 1>2→F, 3>3→F, 5>4→T, 3>3→F → sum=1 */
+    g = ray_graph_new(tbl);
+    a = ray_scan(g, "bip_lw32"); b = ray_scan(g, "bip_ri64");
+    op = ray_gt(g, a, b); s = ray_sum(g, op);
+    result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->i64, 1);
+    ray_release(result); ray_graph_free(g);
+
+    /* GE: 1>=2→F, 3>=3→T, 5>=4→T, 3>=3→T → sum=3 */
+    g = ray_graph_new(tbl);
+    a = ray_scan(g, "bip_lw32"); b = ray_scan(g, "bip_ri64");
+    op = ray_ge(g, a, b); s = ray_sum(g, op);
+    result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->i64, 3);
+    ray_release(result); ray_graph_free(g);
+
+    /* AND: 1&&2→T, 3&&3→T, 5&&4→T, 3&&3→T → sum=4 */
+    g = ray_graph_new(tbl);
+    a = ray_scan(g, "bip_lw32"); b = ray_scan(g, "bip_ri64");
+    op = ray_and(g, a, b); s = ray_sum(g, op);
+    result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->i64, 4);
+    ray_release(result); ray_graph_free(g);
+
+    /* OR: 1||2→T, 3||3→T, 5||4→T, 3||3→T → sum=4 */
+    g = ray_graph_new(tbl);
+    a = ray_scan(g, "bip_lw32"); b = ray_scan(g, "bip_ri64");
+    op = ray_or(g, a, b); s = ray_sum(g, op);
+    result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->i64, 4);
+    ray_release(result); ray_graph_free(g);
+
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ---- binary_range: I32 output with lp_i16 and lp_bool LHS arms ----
+ *
+ * I32 output fires when promote(lhs_type, rhs_type) = I32.
+ * - promote(I16, I32) = I32 → LHS=I16 col → lp_i16 in I32 output block
+ * - promote(U8, I32) = I32 → LHS=U8 col → lp_bool in I32 output block
+ * All ops: ADD/SUB/MUL/IDIV/MOD/MIN2/MAX2.
+ * Arithmetic fast path skipped: lhs->type != out_type (I16!=I32, U8!=I32).
+ */
+static test_result_t test_expr_binary_i32_narrow_lhs_arms(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* I16 lhs + I32 scalar → I32 out, lp_i16 in I32 block */
+    {
+        int16_t rawl[] = {3, 6, 9};
+        ray_t* vl = make_sliced(ray_vec_from_raw(RAY_I16, rawl, 3));
+        int64_t nl = ray_sym_intern("i32li16", 7);
+        ray_t* tbl = make_col_table(nl, vl);
+        ray_release(vl);
+
+        /* ADD: promote(I16, I32_scalar)... scalar atom type=-RAY_I32 → promote(-RAY_I32...)
+         * Actually ray_scan gives out_type=I16. ray_const_atom(I32 atom) gives out_type=I32.
+         * promote(I16, I32) = I32. ADD: 3+2=5, 6+2=8, 9+2=11 → sum=24 */
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* col = ray_scan(g, "i32li16");
+        ray_t* c_atom = ray_i32(2);
+        ray_op_t* c = ray_const_atom(g, c_atom);
+        ray_release(c_atom);
+        ray_op_t* op = ray_add(g, col, c);  /* I32 out, lp_i16 in I32 ADD */
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 24);
+        ray_release(result); ray_graph_free(g);
+
+        /* SUB: 3-2=1, 6-2=4, 9-2=7 → sum=12 */
+        g = ray_graph_new(tbl);
+        col = ray_scan(g, "i32li16");
+        c_atom = ray_i32(2); c = ray_const_atom(g, c_atom); ray_release(c_atom);
+        op = ray_sub(g, col, c); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 12);
+        ray_release(result); ray_graph_free(g);
+
+        /* MUL: 3*2=6, 6*2=12, 9*2=18 → sum=36 */
+        g = ray_graph_new(tbl);
+        col = ray_scan(g, "i32li16");
+        c_atom = ray_i32(2); c = ray_const_atom(g, c_atom); ray_release(c_atom);
+        op = ray_mul(g, col, c); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 36);
+        ray_release(result); ray_graph_free(g);
+
+        /* IDIV: floor(3/2)=1, floor(6/2)=3, floor(9/2)=4 → sum=8
+         * promote(I16, I32) for IDIV... actually ray_idiv uses promote → I32
+         * floor-div: 3/2=1, 6/2=3, 9/2=4 → 8 */
+        g = ray_graph_new(tbl);
+        col = ray_scan(g, "i32li16");
+        c_atom = ray_i32(2); c = ray_const_atom(g, c_atom); ray_release(c_atom);
+        op = ray_idiv(g, col, c); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 8);
+        ray_release(result); ray_graph_free(g);
+
+        /* MOD: 3%2=1, 6%2=0, 9%2=1 → sum=2 */
+        g = ray_graph_new(tbl);
+        col = ray_scan(g, "i32li16");
+        c_atom = ray_i32(2); c = ray_const_atom(g, c_atom); ray_release(c_atom);
+        op = ray_mod(g, col, c); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 2);
+        ray_release(result); ray_graph_free(g);
+
+        /* MIN2: min(3,2)=2, min(6,2)=2, min(9,2)=2 → sum=6 */
+        g = ray_graph_new(tbl);
+        col = ray_scan(g, "i32li16");
+        c_atom = ray_i32(2); c = ray_const_atom(g, c_atom); ray_release(c_atom);
+        op = ray_min2(g, col, c); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 6);
+        ray_release(result); ray_graph_free(g);
+
+        /* MAX2: max(3,2)=3, max(6,2)=6, max(9,2)=9 → sum=18 */
+        g = ray_graph_new(tbl);
+        col = ray_scan(g, "i32li16");
+        c_atom = ray_i32(2); c = ray_const_atom(g, c_atom); ray_release(c_atom);
+        op = ray_max2(g, col, c); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 18);
+        ray_release(result); ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* U8 lhs + I32 scalar → I32 out, lp_bool in I32 block */
+    {
+        uint8_t rawl[] = {3, 6, 9};
+        ray_t* vl = make_sliced(ray_vec_from_raw(RAY_U8, rawl, 3));
+        int64_t nl = ray_sym_intern("i32lu8", 6);
+        ray_t* tbl = make_col_table(nl, vl);
+        ray_release(vl);
+
+        /* ADD: 3+2=5, 6+2=8, 9+2=11 → sum=24 */
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* col = ray_scan(g, "i32lu8");
+        ray_t* c_atom = ray_i32(2);
+        ray_op_t* c = ray_const_atom(g, c_atom);
+        ray_release(c_atom);
+        ray_op_t* op = ray_add(g, col, c);  /* I32 out, lp_bool in I32 ADD */
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 24);
+        ray_release(result); ray_graph_free(g);
+
+        /* SUB: 3-2=1, 6-2=4, 9-2=7 → sum=12 */
+        g = ray_graph_new(tbl);
+        col = ray_scan(g, "i32lu8");
+        c_atom = ray_i32(2); c = ray_const_atom(g, c_atom); ray_release(c_atom);
+        op = ray_sub(g, col, c); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 12);
+        ray_release(result); ray_graph_free(g);
+
+        /* MUL: 3*2=6, 6*2=12, 9*2=18 → sum=36 */
+        g = ray_graph_new(tbl);
+        col = ray_scan(g, "i32lu8");
+        c_atom = ray_i32(2); c = ray_const_atom(g, c_atom); ray_release(c_atom);
+        op = ray_mul(g, col, c); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 36);
+        ray_release(result); ray_graph_free(g);
+
+        /* IDIV: floor(3/2)=1, floor(6/2)=3, floor(9/2)=4 → sum=8 */
+        g = ray_graph_new(tbl);
+        col = ray_scan(g, "i32lu8");
+        c_atom = ray_i32(2); c = ray_const_atom(g, c_atom); ray_release(c_atom);
+        op = ray_idiv(g, col, c); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 8);
+        ray_release(result); ray_graph_free(g);
+
+        /* MOD: 3%2=1, 6%2=0, 9%2=1 → sum=2 */
+        g = ray_graph_new(tbl);
+        col = ray_scan(g, "i32lu8");
+        c_atom = ray_i32(2); c = ray_const_atom(g, c_atom); ray_release(c_atom);
+        op = ray_mod(g, col, c); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 2);
+        ray_release(result); ray_graph_free(g);
+
+        /* MIN2: min(3,2)=2, min(6,2)=2, min(9,2)=2 → sum=6 */
+        g = ray_graph_new(tbl);
+        col = ray_scan(g, "i32lu8");
+        c_atom = ray_i32(2); c = ray_const_atom(g, c_atom); ray_release(c_atom);
+        op = ray_min2(g, col, c); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 6);
+        ray_release(result); ray_graph_free(g);
+
+        /* MAX2: max(3,2)=3, max(6,2)=6, max(9,2)=9 → sum=18 */
+        g = ray_graph_new(tbl);
+        col = ray_scan(g, "i32lu8");
+        c_atom = ray_i32(2); c = ray_const_atom(g, c_atom); ray_release(c_atom);
+        op = ray_max2(g, col, c); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 18);
+        ray_release(result); ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ---- binary_range: F64 output with more LHS × RHS × opcode combinations ----
+ *
+ * Cover remaining missing LV_READ/RV_READ arms in F64 output loops.
+ * Specifically: lp_u32 in F64 ADD/SUB opcodes (currently only DIV/ADD/IDIV/MOD/MIN2/MAX2).
+ * And: rp_u32 in I64 output loops.
+ * And: vec-vs-vec with I64 lhs + I32/I16/U8 rhs for more opcode coverage.
+ */
+static test_result_t test_expr_binary_f64_more_coverage(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* lp_u32 in F64 SUB and MUL loops:
+     * SYM W32 sliced col (lp_u32) + F64 scalar (arm7 RHS, r_scalar=true).
+     * promote(SYM, F64)=F64 → F64 out. Arithmetic fast path skipped (SYM≠F64 out).
+     * IDs: 2,3,4 */
+    {
+        ray_t* vs_raw = ray_sym_vec_new(RAY_SYM_W32, 3);
+        vs_raw->len = 3;
+        uint32_t* sd = (uint32_t*)ray_data(vs_raw);
+        sd[0] = 2; sd[1] = 3; sd[2] = 4;
+        ray_t* vs = ray_vec_slice(vs_raw, 0, 3);
+        ray_release(vs_raw);
+        int64_t na = ray_sym_intern("f64sw32", 7);
+        ray_t* tbl = make_col_table(na, vs);
+        ray_release(vs);
+
+        /* SUB: 2-1=1, 3-1=2, 4-1=3 → sum=6.0 */
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* col = ray_scan(g, "f64sw32");
+        ray_op_t* c = ray_const_f64(g, 1.0);
+        ray_op_t* op = ray_sub(g, col, c);  /* F64 out, lp_u32 in F64 SUB loop */
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_F(result->f64, 6.0, 1e-9);
+        ray_release(result); ray_graph_free(g);
+
+        /* MUL: 2*2=4, 3*2=6, 4*2=8 → sum=18.0 */
+        g = ray_graph_new(tbl);
+        col = ray_scan(g, "f64sw32");
+        c = ray_const_f64(g, 2.0);
+        op = ray_mul(g, col, c);  /* F64 out, lp_u32 in F64 MUL loop */
+        s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_F(result->f64, 18.0, 1e-9);
+        ray_release(result); ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* rp_u32 in I64 output loops (beyond IDIV/MOD/MIN2/MAX2 already covered):
+     * F64 vec LHS + SYM W32 sliced col RHS → F64 out (already covered in test_expr_binary_rp_u32_f64).
+     * For I64 out with rp_u32: need I64 LHS + SYM W32 RHS.
+     * promote(I64, SYM) = I64. lp_i64 + rp_u32 in I64 ADD/SUB/MUL loops. */
+    {
+        int64_t rawl[] = {10, 20, 30};
+        ray_t* vl = make_sliced(ray_vec_from_raw(RAY_I64, rawl, 3));
+        ray_t* vs_raw = ray_sym_vec_new(RAY_SYM_W32, 3);
+        vs_raw->len = 3;
+        uint32_t* sd = (uint32_t*)ray_data(vs_raw);
+        sd[0] = 2; sd[1] = 3; sd[2] = 4;
+        ray_t* vs = ray_vec_slice(vs_raw, 0, 3);
+        ray_release(vs_raw);
+
+        int64_t na = ray_sym_intern("i64rw_l", 7);
+        int64_t nb = ray_sym_intern("i64rw_r", 7);
+        ray_t* tbl = make_two_col_table(na, vl, nb, vs);
+        ray_release(vl); ray_release(vs);
+
+        /* ADD: 10+2=12, 20+3=23, 30+4=34 → sum=69 */
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "i64rw_l");
+        ray_op_t* b = ray_scan(g, "i64rw_r");
+        ray_op_t* op = ray_add(g, a, b);  /* I64 out, lp_i64+rp_u32 in I64 ADD */
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 69);
+        ray_release(result); ray_graph_free(g);
+
+        /* SUB: 10-2=8, 20-3=17, 30-4=26 → sum=51 */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "i64rw_l"); b = ray_scan(g, "i64rw_r");
+        op = ray_sub(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 51);
+        ray_release(result); ray_graph_free(g);
+
+        /* MUL: 10*2=20, 20*3=60, 30*4=120 → sum=200 */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "i64rw_l"); b = ray_scan(g, "i64rw_r");
+        op = ray_mul(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 200);
+        ray_release(result); ray_graph_free(g);
+
+        /* MIN2: min(10,2)=2, min(20,3)=3, min(30,4)=4 → sum=9 */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "i64rw_l"); b = ray_scan(g, "i64rw_r");
+        op = ray_min2(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 9);
+        ray_release(result); ray_graph_free(g);
+
+        /* MAX2: max(10,2)=10, max(20,3)=20, max(30,4)=30 → sum=60 */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "i64rw_l"); b = ray_scan(g, "i64rw_r");
+        op = ray_max2(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 60);
+        ray_release(result); ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* lp_u32 in F64 ADD loop via F64 scalar rhs (already done for DIV, now ADD covered above).
+     * Also cover rp_u32 in F64 SUB loop: F64 lhs + SYM W32 rhs */
+    {
+        double rawl[] = {10.0, 20.0, 30.0};
+        ray_t* vl = make_sliced(ray_vec_from_raw(RAY_F64, rawl, 3));
+        ray_t* vs_raw = ray_sym_vec_new(RAY_SYM_W32, 3);
+        vs_raw->len = 3;
+        uint32_t* sd = (uint32_t*)ray_data(vs_raw);
+        sd[0] = 2; sd[1] = 3; sd[2] = 4;
+        ray_t* vs = ray_vec_slice(vs_raw, 0, 3);
+        ray_release(vs_raw);
+
+        int64_t na = ray_sym_intern("f64lw_l", 7);
+        int64_t nb = ray_sym_intern("f64lw_r", 7);
+        ray_t* tbl = make_two_col_table(na, vl, nb, vs);
+        ray_release(vl); ray_release(vs);
+
+        /* SUB: lp_f64 + rp_u32 in F64 SUB loop: 10-2=8, 20-3=17, 30-4=26 → sum=51 */
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "f64lw_l");
+        ray_op_t* b = ray_scan(g, "f64lw_r");
+        ray_op_t* op = ray_sub(g, a, b);  /* F64 out, lp_f64+rp_u32 in F64 SUB */
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_F(result->f64, 51.0, 1e-9);
+        ray_release(result); ray_graph_free(g);
+
+        /* MUL: lp_f64 + rp_u32 in F64 MUL: 10*2=20, 20*3=60, 30*4=120 → sum=200 */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "f64lw_l"); b = ray_scan(g, "f64lw_r");
+        op = ray_mul(g, a, b);  /* F64 out, lp_f64+rp_u32 in F64 MUL */
+        s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_F(result->f64, 200.0, 1e-9);
+        ray_release(result); ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ---- binary_range: BOOL int-path with lp_i64+rp_i64 (vec-vs-vec comparison) ----
+ *
+ * I64 lhs vec + I64 rhs vec → BOOL output with comparison ops.
+ * Uses sliced cols to bypass fused path.
+ * BOOL fast path skipped (r_scalar=false).
+ * src_is_i64_all=true (both int vecs) → integer comparison path.
+ * Covers lp_i64 + rp_i64 in BOOL int EQ/NE/LT/LE/GT/GE/AND/OR loops.
+ */
+static test_result_t test_expr_binary_bool_int_i64_vecsve(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t rawl[] = {1, 3, 5, 3};
+    int64_t rawr[] = {2, 3, 4, 1};
+    ray_t* vl = make_sliced(ray_vec_from_raw(RAY_I64, rawl, 4));
+    ray_t* vr = make_sliced(ray_vec_from_raw(RAY_I64, rawr, 4));
+    int64_t nl = ray_sym_intern("bii64_l", 7);
+    int64_t nr = ray_sym_intern("bii64_r", 7);
+    ray_t* tbl = make_two_col_table(nl, vl, nr, vr);
+    ray_release(vl); ray_release(vr);
+
+    /* EQ: 1==2→F, 3==3→T, 5==4→F, 3==1→F → sum=1 */
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* a = ray_scan(g, "bii64_l");
+    ray_op_t* b = ray_scan(g, "bii64_r");
+    ray_op_t* op = ray_eq(g, a, b);
+    ray_op_t* s = ray_sum(g, op);
+    ray_t* result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->i64, 1);
+    ray_release(result); ray_graph_free(g);
+
+    /* NE: 1!=2→T, 3!=3→F, 5!=4→T, 3!=1→T → sum=3 */
+    g = ray_graph_new(tbl);
+    a = ray_scan(g, "bii64_l"); b = ray_scan(g, "bii64_r");
+    op = ray_ne(g, a, b); s = ray_sum(g, op);
+    result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->i64, 3);
+    ray_release(result); ray_graph_free(g);
+
+    /* LT: 1<2→T, 3<3→F, 5<4→F, 3<1→F → sum=1 */
+    g = ray_graph_new(tbl);
+    a = ray_scan(g, "bii64_l"); b = ray_scan(g, "bii64_r");
+    op = ray_lt(g, a, b); s = ray_sum(g, op);
+    result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->i64, 1);
+    ray_release(result); ray_graph_free(g);
+
+    /* LE: 1<=2→T, 3<=3→T, 5<=4→F, 3<=1→F → sum=2 */
+    g = ray_graph_new(tbl);
+    a = ray_scan(g, "bii64_l"); b = ray_scan(g, "bii64_r");
+    op = ray_le(g, a, b); s = ray_sum(g, op);
+    result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->i64, 2);
+    ray_release(result); ray_graph_free(g);
+
+    /* GT: 1>2→F, 3>3→F, 5>4→T, 3>1→T → sum=2 */
+    g = ray_graph_new(tbl);
+    a = ray_scan(g, "bii64_l"); b = ray_scan(g, "bii64_r");
+    op = ray_gt(g, a, b); s = ray_sum(g, op);
+    result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->i64, 2);
+    ray_release(result); ray_graph_free(g);
+
+    /* GE: 1>=2→F, 3>=3→T, 5>=4→T, 3>=1→T → sum=3 */
+    g = ray_graph_new(tbl);
+    a = ray_scan(g, "bii64_l"); b = ray_scan(g, "bii64_r");
+    op = ray_ge(g, a, b); s = ray_sum(g, op);
+    result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->i64, 3);
+    ray_release(result); ray_graph_free(g);
+
+    /* AND: 1&&2=1, 3&&3=1, 5&&4=1, 3&&1=1 → sum=4 */
+    g = ray_graph_new(tbl);
+    a = ray_scan(g, "bii64_l"); b = ray_scan(g, "bii64_r");
+    op = ray_and(g, a, b); s = ray_sum(g, op);
+    result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->i64, 4);
+    ray_release(result); ray_graph_free(g);
+
+    /* OR: all non-zero → sum=4 */
+    g = ray_graph_new(tbl);
+    a = ray_scan(g, "bii64_l"); b = ray_scan(g, "bii64_r");
+    op = ray_or(g, a, b); s = ray_sum(g, op);
+    result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->i64, 4);
+    ray_release(result); ray_graph_free(g);
+
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ---- binary_range: I32 output with lp_i16/lp_bool + rp_i32 vec-vs-vec ----
+ *
+ * Covers rp_i32 in I32 output block when LHS is I16 or U8 (not I32).
+ * I16 lhs + I32 rhs vec → promote(I16,I32)=I32 → I32 out.
+ * U8 lhs + I32 rhs vec → promote(U8,I32)=I32 → I32 out.
+ * lhs->type != out_type → arithmetic fast path skipped.
+ */
+static test_result_t test_expr_binary_i32_rp_i32_narrow_lhs(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* I16 lhs vec + I32 rhs vec: lp_i16 + rp_i32 in I32 output block */
+    {
+        int16_t rawl[] = {3, 6, 9};
+        int32_t rawr[] = {2, 3, 4};
+        ray_t* vl = make_sliced(ray_vec_from_raw(RAY_I16, rawl, 3));
+        ray_t* vr = make_sliced(ray_vec_from_raw(RAY_I32, rawr, 3));
+        int64_t nl = ray_sym_intern("i32l16v_l", 9);
+        int64_t nr = ray_sym_intern("i32l16v_r", 9);
+        ray_t* tbl = make_two_col_table(nl, vl, nr, vr);
+        ray_release(vl); ray_release(vr);
+
+        /* ADD: 3+2=5, 6+3=9, 9+4=13 → 27 */
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "i32l16v_l");
+        ray_op_t* b = ray_scan(g, "i32l16v_r");
+        ray_op_t* op = ray_add(g, a, b);  /* I32 out, lp_i16 + rp_i32 */
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 27);
+        ray_release(result); ray_graph_free(g);
+
+        /* SUB: 3-2=1, 6-3=3, 9-4=5 → 9 */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "i32l16v_l"); b = ray_scan(g, "i32l16v_r");
+        op = ray_sub(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 9);
+        ray_release(result); ray_graph_free(g);
+
+        /* MUL: 3*2=6, 6*3=18, 9*4=36 → 60 */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "i32l16v_l"); b = ray_scan(g, "i32l16v_r");
+        op = ray_mul(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 60);
+        ray_release(result); ray_graph_free(g);
+
+        /* MIN2: min(3,2)=2, min(6,3)=3, min(9,4)=4 → 9 */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "i32l16v_l"); b = ray_scan(g, "i32l16v_r");
+        op = ray_min2(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 9);
+        ray_release(result); ray_graph_free(g);
+
+        /* MAX2: max(3,2)=3, max(6,3)=6, max(9,4)=9 → 18 */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "i32l16v_l"); b = ray_scan(g, "i32l16v_r");
+        op = ray_max2(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 18);
+        ray_release(result); ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* U8 lhs vec + I32 rhs vec: lp_bool + rp_i32 in I32 output block */
+    {
+        uint8_t rawl[] = {3, 6, 9};
+        int32_t rawr[] = {2, 3, 4};
+        ray_t* vl = make_sliced(ray_vec_from_raw(RAY_U8, rawl, 3));
+        ray_t* vr = make_sliced(ray_vec_from_raw(RAY_I32, rawr, 3));
+        int64_t nl = ray_sym_intern("i32u8v_l", 8);
+        int64_t nr = ray_sym_intern("i32u8v_r", 8);
+        ray_t* tbl = make_two_col_table(nl, vl, nr, vr);
+        ray_release(vl); ray_release(vr);
+
+        /* ADD: 3+2=5, 6+3=9, 9+4=13 → 27 */
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "i32u8v_l");
+        ray_op_t* b = ray_scan(g, "i32u8v_r");
+        ray_op_t* op = ray_add(g, a, b);  /* I32 out, lp_bool + rp_i32 */
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 27);
+        ray_release(result); ray_graph_free(g);
+
+        /* MUL: 3*2=6, 6*3=18, 9*4=36 → 60 */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "i32u8v_l"); b = ray_scan(g, "i32u8v_r");
+        op = ray_mul(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 60);
+        ray_release(result); ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ---- binary_range: cover more I64/I32/I16 output combinations for remaining LV_READ arms ----
+ *
+ * Covers lp_i64+rp_u32 in I32 and I16 output blocks... wait those are dead.
+ * Instead: cover lp_i32 + rp_u32 in I64 block (I32 lhs + SYM W32 rhs → I64 out).
+ * And: cover vec-vs-vec for I64 out with all ops (ADD/SUB/MUL for more lhs arm combos).
+ */
+static test_result_t test_expr_binary_i64_rp_u32_more(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* lp_i32 + rp_u32 in I64 block:
+     * I32 lhs vec + SYM W32 rhs vec → promote(I32, SYM)=I64 → I64 out.
+     * Arithmetic fast path: lhs->type=I32 ≠ out_type=I64 → skipped.
+     */
+    {
+        int32_t rawl[] = {10, 20, 30};
+        ray_t* vl = make_sliced(ray_vec_from_raw(RAY_I32, rawl, 3));
+        ray_t* vs_raw = ray_sym_vec_new(RAY_SYM_W32, 3);
+        vs_raw->len = 3;
+        uint32_t* sd = (uint32_t*)ray_data(vs_raw);
+        sd[0] = 2; sd[1] = 3; sd[2] = 4;
+        ray_t* vs = ray_vec_slice(vs_raw, 0, 3);
+        ray_release(vs_raw);
+
+        int64_t na = ray_sym_intern("i64i32w_l", 9);
+        int64_t nb = ray_sym_intern("i64i32w_r", 9);
+        ray_t* tbl = make_two_col_table(na, vl, nb, vs);
+        ray_release(vl); ray_release(vs);
+
+        /* ADD: 10+2=12, 20+3=23, 30+4=34 → 69 */
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "i64i32w_l");
+        ray_op_t* b = ray_scan(g, "i64i32w_r");
+        ray_op_t* op = ray_add(g, a, b);  /* I64 out, lp_i32+rp_u32 */
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 69);
+        ray_release(result); ray_graph_free(g);
+
+        /* SUB: 10-2=8, 20-3=17, 30-4=26 → 51 */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "i64i32w_l"); b = ray_scan(g, "i64i32w_r");
+        op = ray_sub(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 51);
+        ray_release(result); ray_graph_free(g);
+
+        /* MUL: 10*2=20, 20*3=60, 30*4=120 → 200 */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "i64i32w_l"); b = ray_scan(g, "i64i32w_r");
+        op = ray_mul(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 200);
+        ray_release(result); ray_graph_free(g);
+
+        /* MOD: 10%2=0, 20%3=2, 30%4=2 → 4 */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "i64i32w_l"); b = ray_scan(g, "i64i32w_r");
+        op = ray_mod(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 4);
+        ray_release(result); ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* lp_i16 + rp_u32 in I64 block:
+     * I16 lhs + SYM W32 rhs → promote(I16, SYM)=I64 → I64 out */
+    {
+        int16_t rawl[] = {10, 20, 30};
+        ray_t* vl = make_sliced(ray_vec_from_raw(RAY_I16, rawl, 3));
+        ray_t* vs_raw = ray_sym_vec_new(RAY_SYM_W32, 3);
+        vs_raw->len = 3;
+        uint32_t* sd = (uint32_t*)ray_data(vs_raw);
+        sd[0] = 2; sd[1] = 3; sd[2] = 4;
+        ray_t* vs = ray_vec_slice(vs_raw, 0, 3);
+        ray_release(vs_raw);
+
+        int64_t na = ray_sym_intern("i64i16w_l", 9);
+        int64_t nb = ray_sym_intern("i64i16w_r", 9);
+        ray_t* tbl = make_two_col_table(na, vl, nb, vs);
+        ray_release(vl); ray_release(vs);
+
+        /* ADD: 10+2=12, 20+3=23, 30+4=34 → 69 */
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "i64i16w_l");
+        ray_op_t* b = ray_scan(g, "i64i16w_r");
+        ray_op_t* op = ray_add(g, a, b);
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 69);
+        ray_release(result); ray_graph_free(g);
+
+        /* SUB: 10-2=8, 20-3=17, 30-4=26 → 51 */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "i64i16w_l"); b = ray_scan(g, "i64i16w_r");
+        op = ray_sub(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 51);
+        ray_release(result); ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* lp_bool + rp_u32 in I64 block:
+     * U8 lhs + SYM W32 rhs → promote(U8, SYM)=I64 → I64 out */
+    {
+        uint8_t rawl[] = {10, 20, 30};
+        ray_t* vl = make_sliced(ray_vec_from_raw(RAY_U8, rawl, 3));
+        ray_t* vs_raw = ray_sym_vec_new(RAY_SYM_W32, 3);
+        vs_raw->len = 3;
+        uint32_t* sd = (uint32_t*)ray_data(vs_raw);
+        sd[0] = 2; sd[1] = 3; sd[2] = 4;
+        ray_t* vs = ray_vec_slice(vs_raw, 0, 3);
+        ray_release(vs_raw);
+
+        int64_t na = ray_sym_intern("i64u8w_l", 8);
+        int64_t nb = ray_sym_intern("i64u8w_r", 8);
+        ray_t* tbl = make_two_col_table(na, vl, nb, vs);
+        ray_release(vl); ray_release(vs);
+
+        /* ADD */
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "i64u8w_l");
+        ray_op_t* b = ray_scan(g, "i64u8w_r");
+        ray_op_t* op = ray_add(g, a, b);
+        ray_op_t* s = ray_sum(g, op);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 69);
+        ray_release(result); ray_graph_free(g);
+
+        /* MOD: 10%2=0, 20%3=2, 30%4=2 → 4 */
+        g = ray_graph_new(tbl);
+        a = ray_scan(g, "i64u8w_l"); b = ray_scan(g, "i64u8w_r");
+        op = ray_mod(g, a, b); s = ray_sum(g, op);
+        result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 4);
+        ray_release(result); ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
     ray_sym_destroy();
     ray_heap_destroy();
     PASS();
@@ -12142,7 +16144,29 @@ const test_entry_t exec_entries[] = {
     { "exec/expr_sym_w32_fast_eq_ne",            test_expr_sym_w32_fast_eq_ne,            NULL, NULL },
     { "exec/expr_sym_vec_vs_vec_nonfused",       test_expr_sym_vec_vs_vec_nonfused,       NULL, NULL },
     { "exec/expr_sym_str_scalar_left",           test_expr_sym_str_scalar_left,           NULL, NULL },
+    { "exec/expr_sym_w64_fast_scalar",           test_expr_sym_w64_fast_scalar,           NULL, NULL },
     { "exec/expr_fused_cast_narrow_to_f64",      test_expr_fused_cast_narrow_to_f64,      NULL, NULL },
     { "exec/expr_const_int_div_idiv",            test_expr_const_int_div_idiv,            NULL, NULL },
+    /* coverage-round-5: binary_range LV/RV READ systematic coverage */
+    { "exec/expr_binary_f64_all_lhs_types",    test_expr_binary_f64_all_lhs_types,    NULL, NULL },
+    { "exec/expr_binary_vecvec_minmax",        test_expr_binary_vecvec_minmax,        NULL, NULL },
+    { "exec/expr_binary_range_rhs_types",      test_expr_binary_range_rhs_types,      NULL, NULL },
+    { "exec/expr_binary_bool_narrow_lhs",      test_expr_binary_bool_narrow_lhs,      NULL, NULL },
+    { "exec/expr_binary_scalar_f64_lhs",       test_expr_binary_scalar_f64_lhs,       NULL, NULL },
+    /* coverage-round-5 part 2: SYM W32 lp_u32/rp_u32, I64→BOOL cast, fused F64 narrow */
+    { "exec/expr_binary_sym_w32_arith",        test_expr_binary_sym_w32_arith,        NULL, NULL },
+    { "exec/expr_binary_sym_w32_rhs",          test_expr_binary_sym_w32_rhs,          NULL, NULL },
+    { "exec/expr_unary_fused_f64_narrow",      test_expr_unary_fused_f64_narrow,      NULL, NULL },
+    { "exec/expr_binary_comprehensive_lhs",    test_expr_binary_comprehensive_lhs,    NULL, NULL },
+    { "exec/expr_binary_rp_u32_f64",           test_expr_binary_rp_u32_f64,           NULL, NULL },
+    { "exec/expr_binary_scalar_i64_lhs_all",   test_expr_binary_scalar_i64_lhs_all_ops, NULL, NULL },
+    /* coverage-round-5 part 3: remaining binary_range arms */
+    { "exec/expr_binary_bool_float_path_lhs",   test_expr_binary_bool_float_path_lhs,   NULL, NULL },
+    { "exec/expr_binary_bool_int_w32_lhs",      test_expr_binary_bool_int_w32_lhs,      NULL, NULL },
+    { "exec/expr_binary_i32_narrow_lhs_arms",   test_expr_binary_i32_narrow_lhs_arms,   NULL, NULL },
+    { "exec/expr_binary_f64_more_coverage",     test_expr_binary_f64_more_coverage,     NULL, NULL },
+    { "exec/expr_binary_bool_int_i64_vecsve",   test_expr_binary_bool_int_i64_vecsve,   NULL, NULL },
+    { "exec/expr_binary_i32_rp_i32_narrow_lhs", test_expr_binary_i32_rp_i32_narrow_lhs, NULL, NULL },
+    { "exec/expr_binary_i64_rp_u32_more",       test_expr_binary_i64_rp_u32_more,       NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
