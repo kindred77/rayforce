@@ -3946,16 +3946,12 @@ static size_t get_vmsize_bytes(void) {
  * pool mmap fails under tight RLIMIT_AS. */
 #define OOM_N 300000
 static test_result_t test_traverse_oom_paths(void) {
-    /* Skip under LLVM coverage instrumentation: profiling runtime reserves
-     * extra virtual address space that makes the tight RLIMIT_AS calculation
-     * unreliable (profiling mmap ops hit the limit → segfault in runtime). */
-    if (getenv("LLVM_PROFILE_FILE")) {
-        ray_heap_init();
-        (void)ray_sym_init();
-        ray_sym_destroy();
-        ray_heap_destroy();
-        SKIP("skipped under coverage instrumentation");
-    }
+    /* Note: LLVM coverage instrumentation (LLVM_PROFILE_FILE) pre-allocates
+     * its write buffers at program start, before this test runs.  RLIMIT_AS
+     * is restored immediately after the OOM window closes (before heap_destroy),
+     * so the profiling runtime can flush normally at process exit.  The old
+     * runtime-env-var skip was overly conservative and prevented OOM-handler
+     * coverage in instrumented builds. */
     ray_heap_init();
     (void)ray_sym_init();
 
@@ -4070,7 +4066,8 @@ static test_result_t test_traverse_oom_paths(void) {
         ray_graph_t* g = ray_graph_new(NULL);
         ray_op_t* pr    = NULL, *cc  = NULL, *lv  = NULL, *dc  = NULL;
         ray_op_t* ts    = NULL, *cl  = NULL, *bt  = NULL, *cls = NULL;
-        ray_op_t* ep    = NULL, *ve  = NULL, *sp  = NULL, *sp_eq = NULL;
+        ray_op_t* ep    = NULL, *ep_d1 = NULL, *ep_d2 = NULL, *ep_fac = NULL;
+        ray_op_t* ve  = NULL, *sp  = NULL, *sp_eq = NULL;
         ray_op_t* dfs_op = NULL, *rw = NULL, *wco = NULL;
         ray_op_t* dj    = NULL, *mst_op = NULL, *as_op = NULL, *ks = NULL;
         if (g) {
@@ -4083,8 +4080,35 @@ static test_result_t test_traverse_oom_paths(void) {
             bt  = ray_betweenness(g, rel, 0);
             cls = ray_closeness(g, rel, 0);
 
+            /* exec_expand direction==0 OOM: hits EXPAND_DIR fwd */
             ray_op_t* exp_src = ray_const_i64(g, 0);
             if (exp_src) ep = ray_expand(g, exp_src, rel, 0);
+
+            /* exec_expand direction==1 OOM: hits EXPAND_DIR rev */
+            ray_op_t* exp_src1 = ray_const_i64(g, 0);
+            if (exp_src1) ep_d1 = ray_expand(g, exp_src1, rel, 1);
+
+            /* exec_expand direction==2 OOM: hits both fwd+rev direction==2 path */
+            ray_op_t* exp_src2 = ray_const_i64(g, 0);
+            if (exp_src2) ep_d2 = ray_expand(g, exp_src2, rel, 2);
+
+            /* exec_expand_factorized OOM: set factorized=1 on the direction==0 expand */
+            ray_op_t* exp_fac_src = ray_const_i64(g, 0);
+            if (exp_fac_src) {
+                ep_fac = ray_expand(g, exp_fac_src, rel, 0);
+                if (ep_fac) {
+                    /* Set factorized flag directly on ext node */
+                    ray_op_ext_t* fac_ext = NULL;
+                    uint32_t fac_id = ep_fac->id;
+                    for (uint32_t fi = 0; fi < g->ext_count; fi++) {
+                        if (g->ext_nodes[fi] && g->ext_nodes[fi]->base.id == fac_id) {
+                            fac_ext = g->ext_nodes[fi];
+                            break;
+                        }
+                    }
+                    if (fac_ext) fac_ext->graph.factorized = 1;
+                }
+            }
 
             ray_op_t* ve_src = ray_const_i64(g, 0);
             if (ve_src) ve = ray_var_expand(g, ve_src, rel, 0, 1, 3, false);
@@ -4169,10 +4193,16 @@ static test_result_t test_traverse_oom_paths(void) {
             if (bt)  { ray_t* r = ray_execute(g, bt);  if (r) ray_release(r); }
             /* exec_closeness OOM: 3 arrays × 2.4 MB = 7.2 MB */
             if (cls) { ray_t* r = ray_execute(g, cls); if (r) ray_release(r); }
-            /* exec_expand OOM: out_start/end/depth = 7.2 MB */
-            if (ep)  { ray_t* r = ray_execute(g, ep);  if (r) ray_release(r); }
+            /* exec_expand OOM direction==0: EXPAND_DIR fwd */
+            if (ep)    { ray_t* r = ray_execute(g, ep);    if (r) ray_release(r); }
+            /* exec_expand OOM direction==1: EXPAND_DIR rev */
+            if (ep_d1) { ray_t* r = ray_execute(g, ep_d1); if (r) ray_release(r); }
+            /* exec_expand OOM direction==2: both fwd+rev path */
+            if (ep_d2) { ray_t* r = ray_execute(g, ep_d2); if (r) ray_release(r); }
+            /* exec_expand_factorized OOM: ray_vec_new for out_src/out_cnt */
+            if (ep_fac) { ray_t* r = ray_execute(g, ep_fac); if (r) ray_release(r); }
             /* exec_var_expand OOM: similar scratch arrays */
-            if (ve)  { ray_t* r = ray_execute(g, ve);  if (r) ray_release(r); }
+            if (ve)    { ray_t* r = ray_execute(g, ve);    if (r) ray_release(r); }
             /* exec_shortest_path OOM: parent[] = 2.4 MB */
             if (sp)  { ray_t* r = ray_execute(g, sp);  if (r) ray_release(r); }
             /* exec_shortest_path src==dst OOM: vec_from_raw fails (pre-built op) */
@@ -4341,6 +4371,395 @@ static test_result_t test_expand_factorized_both_dirs(void) {
 }
 
 /* --------------------------------------------------------------------------
+ * Test: exec_dijkstra with vector (non-atom) src and dst inputs.
+ * Hits: line 942 !ray_is_atom(src_val) branch, line 943 !ray_is_atom(dst_val) branch.
+ * Uses ray_const_vec so the input is a 1-element vector rather than an atom.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_dijkstra_vec_src_dst(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* 0->1 (w=1), 1->2 (w=2), 2->3 (w=1) */
+    int64_t src_arr[] = {0, 1, 2};
+    int64_t dst_arr[] = {1, 2, 3};
+    double  wts[]     = {1.0, 2.0, 1.0};
+    ray_t* edges;
+    ray_rel_t* rel = make_weighted_rel(src_arr, dst_arr, wts, 3, 4, &edges);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    ray_graph_t* g = ray_graph_new(NULL);
+
+    /* Pass src and dst as 1-element I64 vectors (not atoms) */
+    ray_t* src_vec = ray_vec_from_raw(RAY_I64, (int64_t[]){0}, 1);
+    ray_t* dst_vec = ray_vec_from_raw(RAY_I64, (int64_t[]){3}, 1);
+    TEST_ASSERT_NOT_NULL(src_vec);
+    TEST_ASSERT_NOT_NULL(dst_vec);
+
+    ray_op_t* src_op = ray_const_vec(g, src_vec);
+    ray_op_t* dst_op = ray_const_vec(g, dst_vec);
+    ray_release(src_vec);
+    ray_release(dst_vec);
+    TEST_ASSERT_NOT_NULL(src_op);
+    TEST_ASSERT_NOT_NULL(dst_op);
+
+    ray_op_t* dijk_op = ray_dijkstra(g, src_op, dst_op, rel, "weight", 10);
+    TEST_ASSERT_NOT_NULL(dijk_op);
+
+    ray_t* result = ray_execute(g, dijk_op);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
+    /* Path 0->1->2->3 = total dist 4.0; all 4 nodes reachable */
+    int64_t node_sym = ray_sym_intern("_node", 5);
+    ray_t* node_col = ray_table_get_col(result, node_sym);
+    TEST_ASSERT_NOT_NULL(node_col);
+    TEST_ASSERT_EQ_I(node_col->len, 4);
+    ray_release(result);
+
+    ray_graph_free(g);
+    ray_rel_free(rel);
+    ray_release(edges);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: exec_astar with src==dst: path of length 0 (no traversal needed).
+ * The A* loop starts and immediately breaks when u==dst_id.
+ * Hits: the `if (u == dst_id) break` branch (line 2283 at ^21).
+ * -------------------------------------------------------------------------- */
+static test_result_t test_astar_src_eq_dst(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* 4-node ring: 0->1->2->3->0 */
+    int64_t src_arr[] = {0, 1, 2, 3};
+    int64_t dst_arr[] = {1, 2, 3, 0};
+    double  wts[]     = {1.0, 1.0, 1.0, 1.0};
+    ray_t* edges;
+    ray_rel_t* rel = make_weighted_rel(src_arr, dst_arr, wts, 4, 4, &edges);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    /* Node props: lat/lon for all 4 nodes */
+    double lats[] = {0.0, 1.0, 1.0, 0.0};
+    double lons[] = {0.0, 0.0, 1.0, 1.0};
+    ray_t* lat_v = ray_vec_from_raw(RAY_F64, lats, 4);
+    ray_t* lon_v = ray_vec_from_raw(RAY_F64, lons, 4);
+    lat_v->len = 4; lon_v->len = 4;
+    ray_t* np = ray_table_new(2);
+    np = ray_table_add_col(np, ray_sym_intern("lat", 3), lat_v); ray_release(lat_v);
+    np = ray_table_add_col(np, ray_sym_intern("lon", 3), lon_v); ray_release(lon_v);
+    TEST_ASSERT_NOT_NULL(np);
+
+    ray_graph_t* g = ray_graph_new(NULL);
+    ray_op_t* src_op = ray_const_i64(g, 2);
+    ray_op_t* dst_op = ray_const_i64(g, 2);  /* src == dst */
+    ray_op_t* astar_op = ray_astar(g, src_op, dst_op, rel, "weight", "lat", "lon", np, 10);
+    TEST_ASSERT_NOT_NULL(astar_op);
+
+    ray_t* result = ray_execute(g, astar_op);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
+    /* src==dst: only node 2 reachable with dist=0 */
+    int64_t node_sym = ray_sym_intern("_node", 5);
+    ray_t* node_col = ray_table_get_col(result, node_sym);
+    TEST_ASSERT_NOT_NULL(node_col);
+    /* At minimum, src node itself should be reachable */
+    TEST_ASSERT_TRUE(node_col->len >= 1);
+    ray_release(result);
+
+    ray_graph_free(g);
+    ray_rel_free(rel);
+    ray_release(edges);
+    ray_release(np);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: exec_dijkstra with m > n edge-dense graph where heap_cap branches on m.
+ * Also covers the case where dst is a vector (not atom) and m > n branch (heap_cap = m+1).
+ * Hits: line 965 m > n branch for Dijkstra heap_cap.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_dijkstra_vec_dst_dense(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* Dense 3-node graph: 6 edges (all i->j for i!=j) — m=6 > n=3 */
+    int64_t src_arr[] = {0, 0, 1, 1, 2, 2};
+    int64_t dst_arr[] = {1, 2, 0, 2, 0, 1};
+    double  wts[]     = {1.0, 2.0, 1.0, 1.0, 2.0, 1.0};
+    ray_t* edges;
+    ray_rel_t* rel = make_weighted_rel(src_arr, dst_arr, wts, 6, 3, &edges);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    ray_graph_t* g = ray_graph_new(NULL);
+    ray_t* src_vec = ray_vec_from_raw(RAY_I64, (int64_t[]){0}, 1);
+    ray_t* dst_vec = ray_vec_from_raw(RAY_I64, (int64_t[]){2}, 1);
+    src_vec->len = 1; dst_vec->len = 1;
+    ray_op_t* src_op = ray_const_vec(g, src_vec);
+    ray_op_t* dst_op = ray_const_vec(g, dst_vec);
+    ray_release(src_vec);
+    ray_release(dst_vec);
+
+    ray_op_t* dijk_op = ray_dijkstra(g, src_op, dst_op, rel, "weight", 10);
+    TEST_ASSERT_NOT_NULL(dijk_op);
+
+    ray_t* result = ray_execute(g, dijk_op);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
+    ray_release(result);
+
+    ray_graph_free(g);
+    ray_rel_free(rel);
+    ray_release(edges);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: exec_expand direction==2 with a negative node in src_data.
+ * Hits: Branch (244:17) True — `node < 0` in fill-forward loop.
+ *       Branch (256:17) True — `node < 0` in fill-reverse loop.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_expand_dir2_neg_src(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* 3-node symmetric graph: 0->1, 1->2 */
+    int64_t se[] = {0, 1};
+    int64_t de[] = {1, 2};
+    ray_rel_t* rel = make_rel_simple(se, de, 2, 3);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    ray_graph_t* g = ray_graph_new(NULL);
+    /* Source vector containing -1 (invalid/negative node) plus a valid node 0.
+     * The -1 entry triggers `node < 0` in both fwd and rev fill loops. */
+    ray_t* sv = ray_vec_from_raw(RAY_I64, (int64_t[]){-1, 0}, 2);
+    TEST_ASSERT_NOT_NULL(sv);
+    ray_op_t* src_op = ray_const_vec(g, sv);
+    ray_release(sv);
+    TEST_ASSERT_NOT_NULL(src_op);
+
+    ray_op_t* exp_op = ray_expand(g, src_op, rel, 2);
+    TEST_ASSERT_NOT_NULL(exp_op);
+
+    ray_t* result = ray_execute(g, exp_op);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    /* Only node 0 is valid; expand fwd: 0->1; expand rev: nothing from 0 */
+    TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
+    ray_release(result);
+
+    ray_graph_free(g);
+    ray_rel_free(rel);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: exec_expand direction==2 with fwd.n_nodes > rev.n_nodes.
+ * Source contains nodes in the fwd range but beyond rev.n_nodes.
+ * Hits: Branch (256:29) True — `node >= rev->n_nodes` in fill-reverse loop.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_expand_dir2_rev_smaller(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* Asymmetric: fwd has 8 nodes, rev has 4 nodes.
+     * Edges: 0->5, 1->6, 2->7 (fwd-only nodes 5,6,7 >= rev.n_nodes=4).
+     * Source: nodes 0,1,2,3 — nodes 0,1,2 have fwd edges to 5,6,7 which are
+     * out of rev.n_nodes range, so the rev fill hits the >= check. */
+    int64_t se[] = {0, 1, 2};
+    int64_t de[] = {5, 6, 7};
+    ray_rel_t* rel = make_rel_asym(se, de, 3, 8, 4);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    ray_graph_t* g = ray_graph_new(NULL);
+    /* src = {0,1,2,5,6,7}: nodes 5,6,7 are valid for fwd but >= rev.n_nodes=4 */
+    ray_t* sv = ray_vec_from_raw(RAY_I64, (int64_t[]){0, 1, 2, 5, 6, 7}, 6);
+    TEST_ASSERT_NOT_NULL(sv);
+    ray_op_t* src_op = ray_const_vec(g, sv);
+    ray_release(sv);
+    TEST_ASSERT_NOT_NULL(src_op);
+
+    ray_op_t* exp_op = ray_expand(g, src_op, rel, 2);
+    TEST_ASSERT_NOT_NULL(exp_op);
+
+    ray_t* result = ray_execute(g, exp_op);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
+    ray_release(result);
+
+    ray_graph_free(g);
+    ray_rel_free(rel);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: exec_var_expand with a negative start node in the start_vec.
+ * Hits: Branch (324:13) True — `start_node < 0` guard in per-source BFS loop.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_var_expand_neg_start(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t se[] = {0, 1, 2};
+    int64_t de[] = {1, 2, 3};
+    ray_rel_t* rel = make_rel_simple(se, de, 3, 4);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    ray_graph_t* g = ray_graph_new(NULL);
+    /* Start vector: -1 (invalid) and 0 (valid). The -1 hits the < 0 guard
+     * and is skipped; node 0 runs normally. */
+    ray_t* sv = ray_vec_from_raw(RAY_I64, (int64_t[]){-1, 0}, 2);
+    TEST_ASSERT_NOT_NULL(sv);
+    ray_op_t* src_op = ray_const_vec(g, sv);
+    ray_release(sv);
+    TEST_ASSERT_NOT_NULL(src_op);
+
+    ray_op_t* ve_op = ray_var_expand(g, src_op, rel, 0, 1, 3, false);
+    TEST_ASSERT_NOT_NULL(ve_op);
+
+    ray_t* result = ray_execute(g, ve_op);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
+    ray_release(result);
+
+    ray_graph_free(g);
+    ray_rel_free(rel);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: exec_var_expand direction==2 with asymmetric rel (fwd.n_nodes > rev.n_nodes).
+ * BFS frontier will contain nodes with IDs >= rev.n_nodes when expanding fwd.
+ * Hits: Branch (361:25) True — `node >= cur_csr->n_nodes` in inner BFS loop.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_var_expand_dir2_asym(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* fwd has 10 nodes (0..9), rev has 3 nodes (0..2).
+     * Edges: 0->5, 0->7, 1->8.  Nodes 5,7,8 are in fwd range but >= rev.n_nodes=3.
+     * When BFS visits node 5 in the frontier for the direction==2 loop,
+     * the rev CSR check (ci=1) fires: 5 >= rev.n_nodes(3). */
+    int64_t se[] = {0, 0, 1};
+    int64_t de[] = {5, 7, 8};
+    ray_rel_t* rel = make_rel_asym(se, de, 3, 10, 3);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    ray_graph_t* g = ray_graph_new(NULL);
+    ray_t* sv = ray_vec_from_raw(RAY_I64, (int64_t[]){0, 1}, 2);
+    TEST_ASSERT_NOT_NULL(sv);
+    ray_op_t* src_op = ray_const_vec(g, sv);
+    ray_release(sv);
+    TEST_ASSERT_NOT_NULL(src_op);
+
+    ray_op_t* ve_op = ray_var_expand(g, src_op, rel, 2, 1, 3, false);
+    TEST_ASSERT_NOT_NULL(ve_op);
+
+    ray_t* result = ray_execute(g, ve_op);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
+    ray_release(result);
+
+    ray_graph_free(g);
+    ray_rel_free(rel);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: exec_dijkstra with a strictly-negative (non -1) dst_id.
+ * -1 is the sentinel for "no dst"; -2 triggers the dst_id < 0 range check.
+ * Hits: Branch (946:26) True — `dst_id < 0` when dst is provided but negative.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_dijkstra_neg_dst(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t se[] = {0, 1};
+    int64_t de[] = {1, 2};
+    double  wts[] = {1.0, 1.0};
+    ray_t* edges;
+    ray_rel_t* rel = make_weighted_rel(se, de, wts, 2, 3, &edges);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    ray_graph_t* g = ray_graph_new(NULL);
+    ray_op_t* src_op = ray_const_i64(g, 0);
+    /* dst = -2: not the -1 sentinel, but negative → should trigger range error */
+    ray_op_t* dst_op = ray_const_i64(g, -2);
+    TEST_ASSERT_NOT_NULL(src_op);
+    TEST_ASSERT_NOT_NULL(dst_op);
+
+    ray_op_t* dijk_op = ray_dijkstra(g, src_op, dst_op, rel, "weight", 5);
+    TEST_ASSERT_NOT_NULL(dijk_op);
+
+    ray_t* result = ray_execute(g, dijk_op);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(result));
+    ray_release(result);
+
+    ray_graph_free(g);
+    ray_rel_free(rel);
+    ray_release(edges);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: exec_astar with node_props that has "lat" column but no "lon" column.
+ * Hits: Branch (2242:21) True — `!lon_vec` when lat is found but lon is not.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_astar_lat_only(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t se[] = {0, 1};
+    int64_t de[] = {1, 2};
+    double  wts[] = {1.0, 1.0};
+    ray_t* edges;
+    ray_rel_t* rel = make_weighted_rel(se, de, wts, 2, 3, &edges);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    /* Node props with "lat" but NO "lon" column */
+    double lat_arr[] = {0.0, 1.0, 2.0};
+    ray_t* lat_v = ray_vec_new(RAY_F64, 3);
+    memcpy(ray_data(lat_v), lat_arr, sizeof(lat_arr));
+    lat_v->len = 3;
+    ray_t* np = ray_table_new(1);
+    np = ray_table_add_col(np, ray_sym_intern("lat", 3), lat_v);
+    ray_release(lat_v);
+    TEST_ASSERT_NOT_NULL(np);
+
+    ray_graph_t* g = ray_graph_new(NULL);
+    ray_op_t* src_op = ray_const_i64(g, 0);
+    ray_op_t* dst_op = ray_const_i64(g, 2);
+    ray_op_t* astar_op = ray_astar(g, src_op, dst_op, rel, "weight", "lat", "lon", np, 10);
+    TEST_ASSERT_NOT_NULL(astar_op);
+
+    ray_t* result = ray_execute(g, astar_op);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(result));
+    ray_release(result);
+
+    ray_graph_free(g);
+    ray_rel_free(rel);
+    ray_release(edges);
+    ray_release(np);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
  * Suite
  * -------------------------------------------------------------------------- */
 
@@ -4437,5 +4856,14 @@ const test_entry_t traverse_entries[] = {
     { "traverse/k_shortest_found_path_dup",   test_k_shortest_found_path_dup,      NULL, NULL },
     { "traverse/expand_sip_asym_rev_larger",  test_expand_sip_asym_rev_larger,     NULL, NULL },
     { "traverse/expand_factorized_both_dirs", test_expand_factorized_both_dirs,    NULL, NULL },
+    { "traverse/dijkstra_vec_src_dst",        test_dijkstra_vec_src_dst,           NULL, NULL },
+    { "traverse/astar_src_eq_dst",            test_astar_src_eq_dst,               NULL, NULL },
+    { "traverse/dijkstra_vec_dst_dense",      test_dijkstra_vec_dst_dense,         NULL, NULL },
+    { "traverse/expand_dir2_neg_src",         test_expand_dir2_neg_src,            NULL, NULL },
+    { "traverse/expand_dir2_rev_smaller",     test_expand_dir2_rev_smaller,        NULL, NULL },
+    { "traverse/var_expand_neg_start",        test_var_expand_neg_start,           NULL, NULL },
+    { "traverse/var_expand_dir2_asym",        test_var_expand_dir2_asym,           NULL, NULL },
+    { "traverse/dijkstra_neg_dst",            test_dijkstra_neg_dst,               NULL, NULL },
+    { "traverse/astar_lat_only",              test_astar_lat_only,                 NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
