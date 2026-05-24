@@ -33,9 +33,30 @@
 (as 'I64 [1i 2i 3i])       -- [1 2 3]
 (type (as 'I64 [1i 2i 3i])) -- 'I64
 
+;; CAST DATE → I64 via exec_elementwise_unary (line 1402:35 True)
+;; Nullable DATE column forces expr_compile to fail → fallback to unary path.
+;; 2000.01.01=0, 2000.01.02=1, 2000.01.03=2 (days since 2000 epoch)
+(set _Tdate (table [d] (list (as 'DATE [0 1 0N 2]))))
+(sum (at (select {r: (as 'I64 d) from: _Tdate}) 'r)) -- 3
+
+;; CAST TIME → I64 via exec_elementwise_unary (line 1402:58 True)
+;; Nullable TIME column forces expr_compile to fail → fallback to unary path.
+;; TIME values are milliseconds: 1000ms, null, 2000ms
+(set _Ttime (table [t] (list (as 'TIME [1000 0N 2000]))))
+(sum (at (select {r: (as 'I64 t) from: _Ttime}) 'r)) -- 3000
+
 ;; CAST I32 → F64  (line 1348-1355)
 (as 'F64 [1i 2i 3i])       -- [1.0 2.0 3.0]
 (type (as 'F64 [1i 2i 3i])) -- 'F64
+
+;; CAST DATE → F64 via exec_elementwise_unary (line 1402 else: out_type==RAY_F64)
+;; Nullable DATE column forces fallback; out_type=F64 → else branch of line 1403.
+(set _Tdate2 (table [d] (list (as 'DATE [0 1 0N 2]))))
+(< (abs (- (sum (at (select {r: (as 'F64 d) from: _Tdate2}) 'r)) 3.0)) 0.001) -- true
+
+;; CAST TIME → F64 via exec_elementwise_unary (line 1402 else: TIME+F64 out)
+(set _Ttime2 (table [t] (list (as 'TIME [1000 0N 2000]))))
+(< (abs (- (sum (at (select {r: (as 'F64 t) from: _Ttime2}) 'r)) 3000.0)) 0.001) -- true
 
 ;; CAST I16 → I64  (line 1358-1365)
 (as 'I64 [1h 2h 3h])       -- [1 2 3]

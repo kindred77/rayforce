@@ -1,0 +1,467 @@
+;; Coverage for binary_range LV_READ/RV_READ macro branch chains (expr.c lines 1807-1808).
+;;
+;; The slow generic path in binary_range uses two 8-condition ternary chains:
+;;   LV_READ: lp_f64? lp_f64[i] : lp_i64? lp_i64[i] : lp_i32? lp_i32[i] :
+;;            lp_u32? lp_u32[i] : lp_i16? lp_i16[i] : lp_bool? lp_bool[i] :
+;;            (l_scalar && f64-type)? l_f64 : l_i64
+;;   RV_READ: symmetric for rhs
+;;
+;; Each condition adds 2 branch regions (TRUE/FALSE) per call-site.
+;; Tests below force the slow path (not BOOL fast path, not arithmetic fast path)
+;; with specific type combinations to exercise different chain conditions.
+;;
+;; The slow path is reached when:
+;;   - out_type == F64 (arithmetic fast path requires out_type == lhs->type for integer)
+;;   - or vec-vs-vec where neither fast path applies
+;;   - BOOL fast path NOT triggered (F64 lhs, or l_scalar, or non-comparison op)
+;;
+;; Fast paths to avoid:
+;;   BOOL fast path: needs !l_scalar && r_scalar && CMP op && lhs in int/sym family
+;;   Arith fast path: needs !l_scalar && r_scalar && {ADD/SUB/MUL/MIN2/MAX2}
+;;                    && lhs->type == out_type && out_type in {I64,I32,I16,...}
+;;
+;; All tests use vector literals so they go to exec_elementwise_binary directly
+;; (not the fused path which uses expr_exec_binary).
+
+;; ===================================================================
+;; F64 OUTPUT — slow path guaranteed (F64 output != integer lhs type)
+;; ===================================================================
+;;
+;; I64 vec + F64 scalar: out_type=F64, lp_i64 set
+;; LV_READ: cond1(lp_f64?)=FALSE, cond2(lp_i64?)=TRUE
+;; RV_READ: r_scalar=true, rhs->type=F64 → cond7(l_scalar&&f64?)=FALSE, uses r_i64
+;; 1+2+3=6, 2+2+3=7, 3+2+3=8 (all as doubles)
+(+ [1 2 3] 2.0) -- [3.0 4.0 5.0]
+(- [5 6 7] 2.0) -- [3.0 4.0 5.0]
+(* [1 2 3] 2.0) -- [2.0 4.0 6.0]
+(/ [6.0 4.0 2.0] 2) -- [3.0 2.0 1.0]
+
+;; I32 vec + F64 scalar: lp_i32 set
+;; LV_READ: cond1=FALSE, cond2=FALSE, cond3(lp_i32?)=TRUE
+(+ [1i 2i 3i] 2.0) -- [3.0 4.0 5.0]
+(- [5i 6i 7i] 2.0) -- [3.0 4.0 5.0]
+(* [1i 2i 3i] 2.0) -- [2.0 4.0 6.0]
+
+;; I16 vec + F64 scalar: lp_i16 set
+;; LV_READ: cond1=FALSE, cond2=FALSE, cond3=FALSE, cond4(lp_u32?)=FALSE, cond5(lp_i16?)=TRUE
+(+ [1h 2h 3h] 2.0) -- [3.0 4.0 5.0]
+(- [10h 5h 1h] 2.0) -- [8.0 3.0 -1.0]
+(* [2h 3h 4h] 2.0) -- [4.0 6.0 8.0]
+
+;; U8 vec + F64 scalar: lp_bool set
+;; LV_READ: cond1-4=FALSE, cond5=FALSE, cond6(lp_bool?)=TRUE
+(+ (as 'U8 [1 2 3]) 2.0) -- [3.0 4.0 5.0]
+(* (as 'U8 [3 4 5]) 2.0) -- [6.0 8.0 10.0]
+(- (as 'U8 [10 20 30]) 5.0) -- [5.0 15.0 25.0]
+
+;; F64 scalar + I64 vec: l_scalar=true, rp_i64 set
+;; LV_READ: l_scalar=true → cond1-6=FALSE, cond7(l_scalar&&f64?)=TRUE
+;; RV_READ: cond1=FALSE, cond2(rp_i64?)=TRUE
+(+ 2.0 [1 2 3]) -- [3.0 4.0 5.0]
+(- 10.0 [1 2 3]) -- [9.0 8.0 7.0]
+(* 2.0 [1 2 3]) -- [2.0 4.0 6.0]
+(/ 10.0 [2.0 4.0 5.0]) -- [5.0 2.5 2.0]
+
+;; F64 scalar + I32 vec: rp_i32 set
+;; RV_READ: cond1=FALSE, cond2=FALSE, cond3(rp_i32?)=TRUE
+(+ 2.0 [1i 2i 3i]) -- [3.0 4.0 5.0]
+(* 3.0 [2i 3i 4i]) -- [6.0 9.0 12.0]
+
+;; F64 scalar + I16 vec: rp_i16 set
+;; RV_READ: cond1-4=FALSE, cond5(rp_i16?)=TRUE
+(+ 2.0 [1h 2h 3h]) -- [3.0 4.0 5.0]
+(* 2.0 [3h 4h 5h]) -- [6.0 8.0 10.0]
+
+;; F64 scalar + U8 vec: rp_bool set
+;; RV_READ: cond1-5=FALSE, cond6(rp_bool?)=TRUE
+(+ 1.0 (as 'U8 [2 3 4])) -- [3.0 4.0 5.0]
+(* 2.0 (as 'U8 [1 2 3])) -- [2.0 4.0 6.0]
+
+;; I64 scalar + I64 vec → F64 output (uses LV_READ cond8 fallback l_i64)
+;; LV_READ: l_scalar && lhs->type == -RAY_F64? NO (type=RAY_I64 negated = -6 != -3)
+;; So l_scalar integer: cond1-6=FALSE, cond7=FALSE, cond8 = (double)l_i64
+;; This is the scalar integer branch at the END of LV_READ
+(+ 2 [1.0 2.0 3.0]) -- [3.0 4.0 5.0]
+(* 3 [1.0 2.0 3.0]) -- [3.0 6.0 9.0]
+
+;; ===================================================================
+;; BOOL OUTPUT with F64 lhs — slow path (F64 not in BOOL fast path lhs types)
+;; ===================================================================
+;;
+;; F64 vec vs F64 scalar comparisons:
+;; LV_READ: lp_f64 set → cond1=TRUE
+;; RV_READ: r_scalar=true, rhs->type=F64 → cond7(r_scalar&&f64?)=TRUE
+;; This exercises RV_READ cond1-6 = FALSE, cond7=TRUE
+
+(== [1.0 2.0 3.0] 2.0) -- [false true false]
+(!= [1.0 2.0 3.0] 2.0) -- [true false true]
+(< [1.0 2.0 3.0] 2.0) -- [true false false]
+(<= [1.0 2.0 3.0] 2.0) -- [true true false]
+(> [1.0 2.0 3.0] 2.0) -- [false false true]
+(>= [1.0 2.0 3.0] 2.0) -- [false true true]
+
+;; F64 vec vs F64 vec: lp_f64 and rp_f64 set
+(== [1.0 2.0 3.0] [3.0 2.0 1.0]) -- [false true false]
+(!= [1.0 2.0 3.0] [3.0 2.0 1.0]) -- [true false true]
+(< [1.0 2.0 3.0] [3.0 2.0 1.0]) -- [true false false]
+(> [1.0 2.0 3.0] [3.0 2.0 1.0]) -- [false false true]
+
+;; F64 scalar vs F64 vec: l_scalar=true, rp_f64 set
+;; LV_READ: l_scalar && lhs->type==RAY_F64 → cond7=TRUE
+;; RV_READ: cond1(rp_f64?)=TRUE
+(== 2.0 [1.0 2.0 3.0]) -- [false true false]
+(< 2.0 [1.0 2.0 3.0]) -- [false false true]
+(> 2.0 [1.0 2.0 3.0]) -- [true false false]
+
+;; I64 vec vs F64 scalar (BOOL output): slow path since F64 scalar → src_is_i64_all=FALSE
+;; lp_i64 set, r_scalar=true, rhs->type=F64
+;; But wait - BOOL fast path: needs r_scalar, CMP op, lhs in int family → YES these hit fast path
+;; Override: need !l_scalar=true, r_scalar=true, CMP op, lhs=I64 → hits BOOL FAST path, NOT slow
+;; So we need l_scalar=true to avoid BOOL fast path
+
+;; F64 scalar vs I64 vec (BOOL, F64 lhs bypasses fast path since l_scalar=true blocks fast path):
+;; Actually BOOL fast path requires !l_scalar → l_scalar=true bypasses it
+;; RV_READ: rp_f64=NULL, rp_i64 set → cond1=FALSE, cond2=TRUE
+(< 2.0 [1 2 3]) -- [false false true]
+(> 2.0 [1 2 3]) -- [true false false]
+(== 2.0 [1 2 3]) -- [false true false]
+
+;; F64 scalar vs I32 vec (BOOL): rp_i32 set
+;; RV_READ: cond1=FALSE, cond2=FALSE, cond3=TRUE
+(< 2.0 [1i 2i 3i]) -- [false false true]
+(== 2.0 [2i 2i 2i]) -- [true true true]
+
+;; F64 scalar vs I16 vec (BOOL): rp_i16 set
+;; RV_READ: cond1-4=FALSE, cond5=TRUE
+(< 2.0 [1h 2h 3h]) -- [false false true]
+(== 2.0 [2h 2h 2h]) -- [true true true]
+
+;; F64 scalar vs BOOL vec (BOOL output): rp_bool set
+;; But wait: BOOL output with src_is_i64_all=FALSE (lhs is F64 scalar) → float path
+;; RV_READ: cond1-5=FALSE, cond6(rp_bool?)=TRUE
+(== 1.0 (as 'BOOL [true false true])) -- [true false true]
+(< 0.0 (as 'U8 [1 2 3])) -- [true true true]
+
+;; ===================================================================
+;; I64 OUTPUT with vec-vs-vec (bypass arithmetic fast path since both vec)
+;; Both sides vec: !l_scalar && !r_scalar → arithmetic fast path NOT applicable
+;; ===================================================================
+;;
+;; I64 vec vs I64 vec: lp_i64 and rp_i64 set
+;; This goes to slow path (no fast path for vec-vs-vec), cond2 TRUE for both LV_READ and RV_READ
+;; (arithmetic fast path: requires r_scalar, so vec-vs-vec always uses slow path)
+(+ [1 2 3 4 5] [5 4 3 2 1]) -- [6 6 6 6 6]
+(- [5 6 7 8 9] [1 2 3 4 5]) -- [4 4 4 4 4]
+(* [1 2 3 4 5] [5 4 3 2 1]) -- [5 8 9 8 5]
+
+;; I32 vec vs I32 vec: lp_i32 and rp_i32 set (I32 output)
+;; Arithmetic fast path: requires r_scalar → NO (both vec), goes slow path
+(+ [1i 2i 3i 4i] [4i 3i 2i 1i]) -- [5 5 5 5]
+(- [5i 6i 7i 8i] [4i 3i 2i 1i]) -- [1 3 5 7]
+(* [2i 3i 4i 5i] [5i 4i 3i 2i]) -- [10 12 12 10]
+
+;; I16 vec vs I16 vec: lp_i16 and rp_i16 set (I16 output)
+(+ [1h 2h 3h 4h] [4h 3h 2h 1h]) -- [5 5 5 5]
+(- [10h 20h 30h] [1h 2h 3h]) -- [9 18 27]
+(* [2h 3h 4h] [3h 4h 5h]) -- [6 12 20]
+
+;; U8 vec vs U8 vec: lp_bool and rp_bool set (U8 output)
+(+ (as 'U8 [1 2 3 4]) (as 'U8 [4 3 2 1])) -- [0x05 0x05 0x05 0x05]
+(- (as 'U8 [10 20 30]) (as 'U8 [1 2 3])) -- [0x09 0x12 0x1b]
+(* (as 'U8 [2 3 4]) (as 'U8 [3 4 5])) -- [0x06 0x0c 0x14]
+
+;; ===================================================================
+;; exec_elementwise_unary F64→F64 ROUND (line 1318): non-fused path
+;; OP_ROUND is 9, NOT in expr_is_elementwise range (OP_NEG=10 to OP_CAST=19)
+;; So (round vec) always goes non-fused through exec_elementwise_unary
+;; ===================================================================
+
+;; ROUND on F64 vec (non-fused, always)
+(round [1.1 2.5 3.7 -1.5]) -- [1.0 3.0 4.0 -2.0]
+(round [0.4 0.5 0.6]) -- [0.0 1.0 1.0]
+(type (round [1.1 2.5])) -- 'F64
+
+;; ===================================================================
+;; exec_elementwise_unary I64→F64 OP_NEG (line 1360): need I64 in, F64 out
+;; This fires when (neg col) produces out_type=F64 with I64 input
+;; Trigger: a non-nullable I64 vector with (neg) where op->out_type=F64
+;; Actually (neg [1 2 3]) would use out_type=I64 (I64 input → I64 output)
+;; But (neg 2.0) casted back: (neg [1 2 3]) uses I64→I64, NOT I64→F64
+;; I64→F64 path in exec_elementwise_unary is dead since:
+;;   - (neg I64_col) → out_type=I64 → I64→I64 path (line 1341)
+;;   - (neg F64_col) → out_type=F64 → F64→F64 path (line 1305)
+;;   - I64→F64 requires out_type=F64 WITH in_type=I64, which only happens
+;;     if the planner assigns F64 output to a NEG over I64 input.
+;; The path exists but planner always uses I64→I64 for (neg int_col).
+;; SKIP: line 1360 is dead code.
+
+;; ===================================================================
+;; exec_elementwise_unary F64→I64 ops (lines 1329-1336): dead code check
+;; Would need out_type=I64 with F64 input for OP_NEG/ABS/SQRT/etc.
+;; The planner assigns out_type=F64 for these ops on F64 input.
+;; SKIP: dead code.
+;; ===================================================================
+
+;; ===================================================================
+;; exec_elementwise_unary BOOL: dt=BOOL, OP_NOT on BOOL vec (line 875)
+;; and CAST i64/f64 to BOOL (lines 864-870)
+;; ===================================================================
+
+;; OP_NOT on BOOL vec (line 875): non-fused since OP_NOT is in range OP_NEG..OP_CAST
+;; but exec_elementwise_unary is only called for nullable/slice → need nullable BOOL
+;; Actually, literals with nulls use exec_elementwise_unary
+(not [true false true]) -- [false true false]
+(not [false false true]) -- [true true false]
+
+;; ===================================================================
+;; exec_elementwise_binary BOOL output, F64 inputs (lines 760-766)
+;; F64 vec vs F64 vec with NaN null sentinel handling
+;; Needs F64 vectors going through exec_elementwise_binary (non-fused, non-table)
+;; ===================================================================
+
+;; F64 vec with NaN values (these are nulls in F64 semantics)
+;; Using null F64 vec to trigger NaN-aware comparison
+(== [0Nf 1.0 2.0] [1.0 0Nf 2.0]) -- [false false true]
+(!= [0Nf 1.0 2.0] [1.0 0Nf 2.0]) -- [true true false]
+(< [0Nf 1.0 2.0] [1.0 0Nf 2.0]) -- [true false false]
+(> [0Nf 1.0 2.0] [1.0 0Nf 2.0]) -- [false true false]
+(<= [0Nf 1.0 2.0] [0Nf 1.0 2.0]) -- [true true true]
+(>= [0Nf 1.0 2.0] [0Nf 1.0 2.0]) -- [true true true]
+
+;; F64 null vs non-null comparisons for branch coverage in null-aware path
+;; null == null → true; null < non-null → true (null=minimum)
+(== [0Nf 0Nf] [0Nf 1.0]) -- [true false]
+(< [0Nf 0Nf] [0Nf 1.0]) -- [false true]
+(> [0Nf 0Nf] [0Nf 1.0]) -- [false false]
+(<= [0Nf 0Nf] [0Nf 1.0]) -- [true true]
+(>= [0Nf 0Nf] [0Nf 1.0]) -- [true false]
+(!= [0Nf 0Nf] [0Nf 1.0]) -- [false true]
+
+;; ===================================================================
+;; binary_range I64 OP_DIV (line 1835): out_type=I64, OP_DIV
+;; ray_div sets out_type=F64, so this requires (div I64 I64) but with
+;; out_type forced to I64. Not reachable from RFL (ray_div uses F64 output).
+;; SKIP: dead code as documented in narrow_binary.rfl.
+;; ===================================================================
+
+;; ===================================================================
+;; F64 OUTPUT — lp_f64=TRUE path (cond1 of LV_READ in F64 out block)
+;; These ensure the FIRST condition in LV_READ is exercised TRUE
+;; for each F64 opcode.  F64 arithmetic fast path never fires since
+;; out_type=F64 is excluded from the fast-path out_type list.
+;; ===================================================================
+
+;; F64 vec + F64 vec → lp_f64 and rp_f64 both set (cond1 TRUE for LV and RV)
+(+ [1.0 2.0 3.0] [4.0 5.0 6.0]) -- [5.0 7.0 9.0]
+(- [5.0 4.0 3.0] [1.0 1.0 1.0]) -- [4.0 3.0 2.0]
+(* [2.0 3.0 4.0] [3.0 2.0 1.0]) -- [6.0 6.0 4.0]
+
+;; F64 vec + F64 scalar → lp_f64=TRUE, RV_READ cond7=TRUE (r_scalar && F64 type)
+(+ [1.0 2.0 3.0] 2.0) -- [3.0 4.0 5.0]
+(- [5.0 4.0 3.0] 1.0) -- [4.0 3.0 2.0]
+(* [2.0 3.0 4.0] 3.0) -- [6.0 9.0 12.0]
+
+;; F64 scalar + F64 vec → l_scalar F64 → LV_READ cond7=TRUE, rp_f64=TRUE
+(+ 10.0 [1.0 2.0 3.0]) -- [11.0 12.0 13.0]
+(- 10.0 [1.0 2.0 3.0]) -- [9.0 8.0 7.0]
+(* 3.0 [2.0 3.0 4.0]) -- [6.0 9.0 12.0]
+
+;; ===================================================================
+;; I64 OUTPUT — narrow lhs types (slow path via lhs->type ≠ out_type)
+;;
+;; When lhs is I32/I16/U8 and rhs is I64 scalar, promote(I32,I64)=I64
+;; so out_type=I64 but lhs->type != I64 → arithmetic fast path skipped.
+;; This puts us in the I64 output block with lp_i32/lp_i16/lp_bool set.
+;; ===================================================================
+
+;; I32 vec + I64 scalar: out_type=I64, lp_i32=TRUE (cond3 of LV_READ in I64 block)
+;; [1i+5, 2i+5, 3i+5] = [6, 7, 8]
+(+ [1i 2i 3i] 5) -- [6 7 8]
+(- [10i 5i 3i] 3) -- [7 2 0]
+(* [2i 3i 4i] 3) -- [6 9 12]
+
+;; I16 vec + I64 scalar: out_type=I64, lp_i16=TRUE (cond5 of LV_READ in I64 block)
+(+ [1h 2h 3h] 5) -- [6 7 8]
+(- [10h 5h 3h] 3) -- [7 2 0]
+(* [2h 3h 4h] 3) -- [6 9 12]
+
+;; U8 vec + I64 scalar: out_type=I64, lp_bool=TRUE (cond6 of LV_READ in I64 block)
+(+ (as 'U8 [1 2 3]) 5) -- [6 7 8]
+(- (as 'U8 [10 5 3]) 3) -- [7 2 0]
+(* (as 'U8 [2 3 4]) 3) -- [6 9 12]
+
+;; ===================================================================
+;; I64 OUTPUT — narrow rhs types (scalar lhs + narrow rhs vec)
+;; l_scalar=I64, rp_i32/rp_i16/rp_bool set
+;; ===================================================================
+
+;; I64 scalar + I32 vec: promote(I64,I32)=I64, l_scalar, rp_i32=TRUE (RV_READ cond3)
+(+ 5 [1i 2i 3i]) -- [6 7 8]
+(- 10 [1i 2i 3i]) -- [9 8 7]
+(* 3 [2i 3i 4i]) -- [6 9 12]
+
+;; I64 scalar + I16 vec: rp_i16=TRUE (RV_READ cond5)
+(+ 5 [1h 2h 3h]) -- [6 7 8]
+(- 10 [1h 2h 3h]) -- [9 8 7]
+(* 3 [2h 3h 4h]) -- [6 9 12]
+
+;; I64 scalar + U8 vec: rp_bool=TRUE (RV_READ cond6)
+(+ 5 (as 'U8 [1 2 3])) -- [6 7 8]
+(- 10 (as 'U8 [1 2 3])) -- [9 8 7]
+(* 3 (as 'U8 [2 3 4])) -- [6 9 12]
+
+;; ===================================================================
+;; I32 OUTPUT — narrow lhs types (lhs->type != I32)
+;; promote(I16,I32)=I32: I16 vec + I32 scalar → I32 out, lp_i16 in I32 block
+;; promote(U8,I32)=I32:  U8 vec + I32 scalar → I32 out, lp_bool in I32 block
+;; ===================================================================
+
+;; I16 vec + I32 scalar → I32 out, lp_i16=TRUE in I32 output block
+;; (No arithmetic fast path: lhs->type=I16 ≠ out_type=I32)
+;; [1h+1i, 2h+1i, 3h+1i] = [2, 3, 4] (I32)
+(+ [1h 2h 3h] 1i) -- [2 3 4]
+(- [10h 5h 3h] 1i) -- [9 4 2]
+(* [2h 3h 4h] 2i) -- [4 6 8]
+
+;; U8 vec + I32 scalar → I32 out, lp_bool=TRUE in I32 output block
+(+ (as 'U8 [1 2 3]) 1i) -- [2 3 4]
+(- (as 'U8 [10 5 3]) 1i) -- [9 4 2]
+(* (as 'U8 [2 3 4]) 2i) -- [4 6 8]
+
+;; I32 scalar + I16 vec → I32 out, l_scalar, rp_i16=TRUE in I32 block
+(+ 1i [1h 2h 3h]) -- [2 3 4]
+(- 10i [1h 2h 3h]) -- [9 8 7]
+(* 2i [2h 3h 4h]) -- [4 6 8]
+
+;; I32 scalar + U8 vec → I32 out, rp_bool=TRUE in I32 block
+(+ 1i (as 'U8 [1 2 3])) -- [2 3 4]
+(- 10i (as 'U8 [1 2 3])) -- [9 8 7]
+(* 2i (as 'U8 [2 3 4])) -- [4 6 8]
+
+;; ===================================================================
+;; I16 OUTPUT — narrow lhs types
+;; promote(U8,I16)=I16: U8 vec + I16 scalar → I16 out, lp_bool in I16 block
+;; ===================================================================
+
+;; U8 vec + I16 scalar → I16 out, lp_bool=TRUE in I16 output block
+;; (No arithmetic fast path: lhs->type=U8 ≠ out_type=I16)
+(+ (as 'U8 [1 2 3]) 1h) -- [2 3 4]
+(- (as 'U8 [10 5 3]) 1h) -- [9 4 2]
+(* (as 'U8 [2 3 4]) 2h) -- [4 6 8]
+
+;; I16 scalar + U8 vec → I16 out, rp_bool=TRUE in I16 block
+(+ 1h (as 'U8 [1 2 3])) -- [2 3 4]
+(- 10h (as 'U8 [1 2 3])) -- [9 8 7]
+(* 2h (as 'U8 [2 3 4])) -- [4 6 8]
+
+;; ===================================================================
+;; BOOL OUTPUT (src_is_i64_all=TRUE) — narrow lhs types via vec-vs-vec
+;; The BOOL fast path requires r_scalar; with both sides vec, slow path fires.
+;; lp_i32 and rp_i32 set (I32 vec-vs-vec comparison):
+;; (already covered in narrow_binary.rfl for ==,!=,<,<=,>,>=)
+;; Additional coverage for I16 vec-vs-vec and U8 vec-vs-vec:
+;;   lp_i16, rp_i16 set; lp_bool, rp_bool set
+;; Note: bool src_is_i64_all with lp_i16: lp_i16≠NULL, lp_f64=NULL → l_is_int=TRUE
+;; ===================================================================
+
+;; I32 scalar + I16 vec → BOOL out, l_scalar=I32 → LV_READ cond8 (fallback I64), rp_i16
+;; Note: l_scalar=true blocks BOOL fast path (fast path requires !l_scalar)
+(== 2i [1h 2h 3h]) -- [false true false]
+(< 2i [1h 2h 3h]) -- [false false true]
+(> 2i [1h 2h 3h]) -- [true false false]
+
+;; I32 scalar + U8 vec → rp_bool set
+(== 2i (as 'U8 [1 2 3])) -- [false true false]
+(< 2i (as 'U8 [1 2 3])) -- [false false true]
+(> 2i (as 'U8 [1 2 3])) -- [true false false]
+
+;; I16 scalar + I64 vec → BOOL, l_scalar=I16 blocks fast path; RV_READ cond2 (rp_i64)
+(== 2h [1 2 3]) -- [false true false]
+(< 2h [1 2 3]) -- [false false true]
+
+;; I16 scalar + I32 vec → rp_i32 set
+(== 2h [1i 2i 3i]) -- [false true false]
+(< 2h [1i 2i 3i]) -- [false false true]
+
+;; I16 scalar + U8 vec → rp_bool set
+(== 2h (as 'U8 [1 2 3])) -- [false true false]
+
+;; U8 scalar + I64 vec → lp_bool in LV_READ for BOOL block (but l_scalar, no bool ptr set)
+;; Actually: l_scalar=U8, all lp_* = NULL → LV_READ cond1-6=FALSE, cond7=(l_scalar&&F64?)=FALSE → cond8=(double)l_i64
+;; This covers cond6=FALSE, cond7=FALSE (non-F64 scalar)
+(== (as 'U8 2) [1 2 3]) -- [false true false]
+(< (as 'U8 2) [1 2 3]) -- [false false true]
+
+;; ===================================================================
+;; F64 OUTPUT — missing RV_READ conditions
+;; For F64 output with I64 vec lhs (already covered), exercise different RHS types.
+;; ===================================================================
+
+;; I64 vec + I64 vec → F64 output: cannot happen (promote(I64,I64)=I64 → I64 block)
+;; I64 vec + I32 vec → promote(I64,I32)=I64 → I64 block, not F64
+;; To get F64 output with rp_i64 set (non-scalar I64 rhs):
+;;   Need F64 lhs vec + I64 rhs vec (but promote(F64,I64)=F64 → F64 out, rp_i64 set!)
+(+ [1.0 2.0 3.0] [4 5 6]) -- [5.0 7.0 9.0]
+(- [5.0 4.0 3.0] [1 2 3]) -- [4.0 2.0 0.0]
+(* [2.0 3.0 4.0] [3 2 1]) -- [6.0 6.0 4.0]
+
+;; F64 vec + I32 vec → rp_i32 set in F64 ADD
+(+ [1.0 2.0 3.0] [4i 5i 6i]) -- [5.0 7.0 9.0]
+(- [5.0 4.0 3.0] [1i 2i 3i]) -- [4.0 2.0 0.0]
+(* [2.0 3.0 4.0] [3i 2i 1i]) -- [6.0 6.0 4.0]
+
+;; F64 vec + I16 vec → rp_i16 set in F64 ADD
+(+ [1.0 2.0 3.0] [4h 5h 6h]) -- [5.0 7.0 9.0]
+(- [5.0 4.0 3.0] [1h 2h 3h]) -- [4.0 2.0 0.0]
+(* [2.0 3.0 4.0] [3h 2h 1h]) -- [6.0 6.0 4.0]
+
+;; F64 vec + U8 vec → rp_bool set in F64 ADD
+(+ [1.0 2.0 3.0] (as 'U8 [4 5 6])) -- [5.0 7.0 9.0]
+(- [5.0 4.0 3.0] (as 'U8 [1 2 3])) -- [4.0 2.0 0.0]
+(* [2.0 3.0 4.0] (as 'U8 [3 2 1])) -- [6.0 6.0 4.0]
+
+;; ===================================================================
+;; I64 OUTPUT — F64 vec lhs (lp_f64 in I64 output block)
+;; Note: promote(F64, I64) = F64, so normally I64 output + F64 lhs
+;; can't happen via ray_add. But I64 vec + I64 scalar is in arithmetic
+;; fast path → not slow path. We need F64 in I64 block.
+;; Actually: (div [1.0 2.0 3.0] 2) → OP_DIV → out_type=F64, goes to F64 block.
+;; For I64 block with lp_f64: would need ray_idiv(F64_vec, I64_vec) but
+;; ray_idiv sets out_type=I64. promote(F64,I64)=F64 but idiv uses I64.
+;; In test_exec.c: ray_idiv(F64_col, I64_col) → out_type=I64, lp_f64 set!
+;; This needs a C test. Add a note about this - handled in test_exec.c.
+;; ===================================================================
+
+;; ===================================================================
+;; I32 OUTPUT — lp_i64 (I64 scalar + I32 vec was already arithmetic fast path;
+;; I64 scalar + I32 vec with r_scalar=false: I64 vec + I32 vec → promote=I64 not I32)
+;; For lp_i64 in I32 block: need I64 lhs with I32 output.
+;; promote(I64,I32)=I64 → I64 block. promote(I32,I32)=I32 → I32 block.
+;; To get lp_i64 in I32 block: ray_idiv(I64_vec, I64_scalar) → out_type=I64 (not I32).
+;; Alternative: table context with I64 nullable col and I32 output via casting.
+;; This requires C test. Document as needed.
+;;
+;; For I32 block with lp_i32 + rp_i32 (vec-vs-vec): already in narrow_binary.rfl.
+;; ===================================================================
+
+;; ===================================================================
+;; Additional BOOL fast-path bypasses for more coverage
+;; F64 vec vs I64 scalar (F64 lhs bypasses BOOL fast path - I64 scalar OK)
+;; Actually BOOL fast path requires lhs in int/sym family. F64 lhs → bypassed.
+;; lp_f64 set → LV_READ cond1=TRUE; r_scalar I64 → RV_READ cond7=FALSE, cond8=r_i64
+;; (These would hit float-family BOOL path, not src_is_i64_all)
+;; ===================================================================
+
+;; I64 vec + I64 vec → BOOL output, src_is_i64_all=TRUE, vec-vs-vec slow path
+;; lp_i64=TRUE, rp_i64=TRUE (already in binary_range_coverage.rfl for arithmetic)
+;; Let's test comparisons with vec-vs-vec (bypasses BOOL fast path → slow path)
+;; Additional ops not yet covered: AND/OR in BOOL src_is_i64_all path
+;; Use BOOL vecs for AND/OR since both lp_bool and rp_bool are set → covers
+;; OP_AND/OR in src_is_i64_all path (lines 1893-1894)
+(and [true false true] [true true false]) -- [true false false]
+(or [true false true] [true false false]) -- [true false true]
+
+;; AND/OR with BOOL vec-vs-vec (lp_bool=TRUE, rp_bool=TRUE, src_is_i64_all=TRUE)
+;; vec-vs-vec: no BOOL fast path (fast path requires r_scalar)
+(and (as 'BOOL [1 0 1]) (as 'BOOL [1 1 0])) -- [true false false]
+(or (as 'BOOL [1 0 1]) (as 'BOOL [0 0 0])) -- [true false true]

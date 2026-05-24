@@ -1,0 +1,187 @@
+;; group_new_paths.rfl — targeted coverage for previously-zero regions in group.c
+;;
+;; Targets:
+;;   1. n_keys=3/4/5 direct-scatter unique_first_key=true (lines 7122-7133)
+;;   2. n_keys=3 count_only=true in top-N fast path (line 7046 for n_keys=3)
+;;   3. U8 column in count_distinct_per_group cdpg_read (line 914, esz=1)
+;;   4. exec_reduction parallel stddev (line 1933, OP_STDDEV on > 65536 rows)
+;;   5. median on U8 column — med_is_null U8 path (line 1387)
+;;   6. exec_group_per_partition F64 AVG (lines 8683-8686)
+;;   7. exec_group_per_partition F64 STDDEV (lines 8731-8744)
+;;   8. nullable_mask in group_rows_range_existing (lines 2649/2667-2669)
+;;   9. SYM key exec_group_maxmin_rowform empty-table path (line 10673)
+;;  10. FIRST/LAST in exec_reduction parallel path (lines 1919-1920)
+
+;; ─── 1. n_keys=3 direct-scatter unique_first_key=true ─────────────────
+;; Conditions: use_emit_filter, top_count_take>0, n_keys=3, non-null,
+;; non-F64/GUID keys, DA rejected (range product > 262144), direct_ok=true
+;; (all aggs are COUNT or SUM), heavy_count <= 64 (take=2 → 2 groups),
+;; unique k1 among heavy groups.
+;;
+;; k1 in {0,1} (range 2), k2 in {0,512} (range 513), k3 in {0,512} (range 513).
+;; Range product = 2 × 513 × 513 = 526338 > 262144 → DA rejects.
+;; 2 groups: (0,0,0) with 50 rows and (1,512,512) with 50 rows.
+;; Both groups have unique k1 (0 vs 1) → unique_first_key=true.
+;; direct_ok=true: only COUNT + SUM aggs → scatter at lines 7123-7124.
+(set N3us 100)
+(set Tk3us (table [k1 k2 k3 v] (list (as 'I64 (* (% (til N3us) 2) 1)) (as 'I64 (* (% (til N3us) 2) 512)) (as 'I64 (* (% (til N3us) 2) 512)) (as 'I64 (til N3us)))))
+(set Rk3us (select {c: (count k1) s: (sum v) from: Tk3us by: [k1 k2 k3] desc: c take: 2}))
+(count Rk3us) -- 2
+;; Group (0,0,0): rows 0,2,4,...,98 → sum=0+2+...+98=2450, count=50
+;; Group (1,512,512): rows 1,3,5,...,99 → sum=1+3+...+99=2500, count=50
+(min (at Rk3us 'c)) -- 50
+(max (at Rk3us 'c)) -- 50
+;; sum(0+2+...+98) = 2450, sum(1+3+...+99) = 2500 → total = 4950
+(< (abs (- (sum (at Rk3us 's)) 4950.0)) 0.01) -- true
+
+;; ─── 1b. n_keys=4 direct-scatter unique_first_key=true (lines 7126-7128) ──
+;; Add k4 in {0,512}: range product = 2 × 513 × 513 × 513 = 269,847,234 > 262144.
+(set Tk4us (table [k1 k2 k3 k4 v] (list (as 'I64 (* (% (til N3us) 2) 1)) (as 'I64 (* (% (til N3us) 2) 512)) (as 'I64 (* (% (til N3us) 2) 512)) (as 'I64 (* (% (til N3us) 2) 512)) (as 'I64 (til N3us)))))
+(set Rk4us (select {c: (count k1) s: (sum v) from: Tk4us by: [k1 k2 k3 k4] desc: c take: 2}))
+(count Rk4us) -- 2
+(min (at Rk4us 'c)) -- 50
+
+;; ─── 1c. n_keys=5 direct-scatter unique_first_key=true (lines 7130-7132) ──
+(set Tk5us (table [k1 k2 k3 k4 k5 v] (list (as 'I64 (* (% (til N3us) 2) 1)) (as 'I64 (* (% (til N3us) 2) 512)) (as 'I64 (* (% (til N3us) 2) 512)) (as 'I64 (* (% (til N3us) 2) 512)) (as 'I64 (* (% (til N3us) 2) 512)) (as 'I64 (til N3us)))))
+(set Rk5us (select {c: (count k1) s: (sum v) from: Tk5us by: [k1 k2 k3 k4 k5] desc: c take: 2}))
+(count Rk5us) -- 2
+(min (at Rk5us 'c)) -- 50
+
+;; ─── 2. n_keys=3 count_only=true in top-N fast path ──────────────────
+;; count_only=true fires at line 7045 when all aggs are COUNT.
+;; take>1024 defeats bounded_multikey_count_take_candidate so we reach exec_group.
+;; n_keys=3 with range > 262144, only COUNT agg → count_only=true branch.
+(set Tco3 (table [k1 k2 k3] (list (as 'I64 (* (% (til N3us) 2) 1)) (as 'I64 (* (% (til N3us) 2) 512)) (as 'I64 (* (% (til N3us) 2) 512)))))
+(set Rco3 (select {c: (count k1) from: Tco3 by: [k1 k2 k3] desc: c take: 2000}))
+(count Rco3) -- 2
+(min (at Rco3 'c)) -- 50
+(max (at Rco3 'c)) -- 50
+
+;; ─── 3. U8 column in count_distinct_per_group (cdpg_read esz=1) ────────
+;; count(distinct) on a U8 value column per group triggers cdpg_read with esz=1.
+;; Group by I64 key, count(distinct U8 v): exercises the `case 1` in cdpg_read
+;; (line 914: `return (int64_t)((const uint8_t*)base)[r]`).
+;; Use 200k rows to force the parallel path (>= 200000 rows).
+(set Nu8 200000)
+(set Tu8cd (table [k v] (list (% (as 'I64 (til Nu8)) 100) (as 'U8 (% (til Nu8) 200)))))
+(set Ru8cd (select {dc: (count (distinct v)) from: Tu8cd by: k}))
+(count Ru8cd) -- 100
+;; Group g has rows at i=g, g+100, g+200, ...; U8 value = i%200.
+;; Values seen: {g%200, (g+100)%200} — exactly 2 distinct per group.
+(min (at Ru8cd 'dc)) -- 2
+(max (at Ru8cd 'dc)) -- 2
+
+;; ─── 4. Parallel stddev (> 65536 rows) → exec_reduction line 1933 ──────
+;; OP_STDDEV (sample) in the parallel path at line 1933.
+;; 70000 rows → >= RAY_PARALLEL_THRESHOLD = 65536.
+;; [0..69999]: sample stddev = sqrt((N^2-1)/12) ≈ sqrt(69999^2/12) ≈ 20207.
+;; Just verify it's > 0 and not NaN.
+(set Vstd (as 'I64 (til 70000)))
+(> (stddev Vstd) 0.0) -- true
+(== (stddev Vstd) (stddev Vstd)) -- true
+
+;; F64 parallel stddev (parallel F64 STDDEV path)
+(set Vstdf (as 'F64 (til 70000)))
+(> (stddev Vstdf) 0.0) -- true
+
+;; ─── 5. median on U8 column — med_is_null U8 path (line 1387) ──────────
+;; med() on U8 value column drives med_is_null with RAY_U8 (non-nullable path,
+;; returns false).  U8 group-by requires non-null keys; use I64 key.
+(set Tu8med (table [k v] (list (as 'I64 [1 1 1 1 1 2 2 2 2 2]) (as 'U8 [10 20 30 40 50 60 70 80 90 100]))))
+(set Ru8med (select {m: (med v) by: k from: Tu8med}))
+(count Ru8med) -- 2
+;; Group k=1: [10,20,30,40,50] sorted → median = 30
+(< (abs (- (at (at Ru8med 'm) 0) 30.0)) 0.01) -- true
+;; Group k=2: [60,70,80,90,100] sorted → median = 80
+(< (abs (- (at (at Ru8med 'm) 1) 80.0)) 0.01) -- true
+
+;; ─── 6. exec_group_per_partition F64 AVG (lines 8683-8686) ──────────────
+;; Parted table with F64 agg column + AVG → sum_col->type == RAY_F64
+;; in the AVG post-processing of exec_group_per_partition.
+;;
+;; Cardinality gate: can_partition fires only if est_groups*100 <= rows_per_part.
+;; Use 2000 rows/partition with 10 distinct keys: 10*100=1000 <= 2000. ✓
+;;
+;; Partition 1 & 2: k cycles through 10 values [0..9], v = F64 index / 1000.0
+;; Each partition: 2000 rows × 10 groups = 200 rows/group.
+;; k=0: partition1 avg ≈ mean of indices 0,10,20,...,1990 as F64 / 1000.0
+;; After merge, each k group gets 400 rows total from 2 partitions.
+(.sys.exec "rm -rf /tmp/rfl_grp_ppf64") -- 0
+(set _ppf64_N 2000)
+(set _ppf64_k (as 'I64 (% (til _ppf64_N) 10)))
+(set _ppf64_v (/ (as 'F64 (til _ppf64_N)) 1000.0))
+(set _ppf64_a (table [k v] (list _ppf64_k _ppf64_v)))
+(set _ppf64_b (table [k v] (list _ppf64_k _ppf64_v)))
+(.db.splayed.set "/tmp/rfl_grp_ppf64/1/t/" _ppf64_a)
+(.db.splayed.set "/tmp/rfl_grp_ppf64/2/t/" _ppf64_b)
+(set Ppf64 (.db.parted.get "/tmp/rfl_grp_ppf64/" 't))
+;; GROUP BY k with AVG(v): F64 SUM branch in exec_group_per_partition fires.
+(set Rpf64_avg (select {a: (avg v) c: (count v) from: Ppf64 by: k}))
+(count Rpf64_avg) -- 10
+(> (sum (at Rpf64_avg 'c)) 0) -- true
+;; avg must be > 0 (all vals are non-negative floats, not all zero)
+(> (sum (at Rpf64_avg 'a)) 0.0) -- true
+(.sys.exec "rm -rf /tmp/rfl_grp_ppf64") -- 0
+
+;; ─── 7. exec_group_per_partition F64 STDDEV (lines 8731-8744) ────────────
+;; F64 stddev path in per-partition STDDEV post-processing.
+;; Same cardinality gate: 2000 rows/partition, 10 keys → 10*100=1000 <= 2000.
+(.sys.exec "rm -rf /tmp/rfl_grp_ppstd") -- 0
+(set _ppstd_N 2000)
+(set _ppstd_k (as 'I64 (% (til _ppstd_N) 10)))
+(set _ppstd_v (/ (as 'F64 (til _ppstd_N)) 100.0))
+(set _ppstd_a (table [k v] (list _ppstd_k _ppstd_v)))
+(set _ppstd_b (table [k v] (list _ppstd_k _ppstd_v)))
+(.db.splayed.set "/tmp/rfl_grp_ppstd/1/t/" _ppstd_a)
+(.db.splayed.set "/tmp/rfl_grp_ppstd/2/t/" _ppstd_b)
+(set Ppstd (.db.parted.get "/tmp/rfl_grp_ppstd/" 't))
+;; GROUP BY k with STDDEV(v): F64 STDDEV branch in exec_group_per_partition fires.
+(set Rppstd (select {s: (stddev v) from: Ppstd by: k}))
+(count Rppstd) -- 10
+;; Each key group has 400 rows of distinct F64 values → stddev > 0.
+(> (min (at Rppstd 's)) 0.0) -- true
+(.sys.exec "rm -rf /tmp/rfl_grp_ppstd") -- 0
+
+;; ─── 8. nullable_mask in group_rows_range_existing (lines 2649/2667-2669) ─
+;; group_rows_range_existing fires via the !direct_ok top_count path.
+;; To get nullable keys in that path: n_keys=2, non-F64 keys but k2 has nulls,
+;; range > 262144, take=2, min agg (forces !direct_ok).
+;; k1 in {0,512} (range 513), k2 has null → nullable → nullable_mask bit set.
+;; Using 10 rows so it's small enough for the fast path; take=2 means direct_ok=false via min.
+(set Tnkre (table [k1 k2 v] (list (as 'I64 [0 0 0 512 512 512 0 512 0 512]) (as 'I64 [0 0 0N 0 0 0N 511 511 0N 0N]) (as 'I64 [1 2 3 4 5 6 7 8 9 10]))))
+;; k2 has nulls → RAY_ATTR_HAS_NULLS → nullable_mask fires in group_rows_range_existing.
+;; k1 range [0,512]=513, k2 range [0,511]=512; product 513*512=262656 > 262144 → DA rejects.
+;; take=2 with min → !direct_ok → goes to group_rows_range_existing path.
+(set Rnkre (select {c: (count k1) mn: (min v) from: Tnkre by: [k1 k2] desc: c take: 2}))
+(count Rnkre) -- 2
+(> (sum (at Rnkre 'c)) 0) -- true
+
+;; ─── 9. exec_group_maxmin_rowform empty-table + SYM key paths ──────────
+;; Empty-table path for exec_group_maxmin_rowform (line 10672: nrows==0).
+(set Tmm_empty (table [k x y] (list (as 'I64 []) (as 'I64 []) (as 'I64 []))))
+;; This invokes exec_group_maxmin_rowform → nrows==0 → empty-table branch.
+;; The planner only routes to maxmin_rowform for (max x) + (min y) by k shape.
+(set Rmm_empty (select {mx: (max x) mn: (min y) by: k from: Tmm_empty}))
+(count Rmm_empty) -- 0
+
+;; SYM key in exec_group_maxmin_rowform (line 10673: kt==RAY_SYM branch for k_out).
+;; SYM key forces `ray_sym_vec_new` path in the output column allocation.
+(set Tmm_sym (table [k x y] (list (as 'SYM ['a 'b 'a 'b 'c 'c]) (as 'I64 [10 20 30 40 50 60]) (as 'I64 [15 25 5 35 45 55]))))
+;; Groups: 'a: max_x=30, min_y=5; 'b: max_x=40, min_y=25; 'c: max_x=60, min_y=45
+(set Rmm_sym (select {mx: (max x) mn: (min y) by: k from: Tmm_sym}))
+(count Rmm_sym) -- 3
+(sum (at Rmm_sym 'mx)) -- 130
+(sum (at Rmm_sym 'mn)) -- 75
+
+;; ─── 10. FIRST/LAST in exec_reduction parallel path (lines 1919-1920) ──
+;; OP_FIRST and OP_LAST in the parallel exec_reduction branch require:
+;;   - parallel threshold: scan_n >= 65536
+;;   - NOT the early-out path (lines 1833-1856): early-out covers I64/F64/I32/...
+;;   - So need a type NOT in the early-out list: no common numeric type works.
+;;
+;; ARCHITECTURE NOTE: The early-out at line 1833 covers ALL the types that
+;; exec_reduction handles for FIRST/LAST (I64, F64, I32, I16, BOOL, U8,
+;; DATE, TIME, TIMESTAMP, SYM). Any call to exec_reduction with OP_FIRST/LAST
+;; on a vector of supported type is intercepted before reaching the parallel
+;; switch at line 1919. Lines 1919-1920 are effectively unreachable from RFL.
+;; Documented as unreachable at the RFL test boundary.

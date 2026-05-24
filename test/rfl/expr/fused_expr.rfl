@@ -122,3 +122,56 @@
 
 ;; Comparison mixed: I64 col vs F64 value triggers type promotion
 (at (select {r: (> i 2.5) from: Tmix}) 'r) -- [false false true true true]
+
+;; ===================================================================
+;; expr_eval_full_parted path (line 1103): mark_i64_overflow_as_null
+;; Two-partition parted table, I64 column.  expr_compile succeeds
+;; (parted col, non-nullable) → expr_eval_full_parted is called.
+;; expr_last_op_overflows_i64 returns true for OP_NEG on I64 →
+;; mark_i64_overflow_as_null is called (line 1103 covered).
+;; Also covers the ABS variant (same overflow-scan path).
+;; ===================================================================
+(.sys.exec "rm -rf /tmp/rfl_expr_parted_neg/") -- 0
+(set _Pna (table [v] (list (as 'I64 [10 20 30]))))
+(set _Pnb (table [v] (list (as 'I64 [40 50 60]))))
+(.db.splayed.set "/tmp/rfl_expr_parted_neg/1/t/" _Pna)
+(.db.splayed.set "/tmp/rfl_expr_parted_neg/2/t/" _Pnb)
+(set _Pneg (.db.parted.get "/tmp/rfl_expr_parted_neg/" 't))
+;; neg: [-10,-20,-30,-40,-50,-60]; sum = -210
+(== (sum (at (select {n: (neg v) from: _Pneg}) 'n)) -210) -- true
+;; abs of positive values = identity; sum = 10+20+30+40+50+60 = 210
+(== (sum (at (select {n: (abs v) from: _Pneg}) 'n)) 210) -- true
+(.sys.exec "rm -rf /tmp/rfl_expr_parted_neg/") -- 0
+
+;; ===================================================================
+;; expr_eval_full_parted parallel dispatch (line 1096):
+;; seg_len >= RAY_PARALLEL_THRESHOLD (65536) triggers ray_pool_dispatch.
+;; Single-partition parted table with 65536 I64 rows.
+;; neg(til(65536)) = [0, -1, -2, ..., -65535]
+;; sum = -(1+2+...+65535) = -(65535*65536/2) = -2147450880
+;; ===================================================================
+(.sys.exec "rm -rf /tmp/rfl_expr_parted_par/") -- 0
+(set _Ppv (as 'I64 (til 65536)))
+(set _Ppa (table [v] (list _Ppv)))
+(.db.splayed.set "/tmp/rfl_expr_parted_par/1/t/" _Ppa)
+(set _Ppar (.db.parted.get "/tmp/rfl_expr_parted_par/" 't))
+(== (sum (at (select {n: (neg v) from: _Ppar}) 'n)) -2147450880) -- true
+(.sys.exec "rm -rf /tmp/rfl_expr_parted_par/") -- 0
+
+;; ===================================================================
+;; expr_eval_full_parted null-segment path (lines 1083-1088):
+;; Requires a binary expression (+ a b) where partition 2 has column a
+;; but NOT column b.  seg_ok=false triggers the memset-zero branch.
+;; Partition 1: a=[1,2,3], b=[10,20,30] → a+b=[11,22,33], sum=66
+;; Partition 2: a=[4,5,6], b missing → output zeroed, sum=0
+;; Total sum = 66.
+;; ===================================================================
+(.sys.exec "rm -rf /tmp/rfl_expr_parted_null_seg/") -- 0
+(set _Pns1 (table [a b] (list (as 'I64 [1 2 3]) (as 'I64 [10 20 30]))))
+(set _Pns2 (table [a] (list (as 'I64 [4 5 6]))))
+(.db.splayed.set "/tmp/rfl_expr_parted_null_seg/1/t/" _Pns1)
+(.db.splayed.set "/tmp/rfl_expr_parted_null_seg/2/t/" _Pns2)
+(set _Pnsp (.db.parted.get "/tmp/rfl_expr_parted_null_seg/" 't))
+;; partition 2 b is NULL → expr_eval_full_parted seg_ok=false → memset to 0
+(== (sum (at (select {r: (+ a b) from: _Pnsp}) 'r)) 66) -- true
+(.sys.exec "rm -rf /tmp/rfl_expr_parted_null_seg/") -- 0

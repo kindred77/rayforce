@@ -15918,6 +15918,720 @@ static test_result_t test_expr_binary_i64_rp_u32_more(void) {
     PASS();
 }
 
+/* ---- fused path: F64 NaN-aware comparisons (expr_exec_binary lines 760-765) ----
+ * Non-nullable F64 columns containing mathematical NaN (not null sentinel).
+ * The fused path's NaN-aware branches treat NaN as "null = minimum":
+ *   NaN == NaN → true,  NaN == non-NaN → false
+ *   NaN <  non-NaN → true (null is minimum),  non-NaN < NaN → false
+ * This covers the ^0 branches at lines 760-765 of expr_exec_binary. */
+static test_result_t test_expr_fused_f64_nan_cmp(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* Non-nullable columns with mathematical NaN values.
+     * ray_vec_from_raw sets no RAY_ATTR_HAS_NULLS → fused path accepted. */
+    double rawa[] = {NAN, NAN, 1.0, 2.0, 3.0};
+    double rawb[] = {NAN, 1.0, NAN, 2.0, 4.0};
+    ray_t* va = ray_vec_from_raw(RAY_F64, rawa, 5);
+    ray_t* vb = ray_vec_from_raw(RAY_F64, rawb, 5);
+    int64_t na = ray_sym_intern("fa", 2);
+    int64_t nb = ray_sym_intern("fb", 2);
+    ray_t* tbl = make_two_col_table(na, va, nb, vb);
+    ray_release(va); ray_release(vb);
+
+    /* EQ: both-NaN→1, NaN/non→0, equal→1 = {1,0,0,1,0} → sum=2 */
+    {
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "fa");
+        ray_op_t* b = ray_scan(g, "fb");
+        ray_op_t* cmp = ray_eq(g, a, b);
+        ray_op_t* s   = ray_sum(g, cmp);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 2);
+        ray_release(result); ray_graph_free(g);
+    }
+
+    /* NE: both-NaN→0, NaN/non→1, equal→0 = {0,1,1,0,1} → sum=3 */
+    {
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "fa");
+        ray_op_t* b = ray_scan(g, "fb");
+        ray_op_t* cmp = ray_ne(g, a, b);
+        ray_op_t* s   = ray_sum(g, cmp);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 3);
+        ray_release(result); ray_graph_free(g);
+    }
+
+    /* LT: {0,1,0,0,1} → sum=2
+     * NaN<NaN→0; NaN<non→1(null=min); non<NaN→0; 2<2→0; 3<4→1 */
+    {
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "fa");
+        ray_op_t* b = ray_scan(g, "fb");
+        ray_op_t* cmp = ray_lt(g, a, b);
+        ray_op_t* s   = ray_sum(g, cmp);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 2);
+        ray_release(result); ray_graph_free(g);
+    }
+
+    /* LE: {1,1,0,1,1} → sum=4
+     * NaN<=NaN→1; NaN<=non→1(null=min≤anything); non<=NaN→0; 2<=2→1; 3<=4→1 */
+    {
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "fa");
+        ray_op_t* b = ray_scan(g, "fb");
+        ray_op_t* cmp = ray_le(g, a, b);
+        ray_op_t* s   = ray_sum(g, cmp);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 4);
+        ray_release(result); ray_graph_free(g);
+    }
+
+    /* GT: {0,0,1,0,0} → sum=1
+     * NaN>NaN→0; NaN>non→0(null=min); non>NaN→1; 2>2→0; 3>4→0 */
+    {
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "fa");
+        ray_op_t* b = ray_scan(g, "fb");
+        ray_op_t* cmp = ray_gt(g, a, b);
+        ray_op_t* s   = ray_sum(g, cmp);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 1);
+        ray_release(result); ray_graph_free(g);
+    }
+
+    /* GE: {1,0,1,1,0} → sum=3
+     * NaN>=NaN→1; NaN>=non→0(null=min); non>=NaN→1; 2>=2→1; 3>=4→0 */
+    {
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a = ray_scan(g, "fa");
+        ray_op_t* b = ray_scan(g, "fb");
+        ray_op_t* cmp = ray_ge(g, a, b);
+        ray_op_t* s   = ray_sum(g, cmp);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 3);
+        ray_release(result); ray_graph_free(g);
+    }
+
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ---- fix_null_comparisons: OP_LE/GE/LT/GT through the general loop ----
+ *
+ * When BOTH columns have HAS_NULLS set (l_has=true, r_has=true), the fast
+ * path at line 1194 is skipped (l_has^r_has=false) and the general loop
+ * at line 1206 runs for every position.
+ *
+ * Data: la=[NULL,2,NULL,4]  ra=[NULL,NULL,3,4]
+ *   pos 0: both null  → covers Branch(1212:42) OP_LE and Branch(1212:61) OP_GE
+ *   pos 1: rhs null   → covers Branch(1221:19) OP_GT (null=min, 2>null → true)
+ *   pos 2: lhs null   → covers Branch(1217:23) OP_LT (null=min, null<3 → true)
+ *   pos 3: no null    → normal comparison
+ *
+ * Expected sums (ray_sum on BOOL result):
+ *   LT: [0, 0, 1, 0] = 1
+ *   LE: [1, 0, 1, 1] = 3
+ *   GE: [1, 1, 0, 1] = 3
+ *   GT: [0, 1, 0, 0] = 1
+ */
+static test_result_t test_expr_null_cmp_both_nullable_general_loop(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t la[] = {1, 2, 3, 4};  /* payload (overwritten by nulls at 0,2) */
+    int64_t ra[] = {1, 3, 3, 4};  /* payload (overwritten by nulls at 0,1) */
+    ray_t* lv = ray_vec_from_raw(RAY_I64, la, 4);
+    ray_t* rv = ray_vec_from_raw(RAY_I64, ra, 4);
+    /* Both sides nullable: fast path skipped, general loop forced */
+    ray_vec_set_null(lv, 0, true);  /* pos 0: lhs null */
+    ray_vec_set_null(lv, 2, true);  /* pos 2: lhs null */
+    ray_vec_set_null(rv, 0, true);  /* pos 0: rhs null — both-null at pos 0 */
+    ray_vec_set_null(rv, 1, true);  /* pos 1: rhs null only */
+
+    int64_t na = ray_sym_intern("la", 2);
+    int64_t nb = ray_sym_intern("ra", 2);
+    ray_t* tbl = make_two_col_table(na, lv, nb, rv);
+    ray_release(lv); ray_release(rv);
+
+    /* OP_LT: pos2 lhs-null → Branch(1217:23) True; sum=[0,0,1,0]=1 */
+    {
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a   = ray_scan(g, "la");
+        ray_op_t* b   = ray_scan(g, "ra");
+        ray_op_t* cmp = ray_lt(g, a, b);
+        ray_op_t* s   = ray_sum(g, cmp);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 1);
+        ray_release(result); ray_graph_free(g);
+    }
+
+    /* OP_LE: pos0 both-null→1 → Branch(1212:42) True; sum=[1,0,1,1]=3 */
+    {
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a   = ray_scan(g, "la");
+        ray_op_t* b   = ray_scan(g, "ra");
+        ray_op_t* cmp = ray_le(g, a, b);
+        ray_op_t* s   = ray_sum(g, cmp);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 3);
+        ray_release(result); ray_graph_free(g);
+    }
+
+    /* OP_GE: pos0 both-null→1 → Branch(1212:61) True; sum=[1,1,0,1]=3 */
+    {
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a   = ray_scan(g, "la");
+        ray_op_t* b   = ray_scan(g, "ra");
+        ray_op_t* cmp = ray_ge(g, a, b);
+        ray_op_t* s   = ray_sum(g, cmp);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 3);
+        ray_release(result); ray_graph_free(g);
+    }
+
+    /* OP_GT: pos1 rhs-null→1 → Branch(1221:19) True; sum=[0,1,0,0]=1 */
+    {
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* a   = ray_scan(g, "la");
+        ray_op_t* b   = ray_scan(g, "ra");
+        ray_op_t* cmp = ray_gt(g, a, b);
+        ray_op_t* s   = ray_sum(g, cmp);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 1);
+        ray_release(result); ray_graph_free(g);
+    }
+
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ---- binary_range: float-family NaN ln&&rn branches (lines 1900-1908) ----
+ *
+ * Reaches binary_range float path (out_type=BOOL, src_is_i64_all=false)
+ * with both lv=NaN and rv=NaN at pos 0, lv=NaN/rv=finite at pos 1,
+ * lv=finite/rv=NaN at pos 2.
+ *
+ * Requirements to hit binary_range float path:
+ *   - F64 vectors WITHOUT RAY_ATTR_HAS_NULLS (raw NaN payload, no bitmap null)
+ *   - Graph with NULL table (g->table=NULL) to bypass the fused path
+ *   - Non-scalar vs non-scalar F64 → lp_f64 set → src_is_i64_all=false
+ *
+ * NaN-as-null semantics (null = minimum):
+ *   OP_EQ:  (ln&&rn)?1:(ln||rn)?0:lv==rv
+ *   OP_NE:  (ln&&rn)?0:(ln||rn)?1:lv!=rv
+ *   OP_LT:  (ln&&rn)?0:ln?1:rn?0:lv<rv
+ *   OP_LE:  (ln&&rn)?1:ln?1:rn?0:lv<=rv
+ *   OP_GT:  (ln&&rn)?0:rn?1:ln?0:lv>rv
+ *   OP_GE:  (ln&&rn)?1:rn?1:ln?0:lv>=rv
+ *
+ * Data: va=[NaN,NaN,1.0]  vb=[NaN,1.0,NaN]
+ *   pos 0: both NaN → ln=1, rn=1 → covers ln&&rn=true for all ops
+ *   pos 1: lhs=NaN, rhs=finite → ln=1, rn=0 → covers ln=1 (single-NaN)
+ *   pos 2: lhs=finite, rhs=NaN → ln=0, rn=1 → covers rn=1 (single-NaN)
+ *
+ * Expected sums per op: EQ=1, NE=2, LT=1, LE=2, GT=0, GE=1
+ */
+static test_result_t test_expr_binary_range_f64_nan_branches(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* F64 vectors WITHOUT HAS_NULLS — raw NaN values, no bitmap null.
+     * ray_vec_from_raw does NOT set HAS_NULLS; NaN is just a bit pattern. */
+    double rawa[] = {NAN, NAN, 1.0};
+    double rawb[] = {NAN, 1.0, NAN};
+    ray_t* va = ray_vec_from_raw(RAY_F64, rawa, 3);
+    ray_t* vb = ray_vec_from_raw(RAY_F64, rawb, 3);
+    /* Verify: no bitmap null set */
+    TEST_ASSERT_FALSE(va->attrs & RAY_ATTR_HAS_NULLS);
+    TEST_ASSERT_FALSE(vb->attrs & RAY_ATTR_HAS_NULLS);
+
+    /* NULL-table graph: g->table=NULL → fused path (expr_compile) is skipped;
+     * exec_elementwise_binary → binary_range float path is taken.
+     * ray_const_vec retains va/vb; ray_graph_free releases that retain.
+     * The original refcount-1 from ray_vec_from_raw is kept until final release. */
+    #define RUN_NAN_CMP(OP_FN, EXPECTED_SUM) do { \
+        ray_graph_t* g = ray_graph_new(NULL); \
+        ray_op_t* la = ray_const_vec(g, va); \
+        ray_op_t* lb = ray_const_vec(g, vb); \
+        ray_op_t* cmp = OP_FN(g, la, lb); \
+        ray_op_t* s   = ray_sum(g, cmp); \
+        ray_t* result = ray_execute(g, s); \
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result)); \
+        TEST_ASSERT_EQ_I(result->i64, (EXPECTED_SUM)); \
+        ray_release(result); ray_graph_free(g); \
+    } while (0)
+
+    /* OP_EQ: pos0 both-NaN→1; pos1 NaN/fin→0; pos2 fin/NaN→0 → sum=1 */
+    RUN_NAN_CMP(ray_eq, 1);
+    /* OP_NE: pos0 both-NaN→0; pos1 NaN/fin→1; pos2 fin/NaN→1 → sum=2 */
+    RUN_NAN_CMP(ray_ne, 2);
+    /* OP_LT: pos0 both-NaN→0; pos1 NaN/fin→1(null<fin); pos2 fin/NaN→0 → sum=1 */
+    RUN_NAN_CMP(ray_lt, 1);
+    /* OP_LE: pos0 both-NaN→1; pos1 NaN/fin→1(null<=fin); pos2 fin/NaN→0 → sum=2 */
+    RUN_NAN_CMP(ray_le, 2);
+    /* OP_GT: pos0 both-NaN→0; pos1 NaN/fin→0(null<fin,not>); pos2 fin/NaN→1(fin>null) → sum=1 */
+    RUN_NAN_CMP(ray_gt, 1);
+    /* OP_GE: pos0 both-NaN→1; pos1 NaN/fin→0; pos2 fin/NaN→1(fin>=null) → sum=2 */
+    RUN_NAN_CMP(ray_ge, 2);
+
+    #undef RUN_NAN_CMP
+
+    ray_release(va); ray_release(vb);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ---- binary_range: INT64_MIN % -1 overflow guard (line 1837:126) ----
+ *
+ * binary_range I64 OP_MOD checks `ri==0 || (ri==-1 && li==INT64_MIN)`.
+ * Branch (1837:126) is the `ri==-1` sub-check, never exercised by existing
+ * tests.  Use a null-table graph so the fused path is skipped.
+ *
+ * INT64_MIN % -1 is UB in C; the guard sets result=0 (safe fallback).
+ * 7 % -1 = 0 via the overflow path (7 is divisible, C gives 0 anyway).
+ * -7 % 3 = 2 (floor-mod: C gives -1, then -1+3=2).
+ *
+ * Expected results: [0, 0, 2]
+ */
+static test_result_t test_expr_binary_range_i64_mod_overflow(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t INT64_MIN_VAL = (int64_t)((uint64_t)1 << 63);
+    int64_t vals[] = {INT64_MIN_VAL, 7, -7};
+    ray_t* va = ray_vec_from_raw(RAY_I64, vals, 3);
+
+    /* NULL-table graph: bypasses fused path; binary_range I64 OP_MOD fires. */
+    ray_graph_t* g = ray_graph_new(NULL);
+    ray_op_t* la   = ray_const_vec(g, va);
+    ray_op_t* neg1 = ray_const_i64(g, -1);
+    /* ray_mod: promote(I64,I64)=I64 → out_type=I64 → binary_range I64 MOD */
+    ray_op_t* md   = ray_mod(g, la, neg1);
+    /* Use ray_sum to aggregate: INT64_MIN%-1=0, 7%-1=0, -7%-1=-7+(-1)*floor(-7/-1)...
+     * Wait: for -7%-1 via binary_range I64: ri=-1, li=-7; ri!=-1||li!=INT64_MIN → not overflow
+     * Actually -7 != INT64_MIN, so it goes to normal path: r=-7%-1=0 (C gives -7%(-1)=0).
+     * sum = 0+0+0 = 0
+     * Actually let's use sum to verify: 0+0+0=0 */
+    ray_op_t* s   = ray_sum(g, md);
+    ray_t* result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    /* 0 + 0 + 0 = 0 */
+    TEST_ASSERT_EQ_I(result->i64, 0);
+    ray_release(result);
+    ray_graph_free(g);
+
+    /* Also test OP_DIV with INT64_MIN / -1 to cover Branch(1835:126) — but
+     * ray_div always produces F64, so it uses the F64 path (line 1822), not
+     * the I64 path (line 1835).  The I64 OP_DIV case (line 1835) requires
+     * out_type=I64 which requires the I64 DIV path that ray_div never takes.
+     * Leave that as confirmed-dead. */
+
+    ray_release(va);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ---- binary_range: RAY_BOOL lhs column fast path (line 1650:10) ----
+ *
+ * The integer-family fast path for BOOL comparisons (line 1643) tests
+ * lhs->type==RAY_BOOL at line 1650.  Branch(1650:10) shows True=0 because
+ * existing tests use I64/I32 columns, not BOOL columns, in this path.
+ *
+ * NULL-table graph with ray_const_vec(BOOL vec) + ray_const_bool scalar:
+ *   va=[1,0,1,0]  scalar=1
+ *   EQ 1: [1,0,1,0] → sum=2
+ *   NE 1: [0,1,0,1] → sum=2
+ */
+static test_result_t test_expr_binary_range_bool_lhs_fast_path(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    uint8_t bools[] = {1, 0, 1, 0};
+    ray_t* vb = ray_vec_from_raw(RAY_BOOL, bools, 4);
+
+    /* OP_EQ: BOOL vec vs scalar 1 → [1,0,1,0] → sum=2 */
+    {
+        ray_graph_t* g = ray_graph_new(NULL);
+        ray_op_t* la  = ray_const_vec(g, vb);
+        ray_op_t* one = ray_const_bool(g, true);
+        ray_op_t* cmp = ray_eq(g, la, one);
+        ray_op_t* s   = ray_sum(g, cmp);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 2);
+        ray_release(result); ray_graph_free(g);
+    }
+
+    /* OP_NE: BOOL vec vs scalar 1 → [0,1,0,1] → sum=2 */
+    {
+        ray_graph_t* g = ray_graph_new(NULL);
+        ray_op_t* la  = ray_const_vec(g, vb);
+        ray_op_t* one = ray_const_bool(g, true);
+        ray_op_t* cmp = ray_ne(g, la, one);
+        ray_op_t* s   = ray_sum(g, cmp);
+        ray_t* result = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 2);
+        ray_release(result); ray_graph_free(g);
+    }
+
+    ray_release(vb);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ---- linear/affine narrow column types --------------------------------
+ *
+ * Covers type_is_linear_i64_col and try_affine_sumavg_input for non-I64
+ * column types: TIMESTAMP, I32, TIME, I16, U8, BOOL.
+ *
+ * MUST use ray_group(n_keys=0) — not ray_sum() — because:
+ *   try_linear_sumavg_input_i64 is called from exec_group (group.c line 5052),
+ *   not from exec_reduction.  ray_sum() calls exec_reduction which skips it.
+ *
+ * Linear path (try_linear_sumavg_input_i64):
+ *   Branch(178:28) True: t==TIMESTAMP
+ *   Branch(179:12) True: t==I32
+ *   Branch(179:45) True: t==TIME
+ *   Branch(179:62) True: t==I16
+ *   Branch(180:12) True: t==U8 (partially covered; reinforce)
+ *
+ * Affine path (try_affine_sumavg_input) — bt is column base type:
+ *   Branch(372:26) True: bt==TIMESTAMP
+ *   Branch(373:9)  True: bt==I32
+ *   Branch(373:26) True: bt==I16
+ *   Branch(373:43) True: bt==U8
+ *   Branch(373:59) True: bt==BOOL
+ *
+ * ray_group(g, NULL, 0, ops, ins, 1) → exec_group(n_keys=0)
+ * result is RAY_TABLE with 1 row; sum column is I64.
+ */
+static test_result_t test_expr_linear_affine_narrow_col_types(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+/* Helper macro: read the first I64 element from the first column of a
+ * RAY_TABLE result returned by ray_group(n_keys=0). */
+#define GRP_SUM_I64(result_)  \
+    (((int64_t*)ray_data(ray_table_get_col_idx((result_), 0)))[0])
+
+    /* ── TIMESTAMP column: group sum(ts * 2) ── */
+    {
+        int64_t ts_raw[] = {100, 200, 300};
+        ray_t* ts_vec = ray_vec_from_raw(RAY_TIMESTAMP, ts_raw, 3);
+        int64_t cn = ray_sym_intern("ts", 2);
+        ray_t* tbl = ray_table_new(1);
+        tbl = ray_table_add_col(tbl, cn, ts_vec);
+        ray_release(ts_vec);
+
+        /* linear: sum(ts * 2) via try_linear_sumavg_input_i64.
+         * type_is_linear_i64_col(RAY_TIMESTAMP) → Branch(178:28) True.
+         * 2*(100+200+300) = 1200 */
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* x   = ray_scan(g, "ts");
+        ray_op_t* c2  = ray_const_i64(g, 2);
+        ray_op_t* mul = ray_mul(g, x, c2);
+        uint16_t ops[] = { OP_SUM };
+        ray_op_t* ins[] = { mul };
+        ray_op_t* grp = ray_group(g, NULL, 0, ops, ins, 1);
+        ray_t* result = ray_execute(g, grp);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(ray_table_nrows(result), 1);
+        TEST_ASSERT_EQ_I(GRP_SUM_I64(result), 1200);
+        ray_release(result); ray_graph_free(g);
+
+        /* affine: sum(ts + 10) via try_affine_sumavg_input.
+         * bt==TIMESTAMP → Branch(372:26) True.
+         * (100+10)+(200+10)+(300+10) = 630 */
+        g = ray_graph_new(tbl);
+        x = ray_scan(g, "ts");
+        ray_op_t* c10 = ray_const_i64(g, 10);
+        ray_op_t* add = ray_add(g, x, c10);
+        ops[0] = OP_SUM; ins[0] = add;
+        grp = ray_group(g, NULL, 0, ops, ins, 1);
+        result = ray_execute(g, grp);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(ray_table_nrows(result), 1);
+        TEST_ASSERT_EQ_I(GRP_SUM_I64(result), 630);
+        ray_release(result); ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* ── I32 column: group sum(x * 3) and sum(x + 5) ── */
+    {
+        int32_t i32_raw[] = {10, 20, 30};
+        ray_t* i32_vec = ray_vec_from_raw(RAY_I32, i32_raw, 3);
+        int64_t cn = ray_sym_intern("xi32", 4);
+        ray_t* tbl = ray_table_new(1);
+        tbl = ray_table_add_col(tbl, cn, i32_vec);
+        ray_release(i32_vec);
+
+        /* linear: sum(x * 3), type_is_linear_i64_col(RAY_I32) → Branch(179:12) True.
+         * 3*(10+20+30) = 180 */
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* x   = ray_scan(g, "xi32");
+        ray_op_t* c3  = ray_const_i64(g, 3);
+        ray_op_t* mul = ray_mul(g, x, c3);
+        uint16_t ops[] = { OP_SUM };
+        ray_op_t* ins[] = { mul };
+        ray_op_t* grp = ray_group(g, NULL, 0, ops, ins, 1);
+        ray_t* result = ray_execute(g, grp);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(ray_table_nrows(result), 1);
+        TEST_ASSERT_EQ_I(GRP_SUM_I64(result), 180);
+        ray_release(result); ray_graph_free(g);
+
+        /* affine: sum(x + 5), bt==I32 → Branch(373:9) True.
+         * (10+5)+(20+5)+(30+5) = 75 */
+        g = ray_graph_new(tbl);
+        x = ray_scan(g, "xi32");
+        ray_op_t* c5  = ray_const_i64(g, 5);
+        ray_op_t* add = ray_add(g, x, c5);
+        ops[0] = OP_SUM; ins[0] = add;
+        grp = ray_group(g, NULL, 0, ops, ins, 1);
+        result = ray_execute(g, grp);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(ray_table_nrows(result), 1);
+        TEST_ASSERT_EQ_I(GRP_SUM_I64(result), 75);
+        ray_release(result); ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* ── TIME column: group sum(t * 2) ── */
+    {
+        int32_t t_raw[] = {1000, 2000, 3000};
+        ray_t* t_vec = ray_vec_from_raw(RAY_TIME, t_raw, 3);
+        int64_t cn = ray_sym_intern("tm", 2);
+        ray_t* tbl = ray_table_new(1);
+        tbl = ray_table_add_col(tbl, cn, t_vec);
+        ray_release(t_vec);
+
+        /* linear: sum(t * 2), type_is_linear_i64_col(RAY_TIME) → Branch(179:45) True.
+         * 2*(1000+2000+3000) = 12000 */
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* x   = ray_scan(g, "tm");
+        ray_op_t* c2  = ray_const_i64(g, 2);
+        ray_op_t* mul = ray_mul(g, x, c2);
+        uint16_t ops[] = { OP_SUM };
+        ray_op_t* ins[] = { mul };
+        ray_op_t* grp = ray_group(g, NULL, 0, ops, ins, 1);
+        ray_t* result = ray_execute(g, grp);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(ray_table_nrows(result), 1);
+        TEST_ASSERT_EQ_I(GRP_SUM_I64(result), 12000);
+        ray_release(result); ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* ── I16 column: group sum(x * 4) and sum(x + 3) ── */
+    {
+        int16_t i16_raw[] = {5, 10, 15};
+        ray_t* i16_vec = ray_vec_from_raw(RAY_I16, i16_raw, 3);
+        int64_t cn = ray_sym_intern("xi16", 4);
+        ray_t* tbl = ray_table_new(1);
+        tbl = ray_table_add_col(tbl, cn, i16_vec);
+        ray_release(i16_vec);
+
+        /* linear: sum(x * 4), type_is_linear_i64_col(RAY_I16) → Branch(179:62) True.
+         * 4*(5+10+15) = 120 */
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* x   = ray_scan(g, "xi16");
+        ray_op_t* c4  = ray_const_i64(g, 4);
+        ray_op_t* mul = ray_mul(g, x, c4);
+        uint16_t ops[] = { OP_SUM };
+        ray_op_t* ins[] = { mul };
+        ray_op_t* grp = ray_group(g, NULL, 0, ops, ins, 1);
+        ray_t* result = ray_execute(g, grp);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(ray_table_nrows(result), 1);
+        TEST_ASSERT_EQ_I(GRP_SUM_I64(result), 120);
+        ray_release(result); ray_graph_free(g);
+
+        /* affine: sum(x + 3), bt==I16 → Branch(373:26) True.
+         * (5+3)+(10+3)+(15+3) = 39 */
+        g = ray_graph_new(tbl);
+        x = ray_scan(g, "xi16");
+        ray_op_t* c3  = ray_const_i64(g, 3);
+        ray_op_t* add = ray_add(g, x, c3);
+        ops[0] = OP_SUM; ins[0] = add;
+        grp = ray_group(g, NULL, 0, ops, ins, 1);
+        result = ray_execute(g, grp);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(ray_table_nrows(result), 1);
+        TEST_ASSERT_EQ_I(GRP_SUM_I64(result), 39);
+        ray_release(result); ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* ── U8 column: group sum(x * 5) and sum(x + 2) ── */
+    {
+        uint8_t u8_raw[] = {1, 2, 3};
+        ray_t* u8_vec = ray_vec_from_raw(RAY_U8, u8_raw, 3);
+        int64_t cn = ray_sym_intern("xu8", 3);
+        ray_t* tbl = ray_table_new(1);
+        tbl = ray_table_add_col(tbl, cn, u8_vec);
+        ray_release(u8_vec);
+
+        /* linear: sum(x * 5), type_is_linear_i64_col(RAY_U8) → Branch(180:12) True.
+         * 5*(1+2+3) = 30 */
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* x   = ray_scan(g, "xu8");
+        ray_op_t* c5  = ray_const_i64(g, 5);
+        ray_op_t* mul = ray_mul(g, x, c5);
+        uint16_t ops[] = { OP_SUM };
+        ray_op_t* ins[] = { mul };
+        ray_op_t* grp = ray_group(g, NULL, 0, ops, ins, 1);
+        ray_t* result = ray_execute(g, grp);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(ray_table_nrows(result), 1);
+        TEST_ASSERT_EQ_I(GRP_SUM_I64(result), 30);
+        ray_release(result); ray_graph_free(g);
+
+        /* affine: sum(x + 2), bt==U8 → Branch(373:43) True.
+         * (1+2)+(2+2)+(3+2) = 12 */
+        g = ray_graph_new(tbl);
+        x = ray_scan(g, "xu8");
+        ray_op_t* c2  = ray_const_i64(g, 2);
+        ray_op_t* add = ray_add(g, x, c2);
+        ops[0] = OP_SUM; ins[0] = add;
+        grp = ray_group(g, NULL, 0, ops, ins, 1);
+        result = ray_execute(g, grp);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(ray_table_nrows(result), 1);
+        TEST_ASSERT_EQ_I(GRP_SUM_I64(result), 12);
+        ray_release(result); ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+    /* ── BOOL column: group sum(b + 1) ── covers Branch(373:59) True ── */
+    {
+        uint8_t b_raw[] = {1, 0, 1, 0};
+        ray_t* b_vec = ray_vec_from_raw(RAY_BOOL, b_raw, 4);
+        int64_t cn = ray_sym_intern("xbool", 5);
+        ray_t* tbl = ray_table_new(1);
+        tbl = ray_table_add_col(tbl, cn, b_vec);
+        ray_release(b_vec);
+
+        /* affine: sum(b + 1), bt==BOOL → Branch(373:59) True.
+         * (1+1)+(0+1)+(1+1)+(0+1) = 6 */
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* x   = ray_scan(g, "xbool");
+        ray_op_t* c1  = ray_const_i64(g, 1);
+        ray_op_t* add = ray_add(g, x, c1);
+        uint16_t ops[] = { OP_SUM };
+        ray_op_t* ins[] = { add };
+        ray_op_t* grp = ray_group(g, NULL, 0, ops, ins, 1);
+        ray_t* result = ray_execute(g, grp);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(ray_table_nrows(result), 1);
+        TEST_ASSERT_EQ_I(GRP_SUM_I64(result), 6);
+        ray_release(result); ray_graph_free(g);
+
+        ray_release(tbl);
+    }
+
+#undef GRP_SUM_I64
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ---- fix_null_comparisons: null scalar as LHS -------------------------
+ *
+ * When a null I64 scalar (INT64_MIN) is the LHS of a comparison in the
+ * DAG executor (NULL-table graph → exec_elementwise_binary), the RFL
+ * evaluator bypasses this path (can_dag=0 for null scalars), but the
+ * C API can reach it directly.
+ *
+ * Covers:
+ *   Branch(1184:29) True: l_scalar && scalar_is_null(lhs) = true (ln_s=true)
+ *   Branch(1207:19) True: ln_s in general loop of fix_null_comparisons
+ *
+ * Null-as-minimum semantics (null = less than everything):
+ *   null EQ x → false (not in {LT,LE,NE}) → 0 for each
+ *   null LT x → true  (in {LT,LE,NE}) → 1 for each
+ *   null NE x → true  (in {LT,LE,NE}) → 1 for each
+ *
+ * With vec [1, 2, 3]: sum(null EQ vec)=0, sum(null LT vec)=3, sum(null NE vec)=3
+ */
+static test_result_t test_expr_fix_null_cmp_null_scalar_lhs(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t vals[] = {1, 2, 3};
+    ray_t* rv = ray_vec_from_raw(RAY_I64, vals, 3);
+
+    /* EQ: null == [1,2,3] → [false,false,false] → sum=0 */
+    {
+        ray_graph_t* g = ray_graph_new(NULL);
+        ray_op_t* null_s = ray_const_i64(g, (int64_t)INT64_MIN); /* null sentinel */
+        ray_op_t* vec_op = ray_const_vec(g, rv);
+        ray_op_t* cmp    = ray_eq(g, null_s, vec_op);
+        ray_op_t* s      = ray_sum(g, cmp);
+        ray_t* result    = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 0);
+        ray_release(result); ray_graph_free(g);
+    }
+
+    /* LT: null < [1,2,3] → [true,true,true] → sum=3 */
+    {
+        ray_graph_t* g = ray_graph_new(NULL);
+        ray_op_t* null_s = ray_const_i64(g, (int64_t)INT64_MIN);
+        ray_op_t* vec_op = ray_const_vec(g, rv);
+        ray_op_t* cmp    = ray_lt(g, null_s, vec_op);
+        ray_op_t* s      = ray_sum(g, cmp);
+        ray_t* result    = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 3);
+        ray_release(result); ray_graph_free(g);
+    }
+
+    /* NE: null != [1,2,3] → [true,true,true] → sum=3 */
+    {
+        ray_graph_t* g = ray_graph_new(NULL);
+        ray_op_t* null_s = ray_const_i64(g, (int64_t)INT64_MIN);
+        ray_op_t* vec_op = ray_const_vec(g, rv);
+        ray_op_t* cmp    = ray_ne(g, null_s, vec_op);
+        ray_op_t* s      = ray_sum(g, cmp);
+        ray_t* result    = ray_execute(g, s);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 3);
+        ray_release(result); ray_graph_free(g);
+    }
+
+    ray_release(rv);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 /* ======================================================================
  * Suite
  * ====================================================================== */
@@ -16168,5 +16882,19 @@ const test_entry_t exec_entries[] = {
     { "exec/expr_binary_bool_int_i64_vecsve",   test_expr_binary_bool_int_i64_vecsve,   NULL, NULL },
     { "exec/expr_binary_i32_rp_i32_narrow_lhs", test_expr_binary_i32_rp_i32_narrow_lhs, NULL, NULL },
     { "exec/expr_binary_i64_rp_u32_more",       test_expr_binary_i64_rp_u32_more,       NULL, NULL },
+    /* coverage-round-5: fused F64 NaN comparison branches (expr_exec_binary lines 760-765) */
+    { "exec/expr_fused_f64_nan_cmp",            test_expr_fused_f64_nan_cmp,            NULL, NULL },
+    /* coverage-round-5: fix_null_comparisons general-loop OP_LE/GE/LT/GT branches */
+    { "exec/expr_null_cmp_both_nullable_loop",  test_expr_null_cmp_both_nullable_general_loop, NULL, NULL },
+    /* coverage-round-5: binary_range float-family NaN ln&&rn branches (lines 1900-1908) */
+    { "exec/expr_binary_range_f64_nan_branches", test_expr_binary_range_f64_nan_branches, NULL, NULL },
+    /* coverage-round-5: binary_range I64 MOD INT64_MIN overflow guard (line 1837:126) */
+    { "exec/expr_binary_range_i64_mod_overflow", test_expr_binary_range_i64_mod_overflow, NULL, NULL },
+    /* coverage-round-5: binary_range BOOL lhs fast path (line 1650:10) */
+    { "exec/expr_binary_range_bool_lhs_fast_path", test_expr_binary_range_bool_lhs_fast_path, NULL, NULL },
+    /* coverage-round-5: linear/affine narrow col types (TIMESTAMP,I32,TIME,I16,U8,BOOL) */
+    { "exec/expr_linear_affine_narrow_col_types",  test_expr_linear_affine_narrow_col_types,  NULL, NULL },
+    /* coverage-round-5: fix_null_comparisons null scalar LHS (Branch 1184:29, 1207:19) */
+    { "exec/expr_fix_null_cmp_null_scalar_lhs",    test_expr_fix_null_cmp_null_scalar_lhs,    NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };

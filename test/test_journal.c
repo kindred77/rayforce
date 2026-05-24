@@ -31,6 +31,7 @@
 #include "lang/env.h"
 #include "mem/sys.h"
 #include "core/ipc.h"
+#include "ops/journal.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1685,6 +1686,282 @@ static test_result_t test_journal_roll_rename_fails(void) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
+ *  22. Ops-layer (src/ops/journal.c) — direct C-API calls.
+ *
+ *  These tests call the thin ops wrappers directly to cover branches
+ *  that cannot be reached from RFL (NULL expr, long paths, etc.).
+ *  No static de-exposure, no internal-header additions beyond ops/journal.h
+ *  which is the public ops header.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+/* 22a. ray_log_replay_fn: path is NULL — str_to_cpath early-NULL branch. */
+static test_result_t test_ops_replay_null_path(void) {
+    ray_t* r = ray_log_replay_fn(NULL);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    ray_release(r);
+    PASS();
+}
+
+/* 22b. ray_log_replay_fn: path is an integer — type != -RAY_STR branch. */
+static test_result_t test_ops_replay_non_string(void) {
+    ray_t* arg = ray_i64(42);
+    ray_t* r   = ray_log_replay_fn(arg);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    ray_release(arg);
+    ray_release(r);
+    PASS();
+}
+
+/* 22c. ray_log_replay_fn: path longer than 1023 bytes — n+1 > bufsz branch
+ *  in str_to_cpath.  This is the only reachable trigger for line 39. */
+static test_result_t test_ops_replay_long_path(void) {
+    /* Build a 1025-character string — guaranteed to overflow the 1024-byte
+     * local buffer in str_to_cpath. */
+    char long_path[1026];
+    memset(long_path, 'x', 1025);
+    long_path[1025] = '\0';
+
+    ray_t* arg = ray_str(long_path, 1025);
+    TEST_ASSERT_NOT_NULL(arg);
+    ray_t* r = ray_log_replay_fn(arg);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    ray_release(arg);
+    ray_release(r);
+    PASS();
+}
+
+/* 22d. ray_log_validate_fn: NULL path — str_to_cpath early-NULL. */
+static test_result_t test_ops_validate_null_path(void) {
+    ray_t* r = ray_log_validate_fn(NULL);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    ray_release(r);
+    PASS();
+}
+
+/* 22e. ray_log_validate_fn: integer path — type guard. */
+static test_result_t test_ops_validate_non_string(void) {
+    ray_t* arg = ray_i64(99);
+    ray_t* r   = ray_log_validate_fn(arg);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    ray_release(arg);
+    ray_release(r);
+    PASS();
+}
+
+/* 22f. ray_log_validate_fn: path > 1023 bytes — n+1 > bufsz. */
+static test_result_t test_ops_validate_long_path(void) {
+    char long_path[1026];
+    memset(long_path, 'y', 1025);
+    long_path[1025] = '\0';
+
+    ray_t* arg = ray_str(long_path, 1025);
+    TEST_ASSERT_NOT_NULL(arg);
+    ray_t* r = ray_log_validate_fn(arg);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    ray_release(arg);
+    ray_release(r);
+    PASS();
+}
+
+/* 22g. ray_log_open_fn: n != 2 (rank guard). */
+static test_result_t test_ops_open_rank(void) {
+    ray_t* dummy = ray_i64(0);
+    ray_t* args[1] = { dummy };
+    ray_t* r = ray_log_open_fn(args, 1);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    ray_release(dummy);
+    ray_release(r);
+    PASS();
+}
+
+/* 22h. ray_log_open_fn: args[0] = NULL — !args[0] branch. */
+static test_result_t test_ops_open_null_mode(void) {
+    ray_t* str_arg = ray_str("/tmp/jrn_ops_test", 17);
+    ray_t* args[2] = { NULL, str_arg };
+    ray_t* r = ray_log_open_fn(args, 2);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    ray_release(str_arg);
+    ray_release(r);
+    PASS();
+}
+
+/* 22i. ray_log_open_fn: args[0] = integer — type != -RAY_SYM. */
+static test_result_t test_ops_open_int_mode(void) {
+    ray_t* int_arg = ray_i64(1);
+    ray_t* str_arg = ray_str("/tmp/jrn_ops_test", 17);
+    ray_t* args[2] = { int_arg, str_arg };
+    ray_t* r = ray_log_open_fn(args, 2);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    ray_release(int_arg);
+    ray_release(str_arg);
+    ray_release(r);
+    PASS();
+}
+
+/* 22j. ray_log_open_fn: args[1] = NULL — !args[1] branch. */
+static test_result_t test_ops_open_null_base(void) {
+    int64_t async_id = ray_sym_intern("async", 5);
+    ray_t*  sym_arg  = ray_sym(async_id);
+    ray_t*  args[2]  = { sym_arg, NULL };
+    ray_t*  r        = ray_log_open_fn(args, 2);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    ray_release(sym_arg);
+    ray_release(r);
+    PASS();
+}
+
+/* 22k. ray_log_open_fn: args[1] = sym — type != -RAY_STR. */
+static test_result_t test_ops_open_sym_base(void) {
+    int64_t async_id = ray_sym_intern("async", 5);
+    int64_t foo_id   = ray_sym_intern("foo",   3);
+    ray_t*  sym_mode = ray_sym(async_id);
+    ray_t*  sym_base = ray_sym(foo_id);
+    ray_t*  args[2]  = { sym_mode, sym_base };
+    ray_t*  r        = ray_log_open_fn(args, 2);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    ray_release(sym_mode);
+    ray_release(sym_base);
+    ray_release(r);
+    PASS();
+}
+
+/* 22l. ray_log_open_fn: mode sym is not `async or `sync — domain guard. */
+static test_result_t test_ops_open_bad_mode(void) {
+    int64_t bogus_id = ray_sym_intern("bogus", 5);
+    ray_t*  sym_mode = ray_sym(bogus_id);
+    ray_t*  str_base = ray_str("/tmp/jrn_ops_test", 17);
+    ray_t*  args[2]  = { sym_mode, str_base };
+    ray_t*  r        = ray_log_open_fn(args, 2);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    ray_release(sym_mode);
+    ray_release(str_base);
+    ray_release(r);
+    PASS();
+}
+
+/* 22m. ray_log_open_fn: args[1] is a string longer than 1023 bytes — the
+ *  str_to_cpath call at line 72 returns NULL, triggering line 73. */
+static test_result_t test_ops_open_long_base(void) {
+    int64_t async_id  = ray_sym_intern("async", 5);
+    ray_t*  sym_mode  = ray_sym(async_id);
+
+    char long_base[1026];
+    memset(long_base, 'z', 1025);
+    long_base[1025] = '\0';
+    ray_t* str_base = ray_str(long_base, 1025);
+
+    ray_t* args[2] = { sym_mode, str_base };
+    ray_t* r       = ray_log_open_fn(args, 2);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    ray_release(sym_mode);
+    ray_release(str_base);
+    ray_release(r);
+    PASS();
+}
+
+/* 22n. ray_log_open_fn: `sync mode opens cleanly (exercises the sync branch
+ *  at line 68 for any run-context where only `async has been tested). */
+static test_result_t test_ops_open_sync_mode(void) {
+    char base[256]; make_base(base, sizeof(base), "ops_sync");
+
+    int64_t sync_id  = ray_sym_intern("sync", 4);
+    ray_t*  sym_mode = ray_sym(sync_id);
+    ray_t*  str_base = ray_str(base, strlen(base));
+    ray_t*  args[2]  = { sym_mode, str_base };
+    ray_t*  r        = ray_log_open_fn(args, 2);
+    /* Must succeed (null return = ok). */
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(sym_mode);
+    ray_release(str_base);
+    ray_release(r);
+
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    cleanup_base(base);
+    PASS();
+}
+
+/* 22o. ray_log_write_fn: NULL expr — the !expr guard at line 89.
+ *  Journal must be open first so we pass the is_open guard. */
+static test_result_t test_ops_write_null_expr(void) {
+    char base[256]; make_base(base, sizeof(base), "ops_null_expr");
+
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+
+    ray_t* r = ray_log_write_fn(NULL);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    ray_release(r);
+
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    cleanup_base(base);
+    PASS();
+}
+
+/* 22p. ray_log_write_fn: journal not open — noopen guard (line 87-88).
+ *  Also exercises ray_log_write_fn entry with a valid non-NULL expr so we
+ *  confirm the !is_open branch returns an error atom. */
+static test_result_t test_ops_write_noopen(void) {
+    /* Ensure journal is closed. */
+    ray_journal_close();
+
+    ray_t* expr = ray_i64(42);
+    ray_t* r    = ray_log_write_fn(expr);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    ray_release(expr);
+    ray_release(r);
+    PASS();
+}
+
+/* 22q. ray_log_write_fn: pay_size <= 0 (lines 100-103).
+ *
+ *  ray_serde_size returns 0 for object types not in its switch (any type
+ *  value that is not a known atom/vector/container type).  We manufacture
+ *  a stack-local ray_t with type=14 — outside the known range — so the
+ *  function hits the "serde size 0" domain error without touching any
+ *  heap internals of the fake object.
+ *
+ *  Safety: ray_is_lazy checks type==104; RAY_IS_ERR checks type==127;
+ *  RAY_IS_NULL checks type==126.  Type=14 passes all three predicates
+ *  safely.  ray_serde_size dereferences obj->len (for the overflow guard)
+ *  which is 0 from the memset — safe. */
+static test_result_t test_ops_write_serde_size_zero(void) {
+    char base[256]; make_base(base, sizeof(base), "ops_serde_zero");
+
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+
+    /* Stack object with an unknown type tag (14 is not RAY_LIST through
+     * RAY_STR, not RAY_LAZY, RAY_ERROR, or RAY_NULL). */
+    ray_t fake;
+    memset(&fake, 0, sizeof(fake));
+    fake.type = 14;       /* positive unknown → ray_serde_size returns 0 */
+    fake.rc   = 1;        /* non-zero so any accidental retain/release is safe */
+
+    ray_t* r = ray_log_write_fn(&fake);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    ray_release(r);
+
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    cleanup_base(base);
+    PASS();
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
  *  Registration
  * ═══════════════════════════════════════════════════════════════════════ */
 
@@ -1759,5 +2036,23 @@ const test_entry_t journal_entries[] = {
     { "journal/open_qdb_missing_val",      test_journal_open_qdb_missing_val,     jrn_setup, jrn_teardown },
     { "journal/snapshot_rename_fails",     test_journal_snapshot_rename_fails,    jrn_setup, jrn_teardown },
     { "journal/roll_rename_fails",         test_journal_roll_rename_fails,        jrn_setup, jrn_teardown },
+    /* Ops layer (src/ops/journal.c) */
+    { "journal/ops_replay_null_path",      test_ops_replay_null_path,             jrn_setup, jrn_teardown },
+    { "journal/ops_replay_non_string",     test_ops_replay_non_string,            jrn_setup, jrn_teardown },
+    { "journal/ops_replay_long_path",      test_ops_replay_long_path,             jrn_setup, jrn_teardown },
+    { "journal/ops_validate_null_path",    test_ops_validate_null_path,           jrn_setup, jrn_teardown },
+    { "journal/ops_validate_non_string",   test_ops_validate_non_string,          jrn_setup, jrn_teardown },
+    { "journal/ops_validate_long_path",    test_ops_validate_long_path,           jrn_setup, jrn_teardown },
+    { "journal/ops_open_rank",             test_ops_open_rank,                    jrn_setup, jrn_teardown },
+    { "journal/ops_open_null_mode",        test_ops_open_null_mode,               jrn_setup, jrn_teardown },
+    { "journal/ops_open_int_mode",         test_ops_open_int_mode,                jrn_setup, jrn_teardown },
+    { "journal/ops_open_null_base",        test_ops_open_null_base,               jrn_setup, jrn_teardown },
+    { "journal/ops_open_sym_base",         test_ops_open_sym_base,                jrn_setup, jrn_teardown },
+    { "journal/ops_open_bad_mode",         test_ops_open_bad_mode,                jrn_setup, jrn_teardown },
+    { "journal/ops_open_long_base",        test_ops_open_long_base,               jrn_setup, jrn_teardown },
+    { "journal/ops_open_sync_mode",        test_ops_open_sync_mode,               jrn_setup, jrn_teardown },
+    { "journal/ops_write_null_expr",       test_ops_write_null_expr,              jrn_setup, jrn_teardown },
+    { "journal/ops_write_noopen",          test_ops_write_noopen,                 jrn_setup, jrn_teardown },
+    { "journal/ops_write_serde_size_zero", test_ops_write_serde_size_zero,        jrn_setup, jrn_teardown },
     { NULL, NULL, NULL, NULL },
 };
