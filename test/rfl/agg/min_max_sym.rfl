@@ -1,32 +1,80 @@
-;; Bug 1: (min SYM_vec) / (max SYM_vec) must return a SYM atom.
+;; min/max over SYM — lexicographic order (consistent with asc/desc).
 ;;
-;; Before fix: returned int64 (the internal sym id) — type lost.
-;; After fix: returns SYM atom; type preserved.
+;; Historical context: pre-fix, reduction_i64_result lost the SYM type
+;; (returned raw i64 sym_id) — fixed in 1cf45f81.  Then a second, deeper
+;; bug remained: min/max compared sym_ids numerically (in intern order)
+;; instead of resolving to strings — so the result depended on global
+;; session state.  Fixed by sym_lex_lt/sym_lex_gt in src/ops/group.c.
 ;;
-;; Root cause: src/ops/group.c:reduction_i64_result switch had no
-;; case for RAY_SYM, so SYM out_type fell through to ray_i64(val).
+;; Invariant under test:
+;;   (min v) == (first (asc v))    for any SYM vector v
+;;   (max v) == (last  (asc v))
+;; Both standalone reductions and SELECT scalar/by/HT paths.
 
-;; ─── Singleton: trivially min == max == only element ──────────────
+;; ─── Singleton ────────────────────────────────────────────────────
 (min ['x]) -- 'x
 (max ['x]) -- 'x
 (type (min ['x])) -- 'sym
 (type (max ['x])) -- 'sym
 
-;; ─── Two elements ────────────────────────────────────────────────
-;; min/max over SYM uses internal id order (insertion order in this
-;; case). Whatever the first-interned wins for min, last-interned for
-;; max — but type must be SYM in both cases.
-(type (min ['alpha 'beta])) -- 'sym
-(type (max ['alpha 'beta])) -- 'sym
+;; ─── Stable lex value-asserts ─────────────────────────────────────
+;; Lex order is independent of intern order: 'xyz interned first does
+;; NOT make it the min.
+(min ['xyz 'abc 'pqr 'acb 'def]) -- 'abc
+(max ['xyz 'abc 'pqr 'acb 'def]) -- 'xyz
+(min ['zebra 'alpha 'monkey])    -- 'alpha
+(max ['zebra 'alpha 'monkey])    -- 'zebra
+(min ['banana 'apple 'cherry])   -- 'apple
+(max ['banana 'apple 'cherry])   -- 'cherry
 
-;; ─── Identity round-trip: min of repeated single sym is that sym ──
+;; ─── Identity ─────────────────────────────────────────────────────
 (min ['foo 'foo 'foo 'foo]) -- 'foo
 (max ['foo 'foo 'foo 'foo]) -- 'foo
-(type (min ['foo 'foo 'foo 'foo])) -- 'sym
-(type (max ['foo 'foo 'foo 'foo])) -- 'sym
 
 ;; ─── Comparison round-trip ────────────────────────────────────────
-;; (== (min v) <some-sym>) must work — verifies SYM atom equality
-;; survives the reduction
 (== (min ['z 'z 'z]) 'z) -- true
 (== (max ['z 'z 'z]) 'z) -- true
+
+;; ─── Invariant: (min v) == (first (asc v)) ────────────────────────
+;; This would have caught the divergence between sort (lex via
+;; build_enum_rank) and min/max (sym_id) immediately.
+(set _Vs1 ['kappa 'iota 'theta 'eta 'alpha 'omega])
+(== (min _Vs1) (first (asc _Vs1)))  -- true
+(== (max _Vs1) (last  (asc _Vs1)))  -- true
+;; Also check first(desc)/last(desc) — separate code path that previously
+;; dropped SYM type (returned i64) via exec_reduction's ray_i64() path.
+(== (max _Vs1) (first (desc _Vs1))) -- true
+(== (min _Vs1) (last  (desc _Vs1))) -- true
+(type (first (desc _Vs1))) -- 'sym
+(type (last  (desc _Vs1))) -- 'sym
+(type (first (asc  _Vs1))) -- 'sym
+(type (last  (asc  _Vs1))) -- 'sym
+
+(set _Vs2 ['ZZZ 'AAA 'MMM 'BBB 'QQQ])
+(== (min _Vs2) (first (asc _Vs2)))  -- true
+(== (max _Vs2) (last  (asc _Vs2)))  -- true
+(== (max _Vs2) (first (desc _Vs2))) -- true
+(== (min _Vs2) (last  (desc _Vs2))) -- true
+
+;; ─── SELECT scalar agg (n_keys==0, scalar_accum_row) ──────────────
+(set _Tsa (table [k v] (list (as 'SYM ['xyz 'abc 'pqr 'acb 'def]) (as 'I64 [1 2 3 4 5]))))
+(== (at (at (select {m: (min k) from: _Tsa}) 'm) 0) 'abc) -- true
+(== (at (at (select {m: (max k) from: _Tsa}) 'm) 0) 'xyz) -- true
+(== (at (at (select {m: (min k) from: _Tsa where: (>= v 3)}) 'm) 0) 'acb) -- true
+(== (at (at (select {m: (max k) from: _Tsa where: (<= v 3)}) 'm) 0) 'xyz) -- true
+
+;; ─── SELECT by:k (DA path, low cardinality keys) ──────────────────
+(set _Tda (table [k v] (list (as 'I64 [1 1 2 2 3]) (as 'SYM ['xyz 'abc 'pqr 'acb 'def]))))
+(set _Rda (select {mn: (min v) mx: (max v) by: k from: _Tda}))
+(at (at _Rda 'mn) 0) -- 'abc      ;; group k=1: {xyz, abc} → abc
+(at (at _Rda 'mx) 0) -- 'xyz
+(at (at _Rda 'mn) 1) -- 'acb      ;; group k=2: {pqr, acb} → acb
+(at (at _Rda 'mx) 1) -- 'pqr
+
+;; ─── SELECT by:k (HT path, key range > 262144 forces HT) ──────────
+(set _Tht (table [k v] (list (as 'I64 [0 0 0 1000000 1000000]) (as 'SYM ['xyz 'abc 'pqr 'acb 'def]))))
+(set _Rht (select {mn: (min v) mx: (max v) by: k from: _Tht}))
+(at (at _Rht 'mn) 0) -- 'abc      ;; group k=0: {xyz, abc, pqr} → abc
+(at (at _Rht 'mx) 0) -- 'xyz
+(at (at _Rht 'mn) 1) -- 'acb      ;; group k=1000000: {acb, def} → acb
+(at (at _Rht 'mx) 1) -- 'def

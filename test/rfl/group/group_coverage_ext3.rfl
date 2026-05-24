@@ -95,14 +95,15 @@
 ;; STDDEV(v) by k: I64 sum_col in exec_group_per_partition (lines 8746-8758)
 (set Rppstdi (select {s: (stddev v) from: _Ppstdi by: k}))
 (count Rppstdi) -- 10
-;; ── BUG: parted-table STDDEV returns all zeros ──────────────────────────
-;; The same select on a non-parted table (single table with the same
-;; 4000 rows) gives stddev ≈ 578.79 per group.  Parted execution via
-;; exec_group_per_partition produces 0.0 for every group — the
-;; sum_col->type != RAY_F64 (I64) merge path in lines 8746-8758 mis-
-;; handles the SUMSQ accumulator across partitions.  Documented here
-;; until the merge logic is fixed; assertion held as a counter-example.
-(min (at Rppstdi 's)) -- 0.0    ;; BUG: should be > 0; xfail'd here.
+;; BUG-B regression: parted-table STDDEV on I64 column.  Pre-fix the
+;; sumsq was emitted as I64 by SUM((* v v)), then read back as F64 in
+;; the post-merge readout — denormal bit-pattern → stddev = 0 for every
+;; group.  Fixed by casting v to F64 before squaring in the STDDEV
+;; decomposition (src/ops/group.c, exec_group_per_partition).
+;; Per group k: 200 rows {k, k+10, k+20, ..., k+1990} repeated x2 ⇒
+;; 400 values, mean ~995..1004, stddev_samp ~578.07.
+(< (abs (- (at (at Rppstdi 's) 0) 578.07)) 1.0) -- true
+(< (abs (- (max (at Rppstdi 's)) (min (at Rppstdi 's)))) 0.01) -- true
 (.sys.exec "rm -rf /tmp/rfl_grp_ppstd_i64") -- 0
 
 ;; ─── 6. g->selection in exec_reduction (lines 1820-1828) ─────────────────
@@ -121,28 +122,16 @@
 (== (at (at _Rsel_min 'm) 0) 10) -- true
 
 
-;; ─── BUGS DISCOVERED (sections 7-8 removed pending src/ fix) ─────────────
+;; ─── BUG-A fixed: SYM min in SELECT — see test/rfl/agg/min_max_sym.rfl ──
 ;;
-;; While exercising the SYM reduce_range / reduce_cache_get paths, two
-;; real defects in src/ops/group.c surfaced.  Both are documented here
-;; so they don't get lost; the failing assertions are excluded from
-;; this file until src/ fixes land — they will return as regression
-;; tests at that time.
+;; BUG-A was: scalar/DA paths passed attrs=0 to da_read_val, so SYM W64
+;; columns were read as W8 bytes.  Plus the deeper semantic issue where
+;; SYM min/max compared by sym_id (intern order) instead of lex —
+;; inconsistent with asc/desc.  Both fixed in src/ops/group.c
+;; (sym_lex_lt + agg_attrs plumbing + agg_is_sym layout bit).
 ;;
-;; BUG-A: (min sym_col) inside `select {m: (min k) from: T where: ...}`
-;;        returns 0Ns (sym null) instead of the smallest sym in the
-;;        filtered subset.  Standalone `(min sym_vec)` works correctly.
-;;        Reproduce:
-;;          (set T (table [k v] (list (as 'SYM ['a 'b 'c 'd 'e])
-;;                                    (as 'I64 [1 2 3 4 5]))))
-;;          (select {m: (min k) from: T where: (>= v 3)})
-;;        Expected: m = 'c.  Actual: m = 0Ns.
-;;
-;; BUG-B: `(select {s: (stddev v) by: k from: parted_table})` returns
-;;        0.0 for every group while the same query on a single
-;;        (non-parted) table containing the same rows returns the
-;;        correct non-zero stddev (~578.79).  The
-;;        sum_col->type != RAY_F64 (I64) branch of
-;;        exec_group_per_partition (lines 8746-8758) mishandles the
-;;        SUMSQ merge across partitions.  See section 5 above for a
-;;        documented reproduction.
+;; BUG-B fixed: parted-table STDDEV on I64 column now returns the
+;; correct non-zero value.  Fix: cast input to F64 before squaring in
+;; the per-partition STDDEV decomposition so SUM(x²) is F64 across
+;; partitions (matching the readout assumption).  Regression assert
+;; lives in section 5 above.
