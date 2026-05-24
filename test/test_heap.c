@@ -581,6 +581,13 @@ static test_result_t test_slice_owned_ref(void) {
     slice->slice_offset = 4;
     ray_retain(parent);  /* slice owns one ref */
 
+    /* ray_data on a slice resolves slice_parent + slice_offset — exercises
+     * the slice arm of ray_data_fn in include/rayforce.h (otherwise dead
+     * in the test build).  parent[4..12) holds the values 5..12. */
+    int64_t* sd = (int64_t*)ray_data(slice);
+    TEST_ASSERT_EQ_I(sd[0], 5);
+    TEST_ASSERT_EQ_I(sd[7], 12);
+
     uint32_t parent_rc = parent->rc;
 
     /* Copy the slice — ray_retain_owned_refs bumps parent->rc. */
@@ -589,6 +596,10 @@ static test_result_t test_slice_owned_ref(void) {
     TEST_ASSERT_TRUE(copy->attrs & RAY_ATTR_SLICE);
     TEST_ASSERT_EQ_PTR(copy->slice_parent, parent);
     TEST_ASSERT_EQ_U(parent->rc, parent_rc + 1);
+    /* Same slice deref via the copy. */
+    int64_t* cd = (int64_t*)ray_data(copy);
+    TEST_ASSERT_EQ_I(cd[0], 5);
+    TEST_ASSERT_EQ_I(cd[7], 12);
 
     /* Releasing the copy drops parent->rc again. */
     ray_release(copy);
