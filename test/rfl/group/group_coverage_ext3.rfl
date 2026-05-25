@@ -1,0 +1,137 @@
+;; group_coverage_ext3.rfl — additional coverage targets for group.c
+;;
+;; Targets:
+;;   1. F64 SUM in non-emit-filter sparse HT path (line 6602-6603)
+;;   2. F64 SUM in emit-filter sparse HT path (line 6739-6740)
+;;   3. cc[] heap sift-up / sift-down (lines 6993-7009): 20 groups with
+;;      triangular count distribution, take=5
+;;   4. DA FIRST merge parallel path (lines 4314-4317): 65536 rows,
+;;      one row per group, parallel scatter → some workers have mnn==0
+;;   5. exec_group_per_partition I64 STDDEV (lines 8746-8758)
+;;   6. g->selection in exec_reduction (lines 1820-1828)
+;;   7. SYM reduce_range with sel_idx (lines 170-179, 181-190, 192-203)
+;;   8. reduce_cache_get (lines 262-273, 1859-1868) via splayed mmap column
+
+;; ─── 1. F64 SUM in non-emit-filter sparse HT path (line 6602-6603) ──────
+;; Single I64 key, range > 262144 (DA rejects).
+;; Keys 0 and 70000000: range 70000001 > 262144 → DA rejects.
+;; Key 70000000 >= 16777216 (max_dense_cap) → dynamic-dense fails.
+;; F64 agg SUM, no emit filter → non-emit-filter sparse HT path fires.
+;; agg_f64_mask bit set → sums[a].f += ... (line 6602-6603).
+(set Tsp_f64 (table [k v] (list (as 'I64 [0 0 0 70000000 70000000 70000001]) (as 'F64 [1.5 2.5 3.5 4.5 5.5 6.5]))))
+(set Rsp_f64 (select {s: (sum v) by: k from: Tsp_f64}))
+(count Rsp_f64) -- 3
+;; k=0: sum=1.5+2.5+3.5=7.5, k=70000000: sum=4.5+5.5=10.0, k=70000001: sum=6.5
+;; total sum of all sums = 24.0
+(< (abs (- (sum (at Rsp_f64 's)) 24.0)) 0.001) -- true
+
+;; ─── 2. F64 SUM in emit-filter sparse HT path (line 6739-6740) ──────────
+;; Same data but with desc: c take: 2 → use_emit_filter=true.
+;; Count-only first pass (sp_ht, line 6560), then heavy_ht second pass
+;; accumulates F64 sums (line 6739-6740).
+(set Rsp_f64e (select {c: (count k) s: (sum v) from: Tsp_f64 by: k desc: c take: 2}))
+(count Rsp_f64e) -- 2
+;; Top-2 by count: k=0 (count=3, sum=7.5) and k=70000000 (count=2, sum=10.0)
+;; Sum of sums of top-2 = 7.5+10.0 = 17.5
+(< (abs (- (sum (at Rsp_f64e 's)) 17.5)) 0.001) -- true
+
+;; ─── 3. cc[] heap sift-up / sift-down (lines 6993-7009) ─────────────────
+;; 20 groups with counts 1..20 (group g has g+1 rows), total 210 rows.
+;; Row r: group = g = floor((sqrt(8r+1)-1)/2) (0-indexed).
+;; k1 = g*513 (range [0, 19*513]=9748), k2 = g*571 (range [0, 19*571]=10850).
+;; Product 9748*10850 >> 262144 → DA rejects → cc[] fast path.
+;; take=5: during heap build, varying counts trigger sift-up (filling heap)
+;; and sift-down (replacing heap min when a larger-count group arrives).
+(set _tri_row_f (as 'F64 (til 210)))
+(set _tri_g (as 'I64 (floor (/ (- (sqrt (+ 1.0 (* 8.0 _tri_row_f))) 1.0) 2.0))))
+(set Tsift (table [k1 k2 v] (list (* _tri_g 513) (* _tri_g 571) (as 'I64 (til 210)))))
+;; select top-5 groups by count
+(set Rsift (select {c: (count k1) s: (sum v) from: Tsift by: [k1 k2] desc: c take: 5}))
+;; Groups 15..19 are top-5 (counts 16..20); total rows in top-5 = 16+17+18+19+20 = 90
+(count Rsift) -- 5
+(>= (min (at Rsift 'c)) 16) -- true
+;; Sums for top-5 groups: sum(g) = g*(g+1)*(g+2)/2
+;; g=15: 15*16*17/2=2040, g=16: 16*17*18/2=2448, g=17: 17*18*19/2=2907
+;; g=18: 18*19*20/2=3420, g=19: 19*20*21/2=3990
+;; Total = 2040+2448+2907+3420+3990 = 14805
+(< (abs (- (sum (at Rsift 's)) 14805.0)) 0.01) -- true
+
+;; ─── 4. DA FIRST parallel merge (lines 4314-4317) ────────────────────────
+;; 65536 rows, k = i (range [0, 65535], n_slots=65536 >= 1024), v = i.
+;; DA accepted (65536 <= DA_MAX_COMPOSITE_SLOTS=262144).
+;; nrows = 65536 >= RAY_PARALLEL_THRESHOLD=65536 → da_n_workers > 1.
+;; da_n_workers > 1 && n_slots >= 1024 → parallel merge (line 5838).
+;; In da_merge_fn, FIRST merge (line 4314-4317):
+;;   - Worker 0 gets rows [0..k0_end], covers groups k=0..k0_end-1 (mnn>0).
+;;   - Worker w (w>=1) covers groups k=w*chunk..(w+1)*chunk-1.
+;;   - For groups in worker w's range only: mnn=0, wnn=1 → line 4316 fires!
+(set Tdafl (table [k v] (list (as 'I64 (til 65536)) (as 'I64 (til 65536)))))
+(set Rdafl (select {f: (first v) by: k from: Tdafl}))
+;; One row per group k: first(v) = v = k → 65536 groups.
+(count Rdafl) -- 65536
+;; min of first values = 0, max = 65535
+(== (min (at Rdafl 'f)) 0) -- true
+(== (max (at Rdafl 'f)) 65535) -- true
+
+;; DA LAST parallel merge (lines 4318-4321): every worker w>=1 with wnn>0 writes.
+(set Rdall (select {l: (last v) by: k from: Tdafl}))
+(count Rdall) -- 65536
+(== (min (at Rdall 'l)) 0) -- true
+(== (max (at Rdall 'l)) 65535) -- true
+
+;; ─── 5. exec_group_per_partition I64 STDDEV (lines 8746-8758) ────────────
+;; sum_col->type != RAY_F64 branch: INTEGER value column + STDDEV in per-partition.
+;; Two partitions, 2000 rows each, 10 distinct keys, I64 v column.
+;; Cardinality gate: est_groups*100 = 10*100 = 1000 <= rows_per_part=2000. ✓
+(.sys.exec "rm -rf /tmp/rfl_grp_ppstd_i64") -- 0
+(set _ppstdi_N 2000)
+(set _ppstdi_k (as 'I64 (% (til _ppstdi_N) 10)))
+(set _ppstdi_v (as 'I64 (til _ppstdi_N)))
+(set _ppstdi_a (table [k v] (list _ppstdi_k _ppstdi_v)))
+(set _ppstdi_b (table [k v] (list _ppstdi_k _ppstdi_v)))
+(.db.splayed.set "/tmp/rfl_grp_ppstd_i64/1/t/" _ppstdi_a)
+(.db.splayed.set "/tmp/rfl_grp_ppstd_i64/2/t/" _ppstdi_b)
+(set _Ppstdi (.db.parted.get "/tmp/rfl_grp_ppstd_i64/" 't))
+;; STDDEV(v) by k: I64 sum_col in exec_group_per_partition (lines 8746-8758)
+(set Rppstdi (select {s: (stddev v) from: _Ppstdi by: k}))
+(count Rppstdi) -- 10
+;; BUG-B regression: parted-table STDDEV on I64 column.  Pre-fix the
+;; sumsq was emitted as I64 by SUM((* v v)), then read back as F64 in
+;; the post-merge readout — denormal bit-pattern → stddev = 0 for every
+;; group.  Fixed by casting v to F64 before squaring in the STDDEV
+;; decomposition (src/ops/group.c, exec_group_per_partition).
+;; Per group k: 200 rows {k, k+10, k+20, ..., k+1990} repeated x2 ⇒
+;; 400 values, mean ~995..1004, stddev_samp ~578.07.
+(< (abs (- (at (at Rppstdi 's) 0) 578.07)) 1.0) -- true
+(< (abs (- (max (at Rppstdi 's)) (min (at Rppstdi 's)))) 0.01) -- true
+(.sys.exec "rm -rf /tmp/rfl_grp_ppstd_i64") -- 0
+
+;; ─── 6. g->selection in exec_reduction (lines 1820-1828) ─────────────────
+;; WHERE filter installs g->selection; exec_reduction walks only filtered rows.
+;; When input is a column vector (not a table), sel_compact is skipped and
+;; exec_reduction sees g->selection (line 1820).
+;; T: v = [0,1,...,19]; WHERE v>=10: rows 10..19 (scan_n=10).
+;; SUM(v) = 10+11+...+19 = 145.
+(set _Tsel_r (table [v] (list (as 'I64 (til 20)))))
+(set _Rsel_r (select {s: (sum v) from: _Tsel_r where: (>= v 10)}))
+(== (at (at _Rsel_r 's) 0) 145) -- true
+
+;; MIN(v) with WHERE filter: same g->selection path, OP_MIN.
+;; min of v where v>=10 = 10.
+(set _Rsel_min (select {m: (min v) from: _Tsel_r where: (>= v 10)}))
+(== (at (at _Rsel_min 'm) 0) 10) -- true
+
+
+;; ─── BUG-A fixed: SYM min in SELECT — see test/rfl/agg/min_max_sym.rfl ──
+;;
+;; BUG-A was: scalar/DA paths passed attrs=0 to da_read_val, so SYM W64
+;; columns were read as W8 bytes.  Plus the deeper semantic issue where
+;; SYM min/max compared by sym_id (intern order) instead of lex —
+;; inconsistent with asc/desc.  Both fixed in src/ops/group.c
+;; (sym_lex_lt + agg_attrs plumbing + agg_is_sym layout bit).
+;;
+;; BUG-B fixed: parted-table STDDEV on I64 column now returns the
+;; correct non-zero value.  Fix: cast input to F64 before squaring in
+;; the per-partition STDDEV decomposition so SUM(x²) is F64 across
+;; partitions (matching the readout assumption).  Regression assert
+;; lives in section 5 above.

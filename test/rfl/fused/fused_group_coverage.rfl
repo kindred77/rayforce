@@ -1,0 +1,1465 @@
+;; Coverage tests for src/ops/fused_group.c.
+;;
+;; Target regions still at 0% in baseline:
+;;   - fp_eval_cmp_one + fp_eval_cmp_masked (lines 501-557)
+;;     triggered by multi-child AND where at least one child is FP_IN
+;;   - fp_try_i32_mg_top_count (lines 1043-1219)
+;;     triggered by I32 key + desc: count take: N
+;;   - I16 ne0 u32 count topk (lines 1313-1399)
+;;     triggered by I16 key + (!= key 0) WHERE + desc: count take: N
+;;   - SYM ne0 topk (lines 1401-1491)
+;;     triggered by SYM key + (!= sym_col 'x) WHERE + desc: count take: N
+;;   - BOOL key count1 (line 1268)
+;;   - pred_key_ne_zero in fp_direct_count_fn (lines 1231-1246)
+;;   - fp_pred_order_children swap (lines 817-819)
+;;   - mk_state_merge MIN/MAX (lines 2359-2366)
+;;   - eq_i64_count fast path (lines 3684-3697)
+;;   - fp_compile_cmp SYM/temporal branches
+
+;; =====================================================================
+;; 1.  fp_eval_cmp_one + fp_eval_cmp_masked
+;;     Multi-child AND with at least one FP_IN child.
+;;     fp_eval_pred: use_masked=1 → calls fp_eval_cmp_masked for
+;;     children[1..], which calls fp_eval_cmp_one for non-LIKE ops.
+;; =====================================================================
+
+;; Table with I64 key column + group column.
+(set Tand (table [k v g] (list (as 'I64 [1 2 3 4 5 6 7 8 9 10]) (as 'I64 [10 20 30 40 50 60 70 80 90 100]) [0 0 0 0 0 1 1 1 1 1])))
+
+;; (and (in k [1 2 3 99]) (== v 10)) — child[0] is IN, child[1] is EQ.
+;; use_masked=1, fp_eval_cmp_masked called for child[1] (EQ → fp_eval_cmp_one EQ arm)
+(count (select {c: (count k) from: Tand where: (and (in k [1 2 3 99]) (== v 10)) by: g})) -- 1
+(at (at (select {c: (count k) from: Tand where: (and (in k [1 2 3 99]) (== v 10)) by: g}) 'c) 0) -- 1
+
+;; (and (in k [5 6 7]) (< v 80)) — IN + LT, fp_eval_cmp_one LT arm
+(count (select {c: (count k) from: Tand where: (and (in k [5 6 7]) (< v 80)) by: g})) -- 2
+;; groups: g=0 has k=5 and v=50<80, g=1 has k=6→v=60 and k=7→v=70 both <80 → 2 groups
+(sum (at (select {c: (count k) from: Tand where: (and (in k [5 6 7]) (< v 80)) by: g}) 'c)) -- 3
+
+;; (and (in k [2 4 6 8]) (> v 30)) — IN + GT, fp_eval_cmp_one GT arm
+(count (select {c: (count k) from: Tand where: (and (in k [2 4 6 8]) (> v 30)) by: g})) -- 2
+
+;; (and (in k [1 3 5 7 9]) (!= v 10)) — IN + NE, fp_eval_cmp_one NE arm
+(count (select {c: (count k) from: Tand where: (and (in k [1 3 5 7 9]) (!= v 10)) by: g})) -- 2
+
+;; (and (in k [2 4 6 8 10]) (<= v 80)) — IN + LE, fp_eval_cmp_one LE arm
+(count (select {c: (count k) from: Tand where: (and (in k [2 4 6 8 10]) (<= v 80)) by: g})) -- 2
+
+;; (and (in k [1 2 3 4 5]) (>= v 30)) — IN + GE, fp_eval_cmp_one GE arm
+(count (select {c: (count k) from: Tand where: (and (in k [1 2 3 4 5]) (>= v 30)) by: g})) -- 1
+
+;; Three-child AND: (and (in k [1 2 3]) (>= v 10) (< v 40)) — triggers
+;; fp_pred_order_children with three children including one IN.
+;; After sort: GE(v>=10, score 4) second, LT(v<40, score 4) third (IN=score 3 → first!).
+;; Wait: IN(score 3) < GE(score 4) < LT(score 4). Sort: IN first, GE/LT after.
+;; Actually IN(3) < GE(4): after sort, IN is FIRST, then GE and LT.
+;; fp_eval_cmp_masked called for children[1]=GE and [2]=LT.
+(count (select {c: (count k) from: Tand where: (and (in k [1 2 3]) (>= v 10) (< v 40)) by: g})) -- 1
+(sum (at (select {c: (count k) from: Tand where: (and (in k [1 2 3]) (>= v 10) (< v 40)) by: g}) 'c)) -- 3
+
+;; 3-child AND to hit fp_eval_cmp_one(FP_EQ):
+;; Use I64+I16 two-EQ cols + IN. Scores: I64-EQ=1, I16-EQ=2, IN=3.
+;; Sort: I64-EQ first, I16-EQ second, IN third. use_masked=true.
+;; child[1]=I16-EQ → fp_eval_cmp_masked → fp_eval_cmp_one(FP_EQ) ← HIT.
+(set Tmask3 (table [k v w g] (list (as 'I64 [1 2 3 4 5 1 2 3 4 5]) (as 'I16 [1 2 1 2 1 2 1 2 1 2]) (as 'I64 [10 10 20 20 10 10 20 20 10 10]) [0 0 0 0 0 1 1 1 1 1])))
+;; (and (== k 1) (== v 1) (in w [10 20])): k==1 at rows 0,5,8(k=4≠1)...
+;; k=1 at rows idx 0 and 5 (k[0]=1, k[5]=1). v[0]=1, v[5]=2.
+;; (== v 1): row 0 passes (v=1), row 5 fails (v=2). (in w [10 20]): row 0: w=10 ✓.
+;; Only row 0 passes: g=0 → 1 group.
+(set Rmask3 (select {c: (count k) from: Tmask3 where: (and (== k 1) (== v 1) (in w [10 20])) by: g}))
+(count Rmask3) -- 1
+(sum (at Rmask3 'c)) -- 1
+
+;; fp_eval_cmp_one fold=FP_FOLD_TRUE: (!= v16 40000) where v16 is I16,
+;; 40000 > INT16_MAX → fold=FP_FOLD_TRUE (NE above range → always true).
+;; NE-fold child is score=5 (NE, not score=0 for FALSE fold).
+;; With (and (in k [1 2]) (!= v16 40000)): IN first (score=3), NE-FOLD_TRUE second (score=5).
+;; use_masked=true; child[1]=NE-fold → fp_eval_cmp_masked → fp_eval_cmp_one → fold=TRUE → 1.
+(set Tfold (table [k v16 g] (list (as 'I64 [1 2 3 4 5 1 2 3 4 5]) (as 'I16 [1 2 3 4 5 6 7 8 9 10]) [0 0 0 0 0 1 1 1 1 1])))
+;; in k [1 2] matches rows 0,1,5,6. (!= v16 40000) always true (40000 out of I16 range).
+;; Both conditions pass → 2 groups (g=0 and g=1), count 2 each.
+(set Rfold (select {c: (count k) from: Tfold where: (and (in k [1 2]) (!= v16 40000)) by: g}))
+(count Rfold) -- 2
+(sum (at Rfold 'c)) -- 4
+
+;; =====================================================================
+;; 2.  fp_pred_order_children swap path (lines 817-819)
+;;     Swap happens when a later child is more selective than an earlier one.
+;;     Most selective first: EQ (score=2 for narrow esz) < GE (score=4) < NE (score=5)
+;;     Feed them out-of-order: NE first, then EQ — swap NE after EQ.
+;; =====================================================================
+
+;; Swapping: predicate (and (!= v 0) (== k 3)) with I64 col v, I64 col k
+;; fp_cmp_selectivity_score(NE for esz=8) = 5, for EQ esz<8 = 2 → sort: EQ first.
+(set Tord (table [k v g] (list (as 'I64 [1 2 3 4 5 1 2 3 4 5]) (as 'I64 [0 0 3 4 5 6 7 8 9 10]) [0 0 0 0 0 1 1 1 1 1])))
+;; (!= v 0) gives 8 rows; (== k 3) gives 2 rows. After sort: EQ first (score 2 < 5).
+(count (select {c: (count k) from: Tord where: (and (!= v 0) (== k 3)) by: g})) -- 2
+
+;; Force swap: (and (like s "*") (== k 3)) — LIKE has score 6, EQ score 2 → swap
+(set Tsord (table [k s g] (list (as 'I64 [1 2 3 4 5 1 2 3 4 5]) ["a" "b" "c" "d" "e" "f" "g" "h" "i" "j"] [0 0 0 0 0 1 1 1 1 1])))
+;; This exercises fp_pred_order_children with LIKE (score 6) + EQ (score 2)
+(count (select {c: (count k) from: Tsord where: (and (like s "*") (== k 3)) by: g})) -- 2
+
+;; =====================================================================
+;; 3.  fp_try_i32_mg_top_count — Misra-Gries approximation for I32 keys
+;;     Triggered when: I32 key + emit_filter.top_count_take > 0
+;;     (desc: count take: N pattern)
+;; =====================================================================
+
+;; 1000 rows with I32 keys in range [0..9], each key 100 times.
+(set Nmg 1000)
+(set Qi32 (as 'I32 (% (til Nmg) 10)))
+(count Qi32) -- 1000
+(set Ti32mg (table [k] (list Qi32)))
+;; top-3 by count: all keys have count 100, so any 3 → sum = 300
+(set Rmg3 (select {n: (count k) by: k from: Ti32mg desc: n take: 3}))
+(count Rmg3) -- 3
+(sum (at Rmg3 'n)) -- 300
+
+;; top-1 → one key with count 100
+(set Rmg1 (select {n: (count k) by: k from: Ti32mg desc: n take: 1}))
+(count Rmg1) -- 1
+(sum (at Rmg1 'n)) -- 100
+
+;; top-5 → 5 keys, each count 100 → sum=500
+(set Rmg5 (select {n: (count k) by: k from: Ti32mg desc: n take: 5}))
+(count Rmg5) -- 5
+(sum (at Rmg5 'n)) -- 500
+
+;; Exercise Misra-Gries decrement path: many I32 keys > cap(8192) to force
+;; MG candidate eviction. But keep it practical — use 200 distinct I32 keys,
+;; so MG doesn't overflow, but enough rows to stress the heap.
+(set Nmg200 20000)
+(set Qi32b (as 'I32 (% (til Nmg200) 200)))
+(set Ti32mgb (table [k] (list Qi32b)))
+;; Every key appears exactly 100 times. top-3 → 3 groups each count 100.
+(set Rmgb3 (select {n: (count k) by: k from: Ti32mgb desc: n take: 3}))
+(count Rmgb3) -- 3
+(sum (at Rmgb3 'n)) -- 300
+
+;; =====================================================================
+;; 4.  I16 ne0 topk (lines 1313-1399)
+;;     Triggered by: I16 key + pred is (!= key 0) + desc: count take: N
+;;     pred_key_ne_zero=1 → fp_i16_ne0_u32_count_fn + topk emit filter
+;; =====================================================================
+
+;; I16 keys 1..10 (non-zero), 1000 rows uniform → each key 100 times.
+;; WHERE (!= k 0) triggers pred_key_ne_zero=1 in fp_try_direct_count1.
+(set Ni16 1000)
+(set Qi16 (as 'I16 (+ 1 (% (til Ni16) 10))))
+(count Qi16) -- 1000
+(set Ti16ne0 (table [k v] (list Qi16 (as 'I64 (til Ni16)))))
+;; top-2 by count: all keys have count 100; sum of top-2 = 200
+(set Ri16ne0 (select {n: (count v) by: k from: Ti16ne0 where: (!= k 0) desc: n take: 2}))
+(count Ri16ne0) -- 2
+(sum (at Ri16ne0 'n)) -- 200
+
+;; I16 keys WITHOUT topk — pred_key_ne_zero=1 but no emit_filter.top_count_take,
+;; so fp_i16_ne0_u32_count_fn is skipped → falls to fp_direct_count_fn(I16 ne0 branch).
+(set Ni16notop 100)
+(set Qi16notop (as 'I16 (+ 1 (% (til Ni16notop) 5))))
+(set Ti16notop (table [k v] (list Qi16notop (as 'I64 (til Ni16notop)))))
+;; WHERE (!= k 0) with no desc/take → no emit_filter → fp_direct_count_fn I16 ne0 path.
+(set Ri16notop (select {n: (count v) by: k from: Ti16notop where: (!= k 0)}))
+(count Ri16notop) -- 5
+(sum (at Ri16notop 'n)) -- 100
+
+;; I16 keys with explicit zero rows to actually exclude
+(set Ni16z 150)
+(set Qi16z (as 'I16 (concat [0 0 0 0 0] (% (til Ni16z) 10))))
+(count Qi16z) -- 155
+(set Ti16z (table [k v] (list Qi16z (as 'I64 (til 155)))))
+;; WHERE (!= k 0) excludes 5 zero rows; remaining 150 rows in 10 keys (k=0..9).
+;; But key 0 (the I16 value 0) is excluded. So k=1..9 appear, plus k=0 excluded.
+;; Actually % (til 150) 10 gives values 0..9. With WHERE != 0 we exclude k=0.
+;; 9 distinct non-zero keys; top-3 by count
+(set Ri16z (select {n: (count v) by: k from: Ti16z where: (!= k 0) desc: n take: 3}))
+(count Ri16z) -- 3
+
+;; =====================================================================
+;; 5.  SYM key count1 with WHERE — fp_direct_count_fn SYM branch
+;;     (SYM ne0 topk lines 1401-1491 require cval==0 (null SID),
+;;      unreachable from RFL since all interned syms have SID>0.
+;;      This section instead exercises fp_direct_count1 SYM path + topk.)
+;; =====================================================================
+
+;; SYM key table — top-2 by count (exercises SYM direct count emit path)
+(set Tsymtopk (table [k v] (list ['a 'a 'a 'b 'b 'c 'c 'c 'c 'd] (as 'I64 (til 10)))))
+;; Top-2: 'c(4), 'a(3) → sum=7
+(set Rsymtopk (select {n: (count v) by: k from: Tsymtopk desc: n take: 2}))
+(count Rsymtopk) -- 2
+(sum (at Rsymtopk 'n)) -- 7
+
+;; SYM key + WHERE (== k 'a) — exercises SYM EQ predicate compile path
+(set Rsymwhere (select {n: (count v) by: k from: Tsymtopk where: (!= k 'b)}))
+(count Rsymwhere) -- 3
+(sum (at Rsymwhere 'n)) -- 8
+
+;; =====================================================================
+;; 6.  BOOL key count1 (line 1268)
+;;     Triggered by: BOOL type key in exec_filtered_group_count1
+;; =====================================================================
+
+(set Tbool (table [k v] (list [false true false false true true true false] (as 'I64 [1 2 3 4 5 6 7 8]))))
+;; Simple group-by BOOL with WHERE v>=2:
+;; k=false rows: v=1,3,4,8 → v>=2: 3,4,8 → count=3
+;; k=true rows: v=2,5,6,7 → v>=2: all 4 → count=4
+(set Rbool (select {n: (count v) by: k from: Tbool where: (>= v 2)}))
+(count Rbool) -- 2
+(sum (at Rbool 'n)) -- 7
+
+;; With no-predicate (arity=0) to exercise the NULL pred_op path for BOOL
+(set Rbool0 (select {n: (count v) by: k from: Tbool}))
+(count Rbool0) -- 2
+
+;; =====================================================================
+;; 7.  pred_key_ne_zero in fp_direct_count_fn (lines 1231-1246)
+;;     Triggered by: key type U8/I16 + predicate is (!= key 0)
+;;     No topk emit_filter — the non-topk ne0 path (lines 1231-1247)
+;; =====================================================================
+
+;; U8 key with ne0 predicate (no topk — exercises the pred_key_ne_zero
+;; loop body for U8 in fp_direct_count_fn lines 1241-1243)
+;; 100 rows with keys 0..9 (10 each). WHERE (!= k 0) excludes key=0 (10 rows) → 9 keys.
+(set Tu8ne0 (table [k v] (list (as 'U8 (% (til 100) 10)) (as 'I64 (til 100)))))
+;; WHERE (!= k 0) excludes 10 zero-key rows → 9 non-zero keys each count=10
+(set Ru8ne0 (select {n: (count v) by: k from: Tu8ne0 where: (!= k 0)}))
+(count Ru8ne0) -- 9
+(min (at Ru8ne0 'n)) -- 10
+(max (at Ru8ne0 'n)) -- 10
+
+;; U8 key with ne0 predicate + topk (exercises ne0 path inside emit_filter)
+(set Ru8ne0topk (select {n: (count v) by: k from: Tu8ne0 where: (!= k 0) desc: n take: 3}))
+(count Ru8ne0topk) -- 3
+(sum (at Ru8ne0topk 'n)) -- 30
+
+;; =====================================================================
+;; 8.  mk_state_merge MIN/MAX (lines 2359-2366)
+;;     triggered during multi-agg parallel combine when two shards
+;;     contribute to the same group key (collision in global HT).
+;;     Use a single narrow key with many workers → same key in multiple shards.
+;;     Need narrow (non-wide) key + MIN/MAX agg.
+;; =====================================================================
+
+;; Many rows (50000) with only 5 distinct I64 keys so shards will see the
+;; same keys → global HT collision → mk_state_merge called for MIN/MAX.
+(set Nmksm 50000)
+(set Kmksm (% (til Nmksm) 5))
+(set Vmksm (as 'I64 (til Nmksm)))
+(set Tmksm (table [k v] (list Kmksm Vmksm)))
+;; WHERE (>= v 0) always true — forces fused multi path (MIN/MAX require multi).
+(set Rmksm (select {mn: (min v) mx: (max v) from: Tmksm where: (>= v 0) by: k}))
+(count Rmksm) -- 5
+;; max value for key 0 is 49995 (last row with k%5==0)
+(max (at Rmksm 'mx)) -- 49999
+(min (at Rmksm 'mn)) -- 0
+
+;; Larger set to ensure multi-worker shards see same keys + mk_state_merge hit
+;; for MIN/MAX AND COUNT together (agg_kind check switch in mk_state_merge)
+(set Nmksm2 100000)
+(set Kmksm2 (% (til Nmksm2) 3))
+(set Vmksm2 (as 'I64 (til Nmksm2)))
+(set Tmksm2 (table [k v] (list Kmksm2 Vmksm2)))
+(set Rmksm2 (select {c: (count v) mn: (min v) mx: (max v) from: Tmksm2 where: (> k -1) by: k}))
+(count Rmksm2) -- 3
+(sum (at Rmksm2 'c)) -- 100000
+(min (at Rmksm2 'mn)) -- 0
+(max (at Rmksm2 'mx)) -- 99999
+
+;; =====================================================================
+;; 9.  eq_i64_count fast path (lines 3684-3697)
+;;     mk_find_i64_eq_child: multi-child pred with I64 EQ child in multi-agg
+;;     Triggered when: n_aggs==1 (COUNT) + pred.n_children>1 + one child is
+;;     FP_EQ with col_esz==8, col_type!=SYM.
+;; =====================================================================
+
+;; IMPORTANT: exec_filtered_group_multi (not count1) is needed for eq_i64 fast path.
+;; Single-key+single-COUNT → count1 path; need multi-key OR multi-agg.
+;; Use TWO group keys: by: [g1 g2] + single COUNT agg + AND pred with I64 EQ child.
+(set Teq64 (table [k v g1 g2] (list (as 'I64 [1 2 3 4 5 6 7 8 9 10]) (as 'I64 [10 20 30 40 50 10 20 30 40 50]) [0 0 0 0 0 1 1 1 1 1] [0 0 0 0 0 0 0 0 0 0])))
+;; (and (== v 10) (> k 0)) with 2 keys [g1 g2]: mk_find_i64_eq_child finds (== v 10).
+;; rows k=1,v=10,g1=0,g2=0 and k=6,v=10,g1=1,g2=0 → 2 distinct (g1,g2) groups.
+(set Req64 (select {n: (count v) by: [g1 g2] from: Teq64 where: (and (== v 10) (> k 0))}))
+(count Req64) -- 2
+(sum (at Req64 'n)) -- 2
+
+;; Large version: many rows, 2-key composite group, EQ pred on I64.
+;; Pool dispatch for mk_eq_i64_count_fn coverage.
+(set Neq64 100000)
+(set Keq64 (% (til Neq64) 1000))
+(set Veq64 (as 'I64 (% (til Neq64) 200)))
+(set G1eq64 (% (til Neq64) 100))
+(set G2eq64 (% (til Neq64) 50))
+(set Teq64b (table [k v g1 g2] (list Keq64 Veq64 G1eq64 G2eq64)))
+;; (and (== v 42) (> k 5)): 500 matching rows across g1∈{42}, g2∈{42} → count 500.
+(set Req64b (select {n: (count v) by: [g1 g2] from: Teq64b where: (and (== v 42) (> k 5))}))
+(count Req64b) -- 1
+(sum (at Req64b 'n)) -- 500
+
+;; =====================================================================
+;; 10. fp_compile_cmp SYM/temporal branches (lines 604, 637-645, 684, 712+)
+;;     SYM key in fp_compile_cmp via exec_filtered_group_count1 predicate
+;; =====================================================================
+
+;; SYM column in WHERE predicate (fp_compile_cmp SYM branch)
+;; == on SYM compares against string literal → cval = intern'd sym-id
+(set Tsy (table [sy v g] (list ['alpha 'beta 'gamma 'alpha 'beta 'gamma] (as 'I64 [1 2 3 4 5 6]) [0 0 0 1 1 1])))
+;; (== sy 'alpha): 2 rows match → 2 groups
+(count (select {c: (count v) from: Tsy where: (== sy 'alpha) by: g})) -- 2
+(sum (at (select {c: (count v) from: Tsy where: (== sy 'alpha) by: g}) 'c)) -- 2
+
+;; (!= sy 'beta): exclude 'beta, 4 rows → 2 groups
+(count (select {c: (count v) from: Tsy where: (!= sy 'beta) by: g})) -- 2
+(sum (at (select {c: (count v) from: Tsy where: (!= sy 'beta) by: g}) 'c)) -- 4
+
+;; DATE column in WHERE predicate (fp_compile_cmp DATE/I32 branch for compile)
+(set Tdt (table [d v g] (list (as 'date [2020.01.01 2020.01.02 2020.01.03 2020.01.04 2020.01.05 2020.01.06]) (as 'I64 [1 2 3 4 5 6]) [0 0 0 1 1 1])))
+;; >= date: 3 rows match (2020.01.04, 05, 06)
+(count (select {c: (count v) from: Tdt where: (>= d 2020.01.04) by: g})) -- 1
+(sum (at (select {c: (count v) from: Tdt where: (>= d 2020.01.04) by: g}) 'c)) -- 3
+
+;; TIME column WHERE
+(set Ttm (table [t v g] (list (as 'time [00:00:01.000 00:00:02.000 00:00:03.000 00:00:04.000 00:00:05.000 00:00:06.000]) (as 'I64 [1 2 3 4 5 6]) [0 0 0 1 1 1])))
+(count (select {c: (count v) from: Ttm where: (> t 00:00:03.000) by: g})) -- 1
+(sum (at (select {c: (count v) from: Ttm where: (> t 00:00:03.000) by: g}) 'c)) -- 3
+
+;; TIMESTAMP column WHERE
+(set Tts (table [ts v g] (list (as 'timestamp [2020.01.01D00:00:00.000000001 2020.01.01D00:00:00.000000002 2020.01.01D00:00:00.000000003 2020.01.01D00:00:00.000000004 2020.01.01D00:00:00.000000005 2020.01.01D00:00:00.000000006]) (as 'I64 [1 2 3 4 5 6]) [0 0 0 1 1 1])))
+(count (select {c: (count v) from: Tts where: (< ts 2020.01.01D00:00:00.000000004) by: g})) -- 1
+(sum (at (select {c: (count v) from: Tts where: (< ts 2020.01.01D00:00:00.000000004) by: g}) 'c)) -- 3
+
+;; =====================================================================
+;; 11. Multi-agg with MIN/MAX on AVG (hit mk_state_merge AVG branch)
+;;     and wide key (total_bytes > 8) collision in mk_combine
+;; =====================================================================
+
+;; Two I64 keys → 16 bytes composite (wide=1). Many rows for collision.
+(set Nwide 50000)
+(set K1wide (% (til Nwide) 10))
+(set K2wide (% (til Nwide) 7))
+(set Vwide (as 'I64 (til Nwide)))
+(set Twide (table [k1 k2 v] (list K1wide K2wide Vwide)))
+;; AVG + COUNT with wide composite key (k1:I64 + k2:I64 = 16 bytes = wide)
+(set Rwide (select {c: (count v) av: (avg v) from: Twide where: (>= v 0) by: [k1 k2]}))
+(count Rwide) -- 70
+(sum (at Rwide 'c)) -- 50000
+;; avg should be somewhere in middle
+(< (min (at Rwide 'av)) 50000.0) -- true
+
+;; Wide key + MIN/MAX to hit mk_state_merge MIN/MAX in wide path
+(set Rwide2 (select {mn: (min v) mx: (max v) from: Twide where: (> k1 -1) by: [k1 k2]}))
+(count Rwide2) -- 70
+(max (at Rwide2 'mx)) -- 49999
+(min (at Rwide2 'mn)) -- 0
+
+;; Trigger mk_combine_parallel for multi (narrow, 2 I32 keys = 8 bytes ≤ 8 = narrow).
+;; Need ≥50000 distinct (k1,k2) pairs AND duplicates for mk_state_merge collision.
+;; 100000 rows: k1=i%50000 (I32), k2=0 (I32 constant) → 50000 distinct pairs, 2 rows each.
+;; SUM agg (multi path, not count1). Sum = sum(i + i+50000) for i=0..49999 = 4999950000.
+(set Npar 100000)
+(set K1par (as 'I32 (% (til Npar) 50000)))
+(set K2par (as 'I32 (% (til Npar) 1)))
+(set Vpar (as 'I64 (til Npar)))
+(set Tpar (table [k1 k2 v] (list K1par K2par Vpar)))
+;; 50000 distinct (k1,0) pairs, each pair has 2 rows.
+;; Sum over all v: 0+1+...+99999 = 4999950000.
+(set Rpar (select {s: (sum v) from: Tpar where: (>= v 0) by: [k1 k2]}))
+(count Rpar) -- 50000
+(sum (at Rpar 's)) -- 4999950000
+
+;; Wide key (2 I64 = 16 bytes > 8) parallel combine for mk_combine_dedup_fn wide path.
+;; 100000 rows: k1=i%50000 (I64), k2=0 (I64 constant) → 50000 distinct wide-key pairs, 2 each.
+(set Nwpar 100000)
+(set K1wpar (% (til Nwpar) 50000))
+(set K2wpar (% (til Nwpar) 1))
+(set Vwpar (as 'I64 (til Nwpar)))
+(set Twpar (table [k1 k2 v] (list K1wpar K2wpar Vwpar)))
+;; MIN agg + wide keys → mk_combine_dedup_fn wide path; duplicate keys trigger mk_state_merge.
+(set Rwpar (select {mn: (min v) from: Twpar where: (>= v 0) by: [k1 k2]}))
+(count Rwpar) -- 50000
+
+;; =====================================================================
+;; 12. SYM esz=2 and esz=4 in fp_eval_cmp (lines 448-453, 469-474)
+;;     Triggered by: SYM key where sym dictionary has > 256 entries (esz=2)
+;;     or > 65536 entries (esz=4).
+;;     Building >256 distinct symbols forces esz=2 in the SYM vec.
+;; =====================================================================
+
+;; Build a table with 300 distinct symbols (forces esz=2 for SYM col).
+;; Group-by that SYM col with WHERE (== sym 'sym_001) triggers esz=2 EQ arm.
+(set Nsym300 300)
+;; Generate 300 unique strings by building a table with many rows per group,
+;; using sym column. Use simpler approach: build a numeric table and
+;; rely on the fused path's SYM esz paths via a pre-existing SYM column.
+;; NOTE: We rely on the global sym dict having >256 entries from prior tests.
+;; So a SYM col on a small table will have esz >= 2 if sym-ids are large.
+(set Tsym2esz (table [sy v g] (list ['alpha 'beta 'gamma 'alpha 'beta 'gamma] (as 'I64 [1 2 3 4 5 6]) [0 0 0 1 1 1])))
+;; No-WHERE group by sy — exercises fp_eval_cmp SYM path via the fused path
+(set Rsym2esz (select {c: (count v) from: Tsym2esz where: (== sy 'alpha) by: g}))
+(count Rsym2esz) -- 2
+
+;; =====================================================================
+;; 13. Empty result via WHERE that excludes all rows — exec_filtered_group
+;;     fallback for empty count1 result (fp_combine_and_materialize zero path)
+;; =====================================================================
+
+(set Tempty (table [k v] (list (as 'I64 [1 2 3 4 5]) (as 'I64 [10 20 30 40 50]))))
+;; WHERE that matches nothing → total_local==0 path in fp_combine_and_materialize
+(set Rempty (select {n: (count v) by: k from: Tempty where: (> v 1000)}))
+(count Rempty) -- 0
+
+;; =====================================================================
+;; 14. mk_compile with STRLEN agg (lines 3579-3607)
+;;     Triggered by: agg input is OP_STRLEN of a SYM col
+;; =====================================================================
+
+(set Tstrlen (table [sy g] (list ['alpha 'beta 'gamma 'abcde 'ab 'alpha] [0 0 0 1 1 1])))
+;; sum(strlen(sy)) by group: strlen('alpha)=5, strlen('beta)=4, strlen('gamma)=5
+;; g=0: 5+4+5=14; g=1: strlen('abcde)=5, strlen('ab)=2, strlen('alpha)=5 → 12
+(set Rstrlen (select {s: (sum (strlen sy)) from: Tstrlen where: (>= g 0) by: g}))
+(count Rstrlen) -- 2
+(sum (at Rstrlen 's)) -- 26
+
+;; min/max of strlen
+(set Rstrlenm (select {mn: (min (strlen sy)) mx: (max (strlen sy)) from: Tstrlen by: g}))
+(count Rstrlenm) -- 2
+(min (at Rstrlenm 'mn)) -- 2
+(max (at Rstrlenm 'mx)) -- 5
+
+;; avg of strlen
+(set Rstrlenav (select {av: (avg (strlen sy)) from: Tstrlen by: g}))
+(count Rstrlenav) -- 2
+
+;; =====================================================================
+;; 15. BOOL predicate on BOOL column
+;;     - fp_atom_col_compatible: case RAY_BOOL (line 129) fallthrough to U8
+;;     - fp_compile_cmp: cv->type == -RAY_BOOL → line 725
+;;     - fp_eval_cmp: esz=1 path (already covered by U8, reinforced here)
+;; =====================================================================
+
+;; Simple: (== k true) on BOOL key column, grouping by k itself.
+;; Bool col k: false=0, true=1. Predicate (== k true): atom 'true' has type -RAY_BOOL.
+;; fp_atom_col_compatible(-RAY_BOOL, RAY_BOOL): hits case RAY_BOOL: (line 129) fallthrough to U8.
+;; fp_compile_cmp: cv->type == -RAY_BOOL → line 725.
+;; count1 path (single key k, single COUNT).
+(set Rboolpred (select {n: (count v) by: k from: Tbool where: (== k true)}))
+(count Rboolpred) -- 1
+(sum (at Rboolpred 'n)) -- 4
+
+;; (!= k false) on BOOL column — hits line 129 again + line 725 for atom false
+(set Rboolne (select {n: (count v) by: k from: Tbool where: (!= k false)}))
+(count Rboolne) -- 1
+(sum (at Rboolne 'n)) -- 4
+
+;; 3-child AND with I64-EQ(score 1) first, BOOL-EQ(score 2) second, IN(score 3) third.
+;; use_masked=1 (IN present). child[1]=BOOL-EQ → fp_eval_cmp_masked → fp_eval_cmp_one.
+;; fp_cmp_read_i64_at(BOOL) → line 503-504 covered.
+(set Tboolmix (table [k b v g] (list (as 'I64 [1 1 2 2 3 3 4 4]) [true false true false true false true false] (as 'I64 [10 20 10 20 10 20 10 20]) [0 0 0 0 1 1 1 1])))
+;; (and (== k 1) (== b true) (in v [10 20])): rows with k=1, b=true, v in [10,20].
+;; k=1 at rows 0,1. b=true at rows 0,2,4,6. v in [10,20] — all rows.
+;; k=1 AND b=true: row 0 (g=0). Count in g=0: 1.
+(set Rboolmix (select {n: (count v) by: g from: Tboolmix where: (and (== k 1) (== b true) (in v [10 20]))}))
+(count Rboolmix) -- 1
+(sum (at Rboolmix 'n)) -- 1
+
+;; =====================================================================
+;; 16. fp_eval_cmp_masked LIKE branch (lines 547-551)
+;;     (and (in k [1 2 3]) (like s "a*")): IN(score 3) first, LIKE(score 6) second.
+;;     use_masked=1 (IN present). child[1]=LIKE → fp_eval_cmp_masked(LIKE) → lines 548-551.
+;; =====================================================================
+
+;; Reuse Tsord table from section 2: (k I64, s STR, g)
+;; k=1..5 in g=0, k=1..5 in g=1 (repeated). s = ["a","b","c","d","e","f","g","h","i","j"].
+;; (and (in k [1 3 5]) (like s "a*")): k in {1,3,5} is true for rows 0,2,4,5,7,9.
+;; like s "a*": matches "a" (row 0) and "f" (row 5 — no), "a"→row 0, "f"→no.
+;; Tsord rows: k[0]=1,s="a"; k[1]=2,s="b"; k[2]=3,s="c"; k[3]=4,s="d"; k[4]=5,s="e";
+;;             k[5]=1,s="f"; k[6]=2,s="g"; k[7]=3,s="h"; k[8]=4,s="i"; k[9]=5,s="j".
+;; k in {1,3,5}: rows 0,2,4,5,7,9. like "a*": only "a" matches (row 0, s="a").
+;; So 1 row passes: row 0 in g=0 → 1 group.
+(set Rlikemasked (select {c: (count k) from: Tsord where: (and (in k [1 3 5]) (like s "a*")) by: g}))
+(count Rlikemasked) -- 1
+(sum (at Rlikemasked 'c)) -- 1
+
+;; Wider like pattern to match more rows
+;; (and (in k [1 2 3 4 5]) (like s "?")): all single-char strings match.
+;; k in {1..5}: all 10 rows. like "?": all single-char strings match ("a","b","c","d","e","f","g","h","i","j").
+;; All 10 rows pass → 2 groups, count 5 each.
+(set Rlikemasked2 (select {c: (count k) from: Tsord where: (and (in k [1 2 3 4 5]) (like s "?")) by: g}))
+(count Rlikemasked2) -- 2
+(sum (at Rlikemasked2 'c)) -- 10
+
+;; =====================================================================
+;; 17. IN list with non-I64 typed values (fp_compile_cmp lines 637-642)
+;;     (in u8_col [values_as_I32]): sv->type==I32 → lines 640-642
+;;     (in i16_col [values_as_I16]): sv->type==I16 → line 639
+;;     (in u8_col [values_as_U8]): sv->type==U8 → line 638
+;; =====================================================================
+
+;; I32-typed IN list on I32 column: (in k (as 'I32 [1 2 3]))
+;; sv->type == RAY_I32 → fp_compile_cmp hits lines 640-642
+(set Ti32in (table [k v g] (list (as 'I32 [0 1 2 3 4 5 6 7 8 9]) (as 'I64 (til 10)) [0 0 0 0 0 1 1 1 1 1])))
+;; (in k (as 'I32 [1 3 5])): rows k=1,3,5. k=1→g=0, k=3→g=0, k=5→g=1. Two groups.
+(set Ri32in (select {n: (count v) by: g from: Ti32in where: (in k (as 'I32 [1 3 5]))}))
+(count Ri32in) -- 2
+(sum (at Ri32in 'n)) -- 3
+
+;; I16-typed IN list on I16 column: sv->type == RAY_I16 → line 639
+(set Ti16in (table [k v g] (list (as 'I16 [0 1 2 3 4 5 6 7 8 9]) (as 'I64 (til 10)) [0 0 0 0 0 1 1 1 1 1])))
+;; (in k (as 'I16 [2 4 6])): rows k=2,4,6. k=2→g=0, k=4→g=0, k=6→g=1.
+(set Ri16in (select {n: (count v) by: g from: Ti16in where: (in k (as 'I16 [2 4 6]))}))
+(count Ri16in) -- 2
+(sum (at Ri16in 'n)) -- 3
+
+;; =====================================================================
+;; 18. mk_count_upsert_row narrow path (lines 2474-2491)
+;;     Triggered by: two I32 group keys (4+4=8 bytes, total_bytes≤8 → c->wide=0)
+;;     + n_aggs=1 (COUNT) + pred.n_children>1 + I64-EQ child → eq_i64_idx≥0
+;;     → mk_eq_i64_count_fn → mk_count_upsert_row with !c->wide
+;;
+;;     Also covers mk_eq_i64_count_fn pass=0 break (lines 2548-2549):
+;;     rows failing the secondary predicate.
+;; =====================================================================
+
+;; 20 rows with 2 I32 group keys (LCM(5,4)=20 distinct pairs).
+;; k=42 for all rows (constant I64), v=0..19.
+;; (and (== k 42) (>= v 0)): all 20 rows pass.
+;; eq_i64_idx found for (== k 42). mk_count_upsert_row narrow path: c->wide=0.
+(set Tmknarr (table [g1 g2 v k] (list (as 'I32 (% (til 20) 5)) (as 'I32 (% (til 20) 4)) (as 'I64 (til 20)) (as 'I64 (+ 42 (% (til 20) 1))))))
+(set Rmknarr (select {n: (count v) by: [g1 g2] from: Tmknarr where: (and (== k 42) (>= v 0))}))
+(count Rmknarr) -- 20
+(sum (at Rmknarr 'n)) -- 20
+
+;; With secondary predicate failing for rows 0..9 (v<10) → mk_eq_i64_count_fn
+;; evaluates fp_eval_cmp_one for GE returning 0 → pass=0 → lines 2548-2549 covered.
+(set Rmknarr2 (select {n: (count v) by: [g1 g2] from: Tmknarr where: (and (== k 42) (>= v 10))}))
+;; Rows 10-19 pass: (g1=0,g2=2),(g1=1,g2=3),(g1=2,g2=0),(g1=3,g2=1),(g1=4,g2=2),
+;;                  (g1=0,g2=3),(g1=1,g2=0),(g1=2,g2=1),(g1=3,g2=2),(g1=4,g2=3)
+(count Rmknarr2) -- 10
+(sum (at Rmknarr2 'n)) -- 10
+
+;; =====================================================================
+;; 19. SYM LIKE predicate → fp_pred_cleanup frees aux_hdr (lines 842-847)
+;;     LIKE on SYM column allocates like_lut in fp_compile_cmp (lines 671-675).
+;;     fp_pred_cleanup (called after exec) frees aux_hdr for LIKE-SYM child.
+;; =====================================================================
+
+;; Reuse Tsy table from section 10: (sy SYM, v I64, g I32)
+;; LIKE on SYM column → like_lut allocated → fp_pred_cleanup frees aux_hdr.
+(set Rsymlike (select {c: (count v) from: Tsy where: (like sy "alpha*") by: g}))
+;; 'alpha matches "alpha*" in both groups → 2 groups, count 1 each.
+(count Rsymlike) -- 2
+(sum (at Rsymlike 'c)) -- 2
+
+;; Multi-child AND with SYM LIKE: (and (like sy "a*") (>= v 2))
+;; use_masked=0 (no IN), but LIKE+GE compound with SYM LIKE → aux_hdr freed.
+(set Rsymlike2 (select {c: (count v) from: Tsy where: (and (like sy "a*") (>= v 2)) by: g}))
+;; "a*" matches 'alpha. v>=2: rows (sy='alpha,v=4) → 1 row in g=1 → 1 group.
+;; Rows with sy='alpha: row 0 (v=1,g=0) and row 3 (v=4,g=1). v>=2: only row 3.
+(count Rsymlike2) -- 1
+(sum (at Rsymlike2 'c)) -- 1
+
+;; =====================================================================
+;; 20. fp_pred_cleanup via fused_topk LIKE on SYM column (lines 842-847)
+;;     fused_topk path: {from: T asc: col take: N where: (like sym_col "pat")}
+;;     → fp_compile_pred allocates aux_hdr (like_lut) for SYM LIKE child
+;;     → fp_pred_cleanup called at fused_topk.c:408 (success path)
+;;     → child.aux_hdr != NULL → lines 842-847 executed
+;; =====================================================================
+
+;; Reuse Tsy = (sy SYM, v I64, g I32). Filter rows where sy LIKE "alpha*".
+;; Sorted by v asc, take 2. Matching rows: (sy='alpha,v=1), (sy='alpha,v=4).
+;; Sorted asc by v: v=1 first, v=4 second.
+(set Rtopklike (select {sy: sy v: v from: Tsy where: (like sy "alpha*") asc: v take: 2}))
+(count Rtopklike) -- 2
+(at (at Rtopklike 'v) 0) -- 1
+(at (at Rtopklike 'v) 1) -- 4
+
+;; SYM LIKE with multiple results to ensure aux_hdr allocation and cleanup.
+(set Rtopklike2 (select {sy: sy v: v from: Tsy where: (like sy "*") asc: v take: 3}))
+(count Rtopklike2) -- 3
+
+;; =====================================================================
+;; 21. IN list with typed literal vecs (fp_compile_cmp lines 637-642)
+;;     fp_check_in: rhs must be a plain vec literal (no RAY_ATTR_NAME).
+;;     BOOL/DATE/TIME vec literals in parse tree hit the non-I64 branches.
+;;     sv->type == RAY_DATE/RAY_TIME → lines 641-642
+;;     sv->type == RAY_BOOL → lines 637-638
+;; =====================================================================
+
+;; DATE-typed IN list on DATE column: sv->type == RAY_DATE → lines 641-642
+;; Use DATE literals directly: [date1 date2 date3] creates a DATE vec.
+(set Tdatein (table [k v g] (list (as 'date [2020.01.01 2020.01.02 2020.01.03 2020.01.04 2020.01.05 2020.01.06]) (as 'I64 [1 2 3 4 5 6]) [0 0 0 1 1 1])))
+;; (in k [2020.01.01 2020.01.03 2020.01.05]): 3 dates. DATE vec → sv->type=RAY_DATE.
+;; k=2020.01.01→g=0, k=2020.01.03→g=0, k=2020.01.05→g=1 → 2 groups, 3 rows.
+(set Rdatein (select {n: (count v) by: g from: Tdatein where: (in k [2020.01.01 2020.01.03 2020.01.05])}))
+(count Rdatein) -- 2
+(sum (at Rdatein 'n)) -- 3
+
+;; TIME-typed IN list on TIME column: sv->type == RAY_TIME → lines 641-642
+(set Ttimein (table [k v g] (list (as 'time [00:00:01.000 00:00:02.000 00:00:03.000 00:00:04.000 00:00:05.000 00:00:06.000]) (as 'I64 [1 2 3 4 5 6]) [0 0 0 1 1 1])))
+;; TIME literals create TIME vec → sv->type=RAY_TIME → lines 641-642
+(set Rtimein (select {n: (count v) by: g from: Ttimein where: (in k [00:00:02.000 00:00:04.000 00:00:06.000])}))
+(count Rtimein) -- 2
+(sum (at Rtimein 'n)) -- 3
+
+;; BOOL-typed IN list on BOOL column: sv->type == RAY_BOOL → lines 637-638
+;; [true false] creates a BOOL vec. On BOOL key column (2 values).
+;; (in k [true false]) matches all rows. Group by k (BOOL key = 2 groups).
+(set Rboolinall (select {n: (count v) by: k from: Tbool where: (in k [true false])}))
+(count Rboolinall) -- 2
+(sum (at Rboolinall 'n)) -- 8
+
+;; BOOL IN with single value: (in k [true]) → only true rows → 1 group (k=true)
+(set Rboolin1 (select {n: (count v) by: k from: Tbool where: (in k [true])}))
+(count Rboolin1) -- 1
+(sum (at Rboolin1 'n)) -- 4
+
+;; =====================================================================
+;; 22. mk_count_upsert_row narrow collision (lines 2486-2491)
+;;     Triggered when multi-agg narrow path (total_bytes ≤ 8) sees the same
+;;     composite key twice → slot already occupied → lines 2486-2490 hit.
+;;     Use few (g1,g2) distinct pairs with many rows each:
+;;     g1 = i%3 (3 values), g2 = constant 0 → 3 distinct pairs, 6+ rows each.
+;; =====================================================================
+
+;; 30 rows: g1 cycles 0,1,2 (10 times each), g2=constant 0.
+;; AND pred with I64 EQ child → mk_eq_i64_count_fn → mk_count_upsert_row.
+;; Each of the 3 (g1,g2) pairs appears 10 times → collision on rows 2,3 onward.
+(set Tcoll (table [g1 g2 v k] (list (as 'I32 (% (til 30) 3)) (as 'I32 (% (til 30) 1)) (as 'I64 (til 30)) (as 'I64 (+ 42 (% (til 30) 1))))))
+(set Rcoll (select {n: (count v) by: [g1 g2] from: Tcoll where: (and (== k 42) (>= v 0))}))
+(count Rcoll) -- 3
+(sum (at Rcoll 'n)) -- 30
+
+;; Also use the mk_par_fn path (no EQ I64 child) with duplicates:
+;; (>= v 0) single predicate → mk_par_fn → narrow collision in mk_par_fn inlined HT.
+(set Tpar2 (table [g1 g2 v] (list (as 'I32 (% (til 30) 3)) (as 'I32 (% (til 30) 1)) (as 'I64 (til 30)))))
+(set Rpar2 (select {n: (count v) by: [g1 g2] from: Tpar2 where: (>= v 0)}))
+(count Rpar2) -- 3
+(sum (at Rpar2 'n)) -- 30
+
+;; =====================================================================
+;; 23. totals==NULL branch in fp_try_direct_count1 (lines 1544-1547)
+;;     Triggered by: use_emit_filter=true BUT top_count_take=0 (no desc/take).
+;;     Only min_count_exclusive is set (outer WHERE n > K on count result).
+;;     totals is NOT allocated → lines 1543-1547 hit the totals==NULL branch.
+;; =====================================================================
+
+;; BOOL key + outer WHERE (> n 0): sets min_count_exclusive=0, top_count_take=0.
+;; fp_try_direct_count1: use_emit_filter=true, top_count_take=0 → totals=NULL.
+;; Lines 1544-1547: totals==NULL branch sums counts from workers.
+;; Tbool: false=4, true=4 (8 rows). Inner query: 2 groups. Filter n>0 keeps both.
+(count (select {from: (select {n: (count v) by: k from: Tbool}) where: (> n 0)})) -- 2
+
+;; With U8 key + min_count_exclusive filter.
+(set Tu8out (table [k v] (list (as 'U8 [0 1 2 0 1 2 3 3]) (as 'I64 [1 2 3 4 5 6 7 8]))))
+;; key=0 appears 2 times, key=1 appears 2 times, key=2 appears 2 times, key=3 appears 2 times.
+;; Outer WHERE n > 1: all 4 groups pass. Result count = 4.
+(count (select {from: (select {n: (count v) by: k from: Tu8out}) where: (> n 1)})) -- 4
+
+;; I16 key + min_count_exclusive only (no top_count_take).
+(set Ti16mc (table [k v] (list (as 'I16 [1 1 2 2 3 3 4 4]) (as 'I64 (til 8)))))
+;; Each key appears exactly 2 times. WHERE n > 1: all 4 groups pass.
+(count (select {from: (select {n: (count v) by: k from: Ti16mc}) where: (> n 1)})) -- 4
+
+;; =====================================================================
+;; 24. I16 atom in fp_compile_cmp (line 724, case -RAY_I16)
+;;     (>= k myI16): cv->type == -RAY_I16 → out->cval = (int64_t)cv->i16
+;;     Also covers fp_cmp_read_i64_at esz=4 path (line 508) via I32 column
+;;     in fp_eval_cmp_one when inside a masked-AND with IN child.
+;; =====================================================================
+
+;; Pre-evaluated I16 atom: stored as -RAY_I16 in env → ray_const_atom → OP_CONST.
+;; fp_compile_cmp: cv->type == -RAY_I16 → line 724.
+(set myI16cmp (as 'I16 3))
+;; Use I16 key column in a count1 query with I16 atom comparison.
+;; (>= k myI16cmp) on I16 col: cv->type=-RAY_I16 → line 724 → out->cval=3.
+(set Ri16atom (select {n: (count v) by: k from: Ti16notop where: (>= k myI16cmp)}))
+;; Ti16notop: k=1..5 (20 rows each), keys ≥ 3: k=3,4,5 → 3 groups.
+(count Ri16atom) -- 3
+
+;; I32 column in fp_eval_cmp_one esz=4 path (line 508 of fp_cmp_read_i64_at).
+;; Need: (and (in k_i64 [...]) (>= i32col val)) → IN child first (score 3),
+;;        I32 GE child second → fp_eval_cmp_masked → fp_eval_cmp_one → esz=4 switch case.
+;; Pre-evaluate the I32 comparison value to avoid OP_CAST.
+(set myI32cmp (as 'I32 3))
+(set Ti32esz4 (table [k v32 g] (list (as 'I64 [1 2 3 4 5 1 2 3 4 5]) (as 'I32 [1 2 3 4 5 6 7 8 9 10]) [0 0 0 0 0 1 1 1 1 1])))
+;; (and (in k [1 2 3]) (>= v32 3)): IN first (score 3), GE I32 second (score 4).
+;; Literal 3 (type -RAY_I64, no RAY_ATTR_NAME) → fp_check_simple_cmp passes.
+;; use_masked=1. fp_eval_cmp_masked for GE I32 child → fp_eval_cmp_one → esz=4.
+;; k in {1,2,3}: rows 0(k=1,v32=1),1(k=2,v32=2),2(k=3,v32=3),5(k=1,v32=6),6(k=2,v32=7),7(k=3,v32=8).
+;; v32 >= 3 at rows 2,5,6,7 → g=0: row 2 (count 1); g=1: rows 5,6,7 (count 3).
+(set Ri32esz4 (select {n: (count v32) by: g from: Ti32esz4 where: (and (in k [1 2 3]) (>= v32 3))}))
+(count Ri32esz4) -- 2
+(sum (at Ri32esz4 'n)) -- 4
+
+;; =====================================================================
+;; 25. fp_eval_pred n_children==0 path (lines 566-568)
+;;     Triggered when: no WHERE + BOOL/U8/I16 key + desc: count take: N
+;;     → no_where_count_key_ok=1 → ray_filtered_group(g, NULL, ...)
+;;     → fp_compile_pred(g, NULL, &pred) → n_children=0
+;;     → fp_direct_count_fn → fp_eval_pred → memset(bits,1,n) hit
+;; =====================================================================
+
+;; BOOL key + no WHERE + desc: n take: 2
+;; n_children=0 → fp_eval_pred → lines 566-568 (memset bits to all-1).
+(set Rbool_notake (select {n: (count v) by: k from: Tbool desc: n take: 2}))
+(count Rbool_notake) -- 2
+(sum (at Rbool_notake 'n)) -- 8
+
+;; U8 key + no WHERE + desc: n take: 3 (also exercises lines 566-568)
+(set Ru8_notake (select {n: (count v) by: k from: Tu8ne0 desc: n take: 3}))
+(count Ru8_notake) -- 3
+(sum (at Ru8_notake 'n)) -- 30
+
+;; =====================================================================
+;; 26. SYM column with non-existent string → fp_eval_cmp_one line 517
+;;     ray_sym_find returns -1 (no intern) → cval_in_dict=0
+;;     fp_eval_cmp_one: RAY_SYM && !cval_in_dict → line 517: return (op==FP_NE)
+;;     For EQ with cval_in_dict=0: every row returns false → 0 pass.
+;;     Paired with IN on key → AND: use_masked path exercises the SYM code.
+;; =====================================================================
+
+;; Build a table with a SYM column and I64 key column.
+(set Tsym26 (table [k sy v] (list (as 'I64 [1 2 3 4 5 6]) [a b c a b c] (as 'I64 [10 20 30 40 50 60]))))
+
+;; (and (in k [1 2 3 4 5 6]) (== sy "___NOSYM_COVERAGE_XYZ_UNIQUE___"))
+;; ray_sym_find("___NOSYM_COVERAGE_XYZ_UNIQUE___") returns -1 → cval_in_dict=0.
+;; fp_eval_cmp_one: SYM && !cval_in_dict → line 517: return 0 (op==FP_NE is false for EQ).
+;; No rows match → count result is 0.
+(set Rsym26_eq (select {n: (count v) by: k from: Tsym26 where: (and (in k [1 2 3 4 5 6]) (== sy "___NOSYM_COVERAGE_XYZ_UNIQUE___"))}))
+(count Rsym26_eq) -- 0
+
+;; NE with cval_in_dict=0: line 517 returns (op==FP_NE) = 1 → all rows pass.
+;; All 6 distinct keys → 6 groups, each with count 1.
+(set Rsym26_ne (select {n: (count v) by: k from: Tsym26 where: (and (in k [1 2 3 4 5 6]) (!= sy "___NOSYM_COVERAGE_XYZ_UNIQUE___"))}))
+(count Rsym26_ne) -- 6
+(sum (at Rsym26_ne 'n)) -- 6
+
+;; AND with IN child + LIKE child: use_masked=1 → fp_eval_cmp_masked for LIKE child.
+;; fp_eval_cmp_masked: op==FP_LIKE → takes the vectorized path (lines 547-551),
+;; NOT calling fp_eval_cmp_one. So line 519 is NOT covered this way.
+;; Instead: use multi-key GROUP BY with (and (== k1_i64 val) (like sy "pat")).
+;; mk_eq_i64_count_fn calls fp_eval_cmp_one for the LIKE child → line 519 fires.
+;; Build table with 2 I64 keys and a SYM column.
+(set Tlike26 (table [k1 k2 sy v] (list (as 'I64 [1 2 3 3 3 4 5 6]) (as 'I64 [0 0 0 1 2 0 0 0]) [a b a b c d e f] (as 'I64 (til 8)))))
+;; WHERE (and (== k1 3) (like sy "a*")): k1=3 at rows 2,3,4. sy matches "a*" at rows 0,2 (sy='a).
+;; Matching rows: row 2 (k1=3,k2=0,sy='a). Group (k1=3,k2=0): count=1.
+;; mk_eq_i64_count_fn: eq_idx for (== k1 3), LIKE child → fp_eval_cmp_one → line 519 returns 0.
+;; Since line 519 returns 0 (FP_LIKE via fp_eval_cmp_one), let's see: line 547 in
+;; fp_eval_cmp_masked takes FP_LIKE via vectorized path. fp_eval_cmp_one is called
+;; for non-masked path children in mk_eq_i64_count_fn (line 2547).
+(set Rlike26 (select {n: (count v) by: [k1 k2] from: Tlike26 where: (and (== k1 3) (like sy "a*"))}))
+;; fp_eval_cmp_one for FP_LIKE returns 0 (line 519). Bug: LIKE via mk_eq_i64_count_fn
+;; gives wrong result — should be 1 group (row 2: k1=3, k2=0, sy='a matches "a*").
+;; Correct expected value = 1. The buggy path returns 0.
+(count Rlike26) -- 1
+
+;; =====================================================================
+;; 27. Wide COUNT with duplicate key pairs → mk_combine_dedup_fn wide path
+;;     lines 3060-3062: wide key merge (lo+hi) via mk_state_merge.
+;;     Requires: I64+I32 key → total_bytes=12 > 8 → wide=1, has_only_count=1.
+;;     Many workers process overlapping key ranges → dedup fires on merge.
+;; =====================================================================
+
+;; 60000 rows, I64 key1 cycles mod 15000, I32 key2 cycles mod 4.
+;; 15000 distinct (k1,k2) pairs; each pair appears exactly 4 times
+;; at rows i, i+15000, i+30000, i+45000 → non-contiguous blocks.
+;; With 4 parallel workers (rows 0-14999, 15000-29999, 30000-44999, 45000-59999),
+;; each worker independently accumulates all 15000 distinct pairs.
+;; total_local = 4×15000 = 60000 ≥ FP_COMBINE_PAR_MIN (50000) → parallel combine.
+;; mk_combine_dedup_fn wide path: same (kv_lo, kv_hi) from different workers →
+;; line 3059 match → mk_state_merge fires. I64+I32 = 12 bytes > 8 → wide=1.
+(set Nwd27 60000)
+(set K1wd27 (% (til Nwd27) 15000))
+(set K2wd27 (as 'I32 (% (til Nwd27) 4)))
+(set Vwd27  (as 'I64 (til Nwd27)))
+(set Twd27  (table [k1 k2 v] (list K1wd27 K2wd27 Vwd27)))
+(set Rwdwide (select {n: (count v) by: [k1 k2] from: Twd27 where: (>= v 0)}))
+(count Rwdwide) -- 15000
+(sum (at Rwdwide 'n)) -- 60000
+
+;; =====================================================================
+;; 28. Heap sift-up in mk_apply_count_emit_filter (lines 2829-2830)
+;;     Triggered when: multi-key GROUP BY + desc: n take: K
+;;     where K < number of groups, and heap sees count(j) < count(0).
+;;     Use two I64 keys (16 bytes > 8 → wide=1), COUNT-only, WHERE predicate,
+;;     desc: n take: 5. Mix high and low-count groups in data order so that
+;;     the heap's sift-down on extraction exercises the swap branch.
+;; =====================================================================
+
+;; Use quadratic residues mod 1000 to create non-uniform group counts.
+;; k1 = j² mod 1000: distribution is non-uniform (some values appear many times,
+;; others zero). With 60000 rows and 1000 possible k1 values, groups with many
+;; rows get large counts and groups with few rows get small counts.
+;; k2 = I32(j² mod 23): adds a second dimension for the wide key (12 bytes > 8).
+;; desc: n take: 5 with many non-uniformly distributed groups guarantees that
+;; the heap sift-up fires: the 2nd+ group scanned in hash order has smaller
+;; count than a previously inserted group with larger count.
+(set Nsift 60000)
+(set Vsift (as 'I64 (til Nsift)))
+(set Sk1sift (% (* Vsift Vsift) 1000))
+(set Sk2sift (as 'I32 (% (* Vsift Vsift) 23)))
+(set Tsift (table [k1 k2 v] (list Sk1sift Sk2sift Vsift)))
+(set Rsift (select {n: (count v) by: [k1 k2] from: Tsift where: (>= v 0) desc: n take: 5}))
+(count Rsift) -- 5
+
+;; =====================================================================
+;; 29. COUNT-1 narrow dedup merge (lines 1780-1782 in fp_combine_dedup_fn)
+;;     Same analysis as Section 27 but for the single-key COUNT-1 path.
+;;     Requires: 1 I64 key column (narrow, total_bytes=8), COUNT only,
+;;     total_local >= 50000 (FP_COMBINE_PAR_MIN), same key in multiple
+;;     worker shards → fp_combine_dedup_fn merge fires (line 1780).
+;; =====================================================================
+
+;; 60000 rows, key = row % 15000 → 15000 distinct keys, each 4 times.
+;; Workers split at 0-14999, 15000-29999, 30000-44999, 45000-59999.
+;; Each worker's shard has all 15000 keys. total_local=60000 ≥ 50000.
+;; Same key from 2+ workers → fp_combine_dedup_fn: line 1779 matches → 1780 merge.
+(set Ndedup 60000)
+(set Kdedup (% (til Ndedup) 15000))
+(set Vdedup (as 'I64 (til Ndedup)))
+(set Tdedup (table [k v] (list Kdedup Vdedup)))
+(set Rdedup (select {n: (count v) by: k from: Tdedup where: (>= v 0)}))
+(count Rdedup) -- 15000
+(sum (at Rdedup 'n)) -- 60000
+
+;; =====================================================================
+;; 30. Wide key + MIN/MAX aggregates (lines 2718-2721 in mk_par_fn)
+;;     When total_bytes > 8 (wide=1), new slot initialization for
+;;     MK_AGG_MIN sets INT64_MAX and MK_AGG_MAX sets INT64_MIN.
+;;     Triggered by two I64 keys (8+8=16 bytes > 8 → wide=1).
+;; =====================================================================
+
+;; Two I64 keys: total_bytes = 8+8 = 16 > 8 → wide=1.
+;; MIN and MAX aggregates exercise lines 2718-2721 on first slot insertion.
+;; 8 rows, 8 distinct (k1,k2) pairs (each appears once).
+(set Twmin (table [k1 k2 v] (list (as 'I64 [0 1 0 1 0 1 0 1]) (as 'I64 [0 0 1 1 2 2 3 3]) (as 'I64 [10 20 30 40 50 60 70 80]))))
+(set Rwmin (select {lo: (min v) hi: (max v) by: [k1 k2] from: Twmin where: (>= v 0)}))
+(count Rwmin) -- 8
+(min (at Rwmin 'lo)) -- 10
+(max (at Rwmin 'hi)) -- 80
+
+;; Wider test: more rows to ensure parallel workers all hit new-slot init.
+;; 200 rows, k1 in [0..19], k2 in [0..12] → gcd(20,13)=1, lcm=260 > 200
+;; so all 200 (k1,k2) pairs are distinct (one row each).
+;; MIN == MAX == v for each group (count=1 per pair).
+(set Nwm2 200)
+(set K1wm2 (% (til Nwm2) 20))
+(set K2wm2 (% (til Nwm2) 13))
+(set Vwm2  (as 'I64 (til Nwm2)))
+(set Twm2  (table [k1 k2 v] (list K1wm2 K2wm2 Vwm2)))
+(set Rwm2 (select {lo: (min v) hi: (max v) by: [k1 k2] from: Twm2 where: (>= v 0)}))
+(count Rwm2) -- 200
+(min (at Rwm2 'lo)) -- 0
+(max (at Rwm2 'hi)) -- 199
+
+;; =====================================================================
+;; 31. STR LIKE in fp_eval_cmp_one (lines 539-548)
+;;     mk_eq_i64_count_fn: eq_idx for (== k1 3), LIKE child on STR column.
+;;     fp_eval_cmp_one called for LIKE with col_type==RAY_STR → lines 539-548.
+;;     [Note: SYM LIKE already covered by section 26.]
+;; =====================================================================
+
+;; Two I64 keys + a STR column s. WHERE: (and (== k1 3) (like s "a*")).
+;; mk_eq_i64_count_fn fast path: eq_idx for k1==3, LIKE child on STR col.
+;; fp_eval_cmp_one for STR LIKE: col_type==RAY_STR → lines 539-548.
+;; k1=3 at rows 2,3,4. "a*" matches "ax" → rows 0,2. Intersection: row 2 (k1=3,s="ax").
+;; Result: 1 group (k1=3, k2=0), count=1.
+(set Tstrlike (table [k1 k2 s v] (list (as 'I64 [1 2 3 3 3 4 5 6]) (as 'I64 [0 0 0 1 2 0 0 0]) ["ax" "bx" "ax" "bx" "cx" "dx" "ex" "fx"] (as 'I64 (til 8)))))
+(set Rstrlike (select {n: (count v) by: [k1 k2] from: Tstrlike where: (and (== k1 3) (like s "a*"))}))
+(count Rstrlike) -- 1
+(sum (at Rstrlike 'n)) -- 1
+
+;; Verify LIKE matching works: "b*" matches "bx" → rows 1,3. k1=3 at rows 2,3,4.
+;; Intersection: row 3 (k1=3, k2=1, s="bx"). Group (3,1): count=1.
+(set Rstrblike (select {n: (count v) by: [k1 k2] from: Tstrlike where: (and (== k1 3) (like s "b*"))}))
+(count Rstrblike) -- 1
+(sum (at Rstrblike 'n)) -- 1
+
+;; No match: "z*" matches nothing → 0 groups.
+(set Rstrnone (select {n: (count v) by: [k1 k2] from: Tstrlike where: (and (== k1 3) (like s "z*"))}))
+(count Rstrnone) -- 0
+
+;; =====================================================================
+;; 32. SYM ne0 path in fp_direct_count_fn (lines 1265-1268)
+;;     Triggered by SYM key + pred_key_ne_zero=1:
+;;     cmp->op==FP_NE && cmp->cval==0 && col matches kbase/kt/kesz.
+;;     Requires WHERE (!= sym_col <null_sym>) where SID 0 is uninterned.
+;;     Approach: use a SYM column with WHERE (== sym 'sentinel) which
+;;     has cval == SID of 'sentinel > 0. BUT pred_key_ne_zero needs cval==0.
+;;     Alternative: (select {n: (count v) by: sym_col from: T where: (!= sym_col 'xxx)})
+;;     where 'xxx has SID != 0. This won't trigger pred_key_ne_zero.
+;;
+;;     Actually: pred_key_ne_zero needs cval==0. In RFL, when we write
+;;     (select {n: (count v) by: k from: T where: (!= k 0)}), the literal 0
+;;     is type -RAY_I64 not -RAY_SYM or -RAY_STR. fp_atom_col_compatible
+;;     rejects -RAY_I64 for RAY_SYM col → falls to unfused path.
+;;     Lines 1265-1268 appear unreachable from RFL (need SYM key with cval==0
+;;     which can't be expressed as a SYM literal in RFL with SID==0).
+;; =====================================================================
+
+;; NOTE: Lines 1265-1268 appear unreachable from RFL without internal API access.
+;; SYM key WHERE (!= sym 0-SID) cannot be expressed: RFL intern always gives SID>0.
+;; Skip: no test added for this block.
+
+;; =====================================================================
+;; 33. Additional wide multi-key SUM coverage
+;;     Wide path (16 bytes) with SUM to complement MIN/MAX in section 30.
+;; =====================================================================
+
+;; Wide SUM+COUNT: covers mk_par_fn PASS 2 SUM/COUNT in wide path.
+;; I64 + I64 keys = 16 bytes (wide=1). SUM of v.
+(set Twsum (table [k1 k2 v] (list (as 'I64 [0 1 2 0 1 2 0 1 2 0]) (as 'I64 [0 0 0 1 1 1 2 2 2 3]) (as 'I64 [1 2 3 4 5 6 7 8 9 10]))))
+(set Rwsum (select {n: (count v) s: (sum v) by: [k1 k2] from: Twsum where: (>= v 0)}))
+(count Rwsum) -- 10
+(sum (at Rwsum 'n)) -- 10
+(sum (at Rwsum 's)) -- 55
+
+;; =====================================================================
+;; 34. mk_find_i64_eq_child returns -1
+;;     multi-key COUNT, n_children>1, but no FP_EQ child with esz==8.
+;;     Using GE+LE on an I64 column: both are FP_GE/FP_LE, not FP_EQ,
+;;     so mk_find_i64_eq_child loops all children and returns -1 → the
+;;     plain mk_par_fn path is used instead of mk_eq_i64_count_fn.
+;; =====================================================================
+
+(set Tnoeq (table [k1 k2 v] (list (as 'I32 (% (til 200) 10)) (as 'I32 (% (til 200) 7)) (as 'I64 (til 200)))))
+(set Rnoeq (select {n: (count v) by: [k1 k2] from: Tnoeq where: (and (>= v 0) (<= v 199))}))
+(count Rnoeq) -- 70
+(sum (at Rnoeq 'n)) -- 200
+
+;; =====================================================================
+;; 35. mk_count_upsert_row: shard grow (lines 2494-2496) + narrow
+;;     hash-collision linear probe (line 2519).
+;;     Requires >512 unique narrow group-key pairs through the
+;;     mk_eq_i64_count_fn path (n_aggs==1, COUNT, n_children>1, EQ I64).
+;;     Keys: two I32 columns → total_bytes=8 → narrow (wide=0).
+;;     Predicate: (and (== fc 0) (>= v 0)) — fc is I64 → eq_i64_idx≥0.
+;;     700 rows with 700 distinct (k1,k2) pairs exceed the 512 threshold
+;;     that triggers mk_shard_grow, and the dense hash table guarantees
+;;     linear-probe collisions before the grow.
+;; =====================================================================
+
+(set N35 700)
+;; K1 = 0..699, K2 = 0 → 700 distinct (k1,k2) pairs (each row unique).
+(set K1_35 (as 'I32 (til N35)))
+(set K2_35 (as 'I32 (% (til N35) 1)))   ;; constant 0
+(set FC_35 (as 'I64 (% (til N35) 1)))   ;; constant 0
+(set V35  (as 'I64 (til N35)))
+(set T35 (table [k1 k2 fc v] (list K1_35 K2_35 FC_35 V35)))
+(set R35 (select {n: (count v) by: [k1 k2] from: T35 where: (and (== fc 0) (>= v 0))}))
+(count R35) -- 700
+(sum (at R35 'n)) -- 700
+
+;; =====================================================================
+;; 36. fp_eval_cmp esz=1 EQ, LT, LE, GT branches
+;;     fp_eval_cmp is called for the FIRST (or only) child of a pred.
+;;     esz=1 covers BOOL (1 byte) and U8 (1 byte).
+;;     Need single-child WHERE on U8 column to hit each branch directly.
+;;
+;;     U8 key: 10 rows with values 0..9. Single-child preds:
+;;       (== u8k 5)  → esz=1 case FP_EQ
+;;       (< u8k 5)   → esz=1 case FP_LT
+;;       (<= u8k 4)  → esz=1 case FP_LE
+;;       (> u8k 4)   → esz=1 case FP_GT
+;; =====================================================================
+
+;; Table with U8 key column used as both key and filter target.
+(set Tu8ev (table [k v] (list (as 'U8 [0 1 2 3 4 5 6 7 8 9]) (as 'I64 (til 10)))))
+
+;; (== k 5): esz=1 FP_EQ → 1 group (k=5), count 1
+(set Ru8eq (select {n: (count v) by: k from: Tu8ev where: (== k 5)}))
+(count Ru8eq) -- 1
+(sum (at Ru8eq 'n)) -- 1
+
+;; (< k 5): esz=1 FP_LT → 5 groups (k=0..4), count 1 each
+(set Ru8lt (select {n: (count v) by: k from: Tu8ev where: (< k 5)}))
+(count Ru8lt) -- 5
+(sum (at Ru8lt 'n)) -- 5
+
+;; (<= k 4): esz=1 FP_LE → 5 groups (k=0..4)
+(set Ru8le (select {n: (count v) by: k from: Tu8ev where: (<= k 4)}))
+(count Ru8le) -- 5
+(sum (at Ru8le 'n)) -- 5
+
+;; (> k 4): esz=1 FP_GT → 5 groups (k=5..9)
+(set Ru8gt (select {n: (count v) by: k from: Tu8ev where: (> k 4)}))
+(count Ru8gt) -- 5
+(sum (at Ru8gt 'n)) -- 5
+
+;; =====================================================================
+;; 37. fp_eval_cmp esz=2 I16 EQ and NE branches (non-SYM path)
+;;     Currently LT and GE are covered; EQ and NE on I16 are not.
+;;     Need single-child WHERE `(== i16_col val)` or `(!= i16_col val)`
+;;     as the FIRST child with no IN child present (so fp_eval_cmp
+;;     is called directly, not fp_eval_cmp_one via masked path).
+;;
+;;     Also cover LE and GT for I16 (esz=2 non-SYM).
+;; =====================================================================
+
+;; Table with I16 key column.
+(set Ti16ev (table [k v] (list (as 'I16 [1 2 3 4 5 6 7 8 9 10]) (as 'I64 (til 10)))))
+
+;; (== k 5): esz=2 I16 EQ → 1 group
+(set Ri16eq (select {n: (count v) by: k from: Ti16ev where: (== k 5)}))
+(count Ri16eq) -- 1
+(sum (at Ri16eq 'n)) -- 1
+
+;; (!= k 5): esz=2 I16 NE → 9 groups
+(set Ri16ne (select {n: (count v) by: k from: Ti16ev where: (!= k 5)}))
+(count Ri16ne) -- 9
+(sum (at Ri16ne 'n)) -- 9
+
+;; (<= k 5): esz=2 I16 LE → 5 groups (k=1..5)
+(set Ri16le (select {n: (count v) by: k from: Ti16ev where: (<= k 5)}))
+(count Ri16le) -- 5
+(sum (at Ri16le 'n)) -- 5
+
+;; (> k 5): esz=2 I16 GT → 5 groups (k=6..10)
+(set Ri16gt (select {n: (count v) by: k from: Ti16ev where: (> k 5)}))
+(count Ri16gt) -- 5
+(sum (at Ri16gt 'n)) -- 5
+
+;; =====================================================================
+;; 38. fp_eval_cmp esz=4 I32 NE, LT, LE, GT branches
+;;     Currently EQ and GE are covered for I32; the others are not.
+;;     Use single-child WHERE on I32 key column.
+;; =====================================================================
+
+;; Table with I32 key column.
+(set Ti32ev (table [k v] (list (as 'I32 [1 2 3 4 5 6 7 8 9 10]) (as 'I64 (til 10)))))
+
+;; (!= k 5): esz=4 I32 NE → 9 groups
+(set Ri32ne (select {n: (count v) by: k from: Ti32ev where: (!= k 5)}))
+(count Ri32ne) -- 9
+(sum (at Ri32ne 'n)) -- 9
+
+;; (< k 5): esz=4 I32 LT → 4 groups (k=1..4)
+(set Ri32lt (select {n: (count v) by: k from: Ti32ev where: (< k 5)}))
+(count Ri32lt) -- 4
+(sum (at Ri32lt 'n)) -- 4
+
+;; (<= k 5): esz=4 I32 LE → 5 groups (k=1..5)
+(set Ri32le (select {n: (count v) by: k from: Ti32ev where: (<= k 5)}))
+(count Ri32le) -- 5
+(sum (at Ri32le 'n)) -- 5
+
+;; (> k 5): esz=4 I32 GT → 5 groups (k=6..10)
+(set Ri32gt (select {n: (count v) by: k from: Ti32ev where: (> k 5)}))
+(count Ri32gt) -- 5
+(sum (at Ri32gt 'n)) -- 5
+
+;; =====================================================================
+;; 39. fp_eval_cmp FP_LIKE single-child (direct call to fp_eval_cmp)
+;;     Single-child LIKE pred means fp_eval_cmp is called for it
+;;     directly (not via fp_eval_cmp_masked).
+;;     SYM LIKE: fp_eval_cmp line 355 (SYM lut path).
+;;     STR LIKE: fp_eval_cmp line 390 (STR vec path).
+;; =====================================================================
+
+;; SYM LIKE as single-child WHERE: fp_eval_cmp SYM LIKE branch.
+;; Reuse Tsymtopk from section 5: (k SYM, v I64).
+;; (like k "a*") as single-child pred on SYM key column.
+(set Rsymlike_single (select {n: (count v) by: k from: Tsymtopk where: (like k "a*")}))
+;; 'a (3 rows) → 1 group, count=3
+(count Rsymlike_single) -- 1
+(sum (at Rsymlike_single 'n)) -- 3
+
+;; SYM LIKE single-child with multi-char pattern (no anchors → full scan)
+(set Rsymlike_b (select {n: (count v) by: k from: Tsymtopk where: (like k "b*")}))
+(count Rsymlike_b) -- 1
+(sum (at Rsymlike_b 'n)) -- 2
+
+;; STR LIKE as single-child WHERE: fp_eval_cmp STR LIKE branch.
+;; Reuse Tstrlike from section 31: (k1 I64, k2 I64, s STR, v I64).
+;; Need group-by a key column (not s) with LIKE on STR column as single-child.
+;; Single-child LIKE on STR (not masked-AND): group by k1, WHERE (like s "a*").
+(set Rstrlike_single (select {n: (count v) by: k1 from: Tstrlike where: (like s "a*")}))
+;; s="ax" at rows 0 (k1=1) and 2 (k1=3) → 2 groups.
+(count Rstrlike_single) -- 2
+(sum (at Rstrlike_single 'n)) -- 2
+
+;; STR LIKE with "?" matching single char
+(set Rstrlike_q (select {n: (count v) by: k1 from: Tstrlike where: (like s "?x")}))
+;; All "?x" = all strings of form _x. "ax","bx","ax","bx","cx","dx","ex","fx" → all 8 rows.
+;; k1 values: 1,2,3,3,3,4,5,6 → 6 distinct groups.
+(count Rstrlike_q) -- 6
+(sum (at Rstrlike_q 'n)) -- 8
+
+;; =====================================================================
+;; 40. fp_eval_cmp FP_IN esz=1 (U8 column), esz=2 (I16 column),
+;;     esz=4 (I32 column) as FIRST child of pred.
+;;     Currently only esz=8 (I64 IN) is covered.
+;;     A single-child IN pred calls fp_eval_cmp directly.
+;; =====================================================================
+
+;; IN on U8 column (esz=1): single-child WHERE.
+;; Tu8ev: k = 0..9 (U8), v = 0..9. (in k [2 4 6 8]): 4 groups.
+(set Ru8in (select {n: (count v) by: k from: Tu8ev where: (in k (as 'U8 [2 4 6 8]))}))
+(count Ru8in) -- 4
+(sum (at Ru8in 'n)) -- 4
+
+;; IN on I16 column (esz=2): single-child WHERE.
+;; Ti16ev: k = 1..10 (I16). (in k [3 5 7]) → 3 groups.
+(set Ri16in_esz2 (select {n: (count v) by: k from: Ti16ev where: (in k (as 'I16 [3 5 7]))}))
+(count Ri16in_esz2) -- 3
+(sum (at Ri16in_esz2 'n)) -- 3
+
+;; IN on I32 column (esz=4): single-child WHERE.
+;; Ti32ev: k = 1..10 (I32). (in k [1 5 9]) → 3 groups.
+(set Ri32in_esz4 (select {n: (count v) by: k from: Ti32ev where: (in k (as 'I32 [1 5 9]))}))
+(count Ri32in_esz4) -- 3
+(sum (at Ri32in_esz4 'n)) -- 3
+
+;; =====================================================================
+;; 41. fp_try_direct_count1 BOOL key path (n_slots=2)
+;;     Triggered by: BOOL key column + any WHERE (or no WHERE).
+;;     fp_try_direct_count1 with kt==RAY_BOOL → n_slots=2.
+;;
+;;     BUT: for BOOL key with no WHERE, n_children=0 → the no-WHERE
+;;     code path is taken before fp_try_direct_count1 is called.
+;;     BOOL key WITH a WHERE predicate that is NOT on the key column
+;;     (so pred_key_ne_zero=0) should reach the BOOL path.
+;; =====================================================================
+
+;; BOOL key + WHERE on a non-key column → BOOL path in fp_try_direct_count1.
+;; Tbool: k=[false true false false true true true false], v=I64[1..8].
+;; WHERE (> v 3): rows v=4..8 pass. k=[false,true,true,true,false] → 2 groups.
+;; false: rows v=4(k=false) and v=8(k=false) = 2 rows.
+;; true: rows v=5(k=true),v=6(k=true),v=7(k=true) = 3 rows.
+(set Rbool_direct (select {n: (count v) by: k from: Tbool where: (> v 3)}))
+(count Rbool_direct) -- 2
+(sum (at Rbool_direct 'n)) -- 5
+
+;; BOOL key + WHERE (>= v 1) → all 8 rows pass → 2 groups.
+(set Rbool_direct2 (select {n: (count v) by: k from: Tbool where: (>= v 1)}))
+(count Rbool_direct2) -- 2
+(sum (at Rbool_direct2 'n)) -- 8
+
+;; =====================================================================
+;; 42. fp_count_emit_keep_min for count1 path (serial serial HT merge)
+;;     Triggered when use_emit_filter=true AND total_groups > k_take.
+;;     For U8 key: all 256 possible keys but only K taken.
+;;     When we have more distinct groups than k_take, the heap-based
+;;     keep_min computation runs inside fp_combine_and_materialize.
+;;
+;;     Use U8 key with many distinct keys (say 10 distinct keys each
+;;     appearing many times) + desc: count take: 3.
+;;     This forces fp_count_emit_keep_min to compute keep_min via heap.
+;; =====================================================================
+
+;; 100 rows, U8 key cycling 0..9 (10 rows per key).
+;; desc: count take: 3 → top-3 keys by count.
+;; All keys have count=10 → any 3 keys chosen. keep_min computed.
+(set Tu8km (table [k v] (list (as 'U8 (% (til 100) 10)) (as 'I64 (til 100)))))
+(set Ru8km (select {n: (count v) by: k from: Tu8km desc: n take: 3}))
+(count Ru8km) -- 3
+(sum (at Ru8km 'n)) -- 30
+
+;; U8 keys with non-uniform distribution → heap needs to sift properly.
+;; key=0 appears 50 times, keys 1..9 appear 50/9 each ≈ 5 times each.
+;; desc:n take:2 → top-2 are key=0(50) and one of keys 1-9.
+(set Tu8km2 (table [k v] (list (as 'U8 (concat (% (til 50) 1) (% (til 50) 9))) (as 'I64 (til 100)))))
+(set Ru8km2 (select {n: (count v) by: k from: Tu8km2 desc: n take: 2}))
+(count Ru8km2) -- 2
+
+;; =====================================================================
+;; 43. fp_eval_cmp SYM cval_not_in_dict path (single-child WHERE)
+;;     Line 350: ct==RAY_SYM && !cval_in_dict → memset(bits, FP_NE, n).
+;;     Triggered when: SYM WHERE predicate + literal string not in dict.
+;;     BUT the masked-AND path (fp_eval_cmp_one) is triggered by section 26.
+;;     Need: single-child SYM EQ/NE pred with non-existent symbol to
+;;     trigger fp_eval_cmp directly (not via masked path).
+;; =====================================================================
+
+;; Single-child SYM (== k "___NOSYM_EVALSINGLE___") on SYM key column.
+;; ray_sym_find returns -1 → cval_in_dict=0 → memset(bits, 0) for EQ.
+;; No rows match → 0 groups.
+(set Tsym43 (table [k v] (list ['a 'b 'c 'a 'b] (as 'I64 [1 2 3 4 5]))))
+(set Rsym43_eq (select {n: (count v) by: k from: Tsym43 where: (== k "___NOSYM_EVALSINGLE___")}))
+(count Rsym43_eq) -- 0
+
+;; NE with non-existent sym → all rows pass → 3 groups (a,b,c).
+(set Rsym43_ne (select {n: (count v) by: k from: Tsym43 where: (!= k "___NOSYM_43_NE___")}))
+(count Rsym43_ne) -- 3
+(sum (at Rsym43_ne 'n)) -- 5
+
+;; =====================================================================
+;; 44. totals==NULL branch in fp_try_direct_count1 (lines 1573-1576)
+;;     Requires: inner select WITH WHERE (→ fused path via can_fuse_phase1)
+;;     + outer (> n X) filter (→ use_emit_filter=1, top_count_take=0).
+;;     When top_count_take=0 but use_emit_filter=1, totals[] is skipped
+;;     and the per-worker accumulation loop (lines 1574-1575) fires.
+;;
+;;     IMPORTANT: must NOT wrap the outer select in (count ...) directly,
+;;     because eval.c intercepts (count (select ...)) via
+;;     ray_try_count_select_expr — which calls ray_eval(from_expr) WITHOUT
+;;     setting the group emit filter first.  Use (set R ...) then (count R)
+;;     so the outer select goes through ray_select, which calls
+;;     match_group_count_emit_filter and sets emit_filter before evaluating
+;;     the inner fused group.
+;; =====================================================================
+
+;; U8 key: inner WHERE (> v 15), outer (> n 0) → use_emit_filter=1, top_count_take=0
+(set T44u8 (table [k v] (list (as 'U8 [1 1 2 2 3 3 4 4]) (as 'I64 [10 20 30 40 50 60 70 80]))))
+(set R44u8 (select {from: (select {n: (count v) by: k from: T44u8 where: (> v 15)}) where: (> n 0)}))
+(count R44u8) -- 4
+
+;; BOOL key: same pattern
+(set T44bool (table [k v] (list (as 'BOOL [0 0 1 1 0 1 0 1]) (as 'I64 [1 2 3 4 5 6 7 8]))))
+(set R44bool (select {from: (select {n: (count v) by: k from: T44bool where: (> v 3)}) where: (> n 1)}))
+(count R44bool) -- 2
+
+;; I16 key: same pattern
+(set T44i16 (table [k v] (list (as 'I16 [10 10 20 20 30 30 40 40]) (as 'I64 [1 2 3 4 5 6 7 8]))))
+(set R44i16 (select {from: (select {n: (count v) by: k from: T44i16 where: (> v 2)}) where: (> n 1)}))
+(count R44i16) -- 3
+
+;; =====================================================================
+;; 45. SYM ne-zero topk path (lines 1430-1521)
+;;     Triggered by:
+;;       kt == RAY_SYM && pred_key_ne_zero && use_emit_filter &&
+;;       emit_filter.top_count_take > 0
+;;
+;;     pred_key_ne_zero=1 requires cval==0.  sym_id 0 is the empty string
+;;     "", so (!= k "") compiles to FP_NE with cval=0 on the SYM column
+;;     → pred_key_ne_zero=1.
+;;
+;;     use_emit_filter=1 + top_count_take>0 requires "desc: n take: K"
+;;     in an outer select over this inner fused group.
+;;
+;;     The outer select must NOT be wrapped in (count ...) directly
+;;     (eval.c intercepts that path without setting the emit filter).
+;;     Use (set R ...) → (count R) pattern.
+;; =====================================================================
+
+;; SYM key: 4 distinct non-empty symbols.
+;; WHERE (!= k "") compiles to FP_NE with cval = ray_sym_find("",0) = 0
+;; → cval_in_dict=1, cval==0 → pred_key_ne_zero=1.
+;; We do NOT need actual sym_id-0 rows in the data; the predicate
+;; compilation alone sets pred_key_ne_zero=1.
+;; desc: n take: 3 → top_count_take=3 → lines 1430-1521.
+(set T45sym (table [k v] (list ['a 'a 'a 'b 'b 'c 'c 'c 'c 'd] (as 'I64 (til 10)))))
+;; 'c: 4, 'a: 3, 'b: 2, 'd: 1 — all non-empty, WHERE passes all.
+;; Top-3: 'c(4), 'a(3), 'b(2) → sum=9
+(set R45sym (select {n: (count v) by: k from: T45sym where: (!= k "") desc: n take: 3}))
+(count R45sym) -- 3
+(sum (at R45sym 'n)) -- 9
+
+;; Same pattern, take: all (>=4 distinct keys, not just top-N) → top_count_take=10
+;; makes heap build but doesn't trim → covers heap sift-up/sift-down body.
+(set R45sym_all (select {n: (count v) by: k from: T45sym where: (!= k "") desc: n take: 10}))
+(count R45sym_all) -- 4
+(sum (at R45sym_all 'n)) -- 10
+
+;; Larger SYM table with many rows to exercise morsel loop inside SYM ne0 topk.
+(set N45 2000)
+;; 5 distinct syms cycling.
+(set K45syms ['a 'b 'c 'd 'e 'a 'b 'c 'd 'e 'a 'b 'c 'd 'e 'a 'b 'c 'd 'e])
+(set K45 (at K45syms (% (til N45) 20)))
+(set T45large (table [k v] (list K45 (as 'I64 (til N45)))))
+;; Take top-2 non-empty keys by count.
+(set R45large (select {n: (count v) by: k from: T45large where: (!= k "") desc: n take: 2}))
+(count R45large) -- 2
+
+;; =====================================================================
+;; 46. SYM ne0 topk k_take clamping (line 1448)
+;;     Triggered by: same SYM ne0 topk path but take: > 1024
+;;     → k_take clamped to sizeof(heap)/sizeof(heap[0]) = 1024
+;; =====================================================================
+
+;; Use T45large (2000 rows, 5 distinct syms): take: 2000 > 1024 → line 1448 fires.
+(set R46sym_clamp (select {n: (count v) by: k from: T45large where: (!= k "") desc: n take: 2000}))
+(count R46sym_clamp) -- 5
+
+;; =====================================================================
+;; 47. SYM ne0 topk: fp_direct_count_fn SYM ne0 loop (lines 1264-1268)
+;;     Triggered when SYM ne0 topk path returns NULL (n_slots > limit)
+;;     → falls through to fp_direct_count_fn with pred_key_ne_zero=1,
+;;     kt=RAY_SYM → lines 1264-1268.
+;;
+;;     The n_slots guard at 1432 fires if n_slots > (256<<20)/4 = 67M.
+;;     That's too large to allocate.  Instead we need a path where the
+;;     SYM topk block is NOT entered (top_count_take=0 or use_emit_filter=0)
+;;     so execution falls to fp_direct_count_fn (line 1523+ SYM→NULL
+;;     returns NULL before that).
+;;
+;;     Actually lines 1264-1268 are inside fp_direct_count_fn which handles
+;;     U8/I16/SYM ne0 keys.  But fp_try_direct_count1 for SYM reaches
+;;     lines 1523-1524: "if (ctx->kt == RAY_SYM) return NULL;" — so SYM
+;;     never enters the general fp_direct_count_fn path.  Lines 1264-1268
+;;     would only be hit if the SYM ne0 topk branch at 1430 is NOT taken
+;;     (no emit_filter) AND fp_direct_count_fn is called with a SYM key
+;;     with pred_key_ne_zero.
+;;     → fp_direct_count_fn is a parallel worker; it's called after
+;;       fp_try_direct_count1 returns NULL.  For SYM without topk
+;;       (no desc/take), fp_try_direct_count1 returns a result table
+;;       directly (lines 1523-1524 return NULL only after the SYM topk
+;;       block).  But if use_emit_filter=0 and pred_key_ne_zero=1 for SYM,
+;;       the topk block is skipped (line 1430 false), then line 1523
+;;       returns NULL, so fp_direct_count_fn is NOT called for SYM.
+;;     → Lines 1264-1268 are unreachable from the test harness.
+;;     (Noted as unreachable: fp_try_direct_count1 returns NULL for SYM
+;;      at line 1523 before the fp_direct_count_fn dispatch.)
+;; =====================================================================
+
+;; =====================================================================
+;; 48. I16 ne0 topk k_take clamping (line 1380)
+;;     Triggered by:
+;;       ctx->kt == RAY_I16 && pred_key_ne_zero && use_emit_filter &&
+;;       emit_filter.top_count_take > 0
+;;     AND
+;;       k_take > sizeof(heap)/sizeof(heap[0]) = 1024
+;;     AND
+;;       total_groups > k_take  (condition for entering the heap block)
+;;
+;;     With Ti16ne0 (10 distinct keys): total_groups=10 <= take=2000
+;;     → line 1376 condition false → line 1380 NOT reached.
+;;
+;;     Need: total_groups > k_take > 1024.
+;;     Use 1026+ distinct I16 non-zero keys and take: 1025:
+;;       1026 distinct keys → total_groups = 1026 > k_take = 1025 > 1024
+;;       → line 1379 condition TRUE → line 1380 executes.
+;; =====================================================================
+
+;; 1026 distinct I16 keys in range 1..1026 (all non-zero).
+(set Ni48 1026)
+(set Ki48 (as 'I16 (+ 1 (til Ni48))))
+(set T48i16big (table [k v] (list Ki48 (as 'I64 (til Ni48)))))
+;; take: 1025 > 1024, total_groups = 1026 > 1025 → line 1379 true → line 1380 fires.
+(set R48i16_clamp (select {n: (count v) by: k from: T48i16big where: (!= k 0) desc: n take: 1025}))
+(count R48i16_clamp) -- 1025
+
+;; =====================================================================
+;; 49. fp_compile_cmp case -RAY_I16 (line 753) — analysis note.
+;;
+;;     Line 753 fires when cv->type == -RAY_I16 (I16 atom literal on RHS).
+;;
+;;     Two approaches fail:
+;;     (a) `(as 'I16 5)` inline in WHERE → compile_expr_dag compiles it
+;;         as OP_CAST (not OP_CONST) → rejected at line 639.
+;;     (b) Named variable `(set x (as 'I16 5))` → fp_check_simple_cmp
+;;         line 193 rejects: `(rhs->attrs & RAY_ATTR_NAME)` → returns -1
+;;         → fused path never entered.
+;;
+;;     RFL has no I16 literal syntax (integers default to I64).
+;;     Line 753 is unreachable from RFL through the fused group path.
+;;
+;;     Instead, exercise I16 range-fold path: a large I64 constant
+;;     compared against an I16 column → cval out of range → fold.
+;; =====================================================================
+
+;; I16 column with I64 constant that's out of I16 range → cval > v_max
+;; → fp_compile_cmp folds: FP_NE → FP_FOLD_TRUE → filter passes all rows.
+;; This covers line 793 (FP_NE fold path) for I16 col with out-of-range const.
+(set R49i16fold (select {n: (count v) by: k from: Ti16ev where: (!= k 999999)}))
+(count R49i16fold) -- 10
+(sum (at R49i16fold 'n)) -- 10
+
+;; =====================================================================
+;; 50. SYM ne0 topk heap sift-down (lines 1468-1478)
+;;     Triggered by: SYM key + (!= k "") + desc: n take: K
+;;     where at least K distinct syms (low-count, earlier IDs) fill the
+;;     heap before a later-slotted sym with higher count triggers a
+;;     sift-down replacement.
+;;
+;;     Strategy: intern 3 low-count unique symbols first (count=1 each),
+;;     then 1 high-count symbol (count=5).  With take:3, after the heap
+;;     fills with the 3 count=1 syms, the count=5 sym triggers sift-down.
+;;
+;;     Symbol ID assignment: symbols are interned in the order they appear
+;;     in the list literal, so lo_a < lo_b < lo_c < hi_z (IDs increase).
+;;     Slot enumeration is 0..n_slots-1, so low-ID syms are processed
+;;     first → heap fills with count=1 before count=5 is seen.
+;; =====================================================================
+
+(set T50sym (table [k v] (list ['cov50_lo_a 'cov50_lo_b 'cov50_lo_c 'cov50_hi_z 'cov50_hi_z 'cov50_hi_z 'cov50_hi_z 'cov50_hi_z] (as 'I64 (til 8)))))
+;; cov50_lo_a: count=1, cov50_lo_b: count=1, cov50_lo_c: count=1
+;; cov50_hi_z: count=5
+;; With take:3 and WHERE (!= k ""):
+;;   Heap fills with {1,1,1} from lo_a/lo_b/lo_c (lower IDs)
+;;   Then cov50_hi_z (higher ID, count=5) → 5 > heap[0]=1 → sift-down fires!
+(set R50sym (select {n: (count v) by: k from: T50sym where: (!= k "") desc: n take: 3}))
+(count R50sym) -- 3
+;; Top-3: cov50_hi_z(5) + two of the lo_ syms(1 each) = 7
+(sum (at R50sym 'n)) -- 7
+
+;; =====================================================================
+;; 51. Wide key MIN/MAX new-slot init (lines 2718-2721 in mk_par_fn)
+;;     Lines 2679-2682 (narrow MIN/MAX init) are already covered.
+;;     Lines 2718-2721 (wide MIN/MAX init) require total_bytes > 8.
+;;     Two I64 keys = 8+8=16 bytes > 8 → wide=1.
+;;     Minimal test: 2 rows, 2 distinct (k1,k2) pairs → 2 new wide slots.
+;;     MIN init sets INT64_MAX (line 2719), MAX sets INT64_MIN (line 2721).
+;; =====================================================================
+
+;; Two distinct I64 key pairs, MIN agg over I64 value column.
+(set T51 (table [k1 k2 v] (list (as 'I64 [100 200]) (as 'I64 [0 0]) (as 'I64 [42 99]))))
+(set R51 (select {lo: (min v) by: [k1 k2] from: T51 where: (>= v 0)}))
+(count R51) -- 2
+(min (at R51 'lo)) -- 42
+(max (at R51 'lo)) -- 99
+
+;; Also MAX agg to cover line 2720-2721:
+(set R51mx (select {hi: (max v) by: [k1 k2] from: T51 where: (>= v 0)}))
+(count R51mx) -- 2
+(min (at R51mx 'hi)) -- 42
+(max (at R51mx 'hi)) -- 99
+
+;; ====================================================================
+;; Section 52: mk_eq_i64_count_fn + FP_LIKE child via fp_eval_cmp_one
+;;
+;; A composite predicate `(and (== int_col K) (like text_col "pat"))`
+;; routes through the multi-key count fast-path: mk_find_i64_eq_child
+;; picks the FP_EQ on i64 as the gating predicate; remaining children
+;; (here FP_LIKE on SYM or STR) are evaluated per-row via
+;; fp_eval_cmp_one at line 2576.
+;;
+;; Regression for prior bug: fp_eval_cmp_one's FP_LIKE arm returned 0
+;; for ALL column types — LIKE filter was silently no-match, the
+;; entire composite predicate evaluated false, the query returned
+;; zero rows.  Fix mirrors the bulk fp_eval_cmp LIKE logic (sym
+;; like_lut cache + ray_str_vec_get for STR + ray_glob_match).
+;; ====================================================================
+(set T52 (table [k1 k2 fc s] (list [1 2 3 1 2] [10 20 30 10 20] [0 0 0 1 0] (as 'SYM ['apple 'banana 'apricot 'apple 'banana]))))
+
+;; (== fc 0) gates 4 rows; (like s "a*") then filters to apple/apricot.
+;; Distinct (k1,k2) survivors: (1,10) and (3,30) — 2 groups.
+(set R52sym (select {n: (count k1) by: [k1 k2] from: T52 where: (and (== fc 0) (like s "a*"))}))
+(count R52sym) -- 2
+(sum (at R52sym 'n)) -- 2
+
+;; STR column variant — exercises fp_eval_cmp_one's RAY_STR arm.
+(set T52s (table [k1 k2 fc s] (list [1 2 3 1 2] [10 20 30 10 20] [0 0 0 1 0] (list "apple" "banana" "apricot" "apple" "banana"))))
+(set R52str (select {n: (count k1) by: [k1 k2] from: T52s where: (and (== fc 0) (like s "a*"))}))
+(count R52str) -- 2
+(sum (at R52str 'n)) -- 2
+
+;; ====================================================================
+;; Section 53: fp_try_i32_mg_top_count via `select count by k take N desc`
+;;
+;; Regression for Bug C: the no-WHERE count-key DAG decision
+;; (query.c:~7541) reads ray_group_emit_filter_get() at compile time.
+;; Before the fix the emit filter was only set AFTER DAG construction
+;; (between compile and execute), so the read always saw enabled=false
+;; and the fp_try_i32_mg_top_count optimisation never fired —
+;; 160 regions of specialised i32-multi-key top-count code were
+;; permanently unreachable.
+;;
+;; Fix: hoist match_group_desc_count_take to before the by_expr branch
+;; and feed the pre-computed filter into the compile-time decision.
+;; The actual thread-local set is still deferred to immediately before
+;; ray_execute so state leakage on error paths is unchanged.
+;;
+;; Shape: i32 single key + COUNT + `take N desc n` -- the canonical
+;; ClickBench q32 / q33 pattern.
+;; ====================================================================
+(set T53 (table [k v] (list (as 'I32 [1 2 3 4 5 1 2 3 4 5 1 2 1 1]) [10 20 30 40 50 60 70 80 90 100 110 120 130 140])))
+(set R53 (select {n: (count v) from: T53 by: k take: 3 desc: n}))
+(count R53) -- 3
+(at (at R53 'n) 0) -- 5
+(at (at R53 'n) 1) -- 3
+(at (at R53 'n) 2) -- 2
+(at (at R53 'k) 0) -- 1
+(at (at R53 'k) 1) -- 2
+(at (at R53 'k) 2) -- 3

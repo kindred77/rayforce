@@ -1,0 +1,230 @@
+;; ════════════════════════════════════════════════════════════════════
+;; group_ht_grow.rfl — targeted coverage for HT grow paths and
+;; scatter-buffer growth paths in group.c rowform functions.
+;;
+;; Targets:
+;;   1. grpmm_ht_grow_slots  (line 10463): maxmin rowform, >4096 groups/part
+;;   2. grpmm_ht_grow_entries (line 10487): same condition
+;;   3. grpmm_scat_push growth (line 10545): >256 rows/partition
+;;   4. grpms_scat_push growth (line 11006): >256 rows/partition in
+;;      median+stddev rowform with serial path
+;;   5. grpms_ht_grow_slots  (line 10910): already triggered by Tms_g
+;;      in group_rowforms.rfl; this file adds an explicit large-N serial
+;;      path that keeps n_workers=1 to drive the serial code branches
+;;   6. exec_group_maxmin_rowform empty-table SYM key branch (line 10673)
+;;   7. grpsc_scat_push growth (line 11639): >256 rows/partition in
+;;      sum_count rowform (already hit by group_coverage_boost Tsc_g2
+;;      with 100k rows; included here for explicitness)
+;;   8. F64 value column in grpsc_phase1_fn (v_is_f64=true path, line 11669)
+;;
+;; NOTE: grpmm_ht_grow_* requires approximately 1.2M distinct keys so
+;; that each of the 256 radix partitions receives ~4688 distinct groups,
+;; exceeding the initial entry_cap of 4096.  Tests 1+2 use N=1,200,000
+;; rows with k=0..1199999 (all distinct).
+;; ════════════════════════════════════════════════════════════════════
+
+;; ─── 1+2+3. grpmm_ht_grow_slots/entries + grpmm_scat_push growth ──────
+;; 1.2M distinct I64 keys; each radix partition receives ~4688 distinct
+;; groups, exceeding the initial entry_cap=4096 and slot grow threshold.
+;; Serial path (nrows < 16384 per chunk): n_workers=1 for phase2 dispatch
+;; since the rowform uses parallel when nrows >= 16384 — here nrows=1.2M
+;; so parallel path fires, but all 1.2M rows get distributed across 256
+;; partitions and the HT for each partition must grow.
+;; Also: init_cap=256 for scatter bufs; 1.2M/256 ≈ 4688 per partition
+;; exceeds 256 → grpmm_scat_push growth fires in phase1.
+(set Tmm_htg (table [k x y] (list (as 'I64 (til 1200000)) (as 'I64 (til 1200000)) (as 'I64 (til 1200000)))))
+(set Rmm_htg (select {mx: (max x) mn: (min y) by: k from: Tmm_htg}))
+;; 1.2M distinct keys → 1.2M output groups.
+(count Rmm_htg) -- 1200000
+;; max(x) per group = k (x=k), so sum of all max-x = 0+1+...+1199999
+(< (abs (- (sum (at Rmm_htg 'mx)) 719999400000.0)) 1.0) -- true
+
+;; ─── 4. grpms parallel path — N=70000 (2-key median+stddev) ─────────
+;; N=70000 uses the parallel path (nrows >= 16384).  Each of 8 workers
+;; processes ~8750 rows, scattering ~34 entries per partition per worker.
+;; The grpms_phase2_fn init_ht logic: init_ht starts at 64 and doubles
+;; while < total_entries/4.  With ~273 total entries per partition:
+;; init_ht = 64 (64 >= 273/4=68 is false; 128 >= 68 — wait 64<68 so
+;; init_ht becomes 128) → cap=128, entry_cap=64.  With up to ~273 distinct
+;; groups per partition, grpms_ht_grow fires multiple times.
+;; NOTE: grpms_scat_push growth (per-worker buf overflow) is unreachable
+;; in parallel builds with N < 512k (each worker gets < 256 entries/partition).
+(set Tms_70k (table [k0 k1 v] (list (as 'I64 (% (til 70000) 2000)) (as 'I64 (% (til 70000) 700)) (as 'I64 (til 70000)))))
+(set Rms_70k (select {m: (med v) s: (stddev v) by: [k0 k1] from: Tms_70k}))
+;; At most lcm(2000,700)=14000 distinct (k0,k1) pairs; 70000 rows so each
+;; group has on average 5 rows.
+(> (count Rms_70k) 100) -- true
+(> (sum (at Rms_70k 'm)) 0.0) -- true
+
+;; ─── 6. exec_group_maxmin_rowform — empty table with SYM key ──────────
+;; nrows=0 with SYM key type fires the empty-table branch at line 10671.
+;; Line 10673: `ray_sym_vec_new(k_vec->attrs & RAY_SYM_W_MASK, 0)`.
+(set Tmm_e_sym (table [k x y] (list (as 'SYM []) (as 'I64 []) (as 'I64 []))))
+(set Rmm_e_sym (select {mx: (max x) mn: (min y) by: k from: Tmm_e_sym}))
+(count Rmm_e_sym) -- 0
+
+;; ─── 8. F64 value column in grpsc_phase1_fn (v_is_f64=true path) ─────
+;; exec_group_sum_count_rowform with F64 value column.
+;; v_is_f64=true triggers line 11669: `memcpy(&v_bits, &((const double*)c->v_data)[r], 8)`.
+(set Tsc_f64v (table [k1 k2 k3 v] (list (as 'I64 (% (til 10000) 100)) (as 'I64 (% (til 10000) 50)) (as 'I64 (% (til 10000) 20)) (* 0.5 (as 'F64 (til 10000))))))
+(set Rsc_f64v (select {s: (sum v) c: (count v) by: [k1 k2 k3] from: Tsc_f64v}))
+(> (count Rsc_f64v) 0) -- true
+;; sum of all v = 0.5 * (0+1+...+9999) = 0.5 * 49995000 = 24997500.0
+(< (abs (- (sum (at Rsc_f64v 's)) 24997500.0)) 1.0) -- true
+
+;; F64 val, parallel path (N >= 16384)
+(set Tsc_f64vp (table [k1 k2 k3 v] (list (as 'I64 (% (til 20000) 100)) (as 'I64 (% (til 20000) 50)) (as 'I64 (% (til 20000) 20)) (* 1.0 (as 'F64 (til 20000))))))
+(set Rsc_f64vp (select {s: (sum v) c: (count v) by: [k1 k2 k3] from: Tsc_f64vp}))
+(> (count Rsc_f64vp) 0) -- true
+;; sum of all v = 0+1+...+19999 = 199990000.0
+(< (abs (- (sum (at Rsc_f64vp 's)) 199990000.0)) 1.0) -- true
+
+;; ─── grpms_ht_grow serial path with small N (forces serial branch) ────
+;; N < 16384 uses serial path (grpms_phase2_fn with n_workers=1).
+;; With 5000 rows and many distinct 2-key groups, each partition receives
+;; ~195 entries; init_ht=64 → grows 3 times (32→64→128→256 caps).
+(set Tms_ser (table [k0 k1 v] (list (as 'I64 (% (til 5000) 100)) (as 'I64 (% (til 5000) 51)) (as 'I64 (til 5000)))))
+(set Rms_ser (select {m: (med v) s: (stddev v) by: [k0 k1] from: Tms_ser}))
+;; lcm(100, 51) = 5100 > 5000 so all (k0,k1) pairs are distinct within 5000 rows
+(> (count Rms_ser) 100) -- true
+(> (sum (at Rms_ser 'm)) 0.0) -- true
+
+;; ─── grpms_ht_grow with count col (with_count=true) ──────────────────
+;; Serial 2-key median+stddev+count with many distinct groups per partition
+;; exercises grpms_ht_grow on the with_count code path.
+(set Tms_cnt (table [k0 k1 v] (list (as 'I64 (% (til 8000) 100)) (as 'I64 (% (til 8000) 81)) (as 'I64 (til 8000)))))
+(set Rms_cnt (select {m: (med v) s: (stddev v) c: (count v) by: [k0 k1] from: Tms_cnt}))
+;; lcm(100,81)=8100 > 8000 so all pairs distinct in range
+(> (count Rms_cnt) 100) -- true
+;; Each group has at most a few rows; total count = sum of group sizes = 8000
+(== (sum (at Rms_cnt 'c)) 8000) -- true
+
+;; ─── grpms_phase3_fn stddev cnt<2 null path ──────────────────────────
+;; Groups with exactly 1 row have cnt=1 < 2, triggering the null branch
+;; for stddev at line 11194: `ray_vec_set_null(c->std_vec, out_row, true)`.
+;; Use distinct (k0,k1) keys so every group has exactly 1 row.
+(set Tms_1row (table [k0 k1 v] (list (as 'I64 (til 10)) (as 'I64 (til 10)) (as 'F64 [1.0 2.0 3.0 4.0 5.0 6.0 7.0 8.0 9.0 10.0]))))
+(set Rms_1row (select {m: (med v) s: (stddev v) by: [k0 k1] from: Tms_1row}))
+(count Rms_1row) -- 10
+;; stddev for single-row groups should be null
+(nil? (at (at Rms_1row 's) 0)) -- true
+
+;; ─── Empty table SYM key paths ────────────────────────────────────────
+;; exec_group_pearson_rowform nrows==0 with SYM key (line 10193 SYM branch)
+(set Tprf_sym_e (table [k x y] (list (as 'SYM []) (as 'F64 []) (as 'F64 []))))
+(set Rprf_sym_e (select {r: (pearson_corr x y) by: k from: Tprf_sym_e}))
+(count Rprf_sym_e) -- 0
+
+;; exec_group_median_stddev_rowform nrows==0 with SYM keys (line 11261-11264 SYM branch)
+(set Tms_sym_e (table [k0 k1 v] (list (as 'SYM []) (as 'SYM []) (as 'I64 []))))
+(set Rms_sym_e (select {m: (med v) s: (stddev v) by: [k0 k1] from: Tms_sym_e}))
+(count Rms_sym_e) -- 0
+
+;; exec_group_sum_count_rowform nrows==0 with SYM keys (line 11842 SYM branch)
+(set Tsc_sym_e (table [k1 k2 k3 v] (list (as 'SYM []) (as 'SYM []) (as 'SYM []) (as 'I64 []))))
+(set Rsc_sym_e (select {s: (sum v) c: (count v) by: [k1 k2 k3] from: Tsc_sym_e}))
+(count Rsc_sym_e) -- 0
+
+;; exec_group_maxmin_rowform nrows>0 with SYM key — output SYM write path
+;; Line 10800: write_col_i64(k_dst, row, e->key, kt=RAY_SYM, k_vec->attrs)
+;; Also line 10310-10311: k0_out = ray_sym_vec_new(...) in Pearson rowform.
+(set Tmm_sym_data (table [k x y] (list ['alpha 'alpha 'beta 'beta 'gamma 'gamma] (as 'I64 [1 2 3 4 5 6]) (as 'I64 [10 5 30 20 50 40]))))
+(set Rmm_sym_data (select {mx: (max x) mn: (min y) by: k from: Tmm_sym_data}))
+(count Rmm_sym_data) -- 3
+(sum (at Rmm_sym_data 'mx)) -- 12
+(sum (at Rmm_sym_data 'mn)) -- 65
+
+;; exec_group_pearson_rowform with SYM key and data (line 10310-10311 SYM k0_out)
+(set Tprf_sym_d (table [k x y] (list ['a 'a 'a 'b 'b 'b] (as 'F64 [1.0 2.0 3.0 4.0 5.0 6.0]) (as 'F64 [2.0 4.0 6.0 8.0 10.0 12.0]))))
+(set Rprf_sym_d (select {r: (pearson_corr x y) by: k from: Tprf_sym_d}))
+(count Rprf_sym_d) -- 2
+;; k=a and k=b have perfect correlation (y=2*x) → r^2=1.0
+(< (abs (- (min (at Rprf_sym_d 'r)) 1.0)) 0.001) -- true
+
+;; 2-key pearson with first key SYM (exercises k0_out SYM branch in emit, line 10310)
+(set Tprf_2sym (table [k1 k2 x y] (list ['a 'a 'b 'b] (as 'I64 [0 0 0 0]) (as 'F64 [1.0 2.0 3.0 4.0]) (as 'F64 [2.0 4.0 6.0 8.0]))))
+(set Rprf_2sym (select {r: (pearson_corr x y) by: [k1 k2] from: Tprf_2sym}))
+(count Rprf_2sym) -- 2
+(< (abs (- (min (at Rprf_2sym 'r)) 1.0)) 0.001) -- true
+
+;; 2-key pearson with second key SYM (exercises k1_out SYM branch in emit, line 10315)
+(set Tprf_sym2 (table [k1 k2 x y] (list (as 'I64 [1 1 2 2]) ['a 'a 'b 'b] (as 'F64 [1.0 2.0 3.0 4.0]) (as 'F64 [2.0 4.0 6.0 8.0]))))
+(set Rprf_sym2 (select {r: (pearson_corr x y) by: [k1 k2] from: Tprf_sym2}))
+(count Rprf_sym2) -- 2
+(< (abs (- (min (at Rprf_sym2 'r)) 1.0)) 0.001) -- true
+
+;; ─── SYM key in median+stddev rowform with data ───────────────────────
+;; exec_group_median_stddev_rowform with k0=SYM, k1=SYM.
+;; Exercises grpms_phase3_fn write_col_i64(k0_out, row, key0, RAY_SYM, attrs)
+;; at line 11180-11181. Also k0_out = ray_sym_vec_new(...) at line 11391.
+(set Tms_sym_d (table [k0 k1 v] (list ['a 'a 'a 'b 'b 'b] ['x 'x 'x 'y 'y 'y] (as 'I64 [1 2 3 4 5 6]))))
+(set Rms_sym_d (select {m: (med v) s: (stddev v) by: [k0 k1] from: Tms_sym_d}))
+(count Rms_sym_d) -- 2
+;; k0=a,k1=x: med([1,2,3])=2.0; k0=b,k1=y: med([4,5,6])=5.0
+(< (abs (- (sum (at Rms_sym_d 'm)) 7.0)) 0.01) -- true
+
+;; ─── SYM key in sum_count rowform with data ───────────────────────────
+;; exec_group_sum_count_rowform with SYM keys.
+;; Exercises grpsc_phase3_fn write_col_i64 with RAY_SYM key type (line 11774).
+;; Also key_outs[k] = ray_sym_vec_new(...) at line 11966-11967.
+(set Tsc_sym_d (table [k1 k2 k3 v] (list ['a 'a 'b 'b] ['x 'x 'y 'y] ['p 'p 'q 'q] (as 'I64 [10 20 30 40]))))
+(set Rsc_sym_d (select {s: (sum v) c: (count v) by: [k1 k2 k3] from: Tsc_sym_d}))
+(count Rsc_sym_d) -- 2
+;; (a,x,p): 10+20=30; (b,y,q): 30+40=70
+(< (abs (- (sum (at Rsc_sym_d 's)) 100.0)) 0.01) -- true
+
+;; ─── grpc_ht_grow_slots/entries (lines 9886/9917) ─────────────────────
+;; grpc_ht_init(ph, 8192) → cap=8192, entry_cap=4096.  Growth fires
+;; when count reaches 4096 per partition.  With N=1.1M distinct keys
+;; and 256 partitions: ~4297 groups per partition → every partition
+;; triggers grpc_ht_grow_slots and grpc_ht_grow_entries.
+;; Also fires grpc_scat_push growth: N/256 ≈ 4297 >> init_cap=256.
+(set Tprf_htg (table [k x y] (list (as 'I64 (til 1100000)) (* 0.001 (as 'F64 (til 1100000))) (* 0.002 (as 'F64 (til 1100000))))))
+(set Rprf_htg (select {r: (pearson_corr x y) by: k from: Tprf_htg}))
+;; 1.1M distinct keys, each group has 1 row → cnt=1 < 2 → r² = NaN for all
+(count Rprf_htg) -- 1100000
+
+;; ─── grpms_scat_push growth (line 11006) ─────────────────────────────
+;; init_cap=256 per worker per partition.  Need N/n_workers/256 > 256
+;; → N > 256 * 8 * 256 = 524288.  Use N=600000.
+;; 600000 / 8 workers = 75000 per worker; 75000 / 256 partitions ≈ 293 > 256.
+;; k0 = i%2000, k1 = i%700 → lcm(2000,700)=14000 distinct pairs; each with
+;; 600000/14000 ≈ 43 rows.
+(set Tms_scat (table [k0 k1 v] (list (as 'I64 (% (til 600000) 2000)) (as 'I64 (% (til 600000) 700)) (as 'I64 (til 600000)))))
+(set Rms_scat (select {m: (med v) s: (stddev v) by: [k0 k1] from: Tms_scat}))
+;; expect at most 14000 distinct (k0,k1) groups
+(> (count Rms_scat) 100) -- true
+;; sum of all medians should be positive
+(> (sum (at Rms_scat 'm)) 0.0) -- true
+
+;; ─── grpsc_scat_push growth (line 11639) ─────────────────────────────
+;; init_cap=256 per worker per partition.  Need N/n_workers/256 > 256.
+;; Use N=600000 with 3 keys.
+;; k1=i%2000, k2=i%700, k3=i%50 → lcm(2000,700,50)=14000 distinct triples.
+(set Tsc_scat (table [k1 k2 k3 v] (list (as 'I64 (% (til 600000) 2000)) (as 'I64 (% (til 600000) 700)) (as 'I64 (% (til 600000) 50)) (as 'I64 (til 600000)))))
+(set Rsc_scat (select {s: (sum v) c: (count v) by: [k1 k2 k3] from: Tsc_scat}))
+(> (count Rsc_scat) 100) -- true
+;; sum of all v = 0+1+...+599999 = 600000*599999/2 = 179999700000
+(< (abs (- (sum (at Rsc_scat 's)) 179999700000.0)) 1.0) -- true
+
+;; ─── Pearson rowform dx=0 or dy=0 (inner if-branch not taken) ─────────
+;; Group where all x values are the same (dx=n*sumsq_x - sum_x^2 = 0)
+;; or all y values the same (dy=0). cnt>=2 branch is entered but the
+;; inner `if (dx > 0.0 && dy > 0.0)` is NOT taken → r2 stays as NaN.
+;; k=1: x all=5 → dx=0; k=2: y all=10 → dy=0; k=3: both constant.
+(set Tprf_const (table [k x y] (list (as 'I64 [1 1 1 2 2 2 3 3 3]) (as 'F64 [5.0 5.0 5.0 1.0 2.0 3.0 7.0 7.0 7.0]) (as 'F64 [1.0 2.0 3.0 10.0 10.0 10.0 9.0 9.0 9.0]))))
+(set Rprf_const (select {r: (pearson_corr x y) by: k from: Tprf_const}))
+(count Rprf_const) -- 3
+;; all three groups have r2=NaN (undefined) since either dx=0 or dy=0
+
+;; ─── Pearson rowform: nullable I64 key (grpc_is_null I64 path) ─────────
+;; The planner routes nullable I64 key through exec_group_pearson_rowform
+;; (no HAS_NULLS check in prf_ok gate). grpc_phase1_fn calls grpc_is_null
+;; for each row with k0_has_nulls=true, skipping null-key rows.
+(set Tprf_nk (table [k x y] (list (as 'I64 [1 0N 2 1 0N 2]) (as 'F64 [1.0 2.0 3.0 4.0 5.0 6.0]) (as 'F64 [2.0 4.0 6.0 8.0 10.0 12.0]))))
+(set Rprf_nk (select {r: (pearson_corr x y) by: k from: Tprf_nk}))
+;; null-key rows are skipped; k=1 and k=2 each have 2 non-null rows.
+(count Rprf_nk) -- 2
+;; k=1: (1.0,2.0)(4.0,8.0) → y=2*x → r=1.0
+;; k=2: (3.0,6.0)(6.0,12.0) → y=2*x → r=1.0
+(< (abs (- (min (at Rprf_nk 'r)) 1.0)) 0.001) -- true

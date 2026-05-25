@@ -1,0 +1,222 @@
+;; eval.c coverage round 3 — targets uncovered regions from PR #212 analysis.
+;; Focus: do_cache block, gather_by_idx paths, VM null-arg paths.
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 1. do_cache block (eval.c lines 1490-1587)
+;;    Activated when g_ray_profile.active is true.
+;;    (do expr null) pattern triggers do_cache_hash(args[0]) and
+;;    do_null_cache_put when result == NULL.
+;; ═══════════════════════════════════════════════════════════════════
+
+;; Turn on profiling
+(.sys.timeit 1) -- 1
+
+;; Simple (do (+ 1 2) null) — args[0] is a RAY_LIST expression
+;; Covers: do_cache_is_null_name → true, do_cache_contains_set → false,
+;;         do_cache_hash → RAY_LIST branch (1502-1505),
+;;         elements include -RAY_SYM (sym atoms for + name) and -RAY_I64 (1,2)
+;;         do_null_cache_put fires when result == NULL (null eval).
+(do (+ 1 2) null) -- null
+
+;; Second call with same expr → do_null_cache_get returns true → cached NULL
+(do (+ 1 2) null) -- null
+
+;; Different expressions to cover other hash type branches
+
+;; args[0] = f64 atom (−RAY_F64 branch, lines 1534-1537)
+(do 1.5 null) -- null
+(do 1.5 null) -- null
+
+;; args[0] = str atom (-RAY_STR branch, lines 1516-1520)
+(do "hello" null) -- null
+(do "hello" null) -- null
+
+;; args[0] = i32 atom (-RAY_I32 branch, lines 1525-1528)
+(do 1i null) -- null
+(do 1i null) -- null
+
+;; args[0] = i16 atom (-RAY_I16 branch, lines 1529-1530)
+(do 1h null) -- null
+(do 1h null) -- null
+
+;; args[0] = bool atom (-RAY_BOOL branch, lines 1531-1533)
+(do true null) -- null
+(do true null) -- null
+
+;; args[0] = sym atom (-RAY_SYM branch, lines 1521-1524)
+(do 'mysym null) -- null
+(do 'mysym null) -- null
+
+;; args[0] = LIST containing nested list (recursive hash branch)
+(do (+ (+ 1 2) 3) null) -- null
+(do (+ (+ 1 2) 3) null) -- null
+
+;; Expr with (set ...) → do_cache_contains_set → true → no caching
+;; (do_cache_contains_set is true when arg[0] contains a set form)
+;; Just verify it runs normally (no crash)
+(do (set _dcov_x 42) null) -- null
+_dcov_x -- 42
+
+;; do_cache_contains_set: nested set (recursive branch, line 1553-1554)
+(do (+ (set _dcov_y 5) 1) null) -- null
+_dcov_y -- 5
+
+;; Turn off profiling
+(.sys.timeit 0) -- 0
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 2. gather_by_idx SYM (eval.c lines 1134-1161)
+;;    xasc on a table where a SYM column exercises the SYM gather path.
+;;    SYM columns don't support null bitmaps by design, so lines 1150-1153
+;;    are unreachable. Lines 1158-1160 require sym_dict on the column —
+;;    not settable from RFL directly.
+;;    This test covers the SYM gather switch branches (lines 1143-1147)
+;;    via sort on a table with a SYM column.
+;; ═══════════════════════════════════════════════════════════════════
+(set t_sn (table ['s 'v] (list (as 'SYM ['b 'a 'c]) [20 10 30])))
+(set t_sorted (xasc t_sn 'v))
+;; After sort by v: row v=10 is first, s='a
+(at (at t_sorted 's) 0) -- 'a
+(at (at t_sorted 'v) 0) -- 10
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 3. gather_by_idx LIST (eval.c lines 1165-1177)
+;;    Sort a table where a column is a RAY_LIST (non-atomic elements)
+;;    triggers the LIST gather path.
+;; ═══════════════════════════════════════════════════════════════════
+;; Build a table with a LIST column (vector of vectors) and a sort key
+(set vcol (list [3 3] [1 1] [2 2]))
+(set t_list_col (table ['k 'v] (list [30 10 20] vcol)))
+;; Sort by k → v column (RAY_LIST) gets gathered
+(set t_list_sorted (xasc t_list_col 'k))
+;; After sort by k: row with k=10 is first, so v[0] = [1 1]
+(at (at (at t_list_sorted 'v) 0) 0) -- 1
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 4. gather_by_idx typed vec null bitmap propagation (eval.c lines 1196-1199)
+;;    Sort a table where a numeric column has nulls — exercises the
+;;    null-bitmap propagation in the generic typed-gather path.
+;; ═══════════════════════════════════════════════════════════════════
+(set t_null_i (table ['k 'v] (list [3 1 2] [30 0Nl 20])))
+(set t_ni_s (xasc t_null_i 'k))
+;; After sort by k: row k=1 first, v=null
+(nil? (at (at t_ni_s 'v) 0)) -- true
+(at (at t_ni_s 'v) 1) -- 20
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 5. do_cache_hash RAY_DICT branch (lines 1506-1508)
+;;    args[0] is a dict expression. Use (select {...}) as the first arg.
+;; ═══════════════════════════════════════════════════════════════════
+(.sys.timeit 1) -- 1
+
+;; A (select ...) expr contains a dict literal in the AST
+(set _t5 (table ['k 'v] (list [1 2 3] [10 20 30])))
+(do (select {from: _t5 s: (sum v)}) null) -- null
+(do (select {from: _t5 s: (sum v)}) null) -- null
+
+(.sys.timeit 0) -- 0
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 6. do_cache_hash RAY_STR vec branch (lines 1509-1515)
+;;    args[0] IS a RAY_STR vec literal (the parser creates a RAY_STR vec
+;;    directly from ["str" "str2"] syntax).  do_cache_hash sees a RAY_STR
+;;    and walks its elements to build the hash.
+;; ═══════════════════════════════════════════════════════════════════
+(.sys.timeit 1) -- 1
+
+;; args[0] = ["hello" "world"] — a RAY_STR vec in the AST directly
+;; → do_cache_hash sees x->type == RAY_STR → lines 1510-1515 covered
+(do ["hello" "world"] null) -- null
+(do ["hello" "world"] null) -- null   ;; cache hit
+
+;; Multiple STR elements to exercise the inner char-by-char loop
+(do ["abc" "de" "f"] null) -- null
+(do ["abc" "de" "f"] null) -- null   ;; cache hit
+
+(.sys.timeit 0) -- 0
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 7. gather_by_idx STR with nulls (eval.c lines 1121-1124)
+;;    Sort a table where a STR column has nulls.
+;;    (as 'STR [1 0Nl 2]) creates a STR vec with HAS_NULLS set.
+;; ═══════════════════════════════════════════════════════════════════
+(set t_str_n (table ['s 'k] (list (as 'STR [1 0Nl 2]) [2 1 3])))
+(set t_str_s (xasc t_str_n 'k))
+;; After sort by k: row k=1 is first, s[0] = null str
+(nil? (at (at t_str_s 's) 0)) -- true
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 8. affine_sum_cache: vec has RAY_ATTR_HAS_NULLS → cache bypass
+;;    (try_sum_affine_expr lines 211-215)
+;; ═══════════════════════════════════════════════════════════════════
+;; Build a vec with nulls via table extraction
+(set t_an (table ['v] (list [1 0Nl 3])))
+(set v_n (at t_an 'v))
+;; (sum (+ v_n 1)): try_sum_affine_expr detects HAS_NULLS → handled=0
+;; falls back to normal evaluation: sum of [2, null, 4] = 6
+(sum (+ v_n 1)) -- 6
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 9. to_boxed_list error path (eval.c lines 326-329)
+;;    collection_elem returns an error for an out-of-bounds index.
+;;    This is exercised when atomic_map calls it and it fails.
+;;    (map fn coll) where coll has an element that errors is covered
+;;    by prior tests. The to_boxed_list path needs a typed vec where
+;;    collection_elem fails — structurally unreachable from RFL.
+;; ═══════════════════════════════════════════════════════════════════
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 10. atomic_map_binary_parted error path (eval.c lines 406-424)
+;;     binary op on two parted collections where one segment errors.
+;;     This requires parted data from .db.parted — skip (needs files).
+;; ═══════════════════════════════════════════════════════════════════
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 11. do_cache: n != 2 — not triggered (guard n == 2 fails)
+;;     (do x y z) — 3 args → null_cache_hash stays 0
+;; ═══════════════════════════════════════════════════════════════════
+(.sys.timeit 1) -- 1
+;; 3-arg do — does NOT hit the cache path (n != 2)
+(do (+ 1 1) (+ 2 2) null) -- null
+(.sys.timeit 0) -- 0
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 12. ray_table_fn: col_vec OOM path (lines 1331, 1374)
+;;     Only reachable on allocation failure — structurally unreachable.
+;; ═══════════════════════════════════════════════════════════════════
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 13. call_lambda tree-walk path (eval.c lines 1812-1813)
+;;     A lambda that fails compilation runs via tree-walk.
+;;     The reserved-param guard fires BEFORE compilation
+;;     (ray_fn at line 1640), returning an error from ray_fn itself.
+;;     jump-offset overflow (body > 32767 bytes) is impractical.
+;;     tree-walk success (lines 1812-1813) appears unreachable from RFL.
+;; ═══════════════════════════════════════════════════════════════════
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 14. numeric_atom_i64 -RAY_U8 case (eval.c line 145)
+;;     0x01 is a -RAY_U8 hex literal atom.
+;;     try_sum_affine_expr calls numeric_atom_i64(c_expr) on the constant
+;;     in (+ vec c).  When c is a U8 atom, line 145 fires.
+;; ═══════════════════════════════════════════════════════════════════
+(sum (+ [1 2 3] 0x01)) -- 9
+(sum (+ [10 20 30] 0xff)) -- 825
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 15. op_callf RAY_UNARY lazy materialize (eval.c lines 2152-2154)
+;;     When a builtin function is passed as a lambda parameter,
+;;     the compiler emits OP_CALLF (not OP_CALL1) at the call site.
+;;     (sum v) pushes a LAZY value onto the VM stack; op_callf then
+;;     calls ray_lazy_materialize before invoking the unary fn.
+;; ═══════════════════════════════════════════════════════════════════
+((fn [f v] (f (sum v))) neg [1 2 3]) -- -6
+((fn [f v] (f (sum v))) abs [-5 -3 -1]) -- 9
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 16. op_callf RAY_BINARY lazy materialize both args (eval.c lines 2165-2167, 2169-2171)
+;;     Same mechanism: both args are LAZY because (sum v) returns lazy.
+;;     op_callf materializes each lazy arg before the binary call.
+;; ═══════════════════════════════════════════════════════════════════
+((fn [f v] (f (sum v) (sum v))) + [1 2 3]) -- 12
+((fn [f v] (f (sum v) (sum v))) * [2 3 4]) -- 81

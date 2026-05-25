@@ -1,3 +1,5 @@
+/* _POSIX_C_SOURCE: setenv / unsetenv (POSIX.1-2008) */
+#define _POSIX_C_SOURCE 200809L
 /*
  *   Copyright (c) 2025-2026 Anton Kundenko <singaraiona@gmail.com>
  *   All rights reserved.
@@ -38,6 +40,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <sys/stat.h>
 
 /* ---- Setup / Teardown -------------------------------------------------- */
 
@@ -689,6 +692,358 @@ static test_result_t test_validate_sym_zero_col_table(void) {
     PASS();
 }
 
+/* =========================================================================
+ * 18. ray_splay_save_bulk: durable=false + sym_path != NULL → hits the
+ *     ray_sym_save_bulk branch (line 78 of splay.c).
+ *     ray_splay_save_bulk is the only caller that sets durable=false.
+ *     Previous tests only called ray_splay_save (durable=true), so
+ *     ray_sym_save_bulk was never invoked.
+ * ========================================================================= */
+static test_result_t test_save_bulk_with_sym_path(void) {
+    const char* dir      = TMP_SPLAY_BASE "/bulk_sym";
+    const char* sym_path = TMP_SPLAY_BASE "/bulk_sym.sym";
+    rm_rf(dir);
+    unlink(sym_path);
+
+    int64_t id_w = ray_sym_intern("wval", 4);
+    int64_t raw[] = {100, 200};
+    ray_t* col = ray_vec_from_raw(RAY_I64, raw, 2);
+    TEST_ASSERT_NOT_NULL(col);
+
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, id_w, col);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+
+    /* durable=false (bulk) + sym_path → exercises ray_sym_save_bulk at line 78 */
+    ray_err_t err = ray_splay_save_bulk(tbl, dir, sym_path);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    /* Confirm the sym file was written */
+    TEST_ASSERT_EQ_I(access(sym_path, F_OK), 0);
+
+    ray_release(col);
+    ray_release(tbl);
+    rm_rf(dir);
+    unlink(sym_path);
+    PASS();
+}
+
+/* =========================================================================
+ * 19. splay_save_impl line 89: snprintf overflow for "%s/.d" path.
+ *     Requires strlen(dir) >= 1021 so that strlen(dir)+3 >= 1024.
+ *     Build a deeply nested path using short components (≤ 50 chars each)
+ *     so the filesystem NAME_MAX (255) is not exceeded, then call mkdir_p
+ *     via system(), then ray_splay_save → snprintf("%s/.d") fires range.
+ *
+ *     Path layout (each component 50 chars):
+ *       /tmp/rft_deep_save/         (18 chars)
+ *       + 20 levels of "aaaaa...a/" (51 chars each)
+ *       total 18 + 20*51 - 1 = 1037 chars (last level has no trailing /)
+ *     Actually: 18 + 19*51 + 50 = 18 + 969 + 50 = 1037 ≥ 1021. Good.
+ * ========================================================================= */
+static test_result_t test_save_dir_path_too_long(void) {
+#ifdef __APPLE__
+    /* macOS PATH_MAX = 1024; mkdir -p stops short of the 1021-char
+     * tree this test needs.  ray_splay_save's path-overflow guard
+     * fires under the same condition on Linux PATH_MAX = 4096.  Skip
+     * on Darwin — the Linux runner covers the regression. */
+    SKIP("PATH_MAX=1024 on macOS — deep-mkdir fixture not portable");
+#endif
+    /* Construct the nested path in a buffer */
+    char long_dir[2048];
+    const char* base   = "/tmp/rft_deep_save";  /* 18 chars */
+    const char* comp   = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; /* 50 chars */
+    int nlevels        = 20;
+
+    int off = snprintf(long_dir, sizeof(long_dir), "%s", base);
+    for (int i = 0; i < nlevels && off < (int)sizeof(long_dir) - 2; i++) {
+        long_dir[off++] = '/';
+        int rem = (int)sizeof(long_dir) - off - 1;
+        if (rem <= 0) break;
+        int clen = (int)strlen(comp);
+        if (clen > rem) clen = rem;
+        memcpy(long_dir + off, comp, (size_t)clen);
+        off += clen;
+    }
+    long_dir[off] = '\0';
+
+    /* Verify we actually have a long enough path */
+    TEST_ASSERT_TRUE((size_t)off >= 1021);
+
+    /* Create the directory tree so ray_mkdir_p inside save succeeds.
+     * system("mkdir -p ...") handles arbitrarily deep paths. */
+    char mk[4096];
+    snprintf(mk, sizeof(mk), "mkdir -p \"%s\"", long_dir);
+    (void)!system(mk);
+
+    int64_t id_v2 = ray_sym_intern("v2long", 6);
+    int64_t raw[] = {1};
+    ray_t* col = ray_vec_from_raw(RAY_I64, raw, 1);
+    TEST_ASSERT_NOT_NULL(col);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, id_v2, col);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+
+    /* ray_splay_save: mkdir_p passes (dir exists), then snprintf("%s/.d")
+     * overflows the 1024-byte buffer → returns RAY_ERR_RANGE (line 89) */
+    ray_err_t err = ray_splay_save(tbl, long_dir, NULL);
+    TEST_ASSERT_EQ_I(err, RAY_ERR_RANGE);
+
+    ray_release(col);
+    ray_release(tbl);
+    /* Cleanup entire nested tree from the base */
+    char rm_cmd[256];
+    snprintf(rm_cmd, sizeof(rm_cmd), "rm -rf /tmp/rft_deep_save");
+    (void)!system(rm_cmd);
+    PASS();
+}
+
+/* =========================================================================
+ * 20. splay_save_impl line 115: snprintf overflow for "%s/<colname>" path.
+ *     Use a short dir + a column name long enough that dir + "/" + name
+ *     overflows 1024 bytes.  dir="/tmp/rft_sv" (12 chars) + "/" (1) +
+ *     1011 'c' chars = 1024, which is NOT < 1024, so overflow fires.
+ *     The column must pass the name-safety check (no /, \, ., not empty).
+ * ========================================================================= */
+static test_result_t test_save_col_path_too_long(void) {
+    const char* dir = "/tmp/rft_sv";
+    rm_rf(dir);
+
+    /* dir = 11 chars; "/" = 1 char; need name_len >= 1012 to make total >= 1024 */
+    char long_colname[1013];
+    memset(long_colname, 'c', sizeof(long_colname) - 1);
+    long_colname[sizeof(long_colname) - 1] = '\0';  /* 1012-char name */
+
+    int64_t id_long_col = ray_sym_intern(long_colname, sizeof(long_colname) - 1);
+    int64_t id_short    = ray_sym_intern("sv_ok", 5);
+
+    int64_t raw[] = {7, 8};
+    ray_t* col_long  = ray_vec_from_raw(RAY_I64, raw, 2);
+    ray_t* col_short = ray_vec_from_raw(RAY_I64, raw, 2);
+    TEST_ASSERT_NOT_NULL(col_long);
+    TEST_ASSERT_NOT_NULL(col_short);
+
+    /* Put the short column first so schema writes fine, then long col triggers
+     * the path-overflow on the second iteration */
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, id_short,    col_short);
+    tbl = ray_table_add_col(tbl, id_long_col, col_long);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+
+    ray_err_t err = ray_splay_save(tbl, dir, NULL);
+    TEST_ASSERT_EQ_I(err, RAY_ERR_RANGE);
+
+    ray_release(col_long);
+    ray_release(col_short);
+    ray_release(tbl);
+    rm_rf(dir);
+    PASS();
+}
+
+/* =========================================================================
+ * 21. RAY_CSV_TRACE env: trace=true + valid dir → hits line 146 fprintf.
+ *     Use setenv("RAY_CSV_TRACE","1",1) before the call and unsetenv after.
+ * ========================================================================= */
+static test_result_t test_trace_valid_dir(void) {
+    const char* dir = TMP_SPLAY_BASE "/trace_valid";
+    rm_rf(dir);
+
+    int64_t id_t = ray_sym_intern("tval", 4);
+    int64_t raw[] = {1, 2};
+    ray_t* col = ray_vec_from_raw(RAY_I64, raw, 2);
+    TEST_ASSERT_NOT_NULL(col);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, id_t, col);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    ray_err_t err = ray_splay_save(tbl, dir, NULL);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    /* Activate trace: splay_load_impl line 144-146 */
+    setenv("RAY_CSV_TRACE", "1", 1);
+    ray_t* loaded = ray_splay_load(dir, NULL);
+    unsetenv("RAY_CSV_TRACE");
+
+    TEST_ASSERT_NOT_NULL(loaded);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    ray_release(loaded);
+
+    ray_release(col);
+    ray_release(tbl);
+    rm_rf(dir);
+    PASS();
+}
+
+/* =========================================================================
+ * 22. RAY_CSV_TRACE env: trace=true + missing schema → hits lines 161-163
+ *     fprintf (schema load failed branch).
+ * ========================================================================= */
+static test_result_t test_trace_missing_schema(void) {
+    const char* dir = TMP_SPLAY_BASE "/trace_noschema";
+    rm_rf(dir);
+    /* Create dir without .d file */
+    char mk[512];
+    snprintf(mk, sizeof(mk), "mkdir -p %s", dir);
+    (void)!system(mk);
+
+    setenv("RAY_CSV_TRACE", "1", 1);
+    ray_t* r = ray_splay_load(dir, NULL);
+    unsetenv("RAY_CSV_TRACE");
+
+    /* Schema load failed → error returned */
+    TEST_ASSERT_TRUE(!r || RAY_IS_ERR(r));
+    if (r) ray_release(r);
+
+    rm_rf(dir);
+    PASS();
+}
+
+/* =========================================================================
+ * 23. RAY_CSV_TRACE env: trace=true + schema exists but column file missing
+ *     → hits lines 221-223 fprintf (col load failed branch).
+ * ========================================================================= */
+static test_result_t test_trace_missing_col(void) {
+    const char* dir = TMP_SPLAY_BASE "/trace_misscol";
+    rm_rf(dir);
+
+    int64_t id_a = ray_sym_intern("ta", 2);
+    int64_t id_b = ray_sym_intern("tb", 2);
+    int64_t raw[] = {5, 6};
+    ray_t* col_a = ray_vec_from_raw(RAY_I64, raw, 2);
+    ray_t* col_b = ray_vec_from_raw(RAY_I64, raw, 2);
+    TEST_ASSERT_NOT_NULL(col_a);
+    TEST_ASSERT_NOT_NULL(col_b);
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, id_a, col_a);
+    tbl = ray_table_add_col(tbl, id_b, col_b);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    ray_err_t err = ray_splay_save(tbl, dir, NULL);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    /* Remove column "tb" to cause col load failure */
+    char miss[512];
+    snprintf(miss, sizeof(miss), "%s/tb", dir);
+    unlink(miss);
+
+    setenv("RAY_CSV_TRACE", "1", 1);
+    ray_t* r = ray_splay_load(dir, NULL);
+    unsetenv("RAY_CSV_TRACE");
+
+    TEST_ASSERT_TRUE(!r || RAY_IS_ERR(r));
+    if (r) ray_release(r);
+
+    ray_release(col_a);
+    ray_release(col_b);
+    ray_release(tbl);
+    rm_rf(dir);
+    PASS();
+}
+
+/* =========================================================================
+ * 24. RAY_CSV_TRACE env: trace=true + sym ID not found in sym table
+ *     → hits lines 183-185 fprintf (missing schema symbol branch).
+ *     Use the same corrupt-schema technique: save table, reset sym table,
+ *     reload without sym_path so name_atom is NULL on first column.
+ * ========================================================================= */
+static test_result_t test_trace_missing_sym_id(void) {
+    const char* dir = TMP_SPLAY_BASE "/trace_missym";
+    rm_rf(dir);
+
+    int64_t id_c = ray_sym_intern("tc", 2);
+    int64_t raw[] = {9};
+    ray_t* col = ray_vec_from_raw(RAY_I64, raw, 1);
+    TEST_ASSERT_NOT_NULL(col);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, id_c, col);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    ray_err_t err = ray_splay_save(tbl, dir, NULL);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    /* Reset sym table — now name_id for "tc" is no longer valid */
+    ray_sym_destroy();
+    (void)ray_sym_init();
+
+    setenv("RAY_CSV_TRACE", "1", 1);
+    ray_t* r = ray_splay_load(dir, NULL);
+    unsetenv("RAY_CSV_TRACE");
+
+    TEST_ASSERT_TRUE(!r || RAY_IS_ERR(r));
+    if (r) ray_release(r);
+
+    ray_release(col);
+    ray_release(tbl);
+    rm_rf(dir);
+    PASS();
+}
+
+/* =========================================================================
+ * 25. splay_save_impl line 91: ray_col_save(".d") fails because the
+ *     directory is read-only after being created.
+ *     mkdir_p returns OK (dir is created with permissions), then we chmod
+ *     the dir to 0555 so the .d file cannot be written.
+ * ========================================================================= */
+static test_result_t test_save_schema_write_fails(void) {
+    const char* dir = TMP_SPLAY_BASE "/no_write_schema";
+    rm_rf(dir);
+    char mk[512];
+    snprintf(mk, sizeof(mk), "mkdir -p %s", dir);
+    (void)!system(mk);
+
+    /* Make dir read-only so .d cannot be written */
+    chmod(dir, 0555);
+
+    int64_t id_w = ray_sym_intern("ws", 2);
+    int64_t raw[] = {3, 4};
+    ray_t* col = ray_vec_from_raw(RAY_I64, raw, 2);
+    TEST_ASSERT_NOT_NULL(col);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, id_w, col);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+
+    /* ray_splay_save: mkdir_p passes (dir exists), then ray_col_save(".d") fails */
+    ray_err_t err = ray_splay_save(tbl, dir, NULL);
+    /* Must restore permissions before cleanup */
+    chmod(dir, 0755);
+    /* Expect a write failure (io or similar) */
+    TEST_ASSERT_TRUE(err != RAY_OK);
+
+    ray_release(col);
+    ray_release(tbl);
+    rm_rf(dir);
+    PASS();
+}
+
+/* =========================================================================
+ * 26. splay_save_impl line 120: ray_col_save(col) fails because the
+ *     directory becomes read-only after the .d schema is written.
+ *     Strategy: first write the .d file, then chmod dir to 0555 mid-save.
+ *     We cannot intercept mid-save, so we pre-write the .d ourselves and
+ *     then call save on a pre-existing read-only directory.
+ *     Actually: if .d already exists in a read-only dir, ray_col_save for
+ *     .d also fails.  We need write-ok for .d but not for the column.
+ *
+ *     Alternative: save a 2-column table where the first column succeeds,
+ *     then make the dir read-only after .d writes.  This is TOCTOU and not
+ *     reliable.  Instead we use a different approach:
+ *
+ *     Write schema to a separate file, create dir with 0755, pre-save the
+ *     .d, chmod 0555, then call ray_splay_save on the same dir — it will
+ *     fail on overwriting .d (also an io error hitting line 91).  OR:
+ *
+ *     Use a sub-directory trick: put the column file in a subdirectory
+ *     whose permissions we control, while .d is in a writable parent.
+ *     This requires a custom directory layout not supported by splay API.
+ *
+ *     Practical approach: use a tmpfs or overlay filesystem — too complex.
+ *
+ *     Best achievable: use /proc/self or /sys path (already read-only) as
+ *     dir, which causes mkdir_p to fail at line 73-74.  This covers the
+ *     mkdir_p failure branch (line 74, `^2` shows it's already covered by 2
+ *     calls — but let's verify).
+ *
+ *     We skip this test to avoid fragile TOCTOU and note it as unreachable
+ *     through the single-process API without a filesystem hook.
+ * ========================================================================= */
+
 /* ---- Suite definition -------------------------------------------------- */
 
 const test_entry_t splay_entries[] = {
@@ -708,5 +1063,13 @@ const test_entry_t splay_entries[] = {
     { "splay/validate_sym_zero_col",      test_validate_sym_zero_col_table,     splay_setup, splay_teardown },
     { "splay/load_dir_path_too_long",     test_load_dir_path_too_long,          splay_setup, splay_teardown },
     { "splay/load_col_path_too_long",     test_load_col_path_too_long,          splay_setup, splay_teardown },
+    { "splay/save_bulk_with_sym_path",    test_save_bulk_with_sym_path,         splay_setup, splay_teardown },
+    { "splay/save_dir_path_too_long",     test_save_dir_path_too_long,          splay_setup, splay_teardown },
+    { "splay/save_col_path_too_long",     test_save_col_path_too_long,          splay_setup, splay_teardown },
+    { "splay/trace_valid_dir",            test_trace_valid_dir,                 splay_setup, splay_teardown },
+    { "splay/trace_missing_schema",       test_trace_missing_schema,            splay_setup, splay_teardown },
+    { "splay/trace_missing_col",          test_trace_missing_col,               splay_setup, splay_teardown },
+    { "splay/trace_missing_sym_id",       test_trace_missing_sym_id,            splay_setup, splay_teardown },
+    { "splay/save_schema_write_fails",    test_save_schema_write_fails,         splay_setup, splay_teardown },
     { NULL, NULL, NULL, NULL },
 };

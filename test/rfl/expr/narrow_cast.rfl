@@ -54,3 +54,65 @@
 ;; ── narrow → narrow (no-op same type) ───────────────────────────
 (set Tn (table [v] (list (as 'I32 [1 2 3]))))
 (at (at (select {x: (as 'I32 v) from: Tn}) 'x) 0) -- 1
+
+;; ── exec_elementwise_unary: F64 vector → narrow types (non-fused path) ──────
+;; Bare F64 vector cast (no table): falls to exec_elementwise_unary, not fused
+;; F64 → I32
+(as 'I32 [1.0 2.9 -3.7])  -- [1 2 -3]
+(at (as 'I32 [1.0 2.9 -3.7]) 0)  -- 1
+(at (as 'I32 [100.5 -50.9]) 1) -- -50
+
+;; F64 → I16
+(as 'I16 [1.0 2.9 -3.7])  -- [1 2 -3]
+(at (as 'I16 [1.0 2.9 -3.7]) 0)  -- 1
+
+;; F64 → U8
+(as 'U8 [1.0 2.9 100.7])  -- [0x01 0x02 0x64]
+(at (as 'U8 [1.0 255.0]) 1)  -- 0xFF
+
+;; F64 → BOOL (non-zero → true, zero → false)
+(as 'BOOL [0.0 1.0 0.5 -1.0])  -- [false true true true]
+(at (as 'BOOL [0.0 1.0]) 0)  -- false
+(at (as 'BOOL [0.0 1.0]) 1)  -- true
+
+;; ── exec_elementwise_unary: I64 → narrow via nullable column ─────────────────
+;; Nullable I64 col → I32: expr_compile refuses nullable → exec_elementwise_unary
+(set TnullI (table [v] (list [1 2 0Nl 4 5])))
+(set TnullI_i32 (at (select {x: (as 'I32 v) from: TnullI}) 'x))
+(at TnullI_i32 0) -- 1
+(at TnullI_i32 1) -- 2
+(at TnullI_i32 3) -- 4
+
+;; Nullable I64 col → I16
+(set TnullI_i16 (at (select {x: (as 'I16 v) from: TnullI}) 'x))
+(at TnullI_i16 0) -- 1
+(at TnullI_i16 4) -- 5
+
+;; Nullable I64 → BOOL: non-fused path (exec_elementwise_unary).
+;; Regression for prior bug: the `in_type==I64 && out_type==BOOL` branch
+;; at expr.c:1360 lacked opcode gating, so OP_CAST hit the OP_ISNULL
+;; specialization and filled dst with 0 regardless of input.  Fix gates
+;; the branch on opc and adds a CAST arm that applies truthy semantics
+;; treating NULL_I64 (INT64_MIN) sentinel as false.
+;; Input: [1 2 0Nl 4 5] → [true true false true true].
+(set TnullI_bool (at (select {x: (as 'BOOL v) from: TnullI}) 'x))
+(type TnullI_bool) -- 'B8
+(at TnullI_bool 0) -- true
+(at TnullI_bool 1) -- true
+(at TnullI_bool 2) -- false     ;; null → false (was 0 via ISNULL-stuck bug)
+(at TnullI_bool 3) -- true
+(at TnullI_bool 4) -- true
+
+;; ── exec_elementwise_unary: F64 col → narrow via nullable column ─────────────
+(set TnullF (table [v] (list [1.5 2.5 0Nf 4.5 5.5])))
+(set TnullF_i32 (at (select {x: (as 'I32 v) from: TnullF}) 'x))
+(at TnullF_i32 0) -- 1
+(at TnullF_i32 3) -- 4
+(set TnullF_i16 (at (select {x: (as 'I16 v) from: TnullF}) 'x))
+(at TnullF_i16 1) -- 2
+(set TnullF_u8 (at (select {x: (as 'U8  v) from: TnullF}) 'x))
+(at TnullF_u8 4) -- 0x05
+;; F64→BOOL: truthy semantics (non-zero → true)
+(set TnullF_bool (at (select {x: (as 'BOOL v) from: TnullF}) 'x))
+(at TnullF_bool 0) -- true
+(at TnullF_bool 1) -- true

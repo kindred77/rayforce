@@ -1,0 +1,520 @@
+;; Coverage extension for src/ops/group.c — round 5 additions.
+;;
+;; Targets not yet reached by other group/ tests:
+;;
+;;   exec_reduction TABLE non-COUNT error arm (line 1781)
+;;   exec_reduction OP_STDDEV_POP in parallel path (line 1933)
+;;   group_strlen_at SYM arm (lines 3737-3741) via scalar agg + 2-key HT
+;;   DA path: sequential merge FIRST/LAST (lines 5865-5870)
+;;   DA path: PROD merge in sequential path (lines ~5871-5879)
+;;   DA path: FIRST/LAST with parallel merge n_slots >= 1024 (lines 5763-5806)
+;;   DA path: nullable agg nn_count merge (lines 5671-5675, 5831-5833, 5911-5913)
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 1. exec_reduction error arm for non-COUNT on TABLE (line 1781)
+;;
+;; When input is a TABLE, only OP_COUNT returns a valid result.
+;; avg/min/max of a table → type error.
+;; ════════════════════════════════════════════════════════════════════════
+(set Terr_tbl (table [a] (list [1 2 3])))
+
+;; sum of a table → type error (line 1781)
+(sum Terr_tbl) !- type
+
+;; avg of a table → type error (same line)
+(avg Terr_tbl) !- type
+
+;; min of a table → type error (same line)
+(min Terr_tbl) !- type
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 2. exec_reduction OP_STDDEV_POP parallel path (line 1933)
+;;
+;; ≥65537 elements → parallel path.  OP_STDDEV_POP hits line 1933 in the
+;; parallel merge switch.
+;;
+;; Population stddev of 0..N-1:
+;;   var_pop = (N² - 1) / 12
+;;   For N=70000: var_pop = (70000² - 1) / 12 = 4899999999 / 12 ≈ 408333333.25
+;;   stddev_pop ≈ sqrt(408333333.25) ≈ 20207.26
+;; ════════════════════════════════════════════════════════════════════════
+(set Vbig_i64 (as 'I64 (til 70000)))
+(set Sp_result (stddev_pop Vbig_i64))
+;; stddev_pop of 0..69999 ≈ 20207.26; verify within 0.1
+(< (abs (- Sp_result 20207.26)) 0.1) -- true
+
+;; var_pop parallel (OP_VAR_POP case, line 1930)
+(set Vp_result (var_pop Vbig_i64))
+;; var_pop = (70000²-1)/12 ≈ 408333333.25; within 1.0
+(< (abs (- Vp_result 408333333.25)) 1.0) -- true
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 3. group_strlen_at SYM arm (lines 3737-3741) via scalar agg (n_keys=0)
+;;
+;; (select {l: (sum (strlen s)) from: T}) with no by: clause uses exec_group
+;; with n_keys=0 → scalar_accum_fn → scalar_accum_row → group_strlen_at.
+;; When col->type==RAY_SYM, lines 3737-3741 fire.
+;; ════════════════════════════════════════════════════════════════════════
+;; Build table with SYM column (4 distinct syms, 3 repetitions each).
+(set Vsym_sl (as 'SYM ['abc 'de 'f 'ghij 'abc 'de 'f 'ghij 'abc 'de 'f 'ghij]))
+(set Tsym_sl (table [k s] (list (as 'I64 (% (til 12) 4)) Vsym_sl)))
+
+;; Global strlen sum (scalar path, no key): positive result
+(set Rssl (select {l: (sum (strlen s)) from: Tsym_sl}))
+(> (at (at Rssl 'l) 0) 0) -- true
+
+;; Grouped strlen with narrow key k∈[0,3] → DA path (4 slots < 262144).
+;; group_strlen_at_cached called in da_accum_row for SYM column.
+(set Rssl_g (select {l: (sum (strlen s)) by: k from: Tsym_sl}))
+(count Rssl_g) -- 4
+;; All per-group sums positive
+(> (sum (at Rssl_g 'l)) 0) -- true
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 4. group_strlen_at SYM arm via 2-key HT path (lines 2604, 2697, 2849)
+;;
+;; Multi-key GROUP BY with sum(strlen(sym_col)) uses the HT scatter path
+;; which calls group_strlen_at directly (not cached).
+;; Wide k1 spacing forces composite range > DA_MAX_COMPOSITE_SLOTS → HT.
+;; ════════════════════════════════════════════════════════════════════════
+(set Nsym_ht2 100)
+;; k1 ∈ {0,100000,200000,...,2400000} (25 values), k2 ∈ [0..3]
+;; composite range: 2400001 * 4 = 9600004 > 262144 → DA rejects → HT path
+(set Tsym_ht2 (table [k1 k2 s] (list (as 'I64 (* 100000 (% (til Nsym_ht2) 25))) (as 'I64 (% (til Nsym_ht2) 4)) (as 'SYM (% (til Nsym_ht2) 4)))))
+(set Rssl_ht (select {l: (sum (strlen s)) by: [k1 k2] from: Tsym_ht2}))
+(count Rssl_ht) -- 100
+;; Total strlen sum > 0 (sym names are non-empty)
+(> (sum (at Rssl_ht 'l)) 0) -- true
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 5. DA path: sequential merge FIRST/LAST (lines 5865-5870)
+;;
+;; k ∈ [0,9] → n_slots = 10 < 1024 → sequential DA merge path.
+;; nrows = 70000 ≥ 65537 → parallel DA with multiple workers.
+;; Lines 5865-5870: OP_FIRST / OP_LAST merge in sequential merge loop.
+;;
+;; k = i%10, v = i.
+;; first(v) per group k = k (first row with key k has value k).
+;; Sum of first = 0+1+...+9 = 45.
+;; last(v) per group k: last row index = k + 10*6999 = k + 69990.
+;; Sum of last = Σ_{k=0}^{9}(k+69990) = 45 + 10*69990 = 699945.
+;; ════════════════════════════════════════════════════════════════════════
+(set N_dafl 70000)
+(set Tdafl (table [k v] (list (as 'I64 (% (til N_dafl) 10)) (as 'I64 (til N_dafl)))))
+
+;; first(v) by narrow key → sequential DA merge
+(set Rdafl_f (select {f: (first v) by: k from: Tdafl}))
+(count Rdafl_f) -- 10
+(sum (at Rdafl_f 'f)) -- 45
+
+;; last(v) by narrow key
+(set Rdafl_l (select {l: (last v) by: k from: Tdafl}))
+(count Rdafl_l) -- 10
+(sum (at Rdafl_l 'l)) -- 699945
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 6. DA path: PROD merge in sequential path (lines ~5871-5879)
+;; SKIPPED: OP_PROD exists in graph.c (ray_prod) but has no RFL
+;; builtin binding in eval.c — same situation as the temporal trunc
+;; MINUTE case.  Adding (register_unary "prod" ...) would unlock both
+;; this section and §13/§15/§17.
+;; ════════════════════════════════════════════════════════════════════════
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 7. DA path: FIRST/LAST with parallel merge (n_slots >= 1024)
+;;
+;; k ∈ [0,1023] → n_slots = 1024 ≥ 1024 → parallel DA merge path
+;; (lines 5763-5806, when da_n_workers > 1 && n_slots >= 1024 && da_pool).
+;;
+;; k = i%1024, v = i. 70000 rows.
+;; first(v) of group k = k (first row in group k has value k).
+;; Sum of first = 0+1+...+1023 = 1023*1024/2 = 523776.
+;;
+;; last(v) of group k:
+;;   70000 mod 1024 = 368; groups 0..367 get floor=68 full cycles + 1 extra
+;;   → last row index = k + 1024*68 = k + 69632 (for k < 368)
+;;   → groups 368..1023: last = k + 1024*67 = k + 68608
+;; Sum of last = Σ_{k=0}^{367}(k+69632) + Σ_{k=368}^{1023}(k+68608)
+;;   = Σ_{k=0}^{1023}k + 368*69632 + 656*68608
+;;   = 523776 + 25624576 + 45006848 = 71155200
+;; ════════════════════════════════════════════════════════════════════════
+(set Tdafl_par (table [k v] (list (as 'I64 (% (til N_dafl) 1024)) (as 'I64 (til N_dafl)))))
+
+(set Rdafl_pf (select {f: (first v) by: k from: Tdafl_par}))
+(count Rdafl_pf) -- 1024
+(sum (at Rdafl_pf 'f)) -- 523776
+
+(set Rdafl_pl (select {l: (last v) by: k from: Tdafl_par}))
+(count Rdafl_pl) -- 1024
+(sum (at Rdafl_pl 'l)) -- 71155200
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 8. DA path: nullable F64 agg — nn_count allocation + merge (lines 5671-5675)
+;;
+;; When agg col has HAS_NULLS and type is F64, da_any_nullable=true
+;; → nn_count arrays allocated per worker.
+;; Parallel DA (nrows ≥ 65537) exercises both alloc and sequential merge
+;; (n_slots=10 < 1024) of nn_count.
+;;
+;; k ∈ [0,9], v = F64 with nulls every 7th row.
+;; ════════════════════════════════════════════════════════════════════════
+(set Tdann (table [k v] (list (as 'I64 (% (til N_dafl) 10)) (as 'F64 (take [1.0 2.0 3.0 4.0 5.0 6.0 0N] N_dafl)))))
+(set Rdann (select {s: (sum v) by: k from: Tdann}))
+(count Rdann) -- 10
+;; All sums positive (non-null rows dominate)
+(> (sum (at Rdann 's)) 0.0) -- true
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 9. DA path: nullable I64 agg with parallel merge (n_slots=1024)
+;;
+;; Same nullable pattern but n_slots=1024 → parallel DA merge exercises
+;; lines 5831-5833 (parallel nn_count merge).
+;; ════════════════════════════════════════════════════════════════════════
+(set Tdann_par (table [k v] (list (as 'I64 (% (til N_dafl) 1024)) (as 'I64 (take [1 2 3 4 5 6 0N] N_dafl)))))
+(set Rdann_par (select {s: (sum v) by: k from: Tdann_par}))
+(count Rdann_par) -- 1024
+(> (sum (at Rdann_par 's)) 0) -- true
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 10. DA path: stddev/var agg (SUMSQ allocation, lines 5643-5647)
+;;
+;; OP_STDDEV forces DA_NEED_SUMSQ → sumsq_f64 arrays allocated per worker.
+;; With nrows=70000 and n_slots=10, exercises the sumsq merge at line 5853.
+;; k ∈ [0,9], v = I64; each group k has v values k, k+10, k+20, ..., k+69990.
+;;
+;; For group k: n=7000 values; v_i = k + 10*i for i=0..6999.
+;; stddev of group k = stddev of {k, k+10, ..., k+69990}
+;;                   = 10 * stddev of {0,1,...,6999}
+;;                   = 10 * sqrt((6999²-1)/12) ≈ 10 * 2020.73 ≈ 20207.3
+;; All groups have same stddev (each is a scaled arithmetic progression).
+;; ════════════════════════════════════════════════════════════════════════
+(set Tdastd (table [k v] (list (as 'I64 (% (til N_dafl) 10)) (as 'I64 (til N_dafl)))))
+(set Rdastd (select {s: (stddev_pop v) by: k from: Tdastd}))
+(count Rdastd) -- 10
+;; Group k=0 has values 0,10,20,...,69990 (n=7000, d=10): stddev_pop = 10*sqrt((7000²-1)/12) ≈ 20207.26
+(< (abs (- (at (at Rdastd 's) 0) 20207.26)) 1.0) -- true
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 11. DA path: MIN/MAX with nullable F64 (DA_NEED_MIN + DA_NEED_MAX)
+;;    Exercises lines 5648-5666 (min/max init) + merge lines 5807-5829.
+;; k ∈ [0,1023] (1024 slots → parallel merge), v = F64 with some nulls.
+;; ════════════════════════════════════════════════════════════════════════
+(set Tdamm_par (table [k v] (list (as 'I64 (% (til N_dafl) 1024)) (as 'F64 (take [1.0 2.0 3.0 4.0 5.0 6.0 7.0 8.0 9.0 10.0 0N] N_dafl)))))
+(set Rdamm_par (select {mn: (min v) mx: (max v) by: k from: Tdamm_par}))
+(count Rdamm_par) -- 1024
+;; max of entire column ≥ min of entire column
+(>= (max (at Rdamm_par 'mx)) (min (at Rdamm_par 'mn))) -- true
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 12. exec_reduction OP_STDDEV (sample) parallel path (line 1933)
+;;
+;; ≥65537 elements → parallel path.  OP_STDDEV hits line 1933 in the
+;; parallel merge switch (sample stddev uses n-1 denominator).
+;;
+;; Sample stddev of 0..69999:
+;;   var_pop = (70000²-1)/12 ≈ 408333333.25
+;;   var_samp = var_pop * 70000/69999 ≈ 408339166.75
+;;   stddev_samp = sqrt(408339166.75) ≈ 20207.40
+;; ════════════════════════════════════════════════════════════════════════
+(set Vstd_samp (as 'I64 (til 70000)))
+(set Rstd_samp (stddev Vstd_samp))
+;; Within 0.5 of the expected value
+(< (abs (- Rstd_samp 20207.40)) 0.5) -- true
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 13. DA path: F64 PROD in sequential merge (line 5876)
+;; SKIPPED: see §6 — needs RFL `prod` binding.
+;; ════════════════════════════════════════════════════════════════════════
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 14. group_strlen_at STR branch (lines 3731-3735) via HT path
+;;
+;; group_strlen_at_cached handles RAY_SYM directly; group_strlen_at (the
+;; non-cached version) is called from group_rows_range (line 2604) and
+;; hits the RAY_STR branch at line 3730-3735 when the agg column is STR.
+;;
+;; 2-key composite range = 300001 × 4 = 1,200,004 > 262,144 → DA rejects
+;; → HT path → group_rows_range → group_strlen_at with RAY_STR column.
+;;
+;; strlen values: "abc"=3, "de"=2, "f"=1, "ghij"=4.
+;; sum over all 4 distinct groups = 3+2+1+4 = 10.
+;; ════════════════════════════════════════════════════════════════════════
+(set Tsstr_ht2 (table [k1 k2 s] (list (as 'I64 [0 100000 200000 300000]) (as 'I64 [0 1 2 3]) ["abc" "de" "f" "ghij"])))
+(set Rsstr_ht (select {l: (sum (strlen s)) by: [k1 k2] from: Tsstr_ht2}))
+(count Rsstr_ht) -- 4
+(sum (at Rsstr_ht 'l)) -- 10
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 15. DA path: FIRST/LAST merge + F64 PROD + nullable F64 SUM nn_count
+;; SKIPPED: combined regression needs PROD; see §6 — needs RFL `prod`
+;; binding.  The FIRST + nullable-SUM combination without PROD is
+;; already exercised in §7 (parallel FIRST/LAST) + §8 (nullable F64
+;; nn_count merge).
+;; ════════════════════════════════════════════════════════════════════════
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 16. Scalar path (n_keys=0): parallel nn_count merge (lines 5385-5388)
+;;
+;; n_keys=0, nullable F64 SUM, 70000 rows → sc_n > 1 (parallel).
+;; sc_any_nullable=true (F64 HAS_NULLS) → nn_count allocated per worker.
+;; Merge loop at line 5327 fires; lines 5385-5388 (nn_count add) execute.
+;;
+;; take [1.0 0N] 70000: 35000 non-null (1.0) + 35000 null.
+;; sum of non-null F64 = 35000 × 1.0 = 35000.0.
+;; ════════════════════════════════════════════════════════════════════════
+(set Vsc_nn (as 'F64 (take [1.0 0N] 70000)))
+(set Rsc_nn (sum Vsc_nn))
+(< (abs (- Rsc_nn 35000.0)) 0.5) -- true
+
+;; Scalar parallel nn_count merge with I64 nullable (sentinel-typed).
+;; take [1 0N] 70000 as I64 HAS_NULLS → sc_any_nullable=true.
+;; sum of non-null I64 = 35000 × 1 = 35000.
+(set Vsc_nni (as 'I64 (take [1 0N] 70000)))
+(sum Vsc_nni) -- 35000
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 17. Scalar path (n_keys=0): parallel PROD merge (lines 5342-5350)
+;; SKIPPED: see §6 — needs RFL `prod` binding.
+;; ════════════════════════════════════════════════════════════════════════
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 18. Scalar strlen slow path (scalar_accum_row lines 3948-3950)
+;;
+;; n_keys=0, SUM(strlen(STR_col)) → agg_strlen[0]=true, agg_vecs[0] is
+;; RAY_STR.  RAY_STR ≠ RAY_I64/SYM/F64 so the specialized scalar_sum_*_fn
+;; is NOT selected; scalar_accum_fn → scalar_accum_row fires, hitting
+;; the agg_strlen branch at line 3948.
+;;
+;; Input: 4 strings with lengths 1, 2, 3, 4 → sum = 10.
+;; ════════════════════════════════════════════════════════════════════════
+(set Tsc_strlen (table [s] (list ["a" "bb" "ccc" "dddd"])))
+(set Rsc_strlen (select {sl: (sum (strlen s)) from: Tsc_strlen}))
+(at (at Rsc_strlen 'sl) 0) -- 10
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 19. DA path: FIRST + strlen (da_accum_row lines 4097-4100)
+;;
+;; DA path (single I64 key, small range ≤ 262144) with agg_strlen=true
+;; AND has_first_last=true → all_sum=false → da_accum_row slow path →
+;; lines 4097-4100 execute (group_strlen_at_cached call).
+;;
+;; k = i % 4 (4 groups, DA range = 4 < 262144 → DA path taken).
+;; FIRST agg makes all_sum=false; strlen(s) is the agg.
+;; sum(strlen) is also computed so we verify group counts.
+;; first(v) per group k: v=i, so first(v)=0 for k=0, 1 for k=1, etc.
+;; sum(strlen(s)): "ab"=2, "cde"=3, cycling over 4 rows; 2+3+2+3=10 per cycle.
+;; ════════════════════════════════════════════════════════════════════════
+(set Tda_strlen (table [k v s] (list (as 'I64 (% (til 8) 4)) (as 'I64 (til 8)) ["ab" "cde" "ab" "cde" "ab" "cde" "ab" "cde"])))
+(set Rda_strlen (select {f: (first v) sl: (sum (strlen s)) by: k from: Tda_strlen}))
+(count Rda_strlen) -- 4
+;; first(v): 0,1,2,3 → sum = 6
+(sum (at Rda_strlen 'f)) -- 6
+;; sum(strlen(s)) per group: "ab"=2,"cde"=3 → each key has 2 strings, alternating
+;; k=0: rows 0,4 → "ab","ab" → 2+2=4; k=1: rows 1,5 → "cde","cde" → 3+3=6
+;; k=2: rows 2,6 → "ab","ab" → 4; k=3: rows 3,7 → "cde","cde" → 6
+(sum (at Rda_strlen 'sl)) -- 20
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 20. Single-key dyn_dense with top-count emit filter (lines 6114-6198)
+;;
+;; Conditions: sp_eligible=true (single I64 non-null key, COUNT-only agg),
+;; use_emit_filter=true (emit_filter.top_count_take > 0), n_scan <= UINT32_MAX.
+;; Key values in [0, 1000000) → small enough for dyn_dense (< 16777216).
+;; DA path rejected: key range 0..999 < 262144 → DA fits first! Need keys
+;; with range > 262144 but < 16777216, OR use a non-DA-eligible agg.
+;;
+;; Use key range > 262144: k ∈ {0, 300000, 600000, 900000} → range 900001 > 262144
+;; → DA rejects (total_slots > DA_MAX_COMPOSITE_SLOTS) → sp_eligible path.
+;; Keys 300000 and 600000 ≥ initial cap (1<<20=1048576)? No: 900000 < 1048576.
+;; So no realloc needed — tests lines 6114-6120, 6150-6165, 6168-6198.
+;;
+;; 8 rows: k ∈ {0, 300000, 600000, 900000} each appearing 2 or 1 times.
+;; k=0: 3 times, k=300000: 2 times, k=600000: 2 times, k=900000: 1 time.
+;; top-2 (heap): heap of size 2 fills with counts [3,2] → min=2.
+;; keep_min: heap[0]=2 > 1 → keep_min=2.
+;; Groups with count >= 2: k=0 (3), k=300000 (2), k=600000 (2) → 3 groups.
+;; ════════════════════════════════════════════════════════════════════════
+(set Tdd (table [k v] (list (as 'I64 [0 300000 600000 900000 0 300000 600000 0]) (as 'I64 (til 8)))))
+(set Rdd (select {c: (count v) desc: c take: 2 from: Tdd by: k}))
+;; take:2 returns exactly 2 rows (top-2 by count desc): k=0(3), k=300000(2).
+(count Rdd) -- 2
+(sum (at Rdd 'c)) -- 5
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 21. Single-key dyn_dense: cap realloc path (lines 6123-6148)
+;;
+;; Key values >= initial cap (1<<20 = 1048576) force scratch_realloc.
+;; k ∈ {0, 1200000, 2400000} → 2400000 >= 1048576 → cap doubles twice:
+;;   1048576 → 2097152 → 4194304; keys all < max_dense_cap (1<<24).
+;; COUNT+SUM included: sp_need_sum=true exercises range_sum realloc
+;; at lines 6136-6148 (the sum array is realloced alongside cnt).
+;; ════════════════════════════════════════════════════════════════════════
+(set Tdd2 (table [k v] (list (as 'I64 [0 1200000 2400000 0 1200000]) (as 'I64 [1 2 3 4 5]))))
+(set Rdd2 (select {c: (count v) s: (sum v) desc: c take: 3 from: Tdd2 by: k}))
+;; 3 distinct keys {0, 1200000, 2400000} → take:3 keeps all 3.
+(count Rdd2) -- 3
+;; total count = 5 (2+2+1)
+(sum (at Rdd2 'c)) -- 5
+;; sums: k=0 → 1+4=5; k=1200000 → 2+5=7; k=2400000 → 3
+(sum (at Rdd2 's)) -- 15
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 22. Single-key dyn_dense: SUM + COUNT emit filter (lines 6153-6164)
+;;
+;; sp_eligible + sp_need_sum=true (COUNT + SUM agg) + emit filter.
+;; Key range > 262144 (DA rejects), keys < 1048576 (no realloc).
+;; This exercises line 6153 (range_sum != NULL check) and lines 6155-6164
+;; (the inner SUM accumulation loop within dyn_dense).
+;; ════════════════════════════════════════════════════════════════════════
+(set Tdd3 (table [k v] (list (as 'I64 [0 300000 600000 0 300000]) (as 'I64 [10 20 30 40 50]))))
+(set Rdd3 (select {c: (count v) s: (sum v) desc: c take: 2 from: Tdd3 by: k}))
+;; k=0 appears twice → c=2, s=50; k=300000 appears twice → c=2, s=70
+;; k=600000 appears once → c=1: filtered out (keep_min=2).
+(count Rdd3) -- 2
+(sum (at Rdd3 'c)) -- 4
+;; sum of sums: s(k=0)+s(k=300000) = 50+70 = 120
+(sum (at Rdd3 's)) -- 120
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 23. exec_group_topk_rowform: I16 key type (grpt_key_read I16 arm,
+;;     grpt_key_hash, grpt_write_key I16 arm)
+;;
+;; I16 key: covers RAY_I16 arm in grpt_key_read (line 9250) and
+;;          the I16 write back in grpt_write_key.
+;; Serial path (small table < 16384 rows).
+;; k=I16 {100, 200, 300}, v=I64; top-1 per group.
+;; ════════════════════════════════════════════════════════════════════════
+(set Ttrk_i16 (table [k v] (list (as 'I16 [100 100 200 200 300 300]) (as 'I64 [1 2 3 4 5 6]))))
+(set Rtrk_i16 (select {t: (top v 1) by: k from: Ttrk_i16}))
+(count Rtrk_i16) -- 3
+;; top-1 per group: k=100→max(1,2)=2; k=200→max(3,4)=4; k=300→max(5,6)=6 → sum=12
+(sum (at Rtrk_i16 't)) -- 12
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 24. exec_group_topk_rowform: U8 key type (grpt_key_read U8 arm,
+;;     grpt_key_hash, grpt_write_key U8 arm)
+;;
+;; U8 key: covers RAY_U8 arm (same branch as BOOL) in grpt_key_read.
+;; Serial path.
+;; ════════════════════════════════════════════════════════════════════════
+(set Ttrk_u8 (table [k v] (list (as 'U8 [10 10 20 20 30 30]) (as 'I64 [1 2 3 4 5 6]))))
+(set Rtrk_u8 (select {t: (top v 1) by: k from: Ttrk_u8}))
+(count Rtrk_u8) -- 3
+;; top-1 per group: 2, 4, 6 → sum = 12
+(sum (at Rtrk_u8 't)) -- 12
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 25. exec_group_topk_rowform: I16 val type (grpt_val_read I16 arm)
+;;
+;; I16 value column: covers RAY_I16 in grpt_val_read (line 9310).
+;; Key=I64, val=I16.
+;; ════════════════════════════════════════════════════════════════════════
+(set Ttrk_vi16 (table [k v] (list (as 'I64 [1 1 2 2 3 3]) (as 'I16 [10 20 30 40 50 60]))))
+(set Rtrk_vi16 (select {t: (top v 1) by: k from: Ttrk_vi16}))
+(count Rtrk_vi16) -- 3
+;; top-1 per group: 20, 40, 60 → sum = 120
+(sum (at Rtrk_vi16 't)) -- 120
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 26. exec_group_topk_rowform: U8 val type (grpt_val_read U8 arm)
+;;
+;; U8 value: covers RAY_U8 arm (line 9311) in grpt_val_read.
+;; ════════════════════════════════════════════════════════════════════════
+(set Ttrk_vu8 (table [k v] (list (as 'I64 [1 1 2 2]) (as 'U8 [5 15 25 35]))))
+(set Rtrk_vu8 (select {t: (top v 1) by: k from: Ttrk_vu8}))
+(count Rtrk_vu8) -- 2
+;; top-1 per group: 15, 35 → sum = 50
+(sum (at Rtrk_vu8 't)) -- 50
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 27. exec_group_topk_rowform: null I64 keys (grpt_is_null I64 arm)
+;;
+;; When key column has HAS_NULLS, grpt_is_null fires for null-key rows
+;; (line 9359: knulls && grpt_is_null → skip row).
+;; Groups formed from non-null keys only.
+;; k=I64 [1, 0N, 2, 1, 0N] → null rows skipped; k=1→[10,40]=top-1→40; k=2→[30]
+;; ════════════════════════════════════════════════════════════════════════
+(set Ttrk_nki64 (table [k v] (list (as 'I64 [1 0N 2 1 0N]) (as 'I64 [10 20 30 40 50]))))
+(set Rtrk_nki64 (select {t: (top v 1) by: k from: Ttrk_nki64}))
+(count Rtrk_nki64) -- 2
+;; top-1: k=1→40; k=2→30 → sum = 70
+(sum (at Rtrk_nki64 't)) -- 70
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 28. exec_group_topk_rowform: I32 null key (grpt_is_null I32 arm, line 9282)
+;;
+;; grpt_is_null RAY_I32 arm is hit when key type=I32 and key has null values.
+;; ════════════════════════════════════════════════════════════════════════
+(set Ttrk_nki32 (table [k v] (list (as 'I32 [100 0N 200 100]) (as 'I64 [1 2 3 4]))))
+(set Rtrk_nki32 (select {t: (top v 1) by: k from: Ttrk_nki32}))
+(count Rtrk_nki32) -- 2
+;; k=100: top-1 of [1,4]=4; k=200: top-1 of [3]=3 → sum = 7
+(sum (at Rtrk_nki32 't)) -- 7
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 29. exec_group_topk_rowform: I16 null key (grpt_is_null I16 arm, line 9285)
+;;
+;; grpt_is_null RAY_I16 arm fires when key=I16 has null values.
+;; ════════════════════════════════════════════════════════════════════════
+(set Ttrk_nki16 (table [k v] (list (as 'I16 [10 0N 20 10]) (as 'I64 [1 2 3 4]))))
+(set Rtrk_nki16 (select {t: (top v 1) by: k from: Ttrk_nki16}))
+(count Rtrk_nki16) -- 2
+;; k=10: top-1 of [1,4]=4; k=20: top-1=[3] → sum = 7
+(sum (at Rtrk_nki16 't)) -- 7
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 30. exec_group_topk_rowform: F64 null key (grpt_is_null F64 arm, line 9278)
+;;
+;; grpt_is_null RAY_F64 arm: null F64 is NaN → (f != f) check fires.
+;; Null F64 keys are skipped.
+;; ════════════════════════════════════════════════════════════════════════
+(set Ttrk_nkf64 (table [k v] (list (as 'F64 [1.0 0N 2.0 1.0]) (as 'I64 [10 20 30 40]))))
+(set Rtrk_nkf64 (select {t: (top v 1) by: k from: Ttrk_nkf64}))
+(count Rtrk_nkf64) -- 2
+;; k=1.0: top-1 of [10,40]=40; k=2.0: top-1=[30] → sum = 70
+(sum (at Rtrk_nkf64 't)) -- 70
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 31. exec_group_topk_rowform: BOOL key type
+;;
+;; BOOL key: two groups (false=0, true=1), covers RAY_BOOL arm.
+;; grpt_key_read RAY_BOOL/U8 arm (line 9251): return (int64_t)((uint8_t*)base)[row]
+;; ════════════════════════════════════════════════════════════════════════
+(set Ttrk_bool (table [k v] (list [false true false true true] (as 'I64 [1 2 3 4 5]))))
+(set Rtrk_bool (select {t: (top v 1) by: k from: Ttrk_bool}))
+(count Rtrk_bool) -- 2
+;; k=false: [1,3] → top-1=3; k=true: [2,4,5] → top-1=5 → sum=8
+(sum (at Rtrk_bool 't)) -- 8
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 32. exec_group_topk_rowform: BOOL val type (grpt_val_read BOOL arm)
+;;
+;; BOOL value: grpt_val_read RAY_BOOL/U8 arm (line 9311-9312).
+;; top-1 of BOOL values per group: k=1→[false,true]→top=1; k=2→[false]→top=0
+;; ════════════════════════════════════════════════════════════════════════
+(set Ttrk_vbool (table [k v] (list (as 'I64 [1 1 2]) [false true false])))
+(set Rtrk_vbool (select {t: (top v 1) by: k from: Ttrk_vbool}))
+(count Rtrk_vbool) -- 2
+;; k=1: top-1 of [0,1]=1; k=2: top-1 of [0]=0 → sum=1
+(sum (at Rtrk_vbool 't)) -- 1
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 33. group_rows_range_existing with strlen agg (line 2697)
+;;
+;; multi-key top-N + sum(strlen s) → direct_ok=false (agg_strlen[a]=true
+;; exits the direct_ok=false at line 7061 check).
+;; → group_rows_range_existing at line 7180 fires, calling group_strlen_at
+;; at line 2697 inside the per-row entry encoding.
+;;
+;; 2-key F64-first-key forces DA to reject (F64 not DA-eligible); use_emit_filter
+;; on count agg; direct_ok=false because strlen agg.
+;; k1=F64 (cycling 0.0..4.0), k2=I64 (cycling 0..6) → 35 distinct groups.
+;; top-3 by count desc.
+;; ════════════════════════════════════════════════════════════════════════
+(set Tgre_str (table [k1 k2 s v] (list (as 'F64 (% (til 200) 5)) (as 'I64 (% (til 200) 7)) (as 'SYM (% (til 200) 5)) (as 'I64 (til 200)))))
+(set Rgre_str (select {l: (sum (strlen s)) c: (count v) from: Tgre_str by: [k1 k2] desc: c take: 3}))
+(count Rgre_str) -- 3
+(> (sum (at Rgre_str 'l)) 0) -- true
+;; Each of the top-3 groups has count=6 (200 rows / 35 groups ≈ 5.7; top 5 groups have 6)
+(min (at Rgre_str 'c)) -- 6
+

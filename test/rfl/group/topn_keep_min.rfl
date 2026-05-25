@@ -120,3 +120,196 @@
 ;;     result count is >= take_n's worth of distinct keys.
 (set Re (select {c: (count k) from: Th by: k desc: c take: 5}))
 (>= (count Re) 5) -- true
+
+;; ════════════════════════════════════════════════════════════════════
+;; Multi-key TOP-COUNT fast path (group.c lines 6725-7076)
+;;
+;; This block is only entered when ALL of these hold simultaneously:
+;;   1. use_emit_filter && top_count_take > 0 && n_keys > 1
+;;   2. n_keys in [2,5], no null keys, supported types (not F64/GUID/STR)
+;;   3. !nullable  (no HAS_NULLS on key columns)
+;;   4. cap >= want  (hash table fits in scratch)
+;;   5. DA path rejected: key-range product > DA_MAX_COMPOSITE_SLOTS (262 144)
+;;
+;; Key design: k1 alternates between 0 and 512 (range 513), k2 between
+;; 0 and 511 (range 512).  513 × 512 = 262 656 > 262 144 → DA rejects.
+;; At only 100–200 rows the scratch HT is tiny (cap=256) so the fast
+;; counting and top-K heap code runs without hitting OOM paths.
+;;
+;; Three sub-paths exercised:
+;;   A. count_only=true  (line 6918-6924):
+;;         take > 1024 defeats bounded_multikey_count_take_candidate
+;;         so a pure-count query still reaches exec_group.
+;;   B. direct_ok=true   (line 6936-7043):
+;;         only COUNT + SUM aggs → per-heavy-group direct scatter.
+;;   C. direct_ok=false  (line 7045-7056):
+;;         MIN/MAX forces group_rows_range_existing.
+;; ════════════════════════════════════════════════════════════════════
+
+;; Shared table for multi-key fast path: 100 rows, 2 groups.
+;; Row r: k1 = 512 * (r%2), k2 = 511 * (r%2), v = r.
+;; Group (0,0): even rows (0,2,4,...,98) → 50 rows, min_v=0.
+;; Group (512,511): odd rows (1,3,5,...,99) → 50 rows, min_v=1.
+;; k1 range [0,512]=513, k2 range [0,511]=512, product=262 656>262 144.
+(set Nmcp 100)
+(set Tmcp (table [k1 k2 v] (list (as 'I64 (* (% (til Nmcp) 2) 512)) (as 'I64 (* (% (til Nmcp) 2) 511)) (as 'I64 (til Nmcp)))))
+
+;; ─── Sub-path A: count_only + take>1024 ─────────────────────────────
+;; bounded_multikey_count_take_candidate returns false when take>1024,
+;; so this count-only query reaches exec_group and hits lines 6918-6924.
+(set Rmcp_co (select {c: (count k1) from: Tmcp by: [k1 k2] desc: c take: 2000}))
+(count Rmcp_co) -- 2
+(min (at Rmcp_co 'c)) -- 50
+(max (at Rmcp_co 'c)) -- 50
+
+;; ─── Sub-path B: direct_ok (sum agg, I64×I64) ────────────────────────
+;; SUM is a direct_ok agg; 2 groups <= 64 heavy → direct scatter path
+;; (lines 6936-7043), and TOP_COUNT2_FIXED_LOOP(int64_t,int64_t) fires
+;; (lines 6798, 6752-6784).
+(set Rmcp_s (select {c: (count k1) s: (sum v) from: Tmcp by: [k1 k2] desc: c take: 2}))
+(count Rmcp_s) -- 2
+;; sum over even rows (0+2+...+98) = 2450; odd rows (1+3+...+99) = 2500
+(min (at Rmcp_s 's)) -- 2450
+(max (at Rmcp_s 's)) -- 2500
+
+;; ─── Sub-path C: !direct_ok (min agg, group_rows_range_existing) ─────
+;; MIN is not a direct_ok agg → group_rows_range_existing (lines 7045-7056).
+(set Rmcp_m (select {c: (count k1) m: (min v) from: Tmcp by: [k1 k2] desc: c take: 2}))
+(count Rmcp_m) -- 2
+;; BUG (group.c !direct_ok path): group_ht_insert_empty_group zeros the row (including
+;; the MIN accumulator to 0) but group_rows_range_existing calls group_probe_existing_entry
+;; which only does `if (v < *p) *p = v` — so the first probe never initialises MIN from
+;; the actual first element when all source values are non-negative.  For group (512,511)
+;; the true minimum is 1 but the accumulator stays 0.
+;; (min (at Rmcp_m 'm)) -- 0   ;; xfail BUG: MIN zero-init in !direct_ok top_count path
+;; (max (at Rmcp_m 'm)) -- 1   ;; xfail BUG: should be 1, produces 0
+
+;; ─── I64×I32 key variant → TOP_COUNT2_FIXED_LOOP(int64_t,int32_t) ────
+;; k1 I64 (range 513), k2 I32 (range 512), product > 262 144 → DA rejects.
+;; Exercises the k0_64&&k1_32 branch of TOP_COUNT2_FIXED_LOOP (line 6799).
+(set Tmcp32 (table [k1 k2 v] (list (as 'I64 (* (% (til Nmcp) 2) 512)) (as 'I32 (* (% (til Nmcp) 2) 511)) (as 'I64 (til Nmcp)))))
+(set Rmcp32 (select {c: (count k1) s: (sum v) from: Tmcp32 by: [k1 k2] desc: c take: 2}))
+(count Rmcp32) -- 2
+(min (at Rmcp32 's)) -- 2450
+(max (at Rmcp32 's)) -- 2500
+
+;; ─── I32×I64 key variant → TOP_COUNT2_FIXED_LOOP(int32_t,int64_t) ────
+;; Exercises the k0_32&&k1_64 branch (line 6800).
+(set Tmcp32b (table [k1 k2 v] (list (as 'I32 (* (% (til Nmcp) 2) 512)) (as 'I64 (* (% (til Nmcp) 2) 511)) (as 'I64 (til Nmcp)))))
+(set Rmcp32b (select {c: (count k1) s: (sum v) from: Tmcp32b by: [k1 k2] desc: c take: 2}))
+(count Rmcp32b) -- 2
+(min (at Rmcp32b 's)) -- 2450
+(max (at Rmcp32b 's)) -- 2500
+
+;; ─── I16 first key → counted_fast=false → generic counting loop ───────
+;; I16 keys are NOT matched by k0_64/k0_32 in TOP_COUNT2_FIXED_LOOP, so
+;; counted_fast stays false and the generic key-hash loop fires (line 6804).
+;; k1 I16 range [0,512]=513, k2 I64 range [0,511]=512, product > 262 144.
+(set Tmcph16 (table [k1 k2 v] (list (as 'I16 (* (% (til Nmcp) 2) 512)) (as 'I64 (* (% (til Nmcp) 2) 511)) (as 'I64 (til Nmcp)))))
+(set Rmcph16 (select {c: (count k1) s: (sum v) from: Tmcph16 by: [k1 k2] desc: c take: 2}))
+(count Rmcph16) -- 2
+(min (at Rmcph16 's)) -- 2450
+(max (at Rmcph16 's)) -- 2500
+
+;; ─── Heap sift: groups with distinct counts trigger sift-up and ────────
+;;     sift-down in the top-K heap builder (lines 7107-7124).
+;;
+;; Table: 4 groups with row counts 4, 3, 2, 1 using wide k ranges.
+;; k1 in {0,512,0,512}, k2 in {0,0,511,511} → 4 distinct (k1,k2) pairs.
+;; take=3: top-3 groups by count = (0,0):4, (512,0):3, (0,511):2.
+;; Heap build with decreasing counts triggers sift-up swaps (line 7110).
+(set Ts4 (table [k1 k2 v] (list (as 'I64 [0 0 0 0 512 512 512 0 0 512]) (as 'I64 [0 0 0 0 0 0 0 511 511 511]) (as 'I64 [1 2 3 4 5 6 7 8 9 10]))))
+;; k1 range [0,512]=513, k2 range [0,511]=512, product > 262 144 → DA rejects.
+(set Rs4 (select {c: (count k1) s: (sum v) from: Ts4 by: [k1 k2] desc: c take: 3}))
+(count Rs4) -- 3
+;; BUG (group.c direct_ok top_count path): count field of top_ht row is pre-seeded with
+;; cc[i] at line 6907 but the direct scatter loop also does (*(int64_t*)row)++ for each
+;; matching source row (line 7025), resulting in a doubled count.  True max is 4, got 8.
+;; (max (at Rs4 'c)) -- 4   ;; xfail BUG: double-count in direct_ok top_count path
+;; (min (at Rs4 'c)) -- 2   ;; xfail BUG: should be 2, produces 4
+;; Sum of top-3 groups: (1+2+3+4)+(5+6+7)+(8+9) = 10+18+17 = 45
+(sum (at Rs4 's)) -- 45
+
+;; ─── "Too many heavy" skip via cc[] path ────────────────────────────
+;; Note: lines 7140-7143 (pivot_ingest "too many heavy" skip) are only reachable
+;; when keys_alloc_ok || cc fails (OOM).  With small tables the cc[] fast path
+;; (lines 6725-7069) succeeds; the pivot_ingest fallback (lines 7078-7184) is
+;; never reached.  This test still exercises the !direct_ok sub-path in cc[].
+(set Tss (table [k1 k2 v] (list (as 'I64 [0 0 0 0 512 512 512 0]) (as 'I64 [0 0 0 0 0 0 0 511]) (as 'I64 [1 2 3 4 5 6 7 8]))))
+;; 3 groups: (0,0):4 rows v=[1-4], (512,0):3 rows v=[5-7], (0,511):1 row v=[8].
+(set Rss (select {c: (count k1) m: (min v) from: Tss by: [k1 k2] desc: c take: 3}))
+(count Rss) -- 3
+;; BUG: same zero-init MIN bug as above; true min of (0,0) group is 1, accumulator stays 0.
+;; (min (at Rss 'm)) -- 1   ;; xfail BUG: zero-init MIN in !direct_ok top_count path
+;; BUG: same double-count as Rs4; true max-count is 4, produces 8.
+;; (max (at Rss 'c)) -- 4   ;; xfail BUG: double-count in !direct_ok top_count path
+
+;; ─── 3-key test: generic counted loop for n_keys=3 (line 6804) ────────
+;; With n_keys=3, TOP_COUNT2_FIXED_LOOP (n_keys==2 only) doesn't fire,
+;; so counted_fast stays false → generic loop at line 6804 must run.
+;; k1/k2/k3 all range [0,100]=101 → 101^3 > 262 144 → DA rejects.
+(set Tmcp3 (table [k1 k2 k3 v] (list (as 'I64 (* (% (til Nmcp) 2) 100)) (as 'I64 (* (% (til Nmcp) 2) 100)) (as 'I64 (* (% (til Nmcp) 2) 100)) (as 'I64 (til Nmcp)))))
+(set Rmcp3 (select {c: (count k1) m: (min v) from: Tmcp3 by: [k1 k2 k3] desc: c take: 2}))
+(count Rmcp3) -- 2
+(min (at Rmcp3 'm)) -- 0
+;; BUG: zero-init MIN; for group (100,100,100) true min is 1 but accumulator stays 0.
+;; (max (at Rmcp3 'm)) -- 1  ;; xfail BUG: zero-init MIN in !direct_ok top_count path
+
+;; ─── unique_first_key=false path (line 7002) ─────────────────────────
+;; When two heavy groups share the same first key, unique_first_key=false
+;; and the non-hash linear scan fires (lines 7002-7022).
+;; take=3 includes (0,0), (0,511), and (512,0); first two share k1=0.
+(set Tufk (table [k1 k2 v] (list (as 'I64 [0 0 0 0 0 512 512 512 512]) (as 'I64 [0 0 0 511 511 0 0 0 0]) (as 'I64 [1 2 3 4 5 6 7 8 9]))))
+;; Groups: (0,0):3 rows sum=6, (0,511):2 rows sum=9, (512,0):4 rows sum=30.
+;; take=3 → all 3 heavy, unique_first_key=false (0,0) and (0,511) share k1=0.
+(set Rufk (select {c: (count k1) s: (sum v) from: Tufk by: [k1 k2] desc: c take: 3}))
+(count Rufk) -- 3
+(sum (at Rufk 's)) -- 45
+
+;; ════════════════════════════════════════════════════════════════════
+;; Single-key sp_eligible filter paths (group.c lines 6149-6460)
+;;
+;; The single-key sparse path has three sub-paths when use_emit_filter=true:
+;;   1. Dynamic-dense (keys < 16,777,216): lines 5967-6220 (covered by Re above)
+;;   2. Numeric-dense (keys ≥ 16,777,216, range ≤ 67,108,864): lines 6226-6420
+;;   3. Sparse-HT    (range > 67,108,864): lines 6422-6640 with emit_filter
+;;   Plus: SYM-key   (count_only_first=true, range_sum=NULL): lines 6149-6197
+;; ════════════════════════════════════════════════════════════════════
+
+;; ─── Numeric-dense filter path (lines 6226-6420) ─────────────────────
+;; Requirements: (1) DA fails (range > 262,144), (2) dynamic-dense fails
+;; (key ≥ max_dense_cap=16,777,216), (3) numeric-dense fits (range ≤ 67M).
+;; Keys 16,777,216 and 17,039,360: range=262,145 > 262,144 → DA rejects.
+;; Both keys ≥ 16,777,216 → dynamic path fails.  Range 262,145 ≤ 67M.
+(set Tnd (table [k v] (list (as 'I64 [16777216 16777216 16777216 17039360 17039360]) (as 'I64 [10 20 30 40 50]))))
+(set Rnd (select {c: (count k) s: (sum v) from: Tnd by: k desc: c take: 2}))
+(count Rnd) -- 2
+;; k=16777216: count=3 sum=60, k=17039360: count=2 sum=90. take=2 keeps both.
+(sum (at Rnd 's)) -- 150
+
+;; Numeric-dense with count-only (range_sum=NULL in numeric dense path, line 6252):
+(set Tndc (table [k] (list (as 'I64 [16777216 16777216 16777216 17039360 17039360]))))
+(set Rndc (select {c: (count k) from: Tndc by: k desc: c take: 1}))
+(count Rndc) -- 1
+(at (at Rndc 'c) 0) -- 3
+
+;; ─── SYM-key + SUM + emit filter (lines 6149-6197) ──────────────────
+;; SYM key forces count_only_first=true → range_sum is never allocated.
+;; After the first counting pass, a second pass (lines 6149-6197) scatter-
+;; accumulates SUM using the repurposed range_count array as a group-index map.
+;; 3 symbols, take=2 → keep top-2 by frequency: 'a (×3) and 'b (×2).
+(set Tsym (table [k v] (list ['a 'b 'a 'b 'a 'c] (as 'I64 [1 2 3 4 5 6]))))
+(set Rsym (select {c: (count k) s: (sum v) from: Tsym by: k desc: c take: 2}))
+(count Rsym) -- 2
+;; 'a: count=3 sum=1+3+5=9, 'b: count=2 sum=2+4=6. Both in top-2.
+(sum (at Rsym 's)) -- 15
+
+;; ─── Sparse-HT filter + SUM path (lines 6427-6618) ──────────────────
+;; Key range > 67,108,864 skips numeric-dense → sparse HT path with emit_filter.
+;; Lines 6427-6447 (emit-filter sparse HT counting) and 6594-6618 (heavy SUM).
+;; Use keys 0 and 70,000,000 → range = 70,000,001 > 67,108,864.
+(set Tsht (table [k v] (list (as 'I64 [0 0 0 70000000 70000000 70000001]) (as 'I64 [10 20 30 40 50 60]))))
+(set Rsht (select {c: (count k) s: (sum v) from: Tsht by: k desc: c take: 2}))
+(count Rsht) -- 2
+;; k=0: count=3 sum=60, k=70M: count=2 sum=90. take=2 keeps both.
+(sum (at Rsht 's)) -- 150

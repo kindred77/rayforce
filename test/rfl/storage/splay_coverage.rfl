@@ -19,12 +19,12 @@
 ;;   splay_save_impl line 74 true   — mkdir_p failure — REACHABLE (covered
 ;;                                    below via /proc/ path).
 ;;
-;;   splay_save_impl line 78        — ray_sym_save_bulk: called only from
-;;                                    splay_save_impl with durable=false AND
-;;                                    sym_path != NULL.  The only callers
-;;                                    that set durable=false are in csv.c,
-;;                                    which always pass sym_path=NULL.  No
-;;                                    RFL builtin exposes this combination.
+;;   splay_save_impl line 78        — ray_sym_save_bulk: COVERED by
+;;                                    test/test_splay.c::test_save_bulk_with_sym_path
+;;                                    which calls ray_splay_save_bulk() with
+;;                                    sym_path != NULL (the only way to reach
+;;                                    this branch).  Not reachable from RFL
+;;                                    because csv.c always passes sym_path=NULL.
 ;;
 ;;   splay_save_impl line 79 true   — sym_save error: requires durable=true +
 ;;                                    sym_path in an unwritable directory.
@@ -33,12 +33,13 @@
 ;;                                    (line 74), so line 79 never fires
 ;;                                    independently from RFL.
 ;;
-;;   splay_save_impl lines 89,115   — snprintf overflow guards: the path
-;;                                    buffer is 1024 bytes; column names and
-;;                                    dir paths are bounded by the OS (4096)
-;;                                    and the str_to_cpath check (1024),
-;;                                    so neither overflow can occur for any
-;;                                    valid RFL argument.
+;;   splay_save_impl lines 89,115   — snprintf overflow guards: COVERED by
+;;                                    test/test_splay.c::test_save_dir_path_too_long
+;;                                    (line 89, dir path ≥1021 chars) and
+;;                                    test_save_col_path_too_long (line 115,
+;;                                    column name ≥1012 chars for 11-char dir).
+;;                                    Not reachable from RFL because str_to_cpath
+;;                                    limits all path arguments to 1023 bytes.
 ;;
 ;;   splay_save_impl lines 91,120   — col/schema save I/O error: requires
 ;;                                    the directory to become unwritable after

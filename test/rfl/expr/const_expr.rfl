@@ -1,0 +1,129 @@
+;; Coverage for eval_const_numeric_expr in expr.c:
+;;   - integer IDIV path (lines 141-144): reached via exec_group n_keys=0 with
+;;     try_linear_sumavg_input_i64 → parse_linear_i64_expr → const_expr_to_i64 →
+;;     eval_const_numeric_expr on an integer-typed (div A B) node.
+;;   - F64 IDIV path (line 120): same route but with a float operand, so
+;;     l_is_f64=true and the F64 branch fires first.
+;;   - integer IDIV by-zero path (line 142): ri==0 → return false, fast-path
+;;     rejected, exec_group falls back to vector materialisation.
+;;
+;; All queries use (select {agg: ... from: T}) with no `by:` clause and
+;; all-aggregate outputs so query.c routes to ray_group(n_keys=0) →
+;; exec_group → try_linear_sumavg_input_i64.
+
+;; ===================================================================
+;; Setup: small non-nullable I64 table.
+;; HAS_NULLS must be 0: try_linear_sumavg_input_i64 line 302 rejects nullable cols.
+;; ===================================================================
+(set Tce (table [x] (list [1 2 3 4 5])))
+
+;; ===================================================================
+;; Integer IDIV path in eval_const_numeric_expr (lines 141-144)
+;;
+;; (div 10 3) → OP_IDIV, out_type=I64, both operands I64.
+;; At line 111: out_type!=F64, !l_is_f64, !r_is_f64, opc!=OP_DIV → integer branch.
+;; Line 141: case OP_IDIV: ri=3≠0, r=10/3=3, ((10^3)≥0 so no fixup) → *out_i=3.
+;; sum(x * 3) = (1+2+3+4+5)*3 = 45
+;; ===================================================================
+(select {s: (sum (* x (div 10 3))) from: Tce}) -- (table [s] (list [45]))
+
+;; Negative dividend: floor(-7 / 2) = -4 (line 143 fixup: ((-7^2)<0 and r*2≠-7))
+;; sum(x * -4) = 15 * (-4) = -60
+(select {s: (sum (* x (div -7 2))) from: Tce}) -- (table [s] (list [-60]))
+
+;; ===================================================================
+;; Integer IDIV by-zero path (line 142): ri==0 → eval_const_numeric_expr
+;; returns false → const_expr_to_i64 fails → try_linear_sumavg_input_i64 fails.
+;; exec_group falls back to vector materialisation: idiv(1,0) produces 0
+;; (binary_range OP_IDIV: rv==0.0 → 0), so sum(x*0) = 0.
+;; ===================================================================
+(select {s: (sum (* x (div 1 0))) from: Tce}) -- (table [s] (list [0]))
+
+;; ===================================================================
+;; F64 IDIV path in eval_const_numeric_expr (line 120)
+;;
+;; (div 10.0 3) → OP_IDIV, l_is_f64=true.
+;; At line 111: l_is_f64=true → F64 branch fires.
+;; Line 120: case OP_IDIV: r = rv!=0.0 ? floor(lv/rv) : NAN → floor(10.0/3)=3.0.
+;; const_expr_to_i64: c_is_f64=true, c_f=3.0, modf(3.0)==0.0 → *out=3.
+;; sum(x * 3) = 45.
+;; ===================================================================
+(select {s: (sum (* x (div 10.0 3))) from: Tce}) -- (table [s] (list [45]))
+
+;; ===================================================================
+;; linear_expr_scale k=1: covers the early-return branch at line 208
+;; when scale==1 the function returns immediately without multiplying.
+;; sum(x * 1) = 1+2+3+4+5 = 15
+;; ===================================================================
+(select {s: (sum (* x 1)) from: Tce}) -- (table [s] (list [15]))
+
+;; ===================================================================
+;; ABS of positive constant (optimizer folds to 3): behavioral test.
+;; sum(x * abs(3)) = sum(x * 3) = 45
+;; ===================================================================
+(select {s: (sum (* x (abs 3))) from: Tce}) -- (table [s] (list [45]))
+
+;; ===================================================================
+;; ABS of negative constant (optimizer folds to 3): behavioral test.
+;; sum(x * abs(-3)) = sum(x * 3) = 45
+;; ===================================================================
+(select {s: (sum (* x (abs -3))) from: Tce}) -- (table [s] (list [45]))
+
+;; ===================================================================
+;; Fractional F64 constant → const_expr_to_i64 rejects at modf check
+;; (line 171: modf(3.5, &ip) = 0.5 ≠ 0.0 → return false → fast path
+;; rejected, falls back to vector materialisation)
+;; sum(x * 3.5) = (1+2+3+4+5)*3.5 = 15*3.5 = 52.5
+;; ===================================================================
+(select {s: (sum (* x 3.5)) from: Tce}) -- (table [s] (list [52.5]))
+
+;; ===================================================================
+;; Non-finite constant (NaN from 0.0/0.0) → const_expr_to_i64 rejects
+;; at isfinite check (line 169: !isfinite(NaN) → return false → fallback)
+;; 0.0/0.0 = NaN; x*NaN = NaN for all x; sum([NaN...]) = 0 (nulls ignored)
+;; ===================================================================
+(select {s: (sum (* x (div 0.0 0.0))) from: Tce}) -- (table [s] (list [0]))
+
+;; ===================================================================
+;; Inf additive constant → try_affine_sumavg_input rejects at isfinite
+;; check (line 377: !isfinite(Inf) → return false → fallback)
+;; sum(x + Inf) = sum([Inf,Inf,...]) = 0 (NaN/Inf collapsed to null)
+;; ===================================================================
+(select {s: (sum (+ x (div 1.0 0.0))) from: Tce}) -- (table [s] (list [0]))
+
+;; ===================================================================
+;; Fractional additive constant → try_affine_sumavg_input rejects at
+;; modf check (line 379: modf(3.5)=0.5≠0 → return false → fallback)
+;; sum(x + 3.5) = (1+3.5)+(2+3.5)+(3+3.5)+(4+3.5)+(5+3.5) = 32.5
+;; ===================================================================
+(select {s: (sum (+ x 3.5)) from: Tce}) -- (table [s] (list [32.5]))
+
+;; ===================================================================
+;; DATE constant in arithmetic → atom_to_numeric called with -RAY_DATE
+;; type (line 38: case -RAY_DATE → Branch(39:9) True).
+;; 2024.01.01 represents 8766 days; sum(x * 8766) = 15 * 8766 = 131490
+;; ===================================================================
+(select {s: (sum (* x 2024.01.01)) from: Tce}) -- (table [s] (list [131490]))
+
+;; ===================================================================
+;; TIME constant in arithmetic → atom_to_numeric with -RAY_TIME
+;; (line 39: case -RAY_TIME → Branch(40:9) True).
+;; 12:00:00 = 43200000ms; sum(x * 43200000) = 15 * 43200000 = 648000000
+;; ===================================================================
+(select {s: (sum (* x 12:00:00)) from: Tce}) -- (table [s] (list [648000000]))
+
+;; ===================================================================
+;; TIMESTAMP constant in arithmetic → atom_to_numeric with -RAY_TIMESTAMP
+;; (line 40: case -RAY_TIMESTAMP → Branch(40:9) True).
+;; 2000.01.01D00:00:00.000000001 = 1 nanosecond since epoch.
+;; sum(x * 1) = 1+2+3+4+5 = 15
+;; ===================================================================
+(select {s: (sum (* x 2000.01.01D00:00:00.000000001)) from: Tce}) -- (table [s] (list [15]))
+
+;; ===================================================================
+;; F64 NEG constant → eval_const_numeric_expr NEG/ABS branch (line 83:25)
+;; (neg 3.0): inner CONST is F64 → a_is_f64=true → Branch(83:25) True.
+;; const_expr_to_i64: modf(-3.0)=0 → k=-3.
+;; sum(x * -3) = (1+2+3+4+5)*(-3) = -45
+;; ===================================================================
+(select {s: (sum (* x (neg 3.0))) from: Tce}) -- (table [s] (list [-45]))

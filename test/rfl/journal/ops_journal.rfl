@@ -4,50 +4,44 @@
 ;; test/rfl/system/log_journal.rfl (stages A-J run in-process).  This file
 ;; targets the remaining zero-coverage regions after that suite runs:
 ;;
-;;   (a) ray_log_write_fn: lazy-expr materialisation path (lines 92-97).
-;;       ray_log_write_fn calls ray_is_lazy() before serialising; when expr
-;;       is lazy (e.g. the result of `asc`) it must materialise it first.
-;;       The existing tests only pass self-evaluating integers/vectors —
-;;       none trigger the lazy branch.
-;;
-;;   (b) ray_log_replay_fn: RAY_JREPLAY_DESER switch arm (lines 150-153).
+;;   (a) ray_log_replay_fn: RAY_JREPLAY_DESER switch arm.
 ;;       Reached when replay reads a valid IPC frame but ray_de_raw rejects
 ;;       the payload (unknown type tag, bad length, etc.).  Crafting the
 ;;       binary file with .sys.exec/python3 is the only RFL-reachable path.
 ;;
-;;   (c) ray_log_replay_fn: RAY_JREPLAY_DECOMP switch arm (lines 154-157).
+;;   (b) ray_log_replay_fn: RAY_JREPLAY_DECOMP switch arm.
 ;;       Reached when the COMPRESSED flag is set in the frame header but
 ;;       the compressed bytes cannot be decompressed.
 ;;
 ;; Unreachable from RFL (documented):
 ;;
-;;   ray_log_open_fn  line 73   — base path ≥ 1024 bytes: the str_to_cpath
-;;                               buffer is on the stack; the only RFL way to
-;;                               pass a >1023-char string requires (concat
-;;                               ...) but the journal open is synchronous, so
-;;                               longer paths would crash str_to_cpath's
-;;                               caller before the guard fires.  In practice
-;;                               no filesystem supports >1000-char paths.
+;;   ray_log_open_fn  str_to_cpath guard — base path ≥ 1024 bytes: no
+;;                               filesystem supports >1000-char component paths.
 ;;
-;;   ray_log_write_fn lines 100-103 — ray_serde_size() ≤ 0: unreachable for
-;;                               any valid ray_t value the runtime can hold.
+;;   ray_log_write_fn lazy-materialise block — eval.c unconditionally
+;;                               materialises lazy args for non-LAZY_AWARE fns
+;;                               (src/lang/eval.c op_call1, ~line 1993) before
+;;                               dispatching to ray_log_write_fn, so the
+;;                               ray_is_lazy() guard inside the fn can never be
+;;                               true when called via RFL.
 ;;
-;;   ray_log_write_fn lines 106-109 — ray_sys_alloc OOM: OOM guard not
-;;                               triggerable from RFL without exhausting the
-;;                               process address space.
+;;   ray_log_write_fn serde-size ≤ 0 — unreachable for any valid ray_t.
 ;;
-;;   ray_log_write_fn lines 112-116 — ray_ser_raw size mismatch: unreachable;
-;;                               ray_ser_raw is deterministic given a fixed
-;;                               ray_t and ray_serde_size returns the exact
-;;                               byte count.
+;;   ray_log_write_fn ray_sys_alloc OOM — not triggerable from RFL.
 ;;
-;;   ray_log_replay_fn lines 158-161 — RAY_JREPLAY_OOM: reaching OOM in the
-;;                               middle of replaying a log entry requires
-;;                               exhausting memory, not achievable from RFL.
+;;   ray_log_write_fn ray_ser_raw size mismatch — deterministic; size always
+;;                               matches what ray_serde_size returned.
 ;;
-;;   ray_log_replay_fn line 166  — return ray_error("internal", ...): the
-;;                               switch is exhaustive over the 6-value enum;
-;;                               the default fall-through is dead.
+;;   ray_log_replay_fn RAY_JREPLAY_OOM — mid-replay OOM not triggerable from
+;;                               RFL without exhausting process address space.
+;;
+;;   ray_log_replay_fn switch default — exhaustive enum; fall-through is dead.
+;;
+;;   err_to_ray fallback branches — ray_err_code_str always returns non-NULL
+;;                               for all valid ray_err_t values.
+;;
+;;   ray_log_validate_fn OOM guards — ray_list_new / ray_list_append OOM not
+;;                               triggerable from RFL.
 ;;
 ;; Base path: /tmp/rfl_ops_journal — distinct from system/log_journal.rfl
 ;; (/tmp/rfl_log_inproc) to avoid cross-test state pollution.
@@ -56,42 +50,29 @@
 (.sys.exec "rm -f /tmp/rfl_ops_journal.log /tmp/rfl_ops_journal_deser.log /tmp/rfl_ops_journal_decomp.log")
 
 ;; ════════════════════════════════════════════════════════════════════════
-;; 1. Lazy-expr materialisation in ray_log_write_fn (lines 92-97).
+;; 1. Basic .log.open / .log.write / .log.replay round-trip.
 ;;
-;; `(asc V)` produces a lazy object.  When passed to .log.write, the fn
-;; checks ray_is_lazy(), sets owned=true, calls ray_lazy_materialize, and
-;; serialises the materialised concrete vector.  On success .log.write
-;; returns null — same observable result as a non-lazy argument.
+;; Note: asc, desc, and reverse are NOT LAZY_AWARE, so eval.c materialises
+;; their results before passing to .log.write — the ray_is_lazy() guard
+;; inside ray_log_write_fn is never reached from RFL.  These tests exercise
+;; the happy-path write machinery and replay round-trip instead.
 ;;
-;; Three lazy expressions exercise the branch three times, hitting the
-;; retain/materialise/owned-release path once per call.
+;; Use only self-evaluating atoms (integers, floats) so replay can re-eval
+;; them without triggering name-lookup errors for string literals.
 ;; ════════════════════════════════════════════════════════════════════════
 (nil? (.log.open 'async "/tmp/rfl_ops_journal")) -- true
 
-;; Lazy from asc — exercises the is_lazy → materialise path.
-(nil? (.log.write (asc [3 1 4 1 5]))) -- true
-
-;; Lazy from desc — second pass through the same branch.
-(nil? (.log.write (desc [2 7 1 8 2]))) -- true
-
-;; Lazy from reverse — third pass; also proves the write machinery
-;; handles any lazy result, not just asc/desc.
-(nil? (.log.write (reverse [10 20 30]))) -- true
-
-;; Non-lazy for contrast: integer literal is not lazy, takes the else branch.
-(nil? (.log.write 99)) -- true
+;; Write various self-evaluating values through the serialise path.
+(nil? (.log.write 42))          -- true
+(nil? (.log.write 3.14))        -- true
+(nil? (.log.write -7))          -- true
+(nil? (.log.write [1 2 3 4 5])) -- true
 
 (nil? (.log.close)) -- true
 
-;; Validate the log — must contain at least 4 entries (3 lazy + 1 non-lazy).
-(set vLazy (.log.validate "/tmp/rfl_ops_journal.log"))
-(>= (first vLazy) 4) -- true
-(>  (last  vLazy) 0) -- true
-
-;; Replay the log — materialised values are self-evaluating; replay should
-;; return the chunk count and not error.
-(set repLazy (.log.replay "/tmp/rfl_ops_journal.log"))
-(>= repLazy 4) -- true
+;; Replay the log — all 4 entries are self-evaluating; replay returns
+;; the chunk count (an integer ≥ 4).
+(>= (.log.replay "/tmp/rfl_ops_journal.log") 4) -- true
 
 ;; ════════════════════════════════════════════════════════════════════════
 ;; 2. RAY_JREPLAY_DESER — valid IPC frame, invalid payload (lines 150-153).
