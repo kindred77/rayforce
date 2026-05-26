@@ -60,3 +60,10 @@
 (sum 3.14) -- 3.14
 ;; DATE vec → type error (line 228)
 (sum (as 'DATE [7300 7301])) !- type
+
+;; ---- error propagation through agg inside select (exec_group path) ----
+(set _erp_T (table [v] (list (as 'I64 [10 20 30]))))
+(select {s: (sum (round "x")) from: _erp_T})   !- type
+(select {s: (avg (sqrt "x")) from: _erp_T})    !- type
+(select {s: (min (+ "a" 1)) from: _erp_T})     !- type
+(select {s: (max (+ "a" 1)) from: _erp_T})     !- type
