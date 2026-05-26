@@ -53,3 +53,14 @@
 ;; Empty vectors and indices
 (split [] []) -- null
 (split [1 2 3] []) -- null
+
+;; ── error-guard regression: split type guards (strop.c 277, 280) ──
+;; First-arg `str` must be string atom / sym / list / vector; numeric
+;; atom falls through both vector and list dispatches and hits the
+;; "else return ray_error("type", NULL)" on line 277.
+(split 42 ",")   !- type
+(split 1.5 ",")  !- type
+;; First-arg is a valid string; delim must be string atom — numeric
+;; delim falls through and hits the "type" guard on line 280.
+(split "abc" 42)   !- type
+(split "abc" 1.5)  !- type

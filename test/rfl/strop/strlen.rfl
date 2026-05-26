@@ -2,3 +2,13 @@
 (strlen "") -- 0
 (strlen 'alpha) -- 5
 (sum (strlen ["aa" "bbb" ""])) -- 5
+
+;; ── error-guard regression: type guards on non-string inputs ──
+;; Atom fall-through (ray_strlen_fn line 152): numeric atom is not
+;; string/sym/list/vec/MAPCOMMON/PARTED — fails the final dispatch.
+(strlen 42)   !- type
+(strlen 1.5)  !- type
+;; Vec fall-through (strlen_vec line 65): vector of non-string type.
+(strlen [1 2 3])     !- type
+(strlen [1.0 2.0])   !- type
+(strlen [true false]) !- type

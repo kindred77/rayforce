@@ -43,3 +43,7 @@
 (< 'foobar 'foo) -- false
 (< ['a 'b 'c] 'b) -- [true false false]
 (< ['a 'b] ['b 'a]) -- [true false]
+
+;; type errors — cross-type compare not numeric/temporal/sym/str
+(< 'foo 1) !- type
+(< 1 'foo) !- type

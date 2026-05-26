@@ -59,3 +59,7 @@
 ;; 's' > 'l' so 'short > 'longer_…
 (> 'short 'longer_than_twelve_bytes_symbol) -- true
 (> 'longer_than_twelve_bytes_symbol 'short) -- false
+
+;; type errors — cross-type compare not numeric/temporal/sym/str
+(> 'foo 1) !- type
+(> 1 'foo) !- type

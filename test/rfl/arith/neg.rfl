@@ -106,3 +106,7 @@
 ;; goes through atomic_map_unary → ray_neg_fn per element.
 (nil? (at (neg Vn) 0)) -- true
 (at (neg Vn) 1)        -- 5
+
+;; type errors — non-numeric input
+(neg "abc") !- type
+(neg 'foo)  !- type

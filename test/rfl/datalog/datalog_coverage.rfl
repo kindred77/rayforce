@@ -303,3 +303,68 @@
 (set Db (datoms))
 (set Db (assert-fact Db 1 'tag 'x))
 (query Db (find ?e) (where (p ?e)) (rules ((p ?e) (?e :tag 'x) (not (q ?e))) ((q ?e) (?e :tag 'x) (not (p ?e))))) !- domain
+
+;; ════════════════════════ extra error-guard coverage (round 2) ═════════════════════════
+;; scan-eav 3-arg: non-sym attr (line 3281)
+(set Db (datoms))
+(set Db (assert-fact Db 1 'age 30))
+(scan-eav Db 1 1) !- type
+
+;; query: first arg of (find ...) must be a symbol (line 3964).
+;; Use an integer in head position so find_elems[0]->type != -RAY_SYM.
+(query Db (3 ?e) (where (?e :age 30))) !- type
+;; same for (where ...) — line 3995
+(query Db (find ?e) (3 (?e :age 30))) !- type
+;; same for the optional fourth arg (rules ...) — line 4014
+(query Db (find ?e) (where (?e :age 30)) (3)) !- type
+
+;; not: inner clause must be a list (line 3639)
+(query Db (find ?e) (where (?e :age 30) (not 5))) !- type
+;; not: inner clause head must be a symbol (line 3658)
+(query Db (find ?e) (where (?e :age 30) (not (5 ?e)))) !- type
+
+;; aggregate: predicate must be a symbol (line 3688)
+(query Db (find ?n) (where (foo ?n)) (rules ((employee ?e ?v) (?e :age ?v)) ((foo ?n) (sum ?n 1 1)))) !- type
+;; aggregate: group key must be ?variable (line 3717)
+(query Db (find ?n ?k) (where (foo ?n ?k)) (rules ((employee ?e ?v) (?e :age ?v)) ((foo ?n ?k) (sum ?n employee 1 by 5 0)))) !- type
+;; aggregate: at most one value column index (line 3732)
+(query Db (find ?n) (where (foo ?n)) (rules ((employee ?e ?v) (?e :age ?v)) ((foo ?n) (sum ?n employee 1 2)))) !- type
+;; aggregate: unexpected token in aggregate clause (line 3738) — a non-int, non-by symbol
+(query Db (find ?n) (where (foo ?n)) (rules ((employee ?e ?v) (?e :age ?v)) ((foo ?n) (sum ?n employee 'bogus)))) !- type
+
+;; Rule special form: assignment with unparseable RHS expression (line 3782).
+;; (= ?y (zzz ?x)) — zzz is not a known arithmetic operator,
+;; so dl_build_expr returns NULL and we hit the type guard.
+(query Db (find ?e ?y) (where (?e :age ?x) (= ?y (zzz ?x)))) !- type
+
+;; Expression comparison: LHS expression that fails to parse (line 3827).
+;; (< (zzz ?x) ?y) — neither side is a plain var or const, so the
+;; expression-builder branch fires; with zzz unknown, le ends up NULL.
+(query Db (find ?e) (where (?e :age ?x) (?e :age ?y) (< (zzz ?x) (+ ?y 1)))) !- type
+
+;; ════════════════════════ rule special form extra guards ═════════════════════════
+;; rule body: (not 5) — non-list inner clause (also covers 3639 via (rule))
+(rule (bad-r ?e) (?e :age 30) (not 5)) !- type
+;; rule body: (not (5 ?x)) — non-sym inner head
+(rule (bad-r ?e) (?e :age 30) (not (5 ?e))) !- type
+;; rule body: aggregate predicate not a symbol
+(rule (bad-r ?n) (sum ?n 1 1)) !- type
+;; rule body: aggregate with unexpected token
+(rule (bad-r ?n) (sum ?n employee 'bogus)) !- type
+
+;; rule/query: unrecognized body clause form (line 3848).
+;; A body clause whose head is itself a list (not a symbol) — falls past
+;; every recognized shape and lands at the final unrecognized-form guard.
+(query Db (find ?e) (where (?e :age 30) ((+ 1 2) ?e))) !- type
+
+;; rule: cannot evaluate constant in body (line 3594).
+;; Pass a body-position term whose ray_eval fails — an apply of an
+;; unknown function lands in the dl_set_body_pos fallback path.
+;; ray_eval returns its own error (e.g. "name" for unknown function), so
+;; the guard returns that error verbatim — both branches of the if are
+;; taken across this test and the empty-result case above.
+(query Db (find ?e) (where (?e :age 30) (some-rel ?e (nonexistent-fn 1)))) !- name
+;; rule: unsupported constant type in body (line 3601).
+;; A body-position term that evaluates successfully to a non-i64/sym
+;; (a list literal here) trips the unsupported-constant-type guard.
+(query Db (find ?e) (where (?e :age 30) (some-rel ?e [1 2 3]))) !- type

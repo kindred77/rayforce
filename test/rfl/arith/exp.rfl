@@ -15,3 +15,7 @@
 (set X (div (- (rand 128 400) 200) 100))
 (set Y (div (- (rand 128 400) 200) 100))
 (count X) -- (sum (< (abs (- (exp (+ X Y)) (* (exp X) (exp Y)))) 0.001))
+
+;; type errors — non-numeric input
+(exp "abc") !- type
+(exp 'foo)  !- type

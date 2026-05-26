@@ -198,3 +198,10 @@
 (sum (as 'I64 (== (at rk5s 'g) (asc gs)))) -- 100
 ;; desc also works end to end
 (count (xdesc rk5 ['g 'p])) -- 100
+
+;; OP_DISTINCT vector-input guard: a lazy chain whose previous op is
+;; an aggregator (FIRST) yields a scalar at materialisation; OP_DISTINCT
+;; must reject the non-vec input rather than dispatching to
+;; distinct_vec_eager.  Covers exec.c L1049.
+(distinct (first [1 2 3 4])) !- type
+(distinct (last [1 2 3 4])) !- type

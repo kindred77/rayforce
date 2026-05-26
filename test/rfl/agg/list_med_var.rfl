@@ -42,6 +42,10 @@
 
 ;; ─── med type error on non-list non-vec (line 519) ───────────────────
 (med 'some_sym) !- type
+;; Atom path hits 491; dict / table hit the trailing 519 guard
+;; (not atom, not vec, not list, no parted dispatch).
+(med (dict ["a" "b"] [1 2])) !- type
+(med (table [k] (list [1 2 3]))) !- type
 
 ;; ─── var/stddev on list (var_stddev_core list branch: lines 593-607) ──
 ;; Basic: list [1 2 3 4 5], pop_var = 2.0, sample_var = 2.5
@@ -72,6 +76,12 @@
 ;; ─── var type error on non-list non-vec (line 606) ───────────────────
 (var_pop 'sym_input) !- type
 (dev     'sym_input) !- type
+;; Dict / table fall through the atom / vec / list dispatch and land
+;; on the trailing 606 guard.
+(var     (dict ["a" "b"] [1 2])) !- type
+(var_pop (table [k] (list [1 2 3]))) !- type
+(stddev  (dict ["x"] [1])) !- type
+(dev     (table [k] (list [1 2]))) !- type
 
 ;; ─── vec_to_f64_scratch type error path (lines 475-476) ─────────────
 ;; SYM vec is not numeric → error from vec_to_f64_scratch.

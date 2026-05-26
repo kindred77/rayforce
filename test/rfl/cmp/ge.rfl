@@ -41,3 +41,7 @@
 (>= 'b 'a) -- true
 (>= 'a 'b) -- false
 (>= ['a 'b 'c] 'b) -- [false true true]
+
+;; type errors — cross-type compare not numeric/temporal/sym/str
+(>= 'foo 1) !- type
+(>= 1 'foo) !- type
