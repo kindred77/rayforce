@@ -196,3 +196,63 @@
 (count _R11) -- 1
 (at (at _R11 's) 0) -- 'a.b.c.d.e
 (.sys.exec "rm -rf /tmp/rfl_sym_cov_edge2") -- 0
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 12. Narrow-width SYM (W8/W16) operations via CSV ingest
+;;
+;;     `.csv.read [I64 SYMBOL]` narrows the SYM column to W8 (<=255
+;;     distinct ids), exercising:
+;;       - dict.c ray_dict_find_sym W8 arm (used by typed-dict probes)
+;;       - vec.c sym_elem_size narrow path
+;;       - ops/sort.c radix_encode_fn RAY_SYM with W8 ray_read_sym
+;;       - ops/group.c read_col_i64 W8 SYM arm
+;;     Confirms type-preservation: distinct/first/last yield SYM atoms.
+;; ═══════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'id,s\n1,red\n2,blue\n3,green\n4,red\n5,blue\n6,red\n7,green\n8,blue\n' > /tmp/rfl_sym_w8_csv.csv") -- 0
+(set _Tw8 (.csv.read [I64 SYMBOL] "/tmp/rfl_sym_w8_csv.csv"))
+(count _Tw8) -- 8
+(type (at _Tw8 's)) -- 'SYM
+
+;; Distinct on narrow SYM column
+(set _d8 (distinct (at _Tw8 's)))
+(count _d8) -- 3
+(type _d8) -- 'SYM
+
+;; Sort the narrow SYM column (radix path; SYM encode uses ray_read_sym)
+(set _a8 (asc (at _Tw8 's)))
+(at _a8 0) -- 'blue
+(at (take _a8 -1) 0) -- 'red
+
+;; first / last preserve SYM atom from narrow-width column
+(first (at _Tw8 's)) -- 'red
+(last  (at _Tw8 's)) -- 'blue
+(type (first (at _Tw8 's))) -- 'sym
+(type (last  (at _Tw8 's))) -- 'sym
+
+;; group-by aggregation on narrow SYM key
+(set _R8 (select {c: (count id) from: _Tw8 by: s asc: s}))
+(count _R8) -- 3
+(at (at _R8 's) 0) -- 'blue
+(at (at _R8 'c) 0) -- 3   ;; blue: rows 2,5,8
+
+;; Mixed-width compare: narrow W8 SYM vs literal sym atom from W64 table
+(== (first (at _Tw8 's)) 'red) -- true
+(== (last  (at _Tw8 's)) 'blue) -- true
+;; In-membership against literal symbol list
+(in 'green (at _Tw8 's)) -- true
+(in 'purple (at _Tw8 's)) -- false
+
+;; Sort table by narrow SYM column + numeric tie-breaker
+(set _SortW8 (xasc _Tw8 ['s 'id]))
+(count _SortW8) -- 8
+(at (at _SortW8 's) 0) -- 'blue
+(at (at _SortW8 'id) 0) -- 2
+
+;; Splayed round-trip preserves narrow width; sort/agg on reloaded SYM
+;; still hits W8 ray_read_sym.
+(.db.splayed.set "/tmp/rfl_sym_w8_db/" _Tw8)
+(set _Tw8r (.db.splayed.get "/tmp/rfl_sym_w8_db/"))
+(count _Tw8r) -- 8
+(type (at _Tw8r 's)) -- 'SYM
+(at (asc (at _Tw8r 's)) 0) -- 'blue
+(.sys.exec "rm -rf /tmp/rfl_sym_w8_csv.csv /tmp/rfl_sym_w8_db") -- 0

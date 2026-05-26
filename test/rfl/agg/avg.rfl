@@ -11,3 +11,20 @@
 ;; constant vector: avg == that constant
 (set K 42)
 (avg (take (enlist K) 50)) -- 42.0
+
+;; ─── edge cases: single-element / negatives / empty list ─────────────
+(avg [42]) -- 42.0
+(avg [-5]) -- -5.0
+(avg [-10 -20 -30]) -- -20.0
+(avg [0 0 0 0]) -- 0.0
+;; empty list → domain error (line 314 in ray_avg_fn)
+(avg (list)) !- domain
+;; single-element list
+(avg (list 7)) -- 7.0
+;; list with all nulls → typed null F64
+(nil? (avg (list 0Ni 0Ni 0Ni))) -- true
+;; F64 atom passes through
+(avg 3.14) -- 3.14
+(avg -2.5) -- -2.5
+;; null atom → typed null F64
+(nil? (avg 0Nf)) -- true

@@ -38,3 +38,20 @@
 ;; type errors — cross-type compare not numeric/temporal/sym/str
 (<= 'foo 1) !- type
 (<= 1 'foo) !- type
+
+;; ──────────────────────────────────────────────────────────────────
+;; GUID lex <= (memcmp16 path)
+;; ──────────────────────────────────────────────────────────────────
+(set Gs (take (guid 2) 2))
+(<= (at Gs 0) (at Gs 0)) -- true
+
+;; Cross-temporal <=
+(<= (as 'DATE 7305) (as 'DATE 7306)) -- true
+(<= (as 'DATE 7305) (as 'DATE 7305)) -- true
+(<= (as 'TIME 1000) (as 'TIME 2000)) -- true
+(<= (as 'TIMESTAMP 100) (as 'TIMESTAMP 200)) -- true
+
+;; Mixed-width numeric <=
+(<= (as 'I16 100) (as 'I32 200)) -- true
+(<= (as 'F64 100.0) (as 'I64 200)) -- true
+(<= (as 'U8 5) (as 'I32 100)) -- true

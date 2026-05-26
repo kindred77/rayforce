@@ -41,3 +41,9 @@
 ;; reverse_vec_eager.  Covers exec.c L1085.
 (reverse (first [1 2 3 4])) !- type
 (reverse (last [1 2 3 4])) !- type
+
+;; ---- RAY_IS_ERR propagation: reverse(erroring arg) ----
+(reverse (+ "a" 1))     !- type
+(reverse (sqrt 'foo))   !- type
+(reverse (round "x"))   !- type
+(reverse (- 'a 1))      !- type

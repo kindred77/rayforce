@@ -12,3 +12,18 @@
 (set A (rand 50 10000))
 (set B (rand 50 10000))
 (min (concat A B)) -- (min (list (min A) (min B)))
+
+;; ─── edge cases: single-element / all-equal / negatives / atoms ──────
+(min [42]) -- 42
+(min [7 7 7 7]) -- 7
+(min [-1 -5 -10 0]) -- -10
+(min [-5.5 -1.2 -10.3 0.0]) -- -10.3
+;; min on F64 vec
+(min [3.14 1.41 2.71]) -- 1.41
+;; min over a list with null skips the null
+(min (list 5 0Ni 3)) -- 3
+;; list of all-nulls → typed null
+(nil? (min (list 0Ni 0Ni))) -- true
+;; atom pass-through
+(min 99) -- 99
+(min -7) -- -7

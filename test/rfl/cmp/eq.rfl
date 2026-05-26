@@ -55,3 +55,32 @@
 (set V (til 1024))
 (sum (== V V)) -- 1024
 (sum (== V 0)) -- 1
+
+;; ──────────────────────────────────────────────────────────────────
+;; Mixed-width / sym / guid / temporal-cross
+;; ──────────────────────────────────────────────────────────────────
+
+;; sym vs different sym (interned-id equal-id path)
+(== 'foo 'foo) -- true
+(== 'foo 'bar) -- false
+
+;; bool vs bool — both directions
+(== (as 'BOOL true) (as 'BOOL true)) -- true
+(== (as 'BOOL true) (as 'BOOL false)) -- false
+
+;; GUID vs GUID (memcmp16 path)
+(set Gs (take (guid 2) 2))
+(== (at Gs 0) (at Gs 0)) -- true
+(== (at Gs 0) (at Gs 1)) -- false
+
+;; Cross-temporal equality (temporal_as_ns conversion)
+(== (as 'DATE 7305) (as 'DATE 7305)) -- true
+(== (as 'DATE 7305) (as 'DATE 7306)) -- false
+(== (as 'TIME 1000) (as 'TIME 1000)) -- true
+(== (as 'TIMESTAMP 0) (as 'TIMESTAMP 0)) -- true
+
+;; Mixed-width numeric: I16 vs I32, I32 vs F64, U8 vs I64
+(== (as 'I16 5) (as 'I32 5)) -- true
+(== (as 'I32 5) (as 'F64 5.0)) -- true
+(== (as 'U8 5) (as 'I64 5)) -- true
+(== (as 'BOOL true) (as 'I64 1)) -- true

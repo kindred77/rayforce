@@ -12,3 +12,25 @@
 
 ;; til n has count n
 (count (til 123)) -- 123
+
+;; ─── edge cases: empty / single / atom / heterogeneous list ──────────
+;; empty string -> count 0
+(count "") -- 0
+;; single-char string -> count 1
+(count "x") -- 1
+;; empty list (heterogeneous) -> 0
+(count (list)) -- 0
+;; list with elements -> ray_len
+(count (list 1 "two" 'three)) -- 3
+;; F64 atom -> 1
+(count 3.14) -- 1
+;; SYM atom -> 1
+(count 'foo) -- 1
+;; null atom -> 1
+(count 0Ni) -- 1
+;; dict (atom_eq treats dict as collection)
+(count (dict ['a 'b 'c] [1 2 3])) -- 3
+;; table count == nrow
+(count (table [a b] (list [1 2 3 4 5] [10 20 30 40 50]))) -- 5
+;; empty table
+(count (table [a b] (list (as 'I64 []) (as 'I64 [])))) -- 0

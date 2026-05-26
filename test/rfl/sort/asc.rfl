@@ -65,3 +65,15 @@ N -- (sum (<= (at S (til N)) (at S (+ 1 (til N)))))
 
 (asc (asc V2)) -- (asc V2)
 (reverse (asc V2)) -- (desc V2)
+
+;; ---- RAY_IS_ERR propagation: asc(erroring arg) ----
+;; asc must propagate inner errors via RAY_IS_ERR rather than dispatch
+;; to its sort path.
+(asc (round "x"))         !- type
+(asc (+ "abc" 1))         !- type
+(asc (- 'a 1))            !- type
+(asc (sqrt 'foo))         !- type
+;; deep chain: round → asc → at, multiple propagation guards
+(at (asc (round "x")) 0)  !- type
+;; xasc on erroring table
+(xasc (table [a] (list (round "x"))) 'a) !- type

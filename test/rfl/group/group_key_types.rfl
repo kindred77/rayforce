@@ -148,3 +148,52 @@
 (count Rdkm) -- 2
 (at (at Rdkm 'mn) 0) -- 10
 (at (at Rdkm 'mx) 1) -- 40
+
+;; ─── Narrow SYM (W8) group-by ────────────────────────────────────────
+;; CSV reader narrows SYM to W8 when distinct count <= 255.  Group-by
+;; on the narrow column exercises:
+;;   - read_col_i64 W8 arm (group.c:185, etc.)
+;;   - sym_minmax MINMAX_SEG_LOOP W8 dispatch (group.c:3244)
+;;   - per-group emit of narrow SYM key column (ray_sym_vec_new with
+;;     k_attrs[k] & RAY_SYM_W_MASK).
+(.sys.exec "printf 'id,cat\n1,x\n2,y\n3,x\n4,z\n5,y\n6,x\n7,z\n8,y\n9,x\n10,z\n' > /tmp/rfl_grp_sw8.csv") -- 0
+(set Tsw8 (.csv.read [I64 SYMBOL] "/tmp/rfl_grp_sw8.csv"))
+(count Tsw8) -- 10
+(type (at Tsw8 'cat)) -- 'SYM
+
+;; Group-by on narrow SYM key + count/sum aggs
+(set Rsw8 (select {c: (count id) s: (sum id) from: Tsw8 by: cat}))
+(count Rsw8) -- 3
+;; cat counts: x=4, y=3, z=3 → sum of counts = 10
+(sum (at Rsw8 'c)) -- 10
+;; cat sums: x: 1+3+6+9=19, y: 2+5+8=15, z: 4+7+10=21 → sum=55
+(sum (at Rsw8 's)) -- 55
+
+;; Group-by with min/max aggs — exercises sym_minmax narrow W8 SEG_LOOP
+(set Rsw8mm (select {mn: (min id) mx: (max id) from: Tsw8 by: cat}))
+(count Rsw8mm) -- 3
+(sum (at Rsw8mm 'mn)) -- 7   ;; 1+2+4
+(sum (at Rsw8mm 'mx)) -- 27  ;; 9+8+10
+
+;; first/last on narrow SYM key — type preservation regression check.
+(set Rsw8fl (select {f: (first id) l: (last id) from: Tsw8 by: cat asc: cat}))
+(count Rsw8fl) -- 3
+(at (at Rsw8fl 'cat) 0) -- 'x
+(at (at Rsw8fl 'f) 0) -- 1
+(at (at Rsw8fl 'l) 0) -- 9
+
+;; distinct on narrow SYM column
+(count (distinct (at Tsw8 'cat))) -- 3
+
+;; Type preservation: first/last on the narrow-SYM column itself
+(type (first (at Tsw8 'cat))) -- 'sym
+(type (last  (at Tsw8 'cat))) -- 'sym
+(first (at Tsw8 'cat)) -- 'x
+(last  (at Tsw8 'cat)) -- 'z
+
+;; Two-key group: narrow SYM + small I32 — composite path with narrow
+;; SYM emit.
+(set Tsw8b (table [k1 k2 v] (list (take (at Tsw8 'cat) 9) (as 'I32 [1 2 1 2 1 2 1 2 1]) (as 'I64 [10 20 30 40 50 60 70 80 90]))))
+(set Rsw8b (select {c: (count v) from: Tsw8b by: [k1 k2]}))
+(>= (count Rsw8b) 3) -- true
+(.sys.exec "rm -f /tmp/rfl_grp_sw8.csv") -- 0
