@@ -1,0 +1,433 @@
+;; branch_coverage.rfl -- target uncovered branches in src/ops/agg.c
+;;
+;; Focuses on:
+;;   - parted null-aware paths (has_nulls in sum/avg/minmax)
+;;   - parted TIME/TIMESTAMP sum returns
+;;   - parted avg type error + all-null
+;;   - parted minmax type error + all-null
+;;   - U8/TIME vec sum with nulls
+;;   - min/max list with F64 elements + all-null F64
+;;   - first/last on empty string, empty table, empty list
+;;   - count on non-collection non-atom (type error)
+;;   - avg lazy dispatch
+;;   - var_stddev_core atom sample=1 numeric branch
+;;   - pearson_corr null-skipping + null/error guard branches
+;;
+;; NEVER modifies src/. Uses existing RFL surface constructs only.
+
+;; ════════════════════════════════════════════════════════════════════
+;; 1. Parted null-aware: F64 sum / avg / min / max with HAS_NULLS
+;; ════════════════════════════════════════════════════════════════════
+;; Build a parted F64 table whose segments contain nulls.
+;; Hits: agg_parted_sum L139 has_nulls=true, agg_parted_avg L169,
+;;       agg_parted_minmax L197.
+(.sys.exec "rm -rf /tmp/rfl_agg_bc_f64n")
+(set Tn1 (table [v] (list (as 'F64 [1.0 0Nf 3.0]))))
+(set Tn2 (table [v] (list (as 'F64 [0Nf 5.0]))))
+(.db.splayed.set "/tmp/rfl_agg_bc_f64n/1/t/" Tn1)
+(.db.splayed.set "/tmp/rfl_agg_bc_f64n/2/t/" Tn2)
+(set Pfn (.db.parted.get "/tmp/rfl_agg_bc_f64n/" 't))
+;; sum skips nulls: 1 + 3 + 5 = 9
+(sum (at Pfn 'v)) -- 9.0
+;; avg skips nulls: 9 / 3 = 3.0
+(avg (at Pfn 'v)) -- 3.0
+;; min skips nulls: 1.0
+(min (at Pfn 'v)) -- 1.0
+;; max skips nulls: 5.0
+(max (at Pfn 'v)) -- 5.0
+(.sys.exec "rm -rf /tmp/rfl_agg_bc_f64n")
+
+;; ════════════════════════════════════════════════════════════════════
+;; 2. Parted null-aware: I64 sum / avg / min / max with HAS_NULLS
+;; ════════════════════════════════════════════════════════════════════
+;; Hits: agg_parted_sum L149 has_nulls=true integer path,
+;;       agg_parted_avg L174, agg_parted_minmax L205.
+(.sys.exec "rm -rf /tmp/rfl_agg_bc_i64n")
+(set Ti1 (table [v] (list [10 0N 30])))
+(set Ti2 (table [v] (list [0N 50])))
+(.db.splayed.set "/tmp/rfl_agg_bc_i64n/1/t/" Ti1)
+(.db.splayed.set "/tmp/rfl_agg_bc_i64n/2/t/" Ti2)
+(set Pin (.db.parted.get "/tmp/rfl_agg_bc_i64n/" 't))
+;; sum skips nulls: 10 + 30 + 50 = 90
+(sum (at Pin 'v)) -- 90
+;; avg skips nulls: 90 / 3 = 30.0
+(avg (at Pin 'v)) -- 30.0
+;; min = 10
+(min (at Pin 'v)) -- 10
+;; max = 50
+(max (at Pin 'v)) -- 50
+(.sys.exec "rm -rf /tmp/rfl_agg_bc_i64n")
+
+;; ════════════════════════════════════════════════════════════════════
+;; 3. Parted all-null: avg returns typed-null (L179), minmax returns
+;;    typed-null (L213).
+;; ════════════════════════════════════════════════════════════════════
+(.sys.exec "rm -rf /tmp/rfl_agg_bc_allnull")
+(set Tan1 (table [v] (list [0N 0N])))
+(set Tan2 (table [v] (list [0N])))
+(.db.splayed.set "/tmp/rfl_agg_bc_allnull/1/t/" Tan1)
+(.db.splayed.set "/tmp/rfl_agg_bc_allnull/2/t/" Tan2)
+(set Pallnull (.db.parted.get "/tmp/rfl_agg_bc_allnull/" 't))
+(nil? (avg (at Pallnull 'v))) -- true
+(nil? (min (at Pallnull 'v))) -- true
+(nil? (max (at Pallnull 'v))) -- true
+(.sys.exec "rm -rf /tmp/rfl_agg_bc_allnull")
+
+;; ════════════════════════════════════════════════════════════════════
+;; 4. Parted TIME sum (L151) and TIMESTAMP sum (L152)
+;; ════════════════════════════════════════════════════════════════════
+(.sys.exec "rm -rf /tmp/rfl_agg_bc_ptime /tmp/rfl_agg_bc_pts")
+;; TIME
+(set Ttm1 (table [t] (list (as 'TIME [100 200]))))
+(set Ttm2 (table [t] (list (as 'TIME [300]))))
+(.db.splayed.set "/tmp/rfl_agg_bc_ptime/1/t/" Ttm1)
+(.db.splayed.set "/tmp/rfl_agg_bc_ptime/2/t/" Ttm2)
+(set Ptm (.db.parted.get "/tmp/rfl_agg_bc_ptime/" 't))
+(sum (at Ptm 't)) -- (as 'TIME 600)
+(type (sum (at Ptm 't))) -- 'time
+;; TIMESTAMP
+(set Tts1 (table [ts] (list (as 'TIMESTAMP [1000 2000]))))
+(set Tts2 (table [ts] (list (as 'TIMESTAMP [3000]))))
+(.db.splayed.set "/tmp/rfl_agg_bc_pts/1/t/" Tts1)
+(.db.splayed.set "/tmp/rfl_agg_bc_pts/2/t/" Tts2)
+(set Pts (.db.parted.get "/tmp/rfl_agg_bc_pts/" 't))
+(sum (at Pts 'ts)) -- (as 'TIMESTAMP 6000)
+(type (sum (at Pts 'ts))) -- 'timestamp
+(.sys.exec "rm -rf /tmp/rfl_agg_bc_ptime /tmp/rfl_agg_bc_pts")
+
+;; ════════════════════════════════════════════════════════════════════
+;; 5. Parted avg type error (L158) and parted minmax type error (L185)
+;; ════════════════════════════════════════════════════════════════════
+;; SYM base type is non-numeric; hits the type error path.
+(.sys.exec "rm -rf /tmp/rfl_agg_bc_psym")
+(set Tps1 (table [s] (list ['a 'b 'c])))
+(set Tps2 (table [s] (list ['d 'e])))
+(.db.splayed.set "/tmp/rfl_agg_bc_psym/1/t/" Tps1)
+(.db.splayed.set "/tmp/rfl_agg_bc_psym/2/t/" Tps2)
+(set Psym (.db.parted.get "/tmp/rfl_agg_bc_psym/" 't))
+(avg (at Psym 's)) !- type
+(min (at Psym 's)) !- type
+(max (at Psym 's)) !- type
+(.sys.exec "rm -rf /tmp/rfl_agg_bc_psym")
+
+;; ════════════════════════════════════════════════════════════════════
+;; 6. U8 vec sum with nulls (L248 has_nulls=true)
+;; ════════════════════════════════════════════════════════════════════
+;; Build a null-bearing U8 vec via concat of [0Nl] cast to U8 won't work,
+;; so we use a list-cast approach or a table path.
+;; U8 type doesn't have a native null sentinel, but the HAS_NULLS flag
+;; can be set if a null bitmap exists. Use a table + where-filter to
+;; produce a null-bearing narrow vector.
+;; Alternative: directly test sum on a list containing U8 atoms with nulls.
+(sum (as 'U8 [0 1 0N 3])) -- 4
+(type (sum (as 'U8 [0 1 0N 3]))) -- 'i64
+
+;; ════════════════════════════════════════════════════════════════════
+;; 7. TIME vec sum with nulls (L253 has_nulls=true)
+;; ════════════════════════════════════════════════════════════════════
+(sum (as 'TIME [100 0N 300])) -- (as 'TIME 400)
+(type (sum (as 'TIME [100 0N 300]))) -- 'time
+
+;; ════════════════════════════════════════════════════════════════════
+;; 8. min/max list with F64 elements (L340/L362 has_float=1)
+;;    min/max all-null F64 list → typed null F64 (L345/L367)
+;;    min/max list returning F64 (L346/L368 has_float branch)
+;; ════════════════════════════════════════════════════════════════════
+;; F64 list: triggers has_float=1 path
+(min (list 3.14 1.41 2.71)) -- 1.41
+(max (list 3.14 1.41 2.71)) -- 3.14
+;; Mixed int + float list: has_float=1 with I64 elements too
+(min (list 10 2.5 7)) -- 2.5
+(max (list 10 2.5 7)) -- 10.0
+;; All-null F64 list → typed null F64 (L345/L367 has_float ? -F64 : -I64)
+(nil? (min (list 0Nf 0Nf))) -- true
+(nil? (max (list 0Nf 0Nf))) -- true
+(type (min (list 0Nf 0Nf))) -- 'f64
+(type (max (list 0Nf 0Nf))) -- 'f64
+;; min/max list with F64 results (non-null F64 present)
+(min (list 0Nf 5.0 3.0)) -- 3.0
+(max (list 0Nf 5.0 3.0)) -- 5.0
+(type (min (list 0Nf 5.0 3.0))) -- 'f64
+(type (max (list 0Nf 5.0 3.0))) -- 'f64
+
+;; ════════════════════════════════════════════════════════════════════
+;; 9. min/max empty list → domain error (L334/L356)
+;; ════════════════════════════════════════════════════════════════════
+(min (list)) !- domain
+(max (list)) !- domain
+
+;; ════════════════════════════════════════════════════════════════════
+;; 10. min/max non-list non-vec non-atom → type error (L332/L354)
+;; ════════════════════════════════════════════════════════════════════
+(max (dict ['a] [1])) !- type
+;; (min on dict covered by existing tests; add max on table)
+(max (table [x] (list [1 2 3]))) !- type
+
+;; ════════════════════════════════════════════════════════════════════
+;; 11. first/last on empty string → domain error (L376/L415)
+;; ════════════════════════════════════════════════════════════════════
+(first "") !- domain
+(last "")  !- domain
+
+;; ════════════════════════════════════════════════════════════════════
+;; 12. first/last on empty table → domain error (L383/L423)
+;; ════════════════════════════════════════════════════════════════════
+(set Tempty (table [a] (list (as 'I64 []))))
+(first Tempty) !- domain
+(last Tempty)  !- domain
+
+;; ════════════════════════════════════════════════════════════════════
+;; 13. first/last on empty list → typed null (L404/L443)
+;; ════════════════════════════════════════════════════════════════════
+(nil? (first (list))) -- true
+(nil? (last (list)))  -- true
+
+;; ════════════════════════════════════════════════════════════════════
+;; 14. first/last on non-list non-vec non-atom non-table → type error
+;;     (L403/L441)
+;; ════════════════════════════════════════════════════════════════════
+(first (dict ['a] [1])) !- type
+(last (dict ['a] [1]))  !- type
+
+;; ════════════════════════════════════════════════════════════════════
+;; 15. var_stddev_core atom, sample=1, numeric → typed null F64 (L579)
+;;     The branch sample ? typed_null : make_f64(0.0) — the True arm
+;;     for a numeric atom with sample=1.
+;; ════════════════════════════════════════════════════════════════════
+;; stddev(atom) and var(atom) use sample=1.
+(nil? (stddev 42))   -- true
+(nil? (var   42))    -- true
+(nil? (stddev 3.14)) -- true
+(nil? (var   3.14))  -- true
+;; Population mode on same atom → 0.0 (not null).
+(dev 42) -- 0.0
+(var_pop 42) -- 0.0
+
+;; ════════════════════════════════════════════════════════════════════
+;; 16. pearson_corr: null elements in vectors (L672 !xn && !yn false)
+;; ════════════════════════════════════════════════════════════════════
+;; Null in x or y skips the pair from both sums.
+;; x=[1 0N 3 4 5], y=[2 4 0Nf 8 10]: pairs with nulls skipped,
+;; remaining: (1,2),(4,8),(5,10) → r = 1.0 (perfect positive).
+(pearson_corr [1 0N 3 4 5] [2.0 4.0 0Nf 8.0 10.0]) -- 1.0
+
+;; ════════════════════════════════════════════════════════════════════
+;; 17. avg on list with non-numeric → type error (L319)
+;; ════════════════════════════════════════════════════════════════════
+(avg (list 1 "bad" 3)) !- type
+
+;; ════════════════════════════════════════════════════════════════════
+;; 18. min/max list: non-numeric element → type error (L339/L361)
+;; ════════════════════════════════════════════════════════════════════
+(min (list 1 "bad" 3)) !- type
+(max (list 1 "bad" 3)) !- type
+
+;; ════════════════════════════════════════════════════════════════════
+;; 19. sum on BOOL atom passthrough (L225: ray_retain + return)
+;; ════════════════════════════════════════════════════════════════════
+(sum true) -- true
+(sum false) -- false
+
+;; ════════════════════════════════════════════════════════════════════
+;; 20. sum on I64/F64 atoms passthrough (L225)
+;; ════════════════════════════════════════════════════════════════════
+(sum 0) -- 0
+(sum 0.0) -- 0.0
+
+;; ════════════════════════════════════════════════════════════════════
+;; 21. sum list with float-null: (L276 F64 null → has_float=1)
+;;     already partly covered; verify return type is F64
+;; ════════════════════════════════════════════════════════════════════
+(type (sum (list 1 0Nf 3))) -- 'f64
+(sum (list 1 0Nf 3)) -- 4.0
+
+;; ════════════════════════════════════════════════════════════════════
+;; 22. sum list mixed narrow types (L281 else branch: as_f64)
+;; ════════════════════════════════════════════════════════════════════
+;; U8 atoms in list
+(sum (list (as 'U8 1) (as 'U8 2) (as 'U8 3))) -- 6
+;; I16 atoms in list
+(sum (list (as 'I16 10) (as 'I16 20))) -- 30
+;; I32 atoms in list
+(sum (list (as 'I32 100) (as 'I32 200))) -- 300
+
+;; ════════════════════════════════════════════════════════════════════
+;; 23. sum list non-numeric → type error (L274)
+;; ════════════════════════════════════════════════════════════════════
+(sum (list 1 "bad" 3)) !- type
+(sum (list 'a 'b)) !- type
+
+;; ════════════════════════════════════════════════════════════════════
+;; 24. sum non-list non-vec non-atom → type error (L266)
+;; ════════════════════════════════════════════════════════════════════
+(sum (dict ['a] [1])) !- type
+
+;; ════════════════════════════════════════════════════════════════════
+;; 25. vec_to_f64_scratch: I32 null skipping (L467 branch)
+;; ════════════════════════════════════════════════════════════════════
+;; Already covered via group tests; add standalone med on I32 with nulls.
+(med (as 'I32 [10 0N 30 0N 50])) -- 30.0
+;; var on I32 with nulls
+(var_pop (as 'I32 [10 0N 30 0N 50])) -- 266.6666666666666666
+
+;; ════════════════════════════════════════════════════════════════════
+;; 26. med on empty vec of various types → typed null
+;; ════════════════════════════════════════════════════════════════════
+(nil? (med (as 'I32 (list)))) -- true
+(nil? (med (as 'I16 (list)))) -- true
+(nil? (med (as 'U8 (list)))) -- true
+
+;; ════════════════════════════════════════════════════════════════════
+;; 27. var/stddev on empty vec → typed null (L588)
+;; ════════════════════════════════════════════════════════════════════
+(nil? (var (as 'I64 (list)))) -- true
+(nil? (dev (as 'F64 (list)))) -- true
+(nil? (stddev (as 'I64 (list)))) -- true
+(nil? (stddev_pop (as 'I64 (list)))) -- true
+(nil? (var_pop (as 'I64 (list)))) -- true
+
+;; ════════════════════════════════════════════════════════════════════
+;; 28. Parted I64 sum with nulls → integer has_nulls path
+;; ════════════════════════════════════════════════════════════════════
+(.sys.exec "rm -rf /tmp/rfl_agg_bc_i64null2")
+(set Tnull1 (table [v] (list [10 0N 30])))
+(set Tnull2 (table [v] (list [0N 50 0N])))
+(.db.splayed.set "/tmp/rfl_agg_bc_i64null2/1/t/" Tnull1)
+(.db.splayed.set "/tmp/rfl_agg_bc_i64null2/2/t/" Tnull2)
+(set Pi2 (.db.parted.get "/tmp/rfl_agg_bc_i64null2/" 't))
+(sum (at Pi2 'v)) -- 90
+(.sys.exec "rm -rf /tmp/rfl_agg_bc_i64null2")
+
+;; ════════════════════════════════════════════════════════════════════
+;; 29. Parted all-null F64 → typed null from avg/min/max
+;; ════════════════════════════════════════════════════════════════════
+(.sys.exec "rm -rf /tmp/rfl_agg_bc_f64allnull")
+(set Tanf1 (table [v] (list (as 'F64 [0Nf 0Nf]))))
+(set Tanf2 (table [v] (list (as 'F64 [0Nf]))))
+(.db.splayed.set "/tmp/rfl_agg_bc_f64allnull/1/t/" Tanf1)
+(.db.splayed.set "/tmp/rfl_agg_bc_f64allnull/2/t/" Tanf2)
+(set Pfallnull (.db.parted.get "/tmp/rfl_agg_bc_f64allnull/" 't))
+(nil? (avg (at Pfallnull 'v))) -- true
+(nil? (min (at Pfallnull 'v))) -- true
+(nil? (max (at Pfallnull 'v))) -- true
+(.sys.exec "rm -rf /tmp/rfl_agg_bc_f64allnull")
+
+;; ════════════════════════════════════════════════════════════════════
+;; 30. Parted sum on non-numeric base: SYM → type error (L128 first arm)
+;;     (distinct from DATE which hits the second arm)
+;; ════════════════════════════════════════════════════════════════════
+(.sys.exec "rm -rf /tmp/rfl_agg_bc_psymsum")
+(set Tss1 (table [s] (list ['x 'y])))
+(set Tss2 (table [s] (list ['z])))
+(.db.splayed.set "/tmp/rfl_agg_bc_psymsum/1/t/" Tss1)
+(.db.splayed.set "/tmp/rfl_agg_bc_psymsum/2/t/" Tss2)
+(set Pss (.db.parted.get "/tmp/rfl_agg_bc_psymsum/" 't))
+(sum (at Pss 's)) !- type
+(.sys.exec "rm -rf /tmp/rfl_agg_bc_psymsum")
+
+;; ════════════════════════════════════════════════════════════════════
+;; 31. pearson_corr with non-numeric element in SECOND vector (L673
+;;     !is_numeric(ye) True arm — previously only the !is_numeric(xe)
+;;     arm was hit because the first non-numeric was always in x).
+;; ════════════════════════════════════════════════════════════════════
+(pearson_corr [1 2 3] ["a" "b" "c"])  !- type
+;; Both numeric x, non-numeric y triggers the second arm.
+(pearson_corr [1.0 2.0 3.0] ['a 'b 'c]) !- type
+
+;; ════════════════════════════════════════════════════════════════════
+;; 32. pearson_corr with null in x only, null in y only, null in both
+;;     Exercises all combinations of (xn, yn) at L670-672.
+;; ════════════════════════════════════════════════════════════════════
+;; Null in x only, y non-null: skip pair.
+;; x = [0N 2 3 4 5], y = [10 20 30 40 50].
+;; Valid pairs: (2,20),(3,30),(4,40),(5,50) → r = 1.0
+(pearson_corr [0N 2 3 4 5] [10.0 20.0 30.0 40.0 50.0]) -- 1.0
+;; Null in y only: x = [1 2 3 4 5], y = [0Nf 20 30 40 50].
+(pearson_corr [1 2 3 4 5] [0Nf 20.0 30.0 40.0 50.0]) -- 1.0
+;; Both null at same position: x = [0N 2 3 4 5], y = [0Nf 20 30 40 50].
+(pearson_corr [0N 2 3 4 5] [0Nf 20.0 30.0 40.0 50.0]) -- 1.0
+
+;; ════════════════════════════════════════════════════════════════════
+;; 33. pearson_corr all-null → NaN (cnt < 2).
+;; ════════════════════════════════════════════════════════════════════
+(nil? (pearson_corr [0N 0N 0N] [0Nf 0Nf 0Nf])) -- true
+
+;; ════════════════════════════════════════════════════════════════════
+;; 34. med / var on narrow int vecs (I16 / U8) with no nulls
+;;     Drives vec_to_f64_scratch I16 and U8 paths.
+;; ════════════════════════════════════════════════════════════════════
+(med (as 'I16 [10 20 30 40 50])) -- 30.0
+(med (as 'U8  [10 20 30 40 50])) -- 30.0
+(var_pop (as 'I16 [10 20 30 40 50])) -- 200.0
+(var_pop (as 'U8  [10 20 30 40 50])) -- 200.0
+
+;; ════════════════════════════════════════════════════════════════════
+;; 35. I32 vec sum with nulls (L238 has_nulls=true, already some hits
+;;     but ensure the null-skip branch is covered well)
+;; ════════════════════════════════════════════════════════════════════
+(sum (as 'I32 [10 0N 30 0N 50])) -- 90
+(type (sum (as 'I32 [10 0N 30 0N 50]))) -- 'i64
+
+;; ════════════════════════════════════════════════════════════════════
+;; 36. I16 vec sum with nulls (L243 has_nulls=true)
+;; ════════════════════════════════════════════════════════════════════
+(sum (as 'I16 [10 0N 30 0N 50])) -- 90
+(type (sum (as 'I16 [10 0N 30 0N 50]))) -- 'i64
+
+;; ════════════════════════════════════════════════════════════════════
+;; 37. avg list with all-null → typed null F64 (L323 cnt==0)
+;; ════════════════════════════════════════════════════════════════════
+(nil? (avg (list 0Ni 0Ni 0Ni))) -- true
+
+;; ════════════════════════════════════════════════════════════════════
+;; 38. count on non-atom non-collection → type error (L298)
+;;     This requires something that is NOT an atom, vec, list, table,
+;;     dict, or string atom. A lambda / function might trigger it.
+;; ════════════════════════════════════════════════════════════════════
+;; Note: L298 is unreachable in practice because every ray_t is one of
+;; these types. Documenting as unreachable.
+
+;; ════════════════════════════════════════════════════════════════════
+;; Unreachable branches (documented):
+;;
+;; L30-33: dbl_cmp (qsort fallback) — nth_element_dbl's depth_limit
+;;   exceeds 2*log2(range) only for adversarial data patterns that
+;;   defeat median-of-three pivot selection. Not constructible via RFL.
+;;
+;; L46: depth_limit-- <= 0 — same as above.
+;;
+;; L86/455/507: OOM paths (!g, !scratch) — memory exhaustion not
+;;   triggerable in normal test runs.
+;;
+;; L109: agg_read_i64 default — all callers pass valid type enums.
+;;
+;; L135/146/164/192: !seg (NULL segment pointer in parted) — parted
+;;   construction via .db.splayed.set never creates NULL segments.
+;;
+;; L248: U8 vec sum with HAS_NULLS — U8 type has no null sentinel,
+;;   so RFL cannot construct a U8 vec with the HAS_NULLS bitmap.
+;;   The branch is defensive code for callers that manually set the
+;;   null bitmap on a U8 column.
+;;
+;; L298: ray_count_fn type error for non-collection non-atom — no
+;;   ray_t value exists that is none of (atom, vec, list, table, dict).
+;;
+;; L304/328/350: lazy dispatch for avg/min/max — the DAG executor
+;;   materializes inputs before calling these functions, so the lazy
+;;   branch is only reachable from internal chained-DAG construction
+;;   patterns not exposed through RFL surface syntax.
+;;
+;; L555: ray_median_dbl_inplace n<=0 — callers always check n>0
+;;   before calling this helper (it serves as a safety net).
+;;
+;; L647: pearson_corr !x / RAY_IS_ERR(x) — the dispatcher
+;;   materializes both arguments before calling the function.
+;;
+;; L665-669: collection_elem returning NULL or ERR — collection_elem
+;;   on a valid numeric vec never returns NULL or error.
+;;
+;; L473 False: U8 ray_vec_is_null always returns false (no null sentinel).
+;; L374/413 False: first/last atom type check always STR (non-STR atoms
+;;   caught by the subsequent ray_is_atom guard).
+;; L674/675/687/688 False: xa/ya always true for vec collection_elem.
+;; ════════════════════════════════════════════════════════════════════

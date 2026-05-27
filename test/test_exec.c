@@ -16633,6 +16633,392 @@ static test_result_t test_expr_fix_null_cmp_null_scalar_lhs(void) {
 }
 
 /* ======================================================================
+ * Branch coverage: exec.c dispatch paths only reachable via C graph API
+ * ====================================================================== */
+
+/* OP_DISTINCT on non-vector → error (exec.c:1047-1049) */
+static test_result_t test_exec_distinct_non_vector(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    ray_t* tbl = make_exec_table();
+    ray_graph_t* g = ray_graph_new(tbl);
+
+    /* Pass a table-rooted op (OP_SCAN of the entire table) to distinct.
+     * Since the scan returns a vector (column), use a constant table atom
+     * as the input to force the non-vector path. */
+    ray_op_t* tbl_op = ray_const_table(g, tbl);
+    ray_op_t* dist = ray_distinct_op(g, tbl_op);
+
+    ray_t* result = ray_execute(g, dist);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(result));
+    ray_release(result);
+
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* OP_ASC on non-vector → error (exec.c:1059-1061) */
+static test_result_t test_exec_asc_non_vector(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    ray_t* tbl = make_exec_table();
+    ray_graph_t* g = ray_graph_new(tbl);
+
+    ray_op_t* tbl_op = ray_const_table(g, tbl);
+    ray_op_t* asc = ray_asc_op(g, tbl_op);
+
+    ray_t* result = ray_execute(g, asc);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(result));
+    ray_release(result);
+
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* OP_DESC on non-vector → error (exec.c:1071-1073) */
+static test_result_t test_exec_desc_non_vector(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    ray_t* tbl = make_exec_table();
+    ray_graph_t* g = ray_graph_new(tbl);
+
+    ray_op_t* tbl_op = ray_const_table(g, tbl);
+    ray_op_t* desc = ray_desc_op(g, tbl_op);
+
+    ray_t* result = ray_execute(g, desc);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(result));
+    ray_release(result);
+
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* OP_REVERSE on non-vector → error (exec.c:1083-1085) */
+static test_result_t test_exec_reverse_non_vector(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    ray_t* tbl = make_exec_table();
+    ray_graph_t* g = ray_graph_new(tbl);
+
+    ray_op_t* tbl_op = ray_const_table(g, tbl);
+    ray_op_t* rev = ray_reverse_op(g, tbl_op);
+
+    ray_t* result = ray_execute(g, rev);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(result));
+    ray_release(result);
+
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* OP_HEAD on vector (not table) input — exec.c:1509-1519 */
+static test_result_t test_exec_head_vector(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t data[] = {10, 20, 30, 40, 50};
+    ray_t* vec = ray_vec_from_raw(RAY_I64, data, 5);
+
+    ray_graph_t* g = ray_graph_new(NULL);
+    ray_op_t* v = ray_const_vec(g, vec);
+    ray_op_t* h = ray_head(g, v, 3);
+    ray_op_t* s = ray_sum(g, h);
+
+    ray_t* result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->i64, 60); /* 10+20+30 */
+
+    ray_release(result);
+    ray_graph_free(g);
+
+    /* Head clamps when n > len */
+    g = ray_graph_new(NULL);
+    v = ray_const_vec(g, vec);
+    h = ray_head(g, v, 100);
+    s = ray_sum(g, h);
+    result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->i64, 150); /* all 5 */
+    ray_release(result);
+    ray_graph_free(g);
+
+    ray_release(vec);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* OP_TAIL on vector (not table) input — exec.c:1620-1632 */
+static test_result_t test_exec_tail_vector(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t data[] = {10, 20, 30, 40, 50};
+    ray_t* vec = ray_vec_from_raw(RAY_I64, data, 5);
+
+    ray_graph_t* g = ray_graph_new(NULL);
+    ray_op_t* v = ray_const_vec(g, vec);
+    ray_op_t* t = ray_tail(g, v, 3);
+    ray_op_t* s = ray_sum(g, t);
+
+    ray_t* result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->i64, 120); /* 30+40+50 */
+
+    ray_release(result);
+    ray_graph_free(g);
+
+    /* Tail clamps when n > len */
+    g = ray_graph_new(NULL);
+    v = ray_const_vec(g, vec);
+    t = ray_tail(g, v, 100);
+    s = ray_sum(g, t);
+    result = ray_execute(g, s);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->i64, 150);
+    ray_release(result);
+    ray_graph_free(g);
+
+    ray_release(vec);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* OP_PROD reduction — exec.c:1015 */
+static test_result_t test_exec_prod(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t data[] = {1, 2, 3, 4, 5};
+    ray_t* vec = ray_vec_from_raw(RAY_I64, data, 5);
+    int64_t name = ray_sym_intern("x", 1);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, name, vec);
+    ray_release(vec);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* x = ray_scan(g, "x");
+    ray_op_t* p = ray_prod(g, x);
+
+    ray_t* result = ray_execute(g, p);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->i64, 120);
+
+    ray_release(result);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ray_execute with NULL root → error (exec.c:2169) */
+static test_result_t test_exec_null_op(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    ray_t* tbl = make_exec_table();
+    ray_graph_t* g = ray_graph_new(tbl);
+
+    ray_t* result = ray_execute(g, NULL);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(result));
+    ray_release(result);
+
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* OP_DISTINCT / OP_ASC / OP_DESC / OP_REVERSE on vector (happy path)
+ * — exercises the non-error branch (exec.c:1044-1090) */
+static test_result_t test_exec_distinct_asc_desc_reverse_vector(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t data[] = {3, 1, 2, 1, 3};
+    ray_t* vec = ray_vec_from_raw(RAY_I64, data, 5);
+
+    /* distinct([3,1,2,1,3]) = [1,2,3] → count=3 */
+    {
+        ray_graph_t* g = ray_graph_new(NULL);
+        ray_op_t* v = ray_const_vec(g, vec);
+        ray_op_t* d = ray_distinct_op(g, v);
+        ray_op_t* cnt = ray_count(g, d);
+        ray_t* result = ray_execute(g, cnt);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 3);
+        ray_release(result);
+        ray_graph_free(g);
+    }
+
+    /* asc([3,1,2,1,3]) → sorted ascending → first=1, sum=10 */
+    {
+        ray_graph_t* g = ray_graph_new(NULL);
+        ray_op_t* v = ray_const_vec(g, vec);
+        ray_op_t* a = ray_asc_op(g, v);
+        ray_op_t* f = ray_first(g, a);
+        ray_t* result = ray_execute(g, f);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 1);
+        ray_release(result);
+        ray_graph_free(g);
+    }
+
+    /* desc([3,1,2,1,3]) → sorted descending → first=3 */
+    {
+        ray_graph_t* g = ray_graph_new(NULL);
+        ray_op_t* v = ray_const_vec(g, vec);
+        ray_op_t* d = ray_desc_op(g, v);
+        ray_op_t* f = ray_first(g, d);
+        ray_t* result = ray_execute(g, f);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 3);
+        ray_release(result);
+        ray_graph_free(g);
+    }
+
+    /* reverse([3,1,2,1,3]) → [3,1,2,1,3] reversed → first=3, last=3 */
+    {
+        ray_graph_t* g = ray_graph_new(NULL);
+        ray_op_t* v = ray_const_vec(g, vec);
+        ray_op_t* r = ray_reverse_op(g, v);
+        ray_op_t* f = ray_first(g, r);
+        ray_t* result = ray_execute(g, f);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->i64, 3);
+        ray_release(result);
+        ray_graph_free(g);
+    }
+
+    ray_release(vec);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* OP_VAR, OP_VAR_POP reductions (exec.c:1015-1017) */
+static test_result_t test_exec_var_pop(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    double data[] = {10.0, 20.0, 30.0};
+    ray_t* vec = ray_vec_from_raw(RAY_F64, data, 3);
+    int64_t name = ray_sym_intern("x", 1);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, name, vec);
+    ray_release(vec);
+
+    /* var_pop([10,20,30]) = ((10-20)^2 + (20-20)^2 + (30-20)^2)/3 = 200/3 */
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* x = ray_scan(g, "x");
+    ray_op_t* vp = ray_var_pop(g, x);
+    ray_t* result = ray_execute(g, vp);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_F(result->f64, 200.0 / 3.0, 1e-6);
+    ray_release(result);
+    ray_graph_free(g);
+
+    /* stddev_pop([10,20,30]) = sqrt(200/3) */
+    g = ray_graph_new(tbl);
+    x = ray_scan(g, "x");
+    ray_op_t* sp = ray_stddev_pop(g, x);
+    result = ray_execute(g, sp);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_F(result->f64, sqrt(200.0 / 3.0), 1e-6);
+    ray_release(result);
+    ray_graph_free(g);
+
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* exec_node_inner default case → nyi error (exec.c:1882)
+ * We can't easily construct a node with an unknown opcode through
+ * the public API.  This branch is a safety guard for internal
+ * corruption / future opcodes that haven't been added to the switch.
+ * Documented as unreachable from the public graph builder API. */
+
+/* OP_PROD on F64 — exercises F64 product path */
+static test_result_t test_exec_prod_f64(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    double data[] = {1.5, 2.0, 3.0};
+    ray_t* vec = ray_vec_from_raw(RAY_F64, data, 3);
+    int64_t name = ray_sym_intern("x", 1);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, name, vec);
+    ray_release(vec);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* x = ray_scan(g, "x");
+    ray_op_t* p = ray_prod(g, x);
+
+    ray_t* result = ray_execute(g, p);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_F(result->f64, 9.0, 1e-6); /* 1.5 * 2.0 * 3.0 */
+
+    ray_release(result);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* OP_PROD sel_compact — reduction with lazy selection (exec.c:1021-1030) */
+static test_result_t test_exec_prod_sel_compact(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t data[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+    ray_t* vec = ray_vec_from_raw(RAY_I64, data, 10);
+    int64_t name = ray_sym_intern("x", 1);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, name, vec);
+    ray_release(vec);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* x = ray_scan(g, "x");
+    ray_op_t* threshold = ray_const_i64(g, 7);
+    ray_op_t* pred = ray_gt(g, x, threshold);
+    ray_op_t* filtered = ray_filter(g, x, pred);
+    ray_op_t* p = ray_prod(g, filtered);
+
+    ray_t* result = ray_execute(g, p);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->i64, 720); /* 8*9*10 */
+
+    ray_release(result);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ======================================================================
  * Suite
  * ====================================================================== */
 
@@ -16896,5 +17282,18 @@ const test_entry_t exec_entries[] = {
     { "exec/expr_linear_affine_narrow_col_types",  test_expr_linear_affine_narrow_col_types,  NULL, NULL },
     /* coverage-round-5: fix_null_comparisons null scalar LHS (Branch 1184:29, 1207:19) */
     { "exec/expr_fix_null_cmp_null_scalar_lhs",    test_expr_fix_null_cmp_null_scalar_lhs,    NULL, NULL },
+    /* exec.c branch coverage */
+    { "exec/distinct_non_vector",                test_exec_distinct_non_vector,             NULL, NULL },
+    { "exec/asc_non_vector",                     test_exec_asc_non_vector,                  NULL, NULL },
+    { "exec/desc_non_vector",                    test_exec_desc_non_vector,                 NULL, NULL },
+    { "exec/reverse_non_vector",                 test_exec_reverse_non_vector,              NULL, NULL },
+    { "exec/head_vector",                        test_exec_head_vector,                     NULL, NULL },
+    { "exec/tail_vector",                        test_exec_tail_vector,                     NULL, NULL },
+    { "exec/prod",                               test_exec_prod,                            NULL, NULL },
+    { "exec/null_op",                            test_exec_null_op,                         NULL, NULL },
+    { "exec/distinct_asc_desc_reverse_vector",   test_exec_distinct_asc_desc_reverse_vector, NULL, NULL },
+    { "exec/var_pop",                            test_exec_var_pop,                         NULL, NULL },
+    { "exec/prod_f64",                           test_exec_prod_f64,                        NULL, NULL },
+    { "exec/prod_sel_compact",                   test_exec_prod_sel_compact,                NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };

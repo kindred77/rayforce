@@ -1,0 +1,33 @@
+;; Pass-8 sort.c branch coverage.
+
+;; ── A. Packed radix reverse detection ───────────────────────────────
+(at (asc (reverse (til 4097))) 0) -- 0
+
+;; ── B. STR topk fallback ───────────────────────────────────────────
+(set Vstr ["zebra" "apple" "mango" "banana" "cherry" "kiwi" "lemon" "orange"])
+(top Vstr 3) -- ["zebra" "orange" "mango"]
+(bot Vstr 3) -- ["apple" "banana" "cherry"]
+(count (top Vstr 100)) -- 8
+
+;; ── C. iasc/idesc/rank over types ──────────────────────────────────
+(rank [3.0 1.0 2.0]) -- [2 0 1]
+(rank ['c 'a 'b]) -- [2 0 1]
+(iasc [2024.12.31 2024.01.01 2024.06.15]) -- [1 2 0]
+(iasc ["cherry" "apple" "banana"]) -- [1 2 0]
+
+;; ── D. Error paths ─────────────────────────────────────────────────
+(top [1 2 3] "x") !- type
+(bot [1 2 3] "x") !- type
+(top 42 3) !- type
+(bot 42 3) !- type
+;; top/bot with K=0 exercised via C test (topk_take_vec k<=0 path).
+(iasc 42) !- type
+(idesc 42) !- type
+(rank 42) !- type
+
+;; ── E. top/bot on DATE ─────────────────────────────────────────────
+(top [2024.12.31 2024.01.01 2024.06.15] 2) -- [2024.12.31 2024.06.15]
+(bot [2024.12.31 2024.01.01 2024.06.15] 2) -- [2024.01.01 2024.06.15]
+
+;; ── F. SYM desc ────────────────────────────────────────────────────
+(at (desc (take ['ZZ 'AA 'MM 'BB 'QQ] 200)) 0) -- 'ZZ

@@ -33,6 +33,7 @@
 #include "mem/heap.h"
 #include "table/sym.h"
 #include "lang/eval.h"
+#include "lang/internal.h"
 #include "lang/format.h"
 #include "store/hnsw.h"
 #include <math.h>
@@ -1255,6 +1256,609 @@ static test_result_t test_knn_f64_source_vecs(void) {
     PASS();
 }
 
+/* ============ Branch-coverage tests (S8) ============ */
+
+/* vec_binary_metric NULL-arg guards: !a and !b. */
+static test_result_t test_cos_dist_null_args(void) {
+    /* NULL first arg → type error. */
+    ray_t* r = ray_cos_dist_fn(NULL, NULL);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+
+    /* NULL only first arg. */
+    float f[2] = {1.0f, 0.0f};
+    ray_t* v = ray_vec_from_raw(RAY_F32, f, 2);
+    TEST_ASSERT_NOT_NULL(v);
+    r = ray_cos_dist_fn(NULL, v);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    r = ray_cos_dist_fn(v, NULL);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    ray_release(v);
+
+    /* Same for l2-dist and inner-prod. */
+    r = ray_l2_dist_fn(NULL, NULL);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    r = ray_inner_prod_fn(NULL, NULL);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    PASS();
+}
+
+/* ray_norm_fn with NULL input → type error. */
+static test_result_t test_norm_null(void) {
+    ray_t* r = ray_norm_fn(NULL);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    PASS();
+}
+
+/* ray_knn_fn direct C-API: rank errors (too few / too many args). */
+static test_result_t test_knn_rank_errors(void) {
+    float f[3] = {1.0f, 0.0f, 0.0f};
+    ray_t* v = ray_vec_from_raw(RAY_F32, f, 3);
+    TEST_ASSERT_NOT_NULL(v);
+    ray_t* col = ray_list_new(1);
+    col = ray_list_append(col, v);
+
+    /* Too few: n=2 (need 3-4). */
+    ray_t* args2[2] = { col, v };
+    ray_t* r = ray_knn_fn(args2, 2);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+
+    /* Too many: n=5 (max 4). */
+    ray_t* katom = make_i64(1);
+    ray_t* args5[5] = { col, v, katom, NULL, NULL };
+    r = ray_knn_fn(args5, 5);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+
+    ray_release(v);
+    ray_release(col);
+    ray_release(katom);
+    PASS();
+}
+
+/* ray_knn_fn: col is NULL or not a list → type error. */
+static test_result_t test_knn_col_type_errors(void) {
+    float f[3] = {1.0f, 0.0f, 0.0f};
+    ray_t* v = ray_vec_from_raw(RAY_F32, f, 3);
+    ray_t* katom = make_i64(1);
+
+    /* col is NULL. */
+    ray_t* args_null[3] = { NULL, v, katom };
+    ray_t* r = ray_knn_fn(args_null, 3);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+
+    /* col is not a list (a scalar). */
+    ray_t* scalar = make_i64(42);
+    ray_t* args_scalar[3] = { scalar, v, katom };
+    r = ray_knn_fn(args_scalar, 3);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+
+    ray_release(v);
+    ray_release(katom);
+    ray_release(scalar);
+    PASS();
+}
+
+/* ray_knn_fn: query not numeric → type error. */
+static test_result_t test_knn_query_type_error(void) {
+    float f[3] = {1.0f, 0.0f, 0.0f};
+    ray_t* v = ray_vec_from_raw(RAY_F32, f, 3);
+    ray_t* col = ray_list_new(1);
+    col = ray_list_append(col, v);
+    ray_t* katom = make_i64(1);
+
+    /* query is a scalar, not a vec. */
+    ray_t* bad_query = make_i64(5);
+    ray_t* args[3] = { col, bad_query, katom };
+    ray_t* r = ray_knn_fn(args, 3);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+
+    ray_release(v);
+    ray_release(col);
+    ray_release(katom);
+    ray_release(bad_query);
+    PASS();
+}
+
+/* ray_knn_fn: k atom is not int → type error. */
+static test_result_t test_knn_k_type_error(void) {
+    float f[3] = {1.0f, 0.0f, 0.0f};
+    ray_t* v = ray_vec_from_raw(RAY_F32, f, 3);
+    ray_t* col = ray_list_new(1);
+    col = ray_list_append(col, v);
+
+    /* k is a float, not int. */
+    ray_t* kfloat = make_f64(1.5);
+    ray_t* args[3] = { col, v, kfloat };
+    ray_t* r = ray_knn_fn(args, 3);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+
+    ray_release(v);
+    ray_release(col);
+    ray_release(kfloat);
+    PASS();
+}
+
+/* ray_hnsw_build_fn direct C-API: rank errors. */
+static test_result_t test_hnsw_build_rank_errors(void) {
+    /* n=0: too few. */
+    ray_t* r = ray_hnsw_build_fn(NULL, 0);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    /* n=5: too many. */
+    ray_t* args[5] = { NULL, NULL, NULL, NULL, NULL };
+    r = ray_hnsw_build_fn(args, 5);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    PASS();
+}
+
+/* ray_hnsw_build_fn: col is NULL → type error. */
+static test_result_t test_hnsw_build_col_null(void) {
+    ray_t* args[1] = { NULL };
+    ray_t* r = ray_hnsw_build_fn(args, 1);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    PASS();
+}
+
+/* ray_ann_fn rank errors. */
+static test_result_t test_ann_rank_errors(void) {
+    ray_t* r = ray_ann_fn(NULL, 2);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    ray_t* args[5] = { NULL, NULL, NULL, NULL, NULL };
+    r = ray_ann_fn(args, 5);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    PASS();
+}
+
+/* ray_ann_fn: handle is not HNSW → type error. */
+static test_result_t test_ann_handle_type_error(void) {
+    ray_t* bad = make_i64(42);
+    float f[3] = {1.0f, 0.0f, 0.0f};
+    ray_t* v = ray_vec_from_raw(RAY_F32, f, 3);
+    ray_t* katom = make_i64(1);
+    ray_t* args[3] = { bad, v, katom };
+    ray_t* r = ray_ann_fn(args, 3);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    ray_release(bad);
+    ray_release(v);
+    ray_release(katom);
+    PASS();
+}
+
+/* ray_ann_fn: query not numeric → type error. */
+static test_result_t test_ann_query_type_error(void) {
+    /* Build a real index to get past the handle check. */
+    float vecs[3 * 3] = {
+        1.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f,
+        0.0f, 0.0f, 1.0f,
+    };
+    ray_t* col = ray_list_new(3);
+    for (int i = 0; i < 3; i++) {
+        ray_t* v = ray_vec_from_raw(RAY_F32, vecs + i * 3, 3);
+        col = ray_list_append(col, v);
+        ray_release(v);
+    }
+    ray_t* build_args[2];
+    build_args[0] = col;
+    int64_t cos_sym = ray_sym_intern("l2", 2);
+    ray_t* metric_atom = ray_sym(cos_sym);
+    build_args[1] = metric_atom;
+    ray_t* handle = ray_hnsw_build_fn(build_args, 2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(handle));
+
+    /* Query with a non-numeric (scalar I64). */
+    ray_t* bad_query = make_i64(42);
+    ray_t* katom = make_i64(1);
+    ray_t* ann_args[3] = { handle, bad_query, katom };
+    ray_t* r = ray_ann_fn(ann_args, 3);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+
+    /* Query with wrong dimension. */
+    float f2[2] = {1.0f, 0.0f};
+    ray_t* short_v = ray_vec_from_raw(RAY_F32, f2, 2);
+    ann_args[1] = short_v;
+    r = ray_ann_fn(ann_args, 3);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+
+    /* k is not int → type error. */
+    float f3[3] = {1.0f, 0.0f, 0.0f};
+    ray_t* good_q = ray_vec_from_raw(RAY_F32, f3, 3);
+    ray_t* kfloat = make_f64(1.5);
+    ray_t* ann_args2[3] = { handle, good_q, kfloat };
+    r = ray_ann_fn(ann_args2, 3);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+
+    /* k <= 0 → domain error. */
+    ray_t* k0 = make_i64(0);
+    ray_t* ann_args3[3] = { handle, good_q, k0 };
+    r = ray_ann_fn(ann_args3, 3);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+
+    ray_hnsw_free_fn(handle);
+    ray_release(col);
+    ray_release(metric_atom);
+    ray_release(handle);
+    ray_release(bad_query);
+    ray_release(katom);
+    ray_release(short_v);
+    ray_release(good_q);
+    ray_release(kfloat);
+    ray_release(k0);
+    PASS();
+}
+
+/* ray_hnsw_free_fn: non-handle → type error. */
+static test_result_t test_hnsw_free_type_errors(void) {
+    ray_t* r = ray_hnsw_free_fn(NULL);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    ray_t* s = make_i64(42);
+    r = ray_hnsw_free_fn(s);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    ray_release(s);
+    PASS();
+}
+
+/* ray_hnsw_save_fn: various error paths. */
+static test_result_t test_hnsw_save_type_errors(void) {
+    /* NULL handle → type error. */
+    ray_t* path = ray_eval_str("\"some_path\"");
+    ray_t* r = ray_hnsw_save_fn(NULL, path);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+
+    /* Non-handle → type error. */
+    ray_t* scalar = make_i64(42);
+    r = ray_hnsw_save_fn(scalar, path);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+
+    /* Valid handle, NULL path → type error. */
+    float vecs[3] = {1.0f, 0.0f, 0.0f};
+    ray_t* col = ray_list_new(1);
+    ray_t* v = ray_vec_from_raw(RAY_F32, vecs, 3);
+    col = ray_list_append(col, v);
+    ray_t* build_args[1] = { col };
+    ray_t* handle = ray_hnsw_build_fn(build_args, 1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(handle));
+
+    r = ray_hnsw_save_fn(handle, NULL);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+
+    /* Valid handle, non-string path → type error. */
+    r = ray_hnsw_save_fn(handle, scalar);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+
+    ray_hnsw_free_fn(handle);
+    ray_release(v);
+    ray_release(col);
+    ray_release(handle);
+    ray_release(path);
+    ray_release(scalar);
+    PASS();
+}
+
+/* ray_hnsw_load_fn: various error paths. */
+static test_result_t test_hnsw_load_type_errors(void) {
+    /* NULL → type error. */
+    ray_t* r = ray_hnsw_load_fn(NULL);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    /* Non-string → type error. */
+    ray_t* scalar = make_i64(42);
+    r = ray_hnsw_load_fn(scalar);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    ray_release(scalar);
+    PASS();
+}
+
+/* ray_hnsw_info_fn: non-handle → type error. */
+static test_result_t test_hnsw_info_type_errors(void) {
+    ray_t* r = ray_hnsw_info_fn(NULL);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    ray_t* scalar = make_i64(42);
+    r = ray_hnsw_info_fn(scalar);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    ray_release(scalar);
+    PASS();
+}
+
+/* knn with k as I32 and I16 atoms (atom_to_i64 non-I64 branches). */
+static test_result_t test_knn_k_i32_i16(void) {
+    /* Build col via eval. */
+    ray_eval_str("(set __k_test_col (list [1.0 0.0 0.0] [0.0 1.0 0.0] [0.0 0.0 1.0]))");
+    /* k as I32 (1i suffix). */
+    TEST_ASSERT_EQ_I(eval_i64("(first (at (knn __k_test_col [1.0 0.0 0.0] 1i 'l2) '_rowid))"), 0);
+    /* k as I16 (1h suffix). */
+    TEST_ASSERT_EQ_I(eval_i64("(first (at (knn __k_test_col [1.0 0.0 0.0] 1h 'l2) '_rowid))"), 0);
+    PASS();
+}
+
+/* hnsw-build with I32/I64/F64 source vecs (rayvec_to_floats non-F32 path). */
+static test_result_t test_hnsw_build_non_f32_source(void) {
+    /* F64 vectors → rayvec_to_floats takes the loop path. */
+    double f64_vecs[3][3] = {{1.0,0.0,0.0},{0.0,1.0,0.0},{0.0,0.0,1.0}};
+    ray_t* col = ray_list_new(3);
+    for (int i = 0; i < 3; i++) {
+        ray_t* v = ray_vec_from_raw(RAY_F64, f64_vecs[i], 3);
+        TEST_ASSERT_NOT_NULL(v);
+        col = ray_list_append(col, v);
+        ray_release(v);
+    }
+    ray_t* build_args[1] = { col };
+    ray_t* handle = ray_hnsw_build_fn(build_args, 1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(handle));
+    ray_hnsw_free_fn(handle);
+    ray_release(handle);
+    ray_release(col);
+
+    /* I32 vectors. */
+    int32_t i32_vecs[3][3] = {{1,0,0},{0,1,0},{0,0,1}};
+    col = ray_list_new(3);
+    for (int i = 0; i < 3; i++) {
+        ray_t* v = ray_vec_from_raw(RAY_I32, i32_vecs[i], 3);
+        TEST_ASSERT_NOT_NULL(v);
+        col = ray_list_append(col, v);
+        ray_release(v);
+    }
+    build_args[0] = col;
+    handle = ray_hnsw_build_fn(build_args, 1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(handle));
+    ray_hnsw_free_fn(handle);
+    ray_release(handle);
+    ray_release(col);
+
+    /* I64 vectors. */
+    int64_t i64_vecs[3][3] = {{1,0,0},{0,1,0},{0,0,1}};
+    col = ray_list_new(3);
+    for (int i = 0; i < 3; i++) {
+        ray_t* v = ray_vec_from_raw(RAY_I64, i64_vecs[i], 3);
+        TEST_ASSERT_NOT_NULL(v);
+        col = ray_list_append(col, v);
+        ray_release(v);
+    }
+    build_args[0] = col;
+    handle = ray_hnsw_build_fn(build_args, 1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(handle));
+    ray_hnsw_free_fn(handle);
+    ray_release(handle);
+    ray_release(col);
+    PASS();
+}
+
+/* hnsw-build M out-of-range defaults: M=0 and M=999. */
+static test_result_t test_hnsw_build_m_out_of_range(void) {
+    float vecs[3 * 3] = {
+        1.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f,
+        0.0f, 0.0f, 1.0f,
+    };
+    ray_t* col = ray_list_new(3);
+    for (int i = 0; i < 3; i++) {
+        ray_t* v = ray_vec_from_raw(RAY_F32, vecs + i * 3, 3);
+        col = ray_list_append(col, v);
+        ray_release(v);
+    }
+    int64_t l2_sym = ray_sym_intern("l2", 2);
+    ray_t* metric_atom = ray_sym(l2_sym);
+
+    /* M=0 → out-of-range, keeps default. */
+    ray_t* m0 = make_i64(0);
+    ray_t* args3[3] = { col, metric_atom, m0 };
+    ray_t* h = ray_hnsw_build_fn(args3, 3);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(h));
+    ray_hnsw_free_fn(h);
+    ray_release(h);
+
+    /* M=999 → out-of-range (> 512), keeps default. */
+    ray_t* m999 = make_i64(999);
+    args3[2] = m999;
+    h = ray_hnsw_build_fn(args3, 3);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(h));
+    ray_hnsw_free_fn(h);
+    ray_release(h);
+
+    /* M is not int → type error. */
+    ray_t* mfloat = make_f64(8.0);
+    args3[2] = mfloat;
+    ray_t* r = ray_hnsw_build_fn(args3, 3);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+
+    ray_release(col);
+    ray_release(metric_atom);
+    ray_release(m0);
+    ray_release(m999);
+    ray_release(mfloat);
+    PASS();
+}
+
+/* hnsw-build ef_c out-of-range defaults: ef_c=0 and ef_c=9999. */
+static test_result_t test_hnsw_build_efc_out_of_range(void) {
+    float vecs[3 * 3] = {
+        1.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f,
+        0.0f, 0.0f, 1.0f,
+    };
+    ray_t* col = ray_list_new(3);
+    for (int i = 0; i < 3; i++) {
+        ray_t* v = ray_vec_from_raw(RAY_F32, vecs + i * 3, 3);
+        col = ray_list_append(col, v);
+        ray_release(v);
+    }
+    int64_t l2_sym = ray_sym_intern("l2", 2);
+    ray_t* metric_atom = ray_sym(l2_sym);
+    ray_t* m8 = make_i64(8);
+
+    /* ef_c=0 → out-of-range. */
+    ray_t* ef0 = make_i64(0);
+    ray_t* args4[4] = { col, metric_atom, m8, ef0 };
+    ray_t* h = ray_hnsw_build_fn(args4, 4);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(h));
+    ray_hnsw_free_fn(h);
+    ray_release(h);
+
+    /* ef_c=9999 → out-of-range (> 4096). */
+    ray_t* ef9999 = make_i64(9999);
+    args4[3] = ef9999;
+    h = ray_hnsw_build_fn(args4, 4);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(h));
+    ray_hnsw_free_fn(h);
+    ray_release(h);
+
+    /* ef_c is not int → type error. */
+    ray_t* effloat = make_f64(50.0);
+    args4[3] = effloat;
+    ray_t* r = ray_hnsw_build_fn(args4, 4);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+
+    ray_release(col);
+    ray_release(metric_atom);
+    ray_release(m8);
+    ray_release(ef0);
+    ray_release(ef9999);
+    ray_release(effloat);
+    PASS();
+}
+
+/* list_vec_validate return 3: mixed-dimension vectors in LIST. */
+static test_result_t test_list_validate_dim_mismatch(void) {
+    /* Build LIST with dim-mismatch: [1,0,0] and [1,0]. */
+    ray_t* r = ray_eval_str("(cos-dist (list [1.0 0.0 0.0] [1.0 0.0]) [1.0 0.0 0.0])");
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    /* Same for knn. */
+    r = ray_eval_str("(knn (list [1.0 0.0 0.0] [1.0 0.0]) [1.0 0.0 0.0] 1)");
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    /* Same for hnsw-build. */
+    r = ray_eval_str("(hnsw-build (list [1.0 0.0 0.0] [1.0 0.0]))");
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    PASS();
+}
+
+/* list_vec_validate return 2: first element non-numeric. */
+static test_result_t test_list_validate_first_bad(void) {
+    ray_t* r = ray_eval_str("(cos-dist (list (as 'BOOL [true false]) [1.0 0.0]) [1.0 0.0])");
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    /* norm on list with bad first element. */
+    r = ray_eval_str("(norm (list (as 'BOOL [true false]) [1.0 0.0]))");
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    PASS();
+}
+
+/* knn empty column with zero-dim query → empty result table. */
+static test_result_t test_knn_empty_column(void) {
+    ray_t* r = ray_eval_str("(count (knn (list) (as 'F64 []) 1))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    PASS();
+}
+
+/* cos-dist with zero-denom: zero row vector → denom == 0, sim=0, dist=1. */
+static test_result_t test_cos_dist_zero_denom(void) {
+    /* Zero row vector. */
+    TEST_ASSERT_EQ_F(eval_f64("(cos-dist [0.0 0.0] [1.0 0.0])"), 1.0, 1e-6);
+    /* Both zero vectors. */
+    TEST_ASSERT_EQ_F(eval_f64("(cos-dist [0.0 0.0] [0.0 0.0])"), 1.0, 1e-6);
+    /* LIST with zero row. */
+    TEST_ASSERT_EQ_F(eval_f64("(at (cos-dist (list [0.0 0.0] [1.0 0.0]) [1.0 0.0]) 0)"), 1.0, 1e-6);
+    PASS();
+}
+
+/* knn with IP metric: row_score dispatches through RAY_HNSW_IP → negated dot. */
+static test_result_t test_knn_ip_negated_distance(void) {
+    double d = eval_f64("(first (at (knn (list [1.0 0.0 0.0] [0.0 1.0 0.0]) [1.0 0.0 0.0] 1 'ip) '_dist))");
+    TEST_ASSERT_EQ_F(d, -1.0, 1e-6);
+    PASS();
+}
+
+/* vec_binary_metric scalar path: a->len <= 0 → length error. */
+static test_result_t test_metric_scalar_empty_vec(void) {
+    ray_t* r = ray_eval_str("(cos-dist (as 'F32 []) (as 'F32 []))");
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    r = ray_eval_str("(l2-dist (as 'F32 []) (as 'F32 []))");
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    r = ray_eval_str("(inner-prod (as 'F32 []) (as 'F32 []))");
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    PASS();
+}
+
+/* hnsw-build on empty list → dim <= 0 → length error. */
+static test_result_t test_hnsw_build_empty_list(void) {
+    ray_t* r = ray_eval_str("(hnsw-build (list))");
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    PASS();
+}
+
+/* knn: k > nrows clamping and insertion sort on ascending output. */
+static test_result_t test_knn_k_clamp_and_sort(void) {
+    /* 3 rows, k=100 → clamped to 3. */
+    TEST_ASSERT_EQ_I(eval_i64("(count (knn (list [1.0 0.0] [0.0 1.0] [1.0 1.0]) [1.0 0.0] 100 'l2))"), 3);
+    /* Verify ascending sort. */
+    double d0 = eval_f64("(first (at (knn (list [5.0 0.0] [3.0 0.0] [1.0 0.0]) [0.0 0.0] 3 'l2) '_dist))");
+    double d2 = eval_f64("(last (at (knn (list [5.0 0.0] [3.0 0.0] [1.0 0.0]) [0.0 0.0] 3 'l2) '_dist))");
+    TEST_ASSERT_EQ_F(d0, 1.0, 1e-6);
+    TEST_ASSERT_EQ_F(d2, 5.0, 1e-6);
+    PASS();
+}
+
+/* ann: ef_s out-of-range keeps computed ef. */
+static test_result_t test_ann_efs_out_of_range(void) {
+    ray_eval_str("(set __efs_idx (hnsw-build (list [1.0 0.0 0.0] [0.0 1.0 0.0] [0.0 0.0 1.0]) 'l2))");
+    /* ef_s=0 → keeps default. */
+    TEST_ASSERT_EQ_I(eval_i64("(count (ann __efs_idx [1.0 0.0 0.0] 2 0))"), 2);
+    /* ef_s=9999 → v > 4096, keeps computed ef. */
+    TEST_ASSERT_EQ_I(eval_i64("(count (ann __efs_idx [1.0 0.0 0.0] 2 9999))"), 2);
+    /* ef_s as non-int → type error. */
+    ray_t* r = ray_eval_str("(ann __efs_idx [1.0 0.0 0.0] 2 1.5)");
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    ray_eval_str("(hnsw-free __efs_idx)");
+    PASS();
+}
+
+/* hnsw-info for each metric to cover the switch. */
+static test_result_t test_hnsw_info_all_metrics(void) {
+    /* Cosine → "cosine" */
+    ray_eval_str("(set __info_cos (hnsw-build (list [1.0 0.0 0.0] [0.0 1.0 0.0]) 'cosine))");
+    ray_t* r = ray_eval_str("(== (at (hnsw-info __info_cos) 'metric) 'cosine)");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_U(r->b8, 1);
+    ray_release(r);
+    ray_eval_str("(hnsw-free __info_cos)");
+
+    /* L2 → "l2" */
+    ray_eval_str("(set __info_l2 (hnsw-build (list [1.0 0.0 0.0] [0.0 1.0 0.0]) 'l2))");
+    r = ray_eval_str("(== (at (hnsw-info __info_l2) 'metric) 'l2)");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_U(r->b8, 1);
+    ray_release(r);
+    ray_eval_str("(hnsw-free __info_l2)");
+
+    /* IP → "ip" */
+    ray_eval_str("(set __info_ip (hnsw-build (list [1.0 0.0 0.0] [0.0 1.0 0.0]) 'ip))");
+    r = ray_eval_str("(== (at (hnsw-info __info_ip) 'metric) 'ip)");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_U(r->b8, 1);
+    ray_release(r);
+    ray_eval_str("(hnsw-free __info_ip)");
+    PASS();
+}
+
+/* knn heap sift patterns: exercises both heap-up break and sift-down paths
+ * with a variety of k values and distance orderings. */
+static test_result_t test_knn_heap_patterns(void) {
+    /* 6 rows at distances 6,5,4,3,2,1 from origin. k=3.
+     * First 3 fill heap: [6,5,4] (max-heap root=6).
+     * Row 3 (d=3): 3 < 6 → replace root, sift-down.
+     * Row 4 (d=2): 2 < 5 (new root after sift) → replace, sift-down.
+     * Row 5 (d=1): 1 < 4 (new root) → replace, sift-down.
+     * Final sorted: 1,2,3. */
+    TEST_ASSERT_EQ_F(eval_f64("(first (at (knn (list [6.0 0.0] [5.0 0.0] [4.0 0.0] [3.0 0.0] [2.0 0.0] [1.0 0.0]) [0.0 0.0] 3 'l2) '_dist))"), 1.0, 1e-6);
+    TEST_ASSERT_EQ_F(eval_f64("(last  (at (knn (list [6.0 0.0] [5.0 0.0] [4.0 0.0] [3.0 0.0] [2.0 0.0] [1.0 0.0]) [0.0 0.0] 3 'l2) '_dist))"), 3.0, 1e-6);
+
+    /* k=1: first entry fills, subsequent replacements exercise sift-down
+     * in the degenerate single-element heap (best == j, breaks immediately). */
+    TEST_ASSERT_EQ_F(eval_f64("(first (at (knn (list [6.0 0.0] [5.0 0.0] [1.0 0.0]) [0.0 0.0] 1 'l2) '_dist))"), 1.0, 1e-6);
+
+    /* All ties: heap fills but no replacements needed (d >= heap[0].d fails). */
+    TEST_ASSERT_EQ_F(eval_f64("(first (at (knn (list [1.0 0.0] [0.0 1.0] [-1.0 0.0] [0.0 -1.0]) [0.0 0.0] 4 'l2) '_dist))"), 1.0, 1e-6);
+    PASS();
+}
+
 /* ============ Suite table ============ */
 
 const test_entry_t embedding_entries[] = {
@@ -1312,6 +1916,38 @@ const test_entry_t embedding_entries[] = {
     { "embedding/rerank_knn_nullable_col_gather", test_knn_rerank_nullable_col_gather, emb_setup, emb_teardown },
     { "embedding/rerank_knn_heap_right_child", test_knn_rerank_heap_right_child, emb_setup, emb_teardown },
     { "embedding/rerank_knn_zero_query_cosine", test_knn_rerank_zero_query_cosine, emb_setup, emb_teardown },
+
+    /* branch coverage (S8) */
+    { "embedding/cos_dist_null_args", test_cos_dist_null_args, emb_setup, emb_teardown },
+    { "embedding/norm_null", test_norm_null, emb_setup, emb_teardown },
+    { "embedding/knn_rank_errors", test_knn_rank_errors, emb_setup, emb_teardown },
+    { "embedding/knn_col_type_errors", test_knn_col_type_errors, emb_setup, emb_teardown },
+    { "embedding/knn_query_type_error", test_knn_query_type_error, emb_setup, emb_teardown },
+    { "embedding/knn_k_type_error", test_knn_k_type_error, emb_setup, emb_teardown },
+    { "embedding/hnsw_build_rank_errors", test_hnsw_build_rank_errors, emb_setup, emb_teardown },
+    { "embedding/hnsw_build_col_null", test_hnsw_build_col_null, emb_setup, emb_teardown },
+    { "embedding/ann_rank_errors", test_ann_rank_errors, emb_setup, emb_teardown },
+    { "embedding/ann_handle_type_error", test_ann_handle_type_error, emb_setup, emb_teardown },
+    { "embedding/ann_query_type_error", test_ann_query_type_error, emb_setup, emb_teardown },
+    { "embedding/hnsw_free_type_errors", test_hnsw_free_type_errors, emb_setup, emb_teardown },
+    { "embedding/hnsw_save_type_errors", test_hnsw_save_type_errors, emb_setup, emb_teardown },
+    { "embedding/hnsw_load_type_errors", test_hnsw_load_type_errors, emb_setup, emb_teardown },
+    { "embedding/hnsw_info_type_errors", test_hnsw_info_type_errors, emb_setup, emb_teardown },
+    { "embedding/knn_k_i32_i16", test_knn_k_i32_i16, emb_setup, emb_teardown },
+    { "embedding/hnsw_build_non_f32_source", test_hnsw_build_non_f32_source, emb_setup, emb_teardown },
+    { "embedding/hnsw_build_m_out_of_range", test_hnsw_build_m_out_of_range, emb_setup, emb_teardown },
+    { "embedding/hnsw_build_efc_out_of_range", test_hnsw_build_efc_out_of_range, emb_setup, emb_teardown },
+    { "embedding/list_validate_dim_mismatch", test_list_validate_dim_mismatch, emb_setup, emb_teardown },
+    { "embedding/list_validate_first_bad", test_list_validate_first_bad, emb_setup, emb_teardown },
+    { "embedding/knn_empty_column", test_knn_empty_column, emb_setup, emb_teardown },
+    { "embedding/cos_dist_zero_denom", test_cos_dist_zero_denom, emb_setup, emb_teardown },
+    { "embedding/knn_ip_negated_distance", test_knn_ip_negated_distance, emb_setup, emb_teardown },
+    { "embedding/metric_scalar_empty_vec", test_metric_scalar_empty_vec, emb_setup, emb_teardown },
+    { "embedding/hnsw_build_empty_list", test_hnsw_build_empty_list, emb_setup, emb_teardown },
+    { "embedding/knn_k_clamp_and_sort", test_knn_k_clamp_and_sort, emb_setup, emb_teardown },
+    { "embedding/ann_efs_out_of_range", test_ann_efs_out_of_range, emb_setup, emb_teardown },
+    { "embedding/hnsw_info_all_metrics", test_hnsw_info_all_metrics, emb_setup, emb_teardown },
+    { "embedding/knn_heap_patterns", test_knn_heap_patterns, emb_setup, emb_teardown },
 
     { NULL, NULL, NULL, NULL },
 };

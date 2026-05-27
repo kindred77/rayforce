@@ -1,0 +1,181 @@
+;; system_branch_cov2.rfl — branch coverage for src/ops/system.c (part 2).
+;;
+;; Covers: quote, return, args, rc, diverse, get, remove, timer,
+;; internals, memstat, sysinfo, hopen, hclose, hsend, serde extras,
+;; splayed mount with mixed children, parse edge cases.
+;;
+;; Split from system_branch_cov.rfl to avoid stack-overflow on teardown
+;; when too many globals accumulate in a single test runtime.
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_quote_fn  (lines 583-587)
+;; ══════════════════════════════════════════════════════════════════════
+(quote 42) -- 42
+(quote 'hello) -- 'hello
+(quote [1 2 3]) -- [1 2 3]
+(nil? (quote (+ 1 2))) -- false
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_return_fn  (lines 590-593)
+;; ══════════════════════════════════════════════════════════════════════
+(return 42) -- 42
+(return "hello") -- "hello"
+(return [1 2 3]) -- [1 2 3]
+((fn [x] (return (+ x 1))) 5) -- 6
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_args_fn  (lines 596-602)
+;; ══════════════════════════════════════════════════════════════════════
+(type (args 0)) -- 'LIST
+(count (args 0)) -- 0
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_rc_fn  (lines 605-608)
+;; ══════════════════════════════════════════════════════════════════════
+(>= (rc 42) 0) -- true
+(>= (rc "hello") 0) -- true
+(>= (rc [1 2 3]) 0) -- true
+(>= (rc (list 1 2)) 1) -- true
+(>= (rc (dict ['a] [1])) 1) -- true
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_diverse_fn  (lines 611-629)
+;; ══════════════════════════════════════════════════════════════════════
+;; Atom: always true
+(diverse 42) -- true
+(diverse "hello") -- true
+(diverse 'sym) -- true
+;; Non-collection: error
+(diverse null) !- type
+;; Single element: true
+(diverse [1]) -- true
+;; All unique: true
+(diverse [1 2 3 4 5]) -- true
+;; Duplicates: false
+(diverse [1 2 1]) -- false
+(diverse [1 1 1]) -- false
+;; Empty vector: <= 1 elements -> true
+(diverse (take [1] 0)) -- true
+;; Float
+(diverse [1.0 2.0 3.0]) -- true
+(diverse [1.0 1.0]) -- false
+;; Symbol
+(diverse ['a 'b 'c]) -- true
+(diverse ['a 'a]) -- false
+;; String
+(diverse ["x" "y" "z"]) -- true
+;; Lazy distinct materialization path
+(diverse (til 20)) -- true
+(diverse (take [1 2 3] 12)) -- false
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_get_fn  (lines 632-634) — alias for at
+;; ══════════════════════════════════════════════════════════════════════
+(get (dict ['a 'b 'c] [10 20 30]) 'a) -- 10
+(get (dict ['a 'b 'c] [10 20 30]) 'b) -- 20
+(get (dict ['a 'b 'c] [10 20 30]) 'c) -- 30
+(nil? (get (dict ['a 'b] [1 2]) 'z)) -- true
+;; get on table
+(sum (get (table [x y] (list [1 2 3] [4 5 6])) 'x)) -- 6
+(sum (get (table [x y] (list [1 2 3] [4 5 6])) 'y)) -- 15
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_remove_fn  (lines 637-641)
+;; ══════════════════════════════════════════════════════════════════════
+(remove 42 'a) !- type
+(remove [1 2 3] 'a) !- type
+(remove null 'a) !- type
+(count (remove (dict ['a 'b 'c] [1 2 3]) 'b)) -- 2
+(at (remove (dict ['a 'b 'c] [1 2 3]) 'b) 'a) -- 1
+(at (remove (dict ['a 'b 'c] [1 2 3]) 'b) 'c) -- 3
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_timer_fn  (lines 645-649)
+;; ══════════════════════════════════════════════════════════════════════
+(>= (timer 0) 0) -- true
+(type (timer 0)) -- 'i64
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_internals_fn (.sys.build)  (lines 674-700)
+;; ══════════════════════════════════════════════════════════════════════
+(type (.sys.build)) -- 'DICT
+(count (.sys.build)) -- 2
+(type (at (.sys.build) 'version)) -- 'str
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_memstat_fn (.sys.mem)  (lines 703-728)
+;; ══════════════════════════════════════════════════════════════════════
+(type (.sys.mem)) -- 'DICT
+(count (.sys.mem)) -- 5
+(type (value (.sys.mem))) -- 'LIST
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_sysinfo_fn (.sys.info)  (lines 730-762)
+;; ══════════════════════════════════════════════════════════════════════
+(type (.sys.info)) -- 'DICT
+(count (.sys.info)) -- 3
+(> (at (.sys.info) 'cores) 0) -- true
+(count (value (.sys.info))) -- 3
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_hopen_fn  (lines 769-825)
+;; ══════════════════════════════════════════════════════════════════════
+(.ipc.open [1 2]) !- type
+(.ipc.open 42) !- type
+(.ipc.open 'foo) !- type
+(.ipc.open "localhost") !- domain
+(.ipc.open "") !- domain
+(.ipc.open "localhost:0") !- domain
+(.ipc.open "localhost:99999") !- domain
+(.ipc.open "localhost:-1") !- domain
+(.ipc.open "localhost:65536") !- domain
+(.ipc.open "localhost:abc") !- domain
+(.ipc.open "127.0.0.1:19876") !- io
+(.ipc.open "127.0.0.1:19876:user:pass") !- io
+(.ipc.open "127.0.0.1:19876:extra") !- io
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_hclose_fn  (lines 828-834)
+;; ══════════════════════════════════════════════════════════════════════
+(.ipc.close [1 2]) !- type
+(.ipc.close "foo") !- type
+(.ipc.close 1.5) !- type
+(nil? (.ipc.close 9999)) -- true
+(nil? (.ipc.close 9999i)) -- true
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_hsend_fn  (lines 837-845)
+;; ══════════════════════════════════════════════════════════════════════
+(.ipc.send [1 2] "msg") !- type
+(.ipc.send "foo" "msg") !- type
+(.ipc.send 1.5 "msg") !- type
+
+;; ══════════════════════════════════════════════════════════════════════
+;; parse on edge cases
+;; ══════════════════════════════════════════════════════════════════════
+(eval (parse "42")) -- 42
+(eval (parse "\"hello\"")) -- "hello"
+;; "null" parses to a symbol atom, not a list
+(type (parse "null")) -- 'sym
+
+;; ══════════════════════════════════════════════════════════════════════
+;; Serde round-trip on additional types
+;; ══════════════════════════════════════════════════════════════════════
+(at (de (ser (dict ['a 'b] [1 2]))) 'a) -- 1
+(count (de (ser (table [x] (list [10 20 30]))))) -- 3
+(count (de (ser (guid 3)))) -- 3
+(de (ser [true false true])) -- [true false true]
+
+;; ══════════════════════════════════════════════════════════════════════
+;; Splayed mount: mixed children (exercises mount_record + finalize)
+;; ══════════════════════════════════════════════════════════════════════
+(.sys.exec "rm -rf /tmp/rfl_sys_bc2_*")
+(.db.splayed.set "/tmp/rfl_sys_bc2_mx/good/" (table [x] (list [1 2 3])))
+(.sys.exec "mkdir -p /tmp/rfl_sys_bc2_mx/bad_no_d/")
+(count (.db.splayed.mount "/tmp/rfl_sys_bc2_mx/")) -- 1
+(.sys.exec "rm -rf /tmp/rfl_sys_bc2_*")
+
+;; ══════════════════════════════════════════════════════════════════════
+;; GUID distinct uniqueness across calls
+;; ══════════════════════════════════════════════════════════════════════
+(count (distinct (concat (guid 5) (guid 5)))) -- 10

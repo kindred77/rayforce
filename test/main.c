@@ -182,7 +182,7 @@ static const test_entry_t* const compiled_groups[] = {
  * evaluates it under a fresh runtime (via rfl_setup/rfl_teardown).
  */
 
-#define RFL_THUNK_CAPACITY 320
+#define RFL_THUNK_CAPACITY 384
 
 static char  g_rfl_paths[RFL_THUNK_CAPACITY][512];
 static char  g_rfl_names[RFL_THUNK_CAPACITY][256];
@@ -462,7 +462,15 @@ static void rfl_teardown(void) { ray_runtime_destroy(__RUNTIME); }
     X(288) X(289) X(290) X(291) X(292) X(293) X(294) X(295) \
     X(296) X(297) X(298) X(299) X(300) X(301) X(302) X(303) \
     X(304) X(305) X(306) X(307) X(308) X(309) X(310) X(311) \
-    X(312) X(313) X(314) X(315) X(316) X(317) X(318) X(319)
+    X(312) X(313) X(314) X(315) X(316) X(317) X(318) X(319) \
+    X(320) X(321) X(322) X(323) X(324) X(325) X(326) X(327) \
+    X(328) X(329) X(330) X(331) X(332) X(333) X(334) X(335) \
+    X(336) X(337) X(338) X(339) X(340) X(341) X(342) X(343) \
+    X(344) X(345) X(346) X(347) X(348) X(349) X(350) X(351) \
+    X(352) X(353) X(354) X(355) X(356) X(357) X(358) X(359) \
+    X(360) X(361) X(362) X(363) X(364) X(365) X(366) X(367) \
+    X(368) X(369) X(370) X(371) X(372) X(373) X(374) X(375) \
+    X(376) X(377) X(378) X(379) X(380) X(381) X(382) X(383)
 
 #define X(N) static test_result_t rfl_thunk_##N(void) { return run_rfl_at(N); }
 RFL_THUNKS(X)

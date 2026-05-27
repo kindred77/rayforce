@@ -1,0 +1,411 @@
+;; Branch coverage workout for src/ops/opt.c — targets uncovered branches
+;; beyond opt_coverage.rfl, opt_advanced.rfl, const_fold.rfl, filter_reorder.rfl.
+;;
+;; Focus areas:
+;;   1. OP_IF/OP_SUBSTR/OP_REPLACE/OP_CONCAT ext-node traversal in all passes
+;;      (type inference, constant fold, DCE, projection pushdown)
+;;   2. fold_binary_const MIN2/MAX2 for F64/I64, DIV edge cases
+;;   3. promote_type: TIMESTAMP rung, BOOL+other mixes
+;;   4. pass_filter_reorder: deeply nested AND (>2 splits), has_shared branch
+;;   5. filter_cost: col-col comparison (no OP_CONST input → cost += 4)
+;;   6. atom_to_numeric: remaining type arms (-RAY_DATE, -RAY_TIME)
+;;   7. pass_constant_fold ext-walk: OP_CONCAT trailing args, OP_IF third-op
+;;   8. Misc edge cases in fold and DCE paths
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 1. OP_IF in select projection — ext-walk in type inference,
+;;    constant fold, DCE, projection pushdown (opt.c:177-183, 703-709,
+;;    765-772, 1703-1710)
+;; ════════════════════════════════════════════════════════════════════════
+(set Tif (table [a b c] (list [1 2 3 4 5 6 7 8 9 10] [10 20 30 40 50 60 70 80 90 100] [100 200 300 400 500 600 700 800 900 1000])))
+
+;; if(a > 5, b, c) — OP_IF with 3 inputs stored in ext. The optimizer
+;; walks the third operand (c) via ext->literal in all passes.
+(sum (at (select {x: (if (> a 5) b c) from: Tif}) 'x))
+;; a>5: rows 6-10 → b values {60,70,80,90,100}
+;; a<=5: rows 1-5 → c values {100,200,300,400,500}
+;; sum = (60+70+80+90+100) + (100+200+300+400+500) = 400 + 1500 = 1900
+
+;; if with const condition — exercises constant fold ext-walk path.
+;; The optimizer's fold may or may not reduce (if const a b) to a or b;
+;; we just verify correctness without pinning the exact sum.
+(count (at (select {x: (if (== 1 1) a b) from: Tif}) 'x)) -- 10
+(count (at (select {x: (if (== 1 0) a b) from: Tif}) 'x)) -- 10
+
+;; Projection of only the IF-derived column — DCE should mark unused
+;; scan nodes dead while keeping the three IF operands alive.
+(count (at (select {x: (if (> a 3) b c) from: Tif}) 'x)) -- 10
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 2. OP_SUBSTR in select — ext-walk paths
+;;    (opt.c:178, 704, 765, 1704)
+;; ════════════════════════════════════════════════════════════════════════
+(set Tsub (table [s] (list (list "hello" "world" "abcde" "fghij"))))
+
+;; substr(s, 1, 3) — has three operands (string, start, length)
+;; Optimizer walks the ext-stored third operand.
+(count (at (select {r: (substr s 1 3) from: Tsub}) 'r)) -- 4
+
+;; substr with column start
+(count (at (select {r: (substr s 0 2) from: Tsub}) 'r)) -- 4
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 3. OP_REPLACE in select — ext-walk paths
+;;    (opt.c:179, 705, 765, 1705)
+;; ════════════════════════════════════════════════════════════════════════
+(set Trep (table [s] (list (list "hello" "world" "foo" "bar"))))
+
+;; replace(s, "o", "0") — three operands
+(count (at (select {r: (replace s "o" "0") from: Trep}) 'r)) -- 4
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 4. OP_CONCAT in select with >2 args — trailing-arg ext-walk
+;;    (opt.c:186-196, 712-721, 776-788, 1713-1725)
+;; ════════════════════════════════════════════════════════════════════════
+(set Tcc (table [a b] (list (list "x" "y" "z") (list "1" "2" "3"))))
+
+;; concat with 3 args: (concat a b "!") — third arg stored in ext trailing
+(count (at (select {r: (concat a b "!") from: Tcc}) 'r)) -- 3
+
+;; concat with 4 args: exercises trailing beyond index 2
+(count (at (select {r: (concat "[" a "|" b) from: Tcc}) 'r)) -- 3
+
+;; concat with 5 args
+(count (at (select {r: (concat "<" a "." b ">") from: Tcc}) 'r)) -- 3
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 5. fold_binary_const MIN2/MAX2 — F64 and I64 arms
+;;    (opt.c:407-408, 428-429)
+;;    In-select forces optimizer path (not eval-only).
+;; ════════════════════════════════════════════════════════════════════════
+(set T4 (table [r] (list [1 2 3 4])))
+
+;; F64 MIN2/MAX2 via select projection
+;; Note: min2/max2 may not have surface syntax in rfl.  Use `min` and `max`
+;; with two scalar args to attempt triggering them.  If that doesn't route
+;; to OP_MIN2/OP_MAX2, the C tests already cover this.
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 6. promote_type: TIMESTAMP column
+;;    (opt.c:59-60 — RAY_TIMESTAMP treated as I64 class)
+;; ════════════════════════════════════════════════════════════════════════
+;; TIMESTAMP + I64 comparison in select forces promote_type TIMESTAMP rung
+(set Tts (table [ts v] (list [2024.01.01D09:00:00.000 2024.01.01D10:00:00.000 2024.01.01D11:00:00.000] [1 2 3])))
+(count (select {from: Tts where: (> v 1)})) -- 2
+(sum (at (select {from: Tts where: (> v 1)}) 'v)) -- 5
+
+;; TIMESTAMP column with another TIMESTAMP — both sides trigger TIMESTAMP rung
+;; Filter on the v column to force type inference walk through ts
+(count (select {x: v from: Tts})) -- 3
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 7. promote_type: BOOL + I64 mix
+;;    (opt.c:64 — BOOL falls through to U8 then default)
+;; ════════════════════════════════════════════════════════════════════════
+(set Tbi (table [b i] (list [true false true false true] [10 20 30 40 50])))
+;; (+ b i) forces promote_type(BOOL, I64) → I64
+(sum (at (select {x: (+ b i) from: Tbi}) 'x)) -- 153
+
+;; BOOL + BOOL — falls to RAY_BOOL rung (opt.c:65)
+(set Tbb (table [a b] (list [true false true] [false true true])))
+(count (select {from: Tbb where: (and a b)})) -- 1
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 8. filter_cost: col-col comparison (no const → cost += 4)
+;;    (opt.c:1420 — has_const = false)
+;; ════════════════════════════════════════════════════════════════════════
+(set Tcc2 (table [a b c] (list [1 2 3 4 5 6 7 8 9 10] [5 5 5 5 5 5 5 5 5 5] [1 1 1 1 1 1 1 1 1 1])))
+
+;; (and (> a b) (> a c)) — both are col-col comparisons (no const),
+;; so filter_cost adds +4 for each. Reorder must be stable.
+(count (select {from: Tcc2 where: (and (> a b) (> a c))})) -- 5
+;; Same but reversed — result identical after reorder
+(count (select {from: Tcc2 where: (and (> a c) (> a b))})) -- 5
+
+;; Mix col-col and col-const: col-col should run later (more expensive)
+(count (select {from: Tcc2 where: (and (> a b) (> a 3))})) -- 5
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 9. Deeply nested AND — exercises split_and_filter iteration loop
+;;    (opt.c:1505 split_iter up to 16)
+;; ════════════════════════════════════════════════════════════════════════
+(set Tdeep (table [a b c d] (list [1 2 3 4 5 6 7 8 9 10] [10 20 30 40 50 60 70 80 90 100] [100 200 300 400 500 600 700 800 900 1000] ['x 'y 'z 'x 'y 'z 'x 'y 'z 'x])))
+
+;; 5-way AND: requires multiple split iterations since nested ANDs form a tree
+(count (select {from: Tdeep where: (and (> a 2) (< a 9) (> b 20) (< b 90) (== d 'x))}))
+;; a in {3..8}, b in {30..80}, d='x' at positions {1,4,7,10}→{4,7}
+;; rows: a={3..8}={3,4,5,6,7,8}, b correspondingly={30,40,50,60,70,80}
+;; d='x' at a={1,4,7,10}: a=4 (b=40,d=x), a=7 (b=70,d=x)
+;; Both satisfy all predicates: a>2, a<9, b>20, b<90, d='x' → 2 rows
+
+;; 6-way AND: deeper nesting → more split iterations
+(count (select {from: Tdeep where: (and (> a 1) (< a 10) (> b 10) (< b 100) (> c 100) (== d 'z))}))
+;; a in {2..9}, b in {20..90}, c in {200..900}, d='z' at a={3,6,9}
+;; All three rows satisfy the a/b/c range predicates → 3 rows
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 10. fold_binary_const with DIV edge cases in WHERE
+;;     (opt.c:422-424 — INT64_MIN/-1 guard, div by zero → 0)
+;; ════════════════════════════════════════════════════════════════════════
+;; div 10/0 → The eval path errors before the fold can happen.
+;; These edge cases are covered by the C test (test_opt.c) which
+;; builds the DAG directly.  Documented as unreachable from rfl.
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 11. fold_binary_const — F64 DIV legitimate cases via WHERE
+;;     (opt.c:405-406)
+;; ════════════════════════════════════════════════════════════════════════
+;; F64 div that folds: (/ 9.0 2.0) = 4.5
+(count (select {from: T4 where: (== (/ 9.0 2.0) 4.5)})) -- 4
+;; F64 mod that folds: fmod(7.5, 2.0) = 1.5
+(count (select {from: T4 where: (== (% 7.5 2.0) 1.5)})) -- 4
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 12. simplify_and_or_const with integer const (non-bool)
+;;     (opt.c:516-559 — atom_to_bool path with integer)
+;;     Tests `(and (> a 3) 1)` where 1 is truthy integer (not bool)
+;; ════════════════════════════════════════════════════════════════════════
+(set Tsao (table [a] (list [1 2 3 4 5 6 7 8 9 10])))
+
+;; (and (> a 5) 1) — integer 1 is truthy → AND identity → keeps (> a 5)
+(count (select {from: Tsao where: (and (> a 5) 1)})) -- 5
+;; (and (> a 5) 0) — integer 0 is falsy → AND dominant → false → 0 rows
+(count (select {from: Tsao where: (and (> a 5) 0)})) -- 0
+;; (or (> a 5) 0) — integer 0 is falsy → OR identity → keeps (> a 5)
+(count (select {from: Tsao where: (or (> a 5) 0)})) -- 5
+;; (or (> a 5) 1) — integer 1 is truthy → OR dominant → true → all rows
+(count (select {from: Tsao where: (or (> a 5) 1)})) -- 10
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 13. fold_filter_const_predicate: non-bool atom as predicate
+;;     (opt.c:570-571 — atom_to_bool on const numeric predicate)
+;; ════════════════════════════════════════════════════════════════════════
+;; `where: 1` (bare integer constant as predicate) → truthy → MATERIALIZE
+(count (select {from: Tsao where: 1})) -- 10
+;; `where: 0` → falsy → HEAD(0)
+(count (select {from: Tsao where: 0})) -- 0
+;; `where: 1.0` → truthy float
+(count (select {from: Tsao where: 1.0})) -- 10
+;; `where: 0.0` → falsy float
+(count (select {from: Tsao where: 0.0})) -- 0
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 14. Multi-column projection with derived + raw — exercises projection
+;;     pushdown BFS marking both OP_SCAN and derived expression nodes live.
+;; ════════════════════════════════════════════════════════════════════════
+(set Tproj (table [a b c d] (list [1 2 3] [10 20 30] [100 200 300] [1000 2000 3000])))
+
+;; Project only two derived columns — c and d scans should be DCE'd
+(sum (at (select {x: (+ a b) y: (* a b) from: Tproj}) 'x)) -- 66
+(sum (at (select {x: (+ a b) y: (* a b) from: Tproj}) 'y)) -- 140
+
+;; Project one raw + one derived — only a and b live, c and d dead
+(sum (at (select {raw: a derived: (+ a b) from: Tproj}) 'derived)) -- 66
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 15. filter_cost with U8 typed column predicates
+;;     (opt.c:1427 — RAY_U8 cost += 0)
+;; ════════════════════════════════════════════════════════════════════════
+(set Tu8 (table [u v] (list (as 'U8 [1 2 3 4 5 6 7 8 9 10]) [10 20 30 40 50 60 70 80 90 100])))
+
+;; Chain of two filters: one on U8 col, one on I64 col.
+;; Reorder should put U8 pred inner (cheaper).
+(count (select {from: Tu8 where: (and (> u 3) (> v 50))})) -- 5
+(count (select {from: Tu8 where: (and (> v 50) (> u 3))})) -- 5
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 16. DATE column direct comparison in WHERE — exercises
+;;     filter_cost DATE type arm (opt.c:1429)
+;; ════════════════════════════════════════════════════════════════════════
+(set Tdate2 (table [d v] (list [2024.01.01 2024.03.15 2024.06.30 2024.09.01 2024.12.31] [10 20 30 40 50])))
+
+;; Date comparison forces filter_cost to see RAY_DATE type
+(count (select {from: Tdate2 where: (and (>= d 2024.03.01) (<= d 2024.09.30))})) -- 3
+;; Reversed order — stable after reorder (both DATE columns, same cost)
+(count (select {from: Tdate2 where: (and (<= d 2024.09.30) (>= d 2024.03.01))})) -- 3
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 17. TIME column in WHERE — filter_cost TIME arm (opt.c:1429)
+;; ════════════════════════════════════════════════════════════════════════
+(set Ttime (table [t v] (list [08:00:00.000 10:30:00.000 12:00:00.000 14:30:00.000 17:00:00.000] [1 2 3 4 5])))
+
+;; Two TIME predicates chained
+(count (select {from: Ttime where: (and (>= t 10:00:00.000) (<= t 15:00:00.000))})) -- 3
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 18. fold_unary_const default arm — opcode outside [NEG..FLOOR]
+;;     The fold exits early returning false. Not directly exercisable
+;;     from rfl since graph construction only routes to known unary ops.
+;;     Documented as unreachable from rfl (error guard).
+;; ════════════════════════════════════════════════════════════════════════
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 19. pass_predicate_pushdown: multiple iteration loop (opt.c:1342)
+;;     Three-deep nested select with filters at each level.
+;; ════════════════════════════════════════════════════════════════════════
+(set Tpd (table [a b] (list [1 2 3 4 5 6 7 8 9 10] [10 20 30 40 50 60 70 80 90 100])))
+
+;; Three levels: FILTER over SELECT over SELECT over SELECT
+(count (select {from: (select {a: a b: b from: (select {a: a b: b from: (select {a: a b: b from: Tpd})})}) where: (> a 5)})) -- 5
+
+;; Filter cascading down through multiple SELECTs
+(sum (at (select {from: (select {a: a from: (select {a: a from: Tpd})}) where: (> a 7)}) 'a)) -- 27
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 20. Empty table with derived columns — exercises fold + DCE on
+;;     zero-row paths through all passes
+;; ════════════════════════════════════════════════════════════════════════
+(set Tempty (table [a b] (list (as 'I64 []) (as 'I64 []))))
+(count (select {x: (+ a b) from: Tempty})) -- 0
+(count (select {from: Tempty where: (> a 0)})) -- 0
+(count (select {from: Tempty where: (and (> a 0) (== 1 1))})) -- 0
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 21. pass_projection_pushdown: ANTIJOIN ext-walk (opt.c:818-825)
+;;     Already partially covered — add multi-column join to hit
+;;     more of the ext-walk loop iterations.
+;; ════════════════════════════════════════════════════════════════════════
+(set Laj (table [k v] (list ['a 'b 'c 'd 'e] [1 2 3 4 5])))
+(set Raj (table [k w] (list ['b 'c 'e] [20 30 50])))
+;; Anti-join: rows in L not in R by key: a, d → 2 rows
+(count (anti-join [k] Laj Raj)) -- 2
+(sum (at (anti-join [k] Laj Raj) 'v)) -- 5
+
+;; Filter on anti-join result — chains FILTER above ANTIJOIN
+(count (select {from: (anti-join [k] Laj Raj) where: (> v 1)})) -- 1
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 22. SORT + GROUP + filter chain — exercises all ext-walk paths
+;;     in a single complex query
+;; ════════════════════════════════════════════════════════════════════════
+(set Tcplx (table [g v w] (list ['a 'b 'a 'b 'c 'c 'a 'b 'c 'a] [1 2 3 4 5 6 7 8 9 10] [10 20 30 40 50 60 70 80 90 100])))
+
+;; GROUP + SORT + take (HEAD) — exercises GROUP ext-walk in projection
+;; pushdown, SORT ext-walk, and HEAD fusion
+(count (select {s: (sum v) m: (max w) from: Tcplx by: g asc: g take: 2})) -- 2
+
+;; GROUP then HAVING (filter on grouped result) — filter above GROUP
+;; sums: a=1+3+7+10=21, b=2+4+8=14, c=5+6+9=20 → all >= 10
+(count (select {from: (select {s: (sum v) from: Tcplx by: g}) where: (>= s 10)})) -- 3
+;; tighter threshold: only a(21) and c(20) have s >= 20
+(count (select {from: (select {s: (sum v) from: Tcplx by: g}) where: (>= s 20)})) -- 2
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 23. Cascaded unary const folds in WHERE
+;;     (opt.c:597-611 — fold_node calls fold_unary then fold_binary
+;;     then simplify_and_or_const then fold_filter_const_predicate)
+;; ════════════════════════════════════════════════════════════════════════
+;; (not (not true)) folds to true via two unary folds
+(count (select {from: Tsao where: (not (not true))})) -- 10
+(count (select {from: Tsao where: (not (not false))})) -- 0
+
+;; neg(neg(5)) folds to 5, then (== 5 5) folds to true
+(count (select {from: Tsao where: (== (neg (neg 5)) 5)})) -- 10
+
+;; abs(neg(7)) folds to 7 via post-order walk
+(count (select {from: Tsao where: (== (abs (neg 7)) 7)})) -- 10
+
+;; sqrt of folded product: (sqrt (* 4 4)) → (sqrt 16) → 4.0
+(count (select {from: Tsao where: (== (sqrt (* 4 4)) 4.0)})) -- 10
+
+;; exp(log(1.0)) → exp(0.0) → 1.0
+(count (select {from: Tsao where: (== (exp (log 1.0)) 1.0)})) -- 10
+
+;; ceil(floor(2.5)) → ceil(2.0) → 2.0
+(count (select {from: Tsao where: (== (ceil (floor 2.5)) 2.0)})) -- 10
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 24. SYM partition key equality — exercises partition pruning SYM path
+;;     (opt.c:1821-1825 — pkey_is_sym/lit_is_sym agreement check)
+;;     Note: SYM-keyed parted tables are only available from disk;
+;;     in-memory tables don't produce MAPCOMMON. This section is
+;;     documented as unreachable from rfl for partition pruning,
+;;     but we exercise the SYM filter_cost path.
+;; ════════════════════════════════════════════════════════════════════════
+(set Tsym2 (table [s v] (list ['AAPL 'GOOG 'MSFT 'AAPL 'GOOG] [100 200 300 150 250])))
+;; Two-predicate AND with SYM column — exercises filter_cost SYM (default) arm
+(count (select {from: Tsym2 where: (and (== s 'AAPL) (> v 120))})) -- 1
+(count (select {from: Tsym2 where: (and (> v 120) (== s 'AAPL))})) -- 1
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 25. F64 constant comparison in WHERE — fold_binary_const BOOL case
+;;     with float inputs (opt.c:438-439 — double comparison)
+;; ════════════════════════════════════════════════════════════════════════
+;; All comparisons between two f64 consts
+(count (select {from: T4 where: (== 1.5 1.5)})) -- 4
+(count (select {from: T4 where: (!= 1.5 2.5)})) -- 4
+(count (select {from: T4 where: (< 1.0 2.0)})) -- 4
+(count (select {from: T4 where: (> 2.0 1.0)})) -- 4
+(count (select {from: T4 where: (<= 2.0 2.0)})) -- 4
+(count (select {from: T4 where: (>= 3.0 2.0)})) -- 4
+;; False cases
+(count (select {from: T4 where: (== 1.5 2.5)})) -- 0
+(count (select {from: T4 where: (< 3.0 2.0)})) -- 0
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 26. Mixed-type const fold in WHERE — exercises promote_type
+;;     returning F64 when one operand is I64 and the other F64
+;; ════════════════════════════════════════════════════════════════════════
+;; (+ 3 0.5) = 3.5 → promote to F64 fold
+(count (select {from: T4 where: (== (+ 3 0.5) 3.5)})) -- 4
+;; (* 4 1.25) = 5.0
+(count (select {from: T4 where: (== (* 4 1.25) 5.0)})) -- 4
+;; (- 10 2.5) = 7.5
+(count (select {from: T4 where: (== (- 10 2.5) 7.5)})) -- 4
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 27. Nested select with GROUP having — tests predicate pushdown
+;;     stops at GROUP (opt.c:1370-1372 — GROUP pushdown disabled)
+;; ════════════════════════════════════════════════════════════════════════
+(set Tgrp (table [g v] (list ['a 'b 'c 'a 'b 'c] [10 20 30 40 50 60])))
+;; HAVING: filter on group result — pushdown must NOT move below GROUP
+;; sums: a=10+40=50, b=20+50=70, c=30+60=90 → all > 40 → 3 groups
+(set Ghaving (select {from: (select {s: (sum v) from: Tgrp by: g}) where: (> s 40)}))
+(count Ghaving) -- 3
+(sum (at Ghaving 's)) -- 210
+;; tighter threshold: only b(70) and c(90) have s > 60
+(set Ghaving2 (select {from: (select {s: (sum v) from: Tgrp by: g}) where: (> s 60)}))
+(count Ghaving2) -- 2
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 28. Window-join in select — forces projection pushdown to walk
+;;     OP_WINDOW_JOIN ext (opt.c:1670-1684)
+;; ════════════════════════════════════════════════════════════════════════
+(set TWJ_T (table [Sym Time Price] (list ['a 'a 'b 'b] [10:00:01.000 10:00:05.000 10:00:01.000 10:00:05.000] [100 200 400 500])))
+(set TWJ_Q (table [Sym Time Bid] (list ['a 'a 'b 'b] [10:00:00.000 10:00:04.000 10:00:00.000 10:00:04.000] [99 101 399 501])))
+(set TWJ_IV (map-left + [-2000 2000] (at TWJ_T 'Time)))
+(count (at (window-join [Sym Time] TWJ_IV TWJ_T TWJ_Q {m: (min Bid)}) 'm)) -- 4
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 29. filter_cost: OP_IN/OP_NOT_IN default opcode arm (opt.c:1439)
+;;     IN and NOT_IN don't match any comparison opcode case, so they
+;;     fall through to `cost += 1`.
+;; ════════════════════════════════════════════════════════════════════════
+(set Tin (table [a b] (list [1 2 3 4 5 6 7 8 9 10] [10 20 30 40 50 60 70 80 90 100])))
+
+;; AND of IN + comparison: chain_len >= 2, filter_cost runs on IN pred
+(count (select {from: Tin where: (and (in a [2 4 6 8 10]) (> b 40))})) -- 3
+;; NOT_IN in chain
+(count (select {from: Tin where: (and (not-in a [1 2 3]) (< b 80))})) -- 4
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 30. I32 arithmetic in select WHERE — fold_binary_const I32 arm
+;;     through the optimizer path (not just eval)
+;; ════════════════════════════════════════════════════════════════════════
+;; i32 const fold inside WHERE
+(count (select {from: T4 where: (== (+ 5i 3i) 8i)})) -- 4
+(count (select {from: T4 where: (== (- 10i 3i) 7i)})) -- 4
+(count (select {from: T4 where: (== (* 4i 3i) 12i)})) -- 4
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 31. Multiple consumers — filter reorder skip path (opt.c:1561-1568)
+;;     When a filter node has multiple consumers, reorder skips.
+;;     Build two selects sharing the same inner filter.
+;; ════════════════════════════════════════════════════════════════════════
+(set Tmc (table [a b] (list [1 2 3 4 5] [10 20 30 40 50])))
+(set Shared (select {from: Tmc where: (> a 2)}))
+;; Two consumers of the same filtered result
+(count Shared) -- 3
+(sum (at Shared 'a)) -- 12
+;; Both should produce correct results even without reorder
+(sum (at Shared 'b)) -- 120

@@ -471,6 +471,172 @@
 (count (distinct (at TX 'boolc))) -- 2
 
 ;; ====================================================================
+;; PASS 3 ADDITIONS — branch coverage for exec.c paths missed by
+;; exec_coverage.rfl pass 1-2, exec_advanced*.rfl, exec_worker_merge.rfl.
+;;
+;; Targets:
+;;   - Reductions: PROD, STDDEV, VAR (exec.c:1015-1033)
+;;   - OP_HEAD on vector input (exec.c:1509-1519)
+;;   - OP_TAIL on vector input (exec.c:1620-1632)
+;;   - HEAD/TAIL on empty table (exec.c:1443, 1530)
+;;   - pg_block_fn e==2 and e==1 arms (I16/BOOL columns at large scale)
+;;   - Reduction under lazy selection (sel_compact for PROD/STDDEV/VAR)
+;;   - OP_ROUND dispatch (exec.c:977)
+;;   - OP_CONST pass-through (exec.c:956-961)
+;;   - OP_ALIAS / OP_MATERIALIZE chaining (exec.c:1671-1677)
+;;   - HEAD(GROUP) with selection compact (exec.c:1378-1396)
+;;   - OP_PIVOT with selection compact (exec.c:1258-1265)
+;;   - OP_GROUP clear selection (exec.c:1229-1233)
+;;   - OP_IN empty set (set_len=0 fallback)
+;;   - Gather nullable path via sort with nullable column
+;;   - broadcast_scalar null atom propagation (exec.c:547-550)
+;;   - OP_IF SYM output branch
+;;   - OP_DATE_TRUNC dispatch (exec.c:1667-1669)
+;;   - Error guard: non-existent column scan (exec.c:917)
+;;   - OP_GROUP_TOPK_ROWFORM / OP_GROUP_BOTK_ROWFORM (exec.c:1239-1241)
+;; ====================================================================
+
+;; ====================================================================
+;; Reductions: STDDEV, VAR (exec.c:1015-1017)
+;; ====================================================================
+(stddev [10 20 30]) -- 10.0
+(var [10 20 30]) -- 100.0
+
+;; ====================================================================
+;; OP_HEAD / OP_TAIL on vector input (exec.c:1509-1519, 1620-1632)
+;; NOTE: These paths are reached only through the DAG executor when the
+;; child of OP_HEAD/TAIL evaluates to a vector (not table).  The eval-
+;; layer (take V N) builtin goes through collection.c, not exec.c.
+;; Covered via C tests in test_exec.c (test_exec_head_vector,
+;; test_exec_tail_vector).  RFL can only hit these via select {take:}
+;; which always produces TABLE output — the vector-input branch is a
+;; fallback guard in the DAG executor.
+;; ====================================================================
+
+;; ====================================================================
+;; HEAD/TAIL on empty table — exec.c:1443, 1530
+;; ====================================================================
+(set TE (table [x] (list (til 0))))
+(count (select {from: TE take: 5}))  -- 0
+(count (select {from: TE take: -5})) -- 0
+
+;; ====================================================================
+;; Partitioned_gather e==2 (I16) and e==1 (BOOL) at PG_MIN scale
+;; (pg_block_fn exec.c:370-377)
+;; ====================================================================
+(set N5 150000)
+(set TBig2 (table [k i16c boolc] (list (- (- N5 1) (til N5)) (as 'I16 (% (til N5) 1000)) (take [true false] N5))))
+(at (at (select {from: TBig2 asc: k}) 'k) 0) -- 0
+(at (as 'I64 (at (select {from: TBig2 asc: k}) 'i16c)) 0) -- 999
+(sum (as 'I64 (at (select {from: TBig2 asc: k}) 'boolc))) -- 75000
+
+;; ====================================================================
+;; Reduction under lazy selection — sel_compact + reduce for STDDEV/VAR
+;; (exec.c:1021-1030)
+;; ====================================================================
+(set T10 (table [x] (list [1 2 3 4 5 6 7 8 9 10])))
+(stddev (at (select {from: T10 where: (> x 7)}) 'x)) -- 1.0
+(var (at (select {from: T10 where: (> x 7)}) 'x)) -- 1.0
+
+;; ====================================================================
+;; OP_ROUND dispatch (exec.c:977)
+;; ====================================================================
+(sum (at (select {r: (round (as 'F64 x)) from: T10}) 'r)) -- 55.0
+
+;; ====================================================================
+;; OP_CONST in projection (exec.c:956-961)
+;; ====================================================================
+(sum (at (select {c: 99 from: T10}) 'c)) -- 990
+
+;; ====================================================================
+;; OP_ALIAS / OP_MATERIALIZE chaining (exec.c:1671-1677)
+;; ====================================================================
+(count (select {from: (select {from: (select {from: T10 where: (> x 3)}) where: (< x 8)}) take: 2})) -- 2
+
+;; ====================================================================
+;; Chained filters → rowsel refine + sel_compact for SORT (exec.c:1165)
+;; ====================================================================
+(first (at (select {from: (select {from: T10 where: (> x 2)}) asc: x}) 'x)) -- 3
+(first (at (select {from: (select {from: T10 where: (> x 2)}) desc: x}) 'x)) -- 10
+
+;; ====================================================================
+;; HEAD(GROUP) with needs_compact (exec.c:1378-1396)
+;; ====================================================================
+(set TGF (table [g v] (list ['a 'b 'c 'a 'b 'c 'a 'b 'c 'd] [1 2 3 4 5 6 7 8 9 10])))
+(count (select {s: (sum v) from: (select {from: TGF where: (> v 2)}) by: g take: 2})) -- 2
+
+;; ====================================================================
+;; OP_PIVOT with selection (exec.c:1258-1265)
+;; ====================================================================
+(set TP2 (table [r c v] (list ['A 'A 'B 'B 'A 'A] ['x 'y 'x 'y 'y 'x] [1 2 3 4 5 6])))
+(count (pivot (select {from: TP2 where: (> v 2)}) 'r 'c 'v sum)) -- 2
+
+;; ====================================================================
+;; OP_GROUP clear selection after (exec.c:1229-1233)
+;; ====================================================================
+(sum (at (select {s: (sum v) from: (select {from: TGF where: (!= g 'd)}) by: g}) 's)) -- 45
+
+;; ====================================================================
+;; OP_IN empty set — exec.c:806 set_len>0 guard skipped
+;; ====================================================================
+(count (select {from: T10 where: (in x [])})) -- 0
+(count (select {from: T10 where: (not-in x [])})) -- 10
+
+;; ====================================================================
+;; Gather nullable path — sort with nullable column (exec.c:220-231)
+;; ====================================================================
+(set TNS (table [k v] (list [3 1 2 5 4] [10 0Nl 30 0Nl 50])))
+(first (at (select {from: TNS asc: k}) 'k)) -- 1
+;; After sort by k asc: row 0=(k=1,v=null), row 1=(k=2,v=30),
+;; row 2=(k=3,v=10), row 3=(k=4,v=50), row 4=(k=5,v=null).
+(at (at (select {from: TNS asc: k}) 'v) 1) -- 30
+(at (at (select {from: TNS asc: k}) 'v) 2) -- 10
+
+;; ====================================================================
+;; broadcast_scalar null atom (exec.c:547-550) — single-element group
+;; stddev returns null, broadcast propagates null bit
+;; ====================================================================
+(set TSG2 (table [g v] (list ['a 'b 'a 'b 'c] [1.0 2.0 3.0 4.0 5.0])))
+(count (select {s: (stddev v) from: TSG2 by: g})) -- 3
+
+;; ====================================================================
+;; OP_IF SYM output (exec.c:1636)
+;; ====================================================================
+(set TIF (table [b v] (list [true false true false true] [1 2 3 4 5])))
+(first (at (select {s: (if b 'yes 'no) from: TIF}) 's)) -- 'yes
+(last  (at (select {s: (if b 'yes 'no) from: TIF}) 's)) -- 'yes
+
+;; ====================================================================
+;; OP_DATE_TRUNC dispatch (exec.c:1667-1669) — covered by temporal/
+;; branch_coverage.rfl via dotted truncates (e.g. d.month).  The DAG
+;; exec_date_trunc path is exercised there; not duplicated here.
+;; ====================================================================
+
+;; ====================================================================
+;; Error guard: non-existent column scan (exec.c:917)
+;; ====================================================================
+(select {from: T10 where: (> nonexistent 5)}) !- schema
+
+;; ====================================================================
+;; OP_GROUP_TOPK_ROWFORM / OP_GROUP_BOTK_ROWFORM (exec.c:1239-1241)
+;; ====================================================================
+(set TTK (table [g v] (list ['a 'a 'a 'b 'b 'b] [10 20 30 40 50 60])))
+;; (top v 2) per group: each cell is a list of up to 2 elements.
+;; group 'a: top 2 of [10 20 30] = [30 20]; group 'b: top 2 of [40 50 60] = [60 50].
+;; Total sum = 30+20+60+50 = 160.
+(fold + 0 (map sum (at (select {t: (top v 2) by: g from: TTK}) 't))) -- 160
+;; (bot v 2) per group: smallest 2 per group.
+;; group 'a: [10 20]; group 'b: [40 50]. Sum = 10+20+40+50 = 120.
+(fold + 0 (map sum (at (select {t: (bot v 2) by: g from: TTK}) 't))) -- 120
+
+;; ====================================================================
+;; OP_WINDOW — exercised via C test (test_exec.c) since window-join
+;; with selection compact requires low-level graph construction.
+;; The OP_WINDOW dispatch (exec.c:1326-1342) is covered by the
+;; existing window-join RFL tests in exec_coverage.rfl lines 123-126.
+;; ====================================================================
+
+;; ====================================================================
 ;; Cleanup
 ;; ====================================================================
 (.sys.exec "rm -rf /tmp/rfl_exec_coverage")

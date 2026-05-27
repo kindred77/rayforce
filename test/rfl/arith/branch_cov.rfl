@@ -1,0 +1,785 @@
+;; Branch coverage for src/ops/arith.c — targeting uncovered branches.
+;;
+;; Organised by function, then by source line / branch.
+;; Each assertion documents the branch it targets.
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_add_fn — temporal + integer arithmetic
+;; ══════════════════════════════════════════════════════════════════════
+
+;; ── L37-38: is_temporal(a) && is_numeric(b) — null propagation ──
+
+;; null DATE + int → null DATE (a is null)
+(nil? (+ 0Nd 5))         -- true
+(type (+ 0Nd 5))         -- 'date
+
+;; DATE + null int → null DATE (b is null)
+(nil? (+ (as 'DATE 7305) 0Ni)) -- true
+(type (+ (as 'DATE 7305) 0Ni)) -- 'date
+
+;; null TIME + int → null TIME (a is null)
+(nil? (+ 0Nt 5))         -- true
+(type (+ 0Nt 5))         -- 'time
+
+;; TIME + null int → null TIME (b is null)
+(nil? (+ (as 'TIME 1000) 0Ni)) -- true
+(type (+ (as 'TIME 1000) 0Ni)) -- 'time
+
+;; null TIMESTAMP + int → null TIMESTAMP (a is null)
+(nil? (+ 0Np 5))         -- true
+(type (+ 0Np 5))         -- 'timestamp
+
+;; TIMESTAMP + null int → null TIMESTAMP (b is null)
+(nil? (+ (as 'TIMESTAMP 1000) 0Ni)) -- true
+(type (+ (as 'TIMESTAMP 1000) 0Ni)) -- 'timestamp
+
+;; ── L41-43: non-null temporal + int dispatch (all three types) ──
+
+;; DATE + int → DATE (non-null)
+(+ (as 'DATE 7305) 5) -- 2020.01.06
+
+;; TIME + int → TIME (non-null)
+(type (+ (as 'TIME 1000) 500)) -- 'time
+
+;; TIMESTAMP + int → TIMESTAMP (non-null)
+(type (+ (as 'TIMESTAMP 1000) 500)) -- 'timestamp
+
+;; ── L45-53: numeric(a) + temporal(b) — non-F64 path ──
+
+;; int + null DATE → null DATE
+(nil? (+ 5 0Nd))         -- true
+(type (+ 5 0Nd))         -- 'date
+
+;; null int + DATE → null DATE
+(nil? (+ 0Ni (as 'DATE 7305))) -- true
+(type (+ 0Ni (as 'DATE 7305))) -- 'date
+
+;; int + DATE (non-null) → DATE
+(+ 5 (as 'DATE 7305)) -- 2020.01.06
+
+;; int + TIME (non-null) → TIME
+(type (+ 500 (as 'TIME 1000))) -- 'time
+
+;; int + TIMESTAMP (non-null) → TIMESTAMP
+(type (+ 500 (as 'TIMESTAMP 1000))) -- 'timestamp
+
+;; ── L55-56: float + temporal → type error (both directions) ──
+
+(+ 1.5 (as 'DATE 7305))     !- type
+(+ 1.5 (as 'TIME 1000))     !- type
+(+ 1.5 (as 'TIMESTAMP 100)) !- type
+(+ (as 'DATE 7305) 1.5)     !- type
+(+ (as 'TIME 1000) 1.5)     !- type
+(+ (as 'TIMESTAMP 100) 1.5) !- type
+
+;; ── L58-59: null numeric + temporal (non-F64 null, like null i32) ──
+;; These hit the "reject null_numeric + temporal" guard.
+;; 0Ni is a null I32 — it's numeric and null but not temporal-compatible
+;; after the first temporal+numeric block passed through.
+;; Actually these are caught by L37/L46 first. The L58-59 guard catches
+;; the case where the null numeric has a float-null type.
+
+;; ── L60-61: temporal + null numeric ──
+;; These should be caught when temporal(a) + numeric null(b) goes through
+;; L37 first. The L60 guard catches is_temporal(a) && is_numeric(b) && IS_NULL(b)
+;; which fires for float-null on right.
+
+;; ── L63-65: DATE + TIME → TIMESTAMP (null propagation) ──
+
+;; null DATE + TIME → null TIMESTAMP
+(nil? (+ 0Nd (as 'TIME 0)))    -- true
+(type (+ 0Nd (as 'TIME 0)))    -- 'timestamp
+
+;; DATE + null TIME → null TIMESTAMP
+(nil? (+ (as 'DATE 7305) 0Nt)) -- true
+(type (+ (as 'DATE 7305) 0Nt)) -- 'timestamp
+
+;; ── L67-69: TIME + DATE → TIMESTAMP (null propagation) ──
+
+;; null TIME + DATE → null TIMESTAMP
+(nil? (+ 0Nt (as 'DATE 7305))) -- true
+(type (+ 0Nt (as 'DATE 7305))) -- 'timestamp
+
+;; TIME + null DATE → null TIMESTAMP
+(nil? (+ (as 'TIME 0) 0Nd))    -- true
+(type (+ (as 'TIME 0) 0Nd))    -- 'timestamp
+
+;; ── L72-74: TIME + TIME → TIME (null propagation) ──
+
+;; null TIME + TIME → null TIME
+(nil? (+ 0Nt (as 'TIME 1000)))    -- true
+(type (+ 0Nt (as 'TIME 1000)))    -- 'time
+
+;; TIME + null TIME → null TIME
+(nil? (+ (as 'TIME 1000) 0Nt))    -- true
+(type (+ (as 'TIME 1000) 0Nt))    -- 'time
+
+;; ── L77-79: TIME + TIMESTAMP → TIMESTAMP (null propagation) ──
+
+;; null TIME + TIMESTAMP → null TIMESTAMP
+(nil? (+ 0Nt (as 'TIMESTAMP 2000))) -- true
+(type (+ 0Nt (as 'TIMESTAMP 2000))) -- 'timestamp
+
+;; TIME + null TIMESTAMP → null TIMESTAMP
+(nil? (+ (as 'TIME 1000) 0Np))      -- true
+(type (+ (as 'TIME 1000) 0Np))      -- 'timestamp
+
+;; ── L81-83: TIMESTAMP + TIME → TIMESTAMP (null propagation) ──
+
+;; null TIMESTAMP + TIME → null TIMESTAMP
+(nil? (+ 0Np (as 'TIME 1000)))      -- true
+(type (+ 0Np (as 'TIME 1000)))      -- 'timestamp
+
+;; TIMESTAMP + null TIME → null TIMESTAMP
+(nil? (+ (as 'TIMESTAMP 2000) 0Nt)) -- true
+(type (+ (as 'TIMESTAMP 2000) 0Nt)) -- 'timestamp
+
+;; ── L90: null propagation for numeric+numeric (typed null varieties) ──
+
+;; null I16 + I16 → null I16
+(nil? (+ 0Nh 5h)) -- true
+(type (+ 0Nh 5h)) -- 'i16
+
+;; null I32 + I32 → null I32
+(nil? (+ 0Ni 5i)) -- true
+(type (+ 0Ni 5i)) -- 'i32
+
+;; null I16 + I64 → null I64
+(nil? (+ 0Nh 5)) -- true
+(type (+ 0Nh 5)) -- 'i64
+
+;; null I32 + I64 → null I64
+(nil? (+ 0Ni 5)) -- true
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_sub_fn — temporal subtraction branches
+;; ══════════════════════════════════════════════════════════════════════
+
+;; ── L101-103: temporal(a) - numeric(b) null → null typed on a ──
+
+;; null TIMESTAMP - int → null TIMESTAMP
+(nil? (- 0Np 5))                    -- true
+(type (- 0Np 5))                    -- 'timestamp
+
+;; null TIME - int → null TIME
+(nil? (- 0Nt 5))                    -- true
+(type (- 0Nt 5))                    -- 'time
+
+;; null DATE - int → null DATE
+(nil? (- 0Nd 5))                    -- true
+(type (- 0Nd 5))                    -- 'date
+
+;; TIMESTAMP - null int → null TIMESTAMP
+(nil? (- (as 'TIMESTAMP 5000) 0Ni)) -- true
+(type (- (as 'TIMESTAMP 5000) 0Ni)) -- 'timestamp
+
+;; ── L105-107: numeric(a) - temporal(b) null → null typed on b ──
+
+;; int - null DATE → null DATE
+(nil? (- 5 0Nd))                    -- true
+(type (- 5 0Nd))                    -- 'date
+
+;; int - null TIMESTAMP → null TIMESTAMP
+(nil? (- 5 0Np))                    -- true
+(type (- 5 0Np))                    -- 'timestamp
+
+;; null int - TIME → null TIME
+(nil? (- 0Ni (as 'TIME 500)))       -- true
+(type (- 0Ni (as 'TIME 500)))       -- 'time
+
+;; ── L114-116: DATE - DATE null → null I32 ──
+
+(nil? (- 0Nd (as 'DATE 7305)))      -- true
+(type (- 0Nd (as 'DATE 7305)))      -- 'i32
+
+(nil? (- (as 'DATE 7305) 0Nd))      -- true
+(type (- (as 'DATE 7305) 0Nd))      -- 'i32
+
+;; ── L119-121: DATE - TIME null → null TIMESTAMP ──
+
+(nil? (- 0Nd (as 'TIME 0)))         -- true
+(type (- 0Nd (as 'TIME 0)))         -- 'timestamp
+
+(nil? (- (as 'DATE 7305) 0Nt))      -- true
+(type (- (as 'DATE 7305) 0Nt))      -- 'timestamp
+
+;; ── L132-134: TIME - TIME null → null TIME ──
+
+(nil? (- 0Nt (as 'TIME 2000)))      -- true
+(type (- 0Nt (as 'TIME 2000)))      -- 'time
+
+(nil? (- (as 'TIME 5000) 0Nt))      -- true
+(type (- (as 'TIME 5000) 0Nt))      -- 'time
+
+;; ── L141-143: TIMESTAMP - TIME null → null TIMESTAMP ──
+
+(nil? (- 0Np (as 'TIME 0)))         -- true
+(type (- 0Np (as 'TIME 0)))         -- 'timestamp
+
+(nil? (- (as 'TIMESTAMP 5000) 0Nt)) -- true
+(type (- (as 'TIMESTAMP 5000) 0Nt)) -- 'timestamp
+
+;; ── L146-148: TIMESTAMP - TIMESTAMP null → null I64 ──
+
+(nil? (- 0Np (as 'TIMESTAMP 2000))) -- true
+(type (- 0Np (as 'TIMESTAMP 2000))) -- 'i64
+
+(nil? (- (as 'TIMESTAMP 5000) 0Np)) -- true
+(type (- (as 'TIMESTAMP 5000) 0Np)) -- 'i64
+
+;; ── L158: numeric null sub propagation (I16 null) ──
+
+(nil? (- 0Nh 5h)) -- true
+(type (- 0Nh 5h)) -- 'i16
+
+;; ── L159-162: float sub path and -0 normalization ──
+
+(- 1.0 1.0) -- 0.0
+(- 0.5 0.5) -- 0.0
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_mul_fn — temporal multiply branches
+;; ══════════════════════════════════════════════════════════════════════
+
+;; ── L185-187: non-numeric type error for mul ──
+
+(* (as 'DATE 7305) 2) !- type
+(* 2 (as 'DATE 7305)) !- type
+(* (as 'TIMESTAMP 1000) 2) !- type
+
+;; ── L189: null numeric * numeric → null (I16 path) ──
+
+(nil? (* 0Nh 5h)) -- true
+(type (* 0Nh 5h)) -- 'i16
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_div_fn — division branches
+;; ══════════════════════════════════════════════════════════════════════
+
+;; ── L198-200: non-numeric type error ──
+
+(/ "abc" 2)          !- type
+(/ (as 'DATE 7305) 2) !- type
+(/ (as 'TIME 1000) 2) !- type
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_idiv_fn — integer division branches
+;; ══════════════════════════════════════════════════════════════════════
+
+;; ── L210-211: non-numeric type error ──
+
+(div "abc" 2)            !- type
+(div (as 'DATE 7305) 2)  !- type
+
+;; ── L213-214: null propagation ──
+
+(nil? (div 0Ni 5))   -- true
+(nil? (div 5 0Ni))   -- true
+(nil? (div 0Nf 5.0)) -- true
+(type (div 0Ni 5))   -- 'i64
+
+;; ── L216-217: div by zero ──
+
+(nil? (div 10 0))    -- true
+(nil? (div 10.0 0.0)) -- true
+(type (div 10 0))    -- 'i64
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_mod_fn — temporal and float modulo branches
+;; ══════════════════════════════════════════════════════════════════════
+
+;; ── L228-230: temporal % numeric null propagation ──
+
+;; null DATE % int → null DATE
+(nil? (% 0Nd 5))         -- true
+(type (% 0Nd 5))         -- 'date
+
+;; null TIME % int → null TIME
+(nil? (% 0Nt 5))         -- true
+(type (% 0Nt 5))         -- 'time
+
+;; null TIMESTAMP % int → null TIMESTAMP
+(nil? (% 0Np 5))         -- true
+(type (% 0Np 5))         -- 'timestamp
+
+;; DATE % null int → null DATE
+(nil? (% (as 'DATE 7305) 0Ni)) -- true
+(type (% (as 'DATE 7305) 0Ni)) -- 'date
+
+;; TIME % null int → null TIME
+(nil? (% (as 'TIME 100000) 0Ni)) -- true
+(type (% (as 'TIME 100000) 0Ni)) -- 'time
+
+;; TIMESTAMP % null int → null TIMESTAMP
+(nil? (% (as 'TIMESTAMP 1000000) 0Ni)) -- true
+(type (% (as 'TIMESTAMP 1000000) 0Ni)) -- 'timestamp
+
+;; ── L232-236: temporal % float — zero divisor → typed null ──
+
+(nil? (% (as 'TIME 100000) 0.0)) -- true
+(type (% (as 'TIME 100000) 0.0)) -- 'time
+
+;; ── L240-241: temporal % int — zero divisor ──
+
+;; (already covered in mod.rfl for TIME and DATE)
+;; Ensure TIMESTAMP path:
+(nil? (% (as 'TIMESTAMP 1000000) 0)) -- true
+(type (% (as 'TIMESTAMP 1000000) 0)) -- 'timestamp
+
+;; ── L245: temporal mod — floor-division correction for negative ──
+;; (av ^ bv) < 0 triggers the q-- adjustment
+
+;; floor-mod: sign follows divisor (negative), so result is negative TIME
+(% (as 'TIME 100000) -3) -- -00:00:00.002
+(% (as 'DATE 7305) -3)   -- 2000.01.01
+
+;; ── L247-249: temporal mod result types ──
+
+;; TIME % positive → TIME
+(type (% (as 'TIME 100000) 3)) -- 'time
+
+;; DATE % positive → DATE
+(type (% (as 'DATE 7305) 3)) -- 'date
+
+;; TIMESTAMP % positive → TIMESTAMP (line 249)
+(type (% (as 'TIMESTAMP 1000000) 3)) -- 'timestamp
+
+;; ── L251-253: non-numeric mod error ──
+
+(% "abc" 2) !- type
+(% 2 "abc") !- type
+
+;; ── L261-263: u8 left, non-u8 right — fallthrough ──
+;; (already covered in mod.rfl)
+
+;; ── L266-268: null propagation — rhs typed null ──
+
+;; null + F64 rhs → null F64
+(nil? (% 0Nf 5.0))   -- true
+(type (% 0Nf 5.0))   -- 'f64
+
+;; null + I32 rhs → null I32
+(nil? (% 0Ni (as 'I32 5))) -- true
+
+;; null I64 lhs + non-null I32 rhs → rt follows logic
+(nil? (% 0Nl 5i))    -- true
+
+;; F64 null lhs, I32 rhs → F64 (L267: a->type == -RAY_F64)
+(nil? (% 0Nf 5i))    -- true
+(type (% 0Nf 5i))    -- 'f64
+
+;; ── L272-284: float modulo branches ──
+
+;; f64 % f64 basic
+(% 10.0 3.0) -- 1.0
+
+;; f64 % f64 — zero divisor → typed null
+(nil? (% 10.0 0.0))  -- true
+(type (% 10.0 0.0))  -- 'f64
+
+;; f64 % I32 rhs → still F64 result (L281 checks a->type == F64 first)
+(% 10.0 (as 'I32 3))  -- 1.0
+(type (% 10.0 (as 'I32 3))) -- 'f64
+
+;; f64 % I16 rhs → still F64
+(% 10.0 (as 'I16 3))  -- 1.0
+(type (% 10.0 (as 'I16 3))) -- 'f64
+
+;; f64 % I64 rhs → F64
+(% 10.0 3)  -- 1.0
+
+;; NOTE: lines 282-284 (make_i32/make_i16/make_i64 in float-mod block)
+;; are structurally unreachable: is_float_op(a,b) requires at least one
+;; operand to be F64, and L281 returns make_f64 when either is F64.
+;; The guards on L282-284 are dead branches.
+
+;; Float mod snap: result near zero snaps to 0
+(% 3.0 3.0) -- 0.0
+
+;; Float mod snap: result near |bv| snaps to 0
+(% 6.0 3.0) -- 0.0
+
+;; Float mod with zero divisor, non-f64 types (L274-276)
+(nil? (% 10.0 (as 'I32 0))) -- true
+(type (% 10.0 (as 'I32 0))) -- 'f64
+
+;; ── L288-299: integer modulo branches ──
+
+;; Integer mod: zero divisor with I64 rhs → null I64
+(nil? (% 10 0))  -- true
+(type (% 10 0))  -- 'i64
+
+;; Integer mod: floor-division correction for negative (line 293)
+(% -10 3) -- 2
+(% 10 -3) -- -2
+
+;; Integer mod: result type I32 (line 296)
+(% 100 (as 'I32 7)) -- 2
+
+;; Integer mod: result type I16 (line 297)
+(% 100 (as 'I16 7)) -- 2
+
+;; Integer mod: U8 result (line 298)
+(% 100 (as 'U8 7)) -- 0x02
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_neg_fn — negation branches
+;; ══════════════════════════════════════════════════════════════════════
+
+;; ── L303: null propagation (different null types) ──
+
+;; null F64 → stays null
+(nil? (neg 0Nf))  -- true
+(type (neg 0Nf))  -- 'f64
+
+;; null I64 → stays null
+(nil? (neg 0Nl))  -- true
+(type (neg 0Nl))  -- 'i64
+
+;; ── L322: type error for non-numeric ──
+
+(neg (as 'DATE 7305)) !- type
+(neg (as 'TIME 1000)) !- type
+(neg (as 'TIMESTAMP 1000)) !- type
+(neg (as 'U8 5))       !- type
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_round_fn — rounding branches
+;; ══════════════════════════════════════════════════════════════════════
+
+;; ── L327: null propagation (different null types) ──
+
+(nil? (round 0Nf))  -- true
+(type (round 0Nf))  -- 'f64
+
+(nil? (round 0Nl))  -- true
+(type (round 0Nl))  -- 'f64
+
+(nil? (round 0Nh))  -- true
+(type (round 0Nh))  -- 'f64
+
+(nil? (round 0Ni))  -- true
+(type (round 0Ni))  -- 'f64
+
+;; ── L329: is_numeric(x) for int (not f64) input ──
+
+(round 5h) -- 5.0
+(round 5i) -- 5.0
+
+;; ── L330: type error ──
+
+(round (as 'DATE 7305)) !- type
+(round (as 'TIME 1000)) !- type
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_floor_fn — floor branches
+;; ══════════════════════════════════════════════════════════════════════
+
+;; ── L335: null propagation ──
+
+(nil? (floor 0Nf))  -- true
+(type (floor 0Nf))  -- 'f64
+
+(nil? (floor 0Nl))  -- true
+(type (floor 0Nl))  -- 'i64
+
+(nil? (floor 0Nh))  -- true
+(type (floor 0Nh))  -- 'i16
+
+(nil? (floor 0Ni))  -- true
+(type (floor 0Ni))  -- 'i32
+
+;; ── L337: is_numeric, not f64 → identity (retain) ──
+
+(floor 7h)  -- 7h
+(floor 7i)  -- 7i
+(floor 7)   -- 7
+
+;; ── L338: type error for non-numeric ──
+
+(floor (as 'DATE 7305)) !- type
+(floor (as 'TIME 1000)) !- type
+(floor "abc") !- type
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_ceil_fn — ceil branches
+;; ══════════════════════════════════════════════════════════════════════
+
+;; ── L343: null propagation ──
+
+(nil? (ceil 0Nf))  -- true
+(type (ceil 0Nf))  -- 'f64
+
+(nil? (ceil 0Nl))  -- true
+(type (ceil 0Nl))  -- 'i64
+
+(nil? (ceil 0Nh))  -- true
+(type (ceil 0Nh))  -- 'i16
+
+(nil? (ceil 0Ni))  -- true
+(type (ceil 0Ni))  -- 'i32
+
+;; ── L345: is_numeric, not f64 → identity (retain) ──
+
+(ceil 7h)  -- 7h
+(ceil 7i)  -- 7i
+(ceil 7)   -- 7
+
+;; ── L346: type error for non-numeric ──
+
+(ceil (as 'DATE 7305)) !- type
+(ceil (as 'TIME 1000)) !- type
+(ceil "abc") !- type
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_abs_fn — absolute value branches
+;; ══════════════════════════════════════════════════════════════════════
+
+;; ── L354: null propagation (different types) ──
+
+(nil? (abs 0Nf))  -- true
+(type (abs 0Nf))  -- 'f64
+
+(nil? (abs 0Nl))  -- true
+(type (abs 0Nl))  -- 'i64
+
+(nil? (abs 0Nh))  -- true
+(type (abs 0Nh))  -- 'i16
+
+(nil? (abs 0Ni))  -- true
+(type (abs 0Ni))  -- 'i32
+
+;; ── L358: i64 positive value (x >= 0, no negate needed) ──
+
+(abs 5)  -- 5
+(abs 0)  -- 0
+
+;; ── L362: i32 positive ──
+
+(abs 5i)  -- 5i
+(abs 0i)  -- 0i
+
+;; ── L366: i16 positive ──
+
+(abs 5h)  -- 5h
+(abs 0h)  -- 0h
+
+;; ── L368: type error for non-numeric ──
+
+(abs (as 'DATE 7305)) !- type
+(abs (as 'TIME 1000)) !- type
+(abs (as 'TIMESTAMP 1000)) !- type
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_sqrt_fn — square root branches
+;; ══════════════════════════════════════════════════════════════════════
+
+;; ── L373: null propagation ──
+
+(nil? (sqrt 0Nf))  -- true
+(type (sqrt 0Nf))  -- 'f64
+
+(nil? (sqrt 0Nl))  -- true
+(type (sqrt 0Nl))  -- 'f64
+
+(nil? (sqrt 0Nh))  -- true
+(type (sqrt 0Nh))  -- 'f64
+
+(nil? (sqrt 0Ni))  -- true
+(type (sqrt 0Ni))  -- 'f64
+
+;; ── L375: is_numeric(x) integer input ──
+
+(sqrt 4)  -- 2.0
+(sqrt 9h) -- 3.0
+(sqrt 4i) -- 2.0
+(type (sqrt 4))  -- 'f64
+(type (sqrt 9h)) -- 'f64
+
+;; ── L376: type error ──
+
+(sqrt (as 'DATE 7305)) !- type
+(sqrt (as 'TIME 1000)) !- type
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_log_fn — natural log branches
+;; ══════════════════════════════════════════════════════════════════════
+
+;; ── L381: null propagation ──
+
+(nil? (log 0Nf))  -- true
+(type (log 0Nf))  -- 'f64
+
+(nil? (log 0Nl))  -- true
+(type (log 0Nl))  -- 'f64
+
+(nil? (log 0Nh))  -- true
+(type (log 0Nh))  -- 'f64
+
+(nil? (log 0Ni))  -- true
+(type (log 0Ni))  -- 'f64
+
+;; ── L383: is_numeric(x) integer input ──
+
+(type (log 5))  -- 'f64
+(type (log 5h)) -- 'f64
+(type (log 5i)) -- 'f64
+
+;; ── L384: type error ──
+
+(log (as 'DATE 7305)) !- type
+(log (as 'TIME 1000)) !- type
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_exp_fn — exponential branches
+;; ══════════════════════════════════════════════════════════════════════
+
+;; ── L389: null propagation ──
+
+(nil? (exp 0Nf))  -- true
+(type (exp 0Nf))  -- 'f64
+
+(nil? (exp 0Nl))  -- true
+(type (exp 0Nl))  -- 'f64
+
+(nil? (exp 0Nh))  -- true
+(type (exp 0Nh))  -- 'f64
+
+(nil? (exp 0Ni))  -- true
+(type (exp 0Ni))  -- 'f64
+
+;; ── L391: is_numeric(x) integer input ──
+
+(type (exp 1))  -- 'f64
+(type (exp 1h)) -- 'f64
+(type (exp 1i)) -- 'f64
+
+;; ── L392: type error ──
+
+(exp (as 'DATE 7305)) !- type
+(exp (as 'TIME 1000)) !- type
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_pow_fn — power branches
+;; ══════════════════════════════════════════════════════════════════════
+
+;; ── L405: both null → F64 null ──
+
+(nil? (pow 0Nl 0Nl))  -- true
+(type (pow 0Nl 0Nl))  -- 'f64
+
+(nil? (pow 0Nf 0Nf))  -- true
+(type (pow 0Nf 0Nf))  -- 'f64
+
+;; ── L407-408: non-numeric → type error ──
+
+(pow (as 'DATE 7305) 2) !- type
+(pow 2 (as 'DATE 7305)) !- type
+(pow (as 'TIME 1000) 2) !- type
+
+;; ══════════════════════════════════════════════════════════════════════
+;; Cross-cutting: numeric null propagation through null_for_promoted
+;; (internal.h L139-148) — make sure each width-pair's null branch fires
+;; ══════════════════════════════════════════════════════════════════════
+
+;; I16 + null I16 → null I16 (L146-147)
+(nil? (+ 5h 0Nh)) -- true
+(type (+ 5h 0Nh)) -- 'i16
+
+;; I32 + null I32 → null I32 (L144-145)
+(nil? (+ 5i 0Ni)) -- true
+(type (+ 5i 0Ni)) -- 'i32
+
+;; I64 + null I64 → null I64 (L142-143)
+(nil? (+ 5 0Nl)) -- true
+(type (+ 5 0Nl)) -- 'i64
+
+;; F64 + null F64 → null F64 (L140-141)
+(nil? (+ 5.0 0Nf)) -- true
+(type (+ 5.0 0Nf)) -- 'f64
+
+;; Cross-width null: I16 + null I32 → null I32
+(nil? (+ 5h 0Ni)) -- true
+(type (+ 5h 0Ni)) -- 'i32
+
+;; Cross-width null: I16 + null I64 → null I64
+(nil? (+ 5h 0Nl)) -- true
+(type (+ 5h 0Nl)) -- 'i64
+
+;; Cross-width null: I32 + null I64 → null I64
+(nil? (+ 5i 0Nl)) -- true
+(type (+ 5i 0Nl)) -- 'i64
+
+;; ══════════════════════════════════════════════════════════════════════
+;; Additional sub branches — promote_int_type_right paths
+;; ══════════════════════════════════════════════════════════════════════
+
+;; sub result type follows RIGHT operand's width (promote_int_type_right)
+(type (- 10 5i)) -- 'i32
+(type (- 10 5h)) -- 'i16
+(type (- 10 (as 'U8 3))) -- 'u8
+
+;; When right is not a recognized int type, fall through to left
+;; (but all numeric types are recognized, so just test coverage of each)
+(type (- 10h 5)) -- 'i64
+(type (- 10i 5)) -- 'i64
+
+;; ══════════════════════════════════════════════════════════════════════
+;; Additional add branches — promote_int_type paths
+;; ══════════════════════════════════════════════════════════════════════
+
+;; U8 + U8 → U8 (L162)
+(+ (as 'U8 3) (as 'U8 4)) -- 0x07
+(type (+ (as 'U8 3) (as 'U8 4))) -- 'u8
+
+;; U8 + I16 → I16 (L163)
+(+ (as 'U8 3) 4h) -- 7
+(type (+ (as 'U8 3) 4h)) -- 'i16
+
+;; I16 + U8 → I16 (L163 symmetric)
+(+ 3h (as 'U8 4)) -- 7
+(type (+ 3h (as 'U8 4))) -- 'i16
+
+;; U8 + I64 → I64 (L163 default branch: neither is I16)
+(+ (as 'U8 3) 4) -- 7
+(type (+ (as 'U8 3) 4)) -- 'i64
+
+;; ══════════════════════════════════════════════════════════════════════
+;; Temporal % float non-zero-divisor (L232-236 non-zero path)
+;; ══════════════════════════════════════════════════════════════════════
+
+;; temporal % float where float truncates to non-zero int
+(type (% (as 'TIME 100000) 3.0)) -- 'time
+(type (% (as 'DATE 7305) 5.0)) -- 'date
+(type (% (as 'TIMESTAMP 1000000) 7.0)) -- 'timestamp
+
+;; temporal % float where float truncates to zero (e.g. 0.5 → 0)
+(nil? (% (as 'TIME 100000) 0.5)) -- true
+(type (% (as 'TIME 100000) 0.5)) -- 'time
+
+;; ══════════════════════════════════════════════════════════════════════
+;; Float mod snap branches (L280)
+;; ══════════════════════════════════════════════════════════════════════
+
+;; Negative divisor snap: result near |bv| → bv > 0 ? 0.0 : -0.0
+(% 6.0 -3.0) -- 0.0
+(% -6.0 3.0) -- 0.0
+(% -6.0 -3.0) -- 0.0
+
+;; ══════════════════════════════════════════════════════════════════════
+;; STRUCTURAL NOTES — unreachable branches in arith.c
+;; ══════════════════════════════════════════════════════════════════════
+;;
+;; L58-59 (add): `is_numeric(a) && RAY_ATOM_IS_NULL(a) && is_temporal(b)`
+;;   Unreachable: non-F64 null numerics are caught by L45-47 (which
+;;   matches `is_numeric(a) && a->type != -RAY_F64 && is_temporal(b)`
+;;   then L46 null-check). F64 nulls are caught by L55 (`a->type == -RAY_F64
+;;   && is_temporal(b)` → error). No path reaches L58.
+;;
+;; L60-61 (add): `is_temporal(a) && is_numeric(b) && RAY_ATOM_IS_NULL(b)`
+;;   Unreachable: non-F64 null numerics caught by L36-38. F64 caught by L55.
+;;
+;; L282-284 (mod): float-mod I32/I16/I64 result branches
+;;   Unreachable: `is_float_op(a,b)` (L272) requires at least one F64 operand.
+;;   L281 checks `b->type == -RAY_F64 || a->type == -RAY_F64` — same condition.
+;;   So L281 always returns, and L282-284 are dead code.

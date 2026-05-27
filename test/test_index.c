@@ -1318,6 +1318,1466 @@ static test_result_t test_index_builtin_fns(void) {
     PASS();
 }
 
+/* ─── F32 hash with NaN (covers numeric_key_word F32 NaN branch) ────────── */
+
+static test_result_t test_index_hash_f32_nan(void) {
+    ray_heap_init();
+    float xs[] = { 1.0f, (float)NAN, 2.0f, (float)NAN };
+    ray_t* v = ray_vec_new(RAY_F32, 4);
+    for (int i = 0; i < 4; i++) v = ray_vec_append(v, &xs[i]);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_hash(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* ih = ray_index_payload(w->index);
+    /* All 4 rows are non-null; NaN rows get per-row bucket via numeric_key_word. */
+    TEST_ASSERT_EQ_I(ih->u.hash.n_keys, 4);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── F32 zone with NaN (covers zone_scan_float es=4 NaN skip) ────────── */
+
+static test_result_t test_index_zone_f32_nan(void) {
+    ray_heap_init();
+    float xs[] = { 1.0f, (float)NAN, 3.0f, (float)NAN };
+    ray_t* v = ray_vec_new(RAY_F32, 4);
+    for (int i = 0; i < 4; i++) v = ray_vec_append(v, &xs[i]);
+
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_zone(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* iz = ray_index_payload(w->index);
+    /* NaN rows are skipped: min=1.0, max=3.0 */
+    TEST_ASSERT_TRUE(iz->u.zone.min_f == 1.0);
+    TEST_ASSERT_TRUE(iz->u.zone.max_f == 3.0);
+    TEST_ASSERT_EQ_I(iz->u.zone.n_nulls, 0);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── F32 zone with nulls (covers zone_scan_float es=4 null path) ──────── */
+
+static test_result_t test_index_zone_f32_nulls(void) {
+    ray_heap_init();
+    float xs[] = { 10.0f, 20.0f, 30.0f, 40.0f };
+    ray_t* v = ray_vec_new(RAY_F32, 4);
+    for (int i = 0; i < 4; i++) v = ray_vec_append(v, &xs[i]);
+    TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 1, true), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 3, true), RAY_OK);
+
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_zone(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* iz = ray_index_payload(w->index);
+    TEST_ASSERT_TRUE(iz->u.zone.min_f == 10.0);
+    TEST_ASSERT_TRUE(iz->u.zone.max_f == 30.0);
+    TEST_ASSERT_EQ_I(iz->u.zone.n_nulls, 2);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── F32 zone all-null (covers zone_scan_float es=4 !any_value) ───────── */
+
+static test_result_t test_index_zone_f32_all_null(void) {
+    ray_heap_init();
+    float xs[] = { 1.0f, 2.0f };
+    ray_t* v = ray_vec_new(RAY_F32, 2);
+    for (int i = 0; i < 2; i++) v = ray_vec_append(v, &xs[i]);
+    TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 0, true), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 1, true), RAY_OK);
+
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_zone(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* iz = ray_index_payload(w->index);
+    TEST_ASSERT_TRUE(iz->u.zone.min_f == 0.0);
+    TEST_ASSERT_TRUE(iz->u.zone.max_f == 0.0);
+    TEST_ASSERT_EQ_I(iz->u.zone.n_nulls, 2);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── F64 hash with -0.0 (covers clear_neg_zero path in numeric_key_word) ─ */
+
+static test_result_t test_index_hash_f64_neg_zero(void) {
+    ray_heap_init();
+    double xs[] = { -0.0, 0.0, 1.0, -0.0 };
+    ray_t* v = make_f64_vec(xs, 4);
+
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_hash(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* ih = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I(ih->u.hash.n_keys, 4);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── F32 hash with -0.0 (covers clear_neg_zero on F32 path) ──────────── */
+
+static test_result_t test_index_hash_f32_neg_zero(void) {
+    ray_heap_init();
+    float xs[] = { -0.0f, 0.0f, 1.0f };
+    ray_t* v = ray_vec_new(RAY_F32, 3);
+    for (int i = 0; i < 3; i++) v = ray_vec_append(v, &xs[i]);
+
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_hash(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* ih = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I(ih->u.hash.n_keys, 3);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── TIME through all four index kinds ───────────────────────────────── */
+
+static test_result_t test_index_time_all_kinds(void) {
+    ray_heap_init();
+    int64_t ts[] = { 0, 3600, 86399, 1000, 7200 };
+    ray_t* v = ray_vec_new(RAY_TIME, 5);
+    for (int i = 0; i < 5; i++) {
+        int32_t t = (int32_t)ts[i];
+        v = ray_vec_append(v, &t);
+    }
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+
+    /* hash */
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_hash(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* ih = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I(ih->u.hash.n_keys, 5);
+    ray_index_drop(&w);
+
+    /* sort */
+    r = ray_index_attach_sort(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* is = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I(is->u.sort.perm->len, 5);
+    ray_index_drop(&w);
+
+    /* bloom */
+    r = ray_index_attach_bloom(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* ib = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I(ib->u.bloom.n_keys, 5);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── DATE through hash, sort, bloom ──────────────────────────────────── */
+
+static test_result_t test_index_date_all_kinds(void) {
+    ray_heap_init();
+    int32_t dates[] = { 0, 18000, -365, 36500 };
+    ray_t* v = ray_vec_new(RAY_DATE, 4);
+    for (int i = 0; i < 4; i++) v = ray_vec_append(v, &dates[i]);
+
+    /* hash */
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_hash(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* ih = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I(ih->u.hash.n_keys, 4);
+    ray_index_drop(&w);
+
+    /* sort */
+    r = ray_index_attach_sort(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* is = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I(is->u.sort.perm->len, 4);
+    ray_index_drop(&w);
+
+    /* bloom */
+    r = ray_index_attach_bloom(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* ib = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I(ib->u.bloom.n_keys, 4);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── TIMESTAMP through hash, sort, bloom ─────────────────────────────── */
+
+static test_result_t test_index_timestamp_all_kinds(void) {
+    ray_heap_init();
+    int64_t ts[] = { 1700000000000LL, 0LL, 1000000LL, 5LL };
+    ray_t* v = ray_vec_new(RAY_TIMESTAMP, 4);
+    for (int i = 0; i < 4; i++) v = ray_vec_append(v, &ts[i]);
+
+    /* hash */
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_hash(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* ih = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I(ih->u.hash.n_keys, 4);
+    ray_index_drop(&w);
+
+    /* sort */
+    r = ray_index_attach_sort(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* is = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I(is->u.sort.perm->len, 4);
+    ray_index_drop(&w);
+
+    /* bloom */
+    r = ray_index_attach_bloom(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* ib = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I(ib->u.bloom.n_keys, 4);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── I16 through sort and bloom ──────────────────────────────────────── */
+
+static test_result_t test_index_i16_sort_and_bloom(void) {
+    ray_heap_init();
+    int16_t xs[] = { 300, -100, 0, 200, -32768 };
+    ray_t* v = ray_vec_new(RAY_I16, 5);
+    for (int i = 0; i < 5; i++) v = ray_vec_append(v, &xs[i]);
+
+    /* sort */
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_sort(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* is = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I(is->u.sort.perm->len, 5);
+    ray_index_drop(&w);
+
+    /* bloom */
+    r = ray_index_attach_bloom(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* ib = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I(ib->u.bloom.n_keys, 5);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── U8 through sort and bloom ───────────────────────────────────────── */
+
+static test_result_t test_index_u8_sort_and_bloom(void) {
+    ray_heap_init();
+    uint8_t xs[] = { 50, 10, 200, 1, 255 };
+    ray_t* v = ray_vec_new(RAY_U8, 5);
+    for (int i = 0; i < 5; i++) v = ray_vec_append(v, &xs[i]);
+
+    /* sort */
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_sort(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* is = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I(is->u.sort.perm->len, 5);
+    ray_index_drop(&w);
+
+    /* bloom */
+    r = ray_index_attach_bloom(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* ib = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I(ib->u.bloom.n_keys, 5);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── BOOL through sort and bloom ─────────────────────────────────────── */
+
+static test_result_t test_index_bool_sort_and_bloom(void) {
+    ray_heap_init();
+    uint8_t xs[] = { 1, 0, 1, 0, 1 };
+    ray_t* v = ray_vec_new(RAY_BOOL, 5);
+    for (int i = 0; i < 5; i++) v = ray_vec_append(v, &xs[i]);
+
+    /* sort */
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_sort(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* is = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I(is->u.sort.perm->len, 5);
+    ray_index_drop(&w);
+
+    /* bloom */
+    r = ray_index_attach_bloom(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* ib = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I(ib->u.bloom.n_keys, 5);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── I32 through zone, sort, bloom (zone with nulls) ─────────────────── */
+
+static test_result_t test_index_i32_zone_sort_bloom(void) {
+    ray_heap_init();
+    int32_t xs[] = { 100, -50, 0, 999, -999 };
+    ray_t* v = ray_vec_new(RAY_I32, 5);
+    for (int i = 0; i < 5; i++) v = ray_vec_append(v, &xs[i]);
+
+    /* zone with nulls */
+    TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 2, true), RAY_OK);
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_zone(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* iz = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I(iz->u.zone.min_i, -999);
+    TEST_ASSERT_EQ_I(iz->u.zone.max_i, 999);
+    TEST_ASSERT_EQ_I(iz->u.zone.n_nulls, 1);
+    ray_index_drop(&w);
+
+    /* sort */
+    r = ray_index_attach_sort(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* is = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I(is->u.sort.perm->len, 5);
+    ray_index_drop(&w);
+
+    /* bloom */
+    r = ray_index_attach_bloom(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* ib = ray_index_payload(w->index);
+    /* row 2 is null, so n_keys = 4 */
+    TEST_ASSERT_EQ_I(ib->u.bloom.n_keys, 4);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── F64 sort and bloom ──────────────────────────────────────────────── */
+
+static test_result_t test_index_f64_sort_and_bloom(void) {
+    ray_heap_init();
+    double xs[] = { 3.14, -2.5, 0.0, 100.0, 1.5 };
+    ray_t* v = make_f64_vec(xs, 5);
+
+    /* sort */
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_sort(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* is = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I(is->u.sort.perm->len, 5);
+    ray_index_drop(&w);
+
+    /* bloom */
+    r = ray_index_attach_bloom(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* ib = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I(ib->u.bloom.n_keys, 5);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── F32 sort and bloom ──────────────────────────────────────────────── */
+
+static test_result_t test_index_f32_sort_and_bloom(void) {
+    ray_heap_init();
+    float xs[] = { 3.14f, -2.5f, 0.0f, 100.0f, 1.5f };
+    ray_t* v = ray_vec_new(RAY_F32, 5);
+    for (int i = 0; i < 5; i++) v = ray_vec_append(v, &xs[i]);
+
+    /* sort */
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_sort(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* is = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I(is->u.sort.perm->len, 5);
+    ray_index_drop(&w);
+
+    /* bloom */
+    r = ray_index_attach_bloom(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* ib = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I(ib->u.bloom.n_keys, 5);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── prepare_attach with vp == NULL (covers !vp true branch) ──────────── */
+
+static test_result_t test_index_attach_null_vp(void) {
+    ray_heap_init();
+
+    /* Pass NULL pointer-to-pointer — triggers the !vp branch in prepare_attach. */
+    ray_t* r1 = ray_index_attach_zone(NULL);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r1));
+    ray_error_free(r1);
+
+    ray_t* r2 = ray_index_attach_hash(NULL);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r2));
+    ray_error_free(r2);
+
+    ray_t* r3 = ray_index_attach_sort(NULL);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r3));
+    ray_error_free(r3);
+
+    ray_t* r4 = ray_index_attach_bloom(NULL);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r4));
+    ray_error_free(r4);
+
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── attach_via error propagation (NULL input to fn wrappers) ──────────── */
+
+static test_result_t test_index_fn_null_input(void) {
+    ray_heap_init();
+
+    /* NULL input to all fn wrappers — covers attach_via !v branch. */
+    ray_t* r1 = ray_idx_zone_fn(NULL);
+    TEST_ASSERT_TRUE(r1 == NULL);
+
+    ray_t* r2 = ray_idx_hash_fn(NULL);
+    TEST_ASSERT_TRUE(r2 == NULL);
+
+    ray_t* r3 = ray_idx_sort_fn(NULL);
+    TEST_ASSERT_TRUE(r3 == NULL);
+
+    ray_t* r4 = ray_idx_bloom_fn(NULL);
+    TEST_ASSERT_TRUE(r4 == NULL);
+
+    /* Error input to attach_via — covers RAY_IS_ERR(v) branch. */
+    ray_t* err = ray_error("test", "synthetic");
+    ray_t* r5 = ray_idx_zone_fn(err);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r5));
+
+    err = ray_error("test", "synthetic");
+    ray_t* r6 = ray_idx_hash_fn(err);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r6));
+
+    err = ray_error("test", "synthetic");
+    ray_t* r7 = ray_idx_sort_fn(err);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r7));
+
+    err = ray_error("test", "synthetic");
+    ray_t* r8 = ray_idx_bloom_fn(err);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r8));
+
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── ray_idx_drop_fn with NULL and error ──────────────────────────────── */
+
+static test_result_t test_index_drop_fn_null_error(void) {
+    ray_heap_init();
+
+    /* NULL input — covers !v branch in ray_idx_drop_fn. */
+    ray_t* r1 = ray_idx_drop_fn(NULL);
+    TEST_ASSERT_TRUE(r1 == NULL);
+
+    /* Error input — covers RAY_IS_ERR(v) branch. */
+    ray_t* err = ray_error("test", "synthetic");
+    ray_t* r2 = ray_idx_drop_fn(err);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r2));
+    ray_error_free(r2);
+
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── ray_idx_has_fn with NULL ─────────────────────────────────────────── */
+
+static test_result_t test_index_has_fn_null(void) {
+    ray_heap_init();
+
+    /* ray_idx_has_fn on a vec without index returns false (0b). */
+    int64_t xs[] = { 1, 2, 3 };
+    ray_t* v = make_i64_vec(xs, 3);
+    ray_t* r = ray_idx_has_fn(v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    ray_release(v);
+
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── release_payload with NULL pointers in hash/sort/bloom ────────────── *
+ *
+ * Exercises the false branches of the NULL checks in ray_index_release_payload
+ * (lines 142-156): hash.table==NULL, hash.chain==NULL, sort.perm==NULL,
+ * bloom.bits==NULL. */
+
+static test_result_t test_index_release_payload_null_ptrs(void) {
+    ray_heap_init();
+
+    /* Hash with NULL table and chain. */
+    ray_index_t ix_hash;
+    memset(&ix_hash, 0, sizeof(ix_hash));
+    ix_hash.kind = RAY_IDX_HASH;
+    ix_hash.u.hash.table = NULL;
+    ix_hash.u.hash.chain = NULL;
+    ray_index_release_payload(&ix_hash);  /* Should be safe no-op. */
+
+    /* Sort with NULL perm. */
+    ray_index_t ix_sort;
+    memset(&ix_sort, 0, sizeof(ix_sort));
+    ix_sort.kind = RAY_IDX_SORT;
+    ix_sort.u.sort.perm = NULL;
+    ray_index_release_payload(&ix_sort);
+
+    /* Bloom with NULL bits. */
+    ray_index_t ix_bloom;
+    memset(&ix_bloom, 0, sizeof(ix_bloom));
+    ix_bloom.kind = RAY_IDX_BLOOM;
+    ix_bloom.u.bloom.bits = NULL;
+    ray_index_release_payload(&ix_bloom);
+
+    /* NONE kind. */
+    ray_index_t ix_none;
+    memset(&ix_none, 0, sizeof(ix_none));
+    ix_none.kind = RAY_IDX_NONE;
+    ray_index_release_payload(&ix_none);
+
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── retain_payload with NULL pointers in hash/sort/bloom ─────────────── */
+
+static test_result_t test_index_retain_payload_null_ptrs(void) {
+    ray_heap_init();
+
+    /* Hash with NULL table and chain — the if checks must skip retain. */
+    ray_index_t ix_hash;
+    memset(&ix_hash, 0, sizeof(ix_hash));
+    ix_hash.kind = RAY_IDX_HASH;
+    ix_hash.u.hash.table = NULL;
+    ix_hash.u.hash.chain = NULL;
+    ray_index_retain_payload(&ix_hash);
+
+    /* Sort with NULL perm. */
+    ray_index_t ix_sort;
+    memset(&ix_sort, 0, sizeof(ix_sort));
+    ix_sort.kind = RAY_IDX_SORT;
+    ix_sort.u.sort.perm = NULL;
+    ray_index_retain_payload(&ix_sort);
+
+    /* Bloom with NULL bits. */
+    ray_index_t ix_bloom;
+    memset(&ix_bloom, 0, sizeof(ix_bloom));
+    ix_bloom.kind = RAY_IDX_BLOOM;
+    ix_bloom.u.bloom.bits = NULL;
+    ray_index_retain_payload(&ix_bloom);
+
+    /* NONE kind. */
+    ray_index_t ix_none;
+    memset(&ix_none, 0, sizeof(ix_none));
+    ix_none.kind = RAY_IDX_NONE;
+    ray_index_retain_payload(&ix_none);
+
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── Empty vec through all four kinds ─────────────────────────────────── */
+
+static test_result_t test_index_empty_vec_all_kinds(void) {
+    ray_heap_init();
+    ray_t* v = ray_vec_new(RAY_I64, 0);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+
+    /* zone on empty */
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_zone(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* iz = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I(iz->u.zone.min_i, 0);
+    TEST_ASSERT_EQ_I(iz->u.zone.max_i, 0);
+    TEST_ASSERT_EQ_I(iz->u.zone.n_nulls, 0);
+    ray_index_drop(&w);
+
+    /* hash on empty (chain->len = 0) */
+    r = ray_index_attach_hash(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* ih = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I(ih->u.hash.n_keys, 0);
+    ray_index_drop(&w);
+
+    /* sort on empty */
+    r = ray_index_attach_sort(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* is = ray_index_payload(w->index);
+    TEST_ASSERT_NOT_NULL(is->u.sort.perm);
+    ray_index_drop(&w);
+
+    /* bloom on empty (n_set=0, target_bits < 8 branch, floor 64) */
+    r = ray_index_attach_bloom(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* ib = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I(ib->u.bloom.n_keys, 0);
+    TEST_ASSERT_TRUE((ib->u.bloom.m_mask + 1) == 64);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── Hash with nulls across multiple types ────────────────────────────── *
+ *
+ * Ensures the null-skip branch in hash build (line 380) fires for I16,
+ * I32, F32, DATE types.  BOOL/U8 are non-nullable so excluded. */
+
+static test_result_t test_index_hash_nulls_multi_type(void) {
+    ray_heap_init();
+
+    /* I16 with null */
+    int16_t i16_xs[] = { 10, 20, 30 };
+    ray_t* v16 = ray_vec_new(RAY_I16, 3);
+    for (int i = 0; i < 3; i++) v16 = ray_vec_append(v16, &i16_xs[i]);
+    TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v16, 1, true), RAY_OK);
+    ray_t* w16 = v16;
+    ray_t* r = ray_index_attach_hash(&w16);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_index_payload(w16->index)->u.hash.n_keys, 2);
+    ray_release(w16);
+
+    /* I32 with null */
+    int32_t i32_xs[] = { 100, 200, 300 };
+    ray_t* v32 = ray_vec_new(RAY_I32, 3);
+    for (int i = 0; i < 3; i++) v32 = ray_vec_append(v32, &i32_xs[i]);
+    TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v32, 0, true), RAY_OK);
+    ray_t* w32 = v32;
+    r = ray_index_attach_hash(&w32);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_index_payload(w32->index)->u.hash.n_keys, 2);
+    ray_release(w32);
+
+    /* F32 with null */
+    float f32_xs[] = { 1.5f, 2.5f, 3.5f };
+    ray_t* vf32 = ray_vec_new(RAY_F32, 3);
+    for (int i = 0; i < 3; i++) vf32 = ray_vec_append(vf32, &f32_xs[i]);
+    TEST_ASSERT_EQ_I(ray_vec_set_null_checked(vf32, 1, true), RAY_OK);
+    ray_t* wf32 = vf32;
+    r = ray_index_attach_hash(&wf32);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_index_payload(wf32->index)->u.hash.n_keys, 2);
+    ray_release(wf32);
+
+    /* DATE with null */
+    int32_t date_xs[] = { 18000, 19000, 20000 };
+    ray_t* vd = ray_vec_new(RAY_DATE, 3);
+    for (int i = 0; i < 3; i++) vd = ray_vec_append(vd, &date_xs[i]);
+    TEST_ASSERT_EQ_I(ray_vec_set_null_checked(vd, 0, true), RAY_OK);
+    ray_t* wd = vd;
+    r = ray_index_attach_hash(&wd);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_index_payload(wd->index)->u.hash.n_keys, 2);
+    ray_release(wd);
+
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── Bloom with nulls across multiple types ───────────────────────────── */
+
+static test_result_t test_index_bloom_nulls_multi_type(void) {
+    ray_heap_init();
+
+    /* I16 with null */
+    int16_t i16_xs[] = { 10, 20, 30, 40 };
+    ray_t* v16 = ray_vec_new(RAY_I16, 4);
+    for (int i = 0; i < 4; i++) v16 = ray_vec_append(v16, &i16_xs[i]);
+    TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v16, 1, true), RAY_OK);
+    ray_t* w16 = v16;
+    ray_t* r = ray_index_attach_bloom(&w16);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_index_payload(w16->index)->u.bloom.n_keys, 3);
+    ray_release(w16);
+
+    /* F32 with null */
+    float f32_xs[] = { 1.5f, 2.5f, 3.5f, 4.5f };
+    ray_t* vf32 = ray_vec_new(RAY_F32, 4);
+    for (int i = 0; i < 4; i++) vf32 = ray_vec_append(vf32, &f32_xs[i]);
+    TEST_ASSERT_EQ_I(ray_vec_set_null_checked(vf32, 0, true), RAY_OK);
+    ray_t* wf32 = vf32;
+    r = ray_index_attach_bloom(&wf32);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_index_payload(wf32->index)->u.bloom.n_keys, 3);
+    ray_release(wf32);
+
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── Sort with nulls ──────────────────────────────────────────────────── */
+
+static test_result_t test_index_sort_with_nulls(void) {
+    ray_heap_init();
+    int64_t xs[] = { 50, 10, 30, 20, 40 };
+    ray_t* v = make_i64_vec(xs, 5);
+    TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 2, true), RAY_OK);
+
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_sort(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* is = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I(is->u.sort.perm->len, 5);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── Zone scan I64 with single value (min == max) ─────────────────────── */
+
+static test_result_t test_index_zone_single_value(void) {
+    ray_heap_init();
+    int64_t xs[] = { 42 };
+    ray_t* v = make_i64_vec(xs, 1);
+
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_zone(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* iz = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I(iz->u.zone.min_i, 42);
+    TEST_ASSERT_EQ_I(iz->u.zone.max_i, 42);
+    TEST_ASSERT_EQ_I(iz->u.zone.n_nulls, 0);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── F64 bloom with NaN (covers numeric_key_word F64 NaN in bloom) ────── */
+
+static test_result_t test_index_bloom_f64_nan(void) {
+    ray_heap_init();
+    double xs[] = { 1.0, (double)NAN, 3.0, (double)NAN, 5.0 };
+    ray_t* v = make_f64_vec(xs, 5);
+
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_bloom(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* ib = ray_index_payload(w->index);
+    /* All 5 rows are non-null (NaN is not null), all 5 get hashed. */
+    TEST_ASSERT_EQ_I(ib->u.bloom.n_keys, 5);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── F32 bloom with NaN (covers numeric_key_word F32 NaN in bloom) ────── */
+
+static test_result_t test_index_bloom_f32_nan(void) {
+    ray_heap_init();
+    float xs[] = { 1.0f, (float)NAN, 3.0f, (float)NAN };
+    ray_t* v = ray_vec_new(RAY_F32, 4);
+    for (int i = 0; i < 4; i++) v = ray_vec_append(v, &xs[i]);
+
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_bloom(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* ib = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I(ib->u.bloom.n_keys, 4);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── F64 bloom with -0.0 ─────────────────────────────────────────────── */
+
+static test_result_t test_index_bloom_f64_neg_zero(void) {
+    ray_heap_init();
+    double xs[] = { -0.0, 0.0, 1.0 };
+    ray_t* v = make_f64_vec(xs, 3);
+
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_bloom(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* ib = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I(ib->u.bloom.n_keys, 3);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── Zone scan F64 with -0.0 (clear_neg_zero in zone_scan_float) ──────── */
+
+static test_result_t test_index_zone_f64_neg_zero(void) {
+    ray_heap_init();
+    double xs[] = { -0.0, 1.0, -1.0 };
+    ray_t* v = make_f64_vec(xs, 3);
+
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_zone(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* iz = ray_index_payload(w->index);
+    TEST_ASSERT_TRUE(iz->u.zone.min_f == -1.0);
+    TEST_ASSERT_TRUE(iz->u.zone.max_f == 1.0);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── info on sort with NULL perm (covers sort.perm ? perm->len : 0) ───── */
+
+static test_result_t test_index_info_sort(void) {
+    ray_heap_init();
+    int64_t xs[] = { 3, 1, 2 };
+    ray_t* v = make_i64_vec(xs, 3);
+
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_sort(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+
+    /* Get info dict — covers RAY_IDX_SORT branch in ray_index_info. */
+    ray_t* info = ray_index_info(w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(info));
+    ray_release(info);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── info on bloom (covers RAY_IDX_BLOOM branch in ray_index_info) ────── */
+
+static test_result_t test_index_info_bloom(void) {
+    ray_heap_init();
+    int64_t xs[] = { 10, 20, 30 };
+    ray_t* v = make_i64_vec(xs, 3);
+
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_bloom(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+
+    ray_t* info = ray_index_info(w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(info));
+    ray_release(info);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── info on hash (covers RAY_IDX_HASH branch in ray_index_info) ──────── */
+
+static test_result_t test_index_info_hash(void) {
+    ray_heap_init();
+    int64_t xs[] = { 10, 20, 30 };
+    ray_t* v = make_i64_vec(xs, 3);
+
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_hash(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+
+    ray_t* info = ray_index_info(w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(info));
+    ray_release(info);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── info on zone with int parent (covers else branch in zone info) ───── */
+
+static test_result_t test_index_info_zone_int(void) {
+    ray_heap_init();
+    int64_t xs[] = { 5, 1, 9 };
+    ray_t* v = make_i64_vec(xs, 3);
+
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_zone(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+
+    ray_t* info = ray_index_info(w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(info));
+    ray_release(info);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── info on zone with F64 parent (covers F32/F64 branch in zone info) ── */
+
+static test_result_t test_index_info_zone_f64(void) {
+    ray_heap_init();
+    double xs[] = { 1.5, -2.5, 3.14 };
+    ray_t* v = make_f64_vec(xs, 3);
+
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_zone(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+
+    ray_t* info = ray_index_info(w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(info));
+    ray_release(info);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── Hash on n=1 (n < 4 branch, capacity=8) ──────────────────────────── */
+
+static test_result_t test_index_hash_single_elem(void) {
+    ray_heap_init();
+    int64_t xs[] = { 42 };
+    ray_t* v = make_i64_vec(xs, 1);
+
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_hash(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* ih = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I(ih->u.hash.n_keys, 1);
+    /* n=1 < 4, so cap = next_pow2(8) = 8 */
+    TEST_ASSERT_TRUE((ih->u.hash.mask + 1) == 8);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── I64 zone with nulls where min/max update on non-null ─────────────── */
+
+static test_result_t test_index_zone_i64_mixed_nulls(void) {
+    ray_heap_init();
+    int64_t xs[] = { 100, 200, 50, 300, 75 };
+    ray_t* v = make_i64_vec(xs, 5);
+    TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 0, true), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 3, true), RAY_OK);
+
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_zone(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* iz = ray_index_payload(w->index);
+    /* Non-null: 200, 50, 75 -> min=50, max=200 */
+    TEST_ASSERT_EQ_I(iz->u.zone.min_i, 50);
+    TEST_ASSERT_EQ_I(iz->u.zone.max_i, 200);
+    TEST_ASSERT_EQ_I(iz->u.zone.n_nulls, 2);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── F64 zone with explicit null via set_null_checked ──────────────────── *
+ *
+ * Note: NaN IS the F64 null sentinel.  Once HAS_NULLS is set via
+ * set_null_checked, any NaN row will also be detected as null.
+ * This test uses only non-NaN data and marks one row null. */
+
+static test_result_t test_index_zone_f64_nan_and_null(void) {
+    ray_heap_init();
+    double xs[] = { 1.0, 5.0, 3.0, 7.0 };
+    ray_t* v = make_f64_vec(xs, 4);
+    TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 2, true), RAY_OK);
+
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_zone(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* iz = ray_index_payload(w->index);
+    /* Row 2 is null (sentinel NaN), non-null rows: 1.0, 5.0, 7.0 */
+    TEST_ASSERT_TRUE(iz->u.zone.min_f == 1.0);
+    TEST_ASSERT_TRUE(iz->u.zone.max_f == 7.0);
+    TEST_ASSERT_EQ_I(iz->u.zone.n_nulls, 1);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── attach_via error path via unsupported type ───────────────────────── *
+ *
+ * Uses a SYM vec through the fn wrappers to hit the error branch in
+ * attach_via (line 654: RAY_IS_ERR(r) -> release w, return r). */
+
+static test_result_t test_index_fn_error_propagation(void) {
+    ray_heap_init();
+    ray_t* v = ray_sym_vec_new(RAY_SYM_W64, 4);
+    int64_t s = ray_sym_intern("test", 4);
+    v = ray_vec_append(v, &s);
+
+    /* All four fn wrappers should return an error for SYM vec. */
+    ray_retain(v);
+    ray_t* r1 = ray_idx_zone_fn(v);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r1));
+    ray_error_free(r1);
+
+    ray_retain(v);
+    ray_t* r2 = ray_idx_hash_fn(v);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r2));
+    ray_error_free(r2);
+
+    ray_retain(v);
+    ray_t* r3 = ray_idx_sort_fn(v);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r3));
+    ray_error_free(r3);
+
+    ray_retain(v);
+    ray_t* r4 = ray_idx_bloom_fn(v);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r4));
+    ray_error_free(r4);
+
+    ray_release(v);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── Hash on large n (n >= 4, 2*n path in capacity calc) ─────────────── */
+
+static test_result_t test_index_hash_large_n(void) {
+    ray_heap_init();
+    int64_t n = 100;
+    ray_t* v = ray_vec_new(RAY_I64, n);
+    for (int64_t i = 0; i < n; i++) v = ray_vec_append(v, &i);
+
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_hash(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* ih = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I(ih->u.hash.n_keys, 100);
+    /* n=100 >= 4, cap = next_pow2(200) = 256 */
+    TEST_ASSERT_TRUE((ih->u.hash.mask + 1) == 256);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── Bloom on large vec (n_set >= 8, 8*n_set path in sizing) ──────────── */
+
+static test_result_t test_index_bloom_large_n(void) {
+    ray_heap_init();
+    int64_t n = 50;
+    ray_t* v = ray_vec_new(RAY_I64, n);
+    for (int64_t i = 0; i < n; i++) v = ray_vec_append(v, &i);
+
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_bloom(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* ib = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I(ib->u.bloom.n_keys, 50);
+    /* n_set=50, 8*50=400, next_pow2(400)=512 */
+    TEST_ASSERT_TRUE((ib->u.bloom.m_mask + 1) == 512);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── LIST vec unsupported through all four kinds ──────────────────────── *
+ *
+ * RAY_LIST is type 0 which fails ray_is_vec, so prepare_attach returns
+ * "type" error.  This covers the !ray_is_vec branch for all four kinds. */
+
+static test_result_t test_index_list_unsupported(void) {
+    ray_heap_init();
+    ray_t* v = ray_list_new(4);
+    ray_t* elem = ray_i64(1);
+    v = ray_list_append(v, elem);
+    ray_release(elem);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+
+    ray_t* w = v;
+    ray_t* r1 = ray_index_attach_zone(&w);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r1));
+    ray_error_free(r1);
+
+    w = v;
+    ray_t* r2 = ray_index_attach_hash(&w);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r2));
+    ray_error_free(r2);
+
+    w = v;
+    ray_t* r3 = ray_index_attach_sort(&w);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r3));
+    ray_error_free(r3);
+
+    w = v;
+    ray_t* r4 = ray_index_attach_bloom(&w);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r4));
+    ray_error_free(r4);
+
+    ray_release(v);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── Non-vec (atom) through all kinds (covers !ray_is_vec branch) ──────── */
+
+static test_result_t test_index_attach_atom_error(void) {
+    ray_heap_init();
+    ray_t* a = ray_i64(42);
+
+    /* Zone */
+    ray_t* wa = a;
+    ray_t* r1 = ray_index_attach_zone(&wa);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r1));
+    ray_error_free(r1);
+
+    /* Hash */
+    wa = a;
+    ray_t* r2 = ray_index_attach_hash(&wa);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r2));
+    ray_error_free(r2);
+
+    /* Sort */
+    wa = a;
+    ray_t* r3 = ray_index_attach_sort(&wa);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r3));
+    ray_error_free(r3);
+
+    /* Bloom */
+    wa = a;
+    ray_t* r4 = ray_index_attach_bloom(&wa);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r4));
+    ray_error_free(r4);
+
+    ray_release(a);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── I64 hash with all-same values (chains build up in single bucket) ─── */
+
+static test_result_t test_index_hash_collisions(void) {
+    ray_heap_init();
+    int64_t xs[] = { 5, 5, 5, 5, 5 };
+    ray_t* v = make_i64_vec(xs, 5);
+
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_hash(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* ih = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I(ih->u.hash.n_keys, 5);
+
+    /* Verify chain links exist — all 5 rows hash to the same bucket. */
+    int64_t* chn = (int64_t*)ray_data(ih->u.hash.chain);
+    int chain_links = 0;
+    for (int64_t i = 0; i < 5; i++) {
+        if (chn[i] != 0) chain_links++;
+    }
+    /* At least 4 rows should chain (first becomes head, rest chain). */
+    TEST_ASSERT_TRUE(chain_links >= 4);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── Bloom n_set in [1,7] range (n_set < 8, target_bits=64 floor) ────── */
+
+static test_result_t test_index_bloom_small_n_set(void) {
+    ray_heap_init();
+    int64_t xs[] = { 42 };
+    ray_t* v = make_i64_vec(xs, 1);
+
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_bloom(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* ib = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I(ib->u.bloom.n_keys, 1);
+    /* n_set=1 < 8 -> target_bits=64 -> m=64 */
+    TEST_ASSERT_TRUE((ib->u.bloom.m_mask + 1) == 64);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── Drop on vec whose index was already dropped (double-drop) ────────── */
+
+static test_result_t test_index_double_drop(void) {
+    ray_heap_init();
+    int64_t xs[] = { 1, 2, 3 };
+    ray_t* v = make_i64_vec(xs, 3);
+
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_zone(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+
+    ray_index_drop(&w);
+    TEST_ASSERT_FALSE(w->attrs & RAY_ATTR_HAS_INDEX);
+
+    /* Second drop is a no-op (covers !(v->attrs & RAY_ATTR_HAS_INDEX) branch). */
+    ray_t* r2 = ray_index_drop(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r2));
+    TEST_ASSERT_FALSE(w->attrs & RAY_ATTR_HAS_INDEX);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── F64 zone only-NaN rows (all NaN, no null: !any_value path) ───────── */
+
+static test_result_t test_index_zone_f64_only_nan(void) {
+    ray_heap_init();
+    double xs[] = { (double)NAN, (double)NAN, (double)NAN };
+    ray_t* v = make_f64_vec(xs, 3);
+
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_zone(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* iz = ray_index_payload(w->index);
+    /* All NaN, none null: NaN skipped in min/max, !any_value -> 0.0/0.0 */
+    TEST_ASSERT_TRUE(iz->u.zone.min_f == 0.0);
+    TEST_ASSERT_TRUE(iz->u.zone.max_f == 0.0);
+    TEST_ASSERT_EQ_I(iz->u.zone.n_nulls, 0);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── F32 zone only-NaN rows ──────────────────────────────────────────── */
+
+static test_result_t test_index_zone_f32_only_nan(void) {
+    ray_heap_init();
+    float xs[] = { (float)NAN, (float)NAN };
+    ray_t* v = ray_vec_new(RAY_F32, 2);
+    for (int i = 0; i < 2; i++) v = ray_vec_append(v, &xs[i]);
+
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_zone(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* iz = ray_index_payload(w->index);
+    TEST_ASSERT_TRUE(iz->u.zone.min_f == 0.0);
+    TEST_ASSERT_TRUE(iz->u.zone.max_f == 0.0);
+    TEST_ASSERT_EQ_I(iz->u.zone.n_nulls, 0);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── I16 zone with nulls (covers zone_scan_int es=2 null path) ────────── */
+
+static test_result_t test_index_zone_i16_nulls(void) {
+    ray_heap_init();
+    int16_t xs[] = { 100, -200, 300, 0, 50 };
+    ray_t* v = ray_vec_new(RAY_I16, 5);
+    for (int i = 0; i < 5; i++) v = ray_vec_append(v, &xs[i]);
+    TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 1, true), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 3, true), RAY_OK);
+
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_zone(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* iz = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I(iz->u.zone.min_i, 50);
+    TEST_ASSERT_EQ_I(iz->u.zone.max_i, 300);
+    TEST_ASSERT_EQ_I(iz->u.zone.n_nulls, 2);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── U8 / BOOL are non-nullable: set_null_checked rejects them ──────────
+ *
+ * BOOL/U8 have no null sentinel, so ray_vec_set_null_checked returns
+ * RAY_ERR_TYPE.  This is NOT an idxop branch — but it documents the
+ * constraint.  Zone-scan on BOOL/U8 never enters the null-skip branch.
+ * The zone_scan_int es=1 path is already covered by the non-null BOOL
+ * and U8 zone tests above. */
+
+static test_result_t test_index_u8_bool_non_nullable(void) {
+    ray_heap_init();
+
+    /* U8: set_null_checked must reject. */
+    uint8_t ux[] = { 10, 20 };
+    ray_t* vu = ray_vec_new(RAY_U8, 2);
+    for (int i = 0; i < 2; i++) vu = ray_vec_append(vu, &ux[i]);
+    TEST_ASSERT_EQ_I(ray_vec_set_null_checked(vu, 0, true), RAY_ERR_TYPE);
+    ray_release(vu);
+
+    /* BOOL: set_null_checked must reject. */
+    uint8_t bx[] = { 1, 0 };
+    ray_t* vb = ray_vec_new(RAY_BOOL, 2);
+    for (int i = 0; i < 2; i++) vb = ray_vec_append(vb, &bx[i]);
+    TEST_ASSERT_EQ_I(ray_vec_set_null_checked(vb, 0, true), RAY_ERR_TYPE);
+    ray_release(vb);
+
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── DATE zone with nulls (covers zone_scan_int es=4 null) ────────────── */
+
+static test_result_t test_index_zone_date_nulls(void) {
+    ray_heap_init();
+    int32_t dates[] = { 18000, 19000, 20000, 21000 };
+    ray_t* v = ray_vec_new(RAY_DATE, 4);
+    for (int i = 0; i < 4; i++) v = ray_vec_append(v, &dates[i]);
+    TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 0, true), RAY_OK);
+
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_zone(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* iz = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I(iz->u.zone.n_nulls, 1);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── TIME zone with nulls (covers zone_scan_int es=8 null for TIME) ──── */
+
+static test_result_t test_index_zone_time_nulls(void) {
+    ray_heap_init();
+    int32_t times[] = { 0, 3600, 86399, 1000 };
+    ray_t* v = ray_vec_new(RAY_TIME, 4);
+    for (int i = 0; i < 4; i++) v = ray_vec_append(v, &times[i]);
+    TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 1, true), RAY_OK);
+
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_zone(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* iz = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I(iz->u.zone.n_nulls, 1);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── TIMESTAMP zone with nulls ───────────────────────────────────────── */
+
+static test_result_t test_index_zone_timestamp_nulls(void) {
+    ray_heap_init();
+    int64_t ts[] = { 1700000000000LL, 0LL, 1000000LL };
+    ray_t* v = ray_vec_new(RAY_TIMESTAMP, 3);
+    for (int i = 0; i < 3; i++) v = ray_vec_append(v, &ts[i]);
+    TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 2, true), RAY_OK);
+
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_zone(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* iz = ray_index_payload(w->index);
+    TEST_ASSERT_EQ_I(iz->u.zone.n_nulls, 1);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── F64 zone all-null via set_null_checked (all rows become NaN) ──────── *
+ *
+ * NaN IS the F64 null sentinel.  Once HAS_NULLS is set, ALL NaN values
+ * are detected as null by ray_vec_is_null.  This test marks all rows
+ * null to trigger the !any_value branch in zone_scan_float. */
+
+static test_result_t test_index_zone_f64_null_and_nan(void) {
+    ray_heap_init();
+    double xs[] = { 1.0, 2.0, 3.0 };
+    ray_t* v = make_f64_vec(xs, 3);
+    /* Mark all rows null. */
+    TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 0, true), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 1, true), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 2, true), RAY_OK);
+
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_zone(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* iz = ray_index_payload(w->index);
+    /* All null: !any_value -> min=0.0, max=0.0 */
+    TEST_ASSERT_TRUE(iz->u.zone.min_f == 0.0);
+    TEST_ASSERT_TRUE(iz->u.zone.max_f == 0.0);
+    TEST_ASSERT_EQ_I(iz->u.zone.n_nulls, 3);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── Hash n=3 (n < 4 boundary, cap=8) ─────────────────────────────────── */
+
+static test_result_t test_index_hash_n3(void) {
+    ray_heap_init();
+    int64_t xs[] = { 1, 2, 3 };
+    ray_t* v = make_i64_vec(xs, 3);
+
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_hash(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* ih = ray_index_payload(w->index);
+    /* n=3 < 4 -> cap = next_pow2(8) = 8 */
+    TEST_ASSERT_TRUE((ih->u.hash.mask + 1) == 8);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── Hash n=4 (exactly at boundary, cap=next_pow2(8)=8) ──────────────── */
+
+static test_result_t test_index_hash_n4(void) {
+    ray_heap_init();
+    int64_t xs[] = { 1, 2, 3, 4 };
+    ray_t* v = make_i64_vec(xs, 4);
+
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_hash(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* ih = ray_index_payload(w->index);
+    /* n=4 >= 4 -> 2*4=8, next_pow2(8)=8 */
+    TEST_ASSERT_TRUE((ih->u.hash.mask + 1) == 8);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── Hash n=5 (2*5=10, next_pow2(10)=16) ─────────────────────────────── */
+
+static test_result_t test_index_hash_n5(void) {
+    ray_heap_init();
+    int64_t xs[] = { 1, 2, 3, 4, 5 };
+    ray_t* v = make_i64_vec(xs, 5);
+
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_hash(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_index_t* ih = ray_index_payload(w->index);
+    /* n=5 >= 4 -> 2*5=10, next_pow2(10)=16 */
+    TEST_ASSERT_TRUE((ih->u.hash.mask + 1) == 16);
+
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t index_entries[] = {
     { "index/attach_drop_no_nulls",          test_index_attach_drop_no_nulls,          NULL, NULL },
     { "index/attach_drop_with_inline_nulls", test_index_attach_drop_with_inline_nulls, NULL, NULL },
@@ -1359,5 +2819,62 @@ const test_entry_t index_entries[] = {
     { "index/attach_null_vec",               test_index_attach_null_vec,               NULL, NULL },
     { "index/attach_on_linked_vec",          test_index_attach_on_linked_vec,          NULL, NULL },
     { "index/drop_null_guard",               test_index_drop_null_guard,               NULL, NULL },
+    { "index/hash_f32_nan",                  test_index_hash_f32_nan,                  NULL, NULL },
+    { "index/zone_f32_nan",                  test_index_zone_f32_nan,                  NULL, NULL },
+    { "index/zone_f32_nulls",                test_index_zone_f32_nulls,                NULL, NULL },
+    { "index/zone_f32_all_null",             test_index_zone_f32_all_null,             NULL, NULL },
+    { "index/hash_f64_neg_zero",             test_index_hash_f64_neg_zero,             NULL, NULL },
+    { "index/hash_f32_neg_zero",             test_index_hash_f32_neg_zero,             NULL, NULL },
+    { "index/time_all_kinds",                test_index_time_all_kinds,                NULL, NULL },
+    { "index/date_all_kinds",                test_index_date_all_kinds,                NULL, NULL },
+    { "index/timestamp_all_kinds",           test_index_timestamp_all_kinds,           NULL, NULL },
+    { "index/i16_sort_and_bloom",            test_index_i16_sort_and_bloom,            NULL, NULL },
+    { "index/u8_sort_and_bloom",             test_index_u8_sort_and_bloom,             NULL, NULL },
+    { "index/bool_sort_and_bloom",           test_index_bool_sort_and_bloom,           NULL, NULL },
+    { "index/i32_zone_sort_bloom",           test_index_i32_zone_sort_bloom,           NULL, NULL },
+    { "index/f64_sort_and_bloom",            test_index_f64_sort_and_bloom,            NULL, NULL },
+    { "index/f32_sort_and_bloom",            test_index_f32_sort_and_bloom,            NULL, NULL },
+    { "index/attach_null_vp",                test_index_attach_null_vp,                NULL, NULL },
+    { "index/fn_null_input",                 test_index_fn_null_input,                 NULL, NULL },
+    { "index/drop_fn_null_error",            test_index_drop_fn_null_error,            NULL, NULL },
+    { "index/has_fn_null",                   test_index_has_fn_null,                   NULL, NULL },
+    { "index/release_payload_null_ptrs",     test_index_release_payload_null_ptrs,     NULL, NULL },
+    { "index/retain_payload_null_ptrs",      test_index_retain_payload_null_ptrs,      NULL, NULL },
+    { "index/empty_vec_all_kinds",           test_index_empty_vec_all_kinds,           NULL, NULL },
+    { "index/hash_nulls_multi_type",         test_index_hash_nulls_multi_type,         NULL, NULL },
+    { "index/bloom_nulls_multi_type",        test_index_bloom_nulls_multi_type,        NULL, NULL },
+    { "index/sort_with_nulls",               test_index_sort_with_nulls,               NULL, NULL },
+    { "index/zone_single_value",             test_index_zone_single_value,             NULL, NULL },
+    { "index/bloom_f64_nan",                 test_index_bloom_f64_nan,                 NULL, NULL },
+    { "index/bloom_f32_nan",                 test_index_bloom_f32_nan,                 NULL, NULL },
+    { "index/bloom_f64_neg_zero",            test_index_bloom_f64_neg_zero,            NULL, NULL },
+    { "index/zone_f64_neg_zero",             test_index_zone_f64_neg_zero,             NULL, NULL },
+    { "index/info_sort",                     test_index_info_sort,                     NULL, NULL },
+    { "index/info_bloom",                    test_index_info_bloom,                    NULL, NULL },
+    { "index/info_hash",                     test_index_info_hash,                     NULL, NULL },
+    { "index/info_zone_int",                 test_index_info_zone_int,                 NULL, NULL },
+    { "index/info_zone_f64",                 test_index_info_zone_f64,                 NULL, NULL },
+    { "index/hash_single_elem",              test_index_hash_single_elem,              NULL, NULL },
+    { "index/zone_i64_mixed_nulls",          test_index_zone_i64_mixed_nulls,          NULL, NULL },
+    { "index/zone_f64_nan_and_null",         test_index_zone_f64_nan_and_null,         NULL, NULL },
+    { "index/fn_error_propagation",          test_index_fn_error_propagation,          NULL, NULL },
+    { "index/hash_large_n",                  test_index_hash_large_n,                  NULL, NULL },
+    { "index/bloom_large_n",                 test_index_bloom_large_n,                 NULL, NULL },
+    { "index/list_unsupported",              test_index_list_unsupported,              NULL, NULL },
+    { "index/attach_atom_error",             test_index_attach_atom_error,             NULL, NULL },
+    { "index/hash_collisions",               test_index_hash_collisions,               NULL, NULL },
+    { "index/bloom_small_n_set",             test_index_bloom_small_n_set,             NULL, NULL },
+    { "index/double_drop",                   test_index_double_drop,                   NULL, NULL },
+    { "index/zone_f64_only_nan",             test_index_zone_f64_only_nan,             NULL, NULL },
+    { "index/zone_f32_only_nan",             test_index_zone_f32_only_nan,             NULL, NULL },
+    { "index/zone_i16_nulls",                test_index_zone_i16_nulls,               NULL, NULL },
+    { "index/u8_bool_non_nullable",           test_index_u8_bool_non_nullable,         NULL, NULL },
+    { "index/zone_date_nulls",               test_index_zone_date_nulls,              NULL, NULL },
+    { "index/zone_time_nulls",               test_index_zone_time_nulls,              NULL, NULL },
+    { "index/zone_timestamp_nulls",          test_index_zone_timestamp_nulls,         NULL, NULL },
+    { "index/zone_f64_null_and_nan",         test_index_zone_f64_null_and_nan,        NULL, NULL },
+    { "index/hash_n3",                       test_index_hash_n3,                      NULL, NULL },
+    { "index/hash_n4",                       test_index_hash_n4,                      NULL, NULL },
+    { "index/hash_n5",                       test_index_hash_n5,                      NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
