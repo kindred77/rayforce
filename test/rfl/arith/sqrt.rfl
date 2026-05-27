@@ -24,3 +24,12 @@
 ;; (vector version: sort A, verify sqrt preserves order)
 (set S (asc A))
 (count S) -- (sum (== (sqrt S) (asc (sqrt A))))
+
+;; type errors — non-numeric input
+(sqrt "abc") !- type
+(sqrt 'foo)  !- type
+
+;; ---- RAY_IS_ERR propagation: sqrt(erroring arg) ----
+(sqrt (+ "a" 1))    !- type
+(sqrt (- 'a 1))     !- type
+(sqrt (round "x"))  !- type

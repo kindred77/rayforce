@@ -7,3 +7,17 @@
 
 ;; asc on sym vectors
 (asc ['c 'a 'b]) -- ['a 'b 'c]
+
+;; ─── edge cases: empty / single / all-equal sym & string ────────────
+;; empty SYM vec
+(asc (as 'SYM (list))) -- (as 'SYM (list))
+;; single-element sym
+(asc ['only]) -- ['only]
+;; all-equal sym
+(asc ['x 'x 'x]) -- ['x 'x 'x]
+;; long strings (>12 bytes pool path)
+(asc ["banana_pie_recipe" "apple_pie_dough" "cherry_pie_glaze"]) -- ["apple_pie_dough" "banana_pie_recipe" "cherry_pie_glaze"]
+;; mixed short+long strings
+(asc ["short" "this_is_a_long_string"]) -- ["short" "this_is_a_long_string"]
+;; all-empty strings
+(asc ["" "" ""]) -- ["" "" ""]

@@ -156,3 +156,57 @@
 (+ 1)           !- arity
 (+ 1 2 3)       !- arity
 (+ 1 2 3 4 5)   !- arity
+
+;; ---- RAY_IS_ERR propagation: + with erroring arg on either side ----
+(+ (sqrt 'foo) 1)   !- type
+(+ 1 (sqrt 'foo))   !- type
+(+ (round "x") 1)   !- type
+(+ (- 'a 1) 1)      !- type
+
+;; ──────────────────────────────────────────────────────────────────
+;; Mixed-width type-pair coverage (arith.c type-dispatch arms)
+;; ──────────────────────────────────────────────────────────────────
+
+;; I16 vec + I32 vec → I32
+(+ (as 'I16 [1 2 3]) (as 'I32 [10 20 30])) -- [11 22 33]
+(type (+ (as 'I16 [1 2 3]) (as 'I32 [10 20 30]))) -- 'I32
+
+;; I32 vec + F64 vec → F64
+(+ (as 'I32 [1 2 3]) (as 'F64 [0.5 1.5 2.5])) -- [1.5 3.5 5.5]
+(type (+ (as 'I32 [1 2 3]) (as 'F64 [0.5 1.5 2.5]))) -- 'F64
+
+;; I16 atom + F64 atom → F64
+(+ (as 'I16 5) 2.5) -- 7.5
+(type (+ (as 'I16 5) 2.5)) -- 'f64
+
+;; U8 vec + I64 vec
+(+ (as 'U8 [1 2 3]) (as 'I64 [10 20 30])) -- [11 22 33]
+
+;; BOOL atom + I64 atom
+(+ (as 'BOOL true) (as 'I64 5)) -- 6
+
+;; Numeric + temporal: cross-arms
+(+ (as 'I32 5) (as 'DATE 7305))         -- 2020.01.06
+(+ (as 'I16 100) (as 'TIME 1000))       -- 00:00:01.100
+(+ (as 'I32 500) (as 'TIMESTAMP 1000))  -- 2000.01.01D00:00:00.000001500
+
+;; Numeric NULL + temporal returns typed-null on right operand
+(nil? (+ 0Ni (as 'TIME 1000)))      -- true
+(type (+ 0Ni (as 'TIME 1000)))      -- 'time
+(nil? (+ 0Ni (as 'TIMESTAMP 1000))) -- true
+(type (+ 0Ni (as 'TIMESTAMP 1000))) -- 'timestamp
+
+;; DATE + TIME → TIMESTAMP (both directions)
+(type (+ (as 'DATE 7305) (as 'TIME 0))) -- 'timestamp
+(type (+ (as 'TIME 0) (as 'DATE 7305))) -- 'timestamp
+
+;; TIME + TIME → TIME
+(+ (as 'TIME 1000) (as 'TIME 2000)) -- 00:00:03.000
+
+;; TIME + TIMESTAMP → TIMESTAMP (and reverse)
+(type (+ (as 'TIME 1000) (as 'TIMESTAMP 2000))) -- 'timestamp
+(type (+ (as 'TIMESTAMP 2000) (as 'TIME 1000))) -- 'timestamp
+
+;; Reject float + temporal
+(+ 0Nf (as 'DATE 7305))         !- type
+(+ (as 'TIMESTAMP 1000) 0Nf)    !- type

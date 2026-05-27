@@ -325,6 +325,31 @@
 (count VeSpoke2)                                  -- 1
 (first (at VeSpoke2 '_end))                       -- 0
 
+;; =====================================================================
+;; Section 6: type-guard error paths in graph_builtin.c
+;;   - .graph.pagerank   (line 374): damping must be -RAY_F64 or int
+;;   - .graph.k-shortest (line 634): src/dst/k must all be int
+;;   - .graph.var-expand (line 726): src/min/max must all be int
+;;   - .graph.var-expand (line 742): track-path must be bool or int
+;; =====================================================================
+
+;; pagerank with non-numeric damping (3rd arg must be float or int).
+(.graph.pagerank K4 10 "bad")                    !- type
+
+;; k-shortest with non-int src/dst/k.  Use a string for src.
+(.graph.k-shortest K4 "bad" 1 2)                 !- type
+(.graph.k-shortest K4 0 "bad" 2)                 !- type
+(.graph.k-shortest K4 0 1 "bad")                 !- type
+
+;; var-expand with non-int src.
+(.graph.var-expand K4 "bad" 1 2)                 !- type
+;; var-expand with non-int min-depth.
+(.graph.var-expand K4 0 "bad" 2)                 !- type
+;; var-expand with non-int max-depth.
+(.graph.var-expand K4 0 1 "bad")                 !- type
+;; var-expand with non-bool / non-int track-path arg (6-arg form).
+(.graph.var-expand K4 0 1 2 0 "bad")             !- type
+
 ;; Cleanup
 (.graph.free K4)
 (.graph.free Chain)

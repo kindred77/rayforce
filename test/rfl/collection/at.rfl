@@ -16,3 +16,32 @@
 
 ;; at (n-1) == last
 (at V (- (count V) 1)) -- (last V)
+
+;; ---- RAY_IS_ERR propagation: at(erroring container/index) ----
+(at (sqrt 'foo) 0)           !- type
+(at (+ "abc" 1) 0)           !- type
+(at [1 2 3] (round "x"))     !- type
+(at [1 2 3] (sqrt 'foo))     !- type
+(at (- 'a 1) [0 1])          !- type
+
+;; ─── edge cases: boundary indices / out-of-range / single-element ────
+;; index = count - 1 → last element
+(at [10 20 30] 2) -- 30
+;; index = 0 on a single-element vec → that element
+(at [42] 0) -- 42
+;; index 0 on string with single char
+(at "x" 0) -- 'x'
+;; index = strlen - 1 → last char
+(at "hello" 4) -- 'o'
+;; table row 0 → dict of column values for that row
+(type (at (table [a b] (list [10 20 30] [100 200 300])) 0)) -- 'DICT
+;; table row at last index
+(at (at (table [a b] (list [10 20 30] [100 200 300])) 2) 'a) -- 30
+;; table row out of range → domain
+(at (table [a b] (list [1 2 3] [4 5 6])) 99) !- domain
+;; table negative row → domain (line 1608)
+(at (table [a b] (list [1 2 3] [4 5 6])) -1) !- domain
+;; vec with empty index vector → empty vec
+(count (at [10 20 30] (as 'I64 (list)))) -- 0
+;; dict missing key → 0Nl typed null (line 1667)
+(nil? (at (dict ['a 'b] [1 2]) 'missing)) -- true

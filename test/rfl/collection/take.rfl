@@ -140,3 +140,31 @@
 (take (dict ['a 'b 'c 'd] [1 2 3 4]) [1 2]) -- (dict ['b 'c] [2 3])
 (take (table [a b] (list [1 2 3 4] ['x 'y 'z 'w])) [1 2]) -- (table [a b] (list [2 3] ['y 'z]))
 (take [1 2 3] [1 -2]) !- length
+
+;; ---- RAY_IS_ERR propagation: take(erroring arg) ----
+(take (sqrt 'foo) 2)        !- type
+(take 2 (sqrt 'foo))        !- type
+(take (round "x") 1)        !- type
+(take (+ "a" 1) 1)          !- type
+
+;; ─── edge cases: take exactly the count / take 0 / negative-from-empty ──
+;; take 0 on a longer vec → empty same-type vec
+(count (take [10 20 30 40 50] 0)) -- 0
+(type (take [10 20 30 40 50] 0)) -- 'I64
+;; take = count → identity
+(take [1 2 3] 3) -- [1 2 3]
+;; take negative = count → identity (last N == all when N == count)
+(take [1 2 3] -3) -- [1 2 3]
+;; take 1 (single-element) from a longer vec
+(take [10 20 30 40 50] 1) -- [10]
+;; take -1 from longer vec → last element
+(take [10 20 30 40 50] -1) -- [50]
+;; take from empty: zero result is zero; positive result memset to zero (line 1500-1501)
+(count (take (as 'I64 (list)) 0)) -- 0
+(count (take (as 'I64 (list)) 5)) -- 5
+;; zero-fill for take-from-empty
+(sum (take (as 'I64 (list)) 5)) -- 0
+;; range take with zero amount → empty
+(count (take [1 2 3 4 5] [2 0])) -- 0
+;; range take with start = count → empty
+(count (take [1 2 3 4 5] [5 3])) -- 0

@@ -3275,6 +3275,927 @@ static test_result_t test_window_sym_partition_large_pool(void) {
     PASS();
 }
 
+/* ─── TIMESTAMP order key: win_keys_differ I64/TIMESTAMP branch (line 37) ─ */
+
+static test_result_t test_window_timestamp_order_key(void) {
+    ray_heap_init(); (void)ray_sym_init();
+
+    int64_t n = 4;
+    int64_t gd[] = {1, 1, 1, 1};
+    /* TIMESTAMP values (I64-typed microseconds-since-epoch) with ties */
+    int64_t od[] = {1000, 1000, 2000, 3000};
+    int64_t vd[] = {10, 20, 30, 40};
+    ray_t* gv = ray_vec_from_raw(RAY_I64, gd, n);
+    ray_t* ov = ray_vec_from_raw(RAY_TIMESTAMP, od, n);
+    ray_t* vv = ray_vec_from_raw(RAY_I64, vd, n);
+    int64_t ng = ray_sym_intern("g", 1);
+    int64_t no = ray_sym_intern("o", 1);
+    int64_t nv = ray_sym_intern("v", 1);
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, ng, gv);
+    tbl = ray_table_add_col(tbl, no, ov);
+    tbl = ray_table_add_col(tbl, nv, vv);
+    ray_release(gv); ray_release(ov); ray_release(vv);
+
+    /* PARTITION BY g, ORDER BY o (TIMESTAMP) — RANK with tie at 1000.
+     * Expected ranks: 1, 1, 3, 4 */
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* tbl_op = ray_const_table(g, tbl);
+    ray_op_t* g_op = ray_scan(g, "g");
+    ray_op_t* o_op = ray_scan(g, "o");
+    ray_op_t* v_op = ray_scan(g, "v");
+    ray_op_t* parts[]  = { g_op };
+    ray_op_t* orders[] = { o_op };
+    uint8_t   ndesc[]  = { 0 };
+    uint8_t   kinds[]  = { RAY_WIN_RANK };
+    ray_op_t* fins[]   = { v_op };
+    int64_t   params[] = { 0 };
+    ray_op_t* w = ray_window_op(g, tbl_op,
+                                parts, 1,
+                                orders, ndesc, 1,
+                                kinds, fins, params, 1,
+                                RAY_FRAME_ROWS,
+                                RAY_BOUND_UNBOUNDED_PRECEDING,
+                                RAY_BOUND_UNBOUNDED_FOLLOWING,
+                                0, 0);
+    ray_t* result = ray_execute(g, w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    ray_t* rc = win_result_col(result, 3);
+    int64_t* rd = (int64_t*)ray_data(rc);
+    TEST_ASSERT_EQ_I(rd[0], 1);
+    TEST_ASSERT_EQ_I(rd[1], 1);
+    TEST_ASSERT_EQ_I(rd[2], 3);
+    TEST_ASSERT_EQ_I(rd[3], 4);
+
+    ray_release(result); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* ─── TIME order key: win_keys_differ I32/TIME branch (line 47) ─────── */
+
+static test_result_t test_window_time_order_key(void) {
+    ray_heap_init(); (void)ray_sym_init();
+
+    int64_t n = 4;
+    int64_t gd[] = {1, 1, 1, 1};
+    /* TIME values (I32-typed milliseconds-since-midnight) with ties */
+    int32_t od[] = {36000, 36000, 72000, 108000};
+    int64_t vd[] = {10, 20, 30, 40};
+    ray_t* gv = ray_vec_from_raw(RAY_I64, gd, n);
+    ray_t* ov = ray_vec_from_raw(RAY_TIME, od, n);
+    ray_t* vv = ray_vec_from_raw(RAY_I64, vd, n);
+    int64_t ng = ray_sym_intern("g", 1);
+    int64_t no = ray_sym_intern("o", 1);
+    int64_t nv = ray_sym_intern("v", 1);
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, ng, gv);
+    tbl = ray_table_add_col(tbl, no, ov);
+    tbl = ray_table_add_col(tbl, nv, vv);
+    ray_release(gv); ray_release(ov); ray_release(vv);
+
+    /* PARTITION BY g, ORDER BY o (TIME) — RANK with tie at 36000.
+     * Expected ranks: 1, 1, 3, 4 */
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* tbl_op = ray_const_table(g, tbl);
+    ray_op_t* g_op = ray_scan(g, "g");
+    ray_op_t* o_op = ray_scan(g, "o");
+    ray_op_t* v_op = ray_scan(g, "v");
+    ray_op_t* parts[]  = { g_op };
+    ray_op_t* orders[] = { o_op };
+    uint8_t   ndesc[]  = { 0 };
+    uint8_t   kinds[]  = { RAY_WIN_RANK };
+    ray_op_t* fins[]   = { v_op };
+    int64_t   params[] = { 0 };
+    ray_op_t* w = ray_window_op(g, tbl_op,
+                                parts, 1,
+                                orders, ndesc, 1,
+                                kinds, fins, params, 1,
+                                RAY_FRAME_ROWS,
+                                RAY_BOUND_UNBOUNDED_PRECEDING,
+                                RAY_BOUND_UNBOUNDED_FOLLOWING,
+                                0, 0);
+    ray_t* result = ray_execute(g, w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    ray_t* rc = win_result_col(result, 3);
+    int64_t* rd = (int64_t*)ray_data(rc);
+    TEST_ASSERT_EQ_I(rd[0], 1);
+    TEST_ASSERT_EQ_I(rd[1], 1);
+    TEST_ASSERT_EQ_I(rd[2], 3);
+    TEST_ASSERT_EQ_I(rd[3], 4);
+
+    ray_release(result); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* ─── TIMESTAMP value for SUM/AVG: win_read_i64/win_read_f64 TIMESTAMP arm
+ *     (lines 79, 93) ───────────────────────────────────────────────────── */
+
+static test_result_t test_window_timestamp_value(void) {
+    ray_heap_init(); (void)ray_sym_init();
+
+    int64_t n = 4;
+    int64_t gd[] = {1, 1, 2, 2};
+    int64_t vd[] = {100, 200, 300, 400};
+    ray_t* gv = ray_vec_from_raw(RAY_I64, gd, n);
+    ray_t* vv = ray_vec_from_raw(RAY_TIMESTAMP, vd, n);
+    int64_t ng = ray_sym_intern("g", 1);
+    int64_t nv = ray_sym_intern("v", 1);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ng, gv);
+    tbl = ray_table_add_col(tbl, nv, vv);
+    ray_release(gv); ray_release(vv);
+
+    /* SUM(TIMESTAMP) → win_read_i64 TIMESTAMP arm (line 93) */
+    {
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* tbl_op = ray_const_table(g, tbl);
+        ray_op_t* w = build_whole_window(g, tbl_op, "g", "v",
+                                          RAY_WIN_SUM, "v", 0);
+        ray_t* result = ray_execute(g, w);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        ray_t* rc = win_result_col(result, 2);
+        TEST_ASSERT_EQ_I(rc->type, RAY_I64);
+        int64_t* rd = (int64_t*)ray_data(rc);
+        TEST_ASSERT_EQ_I(rd[0], 300);
+        TEST_ASSERT_EQ_I(rd[2], 700);
+        ray_release(result); ray_graph_free(g);
+    }
+
+    /* AVG(TIMESTAMP) → win_read_f64 TIMESTAMP arm (line 79) */
+    {
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* tbl_op = ray_const_table(g, tbl);
+        ray_op_t* w = build_whole_window(g, tbl_op, "g", "v",
+                                          RAY_WIN_AVG, "v", 0);
+        ray_t* result = ray_execute(g, w);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        ray_t* rc = win_result_col(result, 2);
+        TEST_ASSERT_EQ_I(rc->type, RAY_F64);
+        double* rd = (double*)ray_data(rc);
+        TEST_ASSERT_EQ_F(rd[0], 150.0, 1e-9);
+        TEST_ASSERT_EQ_F(rd[2], 350.0, 1e-9);
+        ray_release(result); ray_graph_free(g);
+    }
+
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* ─── TIME (I32) value for SUM/AVG: win_read_i64/win_read_f64 TIME arm
+ *     (lines 81, 95) ───────────────────────────────────────────────────── */
+
+static test_result_t test_window_time_value(void) {
+    ray_heap_init(); (void)ray_sym_init();
+
+    int64_t n = 4;
+    int64_t gd[] = {1, 1, 2, 2};
+    int32_t vd[] = {100, 200, 300, 400};
+    ray_t* gv = ray_vec_from_raw(RAY_I64, gd, n);
+    ray_t* vv = ray_vec_from_raw(RAY_TIME, vd, n);
+    int64_t ng = ray_sym_intern("g", 1);
+    int64_t nv = ray_sym_intern("v", 1);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ng, gv);
+    tbl = ray_table_add_col(tbl, nv, vv);
+    ray_release(gv); ray_release(vv);
+
+    /* SUM(TIME) → win_read_i64 I32/TIME arm (line 95) */
+    {
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* tbl_op = ray_const_table(g, tbl);
+        ray_op_t* w = build_whole_window(g, tbl_op, "g", "v",
+                                          RAY_WIN_SUM, "v", 0);
+        ray_t* result = ray_execute(g, w);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        ray_t* rc = win_result_col(result, 2);
+        TEST_ASSERT_EQ_I(rc->type, RAY_I64);
+        int64_t* rd = (int64_t*)ray_data(rc);
+        TEST_ASSERT_EQ_I(rd[0], 300);
+        TEST_ASSERT_EQ_I(rd[2], 700);
+        ray_release(result); ray_graph_free(g);
+    }
+
+    /* AVG(TIME) → win_read_f64 I32/TIME arm (line 81) */
+    {
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* tbl_op = ray_const_table(g, tbl);
+        ray_op_t* w = build_whole_window(g, tbl_op, "g", "v",
+                                          RAY_WIN_AVG, "v", 0);
+        ray_t* result = ray_execute(g, w);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        ray_t* rc = win_result_col(result, 2);
+        double* rd = (double*)ray_data(rc);
+        TEST_ASSERT_EQ_F(rd[0], 150.0, 1e-9);
+        TEST_ASSERT_EQ_F(rd[2], 350.0, 1e-9);
+        ray_release(result); ray_graph_free(g);
+    }
+
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* ─── BOOL value for AVG: win_read_f64 BOOL/U8 arm (line 86) ────────── */
+
+static test_result_t test_window_bool_value_avg(void) {
+    ray_heap_init(); (void)ray_sym_init();
+
+    int64_t n = 4;
+    int64_t gd[] = {1, 1, 2, 2};
+    uint8_t vd[] = {1, 0, 1, 1};
+    ray_t* gv = ray_vec_from_raw(RAY_I64, gd, n);
+    ray_t* vv = ray_vec_from_raw(RAY_BOOL, vd, n);
+    int64_t ng = ray_sym_intern("g", 1);
+    int64_t nv = ray_sym_intern("v", 1);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ng, gv);
+    tbl = ray_table_add_col(tbl, nv, vv);
+    ray_release(gv); ray_release(vv);
+
+    /* AVG(BOOL) → win_read_f64 BOOL arm (line 86) */
+    {
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* tbl_op = ray_const_table(g, tbl);
+        ray_op_t* w = build_whole_window(g, tbl_op, "g", "v",
+                                          RAY_WIN_AVG, "v", 0);
+        ray_t* result = ray_execute(g, w);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        ray_t* rc = win_result_col(result, 2);
+        double* rd = (double*)ray_data(rc);
+        TEST_ASSERT_EQ_F(rd[0], 0.5, 1e-9);  /* (1+0)/2 */
+        TEST_ASSERT_EQ_F(rd[2], 1.0, 1e-9);  /* (1+1)/2 */
+        ray_release(result); ray_graph_free(g);
+    }
+
+    /* SUM(BOOL) → win_read_i64 BOOL arm (line 101) */
+    {
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* tbl_op = ray_const_table(g, tbl);
+        ray_op_t* w = build_whole_window(g, tbl_op, "g", "v",
+                                          RAY_WIN_SUM, "v", 0);
+        ray_t* result = ray_execute(g, w);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        ray_t* rc = win_result_col(result, 2);
+        int64_t* rd = (int64_t*)ray_data(rc);
+        TEST_ASSERT_EQ_I(rd[0], 1);
+        TEST_ASSERT_EQ_I(rd[2], 2);
+        ray_release(result); ray_graph_free(g);
+    }
+
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* ─── FIRST_VALUE f64: lines 461-468 ──────────────────────────────── */
+
+static test_result_t test_window_first_value_f64(void) {
+    ray_heap_init(); (void)ray_sym_init();
+
+    int64_t n = 3;
+    int64_t gd[] = {1, 1, 1};
+    double  vd[] = {1.5, 2.5, 3.5};
+    ray_t* tbl = mk_tbl_i64_f64(gd, vd, n);
+
+    /* FIRST_VALUE f64 whole (line 465): non-null first value */
+    {
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* tbl_op = ray_const_table(g, tbl);
+        ray_op_t* w = build_whole_window(g, tbl_op, "g", "v",
+                                          RAY_WIN_FIRST_VALUE, "v", 0);
+        ray_t* result = ray_execute(g, w);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        ray_t* rc = win_result_col(result, 2);
+        TEST_ASSERT_EQ_I(rc->type, RAY_F64);
+        double* rd = (double*)ray_data(rc);
+        for (int64_t i = 0; i < n; i++) TEST_ASSERT_EQ_F(rd[i], 1.5, 1e-9);
+        ray_release(result); ray_graph_free(g);
+    }
+
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* ─── FIRST_VALUE f64 with null first: line 468 (win_set_null) ────── */
+
+static test_result_t test_window_first_value_f64_null(void) {
+    ray_heap_init(); (void)ray_sym_init();
+
+    int64_t n = 3;
+    int64_t gd[] = {1, 1, 1};
+    double  vd[] = {0.0, 2.5, 3.5};
+    ray_t* gv = ray_vec_from_raw(RAY_I64, gd, n);
+    ray_t* vv = ray_vec_from_raw(RAY_F64, vd, n);
+    ray_vec_set_null(vv, 0, true);   /* first row null */
+    int64_t ng = ray_sym_intern("g", 1);
+    int64_t nv = ray_sym_intern("v", 1);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ng, gv);
+    tbl = ray_table_add_col(tbl, nv, vv);
+    ray_release(gv); ray_release(vv);
+
+    /* FIRST_VALUE f64 whole, first row null → all null (lines 462, 465, 468) */
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* tbl_op = ray_const_table(g, tbl);
+    ray_op_t* g_op = ray_scan(g, "g");
+    ray_op_t* v_op = ray_scan(g, "v");
+    ray_op_t* parts[]  = { g_op };
+    uint8_t   kinds[]  = { RAY_WIN_FIRST_VALUE };
+    ray_op_t* fins[]   = { v_op };
+    int64_t   params[] = { 0 };
+    ray_op_t* w = ray_window_op(g, tbl_op,
+                                parts, 1,
+                                NULL, NULL, 0,
+                                kinds, fins, params, 1,
+                                RAY_FRAME_ROWS,
+                                RAY_BOUND_UNBOUNDED_PRECEDING,
+                                RAY_BOUND_UNBOUNDED_FOLLOWING,
+                                0, 0);
+    ray_t* result = ray_execute(g, w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    ray_t* rc = win_result_col(result, 2);
+    TEST_ASSERT_EQ_I(rc->type, RAY_F64);
+    for (int64_t i = 0; i < n; i++)
+        TEST_ASSERT_TRUE(ray_vec_is_null(rc, i));
+
+    ray_release(result); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* ─── LAST_VALUE whole f64 with null last: lines 486, 489 ──────────── */
+
+static test_result_t test_window_last_value_whole_f64_null(void) {
+    ray_heap_init(); (void)ray_sym_init();
+
+    int64_t n = 3;
+    int64_t gd[] = {1, 1, 1};
+    double  vd[] = {1.5, 2.5, 0.0};
+    ray_t* gv = ray_vec_from_raw(RAY_I64, gd, n);
+    ray_t* vv = ray_vec_from_raw(RAY_F64, vd, n);
+    ray_vec_set_null(vv, 2, true);   /* last row null */
+    int64_t ng = ray_sym_intern("g", 1);
+    int64_t nv = ray_sym_intern("v", 1);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ng, gv);
+    tbl = ray_table_add_col(tbl, nv, vv);
+    ray_release(gv); ray_release(vv);
+
+    /* LAST_VALUE f64 whole: last row null → all null (lines 485-489) */
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* tbl_op = ray_const_table(g, tbl);
+    ray_op_t* g_op = ray_scan(g, "g");
+    ray_op_t* v_op = ray_scan(g, "v");
+    ray_op_t* parts[]  = { g_op };
+    uint8_t   kinds[]  = { RAY_WIN_LAST_VALUE };
+    ray_op_t* fins[]   = { v_op };
+    int64_t   params[] = { 0 };
+    ray_op_t* w = ray_window_op(g, tbl_op,
+                                parts, 1,
+                                NULL, NULL, 0,
+                                kinds, fins, params, 1,
+                                RAY_FRAME_ROWS,
+                                RAY_BOUND_UNBOUNDED_PRECEDING,
+                                RAY_BOUND_UNBOUNDED_FOLLOWING,
+                                0, 0);
+    ray_t* result = ray_execute(g, w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    ray_t* rc = win_result_col(result, 2);
+    TEST_ASSERT_EQ_I(rc->type, RAY_F64);
+    for (int64_t i = 0; i < n; i++)
+        TEST_ASSERT_TRUE(ray_vec_is_null(rc, i));
+
+    ray_release(result); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* ─── LAST_VALUE whole i64 with null last: lines 502, 505 ──────────── */
+
+static test_result_t test_window_last_value_whole_i64_null(void) {
+    ray_heap_init(); (void)ray_sym_init();
+
+    int64_t n = 3;
+    int64_t gd[] = {1, 1, 1};
+    int64_t vd[] = {10, 20, 0};
+    ray_t* gv = ray_vec_from_raw(RAY_I64, gd, n);
+    ray_t* vv = ray_vec_from_raw(RAY_I64, vd, n);
+    ray_vec_set_null(vv, 2, true);   /* last row null */
+    int64_t ng = ray_sym_intern("g", 1);
+    int64_t nv = ray_sym_intern("v", 1);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ng, gv);
+    tbl = ray_table_add_col(tbl, nv, vv);
+    ray_release(gv); ray_release(vv);
+
+    /* LAST_VALUE i64 whole: last row null → all null (lines 501-505) */
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* tbl_op = ray_const_table(g, tbl);
+    ray_op_t* g_op = ray_scan(g, "g");
+    ray_op_t* v_op = ray_scan(g, "v");
+    ray_op_t* parts[]  = { g_op };
+    uint8_t   kinds[]  = { RAY_WIN_LAST_VALUE };
+    ray_op_t* fins[]   = { v_op };
+    int64_t   params[] = { 0 };
+    ray_op_t* w = ray_window_op(g, tbl_op,
+                                parts, 1,
+                                NULL, NULL, 0,
+                                kinds, fins, params, 1,
+                                RAY_FRAME_ROWS,
+                                RAY_BOUND_UNBOUNDED_PRECEDING,
+                                RAY_BOUND_UNBOUNDED_FOLLOWING,
+                                0, 0);
+    ray_t* result = ray_execute(g, w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    ray_t* rc = win_result_col(result, 2);
+    TEST_ASSERT_EQ_I(rc->type, RAY_I64);
+    for (int64_t i = 0; i < n; i++)
+        TEST_ASSERT_TRUE(ray_vec_is_null(rc, i));
+
+    ray_release(result); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* ─── LEAD offset=0: coerced to 1 (line 430) ─────────────────────── */
+
+static test_result_t test_window_lead_offset_zero(void) {
+    ray_heap_init(); (void)ray_sym_init();
+
+    int64_t n = 3;
+    int64_t gd[] = {1, 1, 1};
+    int64_t vd[] = {10, 20, 30};
+    ray_t* tbl = mk_tbl_i64_2(gd, vd, n);
+
+    /* LEAD offset=0 → coerced to 1 */
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* tbl_op = ray_const_table(g, tbl);
+    ray_op_t* w = build_whole_window(g, tbl_op, "g", "v",
+                                      RAY_WIN_LEAD, "v", 0);
+    ray_t* result = ray_execute(g, w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    ray_t* rc = win_result_col(result, 2);
+    int64_t* rd = (int64_t*)ray_data(rc);
+    TEST_ASSERT_EQ_I(rd[0], 20);
+    TEST_ASSERT_EQ_I(rd[1], 30);
+    TEST_ASSERT_TRUE(ray_vec_is_null(rc, 2));
+
+    ray_release(result); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* ─── LEAD f64 offset=0: coerced to 1, f64 path (lines 428, 430, 431) */
+
+static test_result_t test_window_lead_f64_offset_zero(void) {
+    ray_heap_init(); (void)ray_sym_init();
+
+    int64_t n = 3;
+    int64_t gd[] = {1, 1, 1};
+    double  vd[] = {1.5, 2.5, 3.5};
+    ray_t* tbl = mk_tbl_i64_f64(gd, vd, n);
+
+    /* LEAD f64 offset=0 → coerced to 1 */
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* tbl_op = ray_const_table(g, tbl);
+    ray_op_t* w = build_whole_window(g, tbl_op, "g", "v",
+                                      RAY_WIN_LEAD, "v", 0);
+    ray_t* result = ray_execute(g, w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    ray_t* rc = win_result_col(result, 2);
+    TEST_ASSERT_EQ_I(rc->type, RAY_F64);
+    double* rd = (double*)ray_data(rc);
+    TEST_ASSERT_EQ_F(rd[0], 2.5, 1e-9);
+    TEST_ASSERT_EQ_F(rd[1], 3.5, 1e-9);
+    TEST_ASSERT_TRUE(ray_vec_is_null(rc, 2));
+
+    ray_release(result); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* ─── NTH_VALUE f64 with out-of-range nth → all null ─────────────── */
+
+static test_result_t test_window_nth_value_f64_oob(void) {
+    ray_heap_init(); (void)ray_sym_init();
+
+    int64_t n = 3;
+    int64_t gd[] = {1, 1, 1};
+    double  vd[] = {1.5, 2.5, 3.5};
+    ray_t* tbl = mk_tbl_i64_f64(gd, vd, n);
+
+    /* NTH_VALUE f64 nth=99 > part_len → all null */
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* tbl_op = ray_const_table(g, tbl);
+    ray_op_t* w = build_whole_window(g, tbl_op, "g", "v",
+                                      RAY_WIN_NTH_VALUE, "v", 99);
+    ray_t* result = ray_execute(g, w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    ray_t* rc = win_result_col(result, 2);
+    TEST_ASSERT_EQ_I(rc->type, RAY_F64);
+    for (int64_t i = 0; i < n; i++)
+        TEST_ASSERT_TRUE(ray_vec_is_null(rc, i));
+
+    ray_release(result); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* ─── BOOL order key: win_keys_differ U8/BOOL arm (lines 59-62) ──── */
+
+static test_result_t test_window_bool_order_key(void) {
+    ray_heap_init(); (void)ray_sym_init();
+
+    int64_t n = 4;
+    int64_t gd[] = {1, 1, 1, 1};
+    uint8_t od[] = {0, 0, 1, 1};  /* ties at 0 */
+    int64_t vd[] = {10, 20, 30, 40};
+    ray_t* gv = ray_vec_from_raw(RAY_I64, gd, n);
+    ray_t* ov = ray_vec_from_raw(RAY_BOOL, od, n);
+    ray_t* vv = ray_vec_from_raw(RAY_I64, vd, n);
+    int64_t ng = ray_sym_intern("g", 1);
+    int64_t no = ray_sym_intern("o", 1);
+    int64_t nv = ray_sym_intern("v", 1);
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, ng, gv);
+    tbl = ray_table_add_col(tbl, no, ov);
+    tbl = ray_table_add_col(tbl, nv, vv);
+    ray_release(gv); ray_release(ov); ray_release(vv);
+
+    /* PARTITION BY g, ORDER BY o (BOOL) — RANK with tie at 0.
+     * Expected ranks: 1, 1, 3, 3 */
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* tbl_op = ray_const_table(g, tbl);
+    ray_op_t* g_op = ray_scan(g, "g");
+    ray_op_t* o_op = ray_scan(g, "o");
+    ray_op_t* v_op = ray_scan(g, "v");
+    ray_op_t* parts[]  = { g_op };
+    ray_op_t* orders[] = { o_op };
+    uint8_t   ndesc[]  = { 0 };
+    uint8_t   kinds[]  = { RAY_WIN_RANK };
+    ray_op_t* fins[]   = { v_op };
+    int64_t   params[] = { 0 };
+    ray_op_t* w = ray_window_op(g, tbl_op,
+                                parts, 1,
+                                orders, ndesc, 1,
+                                kinds, fins, params, 1,
+                                RAY_FRAME_ROWS,
+                                RAY_BOUND_UNBOUNDED_PRECEDING,
+                                RAY_BOUND_UNBOUNDED_FOLLOWING,
+                                0, 0);
+    ray_t* result = ray_execute(g, w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    ray_t* rc = win_result_col(result, 3);
+    int64_t* rd = (int64_t*)ray_data(rc);
+    /* sorted by BOOL ASC: [0,0,1,1] → ranks 1,1,3,3 */
+    TEST_ASSERT_EQ_I(rd[0], 1);
+    TEST_ASSERT_EQ_I(rd[1], 1);
+    TEST_ASSERT_EQ_I(rd[2], 3);
+    TEST_ASSERT_EQ_I(rd[3], 3);
+
+    ray_release(result); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* ─── STR order key: win_keys_differ STR arm (lines 63-69) ──────── */
+
+static test_result_t test_window_str_order_key(void) {
+    ray_heap_init(); (void)ray_sym_init();
+
+    int64_t n = 4;
+    int64_t gd[] = {1, 1, 1, 1};
+    int64_t vd[] = {10, 20, 30, 40};
+    ray_t* gv = ray_vec_from_raw(RAY_I64, gd, n);
+    ray_t* ov = ray_vec_new(RAY_STR, n);
+    ov = ray_str_vec_append(ov, "alpha", 5);
+    ov = ray_str_vec_append(ov, "alpha", 5);
+    ov = ray_str_vec_append(ov, "beta", 4);
+    ov = ray_str_vec_append(ov, "gamma", 5);
+    ray_t* vv = ray_vec_from_raw(RAY_I64, vd, n);
+    int64_t ng = ray_sym_intern("g", 1);
+    int64_t no = ray_sym_intern("o", 1);
+    int64_t nv = ray_sym_intern("v", 1);
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, ng, gv);
+    tbl = ray_table_add_col(tbl, no, ov);
+    tbl = ray_table_add_col(tbl, nv, vv);
+    ray_release(gv); ray_release(ov); ray_release(vv);
+
+    /* PARTITION BY g, ORDER BY o (STR) — RANK with tie at "alpha".
+     * Expected ranks: 1, 1, 3, 4 */
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* tbl_op = ray_const_table(g, tbl);
+    ray_op_t* g_op = ray_scan(g, "g");
+    ray_op_t* o_op = ray_scan(g, "o");
+    ray_op_t* v_op = ray_scan(g, "v");
+    ray_op_t* parts[]  = { g_op };
+    ray_op_t* orders[] = { o_op };
+    uint8_t   ndesc[]  = { 0 };
+    uint8_t   kinds[]  = { RAY_WIN_RANK };
+    ray_op_t* fins[]   = { v_op };
+    int64_t   params[] = { 0 };
+    ray_op_t* w = ray_window_op(g, tbl_op,
+                                parts, 1,
+                                orders, ndesc, 1,
+                                kinds, fins, params, 1,
+                                RAY_FRAME_ROWS,
+                                RAY_BOUND_UNBOUNDED_PRECEDING,
+                                RAY_BOUND_UNBOUNDED_FOLLOWING,
+                                0, 0);
+    ray_t* result = ray_execute(g, w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    ray_t* rc = win_result_col(result, 3);
+    int64_t* rd = (int64_t*)ray_data(rc);
+    TEST_ASSERT_EQ_I(rd[0], 1);
+    TEST_ASSERT_EQ_I(rd[1], 1);
+    TEST_ASSERT_EQ_I(rd[2], 3);
+    TEST_ASSERT_EQ_I(rd[3], 4);
+
+    ray_release(result); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* ─── DATE value for AVG: win_read_f64 DATE arm (line 81:19) ────────── */
+
+static test_result_t test_window_date_value_avg(void) {
+    ray_heap_init(); (void)ray_sym_init();
+
+    int64_t n = 4;
+    int64_t gd[] = {1, 1, 2, 2};
+    int32_t vd[] = {100, 200, 300, 400};
+    ray_t* gv = ray_vec_from_raw(RAY_I64, gd, n);
+    ray_t* vv = ray_vec_from_raw(RAY_DATE, vd, n);
+    int64_t ng = ray_sym_intern("g", 1);
+    int64_t nv = ray_sym_intern("v", 1);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ng, gv);
+    tbl = ray_table_add_col(tbl, nv, vv);
+    ray_release(gv); ray_release(vv);
+
+    /* AVG(DATE) → win_read_f64 DATE arm */
+    {
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* tbl_op = ray_const_table(g, tbl);
+        ray_op_t* w = build_whole_window(g, tbl_op, "g", "v",
+                                          RAY_WIN_AVG, "v", 0);
+        ray_t* result = ray_execute(g, w);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        ray_t* rc = win_result_col(result, 2);
+        double* rd = (double*)ray_data(rc);
+        TEST_ASSERT_EQ_F(rd[0], 150.0, 1e-9);
+        TEST_ASSERT_EQ_F(rd[2], 350.0, 1e-9);
+        ray_release(result); ray_graph_free(g);
+    }
+
+    /* SUM(DATE) → win_read_i64 DATE arm */
+    {
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* tbl_op = ray_const_table(g, tbl);
+        ray_op_t* w = build_whole_window(g, tbl_op, "g", "v",
+                                          RAY_WIN_SUM, "v", 0);
+        ray_t* result = ray_execute(g, w);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        ray_t* rc = win_result_col(result, 2);
+        int64_t* rd = (int64_t*)ray_data(rc);
+        TEST_ASSERT_EQ_I(rd[0], 300);
+        TEST_ASSERT_EQ_I(rd[2], 700);
+        ray_release(result); ray_graph_free(g);
+    }
+
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* ─── Running MIN f64 with decreasing values: line 291 v<mn branch ── */
+
+static test_result_t test_window_running_min_f64_decreasing(void) {
+    ray_heap_init(); (void)ray_sym_init();
+
+    /* Use a separate order key so values decrease in sorted order,
+     * exercising the `v < mn` branch in running MIN f64 (line 291). */
+    int64_t n = 4;
+    int64_t gd[] = {1, 1, 1, 1};
+    int64_t od[] = {1, 2, 3, 4};       /* order key ascending */
+    double  vd[] = {5.0, 3.0, 1.0, 2.0};  /* values: decreasing then up */
+    ray_t* gv = ray_vec_from_raw(RAY_I64, gd, n);
+    ray_t* ov = ray_vec_from_raw(RAY_I64, od, n);
+    ray_t* vv = ray_vec_from_raw(RAY_F64, vd, n);
+    int64_t ng = ray_sym_intern("g", 1);
+    int64_t no = ray_sym_intern("o", 1);
+    int64_t nv = ray_sym_intern("v", 1);
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, ng, gv);
+    tbl = ray_table_add_col(tbl, no, ov);
+    tbl = ray_table_add_col(tbl, nv, vv);
+    ray_release(gv); ray_release(ov); ray_release(vv);
+
+    /* Running MIN f64, PARTITION BY g, ORDER BY o ASC.
+     * Sorted: [5.0, 3.0, 1.0, 2.0]; running min: [5.0, 3.0, 1.0, 1.0].
+     * This exercises v < mn at steps 1 (3<5) and 2 (1<3). */
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* tbl_op = ray_const_table(g, tbl);
+    ray_op_t* g_op = ray_scan(g, "g");
+    ray_op_t* o_op = ray_scan(g, "o");
+    ray_op_t* v_op = ray_scan(g, "v");
+    ray_op_t* parts[]  = { g_op };
+    ray_op_t* orders[] = { o_op };
+    uint8_t   ndesc[]  = { 0 };
+    uint8_t   kinds[]  = { RAY_WIN_MIN };
+    ray_op_t* fins[]   = { v_op };
+    int64_t   params[] = { 0 };
+    ray_op_t* w = ray_window_op(g, tbl_op,
+                                parts, 1,
+                                orders, ndesc, 1,
+                                kinds, fins, params, 1,
+                                RAY_FRAME_ROWS,
+                                RAY_BOUND_UNBOUNDED_PRECEDING,
+                                RAY_BOUND_CURRENT_ROW,
+                                0, 0);
+    ray_t* result = ray_execute(g, w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    ray_t* rc = win_result_col(result, 3);
+    double* rd = (double*)ray_data(rc);
+    /* order: orig 0→5.0, 1→3.0, 2→1.0, 3→2.0
+     * running min: [5.0, 3.0, 1.0, 1.0]
+     * out[0]=5.0, out[1]=3.0, out[2]=1.0, out[3]=1.0 */
+    TEST_ASSERT_EQ_F(rd[0], 5.0, 1e-9);
+    TEST_ASSERT_EQ_F(rd[1], 3.0, 1e-9);
+    TEST_ASSERT_EQ_F(rd[2], 1.0, 1e-9);
+    TEST_ASSERT_EQ_F(rd[3], 1.0, 1e-9);
+
+    ray_release(result); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* ─── Running MIN i64 with decreasing values: separate order key ──── */
+
+static test_result_t test_window_running_min_i64_decreasing(void) {
+    ray_heap_init(); (void)ray_sym_init();
+
+    int64_t n = 4;
+    int64_t gd[] = {1, 1, 1, 1};
+    int64_t od[] = {1, 2, 3, 4};
+    int64_t vd[] = {50, 30, 10, 20};
+    ray_t* gv = ray_vec_from_raw(RAY_I64, gd, n);
+    ray_t* ov = ray_vec_from_raw(RAY_I64, od, n);
+    ray_t* vv = ray_vec_from_raw(RAY_I64, vd, n);
+    int64_t ng = ray_sym_intern("g", 1);
+    int64_t no = ray_sym_intern("o", 1);
+    int64_t nv = ray_sym_intern("v", 1);
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, ng, gv);
+    tbl = ray_table_add_col(tbl, no, ov);
+    tbl = ray_table_add_col(tbl, nv, vv);
+    ray_release(gv); ray_release(ov); ray_release(vv);
+
+    /* Running MIN i64: values in order [50,30,10,20]; running min: [50,30,10,10]. */
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* tbl_op = ray_const_table(g, tbl);
+    ray_op_t* g_op = ray_scan(g, "g");
+    ray_op_t* o_op = ray_scan(g, "o");
+    ray_op_t* v_op = ray_scan(g, "v");
+    ray_op_t* parts[]  = { g_op };
+    ray_op_t* orders[] = { o_op };
+    uint8_t   ndesc[]  = { 0 };
+    uint8_t   kinds[]  = { RAY_WIN_MIN };
+    ray_op_t* fins[]   = { v_op };
+    int64_t   params[] = { 0 };
+    ray_op_t* w = ray_window_op(g, tbl_op,
+                                parts, 1,
+                                orders, ndesc, 1,
+                                kinds, fins, params, 1,
+                                RAY_FRAME_ROWS,
+                                RAY_BOUND_UNBOUNDED_PRECEDING,
+                                RAY_BOUND_CURRENT_ROW,
+                                0, 0);
+    ray_t* result = ray_execute(g, w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    ray_t* rc = win_result_col(result, 3);
+    int64_t* rd = (int64_t*)ray_data(rc);
+    TEST_ASSERT_EQ_I(rd[0], 50);
+    TEST_ASSERT_EQ_I(rd[1], 30);
+    TEST_ASSERT_EQ_I(rd[2], 10);
+    TEST_ASSERT_EQ_I(rd[3], 10);
+
+    ray_release(result); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* ─── Running MAX f64 with increasing values: line 354 v>mx branch ── */
+
+static test_result_t test_window_running_max_f64_increasing(void) {
+    ray_heap_init(); (void)ray_sym_init();
+
+    int64_t n = 4;
+    int64_t gd[] = {1, 1, 1, 1};
+    int64_t od[] = {1, 2, 3, 4};
+    double  vd[] = {1.0, 3.0, 2.0, 5.0};
+    ray_t* gv = ray_vec_from_raw(RAY_I64, gd, n);
+    ray_t* ov = ray_vec_from_raw(RAY_I64, od, n);
+    ray_t* vv = ray_vec_from_raw(RAY_F64, vd, n);
+    int64_t ng = ray_sym_intern("g", 1);
+    int64_t no = ray_sym_intern("o", 1);
+    int64_t nv = ray_sym_intern("v", 1);
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, ng, gv);
+    tbl = ray_table_add_col(tbl, no, ov);
+    tbl = ray_table_add_col(tbl, nv, vv);
+    ray_release(gv); ray_release(ov); ray_release(vv);
+
+    /* Running MAX f64: [1.0, 3.0, 2.0, 5.0] → [1.0, 3.0, 3.0, 5.0] */
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* tbl_op = ray_const_table(g, tbl);
+    ray_op_t* g_op = ray_scan(g, "g");
+    ray_op_t* o_op = ray_scan(g, "o");
+    ray_op_t* v_op = ray_scan(g, "v");
+    ray_op_t* parts[]  = { g_op };
+    ray_op_t* orders[] = { o_op };
+    uint8_t   ndesc[]  = { 0 };
+    uint8_t   kinds[]  = { RAY_WIN_MAX };
+    ray_op_t* fins[]   = { v_op };
+    int64_t   params[] = { 0 };
+    ray_op_t* w = ray_window_op(g, tbl_op,
+                                parts, 1,
+                                orders, ndesc, 1,
+                                kinds, fins, params, 1,
+                                RAY_FRAME_ROWS,
+                                RAY_BOUND_UNBOUNDED_PRECEDING,
+                                RAY_BOUND_CURRENT_ROW,
+                                0, 0);
+    ray_t* result = ray_execute(g, w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    ray_t* rc = win_result_col(result, 3);
+    double* rd = (double*)ray_data(rc);
+    TEST_ASSERT_EQ_F(rd[0], 1.0, 1e-9);
+    TEST_ASSERT_EQ_F(rd[1], 3.0, 1e-9);
+    TEST_ASSERT_EQ_F(rd[2], 3.0, 1e-9);
+    TEST_ASSERT_EQ_F(rd[3], 5.0, 1e-9);
+
+    ray_release(result); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* ─── I32 order key (plain RAY_I32, not DATE/TIME): line 47:9 ─────── */
+
+static test_result_t test_window_i32_plain_order_key(void) {
+    ray_heap_init(); (void)ray_sym_init();
+
+    int64_t n = 4;
+    int64_t gd[] = {1, 1, 1, 1};
+    int32_t od[] = {100, 100, 200, 300};  /* ties at 100 */
+    int64_t vd[] = {10, 20, 30, 40};
+    ray_t* gv = ray_vec_from_raw(RAY_I64, gd, n);
+    ray_t* ov = ray_vec_from_raw(RAY_I32, od, n);
+    ray_t* vv = ray_vec_from_raw(RAY_I64, vd, n);
+    int64_t ng = ray_sym_intern("g", 1);
+    int64_t no = ray_sym_intern("o", 1);
+    int64_t nv = ray_sym_intern("v", 1);
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, ng, gv);
+    tbl = ray_table_add_col(tbl, no, ov);
+    tbl = ray_table_add_col(tbl, nv, vv);
+    ray_release(gv); ray_release(ov); ray_release(vv);
+
+    /* PARTITION BY g, ORDER BY o (I32) — RANK with tie at 100.
+     * Expected ranks: 1, 1, 3, 4 */
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* tbl_op = ray_const_table(g, tbl);
+    ray_op_t* g_op = ray_scan(g, "g");
+    ray_op_t* o_op = ray_scan(g, "o");
+    ray_op_t* v_op = ray_scan(g, "v");
+    ray_op_t* parts[]  = { g_op };
+    ray_op_t* orders[] = { o_op };
+    uint8_t   ndesc[]  = { 0 };
+    uint8_t   kinds[]  = { RAY_WIN_RANK };
+    ray_op_t* fins[]   = { v_op };
+    int64_t   params[] = { 0 };
+    ray_op_t* w = ray_window_op(g, tbl_op,
+                                parts, 1,
+                                orders, ndesc, 1,
+                                kinds, fins, params, 1,
+                                RAY_FRAME_ROWS,
+                                RAY_BOUND_UNBOUNDED_PRECEDING,
+                                RAY_BOUND_UNBOUNDED_FOLLOWING,
+                                0, 0);
+    ray_t* result = ray_execute(g, w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    ray_t* rc = win_result_col(result, 3);
+    int64_t* rd = (int64_t*)ray_data(rc);
+    TEST_ASSERT_EQ_I(rd[0], 1);
+    TEST_ASSERT_EQ_I(rd[1], 1);
+    TEST_ASSERT_EQ_I(rd[2], 3);
+    TEST_ASSERT_EQ_I(rd[3], 4);
+
+    ray_release(result); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
 /* ─── Suite registration ──────────────────────────────────────────── */
 
 const test_entry_t window_entries[] = {
@@ -3339,5 +4260,24 @@ const test_entry_t window_entries[] = {
     { "window/multikey_u8_radix",        test_window_multikey_u8_radix,        NULL, NULL },
     { "window/avg_sym_value",            test_window_avg_sym_value,            NULL, NULL },
     { "window/sym_partition_large_pool", test_window_sym_partition_large_pool, NULL, NULL },
+    { "window/timestamp_order_key",     test_window_timestamp_order_key,     NULL, NULL },
+    { "window/time_order_key",          test_window_time_order_key,          NULL, NULL },
+    { "window/timestamp_value",         test_window_timestamp_value,         NULL, NULL },
+    { "window/time_value",              test_window_time_value,              NULL, NULL },
+    { "window/bool_value_avg",          test_window_bool_value_avg,          NULL, NULL },
+    { "window/first_value_f64",         test_window_first_value_f64,         NULL, NULL },
+    { "window/first_value_f64_null",    test_window_first_value_f64_null,    NULL, NULL },
+    { "window/last_value_whole_f64_null", test_window_last_value_whole_f64_null, NULL, NULL },
+    { "window/last_value_whole_i64_null", test_window_last_value_whole_i64_null, NULL, NULL },
+    { "window/lead_offset_zero",        test_window_lead_offset_zero,        NULL, NULL },
+    { "window/lead_f64_offset_zero",    test_window_lead_f64_offset_zero,    NULL, NULL },
+    { "window/nth_value_f64_oob",       test_window_nth_value_f64_oob,       NULL, NULL },
+    { "window/bool_order_key",          test_window_bool_order_key,          NULL, NULL },
+    { "window/str_order_key",           test_window_str_order_key,           NULL, NULL },
+    { "window/date_value_avg",          test_window_date_value_avg,          NULL, NULL },
+    { "window/running_min_f64_decreasing", test_window_running_min_f64_decreasing, NULL, NULL },
+    { "window/running_min_i64_decreasing", test_window_running_min_i64_decreasing, NULL, NULL },
+    { "window/running_max_f64_increasing", test_window_running_max_f64_increasing, NULL, NULL },
+    { "window/i32_order_key_plain",     test_window_i32_plain_order_key,     NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };

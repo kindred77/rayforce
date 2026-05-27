@@ -24,3 +24,46 @@
 (sum (list 1 0Ni 3 0Ni 5)) -- 9
 (sum (list 0Ni 0Ni 0Ni))   -- 0
 (sum (list))               -- 0
+
+;; ---- RAY_IS_ERR propagation: sum(erroring arg) ----
+(sum (* 'bad 1))    !- type
+(sum (+ "a" 1))     !- type
+(sum (sqrt 'foo))   !- type
+(sum (round "x"))   !- type
+
+;; ─── edge cases: single / empty / all-equal / negatives / atoms ──────
+;; single-element vectors of every numeric type
+(sum [42]) -- 42
+(sum (as 'I32 [42])) -- 42
+(sum (as 'I16 [42])) -- 42
+(sum (as 'U8 [42])) -- 42
+(sum [42.5]) -- 42.5
+;; empty vec → 0 of that type
+(sum (as 'I64 (list))) -- 0
+(sum (as 'F64 (list))) -- 0.0
+(sum (as 'I32 (list))) -- 0
+;; all-equal
+(sum [5 5 5 5 5]) -- 25
+;; negatives
+(sum [-1 -2 -3 -4 -5]) -- -15
+;; sum of mixed-sign cancels out
+(sum [-3 -1 1 3]) -- 0
+;; U8 atom scalar → I64 (line 223 in ray_sum_fn)
+(sum (as 'U8 42)) -- 42
+(type (sum (as 'U8 42))) -- 'i64
+;; I16 atom scalar → I64 (line 224)
+(sum (as 'I16 -5)) -- -5
+(type (sum (as 'I16 -5))) -- 'i64
+;; I64 atom passes through
+(sum 99) -- 99
+;; F64 atom passes through
+(sum 3.14) -- 3.14
+;; DATE vec → type error (line 228)
+(sum (as 'DATE [7300 7301])) !- type
+
+;; ---- error propagation through agg inside select (exec_group path) ----
+(set _erp_T (table [v] (list (as 'I64 [10 20 30]))))
+(select {s: (sum (round "x")) from: _erp_T})   !- type
+(select {s: (avg (sqrt "x")) from: _erp_T})    !- type
+(select {s: (min (+ "a" 1)) from: _erp_T})     !- type
+(select {s: (max (+ "a" 1)) from: _erp_T})     !- type

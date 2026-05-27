@@ -432,3 +432,64 @@
 (count (asc Vnreal)) -- 8192
 (count (desc Vnreal)) -- 8192
 
+;; ────────────────────────────────────────────────────────────────────
+;; 25. NARROW-WIDTH SYM sort (W8) — radix_encode_fn RAY_SYM arm
+;;     dispatched via ray_read_sym for narrow widths.
+;;
+;; The CSV loader narrows SYM cols to W8 when distinct count ≤ 255.
+;; A small 3-distinct-id SYM column from CSV is W8.  Sorting it must
+;; exercise the W8 read path inside the SYM encode loop (sort.c:1010).
+;; Take/replicate to 8192 to force the radix path (>RADIX_SORT_THRESHOLD).
+;; ────────────────────────────────────────────────────────────────────
+(.sys.exec "printf 'id,s\n1,zz\n2,aa\n3,mm\n4,aa\n5,zz\n6,mm\n' > /tmp/rfl_sort_symw8.csv") -- 0
+(set Tsw8 (.csv.read [I64 SYMBOL] "/tmp/rfl_sort_symw8.csv"))
+(count Tsw8) -- 6
+(type (at Tsw8 's)) -- 'SYM
+
+;; Small-N asc/desc on narrow SYM
+(set Vw8 (at Tsw8 's))
+(at (asc Vw8) 0) -- 'aa
+(at (desc Vw8) 0) -- 'zz
+(count (asc Vw8)) -- 6
+(count (desc Vw8)) -- 6
+
+;; Large-N: take to 8192 to drive radix path through narrow SYM read
+(set Vw8big (take Vw8 8192))
+(count (asc Vw8big)) -- 8192
+(count (desc Vw8big)) -- 8192
+(at (asc Vw8big) 0) -- 'aa
+(at (take (desc Vw8big) -1) 0) -- 'aa
+
+;; Multi-key sort with narrow SYM as one of the keys.  Forces narrow
+;; SYM encode within composite radix path.
+(set Tsw8x (table [k s v] (list (as 'I32 (% (til 8192) 7)) (take Vw8 8192) (as 'I64 (til 8192)))))
+(count (xasc Tsw8x ['s 'k])) -- 8192
+(count (xdesc Tsw8x ['s 'k])) -- 8192
+
+;; Sort with NULLS FIRST/LAST on narrow SYM via splayed round-trip.
+;; SYM has 0 as null id; CSV path won't emit nulls, but the splayed
+;; round-trip is the public route to confirm the narrow-width column
+;; participates in mixed-attribute sorts.
+(.db.splayed.set "/tmp/rfl_sort_symw8_db/" Tsw8)
+(set Tsw8r (.db.splayed.get "/tmp/rfl_sort_symw8_db/"))
+(count Tsw8r) -- 6
+(type (at Tsw8r 's)) -- 'SYM
+(at (asc (at Tsw8r 's)) 0) -- 'aa
+(.sys.exec "rm -rf /tmp/rfl_sort_symw8.csv /tmp/rfl_sort_symw8_db") -- 0
+
+;; ────────────────────────────────────────────────────────────────────
+;; 26. NARROW-WIDTH SYM topk / fused sort+take (single-key SYM topk)
+;;     Exercises topk_indices_cmp_single → topk_indices_cmp with
+;;     SYM comparator heap on narrow-width data.
+;; ────────────────────────────────────────────────────────────────────
+(.sys.exec "printf 'id,s\n1,zz\n2,aa\n3,mm\n4,bb\n5,cc\n6,dd\n7,ee\n8,ff\n9,gg\n10,hh\n11,ii\n12,jj\n13,kk\n14,ll\n15,nn\n16,oo\n17,pp\n18,qq\n19,rr\n20,ss\n' > /tmp/rfl_sort_symtopk.csv") -- 0
+(set Ttk (.csv.read [I64 SYMBOL] "/tmp/rfl_sort_symtopk.csv"))
+(type (at Ttk 's)) -- 'SYM
+;; Take first 3 after sort — single-key SYM goes through cmp-heap topk
+(set Rtk3 (select {from: Ttk asc: s take: 3}))
+(count Rtk3) -- 3
+(at (at Rtk3 's) 0) -- 'aa
+(at (at Rtk3 's) 1) -- 'bb
+(at (at Rtk3 's) 2) -- 'cc
+(.sys.exec "rm -f /tmp/rfl_sort_symtopk.csv") -- 0
+

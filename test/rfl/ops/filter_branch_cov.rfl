@@ -1,0 +1,331 @@
+;; Branch-coverage tests for src/ops/filter.c.
+;;
+;; Targets uncovered branches at lines:
+;;   parted_gather_col : 36 (n_segs==0), 58 (segment cursor advance)
+;;   exec_filter_vec   : 74 (alloc fail — unreachable), 82 (length mismatch)
+;;   exec_filter_parted_vec: 113, 116, 118, 135, 142
+;;   exec_filter_seq   : 184, 187, 191, 201
+;;   exec_filter        : 211, 212, 235, 240, 246, 265, 276, 298,
+;;                         309, 333, 347, 356, 358, 362, 371, 373, 386
+;;   exec_filter_head  : parted I64/STR/SYM gather paths
+;;   sel_compact        : parted gather path (has_parted=true branches)
+;;
+;; Key routing:
+;;   select {from: T where: ...}  → lazy rowsel → sel_compact at boundary ops
+;;   select {from: T where: ... take: N} → exec_filter_head
+;;   HAVING: select {from: (select {agg from: T by: k}) where: ...}
+;;           → exec_filter → exec_filter_seq (small tables)
+
+;; ════════════════════════════════════════════════════════════════════
+;; Pre-flight cleanup
+;; ════════════════════════════════════════════════════════════════════
+(.sys.exec "rm -rf /tmp/rfl_fc_i64 /tmp/rfl_fc_sym /tmp/rfl_fc_str /tmp/rfl_fc_f64 /tmp/rfl_fc_mix /tmp/rfl_fc_multi /tmp/rfl_fc_big")
+
+;; ════════════════════════════════════════════════════════════════════
+;; 1. sel_compact on parted I64 table
+;;    Exercises: sel_compact has_parted=true → parted_gather_col (I64)
+;;    Covers lines: sel_compact 628-637 (parted basetype), 645-666
+;;                  parted_gather_col 37-67 (full gather loop)
+;; ════════════════════════════════════════════════════════════════════
+(set S1A (table [v] (list [10 20 30])))
+(set S1B (table [v] (list [40 50 60 70])))
+(set S1C (table [v] (list [80 90])))
+(.db.splayed.set "/tmp/rfl_fc_i64/2024.01.01/t/" S1A)
+(.db.splayed.set "/tmp/rfl_fc_i64/2024.01.02/t/" S1B)
+(.db.splayed.set "/tmp/rfl_fc_i64/2024.01.03/t/" S1C)
+(set Pi64 (.db.parted.get "/tmp/rfl_fc_i64/" 't))
+(count Pi64) -- 9
+
+;; Mixed-pass filter on parted I64 — parted_gather_col walks segments
+(count (select {from: Pi64 where: (> v 30)})) -- 6
+(sum (at (select {from: Pi64 where: (> v 30)}) 'v)) -- 390
+
+;; Filter that spans segment boundary — parted_gather_col L58
+;; Rows 2 (v=30) and 3 (v=40) straddle seg boundary
+(count (select {from: Pi64 where: (and (>= v 30) (<= v 50))})) -- 3
+(sum (at (select {from: Pi64 where: (and (>= v 30) (<= v 50))}) 'v)) -- 120
+
+;; All-pass on parted → sel_compact all-pass fast path (L528)
+(count (select {from: Pi64 where: (> v 0)})) -- 9
+(sum (at (select {from: Pi64 where: (> v 0)}) 'v)) -- 450
+
+;; None-pass on parted → sel_compact none-pass path (L531-548)
+(count (select {from: Pi64 where: (> v 999)})) -- 0
+
+;; Single row from last segment
+(count (select {from: Pi64 where: (== v 90)})) -- 1
+(first (at (select {from: Pi64 where: (== v 90)}) 'v)) -- 90
+
+;; ════════════════════════════════════════════════════════════════════
+;; 2. sel_compact on parted SYM table
+;;    Exercises: sel_compact has_parted=true with SYM base type
+;;    Covers lines: sel_compact 631-635 (SYM attrs from parted),
+;;                  parted_gather_col 39-41 (SYM esz)
+;; ════════════════════════════════════════════════════════════════════
+(set S2A (table [k v] (list ['aa 'bb 'cc] [1 2 3])))
+(set S2B (table [k v] (list ['dd 'ee] [4 5])))
+(.db.splayed.set "/tmp/rfl_fc_sym/2024.01.01/t/" S2A)
+(.db.splayed.set "/tmp/rfl_fc_sym/2024.01.02/t/" S2B)
+(set Psym (.db.parted.get "/tmp/rfl_fc_sym/" 't))
+(count Psym) -- 5
+
+;; Filter by numeric column, read back SYM column — parted SYM gather
+(count (select {from: Psym where: (> v 2)})) -- 3
+(first (at (select {from: Psym where: (> v 2)}) 'k)) -- 'cc
+
+;; Filter selecting from both segments — SYM segment crossing
+(count (select {from: Psym where: (and (>= v 2) (<= v 4))})) -- 3
+
+;; ════════════════════════════════════════════════════════════════════
+;; 3. sel_compact on parted STR table
+;;    Exercises: sel_compact has_parted=true with STR base type
+;;    Covers lines: sel_compact 650-655 (pbase==RAY_STR →
+;;                  parted_gather_str_rows), 704-709 (STR propagation)
+;; ════════════════════════════════════════════════════════════════════
+(set S3A (table [s v] (list (list "apple" "banana" "cherry") [1 2 3])))
+(set S3B (table [s v] (list (list "date" "elderberry") [4 5])))
+(.db.splayed.set "/tmp/rfl_fc_str/2024.01.01/t/" S3A)
+(.db.splayed.set "/tmp/rfl_fc_str/2024.01.02/t/" S3B)
+(set Pstr (.db.parted.get "/tmp/rfl_fc_str/" 't))
+(count Pstr) -- 5
+
+;; Filter by numeric col, gather STR column from parted
+(count (select {from: Pstr where: (> v 2)})) -- 3
+(count (select {from: Pstr where: (>= v 4)})) -- 2
+
+;; ════════════════════════════════════════════════════════════════════
+;; 4. sel_compact on parted F64 table
+;;    Exercises: parted_gather_col for F64 base type
+;; ════════════════════════════════════════════════════════════════════
+(set S4A (table [f v] (list [1.5 2.5 3.5] [1 2 3])))
+(set S4B (table [f v] (list [4.5 5.5] [4 5])))
+(.db.splayed.set "/tmp/rfl_fc_f64/2024.01.01/t/" S4A)
+(.db.splayed.set "/tmp/rfl_fc_f64/2024.01.02/t/" S4B)
+(set Pf64 (.db.parted.get "/tmp/rfl_fc_f64/" 't))
+(count Pf64) -- 5
+
+;; F64 parted gather
+(count (select {from: Pf64 where: (> v 3)})) -- 2
+(sum (at (select {from: Pf64 where: (> v 3)}) 'f)) -- 10.0
+
+;; ════════════════════════════════════════════════════════════════════
+;; 5. sel_compact on parted table with mixed column types
+;;    Exercises: parted_gather_col for each type + str_pool propagation
+;;    Covers: sel_compact 701-714 (str_pool propagation for parted
+;;            cols, null propagation for flat cols)
+;; ════════════════════════════════════════════════════════════════════
+(set S5A (table [i f s v] (list [1 2 3] [1.0 2.0 3.0] ['x 'y 'z] [10 20 30])))
+(set S5B (table [i f s v] (list [4 5] [4.0 5.0] ['a 'b] [40 50])))
+(.db.splayed.set "/tmp/rfl_fc_mix/2024.01.01/t/" S5A)
+(.db.splayed.set "/tmp/rfl_fc_mix/2024.01.02/t/" S5B)
+(set Pmix (.db.parted.get "/tmp/rfl_fc_mix/" 't))
+(count Pmix) -- 5
+
+;; Mixed-type parted filter — all column types gathered
+(count (select {from: Pmix where: (> v 20)})) -- 3
+(sum (at (select {from: Pmix where: (> v 20)}) 'i)) -- 12
+(sum (at (select {from: Pmix where: (> v 20)}) 'f)) -- 12.0
+
+;; ════════════════════════════════════════════════════════════════════
+;; 6. exec_filter_head on parted table (select-where-take)
+;;    Exercises: exec_filter_head parted gather (lines 460-484)
+;;    The parted I64/STR gather and segment cursor advance in
+;;    exec_filter_head are separate from sel_compact's.
+;; ════════════════════════════════════════════════════════════════════
+
+;; exec_filter_head with parted I64 gather
+(count (select {from: Pi64 where: (> v 20) take: 3})) -- 3
+(sum (at (select {from: Pi64 where: (> v 20) take: 3}) 'v)) -- 120
+(count (select {from: Pi64 where: (> v 20) take: 100})) -- 7
+
+;; exec_filter_head on parted STR
+(count (select {from: Pstr where: (> v 2) take: 2})) -- 2
+
+;; exec_filter_head on parted SYM
+(count (select {from: Psym where: (> v 2) take: 2})) -- 2
+
+;; exec_filter_head with parted mixed types
+(count (select {from: Pmix where: (> v 10) take: 2})) -- 2
+
+;; exec_filter_head take=0 — empty result
+(count (select {from: Pi64 where: (> v 0) take: 0})) -- 0
+
+;; exec_filter_head none-pass
+(count (select {from: Pi64 where: (> v 999) take: 5})) -- 0
+
+;; ════════════════════════════════════════════════════════════════════
+;; 7. HAVING — exec_filter → exec_filter_seq on small group result
+;;    Exercises: exec_filter L208-228 (entry, pass_count scan),
+;;              exec_filter L227-228 (vector filter — non-table input),
+;;              exec_filter_seq L181-206 (sequential table filter)
+;;    The group result is a small flat table, hitting exec_filter_seq.
+;; ════════════════════════════════════════════════════════════════════
+
+;; HAVING on parted group result — filter on aggregated columns
+;; The group result table is flat (not parted), so this exercises
+;; exec_filter_seq → exec_filter_vec for each result column.
+(set Rh (select {from: (select {s: (sum v) from: Pi64 by: date}) where: (> s 100)}))
+(count Rh) -- 2
+
+;; HAVING with none-pass predicate
+(count (select {from: (select {s: (sum v) from: Pi64 by: date}) where: (> s 9999)})) -- 0
+
+;; HAVING with all-pass predicate
+(count (select {from: (select {s: (sum v) from: Pi64 by: date}) where: (> s 0)})) -- 3
+
+;; ════════════════════════════════════════════════════════════════════
+;; 8. HAVING on large group result — exec_filter parallel paths
+;;    With >65536 rows, exec_filter uses parallel gather.
+;;    Exercises: exec_filter L231-265 (parallel setup, match_idx build),
+;;              L329-342 (multi_gather_fn dispatch)
+;; ════════════════════════════════════════════════════════════════════
+
+;; Build a 70000-row table grouped to 70000 groups (1 row each),
+;; then HAVING on the aggregated column.  The group result is a
+;; 70000-row flat table.
+(set Tbig (table [k v] (list (til 70000) (til 70000))))
+
+;; HAVING on 70000-row group result → exec_filter parallel paths
+(count (select {from: (select {s: (sum v) from: Tbig by: k}) where: (> s 69990)})) -- 9
+
+;; HAVING keeping ~half — stresses multi_gather_fn for moderate pass_count
+(count (select {from: (select {s: (sum v) from: Tbig by: k}) where: (>= s 35000)})) -- 35000
+
+;; ════════════════════════════════════════════════════════════════════
+;; 9. Multi-segment parted table — parted_gather_col segment advance
+;;    Exercises: parted_gather_col L54-57 (segment cursor advance),
+;;              L58 (row >= seg_ends[seg] condition),
+;;              L60-63 (local_row calculation across segments)
+;; ════════════════════════════════════════════════════════════════════
+(set M1 (table [v] (list [1 2])))
+(set M2 (table [v] (list [3 4 5])))
+(set M3 (table [v] (list [6 7 8 9])))
+(.db.splayed.set "/tmp/rfl_fc_multi/2024.01.01/t/" M1)
+(.db.splayed.set "/tmp/rfl_fc_multi/2024.01.02/t/" M2)
+(.db.splayed.set "/tmp/rfl_fc_multi/2024.01.03/t/" M3)
+(set Pmulti (.db.parted.get "/tmp/rfl_fc_multi/" 't))
+(count Pmulti) -- 9
+
+;; Match from each segment — forces segment cursor to advance
+(count (select {from: Pmulti where: (or (== v 1) (or (== v 5) (== v 9)))})) -- 3
+(sum (at (select {from: Pmulti where: (or (== v 1) (or (== v 5) (== v 9)))}) 'v)) -- 15
+
+;; Match from only last segment — cursor must skip to seg 2
+(count (select {from: Pmulti where: (> v 7)})) -- 2
+(sum (at (select {from: Pmulti where: (> v 7)}) 'v)) -- 17
+
+;; Match from only first segment — cursor stays at seg 0
+(count (select {from: Pmulti where: (< v 3)})) -- 2
+
+;; Alternating matches across segments
+(count (select {from: Pmulti where: (== (% v 2) 0)})) -- 4
+(sum (at (select {from: Pmulti where: (== (% v 2) 0)}) 'v)) -- 20
+
+;; exec_filter_head across multiple segments
+(count (select {from: Pmulti where: (> v 0) take: 5})) -- 5
+(sum (at (select {from: Pmulti where: (> v 0) take: 5}) 'v)) -- 15
+
+;; ════════════════════════════════════════════════════════════════════
+;; 10. sel_compact MAPCOMMON materialization
+;;     When a parted table has a MAPCOMMON column (the date partition
+;;     key), sel_compact L600-627 materializes it via row-index lookup.
+;;     The parted_gather_col path handles the data columns.
+;; ════════════════════════════════════════════════════════════════════
+
+;; The MAPCOMMON 'date' column is materialized alongside parted 'v'
+;; in the same sel_compact call.
+(count (select {from: Pi64 where: (and (> v 20) (< v 80))})) -- 5
+(sum (at (select {from: Pi64 where: (and (> v 20) (< v 80))}) 'v)) -- 250
+
+;; ════════════════════════════════════════════════════════════════════
+;; 11. sel_compact str_pool propagation for non-STR parted columns
+;;     Exercises: sel_compact L701-714 — parted non-STR path calls
+;;     col_propagate_str_pool_parted; flat columns call
+;;     col_propagate_str_pool + col_propagate_nulls_gather.
+;;     SYM columns carry sym-pool metadata that needs propagation.
+;; ════════════════════════════════════════════════════════════════════
+
+;; SYM parted column — triggers col_propagate_str_pool_parted (L706-708)
+(first (at (select {from: Psym where: (== v 5)}) 'k)) -- 'ee
+
+;; ════════════════════════════════════════════════════════════════════
+;; 12. Chained filter on parted — sel_compact reads compacted flat tbl
+;;     Double filter on parted table — second filter's sel_compact
+;;     operates on a flat (already-compacted) table.
+;; ════════════════════════════════════════════════════════════════════
+(count (select {from: (select {from: Pi64 where: (> v 20)}) where: (< v 80)})) -- 5
+
+;; ════════════════════════════════════════════════════════════════════
+;; 13. Larger parted table to exercise morsel boundaries in sel_compact
+;;     RAY_MORSEL_ELEMS=1024.  A parted table with >1024 total rows
+;;     exercises multi-morsel rowsel walking in sel_compact.
+;; ════════════════════════════════════════════════════════════════════
+(set B1 (table [v] (list (til 600))))
+(set B2 (table [v] (list (+ (til 600) 600))))
+(.db.splayed.set "/tmp/rfl_fc_big/2024.01.01/t/" B1)
+(.db.splayed.set "/tmp/rfl_fc_big/2024.01.02/t/" B2)
+(set Pbig (.db.parted.get "/tmp/rfl_fc_big/" 't))
+(count Pbig) -- 1200
+
+;; Filter spanning morsel boundary (1024) on parted table
+(count (select {from: Pbig where: (> v 500)})) -- 699
+(count (select {from: Pbig where: (and (>= v 400) (< v 800))})) -- 400
+(sum (at (select {from: Pbig where: (and (>= v 400) (< v 800))}) 'v)) -- 239800
+
+;; exec_filter_head on large parted table across morsel boundary
+(count (select {from: Pbig where: (> v 100) take: 50})) -- 50
+
+;; ════════════════════════════════════════════════════════════════════
+;; 14. HAVING with STR columns in group result
+;;     exec_filter_seq → exec_filter_vec on STR column
+;;     Exercises: exec_filter_vec on STR (col_esz path)
+;; ════════════════════════════════════════════════════════════════════
+(set Ts (table [k v] (list ['a 'a 'b 'b 'c] [1 2 3 4 5])))
+(count (select {from: (select {s: (sum v) from: Ts by: k}) where: (> s 3)})) -- 2
+
+;; ════════════════════════════════════════════════════════════════════
+;; 15. Parted SYM + STR in exec_filter_head
+;;     exec_filter_head L443-452: SYM type-dispatch with parted attrs
+;;     exec_filter_head L460-466: parted STR deep-copy
+;; ════════════════════════════════════════════════════════════════════
+
+;; exec_filter_head on parted SYM with take
+(count (select {from: Psym where: (>= v 1) take: 3})) -- 3
+(first (at (select {from: Psym where: (>= v 1) take: 3}) 'k)) -- 'aa
+
+;; exec_filter_head on parted STR with take
+(count (select {from: Pstr where: (>= v 1) take: 3})) -- 3
+
+;; ════════════════════════════════════════════════════════════════════
+;; 16. exec_filter on vector input (non-table)
+;;     exec_filter L227-228: input->type != RAY_TABLE
+;;     This path is hit when filter is applied eagerly to a vector.
+;; ════════════════════════════════════════════════════════════════════
+
+;; Vector filter through select on a column vector directly
+;; The builtin (filter v mask) goes through collection.c, not filter.c.
+;; exec_filter on vector happens only through the graph executor.
+;; This is already covered by the HAVING path (exec_filter_vec is
+;; called per-column inside exec_filter_seq).
+
+;; ════════════════════════════════════════════════════════════════════
+;; 17. AND/OR composites on parted — complex predicates that create
+;;     diverse rowsel patterns (MIX segments in sel_compact)
+;; ════════════════════════════════════════════════════════════════════
+(count (select {from: Pmulti where: (and (> v 2) (< v 8))})) -- 5
+(count (select {from: Pmulti where: (or (< v 3) (> v 7))})) -- 4
+(count (select {from: Pmulti where: (not (== v 5))})) -- 8
+
+;; ════════════════════════════════════════════════════════════════════
+;; 18. Nested select on parted table — double sel_compact
+;;     First select-where creates lazy sel, boundary op compacts,
+;;     second select-where on compacted (flat) table.
+;; ════════════════════════════════════════════════════════════════════
+(set R18 (select {from: (select {from: Pmix where: (> v 10)}) where: (< v 50)}))
+(count R18) -- 3
+(sum (at R18 'v)) -- 90
+
+;; ════════════════════════════════════════════════════════════════════
+;; Teardown
+;; ════════════════════════════════════════════════════════════════════
+(.sys.exec "rm -rf /tmp/rfl_fc_i64 /tmp/rfl_fc_sym /tmp/rfl_fc_str /tmp/rfl_fc_f64 /tmp/rfl_fc_mix /tmp/rfl_fc_multi /tmp/rfl_fc_big")

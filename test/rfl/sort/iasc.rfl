@@ -20,3 +20,13 @@
 
 ;; negatives
 (iasc [-1 -3 -2]) -- [1 2 0]
+
+;; ─── edge cases: empty / all-equal / atoms ──────────────────────────
+;; empty vec → empty index vec
+(iasc (as 'I64 (list))) -- (as 'I64 (list))
+;; all-equal: stable sort returns input order (0..n-1)
+(iasc [7 7 7 7]) -- [0 1 2 3]
+(iasc (as 'F64 [3.14 3.14 3.14])) -- [0 1 2]
+;; single-element
+(iasc [42]) -- [0]
+(iasc [3.14]) -- [0]

@@ -79,3 +79,7 @@
 (nil? (at (abs Va) 0)) -- true
 (at (abs Va) 1)        -- 5
 (at (abs Va) 2)        -- 5
+
+;; type errors — non-numeric input
+(abs "abc") !- type
+(abs 'foo)  !- type

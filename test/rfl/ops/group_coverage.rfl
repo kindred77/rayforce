@@ -681,6 +681,9 @@
 (sum (at (select {s: (sum v) from: Pmc by: date}) 's)) -- 499500
 ;; AVG/STDDEV with MAPCOMMON key
 (count (select {av: (avg v) from: Pmc by: date})) -- 2
+;; WHERE + GROUP BY MAPCOMMON: sel_compact must preserve MAPCOMMON column
+(count (select {s: (sum v) from: Pmc where: (> v 250) by: date})) -- 2
+(sum (at (select {s: (sum v) from: Pmc where: (> v 250) by: date}) 's)) -- 468125
 (.sys.exec "rm -rf /tmp/grp_cov_mc")
 
 ;; ────────────── 67. exec_group_parted: SYM key cardinality estimation ──────────────

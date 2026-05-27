@@ -27,3 +27,7 @@
 (set X 1.7)
 (>= (round X) (floor X)) -- true
 (<= (round X) (ceil X))  -- true
+
+;; type errors — non-numeric input
+(round "abc") !- type
+(round 'foo)  !- type

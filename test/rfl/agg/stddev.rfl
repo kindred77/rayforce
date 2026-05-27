@@ -5,3 +5,8 @@
 ;; non-negative
 (set V (rand 100 1000))
 1 -- (as 'I64 (>= (stddev V) 0.0))
+
+;; ---- RAY_IS_ERR propagation: stddev(erroring arg) ----
+(stddev (* "bad" 5))    !- type
+(stddev (- 'a 1))       !- type
+(stddev (sqrt 'foo))    !- type

@@ -43,3 +43,37 @@
 (< 'foobar 'foo) -- false
 (< ['a 'b 'c] 'b) -- [true false false]
 (< ['a 'b] ['b 'a]) -- [true false]
+
+;; type errors — cross-type compare not numeric/temporal/sym/str
+(< 'foo 1) !- type
+(< 1 'foo) !- type
+
+;; ---- RAY_IS_ERR propagation: < with erroring arg on either side ----
+(< (sqrt 'foo) 5)  !- type
+(< 5 (sqrt 'foo))  !- type
+(< (- 'a 1) 5)     !- type
+
+;; ──────────────────────────────────────────────────────────────────
+;; GUID lex ordering (memcmp16 path)
+;; ──────────────────────────────────────────────────────────────────
+(set Gs (take (guid 2) 2))
+;; reflexivity for guid: (< g g) = false
+(< (at Gs 0) (at Gs 0)) -- false
+;; either (<G0 G1) or (<G1 G0) — anti-symmetric
+(set R (or (< (at Gs 0) (at Gs 1)) (< (at Gs 1) (at Gs 0))))
+R -- true
+
+;; ──────────────────────────────────────────────────────────────────
+;; Cross-temporal ordering via temporal_as_ns conversion
+;; ──────────────────────────────────────────────────────────────────
+(< (as 'DATE 7305) (as 'DATE 7306))     -- true
+(< (as 'TIME 1000) (as 'TIME 2000))     -- true
+(< (as 'TIMESTAMP 100) (as 'TIMESTAMP 200)) -- true
+
+;; ──────────────────────────────────────────────────────────────────
+;; Mixed-width numeric ordering
+;; ──────────────────────────────────────────────────────────────────
+(< (as 'I16 100) (as 'I64 200)) -- true
+(< (as 'I32 100) (as 'F64 200.0)) -- true
+(< (as 'U8 5) (as 'I32 200)) -- true
+(< (as 'BOOL false) (as 'I16 5)) -- true

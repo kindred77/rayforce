@@ -1,0 +1,410 @@
+;; Branch-coverage extension for src/ops/tblop.c — targets the 59 uncovered
+;; branches at 67.44% baseline.
+;;
+;; Strategy: exercise the generic-fallback pivot path (lines 151-518) which
+;; requires a lambda agg-fn (dag_ok=false because pivot_fn_to_agg_op
+;; returns 0).  STR-column pivots currently hit "nyi" in the GROUP BY DAG
+;; path, so we test those as expected errors and focus on non-STR generic
+;; fallback paths for correctness.
+;;
+;; Reachable branches targeted:
+;;   L85   — ray_is_vec(index_arg) true (SYM vec index arg, lambda agg)
+;;   L87   — len > 16 index columns guard
+;;   L124  — STR index column forces dag_ok=false (tested via !- nyi)
+;;   L253  — gid_cap while-loop for large n_grps
+;;   L265  — hash collision during grouped-HT insert
+;;   L289  — atom_eq mismatch in index-column probe
+;;   L297  — atom_eq mismatch in pivot-column probe
+;;   L478  — F64 agg result type detection in column naming
+;;   L493  — F64 pivot-value column naming (snprintf "%g")
+;;   L604  — alter set: missing 4th argument
+;;   L606  — alter set: idx eval returns error/NULL
+;;   L608  — alter set: val eval returns error/NULL
+;;   L682  — alter set: out-of-range scalar index
+;;   L744  — alter concat: val eval returns error
+;;   L758  — alter remove: idx eval returns error
+;;   L839  — del reserved binding
+;;
+;; OOM-only branches (unreachable from RFL without OOM injection):
+;;   L128, L134, L156, L164, L169, L174, L179, L183, L205, L255,
+;;   L270, L314, L323, L336, L344, L425, L597
+
+(.sys.exec "rm -rf /tmp/rfl_tblop_branch")
+
+;; ══════════════════════════════════════════════════════════════════
+;; Section 1: STR columns force dag_ok=false (L124) but the GROUP BY
+;;            DAG path does not support STR keys → "nyi" error.
+;;            These test the error propagation, not the happy path.
+;; ══════════════════════════════════════════════════════════════════
+
+;; STR index column → nyi in GROUP BY DAG.
+(set Tstr_idx (table [idx pv val] (list (list "alice" "alice" "bob" "bob") ['x 'y 'x 'y] [10 20 30 40])))
+(pivot Tstr_idx 'idx 'pv 'val sum) !- nyi
+
+;; STR pivot column → nyi in GROUP BY DAG.
+(set Tstr_pv (table [k pv val] (list ['A 'A 'B 'B] (list "x" "y" "x" "y") [10 20 30 40])))
+(pivot Tstr_pv 'k 'pv 'val sum) !- nyi
+
+;; STR value column with lambda agg — the generic fallback's
+;; list_to_typed_vec assumes numeric agg results (agg_type defaults
+;; to RAY_I64).  STR agg results (e.g. first of a STR subset) are
+;; coerced to integers.  This is a known limitation of the fallback
+;; path; STR values only work via the DAG fast path.
+;; (Documented: STR value column in generic fallback produces numeric coercion.)
+
+;; ══════════════════════════════════════════════════════════════════
+;; Section 2: larger table to trigger hash collisions (L253, L265,
+;;            L289, L297)
+;;            With many distinct (index, pivot) groups, the HT probing
+;;            code at lines 262-304 will encounter collisions.
+;; ══════════════════════════════════════════════════════════════════
+
+;; 50 distinct index values * 3 pivot values = 150 groups.
+;; Lambda agg forces generic fallback.  Hash collisions are inevitable
+;; with 150 groups in a cap-256 HT (>50% load factor).
+(set bigIdx (til 50))
+(set bigTblX (table [k c v] (list bigIdx (take ['x] 50) (take [1] 50))))
+(set bigTblY (table [k c v] (list bigIdx (take ['y] 50) (take [2] 50))))
+(set bigTblZ (table [k c v] (list bigIdx (take ['z] 50) (take [3] 50))))
+(set bigTbl (union-all (union-all bigTblX bigTblY) bigTblZ))
+(count bigTbl) -- 150
+(set Pbig (pivot bigTbl 'k 'c 'v (fn [xs] (sum xs))))
+(count Pbig) -- 50
+(sum (at Pbig 'x)) -- 50
+(sum (at Pbig 'y)) -- 100
+(sum (at Pbig 'z)) -- 150
+
+;; ══════════════════════════════════════════════════════════════════
+;; Section 3: F64 agg result → L478 (agg_type = RAY_F64)
+;;            When agg_fn returns an F64 scalar, the column-building
+;;            loop at L477-478 detects -RAY_F64 and sets agg_type.
+;; ══════════════════════════════════════════════════════════════════
+
+;; avg on I64 values returns F64 → agg_type = RAY_F64 at line 478.
+(set Tavg_fb (table [k c v] (list ['A 'A 'B 'B] ['x 'y 'x 'y] [3 4 5 6])))
+(set Pavg_fb (pivot Tavg_fb 'k 'c 'v (fn [xs] (avg xs))))
+(count Pavg_fb) -- 2
+(at (at Pavg_fb 'x) 0) -- 3.0
+(at (at Pavg_fb 'y) 0) -- 4.0
+(at (at Pavg_fb 'x) 1) -- 5.0
+(at (at Pavg_fb 'y) 1) -- 6.0
+
+;; ══════════════════════════════════════════════════════════════════
+;; Section 4: F64 pivot column with lambda agg → L493 (snprintf "%g")
+;;            The column-naming code at L492-495 enters the -RAY_F64
+;;            branch when pivot values are F64 atoms.
+;; ══════════════════════════════════════════════════════════════════
+
+(set Tf64pv_fb (table [k c v] (list ['A 'A 'B 'B] [1.5 2.5 1.5 2.5] [10 20 30 40])))
+(set Pf64pv_fb (pivot Tf64pv_fb 'k 'c 'v (fn [xs] (sum xs))))
+(count Pf64pv_fb) -- 2
+;; Column names are "1.5" and "2.5" (snprintf of the F64 pivot values).
+(at (at Pf64pv_fb '1.5) 0) -- 10
+(at (at Pf64pv_fb '2.5) 0) -- 20
+(at (at Pf64pv_fb '1.5) 1) -- 30
+(at (at Pf64pv_fb '2.5) 1) -- 40
+
+;; ══════════════════════════════════════════════════════════════════
+;; Section 5: I64 pivot column with lambda agg → L489-491
+;;            The -RAY_I64 branch in column naming.
+;; ══════════════════════════════════════════════════════════════════
+
+(set Ti64pv_fb (table [k c v] (list ['A 'A 'B 'B] [100 200 100 200] [10 20 30 40])))
+(set Pi64pv_fb (pivot Ti64pv_fb 'k 'c 'v (fn [xs] (sum xs))))
+(count Pi64pv_fb) -- 2
+(count (key Pi64pv_fb)) -- 3
+
+;; ══════════════════════════════════════════════════════════════════
+;; Section 6: BOOL pivot column with lambda agg → L496-497
+;;            The -RAY_BOOL branch in column naming.
+;; ══════════════════════════════════════════════════════════════════
+
+(set Tboolpv_fb (table [k c v] (list ['A 'A 'B 'B] [true false true false] [10 20 30 40])))
+(set Pboolpv_fb (pivot Tboolpv_fb 'k 'c 'v (fn [xs] (sum xs))))
+(count Pboolpv_fb) -- 2
+(at (at Pboolpv_fb 'true) 0) -- 10
+(at (at Pboolpv_fb 'false) 0) -- 20
+(at (at Pboolpv_fb 'true) 1) -- 30
+(at (at Pboolpv_fb 'false) 1) -- 40
+
+;; ══════════════════════════════════════════════════════════════════
+;; Section 7: Generic fallback with multi-key SYM vec index (L85)
+;;            Uses a symbol vector ['a 'b] as index_arg, which enters
+;;            the ray_is_vec(index_arg) branch at line 85 since SYM
+;;            vecs have type RAY_SYM (not RAY_LIST).  Lambda agg
+;;            forces generic fallback.
+;; ══════════════════════════════════════════════════════════════════
+
+(set Tmk_fb (table [a b c v] (list ['X 'X 'Y 'Y] [1 2 1 2] ['p 'q 'p 'q] [10 20 30 40])))
+(set Pmk_fb (pivot Tmk_fb ['a 'b] 'c 'v (fn [xs] (sum xs))))
+(count Pmk_fb) -- 4
+(at (at Pmk_fb 'p) 0) -- 10
+(at (at Pmk_fb 'q) 1) -- 20
+
+;; ══════════════════════════════════════════════════════════════════
+;; Section 8: pivot with >16 index columns → L87 ("too many index
+;;            columns" error)
+;; ══════════════════════════════════════════════════════════════════
+
+;; The pivot limit is 16 index columns.  We test via a list (not vec)
+;; of 17 symbols as the index arg.  Any table with 17+ named columns
+;; would work; the error fires during index-arg parsing before the
+;; table is examined.
+(set T17 (table [a b c pv val] (list [1] [1] [1] ['x] [42])))
+(pivot T17 (list 'a 'b 'c 'a 'b 'c 'a 'b 'c 'a 'b 'c 'a 'b 'c 'a 'b) 'pv 'val sum) !- limit
+
+;; ══════════════════════════════════════════════════════════════════
+;; Section 9: Larger pivot to exercise HT probe walks past non-matching
+;;            slots (L289, L297)
+;;            When multiple (index, pivot) groups hash to the same
+;;            bucket, the probe loop checks atom_eq for both index
+;;            columns (L289) and pivot column (L297).
+;; ══════════════════════════════════════════════════════════════════
+
+;; 40 distinct index values * 4 pivot values = 160 groups.
+;; 160 groups in cap-256 HT → 62.5% load → many collisions.
+(set TcollIdx (til 40))
+(set TcollA (table [k c v] (list TcollIdx (take ['a] 40) (take [1] 40))))
+(set TcollB (table [k c v] (list TcollIdx (take ['b] 40) (take [2] 40))))
+(set TcollC (table [k c v] (list TcollIdx (take ['c] 40) (take [3] 40))))
+(set TcollD (table [k c v] (list TcollIdx (take ['d] 40) (take [4] 40))))
+(set Tcoll (union-all (union-all TcollA TcollB) (union-all TcollC TcollD)))
+(count Tcoll) -- 160
+(set Pcoll (pivot Tcoll 'k 'c 'v (fn [xs] (sum xs))))
+(count Pcoll) -- 40
+(sum (at Pcoll 'a)) -- 40
+(sum (at Pcoll 'b)) -- 80
+(sum (at Pcoll 'c)) -- 120
+(sum (at Pcoll 'd)) -- 160
+
+;; ══════════════════════════════════════════════════════════════════
+;; Section 10: Generic fallback with F64 index column
+;;             F64 index columns trigger the F64 hash path in the
+;;             FB_ROW_HASH macro and the atom_eq comparison path.
+;; ══════════════════════════════════════════════════════════════════
+
+(set Tf64idx_fb (table [k c v] (list [1.1 1.1 2.2 2.2] ['x 'y 'x 'y] [10 20 30 40])))
+(set Pf64idx_fb (pivot Tf64idx_fb 'k 'c 'v (fn [xs] (sum xs))))
+(count Pf64idx_fb) -- 2
+(at (at Pf64idx_fb 'x) 0) -- 10
+(at (at Pf64idx_fb 'y) 1) -- 40
+
+;; ══════════════════════════════════════════════════════════════════
+;; Section 11: Generic fallback — lazy agg result materialization
+;;             When the lambda returns a lazy value (e.g. from sum on
+;;             a lazy chain), line 370-371 materializes it.
+;; ══════════════════════════════════════════════════════════════════
+
+(set Tlazy (table [k c v] (list ['A 'A 'B 'B 'C 'C] ['x 'y 'x 'y 'x 'y] [1 2 3 4 5 6])))
+(set Plazy (pivot Tlazy 'k 'c 'v (fn [xs] (sum xs))))
+(count Plazy) -- 3
+(at (at Plazy 'x) 0) -- 1
+(at (at Plazy 'y) 2) -- 6
+
+;; ══════════════════════════════════════════════════════════════════
+;; Section 12: alter — first arg evals to error (L586)
+;;             ray_eval(args[0]) returns error → propagate.
+;; ══════════════════════════════════════════════════════════════════
+
+;; (alter <expr-that-errors> set 0 99) — args[0] is (at 42 0), which
+;; evaluates to an error because 42 is not a collection.
+(alter (at 42 0) set 0 99) !- type
+
+;; ══════════════════════════════════════════════════════════════════
+;; Section 12b: alter set — missing 4th arg (L604)
+;;              (alter 'v set idx) with no value arg.
+;; ══════════════════════════════════════════════════════════════════
+
+(set v_alt [1 2 3])
+(alter 'v_alt set 0) !- domain
+
+;; ══════════════════════════════════════════════════════════════════
+;; Section 13: alter set — idx eval returns error (L606)
+;;             When args[2] evaluates to an error, the error propagates.
+;; ══════════════════════════════════════════════════════════════════
+
+(set v_alt2 [1 2 3])
+(alter 'v_alt2 set no_such_var 99) !- name
+
+;; ══════════════════════════════════════════════════════════════════
+;; Section 14: alter set — val eval returns error (L607-608)
+;;             When args[3] evaluates to an error.
+;; ══════════════════════════════════════════════════════════════════
+
+(set v_alt3 [1 2 3])
+(alter 'v_alt3 set 0 no_such_val_var) !- name
+
+;; ══════════════════════════════════════════════════════════════════
+;; Section 15: alter set — out-of-range scalar index (L682-686)
+;;             Scalar index beyond vec bounds → "index" error.
+;; ══════════════════════════════════════════════════════════════════
+
+(set v_oob [1 2 3])
+(alter 'v_oob set 99 42) !- index
+(alter 'v_oob set -1 42) !- index
+
+;; ══════════════════════════════════════════════════════════════════
+;; Section 16: alter concat — val eval returns error (L744)
+;; ══════════════════════════════════════════════════════════════════
+
+(set v_cat [1 2 3])
+(alter 'v_cat concat no_such_var) !- name
+
+;; ══════════════════════════════════════════════════════════════════
+;; Section 17: alter remove — idx eval returns error (L758)
+;; ══════════════════════════════════════════════════════════════════
+
+(set L_rm (list 1 2 3))
+(alter 'L_rm remove no_such_var) !- name
+
+;; ══════════════════════════════════════════════════════════════════
+;; Section 18: del reserved binding → "reserve" error (L839-841)
+;; ══════════════════════════════════════════════════════════════════
+
+(del .sys.gc) !- reserve
+
+;; ══════════════════════════════════════════════════════════════════
+;; Section 19: pivot with SYM vec index + lambda → multi-key fallback
+;;             Two index columns via SYM vec: exercises L85 (ray_is_vec)
+;;             plus the multi-key generic fallback.
+;; ══════════════════════════════════════════════════════════════════
+
+(set Tmk2 (table [a n c v] (list ['X 'X 'X 'X 'Y 'Y 'Y 'Y] [1 1 2 2 1 1 2 2] ['p 'q 'p 'q 'p 'q 'p 'q] [10 20 30 40 50 60 70 80])))
+(set Pmk2 (pivot Tmk2 ['a 'n] 'c 'v (fn [xs] (sum xs))))
+(count Pmk2) -- 4
+(at (at Pmk2 'p) 0) -- 10
+(at (at Pmk2 'q) 3) -- 80
+
+;; ══════════════════════════════════════════════════════════════════
+;; Section 20: pivot — "col%ld" fallback column naming (L498-500)
+;;             When pivot column values have a type that doesn't match
+;;             SYM/I64/F64/BOOL, the fallback formats "col%ld".
+;;             U8 pivot values in the generic fallback (lambda agg).
+;; ══════════════════════════════════════════════════════════════════
+
+(set Tu8fb (table [k c v] (list ['A 'A 'B 'B] [0x01 0x02 0x01 0x02] [10 20 30 40])))
+(set Pu8fb (pivot Tu8fb 'k 'c 'v (fn [xs] (sum xs))))
+(count Pu8fb) -- 2
+(count (key Pu8fb)) -- 3
+
+;; ══════════════════════════════════════════════════════════════════
+;; Section 21: modify — fn that returns error (call_fn1 RAY_IS_ERR)
+;;             Exercises the modify path where call_fn1 returns an
+;;             error (line 543 check).
+;; ══════════════════════════════════════════════════════════════════
+
+(set Tmod (table [a b] (list [1 2 3] [10 20 30])))
+(modify Tmod 'a (fn [x] (+ x no_such_var))) !- name
+
+;; ══════════════════════════════════════════════════════════════════
+;; Section 22: union-all — happy path concatenation (sanity)
+;; ══════════════════════════════════════════════════════════════════
+
+(set Tua1 (table [a b] (list [1 2] [10 20])))
+(set Tua2 (table [a b] (list [3 4] [30 40])))
+(set Tunion (union-all Tua1 Tua2))
+(count Tunion) -- 4
+(sum (at Tunion 'a)) -- 10
+(sum (at Tunion 'b)) -- 100
+
+;; ══════════════════════════════════════════════════════════════════
+;; Section 23: pivot — generic fallback + negative-zero F64 normalization
+;;             Line 493: `if (fv == 0.0 && signbit(fv)) fv = 0.0;`
+;;             ensures -0.0 pivot values are normalized to 0.0.
+;; ══════════════════════════════════════════════════════════════════
+
+(set Tnz (table [k c v] (list ['A 'A 'B 'B] (as 'F64 [0.0 -0.0 0.0 -0.0]) [1 2 3 4])))
+(set Pnz (pivot Tnz 'k 'c 'v (fn [xs] (sum xs))))
+(count Pnz) -- 2
+
+;; ══════════════════════════════════════════════════════════════════
+;; Section 24: pivot_fn_to_agg_op — all known builtins (lines 43-53)
+;;             Verify the DAG fast path for each known builtin.
+;; ══════════════════════════════════════════════════════════════════
+
+(set Tagg (table [k c v] (list ['A 'A 'B 'B] ['x 'y 'x 'y] [10 20 30 40])))
+
+(count (pivot Tagg 'k 'c 'v sum)) -- 2
+(count (pivot Tagg 'k 'c 'v avg)) -- 2
+(count (pivot Tagg 'k 'c 'v min)) -- 2
+(count (pivot Tagg 'k 'c 'v max)) -- 2
+(count (pivot Tagg 'k 'c 'v count)) -- 2
+(count (pivot Tagg 'k 'c 'v first)) -- 2
+(count (pivot Tagg 'k 'c 'v last)) -- 2
+;; non-builtin agg → pivot_fn_to_agg_op returns 0 → generic fallback
+(count (pivot Tagg 'k 'c 'v (fn [xs] (sum xs)))) -- 2
+
+;; ══════════════════════════════════════════════════════════════════
+;; Section 25: alter set — list with scalar idx (single element replace)
+;; ══════════════════════════════════════════════════════════════════
+
+(set Lset (list 'a 'b 'c 'd))
+(alter 'Lset set 2 'Z)
+Lset -- (list 'a 'b 'Z 'd)
+
+;; ══════════════════════════════════════════════════════════════════
+;; Section 26: Generic fallback — many groups > 256 to exercise
+;;             gid_cap while-loop resize (L253)
+;; ══════════════════════════════════════════════════════════════════
+
+;; 200 index values * 2 pivot values = 400 groups.
+;; gid_cap starts at 256, needs to grow to 1024 (400*2=800 > 256).
+(set bigIdx2 (til 200))
+(set bigT2X (table [k c v] (list bigIdx2 (take ['p] 200) (take [1] 200))))
+(set bigT2Y (table [k c v] (list bigIdx2 (take ['q] 200) (take [2] 200))))
+(set bigT2 (union-all bigT2X bigT2Y))
+(count bigT2) -- 400
+(set Pbig2 (pivot bigT2 'k 'c 'v (fn [xs] (sum xs))))
+(count Pbig2) -- 200
+(sum (at Pbig2 'p)) -- 200
+(sum (at Pbig2 'q)) -- 400
+
+;; ══════════════════════════════════════════════════════════════════
+;; Section 27: Generic fallback with multiple duplicate rows
+;;             Exercises counting-sort path (L329-354) and the
+;;             gather_by_idx + call_fn1 loop (L357-378).
+;; ══════════════════════════════════════════════════════════════════
+
+;; Same (index, pivot) group appears 3 times → subset has 3 elements.
+(set Tdup (table [k c v] (list ['A 'A 'A 'B 'B 'B] ['x 'x 'x 'y 'y 'y] [1 2 3 4 5 6])))
+(set Pdup (pivot Tdup 'k 'c 'v (fn [xs] (sum xs))))
+(count Pdup) -- 2
+(at (at Pdup 'x) 0) -- 6
+(at (at Pdup 'y) 1) -- 15
+
+;; ══════════════════════════════════════════════════════════════════
+;; Section 28: pivot with F64 value column in generic fallback
+;;             Ensures the F64 typed agg result propagates correctly.
+;; ══════════════════════════════════════════════════════════════════
+
+(set Tf64v (table [k c v] (list ['A 'A 'B 'B] ['x 'y 'x 'y] [1.5 2.5 3.5 4.5])))
+(set Pf64v (pivot Tf64v 'k 'c 'v (fn [xs] (sum xs))))
+(count Pf64v) -- 2
+(at (at Pf64v 'x) 0) -- 1.5
+(at (at Pf64v 'y) 1) -- 4.5
+
+;; ══════════════════════════════════════════════════════════════════
+;; Unreachable branches documentation (OOM guards, internal-only):
+;;
+;; L128  — ray_graph_new returns NULL (OOM in DAG fast path)
+;; L134  — ray_scan returns NULL for index col (OOM/internal)
+;; L156  — ray_graph_new returns NULL (OOM in generic fallback)
+;; L164  — ray_scan returns NULL for key col (OOM/internal)
+;; L169  — ray_scan returns NULL for pivot col (OOM/internal)
+;; L174  — ray_scan returns NULL for value col (OOM/internal)
+;; L179  — ray_group returns NULL (OOM)
+;; L183  — ray_execute returns NULL/error (internal DAG failure)
+;; L205  — ray_lazy_materialize fails (OOM)
+;; L255  — ray_alloc for gid_ht_hdr fails (OOM)
+;; L270  — ray_vec_new for gid_vec fails (OOM)
+;; L314  — ray_alloc for agg_results fails (OOM)
+;; L323  — ray_alloc for off_hdr fails (OOM)
+;; L336  — ray_alloc for sorted_hdr fails (OOM)
+;; L344  — ray_alloc for wcur_hdr fails (OOM)
+;; L425  — collection_elem returns non-allocated (requires LIST-typed
+;;          grouped columns; GROUP BY DAG always produces typed vecs)
+;; L597  — ray_sym_str returns NULL (requires an interned sym with no
+;;          string representation; impossible from user-facing RFL)
+;; ══════════════════════════════════════════════════════════════════
+
+(.sys.exec "rm -rf /tmp/rfl_tblop_branch")

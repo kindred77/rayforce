@@ -174,6 +174,27 @@
 (at (strlen (at Ppi 'tag)) 4) -- 2
 (at (strlen (at Ppi 'tag)) 5) -- 3
 
+;; ════════════════════════════════════════════════════════════════
+;; 6. Error-guard coverage: strlen on non-string MAPCOMMON / PARTED.
+;;
+;; • strlen_mapcommon line 92: keys vec is not RAY_STR/RAY_SYM
+;;   (date-shaped partition dirs → MAPCOMMON of DATE keys).
+;; • strlen_parted line 119: parted base type is not RAY_STR/RAY_SYM
+;;   (numeric data column under a parted root).
+;; ════════════════════════════════════════════════════════════════
+;; Reuse the rf_test_strlen_parted_sym fixture: its 'date column is a
+;; MAPCOMMON of DATE keys, and 'v is a parted I64 data column.
+(set PB-A (table [v] (list [10 20])))
+(set PB-B (table [v] (list [30])))
+(.db.splayed.set "rf_test_strlen_badtype/2024.01.01/t/" PB-A)
+(.db.splayed.set "rf_test_strlen_badtype/2024.01.02/t/" PB-B)
+(set Pb (.db.parted.get "rf_test_strlen_badtype/" 't))
+;; MAPCOMMON-DATE key column → strlen_mapcommon type guard (line 92).
+(strlen (at Pb 'date)) !- type
+;; PARTED I64 data column → strlen_parted type guard (line 119).
+(strlen (at Pb 'v))    !- type
+(.sys.exec "rm -rf rf_test_strlen_badtype")
+
 ;; ────────────── teardown ──────────────
 (.sys.exec "rm -rf rf_test_strlen_mc_sym rf_test_strlen_mc_long rf_test_strlen_parted_sym rf_test_strlen_parted_date rf_test_strlen_parted_int")
 

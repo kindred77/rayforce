@@ -9,3 +9,26 @@
 (set V (rand 101 10000))
 1 -- (as 'I64 (<= (as 'F64 (min V)) (med V)))
 1 -- (as 'I64 (<= (med V) (as 'F64 (max V))))
+
+;; ─── edge cases: empty / single / all-equal / two-element / atom ─────
+;; empty vec → typed-null F64 (line 499 in ray_med_fn)
+(nil? (med (as 'I64 (list)))) -- true
+(nil? (med (as 'F64 (list)))) -- true
+;; single-element vec → that element as F64
+(med [42]) -- 42.0
+(med [3.14]) -- 3.14
+;; two-element → mean
+(med [10 30]) -- 20.0
+(med [-5 5]) -- 0.0
+;; all-equal → that value
+(med [7 7 7 7]) -- 7.0
+(med [5.5 5.5 5.5]) -- 5.5
+;; negative numbers
+(med [-10 -20 -30]) -- -20.0
+;; F64 atom passes through
+(med 42.0) -- 42.0
+(med -2.5) -- -2.5
+;; numeric atom → coerced
+(med 7) -- 7.0
+;; null atom → typed-null F64
+(nil? (med 0Nf)) -- true

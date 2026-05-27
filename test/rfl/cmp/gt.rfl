@@ -59,3 +59,30 @@
 ;; 's' > 'l' so 'short > 'longer_…
 (> 'short 'longer_than_twelve_bytes_symbol) -- true
 (> 'longer_than_twelve_bytes_symbol 'short) -- false
+
+;; type errors — cross-type compare not numeric/temporal/sym/str
+(> 'foo 1) !- type
+(> 1 'foo) !- type
+
+;; ---- RAY_IS_ERR propagation: > with erroring arg on either side ----
+(> (sqrt 'foo) 5)  !- type
+(> 5 (sqrt 'foo))  !- type
+(> (round "x") 5)  !- type
+
+;; ──────────────────────────────────────────────────────────────────
+;; GUID lex ordering (memcmp16 path)
+;; ──────────────────────────────────────────────────────────────────
+(set Gs (take (guid 2) 2))
+(> (at Gs 0) (at Gs 0)) -- false
+(set R (or (> (at Gs 0) (at Gs 1)) (> (at Gs 1) (at Gs 0))))
+R -- true
+
+;; Cross-temporal ordering
+(> (as 'DATE 7306) (as 'DATE 7305)) -- true
+(> (as 'TIME 2000) (as 'TIME 1000)) -- true
+(> (as 'TIMESTAMP 200) (as 'TIMESTAMP 100)) -- true
+
+;; Mixed-width
+(> (as 'I32 200) (as 'I16 100)) -- true
+(> (as 'F64 200.0) (as 'I32 100)) -- true
+(> (as 'I64 200) (as 'U8 5)) -- true

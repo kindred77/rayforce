@@ -80,3 +80,41 @@
 ;; ── Arity — binary verb (pre-fix: extras silently dropped) ──
 (* 2 3 4)       !- arity
 (* 2 3 4 5)     !- arity
+
+;; ---- RAY_IS_ERR propagation: * with erroring arg on either side ----
+(* (sqrt 'foo) 5)   !- type
+(* 5 (sqrt 'foo))   !- type
+(* (round "x") 5)   !- type
+(* (- 'a 1) 5)      !- type
+
+;; ──────────────────────────────────────────────────────────────────
+;; Mixed-width / temporal type-pair coverage
+;; ──────────────────────────────────────────────────────────────────
+
+;; I16 * I32 → I32
+(* (as 'I16 3) (as 'I32 4)) -- 12
+(type (* (as 'I16 3) (as 'I32 4))) -- 'i32
+
+;; I32 * F64 → F64
+(* (as 'I32 3) 2.5) -- 7.5
+(type (* (as 'I32 3) 2.5)) -- 'f64
+
+;; U8 * I64 → I64
+(* (as 'U8 3) (as 'I64 4)) -- 12
+
+;; BOOL * I64 → I64
+(* (as 'BOOL true) (as 'I64 5)) -- 5
+
+;; int * TIME → TIME and TIME * int → TIME
+(* 3 (as 'TIME 1000)) -- 00:00:03.000
+(type (* 3 (as 'TIME 1000))) -- 'time
+(* (as 'TIME 1000) 3) -- 00:00:03.000
+(type (* (as 'TIME 1000) 3)) -- 'time
+
+;; null-int * TIME → null TIME (line 174 path)
+(nil? (* 0Ni (as 'TIME 1000))) -- true
+(type (* 0Ni (as 'TIME 1000))) -- 'time
+
+;; TIME * null-int → null TIME
+(nil? (* (as 'TIME 1000) 0Ni)) -- true
+(type (* (as 'TIME 1000) 0Ni)) -- 'time

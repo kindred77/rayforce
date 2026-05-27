@@ -1,0 +1,1195 @@
+;; Branch coverage for src/ops/builtins.c
+;;
+;; Targets uncovered branches at lines:
+;;   68-74   null_literal_str  — F32/F64/DATE/TIME/TIMESTAMP/SYM/default
+;;   80,83-85 ray_lang_print  — error/null/lazy guards
+;;   94      ray_lang_print   — signbit(-0.0)
+;;  126      ray_lang_print   — UNARY/BINARY/VARY
+;;  142      ray_lang_print   — ray_fmt fail fallback
+;; 161-222  fmt_interpolate   — per-type branches in format
+;; 233-253  ray_println_fn    — format-string mode / multi-arg
+;; 310-327  ray_format_fn     — error/no-placeholder
+;; 1184-1706 ray_cast_fn      — null propagation, atom casts, vec casts
+;; 1830-1938 ray_enlist_fn    — homogeneous/mixed/promote paths
+;; 1945-1976 ray_dict_fn      — dict creation from keys/vals
+;; 1979-1983 ray_nil_fn       — null checks
+;; 1986-2001 ray_where_fn     — bool vec filter
+;; 2222-2697 ray_group_fn     — LIST/GUID/STR/scalar paths
+;; 2700-3008 ray_concat_fn    — str/vec/list/dict/table/atom concat
+;; 3012-3068 ray_raze_fn      — flat/slow paths
+;; 3071-3100 ray_within_fn    — I64/F64/I32 within checks
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 1. null_literal_str — exercise each null-type label via println/format
+;;    Each typed null atom calls null_literal_str when printed/formatted.
+;; ═════════════════════════════════════════════════════════════════════
+
+;; F64 null (line 69) — format returns "0Nf"
+(format "%" 0Nf) -- "0Nf"
+
+;; DATE null (line 70)
+(format "%" 0Nd) -- "0Nd"
+
+;; TIME null (line 71)
+(format "%" 0Nt) -- "0Nt"
+
+;; TIMESTAMP null (line 72)
+(format "%" 0Np) -- "0Np"
+
+;; SYM null (line 73) — 0Ns
+(format "%" 0Ns) -- "0Ns"
+
+;; I16 null (line 65) — 0Nh
+(format "%" 0Nh) -- "0Nh"
+
+;; I32 null (line 66)
+(format "%" 0Ni) -- "0Ni"
+
+;; I64 null (line 67)
+(format "%" 0Nl) -- "0Nl"
+
+;; default null (line 74) — null_literal_str returns "null" for types
+;; not in the switch (BOOL, U8, GUID, etc.)
+;; The all-zeros GUID is the null GUID, and GUID isn't in the switch,
+;; so it triggers the default branch.
+;; Exercise this via println/format of the null GUID atom:
+(format "%" (as 'GUID "00000000-0000-0000-0000-000000000000")) -- "null"
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 2. ray_lang_print branches — println drives the switch
+;; ═════════════════════════════════════════════════════════════════════
+
+;; signbit(-0.0) normalisation (line 94): clear_neg_zero via memcpy
+(format "%" (neg 0.0)) -- "0"
+
+;; -RAY_BOOL false path (line 98 ternary)
+(format "%" false) -- "false"
+
+;; -RAY_BOOL true path
+(format "%" true) -- "true"
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 3. fmt_interpolate — per-type branches in "format" / println
+;;    Lines 166-224: each type arg hits a different branch.
+;; ═════════════════════════════════════════════════════════════════════
+
+;; I64 branch (line 176-177)
+(format "val=%" 42) -- "val=42"
+
+;; F64 branch (lines 178-181), includes -0.0 signbit guard
+(format "val=%" 3.14) -- "val=3.14"
+(format "neg=%" (neg 0.0)) -- "neg=0"
+
+;; BOOL branch (lines 182-183)
+(format "b=%" true) -- "b=true"
+(format "b=%" false) -- "b=false"
+
+;; STR branch (lines 184-190) — string arg inlined into output
+(format "s=%" "hello") -- "s=hello"
+
+;; SYM branch (lines 191-200) — symbol arg resolved to name
+(format "sym=%" 'mySymbol) -- "sym=mySymbol"
+
+;; typed null arg (lines 174-175) — triggers null_literal_str inside format
+(format "n=%" 0Nl) -- "n=0Nl"
+(format "n=%" 0Nf) -- "n=0Nf"
+(format "n=%" 0Nd) -- "n=0Nd"
+(format "n=%" 0Nt) -- "n=0Nt"
+(format "n=%" 0Np) -- "n=0Np"
+(format "n=%" 0Ns) -- "n=0Ns"
+(format "n=%" 0Nh) -- "n=0Nh"
+(format "n=%" 0Ni) -- "n=0Ni"
+
+;; ray_fmt fallback (lines 203-213) — i32 atom, vec, dict
+(format "i32=%" 5i) -- "i32=5"
+(format "v=%" [1 2 3]) -- "v=[1 2 3]"
+(format "d=%" (dict [a b] (list 1 2))) -- "d={a:1 b:2}"
+
+;; Multiple substitutions in one format string
+(format "%+%=%" 1 2 3) -- "1+2=3"
+
+;; More args than placeholders — extras ignored
+(format "x=%" 1 2 3) -- "x=1"
+
+;; No placeholder in format string (lines 155-156) — returns as-is
+(format "no-placeholder" 1 2) -- "no-placeholder"
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 4. ray_format_fn — error paths (lines 310-327)
+;; ═════════════════════════════════════════════════════════════════════
+
+;; Zero args → domain error (line 311)
+(format) !- domain
+
+;; Non-string first arg → type error (line 314)
+(format 42 "x") !- type
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 5. ray_cast_fn — null propagation (lines 1186-1208)
+;;    Casting typed null atoms to various target types.
+;; ═════════════════════════════════════════════════════════════════════
+
+;; null → I64
+(nil? (as 'I64 0Nl)) -- true
+(nil? (as 'I64 0Nf)) -- true
+
+;; null → I32
+(nil? (as 'I32 0Ni)) -- true
+(nil? (as 'I32 0Nl)) -- true
+
+;; null → I16
+(nil? (as 'I16 0Nh)) -- true
+
+;; null → U8 — produces null U8 sentinel
+(nil? (as 'U8 0Nl)) -- true
+
+;; null → F64
+(nil? (as 'F64 0Nf)) -- true
+(nil? (as 'F64 0Nl)) -- true
+
+;; null → BOOL — produces null BOOL sentinel
+(nil? (as 'BOOL 0Nl)) -- true
+
+;; null → SYMBOL
+(nil? (as 'SYMBOL 0Ns)) -- true
+
+;; null → DATE
+(nil? (as 'DATE 0Nd)) -- true
+
+;; null → TIME
+(nil? (as 'TIME 0Nt)) -- true
+
+;; null → TIMESTAMP
+(nil? (as 'TIMESTAMP 0Np)) -- true
+
+;; null → GUID
+(nil? (as 'GUID 0Nl)) -- true
+
+;; null → STR — returns empty string
+(as 'STR 0Nl) -- ""
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 6. ray_cast_fn — atom casts (lines 1215-1706)
+;;    Systematically hit each input-type branch for each output type.
+;; ═════════════════════════════════════════════════════════════════════
+
+;; --- Cast to I64 ---
+(as 'I64 42)    -- 42       ;; already I64
+(as 'I64 3.14)  -- 3        ;; F64 → I64
+(as 'I64 true)  -- 1        ;; BOOL → I64
+(as 'I64 false) -- 0        ;; BOOL → I64 (false branch)
+(as 'I64 5i)    -- 5        ;; I32 → I64
+(as 'I64 5h)    -- 5        ;; I16 → I64
+(as 'I64 "123") -- 123      ;; STR → I64
+
+;; --- Cast to I32 ---
+(as 'I32 5i)    -- 5i       ;; already I32
+(as 'I32 true)  -- 1i       ;; BOOL → I32
+(as 'I32 42)    -- 42i      ;; I64 → I32
+(as 'I32 3.14)  -- 3i       ;; F64 → I32
+(as 'I32 5h)    -- 5i       ;; I16 → I32
+(as 'I32 "99")  -- 99i      ;; STR → I32
+
+;; --- Cast to I16 ---
+(as 'I16 5h)    -- 5h       ;; already I16
+(as 'I16 true)  -- 1h       ;; BOOL → I16
+(as 'I16 42)    -- 42h      ;; I64 → I16
+(as 'I16 42i)   -- 42h      ;; I32 → I16
+(as 'I16 3.14)  -- 3h       ;; F64 → I16
+(as 'I16 "10")  -- 10h      ;; STR → I16
+
+;; --- Cast to F64 ---
+(as 'F64 1.5)   -- 1.5      ;; already F64
+(as 'F64 true)  -- 1.0      ;; BOOL → F64
+(as 'F64 false) -- 0.0      ;; BOOL → F64 (false branch)
+(as 'F64 42)    -- 42.0     ;; I64 → F64
+(as 'F64 5i)    -- 5.0      ;; I32 → F64
+(as 'F64 5h)    -- 5.0      ;; I16 → F64
+(as 'F64 "2.5") -- 2.5      ;; STR → F64
+
+;; --- Cast to BOOL ---
+(as 'BOOL true)  -- true    ;; already BOOL
+(as 'BOOL 1)     -- true    ;; I64 → BOOL
+(as 'BOOL 0)     -- false   ;; I64 → BOOL (zero)
+(as 'BOOL 1i)    -- true    ;; I32 → BOOL
+(as 'BOOL 0i)    -- false   ;; I32 → BOOL (zero)
+(as 'BOOL 1h)    -- true    ;; I16 → BOOL
+(as 'BOOL 0h)    -- false   ;; I16 → BOOL (zero)
+(as 'BOOL 1.0)   -- true    ;; F64 → BOOL
+(as 'BOOL 0.0)   -- false   ;; F64 → BOOL (zero)
+(as 'BOOL "hi")  -- true    ;; STR → BOOL (non-empty)
+(nil? (as 'BOOL ""))  -- true   ;; STR → BOOL (empty → null bool)
+
+;; --- Cast to STR ---
+(as 'STR "hi")   -- "hi"    ;; already STR
+(as 'STR 42)     -- "42"    ;; I64 → STR
+(as 'STR 5i)     -- "5"     ;; I32 → STR
+(as 'STR 5h)     -- "5"     ;; I16 → STR
+(as 'STR 3.14)   -- "3.14"  ;; F64 → STR
+(as 'STR true)   -- "true"  ;; BOOL → STR
+(as 'STR false)  -- "false" ;; BOOL → STR
+(as 'STR 'foo)   -- "foo"   ;; SYM → STR
+
+;; --- Cast to SYMBOL ---
+(as 'SYMBOL 'foo) -- 'foo    ;; already SYM
+(as 'SYMBOL "bar") -- 'bar   ;; STR → SYM
+
+;; Integer/bool/numeric atom → SYM (lines 1394-1409)
+(type (as 'SYMBOL 42)) -- 'sym
+(type (as 'SYMBOL true)) -- 'sym
+(type (as 'SYMBOL 3.14)) -- 'sym
+(type (as 'SYMBOL 5i)) -- 'sym
+(type (as 'SYMBOL 5h)) -- 'sym
+
+;; --- Cast to DATE ---
+(type (as 'DATE 0)) -- 'date           ;; I64 → DATE
+(type (as 'DATE 0i)) -- 'date          ;; I32 → DATE
+(type (as 'DATE 0h)) -- 'date          ;; I16 → DATE
+(type (as 'DATE 0.0)) -- 'date         ;; F64 → DATE
+(type (as 'DATE true)) -- 'date        ;; BOOL → DATE
+(type (as 'DATE "2024.01.15")) -- 'date ;; STR → DATE
+
+;; --- Cast to TIME ---
+(type (as 'TIME 0)) -- 'time           ;; I64 → TIME
+(type (as 'TIME 0i)) -- 'time          ;; I32 → TIME
+(type (as 'TIME 0h)) -- 'time          ;; I16 → TIME
+(type (as 'TIME 0.0)) -- 'time         ;; F64 → TIME
+(type (as 'TIME true)) -- 'time        ;; BOOL → TIME
+(type (as 'TIME "12:30:45")) -- 'time   ;; STR → TIME with HH:MM:SS
+(type (as 'TIME "12:30:45.123")) -- 'time ;; STR → TIME with millis
+
+;; --- Cast to TIMESTAMP ---
+(type (as 'TIMESTAMP 0)) -- 'timestamp          ;; I64 → TS
+(type (as 'TIMESTAMP 0i)) -- 'timestamp         ;; I32 → TS
+(type (as 'TIMESTAMP 0h)) -- 'timestamp         ;; I16 → TS
+(type (as 'TIMESTAMP 0.0)) -- 'timestamp        ;; F64 → TS
+(type (as 'TIMESTAMP true)) -- 'timestamp       ;; BOOL → TS
+
+;; TIMESTAMP from DATE atom (line 1512-1515)
+(type (as 'TIMESTAMP (as 'DATE 100))) -- 'timestamp
+
+;; TIMESTAMP from TIME atom (line 1511)
+(type (as 'TIMESTAMP (as 'TIME 5000))) -- 'timestamp
+
+;; TIMESTAMP from STR: ISO format (lines 1517-1583)
+(type (as 'TIMESTAMP "2024-01-15T12:30:45.000000000")) -- 'timestamp
+
+;; TIMESTAMP STR with timezone +HH:MM (lines 1558-1579)
+(type (as 'TIMESTAMP "2024-01-15T12:30:45.000+05:30")) -- 'timestamp
+
+;; TIMESTAMP STR with timezone -HHMM (line 1576)
+(type (as 'TIMESTAMP "2024-01-15T12:30:45.000-0800")) -- 'timestamp
+
+;; TIMESTAMP STR with 'Z' UTC marker (line 1567)
+(type (as 'TIMESTAMP "2024-01-15T12:30:45.000Z")) -- 'timestamp
+
+;; TIMESTAMP STR with YYYY.MM.DD format (line 1527)
+(type (as 'TIMESTAMP "2024.01.15D12:30:45.000000000")) -- 'timestamp
+
+;; --- Cast to GUID ---
+(type (as 'GUID "01234567-89ab-cdef-0123-456789abcdef")) -- 'guid
+
+;; --- Cast to U8 ---
+(as 'U8 true)  -- 0x01     ;; BOOL → U8
+(as 'U8 42h)   -- 0x2a     ;; I16 → U8
+(as 'U8 42i)   -- 0x2a     ;; I32 → U8
+(as 'U8 42)    -- 0x2a     ;; I64 → U8
+(as 'U8 42.0)  -- 0x2a     ;; F64 → U8
+(as 'U8 "42")  -- 0x2a     ;; STR → U8
+
+;; --- Cast to DICT ---
+(type (as 'DICT (table [a b] (list [1 2] [3 4])))) -- 'DICT
+(as 'DICT (as 'DICT (dict [x] (list 1)))) -- (dict [x] (list 1))
+
+;; --- Cast to TABLE ---
+(type (as 'TABLE (dict [a b] (list [1 2] [3 4])))) -- 'TABLE
+(as 'TABLE (table [x] (list [1 2]))) -- (table [x] (list [1 2]))
+
+;; Unknown cast target → domain error (line 1705)
+(as 'BADTYPE 42) !- domain
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 7. Vector casts — cast_vec_numeric (lines 1103-1182)
+;;    Drive fast-path typed vec → numeric vec conversions.
+;; ═════════════════════════════════════════════════════════════════════
+
+;; I64 vec → F64 vec (fast path)
+(as 'F64 [1 2 3]) -- [1.0 2.0 3.0]
+
+;; F64 vec → I64 vec
+(as 'I64 [1.0 2.5 3.9]) -- [1 2 3]
+
+;; BOOL vec → I64 vec
+(as 'I64 [true false true]) -- [1 0 1]
+
+;; I64 vec → BOOL vec
+(as 'BOOL [0 1 2]) -- [false true true]
+
+;; F64 vec → BOOL vec
+(as 'BOOL [0.0 1.5 0.0]) -- [false true false]
+
+;; I64 vec → I32 vec
+(as 'I32 [1 2 3]) -- [1i 2i 3i]
+
+;; I32 vec → I64 vec
+(as 'I64 [1i 2i 3i]) -- [1 2 3]
+
+;; I64 vec → I16 vec
+(as 'I16 [1 2 3]) -- [1h 2h 3h]
+
+;; I16 vec → I64 vec
+(as 'I64 [1h 2h 3h]) -- [1 2 3]
+
+;; I64 vec → U8 vec
+(type (as 'U8 [1 2 3])) -- 'U8
+
+;; U8 vec → I64 vec
+(as 'I64 (as 'U8 [1 2 3])) -- [1 2 3]
+
+;; STR vec → SYMBOL vec (fast path, lines 1144-1156)
+(type (as 'SYMBOL ["foo" "bar" "baz"])) -- 'SYM
+
+;; BOOL vec → I32/I16/U8/F64 vec (various fast paths)
+(as 'I32 [true false]) -- [1i 0i]
+(as 'I16 [true false]) -- [1h 0h]
+(as 'F64 [true false]) -- [1.0 0.0]
+
+;; I16 vec → I32 vec
+(as 'I32 [1h 2h 3h]) -- [1i 2i 3i]
+
+;; I32 vec → I16 vec
+(as 'I16 [1i 2i 3i]) -- [1h 2h 3h]
+
+;; I16 vec → F64 vec
+(as 'F64 [1h 2h 3h]) -- [1.0 2.0 3.0]
+
+;; I32 vec → F64 vec
+(as 'F64 [1i 2i 3i]) -- [1.0 2.0 3.0]
+
+;; U8 vec → I32 vec
+(as 'I32 (as 'U8 [1 2 3])) -- [1i 2i 3i]
+
+;; U8 vec → F64 vec
+(as 'F64 (as 'U8 [1 2 3])) -- [1.0 2.0 3.0]
+
+;; U8 vec → I16 vec
+(as 'I16 (as 'U8 [1 2 3])) -- [1h 2h 3h]
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 8. Vector casts with nulls — cast_vec_copy_nulls (lines 748-805)
+;;    Null propagation from source vec to target.
+;; ═════════════════════════════════════════════════════════════════════
+
+;; I64 vec with null → F64 (null propagates as NaN/0Nf)
+(nil? (at (as 'F64 [1 0Nl 3]) 1)) -- true
+
+;; I64 vec with null → I32 (null propagates)
+(nil? (at (as 'I32 [1 0Nl 3]) 1)) -- true
+
+;; I64 vec with null → I16 (null propagates)
+(nil? (at (as 'I16 [1 0Nl 3]) 1)) -- true
+
+;; I64 vec with null → BOOL (BOOL non-nullable, line 753)
+;; BOOL/U8 destinations: null sentinel != 0, so cast produces non-zero → true.
+;; The key coverage point is hitting the BOOL/U8 return path in cast_vec_copy_nulls.
+(count (as 'BOOL [1 0Nl 3])) -- 3
+
+;; I64 vec with null → U8 (U8 non-nullable, line 753)
+(count (as 'U8 [1 0Nl 3])) -- 3
+
+;; LIST with null elements → I64 vec (LIST branch, lines 758-765)
+(nil? (at (as 'I64 (list 1 0Nl 3)) 1)) -- true
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 9. Temporal casts — cross-unit conversions
+;; ═════════════════════════════════════════════════════════════════════
+
+;; DATE → TIMESTAMP (days * NS_PER_DAY, line 869-871)
+(type (as 'TIMESTAMP (as 'DATE [0 1 2]))) -- 'TIMESTAMP
+
+;; TIMESTAMP → DATE (floor-div, lines 873-877)
+(type (as 'DATE (as 'TIMESTAMP [0 86400000000000 172800000000000]))) -- 'DATE
+
+;; TIMESTAMP → TIME (floor-mod ns→ms, lines 879-883)
+(type (as 'TIME (as 'TIMESTAMP [0 3600000000000 7200000000000]))) -- 'TIME
+
+;; DATE atom ↔ TIMESTAMP atom (lines 1439, 1512-1515)
+(type (as 'DATE (as 'TIMESTAMP 86400000000000))) -- 'date
+(type (as 'TIMESTAMP (as 'DATE 1))) -- 'timestamp
+
+;; TIME atom from TIMESTAMP atom (line 1473-1478)
+(type (as 'TIME (as 'TIMESTAMP 3600000000000))) -- 'time
+
+;; DATE from TIME atom (line 1438)
+(type (as 'DATE (as 'TIME 1000))) -- 'date
+
+;; TIME from DATE atom (line 1472)
+(type (as 'TIME (as 'DATE 100))) -- 'time
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 10. ray_cast_fn — STR → I64/I32/F64 parse errors (domain)
+;; ═════════════════════════════════════════════════════════════════════
+
+(as 'I64 "not_a_number") !- domain
+(as 'I32 "abc") !- domain
+(as 'I16 "xyz") !- domain
+(as 'F64 "nope") !- domain
+(as 'U8 "zzz") !- domain
+(as 'DATE "bad-date") !- domain
+(as 'TIME "x") !- domain
+(as 'TIMESTAMP "too-short") !- domain
+
+;; type error: unsupported input type
+(as 'I64 (dict [a] (list 1))) !- type
+(as 'I32 (dict [a] (list 1))) !- type
+(as 'F64 (dict [a] (list 1))) !- type
+(as 'BOOL (dict [a] (list 1))) !- type
+(as 'I16 (dict [a] (list 1))) !- type
+(as 'U8 (dict [a] (list 1))) !- type
+
+;; Cast non-sym type_sym → type error (line 1185)
+;; Can't easily trigger from RFL since `as` wraps the first arg as sym.
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 11. STR vec cast — (as 'STR vec) (lines 1360-1381)
+;; ═════════════════════════════════════════════════════════════════════
+
+(as 'STR [1 2 3]) -- ["1" "2" "3"]
+(as 'STR [true false]) -- ["true" "false"]
+(as 'STR [1.5 2.5]) -- ["1.5" "2.5"]
+(as 'STR [1i 2i]) -- ["1" "2"]
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 12. SYMBOL vec cast — (as 'SYMBOL vec) (lines 1424-1426)
+;; ═════════════════════════════════════════════════════════════════════
+
+(type (as 'SYMBOL [1 2 3])) -- 'SYM
+(type (as 'SYMBOL (list "a" "b" "c"))) -- 'SYM
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 13. ray_enlist_fn — homogeneous/mixed/promote (lines 1830-1938)
+;; ═════════════════════════════════════════════════════════════════════
+
+;; Empty enlist (line 1831)
+(count (enlist)) -- 0
+
+;; Homogeneous I64
+(enlist 1 2 3) -- [1 2 3]
+
+;; Homogeneous F64
+(enlist 1.0 2.0 3.0) -- [1.0 2.0 3.0]
+
+;; Mixed int/float → promote to F64 (lines 1843-1859)
+(type (enlist 1 2.0 3)) -- 'F64
+
+;; Homogeneous BOOL
+(enlist true false true) -- [true false true]
+
+;; Homogeneous SYM
+(type (enlist 'a 'b 'c)) -- 'SYM
+
+;; Homogeneous I32
+(type (enlist 1i 2i 3i)) -- 'I32
+
+;; Homogeneous I16
+(type (enlist 1h 2h 3h)) -- 'I16
+
+;; Homogeneous STR
+(type (enlist "a" "b" "c")) -- 'STR
+
+;; Homogeneous U8
+(type (enlist (as 'U8 1) (as 'U8 2))) -- 'U8
+
+;; Heterogeneous → list (lines 1928-1938)
+(type (enlist 1 "two" 'three)) -- 'LIST
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 14. ray_enlist_fn with null atoms — null propagation (lines 1850-1858, 1922-1926)
+;; ═════════════════════════════════════════════════════════════════════
+
+;; Null in homogeneous I64 enlist → null slot propagated
+(nil? (at (enlist 1 0Nl 3) 1)) -- true
+
+;; Null in mixed int/float promote → dual-encoding (lines 1850-1858)
+(nil? (at (enlist 1 0Nl 3.0) 1)) -- true
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 15. ray_dict_fn — dict creation (lines 1945-1976)
+;; ═════════════════════════════════════════════════════════════════════
+
+;; Normal dict creation
+(at (dict [a b] (list 10 20)) 'a) -- 10
+(at (dict [a b] (list 10 20)) 'b) -- 20
+
+;; Vals as vec (lines 1960-1963)
+(at (dict [a b] [10 20]) 'a) -- 10
+
+;; Vals shorter than keys → tail filled with null (lines 1958-1971)
+;; dict with 3 keys and 2 vals — third val padded with null I64
+(nil? (at (dict [a b c] (list 10 20)) 'c)) -- true
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 16. ray_nil_fn — null checks (lines 1979-1983)
+;; ═════════════════════════════════════════════════════════════════════
+
+;; Typed null atom → true (line 1981)
+(nil? 0Nl) -- true
+(nil? 0Nf) -- true
+(nil? 0Ni) -- true
+
+;; Non-null → false (line 1982)
+(nil? 42) -- false
+(nil? "hello") -- false
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 17. ray_where_fn — bool vec filter (lines 1986-2001)
+;; ═════════════════════════════════════════════════════════════════════
+
+(where [true false true false true]) -- [0 2 4]
+(where [false false false]) -- []
+
+;; Error: non-bool input (line 1988)
+(where [1 2 3]) !- type
+(where 42) !- type
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 18. ray_concat_fn — various concat paths (lines 2700-3008)
+;; ═════════════════════════════════════════════════════════════════════
+
+;; String atom + string atom (lines 2705-2718)
+(concat "hello" " world") -- "hello world"
+
+;; Same-type vec concat (line 2722-2723)
+(concat [1 2] [3 4]) -- [1 2 3 4]
+
+;; List + list (lines 2757-2768)
+(concat (list 1 "a") (list 2 "b")) -- (list 1 "a" 2 "b")
+
+;; Mixed-type vec concat → list (lines 2771-2788)
+(type (concat [1 2] [1.0 2.0])) -- 'LIST
+
+;; Atom + vec (lines 2790-2817)
+(concat 0 [1 2 3]) -- [0 1 2 3]
+
+;; Vec + atom (lines 2819-2845)
+(concat [1 2 3] 4) -- [1 2 3 4]
+
+;; Atom + atom same type (lines 2848-2887)
+(concat 1 2) -- [1 2]
+(concat 1.0 2.0) -- [1.0 2.0]
+(concat true false) -- [true false]
+
+;; Atom + atom different type (lines 2998-3007)
+(type (concat 1 "a")) -- 'LIST
+(count (concat 1 "a")) -- 2
+
+;; Vec + list (lines 2725-2755)
+(count (concat [1 2] (list 3 "a"))) -- 4
+
+;; List + vec (lines 2725-2755)
+(count (concat (list 1 "a") [3 4])) -- 4
+
+;; Atom + list (lines 2970-2981)
+(count (concat 1 (list 2 3))) -- 3
+(at (concat 1 (list 2 3)) 0) -- 1
+
+;; List + atom (lines 2984-2996)
+(count (concat (list 1 2) 3)) -- 3
+(at (concat (list 1 2) 3) 2) -- 3
+
+;; Dict concat (lines 2890-2929)
+(at (concat (dict [a] (list 1)) (dict [b] (list 2))) 'b) -- 2
+
+;; Table concat (lines 2932-2967)
+(set T1 (table [a b] (list [1 2] [3 4])))
+(set T2 (table [a b] (list [5 6] [7 8])))
+(count (concat T1 T2)) -- 4
+
+;; Table concat type mismatch → error
+(set T3 (table [a] (list [1.0 2.0])))
+(set T4 (table [a] (list [1 2])))
+(concat T3 T4) !- type
+
+;; Table concat missing column → error
+(set T5 (table [a b] (list [1] [2])))
+(set T6 (table [a c] (list [3] [4])))
+(concat T5 T6) !- value
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 19. ray_raze_fn — flatten (lines 3012-3068)
+;; ═════════════════════════════════════════════════════════════════════
+
+;; Atom passthrough (line 3014)
+(raze 42) -- 42
+
+;; Typed vec passthrough (line 3016)
+(raze [1 2 3]) -- [1 2 3]
+
+;; Empty list (line 3020)
+(count (raze (list))) -- 0
+
+;; List of same-type vecs — fast path (lines 3027-3054)
+(raze (list [1 2] [3 4] [5 6])) -- [1 2 3 4 5 6]
+
+;; Non-list error (line 3018)
+(raze (dict [a] (list 1))) !- type
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 20. ray_within_fn — range check (lines 3071-3100)
+;; ═════════════════════════════════════════════════════════════════════
+
+;; I64 vec (lines 3079-3083)
+(within [1 5 10] [3 7]) -- [false true false]
+
+;; F64 vec (lines 3084-3088)
+(within [1.0 5.0 10.0] [3.0 7.0]) -- [false true false]
+
+;; I32 vec (lines 3089-3093)
+(within [1i 5i 10i] [3i 7i]) -- [false true false]
+
+;; Error: unsupported type (lines 3094-3096)
+(within [true false true] [false true]) !- type
+
+;; Error: wrong input (line 3072)
+(within 42 [1 10]) !- type
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 21. ray_type_fn — type queries (lines 1711-1716)
+;; ═════════════════════════════════════════════════════════════════════
+
+;; null → 'null (line 1712)
+(type null) -- 'null
+
+;; Atom types (lowercase for atoms)
+(type 42) -- 'i64
+(type 3.14) -- 'f64
+(type true) -- 'b8
+(type "hi") -- 'str
+(type 'foo) -- 'sym
+(type 5i) -- 'i32
+(type 5h) -- 'i16
+;; Vec types (uppercase for vecs)
+(type [1 2 3]) -- 'I64
+;; Composite types (uppercase)
+(type (dict [a] (list 1))) -- 'DICT
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 22. ray_group_fn — grouping paths (lines 2222-2697)
+;; ═════════════════════════════════════════════════════════════════════
+
+;; Empty vec (lines 2226-2232)
+(count (group [])) -- 0
+
+;; I64 vec (scalar path, lines 2484-2601)
+(count (group [1 2 1 3 2])) -- 3
+
+;; BOOL vec (lines 2525-2526 in scalar path)
+(count (group [true false true false])) -- 2
+
+;; F64 vec (lines 2527-2560 in scalar path)
+(count (group [1.0 2.0 1.0 3.0])) -- 3
+
+;; SYM vec (line 2519)
+(count (group ['a 'b 'a 'c])) -- 3
+
+;; I32 vec (lines 2521-2522)
+(count (group [1i 2i 1i 3i])) -- 3
+
+;; I16 vec (lines 2523-2524)
+(count (group [1h 2h 1h 3h])) -- 3
+
+;; LIST type grouping (lines 2256-2328)
+(count (group (list 1 "a" 1 "a" 2))) -- 3
+
+;; STR vec grouping (lines 2418-2478)
+(count (group (as 'STR ["foo" "bar" "foo" "baz"]))) -- 3
+
+;; Group type error (line 2223-2224)
+(group 42) !- type
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 23. GUID casts and operations (lines 1591-1634)
+;; ═════════════════════════════════════════════════════════════════════
+
+;; GUID already-GUID cast (line 1593)
+(set g1 (as 'GUID "01234567-89ab-cdef-0123-456789abcdef"))
+(type (as 'GUID g1)) -- 'guid
+
+;; Empty vec → GUID (line 1612-1613)
+(count (as 'GUID [])) -- 0
+
+;; List of GUID strings → GUID vec (lines 1615-1632)
+(count (as 'GUID (list "01234567-89ab-cdef-0123-456789abcdef" "fedcba98-7654-3210-fedc-ba9876543210"))) -- 2
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 24. GUID atom concat (lines 2878-2884 / 2809-2811 / 2839-2840)
+;; ═════════════════════════════════════════════════════════════════════
+
+(set ga (as 'GUID "01234567-89ab-cdef-0123-456789abcdef"))
+(set gb (as 'GUID "fedcba98-7654-3210-fedc-ba9876543210"))
+
+;; GUID atom + atom → 2-element vec
+(count (concat ga gb)) -- 2
+(type (concat ga gb)) -- 'GUID  ;; vec type → uppercase
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 25. Temporal atom cast cross-paths — DATE/TIME/TIMESTAMP (lines 1428-1589)
+;; ═════════════════════════════════════════════════════════════════════
+
+;; DATE from U8 atom (line 1433)
+(type (as 'DATE (as 'U8 10))) -- 'date
+
+;; TIME from U8 atom (line 1467)
+(type (as 'TIME (as 'U8 10))) -- 'time
+
+;; TIMESTAMP from U8 atom (line 1506)
+(type (as 'TIMESTAMP (as 'U8 10))) -- 'timestamp
+
+;; DATE vec cast (line 1458-1459)
+(type (as 'DATE [0 1 2])) -- 'DATE
+
+;; TIME vec cast (line 1497-1498)
+(type (as 'TIME [0 1000 2000])) -- 'TIME
+
+;; TIMESTAMP vec cast (line 1586-1587)
+(type (as 'TIMESTAMP [0 1000 2000])) -- 'TIMESTAMP
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 26. Temporal cast from TIMESTAMP atom (line 1439, 1473-1478)
+;;     Pre-epoch timestamps for floor-div / floor-mod correctness.
+;; ═════════════════════════════════════════════════════════════════════
+
+;; TIMESTAMP → DATE for pre-epoch (ns=-1 should give date -1, i.e. 1999-12-31)
+(as 'I32 (as 'DATE (as 'TIMESTAMP -1))) -- -1i
+
+;; TIMESTAMP → TIME for pre-epoch (ns-of-day should still be positive)
+;; ts_ns_in_day(-1) = NS_PER_DAY - 1 → ~86399999 ms
+(> (as 'I32 (as 'TIME (as 'TIMESTAMP -1))) 0i) -- true
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 27. cast_vec_relabel_compat — same-byte-rep casts (lines 823-830)
+;;     I64↔TIMESTAMP, I32↔DATE↔TIME: memcpy fast path.
+;; ═════════════════════════════════════════════════════════════════════
+
+;; I64 vec → TIMESTAMP vec (relabel)
+(type (as 'TIMESTAMP [0 1 2])) -- 'TIMESTAMP
+
+;; TIMESTAMP vec → I64 vec (relabel)
+(as 'I64 (as 'TIMESTAMP [0 1 2])) -- [0 1 2]
+
+;; I32 vec → DATE vec (relabel)
+(type (as 'DATE [0i 1i 2i])) -- 'DATE
+
+;; DATE vec → I32 vec (relabel)
+(as 'I32 (as 'DATE [0i 1i 2i])) -- [0i 1i 2i]
+
+;; I32 vec → TIME vec (relabel)
+(type (as 'TIME [0i 1000i 2000i])) -- 'TIME
+
+;; DATE vec → TIME vec (relabel — I32-compatible)
+(type (as 'TIME (as 'DATE [0i 1i 2i]))) -- 'TIME
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 28. SYM atom → STR cast (line 1328-1330)
+;; ═════════════════════════════════════════════════════════════════════
+
+(as 'STR 'hello) -- "hello"
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 29. Temporal atom → SYMBOL (ray_fmt path, lines 1412-1421)
+;; ═════════════════════════════════════════════════════════════════════
+
+(type (as 'SYMBOL (as 'DATE 100))) -- 'sym
+(type (as 'SYMBOL (as 'TIME 5000))) -- 'sym
+(type (as 'SYMBOL (as 'TIMESTAMP 0))) -- 'sym
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 30. BOOL cast edge: DATE / TIME / TIMESTAMP → BOOL (lines 1315-1317)
+;; ═════════════════════════════════════════════════════════════════════
+
+(as 'BOOL (as 'DATE 1)) -- true
+(as 'BOOL (as 'DATE 0)) -- false
+(as 'BOOL (as 'TIME 1000)) -- true
+(as 'BOOL (as 'TIME 0)) -- false
+(as 'BOOL (as 'TIMESTAMP 1)) -- true
+(as 'BOOL (as 'TIMESTAMP 0)) -- false
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 31. I32/I16 atom from DATE/TIME atom (lines 1247, 1269)
+;; ═════════════════════════════════════════════════════════════════════
+
+(as 'I32 (as 'DATE 100)) -- 100i
+(as 'I32 (as 'TIME 5000)) -- 5000i
+(as 'I16 (as 'DATE 100)) -- 100h
+(as 'I16 (as 'TIME 5000)) -- 5000h
+(as 'I32 (as 'TIMESTAMP 100)) -- 100i
+(as 'I16 (as 'TIMESTAMP 100)) -- 100h
+
+;; F64 from DATE/TIME/TIMESTAMP (lines 1291-1292)
+(as 'F64 (as 'DATE 100)) -- 100.0
+(as 'F64 (as 'TIME 5000)) -- 5000.0
+(as 'F64 (as 'TIMESTAMP 100)) -- 100.0
+
+;; U8 from DATE/TIME (through I32 conversion)
+;; Not directly — U8 has no DATE/TIME path. Falls through to error.
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 32. I64 from TIMESTAMP atom (line 1222)
+;; ═════════════════════════════════════════════════════════════════════
+
+(as 'I64 (as 'TIMESTAMP 12345)) -- 12345
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 33. concat with I16/I32/SYM/BOOL/U8/GUID atoms (lines 2796-2813, 2826-2840, 2853-2884)
+;; ═════════════════════════════════════════════════════════════════════
+
+;; I32 atom + I32 vec
+(concat 0i [1i 2i 3i]) -- [0i 1i 2i 3i]
+
+;; I32 vec + I32 atom
+(concat [1i 2i] 3i) -- [1i 2i 3i]
+
+;; I16 atom + I16 vec
+(concat 0h [1h 2h 3h]) -- [0h 1h 2h 3h]
+
+;; I16 vec + I16 atom
+(concat [1h 2h] 3h) -- [1h 2h 3h]
+
+;; BOOL atom + BOOL vec
+(concat true [false true]) -- [true false true]
+
+;; BOOL vec + BOOL atom
+(concat [true false] true) -- [true false true]
+
+;; SYM atom + SYM vec
+(count (concat 'a ['b 'c])) -- 3
+
+;; SYM vec + SYM atom
+(count (concat ['a 'b] 'c)) -- 3
+
+;; I32 atom + I32 atom → 2-element vec
+(concat 1i 2i) -- [1i 2i]
+
+;; I16 atom + I16 atom → 2-element vec
+(concat 1h 2h) -- [1h 2h]
+
+;; BOOL atom + BOOL atom → 2-element vec
+(concat true false) -- [true false]
+
+;; F64 atom + F64 vec
+(concat 0.0 [1.0 2.0]) -- [0.0 1.0 2.0]
+
+;; F64 vec + F64 atom
+(concat [1.0 2.0] 3.0) -- [1.0 2.0 3.0]
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 34. format with DATE/TIME atoms (ray_fmt fallback inside fmt_interpolate)
+;; ═════════════════════════════════════════════════════════════════════
+
+(type (as 'DATE "2024.01.15")) -- 'date
+(type (as 'TIME "12:30:45")) -- 'time
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 35. GUID GUID vec operations (group, concat)
+;; ═════════════════════════════════════════════════════════════════════
+
+;; GUID vec grouping (lines 2335-2415)
+(set gvec (as 'GUID (list "01234567-89ab-cdef-0123-456789abcdef" "fedcba98-7654-3210-fedc-ba9876543210" "01234567-89ab-cdef-0123-456789abcdef")))
+(count (group gvec)) -- 2
+
+;; GUID atom + vec, vec + atom
+(set gv2 (as 'GUID (list "01234567-89ab-cdef-0123-456789abcdef")))
+(count (concat ga gv2)) -- 2
+(count (concat gv2 gb)) -- 2
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 36. GUID enlist — homogeneous GUID atoms (lines 1911-1917)
+;; ═════════════════════════════════════════════════════════════════════
+
+(count (enlist ga gb)) -- 2
+(type (enlist ga gb)) -- 'GUID
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 37. ray_cast_fn — STR atom via ray_fmt fallback (lines 1354-1358)
+;;     Casting a DATE or other non-standard atom to STR.
+;; ═════════════════════════════════════════════════════════════════════
+
+(type (as 'STR (as 'DATE 100))) -- 'str
+(type (as 'STR (as 'TIME 5000))) -- 'str
+(type (as 'STR (as 'TIMESTAMP 0))) -- 'str
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 38. Group with null elements — null routing (lines 2498-2517)
+;;     Scalar group path: nullable I64 vec with null values.
+;; ═════════════════════════════════════════════════════════════════════
+
+;; Group I64 vec with nulls: nulls form their own group
+(count (group [1 0Nl 2 0Nl 1])) -- 3
+
+;; Group F64 vec with null: null values merge into one null group
+;; (null routing path, lines 2498-2517, not NaN path)
+(set _gnan (group [1.0 0Nf 2.0 0Nf]))
+;; 1.0, 2.0, and one null group = 3 groups total
+(count _gnan) -- 3
+
+;; Group I32 vec with nulls
+(count (group [1i 0Ni 2i 0Ni 1i])) -- 3
+
+;; Group I16 vec with nulls
+(count (group [1h 0Nh 2h 0Nh 1h])) -- 3
+
+;; Group F64 vec (scalar path): exercises the F64 IEEE-754 bit-pattern
+;; hash path including -0.0 canonicalization (line 2559)
+(count (group [0.0 1.0 0.0 2.0])) -- 3
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 39. Dict concat with I64 keys (lines 2907-2910)
+;; ═════════════════════════════════════════════════════════════════════
+
+;; Dict with I64 keys: exercises the I64/TIMESTAMP key dispatch path
+(set _d1 (dict [1 2] (list "a" "b")))
+(set _d2 (dict [2 3] (list "c" "d")))
+(at (concat _d1 _d2) 3) -- "d"
+(at (concat _d1 _d2) 2) -- "c"
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 40. Group null key sentinel propagation (lines 2654-2675)
+;;     When source vec has nulls, group keys should carry the null marker.
+;; ═════════════════════════════════════════════════════════════════════
+
+;; I64 vec group with null — check null key exists
+(set _gnull (group [1 0Nl 2]))
+(count _gnull) -- 3
+
+;; F64 vec group with -0.0 and +0.0 (should merge, line 2559)
+;; Can't embed (neg 0.0) in a vec literal; use list + cast instead
+(set _negzero (neg 0.0))
+(set _fv (as 'F64 (list 0.0 _negzero 1.0)))
+(count (group _fv)) -- 2
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 41. Dict concat with LIST keys (line 2901-2902)
+;; ═════════════════════════════════════════════════════════════════════
+
+;; Dict with SYM keys concat — exercises the SYM key dispatch (line 2903-2906)
+(set _dl1 (dict ['a 'b] (list 1 2)))
+(set _dl2 (dict ['b 'c] (list 3 4)))
+(at (concat _dl1 _dl2) 'c) -- 4
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 42. concat error paths — unsupported type combos
+;; ═════════════════════════════════════════════════════════════════════
+
+;; Table + non-table → type error (line 3008)
+(concat (table [a] (list [1])) 42) !- type
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 43. Raze slow path — mixed-type list items (lines 3059-3067)
+;; ═════════════════════════════════════════════════════════════════════
+
+;; List of different-typed vecs → slow path pairwise concat
+(count (raze (list [1 2] [1.0 2.0]))) -- 4
+
+;; List with SYM vecs → slow path (SYM excluded from fast path)
+(count (raze (list ['a 'b] ['c 'd]))) -- 4
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 44. println returns null — via format string mode check
+;;     println with format string writes to stdout (can't assert output),
+;;     but we can assert it returns null.
+;; ═════════════════════════════════════════════════════════════════════
+
+;; println with format string mode (lines 238-249)
+(nil? (println "hello % world" 42)) -- true
+
+;; println with multiple args, no format (lines 252-253)
+(nil? (println 1 2 3)) -- true
+
+;; print (like println without newline)
+(nil? (print "x=%" 42)) -- true
+(nil? (print 1 2)) -- true
+
+;; show
+(nil? (show 42)) -- true
+(nil? (show [1 2 3])) -- true
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 45. println typed null atoms — exercise null_literal_str via println
+;;     These print to stdout; we verify they don't error by checking nil?.
+;; ═════════════════════════════════════════════════════════════════════
+
+(nil? (println 0Nf)) -- true
+(nil? (println 0Nd)) -- true
+(nil? (println 0Nt)) -- true
+(nil? (println 0Np)) -- true
+(nil? (println 0Ns)) -- true
+(nil? (println 0Nh)) -- true
+(nil? (println 0Ni)) -- true
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 46. Temporal vec casts through generic path (LIST input)
+;; ═════════════════════════════════════════════════════════════════════
+
+;; DATE vec from list (goes through generic path)
+(type (as 'DATE (list 0 1 2))) -- 'DATE
+
+;; TIME vec from list
+(type (as 'TIME (list 0 1000 2000))) -- 'TIME
+
+;; TIMESTAMP vec from list
+(type (as 'TIMESTAMP (list 0 1000 2000))) -- 'TIMESTAMP
+
+;; U8 vec from list
+(type (as 'U8 (list 1 2 3))) -- 'U8
+
+;; I16 vec from list
+(type (as 'I16 (list 1 2 3))) -- 'I16
+
+;; I32 vec from list
+(type (as 'I32 (list 1 2 3))) -- 'I32
+
+;; BOOL vec from list
+(type (as 'BOOL (list 1 0 1))) -- 'B8
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 47. Enlist GUID with null atoms (lines 1922-1926)
+;; ═════════════════════════════════════════════════════════════════════
+
+;; GUID enlist
+(set ga2 (as 'GUID "01234567-89ab-cdef-0123-456789abcdef"))
+(set gb2 (as 'GUID "fedcba98-7654-3210-fedc-ba9876543210"))
+(count (enlist ga2 gb2)) -- 2
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 48. Format with GUID atom — exercises ray_fmt fallback
+;; ═════════════════════════════════════════════════════════════════════
+
+(format "guid=%" (as 'GUID "01234567-89ab-cdef-0123-456789abcdef")) -- "guid=01234567-89ab-cdef-0123-456789abcdef"
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 49. Cast type-error paths — unsupported source types for each target
+;; ═════════════════════════════════════════════════════════════════════
+
+;; STR cast of unsupported type → type error (line 1381)
+(as 'STR (table [a] (list [1]))) !- type
+
+;; SYMBOL cast of unsupported type → type error (line 1426)
+(as 'SYMBOL (table [a] (list [1]))) !- type
+
+;; DATE cast of unsupported type → type error (line 1460)
+(as 'DATE (dict [a] (list 1))) !- type
+
+;; TIME cast of unsupported type → type error (line 1499)
+(as 'TIME (dict [a] (list 1))) !- type
+
+;; TIMESTAMP cast of unsupported type → type error (line 1588)
+(as 'TIMESTAMP (dict [a] (list 1))) !- type
+
+;; GUID cast of unsupported type → type error (line 1633)
+(as 'GUID 42) !- type
+
+;; DICT cast of unsupported type → type error (line 1676)
+(as 'DICT [1 2 3]) !- type
+
+;; TABLE cast of unsupported type → type error (line 1702)
+(as 'TABLE [1 2 3]) !- type
+
+;; TABLE from dict with non-SYM keys → type error (line 1688)
+(as 'TABLE (dict [1 2] (list "a" "b"))) !- type
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 50. BOOL vec → BOOL vec cast (line 922 in cast_range_worker)
+;;     and U8 vec → BOOL vec cast (line 944)
+;; ═════════════════════════════════════════════════════════════════════
+
+;; BOOL vec → BOOL: identity-like (passthrough or relabel)
+(as 'BOOL [true false true]) -- [true false true]
+
+;; U8 vec → BOOL vec (line 944)
+(as 'BOOL (as 'U8 [0 1 2])) -- [false true true]
+
+;; BOOL vec → U8 vec (line 922)
+(type (as 'U8 [true false true])) -- 'U8
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 51. Dict vals as single atom — scalar val (line 1963)
+;; ═════════════════════════════════════════════════════════════════════
+
+;; dict where vals is a single atom (not list/vec) — broadcasts to all keys
+(at (dict [a b] 42) 'a) -- 42
+(at (dict [a b] 42) 'b) -- 42
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 52. Enlist default → as_list (line 1919)
+;;     Homogeneous temporal atoms don't have an explicit switch case.
+;; ═════════════════════════════════════════════════════════════════════
+
+;; DATE atoms → I32 switch branch (RAY_DATE maps to I32 case in enlist)
+(type (enlist (as 'DATE 0) (as 'DATE 1))) -- 'DATE
+;; Heterogeneous temporal atoms → as_list via default goto
+;; Mix DATE + TIME (different atom types) → heterogeneous list
+(type (enlist (as 'DATE 0) (as 'TIME 100))) -- 'LIST
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 53. I64 vec with null → TIMESTAMP vec: null propagation (line 783)
+;; ═════════════════════════════════════════════════════════════════════
+
+(nil? (at (as 'TIMESTAMP [0 0Nl 2]) 1)) -- true
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 54. F64 vec with null → I64: null sentinel propagation (line 783)
+;; ═════════════════════════════════════════════════════════════════════
+
+(nil? (at (as 'I64 (as 'F64 [1.0 0Nf 3.0])) 1)) -- true
+
+;; ═════════════════════════════════════════════════════════════════════
+;; UNREACHABLE BRANCHES (documented):
+;;
+;; Line 68: RAY_F32 case in null_literal_str — F32 typed null atom is
+;;   not directly constructible from RFL syntax. No `0Ne` parser literal
+;;   exists; (as 'F32 ...) is not a valid cast target.
+;;
+;; Lines 84, 351-355: Lazy materialization paths — RFL-visible APIs
+;;   always return materialized values by the time they reach println
+;;   or resolve. Lazy handles are internal to the query engine.
+;;
+;; Lines 141-142: ray_lang_print ray_fmt failure fallback — ray_fmt
+;;   would need to return an error for a valid ray_t*, which doesn't
+;;   happen in normal execution.
+;;
+;; Lines 173, 202, 215-216: fmt_interpolate error/failure fallbacks —
+;;   require ray_fmt to fail or error args, not triggerable from RFL.
+;;
+;; Lines 407-414: resolve all_user_sym=true SYM-conversion — requires
+;;   an I64 vec whose elements are valid multi-char user-sym IDs.
+;;   Not constructible from RFL (as 'I64 ['foo]) errors.
+;;
+;; Lines 447: ray_exit_fn return after exit() — unreachable by definition.
+;;
+;; Lines 497-498, 550-551, 586-592, 644, 668-669, 710-712, 725-726:
+;;   CSV read/write/splayed/parted function error paths — require
+;;   specific file system setup or malformed CSV files.
+;;
+;; Lines 757, 1207: OOM error guards in cast functions — unreachable
+;;   without memory pressure.
+;;
+;; Lines 898-955: cast_range_worker switch cases that are only reached
+;;   for unsupported (in_type, out_type) pairs or specific type combos
+;;   not exercisable from simple RFL casts.
+;;
+;; Lines 1065, 1085: Cancel check paths in cast_vec_numeric_fast —
+;;   require concurrent cancellation signal.
+;;
+;; Lines 2487-2489, 2504-2508, 2545-2551, 2579-2583, 2593-2597:
+;;   OOM guards in group_fn hash table operations.
+;;
+;; Lines 2638-2643: F32 group key reconstruction — F32 not directly
+;;   constructible from RFL.
+;;
+;; Lines 2691-2696: gfail label — error cleanup path, only on OOM.
+;;
+;; Lines 2813, 2842, 2885: concat default type error for exotic types.
+;;
+;; Lines 2902-2925: Dict concat with LIST/I64 keys — partially covered
+;;   by test 39/41 above; some sub-paths need non-SYM boxed keys.
+;; ═════════════════════════════════════════════════════════════════════

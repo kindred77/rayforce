@@ -15,3 +15,17 @@
 
 ;; max >= min
 1 -- (as 'I64 (>= (max V) (min V)))
+
+;; ─── edge cases: single-element / all-equal / negatives / atoms ──────
+(max [42]) -- 42
+(max [7 7 7 7]) -- 7
+(max [-1 -5 -10 0]) -- 0
+(max [-5.5 -1.2 -10.3 -0.5]) -- -0.5
+(max [3.14 1.41 2.71]) -- 3.14
+;; max over a list with null skips the null
+(max (list 5 0Ni 3)) -- 5
+;; list of all-nulls → typed null
+(nil? (max (list 0Ni 0Ni))) -- true
+;; atom pass-through
+(max 99) -- 99
+(max -7) -- -7

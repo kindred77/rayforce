@@ -149,3 +149,37 @@
 ;;     ray_div sets out_type=RAY_F64 → unreachable from RFL
 ;;   OP_MIN2/MAX2: not exposed in RFL (only via C API ray_min2/ray_max2)
 ;; ===================================================================
+
+;; ===================================================================
+;; expr_load_f64 column-type conversion paths (lines 622-645)
+;; Forced via select{}: F64 expr promotion from narrow column requires
+;; conversion into f64 scratch buffer.
+;; ===================================================================
+
+;; I32 column → F64 scratch (line 633-636)
+(set _Ti32 (table [x] (list (as 'I32 [1 2 3]))))
+(at (select {y: (* x 2.0) from: _Ti32}) 'y) -- [2.0 4.0 6.0]
+
+;; I16 column → F64 scratch (line 641-644)
+(set _Ti16 (table [x] (list (as 'I16 [10 20 30]))))
+(at (select {y: (* x 2.0) from: _Ti16}) 'y) -- [20.0 40.0 60.0]
+
+;; U8 column → F64 scratch (line 637-640)
+(set _Tu8 (table [x] (list (as 'U8 [4 5 6]))))
+(at (select {y: (* x 2.0) from: _Tu8}) 'y) -- [8.0 10.0 12.0]
+
+;; TIMESTAMP column → F64 scratch (line 625-628 I64/TIMESTAMP path)
+(set _Tts (table [x] (list (as 'TIMESTAMP [1000 2000 3000]))))
+(at (select {y: (* x 2.0) from: _Tts}) 'y) -- [2000.0 4000.0 6000.0]
+
+;; DATE column → F64 scratch (line 633: DATE/TIME path via I32)
+(set _Td (table [x] (list (as 'DATE [0 1 2]))))
+(at (select {y: (* x 2.0) from: _Td}) 'y) -- [0.0 2.0 4.0]
+
+;; TIME column → F64 scratch
+(set _Tt (table [x] (list (as 'TIME [100 200 300]))))
+(at (select {y: (* x 2.0) from: _Tt}) 'y) -- [200.0 400.0 600.0]
+
+;; BOOL column → F64 scratch (line 637-640 U8/BOOL path)
+(set _Tb (table [x] (list (as 'BOOL [true false true]))))
+(at (select {y: (* x 2.0) from: _Tb}) 'y) -- [2.0 0.0 2.0]

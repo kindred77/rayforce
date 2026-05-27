@@ -1,0 +1,768 @@
+;; collection_branch_cov.rfl — branch coverage for src/ops/collection.c
+;;
+;; Targets uncovered branches identified at 64.84% baseline. Each section
+;; documents the line(s) it exercises and whether branches are reachable.
+
+;; ══════════════════════════════════════════════════════════════════════
+;; Section 1: ray_map_fn error & edge paths (lines 339, 341, 350)
+;; ══════════════════════════════════════════════════════════════════════
+
+;; Line 339: n < 2 → domain error (map called with only fn arg)
+(try (map +) (fn [e] "err")) -- "err"
+
+;; Line 350: unary map on non-list (scalar) → type error
+;; (map fn scalar) where scalar is not a list
+(try (map (fn [x] (+ x 1)) 42) (fn [e] "err")) -- "err"
+
+;; Line 341: lazy materialization of map args
+;; Passing a lazy (reverse of vec) as an arg to map → materializes
+(map (fn [x] (+ x 10)) (reverse [1 2 3])) -- (list 13 12 11)
+
+;; Binary map: (map fn val vec) where vec is scalar → call fn(val, scalar) once
+;; Lines 375-377
+(map + 10 5) -- 15
+
+;; Unary map error propagation (lines 360-363)
+;; fn that errors on 2nd element → cleanup first result then return error
+(try (map (fn [x] (if (> x 1) (raise 77) x)) (list 0 1 2)) (fn [e] e)) -- 77
+
+;; Binary map error propagation (lines 388-391)
+(try (map (fn [a b] (if (> b 1) (raise 88) (+ a b))) 0 (list 0 1 2)) (fn [e] e)) -- 88
+
+;; ══════════════════════════════════════════════════════════════════════
+;; Section 2: pmap — alias for map (line 399-401)
+;; ══════════════════════════════════════════════════════════════════════
+(pmap (fn [x] (+ x 1)) (list 1 2 3)) -- (list 2 3 4)
+(pmap + 10 (list 1 2 3)) -- (list 11 12 13)
+
+;; ══════════════════════════════════════════════════════════════════════
+;; Section 3: ray_fold_fn error paths (lines 404-449)
+;; ══════════════════════════════════════════════════════════════════════
+
+;; n < 2 → domain error (line 405)
+(try (fold +) (fn [e] "err")) -- "err"
+
+;; 2-arg fold on empty list → domain error (line 419)
+(try (fold + (list)) (fn [e] "err")) -- "err"
+
+;; 2-arg fold on non-list → type error (line 417)
+(try (fold + 42) (fn [e] "err")) -- "err"
+
+;; 3-arg fold on non-list → type error (line 438)
+(try (fold + 0 42) (fn [e] "err")) -- "err"
+
+;; 3-arg fold with error propagation (line 444)
+(try (fold (fn [a b] (if (> b 3) (raise 99) (+ a b))) 0 (list 1 2 3 4)) (fn [e] e)) -- 99
+
+;; 2-arg fold error propagation (line 426)
+(try (fold (fn [a b] (if (> b 2) (raise 44) (+ a b))) (list 1 2 3)) (fn [e] e)) -- 44
+
+;; fold with lazy arg materialization (line 407)
+(fold + 0 (reverse (list 1 2 3))) -- 6
+
+;; ══════════════════════════════════════════════════════════════════════
+;; Section 4: ray_scan_fn error paths (lines 452-491)
+;; ══════════════════════════════════════════════════════════════════════
+
+;; n < 2 → domain error (line 453)
+(try (scan +) (fn [e] "err")) -- "err"
+
+;; scan on non-list → type error (line 461)
+(try (scan + 42) (fn [e] "err")) -- "err"
+
+;; scan on empty list → empty (lines 463-470)
+(count (scan + (list))) -- 0
+
+;; scan with lazy arg (line 455)
+(scan + (reverse (list 1 2 3))) -- (list 3 5 6)
+
+;; scan error propagation (lines 483-486)
+(try (scan (fn [a b] (if (> b 2) (raise 55) (+ a b))) (list 1 2 3)) (fn [e] e)) -- 55
+
+;; ══════════════════════════════════════════════════════════════════════
+;; Section 5: ray_filter_fn paths (lines 494-604)
+;; ══════════════════════════════════════════════════════════════════════
+
+;; Table filter (lines 499-515) — already in cov2; add error propagation
+;; Table filter column error propagation (line 509)
+;; filter with wrong-length mask on table with multiple cols
+(try (filter (table [a b] (list [1 2 3] [4 5 6])) [true false]) (fn [e] "err")) -- "err"
+
+;; STR filter (lines 518-533) — already covered; add size=0 result
+(filter "abc" [false false false]) -- ""
+
+;; Typed vec filter with null bitmap (lines 557-559)
+(nil? (at (filter (concat [0Nl 1 2] []) [true false true]) 0)) -- true
+(at (filter (concat [0Nl 1 2] []) [true false true]) 1) -- 2
+
+;; Boxed list filter where mask is not all bools → type error (line 581)
+(try (filter (list 1 2 3) (list 1 0 1)) (fn [e] "err")) -- "err"
+
+;; Boxed list filter — happy path (lines 594-600)
+(filter (list 10 20 30) (list true false true)) -- (list 10 30)
+
+;; ══════════════════════════════════════════════════════════════════════
+;; Section 6: ray_apply_fn paths (lines 607-647)
+;; ══════════════════════════════════════════════════════════════════════
+
+;; n < 3 → domain error (line 608)
+(try (apply + 1) (fn [e] "err")) -- "err"
+
+;; Both args scalar → call fn once (lines 615-616)
+(apply + 3 4) -- 7
+
+;; Both args non-list → type error (line 623)
+(try (apply + (list 1 2) 42) (fn [e] "err")) -- "err"
+
+;; Normal apply (zip two lists)
+(apply + (list 1 2 3) (list 10 20 30)) -- (list 11 22 33)
+
+;; Apply with lazy args (line 610)
+(apply + (reverse (list 1 2 3)) (list 10 20 30)) -- (list 13 22 31)
+
+;; Apply error propagation (lines 638-641)
+(try (apply (fn [a b] (if (> a 1) (raise 66) (+ a b))) (list 0 1 2) (list 10 20 30)) (fn [e] e)) -- 66
+
+;; Apply with mismatched lengths → truncates to shorter
+(apply + (list 1 2) (list 10 20 30)) -- (list 11 22)
+
+;; ══════════════════════════════════════════════════════════════════════
+;; Section 7: atom_eq edge cases (lines 654-711)
+;; ══════════════════════════════════════════════════════════════════════
+
+;; Cross-type numeric: i64 vs f64 → compare as f64 (line 661)
+(in 1 (list 1.0)) -- true
+(in 2.0 (list 2)) -- true
+(in 1h (list 1.0)) -- true
+
+;; Different non-numeric types → not equal (line 662)
+(in 'a (list 1)) -- false
+
+;; atom_eq timestamp (lines 674-675)
+(count (distinct (list 2024.01.01D10:00:00.000000000 2024.01.01D10:00:00.000000000))) -- 1
+
+;; atom_eq GUID (lines 676-679)
+(set _g1 (guid 1))
+(in (first _g1) (list (first _g1))) -- true
+
+;; atom_eq LIST structural comparison (lines 684-701)
+;; Equal lists at different addresses
+(count (distinct (list (list 1 2) (list 1 2)))) -- 1
+;; Different length lists → not equal
+(count (distinct (list [1 2] [1 2 3]))) -- 2
+
+;; atom_eq default: typed vecs as atoms (lines 703-710)
+(count (distinct (list [1 2] [3 4] [1 2]))) -- 2
+;; Different type vecs → not equal
+(count (distinct (list [1 2] [1.0 2.0]))) -- 2
+
+;; ══════════════════════════════════════════════════════════════════════
+;; Section 8: hs_hash_row — typed vec branches used in hashset
+;; Exercise each type switch branch for typed-vec hashset ops.
+;; ══════════════════════════════════════════════════════════════════════
+
+;; I16 distinct (line 75 hash, line 267 sort)
+(count (distinct [1h 2h 1h 3h 2h])) -- 3
+;; U8/BOOL distinct (line 77 hash, line 272 sort)
+(count (distinct [0x01 0x02 0x01])) -- 2
+(count (distinct [true false true])) -- 2
+;; DATE distinct (line 79 hash, line 262 sort)
+(count (distinct [2025.01.01 2025.01.02 2025.01.01 2025.01.03])) -- 3
+;; TIME distinct (line 80 hash, line 262 sort)
+(count (distinct [10:00:00.000 11:00:00.000 10:00:00.000 12:00:00.000])) -- 3
+;; TIMESTAMP distinct (line 81 hash, line 257 sort)
+(count (distinct [2024.01.01D00:00:01.000000000 2024.01.02D00:00:01.000000000 2024.01.01D00:00:01.000000000])) -- 2
+;; SYM distinct (line 82-84 hash, skips sort at line 740)
+(count (distinct ['a 'b 'c 'a 'b])) -- 3
+;; GUID distinct (line 86-87 hash, skips sort at line 740)
+(set _g2 (guid 3))
+(count (distinct (concat _g2 _g2))) -- 3
+;; STR distinct (line 88-91 hash, skips sort at line 740)
+(count (distinct ["aa" "bb" "aa" "cc"])) -- 3
+
+;; ══════════════════════════════════════════════════════════════════════
+;; Section 9: hs_eq_rows — typed vec equality in hashset collisions
+;; Force hash collisions by having many items of the same type
+;; Exercise each type in hs_eq_rows (lines 126-166)
+;; ══════════════════════════════════════════════════════════════════════
+
+;; I32 equality (line 129): distinct with >8 unique I32s triggers grow+collisions
+(count (distinct (as 'I32 (til 20)))) -- 20
+;; I16 equality (line 130)
+(count (distinct (as 'I16 (til 20)))) -- 20
+;; U8 equality (line 131)
+(count (distinct (as 'U8 (til 20)))) -- 20
+;; F64 equality (line 133)
+(count (distinct (as 'F64 (til 20)))) -- 20
+;; DATE equality (lines 134-135)
+(count (union [2025.01.01 2025.01.02 2025.01.03] [2025.01.02 2025.01.03 2025.01.04])) -- 4
+;; TIME equality (lines 134-135)
+(count (union [10:00:00.000 11:00:00.000] [11:00:00.000 12:00:00.000])) -- 3
+;; TIMESTAMP equality (line 136)
+(count (union [2024.01.01D00:00:01.000000000 2024.01.02D00:00:01.000000000] [2024.01.02D00:00:01.000000000 2024.01.03D00:00:01.000000000])) -- 3
+;; SYM equality (lines 137-140)
+(count (union ['a 'b 'c] ['b 'c 'd])) -- 4
+;; GUID equality (lines 142-144)
+(set _g3 (guid 3))
+(count (union _g3 _g3)) -- 3
+;; STR equality (lines 145-151)
+(count (union ["aa" "bb"] ["bb" "cc"])) -- 3
+
+;; Cross-type comparison via atom_eq fallback (lines 159-165)
+;; except where vec1 is I64 and vec2 is F64 → cross-type hs_eq_rows
+;; NOTE: hash values differ across types (I64 vs F64), so the hashset
+;; probe may miss. The typed-vec path uses type-specific hashing, so
+;; cross-type except returns all of vec1 (no matches found).
+(count (except [1 2 3 4] (as 'F64 [2 3]))) -- 4
+
+;; ══════════════════════════════════════════════════════════════════════
+;; Section 10: hashset_grow — trigger by exceeding load factor (lines 202-226)
+;; hashset_init with hint=8 → cap=16. Insert 8 unique → grow at 8th.
+;; ══════════════════════════════════════════════════════════════════════
+
+;; in with 8-element RHS: hashset built on 8 items, cap=16 → grow at count=8
+(in 1 [1 2 3 4 5 6 7 8]) -- true
+(in 9 [1 2 3 4 5 6 7 8]) -- false
+
+;; except with 9 unique items: cap=32 (hint=9 → cap=32 since 18>16)
+;; Actually hint=9 → cap target=18 → next power of 2 = 32. 9 < 16, no grow.
+;; Need hint such that items > cap/2. With hint=4, cap=16, items=4: no grow.
+;; The key is distinct_vec_eager where hint=len: distinct(til 9) → hint=9, cap=32, 9<16: no grow.
+;; distinct(til 64) → hint=64, cap=128, items=64, 64*2=128>=128 → GROW at item 64
+(count (distinct (til 64))) -- 64
+
+;; Force grow in union: vec1.len determines hashset init.
+;; union [1..8] with [9..16]: hs built on vec1 (8 items), cap=16
+;; After inserting 8 items: count*2=16>=16 → grow on 8th insert
+(count (union [1 2 3 4 5 6 7 8] [5 6 7 8 9 10 11 12])) -- 12
+
+;; ══════════════════════════════════════════════════════════════════════
+;; Section 11: distinct_sort_cmp — each type branch (lines 253-293)
+;; ══════════════════════════════════════════════════════════════════════
+
+;; I64/TIMESTAMP (line 257): already well-covered by (distinct (til N))
+(count (distinct [3 1 2])) -- 3
+
+;; I32 (line 262): distinct on I32 vec with multiple unique values
+(count (distinct [3i 1i 2i 1i 3i])) -- 3
+;; Verify sorted output
+(at (distinct [3i 1i 2i]) 0) -- 1i
+
+;; DATE (line 262): distinct on date vec with sorted output
+(count (distinct [2025.01.03 2025.01.01 2025.01.02 2025.01.01])) -- 3
+(at (distinct [2025.01.03 2025.01.01 2025.01.02]) 0) -- 2025.01.01
+
+;; TIME (line 262): distinct on time vec with sorted output
+(count (distinct [12:00:00.000 10:00:00.000 11:00:00.000 10:00:00.000])) -- 3
+(at (distinct [12:00:00.000 10:00:00.000 11:00:00.000]) 0) -- 10:00:00.000
+
+;; I16 (line 267): distinct on I16 vec
+(count (distinct [3h 1h 2h 1h 3h])) -- 3
+(at (distinct [3h 1h 2h]) 0) -- 1h
+
+;; U8/BOOL (line 272): distinct on U8 vec
+(count (distinct [0x03 0x01 0x02 0x01])) -- 3
+
+;; F64 (line 277): distinct on F64 vec
+(count (distinct [3.0 1.0 2.0 1.0])) -- 3
+(at (distinct [3.0 1.0 2.0]) 0) -- 1.0
+
+;; ══════════════════════════════════════════════════════════════════════
+;; Section 12: hashset_insert null paths (lines 308-329)
+;; ══════════════════════════════════════════════════════════════════════
+
+;; typed vec with nulls — null_seen path (lines 309-313)
+;; distinct on vec with nulls: first null inserts, second null is duplicate
+(count (distinct [1 0Nl 2 0Nl 3])) -- 4
+
+;; except with null-bearing vec (lines 309-313 via hashset_find_xrow)
+(count (except (concat [0Nl 1 2 3] []) (concat [0Nl 2] []))) -- 2
+
+;; sect with null-bearing vecs
+(count (sect (concat [0Nl 1 2] []) (concat [0Nl 2 3] []))) -- 2
+
+;; in with null-bearing RHS
+(sum (as 'I64 (in [1 2 3] (concat [0Nl 1 3] [])))) -- 2
+
+;; ══════════════════════════════════════════════════════════════════════
+;; Section 13: ray_in_fn edge cases (lines 878-1039)
+;; ══════════════════════════════════════════════════════════════════════
+
+;; STR in STR (lines 882-898)
+(in "abc" "abcd") -- [true true true]
+(in "xyz" "abc") -- [false false false]
+
+;; Scalar in scalar (lines 900-901)
+(in 3 3) -- true
+(in 3 4) -- false
+
+;; STR in LIST (lines 903-921)
+(in "ab" (list "a" "b" "c")) -- [true true]
+(in "xy" (list "x" "z")) -- [true false]
+
+;; Empty collection val (line 925-927)
+(in (as 'I64 (list)) [1 2 3]) -- (list)
+
+;; Typed vec val vs typed vec: hashset path (lines 933-950)
+(in [1 2 3] [2 3 4]) -- [false true true]
+
+;; Non-scalar results from in (lines 978-997): STR vec in STR atom
+;; Each char-check returns a bool vec → results are non-scalar → LIST collect
+(in (list "ab" "cd") "abcd") -- (list [true true] [true true])
+
+;; val_null in vec with nulls → true (line 1007)
+(in 0Nl (concat [0Nl 1 2] [])) -- true
+;; val_null in vec without nulls → false (line 1017)
+(in 0Nl [1 2 3]) -- false
+
+;; ══════════════════════════════════════════════════════════════════════
+;; Section 14: ray_except_fn typed vec + scalar (lines 1079-1087)
+;; ══════════════════════════════════════════════════════════════════════
+
+;; Typed vec except scalar atom (lines 1079-1087)
+(except [1 2 3 4 5] 3) -- [1 2 4 5]
+(except [1.0 2.0 3.0] 2.0) -- [1.0 3.0]
+(except ['a 'b 'c] 'b) -- ['a 'c]
+
+;; Boxed list except scalar (lines 1125-1128)
+(except (list 1 2 3) 2) -- (list 1 3)
+(except (list 'a 'b 'c) 'b) -- (list 'a 'c)
+
+;; Boxed list except list (lines 1130-1138)
+(except (list 1 2 3 4) (list 2 4)) -- (list 1 3)
+
+;; ══════════════════════════════════════════════════════════════════════
+;; Section 15: ray_take_fn edge cases (lines 1268-1589)
+;; ══════════════════════════════════════════════════════════════════════
+
+;; Take float → type error (line 1274-1275)
+(try (take [1 2 3] 1.5) (fn [e] "err")) -- "err"
+
+;; Range take negative amount → length error (line 1281)
+(try (take [1 2 3] [0 -1]) (fn [e] "err")) -- "err"
+
+;; Table range take (lines 1284-1298)
+(set _tt (table [a b] (list [1 2 3 4 5] [10 20 30 40 50])))
+(count (take _tt [1 2])) -- 2
+(at (at (take _tt [1 2]) 'a) 0) -- 2
+
+;; String range take (lines 1301-1309)
+(take "hello" [1 3]) -- "ell"
+(take "hello" [-2 2]) -- "lo"
+(take "hello" [10 3]) -- ""
+
+;; Typed vec range take with negative start (lines 1315-1316)
+(take [10 20 30 40 50] [-3 2]) -- [30 40]
+
+;; Typed vec range take start >= len → empty (line 1317-1324)
+(count (take [1 2 3] [10 5])) -- 0
+
+;; Dict range take with LIST vals (lines 1367-1378)
+(set _dl (dict ['a 'b 'c 'd] (list 1 "two" 3.0 'four)))
+(count (key (take _dl [1 2]))) -- 2
+
+;; Dict range take with typed vals (lines 1379-1381)
+(set _dt (dict ['a 'b 'c 'd] [1 2 3 4]))
+(count (key (take _dt [1 2]))) -- 2
+(at (value (take _dt [1 2])) 0) -- 2
+
+;; Boxed list range take (lines 1387-1411)
+(take (list 10 20 30 40) [1 2]) -- (list 20 30)
+(count (take (list 1 2 3) [10 5])) -- 0
+
+;; Range take with negative start on list (line 1389)
+(take (list 10 20 30 40) [-2 2]) -- (list 30 40)
+
+;; Scalar take (lines 1425-1434): repeat a scalar value n times
+(take 42 3) -- [42 42 42]
+(take 3.14 2) -- [3.14 3.14]
+(take true 3) -- [true true true]
+
+;; Char take (lines 1416-1422): repeat a char n times
+(take 'a' 3) -- "aaa"
+(take 'z' 1) -- "z"
+
+;; String take (lines 1437-1457)
+(take "abc" 5) -- "abcab"
+(take "abc" -4) -- "cabc"
+(take "" 0) -- ""
+(take "" 3) -- ""
+
+;; Typed vec null bitmap propagation for positive take (lines 1540-1544)
+(nil? (at (take (concat [0Nl 1 2] []) 6) 0)) -- true
+(nil? (at (take (concat [0Nl 1 2] []) 6) 3)) -- true
+(at (take (concat [0Nl 1 2] []) 6) 1) -- 1
+
+;; Typed vec null bitmap propagation for negative take (lines 1545-1553)
+(nil? (at (take (concat [0Nl 1 2] []) -6) 3)) -- true
+(at (take (concat [0Nl 1 2] []) -6) 4) -- 1
+
+;; Boxed list take with len=0 (line 1572-1573)
+(count (take (list) 5)) -- 0
+
+;; Boxed list negative take (lines 1579-1585)
+(take (list 1 2 3 4) -2) -- (list 3 4)
+
+;; ══════════════════════════════════════════════════════════════════════
+;; Section 16: ray_at_fn paths (lines 1592-1745)
+;; ══════════════════════════════════════════════════════════════════════
+
+;; Table column by symbol (lines 1595-1599)
+(set _ta (table [x y] (list [1 2 3] [4 5 6])))
+(at _ta 'x) -- [1 2 3]
+;; Missing column → domain error
+(try (at _ta 'z) (fn [e] "err")) -- "err"
+
+;; Table row by integer (lines 1603-1628)
+(set _row (at _ta 0))
+(at _row 'x) -- 1
+
+;; Table row out of bounds → domain error (line 1608)
+(try (at _ta 5) (fn [e] "err")) -- "err"
+(try (at _ta -1) (fn [e] "err")) -- "err"
+
+;; Table row selection by I64 vec (lines 1634-1661)
+(count (at _ta [0 2])) -- 2
+;; Out of bounds in index vec → domain error (line 1639-1640)
+(try (at _ta [0 99]) (fn [e] "err")) -- "err"
+
+;; Dict key access (lines 1664-1668)
+(set _da (dict ['a 'b 'c] [10 20 30]))
+(at _da 'a) -- 10
+;; Missing key → typed null (line 1667)
+(nil? (at _da 'z)) -- true
+
+;; String indexing single index (lines 1671-1692)
+(at "hello" 0) -- "h"
+(at "hello" 4) -- "o"
+;; Out of bounds → domain error (line 1690)
+(try (at "hello" -1) (fn [e] "err")) -- "err"
+(try (at "hello" 5) (fn [e] "err")) -- "err"
+
+;; String multi-index (lines 1674-1687)
+(at "hello" [0 4]) -- "ho"
+;; Out of bounds in multi-index → domain error (line 1684)
+(try (at "hello" [0 10]) (fn [e] "err")) -- "err"
+
+;; Vector index as collection (lines 1696-1722)
+(at [10 20 30] [0 2]) -- (list 10 30)
+
+;; Non-integer idx → type error (lines 1724-1726)
+(try (at [1 2 3] "bad") (fn [e] "err")) -- "err"
+
+;; Typed vec out of bounds → typed null (line 1732)
+(nil? (at [1 2 3] 10)) -- true
+(nil? (at [1 2 3] -1)) -- true
+
+;; Boxed list access (lines 1739-1744)
+(at (list 10 20 30) 1) -- 20
+;; Out of bounds → typed null (line 1741)
+(nil? (at (list 10 20 30) 99)) -- true
+
+;; Non-list, non-vec → type error (line 1739)
+(try (at + 0) (fn [e] "err")) -- "err"
+
+;; ══════════════════════════════════════════════════════════════════════
+;; Section 17: ray_find_fn paths (lines 1748-1827)
+;; ══════════════════════════════════════════════════════════════════════
+
+;; String find (lines 1752-1759)
+(find "hello" 'l') -- 2
+;; Not found → typed null
+(nil? (find "hello" 'z')) -- true
+
+;; Vector val find (lines 1762-1783)
+(find [10 20 30] [20 30 40]) -- (list 1 2 0Nl)
+
+;; Empty vec find with vector val (lines 1764-1765)
+(count (find (as 'I64 (list)) [1 2])) -- 0
+
+;; Typed vec find with nulls — null val (lines 1790-1793)
+(find (concat [0Nl 1 2] []) 0Nl) -- 0
+;; Typed vec find with nulls — non-null val (lines 1796-1801)
+(find (concat [0Nl 1 2] []) 2) -- 2
+;; Typed vec find with nulls — not found (lines 1790-1813)
+(nil? (find (concat [0Nl 1 2] []) 9)) -- true
+
+;; Typed vec find without nulls — null val: skip (line 1804)
+(nil? (find [1 2 3] 0Nl)) -- true
+;; Typed vec find without nulls — found (lines 1805-1811)
+(find [10 20 30] 20) -- 1
+;; Typed vec find without nulls — not found
+(nil? (find [10 20 30] 99)) -- true
+
+;; Boxed list find (lines 1816-1826)
+(find (list 10 20 30) 20) -- 1
+(nil? (find (list 10 20 30) 99)) -- true
+
+;; ══════════════════════════════════════════════════════════════════════
+;; Section 18: ray_reverse_fn paths (lines 1907-1944)
+;; ══════════════════════════════════════════════════════════════════════
+
+;; Atom reverse → identity (line 1913)
+(reverse 42) -- 42
+(reverse "hello") -- "hello"
+
+;; Typed vec reverse (via lazy chain) (lines 1917-1923)
+(reverse [1 2 3]) -- [3 2 1]
+(reverse [1.0 2.0 3.0]) -- [3.0 2.0 1.0]
+
+;; Boxed list reverse (lines 1926-1943)
+(reverse (list 1 2 3)) -- (list 3 2 1)
+(reverse (list "a" "b" "c")) -- (list "c" "b" "a")
+
+;; Null/error guard (line 1908)
+;; reverse of error should propagate
+(reverse (+ "a" 1)) !- type
+
+;; ══════════════════════════════════════════════════════════════════════
+;; Section 19: ray_rand_fn error paths (lines 1951-1969)
+;; ══════════════════════════════════════════════════════════════════════
+
+;; Non-atom args → type error (line 1952)
+(try (rand [1 2] 10) (fn [e] "err")) -- "err"
+(try (rand 10 [1 2]) (fn [e] "err")) -- "err"
+
+;; F64 args → type error (lines 1956, 1959)
+(try (rand 1.0 10) (fn [e] "err")) -- "err"
+(try (rand 10 1.0) (fn [e] "err")) -- "err"
+
+;; Negative n → domain error (line 1960)
+(try (rand -1 10) (fn [e] "err")) -- "err"
+
+;; mx <= 0 → domain error (line 1961)
+(try (rand 5 0) (fn [e] "err")) -- "err"
+(try (rand 5 -3) (fn [e] "err")) -- "err"
+
+;; n == 0 → empty vec (line 1962)
+(count (rand 0 100)) -- 0
+
+;; I32 args (lines 1955, 1958)
+(count (rand 5i 100i)) -- 5
+
+;; ══════════════════════════════════════════════════════════════════════
+;; Section 20: ray_bin_fn / ray_binr_fn (lines 1972-2047)
+;; ══════════════════════════════════════════════════════════════════════
+
+;; bin sorted not I64 → type error (line 1974)
+(try (bin [1.0 2.0 3.0] 2) (fn [e] "err")) -- "err"
+
+;; bin scalar (lines 1978-1987)
+(bin [1 3 5 7 9] 4) -- 1
+(bin [1 3 5 7 9] 0) -- -1
+(bin [1 3 5 7 9] 9) -- 4
+(bin [1 3 5 7 9] 4i) -- 1
+
+;; bin vec (lines 1988-2006)
+(bin [1 3 5 7 9] [0 4 10]) -- [-1 1 4]
+
+;; bin val wrong type → type error (line 2007)
+(try (bin [1 2 3] 1.5) (fn [e] "err")) -- "err"
+
+;; binr scalar (lines 2017-2026)
+(binr [1 3 5 7 9] 4) -- 2
+(binr [1 3 5 7 9] 1) -- 0
+(binr [1 3 5 7 9] 10) -- 4
+
+;; binr vec (lines 2027-2045)
+(binr [1 3 5 7 9] [0 4 10]) -- [0 2 4]
+
+;; binr val wrong type → type error (line 2046)
+(try (binr [1 2 3] 1.5) (fn [e] "err")) -- "err"
+
+;; ══════════════════════════════════════════════════════════════════════
+;; Section 21: map-left / map-right (lines 2055-2125)
+;; ══════════════════════════════════════════════════════════════════════
+
+;; map-left wrong arity → domain error (line 2096)
+(try (map-left + 1) (fn [e] "err")) -- "err"
+
+;; map-left normal (line 2107)
+(map-left + 10 (list 1 2 3)) -- (list 11 12 13)
+(map-left + 10 [1 2 3]) -- (list 11 12 13)
+
+;; map-left auto-swap: vec is scalar, fixed is vector (lines 2102-2104)
+(map-left + 5 (list 1 2 3)) -- (list 6 7 8)
+
+;; map-right wrong arity → domain error (line 2113)
+(try (map-right + 1) (fn [e] "err")) -- "err"
+
+;; map-right normal (line 2124)
+(map-right + [1 2 3] 10) -- (list 11 12 13)
+
+;; map-right auto-swap: vec is scalar, fixed is vector (lines 2119-2121)
+(map-right + 5 [1 2 3]) -- (list 6 7 8)
+
+;; map-iterate on scalar (non-vec, non-list) → call once (lines 2057-2062)
+(map-left + 10 5) -- 15
+(map-right + 5 10) -- 15
+
+;; map-iterate error propagation (lines 2080-2085)
+(try (map-left (fn [a b] (if (> b 1) (raise 11) (+ a b))) 0 (list 0 1 2)) (fn [e] e)) -- 11
+
+;; ══════════════════════════════════════════════════════════════════════
+;; Section 22: fold-right (lines 2138-2183)
+;; ══════════════════════════════════════════════════════════════════════
+
+;; n < 2 → domain error (line 2139)
+(try (fold-right +) (fn [e] "err")) -- "err"
+
+;; 2-arg form: uses last element as init (lines 2148-2165)
+(fold-right + (list 1 2 3 4)) -- 10
+(fold-right + (list 42)) -- 42
+
+;; 2-arg on empty list → domain error (line 2154)
+(try (fold-right + (list)) (fn [e] "err")) -- "err"
+
+;; 2-arg on non-list → type error (line 2152)
+(try (fold-right + 42) (fn [e] "err")) -- "err"
+
+;; 3-arg form (lines 2168-2183)
+(fold-right - 0 (list 1 2 3)) -- 2
+(fold-right + 10 (list 1 2 3)) -- 16
+
+;; 3-arg on non-list → type error (line 2173)
+(try (fold-right + 0 42) (fn [e] "err")) -- "err"
+
+;; Error propagation in 2-arg form (line 2161)
+(try (fold-right (fn [a b] (raise 22)) (list 1 2 3)) (fn [e] e)) -- 22
+
+;; Error propagation in 3-arg form (line 2179)
+(try (fold-right (fn [a b] (raise 33)) 0 (list 1 2)) (fn [e] e)) -- 33
+
+;; ══════════════════════════════════════════════════════════════════════
+;; Section 23: scan-right (lines 2192-2231)
+;; ══════════════════════════════════════════════════════════════════════
+
+;; n < 2 → domain error (line 2193)
+(try (scan-right +) (fn [e] "err")) -- "err"
+
+;; Non-list → type error (line 2201)
+(try (scan-right + 42) (fn [e] "err")) -- "err"
+
+;; Empty list → empty (lines 2203-2210)
+(count (scan-right + (list))) -- 0
+
+;; Normal scan-right (lines 2219-2228)
+(scan-right + (list 1 2 3 4)) -- (list 10 9 7 4)
+
+;; Error propagation (lines 2223-2226)
+(try (scan-right (fn [a b] (raise 44)) (list 1 2 3)) (fn [e] e)) -- 44
+
+;; ══════════════════════════════════════════════════════════════════════
+;; Section 24: distinct — string path (lines 810-826)
+;; ══════════════════════════════════════════════════════════════════════
+
+;; Empty string → identity (lines 813-814)
+(distinct "") -- ""
+
+;; Non-empty string → unique chars sorted (lines 815-825)
+(distinct "banana") -- "abn"
+(distinct "aaabbb") -- "ab"
+
+;; ══════════════════════════════════════════════════════════════════════
+;; Section 25: distinct — boxed list path (lines 838-874)
+;; ══════════════════════════════════════════════════════════════════════
+
+;; Empty boxed list (line 843)
+(count (distinct (list))) -- 0
+
+;; Boxed list with duplicates (lines 852-860)
+(count (distinct (list 1 2 1 3))) -- 3
+
+;; Boxed list sorting: atoms before vectors (lines 864-872)
+(count (distinct (list [1 2] 3 [1 2] 4))) -- 3
+(at (distinct (list [1 2] 3 4)) 0) -- 3
+
+;; ══════════════════════════════════════════════════════════════════════
+;; Section 26: list_to_typed_vec — SYM/STR empty conversion (lines 1042-1062)
+;; ══════════════════════════════════════════════════════════════════════
+
+;; Empty SYM result from except → typed SYM vec (lines 1046-1049)
+(type (except ['a 'b] ['a 'b 'c])) -- 'SYM
+(count (except ['a 'b] ['a 'b 'c])) -- 0
+
+;; Empty STR result from except → typed STR vec (lines 1046-1049)
+(type (except ["aa" "bb"] ["aa" "bb" "cc"])) -- 'STR
+(count (except ["aa" "bb"] ["aa" "bb" "cc"])) -- 0
+
+;; Non-empty SYM/STR → stays as boxed list (line 1051)
+(count (except ['a 'b 'c] ['b])) -- 2
+(count (except ["aa" "bb" "cc"] ["bb"])) -- 2
+
+;; ══════════════════════════════════════════════════════════════════════
+;; Section 27: reverse_vec_eager — non-STR typed vecs with nulls (lines 1892-1898)
+;; ══════════════════════════════════════════════════════════════════════
+
+;; I64 vec with nulls reversed
+(set _rn (reverse (concat [0Nl 1 2] [])))
+(nil? (at _rn 2)) -- true
+(at _rn 0) -- 2
+(at _rn 1) -- 1
+
+;; I32 vec with nulls reversed
+(set _r32 (reverse (as 'I32 (concat [0Nl 10 20] []))))
+(nil? (at _r32 2)) -- true
+(at _r32 0) -- 20i
+
+;; ══════════════════════════════════════════════════════════════════════
+;; Section 28: parted distinct paths (lines 749-786, 801-807)
+;; ══════════════════════════════════════════════════════════════════════
+
+;; Parted I64 distinct (non-STR path in parted_to_flat_vec lines 773-779)
+(.sys.exec "rm -rf /tmp/rf_bcov_parted") -- 0
+(.sys.exec "rm -f /tmp/rf_bcov_parted.csv") -- 0
+(.sys.exec "printf 'val\n1\n2\n3\n1\n2\n' > /tmp/rf_bcov_parted.csv") -- 0
+(set _prt (.csv.parted [I64] "/tmp/rf_bcov_parted.csv" "/tmp/rf_bcov_parted" 'bcov))
+(count (distinct (at _prt 'val))) -- 3
+(.sys.exec "rm -rf /tmp/rf_bcov_parted") -- 0
+(.sys.exec "rm -f /tmp/rf_bcov_parted.csv") -- 0
+
+;; ══════════════════════════════════════════════════════════════════════
+;; Section 29: Null-bearing STR vec operations
+;; Build via CSV with empty cells to get RAY_ATTR_HAS_NULLS on STR vec
+;; ══════════════════════════════════════════════════════════════════════
+
+(.sys.exec "rm -f /tmp/rf_bcov_strnull.csv") -- 0
+(.sys.exec "printf 'word\nhello\n\nworld\nhello\n' > /tmp/rf_bcov_strnull.csv") -- 0
+(set _tsn (.csv.read [STR] "/tmp/rf_bcov_strnull.csv"))
+(set _scn (at _tsn 'word))
+
+;; distinct on STR vec with nulls
+(count (distinct _scn)) -- 3
+
+;; reverse on STR vec with nulls (lines 1860-1871)
+(set _rsn (reverse _scn))
+(count _rsn) -- 4
+(nil? (at _rsn 2)) -- true
+(at _rsn 0) -- "hello"
+(at _rsn 3) -- "hello"
+
+;; filter on STR vec (typed vec path with null bitmap, lines 554-562)
+(set _fsn (filter _scn [true true false true]))
+(nil? (at _fsn 1)) -- true
+(at _fsn 0) -- "hello"
+(at _fsn 2) -- "hello"
+
+(.sys.exec "rm -f /tmp/rf_bcov_strnull.csv") -- 0
+
+;; ══════════════════════════════════════════════════════════════════════
+;; Section 30: hs_hash_row RAY_LIST branches — exercised via boxed-list
+;; hashset ops. NOTE: The hashset is only initialized with typed vecs
+;; in the current code, so the RAY_LIST branches in hs_hash_row
+;; (lines 93-117) and hs_row_is_null (lines 170-172) are UNREACHABLE
+;; from the current call graph. They exist for potential future callers.
+;;
+;; Similarly, hs_eq_rows lines 149-150 (STR null-ptr guards) are
+;; DEFENSIVE: null STR entries are caught by hs_row_is_null before
+;; reaching the STR equality comparison.
+;;
+;; hashset_init OOM (line 182), hashset_grow overflow (line 206),
+;; hashset_grow OOM (line 208), and hashset_insert grow-fail
+;; fallthrough (line 316 false branch) are all OOM-only paths.
+;;
+;; distinct_sort_cmp default (lines 283-291) is unreachable because
+;; the only caller (distinct_vec_eager) excludes SYM/GUID/STR from
+;; sorting (line 740), and all other types have explicit switch cases.
+;; (Note: F32 type can reach it via CSV [F32] hint, tested in cov5.rfl.)
+;; ══════════════════════════════════════════════════════════════════════

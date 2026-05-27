@@ -23,6 +23,13 @@ N -- (sum (<= (at S (til N)) (at S (+ 1 (til N)))))
 ;; idempotent
 (asc (asc V)) -- (asc V)
 
+;; OP_ASC vector-input guard: a lazy chain whose previous op is an
+;; aggregator (FIRST) yields a scalar when materialised; the
+;; subsequent OP_ASC executor must reject the non-vec input rather
+;; than dispatching to asc_vec_eager.  Covers exec.c L1061.
+(asc (first [1 2 3 4])) !- type
+(asc (last [1 2 3 4])) !- type
+
 ;; ──────────────────────────────────────────────────────────────────
 ;; Float / negatives / mixed
 ;; ──────────────────────────────────────────────────────────────────
@@ -58,3 +65,15 @@ N -- (sum (<= (at S (til N)) (at S (+ 1 (til N)))))
 
 (asc (asc V2)) -- (asc V2)
 (reverse (asc V2)) -- (desc V2)
+
+;; ---- RAY_IS_ERR propagation: asc(erroring arg) ----
+;; asc must propagate inner errors via RAY_IS_ERR rather than dispatch
+;; to its sort path.
+(asc (round "x"))         !- type
+(asc (+ "abc" 1))         !- type
+(asc (- 'a 1))            !- type
+(asc (sqrt 'foo))         !- type
+;; deep chain: round → asc → at, multiple propagation guards
+(at (asc (round "x")) 0)  !- type
+;; xasc on erroring table
+(xasc (table [a] (list (round "x"))) 'a) !- type
