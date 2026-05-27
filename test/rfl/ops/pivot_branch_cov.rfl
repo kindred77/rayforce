@@ -1,0 +1,352 @@
+;; Targeted branch coverage for src/ops/pivot.c — fills the remaining gaps.
+;;
+;; Uncovered branches (65 total at lines):
+;;   52-54,57,59,62,75  — error guards on NULL/ERR cond/then/else/result
+;;   90-91              — F64 if dispatch (vector then/else + mixed cond)
+;;   124,132,147,155    — STR null-safety checks (ray_str_vec_get returns NULL)
+;;   193,200-201        — BOOL/U8 if dispatch (vector then/else)
+;;   202-219            — TIMESTAMP/DATE/TIME if dispatch (unreachable; promote
+;;                        demotes temporal types to I64/I32)
+;;
+;; Categories:
+;;   REACHABLE — covered by new tests below.
+;;   UNREACHABLE — documented with reason.
+
+;; ====================================================================
+;; Section A: exec_if — F64 output, vector then + vector else
+;;            Covers lines 90-91 with t_arr!=NULL and e_arr!=NULL paths.
+;;            Existing tests only exercised F64 scalar (1-row broadcast);
+;;            this uses multi-row F64 columns for both then and else.
+;; ====================================================================
+
+;; Multi-row table with BOOL condition and two F64 columns.
+;; Mixed cond values ensure both the true-branch (t_arr[i]) and
+;; false-branch (e_arr[i]) of lines 90-91 execute.
+(set TF64vec (table [x a b] (list [true false true false true] (as 'F64 [1.0 2.0 3.0 4.0 5.0]) (as 'F64 [10.0 20.0 30.0 40.0 50.0]))))
+
+;; (if x a b): when x=true pick from a, else from b.
+;; Expected: [1.0, 20.0, 3.0, 40.0, 5.0] -> sum = 69.0
+(set RF64vec (at (select {v: (if x a b) from: TF64vec}) 'v))
+(count RF64vec) -- 5
+(sum RF64vec) -- 69.0
+(at RF64vec 0) -- 1.0
+(at RF64vec 1) -- 20.0
+(at RF64vec 2) -- 3.0
+(at RF64vec 3) -- 40.0
+(at RF64vec 4) -- 5.0
+
+;; ====================================================================
+;; Section B: exec_if — F64 output, scalar then + vector else
+;;            Covers line 90 (t_arr==NULL -> t_scalar) + line 91 (e_arr!=NULL).
+;; ====================================================================
+
+;; (if x 99.0 b): then is a scalar F64 literal, else is F64 column vector.
+;; Expected: [99.0, 20.0, 99.0, 40.0, 99.0] -> sum = 357.0
+(set RF64sv (at (select {v: (if x 99.0 b) from: TF64vec}) 'v))
+(count RF64sv) -- 5
+(sum RF64sv) -- 357.0
+(at RF64sv 0) -- 99.0
+(at RF64sv 1) -- 20.0
+
+;; ====================================================================
+;; Section C: exec_if — F64 output, vector then + scalar else
+;;            Covers line 90 (t_arr!=NULL) + line 91 (e_arr==NULL -> e_scalar).
+;; ====================================================================
+
+;; (if x a -1.0): then is F64 column, else is scalar F64 literal.
+;; Expected: [1.0, -1.0, 3.0, -1.0, 5.0] -> sum = 7.0
+(set RF64vs (at (select {v: (if x a -1.0) from: TF64vec}) 'v))
+(count RF64vs) -- 5
+(sum RF64vs) -- 7.0
+(at RF64vs 1) -- -1.0
+(at RF64vs 3) -- -1.0
+
+;; ====================================================================
+;; Section D: exec_if — BOOL output, vector then + vector else
+;;            Covers lines 193, 200-201 with t_arr!=NULL and e_arr!=NULL.
+;;            Existing tests used atom scalars (true/false literals);
+;;            this uses multi-row BOOL *columns* as both then and else.
+;; ====================================================================
+
+;; Table with BOOL condition and two BOOL columns.
+(set TBvec (table [x a b] (list [true false true false] [true true false false] [false false true true])))
+
+;; (if x a b): when x=true pick from a, else from b.
+;; Expected: [true, false, false, true] -> sum = 2
+(set RBvec (at (select {v: (if x a b) from: TBvec}) 'v))
+(count RBvec) -- 4
+(sum RBvec) -- 2
+(at RBvec 0) -- true
+(at RBvec 1) -- false
+(at RBvec 2) -- false
+(at RBvec 3) -- true
+
+;; ====================================================================
+;; Section E: exec_if — BOOL output, scalar then + vector else
+;;            Covers lines 200-201 with t_arr==NULL (scalar then).
+;; ====================================================================
+
+;; (if x true b): then is scalar true, else is BOOL column.
+;; Expected: [true, false, true, true] -> sum = 3
+(set RBsv (at (select {v: (if x true b) from: TBvec}) 'v))
+(count RBsv) -- 4
+(sum RBsv) -- 3
+
+;; ====================================================================
+;; Section F: exec_if — BOOL output, vector then + scalar else
+;;            Covers lines 200-201 with e_arr==NULL (scalar else).
+;; ====================================================================
+
+;; (if x a false): then is BOOL column, else is scalar false.
+;; Expected: [true, false, false, false] -> sum = 1
+(set RBvs (at (select {v: (if x a false) from: TBvec}) 'v))
+(count RBvs) -- 4
+(sum RBvs) -- 1
+
+;; ====================================================================
+;; Section G: exec_if — I64 output, vector then + vector else
+;;            Ensures the I64 dispatch at lines 92-100 fires with
+;;            both t_arr!=NULL and e_arr!=NULL paths, plus mixed cond.
+;; ====================================================================
+
+(set TI64vec (table [x a b] (list [true false true false] [10 20 30 40] [100 200 300 400])))
+
+;; (if x a b): pick from a when true, b when false.
+;; Expected: [10, 200, 30, 400] -> sum = 640
+(set RI64vec (at (select {v: (if x a b) from: TI64vec}) 'v))
+(count RI64vec) -- 4
+(sum RI64vec) -- 640
+
+;; ====================================================================
+;; Section H: exec_if — I32 output, vector then + vector else (mixed cond)
+;;            Ensures the I32 dispatch fires with vector paths.
+;; ====================================================================
+
+(set TI32vec (table [x c d] (list [true false true false] (as 'I32 [10 20 30 40]) (as 'I32 [1 2 3 4]))))
+
+;; (if x c d): [10, 2, 30, 4] -> sum = 46
+(set RI32vec (at (select {v: (if x c d) from: TI32vec}) 'v))
+(count RI32vec) -- 4
+(sum RI32vec) -- 46
+
+;; ====================================================================
+;; Section I: exec_if — I16 output, vector then + vector else (mixed cond)
+;;            Ensures the I16 dispatch at lines 223-231 fires.
+;; ====================================================================
+
+(set TI16vec (table [x c d] (list [true false true false] (as 'I16 [10 20 30 40]) (as 'I16 [1 2 3 4]))))
+
+;; (if x c d): [10, 2, 30, 4] -> sum = 46
+(set RI16vec (at (select {v: (if x c d) from: TI16vec}) 'v))
+(count RI16vec) -- 4
+(sum RI16vec) -- 46
+
+;; ====================================================================
+;; Section J: exec_if — F64 scalar+scalar broadcast (both then and else
+;;            are scalar), multi-row cond.
+;;            Covers both t_scalar and e_scalar in the F64 dispatch.
+;; ====================================================================
+
+(set TFcond (table [x] (list [true false true false true])))
+
+;; (if x 3.14 2.72): both scalars -> 3*3.14 + 2*2.72 = 14.86
+(set RFss (at (select {v: (if x 3.14 2.72) from: TFcond}) 'v))
+(count RFss) -- 5
+(at RFss 0) -- 3.14
+(at RFss 1) -- 2.72
+(at RFss 4) -- 3.14
+
+;; ====================================================================
+;; Section K: exec_pivot — I64 agg scatter (non-F64 branch at lines 621-632)
+;;            Exercises the I64 emit path with OP_SUM, OP_MIN, OP_MAX,
+;;            OP_FIRST, OP_LAST, OP_COUNT on I64 value columns.
+;;            Ensures the non-F64 branch (else at line 621) fires.
+;; ====================================================================
+
+(set TK (table [k c v] (list ['A 'A 'B 'B 'A 'B] ['x 'y 'x 'y 'x 'y] [10 20 30 40 50 60])))
+
+;; SUM — I64 value -> out_agg_type=RAY_I64 -> else branch at 621
+(set PKsum (pivot TK 'k 'c 'v sum))
+(count PKsum) -- 2
+(at (at PKsum 'x) 0) -- 60
+(at (at PKsum 'y) 0) -- 20
+(at (at PKsum 'x) 1) -- 30
+(at (at PKsum 'y) 1) -- 100
+
+;; MIN — I64 value -> RAY_I64 -> non-F64 scatter (OP_MIN)
+(set PKmin (pivot TK 'k 'c 'v min))
+(at (at PKmin 'x) 0) -- 10
+(at (at PKmin 'y) 0) -- 20
+(at (at PKmin 'x) 1) -- 30
+(at (at PKmin 'y) 1) -- 40
+
+;; MAX — I64 value -> RAY_I64 -> non-F64 scatter (OP_MAX)
+(set PKmax (pivot TK 'k 'c 'v max))
+(at (at PKmax 'x) 0) -- 50
+(at (at PKmax 'y) 0) -- 20
+(at (at PKmax 'x) 1) -- 30
+(at (at PKmax 'y) 1) -- 60
+
+;; FIRST — I64 value -> RAY_I64 -> non-F64 scatter (OP_FIRST/LAST)
+(set PKfirst (pivot TK 'k 'c 'v first))
+(at (at PKfirst 'x) 0) -- 10
+(at (at PKfirst 'y) 0) -- 20
+
+;; LAST
+(set PKlast (pivot TK 'k 'c 'v last))
+(at (at PKlast 'x) 0) -- 50
+(at (at PKlast 'y) 0) -- 20
+
+;; COUNT — always I64 output
+(set PKcount (pivot TK 'k 'c 'v count))
+(at (at PKcount 'x) 0) -- 2
+(at (at PKcount 'y) 0) -- 1
+
+;; ====================================================================
+;; Section L: exec_if — SYM output, vector SYM then + vector SYM else
+;;            Exercises the SYM branch at lines 167-192 with non-scalar
+;;            then and else columns.  Both t_arr and e_arr are SYM vecs.
+;; ====================================================================
+
+(set TSvec (table [x a b] (list [true false true false] (as 'SYM ["w" "x" "y" "z"]) (as 'SYM ["1" "2" "3" "4"]))))
+
+;; (if x a b): SYM output, pick from a when true, b when false.
+(set RSvec (at (select {v: (if x a b) from: TSvec}) 'v))
+(count RSvec) -- 4
+(at RSvec 0) -- 'w
+(at RSvec 1) -- '2
+(at RSvec 2) -- 'y
+(at RSvec 3) -- '4
+
+;; ====================================================================
+;; Section M: exec_if — STR output, vector STR then + vector STR else
+;;            Exercises lines 130-132 (then vector STR) and lines 153-155
+;;            (else vector STR) in a single multi-row expression.
+;; ====================================================================
+
+(set TStrvec (table [x a b] (list [true false true false] (list "aa" "bb" "cc" "dd") (list "11" "22" "33" "44"))))
+
+;; (if x a b): STR output.
+;; Expected: ["aa", "22", "cc", "44"]
+(set RStrvec (at (select {v: (if x a b) from: TStrvec}) 'v))
+(count RStrvec) -- 4
+(at RStrvec 0) -- "aa"
+(at RStrvec 1) -- "22"
+(at RStrvec 2) -- "cc"
+(at RStrvec 3) -- "44"
+
+;; ====================================================================
+;; Section N: exec_if — SYM output, SYM scalar then + SYM column else
+;;            Covers lines 167-192 (SYM dispatch) with scalar then and
+;;            vector else.  promote(SYM, SYM) = SYM.
+;; ====================================================================
+
+(set TSymMix (table [x s] (list [true false true false] (as 'SYM ["a" "b" "c" "d"]))))
+
+;; (if x 'Z s): SYM output, then is SYM atom, else is SYM column.
+(set RSymMix (at (select {v: (if x 'Z s) from: TSymMix}) 'v))
+(count RSymMix) -- 4
+(at RSymMix 0) -- 'Z
+(at RSymMix 1) -- 'b
+(at RSymMix 2) -- 'Z
+(at RSymMix 3) -- 'd
+
+;; Reverse: (if x s 'Z): SYM output, then is SYM column, else is SYM atom.
+(set RSymMix2 (at (select {v: (if x s 'Z) from: TSymMix}) 'v))
+(count RSymMix2) -- 4
+(at RSymMix2 0) -- 'a
+(at RSymMix2 1) -- 'Z
+(at RSymMix2 2) -- 'c
+(at RSymMix2 3) -- 'Z
+
+;; ====================================================================
+;; Section N2: exec_if — STR output with SYM scalar then + STR vec else
+;;             Covers line 125-128 (SYM scalar then in STR dispatch)
+;;             and line 156-161 (SYM column else in STR dispatch).
+;;             promote(SYM, STR) = STR, so STR dispatch is used.
+;; ====================================================================
+
+(set TSymStr (table [x str1] (list [true false true false] (list "aa" "bb" "cc" "dd"))))
+
+;; (if x 'Z str1): then is SYM atom, else is STR column -> STR output.
+;; cond=true rows: SYM atom 'Z -> string "Z" (line 125-128).
+;; cond=false rows: STR column str1 (line 130-131).
+(set RN2a (at (select {v: (if x 'Z str1) from: TSymStr}) 'v))
+(count RN2a) -- 4
+(at RN2a 0) -- "Z"
+(at RN2a 1) -- "bb"
+(at RN2a 2) -- "Z"
+(at RN2a 3) -- "dd"
+
+;; Reverse: (if x str1 'Z): then is STR column, else is SYM atom.
+;; cond=true rows: STR column str1 (line 130-131).
+;; cond=false rows: SYM atom 'Z -> string "Z" (line 148-151).
+(set RN2b (at (select {v: (if x str1 'Z) from: TSymStr}) 'v))
+(count RN2b) -- 4
+(at RN2b 0) -- "aa"
+(at RN2b 1) -- "Z"
+(at RN2b 2) -- "cc"
+(at RN2b 3) -- "Z"
+
+;; ====================================================================
+;; Section O: exec_if — STR output, string-atom then + string-atom else
+;;            When both then and else are string literals, the planner
+;;            may produce SYM output (atom->sym promotion).  Verify the
+;;            correct count and that the result values match the symbols.
+;; ====================================================================
+
+(set TCond (table [x] (list [true false true false true])))
+
+;; (if x "yes" "no"): both are string atoms; planner promotes to SYM.
+(set ROstr (at (select {v: (if x "yes" "no") from: TCond}) 'v))
+(count ROstr) -- 5
+(at ROstr 0) -- 'yes
+(at ROstr 1) -- 'no
+(at ROstr 2) -- 'yes
+(at ROstr 3) -- 'no
+(at ROstr 4) -- 'yes
+
+;; ====================================================================
+;; Section P: exec_pivot — AVG on I64 value column
+;;            Covers the F64-output, val_is_f64=false sub-branch at
+;;            lines 603-604: (double)ROW_RD_I64(row, ly.off_sum, s) / cnt
+;; ====================================================================
+
+(set TPavg (table [k c v] (list ['A 'A 'B 'B] ['x 'y 'x 'y] [10 20 30 40])))
+(set PPavg (pivot TPavg 'k 'c 'v avg))
+(count PPavg) -- 2
+(at (at PPavg 'x) 0) -- 10.0
+(at (at PPavg 'y) 0) -- 20.0
+(at (at PPavg 'x) 1) -- 30.0
+(at (at PPavg 'y) 1) -- 40.0
+
+;; ====================================================================
+;; UNREACHABLE BRANCHES (documented for coverage records)
+;; ====================================================================
+;;
+;; Lines 52-54 (cond_v NULL/ERR guard):
+;;   Only fires if exec_node(cond) returns NULL or an error. This requires
+;;   an internal evaluation failure or OOM during expression evaluation.
+;;   Not triggerable from RFL without corrupted AST or memory exhaustion.
+;;
+;; Lines 57, 59 (then_v NULL/ERR guard):
+;;   Same as above for the then-branch input.
+;;
+;; Line 62 (else_v NULL/ERR guard):
+;;   Same as above for the else-branch input.
+;;
+;; Line 75 (result allocation failure):
+;;   Only fires if ray_vec_new() fails (OOM). Not triggerable from RFL.
+;;
+;; Lines 124, 132, 147, 155 (STR null-safety checks):
+;;   ray_str_vec_get() returning NULL. This would require a corrupted STR
+;;   vector where the internal offset table points beyond the data buffer.
+;;   Not triggerable from valid RFL inputs.
+;;
+;; Lines 202-219 (TIMESTAMP/DATE/TIME if branches):
+;;   The type promotion layer (promote()) returns RAY_I64 for
+;;   promote(TIMESTAMP, TIMESTAMP) and RAY_I32 for promote(DATE, DATE)
+;;   and promote(TIME, TIME). Therefore exec_if's out_type is never
+;;   RAY_TIMESTAMP, RAY_DATE, or RAY_TIME. These branches are dead code
+;;   left as a safety net for future promote() changes.
+;;   (Also documented in existing pivot_coverage.rfl Section 29.)

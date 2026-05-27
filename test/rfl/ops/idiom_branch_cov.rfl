@@ -1,0 +1,359 @@
+;; idiom_branch_cov.rfl — branch coverage for src/ops/idiom.c
+;;
+;; Targets uncovered branches at lines:
+;;   46,50,65,69,79,82,88,90,96,108,115,124,138,142,156,160,
+;;   196,214,216,238,246,252,253,254,261,262,263,272,277
+;;
+;; Strategy: exercises the False (happy-path) sides of defensive guards
+;; under diverse scenarios — different column types, null-bearing vs
+;; null-free scan columns, parted columns, joined tables, nested idiom
+;; chains, non-matching opcodes, select-by graph shapes.
+;;
+;; ALL 65 uncovered branches (True sides) in idiom.c are unreachable
+;; from RFL without allocator injection or de-static'ing:
+;;
+;;   Lines 46,65,138,156 (8 branches): NULL-input guards on
+;;     node->inputs[0].  The graph builder always populates inputs for
+;;     nodes with arity >= 1.  Would require corrupted graph state.
+;;
+;;   Lines 50,69,142,160 (4 branches): graph_alloc_node_opt returning
+;;     NULL.  Only fires on OOM.  Requires allocator injection.
+;;
+;;   Lines 79 (3 branches): scan_source_col NULL guards (!g, !src,
+;;     src->opcode != OP_SCAN).  Only called with valid g/src/OP_SCAN.
+;;
+;;   Line 82 (1 branch): find_ext returning NULL for a valid OP_SCAN.
+;;     The graph builder always creates an ext for OP_SCAN nodes.
+;;
+;;   Lines 88,90 (3 branches): Multi-table path in scan_source_col.
+;;     stored_table_id > 0 requires OP_SCAN referencing a secondary
+;;     join table, but the idiom pass only sees direct OP_SCAN children
+;;     of OP_ASC which always reference the primary table (g->table).
+;;
+;;   Line 96 (1 branch): !tbl after resolving the scan table.
+;;     g->table is always set for any query that reaches the idiom pass.
+;;
+;;   Lines 108 (2 branches): NULL guards on asc/asc->inputs[0] in
+;;     pre_no_nulls_on_asc_input.  Same as lines 46/65 — always valid.
+;;
+;;   Lines 115 (2 branches): find_ext/ext->literal NULL guards for
+;;     OP_CONST.  The graph builder always populates these.
+;;
+;;   Line 124 (1 branch): scan_source_col returning NULL from
+;;     pre_no_nulls_on_asc_input.  Requires a valid OP_SCAN with no
+;;     matching column — not reachable through normal query planning.
+;;
+;;   Line 196 (1 branch): opcode >= RAY_IDIOM_OPCODE_CAP (128) in
+;;     build_index.  All current idiom entries use opcodes < 128.
+;;
+;;   Lines 214 (2 branches): try_rewrite NULL/dead-flag guards.
+;;     !node is unreachable (g->nodes[] always valid for nid < nc).
+;;     OP_FLAG_DEAD is never set before the idiom pass runs — it is
+;;     only set by try_rewrite itself, and each node is visited once.
+;;
+;;   Line 216 (1 branch): node->opcode >= RAY_IDIOM_OPCODE_CAP.
+;;     All current opcodes are < 128 (max is OP_GROUP_SUM_COUNT_ROWFORM=114).
+;;
+;;   Lines 238 (3 branches): ray_idiom_pass entry guards (!g, !root,
+;;     node_count == 0).  The optimizer always passes a valid graph/root.
+;;
+;;   Line 246 (1 branch): nc > UINT32_MAX/4 overflow guard.  Requires
+;;     ~1 billion graph nodes.
+;;
+;;   Lines 252-254 (4 branches): stk1/stk2 OOM during heap allocation.
+;;     Requires allocator injection.
+;;
+;;   Lines 261-263 (3 branches): visited[] OOM.  Same as above.
+;;
+;;   Line 272 (1 branch): nid >= nc — node ID out of bounds.  Would
+;;     require corrupted node->inputs[] pointers.  Graph builder and
+;;     graph_alloc_node_opt guarantee IDs < nc.
+;;
+;;   Line 277 (1 branch): dead flag during stk1 traversal.  The stk1
+;;     phase runs BEFORE any rewrites; no nodes are dead at that point.
+;;     Dead flags are only set during the subsequent stk2 post-order
+;;     processing phase, which doesn't revisit stk1.
+;;
+;; Total unreachable branches: 42 (True sides of defensive guards)
+;; The remaining 23 uncovered "branches" are the False/continuation
+;; sides of multi-condition expressions already counted above.
+
+;; ──────────────────────────────────────────────────────────────────────
+;; Section A: scan_source_col — single-table OP_SCAN path (line 88-94)
+;; ──────────────────────────────────────────────────────────────────────
+;; When the input to asc is an OP_SCAN on a single-table query,
+;; stored_table_id == 0, so scan_source_col falls through to
+;; g->table (line 93).  pre_no_nulls_on_asc_input then checks the
+;; column's RAY_ATTR_HAS_NULLS bit.
+
+;; Null-free table column: precondition fires true → rewrite to OP_MIN/OP_MAX
+(set TA (table [v] (list [5 3 8 1 7 2 6 4])))
+(first (asc (at TA 'v))) -- 1
+(last  (asc (at TA 'v))) -- 8
+(count (distinct (at TA 'v))) -- 8
+(count (asc (at TA 'v))) -- 8
+(count (desc (at TA 'v))) -- 8
+(count (reverse (at TA 'v))) -- 8
+
+;; Null-bearing table column: precondition fires false → slow path
+;; Exercises scan_source_col line 96 (tbl not null) and line 126
+;; returning false because RAY_ATTR_HAS_NULLS is set.
+(set TAN (table [v] (list [5 0Nl 3 0Nl 1])))
+(first (asc (at TAN 'v))) -- 1
+(last  (asc (at TAN 'v))) -- 5
+(count (distinct (at TAN 'v))) -- 4
+(count (asc (at TAN 'v))) -- 5
+
+;; Multi-column table: idiom on one column while another exists
+(set TAM (table [a b] (list [10 20 30 40 50] [5 4 3 2 1])))
+(first (asc (at TAM 'b))) -- 1
+(last  (asc (at TAM 'b))) -- 5
+(count (distinct (at TAM 'a))) -- 5
+
+;; ──────────────────────────────────────────────────────────────────────
+;; Section B: pre_no_nulls_on_asc_input — OP_CONST paths (lines 113-120)
+;; ──────────────────────────────────────────────────────────────────────
+;; OP_CONST with a vector literal (already covered in idiom.rfl).
+;; OP_CONST with null-bearing vector: precondition returns false.
+(first (asc [10 0Nl 20 0Nl 30])) -- 10
+(last  (asc [10 0Nl 20 0Nl 30])) -- 30
+
+;; OP_CONST null-free F64 vector — precondition returns true
+(first (asc (as 'F64 [3.0 1.0 2.0]))) -- 1.0
+(last  (asc (as 'F64 [3.0 1.0 2.0]))) -- 3.0
+
+;; OP_CONST null-free I32/I16/U8 vectors — width variants
+(first (asc (as 'I32 [30 10 20]))) -- 10
+(last  (asc (as 'I32 [30 10 20]))) -- 30
+(first (asc (as 'I16 [300 100 200]))) -- 100
+(last  (asc (as 'I16 [300 100 200]))) -- 300
+
+;; ──────────────────────────────────────────────────────────────────────
+;; Section C: parted columns with aggregates
+;; ──────────────────────────────────────────────────────────────────────
+;; Line 125: !ray_is_vec(col) && !RAY_IS_PARTED(col->type)
+;; For a parted column, RAY_IS_PARTED returns true, so the check
+;; passes to line 126.  Parted columns without nulls → rewrite fires.
+;; However, asc/desc/reverse on raw parted columns raises a type error.
+;; Use aggregates that go through select-by where the planner handles
+;; parted sources natively.
+
+(.sys.exec "rm -rf /tmp/rfl_idiom_parted")
+(set PTA (table [v] (list [1 2 3])))
+(set PTB (table [v] (list [4 5 6])))
+(.db.splayed.set "/tmp/rfl_idiom_parted/1/t/" PTA)
+(.db.splayed.set "/tmp/rfl_idiom_parted/2/t/" PTB)
+(set PT (.db.parted.get "/tmp/rfl_idiom_parted/" 't))
+
+;; Parted column: count(distinct) — goes through the idiom rewrite
+;; rw_count_distinct, and scan_source_col line 125 RAY_IS_PARTED path.
+(count (distinct (at PT 'v))) -- 6
+
+;; Parted sum/min/max — these go through the parted agg path, not through
+;; the idiom, but exercising the table scan to confirm parted resolution.
+(sum (at PT 'v)) -- 21
+(min (at PT 'v)) -- 1
+(max (at PT 'v)) -- 6
+
+;; ──────────────────────────────────────────────────────────────────────
+;; Section D: try_rewrite — is_ext_root and non-idiom opcodes (lines 214-216)
+;; ──────────────────────────────────────────────────────────────────────
+;; When the idiom pass walks the graph, it encounters structural nodes
+;; like OP_GROUP, OP_SELECT, OP_SORT — is_ext_root returns true and
+;; try_rewrite bails at line 215.
+;;
+;; Also, non-idiom opcodes (OP_ADD, OP_FILTER, etc.) fall through the
+;; first_idiom[] lookup and the while loop at line 219 exits immediately.
+;;
+;; select-by queries create OP_GROUP + OP_SELECT nodes in the graph.
+;; The post-order walk visits them but try_rewrite skips them.
+
+(set TD (table [k v] (list ['a 'a 'b 'b] [3 1 4 2])))
+
+;; select-by with count(distinct) — graph has OP_GROUP + OP_SELECT
+;; that try_rewrite must skip.
+(set RD (select {cd: (count (distinct v)) from: TD by: k}))
+(sum (at RD 'cd)) -- 4
+
+;; select-by with first(asc) — same graph shape, different idiom
+(set RD2 (select {m: (first (asc v)) from: TD by: k}))
+(at (at RD2 'm) 0) -- 1
+(at (at RD2 'm) 1) -- 2
+
+;; select with where: adds OP_FILTER — try_rewrite sees it, no match
+(set RD3 (select {m: (first (asc v)) from: TD by: k where: (> v 0)}))
+(at (at RD3 'm) 0) -- 1
+(at (at RD3 'm) 1) -- 2
+
+;; Arithmetic inside idiom: (count (distinct (+ v 1))) — the OP_ADD node
+;; is visited by the walk but try_rewrite finds no matching idiom row.
+(count (distinct (+ [1 1 2 2 3] 1))) -- 3
+
+;; ──────────────────────────────────────────────────────────────────────
+;; Section E: try_rewrite — node with no matching child0_op (line 221)
+;; ──────────────────────────────────────────────────────────────────────
+;; When the outer opcode matches an idiom row but the child0's opcode
+;; does NOT match, the while loop continues to next_idiom.
+;; (count (+ v 1)) — OP_COUNT's child is OP_ADD, not OP_DISTINCT/ASC/DESC/REVERSE.
+(count (+ [1 2 3] 1)) -- 3
+
+;; (first ...) without asc — OP_FIRST's child is not OP_ASC
+(first [10 20 30]) -- 10
+
+;; (last ...) without asc — OP_LAST's child is not OP_ASC
+(last [10 20 30]) -- 30
+
+;; ──────────────────────────────────────────────────────────────────────
+;; Section F: dead flag in graph walk (line 277)
+;; ──────────────────────────────────────────────────────────────────────
+;; When a nested idiom pattern is present, the inner rewrite marks the
+;; inner node dead (OP_FLAG_DEAD) during post-order processing.  Then
+;; the stk1 traversal encounters the dead node and continues (line 277).
+;;
+;; Pattern: count(reverse(distinct V)) — two idioms chain:
+;;   1. Post-order first rewrites inner: but reverse(distinct) is not
+;;      an idiom (reverse is not the root of any idiom). The outer
+;;      count(reverse(distinct V)) matches count(reverse) idiom, rewrites
+;;      to count(distinct V).  Wait — actually idiom is root=OP_COUNT,
+;;      child0=OP_REVERSE.  So: count -> inputs[0] = reverse.
+;;      reverse is the child0.  The idiom fires: rw_count_passthrough
+;;      replaces count(reverse(distinct V)) with count(distinct V).
+;;      reverse is marked dead.
+;;
+;; Nested: count(asc(distinct V)) — count -> asc -> distinct
+;;   count(asc) matches → rewrite to count(distinct V).  asc marked dead.
+;;   If distinct was already walked and no idiom matched (distinct has
+;;   no parent idiom), distinct survives.
+(count (asc (distinct [1 1 2 2 3]))) -- 3
+(count (desc (distinct [1 1 2 2 3]))) -- 3
+(count (reverse (distinct [1 1 2 2 3]))) -- 3
+
+;; Deeper nesting: count(asc(reverse V))
+;; Post-order: reverse(V) — no idiom match (OP_REVERSE not a root_op).
+;; Then: count(asc(reverse V)) — count's child0 is asc → count(asc) matches!
+;; Rewrite: count(reverse V).  asc marked dead.
+;; But wait — the walk already pushed reverse's children into stk2.
+;; The dead asc won't be re-visited (visited[] guard), but try_rewrite
+;; sees it and returns NULL (line 214: dead flag check).
+(count (asc (reverse [1 2 3 4 5]))) -- 5
+(count (desc (reverse [1 2 3 4 5]))) -- 5
+
+;; Triple nesting: count(asc(desc(asc V)))
+;; This creates a chain where the inner desc(asc V) has no idiom match,
+;; then count(asc(desc(asc V))) fires count(asc) → count(desc(asc V)).
+(count (asc (desc (asc [10 20 30])))) -- 3
+
+;; ──────────────────────────────────────────────────────────────────────
+;; Section G: ray_idiom_pass entry guard (line 238)
+;; ──────────────────────────────────────────────────────────────────────
+;; The entry guard `if (!g || !root || g->node_count == 0) return root;`
+;; has three conditions.  The `!g` and `g->node_count == 0` branches
+;; are unreachable from RFL because the runtime always builds a valid
+;; graph.  The `!root` branch is unreachable for the same reason.
+;;
+;; However, a trivial expression (atom) should produce a minimal graph
+;; that still goes through the idiom pass but with no idiom matches,
+;; exercising the normal-flow path.
+42 -- 42
+(+ 1 2) -- 3
+
+;; ──────────────────────────────────────────────────────────────────────
+;; Section H: scan_source_col — multi-table path (lines 88-91)
+;; ──────────────────────────────────────────────────────────────────────
+;; When OP_SCAN has stored_table_id > 0 (secondary table in a join),
+;; scan_source_col uses g->tables[table_id].  To trigger this, we need
+;; (first (asc col)) where col comes from a join's secondary table.
+;; However, in a join query like (inner-join [k] T1 T2), the column
+;; references go through the OP_JOIN node, not directly to OP_SCAN.
+;; The idiom pass only fires when the DAG shape is
+;;   OP_FIRST -> OP_ASC -> OP_SCAN (direct).
+;;
+;; Multi-table path is exercised when a select-by uses a joined table
+;; as its source:
+(set TL (table [k v] (list [1 2 3] [10 20 30])))
+(set TR (table [k w] (list [1 2 3] [100 200 300])))
+(set TJ (inner-join [k] TL TR))
+;; idiom over joined result: count(distinct) — the column reference
+;; after join resolution may still be OP_SCAN referencing a secondary table.
+(count (distinct (at TJ 'v))) -- 3
+(count (distinct (at TJ 'w))) -- 3
+(count (asc (at TJ 'v))) -- 3
+(first (asc (at TJ 'v))) -- 10
+(last  (asc (at TJ 'v))) -- 30
+
+;; ──────────────────────────────────────────────────────────────────────
+;; Section I: select-by with idiom over F64 table column scan
+;; ──────────────────────────────────────────────────────────────────────
+;; Exercises scan_source_col with F64 columns to ensure type-width
+;; variance in the OP_SCAN path.
+(set TF (table [k v] (list ['x 'x 'y 'y] (as 'F64 [1.5 2.5 3.5 4.5]))))
+(set RF (select {m: (first (asc v)) from: TF by: k}))
+(at (at RF 'm) 0) -- 1.5
+(at (at RF 'm) 1) -- 3.5
+(set RF2 (select {m: (last (asc v)) from: TF by: k}))
+(at (at RF2 'm) 0) -- 2.5
+(at (at RF2 'm) 1) -- 4.5
+
+;; ──────────────────────────────────────────────────────────────────────
+;; Section J: null-bearing table column — OP_SCAN + HAS_NULLS
+;; ──────────────────────────────────────────────────────────────────────
+;; The column scan finds a column with RAY_ATTR_HAS_NULLS → precondition
+;; returns false → slow path (no rewrite to OP_MIN/OP_MAX).
+;; Use bare expression form (not select-by) to test the scan path.
+(set TN (table [k v] (list ['a 'a 'a 'b 'b] [1 0Nl 3 0Nl 5])))
+
+;; first/last(asc) on null-bearing scan column — precondition false → slow path
+(first (asc (at TN 'v))) -- 1
+(last  (asc (at TN 'v))) -- 5
+
+;; count-based idioms work fine in select-by with nulls
+(set RN3 (select {cd: (count (distinct v)) from: TN by: k}))
+(at (at RN3 'cd) 0) -- 3
+(at (at RN3 'cd) 1) -- 2
+
+(set RN4 (select {c: (count (asc v)) from: TN by: k}))
+(at (at RN4 'c) 0) -- 3
+(at (at RN4 'c) 1) -- 2
+
+;; ──────────────────────────────────────────────────────────────────────
+;; Section K: SYM-typed vectors — OP_CONST path, non-numeric distinct
+;; ──────────────────────────────────────────────────────────────────────
+;; count(distinct) on SYM vector exercises rw_count_distinct with SYM type.
+(count (distinct ['a 'b 'c 'a 'b])) -- 3
+(count (asc ['a 'b 'c 'a 'b])) -- 5
+(count (desc ['a 'b 'c 'a 'b])) -- 5
+(count (reverse ['a 'b 'c 'a 'b])) -- 5
+
+;; ──────────────────────────────────────────────────────────────────────
+;; Section L: BOOL-typed vectors — edge case for idiom rewrites
+;; ──────────────────────────────────────────────────────────────────────
+(count (distinct [true false true false])) -- 2
+(count (asc [true false true])) -- 3
+(first (asc [true false true])) -- 0
+(last  (asc [true false true])) -- 1
+
+;; ──────────────────────────────────────────────────────────────────────
+;; Section M: large graph — exercises heap-alloc path for stk1/stk2
+;; ──────────────────────────────────────────────────────────────────────
+;; Lines 250-251: stk1/stk2 use stack-local arrays when cap <= 256,
+;; else heap-alloc.  A graph with many nodes (> 128 unique ops) would
+;; trigger the heap path.  However, producing > 128 graph nodes from a
+;; single RFL expression is impractical without very deep nesting.
+;; The local-array path is the common case and is already well-covered.
+
+;; Deep arithmetic chain — creates many graph nodes
+(set V [1 2 3 4 5])
+(count (distinct (+ (+ (+ (+ V 1) 1) 1) 1))) -- 5
+
+;; ──────────────────────────────────────────────────────────────────────
+;; Section N: first/last on desc (NOT an idiom — no rewrite should fire)
+;; ──────────────────────────────────────────────────────────────────────
+;; Ensures that (first (desc v)) does NOT get rewritten — there is no
+;; idiom row for OP_FIRST/OP_DESC.  The slow path runs.
+(first (desc [3 1 4 1 5 9])) -- 9
+(last  (desc [3 1 4 1 5 9])) -- 1
+
+;; Over table columns too
+(set TDesc (table [v] (list [5 3 8 1 7])))
+(first (desc (at TDesc 'v))) -- 8
+(last  (desc (at TDesc 'v))) -- 1

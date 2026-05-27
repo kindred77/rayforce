@@ -1,0 +1,360 @@
+;; join_branch_cov.rfl — branch-coverage tests for src/ops/join.c
+;;
+;; Targets uncovered branches at lines:
+;;   33, 35, 75, 85, 126, 172, 180, 182, 194, 196, 203, 237, 255, 265,
+;;   293, 298, 301-303, 316-318, 349-351, 379, 419, 427-429
+;;
+;; Many branches are OOM-only or require radix path (>65536 rows).
+;; This file covers what is reachable from the RFL layer.
+
+;; ──────────────────────────────────────────────────────────────────
+;; L35: hash_row_keys — NULL values in join key column
+;; NULL keys should produce unique hashes, so NULLs never match.
+;; ──────────────────────────────────────────────────────────────────
+
+;; inner-join with null keys in left — nulls don't match
+(set jL (table [id val] (list [1 0Nl 3] [10 20 30])))
+(set jR (table [id val2] (list [1 3] [100 300])))
+(count (inner-join [id] jL jR)) -- 2
+(at (inner-join [id] jL jR) 'val) -- [10 30]
+
+;; inner-join with null keys in right — nulls don't match
+(set jL2 (table [id val] (list [1 2 3] [10 20 30])))
+(set jR2 (table [id val2] (list [1 0Nl 3] [100 200 300])))
+(count (inner-join [id] jL2 jR2)) -- 2
+(at (inner-join [id] jL2 jR2) 'val2) -- [100 300]
+
+;; inner-join with null keys in both sides — nulls never match nulls
+(set jL3 (table [id val] (list [0Nl 2 3] [10 20 30])))
+(set jR3 (table [id val2] (list [0Nl 2 3] [100 200 300])))
+(count (inner-join [id] jL3 jR3)) -- 2
+
+;; left-join with null keys — unmatched left rows preserved with null right
+(set jL4 (table [id val] (list [1 0Nl 3] [10 20 30])))
+(set jR4 (table [id val2] (list [1 3] [100 300])))
+(count (left-join [id] jL4 jR4)) -- 3
+
+;; left-join with null in right key — no match for that right row
+(set jL5 (table [id val] (list [1 2 3] [10 20 30])))
+(set jR5 (table [id val2] (list [1 0Nl] [100 200])))
+(count (left-join [id] jL5 jR5)) -- 3
+
+;; ──────────────────────────────────────────────────────────────────
+;; L379: join_keys_eq — F64 key comparison (false branch: mismatch)
+;; ──────────────────────────────────────────────────────────────────
+
+;; F64 keys — some match, some don't (exercises both true and false branches)
+(set fL (table [price val] (list [1.0 2.0 3.0 4.0] [10 20 30 40])))
+(set fR (table [price val2] (list [1.0 3.0 5.0] [100 300 500])))
+(count (inner-join [price] fL fR)) -- 2
+(at (inner-join [price] fL fR) 'val) -- [10 30]
+(at (inner-join [price] fL fR) 'val2) -- [100 300]
+
+;; F64 keys — left join to exercise mismatch → null fill path
+(count (left-join [price] fL fR)) -- 4
+
+;; F64 keys — no matches at all
+(set fL2 (table [price val] (list [1.0 2.0] [10 20])))
+(set fR2 (table [price val2] (list [3.0 4.0] [30 40])))
+(count (inner-join [price] fL2 fR2)) -- 0
+
+;; ──────────────────────────────────────────────────────────────────
+;; L35 + L379: multi-key join with mixed types including F64 + nulls
+;; ──────────────────────────────────────────────────────────────────
+
+;; Multi-key join with null in one of the keys
+(set mkL (table [k1 k2 val] (list [1 1 2] [10.0 0Nf 30.0] [100 200 300])))
+(set mkR (table [k1 k2 val2] (list [1 2] [10.0 30.0] [1000 3000])))
+(count (inner-join [k1 k2] mkL mkR)) -- 2
+(at (inner-join [k1 k2] mkL mkR) 'val2) -- [1000 3000]
+
+;; Multi-key with both nulls — no match
+(set mkL2 (table [k1 k2 val] (list [0Nl] [10.0] [100])))
+(set mkR2 (table [k1 k2 val2] (list [0Nl] [10.0] [1000])))
+(count (inner-join [k1 k2] mkL2 mkR2)) -- 0
+
+;; ──────────────────────────────────────────────────────────────────
+;; anti-join with null keys
+;; ──────────────────────────────────────────────────────────────────
+
+;; anti-join: null key in left doesn't match anything → preserved
+(set aL (table [id val] (list [1 0Nl 3] [10 20 30])))
+(set aR (table [id] (list [1])))
+(count (anti-join [id] aL aR)) -- 2
+
+;; anti-join: null key in right — doesn't exclude anything
+(set aL2 (table [id val] (list [1 2 3] [10 20 30])))
+(set aR2 (table [id] (list [0Nl 2])))
+(count (anti-join [id] aL2 aR2)) -- 2
+
+;; anti-join with F64 keys
+(set aFL (table [price val] (list [1.0 2.0 3.0] [10 20 30])))
+(set aFR (table [price] (list [2.0])))
+(count (anti-join [price] aFL aFR)) -- 2
+
+;; ──────────────────────────────────────────────────────────────────
+;; asof-join with null time keys — L35 for window_join path
+;; ──────────────────────────────────────────────────────────────────
+
+;; asof-join: null time in left trade → no match (left-outer: preserved with null right cols)
+(set ajL (table [Sym Time Price] (list [a a] [10:00:01.000 0Nt] [100.0 200.0])))
+(set ajR (table [Sym Time Bid] (list [a a] [10:00:00.000 10:00:02.000] [99.0 100.0])))
+(count (asof-join [Sym Time] ajL ajR)) -- 2
+
+;; asof-join: null time in right quote → skipped during merge walk
+(set ajL2 (table [Sym Time Price] (list [a a] [10:00:01.000 10:00:03.000] [100.0 200.0])))
+(set ajR2 (table [Sym Time Bid] (list [a a a] [10:00:00.000 0Nt 10:00:02.000] [99.0 50.0 100.0])))
+(count (asof-join [Sym Time] ajL2 ajR2)) -- 2
+
+;; asof-join: null eq key in left → no match (left-outer: row preserved)
+(set ajL3 (table [Sym Time Price] (list [a 0Ns] [10:00:01.000 10:00:03.000] [100.0 200.0])))
+(set ajR3 (table [Sym Time Bid] (list [a a] [10:00:00.000 10:00:02.000] [99.0 100.0])))
+(count (asof-join [Sym Time] ajL3 ajR3)) -- 2
+
+;; asof-join: null eq key in right → skipped
+(set ajL4 (table [Sym Time Price] (list [a a] [10:00:01.000 10:00:03.000] [100.0 200.0])))
+(set ajR4 (table [Sym Time Bid] (list [a 0Ns a] [10:00:00.000 10:00:01.500 10:00:02.000] [99.0 50.0 100.0])))
+(count (asof-join [Sym Time] ajL4 ajR4)) -- 2
+
+;; ──────────────────────────────────────────────────────────────────
+;; asof-join: inner join type (join_type==0 in exec_window_join)
+;; The RFL asof-join always uses left-outer (type 1), so
+;; exec_window_join L1858 (join_type==1 → out_n=left_n) is exercised.
+;; The join_type==0 path (L1861) is not reachable from RFL.
+;; ──────────────────────────────────────────────────────────────────
+
+;; asof-join: no match at all (left-outer, all right cols null)
+(set ajL5 (table [Sym Time Price] (list [a] [10:00:00.000] [100.0])))
+(set ajR5 (table [Sym Time Bid] (list [b] [10:00:00.000] [99.0])))
+(count (asof-join [Sym Time] ajL5 ajR5)) -- 1
+
+;; asof-join: right time all after left → no match
+(set ajL6 (table [Sym Time Price] (list [a] [10:00:01.000] [100.0])))
+(set ajR6 (table [Sym Time Bid] (list [a a] [10:00:02.000 10:00:03.000] [99.0 100.0])))
+(count (asof-join [Sym Time] ajL6 ajR6)) -- 1
+
+;; ──────────────────────────────────────────────────────────────────
+;; asof-join: multiple partitions with Timestamp — exercises sort
+;; and partition-change detection in merge walk
+;; ──────────────────────────────────────────────────────────────────
+(set ajL7 (table [ID Ts Val] (list [1 2 1 2] [2024.01.01D10:00:01.000000000 2024.01.01D10:00:02.000000000 2024.01.01D10:00:05.000000000 2024.01.01D10:00:06.000000000] [10 20 30 40])))
+(set ajR7 (table [ID Ts Ref] (list [1 1 2 2] [2024.01.01D10:00:00.000000000 2024.01.01D10:00:04.000000000 2024.01.01D10:00:01.000000000 2024.01.01D10:00:05.000000000] [100 200 300 400])))
+(at (asof-join [ID Ts] ajL7 ajR7) 'Ref) -- [100 300 200 400]
+
+;; ──────────────────────────────────────────────────────────────────
+;; asof-join: Date time type (32-bit) — exercises READ_TIME macro L1597
+;; ──────────────────────────────────────────────────────────────────
+(set ajLD (table [Grp Date Val] (list [a a] [2024.01.02 2024.01.05] [10 20])))
+(set ajRD (table [Grp Date Ref] (list [a a] [2024.01.01 2024.01.04] [100 200])))
+(at (asof-join [Grp Date] ajLD ajRD) 'Ref) -- [100 200]
+
+;; ──────────────────────────────────────────────────────────────────
+;; join edge cases: empty tables
+;; ──────────────────────────────────────────────────────────────────
+
+;; inner-join: both empty
+(set eL (table [id val] (list (take [1] 0) (take [1] 0))))
+(set eR (table [id val2] (list (take [1] 0) (take [1] 0))))
+(count (inner-join [id] eL eR)) -- 0
+
+;; left-join: both empty
+(count (left-join [id] eL eR)) -- 0
+
+;; anti-join: both empty
+(count (anti-join [id] eL eR)) -- 0
+
+;; anti-join: left empty, right non-empty
+(set eR2 (table [id val2] (list [1 2 3] [100 200 300])))
+(count (anti-join [id] eL eR2)) -- 0
+
+;; ──────────────────────────────────────────────────────────────────
+;; Duplicate key values — exercises hash collision / chain traversal
+;; ──────────────────────────────────────────────────────────────────
+
+;; inner-join with duplicate keys in right (1:N)
+(set dL (table [id val] (list [1 2] [10 20])))
+(set dR (table [id val2] (list [1 1 2 2 2] [100 101 200 201 202])))
+(count (inner-join [id] dL dR)) -- 5
+
+;; inner-join with duplicate keys in left (N:1)
+(set dL2 (table [id val] (list [1 1 1 2] [10 11 12 20])))
+(set dR2 (table [id val2] (list [1 2] [100 200])))
+(count (inner-join [id] dL2 dR2)) -- 4
+
+;; inner-join with duplicate keys in both sides (N:M)
+(set dL3 (table [id val] (list [1 1 2] [10 11 20])))
+(set dR3 (table [id val2] (list [1 1 2 2] [100 101 200 201])))
+(count (inner-join [id] dL3 dR3)) -- 6
+
+;; left-join with duplicate keys in right (1:N) — all left rows preserved with multiple matches
+(set dL4 (table [id val] (list [1 2 3] [10 20 30])))
+(set dR4 (table [id val2] (list [1 1 2] [100 101 200])))
+(count (left-join [id] dL4 dR4)) -- 4
+
+;; ──────────────────────────────────────────────────────────────────
+;; Type variety: I32 (Date) keys, I16 (Time) keys, Bool keys
+;; for hash/comparison paths
+;; ──────────────────────────────────────────────────────────────────
+
+;; inner-join by Bool — exercises read_col_i64 with small types
+(set bL (table [flag val] (list [true false true] [10 20 30])))
+(set bR (table [flag val2] (list [true false] [100 200])))
+(count (inner-join [flag] bL bR)) -- 3
+
+;; inner-join by Timestamp
+(set tsL (table [ts val] (list [2024.01.01D10:00:00.000000000 2024.01.01D10:00:01.000000000] [10 20])))
+(set tsR (table [ts val2] (list [2024.01.01D10:00:00.000000000] [100])))
+(count (inner-join [ts] tsL tsR)) -- 1
+(at (inner-join [ts] tsL tsR) 'val2) -- [100]
+
+;; ──────────────────────────────────────────────────────────────────
+;; Large table join — triggers radix-partitioned path (>65536 rows)
+;; Exercises lines 75, 85, and the radix build+probe pipeline
+;; ──────────────────────────────────────────────────────────────────
+
+;; Generate large right table (70000 rows) to trigger radix path
+(set bigR (table [id val2] (list (til 70000) (til 70000))))
+;; Small left table — inner join should match all left rows
+(set smallL (table [id val] (list [0 100 500 1000 5000 10000 50000 69999] [1 2 3 4 5 6 7 8])))
+(count (inner-join [id] smallL bigR)) -- 8
+(sum (at (inner-join [id] smallL bigR) 'val)) -- 36
+
+;; Large right + left-join: unmatched left rows preserved
+(set smallL2 (table [id val] (list [0 100 99999] [1 2 3])))
+(count (left-join [id] smallL2 bigR)) -- 3
+
+;; Large left, large right — both sides trigger radix partitioning
+(set bigL (table [id val] (list (til 70000) (til 70000))))
+(count (inner-join [id] bigL bigR)) -- 70000
+
+;; Large join with null keys — exercises L35 on radix path
+(set bigL_null (table [id val] (list (+ 0Nl (til 70000)) (til 70000))))
+;; All keys are null, so no matches
+(count (inner-join [id] bigL_null bigR)) -- 0
+
+;; Large join with left-join — exercises join_type>=1 on radix path
+(count (left-join [id] bigL bigR)) -- 70000
+
+;; Large anti-join — exercises exec_antijoin with moderate table sizes
+(set aLbig (table [id val] (list (til 100) (til 100))))
+(set aRbig (table [id] (list (til 50))))
+(count (anti-join [id] aLbig aRbig)) -- 50
+
+;; ──────────────────────────────────────────────────────────────────
+;; F64 multi-key join — exercises L379 false branch thoroughly
+;; ──────────────────────────────────────────────────────────────────
+
+;; Two F64 keys — partial match
+(set fmL (table [x y val] (list [1.0 1.0 2.0] [10.0 20.0 10.0] [100 200 300])))
+(set fmR (table [x y val2] (list [1.0 2.0] [10.0 10.0] [1000 3000])))
+(count (inner-join [x y] fmL fmR)) -- 2
+
+;; F64 keys with NaN-like edge values (0.0 and -0.0 should be equal in hash)
+(set fnL (table [price val] (list [0.0] [10])))
+(set fnR (table [price val2] (list [0.0] [100])))
+(count (inner-join [price] fnL fnR)) -- 1
+
+;; ──────────────────────────────────────────────────────────────────
+;; Single-row edge cases
+;; ──────────────────────────────────────────────────────────────────
+
+;; Single row left, single row right — match
+(set sL (table [id val] (list [1] [10])))
+(set sR (table [id val2] (list [1] [100])))
+(count (inner-join [id] sL sR)) -- 1
+(at (inner-join [id] sL sR) 'val2) -- [100]
+
+;; Single row left, single row right — no match
+(set sL2 (table [id val] (list [1] [10])))
+(set sR2 (table [id val2] (list [2] [100])))
+(count (inner-join [id] sL2 sR2)) -- 0
+
+;; Single row left-join — no match → null fill
+(count (left-join [id] sL2 sR2)) -- 1
+
+;; ──────────────────────────────────────────────────────────────────
+;; asof-join edge cases for exec_window_join
+;; ──────────────────────────────────────────────────────────────────
+
+;; asof-join: empty left table
+(set ajEL (table [Sym Time Price] (list (as 'SYMBOL []) (as 'TIME []) (as 'F64 []))))
+(set ajER (table [Sym Time Bid] (list [a] [10:00:00.000] [99.0])))
+(count (asof-join [Sym Time] ajEL ajER)) -- 0
+
+;; asof-join: empty right table
+(set ajEL2 (table [Sym Time Price] (list [a] [10:00:01.000] [100.0])))
+(set ajER2 (table [Sym Time Bid] (list (as 'SYMBOL []) (as 'TIME []) (as 'F64 []))))
+(count (asof-join [Sym Time] ajEL2 ajER2)) -- 1
+
+;; asof-join: single left, single right with exact time match
+(set ajSL (table [Sym Time Price] (list [a] [10:00:01.000] [100.0])))
+(set ajSR (table [Sym Time Bid] (list [a] [10:00:01.000] [99.0])))
+(at (asof-join [Sym Time] ajSL ajSR) 'Bid) -- [99.0]
+
+;; asof-join: multiple eq keys (exercises eq key comparison in merge walk)
+(set ajMKL (table [K1 K2 Time Val] (list [1 1 2] [a a b] [10:00:01.000 10:00:03.000 10:00:02.000] [10 20 30])))
+(set ajMKR (table [K1 K2 Time Ref] (list [1 1 2] [a a b] [10:00:00.000 10:00:02.000 10:00:01.000] [100 200 300])))
+(at (asof-join [K1 K2 Time] ajMKL ajMKR) 'Ref) -- [100 200 300]
+
+;; ──────────────────────────────────────────────────────────────────
+;; inner-join: all null keys on one side
+;; ──────────────────────────────────────────────────────────────────
+(set allnL (table [id val] (list [0Nl 0Nl 0Nl] [10 20 30])))
+(set allnR (table [id val2] (list [1 2 3] [100 200 300])))
+(count (inner-join [id] allnL allnR)) -- 0
+
+;; left-join: all null keys on left → all unmatched, all preserved
+(count (left-join [id] allnL allnR)) -- 3
+
+;; ──────────────────────────────────────────────────────────────────
+;; Large F64 key join — triggers radix path with F64 keys
+;; Exercises hash_f64 + radix partitioning + F64 comparison
+;; ──────────────────────────────────────────────────────────────────
+(set bigFL (table [price val] (list (as 'F64 (til 70000)) (til 70000))))
+(set bigFR (table [price val2] (list (as 'F64 (til 70000)) (til 70000))))
+(count (inner-join [price] bigFL bigFR)) -- 70000
+
+;; ──────────────────────────────────────────────────────────────────
+;; L33: hash_row_keys — NULL key vector (key column missing from table)
+;; When the join key doesn't exist in one table, the key_vec is NULL
+;; and hash_row_keys skips it via `if (!col) continue;`.
+;; ──────────────────────────────────────────────────────────────────
+
+;; inner-join: key exists only in left table → no right key vec → 0 matches
+(set mL (table [a val] (list [1 2] [10 20])))
+(set mR (table [b val2] (list [1 2] [100 200])))
+(count (inner-join [a] mL mR)) -- 0
+
+;; left-join: key exists only in left → all left rows unmatched
+(count (left-join [a] mL mR)) -- 2
+
+;; anti-join: key missing from right → all left rows pass (no matches possible)
+(count (anti-join [a] mL mR)) -- 2
+
+;; multi-key: one key exists in both, other only in left
+(set mkML (table [k1 k2 val] (list [1 2] [a b] [10 20])))
+(set mkMR (table [k1 val2] (list [1 2] [100 200])))
+(count (inner-join [k1 k2] mkML mkMR)) -- 0
+
+;; ──────────────────────────────────────────────────────────────────
+;; Large table left-join with NULL keys — exercises L35 on radix path
+;; Plus exercises left-outer unmatched row emission on radix path
+;; (join_radix_build_probe_fn L452: join_type >= 1 && lp->count > 0)
+;; ──────────────────────────────────────────────────────────────────
+
+;; Large left with some nulls, large right — left-join on radix path
+(set bigLN (table [id val] (list (til 70000) (til 70000))))
+(set bigRN (table [id val2] (list (til 35000) (til 35000))))
+;; Only first 35000 ids match, rest are unmatched left rows
+(count (left-join [id] bigLN bigRN)) -- 70000
+
+;; Large radix path with F64 and nulls in key
+;; Create a vector with nulls at specific positions
+(set vn (+ 0Nl (til 70000)))
+(set bigFN (table [price val] (list vn (til 70000))))
+(set bigF2 (table [price val2] (list (as 'F64 (til 70000)) (til 70000))))
+;; All left keys are null → 0 inner-join matches
+(count (inner-join [price] bigFN bigF2)) -- 0
+
+;; Large left-join with all-null left keys → all 70000 unmatched
+(count (left-join [price] bigFN bigF2)) -- 70000

@@ -1,0 +1,393 @@
+;; datalog_branch_cov.rfl — branch coverage push for src/ops/datalog.c
+;; Targets uncovered branches that the existing datalog_coverage.rfl /
+;; rule.rfl / eav_ops.rfl tests don't reach.
+
+;; ════════════════════════ grouped aggregation: SUM / MIN / MAX / AVG ═════════════════════════
+;; The existing tests only cover grouped COUNT. These exercise the
+;; grouped-agg SUM/MIN/MAX/AVG paths in dl_compile_rule (lines 1644-1696).
+(set Db (datoms))
+(set Db (assert-fact Db 1 'dept 10))
+(set Db (assert-fact Db 1 'salary 50))
+(set Db (assert-fact Db 2 'dept 10))
+(set Db (assert-fact Db 2 'salary 100))
+(set Db (assert-fact Db 3 'dept 20))
+(set Db (assert-fact Db 3 'salary 200))
+(set Db (assert-fact Db 4 'dept 20))
+(set Db (assert-fact Db 4 'salary 300))
+
+;; grouped SUM — two groups, one row each
+(count (query Db (find ?d ?s) (where (dept-sum ?d ?s)) (rules ((emp ?d ?s) (?e :dept ?d) (?e :salary ?s)) ((dept-sum ?d ?s) (sum ?s emp 1 by ?d 0))))) -- 2
+
+;; grouped MIN
+(count (query Db (find ?d ?m) (where (dept-min ?d ?m)) (rules ((emp2 ?d ?s) (?e :dept ?d) (?e :salary ?s)) ((dept-min ?d ?m) (min ?m emp2 1 by ?d 0))))) -- 2
+
+;; grouped MAX
+(count (query Db (find ?d ?m) (where (dept-max ?d ?m)) (rules ((emp3 ?d ?s) (?e :dept ?d) (?e :salary ?s)) ((dept-max ?d ?m) (max ?m emp3 1 by ?d 0))))) -- 2
+
+;; grouped AVG
+(count (query Db (find ?d ?a) (where (dept-avg ?d ?a)) (rules ((emp4 ?d ?s) (?e :dept ?d) (?e :salary ?s)) ((dept-avg ?d ?a) (avg ?a emp4 1 by ?d 0))))) -- 2
+
+;; ════════════════════════ scalar aggregates over f64 source columns ═════════════════════════
+;; The existing tests aggregate over I64 columns. These exercise the
+;; RAY_F64 source-column paths (lines 1795-1819).
+(set Fdb (datoms))
+(set f64src (table ['k 'v] (list [1 2 3] [1.5 2.5 3.5])))
+
+;; scalar SUM over f64
+(count (query Fdb (find ?s) (where (fsum ?s)) (rules ((fsum ?s) (sum ?s f64src 1))))) -- 1
+
+;; scalar MIN over f64
+(count (query Fdb (find ?m) (where (fmin ?m)) (rules ((fmin ?m) (min ?m f64src 1))))) -- 1
+
+;; scalar MAX over f64
+(count (query Fdb (find ?m) (where (fmax ?m)) (rules ((fmax ?m) (max ?m f64src 1))))) -- 1
+
+;; scalar AVG over f64
+(count (query Fdb (find ?a) (where (favg ?a)) (rules ((favg ?a) (avg ?a f64src 1))))) -- 1
+
+;; ════════════════════════ empty-source AVG and MAX aggregates ═════════════════════════
+;; AVG and MAX over empty source — should produce 0 rows (lines 1725-1732).
+(set Empty (datoms))
+(count (query Empty (find ?a) (where (emavg ?a)) (rules ((esrc ?e ?v) (?e :nope ?v)) ((emavg ?a) (avg ?a esrc 1))))) -- 0
+(count (query Empty (find ?m) (where (emmax ?m)) (rules ((esrc2 ?e ?v) (?e :nope ?v)) ((emmax ?m) (max ?m esrc2 1))))) -- 0
+
+;; ════════════════════════ expression comparison with f64 operands ═════════════════════════
+;; Covers the use_f64 path in DL_CMP (lines 2016-2032).
+(set Db (datoms))
+(set Db (assert-fact Db 1 'val 10))
+(set Db (assert-fact Db 2 'val 20))
+(set Db (assert-fact Db 3 'val 30))
+
+;; f64 expression < : LHS = x + 0.5, RHS = x * 1.0. LHS > RHS always => 0.
+(count (query Db (find ?e) (where (?e :val ?x) (< (+ ?x 0.5) (* ?x 1.0))))) -- 0
+
+;; f64 expression > : all 3 pass
+(count (query Db (find ?e) (where (?e :val ?x) (> (+ ?x 0.5) (* ?x 1.0))))) -- 3
+
+;; f64 expression ==
+(count (query Db (find ?e) (where (?e :val ?x) (== (+ ?x 0.0) (* ?x 1.0))))) -- 3
+
+;; f64 expression !=
+(count (query Db (find ?e) (where (?e :val ?x) (!= (+ ?x 0.0) (* ?x 1.0))))) -- 0
+
+;; f64 expression >=
+(count (query Db (find ?e) (where (?e :val ?x) (>= (+ ?x 0.5) (* ?x 1.0))))) -- 3
+
+;; f64 expression <=
+(count (query Db (find ?e) (where (?e :val ?x) (<= (+ ?x 0.5) (* ?x 1.0))))) -- 0
+
+;; ════════════════════════ f64 comparison: var vs constant (rhs_src NULL) ═════════════════════════
+;; Exercises the f64 CMP path when rhs_src is NULL (const), line 2023-2024.
+(count (query Db (find ?e ?y) (where (?e :val ?x) (= ?y (+ ?x 0.5)) (> ?y 20.0)))) -- 2
+
+;; ════════════════════════ integer division by zero in expressions ═════════════════════════
+;; Exercises the rd[r] != 0 ? ... : 0 branch in i64 binop path (line 748).
+(count (query Db (find ?e ?y) (where (?e :val ?x) (= ?y (/ ?x 0))))) -- 3
+
+;; Exercises the rd[r] != 0.0 ? ... : 0.0 branch in f64 binop path (line 725).
+(count (query Db (find ?e ?y) (where (?e :val ?x) (= ?y (/ ?x 0.0))))) -- 3
+
+;; ════════════════════════ f64 subtraction, multiplication, division in expressions ═════════════════════════
+(count (query Db (find ?e ?y) (where (?e :val ?x) (= ?y (- ?x 0.5)) (> ?y 10.0)))) -- 2
+(count (query Db (find ?e ?y) (where (?e :val ?x) (= ?y (* ?x 2.0)) (>= ?y 40.0)))) -- 2
+(count (query Db (find ?e ?y) (where (?e :val ?x) (= ?y (/ ?x 2.0)) (> ?y 5.0)))) -- 2
+
+;; ════════════════════════ negation with constant in negated body ═════════════════════════
+;; Exercises the constant-filter-on-negated-relation path (lines 1466-1483).
+(set Db (datoms))
+(set Db (assert-fact Db 1 'tag 'a))
+(set Db (assert-fact Db 2 'tag 'b))
+(set Db (assert-fact Db 3 'tag 'a))
+;; Exclude entities whose tag is 'a — only entity 2 should remain.
+(count (query Db (find ?e) (where (?e :tag ?t) (not (?e :tag 'a))))) -- 1
+;; Negated triple with non-matching constant — nobody is excluded.
+(count (query Db (find ?e) (where (?e :tag ?t) (not (?e :tag 'zzz))))) -- 3
+
+;; ════════════════════════ cross-product join (no shared variables) ═════════════════════════
+;; Two body atoms with disjoint variable sets: exercises the n_jk==0
+;; cross-product path in dl_compile_rule (lines 1355-1358).
+(set Db (datoms))
+(set Db (assert-fact Db 1 'color 'red))
+(set Db (assert-fact Db 2 'shape 'circle))
+(set Db (assert-fact Db 3 'shape 'square))
+(count (query Db (find ?c ?s) (where (cross ?c ?s)) (rules ((cross ?c ?s) (?e1 :color ?c) (?e2 :shape ?s))))) -- 2
+
+;; ════════════════════════ CMP with all-rows-pass (count == nrows) ═════════════════════════
+;; Exercises the early-exit at line 2053 (all rows pass the filter).
+(set Db (datoms))
+(set Db (assert-fact Db 1 'val 10))
+(set Db (assert-fact Db 2 'val 20))
+(count (query Db (find ?e ?x) (where (?e :val ?x) (> ?x 0)))) -- 2
+
+;; ════════════════════════ string literal in body position ═════════════════════════
+;; Exercises the RAY_STR branch in dl_set_body_pos (line 3582-3589).
+;; "Alice" interned as sym matches the DATOM-tagged cell via tag-aware compare.
+(set Db (datoms))
+(set Db (assert-fact Db 1 'name 'Alice))
+(count (query Db (find ?e) (where (?e :name "Alice")))) -- 1
+;; string that does NOT match any stored value
+(count (query Db (find ?e) (where (?e :name "Nonexistent")))) -- 0
+
+;; ════════════════════════ EQ and NE comparison with integer const ═════════════════════════
+(set Db (datoms))
+(set Db (assert-fact Db 1 'score 50))
+(set Db (assert-fact Db 2 'score 50))
+(set Db (assert-fact Db 3 'score 100))
+(count (query Db (find ?e ?s) (where (?e :score ?s) (== ?s 50)))) -- 2
+(count (query Db (find ?e ?s) (where (?e :score ?s) (!= ?s 50)))) -- 1
+
+;; ════════════════════════ aggregate: env-backed table source ═════════════════════════
+;; Exercises the pred_arity==0 sentinel path in env auto-register (line 4145).
+(set Db (datoms))
+(set agg_src (table ['k 'v] (list [1 2 3] [10 20 30])))
+(count (query Db (find ?s) (where (etotal ?s)) (rules ((etotal ?s) (sum ?s agg_src 1))))) -- 1
+(count (query Db (find ?n) (where (ecount ?n)) (rules ((ecount ?n) (count ?n agg_src))))) -- 1
+
+;; ════════════════════════ multiple find variables from different body atoms ═════════════════════════
+(set Db (datoms))
+(set Db (assert-fact Db 1 'name 'Alice))
+(set Db (assert-fact Db 1 'age 30))
+(set Db (assert-fact Db 2 'name 'Bob))
+(set Db (assert-fact Db 2 'age 25))
+(count (query Db (find ?e ?n ?a) (where (?e :name ?n) (?e :age ?a)))) -- 2
+
+;; ════════════════════════ wildcard in triple positions ═════════════════════════
+(set Db (datoms))
+(set Db (assert-fact Db 1 'x 10))
+(set Db (assert-fact Db 2 'y 20))
+(set Db (assert-fact Db 3 'z 30))
+(count (query Db (find ?e) (where (_ :x ?e)))) -- 1
+
+;; ════════════════════════ aggregate: count with empty env-backed source ═════════════════════════
+(set Empty (datoms))
+(set empty_src (table ['a 'b] (list [] [])))
+(count (query Empty (find ?n) (where (zero-count ?n)) (rules ((zero-count ?n) (count ?n empty_src))))) -- 1
+
+;; ════════════════════════ query with inline rules — body references unknown predicate ═════════════════════════
+(set Db (datoms))
+(count (query Db (find ?x) (where (phantom ?x)) (rules ((phantom ?x) (nonexistent-rel ?x))))) -- 0
+
+;; ════════════════════════ neg with no shared keys (n_keys==0) ═════════════════════════
+(set Db (datoms))
+(set Db (assert-fact Db 1 'tag 'a))
+(set Db (assert-fact Db 2 'tag 'b))
+(count (query Db (find ?e) (where (?e :tag ?t) (not (nope-rel ?z))) (rules ((nope-rel ?z) (?z :nope ?v))))) -- 2
+
+;; ════════════════════════ assignment followed by comparison ═════════════════════════
+(set Db (datoms))
+(set Db (assert-fact Db 1 'x 5))
+(set Db (assert-fact Db 2 'x 15))
+(set Db (assert-fact Db 3 'x 25))
+(count (query Db (find ?e ?y) (where (?e :x ?x) (= ?y (* ?x 2)) (> ?y 20)))) -- 2
+
+;; ════════════════════════ all six comparison ops with integer const ═════════════════════════
+(set Db (datoms))
+(set Db (assert-fact Db 1 'n 10))
+(set Db (assert-fact Db 2 'n 20))
+(set Db (assert-fact Db 3 'n 30))
+(count (query Db (find ?e) (where (?e :n ?v) (> ?v 15)))) -- 2
+(count (query Db (find ?e) (where (?e :n ?v) (>= ?v 20)))) -- 2
+(count (query Db (find ?e) (where (?e :n ?v) (< ?v 25)))) -- 2
+(count (query Db (find ?e) (where (?e :n ?v) (<= ?v 20)))) -- 2
+(count (query Db (find ?e) (where (?e :n ?v) (== ?v 20)))) -- 1
+(count (query Db (find ?e) (where (?e :n ?v) (!= ?v 20)))) -- 2
+
+;; ════════════════════════ var-var comparison — all six ops ═════════════════════════
+(set Db (datoms))
+(set Db (assert-fact Db 1 'a 10))
+(set Db (assert-fact Db 1 'b 20))
+(set Db (assert-fact Db 2 'a 30))
+(set Db (assert-fact Db 2 'b 25))
+(count (query Db (find ?e) (where (?e :a ?x) (?e :b ?y) (< ?x ?y)))) -- 1
+(count (query Db (find ?e) (where (?e :a ?x) (?e :b ?y) (> ?x ?y)))) -- 1
+(count (query Db (find ?e) (where (?e :a ?x) (?e :b ?y) (>= ?x ?y)))) -- 1
+(count (query Db (find ?e) (where (?e :a ?x) (?e :b ?y) (<= ?x ?y)))) -- 1
+(count (query Db (find ?e) (where (?e :a ?x) (?e :b ?y) (== ?x ?y)))) -- 0
+(count (query Db (find ?e) (where (?e :a ?x) (?e :b ?y) (!= ?x ?y)))) -- 2
+
+;; ════════════════════════ flipped const-op-var comparison (EQ / NE branches) ═════════════════════════
+(set Db (datoms))
+(set Db (assert-fact Db 1 'v 10))
+(set Db (assert-fact Db 2 'v 20))
+(count (query Db (find ?e ?x) (where (?e :v ?x) (== 10 ?x)))) -- 1
+(count (query Db (find ?e ?x) (where (?e :v ?x) (!= 10 ?x)))) -- 1
+
+;; ════════════════════════ SYM column in aggregate (auto-converted to I64) ═════════════════════════
+;; SYM columns get converted to I64 by the env auto-register path, so this
+;; computes the sum of sym IDs. Exercises the I64 aggregate path with
+;; originally-SYM data. 1 result row.
+(set Db (datoms))
+(set sym_vals (table ['k 'v] (list [1 2] ['x 'y])))
+(count (query Db (find ?s) (where (symsum ?s)) (rules ((symsum ?s) (sum ?s sym_vals 1))))) -- 1
+
+;; ════════════════════════ value-col bounds check ═════════════════════════
+(set Db (datoms))
+(set twocol (table ['a 'b] (list [1 2] [3 4])))
+(query Db (find ?s) (where (bad-idx ?s)) (rules ((bad-idx ?s) (sum ?s twocol 5)))) !- domain
+
+;; ════════════════════════ table_union pass-through (a is empty) ═════════════════════════
+(set Db (datoms))
+(set Db (assert-fact Db 1 'tag 'x))
+(count (query Db (find ?e) (where (simple ?e)) (rules ((simple ?e) (?e :tag 'x))))) -- 1
+
+;; ════════════════════════ recursive fixpoint — semi-naive delta loop ═════════════════════════
+(set Db (datoms))
+(set Db (assert-fact Db 1 'e 2))
+(set Db (assert-fact Db 2 'e 3))
+(set Db (assert-fact Db 3 'e 4))
+(set Db (assert-fact Db 4 'e 5))
+(count (query Db (find ?x ?y) (where (path ?x ?y)) (rules ((path ?x ?y) (?x :e ?y)) ((path ?x ?z) (?x :e ?y) (path ?y ?z))))) -- 10
+
+;; ════════════════════════ stratified negation — multi-stratum ═════════════════════════
+(set Db (datoms))
+(set Db (assert-fact Db 1 'tag 'keep))
+(set Db (assert-fact Db 2 'tag 'skip))
+(set Db (assert-fact Db 3 'tag 'keep))
+(count (query Db (find ?e) (where (derived ?e)) (rules ((base ?e) (?e :tag ?t)) ((excluded ?e) (?e :tag 'skip)) ((derived ?e) (base ?e) (not (excluded ?e)))))) -- 2
+
+;; ════════════════════════ positive dependency across strata ═════════════════════════
+(set Db (datoms))
+(set Db (assert-fact Db 1 'x 10))
+(count (query Db (find ?e) (where (layer3 ?e)) (rules ((layer1 ?e ?v) (?e :x ?v)) ((layer2 ?e) (layer1 ?e ?v)) ((layer3 ?e) (layer2 ?e) (not (layer1 ?e 999)))))) -- 1
+
+;; ════════════════════════ CMP filter that removes all rows ═════════════════════════
+(set Db (datoms))
+(set Db (assert-fact Db 1 'val 5))
+(count (query Db (find ?e ?v) (where (?e :val ?v) (> ?v 100)))) -- 0
+
+;; ════════════════════════ aggregate-only rule (no positive body atoms) ═════════════════════════
+(set Db (datoms))
+(set cnt_src (table ['id] (list [1 2 3 4 5])))
+(count (query Db (find ?n) (where (total ?n)) (rules ((total ?n) (count ?n cnt_src))))) -- 1
+
+;; ════════════════════════ body with quoted symbol (non-variable sym) ═════════════════════════
+(set Db (datoms))
+(set Db (assert-fact Db 1 'color 'red))
+(set Db (assert-fact Db 2 'color 'blue))
+(count (query Db (find ?e) (where (?e :color 'red)))) -- 1
+(count (query Db (find ?e) (where (?e :color 'blue)))) -- 1
+
+;; ════════════════════════ between sugar ═════════════════════════
+(set Db (datoms))
+(set Db (assert-fact Db 1 'score 10))
+(set Db (assert-fact Db 2 'score 50))
+(set Db (assert-fact Db 3 'score 90))
+(count (query Db (find ?e ?s) (where (?e :score ?s) (between ?s 20 80)))) -- 1
+(count (query Db (find ?e ?s) (where (?e :score ?s) (between ?s 0 100)))) -- 3
+
+;; ════════════════════════ table_distinct on single-row table ═════════════════════════
+(set Db (datoms))
+(set Db (assert-fact Db 1 'solo 42))
+(count (query Db (find ?e ?v) (where (?e :solo ?v)))) -- 1
+
+;; ════════════════════════ dl_is_triple_pattern — constant entity ═════════════════════════
+(set Db (datoms))
+(set Db (assert-fact Db 1 'name 100))
+(set Db (assert-fact Db 2 'name 200))
+(count (query Db (find ?v) (where (1 :name ?v)))) -- 1
+
+;; ════════════════════════ SUM over empty source (identity = 0) ═════════════════════════
+(set Db (datoms))
+(set empty_tab (table ['a 'b] (list [] [])))
+(count (query Db (find ?s) (where (empty-sum ?s)) (rules ((empty-sum ?s) (sum ?s empty_tab 1))))) -- 1
+
+;; ════════════════════════ dl_program_free: NULL guard (line 64) ═════════════════════════
+;; Indirectly exercised: dl_program_free(prog) is called from query; when
+;; prog->rels has ERR tables the loop in dl_program_free checks IS_ERR.
+;; Already covered by error paths. This section exercises the happy path.
+
+;; ════════════════════════ head with I64 constant affecting IDB alignment (line 177-203) ═════════════════════════
+;; Two rules with the same head predicate but different typed head constants
+;; in the same position. The first rule establishes RAY_I64, the second rule
+;; has the same type, so no conflict => alignment stays. Exercises the
+;; any_change=false early return at line 203.
+(set Db (datoms))
+(set Db (assert-fact Db 1 'role 'admin))
+(set Db (assert-fact Db 2 'role 'user))
+(count (query Db (find ?e) (where (has-i ?e)) (rules ((has-i 7) (?e :role 'admin)) ((has-i 8) (?e :role 'user))))) -- 2
+
+;; ════════════════════════ env-backed EDB via aggregate source (DL_AGG auto-register) ═════════════════════════
+;; The aggregate references a predicate that exists only as env-bound table.
+;; Tests the DL_AGG branch in the env-auto-register loop (lines 4126-4128).
+(set Db (datoms))
+(set agg_env (table ['x 'y] (list [1 2 3 4] [10 20 30 40])))
+(count (query Db (find ?n) (where (acount ?n)) (rules ((acount ?n) (count ?n agg_env))))) -- 1
+(count (query Db (find ?s) (where (asum ?s)) (rules ((asum ?s) (sum ?s agg_env 1))))) -- 1
+
+;; ════════════════════════ dl_find_rel returns -1 for unknown body pred ═════════════════════════
+;; Exercises line 1297 (rel_idx < 0 => return NULL) in dl_compile_rule.
+;; When a positive body atom references a predicate unknown to the program,
+;; compile_rule returns NULL silently (no eval_err, just 0 rows).
+(set Db (datoms))
+(set Db (assert-fact Db 1 'tag 'x))
+(count (query Db (find ?e) (where (uses-unknown ?e)) (rules ((uses-unknown ?e) (no-such-pred ?e ?v))))) -- 0
+
+;; ════════════════════════ table_antijoin: left empty ═════════════════════════
+;; Exercises the ray_table_nrows(left)==0 early return in table_antijoin (line 2368).
+(set Db (datoms))
+(count (query Db (find ?e) (where (?e :nope ?v) (not (?e :tag 'x))))) -- 0
+
+;; ════════════════════════ table_antijoin: right empty ═════════════════════════
+;; Exercises the right==0 early return in table_antijoin (line 2364).
+(set Db (datoms))
+(set Db (assert-fact Db 1 'tag 'x))
+(set Db (assert-fact Db 2 'tag 'y))
+;; negated EAV pattern that matches nothing => right table is empty => all rows pass
+(count (query Db (find ?e) (where (?e :tag ?t) (not (?e :missing ?v))))) -- 2
+
+;; ════════════════════════ table_distinct: 0 cols early return (line 2332) ═════════════════════════
+;; Indirectly: a query that produces a result with data always has cols.
+;; The ncols<=0 path is only triggered by malformed internal tables.
+
+;; ════════════════════════ SYM column filter via dl_col_eq_row ═════════════════════════
+;; Exercises the RAY_SYM branch of dl_col_eq_row (line 1006-1007)
+;; when a body constant is matched against a SYM-type column.
+;; This is exercised through sym-to-i64 conversion in env EDB, but
+;; the tag-aware compare paths are also triggered by EAV queries.
+(set Db (datoms))
+(set Db (assert-fact Db 1 'x 'hello))
+(set Db (assert-fact Db 2 'x 'world))
+(count (query Db (find ?e) (where (?e :x 'hello)))) -- 1
+
+;; ════════════════════════ dl_is_wildcard false case (line 3474-3476) ═════════════════════════
+;; Exercises the dl_is_wildcard function returning false for non-_ symbols.
+;; Already covered implicitly by every non-wildcard symbol usage.
+
+;; ════════════════════════ dl_is_aggregate — avg ═════════════════════════
+;; Exercises the strcmp chain in dl_is_aggregate for "avg" (line 3536-3538).
+(set Db (datoms))
+(set Db (assert-fact Db 1 'v 10))
+(set Db (assert-fact Db 2 'v 20))
+(count (query Db (find ?a) (where (my-avg ?a)) (rules ((my-src ?e ?v) (?e :v ?v)) ((my-avg ?a) (avg ?a my-src 1))))) -- 1
+
+;; ════════════════════════ dl_expr_var: variable reference in expression ═════════════════════════
+;; Exercises DL_EXPR_VAR kind (line 679-691).
+(set Db (datoms))
+(set Db (assert-fact Db 1 'a 5))
+(set Db (assert-fact Db 2 'a 15))
+(count (query Db (find ?e ?y) (where (?e :a ?x) (= ?y (+ ?x ?x))))) -- 2
+
+;; ════════════════════════ dl_expr_const_f64: float constant in expression ═════════════════════════
+;; Exercises DL_EXPR_CONST_F64 kind (lines 669-677).
+(set Db (datoms))
+(set Db (assert-fact Db 1 'p 1))
+(count (query Db (find ?e ?y) (where (?e :p ?x) (= ?y (+ ?x 3.14))))) -- 1
+
+;; ════════════════════════ f64 expression: both sides f64 (no promotion) ═════════════════════════
+;; Exercises the is_f64 path in DL_EXPR_BINOP where both sides are already f64
+;; (lines 701-731).
+(set Db (datoms))
+(set Db (assert-fact Db 1 'v 1))
+(count (query Db (find ?e ?y) (where (?e :v ?x) (= ?y (+ 1.5 2.5))))) -- 1
+
+;; ════════════════════════ aggregate: grouped COUNT over env-backed table ═════════════════════════
+;; Exercises grouped aggregation with a COUNT op (line 1645).
+(set Db (datoms))
+(set gcnt (table ['grp 'val] (list [1 1 2 2 2] [10 20 30 40 50])))
+(count (query Db (find ?g ?n) (where (grp-count ?g ?n)) (rules ((grp-count ?g ?n) (count ?n gcnt by ?g 0))))) -- 2
+
+;; ════════════════════════ aggregate: grouped COUNT with no source rows ═════════════════════════
+;; Exercises the src_nrows==0 path for grouped aggregation (line 1571-1575).
+(set Db (datoms))
+(set gempty (table ['grp 'val] (list [] [])))
+(count (query Db (find ?g ?n) (where (eg-count ?g ?n)) (rules ((eg-count ?g ?n) (count ?n gempty by ?g 0))))) -- 0

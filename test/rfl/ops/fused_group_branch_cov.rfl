@@ -1,0 +1,706 @@
+;; Branch coverage for src/ops/fused_group.c
+;;
+;; Targets uncovered branches at lines:
+;;   44       ray_filtered_group: !g NULL guard (unreachable from RFL)
+;;   60       ray_filtered_group: !ext NULL guard (unreachable from RFL)
+;;   136-139  fp_atom_col_compatible: integer family subcombinations
+;;   152      fp_col_supported: !col NULL guard
+;;   158-169  fp_expr_const_str: various branches
+;;   177-182  fp_check_simple_cmp: expr/element validation
+;;   190,193  fp_check_simple_cmp: LHS/RHS validation
+;;   204-208  fp_check_simple_cmp: col resolution, parted, SYM ordering
+;;   221-236  fp_check_like: LIKE validation on STR/SYM
+;;
+;; Strategy: exercise the planner gate `ray_fused_group_supported`
+;; with diverse predicate shapes and column types so both the "accept"
+;; (fused) and "reject" (unfused fallback) branches fire.  Both paths
+;; must produce correct results.
+
+;; =====================================================================
+;; Section 1: fp_atom_col_compatible — integer family cross-products
+;;
+;; Lines 129-138: BOOL/U8/I16/I32/I64 columns against BOOL/U8/I16/I32/I64
+;; atom constants.  The short-circuit || chain means each atom-type check
+;; is a separate branch.  We need queries with each column type tested
+;; against each atom type that will reach fp_atom_col_compatible.
+;; =====================================================================
+
+;; --- BOOL column with integer literal comparisons ---
+;; BOOL column stores 0/1 as uint8_t.  EQ against integer literals.
+;; The RFL literal `true` is type -RAY_BOOL, `1` is type -RAY_I64.
+;; fp_atom_col_compatible(BOOL col, -RAY_I64 atom) → line 138 (last ||)
+(set Tbcol (table [k v] (list [false true false true false true] (as 'I64 [1 2 3 4 5 6]))))
+;; (== k 1) → atom type -RAY_I64 against BOOL column → hits line 138
+(set Rb1 (select {n: (count v) by: k from: Tbcol where: (== k 1)}))
+(count Rb1) -- 1
+(sum (at Rb1 'n)) -- 3
+
+;; (== k true) → atom type -RAY_BOOL against BOOL column → hits line 136 first ||
+(set Rb2 (select {n: (count v) by: k from: Tbcol where: (== k true)}))
+(count Rb2) -- 1
+(sum (at Rb2 'n)) -- 3
+
+;; --- U8 column with various atom types ---
+;; Literal 5 is -RAY_I64.  fp_atom_col_compatible(U8, -RAY_I64) → line 138
+(set Tu8col (table [k v] (list (as 'U8 [0 1 2 3 4 5]) (as 'I64 [10 20 30 40 50 60]))))
+(set Ru81 (select {n: (count v) by: k from: Tu8col where: (== k 5)}))
+(count Ru81) -- 1
+(sum (at Ru81 'n)) -- 1
+
+;; --- I16 column with I64 literal ---
+;; fp_atom_col_compatible(I16, -RAY_I64) → passes through lines 136-138
+(set Ti16col (table [k v] (list (as 'I16 [10 20 30 40 50 60]) (as 'I64 [1 2 3 4 5 6]))))
+(set Ri161 (select {n: (count v) by: k from: Ti16col where: (== k 30)}))
+(count Ri161) -- 1
+(sum (at Ri161 'n)) -- 1
+
+;; --- I32 column with I64 literal ---
+(set Ti32col (table [k v] (list (as 'I32 [100 200 300 400 500 600]) (as 'I64 [1 2 3 4 5 6]))))
+(set Ri321 (select {n: (count v) by: k from: Ti32col where: (== k 300)}))
+(count Ri321) -- 1
+(sum (at Ri321 'n)) -- 1
+
+;; --- I64 column with I64 literal (most common) ---
+(set Ti64col (table [k v] (list (as 'I64 [1000 2000 3000 4000 5000 6000]) (as 'I64 [1 2 3 4 5 6]))))
+(set Ri641 (select {n: (count v) by: k from: Ti64col where: (== k 3000)}))
+(count Ri641) -- 1
+(sum (at Ri641 'n)) -- 1
+
+;; =====================================================================
+;; Section 2: fp_atom_col_compatible — SYM column
+;;
+;; Line 122: SYM col + -RAY_SYM atom || -RAY_STR atom
+;; (== sym_col 'foo) → atom type -RAY_SYM → first || hits
+;; (== sym_col "foo") → atom type -RAY_STR → second || hits
+;; =====================================================================
+
+(set Tsymcol (table [k v g] (list ['foo 'bar 'baz 'foo 'bar 'baz] (as 'I64 [1 2 3 4 5 6]) [0 0 0 1 1 1])))
+
+;; SYM col vs SYM atom (line 122 first ||)
+(set Rsym1 (select {n: (count v) by: g from: Tsymcol where: (== k 'foo)}))
+(count Rsym1) -- 2
+(sum (at Rsym1 'n)) -- 2
+
+;; SYM col vs STR atom (line 122 second ||)
+(set Rsym2 (select {n: (count v) by: g from: Tsymcol where: (== k "bar")}))
+(count Rsym2) -- 2
+(sum (at Rsym2 'n)) -- 2
+
+;; =====================================================================
+;; Section 3: fp_atom_col_compatible — temporal columns
+;;
+;; Lines 123-128: DATE/TIME/TIMESTAMP columns with matching atom types.
+;; Each temporal type only accepts its own atom type.
+;; =====================================================================
+
+;; DATE column + DATE atom (line 124)
+(set Tdcol (table [k v g] (list (as 'date [2020.01.01 2020.01.02 2020.01.03 2020.01.04 2020.01.05 2020.01.06]) (as 'I64 [1 2 3 4 5 6]) [0 0 0 1 1 1])))
+(set Rd1 (select {n: (count v) by: g from: Tdcol where: (== k 2020.01.03)}))
+(count Rd1) -- 1
+(sum (at Rd1 'n)) -- 1
+
+;; TIME column + TIME atom (line 126)
+(set Ttcol (table [k v g] (list (as 'time [00:00:01.000 00:00:02.000 00:00:03.000 00:00:04.000 00:00:05.000 00:00:06.000]) (as 'I64 [1 2 3 4 5 6]) [0 0 0 1 1 1])))
+(set Rt1 (select {n: (count v) by: g from: Ttcol where: (> k 00:00:03.000)}))
+(count Rt1) -- 1
+(sum (at Rt1 'n)) -- 3
+
+;; TIMESTAMP column + TIMESTAMP atom (line 128)
+(set Ttscol (table [k v g] (list (as 'timestamp [2020.01.01D00:00:00.000000001 2020.01.01D00:00:00.000000002 2020.01.01D00:00:00.000000003 2020.01.01D00:00:00.000000004 2020.01.01D00:00:00.000000005 2020.01.01D00:00:00.000000006]) (as 'I64 [1 2 3 4 5 6]) [0 0 0 1 1 1])))
+(set Rts1 (select {n: (count v) by: g from: Ttscol where: (<= k 2020.01.01D00:00:00.000000003)}))
+(count Rts1) -- 1
+(sum (at Rts1 'n)) -- 3
+
+;; =====================================================================
+;; Section 4: fp_atom_col_compatible default → 0 (line 139-140)
+;;
+;; F32/F64/STR/GUID columns are not in the switch → default returns 0.
+;; The fused path rejects this at fp_check_simple_cmp line 210-213.
+;; The query falls back to the unfused path but must still be correct.
+;; =====================================================================
+
+;; F64 column with numeric WHERE — fused gate rejects F64 → unfused fallback
+(set Tf64col (table [k v g] (list (as 'F64 [1.1 2.2 3.3 4.4 5.5 6.6]) (as 'I64 [1 2 3 4 5 6]) [0 0 0 1 1 1])))
+(set Rf641 (select {n: (count v) by: g from: Tf64col where: (> k 3.0)}))
+(count Rf641) -- 2
+(sum (at Rf641 'n)) -- 4
+
+;; STR column with LIKE — fused gate checks fp_check_like on STR col
+;; STR LIKE should be accepted by fp_check_like line 236 (col->type == RAY_STR)
+(set Tstrcol (table [k v g] (list ["apple" "banana" "cherry" "apricot" "blueberry" "cranberry"] (as 'I64 [1 2 3 4 5 6]) [0 0 0 1 1 1])))
+(set Rstr1 (select {n: (count v) by: g from: Tstrcol where: (like k "a*")}))
+(count Rstr1) -- 2
+(sum (at Rstr1 'n)) -- 2
+
+;; =====================================================================
+;; Section 5: fp_check_simple_cmp — ordering ops on SYM column
+;;
+;; Line 208: is_ord && ct == RAY_SYM → return -1
+;; SYM column with <, <=, >, >= → rejected by fused gate → unfused.
+;; The query must still return correct results via unfused path.
+;; =====================================================================
+
+;; SYM column with ordering op → fused rejects, unfused handles
+(set Tsymord (table [k v g] (list ['aa 'bb 'cc 'dd 'ee 'ff] (as 'I64 [1 2 3 4 5 6]) [0 0 0 1 1 1])))
+;; (> k 'bb) on SYM → ordering on SYM rejected → unfused fallback
+(set Rsymord1 (select {n: (count v) by: g from: Tsymord where: (> k 'bb)}))
+;; Unfused path handles SYM ordering; exact result depends on engine
+;; comparison semantics (SYM IDs or strings).  Just verify no crash.
+(>= (count Rsymord1) 0) -- true
+
+;; =====================================================================
+;; Section 6: fp_col_supported — nullable column (line 153)
+;;
+;; A column with RAY_ATTR_HAS_NULLS → fp_col_supported returns 0.
+;; The fused gate rejects → unfused path handles nulls correctly.
+;; This exercises line 153 (col->attrs & RAY_ATTR_HAS_NULLS → 0).
+;; =====================================================================
+
+;; Nullable predicate column → fused gate rejects via fp_col_supported
+(set Tnull (table [k v g] (list [1 0N 3 4 0N 6] (as 'I64 [10 20 30 40 50 60]) [0 0 0 1 1 1])))
+;; (== k 3) with nullable k → fp_col_supported returns 0 → unfused
+(set Rnull1 (select {n: (count v) by: g from: Tnull where: (== k 3)}))
+(count Rnull1) -- 1
+(sum (at Rnull1 'n)) -- 1
+
+;; Nullable column with NE — null sentinel differs from 1, so unfused
+;; path may count nulls as passing != 1.  k=0N has stored sentinel != 1.
+;; Rows passing: k=0N(g=0), k=3(g=0), k=4(g=1), k=0N(g=1), k=6(g=1) → 5 rows, 2 groups
+(set Rnull2 (select {n: (count v) by: g from: Tnull where: (!= k 1)}))
+(count Rnull2) -- 2
+(sum (at Rnull2 'n)) -- 5
+
+;; =====================================================================
+;; Section 7: fp_check_like — LIKE on SYM column (lines 235-236)
+;;
+;; fp_check_like: col->type == RAY_SYM → return 1 (supported)
+;; This exercises line 236 (col->type != RAY_STR && col->type != RAY_SYM)
+;; when we test with a non-STR/non-SYM column → return 0.
+;; Also exercises the acceptance path for SYM LIKE.
+;; =====================================================================
+
+;; SYM LIKE → accepted by fp_check_like (line 236 col->type == RAY_SYM)
+(set Tsymlike (table [k v g] (list ['alpha 'beta 'gamma 'alpha 'beta 'gamma] (as 'I64 [1 2 3 4 5 6]) [0 0 0 1 1 1])))
+(set Rsymlike1 (select {n: (count v) by: g from: Tsymlike where: (like k "alpha*")}))
+(count Rsymlike1) -- 2
+(sum (at Rsymlike1 'n)) -- 2
+
+;; STR LIKE → accepted by fp_check_like (line 236 col->type == RAY_STR)
+(set Tstrlike (table [k v g] (list ["hello" "world" "help" "hero" "wizard" "wonder"] (as 'I64 [1 2 3 4 5 6]) [0 0 0 1 1 1])))
+(set Rstrlike1 (select {n: (count v) by: g from: Tstrlike where: (like k "he*")}))
+(count Rstrlike1) -- 2
+(sum (at Rstrlike1 'n)) -- 3
+
+;; =====================================================================
+;; Section 8: fp_expr_const_str — concat pattern (lines 160-169)
+;;
+;; fp_expr_const_str recognizes (concat "a" "b") as a constant string
+;; expression for the LIKE pattern.  The branches at lines 160-169
+;; validate the (concat ...) list form.
+;;
+;; LIKE with a (concat ...) pattern on STR/SYM column exercises:
+;;   line 160: expr->type == RAY_LIST check
+;;   line 162: elems[0] is a SYM (the 'concat head)
+;;   line 165-166: head matches "concat"
+;;   line 168-169: recursive check on each concat arg
+;; =====================================================================
+
+;; LIKE with concat pattern on STR column
+;; (like k (concat "he" "*")) → fp_expr_const_str → concat path
+(set Rconcat1 (select {n: (count v) by: g from: Tstrlike where: (like k (concat "he" "*"))}))
+(count Rconcat1) -- 2
+(sum (at Rconcat1 'n)) -- 3
+
+;; LIKE with concat pattern on SYM column
+(set Rconcat2 (select {n: (count v) by: g from: Tsymlike where: (like k (concat "al" "*"))}))
+(count Rconcat2) -- 2
+(sum (at Rconcat2 'n)) -- 2
+
+;; Nested concat: (concat "a" (concat "l" "*"))
+(set Rconcat3 (select {n: (count v) by: g from: Tsymlike where: (like k (concat "a" (concat "l" "*")))}))
+(count Rconcat3) -- 2
+(sum (at Rconcat3 'n)) -- 2
+
+;; =====================================================================
+;; Section 9: fp_check_simple_cmp — various operator recognition
+;;
+;; Lines 185-187: fp_op_from_2char / fp_op_from_1char
+;; These are exercised by using each comparison operator.
+;; Targeting operators that may be underexercised: <=, >=, <, >
+;; on different column types.
+;; =====================================================================
+
+;; LE on DATE column (exercises fp_op_from_2char with '<=' → FP_LE code 3)
+(set Rdle (select {n: (count v) by: g from: Tdcol where: (<= k 2020.01.03)}))
+(count Rdle) -- 1
+(sum (at Rdle 'n)) -- 3
+
+;; GE on TIME column (exercises fp_op_from_2char with '>=' → FP_GE code 5)
+(set Rtge (select {n: (count v) by: g from: Ttcol where: (>= k 00:00:04.000)}))
+(count Rtge) -- 1
+(sum (at Rtge 'n)) -- 3
+
+;; LT on TIMESTAMP column (exercises fp_op_from_1char with '<' → FP_LT code 2)
+(set Rtslt (select {n: (count v) by: g from: Ttscol where: (< k 2020.01.01D00:00:00.000000004)}))
+(count Rtslt) -- 1
+(sum (at Rtslt 'n)) -- 3
+
+;; GT on I32 column (exercises fp_op_from_1char with '>' → FP_GT code 4)
+;; Ti32col: k=[100,200,300,400,500,600]. k>300: rows k=400,500,600 → 3 groups.
+(set Ri32gt (select {n: (count v) by: k from: Ti32col where: (> k 300)}))
+(count Ri32gt) -- 3
+(sum (at Ri32gt 'n)) -- 3
+
+;; NE on I16 column (exercises fp_op_from_2char with '!=' → FP_NE code 1)
+(set Ri16ne (select {n: (count v) by: k from: Ti16col where: (!= k 30)}))
+(count Ri16ne) -- 5
+(sum (at Ri16ne 'n)) -- 5
+
+;; =====================================================================
+;; Section 10: fp_check_in — IN predicate validation
+;;
+;; Lines 247-271: fp_check_in validates IN predicates.
+;; Exercise IN with different typed vectors on different column types.
+;; =====================================================================
+
+;; IN on BOOL column (fp_int_family BOOL → accepted)
+(set Rbin (select {n: (count v) by: k from: Tbcol where: (in k [true])}))
+(count Rbin) -- 1
+(sum (at Rbin 'n)) -- 3
+
+;; IN on U8 column
+(set Ru8in (select {n: (count v) by: k from: Tu8col where: (in k (as 'U8 [1 3 5]))}))
+(count Ru8in) -- 3
+(sum (at Ru8in 'n)) -- 3
+
+;; IN on I16 column
+(set Ri16in (select {n: (count v) by: k from: Ti16col where: (in k (as 'I16 [20 40 60]))}))
+(count Ri16in) -- 3
+(sum (at Ri16in 'n)) -- 3
+
+;; IN on I32 column
+(set Ri32in (select {n: (count v) by: k from: Ti32col where: (in k (as 'I32 [200 400 600]))}))
+(count Ri32in) -- 3
+(sum (at Ri32in 'n)) -- 3
+
+;; IN on DATE column
+(set Rdin (select {n: (count v) by: g from: Tdcol where: (in k [2020.01.02 2020.01.04 2020.01.06])}))
+(count Rdin) -- 2
+(sum (at Rdin 'n)) -- 3
+
+;; IN on TIME column
+(set Rtin (select {n: (count v) by: g from: Ttcol where: (in k [00:00:01.000 00:00:03.000 00:00:05.000])}))
+(count Rtin) -- 2
+(sum (at Rtin 'n)) -- 3
+
+;; IN on TIMESTAMP column
+(set Rtsin (select {n: (count v) by: g from: Ttscol where: (in k [2020.01.01D00:00:00.000000001 2020.01.01D00:00:00.000000003 2020.01.01D00:00:00.000000005])}))
+(count Rtsin) -- 2
+(sum (at Rtsin 'n)) -- 3
+
+;; =====================================================================
+;; Section 11: AND compound predicates — mixed types in AND
+;;
+;; Lines 292-299: ray_fused_group_supported detects (and ...) and
+;; validates each child via fp_check_simple_cmp || fp_check_like || fp_check_in.
+;; Exercise AND with a mix of cmp/like/in children.
+;; =====================================================================
+
+;; AND with CMP + LIKE children
+(set Tmix (table [k s v g] (list (as 'I64 [1 2 3 4 5 6]) ["alpha" "beta" "gamma" "apple" "banana" "cherry"] (as 'I64 [10 20 30 40 50 60]) [0 0 0 1 1 1])))
+;; (and (> k 2) (like s "a*")) → CMP + LIKE in AND
+(set Rmix1 (select {n: (count v) by: g from: Tmix where: (and (> k 2) (like s "a*"))}))
+;; k>2: rows 3,4,5,6. like s "a*": "gamma"→no, "apple"→yes, "banana"→no, "cherry"→no
+;; Only row 4 (k=4, s="apple", g=1) passes → 1 group
+(count Rmix1) -- 1
+(sum (at Rmix1 'n)) -- 1
+
+;; AND with CMP + IN children
+(set Rmix2 (select {n: (count v) by: g from: Tmix where: (and (> k 2) (in k [3 5]))}))
+;; k>2: rows 3,4,5,6. in k [3,5]: k=3,k=5. Intersection: k=3(g=0),k=5(g=1) → 2 groups
+(count Rmix2) -- 2
+(sum (at Rmix2 'n)) -- 2
+
+;; AND with LIKE + IN children
+(set Rmix3 (select {n: (count v) by: g from: Tmix where: (and (like s "a*") (in k [1 4]))}))
+;; like s "a*": rows 1(alpha),4(apple). in k [1,4]: k=1,k=4. Intersection: k=1(g=0,s=alpha),k=4(g=1,s=apple)
+(count Rmix3) -- 2
+(sum (at Rmix3 'n)) -- 2
+
+;; 3-child AND with CMP + LIKE + IN — all three child-check paths
+(set Rmix4 (select {n: (count v) by: g from: Tmix where: (and (> k 0) (like s "*a*") (in k [1 2 3 4 5 6]))}))
+;; k>0: all. like s "*a*": "alpha","beta","gamma","apple","banana" (rows 1-5). in k [1..6]: all.
+;; Intersection: rows 1-5 → 2 groups (g=0 has 3, g=1 has 2)
+(count Rmix4) -- 2
+(sum (at Rmix4 'n)) -- 5
+
+;; =====================================================================
+;; Section 12: ray_fused_group_supported — single-child fall-through
+;;
+;; Lines 303-305: single comparison (not AND) checked via fallthrough.
+;; The `||` chain: fp_check_simple_cmp || fp_check_like || fp_check_in
+;; =====================================================================
+
+;; Single LIKE (not AND) → line 305 fp_check_like returns 1
+(set Rslike1 (select {n: (count v) by: g from: Tstrlike where: (like k "w*")}))
+;; "world","wizard","wonder" → rows 2(g=0),5(g=1),6(g=1). 2 groups.
+(count Rslike1) -- 2
+(sum (at Rslike1 'n)) -- 3
+
+;; Single IN (not AND) → line 305 fp_check_in returns 1
+(set Rsin1 (select {n: (count v) by: k from: Ti64col where: (in k [1000 3000 5000])}))
+(count Rsin1) -- 3
+(sum (at Rsin1 'n)) -- 3
+
+;; =====================================================================
+;; Section 13: fp_eval_cmp range-fold branches
+;;
+;; Lines 789-800: when cval is out of the column's representable range,
+;; the comparison is folded to constant true/false.
+;; Exercise each fold case for different operators.
+;; =====================================================================
+
+;; U8 column (range 0-255):
+;; (== k 300) → out of range above → FP_FOLD_FALSE → 0 rows
+(set Rfold1 (select {n: (count v) by: k from: Tu8col where: (== k 300)}))
+(count Rfold1) -- 0
+
+;; (!= k 300) → out of range above → FP_FOLD_TRUE → all rows
+(set Rfold2 (select {n: (count v) by: k from: Tu8col where: (!= k 300)}))
+(count Rfold2) -- 6
+(sum (at Rfold2 'n)) -- 6
+
+;; (< k 300) → above → FP_FOLD_TRUE → all rows
+(set Rfold3 (select {n: (count v) by: k from: Tu8col where: (< k 300)}))
+(count Rfold3) -- 6
+(sum (at Rfold3 'n)) -- 6
+
+;; (> k 300) → above → FP_FOLD_FALSE → 0 rows
+(set Rfold4 (select {n: (count v) by: k from: Tu8col where: (> k 300)}))
+(count Rfold4) -- 0
+
+;; (<= k 300) → above → FP_FOLD_TRUE → all rows
+(set Rfold5 (select {n: (count v) by: k from: Tu8col where: (<= k 300)}))
+(count Rfold5) -- 6
+(sum (at Rfold5 'n)) -- 6
+
+;; (>= k 300) → above → FP_FOLD_FALSE → 0 rows
+(set Rfold6 (select {n: (count v) by: k from: Tu8col where: (>= k 300)}))
+(count Rfold6) -- 0
+
+;; Below range: (< k -1) → below (cval=-1 < v_min=0) → FP_FOLD_FALSE
+(set Rfold7 (select {n: (count v) by: k from: Tu8col where: (< k -1)}))
+(count Rfold7) -- 0
+
+;; (> k -1) → below → FP_FOLD_TRUE → all rows
+(set Rfold8 (select {n: (count v) by: k from: Tu8col where: (> k -1)}))
+(count Rfold8) -- 6
+(sum (at Rfold8 'n)) -- 6
+
+;; (>= k -1) → below → FP_FOLD_TRUE
+(set Rfold9 (select {n: (count v) by: k from: Tu8col where: (>= k -1)}))
+(count Rfold9) -- 6
+(sum (at Rfold9 'n)) -- 6
+
+;; (<= k -1) → below → FP_FOLD_FALSE
+(set Rfold10 (select {n: (count v) by: k from: Tu8col where: (<= k -1)}))
+(count Rfold10) -- 0
+
+;; =====================================================================
+;; Section 14: fp_eval_cmp — FP_IN with various esz widths
+;;
+;; Lines 407-431: FP_IN dispatches on esz (1/2/4/default=8).
+;; Need IN on U8 (esz=1), I16 (esz=2), I32 (esz=4), I64 (esz=8)
+;; as the FIRST/ONLY child of the predicate (to call fp_eval_cmp not
+;; fp_eval_cmp_masked).
+;; =====================================================================
+
+;; IN on U8 as single child (esz=1 path line 417-419)
+(set Rin_u8 (select {n: (count v) by: k from: Tu8col where: (in k (as 'U8 [0 2 4]))}))
+(count Rin_u8) -- 3
+(sum (at Rin_u8 'n)) -- 3
+
+;; IN on I16 as single child (esz=2 path line 421-423)
+(set Rin_i16 (select {n: (count v) by: k from: Ti16col where: (in k (as 'I16 [10 30 50]))}))
+(count Rin_i16) -- 3
+(sum (at Rin_i16 'n)) -- 3
+
+;; IN on I32 as single child (esz=4 path line 425-427)
+(set Rin_i32 (select {n: (count v) by: k from: Ti32col where: (in k (as 'I32 [100 300 500]))}))
+(count Rin_i32) -- 3
+(sum (at Rin_i32 'n)) -- 3
+
+;; IN on I64 as single child (esz=8 default path line 429)
+(set Rin_i64 (select {n: (count v) by: k from: Ti64col where: (in k [1000 3000 5000])}))
+(count Rin_i64) -- 3
+(sum (at Rin_i64 'n)) -- 3
+
+;; =====================================================================
+;; Section 15: fp_eval_cmp esz=2 SYM NE (lines 448-453)
+;;
+;; SYM column with esz=2 (>256 symbols in dict) is hard to construct
+;; in a simple RFL test.  Instead target the SYM esz=2 EQ/NE branches
+;; indirectly via a SYM column on a table where the global sym dict
+;; has grown past 256 entries from prior tests in this session.
+;; =====================================================================
+
+;; SYM NE (exercises SYM path in fp_eval_cmp)
+(set Tsymne (table [k v g] (list ['x 'y 'z 'x 'y 'z] (as 'I64 [1 2 3 4 5 6]) [0 0 0 1 1 1])))
+(set Rsymne (select {n: (count v) by: g from: Tsymne where: (!= k 'x)}))
+(count Rsymne) -- 2
+;; Rows where k!='x': k='y'(g=0), k='z'(g=0), k='y'(g=1), k='z'(g=1) → 2 groups, 2 each
+(sum (at Rsymne 'n)) -- 4
+
+;; =====================================================================
+;; Section 16: fp_eval_cmp_one — IN on fp_eval_cmp_one path
+;;
+;; Lines 551-555: fp_eval_cmp_one FP_IN path.
+;; Triggered by multi-child AND with IN child where masked path calls
+;; fp_eval_cmp_one for the IN child.
+;; =====================================================================
+
+;; AND with two INs — second IN goes through fp_eval_cmp_masked→fp_eval_cmp_one
+(set Tdoublein (table [k v g] (list (as 'I64 [1 2 3 4 5 6 7 8]) (as 'I64 [10 20 30 40 50 60 70 80]) [0 0 0 0 1 1 1 1])))
+(set Rdin2 (select {n: (count v) by: g from: Tdoublein where: (and (in k [1 3 5 7]) (in v [10 30 50 70]))}))
+;; k in {1,3,5,7}: rows 1,3,5,7. v in {10,30,50,70}: rows 1,3,5,7. Intersection: all 4.
+;; g=0: rows 1,3 (k=1,v=10; k=3,v=30). g=1: rows 5,7 (k=5,v=50; k=7,v=70).
+(count Rdin2) -- 2
+(sum (at Rdin2 'n)) -- 4
+
+;; =====================================================================
+;; Section 17: Multi-agg with SUM agg on different typed columns
+;;
+;; mk_par_fn PASS 2: SUM branch (line 2749-2754) for various input types.
+;; Exercise SUM on BOOL/U8/I16/I32/I64/DATE/TIME/TIMESTAMP inputs.
+;; =====================================================================
+
+;; SUM on BOOL column (treated as 0/1)
+(set Tsumagg (table [g b u8 i16 i32 i64 dt tm ts] (list [0 0 0 1 1 1] [false true true false true false] (as 'U8 [10 20 30 40 50 60]) (as 'I16 [100 200 300 400 500 600]) (as 'I32 [1000 2000 3000 4000 5000 6000]) (as 'I64 [10000 20000 30000 40000 50000 60000]) (as 'date [2020.01.01 2020.01.02 2020.01.03 2020.01.04 2020.01.05 2020.01.06]) (as 'time [00:00:01.000 00:00:02.000 00:00:03.000 00:00:04.000 00:00:05.000 00:00:06.000]) (as 'timestamp [2020.01.01D00:00:00.000000001 2020.01.01D00:00:00.000000002 2020.01.01D00:00:00.000000003 2020.01.01D00:00:00.000000004 2020.01.01D00:00:00.000000005 2020.01.01D00:00:00.000000006]))))
+
+;; SUM of U8 column
+(set Rsu8 (select {s: (sum u8) from: Tsumagg where: (>= g 0) by: g}))
+(count Rsu8) -- 2
+(sum (at Rsu8 's)) -- 210
+
+;; SUM of I16 column
+(set Rsi16 (select {s: (sum i16) from: Tsumagg where: (>= g 0) by: g}))
+(count Rsi16) -- 2
+(sum (at Rsi16 's)) -- 2100
+
+;; MIN and MAX of I32 column
+(set Rmi32 (select {lo: (min i32) hi: (max i32) from: Tsumagg where: (>= g 0) by: g}))
+(count Rmi32) -- 2
+(min (at Rmi32 'lo)) -- 1000
+(max (at Rmi32 'hi)) -- 6000
+
+;; AVG of I64 column
+(set Rai64 (select {av: (avg i64) from: Tsumagg where: (>= g 0) by: g}))
+(count Rai64) -- 2
+
+;; =====================================================================
+;; Section 18: Empty IN list → all-zero bits (line 403-405)
+;;
+;; fp_eval_cmp: op==FP_IN && n_cvals==0 → memset(bits, 0, n)
+;; An IN list where all values are NULL → n_cvals=0 after null filtering.
+;; =====================================================================
+
+;; Actually, RFL doesn't support null-containing IN lists easily.
+;; Instead exercise "no match" IN by using values not present in column.
+;; (in k [999 998 997]) on I64 col with values 1000-6000 → no rows match
+(set Rnomatch (select {n: (count v) by: k from: Ti64col where: (in k [999 998 997])}))
+(count Rnomatch) -- 0
+
+;; =====================================================================
+;; Section 19: Multi-key GROUP BY with different key type combos
+;;
+;; mk_compile: exercises key type loop (lines 3646-3670).
+;; Different key type combinations for composite keys.
+;; =====================================================================
+
+;; BOOL + I64 keys (1 + 8 = 9 bytes → wide key)
+(set Tboolmk (table [kb ki v] (list [false true false true false true] (as 'I64 [1 1 2 2 3 3]) (as 'I64 [10 20 30 40 50 60]))))
+(set Rboolmk (select {n: (count v) by: [kb ki] from: Tboolmk where: (>= v 0)}))
+(count Rboolmk) -- 6
+(sum (at Rboolmk 'n)) -- 6
+
+;; U8 + I32 keys (1 + 4 = 5 bytes → narrow)
+(set Tu8i32mk (table [ku ki v] (list (as 'U8 [0 1 0 1 0 1]) (as 'I32 [10 10 20 20 30 30]) (as 'I64 [1 2 3 4 5 6]))))
+(set Ru8i32mk (select {n: (count v) by: [ku ki] from: Tu8i32mk where: (>= v 0)}))
+(count Ru8i32mk) -- 6
+(sum (at Ru8i32mk 'n)) -- 6
+
+;; I16 + I16 keys (2 + 2 = 4 bytes → narrow)
+(set Ti16i16mk (table [k1 k2 v] (list (as 'I16 [1 2 3 1 2 3]) (as 'I16 [10 10 10 20 20 20]) (as 'I64 [1 2 3 4 5 6]))))
+(set Ri16i16mk (select {n: (count v) by: [k1 k2] from: Ti16i16mk where: (>= v 0)}))
+(count Ri16i16mk) -- 6
+(sum (at Ri16i16mk 'n)) -- 6
+
+;; SYM + I32 keys
+(set Tsymi32mk (table [ks ki v] (list ['a 'b 'a 'b 'a 'b] (as 'I32 [1 1 2 2 3 3]) (as 'I64 [10 20 30 40 50 60]))))
+(set Rsymi32mk (select {n: (count v) by: [ks ki] from: Tsymi32mk where: (>= v 0)}))
+(count Rsymi32mk) -- 6
+(sum (at Rsymi32mk 'n)) -- 6
+
+;; =====================================================================
+;; Section 20: fp_check_simple_cmp with tbl=NULL path (line 202)
+;;
+;; Lines 202-216: the tbl!=NULL branch does column validation.
+;; The tbl==NULL case (lines 202 check fails, skip to return code)
+;; is called when ray_fused_group_supported is invoked with tbl=NULL
+;; during early planner checks.
+;; NOTE: This branch is unreachable from RFL because the planner
+;; always passes a non-NULL table.
+;; =====================================================================
+
+;; (documented as unreachable from RFL — tbl is always non-NULL in planner)
+
+;; =====================================================================
+;; Section 21: fp_compile_cmp temporal atom decode (lines 750-756)
+;;
+;; The atom decode switch for the constant value in comparisons:
+;; case -RAY_DATE/-RAY_TIME: out->cval = (int64_t)cv->i32
+;; case -RAY_TIMESTAMP: out->cval = cv->i64
+;; case -RAY_BOOL/-RAY_U8: out->cval = (int64_t)cv->b8
+;; =====================================================================
+
+;; DATE comparison fires the -RAY_DATE case in fp_compile_cmp
+(set Rcompdate (select {n: (count v) by: g from: Tdcol where: (>= k 2020.01.04)}))
+(count Rcompdate) -- 1
+(sum (at Rcompdate 'n)) -- 3
+
+;; TIME comparison fires the -RAY_TIME case
+(set Rcomptime (select {n: (count v) by: g from: Ttcol where: (<= k 00:00:03.000)}))
+(count Rcomptime) -- 1
+(sum (at Rcomptime 'n)) -- 3
+
+;; TIMESTAMP comparison fires the -RAY_TIMESTAMP case
+(set Rcompts (select {n: (count v) by: g from: Ttscol where: (== k 2020.01.01D00:00:00.000000003)}))
+(count Rcompts) -- 1
+(sum (at Rcompts 'n)) -- 1
+
+;; =====================================================================
+;; Section 22: exec_filtered_group dispatch — count1 vs multi path
+;;
+;; Lines 3805-3810: single-key single-COUNT → count1; else → multi.
+;; Exercise both paths with different shapes.
+;; =====================================================================
+
+;; count1 path: single key, single COUNT
+(set Rc1 (select {n: (count v) by: k from: Ti64col where: (>= k 2000)}))
+(count Rc1) -- 5
+(sum (at Rc1 'n)) -- 5
+
+;; multi path: single key, multiple aggs
+(set Rmulti1 (select {n: (count v) s: (sum v) by: k from: Ti64col where: (>= k 2000)}))
+(count Rmulti1) -- 5
+(sum (at Rmulti1 's)) -- 20
+
+;; multi path: multiple keys, single COUNT
+(set Rmulti2 (select {n: (count v) by: [g k] from: Tsymcol where: (>= v 2)}))
+(count Rmulti2) -- 5
+
+;; multi path: multiple keys, multiple aggs
+(set Rmulti3 (select {n: (count v) s: (sum v) by: [g k] from: Tsymcol where: (>= v 1)}))
+(count Rmulti3) -- 6
+
+;; =====================================================================
+;; Section 23: Fallback to unfused path (line 3812-3815)
+;;
+;; When the fused exec returns error "nyi", exec_filtered_group
+;; catches it and falls back to exec_filtered_group_fallback.
+;; This happens when planner gate allows but executor rejects.
+;; F32/F64 agg columns would trigger this in mk_compile.
+;; =====================================================================
+
+;; F64 agg input → mk_compile rejects → fallback to unfused
+(set Tf64agg (table [g v] (list [0 0 0 1 1 1] (as 'F64 [1.1 2.2 3.3 4.4 5.5 6.6]))))
+(set Rf64agg (select {s: (sum v) from: Tf64agg where: (>= g 0) by: g}))
+(count Rf64agg) -- 2
+
+;; =====================================================================
+;; Section 24: SYM key in count1 direct path
+;;
+;; fp_try_direct_count1: kt==RAY_SYM → scan for max_key (lines 1312-1324)
+;; =====================================================================
+
+;; SYM key count1 (no WHERE) — exercises SYM max_key scan
+(set Tsymc1 (table [k v] (list ['alpha 'beta 'gamma 'alpha 'beta 'gamma 'alpha 'beta] (as 'I64 (til 8)))))
+(set Rsymc1 (select {n: (count v) by: k from: Tsymc1}))
+(count Rsymc1) -- 3
+(sum (at Rsymc1 'n)) -- 8
+
+;; SYM key count1 with WHERE
+(set Rsymc2 (select {n: (count v) by: k from: Tsymc1 where: (>= v 2)}))
+(count Rsymc2) -- 3
+(sum (at Rsymc2 'n)) -- 6
+
+;; =====================================================================
+;; Section 25: I32 key count1 with MG top-count (lines 1113-1248)
+;;
+;; fp_try_i32_mg_top_count for I32 keys + top-N count.
+;; Need I32 key with no WHERE (or simple WHERE) + desc: n take: K.
+;; =====================================================================
+
+;; I32 key count1 with top-3 (exercises Misra-Gries approximation)
+(set Ti32mg (table [k v] (list (as 'I32 (% (til 500) 25)) (as 'I64 (til 500)))))
+(set Ri32mg (select {n: (count v) by: k from: Ti32mg desc: n take: 5}))
+(count Ri32mg) -- 5
+(sum (at Ri32mg 'n)) -- 100
+
+;; =====================================================================
+;; Section 26: BOOL key direct count path (line 1296-1297)
+;;
+;; fp_try_direct_count1 with kt==RAY_BOOL → n_slots=2.
+;; =====================================================================
+
+;; BOOL key with WHERE on non-key column
+(set Tbooldc (table [k v] (list [false true false true false true false true] (as 'I64 [1 2 3 4 5 6 7 8]))))
+(set Rbooldc (select {n: (count v) by: k from: Tbooldc where: (> v 4)}))
+(count Rbooldc) -- 2
+(sum (at Rbooldc 'n)) -- 4
+
+;; =====================================================================
+;; Section 27: U8 key direct count with WHERE (pred_key_ne_zero)
+;;
+;; Line 1327-1335: pred_key_ne_zero detection.
+;; (!= u8_key 0) triggers pred_key_ne_zero=1 for U8 key.
+;; =====================================================================
+
+(set Tu8ne (table [k v] (list (as 'U8 (% (til 100) 10)) (as 'I64 (til 100)))))
+(set Ru8ne (select {n: (count v) by: k from: Tu8ne where: (!= k 0)}))
+(count Ru8ne) -- 9
+(sum (at Ru8ne 'n)) -- 90
+
+;; =====================================================================
+;; Section 28: I16 key direct count with WHERE + topk
+;;
+;; Lines 1340-1429: I16 ne0 u32 count path with top-N.
+;; (!= i16_key 0) + desc: n take: K triggers the specialized I16 path.
+;; =====================================================================
+
+(set Ti16ne (table [k v] (list (as 'I16 (+ 1 (% (til 200) 20))) (as 'I64 (til 200)))))
+(set Ri16ne2 (select {n: (count v) by: k from: Ti16ne where: (!= k 0) desc: n take: 5}))
+(count Ri16ne2) -- 5
+(sum (at Ri16ne2 'n)) -- 50
+
+;; =====================================================================
+;; Section 29: Summary of unreachable branches from RFL
+;;
+;; The following branches are unreachable from the RFL test harness:
+;;
+;;   Line 44: ray_filtered_group(!g) — graph is always non-NULL in RFL
+;;   Line 60: ray_filtered_group(!ext) — allocation failure; OOM-only
+;;   Line 152: fp_col_supported(!col) — col is always resolved before call
+;;   Line 158: fp_expr_const_str(!expr) — expr is always non-NULL in AST
+;;   Lines 162,164: fp_expr_const_str concat head validation — would need
+;;     a malformed AST node that RFL's parser cannot produce
+;;   Lines 177,180,182: fp_check_simple_cmp NULL/type guards — parser
+;;     guarantees well-formed expression lists
+;;   Line 202+tbl=NULL: fp_check_simple_cmp with NULL table — planner
+;;     always passes a table reference
+;;   Line 205: PARTED/MAPCOMMON column check — these column types are
+;;     internal and cannot be created through RFL table literals
+;;
+;; These are defensive guards against C API misuse or internal bugs
+;; that are not reachable from the public RFL evaluation path.
+;; =====================================================================

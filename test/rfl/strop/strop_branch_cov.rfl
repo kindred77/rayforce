@@ -1,0 +1,235 @@
+;; strop_branch_cov.rfl — targeted branch coverage for src/ops/strop.c
+;;
+;; Uncovered branches at baseline (62.45% branch cov, lines referenced):
+;;   69, 89, 96, 104, 105, 109, 123, 131, 134,
+;;   158, 160, 162, 177, 216, 221, 238, 239, 240, 258,
+;;   275, 280, 283, 285, 289, 290, 298, 301, 310, 314, 452
+;;
+;; Each section documents which line/branch it targets.
+
+;; ════════════════════════════════════════════════════════════════════
+;; 1. split with SYM atom first arg (line 275)
+;;
+;; The string-string split path at line 274-275 dispatches to the
+;; -RAY_SYM branch when str->type == -RAY_SYM.  The sym string is
+;; resolved via ray_sym_str, then split proceeds as normal string split.
+;; Already partially covered by split.rfl line 32-33 but let us
+;; exercise the branch more explicitly with a multi-char delimiter.
+;; ════════════════════════════════════════════════════════════════════
+(split 'hello_world "_") -- (list "hello" "world")
+(split 'foobar "ob") -- (list "fo" "ar")
+(split 'abc "x") -- (list "abc")
+
+;; ════════════════════════════════════════════════════════════════════
+;; 2. split with empty delimiter (line 285, dlen == 0)
+;;
+;; When the delimiter is "", dlen == 0 triggers the early-return path
+;; at line 285-291.  The whole string is returned as a single-element
+;; list.  This also exercises the sym_str_s cleanup at lines 289-290
+;; when the first arg is a SYM (sym_str_s != NULL).
+;; ════════════════════════════════════════════════════════════════════
+(split "hello" "") -- (list "hello")
+(split 'hello "") -- (list "hello")
+
+;; ════════════════════════════════════════════════════════════════════
+;; 3. split: SYM atom + sym_str_s/sym_str_d cleanup (lines 289, 290, 313, 314)
+;;
+;; When str is -RAY_SYM, sym_str_s is set (line 275).  sym_str_d is
+;; always NULL (never assigned since delim goes through -RAY_STR path
+;; only).  The release guards at 289/290/313/314 run when the split
+;; returns normally.  Exercise with a SYM + non-empty delim to run
+;; lines 313-314 (the tail cleanup after the main loop).
+;; ════════════════════════════════════════════════════════════════════
+(split 'a_b_c "_") -- (list "a" "b" "c")
+(split 'ab__cd "__") -- (list "ab" "cd")
+
+;; ════════════════════════════════════════════════════════════════════
+;; 4. List split with I16/I32 indices (line 158 branches)
+;;
+;; The list-split dispatch at line 157-158 checks
+;;   delim->type == RAY_I64 || delim->type == RAY_I16 || delim->type == RAY_I32
+;; Existing tests only cover I64 indices on lists.  I16 ('h' suffix)
+;; and I32 ('i' suffix) exercise the other OR branches.
+;; ════════════════════════════════════════════════════════════════════
+(split (list 1 2 3 4 5 6 "asdf" 9.33) [0h 2h 4h]) -- (list [1 2] [3 4] (list 5 6 "asdf" 9.33))
+
+;; ════════════════════════════════════════════════════════════════════
+;; 5. List split with empty indices: nidx == 0 (line 160)
+;;
+;; Empty I64 index vec on a LIST (not a vector).  Line 160 returns
+;; NULL for empty indices.  The existing tests (split [] []) exercise
+;; the VECTOR path at line 218, not the LIST path at line 160.
+;; ════════════════════════════════════════════════════════════════════
+(split (list 1 "a" 3.0) []) -- null
+
+;; ════════════════════════════════════════════════════════════════════
+;; 6. List split: seglen < 0 (line 177)
+;;
+;; When indices are descending (e.g. [4 2]), end < start, so
+;; seglen = end - start < 0.  The guard clamps to 0.  Result segment
+;; is an empty list.
+;; ════════════════════════════════════════════════════════════════════
+(count (split (list 1 2 3 4 5) [4 2])) -- 2
+(count (at (split (list 1 2 3 4 5) [4 2]) 0)) -- 0
+(count (at (split (list 1 2 3 4 5) [4 2]) 1)) -- 3
+
+;; ════════════════════════════════════════════════════════════════════
+;; 7. String split by indices: boundary cases (lines 238-240)
+;;
+;; Line 238: seglen < 0 when indices descend (e.g. "hello" [4 2]).
+;; Line 239: start > total (e.g. "hello" [10]).
+;; Line 240: start + seglen > total (e.g. "he" [1 999]).
+;; ════════════════════════════════════════════════════════════════════
+;; Descending indices → seglen < 0 → clamped to 0, produces empty string.
+(count (split "hello" [4 2])) -- 2
+(at (split "hello" [4 2]) 0) -- ""
+(at (split "hello" [4 2]) 1) -- "llo"
+
+;; start > total → start clamped to total, seglen → 0 → empty string.
+(at (split "hi" [10]) 0) -- ""
+
+;; start + seglen > total → seglen clamped.
+(at (split "hi" [1]) 0) -- "i"
+
+;; ════════════════════════════════════════════════════════════════════
+;; 8. Vector split by indices: seglen < 0 (line 258)
+;;
+;; Same descending-index trick on a typed vector.
+;; ════════════════════════════════════════════════════════════════════
+(count (split [10 20 30 40 50] [4 2])) -- 2
+(count (at (split [10 20 30 40 50] [4 2]) 0)) -- 0
+(count (at (split [10 20 30 40 50] [4 2]) 1)) -- 3
+
+;; ════════════════════════════════════════════════════════════════════
+;; 9. String/vec split: I16 and I32 index types (line 216)
+;;
+;; The vec/string split dispatch at line 215-216 checks
+;;   delim->type == RAY_I64 || delim->type == RAY_I16 || delim->type == RAY_I32
+;; String split with I16 indices:
+;; ════════════════════════════════════════════════════════════════════
+(split "abcdef" [0h 3h]) -- (list "abc" "def")
+
+;; ════════════════════════════════════════════════════════════════════
+;; 9b. String split: start + seglen > total (line 240)
+;;
+;; With "hi" (len 2) and indices [0 4], segment 0 has start=0,
+;; end=4 (from idx_buf[1]), seglen=4.  seglen >= 0 (line 238 not hit).
+;; start=0 <= 2 (line 239 not hit).  But start + seglen = 4 > 2
+;; → seglen clamped to total - start = 2 (line 240 taken).
+;; ════════════════════════════════════════════════════════════════════
+(at (split "hi" [0 4]) 0) -- "hi"
+
+;; ════════════════════════════════════════════════════════════════════
+;; 9c. split: SYM str + non-string delim (line 280 sym_str_s release)
+;;
+;; When str is -RAY_SYM, sym_str_s is set at line 275.  If delim is
+;; not -RAY_STR, line 280 runs `if (sym_str_s) ray_release(sym_str_s)`
+;; before returning the type error.
+;; ════════════════════════════════════════════════════════════════════
+(split 'abc 42) !- type
+
+;; ════════════════════════════════════════════════════════════════════
+;; 10. like: type error on non-string pattern (line 324)
+;;
+;; pattern must be -RAY_STR.  Numeric pattern hits the type guard.
+;; ════════════════════════════════════════════════════════════════════
+(like "hello" 42) !- type
+(like "hello" 'sym) !- type
+
+;; ════════════════════════════════════════════════════════════════════
+;; 11. like: type error on non-string/sym input (line 493)
+;;
+;; Input x is neither atom string/sym nor vec STR/SYM.
+;; ════════════════════════════════════════════════════════════════════
+(like 42 "hello") !- type
+(like [1 2 3] "hello") !- type
+
+;; ════════════════════════════════════════════════════════════════════
+;; 12. like: SYM atom with SHAPE_NONE pattern (line 347-348)
+;;
+;; When use_simple is false (SHAPE_NONE), the atom SYM path at
+;; line 347-348 takes the ray_glob_match branch instead of
+;; ray_glob_match_compiled.  Use a pattern with `?` or `[` to force
+;; SHAPE_NONE.
+;; ════════════════════════════════════════════════════════════════════
+(like 'hello "h?llo") -- true
+(like 'hello "[hH]ello") -- true
+(like 'world "[hH]ello") -- false
+(like 'abc "a?c") -- true
+(like 'abc "a??c") -- false
+
+;; ════════════════════════════════════════════════════════════════════
+;; 13. like: STR vector with SHAPE_NONE pattern (line 484-485)
+;;
+;; When the pattern forces SHAPE_NONE, the STR vector path at
+;; line 484-485 uses ray_glob_match instead of ray_glob_match_compiled.
+;; ════════════════════════════════════════════════════════════════════
+(sum (like ["hello" "world" "hi"] "h?llo")) -- 1
+(sum (like ["abc" "def" "axc"] "[aA]?c")) -- 2
+
+;; ════════════════════════════════════════════════════════════════════
+;; 14. like: SYM vector W64 with SHAPE_NONE (line 452, DICT_PASS/ROW_PASS)
+;;
+;; Small in-RFL SYM vecs are W64.  SHAPE_NONE forces the general
+;; matcher path in the DICT_PASS macro at line 424-426.
+;; ════════════════════════════════════════════════════════════════════
+(sum (like ['hello 'world 'hi] "h?llo")) -- 1
+(sum (like ['abc 'def 'axc] "[aA]?c")) -- 2
+
+;; ════════════════════════════════════════════════════════════════════
+;; 15. strlen: SYM vector (strlen_vec line 54-58)
+;;
+;; strlen_vec's SYM branch reads sym IDs via ray_read_sym.  In-RFL
+;; SYM vectors are W64.  This exercises the strlen_vec_value SYM path.
+;; ════════════════════════════════════════════════════════════════════
+(sum (strlen ['abc 'de 'f])) -- 6
+(sum (strlen ['hello 'world])) -- 10
+
+;; ════════════════════════════════════════════════════════════════════
+;; 16. strlen: STR vector with nulls (strlen_vec lines 72-78)
+;;
+;; strlen_vec checks has_nulls && ray_vec_is_null for each element.
+;; Build a STR vec with null via cast: (as 'STR [1 0Nl 3]).
+;; ════════════════════════════════════════════════════════════════════
+(at (strlen (as 'STR [1 0Nl 3])) 0) -- 1
+(nil? (at (strlen (as 'STR [1 0Nl 3])) 1)) -- true
+(at (strlen (as 'STR [1 0Nl 3])) 2) -- 1
+
+;; ════════════════════════════════════════════════════════════════════
+;; 17. Reachability notes — unreachable branches
+;;
+;; The following branches are NOT reachable from RFL test fixtures
+;; and remain uncovered by design:
+;;
+;; OOM guards (internal memory-pressure paths):
+;;   Line 69:  strlen_vec: ray_vec_new returns NULL/error.
+;;   Line 96:  strlen_mapcommon: ray_vec_new returns NULL/error.
+;;   Line 123: strlen_parted: ray_vec_new returns NULL/error.
+;;   Line 283: split: ray_list_new returns error.
+;;   Line 298, 301, 310: split loop: ray_str/ray_list_append error.
+;;   Lines 461-476: like SYM vec OOM fallback (lut/seen scratch_alloc
+;;             fails).  Only reachable under extreme memory pressure.
+;;
+;; Structural guards (no public API to produce required input):
+;;   Line 89:  strlen_mapcommon: keys/counts NULL/error.  Partition
+;;             columns from .db.parted.get are always well-formed.
+;;   Line 104-105, 109: strlen_mapcommon null-key.  Partition keys
+;;             never carry HAS_NULLS (see strlen_partitioned.rfl).
+;;   Line 131: strlen_parted: NULL/error segment.  Segments from
+;;             .db.parted.get are always valid.
+;;   Line 134: strlen_parted null-in-segment.  SYM segments from
+;;             splayed tables don't carry HAS_NULLS unless CSV with
+;;             empty SYM fields (RFL syntax cannot produce this).
+;;
+;; Protective limit guards:
+;;   Line 162: List split nidx > 256 (257+ element index vector).
+;;   Line 221: Vec/string split nidx > 256 (same limit).
+;;
+;; Dead code:
+;;   Line 290: `if (sym_str_d)` — sym_str_d is initialized to NULL at
+;;             line 273 and never assigned thereafter.  Always false.
+;;   Line 314: `if (sym_str_d)` — same dead code in tail cleanup.
+;;   Line 452: `default:` case in SYM width switch.  The RAY_SYM_W_MASK
+;;             exhausts W8/W16/W32/W64; no other value is possible.
+;;             The `default:` is a defensive catch-all.
+;; ════════════════════════════════════════════════════════════════════
