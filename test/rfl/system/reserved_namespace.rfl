@@ -24,8 +24,8 @@
 ;; gc, exec, build, mem, info, cmd, timeit, listen, env
 (count .os) -- 4
 ;; getenv, setenv, size, list
-(count .ipc) -- 3
-;; open, close, send
+(count .ipc) -- 4
+;; open, close, send, handle
 (count .csv) -- 4
 ;; read, splayed, parted, write
 ;; .db.* — three-level reserved namespace for storage I/O.  The
@@ -115,3 +115,32 @@ internals !- name
 ;; User-level dotted writes under a non-`.` root still work.
 (set myns.x 1)
 myns.x -- 1
+;; Connection-hook carve-out: the five `.ipc.on.*` names are the only
+;; dotted-reserved names a user can set.  `set` accepts them, `let`
+;; accepts them, and the rest of `.ipc.*` (open / close / send / handle)
+;; stays unsettable.
+(set .ipc.on.open  (fn [h] h))
+(set .ipc.on.close (fn [h] h))
+(set .ipc.on.sync  (fn [m] m))
+(set .ipc.on.async (fn [m] m))
+(set .ipc.on.auth  (fn [u p] true))
+;; Each binding resolves back to a callable lambda.
+(nil? .ipc.on.open)  -- false
+(nil? .ipc.on.close) -- false
+(nil? .ipc.on.sync)  -- false
+(nil? .ipc.on.async) -- false
+(nil? .ipc.on.auth)  -- false
+;; Anything ELSE under `.ipc.*` (or any other reserved root) is still
+;; rejected with `reserve`, even names that visually resemble a hook.
+(set .ipc.handle 9)        !- reserve
+(set .ipc.open    (fn [x] x)) !- reserve
+(set .ipc.send    (fn [a b] a)) !- reserve
+(set .ipc.on.bogus  (fn [x] x)) !- reserve
+(let .ipc.on.bogus  (fn [x] x)) !- reserve
+;; Clearing a hook with a non-lambda value is allowed — the server
+;; treats anything that isn't a lambda as "no hook installed".
+(set .ipc.on.open 0)
+.ipc.on.open -- 0
+;; `.ipc.handle` outside any hook reads -1 — the thread-local default.
+(.ipc.handle) -- -1
+(.ipc.handle 0) -- -1

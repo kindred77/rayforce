@@ -739,6 +739,12 @@
           <tr><td><code>.ipc.open</code></td><td>unary</td><td>restricted</td><td>Open TCP connection to host:port, returns handle</td><td><code>(.ipc.open "localhost:5000")</code></td></tr>
           <tr><td><code>.ipc.close</code></td><td>unary</td><td>restricted</td><td>Close an IPC connection handle</td><td><code>(.ipc.close h)</code></td></tr>
           <tr><td><code>.ipc.send</code></td><td>binary</td><td>restricted</td><td>Send a value over an IPC handle (sync request)</td><td><code>(.ipc.send h "(sum (til 100))")</code></td></tr>
+          <tr><td><code>.ipc.handle</code></td><td>variadic</td><td>&mdash;</td><td>Current connection handle inside any <code>.ipc.on.*</code> hook, <code>-1</code> outside</td><td><code>(.ipc.handle)</code></td></tr>
+          <tr><td><code>.ipc.on.open</code></td><td>hook</td><td>user-settable</td><td>Fires after inbound connection completes handshake; arg = handle</td><td><code>(set .ipc.on.open (fn [h] ...))</code></td></tr>
+          <tr><td><code>.ipc.on.close</code></td><td>hook</td><td>user-settable</td><td>Fires before inbound connection teardown; arg = handle</td><td><code>(set .ipc.on.close (fn [h] ...))</code></td></tr>
+          <tr><td><code>.ipc.on.sync</code></td><td>hook</td><td>user-settable</td><td>Intercepts sync messages; return value becomes the response</td><td><code>(set .ipc.on.sync (fn [m] (eval (parse m))))</code></td></tr>
+          <tr><td><code>.ipc.on.async</code></td><td>hook</td><td>user-settable</td><td>Intercepts async messages; return value ignored</td><td><code>(set .ipc.on.async (fn [m] ...))</code></td></tr>
+          <tr><td><code>.ipc.on.auth</code></td><td>hook</td><td>user-settable</td><td>Narrows <code>-u</code>/<code>-U</code> auth; truthy = accept, falsy = reject</td><td><code>(set .ipc.on.auth (fn [u p] (!= u "ban")))</code></td></tr>
         </tbody>
       </table>
 

@@ -330,6 +330,100 @@
         <strong>Message types.</strong> <code>.ipc.send</code> uses synchronous messaging &mdash; it blocks until the server returns a result. Asynchronous (fire-and-forget) messaging is available via the C API (<code>ray_ipc_send_async</code>).
       </div>
 
+      <h2 id="connection-hooks">Connection Hooks</h2>
+      <p>The server side exposes the inbound connection lifecycle to Rayfall code through five hook slots under <code>.ipc.on.*</code>. Each is a user-installable lambda; when unbound the server falls back to its built-in default, so installing a hook is purely opt-in.</p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Signature</th>
+            <th>Fires</th>
+            <th>Return value</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>.ipc.on.open</code></td>
+            <td><code>(fn [h] ...)</code></td>
+            <td>Inbound connection fully handshaked (and authed when <code>-u</code>/<code>-U</code> is on), just before the first header read.</td>
+            <td>Ignored.</td>
+          </tr>
+          <tr>
+            <td><code>.ipc.on.close</code></td>
+            <td><code>(fn [h] ...)</code></td>
+            <td>Inbound connection about to close, before its socket is closed and per-conn state is freed. Pairs 1-to-1 with <code>.ipc.on.open</code> &mdash; never fires for connections that died mid-handshake.</td>
+            <td>Ignored.</td>
+          </tr>
+          <tr>
+            <td><code>.ipc.on.sync</code></td>
+            <td><code>(fn [m] ...)</code></td>
+            <td>Inbound sync request, after the payload is deserialised into <code>m</code>. Replaces the default in-process <code>eval</code>.</td>
+            <td>Serialised and shipped to the client as the response.</td>
+          </tr>
+          <tr>
+            <td><code>.ipc.on.async</code></td>
+            <td><code>(fn [m] ...)</code></td>
+            <td>Inbound async message. Same dispatch point as <code>on.sync</code>, but the wire produces no response.</td>
+            <td>Ignored (errors are logged to stderr).</td>
+          </tr>
+          <tr>
+            <td><code>.ipc.on.auth</code></td>
+            <td><code>(fn [u p] ...)</code></td>
+            <td>After the constant-time secret compare in <code>-u</code>/<code>-U</code> auth passes. Servers started without auth never reach this hook.</td>
+            <td>Truthy = accept connection, falsy / error = reject and close.</td>
+          </tr>
+          <tr>
+            <td><code>.ipc.handle</code></td>
+            <td><code>(.ipc.handle)</code></td>
+            <td>Builtin readable inside any of the five hooks above &mdash; returns the current connection's handle.</td>
+            <td><code>-1</code> outside any hook.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p>Install with plain <code>set</code> or the colon binder:</p>
+
+      <pre><code>(<span class="hl-kw">set</span> <span class="hl-fn">.ipc.on.open</span>  (<span class="hl-kw">fn</span> [h] (<span class="hl-fn">println</span> <span class="hl-str">"+ "</span> h)))
+(<span class="hl-kw">set</span> <span class="hl-fn">.ipc.on.close</span> (<span class="hl-kw">fn</span> [h] (<span class="hl-fn">println</span> <span class="hl-str">"- "</span> h)))
+
+<span class="hl-comment">;; Sync hook receives the raw deserialised payload.  Strings need an
+;; explicit parse before eval; the default in-server dispatch does this
+;; for you, but a hook gets the message as-is.</span>
+(<span class="hl-kw">set</span> <span class="hl-fn">.ipc.on.sync</span>  (<span class="hl-kw">fn</span> [m] (<span class="hl-fn">eval</span> (<span class="hl-fn">parse</span> m))))
+
+<span class="hl-comment">;; Narrow auth: hook runs AFTER the password check, so it can only
+;; deny extras &mdash; never widen access.  Here, deny the username "ban".</span>
+(<span class="hl-kw">set</span> <span class="hl-fn">.ipc.on.auth</span>  (<span class="hl-kw">fn</span> [u p] (!= u <span class="hl-str">"ban"</span>)))</code></pre>
+
+      <div class="info-box">
+        <strong>Reserved-namespace carve-out.</strong> The five <code>.ipc.on.*</code> names are the only dotted-reserved names a user can <code>set</code> &mdash; the rest of <code>.ipc.*</code> (<code>open</code>, <code>close</code>, <code>send</code>, <code>handle</code>) and every other system namespace (<code>.sys.*</code>, <code>.os.*</code>, <code>.csv.*</code>, &hellip;) stays unsettable and returns a <code>reserve</code> error on any binding attempt.
+      </div>
+
+      <p>Clear a hook by assigning a non-lambda value:</p>
+
+      <pre><code><span class="hl-comment">;; Cleared &mdash; server falls back to the default behaviour.</span>
+(<span class="hl-kw">set</span> <span class="hl-fn">.ipc.on.open</span> <span class="hl-num">0</span>)</code></pre>
+
+      <p>Anything that isn&rsquo;t a callable lambda is treated as &ldquo;no hook installed&rdquo;, so a stale binding never wedges the server. Per-hook error handling:</p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Hook</th>
+            <th>Error in hook body</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td><code>.ipc.on.open</code> / <code>.ipc.on.close</code></td><td>Logged to stderr, swallowed. Connection teardown proceeds.</td></tr>
+          <tr><td><code>.ipc.on.sync</code></td><td>Serialised and shipped to the client as the response &mdash; same as a raw <code>eval</code> error.</td></tr>
+          <tr><td><code>.ipc.on.async</code></td><td>Logged to stderr, dropped. No wire response on async.</td></tr>
+          <tr><td><code>.ipc.on.auth</code></td><td>Treated as reject. Same <code>0x01</code> handshake byte as a wrong-password rejection.</td></tr>
+        </tbody>
+      </table>
+
+      <p>Hooks run under the same restricted-mode flag the inbound message would otherwise see &mdash; a <code>.ipc.on.sync</code> installed on a <code>-U</code> server cannot escalate privilege; the same blocked-builtins list above applies inside the hook body.</p>
+
       <h2 id="serialization-with-ser">Serialization with <code>ser</code></h2>
       <p>The <code>ser</code> builtin converts any value to a binary buffer (a <code>U8</code> vector). Pass it any Rayforce value &mdash; atom, vector, list, or table:</p>
 

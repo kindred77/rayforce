@@ -1492,6 +1492,170 @@ static test_result_t test_ipc_send_lazy_msg(void) {
     PASS();
 }
 
+/* ---- test_ipc_hooks_lifecycle ------------------------------------------- */
+/*
+ * End-to-end exercise of the `.ipc.on.*` connection hooks on the legacy
+ * server path.  Three hooks are installed via `set`; a single round-trip
+ * (open → SYNC eval → close) drives them all.  We track side effects
+ * through plain user-bound globals that hooks mutate, then read those
+ * globals back after the connection lifecycle has completed.
+ *
+ * Covers: the reserved-namespace allow-list for .ipc.on.*, hook_lookup,
+ * hook_call_lifecycle, the sync-message dispatch replacement in
+ * eval_payload_core, and `.ipc.handle` thread-local set/restore around
+ * the eval window.  The "_hook_sync_handle" assertion is the cross-
+ * thread piece: the server thread writes through ray_env_set into the
+ * same global env the test thread reads via ray_env_resolve.
+ */
+static test_result_t test_ipc_hooks_lifecycle(void) {
+    /* Wire up counters + hooks BEFORE the server thread starts so the
+     * very first `.ipc.on.open` fired sees the binding. */
+    const char* setup =
+        "(set _hook_open 0)"
+        "(set _hook_close 0)"
+        "(set _hook_sync_handle (- 0 99))"
+        "(set _hook_sync_msg 0)"
+        /* Lifecycle hooks: just bump counters.  Return value ignored. */
+        "(set .ipc.on.open  (fn [h] (set _hook_open  (+ _hook_open  1))))"
+        "(set .ipc.on.close (fn [h] (set _hook_close (+ _hook_close 1))))"
+        /* Sync hook: capture the handle visible via `.ipc.handle`, then
+         * parse + eval the inbound message and return its result so the
+         * client still gets a sensible response.  We use `parse + eval`
+         * because Rayfall's `eval` operates on a parsed AST, while the
+         * client sends a string source — the dual-path the default in
+         * eval_payload_core handles is now the user's responsibility. */
+        "(set .ipc.on.sync  (fn [m] "
+        "  (set _hook_sync_handle (.ipc.handle)) "
+        "  (set _hook_sync_msg 1) "
+        "  (eval (parse m))))";
+    ray_t* r = ray_eval_str(setup);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    if (r != RAY_NULL_OBJ) ray_release(r);
+
+    ray_ipc_server_t srv;
+    ray_err_t err = ray_ipc_server_init(&srv, 0);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    uint16_t port = get_listen_port(srv.listen_fd);
+    TEST_ASSERT((port) > (0), "port > 0");
+
+    ray_vm_t* srv_vm = make_server_vm();
+    TEST_ASSERT_NOT_NULL(srv_vm);
+
+    ipc_thread_ctx_t ctx = { .srv = &srv, .vm = srv_vm };
+    ray_thread_t tid;
+    ray_thread_create(&tid, server_thread_fn, &ctx);
+
+    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL);
+    TEST_ASSERT((h) >= (0), "h >= 0");
+
+    /* One SYNC round-trip — drives on.open (after handshake), on.sync
+     * (during eval), and on.close (on client-side close below). */
+    ray_t* msg = ray_str("(+ 2 3)", 7);
+    ray_t* resp = ray_ipc_send(h, msg);
+    ray_release(msg);
+    TEST_ASSERT_NOT_NULL(resp);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(resp));
+    TEST_ASSERT_EQ_I(resp->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(resp->i64, 5);
+    ray_release(resp);
+
+    /* Trigger on.close on the SERVER side by tearing the connection
+     * down from underneath the poll loop.  Closing the client socket
+     * makes the server's recv return 0, which routes through conn_close
+     * → hook_call_lifecycle(CLOSE). */
+    ray_ipc_close(h);
+    sleep_ms(50);
+
+    /* Stop the server before reading hook side effects — guarantees
+     * the close hook has fired (otherwise we'd race the poll loop). */
+    srv.running = false;
+    ray_thread_join(tid);
+    ray_ipc_server_destroy(&srv);
+    ray_sys_free(srv_vm);
+
+    /* Read counters back through the global env.  on.open + on.sync
+     * + on.close each fired exactly once.  `_hook_sync_handle` records
+     * `.ipc.handle` as seen INSIDE the sync hook — must equal the
+     * legacy server's conn-array index (0 for the only active conn). */
+    int64_t sym_open  = ray_sym_intern("_hook_open",        strlen("_hook_open"));
+    int64_t sym_close = ray_sym_intern("_hook_close",       strlen("_hook_close"));
+    int64_t sym_h     = ray_sym_intern("_hook_sync_handle", strlen("_hook_sync_handle"));
+    int64_t sym_msg   = ray_sym_intern("_hook_sync_msg",    strlen("_hook_sync_msg"));
+
+    ray_t* v_open  = ray_env_get(sym_open);   TEST_ASSERT_NOT_NULL(v_open);
+    ray_t* v_close = ray_env_get(sym_close);  TEST_ASSERT_NOT_NULL(v_close);
+    ray_t* v_h     = ray_env_get(sym_h);      TEST_ASSERT_NOT_NULL(v_h);
+    ray_t* v_msg   = ray_env_get(sym_msg);    TEST_ASSERT_NOT_NULL(v_msg);
+
+    TEST_ASSERT_EQ_I(v_open->i64,  1);
+    TEST_ASSERT_EQ_I(v_close->i64, 1);
+    TEST_ASSERT_EQ_I(v_msg->i64,   1);
+    TEST_ASSERT_EQ_I(v_h->i64,     0);
+
+    /* `.ipc.handle` outside any hook reads back -1. */
+    ray_t* handle_outside = ray_eval_str("(.ipc.handle)");
+    TEST_ASSERT_NOT_NULL(handle_outside);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(handle_outside));
+    TEST_ASSERT_EQ_I(handle_outside->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(handle_outside->i64, -1);
+    if (handle_outside != RAY_NULL_OBJ) ray_release(handle_outside);
+    PASS();
+}
+
+/* ---- test_ipc_hooks_auth_narrow ----------------------------------------- */
+/*
+ * Poll-based server with `-u` auth + a `.ipc.on.auth` hook that rejects
+ * the username "ban".  Drives the on.auth narrowing path: the secret
+ * compare passes (correct password) but the hook returns false, so the
+ * handshake is refused.  A second client with username "ok" succeeds —
+ * proving the hook can selectively narrow rather than blanket-reject.
+ */
+static test_result_t test_ipc_hooks_auth_narrow(void) {
+    ray_t* r = ray_eval_str(
+        "(set .ipc.on.auth (fn [u p] (!= u \"ban\")))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    if (r != RAY_NULL_OBJ) ray_release(r);
+
+    ray_poll_t* poll = ray_poll_create();
+    TEST_ASSERT_NOT_NULL(poll);
+    strcpy(poll->auth_secret, "secret");
+
+    int64_t listener_id = ray_ipc_listen(poll, 0);
+    TEST_ASSERT((listener_id) >= (0), "listener_id >= 0");
+    ray_selector_t* listener_sel = ray_poll_get(poll, listener_id);
+    TEST_ASSERT_NOT_NULL(listener_sel);
+    uint16_t port = get_listen_port((ray_sock_t)listener_sel->fd);
+    TEST_ASSERT((port) > (0), "port > 0");
+
+    ray_vm_t* srv_vm = make_server_vm();
+    TEST_ASSERT_NOT_NULL(srv_vm);
+
+    poll_thread_ctx_t pctx = { .poll = poll, .vm = srv_vm, .running = 1 };
+    ray_thread_t tid;
+    ray_thread_create(&tid, (void(*)(void*))poll_server_thread_fn, &pctx);
+    sleep_ms(20);
+
+    /* "ban":secret → password is correct, but the hook returns false
+     * → handshake rejected with the same 0x01 byte the wrong-password
+     * path uses, so the client surfaces -3 (auth rejected). */
+    int64_t h_banned = ray_ipc_connect("127.0.0.1", port, "ban", "secret");
+    TEST_ASSERT_EQ_I(h_banned, -3);
+
+    /* "ok":secret → both checks pass, connection succeeds. */
+    int64_t h_ok = ray_ipc_connect("127.0.0.1", port, "ok", "secret");
+    TEST_ASSERT((h_ok) >= (0), "h_ok >= 0");
+    if (h_ok >= 0) ray_ipc_close(h_ok);
+
+    poll_stop(poll, port);
+    ray_thread_join(tid);
+    ray_poll_destroy(poll);
+    ray_sys_free(srv_vm);
+    PASS();
+}
+
 /* ---- Registry ------------------------------------------------------------ */
 
 const test_entry_t ipc_entries[] = {
@@ -1523,5 +1687,7 @@ const test_entry_t ipc_entries[] = {
     { "ipc/server_conn_swap",            test_ipc_server_conn_swap,               ipc_setup, ipc_teardown },
     { "ipc/journal_restricted",          test_ipc_journal_restricted,             ipc_setup, ipc_teardown },
     { "ipc/send_lazy_msg",               test_ipc_send_lazy_msg,                  ipc_setup, ipc_teardown },
+    { "ipc/hooks_lifecycle",             test_ipc_hooks_lifecycle,                ipc_setup, ipc_teardown },
+    { "ipc/hooks_auth_narrow",           test_ipc_hooks_auth_narrow,              ipc_setup, ipc_teardown },
     { NULL, NULL, NULL, NULL },
 };
