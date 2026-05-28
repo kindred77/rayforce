@@ -49,6 +49,7 @@ typedef struct {
 
     ray_t    *dbg_obj;   /* I64 vector: pairs of [offset, span.id] */
     int32_t   dbg_len;
+    int32_t  trap_depth;  /* open OP_TRAP frames in current lambda */
 } compiler_t;
 
 static void compile_expr(compiler_t *c, ray_t *ast);
@@ -192,7 +193,7 @@ static void patch_jump(compiler_t *c, int32_t pos) {
 }
 
 /* Cached sym IDs for special forms */
-static _Thread_local int64_t sf_set = -1, sf_let = -1, sf_if = -1, sf_do = -1, sf_fn = -1, sf_self = -1, sf_try = -1;
+static _Thread_local int64_t sf_set = -1, sf_let = -1, sf_if = -1, sf_do = -1, sf_fn = -1, sf_self = -1, sf_try = -1, sf_return = -1;
 
 static void init_sf_syms(void) {
     if (sf_set >= 0) return;
@@ -203,6 +204,7 @@ static void init_sf_syms(void) {
     sf_fn   = ray_sym_intern("fn",  2);
     sf_self = ray_sym_intern("self", 4);
     sf_try  = ray_sym_intern("try",  3);
+    sf_return = ray_sym_intern("return", 6);
 }
 
 /* ── Compile a list (special form or function call) ── */
@@ -310,7 +312,9 @@ static void compile_list(compiler_t *c, ray_t *ast) {
             if (err_slot < 0) { c->error = true; return; }
 
             int32_t trap_pos = emit_jump(c, OP_TRAP);
+            c->trap_depth++;
             compile_expr(c, elems[1]);       /* body */
+            c->trap_depth--;
             emit(c, OP_TRAP_END);
             int32_t jmp_pos = emit_jump(c, OP_JMP);
             patch_jump(c, trap_pos);         /* handler starts here */
@@ -324,6 +328,25 @@ static void compile_list(compiler_t *c, ray_t *ast) {
             emit(c, OP_CALLF);
             emit(c, 1);                     /* call handler(err_val) */
             patch_jump(c, jmp_pos);          /* end */
+            return;
+        }
+
+        /* (return) | (return x) — early exit from enclosing compiled
+         * lambda. (return) pushes RAY_NULL_OBJ explicitly because
+         * OP_RET takes top-of-stack as the result; if (return) sits
+         * inside an outer expression that has already pushed values
+         * (e.g. (+ 1 (return))), relying on OP_RET's stack-empty
+         * fallback would return a stale value. */
+        if (sym_id == sf_return && (n == 1 || n == 2)) {
+            if (n == 2) {
+                compile_expr(c, elems[1]);
+            } else {
+                int32_t idx = add_constant(c, RAY_NULL_OBJ);
+                emit_const(c, idx);
+            }
+            for (int32_t i = 0; i < c->trap_depth; i++)
+                emit(c, OP_TRAP_END);
+            emit(c, OP_RET);
             return;
         }
     }
@@ -521,5 +544,5 @@ ray_span_t ray_bc_dbg_get(ray_t* dbg, int32_t ip) {
 }
 
 void ray_compile_reset(void) {
-    sf_set = sf_let = sf_if = sf_do = sf_fn = sf_self = sf_try = -1;
+    sf_set = sf_let = sf_if = sf_do = sf_fn = sf_self = sf_try = sf_return = -1;
 }
