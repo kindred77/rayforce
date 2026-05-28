@@ -407,7 +407,9 @@ static test_result_t test_syscov_return(void) {
     TEST_ASSERT_TRUE(eval_eq("(return \"hello\")", "\"hello\""));
     {
         ray_t* r = ray_eval_str("(return)");
-        TEST_ASSERT_TRUE(r && RAY_IS_NULL(r));
+        TEST_ASSERT_NOT_NULL(r);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        TEST_ASSERT_TRUE(RAY_IS_NULL(r));
         ray_release(r);
     }
     TEST_ASSERT_TRUE(eval_err("(return 1 2)", "domain"));
@@ -418,7 +420,9 @@ static test_result_t test_syscov_return(void) {
     /* Zero-arg form returns null. */
     {
         ray_t* r = ray_eval_str("((fn [] (return)))");
-        TEST_ASSERT_TRUE(r && RAY_IS_NULL(r));
+        TEST_ASSERT_NOT_NULL(r);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        TEST_ASSERT_TRUE(RAY_IS_NULL(r));
         ray_release(r);
     }
     /* Early return from a conditional branch. */
@@ -426,11 +430,16 @@ static test_result_t test_syscov_return(void) {
     TEST_ASSERT_TRUE(eval_eq("((fn [x] (if (> x 0) (return 1)) 0) -1)", "0"));
     /* return inside (try ...) — must emit OP_TRAP_END before OP_RET. */
     TEST_ASSERT_TRUE(eval_eq("((fn [] (try (return 42) (fn [e] e))))", "42"));
-    /* (return) nested in a partially-evaluated expression — must push
-     * null, not bubble the lingering 1. */
+    /* return inside nested (try ...) — must emit two OP_TRAP_ENDs. */
+    TEST_ASSERT_TRUE(eval_eq(
+        "((fn [] (try (try (return 42) (fn [e] e)) (fn [e] e))))", "42"));
+    /* (return) nested in a partially-evaluated expression — must return
+     * null rather than the stale 1 already on the stack when OP_RET fires. */
     {
         ray_t* r = ray_eval_str("((fn [] (+ 1 (return))))");
-        TEST_ASSERT_TRUE(r && RAY_IS_NULL(r));
+        TEST_ASSERT_NOT_NULL(r);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        TEST_ASSERT_TRUE(RAY_IS_NULL(r));
         ray_release(r);
     }
     /* return bound to a local and called as a value still hits the
