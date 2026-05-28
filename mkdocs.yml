@@ -1,6 +1,6 @@
 site_name: Rayforce
 site_description: Rayforce — embeddable columnar analytics and graph traversal engine in pure C17. Built-in Rayfall query language, IPC, datalog, and vector search.
-site_url: https://rayforcedb.com/docs/
+site_url: https://rayforcedb.com/
 site_author: Anton Kundenko
 copyright: Copyright &copy; 2025-2026 Anton Kundenko · MIT licensed
 repo_name: RayforceDB/rayforce
@@ -12,31 +12,32 @@ site_dir: site
 exclude_docs: |
   superpowers/
 
+# about.md is a marketing-style page reachable from the pill nav and
+# the marketing footer — intentionally outside the docs sidebar.
+not_in_nav: |
+  /about.md
+
 theme:
   name: material
+  custom_dir: overrides
   language: en
-  font:
-    text: Inter
-    code: JetBrains Mono
+  logo: assets/logo-light-full.svg
+  favicon: assets/favicon.svg
+  # font: false disables Material's Google Fonts loader.  Our extra.css
+  # declares @font-face for the brand fonts (Inter, Oswald, JetBrains Mono)
+  # hosted at /assets/fonts/ alongside the marketing site.
+  font: false
   palette:
-    - media: "(prefers-color-scheme: dark)"
-      scheme: slate
-      primary: deep orange
-      accent: orange
-      toggle:
-        icon: material/weather-sunny
-        name: Switch to light mode
-    - media: "(prefers-color-scheme: light)"
-      scheme: default
-      primary: deep orange
-      accent: orange
-      toggle:
-        icon: material/weather-night
-        name: Switch to dark mode
+    # Single scheme to match the marketing site — no light/dark toggle.
+    scheme: slate
   features:
-    - navigation.instant
+    # `navigation.instant` intentionally omitted — it client-side-swaps
+    # only the content area, which breaks transitions between the docs
+    # template (Material chrome) and the landing template (custom hero
+    # via overrides/home.html).  Clicking the logo from a docs page
+    # would otherwise render the landing inside the docs shell until
+    # the user hard-refreshes.
     - navigation.tracking
-    - navigation.tabs
     - navigation.sections
     - navigation.expand
     - navigation.indexes
@@ -57,6 +58,12 @@ extra:
   social:
     - icon: fontawesome/brands/github
       link: https://github.com/RayforceDB/rayforce
+
+extra_css:
+  - assets/extra.css
+
+extra_javascript:
+  - javascripts/main.js
 
 markdown_extensions:
   - admonition
@@ -97,68 +104,70 @@ plugins:
 
 nav:
   - Home: index.md
-  - Getting Started:
-      - Quick Start: getting-started/quick-start.md
-      - Tutorial: getting-started/tutorial.md
-  - Tutorials:
-      - Graph Queries: tutorials/graph.md
-      - Datalog: tutorials/datalog.md
-      - Data Loading: tutorials/storage.md
-      - Advanced Analytics: tutorials/analytics.md
-  - Rayfall Language:
-      - Syntax: language/syntax.md
-      - Functions Reference: language/functions.md
-      - Math Operations: language/math.md
-      - String Operations: language/string.md
-      - Control Flow: language/control-flow.md
-      - REPL Reference: language/repl.md
-  - Namespaces:
-      - Overview: namespaces/index.md
-      - .col — Column linking: namespaces/col.md
-      - .csv — CSV I/O: namespaces/csv.md
-      - .db — Tables on disk: namespaces/db.md
-      - .graph — Graph algorithms: namespaces/graph.md
-      - .idx — Indexes: namespaces/idx.md
-      - .ipc — IPC client: namespaces/ipc.md
-      - .log — Write-ahead log: namespaces/log.md
-      - .os — Filesystem & env: namespaces/os.md
-      - .repl — REPL control: namespaces/repl.md
-      - .sys — System info: namespaces/sys.md
-      - .time — Clock & timers: namespaces/time.md
-  - Data & Types:
-      - Data Types: data-types/index.md
-      - Collections: data-types/collections.md
-  - Queries:
-      - Select Queries: queries/select.md
-      - Joins: queries/joins.md
-      - Linked Columns: queries/links.md
-      - Indexes Overview: queries/indexes-overview.md
-      - Accelerator Indexes: queries/indexes.md
-      - Pivot: queries/pivot.md
-  - Storage & IPC:
-      - Columnar Storage: storage/index.md
-      - IPC & Serialization: storage/ipc.md
-      - IPC Connection Hooks: storage/ipc-hooks.md
-  - Graph Engine:
-      - Graph Storage: graph/storage.md
-      - Graph Algorithms: graph/algorithms.md
-      - Vector Search: graph/vector-search.md
-  - Guides:
-      - Indexes Guide: guides/indexes.md
-      - Analytics Cookbook: guides/analytics.md
-      - Datalog Guide: guides/datalog.md
-      - Datalog Reference: guides/datalog-reference.md
-      - Storage Guide: guides/storage.md
-      - IPC Guide: guides/ipc.md
-      - Error Handling: guides/errors.md
-      - Memory & Monitoring: guides/memory.md
-      - Type Casting: guides/types.md
-  - Architecture:
-      - Pipeline & Optimizer: architecture/pipeline.md
-      - Memory Model: architecture/memory.md
-      - Block Offloading: architecture/offloading.md
-  - C API:
-      - Core API: c-api/core.md
-      - DAG API: c-api/dag.md
-  - Reference:
-      - All Functions: reference/all-functions.md
+  - Docs:
+      - Overview: docs/index.md
+      - Getting Started:
+          - Quick Start: docs/getting-started/quick-start.md
+          - Tutorial: docs/getting-started/tutorial.md
+      - Tutorials:
+          - Graph Queries: docs/tutorials/graph.md
+          - Datalog: docs/tutorials/datalog.md
+          - Data Loading: docs/tutorials/storage.md
+          - Advanced Analytics: docs/tutorials/analytics.md
+      - Rayfall Language:
+          - Syntax: docs/language/syntax.md
+          - Functions Reference: docs/language/functions.md
+          - Math Operations: docs/language/math.md
+          - String Operations: docs/language/string.md
+          - Control Flow: docs/language/control-flow.md
+          - REPL Reference: docs/language/repl.md
+      - Namespaces:
+          - Overview: docs/namespaces/index.md
+          - .col — Column linking: docs/namespaces/col.md
+          - .csv — CSV I/O: docs/namespaces/csv.md
+          - .db — Tables on disk: docs/namespaces/db.md
+          - .graph — Graph algorithms: docs/namespaces/graph.md
+          - .idx — Indexes: docs/namespaces/idx.md
+          - .ipc — IPC client: docs/namespaces/ipc.md
+          - .log — Write-ahead log: docs/namespaces/log.md
+          - .os — Filesystem & env: docs/namespaces/os.md
+          - .repl — REPL control: docs/namespaces/repl.md
+          - .sys — System info: docs/namespaces/sys.md
+          - .time — Clock & timers: docs/namespaces/time.md
+      - Data & Types:
+          - Data Types: docs/data-types/index.md
+          - Collections: docs/data-types/collections.md
+      - Queries:
+          - Select Queries: docs/queries/select.md
+          - Joins: docs/queries/joins.md
+          - Linked Columns: docs/queries/links.md
+          - Indexes Overview: docs/queries/indexes-overview.md
+          - Accelerator Indexes: docs/queries/indexes.md
+          - Pivot: docs/queries/pivot.md
+      - Storage & IPC:
+          - Columnar Storage: docs/storage/index.md
+          - IPC & Serialization: docs/storage/ipc.md
+          - IPC Connection Hooks: docs/storage/ipc-hooks.md
+      - Graph Engine:
+          - Graph Storage: docs/graph/storage.md
+          - Graph Algorithms: docs/graph/algorithms.md
+          - Vector Search: docs/graph/vector-search.md
+      - Guides:
+          - Indexes Guide: docs/guides/indexes.md
+          - Analytics Cookbook: docs/guides/analytics.md
+          - Datalog Guide: docs/guides/datalog.md
+          - Datalog Reference: docs/guides/datalog-reference.md
+          - Storage Guide: docs/guides/storage.md
+          - IPC Guide: docs/guides/ipc.md
+          - Error Handling: docs/guides/errors.md
+          - Memory & Monitoring: docs/guides/memory.md
+          - Type Casting: docs/guides/types.md
+      - Architecture:
+          - Pipeline & Optimizer: docs/architecture/pipeline.md
+          - Memory Model: docs/architecture/memory.md
+          - Block Offloading: docs/architecture/offloading.md
+      - C API:
+          - Core API: docs/c-api/core.md
+          - DAG API: docs/c-api/dag.md
+      - Reference:
+          - All Functions: docs/reference/all-functions.md

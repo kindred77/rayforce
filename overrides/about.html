@@ -1,0 +1,100 @@
+{#-
+  Rayforce About — custom marketing-page template.
+
+  Wraps the rendered Markdown in <section class="about-content">
+  so the marketing typography from landing.css applies (.about-content
+  h1/h2/p/ul/li/strong/a/code rules) and the page reads as part of the
+  marketing site, not the docs shell.
+
+  The pill nav at the top comes from overrides/partials/header.html
+  which renders the pill for page.url in {'', 'about/'} (see that file).
+  Sidebar / TOC / Material footer are suppressed via page front-matter
+  hide: navigation/toc/footer.
+-#}
+{% extends "main.html" %}
+
+{% block extrahead %}
+  <link rel="stylesheet" href="{{ 'assets/landing.css' | url }}">
+  <script>document.documentElement.classList.add('landing-page');</script>
+{% endblock %}
+
+{# Suppress Material's tab row (already disabled in mkdocs.yml, defensive). #}
+{% block tabs %}{% endblock %}
+
+{# Replace the docs shell with the upstream About layout: a fullscreen
+   promo iframe pinned under the floating pill nav, followed by the
+   about-content section.  `promo.html` is a self-contained 1.7MB React
+   bundle copied verbatim from website/promo.html into docs/promo.html,
+   so MkDocs serves it at /promo.html with no asset wiring needed. #}
+{% block container %}
+<iframe class="promo-frame" src="{{ 'promo.html' | url }}" title="Rayforce — animated introduction" allow="autoplay" loading="eager"></iframe>
+
+<section class="about-content">
+  <div class="container md-typeset">
+    {{ page.content }}
+  </div>
+</section>
+
+<script>
+  // Embedded promo: hide the dev playback bar. Keep the Stage's own scaling
+  // (Math.min / contain) so nothing gets cropped — a few px of dark padding
+  // at the edges is preferable to text being clipped out of view.
+  //
+  // Poll for the canvas instead of listening on iframe.load: the promo's
+  // loader calls document.documentElement.replaceWith(...) after load has
+  // already fired, which would discard anything we attached to the old
+  // document. Canvas existence means React has mounted, so the final
+  // document is stable and our attachments will survive.
+  (function () {
+    const iframe = document.querySelector('iframe.promo-frame');
+    if (!iframe) return;
+
+    function attach() {
+      const doc = iframe.contentDocument;
+      if (!doc || !doc.documentElement) return false;
+      if (!doc.querySelector('#root > div > div > div')) return false;
+
+      const style = doc.createElement('style');
+      style.textContent =
+        '#root > div > div:last-child { display: none !important; }' +
+        // Match the Stage outer to the site bg (#0a0e13) so letterbox
+        // bars from contain-mode scaling blend into the page.
+        '#root > div { background: #0a0e13 !important; }';
+      doc.head.appendChild(style);
+      return true;
+    }
+
+    let tries = 0;
+    const iv = setInterval(function () {
+      if (attach() || ++tries > 100) clearInterval(iv);
+    }, 100);
+  })();
+</script>
+{% endblock %}
+
+{# Reuse the marketing footer from home.html so About matches the landing. #}
+{% block footer %}
+<footer class="footer landing-footer">
+  <div class="container">
+    <div class="footer-inner">
+      <div class="footer-brand">
+        <img src="{{ 'assets/logo-light-full.svg' | url }}" alt="Rayforce" width="168" height="28">
+      </div>
+      <div class="footer-links">
+        <a href="https://github.com/RayforceDB/rayforce" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://x.com/RayforceDB" target="_blank" rel="noopener">X / Twitter</a>
+        <a href="https://www.reddit.com/r/rayforcedb/" target="_blank" rel="noopener">Reddit</a>
+        <a href="https://rayforcedb.zulipchat.com/join/l33sichu4vp7nf77hgdul4om/" target="_blank" rel="noopener">Zulip Chat</a>
+        <a href="https://www.linkedin.com/in/anton-kundenko-a22a3667" target="_blank" rel="noopener">LinkedIn</a>
+        <a href="{{ 'docs/' | url }}">Docs</a>
+        <a href="https://github.com/RayforceDB/rayforce/blob/master/LICENSE" target="_blank" rel="noopener">MIT License</a>
+      </div>
+    </div>
+  </div>
+</footer>
+{% endblock %}
+
+{% block scripts %}
+  {{ super() }}
+  <script src="{{ 'javascripts/landing.js' | url }}"></script>
+{% endblock %}

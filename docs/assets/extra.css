@@ -1,0 +1,497 @@
+/* Rayforce docs — brand-aligned overrides for MkDocs Material
+   Mirrors website/style.css palette and typography. */
+
+/* ── Self-hosted brand fonts ──────────────────────────────────
+   Loaded from the marketing site (deployed at /assets/fonts/);
+   docs pages reference them at the absolute path so caching is
+   shared with the rest of the site. */
+
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/assets/fonts/inter-400.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url('/assets/fonts/inter-600.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url('/assets/fonts/inter-700.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'Oswald';
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url('/assets/fonts/oswald-600.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'Oswald';
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url('/assets/fonts/oswald-700.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/assets/fonts/jbmono-400.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url('/assets/fonts/jbmono-600.woff2') format('woff2');
+}
+
+/* ── Fallback font-face overrides ──────────────────────────────
+   Make system fallbacks render at the brand fonts' visual metrics
+   so the swap from fallback to web font produces no layout shift.
+   Mirrors website/style.css.  font-weight: 100 900 ensures the
+   override applies to all weights (incl 500/600/700). */
+@font-face {
+  font-family: 'Inter Fallback';
+  src: local('Arial'), local('Helvetica');
+  font-weight: 100 900;
+  size-adjust: 107%;
+  ascent-override: 90%;
+  descent-override: 22%;
+  line-gap-override: 0%;
+}
+@font-face {
+  font-family: 'Oswald Fallback';
+  src: local('Arial Narrow'), local('Impact'), local('Arial');
+  font-weight: 100 900;
+  size-adjust: 87%;
+  ascent-override: 100%;
+  descent-override: 31%;
+  line-gap-override: 0%;
+}
+@font-face {
+  font-family: 'JetBrains Mono Fallback';
+  src: local('Menlo'), local('Consolas'), local('Courier New');
+  font-weight: 100 900;
+  size-adjust: 99%;
+  ascent-override: 100%;
+  descent-override: 22%;
+  line-gap-override: 0%;
+}
+
+/* ── Marketing palette variables (shared semantics) ────────────
+   Mirrors website/style.css :root.  These let nav / footer rules
+   share the same tokens as the marketing site without hand-editing
+   colour values across the file. */
+:root {
+  --bg: #0a0e13;
+  --bg-section: #0d1219;
+  --bg-card: #111820;
+  --border: rgba(233, 160, 51, 0.1);
+  --border-hover: rgba(233, 160, 51, 0.25);
+  --primary: #e9a033;
+  --primary-light: #f0b954;
+  --primary-lighter: #f5d080;
+  --primary-pale: #fdf0d8;
+  --primary-dark: #c4821a;
+  --accent: #5eead4;
+  --accent-blue: #60a5fa;
+  --navy: #0e1b24;
+  --text: #f1f5f9;
+  --text-muted: #7b8fa0;
+  --text-dim: #3a4f5c;
+  --max-w: 1200px;
+  --font: 'Inter', 'Inter Fallback', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-heading: 'Oswald', 'Oswald Fallback', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --mono: 'JetBrains Mono', 'JetBrains Mono Fallback', 'SF Mono', SFMono-Regular, ui-monospace, Menlo, Consolas, monospace;
+}
+
+/* ── Brand palette ─────────────────────────────────────────────
+   Match website/style.css :root variables.  These override the
+   Material defaults at the document level so both light and dark
+   schemes pull from the same source. */
+
+:root,
+[data-md-color-scheme="default"],
+[data-md-color-scheme="slate"] {
+  /* Primary (amber/orange brand) */
+  --md-primary-fg-color: #e9a033;
+  --md-primary-fg-color--light: #f0b954;
+  --md-primary-fg-color--dark: #c4821a;
+  /* primary-bg is used as foreground text on primary-coloured surfaces
+     (header chrome, tabs). Keep it light so it stays legible on our
+     dark tab bar; the bar itself is overridden below. */
+  --md-primary-bg-color: #f1f5f9;
+  --md-primary-bg-color--light: rgba(241, 245, 249, 0.7);
+
+  /* Accent (cyan/teal) */
+  --md-accent-fg-color: #5eead4;
+  --md-accent-fg-color--transparent: rgba(94, 234, 212, 0.1);
+  --md-accent-bg-color: #f1f5f9;
+  --md-accent-bg-color--light: rgba(241, 245, 249, 0.7);
+
+  /* Typography */
+  --md-text-font: 'Inter', 'Inter Fallback', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --md-code-font: 'JetBrains Mono', 'JetBrains Mono Fallback', 'SF Mono', SFMono-Regular, ui-monospace, Menlo, Consolas, monospace;
+}
+
+/* Dark scheme (default) — match marketing site's bold/editorial dark theme. */
+[data-md-color-scheme="slate"] {
+  --md-default-bg-color: #0a0e13;
+  --md-default-bg-color--light: #0d1219;
+  --md-default-bg-color--lighter: #111820;
+  --md-default-bg-color--lightest: #111820;
+
+  --md-default-fg-color: #f1f5f9;
+  --md-default-fg-color--light: #cbd5e1;
+  --md-default-fg-color--lighter: #7b8fa0;
+  --md-default-fg-color--lightest: #3a4f5c;
+
+  --md-typeset-color: #f1f5f9;
+  --md-typeset-a-color: #f0b954;
+
+  --md-code-bg-color: #0d1219;
+  --md-code-fg-color: #f5d080;
+
+  --md-footer-bg-color: #050810;
+  --md-footer-bg-color--dark: #050810;
+}
+
+/* Light scheme — keep, but tone marketing in. */
+[data-md-color-scheme="default"] {
+  --md-typeset-a-color: #c4821a;
+}
+
+/* ── Heading permalinks: hide the ¶ but keep them clickable on hover.
+   `permalink: true` in mkdocs.yml emits a <a class="headerlink">¶</a>
+   beside every heading — useful for "copy link to section" but visually
+   noisy.  Hide by default, fade in only when the heading is hovered. */
+.md-typeset .headerlink {
+  opacity: 0;
+  margin-left: 0.4em;
+  color: var(--accent);
+  transition: opacity .15s;
+}
+.md-typeset :is(h1, h2, h3, h4, h5, h6):hover .headerlink,
+.md-typeset .headerlink:focus { opacity: 0.7; }
+.md-typeset .headerlink:hover { opacity: 1; }
+
+/* ── Headings: Oswald, marketing-style ────────────────────────── */
+
+.md-typeset h1,
+.md-typeset h2,
+.md-typeset h3,
+.md-typeset h4,
+.md-typeset h5,
+.md-typeset h6,
+.md-header__title {
+  font-family: 'Oswald', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+
+.md-typeset h1 {
+  font-weight: 700;
+  font-size: 2.4rem;
+  line-height: 1.1;
+  color: #f1f5f9;
+}
+
+.md-typeset h2 {
+  font-size: 1.7rem;
+  border-bottom: 1px solid rgba(233, 160, 51, 0.15);
+  padding-bottom: 0.3rem;
+  margin-top: 2.5rem;
+}
+
+.md-typeset h3 {
+  font-size: 1.3rem;
+  color: #f0b954;
+}
+
+/* ── Top navigation bar ──────────────────────────────────────── */
+
+.md-header {
+  background-color: rgba(10, 14, 19, 0.92);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  box-shadow: 0 1px 0 rgba(233, 160, 51, 0.1);
+  height: 64px;
+}
+.md-header__inner {
+  height: 64px;
+  align-items: center;
+  padding: 0 16px;
+}
+/* Logo: use the brand mark at full size (it already contains the
+   "Rayforce" wordmark — no separate site-name text rendered). */
+.md-header .md-logo {
+  display: inline-flex;
+  align-items: center;
+  margin: 0;
+  padding: 0;
+}
+.md-header .md-logo img,
+.md-header .md-logo svg {
+  height: 36px;
+  width: auto;
+  max-height: 36px;
+  display: block;
+}
+/* Spacer absorbs the room the dropped title block used to take so
+   search/repo align right. */
+.md-header__spacer {
+  flex: 1 1 auto;
+}
+
+/* tabs feature is no longer enabled — keep these defensive resets
+   in case Material renders the row from any other code path. */
+.md-tabs { display: none; }
+
+/* (tabs row dropped from features — link styles removed.) */
+
+/* ── Sidebar ─────────────────────────────────────────────────── */
+
+.md-nav__title {
+  font-family: 'Oswald', -apple-system, sans-serif;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-size: 0.72rem;
+  color: #7b8fa0;
+}
+
+.md-nav__link {
+  font-size: 0.78rem;
+}
+
+.md-nav__link--active {
+  color: #f0b954;
+  font-weight: 600;
+}
+
+/* ── Inline code & code blocks ───────────────────────────────── */
+
+.md-typeset code {
+  background: rgba(233, 160, 51, 0.1);
+  color: #f5d080;
+  padding: 0.12em 0.35em;
+  border-radius: 3px;
+  font-size: 0.88em;
+}
+
+.md-typeset pre > code {
+  background: #0d1219;
+  color: #f1f5f9;
+  border: 1px solid rgba(233, 160, 51, 0.08);
+}
+
+/* ── Tables ──────────────────────────────────────────────────── */
+
+.md-typeset table:not([class]) {
+  border: 1px solid rgba(233, 160, 51, 0.1);
+  background: rgba(17, 24, 32, 0.4);
+}
+
+.md-typeset table:not([class]) th {
+  background: rgba(233, 160, 51, 0.08);
+  color: #f0b954;
+  font-family: 'Oswald', sans-serif;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.82rem;
+}
+
+/* ── Admonitions: match info-box look ────────────────────────── */
+
+.md-typeset .admonition,
+.md-typeset details {
+  border-left: 3px solid #e9a033;
+  background: rgba(17, 24, 32, 0.5);
+  font-size: 0.85rem;
+}
+
+.md-typeset .admonition-title,
+.md-typeset summary {
+  background: rgba(233, 160, 51, 0.08);
+  font-family: 'Oswald', sans-serif;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #f0b954;
+}
+
+/* ── Buttons (.md-button) ────────────────────────────────────── */
+
+.md-typeset .md-button {
+  font-family: 'Oswald', sans-serif;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  border: 1px solid #e9a033;
+  color: #f0b954;
+  transition: all .15s;
+}
+
+.md-typeset .md-button:hover {
+  background: rgba(233, 160, 51, 0.1);
+  border-color: #f0b954;
+  color: #f5d080;
+}
+
+.md-typeset .md-button--primary {
+  background: #e9a033;
+  color: #0a0e13;
+}
+
+.md-typeset .md-button--primary:hover {
+  background: #f0b954;
+  color: #0a0e13;
+}
+
+/* ── Search ──────────────────────────────────────────────────── */
+
+.md-search__input {
+  background: rgba(17, 24, 32, 0.6);
+  color: #f1f5f9;
+}
+
+.md-search__input::placeholder {
+  color: #7b8fa0;
+}
+
+/* ── Links inside body ──────────────────────────────────────── */
+
+.md-typeset a {
+  color: #f0b954;
+  transition: color .15s;
+}
+
+.md-typeset a:hover {
+  color: #5eead4;
+}
+
+/* ── Footer ──────────────────────────────────────────────────── */
+
+.md-footer {
+  border-top: 1px solid rgba(233, 160, 51, 0.1);
+}
+
+.md-footer-meta {
+  background-color: #050810;
+}
+
+/* ── Scrollbar ───────────────────────────────────────────────── */
+
+[data-md-color-scheme="slate"] ::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+[data-md-color-scheme="slate"] ::-webkit-scrollbar-track {
+  background: #0a0e13;
+}
+
+[data-md-color-scheme="slate"] ::-webkit-scrollbar-thumb {
+  background: rgba(233, 160, 51, 0.2);
+  border-radius: 5px;
+}
+
+[data-md-color-scheme="slate"] ::-webkit-scrollbar-thumb:hover {
+  background: rgba(233, 160, 51, 0.4);
+}
+
+/* ════════════════════════════════════════════════════════════════
+   Landing page — break Material's content wrappers
+   so the marketing hero renders edge-to-edge like the original
+   website/index.html (no 1220px max-width from .md-main__inner,
+   no .md-content padding, no .md-grid margins).  The landing
+   provides its own `.container` 1200px-max centring inside each
+   section.
+
+   Scoped by html.landing-page body (set early by docs/javascripts/landing.js)
+   so docs pages are untouched.
+   ════════════════════════════════════════════════════════════════ */
+/* Restore browser-default font size on landing — Material sets
+   html { font-size: 20px } and body { font-size: 10px } so every
+   `rem` value the marketing CSS uses (designed against 16px root)
+   blows up by 1.25×, breaking the hero typography. */
+html.landing-page { font-size: 16px; }
+html.landing-page body { font-size: 1rem; line-height: 1.6; }
+
+html.landing-page body .md-container,
+html.landing-page body .md-main,
+html.landing-page body .md-main__inner {
+  max-width: none;
+  margin: 0;
+  padding: 0;
+  display: block;
+}
+html.landing-page body .md-content,
+html.landing-page body .md-content__inner {
+  margin: 0;
+  padding: 0;
+  max-width: none;
+}
+html.landing-page body .md-content__inner::before { display: none; }
+html.landing-page body .md-sidebar,
+html.landing-page body .md-main__inner > .md-sidebar { display: none; }
+/* The landing has its own footer block; suppress Material's. */
+html.landing-page body > .md-footer,
+html.landing-page body .md-footer { display: none; }
+/* Re-show ONLY the landing's <footer class="landing-footer">. */
+html.landing-page body .footer.landing-footer { display: block; }
+
+/* ════════════════════════════════════════════════════════════════
+   Pill-nav styles intentionally NOT duplicated here.
+
+   The floating pill is rendered only on the landing page
+   (overrides/partials/header.html switches based on page.url).
+   `.nav`, `.nav-link-demo`, `.github-widget`, `.nav-toggle`,
+   `.nav-links a`, and the mobile breakpoint for them all live in
+   docs/assets/landing.css — a verbatim copy of website/style.css —
+   which is included only by overrides/home.html.
+
+   Previously this file shadowed those rules with subtly different
+   values (amber-gradient Live Demo, padded GitHub widget) which
+   diverged from website/index.html.  Keep this file scoped to docs
+   chrome only.
+   ════════════════════════════════════════════════════════════════ */
+
+/* Search results dropdown — restyled panel chrome for docs pages
+   (search lives in the standard Material header on docs). */
+[data-md-color-scheme="slate"] .md-search__output {
+  background: var(--bg-section);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.5);
+}
+[data-md-color-scheme="slate"] .md-search-result__meta {
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text-muted);
+}
+[data-md-color-scheme="slate"] .md-search-result__item {
+  border-color: var(--border);
+}
+[data-md-color-scheme="slate"] .md-search-result__link:focus,
+[data-md-color-scheme="slate"] .md-search-result__link:hover {
+  background: rgba(233, 160, 51, 0.06);
+}
+
+/* GitHub widget, .nav-toggle, mobile breakpoint:
+   intentionally removed.  These styles live in landing.css (verbatim
+   website/style.css) and are loaded only when the pill nav is rendered
+   (the landing page).  Keeping them here was shadowing the original
+   marketing values. */
+
