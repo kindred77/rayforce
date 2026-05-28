@@ -88,51 +88,12 @@ markdown_extensions:
 
 plugins:
   - search
-  - redirects:
-      redirect_maps:
-        # Old website/docs/*.html → new structure (filled in during migration)
-        quick-start.html: getting-started/quick-start.md
-        tutorial.html: getting-started/tutorial.md
-        tutorial-graph.html: tutorials/graph.md
-        tutorial-datalog.html: tutorials/datalog.md
-        tutorial-storage.html: tutorials/storage.md
-        tutorial-analytics.html: tutorials/analytics.md
-        rayfall-syntax.html: language/syntax.md
-        rayfall-functions.html: language/functions.md
-        operations-math.html: language/math.md
-        operations-string.html: language/string.md
-        control-flow.html: language/control-flow.md
-        repl.html: language/repl.md
-        data-types.html: data-types/index.md
-        data-types-collections.html: data-types/collections.md
-        queries-select.html: queries/select.md
-        queries-joins.html: queries/joins.md
-        queries-links.html: queries/links.md
-        queries-pivot.html: queries/pivot.md
-        indexes-overview.html: queries/indexes-overview.md
-        queries-indexes.html: queries/indexes.md
-        storage.html: storage/index.md
-        ipc.html: storage/ipc.md
-        ipc-hooks.html: storage/ipc-hooks.md
-        graph-storage.html: graph/storage.md
-        graph-algorithms.html: graph/algorithms.md
-        vector-search.html: graph/vector-search.md
-        guide-indexes.html: guides/indexes.md
-        guide-analytics.html: guides/analytics.md
-        guide-datalog.html: guides/datalog.md
-        datalog.html: guides/datalog-reference.md
-        guide-storage.html: guides/storage.md
-        guide-ipc.html: guides/ipc.md
-        guide-errors.html: guides/errors.md
-        guide-memory.html: guides/memory.md
-        guide-types.html: guides/types.md
-        architecture-pipeline.html: architecture/pipeline.md
-        architecture-memory.html: architecture/memory.md
-        architecture-offloading.html: architecture/offloading.md
-        c-api-core.html: c-api/core.md
-        c-api-dag.html: c-api/dag.md
-        reference.html: reference/all-functions.md
-        index.html: index.md
+# Old website/docs/*.html URLs are preserved via static stubs in docs/*.html
+# (each has a meta-refresh to the new directory URL).  See the *.html files
+# committed alongside this config; they're copied verbatim into site/ by
+# MkDocs, so /docs/quick-start.html, /docs/ipc-hooks.html, etc. keep working.
+#
+# Disabled: mkdocs-redirects plugin (only accepts .md keys, not .html).
 
 nav:
   - Home: index.md
