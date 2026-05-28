@@ -1,3 +1,627 @@
-# All Functions
+# Complete Function Reference
 
-_Coming soon._
+!!! note "Legend"
+    **atomic** — auto-maps element-wise over vectors.
+    **aggr** — reduces vectors to scalars (used in group-by).
+    **special** — receives unevaluated arguments (special form).
+    **restricted** — disabled in sandboxed mode.
+
+## Categories
+
+| | | |
+|---|---|---|
+| [Arithmetic](#arithmetic) (15) | [Comparison](#comparison) (7) | [Logic](#logic) (3) |
+| [Aggregation](#aggregation) (14) | [Higher-Order](#higher-order) (12) | [Collection](#collection) (19) |
+| [Sorting & Ordering](#sorting) (8) | [Control Flow & Special Forms](#control) (11) | [Table Operations](#table-ops) (13) |
+| [Query](#query) (4) | [Joins](#joins) (6) | [Pivot](#pivot) (1) |
+| [String](#string-ops) (3) | [Temporal](#temporal) (3) | [Type & Introspection](#type-ops) (5) |
+| [I/O & Output](#io) (12) | [System & Utility](#system) (15) | [Serialization](#serialization) (2) |
+| [Storage](#storage) (3) | [IPC](#ipc) (3) | [EAV Triple Store](#eav) (5) |
+| [Datalog](#datalog) (2) | [Datalog Program API](#datalog-program) (6) | |
+
+## Arithmetic
+
+All arithmetic operators are **atomic** — they auto-map over vectors and broadcast scalars.
+
+| Function | Type | Flags | Description | Example |
+|---|---|---|---|---|
+| `+` | binary | atomic | Addition | `(+ 3 4)` → `7` |
+| `-` | binary | atomic | Subtraction | `(- 10 3)` → `7` |
+| `*` | binary | atomic | Multiplication | `(* 3 4)` → `12` |
+| `/` | binary | atomic | Integer division (floor) | `(/ 7 2)` → `3` |
+| `%` | binary | atomic | Modulo (remainder) | `(% 7 3)` → `1` |
+| `div` | binary | atomic | Float division (always returns f64) | `(div 7 2)` → `3.5` |
+| `neg` | unary | atomic | Negate value | `(neg 5)` → `-5` |
+| `round` | unary | atomic | Round to nearest integer | `(round 3.7)` → `4.0` |
+| `floor` | unary | atomic | Floor (round down) | `(floor 3.7)` → `3.0` |
+| `ceil` | unary | atomic | Ceiling (round up) | `(ceil 3.2)` → `4.0` |
+| `abs` | unary | atomic | Absolute value | `(abs -7)` → `7` |
+| `sqrt` | unary | atomic | Square root (returns f64) | `(sqrt 9)` → `3.0` |
+| `log` | unary | atomic | Natural logarithm | `(log 2.718)` → `~1.0` |
+| `exp` | unary | atomic | Exponential (e^x) | `(exp 1)` → `2.718...` |
+| `xbar` | binary | atomic | Round down to nearest multiple (bucketing) | `(xbar [3 7 12] 5)` → `[0 5 10]` |
+
+```lisp
+; Vector arithmetic — atomic ops broadcast scalars
+(+ [1 2 3] [10 20 30])   ; [11 22 33]
+(* [1 2 3] 10)            ; [10 20 30]  scalar broadcast
+(abs [-3 0 5])              ; [3 0 5]
+(sqrt [4 9 16])             ; [2.0 3.0 4.0]
+
+; Time bucketing for OHLC bars
+(xbar [3 15 27] 10)        ; [0 10 20]
+```
+
+## Comparison
+
+All comparison operators are **atomic** and return boolean results.
+
+| Function | Type | Flags | Description | Example |
+|---|---|---|---|---|
+| `>` | binary | atomic | Greater than | `(> 5 3)` → `true` |
+| `<` | binary | atomic | Less than | `(< 3 5)` → `true` |
+| `>=` | binary | atomic | Greater than or equal | `(>= 5 5)` → `true` |
+| `<=` | binary | atomic | Less than or equal | `(<= 3 5)` → `true` |
+| `==` | binary | atomic | Equal | `(== 3 3)` → `true` |
+| `!=` | binary | atomic | Not equal | `(!= 3 4)` → `true` |
+| `within` | binary | — | Check which elements fall within a [lo hi) range | `(within [1 5 10] [3 7])` → `[false true false]` |
+
+```lisp
+; Vector comparisons return boolean vectors
+(> [10 20 30] 15)          ; [false true true]
+(== [1 2 3] [1 0 3])       ; [true false true]
+
+; within checks half-open range [lo, hi)
+(within [1 3 5 7] [3 6])  ; [false true true false]
+```
+
+## Logic
+
+Boolean logic operators. Work on scalars and vectors alike.
+
+| Function | Type | Flags | Description | Example |
+|---|---|---|---|---|
+| `and` | binary | — | Logical AND | `(and true false)` → `false` |
+| `or` | binary | — | Logical OR | `(or true false)` → `true` |
+| `not` | unary | — | Logical NOT | `(not true)` → `false` |
+
+```lisp
+; Combine filters with logic ops
+(and (> [1 5 3] 2) (< [1 5 3] 4))  ; [false false true]
+(not [true false true])    ; [false true false]
+```
+
+## Aggregation
+
+Aggregation functions reduce vectors to scalar values. Functions marked **aggr** are recognized by the DAG executor for group-by operations.
+
+| Function | Type | Flags | Description | Example |
+|---|---|---|---|---|
+| `sum` | unary | aggr | Sum of all elements | `(sum [1 2 3])` → `6` |
+| `count` | unary | aggr | Count of elements | `(count [1 2 3])` → `3` |
+| `avg` | unary | aggr | Arithmetic mean | `(avg [1 2 3])` → `2.0` |
+| `min` | unary | aggr | Minimum value | `(min [3 1 2])` → `1` |
+| `max` | unary | aggr | Maximum value | `(max [3 1 2])` → `3` |
+| `first` | unary | — | First element of a vector | `(first [10 20 30])` → `10` |
+| `last` | unary | — | Last element of a vector | `(last [10 20 30])` → `30` |
+| `med` | unary | aggr | Median value | `(med [1 3 2])` → `2` |
+| `dev` | unary | aggr | Sample standard deviation | `(dev [2 4 4 4 5 5 7 9])` → `2.0` |
+| `stddev` | unary | aggr | Sample standard deviation (alias of dev) | `(stddev [1 2 3])` → `0.816...` |
+| `stddev_pop` | unary | aggr | Population standard deviation | `(stddev_pop [1 2 3])` |
+| `dev_pop` | unary | aggr | Population standard deviation (alias) | `(dev_pop [1 2 3])` |
+| `var` | unary | aggr | Sample variance | `(var [1 2 3])` → `1.0` |
+| `var_pop` | unary | aggr | Population variance | `(var_pop [1 2 3])` |
+
+```lisp
+; Basic aggregation
+(sum [10 20 30])           ; 60
+(avg [10 20 30])           ; 20.0
+(med [1 100 5])            ; 5
+
+; Group-by aggregation in select
+(select {from: trades
+         by:   {sym: sym}
+         cols: {hi: (max price) lo: (min price) n: (count price)}})
+```
+
+## Higher-Order Functions { #higher-order }
+
+Functions that take other functions as arguments for mapping, folding, and filtering.
+
+| Function | Type | Flags | Description | Example |
+|---|---|---|---|---|
+| `map` | variadic | — | Apply function to each element | `(map (fn [x] (* x 2)) [1 2 3])` → `[2 4 6]` |
+| `pmap` | variadic | — | Parallel map (multi-threaded) | `(pmap (fn [x] (* x x)) [1 2 3])` → `[1 4 9]` |
+| `fold` | variadic | — | Reduce with function and initial value | `(fold + 0 [1 2 3])` → `6` |
+| `fold-left` | variadic | — | Left-associative fold | `(fold-left - 10 [1 2 3])` → `4` |
+| `fold-right` | variadic | — | Right-associative fold | `(fold-right - 10 [1 2 3])` → `-8` |
+| `scan` | variadic | — | Running fold (all intermediate results) | `(scan + (enlist 1 2 3))` → `[1 3 6]` |
+| `scan-left` | variadic | — | Left-to-right running fold | `(scan-left + (enlist 1 2 3))` → `[1 3 6]` |
+| `scan-right` | variadic | — | Right-to-left running fold | `(scan-right + (enlist 1 2 3))` → `[6 5 3]` |
+| `filter` | binary | — | Keep elements where boolean mask is true | `(filter [1 2 3 4] (> [1 2 3 4] 2))` → `[3 4]` |
+| `apply` | variadic | — | Zip-apply function pairwise over lists | `(apply + (enlist 1 2) (enlist 3 4))` → `[4 6]` |
+| `map-left` | variadic | — | Map with left argument fixed | `(map-left + 10 [1 2 3])` → `[11 12 13]` |
+| `map-right` | variadic | — | Map with right argument fixed | `(map-right - [10 20 30] 5)` → `[5 15 25]` |
+
+```lisp
+; Transform each row with map
+(map (fn [x] (* x x)) [1 2 3 4])  ; [1 4 9 16]
+
+; Parallel map for expensive computation
+(pmap (fn [t] (sum (til t))) [100 200 300])
+
+; Running sum with scan
+(scan + (enlist 1 2 3 4))  ; [1 3 6 10]
+```
+
+## Collection Operations { #collection }
+
+Operations on vectors and lists as collections — set operations, indexing, searching, and construction.
+
+| Function | Type | Flags | Description | Example |
+|---|---|---|---|---|
+| `distinct` | unary | — | Remove duplicates, preserving order | `(distinct [1 2 2 3])` → `[1 2 3]` |
+| `in` | binary | — | Membership test (is element in vector?) | `(in 2 [1 2 3])` → `true` |
+| `except` | binary | — | Set difference (elements in A not in B) | `(except [1 2 3] [2])` → `[1 3]` |
+| `union` | binary | — | Set union (deduplicated) | `(union [1 2] [2 3])` → `[1 2 3]` |
+| `sect` | binary | — | Set intersection | `(sect [1 2 3] [2 3 4])` → `[2 3]` |
+| `take` | binary | — | Take first N elements (negative N takes from end) | `(take [10 20 30] 2)` → `[10 20]` |
+| `at` | binary | — | Index into vector (0-based) | `(at [10 20 30] 1)` → `20` |
+| `find` | binary | — | Find index of first occurrence | `(find [10 20 30] 20)` → `1` |
+| `reverse` | unary | — | Reverse element order | `(reverse [1 2 3])` → `[3 2 1]` |
+| `til` | unary | — | Generate range [0..n) | `(til 5)` → `[0 1 2 3 4]` |
+| `enlist` | variadic | — | Wrap value(s) in a vector (list of atoms) | `(enlist 1 2 3)` → `[1 2 3]` |
+| `concat` | binary | — | Concatenate two vectors or strings | `(concat [1 2] [3 4])` → `[1 2 3 4]` |
+| `raze` | unary | — | Flatten a list of vectors into one vector | `(raze (list [1 2] [3 4]))` → `[1 2 3 4]` |
+| `where` | unary | — | Indices where boolean vector is true | `(where [true false true])` → `[0 2]` |
+| `group` | unary | — | Group indices by value (returns dict) | `(group ['a 'b 'a])` → dict |
+| `diverse` | unary | — | Check if all elements are unique (no duplicates) | `(diverse [1 2 3])` → `true` |
+| `rand` | binary | — | Generate N random values from range or sample from vector | `(rand 3 100)` → 3 random ints 0..99 |
+| `bin` | binary | — | Binary search — left boundary (sorted input) | `(bin [10 20 30] 25)` → `1` |
+| `binr` | binary | — | Binary search — right boundary (sorted input) | `(binr [10 20 30] 25)` → `2` |
+
+```lisp
+; Build and manipulate vectors
+(set v (til 10))             ; [0 1 2 3 4 5 6 7 8 9]
+(take v 3)                  ; [0 1 2]
+(take v -3)                 ; [7 8 9]
+(at v (where (> v 5)))      ; [6 7 8 9]
+
+; Set operations
+(union [1 2 3] [3 4 5])   ; [1 2 3 4 5]
+(sect [1 2 3] [2 3 4])    ; [2 3]
+(except [1 2 3] [2])      ; [1 3]
+```
+
+## Sorting & Ordering { #sorting }
+
+Sort vectors, compute sort indices, and rank elements.
+
+| Function | Type | Flags | Description | Example |
+|---|---|---|---|---|
+| `asc` | unary | — | Sort ascending | `(asc [3 1 2])` → `[1 2 3]` |
+| `desc` | unary | — | Sort descending | `(desc [3 1 2])` → `[3 2 1]` |
+| `iasc` | unary | — | Indices that would sort ascending (grade up) | `(iasc [30 10 20])` → `[1 2 0]` |
+| `idesc` | unary | — | Indices that would sort descending (grade down) | `(idesc [30 10 20])` → `[0 2 1]` |
+| `rank` | unary | — | Rank of each element (0-based) | `(rank [30 10 20])` → `[2 0 1]` |
+| `xasc` | binary | — | Sort table ascending by column(s) | `(xasc 'price trades)` |
+| `xdesc` | binary | — | Sort table descending by column(s) | `(xdesc 'price trades)` |
+| `xrank` | binary | — | Assign N rank buckets (quantile ranking) | `(xrank 4 [10 20 30 40])` → `[0 1 2 3]` |
+
+```lisp
+; Sort indices for reordering
+(set v [30 10 20])
+(at v (iasc v))              ; [10 20 30]  same as (asc v)
+
+; Sort a table by price descending
+(xdesc 'price trades)
+
+; Quantile buckets
+(xrank 10 (til 100))        ; 10 equal-sized buckets 0..9
+```
+
+## Control Flow & Special Forms { #control }
+
+Special forms receive their arguments unevaluated. These are the core language primitives for binding, branching, function definition, and error handling.
+
+| Function | Type | Flags | Description | Example |
+|---|---|---|---|---|
+| `set` | binary | special, restricted | Bind value to global variable | `(set x 42)` |
+| `let` | binary | special | Bind value to local variable (lexical scope) | `(let y (+ x 1))` |
+| `if` | variadic | special | Conditional: (if cond then else) | `(if (> x 0) "pos" "neg")` |
+| `do` | variadic | special | Sequential execution, returns last value | `(do (set x 1) (set y 2) (+ x y))` |
+| `fn` | variadic | special | Create lambda function | `(fn [x y] (+ x y))` |
+| `try` | binary | special | Error handling: (try expr handler-fn) | `(try (/ 1 0) (fn [e] 0))` |
+| `raise` | unary | — | Throw an error with message | `(raise "bad input")` |
+| `return` | unary | — | Early return from function body | `(return 42)` |
+| `quote` | variadic | special | Return argument unevaluated | `(quote (+ 1 2))` → `(+ 1 2)` |
+| `alter` | variadic | special | In-place mutation of table column | `(alter trades 'price (* price 1.1))` |
+| `del` | variadic | special, restricted | Delete columns or rows from table | `(del trades 'temp_col)` |
+
+```lisp
+; Variable binding and branching
+(set threshold 100)
+(set classify (fn [x]
+  (if (> x threshold) "high"
+      (> x 50)        "mid"
+                        "low")))
+
+; Error handling
+(try
+  (/ 100 0)
+  (fn [err] (println "caught:" err) 0))
+```
+
+## Table Operations { #table-ops }
+
+Create and manipulate tables, dictionaries, and their metadata.
+
+| Function | Type | Flags | Description | Example |
+|---|---|---|---|---|
+| `list` | variadic | — | Create a list from vectors (column data for tables) | `(list [1 2] ['a 'b])` |
+| `table` | binary | — | Create table from column names and list of vectors | `(table [x y] (list [1 2] ['a 'b]))` |
+| `dict` | binary | — | Create dictionary from keys and values vectors | `(dict ['a 'b] [1 2])` |
+| `key` | unary | — | Get column names (table) or keys (dict) | `(key trades)` → `[sym price size]` |
+| `value` | unary | — | Get column data (table) or values (dict) | `(value d)` |
+| `get` | binary | — | Lookup key in dict or column in table | `(get d 'a)` → `1` |
+| `remove` | binary | — | Remove key from dictionary | `(remove d 'a)` |
+| `row` | binary | — | Extract single row from table as dict | `(row trades 0)` |
+| `meta` | unary | — | Get table metadata (column types, lengths) | `(meta trades)` |
+| `union-all` | binary | — | Concatenate two tables (all rows, no dedup) | `(union-all t1 t2)` |
+| `unify` | binary | — | Merge two tables/dicts (second takes precedence) | `(unify d1 d2)` |
+| `modify` | variadic | restricted | Functional table update (returns new table) | `(modify trades 'price (fn [p] (* p 1.1)))` |
+| `pivot` | variadic | — | Pivot table — reshape long to wide format | `(pivot trades 'sym 'date 'price)` |
+
+```lisp
+; Create a table
+(set trades (table [sym price size]
+  (list ['AAPL 'GOOG 'AAPL]
+        [150.0 2800.0 151.0]
+        [100 50 200])))
+
+; Dictionary operations
+(set d (dict ['name 'age] ["Alice" 30]))
+(get d 'name)              ; "Alice"
+(key d)                      ; [name age]
+
+; Pivot: long to wide
+(pivot trades 'sym 'date 'price)
+```
+
+## Query Operations { #query }
+
+Special forms that bridge to the Rayforce DAG executor for high-performance columnar queries.
+
+| Function | Type | Flags | Description | Example |
+|---|---|---|---|---|
+| `select` | variadic | special | Query table with optional filter, projection, grouping, and aggregation | `(select {from: t cols: {a: a}})` |
+| `update` | variadic | special, restricted | Add or modify columns in a table (mutates in-place) | `(update {from: t cols: {b: (* a 2)}})` |
+| `insert` | variadic | special, restricted | Insert rows into a table | `(insert t {x: 10 y: 20})` |
+| `upsert` | variadic | special, restricted | Insert or update rows by key match | `(upsert t {x: 10 y: 20})` |
+
+```lisp
+; Select with filter and projection
+(select {from: trades
+         where: (> price 100)
+         cols: {sym: sym notional: (* price size)}})
+
+; Group-by with VWAP
+(select {from: trades
+         by:   {sym: sym}
+         cols: {vwap: (/ (sum (* price size)) (sum size))
+                n: (count price)}})
+
+; Update: add computed column
+(update {from: trades
+         cols: {notional: (* price size)}})
+```
+
+## Joins
+
+Rayforce supports six join types, including time-series-aware as-of and window joins.
+
+| Function | Type | Flags | Description | Example |
+|---|---|---|---|---|
+| `left-join` | variadic | — | Left join — all left rows, unmatched filled with null | `(left-join trades quotes 'sym)` |
+| `inner-join` | variadic | — | Inner join — only matching rows from both sides | `(inner-join orders products 'product_id)` |
+| `anti-join` | variadic | — | Anti-semi-join — left rows with no right match | `(anti-join t1 t2 'key)` |
+| `window-join` | variadic | special | Window join — match rows within a time range | `(window-join {left: t1 right: t2 ...})` |
+| `window-join1` | variadic | special | Window join variant (single-row match per window) | `(window-join1 {left: t1 right: t2 ...})` |
+| `asof-join` | variadic | — | As-of join — match most recent preceding value | `(asof-join trades quotes 'sym)` |
+
+```lisp
+; Left join on sym column
+(left-join trades quotes 'sym)
+
+; Window join: match trades to quotes within 1-second window
+(window-join {left: trades  right: quotes
+              on: [sym]  window: [-1000 0]
+              cols: {avg_bid: (avg bid)}})
+
+; As-of join: find most recent quote for each trade
+(asof-join trades quotes 'sym)
+```
+
+## Pivot
+
+| Function | Type | Flags | Description | Example |
+|---|---|---|---|---|
+| `pivot` | variadic | — | Pivot table — reshape long to wide. Args: table, row-key col, col-key col, value col | `(pivot sales 'region 'product 'revenue)` |
+
+```lisp
+; Pivot sales data: rows=region, cols=product, values=revenue
+(set sales (table [region product revenue]
+  (list ['east 'east 'west 'west]
+        ['widgets 'gadgets 'widgets 'gadgets]
+        [100 200 150 250])))
+(pivot sales 'region 'product 'revenue)
+```
+
+## String Operations { #string-ops }
+
+String functions available as builtins. Additional string operations (UPPER, LOWER, TRIM, SUBSTR, REPLACE, STRLEN) are available at the DAG executor level via `select`/`update`.
+
+| Function | Type | Flags | Description | Example |
+|---|---|---|---|---|
+| `split` | binary | — | Split string by delimiter into vector of strings | `(split "a,b,c" ",")` → `["a" "b" "c"]` |
+| `like` | binary | — | Glob-style pattern match (* and ? wildcards) | `(like "hello" "hel*")` → `true` |
+| `sym-name` | unary | — | Resolve integer sym IDs to symbols (passthrough for sym atoms) | `(sym-name 0)` → sym at ID 0 |
+
+```lisp
+; Split and rejoin
+(split "2026-04-16" "-")    ; ["2026" "04" "16"]
+
+; Pattern matching on a vector of strings
+(like ["apple" "banana" "avocado"] "a*")
+; [true false true]
+
+; String concat also works on strings
+(concat "hello" " world")  ; "hello world"
+```
+
+## Date & Time { #temporal }
+
+Temporal constructors. Pass `0` to get the current clock value. Cross-temporal comparisons are supported (dates, times, timestamps are all converted to nanoseconds internally).
+
+| Function | Type | Flags | Description | Example |
+|---|---|---|---|---|
+| `date` | unary | — | Current date, or extract date from timestamp | `(date 0)` → today's date |
+| `time` | unary | — | Current time, or extract time from timestamp | `(time 0)` → current time |
+| `timestamp` | unary | — | Current timestamp (nanosecond precision) | `(timestamp 0)` |
+
+```lisp
+; Get current date/time
+(date 0)                    ; 2026.04.16
+(time 0)                    ; 14:30:00.000000000
+(timestamp 0)               ; 2026.04.16T14:30:00.000000000
+```
+
+## Type & Introspection { #type-ops }
+
+Type checking, casting, null testing, and object inspection.
+
+| Function | Type | Flags | Description | Example |
+|---|---|---|---|---|
+| `type` | unary | — | Get the type name of a value | `(type 42)` → `'i64` |
+| `as` | binary | — | Cast value to another type | `(as 'i64 "42")` → `42` |
+| `nil?` | unary | — | Test if value is null | `(nil? 0Ni)` → `true` |
+| `rc` | unary | — | Get reference count of an object | `(rc x)` → `1` |
+| `guid` | unary | — | Generate N GUIDs (pass 0 for a single GUID) | `(guid 0)` |
+
+```lisp
+; Type checking and casting
+(type [1 2 3])              ; "I64"
+(type "hello")              ; "str"
+(as 'f64 [1 2 3])          ; [1.0 2.0 3.0]
+(nil? 0Ni)                   ; true
+
+; Generate a batch of GUIDs
+(guid 5)                    ; vector of 5 GUIDs
+```
+
+## I/O & Output { #io }
+
+Printing, file I/O, CSV loading, and script execution.
+
+| Function | Type | Flags | Description | Example |
+|---|---|---|---|---|
+| `println` | variadic | — | Print values with newline | `(println "hello" 42)` |
+| `print` | unary | — | Print value without newline | `(print "hello")` |
+| `show` | variadic | — | Pretty-print a value (tables formatted) | `(show trades)` |
+| `format` | variadic | — | Format value to string (% as placeholder) | `(format "val=%" 42)` → `"val=42"` |
+| `.csv.read` | variadic | restricted | Load CSV file into table (mmap, parallel parse) | `(.csv.read "data.csv")` |
+| `.csv.write` | variadic | restricted | Write table to CSV file | `(.csv.write trades "out.csv")` |
+| `read` | unary | restricted | Read file contents as string | `(read "file.txt")` |
+| `write` | binary | restricted | Write string to file | `(write "file.txt" "content")` |
+| `load` | unary | restricted | Load and evaluate a Rayfall script file | `(load "lib.rfl")` |
+| `exit` | unary | restricted | Exit the process with status code | `(exit 0)` |
+| `resolve` | variadic | special | Resolve a symbol in the current scope | `(resolve 'x)` |
+| `timeit` | variadic | special | Benchmark an expression (prints elapsed time) | `(timeit (sum (til 1000000)))` |
+
+```lisp
+; Load and query CSV data
+(set trades (.csv.read "trades.csv"))
+(show trades)
+(println (format "Loaded % rows" (count (value (first (value trades))))))
+
+; Benchmark
+(timeit (sum (til 10000000)))
+```
+
+## System & Utility { #system }
+
+System interaction, metaprogramming, diagnostics, and runtime inspection.
+
+| Function | Type | Flags | Description | Example |
+|---|---|---|---|---|
+| `eval` | unary | — | Evaluate a parsed Rayfall expression | `(eval (parse "(+ 1 2)"))` → `3` |
+| `parse` | unary | — | Parse a string into a Rayfall expression tree | `(parse "(+ 1 2)")` |
+| `.sys.gc` | variadic | — | Trigger GC / heap flush, returns `0` | `(.sys.gc)` |
+| `.sys.exec` | unary | restricted | Execute a shell command, return exit code | `(.sys.exec "ls -la")` |
+| `.os.getenv` | unary | restricted | Get environment variable value | `(.os.getenv "HOME")` |
+| `.os.setenv` | binary | restricted | Set environment variable | `(.os.setenv "KEY" "value")` |
+| `args` | unary | — | Get command-line arguments as vector | `(args 0)` |
+| `env` | unary | — | List all global environment bindings | `(env 0)` |
+| `.time.now` | variadic | — | Monotonic time in milliseconds | `(.time.now)` |
+| `.time.timer.set` | variadic | restricted | Schedule callback every `ms`, `num` times (0 = forever); returns id | `(.time.timer.set 1000 0 (fn [t] (println t)))` |
+| `.time.timer.del` | unary | restricted | Cancel a scheduled timer by id; returns null | `(.time.timer.del 0)` |
+| `.sys.build` | variadic | — | Build metadata dict with `version` + `build-date` | `(.sys.build)` |
+| `.sys.mem` | variadic | — | Memory allocator statistics (alloc / peak / slab hits) | `(.sys.mem)` |
+| `.sys.info` | variadic | — | System information (cores, page size, total memory) | `(.sys.info)` |
+
+```lisp
+; Metaprogramming: parse and eval
+(set expr (parse "(+ 10 20)"))
+(eval expr)                  ; 30
+
+; Timing with monotonic millisecond clock
+(set t0 (.time.now))
+(sum (til 1000000))
+(println (format "%ms" (- (.time.now) t0)))
+
+; System diagnostics
+(.sys.info 0)                  ; OS, CPU cores, memory budget
+(.sys.mem 0)                  ; heap usage statistics
+```
+
+## Serialization
+
+Binary serialization for any Rayforce object. Useful for IPC, caching, and persistence.
+
+| Function | Type | Flags | Description | Example |
+|---|---|---|---|---|
+| `ser` | unary | — | Serialize any value to binary format (byte vector) | `(ser [1 2 3])` |
+| `de` | unary | — | Deserialize from binary format back to value | `(de bytes)` → `[1 2 3]` |
+
+```lisp
+; Round-trip serialization
+(set data [1 2 3])
+(set bytes (ser data))
+(de bytes)                   ; [1 2 3]
+
+; Serialize a table for caching
+(write "cache.bin" (ser trades))
+(set cached (de (read "cache.bin")))
+```
+
+## Storage
+
+Persistent columnar storage — splayed (one file per column) and partitioned tables.
+
+| Function | Type | Flags | Description | Example |
+|---|---|---|---|---|
+| `.db.splayed.set` | variadic | restricted | Save table as splayed columns to a directory | `(.db.splayed.set "db/trades" trades)` |
+| `.db.splayed.get` | variadic | — | Load splayed table from a directory | `(.db.splayed.get "db/trades")` |
+| `.db.parted.get` | variadic | — | Load partitioned table from root directory | `(.db.parted.get "db" 'trades)` |
+
+```lisp
+; Save and reload a splayed table
+(.db.splayed.set "db/trades" trades)
+(set t (.db.splayed.get "db/trades"))
+(show t)
+
+; Load a date-partitioned table
+(set hist (.db.parted.get "db" 'trades))
+```
+
+## IPC (Inter-Process Communication) { #ipc }
+
+TCP-based IPC for connecting to remote Rayforce instances. Uses binary serialization on the wire.
+
+| Function | Type | Flags | Description | Example |
+|---|---|---|---|---|
+| `.ipc.open` | unary | restricted | Open TCP connection to host:port, returns handle | `(.ipc.open "localhost:5000")` |
+| `.ipc.close` | unary | restricted | Close an IPC connection handle | `(.ipc.close h)` |
+| `.ipc.send` | binary | restricted | Send a value over an IPC handle (sync request) | `(.ipc.send h "(sum (til 100))")` |
+| `.ipc.handle` | variadic | — | Current connection handle inside any `.ipc.on.*` hook, `-1` outside | `(.ipc.handle)` |
+| `.ipc.on.open` | hook | user-settable | Fires after inbound connection completes handshake; arg = handle | `(set .ipc.on.open (fn [h] ...))` |
+| `.ipc.on.close` | hook | user-settable | Fires before inbound connection teardown; arg = handle | `(set .ipc.on.close (fn [h] ...))` |
+| `.ipc.on.sync` | hook | user-settable | Intercepts sync messages; return value becomes the response | `(set .ipc.on.sync (fn [m] (eval (parse m))))` |
+| `.ipc.on.async` | hook | user-settable | Intercepts async messages; return value ignored | `(set .ipc.on.async (fn [m] ...))` |
+| `.ipc.on.auth` | hook | user-settable | Narrows `-u`/`-U` auth; truthy = accept, falsy = reject | `(set .ipc.on.auth (fn [u p] (!= u "ban")))` |
+
+```lisp
+; Connect to a remote Rayforce instance
+(set h (.ipc.open "localhost:5000"))
+(set result (.ipc.send h "(select {from: trades where: (> price 100)})"))
+(show result)
+(.ipc.close h)
+```
+
+## EAV Triple Store { #eav }
+
+Built-in Entity-Attribute-Value store. The EAV table has three columns: `e` (entity, i64), `a` (attribute, sym), `v` (value, i64). Foundation for the Datalog engine.
+
+| Function | Type | Flags | Description | Example |
+|---|---|---|---|---|
+| `datoms` | variadic | — | Create an empty EAV table | `(datoms)` |
+| `assert-fact` | variadic | — | Append a triple (e, a, v) to the EAV table | `(assert-fact db 1 'name 100)` |
+| `retract-fact` | variadic | — | Remove a triple from the EAV table | `(retract-fact db 1 'name 100)` |
+| `scan-eav` | variadic | — | Query EAV by attribute, returns (e, v) table | `(scan-eav db 'name)` |
+| `pull` | variadic | — | Entity-centric retrieval — returns all attributes as dict | `(pull db 1)` → `{name:100 age:30}` |
+
+```lisp
+; Build a knowledge base with EAV triples
+(set db (datoms))
+(set db (assert-fact db 1 'name 100))
+(set db (assert-fact db 1 'age 30))
+(set db (assert-fact db 2 'name 200))
+
+(pull db 1)                  ; {name:100 age:30}
+(scan-eav db 'name)         ; table of (e, v) where a=name
+```
+
+## Datalog
+
+Datalog rules and queries integrate with the EAV store. Rules use the `(?entity :attribute ?value)` pattern to match triples. Supports recursive rules and stratified negation.
+
+| Function | Type | Flags | Description | Example |
+|---|---|---|---|---|
+| `rule` | variadic | special | Define a Datalog rule (head + body clauses) | `(rule (path ?x ?y) (?x :edge ?y))` |
+| `query` | variadic | special | Compile and execute a Datalog query against EAV store | `(query db (find ?x ?y) (where (path ?x ?y)))` |
+
+```lisp
+; Recursive transitive closure
+(rule (path ?x ?y) (?x :edge ?y))
+(rule (path ?x ?z) (?x :edge ?y) (path ?y ?z))
+
+(set db (datoms))
+(set db (assert-fact db 1 'edge 2))
+(set db (assert-fact db 2 'edge 3))
+(query db (find ?x ?y) (where (path ?x ?y)))
+; (1,2) (1,3) (2,3)
+
+; Stratified negation: nodes with no outgoing edges
+(rule (leaf ?x) (?x :edge ?_) (not (?x :edge ?_)))
+(query db (find ?x) (where (leaf ?x)))
+```
+
+## Datalog Program API { #datalog-program }
+
+Low-level API for building and evaluating Datalog programs directly, bypassing the EAV store. Useful for custom base relations from tables.
+
+| Function | Type | Flags | Description | Example |
+|---|---|---|---|---|
+| `dl-program` | variadic | — | Create an empty Datalog program | `(dl-program)` |
+| `dl-add-edb` | variadic | — | Register a base relation (table + arity) | `(dl-add-edb prog 'edge tbl 2)` |
+| `dl-stratify` | unary | — | Compute strata for the program (required before eval) | `(dl-stratify prog)` |
+| `dl-eval` | unary | — | Evaluate program to fixpoint (semi-naive iteration) | `(dl-eval prog)` |
+| `dl-query` | binary | — | Query a derived or base relation by name | `(dl-query prog 'path)` |
+| `dl-provenance` | binary | — | Get derivation provenance tracking for a relation | `(dl-provenance prog 'path)` |
+
+```lisp
+; Build a Datalog program from a table
+(set edges (table [x y] (list [1 2 3] [2 3 4])))
+(set prog (dl-program))
+(dl-add-edb prog 'edge edges 2)
+
+; Add rules and evaluate
+(rule (path ?x ?y) (edge ?x ?y))
+(rule (path ?x ?z) (edge ?x ?y) (path ?y ?z))
+(dl-stratify prog)
+(dl-eval prog)
+
+; Query results
+(dl-query prog 'path)       ; all reachable pairs
+(dl-provenance prog 'path)  ; derivation tracking
+```
