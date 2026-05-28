@@ -1,0 +1,203 @@
+site_name: Rayforce
+site_description: Rayforce — embeddable columnar analytics and graph traversal engine in pure C17. Built-in Rayfall query language, IPC, datalog, and vector search.
+site_url: https://rayforcedb.com/docs/
+site_author: Anton Kundenko
+copyright: Copyright &copy; 2025-2026 Anton Kundenko · MIT licensed
+repo_name: RayforceDB/rayforce
+repo_url: https://github.com/RayforceDB/rayforce
+edit_uri: edit/master/docs/
+
+docs_dir: docs
+site_dir: site
+exclude_docs: |
+  superpowers/
+
+theme:
+  name: material
+  language: en
+  font:
+    text: Inter
+    code: JetBrains Mono
+  palette:
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: deep orange
+      accent: orange
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: deep orange
+      accent: orange
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.indexes
+    - navigation.top
+    - navigation.footer
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - search.share
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+  icon:
+    repo: fontawesome/brands/github
+    edit: material/pencil
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/RayforceDB/rayforce
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.keys
+  - pymdownx.mark
+  - pymdownx.tilde
+  - pymdownx.caret
+  - pymdownx.smartsymbols
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+plugins:
+  - search
+  - redirects:
+      redirect_maps:
+        # Old website/docs/*.html → new structure (filled in during migration)
+        quick-start.html: getting-started/quick-start.md
+        tutorial.html: getting-started/tutorial.md
+        tutorial-graph.html: tutorials/graph.md
+        tutorial-datalog.html: tutorials/datalog.md
+        tutorial-storage.html: tutorials/storage.md
+        tutorial-analytics.html: tutorials/analytics.md
+        rayfall-syntax.html: language/syntax.md
+        rayfall-functions.html: language/functions.md
+        operations-math.html: language/math.md
+        operations-string.html: language/string.md
+        control-flow.html: language/control-flow.md
+        repl.html: language/repl.md
+        data-types.html: data-types/index.md
+        data-types-collections.html: data-types/collections.md
+        queries-select.html: queries/select.md
+        queries-joins.html: queries/joins.md
+        queries-links.html: queries/links.md
+        queries-pivot.html: queries/pivot.md
+        indexes-overview.html: queries/indexes-overview.md
+        queries-indexes.html: queries/indexes.md
+        storage.html: storage/index.md
+        ipc.html: storage/ipc.md
+        ipc-hooks.html: storage/ipc-hooks.md
+        graph-storage.html: graph/storage.md
+        graph-algorithms.html: graph/algorithms.md
+        vector-search.html: graph/vector-search.md
+        guide-indexes.html: guides/indexes.md
+        guide-analytics.html: guides/analytics.md
+        guide-datalog.html: guides/datalog.md
+        datalog.html: guides/datalog-reference.md
+        guide-storage.html: guides/storage.md
+        guide-ipc.html: guides/ipc.md
+        guide-errors.html: guides/errors.md
+        guide-memory.html: guides/memory.md
+        guide-types.html: guides/types.md
+        architecture-pipeline.html: architecture/pipeline.md
+        architecture-memory.html: architecture/memory.md
+        architecture-offloading.html: architecture/offloading.md
+        c-api-core.html: c-api/core.md
+        c-api-dag.html: c-api/dag.md
+        reference.html: reference/all-functions.md
+        index.html: index.md
+
+nav:
+  - Home: index.md
+  - Getting Started:
+      - Quick Start: getting-started/quick-start.md
+      - Tutorial: getting-started/tutorial.md
+  - Tutorials:
+      - Graph Queries: tutorials/graph.md
+      - Datalog: tutorials/datalog.md
+      - Data Loading: tutorials/storage.md
+      - Advanced Analytics: tutorials/analytics.md
+  - Rayfall Language:
+      - Syntax: language/syntax.md
+      - Functions Reference: language/functions.md
+      - Math Operations: language/math.md
+      - String Operations: language/string.md
+      - Control Flow: language/control-flow.md
+      - REPL Reference: language/repl.md
+  - Namespaces:
+      - Overview: namespaces/index.md
+      - .col — Column linking: namespaces/col.md
+      - .csv — CSV I/O: namespaces/csv.md
+      - .db — Tables on disk: namespaces/db.md
+      - .graph — Graph algorithms: namespaces/graph.md
+      - .idx — Indexes: namespaces/idx.md
+      - .ipc — IPC client: namespaces/ipc.md
+      - .log — Write-ahead log: namespaces/log.md
+      - .os — Filesystem & env: namespaces/os.md
+      - .repl — REPL control: namespaces/repl.md
+      - .sys — System info: namespaces/sys.md
+      - .time — Clock & timers: namespaces/time.md
+  - Data & Types:
+      - Data Types: data-types/index.md
+      - Collections: data-types/collections.md
+  - Queries:
+      - Select Queries: queries/select.md
+      - Joins: queries/joins.md
+      - Linked Columns: queries/links.md
+      - Indexes Overview: queries/indexes-overview.md
+      - Accelerator Indexes: queries/indexes.md
+      - Pivot: queries/pivot.md
+  - Storage & IPC:
+      - Columnar Storage: storage/index.md
+      - IPC & Serialization: storage/ipc.md
+      - IPC Connection Hooks: storage/ipc-hooks.md
+  - Graph Engine:
+      - Graph Storage: graph/storage.md
+      - Graph Algorithms: graph/algorithms.md
+      - Vector Search: graph/vector-search.md
+  - Guides:
+      - Indexes Guide: guides/indexes.md
+      - Analytics Cookbook: guides/analytics.md
+      - Datalog Guide: guides/datalog.md
+      - Datalog Reference: guides/datalog-reference.md
+      - Storage Guide: guides/storage.md
+      - IPC Guide: guides/ipc.md
+      - Error Handling: guides/errors.md
+      - Memory & Monitoring: guides/memory.md
+      - Type Casting: guides/types.md
+  - Architecture:
+      - Pipeline & Optimizer: architecture/pipeline.md
+      - Memory Model: architecture/memory.md
+      - Block Offloading: architecture/offloading.md
+  - C API:
+      - Core API: c-api/core.md
+      - DAG API: c-api/dag.md
+  - Reference:
+      - All Functions: reference/all-functions.md
