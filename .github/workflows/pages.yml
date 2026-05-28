@@ -1,11 +1,18 @@
 name: Deploy to GitHub Pages
 
+# The site is now a single MkDocs build: marketing landing at /, docs at
+# /docs/, About at /about/.  The legacy website/ directory has been
+# subsumed into docs/ (CNAME, _headers, robots.txt, llms.txt all live
+# under docs/ now and get copied to site/ verbatim by mkdocs), so this
+# workflow just builds MkDocs and uploads site/ directly — no more
+# shuffling artifacts between website/ and site/.
+
 on:
   push:
     branches: [master]
     paths:
-      - 'website/**'
       - 'docs/**'
+      - 'overrides/**'
       - 'mkdocs.yml'
       - 'requirements-docs.txt'
       - '.github/workflows/pages.yml'
@@ -32,18 +39,12 @@ jobs:
           cache-dependency-path: requirements-docs.txt
       - name: Install MkDocs Material
         run: pip install -r requirements-docs.txt
-      - name: Build docs (MkDocs)
+      - name: Build site (MkDocs)
         run: mkdocs build --strict
-      - name: Combine marketing + docs into deploy artifact
-        run: |
-          # The legacy hand-edited /docs/ directory under website/ is fully
-          # replaced by the MkDocs build output.
-          rm -rf website/docs
-          mv site website/docs
       - uses: actions/configure-pages@v4
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: website
+          path: site
 
   deploy:
     needs: build
