@@ -33,3 +33,5 @@ coverage*.info
 coverage_html/
 rayforce.cov
 .playwright-mcp/
+site/
+.venv-docs/
