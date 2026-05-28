@@ -564,7 +564,9 @@
           <tr><td><code>.os.setenv</code></td><td>binary</td><td>Set environment variable</td><td><code>(.os.setenv "KEY" "value")</code></td></tr>
           <tr><td><code>exit</code></td><td>unary</td><td>Exit with status code</td><td><code>(exit 0)</code></td></tr>
           <tr><td><code>timeit</code></td><td>variadic, special</td><td>Benchmark an expression</td><td><code>(timeit (sum (til 1000000)))</code></td></tr>
-          <tr><td><code>timer</code></td><td>unary</td><td>High-resolution monotonic nanosecond clock</td><td><code>(timer 0)</code></td></tr>
+          <tr><td><code>.time.now</code></td><td>variadic</td><td>Current monotonic time in milliseconds</td><td><code>(.time.now)</code></td></tr>
+          <tr><td><code>.time.timer.set</code></td><td>variadic, restricted</td><td>Schedule a callback every <code>ms</code> milliseconds, <code>num</code> times (0 = forever). Returns timer id.</td><td><code>(.time.timer.set 1000 0 (fn [t] (println t)))</code></td></tr>
+          <tr><td><code>.time.timer.del</code></td><td>unary, restricted</td><td>Cancel a scheduled timer by id. Returns null.</td><td><code>(.time.timer.del 0)</code></td></tr>
           <tr><td><code>args</code></td><td>unary</td><td>Command-line arguments</td><td><code>(args 0)</code></td></tr>
           <tr><td><code>env</code></td><td>unary</td><td>List all global environment bindings</td><td><code>(env 0)</code></td></tr>
           <tr><td><code>.sys.build</code></td><td>variadic</td><td>Build metadata: <code>version</code> + <code>build-date</code></td><td><code>(.sys.build)</code></td></tr>

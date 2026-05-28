@@ -668,7 +668,9 @@
           <tr><td><code>.os.setenv</code></td><td>binary</td><td>restricted</td><td>Set environment variable</td><td><code>(.os.setenv "KEY" "value")</code></td></tr>
           <tr><td><code>args</code></td><td>unary</td><td>&mdash;</td><td>Get command-line arguments as vector</td><td><code>(args 0)</code></td></tr>
           <tr><td><code>env</code></td><td>unary</td><td>&mdash;</td><td>List all global environment bindings</td><td><code>(env 0)</code></td></tr>
-          <tr><td><code>timer</code></td><td>unary</td><td>&mdash;</td><td>High-resolution monotonic nanosecond clock</td><td><code>(timer 0)</code></td></tr>
+          <tr><td><code>.time.now</code></td><td>variadic</td><td>&mdash;</td><td>Monotonic time in milliseconds</td><td><code>(.time.now)</code></td></tr>
+          <tr><td><code>.time.timer.set</code></td><td>variadic</td><td>restricted</td><td>Schedule callback every <code>ms</code>, <code>num</code> times (0 = forever); returns id</td><td><code>(.time.timer.set 1000 0 (fn [t] (println t)))</code></td></tr>
+          <tr><td><code>.time.timer.del</code></td><td>unary</td><td>restricted</td><td>Cancel a scheduled timer by id; returns null</td><td><code>(.time.timer.del 0)</code></td></tr>
           <tr><td><code>.sys.build</code></td><td>variadic</td><td>&mdash;</td><td>Build metadata dict with <code>version</code> + <code>build-date</code></td><td><code>(.sys.build)</code></td></tr>
           <tr><td><code>.sys.mem</code></td><td>variadic</td><td>&mdash;</td><td>Memory allocator statistics (alloc / peak / slab hits)</td><td><code>(.sys.mem)</code></td></tr>
           <tr><td><code>.sys.info</code></td><td>variadic</td><td>&mdash;</td><td>System information (cores, page size, total memory)</td><td><code>(.sys.info)</code></td></tr>
@@ -679,10 +681,10 @@
 (<span class="hl-kw">set</span> expr (<span class="hl-fn">parse</span> <span class="hl-str">"(+ 10 20)"</span>))
 (<span class="hl-fn">eval</span> expr)                  <span class="hl-comment">; 30</span>
 
-<span class="hl-comment">; Timing with nanosecond clock</span>
-(<span class="hl-kw">set</span> t0 (<span class="hl-fn">timer</span> <span class="hl-num">0</span>))
+<span class="hl-comment">; Timing with monotonic millisecond clock</span>
+(<span class="hl-kw">set</span> t0 (<span class="hl-fn">.time.now</span>))
 (<span class="hl-fn">sum</span> (<span class="hl-fn">til</span> <span class="hl-num">1000000</span>))
-(<span class="hl-fn">println</span> (<span class="hl-fn">format</span> <span class="hl-str">"%ns"</span> (<span class="hl-fn">-</span> (<span class="hl-fn">timer</span> <span class="hl-num">0</span>) t0)))
+(<span class="hl-fn">println</span> (<span class="hl-fn">format</span> <span class="hl-str">"%ms"</span> (<span class="hl-fn">-</span> (<span class="hl-fn">.time.now</span>) t0)))
 
 <span class="hl-comment">; System diagnostics</span>
 (<span class="hl-fn">.sys.info</span> <span class="hl-num">0</span>)                  <span class="hl-comment">; OS, CPU cores, memory budget</span>

@@ -28,6 +28,8 @@
 #include <rayforce.h>
 #include "core/runtime.h"   /* ray_runtime_t, ray_runtime_create*, __RUNTIME */
 #include "core/sock.h"      /* ray_sock_* */
+#include "core/poll.h"      /* ray_poll_t, ray_poll_create/destroy */
+#include "core/timer.h"     /* ray_timers_t, ray_timers_pump_for */
 #include "lang/format.h"    /* ray_fmt for eval_err */
 #include <stdio.h>
 #include <stdlib.h>
@@ -375,6 +377,23 @@ static int eval_err(const char* src, const char* substr) {
 static void sys_setup(void)    { ray_runtime_create(0, NULL); }
 static void sys_teardown(void) { ray_runtime_destroy(__RUNTIME); }
 
+/* Variant that also wires up a poll loop — required by .time.timer.*
+ * tests, since `ray_runtime_create` doesn't allocate one (only main.c
+ * does in production).  Without it, .time.timer.set returns
+ * `"no poll loop active"`. */
+static ray_poll_t* g_test_poll = NULL;
+static void sys_setup_with_poll(void) {
+    ray_runtime_create(0, NULL);
+    g_test_poll = ray_poll_create();
+    ray_runtime_set_poll(g_test_poll);
+}
+static void sys_teardown_with_poll(void) {
+    ray_runtime_set_poll(NULL);
+    if (g_test_poll) ray_poll_destroy(g_test_poll);
+    g_test_poll = NULL;
+    ray_runtime_destroy(__RUNTIME);
+}
+
 static test_result_t test_syscov_eval_builtin(void) {
     /* (eval (parse "42")) -> 42 */
     TEST_ASSERT_TRUE(eval_eq("(eval (parse \"42\"))", "42"));
@@ -476,13 +495,82 @@ static test_result_t test_syscov_rc(void) {
     PASS();
 }
 
-/* timer builtin (ray_timer_fn) */
-static test_result_t test_syscov_timer(void) {
-    ray_t* r = ray_eval_str("(timer 0)");
+/* .time.now */
+static test_result_t test_syscov_time_now(void) {
+    ray_t* r = ray_eval_str("(.time.now)");
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     TEST_ASSERT_EQ_I(r->type, -RAY_I64);
+    TEST_ASSERT_TRUE(r->i64 > 0);
     ray_release(r);
+    TEST_ASSERT_TRUE(eval_err("(.time.now 1)", "domain"));
+    PASS();
+}
+
+/* .time.timer.set / .time.timer.del — argument validation + idempotent delete */
+static test_result_t test_syscov_time_timer_set_del(void) {
+    TEST_ASSERT_TRUE(eval_err("(.time.timer.set)",              "domain"));
+    TEST_ASSERT_TRUE(eval_err("(.time.timer.set 1000)",         "domain"));
+    TEST_ASSERT_TRUE(eval_err("(.time.timer.set 1000 0)",       "domain"));
+    TEST_ASSERT_TRUE(eval_err("(.time.timer.set \"x\" 0 (fn [t] t))", "type"));
+    TEST_ASSERT_TRUE(eval_err("(.time.timer.set 1000 \"x\" (fn [t] t))", "type"));
+    TEST_ASSERT_TRUE(eval_err("(.time.timer.set -1 0 (fn [t] t))",      "domain"));
+    TEST_ASSERT_TRUE(eval_err("(.time.timer.set 1000 -1 (fn [t] t))",   "domain"));
+    TEST_ASSERT_TRUE(eval_err("(.time.timer.set 1000 0 42)",            "type"));
+    TEST_ASSERT_TRUE(eval_err("(.time.timer.set 1000 0 (fn [a b] a))",  "domain"));
+
+    /* Schedule then cancel — del returns null. */
+    {
+        ray_t* id = ray_eval_str("(.time.timer.set 100000 1 (fn [t] t))");
+        TEST_ASSERT_NOT_NULL(id);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(id));
+        TEST_ASSERT_EQ_I(id->type, -RAY_I64);
+        char src[128];
+        snprintf(src, sizeof src, "(.time.timer.del %lld)", (long long)id->i64);
+        ray_t* r = ray_eval_str(src);
+        TEST_ASSERT_NOT_NULL(r);
+        TEST_ASSERT_TRUE(RAY_IS_NULL(r));
+        ray_release(id);
+        ray_release(r);
+    }
+
+    /* Del of bogus id returns null (idempotent). */
+    {
+        ray_t* r = ray_eval_str("(.time.timer.del 999999)");
+        TEST_ASSERT_NOT_NULL(r);
+        TEST_ASSERT_TRUE(RAY_IS_NULL(r));
+        ray_release(r);
+    }
+
+    TEST_ASSERT_TRUE(eval_err("(.time.timer.del \"x\")", "type"));
+    PASS();
+}
+
+/* Integration: schedule, pump the heap for 100 ms, verify N fires happened. */
+static test_result_t test_syscov_time_timer_fires(void) {
+    /* Reach the runtime's active poll directly. */
+    ray_poll_t* poll = (ray_poll_t*)ray_runtime_get_poll();
+    TEST_ASSERT_NOT_NULL(poll);
+
+    /* Set up a counter and schedule a 3-shot timer that increments it. */
+    ray_t* setup_counter = ray_eval_str("(set tcounter 0)");
+    if (setup_counter) ray_release(setup_counter);
+    ray_t* setup_timer = ray_eval_str(
+        "(.time.timer.set 5 3 (fn [t] (set tcounter (+ tcounter 1))))");
+    TEST_ASSERT_NOT_NULL(setup_timer);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(setup_timer));
+    ray_release(setup_timer);
+
+    /* Pump for 100 ms — enough for 3 fires at 5 ms each, with slack. */
+    ray_timers_pump_for((ray_timers_t*)poll->timers, 100);
+
+    /* Verify the counter advanced. */
+    ray_t* c = ray_eval_str("tcounter");
+    TEST_ASSERT_NOT_NULL(c);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(c));
+    TEST_ASSERT_EQ_I(c->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(c->i64, 3);
+    ray_release(c);
     PASS();
 }
 
@@ -613,7 +701,9 @@ const test_entry_t runtime_entries[] = {
     { "runtime/syscov_return",               test_syscov_return,               sys_setup, sys_teardown },
     { "runtime/syscov_args",                 test_syscov_args,                 sys_setup, sys_teardown },
     { "runtime/syscov_rc",                   test_syscov_rc,                   sys_setup, sys_teardown },
-    { "runtime/syscov_timer",                test_syscov_timer,                sys_setup, sys_teardown },
+    { "runtime/syscov_time_now",             test_syscov_time_now,             sys_setup, sys_teardown },
+    { "runtime/syscov_time_timer_set_del",   test_syscov_time_timer_set_del,   sys_setup_with_poll, sys_teardown_with_poll },
+    { "runtime/syscov_time_timer_fires",     test_syscov_time_timer_fires,     sys_setup_with_poll, sys_teardown_with_poll },
     { "runtime/syscov_env",                  test_syscov_env,                  sys_setup, sys_teardown },
     { "runtime/syscov_setenv_type_errors",   test_syscov_setenv_type_errors,   sys_setup, sys_teardown },
     { "runtime/syscov_hopen_type_error",     test_syscov_hopen_type_error,     sys_setup, sys_teardown },
