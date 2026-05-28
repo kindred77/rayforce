@@ -544,7 +544,7 @@
           <tr><td><code>fn</code></td><td>variadic, special</td><td>Create lambda function</td><td><code>(fn [x] (* x x))</code></td></tr>
           <tr><td><code>try</code></td><td>binary, special</td><td>Error handling (expr handler)</td><td><code>(try (/ 1 0) (fn [e] 0))</code></td></tr>
           <tr><td><code>raise</code></td><td>unary</td><td>Throw an error</td><td><code>(raise "bad input")</code></td></tr>
-          <tr><td><code>return</code></td><td>unary</td><td>Early return from function</td><td><code>(return 42)</code></td></tr>
+          <tr><td><code>return</code></td><td>variadic</td><td>Early return from compiled lambda (0 args &rarr; null)</td><td><code>(return 42)</code></td></tr>
           <tr><td><code>quote</code></td><td>variadic, special</td><td>Return argument unevaluated</td><td><code>(quote (+ 1 2))</code> &rarr; <code>(+ 1 2)</code></td></tr>
           <tr><td><code>resolve</code></td><td>variadic, special</td><td>Resolve a symbol in current scope</td><td><code>(resolve 'x)</code></td></tr>
         </tbody>

@@ -230,12 +230,19 @@
       <p>If no error is raised, <code>try</code> returns the result of the body expression normally. Works inside lambdas compiled to bytecode.</p>
 
       <h2 id="early-return-return">Early Return: return</h2>
-      <p><code>return</code> exits a lambda early with the given value:</p>
+      <p><code>return</code> exits the innermost enclosing compiled lambda early with the given value:</p>
       <pre><code><span class="hl-comment">‣</span> (<span class="hl-kw">set</span> f (<span class="hl-kw">fn</span> [x] (<span class="hl-kw">if</span> (<span class="hl-fn">&lt;</span> x <span class="hl-num">0</span>) (<span class="hl-kw">return</span> <span class="hl-num">-1</span>) (<span class="hl-fn">+</span> x <span class="hl-num">1</span>))))
 <span class="hl-comment">‣</span> (f <span class="hl-num">-5</span>)
 -1
 <span class="hl-comment">‣</span> (f <span class="hl-num">5</span>)
 6</code></pre>
+      <p>The zero-arg form returns null:</p>
+      <pre><code><span class="hl-comment">‣</span> ((<span class="hl-kw">fn</span> [] (<span class="hl-kw">return</span>)))
+<span class="hl-comment">‣</span></code></pre>
+      <p><code>return</code> works inside <code>(try ...)</code>: the trap frame is unwound cleanly before the lambda exits.</p>
+      <pre><code><span class="hl-comment">‣</span> ((<span class="hl-kw">fn</span> [] (<span class="hl-kw">try</span> (<span class="hl-kw">return</span> <span class="hl-num">42</span>) (<span class="hl-kw">fn</span> [e] e))))
+42</code></pre>
+      <p><code>return</code> only exits the lambda it is lexically inside &mdash; not any outer lambdas. There is no non-local return.</p>
 
       <h2 id="null-semantics">Null Semantics</h2>
       <p>Nulls are tracked via a per-element bitmap, not sentinel values. Typed null literals create atoms with the null bit set:</p>
