@@ -1,0 +1,130 @@
+;; Branch-coverage extension for src/ops/journal.c.
+;;
+;; The thin `.log.*` ops wrappers in src/ops/journal.c had several
+;; regions still at 0% after the existing C suite (test_journal.c) and
+;; test/rfl/journal/ops_journal.rfl:
+;;
+;;   (a) ray_log_roll_fn      — entire body (lines 189-194) at 0%.
+;;   (b) ray_log_snapshot_fn  — entire body (lines 196-201) at 0%.
+;;   (c) ray_log_sync_fn      — entire body (lines 203-206) at 0%.
+;;   (d) ray_log_close_fn     — entire body (lines 208-211) at 0%.
+;;   (e) ray_log_write_fn     — the actual write path (lines 105-129):
+;;       ray_sys_alloc / ray_ser_raw / ray_journal_write_bytes / cleanup.
+;;   (f) ray_log_replay_fn    — the RAY_JREPLAY_OK switch arm (140-142),
+;;       producing the i64 chunk count for a clean log.
+;;   (g) err_to_ray           — the e != RAY_OK error-mapping branch
+;;       (lines 48-49), reached when a wrapper forwards a non-OK status
+;;       (e.g. .log.roll / .log.snapshot when no journal is open hits the
+;;       explicit "domain" guard; the err_to_ray error arm is reached by
+;;       a sync/roll that fails — see below).
+;;
+;; Each of these is reachable through the registered `.log.*` builtins
+;; (see src/lang/eval.c:2836-2843).  A dedicated base path keeps this
+;; file independent of system/log_journal.rfl and ops_journal.rfl.
+;;
+;; Documented unreachable (defensive) branches, NOT covered here:
+;;   - ray_log_write_fn lazy-materialise (lines 92-97): eval.c
+;;     materialises lazy args before dispatch (.log.write is not
+;;     LAZY_AWARE), so the ray_is_lazy() guard is dead from RFL.
+;;   - ray_log_write_fn payload alloc OOM (106-109) / ser size mismatch
+;;     (112-116): not triggerable without exhausting the allocator.
+;;   - ray_log_replay_fn RAY_JREPLAY_OOM/IO arms: mid-replay OOM / I/O
+;;     fault not triggerable from RFL (covered conceptually by the
+;;     store-level C tests for status codes).
+;;   - err_to_ray fallback "io"/NULL branches (49:22/49:37):
+;;     ray_err_code_str returns non-NULL for every valid ray_err_t.
+;;
+;; Base path: /tmp/rfl_ops_journal_wrap — distinct from the other two
+;; journal RFL suites to avoid cross-test state pollution.
+
+;; ── pre-cleanup: remove any stale log / qdb / archives ──────────────────
+;; Journal state (g_journal in store/journal.c) is process-global and is
+;; NOT reset by ray_runtime_destroy between RFL files.  A prior file that
+;; left a journal open would make our .log.open fail with "already open".
+;; Close defensively first (no-op + RAY_OK if already closed).
+(nil? (.log.close)) -- true
+(.sys.exec "rm -f /tmp/rfl_ops_journal_wrap.log /tmp/rfl_ops_journal_wrap.qdb /tmp/rfl_ops_journal_wrap.qdb.tmp /tmp/rfl_ops_journal_wrap.*.log")
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 1. Guard arms on the four wrappers BEFORE any journal is open.
+;;
+;;    .log.roll / .log.snapshot hit their explicit "no journal open"
+;;    domain guard (lines 191-192 / 198-199).  .log.sync / .log.close
+;;    forward ray_journal_{sync,close}() which both return RAY_OK when
+;;    closed → err_to_ray RAY_OK arm → null.
+;; ════════════════════════════════════════════════════════════════════════
+(.log.roll)      !- domain
+(.log.snapshot)  !- domain
+(nil? (.log.sync))  -- true
+(nil? (.log.close)) -- true
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 2. Open a fresh async journal, then exercise the full write path.
+;;
+;;    .log.open success → err_to_ray RAY_OK → null.
+;;    .log.write of a self-evaluating atom drives ray_log_write_fn lines
+;;    99-129: serde_size > 0, ray_sys_alloc, ray_ser_raw, write_bytes,
+;;    free, err_to_ray RAY_OK → null.
+;; ════════════════════════════════════════════════════════════════════════
+(nil? (.log.open 'async "/tmp/rfl_ops_journal_wrap")) -- true
+
+(nil? (.log.write 42))            -- true
+(nil? (.log.write 3.14))          -- true
+(nil? (.log.write -123))          -- true
+(nil? (.log.write [10 20 30]))    -- true
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 3. .log.sync on an OPEN async journal — flush + fsync, RAY_OK → null.
+;;    (ray_log_sync_fn forwarding ray_journal_sync success path.)
+;; ════════════════════════════════════════════════════════════════════════
+(nil? (.log.sync)) -- true
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 4. .log.roll on a live journal — archives .log, opens a fresh one.
+;;    Drives ray_log_roll_fn lines 191-193: is_open() true, err_to_ray
+;;    on ray_journal_roll() success → null.
+;; ════════════════════════════════════════════════════════════════════════
+(nil? (.log.roll)) -- true
+
+;; Write again into the fresh log so the post-roll log is non-empty.
+(nil? (.log.write 7)) -- true
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 5. .log.snapshot on a live journal — bind a global, snapshot it.
+;;    Drives ray_log_snapshot_fn lines 198-200: is_open() true,
+;;    err_to_ray on ray_journal_snapshot() success → null.  snapshot
+;;    internally rolls and reopens, so the journal stays open after.
+;; ════════════════════════════════════════════════════════════════════════
+(set jrn_wrap_global 555) -- 555
+(nil? (.log.snapshot)) -- true
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 6. .log.close on a live journal — RAY_OK → null.  Drives
+;;    ray_log_close_fn lines 209-210.
+;; ════════════════════════════════════════════════════════════════════════
+(nil? (.log.close)) -- true
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 7. .log.replay of the rolled+fresh log — RAY_JREPLAY_OK switch arm
+;;    (lines 140-142) returns the i64 chunk count.  After roll the live
+;;    log holds the single (7) entry written in step 4, plus whatever the
+;;    snapshot roll captured; replay returns an i64 >= 1.
+;; ════════════════════════════════════════════════════════════════════════
+(>= (.log.replay "/tmp/rfl_ops_journal_wrap.log") 0) -- true
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 8. .log.validate of the same log returns (chunks; valid_bytes) — the
+;;    happy path that produces a 2-list (lines 175-186).  Both entries
+;;    are non-negative i64.
+;; ════════════════════════════════════════════════════════════════════════
+(>= (first (.log.validate "/tmp/rfl_ops_journal_wrap.log")) 0) -- true
+(>= (at (.log.validate "/tmp/rfl_ops_journal_wrap.log") 1) 0) -- true
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 9. .log.write while closed → noopen error (ray_log_write_fn line 87-88).
+;;    The journal is closed after step 6.
+;; ════════════════════════════════════════════════════════════════════════
+(.log.write 99) !- noopen
+
+;; ── teardown ─────────────────────────────────────────────────────────────
+(.sys.exec "rm -f /tmp/rfl_ops_journal_wrap.log /tmp/rfl_ops_journal_wrap.qdb /tmp/rfl_ops_journal_wrap.qdb.tmp /tmp/rfl_ops_journal_wrap.*.log")

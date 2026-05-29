@@ -1,0 +1,239 @@
+;; Branch-coverage extension for src/ops/expr.c.
+;;
+;; expr.c already has dedicated tests (fused_expr, cast_unary, const_expr,
+;; narrow_binary, null_compare, null_propagation, and the ops/expr_* suite).
+;; This file targets the residual *reachable* branches those leave behind:
+;;
+;;   - Fused CAST narrowing of a computed scratch register (I64/F64 -> I32,
+;;     I16, U8, BOOL) in expr_exec_unary (expr.c dt=I32/I16/U8/BOOL arms).
+;;   - Fused CAST BOOL->I64 (expr_exec_unary dt=I64, t1=BOOL).
+;;   - Fused mixed-type comparison promotion (expr_compile ot==BOOL && t1!=t2)
+;;     where one operand is F64 and the other an integer scratch.
+;;   - Non-fused exec_elementwise_unary I64-column -> F64 with SQRT/LOG/EXP
+;;     (the I64->F64 arm's non-NEG cases), forced via a nullable column.
+;;   - exec_elementwise_binary scalar-F64-divisor div/mod -> null marking.
+;;   - str_resolved with the *left* operand a -RAY_STR literal vs a SYM column
+;;     (the lhs branch of the SYM-vs-STR resolution).
+;;   - F64 unary CEIL/FLOOR via the fused path (expr_exec_unary F64 arm).
+;;
+;; All assertions are happy-path with hand-computable results, run on the
+;; standard select()/where() pipeline so the DAG executor reaches expr.c.
+;;
+;; Documented UNREACHABLE branches (no RFL surface / defensive guards):
+;;   - OP_MIN2 / OP_MAX2 element-wise: only ray_min2/ray_max2 graph API,
+;;     no RFL operator -> expr_exec_binary MIN2/MAX2 arms + binary_range
+;;     BR_AR_FAST MIN2/MAX2 cases are dead from RFL.
+;;   - expr_eval_morsel REG_SCAN SYM W64 direct pointer (col_attrs W64):
+;;     needs a dictionary with > 4 billion symbols -> unreachable.
+;;   - expr_exec_binary narrow dt (I32/DATE/TIME, I16, U8) arms: fused
+;;     registers are only ever F64/I64/BOOL (expr_compile never emits a
+;;     narrow-typed binary destination) -> dead in the fused evaluator.
+;;   - binary_range I32/I16/U8 OP_DIV, F64 OP_IDIV, I64 OP_DIV: ray_div
+;;     hard-codes F64 output and ray_idiv hard-codes I64 output, so these
+;;     opcode/type pairs never co-occur (see narrow_binary.rfl notes).
+;;   - EXPR_MAX_REGS / EXPR_MAX_INS / depth-64 / VLA>4096 guards in
+;;     expr_compile: defensive caps on expression size; an RFL expression
+;;     large enough to trip them would exceed the parser's practical limits.
+;;   - OOM returns (ray_vec_new == NULL, scratch_alloc == NULL): allocator
+;;     failure, not reachable without fault injection.
+
+;; ====================================================================
+;; SETUP — non-nullable columns force the fused (expr_compile) path.
+;; ====================================================================
+(set Ti (table [a b] (list [10 20 30 40 50] [3 4 6 8 10])))
+(set Tf (table [x y] (list [1.5 2.5 3.5 4.5 5.5] [2.0 2.0 2.0 2.0 2.0])))
+
+;; ====================================================================
+;; 1. Fused CAST narrowing of a *computed* scratch register.
+;;    (+ a b) compiles to an I64 scratch, then (as 'TYPE ...) emits an
+;;    OP_CAST whose dst is the narrow type -> expr_exec_unary dt=I32/I16/U8
+;;    with t1=I64 (the integer-source arm of each narrow block).
+;; ====================================================================
+
+;; I64 scratch -> I32  (expr_exec_unary dt=I32, t1=I64 -> (int32_t)a[j])
+(at (select {r: (as 'I32 (+ a b)) from: Ti}) 'r) -- [13 24 36 48 60]
+(type (at (select {r: (as 'I32 (+ a b)) from: Ti}) 'r)) -- 'I32
+
+;; I64 scratch -> I16  (expr_exec_unary dt=I16, t1=I64 -> (int16_t)a[j])
+(at (select {r: (as 'I16 (+ a b)) from: Ti}) 'r) -- [13 24 36 48 60]
+(type (at (select {r: (as 'I16 (+ a b)) from: Ti}) 'r)) -- 'I16
+
+;; I64 scratch -> U8  (expr_exec_unary dt=U8, t1=I64 -> (uint8_t)a[j])
+(at (select {r: (as 'U8 (+ a b)) from: Ti}) 'r) -- [0x0d 0x18 0x24 0x30 0x3c]
+(type (at (select {r: (as 'U8 (+ a b)) from: Ti}) 'r)) -- 'U8
+
+;; F64 scratch -> I32  (expr_exec_unary dt=I32, t1=F64 -> (int32_t)a[j])
+;; (* x y) = [3.0 5.0 7.0 9.0 11.0]; truncate to I32.
+(at (select {r: (as 'I32 (* x y)) from: Tf}) 'r) -- [3 5 7 9 11]
+(type (at (select {r: (as 'I32 (* x y)) from: Tf}) 'r)) -- 'I32
+
+;; F64 scratch -> I16  (expr_exec_unary dt=I16, t1=F64 -> (int16_t)a[j])
+(at (select {r: (as 'I16 (* x y)) from: Tf}) 'r) -- [3 5 7 9 11]
+(type (at (select {r: (as 'I16 (* x y)) from: Tf}) 'r)) -- 'I16
+
+;; F64 scratch -> U8  (expr_exec_unary dt=U8, t1=F64 -> (uint8_t)a[j])
+(at (select {r: (as 'U8 (* x y)) from: Tf}) 'r) -- [0x03 0x05 0x07 0x09 0x0b]
+(type (at (select {r: (as 'U8 (* x y)) from: Tf}) 'r)) -- 'U8
+
+;; ====================================================================
+;; 2. Fused CAST to BOOL of a computed register.
+;;    (- a b) over Ti = [7 16 24 32 40]  (all non-zero) -> all true.
+;;    expr_exec_unary dt=BOOL, OP_CAST, I64 source (a[j]!=0 && a[j]!=NULL_I64).
+;; ====================================================================
+(at (select {r: (as 'BOOL (- a b)) from: Ti}) 'r) -- [true true true true true]
+(type (at (select {r: (as 'BOOL (- a b)) from: Ti}) 'r)) -- 'B8
+
+;; Include a zero result so the false branch of the truthy test fires.
+;; (- a a) = 0 for every row -> all false.
+(at (select {r: (as 'BOOL (- a a)) from: Ti}) 'r) -- [false false false false false]
+
+;; F64 source CAST -> BOOL (expr_exec_unary dt=BOOL, OP_CAST, F64 arm,
+;; NaN/zero check).  (- x x) = 0.0 -> false;  (* x y) != 0 -> true.
+(at (select {r: (as 'BOOL (- x x)) from: Tf}) 'r) -- [false false false false false]
+(at (select {r: (as 'BOOL (* x y)) from: Tf}) 'r) -- [true true true true true]
+
+;; ====================================================================
+;; 3. Fused CAST BOOL -> I64 (expr_exec_unary dt=I64, t1=BOOL).
+;;    (== a b) produces a BOOL scratch; (as 'I64 ...) of it copies the
+;;    1-byte BOOL cells into the I64 destination.
+;;    Ti a=[10 20 30 40 50] b=[3 4 6 8 10]; (== a b) all false -> 0.
+;; ====================================================================
+(at (select {r: (as 'I64 (== a b)) from: Ti}) 'r) -- [0 0 0 0 0]
+(type (at (select {r: (as 'I64 (== a b)) from: Ti}) 'r)) -- 'I64
+
+;; A column where some comparisons are true: (>= a 30) -> [f f t t t].
+(at (select {r: (as 'I64 (>= a 30)) from: Ti}) 'r) -- [0 0 1 1 1]
+(sum (at (select {r: (as 'I64 (>= a 30)) from: Ti}) 'r)) -- 3
+
+;; ====================================================================
+;; 4. Fused mixed-type comparison promotion (expr_compile ot==BOOL,
+;;    s2!=0xFF, t1!=t2).  Compare an I64 column against an F64 column:
+;;    one side I64, one side F64 -> both promoted to F64 before OP_GT.
+;;    Tmix i=[1 2 3 4 5] f=[3.0 3.0 3.0 3.0 3.0].
+;; ====================================================================
+(set Tmix2 (table [i f] (list [1 2 3 4 5] [3.0 3.0 3.0 3.0 3.0])))
+(at (select {r: (> i f) from: Tmix2}) 'r) -- [false false false true true]
+(at (select {r: (< i f) from: Tmix2}) 'r) -- [true true false false false]
+(at (select {r: (== i f) from: Tmix2}) 'r) -- [false false true false false]
+(at (select {r: (>= i f) from: Tmix2}) 'r) -- [false false true true true]
+(at (select {r: (<= i f) from: Tmix2}) 'r) -- [true true true false false]
+(at (select {r: (!= i f) from: Tmix2}) 'r) -- [true true false true true]
+
+;; ====================================================================
+;; 5. F64 CEIL / FLOOR via the fused path (expr_exec_unary F64 arm,
+;;    OP_CEIL line + OP_FLOOR line).  Non-null F64 column in select.
+;; ====================================================================
+(set Tcf (table [x] (list [1.2 2.7 -1.2 -2.7 3.0])))
+(at (select {r: (ceil x) from: Tcf}) 'r)  -- [2.0 3.0 -1.0 -2.0 3.0]
+(at (select {r: (floor x) from: Tcf}) 'r) -- [1.0 2.0 -2.0 -3.0 3.0]
+
+;; ====================================================================
+;; 6. F64 SQRT / LOG / EXP via the fused path (expr_exec_unary F64 arm).
+;; ====================================================================
+(set Tsq (table [x] (list [1.0 4.0 9.0 16.0 25.0])))
+(at (select {r: (sqrt x) from: Tsq}) 'r) -- [1.0 2.0 3.0 4.0 5.0]
+;; exp(log(x)) == x within tolerance
+(< (sum (abs (- (at (select {r: (exp (log x)) from: Tsq}) 'r) [1.0 4.0 9.0 16.0 25.0]))) 0.001) -- true
+
+;; ====================================================================
+;; 7. Non-fused exec_elementwise_unary I64-column -> F64 SQRT/LOG/EXP.
+;;    A nullable I64 column makes expr_compile bail (HAS_NULLS check),
+;;    so exec_elementwise_unary runs.  in_type=I64, out_type=F64, the
+;;    SQRT/LOG/EXP cases (not the NEG default) of that arm.
+;; ====================================================================
+(set Tnull (table [v] (list [1 4 0Nl 16])))
+;; sqrt over the non-null rows: 1,2,_,4  -> the null row stays null.
+(sum (at (select {r: (sqrt v) from: Tnull}) 'r)) -- 7.0
+(nil? (at (at (select {r: (sqrt v) from: Tnull}) 'r) 2)) -- true
+;; exp/log round-trip on the non-null rows.
+(< (abs (- (sum (at (select {r: (exp (log v)) from: Tnull}) 'r)) 21.0)) 0.001) -- true
+
+;; Non-fused I64->F64 SQRT/LOG/EXP on a plain nullable vector too.
+(sqrt [1 4 9 16]) -- [1.0 2.0 3.0 4.0]
+(type (sqrt [1 4 9 16])) -- 'F64
+
+;; ====================================================================
+;; 8. div / mod by a *scalar* F64 zero divisor -> every row marked null
+;;    (exec_elementwise_binary scalar-divisor is_zero F64 arm).
+;; ====================================================================
+(sum (map nil? (/ [1.0 2.0 3.0] 0.0))) -- 3
+(sum (map nil? (% [1.0 2.0 3.0] 0.0))) -- 3
+;; div by scalar I64 zero -> all null (the integer is_zero arm).
+(sum (map nil? (div [1 2 3] 0))) -- 3
+(sum (map nil? (% [10 20 30] 0))) -- 3
+
+;; ====================================================================
+;; 9. SYM-vs-STR resolution with the *left* operand a string literal.
+;;    exec_elementwise_binary str_resolved branch where lhs is -RAY_STR
+;;    and rhs is a SYM column (the `else if (l_scalar ...)` arm).
+;;    Reachable through select/where where the column is typed RAY_SYM.
+;; ====================================================================
+(set TSymL (table [k v] (list ['a 'b 'c 'a 'b] [10 20 30 40 50])))
+;; ("a" == k) : left STR literal, right SYM column.
+(sum (at (select {from: TSymL where: (== "a" k)}) 'v)) -- 50
+(sum (at (select {from: TSymL where: (!= "a" k)}) 'v)) -- 100
+(sum (at (select {from: TSymL where: (== "b" k)}) 'v)) -- 70
+;; A string literal not present in the symbol table -> resolves to -1,
+;; so no row matches (== unmatched) / every row matches (!= unmatched).
+(count (select {from: TSymL where: (== "zzz" k)})) -- 0
+(count (select {from: TSymL where: (!= "zzz" k)})) -- 5
+
+;; ====================================================================
+;; 10. Fused F64-output arithmetic promoting BOTH integer operands
+;;     (expr_compile ot==F64 && s2!=0xFF arm -> two expr_ensure_type
+;;     CAST inserts).  (/ a b) forces F64 output; a,b both I64 columns.
+;;     a=[10 20 30 40 50] b=[3 4 6 8 10] -> [3.333.. 5.0 5.0 5.0 5.0].
+;; ====================================================================
+(at (select {r: (/ a b) from: Ti}) 'r) -- [3.3333333333333335 5.0 5.0 5.0 5.0]
+(type (at (select {r: (/ a b) from: Ti}) 'r)) -- 'F64
+
+;; ====================================================================
+;; 11. Integer div / mod by a zero divisor stored in a column.
+;;     `div` lowers to OP_IDIV, which is NOT in expr_is_elementwise's
+;;     fuseable range -> it takes exec_elementwise_binary -> binary_range,
+;;     whose div/mod post-pass marks the zero-divisor row null (lines
+;;     ~2142-2153, the !r_scalar I64 b[i]==0 -> ray_vec_set_null arm).
+;;     `%` lowers to OP_MOD, which DOES fuse -> expr_exec_binary I64
+;;     OP_MOD b[j]==0 guard writes 0 (no fused null post-pass).
+;;     z has a zero in the middle row.
+;; ====================================================================
+(set Tdz (table [a z] (list [10 20 30 40] [2 0 5 4])))
+;; div (non-fused, OP_IDIV) -> zero-divisor row is NULL.
+(at (select {r: (div a z) from: Tdz}) 'r) -- [5 0Nl 6 10]
+(nil? (at (at (select {r: (div a z) from: Tdz}) 'r) 1)) -- true
+;; mod (fused, OP_MOD) -> zero-divisor row is 0, not null.
+(at (select {r: (% a z) from: Tdz}) 'r) -- [0 0 0 0]
+(nil? (at (at (select {r: (% a z) from: Tdz}) 'r) 1)) -- false
+
+;; ====================================================================
+;; 12. Fused F64 -> I64 CAST out-of-range clamp (expr_exec_unary dt=I64,
+;;     f64 source: a[j] >= INT64_MAX -> INT64_MAX; a[j] <= INT64_MIN ->
+;;     INT64_MIN).  A column holding values past the i64 range exercises
+;;     both clamp directions.  9.3e18 > INT64_MAX(9.223e18); -9.3e18 <
+;;     INT64_MIN; the middle value casts exactly.
+;;     NOTE: INT64_MIN is the NULL_I64 sentinel, so we assert the
+;;     negative clamp via an ordering compare (the fused CAST does not
+;;     set HAS_NULLS, so the value is a real INT64_MIN payload) rather
+;;     than an exact literal (which the parser would fold to null).
+;; ====================================================================
+(set Tclamp (table [x] (list [9.3e18 -9.3e18 1000.0])))
+;; Positive clamp: INT64_MAX (not a null sentinel) and exact mid value.
+(at (at (select {r: (as 'I64 x) from: Tclamp}) 'r) 0) -- 9223372036854775807
+(at (at (select {r: (as 'I64 x) from: Tclamp}) 'r) 2) -- 1000
+(type (at (select {r: (as 'I64 x) from: Tclamp}) 'r)) -- 'I64
+;; Negative clamp landed at the i64 floor: result row 1 < -9e18.
+(< (at (at (select {r: (as 'I64 x) from: Tclamp}) 'r) 1) -9000000000000000000) -- true
+
+;; ====================================================================
+;; 13. Non-fused TIMESTAMP-vec comparison vs TIMESTAMP scalar
+;;     (binary_range BOOL fast path lhs->type == RAY_TIMESTAMP arm).
+;;     A plain TIMESTAMP vector (not in a table) keeps the non-fused
+;;     exec_elementwise_binary -> binary_range route.
+;; ====================================================================
+(set VTS2 (as 'TIMESTAMP [1000 2000 3000 4000 5000]))
+(> VTS2 (as 'TIMESTAMP 3000))  -- [false false false true true]
+(< VTS2 (as 'TIMESTAMP 3000))  -- [true true false false false]
+(== VTS2 (as 'TIMESTAMP 3000)) -- [false false true false false]
+(>= VTS2 (as 'TIMESTAMP 3000)) -- [false false true true true]
+(<= VTS2 (as 'TIMESTAMP 3000)) -- [true true true false false]
+(!= VTS2 (as 'TIMESTAMP 3000)) -- [true true false true true]

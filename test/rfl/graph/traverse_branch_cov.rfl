@@ -1,0 +1,258 @@
+;; Branch-coverage tests for src/ops/traverse.c — targets REACHABLE
+;; functional branches not exercised by graph_basic / graph_advanced /
+;; graph_algos_advanced / traverse_coverage / traverse_weighted.
+;;
+;; All graphs reach traverse.c only through the 17 registered builtins
+;; (.graph.* in src/lang/eval.c).  Direction-1 shortest-path / dijkstra,
+;; A* and WCO-join have NO builtin and are covered by test/test_traverse.c.
+;;
+;; Branch targets (file/function : branch):
+;;   1. exec_shortest_path  — max_depth cutoff: target beyond depth -> range
+;;   2. exec_shortest_path  — success exactly at the depth boundary
+;;   3. exec_dfs            — `d < max_depth` FALSE branch (frontier capped)
+;;   4. exec_var_expand     — `depth >= min_depth` FALSE then TRUE (min_depth>1)
+;;   5. exec_var_expand     — track-path integer-true 6-arg form
+;;   6. exec_random_walk    — default walk-len (2-arg form) + full cycle walk
+;;   7. exec_pagerank       — default args (1-arg) and explicit iters (2-arg)
+;;   8. exec_connected_comp — single fully-connected component (one label)
+;;   9. exec_connected_comp — self-loop-only node (changed=false fast path)
+;;  10. exec_topsort        — valid DAG success, multiple zero-in roots
+;;  11. exec_topsort        — single linear chain (queue head/tail walk)
+;;  12. exec_cluster_coeff  — directed cycle: nonzero triangle count branch
+;;  13. exec_degree_cent    — node with both in and out edges (mixed degree)
+;;  14. exec_dijkstra       — relaxation re-relax (`new_dist < dist[v]` retrue)
+;;  15. exec_dijkstra       — default 1-arg single-source over a cycle
+;;  16. exec_mst            — single-node graph (max_mst = n-1 = 0)
+;;  17. exec_betweenness    — path interior nodes carry nonzero centrality
+;;  18. exec_closeness      — path interior closeness > endpoint closeness
+;;  19. exec_expand         — direction 2 where node has fwd-only / rev-only
+;;  20. exec_var_expand     — direction 0 (forward only, explicit) multi-hop
+
+;; =====================================================================
+;; Fixture P5: directed path 0->1->2->3->4 (unit weights).
+;; =====================================================================
+(set P5e (table [src dst w] (list [0 1 2 3] [1 2 3 4] [1.0 1.0 1.0 1.0])))
+(set P5 (.graph.build P5e 'src 'dst 'w))
+
+;; (1) shortest-path max_depth cutoff: 0->4 is 4 hops; cap at 2 -> range.
+(.graph.shortest-path P5 0 4 2)                   !- range
+;; (2) success exactly at the depth boundary: 0->2 is 2 hops, cap=2 OK.
+(set SpD (.graph.shortest-path P5 0 2 2))
+(count SpD)                                        -- 3
+(first (at SpD '_node))                            -- 0
+(last (at SpD '_node))                             -- 2
+(max (at SpD '_depth))                             -- 2
+;; unbounded default depth still reaches node 4 (5 nodes on the path)
+(count (.graph.shortest-path P5 0 4))              -- 5
+
+;; (3) dfs max_depth FALSE branch: depth-cap 2 visits {0,1,2} only.
+(set DfsCap (.graph.dfs P5 0 2))
+(count DfsCap)                                     -- 3
+(max (at DfsCap '_depth))                          -- 2
+;; depth-cap 0: only the source itself is emitted.
+(count (.graph.dfs P5 0 0))                        -- 1
+;; unbounded dfs walks the whole chain.
+(count (.graph.dfs P5 0))                          -- 5
+
+;; (4) var-expand min_depth>1: from 0, min=2 max=3 forward.
+;;     depth-1 neighbor {1} traversed but NOT emitted (depth<min);
+;;     depth-2 {2} and depth-3 {3} emitted.
+(set VeMin (.graph.var-expand P5 0 2 3))
+(count VeMin)                                      -- 2
+(min (at VeMin '_depth))                           -- 2
+(max (at VeMin '_depth))                           -- 3
+;; min==max==3 emits only the single depth-3 node.
+(set VeOne (.graph.var-expand P5 0 3 3))
+(count VeOne)                                      -- 1
+(first (at VeOne '_end))                           -- 3
+(first (at VeOne '_depth))                         -- 3
+
+;; (20) var-expand direction 0 explicit forward, depth 1..4 -> {1,2,3,4}.
+(set VeFwd (.graph.var-expand P5 0 1 4 0))
+(count VeFwd)                                      -- 4
+(min (at VeFwd '_depth))                           -- 1
+(max (at VeFwd '_depth))                           -- 4
+
+;; (17) betweenness on a 5-path: interior nodes carry > 0, endpoints = 0.
+(set BetP (.graph.betweenness P5))
+(count BetP)                                       -- 5
+(set BetN (at BetP '_node))
+(set BetC (at BetP '_centrality))
+(at BetC (at (where (== BetN 0)) 0))               -- 0.0
+(at BetC (at (where (== BetN 4)) 0))               -- 0.0
+(> (at BetC (at (where (== BetN 2)) 0)) 0.0)       -- true
+
+;; (18) closeness on a 5-path: interior node 2 is the most central.
+(set CloP (.graph.closeness P5))
+(count CloP)                                       -- 5
+(set CloN (at CloP '_node))
+(set CloC (at CloP '_centrality))
+(> (at CloC (at (where (== CloN 2)) 0)) (at CloC (at (where (== CloN 0)) 0))) -- true
+
+;; =====================================================================
+;; Fixture C4: directed 4-cycle 0->1->2->3->0 (unit weights).
+;; No dead ends -> random walk always reaches walk_len.
+;; =====================================================================
+(set C4e (table [src dst w] (list [0 1 2 3] [1 2 3 0] [1.0 1.0 1.0 1.0])))
+(set C4 (.graph.build C4e 'src 'dst 'w))
+
+;; (6) random-walk default walk-len (2-arg form) -> 11 rows (walk_len 10 + 1).
+(set RwDef (.graph.random-walk C4 0))
+(count RwDef)                                      -- 11
+(first (at RwDef '_step))                          -- 0
+(first (at RwDef '_node))                          -- 0
+(last (at RwDef '_step))                           -- 10
+
+;; (15) dijkstra default 1-arg single-source over a cycle reaches all 4.
+(set DjC (.graph.dijkstra C4 0))
+(count DjC)                                        -- 4
+(set DjCn (at DjC '_node))
+(set DjCd (at DjC '_dist))
+(at DjCd (at (where (== DjCn 0)) 0))               -- 0.0
+(at DjCd (at (where (== DjCn 3)) 0))               -- 3.0
+
+;; (12) cluster_coeff on a directed 3-cycle 0->1->2->0.
+;; For node 0: undirected neighbors {1,2}; fwd edge 1->2 lies inside the
+;; neighbor set -> one triangle counted -> coefficient > 0.
+(set Tri3e (table [src dst w] (list [0 1 2] [1 2 0] [1.0 1.0 1.0])))
+(set Tri3 (.graph.build Tri3e 'src 'dst 'w))
+(set CcTri (.graph.cluster Tri3))
+(count CcTri)                                      -- 3
+(> (max (at CcTri '_coefficient)) 0.0)             -- true
+
+;; (10) topsort valid DAG with two zero-in-degree roots.
+;;   0->2, 1->2, 2->3 : roots {0,1}, then 2, then 3.
+(set DagE (table [src dst w] (list [0 1 2] [2 2 3] [1.0 1.0 1.0])))
+(set Dag (.graph.build DagE 'src 'dst 'w))
+(set Ts (.graph.topsort Dag))
+(count Ts)                                          -- 4
+;; node 3 is processed last -> highest order value.
+(set TsN (at Ts '_node))
+(set TsO (at Ts '_order))
+(== (at TsO (at (where (== TsN 3)) 0)) (max TsO))  -- true
+;; node 2 comes after both roots 0 and 1.
+(> (at TsO (at (where (== TsN 2)) 0)) (at TsO (at (where (== TsN 0)) 0))) -- true
+
+;; (11) topsort on the linear chain P5: strict 0..4 order.
+(set TsP (.graph.topsort P5))
+(count TsP)                                         -- 5
+(set TsPn (at TsP '_node))
+(set TsPo (at TsP '_order))
+(at TsPo (at (where (== TsPn 0)) 0))               -- 0
+(at TsPo (at (where (== TsPn 4)) 0))               -- 4
+
+;; =====================================================================
+;; Fixture Dia: diamond with a cheaper detour to force dijkstra re-relax.
+;;   0->1 w=1, 0->2 w=5, 1->2 w=1, 2->3 w=1
+;; Node 2 first reached via 0->2 (dist 5), then relaxed via 0->1->2 (dist 2).
+;; =====================================================================
+(set DiaE (table [src dst w] (list [0 0 1 2] [1 2 2 3] [1.0 5.0 1.0 1.0])))
+(set Dia (.graph.build DiaE 'src 'dst 'w))
+
+;; (14) dijkstra picks the relaxed cheaper distance to node 2 (=2, not 5).
+(set DjD (.graph.dijkstra Dia 0))
+(set DjDn (at DjD '_node))
+(set DjDd (at DjD '_dist))
+(at DjDd (at (where (== DjDn 2)) 0))               -- 2.0
+(at DjDd (at (where (== DjDn 3)) 0))               -- 3.0
+;; explicit dst with early-exit yields the same cheapest distance to 3.
+(set DjDr (.graph.dijkstra Dia 0 3))
+(at (at DjDr '_dist) (at (where (== (at DjDr '_node) 3)) 0)) -- 3.0
+
+;; =====================================================================
+;; Fixture Mix: node with both in- and out-edges (mixed degree).
+;;   0->1, 1->2, 2->1  : node 1 has out={2}, in={0,2} -> in=2 out=1 deg=3
+;; =====================================================================
+(set MixE (table [src dst w] (list [0 1 2] [1 2 1] [1.0 1.0 1.0])))
+(set Mix (.graph.build MixE 'src 'dst 'w))
+
+;; (13) degree centrality: node 1 in=2, out=1, total=3.
+(set DgM (.graph.degree Mix))
+(set DgMn (at DgM '_node))
+(at (at DgM '_in_degree)  (at (where (== DgMn 1)) 0)) -- 2
+(at (at DgM '_out_degree) (at (where (== DgMn 1)) 0)) -- 1
+(at (at DgM '_degree)     (at (where (== DgMn 1)) 0)) -- 3
+
+;; (19) expand direction 2 on node 1 of Mix: fwd={2}, rev={0,2} -> 3 rows.
+(set ExpB (.graph.expand Mix 1 2))
+(count ExpB)                                        -- 3
+(== (min (at ExpB '_src)) 1)                        -- true
+;; node 0 has fwd={1}, rev={} -> direction 2 gives 1 row.
+(count (.graph.expand Mix 0 2))                     -- 1
+
+;; =====================================================================
+;; Fixture One: single-node graph via self-loop 0->0.
+;; n_nodes = 1, fwd.n_edges = 1.
+;; =====================================================================
+(set OneE (table [src dst w] (list [0] [0] [1.0])))
+(set One (.graph.build OneE 'src 'dst 'w))
+
+;; (16) MST on a single-node graph: max_mst = n-1 = 0 -> empty forest.
+(set MstOne (.graph.mst One))
+(count MstOne)                                      -- 0
+
+;; (9) connected components: single self-loop node -> one component, label 0.
+(set CompOne (.graph.connected One))
+(count CompOne)                                     -- 1
+(first (at CompOne '_component))                    -- 0
+
+;; (7) pagerank default args (1-arg) on a single node -> rank 1.0.
+(set PrOne (.graph.pagerank One))
+(count PrOne)                                       -- 1
+(>= (first (at PrOne '_rank)) 0.99)                 -- true
+(<= (first (at PrOne '_rank)) 1.01)                 -- true
+
+;; =====================================================================
+;; Fixture FC: fully connected pair via bidirectional edge 0<->1.
+;; =====================================================================
+(set FCe (table [src dst w] (list [0 1] [1 0] [1.0 1.0])))
+(set FC (.graph.build FCe 'src 'dst 'w))
+
+;; (8) connected components: both nodes in one component -> single label.
+(set CompFC (.graph.connected FC))
+(count CompFC)                                      -- 2
+(count (distinct (at CompFC '_component)))          -- 1
+
+;; (7) pagerank explicit iters (2-arg form) on the pair -> ranks sum ~1.
+(set PrFC (.graph.pagerank FC 20))
+(count PrFC)                                         -- 2
+(>= (sum (at PrFC '_rank)) 0.99)                     -- true
+(<= (sum (at PrFC '_rank)) 1.01)                     -- true
+
+;; (5) var-expand track-path integer-true 6-arg form (schema unchanged).
+(>= (count (.graph.var-expand FC 0 1 2 2 1)) 1)     -- true
+;; track-path integer-false also accepted.
+(>= (count (.graph.var-expand FC 0 1 2 2 0)) 1)     -- true
+
+;; =====================================================================
+;; Unreachable / defensive branches in src/ops/traverse.c (NOT testable
+;; from RFL — documented here so the gap is understood, not chased):
+;;
+;;   * Every `ray_error("oom", NULL)` arm (vec/table alloc failure) — only
+;;     reachable under allocator exhaustion; covered by test_traverse.c's
+;;     test_traverse_oom_paths / test_wco_join_ctx_oom via stubbed alloc.
+;;   * exec_shortest_path / exec_var_expand : direction==1 (reverse-only)
+;;     csr-select arm — `.graph.shortest-path` hardwires direction 0 and
+;;     there is no reverse builtin; reached only by test_shortest_path_reverse.
+;;   * exec_var_expand / exec_shortest_path : next_front / queue scratch_realloc
+;;     growth + the INT64_MAX/2 overflow guards — need >1024 frontier or
+;;     >1024-deep BFS; not practical from a unit graph (defensive overflow).
+;;   * exec_shortest_path : "path exceeds 254 hops" arm — needs a >254-node
+;;     simple path; covered by test_shortest_path_exceeds_254.
+;;   * exec_astar / exec_wco_join : no .graph.* builtin exists — exercised
+;;     only through the C harness (test_astar_*, test_wco_join_*).
+;;   * find_ext()==NULL ("nyi") and rel==NULL ("schema") arms — require a
+;;     malformed op/graph the builtins never construct (defensive).
+;; =====================================================================
+
+;; =====================================================================
+;; Cleanup
+;; =====================================================================
+(.graph.free P5)
+(.graph.free C4)
+(.graph.free Tri3)
+(.graph.free Dag)
+(.graph.free Dia)
+(.graph.free Mix)
+(.graph.free One)
+(.graph.free FC)

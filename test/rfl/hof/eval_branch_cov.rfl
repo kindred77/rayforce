@@ -1,0 +1,217 @@
+;; eval.c branch coverage round 4 — targets reachable uncovered branches not
+;; yet hit by eval_coverage{,2,3}.rfl / try_raise.rfl / vm_coverage.rfl.
+;;
+;; Focus areas:
+;;   - ray_table_fn element-wise column builder (typed-from-LIST path)
+;;   - key / value dispatch over DICT and TABLE + error arms
+;;   - try_sum_affine_expr early-out branches
+;;   - special-form / dispatch edge cases (if, do, fn, NULL args)
+;;   - do_cache_hash positive-type (vector) branches under profiling
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 1. ray_table_fn — element-wise column builder (eval.c ~1294-1372)
+;;    A column given as a Rayfall (list a b c) of bare ATOMS is not a
+;;    typed vector, so ray_table_fn walks the elements and builds a
+;;    typed column.  This exercises the col_type detection switch
+;;    (lines 1305-1318) and the per-element store loop (1326-1368),
+;;    which the typed-vector fast path (used everywhere else) skips.
+;; ═══════════════════════════════════════════════════════════════════
+
+;; F64 column (row_elems[0]->type == -RAY_F64, line 1305)
+(type (at (table ['a] (list (list 1.5 2.5 3.5))) 'a)) -- 'F64
+(at (table ['a] (list (list 1.5 2.5))) 'a) -- [1.5 2.5]
+
+;; BOOL column (line 1306)
+(type (at (table ['a] (list (list true false true))) 'a)) -- 'B8
+(at (table ['a] (list (list true false))) 'a) -- [true false]
+
+;; SYM column (line 1307) — stored via else val_ptr = &i64 (line 1363)
+(type (at (table ['a] (list (list 'x 'y 'z))) 'a)) -- 'SYM
+(at (table ['a] (list (list 'x 'y 'z))) 'a) -- [x y z]
+
+;; STR column (line 1308) — ray_str_vec_append branch (line 1336)
+(type (at (table ['a] (list (list "p" "q"))) 'a)) -- 'STR
+
+;; TIMESTAMP column (line 1310) — stored via &i64 (line 1363)
+(type (at (table ['a] (list (list (as 'TIMESTAMP 1) (as 'TIMESTAMP 2)))) 'a)) -- 'TIMESTAMP
+
+;; DATE column (line 1311)
+(type (at (table ['a] (list (list 2024.01.01 2024.01.02))) 'a)) -- 'DATE
+
+;; TIME column (line 1312)
+(type (at (table ['a] (list (list 12:00:00.000 13:00:00.000))) 'a)) -- 'TIME
+
+;; Default I64 column (no special type, line 1303)
+(type (at (table ['a] (list (list 1 2 3))) 'a)) -- 'I64
+
+;; I64 → F64 promotion: first elem is I64 but a later one is F64
+;; (scan loop lines 1316-1320, promoted-value branch line 1357-1359)
+(type (at (table ['a] (list (list 1 2.5 3))) 'a)) -- 'F64
+(at (table ['a] (list (list 1 2.5 3))) 'a) -- [1.0 2.5 3.0]
+
+;; ── ray_table_fn error arms ──────────────────────────────────────
+;; row-count mismatch across columns → domain (line 1287)
+(table ['a 'b] (list (list 1 2) (list 3))) !- domain
+;; names/cols length mismatch → domain (line 1225)
+(table ['a 'b] (list (list 1 2))) !- domain
+;; non-SYM column name → type (line 1235)
+(table [1] (list (list 1 2))) !- type
+;; element type mismatch in I64 column → type (line 1349)
+(table ['a] (list (list 1 'x))) !- type
+;; element type mismatch in F64 column (non-promotable) → type
+(table ['a] (list (list 1.5 'x))) !- type
+;; element type mismatch in BOOL column → type
+(table ['a] (list (list true 5))) !- type
+;; element type mismatch in SYM column → type
+(table ['a] (list (list 'a 5))) !- type
+;; element type mismatch in STR column → type (line 1328)
+(table ['a] (list (list "x" 5))) !- type
+;; cols arg is not a list → type (line 1223)
+(table ['a] 5) !- type
+;; names arg is not a list → type (line 1223)
+(table 5 (list (list 1))) !- type
+
+;; ── single-atom column wrap → 1-element vector (lines 1244-1264) ──
+;; A bare atom column is wrapped into a length-1 typed vector.
+(type (at (table ['a] (list 1.5)) 'a)) -- 'F64
+(count (at (table ['a] (list 1.5)) 'a)) -- 1
+(type (at (table ['a] (list 42)) 'a)) -- 'I64
+(type (at (table ['a] (list true)) 'a)) -- 'B8
+(type (at (table ['a] (list 1i)) 'a)) -- 'I32
+(type (at (table ['a] (list 2024.01.01)) 'a)) -- 'DATE
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 2. ray_key_fn / ray_value_fn dispatch (eval.c ~1381-1419)
+;; ═══════════════════════════════════════════════════════════════════
+;; key over a DICT → ray_dict_keys (line 1382)
+(key (dict ['a 'b] [1 2])) -- ['a 'b]
+;; key over a TABLE → SYM vec of column names (line 1388)
+(key (table ['a 'b] (list [1 2] [3 4]))) -- ['a 'b]
+;; value over a TABLE → list of column vectors (line 1402)
+(count (value (table ['a 'b] (list [1 2] [3 4])))) -- 2
+;; value over a DICT → values vector (line 1414)
+(value (dict ['a 'b] [10 20])) -- [10 20]
+;; key over a non-dict/table → type error (line 1388)
+(key 5) !- type
+;; value over a non-dict/table → type error (line 1414)
+(value 5) !- type
+(key [1 2 3]) !- type
+(value "hello") !- type
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 3. try_sum_affine_expr early-out branches (eval.c ~177-253)
+;;    Called for (sum <expr>) before normal eval; returns NULL (handled=0)
+;;    for non-affine shapes, falling through to ordinary evaluation.
+;; ═══════════════════════════════════════════════════════════════════
+;; len(expr) != 3 — inner list has 4 elements → line 179 early return.
+;; (+ 1 2 3) is arity-3 so the eval itself errors after the affine bail.
+(sum (+ 1 2 3)) !- arity
+;; head is not '+' (line 185) → bail, normal eval runs
+(sum (- [10 20 30] 5)) -- 45
+(sum (* [1 2 3] 2)) -- 12
+;; neither operand is a numeric atom (both vectors, line 196) → bail
+(sum (+ [1 2 3] [4 5 6])) -- 21
+;; affine fast path: vector + scalar (both operand orders)
+(sum (+ [1 2 3] 10)) -- 36
+(sum (+ 10 [1 2 3])) -- 36
+;; F64 scalar → make_f64 result branch (line 246-249)
+(sum (+ [1 2 3] 1.5)) -- 10.5
+(sum (+ 1.5 [1 2 3])) -- 10.5
+;; F64 vector with int scalar → ce.is_f64 branch
+(sum (+ [1.0 2.0 3.0] 1)) -- 9.0
+;; vec_expr evaluates to a non-vector (dict) → !ray_is_vec bail (line 206)
+(sum (+ (dict ['a] [1]) 5)) !- type
+;; vec_expr eval error propagates (line 201)
+(sum (+ undefined_affine_v 1)) !- name
+(sum (+ 1 undefined_affine_w)) !- name
+;; empty-vector affine sum
+(sum (+ [] 5)) -- 0
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 4. Dispatch edge cases — NULL args to LAMBDA / VARY (eval.c 3182-3206)
+;;    Passing `null` as an argument makes ray_eval return a NULL ray_t*,
+;;    hitting the (!args[i]) arm of the arg-eval guard.
+;; ═══════════════════════════════════════════════════════════════════
+;; LAMBDA, arg[0] is null → immediate bail (j-loop body skipped)
+((fn [x y] x) null 5) !- type
+;; LAMBDA, arg[1] is null → j-loop releases the prior good arg (line 3206)
+((fn [x y] y) 5 null) !- type
+;; VARY (list), middle arg null → j-loop releases the prior good arg (3184)
+(list 1 null 2) !- type
+;; VARY (list), first arg null
+(list null 1) !- type
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 5. Special-form error / edge branches
+;; ═══════════════════════════════════════════════════════════════════
+;; (fn [params]) with no body → domain error (ray_fn line 1618)
+(fn [x]) !- domain
+(fn) !- domain
+;; (do (raise ..) ..) — error short-circuits, pops scope (ray_do_fn 1600)
+(try (do (raise 5) 99) (fn [e] e)) -- 5
+;; (do <err> ..) — runtime error propagates through do
+(do (+ undefined_do_z 1)) !- name
+;; (if <err-cond> ..) — cond eval error propagates (ray_cond_fn 1470)
+(if undefined_if_cond 1 2) !- name
+;; (if <raise> ..) — cond raises
+(try (if (raise 7) 1 2) (fn [e] e)) -- 7
+;; (if) with too few args → domain (ray_cond_fn n<2, line 1468)
+(if) !- domain
+(if true) !- domain
+;; if with 2 args, false branch → returns make_i64(0) (line 1480)
+(if false 5) -- 0
+(if true 5) -- 5
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 6. do_cache_hash positive-type (vector) branches (eval.c 1514-1527)
+;;    Under active profiling, (do <vec> null) hashes <vec> at the top
+;;    level — exercising the *positive* type tags (RAY_I64, RAY_SYM,
+;;    RAY_DATE, RAY_TIMESTAMP, RAY_TIME, RAY_I16, RAY_U8, RAY_F64 vec)
+;;    that the atom-literal tests in eval_coverage3 cannot reach.
+;; ═══════════════════════════════════════════════════════════════════
+(.sys.timeit 1) -- 1
+;; I64 vector (line 1515: x->type == RAY_I64)
+(nil? (do [1 2 3] null)) -- true
+(nil? (do [1 2 3] null)) -- true
+;; SYM vector (line 1514: x->type == RAY_SYM)
+(nil? (do ['a 'b 'c] null)) -- true
+(nil? (do ['a 'b 'c] null)) -- true
+;; DATE vector (line 1519)
+(nil? (do (as 'DATE [1 2]) null)) -- true
+(nil? (do (as 'DATE [1 2]) null)) -- true
+;; TIMESTAMP vector (line 1516)
+(nil? (do (as 'TIMESTAMP [1 2]) null)) -- true
+;; TIME vector (line 1520)
+(nil? (do (as 'TIME [1 2]) null)) -- true
+;; I16 vector (line 1522)
+(nil? (do (as 'I16 [1 2]) null)) -- true
+;; U8 vector (line 1524)
+(nil? (do (as 'U8 [1 2]) null)) -- true
+;; F64 vector (line 1527)
+(nil? (do [1.0 2.0 3.0] null)) -- true
+;; I32 vector (line 1518)
+(nil? (do (as 'I32 [1 2]) null)) -- true
+(.sys.timeit 0) -- 0
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 7. Restricted-mode dispatch — set/update refused in restricted eval.
+;;    (set .reserved ..) hits ray_set_fn's err != RAY_OK arm (line 1444)
+;;    and (let .reserved ..) hits ray_let_fn's arm (line 1462).
+;; ═══════════════════════════════════════════════════════════════════
+(set .sys.gc 5) !- reserve
+(let .sys.gc 5) !- reserve
+(set 42 5) !- type
+(let 42 5) !- type
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 8. numeric_atom_i64 width branches via affine constant (eval.c 133-150)
+;;    The constant in (+ vec c) is fed to numeric_atom_i64; covering U8
+;;    (line 145), I16 (143), I32 (139), and the default as_f64 fallback.
+;; ═══════════════════════════════════════════════════════════════════
+(sum (+ [1 2 3] 0x02)) -- 12
+(sum (+ [1 2 3] 3h))   -- 15
+(sum (+ [1 2 3] 4i))   -- 18
+;; SYM constant exercises numeric_atom_i64 -RAY_SYM (line 137) only when
+;; (+ vec sym) is affine-eligible; sym isn't numeric so it bails — verify
+;; the bail path produces the normal type error instead.
+(sum (+ [1 2 3] 'a)) !- type

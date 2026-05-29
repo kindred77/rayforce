@@ -1,0 +1,200 @@
+;; src/store/part.c — branch-coverage top-up for ray_read_parted and its
+;; static helpers (is_date_dir, is_integer_str, infer_mc_type,
+;; parse_date_dir, parse_int_dir, collect_part_dirs).
+;;
+;; test/rfl/system/part.rfl already drives the happy DATE / I64 / SYM
+;; paths, the empty-root and missing-table errors, table-name validation
+;; and the per-partition exec/merge surface.  This file fills the
+;; remaining REACHABLE branches that part.rfl never reaches:
+;;
+;;   - is_date_dir calendar guards (month 00 / 13, day 00): a 10-char
+;;     digit/dot dir that passes the length + dot-position checks but
+;;     fails `month >= 1 && month <= 12` / `day >= 1`, so is_date_dir
+;;     returns false and infer_mc_type falls through to RAY_MC_SYM.
+;;     part.rfl's "1.2.3" dirs fail earlier at the length != 10 check,
+;;     so this is the only path that reaches the month/day comparisons.
+;;   - infer_mc_type early break (`!all_date && !all_int` before the
+;;     last dir) and the all_int true->false transition after an
+;;     int-looking first dir.
+;;   - collect_part_dirs realloc growth (> 16 partitions: part_cap
+;;     16 -> 32) plus the bubble-sort swap across that boundary.
+;;   - mixed partition schemas: a later partition with FEWER columns
+;;     than partition 0, so ray_table_get_col_idx returns NULL for the
+;;     trailing column and the `seg == NULL -> segs[p] = NULL` arm of
+;;     the data-column loop runs while building the parted column.
+;;   - RAY_CSV_TRACE diagnostic branches (every `if (trace)` arm in
+;;     ray_read_parted, on both the success and failure paths), toggled
+;;     via .os.setenv so the env lookup `getenv("RAY_CSV_TRACE")` is hot.
+;;
+;; Fixtures use the /tmp/rfl_pbc_* prefix so they never collide with the
+;; /tmp/rfl_part_* roots in part.rfl or /tmp/rfl_splayed_* / /tmp/rfl_parted
+;; in splayed.rfl.  Pre/post cleanup is mandatory: stale sym.lk / .d files
+;; from a prior run cause "error: corrupt" on the second open.
+;;
+;; UNREACHABLE branches (intentionally not targeted, documented for the
+;; next coverage pass):
+;;   - is_integer_str leading-minus arm (L58): collect_part_dirs only
+;;     admits [0-9.] directory names, so a '-' prefix never reaches it.
+;;   - ray_read_parted ncols <= 0 (L263): .db.splayed.set always writes
+;;     at least one column, so the first partition is never 0-wide.
+;;   - the OOM / snprintf-overflow / alloc-failure error arms
+;;     (realloc/malloc/ray_alloc/snprintf bounds): not provoke-able from
+;;     the RFL surface without fault injection.
+
+;; ────────────── pre-flight cleanup ──────────────
+(.sys.exec "rm -rf /tmp/rfl_pbc_dlike /tmp/rfl_pbc_monthzero /tmp/rfl_pbc_dayzero /tmp/rfl_pbc_mix /tmp/rfl_pbc_intmix /tmp/rfl_pbc_grow /tmp/rfl_pbc_schema /tmp/rfl_pbc_trace /tmp/rfl_pbc_traceerr")
+
+;; ────────────── date-LIKE but invalid calendar → RAY_MC_SYM ──────────────
+;; "2024.13.45" is 10 chars with dots at 4/7 and all-digit elsewhere, so
+;; it passes collect_part_dirs' digit/dot filter AND the length / dot-
+;; position checks in is_date_dir — but month=13 (>12) trips the
+;; `month >= 1 && month <= 12` guard, so is_date_dir returns false.
+;; is_integer_str also fails (dots), so infer_mc_type yields RAY_MC_SYM.
+(set DL-A (table [v] (list [1 2])))
+(set DL-B (table [v] (list [3 4 5])))
+(.db.splayed.set "/tmp/rfl_pbc_dlike/2024.13.45/t/" DL-A)
+(.db.splayed.set "/tmp/rfl_pbc_dlike/2024.99.01/t/" DL-B)
+(set Pdl (.db.parted.get "/tmp/rfl_pbc_dlike/" 't))
+(count Pdl) -- 5
+(count (key Pdl)) -- 2
+;; sym-typed partition key reports under 'part, not 'date
+(first (key Pdl)) -- 'part
+(key Pdl) -- ['part 'v]
+
+;; month == 00 (below range) — exercises the `month >= 1` lower bound.
+(set MZ-A (table [v] (list [7])))
+(.db.splayed.set "/tmp/rfl_pbc_monthzero/2024.00.15/t/" MZ-A)
+(set Pmz (.db.parted.get "/tmp/rfl_pbc_monthzero/" 't))
+(count Pmz) -- 1
+(first (key Pmz)) -- 'part
+
+;; day == 00 (below range) with a valid month — exercises the `day >= 1`
+;; lower bound in isolation (only the day check rejects the name).
+(set DZ-A (table [v] (list [8 9])))
+(.db.splayed.set "/tmp/rfl_pbc_dayzero/2024.06.00/t/" DZ-A)
+(set Pdz (.db.parted.get "/tmp/rfl_pbc_dayzero/" 't))
+(count Pdz) -- 2
+(first (key Pdz)) -- 'part
+
+;; ────────────── infer_mc_type early break (!all_date && !all_int) ──────────────
+;; Three dirs.  Sorted order: "100", "2024.01.01", "9.9.9".
+;;   - "100":        not a date (len 3)  -> all_date=false; integer -> all_int=true
+;;   - "2024.01.01": (all_date already false); has dots -> all_int=false
+;;       => BOTH now false, and this is NOT the last entry, so the
+;;          `if (!all_date && !all_int) break;` arm fires before "9.9.9".
+;; Result type is RAY_MC_SYM.
+(set MX-A (table [v] (list [1])))
+(set MX-B (table [v] (list [2 2])))
+(set MX-C (table [v] (list [3 3 3])))
+(.db.splayed.set "/tmp/rfl_pbc_mix/100/t/" MX-A)
+(.db.splayed.set "/tmp/rfl_pbc_mix/2024.01.01/t/" MX-B)
+(.db.splayed.set "/tmp/rfl_pbc_mix/9.9.9/t/" MX-C)
+(set Pmx (.db.parted.get "/tmp/rfl_pbc_mix/" 't))
+(count Pmx) -- 6
+(count (key Pmx)) -- 2
+(first (key Pmx)) -- 'part
+
+;; ────────────── infer_mc_type: int-first then non-int (all_int true->false) ──
+;; "5" and "5.5" — first is a pure integer (all_date already false, all_int
+;; stays true), second has a dot so all_int flips true->false.  Only two
+;; dirs so the break isn't reached; this is the dedicated path where all_int
+;; transitions while all_date is already false (distinct from the date-like
+;; case above where all_int was false from the very first dir).
+(set IM-A (table [v] (list [10 11])))
+(set IM-B (table [v] (list [20])))
+(.db.splayed.set "/tmp/rfl_pbc_intmix/5/t/" IM-A)
+(.db.splayed.set "/tmp/rfl_pbc_intmix/5.5/t/" IM-B)
+(set Pim (.db.parted.get "/tmp/rfl_pbc_intmix/" 't))
+(count Pim) -- 3
+(first (key Pim)) -- 'part
+
+;; ────────────── collect_part_dirs realloc growth (> 16 partitions) ──────────────
+;; part_cap starts at 16; the 17th matching dir trips the
+;; `part_count >= part_cap` realloc (16 -> 32).  20 single-row date
+;; partitions span the growth boundary and exercise the bubble sort over
+;; more than 16 entries.  Date names keep the key type RAY_MC_DATE, so
+;; this also re-covers that arm at a higher partition count.
+(.db.splayed.set "/tmp/rfl_pbc_grow/2024.02.01/t/" (table [n] (list [1])))
+(.db.splayed.set "/tmp/rfl_pbc_grow/2024.02.02/t/" (table [n] (list [2])))
+(.db.splayed.set "/tmp/rfl_pbc_grow/2024.02.03/t/" (table [n] (list [3])))
+(.db.splayed.set "/tmp/rfl_pbc_grow/2024.02.04/t/" (table [n] (list [4])))
+(.db.splayed.set "/tmp/rfl_pbc_grow/2024.02.05/t/" (table [n] (list [5])))
+(.db.splayed.set "/tmp/rfl_pbc_grow/2024.02.06/t/" (table [n] (list [6])))
+(.db.splayed.set "/tmp/rfl_pbc_grow/2024.02.07/t/" (table [n] (list [7])))
+(.db.splayed.set "/tmp/rfl_pbc_grow/2024.02.08/t/" (table [n] (list [8])))
+(.db.splayed.set "/tmp/rfl_pbc_grow/2024.02.09/t/" (table [n] (list [9])))
+(.db.splayed.set "/tmp/rfl_pbc_grow/2024.02.10/t/" (table [n] (list [10])))
+(.db.splayed.set "/tmp/rfl_pbc_grow/2024.02.11/t/" (table [n] (list [11])))
+(.db.splayed.set "/tmp/rfl_pbc_grow/2024.02.12/t/" (table [n] (list [12])))
+(.db.splayed.set "/tmp/rfl_pbc_grow/2024.02.13/t/" (table [n] (list [13])))
+(.db.splayed.set "/tmp/rfl_pbc_grow/2024.02.14/t/" (table [n] (list [14])))
+(.db.splayed.set "/tmp/rfl_pbc_grow/2024.02.15/t/" (table [n] (list [15])))
+(.db.splayed.set "/tmp/rfl_pbc_grow/2024.02.16/t/" (table [n] (list [16])))
+(.db.splayed.set "/tmp/rfl_pbc_grow/2024.02.17/t/" (table [n] (list [17])))
+(.db.splayed.set "/tmp/rfl_pbc_grow/2024.02.18/t/" (table [n] (list [18])))
+(.db.splayed.set "/tmp/rfl_pbc_grow/2024.02.19/t/" (table [n] (list [19])))
+(.db.splayed.set "/tmp/rfl_pbc_grow/2024.02.20/t/" (table [n] (list [20])))
+(set Pgrow (.db.parted.get "/tmp/rfl_pbc_grow/" 't))
+(count Pgrow) -- 20
+(count (key Pgrow)) -- 2
+(first (key Pgrow)) -- 'date
+;; SUM/COUNT via select (parted exec path) over all 20 single-row segments
+(set Rgrow (select {s: (sum n) c: (count n) from: Pgrow}))
+(at Rgrow 's) -- [210]
+(at Rgrow 'c) -- [20]
+
+;; ────────────── mixed partition schemas: NULL segment arm ──────────────
+;; Partition 0 has 3 columns [a b c]; partition 1 has only 2 columns [a b].
+;; ray_read_parted reads the schema from partition 0 (ncols=3) and, for
+;; column index 2 ('c), calls ray_table_get_col_idx(part_tables[1], 2)
+;; which returns NULL (idx >= cols->len) -> the `seg == NULL` arm sets
+;; segs[1] = NULL while building the parted 'c column.  We only reduce
+;; over the columns present in BOTH partitions ('a, 'b); the ragged 'c
+;; column exists in the schema but is never queried.
+(set SC-A (table [a b c] (list [1 2] [10 20] [100 200])))
+(set SC-B (table [a b]   (list [3 4 5] [30 40 50])))
+(.db.splayed.set "/tmp/rfl_pbc_schema/2024.05.01/t/" SC-A)
+(.db.splayed.set "/tmp/rfl_pbc_schema/2024.05.02/t/" SC-B)
+(set Psc (.db.parted.get "/tmp/rfl_pbc_schema/" 't))
+;; total rows = 2 + 3 = 5; columns = 1 key + 3 data (schema from part 0)
+(count Psc) -- 5
+(count (key Psc)) -- 4
+(key Psc) -- ['date 'a 'b 'c]
+;; columns present in BOTH partitions reduce correctly across the segments
+(sum (at Psc 'a)) -- 15
+(sum (at Psc 'b)) -- 150
+(min (at Psc 'a)) -- 1
+(max (at Psc 'a)) -- 5
+
+;; ────────────── RAY_CSV_TRACE: success + diagnostic trace branches ──────────────
+;; Setting RAY_CSV_TRACE makes ray_read_parted emit fprintf diagnostics on
+;; every checkpoint (root/table banner, part count, ncols, and the
+;; collect-fail / splayed-load-fail / failed traces on the error path).
+;; Output goes to stderr (ignored by the harness); we only need the
+;; `if (trace)` true-arms executed.  Toggle on, run one success and two
+;; failure cases, then toggle back off so later files are unaffected.
+(.os.setenv "RAY_CSV_TRACE" "1")
+(.os.getenv "RAY_CSV_TRACE") -- "1"
+(set TRA (table [v] (list [1 2 3])))
+(set TRB (table [v] (list [4 5])))
+(.db.splayed.set "/tmp/rfl_pbc_trace/2024.08.01/t/" TRA)
+(.db.splayed.set "/tmp/rfl_pbc_trace/2024.08.02/t/" TRB)
+(set Ptr (.db.parted.get "/tmp/rfl_pbc_trace/" 't))
+(count Ptr) -- 5
+(count (key Ptr)) -- 2
+;; failure under trace: collect-dirs IO on an empty root (banner + collect-fail trace)
+(.sys.exec "mkdir -p /tmp/rfl_pbc_traceerr")
+(.db.parted.get "/tmp/rfl_pbc_traceerr/" 't) !- io
+;; failure under trace: missing table file in second partition
+;; (splayed-load-fail + "failed" trace)
+(.db.splayed.set "/tmp/rfl_pbc_traceerr/2024.09.01/t/" TRA)
+(.sys.exec "mkdir -p /tmp/rfl_pbc_traceerr/2024.09.02")
+(.db.parted.get "/tmp/rfl_pbc_traceerr/" 't) !- io
+;; restore: trace OFF for subsequent files (cleared to the empty string,
+;; which getenv returns with count 0 — assert that rather than the formatted
+;; empty literal, which the harness renders differently inside comparisons)
+(.os.setenv "RAY_CSV_TRACE" "")
+(count (.os.getenv "RAY_CSV_TRACE")) -- 0
+
+;; ────────────── teardown ──────────────
+(.sys.exec "rm -rf /tmp/rfl_pbc_dlike /tmp/rfl_pbc_monthzero /tmp/rfl_pbc_dayzero /tmp/rfl_pbc_mix /tmp/rfl_pbc_intmix /tmp/rfl_pbc_grow /tmp/rfl_pbc_schema /tmp/rfl_pbc_trace /tmp/rfl_pbc_traceerr")

@@ -1,0 +1,254 @@
+;; Branch coverage for src/ops/group.c — targets reachable arms that the
+;; existing group/*.rfl + ops/group_coverage.rfl corpus leaves cold.
+;;
+;; Confirmed via llvm-cov branch report (clang source-based coverage):
+;;   - grpt rowform top/bot: DATE / TIME value columns (grpt_val_read
+;;     RAY_DATE / RAY_TIME arms, group.c:9418) were never exercised — all
+;;     prior rowform tests use I64/I32/I16/U8/BOOL/F64 values.
+;;   - grpt rowform top/bot: DATE / TIME / TIMESTAMP / I16 / U8 / BOOL KEY
+;;     columns (grpt_key_read, group.c:9356-9363) — temporal keys cold.
+;;   - grpt rowform: null DATE/TIME *key* rows (grpt_is_null I32-width arm
+;;     fired against the key column, group.c:9393).
+;;   - DA-path SYM aggregate value columns: MIN/MAX/FIRST/LAST on a SYM
+;;     column grouped by another key (da_accum_row SYM arms, 4223-4235).
+;;   - reduce_merge SYM lex-min/max across workers (parallel scalar MIN/MAX
+;;     on a >=64K SYM column, group.c:264-270).
+;;   - count(distinct) on STR / GUID / LIST (distinct_vec_eager fallback,
+;;     group.c:680-692).
+;;   - exec_reduction TABLE-input COUNT and atom COUNT/type-error arms
+;;     (group.c:1815-1831).
+;;
+;; Reachability notes (branches deliberately NOT targeted — unreachable by
+;; design, documented per CLAUDE.md):
+;;   - OOM guards after scratch_alloc/scratch_calloc (e.g. group.c
+;;     2151/2157, 580-588, 745-749, …) require allocator failure; not
+;;     exercisable from RFL.
+;;   - grpt_key_read / grpt_is_null RAY_SYM arm (9364/9397): the planner
+;;     refuses SYM keys for the rowform path (query.c kt_ok excludes SYM),
+;;     so this arm is dead by construction.
+;;   - grpt_is_null / grpc_is_null RAY_F32 arm (9390/10103): F32 is not a
+;;     supported group key/agg type; defensive only.
+;;
+;; No external /tmp state used here.
+
+;; ════════════════════════════════════════════════════════════════════
+;; 1. grpt rowform — DATE value column (grpt_val_read RAY_DATE arm)
+;; ════════════════════════════════════════════════════════════════════
+;; (top v K) by: k with a single SCAN key + single SCAN agg + no where
+;; routes to exec_group_topk_rowform.  A DATE value column makes
+;; val_is_f64=0 and dispatches grpt_val_read's RAY_DATE arm (I32 width).
+(set Tdv (table [k v] (list (as 'I64 [1 1 1 2 2 2]) (as 'DATE [7305 7307 7306 7400 7402 7401]))))
+(set Rdv (select {t: (top v 2) by: k from: Tdv}))
+(count Rdv) -- 4
+;; type preserved: DATE
+(type (at Rdv 't)) -- 'DATE
+;; k=1 top-2 dates: 7307,7306 ; k=2 top-2: 7402,7401 (order-independent checks;
+;; SUM is a type error on DATE, so use min/max + distinct-count instead).
+(max (at Rdv 't)) -- (as 'DATE 7402)
+(min (at Rdv 't)) -- (as 'DATE 7306)
+;; the four kept dates are all distinct (7307,7306,7402,7401)
+(count (distinct (at Rdv 't))) -- 4
+
+;; bot on DATE value (desc=0, RAY_DATE val arm again)
+(set Rdvb (select {t: (bot v 1) by: k from: Tdv}))
+(count Rdvb) -- 2
+;; bot-1: min date per group → 7305, 7400
+(min (at Rdvb 't)) -- (as 'DATE 7305)
+(max (at Rdvb 't)) -- (as 'DATE 7400)
+
+;; ════════════════════════════════════════════════════════════════════
+;; 2. grpt rowform — TIME value column (grpt_val_read RAY_TIME arm)
+;; ════════════════════════════════════════════════════════════════════
+(set Ttv (table [k v] (list (as 'I64 [1 1 1 2 2]) (as 'TIME [1000 3000 2000 5000 4000]))))
+(set Rtv (select {t: (top v 1) by: k from: Ttv}))
+(count Rtv) -- 2
+(type (at Rtv 't)) -- 'TIME
+;; top-1: max time per group → 3000, 5000 (order-independent)
+(min (at Rtv 't)) -- (as 'TIME 3000)
+(max (at Rtv 't)) -- (as 'TIME 5000)
+
+;; ════════════════════════════════════════════════════════════════════
+;; 3. grpt rowform — TIMESTAMP value column (grpt_val_read I64 arm reuse)
+;; ════════════════════════════════════════════════════════════════════
+(set Ttsv (table [k v] (list (as 'I64 [1 1 2 2]) (as 'TIMESTAMP [1000 3000 2000 4000]))))
+(set Rtsv (select {t: (bot v 1) by: k from: Ttsv}))
+(count Rtsv) -- 2
+(type (at Rtsv 't)) -- 'TIMESTAMP
+;; bot-1: min timestamp per group → 1000, 2000 (order-independent)
+(min (at Rtsv 't)) -- (as 'TIMESTAMP 1000)
+(max (at Rtsv 't)) -- (as 'TIMESTAMP 2000)
+
+;; ════════════════════════════════════════════════════════════════════
+;; 4. grpt rowform — DATE / TIME / TIMESTAMP KEY (grpt_key_read arms)
+;; ════════════════════════════════════════════════════════════════════
+;; DATE key (I32-width arm of grpt_key_read, group.c:9358).
+(set Tdk2 (table [k v] (list (as 'DATE [7305 7305 7306 7306]) (as 'I64 [10 20 30 40]))))
+(set Rdk2 (select {t: (top v 1) by: k from: Tdk2}))
+(count Rdk2) -- 2
+(type (at Rdk2 'k)) -- 'DATE
+(sum (at Rdk2 't)) -- 60
+
+;; TIME key (I32-width arm).
+(set Ttk2 (table [k v] (list (as 'TIME [1000 1000 2000 2000]) (as 'I64 [5 10 15 20]))))
+(set Rtk2 (select {t: (bot v 1) by: k from: Ttk2}))
+(count Rtk2) -- 2
+(type (at Rtk2 'k)) -- 'TIME
+;; bot-1: min v per group → 5, 15
+(sum (at Rtk2 't)) -- 20
+
+;; TIMESTAMP key (I64-width arm).
+(set Ttsk2 (table [k v] (list (as 'TIMESTAMP [100 100 200 200 300]) (as 'I64 [1 2 3 4 5]))))
+(set Rtsk2 (select {t: (top v 1) by: k from: Ttsk2}))
+(count Rtsk2) -- 3
+(type (at Rtsk2 'k)) -- 'TIMESTAMP
+;; top-1 per ts group → 2,4,5 ; sum=11
+(sum (at Rtsk2 't)) -- 11
+
+;; ════════════════════════════════════════════════════════════════════
+;; 5. grpt rowform — I16 / U8 / BOOL KEY (grpt_key_read narrow arms)
+;; ════════════════════════════════════════════════════════════════════
+(set Ti16k2 (table [k v] (list (as 'I16 [10 10 20 20 30]) (as 'I64 [1 2 3 4 5]))))
+(set Ri16k2 (select {t: (top v 1) by: k from: Ti16k2}))
+(count Ri16k2) -- 3
+(type (at Ri16k2 'k)) -- 'I16
+(sum (at Ri16k2 't)) -- 11
+
+(set Tu8k2 (table [k v] (list (as 'U8 [1 1 2 2 3]) (as 'I64 [10 20 30 40 50]))))
+(set Ru8k2 (select {t: (bot v 1) by: k from: Tu8k2}))
+(count Ru8k2) -- 3
+(type (at Ru8k2 'k)) -- 'U8
+;; bot-1 per group → 10,30,50 ; sum=90
+(sum (at Ru8k2 't)) -- 90
+
+(set Tboolk2 (table [k v] (list (as 'BOOL [true false true false true]) (as 'I64 [1 2 3 4 5]))))
+(set Rboolk2 (select {t: (top v 1) by: k from: Tboolk2}))
+(count Rboolk2) -- 2
+;; true group rows {1,3,5} → max 5 ; false group rows {2,4} → max 4 ; sum=9
+(sum (at Rboolk2 't)) -- 9
+
+;; ════════════════════════════════════════════════════════════════════
+;; 6. grpt rowform — null DATE / TIME KEY rows (grpt_is_null key path)
+;; ════════════════════════════════════════════════════════════════════
+;; Null key rows are discarded in grpt_phase1_fn (knulls && grpt_is_null).
+;; A DATE/TIME key column with a 0N entry exercises the I32-width null
+;; check against the *key* (group.c:9393).
+(set Tdkn (table [k v] (list (as 'DATE [7305 0N 7305 7306 0N]) (as 'I64 [10 20 30 40 50]))))
+(set Rdkn (select {t: (top v 1) by: k from: Tdkn}))
+;; 2 non-null DATE groups (7305, 7306); null-key rows dropped
+(count Rdkn) -- 2
+;; top-1: 7305 group {10,30}→30 ; 7306 group {40}→40 ; sum=70
+(sum (at Rdkn 't)) -- 70
+
+(set Ttkn (table [k v] (list (as 'TIME [1000 2000 0N 1000] ) (as 'I64 [5 10 15 20]))))
+(set Rtkn (select {t: (top v 1) by: k from: Ttkn}))
+;; non-null TIME groups: 1000 {5,20}→20 ; 2000 {10}→10 ; null-key row dropped
+(count Rtkn) -- 2
+(sum (at Rtkn 't)) -- 30
+
+;; ════════════════════════════════════════════════════════════════════
+;; 7. DA-path SYM aggregate value column — MIN / MAX / FIRST / LAST
+;; ════════════════════════════════════════════════════════════════════
+;; Grouped MIN/MAX on a SYM *value* column hits da_accum_row's RAY_SYM
+;; arms (group.c:4223-4235) which use sym_lex_lt/gt and the INT64_MAX /
+;; INT64_MIN "unseen" sentinels.  Key is a small I64 → DA path.
+(set Tsv (table [k s] (list (as 'I64 [1 1 1 2 2 2]) ['delta 'alpha 'charlie 'zulu 'mike 'november])))
+(set Rsv (select {mn: (min s) mx: (max s) fi: (first s) la: (last s) from: Tsv by: k}))
+(count Rsv) -- 2
+;; lexicographic min/max of {alpha,charlie,delta} → alpha / delta
+(at (at Rsv 'mn) 0) -- 'alpha
+(at (at Rsv 'mx) 0) -- 'delta
+;; group 2 {zulu,mike,november} → mike / zulu
+(at (at Rsv 'mn) 1) -- 'mike
+(at (at Rsv 'mx) 1) -- 'zulu
+;; first/last preserve source order within group
+(at (at Rsv 'fi) 0) -- 'delta
+(at (at Rsv 'la) 0) -- 'charlie
+(at (at Rsv 'fi) 1) -- 'zulu
+(at (at Rsv 'la) 1) -- 'november
+;; type preserved as SYM (a grouped column reports the uppercase type tag)
+(type (at Rsv 'mn)) -- 'SYM
+(type (at Rsv 'fi)) -- 'SYM
+
+;; SYM-value MIN/MAX with one group (uniform key) — single accumulator.
+(set Rsv1 (select {mn: (min s) mx: (max s) from: Tsv by: k where: (== k 1)}))
+(count Rsv1) -- 1
+(at (at Rsv1 'mn) 0) -- 'alpha
+(at (at Rsv1 'mx) 0) -- 'delta
+
+;; ════════════════════════════════════════════════════════════════════
+;; 8. reduce_merge SYM lex min/max across parallel workers (>=64K rows)
+;; ════════════════════════════════════════════════════════════════════
+;; Scalar (no-by) MIN/MAX over a large SYM column dispatches the parallel
+;; reduction; reduce_merge's RAY_SYM branch (group.c:264-270) lex-merges
+;; per-worker min/max.  Use distinct lexicographic extremes so the merge
+;; must pick across workers.
+(set Sbig (take ['mmm 'aaa 'zzz 'qqq 'bbb 'yyy] 70000))
+(min Sbig) -- 'aaa
+(max Sbig) -- 'zzz
+(type (min Sbig)) -- 'sym
+(type (max Sbig)) -- 'sym
+
+;; ════════════════════════════════════════════════════════════════════
+;; 9. count(distinct) on STR / GUID / LIST (distinct_vec_eager fallback)
+;; ════════════════════════════════════════════════════════════════════
+;; exec_count_distinct routes STR/GUID/LIST through distinct_vec_eager
+;; (group.c:680-692) instead of the fixed-width hash kernel.
+(count (distinct ["a" "b" "a" "c" "b" "d" "a"])) -- 4
+;; GUID distinct: 4 unique GUIDs concatenated with the first one again → 4 distinct.
+(set Gx (guid 4))
+(count (distinct (concat Gx (take Gx 1)))) -- 4
+;; LIST distinct
+(count (distinct (list [1 2] [3 4] [1 2] [5 6]))) -- 3
+
+;; ════════════════════════════════════════════════════════════════════
+;; 10. exec_reduction TABLE-input + atom-input arms
+;; ════════════════════════════════════════════════════════════════════
+;; COUNT on a TABLE returns row count (group.c:1816-1817).
+(set Ttab (table [a b] (list [1 2 3 4 5] [10 20 30 40 50])))
+(count Ttab) -- 5
+;; Non-COUNT reduction on a TABLE is a type error (group.c:1818).
+(sum Ttab) !- type
+(min Ttab) !- type
+;; COUNT on a STR atom returns its length (group.c:1826-1827).
+(count "hello") -- 5
+;; COUNT on a non-STR atom returns 1 (group.c:1828).
+(count 42) -- 1
+(count 3.14) -- 1
+(count 'sym) -- 1
+
+;; ════════════════════════════════════════════════════════════════════
+;; 11. grpt rowform — I16 / U8 / BOOL VALUE column (grpt_val_read arms)
+;; ════════════════════════════════════════════════════════════════════
+;; Reinforce the narrow integer value arms with type-preservation checks
+;; (existing tests assert sums only; confirm element type round-trips).
+(set Ti16v2 (table [k v] (list (as 'I64 [1 1 2 2]) (as 'I16 [10 30 20 40]))))
+(set Ri16v2 (select {t: (top v 1) by: k from: Ti16v2}))
+(type (at Ri16v2 't)) -- 'I16
+(sum (at Ri16v2 't)) -- 70
+
+(set Tu8v2 (table [k v] (list (as 'I64 [1 1 2 2]) (as 'U8 [5 25 15 35]))))
+(set Ru8v2 (select {t: (bot v 1) by: k from: Tu8v2}))
+(type (at Ru8v2 't)) -- 'U8
+;; bot-1: min per group → 5, 15 ; sum=20
+(sum (at Ru8v2 't)) -- 20
+
+;; ════════════════════════════════════════════════════════════════════
+;; 12. grpt rowform — TIMESTAMP key parallel (>=16384 rows)
+;; ════════════════════════════════════════════════════════════════════
+;; Parallel grpt phases (nrows>=16384) with a temporal key drive the
+;; parallel scatter/HT-build/emit through grpt_key_read's I64 arm under
+;; the multi-worker dispatch.
+(set Ttspar (table [k v] (list (as 'TIMESTAMP (% (til 20000) 500)) (as 'I64 (til 20000)))))
+(set Rtspar (select {t: (top v 1) by: k from: Ttspar}))
+(count Rtspar) -- 500
+(type (at Rtspar 'k)) -- 'TIMESTAMP
+
+;; ════════════════════════════════════════════════════════════════════
+;; 13. grpt rowform — DATE value parallel (>=16384 rows, F64-vs-int arm)
+;; ════════════════════════════════════════════════════════════════════
+;; DATE value column under parallel dispatch — grpt_val_read RAY_DATE arm
+;; in the per-partition heap build (phase 2).
+(set Tdvpar (table [k v] (list (as 'I64 (% (til 20000) 1000)) (as 'DATE (+ 7000 (% (til 20000) 365))))))
+(set Rdvpar (select {t: (top v 1) by: k from: Tdvpar}))
+(count Rdvpar) -- 1000
+(type (at Rdvpar 't)) -- 'DATE

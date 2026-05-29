@@ -1,0 +1,428 @@
+;; ─────────────────────────────────────────────────────────────────────
+;; Branch-coverage tests for src/ops/query.c — REACHABLE functional
+;; branches not exercised by the existing query_* fixtures.  Targets:
+;;   - by-dict guard branches (too-many-keys, duplicate, shadow, length)
+;;   - nearest/ANN/KNN error + variant branches
+;;   - non-group-by take variants (negative tail, vec range, head/tail)
+;;   - single-key group-by across key types + reorder + take
+;;   - simple no-clause / single-projection fast exits
+;;   - WHERE conjunct chaining / predicate forms
+;;
+;; The `--` operator asserts formatted equality; `!-` asserts an error
+;; whose class matches the RHS substring.  Comments above each block
+;; name the approximate query.c site and why the branch is reachable.
+;;
+;; Unreachable branches in query.c that this file deliberately does NOT
+;; target (documented for the record):
+;;   - OOM guards after ray_vec_new / scratch_alloc / ray_sys_alloc
+;;     (e.g. lines 5339, 5413, 5933, 6079) — only fire under allocator
+;;     exhaustion, which RFL cannot induce.
+;;   - "> 255 source columns" nearest limit (line 6064) — needs a 256-col
+;;     table, impractical to build and far outside normal use.
+;;   - parse_gt_name_i64 narrow-width threshold arms (I32/I16/U8/BOOL) —
+;;     the RFL parser emits I64 atoms for all integer literals, so the
+;;     non-I64 switch arms are unreachable from source.
+;;   - defensive "HNSW handle pointer cleared" (line 5975) — attr set but
+;;     pointer NULL is an internal-corruption-only state.
+;;   - PARTED / MAPCOMMON key-reader and materialise branches
+;;     (query_key_reader_init/read, query_materialize_parted_col,
+;;     can_defer_single_key_where's RAY_IS_PARTED gate) — these only fire
+;;     for on-disk splayed/partitioned columns, which need file I/O to
+;;     construct (covered by test/rfl/system/{splayed,part}.rfl, not here).
+;;   - aggr_unary_per_group_buf / aggr_med_per_group_buf (post-DAG scatter
+;;     twins) — every RAY_FN_AGGR unary builtin is in resolve_agg_opcode,
+;;     so dev/var/stddev/med are is_group_dag_agg_expr and stay in the DAG.
+;;     These scatter twins are reached only via a DAG-agg-compile fallback.
+
+;; ====================================================================
+;; §1  No-clause / trivial-projection fast exits — query.c:5105
+;; ====================================================================
+(set T0 (table [a b] (list [1 2 3] [10 20 30])))
+;; n_out==0 and no where/by/take/sort/nearest → returns table as-is.
+(count (select {from: T0})) -- 3
+(count (key (select {from: T0}))) -- 2
+;; Pure projection (no clauses) of all columns.
+(sum (at (select {a: a b: b from: T0}) 'a)) -- 6
+
+;; ====================================================================
+;; §2  by-dict guard branches — query.c:5263-5524
+;; ====================================================================
+(set TBD (table [g h v] (list [1 2 1 2 1] [5 6 5 6 5] [10 20 30 40 50])))
+
+;; Happy path: by-dict trivial self-alias {g: g} → groups on existing col.
+(count (select {s: (sum v) by: {g: g} from: TBD})) -- 2
+;; by-dict computed value {q: (* g 10)} → eval, add col, group.
+(count (select {s: (sum v) by: {q: (* g 10)} from: TBD})) -- 2
+(sum (at (select {s: (sum v) by: {q: (* g 10)} from: TBD}) 's)) -- 150
+;; Multi-key by-dict {g: g h: h}.
+(count (select {s: (sum v) by: {g: g h: h} from: TBD})) -- 2
+
+;; Duplicate key in by-dict → domain error (query.c:5438).
+(select {s: (sum v) by: {g: g g: h} from: TBD}) !- domain
+;; Alias shadows an existing input column (non-trivial) → domain (5451).
+;; {v: (* g 1)} would shadow input column v.
+(select {s: (sum h) by: {v: (* g 1)} from: TBD}) !- domain
+;; by-dict val evaluates to wrong-length vector → length error (5500).
+;; (til 2) is length-2, not nrows (5) → length error.
+(select {s: (sum v) by: {q: (til 2)} from: TBD}) !- length
+;; by-dict val that is an atom (not a vector) → length error.
+(select {s: (sum v) by: {q: 7} from: TBD}) !- length
+
+;; ====================================================================
+;; §3  non-group-by take variants — query.c:8655-8711
+;; ====================================================================
+(set TTk (table [x] (list [10 20 30 40 50])))
+;; Positive atom take → ray_head (8662).
+(count (select {x: x from: TTk take: 3})) -- 3
+(at (at (select {x: x from: TTk take: 3}) 'x) 0) -- 10
+;; Negative atom take → ray_tail (8664), last 2 rows.
+(count (select {x: x from: TTk take: -2})) -- 2
+(at (at (select {x: x from: TTk take: -2}) 'x) 0) -- 40
+;; take=0 → empty result.
+(count (select {x: x from: TTk take: 0})) -- 0
+;; Vec[2] range take → take_range applied post-exec (8666/8704).
+(count (select {x: x from: TTk take: [1 3]})) -- 3
+(at (at (select {x: x from: TTk take: [1 3]}) 'x) 0) -- 20
+;; Take larger than nrows → clamps to nrows.
+(count (select {x: x from: TTk take: 100})) -- 5
+;; Non-atom non-vec2 take → domain error (8670).
+(select {x: x from: TTk take: [1 2 3]}) !- domain
+
+;; ====================================================================
+;; §4  single-key group-by across key types — query.c:6130-6300
+;; ====================================================================
+;; I64 key.
+(set Tk64 (table [k v] (list [1 2 1 2 3] [10 20 30 40 50])))
+(count (select {s: (sum v) by: k from: Tk64})) -- 3
+;; I32 key (narrow DAG slot).
+(set Tk32 (table [k v] (list (as 'I32 [1 2 1 2 3]) [10 20 30 40 50])))
+(count (select {s: (sum v) by: k from: Tk32})) -- 3
+;; I16 key.
+(set Tk16 (table [k v] (list (as 'I16 [1 2 1 2 3]) [10 20 30 40 50])))
+(count (select {s: (sum v) by: k from: Tk16})) -- 3
+;; U8 key.
+(set TkU8 (table [k v] (list (as 'U8 [1 2 1 2 3]) [10 20 30 40 50])))
+(count (select {s: (sum v) by: k from: TkU8})) -- 3
+;; SYM key.
+(set TkSym (table [k v] (list ['a 'b 'a 'b 'c] [10 20 30 40 50])))
+(count (select {s: (sum v) by: k from: TkSym})) -- 3
+;; DATE key.
+(set TkDate (table [k v] (list [2024.01.01 2024.01.02 2024.01.01] [10 20 30])))
+(count (select {s: (sum v) by: k from: TkDate})) -- 2
+;; F64 key → eval-level group path.
+(set TkF64 (table [k v] (list [1.5 2.5 1.5 2.5 3.5] [10 20 30 40 50])))
+(count (select {s: (sum v) by: k from: TkF64})) -- 3
+;; STR key → eval-level group path.
+(set TkStr (table [k v] (list ["aa" "bb" "aa" "bb" "cc"] [10 20 30 40 50])))
+(count (select {s: (sum v) by: k from: TkStr})) -- 3
+
+;; ====================================================================
+;; §5  BOOL group-by reorder — query.c:8713-8774
+;; ====================================================================
+;; Table whose first row's bool key is TRUE.  exec.c radix-sort puts
+;; false first, so first_val(true) != result_first(false) → reverse
+;; reorder fires (8732).  Group order in result becomes [true,false].
+(set TBool (table [b v] (list [true false true false true] [1 2 3 4 5])))
+(count (select {s: (sum v) by: b from: TBool})) -- 2
+;; true group rows = {1,3,5} → sum 9; false group {2,4} → sum 6.
+;; After reorder, index 0 is the true group (first-occurrence order).
+(at (at (select {s: (sum v) by: b from: TBool}) 'b) 0) -- true
+(at (at (select {s: (sum v) by: b from: TBool}) 's) 0) -- 9
+;; Table whose first row is FALSE → no reorder (first_val==result_first).
+(set TBoolF (table [b v] (list [false true false true] [1 2 3 4])))
+(at (at (select {s: (sum v) by: b from: TBoolF}) 'b) 0) -- false
+
+;; ====================================================================
+;; §6  group-by + take + sort combinations — apply_sort_take 521-790
+;; ====================================================================
+(set TGT (table [k v] (list ['a 'b 'c 'd 'e 'a 'b] [1 2 3 4 5 6 7])))
+;; group + positive take (no sort).
+(count (select {s: (sum v) by: k from: TGT take: 2})) -- 2
+;; group + negative take (tail groups).
+(count (select {s: (sum v) by: k from: TGT take: -2})) -- 2
+;; group + take vec[2] range.
+(count (select {s: (sum v) by: k from: TGT take: [1 2]})) -- 2
+;; group + asc on agg result.
+(set TGT2 (table [k v] (list ['a 'b 'c 'a 'b 'c] [3 1 2 30 10 20])))
+;; sums: a=33, b=11, c=22.  asc by s → b(11),c(22),a(33).
+(at (at (select {s: (sum v) by: k from: TGT2 asc: s}) 's) 0) -- 11
+;; desc by s → a(33),c(22),b(11).
+(at (at (select {s: (sum v) by: k from: TGT2 desc: s}) 's) 0) -- 33
+;; group + sort + take (top-K over agg).
+(count (select {s: (sum v) by: k from: TGT2 desc: s take: 2})) -- 2
+(at (at (select {s: (sum v) by: k from: TGT2 desc: s take: 2}) 's) 0) -- 33
+
+;; ====================================================================
+;; §7  non-group sort/topk over a flat table — apply_sort_take topk
+;; ====================================================================
+(set TFlat (table [a b] (list [5 3 1 4 2] [50 30 10 40 20])))
+;; asc single key (no take) → full sort.
+(at (at (select {from: TFlat asc: a}) 'a) 0) -- 1
+;; desc single key.
+(at (at (select {from: TFlat desc: a}) 'a) 0) -- 5
+;; asc + take K (topk fast path, K < nrows).
+(count (select {from: TFlat asc: a take: 2})) -- 2
+(at (at (select {from: TFlat asc: a take: 2}) 'a) 0) -- 1
+;; desc + take K.
+(at (at (select {from: TFlat desc: a take: 2}) 'a) 0) -- 5
+;; multi-key asc + take.
+(count (select {from: TFlat asc: [a b] take: 3})) -- 3
+;; take == nrows → falls outside topk fast path (k < nrows guard).
+(count (select {from: TFlat asc: a take: 5})) -- 5
+;; negative take with sort (tail of sorted) → DAG sort + tail.
+(count (select {from: TFlat asc: a take: -2})) -- 2
+
+;; ====================================================================
+;; §8  WHERE predicate forms + conjunct chaining — query.c:5696-5856
+;; ====================================================================
+(set TW (table [a b s] (list [1 2 3 4 5 6 7 8] [80 70 60 50 40 30 20 10] ["x1" "x2" "y3" "y4" "z5" "z6" "w7" "w8"])))
+;; Single comparison predicate.
+(count (select {from: TW where: (> a 4)})) -- 4
+;; AND of two range comparisons (conjunct chain, reorder-safe).
+(count (select {from: TW where: (and (> a 2) (< a 7))})) -- 4
+;; AND of three conjuncts.
+(count (select {from: TW where: (and (> a 1) (< a 8) (> b 20))})) -- 5
+;; AND including a LIKE (expensive conjunct → cost-ordered last).
+(count (select {from: TW where: (and (> a 0) (like s "y*"))})) -- 2
+;; AND with a modulo guard (reorder_safe=0 path: the % conjunct is an
+;; unknown DAG op → user-given order preserved).  a=[1..8], a%3>0 keeps
+;; a ∈ {1,2,4,5,7,8} → 6 rows (a=3,6 excluded); (!= a 0) is always true.
+(count (select {from: TW where: (and (!= a 0) (> (% a 3) 0))})) -- 6
+;; OR predicate.
+(count (select {from: TW where: (or (== a 1) (== a 8))})) -- 2
+;; IN predicate.
+(count (select {from: TW where: (in a [1 3 5 7])})) -- 4
+;; Pure-literal conjunct in AND → falls back to OP_AND tree (not chain).
+(count (select {from: TW where: (and (> a 4) (== 1 1))})) -- 4
+;; WHERE that filters everything out.
+(count (select {from: TW where: (> a 1000)})) -- 0
+
+;; ====================================================================
+;; §9  WHERE + by + agg combinations — fused-group routing 5543-5694
+;; ====================================================================
+(set TWB (table [g v] (list [1 2 1 2 1 2 1] (as 'I32 [10 20 30 40 50 60 70]))))
+;; where + by + count (count1 fast path).
+(count (select {c: (count v) by: g from: TWB where: (> v 15)})) -- 2
+;; where + by + sum.  (> v 15) keeps v∈{20,30,40,50,60,70}; g=1→{30,50,70}=150,
+;; g=2→{20,40,60}=120; total 270.
+(sum (at (select {s: (sum v) by: g from: TWB where: (> v 15)}) 's)) -- 270
+;; where + by + min/max/avg combo (multi-agg fused path).
+(count (select {mn: (min v) mx: (max v) by: g from: TWB where: (> v 5)})) -- 2
+;; where + multi-key by + count.
+(set TWB2 (table [g1 g2 v] (list (as 'I32 [1 2 1 2]) (as 'I32 [5 5 6 6]) (as 'I32 [1 2 3 4]))))
+(count (select {c: (count v) by: [g1 g2] from: TWB2 where: (> v 0)})) -- 4
+
+;; ====================================================================
+;; §10  count(distinct) per-group — single + multi key
+;; ====================================================================
+(set TCD (table [g v] (list ['a 'a 'b 'b 'a 'b] [1 2 3 3 1 4])))
+;; (a): distinct {1,2}=2; (b): distinct {3,4}=2.
+(sum (at (select {cd: (count (distinct v)) by: g from: TCD}) 'cd)) -- 4
+;; count(distinct) with where filter.
+(count (select {cd: (count (distinct v)) by: g from: TCD where: (> v 1)})) -- 2
+
+;; ====================================================================
+;; §11  type errors / domain guards — query.c:4977-5000
+;; ====================================================================
+;; from: evaluates to a non-table → type error.
+(select {x: x from: [1 2 3]}) !- type
+;; select arg not a dict → type error.
+(select 5) !- type
+
+;; ====================================================================
+;; §12  nearest combined-clause + take guards — query.c:5081-5092, 5891
+;; ====================================================================
+(set TN (table [id Vec] (list [1 2 3 4] (list [1.0 0.0] [0.0 1.0] [1.0 1.0] [0.5 0.5]))))
+;; nearest + asc → domain (mutually exclusive).
+(select {from: TN nearest: (knn Vec [1.0 0.0]) asc: id}) !- domain
+;; nearest + by → domain.
+(select {from: TN nearest: (knn Vec [1.0 0.0]) by: id}) !- domain
+;; nearest take not an integer → type error (5902).
+(select {from: TN nearest: (knn Vec [1.0 0.0]) take: 1.5}) !- type
+;; nearest take <= 0 → domain (5907).
+(select {from: TN nearest: (knn Vec [1.0 0.0]) take: 0}) !- domain
+;; nearest query empty vector → length error (5928).  Use an explicitly
+;; typed empty F64 vec so it passes the numeric-vec type gate and trips
+;; the dim<=0 length guard rather than the type guard.
+(select {from: TN nearest: (knn Vec (as 'F64 []))}) !- length
+;; nearest query non-numeric → type error (5922).
+(select {from: TN nearest: (knn Vec ["a" "b"])}) !- type
+;; knn with default take (10) clamps to nrows.
+(count (select {from: TN nearest: (knn Vec [1.0 0.0])})) -- 4
+;; knn explicit metric arms.
+(count (select {from: TN nearest: (knn Vec [1.0 0.0] 'l2) take: 2})) -- 2
+(count (select {from: TN nearest: (knn Vec [1.0 0.0] 'ip) take: 2})) -- 2
+(count (select {from: TN nearest: (knn Vec [1.0 0.0] 'cosine) take: 2})) -- 2
+;; knn bad metric → domain (6035).
+(select {from: TN nearest: (knn Vec [1.0 0.0] 'bogus)}) !- domain
+;; knn first arg not an unquoted column name → type (6019).
+(select {from: TN nearest: (knn 5 [1.0 0.0])}) !- type
+;; nearest non-list → domain (5875).
+(select {from: TN nearest: 'foo}) !- domain
+;; nearest list too short (<3) → domain (5875).
+(select {from: TN nearest: (list 'knn)}) !- domain
+;; nearest head not a symbol → error (the head `5` fails the symbol gate;
+;; the planner surfaces this as a type error before the domain guard).
+(select {from: TN nearest: (list 5 'Vec [1.0 0.0])}) !- type
+;; nearest head symbol neither ann nor knn → error.  Quote the column
+;; symbol so the (list ...) builds without a name lookup.  A 3-element
+;; nearest list with an unrecognised head surfaces as a type error.
+(select {from: TN nearest: (list 'zzz 'Vec [1.0 0.0])}) !- type
+;; knn with I32 query vector (int→float conversion arm 5949).
+(count (select {from: TN nearest: (knn Vec (as 'I32 [1 0])) take: 2})) -- 2
+;; knn with I64 query vector (arm 5953).
+(count (select {from: TN nearest: (knn Vec [1 0]) take: 2})) -- 2
+
+;; ====================================================================
+;; §13  ANN form with hnsw-build index — query.c:5961-6013
+;; ====================================================================
+(set TANN (table [id Vec] (list [1 2 3 4 5] (list [1.0 0.0 0.0] [0.0 1.0 0.0] [0.0 0.0 1.0] [0.7 0.7 0.0] [0.5 0.5 0.5]))))
+(set IdxA (hnsw-build (at TANN 'Vec) 'l2 8 100))
+;; ann default ef.
+(count (select {from: TANN nearest: (ann IdxA [1.0 0.0 0.0]) take: 3})) -- 3
+;; ann explicit ef.
+(count (select {from: TANN nearest: (ann IdxA [1.0 0.0 0.0] 50) take: 3})) -- 3
+;; ann ef as I32 atom.
+(count (select {from: TANN nearest: (ann IdxA [1.0 0.0 0.0] (as 'I32 40)) take: 2})) -- 2
+;; ann query dim mismatch → length error (5986).
+(select {from: TANN nearest: (ann IdxA [1.0 0.0])}) !- length
+;; ann first arg not an HNSW handle → type error (5972).
+(select {from: TANN nearest: (ann 99 [1.0 0.0 0.0])}) !- type
+;; ann ef bad type → type error (6004).
+(select {from: TANN nearest: (ann IdxA [1.0 0.0 0.0] 1.5)}) !- type
+(hnsw-free IdxA)
+
+;; ====================================================================
+;; §14  projection echoing the group key + agg — layout [key, agg]
+;; ====================================================================
+(set TPK (table [k v] (list ['a 'b 'a 'b 'c] [1 2 3 4 5])))
+;; Echo key + sum agg.
+(count (key (select {k: k s: (sum v) by: k from: TPK}))) -- 2
+(sum (at (select {k: k s: (sum v) by: k from: TPK}) 's)) -- 15
+;; Multiple aggs in one group-by with no explicit key projection: the
+;; group key column is auto-prepended, so the result is [k, mn, mx, c]
+;; → 4 columns.
+(count (key (select {mn: (min v) mx: (max v) c: (count v) by: k from: TPK}))) -- 4
+
+;; ====================================================================
+;; §15  holistic aggregates (dev/var/stddev/med/var_pop/dev_pop) over an
+;;      INTEGER-keyed DAG group-by.  resolve_agg_opcode maps these to
+;;      OP_STDDEV_POP / OP_VAR / OP_VAR_POP / OP_MEDIAN, so they route
+;;      through compile_expr_dag's agg arms (query.c:1430-1434) and the
+;;      DAG group exec — exercising the holistic-agg planner branches.
+;;
+;;      NOTE: the post-DAG scatter twins aggr_unary_per_group_buf /
+;;      aggr_med_per_group_buf are NOT reached here: every RAY_FN_AGGR
+;;      unary builtin is recognised by resolve_agg_opcode, so it is an
+;;      `is_group_dag_agg_expr` (handled in the DAG), never a "non-agg"
+;;      scatter projection.  Those scatter functions are reachable only
+;;      via a DAG-agg-compile fallback and are documented as such.
+;;
+;;      Values chosen so population/sample variance is integer-exact.
+;; ====================================================================
+;; Two I64 groups, each value-pair [2,4] → mean 3, popvar 1, sample var 2.
+;;   dev   (population stddev) = sqrt(1)        = 1.0
+;;   var   (sample variance)   = 2/(n-1)=2/1    = 2.0
+;;   stddev(sample stddev)     = sqrt(2)        ≈ 1.4142135623730951
+(set TSV (table [k v] (list [1 2 1 2] (as 'F64 [2 4 4 6]))))
+;; group k=1 → v=[2,4]; group k=2 → v=[4,6].  Both have popvar=1, dev=1.
+(count (select {d: (dev v) by: k from: TSV})) -- 2
+(at (at (select {d: (dev v) by: k from: TSV}) 'd) 0) -- 1.0
+(at (at (select {d: (dev v) by: k from: TSV}) 'd) 1) -- 1.0
+;; var (sample) → 2.0 for both groups.
+(at (at (select {vr: (var v) by: k from: TSV}) 'vr) 0) -- 2.0
+;; var_pop (population variance) → 1.0.
+(at (at (select {vp: (var_pop v) by: k from: TSV}) 'vp) 0) -- 1.0
+;; dev_pop / stddev_pop — population stddev = 1.0.
+(at (at (select {dp: (dev_pop v) by: k from: TSV}) 'dp) 0) -- 1.0
+;; med (median) per group via aggr_med_per_group_buf fast path.
+;;   group k=1 → med([2,4]) = 3.0 ; group k=2 → med([4,6]) = 5.0.
+(at (at (select {m: (med v) by: k from: TSV}) 'm) 0) -- 3.0
+(at (at (select {m: (med v) by: k from: TSV}) 'm) 1) -- 5.0
+;; Holistic agg over a computed sub-expression: (dev (* v 1.0)) — the
+;; agg arg is a DAG mul node, so the whole expr still compiles in the
+;; DAG agg path (exercises compile_expr_dag's arg-then-agg nesting).
+(at (at (select {d: (dev (* v 1.0)) by: k from: TSV}) 'd) 0) -- 1.0
+;; med over a larger I64-keyed table (odd group sizes → median midpoint).
+(set TMed (table [k v] (list [1 1 1 2 2] (as 'F64 [10 20 30 5 15]))))
+(at (at (select {m: (med v) by: k from: TMed}) 'm) 0) -- 20.0
+(at (at (select {m: (med v) by: k from: TMed}) 'm) 1) -- 10.0
+;; Two holistic/standard aggs in one select (no key projection): result
+;; is [k, s, d] → 3 columns.
+(count (key (select {s: (sum v) d: (dev v) by: k from: TSV}))) -- 3
+(at (at (select {s: (sum v) d: (dev v) by: k from: TSV}) 's) 0) -- 6.0
+
+;; ====================================================================
+;; §16  count(distinct) per group across inner value types and group
+;;      counts — count_distinct_per_group_buf parallel vs serial path
+;;      and cdpg_buf_par_fn typed arms (query.c:4077-4181, 3891-3994).
+;;      >= 4 groups + flat type → parallel; < 4 groups or STR → serial.
+;; ====================================================================
+;; >= 4 SYM-keyed groups, I64 distinct values → parallel path I64 arm.
+(set TCDp (table [g v] (list ['a 'b 'c 'd 'a 'b 'c 'd 'a] [1 2 3 4 1 5 3 6 2])))
+;; a:{1,2}=2 b:{2,5}=2 c:{3}=1 d:{4,6}=2 → 4 groups, sum 7.
+(count (select {cd: (count (distinct v)) by: g from: TCDp})) -- 4
+(sum (at (select {cd: (count (distinct v)) by: g from: TCDp}) 'cd)) -- 7
+;; >= 4 groups, I32 distinct values → parallel I32 arm.
+(set TCDi32 (table [g v] (list ['a 'b 'c 'd 'a 'b 'c 'd] (as 'I32 [1 2 3 4 1 9 3 4]))))
+(sum (at (select {cd: (count (distinct v)) by: g from: TCDi32}) 'cd)) -- 5
+;; >= 4 groups, F64 distinct values → parallel F64 arm.
+(set TCDf (table [g v] (list ['a 'b 'c 'd 'a 'b 'c 'd] [1.5 2.5 3.5 4.5 1.5 9.5 3.5 4.5])))
+(sum (at (select {cd: (count (distinct v)) by: g from: TCDf}) 'cd)) -- 5
+;; >= 4 groups, SYM distinct values → parallel SYM arm.
+(set TCDsym (table [g v] (list ['a 'b 'c 'd 'a 'b 'c 'd] ['x 'y 'z 'w 'x 'q 'z 'w])))
+(sum (at (select {cd: (count (distinct v)) by: g from: TCDsym}) 'cd)) -- 5
+;; >= 4 groups, BOOL distinct values → parallel BOOL arm.
+;; a(0,4)=[true,true]={true}=1 ; b(1,5)=[false,true]={f,t}=2 ;
+;; c(2,6)=[true,false]={t,f}=2 ; d(3,7)=[true,false]={t,f}=2 → sum 7.
+(set TCDb (table [g v] (list ['a 'b 'c 'd 'a 'b 'c 'd] [true false true true true true false false])))
+(sum (at (select {cd: (count (distinct v)) by: g from: TCDb}) 'cd)) -- 7
+;; < 4 groups → serial path (gather_by_idx + exec_count_distinct).
+(set TCDser (table [g v] (list ['a 'b 'a 'b 'a] [1 2 3 2 1])))
+;; a:{1,3}=2 ; b:{2}=1 → 2 groups, sum 3.
+(sum (at (select {cd: (count (distinct v)) by: g from: TCDser}) 'cd)) -- 3
+;; STR inner distinct values → not flat_ok → serial path, STR dedup.
+(set TCDstr (table [g v] (list ['a 'b 'c 'd 'a 'b 'c 'd] ["p" "q" "r" "s" "p" "z" "r" "s"])))
+(sum (at (select {cd: (count (distinct v)) by: g from: TCDstr}) 'cd)) -- 5
+;; count(distinct) mixed with a plain agg in one group-by (no key
+;; projection): result is [g, s, cd] → 3 columns.
+(count (key (select {s: (sum v) cd: (count (distinct v)) by: g from: TCDp}))) -- 3
+;; STR group KEY → eval-level group path → count_distinct_per_group_groups
+;; (query.c:4186) which builds the idx/offset/count buffers then delegates
+;; to count_distinct_per_group_buf.  (SYM keys above take the DAG path; only
+;; STR/LIST keys route through the eval-level groups layout.)
+(set TCDsk (table [g v] (list ["aa" "bb" "aa" "bb" "cc" "aa"] [1 2 1 3 5 9])))
+;; aa:{1,1,9}={1,9}=2 ; bb:{2,3}=2 ; cc:{5}=1 → 3 groups, sum 5.
+(count (select {cd: (count (distinct v)) by: g from: TCDsk})) -- 3
+(sum (at (select {cd: (count (distinct v)) by: g from: TCDsk}) 'cd)) -- 5
+
+;; ====================================================================
+;; §17  non-agg per-group projections — nonagg_eval_per_group_core /
+;;      eval_expr_per_row (query.c:3422-3692).  A by-group projection
+;;      that is neither a DAG agg nor a streaming aggr-unary: an
+;;      element-wise expression evaluated per group, returned as a LIST
+;;      column (one sub-list per group).
+;; ====================================================================
+(set TNA (table [k v w] (list [1 2 1 2 1] [10 20 30 40 50] [1 2 3 4 5])))
+;; (+ v w) per group → element-wise, result is a LIST column.
+(count (select {r: (+ v w) by: k from: TNA})) -- 2
+;; Inner-agg expression: (- (max v) (min v)) per group (must eval per group).
+(count (select {d: (- (max v) (min v)) by: k from: TNA})) -- 2
+;; group k=1 → v=[10,30,50] diff 40 ; k=2 → v=[20,40] diff 20.
+(at (at (select {d: (- (max v) (min v)) by: k from: TNA}) 'd) 0) -- 40
+;; first/last of group.
+(at (at (select {f: (first v) by: k from: TNA}) 'f) 0) -- 10
+(at (at (select {l: (last v) by: k from: TNA}) 'l) 0) -- 50
+
+;; ====================================================================
+;; §18  empty-table and single-row query shapes
+;; ====================================================================
+(set TEmpty (table [a b] (list [] [])))
+(count (select {from: TEmpty})) -- 0
+(count (select {from: TEmpty where: (> a 0)})) -- 0
+(count (select {s: (sum a) by: b from: TEmpty})) -- 0
+(set TOne (table [a b] (list [42] [99])))
+(count (select {from: TOne})) -- 1
+(at (at (select {s: (sum a) by: b from: TOne}) 's) 0) -- 42
+(count (select {from: TOne where: (> a 0)})) -- 1
+(count (select {from: TOne where: (< a 0)})) -- 0
