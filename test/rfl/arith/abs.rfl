@@ -38,7 +38,7 @@
 (type (abs [-1i 2i])) -- 'I32
 
 ;; INT_MIN edge: |INT_MIN| doesn't fit in the same width — abs
-;; returns a typed null of the same width (k/q convention).  Stops
+;; returns a typed null of the same width (by convention).  Stops
 ;; the broken `(abs -32768h) → -32768h` (negative result from abs!)
 ;; behaviour and avoids signed-overflow UB.
 

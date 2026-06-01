@@ -1,7 +1,8 @@
 ;; .db.splayed.mount and .db.parted.mount — bulk-load every
 ;; on-disk table under a root directory and bind each as a global,
-;; returning the dict of bindings made.  Mirrors kdb's `\l /tmp/db/`
-;; but split into format-specific entry points so the discovery
+;; returning the dict of bindings made.  Loads every binding from a
+;; directory into the global env, split into format-specific entry
+;; points so the discovery
 ;; heuristics match the on-disk format exactly:
 ;;
 ;;   .db.splayed.mount → child has `.d` schema → ray_splay_load

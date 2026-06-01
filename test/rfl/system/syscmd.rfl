@@ -1,4 +1,4 @@
-;; .sys.cmd — kdb-style system command entry point.
+;; .sys.cmd — colon-command entry point.
 ;;
 ;; Every command is registered once in lang/syscmd.c and reachable
 ;; through three surfaces:

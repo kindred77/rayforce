@@ -3904,7 +3904,7 @@ static test_result_t test_expr_scalar_null_propagation(void) {
 
     /* x + ns: ns is scalar-null (len=1 w/ null) → set_all_null path
      * in propagate_nulls_binary when r_scalar && scalar_is_null(rhs).
-     * Rayforce count = length (q-style); verify null-ness separately. */
+     * Rayforce count = length (includes nulls); verify null-ness separately. */
     ray_graph_t* g = ray_graph_new(tbl);
     ray_op_t* x  = ray_scan(g, "x");
     ray_op_t* ns = ray_scan(g, "ns");
@@ -3912,7 +3912,7 @@ static test_result_t test_expr_scalar_null_propagation(void) {
     ray_op_t* cnt = ray_count(g, add);
     ray_t* result = ray_execute(g, cnt);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    /* count = length = 3, not 0 (q-style: count includes nulls) */
+    /* count = length = 3, not 0 (count = length (includes nulls)) */
     TEST_ASSERT_EQ_I(result->i64, 3);
     ray_release(result);
     ray_graph_free(g);
@@ -3938,7 +3938,7 @@ static test_result_t test_expr_scalar_null_propagation(void) {
     cnt = ray_count(g, add2);
     result = ray_execute(g, cnt);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    /* count = length = 3, not 0 (q-style: count includes nulls) */
+    /* count = length = 3, not 0 (count = length (includes nulls)) */
     TEST_ASSERT_EQ_I(result->i64, 3);
     ray_release(result);
     ray_graph_free(g);
@@ -4637,14 +4637,14 @@ static test_result_t test_expr_unary_null_propagation(void) {
     ray_graph_free(g);
 
     /* neg(x): null propagation via propagate_nulls.
-     * Rayforce count = length (q-style); verify null-ness separately. */
+     * Rayforce count = length (includes nulls); verify null-ness separately. */
     g = ray_graph_new(tbl);
     x = ray_scan(g, "x");
     ray_op_t* neg = ray_neg(g, x);
     ray_op_t* cnt = ray_count(g, neg);
     result = ray_execute(g, cnt);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    /* count = length = 5, not 4 (q-style: count includes nulls) */
+    /* count = length = 5, not 4 (count = length (includes nulls)) */
     TEST_ASSERT_EQ_I(result->i64, 5);
     ray_release(result);
     ray_graph_free(g);
@@ -4689,7 +4689,7 @@ static test_result_t test_expr_binary_null_propagation(void) {
     ray_release(va); ray_release(vb);
 
     /* a + b: nulls at positions 1,3 propagate into result.
-     * Rayforce count = length (q-style); verify null-ness separately. */
+     * Rayforce count = length (includes nulls); verify null-ness separately. */
     ray_graph_t* g = ray_graph_new(tbl);
     ray_op_t* a_op = ray_scan(g, "a");
     ray_op_t* b_op = ray_scan(g, "b");
@@ -4697,7 +4697,7 @@ static test_result_t test_expr_binary_null_propagation(void) {
     ray_op_t* cnt = ray_count(g, add);
     ray_t* result = ray_execute(g, cnt);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    /* count = length = 5, not 3 (q-style: count includes nulls) */
+    /* count = length = 5, not 3 (count = length (includes nulls)) */
     TEST_ASSERT_EQ_I(result->i64, 5);
     ray_release(result);
     ray_graph_free(g);
@@ -5472,7 +5472,7 @@ static test_result_t test_expr_set_all_null_large(void) {
     ray_release(vec); ray_release(ns);
 
     /* v + ns (len=1 null scalar) → all 200 results null → exercises set_all_null with len>128.
-     * Rayforce count = length (q-style); verify null-ness separately. */
+     * Rayforce count = length (includes nulls); verify null-ness separately. */
     ray_graph_t* g = ray_graph_new(tbl);
     ray_op_t* v_op = ray_scan(g, "v");
     ray_op_t* ns_op = ray_scan(g, "ns");
@@ -5480,7 +5480,7 @@ static test_result_t test_expr_set_all_null_large(void) {
     ray_op_t* cnt = ray_count(g, add);
     ray_t* result = ray_execute(g, cnt);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    /* count = length = 200, not 0 (q-style: count includes nulls) */
+    /* count = length = 200, not 0 (count = length (includes nulls)) */
     TEST_ASSERT_EQ_I(result->i64, 200);
     ray_release(result);
     ray_graph_free(g);
@@ -5530,7 +5530,7 @@ static test_result_t test_expr_propagate_nulls_slice(void) {
     ray_release(vec); ray_release(sl); ray_release(vb);
 
     /* s + b: slice [20, 30(null), 40] + b=[100,200,300] → null propagates at pos 1.
-     * Rayforce count = length (q-style); verify null-ness separately. */
+     * Rayforce count = length (includes nulls); verify null-ness separately. */
     ray_graph_t* g = ray_graph_new(tbl);
     ray_op_t* s_op = ray_scan(g, "s");
     ray_op_t* b_op = ray_scan(g, "b");
@@ -5538,7 +5538,7 @@ static test_result_t test_expr_propagate_nulls_slice(void) {
     ray_op_t* cnt = ray_count(g, add);
     ray_t* result = ray_execute(g, cnt);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    /* count = length = 3, not 2 (q-style: count includes nulls) */
+    /* count = length = 3, not 2 (count = length (includes nulls)) */
     TEST_ASSERT_EQ_I(result->i64, 3);
     ray_release(result);
     ray_graph_free(g);
@@ -6266,7 +6266,7 @@ static test_result_t test_expr_f64_div_zero_scalar(void) {
     ray_release(v);
 
     /* a / 0.0 — scalar divisor = 0 → exercises line 1765.
-     * Rayforce count = length (q-style); verify null-ness separately. */
+     * Rayforce count = length (includes nulls); verify null-ness separately. */
     ray_graph_t* g = ray_graph_new(tbl);
     ray_op_t* col = ray_scan(g, "a");
     ray_op_t* zero = ray_const_f64(g, 0.0);
@@ -6274,7 +6274,7 @@ static test_result_t test_expr_f64_div_zero_scalar(void) {
     ray_op_t* cnt = ray_count(g, dv);
     ray_t* result = ray_execute(g, cnt);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    /* count = length = 4, not 0 (q-style: count includes nulls) */
+    /* count = length = 4, not 0 (count = length (includes nulls)) */
     TEST_ASSERT_EQ_I(result->i64, 4);
     ray_release(result);
     ray_graph_free(g);

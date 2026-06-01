@@ -65,7 +65,7 @@
 
 ;; ──────────────────────────────────────────────────────────────────
 ;; INT_MIN: -INT_MIN doesn't fit in the same signed width (overflow).
-;; Per k/q convention neg surfaces this as a typed null of the same
+;; By convention neg surfaces this as a typed null of the same
 ;; width — type preserved, no UB, detectable via `nil?`.
 ;; ──────────────────────────────────────────────────────────────────
 

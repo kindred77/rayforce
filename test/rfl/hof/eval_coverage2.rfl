@@ -50,9 +50,9 @@
 ;; Rows with null in the sym vec: == 'a → [true, false, true, false]
 (count (where (== col_s 'a))) -- 2
 (count (where (!= col_s 'a))) -- 2
-;; null sym == null sym atom → general path (null ≠ null in q/k semantics)
-;; BUG: In q/k semantics, null == null is 0 (false); only 'a == 'a is true.
-;; The general path is hit regardless; the result follows k/q null rules:
+;; null sym == null sym atom → general path (null ≠ null by null-equality semantics)
+;; BUG: By null-equality semantics, null == null is 0 (false); only 'a == 'a is true.
+;; The general path is hit regardless; the result follows the null-equality rules:
 (sum (as 'I64 (== col_s 0Ns))) -- 0
 (sum (as 'I64 (!= col_s 0Ns))) -- 4
 

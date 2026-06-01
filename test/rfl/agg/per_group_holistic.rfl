@@ -128,8 +128,8 @@
 ;; (sample) while scalar `dev` is OP_STDDEV_POP (population).  The
 ;; one-line fix at src/ops/query.c:316 aligns the planner mapping so
 ;; per-group `dev` is also population — `dev` is now an alias of
-;; `stddev_pop` (and `dev_pop`) in every context, matching Q/K
-;; convention (`dev` = pop, `sdev` would be sample).
+;; `stddev_pop` (and `dev_pop`) in every context, by convention
+;; (`dev` = pop, `sdev` would be sample).
 (sum (at (select {v: (dev v) by: g from: Tvar}) 'v))        -- 4.0
 ;; Sanity: stddev_pop (explicit) sums to 4.0 (= 2 * 2.0).
 (sum (at (select {v: (stddev_pop v) by: g from: Tvar}) 'v)) -- 4.0

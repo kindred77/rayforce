@@ -426,7 +426,7 @@
 ;; ════════════════════════════════════════════════════════════════════
 ;; 16. LENGTH MISMATCH — eval.c routes lists of different lengths
 ;;     through a per-element loop that truncates to the shorter side
-;;     (q/k atomic semantics).  The expr.c-level length guard at
+;;     (atomic semantics).  The expr.c-level length guard at
 ;;     expr.c:1848 is only reached when both sides are typed numeric
 ;;     vectors of equal type that take the DAG path.  Pin the
 ;;     observed truncation here.

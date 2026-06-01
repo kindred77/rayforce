@@ -1,4 +1,4 @@
-;; Journal end-to-end — q/kdb's -l/-L feature, ported.
+;; Journal end-to-end — transaction-log journaling (-l/-L).
 ;;
 ;; Two named processes are spawned in sequence under -l <base>; this
 ;; test asserts that user mutations survive process death + restart

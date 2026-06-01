@@ -566,8 +566,8 @@ static test_result_t test_compile_strlen_null_slot_is_sentinel(void) {
 }
 
 static test_result_t test_compile_overflow_neg_int64_min_slot_is_null_i64(void) {
-    /* Negating INT64_MIN over an i64 column produces INT64_MIN (k/q
-     * convention surfaces this as typed null).  Since INT64_MIN IS
+    /* Negating INT64_MIN over an i64 column produces INT64_MIN (by
+     * convention this surfaces as typed null).  Since INT64_MIN IS
      * NULL_I64, mark_i64_overflow_as_null must leave the sentinel in
      * place, not overwrite with 0. */
     ray_t* r = ray_eval_str(
