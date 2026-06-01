@@ -630,17 +630,6 @@ static test_result_t test_sys_args_builtin(void) {
     PASS();
 }
 
-/* args builtin (ray_args_fn) */
-static test_result_t test_syscov_args(void) {
-    /* (args) returns an empty list */
-    ray_t* r = ray_eval_str("(args 0)");
-    TEST_ASSERT_NOT_NULL(r);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
-    TEST_ASSERT_EQ_I(ray_len(r), 0);
-    ray_release(r);
-    PASS();
-}
-
 /* rc builtin (ray_rc_fn) */
 static test_result_t test_syscov_rc(void) {
     /* rc of a freshly created atom is at least 1 */
@@ -863,7 +852,6 @@ const test_entry_t runtime_entries[] = {
     { "runtime/build_sys_args_flags_user",   test_build_sys_args_flags_and_user, sys_setup, sys_teardown },
     { "runtime/build_sys_args_edges",        test_build_sys_args_edges,        sys_setup, sys_teardown },
     { "runtime/sys_args_builtin",            test_sys_args_builtin,            sys_setup, sys_teardown },
-    { "runtime/syscov_args",                 test_syscov_args,                 sys_setup, sys_teardown },
     { "runtime/syscov_rc",                   test_syscov_rc,                   sys_setup, sys_teardown },
     { "runtime/syscov_time_now",             test_syscov_time_now,             sys_setup, sys_teardown },
     { "runtime/syscov_time_timer_set_del",   test_syscov_time_timer_set_del,   sys_setup_with_poll, sys_teardown_with_poll },
