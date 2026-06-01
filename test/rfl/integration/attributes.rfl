@@ -1,0 +1,11 @@
+;; ===== sorted marker: set / get / drop =====
+;; set on an ascending vector succeeds and round-trips through get
+(set v [1 2 2 5 9])(.attr.get (.attr.set 'sorted v)) -- ['sorted]
+;; set on a non-ascending vector errors (verify failure -> domain)
+(.attr.set 'sorted [3 1 2]) !- domain
+;; get on a plain vector is the empty symbol vector
+(.attr.get [1 2 3]) -- (take ['a] 0)
+;; drop clears the marker
+(.attr.get (.attr.drop (.attr.set 'sorted [1 2 3]))) -- (take ['a] 0)
+;; unknown attribute name errors (unknown attribute -> domain)
+(.attr.set 'bogus [1 2 3]) !- domain
