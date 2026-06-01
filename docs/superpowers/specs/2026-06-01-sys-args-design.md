@@ -25,38 +25,41 @@ dictionary, and remove the misnamed `args` builtin.
 
 ### Shape
 
-`(.sys.args)` returns a fixed-schema dict. Values are strings. Recognized
-launcher flags sit at the top level; everything after `--` is parsed into a
-`user` subdict.
+`(.sys.args)` returns a fixed-schema dict. Because the launcher flags have a
+**known format**, each top-level value carries its natural type — `port` and
+`cores` are `i64`, the on/off flags are `bool`, paths are `str`. Only the `user`
+subdict stays `str→str`, because the types of user-supplied arguments are not
+known to the launcher.
 
 ```
 ./rayforce -p 5000 -c 4 -- -opt 123 --verbose --name ray
 
 (.sys.args) → {
-  file:        ""           / launcher flags — always present (stable schema)
-  port:        "5000"
-  cores:       "4"
-  timeit:      "0"
-  interactive: "0"
-  log:         ""
-  user:      { opt:"123", verbose:"", name:"ray" }
+  file:        ""           / str   — launcher flags, always present (stable schema)
+  port:        5000         / i64
+  cores:       4            / i64
+  timeit:      false        / bool
+  interactive: false        / bool
+  log:         ""           / str
+  user:      { opt:"123", verbose:"", name:"ray" }   / str→str — types unknown
 }
 ```
 
 The top-level schema is **stable**: every non-sensitive launcher flag is always
 present with its effective value (default when not passed), so Rayfall code can
-read `(.sys.args)[`port]` without existence checks.
+read `(.sys.args)[`port]` without existence checks and get a value of the
+expected type.
 
-Top-level keys and defaults:
+Top-level keys, types, and defaults:
 
-| key           | source flag        | default | notes                          |
-|---------------|--------------------|---------|--------------------------------|
-| `file`        | `-f` / positional  | `""`    | script path                    |
-| `port`        | `-p`               | `"0"`   | IPC listen port                |
-| `cores`       | `-c`               | `""`    | worker-pool size; `""` = auto  |
-| `timeit`      | `-t`               | `"0"`   | `"0"` / `"1"`                  |
-| `interactive` | `-i`               | `"0"`   | `"0"` / `"1"`                  |
-| `log`         | `-l` / `-L`        | `""`    | journal base path              |
+| key           | source flag        | type   | default | notes                          |
+|---------------|--------------------|--------|---------|--------------------------------|
+| `file`        | `-f` / positional  | `str`  | `""`    | script path                    |
+| `port`        | `-p`               | `i64`  | `0`     | IPC listen port                |
+| `cores`       | `-c`               | `i64`  | `0`     | worker-pool size; `0` = auto   |
+| `timeit`      | `-t`               | `bool` | `false` | profiler at startup            |
+| `interactive` | `-i`               | `bool` | `false` |                                |
+| `log`         | `-l` / `-L`        | `str`  | `""`    | journal base path              |
 
 **Auth passwords are deliberately excluded.** `-u` / `-U` set a secret; there is
 no `auth` key, so the password is never inspectable from Rayfall. Exposing it
@@ -97,10 +100,12 @@ opaque `void*`, set once by the host, read back by builtins
    ray_t* ray_build_sys_args(int argc, char** argv);
    ```
    It scans `argv`, recognizes the launcher flags into the stable top-level
-   schema (overlaying defaults), and on encountering `--` switches to the
-   `user`-subdict pairing rules above. Dict construction follows the existing
-   `ray_sym_vec_new` + `ray_list_new` + `ray_dict_new` idiom (see
-   `ray_internals_fn`, `ray_sysinfo_fn`).
+   schema with their natural types (`make_i64` for `port`/`cores`, `ray_bool`
+   for `timeit`/`interactive`, `ray_str` for `file`/`log`), overlaying defaults,
+   and on encountering `--` switches to the `user`-subdict pairing rules above
+   (all `str→str`). Dict construction follows the existing `ray_sym_vec_new` +
+   `ray_list_new` + `ray_dict_new` idiom (see `ray_internals_fn`,
+   `ray_sysinfo_fn`).
 
 3. **Launcher wiring (`src/app/main.c`).**
    - Add a `--` terminator to the existing parse loop: `else if
@@ -159,8 +164,11 @@ argv ──main.c parse──┐
 
 - **`ray_build_sys_args` unit tests** (in `test/test_runtime.c`), driving sample
   `argv` arrays directly:
-  - no args → stable schema with all defaults, empty `user`.
-  - recognized flags before `--` → correct top-level values.
+  - no args → stable schema with all defaults, empty `user`; assert each
+    top-level value has its expected type (`port`/`cores` `i64`, `timeit`/
+    `interactive` `bool`, `file`/`log` `str`).
+  - recognized flags before `--` → correct top-level values of the right type
+    (e.g. `-p 5000` → `port` is `i64` 5000, not `"5000"`).
   - `-- -opt 123 --verbose --name ray` → `user` = `{opt:"123", verbose:"",
     name:"ray"}`.
   - bare flags, adjacent flags (`-a -b`), trailing key at end of argv → `""`
