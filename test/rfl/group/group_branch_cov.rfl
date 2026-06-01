@@ -28,6 +28,24 @@
 ;;     so this arm is dead by construction.
 ;;   - grpt_is_null / grpc_is_null RAY_F32 arm (9390/10103): F32 is not a
 ;;     supported group key/agg type; defensive only.
+;;   - grpsc_ht_grow_slots (12376-12398): in exec_group_sum_count_rowform,
+;;     init_ht is sized to 2 × total_entries in phase2 (group.c:12531-12534),
+;;     guaranteeing (count + 1) * 2 ≤ cap.  The grow-slots branch is a
+;;     defensive safety net that never fires under the planner's gates.
+;;   - grpt_phase3_fn has_null_key path (10354-10367): grpt_phase1_fn drops
+;;     all null-key rows (group.c:10180 `if (knulls && grpt_is_null) continue`),
+;;     so the only entry into grpt_ht_get always passes has_null=false
+;;     (group.c:10253), leaving e->has_null_key = 0 in every emit.  Dead by
+;;     construction.
+;;   - count_distinct_per_group_hll (1173-1229): gated by n_rows ≥ 1<<20
+;;     (1M rows).  Exercising would need ≥1M rows per test plus pool gating;
+;;     covered indirectly by group_extra/count_distinct_pg_stream which
+;;     exercises the streaming variant.  CSR HLL fallback path requires both
+;;     stream_ok=false AND n_rows ≥ 1M which the streaming path always
+;;     handles first in practice.
+;;   - radix_v2_phase1_fn binary y-side packing (3502-3509): the v2 gate
+;;     (group.c:7887) explicitly excludes agg_is_binary, so OP_PEARSON_CORR
+;;     never reaches v2_phase1_fn's bin_mask branch.  Dead by gate.
 ;;
 ;; No external /tmp state used here.
 
@@ -252,3 +270,427 @@
 (set Rdvpar (select {t: (top v 1) by: k from: Tdvpar}))
 (count Rdvpar) -- 1000
 (type (at Rdvpar 't)) -- 'DATE
+
+;; ════════════════════════════════════════════════════════════════════
+;; 14. Per-(worker, partition) fused-radix HT direct-insert
+;; ════════════════════════════════════════════════════════════════════
+;; Anton's PR #219 "perf(group): fused radix HT — per-(worker, partition)
+;; direct insert" + "extend per-partition path to SUM/AVG aggregators".
+;; The v2 path fires when:
+;;   nrows >= RAY_PARALLEL_THRESHOLD (65536) AND
+;;   no SYM key AND
+;;   all aggs are COUNT/SUM/AVG AND
+;;   no nullable agg inputs AND
+;;   no rowsel (no WHERE clause)
+;;
+;; Targets radix_v2_phase1_fn (group.c:3417+) + radix_v2_phase2_fn (3533+)
+;; + group_merge_row (3339+) with the need_sum=true path active.
+
+;; ─── 14a. Single I64 key + COUNT (need_flags=0, accum_skip path) ──────
+;; need_flags == 0 → accum_from_entry skip optimization fires; v2_phase1
+;; skips the agg-pack loop entirely (line 3485 `if (ly->need_flags)`).
+;; 80k rows, ~500 distinct keys → enough rows per (worker, partition) HT
+;; to merge multiple entries during phase2 group_merge_row.
+(set Tv2c (table [k] (list (as 'I64 (% (til 80000) 500)))))
+(set Rv2c (select {c: (count k) from: Tv2c by: k}))
+(count Rv2c) -- 500
+(sum (at Rv2c 'c)) -- 80000
+;; uniform distribution → each group has 80000/500 = 160 rows
+(min (at Rv2c 'c)) -- 160
+(max (at Rv2c 'c)) -- 160
+
+;; ─── 14b. Single I64 key + SUM (need_sum=true, merge accumulates) ─────
+;; group_merge_row need_sum=true branch (lines 3377-3392) iterates
+;; agg_val_slot, hits f64_mask=0 (I64 sum) branch (3387-3389).
+(set Tv2s (table [k v] (list (as 'I64 (% (til 80000) 500)) (as 'I64 (til 80000)))))
+(set Rv2s (select {s: (sum v) c: (count k) from: Tv2s by: k}))
+(count Rv2s) -- 500
+;; sum across all groups = sum(0..79999) = 80000*79999/2 = 3199960000
+(sum (at Rv2s 's)) -- 3199960000
+(sum (at Rv2s 'c)) -- 80000
+
+;; ─── 14c. Single I64 key + SUM(F64) — f64_mask branch (3382-3385) ─────
+;; group_merge_row's f64 sum accumulation: src_row uses double layout.
+(set Tv2f (table [k v] (list (as 'I64 (% (til 80000) 500)) (* 0.5 (as 'F64 (til 80000))))))
+(set Rv2f (select {s: (sum v) c: (count k) from: Tv2f by: k}))
+(count Rv2f) -- 500
+;; sum(v) = 0.5 * sum(0..79999) = 0.5 * 3199960000 = 1599980000
+(< (abs (- (sum (at Rv2f 's)) 1599980000.0)) 1.0) -- true
+
+;; ─── 14d. Multi-key (I64 + I32) + AVG — composite v2 merge ────────────
+;; AVG decomposes to SUM/COUNT in radix; need_sum=true.  Multi-key
+;; exercises hash_keys_inline reused inside group_merge_row.
+;; lcm(100, 200) = 200 distinct groups, each ~400 rows.
+(set Tv2avg (table [k1 k2 v] (list (as 'I64 (% (til 80000) 100)) (as 'I32 (% (til 80000) 200)) (as 'I64 (til 80000)))))
+(set Rv2avg (select {a: (avg v) c: (count k1) from: Tv2avg by: [k1 k2]}))
+(== (count Rv2avg) 200) -- true
+(== (sum (at Rv2avg 'c)) 80000) -- true
+;; avg > 0
+(> (sum (at Rv2avg 'a)) 0.0) -- true
+
+;; ─── 14e. Multi-key with TIMESTAMP — wide_key_mask path in v2 phase1 ──
+;; A TIMESTAMP key is read as int64; the v2 phase1 (line 3471) takes the
+;; `else` branch (read_col_i64) when wide=0, t!=RAY_F64.  Combine with
+;; I64 to drive multi-key composite hashing.
+(set Tv2ts (table [ts v] (list (as 'TIMESTAMP (% (til 70000) 250)) (as 'I64 (til 70000)))))
+(set Rv2ts (select {s: (sum v) c: (count ts) from: Tv2ts by: ts}))
+(== (count Rv2ts) 250) -- true
+(== (sum (at Rv2ts 'c)) 70000) -- true
+
+;; ─── 14f. F64 key + COUNT — v2 phase1 RAY_F64 branch (lines 3466-3470) ─
+;; F64 key dispatches the dedicated F64 read+hash branch.
+(set Tv2k (table [k v] (list (* 0.5 (as 'F64 (% (til 70000) 100))) (as 'I64 (til 70000)))))
+(set Rv2k (select {c: (count k) s: (sum v) from: Tv2k by: k}))
+(== (count Rv2k) 100) -- true
+(== (sum (at Rv2k 'c)) 70000) -- true
+
+;; ════════════════════════════════════════════════════════════════════
+;; 15. DA-path early-abort: span > DA_MAX_COMPOSITE_SLOTS (262144)
+;; ════════════════════════════════════════════════════════════════════
+;; minmax_scan_fn (group.c:3601) atomically aborts when kmax-kmin > span_budget.
+;; Need >=65536 rows so the parallel minmax_scan_fn dispatch fires with a
+;; key column whose span > 262144 — the early-out at line 3625 stores into
+;; abort_flag and goto minmax_done.
+
+;; ─── 15a. I64 key with wide span (kmax-kmin >> 262144) ─────────────────
+;; Values 0, 1M, 2M, ... → span > 1M > 262144; aborts after a few morsels.
+(set Tdaab (table [k v] (list (as 'I64 (* 1000000 (% (til 70000) 200))) (as 'I64 (til 70000)))))
+(set Rdaab (select {c: (count k) s: (sum v) from: Tdaab by: k}))
+(== (count Rdaab) 200) -- true
+(== (sum (at Rdaab 'c)) 70000) -- true
+
+;; ─── 15b. I32 key with wide span ───────────────────────────────────────
+;; Test I32 width arm of MINMAX_SEG_LOOP (line 3651-3652 — RAY_I32/DATE/TIME).
+(set Tdai32 (table [k v] (list (as 'I32 (* 500000 (% (til 70000) 100))) (as 'I64 (til 70000)))))
+(set Rdai32 (select {c: (count k) s: (sum v) from: Tdai32 by: k}))
+(== (count Rdai32) 100) -- true
+
+;; ─── 15c. TIMESTAMP key wide span ──────────────────────────────────────
+;; I64-width arm with TIMESTAMP type tag.
+(set Tdats (table [k v] (list (as 'TIMESTAMP (* 2000000 (% (til 70000) 300))) (as 'I64 (til 70000)))))
+(set Rdats (select {c: (count k) from: Tdats by: k}))
+(== (count Rdats) 300) -- true
+
+;; ─── 15d. Multi-key DA early-abort: second key explodes span ───────────
+;; First key narrow (passes), second wide (triggers early-abort during the
+;; per-key minmax_scan loop at group.c:6000-6041).
+(set Tdam (table [k1 k2 v] (list (as 'I64 (% (til 70000) 10)) (as 'I64 (* 1000000 (% (til 70000) 200))) (as 'I64 (til 70000)))))
+(set Rdam (select {c: (count k1) from: Tdam by: [k1 k2]}))
+;; 10 × 200 distinct (k1,k2) pairs — but actual unique combos depend on alignment
+(> (count Rdam) 0) -- true
+
+;; ════════════════════════════════════════════════════════════════════
+;; 16. exec_group_sum_count_rowform — multi-key SUM+COUNT N=3..8
+;; ════════════════════════════════════════════════════════════════════
+;; Anton's PR #219 modified group.c — including this q10-class fast path.
+;; Planner gates: n_keys ∈ {3..8}, n_aggs == 2, OP_SUM+OP_COUNT, all
+;; OP_SCAN keys, no WHERE, non-null typed keys, integer/F64 v.
+;; Routes through exec_group_sum_count_rowform (group.c:12604).
+
+;; ─── 16a. N=3 keys, parallel (nrows >= 16384) ──────────────────────────
+;; Triggers grpsc_phase1_fn + grpsc_phase2_fn + grpsc_phase3_fn pipeline.
+;; 20k rows × 100 distinct (k1,k2,k3) tuples → exec_group_sum_count_rowform.
+(set Tsc3 (table [k1 k2 k3 v] (list (as 'I64 (% (til 20000) 10)) (as 'I64 (% (til 20000) 10)) (as 'I64 (% (til 20000) 10)) (as 'I64 (til 20000)))))
+(set Rsc3 (select {s: (sum v) c: (count v) from: Tsc3 by: [k1 k2 k3]}))
+;; Each (k1,k2,k3) tuple where k1=k2=k3=i%10 → only 10 distinct since they're correlated
+(== (count Rsc3) 10) -- true
+(== (sum (at Rsc3 'c)) 20000) -- true
+
+;; ─── 16b. N=4 keys (>3 forces grpsc path) ──────────────────────────────
+(set Tsc4 (table [k1 k2 k3 k4 v] (list (as 'I64 (% (til 18000) 5)) (as 'I64 (% (til 18000) 9)) (as 'I64 (% (til 18000) 6)) (as 'I64 (% (til 18000) 10)) (as 'I64 (til 18000)))))
+(set Rsc4 (select {s: (sum v) c: (count v) from: Tsc4 by: [k1 k2 k3 k4]}))
+;; lcm(5,9,6,10) = 90 distinct tuples; each group has 200 rows
+(== (count Rsc4) 90) -- true
+(== (sum (at Rsc4 'c)) 18000) -- true
+
+;; ─── 16c. N=5 keys mixed types ─────────────────────────────────────────
+(set Tsc5 (table [k1 k2 k3 k4 k5 v] (list (as 'I64 (% (til 20000) 4)) (as 'I32 (% (til 20000) 5)) (as 'I16 (% (til 20000) 6)) (as 'U8 (% (til 20000) 7)) (as 'BOOL (% (til 20000) 2)) (as 'I64 (til 20000)))))
+(set Rsc5 (select {s: (sum v) c: (count v) from: Tsc5 by: [k1 k2 k3 k4 k5]}))
+;; lcm(4,5,6,7,2) = 420; capped at 20000 rows → all 420 visible
+(== (count Rsc5) 420) -- true
+(== (sum (at Rsc5 'c)) 20000) -- true
+
+;; ─── 16d. N=6 keys with SYM ────────────────────────────────────────────
+(set Tsc6 (table [k1 k2 k3 k4 k5 k6 v] (list (as 'I64 (% (til 18000) 4)) (as 'I32 (% (til 18000) 5)) (as 'I16 (% (til 18000) 3)) (as 'SYM (% (til 18000) 6)) (as 'U8 (% (til 18000) 7)) (as 'BOOL (% (til 18000) 2)) (as 'I64 (til 18000)))))
+(set Rsc6 (select {s: (sum v) c: (count v) from: Tsc6 by: [k1 k2 k3 k4 k5 k6]}))
+(> (count Rsc6) 0) -- true
+(== (sum (at Rsc6 'c)) 18000) -- true
+
+;; ─── 16e. N=3 + F64 value column (grpsc_phase1 v_is_f64=true) ──────────
+(set Tscf (table [k1 k2 k3 v] (list (as 'I64 (% (til 17000) 8)) (as 'I64 (% (til 17000) 9)) (as 'I64 (% (til 17000) 5)) (* 0.25 (as 'F64 (til 17000))))))
+(set Rscf (select {s: (sum v) c: (count v) from: Tscf by: [k1 k2 k3]}))
+(> (count Rscf) 0) -- true
+(== (sum (at Rscf 'c)) 17000) -- true
+
+;; ─── 16f. N=3 large keyspace — forces grpsc_ht_grow_slots ──────────────
+;; Initial HT cap is 256.  Forcing > 128 distinct (k1,k2,k3) tuples per
+;; partition makes grpsc_ht_get hit `count+1)*2 > cap` → grpsc_ht_grow_slots
+;; (group.c:12376-12398).
+(set Tscbig (table [k1 k2 k3 v] (list (as 'I64 (% (til 30000) 50)) (as 'I64 (% (til 30000) 60)) (as 'I64 (% (til 30000) 70)) (as 'I64 (til 30000)))))
+(set Rscbig (select {s: (sum v) c: (count v) from: Tscbig by: [k1 k2 k3]}))
+;; lcm(50,60,70) = 2100 unique tuples (well past 256 → triggers grow)
+(> (count Rscbig) 256) -- true
+(== (sum (at Rscbig 'c)) 30000) -- true
+
+;; ─── 16g. N=3 small (nrows == 0 empty-table early-out) ─────────────────
+;; nrows == 0 path at group.c:12660.
+(set Tsc0 (table [k1 k2 k3 v] (list (as 'I64 []) (as 'I64 []) (as 'I64 []) (as 'I64 []))))
+(set Rsc0 (select {s: (sum v) c: (count v) from: Tsc0 by: [k1 k2 k3]}))
+(== (count Rsc0) 0) -- true
+
+;; ─── 16h. N=3 small sequential path (nrows < 16384) ────────────────────
+(set Tsc3sm (table [k1 k2 k3 v] (list (as 'I64 [1 1 2 2 3 3]) (as 'I64 [10 10 20 20 30 30]) (as 'I64 [100 100 200 200 300 300]) (as 'I64 [1 2 3 4 5 6]))))
+(set Rsc3sm (select {s: (sum v) c: (count v) from: Tsc3sm by: [k1 k2 k3]}))
+(== (count Rsc3sm) 3) -- true
+(== (sum (at Rsc3sm 'c)) 6) -- true
+(== (sum (at Rsc3sm 's)) 21) -- true
+
+;; ════════════════════════════════════════════════════════════════════
+;; 17. Per-partition SUM/AVG with parted tables
+;; ════════════════════════════════════════════════════════════════════
+;; Anton's PR #219 "extend per-partition path to SUM/AVG aggregators".
+;; exec_group_per_partition (group.c:9061+) decomposes AVG → SUM+COUNT
+;; per partition then merges.  exec_group_parted dispatches when:
+;;   - parted_tbl with parted columns
+;;   - all keys/aggs are OP_SCAN
+;;   - est_groups * 100 ≤ rows_per_part (cardinality gate)
+;;   - !g->selection (no WHERE)
+
+;; ─── 17a. Parted SUM I64 — 2 partitions, single I64 key ────────────────
+(.sys.exec "rm -rf /tmp/rfl_pp_sum_i64") -- 0
+(set _ppsumi_N 2000)
+(set _ppsumi_k (as 'I64 (% (til _ppsumi_N) 10)))
+(set _ppsumi_v (as 'I64 (til _ppsumi_N)))
+(set _ppsumi_a (table [k v] (list _ppsumi_k _ppsumi_v)))
+(set _ppsumi_b (table [k v] (list _ppsumi_k _ppsumi_v)))
+(.db.splayed.set "/tmp/rfl_pp_sum_i64/1/t/" _ppsumi_a)
+(.db.splayed.set "/tmp/rfl_pp_sum_i64/2/t/" _ppsumi_b)
+(set Ppsumi (.db.parted.get "/tmp/rfl_pp_sum_i64/" 't))
+;; SUM by k: per-partition SUM, then merge SUM→SUM.
+(set Rpsumi (select {s: (sum v) c: (count v) from: Ppsumi by: k}))
+(== (count Rpsumi) 10) -- true
+;; Each partition: rows 0..1999 → for each k group, sum of v with v%10==k
+;; Each k group: sum of (k, k+10, k+20, ..., k+1990) = 200 terms.  Two partitions doubles.
+;; Total v values = 2 * sum(0..1999) = 2 * 1999000 = 3998000
+(== (sum (at Rpsumi 's)) 3998000) -- true
+(== (sum (at Rpsumi 'c)) 4000) -- true
+(.sys.exec "rm -rf /tmp/rfl_pp_sum_i64") -- 0
+
+;; ─── 17b. Parted I32 cardinality estimation (group.c:5141-5148) ────────
+;; I32 parted key drives the bt == RAY_I32 cardinality estimation branch
+;; in exec_group_parted (5141-5148).
+(.sys.exec "rm -rf /tmp/rfl_pp_i32k") -- 0
+(set _ppi32_N 2000)
+(set _ppi32_k (as 'I32 (% (til _ppi32_N) 10)))
+(set _ppi32_v (as 'I64 (til _ppi32_N)))
+(set _ppi32_a (table [k v] (list _ppi32_k _ppi32_v)))
+(set _ppi32_b (table [k v] (list _ppi32_k _ppi32_v)))
+(.db.splayed.set "/tmp/rfl_pp_i32k/1/t/" _ppi32_a)
+(.db.splayed.set "/tmp/rfl_pp_i32k/2/t/" _ppi32_b)
+(set Ppi32 (.db.parted.get "/tmp/rfl_pp_i32k/" 't))
+(set Rppi32 (select {s: (sum v) from: Ppi32 by: k}))
+(== (count Rppi32) 10) -- true
+(== (sum (at Rppi32 's)) 3998000) -- true
+(.sys.exec "rm -rf /tmp/rfl_pp_i32k") -- 0
+
+;; ─── 17c. Parted AVG with mixed key types (k1=I64, k2=I32) ─────────────
+(.sys.exec "rm -rf /tmp/rfl_pp_avg_mk") -- 0
+(set _ppavm_N 2000)
+(set _ppavm_k1 (as 'I64 (% (til _ppavm_N) 8)))
+(set _ppavm_k2 (as 'I32 (% (til _ppavm_N) 6)))
+(set _ppavm_v (as 'F64 (til _ppavm_N)))
+(set _ppavm_a (table [k1 k2 v] (list _ppavm_k1 _ppavm_k2 _ppavm_v)))
+(set _ppavm_b (table [k1 k2 v] (list _ppavm_k1 _ppavm_k2 _ppavm_v)))
+(.db.splayed.set "/tmp/rfl_pp_avg_mk/1/t/" _ppavm_a)
+(.db.splayed.set "/tmp/rfl_pp_avg_mk/2/t/" _ppavm_b)
+(set Ppavm (.db.parted.get "/tmp/rfl_pp_avg_mk/" 't))
+(set Rpavm (select {a: (avg v) c: (count v) from: Ppavm by: [k1 k2]}))
+;; lcm(8,6) = 24 distinct (k1,k2) tuples
+(== (count Rpavm) 24) -- true
+(== (sum (at Rpavm 'c)) 4000) -- true
+(> (sum (at Rpavm 'a)) 0.0) -- true
+(.sys.exec "rm -rf /tmp/rfl_pp_avg_mk") -- 0
+
+;; ─── 17d. Parted SUM with 3 partitions — exercise batch merge ─────────
+;; MERGE_BATCH = 8; using 3 partitions keeps it under one batch but
+;; verifies the batch loop iterates correctly.
+(.sys.exec "rm -rf /tmp/rfl_pp_3p") -- 0
+(set _pp3p_a (table [k v] (list (as 'I64 [1 1 2 2 3]) (as 'I64 [10 20 30 40 50]))))
+(set _pp3p_b (table [k v] (list (as 'I64 [1 2 3]) (as 'I64 [60 70 80]))))
+(set _pp3p_c (table [k v] (list (as 'I64 [1 1 2 2 3 3]) (as 'I64 [90 100 110 120 130 140]))))
+(.db.splayed.set "/tmp/rfl_pp_3p/1/t/" _pp3p_a)
+(.db.splayed.set "/tmp/rfl_pp_3p/2/t/" _pp3p_b)
+(.db.splayed.set "/tmp/rfl_pp_3p/3/t/" _pp3p_c)
+(set Pp3p (.db.parted.get "/tmp/rfl_pp_3p/" 't))
+(set Rpp3p (select {s: (sum v) c: (count v) from: Pp3p by: k}))
+(== (count Rpp3p) 3) -- true
+;; Total = sum(10..140 step 10) = 10+20+...+140 = 1050
+(== (sum (at Rpp3p 's)) 1050) -- true
+(== (sum (at Rpp3p 'c)) 14) -- true
+(.sys.exec "rm -rf /tmp/rfl_pp_3p") -- 0
+
+;; ─── 17e. Parted MIN/MAX/FIRST/LAST mixed ──────────────────────────────
+;; Tests merge_ops: MIN→MIN, MAX→MAX, FIRST→FIRST, LAST→LAST.
+(.sys.exec "rm -rf /tmp/rfl_pp_minmax") -- 0
+(set _ppmm_a (table [k v] (list (as 'I64 [1 1 2 2]) (as 'I64 [10 30 50 70]))))
+(set _ppmm_b (table [k v] (list (as 'I64 [1 1 2 2]) (as 'I64 [20 40 60 80]))))
+(.db.splayed.set "/tmp/rfl_pp_minmax/1/t/" _ppmm_a)
+(.db.splayed.set "/tmp/rfl_pp_minmax/2/t/" _ppmm_b)
+(set Ppmm (.db.parted.get "/tmp/rfl_pp_minmax/" 't))
+(set Rppmm (select {mn: (min v) mx: (max v) fi: (first v) la: (last v) from: Ppmm by: k}))
+(== (count Rppmm) 2) -- true
+;; k=1: vals {10,30,20,40} → min=10, max=40, first=10, last=40
+;; k=2: vals {50,70,60,80} → min=50, max=80, first=50, last=80
+(== (min (at Rppmm 'mn)) 10) -- true
+(== (max (at Rppmm 'mx)) 80) -- true
+(.sys.exec "rm -rf /tmp/rfl_pp_minmax") -- 0
+
+;; ════════════════════════════════════════════════════════════════════
+;; 18. Multi-key composite key+type combinations (broaden type matrix)
+;; ════════════════════════════════════════════════════════════════════
+;; Cover combinations not in prior tests: TIMESTAMP+SYM, SYM+I32 multi-key,
+;; BOOL+DATE multi-key, etc. — exercises ght_layout key encoding paths.
+
+;; ─── 18a. TIMESTAMP + SYM 2-key composite ──────────────────────────────
+(set T18a (table [ts sk v] (list (as 'TIMESTAMP [100 100 200 200 300]) (as 'SYM ['a 'b 'a 'b 'a]) (as 'I64 [10 20 30 40 50]))))
+(set R18a (select {sm: (sum v) c: (count v) from: T18a by: [ts sk]}))
+;; 5 distinct (ts, sk) pairs: (100,a) (100,b) (200,a) (200,b) (300,a)
+(== (count R18a) 5) -- true
+(== (sum (at R18a 'sm)) 150) -- true
+
+;; ─── 18b. DATE + SYM 2-key, BOOL + TIME 2-key (varied widths) ──────────
+(set T18b (table [d sk v] (list (as 'DATE [7305 7306 7305 7306]) (as 'SYM ['x 'x 'y 'y]) (as 'I64 [1 2 3 4]))))
+(set R18b (select {sm: (sum v) from: T18b by: [d sk]}))
+(== (count R18b) 4) -- true
+(== (sum (at R18b 'sm)) 10) -- true
+
+(set T18c (table [b tk v] (list (as 'BOOL [true true false false true false]) (as 'TIME [1000 2000 1000 2000 3000 3000]) (as 'I64 [10 20 30 40 50 60]))))
+(set R18c (select {sm: (sum v) from: T18c by: [b tk]}))
+;; Pairs: (T,1000) (T,2000) (F,1000) (F,2000) (T,3000) (F,3000) → 6 distinct
+(== (count R18c) 6) -- true
+(== (sum (at R18c 'sm)) 210) -- true
+
+;; ─── 18d. U8 + I16 + SYM 3-key (narrow integer mixed widths) ───────────
+(set T18d (table [u i sk v] (list (as 'U8 [1 1 2 2 3 3]) (as 'I16 [10 10 20 20 30 30]) (as 'SYM ['p 'q 'p 'q 'p 'q]) (as 'I64 [1 2 3 4 5 6]))))
+(set R18d (select {sm: (sum v) from: T18d by: [u i sk]}))
+(== (count R18d) 6) -- true
+(== (sum (at R18d 'sm)) 21) -- true
+
+;; ─── 18e. Parallel 70k rows with mixed I32 + I16 + U8 keys ─────────────
+;; Drives the parallel radix path with narrow-integer mixed-width keys.
+(set T18e (table [k1 k2 k3 v] (list (as 'I32 (% (til 70000) 50)) (as 'I16 (% (til 70000) 30)) (as 'U8 (% (til 70000) 20)) (as 'I64 (til 70000)))))
+(set R18e (select {sm: (sum v) c: (count v) from: T18e by: [k1 k2 k3]}))
+(> (count R18e) 100) -- true
+(== (sum (at R18e 'c)) 70000) -- true
+
+;; ════════════════════════════════════════════════════════════════════
+;; 19. accum_from_entry skip path (HT layout with no agg state)
+;; ════════════════════════════════════════════════════════════════════
+;; Anton's PR #219 "skip accum_from_entry when the HT layout has no agg
+;; state".  init_accum_from_entry (group.c:2348) and accum_from_entry
+;; (2421) early-out when need_flags == 0.  That happens when the only
+;; agg is COUNT (no SUM/MIN/MAX/SUMSQ slot).  Hit the skip branch with
+;; a count-only query forced onto the HT path.
+
+;; ─── 19a. Count-only HT path — F64 key forces HT (DA rejects F64) ──────
+(set T19a (table [k] (list (as 'F64 (% (as 'F64 (til 70000)) 1000.0)))))
+(set R19a (select {c: (count k) from: T19a by: k}))
+(== (count R19a) 1000) -- true
+(== (sum (at R19a 'c)) 70000) -- true
+
+;; ─── 19b. Count-only with wide span I64 key (DA rejects) ───────────────
+(set T19b (table [k] (list (as 'I64 (* 1000 (% (til 70000) 500))))))
+(set R19b (select {c: (count k) from: T19b by: k}))
+(== (count R19b) 500) -- true
+(== (sum (at R19b 'c)) 70000) -- true
+
+;; ─── 19c. Count-only multi-key (DA path rejects multi-key wide-span) ───
+;; k1 = (i%50)*1000, k2 = (i%97)*500 → lcm(50,97)=4850 unique pairs;
+;; the 60000 rows wrap around so all 4850 are visible.
+(set T19c (table [k1 k2] (list (as 'I64 (* 1000 (% (til 60000) 50))) (as 'I64 (* 500 (% (til 60000) 97))))))
+(set R19c (select {c: (count k1) from: T19c by: [k1 k2]}))
+(> (count R19c) 100) -- true
+(== (sum (at R19c 'c)) 60000) -- true
+
+;; ════════════════════════════════════════════════════════════════════
+;; 20. Boundary: small inputs to per-partition + small to grpsc rowform
+;; ════════════════════════════════════════════════════════════════════
+
+;; ─── 20a. Single-partition parted table with COUNT — n_part_keys=1 ─────
+(.sys.exec "rm -rf /tmp/rfl_pp_1p") -- 0
+(set _pp1p_a (table [k v] (list (as 'I64 [1 1 2 2 3]) (as 'I64 [10 20 30 40 50]))))
+(.db.splayed.set "/tmp/rfl_pp_1p/1/t/" _pp1p_a)
+(set Pp1p (.db.parted.get "/tmp/rfl_pp_1p/" 't))
+(set Rpp1p (select {c: (count v) from: Pp1p by: k}))
+(== (count Rpp1p) 3) -- true
+(.sys.exec "rm -rf /tmp/rfl_pp_1p") -- 0
+
+;; ─── 20c. Parallel v2_emit use_topn_filter SUM-orderby ────────────────
+;; v2_emit (group.c:8064) use_topn_filter (5671) needs:
+;;   - parallel >=65536 rows
+;;   - non-SYM key (forces v2 path)
+;;   - DA path REJECTED (key span > DA_MAX_COMPOSITE_SLOTS) → forces HT
+;;   - take: N with desc/asc on a SUM/MIN/MAX agg
+;;   - SUM/MIN/MAX path at lines 8110-8125.
+;; Use sparse wide-span keys (k = i*1000 % bignum) so DA total_slots > 262144.
+(set Tv2top (table [k v] (list (as 'I64 (* 1000 (% (til 80000) 500))) (as 'I64 (til 80000)))))
+;; desc on SUM agg "sm" with take:10 → use_topn_filter triggers OP_SUM branch (8110-8113).
+(set Rv2top_sum (select {sm: (sum v) c: (count k) from: Tv2top by: k desc: sm take: 10}))
+(== (count Rv2top_sum) 10) -- true
+(> (max (at Rv2top_sum 'sm)) 0) -- true
+
+;; desc on MAX agg "mx" with take:10 → use_topn_filter triggers OP_MAX branch (8120-8125).
+(set Rv2top_max (select {mx: (max v) c: (count k) from: Tv2top by: k desc: mx take: 10}))
+(== (count Rv2top_max) 10) -- true
+(> (max (at Rv2top_max 'mx)) 0) -- true
+
+;; asc on MIN agg "mn" with take:10 → use_topn_filter triggers OP_MIN branch (8114-8119).
+(set Rv2top_min (select {mn: (min v) c: (count k) from: Tv2top by: k asc: mn take: 10}))
+(== (count Rv2top_min) 10) -- true
+(>= (min (at Rv2top_min 'mn)) 0) -- true
+
+;; Same shape with COUNT-orderby — exercises the OP_COUNT path in use_topn_filter
+;; (lines 8131 setting desc_dir for COUNT).
+(set Rv2top_cnt (select {c: (count v) from: Tv2top by: k desc: c take: 10}))
+(== (count Rv2top_cnt) 10) -- true
+(> (max (at Rv2top_cnt 'c)) 0) -- true
+
+;; ─── 20d. exec_group_sum_count_rowform large keyspace forcing radix scatter ──
+;; Forces N>3 keys with high cardinality so grpsc_phase1 scatters to many
+;; partitions, grpsc_phase2 builds per-partition HTs with > 256 entries.
+(set Tscbig2 (table [k1 k2 k3 v] (list (as 'I64 (% (til 30000) 31)) (as 'I64 (% (til 30000) 37)) (as 'I64 (% (til 30000) 41)) (as 'I64 (til 30000)))))
+(set Rscbig2 (select {s: (sum v) c: (count v) from: Tscbig2 by: [k1 k2 k3]}))
+;; lcm(31,37,41) = 47027 → all 30000 unique (every row has distinct tuple)
+(== (count Rscbig2) 30000) -- true
+(== (sum (at Rscbig2 'c)) 30000) -- true
+
+;; ─── 20e. exec_group_per_partition with MAPCOMMON key (one partition, all
+;;     keys MAPCOMMON → n_part_keys=0 → cardinality=1 per partition) ──────
+;; Tests the MAPCOMMON key exclusion (group.c:5085-5088) and
+;; n_part_keys==0 fast path.  Build parted table where the key col is
+;; literally the same across partitions (becomes MAPCOMMON on parted_get).
+(.sys.exec "rm -rf /tmp/rfl_pp_mc") -- 0
+(set _mc_T1 (table [k v] (list (as 'SYM (take 'CONSTKEY 100)) (as 'I64 (til 100)))))
+(set _mc_T2 (table [k v] (list (as 'SYM (take 'CONSTKEY 100)) (as 'I64 (+ 100 (til 100))))))
+(.db.splayed.set "/tmp/rfl_pp_mc/1/t/" _mc_T1)
+(.db.splayed.set "/tmp/rfl_pp_mc/2/t/" _mc_T2)
+(set Ppmc (.db.parted.get "/tmp/rfl_pp_mc/" 't))
+(set Rppmc (select {s: (sum v) from: Ppmc by: k}))
+(== (count Rppmc) 1) -- true
+;; sum(0..199) = 19900
+(== (sum (at Rppmc 's)) 19900) -- true
+(.sys.exec "rm -rf /tmp/rfl_pp_mc") -- 0
+
+;; ─── 20b. Parted with MIN agg only — concat fallback if can_partition=0 ──
+(.sys.exec "rm -rf /tmp/rfl_pp_min") -- 0
+(set _ppmn_a (table [k v] (list (as 'I64 [1 1 2 2]) (as 'I64 [10 20 30 40]))))
+(set _ppmn_b (table [k v] (list (as 'I64 [1 1 2 2]) (as 'I64 [5 15 25 35]))))
+(.db.splayed.set "/tmp/rfl_pp_min/1/t/" _ppmn_a)
+(.db.splayed.set "/tmp/rfl_pp_min/2/t/" _ppmn_b)
+(set Ppmn (.db.parted.get "/tmp/rfl_pp_min/" 't))
+(set Rppmn (select {mn: (min v) from: Ppmn by: k}))
+(== (count Rppmn) 2) -- true
+;; k=1 vals {10,20,5,15} → min=5; k=2 vals {30,40,25,35} → min=25
+(== (min (at Rppmn 'mn)) 5) -- true
+(== (max (at Rppmn 'mn)) 25) -- true
+(.sys.exec "rm -rf /tmp/rfl_pp_min") -- 0

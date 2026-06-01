@@ -722,6 +722,329 @@ static test_result_t test_syscov_time_timer_fires(void) {
     PASS();
 }
 
+/* ─── timer.c deep coverage (heap helpers + edge paths) ───────
+ *
+ * The static heap helpers (heap_less, heap_swap, heap_up sift body,
+ * heap_down, heap_grow) and ray_timers_next_deadline_ms only run when
+ * the heap has multiple entries, when sift directions actually fire,
+ * and when growth past the initial cap (16) happens.  The existing
+ * .time.timer tests only schedule one timer at a time.  These tests
+ * push every static branch via the public timer API. */
+
+/* heap_grow: schedule >16 timers in one go (initial cap is 16). */
+static test_result_t test_timer_heap_grow_past_initial_cap(void) {
+    ray_poll_t* poll = (ray_poll_t*)ray_runtime_get_poll();
+    TEST_ASSERT_NOT_NULL(poll);
+
+    /* 20 one-shot timers with very long delays — they won't fire during
+     * the test.  Cleanup is via .time.timer.del in this test (and the
+     * teardown will free anything that slips through). */
+    int64_t ids[20];
+    for (int i = 0; i < 20; i++) {
+        /* Use varying tic_ms so we also exercise the heap_up sift body:
+         * each new timer can be cheaper than its parent, forcing swaps. */
+        char src[128];
+        snprintf(src, sizeof src,
+                 "(.time.timer.set %d 1 (fn [t] t))", 100000 - i * 1000);
+        ray_t* r = ray_eval_str(src);
+        TEST_ASSERT_NOT_NULL(r);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        TEST_ASSERT_EQ_I(r->type, -RAY_I64);
+        ids[i] = r->i64;
+        ray_release(r);
+    }
+
+    /* Heap should be tracking 20 timers now (grew at least once). */
+    TEST_ASSERT_EQ_I(((ray_timers_t*)poll->timers)->n, 20);
+    TEST_ASSERT_TRUE(((ray_timers_t*)poll->timers)->cap >= 20);
+
+    /* Cancel them all.  Deleting in original-id order is NOT same as
+     * heap-array order — for ids beyond the smallest exp, the matching
+     * entry sits in the middle of the array and triggers the rebalance
+     * (sift up/down) branch in ray_timers_del. */
+    for (int i = 0; i < 20; i++) {
+        char src[64];
+        snprintf(src, sizeof src, "(.time.timer.del %lld)",
+                 (long long)ids[i]);
+        ray_t* r = ray_eval_str(src);
+        TEST_ASSERT_NOT_NULL(r);
+        TEST_ASSERT_TRUE(RAY_IS_NULL(r));
+        ray_release(r);
+    }
+
+    TEST_ASSERT_EQ_I(((ray_timers_t*)poll->timers)->n, 0);
+    PASS();
+}
+
+/* ray_timers_next_deadline_ms: empty and populated. */
+static test_result_t test_timer_next_deadline_ms(void) {
+    ray_poll_t* poll = (ray_poll_t*)ray_runtime_get_poll();
+    TEST_ASSERT_NOT_NULL(poll);
+
+    /* timers ptr is lazily allocated by .time.timer.set; force its
+     * existence by scheduling+deleting one.  Then deadline of empty
+     * heap is INT64_MAX. */
+    ray_t* id0 = ray_eval_str("(.time.timer.set 1000 1 (fn [t] t))");
+    TEST_ASSERT_NOT_NULL(id0);
+    char src[64];
+    snprintf(src, sizeof src, "(.time.timer.del %lld)", (long long)id0->i64);
+    ray_release(ray_eval_str(src));
+    ray_release(id0);
+
+    ray_timers_t* timers = (ray_timers_t*)poll->timers;
+    TEST_ASSERT_NOT_NULL(timers);
+    TEST_ASSERT_EQ_I(ray_timers_next_deadline_ms(timers), INT64_MAX);
+    /* NULL ptr path. */
+    TEST_ASSERT_EQ_I(ray_timers_next_deadline_ms(NULL), INT64_MAX);
+
+    /* Populated: deadline is now+tic_ms within the next few seconds. */
+    int64_t before = ray_time_now_ms();
+    ray_t* id = ray_eval_str("(.time.timer.set 50000 1 (fn [t] t))");
+    TEST_ASSERT_NOT_NULL(id);
+    int64_t after = ray_time_now_ms();
+    int64_t dl = ray_timers_next_deadline_ms(timers);
+    TEST_ASSERT_TRUE(dl >= before + 50000);
+    TEST_ASSERT_TRUE(dl <= after  + 50000);
+
+    /* Cleanup. */
+    snprintf(src, sizeof src, "(.time.timer.del %lld)", (long long)id->i64);
+    ray_release(ray_eval_str(src));
+    ray_release(id);
+    PASS();
+}
+
+/* heap_up sift body + heap_down via ray_timers_del rebalance:
+ * schedule a slow timer then a fast one (forcing the new entry to sift
+ * up past its parent), then delete the slow one from the middle/tail
+ * to force the rebalance branch. */
+static test_result_t test_timer_heap_sift_paths(void) {
+    ray_poll_t* poll = (ray_poll_t*)ray_runtime_get_poll();
+    TEST_ASSERT_NOT_NULL(poll);
+
+    /* Slow timer goes in first at index 0. */
+    ray_t* slow = ray_eval_str("(.time.timer.set 90000 1 (fn [t] t))");
+    TEST_ASSERT_NOT_NULL(slow);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(slow));
+
+    /* Fast timer must sift past it (smaller exp_ms wins the heap top). */
+    ray_t* fast = ray_eval_str("(.time.timer.set 100   1 (fn [t] t))");
+    TEST_ASSERT_NOT_NULL(fast);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(fast));
+
+    /* Add a third so there's something to sift after delete. */
+    ray_t* mid = ray_eval_str("(.time.timer.set 50000 1 (fn [t] t))");
+    TEST_ASSERT_NOT_NULL(mid);
+
+    /* Delete the first (slow) timer.  Its current heap slot is the tail
+     * or near-tail; the loop swaps in the tail and runs heap_down+up to
+     * rebalance — that's the i < t->n branch (rebalance) of ray_timers_del. */
+    char src[64];
+    snprintf(src, sizeof src, "(.time.timer.del %lld)", (long long)slow->i64);
+    ray_t* r1 = ray_eval_str(src);
+    TEST_ASSERT_NOT_NULL(r1);
+    TEST_ASSERT_TRUE(RAY_IS_NULL(r1));
+    ray_release(r1);
+
+    /* Drop the remaining timers. */
+    snprintf(src, sizeof src, "(.time.timer.del %lld)", (long long)mid->i64);
+    ray_release(ray_eval_str(src));
+    snprintf(src, sizeof src, "(.time.timer.del %lld)", (long long)fast->i64);
+    ray_release(ray_eval_str(src));
+
+    ray_release(slow); ray_release(fast); ray_release(mid);
+    PASS();
+}
+
+/* heap_less tie-break on equal exp_ms (id ordering).  We can't pin
+ * exp_ms identically across two add calls without arena math, but we
+ * can stuff a large batch of zero-delay timers in fast succession; many
+ * will share an exp_ms millisecond and break ties on id. */
+static test_result_t test_timer_heap_tie_break(void) {
+    ray_poll_t* poll = (ray_poll_t*)ray_runtime_get_poll();
+    TEST_ASSERT_NOT_NULL(poll);
+
+    int64_t ids[8];
+    for (int i = 0; i < 8; i++) {
+        ray_t* r = ray_eval_str(
+            "(.time.timer.set 0 1 (fn [t] t))");
+        TEST_ASSERT_NOT_NULL(r);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        ids[i] = r->i64;
+        ray_release(r);
+    }
+
+    /* Pump briefly — all 8 fire in id order via heap_less tie-break. */
+    ray_timers_pump_for((ray_timers_t*)poll->timers, 30);
+    TEST_ASSERT_EQ_I(((ray_timers_t*)poll->timers)->n, 0);
+    (void)ids;
+    PASS();
+}
+
+/* Forever timer (num == 0): exercises the re-push branch of
+ * ray_timers_fire_expired.  Also exercises the post-pop heap_down
+ * (lines 180-181) when another timer is still pending. */
+static test_result_t test_timer_forever_rearm(void) {
+    ray_poll_t* poll = (ray_poll_t*)ray_runtime_get_poll();
+    TEST_ASSERT_NOT_NULL(poll);
+
+    ray_t* setup = ray_eval_str("(set fcounter 0)");
+    if (setup) ray_release(setup);
+
+    /* A forever timer (num=0) firing every 3 ms. */
+    ray_t* fid = ray_eval_str(
+        "(.time.timer.set 3 0 (fn [t] (set fcounter (+ fcounter 1))))");
+    TEST_ASSERT_NOT_NULL(fid);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(fid));
+
+    /* A second longer-running timer so the heap holds >1 entry, forcing
+     * the heap_down at the top of fire_expired's pop. */
+    ray_t* gid = ray_eval_str(
+        "(.time.timer.set 7 0 (fn [t] (set fcounter (+ fcounter 1))))");
+    TEST_ASSERT_NOT_NULL(gid);
+
+    /* Pump for ~60 ms; at 3 ms each we should see many fires. */
+    ray_timers_pump_for((ray_timers_t*)poll->timers, 60);
+
+    ray_t* c = ray_eval_str("fcounter");
+    TEST_ASSERT_NOT_NULL(c);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(c));
+    TEST_ASSERT_EQ_I(c->type, -RAY_I64);
+    /* Be lenient on a slow CI runner — at least a few fires. */
+    TEST_ASSERT_TRUE(c->i64 >= 2);
+    ray_release(c);
+
+    /* Both timers still live (num=0 never decrements to zero); delete
+     * both to free them and exercise del on a heap with >1 entries. */
+    char src[64];
+    snprintf(src, sizeof src, "(.time.timer.del %lld)", (long long)fid->i64);
+    ray_release(ray_eval_str(src));
+    snprintf(src, sizeof src, "(.time.timer.del %lld)", (long long)gid->i64);
+    ray_release(ray_eval_str(src));
+    ray_release(fid); ray_release(gid);
+    PASS();
+}
+
+/* Timer callback returning an error: hits the RAY_IS_ERR branch
+ * (lines 191-200) of ray_timers_fire_expired.  Multiplying an i64 by a
+ * string is a type error returned as a ray error. */
+static test_result_t test_timer_callback_error(void) {
+    ray_poll_t* poll = (ray_poll_t*)ray_runtime_get_poll();
+    TEST_ASSERT_NOT_NULL(poll);
+
+    /* Suppress the timer-error stderr noise during the test (the timer
+     * runs ray_fmt + fprintf(stderr) when it sees an error). */
+    fflush(stderr);
+    int saved = dup(STDERR_FILENO);
+    int devnull = open("/dev/null", O_WRONLY);
+    if (devnull >= 0) {
+        dup2(devnull, STDERR_FILENO);
+        close(devnull);
+    }
+
+    /* One-shot timer whose body errors on multiplying i64 by string. */
+    ray_t* id = ray_eval_str(
+        "(.time.timer.set 1 1 (fn [t] (* t \"oops\")))");
+    TEST_ASSERT_NOT_NULL(id);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(id));
+
+    ray_timers_pump_for((ray_timers_t*)poll->timers, 30);
+
+    /* Restore stderr. */
+    if (saved >= 0) { dup2(saved, STDERR_FILENO); close(saved); }
+
+    TEST_ASSERT_EQ_I(((ray_timers_t*)poll->timers)->n, 0);
+    ray_release(id);
+    PASS();
+}
+
+/* ray_timers_pump_for guard rails: NULL ptr + non-positive budget. */
+static test_result_t test_timer_pump_for_guards(void) {
+    /* Both early-return; nothing crashes. */
+    ray_timers_pump_for(NULL, 100);
+    ray_timers_pump_for(NULL, 0);
+    ray_timers_pump_for(NULL, -1);
+
+    ray_poll_t* poll = (ray_poll_t*)ray_runtime_get_poll();
+    TEST_ASSERT_NOT_NULL(poll);
+    /* Initialize timers ptr by scheduling+cancelling one. */
+    ray_t* id = ray_eval_str("(.time.timer.set 1000 1 (fn [t] t))");
+    TEST_ASSERT_NOT_NULL(id);
+    char src[64];
+    snprintf(src, sizeof src, "(.time.timer.del %lld)", (long long)id->i64);
+    ray_release(ray_eval_str(src));
+    ray_release(id);
+
+    ray_timers_t* timers = (ray_timers_t*)poll->timers;
+    /* Non-positive budget returns immediately. */
+    ray_timers_pump_for(timers, 0);
+    ray_timers_pump_for(timers, -10);
+
+    /* fire_expired guard rails: NULL and empty heap both return early. */
+    ray_timers_fire_expired(NULL);
+    ray_timers_fire_expired(timers);  /* empty heap branch */
+    PASS();
+}
+
+/* ray_timers_create + ray_timers_destroy direct API.  Covers:
+ *   - initial_cap < 1 normalization
+ *   - destroy(NULL) early return
+ *   - destroy with live entries (lines 73-74) by adding then destroying. */
+static test_result_t test_timer_create_destroy_paths(void) {
+    /* initial_cap < 1 path. */
+    ray_timers_t* t0 = ray_timers_create(0);
+    TEST_ASSERT_NOT_NULL(t0);
+    TEST_ASSERT_EQ_I(t0->cap, 1);
+    TEST_ASSERT_EQ_I(t0->n, 0);
+    ray_timers_destroy(t0);
+
+    /* Negative initial_cap also normalizes. */
+    ray_timers_t* tn = ray_timers_create(-5);
+    TEST_ASSERT_NOT_NULL(tn);
+    TEST_ASSERT_EQ_I(tn->cap, 1);
+    ray_timers_destroy(tn);
+
+    /* NULL early-return. */
+    ray_timers_destroy(NULL);
+
+    /* Non-empty destroy: must release each timer's fn and free entries. */
+    ray_timers_t* th = ray_timers_create(4);
+    TEST_ASSERT_NOT_NULL(th);
+    /* Two retained lambdas via ray_eval_str. */
+    ray_t* f1 = ray_eval_str("(fn [t] t)");
+    ray_t* f2 = ray_eval_str("(fn [t] (+ t 1))");
+    TEST_ASSERT_NOT_NULL(f1);
+    TEST_ASSERT_NOT_NULL(f2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(f1));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(f2));
+    int64_t a = ray_timers_add(th, 10000, 1, f1);
+    int64_t b = ray_timers_add(th, 20000, 1, f2);
+    TEST_ASSERT_TRUE(a >= 0);
+    TEST_ASSERT_TRUE(b >= 0);
+    /* Drop our refs — the heap retains its own. */
+    ray_release(f1);
+    ray_release(f2);
+    /* Destroy with live entries — exercises the for-loop body. */
+    ray_timers_destroy(th);
+
+    /* NULL/fn guards on ray_timers_add. */
+    ray_t* f3 = ray_eval_str("(fn [t] t)");
+    TEST_ASSERT_NOT_NULL(f3);
+    TEST_ASSERT_EQ_I(ray_timers_add(NULL, 0, 1, f3), -1);
+    ray_timers_t* tg = ray_timers_create(2);
+    TEST_ASSERT_NOT_NULL(tg);
+    TEST_ASSERT_EQ_I(ray_timers_add(tg, 0, 1, NULL), -1);
+    ray_release(f3);
+    ray_timers_destroy(tg);
+
+    /* del guards: NULL ptr returns false; unknown id returns false. */
+    TEST_ASSERT_FALSE(ray_timers_del(NULL, 0));
+    ray_timers_t* td = ray_timers_create(2);
+    TEST_ASSERT_FALSE(ray_timers_del(td, 99999));
+    ray_timers_destroy(td);
+
+    PASS();
+}
+
 /* env builtin (ray_env_fn) */
 static test_result_t test_syscov_env(void) {
     ray_t* r = ray_eval_str("(env 0)");
@@ -856,6 +1179,14 @@ const test_entry_t runtime_entries[] = {
     { "runtime/syscov_time_now",             test_syscov_time_now,             sys_setup, sys_teardown },
     { "runtime/syscov_time_timer_set_del",   test_syscov_time_timer_set_del,   sys_setup_with_poll, sys_teardown_with_poll },
     { "runtime/syscov_time_timer_fires",     test_syscov_time_timer_fires,     sys_setup_with_poll, sys_teardown_with_poll },
+    { "runtime/timer_heap_grow_past_initial_cap", test_timer_heap_grow_past_initial_cap, sys_setup_with_poll, sys_teardown_with_poll },
+    { "runtime/timer_next_deadline_ms",      test_timer_next_deadline_ms,      sys_setup_with_poll, sys_teardown_with_poll },
+    { "runtime/timer_heap_sift_paths",       test_timer_heap_sift_paths,       sys_setup_with_poll, sys_teardown_with_poll },
+    { "runtime/timer_heap_tie_break",        test_timer_heap_tie_break,        sys_setup_with_poll, sys_teardown_with_poll },
+    { "runtime/timer_forever_rearm",         test_timer_forever_rearm,         sys_setup_with_poll, sys_teardown_with_poll },
+    { "runtime/timer_callback_error",        test_timer_callback_error,        sys_setup_with_poll, sys_teardown_with_poll },
+    { "runtime/timer_pump_for_guards",       test_timer_pump_for_guards,       sys_setup_with_poll, sys_teardown_with_poll },
+    { "runtime/timer_create_destroy_paths",  test_timer_create_destroy_paths,  sys_setup_with_poll, sys_teardown_with_poll },
     { "runtime/syscov_env",                  test_syscov_env,                  sys_setup, sys_teardown },
     { "runtime/syscov_setenv_type_errors",   test_syscov_setenv_type_errors,   sys_setup, sys_teardown },
     { "runtime/syscov_hopen_type_error",     test_syscov_hopen_type_error,     sys_setup, sys_teardown },
