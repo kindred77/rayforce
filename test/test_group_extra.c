@@ -46,6 +46,7 @@
 #include "mem/heap.h"
 #include "ops/ops.h"
 #include "ops/internal.h"
+#include "ops/hll.h"
 #include "table/sym.h"
 #include <math.h>
 #include <string.h>
@@ -1258,6 +1259,75 @@ static test_result_t test_five_key_group_top_count_emit_filter(void) {
 }
 
 /* --------------------------------------------------------------------------
+ * Test 18: streaming per-group HLL — single-pass kernel
+ *
+ * Direct call to ray_count_distinct_approx_pg_stream with a small-group,
+ * large-row layout that gates into the streaming path: each worker owns
+ * a private bank of n_groups sketches and the kernel skips the
+ * (idx_buf + offsets + counts) CSR scatter that the buf-form entry point
+ * pays for upstream.
+ *
+ * Layout: n_rows = 2 M, n_groups = 100, val = i % 1000 within each group.
+ * Each row's gid = i % 100, val = (i / 100) % 1000.  Per-group distinct
+ * count is exactly 1000 (val cycles through 0..999 across 20000 rows per
+ * group, covering every value at least once).  HLL has ~0.8 % std error
+ * at P=14 → we accept estimates within 5 % to leave slack for the small-
+ * cardinality bias-correction tail.
+ *
+ * Verifies (a) the path returns a populated I64 output, (b) per-group
+ * counts are within 5 % of 1000, (c) no oom / dispatch failure.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_count_distinct_pg_stream(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    const int64_t NROWS = 2 * 1024 * 1024;   /* > 1 M HLL gate */
+    const int64_t NGROUPS = 100;             /* fits 8 MB-per-worker budget */
+    const int64_t DISTINCT_PER_GROUP = 1000;
+
+    ray_t* vec = ray_vec_new(RAY_I64, NROWS);
+    TEST_ASSERT_NOT_NULL(vec);
+    vec->len = NROWS;
+    int64_t* p = (int64_t*)ray_data(vec);
+    for (int64_t i = 0; i < NROWS; i++) p[i] = (i / NGROUPS) % DISTINCT_PER_GROUP;
+
+    ray_t* gids = ray_vec_new(RAY_I64, NROWS);
+    TEST_ASSERT_NOT_NULL(gids);
+    gids->len = NROWS;
+    int64_t* gp = (int64_t*)ray_data(gids);
+    for (int64_t i = 0; i < NROWS; i++) gp[i] = i % NGROUPS;
+
+    ray_t* out = ray_vec_new(RAY_I64, NGROUPS);
+    TEST_ASSERT_NOT_NULL(out);
+    out->len = NGROUPS;
+    int64_t* od = (int64_t*)ray_data(out);
+    memset(od, 0, (size_t)NGROUPS * sizeof(int64_t));
+
+    int rc = ray_count_distinct_approx_pg_stream(vec, gp, NROWS, NGROUPS,
+                                                  RAY_HLL_DEFAULT_P, od);
+    TEST_ASSERT_FMT(rc == 0, "stream returned %d", rc);
+
+    /* Each group has exactly 1000 distinct values.  Accept ±5 % drift
+     * (real HLL std error is ~0.8 % at P=14; the wider band covers the
+     * small-range bias-correction tail and the per-worker merge slop). */
+    for (int64_t g = 0; g < NGROUPS; g++) {
+        double err = fabs((double)od[g] - (double)DISTINCT_PER_GROUP) /
+                     (double)DISTINCT_PER_GROUP;
+        TEST_ASSERT_FMT(err <= 0.05,
+                        "group %lld: got %lld, expected ~%lld (err=%.3f)",
+                        (long long)g, (long long)od[g],
+                        (long long)DISTINCT_PER_GROUP, err);
+    }
+
+    ray_release(out);
+    ray_release(gids);
+    ray_release(vec);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
  * Test registry
  * -------------------------------------------------------------------------- */
 
@@ -1279,5 +1349,6 @@ const test_entry_t group_extra_entries[] = {
     { "group_extra/i16_group_top_count_emit_filter", test_i16_group_top_count_emit_filter, NULL, NULL },
     { "group_extra/sym_group_top_count_emit_filter", test_sym_group_top_count_emit_filter, NULL, NULL },
     { "group_extra/five_key_group_top_count_emit_filter", test_five_key_group_top_count_emit_filter, NULL, NULL },
+    { "group_extra/count_distinct_pg_stream",      test_count_distinct_pg_stream,      NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
