@@ -471,6 +471,26 @@ static test_result_t test_syscov_return(void) {
     PASS();
 }
 
+/* runtime sys_args storage: set/get round-trips, destroy releases it */
+static test_result_t test_sys_args_storage(void) {
+    /* unset → NULL */
+    TEST_ASSERT_NULL(ray_runtime_get_sys_args());
+
+    /* build a tiny dict, store it, read it back (same pointer) */
+    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 1);
+    int64_t s = ray_sym_intern("k", 1);
+    keys = ray_vec_append(keys, &s);
+    ray_t* vals = ray_list_new(1);
+    ray_t* one = ray_i64(1);
+    vals = ray_list_append(vals, one); ray_release(one);
+    ray_t* d = ray_dict_new(keys, vals);
+
+    ray_runtime_set_sys_args(d);                 /* runtime takes ownership */
+    TEST_ASSERT_EQ_PTR(ray_runtime_get_sys_args(), d);
+    /* teardown (ray_runtime_destroy) must release it without leaking */
+    PASS();
+}
+
 /* args builtin (ray_args_fn) */
 static test_result_t test_syscov_args(void) {
     /* (args) returns an empty list */
@@ -699,6 +719,7 @@ const test_entry_t runtime_entries[] = {
     { "runtime/syscov_eval_builtin",         test_syscov_eval_builtin,         sys_setup, sys_teardown },
     { "runtime/syscov_quote",                test_syscov_quote,                sys_setup, sys_teardown },
     { "runtime/syscov_return",               test_syscov_return,               sys_setup, sys_teardown },
+    { "runtime/sys_args_storage",            test_sys_args_storage,            sys_setup, sys_teardown },
     { "runtime/syscov_args",                 test_syscov_args,                 sys_setup, sys_teardown },
     { "runtime/syscov_rc",                   test_syscov_rc,                   sys_setup, sys_teardown },
     { "runtime/syscov_time_now",             test_syscov_time_now,             sys_setup, sys_teardown },
