@@ -491,6 +491,116 @@ static test_result_t test_sys_args_storage(void) {
     PASS();
 }
 
+/* helper: fetch a top-level value from a built args dict (owned) */
+static ray_t* args_top(ray_t* d, const char* name) {
+    ray_t* k = ray_sym(ray_sym_intern(name, strlen(name)));
+    ray_t* v = ray_dict_get(d, k);
+    ray_release(k);
+    return v;
+}
+
+static test_result_t test_build_sys_args_defaults(void) {
+    char* argv[] = { "rayforce" };
+    ray_t* d = ray_build_sys_args(1, argv);
+    TEST_ASSERT_NOT_NULL(d);
+    TEST_ASSERT_EQ_I(d->type, RAY_DICT);
+
+    ray_t* port = args_top(d, "port");
+    TEST_ASSERT_EQ_I(port->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(port->i64, 0);
+    ray_release(port);
+
+    ray_t* cores = args_top(d, "cores");
+    TEST_ASSERT_EQ_I(cores->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(cores->i64, 0);
+    ray_release(cores);
+
+    ray_t* timeit = args_top(d, "timeit");
+    TEST_ASSERT_EQ_I(timeit->type, -RAY_BOOL);
+    TEST_ASSERT_EQ_I(timeit->b8, 0);
+    ray_release(timeit);
+
+    ray_t* file = args_top(d, "file");
+    TEST_ASSERT_EQ_I(file->type, -RAY_STR);
+    TEST_ASSERT_EQ_I(ray_str_len(file), 0);
+    ray_release(file);
+
+    ray_t* user = args_top(d, "user");
+    TEST_ASSERT_EQ_I(user->type, RAY_DICT);
+    TEST_ASSERT_EQ_I(ray_dict_len(user), 0);
+    ray_release(user);
+
+    ray_release(d);
+    PASS();
+}
+
+static test_result_t test_build_sys_args_flags_and_user(void) {
+    char* argv[] = { "rayforce", "-p", "5000", "-c", "4", "-i",
+                     "--", "-opt", "123", "--verbose", "--name", "ray" };
+    ray_t* d = ray_build_sys_args(12, argv);
+
+    ray_t* port = args_top(d, "port");
+    TEST_ASSERT_EQ_I(port->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(port->i64, 5000);
+    ray_release(port);
+
+    ray_t* cores = args_top(d, "cores");
+    TEST_ASSERT_EQ_I(cores->i64, 4);
+    ray_release(cores);
+
+    ray_t* inter = args_top(d, "interactive");
+    TEST_ASSERT_EQ_I(inter->type, -RAY_BOOL);
+    TEST_ASSERT_EQ_I(inter->b8, 1);
+    ray_release(inter);
+
+    ray_t* user = args_top(d, "user");
+    TEST_ASSERT_EQ_I(user->type, RAY_DICT);
+    TEST_ASSERT_EQ_I(ray_dict_len(user), 3);     /* opt, verbose, name */
+
+    ray_t* ko = ray_sym(ray_sym_intern("opt", 3));
+    ray_t* vo = ray_dict_get(user, ko);
+    TEST_ASSERT_EQ_I(vo->type, -RAY_STR);
+    TEST_ASSERT_EQ_I(strcmp(ray_str_ptr(vo), "123"), 0);
+    ray_release(vo); ray_release(ko);
+
+    ray_t* kv = ray_sym(ray_sym_intern("verbose", 7));
+    ray_t* vv = ray_dict_get(user, kv);
+    TEST_ASSERT_EQ_I(vv->type, -RAY_STR);
+    TEST_ASSERT_EQ_I(ray_str_len(vv), 0);         /* bare flag → "" */
+    ray_release(vv); ray_release(kv);
+
+    ray_release(user);
+    ray_release(d);
+    PASS();
+}
+
+static test_result_t test_build_sys_args_edges(void) {
+    /* adjacent flags, dup key (last wins), no auth leakage */
+    char* argv[] = { "rayforce", "-u", "secret",
+                     "--", "-a", "-b", "-k", "v1", "-k", "v2" };
+    ray_t* d = ray_build_sys_args(10, argv);
+
+    ray_t* auth = args_top(d, "auth");
+    TEST_ASSERT_NULL(auth);
+
+    ray_t* user = args_top(d, "user");
+    TEST_ASSERT_EQ_I(ray_dict_len(user), 3);      /* a, b, k */
+
+    ray_t* ka = ray_sym(ray_sym_intern("a", 1));
+    ray_t* va = ray_dict_get(user, ka);
+    TEST_ASSERT_EQ_I(ray_str_len(va), 0);          /* -a -b → a:"" */
+    ray_release(va); ray_release(ka);
+
+    ray_t* kk = ray_sym(ray_sym_intern("k", 1));
+    ray_t* vk = ray_dict_get(user, kk);
+    TEST_ASSERT_EQ_I(strcmp(ray_str_ptr(vk), "v2"), 0);  /* last wins */
+    ray_release(vk); ray_release(kk);
+
+    ray_release(user);
+    ray_release(d);
+    PASS();
+}
+
 /* args builtin (ray_args_fn) */
 static test_result_t test_syscov_args(void) {
     /* (args) returns an empty list */
@@ -720,6 +830,9 @@ const test_entry_t runtime_entries[] = {
     { "runtime/syscov_quote",                test_syscov_quote,                sys_setup, sys_teardown },
     { "runtime/syscov_return",               test_syscov_return,               sys_setup, sys_teardown },
     { "runtime/sys_args_storage",            test_sys_args_storage,            sys_setup, sys_teardown },
+    { "runtime/build_sys_args_defaults",     test_build_sys_args_defaults,     sys_setup, sys_teardown },
+    { "runtime/build_sys_args_flags_user",   test_build_sys_args_flags_and_user, sys_setup, sys_teardown },
+    { "runtime/build_sys_args_edges",        test_build_sys_args_edges,        sys_setup, sys_teardown },
     { "runtime/syscov_args",                 test_syscov_args,                 sys_setup, sys_teardown },
     { "runtime/syscov_rc",                   test_syscov_rc,                   sys_setup, sys_teardown },
     { "runtime/syscov_time_now",             test_syscov_time_now,             sys_setup, sys_teardown },
