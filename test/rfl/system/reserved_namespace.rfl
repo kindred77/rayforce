@@ -20,8 +20,8 @@
 (type .os) -- 'DICT
 (type .ipc) -- 'DICT
 (type .csv) -- 'DICT
-(count .sys) -- 9
-;; gc, exec, build, mem, info, cmd, timeit, listen, env
+(count .sys) -- 10
+;; gc, exec, build, mem, info, cmd, timeit, listen, env, args
 (count .os) -- 4
 ;; getenv, setenv, size, list
 (count .ipc) -- 4

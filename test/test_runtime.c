@@ -601,6 +601,35 @@ static test_result_t test_build_sys_args_edges(void) {
     PASS();
 }
 
+/* .sys.args builtin: empty when unset; reflects stored dict when set */
+static test_result_t test_sys_args_builtin(void) {
+    /* unset → empty dict, never NULL */
+    ray_t* e = ray_eval_str("(.sys.args)");
+    TEST_ASSERT_NOT_NULL(e);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(e));
+    TEST_ASSERT_EQ_I(e->type, RAY_DICT);
+    TEST_ASSERT_EQ_I(ray_dict_len(e), 0);
+    ray_release(e);
+
+    /* set, then read back through the builtin */
+    char* argv[] = { "rayforce", "-p", "5000", "--", "-opt", "123" };
+    ray_runtime_set_sys_args(ray_build_sys_args(6, argv));
+
+    ray_t* d = ray_eval_str("(.sys.args)");
+    TEST_ASSERT_NOT_NULL(d);
+    TEST_ASSERT_EQ_I(d->type, RAY_DICT);
+    ray_t* pk = ray_sym(ray_sym_intern("port", 4));
+    ray_t* pv = ray_dict_get(d, pk);
+    TEST_ASSERT_EQ_I(pv->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(pv->i64, 5000);
+    ray_release(pv); ray_release(pk);
+    ray_release(d);
+
+    /* arity error */
+    TEST_ASSERT_TRUE(eval_err("(.sys.args 0)", "domain"));
+    PASS();
+}
+
 /* args builtin (ray_args_fn) */
 static test_result_t test_syscov_args(void) {
     /* (args) returns an empty list */
@@ -833,6 +862,7 @@ const test_entry_t runtime_entries[] = {
     { "runtime/build_sys_args_defaults",     test_build_sys_args_defaults,     sys_setup, sys_teardown },
     { "runtime/build_sys_args_flags_user",   test_build_sys_args_flags_and_user, sys_setup, sys_teardown },
     { "runtime/build_sys_args_edges",        test_build_sys_args_edges,        sys_setup, sys_teardown },
+    { "runtime/sys_args_builtin",            test_sys_args_builtin,            sys_setup, sys_teardown },
     { "runtime/syscov_args",                 test_syscov_args,                 sys_setup, sys_teardown },
     { "runtime/syscov_rc",                   test_syscov_rc,                   sys_setup, sys_teardown },
     { "runtime/syscov_time_now",             test_syscov_time_now,             sys_setup, sys_teardown },
