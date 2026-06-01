@@ -20,3 +20,12 @@
 ((fn [x] (if (> x 0) 'pos 'neg)) -5) -- 'neg
 ;; ========== RECURSIVE-STYLE (SELF) ==========
 (set factorial (fn [n] (if (<= n 1) 1 (* n (factorial (- n 1)))))) (factorial 5) -- 120
+;; ========== SET INSIDE LAMBDA (global bind whose value is a param) ==========
+;; Regression: `set`'s value expression must be compiled so it can see the
+;; lambda's parameter slots — not dynamically eval'd against the global env.
+(set sf1 (fn [a] (set gb a))) (sf1 42) -- 42
+(set sf2 (fn [a] (set gb a) gb)) (sf2 7) -- 7
+;; The global binding actually received the parameter's value.
+(set sf3 (fn [a] (set gb a))) (sf3 99) gb -- 99
+;; The value may be a computed expression over the parameters.
+(set sf4 (fn [a b] (set gs (+ a b)))) (sf4 3 4) -- 7
