@@ -150,6 +150,21 @@ Rayfall scripts use the `.rfl` extension. Run them directly from the command lin
 ./rayforce my-analysis.rfl
 ```
 
+### Passing arguments to a script
+
+Anything after a `--` separator is handed to your script instead of being read as a Rayforce flag. Read them from Rayfall with [`(.sys.args)`](../namespaces/sys.md#sys-args), which returns a dict: the launcher flags at the top level (typed) and your own options under `user`.
+
+```bash
+./rayforce my-analysis.rfl -- --symbol AAPL --limit 100
+```
+
+```lisp
+(at (.sys.args) 'user)
+;; => {symbol:"AAPL" limit:"100"}
+```
+
+User values are always strings — cast them as needed (e.g. `(as 'i64 (get (at (.sys.args) 'user) 'limit))` → `100`). A bare flag (no following value) maps to the empty string.
+
 ## REPL Commands
 
 The REPL supports several built-in commands:

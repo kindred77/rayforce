@@ -3,12 +3,13 @@
 Process-level introspection (build, memory, host info) and command-style operations (shell-out, profiler toggle, IPC listener bind, env dump, GC trigger). The dotted `.sys.<name>` builtins are the typed entry points; `.sys.cmd` parses a colon-style command string and dispatches to the same handlers — used by the REPL's `:listen 5000` style commands.
 
 !!! note "Restricted under `-U`"
-    `.sys.exec`, `.sys.cmd`, and `.sys.listen` are `RAY_FN_RESTRICTED` — they can either run arbitrary shell commands or change the process's network surface. The introspection entries (`.sys.build`, `.sys.info`, `.sys.mem`, `.sys.gc`, `.sys.env`, `.sys.timeit`) are unrestricted.
+    `.sys.exec`, `.sys.cmd`, and `.sys.listen` are `RAY_FN_RESTRICTED` — they can either run arbitrary shell commands or change the process's network surface. The introspection entries (`.sys.args`, `.sys.build`, `.sys.info`, `.sys.mem`, `.sys.gc`, `.sys.env`, `.sys.timeit`) are unrestricted.
 
 ## Reference
 
 | Function | Arity | Flags | Description |
 |---|---|---|---|
+| [`.sys.args`](#sys-args) | variadic | — | Command-line arguments as a typed dict. |
 | [`.sys.build`](#sys-build) | variadic | — | Version + build date as a dict. |
 | [`.sys.info`](#sys-info) | variadic | — | Host facts: cores, page size, total memory. |
 | [`.sys.mem`](#sys-mem) | variadic | — | Allocator statistics. |
@@ -18,6 +19,39 @@ Process-level introspection (build, memory, host info) and command-style operati
 | [`.sys.cmd`](#sys-cmd) | unary | restricted | Dispatch a colon-command string. |
 | [`.sys.listen`](#sys-listen) | unary | restricted | Bind an IPC listener on a TCP port. |
 | [`.sys.timeit`](#sys-timeit) | variadic | — | Toggle / set the per-expression profiler. |
+
+## `.sys.args` { #sys-args }
+
+Signature: `(.sys.args)`. Returns the process's command-line arguments as a dictionary. Because the launcher flags have a known format, each top-level value carries its natural type; everything after a `--` separator is collected into a `user` subdict (`string → string`), so an application can read its own options without colliding with Rayforce's own flags.
+
+| Key | Type | Source flag | Notes |
+|---|---|---|---|
+| `file` | str | `-f` / positional | Script path; empty if none. |
+| `port` | i64 | `-p` | IPC listen port; `0` if unset. |
+| `cores` | i64 | `-c` | Worker-pool size; `0` = auto. |
+| `timeit` | bool | `-t` | Profiler enabled at startup. |
+| `interactive` | bool | `-i` | Force the REPL after a script. |
+| `log` | str | `-l` / `-L` | Journal base path; empty if none. |
+| `user` | dict | after `--` | The application's own arguments. |
+
+The top-level schema is **stable** — every launcher key is always present with its effective value (the default when the flag wasn't passed), so `(get (.sys.args) 'port)` never misses. Auth passwords (`-u` / `-U`) are deliberately **not** exposed.
+
+**`user` parsing.** Tokens after `--` are paired `-key value` / `--key value`: a token starting with `-` is a key (leading dashes stripped to a symbol), and the next token is its value — unless that token also starts with `-`, in which case the value is the empty string (a bare flag). Duplicate keys keep the last value.
+
+```lisp
+;; launched as:  ./rayforce app.rfl -- -opt 123 --verbose
+(.sys.args)
+;; => {file:"app.rfl" port:0 cores:0 timeit:false interactive:false log:0Nc
+;;     user:{opt:"123" verbose:0Nc}}
+
+(at (.sys.args) 'user)     ;; just the application's options
+;; => {opt:"123" verbose:0Nc}
+
+(get (.sys.args) 'port)    ;; a typed launcher value
+;; => 0
+```
+
+Empty strings render as `0Nc` in the REPL (`log` and the bare `verbose` flag above). See [passing arguments to a script](../getting-started/quick-start.md#passing-arguments-to-a-script) for the launcher side.
 
 ## `.sys.build` { #sys-build }
 
