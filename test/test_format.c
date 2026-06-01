@@ -748,11 +748,25 @@ static test_result_t test_fmt_null_date(void) {
 }
 
 static test_result_t test_fmt_null_str(void) {
+    /* A STR atom has no distinct null: the empty string and the null
+     * string are the same value, and both render as the empty-string
+     * literal "" — never 0Nc (which the parser cannot even read back). */
     ray_t* result = ray_fmt(ray_typed_null(-RAY_STR), 1);
     TEST_ASSERT_NOT_NULL(result);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
     const char* s = ray_str_ptr(result);
-    TEST_ASSERT_NOT_NULL(strstr(s, "0Nc"));
+    TEST_ASSERT_STR_EQ("\"\"", s);
+    ray_release(result);
+    PASS();
+}
+
+static test_result_t test_fmt_empty_str_atom(void) {
+    /* An explicitly-constructed empty string atom renders "" too. */
+    ray_t* result = ray_fmt(ray_str("", 0), 1);
+    TEST_ASSERT_NOT_NULL(result);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    const char* s = ray_str_ptr(result);
+    TEST_ASSERT_STR_EQ("\"\"", s);
     ray_release(result);
     PASS();
 }
@@ -926,6 +940,46 @@ static test_result_t test_fmt_vec_str(void) {
     TEST_ASSERT_NOT_NULL(strstr(s, "hello"));
     ray_release(result);
     ray_release(vec);
+    PASS();
+}
+
+static test_result_t test_fmt_vec_str_null(void) {
+    /* A null element of a STR vector renders as "" — same rule as the
+     * STR atom: empty and null are indistinguishable for strings. */
+    ray_t* vec = ray_vec_new(RAY_STR, 2);
+    TEST_ASSERT_NOT_NULL(vec);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+    vec = ray_str_vec_append(vec, "hello", 5);
+    vec = ray_str_vec_append(vec, "", 0);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+    ray_vec_set_null(vec, 1, true);
+    ray_t* result = ray_fmt(vec, 1);
+    TEST_ASSERT_NOT_NULL(result);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    const char* s = ray_str_ptr(result);
+    TEST_ASSERT_NULL(strstr(s, "0Nc"));
+    TEST_ASSERT_NOT_NULL(strstr(s, "\"\""));
+    ray_release(result);
+    ray_release(vec);
+    PASS();
+}
+
+static test_result_t test_fmt_list_empty_strs(void) {
+    /* A list holding empty-string atoms renders ["" "x" ""], not [0Nc ...]. */
+    ray_t* lst = ray_list_new(3);
+    TEST_ASSERT_NOT_NULL(lst);
+    lst = ray_list_append(lst, ray_str("", 0));
+    lst = ray_list_append(lst, ray_str("x", 1));
+    lst = ray_list_append(lst, ray_str("", 0));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(lst));
+    ray_t* result = ray_fmt(lst, 1);
+    TEST_ASSERT_NOT_NULL(result);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    const char* s = ray_str_ptr(result);
+    TEST_ASSERT_NULL(strstr(s, "0Nc"));
+    TEST_ASSERT_STR_EQ("[\"\" \"x\" \"\"]", s);
+    ray_release(result);
+    ray_release(lst);
     PASS();
 }
 
@@ -1563,6 +1617,7 @@ const test_entry_t format_entries[] = {
     { "format/null/f32", test_fmt_null_f32, fmt_setup, fmt_teardown },
     { "format/null/date", test_fmt_null_date, fmt_setup, fmt_teardown },
     { "format/null/str", test_fmt_null_str, fmt_setup, fmt_teardown },
+    { "format/atom/empty_str", test_fmt_empty_str_atom, fmt_setup, fmt_teardown },
     { "format/null/guid", test_fmt_null_guid, fmt_setup, fmt_teardown },
     { "format/null/sym", test_fmt_null_sym, fmt_setup, fmt_teardown },
     { "format/null/obj", test_fmt_null_obj, fmt_setup, fmt_teardown },
@@ -1576,6 +1631,8 @@ const test_entry_t format_entries[] = {
     { "format/vec/bool", test_fmt_vec_bool, fmt_setup, fmt_teardown },
     { "format/vec/sym", test_fmt_vec_sym, fmt_setup, fmt_teardown },
     { "format/vec/str", test_fmt_vec_str, fmt_setup, fmt_teardown },
+    { "format/vec/str_null", test_fmt_vec_str_null, fmt_setup, fmt_teardown },
+    { "format/list/empty_strs", test_fmt_list_empty_strs, fmt_setup, fmt_teardown },
     { "format/vec/guid", test_fmt_vec_guid, fmt_setup, fmt_teardown },
     { "format/vec/truncate", test_fmt_vec_truncate, fmt_setup, fmt_teardown },
     { "format/list/hetero", test_fmt_list_hetero, fmt_setup, fmt_teardown },
