@@ -75,11 +75,12 @@
 (.sys.exec "printf 'name\\nalice\\n\\nbob\\n\\ncarol\\n' > rf_test_empty.csv") -- 0
 (set _t (.csv.read [SYMBOL] "rf_test_empty.csv"))
 (count _t)                                                            -- 5
-;; Empty string IS a null STR atom and empty SYM cell IS null (sym
-;; id 0).  The SYM vec vs null STR atom comparison short-circuits null:
-;; every cell passes `!= ""` and none passes `== ""`.  Documented
-;; tension; revisit if SQL-style null-aware filtering on SYM columns
-;; becomes a requirement.
-(count (select {x: name from: _t where: (!= name "")}))               -- 5
-(count (select {x: name from: _t where: (== name "")}))               -- 0
+;; The empty SYM cell is the interned empty string (sym id 0), a real
+;; comparable value — SQL-style filtering on SYM columns compares by
+;; value, not by null.  `(!= name "")` therefore excludes the two empty
+;; rows (alice, bob, carol survive) and `(== name "")` selects them.
+;; (See the str-resolved comparison path in src/ops/expr.c, which skips
+;; the null-comparison fixup once a string constant resolves to a sym id.)
+(count (select {x: name from: _t where: (!= name "")}))               -- 3
+(count (select {x: name from: _t where: (== name "")}))               -- 2
 (.sys.exec "rm -f rf_test_empty.csv") -- 0
