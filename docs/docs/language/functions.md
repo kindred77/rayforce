@@ -337,7 +337,7 @@ Cross-temporal comparisons are supported: dates, times, and timestamps are all c
 | `.time.now` | variadic | Current monotonic time in milliseconds | `(.time.now)` |
 | `.time.timer.set` | variadic, restricted | Schedule a callback every `ms` milliseconds, `num` times (0 = forever). Returns timer id. | `(.time.timer.set 1000 0 (fn [t] (println t)))` |
 | `.time.timer.del` | unary, restricted | Cancel a scheduled timer by id. Returns null. | `(.time.timer.del 0)` |
-| `args` | unary | Command-line arguments | `(args 0)` |
+| `.sys.args` | nullary | Application arguments as a typed dict (`user` subdict for post-`--` args) | `(.sys.args)` |
 | `env` | unary | List all global environment bindings | `(env 0)` |
 | `.sys.build` | variadic | Build metadata: `version` + `build-date` | `(.sys.build)` |
 | `.sys.mem` | variadic | Memory allocator statistics (alloc/peak/slab) | `(.sys.mem)` |

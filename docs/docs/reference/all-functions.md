@@ -460,7 +460,7 @@ System interaction, metaprogramming, diagnostics, and runtime inspection.
 | `.sys.exec` | unary | restricted | Execute a shell command, return exit code | `(.sys.exec "ls -la")` |
 | `.os.getenv` | unary | restricted | Get environment variable value | `(.os.getenv "HOME")` |
 | `.os.setenv` | binary | restricted | Set environment variable | `(.os.setenv "KEY" "value")` |
-| `args` | unary | — | Get command-line arguments as vector | `(args 0)` |
+| `.sys.args` | nullary | — | Application arguments as a typed dict; `user` subdict holds post-`--` args | `(.sys.args)` |
 | `env` | unary | — | List all global environment bindings | `(env 0)` |
 | `.time.now` | variadic | — | Monotonic time in milliseconds | `(.time.now)` |
 | `.time.timer.set` | variadic | restricted | Schedule callback every `ms`, `num` times (0 = forever); returns id | `(.time.timer.set 1000 0 (fn [t] (println t)))` |
