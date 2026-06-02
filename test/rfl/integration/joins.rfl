@@ -159,3 +159,26 @@
 (count (left-join [sym] quotes-4 trades-10)) -- 11
 (sum (at (left-join [sym] quotes-4 trades-10) 'bid)) -- 13227.0
 (count (select {from: (left-join [sym] quotes-4 trades-10) where: (== sym 'AMZN)})) -- 1
+
+;; ===== un-partitioned asof-join (1-key) + pre-sorted fast-path =====
+(set Lp (table [Time Price] (list [10:00:01.000 10:00:03.000] [100.0 101.0])))
+(set Rp (table [Time Bid] (list [10:00:00.000 10:00:02.000 10:00:04.000] [99.0 100.5 101.5])))
+(set Ls (table [Time Price] (list (.attr.set 'sorted [10:00:01.000 10:00:03.000]) [100.0 101.0])))
+(set Rs (table [Time Bid] (list (.attr.set 'sorted [10:00:00.000 10:00:02.000 10:00:04.000]) [99.0 100.5 101.5])))
+;; un-partitioned asof-join now works (1-key) and gives the expected left-outer result
+(asof-join [Time] Lp Rp) -- (table [Time Price Bid] (list [10:00:01.000 10:00:03.000] [100.0 101.0] [99.0 100.5]))
+;; the sorted marker survives into the stored column (so the fast path is taken)
+(.attr.get (at Ls 'Time)) -- ['sorted]
+;; fast-path (both sorted) == plain sort-merge
+(asof-join [Time] Ls Rs) -- (asof-join [Time] Lp Rp)
+;; only-left-sorted and only-right-sorted also match
+(asof-join [Time] Ls Rp) -- (asof-join [Time] Lp Rp)
+(asof-join [Time] Lp Rs) -- (asof-join [Time] Lp Rp)
+;; empty key list is still rejected
+(asof-join [] Lp Rp) !- domain
+;; larger interleaved case (4 left rows, 6 right rows): marked == plain
+(set Lp2 (table [Time Price] (list [10:00:01.000 10:00:02.500 10:00:05.000 10:00:09.000] [10.0 20.0 30.0 40.0])))
+(set Rp2 (table [Time Bid] (list [10:00:00.000 10:00:02.000 10:00:04.000 10:00:06.000 10:00:08.000 10:00:10.000] [1.0 2.0 3.0 4.0 5.0 6.0])))
+(set Ls2 (table [Time Price] (list (.attr.set 'sorted [10:00:01.000 10:00:02.500 10:00:05.000 10:00:09.000]) [10.0 20.0 30.0 40.0])))
+(set Rs2 (table [Time Bid] (list (.attr.set 'sorted [10:00:00.000 10:00:02.000 10:00:04.000 10:00:06.000 10:00:08.000 10:00:10.000]) [1.0 2.0 3.0 4.0 5.0 6.0])))
+(asof-join [Time] Ls2 Rs2) -- (asof-join [Time] Lp2 Rp2)
