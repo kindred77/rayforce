@@ -14,3 +14,18 @@
 (.attr.get (.attr.set 'sorted [10:00:01.000 10:00:02.000 10:00:03.000])) -- ['sorted]
 ;; non-ascending TIME vector is rejected (proves element width is read correctly)
 (.attr.set 'sorted [10:00:03.000 10:00:01.000]) !- domain
+;; ===== unique marker =====
+(.attr.get (.attr.set 'unique [1 2 3 4])) -- ['unique]
+(.attr.set 'unique [1 2 2 4]) !- domain
+;; sorted + unique coexist (sorted in attrs, unique in the block)
+(.attr.get (.attr.set 'unique (.attr.set 'sorted [1 2 3]))) -- ['sorted 'unique]
+;; ===== grouped (hash-backed) =====
+(.idx.has? (.attr.set 'grouped [1 1 2 3 3])) -- true
+(.attr.get (.attr.set 'grouped [1 1 2 3 3])) -- ['grouped]
+;; unique then grouped: the unique marker is preserved alongside the hash index
+(.attr.get (.attr.set 'grouped (.attr.set 'unique [1 2 3 4]))) -- ['unique 'grouped]
+;; grouped then unique: exercises the clone-shared-index-block branch of attr.set unique
+(.attr.get (.attr.set 'unique (.attr.set 'grouped [1 2 3 4]))) -- ['unique 'grouped]
+;; drop clears a block-resident marker (unique) and its backing block
+(.idx.has? (.attr.drop (.attr.set 'unique [1 2 3]))) -- false
+(.attr.get (.attr.drop (.attr.set 'unique [1 2 3]))) -- (take ['a] 0)
