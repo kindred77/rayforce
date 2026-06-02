@@ -47,3 +47,34 @@
 (.attr.get (.attr.set 'parted [5])) -- ['parted]
 (.attr.get (.attr.set 'parted [1.0 1.0 2.0])) -- ['parted]
 (.attr.get (.attr.set 'parted (take [1] 0))) -- ['parted]
+
+;; ===== conservative invalidation: transforms drop attributes =====
+;; A transformed/derived vector must NOT inherit its input's attributes:
+;; a stale 'sorted marker or backing index would let a later asof-join
+;; trust a wrong ordering claim. Only a plain copy/rebind preserves them.
+;; arithmetic on a sorted column yields an unattributed result
+(.attr.get (+ (.attr.set 'sorted [1 2 3]) 1)) -- (take ['a] 0)
+;; arithmetic on a grouped (indexed) column drops the backing index
+(.idx.has? (+ (.attr.set 'grouped [1 2 3]) 1)) -- false
+;; a second arithmetic op (multiply) likewise drops the sorted marker
+(.attr.get (* (.attr.set 'sorted [1 2 3]) 2)) -- (take ['a] 0)
+;; multiply on a grouped column drops the backing index
+(.idx.has? (* (.attr.set 'grouped [1 2 3]) 2)) -- false
+;; take (prefix) of a sorted column does NOT carry the marker (conservative)
+(.attr.get (take (.attr.set 'sorted [1 2 3 4 5]) 3)) -- (take ['a] 0)
+;; take of a grouped column does not carry the backing index
+(.idx.has? (take (.attr.set 'grouped [1 1 2 3 3]) 3)) -- false
+;; reverse of a sorted column drops the marker (order is now descending)
+(.attr.get (reverse (.attr.set 'sorted [1 2 3]))) -- (take ['a] 0)
+;; reverse of a grouped column drops the backing index
+(.idx.has? (reverse (.attr.set 'grouped [1 1 2 3 3]))) -- false
+;; concat of a sorted column with more data drops the marker
+(.attr.get (concat (.attr.set 'sorted [1 2 3]) [0 1])) -- (take ['a] 0)
+;; concat of a grouped column drops the backing index
+(.idx.has? (concat (.attr.set 'grouped [1 1 2 3 3]) [4 5])) -- false
+;; where-filtered selection off a sorted column drops the marker
+(.attr.get (at (.attr.set 'sorted [1 2 3 4 5]) (where [true false true false true]))) -- (take ['a] 0)
+;; a plain rebind PRESERVES the marker (trivially-preserving)
+(set _s (.attr.set 'sorted [1 2 3]))(.attr.get _s) -- ['sorted]
+;; a plain rebind PRESERVES the backing index too
+(set _g (.attr.set 'grouped [1 1 2 3 3]))(.idx.has? _g) -- true
