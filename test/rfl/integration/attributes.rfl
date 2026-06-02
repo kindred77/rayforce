@@ -29,3 +29,21 @@
 ;; drop clears a block-resident marker (unique) and its backing block
 (.idx.has? (.attr.drop (.attr.set 'unique [1 2 3]))) -- false
 (.attr.get (.attr.drop (.attr.set 'unique [1 2 3]))) -- (take ['a] 0)
+;; ===== parted (contiguous ascending value-blocks) =====
+;; a column laid out as ascending value-blocks accepts parted
+(.attr.get (.attr.set 'parted [1 1 1 2 2 3])) -- ['parted]
+;; .idx.info reports the part kind and the part count
+(at (.idx.info (.attr.set 'parted [1 1 2 2])) 'kind) -- 'part
+(at (.idx.info (.attr.set 'parted [1 1 2 2])) 'n_parts) -- 2
+;; a non-blocked column is rejected (verify-only: no reorder)
+(.attr.set 'parted [1 2 1 2]) !- domain
+;; descending blocks rejected (blocks must be ascending)
+(.attr.set 'parted [3 3 1 1]) !- domain
+;; unique coexists with parted (exercises clone_index_block on a PART block)
+(.attr.get (.attr.set 'unique (.attr.set 'parted [1 2 3 4]))) -- ['unique 'parted]
+;; parted on a TIME column (the asof partition/time use case is numeric/temporal)
+(.attr.get (.attr.set 'parted [10:00:01.000 10:00:01.000 10:00:02.000])) -- ['parted]
+;; edge cases: single-element, float value-blocks, and empty column
+(.attr.get (.attr.set 'parted [5])) -- ['parted]
+(.attr.get (.attr.set 'parted [1.0 1.0 2.0])) -- ['parted]
+(.attr.get (.attr.set 'parted (take [1] 0))) -- ['parted]
