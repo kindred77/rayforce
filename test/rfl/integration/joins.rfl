@@ -159,3 +159,54 @@
 (count (left-join [sym] quotes-4 trades-10)) -- 11
 (sum (at (left-join [sym] quotes-4 trades-10) 'bid)) -- 13227.0
 (count (select {from: (left-join [sym] quotes-4 trades-10) where: (== sym 'AMZN)})) -- 1
+
+;; ===== un-partitioned asof-join (1-key) + pre-sorted fast-path =====
+(set Lp (table [Time Price] (list [10:00:01.000 10:00:03.000] [100.0 101.0])))
+(set Rp (table [Time Bid] (list [10:00:00.000 10:00:02.000 10:00:04.000] [99.0 100.5 101.5])))
+(set Ls (table [Time Price] (list (.attr.set 'sorted [10:00:01.000 10:00:03.000]) [100.0 101.0])))
+(set Rs (table [Time Bid] (list (.attr.set 'sorted [10:00:00.000 10:00:02.000 10:00:04.000]) [99.0 100.5 101.5])))
+;; un-partitioned asof-join now works (1-key) and gives the expected left-outer result
+(asof-join [Time] Lp Rp) -- (table [Time Price Bid] (list [10:00:01.000 10:00:03.000] [100.0 101.0] [99.0 100.5]))
+;; the sorted marker survives into the stored column (so the fast path is taken)
+(.attr.get (at Ls 'Time)) -- ['sorted]
+;; fast-path (both sorted) == plain sort-merge
+(asof-join [Time] Ls Rs) -- (asof-join [Time] Lp Rp)
+;; only-left-sorted and only-right-sorted also match
+(asof-join [Time] Ls Rp) -- (asof-join [Time] Lp Rp)
+(asof-join [Time] Lp Rs) -- (asof-join [Time] Lp Rp)
+;; empty key list is still rejected
+(asof-join [] Lp Rp) !- domain
+;; larger interleaved case (4 left rows, 6 right rows): marked == plain
+(set Lp2 (table [Time Price] (list [10:00:01.000 10:00:02.500 10:00:05.000 10:00:09.000] [10.0 20.0 30.0 40.0])))
+(set Rp2 (table [Time Bid] (list [10:00:00.000 10:00:02.000 10:00:04.000 10:00:06.000 10:00:08.000 10:00:10.000] [1.0 2.0 3.0 4.0 5.0 6.0])))
+(set Ls2 (table [Time Price] (list (.attr.set 'sorted [10:00:01.000 10:00:02.500 10:00:05.000 10:00:09.000]) [10.0 20.0 30.0 40.0])))
+(set Rs2 (table [Time Bid] (list (.attr.set 'sorted [10:00:00.000 10:00:02.000 10:00:04.000 10:00:06.000 10:00:08.000 10:00:10.000]) [1.0 2.0 3.0 4.0 5.0 6.0])))
+(asof-join [Time] Ls2 Rs2) -- (asof-join [Time] Lp2 Rp2)
+
+;; ===== partitioned asof-join fast-path (parted numeric key + sorted-within-part time) =====
+;; parted requires a NUMERIC partition key, so use an integer ID column.
+(set Lpp (table [ID Time Price] (list [1 1 2 2] [10:00:01.000 10:00:03.000 10:00:01.000 10:00:02.000] [1.0 2.0 3.0 4.0])))
+(set Rpp (table [ID Time Bid] (list [1 1 2 2] [10:00:00.000 10:00:02.000 10:00:00.000 10:00:03.000] [9.0 9.5 8.0 8.5])))
+(set Lgp (table [ID Time Price] (list (.attr.set 'parted [1 1 2 2]) [10:00:01.000 10:00:03.000 10:00:01.000 10:00:02.000] [1.0 2.0 3.0 4.0])))
+(set Rgp (table [ID Time Bid] (list (.attr.set 'parted [1 1 2 2]) [10:00:00.000 10:00:02.000 10:00:00.000 10:00:03.000] [9.0 9.5 8.0 8.5])))
+;; the parted marker survives into the stored column (so the fast path is reachable)
+(.attr.get (at Lgp 'ID)) -- ['parted]
+;; fast-path (both parted, time sorted within each part) == plain sort-merge
+(asof-join [ID Time] Lgp Rgp) -- (asof-join [ID Time] Lpp Rpp)
+;; only-left-parted and only-right-parted also match the plain result
+(asof-join [ID Time] Lgp Rpp) -- (asof-join [ID Time] Lpp Rpp)
+(asof-join [ID Time] Lpp Rgp) -- (asof-join [ID Time] Lpp Rpp)
+;; larger case: 3 parts, interleaved times, marked == plain
+(set Lpp2 (table [ID Time Price] (list [1 1 2 3 3] [10:00:01.000 10:00:05.000 10:00:02.000 10:00:01.000 10:00:09.000] [1.0 2.0 3.0 4.0 5.0])))
+(set Rpp2 (table [ID Time Bid] (list [1 1 2 3 3] [10:00:00.000 10:00:04.000 10:00:03.000 10:00:00.000 10:00:08.000] [9.0 9.5 8.0 7.0 7.5])))
+(set Lgp2 (table [ID Time Price] (list (.attr.set 'parted [1 1 2 3 3]) [10:00:01.000 10:00:05.000 10:00:02.000 10:00:01.000 10:00:09.000] [1.0 2.0 3.0 4.0 5.0])))
+(set Rgp2 (table [ID Time Bid] (list (.attr.set 'parted [1 1 2 3 3]) [10:00:00.000 10:00:04.000 10:00:03.000 10:00:00.000 10:00:08.000] [9.0 9.5 8.0 7.0 7.5])))
+(asof-join [ID Time] Lgp2 Rgp2) -- (asof-join [ID Time] Lpp2 Rpp2)
+;; fallback branch: parted key but time DESCENDS within part ID=1 — the
+;; sorted-within-part check must fail, falling back to the real sort, and the
+;; result must still equal the plain sort-merge.
+(set Lpf (table [ID Time Price] (list [1 1 2 2] [10:00:03.000 10:00:01.000 10:00:01.000 10:00:02.000] [1.0 2.0 3.0 4.0])))
+(set Rpf (table [ID Time Bid] (list [1 1 2 2] [10:00:00.000 10:00:02.000 10:00:00.000 10:00:03.000] [9.0 9.5 8.0 8.5])))
+(set Lgf (table [ID Time Price] (list (.attr.set 'parted [1 1 2 2]) [10:00:03.000 10:00:01.000 10:00:01.000 10:00:02.000] [1.0 2.0 3.0 4.0])))
+(set Rgf (table [ID Time Bid] (list (.attr.set 'parted [1 1 2 2]) [10:00:00.000 10:00:02.000 10:00:00.000 10:00:03.000] [9.0 9.5 8.0 8.5])))
+(asof-join [ID Time] Lgf Rgf) -- (asof-join [ID Time] Lpf Rpf)
