@@ -143,6 +143,7 @@ nav:
           - Linked Columns: docs/queries/links.md
           - Indexes Overview: docs/queries/indexes-overview.md
           - Accelerator Indexes: docs/queries/indexes.md
+          - Column Attributes: docs/queries/attributes.md
           - Pivot: docs/queries/pivot.md
       - Storage & IPC:
           - Columnar Storage: docs/storage/index.md

@@ -77,13 +77,18 @@ Left join on multiple keys:
 
 ## As-of Join
 
-The `asof-join` function is designed for time-series data. For each row in the left table, it finds the most recent matching row in the right table where the time column is less than or equal to the left's time value. Key columns must match exactly; the last column in the key list is the temporal column.
+The `asof-join` function is designed for time-series data. For each row in the left table, it finds the most recent matching row in the right table where the time column is less than or equal to the left's time value. The last column in the key list is the temporal column; any preceding keys are exact-match equality keys.
 
 ### Signature
 
 `(asof-join [keys time-col] left right)`
 
-As-of join for time-series alignment. The last key is the temporal column; preceding keys are exact-match. For each left row, returns the most recent right row where `right.time <= left.time`.
+As-of join for time-series alignment. The last key is the temporal column. For each left row, returns the most recent right row where `right.time <= left.time`.
+
+Equality keys are **optional**:
+
+- `(asof-join [time-col] left right)` — a lone time key runs an un-partitioned as-of join across all rows.
+- `(asof-join [keys time-col] left right)` — preceding keys partition the join; within each partition the temporal match applies.
 
 ### Examples
 
@@ -108,6 +113,30 @@ As-of join for time-series alignment. The last key is the temporal column; prece
 ; AAPL 10:00:05  190.1 190   190.2   ← quote from 10:00:03
 ; MSFT 10:00:04 410.25 410.1 410.3   ← quote from 10:00:02
 ```
+
+### Pre-sorted fast-path
+
+The as-of executor normally sorts both inputs by `(equality-keys, time)` on every call. [Column attributes](attributes.md) let it skip that sort when the data already satisfies the required ordering:
+
+- **Un-partitioned** — if both input time columns carry the `sorted` attribute, both per-join sorts are skipped (O(n+m) instead of O(n log n)).
+- **Partitioned** — if a single numeric equality key carries the `parted` attribute and its time column is non-descending within each part, that side's sort is skipped.
+
+These are pure opt-in acceleration: when the attribute is absent the executor falls back to the usual sort-merge, so results are identical either way.
+
+```lisp
+; Stamp the time column as sorted, then run an un-partitioned as-of join.
+(set Ls (table [Time Price] (list (.attr.set 'sorted [10:00:01.000 10:00:03.000]) [100.0 101.0])))
+(.attr.get (at Ls 'Time))                                        ; ⇒ ['sorted]
+
+; Partitioned: a parted numeric equality key (parted is numeric-only — not a symbol).
+(set Lgp (table [ID Time Price]
+    (list (.attr.set 'parted [1 1 2 2])
+          [10:00:01.000 10:00:03.000 10:00:01.000 10:00:02.000]
+          [1.0 2.0 3.0 4.0])))
+(asof-join [ID Time] Lgp Rgp)
+```
+
+See [Column Attributes](attributes.md) for how to stamp and verify these properties.
 
 ### Large-scale Usage
 
@@ -185,7 +214,7 @@ All join operations compile to the Rayforce execution DAG. The optimizer and exe
 
 1. **DAG construction** — `inner-join` and `left-join` emit `OP_JOIN` nodes with join type flags. `asof-join` emits `OP_ASOF_JOIN`. `window-join` emits `OP_WINDOW_JOIN`.
 2. **Optimizer** — Predicate pushdown moves filters before the join when possible. Type inference propagates column types through join boundaries. SIP (Sideways Information Passing) can prune the build side using selection bitmaps.
-3. **Execution** — Equi-joins use a radix-partitioned hash join: the build side is partitioned by hash, then each morsel from the probe side looks up matches in the corresponding partition. As-of and window joins use sorted merge with binary search on the temporal column.
+3. **Execution** — Equi-joins use a radix-partitioned hash join: the build side is partitioned by hash, then each morsel from the probe side looks up matches in the corresponding partition. As-of and window joins use sorted merge with binary search on the temporal column — the as-of executor skips the per-join sort when the inputs carry the `sorted` / `parted` [attributes](attributes.md) described above.
 
 !!! note "Performance note"
     For large joins, ensure key columns use efficient types. Symbol columns (`RAY_SYM`) are dictionary-encoded integers and join fastest. String columns (`RAY_STR`) work but require hash comparison of variable-length data.
