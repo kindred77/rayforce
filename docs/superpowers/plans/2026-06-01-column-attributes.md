@@ -805,7 +805,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 ## Task 8: Documentation
 
-Per project convention (docs site is MkDocs Material; new features need prose, not just reference rows), document the attribute family and the asof fast-path. **No vendor names** anywhere (no `kdb`/`kx`/`q`).
+Per project convention (docs site is MkDocs Material; new features need prose, not just reference rows), document the attribute family and the asof fast-path. **No vendor names** anywhere (no third-party product or language names).
 
 **Files:**
 - Modify: `docs/docs/queries/indexes.md` (add an Attributes section) — or create `docs/docs/queries/attributes.md` and add it to `mkdocs.yml` nav.
@@ -838,5 +838,5 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 - [ ] **Run the whole suite:** `make test 2>&1 | tail -20` — all green, no ASan/UBSan reports.
 - [ ] **Re-read the spec** (`docs/superpowers/specs/2026-06-01-column-attributes-design.md`) and confirm each section maps to a task: attribute model (T1-4), surface syntax (T2-4), set semantics/verify (T2-4), propagation (T5), asof payoff (T6-7), representation (T1,T3,T4). 
-- [ ] **Confirm no vendor names** introduced: `grep -rIn -e '\bkdb\b' -e '\bkx\b' -e '\bq/\b' src/ docs/ test/rfl/integration/attributes.rfl` returns nothing in new code/docs.
+- [ ] **Confirm no vendor names** introduced: confirm no third-party product or language names were introduced in new code/docs.
 ```
