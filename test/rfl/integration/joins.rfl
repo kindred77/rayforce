@@ -182,3 +182,23 @@
 (set Ls2 (table [Time Price] (list (.attr.set 'sorted [10:00:01.000 10:00:02.500 10:00:05.000 10:00:09.000]) [10.0 20.0 30.0 40.0])))
 (set Rs2 (table [Time Bid] (list (.attr.set 'sorted [10:00:00.000 10:00:02.000 10:00:04.000 10:00:06.000 10:00:08.000 10:00:10.000]) [1.0 2.0 3.0 4.0 5.0 6.0])))
 (asof-join [Time] Ls2 Rs2) -- (asof-join [Time] Lp2 Rp2)
+
+;; ===== partitioned asof-join fast-path (parted numeric key + sorted-within-part time) =====
+;; parted requires a NUMERIC partition key, so use an integer ID column.
+(set Lpp (table [ID Time Price] (list [1 1 2 2] [10:00:01.000 10:00:03.000 10:00:01.000 10:00:02.000] [1.0 2.0 3.0 4.0])))
+(set Rpp (table [ID Time Bid] (list [1 1 2 2] [10:00:00.000 10:00:02.000 10:00:00.000 10:00:03.000] [9.0 9.5 8.0 8.5])))
+(set Lgp (table [ID Time Price] (list (.attr.set 'parted [1 1 2 2]) [10:00:01.000 10:00:03.000 10:00:01.000 10:00:02.000] [1.0 2.0 3.0 4.0])))
+(set Rgp (table [ID Time Bid] (list (.attr.set 'parted [1 1 2 2]) [10:00:00.000 10:00:02.000 10:00:00.000 10:00:03.000] [9.0 9.5 8.0 8.5])))
+;; the parted marker survives into the stored column (so the fast path is reachable)
+(.attr.get (at Lgp 'ID)) -- ['parted]
+;; fast-path (both parted, time sorted within each part) == plain sort-merge
+(asof-join [ID Time] Lgp Rgp) -- (asof-join [ID Time] Lpp Rpp)
+;; only-left-parted and only-right-parted also match the plain result
+(asof-join [ID Time] Lgp Rpp) -- (asof-join [ID Time] Lpp Rpp)
+(asof-join [ID Time] Lpp Rgp) -- (asof-join [ID Time] Lpp Rpp)
+;; larger case: 3 parts, interleaved times, marked == plain
+(set Lpp2 (table [ID Time Price] (list [1 1 2 3 3] [10:00:01.000 10:00:05.000 10:00:02.000 10:00:01.000 10:00:09.000] [1.0 2.0 3.0 4.0 5.0])))
+(set Rpp2 (table [ID Time Bid] (list [1 1 2 3 3] [10:00:00.000 10:00:04.000 10:00:03.000 10:00:00.000 10:00:08.000] [9.0 9.5 8.0 7.0 7.5])))
+(set Lgp2 (table [ID Time Price] (list (.attr.set 'parted [1 1 2 3 3]) [10:00:01.000 10:00:05.000 10:00:02.000 10:00:01.000 10:00:09.000] [1.0 2.0 3.0 4.0 5.0])))
+(set Rgp2 (table [ID Time Bid] (list (.attr.set 'parted [1 1 2 3 3]) [10:00:00.000 10:00:04.000 10:00:03.000 10:00:00.000 10:00:08.000] [9.0 9.5 8.0 7.0 7.5])))
+(asof-join [ID Time] Lgp2 Rgp2) -- (asof-join [ID Time] Lpp2 Rpp2)
