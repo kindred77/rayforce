@@ -9,3 +9,8 @@
 (.attr.get (.attr.drop (.attr.set 'sorted [1 2 3]))) -- (take ['a] 0)
 ;; unknown attribute name errors (unknown attribute -> domain)
 (.attr.set 'bogus [1 2 3]) !- domain
+;; ===== sorted on TIME columns (4-byte int32 — the asof time type) =====
+;; ascending TIME vector accepts sorted
+(.attr.get (.attr.set 'sorted [10:00:01.000 10:00:02.000 10:00:03.000])) -- ['sorted]
+;; non-ascending TIME vector is rejected (proves element width is read correctly)
+(.attr.set 'sorted [10:00:03.000 10:00:01.000]) !- domain
