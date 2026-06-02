@@ -202,3 +202,11 @@
 (set Lgp2 (table [ID Time Price] (list (.attr.set 'parted [1 1 2 3 3]) [10:00:01.000 10:00:05.000 10:00:02.000 10:00:01.000 10:00:09.000] [1.0 2.0 3.0 4.0 5.0])))
 (set Rgp2 (table [ID Time Bid] (list (.attr.set 'parted [1 1 2 3 3]) [10:00:00.000 10:00:04.000 10:00:03.000 10:00:00.000 10:00:08.000] [9.0 9.5 8.0 7.0 7.5])))
 (asof-join [ID Time] Lgp2 Rgp2) -- (asof-join [ID Time] Lpp2 Rpp2)
+;; fallback branch: parted key but time DESCENDS within part ID=1 — the
+;; sorted-within-part check must fail, falling back to the real sort, and the
+;; result must still equal the plain sort-merge.
+(set Lpf (table [ID Time Price] (list [1 1 2 2] [10:00:03.000 10:00:01.000 10:00:01.000 10:00:02.000] [1.0 2.0 3.0 4.0])))
+(set Rpf (table [ID Time Bid] (list [1 1 2 2] [10:00:00.000 10:00:02.000 10:00:00.000 10:00:03.000] [9.0 9.5 8.0 8.5])))
+(set Lgf (table [ID Time Price] (list (.attr.set 'parted [1 1 2 2]) [10:00:03.000 10:00:01.000 10:00:01.000 10:00:02.000] [1.0 2.0 3.0 4.0])))
+(set Rgf (table [ID Time Bid] (list (.attr.set 'parted [1 1 2 2]) [10:00:00.000 10:00:02.000 10:00:00.000 10:00:03.000] [9.0 9.5 8.0 8.5])))
+(asof-join [ID Time] Lgf Rgf) -- (asof-join [ID Time] Lpf Rpf)
