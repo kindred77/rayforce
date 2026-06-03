@@ -2206,6 +2206,20 @@ static test_result_t test_slab_byte_budget(void) {
     PASS();
 }
 
+static test_result_t test_slab_gc_drains_wide(void) {
+    extern RAY_TLS ray_heap_t* ray_tl_heap;
+    ray_heap_t* h = ray_tl_heap;
+    /* Fill the order-14 (16KB) slab, then GC; flush_slabs must empty it. */
+    ray_t* keep[8];
+    for (int i = 0; i < 8; i++) keep[i] = ray_alloc(16384 - 32);
+    for (int i = 0; i < 8; i++) ray_free(keep[i]);   /* into slab */
+    int top14 = SLAB_INDEX(14);
+    TEST_ASSERT(h->slabs[top14].count > 0, "order-14 slab populated");
+    ray_heap_gc();
+    TEST_ASSERT_EQ_I(h->slabs[top14].count, 0);      /* flushed to freelists */
+    PASS();
+}
+
 /* ---- Suite definition -------------------------------------------------- */
 
 const test_entry_t heap_entries[] = {
@@ -2276,5 +2290,6 @@ const test_entry_t heap_entries[] = {
     { "heap/pool_of_oversized_walk",   test_pool_of_oversized_walk,            heap_setup, heap_teardown },
     { "heap/order_overflow_guards",    test_order_overflow_guards,             heap_setup, heap_teardown },
     { "heap/slab_byte_budget",         test_slab_byte_budget,            heap_setup, heap_teardown },
+    { "heap/slab_gc_drains_wide",      test_slab_gc_drains_wide,         heap_setup, heap_teardown },
     { NULL, NULL, NULL, NULL },
 };
