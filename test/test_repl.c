@@ -92,7 +92,6 @@ static void repl_teardown(void) {
      * dangling, scrub it before the next test sees the runtime. */
     g_ray_profile.active = false;
     g_ray_profile.n = 0;
-    g_ray_profile.progress_cb = NULL;
     if (ray_repl_remote_active()) {
         ray_t* args = NULL;
         ray_release(ray_repl_disconnect_fn(&args, 0));
@@ -787,7 +786,7 @@ static test_result_t test_repl_run_piped_eval_error_continues(void) {
 
 /* Toggle profiler mid-stream via :t 1 then run an expression — the
  * piped eval_and_print path now sees timeit && active and walks the
- * profile_reset / span_start / progress_cb / tick / span_end +
+ * profile_reset / span_start / tick / span_end +
  * profile_print branches.  We don't assert on captured output here
  * (the rendered tree contains absolute timestamps that vary) — the
  * point is to exercise the lines in repl.c. */
@@ -801,8 +800,8 @@ static test_result_t test_repl_run_piped_timeit_on(void) {
 
 /* Multi-form profile run — multiple expressions back-to-back with
  * `:t 1` active drives multiple profile_reset cycles in one session,
- * ensuring the renderer's progress_cb wiring is set/cleared on every
- * eval_and_print.  Cleanup is handled by repl_teardown which clears
+ * exercising the profiler span/print path on every eval_and_print.
+ * Cleanup is handled by repl_teardown which clears
  * g_ray_profile.active before the next test runs. */
 static test_result_t test_repl_run_piped_timeit_multi(void) {
     TEST_ASSERT_EQ_I(run_piped_with_input(
