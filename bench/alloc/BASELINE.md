@@ -13,7 +13,7 @@
   throughput        1.0 Mops/s  peak RSS 10574976 KB
 ```
 
-## Post-P1 (commit TBD — warm-first local free, skip cold pool-header read)
+## Post-P1 (commit 25d8b72a — warm-first local free, skip cold pool-header read)
 
 ```
 (a) single-thread alloc/free:
