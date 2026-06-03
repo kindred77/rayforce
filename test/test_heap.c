@@ -423,13 +423,18 @@ static test_result_t test_flush_foreign_during_parallel(void) {
     TEST_ASSERT_NOT_NULL(blk);
 
     ray_tl_heap = heap_a;
-    ray_free(blk);  /* enqueues onto heap_a->foreign */
+    ray_free(blk);  /* enqueues onto heap_a->foreign (or heap_b's thread-free queue) */
+#if !RAY_THREAD_FREE_QUEUE
+    /* Foreign-list model: the cross-thread free sits on the freeing heap. */
     TEST_ASSERT_NOT_NULL(heap_a->foreign);
+#endif
 
     ray_parallel_begin();
     ray_heap_flush_foreign();
+#if !RAY_THREAD_FREE_QUEUE
     /* Foreign list should still be intact (not flushed). */
     TEST_ASSERT_NOT_NULL(heap_a->foreign);
+#endif
     ray_parallel_end();
     /* parallel_end -> ray_heap_gc which DOES flush foreign now safe.  */
     /* Foreign list should be empty after end. */
@@ -740,8 +745,10 @@ static test_result_t test_merge_with_slabs_and_freelist(void) {
     ray_t* fblk = ray_alloc(0);
     TEST_ASSERT_NOT_NULL(fblk);
     ray_tl_heap = heap_b;
-    ray_free(fblk);  /* heap_b->foreign now contains fblk */
+    ray_free(fblk);  /* heap_b->foreign now contains fblk (foreign-list model) */
+#if !RAY_THREAD_FREE_QUEUE
     TEST_ASSERT_NOT_NULL(heap_b->foreign);
+#endif
 
     /* Capture pool count AFTER any allocs heap_a has performed for fblk —
      * lazy heap_add_pool may have grown the count. */

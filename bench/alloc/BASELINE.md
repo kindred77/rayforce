@@ -66,3 +66,35 @@ table is roughly flat vs Post-P2 (atom-64B 115.2 vs 127.7, within run-to-run
 variance; vec/morsel/large unchanged). TSan-clean: no allocator-function data
 races across 4 runs incl. the real parallel_probe / wide_key_probe thread-pool
 tests.
+
+## Post-P5 (A/B — cross-thread free queue, flag RAY_THREAD_FREE_QUEUE)
+
+The optional MPSC owner-drain queue (compile flag, default OFF) routes a
+cross-thread free onto the OWNER heap's atomic `thread_free_head` stack; the
+owner drains+coalesces it continuously on its alloc slow-path and at GC,
+instead of leaving it on the freeing heap's `foreign` list until GC. With the
+flag OFF behavior is byte-identical to Post-P4.
+
+The producer-consumer workload is the headline case: one thread allocates,
+another frees cross-thread. Under the foreign-list model the freed blocks never
+return to the producer between GCs, so the producer keeps growing pools (RSS
+balloons to ~12 GB). With the owner-drain queue ON the producer reclaims them
+continuously and reuses pools — RSS collapses to tens of MB and throughput
+rises ~8x.
+
+```
+producer-consumer (morsel-8K):
+
+  flag OFF (foreign-list, Post-P4 model):
+    throughput   ~1.0-1.1 Mops/s   peak RSS ~12,310,496 KB  (~12 GB)
+
+  flag ON  (RAY_THREAD_FREE_QUEUE=1, owner-drain queue):
+    throughput   ~8.5-9.0 Mops/s   peak RSS ~34,272 KB      (~33 MB)
+```
+
+Net: peak RSS ~360x lower (~12 GB → ~33 MB) and throughput ~8x higher with the
+flag on. Build flag-on bench with `make bench-alloc-tfq`. TSan flag-on: no new
+allocator-function data races across 4 runs (the residual `pool.c`/`sort.c`/
+registry races and the intermittent join spin-wait stall reproduce identically
+on the flag-OFF+TSan build — pre-existing thread-pool behavior, not introduced
+by this change). ASan flag-on: clean.
