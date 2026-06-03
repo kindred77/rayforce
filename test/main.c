@@ -114,6 +114,7 @@ extern const test_entry_t fused_group_entries[];
 extern const test_entry_t fused_topk_entries[];
 extern const test_entry_t hash_entries[];
 extern const test_entry_t heap_entries[];
+extern const test_entry_t heap_parallel_entries[];
 extern const test_entry_t index_entries[];
 extern const test_entry_t ipc_entries[];
 extern const test_entry_t journal_entries[];
@@ -159,6 +160,7 @@ static const test_entry_t* const compiled_groups[] = {
     fused_topk_entries,
     hash_entries,
     heap_entries,
+    heap_parallel_entries,
     index_entries,    ipc_entries,
     journal_entries,
     lang_entries,     link_entries,
