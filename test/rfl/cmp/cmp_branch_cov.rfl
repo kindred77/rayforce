@@ -1,0 +1,288 @@
+;; Branch coverage for src/ops/cmp.c
+;; Targets uncovered branches across all six comparison operators,
+;; and/or/not logic, and char_str_cmp edge cases.
+
+;; ══════════════════════════════════════════════════════════════════
+;; 1. char_str_cmp: a is STR but b is NOT STR (line 36, !b_cs branch)
+;;    Exercises the short-circuit path where a_cs=true, b_cs=false.
+;; ══════════════════════════════════════════════════════════════════
+(> "hello" 5)  !- type
+(< "hello" 5)  !- type
+(>= "hello" 5) !- type
+(<= "hello" 5) !- type
+(== "hello" 5) !- type
+(!= "hello" 5) !- type
+
+;; ══════════════════════════════════════════════════════════════════
+;; 2. Temporal null comparisons — gt (lines 81-82)
+;;    null temporal vs non-null temporal, both-null temporal
+;; ══════════════════════════════════════════════════════════════════
+
+;; Both null temporals: > returns false (null == null, not greater)
+(> 0Nd 0Nd) -- false
+(> 0Np 0Np) -- false
+
+;; Left null, right non-null: null > X = false
+(> 0Nd 2024.01.15) -- false
+(> 0Np 2024.01.01D10:00:00.000000000) -- false
+
+;; Right null, left non-null: X > null = true
+(> 2024.01.15 0Nd) -- true
+(> 2024.01.01D10:00:00.000000000 0Np) -- true
+
+;; ══════════════════════════════════════════════════════════════════
+;; 3. Temporal null comparisons — lt (lines 102-103)
+;;    null temporal vs non-null temporal, both-null temporal
+;; ══════════════════════════════════════════════════════════════════
+
+;; Both null temporals: < returns false
+(< 0Nd 0Nd) -- false
+(< 0Np 0Np) -- false
+
+;; Left null, right non-null: null < X = true
+(< 0Nd 2024.01.15) -- true
+(< 0Np 2024.01.01D10:00:00.000000000) -- true
+
+;; Right null, left non-null: X < null = false
+(< 2024.01.15 0Nd) -- false
+(< 2024.01.01D10:00:00.000000000 0Np) -- false
+
+;; ══════════════════════════════════════════════════════════════════
+;; 4. Temporal null comparisons — gte (lines 123-125)
+;;    Three branches: both null -> true, left null -> false, right null -> true
+;; ══════════════════════════════════════════════════════════════════
+
+;; Both null temporals: >= returns true
+(>= 0Nd 0Nd) -- true
+(>= 0Np 0Np) -- true
+
+;; Left null, right non-null: null >= X = false
+(>= 0Nd 2024.01.15) -- false
+(>= 0Np 2024.01.01D10:00:00.000000000) -- false
+
+;; Right null, left non-null: X >= null = true
+(>= 2024.01.15 0Nd) -- true
+(>= 2024.01.01D10:00:00.000000000 0Np) -- true
+
+;; ══════════════════════════════════════════════════════════════════
+;; 5. Temporal null comparisons — lte (lines 145-147)
+;;    Three branches: both null -> true, left null -> true, right null -> false
+;; ══════════════════════════════════════════════════════════════════
+
+;; Both null temporals: <= returns true
+(<= 0Nd 0Nd) -- true
+(<= 0Np 0Np) -- true
+
+;; Left null, right non-null: null <= X = true
+(<= 0Nd 2024.01.15) -- true
+(<= 0Np 2024.01.01D10:00:00.000000000) -- true
+
+;; Right null, left non-null: X <= null = false
+(<= 2024.01.15 0Nd) -- false
+(<= 2024.01.01D10:00:00.000000000 0Np) -- false
+
+;; ══════════════════════════════════════════════════════════════════
+;; 6. lte temporal — false branch on temporal_as_ns (line 148)
+;;    Need a > b for temporal_as_ns(a) <= temporal_as_ns(b) to be false.
+;; ══════════════════════════════════════════════════════════════════
+(<= 2024.06.01 2024.01.15) -- false
+(<= 2024.01.01D10:00:01.000000000 2024.01.01D10:00:00.000000000) -- false
+
+;; ══════════════════════════════════════════════════════════════════
+;; 7. TIME null comparisons — covers TIME path in RAY_ATOM_IS_NULL
+;; ══════════════════════════════════════════════════════════════════
+;; TIME null atoms — exercises the TIME case in temporal null handling.
+;; Use (as 'TIME 0Ni) to create a null TIME atom (I32 sentinel mapped to TIME).
+(set nt (as 'TIME 0Ni))
+(set vt (as 'TIME 1000))
+
+(> vt nt)  -- true
+(> nt vt)  -- false
+(> nt nt)  -- false
+(< nt vt)  -- true
+(< vt nt)  -- false
+(< nt nt)  -- false
+(>= vt nt) -- true
+(>= nt vt) -- false
+(>= nt nt) -- true
+(<= nt vt) -- true
+(<= vt nt) -- false
+(<= nt nt) -- true
+
+;; ══════════════════════════════════════════════════════════════════
+;; 8. eq/neq type errors for non-numeric/non-temporal/non-str/non-sym/non-bool/non-guid
+;;    (lines 180, 201) — need two atom types where neither is the same
+;;    and one is non-numeric.  BOOL passes is_numeric, SYM does not.
+;; ══════════════════════════════════════════════════════════════════
+;; moved to section 17 (BOOL vs SYM)
+
+;; ══════════════════════════════════════════════════════════════════
+;; 9. neq GUID — memcmp==0 path (line 197, false branch)
+;;    Two identical GUIDs should make != return false.
+;; ══════════════════════════════════════════════════════════════════
+(set g1 (as 'guid "d49f18a4-1969-49e8-9b8a-6bb9a4832eea"))
+(!= g1 g1) -- false
+
+;; ══════════════════════════════════════════════════════════════════
+;; 10. gte/lte GUID — false branches (lines 121, 143)
+;;     Need two distinct GUIDs where memcmp gives a definitive < result.
+;; ══════════════════════════════════════════════════════════════════
+(set ga (as 'guid "00000000-0000-0000-0000-000000000001"))
+(set gb (as 'guid "00000000-0000-0000-0000-000000000002"))
+;; ga < gb, so (>= ga gb) = false  — exercises gte memcmp < 0 path
+(>= ga gb) -- false
+;; gb > ga, so (<= gb ga) = false  — exercises lte memcmp > 0 path
+(<= gb ga) -- false
+
+;; ══════════════════════════════════════════════════════════════════
+;; 11. and/or with scalar atom + bool vector (lines 238-239, 250-251)
+;;     ray_and_fn: ray_is_atom(a) && ray_is_vec(b) && b->type == RAY_BOOL
+;;     ray_or_fn:  ray_is_atom(a) && ray_is_vec(b) && b->type == RAY_BOOL
+;; ══════════════════════════════════════════════════════════════════
+;; For (and scalar vec), the variadic short-circuits when scalar is falsy.
+;; To reach ray_and_fn(atom, bool_vec), we need atom to be truthy.
+;; ray_and_fn then hits the atom+vec path (line 238).
+(and 1 [true false true])     -- [true false true]
+(and "hi" [true false true])  -- [true false true]
+;; For or: scalar falsy first, falls through to ray_or_fn(atom, bool_vec)
+(or  0 [true false true])     -- [true false true]
+(or  0 [false false false])   -- [false false false]
+
+;; ══════════════════════════════════════════════════════════════════
+;; 12. ray_or_fn scalar path: is_truthy(a) true (line 252)
+;;     When both a and b are scalar and a is truthy, the or result is truthy.
+;;     The variadic or short-circuits on truthy first arg (returns the atom).
+;;     To reach ray_or_fn scalar fallback, need falsy first then truthy second,
+;;     which goes through the loop and calls ray_or_fn(acc=falsy, v=truthy).
+;;     Then in ray_or_fn: vec checks fail, scalar fallback: is_truthy(a)=false,
+;;     is_truthy(b)=true -> make_bool(1) = true.
+;;     But is_truthy(a) being TRUE in the scalar fallback requires a truthy
+;;     scalar 'a' that is NOT in a bool-vec path. This happens when the
+;;     accumulator becomes truthy after a loop iteration.
+;; ══════════════════════════════════════════════════════════════════
+;; (or false false 1): acc=false(falsy), no short-circuit, loop i=1:
+;;   ray_or_fn(false, false) -> scalar, is_truthy(false)=0, is_truthy(false)=0 -> make_bool(0)=false
+;;   acc=false, loop i=2: ray_or_fn(false, 1) -> is_truthy(false)=0, is_truthy(1)=1 -> make_bool(1)=true
+(or false false 1) -- true
+;; Direct: 3-arg (or false 1 0): acc=false, no short-circuit.
+;; i=1: ray_or_fn(false, 1) -> scalar, truthy(false)=0, truthy(1)=1 -> true.
+;; acc=true, short-circuit at line 317 -> true
+(or false 1 0) -- true
+
+;; ══════════════════════════════════════════════════════════════════
+;; 13. Unreachable from RFL:
+;;     ray_and_fn scalar path: is_truthy(a)=false (line 240) —
+;;       the variadic and short-circuits falsy before calling ray_and_fn.
+;;     ray_or_fn scalar path: is_truthy(a)=true (line 252) —
+;;       the variadic or short-circuits truthy before calling ray_or_fn.
+;;     These branches are dead-by-dispatch (variadic wrapper always
+;;     short-circuits the determining value before the binary fn sees it).
+
+;; ══════════════════════════════════════════════════════════════════
+;; 13b. Variadic and/or error propagation (lines 290, 311)
+;;      When eval of a later arg errors, the variadic wrapper propagates it.
+;; ══════════════════════════════════════════════════════════════════
+(and true (sqrt 'foo))       !- type
+(and true true (sqrt 'foo))  !- type
+(or  false (sqrt 'foo))      !- type
+(or  false false (sqrt 'foo)) !- type
+
+;; ══════════════════════════════════════════════════════════════════
+;; 14. neq temporal — equal temporal values (line 200, false branch)
+;;     Need two equal temporal atoms for temporal_as_ns != to be false.
+;; ══════════════════════════════════════════════════════════════════
+(!= 2024.01.15 2024.01.15) -- false
+(!= 10:15:30.000 10:15:30.000) -- false
+(!= 2024.01.01D10:00:00.000000000 2024.01.01D10:00:00.000000000) -- false
+
+;; ══════════════════════════════════════════════════════════════════
+;; 15. Cross-temporal null comparisons
+;;     DATE null vs TIMESTAMP non-null, TIME null vs DATE non-null, etc.
+;;     These exercise the temporal null paths with mixed temporal types.
+;; ══════════════════════════════════════════════════════════════════
+(> 0Nd 2024.01.01D10:00:00.000000000) -- false
+(< 0Np 2024.01.15) -- true
+(>= 2024.01.01D10:00:00.000000000 0Nd) -- true
+(<= 0Np 2024.01.15) -- true
+
+;; ══════════════════════════════════════════════════════════════════
+;; 16. eq/neq temporal nulls — exercises null forms in eq/neq
+;;     (eq/neq handle null via the na/nb early-return, not temporal path)
+;; ══════════════════════════════════════════════════════════════════
+(== 0Nd 0Nd)       -- true
+(== 0Np 0Np)       -- true
+(== 0Nd 2024.01.15) -- false
+(!= 0Nd 2024.01.15) -- true
+(!= 0Nd 0Nd)       -- false
+
+;; ══════════════════════════════════════════════════════════════════
+;; 17. eq/neq — BOOL vs non-BOOL (exercises the BOOL-check branch
+;;     where a is BOOL but b is not, line 171/192 second branch)
+;; ══════════════════════════════════════════════════════════════════
+(== true 1)   -- true
+(== false 0)  -- true
+(!= true 0)  -- true
+(!= false 1) -- true
+
+;; BOOL a, non-BOOL b (b is SYM): falls through BOOL check
+;; This would cause type error since BOOL and SYM are not comparable as numeric
+(== true 'foo)  !- type
+(!= false 'foo) !- type
+
+;; ══════════════════════════════════════════════════════════════════
+;; 21. eq/neq: SYM vs numeric (line 173/194 SYM false branch + type error)
+;;     a=SYM, b=numeric -> SYM check sees b is not SYM -> false branch
+;;     Then falls through to !is_numeric(a) -> type error.
+;; ══════════════════════════════════════════════════════════════════
+(== 'foo 5)    !- type
+(!= 'foo 5)   !- type
+(== 5 'foo)    !- type
+(!= 5 'foo)   !- type
+
+;; ══════════════════════════════════════════════════════════════════
+;; 22. Temporal a, non-temporal b (lines 80/101/122/144/178/199 false branch)
+;;     Exercises the is_temporal(b)=false path when a is temporal.
+;; ══════════════════════════════════════════════════════════════════
+(> 2024.01.15 'foo) !- type
+(< 2024.01.15 'foo) !- type
+(>= 2024.01.15 'foo) !- type
+(<= 2024.01.15 'foo) !- type
+(== 2024.01.15 'foo) !- type
+(!= 2024.01.15 'foo) !- type
+
+;; ══════════════════════════════════════════════════════════════════
+;; 23. GUID a, non-GUID b (lines 77/99/120/142/175/196 false branch)
+;;     a=GUID, b=non-GUID -> GUID check b falls to false -> type error
+;; ══════════════════════════════════════════════════════════════════
+(set g_test (as 'guid "d49f18a4-1969-49e8-9b8a-6bb9a4832eea"))
+(> g_test 5)  !- type
+(< g_test 5)  !- type
+(>= g_test 5) !- type
+(<= g_test 5) !- type
+(== g_test 5) !- type
+(!= g_test 5) !- type
+
+;; ══════════════════════════════════════════════════════════════════
+;; 18. SYM a but non-SYM b — line 75/97 second branch
+;;     (a->type == -RAY_SYM && b->type == -RAY_SYM) where a is SYM, b is not
+;; ══════════════════════════════════════════════════════════════════
+(> 'foo 1)  !- type
+(< 'foo 1)  !- type
+(>= 'foo 1) !- type
+(<= 'foo 1) !- type
+
+;; ══════════════════════════════════════════════════════════════════
+;; 19. BOOL_VEC_BINOP — min-length truncation (line 209)
+;;     When vectors have different lengths, uses the shorter.
+;; ══════════════════════════════════════════════════════════════════
+(and [true true true false] [true false]) -- [true false]
+(or  [true false] [false false true])     -- [true false]
+
+;; ══════════════════════════════════════════════════════════════════
+;; 20. gt/lt temporal — false branch of temporal_as_ns comparison
+;;     (lines 83, 104: needs equal temporal values for > to be false)
+;; ══════════════════════════════════════════════════════════════════
+(> 2024.01.15 2024.01.15) -- false
+(< 2024.01.15 2024.01.15) -- false
+(> 10:15:30.000 10:15:30.000) -- false
+(< 10:15:30.000 10:15:30.000) -- false

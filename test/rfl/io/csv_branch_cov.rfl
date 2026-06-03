@@ -1,0 +1,273 @@
+;; Branch coverage for src/io/csv.c — targets reachable functional branches
+;; left uncovered by csv_types.rfl, csv_round2.rfl, csv_splayed.rfl,
+;; system/{read,write}_csv.rfl, and test/test_csv.c.
+;;
+;; Every fixture is written via .sys.exec printf (exit 0 asserted so a stale
+;; file can't false-pass), every assertion is deterministic.  Fixtures use the
+;; rf_test_csvbc_* prefix so the Makefile `rm -f rf_test_*.csv` rule keeps the
+;; tree clean; the few directories we create are removed in the header + footer.
+;;
+;; Targets (csv.c line refs approximate):
+;;   detect_type numeric scan : exponent sign (182), trailing junk → STR (185/223),
+;;                              negative numbers, double-dot, bare sign/exponent
+;;   promote_csv_type         : obs==UNKNOWN after cur set (228), I64→F64 widen (238)
+;;   fast_f64 inf/-inf parse  : ray_parse_f64 inf path → non-null inf
+;;   csv_write_f64 isinf      : 2542 — inf / -inf round-trip writes "inf"/"-inf"
+;;   csv_write_time sign      : 2503-2510 — negative ms-of-day → leading "-"
+;;   csv_write_timestamp neg  : 2523 — pre-2000 ns_in<0 day-borrow fixup
+;;   csv_write_date pre-epoch : 2485+ — negative day count
+;;   fast_time frac truncate  : 441 — >3 fractional digits, digits<3 guard stops
+;;   fast_time_ns frac trunc  : 469 — >9 fractional digits truncated
+;;   csv_write_str newline    : 2461 — embedded \n forces quoting on write
+;;   n_rows==0 empty table    : 1526 — header-only file → empty cols
+;;   single-column (no delim) : ncols==1 path, delimiter auto-detect default ','
+;;   scan_field_quoted EOF    : 303-316 — unterminated quote at buf end
+
+;; ── scrub stale state ────────────────────────────────────────────────────────
+(.sys.exec "rm -rf rf_test_csvbc_parted rf_test_csvbc_splayed") -- 0
+(.sys.exec "rm -f rf_test_csvbc_*.csv") -- 0
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 1. detect_type numeric scan — exponent with explicit sign (line 182).
+;;    "1e+5" and "2.5e-3" must scan as F64 (has_e, then sign consume).
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'x\n1e+5\n2.5e-3\n1E-2\n3.14\n' > rf_test_csvbc_sci.csv") -- 0
+(set Tsci (.csv.read "rf_test_csvbc_sci.csv"))
+(count Tsci) -- 4
+(type (at Tsci 'x)) -- 'F64
+(at (at Tsci 'x) 0) -- 100000.0
+(at (at Tsci 'x) 3) -- 3.14
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 2. detect_type — trailing junk after a numeric prefix → STR (break at 185,
+;;    p != end so falls through to the STR return at 223).  "12abc", "1.2.3"
+;;    (second dot terminates the scan), "1e" (exponent with no digits but
+;;    has_digit already true → still consumed as far as 'e', then 'e' is the
+;;    last char so p<end fails → STR).
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'x\n12abc\n1.2.3\nhello\n42\n' > rf_test_csvbc_junk.csv") -- 0
+(set Tjunk (.csv.read "rf_test_csvbc_junk.csv"))
+(count Tjunk) -- 4
+;; mixed numeric-looking + words → column is a SYM (low cardinality string).
+;; "42" was numeric in inference but the column widened to STR, so it is
+;; interned as the symbol "42".  Compare against the equivalent SYM vector.
+(type (at Tjunk 'x)) -- 'SYM
+(at Tjunk 'x) -- (as 'SYMBOL ["12abc" "1.2.3" "hello" "42"])
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 3. detect_type — negative integers and floats (leading '-' at line 174).
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'i,f\n-5,-1.5\n-10,-2.5\n-15,-3.5\n' > rf_test_csvbc_neg.csv") -- 0
+(set Tneg (.csv.read "rf_test_csvbc_neg.csv"))
+(count Tneg) -- 3
+(type (at Tneg 'i)) -- 'I64
+(type (at Tneg 'f)) -- 'F64
+(sum (at Tneg 'i)) -- -30
+(sum (at Tneg 'f)) -- -7.5
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 4. detect_type — bare sign / bare 'e' with no digits → STR (has_digit=false
+;;    at line 187 so the numeric return is skipped).  "-", "+", "e5", "." (the
+;;    bare-dot null sentinel collapses to UNKNOWN, the others stay STR).
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'x\n-\n+\ne5\nfoo\n' > rf_test_csvbc_baresign.csv") -- 0
+(set Tbs (.csv.read "rf_test_csvbc_baresign.csv"))
+(count Tbs) -- 4
+(type (at Tbs 'x)) -- 'SYM
+;; "-", "+", "e5", "foo" all fail the numeric scan (no digits / trailing junk)
+;; and intern as plain symbols.
+(at Tbs 'x) -- (as 'SYMBOL ["-" "+" "e5" "foo"])
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 5. promote_csv_type — leading nulls then a value (obs after cur, and the
+;;    obs==UNKNOWN early-return at line 228 for the trailing null rows).
+;;    First rows are null sentinels (UNKNOWN), then I64 establishes the type,
+;;    then more null sentinels keep it I64.
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'v\n\n\n42\n\n7\n' > rf_test_csvbc_leadnull.csv") -- 0
+(set Tln (.csv.read [I64] "rf_test_csvbc_leadnull.csv"))
+(count Tln) -- 5
+(nil? (at (at Tln 'v) 0)) -- true
+(nil? (at (at Tln 'v) 1)) -- true
+(at (at Tln 'v) 2) -- 42
+(nil? (at (at Tln 'v) 3)) -- true
+(at (at Tln 'v) 4) -- 7
+(sum (at Tln 'v)) -- 49
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 6. promote_csv_type — I64 seen first, then F64 widens the column (line 238).
+;;    Row order matters: integer rows precede the float row so `cur` is I64
+;;    when the F64 observation arrives.
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'v\n1\n2\n3\n4.5\n' > rf_test_csvbc_i2f.csv") -- 0
+(set Ti2f (.csv.read "rf_test_csvbc_i2f.csv"))
+(count Ti2f) -- 4
+(type (at Ti2f 'v)) -- 'F64
+(sum (at Ti2f 'v)) -- 10.5
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 7. fast_f64 inf / -inf parse + csv_write_f64 isinf branch (line 2542).
+;;    Explicit [F64] schema parses "inf"/"-inf" to real (non-null) infinities;
+;;    they survive a write round-trip as the literal text "inf"/"-inf".
+;;    An empty 4th cell parses with is_null=true → stored as NULL_F64, which
+;;    sets HAS_NULLS and round-trips back out as an empty field.
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'x\ninf\n-inf\n1.5\n\n' > rf_test_csvbc_inf.csv") -- 0
+(set Tinf (.csv.read [F64] "rf_test_csvbc_inf.csv"))
+(count Tinf) -- 4
+;; inf and -inf are NOT null (parse succeeds, payload is finite-infinity);
+;; 1.5 finite; the empty cell IS null (NULL_F64 sentinel + HAS_NULLS).
+(nil? (at (at Tinf 'x) 0)) -- false
+(nil? (at (at Tinf 'x) 1)) -- false
+(at (at Tinf 'x) 2) -- 1.5
+(nil? (at (at Tinf 'x) 3)) -- true
+;; Write back: the isinf branch emits literal "inf" / "-inf"; the null row
+;; emits an empty field.  Assert on the exact bytes.
+(.csv.write Tinf "rf_test_csvbc_inf_out.csv") -- 0
+(read "rf_test_csvbc_inf_out.csv") -- "x\ninf\n-inf\n1.5\n\n"
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 8. csv_write_time — negative ms-of-day (leading '-', lines 2503-2510) and
+;;    the fractional sub-branch (frac != 0 → "%02u:%02u:%02u.%03u").
+;;    A TIME atom holds signed ms-of-day; negative durations render with '-'.
+;; ════════════════════════════════════════════════════════════════════════════
+(set Ttm (table [t] (list (as 'TIME [-3723000 3723500 0]))))
+(.csv.write Ttm "rf_test_csvbc_negtime.csv") -- 0
+(set linesTm (split (read "rf_test_csvbc_negtime.csv") "\n"))
+(count linesTm) -- 5
+(at linesTm 0) -- "t"
+;; -3723000 ms = -(01:02:03) → "-01:02:03"
+(at linesTm 1) -- "-01:02:03"
+;; 3723500 ms = 01:02:03.500 → fractional branch
+(at linesTm 2) -- "01:02:03.500"
+(at linesTm 3) -- "00:00:00"
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 9. csv_write_date pre-epoch + csv_write_timestamp negative ns_in<0 fixup
+;;    (line 2523).  1999-12-31 is day -1; a pre-2000 timestamp has ns<0 so the
+;;    day-borrow branch fires.  Round-trip read recovers the original atoms.
+;; ════════════════════════════════════════════════════════════════════════════
+(set Tpre (table [d ts] (list (as 'DATE [1999.12.31 2000.01.01]) [1999.12.31D23:30:45.000000000 2000.01.02D00:00:00.000000000])))
+(.csv.write Tpre "rf_test_csvbc_pre.csv") -- 0
+(set linesPre (split (read "rf_test_csvbc_pre.csv") "\n"))
+(at linesPre 0) -- "d,ts"
+(at linesPre 1) -- "1999-12-31,1999-12-31T23:30:45"
+(at linesPre 2) -- "2000-01-01,2000-01-02T00:00:00"
+;; Round-trip the pre-epoch values back into typed columns.
+(set Rpre (.csv.read [DATE TIMESTAMP] "rf_test_csvbc_pre.csv"))
+(at (at Rpre 'd) 0) -- 1999.12.31
+(at (at Rpre 'ts) 0) -- 1999.12.31D23:30:45.000000000
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 10. fast_time fractional digit handling — >3 digits truncates to ms
+;;     (the `digits < 3` loop guard at line 441 stops early), and the
+;;     fast_time_ns >9-digit truncation (line 469) for timestamps.
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 't\n10:30:45.123456\n10:30:45.1\n' > rf_test_csvbc_tfrac.csv") -- 0
+(set Ttf (.csv.read [TIME] "rf_test_csvbc_tfrac.csv"))
+(count Ttf) -- 2
+;; .123456 truncates to .123 ms; .1 pads to .100
+(at (at Ttf 't) 0) -- 10:30:45.123
+(at (at Ttf 't) 1) -- 10:30:45.100
+(.sys.exec "printf 'ts\n2000-01-01T00:00:00.1234567899\n' > rf_test_csvbc_tsfrac.csv") -- 0
+(set Ttsf (.csv.read [TIMESTAMP] "rf_test_csvbc_tsfrac.csv"))
+(count Ttsf) -- 1
+;; 10 fractional digits → first 9 kept (123456789), 10th dropped.
+(at (at Ttsf 'ts) 0) -- 2000.01.01D00:00:00.123456789
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 11. csv_write_str — embedded newline forces quoting (line 2461 '\n' branch).
+;;     Round-trip: the quoted field with an embedded \n survives (slow-path
+;;     row scanner treats the inner \n as part of one logical row).
+;; ════════════════════════════════════════════════════════════════════════════
+(set Tnl (table [k v] (list [1 2] (list "a\nb" "plain"))))
+(.csv.write Tnl "rf_test_csvbc_strnl.csv") -- 0
+;; Exact bytes: the first value is quoted because it contains a newline.
+(read "rf_test_csvbc_strnl.csv") -- "k,v\n1,\"a\nb\"\n2,plain\n"
+(set Rnl (.csv.read [I64 STR] "rf_test_csvbc_strnl.csv"))
+(count Rnl) -- 2
+(at (at Rnl 'v) 0) -- "a\nb"
+(at (at Rnl 'v) 1) -- "plain"
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 12. Header-only file → n_rows==0 empty-table path (line 1526).
+;;     The data section is empty, so build_row_offsets returns 0 and the
+;;     reader produces a table of empty F64 columns named by the header.
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'a,b,c\n' > rf_test_csvbc_hdronly.csv") -- 0
+(set Th (.csv.read "rf_test_csvbc_hdronly.csv"))
+(count Th) -- 0
+(key Th) -- ['a 'b 'c]
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 13. Single-column file (no delimiter anywhere) — ncols stays 1, delimiter
+;;     auto-detect sees 0 commas / 0 tabs and defaults to ',' (line 1468).
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'only\n10\n20\n30\n' > rf_test_csvbc_single.csv") -- 0
+(set Tone (.csv.read "rf_test_csvbc_single.csv"))
+(count Tone) -- 3
+(key Tone) -- ['only]
+(sum (at Tone 'only)) -- 60
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 14. Unterminated quoted field at end of buffer (scan_field_quoted loop runs
+;;     to buf_end without a closing quote, lines 303-316).  The final field is
+;;     opened with a quote but the file ends before the closing quote.
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'a,b\n1,\"unterminated' > rf_test_csvbc_unterm.csv") -- 0
+(set Tu (.csv.read [I64 STR] "rf_test_csvbc_unterm.csv"))
+(count Tu) -- 1
+(at (at Tu 'a) 0) -- 1
+(at (at Tu 'b) 0) -- "unterminated"
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 15. promote_csv_type DATE+DATE keeps DATE (cur==obs early return, line 229)
+;;     and pure all-bool column resolves to BOOL (csv_resolve_inferred_type).
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'd,flag\n2020-01-01,true\n2020-06-15,false\n2021-12-31,true\n' > rf_test_csvbc_datebool.csv") -- 0
+(set Tdb (.csv.read "rf_test_csvbc_datebool.csv"))
+(count Tdb) -- 3
+(at (at Tdb 'd) 0) -- 2020.01.01
+(at (at Tdb 'flag) 0) -- true
+(at (at Tdb 'flag) 1) -- false
+(type (at Tdb 'flag)) -- 'B8
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 16. .csv.parted with explicit narrow-int schema (U8/I16/I32 parse-and-narrow
+;;     arms in csv_materialize_rows + csv_parse_serial), driven through the
+;;     parted writer so the chunk/materialize loop is exercised.  The
+;;     [names][types] form sets header=false, so the fixture is header-less.
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf '1,100,1000\n2,200,2000\n3,300,3000\n' > rf_test_csvbc_narrow.csv") -- 0
+(set Rnarrow (.csv.parted [u h w] [U8 I16 I32] "rf_test_csvbc_narrow.csv" "rf_test_csvbc_parted" 'nt))
+(count Rnarrow) -- 3
+(sum (at Rnarrow 'u)) -- 6
+(sum (at Rnarrow 'h)) -- 600
+(sum (at Rnarrow 'w)) -- 6000
+;; max/min confirm the narrow-int values survived parse + parted round-trip.
+(max (at Rnarrow 'u)) -- (as 'U8 3)
+(min (at Rnarrow 'h)) -- (as 'I16 100)
+(max (at Rnarrow 'w)) -- (as 'I32 3000)
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 17. .csv.splayed with narrow-int + null-bearing columns — exercises the
+;;     splayed writer's non-SYM fixed-width append path plus HAS_NULLS footer.
+;;     The explicit [names][types] form sets header=false, so the fixture is
+;;     header-less and column names come from the [a b] names vector.
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf '1,10\n,20\n3,\n' > rf_test_csvbc_spn.csv") -- 0
+(set Tspn (.csv.splayed [a b] [I16 I32] "rf_test_csvbc_spn.csv" "rf_test_csvbc_splayed"))
+(count Tspn) -- 3
+(nil? (at (at Tspn 'a) 1)) -- true
+(nil? (at (at Tspn 'b) 2)) -- true
+(sum (at Tspn 'a)) -- 4
+(sum (at Tspn 'b)) -- 30
+;; Re-load from disk recovers the sentinel-encoded nulls + HAS_NULLS footer.
+(set Rspn (.db.splayed.get "rf_test_csvbc_splayed"))
+(count Rspn) -- 3
+(nil? (at (at Rspn 'a) 1)) -- true
+(nil? (at (at Rspn 'b) 2)) -- true
+
+;; ── cleanup ──────────────────────────────────────────────────────────────────
+(.sys.exec "rm -f rf_test_csvbc_*.csv") -- 0
+(.sys.exec "rm -rf rf_test_csvbc_parted rf_test_csvbc_splayed") -- 0

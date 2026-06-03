@@ -1328,6 +1328,951 @@ static test_result_t test_count_distinct_pg_stream(void) {
 }
 
 /* --------------------------------------------------------------------------
+ * Test 19: ray_hll_init / ray_hll_reset / ray_hll_free direct
+ *
+ * The init/reset entry points are otherwise dead in the RFL pipeline —
+ * ray_count_distinct_approx never reaches them (the scalar HLL path is
+ * gated at len >= 1<<20 inside exec_count_distinct, and the pg kernels
+ * only ever call ray_hll_init_sparse).  Direct C-level invocation drives
+ * the precision-clamp branches (p<4 → 4, p>18 → 18), the scratch_calloc
+ * dense allocation in ray_hll_init, the reset paths for both dense and
+ * sparse modes, and the free / NULL-handle short-circuits.
+ *
+ * Also exercises ray_hll_add against a dense sketch — the fast path that
+ * production code keeps fully inline — and ray_hll_estimate over dense.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_hll_kernels_direct(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* --- 1. ray_hll_init clamps p<4 → 4, p>18 → 18 ----------------------- */
+    {
+        ray_hll_t h;
+        TEST_ASSERT_EQ_I(ray_hll_init(&h, 2), 0);       /* clamped to 4 */
+        TEST_ASSERT_EQ_I(h.p, 4);
+        TEST_ASSERT_EQ_I(h.m, 1u << 4);
+        TEST_ASSERT_NOT_NULL(h.regs);
+        ray_hll_free(&h);
+    }
+    {
+        ray_hll_t h;
+        TEST_ASSERT_EQ_I(ray_hll_init(&h, 20), 0);      /* clamped to 18 */
+        TEST_ASSERT_EQ_I(h.p, 18);
+        TEST_ASSERT_EQ_I(h.m, 1u << 18);
+        TEST_ASSERT_NOT_NULL(h.regs);
+        ray_hll_free(&h);
+    }
+
+    /* --- 2. ray_hll_init / ray_hll_add / ray_hll_estimate on dense ------- */
+    {
+        ray_hll_t h;
+        TEST_ASSERT_EQ_I(ray_hll_init(&h, 14), 0);
+        for (int64_t i = 0; i < 10000; i++) ray_hll_add(&h, ray_hash_i64(i));
+        int64_t est = ray_hll_estimate(&h);
+        double err = fabs((double)est - 10000.0) / 10000.0;
+        TEST_ASSERT_FMT(err < 0.05,
+                        "estimate %lld vs truth 10000 (err=%.3f)",
+                        (long long)est, err);
+
+        /* --- 3. ray_hll_reset clears dense in-place --------------------- */
+        ray_hll_reset(&h);
+        TEST_ASSERT_EQ_I(ray_hll_estimate(&h), 0);
+        ray_hll_free(&h);
+    }
+
+    /* --- 4. ray_hll_init NULL guard ------------------------------------- */
+    TEST_ASSERT_EQ_I(ray_hll_init(NULL, 14), -1);
+
+    /* --- 4b. ray_hll_estimate NULL + m==0 guards + uninit-sketch path --- */
+    TEST_ASSERT_EQ_I(ray_hll_estimate(NULL), 0);
+    {
+        ray_hll_t z;
+        memset(&z, 0, sizeof z);                         /* m == 0          */
+        TEST_ASSERT_EQ_I(ray_hll_estimate(&z), 0);
+
+        /* Force the `else` arm at hll.c L224 — neither regs nor sparse_keys
+         * is set, but m > 0.  Linear-counting collapses to log(m/m) = 0. */
+        z.m = 16;
+        z.p = 4;
+        TEST_ASSERT_EQ_I(ray_hll_estimate(&z), 0);
+    }
+
+    /* --- 5. ray_hll_free on a zeroed (uninitialised) sketch is a no-op  - */
+    {
+        ray_hll_t z;
+        memset(&z, 0, sizeof z);
+        ray_hll_free(&z);                                /* must not crash */
+        ray_hll_free(NULL);                              /* NULL guard     */
+    }
+
+    /* --- 6. ray_hll_reset on uninit / NULL sketch is a no-op ------------ */
+    ray_hll_reset(NULL);
+    {
+        ray_hll_t z;
+        memset(&z, 0, sizeof z);
+        ray_hll_reset(&z);                               /* no regs/sparse */
+    }
+
+    /* --- 7. ray_hll_reset of sparse sketch clears count, keeps buffers - */
+    {
+        ray_hll_t h;
+        uint32_t  sparse[RAY_HLL_SPARSE_CAP];
+        uint8_t   dense[1u << 8];
+        ray_hll_init_sparse(&h, 8, sparse, RAY_HLL_SPARSE_CAP, dense);
+        ray_hll_add(&h, ray_hash_i64(1));
+        ray_hll_add(&h, ray_hash_i64(2));
+        ray_hll_add(&h, ray_hash_i64(3));
+        TEST_ASSERT(h.sparse_count >= 1u, "sparse_count populated");
+
+        /* ray_hll_estimate on a sparse-only sketch: covers the
+         * `else if (h->sparse_keys)` arm at hll.c L212. */
+        int64_t est_sparse = ray_hll_estimate(&h);
+        TEST_ASSERT_FMT(est_sparse >= 2 && est_sparse <= 4,
+                        "sparse estimate: got %lld (expected ~3)",
+                        (long long)est_sparse);
+
+        ray_hll_reset(&h);
+        TEST_ASSERT_EQ_I(h.sparse_count, 0);
+        TEST_ASSERT_NOT_NULL(h.sparse_keys);             /* buffer retained */
+        ray_hll_free(&h);                                /* tagged → no-op  */
+    }
+
+    /* --- 8. ray_hll_promote_to_dense scratch-alloc branch --------------
+     * When a sparse sketch lacks a caller-owned dense buffer (low-bit
+     * cleared _hdr), promote falls back to scratch_calloc.  We force
+     * this by zero-ing the tagged pointer after init_sparse so the
+     * caller_dense_buf() helper returns NULL.
+     */
+    {
+        ray_hll_t h;
+        uint32_t  sparse[RAY_HLL_SPARSE_CAP];
+        uint8_t   dense[1u << 8];
+        ray_hll_init_sparse(&h, 8, sparse, RAY_HLL_SPARSE_CAP, dense);
+        /* Fill sparse to just below cap so the next add doesn't auto-promote.
+         * Then manually drop the tagged dense buf and call promote — that's
+         * the scratch_calloc fallback arm. */
+        for (uint32_t i = 0; i < RAY_HLL_SPARSE_CAP / 2; i++) {
+            ray_hll_add(&h, ray_hash_i64((int64_t)i + 7));
+        }
+        h._hdr = NULL;       /* drop tagged pointer so promote takes the scratch arm */
+        ray_hll_promote_to_dense(&h);
+        TEST_ASSERT_NOT_NULL(h.regs);
+        TEST_ASSERT(h._hdr != NULL, "scratch_calloc allocated a real hdr");
+        /* Estimate against the post-promotion sketch — RAY_HLL_SPARSE_CAP/2
+         * = 128 unique vals; HLL within ±25 % at p=8 (m=256, std error ~6.5%). */
+        int64_t est = ray_hll_estimate(&h);
+        TEST_ASSERT_FMT(est >= 96 && est <= 160,
+                        "promote+estimate: got %lld, expected ~128",
+                        (long long)est);
+        ray_hll_free(&h);    /* free the scratch arena */
+    }
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test 20: ray_count_distinct_approx — scalar entry-point edge cases
+ *
+ * The scalar HLL entry is gated behind exec_count_distinct's
+ * `len >= (1<<20)` check, so atom / empty / error / unsupported-type
+ * branches near the function head are otherwise unreachable from RFL.
+ * Direct invocation lights up:
+ *   - NULL / error input pass-through
+ *   - atom input (null → 0, non-null → 1)
+ *   - non-vec / non-atom input → "type" error
+ *   - empty vec → 0
+ *   - unsupported element type (e.g. GUID) → "type" error
+ *   - happy path on a small vec (len < 1<<20 still hits the kernel
+ *     since we bypass the gate)
+ * -------------------------------------------------------------------------- */
+static test_result_t test_hll_count_distinct_approx_edges(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* NULL input pass-through. */
+    TEST_ASSERT(ray_count_distinct_approx(NULL) == NULL,
+                "NULL passes through");
+
+    /* Error input pass-through.  ray_count_distinct_approx's early-return
+     * gives back the same pointer it received — release once. */
+    ray_t* err_in = ray_error("synth", "for HLL pass-through test");
+    ray_t* err_out = ray_count_distinct_approx(err_in);
+    TEST_ASSERT(RAY_IS_ERR(err_out), "error stays an error");
+    TEST_ASSERT(err_out == err_in, "error returned by identity");
+    ray_release(err_in);
+
+    /* Atom non-null → 1.  Use a plain I64 atom. */
+    {
+        ray_t* a = ray_i64(42);
+        ray_t* r = ray_count_distinct_approx(a);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        TEST_ASSERT_EQ_I(r->type, -RAY_I64);
+        TEST_ASSERT_EQ_I(r->i64, 1);
+        ray_release(r);
+        ray_release(a);
+    }
+
+    /* Atom null → 0.  ray_typed_null(-RAY_I64) gives an I64-typed null atom. */
+    {
+        ray_t* nul = ray_typed_null(-RAY_I64);
+        if (nul) {
+            ray_t* r = ray_count_distinct_approx(nul);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+            TEST_ASSERT_EQ_I(r->type, -RAY_I64);
+            TEST_ASSERT_EQ_I(r->i64, 0);
+            ray_release(r);
+            ray_release(nul);
+        }
+    }
+
+    /* Empty vec → 0. */
+    {
+        ray_t* v = ray_vec_new(RAY_I64, 0);
+        v->len = 0;
+        ray_t* r = ray_count_distinct_approx(v);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        TEST_ASSERT_EQ_I(r->i64, 0);
+        ray_release(r);
+        ray_release(v);
+    }
+
+    /* List input is non-atom non-vec → "type" error. */
+    {
+        ray_t* lst = ray_list_new(0);
+        if (lst) {
+            ray_t* r = ray_count_distinct_approx(lst);
+            TEST_ASSERT(RAY_IS_ERR(r), "list → type error");
+            ray_release(r);
+            ray_release(lst);
+        }
+    }
+
+    /* Unsupported element type — RAY_GUID is not in the hashable list. */
+    {
+        ray_t* v = ray_vec_new(RAY_GUID, 4);
+        v->len = 4;
+        memset(ray_data(v), 0, 4 * 16);
+        ray_t* r = ray_count_distinct_approx(v);
+        TEST_ASSERT(RAY_IS_ERR(r), "GUID → type error");
+        ray_release(r);
+        ray_release(v);
+    }
+
+    /* Happy path — small I64 vec hits cda_scalar_fn serial arm (n < THRESH).
+     * 10000 vals, 100 distinct → linear-counting branch.  Tolerance ±5 %. */
+    {
+        const int64_t Nlo = 10000;
+        ray_t* v = ray_vec_new(RAY_I64, Nlo);
+        v->len = Nlo;
+        int64_t* p = (int64_t*)ray_data(v);
+        for (int64_t i = 0; i < Nlo; i++) p[i] = i % 100;
+        ray_t* r = ray_count_distinct_approx(v);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        TEST_ASSERT_EQ_I(r->type, -RAY_I64);
+        double err = fabs((double)r->i64 - 100.0) / 100.0;
+        TEST_ASSERT_FMT(err <= 0.05,
+                        "I64 small-card: got %lld (err=%.3f)",
+                        (long long)r->i64, err);
+        ray_release(r);
+        ray_release(v);
+    }
+
+    /* Happy path — F64 vec including NaN-skip arm in cda_scalar_fn. */
+    {
+        const int64_t Nlo = 10000;
+        ray_t* v = ray_vec_new(RAY_F64, Nlo);
+        v->len = Nlo;
+        double* p = (double*)ray_data(v);
+        for (int64_t i = 0; i < Nlo; i++)
+            p[i] = (i & 7) == 0 ? (0.0 / 0.0) : (double)(i % 100);
+        ray_t* r = ray_count_distinct_approx(v);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        double err = fabs((double)r->i64 - 100.0) / 100.0;
+        TEST_ASSERT_FMT(err <= 0.10,
+                        "F64+NaN: got %lld (err=%.3f)",
+                        (long long)r->i64, err);
+        ray_release(r);
+        ray_release(v);
+    }
+
+    /* Happy path — STR vec hits cda_scalar_fn STR arm via ray_str_vec_get.
+     * RFL coverage of this arm is awkward (lists materialise as RAY_LIST),
+     * so we exercise it directly here. */
+    {
+        ray_t* v = ray_vec_new(RAY_STR, 0);
+        v = ray_str_vec_append(v, "apple", 5);
+        v = ray_str_vec_append(v, "banana", 6);
+        v = ray_str_vec_append(v, "apple", 5);
+        v = ray_str_vec_append(v, "cherry", 6);
+        v = ray_str_vec_append(v, "", 0);              /* skipped: len 0  */
+        v = ray_str_vec_append(v, "banana", 6);
+        ray_t* r = ray_count_distinct_approx(v);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        /* 3 distinct (apple, banana, cherry); empty skipped. */
+        TEST_ASSERT_FMT(r->i64 >= 2 && r->i64 <= 4,
+                        "STR distinct: got %lld (expected ~3)",
+                        (long long)r->i64);
+        ray_release(r);
+        ray_release(v);
+    }
+
+    /* Large-vec parallel cda_scalar_fn typed-arm coverage.
+     *
+     * The RFL pipeline routes `(count (distinct (as 'I32 V)))` over 1.05 M
+     * rows through ray_count_distinct_approx, but in practice the optimiser
+     * may fold the typed-cast / distinct chain so cda_scalar_fn's I32 / I16
+     * / U8 / SYM arms don't actually execute in the worker.  Direct-API
+     * coverage here closes those arms unambiguously.  Each typed vec is
+     * sized just over the parallel threshold (1.05 M rows) so the kernel
+     * dispatches the per-worker arm. */
+    const int64_t Nbig = 1050000;
+#define HLL_SCALAR_BIG(TYPE, CT, ASSIGN, EXPECT)                            \
+    do {                                                                    \
+        ray_t* v = ray_vec_new(TYPE, Nbig);                                 \
+        TEST_ASSERT_NOT_NULL(v);                                            \
+        v->len = Nbig;                                                      \
+        CT* p = (CT*)ray_data(v);                                           \
+        for (int64_t i = 0; i < Nbig; i++) { ASSIGN; }                      \
+        ray_t* r = ray_count_distinct_approx(v);                            \
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));                                   \
+        double err = fabs((double)r->i64 - (double)(EXPECT)) /              \
+                     (double)(EXPECT);                                      \
+        TEST_ASSERT_FMT(err <= 0.10,                                        \
+                        #TYPE " big: got %lld (expected ~%d, err=%.3f)",    \
+                        (long long)r->i64, (int)(EXPECT), err);             \
+        ray_release(r);                                                     \
+        ray_release(v);                                                     \
+    } while (0)
+
+    HLL_SCALAR_BIG(RAY_I32,       int32_t,  p[i] = (int32_t)(i % 1000),  1000);
+    HLL_SCALAR_BIG(RAY_I16,       int16_t,  p[i] = (int16_t)(i % 250),    250);
+    HLL_SCALAR_BIG(RAY_U8,        uint8_t,  p[i] = (uint8_t)(i % 200),    200);
+    HLL_SCALAR_BIG(RAY_BOOL,      uint8_t,  p[i] = (uint8_t)(i & 1),        2);
+    HLL_SCALAR_BIG(RAY_DATE,      int32_t,  p[i] = (int32_t)(i % 500),    500);
+    HLL_SCALAR_BIG(RAY_TIME,      int32_t,  p[i] = (int32_t)(i % 500),    500);
+    HLL_SCALAR_BIG(RAY_TIMESTAMP, int64_t,  p[i] = (int64_t)(i % 500),    500);
+
+#undef HLL_SCALAR_BIG
+
+    /* SYM widths W8 / W16 / W32 / W64 — direct ray_count_distinct_approx
+     * over 1.05 M rows hits each SYM width branch of cda_scalar_fn. */
+#define HLL_SCALAR_BIG_SYM(WIDTH, CT)                                       \
+    do {                                                                    \
+        ray_t* v = ray_sym_vec_new((WIDTH), Nbig);                          \
+        TEST_ASSERT_NOT_NULL(v);                                            \
+        v->len = Nbig;                                                      \
+        CT* p = (CT*)ray_data(v);                                           \
+        for (int64_t i = 0; i < Nbig; i++)                                  \
+            p[i] = (CT)((i % 200) + 1);                                     \
+        ray_t* r = ray_count_distinct_approx(v);                            \
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));                                   \
+        double err = fabs((double)r->i64 - 200.0) / 200.0;                  \
+        TEST_ASSERT_FMT(err <= 0.10,                                        \
+                        "SYM-W%d big: got %lld (err=%.3f)",                 \
+                        (int)((1 << (WIDTH)) * 8),                          \
+                        (long long)r->i64, err);                            \
+        ray_release(r);                                                     \
+        ray_release(v);                                                     \
+    } while (0)
+
+    HLL_SCALAR_BIG_SYM(RAY_SYM_W8,  uint8_t);
+    HLL_SCALAR_BIG_SYM(RAY_SYM_W16, uint16_t);
+    HLL_SCALAR_BIG_SYM(RAY_SYM_W32, uint32_t);
+    HLL_SCALAR_BIG_SYM(RAY_SYM_W64, int64_t);
+
+#undef HLL_SCALAR_BIG_SYM
+
+    /* HAS_NULLS arms for the I64 / I32 / I16 / F64 scalar paths. */
+    {
+        const int64_t Nh = 1050000;
+        ray_t* v = ray_vec_new(RAY_I64, Nh);
+        v->len = Nh;
+        v->attrs |= RAY_ATTR_HAS_NULLS;
+        int64_t* p = (int64_t*)ray_data(v);
+        for (int64_t i = 0; i < Nh; i++)
+            p[i] = (i % 5 == 0) ? NULL_I64 : (int64_t)(i % 1000);
+        ray_t* r = ray_count_distinct_approx(v);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        ray_release(r);
+        ray_release(v);
+    }
+    {
+        const int64_t Nh = 1050000;
+        ray_t* v = ray_vec_new(RAY_I32, Nh);
+        v->len = Nh;
+        v->attrs |= RAY_ATTR_HAS_NULLS;
+        int32_t* p = (int32_t*)ray_data(v);
+        for (int64_t i = 0; i < Nh; i++)
+            p[i] = (i % 5 == 0) ? NULL_I32 : (int32_t)(i % 1000);
+        ray_t* r = ray_count_distinct_approx(v);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        ray_release(r);
+        ray_release(v);
+    }
+    {
+        const int64_t Nh = 1050000;
+        ray_t* v = ray_vec_new(RAY_I16, Nh);
+        v->len = Nh;
+        v->attrs |= RAY_ATTR_HAS_NULLS;
+        int16_t* p = (int16_t*)ray_data(v);
+        for (int64_t i = 0; i < Nh; i++)
+            p[i] = (i % 5 == 0) ? NULL_I16 : (int16_t)(i % 250);
+        ray_t* r = ray_count_distinct_approx(v);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        ray_release(r);
+        ray_release(v);
+    }
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test 21: ray_count_distinct_approx_pg_buf — per-group CSR direct.
+ *
+ * Production code only reaches the buf entry-point through the streaming-
+ * bailout fallback in group.c (line 1317).  Driving this directly lets us
+ * hit every typed arm of cda_pg_buf_task and the error guards at the
+ * function head:
+ *   - NULL src / NULL idx_buf / NULL offsets / NULL counts / NULL out  → -1
+ *   - error src → -1
+ *   - unsupported element type → -1
+ *   - n_groups <= 0 → 0 (early success)
+ *   - p clamping (p<4 → 4, p>14 → 14)
+ *   - happy paths across I64/I32/I16/U8/F64/SYM-W8 with serial dispatch
+ *     (n_groups < 4 forces the cda_pg_buf_task serial arm).
+ * -------------------------------------------------------------------------- */
+static test_result_t test_hll_count_distinct_approx_pg_buf_direct(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* Tiny CSR layout for the error guards. */
+    int64_t idx_buf[]  = { 0, 1, 2, 3 };
+    int64_t offsets[]  = { 0, 2 };
+    int64_t counts[]   = { 2, 2 };
+    int64_t out[2]     = { -1, -1 };
+
+    /* Error guards: every NULL pointer returns -1. */
+    {
+        ray_t* v = ray_vec_new(RAY_I64, 4);
+        v->len = 4;
+        int64_t* p = (int64_t*)ray_data(v);
+        p[0]=1; p[1]=2; p[2]=3; p[3]=4;
+        TEST_ASSERT_EQ_I(ray_count_distinct_approx_pg_buf(
+            NULL, idx_buf, offsets, counts, 2, 14, out), -1);
+        TEST_ASSERT_EQ_I(ray_count_distinct_approx_pg_buf(
+            v, NULL, offsets, counts, 2, 14, out), -1);
+        TEST_ASSERT_EQ_I(ray_count_distinct_approx_pg_buf(
+            v, idx_buf, NULL, counts, 2, 14, out), -1);
+        TEST_ASSERT_EQ_I(ray_count_distinct_approx_pg_buf(
+            v, idx_buf, offsets, NULL, 2, 14, out), -1);
+        TEST_ASSERT_EQ_I(ray_count_distinct_approx_pg_buf(
+            v, idx_buf, offsets, counts, 2, 14, NULL), -1);
+        ray_release(v);
+    }
+
+    /* Error input → -1. */
+    {
+        ray_t* err = ray_error("test", "synthetic");
+        TEST_ASSERT_EQ_I(ray_count_distinct_approx_pg_buf(
+            err, idx_buf, offsets, counts, 2, 14, out), -1);
+        ray_release(err);
+    }
+
+    /* Unsupported type → -1. */
+    {
+        ray_t* v = ray_vec_new(RAY_GUID, 4);
+        v->len = 4;
+        memset(ray_data(v), 0, 4 * 16);
+        TEST_ASSERT_EQ_I(ray_count_distinct_approx_pg_buf(
+            v, idx_buf, offsets, counts, 2, 14, out), -1);
+        ray_release(v);
+    }
+
+    /* n_groups <= 0 → 0 early success. */
+    {
+        ray_t* v = ray_vec_new(RAY_I64, 4);
+        v->len = 4;
+        int64_t* p = (int64_t*)ray_data(v);
+        p[0]=1; p[1]=2; p[2]=3; p[3]=4;
+        TEST_ASSERT_EQ_I(ray_count_distinct_approx_pg_buf(
+            v, idx_buf, offsets, counts, 0, 14, out), 0);
+        TEST_ASSERT_EQ_I(ray_count_distinct_approx_pg_buf(
+            v, idx_buf, offsets, counts, -1, 14, out), 0);
+        ray_release(v);
+    }
+
+    /* Happy path per typed arm — n_groups = 3 forces serial dispatch
+     * (< 4 task threshold).  Each group covers a 5-row slice of the vec.
+     *
+     * Layout: 15 rows split as group g owns rows [5g, 5g+5).  Vals are
+     * v[r] = r % 3, so each group sees distinct vals {0, 1, 2} → expect 3
+     * (with HLL std error within ±25 % at p=14 for such small N this is
+     * essentially exact via linear counting). */
+    const int64_t NROWS = 15;
+    const int64_t NG    = 3;
+    int64_t pg_idx[15], pg_off[3], pg_cnt[3];
+    for (int64_t i = 0; i < NROWS; i++) pg_idx[i] = i;
+    for (int64_t g = 0; g < NG; g++) {
+        pg_off[g] = g * 5;
+        pg_cnt[g] = 5;
+    }
+    int64_t pg_out[3];
+
+#define HLL_PG_BUF_CASE(TYPE, CT, ASSIGN)                                  \
+    do {                                                                    \
+        ray_t* v = ray_vec_new(TYPE, NROWS);                                \
+        TEST_ASSERT_NOT_NULL(v);                                            \
+        v->len = NROWS;                                                     \
+        CT* p = (CT*)ray_data(v);                                           \
+        for (int64_t i = 0; i < NROWS; i++) { ASSIGN; }                     \
+        memset(pg_out, 0, sizeof pg_out);                                   \
+        int rc = ray_count_distinct_approx_pg_buf(                          \
+            v, pg_idx, pg_off, pg_cnt, NG, 14, pg_out);                     \
+        TEST_ASSERT_EQ_I(rc, 0);                                            \
+        for (int64_t g = 0; g < NG; g++) {                                  \
+            TEST_ASSERT_FMT(pg_out[g] >= 2 && pg_out[g] <= 4,               \
+                            #TYPE " pg %lld: got %lld (expected ~3)",       \
+                            (long long)g, (long long)pg_out[g]);            \
+        }                                                                   \
+        ray_release(v);                                                     \
+    } while (0)
+
+    HLL_PG_BUF_CASE(RAY_I64,       int64_t,  p[i] = (int64_t)(i % 3));
+    HLL_PG_BUF_CASE(RAY_I32,       int32_t,  p[i] = (int32_t)(i % 3));
+    HLL_PG_BUF_CASE(RAY_I16,       int16_t,  p[i] = (int16_t)(i % 3));
+    HLL_PG_BUF_CASE(RAY_U8,        uint8_t,  p[i] = (uint8_t)(i % 3));
+    HLL_PG_BUF_CASE(RAY_BOOL,      uint8_t,  p[i] = (uint8_t)((i & 1)));
+    HLL_PG_BUF_CASE(RAY_F64,       double,   p[i] = (double)(i % 3));
+    HLL_PG_BUF_CASE(RAY_DATE,      int32_t,  p[i] = (int32_t)(i % 3));
+    HLL_PG_BUF_CASE(RAY_TIME,      int32_t,  p[i] = (int32_t)(i % 3));
+    HLL_PG_BUF_CASE(RAY_TIMESTAMP, int64_t,  p[i] = (int64_t)(i % 3));
+
+#undef HLL_PG_BUF_CASE
+
+    /* SYM-W8 (the default when dict <= 255) via the public SYM constructor. */
+    {
+        ray_t* v = ray_sym_vec_new(RAY_SYM_W8, NROWS);
+        TEST_ASSERT_NOT_NULL(v);
+        v->len = NROWS;
+        uint8_t* p = (uint8_t*)ray_data(v);
+        for (int64_t i = 0; i < NROWS; i++) p[i] = (uint8_t)((i % 3) + 1);
+        memset(pg_out, 0, sizeof pg_out);
+        int rc = ray_count_distinct_approx_pg_buf(
+            v, pg_idx, pg_off, pg_cnt, NG, 14, pg_out);
+        TEST_ASSERT_EQ_I(rc, 0);
+        for (int64_t g = 0; g < NG; g++) {
+            TEST_ASSERT_FMT(pg_out[g] >= 2 && pg_out[g] <= 4,
+                            "SYM-W8 pg %lld: got %lld (expected ~3)",
+                            (long long)g, (long long)pg_out[g]);
+        }
+        ray_release(v);
+    }
+
+    /* SYM-W16 (dict > 255 forces W16) via ray_sym_vec_new directly. */
+    {
+        ray_t* v = ray_sym_vec_new(RAY_SYM_W16, NROWS);
+        TEST_ASSERT_NOT_NULL(v);
+        v->len = NROWS;
+        uint16_t* p = (uint16_t*)ray_data(v);
+        for (int64_t i = 0; i < NROWS; i++) p[i] = (uint16_t)((i % 3) + 1);
+        memset(pg_out, 0, sizeof pg_out);
+        int rc = ray_count_distinct_approx_pg_buf(
+            v, pg_idx, pg_off, pg_cnt, NG, 14, pg_out);
+        TEST_ASSERT_EQ_I(rc, 0);
+        for (int64_t g = 0; g < NG; g++) {
+            TEST_ASSERT_FMT(pg_out[g] >= 2 && pg_out[g] <= 4,
+                            "SYM-W16 pg %lld: got %lld (expected ~3)",
+                            (long long)g, (long long)pg_out[g]);
+        }
+        ray_release(v);
+    }
+
+    /* SYM-W32. */
+    {
+        ray_t* v = ray_sym_vec_new(RAY_SYM_W32, NROWS);
+        TEST_ASSERT_NOT_NULL(v);
+        v->len = NROWS;
+        uint32_t* p = (uint32_t*)ray_data(v);
+        for (int64_t i = 0; i < NROWS; i++) p[i] = (uint32_t)((i % 3) + 1);
+        memset(pg_out, 0, sizeof pg_out);
+        int rc = ray_count_distinct_approx_pg_buf(
+            v, pg_idx, pg_off, pg_cnt, NG, 14, pg_out);
+        TEST_ASSERT_EQ_I(rc, 0);
+        for (int64_t g = 0; g < NG; g++) {
+            TEST_ASSERT_FMT(pg_out[g] >= 2 && pg_out[g] <= 4,
+                            "SYM-W32 pg %lld: got %lld (expected ~3)",
+                            (long long)g, (long long)pg_out[g]);
+        }
+        ray_release(v);
+    }
+
+    /* SYM-W64. */
+    {
+        ray_t* v = ray_sym_vec_new(RAY_SYM_W64, NROWS);
+        TEST_ASSERT_NOT_NULL(v);
+        v->len = NROWS;
+        int64_t* p = (int64_t*)ray_data(v);
+        for (int64_t i = 0; i < NROWS; i++) p[i] = (int64_t)((i % 3) + 1);
+        memset(pg_out, 0, sizeof pg_out);
+        int rc = ray_count_distinct_approx_pg_buf(
+            v, pg_idx, pg_off, pg_cnt, NG, 14, pg_out);
+        TEST_ASSERT_EQ_I(rc, 0);
+        for (int64_t g = 0; g < NG; g++) {
+            TEST_ASSERT_FMT(pg_out[g] >= 2 && pg_out[g] <= 4,
+                            "SYM-W64 pg %lld: got %lld (expected ~3)",
+                            (long long)g, (long long)pg_out[g]);
+        }
+        ray_release(v);
+    }
+
+    /* I64 with HAS_NULLS — exercises the `if (hn && v == NULL_I64) continue`
+     * branch in cda_pg_buf_task. */
+    {
+        ray_t* v = ray_vec_new(RAY_I64, NROWS);
+        v->len = NROWS;
+        v->attrs |= RAY_ATTR_HAS_NULLS;
+        int64_t* p = (int64_t*)ray_data(v);
+        for (int64_t i = 0; i < NROWS; i++) {
+            p[i] = (i % 5 == 0) ? NULL_I64 : (int64_t)(i % 3);
+        }
+        memset(pg_out, 0, sizeof pg_out);
+        int rc = ray_count_distinct_approx_pg_buf(
+            v, pg_idx, pg_off, pg_cnt, NG, 14, pg_out);
+        TEST_ASSERT_EQ_I(rc, 0);
+        ray_release(v);
+    }
+
+    /* High-cardinality n_groups > 65536 path — drives the element-based
+     * dispatch arm in ray_count_distinct_approx_pg_buf (hll.c L581-583).
+     * Each group has 1 row → fast.  Use p=8 to keep per-task stack regs
+     * bounded (256 bytes regs[1<<8] + 1 KB sparse_buf).
+     *
+     * Auxiliary int64 buffers (idx_hi, off_hi, cnt_hi, out_hi) live in
+     * fresh I64 vecs so we stay on the internal allocator (no libc malloc). */
+    {
+        const int64_t NG_HI    = 65600;
+        const int64_t NROWS_HI = 65600;
+        ray_t* v_hi   = ray_vec_new(RAY_I64, NROWS_HI);
+        ray_t* idx_v  = ray_vec_new(RAY_I64, NROWS_HI);
+        ray_t* off_v  = ray_vec_new(RAY_I64, NG_HI);
+        ray_t* cnt_v  = ray_vec_new(RAY_I64, NG_HI);
+        ray_t* out_v  = ray_vec_new(RAY_I64, NG_HI);
+        TEST_ASSERT_NOT_NULL(v_hi);
+        TEST_ASSERT_NOT_NULL(idx_v);
+        TEST_ASSERT_NOT_NULL(off_v);
+        TEST_ASSERT_NOT_NULL(cnt_v);
+        TEST_ASSERT_NOT_NULL(out_v);
+        v_hi->len  = NROWS_HI;
+        idx_v->len = NROWS_HI;
+        off_v->len = NG_HI;
+        cnt_v->len = NG_HI;
+        out_v->len = NG_HI;
+        int64_t* vp     = (int64_t*)ray_data(v_hi);
+        int64_t* idx_hi = (int64_t*)ray_data(idx_v);
+        int64_t* off_hi = (int64_t*)ray_data(off_v);
+        int64_t* cnt_hi = (int64_t*)ray_data(cnt_v);
+        int64_t* out_hi = (int64_t*)ray_data(out_v);
+        for (int64_t i = 0; i < NROWS_HI; i++) {
+            vp[i]     = i;
+            idx_hi[i] = i;
+        }
+        for (int64_t g = 0; g < NG_HI; g++) {
+            off_hi[g] = g;
+            cnt_hi[g] = 1;
+            out_hi[g] = -1;
+        }
+        /* Use p=8 for a tiny dense buffer footprint per task (256 bytes
+         * vs 16 KB at p=14) — the n_groups > 65536 branch routes via
+         * ray_pool_dispatch (element-based) instead of dispatch_n. */
+        int rc = ray_count_distinct_approx_pg_buf(
+            v_hi, idx_hi, off_hi, cnt_hi, NG_HI, 8, out_hi);
+        TEST_ASSERT_EQ_I(rc, 0);
+        /* Each group has exactly 1 distinct value → estimate ≈ 1.
+         * At p=8 (m=256) the small-cardinality linear-counting branch
+         * gives a near-exact answer; allow {1, 2} as the expected range. */
+        int64_t ones = 0;
+        for (int64_t g = 0; g < NG_HI; g++) {
+            if (out_hi[g] >= 1 && out_hi[g] <= 2) ones++;
+        }
+        TEST_ASSERT_FMT(ones >= NG_HI - 100,
+                        "got %lld single-distinct groups out of %lld",
+                        (long long)ones, (long long)NG_HI);
+        ray_release(out_v);
+        ray_release(cnt_v);
+        ray_release(off_v);
+        ray_release(idx_v);
+        ray_release(v_hi);
+    }
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test 22: ray_count_distinct_approx_pg_stream — error guards + SYM widths
+ *
+ * The existing test_count_distinct_pg_stream covers the I64 happy path.
+ * This test fills in:
+ *   - NULL src / NULL row_gid / NULL out → -1
+ *   - error src / unsupported type → -1
+ *   - n_rows <= 0 / n_groups <= 0 → -1
+ *   - p clamping
+ *   - happy paths for I32 / I16 / U8 / BOOL / F64 / DATE / TIME / TS
+ *     (each through a sub-1M-row path that still flips the type switch)
+ *   - SYM widths W8 / W16 / W32 / W64 hits the four width branches
+ *
+ * Layout for the happy paths: NROWS = 1.05 M (just above the gate),
+ * NGROUPS = 32 (within the [16, 482] streaming window), gid = i % NGROUPS,
+ * val = i % 4 — each group sees 4 distinct values across ~32 K rows.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_hll_count_distinct_approx_pg_stream_types(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    const int64_t NROWS   = 1100000;
+    const int64_t NGROUPS = 32;
+
+    /* Common gid array. */
+    ray_t* gids = ray_vec_new(RAY_I64, NROWS);
+    gids->len = NROWS;
+    int64_t* gp = (int64_t*)ray_data(gids);
+    for (int64_t i = 0; i < NROWS; i++) gp[i] = i % NGROUPS;
+
+    int64_t out[32];
+
+    /* Error guards. */
+    {
+        ray_t* v = ray_vec_new(RAY_I64, NROWS);
+        v->len = NROWS;
+        int64_t* p = (int64_t*)ray_data(v);
+        for (int64_t i = 0; i < NROWS; i++) p[i] = i % 4;
+
+        TEST_ASSERT_EQ_I(ray_count_distinct_approx_pg_stream(
+            NULL, gp, NROWS, NGROUPS, 14, out), -1);
+        TEST_ASSERT_EQ_I(ray_count_distinct_approx_pg_stream(
+            v, NULL, NROWS, NGROUPS, 14, out), -1);
+        TEST_ASSERT_EQ_I(ray_count_distinct_approx_pg_stream(
+            v, gp, NROWS, NGROUPS, 14, NULL), -1);
+        TEST_ASSERT_EQ_I(ray_count_distinct_approx_pg_stream(
+            v, gp, 0, NGROUPS, 14, out), -1);
+        TEST_ASSERT_EQ_I(ray_count_distinct_approx_pg_stream(
+            v, gp, NROWS, 0, 14, out), -1);
+
+        /* Error input. */
+        ray_t* err = ray_error("test", "synthetic");
+        TEST_ASSERT_EQ_I(ray_count_distinct_approx_pg_stream(
+            err, gp, NROWS, NGROUPS, 14, out), -1);
+        ray_release(err);
+
+        ray_release(v);
+    }
+
+    /* Unsupported type → -1. */
+    {
+        ray_t* v = ray_vec_new(RAY_GUID, NROWS);
+        v->len = NROWS;
+        memset(ray_data(v), 0, (size_t)NROWS * 16);
+        TEST_ASSERT_EQ_I(ray_count_distinct_approx_pg_stream(
+            v, gp, NROWS, NGROUPS, 14, out), -1);
+        ray_release(v);
+    }
+
+#define HLL_PG_STREAM_CASE(TYPE, CT, ASSIGN, DISTINCT)                      \
+    do {                                                                    \
+        ray_t* v = ray_vec_new(TYPE, NROWS);                                \
+        TEST_ASSERT_NOT_NULL(v);                                            \
+        v->len = NROWS;                                                     \
+        CT* p = (CT*)ray_data(v);                                           \
+        for (int64_t i = 0; i < NROWS; i++) { ASSIGN; }                     \
+        memset(out, 0, sizeof out);                                         \
+        int rc = ray_count_distinct_approx_pg_stream(                       \
+            v, gp, NROWS, NGROUPS, 14, out);                                \
+        TEST_ASSERT_EQ_I(rc, 0);                                            \
+        for (int64_t g = 0; g < NGROUPS; g++) {                             \
+            double err = fabs((double)out[g] - (double)(DISTINCT)) /        \
+                         (double)(DISTINCT);                                \
+            TEST_ASSERT_FMT(err <= 0.10,                                    \
+                            #TYPE " pg %lld: got %lld (expected ~%d, err=%.3f)", \
+                            (long long)g, (long long)out[g],                \
+                            (int)(DISTINCT), err);                          \
+        }                                                                   \
+        ray_release(v);                                                     \
+    } while (0)
+
+    /* gid = i % NGROUPS, val = i % 4 → each group sees vals
+     * {gid % 4, (gid + NGROUPS) % 4, (gid + 2 NGROUPS) % 4, ...}.  Since
+     * gcd(NGROUPS=32, 4)=4, each group sees exactly 1 distinct val (val =
+     * (gid % 4)).  Use val = i % 100 instead → 100 vals % 32 distinct
+     * groupings, and each group sees gcd-pattern over 100 vals: ~50 each. */
+
+    HLL_PG_STREAM_CASE(RAY_I64,       int64_t,  p[i] = (int64_t)(i % 100), 100 / 4);  /* 25 per group */
+    HLL_PG_STREAM_CASE(RAY_I32,       int32_t,  p[i] = (int32_t)(i % 100), 25);
+    HLL_PG_STREAM_CASE(RAY_I16,       int16_t,  p[i] = (int16_t)(i % 100), 25);
+    HLL_PG_STREAM_CASE(RAY_U8,        uint8_t,  p[i] = (uint8_t)(i % 100), 25);
+    /* BOOL: gid = i % NGROUPS (32), so i & 1 aliases with the group index
+     * (every gid sees only one BOOL value).  Use a non-aliasing pattern
+     * — i % 7 < 4 — to give each group both true and false. */
+    HLL_PG_STREAM_CASE(RAY_BOOL,      uint8_t,  p[i] = (uint8_t)((i % 7) < 4),  2);
+    HLL_PG_STREAM_CASE(RAY_F64,       double,   p[i] = (double)(i % 100),  25);
+    HLL_PG_STREAM_CASE(RAY_DATE,      int32_t,  p[i] = (int32_t)(i % 100), 25);
+    HLL_PG_STREAM_CASE(RAY_TIME,      int32_t,  p[i] = (int32_t)(i % 100), 25);
+    HLL_PG_STREAM_CASE(RAY_TIMESTAMP, int64_t,  p[i] = (int64_t)(i % 100), 25);
+
+#undef HLL_PG_STREAM_CASE
+
+    /* SYM width branches.  Skip values of 0 (treated as null sentinel by
+     * the SYM arm) by offsetting by 1.  Use val pattern i % 100 + 1. */
+#define HLL_PG_STREAM_SYM(WIDTH, CT)                                        \
+    do {                                                                    \
+        ray_t* v = ray_sym_vec_new((WIDTH), NROWS);                         \
+        TEST_ASSERT_NOT_NULL(v);                                            \
+        v->len = NROWS;                                                     \
+        CT* p = (CT*)ray_data(v);                                           \
+        for (int64_t i = 0; i < NROWS; i++)                                 \
+            p[i] = (CT)((i % 100) + 1);                                     \
+        memset(out, 0, sizeof out);                                         \
+        int rc = ray_count_distinct_approx_pg_stream(                       \
+            v, gp, NROWS, NGROUPS, 14, out);                                \
+        TEST_ASSERT_EQ_I(rc, 0);                                            \
+        for (int64_t g = 0; g < NGROUPS; g++) {                             \
+            double err = fabs((double)out[g] - 25.0) / 25.0;                \
+            TEST_ASSERT_FMT(err <= 0.10,                                    \
+                            "SYM-W%d pg %lld: got %lld (err=%.3f)",         \
+                            (int)((1 << (WIDTH)) * 8),                      \
+                            (long long)g, (long long)out[g], err);          \
+        }                                                                   \
+        ray_release(v);                                                     \
+    } while (0)
+
+    HLL_PG_STREAM_SYM(RAY_SYM_W8,  uint8_t);
+    HLL_PG_STREAM_SYM(RAY_SYM_W16, uint16_t);
+    HLL_PG_STREAM_SYM(RAY_SYM_W32, uint32_t);
+    HLL_PG_STREAM_SYM(RAY_SYM_W64, int64_t);
+
+#undef HLL_PG_STREAM_SYM
+
+    /* p clamping — p<4 → 4, p>14 → 14.  Both arms return 0 success on a
+     * small happy-path input. */
+    {
+        ray_t* v = ray_vec_new(RAY_I64, NROWS);
+        v->len = NROWS;
+        int64_t* p = (int64_t*)ray_data(v);
+        for (int64_t i = 0; i < NROWS; i++) p[i] = i % 10;
+        TEST_ASSERT_EQ_I(ray_count_distinct_approx_pg_stream(
+            v, gp, NROWS, NGROUPS, 2, out), 0);          /* clamped to 4 */
+        TEST_ASSERT_EQ_I(ray_count_distinct_approx_pg_stream(
+            v, gp, NROWS, NGROUPS, 20, out), 0);         /* clamped to 14 */
+        ray_release(v);
+    }
+
+    ray_release(gids);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test 23: ray_hll_merge edge cases — sparse → sparse, sparse → dense,
+ * NULL guards, precision mismatch.
+ *
+ * ray_hll_merge has four (sparse|dense) × (sparse|dense) arms.  The
+ * dense+dense and sparse+dense arms are already exercised through the
+ * pg_stream merge loop (test 18).  Here we hit:
+ *   - NULL guards (dst NULL, src NULL)
+ *   - precision mismatch returns silently
+ *   - sparse→sparse: src sparse + dst sparse → promotes dst, then sparse-
+ *     into-dense replay
+ *   - sparse src + dense dst (other direction from existing coverage)
+ *   - merge that triggers promote on a dst with no caller buffer (scratch
+ *     calloc inside promote_to_dense) — exercises lines 85-93 of hll.c
+ *     and the dense-dst path inside ray_hll_merge.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_hll_merge_edges(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* NULL guards: silent no-op. */
+    ray_hll_merge(NULL, NULL);
+
+    /* Precision mismatch: silent no-op. */
+    {
+        ray_hll_t a, b;
+        TEST_ASSERT_EQ_I(ray_hll_init(&a, 14), 0);
+        TEST_ASSERT_EQ_I(ray_hll_init(&b, 12), 0);
+        ray_hll_merge(&a, &b);                            /* m mismatch */
+        ray_hll_free(&a);
+        ray_hll_free(&b);
+    }
+
+    /* sparse → sparse: dst is sparse with a caller buffer.  Merge a sparse
+     * src into it, which should promote dst to dense (via the caller buf
+     * arm) and then replay src's sparse entries. */
+    {
+        uint32_t dst_sparse[RAY_HLL_SPARSE_CAP];
+        uint8_t  dst_dense[1u << 14];
+        uint32_t src_sparse[RAY_HLL_SPARSE_CAP];
+        uint8_t  src_dense[1u << 14];
+
+        ray_hll_t dst, src;
+        ray_hll_init_sparse(&dst, 14, dst_sparse,
+                            RAY_HLL_SPARSE_CAP, dst_dense);
+        ray_hll_init_sparse(&src, 14, src_sparse,
+                            RAY_HLL_SPARSE_CAP, src_dense);
+
+        /* Populate both with a handful of distinct values. */
+        for (int64_t i = 0; i < 50; i++) {
+            ray_hll_add(&dst, ray_hash_i64(i));
+            ray_hll_add(&src, ray_hash_i64(i + 10000));
+        }
+        ray_hll_merge(&dst, &src);
+        TEST_ASSERT_NOT_NULL(dst.regs);                   /* dst promoted */
+        int64_t est = ray_hll_estimate(&dst);
+        /* Union should be ~100 distinct.  p=14 is very tight here. */
+        TEST_ASSERT_FMT(est >= 90 && est <= 110,
+                        "sparse+sparse merge: got %lld (expected ~100)",
+                        (long long)est);
+
+        ray_hll_free(&dst);
+        ray_hll_free(&src);
+    }
+
+    /* sparse src + dense dst: dst has regs (allocated via ray_hll_init), src
+     * is sparse.  Exercises the `src->sparse_keys` else-if branch in
+     * ray_hll_merge → hll_merge_sparse_into_dense. */
+    {
+        ray_hll_t dst;
+        TEST_ASSERT_EQ_I(ray_hll_init(&dst, 14), 0);
+        for (int64_t i = 0; i < 100; i++) ray_hll_add(&dst, ray_hash_i64(i));
+
+        uint32_t src_sparse[RAY_HLL_SPARSE_CAP];
+        uint8_t  src_dense[1u << 14];
+        ray_hll_t src;
+        ray_hll_init_sparse(&src, 14, src_sparse,
+                            RAY_HLL_SPARSE_CAP, src_dense);
+        for (int64_t i = 0; i < 50; i++)
+            ray_hll_add(&src, ray_hash_i64(i + 10000));
+
+        ray_hll_merge(&dst, &src);
+        int64_t est = ray_hll_estimate(&dst);
+        TEST_ASSERT_FMT(est >= 135 && est <= 165,
+                        "sparse→dense merge: got %lld (expected ~150)",
+                        (long long)est);
+
+        ray_hll_free(&dst);
+        ray_hll_free(&src);
+    }
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
  * Test registry
  * -------------------------------------------------------------------------- */
 
@@ -1350,5 +2295,10 @@ const test_entry_t group_extra_entries[] = {
     { "group_extra/sym_group_top_count_emit_filter", test_sym_group_top_count_emit_filter, NULL, NULL },
     { "group_extra/five_key_group_top_count_emit_filter", test_five_key_group_top_count_emit_filter, NULL, NULL },
     { "group_extra/count_distinct_pg_stream",      test_count_distinct_pg_stream,      NULL, NULL },
+    { "group_extra/hll_kernels_direct",            test_hll_kernels_direct,            NULL, NULL },
+    { "group_extra/hll_count_distinct_approx_edges", test_hll_count_distinct_approx_edges, NULL, NULL },
+    { "group_extra/hll_count_distinct_approx_pg_buf_direct", test_hll_count_distinct_approx_pg_buf_direct, NULL, NULL },
+    { "group_extra/hll_count_distinct_approx_pg_stream_types", test_hll_count_distinct_approx_pg_stream_types, NULL, NULL },
+    { "group_extra/hll_merge_edges",               test_hll_merge_edges,               NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };

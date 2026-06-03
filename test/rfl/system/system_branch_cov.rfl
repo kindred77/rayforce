@@ -1,0 +1,206 @@
+;; system_branch_cov.rfl — branch coverage for src/ops/system.c (part 1).
+;;
+;; Covers: ser/de, splayed set/get, parted get, mount, os.size, os.list,
+;; guid, eval, parse, meta, system, getenv, setenv, gc.
+;;
+;; Conventions:
+;;   LHS -- RHS   assert equality
+;;   EXPR !- TAG  assert error containing TAG
+;;
+;; All filesystem fixtures use /tmp/rfl_sys_bc_* prefix.
+
+;; ────────────── pre-flight cleanup ──────────────
+(.sys.exec "rm -rf /tmp/rfl_sys_bc_*")
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_ser_fn / ray_de_fn  (lines 47-54)
+;; ══════════════════════════════════════════════════════════════════════
+(de (ser 0))   -- 0
+(de (ser 0N))  -- 0N
+(de (ser ""))  -- ""
+(count (de (ser (take [1] 0)))) -- 0
+(de (ser (list 1 "a" 'b)))  -- (list 1 "a" 'b)
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_set_splayed_fn  (lines 78-99) — arity / type guards
+;; ══════════════════════════════════════════════════════════════════════
+(.db.splayed.set "/tmp/rfl_sys_bc_a") !- domain
+(.db.splayed.set "/tmp/rfl_sys_bc_a" (table [x] (list [1])) "/tmp/foo" "extra") !- domain
+(.db.splayed.set 42 (table [x] (list [1]))) !- type
+(.db.splayed.set "/tmp/rfl_sys_bc_a/" 42) !- type
+(.db.splayed.set "/tmp/rfl_sys_bc_a/" null) !- type
+
+;; 3-arg form: explicit sym_path
+(.db.splayed.set "/tmp/rfl_sys_bc_sym3/" (table [s v] (list ['A 'B] [1 2])) "/tmp/rfl_sys_bc_sym3/sym")
+(count (.db.splayed.get "/tmp/rfl_sys_bc_sym3/")) -- 2
+;; 3-arg form: non-string third arg falls back to default sym path
+(.db.splayed.set "/tmp/rfl_sys_bc_sym3b/" (table [s v] (list ['A 'B] [1 2])) 42)
+(count (.db.splayed.get "/tmp/rfl_sys_bc_sym3b/")) -- 2
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_get_splayed_fn  (lines 102-116) — arity / type guards
+;; ══════════════════════════════════════════════════════════════════════
+(.db.splayed.get) !- domain
+(.db.splayed.get "/tmp/rfl_sys_bc_sym3/" "/tmp/rfl_sys_bc_sym3/sym" "extra") !- domain
+(.db.splayed.get 42) !- type
+(count (.db.splayed.get "/tmp/rfl_sys_bc_sym3/" "/tmp/rfl_sys_bc_sym3/sym")) -- 2
+(count (.db.splayed.get "/tmp/rfl_sys_bc_sym3/" 42)) -- 2
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_get_parted_fn  (lines 119-137) — arity / type / name guards
+;; ══════════════════════════════════════════════════════════════════════
+(.db.parted.get "/tmp/foo") !- domain
+(.db.parted.get "/tmp/foo" 't "extra") !- domain
+(.db.parted.get 42 't) !- type
+(.db.parted.get "/tmp/rfl_sys_bc_sym3/" "t") !- type
+(.db.parted.get "/tmp/rfl_sys_bc_sym3/" null) !- type
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_db_splayed_mount_fn  (lines 228-259) — error paths
+;; ══════════════════════════════════════════════════════════════════════
+(.db.splayed.mount) !- domain
+(.db.splayed.mount "/tmp" "extra") !- domain
+(.db.splayed.mount 42) !- type
+(.db.splayed.mount "/tmp/rfl_sys_bc_nosuch/") !- io
+(.sys.exec "mkdir -p /tmp/rfl_sys_bc_empty_root/")
+(count (.db.splayed.mount "/tmp/rfl_sys_bc_empty_root/")) -- 0
+(.sys.exec "mkdir -p /tmp/rfl_sys_bc_fileonly/ && touch /tmp/rfl_sys_bc_fileonly/notadir")
+(count (.db.splayed.mount "/tmp/rfl_sys_bc_fileonly/")) -- 0
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_db_parted_mount_fn  (lines 266-318) — error paths
+;; ══════════════════════════════════════════════════════════════════════
+(.db.parted.mount) !- domain
+(.db.parted.mount "/tmp" "extra") !- domain
+(.db.parted.mount 42) !- type
+(.sys.exec "mkdir -p /tmp/rfl_sys_bc_notparted/child_dir/")
+(.db.parted.mount "/tmp/rfl_sys_bc_notparted/") !- domain
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_os_size_fn  (lines 338-349)
+;; ══════════════════════════════════════════════════════════════════════
+(.os.size [1 2 3]) !- type
+(.os.size 'foo) !- type
+(.os.size "/tmp/rfl_sys_bc_nofile.txt") !- io
+(.os.size "/tmp") !- io
+(.sys.exec "touch /tmp/rfl_sys_bc_empty.txt")
+(.os.size "/tmp/rfl_sys_bc_empty.txt") -- 0
+(.sys.exec "printf 'abcdef' > /tmp/rfl_sys_bc_6bytes.txt")
+(.os.size "/tmp/rfl_sys_bc_6bytes.txt") -- 6
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_os_list_fn  (lines 365-425)
+;; ══════════════════════════════════════════════════════════════════════
+(.os.list [1 2]) !- type
+(.os.list 42) !- type
+(.os.list "/tmp/rfl_sys_bc_nosuchdir/") !- io
+(.os.list "/tmp/rfl_sys_bc_empty.txt") !- io
+;; Directory with a single file
+(.sys.exec "mkdir -p /tmp/rfl_sys_bc_onefile/ && touch /tmp/rfl_sys_bc_onefile/x")
+(count (.os.list "/tmp/rfl_sys_bc_onefile/")) -- 1
+;; dot-prefixed entries (not . or ..) ARE listed
+(.sys.exec "touch /tmp/rfl_sys_bc_onefile/.hidden")
+(count (.os.list "/tmp/rfl_sys_bc_onefile/")) -- 2
+;; > 16 entries triggers realloc growth path
+(.sys.exec "mkdir -p /tmp/rfl_sys_bc_bigdir && cd /tmp/rfl_sys_bc_bigdir && for i in $(seq 1 20); do touch f_$(printf '%02d' $i); done")
+(count (.os.list "/tmp/rfl_sys_bc_bigdir/")) -- 20
+;; Empty directory — previously triggered qsort(NULL, 0, ...) UB.
+(.sys.exec "mkdir -p /tmp/rfl_sys_bc_emptydir")
+(count (.os.list "/tmp/rfl_sys_bc_emptydir/")) -- 0
+(.sys.exec "rm -rf /tmp/rfl_sys_bc_emptydir")
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_guid_fn  (lines 456-475)
+;; ══════════════════════════════════════════════════════════════════════
+(guid "x") !- type
+(guid 'foo) !- type
+(guid -1) !- domain
+(count (guid 0)) -- 0
+(type (guid 0)) -- 'GUID
+(count (guid 1)) -- 1
+(diverse (guid 10)) -- true
+(count (guid 3i)) -- 3
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_eval_builtin_fn  (line 482-484)
+;; ══════════════════════════════════════════════════════════════════════
+(eval (parse "(+ 1 2)")) -- 3
+(eval (parse "(* 3 4)")) -- 12
+(eval 42) -- 42
+(eval "hello") -- "hello"
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_parse_builtin_fn  (lines 487-493)
+;; ══════════════════════════════════════════════════════════════════════
+(parse 42) !- type
+(parse 'foo) !- type
+(type (parse "(+ 1 2)")) -- 'LIST
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_meta_fn  (lines 499-535)
+;; ══════════════════════════════════════════════════════════════════════
+(count (meta 42)) -- 1
+(at (meta 42) 'type) -- 'i64
+(count (meta "hello")) -- 1
+(at (meta "hello") 'type) -- 'str
+(count (meta [1 2 3])) -- 2
+(at (meta [1 2 3]) 'type) -- 'I64
+(at (meta [1 2 3]) 'len) -- 3
+(at (meta (dict ['a 'b] [1 2])) 'len) -- 2
+(at (meta (table [x y] (list [1 2] [3 4]))) 'len) -- 2
+(at (meta (list 1 2 3 4 5)) 'len) -- 5
+(at (meta true) 'type) -- 'b8
+(at (meta 2024.01.15) 'type) -- 'date
+(at (meta 0x01) 'type) -- 'u8
+(at (meta 1h) 'type) -- 'i16
+(at (meta 1i) 'type) -- 'i32
+(at (meta 1.0) 'type) -- 'f64
+;; (meta null) errors with "type" since !x is true for null
+(meta null) !- type
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_system_fn  (lines 542-548) — type guard
+;; ══════════════════════════════════════════════════════════════════════
+(.sys.exec 42) !- type
+(.sys.exec 'foo) !- type
+(.sys.exec "echo hello >/dev/null") -- 0
+(== 0 (.sys.exec "false")) -- false
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_getenv_fn / ray_setenv_fn  (lines 551-575)
+;; ══════════════════════════════════════════════════════════════════════
+(.os.getenv 42) !- type
+(.os.getenv 'foo) !- type
+(.os.getenv "RFL_NO_SUCH_ENV_VAR_12345") -- ""
+(.os.setenv "RFL_SYS_BC_T" "value1")
+(.os.getenv "RFL_SYS_BC_T") -- "value1"
+(.os.setenv 42 "val") !- type
+(.os.setenv "name" 42) !- type
+(.os.setenv 42 42) !- type
+(.os.setenv "RFL_SYS_BC_T" "second")
+(.os.getenv "RFL_SYS_BC_T") -- "second"
+
+;; ══════════════════════════════════════════════════════════════════════
+;; ray_gc_fn  (line 539)
+;; ══════════════════════════════════════════════════════════════════════
+(.sys.gc) -- 0
+(.sys.gc 0) -- 0
+(.sys.gc "x") -- 0
+
+;; ══════════════════════════════════════════════════════════════════════
+;; name_looks_partition / dir_is_parted_root edge cases
+;; Mount-related coverage is in db_mount.rfl; here we exercise the
+;; error guards that db_mount.rfl doesn't hit.
+;; ══════════════════════════════════════════════════════════════════════
+;; Alphabetic-named children — not partitions
+(.sys.exec "rm -rf /tmp/rfl_sys_bc_alpha && mkdir -p /tmp/rfl_sys_bc_alpha/abc/")
+(.db.parted.mount "/tmp/rfl_sys_bc_alpha/") !- domain
+;; "sym" as only child — skipped by partition scan
+(.sys.exec "rm -rf /tmp/rfl_sys_bc_symonly && mkdir -p /tmp/rfl_sys_bc_symonly/sym/")
+(.db.parted.mount "/tmp/rfl_sys_bc_symonly/") !- domain
+;; Partition-named entries that are files (not dirs) — stat filter
+(.sys.exec "rm -rf /tmp/rfl_sys_bc_partfile && mkdir -p /tmp/rfl_sys_bc_partfile/ && touch /tmp/rfl_sys_bc_partfile/2024.01.01")
+(.db.parted.mount "/tmp/rfl_sys_bc_partfile/") !- domain
+
+;; ────────────── teardown ──────────────
+(.sys.exec "rm -rf /tmp/rfl_sys_bc_*")

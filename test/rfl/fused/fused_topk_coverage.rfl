@@ -1,0 +1,167 @@
+;; Coverage tests for src/ops/fused_topk.c — query-level routing.
+;;
+;; These tests exercise fused topk through the `select` query surface
+;; (select {col: col from: T where: pred asc:/desc: key take: K}),
+;; which routes through query.c:5116 into ray_fused_topk_select.
+;;
+;; Target branches:
+;;   - fpk_cmp esz==2 (I16 sort key)
+;;   - fpk_cmp esz==1 (U8 sort key, BOOL sort key)
+;;   - fpk_cmp temporal gates (DATE, TIME, TIMESTAMP)
+;;   - DESC direction for each type
+;;   - SYM sort key DESC
+;;   - multi-key sort (mixed ASC/DESC)
+;;   - null sort key (NULLS LAST for ASC, NULLS FIRST for DESC)
+;;   - selective WHERE (many filtered rows, few passing)
+;;   - K=1 edge
+;;   - fewer-than-K passing rows
+;;   - AND compound predicate
+;;   - aliased output column
+;;   - multi-sort-key vector syntax: asc: [k1 k2]
+
+;; =====================================================================
+;; 1. I16 sort key — fpk_cmp esz==2 branch
+;; =====================================================================
+(set Ti16 (table [k sel] (list (as 'I16 [30 10 50 20 40 25 15 35 45 5]) (til 10))))
+;; ASC
+(at (at (select {k: k from: Ti16 where: (>= sel 0) asc: k take: 3}) 'k) 0) -- (as 'I16 5)
+(at (at (select {k: k from: Ti16 where: (>= sel 0) asc: k take: 3}) 'k) 1) -- (as 'I16 10)
+(at (at (select {k: k from: Ti16 where: (>= sel 0) asc: k take: 3}) 'k) 2) -- (as 'I16 15)
+;; DESC
+(at (at (select {k: k from: Ti16 where: (>= sel 0) desc: k take: 3}) 'k) 0) -- (as 'I16 50)
+(at (at (select {k: k from: Ti16 where: (>= sel 0) desc: k take: 3}) 'k) 1) -- (as 'I16 45)
+(at (at (select {k: k from: Ti16 where: (>= sel 0) desc: k take: 3}) 'k) 2) -- (as 'I16 40)
+
+;; =====================================================================
+;; 2. U8 sort key — fpk_cmp esz==1 unsigned branch
+;; =====================================================================
+(set Tu8 (table [k sel] (list (as 'U8 [30 10 50 20 40 25 15 35 45 5]) (til 10))))
+;; ASC
+(at (at (select {k: k from: Tu8 where: (>= sel 0) asc: k take: 3}) 'k) 0) -- (as 'U8 5)
+(at (at (select {k: k from: Tu8 where: (>= sel 0) asc: k take: 3}) 'k) 1) -- (as 'U8 10)
+(at (at (select {k: k from: Tu8 where: (>= sel 0) asc: k take: 3}) 'k) 2) -- (as 'U8 15)
+;; DESC
+(at (at (select {k: k from: Tu8 where: (>= sel 0) desc: k take: 3}) 'k) 0) -- (as 'U8 50)
+
+;; =====================================================================
+;; 3. BOOL sort key — type gate acceptance + esz==1
+;; =====================================================================
+(set Tbool (table [k v] (list (as 'BOOL [true false true false true false true false]) (til 8))))
+;; ASC: false (0) before true (1) — top 3 ASC = three false rows
+(count (select {k: k from: Tbool where: (>= v 0) asc: k take: 3})) -- 3
+;; DESC: true (1) before false (0) — top 3 DESC = three true rows
+(at (at (select {k: k from: Tbool where: (>= v 0) desc: k take: 3}) 'k) 0) -- true
+
+;; =====================================================================
+;; 4. DATE sort key — temporal type gate (esz==4)
+;; =====================================================================
+(set Td (table [d v] (list (as 'DATE [2025.03.15 2025.01.01 2025.06.20 2025.02.10 2025.12.31]) (til 5))))
+;; ASC: earliest dates first
+(at (at (select {d: d from: Td where: (>= v 0) asc: d take: 2}) 'd) 0) -- 2025.01.01
+(at (at (select {d: d from: Td where: (>= v 0) asc: d take: 2}) 'd) 1) -- 2025.02.10
+;; DESC: latest dates first
+(at (at (select {d: d from: Td where: (>= v 0) desc: d take: 2}) 'd) 0) -- 2025.12.31
+
+;; =====================================================================
+;; 5. TIME sort key — temporal type gate (esz==4)
+;; =====================================================================
+(set Tt (table [t v] (list (as 'TIME [12:00:00.000 09:30:00.000 15:45:00.000 06:15:00.000]) (til 4))))
+;; ASC
+(at (at (select {t: t from: Tt where: (>= v 0) asc: t take: 2}) 't) 0) -- 06:15:00.000
+;; DESC
+(at (at (select {t: t from: Tt where: (>= v 0) desc: t take: 2}) 't) 0) -- 15:45:00.000
+
+;; =====================================================================
+;; 6. TIMESTAMP sort key — temporal type gate (esz==8)
+;; =====================================================================
+(set Tts (table [ts v] (list (as 'TIMESTAMP [2025.01.01D12:00:00.000 2025.06.15D08:30:00.000 2025.03.20D16:45:00.000]) (til 3))))
+;; ASC
+(at (at (select {ts: ts from: Tts where: (>= v 0) asc: ts take: 2}) 'ts) 0) -- 2025.01.01D12:00:00.000
+
+;; =====================================================================
+;; 7. SYM sort key DESC — fpk_cmp SYM + desc branch
+;; =====================================================================
+(set Tsym (table [s v] (list ['apple 'banana 'cherry 'date 'elderberry 'fig 'grape 'honeydew 'kiwi 'lime] (til 10))))
+;; ASC: alphabetical
+(at (at (select {s: s from: Tsym where: (>= v 0) asc: s take: 3}) 's) 0) -- 'apple
+(at (at (select {s: s from: Tsym where: (>= v 0) asc: s take: 3}) 's) 1) -- 'banana
+(at (at (select {s: s from: Tsym where: (>= v 0) asc: s take: 3}) 's) 2) -- 'cherry
+;; DESC: reverse alphabetical
+(at (at (select {s: s from: Tsym where: (>= v 0) desc: s take: 3}) 's) 0) -- 'lime
+(at (at (select {s: s from: Tsym where: (>= v 0) desc: s take: 3}) 's) 1) -- 'kiwi
+(at (at (select {s: s from: Tsym where: (>= v 0) desc: s take: 3}) 's) 2) -- 'honeydew
+
+;; =====================================================================
+;; 8. Multi-key sort (mixed directions) via vector syntax
+;; =====================================================================
+(set Tmk (table [k1 k2 v] (list (as 'I32 [1 1 1 2 2 2 3 3 3 3]) (as 'I64 [30 10 20 60 40 50 90 70 80 100]) (til 10))))
+;; asc: [k1 k2] — k1 ASC then k2 ASC
+(at (at (select {v: v from: Tmk where: (>= v 0) asc: [k1 k2] take: 4}) 'v) 0) -- 1
+(at (at (select {v: v from: Tmk where: (>= v 0) asc: [k1 k2] take: 4}) 'v) 1) -- 2
+(at (at (select {v: v from: Tmk where: (>= v 0) asc: [k1 k2] take: 4}) 'v) 2) -- 0
+(at (at (select {v: v from: Tmk where: (>= v 0) asc: [k1 k2] take: 4}) 'v) 3) -- 4
+
+;; =====================================================================
+;; 9. Selective WHERE — heavy filtering, few rows pass
+;; =====================================================================
+(set Tsel (table [g v] (list (% (til 100) 10) (til 100))))
+;; WHERE g == 7 — only 10 rows pass out of 100
+(at (at (select {v: v from: Tsel where: (== g 7) asc: v take: 3}) 'v) 0) -- 7
+(at (at (select {v: v from: Tsel where: (== g 7) asc: v take: 3}) 'v) 1) -- 17
+(at (at (select {v: v from: Tsel where: (== g 7) asc: v take: 3}) 'v) 2) -- 27
+
+;; =====================================================================
+;; 10. K=1 edge — minimum heap
+;; =====================================================================
+(set Tk1 (table [v] (list [50 10 30 20 40])))
+(at (at (select {v: v from: Tk1 where: (>= v 0) asc: v take: 1}) 'v) 0) -- 10
+(at (at (select {v: v from: Tk1 where: (>= v 0) desc: v take: 1}) 'v) 0) -- 50
+
+;; =====================================================================
+;; 11. AND compound predicate
+;; =====================================================================
+(set Tand2 (table [g v] (list (% (til 100) 10) (til 100))))
+;; WHERE g >= 3 AND g < 6
+(count (select {v: v from: Tand2 where: (and (>= g 3) (< g 6)) asc: v take: 5})) -- 5
+(at (at (select {v: v from: Tand2 where: (and (>= g 3) (< g 6)) asc: v take: 5}) 'v) 0) -- 3
+(at (at (select {v: v from: Tand2 where: (and (>= g 3) (< g 6)) asc: v take: 5}) 'v) 1) -- 4
+(at (at (select {v: v from: Tand2 where: (and (>= g 3) (< g 6)) asc: v take: 5}) 'v) 2) -- 5
+
+;; =====================================================================
+;; 12. Aliased output column (out_alias_syms non-NULL path)
+;; =====================================================================
+(set Talias (table [a b] (list [10 20 30 40 50] [1 2 3 4 5])))
+(at (at (select {renamed: a b: b from: Talias where: (>= b 0) asc: a take: 2}) 'renamed) 0) -- 10
+(at (at (select {renamed: a b: b from: Talias where: (>= b 0) asc: a take: 2}) 'renamed) 1) -- 20
+
+;; =====================================================================
+;; 13. Large table — forces multi-worker dispatch + global merge
+;; =====================================================================
+(set Tbig (table [k v] (list (% (til 5000) 100) (til 5000))))
+(count (select {v: v from: Tbig where: (>= k 0) asc: v take: 10})) -- 10
+;; Top 10 ASC by v = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}
+(at (at (select {v: v from: Tbig where: (>= k 0) asc: v take: 10}) 'v) 0) -- 0
+(at (at (select {v: v from: Tbig where: (>= k 0) asc: v take: 10}) 'v) 9) -- 9
+
+;; =====================================================================
+;; 14. I64 DESC — single key descending
+;; =====================================================================
+(set Tdesc (table [v] (list (til 50))))
+(at (at (select {v: v from: Tdesc where: (>= v 0) desc: v take: 3}) 'v) 0) -- 49
+(at (at (select {v: v from: Tdesc where: (>= v 0) desc: v take: 3}) 'v) 1) -- 48
+(at (at (select {v: v from: Tdesc where: (>= v 0) desc: v take: 3}) 'v) 2) -- 47
+
+;; =====================================================================
+;; 15. Null sort key — NULLS LAST for ASC, NULLS FIRST for DESC
+;; =====================================================================
+;; 0N is the I64 null literal; the table has nulls at positions 0 and 5.
+(set Tnull (table [k v] (list [0Nl 1 2 3 4 0Nl 6 7 8 9] (til 10))))
+;; ASC: nulls go last; top 3 are smallest non-null: 1, 2, 3
+(at (at (select {k: k from: Tnull where: (>= v 0) asc: k take: 3}) 'k) 0) -- 1
+(at (at (select {k: k from: Tnull where: (>= v 0) asc: k take: 3}) 'k) 1) -- 2
+(at (at (select {k: k from: Tnull where: (>= v 0) asc: k take: 3}) 'k) 2) -- 3
+;; DESC: nulls go first; top 4 DESC = 2 nulls then 9, 8
+(nil? (at (at (select {k: k from: Tnull where: (>= v 0) desc: k take: 4}) 'k) 0)) -- true
+(nil? (at (at (select {k: k from: Tnull where: (>= v 0) desc: k take: 4}) 'k) 1)) -- true
+(at (at (select {k: k from: Tnull where: (>= v 0) desc: k take: 4}) 'k) 2) -- 9
+(at (at (select {k: k from: Tnull where: (>= v 0) desc: k take: 4}) 'k) 3) -- 8

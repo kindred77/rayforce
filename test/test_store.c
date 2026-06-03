@@ -3971,6 +3971,668 @@ static test_result_t test_col_sym_w64_negative_index(void) {
     PASS();
 }
 
+/* ---- test_col_str_pool_roundtrip ---------------------------------------- */
+/* Covers the pooled-string path through col.c:
+ *   col_save_impl STR pool write (line 635 True: pool_size > 0),
+ *   col_str_pool_payload_len (line 738 True),
+ *   col_copy_str_pool main path (lines 747-757) via ray_col_load,
+ *   col_validate_str_region pooled-string validation (lines 777-785),
+ *   ray_col_mmap STR str_pool reattach (lines 1028-1035).
+ * A STR vector whose elements exceed RAY_STR_INLINE_MAX (12 bytes) forces
+ * the byte pool to be non-empty so str_pool->len > 0. */
+static test_result_t test_col_str_pool_roundtrip(void) {
+    ray_t* vec = ray_vec_new(RAY_STR, 3);
+    TEST_ASSERT_NOT_NULL(vec);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+
+    /* All > 12 bytes => pooled (not inline). */
+    const char* s0 = "this-string-is-definitely-pooled";
+    const char* s1 = "another-long-pooled-value-here!!";
+    const char* s2 = "yet-a-third-pooled-string-value!";
+    vec = ray_str_vec_append(vec, s0, strlen(s0));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+    vec = ray_str_vec_append(vec, s1, strlen(s1));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+    vec = ray_str_vec_append(vec, s2, strlen(s2));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+    TEST_ASSERT_EQ_I(vec->len, 3);
+    /* Pool must be non-empty (long strings). */
+    TEST_ASSERT_NOT_NULL(vec->str_pool);
+    TEST_ASSERT_TRUE(vec->str_pool->len > 0);
+
+    ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    /* --- Round-trip via ray_col_load (deep-copy str pool) --- */
+    ray_t* loaded = ray_col_load(TMP_COL_PATH);
+    TEST_ASSERT_NOT_NULL(loaded);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    TEST_ASSERT_EQ_I(loaded->type, RAY_STR);
+    TEST_ASSERT_EQ_I(loaded->len, 3);
+    TEST_ASSERT_NOT_NULL(loaded->str_pool);
+    size_t ln = 0;
+    const char* g0 = ray_str_vec_get(loaded, 0, &ln);
+    TEST_ASSERT_EQ_U(ln, strlen(s0));
+    TEST_ASSERT_TRUE(memcmp(g0, s0, ln) == 0);
+    const char* g2 = ray_str_vec_get(loaded, 2, &ln);
+    TEST_ASSERT_EQ_U(ln, strlen(s2));
+    TEST_ASSERT_TRUE(memcmp(g2, s2, ln) == 0);
+    ray_release(loaded);
+
+    /* --- Round-trip via ray_col_mmap (zero-copy, pool->mmod=2) --- */
+    ray_t* mapped = ray_col_mmap(TMP_COL_PATH);
+    TEST_ASSERT_NOT_NULL(mapped);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(mapped));
+    TEST_ASSERT_EQ_I(mapped->type, RAY_STR);
+    TEST_ASSERT_EQ_I(mapped->len, 3);
+    TEST_ASSERT_NOT_NULL(mapped->str_pool);
+    const char* m1 = ray_str_vec_get(mapped, 1, &ln);
+    TEST_ASSERT_EQ_U(ln, strlen(s1));
+    TEST_ASSERT_TRUE(memcmp(m1, s1, ln) == 0);
+    ray_release(mapped);
+
+    ray_release(vec);
+    unlink(TMP_COL_PATH);
+    PASS();
+}
+
+/* ---- test_col_str_empty_roundtrip --------------------------------------- */
+/* Covers the empty STR column path:
+ *   col_str_pool_payload_len when pool is NULL (line 736 False arm 736:41),
+ *   col_validate_str_region with hdr->len == 0 (loop body never runs),
+ *   col_copy_str_pool early NULL return (line 745 str_pool_size == 0). */
+static test_result_t test_col_str_empty_roundtrip(void) {
+    ray_t* vec = ray_vec_new(RAY_STR, 0);
+    TEST_ASSERT_NOT_NULL(vec);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+    TEST_ASSERT_EQ_I(vec->len, 0);
+
+    ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    ray_t* loaded = ray_col_load(TMP_COL_PATH);
+    TEST_ASSERT_NOT_NULL(loaded);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    TEST_ASSERT_EQ_I(loaded->type, RAY_STR);
+    TEST_ASSERT_EQ_I(loaded->len, 0);
+    ray_release(loaded);
+
+    ray_t* mapped = ray_col_mmap(TMP_COL_PATH);
+    TEST_ASSERT_NOT_NULL(mapped);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(mapped));
+    TEST_ASSERT_EQ_I(mapped->len, 0);
+    ray_release(mapped);
+
+    ray_release(vec);
+    unlink(TMP_COL_PATH);
+    PASS();
+}
+
+/* ---- test_col_str_inline_only_roundtrip --------------------------------- */
+/* Covers col_validate_str_region "len <= RAY_STR_INLINE_MAX => continue"
+ * (line 777 True) plus an empty-pool STR column where every element is
+ * inline so str_pool->len == 0 (col_copy_str_pool line 745 True). */
+static test_result_t test_col_str_inline_only_roundtrip(void) {
+    ray_t* vec = ray_vec_new(RAY_STR, 2);
+    TEST_ASSERT_NOT_NULL(vec);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+    vec = ray_str_vec_append(vec, "aa", 2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+    vec = ray_str_vec_append(vec, "bb", 2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+
+    ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    ray_t* loaded = ray_col_load(TMP_COL_PATH);
+    TEST_ASSERT_NOT_NULL(loaded);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    TEST_ASSERT_EQ_I(loaded->len, 2);
+    size_t ln = 0;
+    const char* g = ray_str_vec_get(loaded, 1, &ln);
+    TEST_ASSERT_EQ_U(ln, 2);
+    TEST_ASSERT_TRUE(memcmp(g, "bb", 2) == 0);
+    ray_release(loaded);
+
+    ray_t* mapped = ray_col_mmap(TMP_COL_PATH);
+    TEST_ASSERT_NOT_NULL(mapped);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(mapped));
+    TEST_ASSERT_EQ_I(mapped->len, 2);
+    ray_release(mapped);
+
+    ray_release(vec);
+    unlink(TMP_COL_PATH);
+    PASS();
+}
+
+/* ---- test_col_slice_save ------------------------------------------------ */
+/* Covers col_save_impl RAY_ATTR_SLICE branch (lines 601-610): saving a
+ * zero-copy slice view materializes the parent's data window. */
+static test_result_t test_col_slice_save(void) {
+    int64_t raw[] = {10, 20, 30, 40, 50};
+    ray_t* parent = ray_vec_from_raw(RAY_I64, raw, 5);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(parent));
+
+    /* Slice [1..4) => {20, 30, 40} */
+    ray_t* slice = ray_vec_slice(parent, 1, 3);
+    TEST_ASSERT_NOT_NULL(slice);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(slice));
+    TEST_ASSERT_TRUE(slice->attrs & RAY_ATTR_SLICE);
+    TEST_ASSERT_EQ_I(slice->len, 3);
+
+    ray_err_t err = ray_col_save(slice, TMP_COL_PATH);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    ray_t* loaded = ray_col_load(TMP_COL_PATH);
+    TEST_ASSERT_NOT_NULL(loaded);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    TEST_ASSERT_EQ_I(loaded->type, RAY_I64);
+    TEST_ASSERT_EQ_I(loaded->len, 3);
+    /* Slice flag is cleared on save (materialized). */
+    TEST_ASSERT_FALSE(loaded->attrs & RAY_ATTR_SLICE);
+    int64_t* d = (int64_t*)ray_data(loaded);
+    TEST_ASSERT_EQ_I(d[0], 20);
+    TEST_ASSERT_EQ_I(d[1], 30);
+    TEST_ASSERT_EQ_I(d[2], 40);
+    ray_release(loaded);
+
+    ray_release(slice);
+    ray_release(parent);
+    unlink(TMP_COL_PATH);
+    PASS();
+}
+
+/* ---- test_col_sym_empty_roundtrip --------------------------------------- */
+/* Covers validate_sym_bounds "len == 0" early-return (line 46 arm 46:27):
+ * a zero-length RAY_SYM column skips the index scan. */
+static test_result_t test_col_sym_empty_roundtrip(void) {
+    ray_sym_intern("syme_a", 6);
+    ray_t* vec = ray_sym_vec_new(RAY_SYM_W8, 0);
+    TEST_ASSERT_NOT_NULL(vec);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+    TEST_ASSERT_EQ_I(vec->len, 0);
+
+    ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    ray_t* loaded = ray_col_load(TMP_COL_PATH);
+    TEST_ASSERT_NOT_NULL(loaded);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    TEST_ASSERT_EQ_I(loaded->type, RAY_SYM);
+    TEST_ASSERT_EQ_I(loaded->len, 0);
+    ray_release(loaded);
+
+    ray_t* mapped = ray_col_mmap(TMP_COL_PATH);
+    TEST_ASSERT_NOT_NULL(mapped);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(mapped));
+    TEST_ASSERT_EQ_I(mapped->len, 0);
+    ray_release(mapped);
+
+    ray_release(vec);
+    unlink(TMP_COL_PATH);
+    PASS();
+}
+
+/* ---- test_col_sym_saved_count_reject ------------------------------------ */
+/* Covers col_validate_mapped SYM fast-reject (line 874): a column file whose
+ * saved sym count exceeds the current process sym count is rejected as
+ * corrupt without scanning indices. We forge a high saved count in the rc
+ * field of the on-disk header. */
+static test_result_t test_col_sym_saved_count_reject(void) {
+    ray_sym_intern("scr_a", 5);
+    uint32_t sc = ray_sym_count();
+    TEST_ASSERT_TRUE(sc >= 1);
+
+    ray_t* vec = ray_sym_vec_new(RAY_SYM_W8, 1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+    vec->len = 1;
+    ((uint8_t*)ray_data(vec))[0] = 0;
+    ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    /* rc field (saved sym count) is at offsetof(ray_t, rc). For the on-disk
+     * layout it sits at byte 20 (after mmod/order/type/attrs). Overwrite it
+     * with a count far larger than the live table. */
+    FILE* f = fopen(TMP_COL_PATH, "r+b");
+    TEST_ASSERT_NOT_NULL(f);
+    fseek(f, 20, SEEK_SET);
+    uint32_t huge = sc + 1000000u;
+    fwrite(&huge, sizeof(huge), 1, f);
+    fclose(f);
+
+    /* mmap path uses col_validate_mapped's saved-count branch. */
+    ray_t* bad = ray_col_mmap(TMP_COL_PATH);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(bad));
+    TEST_ASSERT_STR_EQ(ray_err_code(bad), "corrupt");
+    ray_release(bad);
+
+    ray_release(vec);
+    unlink(TMP_COL_PATH);
+    PASS();
+}
+
+/* ---- test_col_str_list_empty_string ------------------------------------- */
+/* Covers col_save_str_list slen==0 branch (line 156:25 False) and
+ * col_load_str_list reading a zero-length element: a RAY_LIST of -RAY_STR
+ * atoms including an empty string. */
+static test_result_t test_col_str_list_empty_string(void) {
+    ray_t* list = ray_list_new(3);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(list));
+    ray_t* s0 = ray_str("nonempty", 8);
+    ray_t* s1 = ray_str("", 0);          /* empty => slen == 0 */
+    ray_t* s2 = ray_str("tail", 4);
+    list = ray_list_append(list, s0);
+    list = ray_list_append(list, s1);
+    list = ray_list_append(list, s2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(list));
+
+    ray_err_t err = ray_col_save(list, TMP_COL_PATH);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    ray_t* loaded = ray_col_load(TMP_COL_PATH);
+    TEST_ASSERT_NOT_NULL(loaded);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    TEST_ASSERT_EQ_I(loaded->type, RAY_LIST);
+    TEST_ASSERT_EQ_I(loaded->len, 3);
+    ray_t* l1 = ray_list_get(loaded, 1);
+    TEST_ASSERT_NOT_NULL(l1);
+    TEST_ASSERT_EQ_U(ray_str_len(l1), 0);
+    ray_t* l2 = ray_list_get(loaded, 2);
+    TEST_ASSERT_STR_EQ(ray_str_ptr(l2), "tail");
+
+    ray_release(loaded);
+    ray_release(s0);
+    ray_release(s1);
+    ray_release(s2);
+    ray_release(list);
+    unlink(TMP_COL_PATH);
+    PASS();
+}
+
+/* ---- test_col_str_list_corrupt ------------------------------------------ */
+/* Covers col_load_str_list corruption guards:
+ *   line 173: count > remaining/4  => "corrupt"
+ *   line 185: slen > remaining     => "corrupt"
+ * We hand-craft STRL-magic files and load them via ray_col_load. */
+static test_result_t test_col_str_list_corrupt(void) {
+    const uint32_t STRL = 0x4C525453U;  /* "STRL" */
+
+    /* (a) count claims 1000 elements but no data follows => count > rem/4 */
+    {
+        FILE* f = fopen(TMP_COL_PATH, "wb");
+        TEST_ASSERT_NOT_NULL(f);
+        fwrite(&STRL, 4, 1, f);
+        int64_t count = 1000;
+        fwrite(&count, 8, 1, f);   /* nothing after => remaining == 0 */
+        fclose(f);
+        ray_t* bad = ray_col_load(TMP_COL_PATH);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(bad));
+        TEST_ASSERT_STR_EQ(ray_err_code(bad), "corrupt");
+        ray_release(bad);
+    }
+
+    /* (b) count=1, slen=99 but only 3 content bytes => slen > remaining */
+    {
+        FILE* f = fopen(TMP_COL_PATH, "wb");
+        TEST_ASSERT_NOT_NULL(f);
+        fwrite(&STRL, 4, 1, f);
+        int64_t count = 1;
+        fwrite(&count, 8, 1, f);
+        uint32_t slen = 99;
+        fwrite(&slen, 4, 1, f);
+        fwrite("abc", 1, 3, f);    /* only 3 bytes, not 99 */
+        fclose(f);
+        ray_t* bad = ray_col_load(TMP_COL_PATH);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(bad));
+        TEST_ASSERT_STR_EQ(ray_err_code(bad), "corrupt");
+        ray_release(bad);
+    }
+
+    /* (c) truncated: magic + only 3 bytes (< 8 for count) => "corrupt" */
+    {
+        FILE* f = fopen(TMP_COL_PATH, "wb");
+        TEST_ASSERT_NOT_NULL(f);
+        fwrite(&STRL, 4, 1, f);
+        fwrite("xy", 1, 2, f);
+        fclose(f);
+        ray_t* bad = ray_col_load(TMP_COL_PATH);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(bad));
+        TEST_ASSERT_STR_EQ(ray_err_code(bad), "corrupt");
+        ray_release(bad);
+    }
+
+    unlink(TMP_COL_PATH);
+    PASS();
+}
+
+/* ---- test_col_str_validate_corrupt -------------------------------------- */
+/* Covers col_validate_str_region corruption guards reachable from a forged
+ * STR column file loaded via ray_col_mmap:
+ *   line 767: pool->type != RAY_U8       => "corrupt"
+ *   line 778: pool_off out of range      => "corrupt"
+ * Build a real STR column with one pooled string, then surgically corrupt
+ * the on-disk bytes. */
+static test_result_t test_col_str_validate_corrupt(void) {
+    ray_t* vec = ray_vec_new(RAY_STR, 1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+    const char* s0 = "a-pooled-string-over-twelve-bytes";
+    vec = ray_str_vec_append(vec, s0, strlen(s0));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+    TEST_ASSERT_TRUE(vec->str_pool && vec->str_pool->len > 0);
+
+    /* Save once; on-disk layout: [32B col hdr][16B ray_str_t elem]
+     * [32B pool hdr][pool bytes]. col hdr=32, data_size=16, so the
+     * pool header starts at offset 48; its type byte sits at 48+18=66. */
+    ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    /* (a) Corrupt the pool header type (offset 66) to a non-U8 value. */
+    {
+        FILE* f = fopen(TMP_COL_PATH, "r+b");
+        TEST_ASSERT_NOT_NULL(f);
+        fseek(f, 48 + 18, SEEK_SET);   /* pool header type byte */
+        uint8_t bad_type = RAY_I64;
+        fwrite(&bad_type, 1, 1, f);
+        fclose(f);
+        ray_t* bad = ray_col_mmap(TMP_COL_PATH);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(bad));
+        TEST_ASSERT_STR_EQ(ray_err_code(bad), "corrupt");
+        ray_release(bad);
+    }
+
+    /* Re-save a clean copy, then corrupt the element pool_off so it points
+     * past the pool. ray_str_t layout: len(4) prefix(4) pool_off(4) pad(4).
+     * Element sits at offset 32; pool_off field at 32 + 8 = 40. */
+    err = ray_col_save(vec, TMP_COL_PATH);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+    {
+        FILE* f = fopen(TMP_COL_PATH, "r+b");
+        TEST_ASSERT_NOT_NULL(f);
+        fseek(f, 32 + 8, SEEK_SET);    /* pool_off field of element 0 */
+        uint32_t huge_off = 0x7FFFFFFFu;
+        fwrite(&huge_off, 4, 1, f);
+        fclose(f);
+        ray_t* bad = ray_col_mmap(TMP_COL_PATH);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(bad));
+        TEST_ASSERT_STR_EQ(ray_err_code(bad), "corrupt");
+        ray_release(bad);
+    }
+
+    ray_release(vec);
+    unlink(TMP_COL_PATH);
+    PASS();
+}
+
+/* ---- test_col_recursive_list_in_list ------------------------------------ */
+/* Covers col_write_recursive / col_read_recursive nested-list path
+ * (lines 269-278 write, 397-413 read) and the empty -RAY_STR atom branch
+ * (line 237:29 False: slen == 0). */
+static test_result_t test_col_recursive_list_in_list(void) {
+    /* Inner list: [i64 atom, empty str atom]. */
+    ray_t* inner = ray_list_new(2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(inner));
+    ray_t* a = ray_i64(7);
+    ray_t* b = ray_str("", 0);  /* empty atom => slen==0 in recursive write */
+    inner = ray_list_append(inner, a);
+    inner = ray_list_append(inner, b);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(inner));
+
+    /* Outer list: [inner_list, i64_vec]. Not a str list => col_save_list. */
+    int64_t raw[] = {100, 200};
+    ray_t* ivec = ray_vec_from_raw(RAY_I64, raw, 2);
+    ray_t* outer = ray_list_new(2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(outer));
+    outer = ray_list_append(outer, inner);
+    outer = ray_list_append(outer, ivec);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(outer));
+
+    ray_err_t err = ray_col_save(outer, TMP_COL_PATH);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    ray_t* loaded = ray_col_load(TMP_COL_PATH);
+    TEST_ASSERT_NOT_NULL(loaded);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    TEST_ASSERT_EQ_I(loaded->type, RAY_LIST);
+    TEST_ASSERT_EQ_I(loaded->len, 2);
+
+    ray_t* got_inner = ray_list_get(loaded, 0);
+    TEST_ASSERT_NOT_NULL(got_inner);
+    TEST_ASSERT_EQ_I(got_inner->type, RAY_LIST);
+    TEST_ASSERT_EQ_I(got_inner->len, 2);
+    ray_t* gi0 = ray_list_get(got_inner, 0);
+    TEST_ASSERT_EQ_I(gi0->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(gi0->i64, 7);
+    ray_t* gi1 = ray_list_get(got_inner, 1);
+    TEST_ASSERT_EQ_I(gi1->type, -RAY_STR);
+    TEST_ASSERT_EQ_U(ray_str_len(gi1), 0);
+
+    ray_t* got_vec = ray_list_get(loaded, 1);
+    TEST_ASSERT_EQ_I(got_vec->type, RAY_I64);
+    TEST_ASSERT_EQ_I(got_vec->len, 2);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(got_vec))[1], 200);
+
+    ray_release(loaded);
+    ray_release(a);
+    ray_release(b);
+    ray_release(inner);
+    ray_release(ivec);
+    ray_release(outer);
+    unlink(TMP_COL_PATH);
+    PASS();
+}
+
+/* ---- test_col_recursive_table ------------------------------------------- */
+/* Covers col_write_recursive / col_read_recursive RAY_TABLE path
+ * (lines 280-293 write, 416-442 read), including a nested STR column with a
+ * pool inside the recursive serializer (lines 259-265 / 364-387). */
+static test_result_t test_col_recursive_table(void) {
+    /* Build a table [id name] with a pooled STR column, wrapped in a list so
+     * is_str_list is false and the save routes through col_save_list ->
+     * col_write_recursive, which then recurses into the RAY_TABLE (and into
+     * the STR column with its pool inside the recursive serializer). */
+    int64_t id_id   = ray_sym_intern("rc_id", 5);
+    int64_t id_name = ray_sym_intern("rc_name", 7);
+
+    int64_t ids[] = {1, 2};
+    ray_t* idcol = ray_vec_from_raw(RAY_I64, ids, 2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(idcol));
+    ray_t* namecol = ray_vec_new(RAY_STR, 2);
+    namecol = ray_str_vec_append(namecol, "first-pooled-name-value", 23);
+    namecol = ray_str_vec_append(namecol, "second-pooled-name-val!", 23);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(namecol));
+
+    ray_t* tbl = ray_table_new(2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    tbl = ray_table_add_col(tbl, id_id, idcol);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    tbl = ray_table_add_col(tbl, id_name, namecol);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+
+    /* Wrap in a list to force the recursive serializer. */
+    ray_t* wrap = ray_list_new(1);
+    wrap = ray_list_append(wrap, tbl);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(wrap));
+
+    ray_err_t err = ray_col_save(wrap, TMP_COL_PATH);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    ray_t* loaded = ray_col_load(TMP_COL_PATH);
+    TEST_ASSERT_NOT_NULL(loaded);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    TEST_ASSERT_EQ_I(loaded->type, RAY_LIST);
+    TEST_ASSERT_EQ_I(loaded->len, 1);
+
+    ray_t* got_tbl = ray_list_get(loaded, 0);
+    TEST_ASSERT_NOT_NULL(got_tbl);
+    TEST_ASSERT_EQ_I(got_tbl->type, RAY_TABLE);
+    TEST_ASSERT_EQ_I(ray_table_ncols(got_tbl), 2);
+    TEST_ASSERT_EQ_I(ray_table_nrows(got_tbl), 2);
+
+    ray_t* gname = ray_table_get_col(got_tbl, id_name);
+    TEST_ASSERT_NOT_NULL(gname);
+    TEST_ASSERT_EQ_I(gname->type, RAY_STR);
+    size_t ln = 0;
+    const char* g0 = ray_str_vec_get(gname, 0, &ln);
+    TEST_ASSERT_EQ_U(ln, 23);
+    TEST_ASSERT_TRUE(memcmp(g0, "first-pooled-name-value", 23) == 0);
+
+    ray_release(loaded);
+    ray_release(idcol);
+    ray_release(namecol);
+    ray_release(tbl);
+    ray_release(wrap);
+    unlink(TMP_COL_PATH);
+    PASS();
+}
+
+/* ---- test_col_recursive_read_corrupt ------------------------------------ */
+/* Covers col_read_recursive corruption guards:
+ *   line 398/402: LIST with truncated count / count < 0 => "corrupt"
+ *   line 417: TABLE header < 16 bytes => "corrupt"
+ * Forge LIST/TABLE-magic files and load them. */
+static test_result_t test_col_recursive_read_corrupt(void) {
+    const uint32_t LISTM  = 0x4754534CU;  /* "LSTG" */
+    const uint32_t TABLEM = 0x4C425454U;  /* "TTBL" */
+
+    /* (a) LIST magic + type byte RAY_LIST but truncated count (<8 bytes). */
+    {
+        FILE* f = fopen(TMP_COL_PATH, "wb");
+        TEST_ASSERT_NOT_NULL(f);
+        fwrite(&LISTM, 4, 1, f);
+        int8_t t = RAY_LIST;
+        fwrite(&t, 1, 1, f);
+        fwrite("xy", 1, 2, f);  /* only 2 bytes, need 8 for count */
+        fclose(f);
+        ray_t* bad = ray_col_load(TMP_COL_PATH);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(bad));
+        TEST_ASSERT_STR_EQ(ray_err_code(bad), "corrupt");
+        ray_release(bad);
+    }
+
+    /* (b) LIST magic + RAY_LIST + negative count => "corrupt". */
+    {
+        FILE* f = fopen(TMP_COL_PATH, "wb");
+        TEST_ASSERT_NOT_NULL(f);
+        fwrite(&LISTM, 4, 1, f);
+        int8_t t = RAY_LIST;
+        fwrite(&t, 1, 1, f);
+        int64_t neg = -5;
+        fwrite(&neg, 8, 1, f);
+        fclose(f);
+        ray_t* bad = ray_col_load(TMP_COL_PATH);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(bad));
+        TEST_ASSERT_STR_EQ(ray_err_code(bad), "corrupt");
+        ray_release(bad);
+    }
+
+    /* (c) TABLE magic + RAY_TABLE type but header < 16 bytes. */
+    {
+        FILE* f = fopen(TMP_COL_PATH, "wb");
+        TEST_ASSERT_NOT_NULL(f);
+        fwrite(&TABLEM, 4, 1, f);
+        int8_t t = RAY_TABLE;
+        fwrite(&t, 1, 1, f);
+        fwrite("only-8b!", 1, 8, f);  /* need 16 for ncols+nrows */
+        fclose(f);
+        ray_t* bad = ray_col_load(TMP_COL_PATH);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(bad));
+        TEST_ASSERT_STR_EQ(ray_err_code(bad), "corrupt");
+        ray_release(bad);
+    }
+
+    unlink(TMP_COL_PATH);
+    PASS();
+}
+
+/* ---- test_col_link_sidecar_whitespace ----------------------------------- */
+/* Covers try_load_link_sidecar trailing-whitespace trim loop (lines 489-491)
+ * and the n==0 early return (line 492). ray_col_save never writes trailing
+ * whitespace, so we hand-write the .link sidecar to exercise the trim. */
+static test_result_t test_col_link_sidecar_whitespace(void) {
+    int64_t target_sym = ray_sym_intern("lc_target_tbl", 13);
+    TEST_ASSERT_TRUE(target_sym >= 0);
+
+    /* Save a plain I64 column (eligible for link sidecar). */
+    int64_t raw[] = {0, 1, 2};
+    ray_t* vec = ray_vec_from_raw(RAY_I64, raw, 3);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+    ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+    ray_release(vec);
+
+    char link_path[1100];
+    snprintf(link_path, sizeof link_path, "%s.link", TMP_COL_PATH);
+
+    /* (a) sidecar with trailing newline / spaces / tab => trimmed, link set. */
+    {
+        FILE* lf = fopen(link_path, "wb");
+        TEST_ASSERT_NOT_NULL(lf);
+        const char* body = "lc_target_tbl \t\r\n";  /* trailing whitespace */
+        fwrite(body, 1, strlen(body), lf);
+        fclose(lf);
+
+        ray_t* loaded = ray_col_load(TMP_COL_PATH);
+        TEST_ASSERT_NOT_NULL(loaded);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+        TEST_ASSERT_TRUE(loaded->attrs & RAY_ATTR_HAS_LINK);
+        TEST_ASSERT_EQ_I(loaded->link_target, target_sym);
+        ray_release(loaded);
+    }
+
+    /* (b) sidecar that is only whitespace => trims to n==0 => no link. */
+    {
+        FILE* lf = fopen(link_path, "wb");
+        TEST_ASSERT_NOT_NULL(lf);
+        const char* body = "   \n\t\r ";
+        fwrite(body, 1, strlen(body), lf);
+        fclose(lf);
+
+        ray_t* loaded = ray_col_load(TMP_COL_PATH);
+        TEST_ASSERT_NOT_NULL(loaded);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+        TEST_ASSERT_FALSE(loaded->attrs & RAY_ATTR_HAS_LINK);
+        ray_release(loaded);
+    }
+
+    /* (c) empty sidecar => fread returns 0 => no link (early return). */
+    {
+        FILE* lf = fopen(link_path, "wb");
+        TEST_ASSERT_NOT_NULL(lf);
+        fclose(lf);
+        ray_t* loaded = ray_col_load(TMP_COL_PATH);
+        TEST_ASSERT_NOT_NULL(loaded);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+        TEST_ASSERT_FALSE(loaded->attrs & RAY_ATTR_HAS_LINK);
+        ray_release(loaded);
+    }
+
+    unlink(link_path);
+    unlink(TMP_COL_PATH);
+    PASS();
+}
+
+/* ---- test_col_save_nyi_type --------------------------------------------- */
+/* Covers col_save_impl is_serializable_type False default (line 543 / 112:55):
+ * saving a type with no serializer (a RAY_DICT) returns RAY_ERR_NYI. */
+static test_result_t test_col_save_nyi_type(void) {
+    /* A dict is not in the serializable allowlist, is not a list/table/
+     * str_list, so col_save_impl falls through to the NYI return. */
+    ray_t* keys = ray_vec_new(RAY_STR, 1);
+    keys = ray_str_vec_append(keys, "k", 1);
+    int64_t vraw[] = {1};
+    ray_t* vals = ray_vec_from_raw(RAY_I64, vraw, 1);
+    ray_t* d = ray_dict_new(keys, vals);  /* consumes keys + vals */
+    TEST_ASSERT_NOT_NULL(d);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(d));
+
+    ray_err_t err = ray_col_save(d, TMP_COL_PATH);
+    TEST_ASSERT_EQ_I(err, RAY_ERR_NYI);
+
+    ray_release(d);
+    unlink(TMP_COL_PATH);
+    PASS();
+}
+
 const test_entry_t store_entries[] = {
     { "store/col_mmap_i64", test_col_mmap_i64, store_setup, store_teardown },
     { "store/col_mmap_f64", test_col_mmap_f64, store_setup, store_teardown },
@@ -4001,6 +4663,20 @@ const test_entry_t store_entries[] = {
     { "store/col_recursive_atoms", test_col_recursive_atoms, store_setup, store_teardown },
     { "store/col_recursive_sym_in_list", test_col_recursive_sym_in_list, store_setup, store_teardown },
     { "store/col_sym_w64_neg_index", test_col_sym_w64_negative_index, store_setup, store_teardown },
+    { "store/col_str_pool_roundtrip", test_col_str_pool_roundtrip, store_setup, store_teardown },
+    { "store/col_str_empty_roundtrip", test_col_str_empty_roundtrip, store_setup, store_teardown },
+    { "store/col_str_inline_only", test_col_str_inline_only_roundtrip, store_setup, store_teardown },
+    { "store/col_slice_save", test_col_slice_save, store_setup, store_teardown },
+    { "store/col_sym_empty_roundtrip", test_col_sym_empty_roundtrip, store_setup, store_teardown },
+    { "store/col_sym_saved_count_reject", test_col_sym_saved_count_reject, store_setup, store_teardown },
+    { "store/col_str_list_empty_string", test_col_str_list_empty_string, store_setup, store_teardown },
+    { "store/col_str_list_corrupt", test_col_str_list_corrupt, store_setup, store_teardown },
+    { "store/col_str_validate_corrupt", test_col_str_validate_corrupt, store_setup, store_teardown },
+    { "store/col_recursive_list_in_list", test_col_recursive_list_in_list, store_setup, store_teardown },
+    { "store/col_recursive_table", test_col_recursive_table, store_setup, store_teardown },
+    { "store/col_recursive_read_corrupt", test_col_recursive_read_corrupt, store_setup, store_teardown },
+    { "store/col_link_sidecar_whitespace", test_col_link_sidecar_whitespace, store_setup, store_teardown },
+    { "store/col_save_nyi_type", test_col_save_nyi_type, store_setup, store_teardown },
     { "store/file_open_close", test_file_open_close, store_setup, store_teardown },
     { "store/file_lock_unlock", test_file_lock_unlock, store_setup, store_teardown },
     { "store/file_sync", test_file_sync_op, store_setup, store_teardown },

@@ -1,0 +1,540 @@
+;; Branch coverage tests for src/ops/graph_builtin.c
+;;
+;; Targets uncovered error-guard and argument-coercion branches in every
+;; ray_graph_*_fn wrapper.  Organized by function, line references are
+;; to graph_builtin.c at commit 4efd42c8.
+;;
+;; Legend:
+;;   -- val   assert equality
+;;   !- code  assert error with that code
+;;
+;; Unreachable branches (documented, not testable without fault injection):
+;;   - graph_wrap line 59: ray_alloc OOM → never NULL in test heap
+;;   - widen_to_i64 line 110: ray_vec_new OOM
+;;   - build line 198/206/210: table_new/add_col/rel_from_edges OOM
+;;   - build line 242/267/274: weight F64 vec alloc / props table OOM
+;;   - build line 285: graph_wrap OOM after build
+;;   - All !g / !op / !src_op / !dst_op guards in algorithm wrappers
+;;     (lines 381-758): ray_graph_new / ray_*_op never return NULL
+;;   - atom_to_i64 line 75 (!a) / line 80 (default): callers always
+;;     guard with atom_is_int first, so a is never NULL and never
+;;     hits the default case
+;;   - atom_is_int line 71 (a==NULL): callers always pass non-NULL args
+;;   - arg_to_sym line 88 (!a), line 93 (!p): callers always non-NULL
+;;   - widen_to_i64 line 103 (!col): build fetches col from table first
+;;   - max_plus_one line 140 (n<=0), line 144 (mx<0): edge tables
+;;     always have n>0 and non-negative node IDs
+;;   - rel_weight_col_name line 346/348/350: defensive guards for
+;;     corrupted/empty rel
+
+;; ====================================================================
+;; Fixtures
+;; ====================================================================
+
+;; Unweighted 3-node cycle: 0->1->2->0
+(set UwEdges (table [src dst] (list [0 1 2] [1 2 0])))
+(set Uw (.graph.build UwEdges 'src 'dst))
+
+;; Weighted 6-node DAG (same as graph_basic.rfl)
+(set WEdges (table [src dst w] (list [0 0 1 1 2 2 3 4] [1 2 2 3 3 4 5 5] [1.0 4.0 2.0 5.0 1.0 3.0 2.0 1.0])))
+(set Wg (.graph.build WEdges 'src 'dst 'w))
+
+;; ====================================================================
+;; ray_graph_build_fn — rank errors (line 157)
+;; ====================================================================
+
+;; n < 3 -> rank error
+(.graph.build UwEdges 'src)                             !- rank
+;; n > 4 -> rank error (5 args)
+(.graph.build UwEdges 'src 'dst 'w 'extra)              !- rank
+
+;; Non-table first arg -> type error (line 159)
+(.graph.build 42 'src 'dst)                              !- type
+
+;; Non-sym/str column name -> type error (line 163)
+(.graph.build UwEdges 42 'dst)                           !- type
+(.graph.build UwEdges 'src 42)                           !- type
+
+;; Column not found in table -> name error (line 173)
+(.graph.build UwEdges 'nosuch 'dst)                      !- name
+
+;; src/dst length mismatch -> length error (line 175)
+;; Cannot construct a mismatched-length table in RFL (table rejects it
+;; with domain error).  This branch is covered by the C test
+;; test_graph_build_validation_errors in test/test_graph_builtin.c.
+
+;; ====================================================================
+;; ray_graph_build_fn — weight column errors (lines 220-232)
+;; ====================================================================
+
+;; Weight column not found -> name error (line 221)
+(.graph.build UwEdges 'src 'dst 'nosuch)                 !- name
+
+;; Weight column is not a vec -> name error (line 221)
+;; (this triggers !w_col branch because column not in table)
+
+;; ====================================================================
+;; ray_graph_build_fn — I32 weight coercion (lines 252-253)
+;; ====================================================================
+(set Wi32E (table [src dst w] (list [0 1 2] [1 2 0] [1i 2i 3i])))
+(set Wi32 (.graph.build Wi32E 'src 'dst 'w))
+(at (.graph.info Wi32) 'has_weights)                     -- true
+(.graph.free Wi32)
+
+;; F32 weight coercion (lines 255-256) is covered by the C test
+;; test_graph_build_weight_i32_f32 in test/test_graph_builtin.c.
+;; F32 vectors cannot be constructed from RFL table literals.
+
+;; ====================================================================
+;; ray_graph_build_fn — I16 src/dst columns (widen_to_i64 I16 path)
+;; ====================================================================
+(set Hi16E (table [src dst] (list [0h 1h 2h] [1h 2h 0h])))
+(set Hi16 (.graph.build Hi16E 'src 'dst))
+(at (.graph.info Hi16) 'n_nodes)                         -- 3
+(at (.graph.info Hi16) 'n_edges)                         -- 3
+(.graph.free Hi16)
+
+;; ====================================================================
+;; ray_graph_build_fn — I32 src/dst columns (widen_to_i64 I32 path)
+;; ====================================================================
+(set Hi32E (table [src dst] (list [0i 1i 2i] [1i 2i 0i])))
+(set Hi32 (.graph.build Hi32E 'src 'dst))
+(at (.graph.info Hi32) 'n_nodes)                         -- 3
+(.graph.free Hi32)
+
+;; ====================================================================
+;; ray_graph_info_fn — type error on non-handle (line 305)
+;; ====================================================================
+(.graph.info 42)                                         !- type
+(.graph.info "hello")                                    !- type
+
+;; ====================================================================
+;; ray_graph_free_fn — type error on non-handle (line 293)
+;; ====================================================================
+(.graph.free 42)                                         !- type
+
+;; ====================================================================
+;; ray_graph_pagerank_fn — branch coverage (lines 359-387)
+;; ====================================================================
+
+;; n=0 or n>3 -> rank error (line 360)
+;; (n=0 cannot be tested from RFL because eval provides at least 1 arg)
+(.graph.pagerank Uw 10 0.85 99)                          !- rank
+
+;; non-handle first arg -> type error (line 362)
+(.graph.pagerank 42)                                     !- type
+
+;; non-int iter arg -> type error (line 367)
+(.graph.pagerank Uw "bad")                               !- type
+(.graph.pagerank Uw 1.5)                                 !- type
+
+;; iter=0 -> domain error (line 369)
+(.graph.pagerank Uw 0)                                   !- domain
+
+;; iter=65536 -> domain error (line 369, v > 65535)
+(.graph.pagerank Uw 65536)                               !- domain
+
+;; iter=-1 -> domain error (line 369, v <= 0)
+(.graph.pagerank Uw -1)                                  !- domain
+
+;; non-float/non-int damping -> type error (line 373-374)
+(.graph.pagerank Uw 10 "bad")                            !- type
+
+;; integer damping (uses atom_to_i64 path) -> domain error
+;; because integer damping would be 0 or >= 1 (both out of range)
+(.graph.pagerank Uw 10 0)                                !- domain
+(.graph.pagerank Uw 10 1)                                !- domain
+
+;; damping at boundary: 0.0 -> domain error (line 377, <= 0.0)
+(.graph.pagerank Uw 10 0.0)                              !- domain
+;; damping at boundary: 1.0 -> domain error (line 377, >= 1.0)
+(.graph.pagerank Uw 10 1.0)                              !- domain
+
+;; ====================================================================
+;; ray_graph_connected_fn — branch coverage (lines 390-402)
+;; ====================================================================
+
+;; wrong arity -> rank error (line 391)
+(.graph.connected Uw 42)                                 !- rank
+
+;; non-handle -> type error (line 393)
+(.graph.connected 42)                                    !- type
+
+;; ====================================================================
+;; ray_graph_dijkstra_fn — branch coverage (lines 405-446)
+;; ====================================================================
+
+;; wrong arity -> rank error (line 406)
+(.graph.dijkstra Wg)                                     !- rank
+(.graph.dijkstra Wg 0 1 2 99)                            !- rank
+
+;; non-handle -> type error (line 408)
+(.graph.dijkstra 42 0)                                   !- type
+
+;; non-int src -> type error (line 409)
+(.graph.dijkstra Wg "bad")                               !- type
+
+;; non-int, non-null dst -> type error (line 419-420)
+(.graph.dijkstra Wg 0 "bad")                             !- type
+
+;; null dst -> single-source mode (line 415-416)
+(>= (count (.graph.dijkstra Wg 0 0Nl)) 1)               -- true
+
+;; max_depth: non-int -> type error (line 425)
+(.graph.dijkstra Wg 0 1 "bad")                           !- type
+
+;; max_depth: v=0 -> domain error (line 426, v <= 0)
+(.graph.dijkstra Wg 0 1 0)                               !- domain
+
+;; max_depth: v=-1 -> domain error (line 426, v <= 0)
+(.graph.dijkstra Wg 0 1 -1)                              !- domain
+
+;; max_depth: v=256 -> domain error (line 426, v > 255)
+(.graph.dijkstra Wg 0 1 256)                             !- domain
+
+;; no weight column -> schema error (line 432)
+(.graph.dijkstra Uw 0)                                   !- schema
+
+;; ====================================================================
+;; ray_graph_louvain_fn — branch coverage (lines 449-468)
+;; ====================================================================
+
+;; wrong arity -> rank error (line 450)
+(.graph.louvain Uw 10 99)                                !- rank
+
+;; non-handle -> type error (line 452)
+(.graph.louvain 42)                                      !- type
+
+;; non-int iter -> type error (line 455)
+(.graph.louvain Uw "bad")                                !- type
+
+;; iter=0 -> domain error (line 457, v <= 0)
+(.graph.louvain Uw 0)                                    !- domain
+
+;; iter=-1 -> domain error (line 457, v <= 0)
+(.graph.louvain Uw -1)                                   !- domain
+
+;; iter=65536 -> domain error (line 457, v > 65535)
+(.graph.louvain Uw 65536)                                !- domain
+
+;; ====================================================================
+;; ray_graph_degree_fn — branch coverage (lines 471-483)
+;; ====================================================================
+
+;; wrong arity -> rank error (line 472)
+(.graph.degree Uw 42)                                    !- rank
+
+;; non-handle -> type error (line 474)
+(.graph.degree 42)                                       !- type
+
+;; ====================================================================
+;; ray_graph_topsort_fn — branch coverage (lines 486-498)
+;; ====================================================================
+
+;; wrong arity -> rank error (line 487)
+(.graph.topsort Uw 42)                                   !- rank
+
+;; non-handle -> type error (line 489)
+(.graph.topsort 42)                                      !- type
+
+;; ====================================================================
+;; ray_graph_dfs_fn — branch coverage (lines 501-524)
+;; ====================================================================
+
+;; wrong arity -> rank error (line 502)
+(.graph.dfs Wg)                                          !- rank
+(.graph.dfs Wg 0 5 99)                                   !- rank
+
+;; non-handle -> type error (line 504)
+(.graph.dfs 42 0)                                        !- type
+
+;; non-int src -> type error (line 505)
+(.graph.dfs Uw "bad")                                    !- type
+
+;; non-int max_depth -> type error (line 509)
+(.graph.dfs Uw 0 "bad")                                  !- type
+
+;; max_depth=-1 -> domain error (line 511, v < 0)
+(.graph.dfs Uw 0 -1)                                     !- domain
+
+;; max_depth=256 -> domain error (line 511, v > 255)
+(.graph.dfs Uw 0 256)                                    !- domain
+
+;; max_depth=0 -> valid (v=0 passes v < 0 check; only visits source)
+(count (.graph.dfs Uw 0 0))                              -- 1
+
+;; ====================================================================
+;; ray_graph_cluster_fn — branch coverage (lines 527-539)
+;; ====================================================================
+
+;; wrong arity -> rank error (line 528)
+(.graph.cluster Uw 42)                                   !- rank
+
+;; non-handle -> type error (line 530)
+(.graph.cluster 42)                                      !- type
+
+;; ====================================================================
+;; ray_graph_betweenness_fn — branch coverage (lines 542-561)
+;; ====================================================================
+
+;; wrong arity -> rank error (line 543)
+(.graph.betweenness Uw 10 99)                            !- rank
+
+;; non-handle -> type error (line 545)
+(.graph.betweenness 42)                                  !- type
+
+;; non-int sample -> type error (line 548)
+(.graph.betweenness Uw "bad")                            !- type
+
+;; sample=-1 -> domain error (line 550, v < 0)
+(.graph.betweenness Uw -1)                               !- domain
+
+;; sample=65536 -> domain error (line 550, v > 65535)
+(.graph.betweenness Uw 65536)                            !- domain
+
+;; sample=0 -> valid (exact mode, v=0 passes, line 550)
+(count (.graph.betweenness Uw 0))                        -- 3
+
+;; ====================================================================
+;; ray_graph_closeness_fn — branch coverage (lines 564-583)
+;; ====================================================================
+
+;; wrong arity -> rank error (line 565)
+(.graph.closeness Uw 10 99)                              !- rank
+
+;; non-handle -> type error (line 567)
+(.graph.closeness 42)                                    !- type
+
+;; non-int sample -> type error (line 570)
+(.graph.closeness Uw "bad")                              !- type
+
+;; sample=-1 -> domain error (line 572, v < 0)
+(.graph.closeness Uw -1)                                 !- domain
+
+;; sample=65536 -> domain error (line 572, v > 65535)
+(.graph.closeness Uw 65536)                              !- domain
+
+;; ====================================================================
+;; ray_graph_mst_fn — branch coverage (lines 586-600)
+;; ====================================================================
+
+;; wrong arity -> rank error (line 587)
+(.graph.mst Wg 42)                                       !- rank
+
+;; non-handle -> type error (line 589)
+(.graph.mst 42)                                          !- type
+
+;; no weight -> schema error (line 591)
+(.graph.mst Uw)                                          !- schema
+
+;; ====================================================================
+;; ray_graph_random_walk_fn — branch coverage (lines 603-626)
+;; ====================================================================
+
+;; wrong arity -> rank error (line 604)
+(.graph.random-walk Uw)                                  !- rank
+(.graph.random-walk Uw 0 5 99)                           !- rank
+
+;; non-handle -> type error (line 606)
+(.graph.random-walk 42 0)                                !- type
+
+;; non-int src -> type error (line 607)
+(.graph.random-walk Uw "bad")                            !- type
+
+;; non-int walk_len -> type error (line 611)
+(.graph.random-walk Uw 0 "bad")                          !- type
+
+;; walk_len=0 -> domain error (line 613, v <= 0)
+(.graph.random-walk Uw 0 0)                              !- domain
+
+;; walk_len=-1 -> domain error (line 613, v <= 0)
+(.graph.random-walk Uw 0 -1)                             !- domain
+
+;; walk_len=65536 -> domain error (line 613, v > 65535)
+(.graph.random-walk Uw 0 65536)                          !- domain
+
+;; ====================================================================
+;; ray_graph_k_shortest_fn — branch coverage (lines 629-652)
+;; ====================================================================
+
+;; wrong arity -> rank error (line 630)
+(.graph.k-shortest Wg 0 1)                               !- rank
+(.graph.k-shortest Wg 0 1 2 99)                          !- rank
+
+;; non-handle -> type error (line 632)
+(.graph.k-shortest 42 0 1 2)                             !- type
+
+;; non-int src/dst/k -> type error (line 633-634)
+(.graph.k-shortest Wg "bad" 1 2)                         !- type
+(.graph.k-shortest Wg 0 "bad" 2)                         !- type
+(.graph.k-shortest Wg 0 1 "bad")                         !- type
+
+;; k=0 -> domain error (line 638, k_v <= 0)
+(.graph.k-shortest Wg 0 1 0)                             !- domain
+
+;; k=-1 -> domain error (line 638, k_v <= 0)
+(.graph.k-shortest Wg 0 1 -1)                            !- domain
+
+;; k=65536 -> domain error (line 638, k_v > 65535)
+(.graph.k-shortest Wg 0 1 65536)                         !- domain
+
+;; no weight -> schema error (line 640)
+(.graph.k-shortest Uw 0 1 2)                             !- schema
+
+;; ====================================================================
+;; ray_graph_shortest_path_fn — branch coverage (lines 659-684)
+;; ====================================================================
+
+;; wrong arity -> rank error (line 660)
+(.graph.shortest-path Uw 0)                              !- rank
+(.graph.shortest-path Uw 0 1 2 99)                       !- rank
+
+;; non-handle -> type error (line 662)
+(.graph.shortest-path 42 0 1)                            !- type
+
+;; non-int src/dst -> type error (line 663)
+(.graph.shortest-path Uw "bad" 1)                        !- type
+(.graph.shortest-path Uw 0 "bad")                        !- type
+
+;; non-int max_depth -> type error (line 668)
+(.graph.shortest-path Uw 0 1 "bad")                      !- type
+
+;; max_depth=0 -> domain error (line 670, v <= 0)
+(.graph.shortest-path Uw 0 1 0)                          !- domain
+
+;; max_depth=-1 -> domain error (line 670, v <= 0)
+(.graph.shortest-path Uw 0 1 -1)                         !- domain
+
+;; max_depth=256 -> domain error (line 670, v > 255)
+(.graph.shortest-path Uw 0 1 256)                        !- domain
+
+;; ====================================================================
+;; ray_graph_expand_fn — branch coverage (lines 688-718)
+;; ====================================================================
+
+;; wrong arity -> rank error (line 689)
+(.graph.expand Uw)                                       !- rank
+(.graph.expand Uw 0 1 99)                                !- rank
+
+;; non-handle -> type error (line 691)
+(.graph.expand 42 0)                                     !- type
+
+;; non-int src -> type error (line 692)
+(.graph.expand Uw "bad")                                 !- type
+
+;; non-int direction -> type error (line 696)
+(.graph.expand Uw 0 "bad")                               !- type
+
+;; direction=-1 -> domain error (line 698, v < 0)
+(.graph.expand Uw 0 -1)                                  !- domain
+
+;; direction=3 -> domain error (line 698, v > 2)
+(.graph.expand Uw 0 3)                                   !- domain
+
+;; direction=2 (both) -> valid
+(>= (count (.graph.expand Uw 0 2)) 1)                   -- true
+
+;; ====================================================================
+;; ray_graph_var_expand_fn — branch coverage (lines 721-762)
+;; ====================================================================
+
+;; wrong arity -> rank error (line 722)
+(.graph.var-expand Uw 0 1)                               !- rank
+(.graph.var-expand Uw 0 1 2 0 true 99)                   !- rank
+
+;; non-handle -> type error (line 724)
+(.graph.var-expand 42 0 1 2)                             !- type
+
+;; non-int src/min/max -> type error (line 725-726)
+(.graph.var-expand Uw "bad" 1 2)                         !- type
+(.graph.var-expand Uw 0 "bad" 2)                         !- type
+(.graph.var-expand Uw 0 1 "bad")                         !- type
+
+;; min < 0 -> domain error (line 730)
+(.graph.var-expand Uw 0 -1 2)                            !- domain
+
+;; min > 255 -> domain error (line 730)
+(.graph.var-expand Uw 0 256 257)                         !- domain
+
+;; max < min -> domain error (line 730)
+(.graph.var-expand Uw 0 5 3)                             !- domain
+
+;; max > 255 -> domain error (line 730)
+(.graph.var-expand Uw 0 1 256)                           !- domain
+
+;; non-int direction -> type error (line 735)
+(.graph.var-expand Uw 0 1 2 "bad")                       !- type
+
+;; direction=-1 -> domain error (line 737, v < 0)
+(.graph.var-expand Uw 0 1 2 -1)                          !- domain
+
+;; direction=3 -> domain error (line 737, v > 2)
+(.graph.var-expand Uw 0 1 2 3)                           !- domain
+
+;; non-bool/non-int track -> type error (line 741-742)
+(.graph.var-expand Uw 0 1 2 0 "bad")                     !- type
+
+;; track as integer (1) -> exercises atom_to_i64 path (line 744)
+(>= (count (.graph.var-expand Uw 0 1 2 0 1)) 1)         -- true
+
+;; track as integer (0) -> exercises atom_to_i64 path (line 744)
+(>= (count (.graph.var-expand Uw 0 1 2 0 0)) 1)         -- true
+
+;; ====================================================================
+;; Supplemental: pagerank with integer damping that converts to valid
+;; float.  In practice integer damping always fails domain (0 or >= 1),
+;; but the atom_to_i64 branch is still exercised.
+;; ====================================================================
+
+;; I32 atom as pagerank iter (atom_to_i64 I32 branch, line 78)
+(count (.graph.pagerank Uw 5i))                          -- 3
+
+;; I16 atom as pagerank iter (atom_to_i64 I16 branch, line 79)
+(count (.graph.pagerank Uw 5h))                          -- 3
+
+;; I32 atom as dfs max_depth (atom_to_i64 I32 branch)
+(>= (count (.graph.dfs Uw 0 2i)) 1)                     -- true
+
+;; I16 atom as dfs max_depth (atom_to_i64 I16 branch)
+(>= (count (.graph.dfs Uw 0 2h)) 1)                     -- true
+
+;; I32 atom as betweenness sample
+(count (.graph.betweenness Uw 0i))                       -- 3
+
+;; I32 atom as closeness sample
+(>= (count (.graph.closeness Uw 0i)) 1)                 -- true
+
+;; I32 atom as louvain iter
+(count (.graph.louvain Uw 10i))                          -- 3
+
+;; I32 atom as random-walk walk_len
+(>= (count (.graph.random-walk Uw 0 3i)) 1)             -- true
+
+;; I32 atom as expand direction
+(>= (count (.graph.expand Uw 0 0i)) 1)                  -- true
+
+;; I32 atom as shortest-path max_depth
+(>= (count (.graph.shortest-path Uw 0 1 5i)) 1)         -- true
+
+;; I32 atom as dijkstra max_depth
+(>= (count (.graph.dijkstra Wg 0 1 5i)) 1)              -- true
+
+;; ====================================================================
+;; Build with string column names (arg_to_sym STR path, line 90-96)
+;; ====================================================================
+(set StrG (.graph.build UwEdges "src" "dst"))
+(at (.graph.info StrG) 'n_nodes)                         -- 3
+(.graph.free StrG)
+
+;; ====================================================================
+;; Build with string weight column name
+;; ====================================================================
+(set StrWg (.graph.build WEdges "src" "dst" "w"))
+(at (.graph.info StrWg) 'has_weights)                    -- true
+(.graph.free StrWg)
+
+;; ====================================================================
+;; Cleanup
+;; ====================================================================
+(.graph.free Uw)
+(.graph.free Wg)

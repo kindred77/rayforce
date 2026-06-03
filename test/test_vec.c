@@ -1198,6 +1198,1004 @@ static test_result_t test_vec_sym_is_null_path(void) {
     PASS();
 }
 
+/* ---- sentinel_is_null: per-type sentinel detection --------------------- *
+ *
+ * ray_vec_is_null reaches sentinel_is_null only when HAS_NULLS is set AND
+ * the type is in the nullable set.  The existing suite exercises I64, I16,
+ * F32 and STR; this fills in the remaining sentinel arms (lines 52-82):
+ * F64, I32, DATE, TIME, TIMESTAMP, GUID.  Each null is set via
+ * ray_vec_set_null_checked (which writes the type-correct NULL_* sentinel
+ * and flips HAS_NULLS) and read back through ray_vec_is_null. */
+
+static test_result_t test_vec_sentinel_all_types(void) {
+    struct { int8_t type; const char* name; } cases[] = {
+        { RAY_F64,       "f64"       },
+        { RAY_I32,       "i32"       },
+        { RAY_DATE,      "date"      },
+        { RAY_TIME,      "time"      },
+        { RAY_TIMESTAMP, "timestamp" },
+        { RAY_I64,       "i64"       },
+        { RAY_I16,       "i16"       },
+    };
+
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        ray_t* v = ray_vec_new(cases[c].type, 8);
+        TEST_ASSERT_NOT_NULL(v);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+
+        /* Append 5 non-null elements (memset-zero raw block, then bump len). */
+        uint8_t esz = ray_sym_elem_size(cases[c].type, 0);
+        for (int i = 0; i < 5; i++) {
+            uint8_t scratch[16] = {0};
+            /* Use a non-sentinel value (1) so is_null is definitively false. */
+            scratch[0] = 1;
+            v = ray_vec_append(v, scratch);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+        }
+        TEST_ASSERT_EQ_I(v->len, 5);
+        (void)esz;
+
+        /* No nulls yet → fast-path gate (HAS_NULLS clear) returns false. */
+        TEST_ASSERT_FALSE(ray_vec_is_null(v, 2));
+
+        /* Set element 3 null → exercises this type's sentinel write + read. */
+        ray_err_t err = ray_vec_set_null_checked(v, 3, true);
+        TEST_ASSERT_EQ_I(err, RAY_OK);
+        TEST_ASSERT_TRUE(v->attrs & RAY_ATTR_HAS_NULLS);
+        TEST_ASSERT_TRUE(ray_vec_is_null(v, 3));
+        TEST_ASSERT_FALSE(ray_vec_is_null(v, 0));
+        TEST_ASSERT_FALSE(ray_vec_is_null(v, 4));
+
+        ray_release(v);
+    }
+    PASS();
+}
+
+/* ---- sentinel_is_null: GUID arm (16-byte all-zero null) ---------------- */
+
+static test_result_t test_vec_guid_null_sentinel(void) {
+    /* GUID null = 16 zero bytes.  Exercises sentinel_is_null RAY_GUID arm
+     * (lines 78-82) and ray_vec_set_null_checked RAY_GUID arm (lines 873-874). */
+    ray_t* v = ray_vec_new(RAY_GUID, 4);
+    TEST_ASSERT_NOT_NULL(v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+
+    for (int i = 0; i < 3; i++) {
+        uint8_t guid[16];
+        memset(guid, (uint8_t)(i + 1), 16);  /* non-zero → not null */
+        v = ray_vec_append(v, guid);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    }
+    TEST_ASSERT_EQ_I(v->len, 3);
+
+    /* Before set-null: a non-zero GUID is not null. */
+    TEST_ASSERT_FALSE(ray_vec_is_null(v, 0));
+
+    ray_err_t err = ray_vec_set_null_checked(v, 1, true);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+    TEST_ASSERT_TRUE(ray_vec_is_null(v, 1));
+    TEST_ASSERT_FALSE(ray_vec_is_null(v, 0));
+    TEST_ASSERT_FALSE(ray_vec_is_null(v, 2));
+
+    /* All 16 bytes of element 1 should now be zero. */
+    const uint8_t* g1 = (const uint8_t*)ray_data(v) + 1 * 16;
+    for (int b = 0; b < 16; b++) TEST_ASSERT_EQ_I(g1[b], 0);
+
+    ray_release(v);
+    PASS();
+}
+
+/* ---- vec_is_null: out-of-range and NULL/err guards --------------------- */
+
+static test_result_t test_vec_is_null_guards(void) {
+    /* ray_vec_is_null returns false for NULL / error / OOB indices
+     * (lines 1246-1247). */
+    TEST_ASSERT_FALSE(ray_vec_is_null(NULL, 0));
+
+    int64_t raw[] = {1, 2, 3};
+    ray_t* v = ray_vec_from_raw(RAY_I64, raw, 3);
+    ray_vec_set_null(v, 1, true);  /* HAS_NULLS set so the gate doesn't short-circuit */
+
+    TEST_ASSERT_FALSE(ray_vec_is_null(v, -1));  /* idx < 0 */
+    TEST_ASSERT_FALSE(ray_vec_is_null(v, 3));   /* idx >= len */
+    TEST_ASSERT_FALSE(ray_vec_is_null(v, 99));  /* idx >> len */
+    TEST_ASSERT_TRUE(ray_vec_is_null(v, 1));    /* in-range null still works */
+
+    ray_release(v);
+    PASS();
+}
+
+/* ---- set_null_checked: range + null/err guards ------------------------- */
+
+static test_result_t test_vec_set_null_checked_guards(void) {
+    /* NULL vec → RAY_ERR_TYPE (line 837). */
+    TEST_ASSERT_EQ_I(ray_vec_set_null_checked(NULL, 0, true), RAY_ERR_TYPE);
+
+    int64_t raw[] = {1, 2, 3};
+    ray_t* v = ray_vec_from_raw(RAY_I64, raw, 3);
+
+    /* idx out of range → RAY_ERR_RANGE (line 839). */
+    TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, -1, true), RAY_ERR_RANGE);
+    TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 3, true), RAY_ERR_RANGE);
+
+    /* is_null=false is a no-op that still returns RAY_OK (clear path,
+     * line 862 false branch). */
+    TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 0, false), RAY_OK);
+    TEST_ASSERT_FALSE(ray_vec_is_null(v, 0));
+
+    ray_release(v);
+    PASS();
+}
+
+/* ---- vec_set: SYM and DATE element types ------------------------------- */
+
+static test_result_t test_vec_set_more_types(void) {
+    /* ray_vec_set on a SYM vec (adaptive width) and a DATE vec — exercises
+     * the generic memcpy slot-write for non-I64 types. */
+    ray_t* sym = ray_sym_vec_new(RAY_SYM_W16, 3);
+    uint16_t ids[] = {10, 20, 30};
+    for (int i = 0; i < 3; i++) sym = ray_vec_append(sym, &ids[i]);
+    TEST_ASSERT_EQ_I(sym->len, 3);
+
+    uint16_t new_id = 999;
+    sym = ray_vec_set(sym, 1, &new_id);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(sym));
+    uint16_t* sd = (uint16_t*)ray_data(sym);
+    TEST_ASSERT_EQ_I(sd[1], 999);
+    ray_release(sym);
+
+    /* DATE vec */
+    int32_t dates[] = {100, 200, 300};
+    ray_t* dv = ray_vec_from_raw(RAY_DATE, dates, 3);
+    int32_t nd = 12345;
+    dv = ray_vec_set(dv, 2, &nd);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(dv));
+    int32_t* dd = (int32_t*)ray_data(dv);
+    TEST_ASSERT_EQ_I(dd[2], 12345);
+
+    /* set on negative index → range error */
+    ray_t* e = ray_vec_set(dv, -1, &nd);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(e));
+    TEST_ASSERT_STR_EQ(ray_err_code(e), "range");
+
+    /* set on STR vec → type error */
+    ray_t* strv = ray_vec_new(RAY_STR, 1);
+    strv = ray_str_vec_append(strv, "x", 1);
+    ray_t* e2 = ray_vec_set(strv, 0, &nd);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(e2));
+    TEST_ASSERT_STR_EQ(ray_err_code(e2), "type");
+    ray_release(strv);
+
+    ray_release(dv);
+    PASS();
+}
+
+/* ---- vec_append: error guards ------------------------------------------ */
+
+static test_result_t test_vec_append_guards(void) {
+    /* NULL passthrough */
+    TEST_ASSERT_NULL(ray_vec_append(NULL, NULL));
+
+    /* error passthrough */
+    ray_t* err = ray_error("range", NULL);
+    ray_t* r = ray_vec_append(err, NULL);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+
+    /* STR rejected (line 217) */
+    ray_t* strv = ray_vec_new(RAY_STR, 1);
+    int64_t dummy = 0;
+    ray_t* e = ray_vec_append(strv, &dummy);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(e));
+    TEST_ASSERT_STR_EQ(ray_err_code(e), "type");
+    ray_release(strv);
+
+    PASS();
+}
+
+/* ---- insert_at: growth past capacity + various types ------------------- */
+
+static test_result_t test_vec_insert_at_grow(void) {
+    /* Force the grow-past-capacity realloc branch (lines 544-561) by
+     * starting tiny and inserting beyond capacity, always at index 0
+     * (the worst-case memmove path). */
+    ray_t* v = ray_vec_new(RAY_I32, 1);
+    TEST_ASSERT_NOT_NULL(v);
+
+    for (int i = 0; i < 64; i++) {
+        int32_t val = (int32_t)(i + 1);
+        v = ray_vec_insert_at(v, 0, &val);  /* always prepend */
+        TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    }
+    TEST_ASSERT_EQ_I(v->len, 64);
+    /* Last inserted (64) is at front; first inserted (1) is at back. */
+    int32_t* d = (int32_t*)ray_data(v);
+    TEST_ASSERT_EQ_I(d[0], 64);
+    TEST_ASSERT_EQ_I(d[63], 1);
+
+    /* insert_at error guards */
+    ray_t* err = ray_vec_insert_at(v, -1, d);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(err));
+    TEST_ASSERT_STR_EQ(ray_err_code(err), "range");
+    err = ray_vec_insert_at(v, 999, d);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(err));
+    TEST_ASSERT_STR_EQ(ray_err_code(err), "range");
+
+    /* NULL passthrough + error passthrough */
+    TEST_ASSERT_NULL(ray_vec_insert_at(NULL, 0, NULL));
+
+    ray_release(v);
+    PASS();
+}
+
+/* ---- insert_at: middle insertion (memmove shift) ----------------------- */
+
+static test_result_t test_vec_insert_at_middle(void) {
+    /* Insert in the middle (idx < old_len) → exercises the memmove
+     * shift branch (line 567). */
+    int64_t raw[] = {10, 20, 30, 40};
+    ray_t* v = ray_vec_from_raw(RAY_I64, raw, 4);
+
+    int64_t mid = 25;
+    v = ray_vec_insert_at(v, 1, &mid);  /* [10, 25, 20, 30, 40] */
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    TEST_ASSERT_EQ_I(v->len, 5);
+    int64_t* d = (int64_t*)ray_data(v);
+    TEST_ASSERT_EQ_I(d[0], 10);
+    TEST_ASSERT_EQ_I(d[1], 25);
+    TEST_ASSERT_EQ_I(d[2], 20);
+    TEST_ASSERT_EQ_I(d[3], 30);
+    TEST_ASSERT_EQ_I(d[4], 40);
+
+    ray_release(v);
+    PASS();
+}
+
+/* ---- insert_vec_at: middle splice (head/tail slice + concat) ----------- */
+
+static test_result_t test_vec_insert_vec_at_middle(void) {
+    /* idx in (0, len) hits the head=slice, tail=slice, concat-concat path
+     * (lines 613-626). */
+    int64_t base_raw[] = {1, 2, 3, 4};
+    ray_t* base = ray_vec_from_raw(RAY_I64, base_raw, 4);
+    int64_t src_raw[] = {97, 98};
+    ray_t* src = ray_vec_from_raw(RAY_I64, src_raw, 2);
+
+    ray_t* r = ray_vec_insert_vec_at(base, 2, src);  /* [1,2,97,98,3,4] */
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->len, 6);
+    int64_t* d = (int64_t*)ray_data(r);
+    TEST_ASSERT_EQ_I(d[0], 1);
+    TEST_ASSERT_EQ_I(d[1], 2);
+    TEST_ASSERT_EQ_I(d[2], 97);
+    TEST_ASSERT_EQ_I(d[3], 98);
+    TEST_ASSERT_EQ_I(d[4], 3);
+    TEST_ASSERT_EQ_I(d[5], 4);
+    ray_release(r);
+
+    /* idx == len → plain concat fast path (line 609) */
+    ray_t* r_end = ray_vec_insert_vec_at(base, base->len, src);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r_end));
+    TEST_ASSERT_EQ_I(r_end->len, 6);
+    int64_t* de = (int64_t*)ray_data(r_end);
+    TEST_ASSERT_EQ_I(de[4], 97);
+    TEST_ASSERT_EQ_I(de[5], 98);
+    ray_release(r_end);
+
+    /* idx == 0 → reversed concat fast path (line 611) */
+    ray_t* r_begin = ray_vec_insert_vec_at(base, 0, src);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r_begin));
+    TEST_ASSERT_EQ_I(r_begin->len, 6);
+    int64_t* db = (int64_t*)ray_data(r_begin);
+    TEST_ASSERT_EQ_I(db[0], 97);
+    TEST_ASSERT_EQ_I(db[1], 98);
+    TEST_ASSERT_EQ_I(db[2], 1);
+    ray_release(r_begin);
+
+    /* Error guards: NULL/err passthrough, type mismatch, OOB idx */
+    TEST_ASSERT_NULL(ray_vec_insert_vec_at(NULL, 0, src));
+    ray_t* f32 = ray_vec_from_raw(RAY_F32, (float[]){1.0f}, 1);
+    ray_t* mism = ray_vec_insert_vec_at(base, 0, f32);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(mism));
+    TEST_ASSERT_STR_EQ(ray_err_code(mism), "type");
+    ray_release(f32);
+
+    ray_t* oob = ray_vec_insert_vec_at(base, 99, src);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(oob));
+    TEST_ASSERT_STR_EQ(ray_err_code(oob), "range");
+
+    ray_release(base);
+    ray_release(src);
+    PASS();
+}
+
+/* ---- insert_vec_at: middle splice with nulls --------------------------- */
+
+static test_result_t test_vec_insert_vec_at_middle_nulls(void) {
+    /* Middle splice where both base and src carry nulls — the head/tail
+     * slices propagate parent nulls through concat. */
+    int64_t base_raw[] = {1, 2, 3, 4};
+    ray_t* base = ray_vec_from_raw(RAY_I64, base_raw, 4);
+    ray_vec_set_null(base, 0, true);  /* base[0] null */
+    ray_vec_set_null(base, 3, true);  /* base[3] null */
+
+    int64_t src_raw[] = {97, 98};
+    ray_t* src = ray_vec_from_raw(RAY_I64, src_raw, 2);
+    ray_vec_set_null(src, 1, true);   /* src[1] null */
+
+    ray_t* r = ray_vec_insert_vec_at(base, 2, src);  /* [N,2,97,N,3,N] */
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->len, 6);
+    TEST_ASSERT_TRUE(ray_vec_is_null(r, 0));   /* base[0] */
+    TEST_ASSERT_FALSE(ray_vec_is_null(r, 1));  /* base[1]=2 */
+    TEST_ASSERT_FALSE(ray_vec_is_null(r, 2));  /* src[0]=97 */
+    TEST_ASSERT_TRUE(ray_vec_is_null(r, 3));   /* src[1] null */
+    TEST_ASSERT_FALSE(ray_vec_is_null(r, 4));  /* base[2]=3 */
+    TEST_ASSERT_TRUE(ray_vec_is_null(r, 5));   /* base[3] null */
+
+    ray_release(r);
+    ray_release(src);
+    ray_release(base);
+    PASS();
+}
+
+/* ---- concat: LIST element retain path ---------------------------------- */
+
+static test_result_t test_vec_concat_list_retain(void) {
+    /* RAY_LIST concat: ray_vec_concat goes through the generic memcpy path
+     * and then the LIST/TABLE child-pointer retain loop (lines 507-512).
+     * ray_list_append retains the item, so we release our own refs after. */
+    ray_t* x = ray_i64(11);
+    ray_t* y = ray_i64(22);
+    ray_t* z = ray_i64(33);
+
+    ray_t* a = ray_list_new(2);
+    a = ray_list_append(a, x);
+    a = ray_list_append(a, y);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(a));
+    TEST_ASSERT_EQ_I(a->len, 2);
+
+    ray_t* b = ray_list_new(1);
+    b = ray_list_append(b, z);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(b));
+
+    ray_t* c = ray_vec_concat(a, b);
+    TEST_ASSERT_NOT_NULL(c);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(c));
+    TEST_ASSERT_EQ_I(c->type, RAY_LIST);
+    TEST_ASSERT_EQ_I(c->len, 3);
+
+    /* Each child must be a valid, retained atom. */
+    ray_t** ptrs = (ray_t**)ray_data(c);
+    TEST_ASSERT_NOT_NULL(ptrs[0]);
+    TEST_ASSERT_NOT_NULL(ptrs[2]);
+    TEST_ASSERT_EQ_I(ptrs[0]->i64, 11);
+    TEST_ASSERT_EQ_I(ptrs[2]->i64, 33);
+
+    ray_release(c);
+    ray_release(a);
+    ray_release(b);
+    /* Drop our original atom refs (list_append + concat each retained). */
+    ray_release(x);
+    ray_release(y);
+    ray_release(z);
+    PASS();
+}
+
+/* ---- concat: GUID (generic memcpy path) -------------------------------- */
+
+static test_result_t test_vec_concat_guid(void) {
+    /* GUID is not STR/SYM, so concat takes the same-width memcpy path
+     * (lines 474-486) with 16-byte elements; verify byte-exact merge. */
+    ray_t* a = ray_vec_new(RAY_GUID, 2);
+    uint8_t g0[16], g1[16];
+    memset(g0, 0xA1, 16);
+    memset(g1, 0xB2, 16);
+    a = ray_vec_append(a, g0);
+    a = ray_vec_append(a, g1);
+    TEST_ASSERT_EQ_I(a->len, 2);
+
+    ray_t* b = ray_vec_new(RAY_GUID, 1);
+    uint8_t g2[16];
+    memset(g2, 0xC3, 16);
+    b = ray_vec_append(b, g2);
+
+    ray_t* c = ray_vec_concat(a, b);
+    TEST_ASSERT_NOT_NULL(c);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(c));
+    TEST_ASSERT_EQ_I(c->len, 3);
+    const uint8_t* cd = (const uint8_t*)ray_data(c);
+    TEST_ASSERT_EQ_I(cd[0 * 16], 0xA1);
+    TEST_ASSERT_EQ_I(cd[1 * 16], 0xB2);
+    TEST_ASSERT_EQ_I(cd[2 * 16], 0xC3);
+
+    ray_release(a);
+    ray_release(b);
+    ray_release(c);
+    PASS();
+}
+
+/* ---- concat: NULL / error passthrough guards --------------------------- */
+
+static test_result_t test_vec_concat_guards(void) {
+    int64_t raw[] = {1, 2};
+    ray_t* v = ray_vec_from_raw(RAY_I64, raw, 2);
+
+    /* a NULL → returns a (NULL) */
+    TEST_ASSERT_NULL(ray_vec_concat(NULL, v));
+    /* b NULL → returns b (NULL) */
+    TEST_ASSERT_NULL(ray_vec_concat(v, NULL));
+
+    /* a is error → returns a */
+    ray_t* err = ray_error("range", NULL);
+    ray_t* r = ray_vec_concat(err, v);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+
+    ray_release(v);
+    PASS();
+}
+
+/* ---- concat: empty operands -------------------------------------------- */
+
+static test_result_t test_vec_concat_empty(void) {
+    /* Concat with an empty vec on either side (a->len==0 / b->len==0). */
+    int64_t raw[] = {1, 2, 3};
+    ray_t* v = ray_vec_from_raw(RAY_I64, raw, 3);
+    ray_t* empty = ray_vec_new(RAY_I64, 0);
+
+    ray_t* c1 = ray_vec_concat(empty, v);   /* [] , [1 2 3] */
+    TEST_ASSERT_FALSE(RAY_IS_ERR(c1));
+    TEST_ASSERT_EQ_I(c1->len, 3);
+    int64_t* d1 = (int64_t*)ray_data(c1);
+    TEST_ASSERT_EQ_I(d1[0], 1);
+    ray_release(c1);
+
+    ray_t* c2 = ray_vec_concat(v, empty);   /* [1 2 3] , [] */
+    TEST_ASSERT_FALSE(RAY_IS_ERR(c2));
+    TEST_ASSERT_EQ_I(c2->len, 3);
+    ray_release(c2);
+
+    ray_t* c3 = ray_vec_concat(empty, empty);  /* [] , [] */
+    TEST_ASSERT_FALSE(RAY_IS_ERR(c3));
+    TEST_ASSERT_EQ_I(c3->len, 0);
+    ray_release(c3);
+
+    ray_release(v);
+    ray_release(empty);
+    PASS();
+}
+
+/* ---- concat: STR with empty/inline and pooled merge -------------------- */
+
+static test_result_t test_vec_concat_str(void) {
+    /* STR concat path (lines 361-440): merges two string vecs with both
+     * inline and pooled elements, rebasing pool offsets. */
+    ray_t* a = ray_vec_new(RAY_STR, 2);
+    a = ray_str_vec_append(a, "hi", 2);                                   /* inline */
+    a = ray_str_vec_append(a, "this_is_a_long_pooled_string_aaa", 32);    /* pooled */
+    TEST_ASSERT_EQ_I(a->len, 2);
+
+    ray_t* b = ray_vec_new(RAY_STR, 2);
+    b = ray_str_vec_append(b, "another_long_pooled_string_bbbb", 31);     /* pooled */
+    b = ray_str_vec_append(b, "yo", 2);                                   /* inline */
+    TEST_ASSERT_EQ_I(b->len, 2);
+
+    ray_t* c = ray_vec_concat(a, b);
+    TEST_ASSERT_NOT_NULL(c);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(c));
+    TEST_ASSERT_EQ_I(c->len, 4);
+
+    size_t l = 0;
+    const char* s0 = ray_str_vec_get(c, 0, &l);
+    TEST_ASSERT_EQ_I((int64_t)l, 2);
+    TEST_ASSERT_MEM_EQ(2, s0, "hi");
+    const char* s1 = ray_str_vec_get(c, 1, &l);
+    TEST_ASSERT_EQ_I((int64_t)l, 32);
+    TEST_ASSERT_MEM_EQ(32, s1, "this_is_a_long_pooled_string_aaa");
+    const char* s2 = ray_str_vec_get(c, 2, &l);
+    TEST_ASSERT_EQ_I((int64_t)l, 31);
+    TEST_ASSERT_MEM_EQ(31, s2, "another_long_pooled_string_bbbb");
+    const char* s3 = ray_str_vec_get(c, 3, &l);
+    TEST_ASSERT_EQ_I((int64_t)l, 2);
+    TEST_ASSERT_MEM_EQ(2, s3, "yo");
+
+    ray_release(a);
+    ray_release(b);
+    ray_release(c);
+    PASS();
+}
+
+/* ---- concat: STR null propagation -------------------------------------- */
+
+static test_result_t test_vec_concat_str_null(void) {
+    ray_t* a = ray_vec_new(RAY_STR, 2);
+    a = ray_str_vec_append(a, "x", 1);
+    a = ray_str_vec_append(a, "yy", 2);
+    ray_vec_set_null(a, 0, true);  /* a[0] null */
+    TEST_ASSERT_TRUE(ray_vec_is_null(a, 0));
+
+    ray_t* b = ray_vec_new(RAY_STR, 1);
+    b = ray_str_vec_append(b, "zzz", 3);
+    ray_vec_set_null(b, 0, true);  /* b[0] null */
+
+    ray_t* c = ray_vec_concat(a, b);
+    TEST_ASSERT_NOT_NULL(c);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(c));
+    TEST_ASSERT_EQ_I(c->len, 3);
+    TEST_ASSERT_TRUE(ray_vec_is_null(c, 0));   /* a[0] */
+    TEST_ASSERT_FALSE(ray_vec_is_null(c, 1));  /* a[1]=yy */
+    TEST_ASSERT_TRUE(ray_vec_is_null(c, 2));   /* b[0] */
+
+    ray_release(a);
+    ray_release(b);
+    ray_release(c);
+    PASS();
+}
+
+/* ---- str_vec_append: pool growth across many large strings ------------- */
+
+static test_result_t test_str_vec_append_pool_grow(void) {
+    /* Append enough large strings to force the pool to realloc past its
+     * initial capacity (lines 972-985), plus element-array growth. */
+    ray_t* v = ray_vec_new(RAY_STR, 1);
+    TEST_ASSERT_NOT_NULL(v);
+
+    char big[64];
+    memset(big, 'Q', sizeof(big));
+    for (int i = 0; i < 40; i++) {
+        /* Vary the first byte so each is distinct; all > 12 bytes → pooled. */
+        big[0] = (char)('A' + (i % 26));
+        v = ray_str_vec_append(v, big, sizeof(big));
+        TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    }
+    TEST_ASSERT_EQ_I(v->len, 40);
+
+    /* Verify a sampling read back correctly. */
+    size_t l = 0;
+    const char* s = ray_str_vec_get(v, 39, &l);
+    TEST_ASSERT_EQ_I((int64_t)l, 64);
+    TEST_ASSERT_EQ_I(s[0], 'A' + (39 % 26));
+
+    ray_release(v);
+    PASS();
+}
+
+/* ---- str_vec_set: grow pool + inline overwrite of pooled --------------- */
+
+static test_result_t test_str_vec_set_paths(void) {
+    ray_t* v = ray_vec_new(RAY_STR, 2);
+    v = ray_str_vec_append(v, "short", 5);                         /* inline */
+    v = ray_str_vec_append(v, "x", 1);                             /* inline */
+    TEST_ASSERT_EQ_I(v->len, 2);
+
+    /* set element 0 to a long pooled string (allocates the pool, lines
+     * 1096-1136). */
+    v = ray_str_vec_set(v, 0, "now_a_long_pooled_string_value!!", 32);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    size_t l = 0;
+    const char* s0 = ray_str_vec_get(v, 0, &l);
+    TEST_ASSERT_EQ_I((int64_t)l, 32);
+    TEST_ASSERT_MEM_EQ(32, s0, "now_a_long_pooled_string_value!!");
+
+    /* Overwrite the pooled element with an inline one — old bytes become
+     * dead (lines 1088-1090). */
+    v = ray_str_vec_set(v, 0, "tiny", 4);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    const char* s0b = ray_str_vec_get(v, 0, &l);
+    TEST_ASSERT_EQ_I((int64_t)l, 4);
+    TEST_ASSERT_MEM_EQ(4, s0b, "tiny");
+
+    /* Overwrite a pooled element with another pooled one (dead-byte track
+     * on the second pooled→pooled set, lines 1126-1128). */
+    v = ray_str_vec_set(v, 1, "first_pooled_value_here_yes!!!!!", 32);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    v = ray_str_vec_set(v, 1, "second_pooled_value_here_too!!!!", 32);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    const char* s1 = ray_str_vec_get(v, 1, &l);
+    TEST_ASSERT_EQ_I((int64_t)l, 32);
+    TEST_ASSERT_MEM_EQ(32, s1, "second_pooled_value_here_too!!!!");
+
+    /* Error guards */
+    ray_t* e = ray_str_vec_set(v, 99, "x", 1);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(e));
+    TEST_ASSERT_STR_EQ(ray_err_code(e), "range");
+    ray_t* iv = ray_vec_from_raw(RAY_I64, (int64_t[]){1}, 1);
+    ray_t* e2 = ray_str_vec_set(iv, 0, "x", 1);  /* non-STR → type */
+    TEST_ASSERT_TRUE(RAY_IS_ERR(e2));
+    TEST_ASSERT_STR_EQ(ray_err_code(e2), "type");
+    ray_release(iv);
+
+    ray_release(v);
+    PASS();
+}
+
+/* ---- str_vec_get/append: error and slice guards ------------------------ */
+
+static test_result_t test_str_vec_guards(void) {
+    /* ray_str_vec_get on non-STR / NULL / OOB returns NULL with *out_len=0. */
+    size_t l = 99;
+    TEST_ASSERT_NULL(ray_str_vec_get(NULL, 0, &l));
+    TEST_ASSERT_EQ_I((int64_t)l, 0);
+
+    int64_t raw[] = {1};
+    ray_t* iv = ray_vec_from_raw(RAY_I64, raw, 1);
+    l = 99;
+    TEST_ASSERT_NULL(ray_str_vec_get(iv, 0, &l));  /* wrong type */
+    TEST_ASSERT_EQ_I((int64_t)l, 0);
+    ray_release(iv);
+
+    ray_t* v = ray_vec_new(RAY_STR, 1);
+    v = ray_str_vec_append(v, "hi", 2);
+    l = 99;
+    TEST_ASSERT_NULL(ray_str_vec_get(v, 5, &l));   /* OOB */
+    TEST_ASSERT_EQ_I((int64_t)l, 0);
+
+    /* ray_str_vec_append on a non-STR vec → type error */
+    ray_t* iv2 = ray_vec_from_raw(RAY_I64, raw, 1);
+    ray_t* e = ray_str_vec_append(iv2, "x", 1);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(e));
+    TEST_ASSERT_STR_EQ(ray_err_code(e), "type");
+    ray_release(iv2);
+
+    /* ray_str_vec_get via slice */
+    v = ray_str_vec_append(v, "pooled_string_longer_than_twelve", 32);
+    ray_t* s = ray_vec_slice(v, 1, 1);  /* slice of the pooled element */
+    TEST_ASSERT_FALSE(RAY_IS_ERR(s));
+    const char* sp = ray_str_vec_get(s, 0, &l);
+    TEST_ASSERT_NOT_NULL(sp);
+    TEST_ASSERT_EQ_I((int64_t)l, 32);
+    TEST_ASSERT_MEM_EQ(32, sp, "pooled_string_longer_than_twelve");
+    ray_release(s);
+
+    ray_release(v);
+    PASS();
+}
+
+/* ---- str_vec_insert_at: middle + boundaries ---------------------------- */
+
+static test_result_t test_str_vec_insert_at_paths(void) {
+    ray_t* v = ray_vec_new(RAY_STR, 3);
+    v = ray_str_vec_append(v, "aa", 2);
+    v = ray_str_vec_append(v, "long_pooled_string_one_here!!!!!", 32);
+    v = ray_str_vec_append(v, "cc", 2);
+    TEST_ASSERT_EQ_I(v->len, 3);
+
+    /* Insert a pooled string in the middle (idx=1). */
+    v = ray_str_vec_insert_at(v, 1, "another_long_pooled_inserted_!!!", 32);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    TEST_ASSERT_EQ_I(v->len, 4);
+    size_t l = 0;
+    const char* s1 = ray_str_vec_get(v, 1, &l);
+    TEST_ASSERT_EQ_I((int64_t)l, 32);
+    TEST_ASSERT_MEM_EQ(32, s1, "another_long_pooled_inserted_!!!");
+    /* Original element shifted to index 2. */
+    const char* s2 = ray_str_vec_get(v, 2, &l);
+    TEST_ASSERT_EQ_I((int64_t)l, 32);
+    TEST_ASSERT_MEM_EQ(32, s2, "long_pooled_string_one_here!!!!!");
+
+    /* Insert at front (idx=0). */
+    v = ray_str_vec_insert_at(v, 0, "front", 5);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    TEST_ASSERT_EQ_I(v->len, 5);
+    const char* s0 = ray_str_vec_get(v, 0, &l);
+    TEST_ASSERT_MEM_EQ(5, s0, "front");
+
+    /* Error guards: non-STR type and OOB idx. */
+    ray_t* iv = ray_vec_from_raw(RAY_I64, (int64_t[]){1}, 1);
+    ray_t* e = ray_str_vec_insert_at(iv, 0, "x", 1);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(e));
+    TEST_ASSERT_STR_EQ(ray_err_code(e), "type");
+    ray_release(iv);
+    ray_t* e2 = ray_str_vec_insert_at(v, 99, "x", 1);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(e2));
+    TEST_ASSERT_STR_EQ(ray_err_code(e2), "range");
+
+    ray_release(v);
+    PASS();
+}
+
+/* ---- str_vec_compact: nulls + no-dead early return + non-STR guard ----- */
+
+static test_result_t test_str_vec_compact_paths(void) {
+    /* Build a STR vec with pooled strings, set one null, overwrite another
+     * (creating dead bytes), then compact.  Exercises ray_str_vec_compact's
+     * null-skip (lines 1197, 1218) and live-rewrite paths. */
+    ray_t* v = ray_vec_new(RAY_STR, 4);
+    v = ray_str_vec_append(v, "pooled_alpha_string_one_here!!!!", 32);
+    v = ray_str_vec_append(v, "pooled_beta_string_two_here!!!!!", 32);
+    v = ray_str_vec_append(v, "pooled_gamma_string_three_here!!", 32);
+    v = ray_str_vec_append(v, "inline", 6);
+    TEST_ASSERT_EQ_I(v->len, 4);
+
+    /* set element 0 → creates dead bytes for the old pooled string. */
+    v = ray_str_vec_set(v, 0, "tiny0", 5);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+
+    /* set element 1 null (STR is nullable). */
+    ray_vec_set_null(v, 1, true);
+    TEST_ASSERT_TRUE(ray_vec_is_null(v, 1));
+
+    /* compact reclaims dead bytes; null + inline elements are skipped. */
+    v = ray_str_vec_compact(v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    TEST_ASSERT_EQ_I(v->len, 4);
+
+    /* element 2 (the only surviving pooled string) must still read back. */
+    size_t l = 0;
+    const char* s2 = ray_str_vec_get(v, 2, &l);
+    TEST_ASSERT_EQ_I((int64_t)l, 32);
+    TEST_ASSERT_MEM_EQ(32, s2, "pooled_gamma_string_three_here!!");
+    /* element 1 remains null after compact. */
+    TEST_ASSERT_TRUE(ray_vec_is_null(v, 1));
+
+    /* compact with no dead bytes is a no-op early return (line 1182). */
+    ray_t* same = ray_str_vec_compact(v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(same));
+
+    /* compact on non-STR → type error. */
+    ray_t* iv = ray_vec_from_raw(RAY_I64, (int64_t[]){1}, 1);
+    ray_t* e = ray_str_vec_compact(iv);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(e));
+    TEST_ASSERT_STR_EQ(ray_err_code(e), "type");
+    ray_release(iv);
+
+    ray_release(v);
+    PASS();
+}
+
+/* ---- str_vec_compact: all-dead pool frees pool entirely ---------------- */
+
+static test_result_t test_str_vec_compact_all_dead(void) {
+    /* When every pooled string is overwritten/nulled, live_size==0 and the
+     * pool is freed (lines 1201-1205). */
+    ray_t* v = ray_vec_new(RAY_STR, 2);
+    v = ray_str_vec_append(v, "first_pooled_to_be_killed_now!!!", 32);
+    v = ray_str_vec_append(v, "second_pooled_also_dead_soon!!!!", 32);
+    TEST_ASSERT_EQ_I(v->len, 2);
+
+    /* Replace both with inline strings → all pooled bytes dead. */
+    v = ray_str_vec_set(v, 0, "ii0", 3);
+    v = ray_str_vec_set(v, 1, "ii1", 3);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+
+    v = ray_str_vec_compact(v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    TEST_ASSERT_EQ_I(v->len, 2);
+    TEST_ASSERT_NULL(v->str_pool);  /* pool freed */
+
+    size_t l = 0;
+    const char* s0 = ray_str_vec_get(v, 0, &l);
+    TEST_ASSERT_EQ_I((int64_t)l, 3);
+    TEST_ASSERT_MEM_EQ(3, s0, "ii0");
+
+    ray_release(v);
+    PASS();
+}
+
+/* ---- copy_nulls: non-slice source, no-nulls, length mismatch ----------- */
+
+static test_result_t test_vec_copy_nulls_paths(void) {
+    /* NULL guard (line 1290). */
+    int64_t raw[] = {1, 2, 3};
+    ray_t* v = ray_vec_from_raw(RAY_I64, raw, 3);
+    TEST_ASSERT_EQ_I(ray_vec_copy_nulls(NULL, v), RAY_ERR_TYPE);
+    TEST_ASSERT_EQ_I(ray_vec_copy_nulls(v, NULL), RAY_ERR_TYPE);
+
+    /* Source with no nulls → early RAY_OK (lines 1299-1301). */
+    ray_t* dst = ray_vec_new(RAY_I64, 3);
+    int64_t z = 0;
+    for (int i = 0; i < 3; i++) dst = ray_vec_append(dst, &z);
+    TEST_ASSERT_EQ_I(ray_vec_copy_nulls(dst, v), RAY_OK);
+    TEST_ASSERT_FALSE(ray_vec_is_null(dst, 0));
+
+    /* Non-slice source with nulls → copy loop (lines 1303-1308). */
+    ray_t* src = ray_vec_from_raw(RAY_I64, raw, 3);
+    ray_vec_set_null(src, 1, true);
+    TEST_ASSERT_EQ_I(ray_vec_copy_nulls(dst, src), RAY_OK);
+    TEST_ASSERT_FALSE(ray_vec_is_null(dst, 0));
+    TEST_ASSERT_TRUE(ray_vec_is_null(dst, 1));
+    TEST_ASSERT_FALSE(ray_vec_is_null(dst, 2));
+
+    /* Length-mismatch: dst shorter than src → loop bounded by min len. */
+    ray_t* dst2 = ray_vec_new(RAY_I64, 2);
+    for (int i = 0; i < 2; i++) dst2 = ray_vec_append(dst2, &z);
+    TEST_ASSERT_EQ_I(ray_vec_copy_nulls(dst2, src), RAY_OK);
+    TEST_ASSERT_TRUE(ray_vec_is_null(dst2, 1));
+
+    ray_release(dst2);
+    ray_release(src);
+    ray_release(dst);
+    ray_release(v);
+    PASS();
+}
+
+/* ---- vec_get: slice path + STR/NULL guards ----------------------------- */
+
+static test_result_t test_vec_get_paths(void) {
+    /* NULL / error guards (line 301). */
+    TEST_ASSERT_NULL(ray_vec_get(NULL, 0));
+
+    int64_t raw[] = {10, 20, 30, 40, 50};
+    ray_t* v = ray_vec_from_raw(RAY_I64, raw, 5);
+
+    /* Slice-path get with OOB on the slice (line 308 idx>=len). */
+    ray_t* s = ray_vec_slice(v, 1, 2);  /* [20, 30] */
+    TEST_ASSERT_FALSE(RAY_IS_ERR(s));
+    int64_t* p = (int64_t*)ray_vec_get(s, 0);
+    TEST_ASSERT_EQ_I(*p, 20);
+    TEST_ASSERT_NULL(ray_vec_get(s, -1));  /* idx < 0 on slice */
+    TEST_ASSERT_NULL(ray_vec_get(s, 2));   /* idx >= slice len */
+    ray_release(s);
+
+    ray_release(v);
+    PASS();
+}
+
+/* ---- sym_vec: W64 append + get_sym_id round-trip ----------------------- */
+
+static test_result_t test_sym_vec_w64(void) {
+    /* W64 path through append and get_sym_id (default width). */
+    ray_t* v = ray_sym_vec_new(RAY_SYM_W64, 4);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    int64_t ids[] = {1, 1000000, 5};
+    for (int i = 0; i < 3; i++) v = ray_vec_append(v, &ids[i]);
+    TEST_ASSERT_EQ_I(v->len, 3);
+    TEST_ASSERT_EQ_I(ray_vec_get_sym_id(v, 0), 1);
+    TEST_ASSERT_EQ_I(ray_vec_get_sym_id(v, 1), 1000000);
+    TEST_ASSERT_EQ_I(ray_vec_get_sym_id(v, 2), 5);
+    /* ray_vec_new(RAY_SYM, ...) delegates to ray_sym_vec_new(W64). */
+    ray_t* v2 = ray_vec_new(RAY_SYM, 2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v2));
+    TEST_ASSERT_EQ_I(v2->type, RAY_SYM);
+    TEST_ASSERT_EQ_I(v2->attrs & RAY_SYM_W_MASK, RAY_SYM_W64);
+    ray_release(v2);
+    ray_release(v);
+    PASS();
+}
+
+/* ---- concat: SYM same width fast path (memcpy) ------------------------- */
+
+static test_result_t test_vec_concat_sym_same_width(void) {
+    /* Same-width SYM concat takes the fast memcpy path (a_esz == b_esz),
+     * NOT the element-by-element widen path. */
+    ray_t* a = ray_sym_vec_new(RAY_SYM_W16, 2);
+    uint16_t a0 = 100, a1 = 200;
+    a = ray_vec_append(a, &a0);
+    a = ray_vec_append(a, &a1);
+    ray_t* b = ray_sym_vec_new(RAY_SYM_W16, 2);
+    uint16_t b0 = 300, b1 = 400;
+    b = ray_vec_append(b, &b0);
+    b = ray_vec_append(b, &b1);
+
+    ray_t* c = ray_vec_concat(a, b);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(c));
+    TEST_ASSERT_EQ_I(c->len, 4);
+    TEST_ASSERT_EQ_I(c->attrs & RAY_SYM_W_MASK, RAY_SYM_W16);
+    TEST_ASSERT_EQ_I(ray_vec_get_sym_id(c, 0), 100);
+    TEST_ASSERT_EQ_I(ray_vec_get_sym_id(c, 3), 400);
+
+    ray_release(a);
+    ray_release(b);
+    ray_release(c);
+    PASS();
+}
+
+/* ---- insert_many: broadcast atom + GUID atom paths --------------------- */
+
+static test_result_t test_vec_insert_many_atom(void) {
+    /* Atom broadcast (vals->type < 0): insert the same I64 atom at 2 spots. */
+    int64_t base_raw[] = {1, 2, 3};
+    ray_t* base = ray_vec_from_raw(RAY_I64, base_raw, 3);
+
+    ray_t* idxs = ray_vec_from_raw(RAY_I64, (int64_t[]){0, 3}, 2);
+    ray_t* atom = ray_i64(777);  /* negative type → broadcast atom */
+    TEST_ASSERT_FALSE(RAY_IS_ERR(atom));
+
+    ray_t* r = ray_vec_insert_many(base, idxs, atom);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->len, 5);  /* [777,1,2,3,777] */
+    int64_t* d = (int64_t*)ray_data(r);
+    TEST_ASSERT_EQ_I(d[0], 777);
+    TEST_ASSERT_EQ_I(d[1], 1);
+    TEST_ASSERT_EQ_I(d[4], 777);
+
+    ray_release(r);
+    ray_release(atom);
+    ray_release(idxs);
+
+    /* Atom type-mismatch: I32 base with I64 atom → type error. */
+    int32_t b32[] = {1, 2};
+    ray_t* base32 = ray_vec_from_raw(RAY_I32, b32, 2);
+    ray_t* idx1 = ray_vec_from_raw(RAY_I64, (int64_t[]){0}, 1);
+    ray_t* atom64 = ray_i64(5);
+    ray_t* e = ray_vec_insert_many(base32, idx1, atom64);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(e));
+    TEST_ASSERT_STR_EQ(ray_err_code(e), "type");
+    ray_release(atom64);
+    ray_release(idx1);
+    ray_release(base32);
+
+    ray_release(base);
+    PASS();
+}
+
+/* ---- insert_many: NULL / error passthrough guards ---------------------- */
+
+static test_result_t test_vec_insert_many_guards(void) {
+    int64_t raw[] = {1, 2};
+    ray_t* base = ray_vec_from_raw(RAY_I64, raw, 2);
+    ray_t* idxs = ray_vec_from_raw(RAY_I64, (int64_t[]){0}, 1);
+    ray_t* vals = ray_vec_from_raw(RAY_I64, (int64_t[]){9}, 1);
+
+    /* vec NULL → returns vec (NULL) */
+    TEST_ASSERT_NULL(ray_vec_insert_many(NULL, idxs, vals));
+    /* idxs NULL → returns idxs (NULL) */
+    TEST_ASSERT_NULL(ray_vec_insert_many(base, NULL, vals));
+    /* vals NULL → returns vals (NULL) */
+    TEST_ASSERT_NULL(ray_vec_insert_many(base, idxs, NULL));
+
+    ray_release(vals);
+    ray_release(idxs);
+    ray_release(base);
+    PASS();
+}
+
+/* ---- from_raw: SYM default-W64 and LIST/TABLE guard -------------------- */
+
+static test_result_t test_vec_from_raw_sym(void) {
+    /* RAY_SYM from_raw defaults to W64 (line 801). */
+    int64_t ids[] = {1, 2, 3};
+    ray_t* v = ray_vec_from_raw(RAY_SYM, ids, 3);
+    TEST_ASSERT_NOT_NULL(v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    TEST_ASSERT_EQ_I(v->type, RAY_SYM);
+    TEST_ASSERT_EQ_I(v->attrs & RAY_SYM_W_MASK, RAY_SYM_W64);
+    TEST_ASSERT_EQ_I(ray_vec_get_sym_id(v, 1), 2);
+    ray_release(v);
+
+    /* GUID from_raw (16-byte elements). */
+    uint8_t guids[32];
+    memset(guids, 0xAB, 16);
+    memset(guids + 16, 0xCD, 16);
+    ray_t* g = ray_vec_from_raw(RAY_GUID, guids, 2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(g));
+    TEST_ASSERT_EQ_I(g->len, 2);
+    const uint8_t* gd = (const uint8_t*)ray_data(g);
+    TEST_ASSERT_EQ_I(gd[0], 0xAB);
+    TEST_ASSERT_EQ_I(gd[16], 0xCD);
+    ray_release(g);
+    PASS();
+}
+
+/* ---- slice: NULL/error passthrough + zero-length ----------------------- */
+
+static test_result_t test_vec_slice_guards(void) {
+    /* NULL passthrough (line 323). */
+    TEST_ASSERT_NULL(ray_vec_slice(NULL, 0, 0));
+
+    int64_t raw[] = {1, 2, 3};
+    ray_t* v = ray_vec_from_raw(RAY_I64, raw, 3);
+
+    /* Negative offset / len → range error (line 324). */
+    ray_t* e1 = ray_vec_slice(v, -1, 1);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(e1));
+    ray_t* e2 = ray_vec_slice(v, 0, -1);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(e2));
+    ray_t* e3 = ray_vec_slice(v, 4, 0);  /* offset > len */
+    TEST_ASSERT_TRUE(RAY_IS_ERR(e3));
+
+    /* Zero-length slice at a valid offset is OK. */
+    ray_t* z = ray_vec_slice(v, 1, 0);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(z));
+    TEST_ASSERT_EQ_I(z->len, 0);
+    ray_release(z);
+
+    ray_release(v);
+    PASS();
+}
+
 /* ---- Suite definition -------------------------------------------------- */
 
 const test_entry_t vec_entries[] = {
@@ -1240,6 +2238,36 @@ const test_entry_t vec_entries[] = {
     { "vec/from_raw_errors", test_vec_from_raw_errors, vec_setup, vec_teardown },
     { "vec/insert_many_sym_and_bc_null", test_vec_insert_many_sym_and_bc_null, vec_setup, vec_teardown },
     { "vec/sym_is_null_path", test_vec_sym_is_null_path, vec_setup, vec_teardown },
+    { "vec/sentinel_all_types", test_vec_sentinel_all_types, vec_setup, vec_teardown },
+    { "vec/guid_null_sentinel", test_vec_guid_null_sentinel, vec_setup, vec_teardown },
+    { "vec/is_null_guards", test_vec_is_null_guards, vec_setup, vec_teardown },
+    { "vec/set_null_checked_guards", test_vec_set_null_checked_guards, vec_setup, vec_teardown },
+    { "vec/set_more_types", test_vec_set_more_types, vec_setup, vec_teardown },
+    { "vec/append_guards", test_vec_append_guards, vec_setup, vec_teardown },
+    { "vec/insert_at_grow", test_vec_insert_at_grow, vec_setup, vec_teardown },
+    { "vec/insert_at_middle", test_vec_insert_at_middle, vec_setup, vec_teardown },
+    { "vec/insert_vec_at_middle", test_vec_insert_vec_at_middle, vec_setup, vec_teardown },
+    { "vec/insert_vec_at_middle_nulls", test_vec_insert_vec_at_middle_nulls, vec_setup, vec_teardown },
+    { "vec/concat_list_retain", test_vec_concat_list_retain, vec_setup, vec_teardown },
+    { "vec/concat_guid", test_vec_concat_guid, vec_setup, vec_teardown },
+    { "vec/concat_guards", test_vec_concat_guards, vec_setup, vec_teardown },
+    { "vec/concat_empty", test_vec_concat_empty, vec_setup, vec_teardown },
+    { "vec/concat_str", test_vec_concat_str, vec_setup, vec_teardown },
+    { "vec/concat_str_null", test_vec_concat_str_null, vec_setup, vec_teardown },
+    { "vec/str_append_pool_grow", test_str_vec_append_pool_grow, vec_setup, vec_teardown },
+    { "vec/str_set_paths", test_str_vec_set_paths, vec_setup, vec_teardown },
+    { "vec/str_guards", test_str_vec_guards, vec_setup, vec_teardown },
+    { "vec/str_insert_at_paths", test_str_vec_insert_at_paths, vec_setup, vec_teardown },
+    { "vec/str_compact_paths", test_str_vec_compact_paths, vec_setup, vec_teardown },
+    { "vec/str_compact_all_dead", test_str_vec_compact_all_dead, vec_setup, vec_teardown },
+    { "vec/copy_nulls_paths", test_vec_copy_nulls_paths, vec_setup, vec_teardown },
+    { "vec/get_paths", test_vec_get_paths, vec_setup, vec_teardown },
+    { "vec/sym_vec_w64", test_sym_vec_w64, vec_setup, vec_teardown },
+    { "vec/concat_sym_same_width", test_vec_concat_sym_same_width, vec_setup, vec_teardown },
+    { "vec/insert_many_atom", test_vec_insert_many_atom, vec_setup, vec_teardown },
+    { "vec/insert_many_guards", test_vec_insert_many_guards, vec_setup, vec_teardown },
+    { "vec/from_raw_sym", test_vec_from_raw_sym, vec_setup, vec_teardown },
+    { "vec/slice_guards", test_vec_slice_guards, vec_setup, vec_teardown },
     { NULL, NULL, NULL, NULL },
 };
 

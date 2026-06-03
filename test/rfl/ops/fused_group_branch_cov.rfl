@@ -684,6 +684,196 @@
 (sum (at Ri16ne2 'n)) -- 50
 
 ;; =====================================================================
+;; Section 30: Multi-key v2 path: 2 I16 + 2 I32 keys (12 bytes total).
+;; Exercises mk_compose_key narrow path with mixed-width keys (lines
+;; 2578-2585) and the wide=0 dispatch in mk_par_v2_fn.
+;; =====================================================================
+
+(set Tmkv2narrow (table [a b c d v] (list (as 'I16 [1 2 1 2 1 2 1 2 1 2 1 2]) (as 'I16 [10 10 20 20 10 10 20 20 10 10 20 20]) (as 'I32 [100 100 100 100 200 200 200 200 300 300 300 300]) (as 'I32 [1000 1000 1000 1000 2000 2000 2000 2000 3000 3000 3000 3000]) (as 'I64 [1 2 3 4 5 6 7 8 9 10 11 12]))))
+(set Rmkv2narrow (select {n: (count v) s: (sum v) by: [a b c d] from: Tmkv2narrow where: (>= v 0)}))
+;; Each (a,b,c,d) tuple is unique → 12 groups, each count=1.
+(count Rmkv2narrow) -- 12
+(sum (at Rmkv2narrow 'n)) -- 12
+
+;; =====================================================================
+;; Section 31: AND with FP_IN as the only child (single-child IN).
+;;
+;; fp_eval_pred with n_children=1 calls fp_eval_cmp directly (not masked).
+;; fp_eval_cmp FP_IN path goes through the FP_RUN_IN macro by esz.
+;; Exercises the esz=1, esz=2, esz=4, esz=8 IN branches as single-child
+;; predicates (lines 484-497).
+;; =====================================================================
+
+;; Single-child IN on U8 column (esz=1)
+(set Tu8ino (table [k v] (list (as 'U8 [0 1 2 3 4 5 6 7]) (as 'I64 [10 20 30 40 50 60 70 80]))))
+(set Ru8ino (select {n: (count v) by: k from: Tu8ino where: (in k (as 'U8 [1 3 5]))}))
+(count Ru8ino) -- 3
+(sum (at Ru8ino 'n)) -- 3
+
+;; Single-child IN on I16 (esz=2)
+(set Ti16ino (table [k v] (list (as 'I16 [100 200 300 400 500 600 700 800]) (as 'I64 [1 2 3 4 5 6 7 8]))))
+(set Ri16ino (select {n: (count v) by: k from: Ti16ino where: (in k (as 'I16 [200 400 600]))}))
+(count Ri16ino) -- 3
+(sum (at Ri16ino 'n)) -- 3
+
+;; Single-child IN on I32 (esz=4)
+(set Ti32ino (table [k v] (list (as 'I32 [1000 2000 3000 4000 5000 6000]) (as 'I64 [1 2 3 4 5 6]))))
+(set Ri32ino (select {n: (count v) by: k from: Ti32ino where: (in k (as 'I32 [2000 4000 6000]))}))
+(count Ri32ino) -- 3
+(sum (at Ri32ino 'n)) -- 3
+
+;; Single-child IN on I64 (esz=8)
+(set Ti64ino (table [k v] (list (as 'I64 [10000 20000 30000 40000 50000]) (as 'I64 [1 2 3 4 5]))))
+(set Ri64ino (select {n: (count v) by: k from: Ti64ino where: (in k [20000 40000])}))
+(count Ri64ino) -- 2
+(sum (at Ri64ino 'n)) -- 2
+
+;; =====================================================================
+;; Section 32: AND of LIKE children — fp_eval_cmp_masked LIKE path.
+;;
+;; In fp_eval_cmp_masked, op == FP_LIKE → eval into tmp[], AND into bits[].
+;; AND with non-IN children (no use_masked) but ≥2 children where second
+;; is LIKE.  Triggers the "uint8_t tmp[]; fp_eval_cmp + bits[]&=tmp[r]"
+;; branch (lines 675-680).
+;; =====================================================================
+
+(set Tlikeand (table [s g v] (list ["hello" "world" "help" "hero" "wonder" "wizard" "wow"] (as 'I64 [1 2 1 2 1 2 1]) (as 'I64 [10 20 30 40 50 60 70]))))
+;; (and (>= v 0) (like s "h*")) → 2 children, no IN, LIKE second → tmp AND
+(set Rlikeand (select {n: (count v) by: g from: Tlikeand where: (and (>= v 0) (like s "h*"))}))
+;; h* matches "hello", "help", "hero" → 3 rows, by g → 2 groups.
+(count Rlikeand) -- 2
+(sum (at Rlikeand 'n)) -- 3
+
+;; =====================================================================
+;; Section 33: Multi-agg path with mixed SUM + MIN + MAX + AVG.
+;;
+;; Exercises all 4 non-COUNT mk_agg_kind branches in mk_par_fn PASS-2
+;; and mk_state_merge.  Single key + multiple non-COUNT aggs → multi path.
+;; =====================================================================
+
+(set Tmixagg (table [g v] (list (as 'I64 [1 1 2 2 3 3 1 2 3 1]) (as 'I64 [10 20 30 40 50 60 70 80 90 100]))))
+(set Rmixagg (select {s: (sum v) lo: (min v) hi: (max v) av: (avg v) from: Tmixagg where: (>= v 0) by: g}))
+(count Rmixagg) -- 3
+;; g=1 rows: v=10,20,70,100 → sum=200, min=10, max=100, avg=50
+;; g=2 rows: v=30,40,80 → sum=150, min=30, max=80, avg=50
+;; g=3 rows: v=50,60,90 → sum=200, min=50, max=90, avg=200/3≈66.6
+(sum (at Rmixagg 's)) -- 550
+(min (at Rmixagg 'lo)) -- 10
+(max (at Rmixagg 'hi)) -- 100
+
+;; =====================================================================
+;; Section 34: count1 BOOL key with WHERE (n_slots=2 path).
+;;
+;; fp_try_direct_count1 BOOL branch (line 1534-1535) with a non-trivial
+;; WHERE.  Falls through to the generic direct-count path (no SYM, no
+;; emit_filter, no pred_key_ne_zero).
+;; =====================================================================
+
+(set Tboolc1 (table [k v] (list [false true false true false true false true false true] (as 'I64 [1 2 3 4 5 6 7 8 9 10]))))
+(set Rboolc1 (select {n: (count v) by: k from: Tboolc1 where: (>= v 3)}))
+(count Rboolc1) -- 2
+(sum (at Rboolc1 'n)) -- 8
+
+;; =====================================================================
+;; Section 35: fp_eval_cmp esz=2 / esz=4 non-SYM ordering paths
+;;
+;; Lines 522-530 and 542-550: esz=2 ordering on I16, esz=4 ordering on
+;; I32 (non-SYM).  Single-child predicate routes through fp_eval_cmp.
+;; =====================================================================
+
+(set Ti16ord (table [k v] (list (as 'I16 [-5 -3 0 2 4 6 8 10 12 14 16 18]) (as 'I64 (til 12)))))
+;; Single-child LT
+(set Ri16lt (select {n: (count v) by: k from: Ti16ord where: (< k 8)}))
+;; k < 8: rows where k in {-5,-3,0,2,4,6} → 6 distinct keys
+(count Ri16lt) -- 6
+(sum (at Ri16lt 'n)) -- 6
+
+;; Single-child GT on I32
+(set Ti32ord (table [k v] (list (as 'I32 [100 200 300 400 500 600 700 800 900 1000]) (as 'I64 (til 10)))))
+(set Ri32gt (select {n: (count v) by: k from: Ti32ord where: (> k 500)}))
+(count Ri32gt) -- 5
+
+;; Single-child LE on I32 (esz=4 LE branch line 547)
+(set Ri32le (select {n: (count v) by: k from: Ti32ord where: (<= k 500)}))
+(count Ri32le) -- 5
+
+;; Single-child GE on I16 (esz=2 GE branch line 528)
+(set Ri16ge (select {n: (count v) by: k from: Ti16ord where: (>= k 6)}))
+(count Ri16ge) -- 7
+
+;; =====================================================================
+;; Section 36: SYM EQ via single-child predicate fp_eval_cmp esz=2/esz=4.
+;;
+;; SYM esz=2 W16 needs >256 distinct syms in the column; hard to construct
+;; reliably.  SYM esz=4 W32 is the default for symbol columns and is
+;; already exercised by Section 2.  Add an explicit SYM EQ via single
+;; child to exercise the esz=4 SYM EQ branch (line 537).
+;; =====================================================================
+
+(set Tsymeq (table [k v] (list ['cat 'dog 'bird 'cat 'dog 'bird 'cat 'dog] (as 'I64 (til 8)))))
+(set Rsymeq (select {n: (count v) by: k from: Tsymeq where: (== k 'cat)}))
+(count Rsymeq) -- 1
+(sum (at Rsymeq 'n)) -- 3
+
+(set Rsymne (select {n: (count v) by: k from: Tsymeq where: (!= k 'cat)}))
+(count Rsymne) -- 2
+(sum (at Rsymne 'n)) -- 5
+
+;; =====================================================================
+;; Section 37: 3-key wide composite (8+8 bytes → wide=1) + COUNT + SUM.
+;;
+;; Drives mk_compose_key2 for wide composite keys + mk_par_v2_fn wide
+;; branch + mk_combine_v2_part_fn wide merge (lines 3306-3358).
+;; =====================================================================
+
+(set T3key (table [a b c v] (list (as 'I64 [1 1 2 2 3 3 1 2 3]) (as 'I64 [10 20 10 20 10 20 30 30 30]) (as 'I64 [100 200 100 200 100 200 300 300 300]) (as 'I64 [1 2 3 4 5 6 7 8 9]))))
+(set R3key (select {n: (count v) s: (sum v) by: [a b c] from: T3key where: (>= v 0)}))
+(count R3key) -- 9
+(sum (at R3key 'n)) -- 9
+(sum (at R3key 's)) -- 45
+
+;; =====================================================================
+;; Section 38: Empty result (predicate matches no rows) → 0-row exit
+;;
+;; fp_combine_and_materialize total_local == 0 path (line 2109-2131).
+;; Builds an empty 2-col table.
+;; =====================================================================
+
+(set Tempty (table [k v] (list (as 'I64 [1 2 3 4 5]) (as 'I64 [10 20 30 40 50]))))
+;; Predicate that matches nothing: k > 999.  Single key + COUNT → count1
+;; path with total_local=0 → empty result.
+(set Rempty (select {n: (count v) by: k from: Tempty where: (> k 999)}))
+(count Rempty) -- 0
+
+;; Multi-agg case with empty: forces multi path empty exit.
+(set Rempty2 (select {n: (count v) s: (sum v) by: k from: Tempty where: (> k 999)}))
+(count Rempty2) -- 0
+
+;; =====================================================================
+;; Section 39: Single-child AND (n_children=1 inside AND head).
+;;
+;; ray_fused_group_supported with `(and (>= k 0))` k=1 child after head.
+;; Section 11 covers 2+ children but not the k=1 corner.
+;; Line 295: `if (k < 1 || k > FP_PRED_MAX_CHILDREN) return 0;`
+;; k=1 is the boundary that survives.
+;; =====================================================================
+
+(set Tsingleand (table [k v] (list (as 'I64 [1 2 3 4 5]) (as 'I64 [10 20 30 40 50]))))
+(set Rsingleand (select {n: (count v) by: k from: Tsingleand where: (and (>= k 2))}))
+(count Rsingleand) -- 4
+
+;; =====================================================================
+;; Section 40: Hash-eq dispatch on a wide composite — AND with hash-eq
+;; on hash-indexed col + a chunk-zone-checkable second cmp.
+;;
+;; This combines hash-eq dispatch with the predicate residue path
+;; (mk_eq_hash_count_fn's loop over remaining children, line 2880-2895).
+;; =====================================================================
+
+;; Note: chunk_zone index attach from RFL isn't directly exposed; this
+;; documents the desired shape that would be tested with a C helper.
+
+;; =====================================================================
 ;; Section 29: Summary of unreachable branches from RFL
 ;;
 ;; The following branches are unreachable from the RFL test harness:

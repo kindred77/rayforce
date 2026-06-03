@@ -1246,6 +1246,96 @@ static test_result_t test_dict_find_idx_guid_null_obj(void) {
     ray_release(d);
     PASS();
 }
+
+/* find_idx — null key against a SLICE keys vec whose window contains no
+ * null slot.  The slice carries RAY_ATTR_SLICE, so keys_have_nulls is true
+ * (dict.c line 187) even though no slot in the window is actually null.
+ * A null key atom therefore enters the null-key probe loop (line 190) but
+ * never matches, exercising the loop fall-through `return -1` (line 192)
+ * that the HAS_NULLS-with-a-real-null fixtures cannot reach. */
+static test_result_t test_dict_find_idx_null_key_slice_no_nulls(void) {
+    int64_t xs[4] = { 10, 20, 30, 40 };
+    ray_t* parent = ray_vec_new(RAY_I64, 4);
+    parent = ray_vec_append(parent, &xs[0]);
+    parent = ray_vec_append(parent, &xs[1]);
+    parent = ray_vec_append(parent, &xs[2]);
+    parent = ray_vec_append(parent, &xs[3]);
+    /* Null lives at index 0 — outside the slice window below. */
+    ray_vec_set_null(parent, 0, true);
+    TEST_ASSERT_TRUE(parent->attrs & RAY_ATTR_HAS_NULLS);
+
+    /* Slice [1..3] = {20, 30, 40}: no null inside, but SLICE attr set. */
+    ray_t* keys = ray_vec_slice(parent, 1, 3);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(keys));
+    TEST_ASSERT_TRUE(keys->attrs & RAY_ATTR_SLICE);
+    TEST_ASSERT_FALSE(ray_vec_is_null(keys, 0));
+    TEST_ASSERT_FALSE(ray_vec_is_null(keys, 1));
+    TEST_ASSERT_FALSE(ray_vec_is_null(keys, 2));
+    ray_release(parent);
+
+    ray_t* vals = ray_list_new(3);
+    vals = ray_list_append(vals, ray_i64(1));
+    vals = ray_list_append(vals, ray_i64(2));
+    vals = ray_list_append(vals, ray_i64(3));
+
+    ray_t* d = ray_dict_new(keys, vals);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(d));
+
+    /* Null key probe: keys_have_nulls (SLICE) true, loop runs, no slot is
+     * null → returns -1 (the line-192 fall-through). */
+    ray_t* nk = ray_typed_null(-RAY_I64);
+    TEST_ASSERT_NOT_NULL(nk);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(nk));
+    TEST_ASSERT_TRUE(RAY_ATOM_IS_NULL(nk));
+    TEST_ASSERT_EQ_I(ray_dict_find_idx(d, nk), -1);
+    ray_release(nk);
+
+    /* A present non-null key still resolves through the slice. */
+    ray_t* k30 = ray_i64(30);
+    TEST_ASSERT_EQ_I(ray_dict_find_idx(d, k30), 1);
+    ray_release(k30);
+
+    ray_release(d);
+    PASS();
+}
+
+/* upsert into an empty dict whose keys vec is SYM-typed, using a non-sym
+ * (I64) key.  Exercises the empty-target adoption guard's
+ * `keys->type == RAY_SYM` sub-condition (dict.c line 496:14, True arm):
+ * keys->len==0 and keys->type(SYM) != -key_atom->type(I64) holds, then the
+ * `!(keys->type==RAY_SYM && key_atom->type==-RAY_SYM)` clause is evaluated
+ * with a non-sym key — the placeholder SYM keys vec is swapped for an I64
+ * one so the int key can be appended.  An empty `{}` literal has LIST keys,
+ * so this SYM-placeholder shape is only constructible from C. */
+static test_result_t test_dict_upsert_empty_sym_keys_adopt_i64(void) {
+    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 0);
+    TEST_ASSERT_NOT_NULL(keys);
+    TEST_ASSERT_EQ_I(keys->type, RAY_SYM);
+    ray_t* vals = ray_list_new(0);
+    ray_t* d = ray_dict_new(keys, vals);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(d));
+
+    ray_t* k = ray_i64(42);
+    ray_t* v = ray_i64(100);
+    d = ray_dict_upsert(d, k, v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(d));
+    TEST_ASSERT_EQ_I(ray_dict_len(d), 1);
+
+    /* Keys vec was adopted to I64. */
+    ray_t* dkeys = ray_dict_keys(d);
+    TEST_ASSERT_EQ_I(dkeys->type, RAY_I64);
+
+    ray_t* got = ray_dict_get(d, k);
+    TEST_ASSERT_NOT_NULL(got);
+    TEST_ASSERT_EQ_I(got->i64, 100);
+    ray_release(got);
+
+    ray_release(k);
+    ray_release(v);
+    ray_release(d);
+    PASS();
+}
+
 /* ---- Suite definition -------------------------------------------------- */
 
 const test_entry_t dict_entries[] = {
@@ -1290,5 +1380,7 @@ const test_entry_t dict_entries[] = {
     { "dict/find_idx_str_with_nulls",      test_dict_find_idx_str_with_nulls,      dict_setup, dict_teardown },
     { "dict/find_idx_guid_with_nulls",     test_dict_find_idx_guid_with_nulls,     dict_setup, dict_teardown },
     { "dict/find_idx_guid_null_obj",       test_dict_find_idx_guid_null_obj,       dict_setup, dict_teardown },
+    { "dict/find_idx_null_key_slice_no_nulls", test_dict_find_idx_null_key_slice_no_nulls, dict_setup, dict_teardown },
+    { "dict/upsert_empty_sym_keys_adopt_i64",  test_dict_upsert_empty_sym_keys_adopt_i64,  dict_setup, dict_teardown },
     { NULL, NULL, NULL, NULL },
 };

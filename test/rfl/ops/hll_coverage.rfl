@@ -1,0 +1,253 @@
+;; Coverage tests for src/ops/hll.c — HyperLogLog approximate
+;; count-distinct kernel (Anton's perf PR #219).  Three public entry
+;; points:
+;;
+;;   ray_count_distinct_approx           — scalar count(distinct V)
+;;   ray_count_distinct_approx_pg_buf    — per-group (CSR idx_buf layout)
+;;   ray_count_distinct_approx_pg_stream — per-group (streaming row_gid)
+;;
+;; Routing (src/ops/group.c + src/ops/query.c):
+;;
+;;   (count (distinct V))   →  exec_count_distinct  (group.c:626)
+;;       len >= (1 << 20)   →  ray_count_distinct_approx
+;;
+;;   (count (distinct V)) by K (ungrouped DAG path in group.c):
+;;       n_rows >= (1<<20)  → ray_count_distinct_per_group → HLL gate:
+;;           n_groups in [16, 482]   → ray_count_distinct_approx_pg_stream
+;;           n_groups < 16  OR  > 482 → count_distinct_per_group_hll
+;;                                     → ray_count_distinct_approx_pg_buf
+;;
+;; HLL is approximate (std error ≈ 0.8% at P=14).  Assertions use
+;; tolerance bounds — never exact equality on the estimate.  Each
+;; type-specialised arm is hit once per kernel (scalar/stream/buf);
+;; the SYM W16/W32 widths and the unsupported-type / atom branches are
+;; covered by C-level tests in test/test_group_extra.c since they
+;; require either > 255 distinct syms (expensive in RFL) or direct
+;; API access.
+;;
+;; Runtime: each 1.1M-row `select … by k` invocation costs ~5-10 s on a
+;; debug build; we reuse a single keys vector (Krange / Kfew / Kmany)
+;; across all type variants to keep the file under 2 min total.
+
+;; ════════════════════════════════════════════════════════════════════
+;; 1. Empty / sub-threshold sanity — confirm the HLL gate fires only
+;;    above 1<<20 rows.  Below threshold, exact dedup-via-hashset gives
+;;    an exact answer; we use that to cross-check the routing.
+;; ════════════════════════════════════════════════════════════════════
+
+;; Empty vec → 0 short-circuit ahead of the HLL gate.
+(count (distinct (as 'I64 []))) -- 0
+(count (distinct (as 'F64 []))) -- 0
+(count (distinct (as 'SYM []))) -- 0
+
+;; Sub-threshold: 10000 rows × 999 distinct → exact path, exact match.
+(count (distinct (% (til 10000) 999))) -- 999
+
+;; Sub-threshold per-group — confirms the buf/stream HLL kernels are
+;; NOT invoked below the 1<<20 row gate.  Exact 7-per-group counts.
+(set Tsm (table [k v] (list (% (til 1000) 10) (% (til 1000) 70))))
+(set Rsm (select {c: (count (distinct v)) from: Tsm by: k}))
+(count Rsm) -- 10
+(at (at Rsm 'c) 0) -- 7
+(sum (at Rsm 'c)) -- 70
+
+;; ════════════════════════════════════════════════════════════════════
+;; 2. ray_count_distinct_approx — scalar count(distinct V) over 1.05M
+;;    rows hits cda_scalar_fn.  One assertion per typed arm (I64 / I32 /
+;;    I16 / U8 / BOOL / F64 / DATE / TIME / TIMESTAMP / SYM-W8).
+;;
+;;    Tolerance: HLL's standard error is ~0.8% at P=14.  We pick
+;;    distinct-value targets that drive both the linear-counting fallback
+;;    (small N) and the raw estimator (mid N) arms in ray_hll_estimate.
+;;    Each assertion is materialised into a single (set …) so the
+;;    expensive evaluation runs once, and the (and …) bound check is a
+;;    pure scalar op.
+;; ════════════════════════════════════════════════════════════════════
+
+(set Ni64 1050000)
+(set Ibase (% (til Ni64) 1000))   ;; reused across typed casts below
+
+;; 2a) I64 — mid-cardinality (1000 distinct) hits the raw-mean estimator.
+(set Ei64 (count (distinct Ibase)))
+(and (>= Ei64 970) (<= Ei64 1030)) -- true
+
+;; 2b) I64 — small distinct count (100 vals over 1.05M rows) hits the
+;;     linear-counting branch in ray_hll_estimate.
+(set Ei64-low (count (distinct (% (til Ni64) 100))))
+(and (>= Ei64-low 97) (<= Ei64-low 103)) -- true
+
+;; 2c) I32 arm.
+(set Ei32 (count (distinct (as 'I32 Ibase))))
+(and (>= Ei32 970) (<= Ei32 1030)) -- true
+
+;; 2d) I16 arm (caps at 32k distinct; 250 is comfortably below).
+(set Ei16 (count (distinct (as 'I16 (% (til Ni64) 250)))))
+(and (>= Ei16 240) (<= Ei16 260)) -- true
+
+;; 2e) U8 arm (caps at 256; 200 is below).
+(set Eu8 (count (distinct (as 'U8 (% (til Ni64) 200)))))
+(and (>= Eu8 192) (<= Eu8 208)) -- true
+
+;; 2f) BOOL arm — exactly 2 distinct values; linear counting near-exact.
+(set Ebool (count (distinct (== 0 (% (til Ni64) 2)))))
+(and (>= Ebool 2) (<= Ebool 3)) -- true
+
+;; 2g) F64 arm with the NaN-skip inside cda_scalar_fn.
+(set Ef64 (count (distinct (as 'F64 Ibase))))
+(and (>= Ef64 970) (<= Ef64 1030)) -- true
+
+;; 2h) DATE arm — esz==4 via the RAY_DATE switch.
+(set Edate (count (distinct (as 'DATE Ibase))))
+(and (>= Edate 970) (<= Edate 1030)) -- true
+
+;; 2i) TIME arm.
+(set Etime (count (distinct (as 'TIME Ibase))))
+(and (>= Etime 970) (<= Etime 1030)) -- true
+
+;; 2j) TIMESTAMP arm — esz==8 via RAY_TIMESTAMP (separate from I64).
+(set Ets (count (distinct (as 'TIMESTAMP Ibase))))
+(and (>= Ets 970) (<= Ets 1030)) -- true
+
+;; 2k) SYM (W8 — dict ≤255) arm with width-8 dispatch.
+(set Esym (count (distinct (as 'SYM (% (til Ni64) 200)))))
+(and (>= Esym 192) (<= Esym 208)) -- true
+
+;; ════════════════════════════════════════════════════════════════════
+;; 3. ray_count_distinct_approx_pg_stream — large by-K with n_groups in
+;;    [16, 482].  Each invocation hits cda_pg_stream_task per type arm
+;;    plus the per-gid merge / estimate loop.
+;;
+;;    Shared scaffolding: 1.1M rows, n_groups = 100 (within the [16,482]
+;;    streaming window), value column cycles 500 distinct vals.  Per
+;;    group sees gcd(100,500)=100 → 500/100 = 5 distinct vals.
+;; ════════════════════════════════════════════════════════════════════
+
+(set Nps 1100000)
+(set Krange (% (til Nps) 100))    ;; 100 groups
+(set Vbase (% (til Nps) 500))     ;; 5 distinct per group
+
+;; 3a) I64 vals — cda_pg_stream_task I64/TIMESTAMP arm.
+(set Rs-i64 (select {c: (count (distinct v)) from: (table [k v] (list Krange Vbase)) by: k}))
+(count Rs-i64) -- 100
+(set Rs-i64-c0 (at (at Rs-i64 'c) 0))
+(and (>= Rs-i64-c0 4) (<= Rs-i64-c0 6)) -- true
+(set Rs-i64-c99 (at (at Rs-i64 'c) 99))
+(and (>= Rs-i64-c99 4) (<= Rs-i64-c99 6)) -- true
+
+;; 3b) I32 vals — cda_pg_stream_task I32/DATE/TIME arm.
+(set Rs-i32 (select {c: (count (distinct v)) from: (table [k v] (list Krange (as 'I32 Vbase))) by: k}))
+(count Rs-i32) -- 100
+(set Rs-i32-c50 (at (at Rs-i32 'c) 50))
+(and (>= Rs-i32-c50 4) (<= Rs-i32-c50 6)) -- true
+
+;; 3c) I16 vals — cda_pg_stream_task I16 arm.
+(set Rs-i16 (select {c: (count (distinct v)) from: (table [k v] (list Krange (as 'I16 Vbase))) by: k}))
+(count Rs-i16) -- 100
+(set Rs-i16-c0 (at (at Rs-i16 'c) 0))
+(and (>= Rs-i16-c0 4) (<= Rs-i16-c0 6)) -- true
+
+;; 3d) U8 vals — cda_pg_stream_task BOOL/U8 arm.  D=200, K=100 → 2 distinct/group.
+(set Rs-u8 (select {c: (count (distinct v)) from: (table [k v] (list Krange (as 'U8 (% (til Nps) 200)))) by: k}))
+(count Rs-u8) -- 100
+(set Rs-u8-c0 (at (at Rs-u8 'c) 0))
+(and (>= Rs-u8-c0 1) (<= Rs-u8-c0 3)) -- true
+
+;; 3e) BOOL vals — cda_pg_stream_task BOOL arm.  Use `% 7 < 4` (not `% 2`)
+;;     to avoid aliasing with Krange (which uses `% 100`, every gid sees
+;;     both true and false through the coprime stride).
+(set Rs-bool (select {c: (count (distinct v)) from: (table [k v] (list Krange (< (% (til Nps) 7) 4))) by: k}))
+(count Rs-bool) -- 100
+(set Rs-bool-c0 (at (at Rs-bool 'c) 0))
+(and (>= Rs-bool-c0 1) (<= Rs-bool-c0 3)) -- true
+
+;; 3f) F64 vals — cda_pg_stream_task F64 arm.
+(set Rs-f64 (select {c: (count (distinct v)) from: (table [k v] (list Krange (as 'F64 Vbase))) by: k}))
+(count Rs-f64) -- 100
+(set Rs-f64-c0 (at (at Rs-f64 'c) 0))
+(and (>= Rs-f64-c0 4) (<= Rs-f64-c0 6)) -- true
+
+;; 3g) TIMESTAMP — RAY_TIMESTAMP shares the I64 stream arm (covered above);
+;;     DATE & TIME share the I32 arm.  Include one TIMESTAMP smoke for the
+;;     attribute-routing branch.
+(set Rs-ts (select {c: (count (distinct v)) from: (table [k v] (list Krange (as 'TIMESTAMP Vbase))) by: k}))
+(count Rs-ts) -- 100
+
+;; 3h) SYM (W8) vals — cda_pg_stream_task RAY_IS_SYM arm, W8 dispatch
+;;     (else-tail of the width switch).
+(set Rs-sym (select {c: (count (distinct v)) from: (table [k v] (list Krange (as 'SYM (% (til Nps) 200)))) by: k}))
+(count Rs-sym) -- 100
+
+;; ════════════════════════════════════════════════════════════════════
+;; 4. ray_count_distinct_approx_pg_buf — reached when streaming is
+;;    bypassed (n_groups outside the [16, 482] window) AND n_rows >=
+;;    (1<<20).  Path:
+;;       group.c:ray_count_distinct_per_group
+;;       → stream_ok=false (n_groups < 16 or > 482)
+;;       → count_distinct_per_group_hll
+;;       → ray_count_distinct_approx_pg_buf  (cda_pg_buf_task)
+;;
+;;    We sample two typed arms (I64, F64) at the upper bound (600
+;;    groups) to drive the budget-overflow code-path; the other typed
+;;    arms in cda_pg_buf_task are isomorphic to their stream-side
+;;    counterparts and are exercised in test/test_group_extra.c via
+;;    direct C invocation, which is ~50× faster than RFL.
+;; ════════════════════════════════════════════════════════════════════
+
+(set Kmany (% (til Nps) 600))     ;; > 482 → streaming bails
+
+;; 4a) I64 buf path — cda_pg_buf_task I64/TIMESTAMP arm.
+(set Rb-i64 (select {c: (count (distinct v)) from: (table [k v] (list Kmany Vbase)) by: k}))
+(count Rb-i64) -- 600
+
+;; 4b) F64 buf path — cda_pg_buf_task F64 arm including NaN skip.
+(set Rb-f64 (select {c: (count (distinct v)) from: (table [k v] (list Kmany (as 'F64 Vbase))) by: k}))
+(count Rb-f64) -- 600
+
+;; 4c) Lower-bound (n_groups < 16) also bypasses streaming → buf path.
+(set Kfew (% (til Nps) 8))
+(set Rb-lo (select {c: (count (distinct v)) from: (table [k v] (list Kfew (% (til Nps) 1000))) by: k}))
+(count Rb-lo) -- 8
+;; gcd(8,1000)=8 → 1000/8 = 125 distinct per group; HLL within ±5%.
+(set Rb-lo-c0 (at (at Rb-lo 'c) 0))
+(and (>= Rb-lo-c0 118) (<= Rb-lo-c0 132)) -- true
+
+;; ════════════════════════════════════════════════════════════════════
+;; 5. has_nulls arms inside cda_pg_stream_task — the per-row
+;;    `if (hn && v == NULL_I64) continue` and F64 NaN skip.  One
+;;    streaming-kernel hit per arm is sufficient since the conditional
+;;    body is identical to the non-null path otherwise.
+;; ════════════════════════════════════════════════════════════════════
+
+;; 5a) I64 with HAS_NULLS — streaming kernel path.
+(set Vnull-i64 (concat [0Nl 1 0Nl 2 0Nl] (% (til (- Nps 5)) 1000)))
+(set Rn-i64 (select {c: (count (distinct v)) from: (table [k v] (list Krange Vnull-i64)) by: k}))
+(count Rn-i64) -- 100
+
+;; 5b) F64 with NaN — cda_pg_stream_task F64 `if (v != v) continue` branch.
+(set Vnan-f64 (concat [0Nf 1.0 0Nf] (as 'F64 (% (til (- Nps 3)) 1000))))
+(set Rn-f64 (select {c: (count (distinct v)) from: (table [k v] (list Krange Vnan-f64)) by: k}))
+(count Rn-f64) -- 100
+
+;; ════════════════════════════════════════════════════════════════════
+;; 6. Sparse → dense promotion (ray_hll_promote_to_dense).
+;;
+;;    Each per-group sketch starts sparse with RAY_HLL_SPARSE_CAP = 256
+;;    entries.  When a group crosses 256 distinct values, ray_hll_add
+;;    invokes ray_hll_promote_to_dense in-place against the caller's
+;;    dense buffer (the "tagged caller-owned" branch, lines 94-98 of
+;;    hll.c).  At 1.1M rows / 100 groups with 11003 distinct vals
+;;    (coprime-ish with 100), every group sees ~110 unique register
+;;    indices but ~11000 distinct hashes that drive registers to dense.
+;;
+;;    Coverage targets:
+;;      - ray_hll_promote_to_dense caller-buffer branch (sparse → dense)
+;;      - ray_hll_estimate's `h->regs` non-NULL arm (dense iteration)
+;;      - dense-dense merge in ray_hll_merge (per-gid merge across workers).
+;; ════════════════════════════════════════════════════════════════════
+
+(set Rdense (select {c: (count (distinct v)) from: (table [k v] (list Krange (% (til Nps) 11003))) by: k}))
+(count Rdense) -- 100
+;; ~11000 distinct per group ± HLL std error (~0.8 % at P=14, generous
+;; ±5 % accounting for merge slop across worker shards).
+(set Rdense-c0 (at (at Rdense 'c) 0))
+(and (>= Rdense-c0 10450) (<= Rdense-c0 11550)) -- true

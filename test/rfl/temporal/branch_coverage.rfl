@@ -1,0 +1,543 @@
+;; Exhaustive branch coverage for src/ops/temporal.c
+;;
+;; Goal: hit every reachable branch in all 4 macro instantiations of
+;; EXTRACT_INNER and DATE_TRUNC_INNER, plus standalone ray_temporal_extract
+;; and ray_temporal_truncate paths.
+;;
+;; Strategy:
+;;   Each of the 4 (HAS_NULLS, IN32) dispatch paths in exec_extract and
+;;   exec_date_trunc has its own copy of every field/switch branch.
+;;   Covering them requires exercising each extract field and each trunc
+;;   switch case for each (null, type) combination via `select`.
+;;
+;; Reachability notes:
+;;   - RAY_EXTRACT_EPOCH: no rfl keyword maps to it; dead from rfl.
+;;   - DATE_TRUNC_INNER MINUTE case: unreachable from rfl (documented in
+;;     temporal.c:240-241).
+;;   - The default case of EXTRACT_INNER (out[off+i]=0, line 440) and
+;;     DATE_TRUNC_INNER (out_us=us, line 597): unreachable from any
+;;     valid field code.
+;;   - rte_extract_one line 87 `mo < 1 || mo > 12`: dead code; Hinnant
+;;     civil_from_days always yields mo in 1..12.
+;;   - rte_extract_one line 93 `return 0`: unreachable for any valid
+;;     RAY_EXTRACT_* code.
+;;   - ray_vec_new failure (line 138, 270, 349, 503): OOM; unreachable
+;;     in normal test conditions.
+
+;; ════════════════════════════════════════════════════════════════════
+;; Section 1: exec_extract EXTRACT_INNER(0,0) — non-null TIMESTAMP
+;; ════════════════════════════════════════════════════════════════════
+;; A TIMESTAMP column without nulls.  Exercises the (HAS_NULLS=0, IN32=0)
+;; instantiation for every reachable field.
+;; 2024-03-15T14:27:31 = 763833600000000000 + 52051000000000 = ?
+;; Simpler: use literal timestamps and let the parser do the work.
+
+(set TS_nn (table [ts] (list [2024.03.15D14:27:31.000000000 2024.07.04D09:15:30.000000000 1999.12.31D23:59:59.500000000])))
+
+;; YEAR
+(at (at (select {y: (year ts) from: TS_nn}) 'y) 0) -- 2024
+(at (at (select {y: (year ts) from: TS_nn}) 'y) 2) -- 1999
+
+;; MONTH
+(at (at (select {m: (month ts) from: TS_nn}) 'm) 0) -- 3
+(at (at (select {m: (month ts) from: TS_nn}) 'm) 1) -- 7
+
+;; DAY
+(at (at (select {d: (day ts) from: TS_nn}) 'd) 0) -- 15
+(at (at (select {d: (day ts) from: TS_nn}) 'd) 1) -- 4
+
+;; HOUR — includes pre-epoch timestamp where day_us < 0 after modulo
+(at (at (select {h: (hour ts) from: TS_nn}) 'h) 0) -- 14
+(at (at (select {h: (hour ts) from: TS_nn}) 'h) 2) -- 23
+
+;; MINUTE — includes pre-epoch
+(at (at (select {mi: (minute ts) from: TS_nn}) 'mi) 0) -- 27
+(at (at (select {mi: (minute ts) from: TS_nn}) 'mi) 2) -- 59
+
+;; SECOND — includes pre-epoch
+(at (at (select {s: (second ts) from: TS_nn}) 's) 0) -- 31
+(at (at (select {s: (second ts) from: TS_nn}) 's) 2) -- 59
+
+;; DOW
+(at (at (select {dw: (dayofweek ts) from: TS_nn}) 'dw) 0) -- 5
+(at (at (select {dw: (dayofweek ts) from: TS_nn}) 'dw) 2) -- 5
+
+;; DOY — includes leap year (2024) and non-leap (1999)
+(at (at (select {dy: (dayofyear ts) from: TS_nn}) 'dy) 0) -- 75
+(at (at (select {dy: (dayofyear ts) from: TS_nn}) 'dy) 1) -- 186
+(at (at (select {dy: (dayofyear ts) from: TS_nn}) 'dy) 2) -- 365
+
+;; ════════════════════════════════════════════════════════════════════
+;; Section 2: exec_extract EXTRACT_INNER(0,1) — non-null DATE
+;; ════════════════════════════════════════════════════════════════════
+;; A DATE column without nulls.  Exercises (HAS_NULLS=0, IN32=1) with
+;; in_type=RAY_DATE for every field.
+
+(set DT_nn (table [d] (list [2024.03.15 2024.07.04 1999.12.31])))
+
+(at (at (select {y: (year d) from: DT_nn}) 'y) 0) -- 2024
+(at (at (select {y: (year d) from: DT_nn}) 'y) 2) -- 1999
+(at (at (select {m: (month d) from: DT_nn}) 'm) 0) -- 3
+(at (at (select {m: (month d) from: DT_nn}) 'm) 2) -- 12
+(at (at (select {dd: (day d) from: DT_nn}) 'dd) 0) -- 15
+(at (at (select {dd: (day d) from: DT_nn}) 'dd) 2) -- 31
+(at (at (select {h: (hour d) from: DT_nn}) 'h) 0) -- 0
+(at (at (select {mi: (minute d) from: DT_nn}) 'mi) 0) -- 0
+(at (at (select {s: (second d) from: DT_nn}) 's) 0) -- 0
+(at (at (select {dw: (dayofweek d) from: DT_nn}) 'dw) 0) -- 5
+(at (at (select {dw: (dayofweek d) from: DT_nn}) 'dw) 2) -- 5
+(at (at (select {dy: (dayofyear d) from: DT_nn}) 'dy) 0) -- 75
+(at (at (select {dy: (dayofyear d) from: DT_nn}) 'dy) 1) -- 186
+(at (at (select {dy: (dayofyear d) from: DT_nn}) 'dy) 2) -- 365
+
+;; ════════════════════════════════════════════════════════════════════
+;; Section 3: exec_extract EXTRACT_INNER(0,1) — non-null TIME
+;; ════════════════════════════════════════════════════════════════════
+;; A TIME column without nulls.  Still IN32=1 but in_type=RAY_TIME so
+;; the inner ternary picks the `raw32 * 1000` arm (not * USEC_PER_DAY).
+
+(set TM_nn (table [t] (list [01:02:03.000 12:30:45.000 23:59:59.000])))
+
+(at (at (select {h: (hour t) from: TM_nn}) 'h) 0) -- 1
+(at (at (select {h: (hour t) from: TM_nn}) 'h) 1) -- 12
+(at (at (select {h: (hour t) from: TM_nn}) 'h) 2) -- 23
+(at (at (select {mi: (minute t) from: TM_nn}) 'mi) 0) -- 2
+(at (at (select {mi: (minute t) from: TM_nn}) 'mi) 1) -- 30
+(at (at (select {s: (second t) from: TM_nn}) 's) 0) -- 3
+(at (at (select {s: (second t) from: TM_nn}) 's) 1) -- 45
+;; TIME is within day 0 (2000-01-01), so calendar fields are epoch-relative
+(at (at (select {y: (year t) from: TM_nn}) 'y) 0) -- 2000
+(at (at (select {m: (month t) from: TM_nn}) 'm) 0) -- 1
+(at (at (select {dd: (day t) from: TM_nn}) 'dd) 0) -- 1
+(at (at (select {dw: (dayofweek t) from: TM_nn}) 'dw) 0) -- 6
+(at (at (select {dy: (dayofyear t) from: TM_nn}) 'dy) 0) -- 1
+
+;; ════════════════════════════════════════════════════════════════════
+;; Section 4: exec_extract EXTRACT_INNER(1,0) — null-bearing TIMESTAMP
+;; ════════════════════════════════════════════════════════════════════
+;; Exercises all field branches inside the null-guarded I64 loop.
+;; Includes pre-epoch to trigger day_us < 0 branches.
+
+;; 763828051000000000 ns = 2024-03-15T14:27:31 (8840 days * 86400e9 + 52051e9)
+;; -1800000000000 ns = 1999-12-31T23:30:00
+(set TS_wn (table [ts] (list (as 'TIMESTAMP [763828051000000000 0N -1800000000000]))))
+
+(at (at (select {y: (year ts) from: TS_wn}) 'y) 0) -- 2024
+(at (at (select {y: (year ts) from: TS_wn}) 'y) 1) -- 0Nl
+(at (at (select {y: (year ts) from: TS_wn}) 'y) 2) -- 1999
+(at (at (select {m: (month ts) from: TS_wn}) 'm) 0) -- 3
+(at (at (select {m: (month ts) from: TS_wn}) 'm) 1) -- 0Nl
+(at (at (select {d: (day ts) from: TS_wn}) 'd) 0) -- 15
+(at (at (select {d: (day ts) from: TS_wn}) 'd) 1) -- 0Nl
+(at (at (select {h: (hour ts) from: TS_wn}) 'h) 0) -- 14
+(at (at (select {h: (hour ts) from: TS_wn}) 'h) 1) -- 0Nl
+(at (at (select {h: (hour ts) from: TS_wn}) 'h) 2) -- 23
+(at (at (select {mi: (minute ts) from: TS_wn}) 'mi) 0) -- 27
+(at (at (select {mi: (minute ts) from: TS_wn}) 'mi) 1) -- 0Nl
+(at (at (select {mi: (minute ts) from: TS_wn}) 'mi) 2) -- 30
+(at (at (select {s: (second ts) from: TS_wn}) 's) 0) -- 31
+(at (at (select {s: (second ts) from: TS_wn}) 's) 1) -- 0Nl
+(at (at (select {s: (second ts) from: TS_wn}) 's) 2) -- 0
+(at (at (select {dw: (dayofweek ts) from: TS_wn}) 'dw) 0) -- 5
+(at (at (select {dw: (dayofweek ts) from: TS_wn}) 'dw) 1) -- 0Nl
+(at (at (select {dy: (dayofyear ts) from: TS_wn}) 'dy) 0) -- 75
+(at (at (select {dy: (dayofyear ts) from: TS_wn}) 'dy) 1) -- 0Nl
+(at (at (select {dy: (dayofyear ts) from: TS_wn}) 'dy) 2) -- 365
+
+;; ════════════════════════════════════════════════════════════════════
+;; Section 5: exec_extract EXTRACT_INNER(1,1) — null-bearing DATE
+;; ════════════════════════════════════════════════════════════════════
+;; 8840 = 2024-03-15 (leap year), 8951 = 2024-07-04
+(set DT_wn (table [d] (list (as 'DATE [8840 0N 8951]))))
+
+(at (at (select {y: (year d) from: DT_wn}) 'y) 0) -- 2024
+(at (at (select {y: (year d) from: DT_wn}) 'y) 1) -- 0Nl
+(at (at (select {m: (month d) from: DT_wn}) 'm) 0) -- 3
+(at (at (select {m: (month d) from: DT_wn}) 'm) 1) -- 0Nl
+(at (at (select {dd: (day d) from: DT_wn}) 'dd) 0) -- 15
+(at (at (select {dd: (day d) from: DT_wn}) 'dd) 1) -- 0Nl
+(at (at (select {h: (hour d) from: DT_wn}) 'h) 0) -- 0
+(at (at (select {h: (hour d) from: DT_wn}) 'h) 1) -- 0Nl
+(at (at (select {mi: (minute d) from: DT_wn}) 'mi) 0) -- 0
+(at (at (select {mi: (minute d) from: DT_wn}) 'mi) 1) -- 0Nl
+(at (at (select {s: (second d) from: DT_wn}) 's) 0) -- 0
+(at (at (select {s: (second d) from: DT_wn}) 's) 1) -- 0Nl
+(at (at (select {dw: (dayofweek d) from: DT_wn}) 'dw) 0) -- 5
+(at (at (select {dw: (dayofweek d) from: DT_wn}) 'dw) 1) -- 0Nl
+(at (at (select {dy: (dayofyear d) from: DT_wn}) 'dy) 0) -- 75
+(at (at (select {dy: (dayofyear d) from: DT_wn}) 'dy) 1) -- 0Nl
+(at (at (select {dy: (dayofyear d) from: DT_wn}) 'dy) 2) -- 186
+
+;; ════════════════════════════════════════════════════════════════════
+;; Section 6: exec_extract EXTRACT_INNER(1,1) — null-bearing TIME
+;; ════════════════════════════════════════════════════════════════════
+;; in_type=RAY_TIME inside (1,1): exercises the IN32 ternary `*1000` arm.
+(set TM_wn (table [t] (list (as 'TIME [3723000 0N 86399000]))))
+
+(at (at (select {h: (hour t) from: TM_wn}) 'h) 0) -- 1
+(at (at (select {h: (hour t) from: TM_wn}) 'h) 1) -- 0Nl
+(at (at (select {mi: (minute t) from: TM_wn}) 'mi) 0) -- 2
+(at (at (select {mi: (minute t) from: TM_wn}) 'mi) 1) -- 0Nl
+(at (at (select {s: (second t) from: TM_wn}) 's) 0) -- 3
+(at (at (select {s: (second t) from: TM_wn}) 's) 1) -- 0Nl
+(at (at (select {y: (year t) from: TM_wn}) 'y) 0) -- 2000
+(at (at (select {y: (year t) from: TM_wn}) 'y) 1) -- 0Nl
+(at (at (select {m: (month t) from: TM_wn}) 'm) 0) -- 1
+(at (at (select {m: (month t) from: TM_wn}) 'm) 1) -- 0Nl
+(at (at (select {dd: (day t) from: TM_wn}) 'dd) 0) -- 1
+(at (at (select {dd: (day t) from: TM_wn}) 'dd) 1) -- 0Nl
+(at (at (select {dw: (dayofweek t) from: TM_wn}) 'dw) 0) -- 6
+(at (at (select {dw: (dayofweek t) from: TM_wn}) 'dw) 1) -- 0Nl
+(at (at (select {dy: (dayofyear t) from: TM_wn}) 'dy) 0) -- 1
+(at (at (select {dy: (dayofyear t) from: TM_wn}) 'dy) 1) -- 0Nl
+
+;; ════════════════════════════════════════════════════════════════════
+;; Section 7: exec_date_trunc DATE_TRUNC_INNER(0,0) — non-null TIMESTAMP
+;; ════════════════════════════════════════════════════════════════════
+;; .date → DAY, .time → SECOND, .year → YEAR, .month → MONTH, .hour → HOUR
+;; Pre-epoch timestamp for r < 0 branches.
+
+(set TDT_nn (table [ts] (list [2024.03.15D14:27:31.500000000 1999.12.31D23:59:59.500000000])))
+
+;; DAY bucket (.date)
+(at (at (select {s: ts.date from: TDT_nn}) 's) 0) -- 2024.03.15D00:00:00.000000000
+(at (at (select {s: ts.date from: TDT_nn}) 's) 1) -- 1999.12.31D00:00:00.000000000
+
+;; SECOND bucket (.time)
+(at (at (select {s: ts.time from: TDT_nn}) 's) 0) -- 2024.03.15D14:27:31.000000000
+(at (at (select {s: ts.time from: TDT_nn}) 's) 1) -- 1999.12.31D23:59:59.000000000
+
+;; YEAR bucket (.year)
+(at (at (select {s: ts.year from: TDT_nn}) 's) 0) -- 2024.01.01D00:00:00.000000000
+(at (at (select {s: ts.year from: TDT_nn}) 's) 1) -- 1999.01.01D00:00:00.000000000
+
+;; MONTH bucket (.month)
+(at (at (select {s: ts.month from: TDT_nn}) 's) 0) -- 2024.03.01D00:00:00.000000000
+(at (at (select {s: ts.month from: TDT_nn}) 's) 1) -- 1999.12.01D00:00:00.000000000
+
+;; HOUR bucket (.hour)
+(at (at (select {s: ts.hour from: TDT_nn}) 's) 0) -- 2024.03.15D14:00:00.000000000
+(at (at (select {s: ts.hour from: TDT_nn}) 's) 1) -- 1999.12.31D23:00:00.000000000
+
+;; ════════════════════════════════════════════════════════════════════
+;; Section 8: exec_date_trunc DATE_TRUNC_INNER(0,1) — non-null DATE
+;; ════════════════════════════════════════════════════════════════════
+;; DATE values are day-aligned so DAY truncate is idempotent.
+;; YEAR/MONTH/HOUR truncate still exercises those switch cases with IN32=1.
+
+(set DDT_nn (table [d] (list [2024.03.15 2024.07.04 1999.12.31])))
+
+;; DAY
+(at (at (select {s: d.date from: DDT_nn}) 's) 0) -- 2024.03.15D00:00:00.000000000
+(at (at (select {s: d.date from: DDT_nn}) 's) 2) -- 1999.12.31D00:00:00.000000000
+
+;; SECOND
+(at (at (select {s: d.time from: DDT_nn}) 's) 0) -- 2024.03.15D00:00:00.000000000
+
+;; YEAR
+(at (at (select {s: d.year from: DDT_nn}) 's) 0) -- 2024.01.01D00:00:00.000000000
+(at (at (select {s: d.year from: DDT_nn}) 's) 2) -- 1999.01.01D00:00:00.000000000
+
+;; MONTH
+(at (at (select {s: d.month from: DDT_nn}) 's) 0) -- 2024.03.01D00:00:00.000000000
+(at (at (select {s: d.month from: DDT_nn}) 's) 2) -- 1999.12.01D00:00:00.000000000
+
+;; HOUR — DATE has no time-of-day so hour truncate gives midnight
+(at (at (select {s: d.hour from: DDT_nn}) 's) 0) -- 2024.03.15D00:00:00.000000000
+
+;; ════════════════════════════════════════════════════════════════════
+;; Section 9: exec_date_trunc DATE_TRUNC_INNER(0,1) — non-null TIME
+;; ════════════════════════════════════════════════════════════════════
+;; TIME column (int32 ms since midnight) through trunc switch cases.
+
+(set TMT_nn (table [t] (list [01:02:03.500 12:30:45.789 23:59:59.999])))
+
+;; DAY — TIME has no date component, truncates to epoch midnight
+(at (at (select {s: t.date from: TMT_nn}) 's) 0) -- 2000.01.01D00:00:00.000000000
+
+;; SECOND — strips sub-second
+(at (at (select {s: t.time from: TMT_nn}) 's) 0) -- 2000.01.01D01:02:03.000000000
+(at (at (select {s: t.time from: TMT_nn}) 's) 1) -- 2000.01.01D12:30:45.000000000
+(at (at (select {s: t.time from: TMT_nn}) 's) 2) -- 2000.01.01D23:59:59.000000000
+
+;; YEAR — TIME epoch is 2000-01-01, year trunc → 2000-01-01
+(at (at (select {s: t.year from: TMT_nn}) 's) 0) -- 2000.01.01D00:00:00.000000000
+
+;; MONTH — TIME epoch is Jan 2000, month trunc → 2000-01-01
+(at (at (select {s: t.month from: TMT_nn}) 's) 0) -- 2000.01.01D00:00:00.000000000
+
+;; HOUR
+(at (at (select {s: t.hour from: TMT_nn}) 's) 0) -- 2000.01.01D01:00:00.000000000
+(at (at (select {s: t.hour from: TMT_nn}) 's) 1) -- 2000.01.01D12:00:00.000000000
+
+;; ════════════════════════════════════════════════════════════════════
+;; Section 10: exec_date_trunc DATE_TRUNC_INNER(1,0) — null-bearing TIMESTAMP
+;; ════════════════════════════════════════════════════════════════════
+;; All trunc switch cases with null-bearing TIMESTAMP.
+;; Pre-epoch timestamp for r < 0 correction.
+
+;; 763828051000000000 ns = 2024-03-15T14:27:31
+;; -1800000000000 ns = 1999-12-31T23:30:00
+(set TDT_wn (table [ts] (list (as 'TIMESTAMP [763828051000000000 0N -1800000000000]))))
+;; row 0 = 2024-03-15T14:27:31; row 1 = null; row 2 = 1999-12-31T23:30:00
+
+;; DAY
+(at (at (select {s: ts.date from: TDT_wn}) 's) 0) -- 2024.03.15D00:00:00.000000000
+(at (at (select {s: ts.date from: TDT_wn}) 's) 1) -- 0Np
+(at (at (select {s: ts.date from: TDT_wn}) 's) 2) -- 1999.12.31D00:00:00.000000000
+
+;; SECOND
+(at (at (select {s: ts.time from: TDT_wn}) 's) 0) -- 2024.03.15D14:27:31.000000000
+(at (at (select {s: ts.time from: TDT_wn}) 's) 1) -- 0Np
+
+;; YEAR
+(at (at (select {s: ts.year from: TDT_wn}) 's) 0) -- 2024.01.01D00:00:00.000000000
+(at (at (select {s: ts.year from: TDT_wn}) 's) 1) -- 0Np
+(at (at (select {s: ts.year from: TDT_wn}) 's) 2) -- 1999.01.01D00:00:00.000000000
+
+;; MONTH
+(at (at (select {s: ts.month from: TDT_wn}) 's) 0) -- 2024.03.01D00:00:00.000000000
+(at (at (select {s: ts.month from: TDT_wn}) 's) 1) -- 0Np
+(at (at (select {s: ts.month from: TDT_wn}) 's) 2) -- 1999.12.01D00:00:00.000000000
+
+;; HOUR
+(at (at (select {s: ts.hour from: TDT_wn}) 's) 0) -- 2024.03.15D14:00:00.000000000
+(at (at (select {s: ts.hour from: TDT_wn}) 's) 1) -- 0Np
+(at (at (select {s: ts.hour from: TDT_wn}) 's) 2) -- 1999.12.31D23:00:00.000000000
+
+;; ════════════════════════════════════════════════════════════════════
+;; Section 11: exec_date_trunc DATE_TRUNC_INNER(1,1) — null-bearing DATE
+;; ════════════════════════════════════════════════════════════════════
+(set DDT_wn (table [d] (list (as 'DATE [8840 0N -1]))))
+;; row 0 = 2024-03-15; row 1 = null; row 2 = 1999-12-31
+
+;; DAY
+(at (at (select {s: d.date from: DDT_wn}) 's) 0) -- 2024.03.15D00:00:00.000000000
+(at (at (select {s: d.date from: DDT_wn}) 's) 1) -- 0Np
+(at (at (select {s: d.date from: DDT_wn}) 's) 2) -- 1999.12.31D00:00:00.000000000
+
+;; SECOND
+(at (at (select {s: d.time from: DDT_wn}) 's) 0) -- 2024.03.15D00:00:00.000000000
+(at (at (select {s: d.time from: DDT_wn}) 's) 1) -- 0Np
+
+;; YEAR
+(at (at (select {s: d.year from: DDT_wn}) 's) 0) -- 2024.01.01D00:00:00.000000000
+(at (at (select {s: d.year from: DDT_wn}) 's) 1) -- 0Np
+(at (at (select {s: d.year from: DDT_wn}) 's) 2) -- 1999.01.01D00:00:00.000000000
+
+;; MONTH
+(at (at (select {s: d.month from: DDT_wn}) 's) 0) -- 2024.03.01D00:00:00.000000000
+(at (at (select {s: d.month from: DDT_wn}) 's) 1) -- 0Np
+(at (at (select {s: d.month from: DDT_wn}) 's) 2) -- 1999.12.01D00:00:00.000000000
+
+;; HOUR
+(at (at (select {s: d.hour from: DDT_wn}) 's) 0) -- 2024.03.15D00:00:00.000000000
+(at (at (select {s: d.hour from: DDT_wn}) 's) 1) -- 0Np
+
+;; ════════════════════════════════════════════════════════════════════
+;; Section 12: exec_date_trunc DATE_TRUNC_INNER(1,1) — null-bearing TIME
+;; ════════════════════════════════════════════════════════════════════
+(set TMT_wn (table [t] (list (as 'TIME [3723000 0N 86399000]))))
+
+;; DAY
+(at (at (select {s: t.date from: TMT_wn}) 's) 0) -- 2000.01.01D00:00:00.000000000
+(at (at (select {s: t.date from: TMT_wn}) 's) 1) -- 0Np
+
+;; SECOND
+(at (at (select {s: t.time from: TMT_wn}) 's) 0) -- 2000.01.01D01:02:03.000000000
+(at (at (select {s: t.time from: TMT_wn}) 's) 1) -- 0Np
+(at (at (select {s: t.time from: TMT_wn}) 's) 2) -- 2000.01.01D23:59:59.000000000
+
+;; YEAR
+(at (at (select {s: t.year from: TMT_wn}) 's) 0) -- 2000.01.01D00:00:00.000000000
+(at (at (select {s: t.year from: TMT_wn}) 's) 1) -- 0Np
+
+;; MONTH
+(at (at (select {s: t.month from: TMT_wn}) 's) 0) -- 2000.01.01D00:00:00.000000000
+(at (at (select {s: t.month from: TMT_wn}) 's) 1) -- 0Np
+
+;; HOUR
+(at (at (select {s: t.hour from: TMT_wn}) 's) 0) -- 2000.01.01D01:00:00.000000000
+(at (at (select {s: t.hour from: TMT_wn}) 's) 1) -- 0Np
+
+;; ════════════════════════════════════════════════════════════════════
+;; Section 13: Standalone ray_temporal_truncate — atom MONTH/HOUR/YEAR
+;; ════════════════════════════════════════════════════════════════════
+;; The atom path of ray_temporal_truncate only distinguishes kind==DAY
+;; vs "else" (which uses SECOND bucket).  The (date X) and (time X)
+;; unary builtins use DAY and SECOND respectively.  The .year/.month/.hour
+;; dotted truncates go through exec_date_trunc (DAG path), not the
+;; standalone path.  So the standalone atom truncate only has DAY and
+;; SECOND buckets — already covered by parse_format.rfl and extract.rfl.
+
+;; ════════════════════════════════════════════════════════════════════
+;; Section 14: Standalone ray_temporal_truncate — vector with pre-epoch
+;; ════════════════════════════════════════════════════════════════════
+;; r < 0 branches in standalone truncate vector path (non-DAG).
+;; Pre-epoch TIMESTAMP vector via (date V) and (time V).
+
+(date [1999.12.31D12:30:45.500000000 2024.03.15D14:00:00.000000000]) -- [1999.12.31D00:00:00.000000000 2024.03.15D00:00:00.000000000]
+(time [1999.12.31D12:30:45.500000000 2024.03.15D14:00:00.000000000]) -- [1999.12.31D12:30:45.000000000 2024.03.15D14:00:00.000000000]
+
+;; ════════════════════════════════════════════════════════════════════
+;; Section 15: Standalone ray_temporal_extract — type error branches
+;; ════════════════════════════════════════════════════════════════════
+;; Wrong-type atom: F64 atom → type error (line 124)
+(yyyy 3.14) !- type
+;; Wrong-type atom: SYM atom → type error
+(mm 'hello) !- type
+;; Wrong-type vector: I32 vector → type error (line 134)
+(dd (as 'I32 [1 2 3])) !- type
+
+;; ════════════════════════════════════════════════════════════════════
+;; Section 16: Standalone ray_temporal_truncate — type error branches
+;; ════════════════════════════════════════════════════════════════════
+;; Wrong-type atom: I64 atom to ray_temporal_truncate directly is not
+;; reachable from rfl — (date 42) falls through to clock path.
+;; Wrong-type vector: F64 vector similarly falls through.
+;; The type-error branches at lines 252 and 266 are only reachable from
+;; internal callers (C code). Documenting as unreachable from rfl.
+
+;; ════════════════════════════════════════════════════════════════════
+;; Section 17: Standalone extract — TIMESTAMP vector, no nulls
+;; ════════════════════════════════════════════════════════════════════
+;; Covers the else branch (TIMESTAMP, no nulls) of ray_temporal_extract
+;; vector path (lines 182-185).
+
+(yyyy [2024.03.15D14:00:00.000000000 1999.12.31D23:59:59.000000000]) -- [2024 1999]
+(mm   [2024.03.15D14:00:00.000000000 1999.12.31D23:59:59.000000000]) -- [3 12]
+(dd   [2024.03.15D14:00:00.000000000 1999.12.31D23:59:59.000000000]) -- [15 31]
+(hh   [2024.03.15D14:00:00.000000000 1999.12.31D23:59:59.000000000]) -- [14 23]
+(minute [2024.03.15D14:00:00.000000000 1999.12.31D23:59:59.000000000]) -- [0 59]
+(ss   [2024.03.15D14:00:00.000000000 1999.12.31D23:59:59.000000000]) -- [0 59]
+(dow  [2024.03.15D14:00:00.000000000 1999.12.31D23:59:59.000000000]) -- [5 5]
+(doy  [2024.03.15D14:00:00.000000000 1999.12.31D23:59:59.000000000]) -- [75 365]
+
+;; ════════════════════════════════════════════════════════════════════
+;; Section 18: Standalone extract — TIMESTAMP vector with nulls
+;; ════════════════════════════════════════════════════════════════════
+;; Covers lines 173-180 of ray_temporal_extract.
+
+;; 763828051000000000 ns = 2024-03-15T14:27:31
+;; -1800000000000 ns = 1999-12-31T23:30:00
+(yyyy (as 'TIMESTAMP [763828051000000000 0N -1800000000000])) -- [2024 0Nl 1999]
+(mm   (as 'TIMESTAMP [763828051000000000 0N -1800000000000])) -- [3 0Nl 12]
+(dd   (as 'TIMESTAMP [763828051000000000 0N -1800000000000])) -- [15 0Nl 31]
+(hh   (as 'TIMESTAMP [763828051000000000 0N -1800000000000])) -- [14 0Nl 23]
+(minute (as 'TIMESTAMP [763828051000000000 0N -1800000000000])) -- [27 0Nl 30]
+(ss   (as 'TIMESTAMP [763828051000000000 0N -1800000000000])) -- [31 0Nl 0]
+(dow  (as 'TIMESTAMP [763828051000000000 0N -1800000000000])) -- [5 0Nl 5]
+(doy  (as 'TIMESTAMP [763828051000000000 0N -1800000000000])) -- [75 0Nl 365]
+
+;; ════════════════════════════════════════════════════════════════════
+;; Section 19: Standalone truncate — TIMESTAMP vector with nulls
+;; ════════════════════════════════════════════════════════════════════
+;; Covers lines 304-321 of ray_temporal_truncate (TIMESTAMP, nulls).
+;; 763828051000000000 ns = 2024-03-15T14:27:31
+;; -1800000000000 ns = 1999-12-31T23:30:00
+(date (as 'TIMESTAMP [763828051000000000 0N -1800000000000])) -- [2024.03.15D00:00:00.000000000 0Np 1999.12.31D00:00:00.000000000]
+(time (as 'TIMESTAMP [763828051000000000 0N -1800000000000])) -- [2024.03.15D14:27:31.000000000 0Np 1999.12.31D23:30:00.000000000]
+
+;; ════════════════════════════════════════════════════════════════════
+;; Section 20: Standalone truncate — DATE/TIME vectors, no nulls
+;; ════════════════════════════════════════════════════════════════════
+;; Lines 297-303 (DATE/TIME, no nulls).
+(date [2024.03.15 1999.12.31 2000.01.01]) -- [2024.03.15D00:00:00.000000000 1999.12.31D00:00:00.000000000 2000.01.01D00:00:00.000000000]
+(time [12:30:45.500 00:00:00.000 23:59:59.999]) -- [2000.01.01D12:30:45.000000000 2000.01.01D00:00:00.000000000 2000.01.01D23:59:59.000000000]
+
+;; ════════════════════════════════════════════════════════════════════
+;; Section 21: ray_temporal_truncate atom — MONTH/HOUR/YEAR kind
+;; ════════════════════════════════════════════════════════════════════
+;; The standalone atom truncate (line 255) only distinguishes DAY vs else.
+;; For MONTH/HOUR/YEAR, the else branch runs (using SECOND bucket).
+;; These ARE reachable indirectly: nothing calls ray_temporal_truncate
+;; with MONTH/HOUR/YEAR for atoms in current code paths.
+;; This is covered only by exec_date_trunc (DAG path).
+;; Documenting as: standalone atom MONTH/HOUR/YEAR truncate paths
+;; are unreachable from RFL.
+
+;; ════════════════════════════════════════════════════════════════════
+;; Section 22: ray_temporal_extract — null atom for TIME type
+;; ════════════════════════════════════════════════════════════════════
+;; Ensure all three temporal atom types pass through the null check.
+(yyyy 0Nd) -- 0Nl
+(hh   0Nt) -- 0Nl
+(ss   0Np) -- 0Nl
+(dow  0Nd) -- 0Nl
+(doy  0Nt) -- 0Nl
+(minute 0Np) -- 0Nl
+
+;; ════════════════════════════════════════════════════════════════════
+;; Section 23: DOY leap-year branches — all macro instantiations
+;; ════════════════════════════════════════════════════════════════════
+;; The `mo > 2 && leap` branch in DOY needs to be hit in each of the
+;; 4 EXTRACT_INNER instantiations. 2024 is a leap year.
+
+;; (0,0) non-null TIMESTAMP — already in section 1 with 2024-07-04
+;; (0,1) non-null DATE — 2024-07-04 doy=186 (mo=7 > 2, leap)
+;; Already in section 2
+
+;; (1,0) null-bearing TIMESTAMP — exercise the doy leap path
+(set TS_leap_n (table [ts] (list (as 'TIMESTAMP [762566400000000000 0N 788918400000000000]))))
+;; 762566400000000000 ns = 2024-03-01, 788918400000000000 ns = 2024-12-31
+(at (at (select {dy: (dayofyear ts) from: TS_leap_n}) 'dy) 0) -- 61
+(at (at (select {dy: (dayofyear ts) from: TS_leap_n}) 'dy) 1) -- 0Nl
+(at (at (select {dy: (dayofyear ts) from: TS_leap_n}) 'dy) 2) -- 366
+
+;; (1,1) null-bearing DATE — exercise doy leap for IN32 path
+(set DT_leap_n (table [d] (list (as 'DATE [8826 0N 9131]))))
+;; 8826 = 2024-03-01, 9131 = 2024-12-31
+(at (at (select {dy: (dayofyear d) from: DT_leap_n}) 'dy) 0) -- 61
+(at (at (select {dy: (dayofyear d) from: DT_leap_n}) 'dy) 1) -- 0Nl
+(at (at (select {dy: (dayofyear d) from: DT_leap_n}) 'dy) 2) -- 366
+
+;; Non-leap: ensure the false branch of `mo > 2 && leap` is hit too
+;; 2023 is not a leap year. 2023-07-04 = doy 185
+(set TS_noleap (table [ts] (list [2023.07.04D12:00:00.000000000 2023.12.31D00:00:00.000000000])))
+(at (at (select {dy: (dayofyear ts) from: TS_noleap}) 'dy) 0) -- 185
+(at (at (select {dy: (dayofyear ts) from: TS_noleap}) 'dy) 1) -- 365
+
+;; ════════════════════════════════════════════════════════════════════
+;; Section 24: Pre-epoch us < 0 && us % USEC_PER_DAY != 0 in calendar
+;; ════════════════════════════════════════════════════════════════════
+;; The `if (us < 0 && us % USEC_PER_DAY != 0) days_since_2000--` branch
+;; in both rte_extract_one (line 65) and EXTRACT_INNER (line 411) and
+;; DATE_TRUNC_INNER MONTH/YEAR cases (lines 568, 583).
+;; Need a pre-epoch timestamp that is NOT at midnight.
+;; 1999-12-31T12:00:00 = -43200000000000 ns → us = -43200000000 µs
+;; us % USEC_PER_DAY = -43200000000 µs (not 0) → days_since_2000--
+
+;; Standalone extract (rte_extract_one line 65)
+(yyyy 1999.12.31D12:00:00.000000000) -- 1999
+(mm   1999.12.31D12:00:00.000000000) -- 12
+(dd   1999.12.31D12:00:00.000000000) -- 31
+
+;; DAG extract (EXTRACT_INNER line 411) — both (0,0) and (1,0)
+;; Already covered in section 1 and section 4 with pre-epoch timestamps
+
+;; ════════════════════════════════════════════════════════════════════
+;; Section 25: Century-rule leap year in DOY
+;; ════════════════════════════════════════════════════════════════════
+;; 2000 is leap (div 400). 1900 is not (div 100, not 400). 2100 same.
+;; Cover century boundary both true and false.
+(doy 2000.03.01) -- 61
+(doy 2100.03.01) -- 60
+(doy 1900.03.01) -- 60
+
+;; ════════════════════════════════════════════════════════════════════
+;; Section 26: ray_date_clock_fn / ray_time_clock_fn without arg
+;; ════════════════════════════════════════════════════════════════════
+;; (date) and (time) with no arg → arity error at eval level.
+;; The NULL-arg path of ray_date_clock_fn/ray_time_clock_fn is only
+;; reachable from internal C callers, not from rfl. Documenting as
+;; unreachable from rfl surface.
+
+;; ════════════════════════════════════════════════════════════════════
+;; Section 27: is_global_arg with non-SYM, non-temporal arg
+;; ════════════════════════════════════════════════════════════════════
+;; An I64 arg like 42 has type -RAY_I64.  ray_date_clock_fn checks if
+;; the abs type is DATE/TIME/TIMESTAMP — it isn't — so falls through to
+;; the clock branch.  is_global_arg(42) returns false (not a SYM) so
+;; local=true.  Returns today's date as a DATE atom.
+(type (date 42)) -- 'date
+(type (time 42)) -- 'time

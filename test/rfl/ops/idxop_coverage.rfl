@@ -307,5 +307,142 @@
 (.idx.has? 42) -- false
 (.idx.has? "abc") -- false
 
+;; ════════════════════════════════════════════════════════════════════════════
+;; ADDITIONAL BRANCH COVERAGE -- type x kind matrix, null paths, NaN paths
+;; ════════════════════════════════════════════════════════════════════════════
+
+;; ── i32 through all four kinds (hash/sort/bloom/zone) ──
+(set v32 (as 'I32 [100 -50 0 999 -999]))
+(set v32z (.idx.zone v32))
+(at (.idx.info v32z) 'kind) -- 'zone
+(at (.idx.info v32z) 'min) -- -999
+(at (.idx.info v32z) 'max) -- 999
+(set v32h (.idx.hash v32))
+(at (.idx.info v32h) 'n_keys) -- 5
+(set v32s (.idx.sort v32))
+(at (.idx.info v32s) 'perm_len) -- 5
+(set v32b (.idx.bloom v32))
+(at (.idx.info v32b) 'n_keys) -- 5
+
+;; ── i16 through sort and bloom ──
+(set v16 (as 'I16 [300 -100 0 200]))
+(set v16s (.idx.sort v16))
+(at (.idx.info v16s) 'perm_len) -- 4
+(set v16b (.idx.bloom v16))
+(at (.idx.info v16b) 'n_keys) -- 4
+
+;; ── u8 through sort and bloom ──
+(set vu (as 'U8 [50 10 200 1]))
+(set vus (.idx.sort vu))
+(at (.idx.info vus) 'perm_len) -- 4
+(set vub (.idx.bloom vu))
+(at (.idx.info vub) 'n_keys) -- 4
+
+;; ── bool through sort and bloom ──
+(set vbl [true false true false])
+(set vbls (.idx.sort vbl))
+(at (.idx.info vbls) 'perm_len) -- 4
+(set vblb (.idx.bloom vbl))
+(at (.idx.info vblb) 'n_keys) -- 4
+
+;; ── date through hash/sort/bloom ──
+(set vdt [2024.01.15 2024.06.30 2024.02.29])
+(set vdth (.idx.hash vdt))
+(at (.idx.info vdth) 'kind) -- 'hash
+(set vdts (.idx.sort vdt))
+(at (.idx.info vdts) 'perm_len) -- 3
+(set vdtb (.idx.bloom vdt))
+(at (.idx.info vdtb) 'n_keys) -- 3
+
+;; ── timestamp through hash/sort/bloom ──
+(set vts2 (as 'TIMESTAMP [5 1 3 2 4]))
+(set vtsh (.idx.hash vts2))
+(at (.idx.info vtsh) 'n_keys) -- 5
+(set vtss (.idx.sort vts2))
+(at (.idx.info vtss) 'perm_len) -- 5
+(set vtsb (.idx.bloom vts2))
+(at (.idx.info vtsb) 'n_keys) -- 5
+
+;; ── f64 sort and bloom ──
+(set vf64s (.idx.sort [3.14 1.5 -2.5 0.0]))
+(at (.idx.info vf64s) 'perm_len) -- 4
+(set vf64b (.idx.bloom [1.5 2.5 3.5 4.5 5.5 6.5 7.5 8.5 9.5]))
+(at (.idx.info vf64b) 'n_keys) -- 9
+
+;; ── zone on i64 with nulls in different positions ──
+(set vmn [100 0Nl 50 0Nl 75])
+(set vmnz (.idx.zone vmn))
+(at (.idx.info vmnz) 'min) -- 50
+(at (.idx.info vmnz) 'max) -- 100
+(at (.idx.info vmnz) 'n_nulls) -- 2
+
+;; ── hash/bloom on i64 with nulls -- null rows excluded ──
+(set vnh (.idx.hash [1 0Nl 2 0Nl 3]))
+(at (.idx.info vnh) 'n_keys) -- 3
+(set vnb (.idx.bloom [1 0Nl 2 0Nl 3]))
+(at (.idx.info vnb) 'n_keys) -- 3
+
+;; ── sort on i64 with nulls ──
+(set vns (.idx.sort [50 0Nl 30 0Nl 40]))
+(at (.idx.info vns) 'perm_len) -- 5
+
+;; ── single-element vec through all kinds ──
+(set v1 [42])
+(set v1z (.idx.zone v1))
+(at (.idx.info v1z) 'min) -- 42
+(at (.idx.info v1z) 'max) -- 42
+(set v1h (.idx.hash v1))
+(at (.idx.info v1h) 'n_keys) -- 1
+(at (.idx.info v1h) 'capacity) -- 8
+(set v1s (.idx.sort v1))
+(at (.idx.info v1s) 'perm_len) -- 1
+(set v1b (.idx.bloom v1))
+(at (.idx.info v1b) 'n_keys) -- 1
+(at (.idx.info v1b) 'm_bits) -- 64
+
+;; ── double-drop is idempotent (second drop is no-op) ──
+(set dd (.idx.zone [1 2 3]))
+(.idx.has? dd) -- true
+(set dd2 (.idx.drop dd))
+(.idx.has? dd2) -- false
+(set dd3 (.idx.drop dd2))
+(.idx.has? dd3) -- false
+
+;; ── overwrite: zone -> hash directly (drop+rebuild in prepare_attach) ──
+(set ow (.idx.zone [10 20 30]))
+(at (.idx.info ow) 'kind) -- 'zone
+(set ow2 (.idx.sort ow))
+(at (.idx.info ow2) 'kind) -- 'sort
+(set ow3 (.idx.bloom ow2))
+(at (.idx.info ow3) 'kind) -- 'bloom
+
+;; ── string sort/bloom also unsupported ──
+(.idx.sort ["a" "b"]) !- nyi
+(.idx.bloom ["x" "y"]) !- nyi
+
+;; ── hash n=4 boundary (first time n >= 4 path is taken) ──
+(set h4 (.idx.hash [1 2 3 4]))
+(at (.idx.info h4) 'capacity) -- 8
+
+;; ── hash n=5 (2*5=10, next_pow2 = 16) ──
+(set h5 (.idx.hash [1 2 3 4 5]))
+(at (.idx.info h5) 'capacity) -- 16
+
+;; ── bloom n_set=8 exactly (n_set < 8 is false, 8*8=64 -> 64) ──
+(set b8 (.idx.bloom [1 2 3 4 5 6 7 8]))
+(at (.idx.info b8) 'n_keys) -- 8
+(at (.idx.info b8) 'm_bits) -- 64
+
+;; ── bloom n_set=9 (8*9=72, next_pow2=128) ──
+(set b9 (.idx.bloom [1 2 3 4 5 6 7 8 9]))
+(at (.idx.info b9) 'n_keys) -- 9
+(at (.idx.info b9) 'm_bits) -- 128
+
+;; ── .idx.info returns null on unindexed ──
+(nil? (.idx.info [1 2 3])) -- true
+
+;; ── .idx.has? on empty list returns false ──
+(.idx.has? (list)) -- false
+
 ;; ────────────── cleanup ──────────────
 (.sys.exec "rm -rf /tmp/rfl_idxop*")

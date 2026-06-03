@@ -1,0 +1,86 @@
+;; Branch-coverage extension for src/ops/rowsel.c.
+;;
+;; rowsel is internal — reached through the query executor: a table
+;; `select {... where: pred ...}` builds a g->selection via
+;; ray_rowsel_from_pred / ray_rowsel_refine, and a grouped
+;; `select {... where: pred by: key ...}` flattens it via
+;; ray_rowsel_to_indices (src/ops/group.c:1860).
+;;
+;; The big multi-segment classification paths (ALL / NONE / MIX over
+;; >1024-row tables, plus to_indices ALL-segment dense expand and
+;; refine ALL-segment popcount) are exercised by
+;; test/rfl/query/where_and_chain.rfl (50_000-row fixture).  This file
+;; pins the remaining sequential-reachable edges:
+;;
+;;   (a) ray_rowsel_from_pred: nrows == 0 — empty predicate (filter an
+;;       empty table) → ray_rowsel_new(0,0,0) (lines 134-137).
+;;   (b) ray_rowsel_from_pred: total_pass == nrows — all rows pass →
+;;       NULL "no selection" convention (lines 177-181, 187-189).
+;;   (c) ray_rowsel_refine: total_pass == nrows in the refined result
+;;       (lines 386-392) and the all-pass-existing → NULL handoff.
+;;   (d) to_indices over an ALL-only selection (single big morsel that
+;;       all passes after a `where` that keeps everything) feeding a
+;;       group-by (lines 261-262, 297-301).
+;;
+;; Documented unreachable from the test harness (NOT covered here):
+;;   - The parallel-dispatch arms (ray_pool_dispatch at lines 156, 226,
+;;     320) require ray_pool_get() != NULL AND nrows >= 65536.  The test
+;;     runtime runs the executor single-threaded (no live worker pool),
+;;     so ray_pool_get() returns NULL and the sequential else-branch is
+;;     always taken.  These are covered by the C-level test_rowsel.c
+;;     test_rowsel_parallel only when a pool is present.
+;;   - OOM returns (ray_alloc NULL at lines 145, 186, 282, 290, 353,
+;;     395) are not triggerable without exhausting the allocator.
+
+;; ════════════════════════════════════════════════════════════════════════
+;; (a) Empty-table filter — ray_rowsel_from_pred with nrows == 0.
+;;     An empty table's `where` predicate is a zero-length BOOL vec, so
+;;     ray_rowsel_from_pred takes the nrows==0 early return.
+;; ════════════════════════════════════════════════════════════════════════
+(set Tempty (table [v g] (list (as 'I64 []) (as 'I64 []))))
+(count Tempty) -- 0
+(count (select {from: Tempty where: (> v 0)})) -- 0
+;; Grouped empty filter — exercises to_indices on a zero-row selection too.
+(count (select {c: (count v) by: g from: Tempty where: (> v 0)})) -- 0
+
+;; ════════════════════════════════════════════════════════════════════════
+;; (b) All-pass predicate — total_pass == nrows → NULL selection.
+;;     Every row of a >1024-row table passes `(>= v 0)` (v is 0..N-1),
+;;     so ray_rowsel_from_pred returns NULL ("no selection").  The query
+;;     result must still be the full table.
+;; ════════════════════════════════════════════════════════════════════════
+(set Tall (table [v g] (list (til 3000) (% (til 3000) 4))))
+(count Tall) -- 3000
+;; All rows satisfy (>= v 0): selection is all-pass → NULL, result = full table.
+(count (select {from: Tall where: (>= v 0)})) -- 3000
+(sum (at (select {from: Tall where: (>= v 0)}) 'v)) -- 4498500
+
+;; All-pass feeding a group-by: to_indices is bypassed (NULL selection)
+;; but the group still produces every row.  Pins the all-pass handoff.
+(sum (at (select {c: (count v) by: g from: Tall where: (>= v 0)}) 'c)) -- 3000
+
+;; ════════════════════════════════════════════════════════════════════════
+;; (c) refine all-pass — chained AND where the second conjunct keeps
+;;     every survivor of the first.  `(and (>= v 0) (< v 3000))` over the
+;;     full 3000-row range: first conjunct all-pass, refine with the
+;;     second (also all-pass) → refined total_pass == nrows.
+;; ════════════════════════════════════════════════════════════════════════
+(count (select {from: Tall where: (and (>= v 0) (< v 3000))})) -- 3000
+(sum (at (select {from: Tall where: (and (>= v 0) (< v 3000))}) 'v)) -- 4498500
+
+;; ════════════════════════════════════════════════════════════════════════
+;; (d) Mixed multi-segment classification across the 1024-morsel
+;;     boundary: a 3000-row table has 3 segments.  `(< v 1024)` makes
+;;     segment 0 entirely ALL, segments 1-2 entirely NONE — exercising
+;;     the ALL-then-NONE flag walk and the to_indices ALL-segment dense
+;;     expand when grouped.
+;; ════════════════════════════════════════════════════════════════════════
+(count (select {from: Tall where: (< v 1024)})) -- 1024
+(sum (at (select {from: Tall where: (< v 1024)}) 'v)) -- 523776
+;; Grouped form drives to_indices over an ALL segment (seg 0) + NONE segs.
+(sum (at (select {c: (count v) by: g from: Tall where: (< v 1024)}) 'c)) -- 1024
+
+;; A partial-last-segment ALL: keep rows [2048, 3000) — segment 2 is the
+;; partial tail (952 rows) and entirely passes → ALL on a partial morsel.
+(count (select {from: Tall where: (>= v 2048)})) -- 952
+(sum (at (select {c: (count v) by: g from: Tall where: (>= v 2048)}) 'c)) -- 952

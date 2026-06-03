@@ -1,0 +1,517 @@
+;; eval.c branch coverage round 4 — targets reachable uncovered branches not
+;; yet hit by eval_coverage{,2,3}.rfl / try_raise.rfl / vm_coverage.rfl.
+;;
+;; Focus areas:
+;;   - ray_table_fn element-wise column builder (typed-from-LIST path)
+;;   - key / value dispatch over DICT and TABLE + error arms
+;;   - try_sum_affine_expr early-out branches
+;;   - special-form / dispatch edge cases (if, do, fn, NULL args)
+;;   - do_cache_hash positive-type (vector) branches under profiling
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 1. ray_table_fn — element-wise column builder (eval.c ~1294-1372)
+;;    A column given as a Rayfall (list a b c) of bare ATOMS is not a
+;;    typed vector, so ray_table_fn walks the elements and builds a
+;;    typed column.  This exercises the col_type detection switch
+;;    (lines 1305-1318) and the per-element store loop (1326-1368),
+;;    which the typed-vector fast path (used everywhere else) skips.
+;; ═══════════════════════════════════════════════════════════════════
+
+;; F64 column (row_elems[0]->type == -RAY_F64, line 1305)
+(type (at (table ['a] (list (list 1.5 2.5 3.5))) 'a)) -- 'F64
+(at (table ['a] (list (list 1.5 2.5))) 'a) -- [1.5 2.5]
+
+;; BOOL column (line 1306)
+(type (at (table ['a] (list (list true false true))) 'a)) -- 'B8
+(at (table ['a] (list (list true false))) 'a) -- [true false]
+
+;; SYM column (line 1307) — stored via else val_ptr = &i64 (line 1363)
+(type (at (table ['a] (list (list 'x 'y 'z))) 'a)) -- 'SYM
+(at (table ['a] (list (list 'x 'y 'z))) 'a) -- [x y z]
+
+;; STR column (line 1308) — ray_str_vec_append branch (line 1336)
+(type (at (table ['a] (list (list "p" "q"))) 'a)) -- 'STR
+
+;; TIMESTAMP column (line 1310) — stored via &i64 (line 1363)
+(type (at (table ['a] (list (list (as 'TIMESTAMP 1) (as 'TIMESTAMP 2)))) 'a)) -- 'TIMESTAMP
+
+;; DATE column (line 1311)
+(type (at (table ['a] (list (list 2024.01.01 2024.01.02))) 'a)) -- 'DATE
+
+;; TIME column (line 1312)
+(type (at (table ['a] (list (list 12:00:00.000 13:00:00.000))) 'a)) -- 'TIME
+
+;; Default I64 column (no special type, line 1303)
+(type (at (table ['a] (list (list 1 2 3))) 'a)) -- 'I64
+
+;; I64 → F64 promotion: first elem is I64 but a later one is F64
+;; (scan loop lines 1316-1320, promoted-value branch line 1357-1359)
+(type (at (table ['a] (list (list 1 2.5 3))) 'a)) -- 'F64
+(at (table ['a] (list (list 1 2.5 3))) 'a) -- [1.0 2.5 3.0]
+
+;; ── ray_table_fn error arms ──────────────────────────────────────
+;; row-count mismatch across columns → domain (line 1287)
+(table ['a 'b] (list (list 1 2) (list 3))) !- domain
+;; names/cols length mismatch → domain (line 1225)
+(table ['a 'b] (list (list 1 2))) !- domain
+;; non-SYM column name → type (line 1235)
+(table [1] (list (list 1 2))) !- type
+;; element type mismatch in I64 column → type (line 1349)
+(table ['a] (list (list 1 'x))) !- type
+;; element type mismatch in F64 column (non-promotable) → type
+(table ['a] (list (list 1.5 'x))) !- type
+;; element type mismatch in BOOL column → type
+(table ['a] (list (list true 5))) !- type
+;; element type mismatch in SYM column → type
+(table ['a] (list (list 'a 5))) !- type
+;; element type mismatch in STR column → type (line 1328)
+(table ['a] (list (list "x" 5))) !- type
+;; cols arg is not a list → type (line 1223)
+(table ['a] 5) !- type
+;; names arg is not a list → type (line 1223)
+(table 5 (list (list 1))) !- type
+
+;; ── single-atom column wrap → 1-element vector (lines 1244-1264) ──
+;; A bare atom column is wrapped into a length-1 typed vector.
+(type (at (table ['a] (list 1.5)) 'a)) -- 'F64
+(count (at (table ['a] (list 1.5)) 'a)) -- 1
+(type (at (table ['a] (list 42)) 'a)) -- 'I64
+(type (at (table ['a] (list true)) 'a)) -- 'B8
+(type (at (table ['a] (list 1i)) 'a)) -- 'I32
+(type (at (table ['a] (list 2024.01.01)) 'a)) -- 'DATE
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 2. ray_key_fn / ray_value_fn dispatch (eval.c ~1381-1419)
+;; ═══════════════════════════════════════════════════════════════════
+;; key over a DICT → ray_dict_keys (line 1382)
+(key (dict ['a 'b] [1 2])) -- ['a 'b]
+;; key over a TABLE → SYM vec of column names (line 1388)
+(key (table ['a 'b] (list [1 2] [3 4]))) -- ['a 'b]
+;; value over a TABLE → list of column vectors (line 1402)
+(count (value (table ['a 'b] (list [1 2] [3 4])))) -- 2
+;; value over a DICT → values vector (line 1414)
+(value (dict ['a 'b] [10 20])) -- [10 20]
+;; key over a non-dict/table → type error (line 1388)
+(key 5) !- type
+;; value over a non-dict/table → type error (line 1414)
+(value 5) !- type
+(key [1 2 3]) !- type
+(value "hello") !- type
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 3. try_sum_affine_expr early-out branches (eval.c ~177-253)
+;;    Called for (sum <expr>) before normal eval; returns NULL (handled=0)
+;;    for non-affine shapes, falling through to ordinary evaluation.
+;; ═══════════════════════════════════════════════════════════════════
+;; len(expr) != 3 — inner list has 4 elements → line 179 early return.
+;; (+ 1 2 3) is arity-3 so the eval itself errors after the affine bail.
+(sum (+ 1 2 3)) !- arity
+;; head is not '+' (line 185) → bail, normal eval runs
+(sum (- [10 20 30] 5)) -- 45
+(sum (* [1 2 3] 2)) -- 12
+;; neither operand is a numeric atom (both vectors, line 196) → bail
+(sum (+ [1 2 3] [4 5 6])) -- 21
+;; affine fast path: vector + scalar (both operand orders)
+(sum (+ [1 2 3] 10)) -- 36
+(sum (+ 10 [1 2 3])) -- 36
+;; F64 scalar → make_f64 result branch (line 246-249)
+(sum (+ [1 2 3] 1.5)) -- 10.5
+(sum (+ 1.5 [1 2 3])) -- 10.5
+;; F64 vector with int scalar → ce.is_f64 branch
+(sum (+ [1.0 2.0 3.0] 1)) -- 9.0
+;; vec_expr evaluates to a non-vector (dict) → !ray_is_vec bail (line 206)
+(sum (+ (dict ['a] [1]) 5)) !- type
+;; vec_expr eval error propagates (line 201)
+(sum (+ undefined_affine_v 1)) !- name
+(sum (+ 1 undefined_affine_w)) !- name
+;; empty-vector affine sum
+(sum (+ [] 5)) -- 0
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 4. Dispatch edge cases — NULL args to LAMBDA / VARY (eval.c 3182-3206)
+;;    Passing `null` as an argument makes ray_eval return a NULL ray_t*,
+;;    hitting the (!args[i]) arm of the arg-eval guard.
+;; ═══════════════════════════════════════════════════════════════════
+;; LAMBDA, arg[0] is null → immediate bail (j-loop body skipped)
+((fn [x y] x) null 5) !- type
+;; LAMBDA, arg[1] is null → j-loop releases the prior good arg (line 3206)
+((fn [x y] y) 5 null) !- type
+;; VARY (list), middle arg null → j-loop releases the prior good arg (3184)
+(list 1 null 2) !- type
+;; VARY (list), first arg null
+(list null 1) !- type
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 5. Special-form error / edge branches
+;; ═══════════════════════════════════════════════════════════════════
+;; (fn [params]) with no body → domain error (ray_fn line 1618)
+(fn [x]) !- domain
+(fn) !- domain
+;; (do (raise ..) ..) — error short-circuits, pops scope (ray_do_fn 1600)
+(try (do (raise 5) 99) (fn [e] e)) -- 5
+;; (do <err> ..) — runtime error propagates through do
+(do (+ undefined_do_z 1)) !- name
+;; (if <err-cond> ..) — cond eval error propagates (ray_cond_fn 1470)
+(if undefined_if_cond 1 2) !- name
+;; (if <raise> ..) — cond raises
+(try (if (raise 7) 1 2) (fn [e] e)) -- 7
+;; (if) with too few args → domain (ray_cond_fn n<2, line 1468)
+(if) !- domain
+(if true) !- domain
+;; if with 2 args, false branch → returns make_i64(0) (line 1480)
+(if false 5) -- 0
+(if true 5) -- 5
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 6. do_cache_hash positive-type (vector) branches (eval.c 1514-1527)
+;;    Under active profiling, (do <vec> null) hashes <vec> at the top
+;;    level — exercising the *positive* type tags (RAY_I64, RAY_SYM,
+;;    RAY_DATE, RAY_TIMESTAMP, RAY_TIME, RAY_I16, RAY_U8, RAY_F64 vec)
+;;    that the atom-literal tests in eval_coverage3 cannot reach.
+;; ═══════════════════════════════════════════════════════════════════
+(.sys.timeit 1) -- 1
+;; I64 vector (line 1515: x->type == RAY_I64)
+(nil? (do [1 2 3] null)) -- true
+(nil? (do [1 2 3] null)) -- true
+;; SYM vector (line 1514: x->type == RAY_SYM)
+(nil? (do ['a 'b 'c] null)) -- true
+(nil? (do ['a 'b 'c] null)) -- true
+;; DATE vector (line 1519)
+(nil? (do (as 'DATE [1 2]) null)) -- true
+(nil? (do (as 'DATE [1 2]) null)) -- true
+;; TIMESTAMP vector (line 1516)
+(nil? (do (as 'TIMESTAMP [1 2]) null)) -- true
+;; TIME vector (line 1520)
+(nil? (do (as 'TIME [1 2]) null)) -- true
+;; I16 vector (line 1522)
+(nil? (do (as 'I16 [1 2]) null)) -- true
+;; U8 vector (line 1524)
+(nil? (do (as 'U8 [1 2]) null)) -- true
+;; F64 vector (line 1527)
+(nil? (do [1.0 2.0 3.0] null)) -- true
+;; I32 vector (line 1518)
+(nil? (do (as 'I32 [1 2]) null)) -- true
+(.sys.timeit 0) -- 0
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 7. Restricted-mode dispatch — set/update refused in restricted eval.
+;;    (set .reserved ..) hits ray_set_fn's err != RAY_OK arm (line 1444)
+;;    and (let .reserved ..) hits ray_let_fn's arm (line 1462).
+;; ═══════════════════════════════════════════════════════════════════
+(set .sys.gc 5) !- reserve
+(let .sys.gc 5) !- reserve
+(set 42 5) !- type
+(let 42 5) !- type
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 8. numeric_atom_i64 width branches via affine constant (eval.c 133-150)
+;;    The constant in (+ vec c) is fed to numeric_atom_i64; covering U8
+;;    (line 145), I16 (143), I32 (139), and the default as_f64 fallback.
+;; ═══════════════════════════════════════════════════════════════════
+(sum (+ [1 2 3] 0x02)) -- 12
+(sum (+ [1 2 3] 3h))   -- 15
+(sum (+ [1 2 3] 4i))   -- 18
+;; SYM constant exercises numeric_atom_i64 -RAY_SYM (line 137) only when
+;; (+ vec sym) is affine-eligible; sym isn't numeric so it bails — verify
+;; the bail path produces the normal type error instead.
+(sum (+ [1 2 3] 'a)) !- type
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 9. OP_STOREGLOBAL error path (eval.c 1860) — `(set <reserved> <val>)`
+;;    inside a compiled lambda exercises op_storeglobal's err != RAY_OK
+;;    arm; the top-level test in §7 hits ray_set_fn (tree-walk path),
+;;    but never the VM opcode emitted by compile.c:242.  Compile lazily
+;;    on first call, so we call once.
+;; ═══════════════════════════════════════════════════════════════════
+(set bad_set_fn (fn [] (set .sys.gc 5)))
+;; Inside compiled fn, (set .sys.gc 5) emits OP_STOREGLOBAL → reserve
+;; error via op_storeglobal's err != RAY_OK arm (eval.c:1860).
+(bad_set_fn) !- reserve
+;; Trap catches it; non-raise errors deliver i64(0) to the handler
+;; (eval.c:2297 / 281 default), so the handler sees 0 not the sentinel.
+(try (bad_set_fn) (fn [e] e)) -- 0
+;; (set <param> <val>) — compile.c:236 special case where set's value
+;; uses a slot-bound parameter (regression covered by commit 90cf600).
+;; Exercises OP_STOREGLOBAL with a value compiled from a slot ref.
+(set fn_set_param (fn [a] (set captured_x a) captured_x))
+(fn_set_param 77) -- 77
+captured_x -- 77
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 10. Lambda dispatch error paths in ray_eval (eval.c 3127-3136)
+;;     - argc > 64 → domain error (line 3127)
+;;     - args[i] errors mid-way (line 3133) with i >= 1 so j-loop releases
+;; ═══════════════════════════════════════════════════════════════════
+;; argc > 64: a lambda call with 65 args trips the domain guard.
+;; Build a fn that accepts 65 params (compile fails > 64 too — fall
+;; through to tree-walk).  We use a non-existent fn so just count args.
+;; Use vary `list` test first: 65 evaluated args triggers RAY_VARY 65>64.
+(count (list 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64)) -- 64
+;; 65 args → ray_eval RAY_VARY argc>64 (line 3105) → domain
+(list 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65) !- domain
+;; LAMBDA with mid-arg error: second arg errors after first succeeded.
+;; ray_eval RAY_LAMBDA case 3133: j-loop releases the prior good arg.
+((fn [x y] (+ x y)) 5 undefined_lambda_mid_z) !- name
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 11. ray_fn parameter list edge cases (eval.c 1530-1538)
+;;     params expressed as a RAY_LIST (not SYM vec) — the list-walk loop
+;;     visits each element checking reserved/sym.  Test all three branch
+;;     conditions: NULL elem, non-SYM elem, non-reserved SYM elem.
+;; ═══════════════════════════════════════════════════════════════════
+;; (list 'a 'b) is itself a list whose head is `list`.  Since `fn` is
+;; a SPECIAL_FORM, its args are NOT evaluated — args[0] is the LITERAL
+;; list expression with head 'list' (a NAME sym), elements 'a 'b.
+;; The walker iterates: 'list', 'a', 'b' — none reserved → all
+;; ray_sym_is_reserved branches return false; lambda is created.  The
+;; lambda has 3 "params" (since `params_list` length is 3), so calling
+;; with 3 args satisfies arity; the body doesn't reference them.
+(set fn_param_list (fn (list a b) 42))
+(fn_param_list 'list 3 4) -- 42
+;; Mixed sym/non-sym element in the list params: (list 'a 5) — the 5
+;; is non-SYM → p->type == -RAY_SYM branch is false → loop continues.
+;; Construct the lambda only — calling it isn't required to hit the
+;; ray_fn walk branch we want.
+(set fn_param_mixed (fn (list a 5) 99))
+;; ray_type_name has no LAMBDA case → returns '?
+(type fn_param_mixed) -- '?
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 12. ray_eval atom dispatch — non-NAME sym, NULL keyword resolution
+;;     (eval.c 2937-2970).  A bare quoted SYM atom (no NAME attr) hits
+;;     line 2969 (ray_retain + return self).  The `null` keyword hits
+;;     line 2945 (returns NULL ptr).
+;; ═══════════════════════════════════════════════════════════════════
+;; Quoted sym (no NAME attr) → atom self-return path.
+'plain_quoted_sym -- 'plain_quoted_sym
+(type 'plain_quoted_sym) -- 'sym
+;; null keyword resolves to NULL — type returns 'null.
+(type null) -- 'null
+(nil? null) -- true
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 13. ray_try_fn handler dispatch (eval.c 289-301).
+;;     Handler can be LAMBDA (line 289), UNARY (line 292), else type.
+;;     The LAMBDA path is heavily covered; UNARY exercise via builtin
+;;     unary fn as handler (also covered by try_raise.rfl §3).  The
+;;     `else` arm (line 295-297) requires a non-fn handler value.
+;;     A VARY (list) handler reaches the else arm.
+;; ═══════════════════════════════════════════════════════════════════
+(try (raise 5) list) !- type
+(try (raise 5) +) !- type
+;; Handler that itself raises → recursive error path inside the handler.
+(try (raise 5) (fn [e] (raise (* e 10)))) !- domain
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 14. (do) with errors at various positions — covers ray_do_fn loop
+;;     branches: short-circuit at i=0 vs i>0, with prior result pending
+;;     ray_release (line 1489).
+;; ═══════════════════════════════════════════════════════════════════
+;; First expr errors → no prior result to release.
+(do undefined_do_first) !- name
+;; Second expr errors → prior result (1) needs release at line 1490.
+(do 1 undefined_do_second) !- name
+;; Third expr errors → release i=1 result; i=0 already released at i=1.
+(do 1 2 undefined_do_third) !- name
+;; All succeed → return last; covers loop full traversal.
+(do 1 2 3 4 5) -- 5
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 15. (if) edge cases — 2-arg (no else) cond=true returns then;
+;;     cond=false → make_i64(0).  3-arg both branches.
+;; ═══════════════════════════════════════════════════════════════════
+;; truthy cond, 2-arg, returns then (covered above)
+(if 1 100) -- 100
+;; falsy cond, 2-arg, returns 0 (line 1480) — already in §5 but extra
+(if 0 100) -- 0
+;; falsy cond, 3-arg, returns else (line 1478 True branch)
+(if 0 1 2) -- 2
+;; Vector cond → non-null object is truthy (internal.h is_truthy)
+(if [1 2 3] 'yes 'no) -- 'yes
+(if [0 0 0] 'yes 'no) -- 'yes
+;; Empty vector still truthy (non-null object); 0 atom is falsy.
+(if [] 'yes 'no) -- 'yes
+(if 0 'yes 'no) -- 'no
+(if false 'yes 'no) -- 'no
+(if 0.0 'yes 'no) -- 'no
+;; Cond errors propagate (already in §5)
+;; (if) with too few args triggers domain (already in §5)
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 16. ray_table_fn additional element-mismatch paths.
+;;     Covers BOOL-element mismatch in BOOL column (lines 1347-1353)
+;;     and TIMESTAMP / DATE / TIME mismatch.
+;; ═══════════════════════════════════════════════════════════════════
+;; BOOL column with non-BOOL elem (covered above), confirm I32 col path.
+;; F64 column followed by SYM elem (non-promotable) → type error.
+(table ['a] (list (list 1.5 2.5 'oops))) !- type
+;; TIMESTAMP column with non-TIMESTAMP elem
+(table ['a] (list (list (as 'TIMESTAMP 1) 'x))) !- type
+;; DATE column with non-DATE
+(table ['a] (list (list 2024.01.01 'x))) !- type
+;; TIME column with non-TIME
+(table ['a] (list (list 12:00:00.000 'x))) !- type
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 17. ray_eval RAY_UNARY null/lazy arg combinations (eval.c 3023-3030).
+;;     Covers: !arg && fn ∈ {nil?, type, ser} branch (True), and
+;;     !arg && fn ∉ {nil?, type, ser} → type error.
+;; ═══════════════════════════════════════════════════════════════════
+;; null → nil? returns true (covers True arm at line 3025 nil_fn)
+(nil? null) -- true
+;; null → type returns 'null (covers True arm at 3025 type_fn)
+(type null) -- 'null
+;; null → neg errors (False arm at 3026)
+(neg null) !- type
+;; null → not errors (False arm)
+(not null) !- type
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 18. ray_value_fn / ray_key_fn over a vec or non-coll → type errors.
+;;     Already covered, but exercise more variants for robustness.
+;; ═══════════════════════════════════════════════════════════════════
+(key 1.5) !- type
+(value 1.5) !- type
+(key 'x) !- type
+(value 'x) !- type
+(key (list 1 2)) !- type
+(value (list 1 2)) !- type
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 19. try_sum_affine_expr extra bail branches (eval.c 177-253).
+;;     Cover: head is + but vec_expr is a string/sym (eval succeeds
+;;     but result is not a vec) → bail at line 206; vec with nulls
+;;     → bail at line 211.
+;; ═══════════════════════════════════════════════════════════════════
+;; vec_expr resolves to a non-vec scalar — bails to normal eval which
+;; returns the scalar sum directly.
+(sum (+ 1.0 1)) -- 2.0
+;; Vector with nulls bails the fast path → normal sum handles it.
+(set v_with_nulls (at (table ['c] (list [1 0N 3])) 'c))
+(sum (+ v_with_nulls 0)) -- 4
+;; Cache reuse: second call hits affine_sum_cache_lookup positive branch
+(sum (+ v_with_nulls 0)) -- 4
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 20. Lambda calling lambda — exercises VM call frame management.
+;;     A compiled lambda calling another compiled lambda hits OP_CALLF's
+;;     LAMBDA branch (line 2004-2053).  Already covered, extra variants.
+;; ═══════════════════════════════════════════════════════════════════
+(set inner_add (fn [a b] (+ a b)))
+(set outer_call (fn [x] (inner_add x x)))
+(outer_call 5) -- 10
+(outer_call 100) -- 200
+;; Compiled lambda calling itself via `self` (covered by fib above but
+;; exercise additional self-call variant under varied stack pressure).
+(set _fact_self (fn [n] (if (<= n 1) 1 (* n (self (- n 1))))))
+(_fact_self 0) -- 1
+(_fact_self 1) -- 1
+(_fact_self 5) -- 120
+(_fact_self 8) -- 40320
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 21. Nested try inside try — VM trap stack push/pop interplay.
+;;     Each compiled (try ...) emits OP_TRAP/OP_TRAP_END; nesting 2+
+;;     exercises the push/pop sequence around inner traps.  16 nested
+;;     is the limit (VM_TRAP_SIZE) — exceeding it would hit line 2229
+;;     but RFL parses fixed depth so 15 is the practical max we test.
+;; ═══════════════════════════════════════════════════════════════════
+(set deeptrap (fn [] (try (try (try (try (raise 1) (fn [e] (raise (+ e 1)))) (fn [e] (raise (+ e 1)))) (fn [e] (raise (+ e 1)))) (fn [e] e))))
+(deeptrap) -- 4
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 22. Raise from inside (do ...) inside (try ...) — VM trap handler
+;;     captures user value vs default-i64 path.  Already covered by
+;;     try_raise.rfl, extra here for VM compiled-form interaction.
+;; ═══════════════════════════════════════════════════════════════════
+(set f_do_raise (fn [x] (try (do (let y x) (raise y)) (fn [e] (* e 2)))))
+(f_do_raise 11) -- 22
+(f_do_raise -5) -- -10
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 23. Lambda dispatch with errors during arg eval — covers loop
+;;     j-release branch (eval.c 3133: True path).  First arg ok,
+;;     second arg errors mid-flight.
+;; ═══════════════════════════════════════════════════════════════════
+((fn [a b c] (+ a (+ b c))) 1 undefined_arg2_z 3) !- name
+((fn [a b c] (+ a (+ b c))) 1 2 undefined_arg3_z) !- name
+((fn [a] a) undefined_arg1_z) !- name
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 24. Quoted-sym arg (no NAME attr) passed to a lambda — VM op_loadenv
+;;     binds the literal sym; no env lookup occurs.  Covers atom
+;;     self-return path inside compiled bytecode.
+;; ═══════════════════════════════════════════════════════════════════
+(set _id_fn (fn [s] s))
+(_id_fn 'literal_sym) -- 'literal_sym
+(_id_fn "string lit") -- "string lit"
+(_id_fn 3.14) -- 3.14
+(_id_fn [1 2 3]) -- [1 2 3]
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 25. (raise <vec>) and (raise <table>) — payloads survive trap path.
+;;     Vector / dict / table payloads exercise VM trap retain/release
+;;     across non-atom values.
+;; ═══════════════════════════════════════════════════════════════════
+(set _raise_vec (fn [] (try (raise [10 20 30]) (fn [e] e))))
+(_raise_vec) -- [10 20 30]
+(set _raise_dict (fn [] (try (raise (dict ['a 'b] [1 2])) (fn [e] (at e 'a)))))
+(_raise_dict) -- 1
+(set _raise_table (fn [] (try (raise (table ['x] (list [1 2 3]))) (fn [e] (count e)))))
+(_raise_table) -- 3
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 26. Restricted-mode RFL surface — `set` is a SPECIAL_FORM with
+;;     RAY_FN_RESTRICTED.  In non-restricted RFL evaluation, the
+;;     restricted check at eval.c:3036 returns false → covers the
+;;     False arm.  This section just exercises set extensively to
+;;     ensure that branch's False side stays warm.
+;; ═══════════════════════════════════════════════════════════════════
+(set rs_a 1) -- 1
+(set rs_b "hello") -- "hello"
+(set rs_c [1 2 3]) -- [1 2 3]
+rs_a -- 1
+rs_b -- "hello"
+rs_c -- [1 2 3]
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 27. (return v) and (return) inside compiled lambda — covers
+;;     OP_RET dispatched from explicit return form (compile.c:358).
+;;     Without value, returns NULL (the "from_stack=false" path,
+;;     eval.c:2186-2187).
+;; ═══════════════════════════════════════════════════════════════════
+(set ret_v (fn [x] (return (* x 2)) 999))
+(ret_v 5) -- 10
+(set ret_empty (fn [] (return)))
+(type (ret_empty)) -- 'null
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 28. Materialise lazy in let / set / if — covers the
+;;     ray_is_lazy(val) True branches at eval.c 1440, 1458, 1472.
+;;     (sum vec) returns a lazy result.
+;; ═══════════════════════════════════════════════════════════════════
+(let _lz_let (sum [10 20 30])) -- 60
+_lz_let -- 60
+(set _lz_set (sum [1 2 3 4 5])) -- 15
+_lz_set -- 15
+;; Lazy as cond → materialised then truthy-tested
+(if (sum [1 2 3]) 'yes 'no) -- 'yes
+(if (sum [0 0 0]) 'yes 'no) -- 'no
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 29. (set self ..) — `self` is the lambda binding sym used by
+;;     recursive call; setting it at global scope shouldn't break
+;;     anything (covered by name resolution).
+;; ═══════════════════════════════════════════════════════════════════
+(set _xself 5) -- 5
+_xself -- 5
+
+;; ═══════════════════════════════════════════════════════════════════
+;; 30. Compiled lambda OP_CALLF arity mismatch → vm_err arity (eval.c
+;;     2020-2025).  Stored lambda called with wrong argc.
+;; ═══════════════════════════════════════════════════════════════════
+(set _stored_2arg (fn [a b] (+ a b)))
+(set _wrapper_wrong (fn [] (_stored_2arg 1 2 3)))
+(try (_wrapper_wrong) (fn [e] -1)) -- -1
+(set _wrapper_short (fn [] (_stored_2arg 1)))
+(try (_wrapper_short) (fn [e] -1)) -- -1

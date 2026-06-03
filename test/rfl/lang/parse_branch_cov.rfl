@@ -1,0 +1,345 @@
+;; Branch-coverage extension for src/lang/parse.c — the Rayfall parser
+;; (tokenizer, atom-literal parsing, list/dict/vector syntax, comments,
+;; escape sequences, error recovery).
+;;
+;; Existing coverage comes from the whole test suite implicitly exercising
+;; the happy path, plus test/rfl/integration/literals.rfl (char / string /
+;; octal literals).  This file targets the residual *reachable* branches:
+;;
+;;   • parse_number  — hex literals, every typed-null suffix, bare-0N
+;;                     identifier-continuation guards, date / time /
+;;                     timestamp parse + their malformed-input error arms,
+;;                     float exponent, integer-overflow → f64 promotion,
+;;                     h/i suffix domain-overflow.
+;;   • parse_string  — every escape (n/t/r/\\/"/octal/default), the
+;;                     unterminated-string error, the >4094-byte escape
+;;                     buffer overflow (domain).
+;;   • parse_symbol  — empty-symbol terminators, simple + escaped + octal +
+;;                     default char literals, dotted / underscored syms.
+;;   • parse_name    — true / false keywords, dotted + hyphenated names.
+;;   • parse_vector  — every homogeneous typed vector, mixed int/float
+;;                     promotion, mixed-type & nested-vector domain errors,
+;;                     empty vector, unclosed-vector parse error.
+;;   • parse_dict    — sym keys, str keys, heterogeneous keys, hyphenated
+;;                     key, empty-key / missing-colon / unclosed errors,
+;;                     nested dict/vector values.
+;;   • parse_list    — nested lists, unclosed-list parse error.
+;;   • parse_expr    — RPAREN/RBRACK/RBRACE stray-close errors, the COLON
+;;                     keyword form (with digit / hyphen continuation),
+;;                     empty-keyword error, the PA_ERR default arm.
+;;   • parse_source  — single expr, multi-expr (do …) wrapping.
+;;
+;; Malformed-input cases use the `(parse "src")` builtin, which calls
+;; ray_parse(src) directly (src/ops/system.c::ray_parse_builtin_fn).  This
+;; keeps the malformed bytes inside a Rayfall string literal so the .rfl
+;; test-runner's line-based " -- " / " !- " marker scan isn't confused by
+;; stray separators or unbalanced quotes in the probe text.
+;;
+;; ─── Documented UNREACHABLE branches (no RFL surface) ───────────────
+;;
+;;   parse_name loop (parse.c:469-473) — the sub-conditions
+;;     `*p->pos == '_' / '.' / '!' / '?' / '+' / '*' / '/' / '%' / '<' /
+;;      '>' / '=' / '&' / '|'` are dead: every one of those bytes is
+;;     classified PA_ALPHA (0x02) in the _PA dispatch table, so the leading
+;;     `PA(*p->pos) == PA_ALPHA` disjunct short-circuits true before any of
+;;     them is evaluated.  Only `*p->pos == '-'` (PA_MINUS, 0x0e) is live
+;;     and is covered below via hyphenated names.
+;;
+;;   parse_dict key loop (parse.c:691) — `*p->pos == '_'` is likewise dead
+;;     (`_` is PA_ALPHA); only `*p->pos == '-'` is live (covered).
+;;
+;;   keyword loop (parse.c:801-802) — `_ / . / / / ?` are all PA_ALPHA, so
+;;     only the PA_DIGIT disjunct (800:47) and `*p->pos == '-'` (801:59)
+;;     are live (both covered).
+;;
+;;   parse_number date branch (parse.c:235 `if (*p->pos != '.')`) — the
+;;     entry guard already requires p->pos[3]=='.', so after reading the
+;;     month this re-check is always false; the true arm is dead.
+;;
+;;   OOM error arms — parse_vector typed-fill / str-append failure returns
+;;     (parse.c:551,595,603,627), parse_source ray_alloc / do_sym failures
+;;     (parse.c:853,862,864), and the count>=4096 vector / count>=256
+;;     top-level / >4094 dict caps require allocator failure or
+;;     multi-thousand-element literals; left to C-level fault injection.
+;;
+;;   float-parse-fail arms (parse.c:311 `ray_parse_f64 == 0`, parse.c:323
+;;     the post-int-overflow f64 retry == 0) — the lexer only routes a
+;;     well-formed digit / dot / [eE][+-]? digit* run to ray_parse_f64,
+;;     which is lenient (`1e`, `1.0e`, `1e+` all parse as 1.0) and a pure
+;;     digit string that overflows i64 always parses as a finite/inf f64.
+;;     No parser-reachable byte sequence makes either ray_parse_f64 return
+;;     0, so both true arms are dead from the parser surface.
+
+;; ════════════════════════════════════════════════════════════════════
+;; 1.  HEX LITERALS  (parse_number 0x.. → U8)
+;; ════════════════════════════════════════════════════════════════════
+0x00 -- 0x00
+0x1f -- 0x1f
+0xff -- 0xff
+0xAB -- 0xab
+(type 0x10) -- 'u8
+;; hex with no digits / bad digit → parse error
+(parse "0x") !- parse
+(parse "0xZ") !- parse
+
+;; ════════════════════════════════════════════════════════════════════
+;; 2.  TYPED-NULL SUFFIXES  (parse_number 0N{h,i,d,t,p,l,f,s})
+;; ════════════════════════════════════════════════════════════════════
+(type 0Nh) -- 'i16
+(type 0Ni) -- 'i32
+(type 0Nl) -- 'i64
+(type 0Nf) -- 'f64
+(type 0Nd) -- 'date
+(type 0Nt) -- 'time
+(type 0Np) -- 'timestamp
+;; 0Ns is the canonical empty symbol (sym 0), not a typed null
+0Ns -- 0Ns
+(type 0Ns) -- 'sym
+(== 0Ns ') -- true
+;; bare 0N defaults to i64 null
+(type 0N) -- 'i64
+(nil? 0N) -- true
+
+;; ════════════════════════════════════════════════════════════════════
+;; 3.  BARE-0N IDENTIFIER-CONTINUATION GUARDS  (parse_number :214-218)
+;; ════════════════════════════════════════════════════════════════════
+;; `0N` followed by a letter/digit/underscore that is NOT a suffix is
+;; *not* a null — the digit `0` is taken and the continuation parsed as a
+;; separate trailing name, so `(do 0 <name>)` evaluates to the name value.
+(set Na 7)
+0Na -- 7
+(set Nz 9)
+0Nz -- 9
+(set N3 3)
+0N3 -- 3
+(set N_x 11)
+0N_x -- 11
+
+;; ════════════════════════════════════════════════════════════════════
+;; 4.  FLOAT / EXPONENT / INTEGER-OVERFLOW PROMOTION  (parse_number)
+;; ════════════════════════════════════════════════════════════════════
+1.5 -- 1.5
+0.5 -- 0.5
+1e3 -- 1000.0
+1e+3 -- 1000.0
+1e-3 -- 0.001
+1.5e2 -- 150.0
+1.5E2 -- 150.0
+1E2 -- 100.0
+1E-2 -- 0.01
+1E+2 -- 100.0
+(type 1e3) -- 'f64
+;; integer too large for i64 → promote to f64 (parse_number :321-326)
+99999999999999999999999999 -- 1e26
+(type 99999999999999999999999999) -- 'f64
+;; negative number (PA_MINUS → parse_number when digit follows)
+-5 -- -5
+-3.14 -- -3.14
+
+;; ════════════════════════════════════════════════════════════════════
+;; 5.  TYPE SUFFIXES h / i, with domain-overflow arms  (parse_number)
+;; ════════════════════════════════════════════════════════════════════
+3h -- 3h
+(type 3h) -- 'i16
+99h -- 99h
+12345i -- 12345i
+(type 12345i) -- 'i32
+;; suffix overflow → domain error
+(parse "40000h") !- domain
+(parse "3000000000i") !- domain
+
+;; ════════════════════════════════════════════════════════════════════
+;; 6.  TEMPORAL LITERALS  (parse_number date / time / timestamp)
+;; ════════════════════════════════════════════════════════════════════
+;; date
+2024.05.09 -- 2024.05.09
+(type 2024.05.09) -- 'date
+;; 4-digit value where the 2nd group isn't a date → ordinary float
+(eval (parse "2024.12")) -- 2024.12
+;; time HH:MM:SS.mmm
+12:30:45.000 -- 12:30:45.000
+12:30:45.123 -- 12:30:45.123
+(type 12:30:45.000) -- 'time
+00:00:00.000 -- 00:00:00.000
+;; time without sub-second fraction is still valid
+(type (parse "12:30:45")) -- 'time
+;; 2-digit + colon where try_parse_time fails → fall through to number,
+;; then the remainder is re-lexed (parse_number :281-289, try_parse_time
+;; NULL at MM :151, at MM-colon :157, at SS digits).  Each yields
+;; `(do 12 <keyword>)` whose value is the trailing keyword sym.
+(eval (parse "12:3x")) -- '3x
+(eval (parse "12:30x")) -- '30x
+(eval (parse "12:30:4x")) -- '4x
+;; timestamp YYYY.MM.DDDhh:mm:ss.nnnnnnnnn
+2024.01.15D12:30:45.000000000 -- 2024.01.15D12:30:45.000000000
+(type 2024.01.15D12:30:45.000000000) -- 'timestamp
+;; timestamp malformed: separator / colon / dot missing
+(parse "2024.01.01D12") !- parse
+(parse "2024.01.01D12:30") !- parse
+(parse "2024.01.01D12:30:45") !- parse
+
+;; ════════════════════════════════════════════════════════════════════
+;; 7.  STRING ESCAPES  (parse_string)
+;; ════════════════════════════════════════════════════════════════════
+"plain" -- "plain"
+"" -- ""
+"tab\there" -- "tab\there"
+"nl\nhere" -- "nl\nhere"
+"cr\rhere" -- "cr\rhere"
+"bs\\here" -- "bs\\here"
+"q\"here" -- "q\"here"
+;; octal escape \101 = 'A'
+"\101" -- "A"
+;; unknown escape → backslash kept literally (parse_string default :391)
+"a\zb" -- "a\zb"
+;; unterminated string → parse error
+(parse "\"unterminated") !- parse
+;; >4094-byte escaped string overflows the decode buffer → domain error
+;; (parse_string :368).  Built on disk so the long source stays off the
+;; .rfl line: a leading quote, 4100 'A's, then a \n escape + closing quote.
+(.sys.exec "rm -f /tmp/rfl_parse_long.txt")
+(.sys.exec "printf '\"' > /tmp/rfl_parse_long.txt")
+(.sys.exec "head -c 4100 /dev/zero | tr '\\0' 'A' >> /tmp/rfl_parse_long.txt")
+(.sys.exec "printf '\\\\n\"' >> /tmp/rfl_parse_long.txt")
+(parse (read "/tmp/rfl_parse_long.txt")) !- domain
+(.sys.exec "rm -f /tmp/rfl_parse_long.txt")
+
+;; ════════════════════════════════════════════════════════════════════
+;; 8.  CHAR / SYMBOL LITERALS  (parse_symbol)
+;; ════════════════════════════════════════════════════════════════════
+;; simple char literal
+'a' -- 'a'
+;; escaped char literals
+'\n' -- '\n'
+'\t' -- '\t'
+'\r' -- '\r'
+'\\' -- '\\'
+'\'' -- '\''
+;; octal char escape \101 = 'A' (parse_symbol :425-438)
+'\101' -- 'A'
+;; default char escape (unknown) keeps the raw char (parse_symbol :440)
+'\z' -- 'z'
+;; bare quoted symbol
+(== 'hello 'hello) -- true
+;; dotted / underscored symbol chars (parse_symbol loop :456)
+(as 'STR 'a.b.c) -- "a.b.c"
+(as 'STR 'a_b) -- "a_b"
+;; empty symbol before a closing bracket / brace / paren
+;; (parse_symbol terminator guard :408-409)
+(count (list ')) -- 1
+(count [']) -- 1
+(count {k: '}) -- 1
+
+;; ════════════════════════════════════════════════════════════════════
+;; 9.  NAME / KEYWORD PARSING  (parse_name, parse_expr COLON)
+;; ════════════════════════════════════════════════════════════════════
+;; true / false keyword names
+true -- true
+false -- false
+(type true) -- 'b8
+;; hyphenated name (parse_name '-' arm :469)
+(set my-var 42)
+my-var -- 42
+;; keyword literal :name (parse_expr PA_COLON) → a sym
+(== :foo 'foo) -- true
+(type :foo) -- 'sym
+;; keyword with digit / hyphen continuation
+(as 'STR :item2) -- "item2"
+(as 'STR :a-b) -- "a-b"
+;; empty keyword → parse error
+(parse ":") !- parse
+;; PA_ERR byte (backtick) falls to parse_expr default → empty name → parse
+(parse "`") !- parse
+
+;; ════════════════════════════════════════════════════════════════════
+;; 10.  VECTOR LITERALS  (parse_vector)
+;; ════════════════════════════════════════════════════════════════════
+;; homogeneous typed vectors
+[1 2 3] -- [1 2 3]
+(type [1 2 3]) -- 'I64
+[1.0 2.0 3.0] -- [1.0 2.0 3.0]
+(type [1.0 2.0 3.0]) -- 'F64
+[1h 2h 3h] -- [1h 2h 3h]
+(type [1h 2h 3h]) -- 'I16
+[1i 2i 3i] -- [1i 2i 3i]
+(type [1i 2i 3i]) -- 'I32
+[0x01 0x02 0x03] -- [0x01 0x02 0x03]
+(type [0x01 0x02 0x03]) -- 'U8
+[true false true] -- [true false true]
+(type [true false true]) -- 'B8
+['a 'b 'c] -- ['a 'b 'c]
+(type ['a 'b 'c]) -- 'SYM
+["x" "y" "z"] -- ["x" "y" "z"]
+(type ["x" "y" "z"]) -- 'STR
+[2024.01.01 2024.06.15] -- [2024.01.01 2024.06.15]
+(type [2024.01.01 2024.06.15]) -- 'DATE
+;; mixed int/float → promote to F64 (parse_vector :624)
+[1 2.0 3] -- [1.0 2.0 3.0]
+(type [1 2.0 3]) -- 'F64
+;; empty vector → empty I64 (parse_vector :518-520)
+[] -- []
+(type []) -- 'I64
+(count []) -- 0
+;; null-in-vector marks the slot null
+(nil? (at [1 0N 3] 1)) -- true
+(nil? (at [1.0 0Nf 3.0] 1)) -- true
+;; mixed-type vector → domain error (parse_vector boxed_list :650-653)
+(parse "[1 'a]") !- domain
+;; nested vector → boxed elements → domain error
+(parse "[[1 2] [3 4]]") !- domain
+;; unclosed vector → parse error
+(parse "[1 2 3") !- parse
+
+;; ════════════════════════════════════════════════════════════════════
+;; 11.  DICT LITERALS  (parse_dict)
+;; ════════════════════════════════════════════════════════════════════
+;; sym-keyed dict (all bareword keys → SYM key vector)
+{a: 1 b: 2} -- {a: 1 b: 2}
+(at {a: 1 b: 2} 'a) -- 1
+;; string-keyed dict (all quoted keys → STR key vector)
+(eval (parse "{\"k1\": 10 \"k2\": 20}")) -- {"k1": 10 "k2": 20}
+;; heterogeneous keys (mix of sym + string → LIST keys)
+(eval (parse "{a: 1 \"b\": 2}"))
+;; hyphenated dict key (parse_dict '-' arm :691)
+(eval (parse "{a-b: 1}"))
+;; nested dict / vector values
+(eval (parse "{a: [1 2] b: {c: 3}}")) -- {a: [1 2] b: {c: 3}}
+;; empty key → parse error
+(parse "{: 1}") !- parse
+;; missing colon → parse error
+(parse "{a 1}") !- parse
+;; unclosed dict → parse error
+(parse "{a: 1") !- parse
+
+;; ════════════════════════════════════════════════════════════════════
+;; 12.  LIST / S-EXPRESSION  (parse_list)
+;; ════════════════════════════════════════════════════════════════════
+(list 1 2 3) -- (list 1 2 3)
+;; nested list
+(type (parse "((1 2) (3 4))")) -- 'LIST
+;; unclosed list → parse error
+(parse "(foo bar") !- parse
+;; stray closers → parse error (parse_expr RPAREN/RBRACK/RBRACE)
+(parse ")") !- parse
+(parse "]") !- parse
+(parse "}") !- parse
+
+;; ════════════════════════════════════════════════════════════════════
+;; 13.  COMMENTS & WHITESPACE  (skip_ws_and_comments)
+;; ════════════════════════════════════════════════════════════════════
+;; ; comment runs to end of line; \r / \t / \n are whitespace
+(eval (parse "  1  ")) -- 1
+(eval (parse "\t\t2")) -- 2
+(eval (parse "; a comment\n3")) -- 3
+(eval (parse "(+ 1 ; inline comment\n 2)")) -- 3
+(eval (parse "\r\n4\r\n")) -- 4
+
+;; ════════════════════════════════════════════════════════════════════
+;; 14.  MULTI-EXPRESSION SOURCE  (parse_source → (do …))
+;; ════════════════════════════════════════════════════════════════════
+;; multiple top-level expressions wrap into (do …); value is the last
+(eval (parse "1 2 3")) -- 3
+;; (do …) shape is a LIST headed by the `do` name symbol
+(type (parse "1 2 3")) -- 'LIST
+;; single expression is returned bare (not wrapped)
+(type (parse "42")) -- 'i64

@@ -728,6 +728,816 @@ static test_result_t test_topk_three_keys(void) {
     PASS();
 }
 
+/* ─── Branch-coverage tests ───────────────────────────────────────── */
+
+/* fpk_cmp esz==2 leg (I16 sort key, lines 158-160). */
+static test_result_t test_topk_i16_sort_key(void) {
+    int64_t N = 50;
+    ray_t* kc  = ray_vec_new(RAY_I16, N); kc->len  = N;
+    ray_t* sc  = ray_vec_new(RAY_I64, N); sc->len  = N;
+    int16_t* kd = (int16_t*)ray_data(kc);
+    int64_t* sd = (int64_t*)ray_data(sc);
+    for (int64_t i = 0; i < N; i++) {
+        kd[i] = (int16_t)(N - 1 - i);  /* descending values */
+        sd[i] = i;
+    }
+    int64_t s_k   = ray_sym_intern("k",   1);
+    int64_t s_sel = ray_sym_intern("sel", 3);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, s_k,   kc);  ray_release(kc);
+    tbl = ray_table_add_col(tbl, s_sel, sc);   ray_release(sc);
+
+    ray_t* where_expr = ray_parse("(>= sel 0)");
+    int64_t sort_keys[1]  = { s_k };
+    uint8_t sort_descs[1] = { 0 };  /* ASC */
+    int64_t out_syms[2]   = { s_k, s_sel };
+    int64_t k_pick = 3;
+    ray_t* res = ray_fused_topk_select(tbl, where_expr,
+                                       sort_keys, sort_descs, 1, k_pick,
+                                       out_syms, NULL, 2);
+    TEST_ASSERT_NOT_NULL(res);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), k_pick);
+    /* Smallest 3 I16 values: 0, 1, 2. */
+    ray_t* k_col = ray_table_get_col(res, s_k);
+    TEST_ASSERT_NOT_NULL(k_col);
+    for (int64_t i = 0; i < k_pick; i++)
+        TEST_ASSERT_EQ_I((int64_t)((int16_t*)ray_data(k_col))[i], i);
+    ray_release(res); ray_release(where_expr); ray_release(tbl);
+    PASS();
+}
+
+/* fpk_cmp esz==2 leg DESC — both comparison directions exercised. */
+static test_result_t test_topk_i16_sort_key_desc(void) {
+    int64_t N = 50;
+    ray_t* kc  = ray_vec_new(RAY_I16, N); kc->len  = N;
+    ray_t* sc  = ray_vec_new(RAY_I64, N); sc->len  = N;
+    int16_t* kd = (int16_t*)ray_data(kc);
+    int64_t* sd = (int64_t*)ray_data(sc);
+    for (int64_t i = 0; i < N; i++) { kd[i] = (int16_t)i; sd[i] = i; }
+    int64_t s_k   = ray_sym_intern("k",   1);
+    int64_t s_sel = ray_sym_intern("sel", 3);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, s_k,   kc);  ray_release(kc);
+    tbl = ray_table_add_col(tbl, s_sel, sc);   ray_release(sc);
+
+    ray_t* where_expr = ray_parse("(>= sel 0)");
+    int64_t sort_keys[1]  = { s_k };
+    uint8_t sort_descs[1] = { 1 };  /* DESC */
+    int64_t out_syms[1]   = { s_k };
+    int64_t k_pick = 3;
+    ray_t* res = ray_fused_topk_select(tbl, where_expr,
+                                       sort_keys, sort_descs, 1, k_pick,
+                                       out_syms, NULL, 1);
+    TEST_ASSERT_NOT_NULL(res);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), k_pick);
+    /* Largest 3 DESC: 49, 48, 47. */
+    ray_t* k_col = ray_table_get_col(res, s_k);
+    for (int64_t i = 0; i < k_pick; i++)
+        TEST_ASSERT_EQ_I((int64_t)((int16_t*)ray_data(k_col))[i], (int64_t)(N - 1 - i));
+    ray_release(res); ray_release(where_expr); ray_release(tbl);
+    PASS();
+}
+
+/* fpk_cmp esz==1 leg (U8 sort key, lines 162-165). */
+static test_result_t test_topk_u8_sort_key(void) {
+    int64_t N = 50;
+    ray_t* kc  = ray_vec_new(RAY_U8, N);  kc->len  = N;
+    ray_t* sc  = ray_vec_new(RAY_I64, N); sc->len  = N;
+    uint8_t* kd = (uint8_t*)ray_data(kc);
+    int64_t* sd = (int64_t*)ray_data(sc);
+    for (int64_t i = 0; i < N; i++) {
+        kd[i] = (uint8_t)((i * 7) % 50);  /* scattered values */
+        sd[i] = i;
+    }
+    int64_t s_k   = ray_sym_intern("k",   1);
+    int64_t s_sel = ray_sym_intern("sel", 3);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, s_k,   kc);  ray_release(kc);
+    tbl = ray_table_add_col(tbl, s_sel, sc);   ray_release(sc);
+
+    ray_t* where_expr = ray_parse("(>= sel 0)");
+    int64_t sort_keys[1]  = { s_k };
+    uint8_t sort_descs[1] = { 0 };  /* ASC */
+    int64_t out_syms[2]   = { s_k, s_sel };
+    int64_t k_pick = 4;
+    ray_t* res = ray_fused_topk_select(tbl, where_expr,
+                                       sort_keys, sort_descs, 1, k_pick,
+                                       out_syms, NULL, 2);
+    TEST_ASSERT_NOT_NULL(res);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), k_pick);
+    /* Verify ASC order on output. */
+    ray_t* k_col = ray_table_get_col(res, s_k);
+    TEST_ASSERT_NOT_NULL(k_col);
+    uint8_t prev = 0;
+    for (int64_t i = 0; i < k_pick; i++) {
+        uint8_t cur = ((uint8_t*)ray_data(k_col))[i];
+        TEST_ASSERT_TRUE(cur >= prev);
+        prev = cur;
+    }
+    ray_release(res); ray_release(where_expr); ray_release(tbl);
+    PASS();
+}
+
+/* fpk_cmp esz==1 leg DESC (U8 sort key). */
+static test_result_t test_topk_u8_sort_key_desc(void) {
+    int64_t N = 30;
+    ray_t* kc  = ray_vec_new(RAY_U8, N);  kc->len  = N;
+    ray_t* sc  = ray_vec_new(RAY_I64, N); sc->len  = N;
+    uint8_t* kd = (uint8_t*)ray_data(kc);
+    int64_t* sd = (int64_t*)ray_data(sc);
+    for (int64_t i = 0; i < N; i++) { kd[i] = (uint8_t)i; sd[i] = i; }
+    int64_t s_k   = ray_sym_intern("k",   1);
+    int64_t s_sel = ray_sym_intern("sel", 3);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, s_k,   kc);  ray_release(kc);
+    tbl = ray_table_add_col(tbl, s_sel, sc);   ray_release(sc);
+
+    ray_t* where_expr = ray_parse("(>= sel 0)");
+    int64_t sort_keys[1]  = { s_k };
+    uint8_t sort_descs[1] = { 1 };  /* DESC */
+    int64_t out_syms[1]   = { s_k };
+    int64_t k_pick = 3;
+    ray_t* res = ray_fused_topk_select(tbl, where_expr,
+                                       sort_keys, sort_descs, 1, k_pick,
+                                       out_syms, NULL, 1);
+    TEST_ASSERT_NOT_NULL(res);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), k_pick);
+    /* Largest 3 DESC: 29, 28, 27. */
+    ray_t* k_col = ray_table_get_col(res, s_k);
+    for (int64_t i = 0; i < k_pick; i++)
+        TEST_ASSERT_EQ_I((int64_t)((uint8_t*)ray_data(k_col))[i], (int64_t)(N - 1 - i));
+    ray_release(res); ray_release(where_expr); ray_release(tbl);
+    PASS();
+}
+
+/* BOOL sort key — type gate acceptance + esz==1 unsigned compare path.
+ * BOOL column values are 0/1 stored as uint8_t. */
+static test_result_t test_topk_bool_sort_key(void) {
+    int64_t N = 20;
+    ray_t* kc  = ray_vec_new(RAY_BOOL, N); kc->len  = N;
+    ray_t* sc  = ray_vec_new(RAY_I64, N);  sc->len  = N;
+    uint8_t* kd = (uint8_t*)ray_data(kc);
+    int64_t* sd = (int64_t*)ray_data(sc);
+    for (int64_t i = 0; i < N; i++) {
+        kd[i] = (uint8_t)(i % 2);  /* alternating 0/1 */
+        sd[i] = i;
+    }
+    int64_t s_k   = ray_sym_intern("k",   1);
+    int64_t s_sel = ray_sym_intern("sel", 3);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, s_k,   kc);  ray_release(kc);
+    tbl = ray_table_add_col(tbl, s_sel, sc);   ray_release(sc);
+
+    ray_t* where_expr = ray_parse("(>= sel 0)");
+    int64_t sort_keys[1]  = { s_k };
+    uint8_t sort_descs[1] = { 0 };  /* ASC: false (0) before true (1) */
+    int64_t out_syms[2]   = { s_k, s_sel };
+    int64_t k_pick = 4;
+    ray_t* res = ray_fused_topk_select(tbl, where_expr,
+                                       sort_keys, sort_descs, 1, k_pick,
+                                       out_syms, NULL, 2);
+    TEST_ASSERT_NOT_NULL(res);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), k_pick);
+    /* ASC: first K=4 are the false values (k==0), rows 0,2,4,6. */
+    ray_t* k_col = ray_table_get_col(res, s_k);
+    for (int64_t i = 0; i < k_pick; i++)
+        TEST_ASSERT_EQ_I((int64_t)((uint8_t*)ray_data(k_col))[i], 0);
+    ray_release(res); ray_release(where_expr); ray_release(tbl);
+    PASS();
+}
+
+/* DATE sort key — temporal type gate (esz==4 via I32 path). */
+static test_result_t test_topk_date_sort_key(void) {
+    int64_t N = 30;
+    ray_t* kc  = ray_vec_new(RAY_DATE, N); kc->len  = N;
+    ray_t* sc  = ray_vec_new(RAY_I64, N);  sc->len  = N;
+    int32_t* kd = (int32_t*)ray_data(kc);
+    int64_t* sd = (int64_t*)ray_data(sc);
+    /* DATE stored as days-since-epoch (I32). Use distinct descending. */
+    for (int64_t i = 0; i < N; i++) {
+        kd[i] = (int32_t)(20000 - (int32_t)i);  /* large to small */
+        sd[i] = i;
+    }
+    int64_t s_k   = ray_sym_intern("k",   1);
+    int64_t s_sel = ray_sym_intern("sel", 3);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, s_k,   kc);  ray_release(kc);
+    tbl = ray_table_add_col(tbl, s_sel, sc);   ray_release(sc);
+
+    ray_t* where_expr = ray_parse("(>= sel 0)");
+    int64_t sort_keys[1]  = { s_k };
+    uint8_t sort_descs[1] = { 0 };  /* ASC */
+    int64_t out_syms[2]   = { s_k, s_sel };
+    int64_t k_pick = 3;
+    ray_t* res = ray_fused_topk_select(tbl, where_expr,
+                                       sort_keys, sort_descs, 1, k_pick,
+                                       out_syms, NULL, 2);
+    TEST_ASSERT_NOT_NULL(res);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), k_pick);
+    /* Smallest 3 date values: 19971, 19972, 19973. */
+    ray_t* k_col = ray_table_get_col(res, s_k);
+    TEST_ASSERT_EQ_I((int64_t)((int32_t*)ray_data(k_col))[0], 20000 - (N - 1));
+    TEST_ASSERT_EQ_I((int64_t)((int32_t*)ray_data(k_col))[1], 20000 - (N - 2));
+    TEST_ASSERT_EQ_I((int64_t)((int32_t*)ray_data(k_col))[2], 20000 - (N - 3));
+    ray_release(res); ray_release(where_expr); ray_release(tbl);
+    PASS();
+}
+
+/* TIME sort key — temporal type gate (esz==4 via I32 path). */
+static test_result_t test_topk_time_sort_key(void) {
+    int64_t N = 20;
+    ray_t* kc  = ray_vec_new(RAY_TIME, N); kc->len  = N;
+    ray_t* sc  = ray_vec_new(RAY_I64, N);  sc->len  = N;
+    int32_t* kd = (int32_t*)ray_data(kc);
+    int64_t* sd = (int64_t*)ray_data(sc);
+    for (int64_t i = 0; i < N; i++) {
+        kd[i] = (int32_t)((i * 3600) % 86400);  /* various times */
+        sd[i] = i;
+    }
+    int64_t s_k   = ray_sym_intern("k",   1);
+    int64_t s_sel = ray_sym_intern("sel", 3);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, s_k,   kc);  ray_release(kc);
+    tbl = ray_table_add_col(tbl, s_sel, sc);   ray_release(sc);
+
+    ray_t* where_expr = ray_parse("(>= sel 0)");
+    int64_t sort_keys[1]  = { s_k };
+    uint8_t sort_descs[1] = { 1 };  /* DESC */
+    int64_t out_syms[1]   = { s_k };
+    int64_t k_pick = 3;
+    ray_t* res = ray_fused_topk_select(tbl, where_expr,
+                                       sort_keys, sort_descs, 1, k_pick,
+                                       out_syms, NULL, 1);
+    TEST_ASSERT_NOT_NULL(res);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), k_pick);
+    /* DESC: largest time values first. */
+    ray_t* k_col = ray_table_get_col(res, s_k);
+    int32_t prev = INT32_MAX;
+    for (int64_t i = 0; i < k_pick; i++) {
+        int32_t cur = ((int32_t*)ray_data(k_col))[i];
+        TEST_ASSERT_TRUE(cur <= prev);
+        prev = cur;
+    }
+    ray_release(res); ray_release(where_expr); ray_release(tbl);
+    PASS();
+}
+
+/* TIMESTAMP sort key — temporal type gate (esz==8 via I64 path). */
+static test_result_t test_topk_timestamp_sort_key(void) {
+    int64_t N = 30;
+    ray_t* kc  = ray_vec_new(RAY_TIMESTAMP, N); kc->len = N;
+    ray_t* sc  = ray_vec_new(RAY_I64, N);       sc->len = N;
+    int64_t* kd = (int64_t*)ray_data(kc);
+    int64_t* sd = (int64_t*)ray_data(sc);
+    for (int64_t i = 0; i < N; i++) {
+        kd[i] = 1700000000000LL + (int64_t)(i * 86400000LL);  /* millis */
+        sd[i] = i;
+    }
+    int64_t s_k   = ray_sym_intern("k",   1);
+    int64_t s_sel = ray_sym_intern("sel", 3);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, s_k,   kc);  ray_release(kc);
+    tbl = ray_table_add_col(tbl, s_sel, sc);   ray_release(sc);
+
+    ray_t* where_expr = ray_parse("(>= sel 0)");
+    int64_t sort_keys[1]  = { s_k };
+    uint8_t sort_descs[1] = { 0 };  /* ASC */
+    int64_t out_syms[2]   = { s_k, s_sel };
+    int64_t k_pick = 3;
+    ray_t* res = ray_fused_topk_select(tbl, where_expr,
+                                       sort_keys, sort_descs, 1, k_pick,
+                                       out_syms, NULL, 2);
+    TEST_ASSERT_NOT_NULL(res);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), k_pick);
+    /* Smallest 3 timestamps: rows 0,1,2. */
+    ray_t* k_col = ray_table_get_col(res, s_k);
+    for (int64_t i = 0; i < k_pick; i++)
+        TEST_ASSERT_EQ_I(((int64_t*)ray_data(k_col))[i],
+                         1700000000000LL + i * 86400000LL);
+    ray_release(res); ray_release(where_expr); ray_release(tbl);
+    PASS();
+}
+
+/* SYM sort key DESC — exercises the `ks->desc ? -cmp : cmp` path with
+ * cmp from ray_str_cmp on SYM strings in the opposite direction. */
+static test_result_t test_topk_sym_key_desc(void) {
+    int64_t N = 50;
+    ray_t* sc = ray_sym_vec_new(RAY_SYM_W32, N);
+    sc->len = N;
+    int64_t s_alpha = ray_sym_intern("alpha", 5);
+    int64_t s_beta  = ray_sym_intern("beta",  4);
+    int64_t s_gamma = ray_sym_intern("gamma", 5);
+    int64_t s_delta = ray_sym_intern("delta", 5);
+    int64_t s_epsi  = ray_sym_intern("epsilon", 7);
+    int64_t syms[5] = { s_alpha, s_beta, s_gamma, s_delta, s_epsi };
+    int32_t* d = (int32_t*)ray_data(sc);
+    for (int64_t i = 0; i < N; i++) d[i] = (int32_t)syms[i % 5];
+
+    ray_t* selc = ray_vec_new(RAY_I64, N); selc->len = N;
+    int64_t* sd = (int64_t*)ray_data(selc);
+    for (int64_t i = 0; i < N; i++) sd[i] = i;
+
+    int64_t s_name = ray_sym_intern("name", 4);
+    int64_t s_sel  = ray_sym_intern("sel",  3);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, s_name, sc);   ray_release(sc);
+    tbl = ray_table_add_col(tbl, s_sel,  selc); ray_release(selc);
+
+    ray_t* where_expr = ray_parse("(>= sel 0)");
+    int64_t sort_keys[1]  = { s_name };
+    uint8_t sort_descs[1] = { 1 };  /* DESC by name string */
+    int64_t out_syms[1]   = { s_name };
+    int64_t k_pick = 4;
+    ray_t* res = ray_fused_topk_select(tbl, where_expr,
+                                       sort_keys, sort_descs, 1, k_pick,
+                                       out_syms, NULL, 1);
+    TEST_ASSERT_NOT_NULL(res);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), k_pick);
+    /* DESC: gamma > epsilon > delta > beta > alpha.
+     * Top 4 DESC = gamma(×10), but K=4 so first 4 gamma rows. */
+    ray_t* name_col = ray_table_get_col(res, s_name);
+    TEST_ASSERT_NOT_NULL(name_col);
+    int32_t got = ((int32_t*)ray_data(name_col))[0];
+    TEST_ASSERT_EQ_I((int64_t)got, s_gamma);
+    ray_release(res); ray_release(where_expr); ray_release(tbl);
+    PASS();
+}
+
+/* Both-null tie on a sort key — line 137 `a_null && b_null` continue,
+ * then break tie on second key or row index. */
+static test_result_t test_topk_both_nulls_tie(void) {
+    int64_t N = 20;
+    ray_t* k1c = ray_vec_new(RAY_I64, N); k1c->len = N;
+    ray_t* k2c = ray_vec_new(RAY_I64, N); k2c->len = N;
+    ray_t* sc  = ray_vec_new(RAY_I64, N); sc->len  = N;
+    int64_t* k1d = (int64_t*)ray_data(k1c);
+    int64_t* k2d = (int64_t*)ray_data(k2c);
+    int64_t* sd  = (int64_t*)ray_data(sc);
+    for (int64_t i = 0; i < N; i++) {
+        k1d[i] = i / 5;   /* 0,0,0,0,0, 1,1,1,1,1, 2,2,2,2,2, 3,3,3,3,3 */
+        k2d[i] = N - i;   /* tie-breaker: descending */
+        sd[i]  = i;
+    }
+    /* Mark several rows null on k1 — including pairs so both-null
+     * branches fire during comparison. */
+    ray_vec_set_null(k1c, 0, true);
+    ray_vec_set_null(k1c, 1, true);
+    ray_vec_set_null(k1c, 5, true);
+    ray_vec_set_null(k1c, 10, true);
+
+    int64_t s_k1  = ray_sym_intern("k1",  2);
+    int64_t s_k2  = ray_sym_intern("k2",  2);
+    int64_t s_sel = ray_sym_intern("sel", 3);
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, s_k1,  k1c); ray_release(k1c);
+    tbl = ray_table_add_col(tbl, s_k2,  k2c); ray_release(k2c);
+    tbl = ray_table_add_col(tbl, s_sel, sc);  ray_release(sc);
+
+    ray_t* where_expr = ray_parse("(>= sel 0)");
+    /* Sort by k1 ASC (nulls last), then k2 ASC. */
+    int64_t sort_keys[2]  = { s_k1, s_k2 };
+    uint8_t sort_descs[2] = { 0, 0 };
+    int64_t out_syms[2]   = { s_k1, s_k2 };
+    int64_t k_pick = 5;
+    ray_t* res = ray_fused_topk_select(tbl, where_expr,
+                                       sort_keys, sort_descs, 2, k_pick,
+                                       out_syms, NULL, 2);
+    TEST_ASSERT_NOT_NULL(res);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), k_pick);
+    /* Non-null k1 values start at row 2 (k1=0).  (k1 ASC, k2 ASC):
+     * k1=0: rows 4(k2=16), 3(k2=17), 2(k2=18).
+     * k1=1: rows 9(k2=11), 8(k2=12), 7(k2=13), 6(k2=14).
+     * Top 5 = {16, 17, 18, 11, 12}. */
+    ray_t* k2_col = ray_table_get_col(res, s_k2);
+    TEST_ASSERT_NOT_NULL(k2_col);
+    int64_t expect_k2[] = {16, 17, 18, 11, 12};
+    for (int64_t i = 0; i < k_pick; i++)
+        TEST_ASSERT_EQ_I(((int64_t*)ray_data(k2_col))[i], expect_k2[i]);
+    ray_release(res); ray_release(where_expr); ray_release(tbl);
+    PASS();
+}
+
+/* Selective WHERE filtering most rows.  K close to the number of
+ * surviving rows.  Exercises !bits[r] branch heavily and the case
+ * where fewer rows pass than K (global_n < k after merge). */
+static test_result_t test_topk_selective_where(void) {
+    int64_t N = 100;
+    ray_t* gc = ray_vec_new(RAY_I64, N); gc->len = N;
+    ray_t* vc = ray_vec_new(RAY_I64, N); vc->len = N;
+    int64_t* gd = (int64_t*)ray_data(gc);
+    int64_t* vd = (int64_t*)ray_data(vc);
+    for (int64_t i = 0; i < N; i++) { gd[i] = i % 10; vd[i] = i; }
+    int64_t s_g = ray_sym_intern("g", 1);
+    int64_t s_v = ray_sym_intern("v", 1);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, s_g, gc); ray_release(gc);
+    tbl = ray_table_add_col(tbl, s_v, vc); ray_release(vc);
+
+    /* WHERE g == 7 — only 10 out of 100 rows pass. */
+    ray_t* where_expr = ray_parse("(== g 7)");
+    TEST_ASSERT_NOT_NULL(where_expr);
+    int64_t sort_keys[1]  = { s_v };
+    uint8_t sort_descs[1] = { 0 };
+    int64_t out_syms[2]   = { s_v, s_g };
+    int64_t k_pick = 3;
+    ray_t* res = ray_fused_topk_select(tbl, where_expr,
+                                       sort_keys, sort_descs, 1, k_pick,
+                                       out_syms, NULL, 2);
+    TEST_ASSERT_NOT_NULL(res);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), k_pick);
+    /* Rows matching g==7: v=7,17,27,37,... Top 3 ASC = 7,17,27. */
+    ray_t* v_col = ray_table_get_col(res, s_v);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(v_col))[0], 7);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(v_col))[1], 17);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(v_col))[2], 27);
+    ray_release(res); ray_release(where_expr); ray_release(tbl);
+    PASS();
+}
+
+/* Fewer-than-K passing rows — the global merge's global_n stays
+ * below k so the final heapify-then-sift path is not taken; instead
+ * the linear accumulate path fills global_idx[0..global_n-1] and
+ * fpk_sort_final sorts that short array. */
+static test_result_t test_topk_fewer_than_k_passing(void) {
+    int64_t N = 50;
+    ray_t* gc = ray_vec_new(RAY_I64, N); gc->len = N;
+    ray_t* vc = ray_vec_new(RAY_I64, N); vc->len = N;
+    int64_t* gd = (int64_t*)ray_data(gc);
+    int64_t* vd = (int64_t*)ray_data(vc);
+    for (int64_t i = 0; i < N; i++) { gd[i] = i % 10; vd[i] = i; }
+    int64_t s_g = ray_sym_intern("g", 1);
+    int64_t s_v = ray_sym_intern("v", 1);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, s_g, gc); ray_release(gc);
+    tbl = ray_table_add_col(tbl, s_v, vc); ray_release(vc);
+
+    /* WHERE g == 7 — only 5 rows pass. K=10 > 5 surviving. */
+    ray_t* where_expr = ray_parse("(== g 7)");
+    int64_t sort_keys[1]  = { s_v };
+    uint8_t sort_descs[1] = { 0 };
+    int64_t out_syms[1]   = { s_v };
+    int64_t k_pick = 10;
+    ray_t* res = ray_fused_topk_select(tbl, where_expr,
+                                       sort_keys, sort_descs, 1, k_pick,
+                                       out_syms, NULL, 1);
+    TEST_ASSERT_NOT_NULL(res);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    /* Only 5 rows pass, so result has 5, not 10. */
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 5);
+    ray_t* v_col = ray_table_get_col(res, s_v);
+    int64_t expect[] = {7, 17, 27, 37, 47};
+    for (int64_t i = 0; i < 5; i++)
+        TEST_ASSERT_EQ_I(((int64_t*)ray_data(v_col))[i], expect[i]);
+    ray_release(res); ray_release(where_expr); ray_release(tbl);
+    PASS();
+}
+
+/* Multi-key with nulls on first key AND ties — exercises both-null
+ * continue (line 137) propagating to second key comparison. */
+static test_result_t test_topk_multi_key_null_tiebreak(void) {
+    int64_t N = 20;
+    ray_t* k1c = ray_vec_new(RAY_I64, N); k1c->len = N;
+    ray_t* k2c = ray_vec_new(RAY_I32, N); k2c->len = N;
+    ray_t* sc  = ray_vec_new(RAY_I64, N); sc->len  = N;
+    int64_t* k1d = (int64_t*)ray_data(k1c);
+    int32_t* k2d = (int32_t*)ray_data(k2c);
+    int64_t* sd  = (int64_t*)ray_data(sc);
+    for (int64_t i = 0; i < N; i++) {
+        k1d[i] = i / 4;   /* groups of 4 */
+        k2d[i] = (int32_t)(i % 4);
+        sd[i]  = i;
+    }
+    /* Null k1 at rows 0,1 (both in group k1=0) and rows 8,9 (group k1=2). */
+    ray_vec_set_null(k1c, 0, true);
+    ray_vec_set_null(k1c, 1, true);
+    ray_vec_set_null(k1c, 8, true);
+    ray_vec_set_null(k1c, 9, true);
+
+    int64_t s_k1  = ray_sym_intern("k1",  2);
+    int64_t s_k2  = ray_sym_intern("k2",  2);
+    int64_t s_sel = ray_sym_intern("sel", 3);
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, s_k1,  k1c); ray_release(k1c);
+    tbl = ray_table_add_col(tbl, s_k2,  k2c); ray_release(k2c);
+    tbl = ray_table_add_col(tbl, s_sel, sc);  ray_release(sc);
+
+    ray_t* where_expr = ray_parse("(>= sel 0)");
+    /* k1 ASC (nulls last), k2 DESC for tie-break. */
+    int64_t sort_keys[2]  = { s_k1, s_k2 };
+    uint8_t sort_descs[2] = { 0, 1 };
+    int64_t out_syms[3]   = { s_k1, s_k2, s_sel };
+    int64_t k_pick = 6;
+    ray_t* res = ray_fused_topk_select(tbl, where_expr,
+                                       sort_keys, sort_descs, 2, k_pick,
+                                       out_syms, NULL, 3);
+    TEST_ASSERT_NOT_NULL(res);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), k_pick);
+    /* Non-null k1: smallest k1=0 at rows 2,3; then k1=1 at rows 4,5,6,7.
+     * For k1=0: k2 DESC → row 3(k2=3), row 2(k2=2).
+     * For k1=1: k2 DESC → row 7(k2=3), row 6(k2=2), row 5(k2=1), row 4(k2=0).
+     * Top 6 = rows 3,2,7,6,5,4. */
+    ray_t* sel_col = ray_table_get_col(res, s_sel);
+    int64_t expect_sel[] = {3, 2, 7, 6, 5, 4};
+    for (int64_t i = 0; i < k_pick; i++)
+        TEST_ASSERT_EQ_I(((int64_t*)ray_data(sel_col))[i], expect_sel[i]);
+    ray_release(res); ray_release(where_expr); ray_release(tbl);
+    PASS();
+}
+
+/* I64 DESC single key — cover the desc branch for esz==8 path (line 167
+ * `ks->desc ? -cmp : cmp` with esz==8).  Existing tests use ASC for I64. */
+static test_result_t test_topk_i64_desc(void) {
+    int64_t N = 100;
+    ray_t* tbl = make_i64_table(N);
+    ray_t* where_expr = ray_parse("(>= v 0)");
+    int64_t s_v = ray_sym_intern("v", 1);
+    int64_t sort_keys[1]  = { s_v };
+    uint8_t sort_descs[1] = { 1 };  /* DESC */
+    int64_t out_syms[1]   = { s_v };
+    int64_t k_pick = 4;
+    ray_t* res = ray_fused_topk_select(tbl, where_expr,
+                                       sort_keys, sort_descs, 1, k_pick,
+                                       out_syms, NULL, 1);
+    TEST_ASSERT_NOT_NULL(res);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), k_pick);
+    /* Top 4 DESC: 99, 98, 97, 96. */
+    ray_t* v_col = ray_table_get_col(res, s_v);
+    for (int64_t i = 0; i < k_pick; i++)
+        TEST_ASSERT_EQ_I(((int64_t*)ray_data(v_col))[i], N - 1 - i);
+    ray_release(res); ray_release(where_expr); ray_release(tbl);
+    PASS();
+}
+
+/* I16 sort key with nulls — exercises the null-aware leg (lines 134-139)
+ * in combination with the esz==2 compare path. */
+static test_result_t test_topk_i16_with_nulls(void) {
+    int64_t N = 20;
+    ray_t* kc  = ray_vec_new(RAY_I16, N); kc->len  = N;
+    ray_t* sc  = ray_vec_new(RAY_I64, N); sc->len  = N;
+    int16_t* kd = (int16_t*)ray_data(kc);
+    int64_t* sd = (int64_t*)ray_data(sc);
+    for (int64_t i = 0; i < N; i++) { kd[i] = (int16_t)i; sd[i] = i; }
+    ray_vec_set_null(kc, 0, true);
+    ray_vec_set_null(kc, 5, true);
+
+    int64_t s_k   = ray_sym_intern("k",   1);
+    int64_t s_sel = ray_sym_intern("sel", 3);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, s_k,   kc);  ray_release(kc);
+    tbl = ray_table_add_col(tbl, s_sel, sc);   ray_release(sc);
+
+    ray_t* where_expr = ray_parse("(>= sel 0)");
+    int64_t sort_keys[1]  = { s_k };
+    uint8_t sort_descs[1] = { 0 };  /* ASC, NULLS LAST */
+    int64_t out_syms[2]   = { s_k, s_sel };
+    int64_t k_pick = 5;
+    ray_t* res = ray_fused_topk_select(tbl, where_expr,
+                                       sort_keys, sort_descs, 1, k_pick,
+                                       out_syms, NULL, 2);
+    TEST_ASSERT_NOT_NULL(res);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), k_pick);
+    /* Non-null I16 ASC: 1,2,3,4,6 (skipping nulls at 0 and 5). */
+    ray_t* k_col  = ray_table_get_col(res, s_k);
+    int16_t expect[] = {1, 2, 3, 4, 6};
+    for (int64_t i = 0; i < k_pick; i++) {
+        TEST_ASSERT_FALSE(ray_vec_is_null(k_col, i));
+        TEST_ASSERT_EQ_I((int64_t)((int16_t*)ray_data(k_col))[i], expect[i]);
+    }
+    ray_release(res); ray_release(where_expr); ray_release(tbl);
+    PASS();
+}
+
+/* AND predicate — multi-clause WHERE exercises the compound-pred path
+ * in fp_compile_pred through fused_topk. */
+static test_result_t test_topk_and_pred(void) {
+    int64_t N = 100;
+    ray_t* gc = ray_vec_new(RAY_I64, N); gc->len = N;
+    ray_t* vc = ray_vec_new(RAY_I64, N); vc->len = N;
+    int64_t* gd = (int64_t*)ray_data(gc);
+    int64_t* vd = (int64_t*)ray_data(vc);
+    for (int64_t i = 0; i < N; i++) { gd[i] = i % 10; vd[i] = i; }
+    int64_t s_g = ray_sym_intern("g", 1);
+    int64_t s_v = ray_sym_intern("v", 1);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, s_g, gc); ray_release(gc);
+    tbl = ray_table_add_col(tbl, s_v, vc); ray_release(vc);
+
+    /* WHERE g >= 5 AND g < 8 — rows where g in {5,6,7}. */
+    ray_t* where_expr = ray_parse("(and (>= g 5) (< g 8))");
+    TEST_ASSERT_NOT_NULL(where_expr);
+    int64_t sort_keys[1]  = { s_v };
+    uint8_t sort_descs[1] = { 0 };
+    int64_t out_syms[2]   = { s_v, s_g };
+    int64_t k_pick = 5;
+    ray_t* res = ray_fused_topk_select(tbl, where_expr,
+                                       sort_keys, sort_descs, 1, k_pick,
+                                       out_syms, NULL, 2);
+    TEST_ASSERT_NOT_NULL(res);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), k_pick);
+    /* Smallest v where g in {5,6,7}: v=5,6,7,15,16. */
+    ray_t* v_col = ray_table_get_col(res, s_v);
+    int64_t expect_v[] = {5, 6, 7, 15, 16};
+    for (int64_t i = 0; i < k_pick; i++)
+        TEST_ASSERT_EQ_I(((int64_t*)ray_data(v_col))[i], expect_v[i]);
+    ray_release(res); ray_release(where_expr); ray_release(tbl);
+    PASS();
+}
+
+/* gate: sort key column not found in table (line 288). */
+static test_result_t test_topk_gate_sort_key_missing(void) {
+    int64_t N = 50;
+    ray_t* tbl = make_i64_table(N);
+    ray_t* where_expr = ray_parse("(>= v 0)");
+    int64_t s_v       = ray_sym_intern("v",     1);
+    int64_t s_missing = ray_sym_intern("noexist", 7);
+    int64_t sort_keys[1]  = { s_missing };
+    uint8_t sort_descs[1] = { 0 };
+    int64_t out_syms[1]   = { s_v };
+    ray_t* res = ray_fused_topk_select(tbl, where_expr,
+                                       sort_keys, sort_descs, 1, 3,
+                                       out_syms, NULL, 1);
+    TEST_ASSERT_NULL(res);
+    ray_release(where_expr); ray_release(tbl);
+    PASS();
+}
+
+/* gate: output column not found in table (line 275). */
+static test_result_t test_topk_gate_out_col_missing(void) {
+    int64_t N = 50;
+    ray_t* tbl = make_i64_table(N);
+    ray_t* where_expr = ray_parse("(>= v 0)");
+    int64_t s_v       = ray_sym_intern("v",     1);
+    int64_t s_missing = ray_sym_intern("noexist", 7);
+    int64_t sort_keys[1]  = { s_v };
+    uint8_t sort_descs[1] = { 0 };
+    int64_t out_syms[1]   = { s_missing };
+    ray_t* res = ray_fused_topk_select(tbl, where_expr,
+                                       sort_keys, sort_descs, 1, 3,
+                                       out_syms, NULL, 1);
+    TEST_ASSERT_NULL(res);
+    ray_release(where_expr); ray_release(tbl);
+    PASS();
+}
+
+/* K=1 edge case — minimum heap size; sift_down is a no-op, but
+ * the heap-reject-fast path (fpk_cmp >= 0 continue) fires on every
+ * row after the first. */
+static test_result_t test_topk_k_equals_one(void) {
+    int64_t N = 50;
+    ray_t* tbl = make_i64_table(N);
+    ray_t* where_expr = ray_parse("(>= v 0)");
+    int64_t s_v = ray_sym_intern("v", 1);
+    int64_t sort_keys[1]  = { s_v };
+    uint8_t sort_descs[1] = { 0 };  /* ASC */
+    int64_t out_syms[1]   = { s_v };
+    ray_t* res = ray_fused_topk_select(tbl, where_expr,
+                                       sort_keys, sort_descs, 1, 1,
+                                       out_syms, NULL, 1);
+    TEST_ASSERT_NOT_NULL(res);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 1);
+    ray_t* v_col = ray_table_get_col(res, s_v);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(v_col))[0], 0);
+    ray_release(res); ray_release(where_expr); ray_release(tbl);
+    PASS();
+}
+
+/* K=1 DESC — minimum heap descending. */
+static test_result_t test_topk_k_one_desc(void) {
+    int64_t N = 50;
+    ray_t* tbl = make_i64_table(N);
+    ray_t* where_expr = ray_parse("(>= v 0)");
+    int64_t s_v = ray_sym_intern("v", 1);
+    int64_t sort_keys[1]  = { s_v };
+    uint8_t sort_descs[1] = { 1 };  /* DESC */
+    int64_t out_syms[1]   = { s_v };
+    ray_t* res = ray_fused_topk_select(tbl, where_expr,
+                                       sort_keys, sort_descs, 1, 1,
+                                       out_syms, NULL, 1);
+    TEST_ASSERT_NOT_NULL(res);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 1);
+    ray_t* v_col = ray_table_get_col(res, s_v);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(v_col))[0], N - 1);
+    ray_release(res); ray_release(where_expr); ray_release(tbl);
+    PASS();
+}
+
+/* SYM key with W64 width — exercises read_by_esz esz=8 through SYM path
+ * (line 142).  W8 is skipped because sym IDs from ray_sym_intern may
+ * exceed 255 after other tests have interned symbols, making truncation
+ * unavoidable.  W64 is a safe large-width alternative. */
+static test_result_t test_topk_sym_key_w64(void) {
+    int64_t N = 30;
+    ray_t* sc = ray_sym_vec_new(RAY_SYM_W64, N);
+    sc->len = N;
+    int64_t s_aa = ray_sym_intern("aa", 2);
+    int64_t s_bb = ray_sym_intern("bb", 2);
+    int64_t s_cc = ray_sym_intern("cc", 2);
+    int64_t syms[3] = { s_aa, s_bb, s_cc };
+    int64_t* d = (int64_t*)ray_data(sc);
+    for (int64_t i = 0; i < N; i++) d[i] = syms[i % 3];
+
+    ray_t* selc = ray_vec_new(RAY_I64, N); selc->len = N;
+    int64_t* sd = (int64_t*)ray_data(selc);
+    for (int64_t i = 0; i < N; i++) sd[i] = i;
+
+    int64_t s_name = ray_sym_intern("name", 4);
+    int64_t s_sel  = ray_sym_intern("sel",  3);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, s_name, sc);   ray_release(sc);
+    tbl = ray_table_add_col(tbl, s_sel,  selc); ray_release(selc);
+
+    ray_t* where_expr = ray_parse("(>= sel 0)");
+    int64_t sort_keys[1]  = { s_name };
+    uint8_t sort_descs[1] = { 0 };  /* ASC */
+    int64_t out_syms[1]   = { s_name };
+    int64_t k_pick = 3;
+    ray_t* res = ray_fused_topk_select(tbl, where_expr,
+                                       sort_keys, sort_descs, 1, k_pick,
+                                       out_syms, NULL, 1);
+    TEST_ASSERT_NOT_NULL(res);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), k_pick);
+    /* ASC: "aa" < "bb" < "cc".  With 10 "aa" rows, top 3 = all "aa". */
+    ray_t* name_col = ray_table_get_col(res, s_name);
+    int64_t got = ((int64_t*)ray_data(name_col))[0];
+    TEST_ASSERT_EQ_I(got, s_aa);
+    ray_release(res); ray_release(where_expr); ray_release(tbl);
+    PASS();
+}
+
+/* SYM key with W16 width — exercises read_by_esz esz=2 through SYM path. */
+static test_result_t test_topk_sym_key_w16(void) {
+    int64_t N = 30;
+    ray_t* sc = ray_sym_vec_new(RAY_SYM_W16, N);
+    sc->len = N;
+    int64_t s_xx = ray_sym_intern("xx", 2);
+    int64_t s_yy = ray_sym_intern("yy", 2);
+    int64_t syms[2] = { s_xx, s_yy };
+    uint16_t* d = (uint16_t*)ray_data(sc);
+    for (int64_t i = 0; i < N; i++) d[i] = (uint16_t)syms[i % 2];
+
+    ray_t* selc = ray_vec_new(RAY_I64, N); selc->len = N;
+    int64_t* sd = (int64_t*)ray_data(selc);
+    for (int64_t i = 0; i < N; i++) sd[i] = i;
+
+    int64_t s_name = ray_sym_intern("name", 4);
+    int64_t s_sel  = ray_sym_intern("sel",  3);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, s_name, sc);   ray_release(sc);
+    tbl = ray_table_add_col(tbl, s_sel,  selc); ray_release(selc);
+
+    ray_t* where_expr = ray_parse("(>= sel 0)");
+    int64_t sort_keys[1]  = { s_name };
+    uint8_t sort_descs[1] = { 0 };  /* ASC */
+    int64_t out_syms[1]   = { s_name };
+    int64_t k_pick = 3;
+    ray_t* res = ray_fused_topk_select(tbl, where_expr,
+                                       sort_keys, sort_descs, 1, k_pick,
+                                       out_syms, NULL, 1);
+    TEST_ASSERT_NOT_NULL(res);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), k_pick);
+    /* ASC: "xx" < "yy".  15 "xx" rows, top 3 = all "xx". */
+    ray_t* name_col = ray_table_get_col(res, s_name);
+    uint16_t got = ((uint16_t*)ray_data(name_col))[0];
+    TEST_ASSERT_EQ_I((int64_t)got, s_xx);
+    ray_release(res); ray_release(where_expr); ray_release(tbl);
+    PASS();
+}
+
+/* gate: tbl is not a table (RAY_TABLE) — passes a vec instead. */
+static test_result_t test_topk_gate_not_table(void) {
+    ray_t* not_a_table = ray_vec_new(RAY_I64, 10);
+    not_a_table->len = 10;
+    ray_t* where_expr = ray_parse("(>= v 0)");
+    int64_t sort_keys[1]  = { 1 };
+    uint8_t sort_descs[1] = { 0 };
+    int64_t out_syms[1]   = { 1 };
+    ray_t* res = ray_fused_topk_select(not_a_table, where_expr,
+                                       sort_keys, sort_descs, 1, 5,
+                                       out_syms, NULL, 1);
+    TEST_ASSERT_NULL(res);
+    ray_release(where_expr); ray_release(not_a_table);
+    PASS();
+}
+
 /* ─── Entry table ──────────────────────────────────────────────────── */
 
 const test_entry_t fused_topk_entries[] = {
@@ -754,5 +1564,42 @@ const test_entry_t fused_topk_entries[] = {
     { "fused_topk/aliased_out",               test_topk_aliased_out,               topk_setup, topk_teardown },
     { "fused_topk/propagates_nullmap",        test_topk_propagates_nullmap,        topk_setup, topk_teardown },
     { "fused_topk/three_keys",                test_topk_three_keys,                topk_setup, topk_teardown },
+    /* Branch-coverage: esz==2 I16 key */
+    { "fused_topk/i16_sort_key",             test_topk_i16_sort_key,              topk_setup, topk_teardown },
+    { "fused_topk/i16_sort_key_desc",        test_topk_i16_sort_key_desc,         topk_setup, topk_teardown },
+    /* Branch-coverage: esz==1 U8/BOOL keys */
+    { "fused_topk/u8_sort_key",              test_topk_u8_sort_key,               topk_setup, topk_teardown },
+    { "fused_topk/u8_sort_key_desc",         test_topk_u8_sort_key_desc,          topk_setup, topk_teardown },
+    { "fused_topk/bool_sort_key",            test_topk_bool_sort_key,             topk_setup, topk_teardown },
+    /* Branch-coverage: temporal type gates */
+    { "fused_topk/date_sort_key",            test_topk_date_sort_key,             topk_setup, topk_teardown },
+    { "fused_topk/time_sort_key",            test_topk_time_sort_key,             topk_setup, topk_teardown },
+    { "fused_topk/timestamp_sort_key",       test_topk_timestamp_sort_key,        topk_setup, topk_teardown },
+    /* Branch-coverage: SYM DESC */
+    { "fused_topk/sym_key_desc",             test_topk_sym_key_desc,              topk_setup, topk_teardown },
+    /* Branch-coverage: both-null tie */
+    { "fused_topk/both_nulls_tie",           test_topk_both_nulls_tie,            topk_setup, topk_teardown },
+    /* Branch-coverage: selective WHERE + fewer-than-K */
+    { "fused_topk/selective_where",          test_topk_selective_where,           topk_setup, topk_teardown },
+    { "fused_topk/fewer_than_k_passing",     test_topk_fewer_than_k_passing,      topk_setup, topk_teardown },
+    /* Branch-coverage: multi-key null tiebreak */
+    { "fused_topk/multi_key_null_tiebreak",  test_topk_multi_key_null_tiebreak,   topk_setup, topk_teardown },
+    /* Branch-coverage: I64 DESC */
+    { "fused_topk/i64_desc",                 test_topk_i64_desc,                  topk_setup, topk_teardown },
+    /* Branch-coverage: I16 with nulls */
+    { "fused_topk/i16_with_nulls",           test_topk_i16_with_nulls,            topk_setup, topk_teardown },
+    /* Branch-coverage: AND predicate */
+    { "fused_topk/and_pred",                 test_topk_and_pred,                  topk_setup, topk_teardown },
+    /* Branch-coverage: gate rejections */
+    { "fused_topk/gate_sort_key_missing",    test_topk_gate_sort_key_missing,     topk_setup, topk_teardown },
+    { "fused_topk/gate_out_col_missing",     test_topk_gate_out_col_missing,      topk_setup, topk_teardown },
+    /* Branch-coverage: K=1 edge */
+    { "fused_topk/k_equals_one",             test_topk_k_equals_one,              topk_setup, topk_teardown },
+    { "fused_topk/k_one_desc",               test_topk_k_one_desc,               topk_setup, topk_teardown },
+    /* Branch-coverage: SYM widths W16/W64 */
+    { "fused_topk/sym_key_w64",             test_topk_sym_key_w64,               topk_setup, topk_teardown },
+    { "fused_topk/sym_key_w16",             test_topk_sym_key_w16,               topk_setup, topk_teardown },
+    /* Branch-coverage: non-table tbl gate */
+    { "fused_topk/gate_not_table",          test_topk_gate_not_table,            topk_setup, topk_teardown },
     { NULL, NULL, NULL, NULL },
 };

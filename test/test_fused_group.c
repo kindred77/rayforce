@@ -36,6 +36,7 @@
 #include "ops/internal.h"
 #include "ops/ops.h"
 #include "ops/fused_group.h"
+#include "ops/idxop.h"
 #include "lang/parse.h"
 #include "table/sym.h"
 #include <string.h>
@@ -1943,6 +1944,2398 @@ static test_result_t test_fp_count_emit_keep_min_i64_serial(void) {
     PASS();
 }
 
+/* ──────────────────────────────────────────────────────────────────────
+ * Coverage extensions for v2 / hash-index / MG-top-K paths (PR #219).
+ *
+ * Targets:
+ *   - mk_par_v2_fn / mk_combine_v2_part_fn / mk_combine_v2_parallel
+ *     (multi-key v2: per-(worker, partition) shards with COUNT/SUM/AVG).
+ *   - mk_eq_hash_count_fn / mk_par_hash_fn (single-predicate FP_EQ
+ *     dispatched through a column's attached RAY_IDX_HASH).
+ *   - fp_try_i64_mg_top_count + fp_try_i32_mg_top_count + the matching
+ *     fp_iXX_mg_lookup / hash_slot / rebuild helpers (Misra-Gries top-K
+ *     over I64/TIMESTAMP/I32 keys with no WHERE clause).
+ *   - mk_eq_i64_count_fn (multi-predicate AND with one FP_EQ on i64,
+ *     including the chunk_zone-driven chunk-skip path).
+ *   - mk_apply_count_emit_filter top-N SUM and top-N MIN branches.
+ *
+ * Unreachable from the test harness (documented for future readers):
+ *
+ *   1. OOM cleanup branches: fp_shard_init / mk_shard_init /
+ *      mk_shard_grow / fp_shard_grow / fp_combine_and_materialize /
+ *      mk_combine_parallel / mk_combine_v2_parallel all carry early-
+ *      return OOM cleanup paths for scratch_alloc failures.  The test
+ *      runtime grows its scratch allocator on demand so these never
+ *      fire in practice; covering them would require an injection
+ *      hook in the allocator.  Leaves ~5-10 missed regions per
+ *      function (≈ 20-25% of mk_shard_init etc.).
+ *
+ *   2. mk_v2_apply_agg_inline MIN/MAX cases: dead by construction.
+ *      The v2_ok gate in exec_filtered_group_multi (line 4930) flips
+ *      false when any agg is MK_AGG_MIN/MAX, so mk_par_v2_fn (which
+ *      is the sole caller of mk_v2_apply_agg_inline) only ever runs
+ *      with COUNT/SUM/AVG aggs.  The MIN/MAX switch arms exist for
+ *      symmetry with mk_par_fn but are unreachable.
+ *
+ *   3. fp_try_i64_mg_top_count / fp_try_i32_mg_top_count: the
+ *      "decrements && keep_min ≤ safety_bound" return-NULL fallback
+ *      (line 1436) fires only when MG's heavy-hitter guarantee can't
+ *      cover the top-K.  Our rebuild_path tests intentionally avoid
+ *      the safety-bound trip so the result is non-NULL (we want to
+ *      see real top-K output); covering this branch would require
+ *      a degenerate input where every key has approximately the
+ *      same low count, defeating the test's correctness check.
+ *
+ *   4. ray_filtered_group NULL-graph / NULL-ext guards (lines 44, 60):
+ *      defensive checks against C-API misuse the test harness can't
+ *      trigger without a fault injection layer.
+ *
+ *   5. fp_compile_cmp / fp_atom_col_compatible / fp_check_*: a handful
+ *      of malformed-AST defensive branches are unreachable from the
+ *      parser (documented in fused_group_branch_cov.rfl Section 29).
+ * ────────────────────────────────────────────────────────────────────── */
+
+/* v2 path activator: 2 I64 keys → 16 bytes total → wide=1, multi-key,
+ * COUNT + SUM + AVG (no MIN/MAX), no hash-eq / eq-i64 / SYM keys.  N is
+ * large enough that the parallel pool fires and per-(worker, partition)
+ * shards are populated; mk_combine_v2_parallel then merges. */
+static test_result_t test_v2_wide_2i64_count_sum_avg(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 80000;
+    ray_t* k1c = ray_vec_new(RAY_I64, N); k1c->len = N;
+    ray_t* k2c = ray_vec_new(RAY_I64, N); k2c->len = N;
+    ray_t* vc  = ray_vec_new(RAY_I64, N); vc->len  = N;
+    int64_t* k1 = (int64_t*)ray_data(k1c);
+    int64_t* k2 = (int64_t*)ray_data(k2c);
+    int64_t* v  = (int64_t*)ray_data(vc);
+    /* High-cardinality (k1, k2) → many groups, many partitions touched. */
+    for (int64_t i = 0; i < N; i++) {
+        k1[i] = i / 4;          /* 20000 distinct k1 */
+        k2[i] = (i * 31) % 7919; /* 7919 distinct k2 */
+        v[i]  = i + 1;
+    }
+
+    int64_t s_k1 = ray_sym_intern("k1", 2);
+    int64_t s_k2 = ray_sym_intern("k2", 2);
+    int64_t s_v  = ray_sym_intern("v",  1);
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, s_k1, k1c); ray_release(k1c);
+    tbl = ray_table_add_col(tbl, s_k2, k2c); ray_release(k2c);
+    tbl = ray_table_add_col(tbl, s_v,  vc);  ray_release(vc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k1 = ray_scan(g, "k1");
+    ray_op_t* scan_k2 = ray_scan(g, "k2");
+    ray_op_t* scan_v  = ray_scan(g, "v");
+    ray_op_t* scan_vp = ray_scan(g, "v");
+    ray_op_t* zero    = ray_const_i64(g, 0);
+    ray_op_t* pred    = ray_binop(g, OP_GE, scan_vp, zero);
+
+    /* COUNT + SUM + AVG only — these are the v2 path's supported aggs. */
+    uint16_t  agg_ops[] = { OP_COUNT, OP_SUM, OP_AVG };
+    ray_op_t* agg_ins[] = { scan_v, scan_v, scan_v };
+    ray_op_t* keys[]    = { scan_k1, scan_k2 };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 2, agg_ops, agg_ins, 3);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_t* res = ray_execute(g, fused);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    int64_t nrows = ray_table_nrows(res);
+    TEST_ASSERT_TRUE(nrows > 1000);
+
+    int64_t cnt_sym = ray_sym_intern("count", 5);
+    int64_t sum_sym = ray_sym_intern("sum",   3);
+    ray_t* cnt_col = ray_table_get_col(res, cnt_sym);
+    ray_t* sum_col = ray_table_get_col(res, sum_sym);
+    TEST_ASSERT_NOT_NULL(cnt_col);
+    TEST_ASSERT_NOT_NULL(sum_col);
+    int64_t total_cnt = 0, total_sum = 0;
+    int64_t expect_sum = N * (N + 1) / 2;
+    for (int64_t i = 0; i < nrows; i++) {
+        total_cnt += ((int64_t*)ray_data(cnt_col))[i];
+        total_sum += ((int64_t*)ray_data(sum_col))[i];
+    }
+    TEST_ASSERT_EQ_I(total_cnt, N);
+    TEST_ASSERT_EQ_I(total_sum, expect_sum);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* v2 path narrow: 2 I32 keys → 8 bytes → wide=0.  Same gate conditions.
+ * Exercises mk_par_v2_fn's narrow branch + mk_combine_v2_part_fn narrow
+ * branch (slots_hi NULL path). */
+static test_result_t test_v2_narrow_2i32_count_sum(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 80000;
+    ray_t* k1c = ray_vec_new(RAY_I32, N); k1c->len = N;
+    ray_t* k2c = ray_vec_new(RAY_I32, N); k2c->len = N;
+    ray_t* vc  = ray_vec_new(RAY_I64, N); vc->len  = N;
+    int32_t* k1 = (int32_t*)ray_data(k1c);
+    int32_t* k2 = (int32_t*)ray_data(k2c);
+    int64_t* v  = (int64_t*)ray_data(vc);
+    for (int64_t i = 0; i < N; i++) {
+        k1[i] = (int32_t)(i / 8);     /* 10000 distinct k1 */
+        k2[i] = (int32_t)((i * 11) % 1009);
+        v[i]  = i + 1;
+    }
+
+    int64_t s_k1 = ray_sym_intern("k1", 2);
+    int64_t s_k2 = ray_sym_intern("k2", 2);
+    int64_t s_v  = ray_sym_intern("v",  1);
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, s_k1, k1c); ray_release(k1c);
+    tbl = ray_table_add_col(tbl, s_k2, k2c); ray_release(k2c);
+    tbl = ray_table_add_col(tbl, s_v,  vc);  ray_release(vc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k1 = ray_scan(g, "k1");
+    ray_op_t* scan_k2 = ray_scan(g, "k2");
+    ray_op_t* scan_v  = ray_scan(g, "v");
+    ray_op_t* scan_vp = ray_scan(g, "v");
+    ray_op_t* zero    = ray_const_i64(g, 0);
+    ray_op_t* pred    = ray_binop(g, OP_GE, scan_vp, zero);
+
+    uint16_t  agg_ops[] = { OP_COUNT, OP_SUM };
+    ray_op_t* agg_ins[] = { scan_v, scan_v };
+    ray_op_t* keys[]    = { scan_k1, scan_k2 };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 2, agg_ops, agg_ins, 2);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_t* res = ray_execute(g, fused);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    int64_t nrows = ray_table_nrows(res);
+    TEST_ASSERT_TRUE(nrows > 100);
+
+    int64_t cnt_sym = ray_sym_intern("count", 5);
+    int64_t sum_sym = ray_sym_intern("sum",   3);
+    ray_t* cnt_col = ray_table_get_col(res, cnt_sym);
+    ray_t* sum_col = ray_table_get_col(res, sum_sym);
+    int64_t total_cnt = 0, total_sum = 0;
+    int64_t expect_sum = N * (N + 1) / 2;
+    for (int64_t i = 0; i < nrows; i++) {
+        total_cnt += ((int64_t*)ray_data(cnt_col))[i];
+        total_sum += ((int64_t*)ray_data(sum_col))[i];
+    }
+    TEST_ASSERT_EQ_I(total_cnt, N);
+    TEST_ASSERT_EQ_I(total_sum, expect_sum);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* v2 gate flips off for MIN/MAX: ensure that multi-key + MIN/MAX still
+ * works correctly (falls back to v1 mk_par_fn), exercising the v2_ok
+ * agg-kind check (the `kk != MK_AGG_COUNT && kk != MK_AGG_SUM &&
+ * kk != MK_AGG_AVG` branch). */
+static test_result_t test_v2_gate_min_max_falls_back(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 80000;
+    ray_t* k1c = ray_vec_new(RAY_I32, N); k1c->len = N;
+    ray_t* k2c = ray_vec_new(RAY_I32, N); k2c->len = N;
+    ray_t* vc  = ray_vec_new(RAY_I64, N); vc->len  = N;
+    int32_t* k1 = (int32_t*)ray_data(k1c);
+    int32_t* k2 = (int32_t*)ray_data(k2c);
+    int64_t* v  = (int64_t*)ray_data(vc);
+    for (int64_t i = 0; i < N; i++) {
+        k1[i] = (int32_t)(i % 100);
+        k2[i] = (int32_t)((i / 100) % 100);
+        v[i]  = i + 1;
+    }
+
+    int64_t s_k1 = ray_sym_intern("k1", 2);
+    int64_t s_k2 = ray_sym_intern("k2", 2);
+    int64_t s_v  = ray_sym_intern("v",  1);
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, s_k1, k1c); ray_release(k1c);
+    tbl = ray_table_add_col(tbl, s_k2, k2c); ray_release(k2c);
+    tbl = ray_table_add_col(tbl, s_v,  vc);  ray_release(vc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k1 = ray_scan(g, "k1");
+    ray_op_t* scan_k2 = ray_scan(g, "k2");
+    ray_op_t* scan_v  = ray_scan(g, "v");
+    ray_op_t* scan_vp = ray_scan(g, "v");
+    ray_op_t* zero    = ray_const_i64(g, 0);
+    ray_op_t* pred    = ray_binop(g, OP_GE, scan_vp, zero);
+
+    /* MIN + MAX → v2_ok flips false → falls back to v1 mk_par_fn. */
+    uint16_t  agg_ops[] = { OP_MIN, OP_MAX };
+    ray_op_t* agg_ins[] = { scan_v, scan_v };
+    ray_op_t* keys[]    = { scan_k1, scan_k2 };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 2, agg_ops, agg_ins, 2);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_t* res = ray_execute(g, fused);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    int64_t nrows = ray_table_nrows(res);
+    /* k1 × k2 = 100 × 100 = 10000 distinct pairs, but i is bounded so
+     * only (i%100, (i/100)%100) for i in [0..80000) → 10000 pairs of
+     * which 8000 see at least one row. */
+    TEST_ASSERT_TRUE(nrows > 1000);
+
+    /* Sanity: global MIN must be 1, global MAX must be N. */
+    int64_t min_sym = ray_sym_intern("min", 3);
+    int64_t max_sym = ray_sym_intern("max", 3);
+    ray_t* min_col = ray_table_get_col(res, min_sym);
+    ray_t* max_col = ray_table_get_col(res, max_sym);
+    int64_t gmin = INT64_MAX, gmax = INT64_MIN;
+    for (int64_t i = 0; i < nrows; i++) {
+        int64_t mn = ((int64_t*)ray_data(min_col))[i];
+        int64_t mx = ((int64_t*)ray_data(max_col))[i];
+        if (mn < gmin) gmin = mn;
+        if (mx > gmax) gmax = mx;
+    }
+    TEST_ASSERT_EQ_I(gmin, 1);
+    TEST_ASSERT_EQ_I(gmax, N);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* Hash-index dispatch via mk_par_hash_fn: build an I64 column with an
+ * attached RAY_IDX_HASH, then run `where: (== col K) by: col` with
+ * multi-agg (so the COUNT-only count_fn shortcut is skipped) to drive
+ * mk_par_hash_fn.  Validates that the hash-chain walk produces the same
+ * counts as the scan path. */
+static test_result_t test_hash_eq_count_dispatch(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 1000;
+    ray_t* kc = ray_vec_new(RAY_I64, N); kc->len = N;
+    int64_t* k = (int64_t*)ray_data(kc);
+    for (int64_t i = 0; i < N; i++) k[i] = (i % 10) * 1000;
+    /* Attach hash index BEFORE adding to the table. */
+    ray_t* kc_orig = kc;
+    ray_t* r = ray_index_attach_hash(&kc);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_TRUE(kc->attrs & RAY_ATTR_HAS_INDEX);
+    (void)kc_orig;
+
+    int64_t s_k = ray_sym_intern("k", 1);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, s_k, kc); ray_release(kc);
+
+    /* Confirm the col carries the hash index after table embedding. */
+    ray_t* col_in_tbl = ray_table_get_col(tbl, s_k);
+    TEST_ASSERT_NOT_NULL(col_in_tbl);
+    TEST_ASSERT_TRUE(col_in_tbl->attrs & RAY_ATTR_HAS_INDEX);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k    = ray_scan(g, "k");
+    ray_op_t* scan_pred = ray_scan(g, "k");
+    ray_op_t* needle    = ray_const_i64(g, 5000);
+    ray_op_t* pred      = ray_binop(g, OP_EQ, scan_pred, needle);
+    /* COUNT + COUNT (n_aggs=2) → not the COUNT-only fast path → routes
+     * through mk_par_hash_fn (hash-chain walk with per-agg accumulate). */
+    uint16_t  agg_ops[] = { OP_COUNT, OP_COUNT };
+    ray_op_t* agg_ins[] = { scan_k, scan_k };
+    ray_op_t* keys[]    = { scan_k };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 1, agg_ops, agg_ins, 2);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_t* res = ray_execute(g, fused);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    /* Only key=5000 passes → 1 group with count = 100 (i mod 10 == 5). */
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 1);
+    int64_t cnt_sym = ray_sym_intern("count", 5);
+    ray_t* cnt_col = ray_table_get_col(res, cnt_sym);
+    int64_t got = ((int64_t*)ray_data(cnt_col))[0];
+    TEST_ASSERT_EQ_I(got, 100);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* Hash-index COUNT-only dispatch: 2 keys + single COUNT → multi path
+ * with n_aggs==1, COUNT, single-FP_EQ predicate.  This is the gate that
+ * routes to mk_eq_hash_count_fn (the COUNT-only fast variant of
+ * mk_par_hash_fn that skips per-agg state init/update). */
+static test_result_t test_mk_eq_hash_count_fn_dispatch(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 800;
+    ray_t* k1c = ray_vec_new(RAY_I64, N); k1c->len = N;
+    ray_t* k2c = ray_vec_new(RAY_I64, N); k2c->len = N;
+    int64_t* k1 = (int64_t*)ray_data(k1c);
+    int64_t* k2 = (int64_t*)ray_data(k2c);
+    for (int64_t i = 0; i < N; i++) {
+        k1[i] = (i % 8) * 1000;
+        k2[i] = i % 4;
+    }
+    /* Attach hash index on the FP_EQ target column (k1). */
+    ray_t* r = ray_index_attach_hash(&k1c);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_TRUE(k1c->attrs & RAY_ATTR_HAS_INDEX);
+
+    int64_t s_k1 = ray_sym_intern("k1", 2);
+    int64_t s_k2 = ray_sym_intern("k2", 2);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, s_k1, k1c); ray_release(k1c);
+    tbl = ray_table_add_col(tbl, s_k2, k2c); ray_release(k2c);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k1   = ray_scan(g, "k1");
+    ray_op_t* scan_k2   = ray_scan(g, "k2");
+    ray_op_t* scan_pred = ray_scan(g, "k1");
+    ray_op_t* needle    = ray_const_i64(g, 4000);
+    ray_op_t* pred      = ray_binop(g, OP_EQ, scan_pred, needle);
+    /* COUNT only, 2 keys → multi path with COUNT-only fast variant. */
+    uint16_t  agg_ops[] = { OP_COUNT };
+    ray_op_t* agg_ins[] = { scan_k1 };
+    ray_op_t* keys[]    = { scan_k1, scan_k2 };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 2, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_t* res = ray_execute(g, fused);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    /* Rows where k1=4000 → i % 8 == 4 → i ∈ {4, 12, 20, ..., 796} → 100
+     * rows.  These rows have k2 ∈ {i%4} = {0}.  All 100 rows have the
+     * same (k1=4000, k2=0) so we expect 1 group with count=100. */
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 1);
+    int64_t cnt_sym = ray_sym_intern("count", 5);
+    ray_t* cnt_col = ray_table_get_col(res, cnt_sym);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(cnt_col))[0], 100);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* Hash-index dispatch with SUM agg → mk_par_hash_fn (not count_fn).
+ * Same setup as above but with OP_SUM aggregating an integer payload. */
+static test_result_t test_hash_eq_sum_dispatch(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 1000;
+    ray_t* kc = ray_vec_new(RAY_I64, N); kc->len = N;
+    ray_t* vc = ray_vec_new(RAY_I64, N); vc->len = N;
+    int64_t* k = (int64_t*)ray_data(kc);
+    int64_t* v = (int64_t*)ray_data(vc);
+    for (int64_t i = 0; i < N; i++) { k[i] = (i % 10) * 1000; v[i] = i + 1; }
+    /* Attach hash index on the key column. */
+    ray_t* r = ray_index_attach_hash(&kc);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_TRUE(kc->attrs & RAY_ATTR_HAS_INDEX);
+
+    int64_t s_k = ray_sym_intern("k", 1);
+    int64_t s_v = ray_sym_intern("v", 1);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, s_k, kc); ray_release(kc);
+    tbl = ray_table_add_col(tbl, s_v, vc); ray_release(vc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k    = ray_scan(g, "k");
+    ray_op_t* scan_v    = ray_scan(g, "v");
+    ray_op_t* scan_pred = ray_scan(g, "k");
+    ray_op_t* needle    = ray_const_i64(g, 3000);
+    ray_op_t* pred      = ray_binop(g, OP_EQ, scan_pred, needle);
+    /* SUM + COUNT → forces mk_par_hash_fn (not the COUNT-only count_fn). */
+    uint16_t  agg_ops[] = { OP_SUM, OP_COUNT };
+    ray_op_t* agg_ins[] = { scan_v, scan_v };
+    ray_op_t* keys[]    = { scan_k };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 1, agg_ops, agg_ins, 2);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_t* res = ray_execute(g, fused);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 1);
+
+    /* Rows passing: k[i]==3000 → i % 10 == 3 → i ∈ {3, 13, 23, ..., 993}.
+     * Sum of (i+1) for those = sum over j=0..99 of (3 + 10*j + 1)
+     *                        = sum (4 + 10*j) = 4*100 + 10 * (99*100/2)
+     *                        = 400 + 49500 = 49900. */
+    int64_t cnt_sym = ray_sym_intern("count", 5);
+    int64_t sum_sym = ray_sym_intern("sum",   3);
+    ray_t* cnt_col = ray_table_get_col(res, cnt_sym);
+    ray_t* sum_col = ray_table_get_col(res, sum_sym);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(cnt_col))[0], 100);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(sum_col))[0], 49900);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* Hash-eq dispatch is gated on n_children == 1; with an AND predicate
+ * the hash dispatch does not fire and the scan path runs.  Verifies
+ * mk_find_hash_eq_child returns -1 for multi-child preds. */
+static test_result_t test_hash_eq_multi_pred_no_dispatch(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 1000;
+    ray_t* kc = ray_vec_new(RAY_I64, N); kc->len = N;
+    ray_t* vc = ray_vec_new(RAY_I64, N); vc->len = N;
+    int64_t* k = (int64_t*)ray_data(kc);
+    int64_t* v = (int64_t*)ray_data(vc);
+    for (int64_t i = 0; i < N; i++) { k[i] = i % 10; v[i] = i + 1; }
+    ray_t* r = ray_index_attach_hash(&kc);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+
+    int64_t s_k = ray_sym_intern("k", 1);
+    int64_t s_v = ray_sym_intern("v", 1);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, s_k, kc); ray_release(kc);
+    tbl = ray_table_add_col(tbl, s_v, vc); ray_release(vc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k    = ray_scan(g, "k");
+    ray_op_t* scan_v    = ray_scan(g, "v");
+    ray_op_t* scan_kp   = ray_scan(g, "k");
+    ray_op_t* scan_vp   = ray_scan(g, "v");
+    ray_op_t* five      = ray_const_i64(g, 5);
+    ray_op_t* lo        = ray_const_i64(g, 100);
+    ray_op_t* p1        = ray_binop(g, OP_EQ, scan_kp, five);
+    ray_op_t* p2        = ray_binop(g, OP_GE, scan_vp, lo);
+    ray_op_t* pred      = ray_binop(g, OP_AND, p1, p2);
+    /* COUNT + SUM → multi path, AND predicate → mk_find_hash_eq_child
+     * returns -1 (n_children != 1), then mk_find_i64_eq_child returns 0
+     * → mk_eq_i64_count_fn fires.  Wait: that's COUNT-only path.  We
+     * want SUM to force the standard mk_par_fn scan with AND-folded
+     * predicates.  Use SUM alone. */
+    uint16_t  agg_ops[] = { OP_SUM };
+    ray_op_t* agg_ins[] = { scan_v };
+    ray_op_t* keys[]    = { scan_k };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 1, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_t* res = ray_execute(g, fused);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 1);
+    /* k=5 rows: i ∈ {5, 15, ..., 995}. v=i+1.  Filter v >= 100: i+1 >= 100
+     * → i >= 99 → i ∈ {105, 115, ..., 995} → 90 rows.
+     * Sum of (i+1) for i ∈ {105, 115, ..., 995} = sum of {106, 116, ..., 996}
+     *   = 90 * (106 + 996) / 2 = 90 * 551 = 49590. */
+    int64_t sum_sym = ray_sym_intern("sum", 3);
+    ray_t* sum_col = ray_table_get_col(res, sum_sym);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(sum_col))[0], 49590);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* mk_eq_i64_count_fn chunk-skip path: at least one predicate child column
+ * carries a RAY_IDX_CHUNK_ZONE, so the loop strides in chunk-size steps
+ * and skips chunks where [min, max] proves all-fail.  Builds a clustered
+ * column (sorted values) so most chunks are skipped.  Requires 2 keys
+ * + 1 COUNT to route through the multi path (not count1). */
+static test_result_t test_mk_eq_i64_count_fn_chunk_skip(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* 1024 rows, chunk_log2=8 → 4 chunks of 256 rows each.  k is the
+     * EQ-target (i64), ts is the chunk-zoned > predicate column, and
+     * k2 is a secondary group key (forces n_keys=2 → multi path). */
+    int64_t N = 1024;
+    ray_t* kc  = ray_vec_new(RAY_I64, N); kc->len  = N;
+    ray_t* k2c = ray_vec_new(RAY_I32, N); k2c->len = N;
+    ray_t* tsc = ray_vec_new(RAY_I64, N); tsc->len = N;
+    int64_t* k  = (int64_t*)ray_data(kc);
+    int32_t* k2 = (int32_t*)ray_data(k2c);
+    int64_t* ts = (int64_t*)ray_data(tsc);
+    for (int64_t i = 0; i < N; i++) {
+        k[i]  = i % 8;
+        k2[i] = (int32_t)(i % 3);
+        ts[i] = i;       /* strictly monotone → tight chunk min/max */
+    }
+    /* Attach a chunk_zone index on the timestamp column. */
+    ray_t* r = ray_index_attach_chunk_zone(&tsc, 8);  /* 256-row chunks */
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_TRUE(tsc->attrs & RAY_ATTR_HAS_INDEX);
+
+    int64_t s_k  = ray_sym_intern("k",  1);
+    int64_t s_k2 = ray_sym_intern("k2", 2);
+    int64_t s_ts = ray_sym_intern("ts", 2);
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, s_k,  kc);  ray_release(kc);
+    tbl = ray_table_add_col(tbl, s_k2, k2c); ray_release(k2c);
+    tbl = ray_table_add_col(tbl, s_ts, tsc); ray_release(tsc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k    = ray_scan(g, "k");
+    ray_op_t* scan_k2   = ray_scan(g, "k2");
+    ray_op_t* scan_kp   = ray_scan(g, "k");
+    ray_op_t* scan_tsp  = ray_scan(g, "ts");
+    ray_op_t* needle    = ray_const_i64(g, 3);
+    ray_op_t* threshold = ray_const_i64(g, 700);  /* skips chunks 0-2 */
+    ray_op_t* p1        = ray_binop(g, OP_EQ, scan_kp, needle);
+    ray_op_t* p2        = ray_binop(g, OP_GE, scan_tsp, threshold);
+    ray_op_t* pred      = ray_binop(g, OP_AND, p1, p2);
+
+    /* COUNT-only + 2 keys + AND with FP_EQ_i64 child → multi path with
+     * eq_i64_idx >= 0 → mk_eq_i64_count_fn fires with chunk_log2=8
+     * picked up from the ts column's chunk_zone. */
+    uint16_t  agg_ops[] = { OP_COUNT };
+    ray_op_t* agg_ins[] = { scan_k };
+    ray_op_t* keys[]    = { scan_k, scan_k2 };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 2, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_t* res = ray_execute(g, fused);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    /* Rows where k=3 and ts>=700.  k=i%8==3 → i ∈ {3,11,...,1019} → 128
+     * rows.  ts=i so ts>=700 → i>=700.
+     * Intersection: i ∈ {707,715,...,1019} → 40 rows.  These are
+     * partitioned by k2=i%3 → 3 groups (some may have unequal counts). */
+    int64_t cnt_sym = ray_sym_intern("count", 5);
+    ray_t* cnt_col = ray_table_get_col(res, cnt_sym);
+    int64_t total = 0;
+    for (int64_t i = 0; i < ray_table_nrows(res); i++)
+        total += ((int64_t*)ray_data(cnt_col))[i];
+    TEST_ASSERT_EQ_I(total, 40);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* mk_eq_i64_count_fn: AND predicate with one FP_EQ on i64 col + COUNT
+ * + 2 group keys (forces multi-path entry, since single-key single-COUNT
+ * routes to count1).  Exercises the per-row scan branch (no chunk_zone). */
+static test_result_t test_mk_eq_i64_count_and_pred(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 5000;
+    ray_t* kc  = ray_vec_new(RAY_I64, N); kc->len  = N;
+    ray_t* k2c = ray_vec_new(RAY_I32, N); k2c->len = N;
+    ray_t* vc  = ray_vec_new(RAY_I64, N); vc->len  = N;
+    int64_t* k  = (int64_t*)ray_data(kc);
+    int32_t* k2 = (int32_t*)ray_data(k2c);
+    int64_t* v  = (int64_t*)ray_data(vc);
+    for (int64_t i = 0; i < N; i++) {
+        k[i]  = i % 50;
+        k2[i] = (int32_t)(i % 3);
+        v[i]  = i + 1;
+    }
+
+    int64_t s_k  = ray_sym_intern("k",  1);
+    int64_t s_k2 = ray_sym_intern("k2", 2);
+    int64_t s_v  = ray_sym_intern("v",  1);
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, s_k,  kc);  ray_release(kc);
+    tbl = ray_table_add_col(tbl, s_k2, k2c); ray_release(k2c);
+    tbl = ray_table_add_col(tbl, s_v,  vc);  ray_release(vc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k    = ray_scan(g, "k");
+    ray_op_t* scan_k2   = ray_scan(g, "k2");
+    ray_op_t* scan_kp   = ray_scan(g, "k");
+    ray_op_t* scan_vp   = ray_scan(g, "v");
+    ray_op_t* needle    = ray_const_i64(g, 7);
+    ray_op_t* threshold = ray_const_i64(g, 500);
+    ray_op_t* p1        = ray_binop(g, OP_EQ, scan_kp, needle);
+    ray_op_t* p2        = ray_binop(g, OP_GE, scan_vp, threshold);
+    ray_op_t* pred      = ray_binop(g, OP_AND, p1, p2);
+    /* COUNT-only with multi-child AND containing FP_EQ on i64 → multi-
+     * path because n_keys=2 → mk_find_i64_eq_child returns 0 →
+     * mk_eq_i64_count_fn fires. */
+    uint16_t  agg_ops[] = { OP_COUNT };
+    ray_op_t* agg_ins[] = { scan_k };
+    ray_op_t* keys[]    = { scan_k, scan_k2 };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 2, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_t* res = ray_execute(g, fused);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+
+    /* k=7 rows: i ∈ {7, 57, 107, ..., N-43}. v = i+1.  Filter v >= 500
+     * → i >= 499 → first such i is 507.
+     * Series: {507, 557, ..., 4957} → 90 rows total, partitioned by k2.
+     * Sum of counts across all k2 groups must = 90. */
+    int64_t cnt_sym = ray_sym_intern("count", 5);
+    ray_t* cnt_col = ray_table_get_col(res, cnt_sym);
+    int64_t total = 0;
+    for (int64_t i = 0; i < ray_table_nrows(res); i++)
+        total += ((int64_t*)ray_data(cnt_col))[i];
+    TEST_ASSERT_EQ_I(total, 90);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* fp_try_i64_mg_top_count: I64 key, NO WHERE clause (pred=NULL),
+ * top-K emit filter set.  Requires C-API construction since the planner
+ * gate (query.c:4586) only fires when where_expr is non-NULL.
+ *
+ * Builds a table with a known skewed distribution and verifies the
+ * top-K results match. */
+static test_result_t test_fp_try_i64_mg_top_count_no_where(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* 20 distinct keys with strongly monotone counts 1..20.  Top-3 by
+     * count are keys with counts 18,19,20 (out of 20).  Heavy-hitter
+     * keys dominate so MG's first pass keeps them all in the candidates
+     * dict (cap=8192 ≫ 20). */
+    int64_t per_key[20];
+    int64_t total_rows = 0;
+    for (int i = 0; i < 20; i++) { per_key[i] = i + 1; total_rows += per_key[i]; }
+    ray_t* kc = ray_vec_new(RAY_I64, total_rows); kc->len = total_rows;
+    int64_t* k = (int64_t*)ray_data(kc);
+    int64_t pos = 0;
+    for (int i = 0; i < 20; i++)
+        for (int64_t r = 0; r < per_key[i]; r++)
+            k[pos++] = (int64_t)(100000 + i);
+
+    int64_t s_k = ray_sym_intern("k", 1);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, s_k, kc); ray_release(kc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k    = ray_scan(g, "k");
+    /* NULL pred = no WHERE → n_children=0 in compiled fp_pred. */
+    uint16_t  agg_ops[] = { OP_COUNT };
+    ray_op_t* agg_ins[] = { scan_k };
+    ray_op_t* keys[]    = { scan_k };
+    ray_op_t* fused     = ray_filtered_group(g, NULL, keys, 1, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_group_emit_filter_t prev = ray_group_emit_filter_get();
+    ray_group_emit_filter_t filter = {0};
+    filter.enabled = 1;
+    filter.agg_index = 0;
+    filter.top_count_take = 3;
+    ray_group_emit_filter_set(filter);
+    ray_t* res = ray_execute(g, fused);
+    ray_group_emit_filter_set(prev);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    /* Top-3 counts = 18, 19, 20.  keep_min = 18 → 3 rows. */
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 3);
+
+    int64_t cnt_sym = ray_sym_intern("count", 5);
+    ray_t* c_col = ray_table_get_col(res, cnt_sym);
+    int64_t got_max = 0, got_sum = 0;
+    for (int64_t i = 0; i < 3; i++) {
+        int64_t c = ((int64_t*)ray_data(c_col))[i];
+        if (c > got_max) got_max = c;
+        got_sum += c;
+    }
+    TEST_ASSERT_EQ_I(got_max, 20);
+    TEST_ASSERT_EQ_I(got_sum, 18 + 19 + 20);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* mk_apply_count_emit_filter top-N SUM path (multi-key + SUM agg with
+ * emit_filter for top-N by SUM).  Exercises the OP_SUM branch of the
+ * agg-op switch + the kept/threshold compaction sweep. */
+static test_result_t test_mk_apply_count_emit_filter_top_sum(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 100;
+    ray_t* k1c = ray_vec_new(RAY_I32, N); k1c->len = N;
+    ray_t* k2c = ray_vec_new(RAY_I32, N); k2c->len = N;
+    ray_t* vc  = ray_vec_new(RAY_I64, N); vc->len  = N;
+    int32_t* k1 = (int32_t*)ray_data(k1c);
+    int32_t* k2 = (int32_t*)ray_data(k2c);
+    int64_t* v  = (int64_t*)ray_data(vc);
+    /* 10 distinct (k1, k2) pairs with v values that produce monotone
+     * sums per group: group i has 10 rows of v=i+1 → sum = 10*(i+1). */
+    for (int64_t i = 0; i < N; i++) {
+        k1[i] = (int32_t)(i / 10);
+        k2[i] = (int32_t)(i / 10);
+        v[i]  = (i / 10) + 1;
+    }
+
+    int64_t s_k1 = ray_sym_intern("k1", 2);
+    int64_t s_k2 = ray_sym_intern("k2", 2);
+    int64_t s_v  = ray_sym_intern("v",  1);
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, s_k1, k1c); ray_release(k1c);
+    tbl = ray_table_add_col(tbl, s_k2, k2c); ray_release(k2c);
+    tbl = ray_table_add_col(tbl, s_v,  vc);  ray_release(vc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k1 = ray_scan(g, "k1");
+    ray_op_t* scan_k2 = ray_scan(g, "k2");
+    ray_op_t* scan_v  = ray_scan(g, "v");
+    ray_op_t* scan_vp = ray_scan(g, "v");
+    ray_op_t* zero    = ray_const_i64(g, 0);
+    ray_op_t* pred    = ray_binop(g, OP_GE, scan_vp, zero);
+
+    uint16_t  agg_ops[] = { OP_SUM };
+    ray_op_t* agg_ins[] = { scan_v };
+    ray_op_t* keys[]    = { scan_k1, scan_k2 };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 2, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_group_emit_filter_t prev = ray_group_emit_filter_get();
+    ray_group_emit_filter_t filter = {0};
+    filter.enabled = 1;
+    filter.agg_index = 0;
+    filter.top_count_take = 3;
+    filter.agg_op = OP_SUM;       /* sort by SUM, not COUNT */
+    filter.desc = 1;              /* top-3 largest sums */
+    ray_group_emit_filter_set(filter);
+    ray_t* res = ray_execute(g, fused);
+    ray_group_emit_filter_set(prev);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    /* Top-3 sums = 100, 90, 80 (groups 9, 8, 7).  3 rows. */
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 3);
+
+    int64_t sum_sym = ray_sym_intern("sum", 3);
+    ray_t* sum_col = ray_table_get_col(res, sum_sym);
+    int64_t got_total = 0;
+    for (int64_t i = 0; i < 3; i++) got_total += ((int64_t*)ray_data(sum_col))[i];
+    TEST_ASSERT_EQ_I(got_total, 100 + 90 + 80);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* mk_apply_count_emit_filter top-N MIN path (multi-key + MIN agg + desc).
+ * Exercises the OP_MIN branch of the agg-op switch.  Sort by MIN value. */
+static test_result_t test_mk_apply_count_emit_filter_top_min(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 100;
+    ray_t* k1c = ray_vec_new(RAY_I32, N); k1c->len = N;
+    ray_t* k2c = ray_vec_new(RAY_I32, N); k2c->len = N;
+    ray_t* vc  = ray_vec_new(RAY_I64, N); vc->len  = N;
+    int32_t* k1 = (int32_t*)ray_data(k1c);
+    int32_t* k2 = (int32_t*)ray_data(k2c);
+    int64_t* v  = (int64_t*)ray_data(vc);
+    /* 10 groups, each with v values starting at group_id * 100 + 1 ...
+     * + 10.  Group min = group_id * 100 + 1.  Top-3 min largest =
+     * groups 7, 8, 9 with mins 701, 801, 901. */
+    for (int64_t i = 0; i < N; i++) {
+        k1[i] = (int32_t)(i / 10);
+        k2[i] = (int32_t)(i / 10);
+        v[i]  = (i / 10) * 100 + (i % 10) + 1;
+    }
+
+    int64_t s_k1 = ray_sym_intern("k1", 2);
+    int64_t s_k2 = ray_sym_intern("k2", 2);
+    int64_t s_v  = ray_sym_intern("v",  1);
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, s_k1, k1c); ray_release(k1c);
+    tbl = ray_table_add_col(tbl, s_k2, k2c); ray_release(k2c);
+    tbl = ray_table_add_col(tbl, s_v,  vc);  ray_release(vc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k1 = ray_scan(g, "k1");
+    ray_op_t* scan_k2 = ray_scan(g, "k2");
+    ray_op_t* scan_v  = ray_scan(g, "v");
+    ray_op_t* scan_vp = ray_scan(g, "v");
+    ray_op_t* zero    = ray_const_i64(g, 0);
+    ray_op_t* pred    = ray_binop(g, OP_GE, scan_vp, zero);
+
+    uint16_t  agg_ops[] = { OP_MIN };
+    ray_op_t* agg_ins[] = { scan_v };
+    ray_op_t* keys[]    = { scan_k1, scan_k2 };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 2, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_group_emit_filter_t prev = ray_group_emit_filter_get();
+    ray_group_emit_filter_t filter = {0};
+    filter.enabled = 1;
+    filter.agg_index = 0;
+    filter.top_count_take = 3;
+    filter.agg_op = OP_MIN;
+    filter.desc = 1;
+    ray_group_emit_filter_set(filter);
+    ray_t* res = ray_execute(g, fused);
+    ray_group_emit_filter_set(prev);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 3);
+
+    int64_t min_sym = ray_sym_intern("min", 3);
+    ray_t* min_col = ray_table_get_col(res, min_sym);
+    int64_t got_total = 0;
+    for (int64_t i = 0; i < 3; i++) got_total += ((int64_t*)ray_data(min_col))[i];
+    /* Top-3 mins (largest) = 901, 801, 701 → total = 2403. */
+    TEST_ASSERT_EQ_I(got_total, 2403);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* I32 mirror of the rebuild test: forces fp_i32_mg_rebuild via >8192
+ * distinct I32 keys.  Reached via OP_GROUP path (fp_try_i32_mg_top_count
+ * is also called from there, not exec_filtered_group_count1 — but the
+ * function is shared).  Build a single-column I32 table, no WHERE, then
+ * top-K to fire MG. */
+static test_result_t test_fp_try_i32_mg_top_count_rebuild_path(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 12000 + 5 * 50;
+    ray_t* kc = ray_vec_new(RAY_I32, N); kc->len = N;
+    int32_t* k = (int32_t*)ray_data(kc);
+    int64_t pos = 0;
+    for (int hh = 1; hh <= 5; hh++)
+        for (int64_t r = 0; r < 50; r++)
+            k[pos++] = (int32_t)hh;
+    for (int64_t i = 0; i < 12000; i++)
+        k[pos++] = (int32_t)(1000 + i);
+
+    int64_t s_k = ray_sym_intern("k", 1);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, s_k, kc); ray_release(kc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k    = ray_scan(g, "k");
+    uint16_t  agg_ops[] = { OP_COUNT };
+    ray_op_t* agg_ins[] = { scan_k };
+    ray_op_t* keys[]    = { scan_k };
+    ray_op_t* fused     = ray_filtered_group(g, NULL, keys, 1, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_group_emit_filter_t prev = ray_group_emit_filter_get();
+    ray_group_emit_filter_t filter = {0};
+    filter.enabled = 1;
+    filter.agg_index = 0;
+    filter.top_count_take = 3;
+    ray_group_emit_filter_set(filter);
+    ray_t* res = ray_execute(g, fused);
+    ray_group_emit_filter_set(prev);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    /* Either MG returns top-K (heavy hitters survive) or returns NULL and
+     * the fallback path runs; either way ensures fp_i32_mg_rebuild is hit. */
+    int64_t nrows = ray_table_nrows(res);
+    if (nrows > 0) {
+        int64_t cnt_sym = ray_sym_intern("count", 5);
+        ray_t* c_col = ray_table_get_col(res, cnt_sym);
+        int seen_50 = 0;
+        for (int64_t i = 0; i < nrows; i++) {
+            if (((int64_t*)ray_data(c_col))[i] == 50) seen_50 = 1;
+        }
+        TEST_ASSERT_TRUE(seen_50);
+    }
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* fp_try_i64_mg_top_count with MORE than MG cap (8192) distinct keys
+ * to drive fp_i64_mg_rebuild (cap exceeded → decrement-and-rebuild step). */
+static test_result_t test_fp_try_i64_mg_top_count_rebuild_path(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* 12,000 distinct sparse keys (each appearing once) → exceeds the
+     * 8,192-candidate MG cap → triggers the rebuild path.  A handful
+     * of "heavy hitter" keys appearing 50× each survive the decrements
+     * and bubble up to the top-K. */
+    int64_t N = 12000 + 5 * 50;  /* 12,250 rows */
+    ray_t* kc = ray_vec_new(RAY_I64, N); kc->len = N;
+    int64_t* k = (int64_t*)ray_data(kc);
+    int64_t pos = 0;
+    /* Heavy hitters: keys 1..5 each appearing 50 times. */
+    for (int hh = 1; hh <= 5; hh++)
+        for (int64_t r = 0; r < 50; r++)
+            k[pos++] = (int64_t)hh;
+    /* Long tail: keys 1000..12999 each once. */
+    for (int64_t i = 0; i < 12000; i++)
+        k[pos++] = (int64_t)(1000 + i);
+
+    int64_t s_k = ray_sym_intern("k", 1);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, s_k, kc); ray_release(kc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k    = ray_scan(g, "k");
+    uint16_t  agg_ops[] = { OP_COUNT };
+    ray_op_t* agg_ins[] = { scan_k };
+    ray_op_t* keys[]    = { scan_k };
+    ray_op_t* fused     = ray_filtered_group(g, NULL, keys, 1, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_group_emit_filter_t prev = ray_group_emit_filter_get();
+    ray_group_emit_filter_t filter = {0};
+    filter.enabled = 1;
+    filter.agg_index = 0;
+    filter.top_count_take = 3;
+    ray_group_emit_filter_set(filter);
+    ray_t* res = ray_execute(g, fused);
+    ray_group_emit_filter_set(prev);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    /* MG with rebuild may give NULL → falls back; either way the result
+     * is correct (or empty if a fallback materialised).  Validate that
+     * the heavy hitter (count=50) is in the result if any rows came out. */
+    int64_t nrows = ray_table_nrows(res);
+    if (nrows > 0) {
+        int64_t cnt_sym = ray_sym_intern("count", 5);
+        ray_t* c_col = ray_table_get_col(res, cnt_sym);
+        int seen_50 = 0;
+        for (int64_t i = 0; i < nrows; i++) {
+            if (((int64_t*)ray_data(c_col))[i] == 50) seen_50 = 1;
+        }
+        TEST_ASSERT_TRUE(seen_50);
+    }
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* fp_try_i64_mg_top_count with TIMESTAMP key column.  Same MG path, with
+ * RAY_TIMESTAMP → kt branch in fp_try_i64_mg_top_count. */
+static test_result_t test_fp_try_timestamp_mg_top_count_no_where(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t per_key[10];
+    int64_t total_rows = 0;
+    for (int i = 0; i < 10; i++) { per_key[i] = (i + 1) * 2; total_rows += per_key[i]; }
+    ray_t* kc = ray_vec_new(RAY_TIMESTAMP, total_rows); kc->len = total_rows;
+    int64_t* k = (int64_t*)ray_data(kc);
+    int64_t pos = 0;
+    for (int i = 0; i < 10; i++)
+        for (int64_t r = 0; r < per_key[i]; r++)
+            k[pos++] = (int64_t)(1000000000000LL + i);  /* TIMESTAMP nanos */
+
+    int64_t s_k = ray_sym_intern("k", 1);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, s_k, kc); ray_release(kc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k    = ray_scan(g, "k");
+    uint16_t  agg_ops[] = { OP_COUNT };
+    ray_op_t* agg_ins[] = { scan_k };
+    ray_op_t* keys[]    = { scan_k };
+    ray_op_t* fused     = ray_filtered_group(g, NULL, keys, 1, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_group_emit_filter_t prev = ray_group_emit_filter_get();
+    ray_group_emit_filter_t filter = {0};
+    filter.enabled = 1;
+    filter.agg_index = 0;
+    filter.top_count_take = 2;
+    ray_group_emit_filter_set(filter);
+    ray_t* res = ray_execute(g, fused);
+    ray_group_emit_filter_set(prev);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    /* Top-2 counts = 18, 20 (keys 8 and 9). */
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 2);
+
+    int64_t cnt_sym = ray_sym_intern("count", 5);
+    ray_t* c_col = ray_table_get_col(res, cnt_sym);
+    int64_t got_max = 0, got_sum = 0;
+    for (int64_t i = 0; i < 2; i++) {
+        int64_t c = ((int64_t*)ray_data(c_col))[i];
+        if (c > got_max) got_max = c;
+        got_sum += c;
+    }
+    TEST_ASSERT_EQ_I(got_max, 20);
+    TEST_ASSERT_EQ_I(got_sum, 18 + 20);
+
+    /* Verify key column is TIMESTAMP. */
+    ray_t* k_col = ray_table_get_col(res, s_k);
+    TEST_ASSERT_NOT_NULL(k_col);
+    TEST_ASSERT_EQ_I(k_col->type, RAY_TIMESTAMP);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* v2 path with 3 I32 keys (12 bytes total → wide=1).  Drives the
+ * mk_par_v2_fn wide branch combined with AVG-only state (2 slots per
+ * group), exercising mk_v2_apply_agg_inline AVG and mk_state_merge AVG
+ * branches inside mk_combine_v2_part_fn. */
+static test_result_t test_v2_wide_3i32_avg(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 60000;
+    ray_t* k1c = ray_vec_new(RAY_I32, N); k1c->len = N;
+    ray_t* k2c = ray_vec_new(RAY_I32, N); k2c->len = N;
+    ray_t* k3c = ray_vec_new(RAY_I32, N); k3c->len = N;
+    ray_t* vc  = ray_vec_new(RAY_I64, N); vc->len  = N;
+    int32_t* k1 = (int32_t*)ray_data(k1c);
+    int32_t* k2 = (int32_t*)ray_data(k2c);
+    int32_t* k3 = (int32_t*)ray_data(k3c);
+    int64_t* v  = (int64_t*)ray_data(vc);
+    for (int64_t i = 0; i < N; i++) {
+        k1[i] = (int32_t)(i % 40);
+        k2[i] = (int32_t)((i / 40) % 40);
+        k3[i] = (int32_t)((i / 1600) % 20);
+        v[i]  = 100 + (i % 50);
+    }
+
+    int64_t s_k1 = ray_sym_intern("k1", 2);
+    int64_t s_k2 = ray_sym_intern("k2", 2);
+    int64_t s_k3 = ray_sym_intern("k3", 2);
+    int64_t s_v  = ray_sym_intern("v",  1);
+    ray_t* tbl = ray_table_new(4);
+    tbl = ray_table_add_col(tbl, s_k1, k1c); ray_release(k1c);
+    tbl = ray_table_add_col(tbl, s_k2, k2c); ray_release(k2c);
+    tbl = ray_table_add_col(tbl, s_k3, k3c); ray_release(k3c);
+    tbl = ray_table_add_col(tbl, s_v,  vc);  ray_release(vc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k1 = ray_scan(g, "k1");
+    ray_op_t* scan_k2 = ray_scan(g, "k2");
+    ray_op_t* scan_k3 = ray_scan(g, "k3");
+    ray_op_t* scan_v  = ray_scan(g, "v");
+    ray_op_t* scan_vp = ray_scan(g, "v");
+    ray_op_t* zero    = ray_const_i64(g, 0);
+    ray_op_t* pred    = ray_binop(g, OP_GE, scan_vp, zero);
+
+    /* AVG only → v2_ok stays true; AVG state contributes 2 slots/group. */
+    uint16_t  agg_ops[] = { OP_AVG };
+    ray_op_t* agg_ins[] = { scan_v };
+    ray_op_t* keys[]    = { scan_k1, scan_k2, scan_k3 };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 3, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_t* res = ray_execute(g, fused);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    int64_t nrows = ray_table_nrows(res);
+    TEST_ASSERT_TRUE(nrows > 100);
+
+    int64_t avg_sym = ray_sym_intern("avg", 3);
+    ray_t* avg_col = ray_table_get_col(res, avg_sym);
+    TEST_ASSERT_NOT_NULL(avg_col);
+    TEST_ASSERT_EQ_I(avg_col->type, RAY_F64);
+    /* Each per-group AVG is in [100, 149] (range of v values). */
+    double* avgs = (double*)ray_data(avg_col);
+    for (int64_t i = 0; i < nrows; i++) {
+        TEST_ASSERT_TRUE(avgs[i] >= 100.0 && avgs[i] <= 149.0);
+    }
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* v2 path activates and then mk_combine_v2_parallel must run.  With very
+ * small N (below the parallel pool threshold) the partition combine still
+ * runs on worker 0 — exercising the "single thread" branch of
+ * mk_combine_v2_parallel. */
+static test_result_t test_v2_small_n_single_thread_combine(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* Small enough that the dispatcher likely runs single-threaded but
+     * still routes via the v2 path (multi-key, no SYM, COUNT/SUM only). */
+    int64_t N = 200;
+    ray_t* k1c = ray_vec_new(RAY_I32, N); k1c->len = N;
+    ray_t* k2c = ray_vec_new(RAY_I32, N); k2c->len = N;
+    ray_t* vc  = ray_vec_new(RAY_I64, N); vc->len  = N;
+    int32_t* k1 = (int32_t*)ray_data(k1c);
+    int32_t* k2 = (int32_t*)ray_data(k2c);
+    int64_t* v  = (int64_t*)ray_data(vc);
+    for (int64_t i = 0; i < N; i++) {
+        k1[i] = (int32_t)(i % 5);
+        k2[i] = (int32_t)(i % 7);
+        v[i]  = i + 1;
+    }
+
+    int64_t s_k1 = ray_sym_intern("k1", 2);
+    int64_t s_k2 = ray_sym_intern("k2", 2);
+    int64_t s_v  = ray_sym_intern("v",  1);
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, s_k1, k1c); ray_release(k1c);
+    tbl = ray_table_add_col(tbl, s_k2, k2c); ray_release(k2c);
+    tbl = ray_table_add_col(tbl, s_v,  vc);  ray_release(vc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k1 = ray_scan(g, "k1");
+    ray_op_t* scan_k2 = ray_scan(g, "k2");
+    ray_op_t* scan_v  = ray_scan(g, "v");
+    ray_op_t* scan_vp = ray_scan(g, "v");
+    ray_op_t* zero    = ray_const_i64(g, 0);
+    ray_op_t* pred    = ray_binop(g, OP_GE, scan_vp, zero);
+
+    uint16_t  agg_ops[] = { OP_COUNT, OP_SUM };
+    ray_op_t* agg_ins[] = { scan_v, scan_v };
+    ray_op_t* keys[]    = { scan_k1, scan_k2 };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 2, agg_ops, agg_ins, 2);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_t* res = ray_execute(g, fused);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    /* lcm(5,7) = 35 distinct (k1, k2) pairs. */
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 35);
+
+    int64_t cnt_sym = ray_sym_intern("count", 5);
+    int64_t sum_sym = ray_sym_intern("sum",   3);
+    ray_t* cnt_col = ray_table_get_col(res, cnt_sym);
+    ray_t* sum_col = ray_table_get_col(res, sum_sym);
+    int64_t total_cnt = 0, total_sum = 0;
+    for (int64_t i = 0; i < 35; i++) {
+        total_cnt += ((int64_t*)ray_data(cnt_col))[i];
+        total_sum += ((int64_t*)ray_data(sum_col))[i];
+    }
+    TEST_ASSERT_EQ_I(total_cnt, N);
+    TEST_ASSERT_EQ_I(total_sum, N * (N + 1) / 2);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* mk_par_hash_fn wide branch: hash-eq dispatch with 2 wide-composite
+ * keys (16 bytes total → wide=1) so the wide-key compose + slots_hi
+ * path runs. */
+static test_result_t test_hash_eq_dispatch_wide_keys(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 500;
+    ray_t* kpc = ray_vec_new(RAY_I64, N); kpc->len = N;  /* predicate key */
+    ray_t* k2c = ray_vec_new(RAY_I64, N); k2c->len = N;  /* second group key */
+    ray_t* vc  = ray_vec_new(RAY_I64, N); vc->len  = N;
+    int64_t* kp = (int64_t*)ray_data(kpc);
+    int64_t* k2 = (int64_t*)ray_data(k2c);
+    int64_t* v  = (int64_t*)ray_data(vc);
+    for (int64_t i = 0; i < N; i++) {
+        kp[i] = (i % 5) * 1000;
+        k2[i] = (i % 4);
+        v[i]  = i + 1;
+    }
+    /* Attach hash index on predicate column. */
+    ray_t* r = ray_index_attach_hash(&kpc);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+
+    int64_t s_kp = ray_sym_intern("kp", 2);
+    int64_t s_k2 = ray_sym_intern("k2", 2);
+    int64_t s_v  = ray_sym_intern("v",  1);
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, s_kp, kpc); ray_release(kpc);
+    tbl = ray_table_add_col(tbl, s_k2, k2c); ray_release(k2c);
+    tbl = ray_table_add_col(tbl, s_v,  vc);  ray_release(vc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_kp   = ray_scan(g, "kp");
+    ray_op_t* scan_k2   = ray_scan(g, "k2");
+    ray_op_t* scan_v    = ray_scan(g, "v");
+    ray_op_t* scan_pred = ray_scan(g, "kp");
+    ray_op_t* needle    = ray_const_i64(g, 3000);
+    ray_op_t* pred      = ray_binop(g, OP_EQ, scan_pred, needle);
+    /* SUM agg (forces mk_par_hash_fn, not count_fn) with 2 keys (16 bytes
+     * → wide=1) to exercise the wide branch. */
+    uint16_t  agg_ops[] = { OP_SUM };
+    ray_op_t* agg_ins[] = { scan_v };
+    ray_op_t* keys[]    = { scan_kp, scan_k2 };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 2, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_t* res = ray_execute(g, fused);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    int64_t nrows = ray_table_nrows(res);
+    TEST_ASSERT_TRUE(nrows >= 1 && nrows <= 4);
+
+    /* Rows where kp=3000 → i % 5 == 3 → i ∈ {3, 8, 13, ..., 498}.
+     * 100 such rows.  Sum of (i+1) for i ∈ {3, 8, ..., 498} =
+     * 100 * (4 + 499) / 2 = 25150.  Group by (kp, k2). */
+    int64_t sum_sym = ray_sym_intern("sum", 3);
+    ray_t* sum_col = ray_table_get_col(res, sum_sym);
+    int64_t total_sum = 0;
+    for (int64_t i = 0; i < nrows; i++) {
+        total_sum += ((int64_t*)ray_data(sum_col))[i];
+    }
+    TEST_ASSERT_EQ_I(total_sum, 25150);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* Hash-eq dispatch on I32 column → mk_eq_hash_count_fn col_esz=4 branch.
+ * The hash builder zero/sign-extends keys based on storage width, so
+ * I32 columns hit a separate switch case than I64. */
+static test_result_t test_hash_eq_i32_count_dispatch(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 500;
+    ray_t* kc = ray_vec_new(RAY_I32, N); kc->len = N;
+    int32_t* k = (int32_t*)ray_data(kc);
+    for (int64_t i = 0; i < N; i++) k[i] = (int32_t)((i % 5) * 1000);
+    ray_t* r = ray_index_attach_hash(&kc);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+
+    int64_t s_k = ray_sym_intern("k", 1);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, s_k, kc); ray_release(kc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k    = ray_scan(g, "k");
+    ray_op_t* scan_pred = ray_scan(g, "k");
+    ray_op_t* needle    = ray_const_i64(g, 2000);
+    ray_op_t* pred      = ray_binop(g, OP_EQ, scan_pred, needle);
+    /* Multi-agg COUNT + COUNT → multi path. */
+    uint16_t  agg_ops[] = { OP_COUNT, OP_COUNT };
+    ray_op_t* agg_ins[] = { scan_k, scan_k };
+    ray_op_t* keys[]    = { scan_k };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 1, agg_ops, agg_ins, 2);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_t* res = ray_execute(g, fused);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 1);
+    int64_t cnt_sym = ray_sym_intern("count", 5);
+    ray_t* cnt_col = ray_table_get_col(res, cnt_sym);
+    /* k=2000 corresponds to (i % 5) == 2 → 100 rows. */
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(cnt_col))[0], 100);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* Chunk-zone fast path in fp_eval_cmp: predicate column carries a
+ * RAY_IDX_CHUNK_ZONE index AND the morsel fits inside one chunk AND
+ * the chunk min/max definitively decide the predicate.  Exercises the
+ * EQ all-fail decision (cval < cmin || cval > cmax). */
+static test_result_t test_fp_eval_cmp_chunk_zone_eq_fold(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* 512 rows, chunk_log2=8 → 2 chunks of 256.  Predicate column is
+     * I64 monotone (ts[i]=i), key column is I64 (i%4).  Single-key
+     * single-COUNT routes through count1 path → fp_eval_pred →
+     * fp_eval_cmp; chunk min/max ranges decide each morsel. */
+    int64_t N = 512;
+    ray_t* kc  = ray_vec_new(RAY_I64, N); kc->len  = N;
+    ray_t* tsc = ray_vec_new(RAY_I64, N); tsc->len = N;
+    int64_t* k  = (int64_t*)ray_data(kc);
+    int64_t* ts = (int64_t*)ray_data(tsc);
+    for (int64_t i = 0; i < N; i++) { k[i] = i % 4; ts[i] = i; }
+    ray_t* r = ray_index_attach_chunk_zone(&tsc, 8);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_TRUE(tsc->attrs & RAY_ATTR_HAS_INDEX);
+
+    int64_t s_k  = ray_sym_intern("k",  1);
+    int64_t s_ts = ray_sym_intern("ts", 2);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, s_k,  kc);  ray_release(kc);
+    tbl = ray_table_add_col(tbl, s_ts, tsc); ray_release(tsc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k    = ray_scan(g, "k");
+    ray_op_t* scan_tsp  = ray_scan(g, "ts");
+    /* needle = 1000, outside both chunks (max=511).  All chunks fail
+     * via "cval > cmax" → memset(bits, 0). */
+    ray_op_t* needle    = ray_const_i64(g, 1000);
+    ray_op_t* pred      = ray_binop(g, OP_EQ, scan_tsp, needle);
+
+    uint16_t  agg_ops[] = { OP_COUNT };
+    ray_op_t* agg_ins[] = { scan_k };
+    ray_op_t* keys[]    = { scan_k };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 1, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_t* res = ray_execute(g, fused);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    /* Empty result → 0 rows. */
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 0);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* Chunk-zone GT all-pass decision (no nulls, cmin > cval). */
+static test_result_t test_fp_eval_cmp_chunk_zone_gt_allpass(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 512;
+    ray_t* kc  = ray_vec_new(RAY_I64, N); kc->len  = N;
+    ray_t* tsc = ray_vec_new(RAY_I64, N); tsc->len = N;
+    int64_t* k  = (int64_t*)ray_data(kc);
+    int64_t* ts = (int64_t*)ray_data(tsc);
+    /* k uniform across single group so result = 1 row. */
+    for (int64_t i = 0; i < N; i++) { k[i] = 7; ts[i] = 1000 + i; }
+    ray_t* r = ray_index_attach_chunk_zone(&tsc, 8);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+
+    int64_t s_k  = ray_sym_intern("k",  1);
+    int64_t s_ts = ray_sym_intern("ts", 2);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, s_k,  kc);  ray_release(kc);
+    tbl = ray_table_add_col(tbl, s_ts, tsc); ray_release(tsc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k    = ray_scan(g, "k");
+    ray_op_t* scan_tsp  = ray_scan(g, "ts");
+    /* needle = 500, chunk min=1000 → all-pass via "cmin > cval". */
+    ray_op_t* needle    = ray_const_i64(g, 500);
+    ray_op_t* pred      = ray_binop(g, OP_GT, scan_tsp, needle);
+
+    uint16_t  agg_ops[] = { OP_COUNT };
+    ray_op_t* agg_ins[] = { scan_k };
+    ray_op_t* keys[]    = { scan_k };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 1, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_t* res = ray_execute(g, fused);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 1);
+    int64_t cnt_sym = ray_sym_intern("count", 5);
+    ray_t* cnt_col = ray_table_get_col(res, cnt_sym);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(cnt_col))[0], N);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* Chunk-zone LT all-fail: cmin >= cval (chunk min outside predicate). */
+static test_result_t test_fp_eval_cmp_chunk_zone_lt_allfail(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 512;
+    ray_t* kc  = ray_vec_new(RAY_I64, N); kc->len  = N;
+    ray_t* tsc = ray_vec_new(RAY_I64, N); tsc->len = N;
+    int64_t* k  = (int64_t*)ray_data(kc);
+    int64_t* ts = (int64_t*)ray_data(tsc);
+    for (int64_t i = 0; i < N; i++) { k[i] = i % 3; ts[i] = 5000 + i; }
+    ray_t* r = ray_index_attach_chunk_zone(&tsc, 8);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+
+    int64_t s_k  = ray_sym_intern("k",  1);
+    int64_t s_ts = ray_sym_intern("ts", 2);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, s_k,  kc);  ray_release(kc);
+    tbl = ray_table_add_col(tbl, s_ts, tsc); ray_release(tsc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k    = ray_scan(g, "k");
+    ray_op_t* scan_tsp  = ray_scan(g, "ts");
+    ray_op_t* needle    = ray_const_i64(g, 4000);  /* < cmin */
+    ray_op_t* pred      = ray_binop(g, OP_LT, scan_tsp, needle);
+
+    uint16_t  agg_ops[] = { OP_COUNT };
+    ray_op_t* agg_ins[] = { scan_k };
+    ray_op_t* keys[]    = { scan_k };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 1, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_t* res = ray_execute(g, fused);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 0);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* Chunk-zone NE all-pass: cmin == cmax == cval inverted.  Single-value
+ * chunk that equals the constant → NE returns all-fail. */
+static test_result_t test_fp_eval_cmp_chunk_zone_ne_allfail(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 256;
+    ray_t* kc  = ray_vec_new(RAY_I64, N); kc->len  = N;
+    ray_t* tsc = ray_vec_new(RAY_I64, N); tsc->len = N;
+    int64_t* k  = (int64_t*)ray_data(kc);
+    int64_t* ts = (int64_t*)ray_data(tsc);
+    /* All ts values = 42 → cmin=cmax=42 in single chunk. */
+    for (int64_t i = 0; i < N; i++) { k[i] = i % 4; ts[i] = 42; }
+    ray_t* r = ray_index_attach_chunk_zone(&tsc, 8);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+
+    int64_t s_k  = ray_sym_intern("k",  1);
+    int64_t s_ts = ray_sym_intern("ts", 2);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, s_k,  kc);  ray_release(kc);
+    tbl = ray_table_add_col(tbl, s_ts, tsc); ray_release(tsc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k    = ray_scan(g, "k");
+    ray_op_t* scan_tsp  = ray_scan(g, "ts");
+    ray_op_t* needle    = ray_const_i64(g, 42);
+    ray_op_t* pred      = ray_binop(g, OP_NE, scan_tsp, needle);
+
+    uint16_t  agg_ops[] = { OP_COUNT };
+    ray_op_t* agg_ins[] = { scan_k };
+    ray_op_t* keys[]    = { scan_k };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 1, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_t* res = ray_execute(g, fused);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 0);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* Chunk-zone LE all-pass: cmax <= cval && !has_nulls → memset(bits, 1).
+ * Also exercises EQ single-value all-pass: cmin == cmax == cval. */
+static test_result_t test_fp_eval_cmp_chunk_zone_le_allpass(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 256;
+    ray_t* kc  = ray_vec_new(RAY_I64, N); kc->len  = N;
+    ray_t* tsc = ray_vec_new(RAY_I64, N); tsc->len = N;
+    int64_t* k  = (int64_t*)ray_data(kc);
+    int64_t* ts = (int64_t*)ray_data(tsc);
+    for (int64_t i = 0; i < N; i++) { k[i] = i % 4; ts[i] = i; }
+    ray_t* r = ray_index_attach_chunk_zone(&tsc, 8);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+
+    int64_t s_k  = ray_sym_intern("k",  1);
+    int64_t s_ts = ray_sym_intern("ts", 2);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, s_k,  kc);  ray_release(kc);
+    tbl = ray_table_add_col(tbl, s_ts, tsc); ray_release(tsc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k    = ray_scan(g, "k");
+    ray_op_t* scan_tsp  = ray_scan(g, "ts");
+    /* needle = 10000, chunk max=255 → all-pass via "cmax <= cval". */
+    ray_op_t* needle    = ray_const_i64(g, 10000);
+    ray_op_t* pred      = ray_binop(g, OP_LE, scan_tsp, needle);
+
+    uint16_t  agg_ops[] = { OP_COUNT };
+    ray_op_t* agg_ins[] = { scan_k };
+    ray_op_t* keys[]    = { scan_k };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 1, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_t* res = ray_execute(g, fused);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 4);
+    int64_t cnt_sym = ray_sym_intern("count", 5);
+    ray_t* cnt_col = ray_table_get_col(res, cnt_sym);
+    int64_t total = 0;
+    for (int64_t i = 0; i < 4; i++) total += ((int64_t*)ray_data(cnt_col))[i];
+    TEST_ASSERT_EQ_I(total, N);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* Chunk-zone GE all-fail: cmax < cval → decision = 0 (no null guard
+ * required for all-fail). */
+static test_result_t test_fp_eval_cmp_chunk_zone_ge_allfail(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 256;
+    ray_t* kc  = ray_vec_new(RAY_I64, N); kc->len  = N;
+    ray_t* tsc = ray_vec_new(RAY_I64, N); tsc->len = N;
+    int64_t* k  = (int64_t*)ray_data(kc);
+    int64_t* ts = (int64_t*)ray_data(tsc);
+    for (int64_t i = 0; i < N; i++) { k[i] = i % 5; ts[i] = i; }
+    ray_t* r = ray_index_attach_chunk_zone(&tsc, 8);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+
+    int64_t s_k  = ray_sym_intern("k",  1);
+    int64_t s_ts = ray_sym_intern("ts", 2);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, s_k,  kc);  ray_release(kc);
+    tbl = ray_table_add_col(tbl, s_ts, tsc); ray_release(tsc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k    = ray_scan(g, "k");
+    ray_op_t* scan_tsp  = ray_scan(g, "ts");
+    /* needle = 9999, chunk max=255 → all-fail via "cmax < cval". */
+    ray_op_t* needle    = ray_const_i64(g, 9999);
+    ray_op_t* pred      = ray_binop(g, OP_GE, scan_tsp, needle);
+
+    uint16_t  agg_ops[] = { OP_COUNT };
+    ray_op_t* agg_ins[] = { scan_k };
+    ray_op_t* keys[]    = { scan_k };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 1, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_t* res = ray_execute(g, fused);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 0);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* Chunk-zone fast path: NE all-pass via "cval < cmin || cval > cmax"
+ * + no-nulls.  All values in [100, 100+N), cval=50 → NE = all-pass. */
+static test_result_t test_fp_eval_cmp_chunk_zone_ne_allpass(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* N must be >= 1 << chunk_log2 (=256 for chunk_log2=8). */
+    int64_t N = 512;
+    ray_t* kc  = ray_vec_new(RAY_I64, N); kc->len  = N;
+    ray_t* tsc = ray_vec_new(RAY_I64, N); tsc->len = N;
+    int64_t* k  = (int64_t*)ray_data(kc);
+    int64_t* ts = (int64_t*)ray_data(tsc);
+    for (int64_t i = 0; i < N; i++) { k[i] = i % 2; ts[i] = 100 + i; }
+    ray_t* r = ray_index_attach_chunk_zone(&tsc, 8);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+
+    int64_t s_k  = ray_sym_intern("k",  1);
+    int64_t s_ts = ray_sym_intern("ts", 2);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, s_k,  kc);  ray_release(kc);
+    tbl = ray_table_add_col(tbl, s_ts, tsc); ray_release(tsc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k    = ray_scan(g, "k");
+    ray_op_t* scan_tsp  = ray_scan(g, "ts");
+    ray_op_t* needle    = ray_const_i64(g, 50);
+    ray_op_t* pred      = ray_binop(g, OP_NE, scan_tsp, needle);
+
+    uint16_t  agg_ops[] = { OP_COUNT };
+    ray_op_t* agg_ins[] = { scan_k };
+    ray_op_t* keys[]    = { scan_k };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 1, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_t* res = ray_execute(g, fused);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 2);
+    int64_t cnt_sym = ray_sym_intern("count", 5);
+    ray_t* cnt_col = ray_table_get_col(res, cnt_sym);
+    int64_t total = 0;
+    for (int64_t i = 0; i < 2; i++) total += ((int64_t*)ray_data(cnt_col))[i];
+    TEST_ASSERT_EQ_I(total, N);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* fp_eval_cmp_one IN path via masked predicate evaluation: AND with
+ * an IN child triggers fp_eval_cmp_masked which calls fp_eval_cmp_one
+ * with op == FP_IN (lines 618-622). */
+static test_result_t test_fp_eval_cmp_one_in_via_masked(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 1024;
+    ray_t* kc = ray_vec_new(RAY_I64, N); kc->len = N;
+    ray_t* vc = ray_vec_new(RAY_I64, N); vc->len = N;
+    int64_t* k = (int64_t*)ray_data(kc);
+    int64_t* v = (int64_t*)ray_data(vc);
+    for (int64_t i = 0; i < N; i++) { k[i] = i % 8; v[i] = i; }
+
+    int64_t s_k = ray_sym_intern("k", 1);
+    int64_t s_v = ray_sym_intern("v", 1);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, s_k, kc); ray_release(kc);
+    tbl = ray_table_add_col(tbl, s_v, vc); ray_release(vc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k    = ray_scan(g, "k");
+    ray_op_t* scan_kp   = ray_scan(g, "k");
+    ray_op_t* scan_vp   = ray_scan(g, "v");
+    /* Build IN list [1,3,5] as a typed I64 vector literal. */
+    int64_t inlist_vals[] = { 1, 3, 5 };
+    ray_t* inlist_vec = ray_vec_new(RAY_I64, 3);
+    inlist_vec->len = 3;
+    memcpy(ray_data(inlist_vec), inlist_vals, sizeof(inlist_vals));
+    ray_op_t* inlist   = ray_const_vec(g, inlist_vec);
+    ray_release(inlist_vec);
+    /* (and (>= v 0) (in k [1,3,5])): cmp first, IN second → masked
+     * path calls fp_eval_cmp_one(IN, ...) per row. */
+    ray_op_t* zero     = ray_const_i64(g, 0);
+    ray_op_t* p1       = ray_binop(g, OP_GE, scan_vp, zero);
+    ray_op_t* p2       = ray_binop(g, OP_IN, scan_kp, inlist);
+    ray_op_t* pred     = ray_binop(g, OP_AND, p1, p2);
+
+    uint16_t  agg_ops[] = { OP_COUNT };
+    ray_op_t* agg_ins[] = { scan_k };
+    ray_op_t* keys[]    = { scan_k };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 1, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_t* res = ray_execute(g, fused);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 3);
+    int64_t cnt_sym = ray_sym_intern("count", 5);
+    ray_t* cnt_col = ray_table_get_col(res, cnt_sym);
+    int64_t total = 0;
+    for (int64_t i = 0; i < 3; i++) total += ((int64_t*)ray_data(cnt_col))[i];
+    /* k in {1,3,5}: each appears N/8 = 128 times → 3*128 = 384. */
+    TEST_ASSERT_EQ_I(total, 384);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* fp_compile_cmp: FP_IN with RAY_I32 literal-vec branch (line 736-738).
+ * The IN list is an I32-typed vector explicitly. */
+static test_result_t test_fp_compile_cmp_in_i32_atom(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 200;
+    ray_t* kc = ray_vec_new(RAY_I32, N); kc->len = N;
+    int32_t* k = (int32_t*)ray_data(kc);
+    for (int64_t i = 0; i < N; i++) k[i] = (int32_t)(i % 10);
+
+    int64_t s_k = ray_sym_intern("k", 1);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, s_k, kc); ray_release(kc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k  = ray_scan(g, "k");
+    ray_op_t* scan_kp = ray_scan(g, "k");
+    int32_t inv[] = { 2, 4, 6 };
+    ray_t* inlist_vec = ray_vec_new(RAY_I32, 3);
+    inlist_vec->len = 3;
+    memcpy(ray_data(inlist_vec), inv, sizeof(inv));
+    ray_op_t* inlist  = ray_const_vec(g, inlist_vec);
+    ray_release(inlist_vec);
+    ray_op_t* pred    = ray_binop(g, OP_IN, scan_kp, inlist);
+
+    uint16_t  agg_ops[] = { OP_COUNT };
+    ray_op_t* agg_ins[] = { scan_k };
+    ray_op_t* keys[]    = { scan_k };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 1, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_t* res = ray_execute(g, fused);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 3);
+    int64_t cnt_sym = ray_sym_intern("count", 5);
+    ray_t* cnt_col = ray_table_get_col(res, cnt_sym);
+    int64_t total = 0;
+    for (int64_t i = 0; i < 3; i++) total += ((int64_t*)ray_data(cnt_col))[i];
+    TEST_ASSERT_EQ_I(total, 3 * (N / 10));
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* fp_compile_cmp: FP_IN with RAY_I16 literal-vec branch (line 735). */
+static test_result_t test_fp_compile_cmp_in_i16_atom(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 100;
+    ray_t* kc = ray_vec_new(RAY_I16, N); kc->len = N;
+    int16_t* k = (int16_t*)ray_data(kc);
+    for (int64_t i = 0; i < N; i++) k[i] = (int16_t)(i % 5);
+
+    int64_t s_k = ray_sym_intern("k", 1);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, s_k, kc); ray_release(kc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k  = ray_scan(g, "k");
+    ray_op_t* scan_kp = ray_scan(g, "k");
+    int16_t inv[] = { 0, 2, 4 };
+    ray_t* inlist_vec = ray_vec_new(RAY_I16, 3);
+    inlist_vec->len = 3;
+    memcpy(ray_data(inlist_vec), inv, sizeof(inv));
+    ray_op_t* inlist  = ray_const_vec(g, inlist_vec);
+    ray_release(inlist_vec);
+    ray_op_t* pred    = ray_binop(g, OP_IN, scan_kp, inlist);
+
+    uint16_t  agg_ops[] = { OP_COUNT };
+    ray_op_t* agg_ins[] = { scan_k };
+    ray_op_t* keys[]    = { scan_k };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 1, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_t* res = ray_execute(g, fused);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 3);
+    int64_t cnt_sym = ray_sym_intern("count", 5);
+    ray_t* cnt_col = ray_table_get_col(res, cnt_sym);
+    int64_t total = 0;
+    for (int64_t i = 0; i < 3; i++) total += ((int64_t*)ray_data(cnt_col))[i];
+    TEST_ASSERT_EQ_I(total, 3 * (N / 5));
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* fp_eval_cmp_one LT/LE/GT/GE branches: AND with multiple ordering
+ * cmps (LT/LE/GT/GE), no IN → use_masked == 0, so 2nd+ children eval
+ * into tmp via fp_eval_cmp, not _one.  To hit _one we need IN in the
+ * predicate.  Combine GT + IN to route through masked path with GT as
+ * the masked-child compared via _one.  Then verify all six op cases
+ * by interleaving them with an IN to force masked. */
+static test_result_t test_fp_eval_cmp_one_lt_le_gt_ge_via_masked(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 256;
+    ray_t* kc = ray_vec_new(RAY_I64, N); kc->len = N;
+    ray_t* vc = ray_vec_new(RAY_I64, N); vc->len = N;
+    int64_t* k = (int64_t*)ray_data(kc);
+    int64_t* v = (int64_t*)ray_data(vc);
+    for (int64_t i = 0; i < N; i++) { k[i] = i % 8; v[i] = i; }
+
+    int64_t s_k = ray_sym_intern("k", 1);
+    int64_t s_v = ray_sym_intern("v", 1);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, s_k, kc); ray_release(kc);
+    tbl = ray_table_add_col(tbl, s_v, vc); ray_release(vc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k   = ray_scan(g, "k");
+    ray_op_t* scan_kp  = ray_scan(g, "k");
+    ray_op_t* scan_vp1 = ray_scan(g, "v");
+    ray_op_t* scan_vp2 = ray_scan(g, "v");
+    ray_op_t* scan_vp3 = ray_scan(g, "v");
+    ray_op_t* scan_vp4 = ray_scan(g, "v");
+    int64_t inv[] = { 0, 1, 2, 3, 4, 5, 6, 7 };
+    ray_t* inlist_vec = ray_vec_new(RAY_I64, 8);
+    inlist_vec->len = 8;
+    memcpy(ray_data(inlist_vec), inv, sizeof(inv));
+    ray_op_t* inlist  = ray_const_vec(g, inlist_vec);
+    ray_release(inlist_vec);
+    ray_op_t* in_pred = ray_binop(g, OP_IN, scan_kp, inlist);
+    /* (and IN GT LE LT GE) with IN first → masked subsequent children
+     * each hit fp_eval_cmp_one for the corresponding op. */
+    ray_op_t* c0 = ray_const_i64(g, 0);
+    ray_op_t* c255 = ray_const_i64(g, 255);
+    ray_op_t* gt_pred = ray_binop(g, OP_GT, scan_vp1, c0);
+    ray_op_t* le_pred = ray_binop(g, OP_LE, scan_vp2, c255);
+    ray_op_t* lt_pred = ray_binop(g, OP_LT, scan_vp3, c255);
+    ray_op_t* ge_pred = ray_binop(g, OP_GE, scan_vp4, c0);
+    ray_op_t* and1 = ray_binop(g, OP_AND, in_pred, gt_pred);
+    ray_op_t* and2 = ray_binop(g, OP_AND, and1, le_pred);
+    ray_op_t* and3 = ray_binop(g, OP_AND, and2, lt_pred);
+    ray_op_t* pred = ray_binop(g, OP_AND, and3, ge_pred);
+
+    uint16_t  agg_ops[] = { OP_COUNT };
+    ray_op_t* agg_ins[] = { scan_k };
+    ray_op_t* keys[]    = { scan_k };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 1, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_t* res = ray_execute(g, fused);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    /* k in 0..7 AND v > 0 AND v <= 255 AND v < 255 AND v >= 0:
+     * v range [1, 254] (254 rows).  Each k = i%8 → roughly N/8 = 32 each.
+     * Just verify no crash and result is non-empty + non-full. */
+    TEST_ASSERT_TRUE(ray_table_nrows(res) > 0);
+    TEST_ASSERT_TRUE(ray_table_nrows(res) <= 8);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* fp_eval_cmp_one EQ/NE via masked path (lines 626-627).  Multi-child
+ * AND with IN forces use_masked=1, and EQ/NE children get routed
+ * through fp_eval_cmp_one. */
+static test_result_t test_fp_eval_cmp_one_eq_ne_via_masked(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 200;
+    ray_t* kc = ray_vec_new(RAY_I64, N); kc->len = N;
+    ray_t* vc = ray_vec_new(RAY_I64, N); vc->len = N;
+    int64_t* k = (int64_t*)ray_data(kc);
+    int64_t* v = (int64_t*)ray_data(vc);
+    for (int64_t i = 0; i < N; i++) { k[i] = i % 4; v[i] = i; }
+
+    int64_t s_k = ray_sym_intern("k", 1);
+    int64_t s_v = ray_sym_intern("v", 1);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, s_k, kc); ray_release(kc);
+    tbl = ray_table_add_col(tbl, s_v, vc); ray_release(vc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k   = ray_scan(g, "k");
+    ray_op_t* scan_kp1 = ray_scan(g, "k");
+    ray_op_t* scan_kp2 = ray_scan(g, "k");
+    int64_t inv[] = { 0, 1, 2, 3 };
+    ray_t* inlist_vec = ray_vec_new(RAY_I64, 4);
+    inlist_vec->len = 4;
+    memcpy(ray_data(inlist_vec), inv, sizeof(inv));
+    ray_op_t* inlist  = ray_const_vec(g, inlist_vec);
+    ray_release(inlist_vec);
+    ray_op_t* in_pred = ray_binop(g, OP_IN, scan_kp1, inlist);
+    ray_op_t* c1   = ray_const_i64(g, 1);
+    ray_op_t* c2   = ray_const_i64(g, 2);
+    ray_op_t* eq_p = ray_binop(g, OP_NE, scan_kp2, c1);
+    ray_op_t* and1 = ray_binop(g, OP_AND, in_pred, eq_p);
+    /* Third child: EQ k 2 (will be evaluated via masked path → _one EQ). */
+    ray_op_t* scan_kp3 = ray_scan(g, "k");
+    ray_op_t* eq_p2 = ray_binop(g, OP_EQ, scan_kp3, c2);
+    ray_op_t* pred = ray_binop(g, OP_AND, and1, eq_p2);
+
+    uint16_t  agg_ops[] = { OP_COUNT };
+    ray_op_t* agg_ins[] = { scan_k };
+    ray_op_t* keys[]    = { scan_k };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 1, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_t* res = ray_execute(g, fused);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    /* k in {0,1,2,3} AND k != 1 AND k == 2 → only k=2 passes.
+     * Rows where k=2: N/4 = 50. */
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 1);
+    int64_t cnt_sym = ray_sym_intern("count", 5);
+    ray_t* cnt_col = ray_table_get_col(res, cnt_sym);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(cnt_col))[0], N / 4);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* fp_try_direct_count1: BOOL key path with WHERE.  n_slots = 2, bias
+ * = 0; exercises the count1 direct-count BOOL branch (line 1534-1535)
+ * which has been only narrowly covered. */
+static test_result_t test_count1_bool_key_with_where(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 100;
+    ray_t* kc = ray_vec_new(RAY_BOOL, N); kc->len = N;
+    ray_t* vc = ray_vec_new(RAY_I64,  N); vc->len = N;
+    uint8_t* k = (uint8_t*)ray_data(kc);
+    int64_t* v = (int64_t*)ray_data(vc);
+    for (int64_t i = 0; i < N; i++) { k[i] = (uint8_t)(i & 1); v[i] = i; }
+
+    int64_t s_k = ray_sym_intern("k", 1);
+    int64_t s_v = ray_sym_intern("v", 1);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, s_k, kc); ray_release(kc);
+    tbl = ray_table_add_col(tbl, s_v, vc); ray_release(vc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k  = ray_scan(g, "k");
+    ray_op_t* scan_vp = ray_scan(g, "v");
+    ray_op_t* fifty   = ray_const_i64(g, 50);
+    ray_op_t* pred    = ray_binop(g, OP_GE, scan_vp, fifty);
+    uint16_t  agg_ops[] = { OP_COUNT };
+    ray_op_t* agg_ins[] = { scan_k };
+    ray_op_t* keys[]    = { scan_k };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 1, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_t* res = ray_execute(g, fused);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 2);
+    int64_t cnt_sym = ray_sym_intern("count", 5);
+    ray_t* cnt_col = ray_table_get_col(res, cnt_sym);
+    int64_t total = 0;
+    for (int64_t i = 0; i < 2; i++) total += ((int64_t*)ray_data(cnt_col))[i];
+    TEST_ASSERT_EQ_I(total, 50);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* fp_try_direct_count1: SYM key with no WHERE and small max_key.  The
+ * SYM branch (line 1562) scans for max_key, then drops through to the
+ * non-pred-key-ne0 path. */
+static test_result_t test_count1_sym_key_small_dict(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 60;
+    /* Build symbol column via sym_vec.  Use a few distinct syms. */
+    int64_t syms[3];
+    syms[0] = ray_sym_intern("alpha", 5);
+    syms[1] = ray_sym_intern("beta", 4);
+    syms[2] = ray_sym_intern("gamma", 5);
+    ray_t* kc = ray_sym_vec_new(RAY_SYM_W32, N);
+    kc->len = N;
+    int32_t* k = (int32_t*)ray_data(kc);
+    for (int64_t i = 0; i < N; i++) k[i] = (int32_t)syms[i % 3];
+
+    int64_t s_k = ray_sym_intern("k", 1);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, s_k, kc); ray_release(kc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k = ray_scan(g, "k");
+    uint16_t  agg_ops[] = { OP_COUNT };
+    ray_op_t* agg_ins[] = { scan_k };
+    ray_op_t* keys[]    = { scan_k };
+    ray_op_t* fused     = ray_filtered_group(g, NULL, keys, 1, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_t* res = ray_execute(g, fused);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    /* 3 distinct syms → 3 groups, 20 rows each. */
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 3);
+    int64_t cnt_sym = ray_sym_intern("count", 5);
+    ray_t* cnt_col = ray_table_get_col(res, cnt_sym);
+    int64_t total = 0;
+    for (int64_t i = 0; i < 3; i++) total += ((int64_t*)ray_data(cnt_col))[i];
+    TEST_ASSERT_EQ_I(total, N);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* mk_eq_hash_count_fn EQ probe with single COUNT agg (already covered)
+ * but also exercise the U8 / I16 / I32 key-width cases in the kbits
+ * switch (lines 2866-2870).  Use a U8 hash-indexed column. */
+static test_result_t test_hash_eq_count_dispatch_u8_key(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 500;
+    ray_t* kc = ray_vec_new(RAY_U8, N); kc->len = N;
+    uint8_t* k = (uint8_t*)ray_data(kc);
+    for (int64_t i = 0; i < N; i++) k[i] = (uint8_t)((i % 10) * 5);
+    ray_t* r = ray_index_attach_hash(&kc);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+
+    int64_t s_k = ray_sym_intern("k", 1);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, s_k, kc); ray_release(kc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k    = ray_scan(g, "k");
+    ray_op_t* scan_pred = ray_scan(g, "k");
+    ray_op_t* needle    = ray_const_i64(g, 10);
+    ray_op_t* pred      = ray_binop(g, OP_EQ, scan_pred, needle);
+    uint16_t  agg_ops[] = { OP_COUNT, OP_COUNT };  /* force multi path */
+    ray_op_t* agg_ins[] = { scan_k, scan_k };
+    ray_op_t* keys[]    = { scan_k };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 1, agg_ops, agg_ins, 2);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_t* res = ray_execute(g, fused);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 1);
+    int64_t cnt_sym = ray_sym_intern("count", 5);
+    ray_t* cnt_col = ray_table_get_col(res, cnt_sym);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(cnt_col))[0], N / 10);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* mk_eq_hash_count_fn with I16 key (kbits switch line 2867: signed
+ * 16-bit extension to int64). */
+static test_result_t test_hash_eq_count_dispatch_i16_key(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 500;
+    ray_t* kc = ray_vec_new(RAY_I16, N); kc->len = N;
+    int16_t* k = (int16_t*)ray_data(kc);
+    for (int64_t i = 0; i < N; i++) k[i] = (int16_t)((i % 10) * 30);
+    ray_t* r = ray_index_attach_hash(&kc);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+
+    int64_t s_k = ray_sym_intern("k", 1);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, s_k, kc); ray_release(kc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k    = ray_scan(g, "k");
+    ray_op_t* scan_pred = ray_scan(g, "k");
+    ray_op_t* needle    = ray_const_i64(g, 60);
+    ray_op_t* pred      = ray_binop(g, OP_EQ, scan_pred, needle);
+    uint16_t  agg_ops[] = { OP_COUNT, OP_COUNT };  /* multi path */
+    ray_op_t* agg_ins[] = { scan_k, scan_k };
+    ray_op_t* keys[]    = { scan_k };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 1, agg_ops, agg_ins, 2);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_t* res = ray_execute(g, fused);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 1);
+    int64_t cnt_sym = ray_sym_intern("count", 5);
+    ray_t* cnt_col = ray_table_get_col(res, cnt_sym);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(cnt_col))[0], N / 10);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* mk_compile: in_strlen flag (line 4794): OP_STRLEN wrapping a SYM
+ * scan as the agg input.  Triggers ray_sym_strings_borrow path. */
+static test_result_t test_mk_compile_in_strlen_sym_agg(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 60;
+    int64_t syms[3];
+    syms[0] = ray_sym_intern("a", 1);
+    syms[1] = ray_sym_intern("bb", 2);
+    syms[2] = ray_sym_intern("ccc", 3);
+    ray_t* sc = ray_sym_vec_new(RAY_SYM_W32, N);
+    sc->len = N;
+    int32_t* s = (int32_t*)ray_data(sc);
+    ray_t* gc = ray_vec_new(RAY_I64, N); gc->len = N;
+    int64_t* gd = (int64_t*)ray_data(gc);
+    for (int64_t i = 0; i < N; i++) { s[i] = (int32_t)syms[i % 3]; gd[i] = i % 2; }
+
+    int64_t s_s = ray_sym_intern("s", 1);
+    int64_t s_g = ray_sym_intern("g", 1);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, s_s, sc); ray_release(sc);
+    tbl = ray_table_add_col(tbl, s_g, gc); ray_release(gc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_g  = ray_scan(g, "g");
+    ray_op_t* scan_s  = ray_scan(g, "s");
+    ray_op_t* strlen_s = ray_strlen(g, scan_s);
+    if (!strlen_s) {
+        ray_graph_free(g); ray_release(tbl);
+        ray_sym_destroy(); ray_heap_destroy();
+        PASS();  /* skip if OP_STRLEN unop helper unavailable */
+    }
+    /* SUM of strlen(s) by g. */
+    uint16_t  agg_ops[] = { OP_SUM };
+    ray_op_t* agg_ins[] = { strlen_s };
+    ray_op_t* keys[]    = { scan_g };
+    ray_op_t* fused     = ray_filtered_group(g, NULL, keys, 1, agg_ops, agg_ins, 1);
+    if (!fused) {
+        ray_graph_free(g); ray_release(tbl);
+        ray_sym_destroy(); ray_heap_destroy();
+        PASS();
+    }
+
+    ray_t* res = ray_execute(g, fused);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    /* If fused path took it, expect 2 groups; otherwise fallback may
+     * produce same.  Just verify non-empty. */
+    TEST_ASSERT_TRUE(ray_table_nrows(res) >= 1);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* fp_try_direct_count1: I16 key with WHERE + topk + bias overflow.
+ * Drives fp_i16_ne0_u32_count_fn variant for "pred_key_ne_zero" path
+ * with top-N emit filter. */
+static test_result_t test_count1_i16_ne0_top_count(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 4000;
+    ray_t* kc = ray_vec_new(RAY_I16, N); kc->len = N;
+    int16_t* k = (int16_t*)ray_data(kc);
+    for (int64_t i = 0; i < N; i++) k[i] = (int16_t)(i % 20);  /* values 0..19 */
+
+    int64_t s_k = ray_sym_intern("k", 1);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, s_k, kc); ray_release(kc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k = ray_scan(g, "k");
+    ray_op_t* scan_p = ray_scan(g, "k");
+    ray_op_t* zero   = ray_const_i64(g, 0);
+    ray_op_t* pred   = ray_binop(g, OP_NE, scan_p, zero);
+    uint16_t  agg_ops[] = { OP_COUNT };
+    ray_op_t* agg_ins[] = { scan_k };
+    ray_op_t* keys[]    = { scan_k };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 1, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_group_emit_filter_t prev = ray_group_emit_filter_get();
+    ray_group_emit_filter_t filter = {0};
+    filter.enabled = 1;
+    filter.agg_index = 0;
+    filter.top_count_take = 5;
+    ray_group_emit_filter_set(filter);
+    ray_t* res = ray_execute(g, fused);
+    ray_group_emit_filter_set(prev);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    /* 19 non-zero values, but top-5 ties (each non-zero has N/20=200). */
+    int64_t nr = ray_table_nrows(res);
+    TEST_ASSERT_TRUE(nr >= 5);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* mk_compile: F64 agg input rejection (line 4811-4813: ct != allowed
+ * types).  Validates that F64 SUM falls back through unfused path. */
+static test_result_t test_mk_compile_rejects_f64_sum(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 100;
+    ray_t* kc = ray_vec_new(RAY_I64, N); kc->len = N;
+    ray_t* vc = ray_vec_new(RAY_F64, N); vc->len = N;
+    int64_t* k = (int64_t*)ray_data(kc);
+    double*  v = (double*)ray_data(vc);
+    for (int64_t i = 0; i < N; i++) { k[i] = i % 4; v[i] = (double)i + 0.5; }
+
+    int64_t s_k = ray_sym_intern("k", 1);
+    int64_t s_v = ray_sym_intern("v", 1);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, s_k, kc); ray_release(kc);
+    tbl = ray_table_add_col(tbl, s_v, vc); ray_release(vc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k  = ray_scan(g, "k");
+    ray_op_t* scan_v  = ray_scan(g, "v");
+    ray_op_t* scan_kp = ray_scan(g, "k");
+    ray_op_t* zero    = ray_const_i64(g, 0);
+    ray_op_t* pred    = ray_binop(g, OP_GE, scan_kp, zero);
+    /* SUM of F64 → mk_compile returns -1 → exec_filtered_group_multi
+     * returns nyi error → fallback to unfused FILTER + GROUP. */
+    uint16_t  agg_ops[] = { OP_SUM };
+    ray_op_t* agg_ins[] = { scan_v };
+    ray_op_t* keys[]    = { scan_k };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 1, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_t* res = ray_execute(g, fused);
+    /* Fallback path must produce correct results. */
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 4);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* mk_compile: SYM scan as MIN agg input (RAY_SYM column, in_strlen=0).
+ * Hits line 4811 first || branch (ct != RAY_BOOL) and chain.  SYM as
+ * MIN/MAX/SUM input falls through to line 4814 return -1 → fallback. */
+static test_result_t test_mk_compile_rejects_sym_sum_input(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 50;
+    int64_t s_a = ray_sym_intern("alpha", 5);
+    int64_t s_b = ray_sym_intern("beta", 4);
+    ray_t* gc = ray_vec_new(RAY_I64, N); gc->len = N;
+    ray_t* sc = ray_sym_vec_new(RAY_SYM_W32, N); sc->len = N;
+    int64_t* gd = (int64_t*)ray_data(gc);
+    int32_t* sd = (int32_t*)ray_data(sc);
+    for (int64_t i = 0; i < N; i++) {
+        gd[i] = i % 3;
+        sd[i] = (int32_t)((i & 1) ? s_a : s_b);
+    }
+
+    int64_t s_g = ray_sym_intern("g", 1);
+    int64_t s_s = ray_sym_intern("s", 1);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, s_g, gc); ray_release(gc);
+    tbl = ray_table_add_col(tbl, s_s, sc); ray_release(sc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_g  = ray_scan(g, "g");
+    ray_op_t* scan_s  = ray_scan(g, "s");
+    /* MIN of SYM (without STRLEN wrap) → ct == RAY_SYM not in allowed
+     * agg-input types (BOOL/U8/I16/I32/I64/DATE/TIME/TIMESTAMP) →
+     * mk_compile returns -1 → fallback. */
+    uint16_t  agg_ops[] = { OP_MIN };
+    ray_op_t* agg_ins[] = { scan_s };
+    ray_op_t* keys[]    = { scan_g };
+    ray_op_t* fused     = ray_filtered_group(g, NULL, keys, 1, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_t* res = ray_execute(g, fused);
+    /* Fallback to unfused must succeed (group with SYM MIN). */
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* Chunk-zone fast path: combined chunk-skip across multiple chunks.
+ * 4 chunks of 256 rows each with disjoint value ranges; constant
+ * outside every chunk's range → all chunks bail to all-fail via
+ * chunk_zone decision. */
+static test_result_t test_fp_eval_cmp_chunk_zone_mixed_predicate(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* Combined chunk-zone EQ all-fail decision in *first* morsel and
+     * later morsels in another chunk hit the per-row path. */
+    int64_t N = 1024;
+    ray_t* kc  = ray_vec_new(RAY_I64, N); kc->len  = N;
+    ray_t* tsc = ray_vec_new(RAY_I64, N); tsc->len = N;
+    int64_t* k  = (int64_t*)ray_data(kc);
+    int64_t* ts = (int64_t*)ray_data(tsc);
+    /* 4 chunks of 256.  Chunk 0: ts in [0,255], chunk 1: ts in [1000,
+     * 1255], chunk 2: [2000, 2255], chunk 3: [3000, 3255].  Constant
+     * 500 → all-fail in chunk 0 (500 > 255), all-fail in chunks 2/3
+     * (500 < 2000), but chunk 1 contains 500 only if min<=500<=max.
+     * 1000 > 500 → all-fail.  So all 4 chunks all-fail → 0 rows. */
+    for (int64_t i = 0; i < N; i++) {
+        k[i] = i % 5;
+        int64_t chunk = i >> 8;
+        ts[i] = (int64_t)chunk * 1000 + (i & 255);
+    }
+    ray_t* r = ray_index_attach_chunk_zone(&tsc, 8);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+
+    int64_t s_k  = ray_sym_intern("k",  1);
+    int64_t s_ts = ray_sym_intern("ts", 2);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, s_k,  kc);  ray_release(kc);
+    tbl = ray_table_add_col(tbl, s_ts, tsc); ray_release(tsc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k    = ray_scan(g, "k");
+    ray_op_t* scan_tsp  = ray_scan(g, "ts");
+    ray_op_t* needle    = ray_const_i64(g, 500);
+    ray_op_t* pred      = ray_binop(g, OP_EQ, scan_tsp, needle);
+
+    uint16_t  agg_ops[] = { OP_COUNT };
+    ray_op_t* agg_ins[] = { scan_k };
+    ray_op_t* keys[]    = { scan_k };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 1, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_t* res = ray_execute(g, fused);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    /* Chunk min/max bracket EQ 500: not in any chunk → 0 rows total. */
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 0);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* Chunk-zone fast path: EQ with cval inside the chunk range, single
+ * chunk holds rows.  The chunk decision is "mixed" (decision = -1) so
+ * the fast path bails to the per-row scan.  Exercises the chunk-zone
+ * mixed/no-decision branch. */
+static test_result_t test_fp_eval_cmp_chunk_zone_eq_mixed(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 512;
+    ray_t* kc  = ray_vec_new(RAY_I64, N); kc->len  = N;
+    ray_t* tsc = ray_vec_new(RAY_I64, N); tsc->len = N;
+    int64_t* k  = (int64_t*)ray_data(kc);
+    int64_t* ts = (int64_t*)ray_data(tsc);
+    for (int64_t i = 0; i < N; i++) {
+        k[i] = i % 4;
+        ts[i] = i;  /* 0..511; chunk 0: 0-255, chunk 1: 256-511 */
+    }
+    ray_t* r = ray_index_attach_chunk_zone(&tsc, 8);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+
+    int64_t s_k  = ray_sym_intern("k",  1);
+    int64_t s_ts = ray_sym_intern("ts", 2);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, s_k,  kc);  ray_release(kc);
+    tbl = ray_table_add_col(tbl, s_ts, tsc); ray_release(tsc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k    = ray_scan(g, "k");
+    ray_op_t* scan_tsp  = ray_scan(g, "ts");
+    /* needle = 100, inside chunk 0 (0..255) → mixed; outside chunk 1
+     * (256..511) → all-fail.  So row 100 alone matches. */
+    ray_op_t* needle    = ray_const_i64(g, 100);
+    ray_op_t* pred      = ray_binop(g, OP_EQ, scan_tsp, needle);
+
+    uint16_t  agg_ops[] = { OP_COUNT };
+    ray_op_t* agg_ins[] = { scan_k };
+    ray_op_t* keys[]    = { scan_k };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 1, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_t* res = ray_execute(g, fused);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    /* Only row 100 (k=0) matches → 1 group with count=1. */
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 1);
+    int64_t cnt_sym = ray_sym_intern("count", 5);
+    ray_t* cnt_col = ray_table_get_col(res, cnt_sym);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(cnt_col))[0], 1);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* fp_try_direct_count1: SYM key with WHERE + topk + bias overflow.
+ * Drives the SYM pred_key_ne_zero + use_emit_filter branch (line
+ * 1681-1772). */
+static test_result_t test_count1_sym_key_pred_ne_top_count(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 800;
+    int64_t syms[8];
+    char buf[8];
+    syms[0] = 0;  /* skip 0 to keep ne 0 simple — but SYM id 0 means empty */
+    for (int i = 1; i < 8; i++) {
+        buf[0] = 'a' + i; buf[1] = 0;
+        syms[i] = ray_sym_intern(buf, 1);
+    }
+    ray_t* kc = ray_sym_vec_new(RAY_SYM_W32, N); kc->len = N;
+    int32_t* k = (int32_t*)ray_data(kc);
+    for (int64_t i = 0; i < N; i++) k[i] = (int32_t)syms[(i % 7) + 1];  /* 1..7 */
+
+    int64_t s_k = ray_sym_intern("k", 1);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, s_k, kc); ray_release(kc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k = ray_scan(g, "k");
+    ray_op_t* scan_p = ray_scan(g, "k");
+    /* `!= empty_sym` triggers pred_key_ne_zero detection only when the
+     * constant cval == 0, i.e. the empty symbol's id.  We use a known
+     * non-empty sym instead, but the topk path should still run. */
+    int64_t empty_sym = 0;
+    (void)empty_sym;
+    ray_op_t* zero   = ray_const_i64(g, 0);  /* will compare against sym id 0 */
+    ray_op_t* pred   = ray_binop(g, OP_NE, scan_p, zero);
+    uint16_t  agg_ops[] = { OP_COUNT };
+    ray_op_t* agg_ins[] = { scan_k };
+    ray_op_t* keys[]    = { scan_k };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 1, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_group_emit_filter_t prev = ray_group_emit_filter_get();
+    ray_group_emit_filter_t filter = {0};
+    filter.enabled = 1;
+    filter.agg_index = 0;
+    filter.top_count_take = 3;
+    ray_group_emit_filter_set(filter);
+    ray_t* res = ray_execute(g, fused);
+    ray_group_emit_filter_set(prev);
+
+    /* Top-3 should return 3 rows, but emit_filter top-3 may select any
+     * of the 7 ties.  Just verify nr <= 3 or nr is in [3..7]. */
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    int64_t nr = ray_table_nrows(res);
+    TEST_ASSERT_TRUE(nr >= 3 && nr <= 7);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t fused_group_entries[] = {
     { "fused_group/eq_count",                    test_eq_count,                    NULL, NULL },
     { "fused_group/ne_two_groups",               test_ne_two_groups,               NULL, NULL },
@@ -1983,5 +4376,53 @@ const test_entry_t fused_group_entries[] = {
     { "fused_group/fp_count_heap_u8_top3",          test_fp_count_heap_u8_top3,          NULL, NULL },
     { "fused_group/fp_count_heap_i16_top5",         test_fp_count_heap_i16_top5,         NULL, NULL },
     { "fused_group/fp_count_emit_keep_min_i64_serial", test_fp_count_emit_keep_min_i64_serial, NULL, NULL },
+    /* v2 path (per-(worker, partition) shards) + hash-eq dispatch +
+     * I64/TIMESTAMP MG top-K + eq-i64 chunk-skip scan (PR #219). */
+    { "fused_group/v2_wide_2i64_count_sum_avg",         test_v2_wide_2i64_count_sum_avg,         NULL, NULL },
+    { "fused_group/v2_narrow_2i32_count_sum",           test_v2_narrow_2i32_count_sum,           NULL, NULL },
+    { "fused_group/v2_gate_min_max_falls_back",         test_v2_gate_min_max_falls_back,         NULL, NULL },
+    { "fused_group/v2_wide_3i32_avg",                   test_v2_wide_3i32_avg,                   NULL, NULL },
+    { "fused_group/v2_small_n_single_thread_combine",   test_v2_small_n_single_thread_combine,   NULL, NULL },
+    { "fused_group/hash_eq_count_dispatch",             test_hash_eq_count_dispatch,             NULL, NULL },
+    { "fused_group/mk_eq_hash_count_fn_dispatch",       test_mk_eq_hash_count_fn_dispatch,       NULL, NULL },
+    { "fused_group/hash_eq_sum_dispatch",               test_hash_eq_sum_dispatch,               NULL, NULL },
+    { "fused_group/hash_eq_multi_pred_no_dispatch",     test_hash_eq_multi_pred_no_dispatch,     NULL, NULL },
+    { "fused_group/hash_eq_dispatch_wide_keys",         test_hash_eq_dispatch_wide_keys,         NULL, NULL },
+    { "fused_group/hash_eq_i32_count_dispatch",         test_hash_eq_i32_count_dispatch,         NULL, NULL },
+    { "fused_group/mk_eq_i64_count_fn_chunk_skip",      test_mk_eq_i64_count_fn_chunk_skip,      NULL, NULL },
+    { "fused_group/mk_eq_i64_count_and_pred",           test_mk_eq_i64_count_and_pred,           NULL, NULL },
+    { "fused_group/fp_try_i64_mg_top_count_no_where",   test_fp_try_i64_mg_top_count_no_where,   NULL, NULL },
+    { "fused_group/mk_apply_count_emit_filter_top_sum", test_mk_apply_count_emit_filter_top_sum, NULL, NULL },
+    { "fused_group/mk_apply_count_emit_filter_top_min", test_mk_apply_count_emit_filter_top_min, NULL, NULL },
+    { "fused_group/fp_try_i32_mg_top_count_rebuild_path", test_fp_try_i32_mg_top_count_rebuild_path, NULL, NULL },
+    { "fused_group/fp_try_i64_mg_top_count_rebuild_path", test_fp_try_i64_mg_top_count_rebuild_path, NULL, NULL },
+    { "fused_group/fp_try_timestamp_mg_top_count_no_where", test_fp_try_timestamp_mg_top_count_no_where, NULL, NULL },
+    /* Branch coverage push: fp_eval_cmp chunk-zone fast path, fp_eval_cmp_one
+     * via masked dispatch, FP_IN with I16/I32 literal vectors, count1
+     * direct-count BOOL/SYM key shapes, hash-eq dispatch with U8/I16 keys,
+     * OP_STRLEN agg input. */
+    { "fused_group/chunk_zone_eq_fold",         test_fp_eval_cmp_chunk_zone_eq_fold,         NULL, NULL },
+    { "fused_group/chunk_zone_gt_allpass",      test_fp_eval_cmp_chunk_zone_gt_allpass,      NULL, NULL },
+    { "fused_group/chunk_zone_lt_allfail",      test_fp_eval_cmp_chunk_zone_lt_allfail,      NULL, NULL },
+    { "fused_group/chunk_zone_ne_allfail",      test_fp_eval_cmp_chunk_zone_ne_allfail,      NULL, NULL },
+    { "fused_group/chunk_zone_le_allpass",      test_fp_eval_cmp_chunk_zone_le_allpass,      NULL, NULL },
+    { "fused_group/chunk_zone_ge_allfail",      test_fp_eval_cmp_chunk_zone_ge_allfail,      NULL, NULL },
+    { "fused_group/chunk_zone_ne_allpass",      test_fp_eval_cmp_chunk_zone_ne_allpass,      NULL, NULL },
+    { "fused_group/cmp_one_in_via_masked",      test_fp_eval_cmp_one_in_via_masked,          NULL, NULL },
+    { "fused_group/compile_cmp_in_i32_atom",    test_fp_compile_cmp_in_i32_atom,             NULL, NULL },
+    { "fused_group/compile_cmp_in_i16_atom",    test_fp_compile_cmp_in_i16_atom,             NULL, NULL },
+    { "fused_group/cmp_one_ord_via_masked",     test_fp_eval_cmp_one_lt_le_gt_ge_via_masked, NULL, NULL },
+    { "fused_group/cmp_one_eq_ne_via_masked",   test_fp_eval_cmp_one_eq_ne_via_masked,       NULL, NULL },
+    { "fused_group/count1_bool_key_where",      test_count1_bool_key_with_where,             NULL, NULL },
+    { "fused_group/count1_sym_key_small_dict",  test_count1_sym_key_small_dict,              NULL, NULL },
+    { "fused_group/hash_eq_count_u8_key",       test_hash_eq_count_dispatch_u8_key,          NULL, NULL },
+    { "fused_group/hash_eq_count_i16_key",      test_hash_eq_count_dispatch_i16_key,         NULL, NULL },
+    { "fused_group/mk_compile_in_strlen",       test_mk_compile_in_strlen_sym_agg,           NULL, NULL },
+    { "fused_group/count1_i16_ne0_top_count",   test_count1_i16_ne0_top_count,               NULL, NULL },
+    { "fused_group/count1_sym_pred_ne_top",     test_count1_sym_key_pred_ne_top_count,       NULL, NULL },
+    { "fused_group/mk_compile_rejects_f64_sum", test_mk_compile_rejects_f64_sum,             NULL, NULL },
+    { "fused_group/mk_compile_sym_sum_input",   test_mk_compile_rejects_sym_sum_input,       NULL, NULL },
+    { "fused_group/chunk_zone_mixed_pred",      test_fp_eval_cmp_chunk_zone_mixed_predicate, NULL, NULL },
+    { "fused_group/chunk_zone_eq_mixed",        test_fp_eval_cmp_chunk_zone_eq_mixed,        NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };

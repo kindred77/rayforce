@@ -1525,6 +1525,667 @@ static test_result_t test_merge_foreign_pool_fallback(void) {
     PASS();
 }
 
+/* ===========================================================================
+ * Branch-coverage push for heap.c — targets reachable functional branches
+ * left uncovered by the tests above and the rfl heap_coverage suite.
+ *
+ * Focus areas (with heap.c line refs against the current tree):
+ *   - ray_retain_owned_refs: NULL/ERR-child short-circuit False sides and
+ *     the HNSW / GRAPH / LAMBDA / TABLE / MAPCOMMON / PARTED / LIST / STR
+ *     atom & compound branches (L607-710)
+ *   - ray_detach_owned_refs (static; reached via ray_scratch_realloc):
+ *     the HNSW / GRAPH / STR arms (L729-776).  The LAMBDA and INDEX detach
+ *     arms are documented as unreachable via realloc (see notes inline).
+ *   - ray_alloc_copy: ERR input + negative-len / overflow OOM guards
+ *     and the invalid-generic-type arm (L999-1033)
+ *   - ray_scratch_realloc: LIST/PARTED negative-len, invalid type, the
+ *     ARENA-flag skip, and the mmod!=0 clamp-skip (L1074-1106)
+ *   - ray_free: mmod==1 vector / TABLE / STR arms and the h==NULL guard
+ *     (L921-944)
+ *   - ray_pool_of oversized downward-walk slow path (heap.h L275-288)
+ *   - ray_order_for_size SIZE_MAX overflow + heap_add_pool pool_order
+ *     overflow at the max order boundary (L162, L271)
+ * =========================================================================== */
+
+#include "store/hnsw.h"   /* ray_hnsw_build / ray_hnsw_free */
+#include "table/sym.h"    /* RAY_TYPE_COUNT (via core/types.h) */
+
+/* ---- ray_retain_owned_refs: direct fan-out over every type family ---------
+ *
+ * ray_retain_owned_refs is a public entry point (heap.h).  Calling it
+ * directly lets us deterministically drive each type arm AND the
+ * "child == NULL" False side of every `child && !RAY_IS_ERR(child)`
+ * short-circuit — the dominant cluster of uncovered branches in the
+ * function.  We retain then release symmetrically so refcounts stay sane. */
+
+static test_result_t test_retain_owned_refs_null_and_err(void) {
+    /* NULL input: early-return true (L608 True via !v). */
+    TEST_ASSERT_TRUE(ray_retain_owned_refs(NULL));
+
+    /* Error object: early-return true (L608 True via RAY_IS_ERR). */
+    ray_t* err = ray_error("oom", NULL);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(err));
+    TEST_ASSERT_TRUE(ray_retain_owned_refs(err));
+    ray_error_free(err);
+    PASS();
+}
+
+static test_result_t test_retain_owned_refs_lambda_null_slots(void) {
+    /* LAMBDA branch (L611-619): mix of NULL and live child slots exercises
+     * both sides of the `slots[i] && !RAY_IS_ERR(slots[i])` guard and the
+     * `if (LAMBDA_NFO/DBG)` NULL guards. */
+    size_t lam_data = 7 * sizeof(ray_t*);
+    ray_t* lam = ray_alloc(lam_data);
+    TEST_ASSERT_NOT_NULL(lam);
+    lam->type = RAY_LAMBDA;
+    memset(ray_data(lam), 0, lam_data);
+
+    ray_t* live = ray_alloc(0);
+    TEST_ASSERT_NOT_NULL(live);
+    live->type = -RAY_I64;
+    uint32_t rc0 = live->rc;
+
+    ray_t** sl = (ray_t**)ray_data(lam);
+    sl[0] = live;   /* live param  */
+    sl[1] = NULL;   /* NULL body — False side of guard */
+    sl[2] = NULL;   /* NULL bytecode */
+    sl[3] = NULL;   /* NULL constants */
+    LAMBDA_NFO(lam) = NULL;  /* NULL NFO — False side */
+    LAMBDA_DBG(lam) = NULL;  /* NULL DBG — False side */
+
+    TEST_ASSERT_TRUE(ray_retain_owned_refs(lam));
+    TEST_ASSERT_EQ_U(live->rc, rc0 + 1);   /* only the live slot retained */
+
+    ray_release(live);            /* undo the retain */
+    sl[0] = NULL;                 /* detach so lam's free is a no-op */
+    ray_free(lam);
+    ray_free(live);
+    PASS();
+}
+
+static test_result_t test_retain_owned_refs_list_null_children(void) {
+    /* LIST branch (L703-708): a list with interleaved NULL slots drives
+     * both sides of the per-element `child && !RAY_IS_ERR(child)` guard. */
+    ray_t* a = ray_alloc(0); a->type = -RAY_I64; a->i64 = 1;
+    ray_t* b = ray_alloc(0); b->type = -RAY_I64; b->i64 = 2;
+    TEST_ASSERT_NOT_NULL(a);
+    TEST_ASSERT_NOT_NULL(b);
+
+    ray_t* list = ray_alloc(4 * sizeof(ray_t*));
+    TEST_ASSERT_NOT_NULL(list);
+    list->type = RAY_LIST;
+    list->len  = 4;
+    ray_t** slots = (ray_t**)ray_data(list);
+    slots[0] = a;
+    slots[1] = NULL;   /* NULL — False side */
+    slots[2] = b;
+    slots[3] = NULL;   /* NULL — False side */
+
+    uint32_t a_rc = a->rc, b_rc = b->rc;
+    TEST_ASSERT_TRUE(ray_retain_owned_refs(list));
+    TEST_ASSERT_EQ_U(a->rc, a_rc + 1);
+    TEST_ASSERT_EQ_U(b->rc, b_rc + 1);
+
+    ray_release(a);
+    ray_release(b);
+    slots[0] = slots[2] = NULL;  /* detach so list free is a no-op */
+    list->len = 0;
+    ray_free(list);
+    ray_free(a);
+    ray_free(b);
+    PASS();
+}
+
+static test_result_t test_retain_owned_refs_table_dict_mc_null(void) {
+    /* TABLE/MAPCOMMON branches with one NULL slot each — drives the False
+     * side of the `slots[0]/slots[1] && !RAY_IS_ERR` guards (L690-699). */
+    ray_t* x = ray_alloc(0); x->type = -RAY_I64; x->i64 = 7;
+    TEST_ASSERT_NOT_NULL(x);
+
+    /* TABLE: slot0 live, slot1 NULL. */
+    ray_t* tbl = ray_alloc(2 * sizeof(ray_t*));
+    TEST_ASSERT_NOT_NULL(tbl);
+    tbl->type = RAY_TABLE;
+    tbl->len  = 0;
+    ray_t** ts = (ray_t**)ray_data(tbl);
+    ts[0] = x; ts[1] = NULL;
+    uint32_t xrc = x->rc;
+    TEST_ASSERT_TRUE(ray_retain_owned_refs(tbl));
+    TEST_ASSERT_EQ_U(x->rc, xrc + 1);
+    ray_release(x);
+    ts[0] = NULL; ray_free(tbl);
+
+    /* MAPCOMMON: slot0 NULL, slot1 live. */
+    ray_t* mc = ray_alloc(2 * sizeof(ray_t*));
+    TEST_ASSERT_NOT_NULL(mc);
+    mc->type = RAY_MAPCOMMON;
+    mc->len  = 2;
+    ray_t** ms = (ray_t**)ray_data(mc);
+    ms[0] = NULL; ms[1] = x;
+    xrc = x->rc;
+    TEST_ASSERT_TRUE(ray_retain_owned_refs(mc));
+    TEST_ASSERT_EQ_U(x->rc, xrc + 1);
+    ray_release(x);
+    ms[1] = NULL; ray_free(mc);
+
+    ray_free(x);
+    PASS();
+}
+
+static test_result_t test_retain_owned_refs_parted_null_seg(void) {
+    /* PARTED branch (L679-686): a segment slot left NULL drives the
+     * `segs[i] && !RAY_IS_ERR` False side. */
+    ray_t* seg = ray_alloc(2 * sizeof(int64_t));
+    TEST_ASSERT_NOT_NULL(seg);
+    seg->type = RAY_I64; seg->len = 2;
+
+    ray_t* parted = ray_alloc(3 * sizeof(ray_t*));
+    TEST_ASSERT_NOT_NULL(parted);
+    parted->type = (int8_t)(RAY_PARTED_BASE + RAY_I64);
+    parted->len  = 3;
+    ray_t** slots = (ray_t**)ray_data(parted);
+    slots[0] = seg;
+    slots[1] = NULL;   /* False side */
+    slots[2] = NULL;   /* False side */
+
+    uint32_t rc = seg->rc;
+    TEST_ASSERT_TRUE(ray_retain_owned_refs(parted));
+    TEST_ASSERT_EQ_U(seg->rc, rc + 1);
+
+    ray_release(seg);
+    slots[0] = NULL; parted->len = 0; ray_free(parted);
+    ray_free(seg);
+    PASS();
+}
+
+static test_result_t test_retain_owned_refs_str_null_pool(void) {
+    /* STR branch (L676): str_pool NULL drives the False side of the
+     * `v->str_pool && !RAY_IS_ERR` guard.  Falls through to return true. */
+    ray_t* s = ray_alloc(0);
+    TEST_ASSERT_NOT_NULL(s);
+    s->type = RAY_STR;
+    s->len  = 0;
+    s->str_pool = NULL;   /* False side */
+    TEST_ASSERT_TRUE(ray_retain_owned_refs(s));
+    s->type = -RAY_I64;   /* avoid str_pool path on free */
+    ray_free(s);
+    PASS();
+}
+
+/* ---- ray_alloc_copy / ray_retain HNSW handle (deep clone) -----------------
+ *
+ * An HNSW handle is a -RAY_I64 atom carrying a ray_hnsw_t* in .i64 with
+ * RAY_ATTR_HNSW set.  ray_alloc_copy treats it as an atom (data_size=0),
+ * then ray_retain_owned_refs deep-clones the index (L628-639).  The copy
+ * owns an independent clone; releasing both frees both indexes. */
+
+static test_result_t test_alloc_copy_hnsw_handle(void) {
+    /* Build a tiny 4-vector, 3-dim L2 index directly. */
+    static const float vecs[12] = {
+        1.0f, 0.0f, 0.0f,
+        0.9f, 0.1f, 0.0f,
+        0.0f, 1.0f, 0.0f,
+        0.5f, 0.5f, 0.0f,
+    };
+    ray_hnsw_t* idx = ray_hnsw_build(vecs, 4, 3, RAY_HNSW_L2, 8, 100);
+    if (!idx) SKIP("hnsw build unavailable");
+
+    ray_t* h = ray_alloc(0);
+    TEST_ASSERT_NOT_NULL(h);
+    h->type   = -RAY_I64;
+    h->attrs |= RAY_ATTR_HNSW;
+    h->i64    = (int64_t)(uintptr_t)idx;
+
+    /* alloc_copy → retain_owned_refs HNSW clone branch (L630-637). */
+    ray_t* copy = ray_alloc_copy(h);
+    TEST_ASSERT_NOT_NULL(copy);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(copy));
+    TEST_ASSERT_TRUE(copy->attrs & RAY_ATTR_HNSW);
+    /* Clone must be a distinct pointer from the source's index. */
+    TEST_ASSERT_TRUE((uintptr_t)copy->i64 != (uintptr_t)h->i64);
+    TEST_ASSERT_TRUE(copy->i64 != 0);
+
+    /* Releasing each frees its own index via ray_release_owned_refs. */
+    ray_free(copy);   /* frees the clone */
+    ray_free(h);      /* frees the original */
+    PASS();
+}
+
+/* ---- ray_detach_owned_refs HNSW / GRAPH / LAMBDA / STR via realloc --------
+ *
+ * ray_detach_owned_refs is static; ray_scratch_realloc reaches it on the
+ * old block after transferring ownership to the new block via memcpy.
+ * For an HNSW atom: the new block inherits the handle (i64 copied), the
+ * old block is detached (i64 zeroed) and freed.  Freeing the new block
+ * then frees the handle exactly once. */
+
+static test_result_t test_scratch_realloc_hnsw_handle(void) {
+    static const float vecs[6] = { 1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f };
+    ray_hnsw_t* idx = ray_hnsw_build(vecs, 2, 3, RAY_HNSW_L2, 8, 100);
+    if (!idx) SKIP("hnsw build unavailable");
+
+    ray_t* h = ray_alloc(0);
+    TEST_ASSERT_NOT_NULL(h);
+    h->type   = -RAY_I64;
+    h->attrs |= RAY_ATTR_HNSW;
+    h->i64    = (int64_t)(uintptr_t)idx;
+
+    /* realloc copies the header (incl i64 + HNSW bit) to h2, then
+     * ray_detach_owned_refs(h) zeroes h's i64 (L731-734) before freeing it. */
+    ray_t* h2 = ray_scratch_realloc(h, 0);
+    TEST_ASSERT_NOT_NULL(h2);
+    TEST_ASSERT_TRUE(h2->attrs & RAY_ATTR_HNSW);
+    TEST_ASSERT_EQ_I(h2->i64, (int64_t)(uintptr_t)idx);
+
+    ray_free(h2);   /* frees idx exactly once */
+    PASS();
+}
+
+static test_result_t test_scratch_realloc_graph_handle(void) {
+    /* GRAPH handle: -RAY_I64 atom with RAY_ATTR_GRAPH.  ray_detach_owned_refs
+     * only zeroes i64 + clears the bit (L738-741) — it never dereferences
+     * the rel pointer.  We use a sentinel non-NULL value and clear the bit
+     * on the surviving block so no ray_rel_free ever runs on the fake ptr. */
+    ray_t* g = ray_alloc(0);
+    TEST_ASSERT_NOT_NULL(g);
+    g->type   = -RAY_I64;
+    g->attrs |= RAY_ATTR_GRAPH;
+    g->i64    = (int64_t)0x1234;   /* sentinel — never dereferenced */
+
+    ray_t* g2 = ray_scratch_realloc(g, 0);   /* detaches g (L738-741) */
+    TEST_ASSERT_NOT_NULL(g2);
+    TEST_ASSERT_TRUE(g2->attrs & RAY_ATTR_GRAPH);
+    /* Neutralize g2 so its free doesn't ray_rel_free the fake pointer. */
+    g2->attrs &= (uint8_t)~RAY_ATTR_GRAPH;
+    g2->i64 = 0;
+    ray_free(g2);
+    PASS();
+}
+
+/* NOTE: the LAMBDA detach arm (heap.c L717-722) is not safely reachable via
+ * ray_scratch_realloc: RAY_LAMBDA is an atom, so ray_scratch_realloc sizes
+ * the copy as data_size=0 and never transfers the lambda's 7 payload slots —
+ * reallocating a lambda is therefore unsound (the new block would carry
+ * garbage slot pointers).  The LAMBDA retain/release arms ARE exercised
+ * (test_release_lambda_owned_refs above, the rfl fn/map/fact cases, and
+ * test_retain_owned_refs_lambda_null_slots here); only the detach arm is
+ * left documented.  HNSW/GRAPH atoms, by contrast, keep all their state in
+ * the 32-byte header, so their detach arms ARE reachable via realloc. */
+
+static test_result_t test_scratch_realloc_str_detach(void) {
+    /* STR detach branch (L774-775): realloc a STR block — old block's
+     * str_pool is nulled before free; the pool ownership moves to the new
+     * block which we then release. */
+    ray_t* pool = ray_alloc(64);
+    TEST_ASSERT_NOT_NULL(pool);
+    pool->type = RAY_U8;
+    pool->len  = 64;
+
+    ray_t* s = ray_alloc(0);
+    TEST_ASSERT_NOT_NULL(s);
+    s->type = RAY_STR;
+    s->len  = 0;
+    s->str_pool = pool;   /* s owns the only ref */
+
+    ray_t* s2 = ray_scratch_realloc(s, 0);   /* detaches s (str_pool=NULL) */
+    TEST_ASSERT_NOT_NULL(s2);
+    TEST_ASSERT_EQ_I(s2->type, RAY_STR);
+    TEST_ASSERT_EQ_PTR(s2->str_pool, pool);   /* ownership transferred */
+
+    ray_release(s2);   /* releases the pool via release_owned_refs */
+    ray_t* probe = ray_alloc(0);
+    TEST_ASSERT_NOT_NULL(probe);
+    ray_free(probe);
+    PASS();
+}
+
+/* NOTE: the RAY_INDEX kind-switch in ray_detach_owned_refs (heap.c L754-765)
+ * is defensive: ray_detach_owned_refs is only ever invoked from
+ * ray_scratch_realloc, and no caller of ray_scratch_realloc ever passes a
+ * RAY_INDEX block (callers in vec.c / list.c realloc only LIST, typed
+ * vectors and str_pools — see grep).  Moreover RAY_INDEX (=97) is not a
+ * vector type, so ray_scratch_realloc/ray_alloc_copy would size the copy as
+ * header-only (data_size=0) and corrupt the payload — making a realloc of an
+ * index block unsound.  Hence the INDEX detach arm is unreachable from any
+ * public entry point and is left documented rather than forced.  The RAY_INDEX
+ * retain/release payload paths ARE exercised via the rfl .idx.* suite. */
+
+/* ---- ray_alloc_copy error / overflow guard branches -----------------------
+ *
+ * Drives the OOM-guard arms that a normal value never hits:
+ *   - ERR input (L999)
+ *   - invalid generic type (L1026 True: data_size=0)
+ *   - negative len in the typed-vector arm (L1030 → oom)
+ *   - negative len in the LIST arm (L1021 → oom)
+ *   - negative len in the PARTED/MAPCOMMON arm (L1014 → oom) */
+
+static test_result_t test_alloc_copy_err_and_overflow(void) {
+    /* ERR input → NULL (L999). */
+    ray_t* err = ray_error("oom", NULL);
+    TEST_ASSERT_NULL(ray_alloc_copy(err));
+    ray_error_free(err);
+
+    /* NULL input → NULL (L999 via !v). */
+    TEST_ASSERT_NULL(ray_alloc_copy(NULL));
+
+    /* Typed vector with negative len → oom (L1030 True). */
+    ray_t* badvec = ray_alloc(0);
+    TEST_ASSERT_NOT_NULL(badvec);
+    badvec->type = RAY_I64;
+    badvec->len  = -1;
+    ray_t* r1 = ray_alloc_copy(badvec);
+    TEST_ASSERT_NOT_NULL(r1);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r1));
+    ray_error_free(r1);
+    badvec->len = 0;
+    ray_free(badvec);
+
+    /* LIST with negative len → oom (L1021 True). */
+    ray_t* badlist = ray_alloc(0);
+    TEST_ASSERT_NOT_NULL(badlist);
+    badlist->type = RAY_LIST;
+    badlist->len  = -1;
+    ray_t* r2 = ray_alloc_copy(badlist);
+    TEST_ASSERT_NOT_NULL(r2);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r2));
+    ray_error_free(r2);
+    badlist->len = 0;
+    ray_free(badlist);
+
+    /* PARTED with negative len → oom (L1014 True). */
+    ray_t* badparted = ray_alloc(0);
+    TEST_ASSERT_NOT_NULL(badparted);
+    badparted->type = (int8_t)(RAY_PARTED_BASE + RAY_I64);
+    badparted->len  = -1;
+    ray_t* r3 = ray_alloc_copy(badparted);
+    TEST_ASSERT_NOT_NULL(r3);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r3));
+    ray_error_free(r3);
+    badparted->len = 0;
+    ray_free(badparted);
+    PASS();
+}
+
+static test_result_t test_alloc_copy_invalid_generic_type(void) {
+    /* A positive type >= RAY_TYPE_COUNT routes to the generic else with
+     * t >= RAY_TYPE_COUNT → data_size = 0 (L1026 True).  The copy is a
+     * header-only block. */
+    ray_t* v = ray_alloc(0);
+    TEST_ASSERT_NOT_NULL(v);
+    v->type = (int8_t)(RAY_TYPE_COUNT);  /* out-of-range positive type */
+    v->len  = 0;
+    ray_t* c = ray_alloc_copy(v);
+    TEST_ASSERT_NOT_NULL(c);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(c));
+    TEST_ASSERT_EQ_I(c->type, (int8_t)RAY_TYPE_COUNT);
+    v->type = -RAY_I64;   /* atom on free */
+    c->type = -RAY_I64;
+    ray_free(v);
+    ray_free(c);
+    PASS();
+}
+
+/* ---- ray_scratch_realloc guard branches -----------------------------------
+ *
+ *   - LIST with negative len → old_data=0 (L1075 True)
+ *   - PARTED with negative len → n_ptrs clamped to 0 (L1082 True)
+ *   - invalid generic type → old_data=0 (L1086 ternary False)
+ *   - ARENA-flagged block → skip detach+free (L1106 False)
+ *   - mmod!=0 block → skip the alloc-size clamp (L1090 False) */
+
+static test_result_t test_scratch_realloc_list_neg_len(void) {
+    ray_t* badlist = ray_alloc(0);
+    TEST_ASSERT_NOT_NULL(badlist);
+    badlist->type = RAY_LIST;
+    badlist->len  = -1;          /* L1075 True: old_data=0 */
+    ray_t* w = ray_scratch_realloc(badlist, 64);
+    TEST_ASSERT_NOT_NULL(w);
+    /* badlist was freed by realloc (len reset path); just confirm heap sane */
+    ray_free(w);
+    PASS();
+}
+
+static test_result_t test_scratch_realloc_parted_neg_len(void) {
+    ray_t* badparted = ray_alloc(0);
+    TEST_ASSERT_NOT_NULL(badparted);
+    badparted->type = (int8_t)(RAY_PARTED_BASE + RAY_I64);
+    badparted->len  = -1;        /* L1082 True: n_ptrs clamped to 0 */
+    ray_t* w = ray_scratch_realloc(badparted, 64);
+    TEST_ASSERT_NOT_NULL(w);
+    ray_free(w);
+    PASS();
+}
+
+static test_result_t test_scratch_realloc_invalid_type(void) {
+    /* Generic else arm with out-of-range type → ternary takes the
+     * old_data=0 branch (L1086 False side of the type/len test). */
+    ray_t* v = ray_alloc(64);
+    TEST_ASSERT_NOT_NULL(v);
+    v->type = (int8_t)(RAY_TYPE_COUNT);  /* >= count → invalid */
+    v->len  = 4;
+    ray_t* w = ray_scratch_realloc(v, 128);
+    TEST_ASSERT_NOT_NULL(w);
+    w->type = -RAY_I64;   /* atom on free */
+    ray_free(w);
+    PASS();
+}
+
+static test_result_t test_scratch_realloc_arena_skip(void) {
+    /* ARENA-flagged old block: ray_scratch_realloc must NOT detach/free it
+     * (L1106 False).  The old block remains valid afterwards. */
+    ray_t* v = ray_alloc(64);
+    TEST_ASSERT_NOT_NULL(v);
+    v->type = RAY_I64;
+    v->len  = 4;
+    int64_t* d = (int64_t*)ray_data(v);
+    for (int i = 0; i < 4; i++) d[i] = (int64_t)(i + 100);
+    v->attrs |= RAY_ATTR_ARENA;
+
+    ray_t* w = ray_scratch_realloc(v, 8 * sizeof(int64_t));
+    TEST_ASSERT_NOT_NULL(w);
+    /* v was NOT freed — its data must still be intact. */
+    TEST_ASSERT_TRUE(v->attrs & RAY_ATTR_ARENA);
+    int64_t* vd = (int64_t*)ray_data(v);
+    for (int i = 0; i < 4; i++) TEST_ASSERT_EQ_I(vd[i], (int64_t)(i + 100));
+
+    ray_free(w);
+    v->attrs &= (uint8_t)~RAY_ATTR_ARENA;
+    ray_free(v);
+    PASS();
+}
+
+static test_result_t test_scratch_realloc_mmod_skip_clamp(void) {
+    /* mmod != 0 old block: the alloc-size clamp at L1090 is skipped
+     * (its guard is `v->mmod == 0 && ...`).  Use a fake mmap'd page as the
+     * source so mmod can be 1 without corrupting heap bookkeeping; realloc
+     * copies header bytes and, since mmod!=0, takes the no-free path
+     * is NOT applicable here (mmod!=0 still detaches+frees), so the source
+     * is a heap block we leave mmod=1 only transiently for the copy math. */
+    ray_t* v = ray_alloc(16 * sizeof(int64_t));
+    TEST_ASSERT_NOT_NULL(v);
+    v->type = RAY_I64;
+    v->len  = 16;
+    int64_t* d = (int64_t*)ray_data(v);
+    for (int i = 0; i < 16; i++) d[i] = (int64_t)i;
+    v->attrs |= RAY_ATTR_ARENA;   /* keep realloc from freeing this heap block */
+    v->mmod = 1;                  /* L1090 guard False: skip the clamp */
+
+    ray_t* w = ray_scratch_realloc(v, 32 * sizeof(int64_t));
+    TEST_ASSERT_NOT_NULL(w);
+    /* w copied up to old_data bytes (unclamped) — first 16 round-trip. */
+    int64_t* wd = (int64_t*)ray_data(w);
+    for (int i = 0; i < 16; i++) TEST_ASSERT_EQ_I(wd[i], (int64_t)i);
+
+    ray_free(w);
+    v->mmod = 0;
+    v->attrs &= (uint8_t)~RAY_ATTR_ARENA;
+    ray_free(v);
+    PASS();
+}
+
+/* ---- ray_free mmod==1 (file-mapped) vector / TABLE / STR arms --------------
+ *
+ * Uses fake anonymous pages standing in for file mappings, mirroring the
+ * existing test_free_mmod1_atom.  ray_vm_unmap_file will munmap them. */
+
+static test_result_t test_free_mmod1_vector(void) {
+    /* mmod==1 with a positive vector type → L923 True branch computes
+     * data_size from len*esz (32 + 100*8 = 832 → rounded to 4096) and
+     * unmaps exactly that size, so map exactly one page. */
+    void* page = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    TEST_ASSERT(page != MAP_FAILED, "mmap for fake mmod==1 vector");
+    ray_t* v = (ray_t*)page;
+    memset(v, 0, 32);
+    v->rc = 1; v->mmod = 1; v->order = 6;
+    v->type = RAY_I64;    /* positive vector type → L923 True */
+    v->len  = 100;        /* 100 * 8 = 800 bytes → one 4 KB page */
+    ray_free(v);          /* ray_vm_unmap_file with computed size (4096) */
+
+    ray_t* probe = ray_alloc(0);
+    TEST_ASSERT_NOT_NULL(probe);
+    ray_free(probe);
+    PASS();
+}
+
+static test_result_t test_free_mmod1_table(void) {
+    /* mmod==1 with RAY_TABLE → L922 True: early return (no unmap). */
+    void* page = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    TEST_ASSERT(page != MAP_FAILED, "mmap for fake mmod==1 table");
+    ray_t* v = (ray_t*)page;
+    memset(v, 0, 32);
+    v->rc = 1; v->mmod = 1; v->order = 6;
+    v->type = RAY_TABLE;   /* L922 True: TABLE/DICT/LIST early return */
+    ray_free(v);           /* returns without unmapping */
+
+    /* Page was NOT unmapped — still writable. */
+    ((char*)page)[0] = 'z';
+    munmap(page, 4096);
+    PASS();
+}
+
+static test_result_t test_free_mmod1_str_with_pool(void) {
+    /* mmod==1 RAY_STR with a str_pool whose len>0 → L926-928 True path
+     * (data_size includes the pool length).  With len=4 and pool_len=32 the
+     * computed data_size stays well under 4 KB → unmaps exactly one page. */
+    void* page = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    TEST_ASSERT(page != MAP_FAILED, "mmap for fake mmod==1 str");
+
+    /* A normal heap pool block standing in as the str_pool.  Give it rc=2
+     * so ray_release_owned_refs (run by ray_free before the mmod==1 arm)
+     * only drops it to rc=1 — leaving it alive so the subsequent read of
+     * v->str_pool->len at heap.c L928 is not a use-after-free. */
+    ray_t* pool = ray_alloc(64);
+    TEST_ASSERT_NOT_NULL(pool);
+    pool->type = RAY_U8;
+    pool->len  = 32;       /* pool_len > 0 → L928 True */
+    ray_retain(pool);      /* rc = 2 */
+
+    ray_t* v = (ray_t*)page;
+    memset(v, 0, 32);
+    v->rc = 1; v->mmod = 1; v->order = 6;
+    v->type = RAY_STR;
+    v->len  = 4;
+    v->str_pool = pool;    /* str_pool present, len>0 */
+
+    /* ray_free runs release_owned_refs (pool rc 2→1), then takes the
+     * mmod==1 STR arm reading pool->len (L928) and unmaps the page. */
+    ray_free(v);
+    TEST_ASSERT_EQ_U(pool->rc, 1);   /* pool survived */
+    ray_free(pool);                  /* now release it */
+
+    ray_t* probe = ray_alloc(0);
+    TEST_ASSERT_NOT_NULL(probe);
+    ray_free(probe);
+    PASS();
+}
+
+static test_result_t test_free_no_heap(void) {
+    /* h == NULL guard (L944): with ray_tl_heap NULL, freeing a normal
+     * (mmod==0, order-valid) block hits `if (!h) return` and leaks the
+     * block.  The block belongs to the saved heap's pool, reclaimed at
+     * teardown — no real leak across the suite. */
+    ray_t* v = ray_alloc(64);
+    TEST_ASSERT_NOT_NULL(v);
+    v->type = -RAY_I64;
+
+    ray_heap_t* save = ray_tl_heap;
+    ray_tl_heap = NULL;
+    ray_free(v);            /* L944: !h → return (block intentionally leaked) */
+    ray_tl_heap = save;
+
+    /* Block was not freed: still readable. */
+    TEST_ASSERT_EQ_I(v->type, -RAY_I64);
+    PASS();
+}
+
+/* ---- ray_pool_of oversized pool downward-walk slow path -------------------
+ *
+ * An oversized pool (pool_order > 25) spans multiple 32 MB-aligned regions.
+ * A block carved into a region whose 32 MB-aligned base is NOT the pool
+ * header forces ray_pool_of's downward walk (heap.h L275-288).  We trigger
+ * it by allocating the oversized pool (one big block) then a smaller block
+ * that lands in the pool's later half, and freeing the smaller one — which
+ * calls ray_pool_of and must resolve the header via the walk. */
+
+static test_result_t test_pool_of_oversized_walk(void) {
+    /* Force a standard pool first so the heap is multi-pool. */
+    ray_t* anchor = ray_alloc(64);
+    TEST_ASSERT_NOT_NULL(anchor);
+
+    /* Allocate a >32 MB block → oversized pool (pool_order 27, 128 MB),
+     * with the right-half blocks placed in the freelist. */
+    size_t big = (size_t)1 << 26;   /* 64 MB data */
+    ray_t* huge = ray_alloc(big);
+    if (!huge) {
+        ray_free(anchor);
+        SKIP("oversized pool alloc unavailable");
+    }
+    uint32_t pools = ray_tl_heap->pool_count;
+    TEST_ASSERT((pools) >= (2), "oversized pool created");
+
+    /* Free the huge block, then allocate a medium block.  The buddy
+     * allocator will carve it from the oversized pool's freelist — placing
+     * it deep inside the pool (not at the 32 MB-aligned header).  Freeing
+     * it exercises the downward-walk in ray_pool_of. */
+    ray_free(huge);
+    ray_t* mid = ray_alloc((size_t)1 << 24);   /* 16 MB — far from base */
+    TEST_ASSERT_NOT_NULL(mid);
+    /* Writing + freeing both validates the resolved pool header is correct. */
+    memset(ray_data(mid), 0x5a, 4096);
+    ray_free(mid);
+
+    ray_heap_gc();   /* reclaim the now-empty oversized pool */
+    ray_free(anchor);
+    PASS();
+}
+
+/* ---- ray_order_for_size SIZE_MAX overflow + max-order pool overflow -------
+ *
+ * ray_order_for_size(SIZE_MAX) returns RAY_HEAP_MAX_ORDER+1 via the
+ * data_size > SIZE_MAX-32 guard (L162).  An allocation whose order maps
+ * to exactly RAY_HEAP_MAX_ORDER (38) passes ray_alloc's order check but
+ * makes heap_add_pool compute pool_order = 39 > MAX_ORDER and return false
+ * at L271 — no mmap is attempted. */
+
+static test_result_t test_order_overflow_guards(void) {
+    /* L162: SIZE_MAX overflows the +32 header math. */
+    TEST_ASSERT_EQ_U(ray_order_for_size(SIZE_MAX), RAY_HEAP_MAX_ORDER + 1);
+    /* Just below the overflow boundary still saturates at MAX_ORDER+1. */
+    TEST_ASSERT_EQ_U(ray_order_for_size(SIZE_MAX - 16), RAY_HEAP_MAX_ORDER + 1);
+
+    /* A size that maps to order RAY_HEAP_MAX_ORDER (38) — pool_order would
+     * be 39 (> MAX) so heap_add_pool returns false at L271 → alloc NULL.
+     * data = (1<<38) - 32 → total = 1<<38 → ceil_log2 = 38. */
+    size_t sz = ((size_t)1 << 38) - 64;
+    TEST_ASSERT_EQ_U(ray_order_for_size(sz), RAY_HEAP_MAX_ORDER);
+    ray_t* v = ray_alloc(sz);   /* heap_add_pool(38) → pool_order 39 → false */
+    TEST_ASSERT_NULL(v);
+    PASS();
+}
+
 /* ---- Suite definition -------------------------------------------------- */
 
 const test_entry_t heap_entries[] = {
@@ -1571,5 +2232,28 @@ const test_entry_t heap_entries[] = {
     { "heap/scratch_realloc_sentinel_nulls", test_scratch_realloc_sentinel_nulls, heap_setup, heap_teardown },
     { "heap/scratch_realloc_parted",   test_scratch_realloc_parted,      heap_setup, heap_teardown },
     { "heap/merge_foreign_fallback",   test_merge_foreign_pool_fallback, heap_setup, heap_teardown },
+    { "heap/retain_null_and_err",      test_retain_owned_refs_null_and_err,    heap_setup, heap_teardown },
+    { "heap/retain_lambda_null_slots", test_retain_owned_refs_lambda_null_slots, heap_setup, heap_teardown },
+    { "heap/retain_list_null_kids",    test_retain_owned_refs_list_null_children, heap_setup, heap_teardown },
+    { "heap/retain_tbl_dict_mc_null",  test_retain_owned_refs_table_dict_mc_null, heap_setup, heap_teardown },
+    { "heap/retain_parted_null_seg",   test_retain_owned_refs_parted_null_seg, heap_setup, heap_teardown },
+    { "heap/retain_str_null_pool",     test_retain_owned_refs_str_null_pool,   heap_setup, heap_teardown },
+    { "heap/alloc_copy_hnsw",          test_alloc_copy_hnsw_handle,            heap_setup, heap_teardown },
+    { "heap/scratch_realloc_hnsw",     test_scratch_realloc_hnsw_handle,       heap_setup, heap_teardown },
+    { "heap/scratch_realloc_graph",    test_scratch_realloc_graph_handle,      heap_setup, heap_teardown },
+    { "heap/scratch_realloc_str",      test_scratch_realloc_str_detach,        heap_setup, heap_teardown },
+    { "heap/alloc_copy_err_overflow",  test_alloc_copy_err_and_overflow,       heap_setup, heap_teardown },
+    { "heap/alloc_copy_invalid_type",  test_alloc_copy_invalid_generic_type,   heap_setup, heap_teardown },
+    { "heap/scratch_realloc_list_neg", test_scratch_realloc_list_neg_len,      heap_setup, heap_teardown },
+    { "heap/scratch_realloc_parted_neg", test_scratch_realloc_parted_neg_len,  heap_setup, heap_teardown },
+    { "heap/scratch_realloc_inval_typ",test_scratch_realloc_invalid_type,      heap_setup, heap_teardown },
+    { "heap/scratch_realloc_arena",    test_scratch_realloc_arena_skip,        heap_setup, heap_teardown },
+    { "heap/scratch_realloc_mmod",     test_scratch_realloc_mmod_skip_clamp,   heap_setup, heap_teardown },
+    { "heap/free_mmod1_vector",        test_free_mmod1_vector,                 heap_setup, heap_teardown },
+    { "heap/free_mmod1_table",         test_free_mmod1_table,                  heap_setup, heap_teardown },
+    { "heap/free_mmod1_str_pool",      test_free_mmod1_str_with_pool,          heap_setup, heap_teardown },
+    { "heap/free_no_heap",             test_free_no_heap,                      heap_setup, heap_teardown },
+    { "heap/pool_of_oversized_walk",   test_pool_of_oversized_walk,            heap_setup, heap_teardown },
+    { "heap/order_overflow_guards",    test_order_overflow_guards,             heap_setup, heap_teardown },
     { NULL, NULL, NULL, NULL },
 };

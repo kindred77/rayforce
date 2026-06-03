@@ -1,0 +1,78 @@
+;; Branch-coverage extension for src/ops/fuse.c (ray_fuse_pass + count_refs).
+;;
+;; ray_fuse_pass runs as optimizer pass 10 on every `select` query
+;; (src/ops/opt.c:2062), so its core is broadly exercised.  This file
+;; pins the marking-loop and count_refs ext-children branches that need
+;; specific node shapes:
+;;
+;;   (a) is_elementwise chain with single-consumer element-wise input —
+;;       the can_fuse=true arm that sets OP_FLAG_FUSED (lines 198-207).
+;;       A chain `(+ (* a b) c)` makes the OP_MUL node a single-consumer
+;;       element-wise input of the OP_ADD node → fuse marking fires.
+;;   (b) count_refs OP_CONCAT trailing-arg walk (lines 94-106): a
+;;       `(concat a b c ...)` with > 2 args stores extra arg node IDs
+;;       after the ext node; the trailing loop counts their refs.
+;;   (c) count_refs 3-input ops (OP_IF / OP_SUBSTR / OP_REPLACE) third
+;;       operand (lines 83-89): `(if cond x y)`, `(substr s i n)`,
+;;       `(replace s a b)` in a derived column.
+;;   (d) count_refs OP_SORT/OP_SELECT column children (lines 128-134)
+;;       and OP_GROUP key/agg children (lines 118-127) via a grouped /
+;;       sorted select.
+;;
+;; Documented unreachable from RFL (NOT covered here):
+;;   - count_refs overflow guard `nc > UINT32_MAX/2` (line 65): needs a
+;;     >2-billion-node graph — impossible.
+;;   - count_refs / ray_fuse_pass heap-alloc fallbacks (lines 68, 183):
+;;     `stack_cap > 256` / `nc > 256` need graphs with >128 / >256 nodes.
+;;     Typical RFL queries build tens of nodes, never hundreds.
+;;   - count_refs OP_WINDOW ext-children (lines 151-164): the window-func
+;;     opcode is only emitted by window verbs not exposed through the
+;;     simple `select` surface here.
+
+;; ════════════════════════════════════════════════════════════════════════
+;; (a) Element-wise fusion chain — (+ (* a b) c).  OP_MUL is consumed
+;;     once by OP_ADD, both element-wise → OP_ADD gets OP_FLAG_FUSED.
+;; ════════════════════════════════════════════════════════════════════════
+(set Tfa (table [a b c] (list [1 2 3 4 5] [10 20 30 40 50] [100 200 300 400 500])))
+;; (a*b)+c per row: 110,240,390,560,750 → sum 2050
+(sum (at (select {x: (+ (* a b) c) from: Tfa}) 'x)) -- 2050
+;; Deeper chain: (- (+ (* a b) c) a) — three element-wise nodes in a row.
+(sum (at (select {x: (- (+ (* a b) c) a) from: Tfa}) 'x)) -- 2035
+;; Unary feeding binary: (+ (neg a) b) — OP_NEG single-consumer of OP_ADD.
+(sum (at (select {x: (+ (neg a) b) from: Tfa}) 'x)) -- 135
+;; Mixed unary+binary chain with cast: (+ (as 'F64 a) b)
+(sum (at (select {x: (+ (as 'F64 a) b) from: Tfa}) 'x)) -- 165.0
+
+;; ════════════════════════════════════════════════════════════════════════
+;; (c) 3-input op: (if cond x y) in a derived column — count_refs walks
+;;     the OP_IF third operand stored as (uintptr_t)ext->literal.
+;; ════════════════════════════════════════════════════════════════════════
+(set Tif (table [a b c] (list [1 2 3 4 5] [10 20 30 40 50] [100 200 300 400 500])))
+;; if a>2 then 10 else 0 (scalar arms): 0,0,10,10,10 → sum 30
+(sum (at (select {x: (if (> a 2) 10 0) from: Tif}) 'x)) -- 30
+;; if a>2 then b else c (column arms): 100,200,30,40,50 → sum 420
+(sum (at (select {x: (if (> a 2) b c) from: Tif}) 'x)) -- 420
+
+;; ════════════════════════════════════════════════════════════════════════
+;; (b)+(c) string 3-input + concat trailing args — count_refs OP_SUBSTR,
+;;     OP_REPLACE, and OP_CONCAT (>2 args) ext-children walks.
+;; ════════════════════════════════════════════════════════════════════════
+(set Tss (table [s] (list ["alpha" "beta" "gamma"])))
+;; substr(s, 0, 3): "alp","bet","gam"
+(count (select {r: (substr s 0 3) from: Tss})) -- 3
+;; replace(s, "a", "X")
+(count (select {r: (replace s "a" "X") from: Tss})) -- 3
+;; 4-arg concat: stores 2 trailing arg IDs after the ext node.
+(count (select {r: (concat s "_" s "!") from: Tss})) -- 3
+;; substr feeding concat — chained ext nodes.
+(count (select {r: (concat (substr s 0 2) "_z") from: Tss})) -- 3
+
+;; ════════════════════════════════════════════════════════════════════════
+;; (d) Grouped + sorted select — count_refs OP_GROUP key/agg and
+;;     OP_SORT/OP_SELECT column children walks.
+;; ════════════════════════════════════════════════════════════════════════
+(set Tg (table [k v] (list ['A 'B 'A 'B 'C] [1 2 3 4 5])))
+;; group by k, sum v, with an element-wise agg input (v*2).
+(sum (at (select {s: (sum (* v 2)) by: k from: Tg}) 's)) -- 30
+;; sorted select — exercises OP_SORT column child counting.
+(at (at (select {v: v from: Tg}) 'v) 0) -- 1

@@ -1,0 +1,72 @@
+;; Branch-coverage extension for src/ops/linkop.c.
+;;
+;; test/test_link.c, test/rfl/linkop/coverage.rfl, and
+;; test/rfl/table/link.rfl already cover attach / detach / deref over
+;; I64/I32/SYM/STR/F64/I16 targets, the HAS_INDEX coexistence branches,
+;; slice inheritance, and the parted-target guards.  This file pins the
+;; remaining RFL-reachable edges on the thin `.col.*` builtin wrappers:
+;;
+;;   (a) ray_col_target_fn: NOT-linked → RAY_NULL_OBJ early return
+;;       (line 307).  Every existing `.col.target` test runs on a linked
+;;       column; this one runs it on a plain int vec.
+;;   (b) ray_link_detach: no-link early return (line 103) — `.col.unlink`
+;;       on a column that was never linked must be a no-op pass-through.
+;;   (d) ray_col_link_p_fn: false arm (line 303) — `.col.link?` on a
+;;       plain vec returns false.
+;;   (e) ray_link_attach via ray_col_link_fn: the wrong-type guard
+;;       (column not I32/I64) returns "type" (line 45-47); a sym column
+;;       is a vec but not an int column.
+;;
+;; Documented unreachable from RFL (NOT covered here):
+;;   - ray_link_attach null/error-vec guard (line 41-42) AND
+;;     ray_col_unlink_fn null/error pass-through (line 294): the VM
+;;     short-circuits an error result from an inner call (op_call*
+;;     `goto vm_error`) before the outer builtin is dispatched, so a
+;;     builtin is never handed a RAY_ERROR argument from RFL.  These are
+;;     defensive guards reachable only via direct C calls.
+;;   - ray_link_attach invalid-sym-ID guard (line 50-51): interned sym
+;;     IDs are always >= 0, so target_sym_id < 0 is unreachable from RFL.
+;;   - ray_link_attach slice-attach guard (line 48-49): no RFL surface
+;;     produces a RAY_ATTR_SLICE vector to hand to .col.link.
+
+;; ════════════════════════════════════════════════════════════════════════
+;; (d) .col.link? on a plain (never-linked) int vec → false (line 303).
+;; ════════════════════════════════════════════════════════════════════════
+(set plain_rids [0 1 2 3])
+(.col.link? plain_rids) -- false
+
+;; ════════════════════════════════════════════════════════════════════════
+;; (a) .col.target on a NOT-linked column → null (RAY_NULL_OBJ, line 307).
+;; ════════════════════════════════════════════════════════════════════════
+(nil? (.col.target plain_rids)) -- true
+
+;; ════════════════════════════════════════════════════════════════════════
+;; (b) .col.unlink on a column with no link attached → pass-through
+;;     (ray_link_detach line 103 early return).  Result is still a plain
+;;     non-linked int vec; .col.link? stays false.
+;; ════════════════════════════════════════════════════════════════════════
+(set unlinked_plain (.col.unlink plain_rids))
+(.col.link? unlinked_plain) -- false
+unlinked_plain -- [0 1 2 3]
+
+;; ════════════════════════════════════════════════════════════════════════
+;; (e) .col.link wrong-type column — a SYM vec is a vector but not
+;;     RAY_I32/RAY_I64, so ray_link_attach returns a "type" error
+;;     (linkop.c lines 45-47).  Build a real table target so the only
+;;     failing condition is the column type.
+;; ════════════════════════════════════════════════════════════════════════
+(set dim_bc (table [id age] (list [100 200 300] [18 25 42])))
+(.col.link 'dim_bc ['a 'b 'c]) !- type
+
+;; ════════════════════════════════════════════════════════════════════════
+;; Round-trip sanity: a valid link survives .col.target and reports the
+;; right target sym, then unlink clears it.  (Reconfirms the linked arms
+;; alongside the not-linked arms above for symmetry.)
+;; ════════════════════════════════════════════════════════════════════════
+(set linked_bc (.col.link 'dim_bc [2 0 1]))
+(.col.link? linked_bc)        -- true
+(.col.target linked_bc)       -- 'dim_bc
+linked_bc.age                 -- [42 18 25]
+(set relinked_off (.col.unlink linked_bc))
+(.col.link? relinked_off)     -- false
+(nil? (.col.target relinked_off)) -- true

@@ -27,8 +27,11 @@
 #include "mem/heap.h"
 #include "ops/ops.h"
 #include "store/csr.h"
+#include "store/col.h"
 #include "ops/fvec.h"
 #include <string.h>
+#include <stdio.h>
+#include <unistd.h>
 
 /* --------------------------------------------------------------------------
  * Helper: create a simple graph with edges
@@ -3028,6 +3031,559 @@ static test_result_t test_rel_from_edges_errors(void) {
 }
 
 /* --------------------------------------------------------------------------
+ * Test: build forward CSR with n_src_nodes == 0
+ *
+ * Exercises csr_build_from_pairs n_nodes==0 paths:
+ *   - line "n_nodes > 0 ? valid_edges : 1" allocation guards for targets/rowmap
+ *   - "ray_alloc(n_nodes > 0 ? n_nodes : 1 ...)" for the position array
+ *   - "if (n_nodes > 0) memcpy(pos, off, ...)" FALSE branch (skips memcpy)
+ *   - every src key (>=0) falls outside [0, 0) so valid_edges == 0
+ * The reverse CSR keeps n_dst_nodes==4 so the rel still has real targets.
+ * -------------------------------------------------------------------------- */
+
+static test_result_t test_csr_zero_src_nodes(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t src_data[] = {0, 1, 2};
+    int64_t dst_data[] = {1, 2, 3};
+    ray_t* sv = ray_vec_from_raw(RAY_I64, src_data, 3);
+    ray_t* dv = ray_vec_from_raw(RAY_I64, dst_data, 3);
+    int64_t ss = ray_sym_intern("src", 3);
+    int64_t ds = ray_sym_intern("dst", 3);
+    ray_t* edges = ray_table_new(2);
+    edges = ray_table_add_col(edges, ss, sv);
+    edges = ray_table_add_col(edges, ds, dv);
+    ray_release(sv); ray_release(dv);
+
+    /* n_src_nodes == 0: forward CSR has zero nodes and zero valid edges */
+    ray_rel_t* rel = ray_rel_from_edges(edges, "src", "dst", 0, 4, false);
+    TEST_ASSERT_NOT_NULL(rel);
+    TEST_ASSERT_EQ_I(rel->fwd.n_nodes, 0);
+    TEST_ASSERT_EQ_I(rel->fwd.n_edges, 0);
+    /* offsets must still be length n_nodes+1 == 1 */
+    TEST_ASSERT_NOT_NULL(rel->fwd.offsets);
+    TEST_ASSERT_EQ_I(rel->fwd.offsets->len, 1);
+    /* targets allocated with the ": 1" fallback, but len == 0 */
+    TEST_ASSERT_NOT_NULL(rel->fwd.targets);
+    TEST_ASSERT_EQ_I(rel->fwd.targets->len, 0);
+
+    /* Reverse CSR (n_dst_nodes == 4) retains the three edges keyed by dst */
+    TEST_ASSERT_EQ_I(rel->rev.n_nodes, 4);
+    TEST_ASSERT_EQ_I(rel->rev.n_edges, 3);
+
+    ray_rel_free(rel);
+    ray_release(edges);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: build with n_src_nodes == 0 AND n_dst_nodes == 0
+ *
+ * Both directions take the n_nodes==0 fallback allocations and produce
+ * empty CSRs.  Confirms the rel is still valid (non-NULL) and frees cleanly.
+ * -------------------------------------------------------------------------- */
+
+static test_result_t test_csr_both_zero_nodes(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t src_data[] = {0, 1};
+    int64_t dst_data[] = {1, 0};
+    ray_t* sv = ray_vec_from_raw(RAY_I64, src_data, 2);
+    ray_t* dv = ray_vec_from_raw(RAY_I64, dst_data, 2);
+    int64_t ss = ray_sym_intern("src", 3);
+    int64_t ds = ray_sym_intern("dst", 3);
+    ray_t* edges = ray_table_new(2);
+    edges = ray_table_add_col(edges, ss, sv);
+    edges = ray_table_add_col(edges, ds, dv);
+    ray_release(sv); ray_release(dv);
+
+    ray_rel_t* rel = ray_rel_from_edges(edges, "src", "dst", 0, 0, true);
+    TEST_ASSERT_NOT_NULL(rel);
+    TEST_ASSERT_EQ_I(rel->fwd.n_nodes, 0);
+    TEST_ASSERT_EQ_I(rel->fwd.n_edges, 0);
+    TEST_ASSERT_EQ_I(rel->rev.n_nodes, 0);
+    TEST_ASSERT_EQ_I(rel->rev.n_edges, 0);
+    /* sort_targets requested: an empty graph still records sorted == true */
+    TEST_ASSERT_TRUE(rel->fwd.sorted);
+    TEST_ASSERT_TRUE(rel->rev.sorted);
+
+    ray_rel_free(rel);
+    ray_release(edges);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: ray_rel_build with n_src_nodes == 0 (empty source table)
+ *
+ * An FK column of length 0 gives n_edges == 0 and n_src_nodes == 0
+ * (ray_table_nrows of an empty table), hitting the same n_nodes==0
+ * allocation guards inside csr_build_from_pairs for the forward CSR.
+ * -------------------------------------------------------------------------- */
+
+static test_result_t test_rel_build_empty(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    ray_t* fk = ray_vec_new(RAY_I64, 1);
+    fk->len = 0;
+    int64_t fk_sym = ray_sym_intern("ref", 3);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, fk_sym, fk);
+    ray_release(fk);
+
+    ray_rel_t* rel = ray_rel_build(tbl, "ref", 3, true);
+    TEST_ASSERT_NOT_NULL(rel);
+    TEST_ASSERT_EQ_I(rel->fwd.n_nodes, 0);   /* zero rows */
+    TEST_ASSERT_EQ_I(rel->fwd.n_edges, 0);
+    TEST_ASSERT_EQ_I(rel->rev.n_nodes, 3);   /* 3 target nodes, no edges */
+    TEST_ASSERT_EQ_I(rel->rev.n_edges, 0);
+
+    /* ray_rel_build with a non-table input → NULL */
+    int64_t junk[] = {1, 2};
+    ray_t* v = ray_vec_from_raw(RAY_I64, junk, 2);
+    TEST_ASSERT_EQ_PTR(ray_rel_build(v, "ref", 3, false), NULL);
+    ray_release(v);
+
+    /* ray_rel_build with a non-I64 FK column → NULL */
+    double fd[] = {0.0, 1.0};
+    ray_t* fvec = ray_vec_from_raw(RAY_F64, fd, 2);
+    int64_t fsym = ray_sym_intern("fk", 2);
+    ray_t* badtbl = ray_table_new(1);
+    badtbl = ray_table_add_col(badtbl, fsym, fvec);
+    ray_release(fvec);
+    TEST_ASSERT_EQ_PTR(ray_rel_build(badtbl, "fk", 3, false), NULL);
+    ray_release(badtbl);
+
+    ray_rel_free(rel);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Corruption helpers for csr_load_impl error branches.
+ *
+ * ray_rel_save lays a relation out as plain column files:
+ *   <dir>/fwd_offsets <dir>/fwd_targets <dir>/fwd_rowmap
+ *   <dir>/rev_offsets <dir>/rev_targets <dir>/rev_rowmap  <dir>/meta
+ * We overwrite individual column files with ray_col_save to forge the
+ * inconsistencies csr_load_impl is supposed to reject, then assert the
+ * loader returns NULL (or, for rowmap/meta, still loads).
+ * -------------------------------------------------------------------------- */
+
+static void csr_overwrite_i64(const char* dir, const char* name,
+                              const int64_t* data, int64_t n) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%s", dir, name);
+    ray_t* v;
+    if (n > 0) {
+        v = ray_vec_from_raw(RAY_I64, data, n);
+    } else {
+        v = ray_vec_new(RAY_I64, 1);
+        v->len = 0;
+    }
+    ray_col_save(v, path);
+    ray_release(v);
+}
+
+static ray_rel_t* csr_make_saved_rel(const char* dir) {
+    ray_t* edges = make_edge_table();
+    ray_rel_t* rel = ray_rel_from_edges(edges, "src", "dst", 4, 4, false);
+    ray_release(edges);
+    if (!rel) return NULL;
+    if (ray_rel_save(rel, dir) != RAY_OK) { ray_rel_free(rel); return NULL; }
+    ray_rel_free(rel);
+    return (ray_rel_t*)1;  /* sentinel: saved OK, on-disk state owns the data */
+}
+
+/* --------------------------------------------------------------------------
+ * Test: load rejects a forward CSR whose offsets are non-monotonic.
+ * Exercises csr_load_impl line "off_data[i] > off_data[i + 1]".
+ * -------------------------------------------------------------------------- */
+
+static test_result_t test_load_nonmonotonic_offsets(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    const char* dir = "/tmp/test_csr_corrupt_mono";
+    TEST_ASSERT_NOT_NULL(csr_make_saved_rel(dir));
+
+    /* fwd has 4 nodes, 6 edges.  Forge offsets[5] = {0,5,2,?,6} so the last
+     * entry still equals n_edges (passes the consistency check) but the
+     * sequence decreases at i=1 (5 > 2) — must be rejected. */
+    int64_t bad[] = {0, 5, 2, 4, 6};
+    csr_overwrite_i64(dir, "fwd_offsets", bad, 5);
+
+    TEST_ASSERT_EQ_PTR(ray_rel_load(dir), NULL);
+    TEST_ASSERT_EQ_PTR(ray_rel_mmap(dir), NULL);
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: load rejects a forward CSR with a negative offset entry.
+ * Exercises csr_load_impl line "off_data[i] < 0".
+ * -------------------------------------------------------------------------- */
+
+static test_result_t test_load_negative_offset(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    const char* dir = "/tmp/test_csr_corrupt_neg";
+    TEST_ASSERT_NOT_NULL(csr_make_saved_rel(dir));
+
+    /* offsets[1] = -1 with last entry still == n_edges (6). */
+    int64_t bad[] = {0, -1, 3, 5, 6};
+    csr_overwrite_i64(dir, "fwd_offsets", bad, 5);
+
+    TEST_ASSERT_EQ_PTR(ray_rel_load(dir), NULL);
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: load rejects offsets whose terminal entry != targets length.
+ * Exercises csr_load_impl line "off_data[csr->n_nodes] != csr->n_edges".
+ * -------------------------------------------------------------------------- */
+
+static test_result_t test_load_offset_count_mismatch(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    const char* dir = "/tmp/test_csr_corrupt_count";
+    TEST_ASSERT_NOT_NULL(csr_make_saved_rel(dir));
+
+    /* targets has 6 edges; make offsets[4] = 5 (monotonic, but != 6). */
+    int64_t bad[] = {0, 1, 2, 3, 5};
+    csr_overwrite_i64(dir, "fwd_offsets", bad, 5);
+
+    TEST_ASSERT_EQ_PTR(ray_rel_load(dir), NULL);
+    TEST_ASSERT_EQ_PTR(ray_rel_mmap(dir), NULL);
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: load rejects an empty offsets file (len < 1).
+ * Exercises csr_load_impl line "csr->offsets->len < 1".
+ * -------------------------------------------------------------------------- */
+
+static test_result_t test_load_empty_offsets(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    const char* dir = "/tmp/test_csr_corrupt_empty_off";
+    TEST_ASSERT_NOT_NULL(csr_make_saved_rel(dir));
+
+    csr_overwrite_i64(dir, "fwd_offsets", NULL, 0);  /* len 0 */
+
+    TEST_ASSERT_EQ_PTR(ray_rel_load(dir), NULL);
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: load succeeds with the forward CSR valid but the REVERSE CSR
+ * corrupt — covers the rel_load_impl branch that releases the already
+ * loaded forward CSR (csr_free(&rel->fwd)) when rev load fails.
+ * -------------------------------------------------------------------------- */
+
+static test_result_t test_load_rev_corrupt_frees_fwd(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    const char* dir = "/tmp/test_csr_corrupt_rev";
+    TEST_ASSERT_NOT_NULL(csr_make_saved_rel(dir));
+
+    /* Corrupt only rev_offsets: fwd loads fine, rev load must fail and the
+     * loader has to free fwd before returning NULL. */
+    int64_t bad[] = {0, 9, 2, 3, 6};   /* non-monotonic, last == 6 */
+    csr_overwrite_i64(dir, "rev_offsets", bad, 5);
+
+    TEST_ASSERT_EQ_PTR(ray_rel_load(dir), NULL);
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: load tolerates a missing rowmap (optional component).
+ * Exercises csr_load_impl rowmap "ignore error → NULL" branch.
+ * -------------------------------------------------------------------------- */
+
+static test_result_t test_load_missing_rowmap(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    const char* dir = "/tmp/test_csr_no_rowmap";
+    TEST_ASSERT_NOT_NULL(csr_make_saved_rel(dir));
+
+    /* Delete both rowmap files — they are optional on load. */
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/fwd_rowmap", dir); unlink(path);
+    snprintf(path, sizeof(path), "%s/rev_rowmap", dir); unlink(path);
+
+    ray_rel_t* rel = ray_rel_load(dir);
+    TEST_ASSERT_NOT_NULL(rel);
+    TEST_ASSERT_EQ_PTR((void*)rel->fwd.rowmap, NULL);
+    TEST_ASSERT_EQ_PTR((void*)rel->rev.rowmap, NULL);
+    /* Topology must still be intact */
+    TEST_ASSERT_EQ_I(rel->fwd.n_nodes, 4);
+    TEST_ASSERT_EQ_I(rel->fwd.n_edges, 6);
+    TEST_ASSERT_EQ_I(ray_csr_degree(&rel->fwd, 0), 2);
+
+    ray_rel_free(rel);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: load tolerates a missing metadata file.
+ * Exercises rel_load_impl branch where ray_col_load(meta) returns NULL,
+ * so neither the ">=5" nor the "release-only" branch runs.
+ * -------------------------------------------------------------------------- */
+
+static test_result_t test_load_missing_meta(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    const char* dir = "/tmp/test_csr_no_meta";
+    TEST_ASSERT_NOT_NULL(csr_make_saved_rel(dir));
+
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/meta", dir); unlink(path);
+
+    ray_rel_t* rel = ray_rel_load(dir);
+    TEST_ASSERT_NOT_NULL(rel);
+    /* Metadata block skipped → fields keep their memset(0) / default state.
+     * name_sym is left as the memset-zeroed value (not the -1 set at build,
+     * since that lived only in memory). */
+    TEST_ASSERT_EQ_I(rel->fwd.n_nodes, 4);
+    TEST_ASSERT_EQ_I(rel->fwd.n_edges, 6);
+
+    ray_rel_free(rel);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: load tolerates a too-short metadata file (len < 5).
+ * Exercises rel_load_impl "else if (meta && !RAY_IS_ERR(meta))" release-only
+ * branch — meta loads but is too short to apply.
+ * -------------------------------------------------------------------------- */
+
+static test_result_t test_load_short_meta(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    const char* dir = "/tmp/test_csr_short_meta";
+    TEST_ASSERT_NOT_NULL(csr_make_saved_rel(dir));
+
+    /* Overwrite meta with a 2-element vector (need >= 5 to apply). */
+    int64_t shortmeta[] = {7, 9};
+    csr_overwrite_i64(dir, "meta", shortmeta, 2);
+
+    ray_rel_t* rel = ray_rel_load(dir);
+    TEST_ASSERT_NOT_NULL(rel);
+    /* Topology intact; metadata not applied (too short). */
+    TEST_ASSERT_EQ_I(rel->fwd.n_nodes, 4);
+    TEST_ASSERT_EQ_I(rel->fwd.n_edges, 6);
+
+    ray_rel_free(rel);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: load via mmap also tolerates a missing rowmap + short meta, and the
+ * targets/rowmap mmap ternary branches in csr_load_impl run.
+ * -------------------------------------------------------------------------- */
+
+static test_result_t test_mmap_missing_rowmap(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    const char* dir = "/tmp/test_csr_mmap_no_rowmap";
+    TEST_ASSERT_NOT_NULL(csr_make_saved_rel(dir));
+
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/fwd_rowmap", dir); unlink(path);
+    snprintf(path, sizeof(path), "%s/rev_rowmap", dir); unlink(path);
+
+    ray_rel_t* rel = ray_rel_mmap(dir);
+    TEST_ASSERT_NOT_NULL(rel);
+    TEST_ASSERT_EQ_PTR((void*)rel->fwd.rowmap, NULL);
+    TEST_ASSERT_EQ_I(rel->fwd.n_edges, 6);
+
+    ray_rel_free(rel);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: load fails when the targets file is missing (offsets present).
+ * Exercises csr_load_impl targets-load failure (releases offsets, NULL).
+ * -------------------------------------------------------------------------- */
+
+static test_result_t test_load_missing_targets(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    const char* dir = "/tmp/test_csr_no_targets";
+    TEST_ASSERT_NOT_NULL(csr_make_saved_rel(dir));
+
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/fwd_targets", dir); unlink(path);
+
+    TEST_ASSERT_EQ_PTR(ray_rel_load(dir), NULL);
+    TEST_ASSERT_EQ_PTR(ray_rel_mmap(dir), NULL);
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: load fails when the offsets file is missing entirely.
+ * Exercises csr_load_impl offsets-load failure (first guard, NULL).
+ * -------------------------------------------------------------------------- */
+
+static test_result_t test_load_missing_offsets(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    const char* dir = "/tmp/test_csr_no_offsets";
+    TEST_ASSERT_NOT_NULL(csr_make_saved_rel(dir));
+
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/fwd_offsets", dir); unlink(path);
+
+    TEST_ASSERT_EQ_PTR(ray_rel_load(dir), NULL);
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: round-trip a relation built with parallel (duplicate) edges and
+ * sorted adjacency lists, verifying neighbor data survives save/load and
+ * the per-node degree counts include the multi-edges.
+ * -------------------------------------------------------------------------- */
+
+static test_result_t test_multi_edge_roundtrip(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* Parallel edges: 0->1 twice, 0->1 again, 0->2; node 1 -> 2. */
+    int64_t src_data[] = {0, 0, 0, 0, 1};
+    int64_t dst_data[] = {1, 1, 1, 2, 2};
+    ray_t* sv = ray_vec_from_raw(RAY_I64, src_data, 5);
+    ray_t* dv = ray_vec_from_raw(RAY_I64, dst_data, 5);
+    int64_t ss = ray_sym_intern("src", 3);
+    int64_t ds = ray_sym_intern("dst", 3);
+    ray_t* edges = ray_table_new(2);
+    edges = ray_table_add_col(edges, ss, sv);
+    edges = ray_table_add_col(edges, ds, dv);
+    ray_release(sv); ray_release(dv);
+
+    ray_rel_t* rel = ray_rel_from_edges(edges, "src", "dst", 3, 3, true);
+    TEST_ASSERT_NOT_NULL(rel);
+    TEST_ASSERT_EQ_I(rel->fwd.n_edges, 5);
+    TEST_ASSERT_EQ_I(ray_csr_degree(&rel->fwd, 0), 4);  /* three 0->1 + one 0->2 */
+
+    /* Sorted adjacency for node 0: [1,1,1,2] */
+    int64_t cnt;
+    int64_t* nb = ray_csr_neighbors(&rel->fwd, 0, &cnt);
+    TEST_ASSERT_EQ_I(cnt, 4);
+    TEST_ASSERT_EQ_I(nb[0], 1);
+    TEST_ASSERT_EQ_I(nb[1], 1);
+    TEST_ASSERT_EQ_I(nb[2], 1);
+    TEST_ASSERT_EQ_I(nb[3], 2);
+
+    const char* dir = "/tmp/test_csr_multi_edge";
+    TEST_ASSERT_EQ_I(ray_rel_save(rel, dir), RAY_OK);
+
+    ray_rel_t* loaded = ray_rel_load(dir);
+    TEST_ASSERT_NOT_NULL(loaded);
+    int64_t lcnt;
+    int64_t* lnb = ray_csr_neighbors(&loaded->fwd, 0, &lcnt);
+    TEST_ASSERT_EQ_I(lcnt, 4);
+    for (int64_t i = 0; i < lcnt; i++) TEST_ASSERT_EQ_I(lnb[i], nb[i]);
+
+    ray_rel_free(loaded);
+    ray_rel_free(rel);
+    ray_release(edges);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: single-edge graph build + round-trip (minimal non-empty CSR).
+ * -------------------------------------------------------------------------- */
+
+static test_result_t test_single_edge_roundtrip(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t s[] = {0};
+    int64_t d[] = {1};
+    ray_t* sv = ray_vec_from_raw(RAY_I64, s, 1);
+    ray_t* dv = ray_vec_from_raw(RAY_I64, d, 1);
+    int64_t ss = ray_sym_intern("src", 3);
+    int64_t ds = ray_sym_intern("dst", 3);
+    ray_t* edges = ray_table_new(2);
+    edges = ray_table_add_col(edges, ss, sv);
+    edges = ray_table_add_col(edges, ds, dv);
+    ray_release(sv); ray_release(dv);
+
+    ray_rel_t* rel = ray_rel_from_edges(edges, "src", "dst", 2, 2, true);
+    TEST_ASSERT_NOT_NULL(rel);
+    TEST_ASSERT_EQ_I(rel->fwd.n_edges, 1);
+    TEST_ASSERT_EQ_I(ray_csr_degree(&rel->fwd, 0), 1);
+    TEST_ASSERT_EQ_I(ray_csr_degree(&rel->fwd, 1), 0);
+    TEST_ASSERT_EQ_I(ray_csr_degree(&rel->rev, 1), 1);
+
+    const char* dir = "/tmp/test_csr_single_edge";
+    TEST_ASSERT_EQ_I(ray_rel_save(rel, dir), RAY_OK);
+    ray_rel_t* loaded = ray_rel_load(dir);
+    TEST_ASSERT_NOT_NULL(loaded);
+    TEST_ASSERT_EQ_I(loaded->fwd.n_edges, 1);
+    int64_t cnt;
+    int64_t* nb = ray_csr_neighbors(&loaded->fwd, 0, &cnt);
+    TEST_ASSERT_EQ_I(cnt, 1);
+    TEST_ASSERT_EQ_I(nb[0], 1);
+
+    ray_rel_free(loaded);
+    ray_rel_free(rel);
+    ray_release(edges);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
  * Suite definition
  * -------------------------------------------------------------------------- */
 
@@ -3095,6 +3651,22 @@ const test_entry_t csr_entries[] = {
     { "csr/rel_save_mmap_reuse", test_rel_save_mmap_reuse, NULL, NULL },
     { "csr/rel_free_null", test_rel_free_null, NULL, NULL },
     { "csr/rel_from_edges_errors", test_rel_from_edges_errors, NULL, NULL },
+    { "csr/zero_src_nodes", test_csr_zero_src_nodes, NULL, NULL },
+    { "csr/both_zero_nodes", test_csr_both_zero_nodes, NULL, NULL },
+    { "csr/rel_build_empty", test_rel_build_empty, NULL, NULL },
+    { "csr/load_nonmono", test_load_nonmonotonic_offsets, NULL, NULL },
+    { "csr/load_neg_off", test_load_negative_offset, NULL, NULL },
+    { "csr/load_count_mismatch", test_load_offset_count_mismatch, NULL, NULL },
+    { "csr/load_empty_off", test_load_empty_offsets, NULL, NULL },
+    { "csr/load_rev_corrupt", test_load_rev_corrupt_frees_fwd, NULL, NULL },
+    { "csr/load_no_rowmap", test_load_missing_rowmap, NULL, NULL },
+    { "csr/load_no_meta", test_load_missing_meta, NULL, NULL },
+    { "csr/load_short_meta", test_load_short_meta, NULL, NULL },
+    { "csr/mmap_no_rowmap", test_mmap_missing_rowmap, NULL, NULL },
+    { "csr/load_no_targets", test_load_missing_targets, NULL, NULL },
+    { "csr/load_no_offsets", test_load_missing_offsets, NULL, NULL },
+    { "csr/multi_edge_rt", test_multi_edge_roundtrip, NULL, NULL },
+    { "csr/single_edge_rt", test_single_edge_roundtrip, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
 

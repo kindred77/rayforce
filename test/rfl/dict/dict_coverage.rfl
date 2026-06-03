@@ -94,6 +94,22 @@
 (at Gt 2025.01.01D00:00:00.000000000) -- [0 2]
 (at Gt 2025.01.02D00:00:00.000000000) -- [1]
 
+;; TIME keys (dict.c line 240 — the RAY_TIME label of the I32/DATE/TIME
+;; case block, previously never reached: DATE exercised the shared body but
+;; the TIME entry-arm stayed cold).  `group` of a TIME vec yields a
+;; TIME-keyed dict; `at` dispatches through the RAY_TIME case.
+(set Gtm (group [12:00:00.000 13:00:00.000 12:00:00.000]))
+(count Gtm) -- 2
+(at Gtm 12:00:00.000) -- [0 2]
+(at Gtm 13:00:00.000) -- [1]
+;; Missing TIME key — DICT_FIND_LOOP exhausts, returns -1 → 0Nl.
+(at Gtm 14:00:00.000) -- 0Nl
+;; Remove a TIME key — exercises the generic typed-vec remove branch with
+;; a 4-byte (I32-width) element size for TIME keys.
+(count (remove Gtm 12:00:00.000)) -- 1
+(at (remove Gtm 12:00:00.000) 13:00:00.000) -- [1]
+(at (remove Gtm 12:00:00.000) 12:00:00.000) -- 0Nl
+
 ;; ========== HETEROGENEOUS LIST-KEYED DICT ==========
 ;; Dict-literal parser builds a LIST when keys mix sym+str (parse.c
 ;; line 732).  This triggers the RAY_LIST branch in ray_dict_find_idx
