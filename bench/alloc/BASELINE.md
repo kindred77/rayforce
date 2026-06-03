@@ -29,3 +29,19 @@
 Note: atom-64B shows ~10% lower than Pre-P0; this regression appears to have
 originated in commits between Pre-P0 and P1 (407df9d9 / 2cb0560b), not in
 the warm-first reorder itself. vec-256B improved +4.5% vs Pre-P0.
+
+## Post-P2 (commit a19e48ae — byte-budgeted morsel slab cache, orders 6-16)
+
+```
+(a) single-thread alloc/free:
+  atom-64B          127.7 Mops/s  (20000000 iters, 0.157s)
+  vec-256B          150.3 Mops/s  (20000000 iters, 0.133s)
+  morsel-8K         146.9 Mops/s  (5000000 iters, 0.034s)
+  morsel-16K        148.8 Mops/s  (5000000 iters, 0.034s)
+  large-1M          111.2 Mops/s  (200000 iters, 0.002s)
+(b) producer-consumer (morsel-8K):
+  throughput        1.0 Mops/s  peak RSS 9804656 KB
+```
+
+morsel-8K: +34.2% vs Post-P1 (146.9 vs 109.5 Mops/s); morsel-16K: +35.4% vs Post-P1 (148.8 vs 109.9 Mops/s).
+Orders 14-16 (8K-64K) are now slab-cached under the 1 MB byte budget.

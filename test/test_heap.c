@@ -2186,6 +2186,26 @@ static test_result_t test_order_overflow_guards(void) {
     PASS();
 }
 
+/* ---- Slab byte-budget caps -------------------------------------------- *
+ *
+ * Verify that ray_heap_init computes slab_cap[] correctly from the default
+ * RAY_SLAB_BUDGET.  Order 6 (64 B) must clamp to RAY_SLAB_CACHE_SIZE; the
+ * top order should equal budget / 2^(RAY_SLAB_MIN+top), clamped to [1,64]. */
+
+static test_result_t test_slab_byte_budget(void) {
+    extern RAY_TLS ray_heap_t* ray_tl_heap;
+    ray_heap_t* h = ray_tl_heap;
+    /* order 6 (64B): cap clamps to RAY_SLAB_CACHE_SIZE (64). */
+    TEST_ASSERT_EQ_I(h->slab_cap[0], RAY_SLAB_CACHE_SIZE);
+    /* top order at 1MB budget: budget / 2^(RAY_SLAB_MIN+top), clamped. */
+    int top = RAY_SLAB_ORDERS - 1;
+    uint32_t expect_top = (uint32_t)(RAY_SLAB_BUDGET / BSIZEOF(RAY_SLAB_MIN + top));
+    if (expect_top < 1) expect_top = 1;
+    if (expect_top > RAY_SLAB_CACHE_SIZE) expect_top = RAY_SLAB_CACHE_SIZE;
+    TEST_ASSERT_EQ_I(h->slab_cap[top], expect_top);
+    PASS();
+}
+
 /* ---- Suite definition -------------------------------------------------- */
 
 const test_entry_t heap_entries[] = {
@@ -2255,5 +2275,6 @@ const test_entry_t heap_entries[] = {
     { "heap/free_no_heap",             test_free_no_heap,                      heap_setup, heap_teardown },
     { "heap/pool_of_oversized_walk",   test_pool_of_oversized_walk,            heap_setup, heap_teardown },
     { "heap/order_overflow_guards",    test_order_overflow_guards,             heap_setup, heap_teardown },
+    { "heap/slab_byte_budget",         test_slab_byte_budget,            heap_setup, heap_teardown },
     { NULL, NULL, NULL, NULL },
 };
