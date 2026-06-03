@@ -36,3 +36,7 @@ rayforce.cov
 .playwright-mcp/
 site/
 .venv-docs/
+
+# Allocator micro-benchmark binaries
+bench-alloc
+bench-alloc-tfq
