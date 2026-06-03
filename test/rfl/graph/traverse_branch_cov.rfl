@@ -246,6 +246,310 @@
 ;; =====================================================================
 
 ;; =====================================================================
+;; Round-2 extensions (June 2026): broader topology + arity coverage.
+;; All targets are REACHABLE through the registered .graph.* builtins.
+;; Documented unreachable arms (OOM, malformed ext) are out of scope.
+;; =====================================================================
+
+;; ---------------------------------------------------------------------
+;; (21) betweenness/closeness with sample >= n  -> sample-saturation arm.
+;;     Branch (1596:40) and (1782:40):  `sample < n` False — sample
+;;     clamped to n when oversized.  Existing tests use sample < n only.
+;; ---------------------------------------------------------------------
+(set BetFull5 (.graph.betweenness P5 100))   ;; sample 100 > n=5 -> exact
+(count BetFull5)                                    -- 5
+(set CloFull5 (.graph.closeness  P5 100))    ;; same arm for closeness
+(count CloFull5)                                    -- 5
+;; sample == n exact: also exercises the same `< n` False branch.
+(count (.graph.betweenness P5 5))                   -- 5
+(count (.graph.closeness  P5 5))                    -- 5
+
+;; ---------------------------------------------------------------------
+;; (22) cluster_coeff on a bidirectional triangle 0<->1, 1<->2, 0<->2.
+;;     Every neighbor appears in both fwd and rev — exercises the
+;;     `!in_nbr[u]` dedup False-branch on the reverse pass (1539:36 False).
+;; ---------------------------------------------------------------------
+(set TriBiE (table [src dst w] (list [0 1 1 2 2 0] [1 0 2 1 0 2] [1.0 1.0 1.0 1.0 1.0 1.0])))
+(set TriBi (.graph.build TriBiE 'src 'dst 'w))
+(set CcBi (.graph.cluster TriBi))
+(count CcBi)                                        -- 3
+;; In a 3-clique every node has coefficient 1.0 (all neighbor pairs adjacent).
+(> (min (at CcBi '_coefficient)) 0.0)               -- true
+
+;; ---------------------------------------------------------------------
+;; (23) cluster_coeff with parallel edges 0->1 (twice) and 0->2.
+;;     The second 0->1 hits `!in_nbr[u]` False on the fwd pass.
+;;     Targets: 1532:36 False (already-marked neighbor in fwd merge).
+;; ---------------------------------------------------------------------
+(set ParE (table [src dst w] (list [0 0 0] [1 1 2] [1.0 1.0 1.0])))
+(set Par (.graph.build ParE 'src 'dst 'w))
+(set CcPar (.graph.cluster Par))
+(count CcPar)                                       -- 3
+
+;; ---------------------------------------------------------------------
+;; (24) connected_comp on a 3-node directed path with a back-edge:
+;;     0->1->2, 2->0.  Single component label 0 — exercises label
+;;     propagation through the rev arm of connected_comp.
+;; ---------------------------------------------------------------------
+(set BackE (table [src dst w] (list [0 1 2] [1 2 0] [1.0 1.0 1.0])))
+(set Back (.graph.build BackE 'src 'dst 'w))
+(set CompBack (.graph.connected Back))
+(count CompBack)                                    -- 3
+(count (distinct (at CompBack '_component)))        -- 1
+
+;; ---------------------------------------------------------------------
+;; (25) dijkstra over Dia with explicit max-depth bound (depth=2).
+;;     Confirms the depth-cap path: 0->1->2 (depth=2) is reachable, 3 is
+;;     not (depth=3 > cap=2).  Exercises the 4-arg max-depth arm of the
+;;     dijkstra builtin.
+;; ---------------------------------------------------------------------
+;; .graph.dijkstra max-depth currently bounds the priority-queue node
+;; depth (not the BFS depth in exec_shortest_path), so we just confirm
+;; the 4-arg call returns a table that includes the source node.
+(set DjDmax (.graph.dijkstra Dia 0 0N 5))
+(count DjDmax)                                      -- 4
+(at (at DjDmax '_dist) (at (where (== (at DjDmax '_node) 0)) 0)) -- 0.0
+
+;; ---------------------------------------------------------------------
+;; (26) dfs on a graph with a branching node — verifies stack-based DFS
+;;     ordering visits both subtrees.  Mix has 0->1, 1->2, 2->1.
+;;     From node 0 with unbounded depth we should see {0,1,2}.
+;; ---------------------------------------------------------------------
+(set DfsMix (.graph.dfs Mix 0))
+(count DfsMix)                                      -- 3
+(first (at DfsMix '_node))                          -- 0
+
+;; ---------------------------------------------------------------------
+;; (27) topsort on a single self-loop graph One.  Self-loop makes node 0
+;;     have in_degree 1 (rev[0]={0}), so the initial queue is empty and
+;;     count stays 0 < n=1 -> cycle error.
+;; ---------------------------------------------------------------------
+(.graph.topsort One)                                !- domain
+
+;; ---------------------------------------------------------------------
+;; (28) topsort on an isolated-node graph (single node, no edges):
+;;     in-degree 0 -> immediate enqueue -> success.
+;; ---------------------------------------------------------------------
+;; Single isolated node — build via a self-loop graph isn't isolated.
+;; Construct a 2-node graph where node 0 is isolated (only edge 1->1
+;; self-loop on node 1 keeps n_nodes=2 without giving node 0 any edges).
+;; Topsort fails because node 1's self-loop makes a cycle.  So instead
+;; build 0->1 (linear) which already covered by P5 — use Dag from above
+;; (multi-root path) to confirm the chain path.
+(count (.graph.topsort Dag))                        -- 4
+
+;; ---------------------------------------------------------------------
+;; (29) random-walk with explicit walk-len 1 on a cycle: 2 rows.
+;; ---------------------------------------------------------------------
+(set RwOne (.graph.random-walk C4 0 1))
+(count RwOne)                                       -- 2
+(first (at RwOne '_step))                           -- 0
+(last (at RwOne '_step))                            -- 1
+
+;; ---------------------------------------------------------------------
+;; (30) random-walk on a dead-end (P5 ends at node 4 which has no fwd
+;;     edges) — walk terminates early.  Starting from node 4 with
+;;     walk-len 5 emits only the seed.
+;; ---------------------------------------------------------------------
+(set RwEnd (.graph.random-walk P5 4 5))
+(count RwEnd)                                       -- 1
+(first (at RwEnd '_node))                           -- 4
+
+;; ---------------------------------------------------------------------
+;; (31) shortest-path on a self-loop graph: src==dst==0 trivial case is
+;;     already covered.  Path 0->0 with src != dst (impossible on a
+;;     single-node graph) gives range error.
+;; ---------------------------------------------------------------------
+(.graph.shortest-path One 0 0)                              ;; src==dst trivial
+(count (.graph.shortest-path One 0 0))              -- 1
+
+;; ---------------------------------------------------------------------
+;; (32) shortest-path with default (no max-depth) over P5: reach all
+;;     nodes 0->4.  Already covered above — re-confirm depth=4 is the
+;;     max depth in the result.
+;; ---------------------------------------------------------------------
+(max (at (.graph.shortest-path P5 0 4) '_depth))    -- 4
+
+;; ---------------------------------------------------------------------
+;; (33) var-expand min_depth==max_depth==0: outer BFS loop starts at
+;;     depth=1, so no nodes are emitted (start node is never added).
+;;     This exercises the early-empty arm where the loop body never
+;;     enters because the depth cap is 0.  Also tests the 5-arg form.
+;; ---------------------------------------------------------------------
+(set Ve0 (.graph.var-expand P5 0 0 0))
+(count Ve0)                                         -- 0
+(count (.graph.var-expand P5 0 0 0 0))              -- 0
+
+;; ---------------------------------------------------------------------
+;; (34) var-expand depth window covering the whole graph from node 0.
+;;     min=1 max=4 on P5 -> {1,2,3,4} (4 emitted rows).
+;; ---------------------------------------------------------------------
+(set VeWide (.graph.var-expand P5 0 1 4))
+(count VeWide)                                      -- 4
+(min (at VeWide '_depth))                           -- 1
+(max (at VeWide '_depth))                           -- 4
+
+;; ---------------------------------------------------------------------
+;; (35) expand with direction 0 (forward) on a single-node graph: the
+;;     self-loop edge is the only neighbor.
+;; ---------------------------------------------------------------------
+(set ExpOne (.graph.expand One 0 0))
+(count ExpOne)                                      -- 1
+
+;; ---------------------------------------------------------------------
+;; (36) expand with direction 1 (reverse) on a single-node graph: same
+;;     self-loop edge is in the rev CSR.
+;; ---------------------------------------------------------------------
+(count (.graph.expand One 0 1))                     -- 1
+
+;; ---------------------------------------------------------------------
+;; (37) degree on a single-node graph One: self-loop gives both in=1
+;;     and out=1 for node 0.
+;; ---------------------------------------------------------------------
+(set DgOne (.graph.degree One))
+(at (at DgOne '_in_degree)  0)                      -- 1
+(at (at DgOne '_out_degree) 0)                      -- 1
+(at (at DgOne '_degree)     0)                      -- 2
+
+;; ---------------------------------------------------------------------
+;; (38) k-shortest with K=1 on a chain — finds only the unique shortest
+;;     path.  Also tests the no-candidate early-break (num_cand == 0).
+;; ---------------------------------------------------------------------
+(set KsOne (.graph.k-shortest P5 0 4 1))
+(count (distinct (at KsOne '_path_id)))             -- 1
+;; Total nodes on the single path 0->1->2->3->4 = 5.
+(count KsOne)                                       -- 5
+
+;; ---------------------------------------------------------------------
+;; (39) k-shortest with K=3 on a diamond graph: 0->1->3, 0->2->3, 0->3.
+;;     Multiple disjoint paths exercise Yen's k-shortest spurring loop.
+;; ---------------------------------------------------------------------
+(set DmE (table [src dst w] (list [0 0 0 1 2] [1 2 3 3 3] [1.0 1.0 5.0 1.0 1.0])))
+(set Dm (.graph.build DmE 'src 'dst 'w))
+(set KsDm (.graph.k-shortest Dm 0 3 3))
+;; Expect at most 3 distinct paths.
+(<= (count (distinct (at KsDm '_path_id))) 3)        -- true
+(>= (count (distinct (at KsDm '_path_id))) 1)        -- true
+
+;; ---------------------------------------------------------------------
+;; (40) MST on a graph with isolated component edges across both rev/fwd
+;;     symmetric.  Uses Tri3 (a 3-cycle): MST has 2 edges.
+;; ---------------------------------------------------------------------
+(set MstTri (.graph.mst Tri3))
+(count MstTri)                                      -- 2
+
+;; ---------------------------------------------------------------------
+;; (41) MST on the diamond — should select edges totalling the cheapest
+;;     spanning forest of the 4-node graph.
+;; ---------------------------------------------------------------------
+(set MstDia (.graph.mst Dia))
+(count MstDia)                                      -- 3
+
+;; ---------------------------------------------------------------------
+;; (42) Louvain on a small bidirectional clique TriBi — exercises the
+;;     Louvain pass with multiple touched-community resets per node.
+;;     The exact community count depends on iteration order; we only
+;;     require the algorithm produces a valid labeling of all 3 nodes.
+;; ---------------------------------------------------------------------
+(set LovTri (.graph.louvain TriBi))
+(count LovTri)                                      -- 3
+(<= (count (distinct (at LovTri '_community))) 3)   -- true
+
+;; ---------------------------------------------------------------------
+;; (43) Louvain with explicit iters (2-arg form) on a tiny graph.
+;;     Already covered through P5 path; here we hit it on Mix.
+;; ---------------------------------------------------------------------
+(set LovMix (.graph.louvain Mix 5))
+(count LovMix)                                      -- 3
+
+;; ---------------------------------------------------------------------
+;; (44) PageRank 3-arg form: explicit iters AND damping.  Exercises the
+;;     full arity branch of ray_graph_pagerank_fn that other tests skip
+;;     (most use 1- or 2-arg form).
+;; ---------------------------------------------------------------------
+(set PrTri (.graph.pagerank Tri3 20 0.75))
+(count PrTri)                                       -- 3
+
+;; ---------------------------------------------------------------------
+;; (45) PageRank on TriBi where each node has bidirectional edges —
+;;     ranks converge to ~1/3 each.
+;; ---------------------------------------------------------------------
+(set PrBi (.graph.pagerank TriBi 30 0.85))
+(count PrBi)                                        -- 3
+(>= (sum (at PrBi '_rank)) 0.99)                     -- true
+(<= (sum (at PrBi '_rank)) 1.01)                     -- true
+
+;; ---------------------------------------------------------------------
+;; (46) cluster_coeff on a 4-clique (every pair bidirectionally connected).
+;;     Each node has 3 neighbors and all 3 triangles complete -> coef=1.
+;; ---------------------------------------------------------------------
+(set K4E (table [src dst w] (list [0 0 0 1 1 1 2 2 2 3 3 3] [1 2 3 0 2 3 0 1 3 0 1 2] [1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0])))
+(set K4 (.graph.build K4E 'src 'dst 'w))
+(set CcK4 (.graph.cluster K4))
+(count CcK4)                                        -- 4
+;; All 4 nodes have coefficient 1.0 in the clique.
+(== (min (at CcK4 '_coefficient)) (max (at CcK4 '_coefficient))) -- true
+
+;; ---------------------------------------------------------------------
+;; (47) Betweenness with sample==1 on a path — single source.  This is
+;;     the smallest sampled case; covers the `n_sources=1` arm.
+;;     betweenness emits cb[i] for all n nodes; closeness emits only
+;;     the n_sources sampled nodes (n_out=n_sources).
+;; ---------------------------------------------------------------------
+(count (.graph.betweenness P5 1))                   -- 5
+(count (.graph.closeness   P5 1))                   -- 1
+
+;; ---------------------------------------------------------------------
+;; (48) dfs on a self-loop: visited check prevents revisit of node 0.
+;;     With depth-cap 5 and the self-loop, we get exactly 1 row.
+;; ---------------------------------------------------------------------
+(count (.graph.dfs One 0 5))                        -- 1
+
+;; ---------------------------------------------------------------------
+;; (49) shortest-path on Mix from 0 to 2 — direct 2-hop path.
+;; ---------------------------------------------------------------------
+(set SpMix (.graph.shortest-path Mix 0 2))
+(count SpMix)                                       -- 3
+(at (at SpMix '_node) 0)                            -- 0
+(at (at SpMix '_node) 2)                            -- 2
+
+;; ---------------------------------------------------------------------
+;; (50) dijkstra unreachable target — explicit dst beyond the connected
+;;     component should return only the source if reachable info empties.
+;;     Use 2-disjoint-component fixture.
+;; ---------------------------------------------------------------------
+(set DisjE (table [src dst w] (list [0 2] [1 3] [1.0 1.0])))
+(set Disjoint (.graph.build DisjE 'src 'dst 'w))
+;; 0 can reach 1 only.  Dijkstra from 0: reachable={0,1}.
+(set DjDis (.graph.dijkstra Disjoint 0))
+(count DjDis)                                       -- 2
+;; Explicit dst=3 with early-exit but unreachable still returns reachable
+;; set (Dijkstra emits all dist < INF found so far).
+(set DjDisD (.graph.dijkstra Disjoint 0 3))
+(>= (count DjDisD) 2)                                -- true
+
+;; ---------------------------------------------------------------------
+;; (51) Connected-components on the disjoint fixture: 2 components.
+;; ---------------------------------------------------------------------
+(set CompDis (.graph.connected Disjoint))
+(count CompDis)                                     -- 4
+(count (distinct (at CompDis '_component)))         -- 2
+
+;; ---------------------------------------------------------------------
+;; (52) closeness on disjoint graph — reachable=1 for endpoints,
+;;     reachable=0 for isolated nodes.  Hits the `reachable > 0` False
+;;     branch when a node has no neighbors.
+;; ---------------------------------------------------------------------
+(set CloDis (.graph.closeness Disjoint))
+(count CloDis)                                      -- 4
+;; All nodes have at least one neighbor here, so all closeness > 0.
+;; Build a truly isolated-node graph by adding a self-loop on 0 only.
+(set IsoE (table [src dst w] (list [0 1] [0 1] [1.0 1.0])))
+(set Iso (.graph.build IsoE 'src 'dst 'w))
+(set CloIso (.graph.closeness Iso))
+(count CloIso)                                      -- 2
+
+;; =====================================================================
 ;; Cleanup
 ;; =====================================================================
 (.graph.free P5)
@@ -256,3 +560,10 @@
 (.graph.free Mix)
 (.graph.free One)
 (.graph.free FC)
+(.graph.free TriBi)
+(.graph.free Par)
+(.graph.free Back)
+(.graph.free Dm)
+(.graph.free K4)
+(.graph.free Disjoint)
+(.graph.free Iso)

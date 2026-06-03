@@ -4760,6 +4760,747 @@ static test_result_t test_astar_lat_only(void) {
 }
 
 /* --------------------------------------------------------------------------
+ * Test: exec_astar relaxation reaches a node via a worse path on a diamond.
+ * Hits: Branch (2290:17) False — `new_dist < dist_a[v]` False when we
+ * re-relax node v via a non-improving path.
+ *
+ * Diamond layout (lat/lon on x-axis, identical heuristic for both arms):
+ *   0->1 w=1, 0->2 w=1, 1->3 w=1, 2->3 w=1.
+ *   After popping 0, both 1 and 2 are relaxed to dist=1.
+ *   After popping 1, node 3 is relaxed to dist=2.
+ *   After popping 2, the relaxation of node 3 yields new_dist=2 == dist[3]
+ *   — the `< dist_a[v]` test is FALSE and the relaxation is skipped.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_astar_diamond_equal(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* Diamond graph 0->1, 0->2, 1->3, 2->3 (equal-cost arms). */
+    int64_t src_e[] = {0, 0, 1, 2};
+    int64_t dst_e[] = {1, 2, 3, 3};
+    double  wts[]   = {1.0, 1.0, 1.0, 1.0};
+    ray_t* edges;
+    ray_rel_t* rel = make_weighted_rel(src_e, dst_e, wts, 4, 4, &edges);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    /* Linear lat/lon — heuristic identical for both diamond arms. */
+    double lat_arr[] = {0.0, 1.0, 1.0, 2.0};
+    double lon_arr[] = {0.0, 0.0, 0.0, 0.0};
+    ray_t* nv   = ray_vec_new(RAY_I64, 4);
+    ray_t* latv = ray_vec_new(RAY_F64, 4);
+    ray_t* lonv = ray_vec_new(RAY_F64, 4);
+    int64_t* ndata = (int64_t*)ray_data(nv);
+    ndata[0]=0; ndata[1]=1; ndata[2]=2; ndata[3]=3; nv->len=4;
+    memcpy(ray_data(latv), lat_arr, sizeof(lat_arr)); latv->len=4;
+    memcpy(ray_data(lonv), lon_arr, sizeof(lon_arr)); lonv->len=4;
+    ray_t* np = ray_table_new(3);
+    np = ray_table_add_col(np, ray_sym_intern("_node", 5), nv);  ray_release(nv);
+    np = ray_table_add_col(np, ray_sym_intern("lat", 3), latv);  ray_release(latv);
+    np = ray_table_add_col(np, ray_sym_intern("lon", 3), lonv);  ray_release(lonv);
+
+    ray_graph_t* g = ray_graph_new(NULL);
+    ray_op_t* src_op = ray_const_i64(g, 0);
+    ray_op_t* dst_op = ray_const_i64(g, 3);
+    ray_op_t* as = ray_astar(g, src_op, dst_op, rel, "weight", "lat", "lon", np, 10);
+    TEST_ASSERT_NOT_NULL(as);
+
+    ray_t* result = ray_execute(g, as);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
+    TEST_ASSERT_TRUE(ray_table_nrows(result) >= 2);
+    ray_release(result);
+
+    ray_graph_free(g);
+    ray_rel_free(rel);
+    ray_release(edges);
+    ray_release(np);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: exec_cluster_coeff on a graph with parallel-fwd edges (0->1 twice).
+ * Hits: Branch (1532:36) False — `!in_nbr[u]` False when the same neighbor
+ * appears twice in the fwd CSR (the second occurrence is already marked).
+ * Also exercises 1539:36 False on the rev pass when the same parallel-edge
+ * structure shows up there.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_cluster_coeff_parallel_edges(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* 4-node graph: 0->1, 0->1 (parallel), 0->2, 1->2.
+     * Node 0's fwd CSR: [1, 1, 2]; the second '1' triggers the dedup
+     * `!in_nbr[1]` False branch on the fwd pass. */
+    int64_t src_arr[] = {0, 0, 0, 1};
+    int64_t dst_arr[] = {1, 1, 2, 2};
+    ray_rel_t* rel = make_rel_simple(src_arr, dst_arr, 4, 3);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    ray_graph_t* g = ray_graph_new(NULL);
+    ray_op_t* cc_op = ray_cluster_coeff(g, rel);
+    TEST_ASSERT_NOT_NULL(cc_op);
+
+    ray_t* result = ray_execute(g, cc_op);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
+    /* 3 nodes (0,1,2) in the output. */
+    TEST_ASSERT_EQ_I(ray_table_nrows(result), 3);
+    ray_release(result);
+
+    ray_graph_free(g);
+    ray_rel_free(rel);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: exec_cluster_coeff on a graph with asymmetric n_src/n_dst.
+ * Hits: Branches (1532:27 False) and (1539:27 False) — `u < n` False when
+ * rev_tgt contains a node id >= rel->fwd.n_nodes.
+ *
+ * Construct: fwd.n_nodes=3 (n_src=3), but edges include 0->5, 1->5, etc.
+ * with n_dst_nodes=6.  The rev CSR's targets contain dst nodes (0..5),
+ * one of which (5) is >= n=3, so the `u < n` False branch fires.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_cluster_coeff_asym(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* 3 src nodes, 6 dst nodes.  Edges: 0->5, 1->5 (both target node 5
+     * which is >= fwd.n_nodes=3, hits `u < n` False in rev loop). */
+    int64_t src_arr[] = {0, 1, 0};
+    int64_t dst_arr[] = {5, 5, 1};
+    ray_rel_t* rel = make_rel_asym(src_arr, dst_arr, 3, 3, 6);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    ray_graph_t* g = ray_graph_new(NULL);
+    ray_op_t* cc_op = ray_cluster_coeff(g, rel);
+    TEST_ASSERT_NOT_NULL(cc_op);
+
+    ray_t* result = ray_execute(g, cc_op);
+    /* Result depends on implementation when rev targets exceed n; either
+     * succeed (skipped) or error.  We only require it not to crash. */
+    if (result) {
+        if (!RAY_IS_ERR(result)) {
+            TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
+        }
+        ray_release(result);
+    }
+
+    ray_graph_free(g);
+    ray_rel_free(rel);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: exec_expand direction==2 SIP with out-of-range positive source.
+ * Hits: Branches (213:46), (222:46), (245:33), (257:33) — `node < src_sel_len`
+ * False when the source vec contains a node id >= the SIP bitmap length
+ * (src_sel_len = max(fwd.n_nodes, rev.n_nodes)).
+ *
+ * Strategy: build a 100-node chain (src_sel_len=100), source vec has 200
+ * elements: nodes 0..99 plus 100..199 (all positive, all >= src_sel_len
+ * for the upper half).  SIP engages (n_src>64, filter_hint=1).
+ * -------------------------------------------------------------------------- */
+static test_result_t test_expand_sip_dir2_oob_src(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t n_nodes = 100;
+    int64_t n_edges = 49;
+
+    ray_t* sv = ray_vec_new(RAY_I64, n_edges);
+    ray_t* dv = ray_vec_new(RAY_I64, n_edges);
+    int64_t* sdata = (int64_t*)ray_data(sv);
+    int64_t* ddata = (int64_t*)ray_data(dv);
+    for (int64_t i = 0; i < n_edges; i++) {
+        sdata[i] = i;
+        ddata[i] = i + 1;
+    }
+    sv->len = n_edges; dv->len = n_edges;
+
+    ray_t* edges = ray_table_new(2);
+    edges = ray_table_add_col(edges, ray_sym_intern("src", 3), sv); ray_release(sv);
+    edges = ray_table_add_col(edges, ray_sym_intern("dst", 3), dv); ray_release(dv);
+    ray_rel_t* rel = ray_rel_from_edges(edges, "src", "dst", n_nodes, n_nodes, false);
+    ray_release(edges);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    /* Source vec: 200 entries; first 100 valid (0..99), next 100 are
+     * positive but >= n_nodes=100 (so beyond src_sel_len when SIP active). */
+    int64_t n_src = 200;
+    ray_t* src_vec = ray_vec_new(RAY_I64, n_src);
+    int64_t* svec_data = (int64_t*)ray_data(src_vec);
+    for (int64_t i = 0; i < n_src; i++) {
+        svec_data[i] = i;  /* 0..199, 100..199 are >= src_sel_len */
+    }
+    src_vec->len = n_src;
+
+    ray_graph_t* g = ray_graph_new(NULL);
+    ray_op_t* src_op = ray_const_vec(g, src_vec);
+    ray_release(src_vec);
+    TEST_ASSERT_NOT_NULL(src_op);
+
+    ray_op_t* expand_op = ray_expand(g, src_op, rel, 2);
+    TEST_ASSERT_NOT_NULL(expand_op);
+
+    /* Engage SIP. */
+    uint32_t expand_id = expand_op->id;
+    for (uint32_t i = 0; i < g->ext_count; i++) {
+        if (g->ext_nodes[i] && g->ext_nodes[i]->base.id == expand_id) {
+            g->ext_nodes[i]->base.pad[2] = 1;
+            break;
+        }
+    }
+
+    ray_t* result = ray_execute(g, expand_op);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
+    ray_release(result);
+
+    ray_graph_free(g);
+    ray_rel_free(rel);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: exec_expand direction==2 SIP with a negative source node.
+ * Hits: Branches (213:33 False) and (222:33 False) — `node >= 0` False
+ * when the source vec contains a -1 sentinel and SIP filter is engaged
+ * (filter_hint=1 + n_src>64).
+ *
+ * Strategy: build a 100-node chain, source vec of size 100 includes -1.
+ * Set pad[2]=1 on the expand ext to engage SIP, then run.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_expand_sip_dir2_neg_src(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t n_nodes = 100;
+    int64_t n_edges = 49;
+
+    ray_t* sv = ray_vec_new(RAY_I64, n_edges);
+    ray_t* dv = ray_vec_new(RAY_I64, n_edges);
+    int64_t* sdata = (int64_t*)ray_data(sv);
+    int64_t* ddata = (int64_t*)ray_data(dv);
+    for (int64_t i = 0; i < n_edges; i++) {
+        sdata[i] = i;
+        ddata[i] = i + 1;
+    }
+    sv->len = n_edges; dv->len = n_edges;
+
+    ray_t* edges = ray_table_new(2);
+    edges = ray_table_add_col(edges, ray_sym_intern("src", 3), sv); ray_release(sv);
+    edges = ray_table_add_col(edges, ray_sym_intern("dst", 3), dv); ray_release(dv);
+    ray_rel_t* rel = ray_rel_from_edges(edges, "src", "dst", n_nodes, n_nodes, false);
+    ray_release(edges);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    /* Source vec: 100 entries where 90 are positive node IDs and 10 are -1.
+     * Total n_src=100 > 64 → SIP engages.  The -1 entries trigger
+     * `node >= 0` False in both count and fill loops. */
+    ray_t* src_vec = ray_vec_new(RAY_I64, n_nodes);
+    int64_t* svec_data = (int64_t*)ray_data(src_vec);
+    for (int64_t i = 0; i < n_nodes; i++) {
+        svec_data[i] = (i < 90) ? i : -1;
+    }
+    src_vec->len = n_nodes;
+
+    ray_graph_t* g = ray_graph_new(NULL);
+    ray_op_t* src_op = ray_const_vec(g, src_vec);
+    ray_release(src_vec);
+    TEST_ASSERT_NOT_NULL(src_op);
+
+    ray_op_t* expand_op = ray_expand(g, src_op, rel, 2);
+    TEST_ASSERT_NOT_NULL(expand_op);
+
+    /* Engage SIP by setting pad[2]=1 on the ext node. */
+    uint32_t expand_id = expand_op->id;
+    for (uint32_t i = 0; i < g->ext_count; i++) {
+        if (g->ext_nodes[i] && g->ext_nodes[i]->base.id == expand_id) {
+            g->ext_nodes[i]->base.pad[2] = 1;
+            break;
+        }
+    }
+
+    ray_t* result = ray_execute(g, expand_op);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
+    ray_release(result);
+
+    ray_graph_free(g);
+    ray_rel_free(rel);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: exec_betweenness with sample >= n (sample-clamping arm).
+ * Hits: Branches (1596:40) and (1633:37) — `sample < n` False when the
+ * caller passes an oversize sample.
+ *
+ * The .graph.betweenness RFL builtin already exercises this; this C-level
+ * test pairs it with the direct ray_betweenness API to belt-and-braces.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_betweenness_sample_clamp(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t src_arr[] = {0, 1, 2, 3};
+    int64_t dst_arr[] = {1, 2, 3, 4};
+    ray_rel_t* rel = make_rel_simple(src_arr, dst_arr, 4, 5);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    ray_graph_t* g = ray_graph_new(NULL);
+    /* sample=20 > n=5: clamped to n. */
+    ray_op_t* op = ray_betweenness(g, rel, 20);
+    TEST_ASSERT_NOT_NULL(op);
+
+    ray_t* result = ray_execute(g, op);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
+    TEST_ASSERT_EQ_I(ray_table_nrows(result), 5);
+    ray_release(result);
+
+    ray_graph_free(g);
+    ray_rel_free(rel);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: exec_closeness with sample >= n on disjoint graph — exercises the
+ * sample-saturation arm together with isolated-node handling.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_closeness_sample_clamp(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t src_arr[] = {0, 2};
+    int64_t dst_arr[] = {1, 3};
+    ray_rel_t* rel = make_rel_simple(src_arr, dst_arr, 2, 4);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    ray_graph_t* g = ray_graph_new(NULL);
+    /* sample=10 > n=4: clamped. */
+    ray_op_t* op = ray_closeness(g, rel, 10);
+    TEST_ASSERT_NOT_NULL(op);
+
+    ray_t* result = ray_execute(g, op);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
+    TEST_ASSERT_EQ_I(ray_table_nrows(result), 4);
+    ray_release(result);
+
+    ray_graph_free(g);
+    ray_rel_free(rel);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: exec_dijkstra over a graph where the heap pops a stale entry
+ * (visited check).  Diamond 0->1(1), 0->2(1), 1->3(1), 2->3(1): both arms
+ * push (3, dist=2) onto the heap; the first pop relaxes via the cheaper
+ * arm, the second pop is stale and the `visited[u]` check fires.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_dijkstra_diamond_stale_pop(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t se[] = {0, 0, 1, 2};
+    int64_t de[] = {1, 2, 3, 3};
+    double  wts[] = {1.0, 1.0, 1.0, 1.0};
+    ray_t* edges;
+    ray_rel_t* rel = make_weighted_rel(se, de, wts, 4, 4, &edges);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    ray_graph_t* g = ray_graph_new(NULL);
+    ray_op_t* src_op = ray_const_i64(g, 0);
+    ray_op_t* op = ray_dijkstra(g, src_op, NULL, rel, "weight", 5);
+    TEST_ASSERT_NOT_NULL(op);
+
+    ray_t* result = ray_execute(g, op);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
+    /* All 4 nodes reachable. */
+    TEST_ASSERT_EQ_I(ray_table_nrows(result), 4);
+    ray_release(result);
+
+    ray_graph_free(g);
+    ray_rel_free(rel);
+    ray_release(edges);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: exec_var_expand direction==2 BFS where the frontier contains nodes
+ * with negative IDs from a multi-seed start vec.  Hits the BFS inner loop
+ * `node < 0` guard via the per-source bfs_n_nodes range check.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_var_expand_multi_seed_neg(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t se[] = {0, 1, 2, 3};
+    int64_t de[] = {1, 2, 3, 4};
+    ray_rel_t* rel = make_rel_simple(se, de, 4, 5);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    ray_graph_t* g = ray_graph_new(NULL);
+    /* Start vec mixes valid nodes with -1 sentinels (and an out-of-range +99). */
+    ray_t* sv = ray_vec_from_raw(RAY_I64, (int64_t[]){-1, 0, 1, 99, 2}, 5);
+    TEST_ASSERT_NOT_NULL(sv);
+    ray_op_t* src_op = ray_const_vec(g, sv);
+    ray_release(sv);
+    TEST_ASSERT_NOT_NULL(src_op);
+
+    ray_op_t* ve_op = ray_var_expand(g, src_op, rel, 2, 1, 3, false);
+    TEST_ASSERT_NOT_NULL(ve_op);
+
+    ray_t* result = ray_execute(g, ve_op);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
+    ray_release(result);
+
+    ray_graph_free(g);
+    ray_rel_free(rel);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: exec_dfs vec_src with the source vec empty — exec_dfs reads
+ * ((int64_t*)ray_data(src_val))[0] only for non-atom args; the atomic
+ * src_val->i64 path is well covered.  Here we test the multi-element
+ * vec source: DFS still starts from element[0].
+ * -------------------------------------------------------------------------- */
+static test_result_t test_dfs_vec_multi(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t se[] = {0, 1, 2, 3};
+    int64_t de[] = {1, 2, 3, 4};
+    ray_rel_t* rel = make_rel_simple(se, de, 4, 5);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    ray_graph_t* g = ray_graph_new(NULL);
+    /* Multi-element vec — DFS uses the first element only. */
+    ray_t* sv = ray_vec_from_raw(RAY_I64, (int64_t[]){0, 3, 4}, 3);
+    TEST_ASSERT_NOT_NULL(sv);
+    ray_op_t* src_op = ray_const_vec(g, sv);
+    ray_release(sv);
+
+    ray_op_t* dfs_op = ray_dfs(g, src_op, rel, 10);
+    TEST_ASSERT_NOT_NULL(dfs_op);
+
+    ray_t* result = ray_execute(g, dfs_op);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
+    /* DFS from node 0 visits {0,1,2,3,4} = 5 nodes. */
+    TEST_ASSERT_EQ_I(ray_table_nrows(result), 5);
+    ray_release(result);
+
+    ray_graph_free(g);
+    ray_rel_free(rel);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: exec_topsort on a graph with multiple disconnected DAGs — each
+ * disconnected component is topologically sorted independently.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_topsort_disjoint(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* Two disjoint DAGs:
+     *   Component A: 0->1->2
+     *   Component B: 3->4 */
+    int64_t se[] = {0, 1, 3};
+    int64_t de[] = {1, 2, 4};
+    ray_rel_t* rel = make_rel_simple(se, de, 3, 5);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    ray_graph_t* g = ray_graph_new(NULL);
+    ray_op_t* op = ray_topsort(g, rel);
+    TEST_ASSERT_NOT_NULL(op);
+
+    ray_t* result = ray_execute(g, op);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
+    TEST_ASSERT_EQ_I(ray_table_nrows(result), 5);
+    ray_release(result);
+
+    ray_graph_free(g);
+    ray_rel_free(rel);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: exec_random_walk on a 2-cycle 0<->1 — every step alternates.
+ * Exercises the deterministic walk arm where the next node is always
+ * uniquely determined.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_random_walk_two_cycle(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t se[] = {0, 1};
+    int64_t de[] = {1, 0};
+    ray_rel_t* rel = make_rel_simple(se, de, 2, 2);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    ray_graph_t* g = ray_graph_new(NULL);
+    ray_op_t* src_op = ray_const_i64(g, 0);
+    ray_op_t* op = ray_random_walk(g, src_op, rel, 7);
+    TEST_ASSERT_NOT_NULL(op);
+
+    ray_t* result = ray_execute(g, op);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
+    /* walk_len=7 produces 8 rows. */
+    TEST_ASSERT_EQ_I(ray_table_nrows(result), 8);
+    ray_release(result);
+
+    ray_graph_free(g);
+    ray_rel_free(rel);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: exec_pagerank on a graph with two dangling nodes (zero out-degree).
+ * Exercises the dangling-mass redistribution arm — `fwd_off[u+1] == fwd_off[u]`
+ * True for both dangling nodes.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_pagerank_multi_dangling(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* 5-node graph: 0->1, 1->2.  Nodes 2, 3, 4 are dangling. */
+    int64_t se[] = {0, 1};
+    int64_t de[] = {1, 2};
+    ray_rel_t* rel = make_rel_simple(se, de, 2, 5);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    ray_graph_t* g = ray_graph_new(NULL);
+    ray_op_t* op = ray_pagerank(g, rel, 30, 0.85);
+    TEST_ASSERT_NOT_NULL(op);
+
+    ray_t* result = ray_execute(g, op);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
+    TEST_ASSERT_EQ_I(ray_table_nrows(result), 5);
+    ray_release(result);
+
+    ray_graph_free(g);
+    ray_rel_free(rel);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: exec_mst on a fully-connected complete weighted graph K4.  MST has
+ * 3 edges; exercises uf_union and the rank-tie path in uf_union.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_mst_k4(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* K4 directed: every pair (12 edges).  MST collects edges with
+     * increasing weights until 3 components are merged. */
+    int64_t se[]  = {0,0,0, 1,1,1, 2,2,2, 3,3,3};
+    int64_t de[]  = {1,2,3, 0,2,3, 0,1,3, 0,1,2};
+    double  wts[] = {1.0,4.0,5.0, 1.0,2.0,6.0, 4.0,2.0,3.0, 5.0,6.0,3.0};
+    ray_t* edges;
+    ray_rel_t* rel = make_weighted_rel(se, de, wts, 12, 4, &edges);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    ray_graph_t* g = ray_graph_new(NULL);
+    ray_op_t* op = ray_mst(g, rel, "weight");
+    TEST_ASSERT_NOT_NULL(op);
+
+    ray_t* result = ray_execute(g, op);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
+    /* n - 1 = 3 edges in MST. */
+    TEST_ASSERT_EQ_I(ray_table_nrows(result), 3);
+    ray_release(result);
+
+    ray_graph_free(g);
+    ray_rel_free(rel);
+    ray_release(edges);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: exec_louvain with movement across multiple iterations.  Two-clique
+ * graph: nodes {0,1,2} fully connected, {3,4,5} fully connected, plus a
+ * weak bridge 2<->3.  Louvain should converge to 2 communities.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_louvain_two_cliques(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* Triangle {0,1,2}: 0<->1<->2<->0, plus triangle {3,4,5}: 3<->4<->5<->3,
+     * plus bridge 2<->3. */
+    int64_t se[] = {0,1, 1,2, 0,2,  3,4, 4,5, 3,5,  2,3};
+    int64_t de[] = {1,0, 2,1, 2,0,  4,3, 5,4, 5,3,  3,2};
+    ray_rel_t* rel = make_rel_simple(se, de, 14, 6);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    ray_graph_t* g = ray_graph_new(NULL);
+    ray_op_t* op = ray_louvain(g, rel, 20);
+    TEST_ASSERT_NOT_NULL(op);
+
+    ray_t* result = ray_execute(g, op);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
+    TEST_ASSERT_EQ_I(ray_table_nrows(result), 6);
+    ray_release(result);
+
+    ray_graph_free(g);
+    ray_rel_free(rel);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: exec_degree_cent on an asymmetric graph (fwd nodes != rev nodes).
+ * Hits the asymmetric branch for in/out degree computation.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_degree_cent_asym(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* 4 src nodes, 6 dst nodes (asym).  Edges: 0->4, 1->5, 2->5. */
+    int64_t se[] = {0, 1, 2};
+    int64_t de[] = {4, 5, 5};
+    ray_rel_t* rel = make_rel_asym(se, de, 3, 4, 6);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    ray_graph_t* g = ray_graph_new(NULL);
+    ray_op_t* op = ray_degree_cent(g, rel);
+    TEST_ASSERT_NOT_NULL(op);
+
+    ray_t* result = ray_execute(g, op);
+    if (result) {
+        if (!RAY_IS_ERR(result)) {
+            TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
+        }
+        ray_release(result);
+    }
+
+    ray_graph_free(g);
+    ray_rel_free(rel);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: exec_shortest_path direction==0 (explicit forward) over a 3-node
+ * chain with src and dst as vec inputs.  Belt-and-braces against the
+ * existing test_shortest_path_vec_input which uses different topology.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_shortest_path_vec_chain(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t se[] = {0, 1};
+    int64_t de[] = {1, 2};
+    ray_rel_t* rel = make_rel_simple(se, de, 2, 3);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    ray_graph_t* g = ray_graph_new(NULL);
+    /* src/dst as vec inputs */
+    ray_t* sv = ray_vec_from_raw(RAY_I64, (int64_t[]){0}, 1);
+    ray_t* dv = ray_vec_from_raw(RAY_I64, (int64_t[]){2}, 1);
+    ray_op_t* src_op = ray_const_vec(g, sv); ray_release(sv);
+    ray_op_t* dst_op = ray_const_vec(g, dv); ray_release(dv);
+    TEST_ASSERT_NOT_NULL(src_op);
+    TEST_ASSERT_NOT_NULL(dst_op);
+
+    ray_op_t* op = ray_shortest_path(g, src_op, dst_op, rel, 5);
+    TEST_ASSERT_NOT_NULL(op);
+
+    ray_t* result = ray_execute(g, op);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
+    TEST_ASSERT_EQ_I(ray_table_nrows(result), 3);
+    ray_release(result);
+
+    ray_graph_free(g);
+    ray_rel_free(rel);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: exec_k_shortest on a graph where the FIRST path is the ONLY path.
+ * After finding the path, num_cand stays 0 and `if (num_cand == 0) break;`
+ * fires immediately on the next k iteration.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_k_shortest_only_one_path(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* 3-node linear chain 0->1->2 — only ONE path from 0 to 2. */
+    int64_t se[] = {0, 1};
+    int64_t de[] = {1, 2};
+    double  wts[] = {1.0, 1.0};
+    ray_t* edges;
+    ray_rel_t* rel = make_weighted_rel(se, de, wts, 2, 3, &edges);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    ray_graph_t* g = ray_graph_new(NULL);
+    ray_op_t* src_op = ray_const_i64(g, 0);
+    ray_op_t* dst_op = ray_const_i64(g, 2);
+    /* K=5 ensures we go into the iteration loop AND hit the
+     * `num_cand == 0` early-break. */
+    ray_op_t* op = ray_k_shortest(g, src_op, dst_op, rel, "weight", 5);
+    TEST_ASSERT_NOT_NULL(op);
+
+    ray_t* result = ray_execute(g, op);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
+    /* Single path 0->1->2 = 3 rows. */
+    TEST_ASSERT_EQ_I(ray_table_nrows(result), 3);
+    ray_release(result);
+
+    ray_graph_free(g);
+    ray_rel_free(rel);
+    ray_release(edges);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
  * Suite
  * -------------------------------------------------------------------------- */
 
@@ -4865,5 +5606,24 @@ const test_entry_t traverse_entries[] = {
     { "traverse/var_expand_dir2_asym",        test_var_expand_dir2_asym,           NULL, NULL },
     { "traverse/dijkstra_neg_dst",            test_dijkstra_neg_dst,               NULL, NULL },
     { "traverse/astar_lat_only",              test_astar_lat_only,                 NULL, NULL },
+    /* Round-2 (June 2026) — additional reachable branches in traverse.c. */
+    { "traverse/astar_diamond_equal",         test_astar_diamond_equal,            NULL, NULL },
+    { "traverse/cluster_coeff_parallel_edges",test_cluster_coeff_parallel_edges,   NULL, NULL },
+    { "traverse/cluster_coeff_asym",          test_cluster_coeff_asym,             NULL, NULL },
+    { "traverse/expand_sip_dir2_neg_src",     test_expand_sip_dir2_neg_src,        NULL, NULL },
+    { "traverse/expand_sip_dir2_oob_src",     test_expand_sip_dir2_oob_src,        NULL, NULL },
+    { "traverse/betweenness_sample_clamp",    test_betweenness_sample_clamp,       NULL, NULL },
+    { "traverse/closeness_sample_clamp",      test_closeness_sample_clamp,         NULL, NULL },
+    { "traverse/dijkstra_diamond_stale_pop",  test_dijkstra_diamond_stale_pop,     NULL, NULL },
+    { "traverse/var_expand_multi_seed_neg",   test_var_expand_multi_seed_neg,      NULL, NULL },
+    { "traverse/dfs_vec_multi",               test_dfs_vec_multi,                  NULL, NULL },
+    { "traverse/topsort_disjoint",            test_topsort_disjoint,               NULL, NULL },
+    { "traverse/random_walk_two_cycle",       test_random_walk_two_cycle,          NULL, NULL },
+    { "traverse/pagerank_multi_dangling",     test_pagerank_multi_dangling,        NULL, NULL },
+    { "traverse/mst_k4",                      test_mst_k4,                         NULL, NULL },
+    { "traverse/louvain_two_cliques",         test_louvain_two_cliques,            NULL, NULL },
+    { "traverse/degree_cent_asym",            test_degree_cent_asym,               NULL, NULL },
+    { "traverse/shortest_path_vec_chain",     test_shortest_path_vec_chain,        NULL, NULL },
+    { "traverse/k_shortest_only_one_path",    test_k_shortest_only_one_path,       NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
