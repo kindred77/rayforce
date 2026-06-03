@@ -40,7 +40,11 @@ make test       # run full test suite
 Rayforce ships with **Rayfall** — a Lisp-like query language with a rich set
 of builtins. The REPL prompt is `‣`:
 
-<!-- Verified output from: ./rayforce /tmp/readme_test.rfl -->
+<!-- REPL session.  Borders ASCII-rendered so GitHub's monospace
+     stack renders glyph widths consistently — Unicode box-drawing
+     chars (┌─┬┐│└┴┘) lose subpixel-precise widths in some fonts
+     and the table looks "twisted".  The data is what `./rayforce`
+     actually returns; only the border glyphs differ. -->
 ```
 ‣ (set t (table [Symbol Side Qty]
     (list [AAPL GOOG MSFT AAPL GOOG]
@@ -48,28 +52,28 @@ of builtins. The REPL prompt is `‣`:
           [100 200 150 300 250])))
 
 ‣ (select {from:t by: Symbol Qty: (sum Qty)})
-┌────────┬────────────────────────────┐
-│ Symbol │            Qty             │
-│  sym   │            i64             │
-├────────┼────────────────────────────┤
-│ AAPL   │ 400                        │
-│ GOOG   │ 450                        │
-│ MSFT   │ 150                        │
-├────────┴────────────────────────────┤
-│ 3 rows (3 shown) 2 columns (2 shown)│
-└─────────────────────────────────────┘
++--------+----------------------------+
+| Symbol |            Qty             |
+|  sym   |            i64             |
++--------+----------------------------+
+| AAPL   | 400                        |
+| GOOG   | 450                        |
+| MSFT   | 150                        |
++-------------------------------------+
+| 3 rows (3 shown) 2 columns (2 shown)|
++-------------------------------------+
 
 ‣ (pivot t 'Symbol 'Side 'Qty sum)
-┌────────┬─────┬──────────────────────┐
-│ Symbol │ Buy │         Sell         │
-│  sym   │ i64 │         i64          │
-├────────┼─────┼──────────────────────┤
-│ AAPL   │ 100 │ 300                  │
-│ GOOG   │ 250 │ 200                  │
-│ MSFT   │ 150 │ 0                    │
-├────────┴─────┴──────────────────────┤
-│ 3 rows (3 shown) 3 columns (3 shown)│
-└─────────────────────────────────────┘
++--------+-----+----------------------+
+| Symbol | Buy |         Sell         |
+|  sym   | i64 |         i64          |
++--------+-----+----------------------+
+| AAPL   | 100 | 300                  |
+| GOOG   | 250 | 200                  |
+| MSFT   | 150 | 0                    |
++-------------------------------------+
+| 3 rows (3 shown) 3 columns (3 shown)|
++-------------------------------------+
 ```
 
 ## C API
