@@ -45,3 +45,24 @@ the warm-first reorder itself. vec-256B improved +4.5% vs Pre-P0.
 
 morsel-8K: +34.2% vs Post-P1 (146.9 vs 109.5 Mops/s); morsel-16K: +35.4% vs Post-P1 (148.8 vs 109.9 Mops/s).
 Orders 14-16 (8K-64K) are now slab-cached under the 1 MB byte budget.
+
+## Post-P4 (commit perf/allocator HEAD — same-pool coalescing under parallel flag, TSan-clean)
+
+```
+(a) single-thread alloc/free:
+  atom-64B          115.2 Mops/s  (20000000 iters, 0.174s)
+  vec-256B          148.7 Mops/s  (20000000 iters, 0.135s)
+  morsel-8K         149.6 Mops/s  (5000000 iters, 0.033s)
+  morsel-16K        150.0 Mops/s  (5000000 iters, 0.033s)
+  large-1M          108.9 Mops/s  (200000 iters, 0.002s)
+(b) producer-consumer (morsel-8K):
+  throughput        1.0 Mops/s  peak RSS 11328400 KB
+```
+
+P4 enables same-pool buddy coalescing during parallel execution (previously
+skipped entirely), guarded by rc==0 + matching heap_id ownership. This mainly
+reduces fragmentation / pool-growth during PARALLEL work; the single-thread (a)
+table is roughly flat vs Post-P2 (atom-64B 115.2 vs 127.7, within run-to-run
+variance; vec/morsel/large unchanged). TSan-clean: no allocator-function data
+races across 4 runs incl. the real parallel_probe / wide_key_probe thread-pool
+tests.
