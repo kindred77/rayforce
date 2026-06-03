@@ -21,6 +21,7 @@ rf_test_*.csv
 
 CLAUDE.md
 docs/plans/
+docs/superpowers/
 
 # IDE state
 .idea/
@@ -39,4 +40,3 @@ site/
 
 # Allocator micro-benchmark binaries
 bench-alloc
-bench-alloc-tfq
