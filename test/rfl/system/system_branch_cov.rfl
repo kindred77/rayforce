@@ -104,6 +104,10 @@
 ;; > 16 entries triggers realloc growth path
 (.sys.exec "mkdir -p /tmp/rfl_sys_bc_bigdir && cd /tmp/rfl_sys_bc_bigdir && for i in $(seq 1 20); do touch f_$(printf '%02d' $i); done")
 (count (.os.list "/tmp/rfl_sys_bc_bigdir/")) -- 20
+;; Empty directory — previously triggered qsort(NULL, 0, ...) UB.
+(.sys.exec "mkdir -p /tmp/rfl_sys_bc_emptydir")
+(count (.os.list "/tmp/rfl_sys_bc_emptydir/")) -- 0
+(.sys.exec "rm -rf /tmp/rfl_sys_bc_emptydir")
 
 ;; ══════════════════════════════════════════════════════════════════════
 ;; ray_guid_fn  (lines 456-475)
