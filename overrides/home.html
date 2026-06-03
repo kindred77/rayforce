@@ -78,34 +78,24 @@ out = (t.where(rf.col(<span class="hl-str">"price"</span>) &gt; <span class="hl-
         </aside>
       </div>
 
-      <div class="hero-numbers">
-        <div class="hero-number">
-          <span class="num-icon">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>
-          </span>
-          <span class="num-title">Single Header</span>
-          <span class="num-label">include/rayforce.h &mdash; one file, full API</span>
+      {# Three display-sized stats — replaces the older 4-tile icon
+         grid.  Reads as a single confident sentence rather than a
+         feature dashboard.  Pass count matches the why-card list
+         below (type inference, constant folding, SIP, factorize,
+         predicate pushdown, filter reorder, fusion, DCE) — keep
+         these in sync if the optimizer chain changes. #}
+      <div class="hero-stats">
+        <div class="hero-stat">
+          <span class="hero-stat-num">16K</span>
+          <span class="hero-stat-label">Lines of C</span>
         </div>
-        <div class="hero-number">
-          <span class="num-icon">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
-          </span>
-          <span class="num-title">Multi-Pass Optimizer</span>
-          <span class="num-label">SIP, factorize, predicate pushdown, fusion, DCE</span>
+        <div class="hero-stat">
+          <span class="hero-stat-num">0</span>
+          <span class="hero-stat-label">External Dependencies</span>
         </div>
-        <div class="hero-number">
-          <span class="num-icon">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>
-          </span>
-          <span class="num-title">Graph Algorithms</span>
-          <span class="num-label">PageRank, Dijkstra, A*, Louvain, LFTJ &mdash; in the same pipeline</span>
-        </div>
-        <div class="hero-number">
-          <span class="num-icon">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
-          </span>
-          <span class="num-title">Rayfall Language</span>
-          <span class="num-label">Lisp-like query language with REPL and rich builtins</span>
+        <div class="hero-stat">
+          <span class="hero-stat-num">8</span>
+          <span class="hero-stat-label">Optimizer Passes</span>
         </div>
       </div>
     </div>
@@ -238,7 +228,7 @@ out = (t.where(rf.col(<span class="hl-str">"price"</span>) &gt; <span class="hl-
           <text x="70" y="86" text-anchor="middle" fill="#f5a623" font-family="'JetBrains Mono', monospace" font-size="12">CSR Graphs</text>
           <rect x="10" y="111" width="120" height="36" rx="8" fill="rgba(255,255,255,0.06)" stroke="rgba(255,255,255,0.15)"/>
           <text x="70" y="134" text-anchor="middle" fill="#f5a623" font-family="'JetBrains Mono', monospace" font-size="12">Rayfall</text>
-          <text x="70" y="166" text-anchor="middle" fill="rgba(255,255,255,0.25)" font-family="Oswald, sans-serif" font-size="9" font-weight="600" letter-spacing="0.12em">SOURCES</text>
+          <text x="70" y="166" text-anchor="middle" fill="rgba(255,255,255,0.25)" font-family="Geist, sans-serif" font-size="9" font-weight="600" letter-spacing="0.12em">SOURCES</text>
           <path d="M130,33 C185,33 185,60 240,60" fill="none" stroke="rgba(245,166,35,0.15)" stroke-width="1.5"/>
           <path d="M130,81 C185,81 185,90 240,90" fill="none" stroke="rgba(245,166,35,0.15)" stroke-width="1.5"/>
           <path d="M130,129 C185,129 185,120 240,120" fill="none" stroke="rgba(245,166,35,0.15)" stroke-width="1.5"/>
@@ -246,7 +236,7 @@ out = (t.where(rf.col(<span class="hl-str">"price"</span>) &gt; <span class="hl-
           <circle r="3" fill="#f5a623" filter="url(#glow)"><animateMotion dur="2.8s" repeatCount="indefinite" path="M130,81 C185,81 185,90 240,90" begin="0.9s"/></circle>
           <circle r="3" fill="#f5a623" filter="url(#glow)"><animateMotion dur="2.6s" repeatCount="indefinite" path="M130,129 C185,129 185,120 240,120" begin="1.7s"/></circle>
           <rect class="arch-core-rect" x="240" y="10" width="320" height="160" rx="14" fill="rgba(153,119,50,0.2)" stroke="rgba(245,166,35,0.4)" stroke-width="1.5"/>
-          <text x="400" y="34" text-anchor="middle" fill="rgba(245,166,35,0.8)" font-family="Oswald, sans-serif" font-size="11" font-weight="700" letter-spacing="0.12em">RAYFORCE ENGINE</text>
+          <text x="400" y="34" text-anchor="middle" fill="rgba(245,166,35,0.8)" font-family="Geist, sans-serif" font-size="11" font-weight="700" letter-spacing="0.12em">RAYFORCE ENGINE</text>
           <rect x="258" y="46" width="72" height="28" rx="6" fill="rgba(255,255,255,0.06)" stroke="rgba(255,255,255,0.08)"/>
           <text x="294" y="64" text-anchor="middle" fill="#e2e8f0" font-family="'JetBrains Mono', monospace" font-size="11">scan</text>
           <rect x="338" y="46" width="72" height="28" rx="6" fill="rgba(255,255,255,0.06)" stroke="rgba(255,255,255,0.08)"/>
@@ -261,7 +251,7 @@ out = (t.where(rf.col(<span class="hl-str">"price"</span>) &gt; <span class="hl-
           <text x="397" y="101" text-anchor="middle" fill="rgba(226,232,240,0.45)" font-family="'JetBrains Mono', monospace" font-size="10">fusion</text>
           <rect x="444" y="84" width="98" height="26" rx="6" fill="rgba(255,255,255,0.03)"/>
           <text x="493" y="101" text-anchor="middle" fill="rgba(226,232,240,0.45)" font-family="'JetBrains Mono', monospace" font-size="10">bytecode</text>
-          <text x="400" y="128" text-anchor="middle" fill="rgba(255,255,255,0.2)" font-family="Oswald, sans-serif" font-size="9" font-weight="600" letter-spacing="0.08em">EXECUTION</text>
+          <text x="400" y="128" text-anchor="middle" fill="rgba(255,255,255,0.2)" font-family="Geist, sans-serif" font-size="9" font-weight="600" letter-spacing="0.08em">EXECUTION</text>
           <rect x="258" y="135" width="98" height="24" rx="6" fill="rgba(255,255,255,0.03)"/>
           <text x="307" y="151" text-anchor="middle" fill="rgba(226,232,240,0.4)" font-family="'JetBrains Mono', monospace" font-size="10">morsel 1024</text>
           <rect x="364" y="135" width="88" height="24" rx="6" fill="rgba(255,255,255,0.03)"/>
@@ -280,7 +270,7 @@ out = (t.where(rf.col(<span class="hl-str">"price"</span>) &gt; <span class="hl-
           <text x="730" y="86" text-anchor="middle" fill="#f5a623" font-family="'JetBrains Mono', monospace" font-size="12">Paths</text>
           <rect x="670" y="111" width="120" height="36" rx="8" fill="rgba(255,255,255,0.06)" stroke="rgba(255,255,255,0.15)"/>
           <text x="730" y="134" text-anchor="middle" fill="#f5a623" font-family="'JetBrains Mono', monospace" font-size="12">Aggregates</text>
-          <text x="730" y="166" text-anchor="middle" fill="rgba(255,255,255,0.25)" font-family="Oswald, sans-serif" font-size="9" font-weight="600" letter-spacing="0.12em">RESULTS</text>
+          <text x="730" y="166" text-anchor="middle" fill="rgba(255,255,255,0.25)" font-family="Geist, sans-serif" font-size="9" font-weight="600" letter-spacing="0.12em">RESULTS</text>
         </svg>
       </div>
 

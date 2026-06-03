@@ -8,7 +8,7 @@ document.addEventListener('DOMContentLoaded', () => {
   // reads as the page "stretching itself in" on hard reload. Snap those
   // to visible instantly; only animate elements that scroll into view
   // *after* the initial paint.
-  const animatedSel = '.feature-card, .why-card, .why-card-small, .usecase-item';
+  const animatedSel = '.feature-card, .why-card, .why-card-small, .usecase-item, .hero-stat';
   const animatedEls = document.querySelectorAll(animatedSel);
   if (animatedEls.length > 0) {
     const inViewportNow = (el) => {
