@@ -1,8 +1,8 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/logo-light.svg">
-    <source media="(prefers-color-scheme: light)" srcset="docs/logo-dark.svg">
-    <img src="docs/logo-dark.svg" alt="Rayforce" width="360">
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-light.svg">
+    <source media="(prefers-color-scheme: light)" srcset="assets/logo-dark.svg">
+    <img src="assets/logo-dark.svg" alt="Rayforce" width="360">
   </picture>
 </p>
 
