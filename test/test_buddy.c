@@ -499,6 +499,19 @@ static test_result_t test_swap_path_default(void) {
     PASS();
 }
 
+static test_result_t test_warm_first_local_free(void) {
+    /* Alloc and free many blocks in the same pool; the MRU should point at
+     * the pool that owns the most-recently-freed block. */
+    ray_t* blocks[32];
+    for (int i = 0; i < 32; i++) blocks[i] = ray_alloc(128);
+    extern RAY_TLS ray_heap_t* ray_tl_heap;
+    ray_heap_t* h = ray_tl_heap;
+    for (int i = 0; i < 32; i++) ray_free(blocks[i]);
+    /* All blocks came from pool 0 (first 32MB pool); MRU must be a valid idx. */
+    TEST_ASSERT(h->last_pool_idx < h->pool_count, "MRU index in range");
+    PASS();
+}
+
 /* ---- Suite definition -------------------------------------------------- */
 
 const test_entry_t buddy_entries[] = {
@@ -521,6 +534,7 @@ const test_entry_t buddy_entries[] = {
     { "buddy/pending_merge", test_heap_pending_merge, buddy_setup, buddy_teardown },
     { "buddy/swap_path_env", test_swap_path_env, buddy_setup, buddy_teardown },
     { "buddy/swap_path_default", test_swap_path_default, NULL, NULL },
+    { "buddy/warm_first_free", test_warm_first_local_free, buddy_setup, buddy_teardown },
     { NULL, NULL, NULL, NULL },
 };
 
