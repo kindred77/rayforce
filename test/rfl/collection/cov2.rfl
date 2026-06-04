@@ -378,6 +378,7 @@
 (type (except ['a 'b] ['a 'b 'c])) -- 'SYM
 (count (except ['a 'b] ['a 'b 'c])) -- 0
 (type (except ["aa" "bb"] ["aa" "bb" "cc"])) -- 'STR
+(count (except ["aa" "bb"] ["aa" "bb" "cc"])) -- 0
 
 ;; ════════════════════════════════════════════════════════════════
 ;; 32. parted_to_flat_vec (lines 760-797) — via distinct on parted vec

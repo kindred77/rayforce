@@ -12,32 +12,67 @@
 (set orders (table [Cust Date Amount] (list [A A B B] [2024.01.02 2024.01.05 2024.01.03 2024.01.06] [100 200 300 400])))(set rates (table [Cust Date Rate] (list [A A B B] [2024.01.01 2024.01.04 2024.01.01 2024.01.05] [0.1 0.15 0.2 0.25])))(at (asof-join [Cust Date] orders rates) 'Rate) -- [0.1 0.15 0.2 0.25]
 ;; left-join all rows match
 (set t1 (table [ID Name] (list [1 3] [a c])))(set t2 (table [ID Value] (list [1 3] [100 300])))(left-join [ID] t1 t2) -- (table [ID Name Value] (list [1 3] [a c] [100 300]))
-;; left-join partial matches
-(set t1 (table [ID Name] (list [1 2 3] [a b c])))(set t2 (table [ID Value] (list [1 3] [100 300])))(count (left-join [ID] t1 t2)) -- 3
-;; left-join by Date
-(set t1 (table [dt val1] (list [2024.01.01 2024.01.02 2024.01.03] [100 200 300])))(set t2 (table [dt val2] (list [2024.01.01 2024.01.03] [1000 3000])))(count (left-join [dt] t1 t2)) -- 3
-;; left-join by Time
-(set t1 (table [tm val1] (list [10:00:00 10:00:01 10:00:02] [100 200 300])))(set t2 (table [tm val2] (list [10:00:00 10:00:02] [1000 3000])))(count (left-join [tm] t1 t2)) -- 3
+;; left-join partial matches — ID 2 has no right match → Value=Null; sum of non-null = 400.
+(set t1 (table [ID Name] (list [1 2 3] [a b c])))(set t2 (table [ID Value] (list [1 3] [100 300])))
+(set ljp (left-join [ID] t1 t2))(count ljp) -- 3
+(at ljp 'ID) -- [1 2 3]
+(at ljp 'Name) -- [a b c]
+;; row for ID=2 has Null Value; non-null sum = 100+300.
+(sum (at ljp 'Value)) -- 400
+(nil? (at (at ljp 'Value) 1)) -- true
+;; left-join by Date — same pattern: middle row's val2 is Null.
+(set t1 (table [dt val1] (list [2024.01.01 2024.01.02 2024.01.03] [100 200 300])))(set t2 (table [dt val2] (list [2024.01.01 2024.01.03] [1000 3000])))
+(set ljd (left-join [dt] t1 t2))(count ljd) -- 3
+(at ljd 'val1) -- [100 200 300]
+(sum (at ljd 'val2)) -- 4000
+(nil? (at (at ljd 'val2) 1)) -- true
+;; left-join by Time — same pattern.
+(set t1 (table [tm val1] (list [10:00:00 10:00:01 10:00:02] [100 200 300])))(set t2 (table [tm val2] (list [10:00:00 10:00:02] [1000 3000])))
+(set ljt (left-join [tm] t1 t2))(count ljt) -- 3
+(at ljt 'val1) -- [100 200 300]
+(sum (at ljt 'val2)) -- 4000
+(nil? (at (at ljt 'val2) 1)) -- true
 ;; inner-join basic
 (set t1 (table [id val1] (list [1 2 3 4 5] [100 200 300 400 500])))(set t2 (table [id val2] (list [1 3 5 6 7] [1000 3000 5000 6000 7000])))(count (inner-join [id] t1 t2)) -- 3
 ;; inner-join returns correct right values
 (set t1 (table [id val1] (list [1 2 3 4 5] [100 200 300 400 500])))(set t2 (table [id val2] (list [1 3 5 6 7] [1000 3000 5000 6000 7000])))(at (inner-join [id] t1 t2) 'val2) -- [1000 3000 5000]
 ;; inner-join preserves correct left values
 (set t1 (table [id val1] (list [1 2 3 4 5] [100 200 300 400 500])))(set t2 (table [id val2] (list [1 3 5 6 7] [1000 3000 5000 6000 7000])))(at (inner-join [id] t1 t2) 'val1) -- [100 300 500]
-;; inner-join by Date
-(set t1 (table [dt val1] (list [2024.01.01 2024.01.02 2024.01.03] [100 200 300])))(set t2 (table [dt val2] (list [2024.01.01 2024.01.03 2024.01.05] [1000 3000 5000])))(count (inner-join [dt] t1 t2)) -- 2
-;; inner-join by Time
-(set t1 (table [tm val1] (list [10:00:00 10:00:01 10:00:02] [100 200 300])))(set t2 (table [tm val2] (list [10:00:00 10:00:02 10:00:05] [1000 3000 5000])))(count (inner-join [tm] t1 t2)) -- 2
+;; inner-join by Date — keys 2024.01.01 and 2024.01.03 match; (val1,val2)=(100,1000),(300,3000).
+(set t1 (table [dt val1] (list [2024.01.01 2024.01.02 2024.01.03] [100 200 300])))(set t2 (table [dt val2] (list [2024.01.01 2024.01.03 2024.01.05] [1000 3000 5000])))
+(set ijd (inner-join [dt] t1 t2))(count ijd) -- 2
+(at ijd 'val1) -- [100 300]
+(at ijd 'val2) -- [1000 3000]
+;; inner-join by Time — 10:00:00 and 10:00:02 match.
+(set t1 (table [tm val1] (list [10:00:00 10:00:01 10:00:02] [100 200 300])))(set t2 (table [tm val2] (list [10:00:00 10:00:02 10:00:05] [1000 3000 5000])))
+(set ijt (inner-join [tm] t1 t2))(count ijt) -- 2
+(at ijt 'val1) -- [100 300]
+(at ijt 'val2) -- [1000 3000]
 ;; inner-join with no matches
 (set t1 (table [id val1] (list [1 2 3] [100 200 300])))(set t2 (table [id val2] (list [4 5 6] [400 500 600])))(count (inner-join [id] t1 t2)) -- 0
-;; inner-join with all matches
-(set t1 (table [id val1] (list [1 2 3] [100 200 300])))(set t2 (table [id val2] (list [1 2 3] [1000 2000 3000])))(count (inner-join [id] t1 t2)) -- 3
-;; inner-join by Symbol
-(set t1 (table [sym val1] (list [AAPL GOOG MSFT] [100 200 300])))(set t2 (table [sym val2] (list [AAPL MSFT TSLA] [1000 3000 5000])))(count (inner-join [sym] t1 t2)) -- 2
-;; inner-join by F64
-(set t1 (table [price val1] (list [1.0 2.0 3.0] [100 200 300])))(set t2 (table [price val2] (list [1.0 3.0 5.0] [1000 3000 5000])))(count (inner-join [price] t1 t2)) -- 2
-;; inner-join multi-key
-(set t1 (table [id1 id2 val1] (list [1 1 2] [a b a] [100 200 300])))(set t2 (table [id1 id2 val2] (list [1 2] [a a] [1000 3000])))(count (inner-join [id1 id2] t1 t2)) -- 2
+;; inner-join with all matches — every id pairs through.
+(set t1 (table [id val1] (list [1 2 3] [100 200 300])))(set t2 (table [id val2] (list [1 2 3] [1000 2000 3000])))
+(set ijall (inner-join [id] t1 t2))(count ijall) -- 3
+(at ijall 'val1) -- [100 200 300]
+(at ijall 'val2) -- [1000 2000 3000]
+;; inner-join by Symbol — AAPL and MSFT match (GOOG/TSLA do not).
+(set t1 (table [sym val1] (list [AAPL GOOG MSFT] [100 200 300])))(set t2 (table [sym val2] (list [AAPL MSFT TSLA] [1000 3000 5000])))
+(set ijs (inner-join [sym] t1 t2))(count ijs) -- 2
+;; left side sums {AAPL=100, MSFT=300} = 400; right side {AAPL=1000, MSFT=3000} = 4000.
+(sum (at ijs 'val1)) -- 400
+(sum (at ijs 'val2)) -- 4000
+;; inner-join by F64 — 1.0 and 3.0 match.
+(set t1 (table [price val1] (list [1.0 2.0 3.0] [100 200 300])))(set t2 (table [price val2] (list [1.0 3.0 5.0] [1000 3000 5000])))
+(set ijf (inner-join [price] t1 t2))(count ijf) -- 2
+(at ijf 'price) -- [1.0 3.0]
+(at ijf 'val1)  -- [100 300]
+(at ijf 'val2)  -- [1000 3000]
+;; inner-join multi-key — (1,a) matches right; (2,a) matches right; (1,b) does not.
+(set t1 (table [id1 id2 val1] (list [1 1 2] [a b a] [100 200 300])))(set t2 (table [id1 id2 val2] (list [1 2] [a a] [1000 3000])))
+(set ijmk (inner-join [id1 id2] t1 t2))(count ijmk) -- 2
+;; (1,a,100,1000) and (2,a,300,3000) → val1 sums to 400, val2 to 4000.
+(sum (at ijmk 'val1)) -- 400
+(sum (at ijmk 'val2)) -- 4000
 ;; window-join
 (set trades (table [Sym Time Price] (list [a a] [10:00:01.000 10:00:05.000] [100 200])))(set quotes (table [Sym Time Bid] (list [a a a] [10:00:00.000 10:00:02.000 10:00:04.000] [99 100 101])))(set intervals (map-left + [-2000 2000] (at trades 'Time)))(at (window-join [Sym Time] intervals trades quotes {minBid: (min Bid)}) 'minBid) -- [99 101]
 ;; window-join1
@@ -111,16 +146,46 @@
 (set trades (table [s time price] (list ['a 'a 'b] [10:00:01.000 10:00:05.000 10:00:03.000] [100 200 150])))(set quotes (table [s time bid] (list ['a 'a 'a 'b 'b] [10:00:00.000 10:00:02.000 10:00:04.000 10:00:01.000 10:00:04.000] [99 100 101 149 151])))(set intervals (map-left + [-2000 2000] (at trades 'time)))(at (window-join [s time] intervals trades quotes {minBid: (min bid)}) 'minBid) -- [99 101 149]
 ;; empty left table
 (set t1 (table [id val1] (list (take [1] 0) (take [1] 0))))(set t2 (table [id val2] (list [1 2 3] [100 200 300])))(count (left-join [id] t1 t2)) -- 0
-;; empty right table
-(set t1 (table [id val1] (list [1 2 3] [100 200 300])))(set t2 (table [id val2] (list (take [1] 0) (take [1] 0))))(count (left-join [id] t1 t2)) -- 3
+;; empty right table — left-join keeps all 3 left rows with val2 = Null.
+(set t1 (table [id val1] (list [1 2 3] [100 200 300])))(set t2 (table [id val2] (list (take [1] 0) (take [1] 0))))
+(set lj (left-join [id] t1 t2))
+(count lj) -- 3
+;; left-side columns preserved verbatim
+(at lj 'id)   -- [1 2 3]
+(at lj 'val1) -- [100 200 300]
+;; right-side val2 is Null for every row
+(nil? (at (at lj 'val2) 0)) -- true
+(nil? (at (at lj 'val2) 1)) -- true
+(nil? (at (at lj 'val2) 2)) -- true
 ;; empty tables for inner-join
 (set t1 (table [id val1] (list (take [1] 0) (take [1] 0))))(set t2 (table [id val2] (list [1 2 3] [100 200 300])))(count (inner-join [id] t1 t2)) -- 0
-;; left-join multi-key
-(set t1 (table [id1 id2 val1] (list [1 1 2] [a b a] [100 200 300])))(set t2 (table [id1 id2 val2] (list [1 2] [a a] [1000 3000])))(count (left-join [id1 id2] t1 t2)) -- 3
-;; inner-join with Timestamp
-(set t1 (table [ts val1] (list [2024.01.01D10:00:00.000000000 2024.01.01D10:00:01.000000000 2024.01.01D10:00:02.000000000] [100 200 300])))(set t2 (table [ts val2] (list [2024.01.01D10:00:00.000000000 2024.01.01D10:00:02.000000000] [1000 3000])))(count (inner-join [ts] t1 t2)) -- 2
-;; asof-join no match before returns Null
-(set trades (table [Sym Time Price] (list [a] [10:00:00.000] [100.0])))(set quotes (table [Sym Time Bid] (list [a] [10:00:05.000] [99.0])))(count (asof-join [Sym Time] trades quotes)) -- 1
+;; left-join multi-key — left has (1,a), (1,b), (2,a); right has (1,a)->1000, (2,a)->3000;
+;; expected: (1,a) joins 1000, (1,b) joins Null, (2,a) joins 3000.
+(set t1 (table [id1 id2 val1] (list [1 1 2] [a b a] [100 200 300])))(set t2 (table [id1 id2 val2] (list [1 2] [a a] [1000 3000])))
+(set ljmk (left-join [id1 id2] t1 t2))
+(count ljmk) -- 3
+;; val2 values: 1000, Null, 3000 → two non-null rows summing to 4000.
+(sum (at ljmk 'val2)) -- 4000
+;; row order may vary, so probe each candidate position for the null.
+(set ljmk_v (at ljmk 'val2))
+(== 1 (+ (+ (as 'I64 (nil? (at ljmk_v 0))) (as 'I64 (nil? (at ljmk_v 1)))) (as 'I64 (nil? (at ljmk_v 2))))) -- true
+;; inner-join with Timestamp — only the two matching ts rows survive.
+(set t1 (table [ts val1] (list [2024.01.01D10:00:00.000000000 2024.01.01D10:00:01.000000000 2024.01.01D10:00:02.000000000] [100 200 300])))(set t2 (table [ts val2] (list [2024.01.01D10:00:00.000000000 2024.01.01D10:00:02.000000000] [1000 3000])))
+(set ijts (inner-join [ts] t1 t2))
+(count ijts) -- 2
+;; The 10:00:00 row keeps val1=100 and pairs with val2=1000; the 10:00:02 row keeps val1=300 / val2=3000.
+(at ijts 'val1) -- [100 300]
+(at ijts 'val2) -- [1000 3000]
+;; asof-join no match before returns Null — trade @10:00:00 but quote starts @10:00:05;
+;; no prior quote exists so the Bid column should be Null for the single output row.
+(set trades (table [Sym Time Price] (list [a] [10:00:00.000] [100.0])))
+(set quotes (table [Sym Time Bid] (list [a] [10:00:05.000] [99.0])))
+(set ajNB (asof-join [Sym Time] trades quotes))
+(count ajNB) -- 1
+;; left side preserved
+(at (at ajNB 'Price) 0) -- 100.0
+;; no prior quote → Bid is Null
+(nil? (at (at ajNB 'Bid) 0)) -- true
 ;; error: left-join wrong type
 (left-join 123 (table [a] (list [1])) (table [a] (list [1]))) !- type
 ;; error: inner-join wrong type

@@ -63,50 +63,89 @@
 (type (== [1h 2h] [3h 4h])) -- 'B8
 
 ;; ── (4) Unary preserve type: neg, floor, ceil
+(neg 5h)         -- -5h
 (type (neg 5h))   -- 'i16
+(neg 5i)         -- -5i
 (type (neg 5i))   -- 'i32
+(neg 5)          -- -5
 (type (neg 5))    -- 'i64
+(neg 5.0)        -- -5.0
 (type (neg 5.0))  -- 'f64
+(neg [1h 2h])    -- [-1h -2h]
 (type (neg [1h 2h])) -- 'I16
+(neg [1i 2i])    -- [-1i -2i]
 (type (neg [1i 2i])) -- 'I32
 
+(floor 5h)        -- 5h
 (type (floor 5h))  -- 'i16
+(floor 5i)        -- 5i
 (type (floor 5i))  -- 'i32
+(floor 5)         -- 5
 (type (floor 5))   -- 'i64
+(floor 5.0)       -- 5.0
 (type (floor 5.0)) -- 'f64
 
+(ceil 5h)         -- 5h
 (type (ceil 5h))  -- 'i16
+(ceil 5i)         -- 5i
 (type (ceil 5i))  -- 'i32
+(ceil 5)          -- 5
 (type (ceil 5))   -- 'i64
+(ceil 5.0)        -- 5.0
 (type (ceil 5.0)) -- 'f64
 
 ;; ── (5) abs preserves type (same convention as neg/floor/ceil)
+(abs 5h)          -- 5h
 (type (abs 5h))   -- 'i16
+(abs 5i)          -- 5i
 (type (abs 5i))   -- 'i32
+(abs 5)           -- 5
 (type (abs 5))    -- 'i64
+(abs 5.0)         -- 5.0
 (type (abs 5.0))  -- 'f64
+(abs [1h -2h])    -- [1h 2h]
 (type (abs [1h -2h])) -- 'I16
+(abs [1i -2i])    -- [1i 2i]
 (type (abs [1i -2i])) -- 'I32
 
 ;; ── (6) Math fns always → f64
+(round 5h)         -- 5.0
 (type (round 5h)) -- 'f64
+(round 5i)         -- 5.0
 (type (round 5i)) -- 'f64
+(round 5)          -- 5.0
 (type (round 5))  -- 'f64
+(round 5.0)        -- 5.0
 (type (round 5.0)) -- 'f64
 
+;; sqrt(5) ≈ 2.2360679774997896
+(< (abs (- (sqrt 5h) 2.236067977499790)) 0.0001) -- true
 (type (sqrt 5h)) -- 'f64
+(< (abs (- (sqrt 5i) 2.236067977499790)) 0.0001) -- true
 (type (sqrt 5i)) -- 'f64
+(< (abs (- (sqrt 5) 2.236067977499790)) 0.0001) -- true
 (type (sqrt 5))  -- 'f64
+(< (abs (- (sqrt 5.0) 2.236067977499790)) 0.0001) -- true
 (type (sqrt 5.0)) -- 'f64
 
+;; log(5) ≈ 1.6094379124341003 (natural log)
+(< (abs (- (log 5h) 1.609437912434100)) 0.0001) -- true
 (type (log 5h)) -- 'f64
+(< (abs (- (log 5i) 1.609437912434100)) 0.0001) -- true
 (type (log 5i)) -- 'f64
+(< (abs (- (log 5) 1.609437912434100)) 0.0001) -- true
 (type (log 5))  -- 'f64
+(< (abs (- (log 5.0) 1.609437912434100)) 0.0001) -- true
 (type (log 5.0)) -- 'f64
 
+;; exp(5) ≈ 148.4131591025766
+(< (abs (- (exp 5h) 148.4131591025766)) 0.0001) -- true
 (type (exp 5h)) -- 'f64
+(< (abs (- (exp 5i) 148.4131591025766)) 0.0001) -- true
 (type (exp 5i)) -- 'f64
+(< (abs (- (exp 5) 148.4131591025766)) 0.0001) -- true
 (type (exp 5))  -- 'f64
+(< (abs (- (exp 5.0) 148.4131591025766)) 0.0001) -- true
 (type (exp 5.0)) -- 'f64
 
 ;; ── Mod (%) preserves type same as +/-/*

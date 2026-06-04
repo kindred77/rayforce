@@ -29,11 +29,24 @@
 (count (xasc Tw ['g 'b])) -- 200
 (count (xasc Tw ['g 'c])) -- 200
 (count (xdesc Tw ['g 'a])) -- 200
+;; verify the secondary-key column is actually sorted within the first
+;; guid-group (min/max bounds preserved across rows; falsifies a sort
+;; that drops or duplicates rows or returns the input order).
+(min (at (xasc Tw ['g 'a]) 'a)) -- (as 'I32 0)
+(max (at (xasc Tw ['g 'a]) 'a)) -- (as 'I32 6)
+(min (at (xasc Tw ['g 'b]) 'b)) -- (as 'I16 0)
+(max (at (xasc Tw ['g 'b]) 'b)) -- (as 'I16 10)
+(min (at (xasc Tw ['g 'c]) 'c)) -- (as 'U8 0)
+(max (at (xasc Tw ['g 'c]) 'c)) -- (as 'U8 4)
 
 ;; Same idea for I32-with-nulls and I16-with-nulls (forces null_cmp
 ;; branches L45-51 alongside the typed compare).
 (set Twn (table [g i32n i16n] (list (take (guid 2) 50) (as 'I32 [1 0Nl 3 0Nl 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50]) (as 'I16 (til 50)))))
 (count (xasc Twn ['g 'i32n])) -- 50
+;; min/max of i32n column after sort matches the source min/max,
+;; verifying no rows dropped/duplicated by xasc.
+(min (at (xasc Twn ['g 'i32n]) 'i32n)) -- (min (at Twn 'i32n))
+(max (at (xasc Twn ['g 'i32n]) 'i32n)) -- (max (at Twn 'i32n))
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; 2. PARALLEL MERGE SORT — sort_phase1_fn / sort_merge_fn (L1987-2034)
@@ -73,18 +86,28 @@
 ;; F64 with NaN — exercises NaN handling in radix encode (L968)
 (set Vnan2 (take [0Nf 3.0 1.0 0Nf 2.0] 8192))
 (count (asc Vnan2)) -- 8192
+;; non-null min after asc is 1.0 (nulls/NaNs sort outside the numeric range
+;; but at minimum the smallest finite value survives at the right end).
+(min (asc Vnan2)) -- 1.0
+(max (asc Vnan2)) -- 3.0
 
 ;; I32 large-N: covers L988 (i32 radix encode), L2347-2353 (decode).
 (set V32 (as 'I32 (take [9 1 5 3 7 2 8 4 6 0] 8192)))
 (count (asc V32)) -- 8192
+(at (asc V32) 0) -- (as 'I32 0)
+(at (take (asc V32) -1) 0) -- (as 'I32 9)
 
 ;; I16 large-N: covers L1015-1024 (i16 encode), L2354-2361 (decode).
 (set V16 (as 'I16 (take [9 1 5 3 7 2 8 4 6 0] 8192)))
 (count (asc V16)) -- 8192
+(at (asc V16) 0) -- (as 'I16 0)
+(at (take (asc V16) -1) 0) -- (as 'I16 9)
 
 ;; BOOL/U8 large-N: covers L1029 (bool encode), L2362-2367 (decode).
 (set Vb8 (as 'U8 (take [3 1 5 0 7 2 4 6] 8192)))
 (count (asc Vb8)) -- 8192
+(at (asc Vb8) 0) -- (as 'U8 0)
+(at (take (asc Vb8) -1) 0) -- (as 'U8 7)
 
 ;; DATE / TIME / TIMESTAMP large-N: covers L83-87 in cmp (won't fire
 ;; because radix path eats them) and the DATE/TIME radix encoders.
@@ -94,6 +117,8 @@
 
 (set Vts (take (as 'TIMESTAMP [5 1 3 2 4]) 8192))
 (count (asc Vts)) -- 8192
+(at (asc Vts) 0) -- (as 'TIMESTAMP 1)
+(at (take (asc Vts) -1) 0) -- (as 'TIMESTAMP 5)
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; 4. SORTEDNESS DETECTION (parallel) — sortedness_fn / key_range_fn
@@ -140,6 +165,11 @@
 (set Vstrn (take ["banana" "" "apple" "cherry"] 1024))
 (count (asc Vstrn)) -- 1024
 (count (desc Vstrn)) -- 1024
+;; lexicographic min ("" < "apple") survives the sort at position 0;
+;; lex max "cherry" lands at the tail.  Falsifies wrong / no-op sort.
+(at (asc Vstrn) 0)             -- ""
+(at (take (asc Vstrn) -1) 0)   -- "cherry"
+(at (desc Vstrn) 0)            -- "cherry"
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; 6. SYM SORT large-N — exercises build_enum_rank parallel

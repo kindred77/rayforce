@@ -29,15 +29,20 @@
 ;; Verify sorted asc order and counts: bucket 1e9=3 rows, 2e9=3 rows, 3e9=2 rows
 (at (at (select {c: (count b) from: Txbc by: {b: (xbar ts 1000000000)} where: (>= region 1) asc: b take: 3}) 'c) 0) -- 3
 (at (at (select {c: (count b) from: Txbc by: {b: (xbar ts 1000000000)} where: (>= region 1) asc: b take: 3}) 'c) 1) -- 3
+;; Sum of all bucket counts = 8 (total rows).
+(sum (at (select {c: (count b) from: Txbc by: {b: (xbar ts 1000000000)} where: (>= region 1) asc: b take: 3}) 'c)) -- 8
 
-;; take 2 → only first 2 buckets
+;; take 2 → only first 2 buckets ; cumulative count = 6.
 (count (select {c: (count b) from: Txbc by: {b: (xbar ts 1000000000)} where: (>= region 1) asc: b take: 2})) -- 2
+(sum (at (select {c: (count b) from: Txbc by: {b: (xbar ts 1000000000)} where: (>= region 1) asc: b take: 2}) 'c)) -- 6
 
-;; WHERE with == filter: only region=1 rows (indices 0,1,6 → all in bucket 1e9 → 1 bucket)
+;; WHERE with == filter: only region=1 rows (indices 0,1,6 → all in bucket 1e9 → 1 bucket of 3 rows)
 (count (select {c: (count b) from: Txbc by: {b: (xbar ts 1000000000)} where: (== region 1) asc: b take: 5})) -- 1
+(at (at (select {c: (count b) from: Txbc by: {b: (xbar ts 1000000000)} where: (== region 1) asc: b take: 5}) 'c) 0) -- 3
 
-;; WHERE with AND: region>=1 AND <=2 → rows with region 1 or 2 → 2 distinct buckets
+;; WHERE with AND: region>=1 AND <=2 → rows with region 1 or 2 → 2 distinct buckets (3 + 3 = 6).
 (count (select {c: (count b) from: Txbc by: {b: (xbar ts 1000000000)} where: (and (>= region 1) (<= region 2)) asc: b take: 5})) -- 2
+(sum (at (select {c: (count b) from: Txbc by: {b: (xbar ts 1000000000)} where: (and (>= region 1) (<= region 2)) asc: b take: 5}) 'c)) -- 6
 
 ;; Cache path: repeat exact same query on same table pointer → cache hit
 (count (select {c: (count b) from: Txbc by: {b: (xbar ts 1000000000)} where: (>= region 1) asc: b take: 3})) -- 3
@@ -56,15 +61,19 @@
 (at (at (select {k: k c: (count k) from: Ti16ne0 by: k where: (!= k 0) desc: c take: 3}) 'k) 0) -- 10h
 (at (at (select {k: k c: (count k) from: Ti16ne0 by: k where: (!= k 0) desc: c take: 3}) 'c) 0) -- 3
 
-;; take 2 → only top 2
+;; take 2 → only top 2 (k=10 → 3, k=20 → 2) ; sum c = 5.
 (count (select {k: k c: (count k) from: Ti16ne0 by: k where: (!= k 0) desc: c take: 2})) -- 2
+(sum (at (select {k: k c: (count k) from: Ti16ne0 by: k where: (!= k 0) desc: c take: 2}) 'c)) -- 5
 
-;; Cache hit: same table, same params
+;; Cache hit: same table, same params ; total c sum = 3+2+1 = 6.
 (count (select {k: k c: (count k) from: Ti16ne0 by: k where: (!= k 0) desc: c take: 3})) -- 3
+(sum (at (select {k: k c: (count k) from: Ti16ne0 by: k where: (!= k 0) desc: c take: 3}) 'c)) -- 6
 
-;; Different table with same schema — cache miss, fresh compute
+;; Different table with same schema — cache miss, fresh compute.
+;; k=5(3), k=7(2), k=0(1, filtered); kept: {5(3), 7(2)} → 2 groups, sum c = 5.
 (set Ti16ne0b (table [k v] (list (as 'I16 [5 5 5 7 7 0]) [1 2 3 4 5 6])))
 (count (select {k: k c: (count k) from: Ti16ne0b by: k where: (!= k 0) desc: c take: 5})) -- 2
+(sum (at (select {k: k c: (count k) from: Ti16ne0b by: k where: (!= k 0) desc: c take: 5}) 'c)) -- 5
 
 ;; ──────────────────────────────────────────────────────────────────────────────
 ;; §3  try_i32_i64_count_distinct_select
@@ -79,11 +88,13 @@
 (count (select {region: region c: (count (distinct url)) from: Tcd32 by: region desc: c take: 3})) -- 3
 (at (at (select {region: region c: (count (distinct url)) from: Tcd32 by: region desc: c take: 3}) 'region) 2) -- 3i
 
-;; take 2 → only top 2
+;; take 2 → only top 2 ; sum cd = 2+2 = 4.
 (count (select {region: region c: (count (distinct url)) from: Tcd32 by: region desc: c take: 2})) -- 2
+(sum (at (select {region: region c: (count (distinct url)) from: Tcd32 by: region desc: c take: 2}) 'c)) -- 4
 
-;; Cache hit: same params
+;; Cache hit: same params ; total cd sum = 2+2+1 = 5.
 (count (select {region: region c: (count (distinct url)) from: Tcd32 by: region desc: c take: 3})) -- 3
+(sum (at (select {region: region c: (count (distinct url)) from: Tcd32 by: region desc: c take: 3}) 'c)) -- 5
 
 ;; ──────────────────────────────────────────────────────────────────────────────
 ;; §3b  count_distinct_per_group_groups — generic single-key path
@@ -112,15 +123,17 @@
 (count (select {c: (count k0) from: Ti16x2 by: {k0: k0 k1: k1} where: (>= region 100) desc: c take: 3})) -- 3
 (at (at (select {c: (count k0) from: Ti16x2 by: {k0: k0 k1: k1} where: (>= region 100) desc: c take: 3}) 'c) 0) -- 3
 
-;; take 2 → only top 2
+;; take 2 → only top 2 (counts 3+2 = 5).
 (count (select {c: (count k0) from: Ti16x2 by: {k0: k0 k1: k1} where: (>= region 100) desc: c take: 2})) -- 2
+(sum (at (select {c: (count k0) from: Ti16x2 by: {k0: k0 k1: k1} where: (>= region 100) desc: c take: 2}) 'c)) -- 5
 
 ;; WHERE == filter: only region=100 → 3 rows with (10,1)
 (count (select {c: (count k0) from: Ti16x2 by: {k0: k0 k1: k1} where: (== region 100) desc: c take: 5})) -- 1
 (at (at (select {c: (count k0) from: Ti16x2 by: {k0: k0 k1: k1} where: (== region 100) desc: c take: 5}) 'c) 0) -- 3
 
-;; Cache hit: same table, same params
+;; Cache hit: same table, same params ; total c sum = 3+2+1 = 6.
 (count (select {c: (count k0) from: Ti16x2 by: {k0: k0 k1: k1} where: (>= region 100) desc: c take: 3})) -- 3
+(sum (at (select {c: (count k0) from: Ti16x2 by: {k0: k0 k1: k1} where: (>= region 100) desc: c take: 3}) 'c)) -- 6
 
 ;; ──────────────────────────────────────────────────────────────────────────────
 ;; §5  select_cache_get / select_cache_put / select_expr_cache_*
@@ -276,14 +289,20 @@
 
 (set Tstr5 (table [name] (list (list "hello" "world" "foo" "bar" "baz"))))
 
-;; substr in DAG
+;; substr in DAG — first 3 chars: {"hel", "wor", "foo", "bar", "baz"}.
 (count (select {s: (substr name 0 3) from: Tstr5})) -- 5
+(at (at (select {s: (substr name 0 3) from: Tstr5}) 's) 0) -- "hel"
+(at (at (select {s: (substr name 0 3) from: Tstr5}) 's) 2) -- "foo"
 
 ;; concat in DAG (folds non-const multi-arg concat)
 (count (select {c: (concat name "!") from: Tstr5})) -- 5
+(at (at (select {c: (concat name "!") from: Tstr5}) 'c) 0) -- "hello!"
+(at (at (select {c: (concat name "!") from: Tstr5}) 'c) 3) -- "bar!"
 
-;; replace in DAG
+;; replace in DAG — replace 'o' with '0' globally per cell.
 (count (select {r: (replace name "o" "0") from: Tstr5})) -- 5
+(at (at (select {r: (replace name "o" "0") from: Tstr5}) 'r) 0) -- "hell0"
+(at (at (select {r: (replace name "o" "0") from: Tstr5}) 'r) 2) -- "f00"
 
 ;; as cast I64→F64 in DAG
 (set Tint5 (table [v] (list [1 2 3 4 5])))

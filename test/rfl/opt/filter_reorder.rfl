@@ -18,11 +18,20 @@
 (set Tdate (table [d v] (list (take [2024.01.01 2024.06.15 2024.12.31] N) (til N))))
 
 ;; filter on date column — forces filter_cost to evaluate out_type=DATE
+;; v values where d=2024.06.15 are rows 1, 4, 7, … step 3 from index 1.
+;; Sum of v in those rows: 1 + 4 + 7 + … + (1+3*66) = 67/2 * (1+199) = 6700.
 (count (select {from: Tdate where: (== d 2024.06.15)})) -- 67
+(sum (at (select {from: Tdate where: (== d 2024.06.15)}) 'v)) -- 6700
 
 ;; Two-predicate AND on date column: split_and_filter fires, then
 ;; insertion-sort reorders by cost (both same width → stable order).
 (count (select {from: Tdate where: (and (>= d 2024.01.01) (<= d 2024.06.15))})) -- 134
+;; All rows except d=2024.12.31 (every 3rd row starting at index 2: count=66)
+;; → kept rows have d∈{2024.01.01, 2024.06.15}, ranges {0,1,3,4,6,7…}.
+;; Each kept row has v from til(200). Total sum = sum(til 200) - sum(d=2024.12.31 rows).
+;; d=2024.12.31 at indices {2,5,8,…197} → 66 indices, sum = (2+197)*66/2 = 6567.
+;; sum(til 200)=19900. Kept sum = 19900 - 6567 = 13333.
+(sum (at (select {from: Tdate where: (and (>= d 2024.01.01) (<= d 2024.06.15))}) 'v)) -- 13333
 
 ;; ====================================================================
 ;; Section 2: split_and_filter + collect_filter_chain length > 2
@@ -69,11 +78,15 @@
 ;; filter on SYM column: filter_cost hits default arm (cost += 3)
 ;; k cycles A(0),B(1),C(2),D(3): k=='C' at rows where i%4==2
 ;; v>50: rows 51..99; k=='C' in that range: {54,58,...,98} → 12 rows
+;; sum = 54+58+62+...+98 = (54+98)*12/2 = 912.
 (count (select {from: Tsym where: (and (> v 50) (== k 'C))})) -- 12
+(sum (at (select {from: Tsym where: (and (> v 50) (== k 'C))}) 'v)) -- 912
 
 ;; With more conjuncts: reorder puts cheaper preds first
-;; v>25 AND v<75 AND k=='B' → 25 rows in {26..74}, k='B'==(row%4==1) → every 4th
+;; v>25 AND v<75 AND k=='B' → kept rows: v∈{29,33,...,73} → 12 rows.
+;; sum = (29+73)*12/2 = 612.
 (count (select {from: Tsym where: (and (> v 25) (< v 75) (== k 'B))})) -- 12
+(sum (at (select {from: Tsym where: (and (> v 25) (< v 75) (== k 'B))}) 'v)) -- 612
 
 ;; ====================================================================
 ;; Section 5: filter_cost — OP_LIKE in reorder (line 1437)
@@ -128,5 +141,6 @@
 ;; DCE marks the (> a 2) subtree dead
 (count (select {from: Tdce where: (and (> a 2) false)})) -- 0
 ;; (or (> a 3) true) → optimizer replaces OR with const true → OP_MATERIALIZE
-;; DCE marks the (> a 3) subtree dead
+;; DCE marks the (> a 3) subtree dead — all rows kept; sum = 15.
 (count (select {from: Tdce where: (or (> a 3) true)})) -- 5
+(sum (at (select {from: Tdce where: (or (> a 3) true)}) 'a)) -- 15

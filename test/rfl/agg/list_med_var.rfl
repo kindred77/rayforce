@@ -92,7 +92,9 @@
 ;; ─── avg non-numeric atom return path (line 309) ─────────────────────
 ;; When ray_is_atom(x) and !is_numeric and !is_null: ray_retain(x); return x
 ;; SYM atom is non-numeric → passes through unchanged.
+(avg 'hello) -- 'hello
 (type (avg 'hello)) -- 'sym
+(avg 'world) -- 'world
 (type (avg 'world)) -- 'sym
 
 ;; ─── sum TIMESTAMP vec (lines 257-261 in ray_sum_fn) ─────────────────

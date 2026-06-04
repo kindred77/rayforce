@@ -66,11 +66,20 @@
 (set t2 (table [k v2] (list [1 3 4] [100 300 400])))
 (count (inner-join [k] t1 t2)) -- 2
 (at (inner-join [k] t1 t2) 'v2) -- [100 300]
-(count (left-join [k] t1 t2))  -- 3
-;; JOIN over symbol keys
+;; left-join: rows with k=1 → v2=100, k=2 → null, k=3 → v2=300; sum non-null = 400.
+(set lj (left-join [k] t1 t2))
+(count lj) -- 3
+(at lj 'v1) -- [10 20 30]
+(sum (at lj 'v2)) -- 400
+(nil? (at (at lj 'v2) 1)) -- true
+;; JOIN over symbol keys — a and c match in both; b/d are excluded.
 (set ts1 (table [s v] (list ['a 'b 'c] [1 2 3])))
 (set ts2 (table [s w] (list ['a 'c 'd] [10 30 40])))
-(count (inner-join [s] ts1 ts2)) -- 2
+(set ijs (inner-join [s] ts1 ts2))
+(count ijs) -- 2
+(at ijs 's) -- [a c]
+(at ijs 'v) -- [1 3]
+(at ijs 'w) -- [10 30]
 
 ;; ──────────── OP_WINDOW_JOIN (heavy) ────────────
 ;; window-join + window-join1 both compile to OP_WINDOW_JOIN.

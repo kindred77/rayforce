@@ -161,8 +161,9 @@
 12:30:45.123 -- 12:30:45.123
 (type 12:30:45.000) -- 'time
 00:00:00.000 -- 00:00:00.000
-;; time without sub-second fraction is still valid
+;; time without sub-second fraction is still valid; eval pins the value.
 (type (parse "12:30:45")) -- 'time
+(eval (parse "12:30:45")) -- 12:30:45.000
 ;; 2-digit + colon where try_parse_time fails → fall through to number,
 ;; then the remainder is re-lexed (parse_number :281-289, try_parse_time
 ;; NULL at MM :151, at MM-colon :157, at SS digits).  Each yields
@@ -315,8 +316,14 @@ my-var -- 42
 ;; 12.  LIST / S-EXPRESSION  (parse_list)
 ;; ════════════════════════════════════════════════════════════════════
 (list 1 2 3) -- (list 1 2 3)
-;; nested list
+;; nested list — eval pins the parsed AST's value rather than just its container type.
 (type (parse "((1 2) (3 4))")) -- 'LIST
+;; ((1 2) (3 4)) at the top level evaluates as (1 2 (3 4)) → applies the function 1
+;; to args, which is not a valid call, so we don't (eval ...) here. Instead, check
+;; structure: outer count 2, each inner is a list.
+(count (parse "((1 2) (3 4))")) -- 2
+(type (at (parse "((1 2) (3 4))") 0)) -- 'LIST
+(type (at (parse "((1 2) (3 4))") 1)) -- 'LIST
 ;; unclosed list → parse error
 (parse "(foo bar") !- parse
 ;; stray closers → parse error (parse_expr RPAREN/RBRACK/RBRACE)
@@ -339,7 +346,10 @@ my-var -- 42
 ;; ════════════════════════════════════════════════════════════════════
 ;; multiple top-level expressions wrap into (do …); value is the last
 (eval (parse "1 2 3")) -- 3
-;; (do …) shape is a LIST headed by the `do` name symbol
+;; (do …) shape is a LIST headed by the `do` name symbol — eval pins the value.
 (type (parse "1 2 3")) -- 'LIST
-;; single expression is returned bare (not wrapped)
+(eval (parse "1 2 3")) -- 3
+;; single expression is returned bare (not wrapped); eval is the identity for an i64 literal.
 (type (parse "42")) -- 'i64
+(eval (parse "42")) -- 42
+(parse "42") -- 42

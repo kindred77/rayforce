@@ -29,5 +29,7 @@
 (type (first [2024.01.01 2024.01.02])) -- 'date
 (first [09:30:00.000 10:00:00.000]) -- 09:30:00.000
 (type (first [09:30:00.000 10:00:00.000])) -- 'time
+(first (as 'TIMESTAMP [1 2])) -- (as 'timestamp 1)
 (type (first (as 'TIMESTAMP [1 2]))) -- 'timestamp
+(first [0x01 0x02 0xff])           -- 0x01
 (type (first [0x01 0x02 0xff]))    -- 'u8

@@ -12,7 +12,9 @@
 
 ;; ────────────── type preservation (regression for last on DATE/BOOL) ──────────────
 (last [1.0 2.0 3.0])              -- 3.0
+(last [1h 2h 3h])                 -- 3h
 (type (last [1h 2h 3h]))          -- 'i16
+(last [1i 2i 3i])                 -- 3i
 (type (last [1i 2i 3i]))          -- 'i32
 (last ['a 'b 'c])                 -- 'c
 (type (last ['a 'b 'c]))          -- 'sym
@@ -23,5 +25,7 @@
 (type (last [2024.01.01 2024.01.02])) -- 'date
 (last [09:30:00.000 10:00:00.000]) -- 10:00:00.000
 (type (last [09:30:00.000 10:00:00.000])) -- 'time
+(last (as 'TIMESTAMP [1 2]))      -- (as 'timestamp 2)
 (type (last (as 'TIMESTAMP [1 2]))) -- 'timestamp
+(last [0x01 0xff])                -- 0xff
 (type (last [0x01 0xff]))         -- 'u8

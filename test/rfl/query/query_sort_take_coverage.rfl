@@ -20,28 +20,35 @@
 ;; Sum is sum of the first 3 groups encountered: aa=4, bb=6, cc=5 → 15
 (sum (at (select {s: (sum v) by: k from: Tsst take: 3}) 's)) -- 15
 
-;; take: 1 → only first group
+;; take: 1 → only first group ("aa" sum 4).
 (count (select {s: (sum v) by: k from: Tsst take: 1})) -- 1
+(at (at (select {s: (sum v) by: k from: Tsst take: 1}) 's) 0) -- 4
 
-;; take: bigger than n_groups → clamped to n_groups
+;; take: bigger than n_groups → clamped to n_groups ; sum of all 5 = 28.
 (count (select {s: (sum v) by: k from: Tsst take: 100})) -- 5
+(sum (at (select {s: (sum v) by: k from: Tsst take: 100}) 's)) -- 28
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; TopK multi-key sort + take → n_keys > 1 path (lines 487-498)
 ;; Multi-key sort triggers ray_topk_table_multi
 ;; ────────────────────────────────────────────────────────────────────
 (set Ttopk (table [a b v] (list [3 1 2 3 1 2] [10 20 30 10 20 30] [100 200 300 400 500 600])))
-;; Top-3 by (a, b) ascending
+;; Top-3 by (a, b) ascending: (1,20)×2, (2,30)×2, (3,10)×2 → first 3 sorted = {1,1,2}.
 (count (select {from: Ttopk asc: [a b] take: 3})) -- 3
-;; Top-3 by (a desc, b asc) - multi-key mixed direction
+(sum (at (select {from: Ttopk asc: [a b] take: 3}) 'a)) -- 4
+;; Top-3 by (asc b, desc a) - asc b is primary; b=10×2(a=3,3), b=20×2(a=1,1) →
+;; top-3 = b=10,10,20 → a={3,3,1} sum 7.
 (count (select {from: Ttopk asc: b desc: a take: 3})) -- 3
+(sum (at (select {from: Ttopk asc: b desc: a take: 3}) 'a)) -- 7
 
 ;; Flat table (no LIST cols) — topk fast path eligible
 (set Tflat (table [x y v] (list [5 3 1 4 2] [10 30 50 20 40] [100 300 500 200 400])))
-;; Top-2 by x asc: rows with x=1(v=500), x=2(v=400)
+;; Top-2 by x asc: rows with x=1(v=500), x=2(v=400) ; sum v 900.
 (count (select {from: Tflat asc: [x y] take: 2})) -- 2
-;; Verify: by x+y asc, top 2
+(sum (at (select {from: Tflat asc: [x y] take: 2}) 'v)) -- 900
+;; Top-4 by x+y asc → first 4 rows when sorted = x∈{1,2,3,4} ; sum 10.
 (count (select {from: Tflat asc: [x y] take: 4})) -- 4
+(sum (at (select {from: Tflat asc: [x y] take: 4}) 'x)) -- 10
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; atom_i64_const with narrow types:
@@ -73,14 +80,17 @@
 ;; DAG path: sort a materialized table using a temporary DAG
 ;; ────────────────────────────────────────────────────────────────────
 (set Tsortake (table [a b c] (list [3 1 4 1 5 9] [2 6 5 3 5 8] [100 200 300 400 500 600])))
-;; Sort by a asc + take 3 → rows with a={1,1,3}, top-3 from sort
+;; Sort by a asc + take 3 → rows with a={1,1,3}, sum 5.
 (count (select {from: Tsortake asc: a take: 3})) -- 3
+(sum (at (select {from: Tsortake asc: a take: 3}) 'a)) -- 5
 
-;; Sort by b desc + take 2 → rows with b={8,6}
+;; Sort by b desc + take 2 → rows with b={8,6}, sum 14.
 (count (select {from: Tsortake desc: b take: 2})) -- 2
+(sum (at (select {from: Tsortake desc: b take: 2}) 'b)) -- 14
 
-;; Sort by [a b] asc + take 4
+;; Sort by [a b] asc + take 4 → top 4 by (a,b): a={1,1,3,4}, sum 9.
 (count (select {from: Tsortake asc: [a b] take: 4})) -- 4
+(sum (at (select {from: Tsortake asc: [a b] take: 4}) 'a)) -- 9
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; BOOL group-by result reorder with NULL column (lines 7117-7121)

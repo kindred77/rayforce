@@ -17,8 +17,14 @@
 (count (select {from: T64 where: (!= v 5)})) -- 9
 (count (select {from: T64 where: (<= v 5)})) -- 5
 (count (select {from: T64 where: (>= v 5)})) -- 6
+;; Value-pair: full result sum should equal sum of the kept rows.
+(sum (at (select {from: T64 where: (> v 5)}) 'v))  -- 40
+(sum (at (select {from: T64 where: (< v 5)}) 'v))  -- 10
+(sum (at (select {from: T64 where: (== v 5)}) 'v)) -- 5
+(sum (at (select {from: T64 where: (!= v 5)}) 'v)) -- 50
 ;; No-where count → line 3413-3417 (handled path, returns nrows directly)
 (count (select {from: T64})) -- 10
+(sum (at (select {from: T64}) 'v)) -- 55
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; U8 column — exercises RAY_U8 arm of count_compare_task
@@ -31,6 +37,12 @@
 (count (select {from: Tu8 where: (!= v 2)})) -- 7
 (count (select {from: Tu8 where: (<= v 2)})) -- 6
 (count (select {from: Tu8 where: (>= v 3)})) -- 4
+;; Value-pair for U8: keep-set is {2,3,2,3,2,3,4} → sum 19.
+(sum (at (select {from: Tu8 where: (> v 1)}) 'v))  -- 19
+;; {1,2,1,2,1,2}=9.
+(sum (at (select {from: Tu8 where: (< v 3)}) 'v))  -- 9
+;; {2,2,2}=6.
+(sum (at (select {from: Tu8 where: (== v 2)}) 'v)) -- 6
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; I16 column — exercises RAY_I16 arm
@@ -40,6 +52,10 @@
 (count (select {from: Ti16 where: (< v 30)}))  -- 4
 (count (select {from: Ti16 where: (== v 20)})) -- 2
 (count (select {from: Ti16 where: (!= v 30)})) -- 5
+;; Value-pair: kept rows for (> v 10) → {20,30,20,30,40}=140.
+(sum (at (select {from: Ti16 where: (> v 10)}) 'v))  -- 140
+;; Value-pair for (== v 20) → 2 rows of 20 each.
+(at (at (select {from: Ti16 where: (== v 20)}) 'v) 0) -- 20
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; I32 column — exercises RAY_I32 arm
@@ -48,6 +64,10 @@
 (count (select {from: Ti32 where: (> v 100)}))  -- 5
 (count (select {from: Ti32 where: (== v 200)})) -- 2
 (count (select {from: Ti32 where: (<= v 200)})) -- 4
+;; Value-pair: kept rows for (> v 100) → {200,300,200,300,400}=1400.
+(sum (at (select {from: Ti32 where: (> v 100)}) 'v))  -- 1400
+;; {100,200,100,200}=600.
+(sum (at (select {from: Ti32 where: (<= v 200)}) 'v)) -- 600
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; SYM column — exercises RAY_SYM arm (read_by_esz path)
@@ -55,6 +75,12 @@
 (set Tsym (table [v] (list ['A 'B 'C 'A 'B 'A])))
 (count (select {from: Tsym where: (== v 'A)})) -- 3
 (count (select {from: Tsym where: (!= v 'B)})) -- 4
+;; Value-pair: every kept row equals 'A in the EQ case.
+(at (at (select {from: Tsym where: (== v 'A)}) 'v) 0) -- 'A
+(at (at (select {from: Tsym where: (== v 'A)}) 'v) 2) -- 'A
+;; (!= v 'B) keeps {A,C,A,A} → no 'B should appear → max-by-string
+;; is uncommon; instead assert distinct ‘A,’C’ via sym-count.
+(count (where (== (at (select {from: Tsym where: (!= v 'B)}) 'v) 'A))) -- 3
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; count_compare_cache: second count of same column+op+rhs hits cache
@@ -64,6 +90,8 @@
 (count (select {from: Tc where: (> v 20)})) -- 3
 ;; Second identical query → cache hit
 (count (select {from: Tc where: (> v 20)})) -- 3
+;; Value-pair on cache hit: result still has {30,40,50}=120.
+(sum (at (select {from: Tc where: (> v 20)}) 'v)) -- 120
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; Flipped operand order: (op literal col) — count_cmp_flip path
@@ -73,6 +101,9 @@
 ;; (< 3 v) means v > 3 (flipped)
 (count (select {from: Tflip where: (< 3 v)})) -- 2
 (count (select {from: Tflip where: (> 3 v)})) -- 2
+;; Value-pair: (< 3 v) keeps {4,5}=9 ; (> 3 v) keeps {1,2}=3.
+(sum (at (select {from: Tflip where: (< 3 v)}) 'v)) -- 9
+(sum (at (select {from: Tflip where: (> 3 v)}) 'v)) -- 3
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; ray_try_count_select_expr — complex WHERE that falls through to
@@ -82,3 +113,5 @@
 (set Tdag (table [v] (list [1 2 3 4 5 6 7 8 9 10])))
 ;; AND predicate → goes through DAG pred_vec path
 (count (select {from: Tdag where: (and (> v 2) (< v 8))})) -- 5
+;; Value-pair: kept rows are {3,4,5,6,7}=25.
+(sum (at (select {from: Tdag where: (and (> v 2) (< v 8))}) 'v)) -- 25

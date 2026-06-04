@@ -16,16 +16,22 @@
 (set Db (assert-fact Db 4 'salary 300))
 
 ;; grouped SUM — two groups, one row each
+;; Dept 10: salaries {50,100}=150 ; Dept 20: salaries {200,300}=500 → total 650.
 (count (query Db (find ?d ?s) (where (dept-sum ?d ?s)) (rules ((emp ?d ?s) (?e :dept ?d) (?e :salary ?s)) ((dept-sum ?d ?s) (sum ?s emp 1 by ?d 0))))) -- 2
+(sum (at (query Db (find ?d ?s) (where (dept-sum ?d ?s)) (rules ((emp ?d ?s) (?e :dept ?d) (?e :salary ?s)) ((dept-sum ?d ?s) (sum ?s emp 1 by ?d 0)))) '?s)) -- 650
+(sum (at (query Db (find ?d ?s) (where (dept-sum ?d ?s)) (rules ((emp ?d ?s) (?e :dept ?d) (?e :salary ?s)) ((dept-sum ?d ?s) (sum ?s emp 1 by ?d 0)))) '?d)) -- 30
 
-;; grouped MIN
+;; grouped MIN — dept 10 min=50, dept 20 min=200 → sum 250.
 (count (query Db (find ?d ?m) (where (dept-min ?d ?m)) (rules ((emp2 ?d ?s) (?e :dept ?d) (?e :salary ?s)) ((dept-min ?d ?m) (min ?m emp2 1 by ?d 0))))) -- 2
+(sum (at (query Db (find ?d ?m) (where (dept-min ?d ?m)) (rules ((emp2 ?d ?s) (?e :dept ?d) (?e :salary ?s)) ((dept-min ?d ?m) (min ?m emp2 1 by ?d 0)))) '?m)) -- 250
 
-;; grouped MAX
+;; grouped MAX — dept 10 max=100, dept 20 max=300 → sum 400.
 (count (query Db (find ?d ?m) (where (dept-max ?d ?m)) (rules ((emp3 ?d ?s) (?e :dept ?d) (?e :salary ?s)) ((dept-max ?d ?m) (max ?m emp3 1 by ?d 0))))) -- 2
+(sum (at (query Db (find ?d ?m) (where (dept-max ?d ?m)) (rules ((emp3 ?d ?s) (?e :dept ?d) (?e :salary ?s)) ((dept-max ?d ?m) (max ?m emp3 1 by ?d 0)))) '?m)) -- 400
 
-;; grouped AVG
+;; grouped AVG — dept 10 avg=75, dept 20 avg=250 → sum 325.
 (count (query Db (find ?d ?a) (where (dept-avg ?d ?a)) (rules ((emp4 ?d ?s) (?e :dept ?d) (?e :salary ?s)) ((dept-avg ?d ?a) (avg ?a emp4 1 by ?d 0))))) -- 2
+(sum (at (query Db (find ?d ?a) (where (dept-avg ?d ?a)) (rules ((emp4 ?d ?s) (?e :dept ?d) (?e :salary ?s)) ((dept-avg ?d ?a) (avg ?a emp4 1 by ?d 0)))) '?a)) -- 325.0
 
 ;; ════════════════════════ scalar aggregates over f64 source columns ═════════════════════════
 ;; The existing tests aggregate over I64 columns. These exercise the
@@ -33,17 +39,21 @@
 (set Fdb (datoms))
 (set f64src (table ['k 'v] (list [1 2 3] [1.5 2.5 3.5])))
 
-;; scalar SUM over f64
+;; scalar SUM over f64 — col v = {1.5,2.5,3.5}, sum=7.5.
 (count (query Fdb (find ?s) (where (fsum ?s)) (rules ((fsum ?s) (sum ?s f64src 1))))) -- 1
+(at (at (query Fdb (find ?s) (where (fsum ?s)) (rules ((fsum ?s) (sum ?s f64src 1)))) '?s) 0) -- 7.5
 
-;; scalar MIN over f64
+;; scalar MIN over f64 — min=1.5.
 (count (query Fdb (find ?m) (where (fmin ?m)) (rules ((fmin ?m) (min ?m f64src 1))))) -- 1
+(at (at (query Fdb (find ?m) (where (fmin ?m)) (rules ((fmin ?m) (min ?m f64src 1)))) '?m) 0) -- 1.5
 
-;; scalar MAX over f64
+;; scalar MAX over f64 — max=3.5.
 (count (query Fdb (find ?m) (where (fmax ?m)) (rules ((fmax ?m) (max ?m f64src 1))))) -- 1
+(at (at (query Fdb (find ?m) (where (fmax ?m)) (rules ((fmax ?m) (max ?m f64src 1)))) '?m) 0) -- 3.5
 
-;; scalar AVG over f64
+;; scalar AVG over f64 — avg=2.5.
 (count (query Fdb (find ?a) (where (favg ?a)) (rules ((favg ?a) (avg ?a f64src 1))))) -- 1
+(at (at (query Fdb (find ?a) (where (favg ?a)) (rules ((favg ?a) (avg ?a f64src 1)))) '?a) 0) -- 2.5
 
 ;; ════════════════════════ empty-source AVG and MAX aggregates ═════════════════════════
 ;; AVG and MAX over empty source — should produce 0 rows (lines 1725-1732).
@@ -78,19 +88,30 @@
 
 ;; ════════════════════════ f64 comparison: var vs constant (rhs_src NULL) ═════════════════════════
 ;; Exercises the f64 CMP path when rhs_src is NULL (const), line 2023-2024.
+;; ?x ∈ {10,20,30} ; ?y = ?x + 0.5 ; > 20.0 keeps {20.5, 30.5}.
 (count (query Db (find ?e ?y) (where (?e :val ?x) (= ?y (+ ?x 0.5)) (> ?y 20.0)))) -- 2
+(sum (at (query Db (find ?e ?y) (where (?e :val ?x) (= ?y (+ ?x 0.5)) (> ?y 20.0))) '?y)) -- 51.0
 
 ;; ════════════════════════ integer division by zero in expressions ═════════════════════════
 ;; Exercises the rd[r] != 0 ? ... : 0 branch in i64 binop path (line 748).
+;; Division by 0 → result is 0 for each row; ?y = 0 for all 3 rows.
 (count (query Db (find ?e ?y) (where (?e :val ?x) (= ?y (/ ?x 0))))) -- 3
+(sum (at (query Db (find ?e ?y) (where (?e :val ?x) (= ?y (/ ?x 0)))) '?y)) -- 0
 
 ;; Exercises the rd[r] != 0.0 ? ... : 0.0 branch in f64 binop path (line 725).
 (count (query Db (find ?e ?y) (where (?e :val ?x) (= ?y (/ ?x 0.0))))) -- 3
+(sum (at (query Db (find ?e ?y) (where (?e :val ?x) (= ?y (/ ?x 0.0)))) '?y)) -- 0.0
 
 ;; ════════════════════════ f64 subtraction, multiplication, division in expressions ═════════════════════════
+;; - ?x 0.5: {9.5, 19.5, 29.5}; > 10.0 keeps {19.5, 29.5} = 49.0.
 (count (query Db (find ?e ?y) (where (?e :val ?x) (= ?y (- ?x 0.5)) (> ?y 10.0)))) -- 2
+(sum (at (query Db (find ?e ?y) (where (?e :val ?x) (= ?y (- ?x 0.5)) (> ?y 10.0))) '?y)) -- 49.0
+;; * ?x 2.0: {20.0, 40.0, 60.0}; >= 40.0 keeps {40.0, 60.0} = 100.0.
 (count (query Db (find ?e ?y) (where (?e :val ?x) (= ?y (* ?x 2.0)) (>= ?y 40.0)))) -- 2
+(sum (at (query Db (find ?e ?y) (where (?e :val ?x) (= ?y (* ?x 2.0)) (>= ?y 40.0))) '?y)) -- 100.0
+;; / ?x 2.0: {5.0, 10.0, 15.0}; > 5.0 keeps {10.0, 15.0} = 25.0.
 (count (query Db (find ?e ?y) (where (?e :val ?x) (= ?y (/ ?x 2.0)) (> ?y 5.0)))) -- 2
+(sum (at (query Db (find ?e ?y) (where (?e :val ?x) (= ?y (/ ?x 2.0)) (> ?y 5.0))) '?y)) -- 25.0
 
 ;; ════════════════════════ negation with constant in negated body ═════════════════════════
 ;; Exercises the constant-filter-on-negated-relation path (lines 1466-1483).
@@ -141,7 +162,10 @@
 (set Db (datoms))
 (set agg_src (table ['k 'v] (list [1 2 3] [10 20 30])))
 (count (query Db (find ?s) (where (etotal ?s)) (rules ((etotal ?s) (sum ?s agg_src 1))))) -- 1
+;; Value-pair: sum of v col = 60.
+(at (at (query Db (find ?s) (where (etotal ?s)) (rules ((etotal ?s) (sum ?s agg_src 1)))) '?s) 0) -- 60
 (count (query Db (find ?n) (where (ecount ?n)) (rules ((ecount ?n) (count ?n agg_src))))) -- 1
+(at (at (query Db (find ?n) (where (ecount ?n)) (rules ((ecount ?n) (count ?n agg_src)))) '?n) 0) -- 3
 
 ;; ════════════════════════ multiple find variables from different body atoms ═════════════════════════
 (set Db (datoms))
@@ -312,7 +336,10 @@
 (set Db (datoms))
 (set agg_env (table ['x 'y] (list [1 2 3 4] [10 20 30 40])))
 (count (query Db (find ?n) (where (acount ?n)) (rules ((acount ?n) (count ?n agg_env))))) -- 1
+(at (at (query Db (find ?n) (where (acount ?n)) (rules ((acount ?n) (count ?n agg_env)))) '?n) 0) -- 4
 (count (query Db (find ?s) (where (asum ?s)) (rules ((asum ?s) (sum ?s agg_env 1))))) -- 1
+;; sum of y col = 100.
+(at (at (query Db (find ?s) (where (asum ?s)) (rules ((asum ?s) (sum ?s agg_env 1)))) '?s) 0) -- 100
 
 ;; ════════════════════════ dl_find_rel returns -1 for unknown body pred ═════════════════════════
 ;; Exercises line 1297 (rel_idx < 0 => return NULL) in dl_compile_rule.
@@ -385,6 +412,10 @@
 (set Db (datoms))
 (set gcnt (table ['grp 'val] (list [1 1 2 2 2] [10 20 30 40 50])))
 (count (query Db (find ?g ?n) (where (grp-count ?g ?n)) (rules ((grp-count ?g ?n) (count ?n gcnt by ?g 0))))) -- 2
+;; group 1 has 2 rows, group 2 has 3 rows → sum of counts = 5.
+(sum (at (query Db (find ?g ?n) (where (grp-count ?g ?n)) (rules ((grp-count ?g ?n) (count ?n gcnt by ?g 0)))) '?n)) -- 5
+;; sum of group keys = 1+2 = 3.
+(sum (at (query Db (find ?g ?n) (where (grp-count ?g ?n)) (rules ((grp-count ?g ?n) (count ?n gcnt by ?g 0)))) '?g)) -- 3
 
 ;; ════════════════════════ aggregate: grouped COUNT with no source rows ═════════════════════════
 ;; Exercises the src_nrows==0 path for grouped aggregation (line 1571-1575).

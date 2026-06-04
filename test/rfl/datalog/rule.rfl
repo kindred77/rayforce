@@ -8,7 +8,13 @@
 (set db (assert-fact db 1 'age 30))
 (set db (assert-fact db 2 'age 25))
 (set db (assert-fact db 3 'age 40))
-(count (query db (find ?e ?n) (where (?e :age ?n)))) -- 3
+(set q1 (query db (find ?e ?n) (where (?e :age ?n))))
+(count q1) -- 3
+;; entity / age pairs come back; verify the right values, not just cardinality
+(set q1_es (asc (at q1 '?e)))
+(set q1_ns (asc (at q1 '?n)))
+q1_es -- [1 2 3]
+q1_ns -- [25 30 40]
 
 ;; constant in object slot filters down to no rows when no fact matches
 (count (query db (find ?e) (where (?e :age 999)))) -- 0
@@ -21,24 +27,37 @@
 (set db (assert-fact db 2 'dept 20))
 (set db (assert-fact db 3 'name 300))
 (set db (assert-fact db 3 'dept 10))
-(count (query db (find ?e ?n ?d) (where (?e :name ?n) (?e :dept ?d)))) -- 3
+(set q2 (query db (find ?e ?n ?d) (where (?e :name ?n) (?e :dept ?d))))
+(count q2) -- 3
+;; Each (?e, ?n, ?d) row must be one of the asserted triples: (1,100,10),
+;; (2,200,20), (3,300,10).  Verify totals match (1+2+3=6 entities,
+;; 100+200+300=600 names, 10+20+10=40 depts).
+(sum (at q2 '?e)) -- 6
+(sum (at q2 '?n)) -- 600
+(sum (at q2 '?d)) -- 40
 
 ;; constant in object slot for one of the two clauses (dept = 10) keeps
-;; only the two entities with that dept
-(count (query db (find ?e ?n) (where (?e :name ?n) (?e :dept 10)))) -- 2
+;; only the two entities with that dept (entities 1 and 3, names 100 and 300)
+(set q2b (query db (find ?e ?n) (where (?e :name ?n) (?e :dept 10))))
+(count q2b) -- 2
+(asc (at q2b '?e)) -- [1 3]
+(asc (at q2b '?n)) -- [100 300]
 
 ;; ────────────── wildcard underscore ──────────────
 ;; `_` matches any value but does not bind.  Only entities with a :dept
-;; fact are returned.
+;; fact are returned — that's entities 1 and 3 (entity 2 has only :name).
 (set db (datoms))
 (set db (assert-fact db 1 'name 100))
 (set db (assert-fact db 1 'dept 10))
 (set db (assert-fact db 2 'name 200))
 (set db (assert-fact db 3 'dept 30))
-(count (query db (find ?e) (where (?e :dept _)))) -- 2
+(set qWild (query db (find ?e) (where (?e :dept _))))
+(count qWild) -- 2
+(asc (at qWild '?e)) -- [1 3]
 
 ;; ────────────── triple-clause join with constant filter ──────────────
-;; Find all (?c ?s) for entities with :age 30.  Two such entities exist.
+;; Find all (?c ?s) for entities with :age 30.  Two such entities exist
+;; (1 and 3) → ?e in {1,3}, ?c both 100, ?s in {80000, 90000}.
 (set db (datoms))
 (set db (assert-fact db 1 'age 30))
 (set db (assert-fact db 1 'city 100))
@@ -49,10 +68,17 @@
 (set db (assert-fact db 3 'age 30))
 (set db (assert-fact db 3 'city 100))
 (set db (assert-fact db 3 'salary 90000))
-(count (query db (find ?e ?c ?s) (where (?e :age 30) (?e :city ?c) (?e :salary ?s)))) -- 2
+(set qTri (query db (find ?e ?c ?s) (where (?e :age 30) (?e :city ?c) (?e :salary ?s))))
+(count qTri) -- 2
+(asc (at qTri '?e)) -- [1 3]
+;; both rows have ?c = 100 (city of age=30 entities)
+(min (at qTri '?c)) -- 100
+(max (at qTri '?c)) -- 100
+(asc (at qTri '?s)) -- [80000 90000]
 
 ;; ────────────── rules: derived relations ──────────────
-;; (employee ?e ?n ?d) projects (entity, name, dept) when both facts hold
+;; (employee ?e ?n ?d) projects (entity, name, dept) when both facts hold.
+;; Expected rows: (1,100,10), (2,200,20), (3,300,10).
 (set db (datoms))
 (set db (assert-fact db 1 'name 100))
 (set db (assert-fact db 1 'dept 10))
@@ -61,9 +87,13 @@
 (set db (assert-fact db 3 'name 300))
 (set db (assert-fact db 3 'dept 10))
 (rule (employee ?e ?n ?d) (?e :name ?n) (?e :dept ?d))
-(count (query db (find ?n ?d) (where (employee ?e ?n ?d)))) -- 3
+(set qEmp (query db (find ?n ?d) (where (employee ?e ?n ?d))))
+(count qEmp) -- 3
+(asc (at qEmp '?n)) -- [100 200 300]
+;; depts {10,10,20}: sorted [10,10,20].
+(asc (at qEmp '?d)) -- [10 10 20]
 
-;; rule with constant body — (eng ?e) iff (?e :dept 10).  Two engineers.
+;; rule with constant body — (eng ?e) iff (?e :dept 10).  Two engineers (entities 1 and 2).
 (set db (datoms))
 (set db (assert-fact db 1 'name 100))
 (set db (assert-fact db 1 'dept 10))
@@ -75,10 +105,14 @@
 (set db (assert-fact db 3 'dept 20))
 (set db (assert-fact db 3 'salary 90000))
 (rule (eng ?e) (?e :dept 10))
-(count (query db (find ?e) (where (eng ?e)))) -- 2
+(set qEng (query db (find ?e) (where (eng ?e))))
+(count qEng) -- 2
+(asc (at qEng '?e)) -- [1 2]
 
 ;; ────────────── transitive closure ──────────────
 ;; Linear chain 1→2→3→4→5: TC has 4+3+2+1 = 10 reachable pairs.
+;; Source nodes: 1 appears 4×, 2 appears 3×, 3 appears 2×, 4 once → sum = 4+6+6+4 = 20.
+;; Target nodes: 2 once, 3 twice, 4 three×, 5 four× → 2+6+12+20 = 40.
 (set db (datoms))
 (set db (assert-fact db 1 'edge 2))
 (set db (assert-fact db 2 'edge 3))
@@ -86,9 +120,18 @@
 (set db (assert-fact db 4 'edge 5))
 (rule (reachable ?x ?y) (?x :edge ?y))
 (rule (reachable ?x ?z) (?x :edge ?y) (reachable ?y ?z))
-(count (query db (find ?x ?y) (where (reachable ?x ?y)))) -- 10
+(set qTc (query db (find ?x ?y) (where (reachable ?x ?y))))
+(count qTc) -- 10
+(sum (at qTc '?x)) -- 20
+(sum (at qTc '?y)) -- 40
+;; Specifically, (1,5) must be among the reachable pairs (longest hop).
+(count (where (and (== (at qTc '?x) 1) (== (at qTc '?y) 5)))) -- 1
+;; And (5,1) is NOT reachable (directed chain).
+(count (where (and (== (at qTc '?x) 5) (== (at qTc '?y) 1)))) -- 0
 
 ;; DAG 1→2, 1→3, 2→4, 3→4, 4→5, 5→6 — 14 reachable pairs.
+;; 1 reaches {2,3,4,5,6} → 5; 2 reaches {4,5,6} → 3; 3 reaches {4,5,6} → 3;
+;; 4 reaches {5,6} → 2; 5 reaches {6} → 1.  Total 14.
 (set db (datoms))
 (set db (assert-fact db 1 'edge 2))
 (set db (assert-fact db 1 'edge 3))
@@ -96,20 +139,33 @@
 (set db (assert-fact db 3 'edge 4))
 (set db (assert-fact db 4 'edge 5))
 (set db (assert-fact db 5 'edge 6))
-(count (query db (find ?x ?y) (where (reachable ?x ?y)))) -- 14
+(set qDag (query db (find ?x ?y) (where (reachable ?x ?y))))
+(count qDag) -- 14
+;; Node 1 must reach 6 (longest TC path).
+(count (where (and (== (at qDag '?x) 1) (== (at qDag '?y) 6)))) -- 1
+;; Node 6 reaches nothing.
+(count (where (== (at qDag '?x) 6))) -- 0
 
-;; Cycle 1↔2, 2→3 — every node reaches every other in {1,2,3} except
-;; that 3 has no outgoing edge.  Reachable pairs: 1→{1,2,3}, 2→{1,2,3} = 6.
+;; Cycle 1↔2, 2→3 — every node in {1,2} reaches every node in {1,2,3} (6 pairs).
+;; Reachable pairs: 1→{1,2,3}, 2→{1,2,3} = 6.
 (set db (datoms))
 (set db (assert-fact db 1 'edge 2))
 (set db (assert-fact db 2 'edge 1))
 (set db (assert-fact db 2 'edge 3))
-(count (query db (find ?x ?y) (where (reachable ?x ?y)))) -- 6
+(set qCyc (query db (find ?x ?y) (where (reachable ?x ?y))))
+(count qCyc) -- 6
+;; Both 1→1 and 2→2 must be present (via cycle), but 3→anything is empty.
+(count (where (and (== (at qCyc '?x) 1) (== (at qCyc '?y) 1)))) -- 1
+(count (where (and (== (at qCyc '?x) 2) (== (at qCyc '?y) 2)))) -- 1
+(count (where (== (at qCyc '?x) 3))) -- 0
 
 ;; Self-loop on 1: only one reachable pair (1,1).
 (set db (datoms))
 (set db (assert-fact db 1 'edge 1))
-(count (query db (find ?x ?y) (where (reachable ?x ?y)))) -- 1
+(set qSelf (query db (find ?x ?y) (where (reachable ?x ?y))))
+(count qSelf) -- 1
+(at (at qSelf '?x) 0) -- 1
+(at (at qSelf '?y) 0) -- 1
 
 ;; ────────────── stratified negation ──────────────
 ;; (not ...) excludes entities whose negated atom is satisfiable.
@@ -124,7 +180,9 @@
 (set db (assert-fact db 3 'dept 20))
 (set db (assert-fact db 3 'manager 1))
 (set db (assert-fact db 4 'dept 10))
-(count (query db (find ?e) (where (?e :dept 10) (not (?e :manager ?m))))) -- 2
+(set qNeg1 (query db (find ?e) (where (?e :dept 10) (not (?e :manager ?m)))))
+(count qNeg1) -- 2
+(asc (at qNeg1 '?e)) -- [2 4]
 
 ;; non-managers among named entities: 2 and 4 have no manager → 2.
 (set db (datoms))
@@ -134,7 +192,9 @@
 (set db (assert-fact db 3 'name 300))
 (set db (assert-fact db 3 'manager 1))
 (set db (assert-fact db 4 'name 400))
-(count (query db (find ?e) (where (?e :name ?n) (not (?e :manager ?m))))) -- 2
+(set qNeg2 (query db (find ?e) (where (?e :name ?n) (not (?e :manager ?m)))))
+(count qNeg2) -- 2
+(asc (at qNeg2 '?e)) -- [2 4]
 
 ;; everyone is a manager → empty result under (not ...)
 (set db (datoms))
@@ -145,6 +205,7 @@
 (count (query db (find ?e) (where (?e :name ?n) (not (?e :manager ?m))))) -- 0
 
 ;; ────────────── recursive rule: ancestor over a parent chain ──────────────
+;; chain 1→2→3→4 and isolated 5→6.  anc 1 ?y reaches {2,3,4}; anc 5 ?y → {6}.
 (set db (datoms))
 (set db (assert-fact db 1 'parent 2))
 (set db (assert-fact db 2 'parent 3))
@@ -152,22 +213,36 @@
 (set db (assert-fact db 5 'parent 6))
 (rule (anc ?x ?y) (?x :parent ?y))
 (rule (anc ?x ?z) (?x :parent ?y) (anc ?y ?z))
-(count (query db (find ?y) (where (anc 1 ?y)))) -- 3
-(count (query db (find ?y) (where (anc 5 ?y)))) -- 1
+(set qAnc1 (query db (find ?y) (where (anc 1 ?y))))
+(count qAnc1) -- 3
+(asc (at qAnc1 '?y)) -- [2 3 4]
+(set qAnc5 (query db (find ?y) (where (anc 5 ?y))))
+(count qAnc5) -- 1
+(at (at qAnc5 '?y) 0) -- 6
 ;; reachable pairs: 1→{2,3,4}, 2→{3,4}, 3→{4}, 5→{6} = 7
-(count (query db (find ?x ?y) (where (anc ?x ?y)))) -- 7
+(set qAncAll (query db (find ?x ?y) (where (anc ?x ?y))))
+(count qAncAll) -- 7
+;; sum of ?x = 1+1+1+2+2+3+5 = 15; sum of ?y = 2+3+4+3+4+4+6 = 26.
+(sum (at qAncAll '?x)) -- 15
+(sum (at qAncAll '?y)) -- 26
 
 ;; ────────────── two-clause derivation (co-friend via shared friend) ──────────────
+;; both 1→2→3 and 1→4→3 yield (1,3); query de-dupes to a single pair.
 (set db (datoms))
 (set db (assert-fact db 1 'friend 2))
 (set db (assert-fact db 2 'friend 3))
 (set db (assert-fact db 1 'friend 4))
 (set db (assert-fact db 4 'friend 3))
 (rule (cofriend ?x ?z) (?x :friend ?y) (?y :friend ?z))
-;; both 1→2→3 and 1→4→3 yield (1,3); query de-dupes
-(count (query db (find ?x ?z) (where (cofriend ?x ?z)))) -- 1
+(set qCo (query db (find ?x ?z) (where (cofriend ?x ?z))))
+(count qCo) -- 1
+(at (at qCo '?x) 0) -- 1
+(at (at qCo '?z) 0) -- 3
 
 ;; ────────────── multi-constant body ──────────────
+;; dept=10 ∩ level='senior → only entity 1.
+;; level='senior alone → entities 1 and 3.
+;; dept=10 alone → entities 1 and 2.
 (set db (datoms))
 (set db (assert-fact db 1 'dept 10))
 (set db (assert-fact db 1 'level 'senior))
@@ -175,6 +250,12 @@
 (set db (assert-fact db 2 'level 'junior))
 (set db (assert-fact db 3 'dept 20))
 (set db (assert-fact db 3 'level 'senior))
-(count (query db (find ?e) (where (?e :dept 10) (?e :level 'senior)))) -- 1
-(count (query db (find ?e) (where (?e :level 'senior)))) -- 2
-(count (query db (find ?e) (where (?e :dept 10)))) -- 2
+(set qMc1 (query db (find ?e) (where (?e :dept 10) (?e :level 'senior))))
+(count qMc1) -- 1
+(at (at qMc1 '?e) 0) -- 1
+(set qMc2 (query db (find ?e) (where (?e :level 'senior))))
+(count qMc2) -- 2
+(asc (at qMc2 '?e)) -- [1 3]
+(set qMc3 (query db (find ?e) (where (?e :dept 10))))
+(count qMc3) -- 2
+(asc (at qMc3 '?e)) -- [1 2]

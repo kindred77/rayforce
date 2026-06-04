@@ -22,24 +22,28 @@
 (count (select {from: (select {n: (count v) by: k from: Tmce}) where: (> n 2)})) -- 1
 (at (at (select {from: (select {n: (count v) by: k from: Tmce}) where: (> n 2)}) 'n) 0) -- 4
 
-;; Outer WHERE (> n 1) keeps A and either B or C
+;; Outer WHERE (> n 1) keeps A and either B or C ; all 3 groups → sum n = 4+2+2 = 8.
 (count (select {from: (select {n: (count v) by: k from: Tmce}) where: (> n 1)})) -- 3
+(sum (at (select {from: (select {n: (count v) by: k from: Tmce}) where: (> n 1)}) 'n)) -- 8
 
-;; Outer WHERE (> n 3) keeps only A
+;; Outer WHERE (> n 3) keeps only A ; n = 4.
 (count (select {from: (select {n: (count v) by: k from: Tmce}) where: (> n 3)})) -- 1
+(at (at (select {from: (select {n: (count v) by: k from: Tmce}) where: (> n 3)}) 'n) 0) -- 4
 
 ;; With additional aggregates in the inner select:
 ;; The emit filter matches on the count field regardless of other aggs
 (count (select {from: (select {n: (count v) s: (sum v) by: k from: Tmce}) where: (> n 2)})) -- 1
 (at (at (select {from: (select {n: (count v) s: (sum v) by: k from: Tmce}) where: (> n 2)}) 's) 0) -- 19
 
-;; Count field not first — agg_index should skip non-count aggs
+;; Count field not first — agg_index should skip non-count aggs ; all 3 groups again.
 (count (select {from: (select {s: (sum v) n: (count v) by: k from: Tmce}) where: (> n 1)})) -- 3
+(sum (at (select {from: (select {s: (sum v) n: (count v) by: k from: Tmce}) where: (> n 1)}) 'n)) -- 8
 
 ;; Larger table to stress the fast path
 (set Tstress (table [k v] (list (take ['A 'B 'C 'D 'E] 100) (til 100))))
-;; A:count=20, B:20, C:20, D:20, E:20 → (> n 15) keeps all 5
+;; A:count=20, B:20, C:20, D:20, E:20 → (> n 15) keeps all 5 ; sum n = 100.
 (count (select {from: (select {n: (count v) by: k from: Tstress}) where: (> n 15)})) -- 5
+(sum (at (select {from: (select {n: (count v) by: k from: Tstress}) where: (> n 15)}) 'n)) -- 100
 ;; (> n 20) keeps none (count=20, not > 20)
 (count (select {from: (select {n: (count v) by: k from: Tstress}) where: (> n 20)})) -- 0
 
@@ -53,8 +57,9 @@
 (count (select {n: (count v) by: k from: Tmdt desc: n take: 2})) -- 2
 (sum (at (select {n: (count v) by: k from: Tmdt desc: n take: 2}) 'n)) -- 6
 
-;; Top-1 by count desc
+;; Top-1 by count desc — A or B (tied at 3) ; n=3.
 (count (select {n: (count v) by: k from: Tmdt desc: n take: 1})) -- 1
+(at (at (select {n: (count v) by: k from: Tmdt desc: n take: 1}) 'n) 0) -- 3
 
 ;; Top-3 by count desc: all groups
 (count (select {n: (count v) by: k from: Tmdt desc: n take: 3})) -- 3
@@ -77,8 +82,9 @@
 ;; ────────────────────────────────────────────────────────────────────
 (set Tpi32 (table [k v] (list ['A 'B 'C 'A 'B 'A 'B 'C] [1 2 3 4 5 6 7 8])))
 ;; A:3, B:3, C:2 — take: 2i (I32 atom instead of I64)
-;; → positive_take_i64 hits -RAY_I32 branch at line 1673
+;; → positive_take_i64 hits -RAY_I32 branch at line 1673 ; top 2 → A,B sum n=6.
 (count (select {n: (count v) by: k from: Tpi32 desc: n take: 2i})) -- 2
+(sum (at (select {n: (count v) by: k from: Tpi32 desc: n take: 2i}) 'n)) -- 6
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; prefilter_computed_by path (lines ~3830-3859):
@@ -119,8 +125,9 @@
 ;; ────────────────────────────────────────────────────────────────────
 (set Tmce3 (table [k v] (list [1 2 3 1 2 1] [10 20 30 40 50 60])))
 ;; Inner select has n: (count v) [agg] AND x: (+ v 1) [non-agg → line 1652]
-;; Outer WHERE (> n 1) → 2 groups (k=1 count=3, k=2 count=2)
+;; Outer WHERE (> n 1) → 2 groups (k=1 count=3, k=2 count=2) ; sum n = 5.
 (count (select {from: (select {n: (count v) x: (+ v 1) by: k from: Tmce3}) where: (> n 1)})) -- 2
+(sum (at (select {from: (select {n: (count v) x: (+ v 1) by: k from: Tmce3}) where: (> n 1)}) 'n)) -- 5
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; parse_gt_name_i64 with I32/TIME threshold (lines 1523-1525):

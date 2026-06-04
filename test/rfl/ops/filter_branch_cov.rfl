@@ -186,10 +186,14 @@
 (set Tbig (table [k v] (list (til 70000) (til 70000))))
 
 ;; HAVING on 70000-row group result → exec_filter parallel paths
+;; s=k for each row; kept s∈{69991..69999} sum = (69991+69999)*9/2 = 629955.
 (count (select {from: (select {s: (sum v) from: Tbig by: k}) where: (> s 69990)})) -- 9
+(sum (at (select {from: (select {s: (sum v) from: Tbig by: k}) where: (> s 69990)}) 's)) -- 629955
 
 ;; HAVING keeping ~half — stresses multi_gather_fn for moderate pass_count
+;; kept s∈{35000..69999}; sum = (35000+69999)*35000/2 = 1837482500.
 (count (select {from: (select {s: (sum v) from: Tbig by: k}) where: (>= s 35000)})) -- 35000
+(sum (at (select {from: (select {s: (sum v) from: Tbig by: k}) where: (>= s 35000)}) 's)) -- 1837482500
 
 ;; ════════════════════════════════════════════════════════════════════
 ;; 9. Multi-segment parted table — parted_gather_col segment advance

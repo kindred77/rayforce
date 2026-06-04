@@ -32,9 +32,13 @@
 (abs -5.0)            -- 5.0
 (type (abs -5))       -- 'i64
 (type (abs -5.0))     -- 'f64
+(abs -5h)             -- 5h
 (type (abs -5h))      -- 'i16
+(abs -5i)             -- 5i
 (type (abs -5i))      -- 'i32
+(abs [-1h 2h])        -- [1h 2h]
 (type (abs [-1h 2h])) -- 'I16
+(abs [-1i 2i])        -- [1i 2i]
 (type (abs [-1i 2i])) -- 'I32
 
 ;; INT_MIN edge: |INT_MIN| doesn't fit in the same width — abs

@@ -24,6 +24,11 @@
 (sum (!= (at _tsyms 'sym) 's0)) -- 19999
 ;; Sort W16 SYM column → gather_by_idx W16 path (eval.c line 1145, case 2)
 (count (asc (at _tsyms 'sym))) -- 20000
+;; CSV generated syms s0..s19999 in id order; sym sort is lex, so 's0
+;; is followed by 's1, 's10, 's100, ... — the smallest in lex order
+;; among "s0".."s19999" is 's0.  This pins the actual sorted contents.
+(first (asc (at _tsyms 'sym))) -- 's0
+(last  (asc (at _tsyms 'sym))) -- 's9999
 
 (.sys.exec "rm -f rf_test_syms.csv") -- 0
 
@@ -82,5 +87,10 @@
 ;; (See the str-resolved comparison path in src/ops/expr.c, which skips
 ;; the null-comparison fixup once a string constant resolves to a sym id.)
 (count (select {x: name from: _t where: (!= name "")}))               -- 3
+;; Value-pair: kept rows are exactly {alice, bob, carol}.
+(at (at (select {x: name from: _t where: (!= name "")}) 'x) 0) -- 'alice
+(at (at (select {x: name from: _t where: (!= name "")}) 'x) 2) -- 'carol
 (count (select {x: name from: _t where: (== name "")}))               -- 2
+;; Value-pair: kept rows are the two empty syms.
+(at (at (select {x: name from: _t where: (== name "")}) 'x) 0) -- '
 (.sys.exec "rm -f rf_test_empty.csv") -- 0

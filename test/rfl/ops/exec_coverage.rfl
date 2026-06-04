@@ -269,20 +269,31 @@
 (set TX (table [i64c i32c i16c f64c boolc symc datec timec] (list (til N2) (as 'I32 (% (til N2) 100)) (as 'I16 (% (til N2) 50)) (as 'F64 (% (til N2) 10)) (take [true false] N2) (take ['AAPL 'GOOG 'MSFT 'TSLA] N2) (take [2024.01.01 2024.01.02 2024.01.03] N2) (take [09:30:00.000 10:00:00.000 11:30:00.000] N2))))
 
 ;; I64 col, I64 set — sequential exec_in_worker via use_double=0.
+;; kept i64c values: {1,2,3,4,5} → sum 15.
 (count (select {from: TX where: (in i64c [1 2 3 4 5])})) -- 5
+(sum (at (select {from: TX where: (in i64c [1 2 3 4 5])}) 'i64c)) -- 15
 ;; I32 col, I64 set — RAY_I32 read in IN_READ_I64.
+;; i32c = i64c%100; kept rows = i64c={0,1,2} → sum i64c 3.
 (count (select {from: TX where: (in i32c [0 1 2])})) -- 3
+(sum (at (select {from: TX where: (in i32c [0 1 2])}) 'i64c)) -- 3
 ;; I16 col, I64 set — RAY_I16 read.  i16c = i64c%50 over rows 0..49,
 ;; so i16c is 0..49 with each value appearing once.
 (count (select {from: TX where: (in i16c [0 1 2])})) -- 3
+(sum (at (select {from: TX where: (in i16c [0 1 2])}) 'i16c)) -- 3
 ;; F64 col, F64 set — use_double=1, RAY_F64 read in IN_READ_F64.
+;; f64c = i64c%10; kept rows where f64c∈{0,1,2}.  Indices: 0,1,2,10,11,12,
+;; 20,21,22,30,31,32,40,41,42 → 15 rows.  sum f64c = 5*(0+1+2)=15.0.
 (count (select {from: TX where: (in f64c [0.0 1.0 2.0])})) -- 15
+(sum (at (select {from: TX where: (in f64c [0.0 1.0 2.0])}) 'f64c)) -- 15.0
 ;; F32 col, F64 set — use_double=1, RAY_F32 read in IN_READ_F64.
 ;; F64 col, I64 set — mixed: float promotion path with integer probe.
 (count (select {from: TX where: (in f64c [0 1 2])})) -- 15
+(sum (at (select {from: TX where: (in f64c [0 1 2])}) 'f64c)) -- 15.0
 ;; I32 col, F64 set — mixed: column read via IN_READ_F64 RAY_I32 arm.
 (count (select {from: TX where: (in i32c [0.0 1.0 2.0])})) -- 3
+(sum (at (select {from: TX where: (in i32c [0.0 1.0 2.0])}) 'i32c)) -- 3
 ;; BOOL col probe — IN_READ_I64 RAY_BOOL arm.
+;; boolc = take [true false] 50 → 25 true, 25 false. Kept: 25 trues.
 (count (select {from: TX where: (in boolc [true])})) -- 25
 ;; DATE col, I64 set — RAY_DATE arm shares the I32 path (epoch days).
 ;; The set [0 1 2] would not match any actual date values; check that
@@ -294,6 +305,8 @@
 ;; SYM col, SYM set — IN_READ_I64 RAY_SYM arm via ray_read_sym.
 ;; AAPL at indices 0,4,...,48 = 13 rows; GOOG at 1,5,...,49 = 13 rows.
 (count (select {from: TX where: (in symc ['AAPL 'GOOG])})) -- 26
+;; Every kept row's sym must be AAPL or GOOG ; counting AAPL via re-filter.
+(count (select {from: (select {from: TX where: (in symc ['AAPL 'GOOG])}) where: (== symc 'AAPL)})) -- 13
 
 ;; ====================================================================
 ;; OP_IN — atom set (set is a scalar literal) — exec.c:763-779.

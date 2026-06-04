@@ -22,7 +22,9 @@
 ;; finding #3: out-of-range constant must fold consistently
 ;; Both paths must return 0 rows for `u8 == 300` (300 is outside U8).
 (count (select {c: (count u8) from: T where: (== u8 300) by: grp})) -- 0
+;; (!= u8 300) keeps all 6 rows → 2 groups (grp=0,1), sum of counts = 6.
 (count (select {c: (count u8) from: T where: (!= u8 300) by: grp})) -- 2
+(sum (at (select {c: (count u8) from: T where: (!= u8 300) by: grp}) 'c)) -- 6
 
 ;; finding #4: signed I16 SUM must equal -1+-2+3+4+-5+6 = 5
 (sum (at (select {s: (sum i16) from: T where: (>= grp 0) by: grp}) 's)) -- 5
@@ -32,18 +34,21 @@
 (max (at (select {m: (max i16) from: T where: (>= grp 0) by: grp}) 'm)) -- 6
 
 ;; ordering ops with out-of-range constants fold to all-true / all-false
-;; u8 < 300 is a tautology — every row passes (6 rows over 2 groups)
+;; u8 < 300 is a tautology — every row passes (6 rows over 2 groups); sum c = 6.
 (count (select {c: (count u8) from: T where: (< u8 300) by: grp})) -- 2
+(sum (at (select {c: (count u8) from: T where: (< u8 300) by: grp}) 'c)) -- 6
 ;; u8 > 300 matches no row
 (count (select {c: (count u8) from: T where: (> u8 300) by: grp})) -- 0
 
 ;; group-by-only no-WHERE shape stays on OP_GROUP (no fused gate
-;; accepts it) and remains correct
+;; accepts it) and remains correct ; sum of counts still 6.
 (count (select {c: (count u8) from: T by: grp})) -- 2
+(sum (at (select {c: (count u8) from: T by: grp}) 'c)) -- 6
 
 ;; chained AND filter with cheap-vs-expensive ordering must produce
-;; the same result whether or not the planner reorders
+;; the same result whether or not the planner reorders ; all 6 rows pass.
 (count (select {c: (count u8) from: T where: (and (>= grp 0) (< i16 100) (!= u8 99)) by: grp})) -- 2
+(sum (at (select {c: (count u8) from: T where: (and (>= grp 0) (< i16 100) (!= u8 99)) by: grp}) 'c)) -- 6
 
 ;; ────────────── nullable column gates (round-2 review) ──────────────
 ;; A predicate column carrying a nullmap must NOT route through the
@@ -51,10 +56,18 @@
 ;; bits).  These queries are correctness-checked against the same
 ;; data; a divergence between fused and unfused would surface here.
 (set Tn (table [v g] (list [1 2 0N 4 5] [0 0 1 1 1])))
-;; v = 1 ⇒ 1 row passes (the literal "1"; the null does NOT match)
+;; v = 1 ⇒ 1 row passes (the literal "1"; the null does NOT match) ; c=1.
 (count (select {c: (count v) from: Tn where: (== v 1) by: g})) -- 1
-;; v != 0 ⇒ 4 non-null rows pass (null compares false to anything)
-(count (select {c: (count v) from: Tn where: (!= v 0) by: g})) -- 2
+(at (at (select {c: (count v) from: Tn where: (== v 1) by: g}) 'c) 0) -- 1
+;; v != 0 under q/k null semantics: null is a distinct least value, so
+;; (!= 0N 0) is TRUE (null is not equal to 0) — the null row PASSES the
+;; filter.  This is the documented convention (cf. (< 0N 0)=true,
+;; (== 0N 0)=false, (!= 0N 0)=true in src/ops/cmp.c ray_neq_fn), NOT a
+;; bug.  g=0 keeps {1,2}→c=2 ; g=1 keeps {null,4,5}→c=3 ; sum 5.
+(sum (at (select {c: (count v) from: Tn where: (!= v 0) by: g}) 'c)) -- 5
+;; cross-check the per-group counts directly
+(at (at (select {c: (count v) from: Tn where: (!= v 0) by: g}) 'c) 0) -- 2
+(at (at (select {c: (count v) from: Tn where: (!= v 0) by: g}) 'c) 1) -- 3
 
 ;; A nullable agg-input column must aggregate null-aware; a stored
 ;; sentinel for the null would otherwise be summed as a real value.
@@ -65,14 +78,18 @@
 (set Tk (table [k v] (list [1 0N 1 0N 2] [10 20 30 40 50])))
 (count (select {c: (count v) from: Tk where: (>= v 0) by: k})) -- 3
 ;; (groups: 1 → 2 rows, 2 → 1 row, null → 2 rows.  Three buckets.)
+;; sum of counts must equal total rows kept (all 5 pass v>=0) = 5.
+(sum (at (select {c: (count v) from: Tk where: (>= v 0) by: k}) 'c)) -- 5
 
 ;; ────────────── temporal mixing (round-2 review) ──────────────
 ;; DATE col compared to a TIMESTAMP constant has different units
 ;; (days vs nanoseconds).  The fused fast path now rejects this
 ;; combination so the unfused engine handles the conversion.
 ;; Construct a DATE col and verify a same-typed compare works.
+;; d=[01,15,31] ; >=2013.07.10 keeps {15, 31} → 2 distinct dates × count 1 each ; sum c = 2.
 (set Td (table [d v] (list (as 'date [2013.07.01 2013.07.15 2013.07.31]) [1 2 3])))
 (count (select {c: (count v) from: Td where: (>= d 2013.07.10) by: d})) -- 2
+(sum (at (select {c: (count v) from: Td where: (>= d 2013.07.10) by: d}) 'c)) -- 2
 
 ;; ────────────── fused top-K alias rejection (round-1 review) ──────
 ;; An aliased projection (alias != source col) must NOT route

@@ -63,6 +63,14 @@
 ;; ────────────── iasc / idesc — index permutations ──────────────
 (count (iasc (take [5 3 1 4 2] N)))   -- 4097
 (count (idesc (take [5 3 1 4 2] N)))  -- 4097
+;; iasc/idesc must each be a permutation of [0..N-1]; assert the sorted
+;; perm equals (til N).  Falsifies "all zeros" or stale-fill bugs.
+(asc (iasc (take [5 3 1 4 2] N)))     -- (til N)
+(asc (idesc (take [5 3 1 4 2] N)))    -- (til N)
+;; gather-roundtrip: (at v (iasc v)) is sorted ascending →
+;; min is 1, max is 5.  Falsifies a sort that returns the original order.
+(at (at (take [5 3 1 4 2] N) (iasc (take [5 3 1 4 2] N))) 0) -- 1
+(at (at (take [5 3 1 4 2] N) (idesc (take [5 3 1 4 2] N))) 0) -- 5
 
 ;; ────────────── xasc / xdesc — table sort ──────────────
 (set T (table [k v] (list (take [5 3 1 4 2] N) (til N))))
@@ -85,3 +93,9 @@
 
 ;; rank preserves length
 (count (rank (take [5 3 1 4 2] N))) -- 4097
+;; rank is a permutation of [0 .. N-1]: every index appears exactly once,
+;; so asc(rank v) == til(count v).  This pins the actual values rather than
+;; only the length, falsifying an all-zero or sentinel-fill bug.
+(asc (rank (take [5 3 1 4 2] N))) -- (til N)
+;; sum of ranks 0..N-1 = N*(N-1)/2 = 4097*4096/2 = 8390656.
+(sum (rank (take [5 3 1 4 2] N))) -- 8390656

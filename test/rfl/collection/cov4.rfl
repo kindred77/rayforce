@@ -40,6 +40,10 @@
 (set _t_sstr (.csv.read [STR] "rf_cov4_str.csv"))
 (type (at _t_sstr 'word)) -- 'STR
 (count (at _t_sstr 'word)) -- 3
+;; verify actual STR values loaded from CSV (not just type+count)
+(at (at _t_sstr 'word) 0) -- "alpha"
+(at (at _t_sstr 'word) 1) -- "beta"
+(at (at _t_sstr 'word) 2) -- "gamma"
 
 ;; ════════════════════════════════════════════════════════════════
 ;; 6. STR vec range-take start >= len → empty result + pool propagate (line 1333)

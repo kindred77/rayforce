@@ -34,10 +34,18 @@
 (< (abs (- (stddev [2.0 4.0 4.0 4.0 5.0 5.0 7.0 9.0]) 2.138089935299395)) 0.000001) -- true
 
 ;; ─── return type is F64 for every wrapper ─────────────────────────
+;; [1 2 3]: mean=2, Σ(x-mean)² = 1+0+1 = 2
+;;   pop_var = 2/3 ≈ 0.666666…, sample_var = 2/2 = 1.0
+;;   pop_stddev = √(2/3) ≈ 0.8164965…, sample_stddev = 1.0
+(var        [1 2 3]) -- 1.0
 (type (var        [1 2 3])) -- 'f64
+(< (abs (- (var_pop [1 2 3]) 0.6666666666666666)) 0.000001) -- true
 (type (var_pop    [1 2 3])) -- 'f64
+(stddev     [1 2 3]) -- 1.0
 (type (stddev     [1 2 3])) -- 'f64
+(< (abs (- (stddev_pop [1 2 3]) 0.8164965809277260)) 0.000001) -- true
 (type (stddev_pop [1 2 3])) -- 'f64
+(< (abs (- (dev [1 2 3]) 0.8164965809277260)) 0.000001) -- true
 (type (dev        [1 2 3])) -- 'f64
 
 ;; ─── constant column → zero variance / dispersion ─────────────────

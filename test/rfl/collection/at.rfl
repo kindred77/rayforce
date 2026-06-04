@@ -35,6 +35,9 @@
 (at "hello" 4) -- 'o'
 ;; table row 0 → dict of column values for that row
 (type (at (table [a b] (list [10 20 30] [100 200 300])) 0)) -- 'DICT
+;; row-dict actually contains the row-0 values from each column
+(at (at (table [a b] (list [10 20 30] [100 200 300])) 0) 'a) -- 10
+(at (at (table [a b] (list [10 20 30] [100 200 300])) 0) 'b) -- 100
 ;; table row at last index
 (at (at (table [a b] (list [10 20 30] [100 200 300])) 2) 'a) -- 30
 ;; table row out of range → domain

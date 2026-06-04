@@ -95,12 +95,18 @@
 ;; i16 <- f64
 (as 'i16 0.0) -- 0h
 (as 'i16 100.9) -- 100h
-;; i16 <- date
+;; i16 <- date — narrowed truncate of the i32 days-since-epoch
 (type (as 'i16 2000.01.01)) -- 'i16
-;; i16 <- time
+(as 'i16 2000.01.01) -- 0h
+(as 'i16 2000.01.02) -- 1h
+;; i16 <- time — narrowed truncate of the i32 ms-of-day (1000 fits in i16)
 (type (as 'i16 00:00:01.000)) -- 'i16
-;; i16 <- timestamp
+(as 'i16 00:00:01.000) -- 1000h
+(as 'i16 00:00:00.000) -- 0h
+;; i16 <- timestamp — narrowed truncate of the i64 ns-since-epoch
 (type (as 'i16 2000.01.01D00:00:00.000000001)) -- 'i16
+(as 'i16 2000.01.01D00:00:00.000000001) -- 1h
+(as 'i16 2000.01.01D00:00:00.000000000) -- 0h
 ;; i16 <- String
 (as 'i16 "42") -- 42h
 (as 'i16 "-100") -- -100h
@@ -127,12 +133,18 @@
 (as 'i32 0.0) -- 0i
 (as 'i32 100.9) -- 100i
 (as 'i32 -100.9) -- -100i
-;; i32 <- date
+;; i32 <- date — DATE is i32 days-since-2000.01.01
 (type (as 'i32 2000.01.01)) -- 'i32
-;; i32 <- time
+(as 'i32 2000.01.01) -- 0i
+(as 'i32 2000.01.02) -- 1i
+;; i32 <- time — TIME is i32 ms-of-day
 (type (as 'i32 00:00:01.000)) -- 'i32
-;; i32 <- timestamp
+(as 'i32 00:00:01.000) -- 1000i
+(as 'i32 00:00:00.000) -- 0i
+;; i32 <- timestamp — narrowed truncate of i64 ns
 (type (as 'i32 2000.01.01D00:00:00.000000001)) -- 'i32
+(as 'i32 2000.01.01D00:00:00.000000001) -- 1i
+(as 'i32 2000.01.01D00:00:00.000000000) -- 0i
 ;; i32 <- String
 (as 'i32 "42") -- 42i
 (as 'i32 "-1000000") -- -1000000i
@@ -158,12 +170,18 @@
 ;; i64 <- f64
 (as 'i64 0.0) -- 0
 (as 'i64 100.9) -- 100
-;; i64 <- date
+;; i64 <- date — widening of i32 days
 (type (as 'i64 2000.01.01)) -- 'i64
-;; i64 <- time
+;; (see line ~399 below for the canonical 2000.01.01 → 0 invariant)
+(as 'i64 2000.01.02) -- 1
+;; i64 <- time — widening of i32 ms-of-day
 (type (as 'i64 00:00:01.000)) -- 'i64
-;; i64 <- timestamp
+;; (see line ~403 below for the canonical 00:00:01.000 → 1000 invariant)
+(as 'i64 00:00:00.000) -- 0
+;; i64 <- timestamp — raw i64 ns reinterpret (see line ~840 builtins_branch_cov)
 (type (as 'i64 2000.01.01D00:00:00.000000001)) -- 'i64
+(as 'i64 2000.01.01D00:00:00.000000001) -- 1
+(as 'i64 2000.01.01D00:00:00.000000000) -- 0
 ;; i64 <- String
 (as 'i64 "42") -- 42
 (as 'i64 "-9999999999") -- -9999999999
@@ -189,12 +207,18 @@
 ;; f64 <- i64
 (as 'f64 0) -- 0.00
 (as 'f64 1000000) -- 1000000.00
-;; f64 <- date
+;; f64 <- date — i32 days promoted to double
 (type (as 'f64 2000.01.01)) -- 'f64
-;; f64 <- time
+(as 'f64 2000.01.01) -- 0.00
+(as 'f64 2000.01.02) -- 1.00
+;; f64 <- time — i32 ms-of-day promoted to double
 (type (as 'f64 00:00:01.000)) -- 'f64
-;; f64 <- timestamp
+(as 'f64 00:00:01.000) -- 1000.00
+(as 'f64 00:00:00.000) -- 0.00
+;; f64 <- timestamp — i64 ns promoted to double
 (type (as 'f64 2000.01.01D00:00:00.000000001)) -- 'f64
+(as 'f64 2000.01.01D00:00:00.000000001) -- 1.00
+(as 'f64 2000.01.01D00:00:00.000000000) -- 0.00
 ;; f64 <- String
 (as 'f64 "42.5") -- 42.50
 (as 'f64 "-100.25") -- -100.25
@@ -205,13 +229,18 @@
 (as 'F64 [0i 100i]) -- [0.0 100.0]
 (as 'F64 [0 100]) -- [0.0 100.0]
 ;; ========== DATE ATOM CASTS ==========
-;; date <- b8
+;; date <- b8 — bool→days promotion: false=day 0 (2000.01.01), true=day 1 (2000.01.02)
 (type (as 'date false)) -- 'date
+(as 'date false) -- 2000.01.01
 (type (as 'date true)) -- 'date
-;; date <- u8
+(as 'date true) -- 2000.01.02
+;; date <- u8 — raw 0..255 days from epoch
 (type (as 'date 0x00)) -- 'date
+(as 'date 0x00) -- 2000.01.01
 ;; date <- i16
 (type (as 'date 0h)) -- 'date
+(as 'date 0h) -- 2000.01.01
+(as 'date 1h) -- 2000.01.02
 ;; date <- i32
 (type (as 'date 0i)) -- 'date
 (as 'date 0i) -- 2000.01.01
@@ -220,37 +249,61 @@
 (as 'date 0) -- 2000.01.01
 ;; date <- f64
 (type (as 'date 0.0)) -- 'date
-;; date <- time (value copy)
+(as 'date 0.0) -- 2000.01.01
+(as 'date 1.0) -- 2000.01.02
+;; date <- time — TIME → DATE reinterprets raw int32 ms as days (cross_cast_period.rfl:119-121).
+;; Round-trip via i64 demonstrates value passthrough without picking a calendar date.
 (type (as 'date 00:00:01.000)) -- 'date
-;; date <- timestamp
+(as 'i64 (as 'date 00:00:00.000)) -- 0
+(as 'i64 (as 'date 00:00:01.000)) -- 1000
+;; date <- timestamp — TIMESTAMP → DATE uses ts_days_floor (cross_cast_period.rfl:98-102).
 (type (as 'date 2000.01.01D00:00:00.000000001)) -- 'date
+(as 'date 2000.01.01D00:00:00.000000001) -- 2000.01.01
+(as 'date 2000.01.02D00:00:00.000000000) -- 2000.01.02
 ;; date <- String
 (as 'date "2024.03.20") -- 2024.03.20
 ;; ========== DATE VECTOR CASTS ==========
 (type (as 'DATE [0 1 2])) -- 'DATE
+(as 'I64 (as 'DATE [0 1 2])) -- [0 1 2]
 (type (as 'DATE [0i 1i 2i])) -- 'DATE
+(as 'I32 (as 'DATE [0i 1i 2i])) -- [0i 1i 2i]
 (type (as 'DATE [0h 1h 2h])) -- 'DATE
+(as 'I64 (as 'DATE [0h 1h 2h])) -- [0 1 2]
 (type (as 'DATE [0.0 1.0 2.0])) -- 'DATE
+(as 'I64 (as 'DATE [0.0 1.0 2.0])) -- [0 1 2]
 ;; ========== TIME ATOM CASTS ==========
-;; time <- b8
+;; time <- b8 — bool→ms (0 / 1)
 (type (as 'time false)) -- 'time
+(as 'time false) -- 00:00:00.000
 (type (as 'time true)) -- 'time
-;; time <- u8
+(as 'i64 (as 'time true)) -- 1
+;; time <- u8 — raw ms
 (type (as 'time 0x00)) -- 'time
-;; time <- i16
+(as 'time 0x00) -- 00:00:00.000
+;; time <- i16 — raw ms
 (type (as 'time 0h)) -- 'time
+(as 'time 0h) -- 00:00:00.000
+(as 'time 1000h) -- 00:00:01.000
 ;; time <- i32
 (type (as 'time 0i)) -- 'time
 (as 'time 0i) -- 00:00:00.000
 ;; time <- i64
 (type (as 'time 0)) -- 'time
+(as 'time 0) -- 00:00:00.000
 (as 'time 1000) -- 00:00:01.000
 ;; time <- f64
 (type (as 'time 0.0)) -- 'time
-;; time <- date (value copy)
+(as 'time 0.0) -- 00:00:00.000
+(as 'time 1000.0) -- 00:00:01.000
+;; time <- date — DATE → TIME reinterprets raw int32 days as ms-of-day (cross_cast_period.rfl:114-117).
+;; 0 days (2000.01.01) → 0 ms → 00:00:00.000.
 (type (as 'time 2000.01.01)) -- 'time
-;; time <- timestamp
+(as 'time 2000.01.01) -- 00:00:00.000
+(as 'i64 (as 'time 2000.01.02)) -- 1
+;; time <- timestamp — ts_ns_in_day floor-mod / 1e6 (cross_cast_period.rfl:106-112).
 (type (as 'time 2000.01.01D00:00:00.000000001)) -- 'time
+(as 'time 2000.01.01D00:00:00.000000000) -- 00:00:00.000
+(as 'time 2000.01.01D00:00:01.000000000) -- 00:00:01.000
 ;; time <- String
 (as 'time "12:30:45.123") -- 12:30:45.123
 (as 'time "20:00:00") -- 20:00:00.000
@@ -264,35 +317,54 @@
 10:00:00.123 -- 10:00:00.123
 ;; ========== TIME VECTOR CASTS ==========
 (type (as 'TIME [0 1000 2000])) -- 'TIME
+(as 'I64 (as 'TIME [0 1000 2000])) -- [0 1000 2000]
 (type (as 'TIME [0i 1000i 2000i])) -- 'TIME
+(as 'I32 (as 'TIME [0i 1000i 2000i])) -- [0i 1000i 2000i]
 (type (as 'TIME [0h 1h 2h])) -- 'TIME
+(as 'I64 (as 'TIME [0h 1h 2h])) -- [0 1 2]
 (type (as 'TIME [0.0 1000.0 2000.0])) -- 'TIME
+(as 'I64 (as 'TIME [0.0 1000.0 2000.0])) -- [0 1000 2000]
 ;; ========== TIMESTAMP ATOM CASTS ==========
-;; timestamp <- b8
+;; timestamp <- b8 — bool→ns: false=epoch, true=1 ns past epoch
 (type (as 'timestamp false)) -- 'timestamp
+(as 'timestamp false) -- 2000.01.01D00:00:00.000000000
 (type (as 'timestamp true)) -- 'timestamp
+(as 'i64 (as 'timestamp true)) -- 1
 ;; timestamp <- u8
 (type (as 'timestamp 0x00)) -- 'timestamp
-;; timestamp <- i16
+(as 'timestamp 0x00) -- 2000.01.01D00:00:00.000000000
+;; timestamp <- i16 — raw ns
 (type (as 'timestamp 0h)) -- 'timestamp
-;; timestamp <- i32
+(as 'timestamp 0h) -- 2000.01.01D00:00:00.000000000
+(as 'i64 (as 'timestamp 1000h)) -- 1000
+;; timestamp <- i32 — raw ns
 (type (as 'timestamp 0i)) -- 'timestamp
+(as 'timestamp 0i) -- 2000.01.01D00:00:00.000000000
 ;; timestamp <- i64
 (type (as 'timestamp 0)) -- 'timestamp
 (as 'timestamp 0) -- 2000.01.01D00:00:00.000000000
 ;; timestamp <- f64
 (type (as 'timestamp 0.0)) -- 'timestamp
-;; timestamp <- date
+(as 'timestamp 0.0) -- 2000.01.01D00:00:00.000000000
+;; timestamp <- date — days*NS_PER_DAY (cross_cast_period.rfl:91-96).
 (type (as 'timestamp 2000.01.01)) -- 'timestamp
-;; timestamp <- time
+(as 'timestamp 2000.01.01) -- 2000.01.01D00:00:00.000000000
+(as 'timestamp 2000.01.02) -- 2000.01.02D00:00:00.000000000
+;; timestamp <- time — raw ms reinterpreted as ns (round-trip check)
 (type (as 'timestamp 00:00:01.000)) -- 'timestamp
+(as 'i64 (as 'timestamp 00:00:00.000)) -- 0
+(as 'i64 (as 'timestamp 00:00:01.000)) -- 1000
 ;; timestamp <- String
 (as 'timestamp "2024.03.20D12:30:45.123456789") -- 2024.03.20D12:30:45.123456789
 ;; ========== TIMESTAMP VECTOR CASTS ==========
 (type (as 'TIMESTAMP [0 1 2])) -- 'TIMESTAMP
+(as 'I64 (as 'TIMESTAMP [0 1 2])) -- [0 1 2]
 (type (as 'TIMESTAMP [0i 1i 2i])) -- 'TIMESTAMP
+(as 'I64 (as 'TIMESTAMP [0i 1i 2i])) -- [0 1 2]
 (type (as 'TIMESTAMP [0h 1h 2h])) -- 'TIMESTAMP
+(as 'I64 (as 'TIMESTAMP [0h 1h 2h])) -- [0 1 2]
 (type (as 'TIMESTAMP [0.0 1.0 2.0])) -- 'TIMESTAMP
+(as 'I64 (as 'TIMESTAMP [0.0 1.0 2.0])) -- [0 1 2]
 ;; ========== SYMBOL ATOM CASTS ==========
 ;; symbol <- b8
 (as 'symbol false) -- '0
@@ -309,16 +381,21 @@
 ;; symbol <- i64
 (as 'symbol 42) -- '42
 (as 'symbol -9999999999) -- '-9999999999
-;; symbol <- f64
+;; symbol <- f64 — uses the F64 → STR formatter then interns
 (type (as 'symbol 42.5)) -- 'sym
-;; symbol <- date
+(as 'STR (as 'symbol 42.5)) -- "42.5"
+;; symbol <- date — uses the DATE → STR formatter (yyyy.mm.dd)
 (type (as 'symbol 2024.03.20)) -- 'sym
-;; symbol <- time
+(as 'STR (as 'symbol 2024.03.20)) -- "2024.03.20"
+;; symbol <- time — HH:MM:SS.mmm
 (type (as 'symbol 12:30:45.123)) -- 'sym
-;; symbol <- timestamp
+(as 'STR (as 'symbol 12:30:45.123)) -- "12:30:45.123"
+;; symbol <- timestamp — yyyy.mm.ddDHH:MM:SS.nnnnnnnnn
 (type (as 'symbol 2024.03.20D12:30:45.123456789)) -- 'sym
-;; symbol <- guid
+(as 'STR (as 'symbol 2024.03.20D12:30:45.123456789)) -- "2024.03.20D12:30:45.123456789"
+;; symbol <- guid — preserves the 36-char canonical hex form
 (type (as 'symbol (as 'guid "d49f18a4-1969-49e8-9b8a-6bb9a4832eea"))) -- 'sym
+(as 'STR (as 'symbol (as 'guid "d49f18a4-1969-49e8-9b8a-6bb9a4832eea"))) -- "d49f18a4-1969-49e8-9b8a-6bb9a4832eea"
 ;; symbol <- String
 (as 'symbol "hello") -- 'hello
 ;; ========== SYMBOL VECTOR CASTS ==========
@@ -327,6 +404,8 @@
 (as 'SYMBOL [0 1 2]) -- [0 1 2]
 (as 'SYMBOL [42 -100 999]) -- [42 -100 999]
 (count (as 'SYMBOL (til 1000))) -- 1000
+(at (as 'SYMBOL (til 5)) 0) -- '0
+(at (as 'SYMBOL (til 5)) 4) -- '4
 ;; ========== STRING/CHAR CASTS ==========
 (as 'STR 'hello) -- "hello"
 (as 'STR 123) -- "123"
@@ -339,6 +418,8 @@
 (as 'STR 12:30:45.123) -- "12:30:45.123"
 ;; ========== GUID CASTS ==========
 (type (as 'guid "d49f18a4-1969-49e8-9b8a-6bb9a4832eea")) -- 'guid
+;; String → GUID → STR round-trip preserves the canonical 36-char form.
+(as 'STR (as 'guid "d49f18a4-1969-49e8-9b8a-6bb9a4832eea")) -- "d49f18a4-1969-49e8-9b8a-6bb9a4832eea"
 ;; ========== IDENTITY CASTS (same type) ==========
 (as 'b8 true) -- true
 (as 'u8 0xFF) -- 0xFF
@@ -350,18 +431,33 @@
 (as 'time 12:30:45.123) -- 12:30:45.123
 (as 'symbol 'hello) -- 'hello
 ;; ========== EMPTY VECTOR CASTS ==========
+;; All empty-cast results have length 0 (count check disambiguates from a
+;; sentinel-bearing single-elem result the type-check alone would accept).
 (type (as 'B8 [])) -- 'B8
+(count (as 'B8 [])) -- 0
 (type (as 'U8 [])) -- 'U8
+(count (as 'U8 [])) -- 0
 (type (as 'I16 [])) -- 'I16
+(count (as 'I16 [])) -- 0
 (type (as 'I32 [])) -- 'I32
+(count (as 'I32 [])) -- 0
 (type (as 'I64 [])) -- 'I64
+(count (as 'I64 [])) -- 0
 (type (as 'F64 [])) -- 'F64
+(count (as 'F64 [])) -- 0
 (type (as 'DATE [])) -- 'DATE
+(count (as 'DATE [])) -- 0
 (type (as 'TIME [])) -- 'TIME
+(count (as 'TIME [])) -- 0
 (type (as 'TIMESTAMP [])) -- 'TIMESTAMP
+(count (as 'TIMESTAMP [])) -- 0
 ;; ========== TABLE/DICT CASTS ==========
 (type (as 'TABLE {a: [1 2 3] b: [4 5 6]})) -- 'TABLE
+(at (as 'TABLE {a: [1 2 3] b: [4 5 6]}) 'a) -- [1 2 3]
+(at (as 'TABLE {a: [1 2 3] b: [4 5 6]}) 'b) -- [4 5 6]
+(count (as 'TABLE {a: [1 2 3] b: [4 5 6]})) -- 3
 (type (as 'DICT (as 'TABLE {a: [1 2 3] b: [4 5 6]}))) -- 'DICT
+(at (as 'DICT (as 'TABLE {a: [1 2 3] b: [4 5 6]})) 'a) -- [1 2 3]
 ;; ========== LIST TO VECTOR CASTS ==========
 (as 'I64 (list 1 2 3)) -- [1 2 3]
 (as 'I32 (list 1i 2i 3i)) -- [1i 2i 3i]

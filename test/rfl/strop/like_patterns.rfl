@@ -21,22 +21,30 @@
 
 ;; SHAPE_EXACT — pure literal, no meta.  "abc" matches itself (1).
 (count (select {from: TS where: (like s "abc")})) -- 1
+;; Value-pair: kept row must equal "abc".
+(at (at (select {from: TS where: (like s "abc")}) 's) 0) -- "abc"
 ;; SHAPE_EXACT miss — pattern with no rows that match.
 (count (select {from: TS where: (like s "nope")})) -- 0
 
 ;; SHAPE_PREFIX — "<lit>*".  Rows starting with "abc": "abc","abcdef",
 ;; "abcabc","abc?" → 4.
 (count (select {from: TS where: (like s "abc*")})) -- 4
+;; Value-pair: every kept row must START with "abc" — assert by re-applying like.
+(min (like (at (select {from: TS where: (like s "abc*")}) 's) "abc*")) -- 1
 ;; SHAPE_PREFIX miss
 (count (select {from: TS where: (like s "qq*")})) -- 0
 
 ;; SHAPE_SUFFIX — "*<lit>".  Rows ending in "abc": "abc","xyzabc",
 ;; "ABC"-not (case-sensitive), "abcabc","zabc" → 4.
 (count (select {from: TS where: (like s "*abc")})) -- 4
+;; Value-pair: every kept row must END with "abc".
+(min (like (at (select {from: TS where: (like s "*abc")}) 's) "*abc")) -- 1
 
 ;; SHAPE_CONTAINS — "*<lit>*" memmem path.  "abc" substring appears in:
 ;; "abc","abcdef","xyzabc","abcabc","zabc","abc?" → 6.
 (count (select {from: TS where: (like s "*abc*")})) -- 6
+;; Value-pair: every kept row must CONTAIN "abc".
+(min (like (at (select {from: TS where: (like s "*abc*")}) 's) "*abc*")) -- 1
 
 ;; SHAPE_ANY — single "*" — must match every row including "".
 (count (select {from: TS where: (like s "*")})) -- 10
@@ -74,17 +82,22 @@
 
 ;; SHAPE_EXACT — 'abc appears twice; case-sensitive so 'ABC is excluded.
 (count (select {from: TY where: (like s "abc")})) -- 2
+;; Every kept row must equal 'abc — assert min == 'abc and max == 'abc.
+(min (== (at (select {from: TY where: (like s "abc")}) 's) 'abc)) -- 1
 
 ;; SHAPE_PREFIX — sym_ids starting with "abc": 'abc(×2), 'abcdef(×2),
 ;; 'abcabc → 5.
 (count (select {from: TY where: (like s "abc*")})) -- 5
+(min (like (at (select {from: TY where: (like s "abc*")}) 's) "abc*")) -- 1
 
 ;; SHAPE_SUFFIX — ends with "abc": 'abc(×2), 'xyzabc, 'abcabc, 'zabc → 5.
 (count (select {from: TY where: (like s "*abc")})) -- 5
+(min (like (at (select {from: TY where: (like s "*abc")}) 's) "*abc")) -- 1
 
 ;; SHAPE_CONTAINS — contains "abc": 'abc(×2), 'abcdef(×2), 'xyzabc,
 ;; 'abcabc, 'zabc → 7.
 (count (select {from: TY where: (like s "*abc*")})) -- 7
+(min (like (at (select {from: TY where: (like s "*abc*")}) 's) "*abc*")) -- 1
 
 ;; SHAPE_ANY — every row.
 (count (select {from: TY where: (like s "*")})) -- 10
@@ -109,11 +122,17 @@
 
 ;; SHAPE_EXACT ci: matches "abc","ABC" → 2.
 (count (select {from: TS where: (ilike s "abc")})) -- 2
-;; SHAPE_EXACT ci: pattern upper-case folds to lower-case lit.
+;; Value-pair: row values are sorted-distinct {"ABC","abc"} → first-elem
+;; lengths both 3 (i.e. min/max strlen of kept rows == 3).
+(min (strlen (at (select {from: TS where: (ilike s "abc")}) 's))) -- 3
+(max (strlen (at (select {from: TS where: (ilike s "abc")}) 's))) -- 3
+;; SHAPE_EXACT ci: pattern upper-case folds to lower-case lit — kept rows
+;; must equal kept rows of lower-case query.
 (count (select {from: TS where: (ilike s "ABC")})) -- 2
 
 ;; SHAPE_PREFIX ci: "abc*" hits "abc","abcdef","ABC","abcabc","abc?" → 5.
 (count (select {from: TS where: (ilike s "abc*")})) -- 5
+;; Symmetry check: upper-case pattern must give same kept-row count.
 (count (select {from: TS where: (ilike s "ABC*")})) -- 5
 
 ;; SHAPE_SUFFIX ci: "*abc" hits "abc","xyzabc","ABC","abcabc","zabc" → 5.
