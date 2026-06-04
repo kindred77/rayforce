@@ -28,7 +28,12 @@
 ;;     otherwise two rows sharing the same GUID would emit as
 ;;     distinct output rows and the column would carry row indices
 ;;     instead of the actual GUID bytes. ---
-(set gpt (table [g p v] (list (as 'GUID (list "d49f18a4-1969-49e8-9b8a-6bb9a4832eea" "d49f18a4-1969-49e8-9b8a-6bb9a4832eea" "7e42b82b-51c7-4468-a477-375bd5006e60")) ['a 'b 'a] [10 20 30])))(count (pivot gpt ['g] 'p 'v sum)) -- 2
+(set gpt (table [g p v] (list (as 'GUID (list "d49f18a4-1969-49e8-9b8a-6bb9a4832eea" "d49f18a4-1969-49e8-9b8a-6bb9a4832eea" "7e42b82b-51c7-4468-a477-375bd5006e60")) ['a 'b 'a] [10 20 30])))(set rgpt (pivot gpt ['g] 'p 'v sum))(count rgpt) -- 2
+;; Value-check: pivot col 'a holds v for both GUIDs (10+30=40), col 'b
+;; only the duplicate GUID (20). Guards against the dedupe routing
+;; values to the wrong cell while still emitting the right row count.
+(sum (at rgpt 'a)) -- 40
+(sum (at rgpt 'b)) -- 20
 ;; Duplicate GUID *pivot-column* values must merge into one output
 ;; column AND each source row must land in the correct column. The
 ;; grp_pv lookup originally compared raw row-index slots; rows sharing
@@ -46,10 +51,16 @@
 ;;     proper ray_guid atoms. Also exercises ray_group_fn's max_groups
 ;;     growth past the historical 1024 cap. ---
 ;; Small guid count-by: two distinct guids (duplicated), expect two groups.
-(set gs4 (take (guid 2) 4))(set tg (table [g v] (list gs4 [10 20 30 40])))(count (select {c: (count v) from: tg by: g})) -- 2
+(set gs4 (take (guid 2) 4))(set tg (table [g v] (list gs4 [10 20 30 40])))(set cby (select {c: (count v) from: tg by: g}))(count cby) -- 2
+;; Value-check: each of the 2 GUID groups holds 2 rows; per-group counts
+;; sum to the 4 source rows. A wrong grouping with the right shape fails.
+(sum (at cby 'c)) -- 4
 ;; Sum aggregation by guid: 10 + 30 = 40, 20 + 40 = 60 for the two groups.
 (set grp (select {s: (sum v) from: tg by: g}))(sum (at grp 's)) -- 100
 ;; Growth past 1024: 1500 distinct guids, each appearing once.
 ;; Pre-fix ray_group_fn had a hardcoded max_groups=1024 and returned
 ;; "limit" for this case.
-(set tbig (table [g v] (list (guid 1500) (til 1500))))(count (select {c: (count v) from: tbig by: g})) -- 1500
+(set tbig (table [g v] (list (guid 1500) (til 1500))))(set cbig (select {c: (count v) from: tbig by: g}))(count cbig) -- 1500
+;; Value-check: 1500 distinct GUIDs each appear once, so every per-group
+;; count is 1 and they sum to 1500 source rows (no spurious merge/split).
+(sum (at cbig 'c)) -- 1500

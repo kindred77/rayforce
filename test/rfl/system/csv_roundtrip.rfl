@@ -14,6 +14,11 @@
 (sum (at Rint 'b)) -- 150
 (type (at Rint 'a)) -- 'I64
 (key Rint) -- (key Tint)
+;; full per-cell value round-trip: I64 columns survive verbatim
+(at Rint 'a) -- [1 2 3 4 5]
+(at Rint 'b) -- [10 20 30 40 50]
+;; whole-table equality — shape AND every cell value preserved
+Rint -- Tint
 
 ;; ────────────── float round-trip with non-integer values ──────────────
 (set Tflt (table [x y] (list [1.5 2.5 3.14] [10.1 20.2 30.3])))
@@ -23,6 +28,11 @@
 (type (at Rflt 'x)) -- 'F64
 (first (at Rflt 'x)) -- 1.5
 (at (at Rflt 'x) 1) -- 2.5
+;; full per-column value round-trip — both float columns survive
+(at Rflt 'x) -- [1.5 2.5 3.14]
+(at Rflt 'y) -- [10.1 20.2 30.3]
+;; whole-table equality (F64 type preserved)
+Rflt -- Tflt
 
 ;; integer-valued floats collapse to I64 on read (documented inference)
 (set Tiv (table [x] (list [10.0 20.0 30.0])))
@@ -31,6 +41,8 @@
 (count Riv) -- 3
 (sum (at Riv 'x)) -- 60
 (type (at Riv 'x)) -- 'I64
+;; integer-valued floats collapse to exact I64 cell values
+(at Riv 'x) -- [10 20 30]
 
 ;; ────────────── string round-trip — string column inferred as SYM ──────────────
 (set Tstr (table [name score] (list ["Alice" "Bob" "Charlie"] [10 20 30])))
@@ -40,6 +52,9 @@
 (type (at Rstr 'name)) -- 'SYM
 (sum (at Rstr 'score)) -- 60
 (first (at Rstr 'name)) -- 'Alice
+;; full per-column value round-trip — strings interned to exact symbols
+(at Rstr 'name) -- ['Alice 'Bob 'Charlie]
+(at Rstr 'score) -- [10 20 30]
 
 ;; ────────────── multi-column mixed types ──────────────
 (set Tmix (table [id name qty price] (list [1 2 3 4 5] ["AAPL" "GOOG" "MSFT" "AAPL" "GOOG"] [100 50 200 150 40] [150.5 2800.0 310.25 151.5 2795.75])))
@@ -52,6 +67,11 @@
 (sum (at Rmix 'price)) -- 6208.0
 (type (at Rmix 'name)) -- 'SYM
 (key Rmix) -- (key Tmix)
+;; full per-column value round-trip across all mixed types
+(at Rmix 'id) -- [1 2 3 4 5]
+(at Rmix 'name) -- ['AAPL 'GOOG 'MSFT 'AAPL 'GOOG]
+(at Rmix 'qty) -- [100 50 200 150 40]
+(at Rmix 'price) -- [150.5 2800.0 310.25 151.5 2795.75]
 
 ;; ────────────── morsel-boundary sizes ──────────────
 (set T1 (table [a] (list [42])))
@@ -59,6 +79,8 @@
 (set R1 (.csv.read "/tmp/rfl_csv_one.csv"))
 (count R1) -- 1
 (first (at R1 'a)) -- 42
+(at R1 'a) -- [42]
+R1 -- T1
 
 ;; exactly 1024 rows — morsel boundary
 (set T1024 (table [n] (list (til 1024))))
@@ -66,6 +88,10 @@
 (set R1024 (.csv.read "/tmp/rfl_csv_1024.csv"))
 (count R1024) -- 1024
 (sum (at R1024 'n)) -- 523776
+;; order-sensitive: full column equals til 1024 (sum alone hides permutation)
+(at R1024 'n) -- (til 1024)
+(at (at R1024 'n) 0) -- 0
+(at (at R1024 'n) 1023) -- 1023
 
 ;; 1100 rows — crosses morsel boundary mid-stream
 (set T1100 (table [n] (list (til 1100))))
@@ -73,3 +99,8 @@
 (set R1100 (.csv.read "/tmp/rfl_csv_1100.csv"))
 (count R1100) -- 1100
 (sum (at R1100 'n)) -- 604450
+;; order-sensitive across the morsel boundary (rows 1023/1024 stitched correctly)
+(at R1100 'n) -- (til 1100)
+(at (at R1100 'n) 1023) -- 1023
+(at (at R1100 'n) 1024) -- 1024
+(at (at R1100 'n) 1099) -- 1099

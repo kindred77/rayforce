@@ -132,8 +132,13 @@
 ;; ====================================================================
 (set Tsq (table [x] (list [1.0 4.0 9.0 16.0 25.0])))
 (at (select {r: (sqrt x) from: Tsq}) 'r) -- [1.0 2.0 3.0 4.0 5.0]
-;; exp(log(x)) == x within tolerance
+;; exp(log(x)) == x within tolerance.  The element-wise abs-diff sum below
+;; already pins every cell (a per-row error shows up in the sum), so this is
+;; a value check, not a shape check.
 (< (sum (abs (- (at (select {r: (exp (log x)) from: Tsq}) 'r) [1.0 4.0 9.0 16.0 25.0]))) 0.001) -- true
+;; Spot-check the first and last cells individually as a backstop.
+(< (abs (- (at (at (select {r: (exp (log x)) from: Tsq}) 'r) 0) 1.0)) 0.001) -- true
+(< (abs (- (at (at (select {r: (exp (log x)) from: Tsq}) 'r) 4) 25.0)) 0.001) -- true
 
 ;; ====================================================================
 ;; 7. Non-fused exec_elementwise_unary I64-column -> F64 SQRT/LOG/EXP.
@@ -143,10 +148,23 @@
 ;; ====================================================================
 (set Tnull (table [v] (list [1 4 0Nl 16])))
 ;; sqrt over the non-null rows: 1,2,_,4  -> the null row stays null.
+;; Pin the full per-element vector so a wrong-but-same-sum result (e.g.
+;; [1 1 _ 5]) cannot pass on the (sum ...)==7 line alone.
+(at (select {r: (sqrt v) from: Tnull}) 'r) -- [1.0 2.0 0Nf 4.0]
 (sum (at (select {r: (sqrt v) from: Tnull}) 'r)) -- 7.0
 (nil? (at (at (select {r: (sqrt v) from: Tnull}) 'r) 2)) -- true
-;; exp/log round-trip on the non-null rows.
+;; And the individual non-null cells are exactly right.
+(at (at (select {r: (sqrt v) from: Tnull}) 'r) 0) -- 1.0
+(at (at (select {r: (sqrt v) from: Tnull}) 'r) 1) -- 2.0
+(at (at (select {r: (sqrt v) from: Tnull}) 'r) 3) -- 4.0
+;; exp/log round-trip on the non-null rows.  Pin each non-null cell within
+;; tolerance (not just the sum) so a value swap between rows can't slip by;
+;; and confirm the null row stays null through the round-trip.
 (< (abs (- (sum (at (select {r: (exp (log v)) from: Tnull}) 'r)) 21.0)) 0.001) -- true
+(< (abs (- (at (at (select {r: (exp (log v)) from: Tnull}) 'r) 0) 1.0)) 0.001) -- true
+(< (abs (- (at (at (select {r: (exp (log v)) from: Tnull}) 'r) 1) 4.0)) 0.001) -- true
+(< (abs (- (at (at (select {r: (exp (log v)) from: Tnull}) 'r) 3) 16.0)) 0.001) -- true
+(nil? (at (at (select {r: (exp (log v)) from: Tnull}) 'r) 2)) -- true
 
 ;; Non-fused I64->F64 SQRT/LOG/EXP on a plain nullable vector too.
 (sqrt [1 4 9 16]) -- [1.0 2.0 3.0 4.0]

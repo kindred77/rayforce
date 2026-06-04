@@ -11,8 +11,13 @@
 ;; ── basics
 (count trades) -- 10
 (count (select {from: trades})) -- 10
+(sum (at (select {from: trades}) 'size)) -- 1240
 (count (select {from: trades where: (== sym 'AAPL)})) -- 4
+(sum (at (select {from: trades where: (== sym 'AAPL)}) 'size)) -- 460
+(sum (at (select {from: trades where: (== sym 'AAPL)}) 'price)) -- 604.0
 (count (select {from: trades where: (> price 200)})) -- 6
+(sum (at (select {from: trades where: (> price 200)}) 'size)) -- 780
+(sum (at (select {from: trades where: (> price 200)}) 'price)) -- 9335.0
 (sum (at trades 'price)) -- 9939.0
 (sum (at trades 'size)) -- 1240
 (max (at trades 'price)) -- 2810.0
@@ -30,6 +35,11 @@
 (set grp-key-proj (select {sym: sym s: (sum size) c: (count sym) u: (count (distinct price)) from: trades by: sym desc: c}))
 (count (key grp-key-proj)) -- 4
 (type (at grp-key-proj 'sym)) -- 'SYM
+(asc (at grp-key-proj 'sym)) -- ['AAPL 'GOOG 'MSFT]
+(at (at grp-key-proj 'sym) 0) -- 'AAPL
+(at (at grp-key-proj 's) 0) -- 460
+(at (at grp-key-proj 'c) 0) -- 4
+(sum (at grp-key-proj 'u)) -- 10
 (count (select {sym: sym c: (count sym) from: trades by: sym desc: c take: 2})) -- 2
 (first (at (select {sym: sym c: (count sym) from: trades by: sym desc: c take: 2}) 'c)) -- 4
 (sum (at (select {sym: sym c: (count sym) from: trades by: sym desc: c take: 2}) 'c)) -- 7
@@ -67,22 +77,34 @@
 
 ;; ── where: simple comparisons against scalars
 (count (select {from: trades-15 where: (== sym 'AAPL)})) -- 4
+(sum (at (select {from: trades-15 where: (== sym 'AAPL)}) 'size)) -- 480
 (count (select {from: trades-15 where: (!= sym 'MSFT)})) -- 11
+(sum (at (select {from: trades-15 where: (!= sym 'MSFT)}) 'size)) -- 945
 (count (select {from: trades-15 where: (> price 200.0)})) -- 11
+(sum (at (select {from: trades-15 where: (> price 200.0)}) 'size)) -- 1285
 (count (select {from: trades-15 where: (< size 100)})) -- 7
+(sum (at (select {from: trades-15 where: (< size 100)}) 'size)) -- 465
 (count (select {from: trades-15 where: (>= size 100)})) -- 8
+(sum (at (select {from: trades-15 where: (>= size 100)}) 'size)) -- 1300
 (count (select {from: trades-15 where: (<= price 2000.0)})) -- 10
+(sum (at (select {from: trades-15 where: (<= price 2000.0)}) 'size)) -- 1485
 
 ;; ── where: compound and / or / not
 (count (select {from: trades-15 where: (and (> price 500.0) (< size 200))})) -- 7
+(sum (at (select {from: trades-15 where: (and (> price 500.0) (< size 200))}) 'size)) -- 465
 (count (select {from: trades-15 where: (or (== sym 'AMZN) (== sym 'TSLA))})) -- 3
+(sum (at (select {from: trades-15 where: (or (== sym 'AMZN) (== sym 'TSLA))}) 'size)) -- 260
 (count (select {from: trades-15 where: (not (== sym 'AAPL))})) -- 11
+(sum (at (select {from: trades-15 where: (not (== sym 'AAPL))}) 'size)) -- 1285
 (count (select {from: trades-15 where: (and (> size 50) (or (== sym 'AAPL) (== sym 'GOOG)))})) -- 6
+(sum (at (select {from: trades-15 where: (and (> size 50) (or (== sym 'AAPL) (== sym 'GOOG)))}) 'size)) -- 595
 
 ;; ── projection: total invariants under arithmetic columns
 (sum (at (select {notional: (* price size) from: trades-15}) 'notional)) -- 1278942.5
 (sum (at (select {ps: (+ price size) from: trades-15}) 'ps)) -- 19523.5
 (count (select {t: sym from: trades-15})) -- 15
+(at (at (select {t: sym from: trades-15}) 't) 0) -- 'AAPL
+(count (distinct (at (select {t: sym from: trades-15}) 't))) -- 5
 
 ;; ── sort: asc / desc preserve totals; first-row equals min/max
 (sum (at (select {from: trades-15 asc: price}) 'price)) -- 17758.5
@@ -90,18 +112,27 @@
 (first (at (select {from: trades-15 asc: size}) 'size)) -- 40
 (first (at (select {from: trades-15 desc: size}) 'size)) -- 250
 (count (select {from: trades-15 asc: tms})) -- 15
+(first (at (select {from: trades-15 asc: tms}) 'size)) -- 100
+(sum (at (select {from: trades-15 asc: tms}) 'size)) -- 1765
 
 ;; ── take: clamping behavior
 (count (select {from: trades-15 take: 5})) -- 5
+(sum (at (select {from: trades-15 take: 5}) 'size)) -- 540
 (count (select {from: trades-15 take: 0})) -- 0
 (count (select {from: trades-15 take: 15})) -- 15
+(sum (at (select {from: trades-15 take: 15}) 'size)) -- 1765
 
 ;; ── edge cases: all-pass / none-pass / single-row / by-distinct-time
 (count (select {from: trades-15 where: (> size -1)})) -- 15
+(sum (at (select {from: trades-15 where: (> size -1)}) 'size)) -- 1765
 (count (select {from: trades-15 where: (> size 999999)})) -- 0
 (count (select {from: trades-15 where: (== size 200)})) -- 1
+(first (at (select {from: trades-15 where: (== size 200)}) 'price)) -- 310.0
 (count (select {s: (sum size) from: trades-15 by: tms})) -- 15
+(sum (at (select {s: (sum size) from: trades-15 by: tms}) 's)) -- 1765
 (count (select {s: (sum size) from: trades-15 by: d})) -- 3
+(sum (at (select {s: (sum size) from: trades-15 by: d}) 's)) -- 1765
+(asc (at (select {s: (sum size) from: trades-15 by: d}) 's)) -- [540 540 685]
 
 ;; ── group-by clause coverage on the 15-row fixture
 (count (select {s: (sum size) from: trades-15 by: sym})) -- 5
@@ -112,7 +143,11 @@
 
 ;; ── combo: where + by + projection / asc + take / no-match
 (count (select {from: trades-15 where: (> price 500.0) asc: price take: 3})) -- 3
+(first (at (select {from: trades-15 where: (> price 500.0) asc: price take: 3}) 'price)) -- 700.0
+(sum (at (select {from: trades-15 where: (> price 500.0) asc: price take: 3}) 'size)) -- 225
 (count (select {s: (sum size) from: trades-15 by: sym asc: sym})) -- 5
+(asc (at (select {s: (sum size) from: trades-15 by: sym asc: sym}) 'sym)) -- ['AAPL 'AMZN 'GOOG 'MSFT 'TSLA]
+(sum (at (select {s: (sum size) from: trades-15 by: sym asc: sym}) 's)) -- 1765
 (count (select {from: trades-15 where: (== sym 'NOPE) by: sym})) -- 0
 (first (at (select {p: (avg price) from: trades-15 by: sym where: (== sym 'GOOG)}) 'p)) -- 2802.5
 
@@ -130,6 +165,7 @@
 (sum (at (select {s: (sum qty) from: trades-mk by: [sector side]}) 's)) -- 1165
 (sum (at (select {s: (sum qty) from: trades-mk by: [sector side] where: (and (== sector 'Tech) (== side 'Buy))}) 's)) -- 515
 (count (select {c: (count qty) from: trades-mk by: [sector side] take: 3})) -- 3
+(sum (at (select {c: (count qty) from: trades-mk by: [sector side] take: 3}) 'c)) -- 10
 
 ;; ── grouped string length aggregation streams from the source column
 (set page-lens (table [bucket url] (list [1 1 2 2] (list "aa" "bbbb" "ccc" ""))))

@@ -10,6 +10,17 @@
 (count "abcdefghijkl") -- 12
 (count "abcdefghijklm") -- 13
 (count "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") -- 100
+;; count alone cannot catch a pool op that corrupts bytes while keeping
+;; the length — pin the actual content of the pooled (>12 byte) strings.
+;; 13-byte string just over the SSO boundary: first/middle/last byte + identity.
+(at "abcdefghijklm" 0)  -- 'a'
+(at "abcdefghijklm" 6)  -- 'g'
+(at "abcdefghijklm" 12) -- 'm'
+(== "abcdefghijklm" "abcdefghijklm") -- true
+;; 100-byte pooled string: ends survive intact, full self-equality holds.
+(at "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" 0)  -- 'a'
+(at "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" 99) -- 'a'
+(== "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") -- true
 
 ;; ────────────── equality across representations ──────────────
 (== "abc" "abc") -- true
@@ -22,6 +33,11 @@
 ;; 12 + 1 = 13 → result lands in the pool
 (count (concat "abcdefghijkl" "x")) -- 13
 (concat "abcdefghijkl" "x") -- "abcdefghijklx"
+;; the boundary byte (index 12) is the one most likely lost when a concat
+;; promotes an inline operand into the pool — pin it and the joining seam.
+(at (concat "abcdefghijkl" "x") 0)  -- 'a'
+(at (concat "abcdefghijkl" "x") 11) -- 'l'
+(at (concat "abcdefghijkl" "x") 12) -- 'x'
 
 ;; concat fits within inline (3 + 3 = 6)
 (concat "abc" "def") -- "abcdef"
@@ -30,6 +46,11 @@
 ;; concat pool + inline / pool + pool retains length
 (concat "abcdefghijklm" "!") -- "abcdefghijklm!"
 (count (concat "abcdefghijklm" "!")) -- 14
+;; pool + pool: both operands already pooled, result must keep every byte.
+(concat "abcdefghijklm" "nopqrstuvwxyz") -- "abcdefghijklmnopqrstuvwxyz"
+(count (concat "abcdefghijklm" "nopqrstuvwxyz")) -- 26
+(at (concat "abcdefghijklm" "nopqrstuvwxyz") 13) -- 'n'
+(at (concat "abcdefghijklm" "nopqrstuvwxyz") 25) -- 'z'
 
 ;; concat with empty operand
 (concat "" "abc") -- "abc"
@@ -42,3 +63,44 @@
 (like "abcdefghijklmnop" "*ghij*")  -- true
 (like "" "")                        -- true
 (like "" "x")                       -- false
+
+;; ────────────── STR vectors: per-vector pool across ops ──────────────
+;; A multi-element STR vector keeps a single shared pool; sort/slice/
+;; reverse/distinct reshuffle pool offsets. count/cardinality alone can
+;; pass while the bytes behind each offset are wrong, so every op below
+;; reads back the actual surviving string value (mix of inline ≤12 and
+;; pooled >12 byte elements, sharing one pool).
+(set Vp ["zebra" "abcdefghijklm" "apple" "abcdefghijkl"])
+
+;; sort must reorder pool offsets, not the bytes: inline "apple" sorts
+;; before pooled strings; the two near-boundary pooled strings stay
+;; intact and correctly ordered ("abcdefghijkl" < "abcdefghijklm").
+(asc Vp)             -- ["abcdefghijkl" "abcdefghijklm" "apple" "zebra"]
+(at (asc Vp) 0)      -- "abcdefghijkl"
+(at (asc Vp) 1)      -- "abcdefghijklm"
+(at (asc Vp) 3)      -- "zebra"
+(at (desc Vp) 0)     -- "zebra"
+(at (desc Vp) 3)     -- "abcdefghijkl"
+
+;; slice/take shares the pool — the long element must read back whole.
+(at (take Vp 2) 1)   -- "abcdefghijklm"
+(at (take Vp -1) 0)  -- "abcdefghijkl"
+
+;; reverse keeps every byte; first/last read the boundary-length elements.
+(at (reverse Vp) 0)  -- "abcdefghijkl"
+(at (reverse Vp) 3)  -- "zebra"
+(first Vp)           -- "zebra"
+(last Vp)            -- "abcdefghijkl"
+
+;; distinct over duplicated pooled + inline strings: dedup by VALUE, and
+;; the kept representative must still carry the right bytes.
+(set Vd ["abcdefghijklm" "abc" "abcdefghijklm" "abc"])
+(count (distinct Vd))   -- 2
+(at (distinct Vd) 0)    -- "abcdefghijklm"
+(at (distinct Vd) 1)    -- "abc"
+
+;; indexing a pooled element out of a vector yields the exact string, and
+;; it compares equal to a fresh literal (pool-backed == literal).
+(at Vp 1)                       -- "abcdefghijklm"
+(== (at Vp 1) "abcdefghijklm")  -- true
+(!= (at Vp 1) (at Vp 3))        -- true

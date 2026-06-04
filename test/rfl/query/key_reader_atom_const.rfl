@@ -44,6 +44,14 @@
 ;; -RAY_I64 atom literal sanity check.  Dep a = k + 100.
 ;; (Same case body as -RAY_TIMESTAMP.)
 (sum (at (select {c: (count v) from: Ta by: {k: k a: (+ k 100)}}) 'a)) -- 410
+;; Order-independent per-group check on the dep alias: a wrong base-key
+;; read that still totals 410 fails here.  Mask SOURCE to k==3 → dep
+;; a==103, and the v rows {30,70} → count 2; assert key, dep, count.
+(set Ga (select {c: (count v) from: Ta by: {k: k a: (+ k 100)} where: (== k 3)}))
+(count Ga) -- 1
+(at (at Ga 'k) 0) -- 3
+(at (at Ga 'a) 0) -- 103
+(at (at Ga 'c) 0) -- 2
 
 ;; -RAY_I16 atom literal: 5h.  Dep alias `a` = k + 5 over distinct
 ;; group keys {1,2,3,4} → sum(a) = sum(k)+4*5 = 10 + 20 = 30.
@@ -78,28 +86,82 @@
 (set Tw (table [k16 k32 v] (list [10h 20h 30h 40h 10h 20h 30h 40h 10h 20h 30h 40h 10h 20h 30h 40h] [100i 100i 100i 100i 200i 200i 200i 200i 300i 300i 300i 300i 400i 400i 400i 400i] [1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16])))
 (count (select {c: (count v) by: [k16 k32] from: Tw take: 100})) -- 16
 (sum (at (select {c: (count v) by: [k16 k32] from: Tw take: 100}) 'c)) -- 16
+;; Order-independent per-group check via composite-key-masked SOURCE: a
+;; wrong I16/I32 key read or swapped group passes the count/sum above but
+;; fails here.  Group (k16==30h, k32==300i) is the single v=11 row.
+(set Gw (select {c: (count v) s: (sum v) by: [k16 k32] where: (and (== k16 30h) (== k32 300i)) from: Tw take: 100}))
+(count Gw) -- 1
+(as 'I64 (at (at Gw 'k16) 0)) -- 30
+(as 'I64 (at (at Gw 'k32) 0)) -- 300
+(at (at Gw 'c) 0) -- 1
+(at (at Gw 's) 0) -- 11
 
 ;; ----- Date + Time key columns (I32-backed RAY_DATE / RAY_TIME) -----
 (set Tdt (table [d t v] (list [2024.01.01 2024.01.01 2024.01.02 2024.01.02 2024.01.01 2024.01.01 2024.01.02 2024.01.02] [09:00:00.000 10:00:00.000 09:00:00.000 10:00:00.000 09:00:00.000 10:00:00.000 09:00:00.000 10:00:00.000] [1 2 3 4 5 6 7 8])))
 ;; 2 dates × 2 times = 4 groups, each twice.
 (count (select {c: (count v) by: [d t] from: Tdt take: 50})) -- 4
 (sum (at (select {c: (count v) by: [d t] from: Tdt take: 50}) 'c)) -- 8
+;; Order-independent per-group check via composite-key-masked SOURCE.
+;; Group (d==2024.01.02, t==09:00:00.000) holds rows {v=3, v=7} → count 2,
+;; sum 10.  Asserting both DATE/TIME key columns catches a wrong I32-backed
+;; key read that still yields the right group count.
+(set Gdt (select {c: (count v) s: (sum v) by: [d t] where: (and (== d 2024.01.02) (== t 09:00:00.000)) from: Tdt take: 50}))
+(count Gdt) -- 1
+(as 'I64 (at (at Gdt 'd) 0)) -- 8767
+(as 'I64 (at (at Gdt 't) 0)) -- 32400000
+(at (at Gdt 'c) 0) -- 2
+(at (at Gdt 's) 0) -- 10
 
 ;; ----- I64 + TIMESTAMP key columns -----
 (set Tts (table [g ts v] (list [100 100 200 200 100 100 200 200] [2024.01.01D00:00:00.000000000 2024.01.02D00:00:00.000000000 2024.01.01D00:00:00.000000000 2024.01.02D00:00:00.000000000 2024.01.01D00:00:00.000000000 2024.01.02D00:00:00.000000000 2024.01.01D00:00:00.000000000 2024.01.02D00:00:00.000000000] [1 2 3 4 5 6 7 8])))
 (count (select {c: (count v) by: [g ts] from: Tts take: 100})) -- 4
 (sum (at (select {c: (count v) by: [g ts] from: Tts take: 100}) 'c)) -- 8
+;; Order-independent per-group check via composite-key-masked SOURCE.
+;; Group (g==200, ts==2024.01.02D...) holds rows {v=4, v=8} → count 2, sum
+;; 12.  Asserts the I64 + TIMESTAMP key reads, not just the group count.
+(set Gts (select {c: (count v) s: (sum v) by: [g ts] where: (and (== g 200) (== ts 2024.01.02D00:00:00.000000000)) from: Tts take: 100}))
+(count Gts) -- 1
+(at (at Gts 'g) 0) -- 200
+(at (at Gts 'c) 0) -- 2
+(at (at Gts 's) 0) -- 12
 
 ;; ----- I64 + F64 key columns (F64 → memcpy branch in reader) -----
 (set Tf (table [g f v] (list [1 1 2 2 1 1 2 2] [1.5 2.5 1.5 2.5 1.5 2.5 1.5 2.5] [1 2 3 4 5 6 7 8])))
 (count (select {c: (count v) by: [g f] from: Tf take: 100})) -- 4
 (sum (at (select {c: (count v) by: [g f] from: Tf take: 100}) 'c)) -- 8
+;; Order-independent per-group check via composite-key-masked SOURCE.
+;; Group (g==2, f==2.5) holds rows {v=4, v=8} → count 2, sum 12.  Asserts
+;; the F64 memcpy-branch key read and the I64 key, not just group count.
+(set Gf (select {c: (count v) s: (sum v) by: [g f] where: (and (== g 2) (== f 2.5)) from: Tf take: 100}))
+(count Gf) -- 1
+(at (at Gf 'g) 0) -- 2
+(at (at Gf 'f) 0) -- 2.5
+(at (at Gf 'c) 0) -- 2
+(at (at Gf 's) 0) -- 12
 
 ;; ----- Nullable I64 column — HAS_NULLS branch in the reader -----
 (set Tnu (table [a b v] (list [1 0Nl 1 0Nl 1 0Nl] [10 10 20 20 10 10] [1 2 3 4 5 6])))
 ;; Distinct (a,b) pairs: (1,10), (NULL,10), (1,20), (NULL,20) = 4.
 (count (select {c: (count v) by: [a b] from: Tnu take: 50})) -- 4
 (sum (at (select {c: (count v) by: [a b] from: Tnu take: 50}) 'c)) -- 6
+;; Order-independent per-group check via composite-key-masked SOURCE on a
+;; NON-NULL pair (a==1, b==10): rows {v=1, v=5} → count 2, sum 6.  Asserts
+;; the I64 key reads under the HAS_NULLS reader, not just the group count.
+(set Gnu (select {c: (count v) s: (sum v) by: [a b] where: (and (== a 1) (== b 10)) from: Tnu take: 50}))
+(count Gnu) -- 1
+(at (at Gnu 'a) 0) -- 1
+(at (at Gnu 'b) 0) -- 10
+(at (at Gnu 'c) 0) -- 2
+(at (at Gnu 's) 0) -- 6
+;; NULL-bearing key group: mask (a==0N, b==20) → single v=4 row.  Exercises
+;; the HAS_NULLS per-row null-bit arm of the reader and isolates the null
+;; group; assert the null key, the non-null companion key, and the value.
+(set Gnn (select {c: (count v) s: (sum v) by: [a b] where: (and (== a 0N) (== b 20)) from: Tnu take: 50}))
+(count Gnn) -- 1
+(nil? (at (at Gnn 'a) 0)) -- true
+(at (at Gnn 'b) 0) -- 20
+(at (at Gnn 'c) 0) -- 1
+(at (at Gnn 's) 0) -- 4
 
 ;; ============================================================
 ;; Part C — expr_affine_of_sym with reversed operand order
@@ -125,8 +187,22 @@
 ;; I16 base key: key_col_read_i64 I16 branch (line 1497)
 ;; Dep a = k + 10 → sum(a) over groups {1,2,3,4} = (1+2+3+4)+4*10 = 50
 (sum (at (select {c: (count v) from: Td16 by: {k: k a: (+ k 10)}}) 'a)) -- 50
+;; Order-independent per-group check on the I16 base-key read + dep alias.
+;; Mask SOURCE to k==3 (I16) → dep a==13, v rows {30,70} → count 2.
+(set Gd16 (select {c: (count v) from: Td16 by: {k: k a: (+ k 10)} where: (== k 3)}))
+(count Gd16) -- 1
+(as 'I64 (at (at Gd16 'k) 0)) -- 3
+(at (at Gd16 'a) 0) -- 13
+(at (at Gd16 'c) 0) -- 2
 
 (set Td32 (table [k v] (list (as 'I32 [1 2 3 4 1 2 3 4]) [10 20 30 40 50 60 70 80])))
 ;; I32 base key: key_col_read_i64 I32 branch (line 1498-1500)
 ;; Dep a = k + 7 → sum(a) over groups {1,2,3,4} = 10 + 28 = 38
 (sum (at (select {c: (count v) from: Td32 by: {k: k a: (+ k 7)}}) 'a)) -- 38
+;; Order-independent per-group check on the I32 base-key read + dep alias.
+;; Mask SOURCE to k==2 (I32) → dep a==9, v rows {20,60} → count 2.
+(set Gd32 (select {c: (count v) from: Td32 by: {k: k a: (+ k 7)} where: (== k 2)}))
+(count Gd32) -- 1
+(as 'I64 (at (at Gd32 'k) 0)) -- 2
+(at (at Gd32 'a) 0) -- 9
+(at (at Gd32 'c) 0) -- 2

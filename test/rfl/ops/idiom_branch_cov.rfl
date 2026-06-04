@@ -91,9 +91,13 @@
 (first (asc (at TA 'v))) -- 1
 (last  (asc (at TA 'v))) -- 8
 (count (distinct (at TA 'v))) -- 8
+(distinct (at TA 'v)) -- [1 2 3 4 5 6 7 8]
 (count (asc (at TA 'v))) -- 8
+(asc (at TA 'v)) -- [1 2 3 4 5 6 7 8]
 (count (desc (at TA 'v))) -- 8
+(desc (at TA 'v)) -- [8 7 6 5 4 3 2 1]
 (count (reverse (at TA 'v))) -- 8
+(reverse (at TA 'v)) -- [4 6 2 7 1 8 3 5]
 
 ;; Null-bearing table column: precondition fires false → slow path
 ;; Exercises scan_source_col line 96 (tbl not null) and line 126
@@ -102,13 +106,16 @@
 (first (asc (at TAN 'v))) -- 1
 (last  (asc (at TAN 'v))) -- 5
 (count (distinct (at TAN 'v))) -- 4
+(distinct (at TAN 'v)) -- [0N 1 3 5]
 (count (asc (at TAN 'v))) -- 5
+(asc (at TAN 'v)) -- [0N 0N 1 3 5]
 
 ;; Multi-column table: idiom on one column while another exists
 (set TAM (table [a b] (list [10 20 30 40 50] [5 4 3 2 1])))
 (first (asc (at TAM 'b))) -- 1
 (last  (asc (at TAM 'b))) -- 5
 (count (distinct (at TAM 'a))) -- 5
+(distinct (at TAM 'a)) -- [10 20 30 40 50]
 
 ;; ──────────────────────────────────────────────────────────────────────
 ;; Section B: pre_no_nulls_on_asc_input — OP_CONST paths (lines 113-120)
@@ -148,6 +155,7 @@
 ;; Parted column: count(distinct) — goes through the idiom rewrite
 ;; rw_count_distinct, and scan_source_col line 125 RAY_IS_PARTED path.
 (count (distinct (at PT 'v))) -- 6
+(distinct (at PT 'v)) -- [1 2 3 4 5 6]
 
 ;; Parted sum/min/max — these go through the parted agg path, not through
 ;; the idiom, but exercising the table scan to confirm parted resolution.
@@ -188,6 +196,7 @@
 ;; Arithmetic inside idiom: (count (distinct (+ v 1))) — the OP_ADD node
 ;; is visited by the walk but try_rewrite finds no matching idiom row.
 (count (distinct (+ [1 1 2 2 3] 1))) -- 3
+(distinct (+ [1 1 2 2 3] 1)) -- [2 3 4]
 
 ;; ──────────────────────────────────────────────────────────────────────
 ;; Section E: try_rewrite — node with no matching child0_op (line 221)
@@ -227,6 +236,9 @@
 (count (asc (distinct [1 1 2 2 3]))) -- 3
 (count (desc (distinct [1 1 2 2 3]))) -- 3
 (count (reverse (distinct [1 1 2 2 3]))) -- 3
+;; value-check the inner aggregate the chain depends on
+(asc (distinct [1 1 2 2 3])) -- [1 2 3]
+(distinct [1 1 2 2 3]) -- [1 2 3]
 
 ;; Deeper nesting: count(asc(reverse V))
 ;; Post-order: reverse(V) — no idiom match (OP_REVERSE not a root_op).
@@ -276,8 +288,11 @@
 ;; idiom over joined result: count(distinct) — the column reference
 ;; after join resolution may still be OP_SCAN referencing a secondary table.
 (count (distinct (at TJ 'v))) -- 3
+(distinct (at TJ 'v)) -- [10 20 30]
 (count (distinct (at TJ 'w))) -- 3
+(distinct (at TJ 'w)) -- [100 200 300]
 (count (asc (at TJ 'v))) -- 3
+(asc (at TJ 'v)) -- [10 20 30]
 (first (asc (at TJ 'v))) -- 10
 (last  (asc (at TJ 'v))) -- 30
 
@@ -320,15 +335,20 @@
 ;; ──────────────────────────────────────────────────────────────────────
 ;; count(distinct) on SYM vector exercises rw_count_distinct with SYM type.
 (count (distinct ['a 'b 'c 'a 'b])) -- 3
+(distinct ['a 'b 'c 'a 'b]) -- ['a 'b 'c]
 (count (asc ['a 'b 'c 'a 'b])) -- 5
+(asc ['a 'b 'c 'a 'b]) -- ['a 'a 'b 'b 'c]
 (count (desc ['a 'b 'c 'a 'b])) -- 5
 (count (reverse ['a 'b 'c 'a 'b])) -- 5
+(reverse ['a 'b 'c 'a 'b]) -- ['b 'a 'c 'b 'a]
 
 ;; ──────────────────────────────────────────────────────────────────────
 ;; Section L: BOOL-typed vectors — edge case for idiom rewrites
 ;; ──────────────────────────────────────────────────────────────────────
 (count (distinct [true false true false])) -- 2
+(distinct [true false true false]) -- [false true]
 (count (asc [true false true])) -- 3
+(asc [true false true]) -- [false true true]
 (first (asc [true false true])) -- 0
 (last  (asc [true false true])) -- 1
 
@@ -344,6 +364,7 @@
 ;; Deep arithmetic chain — creates many graph nodes
 (set V [1 2 3 4 5])
 (count (distinct (+ (+ (+ (+ V 1) 1) 1) 1))) -- 5
+(distinct (+ (+ (+ (+ V 1) 1) 1) 1)) -- [5 6 7 8 9]
 
 ;; ──────────────────────────────────────────────────────────────────────
 ;; Section N: first/last on desc (NOT an idiom — no rewrite should fire)

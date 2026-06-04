@@ -50,6 +50,13 @@
 ;; Large vector — exercises radix path inside ray_sort_indices.
 (set Xbig (take [5 2 8 1 9 3 7 4 6 0] 1024))
 (count (xrank 4 Xbig)) -- 1024
+;; Order invariant: all groups in [0,4) and groups are monotone w.r.t. value.
+(set Xbigg (xrank 4 Xbig))
+(sum (>= Xbigg 0)) -- 1024
+(sum (< Xbigg 4)) -- 1024
+;; Smallest value (0) must land in group 0; largest value (9) in group 3.
+(at Xbigg 9) -- 0
+(at Xbigg 4) -- 3
 
 ;; xrank error paths
 (xrank 0 [1 2 3]) -- []
@@ -77,15 +84,18 @@
 (set Sdsc65 (desc (take ["aaa" "bbb" "ccc" "ddd" "eee" "fff" "ggg" "hhh" "iii" "jjj" "kkk" "lll" "mmm"] 65)))
 (count (desc Sdsc65)) -- 65
 (at (desc Sdsc65) 0) -- "mmm"
+(at (desc Sdsc65) 64) -- "aaa"
 
 ;; Pre-sorted ascending, asking for desc → wrong direction (run_dir=1, want_asc=false)
 ;; hits the reversed-emit branch (line 1681-1689).
 (count (desc Sasc65)) -- 65
 (at (desc Sasc65) 0) -- "mmm"
+(at (desc Sasc65) 64) -- "aaa"
 
 ;; Pre-sorted descending, asking for asc → wrong direction (run_dir=-1, want_asc=true).
 (count (asc Sdsc65)) -- 65
 (at (asc Sdsc65) 0) -- "aaa"
+(at (asc Sdsc65) 64) -- "mmm"
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; 3. strkey_cmp length-only branch (L1161-L1162)
@@ -108,6 +118,7 @@
 (set Spfx2 (take ["abc" "ab" "abcd" "a" "abcde"] 200))
 (count (asc Spfx2)) -- 200
 (at (asc Spfx2) 0) -- "a"
+(at (asc Spfx2) 199) -- "abcde"
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; 4. radix_decode_into for I32 / I64-desc / I16 / BOOL / U8
@@ -146,6 +157,9 @@
 
 ;; Random-order large-range I64, 8193 rows: hits sortedness_fn parallel.
 (count (iasc Vi64big)) -- 8193
+;; iasc is an index permutation: gathering by it must yield sorted values.
+(at (at Vi64big (iasc Vi64big)) 0) -- 1
+(at (at Vi64big (iasc Vi64big)) 8192) -- 100000000
 
 ;; Already-sorted large I64 (asc iota scaled by 100000): sortedness=0
 ;; path inside detect_sortedness → sorted_idx = indices, radix_done.
@@ -179,16 +193,19 @@
 (set Vstrpar (take ["zebra" "apple" "mango" "banana" "cherry" "kiwi" "lemon" "orange" "papaya" "grape" "avocado" "blueberry" "coconut" "date" "elderberry" "fig"] 65536))
 (count (asc Vstrpar)) -- 65536
 (at (asc Vstrpar) 0) -- "apple"
+(at (asc Vstrpar) 65535) -- "zebra"
 
 ;; DESC of parallel string sort.
 (count (desc Vstrpar)) -- 65536
 (at (desc Vstrpar) 0) -- "zebra"
+(at (desc Vstrpar) 65535) -- "apple"
 
 ;; 65536 strings with many sharing the same first byte — forces the
 ;; within-bucket sub-sort (strsort_aflag recursion).
 (set Vstrpar2 (take ["a1" "a2" "a3" "a4" "b1" "b2" "c1" "c2"] 65536))
 (count (asc Vstrpar2)) -- 65536
 (at (asc Vstrpar2) 0) -- "a1"
+(at (asc Vstrpar2) 65535) -- "c2"
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; 8. sort_table_by_keys error/edge paths
@@ -241,6 +258,12 @@
 
 (set Tmc_small (table [a b] (list (as 'I32 (take [5 1 3 4 2] 5000)) (as 'I32 (take [10 7 8 9 6] 5000)))))
 (count (xasc Tmc_small ['a 'b])) -- 5000
+;; Order: rows cycle the pairs (5,10)(1,7)(3,8)(4,9)(2,6); xasc on [a b]
+;; puts a=1 (b=7) first and a=5 (b=10) last.
+(at (at (xasc Tmc_small ['a 'b]) 'a) 0) -- 1
+(at (at (xasc Tmc_small ['a 'b]) 'b) 0) -- 7
+(at (at (xasc Tmc_small ['a 'b]) 'a) 4999) -- 5
+(at (at (xasc Tmc_small ['a 'b]) 'b) 4999) -- 10
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; 12. Multi-column composite sort with tiny n (<= RADIX_SORT_THRESHOLD=4096)
@@ -250,11 +273,24 @@
 (set Tmc_tiny (table [a b] (list (as 'I32 (take [5 1 3 4 2] 100)) (as 'I16 (take [10 7 8 9 6] 100)))))
 (count (xasc Tmc_tiny ['a 'b])) -- 100
 (count (xdesc Tmc_tiny ['a 'b])) -- 100
+;; Order: xasc → a=1 (b=7) first, a=5 (b=10) last; xdesc reverses primary key.
+(at (at (xasc Tmc_tiny ['a 'b]) 'a) 0) -- 1
+(at (at (xasc Tmc_tiny ['a 'b]) 'b) 0) -- 7
+(at (at (xasc Tmc_tiny ['a 'b]) 'a) 99) -- 5
+(at (at (xdesc Tmc_tiny ['a 'b]) 'a) 0) -- 5
+(at (at (xdesc Tmc_tiny ['a 'b]) 'b) 0) -- 10
+(at (at (xdesc Tmc_tiny ['a 'b]) 'a) 99) -- 1
 
 ;; Multi-column sort with U8 secondary key (hits BOOL/U8 range computation lines 2740-2745).
 (set Tmc_u8 (table [a b] (list (as 'I32 (take [5 1 3 4 2] 100)) (as 'U8 (take [3 1 5 0 2] 100)))))
 (count (xasc Tmc_u8 ['a 'b])) -- 100
 (count (xdesc Tmc_u8 ['a 'b])) -- 100
+;; Pairs cycle (5,3)(1,1)(3,5)(4,0)(2,2); xasc → a=1 first, a=5 last; xdesc reverses.
+(at (at (xasc Tmc_u8 ['a 'b]) 'a) 0) -- 1
+(at (at (xasc Tmc_u8 ['a 'b]) 'b) 0) -- 0x01
+(at (at (xasc Tmc_u8 ['a 'b]) 'a) 99) -- 5
+(at (at (xdesc Tmc_u8 ['a 'b]) 'a) 0) -- 5
+(at (at (xdesc Tmc_u8 ['a 'b]) 'a) 99) -- 1
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; 17. exec_sort null propagation (lines 3319-3322)
@@ -265,10 +301,24 @@
 
 (set Tnull (table [k v] (list (as 'I64 [3 0Nl 1 0Nl 2]) (as 'F64 [30.0 0.0 10.0 0.0 20.0]))))
 (count (at (select {from: Tnull asc: k}) 'k)) -- 5
+;; Order: this exec_sort (select asc) path sorts NON-null ascending first
+;; (1,2,3) with nulls at the TAIL.
+(at (at (select {from: Tnull asc: k}) 'k) 0) -- 1
+(at (at (select {from: Tnull asc: k}) 'k) 2) -- 3
+(nil? (at (at (select {from: Tnull asc: k}) 'k) 4)) -- true
 
 ;; sort_table_by_keys (xasc) with a null column.
 (set Tnullxasc (table [k v] (list (as 'I64 [3 0Nl 1 0Nl 2]) (as 'F64 [30.0 0.0 10.0 0.0 20.0]))))
 (count (xasc Tnullxasc 'k)) -- 5
+;; Order: xasc (sort_table_by_keys) sorts nulls FIRST (k/q convention),
+;; then ascending 1,2,3.
+;; NOTE: this DISAGREES with the (select {asc:}) exec_sort path above,
+;; which sinks nulls to the TAIL.  Same data, two code paths, two null
+;; orderings.  Bare (asc vector) also puts nulls first (see line 406 /
+;; section 20), so exec_sort's null-last behaviour is the odd one out.
+(nil? (at (at (xasc Tnullxasc 'k) 'k) 0)) -- true
+(at (at (xasc Tnullxasc 'k) 'k) 2) -- 1
+(at (at (xasc Tnullxasc 'k) 'k) 4) -- 3
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; 18. exec_sort with expression-based sort key (lines 3135-3140, 3337)
@@ -330,10 +380,14 @@
 ;; I64 with nulls, desc sort (large N to use radix encoder).
 (set Vi64nulldesc (as 'I64 (take [100000000 0Nl 50000000 0Nl 99999999 3 75000000 0Nl 25000000 5] 8193)))
 (at (desc Vi64nulldesc) 8192) -- 0Nl
+;; desc: largest non-null value sorts first (nulls sink to the tail).
+(at (desc Vi64nulldesc) 0) -- 100000000
 
 ;; I32 with nulls, desc sort.
 (set Vi32nulldesc (as 'I32 (take [20000000 0Nl 10000000 0Nl 19999999 3 15000000 0Nl 5000000 5] 8193)))
 (at (desc Vi32nulldesc) 8192) -- 0Ni
+;; desc: largest non-null value sorts first.
+(at (desc Vi32nulldesc) 0) -- 20000000
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; 16. sort_str_msd_inplace with null strings (lines 1625-1636,1809-1815)
@@ -348,8 +402,14 @@
 ;; n=200 > 64 so MSD path is entered.
 (set Tstrwnull (table [s v] (list (as 'STR (take [1 0Nl 3 0Nl 5] 200)) (take [10 20 30 40 50] 200))))
 (count (xasc Tstrwnull 's)) -- 200
+;; asc: 80 nulls sort FIRST, then "1","3","5"; last element is the max "5".
+(nil? (at (at (xasc Tstrwnull 's) 's) 0)) -- true
+(at (at (xasc Tstrwnull 's) 's) 80) -- "1"
+(at (at (xasc Tstrwnull 's) 's) 199) -- "5"
 ;; desc: hits lines 1809-1815 (reverse the null rotation for desc order).
 (count (xdesc Tstrwnull 's)) -- 200
+;; desc: largest non-null "5" sorts first.
+(at (at (xdesc Tstrwnull 's) 's) 0) -- "5"
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; 20. I32 null ASC radix encoding (line 993)
@@ -373,13 +433,24 @@
 ;; 2-column table with 70000 rows: exec_sort multi-key, gather_rows > 65536.
 (set Tpar2col (table [a b] (list (as 'I32 (take [5 1 3 4 2] 70000)) (as 'I32 (take [10 7 8 9 6] 70000)))))
 (count (select {from: Tpar2col asc: [a b]})) -- 70000
+;; Order after parallel gather: a=1 (b=7) first, a=5 (b=10) last.
+(at (at (select {from: Tpar2col asc: [a b]}) 'a) 0) -- 1
+(at (at (select {from: Tpar2col asc: [a b]}) 'b) 0) -- 7
+(at (at (select {from: Tpar2col asc: [a b]}) 'a) 69999) -- 5
 
 ;; sort_table_by_keys (xasc) with n > 65536: parallel gather (single-key partitioned_gather).
 (set Tpar1col (table [a b] (list (as 'I32 (take [5 1 3 4 2] 70000)) (take [10 7 8 9 6] 70000))))
 (count (xasc Tpar1col 'a)) -- 70000
+;; Order: a ascending → first 1, last 5.
+(at (at (xasc Tpar1col 'a) 'a) 0) -- 1
+(at (at (xasc Tpar1col 'a) 'a) 69999) -- 5
 
 ;; sort_table_by_keys (xasc) with n > 65536 AND multi-key: parallel multi_gather_fn (line 3579).
 (count (xasc Tpar2col ['a 'b])) -- 70000
+;; Order: a=1 (b=7) first, a=5 (b=10) last.
+(at (at (xasc Tpar2col ['a 'b]) 'a) 0) -- 1
+(at (at (xasc Tpar2col ['a 'b]) 'b) 0) -- 7
+(at (at (xasc Tpar2col ['a 'b]) 'a) 69999) -- 5
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; 22. Parallel STR sort emit for pre-sorted data (lines 1670, 1677, 1686)
@@ -392,13 +463,21 @@
 ;; Pre-sort 65536 strings ascending, then call asc again → run_dir=+1, go_parallel=true → line 1670.
 (set Vstrsorted (asc (take ["zebra" "apple" "mango" "banana" "cherry" "kiwi" "lemon" "orange" "papaya" "grape" "avocado" "blueberry" "coconut" "date" "elderberry" "fig"] 65536)))
 (count (asc Vstrsorted)) -- 65536
+;; Re-sorting sorted data stays sorted: min first, max last.
+(at (asc Vstrsorted) 0) -- "apple"
+(at (asc Vstrsorted) 65535) -- "zebra"
 
 ;; Call desc on already-ascending data → run_dir=+1 but want_asc=false → line 1686.
 (count (desc Vstrsorted)) -- 65536
+;; desc of sorted data: max first, min last.
+(at (desc Vstrsorted) 0) -- "zebra"
+(at (desc Vstrsorted) 65535) -- "apple"
 
 ;; Pre-sort descending, then call desc again → run_dir=-1, want_asc=false → line 1677.
 (set Vstrsorteddesc (desc (take ["zebra" "apple" "mango" "banana" "cherry" "kiwi" "lemon" "orange" "papaya" "grape" "avocado" "blueberry" "coconut" "date" "elderberry" "fig"] 65536)))
 (count (desc Vstrsorteddesc)) -- 65536
+(at (desc Vstrsorteddesc) 0) -- "zebra"
+(at (desc Vstrsorteddesc) 65535) -- "apple"
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; 23. Multi-key sort with unsupported column type (lines 2437-2438)
@@ -414,6 +493,9 @@
 ;; The sort falls back to merge-sort (sort_cmp returns 0 for LIST, so stable).
 (set Tlistkey (table [a b] (list (as 'I32 (til 100)) (take (list [1 2] [3 4] [5 6]) 100))))
 (count (xasc Tlistkey ['a 'b])) -- 100
+;; Primary key a = til 100 (already ascending); LIST key is stable → a stays 0..99.
+(at (at (xasc Tlistkey ['a 'b]) 'a) 0) -- 0
+(at (at (xasc Tlistkey ['a 'b]) 'a) 99) -- 99
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; 24. F64 IEEE NaN encoding (line 968)
@@ -431,6 +513,13 @@
 (set Vnreal (take Vnanbase 8192))
 (count (asc Vnreal)) -- 8192
 (count (desc Vnreal)) -- 8192
+;; Order: real NaN is treated as least (sorts FIRST in asc, like a null),
+;; so the finite values 1.0,2.0,3.0 follow in order; max 3.0 is last.
+(nil? (at (asc Vnreal) 0)) -- true
+(at (asc Vnreal) 8191) -- 3.0
+;; desc: finite max 3.0 first; NaN sinks to the tail.
+(at (desc Vnreal) 0) -- 3.0
+(nil? (at (desc Vnreal) 8191)) -- true
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; 25. NARROW-WIDTH SYM sort (W8) — radix_encode_fn RAY_SYM arm
@@ -465,6 +554,14 @@
 (set Tsw8x (table [k s v] (list (as 'I32 (% (til 8192) 7)) (take Vw8 8192) (as 'I64 (til 8192)))))
 (count (xasc Tsw8x ['s 'k])) -- 8192
 (count (xdesc Tsw8x ['s 'k])) -- 8192
+;; Primary key s ascending → 'aa first, 'zz last; xdesc reverses.
+(at (at (xasc Tsw8x ['s 'k]) 's) 0) -- 'aa
+(at (at (xasc Tsw8x ['s 'k]) 's) 8191) -- 'zz
+(at (at (xdesc Tsw8x ['s 'k]) 's) 0) -- 'zz
+(at (at (xdesc Tsw8x ['s 'k]) 's) 8191) -- 'aa
+;; Within a primary-key block, secondary key k must be ascending under xasc:
+;; the very first 'aa row carries the smallest k present among 'aa rows.
+(<= (at (at (xasc Tsw8x ['s 'k]) 'k) 0) (at (at (xasc Tsw8x ['s 'k]) 'k) 1)) -- true
 
 ;; Sort with NULLS FIRST/LAST on narrow SYM via splayed round-trip.
 ;; SYM has 0 as null id; CSV path won't emit nulls, but the splayed

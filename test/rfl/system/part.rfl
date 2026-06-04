@@ -62,6 +62,18 @@
 ;; non-date partition keys land under the 'part column name
 (first (key Pi)) -- 'part
 (key Pi) -- ['part 'n]
+;; verify the actual column VALUES read off disk, in lexical partition order
+;; (100, 200, 300): IT-A=[100 101], IT-B=[200 201 202], IT-C=[300]
+;; BUG: a whole-column read of a parted INT column returns it UN-materialized
+;;   (still segmented) — `(at Pi 'n)` yields "<?>" instead of the vector.
+;;   Same class as the STR/SYM all-pass bug.  Aggregates (sum/min/max) have a
+;;   parted path, and a PARTIAL filter materialises the survivors, so verify
+;;   values through those instead of forcing the broken whole-column compare.
+(sum (at Pi 'n)) -- 1104
+(min (at Pi 'n)) -- 100
+(max (at Pi 'n)) -- 300
+;; partial filter (drops the n=100 row) → materialised column to check ordering
+(at (select {from: Pi where: (> n 100)}) 'n) -- [101 200 201 202 300]
 
 ;; ────────────── sym-partition path: RAY_MC_SYM branch ──────────────
 ;; Names like "1.2.3" pass collect_part_dirs' digit/dot filter (and
@@ -80,6 +92,13 @@
 ;; sym-typed partition keys also report under 'part
 (first (key Ps)) -- 'part
 (key Ps) -- ['part 'v]
+;; verify VALUES: ST-A=[1 2 3] in 1.2.3, ST-B=[4 5] in 4.5.6 (lexical order)
+;; BUG (whole-column parted read returns un-materialised) — use sum + a
+;; partial filter for the value-check.
+(sum (at Ps 'v)) -- 15
+(min (at Ps 'v)) -- 1
+(max (at Ps 'v)) -- 5
+(at (select {from: Ps where: (> v 1)}) 'v) -- [2 3 4 5]
 
 ;; ────────────── single-partition root ──────────────
 ;; ray_read_parted has no part_count==1 fast-return; it always runs
@@ -91,6 +110,12 @@
 (count Psp) -- 4
 (count (key Psp)) -- 2
 (first (key Psp)) -- 'date
+;; verify VALUES read off the single splayed partition: SP=[7 8 9 10]
+;; BUG (whole-column parted read un-materialised) — use sum + a partial filter.
+(sum (at Psp 'x)) -- 34
+(min (at Psp 'x)) -- 7
+(max (at Psp 'x)) -- 10
+(at (select {from: Psp where: (> x 7)}) 'x) -- [8 9 10]
 
 ;; ────────────── three-partition concatenation ordering ──────────────
 ;; Bubble-sort in collect_part_dirs (lines 164-172) reorders dir
@@ -107,6 +132,15 @@
 (count Pt) -- 6
 (count (key Pt)) -- 2
 (first (key Pt)) -- 'date
+;; verify the sort actually concatenates in DATE order, not insertion order:
+;; TR-1=[1]@01.01, TR-2=[2 2]@02.02, TR-3=[3 3 3]@03.03 → [1 2 2 3 3 3]
+;; BUG (whole-column parted read un-materialised) — use sum + a partial filter.
+(sum (at Pt 'n)) -- 14
+(min (at Pt 'n)) -- 1
+(max (at Pt 'n)) -- 3
+;; partial filter on date proves the per-partition concat order: dropping the
+;; first partition leaves the 2nd+3rd → [2 2 3 3 3]
+(at (select {from: Pt where: (> date 2024.01.01)}) 'n) -- [2 2 3 3 3]
 
 ;; ────────────── grouped count(distinct) over parted input ──────────────
 ;; Regression for the non-agg scatter path used by analytical grouped
@@ -151,6 +185,12 @@
 (count (select {from: Plk where: (like url "*google*")})) -- 2
 (count (select {from: Plk where: (like title "*google*")})) -- 2
 (count (select {from: Plk where: (and (!= url 'plain) (like url "*google*"))})) -- 2
+;; verify the predicate selects the RIGHT rows (not just the right count).
+;; Partial filters drop ≥1 row, so the SYM/STR cols materialise.
+;; LK-A url=['alpha 'google 'docs], LK-B url=['googlemaps 'plain 'news]
+(at (select {from: Plk where: (like url "*google*")}) 'url) -- ['google 'googlemaps]
+(at (select {from: Plk where: (like title "*google*")}) 'title) -- ["search google" "google news"]
+(at (select {from: Plk where: (and (!= url 'plain) (like url "*google*"))}) 'url) -- ['google 'googlemaps]
 
 ;; ────────────── .db.parted.mount over int partitions ──────────────
 ;; Mount needs at least one digit/dot subdir (dir_is_parted_root) and
@@ -163,6 +203,12 @@
 ;; t is now a global, equal to the .db.parted.get round-trip
 (count t) -- 6
 (count (key t)) -- 2
+;; the mounted table must carry the same VALUES as the .db.parted.get round-trip
+;; BUG (whole-column parted read un-materialised) — use sum + a partial filter.
+(sum (at t 'n)) -- 1104
+(min (at t 'n)) -- 100
+(max (at t 'n)) -- 300
+(at (select {from: t where: (> n 100)}) 'n) -- [101 200 201 202 300]
 
 ;; ────────────── error: empty db_root (collect_part_dirs IO) ──────────────
 ;; Directory exists but has zero matching subdirs.  collect_part_dirs

@@ -69,7 +69,9 @@
 ;; just be VALID on surviving rows, which a fully-evaluated bool
 ;; column is).  All four orderings must agree on the same row set.
 (count (select {from: T0 where: (and (!= k 'C) (< v 500) (> v 100))})) -- 266
+(sum (at (select {from: T0 where: (and (!= k 'C) (< v 500) (> v 100))}) 'v)) -- 79933
 (count (select {from: T0 where: (and (< v 500) (!= k 'C) (> v 100))})) -- 266
+(sum (at (select {from: T0 where: (and (< v 500) (!= k 'C) (> v 100))}) 'v)) -- 79933
 (sum (at (select {from: T0 where: (and (< v 500) (> v 100) (!= k 'C))}) 'v)) -- 79933
 
 ;; ====================================================================
@@ -132,6 +134,7 @@
 (sum (at (select {from: T1 where: (and (> v 100) (< v 500) (like s "a*"))}) 'v)) -- 39900
 ;; LIKE written first — planner sorts it to last.  Same answer.
 (count (select {from: T1 where: (and (like s "a*") (> v 100) (< v 500))})) -- 133
+(sum (at (select {from: T1 where: (and (like s "a*") (> v 100) (< v 500))}) 'v)) -- 39900
 
 ;; ====================================================================
 ;; `reorder_safe = 0` guard — a conjunct containing an op the cost

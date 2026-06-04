@@ -40,8 +40,10 @@
 (at (at (select {k: k from: Tu8 where: (>= sel 0) asc: k take: 3}) 'k) 0) -- (as 'U8 5)
 (at (at (select {k: k from: Tu8 where: (>= sel 0) asc: k take: 3}) 'k) 1) -- (as 'U8 10)
 (at (at (select {k: k from: Tu8 where: (>= sel 0) asc: k take: 3}) 'k) 2) -- (as 'U8 15)
-;; DESC
+;; DESC: full ordered top-3 (largest three, sorted desc)
 (at (at (select {k: k from: Tu8 where: (>= sel 0) desc: k take: 3}) 'k) 0) -- (as 'U8 50)
+(at (at (select {k: k from: Tu8 where: (>= sel 0) desc: k take: 3}) 'k) 1) -- (as 'U8 45)
+(at (at (select {k: k from: Tu8 where: (>= sel 0) desc: k take: 3}) 'k) 2) -- (as 'U8 40)
 
 ;; =====================================================================
 ;; 3. BOOL sort key — type gate acceptance + esz==1
@@ -49,8 +51,21 @@
 (set Tbool (table [k v] (list (as 'BOOL [true false true false true false true false]) (til 8))))
 ;; ASC: false (0) before true (1) — top 3 ASC = three false rows
 (count (select {k: k from: Tbool where: (>= v 0) asc: k take: 3})) -- 3
+;; all three selected keys must be false, and they must be the false-row
+;; source positions (v = 1,3,5) in stable order
+(at (at (select {k: k from: Tbool where: (>= v 0) asc: k take: 3}) 'k) 0) -- false
+(at (at (select {k: k from: Tbool where: (>= v 0) asc: k take: 3}) 'k) 1) -- false
+(at (at (select {k: k from: Tbool where: (>= v 0) asc: k take: 3}) 'k) 2) -- false
+(at (at (select {k: k v: v from: Tbool where: (>= v 0) asc: k take: 3}) 'v) 0) -- 1
+(at (at (select {k: k v: v from: Tbool where: (>= v 0) asc: k take: 3}) 'v) 1) -- 3
+(at (at (select {k: k v: v from: Tbool where: (>= v 0) asc: k take: 3}) 'v) 2) -- 5
 ;; DESC: true (1) before false (0) — top 3 DESC = three true rows
 (at (at (select {k: k from: Tbool where: (>= v 0) desc: k take: 3}) 'k) 0) -- true
+(at (at (select {k: k from: Tbool where: (>= v 0) desc: k take: 3}) 'k) 1) -- true
+(at (at (select {k: k from: Tbool where: (>= v 0) desc: k take: 3}) 'k) 2) -- true
+(at (at (select {k: k v: v from: Tbool where: (>= v 0) desc: k take: 3}) 'v) 0) -- 0
+(at (at (select {k: k v: v from: Tbool where: (>= v 0) desc: k take: 3}) 'v) 1) -- 2
+(at (at (select {k: k v: v from: Tbool where: (>= v 0) desc: k take: 3}) 'v) 2) -- 4
 
 ;; =====================================================================
 ;; 4. DATE sort key — temporal type gate (esz==4)
@@ -59,24 +74,28 @@
 ;; ASC: earliest dates first
 (at (at (select {d: d from: Td where: (>= v 0) asc: d take: 2}) 'd) 0) -- 2025.01.01
 (at (at (select {d: d from: Td where: (>= v 0) asc: d take: 2}) 'd) 1) -- 2025.02.10
-;; DESC: latest dates first
+;; DESC: latest dates first (both rows in order)
 (at (at (select {d: d from: Td where: (>= v 0) desc: d take: 2}) 'd) 0) -- 2025.12.31
+(at (at (select {d: d from: Td where: (>= v 0) desc: d take: 2}) 'd) 1) -- 2025.06.20
 
 ;; =====================================================================
 ;; 5. TIME sort key — temporal type gate (esz==4)
 ;; =====================================================================
 (set Tt (table [t v] (list (as 'TIME [12:00:00.000 09:30:00.000 15:45:00.000 06:15:00.000]) (til 4))))
-;; ASC
+;; ASC: both rows in ascending order
 (at (at (select {t: t from: Tt where: (>= v 0) asc: t take: 2}) 't) 0) -- 06:15:00.000
-;; DESC
+(at (at (select {t: t from: Tt where: (>= v 0) asc: t take: 2}) 't) 1) -- 09:30:00.000
+;; DESC: both rows in descending order
 (at (at (select {t: t from: Tt where: (>= v 0) desc: t take: 2}) 't) 0) -- 15:45:00.000
+(at (at (select {t: t from: Tt where: (>= v 0) desc: t take: 2}) 't) 1) -- 12:00:00.000
 
 ;; =====================================================================
 ;; 6. TIMESTAMP sort key — temporal type gate (esz==8)
 ;; =====================================================================
 (set Tts (table [ts v] (list (as 'TIMESTAMP [2025.01.01D12:00:00.000 2025.06.15D08:30:00.000 2025.03.20D16:45:00.000]) (til 3))))
-;; ASC
+;; ASC: both rows in ascending order
 (at (at (select {ts: ts from: Tts where: (>= v 0) asc: ts take: 2}) 'ts) 0) -- 2025.01.01D12:00:00.000
+(at (at (select {ts: ts from: Tts where: (>= v 0) asc: ts take: 2}) 'ts) 1) -- 2025.03.20D16:45:00.000
 
 ;; =====================================================================
 ;; 7. SYM sort key DESC — fpk_cmp SYM + desc branch
@@ -126,6 +145,9 @@
 (at (at (select {v: v from: Tand2 where: (and (>= g 3) (< g 6)) asc: v take: 5}) 'v) 0) -- 3
 (at (at (select {v: v from: Tand2 where: (and (>= g 3) (< g 6)) asc: v take: 5}) 'v) 1) -- 4
 (at (at (select {v: v from: Tand2 where: (and (>= g 3) (< g 6)) asc: v take: 5}) 'v) 2) -- 5
+;; full ordered window — last two rows wrap to the next decade (13,14)
+(at (at (select {v: v from: Tand2 where: (and (>= g 3) (< g 6)) asc: v take: 5}) 'v) 3) -- 13
+(at (at (select {v: v from: Tand2 where: (and (>= g 3) (< g 6)) asc: v take: 5}) 'v) 4) -- 14
 
 ;; =====================================================================
 ;; 12. Aliased output column (out_alias_syms non-NULL path)
@@ -139,8 +161,13 @@
 ;; =====================================================================
 (set Tbig (table [k v] (list (% (til 5000) 100) (til 5000))))
 (count (select {v: v from: Tbig where: (>= k 0) asc: v take: 10})) -- 10
-;; Top 10 ASC by v = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}
+;; Top 10 ASC by v = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9} — endpoints + interior
+;; (interior checks guard against a worker-merge that drops/reorders rows)
 (at (at (select {v: v from: Tbig where: (>= k 0) asc: v take: 10}) 'v) 0) -- 0
+(at (at (select {v: v from: Tbig where: (>= k 0) asc: v take: 10}) 'v) 1) -- 1
+(at (at (select {v: v from: Tbig where: (>= k 0) asc: v take: 10}) 'v) 4) -- 4
+(at (at (select {v: v from: Tbig where: (>= k 0) asc: v take: 10}) 'v) 5) -- 5
+(at (at (select {v: v from: Tbig where: (>= k 0) asc: v take: 10}) 'v) 8) -- 8
 (at (at (select {v: v from: Tbig where: (>= k 0) asc: v take: 10}) 'v) 9) -- 9
 
 ;; =====================================================================

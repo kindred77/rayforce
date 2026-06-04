@@ -45,12 +45,29 @@
 (count Trades)  -- 2
 (count Quotes)  -- 2
 (count Returns) -- 2
+;; Cardinality alone can't tell a correctly-loaded table from a stub of
+;; the same row count: pin the round-tripped COLUMN VALUES too.  Each
+;; mounted global must carry the exact cells written to disk.
+(sum (at Trades 'p))  -- 300.0       ;; [100.0 200.0]
+(sum (at Quotes 'b))  -- 298.0       ;; [99.0 199.0]
+(sum (at Quotes 'a))  -- 302.0       ;; [101.0 201.0]
+(sum (at Returns 'r)) -- -0.01       ;; [0.01 -0.02]
+;; sym column survives the round trip cell-for-cell.
+(at (at Trades 's) 0) -- 'AAPL
+(at (at Trades 's) 1) -- 'GOOG
 
 ;; The returned dict's values are the same tables (dict round-trip
 ;; preserves identity-equivalence via atom_eq on each cell).
 (count (at M 'Trades))  -- 2
 (count (at M 'Quotes))  -- 2
 (count (at M 'Returns)) -- 2
+;; The dict keys are exactly the three on-disk table names, and indexing
+;; the dict yields the same VALUES as the bound globals (not just equal
+;; counts).
+(key M) -- ['Quotes 'Returns 'Trades]
+(sum (at (at M 'Trades) 'p))  -- 300.0
+(sum (at (at M 'Quotes) 'b))  -- 298.0
+(sum (at (at M 'Returns) 'r)) -- -0.01
 
 ;; ────────────── parted mount: 2 partitions × 2 tables ──────────────
 ;; Pre-fix: get-parted required a /<root>/sym file (which set-splayed
@@ -70,9 +87,24 @@
 (set Mp (.db.parted.mount "/tmp/rfl_mount_parted/"))
 (type Mp) -- 'DICT
 (count Mp) -- 2
+;; The mount dict is keyed by the per-partition table names discovered
+;; under the first partition.
+(key Mp) -- ['B 'A]
 ;; A and B are now globals — each is the concatenated 2-partition view.
 (count A) -- 4   ;; 2 partitions × 2 rows each
 (count B) -- 4
+;; Cardinality says "4 rows" but not WHICH rows: verify the concatenated
+;; 'v column carries both partitions' values.  A = [1 2] (01.01) + [3 4]
+;; (01.02); B = [5 6] (01.01) + [7 8] (01.02).
+;; BUG: a raw whole-column read `(at A 'v)` returns the parted column
+;; UN-MATERIALISED (renders as <?>), so value-check via aggregates (which
+;; have a parted code path).
+(sum (at A 'v)) -- 10
+(min (at A 'v)) -- 1
+(max (at A 'v)) -- 4
+(sum (at B 'v)) -- 26
+(min (at B 'v)) -- 5
+(max (at B 'v)) -- 8
 
 ;; ────────────── error path: not a parted root ──────────────
 ;; The splayed root from the first test has no partition directories,

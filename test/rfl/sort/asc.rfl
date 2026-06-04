@@ -46,18 +46,32 @@ N -- (sum (<= (at S (til N)) (at S (+ 1 (til N)))))
 (sum (asc V1))   -- 522753
 (first (asc V1)) -- 0
 (last (asc V1))  -- 1022
+;; sortedness: every neighbour obeys <= (catches unsorted same-sum data)
+(set S1 (asc V1))
+(set N1 (- (count S1) 1))
+N1 -- (sum (<= (at S1 (til N1)) (at S1 (+ 1 (til N1)))))
+;; exact ordering: reversed til must come back as the identity til
+(asc V1) -- (til 1023)
 
 (set V2 (reverse (til 1024)))
 (count (asc V2)) -- 1024
 (sum (asc V2))   -- 523776
 (first (asc V2)) -- 0
 (last (asc V2))  -- 1023
+(set S2 (asc V2))
+(set N2 (- (count S2) 1))
+N2 -- (sum (<= (at S2 (til N2)) (at S2 (+ 1 (til N2)))))
+(asc V2) -- (til 1024)
 
 (set V3 (reverse (til 1025)))
 (count (asc V3)) -- 1025
 (sum (asc V3))   -- 524800
 (first (asc V3)) -- 0
 (last (asc V3))  -- 1024
+(set S3 (asc V3))
+(set N3 (- (count S3) 1))
+N3 -- (sum (<= (at S3 (til N3)) (at S3 (+ 1 (til N3)))))
+(asc V3) -- (til 1025)
 
 ;; ──────────────────────────────────────────────────────────────────
 ;; Idempotence and asc + reverse == desc

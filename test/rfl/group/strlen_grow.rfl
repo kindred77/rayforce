@@ -39,6 +39,20 @@
 (sum (at (select {l: (sum (strlen s)) by: k from: Tss}) 'l)) -- 2560
 ;; AVG: same as sum since each group has one row.
 (sum (at (select {l: (avg (strlen s)) by: k from: Tss}) 'l)) -- 2560.0
+;; Order-independent per-group value checks via key-masked SOURCE lookup.
+;; The grand-total above collapses all 1000 groups — it can pass even if the
+;; wrong sym landed in a group.  Pin specific (key -> sym -> strlen) bindings
+;; so the right string must have grouped under the right int key, and assert
+;; the group-key column reproduces the masked key.
+;;   key 250000 = row 250 -> sym (250%300)='250 -> strlen 3
+(first (at (select {l: (sum (strlen s)) by: k from: Tss where: (== k 250000)}) 'l)) -- 3
+(first (at (select {l: (sum (strlen s)) by: k from: Tss where: (== k 250000)}) 'k)) -- 250000
+;;   key 5000 = row 5 -> sym '5 -> strlen 1
+(first (at (select {l: (sum (strlen s)) by: k from: Tss where: (== k 5000)}) 'l)) -- 1
+(first (at (select {l: (sum (strlen s)) by: k from: Tss where: (== k 5000)}) 'k)) -- 5000
+;;   key 99000 = row 99 -> sym '99 -> strlen 2
+(first (at (select {l: (sum (strlen s)) by: k from: Tss where: (== k 99000)}) 'l)) -- 2
+(first (at (select {l: (sum (strlen s)) by: k from: Tss where: (== k 99000)}) 'k)) -- 99000
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; group_strlen_at_cached — STR column path (not SYM) via sparse HT
@@ -49,6 +63,18 @@
 ;; 4 groups, 1 row each.  Total strlen = 0+1+2+4 = 7.
 (count (select {l: (sum (strlen u)) by: k from: Tstr})) -- 4
 (sum (at (select {l: (sum (strlen u)) by: k from: Tstr}) 'l)) -- 7
+;; Per-group value checks via key-masked SOURCE lookup — the total of 7
+;; collapses all four groups and can pass under a mis-grouping.  Pin each
+;; (key -> string -> strlen) pair and assert the group-key column.
+;;   key 3000000 = row 3 -> "abcd" -> strlen 4
+(first (at (select {l: (sum (strlen u)) by: k from: Tstr where: (== k 3000000)}) 'l)) -- 4
+(first (at (select {l: (sum (strlen u)) by: k from: Tstr where: (== k 3000000)}) 'k)) -- 3000000
+;;   key 0 = row 0 -> "" -> strlen 0
+(first (at (select {l: (sum (strlen u)) by: k from: Tstr where: (== k 0)}) 'l)) -- 0
+(first (at (select {l: (sum (strlen u)) by: k from: Tstr where: (== k 0)}) 'k)) -- 0
+;;   key 2000000 = row 2 -> "yz" -> strlen 2
+(first (at (select {l: (sum (strlen u)) by: k from: Tstr where: (== k 2000000)}) 'l)) -- 2
+(first (at (select {l: (sum (strlen u)) by: k from: Tstr where: (== k 2000000)}) 'k)) -- 2000000
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; grpt_ht_grow_slots — exec_group_topk_rowform partition HT grow
@@ -71,3 +97,12 @@
 (sum (at (select {t: (top v 1) by: k from: Ttk}) 't)) -- 719999400000
 ;; Bot-1 sum identical (group size 1).
 (sum (at (select {b: (bot v 1) by: k from: Ttk}) 'b)) -- 719999400000
+;; Per-group value checks via key-masked SOURCE lookup — the grand sums above
+;; collapse all 1.2M groups and can pass even if a key picked the wrong row's
+;; value.  v == k for every row, so top-1/bot-1 of the masked group is the key.
+;;   key 987654 -> only row v=987654 -> top-1 = [987654] (per-group list)
+(first (first (at (select {t: (top v 1) by: k from: Ttk where: (== k 987654)}) 't))) -- 987654
+(first (at (select {t: (top v 1) by: k from: Ttk where: (== k 987654)}) 'k)) -- 987654
+;;   key 1000 -> only row v=1000 -> bot-1 = [1000] (per-group list)
+(first (first (at (select {b: (bot v 1) by: k from: Ttk where: (== k 1000)}) 'b))) -- 1000
+(first (at (select {b: (bot v 1) by: k from: Ttk where: (== k 1000)}) 'k)) -- 1000

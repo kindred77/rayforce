@@ -31,6 +31,9 @@
 ;; Large list — force the parallel-dispatch path (if thresholded)
 (set BIG (til 1000))
 (count (pmap (fn [x] (+ x 1)) BIG)) -- 1000
+;; value-check: BIG = [0 1 .. 999], so (+ x 1) = [1 2 .. 1000]
+(first (pmap (fn [x] (+ x 1)) BIG)) -- 1
+(last (pmap (fn [x] (+ x 1)) BIG)) -- 1000
 (sum (pmap (fn [x] (+ x 1)) BIG)) -- (+ 1000 (sum BIG))
 
 ;; Wrapper equivalence: pmap == map on the same input
@@ -40,7 +43,13 @@
 
 ;; Result type/count invariants
 (count (pmap (fn [x] x) [1 2 3 4 5])) -- 5
+;; value-check: identity map returns input unchanged
+(pmap (fn [x] x) [1 2 3 4 5]) -- [1 2 3 4 5]
 (count (pmap (fn [x] (* x x)) (til 50))) -- 50
+;; value-check: (til 50) squared — spot-check endpoints and sum
+(first (pmap (fn [x] (* x x)) (til 50))) -- 0
+(last (pmap (fn [x] (* x x)) (til 50))) -- 2401
+(sum (pmap (fn [x] (* x x)) (til 50))) -- 40425
 
 ;; ─────────────────────────────────────────────────────────────────
 ;; fold-left — left-associative fold wrapper (ray_fold_left_fn)
@@ -114,6 +123,8 @@
 (set W (rand 50 100))
 (count W) -- (count (scan-left + W))
 (count (scan-left * [1 2 3 4 5])) -- 5
+;; value-check: prefix products of [1 2 3 4 5] = [1 2 6 24 120]
+(scan-left * [1 2 3 4 5]) -- [1 2 6 24 120]
 
 ;; last(scan-left + v) equals (fold + 0 v) when v non-empty
 (last (scan-left + [1 2 3 4 5])) -- 15

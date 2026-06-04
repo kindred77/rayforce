@@ -31,18 +31,23 @@
 
 ;; STR column (line 1308) — ray_str_vec_append branch (line 1336)
 (type (at (table ['a] (list (list "p" "q"))) 'a)) -- 'STR
+(at (table ['a] (list (list "p" "q"))) 'a) -- ["p" "q"]
 
 ;; TIMESTAMP column (line 1310) — stored via &i64 (line 1363)
 (type (at (table ['a] (list (list (as 'TIMESTAMP 1) (as 'TIMESTAMP 2)))) 'a)) -- 'TIMESTAMP
+(at (table ['a] (list (list (as 'TIMESTAMP 1) (as 'TIMESTAMP 2)))) 'a) -- [2000.01.01D00:00:00.000000001 2000.01.01D00:00:00.000000002]
 
 ;; DATE column (line 1311)
 (type (at (table ['a] (list (list 2024.01.01 2024.01.02))) 'a)) -- 'DATE
+(at (table ['a] (list (list 2024.01.01 2024.01.02))) 'a) -- [2024.01.01 2024.01.02]
 
 ;; TIME column (line 1312)
 (type (at (table ['a] (list (list 12:00:00.000 13:00:00.000))) 'a)) -- 'TIME
+(at (table ['a] (list (list 12:00:00.000 13:00:00.000))) 'a) -- [12:00:00.000 13:00:00.000]
 
 ;; Default I64 column (no special type, line 1303)
 (type (at (table ['a] (list (list 1 2 3))) 'a)) -- 'I64
+(at (table ['a] (list (list 1 2 3))) 'a) -- [1 2 3]
 
 ;; I64 → F64 promotion: first elem is I64 but a later one is F64
 ;; (scan loop lines 1316-1320, promoted-value branch line 1357-1359)
@@ -75,10 +80,15 @@
 ;; A bare atom column is wrapped into a length-1 typed vector.
 (type (at (table ['a] (list 1.5)) 'a)) -- 'F64
 (count (at (table ['a] (list 1.5)) 'a)) -- 1
+(at (table ['a] (list 1.5)) 'a) -- [1.5]
 (type (at (table ['a] (list 42)) 'a)) -- 'I64
+(at (table ['a] (list 42)) 'a) -- [42]
 (type (at (table ['a] (list true)) 'a)) -- 'B8
+(at (table ['a] (list true)) 'a) -- [true]
 (type (at (table ['a] (list 1i)) 'a)) -- 'I32
+(at (table ['a] (list 1i)) 'a) -- [1i]
 (type (at (table ['a] (list 2024.01.01)) 'a)) -- 'DATE
+(at (table ['a] (list 2024.01.01)) 'a) -- [2024.01.01]
 
 ;; ═══════════════════════════════════════════════════════════════════
 ;; 2. ray_key_fn / ray_value_fn dispatch (eval.c ~1381-1419)
@@ -89,6 +99,7 @@
 (key (table ['a 'b] (list [1 2] [3 4]))) -- ['a 'b]
 ;; value over a TABLE → list of column vectors (line 1402)
 (count (value (table ['a 'b] (list [1 2] [3 4])))) -- 2
+(value (table ['a 'b] (list [1 2] [3 4]))) -- (list [1 2] [3 4])
 ;; value over a DICT → values vector (line 1414)
 (value (dict ['a 'b] [10 20])) -- [10 20]
 ;; key over a non-dict/table → type error (line 1388)
@@ -275,6 +286,9 @@ captured_x -- 77
 (set fn_param_mixed (fn (list a 5) 99))
 ;; ray_type_name has no LAMBDA case → returns '?
 (type fn_param_mixed) -- '?
+;; The lambda is well-formed: 3 "params" (list, a, 5) → call with 3 args
+;; returns the body value 99.
+(fn_param_mixed 'list 1 2) -- 99
 
 ;; ═══════════════════════════════════════════════════════════════════
 ;; 12. ray_eval atom dispatch — non-NAME sym, NULL keyword resolution
@@ -484,6 +498,7 @@ rs_c -- [1 2 3]
 (ret_v 5) -- 10
 (set ret_empty (fn [] (return)))
 (type (ret_empty)) -- 'null
+(nil? (ret_empty)) -- true
 
 ;; ═══════════════════════════════════════════════════════════════════
 ;; 28. Materialise lazy in let / set / if — covers the

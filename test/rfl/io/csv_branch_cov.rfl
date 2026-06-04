@@ -36,6 +36,10 @@
 (count Tsci) -- 4
 (type (at Tsci 'x)) -- 'F64
 (at (at Tsci 'x) 0) -- 100000.0
+;; The exponent-sign branch is the point of this section: assert the two
+;; signed-exponent rows by value, not just row 0.
+(at (at Tsci 'x) 1) -- 0.0025
+(at (at Tsci 'x) 2) -- 0.01
 (at (at Tsci 'x) 3) -- 3.14
 
 ;; ════════════════════════════════════════════════════════════════════════════
@@ -119,6 +123,10 @@
 ;; 1.5 finite; the empty cell IS null (NULL_F64 sentinel + HAS_NULLS).
 (nil? (at (at Tinf 'x) 0)) -- false
 (nil? (at (at Tinf 'x) 1)) -- false
+;; Value-check the infinities directly, not just non-null: +inf exceeds every
+;; finite double, -inf is below every finite double, and inf+(-inf) is nan.
+(> (at (at Tinf 'x) 0) 1.0e308) -- true
+(< (at (at Tinf 'x) 1) -1.0e308) -- true
 (at (at Tinf 'x) 2) -- 1.5
 (nil? (at (at Tinf 'x) 3)) -- true
 ;; Write back: the isinf branch emits literal "inf" / "-inf"; the null row

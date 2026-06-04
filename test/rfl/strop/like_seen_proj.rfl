@@ -40,14 +40,18 @@
 ;;
 ;; Pattern "s0*" matches s00..s09 — 10 of 50 syms, ~20% of 200k rows.
 (count (select {from: TW16 where: (like sym "s0*")})) -- 40000
+(asc (distinct (at (select {from: TW16 where: (like sym "s0*")}) 'sym))) -- ['s00 's01 's02 's03 's04 's05 's06 's07 's08 's09]
 ;; Pattern "s4*" matches s40..s49 — 10 of 50 syms, same 40000 rows.
 (count (select {from: TW16 where: (like sym "s4*")})) -- 40000
+(asc (distinct (at (select {from: TW16 where: (like sym "s4*")}) 'sym))) -- ['s40 's41 's42 's43 's44 's45 's46 's47 's48 's49]
 ;; Suffix pattern "*5" matches s05,s15,s25,s35,s45 — 5 syms, 20000 rows.
 (count (select {from: TW16 where: (like sym "*5")})) -- 20000
+(asc (distinct (at (select {from: TW16 where: (like sym "*5")}) 'sym))) -- ['s05 's15 's25 's35 's45]
 ;; Class pattern "s[12]*" — 20 of 50 syms, 80000 rows.  Forces the
 ;; SHAPE_NONE general matcher per dict entry but the seen/proj kernels
 ;; are the same width-typed loops.
 (count (select {from: TW16 where: (like sym "s[12]*")})) -- 80000
+(asc (distinct (at (select {from: TW16 where: (like sym "s[12]*")}) 'sym))) -- ['s10 's11 's12 's13 's14 's15 's16 's17 's18 's19 's20 's21 's22 's23 's24 's25 's26 's27 's28 's29]
 
 ;; ─── Fixture A2: W16 + selection-aware (SEL_ALL+MIX+NONE) ───
 ;; ray_rowsel_init returns NULL for always-true predicates
@@ -58,11 +62,13 @@
 ;; bitmap walk + line 144 W16 MARK), morsels 99..195 SEL_NONE
 ;; (line 128 continue).  Exercises every selection-aware path on W16.
 (count (select {from: TW16 where: (and (< id 100000) (like sym "s3*"))})) -- 20000
+(asc (distinct (at (select {from: TW16 where: (and (< id 100000) (like sym "s3*"))}) 'sym))) -- ['s30 's31 's32 's33 's34 's35 's36 's37 's38 's39]
 
 ;; Mid-range slice (250 < id < 750) — entirely inside a single morsel
 ;; pair → exclusively MIX morsels with a few SEL_NONE.  Probes the MIX
 ;; width-typed inner loop on W16.
 (count (select {from: TW16 where: (and (and (> id 250) (< id 750)) (like sym "s?5"))})) -- 50
+(asc (distinct (at (select {from: TW16 where: (and (and (> id 250) (< id 750)) (like sym "s?5"))}) 'sym))) -- ['s05 's15 's25 's35 's45]
 
 (.sys.exec "rm -f rfl_strop_w16.csv") -- 0
 
@@ -80,11 +86,19 @@
 ;; match in this fixed-width fixture).  s00000 appears at i=0, 70000,
 ;; 140000 → 3 rows.
 (count (select {from: TW32 where: (like sym "s00000*")})) -- 3
+(first (distinct (at (select {from: TW32 where: (like sym "s00000*")}) 'sym))) -- 's00000
+(count (distinct (at (select {from: TW32 where: (like sym "s00000*")}) 'sym))) -- 1
 ;; "*9" matches every s with id divisible-by-10-...-9 in last digit.
 ;; Out of 70000 unique syms, 7000 end in '9'.  In 200000 rows, 7000 *
 ;; (200000 / 70000 ≈ 2.857) → exact count: rows i where (i%70000)%10==9
 ;; In 0..199999 there are floor(200000/10) = 20000 such rows.
 (count (select {from: TW32 where: (like sym "*9")})) -- 20000
+;; Value-check the matched-sym set: 7000 distinct syms, all ending in '9',
+;; spanning s00009..s69999.  (Full enumeration is impractical at 7000
+;; entries; bound by min/max/distinct-count.)
+(count (distinct (at (select {from: TW32 where: (like sym "*9")}) 'sym))) -- 7000
+(first (asc (distinct (at (select {from: TW32 where: (like sym "*9")}) 'sym)))) -- 's00009
+(last (asc (distinct (at (select {from: TW32 where: (like sym "*9")}) 'sym)))) -- 's69999
 
 ;; Selection-aware on W32 — partial conjunct creates SEL_ALL +
 ;; SEL_NONE + SEL_MIX morsels; the SEL_MIX morsel runs the W32
@@ -97,6 +111,12 @@
 ;; [0..99999]: i mod 70000 ⇒ rows 0..69999 give 7000 hits, rows
 ;; 70000..99999 give 3000 hits (s00000..s29999 segment) → 10000.
 (count (select {from: TW32 where: (and (< id 100000) (like sym "*9"))})) -- 10000
+;; id<100000 still spans every sym (id 0..69999 covers s00000..s69999),
+;; so the matched-sym SET is all 7000 syms ending in '9' (s00009..s69999);
+;; only the row COUNT differs from the unconstrained case.
+(count (distinct (at (select {from: TW32 where: (and (< id 100000) (like sym "*9"))}) 'sym))) -- 7000
+(first (asc (distinct (at (select {from: TW32 where: (and (< id 100000) (like sym "*9"))}) 'sym)))) -- 's00009
+(last (asc (distinct (at (select {from: TW32 where: (and (< id 100000) (like sym "*9"))}) 'sym)))) -- 's69999
 
 (.sys.exec "rm -f rfl_strop_w32.csv") -- 0
 
@@ -112,5 +132,12 @@
 (set TW64 (table [s v] (list (take syms Nrow) (til Nrow))))
 ;; (< v 100000) keeps first 100k rows.  AAA cycle pos 0 → 20000 rows.
 (count (select {from: TW64 where: (and (< v 100000) (like s "AAA"))})) -- 20000
+(first (distinct (at (select {from: TW64 where: (and (< v 100000) (like s "AAA"))}) 's))) -- 'AAA
+(count (distinct (at (select {from: TW64 where: (and (< v 100000) (like s "AAA"))}) 's))) -- 1
 ;; Wildcard "*" matches every sym; constrained to v<100000 → 100000.
 (count (select {from: TW64 where: (and (< v 100000) (like s "*"))})) -- 100000
+;; All-pass wildcard "*" matches every sym; the in-RFL W64 column
+;; materializes fine here (the un-materialized-column bug is specific to
+;; parted/CSV-backed columns, not this in-memory table), so the matched
+;; SET is all 5 cycled syms.
+(asc (distinct (at (select {from: TW64 where: (and (< v 100000) (like s "*"))}) 's))) -- ['AAA 'BBB 'CCC 'DDD 'EEE]

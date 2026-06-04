@@ -1,31 +1,90 @@
 ;; Sort behaviour with nulls.
+;; k/q convention: null sorts FIRST in asc (null is the least value),
+;; LAST in desc. NaN/float-null treated as least the same way.
 
 ;; asc: nulls sort first
 (at (asc [3 0N 1 2]) 0) -- 0Nl
 (at (asc [3 0N 1 2]) 1) -- 1
+;; full ordering: the single null lands at the head, survivors ascend
+(asc [3 0N 1 2]) -- [0Nl 1 2 3]
+(nil? (at (asc [3 0N 1 2]) 0)) -- true
+(at (asc [3 0N 1 2]) 3) -- 3
 
 ;; desc: nulls sort last
 (at (desc [3 0N 1 2]) 3) -- 0Nl
 (at (desc [3 0N 1 2]) 0) -- 3
+;; full ordering: survivors descend, the null lands at the tail
+(desc [3 0N 1 2]) -- [3 2 1 0Nl]
+(nil? (at (desc [3 0N 1 2]) 3)) -- true
 
-;; Length preserved
+;; floats: NaN/float-null is the least value — same placement as ints
+;; (tolerance not needed: every survivor is an exact literal, no arithmetic)
+(asc [3.0 0Nf 1.0 2.0])  -- [0Nf 1.0 2.0 3.0]
+(nil? (at (asc [3.0 0Nf 1.0 2.0]) 0)) -- true
+(desc [3.0 0Nf 1.0 2.0]) -- [3.0 2.0 1.0 0Nf]
+(nil? (at (desc [3.0 0Nf 1.0 2.0]) 3)) -- true
+
+;; Length preserved (multiple nulls) — keep count, but also pin where the
+;; nulls land: both nulls bunch at the head (asc) / tail (desc), survivors sorted
 (count (asc [3 0N 1 0N])) -- 4
 (count (desc [3 0N 1 0N])) -- 4
+(asc [3 0N 1 0N])  -- [0Nl 0Nl 1 3]
+(desc [3 0N 1 0N]) -- [3 1 0Nl 0Nl]
+(nil? (at (asc [3 0N 1 0N]) 0)) -- true
+(nil? (at (asc [3 0N 1 0N]) 1)) -- true
 
 ;; iasc/idesc treat nulls consistently — at-projection roundtrips
 (set V [3 0N 1 2])
 (at V (iasc V)) -- (asc V)
 (at V (idesc V)) -- (desc V)
+;; pin the permutations directly so a bad index order can't roundtrip silently
+(iasc V)  -- [1 2 3 0]
+(idesc V) -- [0 3 2 1]
+;; first index in iasc must point at the null slot (original index 1)
+(at (iasc V) 0) -- 1
+;; first index in idesc must point at the max (original index 0, value 3)
+(at (idesc V) 0) -- 0
 
-;; ────────────── xasc/xdesc on tables with null key columns ──────────────
-;; Same convention: null keys sort first under xasc, count preserved.
+;; ────────────── xasc on tables with null key columns ──────────────
+;; Same convention as (asc vec): null keys sort FIRST under xasc, count preserved.
 (set Tn (table [k v] (list [2 0Nl 1 0Nl 3] [10 20 30 40 50])))
 (at (at (xasc Tn 'k) 'k) 0)               -- 0Nl
 (sum (as 'I64 (== (at (xasc Tn 'k) 'k) 0Nl))) -- 2
 (count (xasc Tn 'k))                       -- 5
+;; pin the full sorted key column AND the payload it dragged along (stable):
+;; both null keys lead, survivors ascend; v reorders to match the key permutation
+(at (xasc Tn 'k) 'k) -- [0Nl 0Nl 1 2 3]
+(at (xasc Tn 'k) 'v) -- [20 40 30 10 50]
+(nil? (at (at (xasc Tn 'k) 'k) 0)) -- true
+(nil? (at (at (xasc Tn 'k) 'k) 1)) -- true
+;; first non-null endpoint after the null block:
+(at (at (xasc Tn 'k) 'k) 2) -- 1
+;; last endpoint:
+(at (at (xasc Tn 'k) 'k) 4) -- 3
+
+;; ────────────── (select {asc:}) exec_sort path — nulls land LAST ──────────────
+;; NOTE: the (select {asc: k}) exec_sort path puts nulls LAST, the OPPOSITE of
+;; (asc vec)/xasc which put nulls FIRST. Same key column [2 0Nl 1 0Nl 3] yields
+;; [0Nl 0Nl 1 2 3] under xasc but [1 2 3 0Nl 0Nl] under (select {asc:}).
+;; This split is asserted to its ACTUAL behaviour, not normalised away.
+(at (select {from: Tn asc: k}) 'k) -- [1 2 3 0Nl 0Nl]
+(nil? (at (at (select {from: Tn asc: k}) 'k) 4)) -- true
+(nil? (at (at (select {from: Tn asc: k}) 'k) 3)) -- true
+;; survivors still ascend ahead of the trailing null block:
+(at (at (select {from: Tn asc: k}) 'k) 0) -- 1
+(at (at (select {from: Tn asc: k}) 'k) 2) -- 3
+(count (select {from: Tn asc: k})) -- 5
 
 ;; ────────────── take with nulls — negative count slices from tail ──────────────
-;; (take v -5) keeps the last 5; null count must reflect what was kept.
+;; (take v 5) keeps the first 5; (take v -5) keeps the last 5. Null count must
+;; reflect what was kept AND the surviving values/positions must be exact.
 (set Vt [0Nl 3 1 0Nl 2 5 0Nl 4])
 (sum (as 'I64 (== (take Vt 5) 0Nl)))   -- 2
 (sum (as 'I64 (== (take Vt -5) 0Nl)))  -- 2
+;; pin the actual slices so a mis-sliced window with the right null count can't pass
+(take Vt 5)  -- [0Nl 3 1 0Nl 2]
+(take Vt -5) -- [0Nl 2 5 0Nl 4]
+(nil? (at (take Vt 5) 0)) -- true
+(nil? (at (take Vt 5) 3)) -- true
+(nil? (at (take Vt -5) 0)) -- true
+(nil? (at (take Vt -5) 3)) -- true

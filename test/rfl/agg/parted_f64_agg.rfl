@@ -60,6 +60,31 @@
 (min (at Pf2 'v)) -- 10.0
 (max (at Pf2 'v)) -- 90.0
 
+;; ─── parted F64 per-group aggregation via select (grouped dispatch) ───
+;; Distinct path from bare (sum (at P 'v)): grouping over a parted F64
+;; column. Masked per-group lookups assert the computed aggregate VALUE,
+;; not just cardinality. Groups span both partitions.
+;;   part 1: k=[0 0 1] v=[10 20 30]   part 2: k=[1 1 0] v=[40 50 60]
+;;   group 0 -> {10,20,60}  group 1 -> {30,40,50}
+(.sys.exec "rm -rf /tmp/rfl_agg_pf64g")
+(set TG1 (table [k v] (list (as 'I64 [0 0 1]) (as 'F64 [10.0 20.0 30.0]))))
+(set TG2 (table [k v] (list (as 'I64 [1 1 0]) (as 'F64 [40.0 50.0 60.0]))))
+(.db.splayed.set "/tmp/rfl_agg_pf64g/1/t/" TG1)
+(.db.splayed.set "/tmp/rfl_agg_pf64g/2/t/" TG2)
+(set Pfg (.db.parted.get "/tmp/rfl_agg_pf64g/" 't))
+;; group 0 sum = 10+20+60 = 90
+(at (at (select {s: (sum v) by: k where: (== k 0) from: Pfg}) 's) 0) -- 90.0
+;; group 1 sum = 30+40+50 = 120
+(at (at (select {s: (sum v) by: k where: (== k 1) from: Pfg}) 's) 0) -- 120.0
+;; group 0 min = 10, max = 60
+(at (at (select {mn: (min v) by: k where: (== k 0) from: Pfg}) 'mn) 0) -- 10.0
+(at (at (select {mx: (max v) by: k where: (== k 0) from: Pfg}) 'mx) 0) -- 60.0
+;; group 1 avg = 120/3 = 40.0
+(at (at (select {a: (avg v) by: k where: (== k 1) from: Pfg}) 'a) 0) -- 40.0
+;; cardinality invariant: two distinct groups
+(count (select {s: (sum v) by: k from: Pfg})) -- 2
+(.sys.exec "rm -rf /tmp/rfl_agg_pf64g")
+
 ;; ─── parted I64 avg (non-F64 inner loop: lines 173-177) ─────────────
 ;; When base is I64 (not F64), agg_parted_avg takes the else branch
 ;; at line 172 and uses agg_read_i64 to coerce each element to double.
@@ -87,4 +112,4 @@
 (sum (at Pd 'd)) !- type
 
 ;; ─── cleanup ─────────────────────────────────────────────────────────
-(.sys.exec "rm -rf /tmp/rfl_agg_pf64 /tmp/rfl_agg_pf64b /tmp/rfl_agg_pi64 /tmp/rfl_agg_pdate")
+(.sys.exec "rm -rf /tmp/rfl_agg_pf64 /tmp/rfl_agg_pf64b /tmp/rfl_agg_pf64g /tmp/rfl_agg_pi64 /tmp/rfl_agg_pdate")

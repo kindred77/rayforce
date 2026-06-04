@@ -20,11 +20,37 @@
 (sum (at (select {x: (first v) from: T by: g}) 'x))   -- 1225
 (sum (at (select {x: (last v) from: T by: g}) 'x))    -- 48725
 
+;; Per-group value checks (key-masked, order-independent): group g=3 sees
+;; v ∈ {3,53,…,953}: count=20 sum=9560 min=3 max=953 first=3 last=953
+;; avg=478.0. Sum/total above cannot detect values swapped between groups.
+(at (at (select {x: (sum   v) from: T by: g where: (== g 3)}) 'x) 0)  -- 9560
+(at (at (select {x: (count v) from: T by: g where: (== g 3)}) 'x) 0)  -- 20
+(at (at (select {x: (avg   v) from: T by: g where: (== g 3)}) 'x) 0)  -- 478.0
+(at (at (select {x: (min   v) from: T by: g where: (== g 3)}) 'x) 0)  -- 3
+(at (at (select {x: (max   v) from: T by: g where: (== g 3)}) 'x) 0)  -- 953
+(at (at (select {x: (first v) from: T by: g where: (== g 3)}) 'x) 0)  -- 3
+(at (at (select {x: (last  v) from: T by: g where: (== g 3)}) 'x) 0)  -- 953
+(at (at (select {x: g       from: T by: g where: (== g 3)}) 'g) 0)    -- 3
+;; second group g=47 to guard against cross-group leakage: v ∈ {47,…,997}
+;; count=20 sum=20*47+9500=10440 min=47 max=997
+(at (at (select {x: (sum v) from: T by: g where: (== g 47)}) 'x) 0)   -- 10440
+(at (at (select {x: (min v) from: T by: g where: (== g 47)}) 'x) 0)   -- 47
+(at (at (select {x: (max v) from: T by: g where: (== g 47)}) 'x) 0)   -- 997
+
 ;; ────────────── stat aggregators (dev / var / stddev) ──────────────
 ;; Each group has 20 evenly-spaced values; their variance/stddev is
 ;; the same per group, so summing across 50 groups gives 50× the
 ;; per-group value.  We verify they're non-zero and consistent.
 (count (select {d: (dev v) v: (var v) s: (stddev v) from: T by: g})) -- 50
+
+;; Per-group value checks (key-masked): group g=3 values are 3+50*{0..19}.
+;; Spread is identical for every group (shift-invariant), so var/stddev are
+;; the same per group. var_pop = 2500 * (sum_dev2{0..19}/20) = 2500*33.25 =
+;; 83125; var (sample) = 2500*(665/19) = 87500; stddev = sqrt(var).
+(at (at (select {x: (var      v) from: T by: g where: (== g 3)}) 'x) 0)  -- 87500.0
+(at (at (select {x: (var_pop  v) from: T by: g where: (== g 3)}) 'x) 0)  -- 83125.0
+(at (at (select {x: (stddev   v) from: T by: g where: (== g 3)}) 'x) 0)  -- 295.8039891549808
+(at (at (select {x: (stddev_pop v) from: T by: g where: (== g 3)}) 'x) 0) -- 288.31405222988875
 
 ;; dev_pop and var_pop variants (population vs sample)
 (count (select {d: (dev_pop v) v: (var_pop v) from: T by: g}))  -- 50
@@ -36,16 +62,35 @@
 ;; scalar per group → a typed F64 column of 50 medians.
 (med [1 2 3 4 5]) -- 3.0
 (count (select {m: (med v) from: T by: g})) -- 50
+;; Per-group median (key-masked): group g=3 sorted v = {3,53,…,953} (20 vals)
+;; → median = avg of 10th & 11th = (453+503)/2 = 478.0
+(at (at (select {m: (med v) from: T by: g where: (== g 3)}) 'm) 0)  -- 478.0
+(at (at (select {m: (med v) from: T by: g where: (== g 47)}) 'm) 0) -- 522.0
 
 ;; ────────────── multi-aggregator: 7 aggs in one select ──────────────
 (set Many (select {c: (count v) s: (sum v) mn: (min v) mx: (max v) av: (avg v) f: (first v) l: (last v) from: T by: g}))
 (count Many) -- 50
 (sum (at Many 'c)) -- 1000
 (sum (at Many 's)) -- 499500
+;; Per-group cross-aggregator coherence (key-masked): all 7 aggs for g=3
+;; come from the SAME group, so a value swapped into the wrong group is caught.
+(set Many3 (select {c: (count v) s: (sum v) mn: (min v) mx: (max v) av: (avg v) f: (first v) l: (last v) from: T by: g where: (== g 3)}))
+(at (at Many3 'c)  0) -- 20
+(at (at Many3 's)  0) -- 9560
+(at (at Many3 'mn) 0) -- 3
+(at (at Many3 'mx) 0) -- 953
+(at (at Many3 'av) 0) -- 478.0
+(at (at Many3 'f)  0) -- 3
+(at (at Many3 'l)  0) -- 953
 
 ;; ────────────── float aggregators ──────────────
 (count (select {av: (avg f) sd: (stddev f) from: T by: g})) -- 50
 (sum (at (select {s: (sum f) from: T by: g}) 's))           -- 249750.0
+;; Per-group float aggs (key-masked): g=3 has f=0.5*{3,53,…,953};
+;; sum=4780.0 avg=239.0 stddev=0.5*295.8039891549808=147.9019945774904
+(at (at (select {s: (sum    f) from: T by: g where: (== g 3)}) 's) 0)  -- 4780.0
+(at (at (select {a: (avg    f) from: T by: g where: (== g 3)}) 'a) 0)  -- 239.0
+(at (at (select {d: (stddev f) from: T by: g where: (== g 3)}) 'd) 0)  -- 147.9019945774904
 
 ;; ────────────── diverse — bool predicate "all elements distinct" ──────────────
 ;; (Not count-distinct; returns true iff every element is unique.)
@@ -57,6 +102,11 @@
 ;; ────────────── group-by + filter (predicate pushdown) ──────────────
 ;; (sum v where v < 500) per group. Group g sees only v's < 500 → 10 of 20.
 (count (select {s: (sum v) from: T by: g where: (< v 500)})) -- 50
+;; Per-group filtered aggs (key-masked): g=3 keeps v ∈ {3,53,…,453} (10 of 20);
+;; sum=10*3+50*45=2280 count=10 min=3 max=453
+(at (at (select {s: (sum   v) from: T by: g where: (and (== g 3) (< v 500))}) 's) 0) -- 2280
+(at (at (select {c: (count v) from: T by: g where: (and (== g 3) (< v 500))}) 'c) 0) -- 10
+(at (at (select {m: (max   v) from: T by: g where: (and (== g 3) (< v 500))}) 'm) 0) -- 453
 
 ;; ────────────── group-by no `by` clause: aggregate over whole table ──────────────
 ;; pure aggregations without grouping → ONE row, not nrows broadcast.
@@ -69,22 +119,94 @@
 (set Tsym (table [k v] (list (take ['A 'B 'C 'D 'E] N) (til N))))
 (count (select {s: (sum v) from: Tsym by: k})) -- 5
 (sum (at (select {s: (sum v) from: Tsym by: k}) 's)) -- 499500
+;; Per-group value checks (key-masked) — SYM group order is NON-DETERMINISTIC,
+;; so we mask by key. take cycles A,B,C,D,E: group 'A is i%5==0 → v∈{0,5,…,995}
+;; (200 vals) sum=5*19900=99500 min=0 max=995; group 'C is i%5==2 →
+;; sum=99500+2*200=99900 min=2 max=997. Also assert the key column itself.
+(at (at (select {s: (sum   v) from: Tsym by: k where: (== k 'A)}) 's) 0) -- 99500
+(at (at (select {c: (count v) from: Tsym by: k where: (== k 'A)}) 'c) 0) -- 200
+(at (at (select {m: (min   v) from: Tsym by: k where: (== k 'A)}) 'm) 0) -- 0
+(at (at (select {m: (max   v) from: Tsym by: k where: (== k 'A)}) 'm) 0) -- 995
+(at (at (select {s: (sum   v) from: Tsym by: k where: (== k 'A)}) 'k) 0) -- 'A
+(at (at (select {s: (sum   v) from: Tsym by: k where: (== k 'C)}) 's) 0) -- 99900
+(at (at (select {m: (max   v) from: Tsym by: k where: (== k 'C)}) 'm) 0) -- 997
+(at (at (select {s: (sum   v) from: Tsym by: k where: (== k 'C)}) 'k) 0) -- 'C
 
 ;; ────────────── group-by BOOL ──────────────
 (set Tbool (table [b v] (list (take [true false] N) (til N))))
 (count (select {s: (sum v) from: Tbool by: b})) -- 2
+;; Per-group (key-masked): b=true is i even → v∈{0,2,…,998} sum=249500 count=500
+;; b=false is i odd → v∈{1,3,…,999} sum=250000 max=999
+(at (at (select {s: (sum   v) from: Tbool by: b where: (== b true)}) 's) 0)  -- 249500
+(at (at (select {c: (count v) from: Tbool by: b where: (== b true)}) 'c) 0)  -- 500
+(at (at (select {m: (max   v) from: Tbool by: b where: (== b true)}) 'm) 0)  -- 998
+(at (at (select {s: (sum   v) from: Tbool by: b where: (== b false)}) 's) 0) -- 250000
+(at (at (select {m: (max   v) from: Tbool by: b where: (== b false)}) 'm) 0) -- 999
 
 ;; ────────────── group-by DATE ──────────────
 (set Tdt (table [d v] (list (take [2024.01.01 2024.01.02 2024.01.03] N) (til N))))
 (count (select {s: (sum v) from: Tdt by: d})) -- 3
+;; Per-group (key-masked): day1=2024.01.01 is i%3==0 → v∈{0,3,…,999} (334 vals)
+;; sum=166833 max=999; day3=2024.01.03 is i%3==2 → v∈{2,5,…,998} (333 vals)
+;; sum=166500 max=998. Assert the date key column too.
+(at (at (select {s: (sum   v) from: Tdt by: d where: (== d 2024.01.01)}) 's) 0) -- 166833
+(at (at (select {c: (count v) from: Tdt by: d where: (== d 2024.01.01)}) 'c) 0) -- 334
+(at (at (select {m: (max   v) from: Tdt by: d where: (== d 2024.01.01)}) 'm) 0) -- 999
+(at (at (select {s: (sum   v) from: Tdt by: d where: (== d 2024.01.01)}) 'd) 0) -- 2024.01.01
+(at (at (select {s: (sum   v) from: Tdt by: d where: (== d 2024.01.03)}) 's) 0) -- 166500
+(at (at (select {c: (count v) from: Tdt by: d where: (== d 2024.01.03)}) 'c) 0) -- 333
 
 ;; ────────────── group-by F64 (float key) ──────────────
 (set Tf (table [k v] (list (take [1.5 2.5 3.5 4.5] N) (til N))))
 (count (select {s: (sum v) from: Tf by: k})) -- 4
+;; Per-group (key-masked, F64 key): k=1.5 is i%4==0 → v∈{0,4,…,996} (250 vals)
+;; sum=124500 max=996; k=4.5 is i%4==3 → v∈{3,7,…,999} sum=125250 max=999.
+(at (at (select {s: (sum   v) from: Tf by: k where: (== k 1.5)}) 's) 0) -- 124500
+(at (at (select {c: (count v) from: Tf by: k where: (== k 1.5)}) 'c) 0) -- 250
+(at (at (select {m: (max   v) from: Tf by: k where: (== k 1.5)}) 'm) 0) -- 996
+(at (at (select {s: (sum   v) from: Tf by: k where: (== k 4.5)}) 's) 0) -- 125250
+(at (at (select {m: (max   v) from: Tf by: k where: (== k 4.5)}) 'm) 0) -- 999
 
 ;; ────────────── narrow-int key types (i16, i32) ──────────────
 (set Ti16 (table [k v] (list (as 'I16 (% (til N) 30)) (til N))))
 (count (select {s: (sum v) from: Ti16 by: k})) -- 30
+;; Per-group (key-masked, I16 key): k=0 is i%30==0 → v∈{0,30,…,990} (34 vals)
+;; sum=30*561=16830 max=990; k=5 → v∈{5,35,…,995} (34 vals) sum=16830+5*34=17000
+;; max=995. sum widens narrow ints to i64. Plain-literal mask (typed scalar is
+;; buggy — see Ti32 BUG block).
+(at (at (select {s: (sum   v) from: Ti16 by: k where: (== k 0)}) 's) 0) -- 16830
+(at (at (select {c: (count v) from: Ti16 by: k where: (== k 0)}) 'c) 0) -- 34
+(at (at (select {m: (max   v) from: Ti16 by: k where: (== k 0)}) 'm) 0) -- 990
+(at (at (select {s: (sum   v) from: Ti16 by: k where: (== k 5)}) 's) 0) -- 17000
+(at (at (select {m: (max   v) from: Ti16 by: k where: (== k 5)}) 'm) 0) -- 995
 
 (set Ti32 (table [k v] (list (as 'I32 (% (til N) 10)) (til N))))
 (count (select {s: (sum v) from: Ti32 by: k})) -- 10
+;; Per-group (key-masked, I32 key): k=0 is i%10==0 → v∈{0,10,…,990} (100 vals)
+;; sum=10*4950=49500 max=990; k=7 → v∈{7,17,…,997} sum=50200 max=997.
+;; NB: mask uses a PLAIN integer literal (== k 7), NOT a typed scalar — see
+;; the BUG block below: a typed I32 scalar in a where-clause filter selects
+;; the WRONG rows.
+(at (at (select {s: (sum   v) from: Ti32 by: k where: (== k 0)}) 's) 0) -- 49500
+(at (at (select {c: (count v) from: Ti32 by: k where: (== k 0)}) 'c) 0) -- 100
+(at (at (select {m: (max   v) from: Ti32 by: k where: (== k 0)}) 'm) 0) -- 990
+(at (at (select {s: (sum   v) from: Ti32 by: k where: (== k 7)}) 's) 0) -- 50200
+(at (at (select {m: (max   v) from: Ti32 by: k where: (== k 7)}) 'm) 0) -- 997
+
+;; ────────────── BUG: typed I32 scalar in where-clause filter ──────────────
+;; A bare vector compare against a typed scalar is correct (selects exactly the
+;; 100 rows where k==7):
+(sum (== (as 'I32 (% (til N) 10)) (as 'I32 7))) -- 100
+;; A where-clause filter with a PLAIN literal is correct (k=7 → v∈{7,…,997}):
+(min (at (select {from: Ti32 where: (== k 7)}) 'v)) -- 7
+(sum (at (select {from: Ti32 where: (== k 7)}) 'v)) -- 50200
+;; BUG (xfail): the SAME where-clause filter with a TYPED I32 scalar (as 'I32 7)
+;; returns 100 rows (correct cardinality) whose v values are the k=0 group
+;; (min 0, sum 49500) instead of k=7. The typed scalar appears to be read as 0
+;; in the filter path. Does NOT reproduce with a plain literal or a bare vector
+;; ==. Correct expected values preserved in comments; restore once fixed:
+;;   (min (at (select {from: Ti32 where: (== k (as 'I32 7))}) 'v)) -- 7
+;;   (sum (at (select {from: Ti32 where: (== k (as 'I32 7))}) 'v)) -- 50200
+;; Current (buggy) behaviour pinned so a future fix flips this to a FAIL:
+(min (at (select {from: Ti32 where: (== k (as 'I32 7))}) 'v)) -- 0
+(sum (at (select {from: Ti32 where: (== k (as 'I32 7))}) 'v)) -- 49500

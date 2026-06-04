@@ -33,16 +33,34 @@
 ;; A table with two TIMESTAMP columns; if produces TIMESTAMP output.
 (set TTS (table [x ts ts2] (list [true false true] (as 'TIMESTAMP [100 200 300]) (as 'TIMESTAMP [10 20 30]))))
 ;; if x then ts else ts2: [100, 20, 300] → count = 3
-(count (at (select {t: (if x ts ts2) from: TTS}) 't)) -- 3
+(set RTTS (at (select {t: (if x ts ts2) from: TTS}) 't))
+(count RTTS) -- 3
+;; Value-check: x=[t,f,t] picks ts[0]=100, ts2[1]=20, ts[2]=300.
+(at RTTS 0) -- 100
+(at RTTS 1) -- 20
+(at RTTS 2) -- 300
 
 ;; ── 1d. DATE output branch (4-byte temporal) ───────────────────────
 (set TDate (table [x d] (list [1 2 3 4] [2024.01.01 2024.01.02 2024.01.03 2024.01.04])))
 ;; if x>2 use d else 2024.01.01; dates as epoch-day I32
-(count (at (select {r: (if (> x 2) d 2024.01.01) from: TDate}) 'r)) -- 4
+(set RTDate (at (select {r: (if (> x 2) d 2024.01.01) from: TDate}) 'r))
+(count RTDate) -- 4
+;; Value-check: cond=(x>2)=[f,f,t,t] → [01,01,03,04] as epoch-days
+;; (2024.01.01=8766, 2024.01.03=8768, 2024.01.04=8769).
+(at RTDate 0) -- 8766
+(at RTDate 1) -- 8766
+(at RTDate 2) -- 8768
+(at RTDate 3) -- 8769
 
 ;; ── 1e. TIME output branch (4-byte temporal) ───────────────────────
 (set TTime (table [x t] (list [1 2 3] [09:30:00.000 10:00:00.000 11:00:00.000])))
-(count (at (select {r: (if (> x 1) t 09:30:00.000) from: TTime}) 'r)) -- 3
+(set RTTime (at (select {r: (if (> x 1) t 09:30:00.000) from: TTime}) 'r))
+(count RTTime) -- 3
+;; Value-check: cond=(x>1)=[f,t,t] → [09:30,10:00,11:00] as millis
+;; (34200000, 36000000, 39600000).
+(at RTTime 0) -- 34200000
+(at RTTime 1) -- 36000000
+(at RTTime 2) -- 39600000
 
 ;; ── 1e2. I16 output branch ─────────────────────────────────────────
 ;; A table with two I16 columns; the if projection produces I16 output.
@@ -121,6 +139,12 @@
 (count PI64pv) -- 2
 ;; Verify column count: 1 index col + 2 pivot value cols = 3 cols total.
 (count (key PI64pv)) -- 3
+;; Value-check: pivot values scatter into the right (row,col) cells.
+;; k=A row0: c=100→v=10, c=200→v=20;  k=B row1: c=100→v=30, c=200→v=40.
+(at (at PI64pv '100) 0) -- 10
+(at (at PI64pv '200) 0) -- 20
+(at (at PI64pv '100) 1) -- 30
+(at (at PI64pv '200) 1) -- 40
 
 ;; ── 3b. BOOL pivot column → "true"/"false" snprintf branch ─────────
 (set TBoolpv (table [k c v] (list ['A 'A 'B 'B] [true false true false] [1 2 3 4])))
@@ -140,16 +164,34 @@
 (set TDatepv (table [k c v] (list ['A 'A 'B 'B] [2024.01.01 2024.01.02 2024.01.01 2024.01.02] [10 20 30 40])))
 (set PDatepv (pivot TDatepv 'k 'c 'v sum))
 (count PDatepv) -- 2
+;; Value-check: DATE pivot cols are epoch-day strings (2024.01.01='8766,
+;; 2024.01.02='8767).  k=A row0: 8766→10, 8767→20; k=B row1: 8766→30, 8767→40.
+(at (at PDatepv '8766) 0) -- 10
+(at (at PDatepv '8767) 0) -- 20
+(at (at PDatepv '8766) 1) -- 30
+(at (at PDatepv '8767) 1) -- 40
 
 ;; ── 3e. TIME pivot column → snprintf "%ld" branch ──────────────────
 (set TTimepv (table [k c v] (list ['A 'A 'B 'B] [09:30:00.000 10:00:00.000 09:30:00.000 10:00:00.000] [1 2 3 4])))
 (set PTimepv (pivot TTimepv 'k 'c 'v sum))
 (count PTimepv) -- 2
+;; Value-check: TIME pivot cols are millisecond strings (09:30='34200000,
+;; 10:00='36000000).  k=A row0: →1,→2;  k=B row1: →3,→4.
+(at (at PTimepv '34200000) 0) -- 1
+(at (at PTimepv '36000000) 0) -- 2
+(at (at PTimepv '34200000) 1) -- 3
+(at (at PTimepv '36000000) 1) -- 4
 
 ;; ── 3f. TIMESTAMP pivot column → snprintf "%ld" branch ─────────────
 (set TTSpv (table [k c v] (list ['A 'A 'B 'B] (as 'TIMESTAMP [1000 2000 1000 2000]) [1 2 3 4])))
 (set PTSpv (pivot TTSpv 'k 'c 'v sum))
 (count PTSpv) -- 2
+;; Value-check: TIMESTAMP pivot cols are '1000 / '2000.
+;; k=A row0: →1,→2;  k=B row1: →3,→4.
+(at (at PTSpv '1000) 0) -- 1
+(at (at PTSpv '2000) 0) -- 2
+(at (at PTSpv '1000) 1) -- 3
+(at (at PTSpv '2000) 1) -- 4
 
 ;; ── 3g. U8 pivot column → "col%ld" fallback branch ─────────────────
 ;; U8 type is not in the explicit type list, so hits the "col%ld" branch.
@@ -158,6 +200,12 @@
 (count PU8pv) -- 2
 ;; Two distinct U8 values → 2 pivot cols + 1 index col.
 (count (key PU8pv)) -- 3
+;; Value-check: U8 hits the "col%ld" fallback → cols named 'col1 / 'col2.
+;; k=A row0: →1,→2;  k=B row1: →3,→4.
+(at (at PU8pv 'col1) 0) -- 1
+(at (at PU8pv 'col2) 0) -- 2
+(at (at PU8pv 'col1) 1) -- 3
+(at (at PU8pv 'col2) 1) -- 4
 
 ;; ====================================================================
 ;; Section 4: exec_pivot — SYM index column (multi-column name building)
@@ -553,8 +601,17 @@
 ;; Only rows with non-null pivot keys contribute output columns.
 ;; Result: 2 groups (A and B), 2 pivot values (1 and 2) → 3 cols total.
 (set TNullPvt (table [k c v] (list ['A 'A 'B 'B] [0N 2 1 2] [10 20 30 40])))
-(count (pivot TNullPvt 'k 'c 'v sum)) -- 2
-(count (key (pivot TNullPvt 'k 'c 'v sum))) -- 3
+(set PNullPvt (pivot TNullPvt 'k 'c 'v sum))
+(count PNullPvt) -- 2
+(count (key PNullPvt)) -- 3
+;; Value-check: dropping row (A,null,10) means group A has NO c=1 cell.
+;; pivot.c:581-582 zero-fills missing cells (additive identity for sum),
+;; so the absent (A,c=1) cell is 0 — NOT a typed null.  A's c=2→20.
+;; Group B: c=1→30, c=2→40.
+(at (at PNullPvt '1) 0) -- 0
+(at (at PNullPvt '2) 0) -- 20
+(at (at PNullPvt '1) 1) -- 30
+(at (at PNullPvt '2) 1) -- 40
 
 ;; ====================================================================
 ;; Section 26: exec_pivot — null in F64 index column
@@ -614,12 +671,25 @@
 
 ;; TIMESTAMP if → actually produces I64 (not TIMESTAMP)
 (set TTSdead (table [x ts1 ts2] (list [true false] (as 'TIMESTAMP [100 200]) (as 'TIMESTAMP [10 20]))))
-(count (at (select {t: (if x ts1 ts2) from: TTSdead}) 't)) -- 2
+(set RTSdead (at (select {t: (if x ts1 ts2) from: TTSdead}) 't))
+(count RTSdead) -- 2
+;; Value-check: x=[t,f] picks ts1[0]=100, ts2[1]=20 (demoted to I64 nanos).
+(at RTSdead 0) -- 100
+(at RTSdead 1) -- 20
 
 ;; DATE if → actually produces I32 (not DATE)
 (set TDatedead (table [x d1 d2] (list [true false] [2024.01.01 2024.01.02] [2023.01.01 2023.01.02])))
-(count (at (select {d: (if x d1 d2) from: TDatedead}) 'd)) -- 2
+(set RDatedead (at (select {d: (if x d1 d2) from: TDatedead}) 'd))
+(count RDatedead) -- 2
+;; Value-check: x=[t,f] picks d1[0]=2024.01.01, d2[1]=2023.01.02 (epoch-day I32).
+;; 2024.01.01 epoch-day = 8766; 2023.01.02 = 8766-365+1 = 8402.
+(at RDatedead 0) -- 8766
+(at RDatedead 1) -- 8402
 
 ;; TIME if → actually produces I32 (not TIME)
 (set TTimedead (table [x t1 t2] (list [true false] [09:30:00.000 10:00:00.000] [08:00:00.000 11:00:00.000])))
-(count (at (select {t: (if x t1 t2) from: TTimedead}) 't)) -- 2
+(set RTimedead (at (select {t: (if x t1 t2) from: TTimedead}) 't))
+(count RTimedead) -- 2
+;; Value-check: x=[t,f] picks t1[0]=09:30 (34200000ms), t2[1]=11:00 (39600000ms).
+(at RTimedead 0) -- 34200000
+(at RTimedead 1) -- 39600000

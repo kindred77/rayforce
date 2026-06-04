@@ -65,13 +65,33 @@
 (count PrHub2) -- 5
 (set PrHub2_node (at PrHub2 '_node))
 (set PrHub2_rank (at PrHub2 '_rank))
-(> (at PrHub2_rank (at (where (== PrHub2_node 0)) 0)) (at PrHub2_rank (at (where (== PrHub2_node 1)) 0))) -- true
+;; VALUE-CHECK: hub (node 0) holds the strict max and out-ranks every spoke
+;; on the 2-arg (default-damping) path, not just node 1.
+(set PrHub2_r0 (at PrHub2_rank (at (where (== PrHub2_node 0)) 0)))
+(== PrHub2_r0 (max PrHub2_rank)) -- true
+(> PrHub2_r0 (at PrHub2_rank (at (where (== PrHub2_node 1)) 0))) -- true
+(> PrHub2_r0 (at PrHub2_rank (at (where (== PrHub2_node 2)) 0))) -- true
+(> PrHub2_r0 (at PrHub2_rank (at (where (== PrHub2_node 3)) 0))) -- true
+(> PrHub2_r0 (at PrHub2_rank (at (where (== PrHub2_node 4)) 0))) -- true
 
 ;; default iters + damping (n==1 path)
 (set PrHub3 (.graph.pagerank HUB5))
 (count PrHub3) -- 5
 (>= (sum (at PrHub3 '_rank)) 0.99) -- true
 (<= (sum (at PrHub3 '_rank)) 1.01) -- true
+;; VALUE-CHECK: the count/sum lines above don't verify the *ranking* — a
+;; PageRank that returns 5 normalised-but-wrong ranks would pass.  Assert
+;; the hub-dominance ordering on the default (n==1) code path too: node 0
+;; (the sink all spokes point at) must hold the strict maximum rank and
+;; strictly out-rank every spoke 1..4.
+(set PrHub3_node (at PrHub3 '_node))
+(set PrHub3_rank (at PrHub3 '_rank))
+(set PrHub3_r0 (at PrHub3_rank (at (where (== PrHub3_node 0)) 0)))
+(== PrHub3_r0 (max PrHub3_rank)) -- true
+(> PrHub3_r0 (at PrHub3_rank (at (where (== PrHub3_node 1)) 0))) -- true
+(> PrHub3_r0 (at PrHub3_rank (at (where (== PrHub3_node 2)) 0))) -- true
+(> PrHub3_r0 (at PrHub3_rank (at (where (== PrHub3_node 3)) 0))) -- true
+(> PrHub3_r0 (at PrHub3_rank (at (where (== PrHub3_node 4)) 0))) -- true
 
 ;; ======================================================================
 ;; Fixture LOUV2: 8-node graph with two clearly separated clusters.
@@ -139,6 +159,15 @@
 (set Lou2 (.graph.louvain LOUV2))
 (count Lou2) -- 8
 (== (count (distinct (at Lou2 '_community))) 4) -- true
+;; VALUE-CHECK: the count/distinct lines don't verify *which* nodes share
+;; a community — a partition with 4 communities but a leaked bridge would
+;; pass.  Re-assert the cross-cluster separation on the default-iter path:
+;; node 0 (cluster A) and node 4 (cluster B) must never co-reside.
+(set Lou2_node (at Lou2 '_node))
+(set Lou2_comm (at Lou2 '_community))
+(set Lou2_C0 (at Lou2_comm (at (where (== Lou2_node 0)) 0)))
+(set Lou2_C4 (at Lou2_comm (at (where (== Lou2_node 4)) 0)))
+(!= Lou2_C0 Lou2_C4) -- true
 
 ;; ======================================================================
 ;; Fixture REALLOC: large star graph to force exec_var_expand realloc.
@@ -189,6 +218,14 @@
 (count ReBlast2) -- 1500
 (== (count (distinct (at ReBlast2 '_depth))) 1) -- true
 (first (at ReBlast2 '_depth)) -- 1
+;; VALUE-CHECK: count/depth alone wouldn't catch wrong destinations.  The
+;; emitted ends must be exactly the leaves 1..1500 (all distinct), each
+;; reached from the hub at depth 1.
+(count (distinct (at ReBlast2 '_end))) -- 1500
+(min (at ReBlast2 '_end)) -- 1
+(max (at ReBlast2 '_end)) -- 1500
+(count (distinct (at ReBlast2 '_start))) -- 1
+(first (at ReBlast2 '_start)) -- 0
 
 ;; direction=2 (both fwd+rev) from the hub: same 1500 fwd-leaves, no
 ;; rev neighbours, so still 1500 rows — exercises the realloc paths
@@ -197,6 +234,12 @@
 (count ReBlastBoth) -- 1500
 (min (at ReBlastBoth '_end)) -- 1
 (max (at ReBlastBoth '_end)) -- 1500
+;; VALUE-CHECK: direction=2 walks both CSRs from the hub.  The hub has no
+;; reverse neighbours, so the dual walk must still yield exactly the 1500
+;; distinct fwd-leaves — no duplicates and no spurious rev rows.
+(count (distinct (at ReBlastBoth '_end))) -- 1500
+(count (distinct (at ReBlastBoth '_start))) -- 1
+(first (at ReBlastBoth '_start)) -- 0
 
 ;; reverse direction from a leaf: depth-1 fwd-neighbours of a leaf via
 ;; the reverse CSR is exactly the hub (1 row).  This isn't itself a

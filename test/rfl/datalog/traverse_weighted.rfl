@@ -108,6 +108,13 @@
 ;; ======================================================================
 (set DjMax (.graph.dijkstra DAG1 0 -1 10))
 (count DjMax) -- 5
+;; A generous max_depth (10 >> graph depth) cannot change the result: the
+;; relaxed distances are identical to the single-source run above.
+(set DjMax_node (at DjMax '_node))
+(set DjMax_dist (at DjMax '_dist))
+(at DjMax_dist (at (where (== DjMax_node 0)) 0)) -- 0.0
+(at DjMax_dist (at (where (== DjMax_node 2)) 0)) -- 3.0
+(at DjMax_dist (at (where (== DjMax_node 4)) 0)) -- 8.0
 
 ;; ======================================================================
 ;; 4. exec_mst — Kruskal on a fully-connected 4-node graph (K4).
@@ -218,6 +225,9 @@
 (count Ve2) -- 2
 (min (at Ve2 '_depth)) -- 2
 (max (at Ve2 '_depth)) -- 3
+;; Frontier nodes reached are exactly {2,3}; node 1 (depth 1) is excluded.
+(at (at Ve2 '_end) 0) -- 2
+(at (at Ve2 '_end) 1) -- 3
 
 ;; Exact depth=3 (min==max) on CHAIN: only {3} at depth 3.
 (set Ve3 (.graph.var-expand CHAIN 0 3 3))
@@ -230,6 +240,11 @@
 ;; `depth >= 1` loop init, so min=0 max=3 behaves like min=1 max=3.
 (set Ve0 (.graph.var-expand CHAIN 0 0 3))
 (count Ve0) -- 3
+;; depth=0 self-emission suppressed → identical frontier to [1..3]: {1,2,3}.
+(min (at Ve0 '_end)) -- 1
+(max (at Ve0 '_end)) -- 3
+(min (at Ve0 '_depth)) -- 1
+(max (at Ve0 '_depth)) -- 3
 
 ;; var-expand on DAG1 from node 0 with depth [1..4]: BFS visits all 4
 ;; non-source nodes, each emitted exactly once at the BFS depth-of-first-
@@ -288,6 +303,9 @@
 (set p1_idx (where (== Ksp_pid 1)))
 (set p1_last (- (count p1_idx) 1))
 (>= (at Ksp_dist (at p1_idx p1_last)) 8.0) -- true
+;; Exact second-shortest cost: the cheapest spur deviating from P0 is
+;; 0->2->3->4 = 5.0 + 2.0 + 3.0 = 10.0 (hand-Yen).
+(at Ksp_dist (at p1_idx p1_last)) -- 10.0
 
 ;; K=1 (just the shortest) on K4 from 0 to 3 — Dijkstra-only path.
 ;; 0->3 direct edge has weight 3.0 (and is the cheapest), so K=1 returns
@@ -308,12 +326,23 @@
 (count CcDisc2) -- 6
 (count (distinct (at CcDisc2 '_component))) -- 2
 ;; Nodes 0,1,2 share a component; nodes 3,4,5 share another.
-(set CcDisc2_node (at CcDisc2 '_component))
+(set CcDisc2_node (at CcDisc2 '_node))
+(set CcDisc2_comp (at CcDisc2 '_component))
 ;; Component label is monotone (smallest representative). The components
 ;; for nodes {0,1,2} are all equal; same for nodes {3,4,5}.  We assert
 ;; that the multiset of component labels has exactly 3 of one value and
 ;; 3 of another — i.e. group sizes are balanced.
 (min (at CcDisc2 '_component)) -- 0
+;; Nodes 0,1,2 carry the smallest label (0); nodes 3,4,5 carry label 3.
+(at CcDisc2_comp (at (where (== CcDisc2_node 0)) 0)) -- 0
+(at CcDisc2_comp (at (where (== CcDisc2_node 1)) 0)) -- 0
+(at CcDisc2_comp (at (where (== CcDisc2_node 2)) 0)) -- 0
+(at CcDisc2_comp (at (where (== CcDisc2_node 3)) 0)) -- 3
+(at CcDisc2_comp (at (where (== CcDisc2_node 4)) 0)) -- 3
+(at CcDisc2_comp (at (where (== CcDisc2_node 5)) 0)) -- 3
+;; Balanced 3/3 split: exactly 3 nodes in the label-0 component.
+(count (where (== CcDisc2_comp 0))) -- 3
+(count (where (== CcDisc2_comp 3))) -- 3
 ;; DAG1 and CHAIN are fully connected (one weakly-connected component).
 (count (distinct (at (.graph.connected DAG1) '_component))) -- 1
 (count (distinct (at (.graph.connected CHAIN) '_component))) -- 1
@@ -323,11 +352,20 @@
 ;;     repeat on the new CHAIN/DAG1 fixtures for region coverage).
 ;; ======================================================================
 ;; CHAIN: node 0 has one fwd neighbor {1}.
-(count (.graph.expand CHAIN 0)) -- 1
+(set ExCh0 (.graph.expand CHAIN 0))
+(count ExCh0) -- 1
+(min (at ExCh0 '_dst)) -- 1
+(max (at ExCh0 '_dst)) -- 1
 ;; DAG1 node 0 has two fwd neighbors {1,2}.
-(count (.graph.expand DAG1 0)) -- 2
+(set ExDag0 (.graph.expand DAG1 0))
+(count ExDag0) -- 2
+(min (at ExDag0 '_dst)) -- 1
+(max (at ExDag0 '_dst)) -- 2
 ;; DAG1 node 2 has two fwd neighbors {3,4}.
-(count (.graph.expand DAG1 2)) -- 2
+(set ExDag2 (.graph.expand DAG1 2))
+(count ExDag2) -- 2
+(min (at ExDag2 '_dst)) -- 3
+(max (at ExDag2 '_dst)) -- 4
 
 ;; ======================================================================
 ;; Cleanup

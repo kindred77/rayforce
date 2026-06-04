@@ -164,6 +164,11 @@
 ;; entered when v->type == RAY_DICT (collection.c L1514).  No additional
 ;; case to add here, but verify the count guard.
 (count (dict [a] [1])) -- 1
+;; Value-check the same single-key dict so a wrong key/value association
+;; cannot pass behind the count guard.
+(key (dict [a] [1])) -- [a]
+(value (dict [a] [1])) -- (list 1)
+(at (dict [a] [1]) 'a) -- 1
 
 ;; ========== SINGLE-KEY DICT ==========
 (set D1 (dict [only] [42]))
@@ -224,4 +229,10 @@
 ;; ========== DICT/TABLE CAST (ray_dict_new on cast path) ==========
 (type (as 'DICT (table [x y] (list [1] [2])))) -- 'DICT
 (count (as 'DICT (table [x y] (list [1] [2])))) -- 2
+;; Value-check the same cast: the column names must become the keys and the
+;; column vectors the values, so type+count alone can't hide a wrong mapping.
+(key (as 'DICT (table [x y] (list [1] [2])))) -- [x y]
+(at (as 'DICT (table [x y] (list [1] [2]))) 'x) -- [1]
+(at (as 'DICT (table [x y] (list [1] [2]))) 'y) -- [2]
 (at (as 'DICT (table [x y] (list [1 2] [3 4]))) 'x) -- [1 2]
+(at (as 'DICT (table [x y] (list [1 2] [3 4]))) 'y) -- [3 4]

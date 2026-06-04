@@ -43,6 +43,16 @@
 (date 2000.01.01)                              -- 2000.01.01D00:00:00.000000000
 (date 1999.12.31)                              -- 1999.12.31D00:00:00.000000000
 (date 2024.02.29)                              -- 2024.02.29D00:00:00.000000000
+;; Printer-independent value check: the source DATE literals encode the
+;; correct days-since-2000.01.01 count (raw i32), so a wrong instant with
+;; the right type cannot slip past the rendered-form assertions above.
+(as 'i32 2000.01.01)                           -- 0i
+(as 'i32 2024.03.15)                           -- 8840i
+(as 'i32 1999.12.31)                           -- -1i
+(as 'i32 2024.02.29)                           -- 8825i
+;; …and the truncated TIMESTAMP result re-encodes to ns-since-epoch.
+(as 'i64 (date 2024.03.15))                    -- 763776000000000000
+(as 'i64 (date 2000.01.01))                    -- 0
 
 ;; TIMESTAMP atom: truncate to midnight (drops the time-of-day).
 (type (date 2024.03.15D12:34:56.789000000))   -- 'timestamp
@@ -70,12 +80,24 @@
 (time 2024.03.15D12:34:56.789123456)          -- 2024.03.15D12:34:56.000000000
 (time 2024.03.15D00:00:00.000000000)          -- 2024.03.15D00:00:00.000000000
 (time 2024.03.15D23:59:59.999999999)          -- 2024.03.15D23:59:59.000000000
+;; Printer-independent: source TIMESTAMP literal carries full ns
+;; precision (raw i64); (time …) trims to the second boundary, so the
+;; result's raw count loses the sub-second remainder.
+(as 'i64 2024.03.15D12:34:56.789123456)        -- 763821296789123456
+(as 'i64 (time 2024.03.15D12:34:56.789123456)) -- 763821296000000000
+(as 'i64 (date 2024.03.15D12:34:56.789123456)) -- 763776000000000000
 
 ;; TIME atom: sub-second fraction trims.  12:34:56.789 ms → 12:34:56 at
 ;; epoch.
 (type (time 12:34:56.789))                     -- 'timestamp
 (time 12:34:56.789)                            -- 2000.01.01D12:34:56.000000000
 (time 00:00:00.000)                            -- 2000.01.01D00:00:00.000000000
+;; Printer-independent: the TIME literal stores ms-since-midnight (raw
+;; i32); the second-truncated TIMESTAMP result stores ns-since-epoch.
+(as 'i32 12:34:56.789)                          -- 45296789i
+(as 'i32 00:00:00.000)                          -- 0i
+(as 'i64 (time 12:34:56.789))                   -- 45296000000000
+(as 'i64 (time 00:00:00.000))                   -- 0
 
 ;; DATE atom: no sub-day component to trim, result lands on midnight.
 (time 2024.03.15)                              -- 2024.03.15D00:00:00.000000000

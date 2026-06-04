@@ -61,6 +61,8 @@
 (count (select {from: PT where: (== name "alice")})) -- 1
 (first (at (select {from: PT where: (== name "alice")}) 'name)) -- "alice"
 (count (select {from: PT where: (!= name "alice")})) -- 4
+;; Value-check the flattened STR column: non-alice rows are bob,charlie,dave,eve.
+(first (at (select {from: PT where: (!= name "alice")}) 'name)) -- "bob"
 
 ;; ── 1b. HEAD on parted STR table (parted_head_str) ──
 ;; select { take: 2 } triggers OP_HEAD → parted_head_str for the STR col
@@ -86,6 +88,15 @@
 (count (select {from: PT where: (> id 2)})) -- 3
 (first (at (select {from: PT where: (> id 2)}) 'name)) -- "charlie"
 (count (select {from: PT where: (> id 0)})) -- 5
+;; BUG: an ALL-PASS filter on a parted STR table returns the 'name column
+;; un-materialized (still segmented) — (at … 'name)/(count …)/(first …) all
+;; raise `type` / render as <?>.  A PARTIAL filter that still keeps every row
+;; of both partitions (>= id 2 keeps 4 of 5) materializes correctly, so the
+;; defect is specific to the all-pass short-circuit in exec_filter on parted
+;; STR columns.  The all-pass count above stays a length-only invariant because
+;; its column cannot be read; value-check the working partial path instead.
+(first (at (select {from: PT where: (>= id 2)}) 'name)) -- "bob"
+(at (at (select {from: PT where: (>= id 2)}) 'name) 3) -- "eve"
 
 ;; ── 1e. HEAD within first partition (parted_head_str segment loop) ──
 (count (select {from: PT take: 3})) -- 3
@@ -147,6 +158,11 @@
 ;; with match_idx=[0,1,2,3], rows 2 and 3 land in the NULL segment.
 ;; The null-segment branch (lines 327-329) appends null entries for those.
 (count (select {from: PNS where: (> id 0) take: 4})) -- 4
+;; Value-check: partition 1 supplies "alpha","beta"; partition 2 lacks the
+;; 'name column so its rows come back as null from the null-segment branch.
+(first (at (select {from: PNS where: (> id 0) take: 4}) 'name)) -- "alpha"
+(nil? (at (at (select {from: PNS where: (> id 0) take: 4}) 'name) 2)) -- true
+(nil? (at (at (select {from: PNS where: (> id 0) take: 4}) 'name) 3)) -- true
 
 
 ;; ======================================================================
@@ -168,8 +184,13 @@
 (first (at (select {from: PS take: 3}) 'sym)) -- 'foo
 ;; TAIL of parted SYM → parted_first_attrs + parted_seg_esz_ok.
 (count (select {from: PS take: -2})) -- 2
+;; Value-check the last two SYMs: qux,quux (from partition 2).
+(first (at (select {from: PS take: -2}) 'sym)) -- 'qux
+(at (at (select {from: PS take: -2}) 'sym) 1) -- 'quux
 ;; FILTER of parted SYM — exercise parted_first_attrs in filter.c path.
 (count (select {from: PS where: (> id 2)})) -- 3
+;; Value-check: rows with id>2 are baz,qux,quux.
+(first (at (select {from: PS where: (> id 2)}) 'sym)) -- 'baz
 
 ;; ======================================================================
 ;; 3.  Narrow SYM column from CSV  — read_col_i64 W8 / W16 branches.
@@ -186,11 +207,17 @@
 (count (select {c: (count id) from: NC by: cat})) -- 3
 ;; The 'a' group has 3 rows.
 (first (at (select {c: (count id) s: (sum id) from: NC by: cat asc: cat}) 'c)) -- 3
+;; Value-check the summed id per group (asc cat): a=1+3+6=10, b=2+5=7, c=4.
+(first (at (select {c: (count id) s: (sum id) from: NC by: cat asc: cat}) 's)) -- 10
+(at (at (select {c: (count id) s: (sum id) from: NC by: cat asc: cat}) 's) 2) -- 4
 
 ;; INNER-JOIN on the narrow SYM column — join.c read_col_i64 W8 arm.
 ;; (drop unused NC2 variable; use NC for both sides)
 ;; a=3, b=2, c=1; self-join: 3*3 + 2*2 + 1*1 = 9+4+1 = 14
 (count (inner-join [cat] NC NC)) -- 14
+;; Value-check the join payload: the (left) 'id column sums to 48.
+;; a ids {1,3,6}×3 matches =30, b {2,5}×2 =14, c {4}×1 =4 → 30+14+4 = 48.
+(sum (at (inner-join [cat] NC NC) 'id)) -- 48
 
 ;; ======================================================================
 ;; 4.  Nullable columns + HEAD/TAIL — col_propagate_nulls_range loop.

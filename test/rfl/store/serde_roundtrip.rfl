@@ -220,10 +220,16 @@
 ;; TIME vec
 (type (de (ser (as 'TIME [3723000 7200000])))) -- 'TIME
 (count (de (ser (as 'TIME [3723000 7200000])))) -- 2
+;; value preserved bit-exact: 3723000 ms = 01:02:03.000, 7200000 ms = 02:00:00.000
+(at (de (ser (as 'TIME [3723000 7200000]))) 0) -- 01:02:03.000
+(at (de (ser (as 'TIME [3723000 7200000]))) 1) -- 02:00:00.000
 
 ;; TIMESTAMP vec — 8-byte/elem branch shared with I64 + F64
 (type (de (ser (as 'TIMESTAMP [123456789 987654321])))) -- 'TIMESTAMP
 (count (de (ser (as 'TIMESTAMP [123456789 987654321])))) -- 2
+;; value preserved bit-exact (round-trip equality on the ns-since-epoch payload)
+(at (de (ser (as 'TIMESTAMP [123456789 987654321]))) 0) -- (at (as 'TIMESTAMP [123456789 987654321]) 0)
+(at (de (ser (as 'TIMESTAMP [123456789 987654321]))) 1) -- (at (as 'TIMESTAMP [123456789 987654321]) 1)
 
 ;; GUID vec — 16-byte/elem branch, unique to GUID
 ;; (guid N) generates N random GUIDs; capture in a variable so the LHS
@@ -312,9 +318,17 @@
 ;; backing vec's type (not its parent's).
 (type (de (ser (take (as 'I16 [1 2 3 4 5 6]) 4)))) -- 'I16
 (count (de (ser (take (as 'I16 [1 2 3 4 5 6]) 4)))) -- 4
+;; values of the slice [1 2 3 4] survive the round-trip
+(at (de (ser (take (as 'I16 [1 2 3 4 5 6]) 4))) 0) -- 1h
+(at (de (ser (take (as 'I16 [1 2 3 4 5 6]) 4))) 3) -- 4h
+(sum (de (ser (take (as 'I16 [1 2 3 4 5 6]) 4)))) -- 10
 
 ;; slice of a DATE vec — exercises the 4-byte/elem arm
 (type (de (ser (take (as 'DATE [7305 7306 7307 7308]) 2)))) -- 'DATE
+(count (de (ser (take (as 'DATE [7305 7306 7307 7308]) 2)))) -- 2
+;; day-index values of the slice survive (round-trip equality)
+(at (de (ser (take (as 'DATE [7305 7306 7307 7308]) 2))) 0) -- (at (as 'DATE [7305 7306 7307 7308]) 0)
+(at (de (ser (take (as 'DATE [7305 7306 7307 7308]) 2))) 1) -- (at (as 'DATE [7305 7306 7307 7308]) 1)
 
 ;; slice of SYM vec (variable-length-per-elem)
 (count (de (ser (take ['a 'b 'c 'd 'e] 3)))) -- 3
@@ -449,7 +463,9 @@
 (count (de (ser [42]))) -- 1
 (at (de (ser [42])) 0) -- 42
 (count (de (ser (as 'U8 [200])))) -- 1
+(at (de (ser (as 'U8 [200]))) 0) -- 0xc8
 (count (de (ser (as 'I16 [1234])))) -- 1
+(at (de (ser (as 'I16 [1234]))) 0) -- 1234h
 (at (de (ser ['only])) 0) -- 'only
 
 ;; ════════════════════════════════════════════════════════════════

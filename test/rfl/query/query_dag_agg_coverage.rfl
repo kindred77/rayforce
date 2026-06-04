@@ -71,6 +71,15 @@
 (sum (at (select {n: (count v) by: [k] from: Tsp}) 'n)) -- 5
 ;; Verify identity by comparing with scalar form
 (sum (at (select {n: (count v) by: k from: Tsp}) 'n)) -- 5
+;; Per-group value checks (order-independent, key-masked SOURCE lookup):
+;; mask the SOURCE before grouping so the count is for exactly one key.
+;; A appears at rows 0,3 → count 2; B at rows 1,4 → count 2; C at row 2 → count 1.
+(at (at (select {n: (count v) by: [k] from: Tsp where: (== k 'A)}) 'n) 0) -- 2
+(at (at (select {n: (count v) by: [k] from: Tsp where: (== k 'B)}) 'n) 0) -- 2
+(at (at (select {n: (count v) by: [k] from: Tsp where: (== k 'C)}) 'n) 0) -- 1
+;; Assert the group-key column carries the masked key.
+(at (at (select {n: (count v) by: [k] from: Tsp where: (== k 'A)}) 'k) 0) -- 'A
+(at (at (select {n: (count v) by: [k] from: Tsp where: (== k 'C)}) 'k) 0) -- 'C
 
 ;; key projection: (select {k: k by: [k] from: T}) - single-key identity projection
 ;; is_single_group_key_projection(by=[k], val=k) should return true (skip)
@@ -86,11 +95,27 @@
 (sum (at (select {s: (sum v) by: k from: Tstr}) 's)) -- 15
 ;; aa=4, bb=6, cc=5
 (at (at (select {from: Tstr where: (== k "aa")}) 'v) 0) -- 1
+;; Per-group sum (order-independent, key-masked SOURCE lookup before group):
+;; aa = rows 0,2 = 1+3 = 4; bb = rows 1,3 = 2+4 = 6; cc = row 4 = 5.
+(at (at (select {s: (sum v) by: k from: Tstr where: (== k "aa")}) 's) 0) -- 4
+(at (at (select {s: (sum v) by: k from: Tstr where: (== k "bb")}) 's) 0) -- 6
+(at (at (select {s: (sum v) by: k from: Tstr where: (== k "cc")}) 's) 0) -- 5
+;; Assert the group-key column carries the masked STR key.
+(at (at (select {s: (sum v) by: k from: Tstr where: (== k "aa")}) 'k) 0) -- "aa"
+(at (at (select {s: (sum v) by: k from: Tstr where: (== k "cc")}) 'k) 0) -- "cc"
 
 ;; Multi-key with STR in groups
 (set Tstr2 (table [g1 g2 v] (list ["a" "b" "a" "b" "c"] ["x" "x" "y" "y" "x"] [10 20 30 40 50])))
 (count (select {s: (sum v) by: [g1 g2] from: Tstr2})) -- 5
 (sum (at (select {s: (sum v) by: [g1 g2] from: Tstr2}) 's)) -- 150
+;; Per-group sum via key-masked SOURCE lookup (each pair distinct → 1 row):
+;; (a,x)=10, (b,x)=20, (a,y)=30, (b,y)=40, (c,x)=50.
+(at (at (select {s: (sum v) by: [g1 g2] from: Tstr2 where: (and (== g1 "a") (== g2 "x"))}) 's) 0) -- 10
+(at (at (select {s: (sum v) by: [g1 g2] from: Tstr2 where: (and (== g1 "b") (== g2 "y"))}) 's) 0) -- 40
+(at (at (select {s: (sum v) by: [g1 g2] from: Tstr2 where: (and (== g1 "c") (== g2 "x"))}) 's) 0) -- 50
+;; Assert both group-key columns carry the masked composite key.
+(at (at (select {s: (sum v) by: [g1 g2] from: Tstr2 where: (and (== g1 "a") (== g2 "y"))}) 'g1) 0) -- "a"
+(at (at (select {s: (sum v) by: [g1 g2] from: Tstr2 where: (and (== g1 "a") (== g2 "y"))}) 'g2) 0) -- "y"
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; compile_expr_dag agg opcode switch lines 1254-1263:
@@ -150,13 +175,33 @@
 ;; After WHERE val>15: rows k1='A,k2=1,val=20 and k1='B,k2=2,val=30/40 remain
 ;; Distinct (k1,k2) pairs: ('A,1) and ('B,2) → 2 groups
 (count (select {by: [k1 k2] from: Tnomk where: (> val 15)})) -- 2
+;; The bare count above is a FALSE-POSITIVE: the full table also has exactly 2
+;; distinct (k1,k2) pairs, so it can't tell whether WHERE was applied.  Probe the
+;; WHERE-sensitivity with a key-masked SOURCE lookup.  no-by control proves the
+;; filter itself is correct (1 surviving row → 1 distinct (A,1) group expected).
+(count (select {from: Tnomk where: (and (> val 15) (== k2 1))})) -- 1
+;; xfail BUG (query.c multi-key SYM-vector no-agg by-group path): a no-agg
+;; `select {by: [k1 k2] ... where: ...}` IGNORES the WHERE filter when forming
+;; groups — it groups the UNFILTERED key columns.  The no-by control above proves
+;; the filter is correct (1 surviving row → exactly 1 distinct group (A,1)).  The
+;; grouped path returns 2 (every distinct (k1,k2) pair of the full table).  The
+;; bare `where: (> val 15)` count of 2 above only PASSES because the full table
+;; also has 2 distinct pairs — a coincidence that masked this bug.
+;; (count (select {by: [k1 k2] from: Tnomk where: (and (> val 15) (== k2 1))})) -- 1   ;; xfail BUG: should be 1, produces 2
 
-;; Three-key version: lines 6268 loop iterates 3 times
+;; Three-key version
 (set Tnomk3 (table [k1 k2 k3 val] (list ['A 'A 'B 'B 'C] ['X 'X 'Y 'Y 'Z] [1 1 2 2 3] [5 10 15 20 25])))
 ;; WHERE val > 8 filters out row 0 (val=5)
 ;; Remaining rows: (A,X,1,10),(B,Y,2,15),(B,Y,2,20),(C,Z,3,25)
 ;; Distinct groups: (A,X,1),(B,Y,2),(C,Z,3) → 3 groups
 (count (select {by: [k1 k2 k3] from: Tnomk3 where: (> val 8)})) -- 3
+;; WHERE-sensitivity probe: add `(== k1 'B)`.  no-by control: 2 surviving rows
+;; (both (B,Y,2)) → 1 distinct group expected.
+(count (select {from: Tnomk3 where: (and (> val 8) (== k1 'B))})) -- 2
+;; xfail BUG: same multi-key SYM-vector no-agg by-group WHERE-drop as above.
+;; no-by control: 2 surviving rows (both (B,Y,2)) → 1 distinct group expected.
+;; The 3-key grouped path returns 3 (all distinct triples of the full table).
+;; (count (select {by: [k1 k2 k3] from: Tnomk3 where: (and (> val 8) (== k1 'B))})) -- 1   ;; xfail BUG: should be 1, produces 3
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; No-agg by-group with LIST column (lines 6789-6800)
@@ -170,6 +215,24 @@
 ;; A: first occurrence is row 0 → lst=[1,2]
 ;; B: first occurrence is row 1 → lst=[3,4]
 (count (select {by: k from: Tnoagg_lst})) -- 2
+;; The bare count above can't catch a wrong/swapped first-of-group LIST value.
+;; SYM group emission order is NON-DETERMINISTIC, so index-by-position over the
+;; no-WHERE result is unsafe.  The order-independent way is a key-masked SCALAR
+;; SOURCE lookup (`by: k` + `where: (== k <key>)` → exactly one group), then read
+;; the first-of-group 'lst.  First-of-group: A = row 0 = [1 2]; B = row 1 = [3 4].
+;; xfail BUG (query.c no-agg by-group, non-key LIST column): the LIST column is
+;; DROPPED from the result whenever `where:` is present.  The masked result is
+;; 1x1 (key only) and accessing 'lst raises a domain error.  Verified
+;; LIST-specific: the same shape with a non-key INT column under `where:` keeps
+;; the column (1x2 — see Tsp/Tnomk above), and the LIST column survives when
+;; `where:` is absent (2x2).  Correct first-of-group: A=[1 2], B=[3 4].
+;; (at (at (at (select {by: k from: Tnoagg_lst where: (== k 'A)}) 'lst) 0) 0) -- 1   ;; xfail BUG: 'lst column dropped under where: → domain error
+;; (at (at (at (select {by: k from: Tnoagg_lst where: (== k 'A)}) 'lst) 0) 1) -- 2   ;; xfail BUG: same
+;; (at (at (at (select {by: k from: Tnoagg_lst where: (== k 'B)}) 'lst) 0) 0) -- 3   ;; xfail BUG: same
+;; (at (at (at (select {by: k from: Tnoagg_lst where: (== k 'B)}) 'lst) 0) 1) -- 4   ;; xfail BUG: same
+;; The key column IS retained under WHERE — assert the masked group key (passes):
+(at (at (select {by: k from: Tnoagg_lst where: (== k 'A)}) 'k) 0) -- 'A
+(at (at (select {by: k from: Tnoagg_lst where: (== k 'B)}) 'k) 0) -- 'B
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; expr_contains_call_named recursive return (line 1402 in query.c)
@@ -188,6 +251,13 @@
 ;; Group A: v=[1,3] → distinct=[1,3] → +1=[2,4] → sum=6
 ;; Group B: v=[2,4] → distinct=[2,4] → +1=[3,5] → sum=8
 (sum (at (select {s: (sum (+ (distinct v) 1)) by: k from: Tecdist}) 's)) -- 14
+;; Per-group value checks (key-masked SOURCE lookup; total 14 can't catch a swap):
+;; A: v=[1,3] → distinct+1=[2,4] → sum 6; B: v=[2,4] → [3,5] → sum 8.
+(at (at (select {s: (sum (+ (distinct v) 1)) by: k from: Tecdist where: (== k 'A)}) 's) 0) -- 6
+(at (at (select {s: (sum (+ (distinct v) 1)) by: k from: Tecdist where: (== k 'B)}) 's) 0) -- 8
+;; Assert the group-key column.
+(at (at (select {s: (sum (+ (distinct v) 1)) by: k from: Tecdist where: (== k 'A)}) 'k) 0) -- 'A
+(at (at (select {s: (sum (+ (distinct v) 1)) by: k from: Tecdist where: (== k 'B)}) 'k) 0) -- 'B
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; compile_expr_dag agg switch default (line 1263):

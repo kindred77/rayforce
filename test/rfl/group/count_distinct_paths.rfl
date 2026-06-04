@@ -143,6 +143,24 @@
 (set Rh1 (select {c: (count (distinct v)) from: Th1 by: k}))
 ;; 60000 distinct gids in the key column.
 (count Rh1) -- 60000
+;; Per-group VALUE check (not just the group count): gid g holds rows i with
+;; i % 60000 == g.  For g in 0..39999 that is rows {g, g+60000}; 60000 % 3 == 0
+;; so both rows carry the SAME v % 3 → 1 distinct.  For g in 40000..59999 only
+;; row {g} exists → 1 distinct.  Every group therefore has exactly 1 distinct.
+(min (at Rh1 'c)) -- 1
+(max (at Rh1 'c)) -- 1
+(sum (at Rh1 'c)) -- 60000
+
+;; Same serial global-hash path with VARYING per-group counts so a kernel that
+;; undercounts (or emits a constant) is caught: v = i % 7, 60000 % 7 == 6 != 0.
+;; 2-row groups (g in 0..39999) see two distinct residues → 2; 1-row groups
+;; (g in 40000..59999) → 1.  Sum = 40000*2 + 20000*1 = 100000.
+(set Th2 (table [k v] (list (% (til Nh) 60000) (% (til Nh) 7))))
+(set Rh2 (select {c: (count (distinct v)) from: Th2 by: k}))
+(count Rh2) -- 60000
+(min (at Rh2 'c)) -- 1
+(max (at Rh2 'c)) -- 2
+(sum (at Rh2 'c)) -- 100000
 
 ;; ════════════════════════════════════════════════════════════════════
 ;; 7. count_distinct_per_group_parallel — partitioned kernel
@@ -159,13 +177,44 @@
 (set Tp1 (table [k v] (list (% (til Np) 51000) (as 'F64 (% (til Np) 5)))))
 (set Rp1 (select {c: (count (distinct v)) from: Tp1 by: k}))
 (count Rp1) -- 51000
+;; Per-group VALUE check: gid g holds rows i with i % 51000 == g; 51000 % 5 == 0
+;; so every such row carries the same v % 5 → exactly 1 distinct per group.
+(min (at Rp1 'c)) -- 1
+(max (at Rp1 'c)) -- 1
+(sum (at Rp1 'c)) -- 51000
+
+;; VARYING-count F64 variant through the same partitioned kernel: v = i % 7,
+;; 51000 % 7 == 5.  Group g rows are i = g + 51000*t.  Residues g+5t mod 7 for
+;; t=0..3 are all distinct, so distinct == row-count: g in 0..46999 have 4 rows
+;; (g+153000 < 200000) → 4 distinct; g in 47000..50999 have 3 rows → 3 distinct.
+;; Sum = 47000*4 + 4000*3 = 200000 (every row's v is unique within its group).
+(set Tp1b (table [k v] (list (% (til Np) 51000) (as 'F64 (% (til Np) 7)))))
+(set Rp1b (select {c: (count (distinct v)) from: Tp1b by: k}))
+(count Rp1b) -- 51000
+(min (at Rp1b 'c)) -- 3
+(max (at Rp1b 'c)) -- 4
+(sum (at Rp1b 'c)) -- 200000
 
 ;; Same shape, SYM vals — exercises the SYM esz dispatch in the
-;; partitioned kernel.  3 distinct syms cycling so per-group count
-;; saturates at 3 (or 4 when row count per group rounds favourably).
+;; partitioned kernel.  3 distinct syms cycling.
 (set Tp2 (table [k v] (list (% (til Np) 51000) (take ['x 'y 'z] Np))))
 (set Rp2 (select {c: (count (distinct v)) from: Tp2 by: k}))
 (count Rp2) -- 51000
+;; Per-group VALUE check: 3-sym cycle, 51000 % 3 == 0 → every row in a group
+;; carries the same sym → exactly 1 distinct per group.
+(min (at Rp2 'c)) -- 1
+(max (at Rp2 'c)) -- 1
+(sum (at Rp2 'c)) -- 51000
+
+;; VARYING-count SYM variant: 7-sym cycle reuses the F64 variant's row layout,
+;; so distinct == row-count → 3 or 4 per group, sum 200000.  Catches a SYM
+;; per-group undercount in the partitioned kernel.
+(set Tp2b (table [k v] (list (% (til Np) 51000) (take ['a 'b 'c 'd 'e 'f 'g] Np))))
+(set Rp2b (select {c: (count (distinct v)) from: Tp2b by: k}))
+(count Rp2b) -- 51000
+(min (at Rp2b 'c)) -- 3
+(max (at Rp2b 'c)) -- 4
+(sum (at Rp2b 'c)) -- 200000
 
 ;; ════════════════════════════════════════════════════════════════════
 ;; 8. Multi-key composite group — by [k1 k2]
@@ -196,12 +245,25 @@
 (set Nmk 200000)
 (set Tmkp (table [k1 k2 v] (list (% (til Nmk) 200) (% (til Nmk) 255) (% (til Nmk) 4))))
 (set Rmkp (select {c: (count (distinct v)) from: Tmkp by: [k1 k2]}))
-;; Asserting only that the result has >= 50000 rows (composite cardinality
-;; is data-dependent on the LCM; the planner should produce one row per
-;; observed (k1,k2) pair).  Use a precise count from the table generator:
-;; pairs (i % 200, i % 255) cycle with period lcm(200,255) = 10200 → 10200
+;; Pairs (i % 200, i % 255) cycle with period lcm(200,255) = 10200 → 10200
 ;; distinct pairs.
 (count Rmkp) -- 10200
+;; Per-group VALUE check: a pair occupies one residue class mod 10200; 10200 % 4
+;; == 0 so every row of a pair carries the same v % 4 → 1 distinct per group.
+(min (at Rmkp 'c)) -- 1
+(max (at Rmkp 'c)) -- 1
+(sum (at Rmkp 'c)) -- 10200
+
+;; VARYING-count composite variant: v = i % 23.  Each pair has 19 or 20 rows
+;; (200000 / 10200 ≈ 19.6) and gcd(10200,23)==1, so within a pair the 19–20
+;; rows hit that many distinct residues (all < 23) → distinct == row-count.
+;; Catches a per-group undercount routed through the composite-gid wrapper.
+(set Tmkv (table [k1 k2 v] (list (% (til Nmk) 200) (% (til Nmk) 255) (% (til Nmk) 23))))
+(set Rmkv (select {c: (count (distinct v)) from: Tmkv by: [k1 k2]}))
+(count Rmkv) -- 10200
+(min (at Rmkv 'c)) -- 19
+(max (at Rmkv 'c)) -- 20
+(sum (at Rmkv 'c)) -- 200000
 
 ;; ════════════════════════════════════════════════════════════════════
 ;; 10. SYM key with I64 vals — count_distinct_per_group_buf path

@@ -44,6 +44,20 @@
 ;; non-null with values in [1.0 2.0 3.0]: 3/8 → 26250.
 (count (select {from: TFN where: (in f [1.0 2.0 3.0])})) -- 26250
 (count (select {from: TFN where: (not-in f [1.0 2.0 3.0])})) -- 17500
+;; --- VALUE-LEVEL checks across the worker-shard merge (float+nulls) ---
+;; A count cannot detect a shard that let a null or an out-of-set value
+;; leak through.  Collapse the merged survivor column to a single bool:
+;; every survivor of `in [1 2 3]` must itself be in {1,2,3} (and thus
+;; non-null).  Order- and shard-independent.
+(min (in (at (select {from: TFN where: (in f [1.0 2.0 3.0])}) 'f) [1.0 2.0 3.0])) -- 1
+;; distinct survivor values are exactly {1.0,2.0,3.0} — guards a shard
+;; that merged a 4.0/5.0 row into the match set.
+(count (distinct (at (select {from: TFN where: (in f [1.0 2.0 3.0])}) 'f))) -- 3
+;; sum of survivors: 26250 rows split evenly (8750 each) over 1/2/3 →
+;; 8750*(1+2+3)=52500.  Detects value corruption the count misses.
+(sum (at (select {from: TFN where: (in f [1.0 2.0 3.0])}) 'f)) -- 52500.0
+;; not-in survivors (non-null, value 4 or 5) must NOT be in {1,2,3}.
+(max (in (at (select {from: TFN where: (not-in f [1.0 2.0 3.0])}) 'f) [1.0 2.0 3.0])) -- 0
 
 ;; ====================================================================
 ;; exec_in_worker — RAY_SYM parallel dispatch (L590, IN_READ_I64 sym
@@ -56,6 +70,19 @@
 (count (select {from: TS where: (in s ['AAPL 'TSLA])})) -- 35000
 ;; not-in negation in parallel sym mode.
 (count (select {from: TS where: (not-in s ['AAPL])})) -- 52500
+;; --- VALUE-LEVEL checks across the worker-shard merge ---
+;; A bare count cannot detect a shard that emitted the wrong rows
+;; (e.g. matched GOOG but the survivor still counts).  Assert that
+;; EVERY merged survivor of `in ['AAPL]` actually carries 'AAPL — the
+;; (min (== ...)) collapses the whole merged column to a single bool,
+;; order-independent and shard-independent.
+(min (== (at (select {from: TS where: (in s ['AAPL])}) 's) 'AAPL)) -- 1
+;; every survivor of `not-in ['AAPL]` must NOT be AAPL.
+(max (== (at (select {from: TS where: (not-in s ['AAPL])}) 's) 'AAPL)) -- 0
+;; distinct survivor set of the two-symbol probe is exactly {AAPL,TSLA}
+;; regardless of which shard produced each row.
+(count (distinct (at (select {from: TS where: (in s ['AAPL 'TSLA])}) 's))) -- 2
+(min (in (at (select {from: TS where: (in s ['AAPL 'TSLA])}) 's) ['AAPL 'TSLA])) -- 1
 
 ;; ====================================================================
 ;; exec_in_worker — DATE / TIMESTAMP arms of IN_READ_I64 (L586-589).
@@ -66,6 +93,14 @@
 (set TD (table [d] (list (take [2024.01.01 2024.01.02 2024.01.03] N1))))
 (count (select {from: TD where: (in d [2024.01.01])})) -- 23334
 (count (select {from: TD where: (in d [2024.01.01 2024.01.03])})) -- 46667
+;; --- VALUE-LEVEL checks across the worker-shard merge (DATE) ---
+;; every survivor of the single-date probe must equal that date —
+;; guards a shard that merged a 2024.01.02 row into the match set.
+(min (== (at (select {from: TD where: (in d [2024.01.01])}) 'd) 2024.01.01)) -- 1
+;; two-date probe: distinct survivor dates are exactly {01-01,01-03};
+;; 2024.01.02 must never appear regardless of shard ordering.
+(count (distinct (at (select {from: TD where: (in d [2024.01.01 2024.01.03])}) 'd))) -- 2
+(max (== (at (select {from: TD where: (in d [2024.01.01 2024.01.03])}) 'd) 2024.01.02)) -- 0
 
 ;; ====================================================================
 ;; exec_in_worker — integer path with HAS_NULLS at parallel-pool size.
@@ -78,10 +113,25 @@
 ;; non-null rows in [1 2 3]: 3/8 → 26250.
 (count (select {from: TIN where: (in v [1 2 3])})) -- 26250
 (count (select {from: TIN where: (not-in v [1 2 3])})) -- 17500
+;; --- VALUE-LEVEL checks across the worker-shard merge (int+nulls) ---
+;; every survivor of `in [1 2 3]` must itself be in {1,2,3} (non-null).
+(min (in (at (select {from: TIN where: (in v [1 2 3])}) 'v) [1 2 3])) -- 1
+;; distinct survivor values are exactly {1,2,3}.
+(count (distinct (at (select {from: TIN where: (in v [1 2 3])}) 'v))) -- 3
+;; sum of survivors: 8750 each of 1/2/3 → 8750*6 = 52500.  sum widens
+;; narrow ints to i64 (k/q convention) — expected stays an i64 total.
+(sum (at (select {from: TIN where: (in v [1 2 3])}) 'v)) -- 52500
+;; not-in survivors (value 4 or 5) must NOT be in {1,2,3}.
+(max (in (at (select {from: TIN where: (not-in v [1 2 3])}) 'v) [1 2 3])) -- 0
 ;; not-in with a set that contains nulls — set null is dropped from
 ;; probe buffer (set_has_nulls path); non-null rows compared against
 ;; the compacted probe.
 (count (select {from: TIN where: (in v [1 0Nl 2 3])})) -- 26250
+;; survivors of the null-bearing probe are still exactly {1,2,3}: the
+;; set-null must not match the column-nulls (null is a distinct least
+;; value, never equal under `in`).
+(min (in (at (select {from: TIN where: (in v [1 0Nl 2 3])}) 'v) [1 2 3])) -- 1
+(count (distinct (at (select {from: TIN where: (in v [1 0Nl 2 3])}) 'v))) -- 3
 
 ;; ====================================================================
 ;; NOTE — exec_in_worker col_is_atom branches (L622/632/648/658) are
@@ -121,8 +171,33 @@
 ;; Streamable projection over filtered parted table — also concat-
 ;; merged segment by segment.
 (sum (at (select {from: PT where: (>= v 50)}) 'v)) -- 350
+;; --- ORDER-INDEPENDENT per-row value checks across the merge ---
+;; The count/sum above are blind to a wrong cross-segment combine:
+;; if merge stitched id 5 from one segment to v from another the
+;; totals would not move.  Pin each surviving id's v via a key-masked
+;; lookup (id is the partition-spanning unique key).  id 5 lives in
+;; segment 1 (200/), id 8/9 in segment 2 (300/): a mis-merge that
+;; pairs id with the wrong segment's v column is caught here.
+(at (at (select {from: PT where: (== id 5)}) 'v) 0) -- 50
+(at (at (select {from: PT where: (== id 6)}) 'v) 0) -- 60
+(at (at (select {from: PT where: (== id 7)}) 'v) 0) -- 70
+(at (at (select {from: PT where: (== id 8)}) 'v) 0) -- 80
+(at (at (select {from: PT where: (== id 9)}) 'v) 0) -- 90
+;; assert the masked key column too: a swap that misroutes id along
+;; with v would leave (== id 5) selecting a different physical row.
+(at (at (select {from: PT where: (== id 5)}) 'id) 0) -- 5
+(at (at (select {from: PT where: (== id 9)}) 'id) 0) -- 9
+;; spot-check a non-surviving / boundary id (segment 0) so the
+;; below-threshold half of the parted column is also pinned by value.
+(at (at (select {from: PT where: (== id 1)}) 'v) 0) -- 10
+(at (at (select {from: PT where: (== id 3)}) 'v) 0) -- 30
+;; cardinality of a masked single-key select stays 1 across the merge
+;; (id is unique over all segments — no segment introduces a dup).
+(count (select {from: PT where: (== id 6)})) -- 1
 ;; All-pass predicate: every row from every segment survives → 9.
 (count (select {from: PT where: (>= v 0)})) -- 9
+;; sum of v over the all-pass merge — guards segment-drop / double-count.
+(sum (at (select {from: PT where: (>= v 0)}) 'v)) -- 450
 
 ;; ====================================================================
 ;; ray_result_merge — vector-vector concat over a parted column

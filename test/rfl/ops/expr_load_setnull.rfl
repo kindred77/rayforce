@@ -48,10 +48,20 @@
 (count (at (select {x: (+ f 0Nf) from: T}) 'x)) -- 5
 (sum (map nil? (at (select {x: (+ f 0Nf) from: T}) 'x))) -- 5
 (type (at (select {x: (+ f 0Nf) from: T}) 'x)) -- 'F64
+;; VALUE CHECK: every element is null (not just the right shape/count).
+(nil? (at (at (select {x: (+ f 0Nf) from: T}) 'x) 0)) -- true
+(nil? (at (at (select {x: (+ f 0Nf) from: T}) 'x) 2)) -- true
+(nil? (at (at (select {x: (+ f 0Nf) from: T}) 'x) 4)) -- true
+;; sum skips nulls → empty-of-nulls sums to 0.0 (no garbage leaked in).
+(sum (at (select {x: (+ f 0Nf) from: T}) 'x)) -- 0.0
 
 ;; Symmetric: null on the LHS — exercises the `if (l_scalar &&
 ;; scalar_is_null(lhs))` arm (expr.c:1224).  Same F64 set_all_null fill.
 (sum (map nil? (at (select {x: (+ 0Nf f) from: T}) 'x))) -- 5
+;; VALUE CHECK: LHS-null fill produces an all-null F64 vector too.
+(nil? (at (at (select {x: (+ 0Nf f) from: T}) 'x) 0)) -- true
+(nil? (at (at (select {x: (+ 0Nf f) from: T}) 'x) 4)) -- true
+(sum (at (select {x: (+ 0Nf f) from: T}) 'x)) -- 0.0
 
 ;; --------------------------------------------------------------------
 ;; SECTION 2 — set_all_null I64/TIMESTAMP branch (already 114 hits,
@@ -61,6 +71,11 @@
 ;; a shape (vec col + null I64 scalar inside select) that today only
 ;; fires via REPL-level atomic_map_binary.
 (sum (map nil? (at (select {x: (+ i 0Nl) from: T}) 'x))) -- 5
+;; VALUE CHECK: all-null I64 vector; nothing leaked from the i column.
+(type (at (select {x: (+ i 0Nl) from: T}) 'x)) -- 'I64
+(nil? (at (at (select {x: (+ i 0Nl) from: T}) 'x) 0)) -- true
+(nil? (at (at (select {x: (+ i 0Nl) from: T}) 'x) 4)) -- true
+(sum (at (select {x: (+ i 0Nl) from: T}) 'x)) -- 0
 
 ;; --------------------------------------------------------------------
 ;; SECTION 3 — set_all_null I32/DATE/TIME branch
@@ -71,12 +86,23 @@
 (set TI32 (table [a b] (list (as 'I32 [10 20 30 40]) [100 200 300 400])))
 (count (at (select {x: (+ a 0Ni) from: TI32}) 'x)) -- 4
 (sum (map nil? (at (select {x: (+ a 0Ni) from: TI32}) 'x))) -- 4
+;; VALUE CHECK: result type I32, every element null, no leaked a-values.
+(type (at (select {x: (+ a 0Ni) from: TI32}) 'x)) -- 'I32
+(nil? (at (at (select {x: (+ a 0Ni) from: TI32}) 'x) 0)) -- true
+(nil? (at (at (select {x: (+ a 0Ni) from: TI32}) 'x) 3)) -- true
+;; sum skips nulls; narrow I32 sum widens to i64.
+(sum (at (select {x: (+ a 0Ni) from: TI32}) 'x)) -- 0
+(type (sum (at (select {x: (+ a 0Ni) from: TI32}) 'x))) -- 'i64
 
 ;; DATE col + I32 null atom shares the I32 path (DATE is in the same
 ;; promote_type bucket; opt.c:62).  Result vec type is DATE — still
 ;; routed through the I32-width arm of set_all_null.
 (set TD (table [d v] (list [2024.01.01 2024.06.15 2024.12.31] [1 2 3])))
 (sum (map nil? (at (select {x: (+ d 0Ni) from: TD}) 'x))) -- 3
+;; VALUE CHECK: each element null (no original DATE value survives the fill).
+(nil? (at (at (select {x: (+ d 0Ni) from: TD}) 'x) 0)) -- true
+(nil? (at (at (select {x: (+ d 0Ni) from: TD}) 'x) 1)) -- true
+(nil? (at (at (select {x: (+ d 0Ni) from: TD}) 'x) 2)) -- true
 
 ;; --------------------------------------------------------------------
 ;; SECTION 4 — set_all_null I16 branch
@@ -87,6 +113,11 @@
 (set TI16 (table [h] (list (as 'I16 [1 2 3 4 5 6 7]))))
 (count (at (select {x: (+ h 0Nh) from: TI16}) 'x)) -- 7
 (sum (map nil? (at (select {x: (+ h 0Nh) from: TI16}) 'x))) -- 7
+;; VALUE CHECK: I16 result, all elements null, no leaked h-values.
+(type (at (select {x: (+ h 0Nh) from: TI16}) 'x)) -- 'I16
+(nil? (at (at (select {x: (+ h 0Nh) from: TI16}) 'x) 0)) -- true
+(nil? (at (at (select {x: (+ h 0Nh) from: TI16}) 'x) 6)) -- true
+(sum (at (select {x: (+ h 0Nh) from: TI16}) 'x)) -- 0
 
 ;; --------------------------------------------------------------------
 ;; SECTION 5 — par_binary_str_fn parallel dispatch
@@ -104,12 +135,27 @@
 (count (select {from: TSTR where: (== s "aa")})) -- 23334
 ;; '!= "aa"' → complement; 70000 - 23334 = 46666.
 (count (select {from: TSTR where: (!= s "aa")})) -- 46666
+;; VALUE CHECK: verify the mask selects the RIGHT rows, not just the
+;; right count.  'aa is row 0,3,6,…; matched n-values must be 0,3,6.
+(at (at (select {n: n from: TSTR where: (== s "aa")}) 'n) 0) -- 0
+(at (at (select {n: n from: TSTR where: (== s "aa")}) 'n) 1) -- 3
+(at (at (select {n: n from: TSTR where: (== s "aa")}) 'n) 2) -- 6
+;; All matched rows must be ≡ 0 (mod 3): sum of (n % 3) over matches = 0.
+(sum (map (fn [x] (% x 3)) (at (select {n: n from: TSTR where: (== s "aa")}) 'n))) -- 0
+;; Complement must contain NO row ≡ 0 (mod 3): min (n % 3) over the
+;; '!= "aa"' set is 1, never 0.
+(min (map (fn [x] (% x 3)) (at (select {n: n from: TSTR where: (!= s "aa")}) 'n))) -- 1
 
 ;; STR col == STR col via concat — two STR columns of the same length
 ;; comparing one another.  Hits par_binary_str_fn with both sides
 ;; non-scalar (l_scalar=false, r_scalar=false).
 (set TSTR2 (table [s t] (list (map (fn [x] (as 'STR x)) (take ['aa 'bb 'cc] N_PAR)) (map (fn [x] (as 'STR x)) (take ['aa 'bb 'cc] N_PAR)))))
 (count (select {from: TSTR2 where: (== s t)})) -- 70000
+;; NEGATIVE VALUE CHECK: comparison is real, not always-true.  Shift the
+;; second column by one position (bb,cc,aa) so s != t on every row.
+(set TSTR3 (table [s u] (list (map (fn [x] (as 'STR x)) (take ['aa 'bb 'cc] N_PAR)) (map (fn [x] (as 'STR x)) (take ['bb 'cc 'aa] N_PAR)))))
+(count (select {from: TSTR3 where: (== s u)})) -- 0
+(count (select {from: TSTR3 where: (!= s u)})) -- 70000
 
 ;; --------------------------------------------------------------------
 ;; SECTION 6 — expr_load_f64 reachability probe (documentary)
@@ -123,3 +169,7 @@
 ;; function remains 0% after this file runs).
 (sum (at (select {x: (+ i f) from: T}) 'x)) -- 27.5
 (type (at (select {x: (+ i f) from: T}) 'x)) -- 'F64
+;; VALUE CHECK: per-element i+f, not just the aggregate.  i=[1..5],
+;; f=[0.5..4.5] → [1.5,3.5,5.5,7.5,9.5]; pin first and last.
+(at (at (select {x: (+ i f) from: T}) 'x) 0) -- 1.5
+(at (at (select {x: (+ i f) from: T}) 'x) 4) -- 9.5

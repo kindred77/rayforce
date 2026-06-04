@@ -104,14 +104,22 @@
 ;; boolc alternates [true,false] for 50 rows = 25 trues + 25 falses.
 ;; Set {1.0} matches only true rows = 25.
 (count (select {from: TY where: (in boolc [1.0])})) -- 25
+;; true rows are even indices 0,2,..,48; sum of matched i64c = 600.
+(sum   (at (select {from: TY where: (in boolc [1.0])}) 'i64c)) -- 600
 ;; Set {0.0} matches only false rows = 25.
 (count (select {from: TY where: (in boolc [0.0])})) -- 25
+;; false rows are odd indices 1,3,..,49; sum of matched i64c = 625.
+(sum   (at (select {from: TY where: (in boolc [0.0])}) 'i64c)) -- 625
 ;; Set {0.0,1.0} matches both = 50.
 (count (select {from: TY where: (in boolc [0.0 1.0])})) -- 50
+;; all 50 rows match; sum of i64c (0..49) = 1225.
+(sum   (at (select {from: TY where: (in boolc [0.0 1.0])}) 'i64c)) -- 1225
 
 ;; not-in symmetry: I64 col with float set, negate=1.
 ;; 50 rows total minus 3 matches = 47.
 (count (select {from: TY where: (not-in i64c [1.0 2.0 3.0])})) -- 47
+;; sum of i64c (0..49)=1225 minus the 3 dropped values (1+2+3=6) = 1219.
+(sum   (at (select {from: TY where: (not-in i64c [1.0 2.0 3.0])}) 'i64c)) -- 1219
 
 ;; ====================================================================
 ;; Cleanup

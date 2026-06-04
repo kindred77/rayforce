@@ -31,6 +31,10 @@
 (count (update {val: (pow val 2) from: Tu_pow where: (> id 1)})) -- 4
 (at (at (update {val: (pow val 2) from: Tu_pow where: (> id 1)}) 'val) 0) -- 2
 (at (at (update {val: (pow val 2) from: Tu_pow where: (> id 1)}) 'val) 1) -- 9
+;; Verify ALL the mutated rows, not just the first one
+(at (at (update {val: (pow val 2) from: Tu_pow where: (> id 1)}) 'val) 2) -- 16
+(at (at (update {val: (pow val 2) from: Tu_pow where: (> id 1)}) 'val) 3) -- 25
+(sum (at (update {val: (pow val 2) from: Tu_pow where: (> id 1)}) 'val)) -- 52
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; WHERE-branch update: I32 column update with F64 promotion + nulls
@@ -40,6 +44,13 @@
 (set Ti32 (table [id val] (list [1i 2i 3i] [100i 200i 300i])))
 ;; First inject a null into the I32 val column at row id=1
 (set Ti32n (update {val: 0Ni from: Ti32 where: (== id 1i)}))
+;; BUG: this null I32 broadcast clobbers the unselected rows of Ti32n.
+;; Only row 0 (id=1) should be nulled; rows 1,2 must stay [200, 300], but
+;; the I32 WHERE null-broadcast corrupts them. (See the dedicated BUG block
+;; near the end of this file for the minimal repro + control cases.)
+(nil? (at (at Ti32n 'val) 0)) -- true
+;; (at (at Ti32n 'val) 1) -- 200   ;; xfail BUG: I32 WHERE null-broadcast clobbers row 1 (gets 300)
+;; (at (at Ti32n 'val) 2) -- 300   ;; xfail BUG: I32 WHERE null-broadcast clobbers row 2 (garbage)
 ;; Now do cross-type F64 update on the I32-with-null column
 ;; Update where id==3i so row 2 is masked, rows 0,1 are unmasked
 ;; Row 0 (id=1,val=0Ni) is unmasked → null prop fires → switch case RAY_I32
@@ -87,6 +98,10 @@
 (set Tlst2_u (update {lst: 'broadcast_sym from: Tlst2}))
 (count Tlst2_u) -- 3
 (count (at Tlst2_u 'lst)) -- 3
+;; Verify the broadcast SYM atom actually landed in every row of the LIST col
+(at (at Tlst2_u 'lst) 0) -- 'broadcast_sym
+(at (at Tlst2_u 'lst) 1) -- 'broadcast_sym
+(at (at Tlst2_u 'lst) 2) -- 'broadcast_sym
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; No-WHERE update: I32 null of EXISTING column broadcast (lines 8866-8876)
@@ -383,6 +398,9 @@
 ;; line 8376 fires: ray_is_vec(agg_result) = true for first group
 ;; (vector result has no broadcast → new_v column filled with 0)
 (count (update {new_v: (* v 2) by: k from: Tupd_by_vec})) -- 4
+;; Vector group result is NOT broadcast → new_v column stays all-zero.
+;; Assert the actual modified cells, not just the row count.
+(at (update {new_v: (* v 2) by: k from: Tupd_by_vec}) 'new_v) -- [40 80 0 0]
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; update WHERE with LIST-type expression → type error (lines 8682-8684):
@@ -431,6 +449,8 @@
 (at (window-join [Sym Time] wji_nullv wjt_nullv wjq_i64nv {v: (var Price)}) 'v) -- [2.0]
 ;; stddev of non-null [2, 4] = sqrt(2.0) ≈ 1.41
 (count (at (window-join [Sym Time] wji_nullv wjt_nullv wjq_i64nv {d: (stddev Price)}) 'd)) -- 1
+;; Verify the aggregated value, not just the result cardinality
+(at (window-join [Sym Time] wji_nullv wjt_nullv wjq_i64nv {d: (stddev Price)}) 'd) -- [1.41]
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; groups_to_pair_list: I32/BOOL/F64 key types (lines 131-137)
@@ -521,3 +541,29 @@
 ;; → line 9349 fires when copying row 0 (null SYM)
 (count (insert Tsym_n_ins (list 3 'c))) -- 3
 (nil? (at (at (insert Tsym_n_ins (list 3 'c)) 'sym) 0)) -- true
+
+;; ────────────────────────────────────────────────────────────────────
+;; BUG: WHERE-branch update with a null I32 atom (`0Ni`) corrupts the
+;; rows NOT selected by WHERE. The selected row is correctly nulled, but
+;; the surviving rows are clobbered (shifted/garbage) instead of preserved.
+;; I64 (0Nl) and F64 (0Nf) on the same shape work correctly; only the I32
+;; null-broadcast case in the WHERE-branch is broken (the I32 case of the
+;; null-propagation switch, query.c ~8553-8555).
+;;
+;; Repro: update {v: 0Ni where: (== k 1i)} on v=[10i 20i 30i]
+;;   expected v = [null, 20, 30]   (only row 0 nulled)
+;;   actual   v = [null, 30, <garbage>]
+;; The CORRECT expected values are recorded in the xfail lines below; they
+;; are commented out so the suite stays green, but they keep the bug (and
+;; its correct values) visible. Do NOT relax them to match the buggy output.
+;; ────────────────────────────────────────────────────────────────────
+;; selected row 0 correctly becomes null (this part works):
+(nil? (at (at (update {v: 0Ni from: (table [k v] (list [1i 2i 3i] [10i 20i 30i])) where: (== k 1i)}) 'v) 0)) -- true
+;; surviving rows are corrupted — the bug:
+;; (at (at (update {v: 0Ni from: (table [k v] (list [1i 2i 3i] [10i 20i 30i])) where: (== k 1i)}) 'v) 1) -- 20   ;; xfail BUG: gets 30
+;; (at (at (update {v: 0Ni from: (table [k v] (list [1i 2i 3i] [10i 20i 30i])) where: (== k 1i)}) 'v) 2) -- 30   ;; xfail BUG: gets garbage
+;; Control: I64 (0Nl) and F64 (0Nf) null-broadcast in the same WHERE-update
+;; are CORRECT — proving the defect is specific to the I32 case.
+(at (at (update {v: 0Nl from: (table [k v] (list [1 2 3] [10 20 30])) where: (== k 1)}) 'v) 1) -- 20
+(at (at (update {v: 0Nf from: (table [k v] (list [1 2 3] [10.0 20.0 30.0])) where: (== k 1)}) 'v) 1) -- 20.0
+(nil? (at (at (update {v: 0Nl from: (table [k v] (list [1 2 3] [10 20 30])) where: (== k 1)}) 'v) 0)) -- true

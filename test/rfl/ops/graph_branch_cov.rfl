@@ -47,23 +47,36 @@
 (sum (at (select {r: (% y x) from: T2}) 'r)) -- 0
 
 ;; Comparison in WHERE
+;; count verifies cardinality; sum-of-surviving-x verifies WHICH rows passed.
 (count (select {from: T2 where: (== x 3)})) -- 1
+(sum (at (select {x: x from: T2 where: (== x 3)}) 'x)) -- 3
 (count (select {from: T2 where: (!= x 3)})) -- 4
+(sum (at (select {x: x from: T2 where: (!= x 3)}) 'x)) -- 12
 (count (select {from: T2 where: (> x 3)})) -- 2
+(sum (at (select {x: x from: T2 where: (> x 3)}) 'x)) -- 9
 (count (select {from: T2 where: (>= x 3)})) -- 3
+(sum (at (select {x: x from: T2 where: (>= x 3)}) 'x)) -- 12
 (count (select {from: T2 where: (< x 3)})) -- 2
+(sum (at (select {x: x from: T2 where: (< x 3)}) 'x)) -- 3
 (count (select {from: T2 where: (<= x 3)})) -- 3
+(sum (at (select {x: x from: T2 where: (<= x 3)}) 'x)) -- 6
 
 ;; Logical AND/OR
+;; x>2 -> {3,4,5}; y<40 -> rows{1,2,3,4,5}->x{1,2,3}; intersection x=3.
 (count (select {from: T2 where: (and (> x 2) (< y 40))})) -- 1
+(sum (at (select {x: x from: T2 where: (and (> x 2) (< y 40))}) 'x)) -- 3
+;; x==1 or x==5 -> surviving x {1,5}, sum 6.
 (count (select {from: T2 where: (or (== x 1) (== x 5))})) -- 2
+(sum (at (select {x: x from: T2 where: (or (== x 1) (== x 5))}) 'x)) -- 6
 
 ;; Unary ops
 (sum (at (select {r: (neg x) from: T2}) 'r)) -- -15
 (sum (at (select {r: (abs (neg x)) from: T2}) 'r)) -- 15
 
 ;; Cast
+;; type guards the result dtype; sum verifies the cast values [1.0..5.0].
 (type (at (select {r: (as 'F64 x) from: T2}) 'r)) -- 'F64
+(sum (at (select {r: (as 'F64 x) from: T2}) 'r)) -- 15.0
 
 ;; Aggregation
 (at (at (select {n: (count x) from: T2}) 'n) 0) -- 5
@@ -83,4 +96,6 @@
 (sum (at (select {r: (if (> x 3) y 0) from: T2}) 'r)) -- 90
 
 ;; Like pattern
+;; count verifies cardinality; the surviving s value verifies it matched 'a'.
 (count (select {from: T2 where: (like s "a")})) -- 1
+(at (at (select {s: s from: T2 where: (like s "a")}) 's) 0) -- 'a
