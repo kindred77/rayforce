@@ -33,11 +33,12 @@
 ;; Exact pattern — hits SHAPE_EXACT.
 (count (select {from: PStr where: (like s "fig")})) -- 1
 (first (at (select {from: PStr where: (like s "fig")}) 's)) -- "fig"
-;; Wildcard — SHAPE_ANY, matches all.  Pure cardinality invariant:
-;; every row matches, so count alone fully pins the result.  (The raw
-;; unfiltered parted STR column renders as <?> and asc rejects it — the
-;; filtered patterns above already value-check the materialised rows.)
+;; Wildcard — SHAPE_ANY, matches all.  FIXED: the all-pass filter on a
+;; parted STR column now materializes the segmented column (exec.c
+;; flatten_parted_col on the no-selection finalization path) instead of
+;; returning it un-materialized, so the values are now reachable/value-checked.
 (count (select {from: PStr where: (like s "*")})) -- 6
+(asc (at (select {from: PStr where: (like s "*")}) 's)) -- ["apple" "banana" "cherry" "date" "elderberry" "fig"]
 ;; No-match pattern.
 (count (select {from: PStr where: (like s "xyz*")})) -- 0
 ;; Character class — forces SHAPE_NONE general matcher.
@@ -64,8 +65,9 @@
 ;; Exact match.
 (count (select {from: PSym where: (like s "fig")})) -- 1
 (first (at (select {from: PSym where: (like s "fig")}) 's)) -- 'fig
-;; Universal wildcard.  Pure cardinality invariant: every row matches.
+;; Universal wildcard.  FIXED: all-pass parted SYM column now materializes.
 (count (select {from: PSym where: (like s "*")})) -- 6
+(asc (at (select {from: PSym where: (like s "*")}) 's)) -- ['apple 'banana 'cherry 'date 'elderberry 'fig]
 ;; No-match.
 (count (select {from: PSym where: (like s "zzz*")})) -- 0
 ;; Class pattern.

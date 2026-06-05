@@ -88,13 +88,14 @@
 (count (select {from: PT where: (> id 2)})) -- 3
 (first (at (select {from: PT where: (> id 2)}) 'name)) -- "charlie"
 (count (select {from: PT where: (> id 0)})) -- 5
-;; BUG: an ALL-PASS filter on a parted STR table returns the 'name column
-;; un-materialized (still segmented) — (at … 'name)/(count …)/(first …) all
-;; raise `type` / render as <?>.  A PARTIAL filter that still keeps every row
-;; of both partitions (>= id 2 keeps 4 of 5) materializes correctly, so the
-;; defect is specific to the all-pass short-circuit in exec_filter on parted
-;; STR columns.  The all-pass count above stays a length-only invariant because
-;; its column cannot be read; value-check the working partial path instead.
+;; FIXED: an ALL-PASS filter on a parted STR table now materializes the 'name
+;; column (exec.c flatten_parted_col on the no-selection finalization path),
+;; so (at … 'name)/(first …) are reachable instead of raising `type`.  All 5
+;; rows survive in partition order: alice,bob,charlie (part 1), dave,eve (part 2).
+(first (at (select {from: PT where: (> id 0)}) 'name)) -- "alice"
+(at (at (select {from: PT where: (> id 0)}) 'name) 4) -- "eve"
+(asc (at (select {from: PT where: (> id 0)}) 'name)) -- ["alice" "bob" "charlie" "dave" "eve"]
+;; PARTIAL filter cross-check (always worked):
 (first (at (select {from: PT where: (>= id 2)}) 'name)) -- "bob"
 (at (at (select {from: PT where: (>= id 2)}) 'name) 3) -- "eve"
 
