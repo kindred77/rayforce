@@ -86,18 +86,15 @@
 (at (at Pnz 'x) 1) -- 0.0
 (at (at Pnz 'x) 2) -- 2.5
 
-;; ── F64 pivot-KEY column with -0.0 (REAL BUG: clear_neg_zero collides slot '0') ──
-;; pivot KEY is F64 holding 0.0 and -0.0. clear_neg_zero (pivot.c:665) folds
-;; both distinct pivot-value groups into column name "0", but the scatter keys
-;; on the distinct-value index, NOT the collapsed name — so two same-named
-;; columns are emitted and (at Pkz '0) resolves to only the FIRST (the 0.0
-;; group, value 7). The -0.0 group's value (9) lands in the shadowed second
-;; "0" column and is unreachable by name.
-;; xfail BUG: (sum (at Pkz '0)) should be 16 (7+9 under one merged column);
-;; live-pinned to the buggy 7 below.
+;; ── F64 pivot-KEY column with -0.0 (FIXED) ──
+;; pivot KEY is F64 holding 0.0 and -0.0.  FIXED: ray_pivot_fn collapses
+;; -0.0 -> +0.0 in the F64 pivot key once up front (cold-path bit-check, not in
+;; the group-by hot loop), so 0.0/-0.0 form ONE merged "0" column carrying both
+;; values; previously they split into two same-named "0" columns and (at Pkz
+;; '0) saw only the first (value 7), shadowing the -0.0 value 9.
 (set tkz (table [r c v] (list ['A 'A] [0.0 -0.0] [7 9])))
 (set Pkz (pivot tkz 'r 'c 'v sum))
-(sum (at Pkz '0)) -- 7
+(sum (at Pkz '0)) -- 16
 
 ;; ────────────── pivot with vector row-key (multi-key) ──────────────
 (set tm (table [r c v] (list [1 1 2 2] ['x 'y 'x 'y] [10 20 30 40])))

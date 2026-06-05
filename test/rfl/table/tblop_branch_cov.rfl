@@ -331,16 +331,16 @@
 ;; 0.0 and -0.0 normalize to the single pivot column "0".
 (count (key Pnz)) -- 2
 (count (at Pnz '0)) -- 2
-;; VALUE-CHECK (xfail): the "0" column must hold the real aggregates, not
-;; zero-fill.  Group A = sum[1,2] = 3, group B = sum[3,4] = 7, col sum = 10.
-;; xfail BUG: negative-zero F64 pivot values leave the value column entirely
-;; zero-filled — after clear_neg_zero collapses 0.0/-0.0 into one pivot slot,
-;; the scatter `if (gm_pv[gi] != p) continue;` never matches, so every cell
-;; stays at its 0 init.  Observed: all cells 0 (col sum 0).  Correct expected
-;; recorded below so the bug stays visible; re-enable once tblop.c is fixed.
-;; (at (at Pnz '0) 0) -- 3    ;; xfail BUG: gets 0 (zero-fill not overwritten)
-;; (at (at Pnz '0) 1) -- 7    ;; xfail BUG: gets 0
-;; (sum (at Pnz '0)) -- 10    ;; xfail BUG: gets 0
+;; VALUE-CHECK: the "0" column holds the real aggregates.  Group A = sum[1,2]
+;; = 3, group B = sum[3,4] = 7, col sum = 10.
+;; FIXED: ray_pivot_fn collapses -0.0 -> +0.0 in the F64 pivot KEY once up
+;; front (a cold-path bit-check over the key column, NOT in the group-by hot
+;; loop, so the -fno-signed-zeros vectorization is untouched), so 0.0/-0.0
+;; group into one "0" column carrying the merged sums.  Deterministic across
+;; platforms (bit-check, independent of release FP codegen).
+(at (at Pnz '0) 0) -- 3
+(at (at Pnz '0) 1) -- 7
+(sum (at Pnz '0)) -- 10
 
 ;; ══════════════════════════════════════════════════════════════════
 ;; Section 24: pivot_fn_to_agg_op — all known builtins (lines 43-53)
