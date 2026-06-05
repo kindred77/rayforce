@@ -67,14 +67,16 @@
 (count Ri32v) -- 3
 ;; k=1: 100+200=300, k=2: 300+400=700, k=3: 500+600=1100
 (sum (at Ri32v 's)) -- 2100
-;; BUG: DA path emits grouped min/max for narrow int agg types (I32/I16/U8)
-;; using ((int64_t*)data)[gi] = v, writing 8 bytes into a 4-byte-stride I32
-;; column.  gi=0 low-4 bytes are correct; gi>=1 land at wrong offset, reading
-;; as 0 (the hi-32 of the previous I64 write).  Assertions checking gi>=1 are
-;; commented out until the emit path is fixed to respect the output element size.
+;; FIXED: the DA/HT emit path now stores grouped min/max for narrow-int agg
+;; types (I32/I16/U8) at the output element width (topk_write_i64 +
+;; ray_sym_elem_size) instead of a fixed 8-byte int64 store, so groups past
+;; index 0 land at the right offset.  Groups emit in key order 1,2,3.
 (at (at Ri32v 'mn) 0) -- 100
 (at (at Ri32v 'mx) 0) -- 200
-;; BUG (at (at Ri32v 'mn) 1) -- 300  ;; gets 0 (hi-32 of prev I64 write)
+(at (at Ri32v 'mn) 1) -- 300
+(at (at Ri32v 'mx) 1) -- 400
+(at (at Ri32v 'mn) 2) -- 500
+(at (at Ri32v 'mx) 2) -- 600
 ;; Per-group order-independent checks. sum widens I32→i64 so it is immune to
 ;; the narrow-int min/max emit bug above; key-masked sum pins each group total.
 (at (at (select {s: (sum v) from: Ti32v by: k where: (== k 1)}) 's) 0) -- 300

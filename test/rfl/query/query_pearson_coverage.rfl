@@ -18,28 +18,24 @@
 ;; Non-by select with pearson_corr → returns 1-row table
 (count (select {r: (pearson_corr x y) from: Tp1})) -- 1
 ;; Value check: y=2x is perfectly positively correlated → r should be 1.0.
-;; xfail BUG: the non-by scalar pearson_corr path (s_has_binary/ray_group2
-;; branch in src/ops/query.c) returns an integer 0 instead of computing the
-;; float correlation. The by-group path (exec_group_pearson_rowform) is
-;; correct (see Tp5 below). Correct expected: r ≈ 1.0.
-;; Pin current (buggy) value live so the bug is visible, not hidden:
-(at (at (select {r: (pearson_corr x y) from: Tp1}) 'r) 0) -- 0
+;; FIXED: the non-by scalar pearson_corr path now routes through the HT
+;; reducer (group.c scalar fast-path skips binary aggregators), computing
+;; the real correlation instead of returning integer 0.
+(< (abs (- (at (at (select {r: (pearson_corr x y) from: Tp1}) 'r) 0) 1.0)) 1e-9) -- true
 
 ;; Anti-correlated pair
 (set Tp2 (table [x y] (list [1 2 3 4 5] [-1 -2 -3 -4 -5])))
 (count (select {r: (pearson_corr x y) from: Tp2})) -- 1
 ;; Value check: y=-x is perfectly anti-correlated → r should be -1.0.
-;; xfail BUG: same non-by scalar pearson_corr bug as Tp1 — returns 0.
-;; Correct expected: r ≈ -1.0. Pin current (buggy) value live:
-(at (at (select {r: (pearson_corr x y) from: Tp2}) 'r) 0) -- 0
+;; FIXED (same scalar-path fix as Tp1).
+(< (abs (- (at (at (select {r: (pearson_corr x y) from: Tp2}) 'r) 0) -1.0)) 1e-9) -- true
 
 ;; pearson_corr with WHERE predicate
 (set Tp4 (table [x y z] (list [1 2 3 4] [2 4 6 8] ['A 'B 'A 'B])))
 (count (select {r: (pearson_corr x y) from: Tp4 where: (== z 'A)})) -- 1
 ;; Value check: z='A rows are x=[1,3], y=[2,6] (y=2x) → r should be 1.0.
-;; xfail BUG: same non-by scalar pearson_corr bug — returns 0 even after
-;; WHERE filtering. Correct expected: r ≈ 1.0. Pin current (buggy) value:
-(at (at (select {r: (pearson_corr x y) from: Tp4 where: (== z 'A)}) 'r) 0) -- 0
+;; FIXED (same scalar-path fix as Tp1); WHERE filter applied before the reduce.
+(< (abs (- (at (at (select {r: (pearson_corr x y) from: Tp4 where: (== z 'A)}) 'r) 0) 1.0)) 1e-9) -- true
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; By-group pearson_corr: fused group with binary agg
