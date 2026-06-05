@@ -33,25 +33,40 @@
 ;; distinct returns lazy — chain extends through count.
 (set V [1 1 2 2 3 3])
 (count (distinct V)) -- 3
+;; Value-check: distinct must dedupe to the sorted unique contents, not
+;; just yield the right cardinality.
+(distinct V) -- [1 2 3]
+;; distinct sorts numerics — out-of-order input dedupes to ascending.
+(distinct [3 1 2 1 3]) -- [1 2 3]
 
 ;; The chain still works when reused.
 (count (distinct [4 4 4 4])) -- 1
+;; Value-check: all-equal input collapses to the single value.
+(distinct [4 4 4 4]) -- [4]
 
 ;; asc returns lazy — chain extends through count.
 (set V [1 2 3 4 5])
 (count (asc V)) -- 5
+;; Value-check: asc materialises the fully sorted vector.
+(asc [3 1 4 1 5 9 2 6]) -- [1 1 2 3 4 5 6 9]
 
 ;; asc preserves order semantics through the chain.
 (first (asc [3 1 4 1 5 9 2 6])) -- 1
+(last  (asc [3 1 4 1 5 9 2 6])) -- 9
 
 ;; desc returns lazy — chain extends through count.
 (count (desc V)) -- 5
+;; Value-check: desc materialises the fully reverse-sorted vector.
+(desc [3 1 4 1 5 9 2 6]) -- [9 6 5 4 3 2 1 1]
 
 ;; desc reverses sort order; first(desc) = max element.
 (first (desc [3 1 4 1 5 9 2 6])) -- 9
+(last  (desc [3 1 4 1 5 9 2 6])) -- 1
 
 ;; reverse returns lazy — chain extends through count.
 (count (reverse V)) -- 5
+;; Value-check: reverse materialises the element-reversed vector.
+(reverse [1 2 3 4 5]) -- [5 4 3 2 1]
 
 ;; reverse swaps endpoints; first(reverse) = original last element.
 (first (reverse [1 2 3 4 5])) -- 5

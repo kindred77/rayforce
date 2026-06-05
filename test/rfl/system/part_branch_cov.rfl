@@ -60,6 +60,20 @@
 ;; sym-typed partition key reports under 'part, not 'date
 (first (key Pdl)) -- 'part
 (key Pdl) -- ['part 'v]
+;; value check: the on-disk 'v column carries [1 2] (2024.13.45) + [3 4 5]
+;; (2024.99.01).  Whole-column aggregates materialise the parted segments.
+;; BUG: a raw whole-column read `(at Pdl 'v)` returns the column
+;; UN-MATERIALISED — it renders as <?> instead of [1 2 3 4 5] — so we verify
+;; via aggregates (which have a parted code path) and a PARTIAL filter.
+(sum (at Pdl 'v)) -- 15
+(min (at Pdl 'v)) -- 1
+(max (at Pdl 'v)) -- 5
+;; partial filter dropping v<=2 leaves [3 4 5] -> sum 12, 3 rows
+(set Rdl (select {s: (sum v) from: Pdl where: (> v 2)}))
+(at Rdl 's) -- [12]
+(set Rdl2 (select {from: Pdl where: (> v 2)}))
+(count Rdl2) -- 3
+(sum (at Rdl2 'v)) -- 12
 
 ;; month == 00 (below range) — exercises the `month >= 1` lower bound.
 (set MZ-A (table [v] (list [7])))
@@ -67,6 +81,9 @@
 (set Pmz (.db.parted.get "/tmp/rfl_pbc_monthzero/" 't))
 (count Pmz) -- 1
 (first (key Pmz)) -- 'part
+;; value check: single on-disk row carries v=7
+(sum (at Pmz 'v)) -- 7
+(min (at Pmz 'v)) -- 7
 
 ;; day == 00 (below range) with a valid month — exercises the `day >= 1`
 ;; lower bound in isolation (only the day check rejects the name).
@@ -75,6 +92,10 @@
 (set Pdz (.db.parted.get "/tmp/rfl_pbc_dayzero/" 't))
 (count Pdz) -- 2
 (first (key Pdz)) -- 'part
+;; value check: the on-disk 'v column carries [8 9]
+(sum (at Pdz 'v)) -- 17
+(min (at Pdz 'v)) -- 8
+(max (at Pdz 'v)) -- 9
 
 ;; ────────────── infer_mc_type early break (!all_date && !all_int) ──────────────
 ;; Three dirs.  Sorted order: "100", "2024.01.01", "9.9.9".
@@ -93,6 +114,14 @@
 (count Pmx) -- 6
 (count (key Pmx)) -- 2
 (first (key Pmx)) -- 'part
+;; value check: on-disk 'v carries [1] + [2 2] + [3 3 3] across the 3 parts
+(sum (at Pmx 'v)) -- 14
+(min (at Pmx 'v)) -- 1
+(max (at Pmx 'v)) -- 3
+;; partial filter dropping v<2 leaves [2 2 3 3 3] -> 5 rows, sum 13
+(set Rmx (select {from: Pmx where: (> v 1)}))
+(count Rmx) -- 5
+(sum (at Rmx 'v)) -- 13
 
 ;; ────────────── infer_mc_type: int-first then non-int (all_int true->false) ──
 ;; "5" and "5.5" — first is a pure integer (all_date already false, all_int
@@ -107,6 +136,14 @@
 (set Pim (.db.parted.get "/tmp/rfl_pbc_intmix/" 't))
 (count Pim) -- 3
 (first (key Pim)) -- 'part
+;; value check: on-disk 'v carries [10 11] (dir "5") + [20] (dir "5.5")
+(sum (at Pim 'v)) -- 41
+(min (at Pim 'v)) -- 10
+(max (at Pim 'v)) -- 20
+;; partial filter dropping v<=11 leaves [20] -> 1 row, sum 20
+(set Rim (select {from: Pim where: (> v 11)}))
+(count Rim) -- 1
+(sum (at Rim 'v)) -- 20
 
 ;; ────────────── collect_part_dirs realloc growth (> 16 partitions) ──────────────
 ;; part_cap starts at 16; the 17th matching dir trips the
@@ -182,6 +219,15 @@
 (set Ptr (.db.parted.get "/tmp/rfl_pbc_trace/" 't))
 (count Ptr) -- 5
 (count (key Ptr)) -- 2
+;; value check (success path, under trace): on-disk 'v carries
+;; [1 2 3] (2024.08.01) + [4 5] (2024.08.02)
+(sum (at Ptr 'v)) -- 15
+(min (at Ptr 'v)) -- 1
+(max (at Ptr 'v)) -- 5
+;; partial filter dropping v<=3 leaves [4 5] -> 2 rows, sum 9
+(set Rtr (select {from: Ptr where: (> v 3)}))
+(count Rtr) -- 2
+(sum (at Rtr 'v)) -- 9
 ;; failure under trace: collect-dirs IO on an empty root (banner + collect-fail trace)
 (.sys.exec "mkdir -p /tmp/rfl_pbc_traceerr")
 (.db.parted.get "/tmp/rfl_pbc_traceerr/" 't) !- io

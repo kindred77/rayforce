@@ -162,11 +162,13 @@
 ;; ================================================================
 (set Tsel (table [s v] (list ['Aaa 'Bbb 'Aaa 'Ccc 'Bbb 'Aaa 'Ddd 'Bbb 'Ccc 'Aaa] [1 2 3 4 5 6 7 8 9 10])))
 ;; Chained: v > 3 AND ilike s "a*"
-;; v>3 rows: indices 3,4,5,6,7,8,9 = 7 rows
-;; Of those, ilike "a*" (ci) matches 'Aaa -> rows 5,9 = 2
+;; v>3 rows: indices 3,4,5,6,7,8,9 (indexing from 0); v values 4..10.
+;; Of those, ilike "a*" (ci) matches 'Aaa at rows 5,9 (1-indexed v=6,10) → 2 rows ; sum v 16.
 (count (select {from: Tsel where: (and (> v 3) (ilike s "a*"))})) -- 2
-;; Chained: v > 0 AND ilike s "*bb" -> 'Bbb matches -> rows 1,4,7 = 3
+(sum (at (select {from: Tsel where: (and (> v 3) (ilike s "a*"))}) 'v)) -- 16
+;; Chained: v > 0 AND ilike s "*bb" -> 'Bbb matches -> rows 1,4,7 (v=2,5,8) → 3 rows ; sum v 15.
 (count (select {from: Tsel where: (and (> v 0) (ilike s "*bb"))})) -- 3
+(sum (at (select {from: Tsel where: (and (> v 0) (ilike s "*bb"))}) 'v)) -- 15
 
 ;; ================================================================
 ;; 9. More ILIKE SYM to exercise seen[] cache further

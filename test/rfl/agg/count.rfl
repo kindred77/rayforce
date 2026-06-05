@@ -9,6 +9,11 @@
 (set A (rand 50 1000))
 (set B (rand 80 1000))
 (count (concat A B)) -- (+ (count A) (count B))
+;; absolute pins: rand's first arg is the length, so counts are deterministic
+;; (the invariant above is self-referential — both sides call count)
+(count A) -- 50
+(count B) -- 80
+(count (concat A B)) -- 130
 
 ;; til n has count n
 (count (til 123)) -- 123

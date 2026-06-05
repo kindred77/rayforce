@@ -235,59 +235,99 @@
 (as 'SYMBOL "bar") -- 'bar   ;; STR → SYM
 
 ;; Integer/bool/numeric atom → SYM (lines 1394-1409)
+;; SYM cast routes via the type → STR formatter then interns the result.
 (type (as 'SYMBOL 42)) -- 'sym
+(as 'SYMBOL 42) -- '42
 (type (as 'SYMBOL true)) -- 'sym
+(as 'SYMBOL true) -- '1
+;; F64 with an exact dyadic representation prints back losslessly.
 (type (as 'SYMBOL 3.14)) -- 'sym
+(as 'STR (as 'SYMBOL 0.5)) -- "0.5"
+(as 'SYMBOL 0.5) -- '0.5
 (type (as 'SYMBOL 5i)) -- 'sym
+(as 'SYMBOL 5i) -- '5
 (type (as 'SYMBOL 5h)) -- 'sym
+(as 'SYMBOL 5h) -- '5
 
 ;; --- Cast to DATE ---
+;; DATE stores int32 days-since-2000.01.01.
 (type (as 'DATE 0)) -- 'date           ;; I64 → DATE
+(as 'DATE 0) -- 2000.01.01
 (type (as 'DATE 0i)) -- 'date          ;; I32 → DATE
+(as 'DATE 0i) -- 2000.01.01
 (type (as 'DATE 0h)) -- 'date          ;; I16 → DATE
+(as 'DATE 0h) -- 2000.01.01
 (type (as 'DATE 0.0)) -- 'date         ;; F64 → DATE
-(type (as 'DATE true)) -- 'date        ;; BOOL → DATE
+(as 'DATE 0.0) -- 2000.01.01
+(type (as 'DATE true)) -- 'date        ;; BOOL → DATE — true=1=2000.01.02
+(as 'DATE true) -- 2000.01.02
 (type (as 'DATE "2024.01.15")) -- 'date ;; STR → DATE
+(as 'DATE "2024.01.15") -- 2024.01.15
 
 ;; --- Cast to TIME ---
+;; TIME stores int32 ms-of-day.
 (type (as 'TIME 0)) -- 'time           ;; I64 → TIME
+(as 'TIME 0) -- 00:00:00.000
 (type (as 'TIME 0i)) -- 'time          ;; I32 → TIME
+(as 'TIME 0i) -- 00:00:00.000
 (type (as 'TIME 0h)) -- 'time          ;; I16 → TIME
+(as 'TIME 0h) -- 00:00:00.000
 (type (as 'TIME 0.0)) -- 'time         ;; F64 → TIME
+(as 'TIME 0.0) -- 00:00:00.000
 (type (as 'TIME true)) -- 'time        ;; BOOL → TIME
+(as 'i64 (as 'TIME true)) -- 1
 (type (as 'TIME "12:30:45")) -- 'time   ;; STR → TIME with HH:MM:SS
+(as 'TIME "12:30:45") -- 12:30:45.000
 (type (as 'TIME "12:30:45.123")) -- 'time ;; STR → TIME with millis
+(as 'TIME "12:30:45.123") -- 12:30:45.123
 
 ;; --- Cast to TIMESTAMP ---
+;; TIMESTAMP stores int64 ns-since-2000.01.01 (i.e. 2000.01.01 = ns=0).
 (type (as 'TIMESTAMP 0)) -- 'timestamp          ;; I64 → TS
+(as 'TIMESTAMP 0) -- 2000.01.01D00:00:00.000000000
 (type (as 'TIMESTAMP 0i)) -- 'timestamp         ;; I32 → TS
+(as 'TIMESTAMP 0i) -- 2000.01.01D00:00:00.000000000
 (type (as 'TIMESTAMP 0h)) -- 'timestamp         ;; I16 → TS
+(as 'TIMESTAMP 0h) -- 2000.01.01D00:00:00.000000000
 (type (as 'TIMESTAMP 0.0)) -- 'timestamp        ;; F64 → TS
+(as 'TIMESTAMP 0.0) -- 2000.01.01D00:00:00.000000000
 (type (as 'TIMESTAMP true)) -- 'timestamp       ;; BOOL → TS
+(as 'i64 (as 'TIMESTAMP true)) -- 1
 
 ;; TIMESTAMP from DATE atom (line 1512-1515)
+;; days*NS_PER_DAY; 100 days from 2000.01.01.
 (type (as 'TIMESTAMP (as 'DATE 100))) -- 'timestamp
+(as 'TIMESTAMP (as 'DATE 100)) -- 2000.04.10D00:00:00.000000000
 
 ;; TIMESTAMP from TIME atom (line 1511)
+;; TIME ms → TIMESTAMP ns reinterpret: 5000 ms → raw 5000 ns
 (type (as 'TIMESTAMP (as 'TIME 5000))) -- 'timestamp
+(as 'i64 (as 'TIMESTAMP (as 'TIME 5000))) -- 5000
 
 ;; TIMESTAMP from STR: ISO format (lines 1517-1583)
 (type (as 'TIMESTAMP "2024-01-15T12:30:45.000000000")) -- 'timestamp
+(as 'TIMESTAMP "2024-01-15T12:30:45.000000000") -- 2024.01.15D12:30:45.000000000
 
 ;; TIMESTAMP STR with timezone +HH:MM (lines 1558-1579)
+;; "+05:30" — the parser subtracts 5h30m to convert to UTC.
 (type (as 'TIMESTAMP "2024-01-15T12:30:45.000+05:30")) -- 'timestamp
+(as 'TIMESTAMP "2024-01-15T12:30:45.000+05:30") -- 2024.01.15D07:00:45.000000000
 
 ;; TIMESTAMP STR with timezone -HHMM (line 1576)
 (type (as 'TIMESTAMP "2024-01-15T12:30:45.000-0800")) -- 'timestamp
+(as 'TIMESTAMP "2024-01-15T12:30:45.000-0800") -- 2024.01.15D20:30:45.000000000
 
 ;; TIMESTAMP STR with 'Z' UTC marker (line 1567)
 (type (as 'TIMESTAMP "2024-01-15T12:30:45.000Z")) -- 'timestamp
+(as 'TIMESTAMP "2024-01-15T12:30:45.000Z") -- 2024.01.15D12:30:45.000000000
 
 ;; TIMESTAMP STR with YYYY.MM.DD format (line 1527)
 (type (as 'TIMESTAMP "2024.01.15D12:30:45.000000000")) -- 'timestamp
+(as 'TIMESTAMP "2024.01.15D12:30:45.000000000") -- 2024.01.15D12:30:45.000000000
 
 ;; --- Cast to GUID ---
 (type (as 'GUID "01234567-89ab-cdef-0123-456789abcdef")) -- 'guid
+(as 'STR (as 'GUID "01234567-89ab-cdef-0123-456789abcdef")) -- "01234567-89ab-cdef-0123-456789abcdef"
 
 ;; --- Cast to U8 ---
 (as 'U8 true)  -- 0x01     ;; BOOL → U8
@@ -298,11 +338,17 @@
 (as 'U8 "42")  -- 0x2a     ;; STR → U8
 
 ;; --- Cast to DICT ---
+;; TABLE → DICT preserves the column names as keys and the rows as values list.
 (type (as 'DICT (table [a b] (list [1 2] [3 4])))) -- 'DICT
+(at (as 'DICT (table [a b] (list [1 2] [3 4]))) 'a) -- [1 2]
+(at (as 'DICT (table [a b] (list [1 2] [3 4]))) 'b) -- [3 4]
 (as 'DICT (as 'DICT (dict [x] (list 1)))) -- (dict [x] (list 1))
 
 ;; --- Cast to TABLE ---
+;; DICT → TABLE preserves key→column mapping.
 (type (as 'TABLE (dict [a b] (list [1 2] [3 4])))) -- 'TABLE
+(at (as 'TABLE (dict [a b] (list [1 2] [3 4]))) 'a) -- [1 2]
+(at (as 'TABLE (dict [a b] (list [1 2] [3 4]))) 'b) -- [3 4]
 (as 'TABLE (table [x] (list [1 2]))) -- (table [x] (list [1 2]))
 
 ;; Unknown cast target → domain error (line 1705)
@@ -342,12 +388,14 @@
 
 ;; I64 vec → U8 vec
 (type (as 'U8 [1 2 3])) -- 'U8
+(as 'U8 [1 2 3]) -- [0x01 0x02 0x03]
 
 ;; U8 vec → I64 vec
 (as 'I64 (as 'U8 [1 2 3])) -- [1 2 3]
 
 ;; STR vec → SYMBOL vec (fast path, lines 1144-1156)
 (type (as 'SYMBOL ["foo" "bar" "baz"])) -- 'SYM
+(as 'SYMBOL ["foo" "bar" "baz"]) -- ['foo 'bar 'baz]
 
 ;; BOOL vec → I32/I16/U8/F64 vec (various fast paths)
 (as 'I32 [true false]) -- [1i 0i]
@@ -406,25 +454,39 @@
 
 ;; DATE → TIMESTAMP (days * NS_PER_DAY, line 869-871)
 (type (as 'TIMESTAMP (as 'DATE [0 1 2]))) -- 'TIMESTAMP
+(as 'TIMESTAMP (as 'DATE [0 1 2])) -- [2000.01.01D00:00:00.000000000 2000.01.02D00:00:00.000000000 2000.01.03D00:00:00.000000000]
 
 ;; TIMESTAMP → DATE (floor-div, lines 873-877)
+;; 0 ns→day 0, 86_400e9 ns=1 day, 172_800e9 ns=2 days.
 (type (as 'DATE (as 'TIMESTAMP [0 86400000000000 172800000000000]))) -- 'DATE
+(as 'DATE (as 'TIMESTAMP [0 86400000000000 172800000000000])) -- [2000.01.01 2000.01.02 2000.01.03]
 
 ;; TIMESTAMP → TIME (floor-mod ns→ms, lines 879-883)
+;; 0 ns=00:00, 3600e9 ns=01:00, 7200e9 ns=02:00.
 (type (as 'TIME (as 'TIMESTAMP [0 3600000000000 7200000000000]))) -- 'TIME
+(as 'TIME (as 'TIMESTAMP [0 3600000000000 7200000000000])) -- [00:00:00.000 01:00:00.000 02:00:00.000]
 
 ;; DATE atom ↔ TIMESTAMP atom (lines 1439, 1512-1515)
+;; 86_400e9 ns = 1 day past epoch → 2000.01.02.
 (type (as 'DATE (as 'TIMESTAMP 86400000000000))) -- 'date
+(as 'DATE (as 'TIMESTAMP 86400000000000)) -- 2000.01.02
 (type (as 'TIMESTAMP (as 'DATE 1))) -- 'timestamp
+(as 'TIMESTAMP (as 'DATE 1)) -- 2000.01.02D00:00:00.000000000
 
 ;; TIME atom from TIMESTAMP atom (line 1473-1478)
+;; 3_600e9 ns → 1 hour = 01:00:00.000.
 (type (as 'TIME (as 'TIMESTAMP 3600000000000))) -- 'time
+(as 'TIME (as 'TIMESTAMP 3600000000000)) -- 01:00:00.000
 
-;; DATE from TIME atom (line 1438)
+;; DATE from TIME atom (line 1438) — TIME→DATE reinterprets raw int32 ms as days.
+;; 1000 ms→1000 days from 2000.01.01. Round-trip via i64 pins the int passthrough.
 (type (as 'DATE (as 'TIME 1000))) -- 'date
+(as 'i64 (as 'DATE (as 'TIME 1000))) -- 1000
 
-;; TIME from DATE atom (line 1472)
+;; TIME from DATE atom (line 1472) — DATE→TIME reinterprets raw int32 days as ms.
+;; 100 days → 100 ms.
 (type (as 'TIME (as 'DATE 100))) -- 'time
+(as 'i64 (as 'TIME (as 'DATE 100))) -- 100
 
 ;; ═════════════════════════════════════════════════════════════════════
 ;; 10. ray_cast_fn — STR → I64/I32/F64 parse errors (domain)
@@ -464,7 +526,9 @@
 ;; ═════════════════════════════════════════════════════════════════════
 
 (type (as 'SYMBOL [1 2 3])) -- 'SYM
+(as 'SYMBOL [1 2 3]) -- ['1 '2 '3]
 (type (as 'SYMBOL (list "a" "b" "c"))) -- 'SYM
+(as 'SYMBOL (list "a" "b" "c")) -- ['a 'b 'c]
 
 ;; ═════════════════════════════════════════════════════════════════════
 ;; 13. ray_enlist_fn — homogeneous/mixed/promote (lines 1830-1938)
@@ -711,15 +775,20 @@
 ;; 23. GUID casts and operations (lines 1591-1634)
 ;; ═════════════════════════════════════════════════════════════════════
 
-;; GUID already-GUID cast (line 1593)
+;; GUID already-GUID cast (line 1593) — identity, returns the same canonical form
 (set g1 (as 'GUID "01234567-89ab-cdef-0123-456789abcdef"))
 (type (as 'GUID g1)) -- 'guid
+(as 'GUID g1) -- g1
+(as 'STR (as 'GUID g1)) -- "01234567-89ab-cdef-0123-456789abcdef"
 
 ;; Empty vec → GUID (line 1612-1613)
 (count (as 'GUID [])) -- 0
+(type (as 'GUID [])) -- 'GUID
 
 ;; List of GUID strings → GUID vec (lines 1615-1632)
 (count (as 'GUID (list "01234567-89ab-cdef-0123-456789abcdef" "fedcba98-7654-3210-fedc-ba9876543210"))) -- 2
+(as 'STR (at (as 'GUID (list "01234567-89ab-cdef-0123-456789abcdef" "fedcba98-7654-3210-fedc-ba9876543210")) 0)) -- "01234567-89ab-cdef-0123-456789abcdef"
+(as 'STR (at (as 'GUID (list "01234567-89ab-cdef-0123-456789abcdef" "fedcba98-7654-3210-fedc-ba9876543210")) 1)) -- "fedcba98-7654-3210-fedc-ba9876543210"
 
 ;; ═════════════════════════════════════════════════════════════════════
 ;; 24. GUID atom concat (lines 2878-2884 / 2809-2811 / 2839-2840)
@@ -736,23 +805,29 @@
 ;; 25. Temporal atom cast cross-paths — DATE/TIME/TIMESTAMP (lines 1428-1589)
 ;; ═════════════════════════════════════════════════════════════════════
 
-;; DATE from U8 atom (line 1433)
+;; DATE from U8 atom (line 1433) — U8 0x0A = 10 → day 10 from 2000.01.01 = 2000.01.11
 (type (as 'DATE (as 'U8 10))) -- 'date
+(as 'DATE (as 'U8 10)) -- 2000.01.11
 
-;; TIME from U8 atom (line 1467)
+;; TIME from U8 atom (line 1467) — 10 ms past midnight
 (type (as 'TIME (as 'U8 10))) -- 'time
+(as 'TIME (as 'U8 10)) -- 00:00:00.010
 
-;; TIMESTAMP from U8 atom (line 1506)
+;; TIMESTAMP from U8 atom (line 1506) — 10 ns past epoch
 (type (as 'TIMESTAMP (as 'U8 10))) -- 'timestamp
+(as 'i64 (as 'TIMESTAMP (as 'U8 10))) -- 10
 
 ;; DATE vec cast (line 1458-1459)
 (type (as 'DATE [0 1 2])) -- 'DATE
+(as 'DATE [0 1 2]) -- [2000.01.01 2000.01.02 2000.01.03]
 
-;; TIME vec cast (line 1497-1498)
+;; TIME vec cast (line 1497-1498) — 0/1000/2000 ms
 (type (as 'TIME [0 1000 2000])) -- 'TIME
+(as 'TIME [0 1000 2000]) -- [00:00:00.000 00:00:01.000 00:00:02.000]
 
-;; TIMESTAMP vec cast (line 1586-1587)
+;; TIMESTAMP vec cast (line 1586-1587) — raw ns
 (type (as 'TIMESTAMP [0 1000 2000])) -- 'TIMESTAMP
+(as 'I64 (as 'TIMESTAMP [0 1000 2000])) -- [0 1000 2000]
 
 ;; ═════════════════════════════════════════════════════════════════════
 ;; 26. Temporal cast from TIMESTAMP atom (line 1439, 1473-1478)
@@ -771,20 +846,23 @@
 ;;     I64↔TIMESTAMP, I32↔DATE↔TIME: memcpy fast path.
 ;; ═════════════════════════════════════════════════════════════════════
 
-;; I64 vec → TIMESTAMP vec (relabel)
+;; I64 vec → TIMESTAMP vec (relabel) — value bits unchanged, type tag swapped
 (type (as 'TIMESTAMP [0 1 2])) -- 'TIMESTAMP
+(as 'I64 (as 'TIMESTAMP [0 1 2])) -- [0 1 2]
 
 ;; TIMESTAMP vec → I64 vec (relabel)
 (as 'I64 (as 'TIMESTAMP [0 1 2])) -- [0 1 2]
 
 ;; I32 vec → DATE vec (relabel)
 (type (as 'DATE [0i 1i 2i])) -- 'DATE
+(as 'DATE [0i 1i 2i]) -- [2000.01.01 2000.01.02 2000.01.03]
 
 ;; DATE vec → I32 vec (relabel)
 (as 'I32 (as 'DATE [0i 1i 2i])) -- [0i 1i 2i]
 
 ;; I32 vec → TIME vec (relabel)
 (type (as 'TIME [0i 1000i 2000i])) -- 'TIME
+(as 'TIME [0i 1000i 2000i]) -- [00:00:00.000 00:00:01.000 00:00:02.000]
 
 ;; DATE vec → TIME vec (relabel — I32-compatible)
 (type (as 'TIME (as 'DATE [0i 1i 2i]))) -- 'TIME
@@ -799,9 +877,13 @@
 ;; 29. Temporal atom → SYMBOL (ray_fmt path, lines 1412-1421)
 ;; ═════════════════════════════════════════════════════════════════════
 
+;; (as 'SYMBOL temporal) routes through the type → STR formatter then interns.
 (type (as 'SYMBOL (as 'DATE 100))) -- 'sym
+(as 'STR (as 'SYMBOL (as 'DATE 100))) -- "2000.04.10"
 (type (as 'SYMBOL (as 'TIME 5000))) -- 'sym
+(as 'STR (as 'SYMBOL (as 'TIME 5000))) -- "00:00:05.000"
 (type (as 'SYMBOL (as 'TIMESTAMP 0))) -- 'sym
+(as 'STR (as 'SYMBOL (as 'TIMESTAMP 0))) -- "2000.01.01D00:00:00.000000000"
 
 ;; ═════════════════════════════════════════════════════════════════════
 ;; 30. BOOL cast edge: DATE / TIME / TIMESTAMP → BOOL (lines 1315-1317)
@@ -887,7 +969,9 @@
 ;; ═════════════════════════════════════════════════════════════════════
 
 (type (as 'DATE "2024.01.15")) -- 'date
+(as 'DATE "2024.01.15") -- 2024.01.15
 (type (as 'TIME "12:30:45")) -- 'time
+(as 'TIME "12:30:45") -- 12:30:45.000
 
 ;; ═════════════════════════════════════════════════════════════════════
 ;; 35. GUID GUID vec operations (group, concat)
@@ -915,8 +999,11 @@
 ;; ═════════════════════════════════════════════════════════════════════
 
 (type (as 'STR (as 'DATE 100))) -- 'str
+(as 'STR (as 'DATE 100)) -- "2000.04.10"
 (type (as 'STR (as 'TIME 5000))) -- 'str
+(as 'STR (as 'TIME 5000)) -- "00:00:05.000"
 (type (as 'STR (as 'TIMESTAMP 0))) -- 'str
+(as 'STR (as 'TIMESTAMP 0)) -- "2000.01.01D00:00:00.000000000"
 
 ;; ═════════════════════════════════════════════════════════════════════
 ;; 38. Group with null elements — null routing (lines 2498-2517)
@@ -1032,24 +1119,31 @@
 
 ;; DATE vec from list (goes through generic path)
 (type (as 'DATE (list 0 1 2))) -- 'DATE
+(as 'DATE (list 0 1 2)) -- [2000.01.01 2000.01.02 2000.01.03]
 
 ;; TIME vec from list
 (type (as 'TIME (list 0 1000 2000))) -- 'TIME
+(as 'TIME (list 0 1000 2000)) -- [00:00:00.000 00:00:01.000 00:00:02.000]
 
 ;; TIMESTAMP vec from list
 (type (as 'TIMESTAMP (list 0 1000 2000))) -- 'TIMESTAMP
+(as 'I64 (as 'TIMESTAMP (list 0 1000 2000))) -- [0 1000 2000]
 
 ;; U8 vec from list
 (type (as 'U8 (list 1 2 3))) -- 'U8
+(as 'U8 (list 1 2 3)) -- [0x01 0x02 0x03]
 
 ;; I16 vec from list
 (type (as 'I16 (list 1 2 3))) -- 'I16
+(as 'I16 (list 1 2 3)) -- [1h 2h 3h]
 
 ;; I32 vec from list
 (type (as 'I32 (list 1 2 3))) -- 'I32
+(as 'I32 (list 1 2 3)) -- [1i 2i 3i]
 
 ;; BOOL vec from list
 (type (as 'BOOL (list 1 0 1))) -- 'B8
+(as 'BOOL (list 1 0 1)) -- [true false true]
 
 ;; ═════════════════════════════════════════════════════════════════════
 ;; 47. Enlist GUID with null atoms (lines 1922-1926)
@@ -1110,6 +1204,7 @@
 
 ;; BOOL vec → U8 vec (line 922)
 (type (as 'U8 [true false true])) -- 'U8
+(as 'U8 [true false true]) -- [0x01 0x00 0x01]
 
 ;; ═════════════════════════════════════════════════════════════════════
 ;; 51. Dict vals as single atom — scalar val (line 1963)

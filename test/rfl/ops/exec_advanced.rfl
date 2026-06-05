@@ -84,6 +84,9 @@
 (at (at (select {from: TBigSort asc: k}) 'k) 149999) -- 149999
 ;; Descending: first row is the original last (k=N-1).
 (at (at (select {from: TBigSort desc: k}) 'k) 0) -- 149999
+;; Descending: last row is k=0 (pins the partitioned-gather tail, not
+;; just the head, so a route/block mis-order deeper in the table fails).
+(at (at (select {from: TBigSort desc: k}) 'k) 149999) -- 0
 ;; Companion `v` column rides through partitioned_gather block loop
 ;; with esz=8.  Sum of v should be unchanged: N*(N-1)/2.
 (sum (at (select {from: TBigSort asc: k}) 'v)) -- 11249925000
@@ -96,6 +99,11 @@
 ;; row 0.  a[N-1] = (N-1)%1000 = 999.  b[N-1] = N-1 = 149999.
 (at (at (select {from: TBigMix asc: k}) 'a) 0) -- 999
 (at (at (select {from: TBigMix asc: k}) 'b) 0) -- 149999
+;; Last result row is original row 0 (k=N-1=149999).  a[0]=0%1000=0
+;; (esz-4 I32 arm), b[0]=0 (esz-8 I64 arm).  Probing a second, deep
+;; row confirms both element-size arms route correctly past the head.
+(at (at (select {from: TBigMix asc: k}) 'a) 149999) -- 0
+(at (at (select {from: TBigMix asc: k}) 'b) 149999) -- 0
 
 ;; ====================================================================
 ;; OP_HEAD(SORT) fusion at 150k rows — exec.c:1252-1269.  exec_sort

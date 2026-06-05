@@ -23,8 +23,11 @@
 (sum (at (select {from: T where: (> d 50)}) 'i)) -- 40
 (sum (at (select {from: T where: (> f 5.5)}) 'i)) -- 40
 (count (select {from: T where: (== s 'a)})) -- 4
+(sum (at (select {from: T where: (== s 'a)}) 'i)) -- 22
 (count (select {from: T where: (!= s 'c)})) -- 7
+(sum (at (select {from: T where: (!= s 'c)}) 'i)) -- 37
 (count (select {from: T where: (== b true)})) -- 5
+(sum (at (select {from: T where: (== b true)}) 'i)) -- 25
 
 ;; all-pass / none-pass — sel_compact's pass_count==nrows / pass_count==0 paths
 (count (select {from: T where: (> i 0)})) -- 10
@@ -40,10 +43,15 @@
 
 ;; AND / OR / NOT composites
 (count (select {from: T where: (and (> i 3) (< i 8))})) -- 4
+(sum (at (select {from: T where: (and (> i 3) (< i 8))}) 'i)) -- 22
 (count (select {from: T where: (or (== s 'a) (== s 'b))})) -- 7
+(sum (at (select {from: T where: (or (== s 'a) (== s 'b))}) 'i)) -- 37
 (count (select {from: T where: (not (== s 'c))})) -- 7
+(sum (at (select {from: T where: (not (== s 'c))}) 'i)) -- 37
 (count (select {from: T where: (and (== s 'a) (> i 5))})) -- 2
+(sum (at (select {from: T where: (and (== s 'a) (> i 5))}) 'i)) -- 17
 (count (select {from: T where: (or (and (> i 7) (< i 10)) (== i 1))})) -- 3
+(sum (at (select {from: T where: (or (and (> i 7) (< i 10)) (== i 1))}) 'i)) -- 18
 
 ;; nested select (chained filter) — second sel_compact reads first's output
 (count (select {from: (select {from: T where: (> i 3)}) where: (< i 8)})) -- 4
@@ -52,7 +60,11 @@
 ;; ────────────── 2. STR column in select-where (sel_compact STR path) ──────────────
 (set Tstr (table [k s] (list [1 2 3 4 5] (list "alpha" "beta" "gamma" "delta" "epsilon"))))
 (count (select {from: Tstr where: (> k 2)})) -- 3
+(sum (at (select {from: Tstr where: (> k 2)}) 'k)) -- 12
+(asc (at (select {from: Tstr where: (> k 2)}) 's)) -- (list "delta" "epsilon" "gamma")
 (count (select {from: Tstr where: (< k 3)})) -- 2
+(sum (at (select {from: Tstr where: (< k 3)}) 'k)) -- 3
+(asc (at (select {from: Tstr where: (< k 3)}) 's)) -- (list "alpha" "beta")
 (count (select {from: Tstr where: (> k 999)})) -- 0
 (count (select {from: Tstr where: (> k 0)})) -- 5
 
@@ -64,30 +76,44 @@
 (set N1023 1023)
 (set T1023 (table [i] (list (til N1023))))
 (count (select {from: T1023 where: (> i 0)})) -- 1022
+(first (at (select {from: T1023 where: (> i 0)}) 'i)) -- 1
 (count (select {from: T1023 where: (>= i 0)})) -- 1023
+(first (at (select {from: T1023 where: (>= i 0)}) 'i)) -- 0
 (count (select {from: T1023 where: (> i 99999)})) -- 0
 (sum (at (select {from: T1023 where: (>= i 0)}) 'i)) -- 522753
 (count (select {from: T1023 where: (and (>= i 100) (< i 200))})) -- 100
+(min (at (select {from: T1023 where: (and (>= i 100) (< i 200))}) 'i)) -- 100
+(max (at (select {from: T1023 where: (and (>= i 100) (< i 200))}) 'i)) -- 199
 
 (set N1024 1024)
 (set T1024 (table [i] (list (til N1024))))
 (count (select {from: T1024 where: (> i 0)})) -- 1023
+(first (at (select {from: T1024 where: (> i 0)}) 'i)) -- 1
 (count (select {from: T1024 where: (>= i 0)})) -- 1024
+(first (at (select {from: T1024 where: (>= i 0)}) 'i)) -- 0
 (count (select {from: T1024 where: (> i 99999)})) -- 0
 (sum (at (select {from: T1024 where: (>= i 0)}) 'i)) -- 523776
 (count (select {from: T1024 where: (and (>= i 100) (< i 200))})) -- 100
+(min (at (select {from: T1024 where: (and (>= i 100) (< i 200))}) 'i)) -- 100
+(max (at (select {from: T1024 where: (and (>= i 100) (< i 200))}) 'i)) -- 199
 
 (set N1025 1025)
 (set T1025 (table [i] (list (til N1025))))
 (count (select {from: T1025 where: (> i 0)})) -- 1024
+(first (at (select {from: T1025 where: (> i 0)}) 'i)) -- 1
 (count (select {from: T1025 where: (>= i 0)})) -- 1025
+(first (at (select {from: T1025 where: (>= i 0)}) 'i)) -- 0
 (count (select {from: T1025 where: (> i 99999)})) -- 0
 (sum (at (select {from: T1025 where: (>= i 0)}) 'i)) -- 524800
 (count (select {from: T1025 where: (and (>= i 100) (< i 200))})) -- 100
+(min (at (select {from: T1025 where: (and (>= i 100) (< i 200))}) 'i)) -- 100
+(max (at (select {from: T1025 where: (and (>= i 100) (< i 200))}) 'i)) -- 199
 
 ;; alternating predicate across the boundary — RAY_SEL_MIX in every segment
 (count (select {from: T1025 where: (== (% i 2) 0)})) -- 513
+(sum (at (select {from: T1025 where: (== (% i 2) 0)}) 'i)) -- 262656
 (count (select {from: T1024 where: (== (% i 2) 0)})) -- 512
+(sum (at (select {from: T1024 where: (== (% i 2) 0)}) 'i)) -- 261632
 
 ;; ────────────── 4. select-where-take — exec_filter_head ──────────────
 ;; Exec.c line 1301 routes HEAD(FILTER) into exec_filter_head, which is
@@ -95,16 +121,23 @@
 ;; per-column gather inside the head executor.
 
 (count (select {from: T where: (> i 0) take: 3})) -- 3
+(sum (at (select {from: T where: (> i 0) take: 3}) 'i)) -- 6
+(max (at (select {from: T where: (> i 0) take: 3}) 'i)) -- 3
 (count (select {from: T where: (> i 0) take: 100})) -- 10
+(sum (at (select {from: T where: (> i 0) take: 100}) 'i)) -- 55
 (count (select {from: T where: (> i 999) take: 5})) -- 0
 (count (select {from: T where: (> i 5) take: 2})) -- 2
 (sum (at (select {from: T where: (> i 5) take: 2}) 'i)) -- 13
 (first (at (select {from: T where: (== s 'a) take: 1}) 'i)) -- 1
 (count (select {from: T1025 where: (>= i 0) take: 1})) -- 1
+(first (at (select {from: T1025 where: (>= i 0) take: 1}) 'i)) -- 0
 (count (select {from: T1025 where: (>= i 0) take: 1024})) -- 1024
+(sum (at (select {from: T1025 where: (>= i 0) take: 1024}) 'i)) -- 523776
 (count (select {from: T1025 where: (>= i 0) take: 1025})) -- 1025
+(sum (at (select {from: T1025 where: (>= i 0) take: 1025}) 'i)) -- 524800
 ;; take larger than nrows: clamped to nrows
 (count (select {from: T where: (> i 0) take: 99999})) -- 10
+(sum (at (select {from: T where: (> i 0) take: 99999}) 'i)) -- 55
 ;; take 0 — empty result
 (count (select {from: T where: (> i 0) take: 0})) -- 0
 
@@ -121,6 +154,8 @@
 (count (select {from: (select {s: (sum v) from: Tg by: g}) where: (== s 6)})) -- 1
 (first (at (select {from: (select {s: (sum v) from: Tg by: g}) where: (== s 6)}) 'g)) -- 'a
 (count (select {from: (select {c: (count v) from: Tg by: g}) where: (>= c 2)})) -- 2
+(asc (at (select {from: (select {c: (count v) from: Tg by: g}) where: (>= c 2)}) 'g)) -- ['a 'b]
+(sum (at (select {from: (select {c: (count v) from: Tg by: g}) where: (>= c 2)}) 'c)) -- 5
 
 ;; ────────────── 6. wider columns with multiple types ──────────────
 ;; Extra select-where ensures sel_compact's per-column gather works for
@@ -131,8 +166,10 @@
 (sum (at (select {from: T2 where: (> i 4)}) 'i)) -- 26
 (sum (at (select {from: T2 where: (> i 4)}) 'f)) -- 260.0
 (count (select {from: T2 where: (and (== s 'x) (== b true))})) -- 4
+(sum (at (select {from: T2 where: (and (== s 'x) (== b true))}) 'i)) -- 16
 (count (select {from: T2 where: (and (== s 'x) (== b false))})) -- 0
 (count (select {from: T2 where: (or (== s 'x) (== b true))})) -- 4
+(sum (at (select {from: T2 where: (or (== s 'x) (== b true))}) 'i)) -- 16
 
 ;; ────────────── 7. parallel-gather path: nrows > RAY_PARALLEL_THRESHOLD ──────────────
 ;; RAY_PARALLEL_THRESHOLD = 64 * 1024 = 65536.  A 70000-row table forces
@@ -145,16 +182,22 @@
 
 ;; sel_compact path on a >65536-row table — every boundary op reads it.
 (count (select {from: TL where: (> v 0)})) -- 69999
+(first (at (select {from: TL where: (> v 0)}) 'v)) -- 1
 (count (select {from: TL where: (>= v 0)})) -- 70000
+(sum (at (select {from: TL where: (>= v 0)}) 'v)) -- 2449965000
 (count (select {from: TL where: (> v 999999)})) -- 0
 (count (select {from: TL where: (and (>= v 1000) (< v 2000))})) -- 1000
 (sum (at (select {from: TL where: (and (>= v 1000) (< v 2000))}) 'v)) -- 1499500
+(min (at (select {from: TL where: (and (>= v 1000) (< v 2000))}) 'v)) -- 1000
+(max (at (select {from: TL where: (and (>= v 1000) (< v 2000))}) 'v)) -- 1999
 
 ;; HAVING-style filter on a large group result — a group per-row produces
 ;; 70000 groups, then a where on the aggregated column eagerly filters
 ;; that 70000-row table through exec_filter (parallel-gather branch when
 ;; valid_ncols ≤ MGATHER_MAX_COLS).
 (count (select {from: (select {s: (sum v) from: TL by: k}) where: (> s 69990)})) -- 9
+(sum (at (select {from: (select {s: (sum v) from: TL by: k}) where: (> s 69990)}) 's)) -- 629955
+(min (at (select {from: (select {s: (sum v) from: TL by: k}) where: (> s 69990)}) 's)) -- 69991
 
 ;; ────────────── 8. multi-column wide table ──────────────
 ;; valid_ncols ≤ MGATHER_MAX_COLS=16 routes through multi_gather_fn.
@@ -164,6 +207,8 @@
 (sum (at (select {from: T12 where: (> c0 9)}) 'c5)) -- 1180
 ;; HAVING over this wide table — exec_filter_seq on 12 cols
 (count (select {from: (select {s: (sum c0) from: T12 by: c1}) where: (> s 30)})) -- 19
+(sum (at (select {from: (select {s: (sum c0) from: T12 by: c1}) where: (> s 30)}) 's)) -- 760
+(min (at (select {from: (select {s: (sum c0) from: T12 by: c1}) where: (> s 30)}) 's)) -- 31
 
 ;; ────────────── 9. RAY_SEL_NONE / RAY_SEL_ALL segment-flag coverage ──────────────
 ;; sel_compact's segment-flag dispatch (RAY_SEL_NONE/ALL/MIX) only varies
@@ -179,8 +224,13 @@
 (sum (at (select {from: T2K where: (< i 1024)}) 'i)) -- 523776
 ;; NONE in seg 0, ALL in seg 1
 (count (select {from: T2K where: (>= i 1024)})) -- 1026
+(sum (at (select {from: T2K where: (>= i 1024)}) 'i)) -- 1576449
+(min (at (select {from: T2K where: (>= i 1024)}) 'i)) -- 1024
+(max (at (select {from: T2K where: (>= i 1024)}) 'i)) -- 2049
 ;; MIX seg 0 + ALL seg 1
 (count (select {from: T2K where: (or (== (% i 2) 0) (>= i 1024))})) -- 1538
+(sum (at (select {from: T2K where: (or (== (% i 2) 0) (>= i 1024))}) 'i)) -- 1838081
+(max (at (select {from: T2K where: (or (== (% i 2) 0) (>= i 1024))}) 'i)) -- 2049
 
 ;; ────────────── 10. error path: filter with mismatched lengths ──────────────
 ;; Built-in `filter` (collection.c path) — already covered in

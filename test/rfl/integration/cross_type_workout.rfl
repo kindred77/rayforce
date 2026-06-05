@@ -77,13 +77,27 @@
 (type (last (at T 'bool))) -- 'b8
 
 ;; ════════════════════ COMPARISON ON COLUMNS ════════════════════
+;; sym='AAPL kept → every kept sym is 'AAPL.
 (count (select {from: T where: (== sym 'AAPL)})) -- 40
+(min (== (at (select {from: T where: (== sym 'AAPL)}) 'sym) 'AAPL)) -- 1
+;; != 'TSLA → 160 rows, no 'TSLA in kept set.
 (count (select {from: T where: (!= sym 'TSLA)})) -- 160
+(max (== (at (select {from: T where: (!= sym 'TSLA)}) 'sym) 'TSLA)) -- 0
+;; > price 130 → kept rows price min > 130.
 (count (select {from: T where: (> price 130.0)})) -- 76
+(> (min (at (select {from: T where: (> price 130.0)}) 'price)) 130.0) -- true
+;; <= price 110 → max <= 110.
 (count (select {from: T where: (<= price 110.0)})) -- 44
+(<= (max (at (select {from: T where: (<= price 110.0)}) 'price)) 110.0) -- true
+;; 0 < qty < 100 → all kept rows satisfy.
 (count (select {from: T where: (and (> qty 0) (< qty 100))})) -- 99
+(> (min (at (select {from: T where: (and (> qty 0) (< qty 100))}) 'qty)) 0) -- true
+(< (max (at (select {from: T where: (and (> qty 0) (< qty 100))}) 'qty)) 100) -- true
+;; OR — kept syms must be AAPL or GOOG.
 (count (select {from: T where: (or (== sym 'AAPL) (== sym 'GOOG))})) -- 80
+;; not (== bool true) → all kept rows bool=false; max should be false (0).
 (count (select {from: T where: (not (== bool true))})) -- 100
+(max (at (select {from: T where: (not (== bool true))}) 'bool)) -- 0
 
 ;; ════════════════════ SORT ════════════════════
 ;; whole-vec sort returns a fresh vec
@@ -94,6 +108,9 @@
 (at (asc (at T 'price)) 0)           -- 100.0
 (at (desc (at T 'price)) 0)          -- 149.0
 (count (rank (at T 'id)))            -- 200
+;; rank is a permutation of [0..N-1]: asc(rank) == til(N).  This pins the
+;; actual values, not just the length.
+(asc (rank (at T 'id)))              -- (til 200)
 
 ;; xasc/xdesc on the table reorder rows
 (at (at (xasc T 'qty) 'qty) 0)       -- -50
@@ -145,13 +162,34 @@
 
 ;; ════════════════════ JOINS ════════════════════
 (set Lookup (table [sym sector] (list ['AAPL 'GOOG 'MSFT 'AMZN 'TSLA] ['tech 'tech 'tech 'retail 'auto])))
-(count (inner-join [sym] T Lookup))               -- 200
-(count (left-join  [sym] T Lookup))               -- 200
-(count (anti-join  [sym] T (table [sym] (list ['AAPL 'GOOG])))) -- 120
+;; Inner join: every sym in T (cycled across 5 syms over 200 rows = 40 each)
+;; finds a match in Lookup; result preserves count and the sector distribution.
+(set ijFull (inner-join [sym] T Lookup))
+(count ijFull) -- 200
+;; The full lookup covers all syms, so left-join produces the same row count.
+(set ljFull (left-join [sym] T Lookup))
+(count ljFull) -- 200
+;; sector counts: tech=40*3=120, retail=40, auto=40 (T cycles through 5 syms uniformly).
+(count (where (== (at ijFull 'sector) 'tech)))   -- 120
+(count (where (== (at ijFull 'sector) 'retail))) -- 40
+(count (where (== (at ijFull 'sector) 'auto)))   -- 40
+;; left-join is full coverage, so no nulls in sector.
+(count (where (== (at ljFull 'sector) 'tech)))   -- 120
 
-;; only AAPL and GOOG match the partial-coverage lookup
+;; anti-join: exclude AAPL/GOOG (40 + 40 = 80) → 200 − 80 = 120 rows remain (MSFT/AMZN/TSLA).
+(set ajRes (anti-join [sym] T (table [sym] (list ['AAPL 'GOOG]))))
+(count ajRes) -- 120
+;; Neither AAPL nor GOOG appears in the anti-join result.
+(count (where (== (at ajRes 'sym) 'AAPL))) -- 0
+(count (where (== (at ajRes 'sym) 'GOOG))) -- 0
+(count (where (== (at ajRes 'sym) 'MSFT))) -- 40
+
+;; only AAPL and GOOG match the partial-coverage lookup → 40+40 = 80 inner-join rows.
 (set Partial (table [sym info] (list ['AAPL 'GOOG] ['x 'y])))
-(count (inner-join [sym] T Partial)) -- 80
+(set ijPart (inner-join [sym] T Partial))
+(count ijPart) -- 80
+(count (where (== (at ijPart 'sym) 'AAPL))) -- 40
+(count (where (== (at ijPart 'sym) 'GOOG))) -- 40
 
 ;; ════════════════════ PIVOT ════════════════════
 ;; sym × bool — 5 rows × 2 boolean columns
@@ -160,11 +198,18 @@
 (count (pivot T 'sym 'bool 'price avg))          -- 5
 
 ;; ════════════════════ CAST ACROSS COLUMN TYPES ════════════════════
+;; Widening + narrowing across the integer / float ladder; each cast keeps the
+;; numeric value where representable, so sum-equivalence pins the value path.
 (type (as 'I64 (at T 'i16c)))                 -- 'I64
 (type (as 'F64 (at T 'i32c)))                 -- 'F64
 (type (as 'I32 (at T 'id)))                   -- 'I32
+(sum (as 'I32 (at T 'id))) -- (sum (at T 'id))
 (type (as 'I16 (at T 'i32c)))                 -- 'I16
+;; i32c values are within i16 range — narrowing preserves the sum.
+(sum (as 'I16 (at T 'i32c))) -- (sum (at T 'i32c))
 (type (as 'B8  (at T 'i16c)))                 -- 'B8
+;; B8 cast: nonzero → true, zero → false; count of trues matches count of nonzeros.
+(sum (as 'I64 (as 'B8 (at T 'i16c)))) -- (sum (!= (at T 'i16c) 0h))
 
 (sum (as 'I64 (at T 'i16c))) -- (sum (at T 'i16c))
 (sum (as 'F64 (at T 'id))) -- 19900.0

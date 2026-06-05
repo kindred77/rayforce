@@ -63,8 +63,13 @@
 (first (at (knn V [1.0 0.0 0.0] 1) '_rowid)) -- 0
 (first (at (knn V [1.0 0.0 0.0] 1) '_dist))  -- 0.0
 
-;; k > nrows is clamped, not an error.
-(count (knn V [1.0 0.0 0.0] 99)) -- 5
+;; k > nrows is clamped, not an error.  V has 5 rows so result is all 5.
+;; Row 0 is the exact match, and the result enumerates all 5 row ids.
+(set hits99 (knn V [1.0 0.0 0.0] 99))
+(count hits99) -- 5
+(at (at hits99 '_rowid) 0) -- 0
+(at (at hits99 '_dist)  0) -- 0.0
+(asc (at hits99 '_rowid)) -- [0 1 2 3 4]
 
 ;; Result is sorted ascending by distance.
 (<= (first (at (knn V [1.0 0.0 0.0] 3) '_dist)) (last (at (knn V [1.0 0.0 0.0] 3) '_dist))) -- true
@@ -101,10 +106,18 @@
 (at (hnsw-info IdxIp) 'metric) -- 'ip
 (at (hnsw-info IdxIp) 'M)      -- 16
 (at (hnsw-info IdxIp) 'efc)    -- 64
-(count (ann IdxIp [1.0 0.0 0.0] 2)) -- 2
+;; Top-2 IP search for [1,0,0] must include row 0 (dot=1 → IP distance -1).
+(set ipHits2 (ann IdxIp [1.0 0.0 0.0] 2))
+(count ipHits2) -- 2
+(at (at ipHits2 '_rowid) 0) -- 0
+(<= (at (at ipHits2 '_dist) 0) -0.99) -- true
+;; Ascending order (lower IP distance = closer).
+(<= (first (at ipHits2 '_dist)) (last (at ipHits2 '_dist))) -- true
 
 ;; ann with explicit ef_s argument exercises the n == 4 branch.
-(count (ann IdxIp [1.0 0.0 0.0] 2 100)) -- 2
+(set ipHits2e (ann IdxIp [1.0 0.0 0.0] 2 100))
+(count ipHits2e) -- 2
+(at (at ipHits2e '_rowid) 0) -- 0
 
 ;; ann argument validation.
 (ann IdxIp [1.0 0.0 0.0])         !- rank
@@ -133,7 +146,11 @@
 (at (hnsw-info Loaded) 'metric) -- 'ip
 (at (hnsw-info Loaded) 'nrows)  -- 5
 (at (hnsw-info Loaded) 'dim)    -- 3
-(count (ann Loaded [1.0 0.0 0.0] 3)) -- 3
+;; Round-trip preserved the index — top-1 for [1,0,0] under IP is still row 0.
+(set loadedHits (ann Loaded [1.0 0.0 0.0] 3))
+(count loadedHits) -- 3
+(at (at loadedHits '_rowid) 0) -- 0
+(<= (at (at loadedHits '_dist) 0) -0.99) -- true
 
 ;; hnsw-save / hnsw-load argument validation.
 (hnsw-save 5 "/tmp/rfl_embcov_idx") !- type

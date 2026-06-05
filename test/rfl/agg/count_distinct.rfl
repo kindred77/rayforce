@@ -79,6 +79,35 @@
 (set Ncdpg 200000)
 (set Tcdpg (table [g v] (list (% (til Ncdpg) 51000) (% (til Ncdpg) 4))))
 ;; n_groups = 51000, n_rows = 200000 → count_distinct_per_group_parallel.
-;; Reduced to 4 distinct per group so cdpg_dedup_fn HT settles fast.
+;; NOTE: the original comment claimed "4 distinct per group", but the
+;; payload is DEGENERATE: 51000 % 4 == 0, so within any group g the rows
+;; i = g, g+51000, g+102000, g+153000 all share v = g % 4.  Every group
+;; therefore has exactly ONE distinct value.  This still drives the
+;; planner dispatch into count_distinct_per_group_parallel, but it does
+;; NOT exercise the per-group dedup HT with more than one key.  We keep
+;; this case (with a real per-group value check) and add a non-degenerate
+;; mod-7 case below that genuinely fans the dedup HT.
 (set Rcdpg (select {n: (count (distinct v)) from: Tcdpg by: g}))
 (count Rcdpg) -- 51000
+;; Per-group VALUE checks (not just the group count): every group → 1.
+(distinct (at Rcdpg 'n)) -- [1]
+(min (at Rcdpg 'n)) -- 1
+(max (at Rcdpg 'n)) -- 1
+(sum (at Rcdpg 'n)) -- 51000
+
+;; Non-degenerate per-group dedup: payload mod 7.  51000 % 7 == 5
+;; (coprime to 7), so within a group the row values stride by 5 mod 7 and
+;; the distinct count equals the number of rows in that group.
+;;   - groups g in 0..46999 have 4 rows (g+153000 < 200000) → 4 distinct
+;;   - groups g in 47000..50999 have 3 rows                 → 3 distinct
+;; This exercises cdpg_dedup_fn with a multi-key HT per group.
+(set Tcdpg7 (table [g v] (list (% (til Ncdpg) 51000) (% (til Ncdpg) 7))))
+(set Rcdpg7 (select {n: (count (distinct v)) from: Tcdpg7 by: g}))
+(count Rcdpg7) -- 51000
+(distinct (at Rcdpg7 'n)) -- [3 4]
+(min (at Rcdpg7 'n)) -- 3
+(max (at Rcdpg7 'n)) -- 4
+;; 47000 groups with 4 distinct + 4000 groups with 3 distinct.
+(sum (at Rcdpg7 'n)) -- 200000
+(count (where (== (at Rcdpg7 'n) 4))) -- 47000
+(count (where (== (at Rcdpg7 'n) 3))) -- 4000

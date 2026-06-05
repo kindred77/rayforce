@@ -36,6 +36,11 @@
 (set _d_words (distinct _wcol))
 (count _d_words) -- 3
 (type _d_words) -- 'STR
+;; verify the actual distinct string values (first-occurrence order from
+;; the source: "hello","world","foo","hello","world" → {hello, world, foo})
+(at _d_words 0) -- "hello"
+(at _d_words 1) -- "world"
+(at _d_words 2) -- "foo"
 
 ;; reverse on parted also goes through parted_to_flat_vec
 ;; (ray_reverse_fn checks RAY_IS_PARTED → parted_to_flat_vec → STR branch)
@@ -50,6 +55,10 @@
 (set _ncol (at _Rp2 'name))
 (set _d_names (distinct _ncol))
 (count _d_names) -- 3
+;; verify actual distinct STR values (each row in CSV is unique)
+(at _d_names 0) -- "alpha"
+(at _d_names 1) -- "beta"
+(at _d_names 2) -- "gamma"
 
 ;; ════════════════════════════════════════════════════════════════
 ;; Cleanup

@@ -7,15 +7,23 @@
 (set V (rand 50 100))
 (set T (take [true] (count V)))
 (count V) -- (count (filter V T))
+;; not just the count — all-true must reproduce V element-for-element
+(filter V T) -- V
 
 ;; all-false → empty
 (set F (take [false] (count V)))
 (count (filter V F)) -- 0
+;; empty result is a typed empty long vector (V came from rand → longs)
+(filter V F) -- (take [0] 0)
 
 ;; result count equals mask-true count
 (set M [true false true true false])
 (set W [10 20 30 40 50])
 (count (filter W M)) -- (sum M)
+;; count alone is order-blind — pin the exact survivors at mask positions 0,2,3
+(filter W M) -- [10 30 40]
+(at (filter W M) 0) -- 10
+(at (filter W M) 2) -- 40
 
 ;; ---- Regression tests ported from test_lang_rf.inc::test_rf_filter ----
 ;; Ported from test_lang_rf.inc::test_rf_filter.

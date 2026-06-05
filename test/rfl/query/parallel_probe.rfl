@@ -56,6 +56,45 @@
 (at (at (at Rbig 'v) 1)  0) -- 1
 (at (at (at Rbig 'v) 99) 0) -- 99
 
+;; ── Order-independent per-group value pins.
+;; The positional `(at (at Rbig 'v) i)` checks above assume group
+;; emission order == ascending key; but the parallel scatter merges
+;; per-task histograms and group emission order is NON-DETERMINISTIC,
+;; so a slice swapped between merged groups could survive a positional
+;; sum at the wrong index.  Pin each group by its OWN key instead of by
+;; position: re-run the select with `where: (== k <key>)` so the source
+;; rows are masked to that key before the group, yielding a single
+;; group whose key + aggregates are unambiguous (single row → index 0
+;; is the only row).  Pin the group key column too, so the slice is
+;; proven to belong to the asserted key.
+;; Group k=0: rows {0,100,...,199900}, count 2000, sum 199_900_000,
+;;   min 0, max 199_900.
+(set Gk0 (select {v: v by: k from: Tbig where: (== k 0)}))
+(count Gk0)                  -- 1
+(at (at Gk0 'k) 0)           -- 0
+(count (at (at Gk0 'v) 0))   -- 2000
+(sum (at (at Gk0 'v) 0))     -- 199900000
+(min (at (at Gk0 'v) 0))     -- 0
+(max (at (at Gk0 'v) 0))     -- 199900
+;; Group k=50: rows {50,150,...,199950}, sum = 2000*(50+199950)/2
+;;   = 200_000_000; min 50, max 199_950.
+(set Gk50 (select {v: v by: k from: Tbig where: (== k 50)}))
+(at (at Gk50 'k) 0)          -- 50
+(count (at (at Gk50 'v) 0))  -- 2000
+(sum (at (at Gk50 'v) 0))    -- 200000000
+(min (at (at Gk50 'v) 0))    -- 50
+(max (at (at Gk50 'v) 0))    -- 199950
+;; Group k=99: rows {99,199,...,199999}, sum 200_098_000,
+;;   min 99, max 199_999.
+(set Gk99 (select {v: v by: k from: Tbig where: (== k 99)}))
+(at (at Gk99 'k) 0)          -- 99
+(count (at (at Gk99 'v) 0))  -- 2000
+(sum (at (at Gk99 'v) 0))    -- 200098000
+(min (at (at Gk99 'v) 0))    -- 99
+(max (at (at Gk99 'v) 0))    -- 199999
+;; Whole key set is exactly {0..99} regardless of emission order.
+(asc (at Rbig 'k)) -- (til 100)
+
 ;; ─── Fixture 2: SYM key, same gating
 ;; SYM keys flow through KEY_READ's SYM branch and remain in the parallel
 ;; scatter (key not LIST/STR/GUID, so no eval-group force-out).
@@ -70,6 +109,29 @@
 (fold + 0 (map count (at Rsym 'v))) -- 200000
 ;; Total sum unchanged from total til.
 (fold + 0 (map sum (at Rsym 'v))) -- 19999900000
+;; ── Order-independent per-SYM-group pins (positional checks above
+;; assume hash-bucket order == round-robin order, which it is NOT for
+;; SYM keys).  syms repeat ['AAA 'BBB 'CCC 'DDD 'EEE] so sym at
+;; position p occupies rows {p, p+5, p+10, ...}.
+;;   'AAA → rows {0,5,...,199995}, 40000 rows, min 0,  max 199995.
+;;   'CCC → rows {2,7,...,199997}, 40000 rows, min 2,  max 199997.
+;;     sum = 40000*(0+199995)/2     = 3_999_900_000 (AAA)
+;;     sum = 40000*(2+199997)/2     = 3_999_980_000 (CCC)
+;; Sum of all 5 per-group sums == 19_999_900_000 (pinned above).
+(set GAAA (select {v: v by: k from: Tsym where: (== k 'AAA)}))
+(at (at GAAA 'k) 0)           -- 'AAA
+(count (at (at GAAA 'v) 0))   -- 40000
+(sum (at (at GAAA 'v) 0))     -- 3999900000
+(min (at (at GAAA 'v) 0))     -- 0
+(max (at (at GAAA 'v) 0))     -- 199995
+(set GCCC (select {v: v by: k from: Tsym where: (== k 'CCC)}))
+(at (at GCCC 'k) 0)           -- 'CCC
+(count (at (at GCCC 'v) 0))   -- 40000
+(sum (at (at GCCC 'v) 0))     -- 3999980000
+(min (at (at GCCC 'v) 0))     -- 2
+(max (at (at GCCC 'v) 0))     -- 199997
+;; Full key set is exactly the 5 syms regardless of emission order.
+(asc (at Rsym 'k)) -- (asc syms)
 
 ;; ─── Fixture 3: with WHERE filter — the rowsel-masking applied to
 ;; row_gid before scatter, so dropped rows must not appear in any
@@ -84,6 +146,28 @@
 ;; Total surviving rows = 100_000; sum = 100_000 * 99_999 / 2 = 4_999_950_000.
 (fold + 0 (map count (at Rwh 'v))) -- 100000
 (fold + 0 (map sum (at Rwh 'v))) -- 4999950000
+;; ── Order-independent per-group pins under WHERE (rgid_did_mask path).
+;; Group k filtered to v<100000 keeps rows {k,k+100,...,k+99900}, 1000
+;; rows.  Stacking the extra `where: (== k <key>)` on top of the
+;; existing `v < 100000` masks BOTH predicates before the group, so a
+;; row leaked across merged groups (or a dropped row resurrected) is
+;; caught here, keyed to its own group rather than to a position.
+;;   k=0:  rows {0,...,99900},  sum 1000*(0+99900)/2  = 49_950_000.
+;;   k=50: rows {50,...,99950}, sum 1000*(50+99950)/2 = 50_000_000.
+(set Gwh0 (select {v: v by: k from: Twh where: (and (< v 100000) (== k 0))}))
+(at (at Gwh0 'k) 0)           -- 0
+(count (at (at Gwh0 'v) 0))   -- 1000
+(sum (at (at Gwh0 'v) 0))     -- 49950000
+(min (at (at Gwh0 'v) 0))     -- 0
+(max (at (at Gwh0 'v) 0))     -- 99900
+(set Gwh50 (select {v: v by: k from: Twh where: (and (< v 100000) (== k 50))}))
+(at (at Gwh50 'k) 0)          -- 50
+(count (at (at Gwh50 'v) 0))  -- 1000
+(sum (at (at Gwh50 'v) 0))    -- 50000000
+(min (at (at Gwh50 'v) 0))    -- 50
+(max (at (at Gwh50 'v) 0))    -- 99950
+;; Full surviving key set is still {0..99} (filter keeps every group).
+(asc (at Rwh 'k)) -- (til 100)
 
 ;; ─── Fixture 4: non-agg projection alongside aggs — exercises the
 ;; same scatter index for the agg result AND the non-agg LIST column.
@@ -93,6 +177,26 @@
 (at (at Rmix 'c) 0) -- 2000
 (sum (at Rmix 'c)) -- 200000
 (count (at (at Rmix 'v) 0)) -- 2000
+;; ── Order-independent pins coupling the agg count `c` and the non-agg
+;; LIST `v` for the SAME key.  The `sum (at Rmix 'c)` total above cannot
+;; detect a count swapped between merged groups, nor a `c`/`v` mismatch
+;; (the agg result and the LIST share one idx_buf — they must stay
+;; aligned per group).  Re-mask the source by key: the single group's
+;; `c` must equal the length of its own `v` slice, and both must equal
+;; the per-group cardinality, with min/max pinning the slice contents.
+(set Gm0 (select {c: (count v) v: v by: k from: Tbig where: (== k 0)}))
+(at (at Gm0 'k) 0)            -- 0
+(at (at Gm0 'c) 0)           -- 2000
+(count (at (at Gm0 'v) 0))   -- 2000
+(sum (at (at Gm0 'v) 0))     -- 199900000
+(max (at (at Gm0 'v) 0))     -- 199900
+(set Gm99 (select {c: (count v) v: v by: k from: Tbig where: (== k 99)}))
+(at (at Gm99 'k) 0)          -- 99
+(at (at Gm99 'c) 0)          -- 2000
+(count (at (at Gm99 'v) 0))  -- 2000
+(sum (at (at Gm99 'v) 0))    -- 200098000
+(max (at (at Gm99 'v) 0))    -- 199999
+(asc (at Rmix 'k)) -- (til 100)
 
 ;; ─── Fixture 5: just above the parallel-dispatch threshold (200_001).
 ;; The +1 row goes to the first surviving group; total row count must
@@ -105,3 +209,22 @@
 ;; Group 0 gets the extra row (row 200_000 → k = 200_000 % 100 = 0).
 (count (at (at Redge 'v) 0)) -- 2001
 (count (at (at Redge 'v) 1)) -- 2000
+;; ── Order-independent pins for the uneven split.  The positional
+;; checks above assume group 0 lands at index 0 and group 1 at index 1;
+;; emission order is non-deterministic, so re-mask by key to prove the
+;; +1 row went to k=0 specifically and k=1 is unaffected.
+;;   k=0: rows {0,100,...,200000}, 2001 rows,
+;;        sum = 199_900_000 + 200_000 = 200_100_000, max 200_000.
+;;   k=1: rows {1,101,...,199901},  2000 rows,
+;;        sum = 2000*(1+199901)/2 = 199_902_000, max 199_901.
+(set Ge0 (select {v: v by: k from: Tedge where: (== k 0)}))
+(at (at Ge0 'k) 0)            -- 0
+(count (at (at Ge0 'v) 0))    -- 2001
+(sum (at (at Ge0 'v) 0))      -- 200100000
+(max (at (at Ge0 'v) 0))      -- 200000
+(set Ge1 (select {v: v by: k from: Tedge where: (== k 1)}))
+(at (at Ge1 'k) 0)            -- 1
+(count (at (at Ge1 'v) 0))    -- 2000
+(sum (at (at Ge1 'v) 0))      -- 199902000
+(max (at (at Ge1 'v) 0))      -- 199901
+(asc (at Redge 'k)) -- (til 100)

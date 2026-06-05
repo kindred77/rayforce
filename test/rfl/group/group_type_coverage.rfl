@@ -22,6 +22,14 @@
 (sum (at Ri32k 's)) -- 45
 (at (at Ri32k 'c) 0) -- 3
 (at (at Ri32k 's) 0) -- 12
+;; Per-group order-independent value checks (key-masked SOURCE lookup).
+;; (sum (at R 's)) total cannot detect values swapped between I32 key groups.
+(at (at (select {s: (sum v) c: (count v) from: Ti32k by: k where: (== k 10)}) 's) 0) -- 12
+(at (at (select {s: (sum v) c: (count v) from: Ti32k by: k where: (== k 10)}) 'k) 0) -- 10
+(at (at (select {s: (sum v) from: Ti32k by: k where: (== k 20)}) 's) 0) -- 15
+(at (at (select {s: (sum v) from: Ti32k by: k where: (== k 20)}) 'k) 0) -- 20
+(at (at (select {s: (sum v) from: Ti32k by: k where: (== k 30)}) 's) 0) -- 18
+(at (at (select {s: (sum v) from: Ti32k by: k where: (== k 30)}) 'k) 0) -- 30
 
 ;; DATE key (another I32-width arm)
 (set Tdatek (table [k v] (list (as 'DATE [7305 7306 7307 7305 7306 7307]) (as 'I64 [1 2 3 10 20 30]))))
@@ -30,12 +38,26 @@
 (sum (at Rdatek 's)) -- 66
 (at (at Rdatek 'mn) 0) -- 1
 (at (at Rdatek 'mx) 2) -- 30
+;; Per-group order-independent checks: positional (at 'mn)/(at 'mx) above
+;; assume emission order; key-masked lookup pins each DATE group's min/max.
+(at (at (select {s: (sum v) mn: (min v) mx: (max v) from: Tdatek by: k where: (== k 7305)}) 'mn) 0) -- 1
+(at (at (select {mx: (max v) from: Tdatek by: k where: (== k 7305)}) 'mx) 0) -- 10
+(at (at (select {mn: (min v) from: Tdatek by: k where: (== k 7307)}) 'k) 0) -- 2020.01.03
+(at (at (select {mn: (min v) from: Tdatek by: k where: (== k 7307)}) 'mn) 0) -- 3
+(at (at (select {mx: (max v) from: Tdatek by: k where: (== k 7307)}) 'mx) 0) -- 30
 
 ;; TIME key (I32-width arm)
 (set Ttimek (table [k v] (list (as 'TIME [1000 2000 3000 1000 2000 3000]) (as 'I64 [5 10 15 20 30 40]))))
 (set Rtimek (select {s: (sum v) c: (count v) from: Ttimek by: k}))
 (count Rtimek) -- 3
 (sum (at Rtimek 's)) -- 120
+;; Per-group order-independent checks: the sum total above is the only value
+;; assertion; key-masked lookup pins each TIME group's sum and key.
+(at (at (select {s: (sum v) from: Ttimek by: k where: (== k 1000)}) 's) 0) -- 25
+(at (at (select {s: (sum v) from: Ttimek by: k where: (== k 1000)}) 'k) 0) -- 00:00:01.000
+(at (at (select {s: (sum v) from: Ttimek by: k where: (== k 2000)}) 's) 0) -- 40
+(at (at (select {s: (sum v) from: Ttimek by: k where: (== k 2000)}) 'k) 0) -- 00:00:02.000
+(at (at (select {s: (sum v) from: Ttimek by: k where: (== k 3000)}) 's) 0) -- 55
 
 ;; ─── I32 agg values in group-by (da_accum_fn I32 arm) ────────────────
 ;; I32 value column with SUM/MIN/MAX aggregation; key is I64 so DA path
@@ -45,14 +67,28 @@
 (count Ri32v) -- 3
 ;; k=1: 100+200=300, k=2: 300+400=700, k=3: 500+600=1100
 (sum (at Ri32v 's)) -- 2100
-;; BUG: DA path emits grouped min/max for narrow int agg types (I32/I16/U8)
-;; using ((int64_t*)data)[gi] = v, writing 8 bytes into a 4-byte-stride I32
-;; column.  gi=0 low-4 bytes are correct; gi>=1 land at wrong offset, reading
-;; as 0 (the hi-32 of the previous I64 write).  Assertions checking gi>=1 are
-;; commented out until the emit path is fixed to respect the output element size.
+;; FIXED: the DA/HT emit path now stores grouped min/max for narrow-int agg
+;; types (I32/I16/U8) at the output element width (topk_write_i64 +
+;; ray_sym_elem_size) instead of a fixed 8-byte int64 store, so groups past
+;; index 0 land at the right offset.  Groups emit in key order 1,2,3.
 (at (at Ri32v 'mn) 0) -- 100
 (at (at Ri32v 'mx) 0) -- 200
-;; BUG (at (at Ri32v 'mn) 1) -- 300  ;; gets 0 (hi-32 of prev I64 write)
+(at (at Ri32v 'mn) 1) -- 300
+(at (at Ri32v 'mx) 1) -- 400
+(at (at Ri32v 'mn) 2) -- 500
+(at (at Ri32v 'mx) 2) -- 600
+;; Per-group order-independent checks. sum widens I32→i64 so it is immune to
+;; the narrow-int min/max emit bug above; key-masked sum pins each group total.
+(at (at (select {s: (sum v) from: Ti32v by: k where: (== k 1)}) 's) 0) -- 300
+(at (at (select {s: (sum v) from: Ti32v by: k where: (== k 1)}) 'k) 0) -- 1
+(at (at (select {s: (sum v) from: Ti32v by: k where: (== k 2)}) 's) 0) -- 700
+(at (at (select {s: (sum v) from: Ti32v by: k where: (== k 2)}) 'k) 0) -- 2
+(at (at (select {s: (sum v) from: Ti32v by: k where: (== k 3)}) 's) 0) -- 1100
+;; Key-masked min/max for k=2 (gi>=1 in the unmasked query): under WHERE the
+;; group is emitted at gi=0 so the narrow-int emit bug does not manifest here
+;; and these report the correct I32 min/max (a clean cross-check of the bug).
+(at (at (select {mn: (min v) mx: (max v) from: Ti32v by: k where: (== k 2)}) 'mn) 0) -- 300
+(at (at (select {mn: (min v) mx: (max v) from: Ti32v by: k where: (== k 2)}) 'mx) 0) -- 400
 
 ;; ─── I16 agg values in group-by (da_accum_fn I16 arm) ────────────────
 ;; I16 value column with SUM/MIN/MAX aggregation.
@@ -64,6 +100,14 @@
 (at (at Ri16v 'mn) 0) -- 10
 (at (at Ri16v 'mx) 0) -- 20
 (at (at Ri16v 'avg) 1) -- 35.0
+;; Positional index 0/1 above assume emission order; key-masked lookups pin
+;; each I16-agg group's sum/min/max/avg order-independently.
+(at (at (select {s: (sum v) from: Ti16v by: k where: (== k 1)}) 's) 0) -- 30
+(at (at (select {s: (sum v) from: Ti16v by: k where: (== k 1)}) 'k) 0) -- 1
+(at (at (select {mn: (min v) mx: (max v) from: Ti16v by: k where: (== k 2)}) 'mn) 0) -- 30
+(at (at (select {mn: (min v) mx: (max v) from: Ti16v by: k where: (== k 2)}) 'mx) 0) -- 40
+(at (at (select {a: (avg v) from: Ti16v by: k where: (== k 2)}) 'a) 0) -- 35.0
+(at (at (select {a: (avg v) from: Ti16v by: k where: (== k 2)}) 'k) 0) -- 2
 
 ;; ─── U8 agg values in group-by (da_accum_fn U8 arm) ──────────────────
 ;; U8 value column with SUM/AVG aggregation.
@@ -73,6 +117,12 @@
 (at (at Ru8v 's) 0) -- 30
 (at (at Ru8v 'avg) 0) -- 15.0
 (at (at Ru8v 's) 1) -- 70
+;; Positional 0/1 above assume order; key-masked lookups pin U8-agg groups.
+(at (at (select {s: (sum v) avg: (avg v) from: Tu8v by: k where: (== k 1)}) 's) 0) -- 30
+(at (at (select {avg: (avg v) from: Tu8v by: k where: (== k 1)}) 'avg) 0) -- 15.0
+(at (at (select {s: (sum v) from: Tu8v by: k where: (== k 1)}) 'k) 0) -- 1
+(at (at (select {s: (sum v) avg: (avg v) from: Tu8v by: k where: (== k 2)}) 's) 0) -- 70
+(at (at (select {avg: (avg v) from: Tu8v by: k where: (== k 2)}) 'avg) 0) -- 35.0
 
 ;; ─── BOOL agg value in group-by (da_accum_fn BOOL arm via U8) ─────────
 ;; BOOL value column with COUNT/SUM aggregation.
@@ -83,6 +133,12 @@
 (at (at Rboolv 's) 0) -- 2
 (at (at Rboolv 's) 1) -- 1
 (at (at Rboolv 'c) 0) -- 3
+;; Positional 0/1 above assume order; key-masked lookups pin BOOL-agg groups.
+(at (at (select {s: (sum v) c: (count v) from: Tboolv by: k where: (== k 1)}) 's) 0) -- 2
+(at (at (select {s: (sum v) c: (count v) from: Tboolv by: k where: (== k 1)}) 'c) 0) -- 3
+(at (at (select {s: (sum v) from: Tboolv by: k where: (== k 1)}) 'k) 0) -- 1
+(at (at (select {s: (sum v) c: (count v) from: Tboolv by: k where: (== k 2)}) 's) 0) -- 1
+(at (at (select {s: (sum v) c: (count v) from: Tboolv by: k where: (== k 2)}) 'c) 0) -- 3
 
 ;; ─── F64 agg value in DA path group-by ────────────────────────────────
 ;; F64 value with I32 key — exercises DA path with F64 agg column.
@@ -93,6 +149,14 @@
 (at (at Rf64v 's) 0) -- 4.0
 (at (at Rf64v 'mn) 1) -- 3.5
 (at (at Rf64v 'mx) 2) -- 6.5
+;; Positional indices above assume order; key-masked lookups pin F64-agg
+;; groups order-independently (F64 → exact here, values are representable).
+(at (at (select {s: (sum v) mn: (min v) mx: (max v) from: Tf64v by: k where: (== k 1)}) 's) 0) -- 4.0
+(at (at (select {mn: (min v) from: Tf64v by: k where: (== k 1)}) 'mn) 0) -- 1.5
+(at (at (select {s: (sum v) from: Tf64v by: k where: (== k 1)}) 'k) 0) -- 1
+(at (at (select {mn: (min v) mx: (max v) from: Tf64v by: k where: (== k 2)}) 'mn) 0) -- 3.5
+(at (at (select {mn: (min v) mx: (max v) from: Tf64v by: k where: (== k 2)}) 'mx) 0) -- 4.5
+(at (at (select {mx: (max v) from: Tf64v by: k where: (== k 3)}) 'mx) 0) -- 6.5
 
 ;; ─── F64 key group-by (bypasses DA path → HT path) ────────────────────
 ;; F64 keys cannot use the DA path; forces the HT (radix) path.
@@ -103,6 +167,13 @@
 (sum (at Rf64k 's)) -- 210
 (at (at Rf64k 'c) 0) -- 2
 (min (at Rf64k 'c)) -- 2
+;; sum total + cardinality-only checks above cannot detect swapped values;
+;; key-masked lookups pin each F64-key group's sum/count and key (HT path).
+(at (at (select {s: (sum v) c: (count v) from: Tf64k by: k where: (== k 1.0)}) 's) 0) -- 50
+(at (at (select {s: (sum v) from: Tf64k by: k where: (== k 1.0)}) 'k) 0) -- 1.0
+(at (at (select {s: (sum v) from: Tf64k by: k where: (== k 2.0)}) 's) 0) -- 70
+(at (at (select {s: (sum v) from: Tf64k by: k where: (== k 2.0)}) 'k) 0) -- 2.0
+(at (at (select {s: (sum v) from: Tf64k by: k where: (== k 3.0)}) 's) 0) -- 90
 
 ;; F64 key with min/max aggregation (HT path with min/max agg)
 (set Tf64km (table [k v] (list (as 'F64 [0.5 0.5 1.5 1.5]) (as 'F64 [10.0 20.0 30.0 40.0]))))
@@ -111,6 +182,14 @@
 (at (at Rf64km 'mn) 0) -- 10.0
 (at (at Rf64km 'mx) 0) -- 20.0
 (at (at Rf64km 'avg) 1) -- 35.0
+;; Positional 0/1 above assume order; key-masked lookups pin each F64-key
+;; group's min/max/avg and key value order-independently.
+(at (at (select {mn: (min v) mx: (max v) from: Tf64km by: k where: (== k 0.5)}) 'mn) 0) -- 10.0
+(at (at (select {mn: (min v) mx: (max v) from: Tf64km by: k where: (== k 0.5)}) 'mx) 0) -- 20.0
+(at (at (select {mn: (min v) from: Tf64km by: k where: (== k 0.5)}) 'k) 0) -- 0.5
+(at (at (select {mn: (min v) mx: (max v) from: Tf64km by: k where: (== k 1.5)}) 'mn) 0) -- 30.0
+(at (at (select {mx: (max v) from: Tf64km by: k where: (== k 1.5)}) 'mx) 0) -- 40.0
+(at (at (select {a: (avg v) from: Tf64km by: k where: (== k 1.5)}) 'a) 0) -- 35.0
 
 ;; ─── scalar_accum_fn with I32/I16/U8 value columns (n_keys=0 path) ────
 ;; Direct scalar aggregation via exec_reduction on narrow integer types.
@@ -142,6 +221,12 @@
 (count Rcd_i32) -- 6
 (at (at Rcd_i32 'c) 0) -- 7
 (sum (at Rcd_i32 'c)) -- 42
+;; sum total + positional (at 'c) 0 above are order-dependent / aggregate;
+;; key-masked lookups pin the distinct count for specific I32-val groups.
+(at (at (select {c: (count (distinct v)) from: Tcd_i32 by: k where: (== k 0)}) 'c) 0) -- 7
+(at (at (select {c: (count (distinct v)) from: Tcd_i32 by: k where: (== k 0)}) 'k) 0) -- 0
+(at (at (select {c: (count (distinct v)) from: Tcd_i32 by: k where: (== k 5)}) 'c) 0) -- 7
+(at (at (select {c: (count (distinct v)) from: Tcd_i32 by: k where: (== k 5)}) 'k) 0) -- 5
 
 ;; U8 distinct count per group
 (set Tcd_u8 (table [k v] (list (% (til 500) 5) (as 'U8 (% (til 500) 4)))))
@@ -149,6 +234,11 @@
 (count Rcd_u8) -- 5
 (at (at Rcd_u8 'c) 0) -- 4
 (sum (at Rcd_u8 'c)) -- 20
+;; Key-masked lookups pin the U8-val distinct count per group.
+(at (at (select {c: (count (distinct v)) from: Tcd_u8 by: k where: (== k 0)}) 'c) 0) -- 4
+(at (at (select {c: (count (distinct v)) from: Tcd_u8 by: k where: (== k 0)}) 'k) 0) -- 0
+(at (at (select {c: (count (distinct v)) from: Tcd_u8 by: k where: (== k 4)}) 'c) 0) -- 4
+(at (at (select {c: (count (distinct v)) from: Tcd_u8 by: k where: (== k 4)}) 'k) 0) -- 4
 
 ;; BOOL distinct count per group (at most 2 distinct values: true/false)
 (set Tcd_bool (table [k v] (list (as 'I64 [1 1 1 2 2 2 3 3 3 4 4 4]) (as 'BOOL [true false true false false false true true true false true false]))))
@@ -158,6 +248,15 @@
 (at (at Rcd_bool 'c) 0) -- 2
 (at (at Rcd_bool 'c) 1) -- 1
 (sum (at Rcd_bool 'c)) -- 6
+;; Positional (at 'c) 0/1 above assume order; key-masked lookups pin the BOOL
+;; distinct count per group: k=1→2, k=2→1, k=3→1, k=4→2 (distinguishes the
+;; two cardinality-1 groups from the cardinality-2 groups order-independently).
+(at (at (select {c: (count (distinct v)) from: Tcd_bool by: k where: (== k 1)}) 'c) 0) -- 2
+(at (at (select {c: (count (distinct v)) from: Tcd_bool by: k where: (== k 2)}) 'c) 0) -- 1
+(at (at (select {c: (count (distinct v)) from: Tcd_bool by: k where: (== k 2)}) 'k) 0) -- 2
+(at (at (select {c: (count (distinct v)) from: Tcd_bool by: k where: (== k 3)}) 'c) 0) -- 1
+(at (at (select {c: (count (distinct v)) from: Tcd_bool by: k where: (== k 3)}) 'k) 0) -- 3
+(at (at (select {c: (count (distinct v)) from: Tcd_bool by: k where: (== k 4)}) 'c) 0) -- 2
 
 ;; ─── count(distinct) parallel with I32 (fires cd_hist_fn I32 arm on
 ;; large N > 65536 to use partitioned cd_hist_fn / cd_scatter_fn) ────────
@@ -166,53 +265,114 @@
 (set Rcd_p32 (select {c: (count (distinct v)) from: Tcd_p32 by: k}))
 ;; Should return 60001 groups
 (count Rcd_p32) -- 60001
+;; count-only above is pure cardinality; key-masked lookups pin the distinct
+;; count for specific groups in the partitioned cd_hist_fn/cd_scatter_fn path.
+;; k=0: rows 0 (v=0) and 60001 (v=60001%5=1) → distinct {0,1}=2.
+(at (at (select {c: (count (distinct v)) from: Tcd_p32 by: k where: (== k 0)}) 'c) 0) -- 2
+(at (at (select {c: (count (distinct v)) from: Tcd_p32 by: k where: (== k 0)}) 'k) 0) -- 0
+;; k=60000: only row 60000 (60000+60001 > 69999) → single row, distinct=1.
+(at (at (select {c: (count (distinct v)) from: Tcd_p32 by: k where: (== k 60000)}) 'c) 0) -- 1
+(at (at (select {c: (count (distinct v)) from: Tcd_p32 by: k where: (== k 60000)}) 'k) 0) -- 60000
 
 ;; ─── grpt_val_read I32/I16/U8/BOOL arms: top/bot with those val types ──
 ;; top/bot rowform with I32 val type (grpt_val_read I32 arm, line 9175)
 (set T_t_i32v (table [k v] (list (as 'I64 [1 1 2 2 3 3]) (as 'I32 [100 50 200 150 300 250]))))
 ;; top-1 per group: k=1→[100], k=2→[200], k=3→[300]; recursive sum = 600
 (sum (at (select {t: (top v 1) by: k from: T_t_i32v}) 't)) -- 600
+;; Recursive-sum total above cannot detect a per-group top value swap;
+;; key-masked top/bot lookups pin each group's chosen I32 value + key. The 't
+;; column is a nested list ([v] per group), so triple-at extracts the scalar.
+(at (at (at (select {t: (top v 1) by: k from: T_t_i32v where: (== k 1)}) 't) 0) 0) -- 100
+(at (at (select {t: (top v 1) by: k from: T_t_i32v where: (== k 1)}) 'k) 0) -- 1
+(at (at (at (select {t: (top v 1) by: k from: T_t_i32v where: (== k 2)}) 't) 0) 0) -- 200
+(at (at (at (select {b: (bot v 1) by: k from: T_t_i32v where: (== k 2)}) 'b) 0) 0) -- 150
+(at (at (at (select {t: (top v 1) by: k from: T_t_i32v where: (== k 3)}) 't) 0) 0) -- 300
 
 ;; top/bot rowform with I16 val type (grpt_val_read I16 arm)
 (set T_t_i16v (table [k v] (list (as 'I64 [1 1 2 2]) (as 'I16 [10 20 30 40]))))
 ;; top-1 per group: k=1→20, k=2→40
 (sum (at (select {t: (top v 1) by: k from: T_t_i16v}) 't)) -- 60
+;; Key-masked top/bot pin each group's I16 value order-independently.
+(at (at (at (select {t: (top v 1) by: k from: T_t_i16v where: (== k 1)}) 't) 0) 0) -- 20
+(at (at (select {t: (top v 1) by: k from: T_t_i16v where: (== k 1)}) 'k) 0) -- 1
+(at (at (at (select {t: (top v 1) by: k from: T_t_i16v where: (== k 2)}) 't) 0) 0) -- 40
+(at (at (at (select {b: (bot v 1) by: k from: T_t_i16v where: (== k 2)}) 'b) 0) 0) -- 30
 
 ;; top/bot rowform with U8 val type (grpt_val_read U8 arm)
 (set T_t_u8v (table [k v] (list (as 'I64 [1 1 2 2]) (as 'U8 [5 15 25 35]))))
 ;; top-1 per group: k=1→15, k=2→35
 (sum (at (select {t: (top v 1) by: k from: T_t_u8v}) 't)) -- 50
+;; Key-masked top/bot pin each group's U8 value order-independently.
+;; U8 scalar elements render in hex (0x0f=15, 0x23=35, 0x19=25).
+(at (at (at (select {t: (top v 1) by: k from: T_t_u8v where: (== k 1)}) 't) 0) 0) -- 0x0f
+(at (at (select {t: (top v 1) by: k from: T_t_u8v where: (== k 1)}) 'k) 0) -- 1
+(at (at (at (select {t: (top v 1) by: k from: T_t_u8v where: (== k 2)}) 't) 0) 0) -- 0x23
+(at (at (at (select {b: (bot v 1) by: k from: T_t_u8v where: (== k 2)}) 'b) 0) 0) -- 0x19
 
 ;; top/bot rowform with BOOL val type (grpt_val_read BOOL arm)
 ;; top-1 by key where val is BOOL
 (set T_t_boolv (table [k v] (list (as 'I64 [1 1 2 2 3 3]) (as 'BOOL [true false true true false false]))))
 ;; top-1 per group: k=1→true(1), k=2→true(1), k=3→false(0) → sum=2
 (sum (at (select {t: (top v 1) by: k from: T_t_boolv}) 't)) -- 2
+;; Key-masked top/bot pin each group's BOOL value order-independently; the
+;; recursive sum above could not distinguish which group holds the false top.
+(at (at (at (select {t: (top v 1) by: k from: T_t_boolv where: (== k 1)}) 't) 0) 0) -- true
+(at (at (select {t: (top v 1) by: k from: T_t_boolv where: (== k 1)}) 'k) 0) -- 1
+(at (at (at (select {t: (top v 1) by: k from: T_t_boolv where: (== k 2)}) 't) 0) 0) -- true
+(at (at (at (select {b: (bot v 1) by: k from: T_t_boolv where: (== k 3)}) 'b) 0) 0) -- false
 
 ;; top/bot rowform with I32 key type (grpt_key_read I32 arm, line 9115)
 (set T_t_i32k (table [k v] (list (as 'I32 [10 10 20 20 30 30]) (as 'I64 [100 200 300 400 500 600]))))
 (count (select {t: (top v 1) by: k from: T_t_i32k})) -- 3
 (sum (at (select {t: (top v 1) by: k from: T_t_i32k}) 't)) -- 1200
+;; Cardinality + recursive-sum above; key-masked lookups pin each I32-key
+;; group's top value and key order-independently.
+(at (at (at (select {t: (top v 1) by: k from: T_t_i32k where: (== k 10)}) 't) 0) 0) -- 200
+(at (at (select {t: (top v 1) by: k from: T_t_i32k where: (== k 10)}) 'k) 0) -- 10
+(at (at (at (select {t: (top v 1) by: k from: T_t_i32k where: (== k 20)}) 't) 0) 0) -- 400
+(at (at (at (select {t: (top v 1) by: k from: T_t_i32k where: (== k 30)}) 't) 0) 0) -- 600
+(at (at (at (select {b: (bot v 1) by: k from: T_t_i32k where: (== k 30)}) 'b) 0) 0) -- 500
 
 ;; top/bot rowform with I16 key type (grpt_key_read I16 arm)
 (set T_t_i16k (table [k v] (list (as 'I16 [5 5 10 10]) (as 'I64 [10 20 30 40]))))
 ;; top-1 per group: k=5→20, k=10→40
 (count (select {t: (top v 1) by: k from: T_t_i16k})) -- 2
 (sum (at (select {t: (top v 1) by: k from: T_t_i16k}) 't)) -- 60
+;; Key-masked lookups pin each I16-key group's top value and key.
+(at (at (at (select {t: (top v 1) by: k from: T_t_i16k where: (== k 5)}) 't) 0) 0) -- 20
+(at (at (select {t: (top v 1) by: k from: T_t_i16k where: (== k 5)}) 'k) 0) -- 5
+(at (at (at (select {t: (top v 1) by: k from: T_t_i16k where: (== k 10)}) 't) 0) 0) -- 40
 
 ;; top/bot with U8 key type (grpt_key_read U8 arm)
 (set T_t_u8k (table [k v] (list (as 'U8 [1 1 2 2]) (as 'I64 [10 20 30 40]))))
 (sum (at (select {t: (top v 1) by: k from: T_t_u8k}) 't)) -- 60
+;; Key-masked lookups pin each U8-key group's top value and key.
+(at (at (at (select {t: (top v 1) by: k from: T_t_u8k where: (== k 1)}) 't) 0) 0) -- 20
+(at (at (select {t: (top v 1) by: k from: T_t_u8k where: (== k 1)}) 'k) 0) -- 0x01
+(at (at (at (select {t: (top v 1) by: k from: T_t_u8k where: (== k 2)}) 't) 0) 0) -- 40
 
 ;; bot (min) rowform with F64 key (grpt_key_read F64 arm, line 9108)
 (set T_b_f64k (table [k v] (list (as 'F64 [1.0 1.0 2.0 2.0]) (as 'I64 [10 20 30 40]))))
 ;; bot-1 per group: k=1.0→10, k=2.0→30
 (sum (at (select {b: (bot v 1) by: k from: T_b_f64k}) 'b)) -- 40
+;; Key-masked lookups pin each F64-key group's bot value and key.
+(at (at (at (select {b: (bot v 1) by: k from: T_b_f64k where: (== k 1.0)}) 'b) 0) 0) -- 10
+(at (at (select {b: (bot v 1) by: k from: T_b_f64k where: (== k 1.0)}) 'k) 0) -- 1.0
+(at (at (at (select {b: (bot v 1) by: k from: T_b_f64k where: (== k 2.0)}) 'b) 0) 0) -- 30
+(at (at (at (select {t: (top v 1) by: k from: T_b_f64k where: (== k 2.0)}) 't) 0) 0) -- 40
 
 ;; grpt_key_read DATE arm (I32 width)
 (set T_t_datek (table [k v] (list (as 'DATE [7305 7305 7306 7306]) (as 'I64 [10 20 30 40]))))
 (sum (at (select {t: (top v 1) by: k from: T_t_datek}) 't)) -- 60
+;; Key-masked lookups pin each DATE-key group's top value and key.
+(at (at (at (select {t: (top v 1) by: k from: T_t_datek where: (== k 7305)}) 't) 0) 0) -- 20
+(at (at (select {t: (top v 1) by: k from: T_t_datek where: (== k 7305)}) 'k) 0) -- 2020.01.01
+(at (at (at (select {t: (top v 1) by: k from: T_t_datek where: (== k 7306)}) 't) 0) 0) -- 40
 
 ;; grpt_key_read TIME arm
 (set T_t_timek (table [k v] (list (as 'TIME [1000 1000 2000 2000]) (as 'I64 [5 10 15 20]))))
 (sum (at (select {t: (top v 1) by: k from: T_t_timek}) 't)) -- 30
+;; Key-masked lookups pin each TIME-key group's top value and key.
+(at (at (at (select {t: (top v 1) by: k from: T_t_timek where: (== k 1000)}) 't) 0) 0) -- 10
+(at (at (select {t: (top v 1) by: k from: T_t_timek where: (== k 1000)}) 'k) 0) -- 00:00:01.000
+(at (at (at (select {t: (top v 1) by: k from: T_t_timek where: (== k 2000)}) 't) 0) 0) -- 20

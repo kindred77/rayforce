@@ -620,9 +620,12 @@
 (type (log 0Ni))  -- 'f64
 
 ;; ── L383: is_numeric(x) integer input ──
-
+;; log(5) ≈ 1.6094379124341003 (natural log)
+(< (abs (- (log 5)  1.609437912434100)) 0.0001) -- true
 (type (log 5))  -- 'f64
+(< (abs (- (log 5h) 1.609437912434100)) 0.0001) -- true
 (type (log 5h)) -- 'f64
+(< (abs (- (log 5i) 1.609437912434100)) 0.0001) -- true
 (type (log 5i)) -- 'f64
 
 ;; ── L384: type error ──
@@ -649,9 +652,12 @@
 (type (exp 0Ni))  -- 'f64
 
 ;; ── L391: is_numeric(x) integer input ──
-
+;; exp(1) = e ≈ 2.718281828459045
+(< (abs (- (exp 1)  2.718281828459045)) 0.0001) -- true
 (type (exp 1))  -- 'f64
+(< (abs (- (exp 1h) 2.718281828459045)) 0.0001) -- true
 (type (exp 1h)) -- 'f64
+(< (abs (- (exp 1i) 2.718281828459045)) 0.0001) -- true
 (type (exp 1i)) -- 'f64
 
 ;; ── L392: type error ──

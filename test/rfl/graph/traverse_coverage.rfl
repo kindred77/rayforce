@@ -30,9 +30,13 @@
 (set Ck (.graph.cluster K4))
 (count Ck)                                        -- 4
 (count (distinct (at Ck '_node)))                 -- 4
-;; In K4 every node has all its neighbors connected -> LCC = 1.0
+;; In K4 every node has all its neighbors connected -> LCC = exactly 1.0
 (>= (min (at Ck '_coefficient)) 0.9)              -- true
 (<= (max (at Ck '_coefficient)) 1.0)              -- true
+;; Node IDs 0..3, every coefficient is 1.0 (all 3 neighbors mutually linked).
+(at Ck '_node)                                    -- [0 1 2 3]
+(< (max (- (at Ck '_coefficient) 1.0)) 0.0001)    -- true
+(> (min (at Ck '_coefficient)) 0.9999)            -- true
 
 ;; --- exec_cluster_coeff: deg<2 path -> coefficient = 0.0 ---
 ;; Simple chain: 0->1->2 (no triangles; node 0 and 2 have deg<2)
@@ -41,8 +45,11 @@
 (set Cc (.graph.cluster Chain))
 (count Cc)                                        -- 3
 ;; Node 1 is interior but fwd + rev neighbors are {0, 2} - no fwd edge 0->2
-;; so triangle count = 0, LCC = 0
+;; so triangle count = 0, LCC = 0 for every node.
 (>= (min (at Cc '_coefficient)) 0.0)              -- true
+(at Cc '_node)                                    -- [0 1 2]
+;; No triangles anywhere -> all coefficients exactly 0.0.
+(== (max (at Cc '_coefficient)) 0.0)              -- true
 
 ;; =====================================================================
 ;; Fixture B: Disconnected graph.
@@ -56,6 +63,16 @@
 (count Comp)                                      -- 5
 ;; Exactly 3 distinct component IDs: {0,1} form one, 2 is isolated, {3,4} another
 (count (distinct (at Comp '_component)))          -- 3
+;; Nodes reported in id order 0..4.
+(at Comp '_node)                                  -- [0 1 2 3 4]
+(set Comp_c (at Comp '_component))
+;; Structure (ids are impl-defined): 0 and 1 share a component; 3 and 4 share
+;; a component; 2 (isolated) differs from both; the two pair-components differ.
+(== (at Comp_c 0) (at Comp_c 1))                  -- true
+(== (at Comp_c 3) (at Comp_c 4))                  -- true
+(!= (at Comp_c 0) (at Comp_c 2))                  -- true
+(!= (at Comp_c 3) (at Comp_c 2))                  -- true
+(!= (at Comp_c 0) (at Comp_c 3))                  -- true
 
 ;; =====================================================================
 ;; Fixture C: simple 3-node path 0->1->2 with unit weights.
@@ -98,9 +115,17 @@
 (first (at VeBoth '_start))                       -- 0
 (min (at VeBoth '_depth))                         -- 1
 (max (at VeBoth '_depth))                         -- 1
+;; Endpoints are fwd(0)={1} and rev(0)={2} -> the set {1,2}.
+(== (min (at VeBoth '_end)) 1)                    -- true
+(== (max (at VeBoth '_end)) 2)                    -- true
+(== (count (distinct (at VeBoth '_end))) 2)       -- true
 
-;; direction==2, depth 2 covers all nodes from 0
-(>= (count (.graph.var-expand Ring 0 1 2 2)) 2)   -- true
+;; direction==2, depth 2 covers all OTHER nodes from 0 (visited-dedup) -> {1,2}.
+(set VeBoth2 (.graph.var-expand Ring 0 1 2 2))
+(>= (count VeBoth2) 2)                            -- true
+;; reachable end-node set is exactly {1,2} (node 0 is the start, excluded)
+(== (min (at VeBoth2 '_end)) 1)                   -- true
+(== (max (at VeBoth2 '_end)) 2)                   -- true
 
 ;; --- exec_topsort: cycle detection -> domain error ---
 (set CycE (table [src dst w] (list [0 1 2] [1 2 0] [1.0 1.0 1.0])))
@@ -139,6 +164,16 @@
 ;; Ranks sum to ~1
 (>= (sum (at Pr '_rank)) 0.99)                    -- true
 (<= (sum (at Pr '_rank)) 1.01)                    -- true
+;; Nodes 0..5 in id order.
+(at Pr '_node)                                    -- [0 1 2 3 4 5]
+(set Pr_r (at Pr '_rank))
+;; Hub (node 0) has NO in-edges -> only the base (1-d)/n + dangling share,
+;; so it is the strict minimum.  The 5 spokes each receive the hub's outgoing
+;; mass equally -> they tie as the maximum and exceed the hub.
+(== (min Pr_r) (at Pr_r 0))                       -- true
+(> (at Pr_r 1) (at Pr_r 0))                       -- true
+;; All five spokes equal within float tolerance (symmetric star).
+(< (- (max Pr_r) (min (at Pr_r [1 2 3 4 5]))) 0.0001)  -- true
 
 ;; --- exec_expand on hub (out-degree=5) ---
 (count (.graph.expand Star 0))                    -- 5
@@ -163,17 +198,43 @@
 (count Bet)                                       -- 5
 ;; All centralities >= 0
 (>= (min (at Bet '_centrality)) 0.0)              -- true
+;; Nodes 0..4 in id order.
+(at Bet '_node)                                   -- [0 1 2 3 4]
+(set Bet_c (at Bet '_centrality))
+;; Left nodes {0,1} are the only intermediaries on right<->right shortest
+;; paths, so they carry strictly positive betweenness; right nodes {2,3,4}
+;; lie on no other pair's shortest path through them... actually each right
+;; node bridges left<->left, so all are positive, but the two left hubs
+;; dominate (each on 3 right-right pairs).  Left > right; left pair ties.
+(> (at Bet_c 0) (at Bet_c 2))                     -- true
+(> (at Bet_c 1) (at Bet_c 4))                     -- true
+(< (abs (- (at Bet_c 0) (at Bet_c 1))) 0.01)      -- true
+(< (abs (- (at Bet_c 2) (at Bet_c 3))) 0.01)      -- true
+(< (abs (- (at Bet_c 3) (at Bet_c 4))) 0.01)      -- true
 
 ;; --- exec_closeness on bipartite graph ---
 (set Clo (.graph.closeness K23))
 (count Clo)                                       -- 5
 (>= (min (at Clo '_centrality)) 0.0)              -- true
+;; Nodes 0..4 in id order.
+(at Clo '_node)                                   -- [0 1 2 3 4]
+(set Clo_c (at Clo '_centrality))
+;; Left hubs reach every right node in 1 hop and each other in 2; right nodes
+;; reach left in 1 hop, other right in 2 -> left hubs are closer (higher
+;; closeness).  Left pair ties; right triple ties.
+(> (at Clo_c 0) (at Clo_c 2))                     -- true
+(> (at Clo_c 1) (at Clo_c 3))                     -- true
+(< (abs (- (at Clo_c 0) (at Clo_c 1))) 0.01)      -- true
+(< (abs (- (at Clo_c 2) (at Clo_c 4))) 0.01)      -- true
 
 ;; --- exec_var_expand direction==1 (reverse) ---
 ;; From node 2, direction=1 (reverse) expands to {0, 1} at depth 1
 (set VeRev (.graph.var-expand K23 2 1 1 1))
 (count VeRev)                                     -- 2
 (first (at VeRev '_start))                        -- 2
+;; Reverse neighbors of right-node 2 are exactly the two left nodes {0,1}.
+(== (min (at VeRev '_end)) 0)                     -- true
+(== (max (at VeRev '_end)) 1)                     -- true
 
 ;; --- exec_dijkstra single-source all-reachable ---
 (set DjK (.graph.dijkstra K23 0))
@@ -185,6 +246,13 @@
 (at DjK_dist (at (where (== DjK_node 0)) 0))      -- 0.0
 ;; All reachable nodes have dist < infinity
 (<= (max DjK_dist) 2.0)                           -- true
+;; From left-node 0 each right node is exactly 1 hop (w=1.0) away.
+(at DjK_dist (at (where (== DjK_node 2)) 0))      -- 1.0
+(at DjK_dist (at (where (== DjK_node 3)) 0))      -- 1.0
+(at DjK_dist (at (where (== DjK_node 4)) 0))      -- 1.0
+;; Reachable set is exactly {0,2,3,4} (node 1, the other left node, is
+;; unreachable from 0 in the directed bipartite graph).
+(at DjK '_node)                                   -- [0 2 3 4]
 
 ;; =====================================================================
 ;; Fixture G: simple two-node graph (exercises louvain two_m==0 guard).
@@ -201,12 +269,18 @@
 (set Liso (.graph.louvain IsoG))
 (count Liso)                                      -- 2
 (>= (min (at Liso '_community)) 0)                -- true
+;; Two nodes joined by the single edge 0->1 collapse into one community.
+(at Liso '_node)                                  -- [0 1]
+(== (at (at Liso '_community) 0) (at (at Liso '_community) 1))  -- true
 
 ;; MST on disconnected graph (returns forest, fewer than n-1 edges)
 (set MstDisc (.graph.mst Disc))
 ;; Disc has 3 edges: {0->1, 1->0, 3->4}. MST/forest = 2 edges (one per component)
 (>= (count MstDisc) 1)                            -- true
 (<= (count MstDisc) 4)                            -- true
+;; Forest spans the two 2-node components: exactly 2 edges, each weight 1.0.
+(count MstDisc)                                   -- 2
+(== (sum (at MstDisc '_weight)) 2.0)              -- true
 
 ;; --- exec_mst: equal-weight edges ---
 (set EqE (table [src dst w] (list [0 1 2 3] [1 2 3 0] [2.0 2.0 2.0 2.0])))
@@ -214,8 +288,10 @@
 (set EqMst (.graph.mst EqG))
 ;; MST of a 4-cycle has 3 edges
 (count EqMst)                                     -- 3
-;; All weights are 2.0
+;; All weights are 2.0 (every edge identical) -> sum of the 3 MST edges = 6.0.
 (== (min (at EqMst '_weight)) 2.0)                -- true
+(== (max (at EqMst '_weight)) 2.0)               -- true
+(== (sum (at EqMst '_weight)) 6.0)               -- true
 
 ;; --- exec_k_shortest: disconnected returns empty table ---
 (set Knone (.graph.k-shortest Path 2 0 3))
@@ -238,6 +314,10 @@
 (count ExpRev)                                    -- 2
 (== (min (at ExpRev '_src)) 0)                    -- true
 (== (max (at ExpRev '_src)) 0)                    -- true
+;; Reverse neighbors of node 0 (nodes with a fwd edge ->0) are exactly {1,2}.
+(== (min (at ExpRev '_dst)) 1)                    -- true
+(== (max (at ExpRev '_dst)) 2)                    -- true
+(== (count (distinct (at ExpRev '_dst))) 2)       -- true
 
 ;; --- exec_expand direction==2 (both: fwd + rev of node 1) ---
 ;; Ring is bidirectional: fwd(1)={0,2}, rev(1)={0,2}.
@@ -246,14 +326,30 @@
 (count ExpBoth)                                   -- 4
 (== (min (at ExpBoth '_src)) 1)                   -- true
 (== (max (at ExpBoth '_src)) 1)                   -- true
+;; fwd(1)={0,2} and rev(1)={0,2} concatenated without dedup -> dst set {0,2},
+;; each appearing twice.
+(== (min (at ExpBoth '_dst)) 0)                   -- true
+(== (max (at ExpBoth '_dst)) 2)                   -- true
+(== (count (distinct (at ExpBoth '_dst))) 2)      -- true
 
 ;; --- exec_expand direction==0 on K4 hub node 0 ---
-;; K4 node 0: fwd edges are 0->1, 0->2, 0->3 = 3 forward neighbors
-(count (.graph.expand K4 0))                      -- 3
+;; K4 node 0: fwd edges are 0->1, 0->2, 0->3 = 3 forward neighbors {1,2,3}
+(set Ek0 (.graph.expand K4 0))
+(count Ek0)                                       -- 3
+(== (min (at Ek0 '_dst)) 1)                       -- true
+(== (max (at Ek0 '_dst)) 3)                       -- true
+(== (sum (at Ek0 '_dst)) 6)                       -- true
 ;; reverse of K4 node 2: nodes with edge ->2: {0,1,3} = 3 rows
-(count (.graph.expand K4 2 1))                    -- 3
+(set Ek2 (.graph.expand K4 2 1))
+(count Ek2)                                       -- 3
+(== (min (at Ek2 '_dst)) 0)                       -- true
+(== (max (at Ek2 '_dst)) 3)                       -- true
+(== (sum (at Ek2 '_dst)) 4)                       -- true
 ;; both directions for K4 node 1: fwd {0,2,3} + rev {0,2,3} = 6 rows (no dedup)
-(count (.graph.expand K4 1 2))                    -- 6
+(set Ek1 (.graph.expand K4 1 2))
+(count Ek1)                                       -- 6
+(== (count (distinct (at Ek1 '_dst))) 3)          -- true
+(== (sum (at Ek1 '_dst)) 10)                      -- true
 
 ;; =====================================================================
 ;; Section 3: exec_dijkstra with explicit destination argument
@@ -272,6 +368,10 @@
 (set Dij4_dist (at Dij4r '_dist))
 (at Dij4_dist (at (where (== Dij4_node 0)) 0))    -- 0.0
 (at Dij4_dist (at (where (== Dij4_node 3)) 0))    -- 6.0
+;; Shortest path 0->1(w1)->2(w2)->3(w3): the 0->2 shortcut (w10) is NOT taken,
+;; so node 2 sits at dist 3.0 not 10.0, and node 1 at 1.0.
+(at Dij4_dist (at (where (== Dij4_node 1)) 0))    -- 1.0
+(at Dij4_dist (at (where (== Dij4_node 2)) 0))    -- 3.0
 
 ;; Dijkstra with dst == src: only src row emitted.
 (set DijSS (.graph.dijkstra Dij4 2 2))
@@ -294,6 +394,16 @@
 (set Dk3 (.graph.k-shortest Diam 0 3 3))
 ;; Should find 3 distinct paths
 (count (distinct (at Dk3 '_path_id)))             -- 3
+;; Every path starts at node 0 and ends at node 3, all with total weight 3.0.
+(== (min (at Dk3 '_dist)) 0.0)                    -- true
+(== (max (at Dk3 '_dist)) 3.0)                    -- true
+;; The terminal node 3 is reached on every path at dist exactly 3.0.
+(set Dk3_d (at Dk3 '_dist))
+(set Dk3_n (at Dk3 '_node))
+(== (min (at Dk3_d (where (== Dk3_n 3)))) 3.0)    -- true
+(== (max (at Dk3_d (where (== Dk3_n 3)))) 3.0)    -- true
+;; All three terminate at node 3 (one terminal per path_id).
+(== (count (where (== Dk3_n 3))) 3)               -- true
 
 ;; K=5 on diamond: only 3 paths exist, stops at 3
 (set Dk5 (.graph.k-shortest Diam 0 3 5))
@@ -304,6 +414,11 @@
 ;; First path: P0 (0->1->2->3=3), second path: P1 or P2
 (set Dk2 (.graph.k-shortest Diam 0 3 2))
 (count (distinct (at Dk2 '_path_id)))             -- 2
+;; Both retained paths reach dst node 3 at total weight 3.0.
+(set Dk2_d (at Dk2 '_dist))
+(set Dk2_n (at Dk2 '_node))
+(== (min (at Dk2_d (where (== Dk2_n 3)))) 3.0)    -- true
+(== (max (at Dk2_d (where (== Dk2_n 3)))) 3.0)    -- true
 
 ;; =====================================================================
 ;; Section 5: exec_var_expand direction==2 on asymmetric graph
@@ -315,10 +430,18 @@
 (count Ve2)                                       -- 3
 (min (at Ve2 '_depth))                            -- 1
 (max (at Ve2 '_depth))                            -- 1
+;; fwd(0)={1,2,3} and rev(0)={1,2,3} deduped by visited bitmap -> {1,2,3}.
+(== (min (at Ve2 '_end)) 1)                       -- true
+(== (max (at Ve2 '_end)) 3)                       -- true
+(== (sum (at Ve2 '_end)) 6)                       -- true
 
 ;; Star graph direction==2 from hub (node 0): fwd={1,2,3,4,5}, rev={}
 (set VeStar2 (.graph.var-expand Star 0 1 1 2))
 (count VeStar2)                                   -- 5
+;; Endpoints are exactly the five spokes {1,2,3,4,5}.
+(== (min (at VeStar2 '_end)) 1)                   -- true
+(== (max (at VeStar2 '_end)) 5)                   -- true
+(== (sum (at VeStar2 '_end)) 15)                  -- true
 
 ;; Star graph direction==2 from spoke (node 1): fwd={}, rev={0}
 (set VeSpoke2 (.graph.var-expand Star 1 1 1 2))

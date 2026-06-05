@@ -97,24 +97,41 @@
 ;; ──────────────────────────────────────────────────────────────────
 
 ;; asof-join: null time in left trade → no match (left-outer: preserved with null right cols)
+;; Row 0 (a, 10:00:01) finds quote @10:00:00 = 99; Row 1 (a, null) finds no match → Bid null.
 (set ajL (table [Sym Time Price] (list [a a] [10:00:01.000 0Nt] [100.0 200.0])))
 (set ajR (table [Sym Time Bid] (list [a a] [10:00:00.000 10:00:02.000] [99.0 100.0])))
-(count (asof-join [Sym Time] ajL ajR)) -- 2
+(set ajN1 (asof-join [Sym Time] ajL ajR))
+(count ajN1) -- 2
+(at (at ajN1 'Bid) 0) -- 99.0
+(nil? (at (at ajN1 'Bid) 1)) -- true
 
 ;; asof-join: null time in right quote → skipped during merge walk
+;; (a, 10:00:01) → only valid earlier quote is @10:00:00 = 99 (null skipped).
+;; (a, 10:00:03) → quotes @10:00:00=99 then @10:00:02=100; null skipped → picks 100.
 (set ajL2 (table [Sym Time Price] (list [a a] [10:00:01.000 10:00:03.000] [100.0 200.0])))
 (set ajR2 (table [Sym Time Bid] (list [a a a] [10:00:00.000 0Nt 10:00:02.000] [99.0 50.0 100.0])))
-(count (asof-join [Sym Time] ajL2 ajR2)) -- 2
+(set ajN2 (asof-join [Sym Time] ajL2 ajR2))
+(count ajN2) -- 2
+(at (at ajN2 'Bid) 0) -- 99.0
+(at (at ajN2 'Bid) 1) -- 100.0
 
 ;; asof-join: null eq key in left → no match (left-outer: row preserved)
+;; Row 0 (a, 10:00:01) → quote @10:00:00 = 99 ; Row 1 (null, 10:00:03) → no match.
 (set ajL3 (table [Sym Time Price] (list [a 0Ns] [10:00:01.000 10:00:03.000] [100.0 200.0])))
 (set ajR3 (table [Sym Time Bid] (list [a a] [10:00:00.000 10:00:02.000] [99.0 100.0])))
-(count (asof-join [Sym Time] ajL3 ajR3)) -- 2
+(set ajN3 (asof-join [Sym Time] ajL3 ajR3))
+(count ajN3) -- 2
+(at (at ajN3 'Bid) 0) -- 99.0
+(nil? (at (at ajN3 'Bid) 1)) -- true
 
 ;; asof-join: null eq key in right → skipped
+;; Right quotes with null Sym are unreachable; (a,10:00:01)→99, (a,10:00:03)→100.
 (set ajL4 (table [Sym Time Price] (list [a a] [10:00:01.000 10:00:03.000] [100.0 200.0])))
 (set ajR4 (table [Sym Time Bid] (list [a 0Ns a] [10:00:00.000 10:00:01.500 10:00:02.000] [99.0 50.0 100.0])))
-(count (asof-join [Sym Time] ajL4 ajR4)) -- 2
+(set ajN4 (asof-join [Sym Time] ajL4 ajR4))
+(count ajN4) -- 2
+(at (at ajN4 'Bid) 0) -- 99.0
+(at (at ajN4 'Bid) 1) -- 100.0
 
 ;; ──────────────────────────────────────────────────────────────────
 ;; asof-join: inner join type (join_type==0 in exec_window_join)
@@ -123,15 +140,20 @@
 ;; The join_type==0 path (L1861) is not reachable from RFL.
 ;; ──────────────────────────────────────────────────────────────────
 
-;; asof-join: no match at all (left-outer, all right cols null)
+;; asof-join: no match at all (left-outer, all right cols null) — Sym mismatch.
 (set ajL5 (table [Sym Time Price] (list [a] [10:00:00.000] [100.0])))
 (set ajR5 (table [Sym Time Bid] (list [b] [10:00:00.000] [99.0])))
-(count (asof-join [Sym Time] ajL5 ajR5)) -- 1
+(set ajN5 (asof-join [Sym Time] ajL5 ajR5))
+(count ajN5) -- 1
+(at (at ajN5 'Price) 0) -- 100.0
+(nil? (at (at ajN5 'Bid) 0)) -- true
 
-;; asof-join: right time all after left → no match
+;; asof-join: right time all after left → no match (no prior quote).
 (set ajL6 (table [Sym Time Price] (list [a] [10:00:01.000] [100.0])))
 (set ajR6 (table [Sym Time Bid] (list [a a] [10:00:02.000 10:00:03.000] [99.0 100.0])))
-(count (asof-join [Sym Time] ajL6 ajR6)) -- 1
+(set ajN6 (asof-join [Sym Time] ajL6 ajR6))
+(count ajN6) -- 1
+(nil? (at (at ajN6 'Bid) 0)) -- true
 
 ;; ──────────────────────────────────────────────────────────────────
 ;; asof-join: multiple partitions with Timestamp — exercises sort

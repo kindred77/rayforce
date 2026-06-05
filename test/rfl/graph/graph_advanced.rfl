@@ -59,12 +59,21 @@
 ;; All nodes in the walk are valid IDs in [0..5].
 (>= (min (at Rw '_node)) 0)                      -- true
 (<= (max (at Rw '_node)) 5)                      -- true
+;; The PRNG is xorshift64 seeded from src_id=0, so the walk is fully
+;; deterministic.  Hand-traced on this DAG it picks 0->2->3->5 and then
+;; dead-ends at the sink (node 5), giving exactly these step/node columns.
+(at Rw '_node)                                   -- [0 2 3 5]
+(at Rw '_step)                                   -- [0 1 2 3]
+(count Rw)                                       -- 4
 
-;; Custom walk-len; result has at most walk-len+1 rows.
+;; Custom walk-len; result has at most walk-len+1 rows.  walk-len=3 still
+;; reaches the sink at depth 3 first, so the deterministic walk is the
+;; same 0->2->3->5 sequence.
 (set Rw3 (.graph.random-walk G 0 3))
 (<= (count Rw3) 4)                               -- true
 (>= (count Rw3) 1)                               -- true
 (first (at Rw3 '_node))                          -- 0
+(at Rw3 '_node)                                  -- [0 2 3 5]
 
 ;; Starting from a sink (node 5) immediately dead-ends -> 1 row only.
 (set RwSink (.graph.random-walk G 5 10))
@@ -89,10 +98,35 @@
 ;; Every emitted node is in [0..5].
 (>= (min (at K '_node)) 0)                       -- true
 (<= (max (at K '_node)) 5)                       -- true
+;; Verify each path's node sequence and its cumulative distance column
+;; against the hand-computed shortest paths (P0=4, P1=5, P2=6).
+(set Kpid  (at K '_path_id))
+(set Knode (at K '_node))
+(set Kdist (at K '_dist))
+;; P0: 0->1->2->3, cumulative dist 0,1,3,4.
+(at Knode (where (== Kpid 0)))                   -- [0 1 2 3]
+(at Kdist (where (== Kpid 0)))                   -- [0.0 1.0 3.0 4.0]
+(last (at Kdist (where (== Kpid 0))))            -- 4.0
+;; P1: 0->2->3, cumulative dist 0,4,5.
+(at Knode (where (== Kpid 1)))                   -- [0 2 3]
+(last (at Kdist (where (== Kpid 1))))            -- 5.0
+;; P2: 0->1->3, cumulative dist 0,1,6.
+(at Knode (where (== Kpid 2)))                   -- [0 1 3]
+(last (at Kdist (where (== Kpid 2))))            -- 6.0
 
-;; All k=2 results from 0 to 5: shortest is 6 (0->1->2->3->5).
+;; All k=2 results from 0 to 5: shortest is 6 (0->1->2->3->5),
+;; second-shortest is 7 (0->2->3->5).
 (set K25 (.graph.k-shortest G 0 5 2))
 (count (distinct (at K25 '_path_id)))            -- 2
+(set K25pid  (at K25 '_path_id))
+(set K25node (at K25 '_node))
+(set K25dist (at K25 '_dist))
+;; P0: 0->1->2->3->5, total dist 6.
+(at K25node (where (== K25pid 0)))               -- [0 1 2 3 5]
+(last (at K25dist (where (== K25pid 0))))        -- 6.0
+;; P1: 0->2->3->5, total dist 7.
+(at K25node (where (== K25pid 1)))               -- [0 2 3 5]
+(last (at K25dist (where (== K25pid 1))))        -- 7.0
 
 ;; Disconnected request: k-shortest from a sink to a source must return
 ;; an empty 3-column result table (no paths possible in the DAG).
@@ -119,6 +153,10 @@
 (first (at Ve13 '_start))                        -- 0
 ;; End values cover {1,2,3,4,5} -> 5 distinct.
 (count (distinct (at Ve13 '_end)))               -- 5
+;; BFS discovery order is level-by-level: d=1 {1,2}, d=2 {3,4}, d=3 {5}.
+;; Each end node appears once at its first-discovered depth.
+(at Ve13 '_end)                                  -- [1 2 3 4 5]
+(at Ve13 '_depth)                                -- [1 1 2 2 3]
 ;; Depth column ranges over [1..3].
 (min (at Ve13 '_depth))                          -- 1
 (max (at Ve13 '_depth))                          -- 3
@@ -131,6 +169,8 @@
 (count Ve22)                                     -- 2
 (min (at Ve22 '_depth))                          -- 2
 (max (at Ve22 '_depth))                          -- 2
+;; The level-2 frontier from node 0 is exactly {3,4}.
+(at Ve22 '_end)                                  -- [3 4]
 
 ;; Reverse direction (1) from sink node 5: walks back via reverse CSR.
 ;; Reverse edges into 5: 3->5, 4->5.  Continuing back: 3 from {1,2};
@@ -139,6 +179,8 @@
 ;; d=1: {3,4} (2 rows).
 (set VeRev (.graph.var-expand G 5 1 1 1))
 (count VeRev)                                    -- 2
+;; The reverse-CSR predecessors of sink node 5 are exactly {3,4}.
+(at VeRev '_end)                                 -- [3 4]
 
 ;; track-path = true accepts the boolean form without changing schema
 ;; (the underlying op records paths internally; the result table is the
@@ -208,11 +250,11 @@
 ;; -- result: {_node, _community}, n_nodes rows.  Phase-1 modularity
 ;;    optimisation.  Treats the graph as undirected.
 ;;
-;; On a 4-node connected path, Louvain converges to a single community
-;; (or splits into two halves -- the exact number is implementation-
-;; defined and depends on the iteration order).  Verify only that
-;; community IDs are normalised to a contiguous [0..k-1] range and
-;; cover every node.
+;; On this 4-node path Louvain splits into two halves: {0,1} and {2,3}
+;; (modularity is maximised by merging each adjacent leaf into its
+;; neighbour).  Community LABELS are iteration-defined, so we assert the
+;; label-invariant PARTITION STRUCTURE: same-half nodes share a label,
+;; cross-half nodes differ, and exactly two communities result.
 ;; ====================================================================
 
 (set L (.graph.louvain P))
@@ -224,18 +266,42 @@
 (min (at L '_community))                         -- 0
 ;; Each community ID is in [0..n-1] where n=4.
 (<= (max (at L '_community)) 3)                  -- true
+;; Exactly two communities on this fixture.
+(count (distinct (at L '_community)))            -- 2
+;; Membership invariants (label-independent): nodes 0,1 together;
+;; nodes 2,3 together; the two halves are distinct communities.
+(set L_node (at L '_node))
+(set L_comm (at L '_community))
+(set Lc0 (at L_comm (at (where (== L_node 0)) 0)))
+(set Lc1 (at L_comm (at (where (== L_node 1)) 0)))
+(set Lc2 (at L_comm (at (where (== L_node 2)) 0)))
+(set Lc3 (at L_comm (at (where (== L_node 3)) 0)))
+(== Lc0 Lc1)                                     -- true
+(== Lc2 Lc3)                                     -- true
+(== Lc0 Lc2)                                     -- false
 
 ;; max-iter argument exercises the optional-arg branch of the wrapper.
+;; Same partition (two halves) regardless of the iteration cap.
 (set L1 (.graph.louvain P 5))
-(count L1)                                       -- 4
-(min (at L1 '_community))                        -- 0
+(count L1)                                        -- 4
+(min (at L1 '_community))                         -- 0
+(count (distinct (at L1 '_community)))            -- 2
 
 ;; Louvain on the DAG fixture (G): every node should be assigned a
-;; community ID in [0..5].
+;; community ID in [0..5].  Louvain is approximate, so we pin only
+;; label-invariant structure: it yields a NON-TRIVIAL partition (more
+;; than one community, but fewer than the 6 singletons) -- on this
+;; fixture exactly two communities.
 (set Lg (.graph.louvain G))
 (count Lg)                                       -- 6
 (>= (min (at Lg '_community)) 0)                 -- true
 (<= (max (at Lg '_community)) 5)                 -- true
+(min (at Lg '_community))                        -- 0
+;; Non-trivial: 1 < #communities < 6.
+(> (count (distinct (at Lg '_community))) 1)     -- true
+(< (count (distinct (at Lg '_community))) 6)     -- true
+;; On this fixture the modularity optimum is two communities.
+(count (distinct (at Lg '_community)))           -- 2
 
 ;; ====================================================================
 ;; SKIPPED: (.graph.astar h src dst ...)

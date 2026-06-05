@@ -38,38 +38,72 @@
 
 ;; -RAY_I64 atom (line 91)
 (nil? (println 42)) -- true
+;; value-check: the rendered/formatted I64 atom
+(as 'STR 42) -- "42"
 
 ;; -RAY_F64 atom (lines 92-97) — includes the signbit(-0.0) normalisation
 (nil? (println 1.5)) -- true
+;; value-check: the rendered F64 atom
+(as 'STR 1.5) -- "1.5"
+;; -0.0 normalises to "0" on render (k/q convention)
+(as 'STR -0.0) -- "0"
 
 ;; -RAY_BOOL atom — both true and false paths in the ternary (line 98)
 (nil? (println true)) -- true
+;; value-check: both ternary arms render distinct strings
+(as 'STR true) -- "true"
+(as 'STR false) -- "false"
 
 ;; -RAY_SYM atom (lines 99-104) — bound, so ray_sym_str hits
 (nil? (println 'foo_user_sym)) -- true
+;; value-check: ray_sym_str resolves the interned name
+(as 'STR 'foo_user_sym) -- "foo_user_sym"
 
 ;; -RAY_STR atom (lines 105-110)
 (nil? (println "hello")) -- true
+;; value-check: the rendered STR atom (content preserved)
+(as 'STR "hello") -- "hello"
 
 ;; RAY_LIST heterogeneous (lines 111-121) — both i==0 and i>0 branches
 (nil? (println (list 1 "two" 'three))) -- true
+;; value-check: per-element rendered values across the mixed list
+(at (as 'STR (list 1 "two" 'three)) 0) -- "1"
+(at (as 'STR (list 1 "two" 'three)) 1) -- "two"
+(at (as 'STR (list 1 "two" 'three)) 2) -- "three"
 
 ;; RAY_TABLE (lines 122-125) — prints "<table NxM>" summary
 (nil? (println (table [a b] (list [1 2 3] [4 5 6])))) -- true
+;; value-check: the table the summary describes — 3 rows, both cols' data
+(count (table [a b] (list [1 2 3] [4 5 6]))) -- 3
+(at (at (table [a b] (list [1 2 3] [4 5 6])) 'a) 0) -- 1
+(at (at (table [a b] (list [1 2 3] [4 5 6])) 'b) 2) -- 6
 
 ;; RAY_UNARY / RAY_BINARY / RAY_VARY (lines 126-130) — function handle
 ;; `count` is a unary builtin; `+` is a binary builtin.
 (nil? (println count)) -- true
 (nil? (println +)) -- true
+;; value-check: the printed handles resolve to the correct builtins
+(count [1 2 3]) -- 3
+(+ 2 3) -- 5
 
 ;; default: ray_fmt fallback (lines 131-145) — vec, i32 atom, dict
 (nil? (println [1 2 3])) -- true
 (nil? (println 5i)) -- true
 (nil? (println (dict [a b] (list 1 2)))) -- true
+;; value-check: vec elements rendered, i32 atom rendered, dict values
+(at (as 'STR [1 2 3]) 0) -- "1"
+(at (as 'STR [1 2 3]) 2) -- "3"
+(as 'STR 5i) -- "5"
+(at (dict [a b] (list 1 2)) 'a) -- 1
+(at (dict [a b] (list 1 2)) 'b) -- 2
 
 ;; RAY_ATOM_IS_NULL branch (lines 86-88) — typed null atom
 ;; (null_literal_str dispatch for "0Nl")
 (nil? (println 0Nl)) -- true
+;; value-check: the null literal — distinct least value, casts to empty
+;; string on render (k/q convention).  `type` resolves the typed-null tag.
+(type 0Nl) -- 'i64
+(as 'STR 0Nl) -- ""
 
 ;; ──────────────────────────────────────────────────────────────────────
 ;; 2.  ray_resolve_fn — branch coverage
@@ -89,6 +123,9 @@
 
 ;; (resolve db tbl) — 2-arg form (lines 342-346): db arg evaluated & released
 (count (resolve "ignored_db_arg" (table [c] (list [10 20 30])))) -- 3
+;; value-check: the resolved table's column data is returned intact
+(at (at (resolve "ignored_db_arg" (table [c] (list [10 20 30]))) 'c) 0) -- 10
+(at (at (resolve "ignored_db_arg" (table [c] (list [10 20 30]))) 'c) 2) -- 30
 
 ;; (resolve table-with-entity-ID-column) — all_user_sym=false path.
 ;; Small I64 values like 1,2,3 collide with single-char sym IDs (operators
@@ -98,10 +135,16 @@
 ;; the keep-I64 fall-through.
 (set _Tent (table [e] (list [1 2 3])))
 (type (at (resolve _Tent) 'e)) -- 'I64
+;; value-check: the I64 column values survive the keep-I64 fall-through
+(at (at (resolve _Tent) 'e) 0) -- 1
+(at (at (resolve _Tent) 'e) 2) -- 3
 
 ;; (resolve table-with-negative-id) — `data[r] <= 0` early reject (line 392)
 (set _Tneg (table [x] (list [-1 -2 -3])))
 (type (at (resolve _Tneg) 'x)) -- 'I64
+;; value-check: negative ids are kept verbatim, not sym-converted
+(at (at (resolve _Tneg) 'x) 0) -- -1
+(at (at (resolve _Tneg) 'x) 2) -- -3
 
 ;; (resolve empty-table) — nrows==0 means `all_user_sym = (nrows > 0)` is
 ;; false from the start (line 387); the loop body at 391-404 never
@@ -114,3 +157,7 @@
 (set _Tmix (table [s f] (list (list "a" "b" "c") [1.0 2.0 3.0])))
 (count (resolve _Tmix)) -- 3
 (type (at (resolve _Tmix) 'f)) -- 'F64
+;; value-check: STR and F64 columns keep their data after resolve
+(at (at (resolve _Tmix) 's) 0) -- "a"
+(at (at (resolve _Tmix) 's) 2) -- "c"
+(at (at (resolve _Tmix) 'f) 1) -- 2.0

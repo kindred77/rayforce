@@ -37,8 +37,13 @@
 (set Db (assert-fact Db 1 'name 'Alice))
 (set Db (assert-fact Db 2 'name 'Bob))
 (set Db (assert-fact Db 1 'manager 'true))
-(count (query Db (find ?e) (where (?e :name 'Alice)))) -- 1
-(count (query Db (find ?e) (where (?e :name 'Bob))))   -- 1
+;; Each sym-value query must hit the right entity, not just any one row.
+(set qAl (query Db (find ?e) (where (?e :name 'Alice))))
+(count qAl) -- 1
+(at (at qAl '?e) 0) -- 1
+(set qBo (query Db (find ?e) (where (?e :name 'Bob))))
+(count qBo) -- 1
+(at (at qBo '?e) 0) -- 2
 (count (query Db (find ?e) (where (?e :name 'Charlie)))) -- 0
 
 ;; retract-fact symbol value branch (line ~3127)
@@ -51,14 +56,26 @@
 (set Db (assert-fact Db 1 'name 100))
 (set Db (assert-fact Db 1 'salary 80000))
 (set Db (assert-fact Db 2 'age 25))
-;; pull returns a dict; full pull on entity 1 has 3 attrs.
-(count (pull Db 1)) -- 3
-(count (pull Db 2)) -- 1
+;; pull returns a dict; full pull on entity 1 has 3 attrs (age, name, salary).
+(set p1 (pull Db 1))
+(count p1) -- 3
+;; verify actual values came back, not just cardinality.
+(at p1 'age)    -- 30
+(at p1 'name)   -- 100
+(at p1 'salary) -- 80000
+(set p2 (pull Db 2))
+(count p2) -- 1
+(at p2 'age) -- 25
 ;; entity not in db → empty dict
 (count (pull Db 99)) -- 0
 ;; pull with attribute filter (sym vector) keeps matching attrs only.
-(count (pull Db 1 ['age 'salary])) -- 2
-(count (pull Db 1 ['age]))         -- 1
+(set p1f (pull Db 1 ['age 'salary]))
+(count p1f) -- 2
+(at p1f 'age)    -- 30
+(at p1f 'salary) -- 80000
+(set p1a (pull Db 1 ['age]))
+(count p1a)      -- 1
+(at p1a 'age)    -- 30
 ;; filter that matches nothing
 (count (pull Db 1 ['nonexistent])) -- 0
 
@@ -71,25 +88,60 @@
 
 ;; ════════════════════════ Comparison ops in rule body ═════════════════════════
 ;; (> ?x 25) — variable LHS, integer RHS  (line 3759-3760)
+;; ages: 1→30, 2→20, 3→25, 4→35.
 (set Db (datoms))
 (set Db (assert-fact Db 1 'age 30))
 (set Db (assert-fact Db 2 'age 20))
 (set Db (assert-fact Db 3 'age 25))
 (set Db (assert-fact Db 4 'age 35))
-(count (query Db (find ?e ?a) (where (?e :age ?a) (> ?a 25)))) -- 2
-(count (query Db (find ?e ?a) (where (?e :age ?a) (>= ?a 25)))) -- 3
-(count (query Db (find ?e ?a) (where (?e :age ?a) (< ?a 30)))) -- 2
-(count (query Db (find ?e ?a) (where (?e :age ?a) (<= ?a 25)))) -- 2
-(count (query Db (find ?e ?a) (where (?e :age ?a) (== ?a 25)))) -- 1
-(count (query Db (find ?e ?a) (where (?e :age ?a) (!= ?a 25)))) -- 3
+;; >25 → {1,4} ages {30,35}.
+(set qGt (query Db (find ?e ?a) (where (?e :age ?a) (> ?a 25))))
+(count qGt) -- 2
+(asc (at qGt '?e)) -- [1 4]
+(asc (at qGt '?a)) -- [30 35]
+;; >=25 → {1,3,4} ages {25,30,35}.
+(set qGe (query Db (find ?e ?a) (where (?e :age ?a) (>= ?a 25))))
+(count qGe) -- 3
+(asc (at qGe '?e)) -- [1 3 4]
+;; <30 → {2,3} ages {20,25}.
+(set qLt (query Db (find ?e ?a) (where (?e :age ?a) (< ?a 30))))
+(count qLt) -- 2
+(asc (at qLt '?e)) -- [2 3]
+;; <=25 → {2,3}.
+(set qLe (query Db (find ?e ?a) (where (?e :age ?a) (<= ?a 25))))
+(count qLe) -- 2
+(asc (at qLe '?e)) -- [2 3]
+;; ==25 → {3} only.
+(set qEq (query Db (find ?e ?a) (where (?e :age ?a) (== ?a 25))))
+(count qEq) -- 1
+(at (at qEq '?e) 0) -- 3
+(at (at qEq '?a) 0) -- 25
+;; !=25 → {1,2,4}.
+(set qNe (query Db (find ?e ?a) (where (?e :age ?a) (!= ?a 25))))
+(count qNe) -- 3
+(asc (at qNe '?e)) -- [1 2 4]
 
 ;; const op var — exercises the flipped-comparison branch (3761-3771).
-(count (query Db (find ?e ?a) (where (?e :age ?a) (> 30 ?a)))) -- 2
-(count (query Db (find ?e ?a) (where (?e :age ?a) (< 25 ?a)))) -- 2
-(count (query Db (find ?e ?a) (where (?e :age ?a) (>= 25 ?a)))) -- 2
-(count (query Db (find ?e ?a) (where (?e :age ?a) (<= 30 ?a)))) -- 2
+;; 30 > ?a → ?a < 30 → {2,3}.
+(set qGtF (query Db (find ?e ?a) (where (?e :age ?a) (> 30 ?a))))
+(count qGtF) -- 2
+(asc (at qGtF '?e)) -- [2 3]
+;; 25 < ?a → ?a > 25 → {1,4}.
+(set qLtF (query Db (find ?e ?a) (where (?e :age ?a) (< 25 ?a))))
+(count qLtF) -- 2
+(asc (at qLtF '?e)) -- [1 4]
+;; 25 >= ?a → ?a <= 25 → {2,3}.
+(set qGeF (query Db (find ?e ?a) (where (?e :age ?a) (>= 25 ?a))))
+(count qGeF) -- 2
+(asc (at qGeF '?e)) -- [2 3]
+;; 30 <= ?a → ?a >= 30 → {1,4}.
+(set qLeF (query Db (find ?e ?a) (where (?e :age ?a) (<= 30 ?a))))
+(count qLeF) -- 2
+(asc (at qLeF '?e)) -- [1 4]
 
 ;; var-var comparison after multi-attr join (3757-3758)
+;; entities: 1 (lo=10,hi=20) ✓, 2 (lo=30,hi=25) ✗, 3 (lo=5,hi=100) ✓.
+;; result: {1, 3}.
 (set Db (datoms))
 (set Db (assert-fact Db 1 'lo 10))
 (set Db (assert-fact Db 1 'hi 20))
@@ -97,16 +149,31 @@
 (set Db (assert-fact Db 2 'hi 25))
 (set Db (assert-fact Db 3 'lo 5))
 (set Db (assert-fact Db 3 'hi 100))
-(count (query Db (find ?e ?l ?h) (where (?e :lo ?l) (?e :hi ?h) (< ?l ?h)))) -- 2
+(set qVar (query Db (find ?e ?l ?h) (where (?e :lo ?l) (?e :hi ?h) (< ?l ?h))))
+(count qVar) -- 2
+(asc (at qVar '?e)) -- [1 3]
+;; corresponding (lo,hi): (10,20) and (5,100).
+(asc (at qVar '?l)) -- [5 10]
+(asc (at qVar '?h)) -- [20 100]
 
 ;; ════════════════════════ between sugar ═════════════════════════
+;; ages: 1=18, 2=25, 3=30, 4=65.
 (set Db (datoms))
 (set Db (assert-fact Db 1 'age 18))
 (set Db (assert-fact Db 2 'age 25))
 (set Db (assert-fact Db 3 'age 30))
 (set Db (assert-fact Db 4 'age 65))
-(count (query Db (find ?e ?a) (where (?e :age ?a) (between ?a 20 50)))) -- 2
-(count (query Db (find ?e ?a) (where (?e :age ?a) (between ?a 0 100)))) -- 4
+;; between 20..50 → {2,3}.
+(set qBtw1 (query Db (find ?e ?a) (where (?e :age ?a) (between ?a 20 50))))
+(count qBtw1) -- 2
+(asc (at qBtw1 '?e)) -- [2 3]
+(asc (at qBtw1 '?a)) -- [25 30]
+;; between 0..100 → all 4.
+(set qBtw2 (query Db (find ?e ?a) (where (?e :age ?a) (between ?a 0 100))))
+(count qBtw2) -- 4
+(asc (at qBtw2 '?e)) -- [1 2 3 4]
+(asc (at qBtw2 '?a)) -- [18 25 30 65]
+;; between 100..200 → none.
 (count (query Db (find ?e ?a) (where (?e :age ?a) (between ?a 100 200)))) -- 0
 
 ;; between guards
@@ -116,18 +183,38 @@
 
 ;; ════════════════════════ assignment / arithmetic expressions ═════════════════════════
 ;; (= ?y (+ ?x 1)) — covers dl_build_expr binop + dl_eval_expr ADD path
+;; entities: 1→x=10, 2→x=20, 3→x=30.
 (set Db (datoms))
 (set Db (assert-fact Db 1 'x 10))
 (set Db (assert-fact Db 2 'x 20))
 (set Db (assert-fact Db 3 'x 30))
-(count (query Db (find ?e ?y) (where (?e :x ?xv) (= ?y (+ ?xv 1)) (> ?y 11)))) -- 2
-(count (query Db (find ?e ?y) (where (?e :x ?xv) (= ?y (- ?xv 5)) (> ?y 10)))) -- 2
-(count (query Db (find ?e ?y) (where (?e :x ?xv) (= ?y (* ?xv 2)) (>= ?y 40)))) -- 2
-(count (query Db (find ?e ?y) (where (?e :x ?xv) (= ?y (/ ?xv 10)) (== ?y 1)))) -- 1
+;; ?y = ?xv + 1 ∈ {11,21,31}, > 11 → {21,31} → entities {2,3}.
+(set qAdd (query Db (find ?e ?y) (where (?e :x ?xv) (= ?y (+ ?xv 1)) (> ?y 11))))
+(count qAdd) -- 2
+(asc (at qAdd '?e)) -- [2 3]
+(asc (at qAdd '?y)) -- [21 31]
+;; ?y = ?xv - 5 ∈ {5,15,25}, > 10 → {15,25} → entities {2,3}.
+(set qSub (query Db (find ?e ?y) (where (?e :x ?xv) (= ?y (- ?xv 5)) (> ?y 10))))
+(count qSub) -- 2
+(asc (at qSub '?e)) -- [2 3]
+(asc (at qSub '?y)) -- [15 25]
+;; ?y = ?xv * 2 ∈ {20,40,60}, >= 40 → {40,60} → entities {2,3}.
+(set qMul (query Db (find ?e ?y) (where (?e :x ?xv) (= ?y (* ?xv 2)) (>= ?y 40))))
+(count qMul) -- 2
+(asc (at qMul '?e)) -- [2 3]
+(asc (at qMul '?y)) -- [40 60]
+;; ?y = ?xv / 10 ∈ {1,2,3}, == 1 → entity 1.
+(set qDiv (query Db (find ?e ?y) (where (?e :x ?xv) (= ?y (/ ?xv 10)) (== ?y 1))))
+(count qDiv) -- 1
+(at (at qDiv '?e) 0) -- 1
+(at (at qDiv '?y) 0) -- 1
 
 ;; expression-vs-expression comparison — covers dl_rule_add_cmp_expr.
-;; ?xv ∈ {10,20,30}; LHS=?xv+5, RHS=2*?xv → all 3 rows pass.
-(count (query Db (find ?e) (where (?e :x ?xv) (< (+ ?xv 5) (* ?xv 2))))) -- 3
+;; ?xv ∈ {10,20,30}; LHS=?xv+5, RHS=2*?xv.
+;; xv=10: 15<20 ✓; xv=20: 25<40 ✓; xv=30: 35<60 ✓ → all 3 rows pass.
+(set qCmpE (query Db (find ?e) (where (?e :x ?xv) (< (+ ?xv 5) (* ?xv 2)))))
+(count qCmpE) -- 3
+(asc (at qCmpE '?e)) -- [1 2 3]
 ;; Reversed comparison — LHS>RHS — only when ?xv < 5; no rows.
 (count (query Db (find ?e) (where (?e :x ?xv) (> (+ ?xv 5) (* ?xv 2))))) -- 0
 
@@ -165,16 +252,22 @@
 
 ;; ════════════════════════ negated rule invocation ═════════════════════════
 ;; (not (rule-name ?args)) — distinct from (not (?e :attr ?v)) triple form.
+;; depts: 1=10, 2=10, 3=20, 4=20.
 (set Db (datoms))
 (set Db (assert-fact Db 1 'dept 10))
 (set Db (assert-fact Db 2 'dept 10))
 (set Db (assert-fact Db 3 'dept 20))
 (set Db (assert-fact Db 4 'dept 20))
 ;; (manager ?e) is true for entities in dept 20; (not (manager ?e)) excludes them.
-(count (query Db (find ?e) (where (?e :dept 10) (not (manager ?e))) (rules ((manager ?e) (?e :dept 20))))) -- 2
+;; dept=10 ∩ not manager → {1, 2}.
+(set qNeg (query Db (find ?e) (where (?e :dept 10) (not (manager ?e))) (rules ((manager ?e) (?e :dept 20)))))
+(count qNeg) -- 2
+(asc (at qNeg '?e)) -- [1 2]
 
-;; not on a predicate that matches nothing → all entities pass
-(count (query Db (find ?e) (where (?e :dept 10) (not (impossible ?e))) (rules ((impossible ?e) (?e :dept 999))))) -- 2
+;; not on a predicate that matches nothing → all entities in dept 10 pass.
+(set qNegImp (query Db (find ?e) (where (?e :dept 10) (not (impossible ?e))) (rules ((impossible ?e) (?e :dept 999)))))
+(count qNegImp) -- 2
+(asc (at qNegImp '?e)) -- [1 2]
 
 ;; not on a predicate that matches everything → empty
 (count (query Db (find ?e) (where (?e :dept 10) (not (universal ?e))) (rules ((universal ?e) (?e :dept 10))))) -- 0
@@ -255,7 +348,10 @@
 ;; — query auto-discovers the env-bound table and registers it as an EDB.
 (set Db2 (datoms))
 (set pairs (table ['l 'r] (list [1 2 3] [10 20 30])))
-(count (query Db2 (find ?l ?r) (where (pairs ?l ?r)))) -- 3
+(set qPairs (query Db2 (find ?l ?r) (where (pairs ?l ?r))))
+(count qPairs) -- 3
+(asc (at qPairs '?l)) -- [1 2 3]
+(asc (at qPairs '?r)) -- [10 20 30]
 
 ;; reference relation with arity-mismatch — not registered, 0 rows.
 (set tri (table ['a 'b 'c] (list [1] [2] [3])))
@@ -264,15 +360,20 @@
 ;; env-backed table whose 2nd column is RAY_SYM (auto-converted to I64 via
 ;; ray_read_sym branch — lines 4120-4140).
 (set syms (table ['k 's] (list [1 2 3] ['x 'y 'z])))
-(count (query Db2 (find ?k ?s) (where (syms ?k ?s)))) -- 3
+(set qSyms (query Db2 (find ?k ?s) (where (syms ?k ?s))))
+(count qSyms) -- 3
+(asc (at qSyms '?k)) -- [1 2 3]
 
 ;; ════════════════════════ rule head with sym/string/i64 constants ═════════════════════════
 ;; head_const_typed RAY_SYM branch (3833-3834)
+;; roles: 1=admin, 2=user, 3=user.  admin-only filters to entity 1.
 (set Db (datoms))
 (set Db (assert-fact Db 1 'role 'admin))
 (set Db (assert-fact Db 2 'role 'user))
 (set Db (assert-fact Db 3 'role 'user))
-(count (query Db (find ?e) (where (admin-only ?e)) (rules ((admin-only ?e) (?e :role 'admin))))) -- 1
+(set qAdm (query Db (find ?e) (where (admin-only ?e)) (rules ((admin-only ?e) (?e :role 'admin)))))
+(count qAdm) -- 1
+(at (at qAdm '?e) 0) -- 1
 
 ;; head_const_typed RAY_I64 branch (3831-3832).
 ;; Head has integer constant 7; matching body rows produce tuples (7) in
@@ -292,11 +393,20 @@
 (rule (bad-h [1 2]) (?e :role 'admin)) !- type
 
 ;; ════════════════════════ recursive rule via inline rules (no globals) ═════════════════════════
+;; Chain 1→2→3→4: TC pairs = (1,2),(1,3),(1,4),(2,3),(2,4),(3,4) — 6 rows.
 (set Gdb (datoms))
 (set Gdb (assert-fact Gdb 1 'edge 2))
 (set Gdb (assert-fact Gdb 2 'edge 3))
 (set Gdb (assert-fact Gdb 3 'edge 4))
-(count (query Gdb (find ?x ?y) (where (reach ?x ?y)) (rules ((reach ?x ?y) (?x :edge ?y)) ((reach ?x ?z) (?x :edge ?y) (reach ?y ?z))))) -- 6
+(set qReach (query Gdb (find ?x ?y) (where (reach ?x ?y)) (rules ((reach ?x ?y) (?x :edge ?y)) ((reach ?x ?z) (?x :edge ?y) (reach ?y ?z)))))
+(count qReach) -- 6
+;; Source-side sum: 1*3 + 2*2 + 3*1 = 10; target-side sum: 2 + 3*2 + 4*3 = 20.
+(sum (at qReach '?x)) -- 10
+(sum (at qReach '?y)) -- 20
+;; Specifically (1,4) — longest reach — must be present.
+(count (where (and (== (at qReach '?x) 1) (== (at qReach '?y) 4)))) -- 1
+;; (4, ?) — no outgoing edges from 4.
+(count (where (== (at qReach '?x) 4))) -- 0
 
 ;; ════════════════════════ unstratifiable negation cycle (4170-4173) ═════════════════════════
 ;; p :- not q;  q :- not p.   Mutually negating predicates have no stratification.

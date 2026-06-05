@@ -15,9 +15,20 @@
 (sum Vf)                               -- 9.0
 (avg Vf)                               -- 3.0
 (format "%" (at Vf 1))                 -- "0Nf"
+;; null sorts as least value: 2 nulls first, then ascending survivors
 (at (asc Vf) 0)                        -- 0Nf
+(nil? (at (asc Vf) 1))                 -- true
+(nil? (at (asc Vf) 2))                 -- false
+(at (asc Vf) 2)                        -- 1.0
+(at (asc Vf) 4)                        -- 5.0
+;; desc => survivors descending, both nulls last
+(at (desc Vf) 0)                       -- 5.0
+(nil? (at (desc Vf) 3))                -- true
 (at (desc Vf) 4)                       -- 0Nf
+;; distinct keeps exactly one null; surviving non-null values stay intact
 (count (distinct Vf))                  -- 4
+(sum (map nil? (distinct Vf)))         -- 1
+(sum (distinct Vf))                    -- 9.0
 
 ;; ----- 2. I16 (INT16_MIN sentinel) -----
 (set V16 (as 'I16 [1 0N 2 0N 3]))
@@ -26,8 +37,16 @@
 (sum V16)                              -- 6
 (format "%" (at V16 1))                -- "0Nh"
 (at (asc V16) 0)                       -- 0Nh
+(nil? (at (asc V16) 1))                -- true
+(nil? (at (asc V16) 2))                -- false
+(at (asc V16) 2)                       -- 1h
+(at (asc V16) 4)                       -- 3h
+(at (desc V16) 0)                      -- 3h
+(nil? (at (desc V16) 3))               -- true
 (at (desc V16) 4)                      -- 0Nh
 (count (distinct V16))                 -- 4
+(sum (map nil? (distinct V16)))        -- 1
+(sum (distinct V16))                   -- 6
 
 ;; ----- 3. I32 (INT32_MIN sentinel) -----
 (set V32 (as 'I32 [10 0N 20 0N 30]))
@@ -36,7 +55,16 @@
 (sum V32)                              -- 60
 (format "%" (at V32 1))                -- "0Ni"
 (at (asc V32) 0)                       -- 0Ni
+(nil? (at (asc V32) 1))                -- true
+(nil? (at (asc V32) 2))                -- false
+(at (asc V32) 2)                       -- 10i
+(at (asc V32) 4)                       -- 30i
+(at (desc V32) 0)                      -- 30i
+(nil? (at (desc V32) 3))               -- true
+(at (desc V32) 4)                      -- 0Ni
 (count (distinct V32))                 -- 4
+(sum (map nil? (distinct V32)))        -- 1
+(sum (distinct V32))                   -- 60
 
 ;; ----- 4. I64 (INT64_MIN sentinel) via CSV ingest -----
 ;; CSV reader writes the sentinel into the payload; consumers must read it.
@@ -51,9 +79,20 @@
 (sum Vi)                               -- 900
 (avg Vi)                               -- 300.0
 (format "%" (at Vi 1))                 -- "0Nl"
+;; Vi payload = [100 0N 300 0N 500]; survivors 100/300/500
+(at Vi 0)                              -- 100
+(at Vi 2)                              -- 300
 (at (asc Vi) 0)                        -- 0Nl
+(nil? (at (asc Vi) 1))                 -- true
+(nil? (at (asc Vi) 2))                 -- false
+(at (asc Vi) 2)                        -- 100
+(at (asc Vi) 4)                        -- 500
+(at (desc Vi) 0)                       -- 500
+(nil? (at (desc Vi) 3))                -- true
 (at (desc Vi) 4)                       -- 0Nl
 (count (distinct Vi))                  -- 4
+(sum (map nil? (distinct Vi)))         -- 1
+(sum (distinct Vi))                    -- 900
 
 ;; ----- 5. DATE temporal (NULL_DATE sentinel) -----
 (set Vd (as 'DATE [7305 0N 7306 0N 7307]))
@@ -61,7 +100,15 @@
 (- (count Vd) (sum (map nil? Vd)))     -- 3
 (format "%" (at Vd 1))                 -- "0Nd"
 (at (asc Vd) 0)                        -- 0Nd
+(nil? (at (asc Vd) 1))                 -- true
+(nil? (at (asc Vd) 2))                 -- false
+;; survivors 7305/7306/7307 keep payload through sort; smallest first
+(format "%" (at (asc Vd) 2))           -- "2020.01.01"
+(format "%" (at (asc Vd) 4))           -- "2020.01.03"
+(nil? (at (desc Vd) 4))                -- true
+(format "%" (at (desc Vd) 0))          -- "2020.01.03"
 (count (distinct Vd))                  -- 4
+(sum (map nil? (distinct Vd)))         -- 1
 
 ;; ----- 6. TIMESTAMP temporal (NULL_TIMESTAMP sentinel) -----
 (set Vp (as 'TIMESTAMP [1000 0N 2000 0N 3000]))
@@ -69,4 +116,12 @@
 (- (count Vp) (sum (map nil? Vp)))     -- 3
 (format "%" (at Vp 1))                 -- "0Np"
 (at (asc Vp) 0)                        -- 0Np
+(nil? (at (asc Vp) 1))                 -- true
+(nil? (at (asc Vp) 2))                 -- false
+;; smallest survivor (1000ns) sorts to first non-null slot, largest last
+(format "%" (at (asc Vp) 2))           -- "2000.01.01D00:00:00.000001000"
+(format "%" (at (asc Vp) 4))           -- "2000.01.01D00:00:00.000003000"
+(nil? (at (desc Vp) 4))                -- true
+(format "%" (at (desc Vp) 0))          -- "2000.01.01D00:00:00.000003000"
 (count (distinct Vp))                  -- 4
+(sum (map nil? (distinct Vp)))         -- 1

@@ -17,40 +17,53 @@
 ;; (first (asc v)) → (min v): A=1, B=1, C=2
 (count (select {m: (first (asc v)) by: k from: Tsi})) -- 3
 (sum (at (select {m: (first (asc v)) by: k from: Tsi}) 'm)) -- 4
+;; per-group identity (sum alone can't catch group-mislabel rewrites)
+(at (select {m: (first (asc v)) by: k from: Tsi}) 'k) -- ['A 'B 'C]
+(at (select {m: (first (asc v)) by: k from: Tsi}) 'm) -- [1 1 2]
 
 ;; (last (asc v)) → (max v): A=3, B=5, C=4
 (count (select {m: (last (asc v)) by: k from: Tsi})) -- 3
 (sum (at (select {m: (last (asc v)) by: k from: Tsi}) 'm)) -- 12
+(at (select {m: (last (asc v)) by: k from: Tsi}) 'm) -- [3 5 4]
 
 ;; (count (asc v)) → (count v): 2 per group, total 6
 (count (select {n: (count (asc v)) by: k from: Tsi})) -- 3
 (sum (at (select {n: (count (asc v)) by: k from: Tsi}) 'n)) -- 6
+(at (select {n: (count (asc v)) by: k from: Tsi}) 'n) -- [2 2 2]
 
 ;; (count (desc v)) → (count v): same result
 (count (select {n: (count (desc v)) by: k from: Tsi})) -- 3
 (sum (at (select {n: (count (desc v)) by: k from: Tsi}) 'n)) -- 6
+(at (select {n: (count (desc v)) by: k from: Tsi}) 'n) -- [2 2 2]
 
 ;; (count (reverse v)) → (count v): same result
 (count (select {n: (count (reverse v)) by: k from: Tsi})) -- 3
 (sum (at (select {n: (count (reverse v)) by: k from: Tsi}) 'n)) -- 6
+(at (select {n: (count (reverse v)) by: k from: Tsi}) 'n) -- [2 2 2]
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; Multi-key by-group: idiom rewrite goes through the same path
 ;; ────────────────────────────────────────────────────────────────────
 (set Tmi (table [g h v] (list ['A 'B 'A 'B 'A] ['X 'X 'Y 'Y 'X] [1 2 3 4 5])))
 ;; Groups: (A,X)=[1,5], (B,X)=[2], (A,Y)=[3], (B,Y)=[4]
+;; Output group order (sorted by g then h): (A,X) (A,Y) (B,X) (B,Y)
+(at (select {m: (first (asc v)) by: [g h] from: Tmi}) 'g) -- ['A 'A 'B 'B]
+(at (select {m: (first (asc v)) by: [g h] from: Tmi}) 'h) -- ['X 'Y 'X 'Y]
 
-;; (first (asc v)): A,X=1; B,X=2; A,Y=3; B,Y=4 → sum=10
+;; (first (asc v)): (A,X)=1 (A,Y)=3 (B,X)=2 (B,Y)=4 → sum=10
 (count (select {m: (first (asc v)) by: [g h] from: Tmi})) -- 4
 (sum (at (select {m: (first (asc v)) by: [g h] from: Tmi}) 'm)) -- 10
+(at (select {m: (first (asc v)) by: [g h] from: Tmi}) 'm) -- [1 3 2 4]
 
-;; (last (asc v)): A,X=5; B,X=2; A,Y=3; B,Y=4 → sum=14
+;; (last (asc v)): (A,X)=5 (A,Y)=3 (B,X)=2 (B,Y)=4 → sum=14
 (count (select {m: (last (asc v)) by: [g h] from: Tmi})) -- 4
 (sum (at (select {m: (last (asc v)) by: [g h] from: Tmi}) 'm)) -- 14
+(at (select {m: (last (asc v)) by: [g h] from: Tmi}) 'm) -- [5 3 2 4]
 
-;; (count (desc v)): A,X=2; B,X=1; A,Y=1; B,Y=1 → sum=5
+;; (count (desc v)): (A,X)=2 (A,Y)=1 (B,X)=1 (B,Y)=1 → sum=5
 (count (select {n: (count (desc v)) by: [g h] from: Tmi})) -- 4
 (sum (at (select {n: (count (desc v)) by: [g h] from: Tmi}) 'n)) -- 5
+(at (select {n: (count (desc v)) by: [g h] from: Tmi}) 'n) -- [2 1 1 1]
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; Idiom rewrites combined with other aggregates in same select
@@ -61,9 +74,15 @@
 (count (select {mn: (first (asc v1)) s: (sum v2) by: k from: Tcomb})) -- 2
 (sum (at (select {mn: (first (asc v1)) s: (sum v2) by: k from: Tcomb}) 'mn)) -- 3
 (sum (at (select {mn: (first (asc v1)) s: (sum v2) by: k from: Tcomb}) 's)) -- 150
+;; per-group: A=(min v1=1, sum v2=90), B=(min v1=2, sum v2=60)
+(at (select {mn: (first (asc v1)) s: (sum v2) by: k from: Tcomb}) 'k) -- ['A 'B]
+(at (select {mn: (first (asc v1)) s: (sum v2) by: k from: Tcomb}) 'mn) -- [1 2]
+(at (select {mn: (first (asc v1)) s: (sum v2) by: k from: Tcomb}) 's) -- [90 60]
 
 ;; (last (asc v1)) + (count (desc v2)):
 ;; A: max(v1)=5, count(v2)=3; B: max(v1)=4, count(v2)=2
 (count (select {mx: (last (asc v1)) n: (count (desc v2)) by: k from: Tcomb})) -- 2
 (sum (at (select {mx: (last (asc v1)) n: (count (desc v2)) by: k from: Tcomb}) 'mx)) -- 9
 (sum (at (select {mx: (last (asc v1)) n: (count (desc v2)) by: k from: Tcomb}) 'n)) -- 5
+(at (select {mx: (last (asc v1)) n: (count (desc v2)) by: k from: Tcomb}) 'mx) -- [5 4]
+(at (select {mx: (last (asc v1)) n: (count (desc v2)) by: k from: Tcomb}) 'n) -- [3 2]

@@ -28,18 +28,31 @@
 ;;           line 1733 `cb[i] *= scale`
 (set Bs3 (.graph.betweenness A5 3))
 (count Bs3)                                       -- 6
-(>= (min (at Bs3 '_centrality)) 0.0)              -- true
+(>= (min (at Bs3 '_centrality)) 0.0)             -- true
+;; All 6 nodes emitted in id order (Brandes emits one row per node).
+(at Bs3 '_node)                                  -- [0 1 2 3 4 5]
+;; Sampled (sample=3) Brandes on this 6-cycle yields alternating
+;; scaled centralities [1 3 1 3 1 3] (scale = n/sample = 2).
+(< (max (abs (- (at Bs3 '_centrality) [1.0 3.0 1.0 3.0 1.0 3.0]))) 1e-9) -- true
 
 ;; sampled closeness with sample=3 on 6-node graph
 ;; triggers: line 1867-1871 sampled emitter (n_sources != n)
 (set Cs3 (.graph.closeness A5 3))
 ;; closeness with sample=3 emits n_sources=3 rows
 (== (count Cs3) 3)                                -- true
-(>= (min (at Cs3 '_centrality)) 0.0)              -- true
+(>= (min (at Cs3 '_centrality)) 0.0)             -- true
+;; The 3 sampled source nodes are deterministic: {0,2,4}.
+(at Cs3 '_node)                                  -- [0 2 4]
+;; On this symmetric 6-cycle every node's closeness is equal (~0.556).
+(< (max (abs (- (at Cs3 '_centrality) [0.5556 0.5556 0.5556]))) 0.001) -- true
 
 ;; exact betweenness (sample=0 => all nodes)
 (set Ba (.graph.betweenness A5))
 (count Ba)                                        -- 6
+(at Ba '_node)                                   -- [0 1 2 3 4 5]
+;; Exact (unsampled) Brandes on this symmetric 6-cycle: every node lies
+;; on the same number of shortest paths -> uniform centrality 2.0.
+(< (max (abs (- (at Ba '_centrality) [2.0 2.0 2.0 2.0 2.0 2.0]))) 1e-9) -- true
 
 ;; ====================================================================
 ;; Fixture B: single isolated node (n=1, m=0) — tests louvain two_m guard
@@ -55,12 +68,23 @@
 ;; but exercises the small-graph path
 (set Lb2 (.graph.louvain B2))
 (count Lb2)                                       -- 2
-(>= (min (at Lb2 '_community)) 0)                 -- true
+(>= (min (at Lb2 '_community)) 0)                -- true
+(at Lb2 '_node)                                  -- [0 1]
+;; Connected 2-node graph: both nodes collapse into a single community.
+;; Labels start at 0, so the only community is 0 for both nodes.
+(at Lb2 '_community)                             -- [0 0]
+(count (distinct (at Lb2 '_community)))          -- 1
 
 ;; pagerank on isolated 2-node graph (node 1 is dangling: out-degree=0)
 (set Pb2 (.graph.pagerank B2 5 0.85))
 (count Pb2)                                       -- 2
-(> (min (at Pb2 '_rank)) 0.0)                     -- true
+(> (min (at Pb2 '_rank)) 0.0)                    -- true
+(at Pb2 '_node)                                  -- [0 1]
+;; Node 0 -> 1, node 1 dangling: rank flows to node 1, so rank[1] > rank[0].
+;; Hand reference ~[0.35, 0.65]; ranks sum to 1.
+(< (max (abs (- (at Pb2 '_rank) [0.35 0.65]))) 0.02) -- true
+(< (abs (- (sum (at Pb2 '_rank)) 1.0)) 0.001)    -- true
+(> (at (at Pb2 '_rank) 1) (at (at Pb2 '_rank) 0)) -- true
 
 ;; ====================================================================
 ;; Fixture C: self-loop graph — exercises DFS visited-bitmap shortcircuit
@@ -75,12 +99,20 @@
 (count DfsC)                                      -- 3
 (first (at DfsC '_node))                          -- 0
 (first (at DfsC '_depth))                         -- 0
+;; Self-loop 0->0 is skipped via the visited bitmap; DFS order is 0,1,2
+;; at strictly increasing depths 0,1,2.
+(at DfsC '_node)                                 -- [0 1 2]
+(at DfsC '_depth)                                -- [0 1 2]
 
 ;; cluster_coeff on self-loop graph: node 0 has neighbors {0,1}
 ;; self-loop is included in fwd CSR -> deg >= 2
 (set CcC (.graph.cluster C1))
 (count CcC)                                       -- 3
-(>= (min (at CcC '_coefficient)) 0.0)             -- true
+(>= (min (at CcC '_coefficient)) 0.0)            -- true
+(at CcC '_node)                                  -- [0 1 2]
+;; Edges 0->0,0->1,1->2. Undirected neighbours: 0:{1}(self-loop folded),
+;; 1:{0,2}, 2:{1}. Node 0 LCC=1, node 1 LCC=0.5, node 2 LCC=0.
+(< (max (abs (- (at CcC '_coefficient) [1.0 0.5 0.0]))) 1e-9) -- true
 
 ;; ====================================================================
 ;; Fixture D: cluster_coeff — complete undirected graph K3 (triangle)
@@ -92,7 +124,10 @@
 (set CcD (.graph.cluster D4))
 (count CcD)                                       -- 3
 ;; In K3 all LCC = 1.0
-(>= (min (at CcD '_coefficient)) 0.9)             -- true
+(>= (min (at CcD '_coefficient)) 0.9)            -- true
+(at CcD '_node)                                  -- [0 1 2]
+;; Every node in K3 has both its neighbours connected -> LCC exactly 1.0.
+(< (max (abs (- (at CcD '_coefficient) [1.0 1.0 1.0]))) 1e-9) -- true
 
 ;; ====================================================================
 ;; Fixture E: var_expand multi-source vector
@@ -105,10 +140,13 @@
 
 ;; Single source: depth 1 from node 0 -> {1}
 (count (.graph.var-expand E6 0 1 1))              -- 1
+(at (.graph.var-expand E6 0 1 1) '_end)          -- [1]
 ;; Single source: depth 2 from node 0 -> {1, 2}
 (count (.graph.var-expand E6 0 1 2))              -- 2
+(at (.graph.var-expand E6 0 1 2) '_end)          -- [1 2]
 ;; Single source: depth 1 from node 3 -> {4}
 (count (.graph.var-expand E6 3 1 1))              -- 1
+(at (.graph.var-expand E6 3 1 1) '_end)          -- [4]
 
 ;; ====================================================================
 ;; Fixture F: exec_shortest_path — long path reconstruction
@@ -126,17 +164,24 @@
 ;; Depth increases monotonically
 (== (first (at Sp09 '_depth)) 0)                  -- true
 (== (at (at Sp09 '_depth) 9) 9)                   -- true
+;; Full reconstructed path: every node on the unique 0..9 chain, in order,
+;; at hop-count depths 0..9.
+(at Sp09 '_node)                                 -- [0 1 2 3 4 5 6 7 8 9]
+(at Sp09 '_depth)                                -- [0 1 2 3 4 5 6 7 8 9]
 
 ;; unreachable: going from 9 to 0 (directed chain, no reverse edges)
 (.graph.shortest-path F10 9 0)                    !- range
 
 ;; ====================================================================
 ;; Fixture G: k_shortest — mid-list best candidate swap
-;; Graph with 3 paths of different costs:
-;;   0->1->3 w=5, 0->2->3 w=4, 0->1->2->3 w=4
-;; First: 0->2->3=4, then 0->1->2->3=4, then 0->1->3=5
-;; The algorithm discovers 0->1->3 first as a candidate, but 0->2->3 is cheaper.
-;; When 0->2->3 is selected as best and best != last position -> swap triggered.
+;; Edges: 0->1 w=2, 0->2 w=2, 1->2 w=1, 1->3 w=3, 2->3 w=2.
+;; Three 0->3 paths, sorted by total cost:
+;;   P0: 0->2->3       cost 2+2   = 4
+;;   P1: 0->1->3       cost 2+3   = 5
+;;   P2: 0->1->2->3    cost 2+1+2 = 5
+;; The algorithm discovers 0->1->3 first as a candidate, but 0->2->3 is
+;; cheaper. When 0->2->3 is selected as best and best != last position ->
+;; swap triggered.
 ;; ====================================================================
 (set G3E (table [src dst w] (list [0 0 1 1 2] [1 2 2 3 3] [2.0 2.0 1.0 3.0 2.0])))
 (set G3 (.graph.build G3E 'src 'dst 'w))
@@ -149,6 +194,19 @@
 ;; All paths have non-negative distances
 (>= (min (at Kg3 '_dist)) 0.0)                    -- true
 
+;; Exactly three paths emitted, ordered by total cost.
+(count (distinct (at Kg3 '_path_id)))             -- 3
+(set Kpid (at Kg3 '_path_id))
+;; P0 = 0->2->3 (cheapest, cost 4); cumulative dist 0,2,4.
+(at (at Kg3 '_node) (where (== Kpid 0)))          -- [0 2 3]
+(last (at (at Kg3 '_dist) (where (== Kpid 0))))   -- 4.0
+;; P1 = 0->1->3 (cost 5); cumulative dist 0,2,5.
+(at (at Kg3 '_node) (where (== Kpid 1)))          -- [0 1 3]
+(last (at (at Kg3 '_dist) (where (== Kpid 1))))   -- 5.0
+;; P2 = 0->1->2->3 (cost 5); cumulative dist 0,2,3,5.
+(at (at Kg3 '_node) (where (== Kpid 2)))          -- [0 1 2 3]
+(last (at (at Kg3 '_dist) (where (== Kpid 2))))   -- 5.0
+
 ;; ====================================================================
 ;; Fixture H: connected_comp on disconnected graph
 ;; Components: {0,1,2} and {3,4} — 5 nodes total, 2 components
@@ -159,6 +217,15 @@
 (set Cc6 (.graph.connected H6))
 (count Cc6)                                       -- 5
 (count (distinct (at Cc6 '_component)))           -- 2
+(at Cc6 '_node)                                  -- [0 1 2 3 4]
+;; Component LABELS are non-deterministic, so assert label-invariant
+;; membership structure: {0,1,2} share one label, {3,4} share another,
+;; and the two groups differ.
+(set Hcomp (at Cc6 '_component))
+(== (at Hcomp 0) (at Hcomp 1))                   -- true
+(== (at Hcomp 1) (at Hcomp 2))                   -- true
+(== (at Hcomp 3) (at Hcomp 4))                   -- true
+(== (at Hcomp 0) (at Hcomp 3))                   -- false
 
 ;; ====================================================================
 ;; Cleanup

@@ -44,12 +44,25 @@
 (set Ri32 (select {v: v by: k from: Ti32}))
 (count Ri32) -- 100
 (fold + 0 (map count (at Ri32 'v))) -- 200000
+;; Order-independent per-group check: key-mask the SOURCE on k==7.
+;; Group 7 holds rows {7,107,...,199907} → count 2000, sum 199914000.
+(set Gi32 (select {n: (count v) s: (sum v) by: k from: Ti32 where: (== k 7)}))
+(count Gi32) -- 1
+(at (at Gi32 'k) 0) -- 7
+(at (at Gi32 'n) 0) -- 2000
+(at (at Gi32 's) 0) -- 199914000
 
 ;; ─── 2. key_read_i64: I16 key arm (line 2833) ──────────────────────
 (set Ti16 (table [k v] (list (as 'I16 (% (til N32) Ng32)) (til N32))))
 (set Ri16 (select {v: v by: k from: Ti16}))
 (count Ri16) -- 100
 (fold + 0 (map count (at Ri16 'v))) -- 200000
+;; Order-independent per-group check via key-masked SOURCE (k==7).
+(set Gi16 (select {n: (count v) s: (sum v) by: k from: Ti16 where: (== k 7)}))
+(count Gi16) -- 1
+(at (at Gi16 'k) 0) -- 7
+(at (at Gi16 'n) 0) -- 2000
+(at (at Gi16 's) 0) -- 199914000
 
 ;; ─── 3. key_read_i64: U8 key arm (line 2832, shared with BOOL) ─────
 ;; Keep n_groups <= 256 so U8 doesn't lose distinct values.
@@ -57,6 +70,12 @@
 (set Ru8 (select {v: v by: k from: Tu8}))
 (count Ru8) -- 100
 (fold + 0 (map count (at Ru8 'v))) -- 200000
+;; Order-independent per-group check via key-masked SOURCE (k==7).
+(set Gu8 (select {n: (count v) s: (sum v) by: k from: Tu8 where: (== k 7)}))
+(count Gu8) -- 1
+(at (at Gu8 'k) 0) -- 0x07
+(at (at Gu8 'n) 0) -- 2000
+(at (at Gu8 's) 0) -- 199914000
 
 ;; ─── 4. key_read_i64: BOOL key arm (line 2831) ─────────────────────
 ;; n_groups = 2; the BOOL path shares the U8 read but exercises a
@@ -65,6 +84,13 @@
 (set Rbo (select {v: v by: k from: Tbo}))
 (count Rbo) -- 2
 (fold + 0 (map count (at Rbo 'v))) -- 200000
+;; Order-independent per-group check via key-masked SOURCE (k==1b → odd
+;; rows {1,3,...,199999}: count 100000, sum 10000000000).
+(set Gbo (select {n: (count v) s: (sum v) by: k from: Tbo where: (== k 1)}))
+(count Gbo) -- 1
+(as 'I64 (at (at Gbo 'k) 0)) -- 1
+(at (at Gbo 'n) 0) -- 100000
+(at (at Gbo 's) 0) -- 10000000000
 
 ;; ─── 5. key_read_i64: DATE key arm (line 2835, shared with I32) ────
 ;; Distinct RAY_DATE okt — line 7216 reads via the int32_t arm but
@@ -73,6 +99,12 @@
 (set Rdt (select {v: v by: k from: Tdt}))
 (count Rdt) -- 100
 (fold + 0 (map count (at Rdt 'v))) -- 200000
+;; Order-independent per-group check via key-masked SOURCE (k==7).
+(set Gdt (select {n: (count v) s: (sum v) by: k from: Tdt where: (== k 7)}))
+(count Gdt) -- 1
+(as 'I64 (at (at Gdt 'k) 0)) -- 7
+(at (at Gdt 'n) 0) -- 2000
+(at (at Gdt 's) 0) -- 199914000
 
 ;; ─── 6. key_read_i64: TIMESTAMP key arm (line 2838, shared I64) ────
 ;; Distinct RAY_TIMESTAMP okt — case label in key_read_i64.
@@ -80,6 +112,12 @@
 (set Rts (select {v: v by: k from: Tts}))
 (count Rts) -- 100
 (fold + 0 (map count (at Rts 'v))) -- 200000
+;; Order-independent per-group check via key-masked SOURCE (k==7).
+(set Gts (select {n: (count v) s: (sum v) by: k from: Tts where: (== k 7)}))
+(count Gts) -- 1
+(as 'I64 (at (at Gts 'k) 0)) -- 7
+(at (at Gts 'n) 0) -- 2000
+(at (at Gts 's) 0) -- 199914000
 
 ;; ─── 7. key_read_i64: F64 key arm (line 2843) ──────────────────────
 ;; F64 keys go through the bitcast memcpy path (NaN/-0 equality).
@@ -87,6 +125,12 @@
 (set Rf64 (select {v: v by: k from: Tf64}))
 (count Rf64) -- 100
 (fold + 0 (map count (at Rf64 'v))) -- 200000
+;; Order-independent per-group check via key-masked SOURCE (k==7.0).
+(set Gf64 (select {n: (count v) s: (sum v) by: k from: Tf64 where: (== k 7.0)}))
+(count Gf64) -- 1
+(at (at Gf64 'k) 0) -- 7.0
+(at (at Gf64 'n) 0) -- 2000
+(at (at Gf64 's) 0) -- 199914000
 
 ;; ─── 8. rgid_probe_fn selection path: (count (distinct ...)) + WHERE
 ;; Shape: single non-agg is `(count (distinct v))`, which is the only
@@ -107,6 +151,13 @@
 ;; Every group sees v cycling 0..9 — surviving (v<7) distinct values
 ;; per group = 7.  100 groups * 7 = 700.
 (sum (at Rcd 'c)) -- 700
+;; Order-independent per-group check via key-masked SOURCE (k==42):
+;; v<7 keeps {0..6} distinct = 7 across 1400 surviving rows; assert key.
+(set Gcd (select {c: (count (distinct v)) n: (count v) by: k where: (and (== k 42) (< v 7)) from: Tcd}))
+(count Gcd) -- 1
+(at (at Gcd 'k) 0) -- 42
+(at (at Gcd 'c) 0) -- 7
+(at (at Gcd 'n) 0) -- 1400
 
 ;; ─── 9. rgid_probe_fn selection path — RAY_SEL_NONE / RAY_SEL_ALL.
 ;; Filter on the contiguous k range (k = i/2000), so rows 0..99_999
@@ -118,6 +169,13 @@
 (count Rsa) -- 50
 ;; Surviving 50 groups each see v cycling 0..9 → 10 distinct each.
 (sum (at Rsa 'c)) -- 500
+;; Order-independent per-group check via key-masked SOURCE (k==73, a
+;; surviving group): v cycles 0..9 → 10 distinct over 2000 rows.
+(set Gsa (select {c: (count (distinct v)) n: (count v) by: k where: (and (>= k 50) (== k 73)) from: Tcd}))
+(count Gsa) -- 1
+(at (at Gsa 'k) 0) -- 73
+(at (at Gsa 'c) 0) -- 10
+(at (at Gsa 'n) 0) -- 2000
 
 ;; ─── 10. query_key_reader_init: multi-key by + take ≤ 1024 + count
 ;; Activates the line 4593 init loop for each key column.  Keys are
@@ -126,6 +184,15 @@
 (set Tmk (table [g1 g2 v] (list [1 1 2 2 3 3 4 4 5 5] ['A 'B 'A 'B 'A 'B 'A 'B 'A 'B] [10 20 30 40 50 60 70 80 90 100])))
 (count (select {c: (count v) by: [g1 g2] take: 50 from: Tmk})) -- 10
 (sum (at (select {c: (count v) by: [g1 g2] take: 50 from: Tmk}) 'c)) -- 10
+;; Order-independent per-group check via composite-key-masked SOURCE.
+;; Row (g1==3, g2==B) is the single v=60 row → count 1, sum 60; assert
+;; BOTH composite key columns so a swap between groups is caught.
+(set Gmk (select {c: (count v) s: (sum v) by: [g1 g2] where: (and (== g1 3) (== g2 'B)) from: Tmk}))
+(count Gmk) -- 1
+(at (at Gmk 'g1) 0) -- 3
+(at (at Gmk 'g2) 0) -- 'B
+(at (at Gmk 'c) 0) -- 1
+(at (at Gmk 's) 0) -- 60
 
 ;; ─── 11. query_key_reader_init: multi-key with mixed widths
 ;; I16 + I32 keys — each reader's `r->base_type = col->type` reads the
@@ -134,6 +201,14 @@
 (set Tmw (table [k16 k32 v] (list (as 'I16 [1 1 2 2 3 3]) (as 'I32 [10 20 10 20 10 20]) [100 200 300 400 500 600])))
 (count (select {c: (count v) by: [k16 k32] take: 20 from: Tmw})) -- 6
 (sum (at (select {c: (count v) by: [k16 k32] take: 20 from: Tmw}) 'c)) -- 6
+;; Order-independent per-group check via composite-key-masked SOURCE.
+;; Row (k16==2, k32==20) is the single v=400 row → count 1, sum 400.
+(set Gmw (select {c: (count v) s: (sum v) by: [k16 k32] where: (and (== k16 2) (== k32 20)) from: Tmw}))
+(count Gmw) -- 1
+(at (at Gmw 'k16) 0) -- 2
+(at (at Gmw 'k32) 0) -- 20
+(at (at Gmw 'c) 0) -- 1
+(at (at Gmw 's) 0) -- 400
 
 ;; ─── 12. query_key_reader_init with null-bearing key — exercises
 ;; the HAS_NULLS attr arm of query_key_reader_read (line 198) downstream.
@@ -141,3 +216,52 @@
 (set Tnk (table [k1 k2 v] (list [1 0N 2 0N 3 0N] ['A 'A 'B 'B 'C 'C] [10 20 30 40 50 60])))
 (count (select {c: (count v) by: [k1 k2] take: 30 from: Tnk})) -- 6
 (sum (at (select {c: (count v) by: [k1 k2] take: 30 from: Tnk}) 'c)) -- 6
+;; Order-independent per-group check via composite-key-masked SOURCE on
+;; a NON-NULL key pair (k1==2, k2==B) → single v=30 row, count 1, sum 30.
+(set Gnk (select {c: (count v) s: (sum v) by: [k1 k2] where: (and (== k1 2) (== k2 'B)) from: Tnk}))
+(count Gnk) -- 1
+(at (at Gnk 'k1) 0) -- 2
+(at (at Gnk 'k2) 0) -- 'B
+(at (at Gnk 'c) 0) -- 1
+(at (at Gnk 's) 0) -- 30
+;; NULL-bearing composite key: mask the SYM column (k2==A) and assert the
+;; null-k1 group is isolated with the right value (v=20, count 1).  This
+;; exercises the HAS_NULLS reader arm under a where:-masked multi-key.
+(set Gnn (select {c: (count v) s: (sum v) by: [k1 k2] where: (and (== k1 0N) (== k2 'A)) from: Tnk}))
+(count Gnn) -- 1
+(nil? (at (at Gnn 'k1) 0)) -- true
+(at (at Gnn 'k2) 0) -- 'A
+(at (at Gnn 'c) 0) -- 1
+(at (at Gnn 's) 0) -- 20
+
+;; ─── 13. WATCH: multi-key SYM-vector NO-AGG by-group honoring where: ─
+;; Sibling probe reported that the no-agg multi-key by-group path (which
+;; emits list-valued non-key columns) may IGNORE where:.  Mask SOURCE to
+;; the single (k1==2,k2==B) group: the no-agg by-group result must carry
+;; exactly that one group with v list == [30].  If where: were ignored
+;; this would return all 6 groups / wrong rows.
+(set Gng (select {v: v by: [k1 k2] where: (and (== k1 2) (== k2 'B)) from: Tnk}))
+(count Gng) -- 1
+(at (at Gng 'k1) 0) -- 2
+(at (at Gng 'k2) 0) -- 'B
+(count (at (at Gng 'v) 0)) -- 1
+(at (at (at Gng 'v) 0) 0) -- 30
+
+;; Same shape at vector scale to force the SYM-vector (non-scalar) path.
+;; s1/s2 are SYM vectors, 600 rows, 9 groups; mask to (s1==B, s2==Y).
+;; (% (til 600) 3) → 0,1,2 mapping to A,B,C ; (div (% (til 600) 9) 3)
+;; gives 0,1,2 → X,Y,Z so each (s1,s2) pair is well populated.
+(set s1 (at ['A 'B 'C] (% (til 600) 3)))
+(set s2 (at ['X 'Y 'Z] (div (% (til 600) 9) 3)))
+(set Tsv (table [s1 s2 v] (list s1 s2 (til 600))))
+(set Gsv (select {v: v by: [s1 s2] where: (and (== s1 'B) (== s2 'Y)) from: Tsv}))
+(count Gsv) -- 1
+(at (at Gsv 's1) 0) -- 'B
+(at (at Gsv 's2) 0) -- 'Y
+;; Every row in the masked group must satisfy BOTH key predicates; if
+;; where: were ignored the v list would carry rows from other groups, so
+;; (% v 3) over the group must be uniformly 1 (min==max==1).
+(min (% (at (at Gsv 'v) 0) 3)) -- 1
+(max (% (at (at Gsv 'v) 0) 3)) -- 1
+;; The masked group is a proper subset: i%9==4 → 67 of 600 rows.
+(count (at (at Gsv 'v) 0)) -- 67

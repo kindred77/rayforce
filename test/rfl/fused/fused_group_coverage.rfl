@@ -37,16 +37,24 @@
 (sum (at (select {c: (count k) from: Tand where: (and (in k [5 6 7]) (< v 80)) by: g}) 'c)) -- 3
 
 ;; (and (in k [2 4 6 8]) (> v 30)) — IN + GT, fp_eval_cmp_one GT arm
+;; k∈{4,6,8} (k=2 has v=20<=30); g=0 has {k=4}=1 ; g=1 has {k=6,k=8}=2 → sum 3.
 (count (select {c: (count k) from: Tand where: (and (in k [2 4 6 8]) (> v 30)) by: g})) -- 2
+(sum (at (select {c: (count k) from: Tand where: (and (in k [2 4 6 8]) (> v 30)) by: g}) 'c)) -- 3
 
 ;; (and (in k [1 3 5 7 9]) (!= v 10)) — IN + NE, fp_eval_cmp_one NE arm
+;; k=1 → v=10 fails ; k=3,5,7,9 → v∈{30,50,70,90} → 4 rows ; g=0 has {3,5}=2 ; g=1 has {7,9}=2 ; sum 4.
 (count (select {c: (count k) from: Tand where: (and (in k [1 3 5 7 9]) (!= v 10)) by: g})) -- 2
+(sum (at (select {c: (count k) from: Tand where: (and (in k [1 3 5 7 9]) (!= v 10)) by: g}) 'c)) -- 4
 
 ;; (and (in k [2 4 6 8 10]) (<= v 80)) — IN + LE, fp_eval_cmp_one LE arm
+;; k∈{2,4,6,8} (k=10 has v=100>80); g=0 has {2,4}=2 ; g=1 has {6,8}=2 ; sum 4.
 (count (select {c: (count k) from: Tand where: (and (in k [2 4 6 8 10]) (<= v 80)) by: g})) -- 2
+(sum (at (select {c: (count k) from: Tand where: (and (in k [2 4 6 8 10]) (<= v 80)) by: g}) 'c)) -- 4
 
 ;; (and (in k [1 2 3 4 5]) (>= v 30)) — IN + GE, fp_eval_cmp_one GE arm
+;; k∈{3,4,5} (k=1,2 have v=10,20<30); all in g=0 → 1 group ; c=3.
 (count (select {c: (count k) from: Tand where: (and (in k [1 2 3 4 5]) (>= v 30)) by: g})) -- 1
+(at (at (select {c: (count k) from: Tand where: (and (in k [1 2 3 4 5]) (>= v 30)) by: g}) 'c) 0) -- 3
 
 ;; Three-child AND: (and (in k [1 2 3]) (>= v 10) (< v 40)) — triggers
 ;; fp_pred_order_children with three children including one IN.

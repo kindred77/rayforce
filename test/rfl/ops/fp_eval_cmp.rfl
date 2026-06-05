@@ -25,33 +25,53 @@
 (set T (table [u8 i16 i32 d t ts s sy g] (list (as 'U8 [1 2 3 4 5 6 7 8]) (as 'I16 [1 2 3 4 5 6 7 8]) (as 'I32 [1 2 3 4 5 6 7 8]) (as 'date [2020.01.01 2020.01.02 2020.01.03 2020.01.04 2020.01.05 2020.01.06 2020.01.07 2020.01.08]) (as 'time [00:00:01.000 00:00:02.000 00:00:03.000 00:00:04.000 00:00:05.000 00:00:06.000 00:00:07.000 00:00:08.000]) (as 'timestamp [2020.01.01D00:00:00.000000001 2020.01.01D00:00:00.000000002 2020.01.01D00:00:00.000000003 2020.01.01D00:00:00.000000004 2020.01.01D00:00:00.000000005 2020.01.01D00:00:00.000000006 2020.01.01D00:00:00.000000007 2020.01.01D00:00:00.000000008]) ["alpha" "beta" "axe" "able" "boat" "amber" "bingo" "bee"] ['alpha 'beta 'axe 'able 'boat 'amber 'bingo 'bee] [0 0 0 0 1 1 1 1])))
 
 ;; ───────── esz=1 (U8): EQ / LT / LE / GT — currently 0 each ─────────
+;; Value-checks pin per-group surviving counts (result is by:g asc 0,1).
+;; g=0 rows have u8∈{1,2,3,4}; g=1 rows have u8∈{5,6,7,8}.
 (count (select {c: (count u8) from: T where: (== u8 1) by: g})) -- 1
+(at (select {c: (count u8) from: T where: (== u8 1) by: g}) 'c) -- [1]
 (count (select {c: (count u8) from: T where: (<  u8 5) by: g})) -- 1
+(at (select {c: (count u8) from: T where: (<  u8 5) by: g}) 'c) -- [4]
 (count (select {c: (count u8) from: T where: (<= u8 5) by: g})) -- 2
+(at (select {c: (count u8) from: T where: (<= u8 5) by: g}) 'c) -- [4 1]
 (count (select {c: (count u8) from: T where: (>  u8 0) by: g})) -- 2
+(at (select {c: (count u8) from: T where: (>  u8 0) by: g}) 'c) -- [4 4]
 
 ;; ───────── esz=2 (I16): EQ / NE / LE / GT — currently 0 each ────────
 (count (select {c: (count i16) from: T where: (== i16 1) by: g})) -- 1
+(at (select {c: (count i16) from: T where: (== i16 1) by: g}) 'c) -- [1]
 (count (select {c: (count i16) from: T where: (!= i16 0) by: g})) -- 2
+(at (select {c: (count i16) from: T where: (!= i16 0) by: g}) 'c) -- [4 4]
 (count (select {c: (count i16) from: T where: (<= i16 5) by: g})) -- 2
+(at (select {c: (count i16) from: T where: (<= i16 5) by: g}) 'c) -- [4 1]
 (count (select {c: (count i16) from: T where: (>  i16 0) by: g})) -- 2
+(at (select {c: (count i16) from: T where: (>  i16 0) by: g}) 'c) -- [4 4]
 
 ;; ───────── esz=4 non-SYM: NE / LT / GT (DATE LE, TIME GT, I32) ──────
 (count (select {c: (count i32) from: T where: (!= i32 0)         by: g})) -- 2
+(at (select {c: (count i32) from: T where: (!= i32 0) by: g}) 'c) -- [4 4]
 (count (select {c: (count i32) from: T where: (<  i32 5)         by: g})) -- 1
+(at (select {c: (count i32) from: T where: (<  i32 5) by: g}) 'c) -- [4]
 (count (select {c: (count i32) from: T where: (>  i32 0)         by: g})) -- 2
+(at (select {c: (count i32) from: T where: (>  i32 0) by: g}) 'c) -- [4 4]
 (count (select {c: (count d)   from: T where: (<= d 2020.01.04) by: g})) -- 1
+(at (select {c: (count d) from: T where: (<= d 2020.01.04) by: g}) 'c) -- [4]
 (count (select {c: (count t)   from: T where: (>  t 00:00:00.500) by: g})) -- 2
+(at (select {c: (count t) from: T where: (>  t 00:00:00.500) by: g}) 'c) -- [4 4]
 
 ;; ───────── esz=8 TIMESTAMP EQ/NE — distinct arm from GE-heavy I64 ───
 (count (select {c: (count ts) from: T where: (== ts 2020.01.01D00:00:00.000000001) by: g})) -- 1
+(at (select {c: (count ts) from: T where: (== ts 2020.01.01D00:00:00.000000001) by: g}) 'c) -- [1]
 (count (select {c: (count ts) from: T where: (!= ts 2020.01.01D00:00:00.000000001) by: g})) -- 2
+(at (select {c: (count ts) from: T where: (!= ts 2020.01.01D00:00:00.000000001) by: g}) 'c) -- [3 4]
 
 ;; ───────── FP_IN per-esz arm: esz=1 / esz=2 / esz=4 (8 already hit) ─
 ;; rhs is a literal vec (i64 default) — fp_compile_cmp casts to col esz.
 (count (select {c: (count u8)  from: T where: (in u8  [1 2 99]) by: g})) -- 1
+(at (select {c: (count u8)  from: T where: (in u8  [1 2 99]) by: g}) 'c) -- [2]
 (count (select {c: (count i16) from: T where: (in i16 [3 4 99]) by: g})) -- 1
+(at (select {c: (count i16) from: T where: (in i16 [3 4 99]) by: g}) 'c) -- [2]
 (count (select {c: (count i32) from: T where: (in i32 [5 6 99]) by: g})) -- 1
+(at (select {c: (count i32) from: T where: (in i32 [5 6 99]) by: g}) 'c) -- [2]
 
 ;; FP_IN n_cvals==0 — null-only vec collapses to no candidate values;
 ;; fp_eval_cmp line 403 short-circuits with memset(0) for every row.
@@ -65,12 +85,20 @@
 ;; fp_eval_cmp early-returns memset(0) for EQ, memset(1) for NE.
 (count (select {c: (count sy) from: T where: (== sy "neverbefore_seen_xyz_12345") by: g})) -- 0
 (count (select {c: (count sy) from: T where: (!= sy "neverbefore_seen_xyz_12345") by: g})) -- 2
+(at (select {c: (count sy) from: T where: (!= sy "neverbefore_seen_xyz_12345") by: g}) 'c) -- [4 4]
 
 ;; ───────── FP_LIKE on RAY_STR — both shape-PREFIX (use_simple=1) and
 ;; shape-NONE (use_simple=0, full glob) paths ────────────────────────
+;; g=0 strings {alpha,beta,axe,able}; g=1 {boat,amber,bingo,bee}.
+;; "a*"   matches alpha,axe,able (g=0:3) + amber (g=1:1) → [3 1]
+;; "[ab]*" matches every row (all start a or b)          → [4 4]
 (count (select {c: (count s) from: T where: (like s "a*")    by: g})) -- 2
+(at (select {c: (count s) from: T where: (like s "a*") by: g}) 'c) -- [3 1]
 (count (select {c: (count s) from: T where: (like s "[ab]*") by: g})) -- 2
+(at (select {c: (count s) from: T where: (like s "[ab]*") by: g}) 'c) -- [4 4]
 
 ;; ───────── FP_LIKE on RAY_SYM — LUT path with both shape modes ──────
 (count (select {c: (count sy) from: T where: (like sy "a*")    by: g})) -- 2
+(at (select {c: (count sy) from: T where: (like sy "a*") by: g}) 'c) -- [3 1]
 (count (select {c: (count sy) from: T where: (like sy "[ab]*") by: g})) -- 2
+(at (select {c: (count sy) from: T where: (like sy "[ab]*") by: g}) 'c) -- [4 4]

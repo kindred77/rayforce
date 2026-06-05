@@ -39,6 +39,18 @@
 (<= (sum (at Pr '_rank)) 1.01)                  -- true
 ;; All ranks are strictly positive (no isolated nodes).
 (> (min (at Pr '_rank)) 0.0)                    -- true
+;; Rows are emitted one per node in id order -- pin WHICH node each rank
+;; belongs to, so a permuted/short rank vector can't pass on sum alone.
+(at Pr '_node)                                  -- [0 1 2 3 4 5]
+;; Structural ordering (not fragile FP equality): the sink node 5 absorbs
+;; rank from two high-rank predecessors, so it must rank highest; the
+;; source node 0 (no inbound edges) must rank lowest.
+(set Pr_rank (at Pr '_rank))
+(== (at Pr_rank 5) (max Pr_rank))               -- true
+(== (at Pr_rank 0) (min Pr_rank))               -- true
+;; Sanity on magnitudes (tolerance, hand-computed reference ~0.35/0.074).
+(< (abs (- (at Pr_rank 5) 0.35)) 0.02)          -- true
+(< (abs (- (at Pr_rank 0) 0.074)) 0.02)         -- true
 
 ;; -------------- (.graph.dijkstra) --------------
 ;; Single-source Dijkstra from node 0.  Hand-computed reference:
@@ -69,10 +81,23 @@
 (min (at D '_node))                             -- 0
 (max (at D '_node))                             -- 5
 (count (distinct (at D '_node)))                -- 6
+;; WHICH nodes, in DFS visit order (deterministic frontier).  0 then its
+;; first out-edge 0->1, then 1->2, 2->3, 3->5, finally 2->4 on backtrack.
+(at D '_node)                                   -- [0 1 2 3 5 4]
+;; Sorted membership: exactly the node set {0..5}, no duplicates/strays.
+(asc (at D '_node))                             -- [0 1 2 3 4 5]
+;; Depth and parent vectors aligned to the visit order above.
+(at D '_depth)                                  -- [0 1 2 3 4 3]
+(at D '_parent)                                 -- [-1 0 1 2 3 2]
 
 ;; max_depth=1 limits the DFS frontier.  From node 0 we should see 0
 ;; (depth 0), plus 1 and 2 (depth 1) -- three rows total.
-(count (.graph.dfs G 0 1))                      -- 3
+(set D1 (.graph.dfs G 0 1))
+(count D1)                                      -- 3
+;; WHICH nodes: the source and exactly its two direct successors 1,2 --
+;; nothing from depth >= 2 leaks through.
+(at D1 '_node)                                  -- [0 1 2]
+(at D1 '_depth)                                 -- [0 1 1]
 
 ;; -------------- (.graph.topsort) --------------
 ;; The fixture is a DAG, so a valid total ordering exists.  The order
@@ -89,6 +114,11 @@
 (at Ts_ord (at (where (== Ts_node 0)) 0))       -- 0
 ;; Node 5 has only inbound edges, so it must be last (order=5).
 (at Ts_ord (at (where (== Ts_node 5)) 0))       -- 5
+;; Full ordering: the _node column lists nodes in topological position,
+;; and _order is its rank.  For this fixture every edge points forward
+;; (low->high id), so the unique valid order is identity 0..5.
+(at Ts '_node)                                  -- [0 1 2 3 4 5]
+(at Ts '_order)                                 -- [0 1 2 3 4 5]
 
 ;; -------------- (.graph.mst) --------------
 ;; MST treats edges as undirected.  Hand-Kruskal: sorted edges with
@@ -98,6 +128,17 @@
 (set Mst (.graph.mst G))
 ;; A spanning tree on 6 nodes has exactly 5 edges.
 (count Mst)                                     -- 5
+;; WHICH edges, not just how many.  The MST edge SET is determined by weight
+;; (the three weight-1 edges 0-1,2-3,4-5 are forced; two weight-2 edges 1-2
+;; and 3-5 bridge the components), but Kruskal's emit ORDER depends on how the
+;; weight sort tie-breaks equal-weight edges -- and that differs across
+;; platforms (qsort is not stable).  Assert the order-independent edge
+;; multiset (sorted columns) plus the total weight, not the pick order.
+(asc (at Mst '_src))                            -- [0 1 2 3 4]
+(asc (at Mst '_dst))                            -- [1 2 3 5 5]
+(asc (at Mst '_weight))                         -- [1.0 1.0 1.0 2.0 2.0]
+;; Total spanning-tree weight is 1+1+1+2+2 = 7 (unique-MST invariant).
+(< (abs (- (sum (at Mst '_weight)) 7.0)) 1e-9)  -- true
 
 ;; -------------- (.graph.degree) -- sanity --------------
 ;; Degree centrality returns total degree per node.
@@ -108,21 +149,45 @@
 (count Dg)                                      -- 6
 ;; Sum of total degrees == 2 * n_edges.  Column is `_degree` (in + out).
 (sum (at Dg '_degree))                          -- 16
+;; Per-node degree, not just the sum (a wrong distribution can still total
+;; 16).  node0: out2/in0=2; node1: out2/in1=3; node2: out2/in2=4;
+;; node3: out1/in2=3; node4: out1/in1=2; node5: out0/in2=2.
+(at Dg '_node)                                   -- [0 1 2 3 4 5]
+(at Dg '_degree)                                 -- [2 3 4 3 2 2]
 
 ;; -------------- (.graph.connected) -- sanity --------------
 ;; Whole graph is one weakly-connected component.
 (set Cc (.graph.connected G))
 (count (distinct (at Cc '_component)))          -- 1
+;; WHICH membership: every one of the 6 nodes carries the same component
+;; label (here 0) -- not merely "one distinct label among a subset".
+(at Cc '_node)                                  -- [0 1 2 3 4 5]
+(at Cc '_component)                             -- [0 0 0 0 0 0]
 
 ;; -------------- (.graph.shortest-path) --------------
 ;; BFS shortest path (hop count) from 0 to 5.  In our DAG the minimum
 ;; hop count is 3: 0->1->3->5 or 0->2->3->5 etc. -- at any rate there must
 ;; be at least one row in the result and the destination is reachable.
-(>= (count (.graph.shortest-path G 0 5)) 1)     -- true
+(set Sp (.graph.shortest-path G 0 5))
+(>= (count Sp) 1)                               -- true
+;; A shortest 0->5 route is 3 hops (4 nodes), but several equal-length paths
+;; exist (0->1->3->5, 0->2->3->5, ...) and which one BFS returns depends on
+;; adjacency iteration order (platform-dependent).  Assert the order-
+;; independent invariants -- 4 nodes, monotonic per-hop depth, fixed
+;; endpoints -- not the specific intermediate nodes.
+(count Sp)                                      -- 4
+(at Sp '_depth)                                 -- [0 1 2 3]
+(first (at Sp '_node))                          -- 0
+(last (at Sp '_node))                           -- 5
 
 ;; -------------- (.graph.expand) -- neighbors of node 1 --------------
 ;; Node 1 has out-edges 1->2 and 1->3.  expand returns a 2-column table.
-(count (.graph.expand G 1))                     -- 2
+(set Ex (.graph.expand G 1))
+(count Ex)                                       -- 2
+;; WHICH neighbors: the source repeated in _src and the two successors
+;; {2,3} in _dst -- not just "two rows".
+(at Ex '_src)                                   -- [1 1]
+(asc (at Ex '_dst))                             -- [2 3]
 
 ;; -------------- (.graph.free) --------------
 (.graph.free G)

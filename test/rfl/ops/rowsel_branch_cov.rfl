@@ -57,7 +57,11 @@
 
 ;; All-pass feeding a group-by: to_indices is bypassed (NULL selection)
 ;; but the group still produces every row.  Pins the all-pass handoff.
+;; Total alone could mask a rowsel that mis-routes rows between groups;
+;; pin the per-group breakdown (g=v%4 over 0..2999 → 750 rows each).
 (sum (at (select {c: (count v) by: g from: Tall where: (>= v 0)}) 'c)) -- 3000
+(asc (at (select {c: (count v) by: g from: Tall where: (>= v 0)}) 'g)) -- [0 1 2 3]
+(asc (at (select {c: (count v) by: g from: Tall where: (>= v 0)}) 'c)) -- [750 750 750 750]
 
 ;; ════════════════════════════════════════════════════════════════════════
 ;; (c) refine all-pass — chained AND where the second conjunct keeps
@@ -78,9 +82,19 @@
 (count (select {from: Tall where: (< v 1024)})) -- 1024
 (sum (at (select {from: Tall where: (< v 1024)}) 'v)) -- 523776
 ;; Grouped form drives to_indices over an ALL segment (seg 0) + NONE segs.
+;; Total 1024 alone is satisfied by any rowsel keeping 1024 rows; pin which
+;; rows survive (v=0..1023, g=v%4 → 256 per group) so a mis-routed bitmap
+;; that kept the wrong 1024 rows fails.
 (sum (at (select {c: (count v) by: g from: Tall where: (< v 1024)}) 'c)) -- 1024
+(asc (at (select {c: (count v) by: g from: Tall where: (< v 1024)}) 'c)) -- [256 256 256 256]
 
 ;; A partial-last-segment ALL: keep rows [2048, 3000) — segment 2 is the
 ;; partial tail (952 rows) and entirely passes → ALL on a partial morsel.
+;; Count 952 alone can't tell [2048,3000) from any other 952-row window;
+;; pin the actual survivors by value (sum/first/last of v).
 (count (select {from: Tall where: (>= v 2048)})) -- 952
+(sum (at (select {from: Tall where: (>= v 2048)}) 'v)) -- 2402372
+(first (asc (at (select {from: Tall where: (>= v 2048)}) 'v))) -- 2048
+(last (asc (at (select {from: Tall where: (>= v 2048)}) 'v))) -- 2999
 (sum (at (select {c: (count v) by: g from: Tall where: (>= v 2048)}) 'c)) -- 952
+(asc (at (select {c: (count v) by: g from: Tall where: (>= v 2048)}) 'c)) -- [238 238 238 238]

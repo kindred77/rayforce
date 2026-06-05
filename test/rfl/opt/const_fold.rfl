@@ -223,23 +223,30 @@
 
 ;; const on RHS (rhs_const=true, lhs_const=false at line 526)
 ;; AND identity: (and (> a 2) true)  → keeps rows where a>2  (3 rows: 3,4,5)
+;; sum 12.
 (count (select {from: T where: (and (> a 2) true)}))   -- 3
+(sum (at (select {from: T where: (and (> a 2) true)}) 'a)) -- 12
 ;; AND dominant: (and (> a 2) false) → zero rows
 (count (select {from: T where: (and (> a 2) false)}))  -- 0
 ;; OR identity: (or (> a 2) false)   → same as (> a 2) → 3 rows
 (count (select {from: T where: (or (> a 2) false)}))   -- 3
-;; OR dominant: (or (> a 2) true)    → all rows
+(sum (at (select {from: T where: (or (> a 2) false)}) 'a)) -- 12
+;; OR dominant: (or (> a 2) true)    → all rows; sum 15.
 (count (select {from: T where: (or (> a 2) true)}))    -- 5
+(sum (at (select {from: T where: (or (> a 2) true)}) 'a)) -- 15
 
 ;; const on LHS (lhs_const=true at line 528 — lhs_const branch)
 ;; AND identity: (and true (> a 2))
 (count (select {from: T where: (and true (> a 2))}))   -- 3
+(sum (at (select {from: T where: (and true (> a 2))}) 'a)) -- 12
 ;; AND dominant: (and false (> a 2))
 (count (select {from: T where: (and false (> a 2))}))  -- 0
 ;; OR identity: (or false (> a 2))
 (count (select {from: T where: (or false (> a 2))}))   -- 3
+(sum (at (select {from: T where: (or false (> a 2))}) 'a)) -- 12
 ;; OR dominant: (or true (> a 2))
 (count (select {from: T where: (or true (> a 2))}))    -- 5
+(sum (at (select {from: T where: (or true (> a 2))}) 'a)) -- 15
 
 ;; atom_to_bool is_f64 path (line 493-494): const is float
 ;; atom_to_bool(0.0) → is_f64=true, *out = 0.0!=0.0 = false
@@ -258,8 +265,9 @@
 ;; ====================================================================
 (set Tstr (table [s v] (list ["Apple" "Banana" "avocado" "blueberry" "APRICOT" "cherry"] [10 20 30 40 50 60])))
 
-;; ilike with * wildcard (case-insensitive): matches "Apple", "avocado", "APRICOT" → 3 rows
+;; ilike with * wildcard (case-insensitive): matches "Apple"(10), "avocado"(30), "APRICOT"(50) → 3 rows; sum v 90.
 (count (select {from: Tstr where: (ilike s "a*")})) -- 3
+(sum (at (select {from: Tstr where: (ilike s "a*")}) 'v)) -- 90
 
 ;; ilike inside AND chain — filter_cost reorders ilike to run last
 ;; (and (> v 25) (ilike s "a*")): v>25 keeps rows {30,40,50,60};
@@ -282,9 +290,10 @@
 ;; This is tested via a nested select with an expression column
 (set Tpp (table [a] (list [1 2 3 4 5])))
 ;; nested select: outer select on an inner select with computed column
-;; b = (* a 2) = [2,4,6,8,10]; b>6 → {8,10} → 2 rows
+;; b = (* a 2) = [2,4,6,8,10]; b>6 → {8,10} → 2 rows, sum 18.
 (set Inner (select {b: (* a 2) from: Tpp}))
 (count (select {from: Inner where: (> b 6)})) -- 2
+(sum (at (select {from: Inner where: (> b 6)}) 'b)) -- 18
 
 ;; Predicate pushdown through OP_ALIAS (created by SELECT with renamed col)
 ;; inner has OP_SELECT with alias; outer WHERE pushes through

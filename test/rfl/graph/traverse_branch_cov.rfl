@@ -102,6 +102,10 @@
 (first (at RwDef '_step))                          -- 0
 (first (at RwDef '_node))                          -- 0
 (last (at RwDef '_step))                           -- 10
+;; C4 has out-degree 1 per node, so the walk is fully deterministic:
+;; it cycles 0->1->2->3->0... for 11 steps.
+(at RwDef '_node)                                  -- [0 1 2 3 0 1 2 3 0 1 2]
+(last (at RwDef '_node))                           -- 2
 
 ;; (15) dijkstra default 1-arg single-source over a cycle reaches all 4.
 (set DjC (.graph.dijkstra C4 0))
@@ -119,6 +123,11 @@
 (set CcTri (.graph.cluster Tri3))
 (count CcTri)                                      -- 3
 (> (max (at CcTri '_coefficient)) 0.0)             -- true
+;; Directed 3-cycle: each node has undirected neighbours {prev,next} with
+;; exactly one of the two possible directed edges between them present,
+;; so every coefficient is 0.5.
+(at CcTri '_coefficient)                            -- [0.5 0.5 0.5]
+(at CcTri '_node)                                   -- [0 1 2]
 
 ;; (10) topsort valid DAG with two zero-in-degree roots.
 ;;   0->2, 1->2, 2->3 : roots {0,1}, then 2, then 3.
@@ -275,6 +284,7 @@
 (count CcBi)                                        -- 3
 ;; In a 3-clique every node has coefficient 1.0 (all neighbor pairs adjacent).
 (> (min (at CcBi '_coefficient)) 0.0)               -- true
+(at CcBi '_coefficient)                             -- [1.0 1.0 1.0]
 
 ;; ---------------------------------------------------------------------
 ;; (23) cluster_coeff with parallel edges 0->1 (twice) and 0->2.
@@ -285,6 +295,11 @@
 (set Par (.graph.build ParE 'src 'dst 'w))
 (set CcPar (.graph.cluster Par))
 (count CcPar)                                       -- 3
+;; Parallel edges 0->1,0->1,0->2 form no closed triangle: node 0's
+;; neighbours {1,2} have no edge between them, nodes 1,2 have no peers,
+;; so every coefficient is 0.0.
+(at CcPar '_node)                                  -- [0 1 2]
+(at CcPar '_coefficient)                           -- [0.0 0.0 0.0]
 
 ;; ---------------------------------------------------------------------
 ;; (24) connected_comp on a 3-node directed path with a back-edge:
@@ -309,6 +324,9 @@
 (set DjDmax (.graph.dijkstra Dia 0 0N 5))
 (count DjDmax)                                      -- 4
 (at (at DjDmax '_dist) (at (where (== (at DjDmax '_node) 0)) 0)) -- 0.0
+;; Cheapest distances on Dia from 0: 0,1,2 (via 0->1->2),3 (via ...->3).
+(at DjDmax '_node)                                  -- [0 1 2 3]
+(at DjDmax '_dist)                                  -- [0.0 1.0 2.0 3.0]
 
 ;; ---------------------------------------------------------------------
 ;; (26) dfs on a graph with a branching node — verifies stack-based DFS
@@ -419,6 +437,8 @@
 (count (distinct (at KsOne '_path_id)))             -- 1
 ;; Total nodes on the single path 0->1->2->3->4 = 5.
 (count KsOne)                                       -- 5
+;; The unique shortest path visits every node in order.
+(at KsOne '_node)                                  -- [0 1 2 3 4]
 
 ;; ---------------------------------------------------------------------
 ;; (39) k-shortest with K=3 on a diamond graph: 0->1->3, 0->2->3, 0->3.
@@ -437,6 +457,11 @@
 ;; ---------------------------------------------------------------------
 (set MstTri (.graph.mst Tri3))
 (count MstTri)                                      -- 2
+;; 3-cycle with unit weights: any 2 of the 3 edges span it, so the MST edge
+;; SET is non-unique and which pair is kept depends on the weight sort's
+;; tie-break (platform-dependent).  Assert only the robust invariants: 2
+;; edges, total weight 2.0.
+(sum (at MstTri '_weight))                          -- 2.0
 
 ;; ---------------------------------------------------------------------
 ;; (41) MST on the diamond — should select edges totalling the cheapest
@@ -444,6 +469,12 @@
 ;; ---------------------------------------------------------------------
 (set MstDia (.graph.mst Dia))
 (count MstDia)                                      -- 3
+;; Cheapest spanning tree skips the weight-5 edge 0->2: picks 0-1,1-2,2-3,
+;; each weight 1.0, total 3.0.  The edge SET is unique (the three weight-1
+;; edges) but the emit order is tie-break-dependent, so compare sorted.
+(asc (at MstDia '_src))                            -- [0 1 2]
+(asc (at MstDia '_dst))                            -- [1 2 3]
+(sum (at MstDia '_weight))                          -- 3.0
 
 ;; ---------------------------------------------------------------------
 ;; (42) Louvain on a small bidirectional clique TriBi — exercises the
@@ -461,6 +492,8 @@
 ;; ---------------------------------------------------------------------
 (set LovMix (.graph.louvain Mix 5))
 (count LovMix)                                      -- 3
+;; Mix (0->1->2->1) is one connected blob -> a single community label.
+(count (distinct (at LovMix '_community)))          -- 1
 
 ;; ---------------------------------------------------------------------
 ;; (44) PageRank 3-arg form: explicit iters AND damping.  Exercises the
@@ -469,6 +502,10 @@
 ;; ---------------------------------------------------------------------
 (set PrTri (.graph.pagerank Tri3 20 0.75))
 (count PrTri)                                       -- 3
+;; Symmetric 3-cycle -> ranks are equal and sum to ~1 (normalised).
+(>= (sum (at PrTri '_rank)) 0.99)                   -- true
+(<= (sum (at PrTri '_rank)) 1.01)                   -- true
+(< (- (max (at PrTri '_rank)) (min (at PrTri '_rank))) 0.001) -- true
 
 ;; ---------------------------------------------------------------------
 ;; (45) PageRank on TriBi where each node has bidirectional edges —
@@ -489,6 +526,7 @@
 (count CcK4)                                        -- 4
 ;; All 4 nodes have coefficient 1.0 in the clique.
 (== (min (at CcK4 '_coefficient)) (max (at CcK4 '_coefficient))) -- true
+(at CcK4 '_coefficient)                             -- [1.0 1.0 1.0 1.0]
 
 ;; ---------------------------------------------------------------------
 ;; (47) Betweenness with sample==1 on a path — single source.  This is
@@ -523,6 +561,9 @@
 ;; 0 can reach 1 only.  Dijkstra from 0: reachable={0,1}.
 (set DjDis (.graph.dijkstra Disjoint 0))
 (count DjDis)                                       -- 2
+;; Only 0 (dist 0) and 1 (dist 1) are reachable; 2,3 are a separate component.
+(at DjDis '_node)                                  -- [0 1]
+(at DjDis '_dist)                                  -- [0.0 1.0]
 ;; Explicit dst=3 with early-exit but unreachable still returns reachable
 ;; set (Dijkstra emits all dist < INF found so far).
 (set DjDisD (.graph.dijkstra Disjoint 0 3))
@@ -542,12 +583,18 @@
 ;; ---------------------------------------------------------------------
 (set CloDis (.graph.closeness Disjoint))
 (count CloDis)                                      -- 4
+;; Each node reaches exactly its one component-peer at distance 1 ->
+;; closeness 1/(1) normalised = 1.0 for all four nodes.
+(at CloDis '_centrality)                            -- [1.0 1.0 1.0 1.0]
 ;; All nodes have at least one neighbor here, so all closeness > 0.
 ;; Build a truly isolated-node graph by adding a self-loop on 0 only.
 (set IsoE (table [src dst w] (list [0 1] [0 1] [1.0 1.0])))
 (set Iso (.graph.build IsoE 'src 'dst 'w))
 (set CloIso (.graph.closeness Iso))
 (count CloIso)                                      -- 2
+;; Each node only self-loops -> no other node reachable -> closeness 0.0,
+;; exercising the `reachable > 0` False branch.
+(at CloIso '_centrality)                            -- [0.0 0.0]
 
 ;; =====================================================================
 ;; Cleanup

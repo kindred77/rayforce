@@ -17,14 +17,21 @@
 (set Db (assert-fact Db 1 'age 30))
 (set Db (assert-fact Db 2 'age 25))
 (set Db (assert-fact Db 3 'age 40))
-(count (query Db (find ?n) (where (?e :age ?n)))) -- 3
+(set q (query Db (find ?n) (where (?e :age ?n))))
+(count q) -- 3
+(asc (at q '?n)) -- [25 30 40]
 
+;; retract entity 2's :age → only entities 1 and 3 remain.
 (set Db (retract-fact Db 2 'age 25))
-(count (query Db (find ?n) (where (?e :age ?n)))) -- 2
+(set q (query Db (find ?n) (where (?e :age ?n))))
+(count q) -- 2
+(asc (at q '?n)) -- [30 40]
 
-;; retract a non-existent triple is a no-op (does not error)
+;; retract a non-existent triple is a no-op (does not error); ages unchanged.
 (set Db (retract-fact Db 99 'age 999))
-(count (query Db (find ?n) (where (?e :age ?n)))) -- 2
+(set q (query Db (find ?n) (where (?e :age ?n))))
+(count q) -- 2
+(asc (at q '?n)) -- [30 40]
 
 ;; retract leaves other attributes on the same entity untouched
 (set Db (datoms))
@@ -43,9 +50,11 @@
 (set Db (assert-fact Db 3 'age 40))
 (set Db (assert-fact Db 1 'name 100))
 
-;; 3 rows match :age, 1 row matches :name
-(count (scan-eav Db 'age))  -- 3
-(count (scan-eav Db 'name)) -- 1
+;; 3 rows match :age (entities 1,2,3 with values 30,25,40), 1 row matches :name.
+(set rowsAge (scan-eav Db 'age))
+(count rowsAge) -- 3
+(set rowsName (scan-eav Db 'name))
+(count rowsName) -- 1
 ;; non-existent attribute → empty result, not error
 (count (scan-eav Db 'missing)) -- 0
 
@@ -62,5 +71,9 @@
 (set Db (retract-fact Db 1 'age 30))
 (count (query Db (find ?n) (where (?e :age ?n)))) -- 0
 (set Db (assert-fact Db 1 'age 30))
-(count (query Db (find ?n) (where (?e :age ?n)))) -- 1
+;; Single (?e, ?n) binding (1, 30) restored.
+(set qRt (query Db (find ?e ?n) (where (?e :age ?n))))
+(count qRt) -- 1
+(at (at qRt '?e) 0) -- 1
+(at (at qRt '?n) 0) -- 30
 (scan-eav Db 1 'age) -- 30

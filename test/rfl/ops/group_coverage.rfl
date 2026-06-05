@@ -42,6 +42,8 @@
 (count (select {s: (stddev_pop v) from: Tone by: g})) -- 4
 ;; var_pop on a single value is 0; sum across 4 groups is 0
 (sum (at (select {v: (var_pop v) from: Tone by: g}) 'v)) -- 0.0
+;; stddev_pop on single values also 0.
+(sum (at (select {s: (stddev_pop v) from: Tone by: g}) 's)) -- 0.0
 
 ;; ────────────── 3. F64 key — forces HT path (DA rejects F64) ──────────────
 ;; group.c:2621 lists DA-eligible types; RAY_F64 is not in it, so float

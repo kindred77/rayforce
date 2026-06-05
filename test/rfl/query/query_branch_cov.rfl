@@ -579,10 +579,29 @@
 ;; Lone-time key (un-partitioned) — query.c:11588 nkeys==1 → n_eq=0.
 (set ajLflat (table [Time Price] (list [10:00:01.000 10:00:02.000 10:00:03.000] [100.0 200.0 300.0])))
 (set ajRflat (table [Time Bid]   (list [10:00:00.500 10:00:01.500 10:00:02.500] [98.0 102.0 105.0])))
-(count (asof-join [Time] ajLflat ajRflat)) -- 3
-(at (at (asof-join [Time] ajLflat ajRflat) 'Bid) 0) -- 98.0
+(set ajFlat (asof-join [Time] ajLflat ajRflat))
+(count ajFlat) -- 3
+;; left columns preserved
+(at ajFlat 'Time) -- [10:00:01.000 10:00:02.000 10:00:03.000]
+(at ajFlat 'Price) -- [100.0 200.0 300.0]
+;; asof-join picks the most recent quote at-or-before each trade:
+;;   trade @10:00:01 → quote @10:00:00.5 = 98.0
+;;   trade @10:00:02 → quote @10:00:01.5 = 102.0
+;;   trade @10:00:03 → quote @10:00:02.5 = 105.0
+(at ajFlat 'Bid) -- [98.0 102.0 105.0]
 ;; Equality + time key (Sym + Time).
-(count (asof-join [Sym Time] ajL ajR)) -- 3
+;; ajL: Sym ∈ {x,y,x} @ 10:00:01,02,03 with prices 100,200,300.
+;; ajR: Sym x @ 10:00:00 → 99, x @ 10:00:02.5 → 105, y @ 10:00:01.5 → 199.
+;; Per-Sym asof:
+;;   (x, 10:00:01) → quote x @10:00:00 = 99
+;;   (y, 10:00:02) → quote y @10:00:01.5 = 199
+;;   (x, 10:00:03) → quote x @10:00:02.5 = 105
+(set ajEq (asof-join [Sym Time] ajL ajR))
+(count ajEq) -- 3
+;; The order of result rows must mirror left's order (Sym=x,y,x).
+(at ajEq 'Sym)   -- [x y x]
+(at ajEq 'Price) -- [100.0 200.0 300.0]
+(at ajEq 'Bid)   -- [99.0 199.0 105.0]
 ;; Arity errors (11576).
 (asof-join [Time] ajL) !- arity
 ;; First arg must be a SYM list with ≥1 element (11588).  A string is
@@ -809,14 +828,27 @@
 ;; intervals = per-left-row [lo hi] time window (in nanoseconds offset
 ;; via map-left + to each left Time).
 (set wjIv (map-left + [-2000 2000] (at wjL 'Time)))
+;; Window [-2000ns, +2000ns] around each left Time:
+;;   (x, 10:00:01) ∩ window 09:59:59..10:00:03 — x-bids @00.5, @02.5 → {99, 101}
+;;   (y, 10:00:02) ∩ window 10:00:00..10:00:04 — y-bids @01.5, @02.5 → {199, 201}
+;;   (x, 10:00:03) ∩ window 10:00:01..10:00:05 — x-bid  @02.5      → {101}
 ;; agg dict with min agg.
-(count (window-join [Sym Time] wjIv wjL wjR {mb: (min Bid)})) -- 3
+(set wjMin (window-join [Sym Time] wjIv wjL wjR {mb: (min Bid)}))
+(count wjMin) -- 3
+(at wjMin 'mb) -- [99.0 199.0 101.0]
 ;; agg dict with multiple aggs.
-(count (window-join [Sym Time] wjIv wjL wjR {mb: (min Bid) xb: (max Bid)})) -- 3
+(set wjMx (window-join [Sym Time] wjIv wjL wjR {mb: (min Bid) xb: (max Bid)}))
+(count wjMx) -- 3
+(at wjMx 'mb) -- [99.0 199.0 101.0]
+(at wjMx 'xb) -- [101.0 201.0 101.0]
 ;; agg dict with avg.
-(count (window-join [Sym Time] wjIv wjL wjR {av: (avg Bid)})) -- 3
+(set wjAvg (window-join [Sym Time] wjIv wjL wjR {av: (avg Bid)}))
+(count wjAvg) -- 3
+(at wjAvg 'av) -- [100.0 200.0 101.0]
 ;; agg dict with count (no source read).
-(count (window-join [Sym Time] wjIv wjL wjR {n: (count Bid)})) -- 3
+(set wjCnt (window-join [Sym Time] wjIv wjL wjR {n: (count Bid)}))
+(count wjCnt) -- 3
+(at wjCnt 'n) -- [2 2 1]
 ;; arity error.
 (window-join [Sym Time] wjL wjR) !- domain
 
@@ -836,7 +868,18 @@
 ;; ====================================================================
 (set ajLm (table [Cust Sym Time Price] (list ['A 'A 'B] ['x 'y 'x] [10:00:01.000 10:00:02.000 10:00:03.000] [100.0 200.0 300.0])))
 (set ajRm (table [Cust Sym Time Bid]   (list ['A 'A 'B] ['x 'x 'x] [10:00:00.500 10:00:02.500 10:00:02.000] [99.0 105.0 299.0])))
-(count (asof-join [Cust Sym Time] ajLm ajRm)) -- 3
+;; Two equality keys: (Cust, Sym):
+;;   (A, x, 10:00:01) → quote (A,x) @10:00:00.5 = 99
+;;   (A, y, 10:00:02) → no (A,y) quote → Null
+;;   (B, x, 10:00:03) → quote (B,x) @10:00:02.0 = 299
+(set ajMk (asof-join [Cust Sym Time] ajLm ajRm))
+(count ajMk) -- 3
+(at ajMk 'Cust) -- [A A B]
+(at ajMk 'Sym)  -- [x y x]
+;; row 1 has no prior (A,y) quote → null Bid
+(at (at ajMk 'Bid) 0) -- 99.0
+(nil? (at (at ajMk 'Bid) 1)) -- true
+(at (at ajMk 'Bid) 2) -- 299.0
 
 ;; ====================================================================
 ;; §41  count(distinct) over a computed inner expression — falls outside
@@ -986,7 +1029,16 @@
 ;; ====================================================================
 (set ajLd (table [Cust Day Price] (list [1 1 2 2 3] [2024.01.01 2024.01.05 2024.01.02 2024.01.06 2024.01.03] [100 200 300 400 500])))
 (set ajRd (table [Cust Day Rate]  (list [1 1 2 2 3] [2024.01.01 2024.01.04 2024.01.01 2024.01.05 2024.01.02] [10 20 30 40 50])))
-(count (asof-join [Cust Day] ajLd ajRd)) -- 5
+;; Per (Cust, Day) asof lookup:
+;;   (1, 2024.01.01) → (1, 2024.01.01)=10
+;;   (1, 2024.01.05) → (1, 2024.01.04)=20
+;;   (2, 2024.01.02) → (2, 2024.01.01)=30
+;;   (2, 2024.01.06) → (2, 2024.01.05)=40
+;;   (3, 2024.01.03) → (3, 2024.01.02)=50
+(set ajCd (asof-join [Cust Day] ajLd ajRd))
+(count ajCd) -- 5
+(at ajCd 'Rate)  -- [10 20 30 40 50]
+(at ajCd 'Price) -- [100 200 300 400 500]
 
 ;; ====================================================================
 ;; §55  More unsorted_positive_take_limit code paths — negative take

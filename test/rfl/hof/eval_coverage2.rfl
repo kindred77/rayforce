@@ -10,6 +10,10 @@
 ;; sym-name over a sym vec → each element is a STR atom → boxed list
 (set syms_v (as 'SYM ['a 'b 'c]))
 (count (map sym-name syms_v)) -- 3
+;; value check: sym-name of each element is the sym name itself
+(at (map sym-name syms_v) 0) -- 'a
+(at (map sym-name syms_v) 1) -- 'b
+(at (map sym-name syms_v) 2) -- 'c
 
 ;; empty list (len==0) path for atomic_map_unary → returns typed empty vec
 (count (map neg [])) -- 0
@@ -140,8 +144,10 @@ lz_let -- 60
 (f_apply_bin * 5 6) -- 30
 (f_apply_bin - 10 3) -- 7
 
-;; apply with vectors
+;; apply with vectors: element-wise + over the two vectors
 (at (f_apply_bin + [1 2 3] [10 20 30]) 0) -- 11
+(at (f_apply_bin + [1 2 3] [10 20 30]) 1) -- 22
+(at (f_apply_bin + [1 2 3] [10 20 30]) 2) -- 33
 
 ;; ═══════════════════════════════════════════════════════════════════
 ;; 11. materialize_owned_args lazy path (line 119 in eval.c)
@@ -179,6 +185,10 @@ lz_let -- 60
 ;; Verify elements are syms (sym-name returns sym atoms)
 (type (at names_out 0)) -- 'sym
 (type (at names_out 2)) -- 'sym
+;; value check: each boxed element is the corresponding sym name
+(at names_out 0) -- 'hello
+(at names_out 1) -- 'world
+(at names_out 2) -- 'foo
 
 ;; Error in element function during boxed-list atomic_map_unary
 ;; (error path lines 1013-1017 in eval.c)
@@ -227,8 +237,10 @@ lz_let -- 60
 ;; ═══════════════════════════════════════════════════════════════════
 (set err_map_fn (fn [x] (if (== x 2) (raise x) (* x 10))))
 (try (map err_map_fn [1 2 3]) (fn [e] -1)) -- -1
-;; Successful case (all elements pass):
+;; Successful case (all elements pass): map applies x*10 to each element
 (at (map err_map_fn [1 3 5]) 0) -- 10
+(at (map err_map_fn [1 3 5]) 1) -- 30
+(at (map err_map_fn [1 3 5]) 2) -- 50
 
 ;; ═══════════════════════════════════════════════════════════════════
 ;; 20. Restricted-mode: fn_is_restricted path (line 1030/1058)

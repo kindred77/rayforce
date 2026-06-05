@@ -29,14 +29,20 @@
 ;; ══════════════════════════════════════
 ;; distinct on list with sym atoms
 (count (distinct (list 'a 'b 'a 'c 'b))) -- 3
+;; verify first-occurrence dedup order on sym list
+(distinct (list 'a 'b 'a 'c 'b)) -- (list 'a 'b 'c)
 ;; distinct on list with str atoms
 (count (distinct (list "foo" "bar" "foo" "baz"))) -- 3
+(distinct (list "foo" "bar" "foo" "baz")) -- (list "foo" "bar" "baz")
 ;; distinct on list with numeric atoms
 (count (distinct (list 1 2 1 3 2))) -- 3
+(distinct (list 1 2 1 3 2)) -- (list 1 2 3)
 ;; union of two lists
 (count (union (list 1 2 3) (list 2 3 4))) -- 4
+(union (list 1 2 3) (list 2 3 4)) -- (list 1 2 3 4)
 ;; except of lists
 (count (except (list 1 2 3 4) (list 2 4))) -- 2
+(except (list 1 2 3 4) (list 2 4)) -- (list 1 3)
 
 ;; ══════════════════════════════════════
 ;; 3. sect — boxed list fallback (lines 1149-1174)
@@ -126,6 +132,9 @@
 (set d (dict [a b c d e] [1 2 3 4 5]))
 (count (key (take d [1 2]))) -- 2
 (at (value (take d [1 2])) 0) -- 2
+;; verify the actual key bytes are 'b 'c (range take starting at idx 1)
+(at (key (take d [1 2])) 0) -- 'b
+(at (key (take d [1 2])) 1) -- 'c
 
 ;; ══════════════════════════════════════
 ;; 14. take — range take on vec with null bitmap (lines 1251-1254)
@@ -192,6 +201,8 @@
 (count (distinct ["cc" "aa" "bb" "aa" "cc"])) -- 3
 (at (distinct ["cc" "aa" "bb" "aa" "cc"]) 0) -- "cc"
 (count (distinct ["x" "y" "z" "x" "y"])) -- 3
+;; verify deduped first-occurrence order
+(distinct ["x" "y" "z" "x" "y"]) -- ["x" "y" "z"]
 
 ;; ══════════════════════════════════════
 ;; 22. Timestamp hs_hash_row — RAY_TIMESTAMP in typed vec ops
@@ -206,7 +217,15 @@
 ;; 23. union typed vec — large union triggers hashset_grow
 ;; ══════════════════════════════════════
 (count (union (til 50) [100 200 300])) -- 53
+;; verify the appended elements made it in (last 3 are from RHS)
+(at (union (til 50) [100 200 300]) 50) -- 100
+(at (union (til 50) [100 200 300]) 52) -- 300
 (count (union (til 100) (til 200))) -- 200
+;; union(til 100, til 200) keeps til-100's order then appends 100..199
+(at (union (til 100) (til 200)) 0) -- 0
+(at (union (til 100) (til 200)) 99) -- 99
+(at (union (til 100) (til 200)) 100) -- 100
+(at (union (til 100) (til 200)) 199) -- 199
 
 ;; ══════════════════════════════════════
 ;; 24. in — empty collection val (line 848)
@@ -286,8 +305,12 @@
 ;; 34. group — various types
 ;; ══════════════════════════════════════
 (count (key (group [1.0 2.0 1.0 3.0]))) -- 3
+;; verify the actual distinct key values (group preserves first-occurrence)
+(key (group [1.0 2.0 1.0 3.0])) -- [1.0 2.0 3.0]
 (count (key (group [true false true]))) -- 2
+(key (group [true false true])) -- [true false]
 (count (key (group [1h 2h 1h]))) -- 2
+(key (group [1h 2h 1h])) -- [1h 2h]
 
 ;; ══════════════════════════════════════
 ;; 35. raze — flatten nested list

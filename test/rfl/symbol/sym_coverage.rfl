@@ -94,9 +94,18 @@
 (set _T2 (.csv.splayed "/tmp/rfl_sym_cov.csv" "/tmp/rfl_sym_cov_bulk/"))
 (count _T2) -- 5
 (type (at _T2 's)) -- 'SYM
+;; Value-check the ingested syms (a wrong intern would pass count/type silently).
+(at (at _T2 's) 0) -- 'abc.
+(at (at _T2 's) 1) -- '.foo
+(at (at _T2 's) 2) -- '.foo.bar
+(at (at _T2 's) 3) -- 'a..b
+(at (at _T2 's) 4) -- 'x.y.z
 (set _R2 (.db.splayed.get "/tmp/rfl_sym_cov_bulk/"))
 (count _R2) -- 5
 (at _R2 's) -- (at _T2 's)
+;; Reload values explicitly (not just vector-equal to the ingest).
+(at (at _R2 's) 0) -- 'abc.
+(at (at _R2 's) 4) -- 'x.y.z
 (.sys.exec "rm -f /tmp/rfl_sym_cov.csv; rm -rf /tmp/rfl_sym_cov_bulk") -- 0
 
 ;; ═══════════════════════════════════════════════════════════════════
@@ -160,6 +169,15 @@
 (set _T8 (.csv.read [I64 SYMBOL] "/tmp/rfl_sym_cov_w16.csv"))
 (count _T8) -- 260
 (type (at _T8 's)) -- 'SYM
+;; Value-check the interned syms across the hash-grow: a wrong id/width with
+;; the right count would otherwise pass silently.
+(at (at _T8 's) 0) -- 'sym1
+(at (at _T8 's) 42) -- 'sym43
+(at (at _T8 's) 259) -- 'sym260
+;; Lexicographic min/max (k/q SYM order, NOT intern order): "sym1" is least;
+;; "sym99" is greatest because '9' > '2'/'1' at the 4th char.
+(min (at _T8 's)) -- 'sym1
+(max (at _T8 's)) -- 'sym99
 (.sys.exec "rm -f /tmp/rfl_sym_cov_w16.csv") -- 0
 
 ;; ═══════════════════════════════════════════════════════════════════
@@ -217,6 +235,11 @@
 (set _d8 (distinct (at _Tw8 's)))
 (count _d8) -- 3
 (type _d8) -- 'SYM
+;; distinct preserves first-appearance order for SYM: red, blue, green.
+(distinct (at _Tw8 's)) -- ['red 'blue 'green]
+;; Lexicographic min/max on the narrow-width SYM column (not intern order).
+(min (at _Tw8 's)) -- 'blue
+(max (at _Tw8 's)) -- 'red
 
 ;; Sort the narrow SYM column (radix path; SYM encode uses ray_read_sym)
 (set _a8 (asc (at _Tw8 's)))

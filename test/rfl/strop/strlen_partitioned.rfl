@@ -48,6 +48,9 @@
 ;; Result has one entry per row: 3 rows in "1.2.3" (len 5) +
 ;; 2 rows in "4.5.67" (len 6) → [5 5 5 6 6].
 (count (strlen (at Pmc 'part))) -- 5
+;; Full per-row value-check (closes the gap at index 1, asserts ordering):
+;; "1.2.3"×3 then "4.5.67"×2 → [5 5 5 6 6].
+(strlen (at Pmc 'part)) -- [5 5 5 6 6]
 (sum (strlen (at Pmc 'part))) -- 27
 (at (strlen (at Pmc 'part)) 0) -- 5
 (at (strlen (at Pmc 'part)) 2) -- 5
@@ -78,6 +81,8 @@
 (first (key Pml)) -- 'part
 
 (count (strlen (at Pml 'part))) -- 6
+;; "1.2.3"×1, "12.3"×2, "9.87"×3 → [5 4 4 4 4 4].
+(strlen (at Pml 'part)) -- [5 4 4 4 4 4]
 (sum (strlen (at Pml 'part))) -- 25
 ;; Sorted dir order is ["1.2.3", "12.3", "9.87"].
 (at (strlen (at Pml 'part)) 0) -- 5
@@ -111,6 +116,8 @@
 
 ;; strlen on the parted SYM column — exercises strlen_parted.
 (count (strlen (at Pps 'tag))) -- 5
+;; ['alpha 'beta] ++ ['gamma 'delta 'eps] → [5 4 5 5 3].
+(strlen (at Pps 'tag)) -- [5 4 5 5 3]
 (sum (strlen (at Pps 'tag))) -- 22
 (at (strlen (at Pps 'tag)) 0) -- 5
 (at (strlen (at Pps 'tag)) 1) -- 4
@@ -138,6 +145,8 @@
 (count Ppd) -- 3
 ;; 'tag is the parted SYM column.
 (count (strlen (at Ppd 'tag))) -- 3
+;; ['onesym] ++ ['ab 'cdefgh] → [6 2 6].
+(strlen (at Ppd 'tag)) -- [6 2 6]
 (sum (strlen (at Ppd 'tag))) -- 14
 (at (strlen (at Ppd 'tag)) 0) -- 6
 (at (strlen (at Ppd 'tag)) 1) -- 2
@@ -166,6 +175,7 @@
 (count (strlen (at Ppi 'tag))) -- 6
 ;; Lexical sort: "10", "200", "300" → ['hi 'bye 'hello 'x 'yy 'zzz]
 ;; Lengths: [2 3 5 1 2 3], sum = 16.
+(strlen (at Ppi 'tag)) -- [2 3 5 1 2 3]
 (sum (strlen (at Ppi 'tag))) -- 16
 (at (strlen (at Ppi 'tag)) 0) -- 2
 (at (strlen (at Ppi 'tag)) 1) -- 3

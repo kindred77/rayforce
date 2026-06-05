@@ -34,6 +34,11 @@
 (count (select {m: (med v) by: g from: Tmed})) -- 3
 (sum (at (select {m: (med v) by: g from: Tmed}) 'm)) -- 140.0
 (type (at (select {m: (med v) by: g from: Tmed}) 'm)) -- 'F64
+;; per-group value checks (sum alone can mask a value swap): groups
+;; emit in first-appearance order [0 1 2] → medians [30.0 10.0 100.0].
+(at (at (select {m: (med v) by: g from: Tmed}) 'm) 0) -- 30.0
+(at (at (select {m: (med v) by: g from: Tmed}) 'm) 1) -- 10.0
+(at (at (select {m: (med v) by: g from: Tmed}) 'm) 2) -- 100.0
 
 
 ;; ─── median per group: F64 value ────────────────────────────────────
@@ -66,6 +71,11 @@
 (set Tmm (table [id1 id2 v] (list [A A B B B A] [X Y X Y X Y] (as 'F64 [10.0 20.0 30.0 40.0 50.0 60.0]))))
 (count (select {m: (med v) by: [id1 id2] from: Tmm})) -- 4
 (sum (at (select {m: (med v) by: [id1 id2] from: Tmm}) 'm)) -- 130.0
+;; per-group values (sum 130 = 10+40+40+40 — the lone (A,X) group at
+;; 10.0 is what distinguishes a correct scatter from one that mis-bins).
+;; Group order is first-appearance [(A,X)(A,Y)(B,X)(B,Y)] → [10 40 40 40].
+(at (at (select {m: (med v) by: [id1 id2] from: Tmm}) 'm) 0) -- 10.0
+(at (at (select {m: (med v) by: [id1 id2] from: Tmm}) 'm) 3) -- 40.0
 
 
 ;; ─── top-K / bot-K per group via SYM key (LIST-cell path) ───────────
@@ -107,6 +117,10 @@
 (type (at (at (select {t: (top v 2) by: k from: Ttopf}) 't) 0)) -- 'F64
 ;; top-2 sum = (5.5+3.5) + (7.5+2.5) + (9.5+8.5) = 9 + 10 + 18 = 37.0
 (sum (raze (at (select {t: (top v 2) by: k from: Ttopf}) 't))) -- 37.0
+;; per-cell element check (sum can mask which values land in which cell):
+;; group A cell = [5.5 3.5] descending; assert its largest element.
+(at (at (at (select {t: (top v 2) by: k from: Ttopf}) 't) 0) 0) -- 5.5
+(at (at (at (select {t: (top v 2) by: k from: Ttopf}) 't) 0) 1) -- 3.5
 
 
 ;; ─── variance / stddev per group: canonical Wikipedia fixture ───────
@@ -124,6 +138,10 @@
 ;; Population variance / stddev — exact integer answers.
 (sum (at (select {v: (var_pop v) by: g from: Tvar}) 'v))    -- 8.0
 (sum (at (select {v: (stddev_pop v) by: g from: Tvar}) 'v)) -- 4.0
+;; per-group value (both groups identical Wikipedia fixture → 4.0 each;
+;; assert one group directly so a single bad group can't hide in the sum).
+(at (at (select {v: (var_pop v) by: g from: Tvar}) 'v) 0)    -- 4.0
+(at (at (select {v: (stddev_pop v) by: g from: Tvar}) 'v) 1) -- 2.0
 ;; Bug 5 (now fixed): `dev` in select-by used to map to OP_STDDEV
 ;; (sample) while scalar `dev` is OP_STDDEV_POP (population).  The
 ;; one-line fix at src/ops/query.c:316 aligns the planner mapping so
@@ -209,6 +227,15 @@
 (set Tms2r (select {m: (med v) s: (stddev v) by: [id1 id2] from: Tms2}))
 (count Tms2r) -- 4
 (sum (at Tms2r 'm)) -- 106.0
+;; per-group medians are {25 26 27 28} — close, contiguous values a sum
+;; check (106) cannot disambiguate from a permutation.  NOTE: this 2-key
+;; med+stddev fast path emits groups in hash-bucket order
+;; [(B,Y)(A,Y)(B,X)(A,X)] → [28 26 27 25], NOT first-appearance; pin the
+;; values at the keyed positions so a wrong per-group median is caught.
+(at (at Tms2r 'm) 0) -- 28.0
+(at (at Tms2r 'm) 3) -- 25.0
+(at (at Tms2r 'id1) 0) -- 'B
+(at (at Tms2r 'id2) 0) -- 'Y
 (< (abs (- (sum (at Tms2r 's)) (* 4.0 12.909944487358056))) 0.000001) -- true
 
 
@@ -280,6 +307,13 @@
 (count (select {m: (med v) by: [g h] from: Tmmi})) -- 4
 (sum (at (select {m: (med v) by: [g h] from: Tmmi}) 'm)) -- 115.0
 (sum (at (select {v: (var_pop v) by: [g h] from: Tmmi}) 'v)) -- 375.0
+;; per-group value checks (group order first-appearance
+;; [(0,0)(0,1)(1,0)(1,1)] → med [5 10 30 70], var_pop [0 0 100 275]).
+;; The (1,1) group [60 80 100 60] is the discriminating one: median 70
+;; (mean-of-two-middles: sort 60,60,80,100 → (60+80)/2), var_pop 275.
+(at (at (select {m: (med v) by: [g h] from: Tmmi}) 'm) 3) -- 70.0
+(at (at (select {v: (var_pop v) by: [g h] from: Tmmi}) 'v) 2) -- 100.0
+(at (at (select {v: (var_pop v) by: [g h] from: Tmmi}) 'v) 3) -- 275.0
 
 
 ;; ─── ties: median of duplicate-only group equals that value ─────────

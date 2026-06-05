@@ -94,23 +94,39 @@
 (set Tgmk (table [a b c v] (list ['X 'X 'Y 'Y] [1 2 1 2] ['p 'q 'p 'q] [10 20 30 40])))
 (set Pgmk (pivot Tgmk ['a 'b] 'c 'v (fn [xs] (sum xs))))
 (count Pgmk) -- 4
+;; Index columns survive verbatim; pivot columns p/q carry the summed
+;; values with zero-fill where the (a,b,c) combination never occurred.
+(at Pgmk 'a) -- ['X 'X 'Y 'Y]
+(at Pgmk 'b) -- [1 2 1 2]
+(at Pgmk 'p) -- [10 0 30 0]
+(at Pgmk 'q) -- [0 20 0 40]
 
 ;; Pivot column = i64 vec, lambda agg → fallback path that snprintfs the
 ;; i64 value into a column name ("col10" / "col20" via the i64 branch).
 (set Ti64 (table [k c v] (list ['A 'A 'B 'B] [10 20 10 20] [1 2 3 4])))
 (set Pii (pivot Ti64 'k 'c 'v (fn [xs] (sum xs))))
 (count Pii) -- 2
+;; Column names are the i64 values stringified ("10"/"20"); verify the
+;; cells landed in the right column (k=A→row0, k=B→row1).
+(at Pii '10) -- [1 3]
+(at Pii '20) -- [2 4]
 
 ;; Pivot column = bool vec via lambda → exercises the -RAY_BOOL → "true"/"false"
 ;; column-name branch in the unstack code.
 (set Tb (table [k c v] (list ['A 'A 'B 'B] [true false true false] [1 2 3 4])))
 (set Pb (pivot Tb 'k 'c 'v (fn [xs] (sum xs))))
 (count Pb) -- 2
+;; Column names are "true"/"false"; true→v=1/3, false→v=2/4.
+(at Pb 'true) -- [1 3]
+(at Pb 'false) -- [2 4]
 
 ;; Pivot column = f64 vec via lambda → exercises the f64 snprintf branch.
 (set Tf64p (table [k c v] (list ['A 'A 'B 'B] [1.5 2.5 1.5 2.5] [1 2 3 4])))
 (set Pf64p (pivot Tf64p 'k 'c 'v (fn [xs] (sum xs))))
 (count Pf64p) -- 2
+;; Column names are the f64 values stringified ("1.5"/"2.5").
+(at Pf64p '1.5) -- [1 3]
+(at Pf64p '2.5) -- [2 4]
 
 ;; ══════════════════════════════════════════════════════════════════
 ;; ray_modify_fn — error paths
@@ -276,10 +292,16 @@ tblop_tmp_x !- name
 ;; Distinct on a table with duplicate rows collapses them.
 (set Tdup (table [a b] (list [1 1 2 2 1] [10 10 20 20 10])))
 (count (distinct Tdup)) -- 2
+;; Surviving rows are the two unique (a,b) pairs in first-seen order.
+(at (distinct Tdup) 'a) -- [1 2]
+(at (distinct Tdup) 'b) -- [10 20]
 
 ;; A table with no duplicates is returned with all rows.
 (set Tunq (table [a b] (list [1 2 3] [10 20 30])))
 (count (distinct Tunq)) -- 3
+;; All three rows preserved unchanged.
+(at (distinct Tunq) 'a) -- [1 2 3]
+(at (distinct Tunq) 'b) -- [10 20 30]
 
 ;; Type round-trip: `distinct` on a table returns a table.
 (type (distinct Tdup)) -- 'TABLE

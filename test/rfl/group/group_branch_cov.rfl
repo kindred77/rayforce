@@ -105,6 +105,10 @@
 (count Rdk2) -- 2
 (type (at Rdk2 'k)) -- 'DATE
 (sum (at Rdk2 't)) -- 60
+;; verify the actual DATE key values survive (order-independent: sum of
+;; source dates equals sum of result dates × number of duplicate rows).
+(min (at Rdk2 'k)) -- (as 'DATE 7305)
+(max (at Rdk2 'k)) -- (as 'DATE 7306)
 
 ;; TIME key (I32-width arm).
 (set Ttk2 (table [k v] (list (as 'TIME [1000 1000 2000 2000]) (as 'I64 [5 10 15 20]))))
@@ -113,6 +117,9 @@
 (type (at Rtk2 'k)) -- 'TIME
 ;; bot-1: min v per group → 5, 15
 (sum (at Rtk2 't)) -- 20
+;; verify actual TIME key values survived (the two distinct keys are 1000ms and 2000ms)
+(min (at Rtk2 'k)) -- (as 'TIME 1000)
+(max (at Rtk2 'k)) -- (as 'TIME 2000)
 
 ;; TIMESTAMP key (I64-width arm).
 (set Ttsk2 (table [k v] (list (as 'TIMESTAMP [100 100 200 200 300]) (as 'I64 [1 2 3 4 5]))))
@@ -121,6 +128,9 @@
 (type (at Rtsk2 'k)) -- 'TIMESTAMP
 ;; top-1 per ts group → 2,4,5 ; sum=11
 (sum (at Rtsk2 't)) -- 11
+;; verify actual TIMESTAMP key bytes survive
+(min (at Rtsk2 'k)) -- (as 'TIMESTAMP 100)
+(max (at Rtsk2 'k)) -- (as 'TIMESTAMP 300)
 
 ;; ════════════════════════════════════════════════════════════════════
 ;; 5. grpt rowform — I16 / U8 / BOOL KEY (grpt_key_read narrow arms)
@@ -130,6 +140,11 @@
 (count Ri16k2) -- 3
 (type (at Ri16k2 'k)) -- 'I16
 (sum (at Ri16k2 't)) -- 11
+;; verify the actual I16 key values: distinct keys are 10, 20, 30
+(min (at Ri16k2 'k)) -- (as 'I16 10)
+(max (at Ri16k2 'k)) -- (as 'I16 30)
+;; sum widens to I64 (carry-overflow safe).
+(sum (at Ri16k2 'k)) -- 60
 
 (set Tu8k2 (table [k v] (list (as 'U8 [1 1 2 2 3]) (as 'I64 [10 20 30 40 50]))))
 (set Ru8k2 (select {t: (bot v 1) by: k from: Tu8k2}))
@@ -137,6 +152,11 @@
 (type (at Ru8k2 'k)) -- 'U8
 ;; bot-1 per group → 10,30,50 ; sum=90
 (sum (at Ru8k2 't)) -- 90
+;; verify the actual U8 key bytes: distinct keys are 1, 2, 3
+(min (at Ru8k2 'k)) -- (as 'U8 1)
+(max (at Ru8k2 'k)) -- (as 'U8 3)
+;; sum widens to I64 (carry-overflow safe).
+(sum (at Ru8k2 'k)) -- 6
 
 (set Tboolk2 (table [k v] (list (as 'BOOL [true false true false true]) (as 'I64 [1 2 3 4 5]))))
 (set Rboolk2 (select {t: (top v 1) by: k from: Tboolk2}))
@@ -260,6 +280,12 @@
 (set Rtspar (select {t: (top v 1) by: k from: Ttspar}))
 (count Rtspar) -- 500
 (type (at Rtspar 'k)) -- 'TIMESTAMP
+;; distinct timestamps are 0..499; verify the actual key bytes survived
+(min (at Rtspar 'k)) -- (as 'TIMESTAMP 0)
+(max (at Rtspar 'k)) -- (as 'TIMESTAMP 499)
+;; top-1 per group keeps the last v in 0..19999 with v%500==k; row v=19500+k
+;; gives top-1, so sum of t = sum_{k=0..499}(19500+k) = 500*19500 + 124750 = 9874750.
+(sum (at Rtspar 't)) -- 9874750
 
 ;; ════════════════════════════════════════════════════════════════════
 ;; 13. grpt rowform — DATE value parallel (>=16384 rows, F64-vs-int arm)
@@ -270,6 +296,12 @@
 (set Rdvpar (select {t: (top v 1) by: k from: Tdvpar}))
 (count Rdvpar) -- 1000
 (type (at Rdvpar 't)) -- 'DATE
+;; key column is I64 0..999; sum = 999*1000/2 = 499500.
+(sum (at Rdvpar 'k)) -- 499500
+;; v column = DATE(7000 + i%365); over 20000 rows the value at index
+;; spans 7000..7364.  top-1 per k must pick a DATE in [7000,7364].
+(>= (min (at Rdvpar 't)) (as 'DATE 7000)) -- true
+(<= (max (at Rdvpar 't)) (as 'DATE 7364)) -- true
 
 ;; ════════════════════════════════════════════════════════════════════
 ;; 14. Per-(worker, partition) fused-radix HT direct-insert

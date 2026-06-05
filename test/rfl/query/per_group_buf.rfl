@@ -68,6 +68,13 @@
 ;; B: max(v1)=40 min(v2)=25 → 15
 ;; C: max(v1)=60 min(v2)=45 → 15
 (sum (at (select {r: (- (max v1) (min v2)) by: k from: Ta}) 'r)) -- 45
+;; Per-group value checks (order-independent, key-masked SOURCE lookup;
+;; the sum-45 total can't catch a value swapped between groups).
+(at (at (select {r: (- (max v1) (min v2)) by: k from: Ta where: (== k 'A)}) 'r) 0) -- 15
+(at (at (select {r: (- (max v1) (min v2)) by: k from: Ta where: (== k 'B)}) 'r) 0) -- 15
+(at (at (select {r: (- (max v1) (min v2)) by: k from: Ta where: (== k 'C)}) 'r) 0) -- 15
+(at (at (select {r: (- (max v1) (min v2)) by: k from: Ta where: (== k 'A)}) 'k) 0) -- 'A
+(at (at (select {r: (- (max v1) (min v2)) by: k from: Ta where: (== k 'C)}) 'k) 0) -- 'C
 
 ;; Multi-key by — forces use_eval_group → `nonagg_eval_per_group`
 ;; over the LIST<groups> layout.
@@ -79,6 +86,15 @@
 ;; (B,Y): v1=[40,80] max=80; v2=[4,8] min=4 → 76
 ;; Sum = 49+58+67+76 = 250
 (sum (at (select {r: (- (max v1) (min v2)) by: [g h] from: Tb}) 'r)) -- 250
+;; Per-group value checks (order-independent, key-masked SOURCE lookup;
+;; sum-250 total can't catch a value swapped between groups).  Multi-key
+;; SYM-vector grouping under where: — WATCH-FOR site (may ignore where:).
+(at (at (select {r: (- (max v1) (min v2)) by: [g h] from: Tb where: (and (== g 'A) (== h 'X))}) 'r) 0) -- 49
+(at (at (select {r: (- (max v1) (min v2)) by: [g h] from: Tb where: (and (== g 'A) (== h 'Y))}) 'r) 0) -- 58
+(at (at (select {r: (- (max v1) (min v2)) by: [g h] from: Tb where: (and (== g 'B) (== h 'X))}) 'r) 0) -- 67
+(at (at (select {r: (- (max v1) (min v2)) by: [g h] from: Tb where: (and (== g 'B) (== h 'Y))}) 'r) 0) -- 76
+(at (at (select {r: (- (max v1) (min v2)) by: [g h] from: Tb where: (and (== g 'A) (== h 'X))}) 'g) 0) -- 'A
+(at (at (select {r: (- (max v1) (min v2)) by: [g h] from: Tb where: (and (== g 'A) (== h 'X))}) 'h) 0) -- 'X
 
 ;; F64 arithmetic-of-aggregates per group — same routing, F64 typed
 ;; vec result.
@@ -88,6 +104,13 @@
 ;; B: max(y)=8, min(x)=3 → 5
 ;; C: max(y)=12, min(x)=5 → 7
 (sum (at (select {r: (- (max y) (min x)) by: k from: Tf}) 'r)) -- 15.0
+;; Per-group value checks (order-independent, key-masked SOURCE lookup;
+;; F64, exact since values are integral).
+(at (at (select {r: (- (max y) (min x)) by: k from: Tf where: (== k 'A)}) 'r) 0) -- 3.0
+(at (at (select {r: (- (max y) (min x)) by: k from: Tf where: (== k 'B)}) 'r) 0) -- 5.0
+(at (at (select {r: (- (max y) (min x)) by: k from: Tf where: (== k 'C)}) 'r) 0) -- 7.0
+(at (at (select {r: (- (max y) (min x)) by: k from: Tf where: (== k 'A)}) 'k) 0) -- 'A
+(at (at (select {r: (- (max y) (min x)) by: k from: Tf where: (== k 'C)}) 'k) 0) -- 'C
 
 ;; Integer key (non-symbol) — same row→gid + per-group eval.
 (set Ti (table [k v] (list [1 1 2 2 3 3] [10 20 30 40 50 60])))
@@ -97,6 +120,13 @@
 ;;   k=3: max=60, min=50 → 110
 (sum (at (select {r: (+ (max v) (min v)) by: k from: Ti}) 'r)) -- 210
 (count (select {r: (+ (max v) (min v)) by: k from: Ti})) -- 3
+;; Per-group value checks (order-independent, key-masked SOURCE lookup;
+;; integer key, sum-210 total can't catch a value swapped between groups).
+(at (at (select {r: (+ (max v) (min v)) by: k from: Ti where: (== k 1)}) 'r) 0) -- 30
+(at (at (select {r: (+ (max v) (min v)) by: k from: Ti where: (== k 2)}) 'r) 0) -- 70
+(at (at (select {r: (+ (max v) (min v)) by: k from: Ti where: (== k 3)}) 'r) 0) -- 110
+(at (at (select {r: (+ (max v) (min v)) by: k from: Ti where: (== k 1)}) 'k) 0) -- 1
+(at (at (select {r: (+ (max v) (min v)) by: k from: Ti where: (== k 3)}) 'k) 0) -- 3
 
 ;; Two-key with integer keys — eval-level multi-key, typed-direct.
 (set Tk (table [k1 k2 v] (list [1 1 2 2 1 2] [10 20 10 20 10 20] [100 200 300 400 500 600])))
@@ -107,6 +137,15 @@
 ;;   (2, 20) v=[400, 600] → max=600, min=400 → diff=200
 (count (select {r: (- (max v) (min v)) by: [k1 k2] from: Tk})) -- 4
 (sum (at (select {r: (- (max v) (min v)) by: [k1 k2] from: Tk}) 'r)) -- 600
+;; Per-group value checks (order-independent, key-masked SOURCE lookup;
+;; two integer keys.  sum-600 total can't catch a value swapped between
+;; the (1,10)=400 and (2,20)=200 groups).
+(at (at (select {r: (- (max v) (min v)) by: [k1 k2] from: Tk where: (and (== k1 1) (== k2 10))}) 'r) 0) -- 400
+(at (at (select {r: (- (max v) (min v)) by: [k1 k2] from: Tk where: (and (== k1 1) (== k2 20))}) 'r) 0) -- 0
+(at (at (select {r: (- (max v) (min v)) by: [k1 k2] from: Tk where: (and (== k1 2) (== k2 10))}) 'r) 0) -- 0
+(at (at (select {r: (- (max v) (min v)) by: [k1 k2] from: Tk where: (and (== k1 2) (== k2 20))}) 'r) 0) -- 200
+(at (at (select {r: (- (max v) (min v)) by: [k1 k2] from: Tk where: (and (== k1 1) (== k2 10))}) 'k1) 0) -- 1
+(at (at (select {r: (- (max v) (min v)) by: [k1 k2] from: Tk where: (and (== k1 1) (== k2 10))}) 'k2) 0) -- 10
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; typed-direct happy path inside `nonagg_eval_per_group_core`.

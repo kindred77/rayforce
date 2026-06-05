@@ -21,7 +21,9 @@
 (set Tq6 (table [id4 id5 v3] (list [A A B B B A] [X Y X Y X Y] [10.0 20.0 30.0 40.0 50.0 60.0])))
 
 ;; Single-key median — DAG fast path (existed before, still works).
+;; A: [10,20,60] → median 20 ; B: [30,40,50] → median 40 ; sum = 60.
 (count (select {m: (med v3) by: id4 from: Tq6})) -- 2
+(sum (at (select {m: (med v3) by: id4 from: Tq6}) 'm)) -- 60.0
 
 ;; Multi-key median — q6.  4 distinct (id4,id5) pairs.
 (count (select {m: (med v3) by: [id4 id5] from: Tq6})) -- 4
@@ -35,11 +37,22 @@
 
 ;; ─── q6 with stat aggs that exist in engine ────────────────────────
 ;; Engine has: stddev / var / dev — exposed under those names.
+;; (A,X)=[10] sd=0 ; (A,Y)=[20,60] sd=sqrt(800)≈28.2843 ; (B,X)=[30,50] sd=sqrt(200)≈14.1421 ;
+;; (B,Y)=[40] sd=0.  Sample stddev: A,Y={20,60} mean=40, var=((20-40)²+(60-40)²)/(n-1)=800
+;;   → stddev = sqrt(800) ≈ 28.284271247461902.
+;; B,X={30,50} mean=40, var=200 → stddev = sqrt(200) ≈ 14.142135623730951.
+;; A,X={10} → 0  ; B,Y={40} → 0.  Total sum ≈ 42.426406871192853.
 (count (select {sd: (stddev v3) by: [id4 id5] from: Tq6})) -- 4
+;; Sum approximated via max — assert order-of-magnitude bound rather than exact.
+(> (sum (at (select {sd: (stddev v3) by: [id4 id5] from: Tq6}) 'sd)) 40.0) -- true
+(< (sum (at (select {sd: (stddev v3) by: [id4 id5] from: Tq6}) 'sd)) 45.0) -- true
+;; Sample variance: (A,Y) var=800, (B,X) var=200, singletons var=0 → sum=1000.
 (count (select {vr: (var    v3) by: [id4 id5] from: Tq6})) -- 4
+(sum (at (select {vr: (var v3) by: [id4 id5] from: Tq6}) 'vr)) -- 1000.0
 
-;; Multi-key, multiple aggs in one query.
+;; Multi-key, multiple aggs in one query.  med sum still 130 from above.
 (count (select {m: (med v3) sd: (stddev v3) by: [id4 id5] from: Tq6})) -- 4
+(sum (at (select {m: (med v3) sd: (stddev v3) by: [id4 id5] from: Tq6}) 'm)) -- 130.0
 
 ;; ─── q7: arith-of-aggregates per-group ────────────────────────────
 ;;

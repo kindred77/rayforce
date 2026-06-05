@@ -16,25 +16,68 @@
 ;; sum of all v equals N*(N-1)/2 — 100000*99999/2
 (sum (at (select {s: (sum v) from: Tbig by: g}) 's)) -- 4999950000
 
+;; Per-group value checks (order-independent, key-masked source lookups).
+;; The group-count and sum-total above can't detect v's swapped between
+;; groups; these pin the aggregate AND the group key for specific groups.
+;; group g sees 100 v's: g, 1000+g, …, 99000+g; sum = 100*g + 4950000.
+;; g=500: sum = 100*500 + 4950000 = 5000000, count=100,
+;;        min=500, max=99500, avg=50000.0, key g=500.
+(at (at (select {x: (sum   v) from: Tbig by: g where: (== g 500)}) 'x) 0) -- 5000000
+(at (at (select {x: (count v) from: Tbig by: g where: (== g 500)}) 'x) 0) -- 100
+(at (at (select {x: (min   v) from: Tbig by: g where: (== g 500)}) 'x) 0) -- 500
+(at (at (select {x: (max   v) from: Tbig by: g where: (== g 500)}) 'x) 0) -- 99500
+(at (at (select {x: (avg   v) from: Tbig by: g where: (== g 500)}) 'x) 0) -- 50000.0
+(at (at (select {x: (sum   v) from: Tbig by: g where: (== g 500)}) 'g) 0) -- 500
+
 ;; min / max via group-by
 ;; group g sees 100 v's: g, 1000+g, 2000+g, …, 99000+g.
 ;; sum = 100*g + 1000*(0+1+…+99) = 100*g + 4950000.
 ;; min sum = g=0 → 4950000; max sum = g=999 → 100*999 + 4950000 = 5049900.
 (min (at (select {s: (sum v) from: Tbig by: g}) 's)) -- 4950000
 (max (at (select {s: (sum v) from: Tbig by: g}) 's)) -- 5049900
+;; pin the extremal sums to their actual group keys via key-masked lookup,
+;; so a min/max landing on the wrong group's total would be caught.
+(at (at (select {s: (sum v) from: Tbig by: g where: (== g 0)})   's) 0) -- 4950000
+(at (at (select {s: (sum v) from: Tbig by: g where: (== g 0)})   'g) 0) -- 0
+(at (at (select {s: (sum v) from: Tbig by: g where: (== g 999)}) 's) 0) -- 5049900
+(at (at (select {s: (sum v) from: Tbig by: g where: (== g 999)}) 'g) 0) -- 999
 
 ;; ────────────── multi-aggregator on the same large table ──────────────
 (set Magg (select {c: (count v) s: (sum v) m: (max v) n: (min v) av: (avg v) from: Tbig by: g}))
 (count Magg) -- 1000
 ;; total count across groups equals total rows
 (sum (at Magg 'c)) -- 100000
+;; per-group multi-aggregator check (order-independent): a single radix
+;; bucket carrying mixed columns from different groups would pass the
+;; count-total/group-count above but fail these. group g=500.
+(at (at (select {c: (count v) s: (sum v) m: (max v) n: (min v) av: (avg v) from: Tbig by: g where: (== g 500)}) 'c)  0) -- 100
+(at (at (select {c: (count v) s: (sum v) m: (max v) n: (min v) av: (avg v) from: Tbig by: g where: (== g 500)}) 's)  0) -- 5000000
+(at (at (select {c: (count v) s: (sum v) m: (max v) n: (min v) av: (avg v) from: Tbig by: g where: (== g 500)}) 'm)  0) -- 99500
+(at (at (select {c: (count v) s: (sum v) m: (max v) n: (min v) av: (avg v) from: Tbig by: g where: (== g 500)}) 'n)  0) -- 500
+(at (at (select {c: (count v) s: (sum v) m: (max v) n: (min v) av: (avg v) from: Tbig by: g where: (== g 500)}) 'av) 0) -- 50000.0
+(at (at (select {c: (count v) s: (sum v) m: (max v) n: (min v) av: (avg v) from: Tbig by: g where: (== g 500)}) 'g)  0) -- 500
 
 ;; ────────────── multi-key group-by on 100k ──────────────
 (set Tmk (table [k1 k2 v] (list (% (til N) 50) (% (til N) 7) (til N))))
 (count (select {c: (count v) from: Tmk by: [k1 k2]})) -- 350
+;; per-(k1,k2) value check, order-independent: the 350 group count alone
+;; can't see rows mis-bucketed across the composite radix key. Pin one
+;; cell (k1=3,k2=5) and assert both key columns and the value sum.
+(at (at (select {x: (count v) from: Tmk by: [k1 k2] where: (and (== k1 3) (== k2 5))}) 'x)  0) -- 286
+(at (at (select {x: (sum   v) from: Tmk by: [k1 k2] where: (and (== k1 3) (== k2 5))}) 'x)  0) -- 14293708
+(at (at (select {x: (sum   v) from: Tmk by: [k1 k2] where: (and (== k1 3) (== k2 5))}) 'k1) 0) -- 3
+(at (at (select {x: (sum   v) from: Tmk by: [k1 k2] where: (and (== k1 3) (== k2 5))}) 'k2) 0) -- 5
 
 ;; ────────────── 200k rows for a deeper radix dispatch ──────────────
 (set N2 200000)
 (set Tx (table [g v] (list (% (til N2) 5000) (til N2))))
 (count (select {c: (count v) from: Tx by: g})) -- 5000
 (sum (at (select {s: (sum v) from: Tx by: g}) 's)) -- 19999900000
+;; per-group value check on the deeper (200k-row) radix dispatch. group g
+;; sees 40 v's: g, 5000+g, …, 195000+g. g=2500: sum=4000000, count=40,
+;; min=2500, max=197500, key g=2500. Order-independent key-masked lookup.
+(at (at (select {x: (sum   v) from: Tx by: g where: (== g 2500)}) 'x) 0) -- 4000000
+(at (at (select {x: (count v) from: Tx by: g where: (== g 2500)}) 'x) 0) -- 40
+(at (at (select {x: (min   v) from: Tx by: g where: (== g 2500)}) 'x) 0) -- 2500
+(at (at (select {x: (max   v) from: Tx by: g where: (== g 2500)}) 'x) 0) -- 197500
+(at (at (select {x: (sum   v) from: Tx by: g where: (== g 2500)}) 'g) 0) -- 2500

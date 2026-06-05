@@ -51,6 +51,9 @@
 ;; when start >= len the result type may be LIST depending on path taken
 ;; start=0 within bounds → works
 (count (take _strv [0 2])) -- 2
+;; verify actual content of in-bounds range take
+(at (take _strv [0 2]) 0) -- "aa"
+(at (take _strv [0 2]) 1) -- "bb"
 
 ;; ════════════════════════════════════════════════════════════════
 ;; 5. take — dict range take with typed (non-LIST) value vec (line 1391-1394)
@@ -135,6 +138,8 @@
 ;; find where source vec is empty and val is collection → returns empty vec
 (count (find [] [1 2 3])) -- 0
 (type (find [] [1 2 3])) -- 'I64
+;; empty vec result value-check: explicit empty I64 vec
+(find [] [1 2 3]) -- (as 'I64 [])
 
 ;; ════════════════════════════════════════════════════════════════
 ;; 13. except — boxed list path with scalar vec2 (line 1136-1139)

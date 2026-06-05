@@ -60,12 +60,20 @@
 (set Tss (table [s] (list ["alpha" "beta" "gamma"])))
 ;; substr(s, 0, 3): "alp","bet","gam"
 (count (select {r: (substr s 0 3) from: Tss})) -- 3
-;; replace(s, "a", "X")
+(at (at (select {r: (substr s 0 3) from: Tss}) 'r) 0) -- "alp"
+(at (at (select {r: (substr s 0 3) from: Tss}) 'r) 2) -- "gam"
+;; replace(s, "a", "X") — global replace: alpha→XlphX, gamma→gXmmX
 (count (select {r: (replace s "a" "X") from: Tss})) -- 3
+(at (at (select {r: (replace s "a" "X") from: Tss}) 'r) 0) -- "XlphX"
+(at (at (select {r: (replace s "a" "X") from: Tss}) 'r) 2) -- "gXmmX"
 ;; 4-arg concat: stores 2 trailing arg IDs after the ext node.
 (count (select {r: (concat s "_" s "!") from: Tss})) -- 3
+(at (at (select {r: (concat s "_" s "!") from: Tss}) 'r) 0) -- "alpha_alpha!"
+(at (at (select {r: (concat s "_" s "!") from: Tss}) 'r) 2) -- "gamma_gamma!"
 ;; substr feeding concat — chained ext nodes.
 (count (select {r: (concat (substr s 0 2) "_z") from: Tss})) -- 3
+(at (at (select {r: (concat (substr s 0 2) "_z") from: Tss}) 'r) 0) -- "al_z"
+(at (at (select {r: (concat (substr s 0 2) "_z") from: Tss}) 'r) 2) -- "ga_z"
 
 ;; ════════════════════════════════════════════════════════════════════════
 ;; (d) Grouped + sorted select — count_refs OP_GROUP key/agg and
@@ -73,6 +81,15 @@
 ;; ════════════════════════════════════════════════════════════════════════
 (set Tg (table [k v] (list ['A 'B 'A 'B 'C] [1 2 3 4 5])))
 ;; group by k, sum v, with an element-wise agg input (v*2).
+;; groups A,B,C in first-appearance order: A=(1+3)*2=8, B=(2+4)*2=12, C=5*2=10.
 (sum (at (select {s: (sum (* v 2)) by: k from: Tg}) 's)) -- 30
+;; per-group values (not just the total) — a wrong grouping that still
+;; totals 30 would slip past the (sum ...) check above.
+(at (at (select {s: (sum (* v 2)) by: k from: Tg}) 's) 0) -- 8
+(at (at (select {s: (sum (* v 2)) by: k from: Tg}) 's) 1) -- 12
+(at (at (select {s: (sum (* v 2)) by: k from: Tg}) 's) 2) -- 10
+(at (at (select {s: (sum (* v 2)) by: k from: Tg}) 'k) 0) -- 'A
 ;; sorted select — exercises OP_SORT column child counting.
+;; v column is [1 2 3 4 5]; projecting it preserves row order.
 (at (at (select {v: v from: Tg}) 'v) 0) -- 1
+(at (at (select {v: v from: Tg}) 'v) 4) -- 5

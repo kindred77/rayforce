@@ -183,3 +183,59 @@
 ;; BOOL column → F64 scratch (line 637-640 U8/BOOL path)
 (set _Tb (table [x] (list (as 'BOOL [true false true]))))
 (at (select {y: (* x 2.0) from: _Tb}) 'y) -- [2.0 0.0 2.0]
+
+;; ===================================================================
+;; Overflow / wraparound boundaries — value AND width must be checked.
+;; Narrow-int arithmetic wraps modulo the type's width (documented k/q
+;; rule); a result that wraps but silently widens (or a sign-extension
+;; bug) would pass a type-only or in-range value-only check.
+;; ===================================================================
+
+;; U8 unsigned wraparound: + over 255, * over 255, - below 0
+(+ (as 'U8 [250]) (as 'U8 [10])) -- [0x04]      ;; 260 mod 256 = 4
+(type (+ (as 'U8 [250]) (as 'U8 [10]))) -- 'U8
+(* (as 'U8 [200]) (as 'U8 [2])) -- [0x90]        ;; 400 mod 256 = 144
+(type (* (as 'U8 [200]) (as 'U8 [2]))) -- 'U8
+(- (as 'U8 [5]) (as 'U8 [10])) -- [0xfb]         ;; -5 mod 256 = 251 (no sign-ext)
+(type (- (as 'U8 [5]) (as 'U8 [10]))) -- 'U8
+(* (as 'U8 [16]) (as 'U8 [16])) -- [0x00]        ;; 256 mod 256 = 0 (exact boundary)
+(type (* (as 'U8 [16]) (as 'U8 [16]))) -- 'U8
+
+;; I16 signed wraparound at +/-32768, stays I16 (no promotion to I32)
+(+ [32767h] [1h]) -- [-32768]                    ;; INT16_MAX + 1 wraps to MIN
+(type (+ [32767h] [1h])) -- 'I16
+(- (as 'I16 [-32768]) (as 'I16 [1])) -- [32767]  ;; INT16_MIN - 1 wraps to MAX
+(type (- (as 'I16 [-32768]) (as 'I16 [1]))) -- 'I16
+(* [32000h] [2h]) -- [-1536]                     ;; 64000 wraps (64000 - 65536)
+(type (* [32000h] [2h])) -- 'I16
+(* [200h] [200h]) -- [-25536]                    ;; 40000 wraps (40000 - 65536)
+(type (* [200h] [200h])) -- 'I16
+
+;; I32 signed wraparound at +/-2^31, stays I32 (no promotion to I64)
+(+ [2147483647i] [1i]) -- [-2147483648]          ;; INT32_MAX + 1 wraps to MIN
+(type (+ [2147483647i] [1i])) -- 'I32
+(* [100000i] [100000i]) -- [1410065408]          ;; 10^10 mod 2^32 (signed)
+(type (* [100000i] [100000i])) -- 'I32
+
+;; ===================================================================
+;; Mixed-width promotion: narrower operand widens to the wider type,
+;; values must be exact after promotion (sign/zero extension correct).
+;; ===================================================================
+(+ [1h 2h 3h] [10i 20i 30i]) -- [11 22 33]       ;; I16 + I32 -> I32
+(type (+ [1h 2h 3h] [10i 20i 30i])) -- 'I32
+(+ (as 'U8 [1 2 3]) [10i 20i 30i]) -- [11 22 33] ;; U8 + I32 -> I32 (zero-ext)
+(type (+ (as 'U8 [1 2 3]) [10i 20i 30i])) -- 'I32
+(+ [1h 2h 3h] (as 'U8 [10 20 30])) -- [11 22 33] ;; I16 + U8 -> I16
+(type (+ [1h 2h 3h] (as 'U8 [10 20 30]))) -- 'I16
+
+;; ===================================================================
+;; sum widens narrow ints to i64 (value + width, no overflow at i64)
+;; ===================================================================
+(sum [1h 2h 3h]) -- 6
+(type (sum [1h 2h 3h])) -- 'i64
+(sum (as 'U8 [1 2 3])) -- 6
+(type (sum (as 'U8 [1 2 3]))) -- 'i64
+
+;; null is the least value in narrow-int comparison: -1 is NOT < null
+(< [-1h] [0Nh]) -- [false]
+(type (< [-1h] [0Nh])) -- 'B8

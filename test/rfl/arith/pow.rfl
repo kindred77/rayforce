@@ -15,7 +15,9 @@
 
 ;; result is always F64 even when both operands are integer atoms
 (type (pow 2 3)) -- 'f64
+(pow 2.0 3) -- 8.0
 (type (pow 2.0 3)) -- 'f64
+(pow 2 3.0) -- 8.0
 (type (pow 2 3.0)) -- 'f64
 
 ;; ─── algebraic identities ──────────────────────────────────────────

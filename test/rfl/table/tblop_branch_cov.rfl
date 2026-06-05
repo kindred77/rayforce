@@ -113,6 +113,12 @@
 (set Pi64pv_fb (pivot Ti64pv_fb 'k 'c 'v (fn [xs] (sum xs))))
 (count Pi64pv_fb) -- 2
 (count (key Pi64pv_fb)) -- 3
+;; I64 pivot values produce decimal-string column names "100" / "200".
+;; Value-check the scattered cells (not just shape).
+(at (at Pi64pv_fb '100) 0) -- 10
+(at (at Pi64pv_fb '200) 0) -- 20
+(at (at Pi64pv_fb '100) 1) -- 30
+(at (at Pi64pv_fb '200) 1) -- 40
 
 ;; ══════════════════════════════════════════════════════════════════
 ;; Section 6: BOOL pivot column with lambda agg → L496-497
@@ -286,6 +292,12 @@
 (set Pu8fb (pivot Tu8fb 'k 'c 'v (fn [xs] (sum xs))))
 (count Pu8fb) -- 2
 (count (key Pu8fb)) -- 3
+;; U8 pivot values hit the "col%ld" fallback → column names "col1" / "col2".
+;; Value-check the scattered cells to prove the scatter, not just shape.
+(at (at Pu8fb 'col1) 0) -- 10
+(at (at Pu8fb 'col2) 0) -- 20
+(at (at Pu8fb 'col1) 1) -- 30
+(at (at Pu8fb 'col2) 1) -- 40
 
 ;; ══════════════════════════════════════════════════════════════════
 ;; Section 21: modify — fn that returns error (call_fn1 RAY_IS_ERR)
@@ -316,6 +328,19 @@
 (set Tnz (table [k c v] (list ['A 'A 'B 'B] (as 'F64 [0.0 -0.0 0.0 -0.0]) [1 2 3 4])))
 (set Pnz (pivot Tnz 'k 'c 'v (fn [xs] (sum xs))))
 (count Pnz) -- 2
+;; 0.0 and -0.0 normalize to the single pivot column "0".
+(count (key Pnz)) -- 2
+(count (at Pnz '0)) -- 2
+;; VALUE-CHECK: the "0" column holds the real aggregates.  Group A = sum[1,2]
+;; = 3, group B = sum[3,4] = 7, col sum = 10.
+;; FIXED: ray_pivot_fn collapses -0.0 -> +0.0 in the F64 pivot KEY once up
+;; front (a cold-path bit-check over the key column, NOT in the group-by hot
+;; loop, so the -fno-signed-zeros vectorization is untouched), so 0.0/-0.0
+;; group into one "0" column carrying the merged sums.  Deterministic across
+;; platforms (bit-check, independent of release FP codegen).
+(at (at Pnz '0) 0) -- 3
+(at (at Pnz '0) 1) -- 7
+(sum (at Pnz '0)) -- 10
 
 ;; ══════════════════════════════════════════════════════════════════
 ;; Section 24: pivot_fn_to_agg_op — all known builtins (lines 43-53)
@@ -324,15 +349,49 @@
 
 (set Tagg (table [k c v] (list ['A 'A 'B 'B] ['x 'y 'x 'y] [10 20 30 40])))
 
-(count (pivot Tagg 'k 'c 'v sum)) -- 2
-(count (pivot Tagg 'k 'c 'v avg)) -- 2
-(count (pivot Tagg 'k 'c 'v min)) -- 2
-(count (pivot Tagg 'k 'c 'v max)) -- 2
-(count (pivot Tagg 'k 'c 'v count)) -- 2
-(count (pivot Tagg 'k 'c 'v first)) -- 2
-(count (pivot Tagg 'k 'c 'v last)) -- 2
+;; Each (key,pivot) group has exactly one row, so all aggs reduce to that
+;; row's value (count → 1).  Value-check a representative cell of every agg
+;; so a wrong scatter cannot pass on shape alone.
+(set Psum (pivot Tagg 'k 'c 'v sum))
+(count Psum) -- 2
+(at (at Psum 'x) 0) -- 10
+(at (at Psum 'y) 1) -- 40
+
+(set Pavg (pivot Tagg 'k 'c 'v avg))
+(count Pavg) -- 2
+(at (at Pavg 'x) 0) -- 10.0
+(at (at Pavg 'y) 1) -- 40.0
+
+(set Pmin (pivot Tagg 'k 'c 'v min))
+(count Pmin) -- 2
+(at (at Pmin 'x) 0) -- 10
+(at (at Pmin 'y) 1) -- 40
+
+(set Pmax (pivot Tagg 'k 'c 'v max))
+(count Pmax) -- 2
+(at (at Pmax 'x) 0) -- 10
+(at (at Pmax 'y) 1) -- 40
+
+(set Pcnt (pivot Tagg 'k 'c 'v count))
+(count Pcnt) -- 2
+(at (at Pcnt 'x) 0) -- 1
+(at (at Pcnt 'y) 1) -- 1
+
+(set Pfst (pivot Tagg 'k 'c 'v first))
+(count Pfst) -- 2
+(at (at Pfst 'x) 0) -- 10
+(at (at Pfst 'y) 1) -- 40
+
+(set Plst (pivot Tagg 'k 'c 'v last))
+(count Plst) -- 2
+(at (at Plst 'x) 0) -- 10
+(at (at Plst 'y) 1) -- 40
+
 ;; non-builtin agg → pivot_fn_to_agg_op returns 0 → generic fallback
-(count (pivot Tagg 'k 'c 'v (fn [xs] (sum xs)))) -- 2
+(set Plam (pivot Tagg 'k 'c 'v (fn [xs] (sum xs))))
+(count Plam) -- 2
+(at (at Plam 'x) 0) -- 10
+(at (at Plam 'y) 1) -- 40
 
 ;; ══════════════════════════════════════════════════════════════════
 ;; Section 25: alter set — list with scalar idx (single element replace)

@@ -6,6 +6,14 @@
 (nil? 0Nh) -- true
 (nil? 0Ni) -- true
 (nil? 0Nl) -- true
+;; each sentinel carries its own narrow-int type
+(type 0Nh) -- 'i16
+(type 0Ni) -- 'i32
+(type 0Nl) -- 'i64
+;; the null is the least value; the real value one above the sentinel
+;; (INT_MIN+1) must NOT be confused with null
+(nil? -32767h) -- false
+(nil? -2147483647i) -- false
 
 ;; ----- 2. CSV ingest (I64) -----
 
@@ -37,7 +45,13 @@
 ;; ----- 6. Group-by SUM on nullable I64 (consumer sentinel-skip) -----
 
 (set Tn (table [v g] (list [1 2 0N 4 5] [0 0 1 1 1])))
-(sum (at (select {s: (sum v) from: Tn where: (>= g 0) by: g}) 's)) -- 12
+(set R6 (select {s: (sum v) from: Tn where: (>= g 0) by: g}))
+(sum (at R6 's)) -- 12
+;; group g=0 holds v=[1 2]; group g=1 holds v=[0N 4 5] -> sum skips the null
+(at (at R6 's) 0) -- 3
+(at (at R6 's) 1) -- 9
+(at (at R6 'g) 0) -- 0
+(at (at R6 'g) 1) -- 1
 
 ;; ----- 7. UPDATE with typed-null broadcast preserves sentinel encoding -----
 
@@ -50,10 +64,36 @@
 ;; ----- 8. Group-by with null I64 keys buckets nulls together -----
 
 (set Tk (table [k v] (list [1 0N 1 0N 2] [10 20 30 40 50])))
-(count (select {c: (count v) from: Tk where: (>= v 0) by: k})) -- 3
+(set R8 (select {s: (sum v) c: (count v) from: Tk by: k}))
+(count R8) -- 3
+;; three buckets: key 1 (rows v=10,30), null key (rows v=20,40), key 2 (row v=50)
+(at (at R8 'k) 0) -- 1
+(nil? (at (at R8 'k) 1)) -- true
+(at (at R8 'k) 2) -- 2
+;; null rows bucket together: count 2, sum 60 — distinct from the key-1 bucket
+(at (at R8 'c) 0) -- 2
+(at (at R8 'c) 1) -- 2
+(at (at R8 'c) 2) -- 1
+(at (at R8 's) 0) -- 40
+(at (at R8 's) 1) -- 60
+(at (at R8 's) 2) -- 50
 
 ;; ----- 9. Cast preserves null encoding across widths -----
 
 (nil? (at (as 'I32 [1 0N 3]) 1))  -- true
 (nil? (at (as 'I16 [1 0N 3]) 1))  -- true
 (nil? (at (as 'I64 (as 'I16 [1 0N 3])) 1)) -- true
+;; surviving (non-null) payloads must keep their values; sentinel must not
+;; corrupt neighbours, and a real value must not be read back as null
+(at (as 'I32 [1 0N 3]) 0)  -- 1
+(at (as 'I32 [1 0N 3]) 2)  -- 3
+(nil? (at (as 'I32 [1 0N 3]) 0)) -- false
+(sum (as 'I32 [1 0N 3]))   -- 4
+(at (as 'I16 [1 0N 3]) 0)  -- 1
+(at (as 'I16 [1 0N 3]) 2)  -- 3
+(nil? (at (as 'I16 [1 0N 3]) 2)) -- false
+(sum (as 'I16 [1 0N 3]))   -- 4
+;; round-trip narrow -> wide re-encodes the sentinel and keeps real values
+(at (as 'I64 (as 'I16 [1 0N 3])) 0) -- 1
+(at (as 'I64 (as 'I16 [1 0N 3])) 2) -- 3
+(sum (as 'I64 (as 'I16 [1 0N 3]))) -- 4

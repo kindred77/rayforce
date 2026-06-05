@@ -154,8 +154,11 @@
 ;; ══════════════════════════════════════════════════════════════════════
 (eval (parse "42")) -- 42
 (eval (parse "\"hello\"")) -- "hello"
-;; "null" parses to a symbol atom, not a list
+;; "null" parses to a symbol atom, not a list; evaluating the parsed form
+;; resolves to the runtime null singleton (lookup of the 'null sym).
 (type (parse "null")) -- 'sym
+(parse "null") -- 'null
+(nil? (eval (parse "null"))) -- true
 
 ;; ══════════════════════════════════════════════════════════════════════
 ;; Serde round-trip on additional types

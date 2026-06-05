@@ -17,14 +17,25 @@
 (set Tp1 (table [x y] (list [1 2 3 4 5] [2 4 6 8 10])))
 ;; Non-by select with pearson_corr → returns 1-row table
 (count (select {r: (pearson_corr x y) from: Tp1})) -- 1
+;; Value check: y=2x is perfectly positively correlated → r should be 1.0.
+;; FIXED: the non-by scalar pearson_corr path now routes through the HT
+;; reducer (group.c scalar fast-path skips binary aggregators), computing
+;; the real correlation instead of returning integer 0.
+(< (abs (- (at (at (select {r: (pearson_corr x y) from: Tp1}) 'r) 0) 1.0)) 1e-9) -- true
 
 ;; Anti-correlated pair
 (set Tp2 (table [x y] (list [1 2 3 4 5] [-1 -2 -3 -4 -5])))
 (count (select {r: (pearson_corr x y) from: Tp2})) -- 1
+;; Value check: y=-x is perfectly anti-correlated → r should be -1.0.
+;; FIXED (same scalar-path fix as Tp1).
+(< (abs (- (at (at (select {r: (pearson_corr x y) from: Tp2}) 'r) 0) -1.0)) 1e-9) -- true
 
 ;; pearson_corr with WHERE predicate
 (set Tp4 (table [x y z] (list [1 2 3 4] [2 4 6 8] ['A 'B 'A 'B])))
 (count (select {r: (pearson_corr x y) from: Tp4 where: (== z 'A)})) -- 1
+;; Value check: z='A rows are x=[1,3], y=[2,6] (y=2x) → r should be 1.0.
+;; FIXED (same scalar-path fix as Tp1); WHERE filter applied before the reduce.
+(< (abs (- (at (at (select {r: (pearson_corr x y) from: Tp4 where: (== z 'A)}) 'r) 0) 1.0)) 1e-9) -- true
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; By-group pearson_corr: fused group with binary agg
@@ -34,14 +45,32 @@
 ;; Each group: A → x=[1,2], y=[2,4] → corr=1; B → x=[3,4], y=[6,8] → corr=1
 (count (select {r: (pearson_corr x y) by: k from: Tp5})) -- 2
 (sum (at (select {r: (pearson_corr x y) by: k from: Tp5}) 'r)) -- 2.0
+;; Per-group value checks via key-masked SOURCE lookup (order-independent):
+;; group emission is non-deterministic, so isolate each group with WHERE.
+;; A: x=[1,2], y=[2,4] (y=2x) → r ≈ 1.0
+(< (abs (- (at (at (select {r: (pearson_corr x y) by: k from: Tp5 where: (== k 'A)}) 'r) 0) 1.0)) 0.001) -- true
+;; B: x=[3,4], y=[6,8] (y=2x) → r ≈ 1.0
+(< (abs (- (at (at (select {r: (pearson_corr x y) by: k from: Tp5 where: (== k 'B)}) 'r) 0) 1.0)) 0.001) -- true
 
 ;; By-group pearson_corr combined with count
 (count (select {n: (count x) r: (pearson_corr x y) by: k from: Tp5})) -- 2
 (sum (at (select {n: (count x) r: (pearson_corr x y) by: k from: Tp5}) 'n)) -- 4
+;; Per-group value checks (both n and r) via key-masked SOURCE lookup:
+;; A: count=2, r ≈ 1.0
+(at (at (select {n: (count x) r: (pearson_corr x y) by: k from: Tp5 where: (== k 'A)}) 'n) 0) -- 2
+(< (abs (- (at (at (select {n: (count x) r: (pearson_corr x y) by: k from: Tp5 where: (== k 'A)}) 'r) 0) 1.0)) 0.001) -- true
+;; B: count=2, r ≈ 1.0
+(at (at (select {n: (count x) r: (pearson_corr x y) by: k from: Tp5 where: (== k 'B)}) 'n) 0) -- 2
+(< (abs (- (at (at (select {n: (count x) r: (pearson_corr x y) by: k from: Tp5 where: (== k 'B)}) 'r) 0) 1.0)) 0.001) -- true
 
 ;; By-group with 2 keys (exercises n_keys==2 path in ray_group_pearson_rowform)
 (set Tp6 (table [k1 k2 x y] (list ['A 'A 'B 'B] [1 1 1 1] [1 2 3 4] [2 4 6 8])))
 (count (select {r: (pearson_corr x y) by: [k1 k2] from: Tp6})) -- 2
+;; Per-group value check via key-masked SOURCE lookup (n_keys==2 path):
+;; (A,1): x=[1,2], y=[2,4] (y=2x) → r ≈ 1.0
+(< (abs (- (at (at (select {r: (pearson_corr x y) by: [k1 k2] from: Tp6 where: (== k1 'A)}) 'r) 0) 1.0)) 0.001) -- true
+;; (B,1): x=[3,4], y=[6,8] (y=2x) → r ≈ 1.0
+(< (abs (- (at (at (select {r: (pearson_corr x y) by: [k1 k2] from: Tp6 where: (== k1 'B)}) 'r) 0) 1.0)) 0.001) -- true
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; pearson_corr in eval-group path (STR key) — lines 5473-5484
@@ -52,3 +81,8 @@
 (set Tp7 (table [k x y] (list (list "A" "A" "B" "B") [1 2 3 4] [2 4 6 8])))
 ;; A: x=[1,2], y=[2,4] → corr=1.0; B: x=[3,4], y=[6,8] → corr=1.0
 (count (select {r: (pearson_corr x y) by: k from: Tp7})) -- 2
+;; Per-group value checks via STR-key-masked SOURCE lookup (eval-group path):
+;; A: x=[1,2], y=[2,4] (y=2x) → r ≈ 1.0
+(< (abs (- (at (at (select {r: (pearson_corr x y) by: k from: Tp7 where: (== k "A")}) 'r) 0) 1.0)) 0.001) -- true
+;; B: x=[3,4], y=[6,8] (y=2x) → r ≈ 1.0
+(< (abs (- (at (at (select {r: (pearson_corr x y) by: k from: Tp7 where: (== k "B")}) 'r) 0) 1.0)) 0.001) -- true

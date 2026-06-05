@@ -86,8 +86,12 @@
 
 ;; Variadic and/or balanced-tree fold — query.c:835-921.  4+ args
 ;; folds into a balanced binary tree.  Mixed AND of integers + floats.
+;; TT.a=[1..10], TT.b=[10,20,...,100].  a∈(1,9) → {2..8}; b∈(20,90) → {30..80} → a∈{3..8} = 6 rows; sum a = 33.
 (count (select {from: TT where: (and (> a 1) (< a 9) (> b 20) (< b 90))})) -- 6
+(sum (at (select {from: TT where: (and (> a 1) (< a 9) (> b 20) (< b 90))}) 'a)) -- 33
+;; OR — a ∈ {1, 5, 9, 10} = 4 rows ; sum 25.
 (count (select {from: TT where: (or (== a 1) (== a 5) (== a 9) (== a 10))})) -- 4
+(sum (at (select {from: TT where: (or (== a 1) (== a 5) (== a 9) (== a 10))}) 'a)) -- 25
 
 ;; ====================================================================
 ;; apply_sort_take — query.c:246-363.  Multi-key SYM-vector sort.

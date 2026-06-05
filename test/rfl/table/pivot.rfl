@@ -13,6 +13,17 @@
 (sum (at Pivot-Sum 'Buy))  -- 380
 (sum (at Pivot-Sum 'Sell)) -- 125
 
+;; representative scattered cells (rows ordered by first-seen sym: AAPL,GOOG,MSFT)
+;; AAPL Buy = 100+50 = 150, AAPL Sell = 75
+(at (at Pivot-Sum 'Buy) 0)  -- 150
+(at (at Pivot-Sum 'Sell) 0) -- 75
+;; GOOG Buy = 30, GOOG Sell = 50
+(at (at Pivot-Sum 'Buy) 1)  -- 30
+(at (at Pivot-Sum 'Sell) 1) -- 50
+;; MSFT Buy = 200, MSFT Sell = 0 (zero-filled missing cell)
+(at (at Pivot-Sum 'Buy) 2)  -- 200
+(at (at Pivot-Sum 'Sell) 2) -- 0
+
 ;; total across pivoted columns equals total across the source value col
 (+ (sum (at Pivot-Sum 'Buy)) (sum (at Pivot-Sum 'Sell))) -- (sum (at trades 'qty))
 
@@ -20,6 +31,17 @@
 (set Pivot-Count (pivot trades 'sym 'side 'qty count))
 
 (count Pivot-Count) -- 3
+
+;; representative scattered count cells (same row order: AAPL,GOOG,MSFT)
+;; AAPL: Buy seen twice (100,50), Sell once (75)
+(at (at Pivot-Count 'Buy) 0)  -- 2
+(at (at Pivot-Count 'Sell) 0) -- 1
+;; GOOG: Buy once (30), Sell once (50)
+(at (at Pivot-Count 'Buy) 1)  -- 1
+(at (at Pivot-Count 'Sell) 1) -- 1
+;; MSFT: Buy once (200), Sell zero-filled
+(at (at Pivot-Count 'Buy) 2)  -- 1
+(at (at Pivot-Count 'Sell) 2) -- 0
 
 ;; total cells == total source rows
 (+ (sum (at Pivot-Count 'Buy)) (sum (at Pivot-Count 'Sell))) -- (count trades)
@@ -51,6 +73,28 @@
 (at (at Pf 'x) 0) -- 1.5
 (at (at Pf 'y) 0) -- 2.5
 (at (at Pf 'x) 1) -- 3.5
+;; B has no 'y row → zero-filled (additive identity), NOT null
+(at (at Pf 'y) 1) -- 0.0
+
+;; ────────────── pivot with negative-zero F64 value (zero-fill identity) ──────────────
+;; A pivot VALUE column containing -0.0 alongside real values: sum keeps them.
+(set tnz (table [k1 k2 v] (list ['A 'B 'C] ['x 'x 'x] [1.5 -0.0 2.5])))
+(set Pnz (pivot tnz 'k1 'k2 'v sum))
+(count Pnz) -- 3
+;; expected: A→1.5, B→0.0 (the -0.0), C→2.5
+(at (at Pnz 'x) 0) -- 1.5
+(at (at Pnz 'x) 1) -- 0.0
+(at (at Pnz 'x) 2) -- 2.5
+
+;; ── F64 pivot-KEY column with -0.0 (FIXED) ──
+;; pivot KEY is F64 holding 0.0 and -0.0.  FIXED: ray_pivot_fn collapses
+;; -0.0 -> +0.0 in the F64 pivot key once up front (cold-path bit-check, not in
+;; the group-by hot loop), so 0.0/-0.0 form ONE merged "0" column carrying both
+;; values; previously they split into two same-named "0" columns and (at Pkz
+;; '0) saw only the first (value 7), shadowing the -0.0 value 9.
+(set tkz (table [r c v] (list ['A 'A] [0.0 -0.0] [7 9])))
+(set Pkz (pivot tkz 'r 'c 'v sum))
+(sum (at Pkz '0)) -- 16
 
 ;; ────────────── pivot with vector row-key (multi-key) ──────────────
 (set tm (table [r c v] (list [1 1 2 2] ['x 'y 'x 'y] [10 20 30 40])))

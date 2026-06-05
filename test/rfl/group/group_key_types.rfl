@@ -96,7 +96,10 @@
 
 ;; SYM min/max go through reduction_i64_result's SYM branch (reduce_range.c SYM arm)
 ;; SYM has_nulls=false, no-idx path.
+;; Lex order: 'alpha < 'beta < 'gamma.
+(min ['alpha 'beta 'gamma]) -- 'alpha
 (type (min ['alpha 'beta 'gamma])) -- 'sym
+(max ['alpha 'beta 'gamma]) -- 'gamma
 (type (max ['alpha 'beta 'gamma])) -- 'sym
 
 ;; ─── OP_FIRST / OP_LAST O(1) short-circuit ───────────────────────────

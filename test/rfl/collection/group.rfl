@@ -158,6 +158,15 @@
 (set Klst (map (fn [i] (list i i)) (til 2000)))
 (count (key (group Klst))) -- 2000
 (count (value (group Klst))) -- 2000
+;; Value-check: the count above only proves cardinality; verify the
+;; actual key->index mapping so a mis-grouping with the right group
+;; count can't pass silently.  Keys preserve first-appearance order
+;; (here ascending, since the input is built from `til`): row i holds
+;; the LIST key [i i], and every key is unique so its bucket is [i].
+(at (key (group Klst)) 0) -- [0 0]
+(at (key (group Klst)) 1999) -- [1999 1999]
+(at (value (group Klst)) 0) -- [0]
+(at (value (group Klst)) 1999) -- [1999]
 ;; Every key is unique → every bucket size is 1, total rows = N.
 (sum (map count (value (group Klst)))) -- 2000
 ;; And the analogous shape-failure for `select` with multi-key non-agg

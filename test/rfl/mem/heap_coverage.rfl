@@ -60,11 +60,17 @@
 ;; Larger still — drives split from a higher freelist order.
 (set HUGE (til 1000000))
 (count HUGE) -- 1000000
+(sum HUGE)   -- 499999500000
+(at HUGE 999999) -- 999999
 
 ;; Mixed-size churn so the pool's freelist sees coalescing too.
+;; Pin the sum of each so the split/coalesce cycle can't corrupt payload.
 (count (til 50000))  -- 50000
+(sum (til 50000))    -- 1249975000
 (count (til 250000)) -- 250000
+(sum (til 250000))   -- 31249875000
 (count (til 500000)) -- 500000
+(sum (til 500000))   -- 124999750000
 
 ;; ════════════════════════════════════════════════════════════════════════════
 ;; 3. ray_alloc_copy across every type family (heap.c:978-1029).
@@ -101,20 +107,31 @@ FV1 -- [1.5 2.5 3.5]
 (set L1 (list [1 2 3] [4 5 6] [7 8 9]))
 (set L2 L1)
 (count (reverse L2)) -- 3
+;; Verify the copied list elements survived the alloc_copy, not just count.
+(at (reverse L2) 0) -- [7 8 9]
 (count L1) -- 3
+(at L1 0) -- [1 2 3]
+(at L1 2) -- [7 8 9]
 
 ;; TABLE path: data_size = 2*sizeof(ray_t*) (heap.c:983-984).
 ;;   retain_owned_refs RAY_TABLE branch (heap.c:682-687).
 (set TBL (table [a b] (list [1 2 3] [4 5 6])))
 (set TBL2 TBL)
 (count TBL2) -- 3
+;; Pin both columns so a corrupted copy can't pass on count alone.
+(sum (at TBL2 'a)) -- 6
+(sum (at TBL2 'b)) -- 15
 (count TBL)  -- 3
+(sum (at TBL 'a)) -- 6
 
 ;; DICT path: same data_size as TABLE, RAY_DICT retain branch.
 (set D1 (dict [a b c] [1 2 3]))
 (set D2 D1)
 (count D2) -- 3
+(at D2 'b) -- 2
 (count D1) -- 3
+(at D1 'a) -- 1
+(at D1 'c) -- 3
 
 ;; ════════════════════════════════════════════════════════════════════════════
 ;; 4. ray_release_owned_refs / ray_retain_owned_refs symmetry —
@@ -141,6 +158,9 @@ FV1 -- [1.5 2.5 3.5]
 (set LS1 "hello world this is a long string past the SSO boundary")
 (set LS2 LS1)
 (count LS2) -- 55
+;; Pin endpoints so the aliased long-string buffer isn't silently mangled.
+(at LS2 0) -- "h"
+(at LS2 54) -- "y"
 
 ;; HNSW handle: -RAY_I64 with RAY_ATTR_HNSW (heap.c:521-528, 621-633).
 ;; Build an index, alias it via set, free it — exercises retain on
@@ -183,8 +203,12 @@ FV1 -- [1.5 2.5 3.5]
 (.db.splayed.set "/tmp/rfl_heap_part/2024.01.02/t/" P-2)
 (set PT (.db.parted.get "/tmp/rfl_heap_part/" 't))
 (count PT) -- 5
+;; Pin the concatenated partition payload (10+20+30+40+50) so a corrupted
+;; parted retain/detach can't pass on row count alone.
+(sum (at PT 'v)) -- 150
 (set PT2 PT)
 (count PT2) -- 5
+(sum (at PT2 'v)) -- 150
 
 ;; ════════════════════════════════════════════════════════════════════════════
 ;; 5. ray_scratch_realloc grow + shrink (heap.c:1039-1084).
@@ -199,6 +223,10 @@ FV1 -- [1.5 2.5 3.5]
 (set L (concat L (list 3)))
 (set L (concat L (list 4 5 6 7 8 9 10)))
 (count L) -- 10
+;; Pin sum + endpoints so realloc-grow can't drop or scramble elements.
+(sum L) -- 55
+(at L 0) -- 1
+(at L 9) -- 10
 
 ;; Typed-vector grow via concat — drives the typed branch (heap.c:1056-1060).
 (set V [1 2 3])
@@ -212,13 +240,20 @@ FV1 -- [1.5 2.5 3.5]
 (set FV (concat FV [3.0 4.0 5.0]))
 (set FV (concat FV [6.0 7.0 8.0 9.0 10.0]))
 (count FV) -- 10
+(sum FV) -- 55.0
+(at FV 9) -- 10.0
 
 ;; Sym vector grow — distinct elem_size path.
 (set SV ['a 'b 'c])
 (set SV (concat SV ['d 'e 'f]))
 (count SV) -- 6
+(at SV 0) -- 'a
+(at SV 5) -- 'f
 (set SV (concat SV ['g 'h 'i 'j]))
 (count SV) -- 10
+;; Pin endpoints so the sym realloc-grow preserves order + payload.
+(at SV 0) -- 'a
+(at SV 9) -- 'j
 
 ;; ════════════════════════════════════════════════════════════════════════════
 ;; 6. ray_mem_stats (heap.c:1090-1099).
@@ -241,8 +276,17 @@ FV1 -- [1.5 2.5 3.5]
 ;; 203-element vec with sentinel-encoded nulls scattered.
 (set NV (concat (til 100) (concat [0Nl 0Nl 0Nl] (til 100))))
 (count NV) -- 203
+;; Pin the sentinel positions, surrounding data, and null-skipping sum so a
+;; corrupted retain/release of the sentinel-encoded vec can't pass on count.
+(at NV 99)  -- 99
+(at NV 102) -- 0Nl
+(at NV 103) -- 0
+(at NV 202) -- 99
+(sum NV) -- 9900
 (set NV2 NV)
 (count NV2) -- 203
+(at NV2 100) -- 0Nl
+(sum NV2) -- 9900
 
 ;; ════════════════════════════════════════════════════════════════════════════
 ;; 8. Foreign-block path / parallel flag (heap.c:426-477, 833-844, 1235-1240).
@@ -254,14 +298,20 @@ FV1 -- [1.5 2.5 3.5]
 
 (set BT (table [k v] (list (til 10000) (til 10000))))
 (count (select {from: BT where: (> v 5000)})) -- 4999
+;; Pin the filtered payload so the foreign-block flush can't corrupt gathered rows.
+(at (at (select {from: BT where: (> v 5000)}) 'v) 0) -- 5001
+(sum (at (select {from: BT where: (< v 100)}) 'v)) -- 4950
 (count (select {from: BT where: (< v 100)}))  -- 100
 
 ;; Multi-condition where — drives multiple gather passes.
 (count (select {from: BT where: (> v 1000)})) -- 8999
+(at (at (select {from: BT where: (> v 1000)}) 'v) 0) -- 1001
 
 ;; Group-by + aggregation — radix path triggers at 65536 rows.
 (set GT (table [g v] (list (% (til 100000) 1000) (til 100000))))
 (count (select {s: (sum v) from: GT by: g})) -- 1000
+;; group g==0 holds v in {0,1000,..,99000}: 1000*(0+..+99) = 4950000.
+(at (at (select {s: (sum v) from: GT by: g}) 's) 0) -- 4950000
 
 ;; ════════════════════════════════════════════════════════════════════════════
 ;; 9. Lazy-graph release (heap.c:511-518, 615, 710-713).
@@ -288,6 +338,9 @@ FV1 -- [1.5 2.5 3.5]
 (set RT (.db.splayed.get "/tmp/rfl_heap_splayed/"))
 (count RT) -- 5
 (sum (at RT 'a)) -- 15
+;; Pin the mmap-backed float column too — file-mapped free must round-trip it.
+(sum (at RT 'b)) -- 150.0
+(at (at RT 'b) 4) -- 50.0
 ;; Force the loaded table out of scope by overwriting the binding —
 ;; ray_free runs with v->mmod==1 and drives ray_vm_unmap_file.
 (set RT 0)
@@ -302,6 +355,9 @@ FV1 -- [1.5 2.5 3.5]
 ;; A radix groupby on 200k rows easily pushes past one arena block.
 (set GT2 (table [g v] (list (% (til 200000) 5000) (til 200000))))
 (count (select {s: (sum v) from: GT2 by: g})) -- 5000
+;; group g==0 holds v in {0,5000,..,195000}: 5000*(0+..+39) = 3900000.
+;; Pin it so an arena-block overflow can't scramble the aggregated payload.
+(at (at (select {s: (sum v) from: GT2 by: g}) 's) 0) -- 3900000
 
 ;; ════════════════════════════════════════════════════════════════════════════
 ;; 12. ray_heap_init no-op when already initialized (heap.c:1106).

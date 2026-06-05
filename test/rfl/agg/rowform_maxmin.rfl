@@ -24,6 +24,15 @@
 (count (select {mx: (max x) mn: (min y) by: k from: T})) -- 2
 (sum (at (select {mx: (max x) mn: (min y) by: k from: T}) 'mx)) -- 12
 (sum (at (select {mx: (max x) mn: (min y) by: k from: T}) 'mn)) -- 40
+;; Per-group pins (order-independent, key-masked) — catch a swapped scatter.
+;; g=0: max x=5, min y=30; g=1: max x=7, min y=10.
+(at (at (select {mx: (max x) mn: (min y) by: k where: (== k 0) from: T}) 'mx) 0) -- 5
+(at (at (select {mx: (max x) mn: (min y) by: k where: (== k 0) from: T}) 'mn) 0) -- 30
+(at (at (select {mx: (max x) mn: (min y) by: k where: (== k 1) from: T}) 'mx) 0) -- 7
+(at (at (select {mx: (max x) mn: (min y) by: k where: (== k 1) from: T}) 'mn) 0) -- 10
+;; key column carries the group key, not the value.
+(at (at (select {mx: (max x) mn: (min y) by: k where: (== k 0) from: T}) 'k) 0) -- 0
+(at (at (select {mx: (max x) mn: (min y) by: k where: (== k 1) from: T}) 'k) 0) -- 1
 ;; Output column types match source: I64 throughout.
 (type (at (select {mx: (max x) mn: (min y) by: k from: T}) 'mx)) -- 'I64
 (type (at (select {mx: (max x) mn: (min y) by: k from: T}) 'mn)) -- 'I64
@@ -35,6 +44,14 @@
 (count (select {mx: (max x) mn: (min y) by: k from: Ts})) -- 2
 (sum (at (select {mx: (max x) mn: (min y) by: k from: Ts}) 'mx)) -- 9
 (sum (at (select {mx: (max x) mn: (min y) by: k from: Ts}) 'mn)) -- 8
+;; Per-group pins (SYM emission order is non-deterministic; mask by key).
+;; g=A: max x=5, min y=2; g=B: max x=4, min y=6.
+(at (at (select {mx: (max x) mn: (min y) by: k where: (== k 'A) from: Ts}) 'mx) 0) -- 5
+(at (at (select {mx: (max x) mn: (min y) by: k where: (== k 'A) from: Ts}) 'mn) 0) -- 2
+(at (at (select {mx: (max x) mn: (min y) by: k where: (== k 'B) from: Ts}) 'mx) 0) -- 4
+(at (at (select {mx: (max x) mn: (min y) by: k where: (== k 'B) from: Ts}) 'mn) 0) -- 6
+(at (at (select {mx: (max x) mn: (min y) by: k where: (== k 'A) from: Ts}) 'k) 0) -- 'A
+(at (at (select {mx: (max x) mn: (min y) by: k where: (== k 'B) from: Ts}) 'k) 0) -- 'B
 (type (at (select {mx: (max x) mn: (min y) by: k from: Ts}) 'k)) -- 'SYM
 
 ;; ─── narrow integer key + narrow integer values ─────────────────────
@@ -42,6 +59,12 @@
 ;; g=0: max=7, min=10; g=1: max=13, min=40
 (sum (at (select {mx: (max x) mn: (min y) by: k from: Ti32}) 'mx)) -- 20
 (sum (at (select {mx: (max x) mn: (min y) by: k from: Ti32}) 'mn)) -- 50
+;; Per-group pins: g=0 max=7,min=10; g=1 max=13,min=40.
+(at (at (select {mx: (max x) mn: (min y) by: k where: (== k 0) from: Ti32}) 'mx) 0) -- 7
+(at (at (select {mx: (max x) mn: (min y) by: k where: (== k 0) from: Ti32}) 'mn) 0) -- 10
+(at (at (select {mx: (max x) mn: (min y) by: k where: (== k 1) from: Ti32}) 'mx) 0) -- 13
+(at (at (select {mx: (max x) mn: (min y) by: k where: (== k 1) from: Ti32}) 'mn) 0) -- 40
+(at (at (select {mx: (max x) mn: (min y) by: k where: (== k 1) from: Ti32}) 'k) 0) -- 1
 (type (at (select {mx: (max x) mn: (min y) by: k from: Ti32}) 'mx)) -- 'I32
 (type (at (select {mx: (max x) mn: (min y) by: k from: Ti32}) 'mn)) -- 'I32
 
@@ -49,11 +72,23 @@
 ;; g=0: max=20, min=-2; g=1: max=40, min=-4. Sums: 60, -6.
 (sum (at (select {mx: (max x) mn: (min y) by: k from: Ti16}) 'mx)) -- 60
 (sum (at (select {mx: (max x) mn: (min y) by: k from: Ti16}) 'mn)) -- -6
+;; Per-group pins: g=0 max=20,min=-2; g=1 max=40,min=-4. Negative min path.
+(at (at (select {mx: (max x) mn: (min y) by: k where: (== k 0) from: Ti16}) 'mx) 0) -- 20
+(at (at (select {mx: (max x) mn: (min y) by: k where: (== k 0) from: Ti16}) 'mn) 0) -- -2
+(at (at (select {mx: (max x) mn: (min y) by: k where: (== k 1) from: Ti16}) 'mx) 0) -- 40
+(at (at (select {mx: (max x) mn: (min y) by: k where: (== k 1) from: Ti16}) 'mn) 0) -- -4
+(type (at (select {mx: (max x) mn: (min y) by: k from: Ti16}) 'mx)) -- 'I16
 
 (set Tu8 (table [k x y] (list (as 'U8 [0 0 1 1]) (as 'U8 [10 30 5 7]) (as 'U8 [40 60 20 80]))))
 ;; g=0: max=30, min=40; g=1: max=7, min=20. Sums: 37, 60.
 (sum (at (select {mx: (max x) mn: (min y) by: k from: Tu8}) 'mx)) -- 37
 (sum (at (select {mx: (max x) mn: (min y) by: k from: Tu8}) 'mn)) -- 60
+;; Per-group pins: g=0 max=30,min=40; g=1 max=7,min=20. U8 prints hex, cast to I64.
+(at (as 'I64 (at (select {mx: (max x) mn: (min y) by: k where: (== k 0) from: Tu8}) 'mx)) 0) -- 30
+(at (as 'I64 (at (select {mx: (max x) mn: (min y) by: k where: (== k 0) from: Tu8}) 'mn)) 0) -- 40
+(at (as 'I64 (at (select {mx: (max x) mn: (min y) by: k where: (== k 1) from: Tu8}) 'mx)) 0) -- 7
+(at (as 'I64 (at (select {mx: (max x) mn: (min y) by: k where: (== k 1) from: Tu8}) 'mn)) 0) -- 20
+(type (at (select {mx: (max x) mn: (min y) by: k from: Tu8}) 'mx)) -- 'U8
 
 ;; ─── BOOL x, BOOL y (degenerate but supported) ──────────────────────
 (set Tb (table [k x y] (list [A A B B] [false true true false] [true false true true])))
@@ -62,6 +97,11 @@
 ;; sum of BOOL coerces to I64: true=1, false=0. mx: 1+1=2, mn: 0+1=1.
 (sum (as 'I64 (at (select {mx: (max x) mn: (min y) by: k from: Tb}) 'mx))) -- 2
 (sum (as 'I64 (at (select {mx: (max x) mn: (min y) by: k from: Tb}) 'mn))) -- 1
+;; Per-group pins: g=A max x=true(1),min y=false(0); g=B max x=true(1),min y=true(1).
+(at (as 'I64 (at (select {mx: (max x) mn: (min y) by: k where: (== k 'A) from: Tb}) 'mx)) 0) -- 1
+(at (as 'I64 (at (select {mx: (max x) mn: (min y) by: k where: (== k 'A) from: Tb}) 'mn)) 0) -- 0
+(at (as 'I64 (at (select {mx: (max x) mn: (min y) by: k where: (== k 'B) from: Tb}) 'mx)) 0) -- 1
+(at (as 'I64 (at (select {mx: (max x) mn: (min y) by: k where: (== k 'B) from: Tb}) 'mn)) 0) -- 1
 
 ;; ─── single group ───────────────────────────────────────────────────
 (set T1 (table [k x y] (list (as 'I64 [0 0 0 0 0]) (as 'I64 [3 1 5 2 7]) (as 'I64 [50 30 70 20 60]))))
@@ -78,6 +118,14 @@
 (count (select {mx: (max x) mn: (min y) by: k from: Tm})) -- 10
 (sum (at (select {mx: (max x) mn: (min y) by: k from: Tm}) 'mx)) -- 245
 (sum (at (select {mx: (max x) mn: (min y) by: k from: Tm}) 'mn)) -- 445
+;; Per-group pins: group j has max x=j+20, min y=j+40. Mask a few groups.
+(at (at (select {mx: (max x) mn: (min y) by: k where: (== k 0) from: Tm}) 'mx) 0) -- 20
+(at (at (select {mx: (max x) mn: (min y) by: k where: (== k 0) from: Tm}) 'mn) 0) -- 40
+(at (at (select {mx: (max x) mn: (min y) by: k where: (== k 5) from: Tm}) 'mx) 0) -- 25
+(at (at (select {mx: (max x) mn: (min y) by: k where: (== k 5) from: Tm}) 'mn) 0) -- 45
+(at (at (select {mx: (max x) mn: (min y) by: k where: (== k 9) from: Tm}) 'mx) 0) -- 29
+(at (at (select {mx: (max x) mn: (min y) by: k where: (== k 9) from: Tm}) 'mn) 0) -- 49
+(at (at (select {mx: (max x) mn: (min y) by: k where: (== k 9) from: Tm}) 'k) 0) -- 9
 
 ;; ─── parallel path: nrows >= 16384 ──────────────────────────────────
 ;; 20000 rows. x = i, y = 2N-i.  10 groups (mod 10).
@@ -90,6 +138,13 @@
 (count (select {mx: (max x) mn: (min y) by: k from: Tbig})) -- 10
 (sum (at (select {mx: (max x) mn: (min y) by: k from: Tbig}) 'mx)) -- 199945
 (sum (at (select {mx: (max x) mn: (min y) by: k from: Tbig}) 'mn)) -- 200055
+;; Per-group pins on the parallel path: group j has max x=j+19990, min y=20010-j.
+(at (at (select {mx: (max x) mn: (min y) by: k where: (== k 0) from: Tbig}) 'mx) 0) -- 19990
+(at (at (select {mx: (max x) mn: (min y) by: k where: (== k 0) from: Tbig}) 'mn) 0) -- 20010
+(at (at (select {mx: (max x) mn: (min y) by: k where: (== k 7) from: Tbig}) 'mx) 0) -- 19997
+(at (at (select {mx: (max x) mn: (min y) by: k where: (== k 7) from: Tbig}) 'mn) 0) -- 20003
+(at (at (select {mx: (max x) mn: (min y) by: k where: (== k 9) from: Tbig}) 'mx) 0) -- 19999
+(at (at (select {mx: (max x) mn: (min y) by: k where: (== k 9) from: Tbig}) 'mn) 0) -- 20001
 
 ;; ─── parallel with SYM key (high-cardinality H2O id3 shape) ─────────
 (set Tsbig (table [k x y] (list (as 'SYMBOL (% (til N) 100)) (til N) (- (* 2 N) (til N)))))
@@ -101,3 +156,12 @@
 (count (select {mx: (max x) mn: (min y) by: k from: Tsbig})) -- 100
 (sum (at (select {mx: (max x) mn: (min y) by: k from: Tsbig}) 'mx)) -- 1994950
 (sum (at (select {mx: (max x) mn: (min y) by: k from: Tsbig}) 'mn)) -- 2005050
+;; Per-group pins on the parallel SYM path (emission order non-deterministic).
+;; Group idj has max x=j+19900, min y=20100-j.
+(at (at (select {mx: (max x) mn: (min y) by: k where: (== k '0) from: Tsbig}) 'mx) 0) -- 19900
+(at (at (select {mx: (max x) mn: (min y) by: k where: (== k '0) from: Tsbig}) 'mn) 0) -- 20100
+(at (at (select {mx: (max x) mn: (min y) by: k where: (== k '37) from: Tsbig}) 'mx) 0) -- 19937
+(at (at (select {mx: (max x) mn: (min y) by: k where: (== k '37) from: Tsbig}) 'mn) 0) -- 20063
+(at (at (select {mx: (max x) mn: (min y) by: k where: (== k '99) from: Tsbig}) 'mx) 0) -- 19999
+(at (at (select {mx: (max x) mn: (min y) by: k where: (== k '99) from: Tsbig}) 'mn) 0) -- 20001
+(at (at (select {mx: (max x) mn: (min y) by: k where: (== k '37) from: Tsbig}) 'k) 0) -- '37

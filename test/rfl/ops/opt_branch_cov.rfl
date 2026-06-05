@@ -118,12 +118,17 @@
 
 ;; (and (> a b) (> a c)) — both are col-col comparisons (no const),
 ;; so filter_cost adds +4 for each. Reorder must be stable.
+;; a=[1..10], b=[5..5], c=[1..1]; a>b: a∈{6,7,8,9,10}, a>c: a∈{2..10}. Both: {6..10} sum 40.
 (count (select {from: Tcc2 where: (and (> a b) (> a c))})) -- 5
+(sum (at (select {from: Tcc2 where: (and (> a b) (> a c))}) 'a)) -- 40
 ;; Same but reversed — result identical after reorder
 (count (select {from: Tcc2 where: (and (> a c) (> a b))})) -- 5
+(sum (at (select {from: Tcc2 where: (and (> a c) (> a b))}) 'a)) -- 40
 
 ;; Mix col-col and col-const: col-col should run later (more expensive)
+;; a>b ∩ a>3 → a∈{6..10} (same set since a>5 dominates) ; sum 40.
 (count (select {from: Tcc2 where: (and (> a b) (> a 3))})) -- 5
+(sum (at (select {from: Tcc2 where: (and (> a b) (> a 3))}) 'a)) -- 40
 
 ;; ════════════════════════════════════════════════════════════════════════
 ;; 9. Deeply nested AND — exercises split_and_filter iteration loop
@@ -132,16 +137,15 @@
 (set Tdeep (table [a b c d] (list [1 2 3 4 5 6 7 8 9 10] [10 20 30 40 50 60 70 80 90 100] [100 200 300 400 500 600 700 800 900 1000] ['x 'y 'z 'x 'y 'z 'x 'y 'z 'x])))
 
 ;; 5-way AND: requires multiple split iterations since nested ANDs form a tree
-(count (select {from: Tdeep where: (and (> a 2) (< a 9) (> b 20) (< b 90) (== d 'x))}))
-;; a in {3..8}, b in {30..80}, d='x' at positions {1,4,7,10}→{4,7}
-;; rows: a={3..8}={3,4,5,6,7,8}, b correspondingly={30,40,50,60,70,80}
-;; d='x' at a={1,4,7,10}: a=4 (b=40,d=x), a=7 (b=70,d=x)
-;; Both satisfy all predicates: a>2, a<9, b>20, b<90, d='x' → 2 rows
+;; d='x' at a={1,4,7,10}: a=4 (b=40), a=7 (b=70). Both within 2<a<9 and 20<b<90 → 2 rows; a sum 11, b sum 110.
+(count (select {from: Tdeep where: (and (> a 2) (< a 9) (> b 20) (< b 90) (== d 'x))})) -- 2
+(sum (at (select {from: Tdeep where: (and (> a 2) (< a 9) (> b 20) (< b 90) (== d 'x))}) 'a)) -- 11
+(sum (at (select {from: Tdeep where: (and (> a 2) (< a 9) (> b 20) (< b 90) (== d 'x))}) 'b)) -- 110
 
 ;; 6-way AND: deeper nesting → more split iterations
-(count (select {from: Tdeep where: (and (> a 1) (< a 10) (> b 10) (< b 100) (> c 100) (== d 'z))}))
-;; a in {2..9}, b in {20..90}, c in {200..900}, d='z' at a={3,6,9}
-;; All three rows satisfy the a/b/c range predicates → 3 rows
+;; d='z' at a={3,6,9}, all in a∈(1,10), b in (10,100), c in (100,∞) → 3 rows ; a sum 18.
+(count (select {from: Tdeep where: (and (> a 1) (< a 10) (> b 10) (< b 100) (> c 100) (== d 'z))})) -- 3
+(sum (at (select {from: Tdeep where: (and (> a 1) (< a 10) (> b 10) (< b 100) (> c 100) (== d 'z))}) 'a)) -- 18
 
 ;; ════════════════════════════════════════════════════════════════════════
 ;; 10. fold_binary_const with DIV edge cases in WHERE

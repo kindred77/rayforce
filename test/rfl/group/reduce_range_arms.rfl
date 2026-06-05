@@ -84,7 +84,9 @@
 ;; read_col_i64 and reduces over them.  min/max preserve SYM type
 ;; (cf. test/rfl/agg/min_max_sym.rfl).  This drives the !has_nulls &&
 ;; !idx specialisation of the SYM arm.
+(min ['alpha 'beta 'gamma]) -- 'alpha
 (type (min ['alpha 'beta 'gamma])) -- 'sym
+(max ['alpha 'beta 'gamma]) -- 'gamma
 (type (max ['alpha 'beta 'gamma])) -- 'sym
 (== (min ['z 'z 'z]) 'z) -- true
 
