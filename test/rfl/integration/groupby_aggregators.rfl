@@ -200,13 +200,8 @@
 ;; A where-clause filter with a PLAIN literal is correct (k=7 → v∈{7,…,997}):
 (min (at (select {from: Ti32 where: (== k 7)}) 'v)) -- 7
 (sum (at (select {from: Ti32 where: (== k 7)}) 'v)) -- 50200
-;; BUG (xfail): the SAME where-clause filter with a TYPED I32 scalar (as 'I32 7)
-;; returns 100 rows (correct cardinality) whose v values are the k=0 group
-;; (min 0, sum 49500) instead of k=7. The typed scalar appears to be read as 0
-;; in the filter path. Does NOT reproduce with a plain literal or a bare vector
-;; ==. Correct expected values preserved in comments; restore once fixed:
-;;   (min (at (select {from: Ti32 where: (== k (as 'I32 7))}) 'v)) -- 7
-;;   (sum (at (select {from: Ti32 where: (== k (as 'I32 7))}) 'v)) -- 50200
-;; Current (buggy) behaviour pinned so a future fix flips this to a FAIL:
-(min (at (select {from: Ti32 where: (== k (as 'I32 7))}) 'v)) -- 0
-(sum (at (select {from: Ti32 where: (== k (as 'I32 7))}) 'v)) -- 49500
+;; FIXED: a typed I32 scalar in a where-clause filter is now read at its true
+;; 4-byte width during the I32→I64 promotion (expr.c expr_exec_unary CAST arm),
+;; so (== k (as 'I32 7)) selects the k=7 group, matching the plain-literal path.
+(min (at (select {from: Ti32 where: (== k (as 'I32 7))}) 'v)) -- 7
+(sum (at (select {from: Ti32 where: (== k (as 'I32 7))}) 'v)) -- 50200

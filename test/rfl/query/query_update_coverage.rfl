@@ -49,8 +49,10 @@
 ;; the I32 WHERE null-broadcast corrupts them. (See the dedicated BUG block
 ;; near the end of this file for the minimal repro + control cases.)
 (nil? (at (at Ti32n 'val) 0)) -- true
-;; (at (at Ti32n 'val) 1) -- 200   ;; xfail BUG: I32 WHERE null-broadcast clobbers row 1 (gets 300)
-;; (at (at Ti32n 'val) 2) -- 300   ;; xfail BUG: I32 WHERE null-broadcast clobbers row 2 (garbage)
+;; FIXED: the WHERE-update merge loop now strides the source column at its
+;; true element width (ray_elem_size), so the unmasked I32 rows are preserved.
+(at (at Ti32n 'val) 1) -- 200
+(at (at Ti32n 'val) 2) -- 300
 ;; Now do cross-type F64 update on the I32-with-null column
 ;; Update where id==3i so row 2 is masked, rows 0,1 are unmasked
 ;; Row 0 (id=1,val=0Ni) is unmasked → null prop fires → switch case RAY_I32
@@ -559,9 +561,9 @@
 ;; ────────────────────────────────────────────────────────────────────
 ;; selected row 0 correctly becomes null (this part works):
 (nil? (at (at (update {v: 0Ni from: (table [k v] (list [1i 2i 3i] [10i 20i 30i])) where: (== k 1i)}) 'v) 0)) -- true
-;; surviving rows are corrupted — the bug:
-;; (at (at (update {v: 0Ni from: (table [k v] (list [1i 2i 3i] [10i 20i 30i])) where: (== k 1i)}) 'v) 1) -- 20   ;; xfail BUG: gets 30
-;; (at (at (update {v: 0Ni from: (table [k v] (list [1i 2i 3i] [10i 20i 30i])) where: (== k 1i)}) 'v) 2) -- 30   ;; xfail BUG: gets garbage
+;; FIXED: surviving rows preserved (source stride = ray_elem_size(I32)=4):
+(at (at (update {v: 0Ni from: (table [k v] (list [1i 2i 3i] [10i 20i 30i])) where: (== k 1i)}) 'v) 1) -- 20
+(at (at (update {v: 0Ni from: (table [k v] (list [1i 2i 3i] [10i 20i 30i])) where: (== k 1i)}) 'v) 2) -- 30
 ;; Control: I64 (0Nl) and F64 (0Nf) null-broadcast in the same WHERE-update
 ;; are CORRECT — proving the defect is specific to the I32 case.
 (at (at (update {v: 0Nl from: (table [k v] (list [1 2 3] [10 20 30])) where: (== k 1)}) 'v) 1) -- 20

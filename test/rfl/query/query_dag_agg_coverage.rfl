@@ -180,14 +180,13 @@
 ;; WHERE-sensitivity with a key-masked SOURCE lookup.  no-by control proves the
 ;; filter itself is correct (1 surviving row → 1 distinct (A,1) group expected).
 (count (select {from: Tnomk where: (and (> val 15) (== k2 1))})) -- 1
-;; xfail BUG (query.c multi-key SYM-vector no-agg by-group path): a no-agg
-;; `select {by: [k1 k2] ... where: ...}` IGNORES the WHERE filter when forming
-;; groups — it groups the UNFILTERED key columns.  The no-by control above proves
-;; the filter is correct (1 surviving row → exactly 1 distinct group (A,1)).  The
-;; grouped path returns 2 (every distinct (k1,k2) pair of the full table).  The
-;; bare `where: (> val 15)` count of 2 above only PASSES because the full table
-;; also has 2 distinct pairs — a coincidence that masked this bug.
-;; (count (select {by: [k1 k2] from: Tnomk where: (and (> val 15) (== k2 1))})) -- 1   ;; xfail BUG: should be 1, produces 2
+;; FIXED (query.c multi-key SYM-vector no-agg by-group path): a no-agg
+;; `select {by: [k1 k2] ... where: ...}` now routes to eval-level grouping
+;; (n_out==0 multi-key, mirroring the GUID case) instead of the DAG no-agg
+;; fallback that re-evaluated the by SYM-vector as a literal and ignored WHERE.
+;; The no-by control above proves the filter is correct (1 surviving row → 1
+;; distinct group (A,1)).
+(count (select {by: [k1 k2] from: Tnomk where: (and (> val 15) (== k2 1))})) -- 1
 
 ;; Three-key version
 (set Tnomk3 (table [k1 k2 k3 val] (list ['A 'A 'B 'B 'C] ['X 'X 'Y 'Y 'Z] [1 1 2 2 3] [5 10 15 20 25])))
@@ -198,10 +197,18 @@
 ;; WHERE-sensitivity probe: add `(== k1 'B)`.  no-by control: 2 surviving rows
 ;; (both (B,Y,2)) → 1 distinct group expected.
 (count (select {from: Tnomk3 where: (and (> val 8) (== k1 'B))})) -- 2
-;; xfail BUG: same multi-key SYM-vector no-agg by-group WHERE-drop as above.
-;; no-by control: 2 surviving rows (both (B,Y,2)) → 1 distinct group expected.
-;; The 3-key grouped path returns 3 (all distinct triples of the full table).
-;; (count (select {by: [k1 k2 k3] from: Tnomk3 where: (and (> val 8) (== k1 'B))})) -- 1   ;; xfail BUG: should be 1, produces 3
+;; FIXED: same multi-key SYM-vector no-agg by-group WHERE routing as above.
+;; no-by control: 2 surviving rows (both (B,Y,2)) → 1 distinct group.
+(count (select {by: [k1 k2 k3] from: Tnomk3 where: (and (> val 8) (== k1 'B))})) -- 1
+;; The key columns are correct under the new eval-group routing:
+(at (at (select {by: [k1 k2] from: Tnomk where: (and (> val 15) (== k2 1))}) 'k1) 0) -- 'A
+(at (at (select {by: [k1 k2] from: Tnomk where: (and (> val 15) (== k2 1))}) 'k2) 0) -- 1
+;; KNOWN LIMITATION (xfail): the multi-key no-agg eval-group path returns only
+;; the key columns — it does NOT carry first-of-group non-key columns the way
+;; the single-key no-agg path does (`select {by: k1}` keeps 'val).  The reported
+;; WHERE-ignored grouping bug is fixed (counts/keys above are correct); the
+;; non-key first-of-group gather for the multi-key path is a separate follow-up.
+;; (at (at (select {by: [k1 k2] from: Tnomk where: (and (> val 15) (== k2 1))}) 'val) 0) -- 20   ;; xfail: non-key col dropped on multi-key no-agg
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; No-agg by-group with LIST column (lines 6789-6800)
@@ -220,16 +227,14 @@
 ;; no-WHERE result is unsafe.  The order-independent way is a key-masked SCALAR
 ;; SOURCE lookup (`by: k` + `where: (== k <key>)` → exactly one group), then read
 ;; the first-of-group 'lst.  First-of-group: A = row 0 = [1 2]; B = row 1 = [3 4].
-;; xfail BUG (query.c no-agg by-group, non-key LIST column): the LIST column is
-;; DROPPED from the result whenever `where:` is present.  The masked result is
-;; 1x1 (key only) and accessing 'lst raises a domain error.  Verified
-;; LIST-specific: the same shape with a non-key INT column under `where:` keeps
-;; the column (1x2 — see Tsp/Tnomk above), and the LIST column survives when
-;; `where:` is absent (2x2).  Correct first-of-group: A=[1 2], B=[3 4].
-;; (at (at (at (select {by: k from: Tnoagg_lst where: (== k 'A)}) 'lst) 0) 0) -- 1   ;; xfail BUG: 'lst column dropped under where: → domain error
-;; (at (at (at (select {by: k from: Tnoagg_lst where: (== k 'A)}) 'lst) 0) 1) -- 2   ;; xfail BUG: same
-;; (at (at (at (select {by: k from: Tnoagg_lst where: (== k 'B)}) 'lst) 0) 0) -- 3   ;; xfail BUG: same
-;; (at (at (at (select {by: k from: Tnoagg_lst where: (== k 'B)}) 'lst) 0) 1) -- 4   ;; xfail BUG: same
+;; FIXED (sel_compact no longer drops non-key LIST columns): RAY_LIST==0 was
+;; rejected by typed_vec_new, leaving the column NULL and silently dropped under
+;; WHERE.  sel_compact now allocates LIST via ray_list_new and gathers its
+;; element pointers with a retain.  Correct first-of-group: A=[1 2], B=[3 4].
+(at (at (at (select {by: k from: Tnoagg_lst where: (== k 'A)}) 'lst) 0) 0) -- 1
+(at (at (at (select {by: k from: Tnoagg_lst where: (== k 'A)}) 'lst) 0) 1) -- 2
+(at (at (at (select {by: k from: Tnoagg_lst where: (== k 'B)}) 'lst) 0) 0) -- 3
+(at (at (at (select {by: k from: Tnoagg_lst where: (== k 'B)}) 'lst) 0) 1) -- 4
 ;; The key column IS retained under WHERE — assert the masked group key (passes):
 (at (at (select {by: k from: Tnoagg_lst where: (== k 'A)}) 'k) 0) -- 'A
 (at (at (select {by: k from: Tnoagg_lst where: (== k 'B)}) 'k) 0) -- 'B
