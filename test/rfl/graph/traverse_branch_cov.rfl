@@ -457,10 +457,10 @@
 ;; ---------------------------------------------------------------------
 (set MstTri (.graph.mst Tri3))
 (count MstTri)                                      -- 2
-;; 3-cycle with unit weights: any 2 of the 3 edges span it; the builtin
-;; picks edges 0-1 and 1-2, total weight 2.0.
-(at MstTri '_src)                                  -- [0 1]
-(at MstTri '_dst)                                  -- [1 2]
+;; 3-cycle with unit weights: any 2 of the 3 edges span it, so the MST edge
+;; SET is non-unique and which pair is kept depends on the weight sort's
+;; tie-break (platform-dependent).  Assert only the robust invariants: 2
+;; edges, total weight 2.0.
 (sum (at MstTri '_weight))                          -- 2.0
 
 ;; ---------------------------------------------------------------------
@@ -470,9 +470,10 @@
 (set MstDia (.graph.mst Dia))
 (count MstDia)                                      -- 3
 ;; Cheapest spanning tree skips the weight-5 edge 0->2: picks 0-1,1-2,2-3,
-;; each weight 1.0, total 3.0.
-(at MstDia '_src)                                  -- [0 1 2]
-(at MstDia '_dst)                                  -- [1 2 3]
+;; each weight 1.0, total 3.0.  The edge SET is unique (the three weight-1
+;; edges) but the emit order is tie-break-dependent, so compare sorted.
+(asc (at MstDia '_src))                            -- [0 1 2]
+(asc (at MstDia '_dst))                            -- [1 2 3]
 (sum (at MstDia '_weight))                          -- 3.0
 
 ;; ---------------------------------------------------------------------

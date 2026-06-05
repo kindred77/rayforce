@@ -128,14 +128,16 @@
 (set Mst (.graph.mst G))
 ;; A spanning tree on 6 nodes has exactly 5 edges.
 (count Mst)                                     -- 5
-;; WHICH edges, not just how many.  Kruskal picks the three weight-1
-;; edges (0->1, 2->3, 4->5) first, then weight-2 (1->2) to bridge, then
-;; weight-2 (3->5) to attach the {4,5} component -- emitted in that pick
-;; order: (0,1),(2,3),(4,5),(1,2),(3,5).
-(at Mst '_src)                                  -- [0 2 4 1 3]
-(at Mst '_dst)                                  -- [1 3 5 2 5]
-(at Mst '_weight)                               -- [1.0 1.0 1.0 2.0 2.0]
-;; Total spanning-tree weight is 1+1+1+2+2 = 7.
+;; WHICH edges, not just how many.  The MST edge SET is determined by weight
+;; (the three weight-1 edges 0-1,2-3,4-5 are forced; two weight-2 edges 1-2
+;; and 3-5 bridge the components), but Kruskal's emit ORDER depends on how the
+;; weight sort tie-breaks equal-weight edges -- and that differs across
+;; platforms (qsort is not stable).  Assert the order-independent edge
+;; multiset (sorted columns) plus the total weight, not the pick order.
+(asc (at Mst '_src))                            -- [0 1 2 3 4]
+(asc (at Mst '_dst))                            -- [1 2 3 5 5]
+(asc (at Mst '_weight))                         -- [1.0 1.0 1.0 2.0 2.0]
+;; Total spanning-tree weight is 1+1+1+2+2 = 7 (unique-MST invariant).
 (< (abs (- (sum (at Mst '_weight)) 7.0)) 1e-9)  -- true
 
 ;; -------------- (.graph.degree) -- sanity --------------
@@ -168,10 +170,12 @@
 ;; be at least one row in the result and the destination is reachable.
 (set Sp (.graph.shortest-path G 0 5))
 (>= (count Sp) 1)                               -- true
-;; The actual path nodes and per-hop depth, not just "non-empty".  BFS
-;; returns the 3-hop route 0->1->3->5 (depths 0,1,2,3); the destination 5
-;; is the final row.
-(at Sp '_node)                                  -- [0 1 3 5]
+;; A shortest 0->5 route is 3 hops (4 nodes), but several equal-length paths
+;; exist (0->1->3->5, 0->2->3->5, ...) and which one BFS returns depends on
+;; adjacency iteration order (platform-dependent).  Assert the order-
+;; independent invariants -- 4 nodes, monotonic per-hop depth, fixed
+;; endpoints -- not the specific intermediate nodes.
+(count Sp)                                      -- 4
 (at Sp '_depth)                                 -- [0 1 2 3]
 (first (at Sp '_node))                          -- 0
 (last (at Sp '_node))                           -- 5
