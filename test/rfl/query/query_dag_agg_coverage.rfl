@@ -203,12 +203,16 @@
 ;; The key columns are correct under the new eval-group routing:
 (at (at (select {by: [k1 k2] from: Tnomk where: (and (> val 15) (== k2 1))}) 'k1) 0) -- 'A
 (at (at (select {by: [k1 k2] from: Tnomk where: (and (> val 15) (== k2 1))}) 'k2) 0) -- 1
-;; KNOWN LIMITATION (xfail): the multi-key no-agg eval-group path returns only
-;; the key columns — it does NOT carry first-of-group non-key columns the way
-;; the single-key no-agg path does (`select {by: k1}` keeps 'val).  The reported
-;; WHERE-ignored grouping bug is fixed (counts/keys above are correct); the
-;; non-key first-of-group gather for the multi-key path is a separate follow-up.
-;; (at (at (select {by: [k1 k2] from: Tnomk where: (and (> val 15) (== k2 1))}) 'val) 0) -- 20   ;; xfail: non-key col dropped on multi-key no-agg
+;; FIXED: the multi-key no-agg eval-group path now also carries the
+;; first-of-group value of every non-key column (native type, matching the
+;; single-key `select {by: k1}` semantics), not just the key columns.
+;; Surviving (A,1) group → first row val = 20:
+(at (at (select {by: [k1 k2] from: Tnomk where: (and (> val 15) (== k2 1))}) 'val) 0) -- 20
+;; No-WHERE: groups (A,1) and (B,2), first-of-group val = 10 and 30:
+(at (at (select {by: [k1 k2] from: Tnomk}) 'val) 0) -- 10
+(at (at (select {by: [k1 k2] from: Tnomk}) 'val) 1) -- 30
+;; first-of-group val column is native I64, not a LIST wrap:
+(type (at (select {by: [k1 k2] from: Tnomk}) 'val)) -- 'I64
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; No-agg by-group with LIST column (lines 6789-6800)
