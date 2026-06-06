@@ -43,3 +43,10 @@
 (set Gx (guid 8))
 (set Txgu (table [g] (list Gx)))
 (== (max Gx) (at (at (select {r: (max g) from: Txgu}) 'r) 0)) -- true
+
+;; ── BOOL max preserves the BOOL type (scalar used to widen to i64). ──
+(max [false false true])        -- true
+(type (max [false false true])) -- 'b8
+(set Txb (table [b] (list [false false true])))
+(at (select {r: (max b) from: Txb}) 'r)        -- [true]
+(type (at (select {r: (max b) from: Txb}) 'r)) -- 'B8

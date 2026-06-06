@@ -42,3 +42,12 @@
 (set Gm (guid 8))
 (set Tmgu (table [g] (list Gm)))
 (== (min Gm) (at (at (select {r: (min g) from: Tmgu}) 'r) 0)) -- true
+
+;; ── BOOL min preserves the BOOL type (min/max keep their element type).
+;; The scalar reduction used to widen BOOL to i64 while the DAG kept bool;
+;; both now return a BOOL atom/column. ──
+(min [true false true])        -- false
+(type (min [true false true])) -- 'b8
+(set Tmb (table [b] (list [true false true])))
+(at (select {r: (min b) from: Tmb}) 'r)        -- [false]
+(type (at (select {r: (min b) from: Tmb}) 'r)) -- 'B8

@@ -30,7 +30,7 @@
 ;; "abcabc","abc?" → 4.
 (count (select {from: TS where: (like s "abc*")})) -- 4
 ;; Value-pair: every kept row must START with "abc" — assert by re-applying like.
-(min (like (at (select {from: TS where: (like s "abc*")}) 's) "abc*")) -- 1
+(min (like (at (select {from: TS where: (like s "abc*")}) 's) "abc*")) -- true
 ;; SHAPE_PREFIX miss
 (count (select {from: TS where: (like s "qq*")})) -- 0
 
@@ -38,13 +38,13 @@
 ;; "ABC"-not (case-sensitive), "abcabc","zabc" → 4.
 (count (select {from: TS where: (like s "*abc")})) -- 4
 ;; Value-pair: every kept row must END with "abc".
-(min (like (at (select {from: TS where: (like s "*abc")}) 's) "*abc")) -- 1
+(min (like (at (select {from: TS where: (like s "*abc")}) 's) "*abc")) -- true
 
 ;; SHAPE_CONTAINS — "*<lit>*" memmem path.  "abc" substring appears in:
 ;; "abc","abcdef","xyzabc","abcabc","zabc","abc?" → 6.
 (count (select {from: TS where: (like s "*abc*")})) -- 6
 ;; Value-pair: every kept row must CONTAIN "abc".
-(min (like (at (select {from: TS where: (like s "*abc*")}) 's) "*abc*")) -- 1
+(min (like (at (select {from: TS where: (like s "*abc*")}) 's) "*abc*")) -- true
 
 ;; SHAPE_ANY — single "*" — must match every row including "".
 (count (select {from: TS where: (like s "*")})) -- 10
@@ -83,21 +83,21 @@
 ;; SHAPE_EXACT — 'abc appears twice; case-sensitive so 'ABC is excluded.
 (count (select {from: TY where: (like s "abc")})) -- 2
 ;; Every kept row must equal 'abc — assert min == 'abc and max == 'abc.
-(min (== (at (select {from: TY where: (like s "abc")}) 's) 'abc)) -- 1
+(min (== (at (select {from: TY where: (like s "abc")}) 's) 'abc)) -- true
 
 ;; SHAPE_PREFIX — sym_ids starting with "abc": 'abc(×2), 'abcdef(×2),
 ;; 'abcabc → 5.
 (count (select {from: TY where: (like s "abc*")})) -- 5
-(min (like (at (select {from: TY where: (like s "abc*")}) 's) "abc*")) -- 1
+(min (like (at (select {from: TY where: (like s "abc*")}) 's) "abc*")) -- true
 
 ;; SHAPE_SUFFIX — ends with "abc": 'abc(×2), 'xyzabc, 'abcabc, 'zabc → 5.
 (count (select {from: TY where: (like s "*abc")})) -- 5
-(min (like (at (select {from: TY where: (like s "*abc")}) 's) "*abc")) -- 1
+(min (like (at (select {from: TY where: (like s "*abc")}) 's) "*abc")) -- true
 
 ;; SHAPE_CONTAINS — contains "abc": 'abc(×2), 'abcdef(×2), 'xyzabc,
 ;; 'abcabc, 'zabc → 7.
 (count (select {from: TY where: (like s "*abc*")})) -- 7
-(min (like (at (select {from: TY where: (like s "*abc*")}) 's) "*abc*")) -- 1
+(min (like (at (select {from: TY where: (like s "*abc*")}) 's) "*abc*")) -- true
 
 ;; SHAPE_ANY — every row.
 (count (select {from: TY where: (like s "*")})) -- 10

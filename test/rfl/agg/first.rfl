@@ -33,6 +33,9 @@
 (type (first (as 'TIMESTAMP [1 2]))) -- 'timestamp
 (first [0x01 0x02 0xff])           -- 0x01
 (type (first [0x01 0x02 0xff]))    -- 'u8
+;; BOOL first preserves the BOOL type (was widened to i64 before)
+(first [true false true])          -- true
+(type (first [true false true]))   -- 'b8
 
 ;; ── Wide element types (STR/GUID): scalar first materialises the real
 ;; element, and the DAG (select) path must agree — no-by and by-group. ──

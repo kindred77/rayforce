@@ -349,8 +349,9 @@
 (distinct [true false true false]) -- [false true]
 (count (asc [true false true])) -- 3
 (asc [true false true]) -- [false true true]
-(first (asc [true false true])) -- 0
-(last  (asc [true false true])) -- 1
+;; first/last over a BOOL vector now preserve the BOOL type.
+(first (asc [true false true])) -- false
+(last  (asc [true false true])) -- true
 
 ;; ──────────────────────────────────────────────────────────────────────
 ;; Section M: large graph — exercises heap-alloc path for stk1/stk2
