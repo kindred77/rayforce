@@ -1351,6 +1351,136 @@ static test_result_t test_exec_join_multikey(void) {
     PASS();
 }
 
+/* ---- FULL OUTER JOIN (small / chained-HT path, mixed matched+unmatched) ----
+ * exec_join L1200-1234: small-path FULL OUTER append-unmatched-right block.
+ * Needs pair_count > 0 (some matches) AND some unmatched right rows so the
+ * memcpy at L1217-1219 (copy existing pairs into the grown buffer) fires. */
+static test_result_t test_exec_join_full_small_mixed(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t n_id = ray_sym_intern("id", 2);
+    int64_t n_val = ray_sym_intern("val", 3);
+    int64_t n_score = ray_sym_intern("score", 5);
+
+    /* Left: ids {1,2,3} */
+    int64_t lid[] = {1, 2, 3};
+    int64_t lval[] = {10, 20, 30};
+    ray_t* lid_v = ray_vec_from_raw(RAY_I64, lid, 3);
+    ray_t* lval_v = ray_vec_from_raw(RAY_I64, lval, 3);
+    ray_t* left = ray_table_new(2);
+    left = ray_table_add_col(left, n_id, lid_v);
+    left = ray_table_add_col(left, n_val, lval_v);
+    ray_release(lid_v); ray_release(lval_v);
+
+    /* Right: ids {2,3,4,5} — 2,3 match; 4,5 are unmatched right rows */
+    int64_t rid[] = {2, 3, 4, 5};
+    int64_t rscore[] = {200, 300, 400, 500};
+    ray_t* rid_v = ray_vec_from_raw(RAY_I64, rid, 4);
+    ray_t* rscore_v = ray_vec_from_raw(RAY_I64, rscore, 4);
+    ray_t* right = ray_table_new(2);
+    right = ray_table_add_col(right, n_id, rid_v);
+    right = ray_table_add_col(right, n_score, rscore_v);
+    ray_release(rid_v); ray_release(rscore_v);
+
+    ray_graph_t* g = ray_graph_new(left);
+    ray_op_t* left_op = ray_const_table(g, left);
+    ray_op_t* right_op = ray_const_table(g, right);
+    ray_op_t* k = ray_scan(g, "id");
+    ray_op_t* ka[] = { k };
+    ray_op_t* j = ray_join(g, left_op, ka, right_op, ka, 1, 2);
+
+    ray_t* res = ray_execute(g, j);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(res->type, RAY_TABLE);
+    /* id=1 unmatched-left, 2 matched, 3 matched, plus 4 & 5 unmatched-right.
+     * Total = 5 rows. */
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 5);
+
+    ray_release(res);
+    ray_graph_free(g);
+    ray_release(left);
+    ray_release(right);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ---- LEFT/FULL OUTER JOIN (radix path, empty right partitions) ----
+ * join_radix_build_probe_fn L451-472: a hash partition where rp->count == 0
+ * but lp->count > 0 emits the left rows as unmatched for join_type >= 1.
+ * Force it by giving the (large) right side a single repeated key so all
+ * right rows land in ONE radix partition, leaving the others right-empty
+ * while the left side's distinct keys spread across every partition. */
+static test_result_t test_exec_join_radix_empty_right_part(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t n_id = ray_sym_intern("id", 2);
+
+    /* Right: 70000 rows, all id = 7 → one populated radix partition. */
+    int64_t n_right = 70000;
+    ray_t* rid_v = ray_vec_new(RAY_I64, n_right);
+    rid_v->len = n_right;
+    int64_t* rid = (int64_t*)ray_data(rid_v);
+    for (int64_t i = 0; i < n_right; i++) rid[i] = 7;
+    ray_t* right = ray_table_new(1);
+    right = ray_table_add_col(right, n_id, rid_v);
+    ray_release(rid_v);
+
+    /* Left: 70000 rows, id = i * 1000000 (distinct, NONE equal to 7) →
+     * keys spread over all radix partitions, but zero matches.  This keeps
+     * the per-partition counts clean (no 1:N explosion) while still putting
+     * left rows into the right-empty partitions. */
+    int64_t n_left = 70000;
+    ray_t* lid_v = ray_vec_new(RAY_I64, n_left);
+    lid_v->len = n_left;
+    int64_t* lid = (int64_t*)ray_data(lid_v);
+    for (int64_t i = 0; i < n_left; i++) lid[i] = i * 1000000;
+    ray_t* left = ray_table_new(1);
+    left = ray_table_add_col(left, n_id, lid_v);
+    ray_release(lid_v);
+
+    /* LEFT OUTER (type 1): no matches → all 70000 left rows unmatched. */
+    {
+        ray_graph_t* g = ray_graph_new(left);
+        ray_op_t* left_op = ray_const_table(g, left);
+        ray_op_t* right_op = ray_const_table(g, right);
+        ray_op_t* k = ray_scan(g, "id");
+        ray_op_t* ka[] = { k };
+        ray_op_t* j = ray_join(g, left_op, ka, right_op, ka, 1, 1);
+        ray_t* res = ray_execute(g, j);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+        TEST_ASSERT_EQ_I(res->type, RAY_TABLE);
+        TEST_ASSERT_EQ_I(ray_table_nrows(res), 70000);
+        ray_release(res);
+        ray_graph_free(g);
+    }
+
+    /* FULL OUTER (type 2): no matches → 70000 unmatched left rows +
+     * 70000 unmatched right rows = 140000. */
+    {
+        ray_graph_t* g = ray_graph_new(left);
+        ray_op_t* left_op = ray_const_table(g, left);
+        ray_op_t* right_op = ray_const_table(g, right);
+        ray_op_t* k = ray_scan(g, "id");
+        ray_op_t* ka[] = { k };
+        ray_op_t* j = ray_join(g, left_op, ka, right_op, ka, 1, 2);
+        ray_t* res = ray_execute(g, j);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+        TEST_ASSERT_EQ_I(res->type, RAY_TABLE);
+        TEST_ASSERT_EQ_I(ray_table_nrows(res), 140000);
+        ray_release(res);
+        ray_graph_free(g);
+    }
+
+    ray_release(left);
+    ray_release(right);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 /* ---- WINDOW ---- */
 static test_result_t test_exec_window(void) {
     ray_heap_init();
@@ -17052,6 +17182,8 @@ const test_entry_t exec_entries[] = {
     { "exec/join_skewed", test_exec_join_skewed, NULL, NULL },
     { "exec/join_boundary", test_exec_join_boundary, NULL, NULL },
     { "exec/join_multikey", test_exec_join_multikey, NULL, NULL },
+    { "exec/join_full_small_mixed", test_exec_join_full_small_mixed, NULL, NULL },
+    { "exec/join_radix_empty_right_part", test_exec_join_radix_empty_right_part, NULL, NULL },
     { "exec/window", test_exec_window, NULL, NULL },
     { "exec/select", test_exec_select, NULL, NULL },
     { "exec/stddev", test_exec_stddev, NULL, NULL },

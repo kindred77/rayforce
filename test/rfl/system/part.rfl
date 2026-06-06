@@ -371,5 +371,27 @@
 (at Rt1 'date) -- [2024.01.10 2024.01.10 2024.01.10 2024.01.10]
 (at Rt1 'k) -- [1 2 3 1]
 
+;; ────────────── direct column access on a freshly-loaded parted table ──────────────
+;; A `.db.parted.get` table holds segmented (RAY_IS_PARTED) data columns and a
+;; RAY_MAPCOMMON partition-key column.  `(at table 'col)` must materialize them
+;; so `(at col i)` / count / asc / sum work — previously they raised `type`.
+(.sys.exec "rm -rf /tmp/rfl_part_atcol")
+(.db.splayed.set "/tmp/rfl_part_atcol/1/t/" (table [s v] (list ['apple 'banana] [1 2])))
+(.db.splayed.set "/tmp/rfl_part_atcol/2/t/" (table [s v] (list ['cherry 'date] [3 4])))
+(set Pac (.db.parted.get "/tmp/rfl_part_atcol/" 't))
+(count Pac) -- 4
+;; parted SYM column — direct element access + sorted set
+(at (at Pac 's) 0) -- 'apple
+(asc (at Pac 's)) -- ['apple 'banana 'cherry 'date]
+(count (at Pac 's)) -- 4
+;; parted I64 column
+(sum (at Pac 'v)) -- 10
+(at (at Pac 'v) 0) -- 1
+;; MAPCOMMON partition-key column
+(at (at Pac 'part) 0) -- 1
+(asc (distinct (at Pac 'part))) -- [1 2]
+(count (at Pac 'part)) -- 4
+(.sys.exec "rm -rf /tmp/rfl_part_atcol")
+
 ;; ────────────── teardown ──────────────
 (.sys.exec "rm -rf /tmp/rfl_part_date /tmp/rfl_part_int /tmp/rfl_part_sym /tmp/rfl_part_single /tmp/rfl_part_empty /tmp/rfl_part_missing /tmp/rfl_part_three /tmp/rfl_part_cd /tmp/rfl_part_cd_sym /tmp/rfl_part_minute /tmp/rfl_part_like /tmp/rfl_part_mc /tmp/rfl_part_mb")

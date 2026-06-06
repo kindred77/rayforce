@@ -164,6 +164,19 @@
 (at (asof-join [ID Ts] ajL7 ajR7) 'Ref) -- [100 300 200 400]
 
 ;; ──────────────────────────────────────────────────────────────────
+;; asof-join: right times DESCENDING within a single partition.
+;; Forces the right-side bottom-up mergesort to reorder by time, hitting
+;; the `rt_time[ai] > rt_time[bi]` tie-break swap (exec_window_join L1803).
+;; Times are non-sorted within the part, so the part-index presort
+;; fast-path is rejected and the O(N log N) sort definitely runs.
+;; Right (a), (time,Ref) descending in time: (04,100)(03,200)(02,300)(01,400).
+;; Left (a, 10:00:03.500) → newest right time <= it is 03.000 → Ref 200.
+;; ──────────────────────────────────────────────────────────────────
+(set ajDL (table [Sym Time Px] (list [a] [10:00:03.500] [10.0])))
+(set ajDR (table [Sym Time Ref] (list [a a a a] [10:00:04.000 10:00:03.000 10:00:02.000 10:00:01.000] [100 200 300 400])))
+(at (asof-join [Sym Time] ajDL ajDR) 'Ref) -- [200]
+
+;; ──────────────────────────────────────────────────────────────────
 ;; asof-join: Date time type (32-bit) — exercises READ_TIME macro L1597
 ;; ──────────────────────────────────────────────────────────────────
 (set ajLD (table [Grp Date Val] (list [a a] [2024.01.02 2024.01.05] [10 20])))

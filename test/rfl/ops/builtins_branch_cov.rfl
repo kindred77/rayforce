@@ -1238,6 +1238,62 @@
 (nil? (at (as 'I64 (as 'F64 [1.0 0Nf 3.0])) 1)) -- true
 
 ;; ═════════════════════════════════════════════════════════════════════
+;; 55. atom_hash temporal/GUID atom branches (lines 2120-2128)
+;;    Reached when group()'s RAY_LIST path hashes a boxed list whose
+;;    elements are scalar temporal/guid atoms.  Mixing a string into each
+;;    inner list forces a boxed LIST (not a homogeneous typed vector), so
+;;    atom_hash recurses into the scalar -RAY_DATE / -RAY_TIME /
+;;    -RAY_TIMESTAMP / -RAY_GUID atom cases.
+;; ═════════════════════════════════════════════════════════════════════
+
+;; -RAY_DATE atom hash (line 2121-2122): 2 distinct dates → 2 groups
+(count (group (list (list 2000.01.01 "x") (list 2000.01.01 "x") (list 2000.01.02 "x")))) -- 2
+
+;; -RAY_TIME atom hash (line 2121-2122): 2 distinct times → 2 groups
+(count (group (list (list 12:00:00.000 "x") (list 12:00:00.000 "x") (list 13:00:00.000 "x")))) -- 2
+
+;; -RAY_TIMESTAMP atom hash (line 2123): equal timestamps → 1 group
+(count (group (list (list (as 'TIMESTAMP "2020-01-01T00:00:00") "x") (list (as 'TIMESTAMP "2020-01-01T00:00:00") "x")))) -- 1
+
+;; -RAY_GUID atom hash (lines 2124-2128): 2 distinct guids → 2 groups
+(count (group (list (list (as 'GUID "00000000-0000-0000-0000-000000000001") "x") (list (as 'GUID "00000000-0000-0000-0000-000000000001") "x") (list (as 'GUID "00000000-0000-0000-0000-000000000002") "x")))) -- 2
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 56. cast_vec_numeric slow-path per-element switch (lines 1175-1183)
+;;    The fast path is skipped when the source vector is STR, so casting a
+;;    STR vector to a numeric/bool target drives the per-element slow loop
+;;    and exercises each out_type arm (I32/I16/U8/F64/BOOL).
+;; ═════════════════════════════════════════════════════════════════════
+
+;; STR vec → I32 (slow loop, RAY_I32 arm)
+(at (as 'I32 (enlist "10" "20" "30")) 0) -- 10i
+(type (as 'I32 (enlist "10" "20"))) -- 'I32
+
+;; STR vec → I16 (slow loop, RAY_I16 arm)
+(at (as 'I16 (enlist "1" "2")) 1) -- 2h
+
+;; STR vec → U8 (slow loop, RAY_U8 arm)
+(at (as 'U8 (enlist "5" "6")) 0) -- 0x05
+(type (as 'U8 (enlist "5" "6"))) -- 'U8
+
+;; STR vec → F64 (slow loop, RAY_F64 arm)
+(at (as 'F64 (enlist "1.5" "2.5")) 0) -- 1.5
+
+;; STR vec → B8 (slow loop, RAY_BOOL arm) — length-based: non-empty=true
+(at (as 'B8 (enlist "x" "")) 0) -- true
+(at (as 'B8 (enlist "x" "")) 1) -- false
+
+;; ═════════════════════════════════════════════════════════════════════
+;; 57. ray_concat_fn dict-concat heterogeneous-key fallback (lines 2920-2934)
+;;    A dict whose key vector is neither SYM nor I64/TIMESTAMP (here F64)
+;;    falls into the else branch that boxes each key via collection_elem
+;;    and upserts it.  Concat of two F64-keyed dicts drives this.
+;; ═════════════════════════════════════════════════════════════════════
+
+(at (concat (dict [1.0] (list "a")) (dict [2.0] (list "b"))) 1.0) -- "a"
+(at (concat (dict [1.0] (list "a")) (dict [2.0] (list "b"))) 2.0) -- "b"
+
+;; ═════════════════════════════════════════════════════════════════════
 ;; UNREACHABLE BRANCHES (documented):
 ;;
 ;; Line 68: RAY_F32 case in null_literal_str — F32 typed null atom is
@@ -1281,10 +1337,18 @@
 ;; Lines 2638-2643: F32 group key reconstruction — F32 not directly
 ;;   constructible from RFL.
 ;;
+;; Lines 2552-2567: group_fn NaN float own-bucket path — UNREACHABLE.
+;;   In rayforce NULL_F64 == __builtin_nan(""), so every NaN is the F64
+;;   null sentinel and is caught earlier by ray_vec_is_null() (null
+;;   routing, line 2508).  Control never reaches the dedicated NaN
+;;   branch.  (Confirmed via test/rfl/arith/sqrt.rfl null semantics.)
+;;
 ;; Lines 2691-2696: gfail label — error cleanup path, only on OOM.
 ;;
 ;; Lines 2813, 2842, 2885: concat default type error for exotic types.
 ;;
-;; Lines 2902-2925: Dict concat with LIST/I64 keys — partially covered
-;;   by test 39/41 above; some sub-paths need non-SYM boxed keys.
+;; Lines 2902-2911: Dict concat with boxed-LIST keys — UNREACHABLE via
+;;   the `dict` builtin (ray_dict_fn requires ray_is_vec(keys), rejecting
+;;   boxed-list keys with a `type` error).  The non-SYM/non-I64 key
+;;   fallback (lines 2920-2934) IS now covered by test 57 (F64 keys).
 ;; ═════════════════════════════════════════════════════════════════════

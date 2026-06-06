@@ -1471,3 +1471,78 @@
 (at (at R53 'k) 0) -- 1
 (at (at R53 'k) 1) -- 2
 (at (at R53 'k) 2) -- 3
+
+;; ====================================================================
+;; Section 54: mk_par_fn SUM/MIN/MAX/AVG pass-2 (single key, narrow)
+;;
+;; Single-key group-by with non-COUNT aggregates + a WHERE predicate
+;; routes through exec_filtered_group_multi → mk_compile (v2 rejected
+;; because n_keys == 1) → mk_par_fn.  Exercises mk_par_fn's narrow
+;; per-agg state init (MIN=INT64_MAX, MAX=INT64_MIN) and the PASS-2
+;; per-agg accumulate loops for SUM/MIN/MAX/AVG (lines ~3453, ~3523-3553)
+;; that the COUNT-only tests above never reach.
+;; ====================================================================
+(set T54 (table [k v g] (list (as 'I64 [1 2 3 4 5 6 7 8 9 10]) (as 'I64 [10 20 30 40 50 60 70 80 90 100]) (as 'I64 [1 1 2 2 3 3 4 4 5 5]))))
+(set R54 (select {mn: (min v) mx: (max v) sm: (sum v) av: (avg v) from: T54 where: (> k 0) by: g}))
+(count R54) -- 5
+;; per-group: g=1 {10,20} g=2 {30,40} g=3 {50,60} g=4 {70,80} g=5 {90,100}
+(sum (at R54 'sm)) -- 550
+(sum (at R54 'mn)) -- 250
+(sum (at R54 'mx)) -- 300
+(sum (at R54 'av)) -- 275.0
+;; key-masked spot checks (group emission order is non-deterministic):
+;; min of group g==1 is 10, max is 20.
+(min (at R54 'mn)) -- 10
+(max (at R54 'mx)) -- 100
+
+;; SUM only, single key — separate mk_par_fn SUM pass-2.
+(set R54b (select {sm: (sum v) from: T54 where: (>= v 30) by: g}))
+;; rows with v>=30: groups g=2{30,40},g=3{50,60},g=4{70,80},g=5{90,100} → 4 groups
+(count R54b) -- 4
+(sum (at R54b 'sm)) -- 520
+
+;; ====================================================================
+;; Section 55: mk_par_fn WIDE path (two I64 keys = 16 bytes) MIN/MAX/AVG
+;;
+;; total_bytes (8+8) > 8 → ctx.wide = 1.  MIN/MAX aggs keep v2 disabled,
+;; so this routes to mk_par_fn's `wide` branch: composite key via
+;; mk_compose_key2 + slots_hi, wide per-agg state init (lines ~3492-3500)
+;; and the wide-slot probe.  mk_combine_and_materialize's wide serial
+;; dedup + mk_state_merge MIN/MAX merge cross-worker partials.
+;; ====================================================================
+(set T55 (table [a b v] (list (as 'I64 [1 1 2 2 1 1 2 2]) (as 'I64 [10 20 10 20 10 20 10 20]) (as 'I64 [5 6 7 8 9 1 2 3]))))
+;; Include sum so the wide branch's SUM state-init arm is exercised too.
+(set R55 (select {mn: (min v) mx: (max v) sm: (sum v) av: (avg v) from: T55 where: (> v 0) by: [a b]}))
+;; groups (a,b): (1,10){5,9}=min5/max9 (1,20){6,1}=min1/max6 (2,10){7,2}=min2/max7 (2,20){8,3}=min3/max8
+(count R55) -- 4
+(sum (at R55 'mn)) -- 11
+(sum (at R55 'mx)) -- 30
+(sum (at R55 'sm)) -- 41
+(min (at R55 'mn)) -- 1
+(max (at R55 'mx)) -- 9
+
+;; ====================================================================
+;; Section 56: mk_apply_count_emit_filter — non-COUNT order ops
+;;
+;; Multi-key group with a MIN/MAX/SUM aggregate plus `asc/desc <agg>
+;; take K` sets ray_group_emit_filter with agg_op == OP_MIN/MAX/SUM.
+;; mk_apply_count_emit_filter maps order_op → mk_agg kind and runs the
+;; top-K heap over the post-combine state (lines ~3648-3658 OP_SUM /
+;; OP_MIN / OP_MAX arms).  All 8 (a,b) pairs are distinct so each group
+;; holds one row (min==max==sum==v).
+;; ====================================================================
+(set T56 (table [a b v] (list (as 'I32 [1 1 2 2 3 3 4 4]) (as 'I32 [10 20 10 20 10 20 10 20]) (as 'I64 [5 6 7 8 90 1 2 3]))))
+;; MAX order, desc, top 2 → largest maxes 90 and 8 → sum 98.
+(set R56mx (select {mx: (max v) from: T56 where: (> a 0) by: [a b] desc: mx take: 2}))
+(count R56mx) -- 2
+(sum (at R56mx 'mx)) -- 98
+(max (at R56mx 'mx)) -- 90
+;; MIN order, asc, top 2 → smallest mins 1 and 2 → sum 3.
+(set R56mn (select {mn: (min v) from: T56 where: (> a 0) by: [a b] asc: mn take: 2}))
+(count R56mn) -- 2
+(sum (at R56mn 'mn)) -- 3
+(min (at R56mn 'mn)) -- 1
+;; SUM order, desc, top 2 → largest sums 90 and 8 → sum 98.
+(set R56sm (select {sm: (sum v) from: T56 where: (> a 0) by: [a b] desc: sm take: 2}))
+(count R56sm) -- 2
+(sum (at R56sm 'sm)) -- 98

@@ -1,0 +1,89 @@
+;; Pass-4 structural-coverage push for src/ops/sort.c.
+;;
+;; Targets reachable uncovered lines left after sort_coverage{,2,3}.rfl.
+;; Citations are line ranges in src/ops/sort.c (as of this revision).
+;; Thresholds: RADIX_SORT_THRESHOLD=4096, SMALL_POOL_THRESHOLD=8192,
+;; RAY_STRSORT_KEY_PARTS_MAX=4 (32-byte packed prefix),
+;; RAY_STRSORT_BASE_CASE=24.
+;; ====================================================================
+
+;; ────────────────────────────────────────────────────────────────────
+;; 1. STR sort tail comparison — strkey_cmp tail bytes (L1211-1220).
+;;
+;;    The packed strkey holds only the first RAY_STRSORT_KEY_PARTS_MAX*8
+;;    = 32 bytes.  Two records whose first 32 bytes are identical tie on
+;;    every packed part, so the comparator falls through to the pooled
+;;    tail memcmp.  strkey_cmp is only reached from the bucket
+;;    insertion-sort base case (<= RAY_STRSORT_BASE_CASE = 24 records),
+;;    and sort_str_msd_inplace only runs for nrows > 64.  So: pad the
+;;    input with short, first-byte-distinct strings that branch away at
+;;    byte 0, funnelling the long 32-byte-prefix strings into one small
+;;    bucket that reaches the insertion sort while the packed window is
+;;    still active.
+;; ────────────────────────────────────────────────────────────────────
+
+;; 5 long 'a'-prefixed strings (35 bytes, share the first 32 bytes,
+;; differ only in the "_sNN" tail) + 65 short padding rows.  The 5 long
+;; strings land in a <=24 bucket → insertion sort → strkey_cmp tail
+;; memcmp (L1211-1219).  All five tie on parts, so the tail bytes order
+;; them: _s01 < _s03 < _s05 < _s07 < _s09.
+(set Vtail (concat (concat ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_s01" "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_s09" "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_s05" "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_s03" "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_s07"] (take ["b0" "c1" "d2"] 35)) (take ["m0" "n1"] 30)))
+(count (asc Vtail)) -- 70
+;; 'a' (0x61) < every padding first byte, so the long strings sort first;
+;; among them the tail bytes give _s01 smallest.
+(at (asc Vtail) 0) -- "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_s01"
+(at (take (asc Vtail) -1) 0) -- "n1"
+;; descending: largest long-tail (_s09) is not first (padding 'n'/'m'
+;; outrank 'a'); just assert row count is preserved.
+(count (desc Vtail)) -- 70
+
+;; Tail length-tiebreak (L1220): one string a strict prefix of another
+;; beyond the 32-byte packed window — "pp..._x" is a prefix of
+;; "pp..._xy", so after the tail memcmp ties on the overlap the shorter
+;; one sorts first via the length compare.
+(set Vlen (concat (concat ["pppppppppppppppppppppppppppppppp_xy" "pppppppppppppppppppppppppppppppp_x"] (take ["b0" "c1"] 35)) (take ["m0" "n1"] 35)))
+(count (asc Vlen)) -- 72
+;; "pp..._x" < "pp..._xy" (length tiebreak); both sort after the 'b'/'c'
+;; padding but before 'm'/'n'.
+(at (asc Vlen) 0) -- "b0"
+;; verify the two p-strings are adjacent and correctly ordered.
+(at (asc Vlen) 70) -- "pppppppppppppppppppppppppppppppp_x"
+(at (asc Vlen) 71) -- "pppppppppppppppppppppppppppppppp_xy"
+
+;; ────────────────────────────────────────────────────────────────────
+;; 2. top / bot full-sort fallback — topk_take_vec (L3230-3238).
+;;
+;;    topk_indices_single only handles the radix-encodable whitelist;
+;;    STR / GUID / LIST return NULL, so top/bot fall back to a full
+;;    asc/desc sort followed by take.
+;; ────────────────────────────────────────────────────────────────────
+
+(set Vstr ["banana" "apple" "cherry" "date" "elderberry"])
+(top Vstr 2) -- ["elderberry" "date"]
+(bot Vstr 2) -- ["apple" "banana"]
+;; GUID also falls back (no packed uint64 encoding).
+(set Vguid (guid 6))
+(count (top Vguid 2)) -- 2
+(count (bot Vguid 2)) -- 2
+
+;; ────────────────────────────────────────────────────────────────────
+;; 3. asc / desc / xrank argument guards (value-asserting branches).
+;;
+;;    Atom passthrough (ray_asc_fn L3602 / ray_desc_fn L3629), length-1
+;;    passthrough (L3604-3605 / L3631-3632), and the xrank empty/zero
+;;    short-circuit (ray_xrank_fn L3934).
+;; ────────────────────────────────────────────────────────────────────
+
+;; asc/desc of an atom → returned unchanged (no sort).
+(asc 42) -- 42
+(desc 42) -- 42
+;; asc/desc of a length-1 vector → returned unchanged.
+(asc [7]) -- [7]
+(desc [7]) -- [7]
+;; rank of a length-1 vector → single rank 0.
+(rank [99]) -- [0]
+;; xrank short-circuits to an empty I64 vec for n_groups<=0 or empty input.
+(count (xrank 0 [1 2 3])) -- 0
+(count (xrank 3 [])) -- 0
+;; xrank happy path: n_groups buckets over the sorted order.
+(xrank 2 [10 40 20 30]) -- [0 1 0 1]

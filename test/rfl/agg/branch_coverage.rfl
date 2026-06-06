@@ -98,16 +98,22 @@
 ;; ════════════════════════════════════════════════════════════════════
 ;; 5. Parted avg type error (L158) and parted minmax type error (L185)
 ;; ════════════════════════════════════════════════════════════════════
-;; SYM base type is non-numeric; hits the type error path.
+;; A direct `(at Psym 's)` now MATERIALIZES the parted column.  min/max of a
+;; SYM column are DEFINED (lexicographic order), not type errors — the earlier
+;; `!- type` assertions here only passed because accessing the parted column
+;; itself raised `type` (now fixed); they were a false positive.
 (.sys.exec "rm -rf /tmp/rfl_agg_bc_psym")
 (set Tps1 (table [s] (list ['a 'b 'c])))
 (set Tps2 (table [s] (list ['d 'e])))
 (.db.splayed.set "/tmp/rfl_agg_bc_psym/1/t/" Tps1)
 (.db.splayed.set "/tmp/rfl_agg_bc_psym/2/t/" Tps2)
 (set Psym (.db.parted.get "/tmp/rfl_agg_bc_psym/" 't))
+(min (at Psym 's)) -- 'a
+(max (at Psym 's)) -- 'e
+;; FIXED: avg of a non-numeric SYM column now raises `type` — ray_avg_fn's
+;; vector path guards on a numeric element type before aggregating, instead of
+;; silently averaging the raw symbol-dictionary ids.
 (avg (at Psym 's)) !- type
-(min (at Psym 's)) !- type
-(max (at Psym 's)) !- type
 (.sys.exec "rm -rf /tmp/rfl_agg_bc_psym")
 
 ;; ════════════════════════════════════════════════════════════════════

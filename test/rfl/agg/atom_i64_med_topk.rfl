@@ -31,12 +31,16 @@
 ;; through agg_parted_minmax → agg_atom_i64_for_type(base, best_i).
 ;; ════════════════════════════════════════════════════════════════════
 
-;; RAY_BOOL arm — parted BOOL column, max → ray_bool(v != 0).
+;; RAY_BOOL arm — parted BOOL column aggregated via select (column stays
+;; parted), max → ray_bool.  A direct `(at P 'b)` now MATERIALIZES the column,
+;; where bool aggregation widens to i64 (consistent with min/sum of bool); the
+;; parted-agg arm is the one that yields a typed bool, so exercise it through a
+;; query that keeps the column segmented.
 (set Tb-A (table [b] (list (as 'BOOL [false false true]))))
 (set Tb-B (table [b] (list (as 'BOOL [false false false]))))
 (.db.splayed.set "/tmp/rfl_atomi64_bool/2024.01.01/t/" Tb-A)
 (.db.splayed.set "/tmp/rfl_atomi64_bool/2024.01.02/t/" Tb-B)
-(max (at (.db.parted.get "/tmp/rfl_atomi64_bool/" 't) 'b)) -- true
+(at (select {m: (max b) from: (.db.parted.get "/tmp/rfl_atomi64_bool/" 't)}) 'm) -- [true]
 
 ;; RAY_U8 arm — parted U8 column.
 (set Tu-A (table [u] (list (as 'U8 [3 5 7]))))
