@@ -91,8 +91,9 @@
 (.db.splayed.set "/tmp/rfl_agg_bc_pts/1/t/" Tts1)
 (.db.splayed.set "/tmp/rfl_agg_bc_pts/2/t/" Tts2)
 (set Pts (.db.parted.get "/tmp/rfl_agg_bc_pts/" 't))
-(sum (at Pts 'ts)) -- (as 'TIMESTAMP 6000)
-(type (sum (at Pts 'ts))) -- 'timestamp
+;; sum over an absolute-temporal (TIMESTAMP) column is a type error — the
+;; parted base type is unwrapped and rejected just like a flat TIMESTAMP vec.
+(sum (at Pts 'ts)) !- type
 (.sys.exec "rm -rf /tmp/rfl_agg_bc_ptime /tmp/rfl_agg_bc_pts")
 
 ;; ════════════════════════════════════════════════════════════════════
