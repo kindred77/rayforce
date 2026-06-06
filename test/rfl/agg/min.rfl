@@ -27,3 +27,18 @@
 ;; atom pass-through
 (min 99) -- 99
 (min -7) -- -7
+
+;; ── Wide element types (STR/GUID): min is lexicographic.  Scalar routes
+;; STR/GUID through the DAG reducer, so scalar and the select path share
+;; one implementation and must agree — no-by and by-group. ──
+(min ["cat" "apple" "bee"])        -- "apple"
+(type (min ["cat" "apple" "bee"])) -- 'str
+(set Tmn (table [s] (list ["cat" "apple" "bee"])))
+(at (select {r: (min s) from: Tmn}) 'r)               -- ["apple"]
+;; by-group (groups [cat,apple] / [bee,ant]) → lexicographic min per group
+(set Tmg (table [s k] (list ["cat" "apple" "bee" "ant"] [1 1 2 2])))
+(at (select {r: (min s) by: k from: Tmg}) 'r)         -- ["apple" "ant"]
+;; GUID min: scalar == DAG (byte-order comparison; random ids)
+(set Gm (guid 8))
+(set Tmgu (table [g] (list Gm)))
+(== (min Gm) (at (at (select {r: (min g) from: Tmgu}) 'r) 0)) -- true

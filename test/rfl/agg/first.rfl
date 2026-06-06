@@ -33,3 +33,19 @@
 (type (first (as 'TIMESTAMP [1 2]))) -- 'timestamp
 (first [0x01 0x02 0xff])           -- 0x01
 (type (first [0x01 0x02 0xff]))    -- 'u8
+
+;; ── Wide element types (STR/GUID): scalar first materialises the real
+;; element, and the DAG (select) path must agree — no-by and by-group. ──
+(first ["cat" "apple" "bee"])      -- "cat"
+(type (first ["cat" "apple" "bee"])) -- 'str
+;; scalar == DAG no-by
+(set Tfs (table [s] (list ["cat" "apple" "bee"])))
+(at (select {r: (first s) from: Tfs}) 'r)              -- ["cat"]
+;; by-group (groups [cat,apple] / [bee,ant]) → first of each
+(set Tfg (table [s k] (list ["cat" "apple" "bee" "ant"] [1 1 2 2])))
+(at (select {r: (first s) by: k from: Tfg}) 'r)        -- ["cat" "bee"]
+;; GUID first: scalar and DAG agree (random ids, so compare the two paths)
+(set Gf (guid 6))
+(set Tfgu (table [g] (list Gf)))
+(== (first Gf) (at (at (select {r: (first g) from: Tfgu}) 'r) 0)) -- true
+(type (at (select {r: (first g) from: Tfgu}) 'r))      -- 'GUID

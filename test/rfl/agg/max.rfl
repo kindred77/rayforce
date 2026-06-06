@@ -29,3 +29,17 @@
 ;; atom pass-through
 (max 99) -- 99
 (max -7) -- -7
+
+;; ── Wide element types (STR/GUID): max is lexicographic.  Scalar and the
+;; select path share one implementation and must agree — no-by + by-group. ──
+(max ["cat" "apple" "bee"])        -- "cat"
+(type (max ["cat" "apple" "bee"])) -- 'str
+(set Tmx (table [s] (list ["cat" "apple" "bee"])))
+(at (select {r: (max s) from: Tmx}) 'r)               -- ["cat"]
+;; by-group (groups [cat,apple] / [bee,ant]) → lexicographic max per group
+(set Txg (table [s k] (list ["cat" "apple" "bee" "ant"] [1 1 2 2])))
+(at (select {r: (max s) by: k from: Txg}) 'r)         -- ["cat" "bee"]
+;; GUID max: scalar == DAG (byte-order comparison; random ids)
+(set Gx (guid 8))
+(set Txgu (table [g] (list Gx)))
+(== (max Gx) (at (at (select {r: (max g) from: Txgu}) 'r) 0)) -- true
