@@ -118,8 +118,8 @@ internals !- name
 myns.x -- 1
 ;; Connection-hook carve-out: the five `.ipc.on.*` names are the only
 ;; dotted-reserved names a user can set.  `set` accepts them, `let`
-;; accepts them, and the rest of `.ipc.*` (open / close / send / handle)
-;; stays unsettable.
+;; accepts them, and the rest of `.ipc.*` (open / close / send / post /
+;; handle) stays unsettable.
 (set .ipc.on.open  (fn [h] h))
 (set .ipc.on.close (fn [h] h))
 (set .ipc.on.sync  (fn [m] m))
