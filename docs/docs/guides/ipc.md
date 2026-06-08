@@ -178,7 +178,9 @@ For dynamic queries, substitute runtime values into the expression:
 
 On the server, async messages are handled by the `.ipc.on.async` hook (or, with no hook installed, evaluated like any other message). No result is sent back, so a server-side error is logged on the server and never reaches the sender. `.ipc.post` only reports **local** failures: a `type` error if the handle isn't an integer or the message isn't serialisable, or an `io` error if the connection is closed.
 
-Use `.ipc.send` when you need the result or need to know the server succeeded; use `.ipc.post` when throughput matters and the send is one-way.
+Messages on a single connection are processed in send order, so a `.ipc.post` followed by a `.ipc.send` on the same handle will have been applied on the server by the time the synchronous reply comes back.
+
+Use `.ipc.send` when you need the result or need to know the server succeeded; use `.ipc.post` when throughput matters and the send is one-way. See the [`.ipc.post` reference](../namespaces/ipc.md#ipc-post) for the full signature and error semantics.
 
 ## 6. Authentication
 

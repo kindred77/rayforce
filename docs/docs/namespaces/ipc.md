@@ -1,9 +1,9 @@
 # `.ipc.*` — client IPC
 
-Connect to a Rayforce server (`./rayforce -p <port>`) and exchange messages over TCP. The wire format is the same compact binary serialisation used for `ser`/`de`, with automatic delta+RLE compression for payloads larger than 2,000 bytes. All four client builtins live here; the server-side connection hooks (`.ipc.on.open` / `.on.close` / `.on.sync` / `.on.async` / `.on.auth`) live on the [IPC Connection Hooks](../storage/ipc-hooks.md) page — they are user-settable lambda slots, not registered builtins, so they don't appear in the reference table below.
+Connect to a Rayforce server (`./rayforce -p <port>`) and exchange messages over TCP. The wire format is the same compact binary serialisation used for `ser`/`de`, with automatic delta+RLE compression for payloads larger than 2,000 bytes. All five client builtins live here; the server-side connection hooks (`.ipc.on.open` / `.on.close` / `.on.sync` / `.on.async` / `.on.auth`) live on the [IPC Connection Hooks](../storage/ipc-hooks.md) page — they are user-settable lambda slots, not registered builtins, so they don't appear in the reference table below.
 
 !!! note "Restricted under `-U`"
-    `.ipc.open`, `.ipc.close`, and `.ipc.send` are `RAY_FN_RESTRICTED` — IPC chaining is blocked on a `-U` server (a peer cannot dial outward to a third server). `.ipc.handle` is always available so hooks can read the current connection ID.
+    `.ipc.open`, `.ipc.close`, `.ipc.send`, and `.ipc.post` are `RAY_FN_RESTRICTED` — IPC chaining is blocked on a `-U` server (a peer cannot dial outward to a third server). `.ipc.handle` is always available so hooks can read the current connection ID.
 
 ## Reference
 
@@ -11,6 +11,7 @@ Connect to a Rayforce server (`./rayforce -p <port>`) and exchange messages over
 |---|---|---|---|
 | [`.ipc.open`](#ipc-open) | unary | restricted | Open a TCP connection; return an i64 handle. |
 | [`.ipc.send`](#ipc-send) | binary | restricted | Send a message synchronously; return the server's result. |
+| [`.ipc.post`](#ipc-post) | binary | restricted | Send a message asynchronously (fire-and-forget); return the null object. |
 | [`.ipc.close`](#ipc-close) | unary | restricted | Close a connection handle. |
 | [`.ipc.handle`](#ipc-handle) | variadic | — | The current connection's handle inside a server-side hook; `-1` otherwise. |
 
