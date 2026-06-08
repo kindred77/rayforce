@@ -60,7 +60,21 @@ Errors: `type` (`h` not an `i64`/`i32`, or `msg` not serialisable). Server-side 
 (.ipc.send h (til 1000)) ;; => the same vector
 ```
 
-Async-fire-and-forget is not exposed at the Rayfall layer — call `ray_ipc_send_async` from C if you need it. See [IPC & Serialization](../storage/ipc.md) for the wire format and message-type byte.
+For async fire-and-forget, see `.ipc.post` below. See [IPC & Serialization](../storage/ipc.md) for the wire format and message-type byte.
+
+## `.ipc.post` { #ipc-post }
+
+Signature: `(.ipc.post h msg)`. Sends `msg` asynchronously — fire-and-forget. Unlike `.ipc.send`, it does **not** wait for a reply: the server runs the message through its `.ipc.on.async` hook (or default evaluation) and sends nothing back.
+
+Because no response is returned, the only failures the caller can observe are **local** ones. A server-side evaluation error is logged on the server and dropped — it never reaches the sender.
+
+Returns the null object on a successful local send. Errors: `type` (`h` not an `i64`/`i32`, or `msg` not serialisable), `io` (handle invalid / connection closed / socket write failed).
+
+```lisp
+;; Push a state update to the server and move on — no round-trip.
+;; The string payload is parsed and evaluated server-side, just like `.ipc.send`.
+(.ipc.post h "(set last-update 42)")
+```
 
 ## `.ipc.close` { #ipc-close }
 

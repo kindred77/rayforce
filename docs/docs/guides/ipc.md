@@ -163,7 +163,24 @@ For dynamic queries, substitute runtime values into the expression:
 
     Dict literals are self-evaluating — `{from: trades where: (> price 200)}` preserves its contents as data. When the server evaluates the list, `select` resolves `trades` and `price` in the table context. Use `(list ...)` inside the dict when you need to splice runtime values into an expression.
 
-## 5. Authentication
+## 5. Async Fire-and-Forget
+
+`.ipc.send` blocks until the server replies. When you don't need a reply — firing a write, pushing an update, kicking off background work — use `.ipc.post` instead. It sends the message and returns immediately.
+
+```lisp
+(set h (.ipc.open "127.0.0.1:5000"))
+
+;; Fire-and-forget: returns the null object as soon as the send completes
+(.ipc.post h "(set last-update 42)")
+
+(.ipc.close h)
+```
+
+On the server, async messages are handled by the `.ipc.on.async` hook (or, with no hook installed, evaluated like any other message). No result is sent back, so a server-side error is logged on the server and never reaches the sender. `.ipc.post` only reports **local** failures: a `type` error if the handle isn't an integer or the message isn't serialisable, or an `io` error if the connection is closed.
+
+Use `.ipc.send` when you need the result or need to know the server succeeded; use `.ipc.post` when throughput matters and the send is one-way.
+
+## 6. Authentication
 
 Rayforce supports password-based authentication with an optional read-only restriction.
 
@@ -197,7 +214,7 @@ In read-only mode, clients can run queries and read data, but mutating operation
 
     See the [IPC & Serialization](../storage/ipc.md) reference page for the full list of restricted builtins in read-only mode.
 
-## 6. Multi-Process Architecture
+## 7. Multi-Process Architecture
 
 A common pattern is one data server with multiple query clients. Each client connects independently and runs queries against the shared data.
 
@@ -246,7 +263,7 @@ A common pattern is one data server with multiple query clients. Each client con
 
     The server is single-threaded. Client queries are processed sequentially in the order they arrive. For CPU-intensive workloads, consider partitioning data across multiple server processes.
 
-## 7. Error Handling
+## 8. Error Handling
 
 Several categories of errors can occur during IPC operations.
 
@@ -293,7 +310,7 @@ If the server shuts down or the network drops while a query is in flight, `.ipc.
   (fn [e] (println "Query failed:" e)))
 ```
 
-## 8. C API
+## 9. C API
 
 The IPC layer is also accessible from C, enabling you to embed Rayforce clients in applications.
 

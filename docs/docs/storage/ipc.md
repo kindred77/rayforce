@@ -171,7 +171,7 @@ For dynamic queries, substitute values into the dict at construction time:
 ```
 
 !!! note "Message types"
-    `.ipc.send` uses synchronous messaging — it blocks until the server returns a result. Asynchronous (fire-and-forget) messaging is available via the C API (`ray_ipc_send_async`).
+    `.ipc.send` uses synchronous messaging — it blocks until the server returns a result. For asynchronous (fire-and-forget) messaging, use `.ipc.post`, which sends without waiting for a response (the C equivalent is `ray_ipc_send_async`).
 
 ## Connection Hooks
 
