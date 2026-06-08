@@ -275,3 +275,18 @@
 (set Lgf (table [ID Time Price] (list (.attr.set 'parted [1 1 2 2]) [10:00:03.000 10:00:01.000 10:00:01.000 10:00:02.000] [1.0 2.0 3.0 4.0])))
 (set Rgf (table [ID Time Bid] (list (.attr.set 'parted [1 1 2 2]) [10:00:00.000 10:00:02.000 10:00:00.000 10:00:03.000] [9.0 9.5 8.0 8.5])))
 (asof-join [ID Time] Lgf Rgf) -- (asof-join [ID Time] Lpf Rpf)
+
+;; ── Large radix-partitioned join (>65536 rows) under back-to-back dispatch ──
+;; The right side (70000 rows) triggers the parallel radix scatter, which runs
+;; two consecutive pool dispatches (histogram then scatter).  A cross-dispatch
+;; task-ring race in the pool once let a late worker claim a half-republished
+;; slot, double-running/skipping a scatter task and dropping one partition
+;; entry — so the join intermittently lost a row (count 7 vs 8).  Repeating the
+;; join keeps that dispatch path under pressure; the fixed pool must return the
+;; exact same count every iteration.
+(set RJbig (table [id val2] (list (til 70000) (til 70000))))
+(set LJsmall (table [id val] (list [0 100 500 1000 5000 10000 50000 69999] [1 2 3 4 5 6 7 8])))
+(count (inner-join [id] LJsmall RJbig)) -- 8
+(sum (at (inner-join [id] LJsmall RJbig) 'val)) -- 36
+;; 200 back-to-back radix joins — a single dropped row anywhere shows as < 1600.
+(sum (map (fn [_] (count (inner-join [id] LJsmall RJbig))) (til 200))) -- 1600
