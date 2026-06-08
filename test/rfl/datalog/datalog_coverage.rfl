@@ -392,6 +392,29 @@
 ;; head with unsupported constant type (a list literal) — type error.
 (rule (bad-h [1 2]) (?e :role 'admin)) !- type
 
+;; head with a quoted-symbol constant — the -RAY_SYM literal branch (line 3852),
+;; distinct from the "static" string-intern branch above.
+(set qSym (query Db (find ?x) (where (lit-s ?x)) (rules ((lit-s 'mytag) (?e :role 'user)))))
+(count qSym) -- 1
+(at (at qSym '?x) 0) -- 'mytag
+
+;; ════════════════════════ body constant via evaluated (non-literal) expression ═════════════════════════
+;; A body-triple position that is neither a bare ?var / int / sym / str literal
+;; falls through dl_set_body_pos to ray_eval (lines 3562-3573).  Exercise both
+;; the I64 result (line 3566), the SYM result (line 3568), and the
+;; unsupported-type error (lines 3570-3571).
+(set Edb (datoms))
+(set Edb (assert-fact Edb 1 'age 30))
+(set Edb (assert-fact Edb 2 'age 25))
+(set Edb (assert-fact Edb 1 'role 'admin))
+(set Edb (assert-fact Edb 2 'role 'user))
+;; (+ 10 20) → i64 30 ; matches entity 1's age.
+(count (query Edb (find ?e) (where (gi ?e)) (rules ((gi ?e) (?e :age (+ 10 20)))))) -- 1
+;; (first ['admin 'user]) → sym 'admin ; matches entity 1's role.
+(count (query Edb (find ?e) (where (gs ?e)) (rules ((gs ?e) (?e :role (first ['admin 'user])))))) -- 1
+;; evaluates to a float → unsupported constant type in body.
+(query Edb (find ?e) (where (gb ?e)) (rules ((gb ?e) (?e :age (+ 1.0 2.0))))) !- type
+
 ;; ════════════════════════ recursive rule via inline rules (no globals) ═════════════════════════
 ;; Chain 1→2→3→4: TC pairs = (1,2),(1,3),(1,4),(2,3),(2,4),(3,4) — 6 rows.
 (set Gdb (datoms))

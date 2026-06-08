@@ -424,3 +424,27 @@
 ;; Three-way: bool col + comparison + comparison, exercises insertion-sort
 ;; ranking with mixed costs.
 (count (select {from: TBC where: (and b (> a 1) (< a 8))})) -- 3
+
+;; ====================================================================
+;; mark_live (DCE) — OP_PIVOT ext-child walk — opt.c:827-836
+;;
+;; The `pivot` builtin takes the OP_PIVOT DAG fast path when the pivot
+;; column, value column, and all index columns are non-STR with a known
+;; agg op (tblop.c:149-178).  ray_execute then runs the full optimizer,
+;; and pass_dce → mark_live must reach the OP_PIVOT switch arm to keep
+;; the structural ext columns (index_cols / pivot_col / value_col) live
+;; — they live only in the ext node, never in inputs[].  If this arm
+;; were skipped the scans feeding the pivot would be marked DEAD and the
+;; result would be wrong, so a correct value pins the path.
+;;
+;; index=k1 (sym), pivot=k2 (i64 → DAG-eligible), value=v (i64), agg=sum.
+;;   k1='a: k2=1 → v(10+50)=60, k2=2 → v 20
+;;   k1='b: k2=1 → v 30,        k2=2 → v 40
+;; ====================================================================
+(set Tpvt (table [k1 k2 v] (list ['a 'a 'b 'b 'a] [1 2 1 2 1] [10 20 30 40 50])))
+(set Ppvt (pivot Tpvt 'k1 'k2 'v sum))
+(count Ppvt) -- 2
+(at Ppvt 'k1) -- ['a 'b]
+;; value columns are named by the distinct k2 partition values (sym '1, '2)
+(sum (at Ppvt '1)) -- 90
+(sum (at Ppvt '2)) -- 60

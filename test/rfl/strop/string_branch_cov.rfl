@@ -393,3 +393,91 @@
 ;;   Morsel segment counts are always consistent with row counts
 ;;   in well-formed rowsel structures.
 ;; ================================================================
+
+;; ================================================================
+;; 19. exec_like STR parallel dispatch (line 585)
+;;
+;; The non-parted RAY_STR LIKE path dispatches to the worker pool
+;; only when len >= LIKE_PAR_MIN_ROWS_STR (200000) and the pool has
+;; >= 2 workers.  Existing strop tests all run the serial branch
+;; (str_like_par_fn called inline).  A 200k-row STR column forces
+;; ray_pool_dispatch(str_like_par_fn).
+;; ================================================================
+(.sys.exec "rm -f rfl_strop_bigstr.csv") -- 0
+(.sys.exec "awk 'BEGIN{print \"s\"; for(i=0;i<200000;i++) print \"url\" i%7}' > rfl_strop_bigstr.csv") -- 0
+(set TBS (.csv.read [STR] "rfl_strop_bigstr.csv"))
+(count TBS) -- 200000
+;; like "url0" matches i%7==0 -> 0,7,...,199997 -> floor(199999/7)+1 = 28572
+(count (select {from: TBS where: (like s "url0")})) -- 28572
+;; like "url*" matches all rows.
+(count (select {from: TBS where: (like s "url*")})) -- 200000
+(.sys.exec "rm -f rfl_strop_bigstr.csv") -- 0
+
+;; ================================================================
+;; 20. exec_like_parted_sym parallel dispatch (lines 433, 468)
+;;
+;; A parted SYM column whose first segment has >= LIKE_PAR_MIN_ROWS_SYM
+;; (100000) rows drives the per-segment ray_pool_dispatch of
+;; like_seen_fn (433) and like_proj_fn (468).
+;; ================================================================
+(.sys.exec "rm -rf /tmp/rfl_strop_pbsym /tmp/rfl_strop_pbsym.csv") -- 0
+(.sys.exec "awk 'BEGIN{print \"s\"; for(i=0;i<120000;i++) print \"k\" i%5}' > /tmp/rfl_strop_pbsym.csv") -- 0
+(set PBSym (.csv.read [SYMBOL] "/tmp/rfl_strop_pbsym.csv"))
+(.db.splayed.set "/tmp/rfl_strop_pbsym/1/t/" PBSym)
+(.db.splayed.set "/tmp/rfl_strop_pbsym/2/t/" (table [s] (list ['k0 'k1 'k2])))
+(set PSymBig (.db.parted.get "/tmp/rfl_strop_pbsym/" 't))
+(count PSymBig) -- 120003
+;; like "k0": seg1 i%5==0 -> 24000 ; seg2 'k0 once -> 24001
+(count (select {from: PSymBig where: (like s "k0")})) -- 24001
+;; like "k*": all rows.
+(count (select {from: PSymBig where: (like s "k*")})) -- 120003
+(.sys.exec "rm -rf /tmp/rfl_strop_pbsym /tmp/rfl_strop_pbsym.csv") -- 0
+
+;; ================================================================
+;; 21. exec_like_parted_str parallel dispatch (line 388)
+;;
+;; A parted STR column whose first segment has >= LIKE_PAR_MIN_ROWS_STR
+;; (200000) rows drives the per-segment ray_pool_dispatch of
+;; str_like_par_fn.
+;; ================================================================
+(.sys.exec "rm -rf /tmp/rfl_strop_pbstr /tmp/rfl_strop_pbstr.csv") -- 0
+(.sys.exec "awk 'BEGIN{print \"s\"; for(i=0;i<210000;i++) print \"v\" i%4}' > /tmp/rfl_strop_pbstr.csv") -- 0
+(set PBStr (.csv.read [STR] "/tmp/rfl_strop_pbstr.csv"))
+(.db.splayed.set "/tmp/rfl_strop_pbstr/1/t/" PBStr)
+(.db.splayed.set "/tmp/rfl_strop_pbstr/2/t/" (table [s] (list ["v0" "v1"])))
+(set PStrBig (.db.parted.get "/tmp/rfl_strop_pbstr/" 't))
+(count PStrBig) -- 210002
+;; like "v0": seg1 i%4==0 -> 52500 ; seg2 "v0" once -> 52501
+(count (select {from: PStrBig where: (like s "v0")})) -- 52501
+;; like "v*": all rows.
+(count (select {from: PStrBig where: (like s "v*")})) -- 210002
+(.sys.exec "rm -rf /tmp/rfl_strop_pbstr /tmp/rfl_strop_pbstr.csv") -- 0
+
+;; ================================================================
+;; 22. substr with a NULL inside a per-row start/length VECTOR — null
+;;     propagation (string.c:979-980, the `ray_vec_is_null(start_v/len_v, i)`
+;;     True arms).  A null in either vector yields a null result row.
+;;     (An earlier note here claimed this SIGSEGV'd; that crash was a
+;;     mixed-ABI build artifact from concurrent debug/coverage rebuilds, not
+;;     an exec_substr defect — it reproduces on no clean single-config build,
+;;     and ASan reports nothing.)
+(set TSubNull (table [s st ln] (list ["alphabet" "bravo" "charlie"] [1 0N 2] [3 2 0N])))
+;; null in START vector → row 1 is null
+(set RSubNs (at (select {r: (substr s st 3) from: TSubNull}) 'r))
+(at RSubNs 0) -- "alp"
+(nil? (at RSubNs 1)) -- true
+(at RSubNs 2) -- "har"
+;; null in LENGTH vector → row 2 is null
+(set RSubNl (at (select {r: (substr s 1 ln) from: TSubNull}) 'r))
+(at RSubNl 0) -- "alp"
+(at RSubNl 1) -- "br"
+(nil? (at RSubNl 2)) -- true
+
+;; The no-null per-row start/len vector path (covers s_data line 962,
+;; l_data line 974, and the s_data/l_data ternaries at 998-999):
+;; ================================================================
+(set TSubVec (table [s st ln] (list ["alphabet" "bravo" "charlie"] [1 2 3] [3 2 4])))
+(set RSubVec (at (select {r: (substr s st ln) from: TSubVec}) 'r))
+(at RSubVec 0) -- "alp"
+(at RSubVec 1) -- "ra"
+(at RSubVec 2) -- "arli"

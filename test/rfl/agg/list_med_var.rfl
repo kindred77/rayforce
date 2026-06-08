@@ -97,12 +97,14 @@
 (avg 'world) -- 'world
 (type (avg 'world)) -- 'sym
 
-;; ─── sum TIMESTAMP vec (lines 257-261 in ray_sum_fn) ─────────────────
-;; TIMESTAMP scalars as vec via `as`; sum returns a TIMESTAMP atom.
+;; ─── sum TIMESTAMP vec → type error (canonical aggregand table) ──────
+;; TIMESTAMP is an absolute point in time; summing absolute timestamps is
+;; meaningless (matches DuckDB: sum(TIMESTAMP) is a type error), so sum
+;; rejects it in both the scalar builtin and the DAG path.  TIME (a
+;; duration-like ms count) is summable — see the TIME section below.
 (type (as 'TIMESTAMP [1000 2000 3000])) -- 'TIMESTAMP
-(sum (as 'TIMESTAMP [1000 2000 3000])) -- (as 'TIMESTAMP 6000)
-;; Null-aware: null is skipped; result = 1000 + 3000 = 4000.
-(sum (as 'TIMESTAMP [1000 0N 3000])) -- (as 'TIMESTAMP 4000)
+(sum (as 'TIMESTAMP [1000 2000 3000])) !- type
+(sum (as 'TIMESTAMP [1000 0N 3000]))   !- type
 
 ;; ─── sum TIME vec (lines 251-255 in ray_sum_fn) ──────────────────────
 ;; TIME vec; result type TIME.

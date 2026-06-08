@@ -348,3 +348,30 @@
 (>= Spop 0.0) -- true
 ;; sample variance >= pop variance per group (for n>=2) → sums obey too.
 (>= Vp Vpop) -- true
+
+;; ════════════════════════════════════════════════════════════════════
+;; Wide-element (STR/GUID) min/max/first/last per-group — these route
+;; through ray_wide_minmax_per_group_buf, the same holistic post-fill
+;; plumbing as median/topk.  At this scale the keyed radix HT path runs,
+;; exercising the radix post-fill branch (small tables hit the dense one).
+;; ════════════════════════════════════════════════════════════════════
+(set Wn  6000)
+(set Wsr (as 'STR (til Wn)))            ;; "0".."5999"
+(set Wk  (% (til Wn) 200))              ;; 200 groups
+(set Wt  (table [s k] (list Wsr Wk)))
+;; one min/max/first/last value per group
+(== (count (at (select {m: (min s)   by: k from: Wt}) 'm)) 200) -- true
+(== (count (at (select {m: (max s)   by: k from: Wt}) 'm)) 200) -- true
+(== (count (at (select {m: (first s) by: k from: Wt}) 'm)) 200) -- true
+(== (count (at (select {m: (last s)  by: k from: Wt}) 'm)) 200) -- true
+;; result columns keep the STR type (not truncated to a fixed-width int)
+(type (at (select {m: (min s) by: k from: Wt}) 'm)) -- 'STR
+;; group 0 holds rows 0,200,400,... → string "0" is the lexicographic min,
+;; and within that group first is "0", last is "5800".
+(at (at (select {m: (min s)   by: k from: Wt}) 'm) 0) -- "0"
+(at (at (select {m: (first s) by: k from: Wt}) 'm) 0) -- "0"
+(at (at (select {m: (last s)  by: k from: Wt}) 'm) 0) -- "5800"
+;; GUID per-group first agrees with the scalar reducer on the same slice
+(set Wg  (guid Wn))
+(set Wtg (table [g k] (list Wg Wk)))
+(type (at (select {m: (min g) by: k from: Wtg}) 'm)) -- 'GUID

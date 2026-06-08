@@ -2221,6 +2221,123 @@ static test_result_t test_slab_gc_drains_wide(void) {
     PASS();
 }
 
+#include "ops/idxop.h"   /* ray_index_t, ray_index_payload, RAY_IDX_SORT */
+
+/* ---- ray_retain_owned_refs: atom-owns-obj branch (L675-676) ---------------
+ *
+ * ray_atom_owns_obj is true for a -RAY_STR atom that is NOT SSO (slen >= 8,
+ * so the payload lives in an external obj rather than inline).  ray_alloc_copy
+ * treats the atom as data_size=0, memcpy's the 32-byte header (carrying obj),
+ * then ray_retain_owned_refs hits the atom-owns-obj arm and retains obj.
+ * Both copy and source share the one obj; freeing both releases it twice. */
+
+static test_result_t test_retain_owned_refs_atom_obj(void) {
+    /* obj is a real heap block (a U8 byte buffer standing in for the string
+     * payload).  Give it rc=1; the retain on copy bumps it to 2. */
+    ray_t* obj = ray_alloc(16);
+    TEST_ASSERT_NOT_NULL(obj);
+    obj->type = RAY_U8;
+    obj->len  = 16;
+
+    ray_t* s = ray_alloc(0);
+    TEST_ASSERT_NOT_NULL(s);
+    s->type = -RAY_STR;
+    s->slen = 8;          /* >= 8 → non-SSO → ray_atom_owns_obj true */
+    s->obj  = obj;        /* external payload, owned by s */
+
+    uint32_t orc = obj->rc;
+    /* alloc_copy → retain_owned_refs atom-owns-obj arm (L675-676). */
+    ray_t* copy = ray_alloc_copy(s);
+    TEST_ASSERT_NOT_NULL(copy);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(copy));
+    TEST_ASSERT_EQ_PTR(copy->obj, obj);     /* shallow-shared obj */
+    TEST_ASSERT_EQ_U(obj->rc, orc + 1);     /* retained once */
+
+    /* Free copy: release_owned_refs drops obj 2→1.  Then free s: drops 1→0
+     * (frees obj).  Order matters so the shared obj outlives the first free. */
+    ray_free(copy);
+    TEST_ASSERT_EQ_U(obj->rc, orc);         /* back to original */
+    ray_free(s);                            /* releases obj to 0 → freed */
+
+    ray_t* probe = ray_alloc(0);
+    TEST_ASSERT_NOT_NULL(probe);
+    ray_free(probe);
+    PASS();
+}
+
+/* ---- ray_detach_owned_refs: RAY_LAZY arm (L747-751) -----------------------
+ *
+ * ray_detach_owned_refs reaches the LAZY arm from ray_scratch_realloc on the
+ * old block.  RAY_LAZY is an atom (data_size=0); the new block inherits the
+ * graph/op pointers via the header memcpy, and detach nulls them on the old
+ * block.  Detach NEVER dereferences the pointers, so a sentinel is safe; we
+ * neutralize the surviving block before freeing it (mirrors the GRAPH test). */
+
+static test_result_t test_scratch_realloc_lazy_handle(void) {
+    ray_t* g = ray_alloc(0);
+    TEST_ASSERT_NOT_NULL(g);
+    g->type = RAY_LAZY;
+    RAY_LAZY_GRAPH(g) = (ray_graph_t*)0x1234;   /* sentinel — never deref'd */
+    RAY_LAZY_OP(g)    = (ray_op_t*)0x5678;       /* sentinel — never deref'd */
+
+    /* realloc copies header (incl graph/op) to g2, then detaches g (L747-751:
+     * RAY_LAZY_GRAPH/OP(g) set NULL) before freeing it.  g's free runs
+     * release_owned_refs LAZY arm with graph==NULL → no ray_graph_free. */
+    ray_t* g2 = ray_scratch_realloc(g, 0);
+    TEST_ASSERT_NOT_NULL(g2);
+    TEST_ASSERT_EQ_I(g2->type, RAY_LAZY);
+    TEST_ASSERT_EQ_PTR(RAY_LAZY_GRAPH(g2), (ray_graph_t*)0x1234);
+
+    /* Neutralize the survivor so its free doesn't ray_graph_free the sentinel. */
+    RAY_LAZY_GRAPH(g2) = NULL;
+    RAY_LAZY_OP(g2)    = NULL;
+    ray_free(g2);
+    PASS();
+}
+
+/* ---- ray_detach_owned_refs: HAS_INDEX arm (L790-794) ----------------------
+ *
+ * A vector carrying RAY_ATTR_HAS_INDEX stores an owning ray_t* index in
+ * nullmap[0..7] (v->index).  ray_scratch_realloc transfers the vector data to
+ * a new block (index pointer copied), then detaches the old block — nulling
+ * v->index and clearing the HAS_INDEX bit (L790-794).  We use a real RAY_INDEX
+ * block as v->index and let the surviving block own it, releasing once. */
+
+static test_result_t test_scratch_realloc_has_index_detach(void) {
+    /* A minimal RAY_INDEX block: kind RAY_IDX_SORT with perm NULL, so
+     * release_payload is a no-op when the survivor is freed. */
+    ray_t* idx = ray_alloc(sizeof(ray_index_t));
+    TEST_ASSERT_NOT_NULL(idx);
+    idx->type = RAY_INDEX;
+    idx->len  = 0;
+    ray_index_t* ix = ray_index_payload(idx);
+    memset(ix, 0, sizeof(*ix));
+    ix->kind = RAY_IDX_SORT;     /* perm NULL → release is a no-op */
+
+    ray_t* v = ray_alloc(4 * sizeof(int64_t));
+    TEST_ASSERT_NOT_NULL(v);
+    v->type   = RAY_I64;
+    v->len    = 4;
+    v->attrs |= RAY_ATTR_HAS_INDEX;
+    v->index  = idx;             /* v owns the only ref to idx */
+
+    /* realloc copies header (incl index ptr + HAS_INDEX bit) to v2, then
+     * detaches v: v->index=NULL, HAS_INDEX cleared (L790-794).  v's free
+     * then takes the no-index path (won't release idx). */
+    ray_t* v2 = ray_scratch_realloc(v, 8 * sizeof(int64_t));
+    TEST_ASSERT_NOT_NULL(v2);
+    TEST_ASSERT_TRUE(v2->attrs & RAY_ATTR_HAS_INDEX);
+    TEST_ASSERT_EQ_PTR(v2->index, idx);
+
+    /* Freeing v2 takes the HAS_INDEX release arm → ray_release(idx) → freed. */
+    ray_free(v2);
+
+    ray_t* probe = ray_alloc(0);
+    TEST_ASSERT_NOT_NULL(probe);
+    ray_free(probe);
+    PASS();
+}
+
 /* ---- Suite definition -------------------------------------------------- */
 
 const test_entry_t heap_entries[] = {
@@ -2292,5 +2409,8 @@ const test_entry_t heap_entries[] = {
     { "heap/order_overflow_guards",    test_order_overflow_guards,             heap_setup, heap_teardown },
     { "heap/slab_byte_budget",         test_slab_byte_budget,            heap_setup, heap_teardown },
     { "heap/slab_gc_drains_wide",      test_slab_gc_drains_wide,         heap_setup, heap_teardown },
+    { "heap/retain_atom_obj",          test_retain_owned_refs_atom_obj,  heap_setup, heap_teardown },
+    { "heap/scratch_realloc_lazy",     test_scratch_realloc_lazy_handle, heap_setup, heap_teardown },
+    { "heap/scratch_realloc_has_index", test_scratch_realloc_has_index_detach, heap_setup, heap_teardown },
     { NULL, NULL, NULL, NULL },
 };

@@ -60,9 +60,14 @@
 ;; column refs that collapses to a scalar; the non-row-aligned
 ;; fallback re-runs per group).
 (set Tq9 (table [g x y] (list [A A A A A B B B B B] [1.0 2.0 3.0 4.0 5.0 1.0 2.0 3.0 4.0 5.0] [2.0 4.0 6.0 8.0 10.0 5.0 4.0 3.0 2.0 1.0])))
-;; Group A: y = 2x → r = 1.0,  r² = 1.0
-;; Group B: y = 6-x → r = -1.0, r² = 1.0
-(at (at (select {r2: (pow (pearson_corr x y) 2) by: g from: Tq9}) 'r2) 0) -- 1.0
+;; Group A: y = 2x  → r = +1.0
+;; Group B: y = 6-x → r = -1.0
+;; The SIGNED coefficient must be returned per group — squaring it here
+;; (a former workaround) collapsed +1 and -1 to 1.0 and hid the by-group
+;; sign bug.  Assert r directly so the sign is exercised.
+(at (at (select {r: (pearson_corr x y) by: g from: Tq9}) 'r) 0) -- 1.0
+(at (at (select {r: (pearson_corr x y) by: g from: Tq9}) 'r) 1) -- -1.0
+;; r² parity: pow(r,2) is +1.0 for both groups (squaring discards sign).
 (at (at (select {r2: (pow (pearson_corr x y) 2) by: g from: Tq9}) 'r2) 1) -- 1.0
 
 ;; Multi-key q9 — by [id2 id4].

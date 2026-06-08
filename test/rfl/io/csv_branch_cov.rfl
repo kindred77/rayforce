@@ -276,6 +276,126 @@
 (nil? (at (at Rspn 'a) 1)) -- true
 (nil? (at (at Rspn 'b) 2)) -- true
 
+;; ════════════════════════════════════════════════════════════════════════════
+;; 18. Parallel parse path (csv_parse_fn) — non-null type arms.
+;;     ray_read_csv_named_opts dispatches csv_parse_fn on the thread pool only
+;;     when n_rows > 8192.  A 9000-row file with an explicit all-types schema
+;;     drives the BOOL/U8/I64/F64 arms (lines ~959-1001) that the serial path
+;;     leaves uncovered.  CRLF line endings additionally exercise the trailing
+;;     "\r" strip on the last field of each row (line ~955).
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "awk 'BEGIN{printf \"b,u,n,f\\r\\n\"; for(i=1;i<=9000;i++){printf \"true,%d,%d,%d.5\\r\\n\", i%200, i, i}}' > rf_test_csvbc_pbig.csv") -- 0
+(set Tpb (.csv.read [B8 U8 I64 F64] "rf_test_csvbc_pbig.csv"))
+(count Tpb) -- 9000
+(at (at Tpb 'b) 0) -- true
+(at (at Tpb 'u) 0) -- (as 'U8 1)
+(at (at Tpb 'n) 0) -- 1
+(at (at Tpb 'f) 0) -- 1.5
+;; last row survives the CRLF strip intact
+(at (at Tpb 'n) 8999) -- 9000
+(at (at Tpb 'f) 8999) -- 9000.5
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 19. Parallel parse path (csv_parse_fn) — DATE/TIME/TIMESTAMP/GUID/I16/I32
+;;     non-null arms plus the empty-cell null arms for each (the `is_null`
+;;     branches at lines ~986/993/1006/1013/1020/1028 and the STR flen==0
+;;     branch at ~1035).  Every 7th row is all-empty so each nullable column
+;;     records a null in the parallel worker.
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "awk 'BEGIN{print \"h,w,d,t,ts,g,s\"; for(i=1;i<=9000;i++){ if(i%7==0){print \",,,,,,\"} else {printf \"%d,%d,2020-01-01,10:30:45,2020-01-01T10:30:45,00000000-0000-0000-0000-000000000001,str%d\\n\", i%30000, i, i%100} } }' > rf_test_csvbc_pnull.csv") -- 0
+(set Tpn (.csv.read [I16 I32 DATE TIME TIMESTAMP GUID STR] "rf_test_csvbc_pnull.csv"))
+(count Tpn) -- 9000
+;; row 6 (i==7) is the first all-empty row → null in every nullable column
+(nil? (at (at Tpn 'h) 6)) -- true
+(nil? (at (at Tpn 'w) 6)) -- true
+(nil? (at (at Tpn 'd) 6)) -- true
+(nil? (at (at Tpn 't) 6)) -- true
+(nil? (at (at Tpn 'ts) 6)) -- true
+;; non-empty rows keep their parsed values
+(at (at Tpn 'h) 0) -- (as 'I16 1)
+(at (at Tpn 'w) 0) -- (as 'I32 1)
+(at (at Tpn 'd) 0) -- 2020.01.01
+(at (at Tpn 't) 0) -- 10:30:45.000
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 20. Short-row guard (csv_parse_serial line ~1087): a data row with fewer
+;;     fields than ncols.  Once scan_field walks past row_end, the remaining
+;;     columns are filled with type defaults + null (nullable types) so the
+;;     row count is preserved and downstream columns stay aligned.
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'a,b,c\n1,2,3\n9\n4,5,6\n' > rf_test_csvbc_short.csv") -- 0
+(set Tsh (.csv.read [I64 I64 I64] "rf_test_csvbc_short.csv"))
+(count Tsh) -- 3
+(at (at Tsh 'a) 1) -- 9
+(nil? (at (at Tsh 'b) 1)) -- true
+(nil? (at (at Tsh 'c) 1)) -- true
+;; full rows on either side are unaffected
+(at (at Tsh 'c) 0) -- 3
+(at (at Tsh 'a) 2) -- 4
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 21. .csv.parted trace branches (ray_csv_save_parted_named_opts, lines
+;;     ~2410-2553 guarded by getenv("RAY_CSV_TRACE")).  Enabling the env var
+;;     exercises the per-stage stderr trace prints; rows_per_part=2 over 3 rows
+;;     forces a two-part split so the per-part save trace fires more than once.
+;; ════════════════════════════════════════════════════════════════════════════
+(.os.setenv "RAY_CSV_TRACE" "1") -- "1"
+(.sys.exec "rm -rf rf_test_csvbc_pttrace") -- 0
+(.sys.exec "printf 'a,b\n1,10\n2,20\n3,30\n' > rf_test_csvbc_pttrace.csv") -- 0
+(set Rpt (.csv.parted "rf_test_csvbc_pttrace.csv" 2 "rf_test_csvbc_pttrace" 'tbl))
+(count Rpt) -- 3
+(sum (at Rpt 'a)) -- 6
+(sum (at Rpt 'b)) -- 60
+(.os.setenv "RAY_CSV_TRACE" "") -- ""
+(.sys.exec "rm -rf rf_test_csvbc_pttrace") -- 0
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 22. Chunk-zone + hash-index attach (ray_read_csv_named_opts lines ~1937-1945):
+;;     a numeric column only gets a per-chunk zone index once its length reaches
+;;     one chunk (65536 rows); high-entropy values then upgrade to a hash index
+;;     (csv_should_attach_hash).  A 70000-row pseudo-random I64 column crosses
+;;     both thresholds.  Spot-check aggregates so the index attach can't quietly
+;;     corrupt the payload.
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "awk 'BEGIN{print \"id\"; for(i=1;i<=70000;i++) print (i*2654435761)%2000000000}' > rf_test_csvbc_zone.csv") -- 0
+(set Tz (.csv.read [I64] "rf_test_csvbc_zone.csv"))
+(count Tz) -- 70000
+(type (at Tz 'id)) -- 'I64
+;; first value: (1*2654435761) % 2000000000 = 654435761
+(at (at Tz 'id) 0) -- 654435761
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 23. Parallel materialize path (csv_materialize_rows lines ~1409-1442): the
+;;     parted/splayed writers materialize each chunk through csv_materialize_rows,
+;;     which dispatches csv_parse_fn on the pool when the chunk exceeds 8192 rows.
+;;     The default rows-per-part (1e6) keeps a 9000-row file in a single chunk so
+;;     the whole batch goes through the parallel branch.  An inferred SYM column
+;;     ("str%50") also exercises the sym-narrow path inside the materializer.
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "rm -rf rf_test_csvbc_mr") -- 0
+(.sys.exec "awk 'BEGIN{print \"n,s\"; for(i=1;i<=9000;i++){printf \"%d,str%d\\n\", i, i%50}}' > rf_test_csvbc_mr.csv") -- 0
+(set Rmr (.csv.parted "rf_test_csvbc_mr.csv" "rf_test_csvbc_mr" 'tbl))
+(count Rmr) -- 9000
+;; sum 1..9000 = 9000*9001/2 = 40504500
+(sum (at Rmr 'n)) -- 40504500
+;; the inferred string column round-trips back (parted reload prepends 'part)
+(key Rmr) -- ['part 'n 's]
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 24. Parallel materialize through the splayed writer (csv_splayed_writer_append
+;;     SYM + fixed-width arms over a 9000-row chunk).  The inferred SYM column
+;;     forces the W32 sym-buffer append loop; the numeric column drives the
+;;     fixed-width fwrite arm.  Re-load from disk confirms the round trip.
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "rm -rf rf_test_csvbc_mrsp") -- 0
+(.sys.exec "awk 'BEGIN{print \"n,s\"; for(i=1;i<=9000;i++){printf \"%d,str%d\\n\", i, i%50}}' > rf_test_csvbc_mrsp.csv") -- 0
+(set Rsp (.csv.splayed "rf_test_csvbc_mrsp.csv" "rf_test_csvbc_mrsp"))
+(count Rsp) -- 9000
+(set Rspget (.db.splayed.get "rf_test_csvbc_mrsp"))
+(count Rspget) -- 9000
+(sum (at Rspget 'n)) -- 40504500
+(key Rspget) -- ['n 's]
+
 ;; ── cleanup ──────────────────────────────────────────────────────────────────
 (.sys.exec "rm -f rf_test_csvbc_*.csv") -- 0
-(.sys.exec "rm -rf rf_test_csvbc_parted rf_test_csvbc_splayed") -- 0
+(.sys.exec "rm -rf rf_test_csvbc_parted rf_test_csvbc_splayed rf_test_csvbc_pttrace rf_test_csvbc_mr rf_test_csvbc_mrsp") -- 0

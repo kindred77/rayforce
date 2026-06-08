@@ -1411,6 +1411,50 @@ static test_result_t test_sym_ensure_cap_large(void) {
     PASS();
 }
 
+/* ---- sym_accessors_uninitialized -------------------------------------- *
+ * Every public accessor must early-return safely when the sym table is not
+ * initialized (g_sym_inited == false), rather than touching freed/NULL
+ * globals.  Exercised by calling each one after ray_sym_destroy().  This
+ * covers the `!inited` guard branch in ray_sym_find, ray_sym_str,
+ * ray_sym_is_dotted, ray_sym_segs, ray_sym_count, ray_sym_persisted_count,
+ * ray_sym_rebuild_segments, ray_sym_strings_borrow, and ray_sym_ensure_cap.
+ *
+ * sym_setup() already called ray_sym_init(); tear it down first, then probe.
+ * sym_teardown() calls ray_sym_destroy() again, which is a no-op the second
+ * time (its own !inited guard).
+ * ----------------------------------------------------------------------- */
+static test_result_t test_sym_accessors_uninitialized(void) {
+    ray_sym_destroy();  /* g_sym_inited -> false */
+
+    TEST_ASSERT_EQ_I(ray_sym_find("anything", 8), -1);
+    TEST_ASSERT_NULL(ray_sym_str(0));
+    TEST_ASSERT_FALSE(ray_sym_is_dotted(0));
+
+    const int64_t* segs = NULL;
+    TEST_ASSERT_EQ_I(ray_sym_segs(0, &segs), 0);
+
+    TEST_ASSERT_EQ_U(ray_sym_count(), 0);
+    TEST_ASSERT_EQ_U(ray_sym_persisted_count(), 0);
+
+    /* rebuild_segments reports RAY_ERR_IO when the table is not initialized. */
+    TEST_ASSERT_EQ_I(ray_sym_rebuild_segments(), RAY_ERR_IO);
+
+    /* strings_borrow must null out its out-params and not dereference globals. */
+    ray_t** out_strings = (ray_t**)0x1; /* poison: must be overwritten to NULL */
+    uint32_t out_count = 99;            /* poison: must be overwritten to 0 */
+    ray_sym_strings_borrow(&out_strings, &out_count);
+    TEST_ASSERT_NULL(out_strings);
+    TEST_ASSERT_EQ_U(out_count, 0);
+
+    /* ensure_cap returns false when not initialized. */
+    TEST_ASSERT_FALSE(ray_sym_ensure_cap(16));
+
+    /* Re-init so sym_teardown()'s ray_sym_destroy has a consistent table to
+     * tear down (and to match the setup/teardown contract). */
+    (void)ray_sym_init();
+    PASS();
+}
+
 /* ---- sym_dotted_leading_dot_with_second_dot ---------------------------- */
 
 /* Leading dot followed by a second dot (`.sys.gc`) should be treated as
@@ -2688,6 +2732,7 @@ const test_entry_t sym_entries[] = {
     { "sym/str_invalid_id",             test_sym_str_invalid_id,           sym_setup, sym_teardown },
     { "sym/is_dotted_invalid_id",       test_sym_is_dotted_invalid_id,     sym_setup, sym_teardown },
     { "sym/segs_invalid_id",            test_sym_segs_invalid_id,          sym_setup, sym_teardown },
+    { "sym/accessors_uninitialized",    test_sym_accessors_uninitialized,  sym_setup, sym_teardown },
     { "sym/find_after_grow",            test_sym_find_after_grow,          sym_setup, sym_teardown },
     { "sym/ensure_cap_zero",            test_sym_ensure_cap_zero,          sym_setup, sym_teardown },
     { "sym/ensure_cap_large",           test_sym_ensure_cap_large,         sym_setup, sym_teardown },

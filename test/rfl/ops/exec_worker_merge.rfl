@@ -49,7 +49,7 @@
 ;; leak through.  Collapse the merged survivor column to a single bool:
 ;; every survivor of `in [1 2 3]` must itself be in {1,2,3} (and thus
 ;; non-null).  Order- and shard-independent.
-(min (in (at (select {from: TFN where: (in f [1.0 2.0 3.0])}) 'f) [1.0 2.0 3.0])) -- 1
+(min (in (at (select {from: TFN where: (in f [1.0 2.0 3.0])}) 'f) [1.0 2.0 3.0])) -- true
 ;; distinct survivor values are exactly {1.0,2.0,3.0} — guards a shard
 ;; that merged a 4.0/5.0 row into the match set.
 (count (distinct (at (select {from: TFN where: (in f [1.0 2.0 3.0])}) 'f))) -- 3
@@ -57,7 +57,7 @@
 ;; 8750*(1+2+3)=52500.  Detects value corruption the count misses.
 (sum (at (select {from: TFN where: (in f [1.0 2.0 3.0])}) 'f)) -- 52500.0
 ;; not-in survivors (non-null, value 4 or 5) must NOT be in {1,2,3}.
-(max (in (at (select {from: TFN where: (not-in f [1.0 2.0 3.0])}) 'f) [1.0 2.0 3.0])) -- 0
+(max (in (at (select {from: TFN where: (not-in f [1.0 2.0 3.0])}) 'f) [1.0 2.0 3.0])) -- false
 
 ;; ====================================================================
 ;; exec_in_worker — RAY_SYM parallel dispatch (L590, IN_READ_I64 sym
@@ -76,13 +76,13 @@
 ;; EVERY merged survivor of `in ['AAPL]` actually carries 'AAPL — the
 ;; (min (== ...)) collapses the whole merged column to a single bool,
 ;; order-independent and shard-independent.
-(min (== (at (select {from: TS where: (in s ['AAPL])}) 's) 'AAPL)) -- 1
+(min (== (at (select {from: TS where: (in s ['AAPL])}) 's) 'AAPL)) -- true
 ;; every survivor of `not-in ['AAPL]` must NOT be AAPL.
-(max (== (at (select {from: TS where: (not-in s ['AAPL])}) 's) 'AAPL)) -- 0
+(max (== (at (select {from: TS where: (not-in s ['AAPL])}) 's) 'AAPL)) -- false
 ;; distinct survivor set of the two-symbol probe is exactly {AAPL,TSLA}
 ;; regardless of which shard produced each row.
 (count (distinct (at (select {from: TS where: (in s ['AAPL 'TSLA])}) 's))) -- 2
-(min (in (at (select {from: TS where: (in s ['AAPL 'TSLA])}) 's) ['AAPL 'TSLA])) -- 1
+(min (in (at (select {from: TS where: (in s ['AAPL 'TSLA])}) 's) ['AAPL 'TSLA])) -- true
 
 ;; ====================================================================
 ;; exec_in_worker — DATE / TIMESTAMP arms of IN_READ_I64 (L586-589).
@@ -96,11 +96,11 @@
 ;; --- VALUE-LEVEL checks across the worker-shard merge (DATE) ---
 ;; every survivor of the single-date probe must equal that date —
 ;; guards a shard that merged a 2024.01.02 row into the match set.
-(min (== (at (select {from: TD where: (in d [2024.01.01])}) 'd) 2024.01.01)) -- 1
+(min (== (at (select {from: TD where: (in d [2024.01.01])}) 'd) 2024.01.01)) -- true
 ;; two-date probe: distinct survivor dates are exactly {01-01,01-03};
 ;; 2024.01.02 must never appear regardless of shard ordering.
 (count (distinct (at (select {from: TD where: (in d [2024.01.01 2024.01.03])}) 'd))) -- 2
-(max (== (at (select {from: TD where: (in d [2024.01.01 2024.01.03])}) 'd) 2024.01.02)) -- 0
+(max (== (at (select {from: TD where: (in d [2024.01.01 2024.01.03])}) 'd) 2024.01.02)) -- false
 
 ;; ====================================================================
 ;; exec_in_worker — integer path with HAS_NULLS at parallel-pool size.
@@ -115,14 +115,14 @@
 (count (select {from: TIN where: (not-in v [1 2 3])})) -- 17500
 ;; --- VALUE-LEVEL checks across the worker-shard merge (int+nulls) ---
 ;; every survivor of `in [1 2 3]` must itself be in {1,2,3} (non-null).
-(min (in (at (select {from: TIN where: (in v [1 2 3])}) 'v) [1 2 3])) -- 1
+(min (in (at (select {from: TIN where: (in v [1 2 3])}) 'v) [1 2 3])) -- true
 ;; distinct survivor values are exactly {1,2,3}.
 (count (distinct (at (select {from: TIN where: (in v [1 2 3])}) 'v))) -- 3
 ;; sum of survivors: 8750 each of 1/2/3 → 8750*6 = 52500.  sum widens
 ;; narrow ints to i64 (k/q convention) — expected stays an i64 total.
 (sum (at (select {from: TIN where: (in v [1 2 3])}) 'v)) -- 52500
 ;; not-in survivors (value 4 or 5) must NOT be in {1,2,3}.
-(max (in (at (select {from: TIN where: (not-in v [1 2 3])}) 'v) [1 2 3])) -- 0
+(max (in (at (select {from: TIN where: (not-in v [1 2 3])}) 'v) [1 2 3])) -- false
 ;; not-in with a set that contains nulls — set null is dropped from
 ;; probe buffer (set_has_nulls path); non-null rows compared against
 ;; the compacted probe.
@@ -130,7 +130,7 @@
 ;; survivors of the null-bearing probe are still exactly {1,2,3}: the
 ;; set-null must not match the column-nulls (null is a distinct least
 ;; value, never equal under `in`).
-(min (in (at (select {from: TIN where: (in v [1 0Nl 2 3])}) 'v) [1 2 3])) -- 1
+(min (in (at (select {from: TIN where: (in v [1 0Nl 2 3])}) 'v) [1 2 3])) -- true
 (count (distinct (at (select {from: TIN where: (in v [1 0Nl 2 3])}) 'v))) -- 3
 
 ;; ====================================================================

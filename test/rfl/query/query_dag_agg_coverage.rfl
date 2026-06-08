@@ -37,8 +37,9 @@
 ;; OP_VAR (line 1260) — sample variance = 10.0
 (at (at (select {va: (var v) from: Tdag}) 'va) 0) -- 10.0
 
-;; OP_MEDIAN (line 1262) — median of [2,4,6,8,10] = 6
-(at (at (select {m: (med v) from: Tdag}) 'm) 0) -- 0
+;; OP_MEDIAN (line 1262) — median of [2,4,6,8,10] = 6.  The no-by select path
+;; now matches the scalar `med` builtin (was 0 before the holistic fix).
+(at (at (select {m: (med v) from: Tdag}) 'm) 0) -- 6.0
 
 ;; Multiple no-by aggs in one select
 (set Tmulti (table [v] (list [1 2 3 4 5])))

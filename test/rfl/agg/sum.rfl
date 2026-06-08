@@ -67,3 +67,32 @@
 (select {s: (avg (sqrt "x")) from: _erp_T})    !- type
 (select {s: (min (+ "a" 1)) from: _erp_T})     !- type
 (select {s: (max (+ "a" 1)) from: _erp_T})     !- type
+
+;; ---- M1: scalar↔DAG type-admission parity (canonical aggregand table) ----
+;; A non-numeric / absolute-temporal aggregand must error in BOTH the scalar
+;; builtin and the DAG (select) path, no-by AND by-group.  Previously the DAG
+;; silently folded raw symbol ids / date integers; now both reject.
+(set Madm (table [s d ts k] (list ['a 'b 'a] (as 'DATE [7300 7301 7302]) (as 'TIMESTAMP [1 2 3]) (as 'I64 [1 1 2]))))
+;; sum SYM — scalar, no-by select, by-group select
+(sum ['a 'b 'a])                          !- type
+(select {r: (sum s) from: Madm})          !- type
+(select {r: (sum s) by: k from: Madm})    !- type
+;; sum DATE / TIMESTAMP (absolute temporals) — DAG both shapes
+(select {r: (sum d) from: Madm})          !- type
+(select {r: (sum d) by: k from: Madm})    !- type
+(select {r: (sum ts) from: Madm})         !- type
+(select {r: (sum ts) by: k from: Madm})   !- type
+
+;; ---- M1: sum(TIME) preserves the TIME type in BOTH paths ----
+;; TIME is duration-like (time+time is a time), so sum keeps it — unlike the
+;; absolute temporals above.  Scalar and DAG must agree on type AND value.
+(set Mtm (table [t k] (list [09:00:00.000 09:00:00.000 01:00:00.000] (as 'I64 [1 1 2]))))
+;; scalar sum returns a TIME atom (lowercase 'time); the select column is a
+;; vector (uppercase 'TIME).  Both carry the TIME type — that is the parity.
+(type (sum [09:00:00.000 09:00:00.000]))                       -- 'time
+(type (at (select {r: (sum t) from: Mtm}) 'r))                 -- 'TIME
+(at (select {r: (sum t) from: Mtm}) 'r)                        -- [19:00:00.000]
+(type (at (select {r: (sum t) by: k from: Mtm}) 'r))           -- 'TIME
+(at (select {r: (sum t) by: k from: Mtm}) 'r)                  -- [18:00:00.000 01:00:00.000]
+;; integer families still widen to I64 (no spurious type preservation)
+(type (at (select {r: (sum k) from: Mtm}) 'r))                 -- 'I64

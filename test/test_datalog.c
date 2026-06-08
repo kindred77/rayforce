@@ -198,6 +198,158 @@ static test_result_t test_source_prov_requires_flag(void) {
     PASS();
 }
 
+/* Source provenance over a body atom that carries a CONSTANT slot.
+ *
+ * dl_build_source_prov matches each derived row against the body relation,
+ * and for a constant body position it compares the source cell against
+ * body->const_vals[c] (datalog.c:2566).  The plain-variable provenance test
+ * above never exercises that comparison.
+ *
+ * Program:
+ *   EDB: kv(1,7), kv(2,7), kv(3,9)
+ *   Rule: hit(E) :- kv(E, 7)          // second body slot is the constant 7
+ *
+ * Expected: hit has 2 rows (E=1, E=2).  Each derived row's provenance points
+ * at exactly the matching kv source row (the const filter rejects kv(3,9)). */
+static test_result_t test_source_prov_const_body_slot(void) {
+    int64_t e_vals[] = {1, 2, 3};
+    int64_t k_vals[] = {7, 7, 9};
+    ray_t* e_col = ray_vec_from_raw(RAY_I64, e_vals, 3);
+    ray_t* k_col = ray_vec_from_raw(RAY_I64, k_vals, 3);
+    TEST_ASSERT_NOT_NULL(e_col);
+    TEST_ASSERT_NOT_NULL(k_col);
+
+    ray_t* kv = ray_table_new(2);
+    kv = ray_table_add_col(kv, ray_sym_intern("kv__c0", 6), e_col);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(kv));
+    kv = ray_table_add_col(kv, ray_sym_intern("kv__c1", 6), k_col);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(kv));
+
+    dl_program_t* prog = dl_program_new();
+    TEST_ASSERT_NOT_NULL(prog);
+    prog->flags |= DL_FLAG_PROVENANCE;
+
+    int kv_idx = dl_add_edb(prog, "kv", kv, 2);
+    TEST_ASSERT_EQ_I(kv_idx, 0);
+
+    /* hit(E) :- kv(E, 7) */
+    dl_rule_t rule;
+    dl_rule_init(&rule, "hit", 1);
+    dl_rule_head_var(&rule, 0, 0);
+    int body = dl_rule_add_atom(&rule, "kv", 2);
+    dl_body_set_var(&rule, body, 0, 0);                 /* E */
+    dl_body_set_const_typed(&rule, body, 1, 7, RAY_I64); /* constant 7 */
+    rule.n_vars = 1;
+    TEST_ASSERT_EQ_I(dl_add_rule(prog, &rule), 0);
+
+    TEST_ASSERT_EQ_I(dl_eval(prog), 0);
+
+    ray_t* out = dl_query(prog, "hit");
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_EQ_I((int)ray_table_nrows(out), 2);
+
+    ray_t* offsets = dl_get_provenance_src_offsets(prog, "hit");
+    ray_t* data    = dl_get_provenance_src_data(prog, "hit");
+    TEST_ASSERT_NOT_NULL(offsets);
+    TEST_ASSERT_NOT_NULL(data);
+    /* 2 derived rows → offsets length 3; one source ref per row (the const
+     * filter keeps only the matching kv row). */
+    TEST_ASSERT_EQ_I((int)ray_len(offsets), 3);
+    TEST_ASSERT_EQ_I((int)ray_len(data), 2);
+    int64_t* off = (int64_t*)ray_data(offsets);
+    TEST_ASSERT_EQ_I((int)off[0], 0);
+    TEST_ASSERT_EQ_I((int)off[1], 1);
+    TEST_ASSERT_EQ_I((int)off[2], 2);
+    /* Both refs must point at relation kv (idx 0), rows 0 and 1 — never row 2,
+     * which holds the const-mismatched kv(3,9). */
+    int64_t* sd = (int64_t*)ray_data(data);
+    for (int i = 0; i < 2; i++) {
+        TEST_ASSERT_EQ_I((int)(sd[i] >> 32), kv_idx);
+        TEST_ASSERT_TRUE((sd[i] & 0xffffffff) != 2);
+    }
+
+    dl_program_free(prog);
+    ray_release(kv);
+    ray_release(e_col);
+    ray_release(k_col);
+    PASS();
+}
+
+/* Source provenance whose packed-ref buffer must GROW past its initial cap.
+ *
+ * dl_build_source_prov sizes the scratch buffer at nrows*4 (min 64) and
+ * doubles it on overflow (datalog.c:2574-2583).  A cross-product rule whose
+ * second body atom shares no variables ("always matches") attaches every row
+ * of that relation to each derived row, so the ref count is nrows*(1+M) which
+ * blows past nrows*4 once M is large enough.
+ *
+ * Program:
+ *   EDB: p(0..19)  q(0..19)
+ *   Rule: r(X) :- p(X), q(Y)          // Y is body-only → unconstrained
+ *
+ * Derived r has 20 rows; each accrues 1 (p) + 20 (q) = 21 source refs, giving
+ * 420 packed entries vs an initial cap of 80 → at least two buffer doublings. */
+static test_result_t test_source_prov_buffer_grow(void) {
+    enum { N = 20 };
+    int64_t pv[N], qv[N];
+    for (int i = 0; i < N; i++) { pv[i] = i; qv[i] = i; }
+    ray_t* p_col = ray_vec_from_raw(RAY_I64, pv, N);
+    ray_t* q_col = ray_vec_from_raw(RAY_I64, qv, N);
+    TEST_ASSERT_NOT_NULL(p_col);
+    TEST_ASSERT_NOT_NULL(q_col);
+
+    ray_t* p = ray_table_new(1);
+    p = ray_table_add_col(p, ray_sym_intern("p__c0", 5), p_col);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(p));
+    ray_t* q = ray_table_new(1);
+    q = ray_table_add_col(q, ray_sym_intern("q__c0", 5), q_col);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(q));
+
+    dl_program_t* prog = dl_program_new();
+    TEST_ASSERT_NOT_NULL(prog);
+    prog->flags |= DL_FLAG_PROVENANCE;
+
+    int p_idx = dl_add_edb(prog, "p", p, 1);
+    TEST_ASSERT_EQ_I(p_idx, 0);
+    dl_add_edb(prog, "q", q, 1);
+
+    /* r(X) :- p(X), q(Y) — Y (var idx 1) appears only in the body. */
+    dl_rule_t rule;
+    dl_rule_init(&rule, "r", 1);
+    dl_rule_head_var(&rule, 0, 0);
+    int b0 = dl_rule_add_atom(&rule, "p", 1);
+    dl_body_set_var(&rule, b0, 0, 0);  /* X */
+    int b1 = dl_rule_add_atom(&rule, "q", 1);
+    dl_body_set_var(&rule, b1, 0, 1);  /* Y, body-only */
+    rule.n_vars = 2;
+    TEST_ASSERT_EQ_I(dl_add_rule(prog, &rule), 0);
+
+    TEST_ASSERT_EQ_I(dl_eval(prog), 0);
+
+    ray_t* out = dl_query(prog, "r");
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_EQ_I((int)ray_table_nrows(out), N);
+
+    ray_t* offsets = dl_get_provenance_src_offsets(prog, "r");
+    ray_t* data    = dl_get_provenance_src_data(prog, "r");
+    TEST_ASSERT_NOT_NULL(offsets);
+    TEST_ASSERT_NOT_NULL(data);
+    /* offsets length nrows+1 = 21; total refs = nrows*(1 + N) = 420, well past
+     * the initial 80-entry cap so the doubling path ran. */
+    TEST_ASSERT_EQ_I((int)ray_len(offsets), N + 1);
+    int64_t* off = (int64_t*)ray_data(offsets);
+    TEST_ASSERT_EQ_I((int)off[0], 0);
+    TEST_ASSERT_EQ_I((int)off[N], N * (1 + N));
+    TEST_ASSERT_EQ_I((int)ray_len(data), N * (1 + N));
+
+    dl_program_free(prog);
+    ray_release(p);
+    ray_release(q);
+    ray_release(p_col);
+    ray_release(q_col);
+    PASS();
+}
+
 /* Verify cmp body literal filters tuples: rule keeps only rows where col0 < 60.
  *
  * Program:
@@ -2286,6 +2438,8 @@ static test_result_t test_rule_add_interval_overflow(void) {
 const test_entry_t datalog_entries[] = {
     { "datalog/source_provenance", test_source_provenance, datalog_setup, datalog_teardown },
     { "datalog/source_prov_requires_flag", test_source_prov_requires_flag, datalog_setup, datalog_teardown },
+    { "datalog/source_prov_const_body_slot", test_source_prov_const_body_slot, datalog_setup, datalog_teardown },
+    { "datalog/source_prov_buffer_grow", test_source_prov_buffer_grow, datalog_setup, datalog_teardown },
     { "datalog/cmp_const_filter", test_cmp_const_filter, datalog_setup, datalog_teardown },
     { "datalog/arith_assignment", test_arith_assignment, datalog_setup, datalog_teardown },
     { "datalog/arith_assign_f64", test_arith_assign_f64, datalog_setup, datalog_teardown },

@@ -55,6 +55,30 @@
 (count (query Fdb (find ?a) (where (favg ?a)) (rules ((favg ?a) (avg ?a f64src 1))))) -- 1
 (at (at (query Fdb (find ?a) (where (favg ?a)) (rules ((favg ?a) (avg ?a f64src 1)))) '?a) 0) -- 2.5
 
+;; ════════════════════════ MIN aggregate where a later element is smaller ═════════════════════════
+;; The MIN reduction seeds result=vd[0]; the inner `if (vd[i] < result)` body
+;; (i64 line 1781 / f64 line 1806) only executes when a *later* row is smaller
+;; than the first.  Existing tests feed ascending columns, so they never take
+;; that branch.  Use a descending value column so vd[0] is the largest.
+;; i64: descending {30,20,5} → min=5.
+(set Imin (table ['k 'v] (list [1 2 3] [30 20 5])))
+(at (at (query Fdb (find ?m) (where (imin ?m)) (rules ((imin ?m) (min ?m Imin 1)))) '?m) 0) -- 5
+;; f64: descending {3.5,2.5,1.5} → min=1.5.
+(set Fmin (table ['k 'v] (list [1 2 3] [3.5 2.5 1.5])))
+(at (at (query Fdb (find ?m) (where (fmin2 ?m)) (rules ((fmin2 ?m) (min ?m Fmin 1)))) '?m) 0) -- 1.5
+
+;; ════════════════════════ f64 variable compared against an integer constant ═════════════════════════
+;; ?y is f64 (derived via + ?x 0.5) but the comparison constant is the *integer*
+;; 20, stored as cmp_const (i64).  This drives the f64 CMP path where rhs_src is
+;; NULL and the const is widened: `rv = (double)body->cmp_const` (line 2024),
+;; distinct from the `> ?y 20.0` case which parses the bound as f64.
+(set Cdb (datoms))
+(set Cdb (assert-fact Cdb 1 'val 10))
+(set Cdb (assert-fact Cdb 2 'val 20))
+(set Cdb (assert-fact Cdb 3 'val 30))
+(count (query Cdb (find ?e ?y) (where (?e :val ?x) (= ?y (+ ?x 0.5)) (> ?y 20)))) -- 2
+(sum (at (query Cdb (find ?e ?y) (where (?e :val ?x) (= ?y (+ ?x 0.5)) (> ?y 20))) '?y)) -- 51.0
+
 ;; ════════════════════════ empty-source AVG and MAX aggregates ═════════════════════════
 ;; AVG and MAX over empty source — should produce 0 rows (lines 1725-1732).
 (set Empty (datoms))

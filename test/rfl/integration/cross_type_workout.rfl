@@ -79,10 +79,11 @@
 ;; ════════════════════ COMPARISON ON COLUMNS ════════════════════
 ;; sym='AAPL kept → every kept sym is 'AAPL.
 (count (select {from: T where: (== sym 'AAPL)})) -- 40
-(min (== (at (select {from: T where: (== sym 'AAPL)}) 'sym) 'AAPL)) -- 1
+;; min over a BOOL vector returns a BOOL (min/max preserve element type).
+(min (== (at (select {from: T where: (== sym 'AAPL)}) 'sym) 'AAPL)) -- true
 ;; != 'TSLA → 160 rows, no 'TSLA in kept set.
 (count (select {from: T where: (!= sym 'TSLA)})) -- 160
-(max (== (at (select {from: T where: (!= sym 'TSLA)}) 'sym) 'TSLA)) -- 0
+(max (== (at (select {from: T where: (!= sym 'TSLA)}) 'sym) 'TSLA)) -- false
 ;; > price 130 → kept rows price min > 130.
 (count (select {from: T where: (> price 130.0)})) -- 76
 (> (min (at (select {from: T where: (> price 130.0)}) 'price)) 130.0) -- true
@@ -95,9 +96,9 @@
 (< (max (at (select {from: T where: (and (> qty 0) (< qty 100))}) 'qty)) 100) -- true
 ;; OR — kept syms must be AAPL or GOOG.
 (count (select {from: T where: (or (== sym 'AAPL) (== sym 'GOOG))})) -- 80
-;; not (== bool true) → all kept rows bool=false; max should be false (0).
+;; not (== bool true) → all kept rows bool=false; max of a BOOL column is BOOL.
 (count (select {from: T where: (not (== bool true))})) -- 100
-(max (at (select {from: T where: (not (== bool true))}) 'bool)) -- 0
+(max (at (select {from: T where: (not (== bool true))}) 'bool)) -- false
 
 ;; ════════════════════ SORT ════════════════════
 ;; whole-vec sort returns a fresh vec
