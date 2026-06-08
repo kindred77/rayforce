@@ -65,6 +65,11 @@
 #include "store/journal.h"
 #include "ops/ops.h"
 
+/* `.ipc.post` C wrapper — declared in src/lang/internal.h, but that header
+ * re-typedefs ray_vm_t and clashes with core/runtime.h already included
+ * above, so forward-declare just the one symbol the guard tests call. */
+ray_t* ray_hpost_fn(ray_t* handle, ray_t* msg);
+
 #ifndef RAY_OS_WINDOWS
   #include <sys/socket.h>
   #include <netinet/in.h>
@@ -1734,6 +1739,46 @@ static test_result_t test_ipc_post_delivery(void) {
     PASS();
 }
 
+/* ---- test_ipc_post_invalid_handle --------------------------------------- */
+/*
+ * The `.ipc.post` wrapper (ray_hpost_fn) with a bad handle must return an
+ * `io` error object — the async send to a closed/invalid handle fails
+ * locally.  Mirrors test_ipc_send_invalid_handle for the sync path.
+ */
+static test_result_t test_ipc_post_invalid_handle(void) {
+    ray_t* handle = ray_i64(-1);
+    ray_t* msg = ray_str("1", 1);
+    ray_t* r = ray_hpost_fn(handle, msg);
+    ray_release(handle);
+    ray_release(msg);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    ray_release(r);
+    PASS();
+}
+
+/* ---- test_ipc_post_non_serializable ------------------------------------- */
+/*
+ * `.ipc.post` must reject a non-serializable message with a `type` error,
+ * BEFORE attempting any send.  We craft an object whose type hits the
+ * default arm of ray_serde_size (returns 0) by overwriting an i64's type
+ * to an unrecognised value, restoring it before release to keep the heap
+ * tracker consistent (same technique as test_serde_save_serde_error in
+ * test_store.c).
+ */
+static test_result_t test_ipc_post_non_serializable(void) {
+    ray_t* handle = ray_i64(0);
+    ray_t* msg = ray_i64(7);
+    int8_t orig_type = msg->type;
+    msg->type = 50; /* not a recognised serde type → serde_size == 0 */
+    ray_t* r = ray_hpost_fn(handle, msg);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    ray_release(r);
+    msg->type = orig_type; /* restore before release */
+    ray_release(handle);
+    ray_release(msg);
+    PASS();
+}
+
 /* ---- Registry ------------------------------------------------------------ */
 
 const test_entry_t ipc_entries[] = {
@@ -1768,5 +1813,7 @@ const test_entry_t ipc_entries[] = {
     { "ipc/hooks_lifecycle",             test_ipc_hooks_lifecycle,                ipc_setup, ipc_teardown },
     { "ipc/hooks_auth_narrow",           test_ipc_hooks_auth_narrow,              ipc_setup, ipc_teardown },
     { "ipc/post_delivery",               test_ipc_post_delivery,                  ipc_setup, ipc_teardown },
+    { "ipc/post_invalid_handle",        test_ipc_post_invalid_handle,            ipc_setup, ipc_teardown },
+    { "ipc/post_non_serializable",      test_ipc_post_non_serializable,          ipc_setup, ipc_teardown },
     { NULL, NULL, NULL, NULL },
 };
