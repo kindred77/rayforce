@@ -29,13 +29,15 @@ Signature: `(.log.open mode "base")`. `mode` is `'async` or `'sync`; `base` is t
 
 Returns the null object on success.
 
+Opens the journal **for append only** — it does not load a snapshot or replay the existing log. Resuming an existing journal therefore does not re-apply its entries; recover state explicitly with [`.log.replay`](#log-replay) (or let the `-l`/`-L` startup path do it for you). This keeps "open to keep writing" distinct from "recover prior state".
+
 Errors: `rank` (arity != 2), `type` (mode not a sym / base not a string), `domain` (unknown mode), `io` (open failed).
 
 ```lisp
 (.log.open 'async "/var/lib/rayforce/journal")
 ```
 
-The server CLI flags `-l` (async) and `-L` (sync) call this automatically at startup.
+The server CLI flags `-l` (async) and `-L` (sync) open the journal at startup and, unlike the bare verb, additionally load the latest snapshot and replay the log first — a full crash-recovery, then open-for-append.
 
 ## `.log.write` { #log-write }
 

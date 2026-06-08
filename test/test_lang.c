@@ -353,6 +353,32 @@ static test_result_t test_eval_set(void) {
     PASS();
 }
 
+/* A list whose head is a symbol applies the function that symbol names.
+ * The tick-shorthand head `'f` must behave the same as the name head
+ * produced by `(quote f)`. */
+static test_result_t test_eval_symbol_head_applies(void) {
+    ray_t* tick = ray_eval_str("(do (set f (fn [x] (+ x 100))) (eval (list 'f 1)))");
+    TEST_ASSERT_NOT_NULL(tick);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tick));
+    TEST_ASSERT_EQ_I(tick->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(tick->i64, 101);
+    ray_release(tick);
+
+    ray_t* q = ray_eval_str("(do (set f (fn [x] (+ x 100))) (eval (list (quote f) 1)))");
+    TEST_ASSERT_NOT_NULL(q);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(q));
+    TEST_ASSERT_EQ_I(q->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(q->i64, 101);
+    ray_release(q);
+
+    /* Unbound head → graceful name error, not a crash. */
+    ray_t* u = ray_eval_str("(eval (list 'nope_unbound_sym 1))");
+    TEST_ASSERT_NOT_NULL(u);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(u));
+    ray_error_free(u);
+    PASS();
+}
+
 /* ---- Test: eval if true ---- */
 static test_result_t test_eval_if_true(void) {
     ray_t* result = ray_eval_str("(if true 1 2)");
@@ -6622,6 +6648,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/div", test_eval_div, lang_setup, lang_teardown },
     { "lang/eval/cmp", test_eval_cmp, lang_setup, lang_teardown },
     { "lang/eval/set", test_eval_set, lang_setup, lang_teardown },
+    { "lang/eval/symbol_head_applies", test_eval_symbol_head_applies, lang_setup, lang_teardown },
     { "lang/eval/if_true", test_eval_if_true, lang_setup, lang_teardown },
     { "lang/eval/if_false", test_eval_if_false, lang_setup, lang_teardown },
     { "lang/eval/let", test_eval_let, lang_setup, lang_teardown },

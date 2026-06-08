@@ -1962,6 +1962,186 @@ static test_result_t test_ops_write_serde_size_zero(void) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
+ *  23. End-to-end RFL round-trip: both `.log.write` symbol-head forms replay.
+ *
+ *  A symbol in functional position applies the named function, so BOTH the
+ *  tick form `(list 'f 10)` and the quote form `(list (quote f) 5)` replay
+ *  by applying `f`.  We drive the public RFL verbs, then reset the
+ *  accumulator and replay explicitly, observing the side effect (15).
+ * ═══════════════════════════════════════════════════════════════════════ */
+static test_result_t test_journal_replay_symbol_head_both_forms(void) {
+    char base[256]; make_base(base, sizeof(base), "symhead");
+    char lpath[270]; log_path(lpath, sizeof(lpath), base);
+
+    /* Open async, define an accumulating fn, write both symbol-head forms,
+     * then close.  Multiple top-level forms in one source string are wrapped
+     * in an implicit (do ...) by the parser, so this evaluates in order. */
+    char src[640];
+    snprintf(src, sizeof(src),
+             "(set _acc 0)"
+             "(set f (fn [x] (set _acc (+ _acc x))))"
+             "(.log.open 'async \"%s\")"
+             "(.log.write (list 'f 10))"
+             "(.log.write (list (quote f) 5))"
+             "(.log.close)",
+             base);
+    ray_t* a = ray_eval_str(src);
+    TEST_ASSERT_NOT_NULL(a);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(a));
+    if (a != RAY_NULL_OBJ) ray_release(a);
+
+    /* Reset the accumulator, then replay the log: both records apply `f`. */
+    char replay[400];
+    snprintf(replay, sizeof(replay),
+             "(set _acc 0)(.log.replay \"%s\")", lpath);
+    ray_t* z = ray_eval_str(replay);
+    TEST_ASSERT_NOT_NULL(z);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(z));
+    if (z != RAY_NULL_OBJ) ray_release(z);
+
+    /* Both records applied: 0 + 10 + 5 == 15. */
+    ray_t* acc = ray_eval_str("_acc");
+    TEST_ASSERT_NOT_NULL(acc);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(acc));
+    TEST_ASSERT_EQ_I(acc->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(acc->i64, 15);
+    ray_release(acc);
+
+    cleanup_base(base);
+    PASS();
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ *  23b. A well-framed record whose head symbol is UNBOUND replays to a
+ *  graceful per-chunk eval error — replay counts it and continues, it
+ *  must NEVER crash.
+ *
+ *  A symbol in functional position resolves+applies; an unbound head
+ *  yields a `name` error from eval rather than a crash.  Framing stays
+ *  intact (the frame deserialized fine), so replay returns RAY_OK with
+ *  status RAY_JREPLAY_OK, chunks == 1, and the failure observable as
+ *  errs == 1.  This guards the eval-corruption fix against regression.
+ * ═══════════════════════════════════════════════════════════════════════ */
+static test_result_t test_journal_replay_unbound_head_is_graceful(void) {
+    char base[256]; make_base(base, sizeof(base), "unbound_head");
+    char lpath[270]; log_path(lpath, sizeof(lpath), base);
+
+    /* Drive the public RFL verbs to write ONE record whose head symbol is
+     * not bound to anything, then close.  Multiple top-level forms in one
+     * source string are wrapped in an implicit (do ...), so this evaluates
+     * in order. */
+    char src[512];
+    snprintf(src, sizeof(src),
+             "(.log.open 'async \"%s\")"
+             "(.log.write (list 'definitely_not_bound 1))"
+             "(.log.close)",
+             base);
+    ray_t* a = ray_eval_str(src);
+    TEST_ASSERT_NOT_NULL(a);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(a));
+    if (a != RAY_NULL_OBJ) ray_release(a);
+
+    /* Replay: the lone frame deserializes fine (framing intact) but its
+     * eval raises a `name` error.  No crash; the error is counted. */
+    int64_t chunks = 0, errs = 0;
+    ray_jreplay_status_t status = RAY_JREPLAY_OK;
+    ray_err_t rc = ray_journal_replay(lpath, &chunks, &errs, &status);
+
+    /* Framing valid -> RAY_OK / RAY_JREPLAY_OK; the one record was replayed
+     * (chunks == 1) and its eval failure noted (errs == 1). */
+    TEST_ASSERT_EQ_I(rc, RAY_OK);
+    TEST_ASSERT_EQ_I(status, RAY_JREPLAY_OK);
+    TEST_ASSERT_EQ_I(chunks, 1);
+    TEST_ASSERT_EQ_I(errs, 1);
+
+    cleanup_base(base);
+    PASS();
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ *  24. `.log.open` opens for append only — it must NOT replay the existing
+ *  log.  Explicit `.log.replay` still applies it.
+ * ═══════════════════════════════════════════════════════════════════════ */
+static test_result_t test_journal_open_does_not_replay(void) {
+    char base[256]; make_base(base, sizeof(base), "open_noreplay");
+    char lpath[270]; log_path(lpath, sizeof(lpath), base);
+
+    /* Open via the verb, write a mutating record, close.  `.log.write`
+     * only SERIALIZES the record — it does NOT evaluate it — so `_m`
+     * stays at the reset value here. */
+    char src[640];
+    snprintf(src, sizeof(src),
+             "(set _m 0)"
+             "(.log.open 'async \"%s\")"
+             "(.log.write \"(set _m 7)\")"
+             "(.log.close)",
+             base);
+    ray_t* a = ray_eval_str(src);
+    TEST_ASSERT_NOT_NULL(a);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(a));
+    if (a != RAY_NULL_OBJ) ray_release(a);
+
+    /* Reopen via the verb — must NOT re-apply (set _m 7). */
+    char reopen[640];
+    snprintf(reopen, sizeof(reopen),
+             "(set _m 0)(.log.open 'async \"%s\")", base);
+    ray_t* b = ray_eval_str(reopen);
+    TEST_ASSERT_NOT_NULL(b);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(b));
+    if (b != RAY_NULL_OBJ) ray_release(b);
+
+    ray_t* m1 = ray_eval_str("_m");
+    TEST_ASSERT_NOT_NULL(m1);
+    TEST_ASSERT_EQ_I(m1->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(m1->i64, 0);   /* NOT replayed on open */
+    ray_release(m1);
+
+    /* Explicit replay DOES apply the record. */
+    char replay[400];
+    snprintf(replay, sizeof(replay), "(.log.replay \"%s\")", lpath);
+    ray_t* c = ray_eval_str(replay);
+    if (c && !RAY_IS_ERR(c) && c != RAY_NULL_OBJ) ray_release(c);
+
+    ray_t* m2 = ray_eval_str("_m");
+    TEST_ASSERT_NOT_NULL(m2);
+    TEST_ASSERT_EQ_I(m2->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(m2->i64, 7);   /* replayed on demand */
+    ray_release(m2);
+
+    ray_t* d = ray_eval_str("(.log.close)");
+    if (d && !RAY_IS_ERR(d) && d != RAY_NULL_OBJ) ray_release(d);
+
+    cleanup_base(base);
+    PASS();
+}
+
+/* A corrupted record encoding pathologically-nested lists must NOT overflow
+ * the C stack — ray_de_raw returns a domain error instead.  Each level on the
+ * wire is a single-element RAY_LIST header [type][attrs:1][count:8 LE]; the
+ * innermost element is a RAY_SERDE_NULL terminal. */
+static test_result_t test_journal_de_depth_limit(void) {
+    const int levels = 5000;   /* far beyond any legitimate nesting */
+    size_t cap = (size_t)levels * 10 + 1;
+    uint8_t* b = (uint8_t*)malloc(cap);
+    TEST_ASSERT_NOT_NULL(b);
+    size_t off = 0;
+    for (int i = 0; i < levels; i++) {
+        b[off++] = (uint8_t)RAY_LIST;          /* type tag = 0 */
+        b[off++] = 0;                          /* attrs */
+        int64_t one = 1;                       /* count = 1 element */
+        memcpy(b + off, &one, 8); off += 8;
+    }
+    b[off++] = (uint8_t)RAY_SERDE_NULL;        /* innermost terminal element */
+
+    int64_t len = (int64_t)off;
+    ray_t* r = ray_de_raw(b, &len);
+    TEST_ASSERT_TRUE(r != NULL && RAY_IS_ERR(r));
+    ray_error_free(r);
+    free(b);
+    PASS();
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
  *  Registration
  * ═══════════════════════════════════════════════════════════════════════ */
 
@@ -2054,5 +2234,11 @@ const test_entry_t journal_entries[] = {
     { "journal/ops_write_null_expr",       test_ops_write_null_expr,              jrn_setup, jrn_teardown },
     { "journal/ops_write_noopen",          test_ops_write_noopen,                 jrn_setup, jrn_teardown },
     { "journal/ops_write_serde_size_zero", test_ops_write_serde_size_zero,        jrn_setup, jrn_teardown },
+    /* End-to-end RFL round-trip */
+    { "journal/replay_symbol_head_both_forms", test_journal_replay_symbol_head_both_forms, jrn_setup, jrn_teardown },
+    { "journal/replay_unbound_head_is_graceful", test_journal_replay_unbound_head_is_graceful, jrn_setup, jrn_teardown },
+    /* Open opens for append only — no replay */
+    { "journal/open_does_not_replay",      test_journal_open_does_not_replay,      jrn_setup, jrn_teardown },
+    { "journal/de_depth_limit",            test_journal_de_depth_limit,            jrn_setup, jrn_teardown },
     { NULL, NULL, NULL, NULL },
 };
