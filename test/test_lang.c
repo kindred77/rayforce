@@ -6648,7 +6648,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/div", test_eval_div, lang_setup, lang_teardown },
     { "lang/eval/cmp", test_eval_cmp, lang_setup, lang_teardown },
     { "lang/eval/set", test_eval_set, lang_setup, lang_teardown },
-    { "lang/eval_symbol_head_applies", test_eval_symbol_head_applies, lang_setup, lang_teardown },
+    { "lang/eval/symbol_head_applies", test_eval_symbol_head_applies, lang_setup, lang_teardown },
     { "lang/eval/if_true", test_eval_if_true, lang_setup, lang_teardown },
     { "lang/eval/if_false", test_eval_if_false, lang_setup, lang_teardown },
     { "lang/eval/let", test_eval_let, lang_setup, lang_teardown },
