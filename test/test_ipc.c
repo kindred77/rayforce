@@ -1694,12 +1694,11 @@ static test_result_t test_ipc_post_delivery(void) {
     TEST_ASSERT((h) >= (0), "h >= 0");
 
     /* Post async via the BUILTIN — build the call string with the live
-     * handle.  Returns the null object on a good local send.  Capture the
-     * result + its error-ness here, but defer the assertions until after
-     * the server thread is joined: a failing assertion early-returns from
-     * the test, and the running server thread would then dereference this
-     * now-dead stack frame (`ctx`/`srv`).  We snapshot now, tear down, then
-     * assert. */
+     * handle.  Returns the null object on a good local send.  We snapshot
+     * the post result + its error-ness here and defer the post-connect
+     * assertions (the post result and the `_async_got` read-back) until
+     * after `ray_thread_join`, so they run only once the server thread
+     * is gone. */
     char post_expr[96];
     snprintf(post_expr, sizeof(post_expr),
              "(.ipc.post %lld \"(set _async_got 42)\")", (long long)h);
@@ -1730,6 +1729,7 @@ static test_result_t test_ipc_post_delivery(void) {
     int64_t sym_got = ray_sym_intern("_async_got", strlen("_async_got"));
     ray_t* v_got = ray_env_get(sym_got);
     TEST_ASSERT_NOT_NULL(v_got);
+    TEST_ASSERT_EQ_I(v_got->type, -RAY_I64);
     TEST_ASSERT_EQ_I(v_got->i64, 42);
     PASS();
 }
@@ -1767,6 +1767,6 @@ const test_entry_t ipc_entries[] = {
     { "ipc/send_lazy_msg",               test_ipc_send_lazy_msg,                  ipc_setup, ipc_teardown },
     { "ipc/hooks_lifecycle",             test_ipc_hooks_lifecycle,                ipc_setup, ipc_teardown },
     { "ipc/hooks_auth_narrow",           test_ipc_hooks_auth_narrow,              ipc_setup, ipc_teardown },
-    { "ipc/post_delivery",              test_ipc_post_delivery,                  ipc_setup, ipc_teardown },
+    { "ipc/post_delivery",               test_ipc_post_delivery,                  ipc_setup, ipc_teardown },
     { NULL, NULL, NULL, NULL },
 };
