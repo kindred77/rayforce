@@ -24,8 +24,8 @@
 ;; gc, exec, build, mem, info, cmd, timeit, listen, env, args
 (count .os) -- 4
 ;; getenv, setenv, size, list
-(count .ipc) -- 4
-;; open, close, send, handle
+(count .ipc) -- 5
+;; open, close, send, post, handle
 (count .csv) -- 4
 ;; read, splayed, parted, write
 ;; .db.* — three-level reserved namespace for storage I/O.  The
@@ -68,6 +68,7 @@
 (nil? .ipc.open) -- false
 (nil? .ipc.close) -- false
 (nil? .ipc.send) -- false
+(nil? .ipc.post) -- false
 (nil? .csv.read) -- false
 (nil? .csv.write) -- false
 ;; Python compatibility aliases resolve to the same CSV builtins.
@@ -135,6 +136,7 @@ myns.x -- 1
 (set .ipc.handle 9)        !- reserve
 (set .ipc.open    (fn [x] x)) !- reserve
 (set .ipc.send    (fn [a b] a)) !- reserve
+(set .ipc.post    (fn [a b] a)) !- reserve
 (set .ipc.on.bogus  (fn [x] x)) !- reserve
 (let .ipc.on.bogus  (fn [x] x)) !- reserve
 ;; Clearing a hook with a non-lambda value is allowed — the server
