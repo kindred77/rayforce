@@ -68,7 +68,7 @@ In restricted mode, specific builtins that write files, mutate state, or control
 | File writes | `write`, `.csv.write`, `load`, `.db.splayed.set` |
 | File reads | `read`, `.csv.read` |
 | System | `.sys.exec`, `.os.getenv`, `.os.setenv`, `exit` |
-| IPC chaining | `.ipc.open`, `.ipc.close`, `.ipc.send` |
+| IPC chaining | `.ipc.open`, `.ipc.close`, `.ipc.send`, `.ipc.post` |
 
 !!! note "Scope"
     Restricted mode blocks the builtins listed above. It does not provide full sandboxing — `select`, `.db.splayed.get`, `.db.parted.get`, and other read operations on already-loaded data or splayed tables remain available.
