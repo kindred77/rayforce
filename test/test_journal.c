@@ -2012,6 +2012,53 @@ static test_result_t test_journal_replay_symbol_head_both_forms(void) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
+ *  23b. A well-framed record whose head symbol is UNBOUND replays to a
+ *  graceful per-chunk eval error — replay counts it and continues, it
+ *  must NEVER crash.
+ *
+ *  A symbol in functional position resolves+applies; an unbound head
+ *  yields a `name` error from eval rather than a crash.  Framing stays
+ *  intact (the frame deserialized fine), so replay returns RAY_OK with
+ *  status RAY_JREPLAY_OK, chunks == 1, and the failure observable as
+ *  errs == 1.  This guards the eval-corruption fix against regression.
+ * ═══════════════════════════════════════════════════════════════════════ */
+static test_result_t test_journal_replay_unbound_head_is_graceful(void) {
+    char base[256]; make_base(base, sizeof(base), "unbound_head");
+    char lpath[270]; log_path(lpath, sizeof(lpath), base);
+
+    /* Drive the public RFL verbs to write ONE record whose head symbol is
+     * not bound to anything, then close.  Multiple top-level forms in one
+     * source string are wrapped in an implicit (do ...), so this evaluates
+     * in order. */
+    char src[512];
+    snprintf(src, sizeof(src),
+             "(.log.open 'async \"%s\")"
+             "(.log.write (list 'definitely_not_bound 1))"
+             "(.log.close)",
+             base);
+    ray_t* a = ray_eval_str(src);
+    TEST_ASSERT_NOT_NULL(a);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(a));
+    if (a != RAY_NULL_OBJ) ray_release(a);
+
+    /* Replay: the lone frame deserializes fine (framing intact) but its
+     * eval raises a `name` error.  No crash; the error is counted. */
+    int64_t chunks = 0, errs = 0;
+    ray_jreplay_status_t status = RAY_JREPLAY_OK;
+    ray_err_t rc = ray_journal_replay(lpath, &chunks, &errs, &status);
+
+    /* Framing valid -> RAY_OK / RAY_JREPLAY_OK; the one record was replayed
+     * (chunks == 1) and its eval failure noted (errs == 1). */
+    TEST_ASSERT_EQ_I(rc, RAY_OK);
+    TEST_ASSERT_EQ_I(status, RAY_JREPLAY_OK);
+    TEST_ASSERT_EQ_I(chunks, 1);
+    TEST_ASSERT_EQ_I(errs, 1);
+
+    cleanup_base(base);
+    PASS();
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
  *  24. `.log.open` opens for append only — it must NOT replay the existing
  *  log.  Explicit `.log.replay` still applies it.
  * ═══════════════════════════════════════════════════════════════════════ */
@@ -2189,6 +2236,7 @@ const test_entry_t journal_entries[] = {
     { "journal/ops_write_serde_size_zero", test_ops_write_serde_size_zero,        jrn_setup, jrn_teardown },
     /* End-to-end RFL round-trip */
     { "journal/replay_symbol_head_both_forms", test_journal_replay_symbol_head_both_forms, jrn_setup, jrn_teardown },
+    { "journal/replay_unbound_head_is_graceful", test_journal_replay_unbound_head_is_graceful, jrn_setup, jrn_teardown },
     /* Open opens for append only — no replay */
     { "journal/open_does_not_replay",      test_journal_open_does_not_replay,      jrn_setup, jrn_teardown },
     { "journal/de_depth_limit",            test_journal_de_depth_limit,            jrn_setup, jrn_teardown },
