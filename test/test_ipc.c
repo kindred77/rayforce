@@ -66,8 +66,9 @@
 #include "ops/ops.h"
 
 /* `.ipc.post` C wrapper — declared in src/lang/internal.h, but that header
- * re-typedefs ray_vm_t and clashes with core/runtime.h already included
- * above, so forward-declare just the one symbol the guard tests call. */
+ * pulls in a conflicting ray_vm_t (via lang/eval.h) that clashes with the
+ * core/runtime.h ray_vm_t already included above, so forward-declare just
+ * the one symbol the guard tests call. */
 extern ray_t* ray_hpost_fn(ray_t* handle, ray_t* msg);
 
 #ifndef RAY_OS_WINDOWS
