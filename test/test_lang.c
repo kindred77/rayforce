@@ -6626,8 +6626,37 @@ static test_result_t test_temporal_date_trunc_month_case(void) {
 }
 
 
+/* Binding well past the old fixed 64-slot frame in a single scope must
+ * still resolve every entry — proves the scope frame grows. */
+static test_result_t test_env_scope_frame_grows(void) {
+    const int N = 200;                 /* > old FRAME_CAP (64) */
+    ray_env_push_scope();
+    for (int i = 0; i < N; i++) {
+        char name[16];
+        int len = snprintf(name, sizeof name, "_g%d", i);
+        int64_t sym = ray_sym_intern(name, (size_t)len);
+        ray_t* v = ray_i64(i);
+        ray_err_t rc = ray_env_set_local(sym, v);
+        ray_release(v);
+        TEST_ASSERT_EQ_I(rc, RAY_OK);  /* old code returns OOM past slot 64 */
+    }
+    for (int i = 0; i < N; i++) {
+        char name[16];
+        int len = snprintf(name, sizeof name, "_g%d", i);
+        int64_t sym = ray_sym_intern(name, (size_t)len);
+        ray_t* r = ray_env_resolve(sym);   /* owned ref */
+        TEST_ASSERT_NOT_NULL(r);
+        TEST_ASSERT_EQ_I(r->type, -RAY_I64);
+        TEST_ASSERT_EQ_I(r->i64, (int64_t)i);
+        ray_release(r);
+    }
+    ray_env_pop_scope();
+    PASS();
+}
+
 
 const test_entry_t lang_entries[] = {
+    { "lang/env/scope_frame_grows", test_env_scope_frame_grows, lang_setup, lang_teardown },
     { "lang/fn_unary", test_fn_unary, lang_setup, lang_teardown },
     { "lang/fn_binary", test_fn_binary, lang_setup, lang_teardown },
     { "lang/fn_vary", test_fn_vary, lang_setup, lang_teardown },
