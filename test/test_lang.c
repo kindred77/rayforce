@@ -3602,10 +3602,11 @@ static test_result_t test_dotted_temporal_truncate_atom(void) {
 static test_result_t test_select_nonagg_dotted_temporal(void) {
     /* Non-agg output expression using a dotted-temporal ref — e.g.
      * `s: Timestamp.ss` — must flow through the scatter path the same
-     * way a plain column ref would.  Previously expr_bind_table_names
-     * checked the whole dotted sym against the table schema, found no
-     * column named "Timestamp.ss", and silently skipped binding — so
-     * the subsequent ray_eval fell off the env and reported undefined. */
+     * way a plain column ref would.  All columns of the from-table are
+     * mounted into the query's local scope for eval, so the dotted
+     * temporal ref `Timestamp.ss` resolves against the mounted `Timestamp`
+     * column by ordinary name lookup rather than requiring a schema match
+     * on the whole dotted symbol. */
     ray_eval_str(
         "(set __sy (table [Sym Ts] "
         "(list ['A 'B 'A 'B 'A] "
