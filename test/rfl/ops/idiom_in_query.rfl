@@ -335,3 +335,30 @@ CAn -- 5
 ;; Reachability: count(distinct) survives predicate pushdown
 ;; (opt.c:2043) + projection pushdown (opt.c:2051) without losing its
 ;; OP_COUNT_DISTINCT identity.
+
+;; ──────────────────────────────────────────────────────────────────────
+;; Section 9 — runtime-built column references resolve in query scope
+;; ──────────────────────────────────────────────────────────────────────
+;; All columns of the from-table are mounted into the query's local
+;; scope before each projection/where expression is eval'd, so a column
+;; reference produced at RUNTIME (not present in the AST the planner
+;; sees) still resolves by ordinary name lookup.
+
+;; B1: a runtime-built column reference resolves under the eval-level
+;; per-group projection fallback.  `c` holds the name-ref `price`; the
+;; projection list `(list + c 0.0)` is assembled and eval'd dynamically
+;; inside (eval ...), so a static AST walk never saw `price`.  The (eval
+;; ...) head is non-vectorizable → compile_expr_dag returns NULL, so the
+;; non-agg projection routes through the eval-level group fallback (the
+;; bind-all-columns site), where every column is mounted in scope.  Prior
+;; to mounting all columns, the static name walk bound nothing for this
+;; expression and `price` raised a name error.
+(set Tdyn (table [g price size] (list ['a 'a 'b] [10.0 200.0 50.0] [1.0 2.0 3.0])))
+(set c (quote price))
+(at (at (select {o: (eval (list + c 0.0)) from: Tdyn by: g}) 'o) 0) -- [10.0 200.0]
+(at (at (select {o: (eval (list + c 0.0)) from: Tdyn by: g}) 'o) 1) -- [50.0]
+
+;; Reachability: the dynamic projection routes through the eval-level
+;; per-group non-agg fallback (not the vectorized DAG), exercising
+;; bind_all_columns' mount-every-column behavior for refs that the old
+;; RAY_ATTR_NAME static walk could not see.
