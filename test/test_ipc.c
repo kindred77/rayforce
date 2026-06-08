@@ -1656,6 +1656,84 @@ static test_result_t test_ipc_hooks_auth_narrow(void) {
     PASS();
 }
 
+/* ---- test_ipc_post_delivery --------------------------------------------- */
+/*
+ * End-to-end exercise of the `.ipc.post` Rayfall builtin (async
+ * fire-and-forget).  A server `.ipc.on.async` hook parses + evals each
+ * inbound message; the client posts `(set _async_got 42)` through the
+ * builtin, then issues ONE sync `.ipc.send` on the same handle as an
+ * ordering barrier (TCP guarantees the async message is drained first).
+ * We then read `_async_got` back from the shared global env to prove
+ * delivery, and assert the builtin returned the null object on a good
+ * local send.  Mirrors test_ipc_hooks_lifecycle's server setup.
+ */
+static test_result_t test_ipc_post_delivery(void) {
+    const char* setup =
+        "(set _async_got 0)"
+        "(set .ipc.on.async (fn [m] (eval (parse m))))";
+    ray_t* r = ray_eval_str(setup);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    if (r != RAY_NULL_OBJ) ray_release(r);
+
+    ray_ipc_server_t srv;
+    ray_err_t err = ray_ipc_server_init(&srv, 0);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    uint16_t port = get_listen_port(srv.listen_fd);
+    TEST_ASSERT((port) > (0), "port > 0");
+
+    ray_vm_t* srv_vm = make_server_vm();
+    TEST_ASSERT_NOT_NULL(srv_vm);
+
+    ipc_thread_ctx_t ctx = { .srv = &srv, .vm = srv_vm };
+    ray_thread_t tid;
+    ray_thread_create(&tid, server_thread_fn, &ctx);
+
+    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL);
+    TEST_ASSERT((h) >= (0), "h >= 0");
+
+    /* Post async via the BUILTIN — build the call string with the live
+     * handle.  Returns the null object on a good local send.  Capture the
+     * result + its error-ness here, but defer the assertions until after
+     * the server thread is joined: a failing assertion early-returns from
+     * the test, and the running server thread would then dereference this
+     * now-dead stack frame (`ctx`/`srv`).  We snapshot now, tear down, then
+     * assert. */
+    char post_expr[96];
+    snprintf(post_expr, sizeof(post_expr),
+             "(.ipc.post %lld \"(set _async_got 42)\")", (long long)h);
+    ray_t* pr = ray_eval_str(post_expr);
+    bool pr_is_null = (pr == RAY_NULL_OBJ);
+    bool pr_is_err  = (pr == NULL) || RAY_IS_ERR(pr);
+    if (pr && pr != RAY_NULL_OBJ && !RAY_IS_ERR(pr)) ray_release(pr);
+
+    /* Ordering barrier: a sync round-trip on the same handle cannot
+     * complete until the server has drained the earlier async message. */
+    ray_t* msg = ray_str("(+ 0 0)", 7);
+    ray_t* resp = ray_ipc_send(h, msg);
+    ray_release(msg);
+    bool resp_ok = (resp != NULL) && !RAY_IS_ERR(resp);
+    if (resp && !RAY_IS_ERR(resp)) ray_release(resp);
+
+    ray_ipc_close(h);
+    srv.running = false;
+    ray_thread_join(tid);
+    ray_ipc_server_destroy(&srv);
+    ray_sys_free(srv_vm);
+
+    /* Now that the server thread is gone, it is safe to assert. */
+    TEST_ASSERT_FALSE(pr_is_err);
+    TEST_ASSERT_TRUE(pr_is_null);
+    TEST_ASSERT_TRUE(resp_ok);
+
+    int64_t sym_got = ray_sym_intern("_async_got", strlen("_async_got"));
+    ray_t* v_got = ray_env_get(sym_got);
+    TEST_ASSERT_NOT_NULL(v_got);
+    TEST_ASSERT_EQ_I(v_got->i64, 42);
+    PASS();
+}
+
 /* ---- Registry ------------------------------------------------------------ */
 
 const test_entry_t ipc_entries[] = {
@@ -1689,5 +1767,6 @@ const test_entry_t ipc_entries[] = {
     { "ipc/send_lazy_msg",               test_ipc_send_lazy_msg,                  ipc_setup, ipc_teardown },
     { "ipc/hooks_lifecycle",             test_ipc_hooks_lifecycle,                ipc_setup, ipc_teardown },
     { "ipc/hooks_auth_narrow",           test_ipc_hooks_auth_narrow,              ipc_setup, ipc_teardown },
+    { "ipc/post_delivery",              test_ipc_post_delivery,                  ipc_setup, ipc_teardown },
     { NULL, NULL, NULL, NULL },
 };
