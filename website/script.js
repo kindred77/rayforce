@@ -269,17 +269,20 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 });
 
-/* GitHub widget: fetch live stars/forks via ungh.cc (CDN-cached proxy
- * without GitHub's 60/hour unauthenticated rate limit) with a 1-hour
- * localStorage cache so repeat visits don't refetch. Falls back silently
- * if every source is unreachable. */
+/* GitHub widget: fetch live stars/forks from the authoritative GitHub API,
+ * with ungh.cc (a CDN-cached proxy) as a fallback. Uses a stale-while-
+ * revalidate localStorage cache: a cached value paints instantly, then the
+ * count is revalidated in the background (at most once every few minutes, to
+ * stay under GitHub's rate limit) and repainted only if it changed — so a
+ * stale cache self-corrects on the next visit instead of freezing. Falls back
+ * silently if every source is unreachable. */
 (function () {
   const targets = document.querySelectorAll('[data-gh-stat]');
   if (targets.length === 0) return;
 
   const REPO = 'RayforceDB/rayforce';
   const CACHE_KEY = 'gh-stats:' + REPO;
-  const CACHE_TTL = 60 * 60 * 1000; /* 1 hour */
+  const REVALIDATE_AFTER = 5 * 60 * 1000; /* skip the background refetch if the cache is younger than this */
 
   function fmt(n) {
     if (typeof n !== 'number' || isNaN(n)) return '—';
@@ -315,11 +318,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function readCache() {
     try {
-      const raw = localStorage.getItem(CACHE_KEY);
-      if (!raw) return null;
-      const v = JSON.parse(raw);
-      if (!v || (Date.now() - v.t) > CACHE_TTL) return null;
-      return v;
+      const v = JSON.parse(localStorage.getItem(CACHE_KEY));
+      return (v && typeof v.stars === 'number' && typeof v.forks === 'number') ? v : null;
     } catch (e) { return null; }
   }
 
@@ -327,30 +327,43 @@ document.addEventListener('DOMContentLoaded', () => {
     try { localStorage.setItem(CACHE_KEY, JSON.stringify({ t: Date.now(), stars, forks })); } catch (e) {}
   }
 
-  /* If we have a fresh cached value, paint it instantly without a network roundtrip. */
-  const cached = readCache();
-  if (cached) { paint(cached.stars, cached.forks); return; }
+  /* Persist the latest counts, and repaint only when they actually changed —
+   * avoids re-animating an identical value the cache already showed. */
+  function update(stars, forks) {
+    const changed = !cached || cached.stars !== stars || cached.forks !== forks;
+    writeCache(stars, forks);
+    if (changed) paint(stars, forks);
+  }
 
-  /* Primary: ungh.cc (CDN-cached, no rate limit). Response shape: { repo: { stars, forks, ... } } */
-  fetch('https://ungh.cc/repos/' + REPO)
-    .then(r => r.ok ? r.json() : Promise.reject(new Error('ungh ' + r.status)))
+  /* Paint the cached value instantly (may be slightly stale), then revalidate. */
+  const cached = readCache();
+  if (cached) paint(cached.stars, cached.forks);
+  if (cached && (Date.now() - cached.t) < REVALIDATE_AFTER) return; /* fresh enough; skip the network */
+
+  /* Primary: the authoritative GitHub API. The per-visitor 60/hour
+   * unauthenticated limit is ample for one request every few minutes, and it
+   * is always fresh. Response shape: { stargazers_count, forks_count } */
+  fetch('https://api.github.com/repos/' + REPO, { headers: { Accept: 'application/vnd.github+json' } })
+    .then(r => r.ok ? r.json() : Promise.reject(new Error('gh ' + r.status)))
     .then(d => {
-      const stars = d && d.repo && d.repo.stars;
-      const forks = d && d.repo && d.repo.forks;
-      if (typeof stars !== 'number' || typeof forks !== 'number') throw new Error('ungh shape');
-      writeCache(stars, forks);
-      paint(stars, forks);
+      const stars = d && d.stargazers_count;
+      const forks = d && d.forks_count;
+      if (typeof stars !== 'number' || typeof forks !== 'number') throw new Error('gh shape');
+      update(stars, forks);
     })
     .catch(() => {
-      /* Fallback: direct GitHub API. Often 403s on busy IPs but free when it works. */
-      return fetch('https://api.github.com/repos/' + REPO, { headers: { Accept: 'application/vnd.github+json' } })
-        .then(r => r.ok ? r.json() : Promise.reject(new Error('gh ' + r.status)))
+      /* Fallback: ungh.cc (CDN-cached proxy, can lag GitHub by ~a day, but
+       * survives a 403 on a busy/shared IP). Shape: { repo: { stars, forks } } */
+      return fetch('https://ungh.cc/repos/' + REPO)
+        .then(r => r.ok ? r.json() : Promise.reject(new Error('ungh ' + r.status)))
         .then(d => {
-          writeCache(d.stargazers_count, d.forks_count);
-          paint(d.stargazers_count, d.forks_count);
+          const stars = d && d.repo && d.repo.stars;
+          const forks = d && d.repo && d.repo.forks;
+          if (typeof stars !== 'number' || typeof forks !== 'number') throw new Error('ungh shape');
+          update(stars, forks);
         });
     })
     .catch(() => {
-      /* Leave the static "—" placeholders. Users still get a working link. */
+      /* Leave whatever is painted (cache or the static "—" placeholders). */
     });
 })();
