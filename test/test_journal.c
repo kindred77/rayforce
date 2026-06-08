@@ -2012,6 +2012,63 @@ static test_result_t test_journal_replay_symbol_head_both_forms(void) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
+ *  24. `.log.open` opens for append only — it must NOT replay the existing
+ *  log.  Explicit `.log.replay` still applies it.
+ * ═══════════════════════════════════════════════════════════════════════ */
+static test_result_t test_journal_open_does_not_replay(void) {
+    char base[256]; make_base(base, sizeof(base), "open_noreplay");
+    char lpath[270]; log_path(lpath, sizeof(lpath), base);
+
+    /* Open via the verb, write a mutating record, close.  `.log.write`
+     * only SERIALIZES the record — it does NOT evaluate it — so `_m`
+     * stays at the reset value here. */
+    char src[640];
+    snprintf(src, sizeof(src),
+             "(set _m 0)"
+             "(.log.open 'async \"%s\")"
+             "(.log.write \"(set _m 7)\")"
+             "(.log.close)",
+             base);
+    ray_t* a = ray_eval_str(src);
+    TEST_ASSERT_NOT_NULL(a);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(a));
+    if (a != RAY_NULL_OBJ) ray_release(a);
+
+    /* Reopen via the verb — must NOT re-apply (set _m 7). */
+    char reopen[640];
+    snprintf(reopen, sizeof(reopen),
+             "(set _m 0)(.log.open 'async \"%s\")", base);
+    ray_t* b = ray_eval_str(reopen);
+    TEST_ASSERT_NOT_NULL(b);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(b));
+    if (b != RAY_NULL_OBJ) ray_release(b);
+
+    ray_t* m1 = ray_eval_str("_m");
+    TEST_ASSERT_NOT_NULL(m1);
+    TEST_ASSERT_EQ_I(m1->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(m1->i64, 0);   /* NOT replayed on open */
+    ray_release(m1);
+
+    /* Explicit replay DOES apply the record. */
+    char replay[400];
+    snprintf(replay, sizeof(replay), "(.log.replay \"%s\")", lpath);
+    ray_t* c = ray_eval_str(replay);
+    if (c && !RAY_IS_ERR(c) && c != RAY_NULL_OBJ) ray_release(c);
+
+    ray_t* m2 = ray_eval_str("_m");
+    TEST_ASSERT_NOT_NULL(m2);
+    TEST_ASSERT_EQ_I(m2->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(m2->i64, 7);   /* replayed on demand */
+    ray_release(m2);
+
+    ray_t* d = ray_eval_str("(.log.close)");
+    if (d && !RAY_IS_ERR(d) && d != RAY_NULL_OBJ) ray_release(d);
+
+    cleanup_base(base);
+    PASS();
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
  *  Registration
  * ═══════════════════════════════════════════════════════════════════════ */
 
@@ -2106,5 +2163,7 @@ const test_entry_t journal_entries[] = {
     { "journal/ops_write_serde_size_zero", test_ops_write_serde_size_zero,        jrn_setup, jrn_teardown },
     /* End-to-end RFL round-trip */
     { "journal/replay_symbol_head_both_forms", test_journal_replay_symbol_head_both_forms, jrn_setup, jrn_teardown },
+    /* Open opens for append only — no replay */
+    { "journal/open_does_not_replay",      test_journal_open_does_not_replay,      jrn_setup, jrn_teardown },
     { NULL, NULL, NULL, NULL },
 };
