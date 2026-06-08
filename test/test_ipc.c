@@ -68,7 +68,7 @@
 /* `.ipc.post` C wrapper — declared in src/lang/internal.h, but that header
  * re-typedefs ray_vm_t and clashes with core/runtime.h already included
  * above, so forward-declare just the one symbol the guard tests call. */
-ray_t* ray_hpost_fn(ray_t* handle, ray_t* msg);
+extern ray_t* ray_hpost_fn(ray_t* handle, ray_t* msg);
 
 #ifndef RAY_OS_WINDOWS
   #include <sys/socket.h>
@@ -1813,7 +1813,7 @@ const test_entry_t ipc_entries[] = {
     { "ipc/hooks_lifecycle",             test_ipc_hooks_lifecycle,                ipc_setup, ipc_teardown },
     { "ipc/hooks_auth_narrow",           test_ipc_hooks_auth_narrow,              ipc_setup, ipc_teardown },
     { "ipc/post_delivery",               test_ipc_post_delivery,                  ipc_setup, ipc_teardown },
-    { "ipc/post_invalid_handle",        test_ipc_post_invalid_handle,            ipc_setup, ipc_teardown },
-    { "ipc/post_non_serializable",      test_ipc_post_non_serializable,          ipc_setup, ipc_teardown },
+    { "ipc/post_invalid_handle",         test_ipc_post_invalid_handle,            ipc_setup, ipc_teardown },
+    { "ipc/post_non_serializable",       test_ipc_post_non_serializable,          ipc_setup, ipc_teardown },
     { NULL, NULL, NULL, NULL },
 };
