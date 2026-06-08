@@ -1962,6 +1962,56 @@ static test_result_t test_ops_write_serde_size_zero(void) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
+ *  23. End-to-end RFL round-trip: both `.log.write` symbol-head forms replay.
+ *
+ *  A symbol in functional position applies the named function, so BOTH the
+ *  tick form `(list 'f 10)` and the quote form `(list (quote f) 5)` replay
+ *  by applying `f`.  We drive the public RFL verbs, then reset the
+ *  accumulator and replay explicitly, observing the side effect (15).
+ * ═══════════════════════════════════════════════════════════════════════ */
+static test_result_t test_journal_replay_symbol_head_both_forms(void) {
+    char base[256]; make_base(base, sizeof(base), "symhead");
+    char lpath[270]; log_path(lpath, sizeof(lpath), base);
+
+    /* Open async, define an accumulating fn, write both symbol-head forms,
+     * then close.  Multiple top-level forms in one source string are wrapped
+     * in an implicit (do ...) by the parser, so this evaluates in order. */
+    char src[640];
+    snprintf(src, sizeof(src),
+             "(set _acc 0)"
+             "(set f (fn [x] (set _acc (+ _acc x))))"
+             "(.log.open 'async \"%s\")"
+             "(.log.write (list 'f 10))"
+             "(.log.write (list (quote f) 5))"
+             "(.log.close)",
+             base);
+    ray_t* a = ray_eval_str(src);
+    TEST_ASSERT_NOT_NULL(a);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(a));
+    if (a != RAY_NULL_OBJ) ray_release(a);
+
+    /* Reset the accumulator, then replay the log: both records apply `f`. */
+    char replay[400];
+    snprintf(replay, sizeof(replay),
+             "(set _acc 0)(.log.replay \"%s\")", lpath);
+    ray_t* z = ray_eval_str(replay);
+    TEST_ASSERT_NOT_NULL(z);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(z));
+    if (z != RAY_NULL_OBJ) ray_release(z);
+
+    /* Both records applied: 0 + 10 + 5 == 15. */
+    ray_t* acc = ray_eval_str("_acc");
+    TEST_ASSERT_NOT_NULL(acc);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(acc));
+    TEST_ASSERT_EQ_I(acc->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(acc->i64, 15);
+    ray_release(acc);
+
+    cleanup_base(base);
+    PASS();
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
  *  Registration
  * ═══════════════════════════════════════════════════════════════════════ */
 
@@ -2054,5 +2104,7 @@ const test_entry_t journal_entries[] = {
     { "journal/ops_write_null_expr",       test_ops_write_null_expr,              jrn_setup, jrn_teardown },
     { "journal/ops_write_noopen",          test_ops_write_noopen,                 jrn_setup, jrn_teardown },
     { "journal/ops_write_serde_size_zero", test_ops_write_serde_size_zero,        jrn_setup, jrn_teardown },
+    /* End-to-end RFL round-trip */
+    { "journal/replay_symbol_head_both_forms", test_journal_replay_symbol_head_both_forms, jrn_setup, jrn_teardown },
     { NULL, NULL, NULL, NULL },
 };
