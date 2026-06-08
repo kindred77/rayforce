@@ -2068,6 +2068,32 @@ static test_result_t test_journal_open_does_not_replay(void) {
     PASS();
 }
 
+/* A corrupted record encoding pathologically-nested lists must NOT overflow
+ * the C stack — ray_de_raw returns a domain error instead.  Each level on the
+ * wire is a single-element RAY_LIST header [type][attrs:1][count:8 LE]; the
+ * innermost element is a RAY_SERDE_NULL terminal. */
+static test_result_t test_journal_de_depth_limit(void) {
+    const int levels = 5000;   /* far beyond any legitimate nesting */
+    size_t cap = (size_t)levels * 10 + 1;
+    uint8_t* b = (uint8_t*)malloc(cap);
+    TEST_ASSERT_NOT_NULL(b);
+    size_t off = 0;
+    for (int i = 0; i < levels; i++) {
+        b[off++] = (uint8_t)RAY_LIST;          /* type tag = 0 */
+        b[off++] = 0;                          /* attrs */
+        int64_t one = 1;                       /* count = 1 element */
+        memcpy(b + off, &one, 8); off += 8;
+    }
+    b[off++] = (uint8_t)RAY_SERDE_NULL;        /* innermost terminal element */
+
+    int64_t len = (int64_t)off;
+    ray_t* r = ray_de_raw(b, &len);
+    TEST_ASSERT_TRUE(r != NULL && RAY_IS_ERR(r));
+    ray_error_free(r);
+    free(b);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════════
  *  Registration
  * ═══════════════════════════════════════════════════════════════════════ */
@@ -2165,5 +2191,6 @@ const test_entry_t journal_entries[] = {
     { "journal/replay_symbol_head_both_forms", test_journal_replay_symbol_head_both_forms, jrn_setup, jrn_teardown },
     /* Open opens for append only — no replay */
     { "journal/open_does_not_replay",      test_journal_open_does_not_replay,      jrn_setup, jrn_teardown },
+    { "journal/de_depth_limit",            test_journal_de_depth_limit,            jrn_setup, jrn_teardown },
     { NULL, NULL, NULL, NULL },
 };
