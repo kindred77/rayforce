@@ -269,10 +269,10 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 });
 
-/* GitHub widget: fetch live stars/forks via ungh.cc (CDN-cached proxy
- * without GitHub's 60/hour unauthenticated rate limit) with a 1-hour
- * localStorage cache so repeat visits don't refetch. Falls back silently
- * if every source is unreachable. */
+/* GitHub widget: fetch live stars/forks from the authoritative GitHub API,
+ * with ungh.cc (a CDN-cached proxy) as a fallback and a 1-hour localStorage
+ * cache so repeat visits don't refetch. Falls back silently if every source
+ * is unreachable. */
 (function () {
   const targets = document.querySelectorAll('[data-gh-stat]');
   if (targets.length === 0) return;
@@ -331,23 +331,29 @@ document.addEventListener('DOMContentLoaded', () => {
   const cached = readCache();
   if (cached) { paint(cached.stars, cached.forks); return; }
 
-  /* Primary: ungh.cc (CDN-cached, no rate limit). Response shape: { repo: { stars, forks, ... } } */
-  fetch('https://ungh.cc/repos/' + REPO)
-    .then(r => r.ok ? r.json() : Promise.reject(new Error('ungh ' + r.status)))
+  /* Primary: the authoritative GitHub API. The per-visitor 60/hour
+   * unauthenticated limit is ample for a single cached request per hour,
+   * and it is always fresh. Response shape: { stargazers_count, forks_count } */
+  fetch('https://api.github.com/repos/' + REPO, { headers: { Accept: 'application/vnd.github+json' } })
+    .then(r => r.ok ? r.json() : Promise.reject(new Error('gh ' + r.status)))
     .then(d => {
-      const stars = d && d.repo && d.repo.stars;
-      const forks = d && d.repo && d.repo.forks;
-      if (typeof stars !== 'number' || typeof forks !== 'number') throw new Error('ungh shape');
+      const stars = d && d.stargazers_count;
+      const forks = d && d.forks_count;
+      if (typeof stars !== 'number' || typeof forks !== 'number') throw new Error('gh shape');
       writeCache(stars, forks);
       paint(stars, forks);
     })
     .catch(() => {
-      /* Fallback: direct GitHub API. Often 403s on busy IPs but free when it works. */
-      return fetch('https://api.github.com/repos/' + REPO, { headers: { Accept: 'application/vnd.github+json' } })
-        .then(r => r.ok ? r.json() : Promise.reject(new Error('gh ' + r.status)))
+      /* Fallback: ungh.cc (CDN-cached proxy, can lag GitHub by ~a day, but
+       * survives a 403 on a busy/shared IP). Shape: { repo: { stars, forks } } */
+      return fetch('https://ungh.cc/repos/' + REPO)
+        .then(r => r.ok ? r.json() : Promise.reject(new Error('ungh ' + r.status)))
         .then(d => {
-          writeCache(d.stargazers_count, d.forks_count);
-          paint(d.stargazers_count, d.forks_count);
+          const stars = d && d.repo && d.repo.stars;
+          const forks = d && d.repo && d.repo.forks;
+          if (typeof stars !== 'number' || typeof forks !== 'number') throw new Error('ungh shape');
+          writeCache(stars, forks);
+          paint(stars, forks);
         });
     })
     .catch(() => {
