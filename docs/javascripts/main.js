@@ -39,9 +39,9 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 });
 
-/* GitHub widget: live stars/forks via ungh.cc (CDN-cached proxy without
- * the 60/hour unauthenticated GitHub rate limit) with a 1-hour
- * localStorage cache.  Falls back silently if every source is unreachable. */
+/* GitHub widget: live stars/forks from the authoritative GitHub API, with
+ * ungh.cc (a CDN-cached proxy) as a fallback and a 1-hour localStorage
+ * cache.  Falls back silently if every source is unreachable. */
 (function () {
   const targets = document.querySelectorAll('[data-gh-stat]');
   if (targets.length === 0) return;
@@ -99,21 +99,28 @@ document.addEventListener('DOMContentLoaded', () => {
   const cached = readCache();
   if (cached) { paint(cached.stars, cached.forks); return; }
 
-  fetch('https://ungh.cc/repos/' + REPO)
-    .then(r => r.ok ? r.json() : Promise.reject(new Error('ungh ' + r.status)))
+  /* GitHub's own API is authoritative and fresh; the per-visitor 60/hour
+   * unauthenticated limit is ample for a single cached request per hour.
+   * ungh.cc is a CDN-cached proxy that can lag GitHub by ~a day, so it is
+   * used only as a fallback when the direct API is unreachable. */
+  fetch('https://api.github.com/repos/' + REPO, { headers: { Accept: 'application/vnd.github+json' } })
+    .then(r => r.ok ? r.json() : Promise.reject(new Error('gh ' + r.status)))
     .then(d => {
-      const stars = d && d.repo && d.repo.stars;
-      const forks = d && d.repo && d.repo.forks;
-      if (typeof stars !== 'number' || typeof forks !== 'number') throw new Error('ungh shape');
+      const stars = d && d.stargazers_count;
+      const forks = d && d.forks_count;
+      if (typeof stars !== 'number' || typeof forks !== 'number') throw new Error('gh shape');
       writeCache(stars, forks);
       paint(stars, forks);
     })
     .catch(() => {
-      return fetch('https://api.github.com/repos/' + REPO, { headers: { Accept: 'application/vnd.github+json' } })
-        .then(r => r.ok ? r.json() : Promise.reject(new Error('gh ' + r.status)))
+      return fetch('https://ungh.cc/repos/' + REPO)
+        .then(r => r.ok ? r.json() : Promise.reject(new Error('ungh ' + r.status)))
         .then(d => {
-          writeCache(d.stargazers_count, d.forks_count);
-          paint(d.stargazers_count, d.forks_count);
+          const stars = d && d.repo && d.repo.stars;
+          const forks = d && d.repo && d.repo.forks;
+          if (typeof stars !== 'number' || typeof forks !== 'number') throw new Error('ungh shape');
+          writeCache(stars, forks);
+          paint(stars, forks);
         });
     })
     .catch(() => { /* leave em-dash placeholders */ });
