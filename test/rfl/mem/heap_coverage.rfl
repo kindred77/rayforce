@@ -311,7 +311,8 @@ FV1 -- [1.5 2.5 3.5]
 (set GT (table [g v] (list (% (til 100000) 1000) (til 100000))))
 (count (select {s: (sum v) from: GT by: g})) -- 1000
 ;; group g==0 holds v in {0,1000,..,99000}: 1000*(0+..+99) = 4950000.
-(at (at (select {s: (sum v) from: GT by: g}) 's) 0) -- 4950000
+;; by-group order over 1000 groups is unspecified, so pin g==0 with where:.
+(at (at (select {s: (sum v) from: GT by: g where: (== g 0)}) 's) 0) -- 4950000
 
 ;; ════════════════════════════════════════════════════════════════════════════
 ;; 9. Lazy-graph release (heap.c:511-518, 615, 710-713).
@@ -356,8 +357,9 @@ FV1 -- [1.5 2.5 3.5]
 (set GT2 (table [g v] (list (% (til 200000) 5000) (til 200000))))
 (count (select {s: (sum v) from: GT2 by: g})) -- 5000
 ;; group g==0 holds v in {0,5000,..,195000}: 5000*(0+..+39) = 3900000.
-;; Pin it so an arena-block overflow can't scramble the aggregated payload.
-(at (at (select {s: (sum v) from: GT2 by: g}) 's) 0) -- 3900000
+;; by-group order over 5000 groups is unspecified; pin g==0 with where:
+;; so an arena-block overflow can't scramble the aggregated payload.
+(at (at (select {s: (sum v) from: GT2 by: g where: (== g 0)}) 's) 0) -- 3900000
 
 ;; ════════════════════════════════════════════════════════════════════════════
 ;; 12. ray_heap_init no-op when already initialized (heap.c:1106).

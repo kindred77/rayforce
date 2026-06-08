@@ -28,8 +28,9 @@
 ;; cc: row 4 → v=[9] → median = 9.0
 (count (select {m: (med v) by: k from: Tms1})) -- 3
 
-;; Verify median value for first group (aa in insertion order) = 5.0
-(at (at (select {m: (med v) by: k from: Tms1}) 'm) 0) -- 5.0
+;; Verify median value for the aa group = 5.0 (bucket order unspecified;
+;; pin the group via where:).
+(at (at (select {m: (med v) by: k from: Tms1 where: (== k "aa")}) 'm) 0) -- 5.0
 
 ;; Sum of medians: aa=5.0 + bb=5.0 + cc=9.0 = 19.0
 (sum (at (select {m: (med v) by: k from: Tms1}) 'm)) -- 19.0
