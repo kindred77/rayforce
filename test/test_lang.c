@@ -6656,8 +6656,44 @@ static test_result_t test_env_scope_frame_grows(void) {
 }
 
 
+/* A table with > 64 columns must be queryable: mounting all columns into one
+ * scope frame would overflow the old fixed 64-slot frame.  The table is built
+ * column-by-column via `update` because a single vary-call (e.g. `list`) is
+ * capped at 64 args in the eval apply path — that cap is unrelated to the
+ * scope-frame growth under test.  The projection is a runtime-built column
+ * reference wrapped in `eval`; that head is non-vectorizable, and with a
+ * scalar `by:` key the non-agg projection routes through the per-group eval
+ * fallback (a bind_all_columns site) where every column is mounted in scope.
+ * The ref `c69` is produced at runtime via (quote c69), so a static AST walk
+ * never saw it — it can only resolve because all 70 columns were mounted. */
+static test_result_t test_query_wide_table_over_64_cols(void) {
+    const int NCOL = 70;
+    char buf[16384];
+    int off = 0;
+    off += snprintf(buf + off, sizeof buf - off,
+                    "(do (set W (table [c0] (list [0]))) ");
+    for (int i = 1; i < NCOL; i++)
+        off += snprintf(buf + off, sizeof buf - off,
+                        "(set W (update {c%d: %d from: W})) ", i, i);
+    /* Runtime-built ref to the LAST column (c69), through the per-group
+     * eval fallback (by: c0).  Collapses to the scalar value 69. */
+    off += snprintf(buf + off, sizeof buf - off,
+                    "(set c (quote c69)) "
+                    "(at (at (at (select {o: (eval (list + c 0)) from: W by: c0}) 'o) 0) 0))");
+
+    ray_t* r = ray_eval_str(buf);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->type, -RAY_I64);   /* c69's single element == 69 */
+    TEST_ASSERT_EQ_I(r->i64, 69);
+    ray_release(r);
+    PASS();
+}
+
+
 const test_entry_t lang_entries[] = {
     { "lang/env/scope_frame_grows", test_env_scope_frame_grows, lang_setup, lang_teardown },
+    { "lang/query/wide_table_over_64_cols", test_query_wide_table_over_64_cols, lang_setup, lang_teardown },
     { "lang/fn_unary", test_fn_unary, lang_setup, lang_teardown },
     { "lang/fn_binary", test_fn_binary, lang_setup, lang_teardown },
     { "lang/fn_vary", test_fn_vary, lang_setup, lang_teardown },

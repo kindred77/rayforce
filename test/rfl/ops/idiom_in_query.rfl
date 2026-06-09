@@ -364,3 +364,44 @@ CAn -- 5
 ;; per-group non-agg fallback (not the vectorized DAG), exercising
 ;; bind_all_columns' mount-every-column behavior for refs that the old
 ;; RAY_ATTR_NAME static walk could not see.
+
+;; ──────────────────────────────────────────────────────────────────────
+;; Section 10 — scoped-column precedence, hygiene, and nesting
+;; ──────────────────────────────────────────────────────────────────────
+;; Now that every column of the from-table is mounted as an ordinary local
+;; before each query expression is eval'd, a bare column name resolves via
+;; the scope chain.  These checks pin down the three properties that fall
+;; out of that design: (a) a column shadows a same-named global INSIDE the
+;; query but the global is untouched OUTSIDE it; (b) after the query the
+;; column bindings are gone (the pushed scope frame was popped); (c) a
+;; nested sub-select binds and pops its own column frame without disturbing
+;; the outer query's frame.
+
+;; Precedence: the `price` column wins over the `price` global inside the
+;; query (resolution walks the pushed column frame first), while the global
+;; `price` stays intact outside the query.
+(set price 999)                                          ;; global
+(set Tsh (table [price] (list [1.0 2.0 3.0])))
+(sum (at (select {s: price from: Tsh}) 's)) -- 6.0       ;; column wins inside
+price -- 999                                             ;; global intact outside
+
+;; Scope hygiene: after the query the column bindings are gone — a bare
+;; column name does not leak into the surrounding (global) scope.  `qty`
+;; was only ever a column of Th, never a global, so it stays unbound.
+(set Th (table [qty] (list [1 2 3])))
+(count (select {x: qty from: Th})) -- 3
+;; `qty` is unbound outside the query — a bare reference raises a name error.
+qty !- name
+
+;; Nested sub-select inside an outer query's projection: the inner query
+;; over Tb binds and pops its own column frame (column `b`) without
+;; disturbing the outer query's frame (column `a`).  The outer query still
+;; produces one row per Ta row.
+(set Ta (table [a] (list [1 2 3])))
+(set Tb (table [b] (list [10 20])))
+(count (select {n: (count (select {m: b from: Tb})) a: a from: Ta})) -- 3
+
+;; Reachability: confirms the bind_all_columns scope frame is correctly
+;; pushed before and popped after each query (outer and inner), so column
+;; visibility is confined to the query body and nesting does not corrupt
+;; the enclosing frame.
