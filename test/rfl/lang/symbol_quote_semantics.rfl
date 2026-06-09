@@ -8,6 +8,9 @@
 ;;                             itself, never resolving to the binding
 ;;   • a tick literal ('x)     is a literal symbol  -> evaluates to itself,
 ;;                             never resolving to the binding
+;; ("never resolving" is the non-query value position exercised here; inside
+;;  a query a literal symbol naming a from-table COLUMN resolves to that
+;;  column -- see test/rfl/query/literal_col_ref.rfl.)
 ;; and serde (ser/de) must preserve each form's flag across the wire.
 ;;
 ;; eval-of-name-reference resolves from env (src/lang/eval.c:2938); a literal

@@ -206,7 +206,7 @@ The single quote `'` prevents evaluation, creating a symbol atom. Useful for col
 (quote price)     ; a bare name becomes a literal symbol, equal to 'price
 ```
 
-`quote` returns its argument unevaluated. When the argument is a bare name, the result is a literal symbol — `(quote name)` is equivalent to the tick form `'name`. Such a literal symbol that names a from-table column resolves to that column during query evaluation (see [IPC](../storage/ipc.md) for the dynamic-query idiom).
+`quote` returns its argument unevaluated. When the argument is a bare name, the result is a literal symbol — `(quote name)` is equal to the tick form `'name`. Such a literal symbol, when it names a from-table column, resolves to that column during query evaluation. This is how the dynamic-query idiom works: a query assembled as data evaluates `(quote name)` to the literal symbol `'name` during construction, and that symbol resolves to the column when the query runs (see [IPC](../storage/ipc.md)). Inside a query, the tick form `'name` and a bare `name` resolve the same way.
 
 ## Comments
 

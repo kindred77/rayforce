@@ -54,3 +54,15 @@
 ;; — never a UBSan crash from ray_elem_size on a literal symbol.
 (select {n: (count price) from: Tlit by: 'nope}) !- domain
 (select {n: (count price) from: Tlit by: nope}) !- domain
+
+;; --- AST-shape boundary: `(quote x)` is value-equivalent to the tick form
+;; `'x` (both literal symbols), but the two are different AST SHAPES — `'x` is
+;; a literal atom, `(quote x)` is a special-form CALL node.  Part 2 resolves a
+;; literal -RAY_SYM ATOM to a column; it does not unwrap a `(quote col)` call
+;; node written inline as a query operand.  So an inline `(quote price)` in a
+;; projection stays the literal symbol, while the tick form `'price` resolves
+;; (see line 16).  The dynamic-query idiom builds the query as DATA, so
+;; `(quote price)` is evaluated to the literal atom `'price` BEFORE it becomes
+;; an operand — that atom then resolves, which is why the idiom works.
+(== 'price (quote price)) -- true
+(at (select {o: (quote price) from: Tlit}) 'o) -- ['price 'price 'price]

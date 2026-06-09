@@ -163,7 +163,7 @@ For dynamic queries, substitute values into the dict at construction time:
 ;; => trades where price > 200
 ```
 
-Here `(quote price)` is a literal symbol that resolves to the `price` column inside the query: a literal symbol naming a from-table column resolves to that column during query evaluation. A bare `price` works the same way.
+The query is assembled as data: while the `(list ...)` is built, `(quote price)` evaluates to the literal symbol `'price`, so the predicate becomes `(> 'price threshold)`. A literal symbol that names a from-table column resolves to that column during query evaluation, so `'price` resolves to the `price` column. Writing the tick form `'price`, or a bare `price`, works the same way.
 
 ### .ipc.close
 
