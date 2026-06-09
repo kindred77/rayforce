@@ -20,9 +20,9 @@
 ;; Sum is sum of the first 3 groups encountered: aa=4, bb=6, cc=5 → 15
 (sum (at (select {s: (sum v) by: k from: Tsst take: 3}) 's)) -- 15
 
-;; take: 1 → only first group ("aa" sum 4).
+;; take: 1 → a single group; bucket order unspecified, so pin "aa" (sum 4).
 (count (select {s: (sum v) by: k from: Tsst take: 1})) -- 1
-(at (at (select {s: (sum v) by: k from: Tsst take: 1}) 's) 0) -- 4
+(at (at (select {s: (sum v) by: k from: Tsst take: 1 where: (== k "aa")}) 's) 0) -- 4
 
 ;; take: bigger than n_groups → clamped to n_groups ; sum of all 5 = 28.
 (count (select {s: (sum v) by: k from: Tsst take: 100})) -- 5
@@ -119,10 +119,11 @@
 (set Tbool_null (update {v: 0Ni from: Tbool_base where: k}))
 ;; Non-agg group-by: DAG first-of-group, swap triggered (no HAS_NULLS from DAG)
 (count (select {by: k from: Tbool_null})) -- 2
-;; Agg group-by with min: true group all-null → grp_finalize_nulls sets HAS_NULLS
-;; After swap, false group (min=20) is at index 1, true group (min=null) at 0
+;; Agg group-by with min: true group all-null → grp_finalize_nulls sets HAS_NULLS.
+;; Bucket order unspecified; pin the true (all-null) group via where: k so its
+;; min(v) is the null we assert.
 (count (select {s: (min v) by: k from: Tbool_null})) -- 2
-(nil? (at (at (select {s: (min v) by: k from: Tbool_null}) 's) 0)) -- true
+(nil? (at (at (select {s: (min v) by: k from: Tbool_null where: k}) 's) 0)) -- true
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; take: vec[2] range form — lines 400-405 in apply_sort_take
@@ -142,10 +143,11 @@
 
 ;; Group-by take: [start count] vec form → goes through apply_sort_take lines 400-405
 (set Tgrprange (table [k v] (list ['A 'B 'C 'A 'B] [1 2 3 4 5])))
-;; 3 groups: A=5, B=7, C=3. take: [1 2] → skip 1, take 2 → groups B(7) and C(3)
+;; 3 groups: A=5, B=7, C=3. take: [1 2] → skip 1, take 2 (range-take path).
+;; The count holds regardless of bucket order:
 (count (select {s: (sum v) by: k from: Tgrprange take: [1 2]})) -- 2
-;; First group in result (B with sum=7)
-(at (at (select {s: (sum v) by: k from: Tgrprange take: [1 2]}) 's) 0) -- 7
+;; Pin order with asc: k → A(5),B(7),C(3); skip 1 → B,C; first sum = 7.
+(at (at (select {s: (sum v) by: k from: Tgrprange asc: k take: [1 2]}) 's) 0) -- 7
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; take: domain error — lines 407-409 in apply_sort_take

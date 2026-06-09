@@ -65,9 +65,11 @@
 ;; (== 0N 0)=false, (!= 0N 0)=true in src/ops/cmp.c ray_neq_fn), NOT a
 ;; bug.  g=0 keeps {1,2}→c=2 ; g=1 keeps {null,4,5}→c=3 ; sum 5.
 (sum (at (select {c: (count v) from: Tn where: (!= v 0) by: g}) 'c)) -- 5
-;; cross-check the per-group counts directly
-(at (at (select {c: (count v) from: Tn where: (!= v 0) by: g}) 'c) 0) -- 2
-(at (at (select {c: (count v) from: Tn where: (!= v 0) by: g}) 'c) 1) -- 3
+;; cross-check the per-group counts directly.  by-group order is
+;; unspecified, so pin each group with an extra predicate rather than
+;; indexing a fixed position.
+(at (at (select {c: (count v) from: Tn where: (and (!= v 0) (== g 0)) by: g}) 'c) 0) -- 2
+(at (at (select {c: (count v) from: Tn where: (and (!= v 0) (== g 1)) by: g}) 'c) 0) -- 3
 
 ;; A nullable agg-input column must aggregate null-aware; a stored
 ;; sentinel for the null would otherwise be summed as a real value.

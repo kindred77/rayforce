@@ -64,9 +64,13 @@
 ;; Closes q8: top-N per group via the eval-level scatter.
 (set Tg (table [g v] (list [A A A B B C C C C] [3 1 5 2 7 4 9 6 8])))
 ;; Group A → top 2 = [5 3]; B → [7 2]; C → [9 8].
-(at (at (select {top2: (top v 2) by: g from: Tg}) 'top2) 0) -- [5 3]
-(at (at (select {top2: (top v 2) by: g from: Tg}) 'top2) 1) -- [7 2]
-(at (at (select {top2: (top v 2) by: g from: Tg}) 'top2) 2) -- [9 8]
+;; by-group result order is unspecified (hash bucket order), so pin each
+;; group with where: rather than indexing a fixed position.
+(at (at (select {top2: (top v 2) by: g where: (== g 'A) from: Tg}) 'top2) 0) -- [5 3]
+(at (at (select {top2: (top v 2) by: g where: (== g 'B) from: Tg}) 'top2) 0) -- [7 2]
+(at (at (select {top2: (top v 2) by: g where: (== g 'C) from: Tg}) 'top2) 0) -- [9 8]
+;; order-independent set check across all groups.
+(asc (raze (at (select {top2: (top v 2) by: g from: Tg}) 'top2))) -- [2 3 5 7 8 9]
 
 ;; Multi-key per-group bot.
 (set Tg2 (table [g h v] (list [A A A B B B] [X Y X X Y Y] [1 2 3 4 5 6])))
