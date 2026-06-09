@@ -40,3 +40,6 @@ site/
 
 # Allocator micro-benchmark binaries
 bench-alloc
+
+# Rayforce REPL history
+.rayhist.dat

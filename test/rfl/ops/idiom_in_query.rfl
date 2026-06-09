@@ -363,7 +363,7 @@ CAn -- 5
 ;; Reachability: the dynamic projection routes through the eval-level
 ;; per-group non-agg fallback (not the vectorized DAG), exercising
 ;; bind_all_columns' mount-every-column behavior for refs that the old
-;; RAY_ATTR_NAME static walk could not see.
+;; ATTR_QUOTED static walk could not see.
 
 ;; ──────────────────────────────────────────────────────────────────────
 ;; Section 10 — scoped-column precedence, hygiene, and nesting
