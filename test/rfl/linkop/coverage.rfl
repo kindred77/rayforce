@@ -38,7 +38,7 @@
 ;; ════════════════════════════════════════════════════════════════════════════
 ;; ray_link_attach: HAS_INDEX branch (lines 90-92)
 ;; Attach a link to a column that ALREADY has an accelerator index.
-;; The HAS_INDEX branch memcpy's target_sym_id into ix->saved_nullmap[8]
+;; The HAS_INDEX branch memcpy's target_sym_id into ix->saved_aux[8]
 ;; so that a future index-drop restores the link metadata correctly.
 ;; ════════════════════════════════════════════════════════════════════════════
 
@@ -56,7 +56,7 @@ both_ai.age                     -- [42 18 25 42]
 ;; ════════════════════════════════════════════════════════════════════════════
 ;; ray_link_detach: HAS_INDEX branch (lines 113-115)
 ;; Detach the link while an index is still attached.
-;; The HAS_INDEX branch memset-clears saved_nullmap[8..15].
+;; The HAS_INDEX branch memset-clears saved_aux[8..15].
 ;; Index must survive; link must be gone.
 ;; ════════════════════════════════════════════════════════════════════════════
 
