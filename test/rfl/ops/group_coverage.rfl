@@ -180,7 +180,7 @@
 ;; ────────────── 14. Stat aggs in multi-agg group with mixed sufficient/insufficient ──────────────
 ;; Some groups have >1 row (var well-defined), others have exactly 1
 ;; (var → null).  The HT-path null-flag prep runs after the parallel
-;; phase3 (group.c:3328-3347) — fixup branch for VAR/STDDEV when nullmap
+;; phase3 (group.c:3328-3347) — fixup branch for VAR/STDDEV when nulls
 ;; prep failed.  Mixed cnt encourages the planner through this branch.
 (set Tmix (table [g v] (list ['a 'a 'a 'b 'c 'c 'd] [1.0 2.0 3.0 5.0 7.0 9.0 11.0])))
 (count (select {v: (var v) s: (stddev v) c: (count v) from: Tmix by: g})) -- 4
@@ -195,7 +195,7 @@
 (count (select {s: (sum v) c: (count v) av: (avg v) from: Tsm by: k})) -- 10
 (sum (at (select {s: (sum v) c: (count v) from: Tsm by: k}) 's)) -- 2449965000
 (sum (at (select {s: (sum v) c: (count v) from: Tsm by: k}) 'c)) -- 70000
-;; multi-agg with min/max/stddev exercises radix_phase3 nullmap fixup
+;; multi-agg with min/max/stddev exercises radix_phase3 null fixup
 (count (select {mn: (min v) mx: (max v) sd: (stddev v) sp: (stddev_pop v) from: Tsm by: k})) -- 10
 
 ;; ────────────── 16. Group-by then access expression (chained) ──────────────
@@ -373,7 +373,7 @@
 ;; Group 1.5 (rows 0,10): sum=12; group 2.5 (rows 1,11): sum=14
 ;; Other groups single-row → var/stddev null.
 
-;; ────────────── 37. HT path stddev/var nullmap fixup (radix phase 3, 100k SYM) ──────────────
+;; ────────────── 37. HT path stddev/var null fixup (radix phase 3, 100k SYM) ──────────────
 ;; Already partially covered in section 15.  Add a case where some groups
 ;; are singletons (var=null) to exercise the post-phase3 fixup loop
 ;; (group.c:3409-3426): set the null bit on insufficient-cnt groups.

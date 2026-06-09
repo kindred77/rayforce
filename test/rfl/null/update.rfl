@@ -20,14 +20,14 @@
 (nil? (at (at r2 'a) 3)) -- true
 
 ;; New-column branch — broadcasting 0N into a brand-new column also
-;; used to drop the nullmap.
+;; used to drop the nulls.
 (set r3 (update {c: 0N from: t}))
 (nil? (at (at r3 'c) 0)) -- true
 (nil? (at (at r3 'c) 1)) -- true
 (nil? (at (at r3 'c) 2)) -- true
 
 ;; Type-promotion overlay — F64 expr written back to I64 col under WHERE.
-;; The path memcpy's orig values, so the nullmap had to be carried over
+;; The path memcpy's orig values, so the null state had to be carried over
 ;; manually for both unmasked rows (orig nulls) and masked rows (expr null).
 (set t4 (table [a b] (list [1 2 0N 4] [10 20 30 40])))
 (set r4 (update {a: (* a 1.5) where: (> b 15) from: t4}))

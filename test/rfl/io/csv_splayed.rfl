@@ -5,7 +5,7 @@
 ;;
 ;;   csv_splayed_writer_open     — opens per-column tmp file
 ;;   csv_splayed_writer_append   — per-chunk col append
-;;   csv_splayed_writer_close    — finalizes header + nullmap, atomic rename
+;;   csv_splayed_writer_close    — finalizes header + null bitmap, atomic rename
 ;;   csv_splayed_writer_null_bit — per-row null-bit accumulator
 ;;   csv_splayed_writer_zero_nulls — backfill / pad helpers (count=0 fast path
 ;;                                   reached here; the inner loop requires
@@ -115,7 +115,7 @@
 (nil? (at (at Tnull 'b) 7)) -- true
 (at (at Tnull 'b) 11) -- 12.5
 
-;; Round-trip load: the saved column file carries an external nullmap
+;; Round-trip load: the saved column file carries an external null bitmap
 ;; bitmap (RAY_ATTR_NULLMAP_EXT in writer_close), and ray_col_load
 ;; restores it.  Re-loaded sums match the original.
 (set Rnull (.db.splayed.get "rf_test_splayed_nulls/"))
@@ -124,7 +124,7 @@
 (sum (at Rnull 'b)) -- 67.5
 (at Rnull 'a) -- (at Tnull 'a)
 (at Rnull 'b) -- (at Tnull 'b)
-;; Literal pins on the reloaded column: the external nullmap bitmap is
+;; Literal pins on the reloaded column: the external null bitmap is
 ;; restored at the right row positions and the non-null payloads survive.
 (at (at Rnull 'a) 0)  -- 1
 (nil? (at (at Rnull 'a) 1)) -- true

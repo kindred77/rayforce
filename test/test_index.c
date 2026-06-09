@@ -51,7 +51,7 @@ static ray_t* make_f64_vec(const double* xs, int64_t n) {
     return v;
 }
 
-/* Snapshot the 16-byte nullmap union and attrs bits we care about. */
+/* Snapshot the 16-byte aux union and attrs bits we care about. */
 typedef struct {
     uint8_t bytes[16];
     uint8_t attrs;  /* HAS_NULLS */
@@ -59,7 +59,7 @@ typedef struct {
 
 static nullmap_snap_t snap_take(const ray_t* v) {
     nullmap_snap_t s;
-    memcpy(s.bytes, v->nullmap, 16);
+    memcpy(s.bytes, v->aux, 16);
     s.attrs = v->attrs & RAY_ATTR_HAS_NULLS;
     return s;
 }
@@ -92,7 +92,7 @@ static test_result_t test_index_attach_drop_no_nulls(void) {
     TEST_ASSERT_EQ_I(ix->u.zone.max_i, 9);
     TEST_ASSERT_EQ_I(ix->u.zone.n_nulls, 0);
 
-    /* Drop and verify the nullmap union round-trips byte-for-byte. */
+    /* Drop and verify the aux union round-trips byte-for-byte. */
     ray_t* d = ray_index_drop(&w);
     TEST_ASSERT_FALSE(RAY_IS_ERR(d));
     TEST_ASSERT_FALSE(w->attrs & RAY_ATTR_HAS_INDEX);
@@ -572,7 +572,7 @@ static test_result_t test_index_insert_at_drops_index(void) {
 static test_result_t test_index_null_readers_through_helper(void) {
     /* Verify the sentinel-based null reader invariant: ray_vec_is_null
      * returns the same answer before and after an index attach, even
-     * though w->nullmap[0..7] holds the index pointer after attach. */
+     * though w->aux[0..7] holds the index pointer after attach. */
     ray_heap_init();
     int64_t xs[] = { 100, 200, 300, 400, 500 };
     ray_t* v = make_i64_vec(xs, 5);

@@ -140,13 +140,13 @@ static test_result_t test_version_string(void) {
 }
 
 /* ---- test_fn_name_builtin ---------------------------------------------- */
-/* ray_fn_name reads the function-object name from nullmap[2..15].  After
+/* ray_fn_name reads the function-object name from aux[2..15].  After
  * ray_runtime_create the global env contains builtins like "+", "sum", and
  * "println"; looking them up and reading the name back round-trips the
  * fn_set_name encoding inside env.c. */
 
 static test_result_t test_fn_name_builtin(void) {
-    /* "+" — single byte name, fits in nullmap[2..15] easily. */
+    /* "+" — single byte name, fits in aux[2..15] easily. */
     int64_t plus_id = ray_sym_intern("+", 1);
     ray_t* plus = ray_env_get(plus_id);
     TEST_ASSERT_NOT_NULL(plus);
@@ -166,9 +166,9 @@ static test_result_t test_fn_name_builtin(void) {
     TEST_ASSERT_NOT_NULL(sum_name);
     TEST_ASSERT_STR_EQ(sum_name, "sum");
 
-    /* The pointer must be inside the function object's nullmap region
-     * (offset 2 from the nullmap base). */
-    TEST_ASSERT_EQ_PTR(sum_name, (const char*)sum->nullmap + 2);
+    /* The pointer must be inside the function object's aux region
+     * (offset 2 from the aux base). */
+    TEST_ASSERT_EQ_PTR(sum_name, (const char*)sum->aux + 2);
 
     PASS();
 }

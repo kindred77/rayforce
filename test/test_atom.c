@@ -458,26 +458,26 @@ static test_result_t test_atom_eq_list_sym_atoms(void) {
 
 static test_result_t test_atom_typed_null_f64(void) {
     /* ray_typed_null(-RAY_F64) stores NaN in the f64 payload AND sets
-     * nullmap[0]&1.  Downstream kernels reading the slot raw see NaN. */
+     * aux[0]&1.  Downstream kernels reading the slot raw see NaN. */
     ray_t* v = ray_typed_null(-RAY_F64);
     TEST_ASSERT_NOT_NULL(v);
     TEST_ASSERT_FALSE(RAY_IS_ERR(v));
     TEST_ASSERT_TRUE(ray_is_atom(v));
     TEST_ASSERT_EQ_I(v->type, -RAY_F64);
     TEST_ASSERT_TRUE(v->f64 != v->f64);          /* NaN by IEEE-754 */
-    TEST_ASSERT_TRUE((v->nullmap[0] & 1) != 0);  /* bitmap bit also set */
+    TEST_ASSERT_TRUE((v->aux[0] & 1) != 0);  /* bitmap bit also set */
     ray_release(v);
     PASS();
 }
 
 static test_result_t test_atom_typed_null_i64(void) {
-    /* Integer typed nulls use the INT_MIN sentinel and set nullmap[0]&1. */
+    /* Integer typed nulls use the INT_MIN sentinel and set aux[0]&1. */
     ray_t* v = ray_typed_null(-RAY_I64);
     TEST_ASSERT_NOT_NULL(v);
     TEST_ASSERT_FALSE(RAY_IS_ERR(v));
     TEST_ASSERT_EQ_I(v->type, -RAY_I64);
     TEST_ASSERT_EQ_I(v->i64, NULL_I64);
-    TEST_ASSERT_TRUE((v->nullmap[0] & 1) != 0);
+    TEST_ASSERT_TRUE((v->aux[0] & 1) != 0);
     ray_release(v);
     PASS();
 }
@@ -488,7 +488,7 @@ static test_result_t test_atom_typed_null_i16(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(v));
     TEST_ASSERT_EQ_I(v->type, -RAY_I16);
     TEST_ASSERT_EQ_I(v->i16, NULL_I16);
-    TEST_ASSERT_TRUE((v->nullmap[0] & 1) != 0);
+    TEST_ASSERT_TRUE((v->aux[0] & 1) != 0);
     ray_release(v);
     PASS();
 }
@@ -499,7 +499,7 @@ static test_result_t test_atom_typed_null_i32(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(v));
     TEST_ASSERT_EQ_I(v->type, -RAY_I32);
     TEST_ASSERT_EQ_I(v->i32, NULL_I32);
-    TEST_ASSERT_TRUE((v->nullmap[0] & 1) != 0);
+    TEST_ASSERT_TRUE((v->aux[0] & 1) != 0);
     ray_release(v);
     PASS();
 }
@@ -510,7 +510,7 @@ static test_result_t test_atom_typed_null_date(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(v));
     TEST_ASSERT_EQ_I(v->type, -RAY_DATE);
     TEST_ASSERT_EQ_I(v->i32, NULL_I32);
-    TEST_ASSERT_TRUE((v->nullmap[0] & 1) != 0);
+    TEST_ASSERT_TRUE((v->aux[0] & 1) != 0);
     ray_release(v);
     PASS();
 }
@@ -521,7 +521,7 @@ static test_result_t test_atom_typed_null_time(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(v));
     TEST_ASSERT_EQ_I(v->type, -RAY_TIME);
     TEST_ASSERT_EQ_I(v->i32, NULL_I32);
-    TEST_ASSERT_TRUE((v->nullmap[0] & 1) != 0);
+    TEST_ASSERT_TRUE((v->aux[0] & 1) != 0);
     ray_release(v);
     PASS();
 }
@@ -532,7 +532,7 @@ static test_result_t test_atom_typed_null_timestamp(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(v));
     TEST_ASSERT_EQ_I(v->type, -RAY_TIMESTAMP);
     TEST_ASSERT_EQ_I(v->i64, NULL_I64);
-    TEST_ASSERT_TRUE((v->nullmap[0] & 1) != 0);
+    TEST_ASSERT_TRUE((v->aux[0] & 1) != 0);
     ray_release(v);
     PASS();
 }

@@ -1146,7 +1146,7 @@ static test_result_t test_eval_select_lambda_arity_err(void) {
  * Regression: compile_expr_dag routed typed null literals
  * (`-RAY_I64` with RAY_ATOM_IS_NULL set) through the fast ctors
  * `ray_const_i64` etc., which carry only the raw value — the
- * null flag stored in atom->nullmap[0] was dropped.  Downstream
+ * null flag stored in atom->aux[0] was dropped.  Downstream
  * fix_null_comparisons saw a non-null scalar rhs and didn't
  * apply null semantics, so `(== k 0N)` missed null rows and
  * `(!= k 0N)` leaked them through.  Now typed null atoms fall
@@ -3819,7 +3819,7 @@ static test_result_t test_dag_temporal_extract_nulls(void) {
      * query) used to decode the raw null-sentinel bytes and emit bogus
      * I64 / timestamp values *without* setting the output null bit.
      * The null sentinel for RAY_TIMESTAMP is 0 (distinguished by the
-     * nullmap bit, not the value), so the extract kernel silently
+     * null bit, not the value), so the extract kernel silently
      * turned every null into `.ss == 0` and lost null-awareness for
      * all downstream consumers.
      *

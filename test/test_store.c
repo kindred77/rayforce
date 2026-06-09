@@ -477,7 +477,7 @@ static test_result_t test_parted_nrows(void) {
     parted->type = RAY_PARTED_BASE + RAY_I64;
     parted->len = 3;
     parted->attrs = 0;
-    memset(parted->nullmap, 0, 16);
+    memset(parted->aux, 0, 16);
 
     ray_t** segs = (ray_t**)ray_data(parted);
     segs[0] = seg0; ray_retain(seg0);
@@ -516,7 +516,7 @@ static test_result_t test_table_nrows_parted(void) {
     parted->type = RAY_PARTED_BASE + RAY_I64;
     parted->len = 2;
     parted->attrs = 0;
-    memset(parted->nullmap, 0, 16);
+    memset(parted->aux, 0, 16);
 
     ray_t** segs = (ray_t**)ray_data(parted);
     segs[0] = seg0; ray_retain(seg0);
@@ -557,7 +557,7 @@ static test_result_t test_parted_release(void) {
     parted->type = RAY_PARTED_BASE + RAY_I64;
     parted->len = 2;
     parted->attrs = 0;
-    memset(parted->nullmap, 0, 16);
+    memset(parted->aux, 0, 16);
 
     ray_t** segs = (ray_t**)ray_data(parted);
     segs[0] = seg0; ray_retain(seg0);
@@ -2226,7 +2226,7 @@ static test_result_t test_serde_vec_null_bitmaps(void) {
         ray_release(b); ray_release(w); ray_release(v);
     }
     /* SYM vector: null state is represented by sym 0 (the empty
-     * string), not a nullmap.  This stanza verifies the round-trip
+     * string), not a null bitmap.  This stanza verifies the round-trip
      * preserves the values intact — there is no HAS_NULLS attribute
      * to assert on. */
     {
@@ -2494,7 +2494,7 @@ static test_result_t test_serde_f32_atom_and_edge_cases(void) {
         if (a && !RAY_IS_ERR(a)) {
             /* Force obj to NULL to trigger the memset path */
             a->obj = NULL;
-            a->nullmap[0] = 0; /* clear null bit to force value path */
+            a->aux[0] = 0; /* clear null bit to force value path */
             ray_t* w = ray_ser(a);
             if (w && !RAY_IS_ERR(w)) {
                 ray_t* b = ray_de(w);

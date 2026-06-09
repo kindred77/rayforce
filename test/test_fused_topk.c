@@ -637,7 +637,7 @@ static test_result_t test_topk_aliased_out(void) {
     PASS();
 }
 
-/* Source nullmap propagated to result.  Exercises lines 432-437. */
+/* Source nulls propagated to result.  Exercises lines 432-437. */
 static test_result_t test_topk_propagates_nullmap(void) {
     int64_t N = 20;
     ray_t* gc = ray_vec_new(RAY_I64, N); gc->len = N;
@@ -646,7 +646,7 @@ static test_result_t test_topk_propagates_nullmap(void) {
     int64_t* vd = (int64_t*)ray_data(vc);
     for (int64_t i = 0; i < N; i++) { gd[i] = i % 4; vd[i] = i; }
     /* Mark some g rows as null — these will be carried into the
-     * result via the nullmap propagation block. */
+     * result via the null propagation block. */
     ray_vec_set_null(gc, 1, true);
     ray_vec_set_null(gc, 2, true);
     int64_t s_g = ray_sym_intern("g", 1);

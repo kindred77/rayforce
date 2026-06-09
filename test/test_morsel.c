@@ -425,7 +425,7 @@ static test_result_t test_morsel_has_index_inline_nulls(void) {
     TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 1, true), RAY_OK);
     TEST_ASSERT_TRUE(v->attrs & RAY_ATTR_HAS_NULLS);
 
-    /* Attach index — displaces nullmap, stores snapshot in ix->saved_nullmap */
+    /* Attach index — displaces aux, stores snapshot in ix->saved_nullmap */
     ray_t* w = v;
     ray_t* r = ray_index_attach_zone(&w);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
@@ -453,7 +453,7 @@ static test_result_t test_morsel_has_index_inline_nulls(void) {
 }
 
 static test_result_t test_morsel_has_index_ext_nulls(void) {
-    /* > 128 elements forces external nullmap */
+    /* > 128 elements forces external null bitmap */
     int64_t n = 200;
     ray_t* v = ray_vec_new(RAY_I64, 0);
     TEST_ASSERT_NOT_NULL(v);
