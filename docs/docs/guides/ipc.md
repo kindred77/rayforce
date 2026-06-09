@@ -163,6 +163,8 @@ For dynamic queries, substitute runtime values into the expression:
 
     Dict literals are self-evaluating — `{from: trades where: (> price 200)}` preserves its contents as data. When the server evaluates the list, `select` resolves `trades` and `price` in the table context. Use `(list ...)` inside the dict when you need to splice runtime values into an expression.
 
+    Because the query is built as data, `(quote price)` and `(quote qty)` evaluate to the literal symbols `'price` and `'qty` as each `(list ...)` is constructed. A literal symbol that names a from-table column resolves to that column during query evaluation, so they resolve to the `price` and `qty` columns. The tick forms `'price`/`'qty`, and bare `price`/`qty`, work the same way.
+
 ## 5. Async Fire-and-Forget
 
 `.ipc.send` blocks until the server replies. When you don't need a reply — firing a write, pushing an update, kicking off background work — use `.ipc.post` instead. It sends the message and returns immediately.

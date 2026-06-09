@@ -4,10 +4,13 @@
 ;;
 ;; Three forms must stay distinguishable:
 ;;   • a bare name  (x)        is a name reference  -> resolves at eval
-;;   • (quote x)               passes the bare name through -> still a name
-;;                             reference -> resolves at eval
+;;   • (quote x)               yields a literal symbol (≡ 'x) -> evaluates to
+;;                             itself, never resolving to the binding
 ;;   • a tick literal ('x)     is a literal symbol  -> evaluates to itself,
 ;;                             never resolving to the binding
+;; ("never resolving" is the non-query value position exercised here; inside
+;;  a query a literal symbol naming a from-table COLUMN resolves to that
+;;  column -- see test/rfl/query/literal_col_ref.rfl.)
 ;; and serde (ser/de) must preserve each form's flag across the wire.
 ;;
 ;; eval-of-name-reference resolves from env (src/lang/eval.c:2938); a literal
@@ -18,9 +21,19 @@
 ;; (1) bare name resolves to its binding
 x -- 42
 
-;; (2) (quote x) is a name reference -> resolves to the binding (an i64)
-(eval (quote x)) -- 42
-(type (eval (quote x))) -- 'i64
+;; (2) (quote x) is a LITERAL symbol (≡ 'x) -> evaluates to itself, a sym
+(eval (quote x)) -- 'x
+(type (eval (quote x))) -- 'sym
+
+;; B3: 'x ≡ (quote x) — both literal symbols.
+(== 'x (quote x)) -- true
+(type (quote x)) -- 'sym
+;; value position: (quote x) no longer resolves outside a query (matches 'x).
+(== (eval (quote x)) (eval 'x)) -- true
+;; head position unaffected (flag-agnostic head application):
+(set f (fn [y] (+ y 100)))
+(eval (list (quote f) 1)) -- 101
+(eval (list 'f 1)) -- 101
 
 ;; (3) 'x is a literal symbol -> evaluates to itself (prints bare, no tick),
 ;;     stays a sym and equals the symbol, NOT the resolved value 42
@@ -28,9 +41,11 @@ x -- 42
 (type (eval 'x)) -- 'sym
 (== (eval 'x) 'x) -- true
 
-;; (4) round-tripped (quote x) keeps its name-reference flag -> still resolves
-(eval (de (ser (quote x)))) -- 42
-(type (eval (de (ser (quote x))))) -- 'i64
+;; (4) round-tripped (quote x) keeps its literal flag -> stays a literal symbol
+;;     (same as 'x).
+(eval (de (ser (quote x)))) -- 'x
+(type (eval (de (ser (quote x))))) -- 'sym
+(== (eval (de (ser (quote x)))) (eval (de (ser 'x)))) -- true
 
 ;; (5) round-tripped 'x keeps its literal flag -> stays a literal symbol
 (eval (de (ser 'x))) -- 'x
