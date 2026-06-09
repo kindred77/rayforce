@@ -1,0 +1,39 @@
+;; B3 Part 2: inside a query, a LITERAL symbol naming a from-table column
+;; resolves to that column.  Outside a query a literal symbol stays literal
+;; (covered by test/rfl/lang/symbol_quote_semantics.rfl).
+;;
+;; Tick `'col` is already a literal symbol (ATTR_QUOTED set), so these forms
+;; exercise the post-Task-2 contract directly without needing (quote x) to be
+;; a literal yet.
+;;
+;; CONTRACT: a literal -RAY_SYM resolves to a from-table COLUMN only — never
+;; to a lambda/let local (no env capture), and only while a query is active.
+;; A literal that names no column stays a constant symbol.
+
+(set Tlit (table [g price] (list ['a 'a 'b] [10.0 20.0 30.0])))
+
+;; literal in projection -> resolves to the column
+(at (select {o: 'price from: Tlit}) 'o) -- [10.0 20.0 30.0]
+
+;; literal in where -> resolves to the column
+(count (select {from: Tlit where: (> 'price 15.0)})) -- 2
+
+;; literal in by -> resolves to the column (2 groups: a, b)
+(count (select {n: (count price) from: Tlit by: 'g})) -- 2
+
+;; a literal that names NO column stays a constant symbol, broadcast per row
+(at (select {o: 'price tag: 'nope from: Tlit}) 'tag) -- ['nope 'nope 'nope]
+
+;; dynamic idiom: a literal symbol carried in a variable, assembled into a
+;; call at runtime and eval'd inside the query, still resolves to the column.
+;; Groups by g: a -> [10.0 20.0], b -> [30.0].
+(set c 'price)
+(at (at (select {o: (eval (list + c 0.0)) from: Tlit by: g}) 'o) 0) -- [10.0 20.0]
+(at (at (select {o: (eval (list + c 0.0)) from: Tlit by: g}) 'o) 1) -- [30.0]
+
+;; A literal symbol that collides with a lambda FORMAL inside a query is NOT
+;; captured as the formal: it resolves to the matching column instead.  Here
+;; the lambda formal is named `price`; applying it with arg 999.0 must still
+;; project the `price` COLUMN (because 'price is a literal, column-scoped),
+;; never the formal value 999.0.
+(at (select {o: ((fn [price] 'price) 999.0) from: Tlit}) 'o) -- [10.0 20.0 30.0]
