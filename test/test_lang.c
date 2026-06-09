@@ -6662,12 +6662,14 @@ static test_result_t test_env_scope_frame_grows(void) {
  * capped at 64 args in the eval apply path — that cap is unrelated to the
  * scope-frame growth under test.  The projection is a runtime-built column
  * reference wrapped in `eval`; that head is non-vectorizable, and with a
- * scalar `by:` key the non-agg projection routes through the per-group eval
- * fallback (a bind_all_columns site) where every column is mounted in scope.
- * The ref `c69` is produced at runtime via (quote c69), so a static AST walk
- * never saw it — it can only resolve because all 70 columns were mounted. */
+ * scalar `by:` key the non-agg projection routes through a tree-walk
+ * bind_all_columns site where every column is mounted in scope.  The last
+ * column's ref is produced at runtime via `(quote c<last>)`, so a static AST
+ * walk never saw it — it can only resolve because all NCOL columns were
+ * mounted. */
 static test_result_t test_query_wide_table_over_64_cols(void) {
     const int NCOL = 70;
+    const int LAST = NCOL - 1;          /* reference the last column */
     char buf[16384];
     int off = 0;
     off += snprintf(buf + off, sizeof buf - off,
@@ -6675,17 +6677,19 @@ static test_result_t test_query_wide_table_over_64_cols(void) {
     for (int i = 1; i < NCOL; i++)
         off += snprintf(buf + off, sizeof buf - off,
                         "(set W (update {c%d: %d from: W})) ", i, i);
-    /* Runtime-built ref to the LAST column (c69), through the per-group
-     * eval fallback (by: c0).  Collapses to the scalar value 69. */
+    /* Runtime-built ref to the last column, through a tree-walk
+     * bind_all_columns site (by: c0).  Collapses to the scalar value LAST. */
     off += snprintf(buf + off, sizeof buf - off,
-                    "(set c (quote c69)) "
-                    "(at (at (at (select {o: (eval (list + c 0)) from: W by: c0}) 'o) 0) 0))");
+                    "(set c (quote c%d)) "
+                    "(at (at (at (select {o: (eval (list + c 0)) from: W by: c0}) 'o) 0) 0))",
+                    LAST);
+    TEST_ASSERT(off > 0 && (size_t)off < sizeof buf, "query source truncated");
 
     ray_t* r = ray_eval_str(buf);
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
-    TEST_ASSERT_EQ_I(r->type, -RAY_I64);   /* c69's single element == 69 */
-    TEST_ASSERT_EQ_I(r->i64, 69);
+    TEST_ASSERT_EQ_I(r->type, -RAY_I64);   /* last column's single element == LAST */
+    TEST_ASSERT_EQ_I(r->i64, LAST);
     ray_release(r);
     PASS();
 }
