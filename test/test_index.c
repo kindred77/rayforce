@@ -55,16 +55,16 @@ static ray_t* make_f64_vec(const double* xs, int64_t n) {
 typedef struct {
     uint8_t bytes[16];
     uint8_t attrs;  /* HAS_NULLS */
-} nullmap_snap_t;
+} aux_snap_t;
 
-static nullmap_snap_t snap_take(const ray_t* v) {
-    nullmap_snap_t s;
+static aux_snap_t snap_take(const ray_t* v) {
+    aux_snap_t s;
     memcpy(s.bytes, v->aux, 16);
     s.attrs = v->attrs & RAY_ATTR_HAS_NULLS;
     return s;
 }
 
-static int snap_eq(const nullmap_snap_t* a, const nullmap_snap_t* b) {
+static int snap_eq(const aux_snap_t* a, const aux_snap_t* b) {
     return memcmp(a->bytes, b->bytes, 16) == 0 && a->attrs == b->attrs;
 }
 
@@ -77,7 +77,7 @@ static test_result_t test_index_attach_drop_no_nulls(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(v));
     TEST_ASSERT_FALSE(v->attrs & RAY_ATTR_HAS_INDEX);
 
-    nullmap_snap_t before = snap_take(v);
+    aux_snap_t before = snap_take(v);
 
     ray_t* w = v;
     ray_t* r = ray_index_attach_zone(&w);
@@ -97,7 +97,7 @@ static test_result_t test_index_attach_drop_no_nulls(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(d));
     TEST_ASSERT_FALSE(w->attrs & RAY_ATTR_HAS_INDEX);
 
-    nullmap_snap_t after = snap_take(w);
+    aux_snap_t after = snap_take(w);
     TEST_ASSERT_TRUE(snap_eq(&before, &after));
 
     ray_release(w);
@@ -114,7 +114,7 @@ static test_result_t test_index_attach_drop_with_inline_nulls(void) {
     TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 3, true), RAY_OK);
     TEST_ASSERT_TRUE(v->attrs & RAY_ATTR_HAS_NULLS);
 
-    nullmap_snap_t before = snap_take(v);
+    aux_snap_t before = snap_take(v);
 
     ray_t* w = v;
     ray_t* r = ray_index_attach_zone(&w);
@@ -135,7 +135,7 @@ static test_result_t test_index_attach_drop_with_inline_nulls(void) {
 
     /* Drop and verify the snapshot is restored. */
     ray_index_drop(&w);
-    nullmap_snap_t after = snap_take(w);
+    aux_snap_t after = snap_take(w);
     TEST_ASSERT_TRUE(snap_eq(&before, &after));
     TEST_ASSERT_TRUE(w->attrs & RAY_ATTR_HAS_NULLS);
 
@@ -262,7 +262,7 @@ static test_result_t test_index_hash_attach_drop(void) {
     ray_heap_init();
     int64_t xs[] = { 7, 3, 7, 9, 3, 1 };  /* duplicates and uniques */
     ray_t* v = make_i64_vec(xs, 6);
-    nullmap_snap_t before = snap_take(v);
+    aux_snap_t before = snap_take(v);
 
     ray_t* w = v;
     ray_t* r = ray_index_attach_hash(&w);
@@ -300,7 +300,7 @@ static test_result_t test_index_hash_attach_drop(void) {
                      (found_at[0] == 2 && found_at[1] == 0));
 
     ray_index_drop(&w);
-    nullmap_snap_t after = snap_take(w);
+    aux_snap_t after = snap_take(w);
     TEST_ASSERT_TRUE(snap_eq(&before, &after));
 
     ray_release(w);
@@ -314,7 +314,7 @@ static test_result_t test_index_hash_with_nulls_preserved(void) {
     ray_t* v = make_i64_vec(xs, 4);
     /* Mark row 1 null. */
     TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 1, true), RAY_OK);
-    nullmap_snap_t before = snap_take(v);
+    aux_snap_t before = snap_take(v);
 
     ray_t* w = v;
     ray_t* r = ray_index_attach_hash(&w);
@@ -328,7 +328,7 @@ static test_result_t test_index_hash_with_nulls_preserved(void) {
     TEST_ASSERT_TRUE(w->attrs & RAY_ATTR_HAS_NULLS);
 
     ray_index_drop(&w);
-    nullmap_snap_t after = snap_take(w);
+    aux_snap_t after = snap_take(w);
     TEST_ASSERT_TRUE(snap_eq(&before, &after));
 
     ray_release(w);
@@ -342,7 +342,7 @@ static test_result_t test_index_sort_attach_drop(void) {
     ray_heap_init();
     int64_t xs[] = { 5, 1, 9, 3, 7 };
     ray_t* v = make_i64_vec(xs, 5);
-    nullmap_snap_t before = snap_take(v);
+    aux_snap_t before = snap_take(v);
 
     ray_t* w = v;
     ray_t* r = ray_index_attach_sort(&w);
@@ -362,7 +362,7 @@ static test_result_t test_index_sort_attach_drop(void) {
     }
 
     ray_index_drop(&w);
-    nullmap_snap_t after = snap_take(w);
+    aux_snap_t after = snap_take(w);
     TEST_ASSERT_TRUE(snap_eq(&before, &after));
 
     ray_release(w);
@@ -376,7 +376,7 @@ static test_result_t test_index_bloom_attach_drop(void) {
     ray_heap_init();
     int64_t xs[] = { 11, 22, 33, 44, 55 };
     ray_t* v = make_i64_vec(xs, 5);
-    nullmap_snap_t before = snap_take(v);
+    aux_snap_t before = snap_take(v);
 
     ray_t* w = v;
     ray_t* r = ray_index_attach_bloom(&w);
@@ -397,7 +397,7 @@ static test_result_t test_index_bloom_attach_drop(void) {
     TEST_ASSERT_TRUE(popcount > 0);
 
     ray_index_drop(&w);
-    nullmap_snap_t after = snap_take(w);
+    aux_snap_t after = snap_take(w);
     TEST_ASSERT_TRUE(snap_eq(&before, &after));
 
     ray_release(w);
@@ -513,7 +513,7 @@ static test_result_t test_index_persistence_roundtrip(void) {
 
 /* ─── Slice null detection on indexed/parent vec ───────────────────── */
 
-static test_result_t test_index_nullmap_helper_slice(void) {
+static test_result_t test_index_aux_helper_slice(void) {
     /* Slice-relative null detection via ray_vec_is_null delegates to
      * the parent's sentinel payload at the translated index. */
     ray_heap_init();
@@ -3679,7 +3679,7 @@ const test_entry_t index_entries[] = {
     { "index/replace_cross_kind",            test_index_replace_cross_kind,            NULL, NULL },
     { "index/insert_at_drops_index",         test_index_insert_at_drops_index,         NULL, NULL },
     { "index/null_readers_through_helper",   test_index_null_readers_through_helper,   NULL, NULL },
-    { "index/nullmap_helper_slice",          test_index_nullmap_helper_slice,          NULL, NULL },
+    { "index/aux_helper_slice",          test_index_aux_helper_slice,          NULL, NULL },
     { "index/drop_under_shared_cow",         test_index_drop_under_shared_cow,         NULL, NULL },
     { "index/persistence_roundtrip",         test_index_persistence_roundtrip,         NULL, NULL },
     { "index/bool_zone_and_hash",            test_index_bool_zone_and_hash,            NULL, NULL },

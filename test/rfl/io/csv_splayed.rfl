@@ -115,8 +115,8 @@
 (nil? (at (at Tnull 'b) 7)) -- true
 (at (at Tnull 'b) 11) -- 12.5
 
-;; Round-trip load: the saved column file carries an external null bitmap
-;; bitmap (RAY_ATTR_NULLMAP_EXT in writer_close), and ray_col_load
+;; Round-trip load: the saved column file carries an external null
+;; bitmap (RAY_ATTR_HAS_NULLS in writer_close), and ray_col_load
 ;; restores it.  Re-loaded sums match the original.
 (set Rnull (.db.splayed.get "rf_test_splayed_nulls/"))
 (count Rnull) -- 12

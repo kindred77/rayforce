@@ -1,7 +1,7 @@
 ;; Characterization pin for the removal of the dead VAR/STDDEV "fixup" loop in
 ;; src/ops/group.c.  Singleton groups have undefined sample variance -> null.
 ;; The main radix-agg path writes the NULL_F64 sentinels directly; the removed
-;; fixup loop (guarded by an always-true nullmap_prep_ok) NEVER executed.  If
+;; fixup loop (guarded by an always-true prep flag) NEVER executed.  If
 ;; this regresses, do NOT restore the fixup — fix the main agg path.
 (set Tsng (table [g v] (list ['a 'b 'b 'c] [10.0 20.0 30.0 40.0])))
 

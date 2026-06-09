@@ -638,7 +638,7 @@ static test_result_t test_topk_aliased_out(void) {
 }
 
 /* Source nulls propagated to result.  Exercises lines 432-437. */
-static test_result_t test_topk_propagates_nullmap(void) {
+static test_result_t test_topk_propagates_nulls(void) {
     int64_t N = 20;
     ray_t* gc = ray_vec_new(RAY_I64, N); gc->len = N;
     ray_t* vc = ray_vec_new(RAY_I64, N); vc->len = N;
@@ -1562,7 +1562,7 @@ const test_entry_t fused_topk_entries[] = {
     { "fused_topk/basic_i64_asc",             test_topk_basic_i64_asc,             topk_setup, topk_teardown },
     { "fused_topk/in_pred",                   test_topk_in_pred,                   topk_setup, topk_teardown },
     { "fused_topk/aliased_out",               test_topk_aliased_out,               topk_setup, topk_teardown },
-    { "fused_topk/propagates_nullmap",        test_topk_propagates_nullmap,        topk_setup, topk_teardown },
+    { "fused_topk/propagates_nulls",        test_topk_propagates_nulls,        topk_setup, topk_teardown },
     { "fused_topk/three_keys",                test_topk_three_keys,                topk_setup, topk_teardown },
     /* Branch-coverage: esz==2 I16 key */
     { "fused_topk/i16_sort_key",             test_topk_i16_sort_key,              topk_setup, topk_teardown },
