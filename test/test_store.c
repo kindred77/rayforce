@@ -1534,13 +1534,14 @@ static test_result_t test_serde_long_str_roundtrip(void) {
 /* ---- test_serde_null_roundtrip ------------------------------------------ */
 
 static test_result_t test_serde_null_roundtrip(void) {
-    /* 1. C NULL pointer → RAY_SERDE_NULL → C NULL */
+    /* 1. C NULL pointer → RAY_SERDE_NULL → RAY_NULL_OBJ (value null) */
     {
         ray_t* wire = ray_ser(NULL);
         TEST_ASSERT_NOT_NULL(wire);
         TEST_ASSERT_FALSE(RAY_IS_ERR(wire));
         ray_t* back = ray_de(wire);
-        TEST_ASSERT_NULL(back);
+        TEST_ASSERT(RAY_IS_NULL(back), "de of serialized null yields the null singleton");
+        ray_release(back);
         ray_release(wire);
     }
 

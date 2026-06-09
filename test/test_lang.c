@@ -4499,7 +4499,7 @@ static test_result_t test_eval_undefined_name(void) {
 /* --- null keyword evaluates to null --- */
 static test_result_t test_eval_null_keyword(void) {
     ray_t* r = ray_eval_str("null");
-    TEST_ASSERT_NULL(r);
+    TEST_ASSERT(RAY_IS_NULL(r), "null keyword yields the null singleton");
     PASS();
 }
 
