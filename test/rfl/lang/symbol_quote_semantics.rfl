@@ -1,0 +1,38 @@
+;; Characterization of bare / quoted / tick symbol forms, observed through
+;; eval, so the upcoming ATTR flag rename + polarity flip can be proven
+;; behavior-preserving.
+;;
+;; Three forms must stay distinguishable:
+;;   • a bare name  (x)        is a name reference  -> resolves at eval
+;;   • (quote x)               passes the bare name through -> still a name
+;;                             reference -> resolves at eval
+;;   • a tick literal ('x)     is a literal symbol  -> evaluates to itself,
+;;                             never resolving to the binding
+;; and serde (ser/de) must preserve each form's flag across the wire.
+;;
+;; eval-of-name-reference resolves from env (src/lang/eval.c:2938); a literal
+;; symbol is an atom and returns itself (src/lang/eval.c:2936).
+
+(set x 42)
+
+;; (1) bare name resolves to its binding
+x -- 42
+
+;; (2) (quote x) is a name reference -> resolves to the binding (an i64)
+(eval (quote x)) -- 42
+(type (eval (quote x))) -- 'i64
+
+;; (3) 'x is a literal symbol -> evaluates to itself (prints bare, no tick),
+;;     stays a sym and equals the symbol, NOT the resolved value 42
+(eval 'x) -- 'x
+(type (eval 'x)) -- 'sym
+(== (eval 'x) 'x) -- true
+
+;; (4) round-tripped (quote x) keeps its name-reference flag -> still resolves
+(eval (de (ser (quote x)))) -- 42
+(type (eval (de (ser (quote x))))) -- 'i64
+
+;; (5) round-tripped 'x keeps its literal flag -> stays a literal symbol
+(eval (de (ser 'x))) -- 'x
+(type (eval (de (ser 'x)))) -- 'sym
+(== (eval (de (ser 'x))) 'x) -- true
