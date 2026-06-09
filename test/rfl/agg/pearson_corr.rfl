@@ -64,9 +64,10 @@
 ;; Group B: y = 6-x → r = -1.0
 ;; The SIGNED coefficient must be returned per group — squaring it here
 ;; (a former workaround) collapsed +1 and -1 to 1.0 and hid the by-group
-;; sign bug.  Assert r directly so the sign is exercised.
-(at (at (select {r: (pearson_corr x y) by: g from: Tq9}) 'r) 0) -- 1.0
-(at (at (select {r: (pearson_corr x y) by: g from: Tq9}) 'r) 1) -- -1.0
+;; sign bug.  Group emit order is hash-bucket order (differs across ASan /
+;; coverage builds), so assert the {+1.0, -1.0} pair order-independently.
+(min (at (select {r: (pearson_corr x y) by: g from: Tq9}) 'r)) -- -1.0
+(max (at (select {r: (pearson_corr x y) by: g from: Tq9}) 'r)) --  1.0
 ;; r² parity: pow(r,2) is +1.0 for both groups (squaring discards sign).
 (at (at (select {r2: (pow (pearson_corr x y) 2) by: g from: Tq9}) 'r2) 1) -- 1.0
 

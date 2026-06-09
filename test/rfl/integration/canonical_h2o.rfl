@@ -125,10 +125,12 @@
 (set Tq8f (table [id v] (list [A A A B B C C C C] [3.0 1.0 5.0 2.0 7.0 4.0 9.0 6.0 8.0])))
 (type (at (at (select {t: (top v 2) by: id from: Tq8f}) 't) 0)) -- 'F64
 ;; K > grp_cnt → cell shorter than K (matches standalone topk_take_vec)
-;; Tq8 group B has 2 rows {2,7}; K=3 → cell length 2
-(count (at (at (select {t: (top v3 3) by: id6 from: Tq8}) 't) 1)) -- 2
-;; K=1 → 1-element cell, equivalent to (max v3) wrapped in a vec
-(at (at (select {t: (top v3 1) by: id6 from: Tq8}) 't) 0) -- [5]
+;; Tq8 group B has 2 rows {2,7}; K=3 → cell length 2.  by-group order is
+;; unspecified, so pin group B with where: instead of a fixed index.
+(count (at (at (select {t: (top v3 3) by: id6 where: (== id6 'B) from: Tq8}) 't) 0)) -- 2
+;; K=1 → 1-element cell, equivalent to (max v3) wrapped in a vec.
+;; Pin group A (max {3,1,5} = 5) rather than indexing position 0.
+(at (at (select {t: (top v3 1) by: id6 where: (== id6 'A) from: Tq8}) 't) 0) -- [5]
 
 ;; ─── Composite-key correctness regression for the atom_eq fix ─────
 ;;

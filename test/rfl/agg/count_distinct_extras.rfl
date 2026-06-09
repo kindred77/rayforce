@@ -87,12 +87,14 @@
 ;; 9) Spot-check a single-group count to confirm distinct-counting
 ;;    semantics on the I32 serial arm (not just row count).
 ;;    Group 0 sees rows 0 and 51000 → v = 0 and 51000%7 = 5 → 2 distinct.
-(at (at (select {n: (count (distinct v)) from: Tcd-i32 by: g}) 'n) 0) -- 2
+;;    51000 groups in unspecified order, so pin g==0 with where:.
+(at (at (select {n: (count (distinct v)) from: Tcd-i32 by: g where: (== g 0)}) 'n) 0) -- 2
 
 ;; 10) Spot-check the F64 arm — group 0 sees rows 0 & 51000; both v=0.0
 ;;     (51000 % 6 == 0), so a single distinct value.  Confirms the F64
 ;;     arm's NaN / -0.0 normalisation doesn't blow up on plain 0.0.
-(at (at (select {n: (count (distinct v)) from: Tcd-f64 by: g}) 'n) 0) -- 1
+;;     51000 groups in unspecified order, so pin g==0 with where:.
+(at (at (select {n: (count (distinct v)) from: Tcd-f64 by: g where: (== g 0)}) 'n) 0) -- 1
 
 ;; ────────── has_nulls fallback (group.c L1204-1227) ──────────
 ;; Build a null-bearing I64 column: cast a small null-bearing prefix
