@@ -1654,7 +1654,7 @@ extern ray_runtime_t* __RUNTIME;
 
 /* fp_expr_const_str: LIKE on a SYM column with a string-literal pattern
  * should be recognised by the planner gate (returns 1).  Exercises the
- * `expr->type == -RAY_STR && !RAY_ATTR_NAME` base case of the recursive
+ * `expr->type == -RAY_STR && !ATTR_QUOTED` base case of the recursive
  * walker. */
 static test_result_t test_fp_expr_const_str_simple_like(void) {
     ray_runtime_create(0, NULL);
