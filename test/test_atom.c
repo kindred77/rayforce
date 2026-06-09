@@ -465,7 +465,7 @@ static test_result_t test_atom_typed_null_f64(void) {
     TEST_ASSERT_TRUE(ray_is_atom(v));
     TEST_ASSERT_EQ_I(v->type, -RAY_F64);
     TEST_ASSERT_TRUE(v->f64 != v->f64);          /* NaN by IEEE-754 */
-    TEST_ASSERT_TRUE((v->aux[0] & 1) != 0);  /* bitmap bit also set */
+    TEST_ASSERT_TRUE((v->aux[0] & 1) != 0);  /* typed-null bit also set */
     ray_release(v);
     PASS();
 }

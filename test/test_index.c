@@ -1084,7 +1084,7 @@ static test_result_t test_index_retain_payload_direct(void) {
 /* ─── ray_index_release_saved / retain_saved are no-ops ────────────── *
  *
  * Index attachment is restricted to numeric vector types (see
- * prepare_attach), so saved_nullmap never carries owned ray_t* refs.
+ * prepare_attach), so saved_aux never carries owned ray_t* refs.
  * The functions are kept for call-site symmetry but do nothing.  These
  * tests verify the no-op contract: calling them on a fully populated
  * ix struct must not touch refcounts on whatever pointers happen to
@@ -1102,9 +1102,9 @@ static test_result_t test_index_release_saved_noop(void) {
     ix.kind = RAY_IDX_ZONE;
     ix.parent_type = RAY_I64;
     ix.saved_attrs = 0;
-    /* Put a real pointer into saved_nullmap[8..15] — if the function
+    /* Put a real pointer into saved_aux[8..15] — if the function
      * were not a no-op it would try to release it and drop the rc. */
-    memcpy(&ix.saved_nullmap[8], &victim, sizeof(victim));
+    memcpy(&ix.saved_aux[8], &victim, sizeof(victim));
 
     ray_index_release_saved(&ix);
     TEST_ASSERT_EQ_U(victim->rc, rc_before);
@@ -1126,7 +1126,7 @@ static test_result_t test_index_retain_saved_noop(void) {
     ix.kind = RAY_IDX_ZONE;
     ix.parent_type = RAY_I64;
     ix.saved_attrs = 0;
-    memcpy(&ix.saved_nullmap[8], &victim, sizeof(victim));
+    memcpy(&ix.saved_aux[8], &victim, sizeof(victim));
 
     ray_index_retain_saved(&ix);
     TEST_ASSERT_EQ_U(victim->rc, rc_before);
