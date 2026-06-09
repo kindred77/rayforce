@@ -316,10 +316,9 @@
 ;; where all null rows have idx < 128.  We need idx >= 128.
 ;; No rfl-level builder for OP_WINDOW exists, so we cannot directly
 ;; call window functions from rfl.  Instead exercise a parallel GROUP BY
-;; with nullable output at result row > 128: group.c:par_prepare_nullmap
-;; is called on result vecs > 128 rows.  When the group output is large
-;; (> 128 distinct keys) and the agg key column has nulls, par_set_null
-;; at rows >= 128 in the output fires.
+;; with nullable output at result row > 128.  When the group output is
+;; large (> 128 distinct keys) and the agg value column has nulls,
+;; par_set_null at rows >= 128 in the output fires.
 ;;
 ;; Strategy: a table with 200 distinct keys (so output is 200 rows)
 ;; where the aggregated value column has nulls — group.c produces a
@@ -338,11 +337,13 @@
 ;; For par_set_null with idx >= 128 in a window context we need to
 ;; trigger it from window.c.  Since we can't call window ops from rfl,
 ;; we rely on the C-level test_window.c to cover that.  The remaining
-;; coverage goal here is group.c's par_prepare_nullmap when output > 128.
+;; coverage goal here is group.c's par_set_null / par_finalize_nulls
+;; when output > 128.
 
-;; par_prepare_nullmap: group with > 128 distinct keys.
-;; Any GROUP BY with > 128 output groups calls par_prepare_nullmap(vec)
-;; where vec->len > 128, which exercises the body (lines 974-978).
+;; par_finalize_nulls: group with > 128 distinct keys.
+;; Any GROUP BY with > 128 output groups produces a result column with
+;; len > 128, so par_finalize_nulls runs over the >128-row output (and
+;; par_set_null fires for any null agg cell at rows >= 128).
 (set BG (table [k v] (list (til 200) (til 200))))
 (count (select {s: (sum v) from: BG by: k})) -- 200
 
@@ -350,11 +351,10 @@
 (at (at (select {s: (sum v) from: BG by: k asc: k}) 's) 0) -- 0
 (at (at (select {s: (sum v) from: BG by: k asc: k}) 's) 199) -- 199
 
-;; Another 200-key GROUP BY exercises the par_prepare_nullmap ext nullmap path
+;; Another 200-key GROUP BY exercises the ext nullmap path
 ;; (par_finalize_nulls checks the ext bits).  Sum over v with a null — sum
 ;; always returns a value (identity 0 for null rows), so the result is non-null.
-;; This exercises par_prepare_nullmap body and par_finalize_nulls for the
-;; 200-group output column.
+;; This exercises par_finalize_nulls for the 200-group output column.
 (set BN (table [k v] (list (til 200) (concat [0Nl] (til 199)))))
 (count (select {s: (sum v) from: BN by: k})) -- 200
 ;; key=0 has v=null → sum returns 0 (identity); key=199 has v=198
