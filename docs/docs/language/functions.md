@@ -319,7 +319,7 @@ Cross-temporal comparisons are supported: dates, times, and timestamps are all c
 | `try` | binary, special | Error handling (expr handler) | `(try (/ 1 0) (fn [e] 0))` |
 | `raise` | unary | Throw an error | `(raise "bad input")` |
 | `return` | variadic | Early return from compiled lambda (0 args → null) | `(return 42)` |
-| `quote` | variadic, special | Return argument unevaluated | `(quote (+ 1 2))` → `(+ 1 2)` |
+| `quote` | variadic, special | Return argument unevaluated; a bare name becomes a literal symbol (`(quote x)` ≡ `'x`) | `(quote (+ 1 2))` → `(+ 1 2)` |
 | `resolve` | variadic, special | Resolve a symbol in current scope | `(resolve 'x)` |
 
 ## System & Utility

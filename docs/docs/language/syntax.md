@@ -203,7 +203,10 @@ The single quote `'` prevents evaluation, creating a symbol atom. Useful for col
 ```lisp
 'price            ; symbol, not a variable lookup
 (quote (+ 1 2))   ; returns the unevaluated list (+ 1 2)
+(quote price)     ; a bare name becomes a literal symbol, equal to 'price
 ```
+
+`quote` returns its argument unevaluated. When the argument is a bare name, the result is a literal symbol — `(quote name)` is equivalent to the tick form `'name`. Such a literal symbol that names a from-table column resolves to that column during query evaluation (see [IPC](../storage/ipc.md) for the dynamic-query idiom).
 
 ## Comments
 
