@@ -44,11 +44,12 @@
 ;; AND / OR / NOT composites
 (count (select {from: T where: (and (> i 3) (< i 8))})) -- 4
 (sum (at (select {from: T where: (and (> i 3) (< i 8))}) 'i)) -- 22
-;; B3 Part 2 collision: T has a column named `b`, so the literal `'b`
-;; inside this query resolves to that (boolean) column, not the symbol
-;; `b`.  `(== s 'b)` then compares the SYM column against the BOOL column
-;; and matches no rows, so only the `(== s 'a)` arm contributes — `'a` is a
-;; literal here too, but T has no column `a`, so it stays the symbol `a`.
+;; B3 Part 2 in-query collision rule: a literal `'col` that names a
+;; from-table column resolves to that column.  `'a` and `'c` name no column
+;; of T, so they stay literal symbols.  `'b` DOES name a column (the bool
+;; column `b`), so `(== s 'b)` compares the SYM column `s` against the BOOL
+;; column `b` — those never compare equal, contributing 0 rows.  The OR thus
+;; reduces to its `(== s 'a)` arm: rows where `s == 'a` → count 4, sum(i) 22.
 (count (select {from: T where: (or (== s 'a) (== s 'b))})) -- 4
 (sum (at (select {from: T where: (or (== s 'a) (== s 'b))}) 'i)) -- 22
 (count (select {from: T where: (not (== s 'c))})) -- 7

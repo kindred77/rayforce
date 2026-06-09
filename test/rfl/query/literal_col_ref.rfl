@@ -37,3 +37,20 @@
 ;; project the `price` COLUMN (because 'price is a literal, column-scoped),
 ;; never the formal value 999.0.
 (at (select {o: ((fn [price] 'price) 999.0) from: Tlit}) 'o) -- [10.0 20.0 30.0]
+
+;; --- regression: count-select fast path must agree with materialised select.
+;; T2 has both a SYM column `s` and a BOOL column `b`.  `'b` names a column,
+;; so inside the query `(== s 'b)` compares the sym column against the bool
+;; column (0 matches) — the in-query collision rule.  The count fast path
+;; (try_count_simple_compare) and the materialised path MUST return the same
+;; value; pin BOTH to 0 so a future divergence fails the suite.
+(set T2 (table [s b] (list ['a 'b 'c 'a] [true false true false])))
+(count (select {from: T2 where: (== s 'b)})) -- 0
+(set R2 (select {from: T2 where: (== s 'b)}))
+(count R2) -- 0
+
+;; --- regression: a literal `by:` symbol naming NO column must produce a
+;; clean column-not-found error (domain) — the SAME as a bare `by: nonexistent`
+;; — never a UBSan crash from ray_elem_size on a literal symbol.
+(select {n: (count price) from: Tlit by: 'nope}) !- domain
+(select {n: (count price) from: Tlit by: nope}) !- domain
