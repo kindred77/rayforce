@@ -1,0 +1,27 @@
+;; map must materialise a LAZY result from its lambda before collecting it.
+;; distinct/count/reverse of a concrete vec return a lazy node; if the lambda
+;; body produces one (e.g. (count (distinct x))), map used to collect the
+;; unforced lazy into its result LIST, so any downstream consumer that does
+;; not force per element (sum, ==, +) hit an unmaterialised node ("?"/nyi).
+;; ray_map_fn now forces lazy results, so the LIST holds concrete values.
+
+;; ─── count(distinct) in a map lambda — the reported case ─────────────
+(sum (map (fn [_] (count (distinct [1 2 2 3]))) (til 3)))   -- 9
+(sum (map (fn [_] (count (distinct [1 2 3 4 5]))) (til 2))) -- 10
+;; the collected results are concrete i64, usable element-wise
+(set Lm (map (fn [_] (count (distinct [1 2 3]))) (til 3)))
+(+ 0 Lm)            -- [3 3 3]
+(== Lm [3 3 3])     -- [true true true]
+(type (at Lm 1))    -- 'i64
+
+;; ─── other lazy-returning ops in a map lambda ───────────────────────
+;; distinct of a vec is lazy too; the result list holds materialised vecs.
+(sum (map (fn [_] (sum (distinct [1 2 2 3 3]))) (til 2)))   -- 12
+;; reverse is lazy; first-of-reverse per element
+(sum (map (fn [_] (first (reverse [10 20 30]))) (til 3)))  -- 90
+
+;; ─── binary map (map fn val vec) forces results too ─────────────────
+(sum (map (fn [a x] (count (distinct [a x a]))) 7 [1 2 3])) -- 6
+
+;; ─── plain (non-lazy) map results unaffected ────────────────────────
+(sum (map (fn [_] (count [1 2 3])) (til 3)))                -- 9
