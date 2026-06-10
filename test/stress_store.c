@@ -187,8 +187,6 @@ static ray_t* build_table_from_rows(const stress_rows_t* rows) {
 /* Extract a loaded table's content into a plain row array, resolving sym
  * IDs to strings through the CURRENT global sym table.  Returns false on
  * structural problems (wrong cols, unresolvable sym). */
-/* used by later tasks */
-__attribute__((unused))
 static bool extract_rows(stress_ctx_t* c, ray_t* tbl, stress_rows_t* out) {
     if (!tbl || RAY_IS_ERR(tbl)) return false;
     if (ray_table_ncols(tbl) != 3) {
@@ -312,6 +310,108 @@ bool stress_seed_initial(stress_ctx_t* c, int64_t live_rows, int nparts,
     }
     c->nparts = nparts;
     return true;
+}
+
+/* ---- destructive ops -------------------------------------------------------
+ * Pattern for every op: load the CURRENT disk state, extract it to a plain
+ * row array, apply the mutation to that array, rebuild + save.  The shadow
+ * gets the same logical mutation applied independently.  Because the real
+ * side starts from disk (not from the shadow), disk corruption propagates
+ * and is caught at the next compare. */
+
+/* Shared tail: extract dir -> mutate via cb -> save.  rows passed to cb is
+ * the extracted DISK content. */
+typedef bool (*mutate_cb_t)(stress_ctx_t* c, stress_rows_t* rows, void* arg);
+
+static bool mutate_dir(stress_ctx_t* c, const char* dir, bool use_mmap,
+                       bool bulk, mutate_cb_t cb, void* arg) {
+    ray_t* tbl = load_dir(c, dir, use_mmap);
+    if (!tbl || RAY_IS_ERR(tbl)) {
+        op_logf(c, "mutate: load %s failed (%s)", dir,
+                tbl ? ray_err_code(tbl) : "null");
+        if (tbl) ray_release(tbl);
+        return false;
+    }
+    stress_rows_t disk = {0};
+    bool ok = extract_rows(c, tbl, &disk);
+    ray_release(tbl);
+    if (ok) ok = cb(c, &disk, arg);
+    if (ok) ok = save_rows(c, dir, &disk, bulk);
+    rows_free(&disk);
+    return ok;
+}
+
+/* -- insert -- */
+
+typedef struct {
+    const stress_row_t* rows;
+    int64_t             n;
+} insert_arg_t;
+
+static bool cb_insert(stress_ctx_t* c, stress_rows_t* disk, void* a) {
+    (void)c;
+    insert_arg_t* arg = (insert_arg_t*)a;
+    for (int64_t i = 0; i < arg->n; i++)
+        if (!rows_append(disk, &arg->rows[i])) return false;
+    return true;
+}
+
+bool stress_op_insert(stress_ctx_t* c, int64_t n, stress_sym_pattern_t pat,
+                      bool bulk, bool via_mmap) {
+    op_logf(c, "insert n=%lld pat=%d bulk=%d mmap=%d", (long long)n, (int)pat,
+            (int)bulk, (int)via_mmap);
+    stress_row_t* fresh =
+        (stress_row_t*)malloc((size_t)n * sizeof(stress_row_t));
+    if (!fresh) return false;
+    for (int64_t i = 0; i < n; i++) gen_row(c, pat, &fresh[i]);
+
+    char dir[512];
+    live_dir(c, dir, sizeof(dir));
+    insert_arg_t arg = { fresh, n };
+    bool ok = mutate_dir(c, dir, via_mmap, bulk, cb_insert, &arg);
+    if (ok)
+        for (int64_t i = 0; i < n; i++)
+            if (!rows_append(&c->live, &fresh[i])) { ok = false; break; }
+    free(fresh);
+    return ok;
+}
+
+/* -- upsert: keyed on ticker; last matching row updated, else append -- */
+
+/* Returns index of last row whose ticker matches, or -1. */
+static int64_t find_last_by_ticker(const stress_rows_t* rows,
+                                   const char* ticker) {
+    for (int64_t i = rows->len - 1; i >= 0; i--)
+        if (strcmp(rows->rows[i].ticker, ticker) == 0) return i;
+    return -1;
+}
+
+static bool cb_upsert(stress_ctx_t* c, stress_rows_t* disk, void* a) {
+    (void)c;
+    const stress_row_t* row = (const stress_row_t*)a;
+    int64_t hit = find_last_by_ticker(disk, row->ticker);
+    if (hit >= 0) {
+        disk->rows[hit] = *row;
+        return true;
+    }
+    return rows_append(disk, row);
+}
+
+bool stress_op_upsert(stress_ctx_t* c, stress_sym_pattern_t pat,
+                      bool via_mmap) {
+    stress_row_t row;
+    gen_row(c, pat, &row);
+    op_logf(c, "upsert ticker=%s pat=%d mmap=%d", row.ticker, (int)pat,
+            (int)via_mmap);
+    char dir[512];
+    live_dir(c, dir, sizeof(dir));
+    if (!mutate_dir(c, dir, via_mmap, false, cb_upsert, &row)) return false;
+    int64_t hit = find_last_by_ticker(&c->live, row.ticker);
+    if (hit >= 0) {
+        c->live.rows[hit] = row;
+        return true;
+    }
+    return rows_append(&c->live, &row);
 }
 
 /* ---- verification ---------------------------------------------------------

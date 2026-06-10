@@ -89,9 +89,59 @@ static test_result_t test_verify_detects_divergence(void) {
     PASS();
 }
 
+static const stress_sym_pattern_t k_patterns[] = {
+    STRESS_SYMS_NEW, STRESS_SYMS_EXISTING, STRESS_SYMS_MIXED,
+    STRESS_SYMS_NULLS,
+};
+#define NPATTERNS (sizeof(k_patterns) / sizeof(k_patterns[0]))
+
+/* insert x {patterns} x {durable,bulk} x {heap,mmap load}, verify after
+ * every combination through both reload paths. */
+static test_result_t test_matrix_insert(void) {
+    stress_ctx_t c;
+    TEST_ASSERT(stress_init(&c, STRESS_DB, 100), "init");
+    TEST_ASSERT(stress_seed_initial(&c, 64, 2, 32), "seed");
+    for (size_t p = 0; p < NPATTERNS; p++)
+        for (int bulk = 0; bulk <= 1; bulk++)
+            for (int mm = 0; mm <= 1; mm++) {
+                TEST_ASSERT_FMT(stress_op_insert(&c, 16, k_patterns[p],
+                                                 bulk, mm),
+                                "insert pat=%zu bulk=%d mmap=%d", p, bulk, mm);
+                TEST_ASSERT_FMT(stress_verify_all(&c, false),
+                                "verify(heap) after pat=%zu bulk=%d mmap=%d",
+                                p, bulk, mm);
+                TEST_ASSERT_FMT(stress_verify_all(&c, true),
+                                "verify(mmap) after pat=%zu bulk=%d mmap=%d",
+                                p, bulk, mm);
+            }
+    stress_destroy(&c);
+    PASS();
+}
+
+/* upsert x {patterns} x {heap,mmap}, many repetitions so both the update
+ * and the append arm are taken. */
+static test_result_t test_matrix_upsert(void) {
+    stress_ctx_t c;
+    TEST_ASSERT(stress_init(&c, STRESS_DB, 101), "init");
+    TEST_ASSERT(stress_seed_initial(&c, 64, 2, 32), "seed");
+    for (size_t p = 0; p < NPATTERNS; p++)
+        for (int mm = 0; mm <= 1; mm++)
+            for (int rep = 0; rep < 8; rep++) {
+                TEST_ASSERT_FMT(stress_op_upsert(&c, k_patterns[p], mm),
+                                "upsert pat=%zu mmap=%d rep=%d", p, mm, rep);
+                TEST_ASSERT_FMT(stress_verify_all(&c, rep & 1),
+                                "verify after upsert pat=%zu mmap=%d rep=%d",
+                                p, mm, rep);
+            }
+    stress_destroy(&c);
+    PASS();
+}
+
 const test_entry_t stress_matrix_entries[] = {
     { "stress/fixture_roundtrip", test_fixture_roundtrip, stress_setup, stress_teardown },
     { "stress/verify_clean",             test_verify_clean,             stress_setup, stress_teardown },
     { "stress/verify_detects_divergence", test_verify_detects_divergence, stress_setup, stress_teardown },
+    { "stress/matrix_insert", test_matrix_insert, stress_setup, stress_teardown },
+    { "stress/matrix_upsert", test_matrix_upsert, stress_setup, stress_teardown },
     { NULL, NULL, NULL, NULL },
 };
