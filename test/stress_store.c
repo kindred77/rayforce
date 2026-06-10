@@ -37,7 +37,6 @@ static void op_logf(stress_ctx_t* c, const char* fmt, ...) {
     c->oplog_len++;
 }
 
-__attribute__((unused)) /* used by later tasks */
 static void dump_failure(stress_ctx_t* c, const char* fmt, ...) {
     char why[512];
     va_list ap;
@@ -251,8 +250,6 @@ static bool save_rows(stress_ctx_t* c, const char* dir,
 }
 
 /* Load one splayed dir (heap or mmap) against the shared symfile. */
-/* used by later tasks */
-__attribute__((unused))
 static ray_t* load_dir(stress_ctx_t* c, const char* dir, bool use_mmap) {
     return use_mmap ? ray_read_splayed(dir, c->sym_path)
                     : ray_splay_load(dir, c->sym_path);
@@ -314,5 +311,131 @@ bool stress_seed_initial(stress_ctx_t* c, int64_t live_rows, int nparts,
         if (!save_rows(c, dir, &c->parts[p], false)) return false;
     }
     c->nparts = nparts;
+    return true;
+}
+
+/* ---- verification ---------------------------------------------------------
+ * Cell-by-cell compare of a loaded splayed dir against its shadow.  Tickers
+ * are compared as strings via ray_sym_find: find(shadow) == disk_id is
+ * equivalent to str(disk_id) == shadow (the intern table is a bijection),
+ * and catches enumeration shifts.  NaN price compares equal to NaN
+ * (NULL_F64). */
+
+static bool compare_dir(stress_ctx_t* c, const char* dir,
+                        const stress_rows_t* shadow, bool use_mmap,
+                        const char* label) {
+    ray_t* tbl = load_dir(c, dir, use_mmap);
+    if (!tbl || RAY_IS_ERR(tbl)) {
+        dump_failure(c, "%s: load failed (%s)", label,
+                     tbl ? ray_err_code(tbl) : "null");
+        if (tbl) ray_release(tbl);
+        return false;
+    }
+    if (ray_table_ncols(tbl) != 3 || ray_table_nrows(tbl) != shadow->len) {
+        dump_failure(c, "%s: shape %lldx%lld, expected %lldx3", label,
+                     (long long)ray_table_nrows(tbl),
+                     (long long)ray_table_ncols(tbl), (long long)shadow->len);
+        ray_release(tbl);
+        return false;
+    }
+    ray_t* tick  = ray_table_get_col_idx(tbl, 0);
+    ray_t* price = ray_table_get_col_idx(tbl, 1);
+    ray_t* qty   = ray_table_get_col_idx(tbl, 2);
+    if (!tick || !price || !qty || tick->len != shadow->len ||
+        price->len != shadow->len || qty->len != shadow->len) {
+        dump_failure(c, "%s: column lengths disagree with row count", label);
+        ray_release(tbl);
+        return false;
+    }
+    const void*    td = ray_data(tick);
+    const double*  pd = (const double*)ray_data(price);
+    const int64_t* qd = (const int64_t*)ray_data(qty);
+    for (int64_t i = 0; i < shadow->len; i++) {
+        const stress_row_t* ex = &shadow->rows[i];
+        int64_t disk_id = ray_read_sym(td, i, RAY_SYM, tick->attrs);
+        int64_t want_id = ray_sym_find(ex->ticker, strlen(ex->ticker));
+        if (disk_id != want_id) {
+            ray_t* s = ray_sym_str(disk_id); /* borrowed; may be NULL */
+            dump_failure(c,
+                "%s row %lld: ticker id %lld ('%.*s') != expected '%s' (id %lld)",
+                label, (long long)i, (long long)disk_id,
+                s ? (int)ray_str_len(s) : 1, s ? ray_str_ptr(s) : "?",
+                ex->ticker, (long long)want_id);
+            ray_release(tbl);
+            return false;
+        }
+        bool price_eq = (pd[i] == ex->price) ||
+                        (isnan(pd[i]) && isnan(ex->price));
+        if (!price_eq) {
+            dump_failure(c, "%s row %lld: price %g != expected %g", label,
+                         (long long)i, pd[i], ex->price);
+            ray_release(tbl);
+            return false;
+        }
+        if (qd[i] != ex->qty) {
+            dump_failure(c, "%s row %lld: qty %lld != expected %lld", label,
+                         (long long)i, (long long)qd[i], (long long)ex->qty);
+            ray_release(tbl);
+            return false;
+        }
+    }
+    ray_release(tbl);
+    return true;
+}
+
+/* Structural invariants on the shared symfile (raw file read, no API):
+ * magic, and count monotonically non-decreasing across the run. */
+bool stress_check_invariants(stress_ctx_t* c) {
+    FILE* f = fopen(c->sym_path, "rb");
+    if (!f) {
+        dump_failure(c, "invariant: symfile %s missing", c->sym_path);
+        return false;
+    }
+    uint32_t magic = 0;
+    int64_t  cnt   = -1;
+    size_t ok = fread(&magic, sizeof(magic), 1, f);
+    ok += fread(&cnt, sizeof(cnt), 1, f);
+    fclose(f);
+    if (ok != 2 || magic != 0x4C525453u) { /* "STRL" */
+        dump_failure(c, "invariant: symfile bad header (magic=0x%x)", magic);
+        return false;
+    }
+    if (cnt < c->last_sym_count) {
+        dump_failure(c, "invariant: symfile count shrank %lld -> %lld",
+                     (long long)c->last_sym_count, (long long)cnt);
+        return false;
+    }
+    if ((uint64_t)cnt > (uint64_t)ray_sym_count()) {
+        dump_failure(c, "invariant: symfile count %lld > in-memory %u",
+                     (long long)cnt, ray_sym_count());
+        return false;
+    }
+    c->last_sym_count = cnt;
+    return true;
+}
+
+bool stress_verify_all(stress_ctx_t* c, bool use_mmap) {
+    op_logf(c, "verify mmap=%d", (int)use_mmap);
+    if (!stress_check_invariants(c)) return false;
+    char dir[512];
+    live_dir(c, dir, sizeof(dir));
+    if (!compare_dir(c, dir, &c->live, use_mmap, "live")) return false;
+    for (int p = 0; p < c->nparts; p++) {
+        part_dir(c, p, dir, sizeof(dir));
+        char label[32];
+        snprintf(label, sizeof(label), "part[%s]", c->part_dates[p]);
+        if (!compare_dir(c, dir, &c->parts[p], use_mmap, label)) return false;
+    }
+    /* the parted loader itself must accept the mixed-layout root */
+    if (c->nparts > 0) {
+        ray_t* parted = ray_read_parted(c->db_root, "hist");
+        if (!parted || RAY_IS_ERR(parted)) {
+            dump_failure(c, "ray_read_parted failed (%s)",
+                         parted ? ray_err_code(parted) : "null");
+            if (parted) ray_release(parted);
+            return false;
+        }
+        ray_release(parted);
+    }
     return true;
 }
