@@ -562,6 +562,102 @@ static test_result_t test_domain_adopt_domain_refcount(void) {
     PASS();
 }
 
+/* ---- Phase 2 Task 2: pivot output-vec adoption --------------------------- */
+
+/* Pivot needs the full eval runtime, not just heap + sym table. */
+static ray_runtime_t* pvt_rt;
+static void domain_rt_setup(void)    { pvt_rt = ray_runtime_create(0, NULL); }
+static void domain_rt_teardown(void) { ray_runtime_destroy(pvt_rt); }
+
+/* A SYM index column carrying a FILE domain must hand that domain to the
+ * pivot output's index column (the output raw-copies cell ids, so it must
+ * resolve over the same dictionary).  Meaningful even pre-flip: col_vec_new
+ * attaches the runtime singleton, and only the adopt call at the pivot
+ * scatter site transfers the FILE-domain pointer. */
+static test_result_t test_domain_pivot_index_adopts(void) {
+    unlink(TMP_DOM_SYM_PATH);
+    unlink(TMP_DOM_SYM_PATH ".lk");
+
+    int64_t id_A = ray_sym_intern("pd_A", 4);
+    int64_t id_B = ray_sym_intern("pd_B", 4);
+    int64_t id_x = ray_sym_intern("pd_x", 4);
+    int64_t id_y = ray_sym_intern("pd_y", 4);
+    TEST_ASSERT_EQ_I(ray_sym_save(TMP_DOM_SYM_PATH), RAY_OK);
+
+    ray_sym_domain_t* dom = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    TEST_ASSERT_NOT_NULL(dom);
+
+    /* Index col 'a': manually attached to the FILE domain (positions
+     * coincide with global ids — the symfile was saved just above). */
+    ray_t* a = ray_sym_vec_new(RAY_SYM_W64, 4);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(a));
+    a->len = 4;
+    int64_t* ad = (int64_t*)ray_data(a);
+    ad[0] = id_A; ad[1] = id_A; ad[2] = id_B; ad[3] = id_B;
+    ray_sym_domain_retain(dom);
+    a->sym_domain = dom;
+
+    /* Pivot col 'c' and value col 'v' stay runtime-domain. */
+    ray_t* cv = ray_sym_vec_new(RAY_SYM_W64, 4);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(cv));
+    cv->len = 4;
+    int64_t* cd = (int64_t*)ray_data(cv);
+    cd[0] = id_x; cd[1] = id_y; cd[2] = id_x; cd[3] = id_y;
+    ray_t* v = ray_vec_new(RAY_I64, 4);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    v->len = 4;
+    int64_t* vd = (int64_t*)ray_data(v);
+    vd[0] = 1; vd[1] = 2; vd[2] = 3; vd[3] = 4;
+
+    ray_t* t = ray_table_new(3);
+    t = ray_table_add_col(t, ray_sym_intern("a", 1), a);
+    t = ray_table_add_col(t, ray_sym_intern("c", 1), cv);
+    t = ray_table_add_col(t, ray_sym_intern("v", 1), v);
+    ray_release(a); ray_release(cv); ray_release(v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+
+    int64_t tname = ray_sym_intern("pvtdom_t", 8);
+    TEST_ASSERT_EQ_I(ray_env_set(tname, t), RAY_OK);
+
+    ray_t* r = ray_eval_str("(pivot pvtdom_t ['a] 'c 'v sum)");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 2);
+
+    ray_t* out_a = ray_table_get_col(r, ray_sym_intern("a", 1));
+    TEST_ASSERT_NOT_NULL(out_a);
+    TEST_ASSERT_EQ_I(out_a->type, RAY_SYM);
+    /* The adoption under test: the output index col resolves over the
+     * SOURCE column's FILE domain, not the runtime singleton. */
+    TEST_ASSERT_EQ_PTR(ray_sym_vec_domain(out_a), dom);
+
+    /* And its cells resolve through that domain to the right strings. */
+    for (int64_t i = 0; i < 2; i++) {
+        ray_t* s = ray_sym_vec_cell(out_a, i);
+        TEST_ASSERT_NOT_NULL(s);
+        TEST_ASSERT_EQ_U(ray_str_len(s), 4);
+        TEST_ASSERT_TRUE(memcmp(ray_str_ptr(s), "pd_A", 4) == 0 ||
+                         memcmp(ray_str_ptr(s), "pd_B", 4) == 0);
+    }
+
+    ray_release(r);
+
+    /* Drop the env binding, our table ref, then the open ref: every
+     * FILE-domain ref must be back before teardown (fresh open proves the
+     * cache entry died; ASan flags any imbalance). */
+    ray_release(ray_eval_str("(set pvtdom_t 0)"));
+    ray_release(t);
+    ray_sym_domain_release(dom);
+
+    ray_sym_domain_t* d2 = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    TEST_ASSERT_NOT_NULL(d2);
+    ray_sym_domain_release(d2);
+
+    unlink(TMP_DOM_SYM_PATH);
+    unlink(TMP_DOM_SYM_PATH ".lk");
+    PASS();
+}
+
 /* ---- registration -------------------------------------------------------- */
 
 const test_entry_t domain_entries[] = {
@@ -578,5 +674,6 @@ const test_entry_t domain_entries[] = {
     { "domain/vec_cell_runtime_equiv",  test_domain_vec_cell_runtime_equiv,  domain_setup, domain_teardown },
     { "domain/vec_lookup_hit_miss",     test_domain_vec_lookup_hit_miss,     domain_setup, domain_teardown },
     { "domain/adopt_domain_refcount",   test_domain_adopt_domain_refcount,   domain_setup, domain_teardown },
+    { "domain/pivot_index_adopts",      test_domain_pivot_index_adopts,      domain_rt_setup, domain_rt_teardown },
     { NULL, NULL, NULL, NULL },
 };

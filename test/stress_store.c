@@ -179,7 +179,7 @@ static ray_t* build_table_from_rows(const stress_rows_t* rows) {
 }
 
 /* Extract a loaded table's content into a plain row array, resolving sym
- * IDs to strings through the CURRENT global sym table.  Returns false on
+ * IDs to strings through the column's domain.  Returns false on
  * structural problems (wrong cols, unresolvable sym). */
 static bool extract_rows(stress_ctx_t* c, ray_t* tbl, stress_rows_t* out) {
     if (!tbl || RAY_IS_ERR(tbl)) return false;
@@ -198,17 +198,15 @@ static bool extract_rows(stress_ctx_t* c, ray_t* tbl, stress_rows_t* out) {
         return false;
     }
     if (!rows_reserve(out, n)) return false;
-    const void*    td = ray_data(tick);
     const double*  pd = (const double*)ray_data(price);
     const int64_t* qd = (const int64_t*)ray_data(qty);
     for (int64_t i = 0; i < n; i++) {
         stress_row_t* r = &out->rows[i];
         memset(r, 0, sizeof(*r));
-        int64_t id = ray_read_sym(td, i, RAY_SYM, tick->attrs);
-        ray_t* s = ray_sym_str(id); /* borrowed, do not release */
+        ray_t* s = ray_sym_vec_cell(tick, i); /* borrowed, do not release */
         if (!s) {
-            op_logf(c, "extract: sym id %lld unresolvable at row %lld",
-                    (long long)id, (long long)i);
+            op_logf(c, "extract: sym unresolvable at row %lld",
+                    (long long)i);
             return false;
         }
         size_t len = ray_str_len(s);
