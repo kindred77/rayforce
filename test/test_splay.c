@@ -38,6 +38,7 @@
 #include "table/sym.h"
 #include <string.h>
 #include <stdio.h>
+#include <stddef.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <sys/stat.h>
@@ -1361,6 +1362,87 @@ static test_result_t test_ragged_columns_corrupt(void) {
     PASS();
 }
 
+/* =========================================================================
+ * 33. Untrusted disk attrs are masked: a crafted column file with runtime-
+ *     only attr bits (HAS_INDEX / HAS_LINK / SLICE) set and garbage in the
+ *     16 aux bytes must never make the loaders route aux as owned pointers
+ *     (ray_release_owned_refs would release attacker-controlled memory).
+ *     Both the buddy-copy loader (ray_splay_load) and the mmap loader
+ *     (ray_read_splayed) must either load cleanly with attrs masked, or
+ *     error — but never crash under ASan.
+ * ========================================================================= */
+static test_result_t test_untrusted_attrs_masked(void) {
+    const char* dir = TMP_SPLAY_BASE "/untrusted_attrs";
+    rm_rf(dir);
+
+    int64_t id_a = ray_sym_intern("a", 1);
+    int64_t raw[] = {7, 8, 9};
+    ray_t* col = ray_vec_from_raw(RAY_I64, raw, 3);
+    TEST_ASSERT_NOT_NULL(col);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, id_a, col);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    TEST_ASSERT_EQ_I(ray_splay_save(tbl, dir, NULL), RAY_OK);
+
+    /* Patch the on-disk header of column "a": garbage "pointer" bytes in
+     * the whole 16-byte aux slot + runtime-only attr bits.  Header layout
+     * (col.c): bytes 0-15 aux, 16 mmod, 17 order, 18 type, 19 attrs. */
+    {
+        char apath[512];
+        snprintf(apath, sizeof(apath), "%s/a", dir);
+        FILE* f = fopen(apath, "rb+");
+        TEST_ASSERT_NOT_NULL(f);
+        uint8_t garbage[16];
+        memset(garbage, 0xA5, sizeof(garbage)); /* invalid non-NULL ptr bytes */
+        TEST_ASSERT_EQ_I(fseek(f, 0, SEEK_SET), 0);
+        TEST_ASSERT_EQ_I(fwrite(garbage, 1, 16, f), 16);
+        long attrs_off = (long)offsetof(ray_t, attrs);
+        TEST_ASSERT_EQ_I(fseek(f, attrs_off, SEEK_SET), 0);
+        uint8_t attrs = 0;
+        TEST_ASSERT_EQ_I(fread(&attrs, 1, 1, f), 1);
+        attrs |= RAY_ATTR_HAS_INDEX | RAY_ATTR_HAS_LINK | RAY_ATTR_SLICE;
+        TEST_ASSERT_EQ_I(fseek(f, attrs_off, SEEK_SET), 0);
+        TEST_ASSERT_EQ_I(fwrite(&attrs, 1, 1, f), 1);
+        fclose(f);
+    }
+
+    const uint8_t runtime_bits =
+        RAY_ATTR_HAS_INDEX | RAY_ATTR_HAS_LINK | RAY_ATTR_SLICE;
+
+    /* Buddy-copy loader path */
+    ray_t* loaded = ray_splay_load(dir, NULL);
+    TEST_ASSERT_NOT_NULL(loaded);
+    if (!RAY_IS_ERR(loaded)) {
+        ray_t* la = ray_table_get_col(loaded, id_a); /* borrowed */
+        TEST_ASSERT_NOT_NULL(la);
+        TEST_ASSERT_EQ_I(la->attrs & runtime_bits, 0);
+        int64_t* d = (int64_t*)ray_data(la);
+        TEST_ASSERT_EQ_I(d[0], 7);
+        TEST_ASSERT_EQ_I(d[1], 8);
+        TEST_ASSERT_EQ_I(d[2], 9);
+        ray_release(loaded); /* must not release garbage aux pointers */
+    }
+
+    /* mmap loader path */
+    ray_t* mloaded = ray_read_splayed(dir, NULL);
+    TEST_ASSERT_NOT_NULL(mloaded);
+    if (!RAY_IS_ERR(mloaded)) {
+        ray_t* la = ray_table_get_col(mloaded, id_a); /* borrowed */
+        TEST_ASSERT_NOT_NULL(la);
+        TEST_ASSERT_EQ_I(la->attrs & runtime_bits, 0);
+        int64_t* d = (int64_t*)ray_data(la);
+        TEST_ASSERT_EQ_I(d[0], 7);
+        TEST_ASSERT_EQ_I(d[1], 8);
+        TEST_ASSERT_EQ_I(d[2], 9);
+        ray_release(mloaded);
+    }
+
+    ray_release(col);
+    ray_release(tbl);
+    rm_rf(dir);
+    PASS();
+}
+
 /* ---- Suite definition -------------------------------------------------- */
 
 const test_entry_t splay_entries[] = {
@@ -1394,5 +1476,6 @@ const test_entry_t splay_entries[] = {
     { "splay/torn_write_heals",           test_torn_write_heals,                splay_setup, splay_teardown },
     { "splay/nested_sym_list_symfile",    test_nested_sym_list_symfile,         splay_setup, splay_teardown },
     { "splay/ragged_columns_corrupt",     test_ragged_columns_corrupt,          splay_setup, splay_teardown },
+    { "splay/untrusted_attrs_masked",     test_untrusted_attrs_masked,          splay_setup, splay_teardown },
     { NULL, NULL, NULL, NULL },
 };
