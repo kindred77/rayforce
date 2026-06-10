@@ -483,11 +483,17 @@ bool stress_op_part_new(stress_ctx_t* c, int64_t n, stress_sym_pattern_t pat) {
     stress_row_t row;
     for (int64_t i = 0; i < n; i++) {
         gen_row(c, pat, &row);
-        if (!rows_append(&c->parts[p], &row)) return false;
+        if (!rows_append(&c->parts[p], &row)) {
+            rows_free(&c->parts[p]);
+            return false;
+        }
     }
     char dir[512];
     part_dir(c, p, dir, sizeof(dir));
-    if (!save_rows(c, dir, &c->parts[p], false)) return false;
+    if (!save_rows(c, dir, &c->parts[p], false)) {
+        rows_free(&c->parts[p]);
+        return false;
+    }
     c->nparts = p + 1;
     return true;
 }
