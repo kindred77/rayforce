@@ -74,8 +74,6 @@ static bool rows_append(stress_rows_t* r, const stress_row_t* row) {
     return true;
 }
 
-/* used by later tasks */
-__attribute__((unused))
 static void rows_trim(stress_rows_t* r, bool tail, int64_t n) {
     if (n > r->len) n = r->len;
     if (!tail)
@@ -412,6 +410,86 @@ bool stress_op_upsert(stress_ctx_t* c, stress_sym_pattern_t pat,
         return true;
     }
     return rows_append(&c->live, &row);
+}
+
+/* -- trim: drop head/tail n rows of live (-1) or a partition -- */
+
+typedef struct {
+    bool    tail;
+    int64_t n;
+} trim_arg_t;
+
+static bool cb_trim(stress_ctx_t* c, stress_rows_t* disk, void* a) {
+    (void)c;
+    trim_arg_t* t = (trim_arg_t*)a;
+    rows_trim(disk, t->tail, t->n);
+    return true;
+}
+
+bool stress_op_trim(stress_ctx_t* c, int part_idx, bool tail, int64_t n) {
+    op_logf(c, "trim part=%d tail=%d n=%lld", part_idx, (int)tail,
+            (long long)n);
+    char dir[512];
+    stress_rows_t* shadow;
+    if (part_idx < 0) {
+        live_dir(c, dir, sizeof(dir));
+        shadow = &c->live;
+    } else {
+        if (part_idx >= c->nparts) return false;
+        part_dir(c, part_idx, dir, sizeof(dir));
+        shadow = &c->parts[part_idx];
+    }
+    trim_arg_t t = { tail, n };
+    if (!mutate_dir(c, dir, false, false, cb_trim, &t)) return false;
+    rows_trim(shadow, tail, n);
+    return true;
+}
+
+/* -- parted append: add rows to an existing partition -- */
+
+bool stress_op_part_append(stress_ctx_t* c, int part_idx, int64_t n,
+                           stress_sym_pattern_t pat) {
+    if (part_idx < 0 || part_idx >= c->nparts) return false;
+    stress_row_t* fresh =
+        (stress_row_t*)malloc((size_t)n * sizeof(stress_row_t));
+    if (!fresh) return false;
+    op_logf(c, "part_append part=%d n=%lld pat=%d", part_idx, (long long)n,
+            (int)pat);
+    for (int64_t i = 0; i < n; i++) gen_row(c, pat, &fresh[i]);
+
+    char dir[512];
+    part_dir(c, part_idx, dir, sizeof(dir));
+    insert_arg_t arg = { fresh, n };
+    bool ok = mutate_dir(c, dir, false, false, cb_insert, &arg);
+    if (ok)
+        for (int64_t i = 0; i < n; i++)
+            if (!rows_append(&c->parts[part_idx], &fresh[i])) {
+                ok = false;
+                break;
+            }
+    free(fresh);
+    return ok;
+}
+
+/* -- new partition: next sequential date dir -- */
+
+bool stress_op_part_new(stress_ctx_t* c, int64_t n, stress_sym_pattern_t pat) {
+    if (c->nparts >= STRESS_MAX_PARTS) return true; /* fixture full: no-op */
+    int p = c->nparts;
+    snprintf(c->part_dates[p], sizeof(c->part_dates[p]), "2024.01.%02d",
+             (p + 1) % 100); /* % keeps -Wformat-truncation provably in range */
+    op_logf(c, "part_new date=%s n=%lld pat=%d", c->part_dates[p],
+            (long long)n, (int)pat);
+    stress_row_t row;
+    for (int64_t i = 0; i < n; i++) {
+        gen_row(c, pat, &row);
+        if (!rows_append(&c->parts[p], &row)) return false;
+    }
+    char dir[512];
+    part_dir(c, p, dir, sizeof(dir));
+    if (!save_rows(c, dir, &c->parts[p], false)) return false;
+    c->nparts = p + 1;
+    return true;
 }
 
 /* ---- verification ---------------------------------------------------------

@@ -166,11 +166,68 @@ static test_result_t test_matrix_upsert(void) {
     return r;
 }
 
+/* trim head/tail on live and on every partition, interleaved with verifies.
+ * Also trims to empty and rebuilds, covering the zero-row save/load edge. */
+static test_result_t test_matrix_trim_impl(stress_ctx_t* c) {
+    TEST_ASSERT(stress_seed_initial(c, 64, 3, 32), "seed");
+    for (int target = -1; target < 3; target++)
+        for (int tail = 0; tail <= 1; tail++) {
+            TEST_ASSERT_FMT(stress_op_trim(c, target, tail, 5),
+                            "trim target=%d tail=%d", target, tail);
+            TEST_ASSERT_FMT(stress_verify_all(c, tail),
+                            "verify after trim target=%d tail=%d", target,
+                            tail);
+        }
+    /* trim live to empty, verify, then refill */
+    TEST_ASSERT(stress_op_trim(c, -1, false, 1000000), "trim to empty");
+    TEST_ASSERT(stress_verify_all(c, false), "verify empty live");
+    TEST_ASSERT(stress_op_insert(c, 32, STRESS_SYMS_MIXED, false, false),
+                "refill");
+    TEST_ASSERT(stress_verify_all(c, true), "verify refilled");
+    PASS();
+}
+
+static test_result_t test_matrix_trim(void) {
+    stress_ctx_t c;
+    TEST_ASSERT(stress_init(&c, STRESS_DB, 102), "init");
+    test_result_t r = test_matrix_trim_impl(&c);
+    stress_destroy(&c);
+    return r;
+}
+
+/* partition append + new-partition growth across patterns; the parted
+ * loader must keep accepting the root after every change. */
+static test_result_t test_matrix_parted_ops_impl(stress_ctx_t* c) {
+    TEST_ASSERT(stress_seed_initial(c, 32, 2, 32), "seed");
+    for (size_t p = 0; p < NPATTERNS; p++) {
+        TEST_ASSERT_FMT(stress_op_part_append(c, (int)(p % 2), 16,
+                                              k_patterns[p]),
+                        "part_append pat=%zu", p);
+        TEST_ASSERT_FMT(stress_verify_all(c, p & 1),
+                        "verify after part_append pat=%zu", p);
+        TEST_ASSERT_FMT(stress_op_part_new(c, 24, k_patterns[p]),
+                        "part_new pat=%zu", p);
+        TEST_ASSERT_FMT(stress_verify_all(c, !(p & 1)),
+                        "verify after part_new pat=%zu", p);
+    }
+    PASS();
+}
+
+static test_result_t test_matrix_parted_ops(void) {
+    stress_ctx_t c;
+    TEST_ASSERT(stress_init(&c, STRESS_DB, 103), "init");
+    test_result_t r = test_matrix_parted_ops_impl(&c);
+    stress_destroy(&c);
+    return r;
+}
+
 const test_entry_t stress_matrix_entries[] = {
     { "stress/fixture_roundtrip", test_fixture_roundtrip, stress_setup, stress_teardown },
     { "stress/verify_clean",             test_verify_clean,             stress_setup, stress_teardown },
     { "stress/verify_detects_divergence", test_verify_detects_divergence, stress_setup, stress_teardown },
     { "stress/matrix_insert", test_matrix_insert, stress_setup, stress_teardown },
     { "stress/matrix_upsert", test_matrix_upsert, stress_setup, stress_teardown },
+    { "stress/matrix_trim",       test_matrix_trim,       stress_setup, stress_teardown },
+    { "stress/matrix_parted_ops", test_matrix_parted_ops, stress_setup, stress_teardown },
     { NULL, NULL, NULL, NULL },
 };
