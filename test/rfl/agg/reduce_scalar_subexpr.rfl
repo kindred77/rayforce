@@ -1,0 +1,36 @@
+;; A reduction applied to a SCALAR sub-expression — (sum (max v)),
+;; (sum (count (distinct v))), (sum (sum v)) — compiles to a DAG whose
+;; reduction input materialises to an atom.  exec_reduction used to reject
+;; that atom with a type error while the direct scalar form ((sum 6))
+;; accepted it — a scalar<->DAG divergence.  exec_reduction's atom branch now
+;; delegates to the scalar builtins, so the two forms agree.
+
+;; ─── reduction of a scalar reduction ─────────────────────────────────
+(sum (max [1 2 3]))        -- 3
+(sum (min [3 1 2]))        -- 1
+(sum (first [5 6 7]))      -- 5
+(sum (last [5 6 7]))       -- 7
+(sum (sum [1 2 3]))        -- 6
+(max (sum [1 2 3]))        -- 6
+(min (max [10 20 30]))     -- 30
+(avg (max [1 2 3]))        -- 3.0
+(avg (sum [2 4 6]))        -- 12.0
+(first (sum [1 2 3]))      -- 6
+(last (max [4 5 6]))       -- 6
+
+;; ─── reduction of count(distinct) ────────────────────────────────────
+(sum (count (distinct [1 2 2 3 3 3]))) -- 3
+(max (count (distinct [1 1 1])))       -- 1
+(avg (count (distinct [5 6 7 8])))     -- 4.0
+
+;; ─── scalar<->DAG parity: the reduction-of-scalar equals the scalar ──
+;; (sum (max v)) must equal (max v); a single SYM atom reduces to itself,
+;; matching the scalar builtin (sum 'c) == 'c.
+(== (sum (max [1 2 3])) (max [1 2 3]))        -- true
+(== (sum (max ['a 'c 'b])) (max ['a 'c 'b]))  -- true
+(sum (max ['a 'c 'b]))     -- 'c
+
+;; ─── type preservation through the scalar delegate ───────────────────
+(type (sum (max [1 2 3])))            -- 'i64
+(type (avg (max [1 2 3])))            -- 'f64
+(type (sum (max [09:00:00.000 10:00:00.000]))) -- 'time
