@@ -396,8 +396,13 @@ bool stress_check_invariants(stress_ctx_t* c) {
     size_t ok = fread(&magic, sizeof(magic), 1, f);
     ok += fread(&cnt, sizeof(cnt), 1, f);
     fclose(f);
-    if (ok != 2 || magic != 0x4C525453u) { /* "STRL" */
-        dump_failure(c, "invariant: symfile bad header (magic=0x%x)", magic);
+    if (ok != 2) {
+        dump_failure(c, "invariant: symfile header truncated (read %zu/2 fields)",
+                     ok);
+        return false;
+    }
+    if (magic != 0x4C525453u) { /* "STRL" */
+        dump_failure(c, "invariant: symfile bad magic 0x%x", magic);
         return false;
     }
     if (cnt < c->last_sym_count) {
