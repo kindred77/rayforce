@@ -82,6 +82,8 @@ bool stress_op_restart(stress_ctx_t* c);
  * stderr, sets c->failed.  use_mmap picks ray_read_splayed vs
  * ray_splay_load for the per-directory reloads. */
 bool stress_verify_all(stress_ctx_t* c, bool use_mmap);
+/* Precondition: stress_seed_initial has run (the shared symfile exists);
+ * calling earlier reports a confusing "symfile missing" failure. */
 bool stress_check_invariants(stress_ctx_t* c);
 
 /* prng (xorshift64*), exposed for the random runner */

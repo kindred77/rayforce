@@ -91,11 +91,6 @@ static void rows_free(stress_rows_t* r) {
 
 /* ---- row generation ----------------------------------------------------- */
 
-__attribute__((unused)) /* used by later tasks */
-static bool row_is_null(const stress_row_t* row) {
-    return row->ticker[0] == '\0';
-}
-
 static void gen_row(stress_ctx_t* c, stress_sym_pattern_t pat,
                     stress_row_t* out) {
     memset(out, 0, sizeof(*out));
@@ -377,6 +372,9 @@ bool stress_op_insert(stress_ctx_t* c, int64_t n, stress_sym_pattern_t pat,
 
 /* -- upsert: keyed on ticker; last matching row updated, else append -- */
 
+/* Null-ticker rows all share the "" key, so an upsert with a null key
+ * collates onto the last null row — intentional test semantics, applied
+ * identically to disk and shadow. */
 /* Returns index of last row whose ticker matches, or -1. */
 static int64_t find_last_by_ticker(const stress_rows_t* rows,
                                    const char* ticker) {

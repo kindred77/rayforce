@@ -50,10 +50,14 @@ static bool random_op(stress_ctx_t* c) {
                                 stress_rand(c) & 1, stress_rand(c) & 1);
     if (roll < 50)
         return stress_op_upsert(c, pat, stress_rand(c) & 1);
-    if (roll < 65)
+    if (roll < 65) {
+        if (c->nparts == 0) /* no partitions yet: redirect to live insert */
+            return stress_op_insert(c, 1 + (int64_t)(stress_rand(c) % 16),
+                                    pat, false, false);
         return stress_op_part_append(
             c, (int)(stress_rand(c) % (uint64_t)c->nparts),
             1 + (int64_t)(stress_rand(c) % 16), pat);
+    }
     if (roll < 75) {
         int target = (int)(stress_rand(c) % (uint64_t)(c->nparts + 1)) - 1;
         return stress_op_trim(c, target, stress_rand(c) & 1,
