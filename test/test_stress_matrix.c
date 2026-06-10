@@ -268,6 +268,79 @@ static test_result_t test_matrix_restart_after_each_op(void) {
     return r;
 }
 
+/* Audit-before-flip baseline (sym-domain Phase 2): the CLIENT layout —
+ * parted `hist` + splayed `live` sharing ONE symfile — under a dense
+ * interleave that alternates live-table ops and partition ops, restarting
+ * and verifying through BOTH reload paths along the way.  The oracle
+ * stores ticker STRINGS, never sym ids or file positions, so this test's
+ * expectations are representation-proof: it must pass unchanged before
+ * AND after the per-vocabulary symfile flip (Task 7). */
+static test_result_t test_matrix_shared_domain_layout_impl(stress_ctx_t* c) {
+    TEST_ASSERT(stress_seed_initial(c, 64, 3, 32), "seed");
+    TEST_ASSERT(stress_verify_all(c, false), "verify(heap) after seed");
+    TEST_ASSERT(stress_verify_all(c, true), "verify(mmap) after seed");
+
+#define VERIFY_BOTH(what)                                                     \
+    do {                                                                      \
+        TEST_ASSERT_FMT(stress_verify_all(c, false), "verify(heap) %s r=%d",  \
+                        what, r);                                             \
+        TEST_ASSERT_FMT(stress_verify_all(c, true), "verify(mmap) %s r=%d",   \
+                        what, r);                                             \
+    } while (0)
+
+    for (int r = 0; r < 2; r++) {
+        /* live insert … */
+        TEST_ASSERT_FMT(stress_op_insert(c, 16,
+                                         r ? STRESS_SYMS_EXISTING
+                                           : STRESS_SYMS_NEW,
+                                         r, !r),
+                        "insert live r=%d", r);
+        VERIFY_BOTH("after insert");
+
+        /* … then a partition append into the shared symfile … */
+        TEST_ASSERT_FMT(stress_op_part_append(c, r, 12, STRESS_SYMS_MIXED),
+                        "part_append r=%d", r);
+        VERIFY_BOTH("after part_append");
+
+        /* … live upsert … */
+        TEST_ASSERT_FMT(stress_op_upsert(c, r ? STRESS_SYMS_NULLS
+                                              : STRESS_SYMS_MIXED, r),
+                        "upsert live r=%d", r);
+        VERIFY_BOTH("after upsert");
+
+        /* … new partition … */
+        TEST_ASSERT_FMT(stress_op_part_new(c, 16, r ? STRESS_SYMS_NEW
+                                                    : STRESS_SYMS_EXISTING),
+                        "part_new r=%d", r);
+        VERIFY_BOTH("after part_new");
+
+        /* … live trim, then partition trim … */
+        TEST_ASSERT_FMT(stress_op_trim(c, -1, r, 4), "trim live r=%d", r);
+        VERIFY_BOTH("after trim live");
+        TEST_ASSERT_FMT(stress_op_trim(c, r, !r, 3), "trim part r=%d", r);
+        VERIFY_BOTH("after trim part");
+
+        /* … restart: every live sym id dies, disk is the only truth. */
+        TEST_ASSERT_FMT(stress_op_restart(c), "restart r=%d", r);
+        VERIFY_BOTH("post-restart");
+    }
+#undef VERIFY_BOTH
+
+    /* Final cold-start check through both reload paths. */
+    TEST_ASSERT(stress_op_restart(c), "final restart");
+    TEST_ASSERT(stress_verify_all(c, false), "final verify(heap)");
+    TEST_ASSERT(stress_verify_all(c, true), "final verify(mmap)");
+    PASS();
+}
+
+static test_result_t test_matrix_shared_domain_layout(void) {
+    stress_ctx_t c;
+    TEST_ASSERT(stress_init(&c, STRESS_DB, 106), "init");
+    test_result_t r = test_matrix_shared_domain_layout_impl(&c);
+    stress_destroy(&c);
+    return r;
+}
+
 const test_entry_t stress_matrix_entries[] = {
     { "stress/fixture_roundtrip", test_fixture_roundtrip, stress_setup, stress_teardown },
     { "stress/verify_clean",             test_verify_clean,             stress_setup, stress_teardown },
@@ -277,5 +350,6 @@ const test_entry_t stress_matrix_entries[] = {
     { "stress/matrix_trim",       test_matrix_trim,       stress_setup, stress_teardown },
     { "stress/matrix_parted_ops", test_matrix_parted_ops, stress_setup, stress_teardown },
     { "stress/matrix_restart_after_each_op", test_matrix_restart_after_each_op, stress_setup, stress_teardown },
+    { "stress/matrix_shared_domain_layout", test_matrix_shared_domain_layout, stress_setup, stress_teardown },
     { NULL, NULL, NULL, NULL },
 };

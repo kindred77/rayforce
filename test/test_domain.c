@@ -414,6 +414,154 @@ static test_result_t test_domain_open_identity_and_release(void) {
     PASS();
 }
 
+/* ---- Phase 2 Task 1: resolution helpers + adopt-domain ------------------- */
+
+/* ray_sym_vec_cell on a runtime-domain vec must be exactly equivalent to
+ * the legacy two-step (ray_read_sym + ray_sym_str) — same borrowed atom. */
+static test_result_t test_domain_vec_cell_runtime_equiv(void) {
+    int64_t ida = ray_sym_intern("cell_a", 6);
+    int64_t idb = ray_sym_intern("cell_b", 6);
+
+    ray_t* v = ray_sym_vec_new(RAY_SYM_W64, 3);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    v->len = 3;
+    int64_t* d = (int64_t*)ray_data(v);
+    d[0] = ida; d[1] = idb; d[2] = ida;
+
+    for (int64_t i = 0; i < 3; i++) {
+        int64_t id = ray_read_sym(ray_data(v), i, RAY_SYM, v->attrs);
+        TEST_ASSERT_EQ_PTR(ray_sym_vec_cell(v, i), ray_sym_str(id));
+    }
+
+    /* narrow width takes the same path through ray_read_sym */
+    ray_t* v8 = ray_sym_vec_new(RAY_SYM_W8, 2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v8));
+    v8->len = 2;
+    ((uint8_t*)ray_data(v8))[0] = (uint8_t)ida;
+    ((uint8_t*)ray_data(v8))[1] = (uint8_t)idb;
+    TEST_ASSERT_EQ_PTR(ray_sym_vec_cell(v8, 0), ray_sym_str(ida));
+    TEST_ASSERT_EQ_PTR(ray_sym_vec_cell(v8, 1), ray_sym_str(idb));
+
+    /* slices resolve data AND domain through the parent */
+    ray_t* s = ray_vec_slice(v, 1, 2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(s));
+    TEST_ASSERT_EQ_PTR(ray_sym_vec_cell(s, 0), ray_sym_str(idb));
+    TEST_ASSERT_EQ_PTR(ray_sym_vec_cell(s, 1), ray_sym_str(ida));
+
+    ray_release(s);
+    ray_release(v8);
+    ray_release(v);
+    PASS();
+}
+
+/* ray_sym_vec_lookup on a runtime vec delegates to the global find:
+ * hit returns the interned id, miss returns -1 (matches nothing). */
+static test_result_t test_domain_vec_lookup_hit_miss(void) {
+    int64_t ida = ray_sym_intern("lkp_hit", 7);
+
+    ray_t* v = ray_sym_vec_new(RAY_SYM_W64, 1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    v->len = 1;
+    ((int64_t*)ray_data(v))[0] = ida;
+
+    TEST_ASSERT_EQ_I(ray_sym_vec_lookup(v, "lkp_hit", 7), ida);
+    TEST_ASSERT_EQ_I(ray_sym_vec_lookup(v, "lkp_hit", 7),
+                     ray_sym_find("lkp_hit", 7));
+    TEST_ASSERT_EQ_I(ray_sym_vec_lookup(v, "lkp_missing", 11), -1);
+
+    /* slice: domain through the parent */
+    ray_t* s = ray_vec_slice(v, 0, 1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(s));
+    TEST_ASSERT_EQ_I(ray_sym_vec_lookup(s, "lkp_hit", 7), ida);
+    ray_release(s);
+    ray_release(v);
+    PASS();
+}
+
+/* adopt_domain: ref balance with a real FILE domain (ASan is the leak
+ * oracle), plus cell/lookup resolution through the adopted domain. */
+static test_result_t test_domain_adopt_domain_refcount(void) {
+    unlink(TMP_DOM_SYM_PATH);
+    unlink(TMP_DOM_SYM_PATH ".lk");
+
+    (void)ray_sym_intern("adopt_x", 7);
+    (void)ray_sym_intern("adopt_y", 7);
+    TEST_ASSERT_EQ_I(ray_sym_save(TMP_DOM_SYM_PATH), RAY_OK);
+
+    ray_sym_domain_t* dom = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    TEST_ASSERT_NOT_NULL(dom);
+
+    int64_t pos_x = ray_sym_domain_find(dom, "adopt_x", 7);
+    int64_t pos_y = ray_sym_domain_find(dom, "adopt_y", 7);
+    TEST_ASSERT(pos_x >= 0 && pos_y >= 0, "positions resolve");
+
+    /* a: heap vec manually attached to the FILE domain (simulates the
+     * Task-7 load path; the vec holds its own ref, dropped on free). */
+    ray_t* a = ray_sym_vec_new(RAY_SYM_W64, 2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(a));
+    a->len = 2;
+    ((int64_t*)ray_data(a))[0] = pos_x;
+    ((int64_t*)ray_data(a))[1] = pos_y;
+    ray_sym_domain_retain(dom);
+    a->sym_domain = dom;
+
+    /* helpers resolve through the FILE domain, not the global table */
+    ray_t* sx = ray_sym_vec_cell(a, 0);
+    TEST_ASSERT_NOT_NULL(sx);
+    TEST_ASSERT_EQ_U(ray_str_len(sx), 7);
+    TEST_ASSERT_MEM_EQ(7, ray_str_ptr(sx), "adopt_x");
+    TEST_ASSERT_EQ_I(ray_sym_vec_lookup(a, "adopt_y", 7), pos_y);
+    TEST_ASSERT_EQ_I(ray_sym_vec_lookup(a, "adopt_absent", 12), -1);
+
+    /* b adopts a's domain: out's runtime ref is a no-op release, the FILE
+     * domain is retained. */
+    ray_t* b = ray_sym_vec_new(RAY_SYM_W64, 0);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(b));
+    ray_sym_vec_adopt_domain(b, a);
+    TEST_ASSERT_EQ_PTR(b->sym_domain, dom);
+    TEST_ASSERT_EQ_PTR(a->sym_domain, dom);
+
+    /* idempotent: adopting the same domain again must not unbalance */
+    ray_sym_vec_adopt_domain(b, a);
+    TEST_ASSERT_EQ_PTR(b->sym_domain, dom);
+
+    /* adopting a runtime vec's domain over a FILE ref releases the FILE ref */
+    ray_t* r = ray_sym_vec_new(RAY_SYM_W64, 0);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_sym_vec_adopt_domain(b, r);
+    TEST_ASSERT_EQ_PTR(b->sym_domain, ray_sym_runtime_domain());
+
+    /* non-SYM pairs are a no-op */
+    ray_t* i64v = ray_vec_new(RAY_I64, 1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(i64v));
+    ray_sym_vec_adopt_domain(i64v, a);
+    TEST_ASSERT(i64v->sym_domain != dom, "non-SYM out untouched");
+    ray_sym_vec_adopt_domain(b, i64v);
+    TEST_ASSERT_EQ_PTR(b->sym_domain, ray_sym_runtime_domain());
+    ray_release(i64v);
+
+    /* re-adopt the FILE domain into b so b's FREE path (heap.c owned-ref
+     * release) carries one of the outstanding refs. */
+    ray_sym_vec_adopt_domain(b, a);
+    TEST_ASSERT_EQ_PTR(b->sym_domain, dom);
+
+    ray_release(r);
+    ray_release(b);              /* drops b's adopt ref */
+    ray_release(a);              /* drops a's manual attach ref */
+    ray_sym_domain_release(dom); /* drops the open ref — last one */
+
+    /* Balance proof: the cache entry must be gone; a fresh open builds a
+     * fully functional mapping (ASan flags any leak/double-free). */
+    ray_sym_domain_t* d2 = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    TEST_ASSERT_NOT_NULL(d2);
+    TEST_ASSERT_EQ_I(ray_sym_domain_find(d2, "adopt_x", 7), pos_x);
+    ray_sym_domain_release(d2);
+
+    unlink(TMP_DOM_SYM_PATH);
+    unlink(TMP_DOM_SYM_PATH ".lk");
+    PASS();
+}
+
 /* ---- registration -------------------------------------------------------- */
 
 const test_entry_t domain_entries[] = {
@@ -427,5 +575,8 @@ const test_entry_t domain_entries[] = {
     { "domain/col_save_load_mmap",      test_domain_col_save_load_mmap,      domain_setup, domain_teardown },
     { "domain/open_basic",              test_domain_open_basic,              domain_setup, domain_teardown },
     { "domain/open_identity_release",   test_domain_open_identity_and_release, domain_setup, domain_teardown },
+    { "domain/vec_cell_runtime_equiv",  test_domain_vec_cell_runtime_equiv,  domain_setup, domain_teardown },
+    { "domain/vec_lookup_hit_miss",     test_domain_vec_lookup_hit_miss,     domain_setup, domain_teardown },
+    { "domain/adopt_domain_refcount",   test_domain_adopt_domain_refcount,   domain_setup, domain_teardown },
     { NULL, NULL, NULL, NULL },
 };
