@@ -163,7 +163,13 @@ static ray_t* build_table_from_rows(const stress_rows_t* rows) {
         tick  = ray_vec_append(tick, &id);
         price = ray_vec_append(price, &r->price);
         qty   = ray_vec_append(qty, &r->qty);
-        if (!tick || !price || !qty) return NULL;
+        if (!tick || RAY_IS_ERR(tick) || !price || RAY_IS_ERR(price) ||
+            !qty || RAY_IS_ERR(qty)) {
+            if (tick)  ray_release(tick);
+            if (price) ray_release(price);
+            if (qty)   ray_release(qty);
+            return NULL;
+        }
     }
     ray_t* tbl = ray_table_new(4);
     tbl = ray_table_add_col(tbl, ray_sym_intern("ticker", 6), tick);
@@ -265,7 +271,11 @@ bool stress_init(stress_ctx_t* c, const char* db_root, uint64_t seed) {
     rm_rf(c->db_root);
     char cmd[600];
     snprintf(cmd, sizeof(cmd), "mkdir -p '%s'", c->db_root);
-    if (system(cmd) != 0) return false;
+    if (system(cmd) != 0) {
+        free(c->oplog);
+        c->oplog = NULL;
+        return false;
+    }
     op_logf(c, "init seed=%llu db=%s", (unsigned long long)seed, db_root);
     return true;
 }
