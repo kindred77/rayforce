@@ -658,6 +658,175 @@ static test_result_t test_domain_pivot_index_adopts(void) {
     PASS();
 }
 
+/* ---- Phase 2 Task 3: query.c resolution / re-expression ------------------ */
+
+#define TMP_DOM_QSYM_PATH "/tmp/rayforce_test_domain_qsym"
+
+/* Build a DIVERGENT file-domain fixture: a symfile in which the
+ * positions of "dq_a"/"dq_b" are SWAPPED relative to the current
+ * runtime's global ids.  Technique: intern a→b, save the whole global
+ * table, then restart the runtime (fresh sym table, identical builtin
+ * prefix) and intern b→a.  Now resolving a cell id through the global
+ * table yields the WRONG symbol — only domain-aware code stays correct.
+ *
+ * On return: pvt_rt is a FRESH runtime, *out_dom is the opened FILE
+ * domain (caller releases), pos_a / pos_b receive the FILE positions
+ * of dq_a/dq_b.  Returns false if the fixture could not be built. */
+static int build_divergent_qsym_fixture(ray_sym_domain_t** out_dom,
+                                        int64_t* pos_a, int64_t* pos_b) {
+    unlink(TMP_DOM_QSYM_PATH);
+    unlink(TMP_DOM_QSYM_PATH ".lk");
+
+    (void)ray_sym_intern("dq_a", 4);
+    (void)ray_sym_intern("dq_b", 4);
+    if (ray_sym_save(TMP_DOM_QSYM_PATH) != RAY_OK) return 0;
+
+    /* Restart: fresh global table, REVERSED intern order. */
+    ray_runtime_destroy(pvt_rt);
+    pvt_rt = ray_runtime_create(0, NULL);
+    if (!pvt_rt) return 0;
+    (void)ray_sym_intern("dq_b", 4);
+    (void)ray_sym_intern("dq_a", 4);
+
+    ray_sym_domain_t* dom = ray_sym_domain_open(TMP_DOM_QSYM_PATH);
+    if (!dom) return 0;
+    *pos_a = ray_sym_domain_find(dom, "dq_a", 4);
+    *pos_b = ray_sym_domain_find(dom, "dq_b", 4);
+    *out_dom = dom;
+    return *pos_a >= 0 && *pos_b >= 0;
+}
+
+/* Table {k: SYM FILE-domain cells [pos_a pos_b], v: I64 [v0 v1]} bound
+ * to env name `tname`.  Returns the owned table (caller releases). */
+static ray_t* build_qsym_table(ray_sym_domain_t* dom, int64_t pos_a,
+                               int64_t pos_b, int64_t v0, int64_t v1,
+                               const char* tname) {
+    ray_t* k = ray_sym_vec_new(RAY_SYM_W64, 2);
+    if (!k || RAY_IS_ERR(k)) return NULL;
+    k->len = 2;
+    ((int64_t*)ray_data(k))[0] = pos_a;
+    ((int64_t*)ray_data(k))[1] = pos_b;
+    ray_sym_domain_retain(dom);
+    k->sym_domain = dom;
+
+    ray_t* v = ray_vec_new(RAY_I64, 2);
+    if (!v || RAY_IS_ERR(v)) { ray_release(k); return NULL; }
+    v->len = 2;
+    ((int64_t*)ray_data(v))[0] = v0;
+    ((int64_t*)ray_data(v))[1] = v1;
+
+    ray_t* t = ray_table_new(2);
+    t = ray_table_add_col(t, ray_sym_intern("k", 1), k);
+    t = ray_table_add_col(t, ray_sym_intern("v", 1), v);
+    ray_release(k); ray_release(v);
+    if (!t || RAY_IS_ERR(t)) return NULL;
+    if (ray_env_set(ray_sym_intern(tname, strlen(tname)), t) != RAY_OK) {
+        ray_release(t);
+        return NULL;
+    }
+    return t;
+}
+
+static int sym_cell_is(ray_t* col, int64_t row, const char* want) {
+    ray_t* s = ray_sym_vec_cell(col, row);
+    size_t n = strlen(want);
+    return s && ray_str_len(s) == n && memcmp(ray_str_ptr(s), want, n) == 0;
+}
+
+/* Upsert's literal-vs-column key match (query.c): the runtime literal
+ * 'dq_a must be resolved into the KEY COLUMN'S domain before the raw
+ * row scan, and the rebuilt SYM column must re-express the untouched
+ * cells through that domain.  With the divergent fixture, the legacy
+ * global-id compare matches the WRONG row (silent wrong-symbol bug). */
+static test_result_t test_domain_query_upsert_key_lookup(void) {
+    ray_sym_domain_t* dom = NULL;
+    int64_t pos_a = -1, pos_b = -1;
+    TEST_ASSERT_TRUE(build_divergent_qsym_fixture(&dom, &pos_a, &pos_b));
+    /* discrimination precondition: file positions != runtime ids */
+    TEST_ASSERT(pos_a != ray_sym_intern("dq_a", 4), "fixture diverges");
+
+    ray_t* t = build_qsym_table(dom, pos_a, pos_b, 10, 20, "dmq_t");
+    TEST_ASSERT_NOT_NULL(t);
+
+    ray_t* r = ray_eval_str("(upsert dmq_t 'k (list 'dq_a 99))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    /* match found in the file domain → UPDATE, not insert */
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 2);
+
+    /* …and the row whose file-domain string is "dq_a" (row 0) got the
+     * new value.  The legacy global compare matched row 1 instead. */
+    ray_t* out_v = ray_table_get_col(r, ray_sym_intern("v", 1));
+    TEST_ASSERT_NOT_NULL(out_v);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(out_v))[0], 99);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(out_v))[1], 20);
+
+    /* The rebuilt SYM column is runtime-domain (it mixes the replacement
+     * atom with re-expressed cells) and resolves to the right strings. */
+    ray_t* out_k = ray_table_get_col(r, ray_sym_intern("k", 1));
+    TEST_ASSERT_NOT_NULL(out_k);
+    TEST_ASSERT_EQ_PTR(ray_sym_vec_domain(out_k), ray_sym_runtime_domain());
+    TEST_ASSERT_TRUE(sym_cell_is(out_k, 0, "dq_a"));
+    TEST_ASSERT_TRUE(sym_cell_is(out_k, 1, "dq_b"));
+
+    ray_release(r);
+    ray_release(ray_eval_str("(set dmq_t 0)"));
+    ray_release(t);
+    ray_sym_domain_release(dom);
+
+    /* ref balance: the cache entry must be gone (fresh open rebuilds) */
+    ray_sym_domain_t* d2 = ray_sym_domain_open(TMP_DOM_QSYM_PATH);
+    TEST_ASSERT_NOT_NULL(d2);
+    ray_sym_domain_release(d2);
+
+    unlink(TMP_DOM_QSYM_PATH);
+    unlink(TMP_DOM_QSYM_PATH ".lk");
+    PASS();
+}
+
+/* Insert's cell-to-output materialization (query.c): the rebuilt SYM
+ * column re-expresses every copied cell through the SOURCE column's
+ * FILE domain before mixing in the appended runtime atom.  The legacy
+ * raw copy produced swapped strings under the divergent fixture. */
+static test_result_t test_domain_query_insert_cell_reexpress(void) {
+    ray_sym_domain_t* dom = NULL;
+    int64_t pos_a = -1, pos_b = -1;
+    TEST_ASSERT_TRUE(build_divergent_qsym_fixture(&dom, &pos_a, &pos_b));
+    TEST_ASSERT(pos_a != ray_sym_intern("dq_a", 4), "fixture diverges");
+
+    ray_t* t = build_qsym_table(dom, pos_a, pos_b, 1, 2, "dmi_t");
+    TEST_ASSERT_NOT_NULL(t);
+
+    ray_t* r = ray_eval_str("(insert dmi_t (list 'dq_a 3))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 3);
+
+    ray_t* out_k = ray_table_get_col(r, ray_sym_intern("k", 1));
+    TEST_ASSERT_NOT_NULL(out_k);
+    TEST_ASSERT_EQ_PTR(ray_sym_vec_domain(out_k), ray_sym_runtime_domain());
+    TEST_ASSERT_TRUE(sym_cell_is(out_k, 0, "dq_a"));   /* was "dq_b" raw */
+    TEST_ASSERT_TRUE(sym_cell_is(out_k, 1, "dq_b"));   /* was "dq_a" raw */
+    TEST_ASSERT_TRUE(sym_cell_is(out_k, 2, "dq_a"));   /* appended atom  */
+
+    ray_t* out_v = ray_table_get_col(r, ray_sym_intern("v", 1));
+    TEST_ASSERT_NOT_NULL(out_v);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(out_v))[2], 3);
+
+    ray_release(r);
+    ray_release(ray_eval_str("(set dmi_t 0)"));
+    ray_release(t);
+    ray_sym_domain_release(dom);
+
+    ray_sym_domain_t* d2 = ray_sym_domain_open(TMP_DOM_QSYM_PATH);
+    TEST_ASSERT_NOT_NULL(d2);
+    ray_sym_domain_release(d2);
+
+    unlink(TMP_DOM_QSYM_PATH);
+    unlink(TMP_DOM_QSYM_PATH ".lk");
+    PASS();
+}
+
 /* ---- registration -------------------------------------------------------- */
 
 const test_entry_t domain_entries[] = {
@@ -675,5 +844,7 @@ const test_entry_t domain_entries[] = {
     { "domain/vec_lookup_hit_miss",     test_domain_vec_lookup_hit_miss,     domain_setup, domain_teardown },
     { "domain/adopt_domain_refcount",   test_domain_adopt_domain_refcount,   domain_setup, domain_teardown },
     { "domain/pivot_index_adopts",      test_domain_pivot_index_adopts,      domain_rt_setup, domain_rt_teardown },
+    { "domain/query_upsert_key_lookup", test_domain_query_upsert_key_lookup, domain_rt_setup, domain_rt_teardown },
+    { "domain/query_insert_reexpress",  test_domain_query_insert_cell_reexpress, domain_rt_setup, domain_rt_teardown },
     { NULL, NULL, NULL, NULL },
 };
