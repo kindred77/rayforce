@@ -588,7 +588,7 @@
 
 ;; =====================================================================
 ;; 21. IN list with typed literal vecs (fp_compile_cmp lines 637-642)
-;;     fp_check_in: rhs must be a plain vec literal (no RAY_ATTR_NAME).
+;;     fp_check_in: rhs must be a plain vec literal (no ATTR_QUOTED).
 ;;     BOOL/DATE/TIME vec literals in parse tree hit the non-I64 branches.
 ;;     sv->type == RAY_DATE/RAY_TIME → lines 641-642
 ;;     sv->type == RAY_BOOL → lines 637-638
@@ -692,7 +692,7 @@
 (set myI32cmp (as 'I32 3))
 (set Ti32esz4 (table [k v32 g] (list (as 'I64 [1 2 3 4 5 1 2 3 4 5]) (as 'I32 [1 2 3 4 5 6 7 8 9 10]) [0 0 0 0 0 1 1 1 1 1])))
 ;; (and (in k [1 2 3]) (>= v32 3)): IN first (score 3), GE I32 second (score 4).
-;; Literal 3 (type -RAY_I64, no RAY_ATTR_NAME) → fp_check_simple_cmp passes.
+;; Literal 3 (type -RAY_I64, no ATTR_QUOTED) → fp_check_simple_cmp passes.
 ;; use_masked=1. fp_eval_cmp_masked for GE I32 child → fp_eval_cmp_one → esz=4.
 ;; k in {1,2,3}: rows 0(k=1,v32=1),1(k=2,v32=2),2(k=3,v32=3),5(k=1,v32=6),6(k=2,v32=7),7(k=3,v32=8).
 ;; v32 >= 3 at rows 2,5,6,7 → g=0: row 2 (count 1); g=1: rows 5,6,7 (count 3).
@@ -1347,7 +1347,7 @@
 ;;     (a) `(as 'I16 5)` inline in WHERE → compile_expr_dag compiles it
 ;;         as OP_CAST (not OP_CONST) → rejected at line 639.
 ;;     (b) Named variable `(set x (as 'I16 5))` → fp_check_simple_cmp
-;;         line 193 rejects: `(rhs->attrs & RAY_ATTR_NAME)` → returns -1
+;;         line 193 rejects: `(rhs->attrs & ATTR_QUOTED)` → returns -1
 ;;         → fused path never entered.
 ;;
 ;;     RFL has no I16 literal syntax (integers default to I64).

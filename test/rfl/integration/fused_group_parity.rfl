@@ -51,7 +51,7 @@
 (sum (at (select {c: (count u8) from: T where: (and (>= grp 0) (< i16 100) (!= u8 99)) by: grp}) 'c)) -- 6
 
 ;; ────────────── nullable column gates (round-2 review) ──────────────
-;; A predicate column carrying a nullmap must NOT route through the
+;; A predicate column carrying nulls must NOT route through the
 ;; fused per-row evaluator (which reads raw payload, not the null
 ;; bits).  These queries are correctness-checked against the same
 ;; data; a divergence between fused and unfused would surface here.
@@ -167,11 +167,11 @@
 (at (at (select {v: v p: p from: Ttn where: (>= p 0) asc: v take: 3}) 'v) 1) -- -50
 (at (at (select {v: v p: p from: Ttn where: (>= p 0) asc: v take: 3}) 'v) 2) -- 0
 
-;; ────────────── Top-K nullmap propagation (review #2) ─────────────
+;; ────────────── Top-K null propagation (review #2) ─────────────
 ;; Output columns with nulls must round-trip the null bit through
 ;; the fused gather.  Previously the planner gate refused fused for
 ;; nullable output columns; the materialiser now propagates the
-;; source nullmap via ray_vec_set_null per gathered row, so the
+;; source nulls via ray_vec_set_null per gathered row, so the
 ;; fused path handles them and the top-3 result preserves the null
 ;; in the second output row.
 (set Tn2 (table [k v] (list [1 2 3 4 5] [10 0N 30 0N 50])))

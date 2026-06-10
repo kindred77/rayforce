@@ -109,9 +109,9 @@ static test_result_t test_header_zeroed(void) {
     ray_t* v = ray_alloc(64);
     TEST_ASSERT_NOT_NULL(v);
 
-    /* Check nullmap region is zeroed */
+    /* Check aux region is zeroed */
     for (int i = 0; i < 16; i++) {
-        TEST_ASSERT_EQ_U(v->nullmap[i], 0);
+        TEST_ASSERT_EQ_U(v->aux[i], 0);
     }
     /* type and attrs should be 0 */
     TEST_ASSERT_EQ_I(v->type, 0);

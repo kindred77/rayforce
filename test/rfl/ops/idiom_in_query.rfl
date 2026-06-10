@@ -335,3 +335,73 @@ CAn -- 5
 ;; Reachability: count(distinct) survives predicate pushdown
 ;; (opt.c:2043) + projection pushdown (opt.c:2051) without losing its
 ;; OP_COUNT_DISTINCT identity.
+
+;; ──────────────────────────────────────────────────────────────────────
+;; Section 9 — runtime-built column references resolve in query scope
+;; ──────────────────────────────────────────────────────────────────────
+;; All columns of the from-table are mounted into the query's local
+;; scope before each projection/where expression is eval'd, so a column
+;; reference produced at RUNTIME (not present in the AST the planner
+;; sees) still resolves by ordinary name lookup.
+
+;; B1: a runtime-built column reference resolves under the per-group
+;; non-agg eval fallback.  `c` holds the name-ref `price`; the
+;; projection list `(list + c 0.0)` is assembled and eval'd dynamically
+;; inside (eval ...), so a static AST walk never saw `price`.  The (eval
+;; ...) head is non-vectorizable → compile_expr_dag returns NULL, so for
+;; this single-scalar-key `by: g` query the non-agg projection routes
+;; through the per-group non-agg eval fallback (a bind_all_columns site),
+;; where every column is mounted in scope, so the runtime-built column
+;; ref resolves via scope.  Prior to mounting all columns, the static
+;; name walk bound nothing for this expression and `price` raised a name
+;; error.
+(set Tdyn (table [g price size] (list ['a 'a 'b] [10.0 200.0 50.0] [1.0 2.0 3.0])))
+(set c (quote price))
+(at (at (select {o: (eval (list + c 0.0)) from: Tdyn by: g}) 'o) 0) -- [10.0 200.0]
+(at (at (select {o: (eval (list + c 0.0)) from: Tdyn by: g}) 'o) 1) -- [50.0]
+
+;; Reachability: the dynamic projection routes through the eval-level
+;; per-group non-agg fallback (not the vectorized DAG), exercising
+;; bind_all_columns' mount-every-column behavior for refs that the old
+;; ATTR_QUOTED static walk could not see.
+
+;; ──────────────────────────────────────────────────────────────────────
+;; Section 10 — scoped-column precedence, hygiene, and nesting
+;; ──────────────────────────────────────────────────────────────────────
+;; Now that every column of the from-table is mounted as an ordinary local
+;; before each query expression is eval'd, a bare column name resolves via
+;; the scope chain.  These checks pin down the three properties that fall
+;; out of that design: (a) a column shadows a same-named global INSIDE the
+;; query but the global is untouched OUTSIDE it; (b) after the query the
+;; column bindings are gone (the pushed scope frame was popped); (c) a
+;; nested sub-select binds and pops its own column frame without disturbing
+;; the outer query's frame.
+
+;; Precedence: the `price` column wins over the `price` global inside the
+;; query (resolution walks the pushed column frame first), while the global
+;; `price` stays intact outside the query.
+(set price 999)                                          ;; global
+(set Tsh (table [price] (list [1.0 2.0 3.0])))
+(sum (at (select {s: price from: Tsh}) 's)) -- 6.0       ;; column wins inside
+price -- 999                                             ;; global intact outside
+
+;; Scope hygiene: after the query the column bindings are gone — a bare
+;; column name does not leak into the surrounding (global) scope.  `qty`
+;; was only ever a column of Th, never a global, so it stays unbound.
+(set Th (table [qty] (list [1 2 3])))
+(count (select {x: qty from: Th})) -- 3
+;; `qty` is unbound outside the query — a bare reference raises a name error.
+qty !- name
+
+;; Nested sub-select inside an outer query's projection: the inner query
+;; over Tb binds and pops its own column frame (column `b`) without
+;; disturbing the outer query's frame (column `a`).  The outer query still
+;; produces one row per Ta row.
+(set Ta (table [a] (list [1 2 3])))
+(set Tb (table [b] (list [10 20])))
+(count (select {n: (count (select {m: b from: Tb})) a: a from: Ta})) -- 3
+
+;; Reachability: confirms the bind_all_columns scope frame is correctly
+;; pushed before and popped after each query (outer and inner), so column
+;; visibility is confined to the query body and nesting does not corrupt
+;; the enclosing frame.

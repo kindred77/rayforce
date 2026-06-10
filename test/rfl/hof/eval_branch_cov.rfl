@@ -139,18 +139,19 @@
 (sum (+ [] 5)) -- 0
 
 ;; ═══════════════════════════════════════════════════════════════════
-;; 4. Dispatch edge cases — NULL args to LAMBDA / VARY (eval.c 3182-3206)
-;;    Passing `null` as an argument makes ray_eval return a NULL ray_t*,
-;;    hitting the (!args[i]) arm of the arg-eval guard.
+;; 4. Dispatch edge cases — `null` as an argument is the null VALUE.
+;;    The null keyword now yields RAY_NULL_OBJ (not C NULL), so it flows
+;;    through arg dispatch as an ordinary value, not a type error.
 ;; ═══════════════════════════════════════════════════════════════════
-;; LAMBDA, arg[0] is null → immediate bail (j-loop body skipped)
-((fn [x y] x) null 5) !- type
-;; LAMBDA, arg[1] is null → j-loop releases the prior good arg (line 3206)
-((fn [x y] y) 5 null) !- type
-;; VARY (list), middle arg null → j-loop releases the prior good arg (3184)
-(list 1 null 2) !- type
+;; LAMBDA, arg[0] is null → x binds to null → returns null
+(nil? ((fn [x y] x) null 5)) -- true
+;; LAMBDA, arg[1] is null → y binds to null → returns null
+(nil? ((fn [x y] y) 5 null)) -- true
+;; VARY (list), middle arg null → 3-element list with a null element
+(count (list 1 null 2)) -- 3
+(nil? (at (list 1 null 2) 1)) -- true
 ;; VARY (list), first arg null
-(list null 1) !- type
+(nil? (at (list null 1) 0)) -- true
 
 ;; ═══════════════════════════════════════════════════════════════════
 ;; 5. Special-form error / edge branches

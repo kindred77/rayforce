@@ -149,7 +149,7 @@
 ;; S3'.1: serde ser_null_bitmap derives bits from sentinel reads).
 ;;
 ;; Hits ray_typed_null branches in ray_de_raw (line 501-542).  The
-;; ser side packs nullmap[0]&1 into the flags byte (line 258); the de
+;; ser side packs aux[0]&1 into the flags byte (line 258); the de
 ;; side reads flags, returns ray_typed_null(type) when bit 0 is set.
 ;; ════════════════════════════════════════════════════════════════
 

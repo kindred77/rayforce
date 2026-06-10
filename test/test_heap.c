@@ -2298,7 +2298,7 @@ static test_result_t test_scratch_realloc_lazy_handle(void) {
 /* ---- ray_detach_owned_refs: HAS_INDEX arm (L790-794) ----------------------
  *
  * A vector carrying RAY_ATTR_HAS_INDEX stores an owning ray_t* index in
- * nullmap[0..7] (v->index).  ray_scratch_realloc transfers the vector data to
+ * aux[0..7] (v->index).  ray_scratch_realloc transfers the vector data to
  * a new block (index pointer copied), then detaches the old block — nulling
  * v->index and clearing the HAS_INDEX bit (L790-794).  We use a real RAY_INDEX
  * block as v->index and let the surviving block own it, releasing once. */

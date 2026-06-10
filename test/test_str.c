@@ -550,10 +550,10 @@ static test_result_t test_str_vec_compact_saturated_dead(void) {
     v = ray_str_vec_append(v, "this is a pooled string!", 24);
 
     /* Force the dead-byte counter to UINT32_MAX to simulate saturation.
-     * The counter is stored in the first 4 bytes of str_pool->nullmap. */
+     * The counter is stored in the first 4 bytes of str_pool->aux. */
     TEST_ASSERT_NOT_NULL(v->str_pool);
     uint32_t saturated = UINT32_MAX;
-    memcpy(v->str_pool->nullmap, &saturated, 4);
+    memcpy(v->str_pool->aux, &saturated, 4);
 
     /* Compact must scan elements for true live size instead of using
      * pool_used - dead (which would underflow). */

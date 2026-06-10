@@ -478,7 +478,7 @@ static test_result_t test_csv_null_sym(void) {
     PASS();
 }
 
-static test_result_t test_csv_no_nulls_no_nullmap(void) {
+static test_result_t test_csv_no_nulls_no_null_bitmap(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
@@ -1501,7 +1501,7 @@ const test_entry_t csv_entries[] = {
     { "csv/null_timestamp", test_csv_null_timestamp, NULL, NULL },
     { "csv/null_bool", test_csv_null_bool, NULL, NULL },
     { "csv/null_sym", test_csv_null_sym, NULL, NULL },
-    { "csv/no_nulls_no_nullmap", test_csv_no_nulls_no_nullmap, NULL, NULL },
+    { "csv/no_nulls_no_null_bitmap", test_csv_no_nulls_no_null_bitmap, NULL, NULL },
     { "csv/null_mixed_columns", test_csv_null_mixed_columns, NULL, NULL },
     { "csv/explicit_str_schema", test_csv_explicit_str_schema, NULL, NULL },
     { "csv/escaped_str_roundtrip", test_csv_escaped_str_roundtrip, NULL, NULL },
