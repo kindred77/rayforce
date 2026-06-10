@@ -1044,6 +1044,84 @@ static test_result_t test_save_schema_write_fails(void) {
  *     through the single-process API without a filesystem hook.
  * ========================================================================= */
 
+/* =========================================================================
+ * 27. ray_splay_load (heap path) on STR columns — covers col_copy_str_pool:
+ *     the main branch (long strings → non-empty str pool deep-copy) and the
+ *     empty-pool early exit (all strings inline).  The language surface is
+ *     mmap-only since the .db.*.mount removal, so this C test is the
+ *     remaining caller of the heap STR deep-copy path.
+ * ========================================================================= */
+static test_result_t test_load_str_pool_heap(void) {
+    const char* dir_pool = TMP_SPLAY_BASE "/str_pool";
+    const char* dir_inl  = TMP_SPLAY_BASE "/str_inline";
+    rm_rf(dir_pool);
+    rm_rf(dir_inl);
+
+    int64_t id_name = ray_sym_intern("name", 4);
+    size_t  slen    = 0;
+
+    /* Long strings (> inline max) → non-empty str pool */
+    ray_t* col_pool = ray_vec_new(RAY_STR, 3);
+    TEST_ASSERT_NOT_NULL(col_pool);
+    col_pool = ray_str_vec_append(col_pool, "a-very-long-pooled-string", 25);
+    col_pool = ray_str_vec_append(col_pool, "another-pooled-string-too", 25);
+    col_pool = ray_str_vec_append(col_pool, "third-pooled-string-here", 24);
+    TEST_ASSERT_NOT_NULL(col_pool);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(col_pool));
+
+    ray_t* tbl_pool = ray_table_new(2);
+    tbl_pool = ray_table_add_col(tbl_pool, id_name, col_pool);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl_pool));
+    TEST_ASSERT_EQ_I(ray_splay_save(tbl_pool, dir_pool, NULL), RAY_OK);
+
+    ray_t* loaded = ray_splay_load(dir_pool, NULL); /* heap, not mmap */
+    TEST_ASSERT_NOT_NULL(loaded);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    ray_t* lc = ray_table_get_col_idx(loaded, 0); /* borrowed */
+    TEST_ASSERT_NOT_NULL(lc);
+    const char* s0 = ray_str_vec_get(lc, 0, &slen);
+    TEST_ASSERT_NOT_NULL(s0);
+    TEST_ASSERT_EQ_U(slen, 25);
+    TEST_ASSERT_MEM_EQ(25, s0, "a-very-long-pooled-string");
+    const char* s2 = ray_str_vec_get(lc, 2, &slen);
+    TEST_ASSERT_NOT_NULL(s2);
+    TEST_ASSERT_EQ_U(slen, 24);
+    TEST_ASSERT_MEM_EQ(24, s2, "third-pooled-string-here");
+    ray_release(loaded);
+    ray_release(col_pool);
+    ray_release(tbl_pool);
+
+    /* Short strings (all inline) → empty pool early-exit branch */
+    ray_t* col_inl = ray_vec_new(RAY_STR, 2);
+    TEST_ASSERT_NOT_NULL(col_inl);
+    col_inl = ray_str_vec_append(col_inl, "aa", 2);
+    col_inl = ray_str_vec_append(col_inl, "bb", 2);
+    TEST_ASSERT_NOT_NULL(col_inl);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(col_inl));
+
+    ray_t* tbl_inl = ray_table_new(2);
+    tbl_inl = ray_table_add_col(tbl_inl, id_name, col_inl);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl_inl));
+    TEST_ASSERT_EQ_I(ray_splay_save(tbl_inl, dir_inl, NULL), RAY_OK);
+
+    ray_t* loaded2 = ray_splay_load(dir_inl, NULL);
+    TEST_ASSERT_NOT_NULL(loaded2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded2));
+    ray_t* lc2 = ray_table_get_col_idx(loaded2, 0);
+    TEST_ASSERT_NOT_NULL(lc2);
+    const char* t1 = ray_str_vec_get(lc2, 1, &slen);
+    TEST_ASSERT_NOT_NULL(t1);
+    TEST_ASSERT_EQ_U(slen, 2);
+    TEST_ASSERT_MEM_EQ(2, t1, "bb");
+    ray_release(loaded2);
+    ray_release(col_inl);
+    ray_release(tbl_inl);
+
+    rm_rf(dir_pool);
+    rm_rf(dir_inl);
+    PASS();
+}
+
 /* ---- Suite definition -------------------------------------------------- */
 
 const test_entry_t splay_entries[] = {
@@ -1071,5 +1149,6 @@ const test_entry_t splay_entries[] = {
     { "splay/trace_missing_col",          test_trace_missing_col,               splay_setup, splay_teardown },
     { "splay/trace_missing_sym_id",       test_trace_missing_sym_id,            splay_setup, splay_teardown },
     { "splay/save_schema_write_fails",    test_save_schema_write_fails,         splay_setup, splay_teardown },
+    { "splay/load_str_pool_heap",         test_load_str_pool_heap,              splay_setup, splay_teardown },
     { NULL, NULL, NULL, NULL },
 };

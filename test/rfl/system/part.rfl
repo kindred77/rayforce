@@ -1,5 +1,5 @@
 ;; src/store/part.c — exercise every reachable branch of ray_read_parted
-;; (the function backing .db.parted.get / .db.parted.mount) plus the
+;; (the function backing .db.parted.get) plus the
 ;; static helpers infer_mc_type, parse_date_dir, parse_int_dir,
 ;; is_date_dir, is_integer_str, and collect_part_dirs.
 ;;
@@ -10,7 +10,7 @@
 ;; below already exercise every line in part.c, no need to fan out.
 ;;
 ;; Fixture roots use the /tmp/rfl_part_* prefix so they don't collide
-;; with /tmp/rfl_mount_* (db_mount.rfl) or /tmp/rfl_splayed_* and
+;; with /tmp/rfl_get_* (db_get.rfl) or /tmp/rfl_splayed_* and
 ;; /tmp/rfl_parted/ (splayed.rfl).  Pre- and post-cleanup is mandatory:
 ;; stale sym.lk / .d files from a prior run cause "error: corrupt"
 ;; on the second open.
@@ -76,8 +76,7 @@
 (at (select {from: Pi where: (> n 100)}) 'n) -- [101 200 201 202 300]
 
 ;; ────────────── sym-partition path: RAY_MC_SYM branch ──────────────
-;; Names like "1.2.3" pass collect_part_dirs' digit/dot filter (and
-;; name_looks_partition, so .db.parted.mount accepts the root) but
+;; Names like "1.2.3" pass collect_part_dirs' digit/dot filter but
 ;; fail both is_date_dir (length != 10) and is_integer_str (has
 ;; dots) → infer_mc_type falls through to RAY_MC_SYM, exercising the
 ;; ray_sym_intern branch (lines 405-411 of part.c).
@@ -191,24 +190,6 @@
 (at (select {from: Plk where: (like url "*google*")}) 'url) -- ['google 'googlemaps]
 (at (select {from: Plk where: (like title "*google*")}) 'title) -- ["search google" "google news"]
 (at (select {from: Plk where: (and (!= url 'plain) (like url "*google*"))}) 'url) -- ['google 'googlemaps]
-
-;; ────────────── .db.parted.mount over int partitions ──────────────
-;; Mount needs at least one digit/dot subdir (dir_is_parted_root) and
-;; uses the first partition's subdirs as table names.  This double-
-;; covers the int branch via the mount entry point and binds the
-;; loaded table as the global `t` so we can re-assert against it.
-(set Mi (.db.parted.mount "/tmp/rfl_part_int/"))
-(type Mi) -- 'DICT
-(count Mi) -- 1
-;; t is now a global, equal to the .db.parted.get round-trip
-(count t) -- 6
-(count (key t)) -- 2
-;; the mounted table must carry the same VALUES as the .db.parted.get round-trip
-;; BUG (whole-column parted read un-materialised) — use sum + a partial filter.
-(sum (at t 'n)) -- 1104
-(min (at t 'n)) -- 100
-(max (at t 'n)) -- 300
-(at (select {from: t where: (> n 100)}) 'n) -- [101 200 201 202 300]
 
 ;; ────────────── error: empty db_root (collect_part_dirs IO) ──────────────
 ;; Directory exists but has zero matching subdirs.  collect_part_dirs

@@ -1,0 +1,89 @@
+;; Multi-table roots through the explicit .db trio — the surface left
+;; after the .db.*.mount removal: every table is opened by name with
+;; .db.splayed.get / .db.parted.get; nothing is discovered or bound
+;; implicitly.  Tests below cover correctness (round-trip values) for
+;; several splayed tables under one root, a multi-table parted root,
+;; and the error paths for wrong-format / missing roots.
+
+;; Stale /tmp dirs from a prior run flip .db.splayed.set to "corrupt"
+;; (overwrite path is a known bug — see splayed.rfl notes).  Wipe up
+;; front so the test is self-contained and re-runnable.
+(.sys.exec "rm -rf /tmp/rfl_get_splayed /tmp/rfl_get_parted")
+
+;; ────────────── several splayed tables under one root ──────────────
+(set Trades  (table [s p] (list ['AAPL 'GOOG] [100.0 200.0])))
+(set Quotes  (table [s b a] (list ['AAPL 'GOOG] [99.0 199.0] [101.0 201.0])))
+(set Returns (table [s r] (list ['AAPL 'GOOG] [0.01 -0.02])))
+
+(.db.splayed.set "/tmp/rfl_get_splayed/Trades"  Trades)
+(.db.splayed.set "/tmp/rfl_get_splayed/Quotes"  Quotes)
+(.db.splayed.set "/tmp/rfl_get_splayed/Returns" Returns)
+
+;; Wipe the originals so the post-get bindings provably came from disk.
+(set Trades  0)
+(set Quotes  0)
+(set Returns 0)
+
+(set Trades  (.db.splayed.get "/tmp/rfl_get_splayed/Trades/"))
+(set Quotes  (.db.splayed.get "/tmp/rfl_get_splayed/Quotes/"))
+(set Returns (.db.splayed.get "/tmp/rfl_get_splayed/Returns/"))
+
+(type Trades)  -- 'TABLE
+(type Quotes)  -- 'TABLE
+(type Returns) -- 'TABLE
+(count Trades)  -- 2
+(count Quotes)  -- 2
+(count Returns) -- 2
+;; Cardinality alone can't tell a correctly-loaded table from a stub of
+;; the same row count: pin the round-tripped COLUMN VALUES too.
+(sum (at Trades 'p))  -- 300.0       ;; [100.0 200.0]
+(sum (at Quotes 'b))  -- 298.0       ;; [99.0 199.0]
+(sum (at Quotes 'a))  -- 302.0       ;; [101.0 201.0]
+(sum (at Returns 'r)) -- -0.01       ;; [0.01 -0.02]
+;; sym column survives the round trip cell-for-cell.
+(at (at Trades 's) 0) -- 'AAPL
+(at (at Trades 's) 1) -- 'GOOG
+
+;; ────────────── multi-table parted root: 2 partitions × 2 tables ──────────────
+(set T-A0 (table [s v] (list ['a 'b] [1 2])))
+(set T-A1 (table [s v] (list ['c 'd] [3 4])))
+(set T-B0 (table [s v] (list ['e 'f] [5 6])))
+(set T-B1 (table [s v] (list ['g 'h] [7 8])))
+
+(.db.splayed.set "/tmp/rfl_get_parted/2024.01.01/A/" T-A0)
+(.db.splayed.set "/tmp/rfl_get_parted/2024.01.02/A/" T-A1)
+(.db.splayed.set "/tmp/rfl_get_parted/2024.01.01/B/" T-B0)
+(.db.splayed.set "/tmp/rfl_get_parted/2024.01.02/B/" T-B1)
+
+;; Each table of the root is opened explicitly by name.
+(set A (.db.parted.get "/tmp/rfl_get_parted/" 'A))
+(set B (.db.parted.get "/tmp/rfl_get_parted/" 'B))
+
+;; Each is the concatenated 2-partition view.
+(count A) -- 4   ;; 2 partitions × 2 rows each
+(count B) -- 4
+;; Cardinality says "4 rows" but not WHICH rows: verify the concatenated
+;; 'v column carries both partitions' values.  A = [1 2] (01.01) + [3 4]
+;; (01.02); B = [5 6] (01.01) + [7 8] (01.02).
+;; BUG: a raw whole-column read `(at A 'v)` returns the parted column
+;; UN-MATERIALISED (renders as <?>), so value-check via aggregates (which
+;; have a parted code path).
+(sum (at A 'v)) -- 10
+(min (at A 'v)) -- 1
+(max (at A 'v)) -- 4
+(sum (at B 'v)) -- 26
+(min (at B 'v)) -- 5
+(max (at B 'v)) -- 8
+
+;; ────────────── error path: not a parted root ──────────────
+;; The splayed root from the first test has no partition directories,
+;; so .db.parted.get on it must fail rather than returning an empty
+;; table (which would silently mask the wrong-format mistake).
+(.db.parted.get "/tmp/rfl_get_splayed/" 'Trades) !- io
+
+;; ────────────── error path: nonexistent directory ──────────────
+(.db.splayed.get "/tmp/rfl_get_does_not_exist/")    !- io
+(.db.parted.get  "/tmp/rfl_get_does_not_exist/" 't) !- io
+
+;; ────────────── cleanup ──────────────
+(.sys.exec "rm -rf /tmp/rfl_get_splayed /tmp/rfl_get_parted") -- 0

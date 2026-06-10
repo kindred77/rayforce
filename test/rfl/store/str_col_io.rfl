@@ -1,14 +1,16 @@
 ;; Coverage for src/store/col.c: col_load_str_vec (STRV-magic legacy reader)
-;; and col_copy_str_pool (deep-copy of the STR byte pool on non-mmap load).
+;; plus mmap-path round-trip checks for STR columns.
 ;;
-;; Reachability map (per llvm-cov, both 0% on master before this test):
+;; Reachability map (per llvm-cov):
 ;;
 ;;   col_copy_str_pool  — reached via ray_col_load on a STR column file
 ;;                        written by ray_col_save (no magic, raw header).
 ;;                        `.db.splayed.get` uses the mmap loader, so it
-;;                        bypasses copy_str_pool entirely.  `.db.splayed.mount`
-;;                        calls ray_splay_load → ray_col_load (no mmap),
-;;                        which hits col_copy_str_pool for every STR column.
+;;                        bypasses copy_str_pool entirely.  The heap loader
+;;                        (ray_splay_load) left the language surface with
+;;                        the .db.*.mount removal, so col_copy_str_pool
+;;                        coverage lives in C now: test_splay.c
+;;                        splay/load_str_pool_heap.
 ;;
 ;;   col_load_str_vec   — reached when ray_col_load sees the legacy STRV
 ;;                        magic (0x53 0x54 0x52 0x56 = "STRV").  Newer
@@ -28,43 +30,34 @@
 (.sys.exec "rm -rf rf_test_str_io_*") -- 0
 
 ;; ════════════════════════════════════════════════════════════════
-;; 1. col_copy_str_pool main path — STR column with long strings
-;;    (>12 bytes = RAY_STR_INLINE_MAX) so str_pool->len > 0.
+;; 1. mmap round-trip — STR column with long strings (>12 bytes =
+;;    RAY_STR_INLINE_MAX) so the column carries a non-empty str_pool.
 ;;
-;;    .db.splayed.set writes a 32-byte STR header + str_pool header
-;;    + bytes (no magic).  .db.splayed.mount uses ray_splay_load
-;;    (non-mmap) → ray_col_load → col_copy_str_pool's main branch:
-;;    ray_alloc + memcpy of 32 + pool_size bytes, then rc/attr fixup.
+;; 2. mmap round-trip — STR column whose strings all fit inline
+;;    (≤12 bytes), str_pool empty.
 ;;
-;; 2. col_copy_str_pool empty-pool branch — STR column whose strings
-;;    all fit inline (≤12 bytes) so str_pool->len == 0.  Validation
-;;    still sets has_str_pool=true, but col_copy_str_pool returns
-;;    NULL at line 745 ("if (cm->str_pool_size == 0)") — the early
-;;    exit that the long-strings path can't hit.
+;;    (The heap-loader deep-copy of these pools — col_copy_str_pool —
+;;    is covered at C level by test_splay.c splay/load_str_pool_heap.)
 ;; ════════════════════════════════════════════════════════════════
 (set Tpool (table [id name] (list [1 2 3] ["a-very-long-pooled-string" "another-pooled-string-too" "third-pooled-string-here"])))
 (set Tinl  (table [id name] (list [10 20]  ["aa" "bb"])))
 
-(.db.splayed.set "rf_test_str_io_mount/pool"   Tpool)
-(.db.splayed.set "rf_test_str_io_mount/inline" Tinl)
+(.db.splayed.set "rf_test_str_io_dirs/pool"   Tpool)
+(.db.splayed.set "rf_test_str_io_dirs/inline" Tinl)
 
-;; Drop the local bindings so the mount must reconstruct the tables
-;; from disk — proves col_copy_str_pool actually rebuilt the pools.
+;; Drop the local bindings so the gets must reconstruct the tables
+;; from disk.
 (set Tpool 0)
 (set Tinl  0)
 
-(.db.splayed.mount "rf_test_str_io_mount/")
+(set pool   (.db.splayed.get "rf_test_str_io_dirs/pool/"))
+(set inline (.db.splayed.get "rf_test_str_io_dirs/inline/"))
 
-;; `pool` and `inline` are now globals bound by the mount.  Every
-;; assertion below is a byte-exact value read from the deep-copied
-;; pool/inline column — the only way they can match is if
-;; col_copy_str_pool preserved both the 32-byte ray_t header and
-;; the payload bytes.
+;; Every assertion below is a byte-exact value read back from disk.
 (count pool) -- 3
 (at (at pool 'name) 0) -- "a-very-long-pooled-string"
 (at (at pool 'name) 2) -- "third-pooled-string-here"
-;; Inline branch — pool_size == 0, early NULL return; the STR values
-;; sit entirely in the 16-byte ray_str_t descriptor.
+;; Inline strings sit entirely in the 16-byte ray_str_t descriptor.
 (count inline) -- 2
 (at (at inline 'name) 1) -- "bb"
 
