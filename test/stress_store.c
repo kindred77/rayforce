@@ -37,6 +37,24 @@ static void op_logf(stress_ctx_t* c, const char* fmt, ...) {
     c->oplog_len++;
 }
 
+__attribute__((unused)) /* used by later tasks */
+static void dump_failure(stress_ctx_t* c, const char* fmt, ...) {
+    char why[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(why, sizeof(why), fmt, ap);
+    va_end(ap);
+    fprintf(stderr, "\n=== STRESS FAILURE: %s\n", why);
+    fprintf(stderr, "=== seed=%llu  db=%s (left on disk for inspection)\n",
+            (unsigned long long)c->seed, c->db_root);
+    int total = c->oplog_len;
+    int n     = total < STRESS_OPLOG_CAP ? total : STRESS_OPLOG_CAP;
+    fprintf(stderr, "=== op log (last %d of %d ops):\n", n, total);
+    for (int i = total - n; i < total; i++)
+        fprintf(stderr, "  %5d: %s\n", i, c->oplog[i % STRESS_OPLOG_CAP]);
+    c->failed = true;
+}
+
 /* ---- shadow row arrays (plain malloc — independent of rayforce heap) ---- */
 
 static bool rows_reserve(stress_rows_t* r, int64_t need) {
@@ -74,6 +92,11 @@ static void rows_free(stress_rows_t* r) {
 }
 
 /* ---- row generation ----------------------------------------------------- */
+
+__attribute__((unused)) /* used by later tasks */
+static bool row_is_null(const stress_row_t* row) {
+    return row->ticker[0] == '\0';
+}
 
 static void gen_row(stress_ctx_t* c, stress_sym_pattern_t pat,
                     stress_row_t* out) {
