@@ -287,14 +287,10 @@ static test_result_t test_validate_sym_no_sym_cols(void) {
     /* Load WITHOUT sym_path so sym table stays empty.
      * validate_sym_columns: sym_count==0, nc==1, no RAY_SYM col → RAY_OK */
     ray_t* loaded = ray_splay_load(dir, NULL);
-    /* May fail because sym IDs in .d are unknown without the sym file — that
-     * hits the name_atom==NULL path (corrupt).  That is also a valid and
-     * covered path, so just check it is either ok or an error. */
-    if (loaded && !RAY_IS_ERR(loaded)) {
-        ray_release(loaded);
-    } else if (loaded) {
-        ray_release(loaded);
-    }
+    TEST_ASSERT_NOT_NULL(loaded);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    TEST_ASSERT_EQ_I(ray_table_nrows(loaded), 3);
+    ray_release(loaded);
 
     ray_release(col);
     ray_release(tbl);
@@ -532,8 +528,6 @@ static test_result_t test_load_corrupt_col_name_in_schema(void) {
     const char* dir = TMP_SPLAY_BASE "/corrupt_name";
     rm_rf(dir);
 
-    /* Intern a name that starts with '.' so the string is available */
-    int64_t id_dot = ray_sym_intern(".bad", 4);
     int64_t id_ok  = ray_sym_intern("okname", 6);
 
     int64_t raw[] = {1, 2};
@@ -548,9 +542,10 @@ static test_result_t test_load_corrupt_col_name_in_schema(void) {
     ray_err_t save_err = ray_splay_save(tbl, dir, NULL);
     TEST_ASSERT_EQ_I(save_err, RAY_OK);
 
-    /* Overwrite .d with a schema that has id_dot */
-    ray_t* fake_schema = ray_vec_from_raw(RAY_I64, &id_dot, 1);
+    /* Overwrite .d with a schema naming a '.'-prefixed column */
+    ray_t* fake_schema = ray_vec_new(RAY_STR, 1);
     TEST_ASSERT_NOT_NULL(fake_schema);
+    fake_schema = ray_str_vec_append(fake_schema, ".bad", 4);
     TEST_ASSERT_FALSE(RAY_IS_ERR(fake_schema));
 
     char d_path[512];
@@ -615,7 +610,6 @@ static test_result_t test_load_col_path_too_long(void) {
     memset(long_name, 'c', sizeof(long_name) - 1);
     long_name[sizeof(long_name) - 1] = '\0';
 
-    int64_t id_long = ray_sym_intern(long_name, sizeof(long_name) - 1);
     int64_t id_ok   = ray_sym_intern("shortcol", 8);
 
     int64_t raw[] = {1, 2};
@@ -630,10 +624,11 @@ static test_result_t test_load_col_path_too_long(void) {
     ray_err_t save_err = ray_splay_save(tbl, dir, NULL);
     TEST_ASSERT_EQ_I(save_err, RAY_OK);
 
-    /* Overwrite .d with the long-name sym ID */
+    /* Overwrite .d with the overlong column name */
     extern ray_err_t ray_col_save(ray_t* vec, const char* path);
-    ray_t* fake_schema = ray_vec_from_raw(RAY_I64, &id_long, 1);
+    ray_t* fake_schema = ray_vec_new(RAY_STR, 1);
     TEST_ASSERT_NOT_NULL(fake_schema);
+    fake_schema = ray_str_vec_append(fake_schema, long_name, sizeof(long_name) - 1);
     TEST_ASSERT_FALSE(RAY_IS_ERR(fake_schema));
 
     char d_path[64];
@@ -939,12 +934,12 @@ static test_result_t test_trace_missing_col(void) {
 }
 
 /* =========================================================================
- * 24. RAY_CSV_TRACE env: trace=true + sym ID not found in sym table
- *     → hits lines 183-185 fprintf (missing schema symbol branch).
- *     Use the same corrupt-schema technique: save table, reset sym table,
- *     reload without sym_path so name_atom is NULL on first column.
+ * 24. RAY_CSV_TRACE env: trace=true + fresh process (sym table reset).
+ *     With the self-describing STR .d schema, the old "missing schema
+ *     symbol" scenario no longer exists — the load now SUCCEEDS even with
+ *     an empty sym table and no symfile.
  * ========================================================================= */
-static test_result_t test_trace_missing_sym_id(void) {
+static test_result_t test_trace_fresh_load(void) {
     const char* dir = TMP_SPLAY_BASE "/trace_missym";
     rm_rf(dir);
 
@@ -958,16 +953,16 @@ static test_result_t test_trace_missing_sym_id(void) {
     ray_err_t err = ray_splay_save(tbl, dir, NULL);
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
-    /* Reset sym table — now name_id for "tc" is no longer valid */
+    /* Reset sym table — schema self-describes, no symfile needed */
     ray_sym_destroy();
     (void)ray_sym_init();
 
     setenv("RAY_CSV_TRACE", "1", 1);
     ray_t* r = ray_splay_load(dir, NULL);
     unsetenv("RAY_CSV_TRACE");
-
-    TEST_ASSERT_TRUE(!r || RAY_IS_ERR(r));
-    if (r) ray_release(r);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
 
     ray_release(col);
     ray_release(tbl);
@@ -1122,6 +1117,57 @@ static test_result_t test_load_str_pool_heap(void) {
     PASS();
 }
 
+/* =========================================================================
+ * 28. Self-describing .d: a symbol-free table saved WITHOUT any symfile
+ *     loads in a "fresh process" (sym table reset, no symfile passed).
+ *     Impossible with the old I64-id .d format — this is the regression
+ *     gate for the STR-schema change.
+ * ========================================================================= */
+static test_result_t test_selfdescribing_schema_fresh_process(void) {
+    const char* dir = TMP_SPLAY_BASE "/selfdesc";
+    rm_rf(dir);
+
+    int64_t id_a = ray_sym_intern("alpha", 5);
+    int64_t id_b = ray_sym_intern("beta", 4);
+    int64_t raw[] = {7, 8, 9};
+    double  rawf[] = {1.5, 2.5, 3.5};
+    ray_t* col_a = ray_vec_from_raw(RAY_I64, raw, 3);
+    ray_t* col_b = ray_vec_from_raw(RAY_F64, rawf, 3);
+    TEST_ASSERT_NOT_NULL(col_a);
+    TEST_ASSERT_NOT_NULL(col_b);
+
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, id_a, col_a);
+    tbl = ray_table_add_col(tbl, id_b, col_b);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    TEST_ASSERT_EQ_I(ray_splay_save(tbl, dir, NULL), RAY_OK);
+
+    /* simulate a fresh process: wipe the in-memory sym table */
+    ray_sym_destroy();
+    (void)ray_sym_init();
+    TEST_ASSERT_EQ_U(ray_sym_count(), 1); /* "" reserved */
+
+    ray_t* loaded = ray_splay_load(dir, NULL);
+    TEST_ASSERT_NOT_NULL(loaded);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    TEST_ASSERT_EQ_I(ray_table_ncols(loaded), 2);
+    TEST_ASSERT_EQ_I(ray_table_nrows(loaded), 3);
+    /* column names round-tripped as strings */
+    ray_t* n0 = ray_sym_str(ray_table_col_name(loaded, 0));
+    TEST_ASSERT_NOT_NULL(n0);
+    TEST_ASSERT_EQ_U(ray_str_len(n0), 5);
+    TEST_ASSERT_MEM_EQ(5, ray_str_ptr(n0), "alpha");
+    int64_t* la = (int64_t*)ray_data(ray_table_get_col_idx(loaded, 0));
+    TEST_ASSERT_EQ_I(la[2], 9);
+
+    ray_release(loaded);
+    ray_release(col_a);
+    ray_release(col_b);
+    ray_release(tbl);
+    rm_rf(dir);
+    PASS();
+}
+
 /* ---- Suite definition -------------------------------------------------- */
 
 const test_entry_t splay_entries[] = {
@@ -1147,8 +1193,9 @@ const test_entry_t splay_entries[] = {
     { "splay/trace_valid_dir",            test_trace_valid_dir,                 splay_setup, splay_teardown },
     { "splay/trace_missing_schema",       test_trace_missing_schema,            splay_setup, splay_teardown },
     { "splay/trace_missing_col",          test_trace_missing_col,               splay_setup, splay_teardown },
-    { "splay/trace_missing_sym_id",       test_trace_missing_sym_id,            splay_setup, splay_teardown },
+    { "splay/trace_fresh_load",           test_trace_fresh_load,                splay_setup, splay_teardown },
     { "splay/save_schema_write_fails",    test_save_schema_write_fails,         splay_setup, splay_teardown },
     { "splay/load_str_pool_heap",         test_load_str_pool_heap,              splay_setup, splay_teardown },
+    { "splay/selfdescribing_schema",      test_selfdescribing_schema_fresh_process, splay_setup, splay_teardown },
     { NULL, NULL, NULL, NULL },
 };
