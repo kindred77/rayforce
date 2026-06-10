@@ -78,3 +78,32 @@
 (at (at _Rht 'mx) 0) -- 'xyz
 (at (at _Rht 'mn) 1) -- 'acb      ;; group k=1000000: {acb, def} → acb
 (at (at _Rht 'mx) 1) -- 'def
+
+;; ─── Multi-worker DA sequential merge (small slot count) ──────────
+;; Regression: the sequential per-worker DA merge (taken when
+;; n_slots < 1024) compared SYM MIN/MAX partial winners by raw intern
+;; id, unlike da_merge_fn's lexicographic merge — wrong winner whenever
+;; intern order != lex order across worker partials.
+;;
+;; Trigger: >= RAY_PARALLEL_THRESHOLD (65536) rows so da_n_workers > 1,
+;; a 7-value key so n_slots = 7 << 1024 (sequential merge), and 'zzz
+;; interned BEFORE 'aaa so id order is the reverse of lex order.  Each
+;; group is ~14k 'zzz rows plus exactly one 'aaa row (rows 70000..70006
+;; cover all 7 groups), so most worker partials are 'zzz while one is
+;; 'aaa: id-order merge picks 'zzz for min ('aaa for max) — lex merge
+;; must pick 'aaa for min ('zzz for max).
+(set _seed ['zzz 'aaa])           ;; intern 'zzz first: id('zzz) < id('aaa)
+(set _Nmw 100000)
+(set _Smw (concat (take ['zzz] 70000) (concat (take ['aaa] 7) (take ['zzz] 29993))))
+(set _Tmw (table [k v] (list (as 'I64 (% (til _Nmw) 7)) _Smw)))
+(set _Rmw (select {mn: (min v) mx: (max v) by: k from: _Tmw}))
+(count (at _Rmw 'k)) -- 7
+(distinct (at _Rmw 'mn)) -- ['aaa]
+(distinct (at _Rmw 'mx)) -- ['zzz]
+;; Same data through the has_first_last sequential merge block (FIRST/
+;; LAST force the row-index-aware serial merge) — it had the same bug.
+(set _Rmwf (select {f: (first v) l: (last v) mn: (min v) mx: (max v) by: k from: _Tmw}))
+(distinct (at _Rmwf 'mn)) -- ['aaa]
+(distinct (at _Rmwf 'mx)) -- ['zzz]
+(distinct (at _Rmwf 'f))  -- ['zzz]
+(distinct (at _Rmwf 'l))  -- ['zzz]
