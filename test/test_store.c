@@ -397,13 +397,13 @@ static test_result_t test_splay_str_column_roundtrip(void) {
  * Regression: short string columns must remain readable through
  * ray_read_splayed.  Older files used STRV and could be smaller than the
  * raw header; newer files use the raw RAY_STR layout and mmap directly.
+ * The two file-size edge cases (24-byte 1-row, 14-byte 0-row) are saved
+ * as separate single-column tables: load now rejects ragged column
+ * lengths, so they can no longer share one table.
  * ---------------------------------------------------------------------- */
 
 static test_result_t test_splay_short_strv_roundtrip(void) {
     (void)!system("rm -rf " TMP_SPLAY_DIR);
-
-    ray_t* tbl = ray_table_new(2);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
 
     int64_t id_short = ray_sym_intern("short", 5);
     int64_t id_empty = ray_sym_intern("empty", 5);
@@ -415,13 +415,8 @@ static test_result_t test_splay_short_strv_roundtrip(void) {
     shorts = ray_str_vec_append(shorts, "hi", 2);
     TEST_ASSERT_FALSE(RAY_IS_ERR(shorts));
 
-    /* 0-row STRV -- 14 bytes on disk */
-    ray_t* empty = ray_vec_new(RAY_STR, 0);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(empty));
-
+    ray_t* tbl = ray_table_new(1);
     tbl = ray_table_add_col(tbl, id_short, shorts);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
-    tbl = ray_table_add_col(tbl, id_empty, empty);
     TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
 
     ray_err_t err = ray_splay_save(tbl, TMP_SPLAY_DIR, NULL);
@@ -430,26 +425,45 @@ static test_result_t test_splay_short_strv_roundtrip(void) {
     ray_t* loaded = ray_read_splayed(TMP_SPLAY_DIR, NULL);
     TEST_ASSERT_NOT_NULL(loaded);
     TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
-    TEST_ASSERT_EQ_I(ray_table_ncols(loaded), 2);
+    TEST_ASSERT_EQ_I(ray_table_ncols(loaded), 1);
 
     ray_t* loaded_shorts = ray_table_get_col(loaded, id_short);
-    ray_t* loaded_empty  = ray_table_get_col(loaded, id_empty);
     TEST_ASSERT_NOT_NULL(loaded_shorts);
-    TEST_ASSERT_NOT_NULL(loaded_empty);
     TEST_ASSERT_EQ_I(loaded_shorts->type, RAY_STR);
     TEST_ASSERT_EQ_I(loaded_shorts->len, 1);
-    TEST_ASSERT_EQ_I(loaded_empty->type, RAY_STR);
-    TEST_ASSERT_EQ_I(loaded_empty->len, 0);
 
     size_t slen = 0;
     const char* s0 = ray_str_vec_get(loaded_shorts, 0, &slen);
     TEST_ASSERT_EQ_U(slen, 2);
     TEST_ASSERT_MEM_EQ(2, s0, "hi");
+    ray_release(loaded);
+
+    /* 0-row STRV -- 14 bytes on disk; re-set sweeps the previous column */
+    ray_t* empty = ray_vec_new(RAY_STR, 0);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(empty));
+
+    ray_t* tbl2 = ray_table_new(1);
+    tbl2 = ray_table_add_col(tbl2, id_empty, empty);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl2));
+
+    err = ray_splay_save(tbl2, TMP_SPLAY_DIR, NULL);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    loaded = ray_read_splayed(TMP_SPLAY_DIR, NULL);
+    TEST_ASSERT_NOT_NULL(loaded);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    TEST_ASSERT_EQ_I(ray_table_ncols(loaded), 1);
+
+    ray_t* loaded_empty = ray_table_get_col(loaded, id_empty);
+    TEST_ASSERT_NOT_NULL(loaded_empty);
+    TEST_ASSERT_EQ_I(loaded_empty->type, RAY_STR);
+    TEST_ASSERT_EQ_I(loaded_empty->len, 0);
 
     ray_release(loaded);
     ray_release(shorts);
     ray_release(empty);
     ray_release(tbl);
+    ray_release(tbl2);
 
     (void)!system("rm -rf " TMP_SPLAY_DIR);
     PASS();

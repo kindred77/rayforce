@@ -1278,6 +1278,89 @@ static test_result_t test_torn_write_heals(void) {
     PASS();
 }
 
+/* =========================================================================
+ * 31. Nested symbols in LIST columns force a symfile: a table whose only
+ *     symbol data lives inside a list column must persist the dictionary
+ *     (regression: the no-symfile exemption checked top-level types only
+ *     and reloaded such tables with silently wrong symbols).
+ * ========================================================================= */
+static test_result_t test_nested_sym_list_symfile(void) {
+    const char* dir  = TMP_SPLAY_BASE "/nested_sym";
+    const char* symp = TMP_SPLAY_BASE "/nested_sym_symfile";
+    rm_rf(dir);
+    unlink(symp);
+
+    int64_t id_l = ray_sym_intern("l", 1);
+    int64_t s1 = ray_sym_intern("aa", 2);
+    int64_t s2 = ray_sym_intern("bb", 2);
+
+    ray_t* inner = ray_sym_vec_new(RAY_SYM_W64, 2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(inner));
+    inner = ray_vec_append(inner, &s1);
+    inner = ray_vec_append(inner, &s2);
+
+    ray_t* lst = ray_list_new(1);
+    lst = ray_list_append(lst, inner);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(lst));
+
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, id_l, lst);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+
+    TEST_ASSERT_EQ_I(ray_splay_save(tbl, dir, symp), RAY_OK);
+    /* the dictionary MUST have been persisted */
+    TEST_ASSERT_EQ_I(access(symp, F_OK), 0);
+
+    ray_release(inner);
+    ray_release(lst);
+    ray_release(tbl);
+    rm_rf(dir);
+    unlink(symp);
+    PASS();
+}
+
+/* =========================================================================
+ * 32. Ragged column lengths -> loud corrupt (the detectable half of the
+ *     in-place overwrite crash window): hand-shorten one column file's
+ *     row count by rewriting it from a narrower vec.
+ * ========================================================================= */
+static test_result_t test_ragged_columns_corrupt(void) {
+    const char* dir = TMP_SPLAY_BASE "/ragged";
+    rm_rf(dir);
+
+    int64_t id_a = ray_sym_intern("a", 1);
+    int64_t id_b = ray_sym_intern("b", 1);
+    int64_t raw3[] = {1, 2, 3};
+    ray_t* col_a = ray_vec_from_raw(RAY_I64, raw3, 3);
+    ray_t* col_b = ray_vec_from_raw(RAY_I64, raw3, 3);
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, id_a, col_a);
+    tbl = ray_table_add_col(tbl, id_b, col_b);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    TEST_ASSERT_EQ_I(ray_splay_save(tbl, dir, NULL), RAY_OK);
+
+    /* shorten b on disk (simulates old-generation leftover) */
+    int64_t raw2[] = {9, 9};
+    ray_t* shorter = ray_vec_from_raw(RAY_I64, raw2, 2);
+    char bpath[512];
+    snprintf(bpath, sizeof(bpath), "%s/b", dir);
+    extern ray_err_t ray_col_save(ray_t* vec, const char* path);
+    TEST_ASSERT_EQ_I(ray_col_save(shorter, bpath), RAY_OK);
+
+    ray_t* r = ray_splay_load(dir, NULL);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    TEST_ASSERT_STR_EQ(ray_err_code(r), "corrupt");
+    ray_release(r);
+
+    ray_release(shorter);
+    ray_release(col_a);
+    ray_release(col_b);
+    ray_release(tbl);
+    rm_rf(dir);
+    PASS();
+}
+
 /* ---- Suite definition -------------------------------------------------- */
 
 const test_entry_t splay_entries[] = {
@@ -1309,5 +1392,7 @@ const test_entry_t splay_entries[] = {
     { "splay/selfdescribing_schema",      test_selfdescribing_schema_fresh_process, splay_setup, splay_teardown },
     { "splay/save_sweeps_stale",          test_save_sweeps_stale_and_skips_sym, splay_setup, splay_teardown },
     { "splay/torn_write_heals",           test_torn_write_heals,                splay_setup, splay_teardown },
+    { "splay/nested_sym_list_symfile",    test_nested_sym_list_symfile,         splay_setup, splay_teardown },
+    { "splay/ragged_columns_corrupt",     test_ragged_columns_corrupt,          splay_setup, splay_teardown },
     { NULL, NULL, NULL, NULL },
 };
