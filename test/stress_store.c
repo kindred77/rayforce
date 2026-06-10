@@ -76,6 +76,7 @@ static bool rows_append(stress_rows_t* r, const stress_row_t* row) {
 
 static void rows_trim(stress_rows_t* r, bool tail, int64_t n) {
     if (n > r->len) n = r->len;
+    if (n <= 0) return; /* nothing to do; also avoids memmove(NULL, NULL, 0) UB */
     if (!tail)
         memmove(r->rows, r->rows + n,
                 (size_t)(r->len - n) * sizeof(stress_row_t));
