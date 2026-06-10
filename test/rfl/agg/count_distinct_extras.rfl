@@ -152,7 +152,7 @@
 ;; count(distinct) helper at L2648.
 
 ;; 13) STR by-key + I64 distinct column.  Column ref → src is bound
-;;     directly (the `inner_expr->type == -RAY_SYM && RAY_ATTR_NAME`
+;;     directly (the `inner_expr->type == -RAY_SYM && ATTR_QUOTED`
 ;;     fast path inside count_distinct_per_group_groups).
 (set Tstr (table [Name v] (list (list "a" "b" "a" "b" "a" "c") [1 2 1 3 2 5])))
 (set Rstr (select {Name: Name n: (count (distinct v)) from: Tstr by: Name}))

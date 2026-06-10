@@ -5585,7 +5585,7 @@ static test_result_t test_expr_set_all_null_large(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    /* Create a large vector (200 elements) to trigger ext nullmap path */
+    /* Create a large vector (200 elements) to trigger ext null path */
     int64_t raw[200];
     int64_t null_vals[200];
     for (int i = 0; i < 200; i++) { raw[i] = i + 1; null_vals[i] = 0; }
@@ -6219,19 +6219,19 @@ static test_result_t test_expr_propagate_nulls_large(void) {
     (void)ray_sym_init();
 
     /* 200-element vector with a null at position 150 (>128) — forces
-     * ext nullmap alloc on the source, which then triggers the ext-alloc
+     * ext null bitmap alloc on the source, which then triggers the ext-alloc
      * path in propagate_nulls (line 1097) for the destination. */
     int64_t raw[200];
     for (int i = 0; i < 200; i++) raw[i] = i + 1;
     ray_t* v = ray_vec_from_raw(RAY_I64, raw, 200);
-    ray_vec_set_null(v, 150, true);  /* pos >128 forces ext nullmap on src */
+    ray_vec_set_null(v, 150, true);  /* pos >128 forces ext null bitmap on src */
     int64_t na = ray_sym_intern("a", 1);
     ray_t* tbl = ray_table_new(1);
     tbl = ray_table_add_col(tbl, na, v);
     ray_release(v);
 
     /* Unary neg on nullable I64 vec (len=200) → exec_elementwise_unary
-     * → propagate_nulls(src=200-elem nullable, dst=200-elem vec without ext nullmap) */
+     * → propagate_nulls(src=200-elem nullable, dst=200-elem vec without ext null bitmap) */
     ray_graph_t* g = ray_graph_new(tbl);
     ray_op_t* a = ray_scan(g, "a");
     ray_op_t* ng = ray_neg(g, a);

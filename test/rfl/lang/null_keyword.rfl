@@ -1,0 +1,22 @@
+;; Regression: the `null` keyword evaluated to C NULL, so using it where the
+;; consumer derefs the value (list-head dispatch; is_truthy/ray_atom_is_null_fn)
+;; segfaulted. It now yields RAY_NULL_OBJ. Asserted with value-robust predicates
+;; (null's rendering is sym-table-state dependent across test isolation).
+
+;; null is the null value, not a function
+(nil? null) -- true
+(== null null) -- true
+
+;; applying null as a function head → clean type error, no crash
+(null) !- type
+(null 1) !- type
+
+;; null is falsy in a condition → else branch, no crash
+(if null 1 2) -- 2
+(if 1 10 20) -- 10
+
+;; producer parity: split-of-empty, ser/de round-trip, resolve-of-unbound
+;; all yield the same null value
+(nil? (split [] [])) -- true
+(nil? (de (ser null))) -- true
+(nil? (resolve 'zz_unbound_xyz_qq123)) -- true

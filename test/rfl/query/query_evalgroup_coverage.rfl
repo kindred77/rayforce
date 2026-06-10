@@ -277,7 +277,7 @@
 ;;   → line 3081: memset(dst, 0, n) for W8
 ;; RAY_ATOM_IS_NULL(0Ns) → case RAY_SYM: i64==0 → true
 ;;   → line 3106: v->attrs |= RAY_ATTR_HAS_NULLS
-;;   → line 3107: memset(v->nullmap, 0xFF, 16)
+;;   → line 3107: memset(v->aux, 0xFF, 16)
 ;; ────────────────────────────────────────────────────────────────────
 (set Tbcast_null (table [k v] (list ['X 'Y 'Z] [10 20 30])))
 ;; extra: 0Ns (null SYM, id=0) → W8 memset + null propagation

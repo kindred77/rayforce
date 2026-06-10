@@ -339,7 +339,7 @@
 
 ;; ====================================================================
 ;; Update WHERE SYM/STR null-bit propagation — query.c:4211-4229.
-;; STR / SYM columns hit dedicated merge loops with nullmap.
+;; STR / SYM columns hit dedicated merge loops with null handling.
 ;; ====================================================================
 
 (set TupS (table [id s] (list [1 2 3 4] (list "a" "b" "c" "d"))))

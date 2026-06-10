@@ -1146,7 +1146,7 @@ static test_result_t test_eval_select_lambda_arity_err(void) {
  * Regression: compile_expr_dag routed typed null literals
  * (`-RAY_I64` with RAY_ATOM_IS_NULL set) through the fast ctors
  * `ray_const_i64` etc., which carry only the raw value — the
- * null flag stored in atom->nullmap[0] was dropped.  Downstream
+ * null flag stored in atom->aux[0] was dropped.  Downstream
  * fix_null_comparisons saw a non-null scalar rhs and didn't
  * apply null semantics, so `(== k 0N)` missed null rows and
  * `(!= k 0N)` leaked them through.  Now typed null atoms fall
@@ -3602,10 +3602,11 @@ static test_result_t test_dotted_temporal_truncate_atom(void) {
 static test_result_t test_select_nonagg_dotted_temporal(void) {
     /* Non-agg output expression using a dotted-temporal ref — e.g.
      * `s: Timestamp.ss` — must flow through the scatter path the same
-     * way a plain column ref would.  Previously expr_bind_table_names
-     * checked the whole dotted sym against the table schema, found no
-     * column named "Timestamp.ss", and silently skipped binding — so
-     * the subsequent ray_eval fell off the env and reported undefined. */
+     * way a plain column ref would.  All columns of the from-table are
+     * mounted into the query's local scope for eval, so the dotted
+     * temporal ref `Timestamp.ss` resolves against the mounted `Timestamp`
+     * column by ordinary name lookup rather than requiring a schema match
+     * on the whole dotted symbol. */
     ray_eval_str(
         "(set __sy (table [Sym Ts] "
         "(list ['A 'B 'A 'B 'A] "
@@ -3818,7 +3819,7 @@ static test_result_t test_dag_temporal_extract_nulls(void) {
      * query) used to decode the raw null-sentinel bytes and emit bogus
      * I64 / timestamp values *without* setting the output null bit.
      * The null sentinel for RAY_TIMESTAMP is 0 (distinguished by the
-     * nullmap bit, not the value), so the extract kernel silently
+     * null bit, not the value), so the extract kernel silently
      * turned every null into `.ss == 0` and lost null-awareness for
      * all downstream consumers.
      *
@@ -4498,7 +4499,7 @@ static test_result_t test_eval_undefined_name(void) {
 /* --- null keyword evaluates to null --- */
 static test_result_t test_eval_null_keyword(void) {
     ray_t* r = ray_eval_str("null");
-    TEST_ASSERT_NULL(r);
+    TEST_ASSERT(RAY_IS_NULL(r), "null keyword yields the null singleton");
     PASS();
 }
 
@@ -6626,8 +6627,77 @@ static test_result_t test_temporal_date_trunc_month_case(void) {
 }
 
 
+/* Binding well past the old fixed 64-slot frame in a single scope must
+ * still resolve every entry — proves the scope frame grows. */
+static test_result_t test_env_scope_frame_grows(void) {
+    const int N = 200;                 /* > old FRAME_CAP (64) */
+    ray_env_push_scope();
+    for (int i = 0; i < N; i++) {
+        char name[16];
+        int len = snprintf(name, sizeof name, "_g%d", i);
+        int64_t sym = ray_sym_intern(name, (size_t)len);
+        ray_t* v = ray_i64(i);
+        ray_err_t rc = ray_env_set_local(sym, v);
+        ray_release(v);
+        TEST_ASSERT_EQ_I(rc, RAY_OK);  /* old code returns OOM past slot 64 */
+    }
+    for (int i = 0; i < N; i++) {
+        char name[16];
+        int len = snprintf(name, sizeof name, "_g%d", i);
+        int64_t sym = ray_sym_intern(name, (size_t)len);
+        ray_t* r = ray_env_resolve(sym);   /* owned ref */
+        TEST_ASSERT_NOT_NULL(r);
+        TEST_ASSERT_EQ_I(r->type, -RAY_I64);
+        TEST_ASSERT_EQ_I(r->i64, (int64_t)i);
+        ray_release(r);
+    }
+    ray_env_pop_scope();
+    PASS();
+}
+
+
+/* A table with > 64 columns must be queryable: mounting all columns into one
+ * scope frame would overflow the old fixed 64-slot frame.  The table is built
+ * column-by-column via `update` because a single vary-call (e.g. `list`) is
+ * capped at 64 args in the eval apply path — that cap is unrelated to the
+ * scope-frame growth under test.  The projection is a runtime-built column
+ * reference wrapped in `eval`; that head is non-vectorizable, and with a
+ * scalar `by:` key the non-agg projection routes through a tree-walk
+ * bind_all_columns site where every column is mounted in scope.  The last
+ * column's ref is produced at runtime via `(quote c<last>)`, so a static AST
+ * walk never saw it — it can only resolve because all NCOL columns were
+ * mounted. */
+static test_result_t test_query_wide_table_over_64_cols(void) {
+    const int NCOL = 70;
+    const int LAST = NCOL - 1;          /* reference the last column */
+    char buf[16384];
+    int off = 0;
+    off += snprintf(buf + off, sizeof buf - off,
+                    "(do (set W (table [c0] (list [0]))) ");
+    for (int i = 1; i < NCOL; i++)
+        off += snprintf(buf + off, sizeof buf - off,
+                        "(set W (update {c%d: %d from: W})) ", i, i);
+    /* Runtime-built ref to the last column, through a tree-walk
+     * bind_all_columns site (by: c0).  Collapses to the scalar value LAST. */
+    off += snprintf(buf + off, sizeof buf - off,
+                    "(set c (quote c%d)) "
+                    "(at (at (at (select {o: (eval (list + c 0)) from: W by: c0}) 'o) 0) 0))",
+                    LAST);
+    TEST_ASSERT(off > 0 && (size_t)off < sizeof buf, "query source truncated");
+
+    ray_t* r = ray_eval_str(buf);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->type, -RAY_I64);   /* last column's single element == LAST */
+    TEST_ASSERT_EQ_I(r->i64, LAST);
+    ray_release(r);
+    PASS();
+}
+
 
 const test_entry_t lang_entries[] = {
+    { "lang/env/scope_frame_grows", test_env_scope_frame_grows, lang_setup, lang_teardown },
+    { "lang/query/wide_table_over_64_cols", test_query_wide_table_over_64_cols, lang_setup, lang_teardown },
     { "lang/fn_unary", test_fn_unary, lang_setup, lang_teardown },
     { "lang/fn_binary", test_fn_binary, lang_setup, lang_teardown },
     { "lang/fn_vary", test_fn_vary, lang_setup, lang_teardown },

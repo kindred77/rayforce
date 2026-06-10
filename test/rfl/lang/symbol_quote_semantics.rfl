@@ -1,0 +1,95 @@
+;; Characterization of bare / quoted / tick symbol forms, observed through
+;; eval, so the upcoming ATTR flag rename + polarity flip can be proven
+;; behavior-preserving.
+;;
+;; Three forms must stay distinguishable:
+;;   • a bare name  (x)        is a name reference  -> resolves at eval
+;;   • (quote x)               yields a literal symbol (≡ 'x) -> evaluates to
+;;                             itself, never resolving to the binding
+;;   • a tick literal ('x)     is a literal symbol  -> evaluates to itself,
+;;                             never resolving to the binding
+;; ("never resolving" is the non-query value position exercised here; inside
+;;  a query a literal symbol naming a from-table COLUMN resolves to that
+;;  column -- see test/rfl/query/literal_col_ref.rfl.)
+;; and serde (ser/de) must preserve each form's flag across the wire.
+;;
+;; eval-of-name-reference resolves from env (src/lang/eval.c:2938); a literal
+;; symbol is an atom and returns itself (src/lang/eval.c:2936).
+
+(set x 42)
+
+;; (1) bare name resolves to its binding
+x -- 42
+
+;; (2) (quote x) is a LITERAL symbol (≡ 'x) -> evaluates to itself, a sym
+(eval (quote x)) -- 'x
+(type (eval (quote x))) -- 'sym
+
+;; B3: 'x ≡ (quote x) — both literal symbols.
+(== 'x (quote x)) -- true
+(type (quote x)) -- 'sym
+;; value position: (quote x) no longer resolves outside a query (matches 'x).
+(== (eval (quote x)) (eval 'x)) -- true
+;; head position unaffected (flag-agnostic head application):
+(set f (fn [y] (+ y 100)))
+(eval (list (quote f) 1)) -- 101
+(eval (list 'f 1)) -- 101
+
+;; (3) 'x is a literal symbol -> evaluates to itself (prints bare, no tick),
+;;     stays a sym and equals the symbol, NOT the resolved value 42
+(eval 'x) -- 'x
+(type (eval 'x)) -- 'sym
+(== (eval 'x) 'x) -- true
+
+;; (4) round-tripped (quote x) keeps its literal flag -> stays a literal symbol
+;;     (same as 'x).
+(eval (de (ser (quote x)))) -- 'x
+(type (eval (de (ser (quote x))))) -- 'sym
+(== (eval (de (ser (quote x)))) (eval (de (ser 'x)))) -- true
+
+;; (5) round-tripped 'x keeps its literal flag -> stays a literal symbol
+(eval (de (ser 'x))) -- 'x
+(type (eval (de (ser 'x)))) -- 'sym
+(== (eval (de (ser 'x))) 'x) -- true
+
+;; ════════════════════════════════════════════════════════════════════
+;; (6) Multi-key by-group with a LITERAL-SYMBOL select value.
+;;
+;; Locks the post-flip behavior of the multi-key group path in
+;; src/ops/query.c (the `by_expr->type == RAY_LIST` branch near 7385/4220
+;; that picks the computed-key name by skipping ATTR_QUOTED elements, and
+;; the trivial-projection guard near 7236 that treats a NON-quoted sym
+;; select value as a source-column ref but a QUOTED sym as a literal
+;; constant).  Post-flip: SET ATTR_QUOTED = literal/constant column;
+;; CLEAR = name reference resolving to a source column.
+;;
+;; Table: two SYM group keys (g,h) + value v.  Groups (4):
+;;   (A,X) -> v=[1,5] sum 6 ; (A,Y) -> 2 ; (B,X) -> 3 ; (B,Y) -> 4.
+(set Tbl6 (table [g h v] (list ['A 'A 'B 'B 'A] ['X 'Y 'X 'Y 'X] [1 2 3 4 5])))
+
+;; 'lit is a literal symbol value -> projected as a per-group constant
+;; column (ATTR_QUOTED set; NOT looked up as a source column).
+(set R6 (select {s: (sum v) tag: 'lit by: [g h] from: Tbl6}))
+(count R6) -- 4
+;; The literal column carries the symbol 'lit in every group.
+(type (first (at R6 'tag))) -- 'sym
+(== (first (at R6 'tag)) 'lit) -- true
+;; The non-quoted name `v` in (sum v) resolved to the source column.
+(first (at (select {s: (sum v) tag: 'lit by: [g h] from: Tbl6 where: (and (== g 'A) (== h 'X))}) 's)) -- 6
+(first (at (select {s: (sum v) tag: 'lit by: [g h] from: Tbl6 where: (and (== g 'A) (== h 'X))}) 'tag)) -- 'lit
+(first (at (select {s: (sum v) tag: 'lit by: [g h] from: Tbl6 where: (and (== g 'B) (== h 'Y))}) 's)) -- 4
+
+;; (7) Single-key DOTTED-temporal by with a literal-symbol select value.
+;;
+;; A true multi-key by-LIST containing a dotted accessor (e.g. [g ts.ss])
+;; is not supported by the by-list path (it resolves each list element as
+;; a plain source-column name), so this pins the dotted-by-with-literal
+;; behavior through the single-key dotted form, where the literal-symbol
+;; select value still flows through the post-flip ATTR_QUOTED check.
+;; ts.ss groups by the seconds field -> 3 groups (0,1,2).
+(set Tts7 (table [k ts] (list [1 2 1 2 1 2] (as 'TIMESTAMP [100000000 200000000 1100000000 1200000000 2100000000 2200000000]))))
+(set R7 (select {n: (count k) tag: 'z by: ts.ss from: Tts7}))
+(count R7) -- 3
+(type (first (at R7 'tag))) -- 'sym
+(first (at R7 'tag)) -- 'z
+(== (first (at R7 'tag)) 'z) -- true

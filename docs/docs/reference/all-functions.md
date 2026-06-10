@@ -234,7 +234,7 @@ Special forms receive their arguments unevaluated. These are the core language p
 | `try` | binary | special | Error handling: (try expr handler-fn) | `(try (/ 1 0) (fn [e] 0))` |
 | `raise` | unary | — | Throw an error with message | `(raise "bad input")` |
 | `return` | unary | — | Early return from function body | `(return 42)` |
-| `quote` | variadic | special | Return argument unevaluated | `(quote (+ 1 2))` → `(+ 1 2)` |
+| `quote` | variadic | special | Return argument unevaluated; a bare name yields a literal symbol (`(quote x)` ≡ `'x`) | `(quote (+ 1 2))` → `(+ 1 2)` |
 | `alter` | variadic | special | In-place mutation of table column | `(alter trades 'price (* price 1.1))` |
 | `del` | variadic | special, restricted | Delete columns or rows from table | `(del trades 'temp_col)` |
 
