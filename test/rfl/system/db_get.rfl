@@ -5,9 +5,8 @@
 ;; several splayed tables under one root, a multi-table parted root,
 ;; and the error paths for wrong-format / missing roots.
 
-;; Stale /tmp dirs from a prior run flip .db.splayed.set to "corrupt"
-;; (overwrite path is a known bug — see splayed.rfl notes).  Wipe up
-;; front so the test is self-contained and re-runnable.
+;; .db.splayed.set sweeps stale files and commits .d last, so re-setting
+;; over a previous run is safe; the wipe below just isolates fixtures.
 (.sys.exec "rm -rf /tmp/rfl_get_splayed /tmp/rfl_get_parted")
 
 ;; ────────────── several splayed tables under one root ──────────────
@@ -84,6 +83,12 @@
 ;; ────────────── error path: nonexistent directory ──────────────
 (.db.splayed.get "/tmp/rfl_get_does_not_exist/")    !- io
 (.db.parted.get  "/tmp/rfl_get_does_not_exist/" 't) !- io
+
+;; ────────────── overwrite heal: narrower re-set sweeps stale columns ──────────────
+(.db.splayed.set "/tmp/rfl_get_splayed/Trades" (table [s] (list ['ZZZ])))
+(set Trades2 (.db.splayed.get "/tmp/rfl_get_splayed/Trades/"))
+(count (key Trades2)) -- 1
+(at (at Trades2 's) 0) -- 'ZZZ
 
 ;; ────────────── cleanup ──────────────
 (.sys.exec "rm -rf /tmp/rfl_get_splayed /tmp/rfl_get_parted") -- 0

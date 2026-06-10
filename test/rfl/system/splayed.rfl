@@ -1,10 +1,8 @@
 ;; Round-trip invariants for `.db.splayed.set` / `.db.splayed.get` — write a
 ;; table to a directory as one file per column, then read it back.
 ;;
-;; Tests use unique /tmp/ paths because the overwrite path is a known
-;; bug (`error: corrupt`); these only exercise the fresh-write path.
-;; Stale data from prior runs flips these to "corrupt" — wipe /tmp
-;; siblings up front so the test is self-contained and re-runnable.
+;; set sweeps stale files and commits .d last, so overwriting a prior
+;; run's dir is safe; the wipe below is kept for fixture isolation only.
 (.sys.exec "rm -rf /tmp/rfl_splayed_* /tmp/rfl_parted")
 
 ;; ────────────── small table ──────────────

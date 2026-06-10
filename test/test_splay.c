@@ -487,16 +487,20 @@ static test_result_t test_read_splayed_roundtrip(void) {
  *     succeed but sym_save might fail if sym_path dir doesn't exist.
  *     Actually ray_sym_save creates/overwrites the file, it only fails on
  *     permissions.  Use a directory as the sym_path (cannot write a file
- *     over a directory).
+ *     over a directory).  The table needs a RAY_SYM column: symbol-free
+ *     tables skip the symfile (no-symbol-columns exemption) and would
+ *     never reach the sym-save branch.
  * ========================================================================= */
 static test_result_t test_save_sym_error(void) {
     const char* dir = TMP_SPLAY_BASE "/sym_err_save";
     rm_rf(dir);
 
     int64_t id_v = ray_sym_intern("v", 1);
-    int64_t raw[] = {1};
-    ray_t* col = ray_vec_from_raw(RAY_I64, raw, 1);
-    TEST_ASSERT_NOT_NULL(col);
+    int64_t vval = ray_sym_intern("v1", 2);
+    ray_t* col = ray_sym_vec_new(RAY_SYM_W8, 4);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(col));
+    col->len = 1;
+    ((uint8_t*)ray_data(col))[0] = (uint8_t)vval;
     ray_t* tbl = ray_table_new(2);
     tbl = ray_table_add_col(tbl, id_v, col);
     TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
@@ -691,10 +695,9 @@ static test_result_t test_validate_sym_zero_col_table(void) {
 
 /* =========================================================================
  * 18. ray_splay_save_bulk: durable=false + sym_path != NULL → hits the
- *     ray_sym_save_bulk branch (line 78 of splay.c).
- *     ray_splay_save_bulk is the only caller that sets durable=false.
- *     Previous tests only called ray_splay_save (durable=true), so
- *     ray_sym_save_bulk was never invoked.
+ *     ray_sym_save_bulk branch.  The table must carry a RAY_SYM column:
+ *     symbol-free tables skip the symfile entirely (no-symbol-columns
+ *     exemption), so a SYM column is required to reach the bulk sym save.
  * ========================================================================= */
 static test_result_t test_save_bulk_with_sym_path(void) {
     const char* dir      = TMP_SPLAY_BASE "/bulk_sym";
@@ -703,15 +706,23 @@ static test_result_t test_save_bulk_with_sym_path(void) {
     unlink(sym_path);
 
     int64_t id_w = ray_sym_intern("wval", 4);
+    int64_t id_s = ray_sym_intern("wsym", 4);
+    int64_t sval = ray_sym_intern("wv1", 3);
     int64_t raw[] = {100, 200};
     ray_t* col = ray_vec_from_raw(RAY_I64, raw, 2);
     TEST_ASSERT_NOT_NULL(col);
+    ray_t* scol = ray_sym_vec_new(RAY_SYM_W8, 4);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(scol));
+    scol->len = 2;
+    ((uint8_t*)ray_data(scol))[0] = (uint8_t)sval;
+    ((uint8_t*)ray_data(scol))[1] = (uint8_t)sval;
 
-    ray_t* tbl = ray_table_new(2);
+    ray_t* tbl = ray_table_new(3);
     tbl = ray_table_add_col(tbl, id_w, col);
+    tbl = ray_table_add_col(tbl, id_s, scol);
     TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
 
-    /* durable=false (bulk) + sym_path → exercises ray_sym_save_bulk at line 78 */
+    /* durable=false (bulk) + sym_path + SYM col → exercises ray_sym_save_bulk */
     ray_err_t err = ray_splay_save_bulk(tbl, dir, sym_path);
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
@@ -719,6 +730,7 @@ static test_result_t test_save_bulk_with_sym_path(void) {
     TEST_ASSERT_EQ_I(access(sym_path, F_OK), 0);
 
     ray_release(col);
+    ray_release(scol);
     ray_release(tbl);
     rm_rf(dir);
     unlink(sym_path);
@@ -726,7 +738,7 @@ static test_result_t test_save_bulk_with_sym_path(void) {
 }
 
 /* =========================================================================
- * 19. splay_save_impl line 89: snprintf overflow for "%s/.d" path.
+ * 19. splay_save_impl: snprintf overflow for the column / ".d" paths.
  *     Requires strlen(dir) >= 1021 so that strlen(dir)+3 >= 1024.
  *     Build a deeply nested path using short components (≤ 50 chars each)
  *     so the filesystem NAME_MAX (255) is not exceeded, then call mkdir_p
@@ -781,8 +793,10 @@ static test_result_t test_save_dir_path_too_long(void) {
     tbl = ray_table_add_col(tbl, id_v2, col);
     TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
 
-    /* ray_splay_save: mkdir_p passes (dir exists), then snprintf("%s/.d")
-     * overflows the 1024-byte buffer → returns RAY_ERR_RANGE (line 89) */
+    /* ray_splay_save: mkdir_p passes (dir exists), then the first column
+     * path snprintf ("%s/<col>") overflows the 1024-byte buffer → returns
+     * RAY_ERR_RANGE.  (.d is written LAST now; its snprintf would overflow
+     * the same way for a zero-column table.) */
     ray_err_t err = ray_splay_save(tbl, long_dir, NULL);
     TEST_ASSERT_EQ_I(err, RAY_ERR_RANGE);
 
@@ -796,7 +810,7 @@ static test_result_t test_save_dir_path_too_long(void) {
 }
 
 /* =========================================================================
- * 20. splay_save_impl line 115: snprintf overflow for "%s/<colname>" path.
+ * 20. splay_save_impl: snprintf overflow for "%s/<colname>" path.
  *     Use a short dir + a column name long enough that dir + "/" + name
  *     overflows 1024 bytes.  dir="/tmp/rft_sv" (12 chars) + "/" (1) +
  *     1011 'c' chars = 1024, which is NOT < 1024, so overflow fires.
@@ -820,8 +834,9 @@ static test_result_t test_save_col_path_too_long(void) {
     TEST_ASSERT_NOT_NULL(col_long);
     TEST_ASSERT_NOT_NULL(col_short);
 
-    /* Put the short column first so schema writes fine, then long col triggers
-     * the path-overflow on the second iteration */
+    /* Short column first: its file writes fine, then the long col triggers
+     * the path-overflow on the second iteration — before .d (written last)
+     * is ever reached. */
     ray_t* tbl = ray_table_new(3);
     tbl = ray_table_add_col(tbl, id_short,    col_short);
     tbl = ray_table_add_col(tbl, id_long_col, col_long);
@@ -973,10 +988,10 @@ static test_result_t test_trace_fresh_load(void) {
 }
 
 /* =========================================================================
- * 25. splay_save_impl line 91: ray_col_save(".d") fails because the
- *     directory is read-only after being created.
- *     mkdir_p returns OK (dir is created with permissions), then we chmod
- *     the dir to 0555 so the .d file cannot be written.
+ * 25. splay_save_impl: a write into a read-only directory fails.
+ *     mkdir_p returns OK (dir already exists), then we chmod the dir to
+ *     0555 so nothing can be written — the first column file write fails
+ *     (with .d last, the column save is the first write to hit the dir).
  * ========================================================================= */
 static test_result_t test_save_schema_write_fails(void) {
     const char* dir = TMP_SPLAY_BASE "/no_write_schema";
@@ -996,7 +1011,7 @@ static test_result_t test_save_schema_write_fails(void) {
     tbl = ray_table_add_col(tbl, id_w, col);
     TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
 
-    /* ray_splay_save: mkdir_p passes (dir exists), then ray_col_save(".d") fails */
+    /* ray_splay_save: mkdir_p passes (dir exists), then the column write fails */
     ray_err_t err = ray_splay_save(tbl, dir, NULL);
     /* Must restore permissions before cleanup */
     chmod(dir, 0755);
@@ -1170,6 +1185,99 @@ static test_result_t test_selfdescribing_schema_fresh_process(void) {
     PASS();
 }
 
+/* =========================================================================
+ * 29. Crash-safe save: (a) re-set with a NARROWER schema removes stale
+ *     column files; (b) symbol-free tables write no symfile even when a
+ *     sym_path is supplied; (c) .d is the commit marker — written last.
+ * ========================================================================= */
+static test_result_t test_save_sweeps_stale_and_skips_sym(void) {
+    const char* dir = TMP_SPLAY_BASE "/sweep";
+    const char* symp = TMP_SPLAY_BASE "/sweep_sym";
+    rm_rf(dir);
+    unlink(symp);
+
+    int64_t id_a = ray_sym_intern("a", 1);
+    int64_t id_b = ray_sym_intern("b", 1);
+    int64_t raw[] = {1, 2};
+    ray_t* col_a = ray_vec_from_raw(RAY_I64, raw, 2);
+    ray_t* col_b = ray_vec_from_raw(RAY_I64, raw, 2);
+
+    /* wide table: columns a, b */
+    ray_t* wide = ray_table_new(3);
+    wide = ray_table_add_col(wide, id_a, col_a);
+    wide = ray_table_add_col(wide, id_b, col_b);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(wide));
+    TEST_ASSERT_EQ_I(ray_splay_save(wide, dir, symp), RAY_OK);
+
+    /* (b) no SYM columns -> no symfile, even though sym_path was given */
+    TEST_ASSERT_EQ_I(access(symp, F_OK), -1);
+
+    /* narrow re-set: only column a */
+    ray_t* narrow = ray_table_new(2);
+    ray_retain(col_a);
+    narrow = ray_table_add_col(narrow, id_a, col_a);
+    ray_release(col_a); /* drop the extra retain */
+    TEST_ASSERT_FALSE(RAY_IS_ERR(narrow));
+    TEST_ASSERT_EQ_I(ray_splay_save(narrow, dir, NULL), RAY_OK);
+
+    /* (a) stale column file "b" must be gone; load sees 1 column */
+    char bpath[512];
+    snprintf(bpath, sizeof(bpath), "%s/b", dir);
+    TEST_ASSERT_EQ_I(access(bpath, F_OK), -1);
+    ray_t* loaded = ray_splay_load(dir, NULL);
+    TEST_ASSERT_NOT_NULL(loaded);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    TEST_ASSERT_EQ_I(ray_table_ncols(loaded), 1);
+    ray_release(loaded);
+
+    ray_release(col_a);
+    ray_release(col_b);
+    ray_release(wide);
+    ray_release(narrow);
+    rm_rf(dir);
+    PASS();
+}
+
+/* =========================================================================
+ * 30. Torn-write recovery: a dir whose .d was lost (crash before commit)
+ *     fails to load with "io" (visible, not corrupt) and a subsequent
+ *     re-set fully heals it.
+ * ========================================================================= */
+static test_result_t test_torn_write_heals(void) {
+    const char* dir = TMP_SPLAY_BASE "/torn";
+    rm_rf(dir);
+
+    int64_t id_x = ray_sym_intern("x", 1);
+    int64_t raw[] = {5, 6, 7};
+    ray_t* col = ray_vec_from_raw(RAY_I64, raw, 3);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, id_x, col);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    TEST_ASSERT_EQ_I(ray_splay_save(tbl, dir, NULL), RAY_OK);
+
+    /* simulate crash between column writes and the .d commit */
+    char dpath[512];
+    snprintf(dpath, sizeof(dpath), "%s/.d", dir);
+    unlink(dpath);
+
+    ray_t* r = ray_splay_load(dir, NULL);
+    TEST_ASSERT_TRUE(!r || RAY_IS_ERR(r)); /* missing, not silently wrong */
+    if (r) ray_release(r);
+
+    /* re-set heals */
+    TEST_ASSERT_EQ_I(ray_splay_save(tbl, dir, NULL), RAY_OK);
+    ray_t* healed = ray_splay_load(dir, NULL);
+    TEST_ASSERT_NOT_NULL(healed);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(healed));
+    TEST_ASSERT_EQ_I(ray_table_nrows(healed), 3);
+    ray_release(healed);
+
+    ray_release(col);
+    ray_release(tbl);
+    rm_rf(dir);
+    PASS();
+}
+
 /* ---- Suite definition -------------------------------------------------- */
 
 const test_entry_t splay_entries[] = {
@@ -1199,5 +1307,7 @@ const test_entry_t splay_entries[] = {
     { "splay/save_schema_write_fails",    test_save_schema_write_fails,         splay_setup, splay_teardown },
     { "splay/load_str_pool_heap",         test_load_str_pool_heap,              splay_setup, splay_teardown },
     { "splay/selfdescribing_schema",      test_selfdescribing_schema_fresh_process, splay_setup, splay_teardown },
+    { "splay/save_sweeps_stale",          test_save_sweeps_stale_and_skips_sym, splay_setup, splay_teardown },
+    { "splay/torn_write_heals",           test_torn_write_heals,                splay_setup, splay_teardown },
     { NULL, NULL, NULL, NULL },
 };
