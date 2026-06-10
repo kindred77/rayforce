@@ -221,6 +221,53 @@ static test_result_t test_matrix_parted_ops(void) {
     return r;
 }
 
+/* every op kind -> restart -> verify (both load paths).  Catches state
+ * that only looks right because the writing process's sym table is hot. */
+static test_result_t test_matrix_restart_after_each_op_impl(stress_ctx_t* c) {
+    TEST_ASSERT(stress_seed_initial(c, 64, 2, 32), "seed");
+
+    for (size_t p = 0; p < NPATTERNS; p++) {
+        TEST_ASSERT_FMT(stress_op_insert(c, 16, k_patterns[p], p & 1, false),
+                        "insert pat=%zu", p);
+        TEST_ASSERT(stress_op_restart(c), "restart after insert");
+        TEST_ASSERT_FMT(stress_verify_all(c, false),
+                        "verify(heap) post-restart insert pat=%zu", p);
+        TEST_ASSERT_FMT(stress_verify_all(c, true),
+                        "verify(mmap) post-restart insert pat=%zu", p);
+
+        TEST_ASSERT_FMT(stress_op_upsert(c, k_patterns[p], false),
+                        "upsert pat=%zu", p);
+        TEST_ASSERT(stress_op_restart(c), "restart after upsert");
+        TEST_ASSERT_FMT(stress_verify_all(c, p & 1),
+                        "verify post-restart upsert pat=%zu", p);
+
+        TEST_ASSERT_FMT(stress_op_part_append(c, 0, 8, k_patterns[p]),
+                        "part_append pat=%zu", p);
+        TEST_ASSERT(stress_op_restart(c), "restart after part_append");
+        TEST_ASSERT_FMT(stress_verify_all(c, !(p & 1)),
+                        "verify post-restart part_append pat=%zu", p);
+
+        TEST_ASSERT(stress_op_trim(c, -1, p & 1, 4), "trim");
+        TEST_ASSERT(stress_op_restart(c), "restart after trim");
+        TEST_ASSERT_FMT(stress_verify_all(c, false),
+                        "verify post-restart trim pat=%zu", p);
+    }
+
+    TEST_ASSERT(stress_op_part_new(c, 16, STRESS_SYMS_MIXED), "part_new");
+    TEST_ASSERT(stress_op_restart(c), "restart after part_new");
+    TEST_ASSERT(stress_verify_all(c, true), "verify post-restart part_new");
+
+    PASS();
+}
+
+static test_result_t test_matrix_restart_after_each_op(void) {
+    stress_ctx_t c;
+    TEST_ASSERT(stress_init(&c, STRESS_DB, 104), "init");
+    test_result_t r = test_matrix_restart_after_each_op_impl(&c);
+    stress_destroy(&c);
+    return r;
+}
+
 const test_entry_t stress_matrix_entries[] = {
     { "stress/fixture_roundtrip", test_fixture_roundtrip, stress_setup, stress_teardown },
     { "stress/verify_clean",             test_verify_clean,             stress_setup, stress_teardown },
@@ -229,5 +276,6 @@ const test_entry_t stress_matrix_entries[] = {
     { "stress/matrix_upsert", test_matrix_upsert, stress_setup, stress_teardown },
     { "stress/matrix_trim",       test_matrix_trim,       stress_setup, stress_teardown },
     { "stress/matrix_parted_ops", test_matrix_parted_ops, stress_setup, stress_teardown },
+    { "stress/matrix_restart_after_each_op", test_matrix_restart_after_each_op, stress_setup, stress_teardown },
     { NULL, NULL, NULL, NULL },
 };

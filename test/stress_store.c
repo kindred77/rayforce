@@ -498,6 +498,29 @@ bool stress_op_part_new(stress_ctx_t* c, int64_t n, stress_sym_pattern_t pat) {
     return true;
 }
 
+/* -- simulated process restart -------------------------------------------
+ * Tear down the global sym table and reload it from the shared symfile,
+ * exactly what a fresh process sees.  Every sym ID minted before this
+ * call is void afterwards; the engine holds no ray_t across ops, and the
+ * shadow stores strings, so only genuine save/merge bugs can surface. */
+
+bool stress_op_restart(stress_ctx_t* c) {
+    op_logf(c, "restart (sym reset + reload %s)", c->sym_path);
+    ray_sym_destroy();
+    ray_err_t e = ray_sym_init();
+    if (e != RAY_OK) {
+        op_logf(c, "restart: sym_init err=%d", (int)e);
+        return false;
+    }
+    e = ray_sym_load(c->sym_path);
+    if (e != RAY_OK) {
+        dump_failure(c, "restart: ray_sym_load err=%d — symfile unreadable "
+                        "by a fresh process", (int)e);
+        return false;
+    }
+    return true;
+}
+
 /* ---- verification ---------------------------------------------------------
  * Cell-by-cell compare of a loaded splayed dir against its shadow.  Tickers
  * are compared as strings via ray_sym_find: find(shadow) == disk_id is
