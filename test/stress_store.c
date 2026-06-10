@@ -358,11 +358,11 @@ static bool cb_insert(stress_ctx_t* c, stress_rows_t* disk, void* a) {
 
 bool stress_op_insert(stress_ctx_t* c, int64_t n, stress_sym_pattern_t pat,
                       bool bulk, bool via_mmap) {
-    op_logf(c, "insert n=%lld pat=%d bulk=%d mmap=%d", (long long)n, (int)pat,
-            (int)bulk, (int)via_mmap);
     stress_row_t* fresh =
         (stress_row_t*)malloc((size_t)n * sizeof(stress_row_t));
     if (!fresh) return false;
+    op_logf(c, "insert n=%lld pat=%d bulk=%d mmap=%d", (long long)n, (int)pat,
+            (int)bulk, (int)via_mmap);
     for (int64_t i = 0; i < n; i++) gen_row(c, pat, &fresh[i]);
 
     char dir[512];
