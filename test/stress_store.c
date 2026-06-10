@@ -522,10 +522,12 @@ bool stress_op_restart(stress_ctx_t* c) {
 
 /* ---- verification ---------------------------------------------------------
  * Cell-by-cell compare of a loaded splayed dir against its shadow.  Tickers
- * are compared as strings via ray_sym_find: find(shadow) == disk_id is
- * equivalent to str(disk_id) == shadow (the intern table is a bijection),
- * and catches enumeration shifts.  NaN price compares equal to NaN
- * (NULL_F64). */
+ * are compared as strings via ray_sym_vec_lookup on the loaded column:
+ * lookup(shadow) == disk_id is equivalent to cell-str(disk_id) == shadow
+ * (a domain is a bijection), and catches enumeration shifts.  Resolving
+ * through the COLUMN's domain keeps this oracle valid across the Phase-2
+ * flip to per-vocabulary symfiles (exact no-op while every domain is the
+ * runtime singleton).  NaN price compares equal to NaN (NULL_F64). */
 
 static bool compare_dir(stress_ctx_t* c, const char* dir,
                         const stress_rows_t* shadow, bool use_mmap,
@@ -559,9 +561,9 @@ static bool compare_dir(stress_ctx_t* c, const char* dir,
     for (int64_t i = 0; i < shadow->len; i++) {
         const stress_row_t* ex = &shadow->rows[i];
         int64_t disk_id = ray_read_sym(td, i, RAY_SYM, tick->attrs);
-        int64_t want_id = ray_sym_find(ex->ticker, strlen(ex->ticker));
+        int64_t want_id = ray_sym_vec_lookup(tick, ex->ticker, strlen(ex->ticker));
         if (disk_id != want_id) {
-            ray_t* s = ray_sym_str(disk_id); /* borrowed; may be NULL */
+            ray_t* s = ray_sym_vec_cell(tick, i); /* borrowed; may be NULL */
             dump_failure(c,
                 "%s row %lld: ticker id %lld ('%.*s') != expected '%s' (id %lld)",
                 label, (long long)i, (long long)disk_id,
@@ -616,6 +618,8 @@ bool stress_check_invariants(stress_ctx_t* c) {
                      (long long)c->last_sym_count, (long long)cnt);
         return false;
     }
+    /* NOTE(flip): this bound assumes global-dump symfiles; revisit at
+     * Phase-2 Task 7 */
     if ((uint64_t)cnt > (uint64_t)ray_sym_count()) {
         dump_failure(c, "invariant: symfile count %lld > in-memory %u",
                      (long long)cnt, ray_sym_count());
