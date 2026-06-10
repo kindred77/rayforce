@@ -359,9 +359,11 @@ static test_result_t test_validate_sym_corrupt(void) {
     ray_release(ok);
 
     /* Reset again — now load WITHOUT sym_path.
-     * The column-name ID for "scol2" is in .d.  With empty sym table,
-     * ray_sym_str(id_col) returns NULL → hits "corrupt" at line 162.
-     * This is also a useful coverage path (lines 161-163 of splay.c). */
+     * The .d is self-describing (column names as strings), so "scol2"
+     * interns fine during the load.  The load still fails "corrupt":
+     * the sym count snapshotted BEFORE the load loop shows no real
+     * symbols while the table carries a RAY_SYM column
+     * (validate_sym_columns), or earlier via column sym-bounds checks. */
     ray_sym_destroy();
     (void)ray_sym_init();
     TEST_ASSERT_EQ_U(ray_sym_count(), 1);  /* "" reserved */

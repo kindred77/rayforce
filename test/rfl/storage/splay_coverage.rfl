@@ -76,22 +76,17 @@
 ;;   splay_load_impl lines 231-235  — OOM in ray_table_add_col (same OOM
 ;;                                    argument as lines 172-174).
 ;;
-;;   validate_sym_columns lines 55-57 — RAY_SYM column found with empty sym
-;;                                    table: to reach the loop body, ALL
-;;                                    column names must resolve via the
-;;                                    symbol table (so name_atom != NULL at
-;;                                    line 179).  With ray_sym_count()==1
-;;                                    only sym ID 0 ("") resolves, but the
-;;                                    path-safety guard at line 196 rejects
-;;                                    any column name with name_len==0 before
-;;                                    the column can be added to the table.
-;;                                    The loop is therefore unreachable from
-;;                                    RFL.
-;;
-;;   validate_sym_columns lines 244-246 — same argument; RAY_ERR_CORRUPT
-;;                                    from validate cannot be returned after
-;;                                    a fully successful column load from an
-;;                                    RFL-produced .d file.
+;;   validate_sym_columns loop body — RAY_SYM column found with an
+;;                                    unpopulated sym table.  Reachable from
+;;                                    C (test_splay.c resets the sym table
+;;                                    before loading; the count is
+;;                                    snapshotted before the load loop, so
+;;                                    interning the .d column names cannot
+;;                                    mask the empty table), but not from
+;;                                    RFL: an RFL session always has a
+;;                                    populated sym table (count > 1) by the
+;;                                    time any load runs, so the guard
+;;                                    short-circuits to RAY_OK.
 
 ;; ════════════════════════════════════════════════════════════════════════
 ;; 1. splay_save_impl line 74 — mkdir_p returns non-OK.
