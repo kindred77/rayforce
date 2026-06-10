@@ -827,6 +827,92 @@ static test_result_t test_domain_query_insert_cell_reexpress(void) {
     PASS();
 }
 
+/* ---- Phase 2 Task 3 follow-up: gather + atom-materialization chokepoints - */
+
+/* gather_by_idx (lang/eval.c) raw-copies SYM cell ids from ONE source vec
+ * into a fresh output vec, so the output must adopt the source's domain.
+ * Driven through the select-by per-group gather: `s: k` collects each
+ * group's slice of the FILE-domain column via gather_by_idx.  Under the
+ * divergent fixture the legacy runtime-domain output resolved to SWAPPED
+ * strings.  Second assertion: collection_elem (lang/internal.h) — the
+ * `(at col i)` atom materialization must re-express the cell id through
+ * the column's domain into a runtime id. */
+static test_result_t test_domain_gather_adopts_domain(void) {
+    ray_sym_domain_t* dom = NULL;
+    int64_t pos_a = -1, pos_b = -1;
+    TEST_ASSERT_TRUE(build_divergent_qsym_fixture(&dom, &pos_a, &pos_b));
+    /* discrimination precondition: file positions != runtime ids */
+    TEST_ASSERT(pos_a != ray_sym_intern("dq_a", 4), "fixture diverges");
+
+    /* Table {k: SYM FILE-domain [a b a b], g: I64 [1 1 2 2]}. */
+    ray_t* k = ray_sym_vec_new(RAY_SYM_W64, 4);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(k));
+    k->len = 4;
+    int64_t* kd = (int64_t*)ray_data(k);
+    kd[0] = pos_a; kd[1] = pos_b; kd[2] = pos_a; kd[3] = pos_b;
+    ray_sym_domain_retain(dom);
+    k->sym_domain = dom;
+
+    ray_t* g = ray_vec_new(RAY_I64, 4);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(g));
+    g->len = 4;
+    int64_t* gd = (int64_t*)ray_data(g);
+    gd[0] = 1; gd[1] = 1; gd[2] = 2; gd[3] = 2;
+
+    ray_t* t = ray_table_new(2);
+    t = ray_table_add_col(t, ray_sym_intern("k", 1), k);
+    t = ray_table_add_col(t, ray_sym_intern("g", 1), g);
+    ray_release(k); ray_release(g);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+    TEST_ASSERT_EQ_I(ray_env_set(ray_sym_intern("dmg_t", 5), t), RAY_OK);
+
+    /* Per-group gather: each group's cell is gather_by_idx(k, group_rows)
+     * — a fresh SYM vec that must resolve over the FILE domain. */
+    ray_t* r = ray_eval_str("(select {from: dmg_t by: g s: k})");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 2);
+
+    ray_t* out_s = ray_table_get_col(r, ray_sym_intern("s", 1));
+    TEST_ASSERT_NOT_NULL(out_s);
+    TEST_ASSERT_EQ_I(out_s->type, RAY_LIST);
+    ray_t** cells = (ray_t**)ray_data(out_s);
+    for (int64_t gi = 0; gi < 2; gi++) {
+        ray_t* cell = cells[gi];
+        TEST_ASSERT_NOT_NULL(cell);
+        TEST_ASSERT_EQ_I(cell->type, RAY_SYM);
+        TEST_ASSERT_EQ_I(cell->len, 2);
+        /* The adoption under test: the gathered vec resolves over the
+         * SOURCE column's FILE domain, not the runtime singleton. */
+        TEST_ASSERT_EQ_PTR(ray_sym_vec_domain(cell), dom);
+        TEST_ASSERT_TRUE(sym_cell_is(cell, 0, "dq_a"));  /* was "dq_b" raw */
+        TEST_ASSERT_TRUE(sym_cell_is(cell, 1, "dq_b"));  /* was "dq_a" raw */
+    }
+    ray_release(r);
+
+    /* collection_elem atom rule: (at k 1) reads cell id pos_b and must
+     * return the RUNTIME atom for "dq_b" (raw copy yielded "dq_a"). */
+    ray_t* a = ray_eval_str("(at (at dmg_t 'k) 1)");
+    TEST_ASSERT_NOT_NULL(a);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(a));
+    TEST_ASSERT_EQ_I(a->type, -RAY_SYM);
+    TEST_ASSERT_EQ_I(a->i64, ray_sym_intern("dq_b", 4));
+    ray_release(a);
+
+    ray_release(ray_eval_str("(set dmg_t 0)"));
+    ray_release(t);
+    ray_sym_domain_release(dom);
+
+    /* ref balance: the cache entry must be gone (fresh open rebuilds) */
+    ray_sym_domain_t* d2 = ray_sym_domain_open(TMP_DOM_QSYM_PATH);
+    TEST_ASSERT_NOT_NULL(d2);
+    ray_sym_domain_release(d2);
+
+    unlink(TMP_DOM_QSYM_PATH);
+    unlink(TMP_DOM_QSYM_PATH ".lk");
+    PASS();
+}
+
 /* ---- registration -------------------------------------------------------- */
 
 const test_entry_t domain_entries[] = {
@@ -846,5 +932,6 @@ const test_entry_t domain_entries[] = {
     { "domain/pivot_index_adopts",      test_domain_pivot_index_adopts,      domain_rt_setup, domain_rt_teardown },
     { "domain/query_upsert_key_lookup", test_domain_query_upsert_key_lookup, domain_rt_setup, domain_rt_teardown },
     { "domain/query_insert_reexpress",  test_domain_query_insert_cell_reexpress, domain_rt_setup, domain_rt_teardown },
+    { "domain/gather_adopts_domain",    test_domain_gather_adopts_domain,    domain_rt_setup, domain_rt_teardown },
     { NULL, NULL, NULL, NULL },
 };
