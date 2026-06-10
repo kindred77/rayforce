@@ -913,6 +913,128 @@ static test_result_t test_domain_gather_adopts_domain(void) {
     PASS();
 }
 
+/* ---- Phase 2 Task 4: group/agg sweep -------------------------------------- */
+
+/* Group-by over FILE-domain SYM columns (ops/group.c): the key output
+ * copies raw cell ids from the source column and must adopt its domain
+ * (query.c's KEY_READ raw compares depend on this invariant); FIRST/MIN
+ * SYM aggregates emit raw cell ids of the value column and must both
+ * resolve lex MIN through the COLUMN's domain and adopt it on the
+ * output.  Built on the divergent fixture, every partial conversion
+ * fails: no adoption ⇒ swapped strings; adoption without the lex-domain
+ * fix ⇒ MIN picks the wrong cell; legacy ⇒ runtime-domain outputs. */
+static test_result_t test_domain_group_by_adopts_domain(void) {
+    ray_sym_domain_t* dom = NULL;
+    int64_t pos_a = -1, pos_b = -1;
+    TEST_ASSERT_TRUE(build_divergent_qsym_fixture(&dom, &pos_a, &pos_b));
+    /* discrimination precondition: file positions != runtime ids */
+    TEST_ASSERT(pos_a != ray_sym_intern("dq_a", 4), "fixture diverges");
+
+    /* Table {k: SYM FILE [a a b b], v: SYM FILE [b a a b], n: I64 [1 2 3 4]}.
+     * Group dq_a: v = {dq_b, dq_a} → first dq_b, min dq_a, sum 3.
+     * Group dq_b: v = {dq_a, dq_b} → first dq_a, min dq_a, sum 7. */
+    ray_t* k = ray_sym_vec_new(RAY_SYM_W64, 4);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(k));
+    k->len = 4;
+    int64_t* kd = (int64_t*)ray_data(k);
+    kd[0] = pos_a; kd[1] = pos_a; kd[2] = pos_b; kd[3] = pos_b;
+    ray_sym_domain_retain(dom);
+    k->sym_domain = dom;
+
+    ray_t* v = ray_sym_vec_new(RAY_SYM_W64, 4);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    v->len = 4;
+    int64_t* vd = (int64_t*)ray_data(v);
+    vd[0] = pos_b; vd[1] = pos_a; vd[2] = pos_a; vd[3] = pos_b;
+    ray_sym_domain_retain(dom);
+    v->sym_domain = dom;
+
+    ray_t* nv = ray_vec_new(RAY_I64, 4);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(nv));
+    nv->len = 4;
+    int64_t* nd = (int64_t*)ray_data(nv);
+    nd[0] = 1; nd[1] = 2; nd[2] = 3; nd[3] = 4;
+
+    ray_t* t = ray_table_new(3);
+    t = ray_table_add_col(t, ray_sym_intern("k", 1), k);
+    t = ray_table_add_col(t, ray_sym_intern("v", 1), v);
+    t = ray_table_add_col(t, ray_sym_intern("n", 1), nv);
+    ray_release(k); ray_release(v); ray_release(nv);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+    TEST_ASSERT_EQ_I(ray_env_set(ray_sym_intern("dmgb_t", 6), t), RAY_OK);
+
+    ray_t* r = ray_eval_str(
+        "(select {from: dmgb_t by: k f: (first v) mn: (min v) s: (sum n)})");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 2);
+
+    /* (a) the key output adopts the source column's FILE domain and
+     *     resolves to the right strings */
+    ray_t* out_k = ray_table_get_col(r, ray_sym_intern("k", 1));
+    TEST_ASSERT_NOT_NULL(out_k);
+    TEST_ASSERT_EQ_I(out_k->type, RAY_SYM);
+    TEST_ASSERT_EQ_PTR(ray_sym_vec_domain(out_k), dom);
+
+    /* locate each group's row by the key's domain-resolved string */
+    int64_t row_a = sym_cell_is(out_k, 0, "dq_a") ? 0
+                  : sym_cell_is(out_k, 1, "dq_a") ? 1 : -1;
+    TEST_ASSERT(row_a >= 0, "group dq_a present");
+    int64_t row_b = 1 - row_a;
+    TEST_ASSERT_TRUE(sym_cell_is(out_k, row_b, "dq_b"));
+
+    /* (b) FIRST on a SYM column: raw cell ids of v — adopted + resolved */
+    ray_t* out_f = ray_table_get_col(r, ray_sym_intern("f", 1));
+    TEST_ASSERT_NOT_NULL(out_f);
+    TEST_ASSERT_EQ_I(out_f->type, RAY_SYM);
+    TEST_ASSERT_EQ_PTR(ray_sym_vec_domain(out_f), dom);
+    TEST_ASSERT_TRUE(sym_cell_is(out_f, row_a, "dq_b"));  /* swapped raw */
+    TEST_ASSERT_TRUE(sym_cell_is(out_f, row_b, "dq_a"));
+
+    /* (c) MIN on a SYM column: lex order comes from the COLUMN's domain
+     *     ("dq_a" < "dq_b" by FILE strings) and the output adopts it.
+     *     Adoption without the lex-domain fix resolves "dq_b" here. */
+    ray_t* out_mn = ray_table_get_col(r, ray_sym_intern("mn", 2));
+    TEST_ASSERT_NOT_NULL(out_mn);
+    TEST_ASSERT_EQ_I(out_mn->type, RAY_SYM);
+    TEST_ASSERT_EQ_PTR(ray_sym_vec_domain(out_mn), dom);
+    TEST_ASSERT_TRUE(sym_cell_is(out_mn, row_a, "dq_a"));
+    TEST_ASSERT_TRUE(sym_cell_is(out_mn, row_b, "dq_a"));
+
+    /* numeric agg sanity (group identity not scrambled by the sweep) */
+    ray_t* out_s = ray_table_get_col(r, ray_sym_intern("s", 1));
+    TEST_ASSERT_NOT_NULL(out_s);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(out_s))[row_a], 3);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(out_s))[row_b], 7);
+    ray_release(r);
+
+    /* Scalar (no-by) reduction: LAST over the FILE-domain column must
+     * surface "dq_b" whichever emit path runs (atom re-expression or
+     * column adoption).  Legacy raw handling surfaced "dq_a". */
+    ray_t* r2 = ray_eval_str("(select {from: dmgb_t l: (last v)})");
+    TEST_ASSERT_NOT_NULL(r2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r2));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r2), 1);
+    ray_t* out_l = ray_table_get_col(r2, ray_sym_intern("l", 1));
+    TEST_ASSERT_NOT_NULL(out_l);
+    TEST_ASSERT_EQ_I(out_l->type, RAY_SYM);
+    TEST_ASSERT_TRUE(sym_cell_is(out_l, 0, "dq_b"));
+    ray_release(r2);
+
+    ray_release(ray_eval_str("(set dmgb_t 0)"));
+    ray_release(t);
+    ray_sym_domain_release(dom);
+
+    /* ref balance: the cache entry must be gone (fresh open rebuilds) */
+    ray_sym_domain_t* d2 = ray_sym_domain_open(TMP_DOM_QSYM_PATH);
+    TEST_ASSERT_NOT_NULL(d2);
+    ray_sym_domain_release(d2);
+
+    unlink(TMP_DOM_QSYM_PATH);
+    unlink(TMP_DOM_QSYM_PATH ".lk");
+    PASS();
+}
+
 /* ---- registration -------------------------------------------------------- */
 
 const test_entry_t domain_entries[] = {
@@ -933,5 +1055,6 @@ const test_entry_t domain_entries[] = {
     { "domain/query_upsert_key_lookup", test_domain_query_upsert_key_lookup, domain_rt_setup, domain_rt_teardown },
     { "domain/query_insert_reexpress",  test_domain_query_insert_cell_reexpress, domain_rt_setup, domain_rt_teardown },
     { "domain/gather_adopts_domain",    test_domain_gather_adopts_domain,    domain_rt_setup, domain_rt_teardown },
+    { "domain/group_by_adopts_domain",  test_domain_group_by_adopts_domain,  domain_rt_setup, domain_rt_teardown },
     { NULL, NULL, NULL, NULL },
 };
