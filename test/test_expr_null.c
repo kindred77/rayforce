@@ -1237,6 +1237,54 @@ static test_result_t test_diff_parted_nullable(void) {
     PASS();
 }
 
+/* ---- F64 AND/OR choke: nullable F64 inputs to AND/OR bail EXPR_BAIL_NULL_SHAPE ----
+ *
+ * Shape: ray_and(g, scan("f"), scan("g")) where f and g are nullable F64 columns.
+ * Graph-build (graph.c): ray_and always emits OP_AND with out_type RAY_BOOL —
+ *   inputs are accepted regardless of type; rejection happens at compile time.
+ * expr_compile: the BOOL output path sets ins_null_aware=true for F64 AND/OR
+ *   (op==OP_AND || OP_OR overrides the F64 type check at line ~702), then the
+ *   null-capability choke fires because expr_null_capable returns false for
+ *   (dt=BOOL, t1=F64, op=OP_AND) — only I64 operands are wired.
+ *   Result: EXPR_BAIL_NULL_SHAPE is counted; fused falls through to fallback.
+ *
+ * Assertions:
+ *   - ray_expr_bail_counts[EXPR_BAIL_NULL_SHAPE] advances after the first execute
+ *   - diff_run(tbl, build_f64_and, false): values agree fused-via-fallback == fallback
+ *
+ * Table: reuses make_f64_minmax_table() which has nullable F64 columns "f" and "g". */
+static ray_op_t* build_f64_and(ray_graph_t* g) {
+    return ray_and(g, ray_scan(g, "f"), ray_scan(g, "g"));
+}
+
+static test_result_t test_diff_f64_andor_chokes(void) {
+    ray_heap_init(); (void)ray_sym_init();
+
+    ray_t* tbl = make_f64_minmax_table();
+
+    /* Snapshot EXPR_BAIL_NULL_SHAPE before first execute */
+    uint64_t null_shape_before = ray_expr_bail_counts[EXPR_BAIL_NULL_SHAPE];
+
+    /* First execute: fused compile should bail and fall through to fallback */
+    ray_graph_t* g1 = ray_graph_new(tbl);
+    ray_t* r1 = ray_execute(g1, build_f64_and(g1));
+    TEST_ASSERT(r1 && !RAY_IS_ERR(r1), "first execute succeeded via fallback");
+
+    TEST_ASSERT_FMT(ray_expr_bail_counts[EXPR_BAIL_NULL_SHAPE] > null_shape_before,
+                    "EXPR_BAIL_NULL_SHAPE must advance (was %llu, now %llu)",
+                    (unsigned long long)null_shape_before,
+                    (unsigned long long)ray_expr_bail_counts[EXPR_BAIL_NULL_SHAPE]);
+
+    ray_release(r1);
+    ray_graph_free(g1);
+
+    /* diff_run: expect_fused=false — shape must bail, but fused-via-fallback == fallback */
+    test_result_t res = diff_run(tbl, build_f64_and, false);
+
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    return res;
+}
+
 const test_entry_t expr_null_entries[] = {
     { "expr_null/bail_counter",            test_expr_bail_counter_nulls,          NULL, NULL },
     { "expr_null/nullfree_invariance",     test_nullfree_stream_unchanged,        NULL, NULL },
@@ -1284,5 +1332,7 @@ const test_entry_t expr_null_entries[] = {
     { "expr_null/fused_agg_allnull_group", test_fused_agg_input_allnull_group,    NULL, NULL },
     /* Task 10: parted nullable columns through the fused path */
     { "expr_null/diff_parted_nullable",    test_diff_parted_nullable,             NULL, NULL },
+    /* F64 AND/OR choke: nullable F64 operands must bail EXPR_BAIL_NULL_SHAPE */
+    { "expr_null/diff_f64_andor_chokes",   test_diff_f64_andor_chokes,            NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };

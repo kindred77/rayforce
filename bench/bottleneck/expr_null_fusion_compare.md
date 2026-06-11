@@ -57,7 +57,7 @@ nullfree_invariance test).
 ## Correctness gates
 
 - Full suite: 3357/3359, 2 pre-existing skips, 0 failed. ASan+UBSan (default
-  test build): clean across the full suite incl. all 39 expr_null tests.
+  test build): clean across the full suite incl. all 38 expr_null tests.
 - Differential harness: fused ≡ forced-fallback on values + null positions for
   every enabled kernel family, incl. zero-divisor, overflow, parted, parallel
   (>65,536 rows), and agg-input attr-gating shapes.
