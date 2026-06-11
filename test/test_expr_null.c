@@ -199,9 +199,123 @@ static test_result_t test_diff_i64_add_nullable_prelanding(void) {
     return r;
 }
 
+/* ---- Step 1: new diff tests for nullable F64 fused execution ---- */
+
+/* (f * 2.0 + 1.0) > 5.0 — arith chain into null-aware f64 compare */
+static ray_op_t* build_f64_chain(ray_graph_t* g) {
+    ray_op_t* f = ray_scan(g, "f");
+    ray_op_t* m = ray_mul(g, f, ray_const_f64(g, 2.0));
+    ray_op_t* a = ray_add(g, m, ray_const_f64(g, 1.0));
+    return ray_gt(g, a, ray_const_f64(g, 5.0));
+}
+
+static test_result_t test_diff_f64_chain_nullable(void) {
+    ray_heap_init(); (void)ray_sym_init();
+
+    int64_t n = 10;
+    double raw[10];
+    for (int64_t i = 0; i < n; i++) raw[i] = 0.5 + (double)i;
+    ray_t* col = ray_vec_from_raw(RAY_F64, raw, n);
+    ray_vec_set_null(col, 1, true);
+    ray_vec_set_null(col, 6, true);
+
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("f", 1), col);
+    ray_release(col);
+
+    test_result_t r = diff_run(tbl, build_f64_chain, true);
+
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
+/* x / 2.0 — nullable i64 promoted to f64 via inserted CAST */
+static ray_op_t* build_i64_promoted(ray_graph_t* g) {
+    return ray_div(g, ray_scan(g, "x"), ray_const_f64(g, 2.0));
+}
+
+static test_result_t test_diff_i64_promoted_nullable(void) {
+    ray_heap_init(); (void)ray_sym_init();
+
+    int64_t vals[] = {2, 4, 6, 8, 10, 12, 14, 16, 18, 20};
+    int64_t nidx[] = {0, 5, 9};
+    ray_t* col = vec_i64_with_nulls(vals, 10, nidx, 3);
+
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("x", 1), col);
+    ray_release(col);
+
+    test_result_t r = diff_run(tbl, build_i64_promoted, true);
+
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
+static test_result_t test_diff_f64_chain_parallel(void) {
+    ray_heap_init(); (void)ray_sym_init();
+
+    int64_t n = 100000;
+    ray_t* col = ray_vec_new(RAY_F64, n);
+    col->len = n;
+    double* d = (double*)ray_data(col);
+    for (int64_t i = 0; i < n; i++) d[i] = 0.5 + (double)(i % 10);
+    /* null every 1000th row */
+    for (int64_t i = 0; i < n; i += 1000)
+        ray_vec_set_null(col, i, true);
+
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("f", 1), col);
+    ray_release(col);
+
+    test_result_t r = diff_run(tbl, build_f64_chain, true);
+
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
+/* ---- Step 6: null-free promotion case ---- */
+
+/* x + f — forces expr_ensure_type cast from i64 to f64 */
+static ray_op_t* build_i64_plus_f64(ray_graph_t* g) {
+    return ray_add(g, ray_scan(g, "x"), ray_scan(g, "f"));
+}
+
+static test_result_t test_nullfree_promotion_invariance(void) {
+    ray_heap_init(); (void)ray_sym_init();
+
+    int64_t xvals[] = {1, 2, 3, 4, 5, 6, 7, 8};
+    double  fvals[] = {1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5};
+    ray_t* xcol = ray_vec_from_raw(RAY_I64, xvals, 8);
+    ray_t* fcol = ray_vec_from_raw(RAY_F64, fvals, 8);
+
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("x", 1), xcol);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("f", 1), fcol);
+    ray_release(xcol); ray_release(fcol);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_expr_t ex;
+    TEST_ASSERT(expr_compile(g, tbl, build_i64_plus_f64(g), &ex),
+                "null-free promotion compiles");
+    for (uint8_t i = 0; i < ex.n_ins; i++)
+        TEST_ASSERT(ex.ins[i].null_aware == 0,
+                    "no null_aware on null-free promotion");
+    for (uint8_t r2 = 0; r2 < ex.n_regs; r2++)
+        TEST_ASSERT(!ex.regs[r2].nullable,
+                    "no nullable regs on null-free promotion");
+
+    ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t expr_null_entries[] = {
-    { "expr_null/bail_counter",        test_expr_bail_counter_nulls,          NULL, NULL },
-    { "expr_null/nullfree_invariance", test_nullfree_stream_unchanged,        NULL, NULL },
-    { "expr_null/diff_i64_add",        test_diff_i64_add_nullable_prelanding, NULL, NULL },
+    { "expr_null/bail_counter",            test_expr_bail_counter_nulls,          NULL, NULL },
+    { "expr_null/nullfree_invariance",     test_nullfree_stream_unchanged,        NULL, NULL },
+    { "expr_null/diff_i64_add",            test_diff_i64_add_nullable_prelanding, NULL, NULL },
+    { "expr_null/diff_f64_chain",          test_diff_f64_chain_nullable,          NULL, NULL },
+    { "expr_null/diff_i64_promoted",       test_diff_i64_promoted_nullable,       NULL, NULL },
+    { "expr_null/diff_f64_chain_parallel", test_diff_f64_chain_parallel,          NULL, NULL },
+    { "expr_null/nullfree_promotion",      test_nullfree_promotion_invariance,    NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
