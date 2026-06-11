@@ -278,9 +278,12 @@ static test_result_t test_sym_save_load_roundtrip(void) {
     PASS();
 }
 
-/* ---- sym_save_append_only --------------------------------------------- */
+/* ---- sym_save_rewrite_stable_ids --------------------------------------- */
 
-static test_result_t test_sym_save_append_only(void) {
+/* Snapshot semantics: every ray_sym_save rewrites the file whole; ids are
+ * stable across repeated save/load cycles because the table itself is
+ * append-only (a later snapshot is always a superset of an earlier one). */
+static test_result_t test_sym_save_rewrite_stable_ids(void) {
     const char* sym_path = "/tmp/test_sym_append.sym";
 
     /* Intern initial batch */
@@ -293,7 +296,7 @@ static test_result_t test_sym_save_append_only(void) {
     ray_err_t err = ray_sym_save(sym_path);
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
-    /* Second save with no changes -> should be no-op */
+    /* Second save with no changes -> rewrites the same snapshot */
     err = ray_sym_save(sym_path);
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
@@ -303,7 +306,7 @@ static test_result_t test_sym_save_append_only(void) {
     TEST_ASSERT((id_c) >= (0), "id_c >= 0");
     TEST_ASSERT((id_d) >= (0), "id_d >= 0");
 
-    /* Save again (append-only: new entries added) */
+    /* Save again — the snapshot now includes the new entries */
     err = ray_sym_save(sym_path);
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
@@ -1147,39 +1150,48 @@ static test_result_t test_sym_load_non_list(void) {
 
 /* ray_sym_load rejects a file that has fewer entries than what was
  * previously persisted (stale / truncated on disk). */
-static test_result_t test_sym_load_stale_prefix(void) {
+static test_result_t test_sym_load_shorter_snapshot_ok(void) {
     const char* sym_path = "/tmp/test_sym_stale.sym";
     remove(sym_path);
     char lk_path[4096];
     snprintf(lk_path, sizeof(lk_path), "%s.lk", sym_path);
     remove(lk_path);
 
-    /* Intern and save 3 symbols so persisted_count == 3. */
-    ray_sym_intern("aaa", 3);
-    ray_sym_intern("bbb", 3);
+    /* Intern 3 symbols and save the snapshot. */
+    int64_t id_a = ray_sym_intern("aaa", 3);
+    int64_t id_c = ray_sym_intern("bbb", 3);
     ray_sym_intern("ccc", 3);
     ray_err_t err = ray_sym_save(sym_path);
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
-    /* Reload from the same file so persisted_count stays 3. */
-    err = ray_sym_load(sym_path);
-    TEST_ASSERT_EQ_I(err, RAY_OK);
-
-    /* Now overwrite the sym file on disk with only 2 entries (stale). */
-    ray_t* short_list = ray_list_new(2);
+    /* Overwrite the file with a 2-entry prefix of the same dictionary —
+     * an OLDER snapshot.  Note ray_col_save writes the runtime-domain
+     * STRL format only because the entries here are plain strings. */
+    ray_t* short_list = ray_list_new(3);
     TEST_ASSERT_NOT_NULL(short_list);
+    ray_t* s_e = ray_str("", 0);
     ray_t* s0 = ray_str("aaa", 3);
-    ray_t* s1 = ray_str("bbb", 3);
+    short_list = ray_list_append(short_list, s_e); ray_release(s_e);
     short_list = ray_list_append(short_list, s0); ray_release(s0);
-    short_list = ray_list_append(short_list, s1); ray_release(s1);
     TEST_ASSERT_NOT_NULL(short_list);
     err = ray_col_save(short_list, sym_path);
     ray_release(short_list);
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
-    /* Load must fail: disk has 2 entries but persisted_count==3. */
+    /* Loading an older snapshot of the same dictionary is fine: the
+     * prefix validates position-for-position, nothing is lost from
+     * memory, ids stay stable.  (The pre-domain "truncation floor"
+     * rejection is gone — table symfiles no longer sync through the
+     * runtime dictionary, so a shorter file is not corruption.) */
     err = ray_sym_load(sym_path);
-    TEST_ASSERT((err) != (RAY_OK), "stale file should be rejected");
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+    TEST_ASSERT_EQ_U(ray_sym_count(), 4);  /* "" + aaa + bbb + ccc kept */
+    ray_t* sa = ray_sym_str(id_a);
+    TEST_ASSERT_NOT_NULL(sa);
+    TEST_ASSERT_MEM_EQ(3, ray_str_ptr(sa), "aaa");
+    ray_t* sc = ray_sym_str(id_c);
+    TEST_ASSERT_NOT_NULL(sc);
+    TEST_ASSERT_MEM_EQ(3, ray_str_ptr(sc), "bbb");
 
     remove(sym_path);
     remove(lk_path);
@@ -1203,7 +1215,7 @@ static test_result_t test_sym_load_prefix_mismatch(void) {
     ray_err_t err = ray_sym_save(sym_path);
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
-    /* Reload so persisted_count == 2. */
+    /* Reload of the identical snapshot is a validating no-op. */
     err = ray_sym_load(sym_path);
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
@@ -1267,19 +1279,19 @@ static test_result_t test_sym_load_id_mismatch(void) {
     PASS();
 }
 
-/* ---- sym_save_existing_not_list --------------------------------------- */
+/* ---- sym_save_overwrites_foreign_file ---------------------------------- */
 
-/* ray_sym_save reads the existing file at the path before writing.
- * If the file is readable but its contents are not a RAY_LIST, it should
- * return RAY_ERR_CORRUPT rather than overwriting. */
-static test_result_t test_sym_save_existing_not_list(void) {
+/* Snapshot semantics: ray_sym_save never reads the target — it replaces
+ * whatever is at the path (single-writer contract).  A foreign/garbage
+ * file is simply healed by the atomic rename. */
+static test_result_t test_sym_save_overwrites_foreign_file(void) {
     const char* sym_path = "/tmp/test_sym_save_notlist.sym";
     remove(sym_path);
     char lk_path[4096];
     snprintf(lk_path, sizeof(lk_path), "%s.lk", sym_path);
     remove(lk_path);
 
-    /* Write a RAY_I64 vector at the sym path. */
+    /* Write a RAY_I64 vector at the sym path (not a STRL snapshot). */
     ray_t* vec = ray_vec_new(RAY_I64, 2);
     TEST_ASSERT_NOT_NULL(vec);
     int64_t v0 = 10, v1 = 20;
@@ -1290,12 +1302,19 @@ static test_result_t test_sym_save_existing_not_list(void) {
     ray_release(vec);
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
-    /* Intern a symbol so there is something to save. */
-    ray_sym_intern("hello", 5);
-
-    /* ray_sym_save must fail because existing file is not a RAY_LIST. */
+    /* Intern a symbol and snapshot over the foreign file. */
+    int64_t id_h = ray_sym_intern("hello", 5);
     err = ray_sym_save(sym_path);
-    TEST_ASSERT((err) != (RAY_OK), "save over non-list file should fail");
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    /* Round-trip proves the file was replaced with a valid snapshot. */
+    ray_sym_destroy();
+    (void)ray_sym_init();
+    err = ray_sym_load(sym_path);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+    ray_t* sh = ray_sym_str(id_h);
+    TEST_ASSERT_NOT_NULL(sh);
+    TEST_ASSERT_MEM_EQ(5, ray_str_ptr(sh), "hello");
 
     remove(sym_path);
     remove(lk_path);
@@ -1416,7 +1435,7 @@ static test_result_t test_sym_ensure_cap_large(void) {
  * initialized (g_sym_inited == false), rather than touching freed/NULL
  * globals.  Exercised by calling each one after ray_sym_destroy().  This
  * covers the `!inited` guard branch in ray_sym_find, ray_sym_str,
- * ray_sym_is_dotted, ray_sym_segs, ray_sym_count, ray_sym_persisted_count,
+ * ray_sym_is_dotted, ray_sym_segs, ray_sym_count,
  * ray_sym_rebuild_segments, ray_sym_strings_borrow, and ray_sym_ensure_cap.
  *
  * sym_setup() already called ray_sym_init(); tear it down first, then probe.
@@ -1434,7 +1453,6 @@ static test_result_t test_sym_accessors_uninitialized(void) {
     TEST_ASSERT_EQ_I(ray_sym_segs(0, &segs), 0);
 
     TEST_ASSERT_EQ_U(ray_sym_count(), 0);
-    TEST_ASSERT_EQ_U(ray_sym_persisted_count(), 0);
 
     /* rebuild_segments reports RAY_ERR_IO when the table is not initialized. */
     TEST_ASSERT_EQ_I(ray_sym_rebuild_segments(), RAY_ERR_IO);
@@ -1558,15 +1576,15 @@ static test_result_t test_sym_load_slen_overflow(void) {
 
 /* ---- sym_load_prefix_mismatch_strl ------------------------------------- */
 
-/* ray_sym_load rejects a reload where a previously-loaded (persisted) entry
- * has a different string content in the new file.
- * Covers sym.c lines 1428-1434.
+/* ray_sym_load rejects a reload where an already-interned position holds a
+ * different string in the new file: the file's "zzz" at position 1 interns
+ * to a fresh id != 1 → divergence (RAY_ERR_CORRUPT).
  *
  * Strategy:
- *   1. Intern "" (id=0), "aaa" (id=1), "bbb" (id=2) and save → persisted=3.
- *   2. Load the file so persisted_count = 3.
+ *   1. Intern "" (id=0), "aaa" (id=1), "bbb" (id=2) and save.
+ *   2. Load the file back (no-op, validates).
  *   3. Build a STRL with the same 3 entries but entry 1 changed ("zzz").
- *   4. Load again → prefix check at i=1 fails (memory has "aaa", file has "zzz"). */
+ *   4. Load again → position check at i=1 fails. */
 static test_result_t test_sym_load_prefix_mismatch_strl(void) {
     const char* sym_path = "/tmp/test_sym_pfx_mm.sym";
     char lk_path[4096];
@@ -1579,7 +1597,7 @@ static test_result_t test_sym_load_prefix_mismatch_strl(void) {
     ray_err_t err = ray_sym_save(sym_path);
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
-    /* Step 2: load → persisted_count = 3 ("", "aaa", "bbb"). */
+    /* Step 2: reload of the identical snapshot is a validating no-op. */
     err = ray_sym_load(sym_path);
     TEST_ASSERT_EQ_I(err, RAY_OK);
     TEST_ASSERT_EQ_U(ray_sym_count(), 3);
@@ -1653,9 +1671,7 @@ static test_result_t test_sym_load_long_path(void) {
 
 /* ---- sym_save_long_path ------------------------------------------------ */
 
-/* ray_sym_save similarly rejects an overlong path (sym.c lines 1057-1058).
- * Intern one sym first so persisted_count != str_count (otherwise save
- * returns RAY_OK immediately without reaching the path-length check). */
+/* ray_sym_save similarly rejects an overlong path (lock_path overflow). */
 static test_result_t test_sym_save_long_path(void) {
     ray_sym_intern("save_long_path_test", 19);
 
@@ -1717,51 +1733,14 @@ static test_result_t test_sym_load_no_parent_dir(void) {
     PASS();
 }
 
-/* ---- sym_save_bad_slot_type -------------------------------------------- */
-
-/* sym_save_impl merge loop rejects a slot from the disk file that is not
- * a -RAY_STR atom (sym.c lines 1089-1093: `s->type != -RAY_STR` check).
- *
- * Write a LSTG (generic list) file with one -RAY_I64 (integer) atom entry.
- * ray_col_load will deserialise this as a RAY_LIST, and sym_save_impl will
- * see `s->type == -RAY_I64 != -RAY_STR` → RAY_ERR_CORRUPT.
- *
- * LSTG format (col.c LIST_MAGIC = 0x4754534CU, LE = 4C 53 54 47):
- *   [4B magic][1B outer-type RAY_LIST=0][8B count][1B elem-type -RAY_I64=0xFB][8B value]
- */
-static test_result_t test_sym_save_bad_slot_type(void) {
-    static const uint8_t lstg_buf[] = {
-        0x4C, 0x53, 0x54, 0x47,              /* LIST_MAGIC "LSTG" LE */
-        0x00,                                /* outer type = RAY_LIST = 0 */
-        0x01, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00,              /* count = 1 */
-        0xFB,                                /* elem type = -RAY_I64 = -5 = 0xFB */
-        0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00               /* i64 value = 0 */
-    };
-    const char* path = "/tmp/sym_test_bad_slot.sym";
-    bool ok = write_strl_raw(path, lstg_buf, sizeof(lstg_buf));
-    TEST_ASSERT_TRUE(ok);
-
-    /* Intern one sym so persisted_count != str_count (skip early return). */
-    ray_sym_intern("bad_slot_sym", 12);
-
-    ray_err_t err = ray_sym_save(path);
-    TEST_ASSERT_EQ_I(err, RAY_ERR_CORRUPT);
-    remove(path);
-    PASS();
-}
-
 /* ---- sym_save_tmppath_overflow ----------------------------------------- */
 
 /* ray_sym_save rejects a path that would overflow the internal tmp_path[]
- * buffer (sym.c line 1060-1061: "%s.tmp" overflow).
+ * buffer ("%s.tmp" overflow).
  * The lock_path[] buffer uses "%s.lk" (3-char suffix), which overflows at
  * strlen >= 1021.  The tmp_path[] buffer uses "%s.tmp" (4-char suffix),
  * which overflows at strlen >= 1020.  So a path of exactly 1020 chars
- * passes the lock_path check but fails the tmp_path check.
- * Intern one sym first so persisted_count != str_count to skip the
- * early-return optimisation. */
+ * passes the lock_path check but fails the tmp_path check. */
 static test_result_t test_sym_save_tmppath_overflow(void) {
     ray_sym_intern("tmppath_overflow_test", 21);
 
@@ -1774,22 +1753,16 @@ static test_result_t test_sym_save_tmppath_overflow(void) {
     PASS();
 }
 
-/* ---- sym_save_diverge_id ----------------------------------------------- */
+/* ---- sym_save_replaces_divergent_file ----------------------------------- */
 
-/* sym_save_impl merge path rejects divergent symbol tables where a symbol
- * from the disk file interns to a different ID than its disk position
- * (sym.c lines 1104-1113: `id != i` check).
+/* Snapshot semantics: a file whose positions diverge from the in-memory
+ * dictionary is NOT merged or position-checked on save — the snapshot
+ * replaces it wholesale (the old merge position-rejection protected table
+ * symfiles, which are now owned by the FILE domain layer).
  *
- * Setup:
- *   1. Write a two-entry STRL file: ["", "apple"] to a tmp path.
- *   2. Intern "banana" in memory — gets id=1 (since "" is always id=0).
- *   3. Call ray_sym_save to the same path.
- *   4. sym_save_impl finds the existing file, tries to merge:
- *      - entry[0]="" → ray_sym_intern_no_split("",0) → id=0 == 0 ✓
- *      - entry[1]="apple" → but "banana" already holds id=1,
- *        so "apple" gets id=2 ≠ 1 → RAY_ERR_CORRUPT ✓
- */
-static test_result_t test_sym_save_diverge_id(void) {
+ * Setup: disk has ["", "apple"], memory interns "banana" at id 1.
+ * Save replaces the file; reload restores "banana" at id 1. */
+static test_result_t test_sym_save_replaces_divergent_file(void) {
     static const uint8_t strl_buf[] = {
         0x53, 0x54, 0x52, 0x4C,              /* magic "STRL" */
         0x02, 0x00, 0x00, 0x00,
@@ -1799,16 +1772,28 @@ static test_result_t test_sym_save_diverge_id(void) {
         'a', 'p', 'p', 'l', 'e'             /* "apple" */
     };
     const char* path = "/tmp/sym_test_diverge_id.sym";
+    char lk_path[4096];
+    snprintf(lk_path, sizeof(lk_path), "%s.lk", path);
     bool ok = write_strl_raw(path, strl_buf, sizeof(strl_buf));
     TEST_ASSERT_TRUE(ok);
 
-    /* Intern "banana" — takes id=1, displacing the expected "apple" slot. */
+    /* Intern "banana" — takes id=1, diverging from the file's "apple". */
     int64_t banana_id = ray_sym_intern("banana", 6);
     TEST_ASSERT_EQ_I(banana_id, 1);
 
     ray_err_t err = ray_sym_save(path);
-    TEST_ASSERT_EQ_I(err, RAY_ERR_CORRUPT);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    ray_sym_destroy();
+    (void)ray_sym_init();
+    err = ray_sym_load(path);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+    ray_t* sb = ray_sym_str(1);
+    TEST_ASSERT_NOT_NULL(sb);
+    TEST_ASSERT_MEM_EQ(6, ray_str_ptr(sb), "banana");
+
     remove(path);
+    remove(lk_path);
     PASS();
 }
 
@@ -1886,13 +1871,13 @@ static test_result_t test_sym_lazy_load_basic(void) {
     TEST_ASSERT_EQ_I(err, RAY_OK);
     TEST_ASSERT_EQ_U(ray_sym_count(), 2);
 
-    /* ray_sym_str(1): strings[1]==NULL and id < persisted_count → triggers
+    /* ray_sym_str(1): strings[1]==NULL and id < lazy_count → triggers
      * sym_lazy_materialize_to_locked (lines 919, else branch at 625). */
     ray_t* s = ray_sym_str(1);
     TEST_ASSERT_NOT_NULL(s);
     TEST_ASSERT_EQ_U(ray_str_len(s), 3);
 
-    /* ray_sym_strings_borrow: lazy_map!=NULL && persisted_count>0 → calls
+    /* ray_sym_strings_borrow: lazy_map!=NULL && lazy_count>0 → calls
      * sym_lazy_materialize_to_locked(1) on an already-materialised sym,
      * taking the fast-return path (line 608). */
     ray_t** out_strings = NULL;
@@ -1913,43 +1898,9 @@ static test_result_t test_sym_lazy_load_basic(void) {
     PASS();
 }
 
-/* ---- sym_save_unreadable_file -------------------------------------------
- * sym_save_impl: when ray_col_load(path) fails AND ray_file_open(path, READ)
- * also fails with errno != ENOENT (e.g. EACCES from a mode-000 file), the
- * function returns RAY_ERR_IO (sym.c lines 1144-1147).
- *
- * Creates a file at path with mode 000, then calls ray_sym_save.
- * Skipped when running as root (root can read mode-000 files).
- * ----------------------------------------------------------------------- */
-static test_result_t test_sym_save_unreadable_file(void) {
-    if (geteuid() == 0) PASS(); /* root bypasses file permissions */
-
-    const char* path = "/tmp/test_sym_unreadable.sym";
-    char lk_path[4096];
-    snprintf(lk_path, sizeof(lk_path), "%s.lk", path);
-    remove(path); remove(lk_path);
-
-    /* Create a non-empty file at path with mode 000 so that ray_col_load
-     * fails and the subsequent probe open also fails with EACCES. */
-    FILE* f = fopen(path, "wb");
-    TEST_ASSERT_NOT_NULL(f);
-    fwrite("x", 1, 1, f);
-    fclose(f);
-    chmod(path, 0000);
-
-    /* persisted_count (0) != str_count (1) → save proceeds past early exit */
-    ray_err_t err = ray_sym_save(path);
-    TEST_ASSERT_EQ_I(err, RAY_ERR_IO);
-
-    chmod(path, 0644); /* restore so remove works */
-    remove(path); remove(lk_path);
-    PASS();
-}
-
 /* ---- sym_save_tmp_blocked -----------------------------------------------
- * sym_save_impl: when ray_col_load(path) fails with ENOENT (file absent) and
- * fopen(tmp_path, "wb") then fails (e.g. because {path}.tmp exists with mode
- * 000), the function returns RAY_ERR_IO (sym.c lines 1172-1176).
+ * ray_sym_save: when fopen(tmp_path, "wb") fails (e.g. because {path}.tmp
+ * exists with mode 000), the function returns RAY_ERR_IO.
  *
  * Skipped when running as root.
  * ----------------------------------------------------------------------- */
@@ -1970,7 +1921,6 @@ static test_result_t test_sym_save_tmp_blocked(void) {
     fclose(f);
     chmod(tmp_path, 0000);
 
-    /* persisted_count (0) != str_count (1) → save proceeds */
     ray_err_t err = ray_sym_save(path);
     TEST_ASSERT_EQ_I(err, RAY_ERR_IO);
 
@@ -2684,7 +2634,7 @@ const test_entry_t sym_entries[] = {
     { "sym/many", test_sym_many, sym_setup, sym_teardown },
     { "sym/bulk", test_sym_bulk, sym_setup, sym_teardown },
     { "sym/save_load_roundtrip", test_sym_save_load_roundtrip, sym_setup, sym_teardown },
-    { "sym/save_append_only", test_sym_save_append_only, sym_setup, sym_teardown },
+    { "sym/save_rewrite_stable_ids", test_sym_save_rewrite_stable_ids, sym_setup, sym_teardown },
     { "sym/load_corrupt", test_sym_load_corrupt, sym_setup, sym_teardown },
     { "sym/load_truncated", test_sym_load_truncated, sym_setup, sym_teardown },
     { "sym/load_missing", test_sym_load_missing, sym_setup, sym_teardown },
@@ -2724,10 +2674,10 @@ const test_entry_t sym_entries[] = {
     { "sym/save_null_path",             test_sym_save_null_path,           sym_setup, sym_teardown },
     { "sym/load_null_path",             test_sym_load_null_path,           sym_setup, sym_teardown },
     { "sym/load_non_list",              test_sym_load_non_list,            sym_setup, sym_teardown },
-    { "sym/load_stale_prefix",          test_sym_load_stale_prefix,        sym_setup, sym_teardown },
+    { "sym/load_shorter_snapshot_ok",   test_sym_load_shorter_snapshot_ok, sym_setup, sym_teardown },
     { "sym/load_prefix_mismatch",       test_sym_load_prefix_mismatch,     sym_setup, sym_teardown },
     { "sym/load_id_mismatch",           test_sym_load_id_mismatch,         sym_setup, sym_teardown },
-    { "sym/save_existing_not_list",     test_sym_save_existing_not_list,   sym_setup, sym_teardown },
+    { "sym/save_overwrites_foreign_file", test_sym_save_overwrites_foreign_file, sym_setup, sym_teardown },
     { "sym/intern_prehashed_basic",     test_sym_intern_prehashed_basic,   sym_setup, sym_teardown },
     { "sym/str_invalid_id",             test_sym_str_invalid_id,           sym_setup, sym_teardown },
     { "sym/is_dotted_invalid_id",       test_sym_is_dotted_invalid_id,     sym_setup, sym_teardown },
@@ -2747,13 +2697,11 @@ const test_entry_t sym_entries[] = {
     { "sym/save_long_path",             test_sym_save_long_path,           sym_setup, sym_teardown },
     { "sym/cache_segs_many_dots",       test_sym_cache_segs_many_dots,     sym_setup, sym_teardown },
     { "sym/load_no_parent_dir",          test_sym_load_no_parent_dir,       sym_setup, sym_teardown },
-    { "sym/save_bad_slot_type",          test_sym_save_bad_slot_type,       sym_setup, sym_teardown },
     { "sym/save_tmppath_overflow",      test_sym_save_tmppath_overflow,    sym_setup, sym_teardown },
-    { "sym/save_diverge_id",            test_sym_save_diverge_id,          sym_setup, sym_teardown },
+    { "sym/save_replaces_divergent_file", test_sym_save_replaces_divergent_file, sym_setup, sym_teardown },
 
     /* Lazy-load path + save error paths */
     { "sym/lazy_load_basic",            test_sym_lazy_load_basic,          sym_setup, sym_teardown },
-    { "sym/save_unreadable_file",       test_sym_save_unreadable_file,     sym_setup, sym_teardown },
     { "sym/save_tmp_blocked",           test_sym_save_tmp_blocked,         sym_setup, sym_teardown },
 
     /* ray_like_fn (src/ops/strop.c) — vector and sym-atom paths */

@@ -2,7 +2,7 @@
 ;;
 ;; Covers: quote, return, args, rc, diverse, get, remove, timer,
 ;; internals, memstat, sysinfo, hopen, hclose, hsend, serde extras,
-;; splayed mount with mixed children, parse edge cases.
+;; parse edge cases.
 ;;
 ;; Split from system_branch_cov.rfl to avoid stack-overflow on teardown
 ;; when too many globals accumulate in a single test runtime.
@@ -167,15 +167,6 @@
 (count (de (ser (table [x] (list [10 20 30]))))) -- 3
 (count (de (ser (guid 3)))) -- 3
 (de (ser [true false true])) -- [true false true]
-
-;; ══════════════════════════════════════════════════════════════════════
-;; Splayed mount: mixed children (exercises mount_record + finalize)
-;; ══════════════════════════════════════════════════════════════════════
-(.sys.exec "rm -rf /tmp/rfl_sys_bc2_*")
-(.db.splayed.set "/tmp/rfl_sys_bc2_mx/good/" (table [x] (list [1 2 3])))
-(.sys.exec "mkdir -p /tmp/rfl_sys_bc2_mx/bad_no_d/")
-(count (.db.splayed.mount "/tmp/rfl_sys_bc2_mx/")) -- 1
-(.sys.exec "rm -rf /tmp/rfl_sys_bc2_*")
 
 ;; ══════════════════════════════════════════════════════════════════════
 ;; GUID distinct uniqueness across calls

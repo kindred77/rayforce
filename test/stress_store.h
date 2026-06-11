@@ -74,6 +74,14 @@ bool stress_op_part_append(stress_ctx_t* c, int part_idx, int64_t n,
                            stress_sym_pattern_t pat);
 bool stress_op_part_new(stress_ctx_t* c, int64_t n, stress_sym_pattern_t pat);
 
+/* vocabulary growth: insert n rows with FRESH tickers into the live
+ * table.  Thin alias over stress_op_insert(STRESS_SYMS_NEW) — fresh-sym
+ * interning through a save IS the growth mechanism (the save merges the
+ * new distinct set into the shared symfile and re-derives the on-disk
+ * column width from the grown vocabulary).  Named so width-transition
+ * tests read as intent. */
+bool stress_op_sym_grow(stress_ctx_t* c, int64_t n);
+
 /* simulated process restart: destroy + re-init the global sym table, then
  * re-load db_root/sym from disk.  Invalidates every live sym ID. */
 bool stress_op_restart(stress_ctx_t* c);

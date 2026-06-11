@@ -397,13 +397,13 @@ static test_result_t test_splay_str_column_roundtrip(void) {
  * Regression: short string columns must remain readable through
  * ray_read_splayed.  Older files used STRV and could be smaller than the
  * raw header; newer files use the raw RAY_STR layout and mmap directly.
+ * The two file-size edge cases (24-byte 1-row, 14-byte 0-row) are saved
+ * as separate single-column tables: load now rejects ragged column
+ * lengths, so they can no longer share one table.
  * ---------------------------------------------------------------------- */
 
 static test_result_t test_splay_short_strv_roundtrip(void) {
     (void)!system("rm -rf " TMP_SPLAY_DIR);
-
-    ray_t* tbl = ray_table_new(2);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
 
     int64_t id_short = ray_sym_intern("short", 5);
     int64_t id_empty = ray_sym_intern("empty", 5);
@@ -415,13 +415,8 @@ static test_result_t test_splay_short_strv_roundtrip(void) {
     shorts = ray_str_vec_append(shorts, "hi", 2);
     TEST_ASSERT_FALSE(RAY_IS_ERR(shorts));
 
-    /* 0-row STRV -- 14 bytes on disk */
-    ray_t* empty = ray_vec_new(RAY_STR, 0);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(empty));
-
+    ray_t* tbl = ray_table_new(1);
     tbl = ray_table_add_col(tbl, id_short, shorts);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
-    tbl = ray_table_add_col(tbl, id_empty, empty);
     TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
 
     ray_err_t err = ray_splay_save(tbl, TMP_SPLAY_DIR, NULL);
@@ -430,26 +425,45 @@ static test_result_t test_splay_short_strv_roundtrip(void) {
     ray_t* loaded = ray_read_splayed(TMP_SPLAY_DIR, NULL);
     TEST_ASSERT_NOT_NULL(loaded);
     TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
-    TEST_ASSERT_EQ_I(ray_table_ncols(loaded), 2);
+    TEST_ASSERT_EQ_I(ray_table_ncols(loaded), 1);
 
     ray_t* loaded_shorts = ray_table_get_col(loaded, id_short);
-    ray_t* loaded_empty  = ray_table_get_col(loaded, id_empty);
     TEST_ASSERT_NOT_NULL(loaded_shorts);
-    TEST_ASSERT_NOT_NULL(loaded_empty);
     TEST_ASSERT_EQ_I(loaded_shorts->type, RAY_STR);
     TEST_ASSERT_EQ_I(loaded_shorts->len, 1);
-    TEST_ASSERT_EQ_I(loaded_empty->type, RAY_STR);
-    TEST_ASSERT_EQ_I(loaded_empty->len, 0);
 
     size_t slen = 0;
     const char* s0 = ray_str_vec_get(loaded_shorts, 0, &slen);
     TEST_ASSERT_EQ_U(slen, 2);
     TEST_ASSERT_MEM_EQ(2, s0, "hi");
+    ray_release(loaded);
+
+    /* 0-row STRV -- 14 bytes on disk; re-set sweeps the previous column */
+    ray_t* empty = ray_vec_new(RAY_STR, 0);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(empty));
+
+    ray_t* tbl2 = ray_table_new(1);
+    tbl2 = ray_table_add_col(tbl2, id_empty, empty);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl2));
+
+    err = ray_splay_save(tbl2, TMP_SPLAY_DIR, NULL);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    loaded = ray_read_splayed(TMP_SPLAY_DIR, NULL);
+    TEST_ASSERT_NOT_NULL(loaded);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    TEST_ASSERT_EQ_I(ray_table_ncols(loaded), 1);
+
+    ray_t* loaded_empty = ray_table_get_col(loaded, id_empty);
+    TEST_ASSERT_NOT_NULL(loaded_empty);
+    TEST_ASSERT_EQ_I(loaded_empty->type, RAY_STR);
+    TEST_ASSERT_EQ_I(loaded_empty->len, 0);
 
     ray_release(loaded);
     ray_release(shorts);
     ray_release(empty);
     ray_release(tbl);
+    ray_release(tbl2);
 
     (void)!system("rm -rf " TMP_SPLAY_DIR);
     PASS();
@@ -1437,13 +1451,14 @@ static test_result_t test_splay_load_sym_missing_corrupt(void) {
     (void)ray_sym_init();
     TEST_ASSERT_EQ_U(ray_sym_count(), 1);  /* "" reserved */
 
-    /* Load with NULL sym_path — should fail because RAY_SYM column exists
-     * but sym table is empty. Note: col.c bounds check catches this first
-     * since sym_count==0 skips validation, but the post-load check in
-     * ray_splay_load catches RAY_SYM + empty sym table. */
+    /* Load with NULL sym_path — fails with the loud "sym" error: the
+     * column's cells are positions in its symfile, and a SYM column with
+     * no resolvable domain must never resolve against incidental state
+     * (sym-domain spec, Load §3; replaces the old validate_sym_columns
+     * "corrupt" which keyed off the global table being empty). */
     ray_t* loaded = ray_splay_load(TMP_SPLAY_SYM_DIR, NULL);
     TEST_ASSERT_TRUE(RAY_IS_ERR(loaded));
-    TEST_ASSERT_STR_EQ(ray_err_code(loaded), "corrupt");
+    TEST_ASSERT_STR_EQ(ray_err_code(loaded), "sym");
     ray_release(loaded);
 
     ray_release(col);
@@ -1470,9 +1485,17 @@ static test_result_t test_read_splayed_bad_sym_fatal(void) {
     ray_err_t err = ray_splay_save(tbl, TMP_SPLAY_SYM_DIR, NULL);
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
-    /* ray_read_splayed with nonexistent sym_path — should fail fatally */
+    /* ray_read_splayed with a nonexistent sym_path on a SYMBOL-FREE
+     * table — post-flip a missing symfile is tolerated (the spec's
+     * no-symbol-columns exemption applies to reads: the argument names
+     * where the domain would live, not a promise it exists).  The loud
+     * "sym" error is reserved for actual SYM columns without a domain
+     * (test_splay_load_sym_missing_corrupt above). */
     ray_t* loaded = ray_read_splayed(TMP_SPLAY_SYM_DIR, "/tmp/rayforce_nonexistent_sym_xyz");
-    TEST_ASSERT_TRUE(RAY_IS_ERR(loaded));
+    TEST_ASSERT_NOT_NULL(loaded);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    TEST_ASSERT_EQ_I(ray_table_nrows(loaded), 3);
+    ray_release(loaded);
 
     ray_release(col_x);
     ray_release(tbl);
@@ -3881,18 +3904,26 @@ static test_result_t test_col_recursive_atoms(void) {
 
 /* ---- test_col_recursive_sym_in_list -------------------------------------- */
 /* Covers col_write_recursive and col_read_recursive: RAY_SYM vector inside a
- * generic list exercises the "type == RAY_SYM" attrs branch. */
+ * generic list.  Post-flip the recursive format serializes nested SYM data
+ * as STRINGS (no symfile applies to nested payloads): the load re-interns
+ * into the global table and rebuilds the vec as runtime-domain W64 — the
+ * on-disk width of the source vec is NOT preserved (representation detail),
+ * the RESOLVED STRINGS are. */
 static test_result_t test_col_recursive_sym_in_list(void) {
     ray_sym_intern("rsl_x", 5);
     ray_sym_intern("rsl_y", 5);
     uint32_t sc = ray_sym_count();
 
-    /* Build W8 sym column */
+    /* Build W8 sym column: ["", <first interned sym>] */
     ray_t* sym_vec = ray_sym_vec_new(RAY_SYM_W8, 2);
     TEST_ASSERT_FALSE(RAY_IS_ERR(sym_vec));
     sym_vec->len = 2;
     uint8_t* sd = (uint8_t*)ray_data(sym_vec);
     sd[0] = 0; sd[1] = 1;
+    ray_t* want0 = ray_sym_str(0);
+    ray_t* want1 = ray_sym_str(1);
+    TEST_ASSERT_NOT_NULL(want0);
+    TEST_ASSERT_NOT_NULL(want1);
 
     /* Wrap in a list (not is_str_list, so uses col_save_list -> col_write_recursive) */
     ray_t* list = ray_list_new(1);
@@ -3912,7 +3943,14 @@ static test_result_t test_col_recursive_sym_in_list(void) {
     ray_t** slots = (ray_t**)ray_data(loaded);
     TEST_ASSERT_EQ_I(slots[0]->type, RAY_SYM);
     TEST_ASSERT_EQ_I(slots[0]->len, 2);
-    TEST_ASSERT_EQ_U(slots[0]->attrs & RAY_SYM_W_MASK, RAY_SYM_W8);
+    /* strings round-trip cell-for-cell (runtime-domain rebuild) */
+    ray_t* got0 = ray_sym_vec_cell(slots[0], 0);
+    ray_t* got1 = ray_sym_vec_cell(slots[0], 1);
+    TEST_ASSERT_NOT_NULL(got0);
+    TEST_ASSERT_NOT_NULL(got1);
+    TEST_ASSERT_EQ_U(ray_str_len(got0), ray_str_len(want0));
+    TEST_ASSERT_EQ_U(ray_str_len(got1), ray_str_len(want1));
+    TEST_ASSERT_MEM_EQ(ray_str_len(got1), ray_str_ptr(got1), ray_str_ptr(want1));
 
     ray_release(loaded);
     ray_release(sym_vec);

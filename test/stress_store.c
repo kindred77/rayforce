@@ -179,7 +179,7 @@ static ray_t* build_table_from_rows(const stress_rows_t* rows) {
 }
 
 /* Extract a loaded table's content into a plain row array, resolving sym
- * IDs to strings through the CURRENT global sym table.  Returns false on
+ * IDs to strings through the column's domain.  Returns false on
  * structural problems (wrong cols, unresolvable sym). */
 static bool extract_rows(stress_ctx_t* c, ray_t* tbl, stress_rows_t* out) {
     if (!tbl || RAY_IS_ERR(tbl)) return false;
@@ -198,17 +198,15 @@ static bool extract_rows(stress_ctx_t* c, ray_t* tbl, stress_rows_t* out) {
         return false;
     }
     if (!rows_reserve(out, n)) return false;
-    const void*    td = ray_data(tick);
     const double*  pd = (const double*)ray_data(price);
     const int64_t* qd = (const int64_t*)ray_data(qty);
     for (int64_t i = 0; i < n; i++) {
         stress_row_t* r = &out->rows[i];
         memset(r, 0, sizeof(*r));
-        int64_t id = ray_read_sym(td, i, RAY_SYM, tick->attrs);
-        ray_t* s = ray_sym_str(id); /* borrowed, do not release */
+        ray_t* s = ray_sym_vec_cell(tick, i); /* borrowed, do not release */
         if (!s) {
-            op_logf(c, "extract: sym id %lld unresolvable at row %lld",
-                    (long long)id, (long long)i);
+            op_logf(c, "extract: sym unresolvable at row %lld",
+                    (long long)i);
             return false;
         }
         size_t len = ray_str_len(s);
@@ -497,6 +495,13 @@ bool stress_op_part_new(stress_ctx_t* c, int64_t n, stress_sym_pattern_t pat) {
     return true;
 }
 
+/* -- vocabulary growth: fresh tickers through the live table -- */
+
+bool stress_op_sym_grow(stress_ctx_t* c, int64_t n) {
+    op_logf(c, "sym_grow n=%lld", (long long)n);
+    return stress_op_insert(c, n, STRESS_SYMS_NEW, false, false);
+}
+
 /* -- simulated process restart -------------------------------------------
  * Tear down the global sym table and reload it from the shared symfile,
  * exactly what a fresh process sees.  Every sym ID minted before this
@@ -522,10 +527,12 @@ bool stress_op_restart(stress_ctx_t* c) {
 
 /* ---- verification ---------------------------------------------------------
  * Cell-by-cell compare of a loaded splayed dir against its shadow.  Tickers
- * are compared as strings via ray_sym_find: find(shadow) == disk_id is
- * equivalent to str(disk_id) == shadow (the intern table is a bijection),
- * and catches enumeration shifts.  NaN price compares equal to NaN
- * (NULL_F64). */
+ * are compared as strings via ray_sym_vec_lookup on the loaded column:
+ * lookup(shadow) == disk_id is equivalent to cell-str(disk_id) == shadow
+ * (a domain is a bijection), and catches enumeration shifts.  Resolving
+ * through the COLUMN's domain keeps this oracle valid across the Phase-2
+ * flip to per-vocabulary symfiles (exact no-op while every domain is the
+ * runtime singleton).  NaN price compares equal to NaN (NULL_F64). */
 
 static bool compare_dir(stress_ctx_t* c, const char* dir,
                         const stress_rows_t* shadow, bool use_mmap,
@@ -559,9 +566,9 @@ static bool compare_dir(stress_ctx_t* c, const char* dir,
     for (int64_t i = 0; i < shadow->len; i++) {
         const stress_row_t* ex = &shadow->rows[i];
         int64_t disk_id = ray_read_sym(td, i, RAY_SYM, tick->attrs);
-        int64_t want_id = ray_sym_find(ex->ticker, strlen(ex->ticker));
+        int64_t want_id = ray_sym_vec_lookup(tick, ex->ticker, strlen(ex->ticker));
         if (disk_id != want_id) {
-            ray_t* s = ray_sym_str(disk_id); /* borrowed; may be NULL */
+            ray_t* s = ray_sym_vec_cell(tick, i); /* borrowed; may be NULL */
             dump_failure(c,
                 "%s row %lld: ticker id %lld ('%.*s') != expected '%s' (id %lld)",
                 label, (long long)i, (long long)disk_id,
@@ -616,9 +623,29 @@ bool stress_check_invariants(stress_ctx_t* c) {
                      (long long)c->last_sym_count, (long long)cnt);
         return false;
     }
-    if ((uint64_t)cnt > (uint64_t)ray_sym_count()) {
-        dump_failure(c, "invariant: symfile count %lld > in-memory %u",
-                     (long long)cnt, ray_sym_count());
+    /* Post-flip domain invariants: the symfile holds the tables'
+     * VOCABULARY (no relation to the global table's count anymore — the
+     * old `cnt <= ray_sym_count()` bound is gone with the global dump).
+     * Position 0 must be the reserved empty string, and the vocabulary
+     * can never exceed every distinct symbol this run generated plus ""
+     * (sym_uniq fresh names + the null) — a gross upper bound that
+     * catches runaway duplication. */
+    if (cnt > 0) {
+        FILE* f2 = fopen(c->sym_path, "rb");
+        uint32_t len0 = 1;
+        bool ok = f2 && fseek(f2, 12, SEEK_SET) == 0 &&
+                  fread(&len0, sizeof(len0), 1, f2) == 1;
+        if (f2) fclose(f2);
+        if (!ok || len0 != 0) {
+            dump_failure(c, "invariant: symfile position 0 is not \"\" "
+                            "(len=%u ok=%d)", len0, (int)ok);
+            return false;
+        }
+    }
+    if (cnt > (int64_t)c->sym_uniq + 1) {
+        dump_failure(c, "invariant: symfile count %lld > distinct symbols "
+                        "ever generated %d + null", (long long)cnt,
+                     c->sym_uniq);
         return false;
     }
     c->last_sym_count = cnt;

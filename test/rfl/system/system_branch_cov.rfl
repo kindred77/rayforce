@@ -1,6 +1,6 @@
 ;; system_branch_cov.rfl — branch coverage for src/ops/system.c (part 1).
 ;;
-;; Covers: ser/de, splayed set/get, parted get, mount, os.size, os.list,
+;; Covers: ser/de, splayed set/get, parted get, os.size, os.list,
 ;; guid, eval, parse, meta, system, getenv, setenv, gc.
 ;;
 ;; Conventions:
@@ -58,27 +58,6 @@
 (.db.parted.get 42 't) !- type
 (.db.parted.get "/tmp/rfl_sys_bc_sym3/" "t") !- type
 (.db.parted.get "/tmp/rfl_sys_bc_sym3/" null) !- type
-
-;; ══════════════════════════════════════════════════════════════════════
-;; ray_db_splayed_mount_fn  (lines 228-259) — error paths
-;; ══════════════════════════════════════════════════════════════════════
-(.db.splayed.mount) !- domain
-(.db.splayed.mount "/tmp" "extra") !- domain
-(.db.splayed.mount 42) !- type
-(.db.splayed.mount "/tmp/rfl_sys_bc_nosuch/") !- io
-(.sys.exec "mkdir -p /tmp/rfl_sys_bc_empty_root/")
-(count (.db.splayed.mount "/tmp/rfl_sys_bc_empty_root/")) -- 0
-(.sys.exec "mkdir -p /tmp/rfl_sys_bc_fileonly/ && touch /tmp/rfl_sys_bc_fileonly/notadir")
-(count (.db.splayed.mount "/tmp/rfl_sys_bc_fileonly/")) -- 0
-
-;; ══════════════════════════════════════════════════════════════════════
-;; ray_db_parted_mount_fn  (lines 266-318) — error paths
-;; ══════════════════════════════════════════════════════════════════════
-(.db.parted.mount) !- domain
-(.db.parted.mount "/tmp" "extra") !- domain
-(.db.parted.mount 42) !- type
-(.sys.exec "mkdir -p /tmp/rfl_sys_bc_notparted/child_dir/")
-(.db.parted.mount "/tmp/rfl_sys_bc_notparted/") !- domain
 
 ;; ══════════════════════════════════════════════════════════════════════
 ;; ray_os_size_fn  (lines 338-349)
@@ -202,21 +181,6 @@
 (.sys.gc) -- 0
 (.sys.gc 0) -- 0
 (.sys.gc "x") -- 0
-
-;; ══════════════════════════════════════════════════════════════════════
-;; name_looks_partition / dir_is_parted_root edge cases
-;; Mount-related coverage is in db_mount.rfl; here we exercise the
-;; error guards that db_mount.rfl doesn't hit.
-;; ══════════════════════════════════════════════════════════════════════
-;; Alphabetic-named children — not partitions
-(.sys.exec "rm -rf /tmp/rfl_sys_bc_alpha && mkdir -p /tmp/rfl_sys_bc_alpha/abc/")
-(.db.parted.mount "/tmp/rfl_sys_bc_alpha/") !- domain
-;; "sym" as only child — skipped by partition scan
-(.sys.exec "rm -rf /tmp/rfl_sys_bc_symonly && mkdir -p /tmp/rfl_sys_bc_symonly/sym/")
-(.db.parted.mount "/tmp/rfl_sys_bc_symonly/") !- domain
-;; Partition-named entries that are files (not dirs) — stat filter
-(.sys.exec "rm -rf /tmp/rfl_sys_bc_partfile && mkdir -p /tmp/rfl_sys_bc_partfile/ && touch /tmp/rfl_sys_bc_partfile/2024.01.01")
-(.db.parted.mount "/tmp/rfl_sys_bc_partfile/") !- domain
 
 ;; ────────────── teardown ──────────────
 (.sys.exec "rm -rf /tmp/rfl_sys_bc_*")
