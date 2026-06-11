@@ -41,7 +41,8 @@ static ray_t* vec_i64_with_nulls(const int64_t* vals, int64_t n,
 }
 
 /* Compare two vectors element-wise: same length, same null positions,
- * same non-null values (F64 compared bitwise-as-null + 1e-12 tolerance). */
+ * same non-null values (F64 compared bitwise-as-null + 1e-12 tolerance).
+ * Convention: a=fused, b=fallback (matches the diff_run call site). */
 static test_result_t vec_expect_equal(ray_t* a, ray_t* b) {
     TEST_ASSERT(a && b && !RAY_IS_ERR(a) && !RAY_IS_ERR(b), "valid results");
     TEST_ASSERT_FMT(a->type == b->type, "type %d != %d", a->type, b->type);
@@ -49,38 +50,67 @@ static test_result_t vec_expect_equal(ray_t* a, ray_t* b) {
                     (long long)a->len, (long long)b->len);
     for (int64_t i = 0; i < a->len; i++) {
         bool na = ray_vec_is_null(a, i), nb = ray_vec_is_null(b, i);
-        TEST_ASSERT_FMT(na == nb, "null mismatch at %lld: %d vs %d",
+        TEST_ASSERT_FMT(na == nb, "null mismatch at %lld: fused=%d fallback=%d",
                         (long long)i, na, nb);
         if (na) continue;
         if (a->type == RAY_F64) {
             double xa = ((double*)ray_data(a))[i];
             double xb = ((double*)ray_data(b))[i];
+            /* Both-NaN is an acceptable match: F64 ops (e.g. DIV by zero)
+             * legitimately produce non-null NaN in both fused and fallback
+             * paths; the harness contract is fused≡fallback, not absolute
+             * correctness. Null-position equivalence is checked above. */
             TEST_ASSERT_FMT(fabs(xa - xb) < 1e-12 || (xa != xa && xb != xb),
-                            "f64 mismatch at %lld: %g vs %g",
+                            "f64 mismatch at %lld: fused=%g fallback=%g",
                             (long long)i, xa, xb);
         } else {
+            /* Hoist elem size: type equality asserted above, so a->type == b->type. */
+            uint8_t esz = ray_elem_size(a->type);
             int64_t xa = 0, xb = 0;
-            memcpy(&xa, (char*)ray_data(a) + i * ray_elem_size(a->type),
-                   ray_elem_size(a->type));
-            memcpy(&xb, (char*)ray_data(b) + i * ray_elem_size(b->type),
-                   ray_elem_size(b->type));
-            TEST_ASSERT_FMT(xa == xb, "mismatch at %lld: %lld vs %lld",
+            memcpy(&xa, (char*)ray_data(a) + i * esz, esz);
+            memcpy(&xb, (char*)ray_data(b) + i * esz, esz);
+            /* Sign-extend narrow values so diagnostic messages are readable
+             * (e.g. I32 -1 prints as -1, not 4294967295). */
+            if      (esz == 4) { xa = (int32_t)xa; xb = (int32_t)xb; }
+            else if (esz == 2) { xa = (int16_t)xa; xb = (int16_t)xb; }
+            else if (esz == 1) { xa = (int8_t)xa;  xb = (int8_t)xb;  }
+            TEST_ASSERT_FMT(xa == xb, "mismatch at %lld: fused=%lld fallback=%lld",
                             (long long)i, (long long)xa, (long long)xb);
         }
     }
     PASS();
 }
 
+/* Sum all bail counters across all bail reasons. */
+static uint64_t expr_bails_total(void) {
+    uint64_t t = 0;
+    for (int i = 0; i < EXPR_BAIL__N; i++) t += ray_expr_bail_counts[i];
+    return t;
+}
+
 /* Execute builder() twice — fused-eligible and forced-fallback — and
- * compare. expect_fused: assert the fused path actually compiled. */
+ * compare. expect_fused: assert the fused path actually compiled.
+ *
+ * Root-compile detection uses BOTH ok and bails snapshots.  Using ok alone
+ * is a false-positive: when the root bails, exec.c recursively evaluates
+ * children, and an all-non-null child subtree can compile (incrementing ok)
+ * even though root fusion never happened.  A genuine root-level compile
+ * produces ok_delta >= 1 with bail_delta == 0; a root bail produces
+ * bail_delta >= 1 (the root contributes at least one bail count). */
 typedef ray_op_t* (*expr_builder_t)(ray_graph_t* g);
 
 static test_result_t diff_run(ray_t* tbl, expr_builder_t builder,
                               bool expect_fused) {
-    uint64_t ok_before = ray_expr_compile_ok;
+    uint64_t ok_before    = ray_expr_compile_ok;
+    uint64_t bails_before = expr_bails_total();
+
     ray_graph_t* g1 = ray_graph_new(tbl);
     ray_t* fused = ray_execute(g1, builder(g1));
-    bool compiled = ray_expr_compile_ok > ok_before;
+
+    /* Capture bails AFTER the first execute but BEFORE disabling fusion,
+     * so the disabled second run's (uncounted) path doesn't skew the delta. */
+    bool compiled = (ray_expr_compile_ok > ok_before) &&
+                    (expr_bails_total() == bails_before);
 
     ray_expr_disable = true;
     ray_graph_t* g2 = ray_graph_new(tbl);
