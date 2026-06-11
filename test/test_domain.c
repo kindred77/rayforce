@@ -1491,6 +1491,248 @@ static test_result_t test_domain_parted_flatten_adopts(void) {
     PASS();
 }
 
+/* ---- Phase 2 Task 7a: flip preconditions ---------------------------------- */
+
+/* Eager atom materialization: every position of a freshly opened FILE
+ * domain resolves IMMEDIATELY (no lazy build dependency on find/first
+ * touch), the borrowed atoms are pointer-stable across calls, and the
+ * resolved bytes match the vocabulary — i.e. behavior is unchanged from
+ * the lazy per-position cache, minus the per-call lock. */
+static test_result_t test_domain_str_eager_lockfree(void) {
+    unlink(TMP_DOM_SYM_PATH);
+    unlink(TMP_DOM_SYM_PATH ".lk");
+
+    int64_t id_a = ray_sym_intern("eager_a", 7);
+    int64_t id_b = ray_sym_intern("eager_b", 7);
+    uint32_t count_at_save = ray_sym_count();
+    TEST_ASSERT_EQ_I(ray_sym_save(TMP_DOM_SYM_PATH), RAY_OK);
+
+    ray_sym_domain_t* dom = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    TEST_ASSERT_NOT_NULL(dom);
+
+    /* First touch after open: walk EVERY position before any find/LUT
+     * call — all atoms must already be there and match the global
+     * table's strings (positions coincide with ids in this fixture). */
+    ray_t* first[2] = { NULL, NULL };
+    for (int64_t p = 0; p < (int64_t)count_at_save; p++) {
+        ray_t* s = ray_sym_domain_str(dom, p);
+        TEST_ASSERT_NOT_NULL(s);
+        ray_t* g = ray_sym_str(p);
+        TEST_ASSERT_EQ_U(ray_str_len(s), ray_str_len(g));
+        TEST_ASSERT_MEM_EQ(ray_str_len(s), ray_str_ptr(s), ray_str_ptr(g));
+        if (p == id_a) first[0] = s;
+        if (p == id_b) first[1] = s;
+    }
+    /* Pointer-stable borrowed atoms: identical on re-resolution. */
+    TEST_ASSERT_EQ_PTR(ray_sym_domain_str(dom, id_a), first[0]);
+    TEST_ASSERT_EQ_PTR(ray_sym_domain_str(dom, id_b), first[1]);
+    /* Out of range still NULL. */
+    TEST_ASSERT_NULL(ray_sym_domain_str(dom, (int64_t)count_at_save));
+    TEST_ASSERT_NULL(ray_sym_domain_str(dom, -1));
+
+    ray_sym_domain_release(dom);
+    unlink(TMP_DOM_SYM_PATH);
+    unlink(TMP_DOM_SYM_PATH ".lk");
+    PASS();
+}
+
+/* Runtime-id LUT: NULL for the runtime singleton; for a FILE domain a
+ * position-indexed array of runtime intern ids (round-trips strings),
+ * built once (idempotent: same pointer).  Divergent fixture proves the
+ * entries are real translations, not identity copies. */
+static test_result_t test_domain_runtime_lut(void) {
+    /* runtime singleton: ids are already runtime ids — no LUT */
+    TEST_ASSERT_NULL(ray_sym_domain_runtime_lut(ray_sym_runtime_domain()));
+
+    ray_sym_domain_t* dom = NULL;
+    int64_t pos_a = -1, pos_b = -1;
+    TEST_ASSERT_TRUE(build_divergent_qsym_fixture(&dom, &pos_a, &pos_b));
+    TEST_ASSERT(pos_a != ray_sym_intern("dq_a", 4), "fixture diverges");
+
+    const int64_t* lut = ray_sym_domain_runtime_lut(dom);
+    TEST_ASSERT_NOT_NULL(lut);
+
+    /* Idempotence: built once, second request returns the same array. */
+    TEST_ASSERT_EQ_PTR((const void*)ray_sym_domain_runtime_lut(dom),
+                       (const void*)lut);
+
+    /* Round-trip: every position's runtime id resolves to the same bytes
+     * as the domain's own vocabulary entry. */
+    int64_t cnt = ray_sym_domain_count(dom);
+    TEST_ASSERT(cnt > 0, "non-empty vocabulary");
+    for (int64_t p = 0; p < cnt; p++) {
+        TEST_ASSERT(lut[p] >= 0, "translated id valid");
+        ray_t* ds = ray_sym_domain_str(dom, p);
+        ray_t* rs = ray_sym_str(lut[p]);
+        TEST_ASSERT_NOT_NULL(ds);
+        TEST_ASSERT_NOT_NULL(rs);
+        TEST_ASSERT_EQ_U(ray_str_len(ds), ray_str_len(rs));
+        TEST_ASSERT_MEM_EQ(ray_str_len(ds), ray_str_ptr(ds), ray_str_ptr(rs));
+    }
+
+    /* Real translation under divergence + the position-0 "" anchor. */
+    TEST_ASSERT_EQ_I(lut[pos_a], ray_sym_intern("dq_a", 4));
+    TEST_ASSERT_EQ_I(lut[pos_b], ray_sym_intern("dq_b", 4));
+    TEST_ASSERT(lut[pos_a] != pos_a, "LUT translates, not identity");
+    TEST_ASSERT_EQ_I(lut[0], 0);  /* "" reserves position 0 AND global id 0 */
+
+    ray_sym_domain_release(dom);
+    unlink(TMP_DOM_QSYM_PATH);
+    unlink(TMP_DOM_QSYM_PATH ".lk");
+    PASS();
+}
+
+#define TMP_DOM_BADSYM_PATH "/tmp/rayforce_test_domain_badsym"
+
+/* Position-0 reservation: ray_sym_save-produced files carry "" at
+ * position 0 (global id 0) and open fine; a crafted symfile whose first
+ * entry is NOT "" is refused (NULL); an EMPTY vocabulary is fine. */
+static test_result_t test_domain_open_position0_validation(void) {
+    unlink(TMP_DOM_SYM_PATH);
+    unlink(TMP_DOM_SYM_PATH ".lk");
+    unlink(TMP_DOM_BADSYM_PATH);
+
+    /* (a) the save path today: "" at position 0 — opens. */
+    (void)ray_sym_intern("p0_ok", 5);
+    TEST_ASSERT_EQ_I(ray_sym_save(TMP_DOM_SYM_PATH), RAY_OK);
+    ray_sym_domain_t* good = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    TEST_ASSERT_NOT_NULL(good);
+    ray_t* s0 = ray_sym_domain_str(good, 0);
+    TEST_ASSERT_NOT_NULL(s0);
+    TEST_ASSERT_EQ_U(ray_str_len(s0), 0);
+    ray_sym_domain_release(good);
+
+    /* (b) crafted STRL whose position 0 is "x": refused. */
+    {
+        FILE* f = fopen(TMP_DOM_BADSYM_PATH, "wb");
+        TEST_ASSERT_NOT_NULL(f);
+        uint32_t magic = 0x4C525453U; /* "STRL" */
+        int64_t  count = 2;
+        uint32_t len_x = 1, len_e = 0;
+        fwrite(&magic, 4, 1, f);
+        fwrite(&count, 8, 1, f);
+        fwrite(&len_x, 4, 1, f);
+        fwrite("x", 1, 1, f);
+        fwrite(&len_e, 4, 1, f);
+        fclose(f);
+    }
+    TEST_ASSERT_NULL(ray_sym_domain_open(TMP_DOM_BADSYM_PATH));
+
+    /* (c) empty vocabulary (count 0): structurally fine. */
+    {
+        FILE* f = fopen(TMP_DOM_BADSYM_PATH, "wb");
+        TEST_ASSERT_NOT_NULL(f);
+        uint32_t magic = 0x4C525453U;
+        int64_t  count = 0;
+        fwrite(&magic, 4, 1, f);
+        fwrite(&count, 8, 1, f);
+        fclose(f);
+    }
+    ray_sym_domain_t* empty = ray_sym_domain_open(TMP_DOM_BADSYM_PATH);
+    TEST_ASSERT_NOT_NULL(empty);
+    TEST_ASSERT_EQ_I(ray_sym_domain_count(empty), 0);
+    TEST_ASSERT_NULL(ray_sym_domain_str(empty, 0));
+    /* empty FILE domain still yields a non-NULL LUT marker (callers
+     * branch on NULL == runtime domain) that is never indexable */
+    TEST_ASSERT_NOT_NULL(ray_sym_domain_runtime_lut(empty));
+    ray_sym_domain_release(empty);
+
+    unlink(TMP_DOM_BADSYM_PATH);
+    unlink(TMP_DOM_SYM_PATH);
+    unlink(TMP_DOM_SYM_PATH ".lk");
+    PASS();
+}
+
+/* dict upsert mutation boundary: a dict whose SYM keys carry an injected
+ * FILE domain re-expresses the keys to the runtime domain on upsert —
+ * the existing-key probe matches by STRING (under the divergent fixture
+ * the raw id compare hits the WRONG row), and the appended key is a
+ * runtime id in a runtime-domain keys vec. */
+static test_result_t test_domain_dict_upsert_file_keys(void) {
+    ray_sym_domain_t* dom = NULL;
+    int64_t pos_a = -1, pos_b = -1;
+    TEST_ASSERT_TRUE(build_divergent_qsym_fixture(&dom, &pos_a, &pos_b));
+    TEST_ASSERT(pos_a != ray_sym_intern("dq_a", 4), "fixture diverges");
+
+    /* keys: FILE-domain [dq_a dq_b]; vals: (10 20) */
+    ray_t* k = ray_sym_vec_new(RAY_SYM_W64, 2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(k));
+    k->len = 2;
+    ((int64_t*)ray_data(k))[0] = pos_a;
+    ((int64_t*)ray_data(k))[1] = pos_b;
+    ray_sym_domain_retain(dom);
+    k->sym_domain = dom;
+
+    ray_t* vals = ray_list_new(2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vals));
+    ray_t* v10 = ray_i64(10);
+    ray_t* v20 = ray_i64(20);
+    vals = ray_list_append(vals, v10);
+    vals = ray_list_append(vals, v20);
+    ray_release(v10);
+    ray_release(v20);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vals));
+
+    ray_t* d = ray_dict_new(k, vals);  /* consumes both */
+    TEST_ASSERT_FALSE(RAY_IS_ERR(d));
+
+    /* (a) upsert an EXISTING key: 'dq_a must UPDATE row 0 (string match
+     * through the FILE domain; the raw runtime-id compare matched the
+     * dq_b row under divergence). */
+    {
+        ray_t* ka = ray_sym(ray_sym_intern("dq_a", 4));
+        ray_t* nv = ray_i64(99);
+        d = ray_dict_upsert(d, ka, nv);
+        ray_release(ka);
+        ray_release(nv);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(d));
+    }
+    ray_t* keys = ray_dict_keys(d);
+    ray_t* outv = ray_dict_vals(d);
+    TEST_ASSERT_NOT_NULL(keys);
+    TEST_ASSERT_NOT_NULL(outv);
+    TEST_ASSERT_EQ_I(keys->len, 2);  /* update, not insert */
+    /* keys were re-expressed to the runtime domain */
+    TEST_ASSERT_EQ_PTR(ray_sym_vec_domain(keys), ray_sym_runtime_domain());
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(keys))[0], ray_sym_intern("dq_a", 4));
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(keys))[1], ray_sym_intern("dq_b", 4));
+    TEST_ASSERT_TRUE(sym_cell_is(keys, 0, "dq_a"));
+    TEST_ASSERT_TRUE(sym_cell_is(keys, 1, "dq_b"));
+    TEST_ASSERT_EQ_I(((ray_t**)ray_data(outv))[0]->i64, 99);
+    TEST_ASSERT_EQ_I(((ray_t**)ray_data(outv))[1]->i64, 20);
+
+    /* (b) upsert a NEW key: appended as a runtime id. */
+    {
+        ray_t* kc = ray_sym(ray_sym_intern("dq_c", 4));
+        ray_t* nv = ray_i64(7);
+        d = ray_dict_upsert(d, kc, nv);
+        ray_release(kc);
+        ray_release(nv);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(d));
+    }
+    keys = ray_dict_keys(d);
+    outv = ray_dict_vals(d);
+    TEST_ASSERT_EQ_I(keys->len, 3);
+    TEST_ASSERT_EQ_PTR(ray_sym_vec_domain(keys), ray_sym_runtime_domain());
+    TEST_ASSERT_TRUE(sym_cell_is(keys, 0, "dq_a"));
+    TEST_ASSERT_TRUE(sym_cell_is(keys, 1, "dq_b"));
+    TEST_ASSERT_TRUE(sym_cell_is(keys, 2, "dq_c"));
+    TEST_ASSERT_EQ_I(((ray_t**)ray_data(outv))[2]->i64, 7);
+
+    ray_release(d);
+    ray_sym_domain_release(dom);
+
+    /* ref balance: the dict's converted keys dropped the FILE-domain ref
+     * (fresh open rebuilds the cache entry). */
+    ray_sym_domain_t* d2 = ray_sym_domain_open(TMP_DOM_QSYM_PATH);
+    TEST_ASSERT_NOT_NULL(d2);
+    ray_sym_domain_release(d2);
+
+    unlink(TMP_DOM_QSYM_PATH);
+    unlink(TMP_DOM_QSYM_PATH ".lk");
+    PASS();
+}
+
 /* ---- registration -------------------------------------------------------- */
 
 const test_entry_t domain_entries[] = {
@@ -1518,5 +1760,9 @@ const test_entry_t domain_entries[] = {
     { "domain/join_across_domains",     test_domain_join_across_domains,     domain_rt_setup, domain_rt_teardown },
     { "domain/asof_join_across_domains", test_domain_asof_join_across_domains, domain_rt_setup, domain_rt_teardown },
     { "domain/parted_flatten_adopts",   test_domain_parted_flatten_adopts,   domain_rt_setup, domain_rt_teardown },
+    { "domain/str_eager_lockfree",      test_domain_str_eager_lockfree,      domain_setup, domain_teardown },
+    { "domain/runtime_lut",             test_domain_runtime_lut,             domain_rt_setup, domain_rt_teardown },
+    { "domain/open_position0_validation", test_domain_open_position0_validation, domain_setup, domain_teardown },
+    { "domain/dict_upsert_file_keys",   test_domain_dict_upsert_file_keys,   domain_rt_setup, domain_rt_teardown },
     { NULL, NULL, NULL, NULL },
 };
