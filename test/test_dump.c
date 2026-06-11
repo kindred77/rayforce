@@ -330,7 +330,7 @@ static test_result_t test_dump_head_tail_annotations(void) {
 }
 
 /* ---------- Tests for OP_SORT / OP_SELECT recursion into ext->sort.columns
- * and the est_rows / OP_FLAG_FUSED branches in dump_node. ---------- */
+ * and the est_rows branch in dump_node. ---------- */
 
 static test_result_t test_dump_sort_select_and_flags(void) {
     ray_heap_init();
@@ -350,9 +350,8 @@ static test_result_t test_dump_sort_select_and_flags(void) {
     ray_op_t* sel_cols[1] = { tbl_node };
     ray_op_t* sl = ray_select_op(g, tbl_node, sel_cols, 1);
 
-    /* est_rows and OP_FLAG_FUSED branches: set them on the SELECT node. */
+    /* est_rows branch: set it on the SELECT node. */
     sl->est_rows = 99;
-    sl->flags   |= OP_FLAG_FUSED;
 
     /* Put both under one root so a single dump walks both subtrees. */
     ray_op_t* root = ray_add(g, so, sl);
@@ -362,8 +361,6 @@ static test_result_t test_dump_sort_select_and_flags(void) {
     TEST_ASSERT_FMT(len > 0, "empty dump output");
     TEST_ASSERT_FMT(strstr(buf, "SORT")   != NULL, "missing SORT");
     TEST_ASSERT_FMT(strstr(buf, "SELECT") != NULL, "missing SELECT");
-    /* OP_FLAG_FUSED -> " [fused]" */
-    TEST_ASSERT_FMT(strstr(buf, "[fused]") != NULL, "missing [fused] flag");
     /* est_rows formatting */
     TEST_ASSERT_FMT(strstr(buf, "~99 rows") != NULL, "missing est_rows annotation");
 

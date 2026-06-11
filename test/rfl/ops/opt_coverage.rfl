@@ -59,7 +59,7 @@
 (floor 5.0) -- 5.0
 
 ;; Unary op over a column — exercises the post-order walk in
-;; pass_constant_fold and the unary fuse path in ray_fuse_pass.
+;; pass_constant_fold.
 ;; (operand is OP_SCAN, not OP_CONST → no actual fold, but the
 ;; pass walks the subtree.)
 (sum (at (select {x: (neg a) from: T}) 'x)) -- -55
@@ -401,11 +401,10 @@
 (count (select {from: T where: (and (> a 0) (== (abs -7) 7))}))
 
 ;; ════════════════════════════════════════════════════════════════════════════
-;; 10. Fusion: HEAD-of-FILTER, HEAD-of-SORT, HEAD-of-GROUP — opt.c invokes
-;; ray_fuse_pass at line 2021.  Already covered by ops/exec_coverage.rfl;
-;; here we add the HAVING + take pattern + multi-key sort variants that
-;; force opt.c's projection_pushdown to walk SORT/SELECT ext->sort.columns
-;; (opt.c:1615-1622).
+;; 10. HEAD-of-FILTER, HEAD-of-SORT, HEAD-of-GROUP — already covered by
+;; ops/exec_coverage.rfl; here we add the HAVING + take pattern + multi-key
+;; sort variants that force opt.c's projection_pushdown to walk SORT/SELECT
+;; ext->sort.columns (opt.c:1615-1622).
 ;; ════════════════════════════════════════════════════════════════════════════
 
 (count (select {from: T asc: a take: 3})) -- 3
