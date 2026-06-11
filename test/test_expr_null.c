@@ -1104,6 +1104,139 @@ static test_result_t test_fused_agg_input_allnull_group(void) {
     PASS();
 }
 
+/* ---- Task 10: parted nullable columns through the fused path ---------------
+ *
+ * Fixture: 3 segments of I64, each 4 rows.
+ *   seg0 = [1, 2, 3, 4]          — no nulls
+ *   seg1 = [5, 6, 7, 8]          — nulls at local indices {1, 3}
+ *   seg2 = [9, 10, 11, 12]       — no nulls
+ * Expression: x + 7
+ *
+ * Part A — diff_run on the parted table.
+ *   Streaming mode (exec.c dag_can_stream → true for elementwise ops)
+ *   calls exec_node per segment with a flat copy of each segment's table.
+ *   Each flat segment's expr_compile sees that segment's attrs:
+ *     seg0/seg2: nullable=false, null_aware=false (fast path)
+ *     seg1:      nullable=true,  null_aware=true  (sentinel-preserving path)
+ *   Fused and fallback both concatenate segment results → must match.
+ *   expect_fused=true: the flat-segment expr_compile fires on each segment.
+ *
+ * Part B — compile-time union: expr_compile on the raw parted table.
+ *   When group.c (or similar) calls expr_compile(g, parted_tbl, ...) the
+ *   compile sees ALL segments; the SCAN handler unions HAS_NULLS across segs.
+ *   Assert regs[out_reg].nullable == true (seg1 poisons the union).
+ *   Assert has_parted == true.
+ *
+ * Part C — expr_eval_full_parted correctness.
+ *   eval on the compiled parted expr (has_parted=true) → expr_eval_full
+ *   dispatches to expr_eval_full_parted.  Morsel evaluator uses compile-time
+ *   nullable (=true union) for every segment; no-null segments just never
+ *   match the sentinel check.  Verify output values and null positions:
+ *     rows  0-3: {8,9,10,11}  — non-null (seg0)
+ *     rows  4-7: {12,NULL,14,NULL}  — nulls at global {5,7} (seg1)
+ *     rows 8-11: {16,17,18,19}  — non-null (seg2)
+ *   Also assert output vector carries RAY_ATTR_HAS_NULLS. */
+
+/* Build a 3-segment parted I64 column: seg0 all non-null, seg1 with 2 nulls,
+ * seg2 all non-null.  Returns owned parted wrapper; caller releases. */
+static ray_t* make_parted_i64_col(void) {
+    int64_t v0[] = {1, 2, 3, 4};
+    int64_t v1[] = {5, 6, 7, 8};
+    int64_t v2[] = {9, 10, 11, 12};
+
+    ray_t* s0 = ray_vec_from_raw(RAY_I64, v0, 4);
+    ray_t* s1 = ray_vec_from_raw(RAY_I64, v1, 4);
+    ray_t* s2 = ray_vec_from_raw(RAY_I64, v2, 4);
+    ray_vec_set_null(s1, 1, true); /* local index 1 → global row 5 */
+    ray_vec_set_null(s1, 3, true); /* local index 3 → global row 7 */
+
+    /* Parted wrapper: data = array of 3 ray_t* pointers. */
+    ray_t* col = ray_alloc(3 * sizeof(ray_t*));
+    col->type = (int8_t)(RAY_PARTED_BASE + RAY_I64);
+    col->len  = 3;
+    col->attrs = 0;
+    memset(col->aux, 0, sizeof(col->aux));
+    ray_t** ptrs = (ray_t**)ray_data(col);
+    ptrs[0] = s0;
+    ptrs[1] = s1;
+    ptrs[2] = s2;
+    return col;
+}
+
+/* x + 7 (reuses build_add_const which scans "x") */
+
+static test_result_t test_diff_parted_nullable(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    ray_t* col = make_parted_i64_col();
+    TEST_ASSERT(col && !RAY_IS_ERR(col), "parted col");
+
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("x", 1), col);
+    ray_release(col);
+    TEST_ASSERT(tbl && !RAY_IS_ERR(tbl), "parted tbl");
+
+    /* ----- Part A: streaming diff (per-segment fused compile) ----- */
+    test_result_t r = diff_run(tbl, build_add_const, true);
+    if (r.status != TEST_PASS) {
+        ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+        return r;
+    }
+
+    /* ----- Part B: compile-time union check on raw parted table ----- */
+    ray_t* xcol = ray_table_get_col(tbl, ray_sym_intern("x", 1));
+    TEST_ASSERT(xcol && RAY_IS_PARTED(xcol->type), "col is parted");
+
+    ray_graph_t* gc = ray_graph_new(tbl);
+    ray_op_t* root_b = build_add_const(gc);
+    ray_expr_t ex;
+    bool ok = expr_compile(gc, tbl, root_b, &ex);
+    TEST_ASSERT(ok, "expr_compile on parted tbl succeeds");
+    TEST_ASSERT(ex.has_parted, "has_parted set");
+    TEST_ASSERT(ex.regs[ex.out_reg].nullable,
+                "compile-time nullable is true (union across segments)");
+    /* The SCAN register for 'x' must also be marked nullable. */
+    bool scan_nullable = false;
+    for (uint8_t r2 = 0; r2 < ex.n_regs; r2++) {
+        if (ex.regs[r2].kind == REG_SCAN && ex.regs[r2].nullable) {
+            scan_nullable = true; break;
+        }
+    }
+    TEST_ASSERT(scan_nullable, "SCAN reg nullable = union across segs");
+
+    /* ----- Part C: expr_eval_full_parted correctness ----- */
+    int64_t nrows = ray_table_nrows(tbl); /* 12 = 4+4+4 */
+    TEST_ASSERT_FMT(nrows == 12, "nrows=%lld", (long long)nrows);
+
+    ray_t* res = expr_eval_full(&ex, nrows);
+    TEST_ASSERT(res && !RAY_IS_ERR(res), "eval result valid");
+    TEST_ASSERT_FMT(res->len == 12, "result len=%lld", (long long)res->len);
+    TEST_ASSERT(res->attrs & RAY_ATTR_HAS_NULLS, "output carries HAS_NULLS");
+
+    /* Expected output: seg0→{8,9,10,11}, seg1→{12,NULL,14,NULL}, seg2→{16,17,18,19} */
+    int64_t expect_val[] = {8,9,10,11, 12,0,14,0, 16,17,18,19};
+    int      expect_null[] = {0,0,0,0, 0,1,0,1, 0,0,0,0};
+    int64_t* d = (int64_t*)ray_data(res);
+    for (int64_t i = 0; i < 12; i++) {
+        bool is_n = ray_vec_is_null(res, i);
+        TEST_ASSERT_FMT(is_n == (bool)expect_null[i],
+                        "null at %lld: got=%d want=%d", (long long)i, is_n, expect_null[i]);
+        if (!is_n) {
+            TEST_ASSERT_FMT(d[i] == expect_val[i],
+                            "val at %lld: got=%lld want=%lld",
+                            (long long)i, (long long)d[i], (long long)expect_val[i]);
+        }
+    }
+
+    ray_release(res);
+    ray_graph_free(gc);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t expr_null_entries[] = {
     { "expr_null/bail_counter",            test_expr_bail_counter_nulls,          NULL, NULL },
     { "expr_null/nullfree_invariance",     test_nullfree_stream_unchanged,        NULL, NULL },
@@ -1149,5 +1282,7 @@ const test_entry_t expr_null_entries[] = {
     { "expr_null/diff_cast_f64_to_i32",    test_diff_cast_f64_to_i32,             NULL, NULL },
     /* Task 9: fused agg inputs — all-null group finalizes to NULL */
     { "expr_null/fused_agg_allnull_group", test_fused_agg_input_allnull_group,    NULL, NULL },
+    /* Task 10: parted nullable columns through the fused path */
+    { "expr_null/diff_parted_nullable",    test_diff_parted_nullable,             NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
