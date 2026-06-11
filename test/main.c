@@ -47,6 +47,7 @@
 #include <rayforce.h>
 #include "lang/eval.h"
 #include "lang/format.h"
+#include "ops/internal.h"
 
 /* Forward-declare runtime API — mirrors existing test_lang.c pattern. */
 struct ray_runtime_s;
@@ -106,6 +107,7 @@ extern const test_entry_t domain_entries[];
 extern const test_entry_t dump_entries[];
 extern const test_entry_t embedding_entries[];
 extern const test_entry_t exec_entries[];
+extern const test_entry_t expr_null_entries[];
 extern const test_entry_t format_entries[];
 extern const test_entry_t fvec_entries[];
 extern const test_entry_t graph_entries[];
@@ -158,7 +160,7 @@ static const test_entry_t* const compiled_groups[] = {
     block_entries,    buddy_entries,    compile_entries,  cow_entries,      csr_entries,
     csv_entries,      datalog_entries,  dict_entries,     domain_entries,
     dump_entries,
-    embedding_entries, exec_entries,
+    embedding_entries, exec_entries,   expr_null_entries,
     format_entries,   fvec_entries,     graph_entries,    graph_builtin_entries,
     group_extra_entries,
     fused_group_entries,
@@ -658,6 +660,7 @@ static int name_matches_filter(const char* name, const char* filter) {
 }
 
 int main(int argc, char** argv) {
+    ray_expr_stats_init();
     g_color = isatty(fileno(stdout));
 
     const char* filter = NULL;
