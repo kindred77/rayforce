@@ -1,0 +1,72 @@
+;; Mixed-width parted SYM regression — partitions saved at different SYM
+;; index widths (legal: each partition's width tracks the shared symfile
+;; vocabulary at ITS save time).  Partition 1 is written while the
+;; vocabulary is tiny (u8 indices); partition 2 is written after 300
+;; fresh syms cross the 255 boundary (u16 indices).  The parted
+;; gather/flatten paths used to pick the FIRST partition's width and
+;; zero-fill mismatched segments — sym 0 = "" — so the whole second
+;; partition read as null symbols in select/group-by/join while
+;; per-partition loads stayed correct.  Fixed by widening per cell to
+;; the max segment width (parted_copy_cells / parted_sym_max_attrs).
+;;
+;; Fixture root uses the /tmp/rfl_part_mw prefix so it doesn't collide
+;; with the other /tmp/rfl_* fixtures.  Pre-cleanup is mandatory: stale
+;; sym.lk files from a prior run cause "error: corrupt" on reopen.
+
+;; ────────────── pre-flight cleanup ──────────────
+(.sys.exec "rm -rf /tmp/rfl_part_mw")
+
+;; ────────────── partition 1: u8-width symfile ──────────────
+(.db.splayed.set "/tmp/rfl_part_mw/2024.01.01/hist/" (table [ticker qty] (list ['aaa 'bbb 'aaa] [1 2 3])) "/tmp/rfl_part_mw/sym")
+
+;; ────────────── partition 2: written after the vocabulary crosses 255 ──────────────
+;; 300 generated syms '0..'299 push the shared symfile past 255 entries,
+;; so this partition's ticker column is saved at u16 width.
+(set WIDE (as 'symbol (til 300)))
+(.db.splayed.set "/tmp/rfl_part_mw/2024.01.02/hist/" (table [ticker qty] (list WIDE (+ 1 (til 300)))) "/tmp/rfl_part_mw/sym")
+
+;; splayed reference table sharing the same root symfile (stress client
+;; layout: splayed "live" + date partitions + one symfile) — used for the
+;; join assertion below.
+(.db.splayed.set "/tmp/rfl_part_mw/ref" (table [ticker w] (list ['aaa '7 '299] [10 20 30])) "/tmp/rfl_part_mw/sym")
+
+(set HT (.db.parted.get "/tmp/rfl_part_mw/" 'hist))
+(count HT) -- 303
+
+;; ────────────── flatten (OP_SCAN / select scatter) ──────────────
+;; partition-2 cells must survive the flatten at full width: 302 distinct
+;; tickers (aaa bbb + 300 generated), not 3 (aaa bbb "").
+(set FL (select {t: ticker q: qty from: HT}))
+(count (distinct (at FL 't))) -- 302
+
+;; totals: 1+2+3 plus 1..300 — a zero-filled partition would still sum
+;; qty right, but the ticker-keyed checks below would not; keep the
+;; total as the row-coverage baseline.
+(sum (at FL 'q)) -- 45156
+(sum (at HT 'qty)) -- 45156
+
+;; ────────────── group-by over the parted table ──────────────
+(set G (select {from: HT by: ticker c: (count qty)}))
+(count G) -- 302
+;; partition-1 symbol: 2 rows
+(at (select {from: G where: (== ticker 'aaa)}) 'c) -- [2]
+;; partition-2 symbols: 1 row each (used to collapse into the "" group)
+(at (select {from: G where: (== ticker '7)}) 'c) -- [1]
+(at (select {from: G where: (== ticker '299)}) 'c) -- [1]
+
+;; ────────────── filtered select on a partition-2 symbol ──────────────
+(set R7 (select {from: HT where: (== ticker '7)}))
+(count R7) -- 1
+(at R7 'qty) -- [8]
+;; and on a partition-1 symbol (u8 segment still exact)
+(count (select {from: HT where: (== ticker 'aaa)})) -- 2
+
+;; ────────────── join against the splayed table ──────────────
+;; ref tickers: aaa (2 hist rows), 7 (1), 299 (1) → 4 inner-join rows.
+(set REF (.db.splayed.get "/tmp/rfl_part_mw/ref" "/tmp/rfl_part_mw/sym"))
+(set LJ (select {ticker: ticker w: w from: REF}))
+(set RJ (select {ticker: ticker rq: qty from: HT}))
+(count (inner-join [ticker] LJ RJ)) -- 4
+
+;; ────────────── post-cleanup ──────────────
+(nil? (.sys.exec "rm -rf /tmp/rfl_part_mw")) -- false
