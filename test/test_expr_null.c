@@ -139,16 +139,23 @@ static test_result_t test_expr_bail_counter_nulls(void) {
     tbl = ray_table_add_col(tbl, ray_sym_intern("x", 1), col);
     ray_release(col);
 
-    uint64_t before = ray_expr_bail_counts[EXPR_BAIL_NULL_SHAPE];
+    /* Task 7: nullable i64 arithmetic now has a null-aware kernel variant.
+     * The fused path compiles and executes — no EXPR_BAIL_NULL_SHAPE fires. */
+    uint64_t ok_before   = ray_expr_compile_ok;
+    uint64_t bail_before = 0;
+    for (int i = 0; i < EXPR_BAIL__N; i++) bail_before += ray_expr_bail_counts[i];
     ray_graph_t* g = ray_graph_new(tbl);
     ray_op_t* x = ray_scan(g, "x");
     ray_op_t* e = ray_add(g, x, ray_const_i64(g, 1));
     ray_t* r = ray_execute(g, e);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
-    /* Nullable i64 column: scan is tracked, arithmetic sets null_aware,
-     * then the capability choke fires EXPR_BAIL_NULL_SHAPE (no kernel yet). */
-    TEST_ASSERT(ray_expr_bail_counts[EXPR_BAIL_NULL_SHAPE] > before,
-                "nullable i64+const counted as EXPR_BAIL_NULL_SHAPE");
+    /* Fused compile should succeed: ok increments, bails do not. */
+    TEST_ASSERT(ray_expr_compile_ok > ok_before,
+                "nullable i64+const now compiles in fused path (Task 7)");
+    uint64_t bail_after = 0;
+    for (int i = 0; i < EXPR_BAIL__N; i++) bail_after += ray_expr_bail_counts[i];
+    TEST_ASSERT(bail_after == bail_before,
+                "no bail for nullable i64+const (kernel variant live)");
 
     ray_release(r); ray_graph_free(g); ray_release(tbl);
     ray_sym_destroy(); ray_heap_destroy();
@@ -192,8 +199,8 @@ static test_result_t test_diff_i64_add_nullable_prelanding(void) {
     tbl = ray_table_add_col(tbl, ray_sym_intern("x", 1), col);
     ray_release(col);
 
-    /* expect_fused=false until the null kernels land (Task 7 flips it). */
-    test_result_t r = diff_run(tbl, build_add_const, false);
+    /* Task 7: null-aware i64 arithmetic kernel landed; expect_fused=true. */
+    test_result_t r = diff_run(tbl, build_add_const, true);
 
     ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
     return r;
@@ -581,6 +588,194 @@ static test_result_t test_diff_i64_or_raw(void) {
     return r;
 }
 
+/* ---- Task 7: null-aware i64 arithmetic + f64 min2/max2 ---- */
+
+/* Two-column i64 fixture:
+ *   x: {1,2,3,4,5,6,7,8,9,10}  nulls {0,4,9}
+ *   y: {0,3,0,7,6,5,4,3,2,1}   nulls {0,3,8}
+ *
+ * y has zero values at non-null rows 2 and 6 (for div/mod zero-divisor tests).
+ * Null rows 0 and 3 have value 0 in raw storage but are null-flagged. */
+static ray_t* make_task7_table(void) {
+    int64_t xv[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+    int64_t xi[] = {0, 4, 9};
+    int64_t yv[] = {0, 3, 0, 7, 6, 5, 4, 3, 2, 1};
+    int64_t yi[] = {0, 3, 8};
+    ray_t* xcol = vec_i64_with_nulls(xv, 10, xi, 3);
+    ray_t* ycol = vec_i64_with_nulls(yv, 10, yi, 3);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("x", 1), xcol);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("y", 1), ycol);
+    ray_release(xcol); ray_release(ycol);
+    return tbl;
+}
+
+static ray_op_t* build_i64_sub(ray_graph_t* g) {
+    return ray_sub(g, ray_scan(g, "x"), ray_scan(g, "y"));
+}
+static ray_op_t* build_i64_mul(ray_graph_t* g) {
+    return ray_mul(g, ray_scan(g, "x"), ray_scan(g, "y"));
+}
+static ray_op_t* build_i64_div(ray_graph_t* g) {
+    /* y has zero at rows 2,6 (non-null) → zero-divisor null; y null at 0,3,8 → propagate null */
+    return ray_div(g, ray_scan(g, "x"), ray_scan(g, "y"));
+}
+static ray_op_t* build_i64_mod(ray_graph_t* g) {
+    return ray_mod(g, ray_scan(g, "x"), ray_scan(g, "y"));
+}
+static ray_op_t* build_i64_min2(ray_graph_t* g) {
+    return ray_min2(g, ray_scan(g, "x"), ray_scan(g, "y"));
+}
+static ray_op_t* build_i64_max2(ray_graph_t* g) {
+    return ray_max2(g, ray_scan(g, "x"), ray_scan(g, "y"));
+}
+
+static test_result_t test_diff_i64_sub(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* tbl = make_task7_table();
+    test_result_t r = diff_run(tbl, build_i64_sub, true);
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+static test_result_t test_diff_i64_mul(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* tbl = make_task7_table();
+    test_result_t r = diff_run(tbl, build_i64_mul, true);
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+static test_result_t test_diff_i64_div(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* tbl = make_task7_table();
+    test_result_t r = diff_run(tbl, build_i64_div, true);
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+static test_result_t test_diff_i64_mod(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* tbl = make_task7_table();
+    test_result_t r = diff_run(tbl, build_i64_mod, true);
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+static test_result_t test_diff_i64_min2(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* tbl = make_task7_table();
+    test_result_t r = diff_run(tbl, build_i64_min2, true);
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+static test_result_t test_diff_i64_max2(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* tbl = make_task7_table();
+    test_result_t r = diff_run(tbl, build_i64_max2, true);
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
+/* Unary NEG/ABS: include INT64_MIN+1 and large-magnitude values.
+ * Fixture:
+ *   x: {1, -1, INT64_MIN+1, INT64_MAX, 0, 42, -42, 100, -100, 7}
+ *   nulls at {0, 5}
+ *
+ * INT64_MIN+1 negated = INT64_MAX (no overflow).
+ * INT64_MAX negated = INT64_MIN+1 via unsigned wrap (no overflow but result is negative large).
+ * Note: INT64_MIN itself would overflow via unsigned wrap → NULL_I64; not placed at a non-null
+ * index to keep the fixture simple (overflow sentinel is exercised by mark_i64_overflow_as_null). */
+static ray_t* make_neg_abs_table(void) {
+    int64_t xv[] = {1, -1, INT64_MIN+1, INT64_MAX, 0, 42, -42, 100, -100, 7};
+    int64_t xi[] = {0, 5};
+    ray_t* xcol = vec_i64_with_nulls(xv, 10, xi, 2);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("x", 1), xcol);
+    ray_release(xcol);
+    return tbl;
+}
+
+static ray_op_t* build_i64_neg(ray_graph_t* g) {
+    return ray_neg(g, ray_scan(g, "x"));
+}
+static ray_op_t* build_i64_abs(ray_graph_t* g) {
+    return ray_abs(g, ray_scan(g, "x"));
+}
+
+static test_result_t test_diff_i64_neg(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* tbl = make_neg_abs_table();
+    test_result_t r = diff_run(tbl, build_i64_neg, true);
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+static test_result_t test_diff_i64_abs(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* tbl = make_neg_abs_table();
+    test_result_t r = diff_run(tbl, build_i64_abs, true);
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
+/* Deep chain: ((x + 1) * y - 3) % 7
+ * Exercises scratch-register sentinel flow through a multi-op chain.
+ * Uses make_task7_table (y has zero divisors for % but 7 is the right divisor here — no zero). */
+static ray_op_t* build_i64_deep_chain(ray_graph_t* g) {
+    ray_op_t* x = ray_scan(g, "x");
+    ray_op_t* y = ray_scan(g, "y");
+    ray_op_t* xp1 = ray_add(g, x, ray_const_i64(g, 1));
+    ray_op_t* mul = ray_mul(g, xp1, y);
+    ray_op_t* sub = ray_sub(g, mul, ray_const_i64(g, 3));
+    return ray_mod(g, sub, ray_const_i64(g, 7));
+}
+
+static test_result_t test_diff_i64_deep_chain(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* tbl = make_task7_table();
+    test_result_t r = diff_run(tbl, build_i64_deep_chain, true);
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
+/* F64 min2/max2 over two nullable F64 columns (no zero-div shapes).
+ * Fixture:
+ *   f: {1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0}  nulls {1, 6}
+ *   g: {10.0, 9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0}  nulls {2, 7} */
+static ray_t* make_f64_minmax_table(void) {
+    double fv[] = {1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0};
+    double gv[] = {10.0, 9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0};
+    ray_t* fcol = ray_vec_from_raw(RAY_F64, fv, 10);
+    ray_vec_set_null(fcol, 1, true);
+    ray_vec_set_null(fcol, 6, true);
+    ray_t* gcol = ray_vec_from_raw(RAY_F64, gv, 10);
+    ray_vec_set_null(gcol, 2, true);
+    ray_vec_set_null(gcol, 7, true);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("f", 1), fcol);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("g", 1), gcol);
+    ray_release(fcol); ray_release(gcol);
+    return tbl;
+}
+
+static ray_op_t* build_f64_min2(ray_graph_t* g) {
+    return ray_min2(g, ray_scan(g, "f"), ray_scan(g, "g"));
+}
+static ray_op_t* build_f64_max2(ray_graph_t* g) {
+    return ray_max2(g, ray_scan(g, "f"), ray_scan(g, "g"));
+}
+
+static test_result_t test_diff_f64_min2(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* tbl = make_f64_minmax_table();
+    test_result_t r = diff_run(tbl, build_f64_min2, true);
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+static test_result_t test_diff_f64_max2(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* tbl = make_f64_minmax_table();
+    test_result_t r = diff_run(tbl, build_f64_max2, true);
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
 const test_entry_t expr_null_entries[] = {
     { "expr_null/bail_counter",            test_expr_bail_counter_nulls,          NULL, NULL },
     { "expr_null/nullfree_invariance",     test_nullfree_stream_unchanged,        NULL, NULL },
@@ -605,5 +800,18 @@ const test_entry_t expr_null_entries[] = {
     /* Raw nullable i64 AND/OR: exercises the null_aware I64 BOOL kernel directly */
     { "expr_null/diff_i64_and_raw",        test_diff_i64_and_raw,                 NULL, NULL },
     { "expr_null/diff_i64_or_raw",         test_diff_i64_or_raw,                  NULL, NULL },
+    /* Task 7: null-aware i64 arithmetic */
+    { "expr_null/diff_i64_sub",            test_diff_i64_sub,                     NULL, NULL },
+    { "expr_null/diff_i64_mul",            test_diff_i64_mul,                     NULL, NULL },
+    { "expr_null/diff_i64_div",            test_diff_i64_div,                     NULL, NULL },
+    { "expr_null/diff_i64_mod",            test_diff_i64_mod,                     NULL, NULL },
+    { "expr_null/diff_i64_min2",           test_diff_i64_min2,                    NULL, NULL },
+    { "expr_null/diff_i64_max2",           test_diff_i64_max2,                    NULL, NULL },
+    { "expr_null/diff_i64_neg",            test_diff_i64_neg,                     NULL, NULL },
+    { "expr_null/diff_i64_abs",            test_diff_i64_abs,                     NULL, NULL },
+    { "expr_null/diff_i64_deep_chain",     test_diff_i64_deep_chain,              NULL, NULL },
+    /* Task 7: null-aware f64 min2/max2 */
+    { "expr_null/diff_f64_min2",           test_diff_f64_min2,                    NULL, NULL },
+    { "expr_null/diff_f64_max2",           test_diff_f64_max2,                    NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
