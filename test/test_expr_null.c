@@ -495,6 +495,66 @@ static test_result_t test_isnull_nonnullable_fused(void) {
     PASS();
 }
 
+/* ---- Raw nullable i64 AND/OR: both inputs are nullable i64 columns ----
+ * Unlike the Task 6 tests (which feed AND/OR from comparison outputs that
+ * are non-nullable BOOLs), these feed raw nullable i64 values directly so
+ * the null_aware I64 BOOL kernel cells are exercised.
+ *
+ * Fixture:
+ *   x: vals {1,0,3,4,5,6,7,8,9,10}  nulls {0,4,9}
+ *   y: vals {1,2,0,4,5,6,7,8,9,10}  nulls {0,3,8}
+ *
+ * Interesting rows:
+ *   row 0: x null,  y null   → both null
+ *   row 2: x=3,     y=0      → y is zero (falsy non-null)
+ *   row 3: x=4,     y null   → y null, x truthy
+ *   row 4: x null,  y=5      → x null, y truthy
+ *   row 8: x=9,     y null   → y null, x truthy
+ *   row 9: x null,  y=10     → x null, y truthy
+ *   remaining rows: both non-null, varying truthiness
+ *
+ * Expected fallback semantics (any null → 0):
+ *   AND: null-on-either → 0; else (a && b) ? 1 : 0
+ *   OR:  null-on-either → 0; else (a || b) ? 1 : 0
+ */
+static ray_t* make_raw_andor_table(void) {
+    int64_t xv[] = {1, 0, 3, 4, 5, 6, 7, 8, 9, 10};
+    int64_t xi[] = {0, 4, 9};
+    int64_t yv[] = {1, 2, 0, 4, 5, 6, 7, 8, 9, 10};
+    int64_t yi[] = {0, 3, 8};
+    ray_t* xcol = vec_i64_with_nulls(xv, 10, xi, 3);
+    ray_t* ycol = vec_i64_with_nulls(yv, 10, yi, 3);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("x", 1), xcol);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("y", 1), ycol);
+    ray_release(xcol); ray_release(ycol);
+    return tbl;
+}
+
+static ray_op_t* build_and_raw(ray_graph_t* g) {
+    return ray_and(g, ray_scan(g, "x"), ray_scan(g, "y"));
+}
+
+static ray_op_t* build_or_raw(ray_graph_t* g) {
+    return ray_or(g, ray_scan(g, "x"), ray_scan(g, "y"));
+}
+
+static test_result_t test_diff_i64_and_raw(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* tbl = make_raw_andor_table();
+    test_result_t r = diff_run(tbl, build_and_raw, true);
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
+static test_result_t test_diff_i64_or_raw(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* tbl = make_raw_andor_table();
+    test_result_t r = diff_run(tbl, build_or_raw, true);
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
 const test_entry_t expr_null_entries[] = {
     { "expr_null/bail_counter",            test_expr_bail_counter_nulls,          NULL, NULL },
     { "expr_null/nullfree_invariance",     test_nullfree_stream_unchanged,        NULL, NULL },
@@ -513,5 +573,8 @@ const test_entry_t expr_null_entries[] = {
     { "expr_null/diff_i64_or",             test_diff_i64_or,                      NULL, NULL },
     { "expr_null/diff_isnull_x",           test_diff_isnull_x,                    NULL, NULL },
     { "expr_null/isnull_nonnullable",      test_isnull_nonnullable_fused,          NULL, NULL },
+    /* Raw nullable i64 AND/OR: exercises the null_aware I64 BOOL kernel directly */
+    { "expr_null/diff_i64_and_raw",        test_diff_i64_and_raw,                 NULL, NULL },
+    { "expr_null/diff_i64_or_raw",         test_diff_i64_or_raw,                  NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
