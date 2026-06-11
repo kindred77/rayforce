@@ -6,7 +6,7 @@ Every Rayforce query goes through three phases:
 
 1. **Build** — Construct a lazy DAG of operations using the C API or Rayfall `select`/`update` builtins. No data is processed at this stage.
 2. **Optimize** — Transform the DAG through multiple optimization passes that rewrite, reorder, and fuse operations.
-3. **Execute** — Walk the optimized DAG and process data in 1024-element morsels using fused bytecode with computed-goto dispatch.
+3. **Execute** — Walk the optimized DAG and process data in 1024-element morsels. Element-wise subtrees are compiled to flat bytecode at execution time and evaluated over per-worker scratch buffers without intermediate materialization.
 
 ```c
 /* Phase 1: Build the DAG (lazy, no data movement) */
@@ -33,7 +33,7 @@ Every operation in the DAG is represented by a 32-byte `ray_op_t` that fits in a
 typedef struct ray_op {
     uint16_t       opcode;     /* OP_ADD, OP_SCAN, OP_FILTER, etc.  */
     uint8_t        arity;      /* 0, 1, or 2                        */
-    uint8_t        flags;      /* OP_FLAG_FUSED, OP_FLAG_DEAD       */
+    uint8_t        flags;      /* OP_FLAG_DEAD                      */
     int8_t         out_type;   /* inferred output type               */
     uint8_t        pad[3];
     uint32_t       id;         /* unique node ID                    */
@@ -46,7 +46,7 @@ Key design decisions:
 
 - **32-byte alignment** — nodes are allocated from a contiguous array in the `ray_graph_t`, keeping the DAG hot in L1 cache during optimization walks.
 - **At most 2 inputs** — binary operations use both; unary ops use `inputs[0]` only; sources have both NULL.
-- **Flags** — `OP_FLAG_FUSED` marks nodes absorbed by fusion; `OP_FLAG_DEAD` marks nodes removed by DCE.
+- **Flags** — `OP_FLAG_DEAD` marks nodes removed by DCE.
 - **est_rows** — populated by the type inference pass and used by filter reorder and join planning.
 
 ### ray_op_ext_t — Extended Node
@@ -91,42 +91,37 @@ Bottom-up pass that propagates types from leaf nodes (SCAN, CONST) through the D
 
 Evaluates operations on constant inputs at optimization time. For example, `ray_add(const(2), const(3))` is replaced with `const(5)`. Applies to all element-wise arithmetic, comparisons, and logical operations.
 
-### 3. Sideways Information Passing (SIP)
+### 3. Idiom Rewrite
+
+Recognizes high-level expression patterns and rewrites them to more efficient equivalents before later passes run. For example, `count(distinct col)` is rewritten to use a dedicated HLL-backed distinct-count aggregate node. Because this pass may replace the root, it runs before predicate pushdown and SIP.
+
+### 4. Sideways Information Passing (SIP)
 
 Propagates selection bitmaps backward through `OP_EXPAND` chains. When a filter follows a graph expansion, SIP creates a `RAY_SEL` bitmap on the source side that allows the executor to skip source nodes whose neighbors would all fail the downstream filter. See [SIP Optimization](../graph/algorithms.md#sip) for details.
 
-### 4. Factorize
+### 5. Factorize
 
 Marks multi-hop graph expansions for factorized execution. Sets the `factorized` flag on EXPAND/VAR_EXPAND nodes, enabling output as `ray_fvec_t` / `ray_ftable_t` instead of flat vectors. Avoids cross-product materialization in multi-join graph patterns.
 
-### 5. Predicate Pushdown
+### 6. Predicate Pushdown
 
 Pushes filter predicates as close to the data source as possible. A filter above a join is split into components that can be evaluated on individual join inputs, reducing the number of rows entering the join. Filters above scans are pushed directly onto the scan, eliminating rows before any computation.
 
-### 6. Filter Reorder
+### 7. Filter Reorder
 
 When multiple filter predicates are chained, reorders them by estimated selectivity (most selective first). Uses the `est_rows` from type inference to estimate selectivity. More selective filters run first, reducing the number of rows processed by subsequent filters.
 
-### 7. Projection Pushdown
+### 8. Projection Pushdown
 
 Identifies which columns are actually needed by the query and pushes projection below joins and group-by operations. Columns that are never referenced after a certain point are dropped early, reducing memory bandwidth and intermediate result sizes.
 
-### 8. Partition Pruning
+### 9. Partition Pruning
 
 For partitioned tables, analyzes filter predicates to determine which partitions can be skipped entirely. A predicate like `date > '2024-01-01'` on a date-partitioned table eliminates all partition directories before that date without scanning them. The pruning pass produces a `seg_mask` bitmap that the executor uses during [block offloading](offloading.md) to skip pruned segments entirely.
 
-### 9. Fusion
-
-The most impactful optimization. Merges chains of element-wise operations (arithmetic, comparisons, logical ops, string ops) into a single fused pass. A chain like `SCAN → ADD → MUL → GT → FILTER` becomes a single bytecode program that processes each morsel in one pass without materializing intermediate vectors.
-
-!!! note "Fusion boundaries"
-    Pipeline breakers (GROUP, SORT, JOIN, WINDOW, graph ops) cannot be fused. They materialize their inputs and produce new vectors for the downstream fused chain.
-
-Fused nodes are marked with `OP_FLAG_FUSED`. The lead node (the last in the chain) consumes all fused predecessors and executes them as inlined bytecode.
-
 ### 10. Dead Code Elimination (DCE)
 
-Removes nodes marked `OP_FLAG_DEAD` or `OP_FLAG_FUSED` (absorbed by fusion) that have no live consumers. Cleans up the DAG after all other passes.
+Removes nodes marked `OP_FLAG_DEAD` that have no live consumers. Cleans up the DAG after all other passes.
 
 ## Morsel-Driven Execution
 
@@ -155,23 +150,22 @@ while (ray_morsel_next(&m)) {         /* advance to next morsel    */
 }
 ```
 
-### Computed-Goto Dispatch
+### Expression Compilation (Fused Execution)
 
-Fused operation chains compile to a bytecode program that the executor runs using computed-goto dispatch (GCC/Clang `__attribute__((computed_goto))`). Each opcode is a label in a jump table, eliminating branch prediction overhead from a traditional switch/case loop. The executor processes one morsel at a time through the entire fused chain before advancing.
+Element-wise operation subtrees are compiled to flat bytecode at **execution time** — not as an optimizer pass. The executor (`exec.c`) calls `expr_compile()` for every element-wise subtree it encounters; the group executor (`group.c`) additionally calls it for aggregate input expressions.
 
-### Register Slots
+`expr_compile` walks the DAG rooted at a node and emits a flat instruction sequence:
 
-During execution, intermediate morsel results are stored in register slots on the executor's pipeline (`ray_pipe_t`). Each fused node reads from and writes to specific register slots, avoiding heap allocation for intermediate results within a morsel.
+- **Registers**: up to 16 slots (`EXPR_MAX_REGS`), each holding a typed lane — `REG_SCAN` (column slice), `REG_CONST` (broadcast scalar), or `REG_SCRATCH` (computed intermediate).
+- **Instructions**: up to 48 opcodes (`EXPR_MAX_INS`) covering arithmetic, comparisons, casts, and logical operations.
+- **Morsel evaluation**: the compiled program is evaluated one morsel at a time (1024 rows) in per-worker scratch buffers allocated on the thread stack. No intermediate vectors are heap-allocated.
+- **Parallelism**: subtrees covering ≥ 65,536 rows (`RAY_PARALLEL_THRESHOLD`) are dispatched across worker threads, each thread processing its own morsel slice independently.
+- **Parted-segment aware**: for partitioned tables, column pointers are rebound per segment at evaluation time — zero-copy, no gather.
 
-```c
-typedef struct ray_pipe {
-    ray_op_t*          op;            /* operation node                */
-    struct ray_pipe*   inputs[2];     /* upstream pipes                */
-    ray_morsel_t       state;         /* current morsel state          */
-    ray_t*             materialized;  /* materialized intermediate     */
-    int               spill_fd;      /* spill file descriptor (-1)    */
-} ray_pipe_t;
-```
+**Null handling.** Nullable integer columns are sentinel-normalized at morsel load: `NULL_I32`/`NULL_I16` are widened to `NULL_I64` in `i64` lanes, or to `NaN` in `f64` lanes. Per-instruction null-aware kernel variants are selected at compile time (sentinel-checking `i64` arithmetic and comparisons, sentinel-mapping casts). F64 `NaN`-nulls propagate through arithmetic natively. Output vectors carry `RAY_ATTR_HAS_NULLS` conservatively. Null-free programs compile to the identical instruction stream as non-nullable inputs — no null checks on the fast path.
+
+!!! note "Fallback conditions"
+    `expr_compile` bails to recursive per-op evaluation when: the column type is `RAY_STR`, the column carries `RAY_ATTR_SLICE`, the column is `MAPCOMMON` or a `FILE`-domain `SYM`, the constant is a null literal, a scalar-broadcast length would mismatch, register or instruction limits are exceeded (> 16 regs / > 48 instructions), the traversal stack depth exceeds 64, the graph has > 4096 nodes, a nullable program hits an instruction without a null-aware kernel variant (e.g. `F64 AND/OR/NOT`), or the operation is `OP_IDIV`.
 
 ## Selection Bitmaps
 
@@ -249,8 +243,9 @@ ray_t* result = ray_execute(g, grouped);
  *  1. Type inference: price=F64, qty=I64, notional=F64, pred=BOOL
  *  2. Constant folding: const 50.0 stays (already constant)
  *  3. Predicate pushdown: filter moves below the multiply
- *  4. Fusion: SCAN(price) -> GT(const) -> FILTER fused into one pass
- *  5. DCE: removes any dead intermediate nodes
+ *  4. DCE: removes any dead intermediate nodes
+ *  At execution time, expr_compile fuses SCAN(price) -> GT(const) into
+ *  a single flat bytecode pass over each 1024-row morsel.
  */
 
 ray_graph_free(g);

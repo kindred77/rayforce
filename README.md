@@ -24,7 +24,8 @@
 
 Rayforce is a pure C17 zero-dependency embeddable engine where columnar
 analytics and graph traversals share a single operation DAG, pass through a
-multi-pass optimizer, and execute as fused morsel-driven bytecode. No malloc.
+multi-pass optimizer, and execute as morsel-driven bytecode compiled at
+execution time. No malloc.
 
 ## Quick Start
 
@@ -124,20 +125,21 @@ int main(void) {
 **Build** — Construct a lazy DAG: scans, filters, joins, aggregations, window
 functions, graph traversals. Nothing executes yet.
 
-**Optimize** — Multi-pass rewriting: type inference → constant folding → SIP →
-factorize → predicate pushdown → filter reorder → projection pushdown →
-partition pruning → fusion → DCE.
+**Optimize** — Multi-pass rewriting: type inference → constant folding → idiom
+rewrite → SIP → factorize → predicate pushdown → filter reorder → projection
+pushdown → partition pruning → DCE.
 
-**Execute** — Fused morsel-driven bytecode processes 1024-element chunks that
-stay L1-resident. Radix-partitioned hash joins size partitions to fit L2.
-Thread pool dispatches morsels in parallel.
+**Execute** — Element-wise subtrees are compiled to flat bytecode at execution
+time and evaluated over 1024-element morsels that stay L1-resident, with no
+intermediate heap allocation. Radix-partitioned hash joins size partitions to
+fit L2. Thread pool dispatches morsels in parallel.
 
 ## Features
 
 **Execution engine**
 - Lazy operation DAG — nothing runs until `ray_execute`
 - Multi-pass optimizer with sideways information passing
-- Fused morsel-driven bytecode — element-wise ops merged into single-pass chunks
+- Expression compilation at execution time — element-wise subtrees compiled to flat bytecode, evaluated in 1024-row morsel batches with no intermediate materialization
 - Radix-partitioned hash joins sized for L2 cache
 - Thread pool with parallel morsel dispatch
 
