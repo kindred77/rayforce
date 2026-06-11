@@ -118,9 +118,11 @@ void stress_gen_row(stress_ctx_t* c, stress_sym_pattern_t pat,
 bool stress_rows_append(stress_rows_t* r, const stress_row_t* row);
 void stress_rows_trim(stress_rows_t* r, bool tail, int64_t n);
 
-/* upsert key semantics: index of LAST row matching ticker, or -1 */
-int64_t stress_find_last_by_ticker(const stress_rows_t* rows,
-                                   const char* ticker);
+/* upsert key semantics: index of FIRST row matching ticker, or -1 — the
+ * language's upsert updates the first key hit (query.c), and both drivers
+ * follow the language. */
+int64_t stress_find_first_by_ticker(const stress_rows_t* rows,
+                                    const char* ticker);
 
 /* fixture path layout */
 void stress_live_dir(const stress_ctx_t* c, char* buf, size_t n);

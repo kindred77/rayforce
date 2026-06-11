@@ -157,10 +157,11 @@ bool stress_eval_table_src(const stress_rows_t* rows, int64_t from, int64_t n,
 }
 
 /* Conservative source-buffer size for a slice of n rows wrapped in one
- * surrounding form (set call + two quoted paths). */
+ * surrounding get→mutate→set form (three quoted dirs + three quoted sym
+ * paths ≤ 6*512, plus verb syntax). */
 static size_t src_bufsz(int64_t n) {
     /* per row: ticker (≤31+2) + price (≤8) + qty (≤21) + separators */
-    return 2048 + (size_t)n * (3 * STRESS_SYM_MAX + 16);
+    return 4096 + (size_t)n * (3 * STRESS_SYM_MAX + 16);
 }
 
 /* (.db.splayed.set "<dir>" <table literal> "<shared sym>") — the explicit
@@ -215,5 +216,211 @@ bool stress_eval_seed_initial(stress_ctx_t* c, int64_t live_rows, int nparts,
         if (!eval_set_dir(c, dir, &c->parts[p])) return false;
     }
     c->nparts = nparts;
+    return true;
+}
+
+/* ---- op executors -----------------------------------------------------------
+ * One engine, two drivers: each executor consumes the ctx rng EXACTLY like
+ * its C counterpart (stress_store.c) and applies the identical shadow
+ * mutation, so the same seed yields bit-identical shadows under either
+ * driver (pinned by stress_eval/equiv_with_c_driver).  The real side is a
+ * SINGLE eval string — get → mutate → set — relying on sequential
+ * evaluation of multiple top-level forms; a failure therefore replays as
+ * one REPL paste from the op log.
+ *
+ * Verified verb forms (test/rfl/table/update.rfl, rfl/null/upsert.rfl,
+ * src/ops/collection.c ray_take_fn):
+ *   (insert 'T <table literal>)   quoted sym = in-place env update;
+ *                                 table payload matches by column name
+ *   (upsert 'T 1 <row list>)      1 = leading key-column count (ticker);
+ *                                 FIRST matching row updated, else append
+ *   (take T n) / (take T -n)      first / last n rows; n ≤ len here, so
+ *                                 take's wrap-extension never triggers
+ */
+
+/* Append rows to the splayed table at dir via (insert 'ST ...). */
+static bool eval_insert_rows(stress_ctx_t* c, const char* dir,
+                             const stress_row_t* fresh, int64_t n) {
+    const stress_rows_t view = { (stress_row_t*)fresh, n, n };
+    size_t cap = src_bufsz(n);
+    char*  src = (char*)malloc(cap);
+    if (!src) return false;
+    size_t off = 0;
+    bool ok = emit(src, cap, &off,
+                   "(set ST (.db.splayed.get \"%s\" \"%s\"))\n(insert 'ST ",
+                   dir, c->sym_path);
+    if (ok) {
+        ok = stress_eval_table_src(&view, 0, n, src + off, cap - off);
+        off += strlen(src + off);
+    }
+    if (ok)
+        ok = emit(src, cap, &off, ")\n(.db.splayed.set \"%s\" ST \"%s\")",
+                  dir, c->sym_path);
+    if (!ok)
+        stress_op_logf(c, "eval insert: source buffer too small for %s", dir);
+    if (ok) ok = stress_eval_exec(c, src);
+    free(src);
+    return ok;
+}
+
+bool stress_eval_op_insert(stress_ctx_t* c, int64_t n,
+                           stress_sym_pattern_t pat) {
+    stress_row_t* fresh =
+        (stress_row_t*)malloc((size_t)n * sizeof(stress_row_t));
+    if (!fresh) return false;
+    stress_op_logf(c, "eval-insert n=%lld pat=%d", (long long)n, (int)pat);
+    for (int64_t i = 0; i < n; i++) {
+        stress_gen_row(c, pat, &fresh[i]);
+        canon_row_price(&fresh[i]);
+    }
+    char dir[512];
+    stress_live_dir(c, dir, sizeof(dir));
+    bool ok = eval_insert_rows(c, dir, fresh, n);
+    if (ok)
+        for (int64_t i = 0; i < n; i++)
+            if (!stress_rows_append(&c->live, &fresh[i])) { ok = false; break; }
+    free(fresh);
+    return ok;
+}
+
+/* One row's values as the upsert payload: (list 'tkr 12.34 56), with the
+ * verified null literals (0Ns / 0Nf / 0Nl) per cell. */
+static bool emit_row_list(char* buf, size_t cap, size_t* off,
+                          const stress_row_t* r) {
+    bool ok = r->ticker[0] == '\0'
+                  ? emit(buf, cap, off, "(list 0Ns ")
+                  : emit(buf, cap, off, "(list '%s ", r->ticker);
+    if (ok)
+        ok = isnan(r->price) ? emit(buf, cap, off, "0Nf ")
+                             : emit(buf, cap, off, PRICE_FMT " ", r->price);
+    if (ok)
+        ok = r->qty == NULL_I64
+                 ? emit(buf, cap, off, "0Nl)")
+                 : emit(buf, cap, off, "%lld)", (long long)r->qty);
+    return ok;
+}
+
+bool stress_eval_op_upsert(stress_ctx_t* c, stress_sym_pattern_t pat) {
+    stress_row_t row;
+    stress_gen_row(c, pat, &row);
+    canon_row_price(&row);
+    stress_op_logf(c, "eval-upsert ticker=%s pat=%d", row.ticker, (int)pat);
+    char dir[512];
+    stress_live_dir(c, dir, sizeof(dir));
+    char   src[4096];
+    size_t off = 0;
+    bool ok = emit(src, sizeof(src), &off,
+                   "(set ST (.db.splayed.get \"%s\" \"%s\"))\n(upsert 'ST 1 ",
+                   dir, c->sym_path);
+    if (ok) ok = emit_row_list(src, sizeof(src), &off, &row);
+    if (ok)
+        ok = emit(src, sizeof(src), &off,
+                  ")\n(.db.splayed.set \"%s\" ST \"%s\")", dir, c->sym_path);
+    if (ok) ok = stress_eval_exec(c, src);
+    if (!ok) return false;
+    /* shadow: language semantics — FIRST matching key updated, else append */
+    int64_t hit = stress_find_first_by_ticker(&c->live, row.ticker);
+    if (hit >= 0) {
+        c->live.rows[hit] = row;
+        return true;
+    }
+    return stress_rows_append(&c->live, &row);
+}
+
+bool stress_eval_op_trim(stress_ctx_t* c, int part_idx, bool tail, int64_t n) {
+    stress_op_logf(c, "eval-trim part=%d tail=%d n=%lld", part_idx, (int)tail,
+                   (long long)n);
+    char           dir[512];
+    stress_rows_t* shadow;
+    if (part_idx < 0) {
+        stress_live_dir(c, dir, sizeof(dir));
+        shadow = &c->live;
+    } else {
+        if (part_idx >= c->nparts) return false;
+        stress_part_dir(c, part_idx, dir, sizeof(dir));
+        shadow = &c->parts[part_idx];
+    }
+    /* No `drop` verb: trim = keep the complement via take.  drop-tail n
+     * keeps the FIRST len-n rows → (take T keep); drop-head n keeps the
+     * LAST len-n rows → (take T -keep).  Clamp like stress_rows_trim, so
+     * keep ∈ [0, len] and take never wrap-extends. */
+    int64_t len  = shadow->len;
+    int64_t drop = n < 0 ? 0 : (n > len ? len : n);
+    long long take_arg = (long long)(tail ? len - drop : -(len - drop));
+    char   src[4096];
+    size_t off = 0;
+    bool ok = emit(src, sizeof(src), &off,
+                   "(set ST (.db.splayed.get \"%s\" \"%s\"))\n"
+                   "(set ST (take ST %lld))\n"
+                   "(.db.splayed.set \"%s\" ST \"%s\")",
+                   dir, c->sym_path, take_arg, dir, c->sym_path);
+    if (ok) ok = stress_eval_exec(c, src);
+    if (!ok) return false;
+    stress_rows_trim(shadow, tail, n);
+    return true;
+}
+
+bool stress_eval_op_part_append(stress_ctx_t* c, int part_idx, int64_t n,
+                                stress_sym_pattern_t pat) {
+    if (part_idx < 0 || part_idx >= c->nparts) return false;
+    stress_row_t* fresh =
+        (stress_row_t*)malloc((size_t)n * sizeof(stress_row_t));
+    if (!fresh) return false;
+    stress_op_logf(c, "eval-part_append part=%d n=%lld pat=%d", part_idx,
+                   (long long)n, (int)pat);
+    for (int64_t i = 0; i < n; i++) {
+        stress_gen_row(c, pat, &fresh[i]);
+        canon_row_price(&fresh[i]);
+    }
+    char dir[512];
+    stress_part_dir(c, part_idx, dir, sizeof(dir));
+    bool ok = eval_insert_rows(c, dir, fresh, n);
+    if (ok)
+        for (int64_t i = 0; i < n; i++)
+            if (!stress_rows_append(&c->parts[part_idx], &fresh[i])) {
+                ok = false;
+                break;
+            }
+    free(fresh);
+    return ok;
+}
+
+bool stress_eval_op_part_new(stress_ctx_t* c, int64_t n,
+                             stress_sym_pattern_t pat) {
+    if (c->nparts >= STRESS_MAX_PARTS) return true; /* fixture full: no-op */
+    int p = c->nparts;
+    snprintf(c->part_dates[p], sizeof(c->part_dates[p]), "2024.01.%02d",
+             (p + 1) % 100); /* % keeps -Wformat-truncation in range */
+    stress_op_logf(c, "eval-part_new date=%s n=%lld pat=%d", c->part_dates[p],
+                   (long long)n, (int)pat);
+    stress_row_t row;
+    for (int64_t i = 0; i < n; i++) {
+        stress_gen_row(c, pat, &row);
+        canon_row_price(&row);
+        if (!stress_rows_append(&c->parts[p], &row)) goto fail;
+    }
+    char dir[512];
+    stress_part_dir(c, p, dir, sizeof(dir));
+    if (!eval_set_dir(c, dir, &c->parts[p])) goto fail;
+    c->nparts = p + 1;
+    return true;
+fail:
+    free(c->parts[p].rows);
+    memset(&c->parts[p], 0, sizeof(c->parts[p]));
+    return false;
+}
+
+/* Simulated process restart, eval flavor: tear the WHOLE runtime down and
+ * recreate it (heap + sym + env all die — every binding and sym id minted
+ * before this call is void).  Nothing is reloaded here: the next op's
+ * get re-opens its table against the shared symfile, exactly like a fresh
+ * process would. */
+bool stress_eval_op_restart(stress_ctx_t* c) {
+    stress_op_logf(c, "eval-restart (runtime destroy + create)");
+    stress_eval_runtime_down();
+    if (!stress_eval_runtime_up()) {
+        stress_dump_failure(c, "eval-restart: ray_runtime_create failed");
+        return false;
+    }
     return true;
 }

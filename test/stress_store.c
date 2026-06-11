@@ -381,15 +381,18 @@ bool stress_op_insert(stress_ctx_t* c, int64_t n, stress_sym_pattern_t pat,
     return ok;
 }
 
-/* -- upsert: keyed on ticker; last matching row updated, else append -- */
+/* -- upsert: keyed on ticker; FIRST matching row updated, else append --
+ * First-match is the LANGUAGE's upsert semantics (query.c breaks on the
+ * first key hit); both drivers follow the language so the eval and C
+ * executors cannot drift. */
 
 /* Null-ticker rows all share the "" key, so an upsert with a null key
- * collates onto the last null row — intentional test semantics, applied
+ * collates onto the first null row — intentional test semantics, applied
  * identically to disk and shadow. */
-/* Returns index of last row whose ticker matches, or -1. */
-int64_t stress_find_last_by_ticker(const stress_rows_t* rows,
-                                   const char* ticker) {
-    for (int64_t i = rows->len - 1; i >= 0; i--)
+/* Returns index of first row whose ticker matches, or -1. */
+int64_t stress_find_first_by_ticker(const stress_rows_t* rows,
+                                    const char* ticker) {
+    for (int64_t i = 0; i < rows->len; i++)
         if (strcmp(rows->rows[i].ticker, ticker) == 0) return i;
     return -1;
 }
@@ -397,7 +400,7 @@ int64_t stress_find_last_by_ticker(const stress_rows_t* rows,
 static bool cb_upsert(stress_ctx_t* c, stress_rows_t* disk, void* a) {
     (void)c;
     const stress_row_t* row = (const stress_row_t*)a;
-    int64_t hit = stress_find_last_by_ticker(disk, row->ticker);
+    int64_t hit = stress_find_first_by_ticker(disk, row->ticker);
     if (hit >= 0) {
         disk->rows[hit] = *row;
         return true;
@@ -414,7 +417,7 @@ bool stress_op_upsert(stress_ctx_t* c, stress_sym_pattern_t pat,
     char dir[512];
     stress_live_dir(c, dir, sizeof(dir));
     if (!mutate_dir(c, dir, via_mmap, false, cb_upsert, &row)) return false;
-    int64_t hit = stress_find_last_by_ticker(&c->live, row.ticker);
+    int64_t hit = stress_find_first_by_ticker(&c->live, row.ticker);
     if (hit >= 0) {
         c->live.rows[hit] = row;
         return true;
