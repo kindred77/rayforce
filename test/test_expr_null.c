@@ -358,6 +358,143 @@ static test_result_t test_diff_f64_arith_output(void) {
     PASS();
 }
 
+/* ---- Task 6: null-aware i64 comparisons, AND/OR, ISNULL ---- */
+
+/* Fixture: 10-row table with two nullable i64 columns.
+ *   x: vals 1..10, nulls at {0,4,9}
+ *   y: vals 10..1 (decreasing), nulls at {0,3,8} */
+static ray_t* make_task6_table(void) {
+    int64_t xv[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+    int64_t xi[] = {0, 4, 9};
+    int64_t yv[] = {10, 9, 8, 7, 6, 5, 4, 3, 2, 1};
+    int64_t yi[] = {0, 3, 8};
+    ray_t* xcol = vec_i64_with_nulls(xv, 10, xi, 3);
+    ray_t* ycol = vec_i64_with_nulls(yv, 10, yi, 3);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("x", 1), xcol);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("y", 1), ycol);
+    ray_release(xcol); ray_release(ycol);
+    return tbl;
+}
+
+/* x > 5 */
+static ray_op_t* build_x_gt_const(ray_graph_t* g) {
+    return ray_gt(g, ray_scan(g, "x"), ray_const_i64(g, 5));
+}
+/* x == 3 */
+static ray_op_t* build_x_eq_const(ray_graph_t* g) {
+    return ray_eq(g, ray_scan(g, "x"), ray_const_i64(g, 3));
+}
+/* x != 3 */
+static ray_op_t* build_x_ne_const(ray_graph_t* g) {
+    return ray_ne(g, ray_scan(g, "x"), ray_const_i64(g, 3));
+}
+/* x <= y */
+static ray_op_t* build_x_le_y(ray_graph_t* g) {
+    return ray_le(g, ray_scan(g, "x"), ray_scan(g, "y"));
+}
+/* (x > 1) and (y < 5) */
+static ray_op_t* build_and_expr(ray_graph_t* g) {
+    return ray_and(g,
+        ray_gt(g, ray_scan(g, "x"), ray_const_i64(g, 1)),
+        ray_lt(g, ray_scan(g, "y"), ray_const_i64(g, 5)));
+}
+/* (x > 1) or (y < 5) */
+static ray_op_t* build_or_expr(ray_graph_t* g) {
+    return ray_or(g,
+        ray_gt(g, ray_scan(g, "x"), ray_const_i64(g, 1)),
+        ray_lt(g, ray_scan(g, "y"), ray_const_i64(g, 5)));
+}
+/* isnull(x) */
+static ray_op_t* build_isnull_x(ray_graph_t* g) {
+    return ray_isnull(g, ray_scan(g, "x"));
+}
+
+static test_result_t test_diff_i64_gt_const(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* tbl = make_task6_table();
+    test_result_t r = diff_run(tbl, build_x_gt_const, true);
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
+static test_result_t test_diff_i64_eq_const(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* tbl = make_task6_table();
+    test_result_t r = diff_run(tbl, build_x_eq_const, true);
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
+static test_result_t test_diff_i64_ne_const(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* tbl = make_task6_table();
+    test_result_t r = diff_run(tbl, build_x_ne_const, true);
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
+static test_result_t test_diff_i64_le_y(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* tbl = make_task6_table();
+    test_result_t r = diff_run(tbl, build_x_le_y, true);
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
+static test_result_t test_diff_i64_and(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* tbl = make_task6_table();
+    test_result_t r = diff_run(tbl, build_and_expr, true);
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
+static test_result_t test_diff_i64_or(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* tbl = make_task6_table();
+    test_result_t r = diff_run(tbl, build_or_expr, true);
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
+static test_result_t test_diff_isnull_x(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* tbl = make_task6_table();
+    test_result_t r = diff_run(tbl, build_isnull_x, true);
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
+/* isnull over a NULL-FREE i64 column: result must be all-false BOOL vec.
+ * Pre-change: ISNULL falls through ot=RAY_I64 in expr_compile so it bails
+ * (BOOL output type is wrong → sentinel path is absent) — the fused path
+ * would produce garbage if it didn't bail, but the capability choke fires
+ * EXPR_BAIL_NULL_SHAPE and the fallback runs instead.  This test pins the
+ * correct all-false result regardless of whether fusion fires. */
+static test_result_t test_isnull_nonnullable_fused(void) {
+    ray_heap_init(); (void)ray_sym_init();
+
+    int64_t vals[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+    ray_t* col = ray_vec_from_raw(RAY_I64, vals, 10);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("x", 1), col);
+    ray_release(col);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_t* res = ray_execute(g, ray_isnull(g, ray_scan(g, "x")));
+    TEST_ASSERT(res && !RAY_IS_ERR(res), "execute succeeded");
+    TEST_ASSERT(res->type == RAY_BOOL, "result is BOOL");
+    TEST_ASSERT_FMT(res->len == 10, "len %lld", (long long)res->len);
+    uint8_t* d = (uint8_t*)ray_data(res);
+    for (int64_t i = 0; i < 10; i++)
+        TEST_ASSERT_FMT(d[i] == 0, "expected false at %lld, got %d",
+                        (long long)i, (int)d[i]);
+    ray_release(res); ray_graph_free(g);
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t expr_null_entries[] = {
     { "expr_null/bail_counter",            test_expr_bail_counter_nulls,          NULL, NULL },
     { "expr_null/nullfree_invariance",     test_nullfree_stream_unchanged,        NULL, NULL },
@@ -367,5 +504,14 @@ const test_entry_t expr_null_entries[] = {
     { "expr_null/diff_f64_chain_parallel", test_diff_f64_chain_parallel,          NULL, NULL },
     { "expr_null/nullfree_promotion",      test_nullfree_promotion_invariance,    NULL, NULL },
     { "expr_null/diff_f64_arith_output",   test_diff_f64_arith_output,            NULL, NULL },
+    /* Task 6: null-aware i64 comparisons, AND/OR, ISNULL */
+    { "expr_null/diff_i64_gt_const",       test_diff_i64_gt_const,                NULL, NULL },
+    { "expr_null/diff_i64_eq_const",       test_diff_i64_eq_const,                NULL, NULL },
+    { "expr_null/diff_i64_ne_const",       test_diff_i64_ne_const,                NULL, NULL },
+    { "expr_null/diff_i64_le_y",           test_diff_i64_le_y,                    NULL, NULL },
+    { "expr_null/diff_i64_and",            test_diff_i64_and,                     NULL, NULL },
+    { "expr_null/diff_i64_or",             test_diff_i64_or,                      NULL, NULL },
+    { "expr_null/diff_isnull_x",           test_diff_isnull_x,                    NULL, NULL },
+    { "expr_null/isnull_nonnullable",      test_isnull_nonnullable_fused,          NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
