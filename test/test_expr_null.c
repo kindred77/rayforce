@@ -139,17 +139,42 @@ static test_result_t test_expr_bail_counter_nulls(void) {
     tbl = ray_table_add_col(tbl, ray_sym_intern("x", 1), col);
     ray_release(col);
 
-    uint64_t before = ray_expr_bail_counts[EXPR_BAIL_NULLS];
+    uint64_t before = ray_expr_bail_counts[EXPR_BAIL_NULL_SHAPE];
     ray_graph_t* g = ray_graph_new(tbl);
     ray_op_t* x = ray_scan(g, "x");
     ray_op_t* e = ray_add(g, x, ray_const_i64(g, 1));
     ray_t* r = ray_execute(g, e);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
-    /* Pre-null-support: nullable column must bail to fallback. */
-    TEST_ASSERT(ray_expr_bail_counts[EXPR_BAIL_NULLS] > before,
-                "nullable scan counted as EXPR_BAIL_NULLS");
+    /* Nullable i64 column: scan is tracked, arithmetic sets null_aware,
+     * then the capability choke fires EXPR_BAIL_NULL_SHAPE (no kernel yet). */
+    TEST_ASSERT(ray_expr_bail_counts[EXPR_BAIL_NULL_SHAPE] > before,
+                "nullable i64+const counted as EXPR_BAIL_NULL_SHAPE");
 
     ray_release(r); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+static test_result_t test_nullfree_stream_unchanged(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    int64_t vals[] = {1, 2, 3, 4, 5, 6, 7, 8};
+    ray_t* col = ray_vec_from_raw(RAY_I64, vals, 8);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("x", 1), col);
+    ray_release(col);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* e = ray_mul(g, ray_add(g, ray_scan(g, "x"),
+                                     ray_const_i64(g, 1)),
+                          ray_const_i64(g, 2));
+    ray_expr_t ex;
+    TEST_ASSERT(expr_compile(g, tbl, e, &ex), "null-free compiles");
+    for (uint8_t i = 0; i < ex.n_ins; i++)
+        TEST_ASSERT(ex.ins[i].null_aware == 0, "no null_aware on null-free");
+    for (uint8_t r2 = 0; r2 < ex.n_regs; r2++)
+        TEST_ASSERT(!ex.regs[r2].nullable, "no nullable regs on null-free");
+
+    ray_graph_free(g); ray_release(tbl);
     ray_sym_destroy(); ray_heap_destroy();
     PASS();
 }
@@ -175,7 +200,8 @@ static test_result_t test_diff_i64_add_nullable_prelanding(void) {
 }
 
 const test_entry_t expr_null_entries[] = {
-    { "expr_null/bail_counter", test_expr_bail_counter_nulls, NULL, NULL },
-    { "expr_null/diff_i64_add", test_diff_i64_add_nullable_prelanding, NULL, NULL },
+    { "expr_null/bail_counter",        test_expr_bail_counter_nulls,          NULL, NULL },
+    { "expr_null/nullfree_invariance", test_nullfree_stream_unchanged,        NULL, NULL },
+    { "expr_null/diff_i64_add",        test_diff_i64_add_nullable_prelanding, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
