@@ -1191,6 +1191,200 @@ static test_result_t test_domain_sort_and_upper_resolve_domain(void) {
     PASS();
 }
 
+/* ---- Phase 2 Task 6: serde encode + join matching across domains --------- */
+
+/* serde (store/serde.c): the wire format carries SYM cells as STRINGS, so
+ * the encoder must resolve each cell through THE VEC's domain; the decoder
+ * interns into the global table (runtime-domain output).  With the
+ * divergent fixture the legacy global-resolution encoder wrote SWAPPED
+ * strings onto the wire — the round-trip must preserve the FILE domain's
+ * strings, re-expressed as runtime-domain output ids. */
+static test_result_t test_domain_serde_sym_file_domain(void) {
+    ray_sym_domain_t* dom = NULL;
+    int64_t pos_a = -1, pos_b = -1;
+    TEST_ASSERT_TRUE(build_divergent_qsym_fixture(&dom, &pos_a, &pos_b));
+    TEST_ASSERT(pos_a != ray_sym_intern("dq_a", 4), "fixture diverges");
+
+    ray_t* t = build_qsym_table(dom, pos_a, pos_b, 1, 2, "dser_t");
+    TEST_ASSERT_NOT_NULL(t);
+
+    ray_t* bytes = ray_ser(t);
+    TEST_ASSERT_NOT_NULL(bytes);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(bytes));
+
+    ray_t* back = ray_de(bytes);
+    TEST_ASSERT_NOT_NULL(back);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(back));
+    TEST_ASSERT_EQ_I(back->type, RAY_TABLE);
+    TEST_ASSERT_EQ_I(ray_table_nrows(back), 2);
+
+    ray_t* out_k = ray_table_get_col(back, ray_sym_intern("k", 1));
+    TEST_ASSERT_NOT_NULL(out_k);
+    TEST_ASSERT_EQ_I(out_k->type, RAY_SYM);
+    /* decode interns globally: the output is runtime-domain... */
+    TEST_ASSERT_EQ_PTR(ray_sym_vec_domain(out_k), ray_sym_runtime_domain());
+    /* ...and carries the SAME STRINGS the file domain held — proving the
+     * encoder resolved through the vec's domain, not the global table. */
+    TEST_ASSERT_TRUE(sym_cell_is(out_k, 0, "dq_a"));
+    TEST_ASSERT_TRUE(sym_cell_is(out_k, 1, "dq_b"));
+
+    ray_t* out_v = ray_table_get_col(back, ray_sym_intern("v", 1));
+    TEST_ASSERT_NOT_NULL(out_v);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(out_v))[0], 1);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(out_v))[1], 2);
+
+    ray_release(back);
+    ray_release(bytes);
+    ray_release(ray_eval_str("(set dser_t 0)"));
+    ray_release(t);
+    ray_sym_domain_release(dom);
+
+    ray_sym_domain_t* d2 = ray_sym_domain_open(TMP_DOM_QSYM_PATH);
+    TEST_ASSERT_NOT_NULL(d2);
+    ray_sym_domain_release(d2);
+
+    unlink(TMP_DOM_QSYM_PATH);
+    unlink(TMP_DOM_QSYM_PATH ".lk");
+    PASS();
+}
+
+/* Hash join key MATCHING (ops/join.c): cells of the two key columns are
+ * compared across the tables, and raw ids only compare within ONE domain.
+ * hash_row_keys canonicalizes SYM cells to runtime ids and join_keys_eq
+ * gates the raw compare on domain identity.  Under the divergent fixture
+ * the runtime ids of dq_a/dq_b are exactly the SWAPPED file positions, so
+ * the legacy raw compare paired every left row with the WRONG right row
+ * (silent wrong-symbol bug); domain-aware matching pairs by string.  Also
+ * pins the joined left SYM output adopting its source's FILE domain. */
+static test_result_t test_domain_join_across_domains(void) {
+    ray_sym_domain_t* dom = NULL;
+    int64_t pos_a = -1, pos_b = -1;
+    TEST_ASSERT_TRUE(build_divergent_qsym_fixture(&dom, &pos_a, &pos_b));
+    TEST_ASSERT(pos_a != ray_sym_intern("dq_a", 4), "fixture diverges");
+
+    /* Left: FILE-domain k ["dq_a" "dq_b"], v [1 2]. */
+    ray_t* lt = build_qsym_table(dom, pos_a, pos_b, 1, 2, "djl_t");
+    TEST_ASSERT_NOT_NULL(lt);
+
+    /* Right: runtime-domain k ['dq_a 'dq_b], w [10 20]. */
+    ray_t* rt = ray_eval_str(
+        "(set djr_t (table [k w] (list [dq_a dq_b] [10 20])))");
+    TEST_ASSERT_NOT_NULL(rt);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(rt));
+
+    ray_t* r = ray_eval_str("(inner-join [k] djl_t djr_t)");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 2);
+
+    ray_t* out_k = ray_table_get_col(r, ray_sym_intern("k", 1));
+    ray_t* out_v = ray_table_get_col(r, ray_sym_intern("v", 1));
+    ray_t* out_w = ray_table_get_col(r, ray_sym_intern("w", 1));
+    TEST_ASSERT_NOT_NULL(out_k);
+    TEST_ASSERT_NOT_NULL(out_v);
+    TEST_ASSERT_NOT_NULL(out_w);
+    TEST_ASSERT_EQ_I(out_k->type, RAY_SYM);
+    /* left gather output resolves over the left key column's dictionary */
+    TEST_ASSERT_EQ_PTR(ray_sym_vec_domain(out_k), dom);
+
+    /* match by STRING, order-independent: dq_a↔(v 1, w 10), dq_b↔(2, 20).
+     * The legacy raw compare produced (1, 20) / (2, 10). */
+    for (int64_t i = 0; i < 2; i++) {
+        int64_t v = ((int64_t*)ray_data(out_v))[i];
+        int64_t w = ((int64_t*)ray_data(out_w))[i];
+        if (sym_cell_is(out_k, i, "dq_a")) {
+            TEST_ASSERT_EQ_I(v, 1);
+            TEST_ASSERT_EQ_I(w, 10);
+        } else {
+            TEST_ASSERT_TRUE(sym_cell_is(out_k, i, "dq_b"));
+            TEST_ASSERT_EQ_I(v, 2);
+            TEST_ASSERT_EQ_I(w, 20);
+        }
+    }
+
+    ray_release(r);
+    ray_release(rt);
+    ray_release(ray_eval_str("(set djl_t 0)"));
+    ray_release(ray_eval_str("(set djr_t 0)"));
+    ray_release(lt);
+    ray_sym_domain_release(dom);
+
+    ray_sym_domain_t* d2 = ray_sym_domain_open(TMP_DOM_QSYM_PATH);
+    TEST_ASSERT_NOT_NULL(d2);
+    ray_sym_domain_release(d2);
+
+    unlink(TMP_DOM_QSYM_PATH);
+    unlink(TMP_DOM_QSYM_PATH ".lk");
+    PASS();
+}
+
+/* asof sort-merge eq-key matching (exec_window_join): when a SYM eq-key
+ * pair spans two domains, the left side sorts and merges in the RIGHT
+ * side's id space (asof_eq_lread).  Divergent fixture: the legacy raw
+ * compare carried each left row to the WRONG right partition. */
+static test_result_t test_domain_asof_join_across_domains(void) {
+    ray_sym_domain_t* dom = NULL;
+    int64_t pos_a = -1, pos_b = -1;
+    TEST_ASSERT_TRUE(build_divergent_qsym_fixture(&dom, &pos_a, &pos_b));
+    TEST_ASSERT(pos_a != ray_sym_intern("dq_a", 4), "fixture diverges");
+
+    /* Left: FILE-domain k ["dq_a" "dq_b"], t TIME [2 2], p [1 2].
+     * build_qsym_table gives {k v}; build the time column by hand. */
+    ray_t* lt = build_qsym_table(dom, pos_a, pos_b, 1, 2, "dajl_t");
+    TEST_ASSERT_NOT_NULL(lt);
+    {
+        ray_t* tv = ray_vec_new(RAY_TIME, 2);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(tv));
+        tv->len = 2;
+        ((int32_t*)ray_data(tv))[0] = 2;
+        ((int32_t*)ray_data(tv))[1] = 2;
+        ray_t* lt2 = ray_table_add_col(lt, ray_sym_intern("t", 1), tv);
+        ray_release(tv);
+        TEST_ASSERT_NOT_NULL(lt2);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(lt2));
+        lt = lt2;
+        TEST_ASSERT_EQ_I(ray_env_set(ray_sym_intern("dajl_t", 6), lt), RAY_OK);
+    }
+
+    /* Right: runtime-domain k ['dq_a 'dq_b], t TIME [1 1], bid [10 20]. */
+    ray_t* rt = ray_eval_str(
+        "(set dajr_t (table [k t bid] "
+        "(list [dq_a dq_b] [00:00:00.001 00:00:00.001] [10 20])))");
+    TEST_ASSERT_NOT_NULL(rt);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(rt));
+
+    ray_t* r = ray_eval_str("(asof-join [k t] dajl_t dajr_t)");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 2);
+
+    ray_t* out_k = ray_table_get_col(r, ray_sym_intern("k", 1));
+    ray_t* out_b = ray_table_get_col(r, ray_sym_intern("bid", 3));
+    TEST_ASSERT_NOT_NULL(out_k);
+    TEST_ASSERT_NOT_NULL(out_b);
+    /* output preserves left row order: ["dq_a" "dq_b"] by FILE strings */
+    TEST_ASSERT_TRUE(sym_cell_is(out_k, 0, "dq_a"));
+    TEST_ASSERT_TRUE(sym_cell_is(out_k, 1, "dq_b"));
+    /* …each carrying the right row matched BY STRING (legacy: swapped) */
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(out_b))[0], 10);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(out_b))[1], 20);
+
+    ray_release(r);
+    ray_release(rt);
+    ray_release(ray_eval_str("(set dajl_t 0)"));
+    ray_release(ray_eval_str("(set dajr_t 0)"));
+    ray_release(lt);
+    ray_sym_domain_release(dom);
+
+    ray_sym_domain_t* d2 = ray_sym_domain_open(TMP_DOM_QSYM_PATH);
+    TEST_ASSERT_NOT_NULL(d2);
+    ray_sym_domain_release(d2);
+
+    unlink(TMP_DOM_QSYM_PATH);
+    unlink(TMP_DOM_QSYM_PATH ".lk");
+    PASS();
+}
+
 /* ---- registration -------------------------------------------------------- */
 
 const test_entry_t domain_entries[] = {
@@ -1214,5 +1408,8 @@ const test_entry_t domain_entries[] = {
     { "domain/group_by_adopts_domain",  test_domain_group_by_adopts_domain,  domain_rt_setup, domain_rt_teardown },
     { "domain/r7_eq_fast_path",         test_domain_r7_eq_fast_path,         domain_rt_setup, domain_rt_teardown },
     { "domain/sort_upper_resolve",      test_domain_sort_and_upper_resolve_domain, domain_rt_setup, domain_rt_teardown },
+    { "domain/serde_sym_file_domain",   test_domain_serde_sym_file_domain,   domain_rt_setup, domain_rt_teardown },
+    { "domain/join_across_domains",     test_domain_join_across_domains,     domain_rt_setup, domain_rt_teardown },
+    { "domain/asof_join_across_domains", test_domain_asof_join_across_domains, domain_rt_setup, domain_rt_teardown },
     { NULL, NULL, NULL, NULL },
 };
