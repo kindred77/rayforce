@@ -158,7 +158,7 @@ Element-wise operation subtrees are compiled to flat bytecode at **execution tim
 
 - **Registers**: up to 16 slots (`EXPR_MAX_REGS`), each holding a typed lane — `REG_SCAN` (column slice), `REG_CONST` (broadcast scalar), or `REG_SCRATCH` (computed intermediate).
 - **Instructions**: up to 48 opcodes (`EXPR_MAX_INS`) covering arithmetic, comparisons, casts, and logical operations.
-- **Morsel evaluation**: the compiled program is evaluated one morsel at a time (1024 rows) in per-worker scratch buffers allocated on the thread stack. No intermediate vectors are heap-allocated.
+- **Morsel evaluation**: the compiled program is evaluated one morsel at a time (1024 rows) in per-worker, arena-allocated scratch buffers. No full-length intermediate vectors are materialized.
 - **Parallelism**: subtrees covering ≥ 65,536 rows (`RAY_PARALLEL_THRESHOLD`) are dispatched across worker threads, each thread processing its own morsel slice independently.
 - **Parted-segment aware**: for partitioned tables, column pointers are rebound per segment at evaluation time — zero-copy, no gather.
 
