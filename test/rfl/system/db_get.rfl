@@ -14,18 +14,26 @@
 (set Quotes  (table [s b a] (list ['AAPL 'GOOG] [99.0 199.0] [101.0 201.0])))
 (set Returns (table [s r] (list ['AAPL 'GOOG] [0.01 -0.02])))
 
-(.db.splayed.set "/tmp/rfl_get_splayed/Trades"  Trades)
-(.db.splayed.set "/tmp/rfl_get_splayed/Quotes"  Quotes)
-(.db.splayed.set "/tmp/rfl_get_splayed/Returns" Returns)
+;; All three tables share ONE root symfile (the client layout): a
+;; multi-table root keeps a single vocabulary so cross-table SYM ops
+;; (joins, comparisons) stay on the same-domain fast path instead of
+;; re-encoding positions between per-table domains.
+(.db.splayed.set "/tmp/rfl_get_splayed/Trades"  Trades  "/tmp/rfl_get_splayed/sym")
+(.db.splayed.set "/tmp/rfl_get_splayed/Quotes"  Quotes  "/tmp/rfl_get_splayed/sym")
+(.db.splayed.set "/tmp/rfl_get_splayed/Returns" Returns "/tmp/rfl_get_splayed/sym")
+
+;; exactly one symfile — at the root, none per table dir
+(.sys.exec "test -f /tmp/rfl_get_splayed/sym")        -- 0
+(.sys.exec "test ! -f /tmp/rfl_get_splayed/Trades/sym") -- 0
 
 ;; Wipe the originals so the post-get bindings provably came from disk.
 (set Trades  0)
 (set Quotes  0)
 (set Returns 0)
 
-(set Trades  (.db.splayed.get "/tmp/rfl_get_splayed/Trades/"))
-(set Quotes  (.db.splayed.get "/tmp/rfl_get_splayed/Quotes/"))
-(set Returns (.db.splayed.get "/tmp/rfl_get_splayed/Returns/"))
+(set Trades  (.db.splayed.get "/tmp/rfl_get_splayed/Trades/"  "/tmp/rfl_get_splayed/sym"))
+(set Quotes  (.db.splayed.get "/tmp/rfl_get_splayed/Quotes/"  "/tmp/rfl_get_splayed/sym"))
+(set Returns (.db.splayed.get "/tmp/rfl_get_splayed/Returns/" "/tmp/rfl_get_splayed/sym"))
 
 (type Trades)  -- 'TABLE
 (type Quotes)  -- 'TABLE
@@ -85,8 +93,10 @@
 (.db.parted.get  "/tmp/rfl_get_does_not_exist/" 't) !- io
 
 ;; ────────────── overwrite heal: narrower re-set sweeps stale columns ──────────────
-(.db.splayed.set "/tmp/rfl_get_splayed/Trades" (table [s] (list ['ZZZ])))
-(set Trades2 (.db.splayed.get "/tmp/rfl_get_splayed/Trades/"))
+;; Re-set against the same shared symfile: 'ZZZ appends to the root
+;; vocabulary (append-only), the stale p column is swept.
+(.db.splayed.set "/tmp/rfl_get_splayed/Trades" (table [s] (list ['ZZZ])) "/tmp/rfl_get_splayed/sym")
+(set Trades2 (.db.splayed.get "/tmp/rfl_get_splayed/Trades/" "/tmp/rfl_get_splayed/sym"))
 (count (key Trades2)) -- 1
 (at (at Trades2 's) 0) -- 'ZZZ
 
