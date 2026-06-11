@@ -944,6 +944,166 @@ static test_result_t test_diff_cast_f64_to_i32(void) {
     return r;
 }
 
+/* ---- Task 9: fused agg input — attr propagation gates sentinel-aware aggregation ----
+ *
+ * Table: k=[1,1,2,2] (group key), x=[10,20,NULL,NULL] (values).
+ * Fused expression: x * 2  (MUL bypasses try_affine_sumavg_input which
+ * only handles OP_ADD/OP_SUB; try_linear_sumavg_input_i64 only fires for
+ * n_keys==0).  So expr_compile fires in group.c for n_keys=1.
+ *
+ * The critical invariant this test pins:
+ *   expr_eval_full MUST set RAY_ATTR_HAS_NULLS on the output vec when the
+ *   out register is nullable.  Without this attr, the accumulator's
+ *   sentinel-skip mask (da_int_null_mask / sc_int_null_mask) is never set,
+ *   NULL_I64 sentinels are summed as raw INT_MIN values, and non-null counts
+ *   are wrong — all silently.
+ *
+ * Part A: direct attr check — compile x*2, eval, assert HAS_NULLS on output.
+ *
+ * Part B: GROUP BY k, AVG(x*2) — AVG returns NULL for all-null group (nn==0
+ *   → NULL_F64; the `nn==0` guard in emit_agg_columns for AVG is the gate).
+ *   group k=1: avg((10*2),(20*2)) = avg(20,40) = 30.0
+ *   group k=2: all inputs NULL → result IS NULL
+ *   This proves the attr is load-bearing: without HAS_NULLS, da_any_nullable
+ *   is false, nn_count is never allocated, nn falls back to counts[gi]=2 (>0),
+ *   and AVG would return 0.0/2 = 0.0 instead of NULL.
+ *
+ * Part C: GROUP BY k, AVG(x*2) fused == fallback (cross-check).
+ *
+ * Group order is hash-bucket order — scan key column to locate groups. */
+static test_result_t test_fused_agg_input_allnull_group(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* k=[1,1,2,2], x=[10,20,NULL,NULL] */
+    int64_t kv[] = {1, 1, 2, 2};
+    int64_t xv[] = {10, 20, 0, 0};
+    int64_t xi[] = {2, 3};
+    ray_t* kcol = ray_vec_from_raw(RAY_I64, kv, 4);
+    ray_t* xcol = vec_i64_with_nulls(xv, 4, xi, 2);
+
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k", 1), kcol);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("x", 1), xcol);
+    ray_release(kcol);
+    ray_release(xcol);
+
+    /* ----- Part A: direct attr check ----- */
+    {
+        uint64_t ok_before    = ray_expr_compile_ok;
+        uint64_t bails_before = expr_bails_total();
+
+        ray_graph_t* gA = ray_graph_new(tbl);
+        ray_op_t* xA  = ray_scan(gA, "x");
+        ray_op_t* mulA = ray_mul(gA, xA, ray_const_i64(gA, 2));
+
+        ray_expr_t exA;
+        bool compiled = expr_compile(gA, tbl, mulA, &exA);
+        TEST_ASSERT(compiled, "Part A: x*2 expr_compile must succeed for nullable i64");
+        TEST_ASSERT(ray_expr_compile_ok > ok_before,
+                    "Part A: compile_ok must increment");
+        TEST_ASSERT(expr_bails_total() == bails_before,
+                    "Part A: no bails for x*2 nullable");
+
+        /* out register must be marked nullable */
+        TEST_ASSERT(exA.regs[exA.out_reg].nullable,
+                    "Part A: out register must be nullable");
+
+        ray_t* evec = expr_eval_full(&exA, 4);
+        TEST_ASSERT(evec && !RAY_IS_ERR(evec), "Part A: eval succeeded");
+        TEST_ASSERT(evec->attrs & RAY_ATTR_HAS_NULLS,
+                    "Part A: expr_eval_full output MUST have RAY_ATTR_HAS_NULLS");
+        /* Also verify the null positions are correct (rows 2 and 3) */
+        TEST_ASSERT(!ray_vec_is_null(evec, 0), "Part A: row 0 non-null");
+        TEST_ASSERT(!ray_vec_is_null(evec, 1), "Part A: row 1 non-null");
+        TEST_ASSERT( ray_vec_is_null(evec, 2), "Part A: row 2 null");
+        TEST_ASSERT( ray_vec_is_null(evec, 3), "Part A: row 3 null");
+        /* And non-null values are correct: 10*2=20, 20*2=40 */
+        int64_t* ev = (int64_t*)ray_data(evec);
+        TEST_ASSERT_FMT(ev[0] == 20, "Part A: row 0 expected 20, got %lld", (long long)ev[0]);
+        TEST_ASSERT_FMT(ev[1] == 40, "Part A: row 1 expected 40, got %lld", (long long)ev[1]);
+
+        ray_release(evec);
+        ray_graph_free(gA);
+    }
+
+    /* ----- Parts B and C: GROUP BY k, AVG(x*2) — fused and fallback -----
+     * AVG uses nn_count (gated on HAS_NULLS) as its divisor.  If HAS_NULLS
+     * is missing: da_any_nullable=false, nn_count=NULL, nn falls back to
+     * counts[gi]=2, AVG = 0/2 = 0.0 (WRONG).
+     * If HAS_NULLS is set: nn_count=0 for group 2 → null finalization. */
+    for (int pass = 0; pass < 2; pass++) {
+        if (pass == 1) ray_expr_disable = true;
+
+        uint64_t ok_before    = ray_expr_compile_ok;
+        uint64_t bails_before = expr_bails_total();
+
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* k_op    = ray_scan(g, "k");
+        ray_op_t* x_op    = ray_scan(g, "x");
+        /* x * 2: MUL bypasses try_affine_sumavg_input (ADD/SUB only) */
+        ray_op_t* x2      = ray_mul(g, x_op, ray_const_i64(g, 2));
+        ray_op_t* keys[1]    = { k_op };
+        ray_op_t* agg_ins[1] = { x2 };
+        uint16_t  agg_ops[1] = { OP_AVG };
+        ray_op_t* grp = ray_group(g, keys, 1, agg_ops, agg_ins, 1);
+        ray_t* result = ray_execute(g, grp);
+
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
+        TEST_ASSERT_EQ_I(ray_table_nrows(result), 2);
+
+        /* Check fused engagement on pass 0 only */
+        if (pass == 0) {
+            bool fused = (ray_expr_compile_ok > ok_before) &&
+                         (expr_bails_total() == bails_before);
+            TEST_ASSERT(fused,
+                "Part B: fused agg compile must fire (compile_ok advanced, no bails)");
+        }
+
+        /* result layout for n_keys=1: col 0 = k (key), col 1 = _0 (avg agg F64) */
+        ray_t* key_col = ray_table_get_col_idx(result, 0);
+        ray_t* avg_col = ray_table_get_col_idx(result, 1);
+        TEST_ASSERT_NOT_NULL(key_col);
+        TEST_ASSERT_NOT_NULL(avg_col);
+
+        int64_t* kd = (int64_t*)ray_data(key_col);
+
+        bool found_k1 = false, found_k2 = false;
+        for (int64_t r = 0; r < 2; r++) {
+            if (kd[r] == 1) {
+                found_k1 = true;
+                TEST_ASSERT_FMT(!ray_vec_is_null(avg_col, r),
+                                "pass %d: group k=1 avg must NOT be null", pass);
+                double v = ((double*)ray_data(avg_col))[r];
+                TEST_ASSERT_FMT(fabs(v - 30.0) < 1e-9,
+                                "pass %d: group k=1 avg(x*2) expected 30.0, got %g",
+                                pass, v);
+            } else if (kd[r] == 2) {
+                found_k2 = true;
+                /* Without HAS_NULLS: nn fallback = counts[gi]=2 → avg=0/2=0.0 (wrong).
+                 * With HAS_NULLS: nn_count=0 → NULL finalization (correct). */
+                TEST_ASSERT_FMT(ray_vec_is_null(avg_col, r),
+                                "pass %d: group k=2 avg(x*2) must be NULL "
+                                "(HAS_NULLS gates nn_count; without it AVG would return 0.0)",
+                                pass);
+            }
+        }
+        TEST_ASSERT_FMT(found_k1, "pass %d: group k=1 not found in result", pass);
+        TEST_ASSERT_FMT(found_k2, "pass %d: group k=2 not found in result", pass);
+
+        ray_release(result);
+        ray_graph_free(g);
+
+        if (pass == 1) ray_expr_disable = false;
+    }
+
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t expr_null_entries[] = {
     { "expr_null/bail_counter",            test_expr_bail_counter_nulls,          NULL, NULL },
     { "expr_null/nullfree_invariance",     test_nullfree_stream_unchanged,        NULL, NULL },
@@ -987,5 +1147,7 @@ const test_entry_t expr_null_entries[] = {
     { "expr_null/diff_cast_i32",           test_diff_cast_i32,                    NULL, NULL },
     { "expr_null/diff_cast_i16",           test_diff_cast_i16,                    NULL, NULL },
     { "expr_null/diff_cast_f64_to_i32",    test_diff_cast_f64_to_i32,             NULL, NULL },
+    /* Task 9: fused agg inputs — all-null group finalizes to NULL */
+    { "expr_null/fused_agg_allnull_group", test_fused_agg_input_allnull_group,    NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };

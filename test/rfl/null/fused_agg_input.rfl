@@ -1,0 +1,38 @@
+;; Fused agg input: aggregate over an ARITHMETIC EXPRESSION of a nullable column.
+;; group.c calls expr_compile for non-SCAN agg inputs when the expression
+;; is not an affine (scan +/- const) or strlen form.  MUL expressions
+;; bypass try_affine_sumavg_input (which only handles OP_ADD/OP_SUB) and
+;; reach the fused expr_compile path.
+;;
+;; The load-bearing invariant: expr_eval_full sets RAY_ATTR_HAS_NULLS on
+;; the output vec when the out register is nullable.  Without this attr,
+;; the accumulator's sentinel-skip mask is never set, and non-null counts
+;; (nn_count) for AVG/MIN/MAX/etc. are wrong — silently, since null
+;; sentinels are treated as regular data.
+;;
+;; AVG is used for the all-null-group test because its null-finalization
+;; path is gated on nn_count==0: without HAS_NULLS, nn falls back to
+;; counts[gi] (=2 here), and AVG would return 0.0 instead of NULL.
+
+;; Table: x=[10 20 0N 0N], k=[1 1 2 2]
+(set T (table [x k] (list [10 20 0N 0N] [1 1 2 2])))
+
+;; AVG over (* x 2) grouped by k.
+;; Group k=1: avg of (20, 40) = 30.0.
+;; Group k=2: both inputs null → NULL  (nn_count=0 triggers null-finalization).
+(at (at (select {a: (avg (* x 2)) from: T by: k where: (== k 1)}) 'a) 0) -- 30.0
+(nil? (at (at (select {a: (avg (* x 2)) from: T by: k where: (== k 2)}) 'a) 0)) -- true
+
+;; MIN over (* x 2): group k=1 min = 20; group k=2 = NULL.
+(at (at (select {m: (min (* x 2)) from: T by: k where: (== k 1)}) 'm) 0) -- 20
+(nil? (at (at (select {m: (min (* x 2)) from: T by: k where: (== k 2)}) 'm) 0)) -- true
+
+;; MAX over (* x 2): group k=1 max = 40; group k=2 = NULL.
+(at (at (select {m: (max (* x 2)) from: T by: k where: (== k 1)}) 'm) 0) -- 40
+(nil? (at (at (select {m: (max (* x 2)) from: T by: k where: (== k 2)}) 'm) 0)) -- true
+
+;; SUM over (* x 2): group k=1 = 60; group k=2 = 0 (SUM identity; null rows skipped).
+;; This verifies the sentinel-skip fires (null rows are NOT summed as INT_MIN, which
+;; would overflow to 0 only by coincidence for exactly 2 null rows).
+(at (at (select {s: (sum (* x 2)) from: T by: k where: (== k 1)}) 's) 0) -- 60
+(at (at (select {s: (sum (* x 2)) from: T by: k where: (== k 2)}) 's) 0) -- 0
