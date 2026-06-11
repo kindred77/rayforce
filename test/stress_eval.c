@@ -663,9 +663,15 @@ static bool verify_join_cardinality(stress_ctx_t* c, const char* live_dir) {
     int64_t got;
     if (!eval_query_i64(c, src, &got)) return false;
     if (got != expect) {
+        int64_t hist_len = 0;
+        for (int p = 0; p < c->nparts; p++) hist_len += c->parts[p].len;
         stress_dump_failure(c, "query (c): inner-join cardinality %lld, "
-                               "shadow expects %lld",
-                            (long long)got, (long long)expect);
+                               "shadow expects %lld [live=%lld hist=%lld "
+                               "nparts=%d live\"\"=%lld hist\"\"=%lld]",
+                            (long long)got, (long long)expect,
+                            (long long)c->live.len, (long long)hist_len,
+                            c->nparts, (long long)rows_key_count(&c->live, ""),
+                            (long long)hist_key_count(c, ""));
         return false;
     }
     return true;

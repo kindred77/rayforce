@@ -8,6 +8,7 @@
 #include "stress_eval.h"
 #include <rayforce.h>
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define STRESS_EVAL_DB "/tmp/rayforce_stress_eval"
@@ -250,6 +251,225 @@ static test_result_t test_eval_equiv_with_c_driver(void) {
     return r;
 }
 
+/* ---- client layout: the full prod mirror, eval-only ---------------------- */
+
+/* The client's exact shape — date-parted hist + splayed live on ONE shared
+ * root symfile — driven end-to-end through the language: seeded hist
+ * partitions, then rounds of the live/hist producer interleaving with the
+ * query oracle and both C loaders checked after every round, and two
+ * full-runtime-recreate restarts (one mid-stream, one before the final
+ * verify) so disk is the only carrier of truth across them. */
+static test_result_t test_eval_client_layout_impl(stress_ctx_t* c) {
+    static const stress_sym_pattern_t pats[3] = {
+        STRESS_SYMS_MIXED, STRESS_SYMS_NULLS, STRESS_SYMS_NEW,
+    };
+    TEST_ASSERT(stress_eval_seed_initial(c, 96, 3, 48), "seed");
+    TEST_ASSERT(stress_verify_all(c, false), "verify after seed");
+    TEST_ASSERT(stress_eval_verify_queries(c), "queries after seed");
+
+    for (int r = 0; r < 3; r++) {
+        stress_sym_pattern_t pat = pats[r];
+        TEST_ASSERT_FMT(stress_eval_op_insert(c, 16, pat), "insert r=%d", r);
+        TEST_ASSERT_FMT(stress_eval_op_part_append(c, r % c->nparts, 10, pat),
+                        "part_append r=%d", r);
+        TEST_ASSERT_FMT(stress_eval_op_upsert(c, pat), "upsert r=%d", r);
+        TEST_ASSERT_FMT(stress_eval_op_part_new(c, 8, pat), "part_new r=%d",
+                        r);
+        TEST_ASSERT_FMT(stress_eval_op_trim(c, -1, r & 1, 4), "trim r=%d", r);
+
+        TEST_ASSERT_FMT(stress_verify_all(c, false), "verify(heap) r=%d", r);
+        TEST_ASSERT_FMT(stress_verify_all(c, true), "verify(mmap) r=%d", r);
+        TEST_ASSERT_FMT(stress_eval_verify_queries(c), "queries r=%d", r);
+
+        if (r == 1) { /* mid-stream restart, then prove disk carried it */
+            TEST_ASSERT(stress_eval_op_restart(c), "mid restart");
+            TEST_ASSERT(stress_verify_all(c, false),
+                        "verify after mid restart");
+            TEST_ASSERT(stress_eval_verify_queries(c),
+                        "queries after mid restart");
+        }
+    }
+
+    TEST_ASSERT(stress_eval_op_restart(c), "end restart");
+    TEST_ASSERT(stress_verify_all(c, false), "final verify(heap)");
+    TEST_ASSERT(stress_verify_all(c, true), "final verify(mmap)");
+    TEST_ASSERT(stress_eval_verify_queries(c), "final queries");
+    PASS();
+}
+
+static test_result_t test_eval_client_layout(void) {
+    stress_ctx_t c;
+    TEST_ASSERT(stress_init(&c, STRESS_EVAL_DB, 204), "init");
+    test_result_t r = test_eval_client_layout_impl(&c);
+    stress_destroy(&c);
+    return r;
+}
+
+/* ---- determinism: same seed twice => identical op logs + shadows ---------- */
+
+/* A miniature random runner over the eval executors: op choice and every
+ * op parameter come from the ctx rng, the query oracle (which also draws
+ * one rng value per call) runs at a cadence, and restarts are in the mix —
+ * the same shape as the random runner's eval mode.  Draws are hoisted into
+ * locals so the consumption ORDER is specified by the C source, not by the
+ * compiler's argument evaluation order. */
+static bool det_run(stress_ctx_t* c) {
+    if (!stress_eval_seed_initial(c, 32, 2, 16)) return false;
+    for (int i = 0; i < 32; i++) {
+        stress_sym_pattern_t pat =
+            (stress_sym_pattern_t)(stress_rand(c) % 4);
+        uint64_t roll = stress_rand(c) % 100;
+        bool     ok;
+        if (roll < 35) {
+            int64_t n = 1 + (int64_t)(stress_rand(c) % 8);
+            ok = stress_eval_op_insert(c, n, pat);
+        } else if (roll < 55) {
+            ok = stress_eval_op_upsert(c, pat);
+        } else if (roll < 70) {
+            int     pi = (int)(stress_rand(c) % (uint64_t)c->nparts);
+            int64_t n  = 1 + (int64_t)(stress_rand(c) % 8);
+            ok = stress_eval_op_part_append(c, pi, n, pat);
+        } else if (roll < 80) {
+            int target = (int)(stress_rand(c) % (uint64_t)(c->nparts + 1)) - 1;
+            bool    tail = stress_rand(c) & 1;
+            int64_t n    = 1 + (int64_t)(stress_rand(c) % 4);
+            ok = stress_eval_op_trim(c, target, tail, n);
+        } else if (roll < 90) {
+            int64_t n = 1 + (int64_t)(stress_rand(c) % 8);
+            ok = stress_eval_op_part_new(c, n, pat);
+        } else {
+            ok = stress_eval_op_restart(c);
+        }
+        if (!ok) return false;
+        if (i % 8 == 7 && !stress_eval_verify_queries(c)) return false;
+    }
+    return stress_verify_all(c, false);
+}
+
+/* Deep snapshot of run 1's observable trace (op log ring + shadows), taken
+ * BEFORE stress_destroy frees them.  Both runs use the SAME db path (the
+ * second stress_init rm-rfs it), so the generated source embedded in the
+ * op log is byte-comparable. */
+typedef struct {
+    char (*oplog)[128];
+    int   oplog_len;
+    stress_rows_t live;
+    stress_rows_t parts[STRESS_MAX_PARTS];
+    char  part_dates[STRESS_MAX_PARTS][16];
+    int   nparts;
+} det_snap_t;
+
+static bool det_rows_copy(stress_rows_t* dst, const stress_rows_t* src) {
+    dst->rows = NULL;
+    dst->len = dst->cap = src->len;
+    if (src->len == 0) return true;
+    dst->rows = (stress_row_t*)malloc((size_t)src->len * sizeof(stress_row_t));
+    if (!dst->rows) return false;
+    memcpy(dst->rows, src->rows, (size_t)src->len * sizeof(stress_row_t));
+    return true;
+}
+
+static bool det_snapshot(const stress_ctx_t* c, det_snap_t* s) {
+    s->oplog = (char(*)[128])malloc((size_t)STRESS_OPLOG_CAP * 128);
+    if (!s->oplog) return false;
+    memcpy(s->oplog, c->oplog, (size_t)STRESS_OPLOG_CAP * 128);
+    s->oplog_len = c->oplog_len;
+    s->nparts    = c->nparts;
+    memcpy(s->part_dates, c->part_dates, sizeof(s->part_dates));
+    if (!det_rows_copy(&s->live, &c->live)) return false;
+    for (int p = 0; p < c->nparts; p++)
+        if (!det_rows_copy(&s->parts[p], &c->parts[p])) return false;
+    return true;
+}
+
+static void det_snap_free(det_snap_t* s) {
+    free(s->oplog);
+    free(s->live.rows);
+    for (int p = 0; p < s->nparts; p++) free(s->parts[p].rows);
+    memset(s, 0, sizeof(*s));
+}
+
+/* bounded strlen (strnlen is POSIX-gated under this build's std mode) */
+static size_t det_slot_len(const char* p) {
+    size_t n = 0;
+    while (n < 128 && p[n]) n++;
+    return n;
+}
+
+/* Used-slot compare: lengths, then memcmp of each used ring slot over its
+ * string (strlen+1) — bytes past the NUL are malloc garbage in both
+ * buffers, never written by op_logf, so they are excluded. */
+static bool det_logs_equal(stress_ctx_t* c2, const det_snap_t* s) {
+    if (s->oplog_len != c2->oplog_len) {
+        stress_dump_failure(c2, "determinism: op log length %d != run 1's %d",
+                            c2->oplog_len, s->oplog_len);
+        return false;
+    }
+    int total = c2->oplog_len;
+    int n     = total < STRESS_OPLOG_CAP ? total : STRESS_OPLOG_CAP;
+    for (int i = total - n; i < total; i++) {
+        const char* a = s->oplog[i % STRESS_OPLOG_CAP];
+        const char* b = c2->oplog[i % STRESS_OPLOG_CAP];
+        size_t la = det_slot_len(a);
+        if (det_slot_len(b) != la || memcmp(a, b, la) != 0) {
+            stress_dump_failure(c2, "determinism: op %d diverged\n"
+                                    "  run1: %.*s\n  run2: %.*s",
+                                i, (int)la, a, (int)det_slot_len(b), b);
+            return false;
+        }
+    }
+    return true;
+}
+
+static test_result_t test_eval_determinism_impl(stress_ctx_t* c2,
+                                                const det_snap_t* s) {
+    TEST_ASSERT(det_run(c2), "run 2");
+    TEST_ASSERT(det_logs_equal(c2, s), "op logs identical");
+    TEST_ASSERT_EQ_I(c2->nparts, s->nparts);
+    TEST_ASSERT(eq_shadows_equal(c2, c2, &s->live, &c2->live, "det live"),
+                "live shadows identical");
+    for (int p = 0; p < s->nparts; p++) {
+        TEST_ASSERT_FMT(strcmp(s->part_dates[p], c2->part_dates[p]) == 0,
+                        "part date %d", p);
+        TEST_ASSERT_FMT(eq_shadows_equal(c2, c2, &s->parts[p], &c2->parts[p],
+                                         "det part"),
+                        "part %d shadows identical", p);
+    }
+    PASS();
+}
+
+static test_result_t test_eval_determinism(void) {
+    det_snap_t s;
+    memset(&s, 0, sizeof(s));
+
+    stress_ctx_t c1;
+    TEST_ASSERT(stress_init(&c1, STRESS_EVAL_DB, 205), "init run 1");
+    bool ok1 = det_run(&c1) && !c1.failed && det_snapshot(&c1, &s);
+    stress_destroy(&c1);
+    if (!ok1) {
+        det_snap_free(&s);
+        TEST_ASSERT(false, "run 1 + snapshot");
+    }
+
+    /* fresh runtime between runs: run 2 must not inherit run 1's interned
+     * vocabulary/env, exactly like the suite's own setup gave run 1 */
+    stress_eval_runtime_down();
+    if (!stress_eval_runtime_up()) {
+        det_snap_free(&s);
+        TEST_ASSERT(false, "runtime recreate between runs");
+    }
+
+    stress_ctx_t c2;
+    if (!stress_init(&c2, STRESS_EVAL_DB, 205)) {
+        det_snap_free(&s);
+        TEST_ASSERT(false, "init run 2");
+    }
+    test_result_t r = test_eval_determinism_impl(&c2, &s);
+    stress_destroy(&c2);
+    det_snap_free(&s);
+    return r;
+}
+
 const test_entry_t stress_eval_entries[] = {
     { "stress_eval/fixture_roundtrip", test_eval_fixture_roundtrip,
       stress_eval_setup, stress_eval_teardown },
@@ -258,6 +478,10 @@ const test_entry_t stress_eval_entries[] = {
     { "stress_eval/query_oracle_detects", test_eval_query_oracle_detects,
       stress_eval_setup, stress_eval_teardown },
     { "stress_eval/equiv_with_c_driver", test_eval_equiv_with_c_driver,
+      stress_eval_setup, stress_eval_teardown },
+    { "stress_eval/client_layout", test_eval_client_layout,
+      stress_eval_setup, stress_eval_teardown },
+    { "stress_eval/determinism", test_eval_determinism,
       stress_eval_setup, stress_eval_teardown },
     { NULL, NULL, NULL, NULL },
 };
