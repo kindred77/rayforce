@@ -309,6 +309,55 @@ static test_result_t test_nullfree_promotion_invariance(void) {
     PASS();
 }
 
+/* (f * 2.0) + 1.0 — pure arithmetic output, stays F64, no comparison.
+ * Verifies: fused == fallback for numeric output; AND that the result
+ * vec has RAY_ATTR_HAS_NULLS set with nulls exactly at the input null
+ * positions {2,7} (numeric-output attr propagation). */
+static ray_op_t* build_f64_arith_output(ray_graph_t* g) {
+    ray_op_t* f = ray_scan(g, "f");
+    ray_op_t* m = ray_mul(g, f, ray_const_f64(g, 2.0));
+    return ray_add(g, m, ray_const_f64(g, 1.0));
+}
+
+static test_result_t test_diff_f64_arith_output(void) {
+    ray_heap_init(); (void)ray_sym_init();
+
+    int64_t n = 10;
+    double raw[10];
+    for (int64_t i = 0; i < n; i++) raw[i] = 0.5 + (double)i;
+    ray_t* col = ray_vec_from_raw(RAY_F64, raw, n);
+    ray_vec_set_null(col, 2, true);
+    ray_vec_set_null(col, 7, true);
+
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("f", 1), col);
+    ray_release(col);
+
+    /* diff_run: fused == fallback */
+    test_result_t r = diff_run(tbl, build_f64_arith_output, true);
+    if (r.status != TEST_PASS) {
+        ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+        return r;
+    }
+
+    /* Re-execute normally and check attr propagation + null positions */
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_t* res = ray_execute(g, build_f64_arith_output(g));
+    TEST_ASSERT(res && !RAY_IS_ERR(res), "execute succeeded");
+    TEST_ASSERT(res->attrs & RAY_ATTR_HAS_NULLS, "HAS_NULLS attr set on numeric output");
+    TEST_ASSERT(ray_vec_is_null(res, 2), "null at index 2");
+    TEST_ASSERT(ray_vec_is_null(res, 7), "null at index 7");
+    for (int64_t i = 0; i < n; i++) {
+        if (i == 2 || i == 7) continue;
+        TEST_ASSERT_FMT(!ray_vec_is_null(res, i),
+                        "unexpected null at index %lld", (long long)i);
+    }
+    ray_release(res); ray_graph_free(g);
+
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t expr_null_entries[] = {
     { "expr_null/bail_counter",            test_expr_bail_counter_nulls,          NULL, NULL },
     { "expr_null/nullfree_invariance",     test_nullfree_stream_unchanged,        NULL, NULL },
@@ -317,5 +366,6 @@ const test_entry_t expr_null_entries[] = {
     { "expr_null/diff_i64_promoted",       test_diff_i64_promoted_nullable,       NULL, NULL },
     { "expr_null/diff_f64_chain_parallel", test_diff_f64_chain_parallel,          NULL, NULL },
     { "expr_null/nullfree_promotion",      test_nullfree_promotion_invariance,    NULL, NULL },
+    { "expr_null/diff_f64_arith_output",   test_diff_f64_arith_output,            NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
