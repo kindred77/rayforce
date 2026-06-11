@@ -873,7 +873,7 @@ static test_result_t test_scalar_broadcast_col_bails(void) {
  *
  * Builders:
  *   (cast I32 (x + 1)) — i64 arithmetic then narrow; x values 1-10 (fit i16),
- *                         nulls at {0,4,9}; uses make_task7_table() single-col slice
+ *                         nulls at {0,4,9}; uses make_cast_narrow_table()
  *   (cast I16 (x + 1)) — identical shape, I16 destination
  *   (cast I32 f)        — direct f64→I32; f values 1.0-10.0, nulls at {1,6};
  *                         uses make_f64_minmax_table()
