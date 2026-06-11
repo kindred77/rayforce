@@ -1,0 +1,55 @@
+;; upsert.rfl — upsert update arm must propagate per-row null state.
+;;
+;; Regression: ray_upsert's "key found — update that row" arm rebuilt
+;; every column via raw copy loops without ray_insert's null
+;; propagation — sentinels survived the copy but the rebuilt columns
+;; lost RAY_ATTR_HAS_NULLS, so null-gated aggregates read NULL_I64 /
+;; NaN sentinels as data afterwards (sum of a 3-row column returning
+;; -9.2e18).  Found by the phase-2 stress probe's upsert-semantics
+;; check.
+
+;; ─── update arm: nulls in untouched rows must survive the rebuild ───
+(set T (table [ticker price qty] (list [aa 0Ns cc] [1.5 0Nf 4.1] [10 0Nl 40])))
+
+;; Pre-upsert baseline.
+(sum (at T 'qty))   -- 50
+(avg (at T 'qty))   -- 25.0
+(sum (at T 'price)) -- 5.6
+(avg (at T 'price)) -- 2.8
+
+;; Update the existing 'cc row (key found → update arm rebuilds all cols).
+(upsert 'T 1 (list 'cc 5.0 50))
+
+;; I64 sentinel class: NULL_I64 in row 1 must stay null-gated.
+(sum (at T 'qty))   -- 60
+(avg (at T 'qty))   -- 30.0
+;; F64 NaN class: NaN-encoded null in row 1 must stay null-gated.
+(sum (at T 'price)) -- 6.5
+(avg (at T 'price)) -- 3.25
+;; Per-row null state is intact, not just the aggregates.
+(nil? (at (at T 'qty) 1))   -- true
+(nil? (at (at T 'price) 1)) -- true
+(at (at T 'qty) 2)          -- 50
+
+;; ─── append arm stays correct (key not found → insert path) ─────────
+(upsert 'T 1 (list 'dd 2.5 100))
+(count T)           -- 4
+(sum (at T 'qty))   -- 160
+(avg (at T 'qty))   -- 53.333333333333336
+(sum (at T 'price)) -- 9.0
+(nil? (at (at T 'qty) 1))   -- true
+(nil? (at (at T 'price) 1)) -- true
+
+;; ─── persisted round-trip: laundered columns must not reach disk ─────
+;; (SYM column dropped — splayed SYM round-trip is tracked separately.)
+(set Tplain (table [price qty] (list (at T 'price) (at T 'qty))))
+(.sys.exec "rm -rf /tmp/rfl_null_upsert_splayed")
+(.db.splayed.set "/tmp/rfl_null_upsert_splayed/" Tplain)
+(set Sp (.db.splayed.get "/tmp/rfl_null_upsert_splayed/"))
+(count Sp)           -- 4
+(sum (at Sp 'qty))   -- 160
+(avg (at Sp 'qty))   -- 53.333333333333336
+(sum (at Sp 'price)) -- 9.0
+(avg (at Sp 'price)) -- 3.0
+(nil? (at (at Sp 'qty) 1))   -- true
+(nil? (at (at Sp 'price) 1)) -- true
