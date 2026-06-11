@@ -1705,6 +1705,69 @@ static test_result_t test_shared_symfile_domain_identity(void) {
     PASS();
 }
 
+/* =========================================================================
+ * 37. Empty-SYM-table round-trip: saving a 0-row table with a SYM column
+ *     must still create the symfile (seeded with the position-0 "").
+ *     Regression: a fresh empty domain merged zero vocabulary and the
+ *     flush no-op'd at count == disk_count (0 == 0), so NO symfile was
+ *     written and the load failed with the loud "sym" error.
+ * ========================================================================= */
+static test_result_t test_empty_sym_table_roundtrip(void) {
+    const char* dir  = TMP_SPLAY_BASE "/empty_sym";
+    const char* symp = TMP_SPLAY_BASE "/empty_sym_symfile";
+    rm_rf(dir);
+    unlink(symp);
+    unlink(TMP_SPLAY_BASE "/empty_sym_symfile.lk");
+
+    int64_t id_s = ray_sym_intern("s", 1);
+    ray_t* col = ray_sym_vec_new(RAY_SYM_W8, 4);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(col));
+    TEST_ASSERT_EQ_I(col->len, 0); /* zero rows */
+
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, id_s, col);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    TEST_ASSERT_EQ_I(ray_table_nrows(tbl), 0);
+
+    TEST_ASSERT_EQ_I(ray_splay_save(tbl, dir, symp), RAY_OK);
+
+    /* symfile must exist and hold exactly the seeded "" (count 1) */
+    TEST_ASSERT_EQ_I(access(symp, F_OK), 0);
+    {
+        FILE* f = fopen(symp, "rb");
+        TEST_ASSERT_NOT_NULL(f);
+        uint32_t magic = 0;
+        int64_t cnt = -1;
+        TEST_ASSERT_EQ_I(fread(&magic, 4, 1, f), 1);
+        TEST_ASSERT_EQ_I(fread(&cnt, 8, 1, f), 1);
+        fclose(f);
+        TEST_ASSERT_EQ_U(magic, 0x4C525453u); /* "STRL" */
+        TEST_ASSERT_EQ_I(cnt, 1);
+    }
+
+    /* both loaders round-trip: 0 rows, 1 SYM column */
+    for (int mm = 0; mm <= 1; mm++) {
+        ray_t* loaded = mm ? ray_read_splayed(dir, symp)
+                           : ray_splay_load(dir, symp);
+        TEST_ASSERT_NOT_NULL(loaded);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+        TEST_ASSERT_EQ_I(ray_table_ncols(loaded), 1);
+        TEST_ASSERT_EQ_I(ray_table_nrows(loaded), 0);
+        ray_t* lc = ray_table_get_col_idx(loaded, 0);
+        TEST_ASSERT_NOT_NULL(lc);
+        TEST_ASSERT_EQ_I(lc->type, RAY_SYM);
+        TEST_ASSERT_EQ_I(lc->len, 0);
+        ray_release(loaded);
+    }
+
+    ray_release(col);
+    ray_release(tbl);
+    rm_rf(dir);
+    unlink(symp);
+    unlink(TMP_SPLAY_BASE "/empty_sym_symfile.lk");
+    PASS();
+}
+
 /* ---- Suite definition -------------------------------------------------- */
 
 const test_entry_t splay_entries[] = {
@@ -1742,5 +1805,6 @@ const test_entry_t splay_entries[] = {
     { "splay/per_table_symfile_vocab",    test_per_table_symfile_vocabulary,    splay_setup, splay_teardown },
     { "splay/restart_reload_divergent",   test_restart_reload_divergent_global, splay_setup, splay_teardown },
     { "splay/shared_symfile_identity",    test_shared_symfile_domain_identity,  splay_setup, splay_teardown },
+    { "splay/empty_sym_table_roundtrip",  test_empty_sym_table_roundtrip,       splay_setup, splay_teardown },
     { NULL, NULL, NULL, NULL },
 };

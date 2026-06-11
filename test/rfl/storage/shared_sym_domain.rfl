@@ -61,5 +61,18 @@
 (.sys.exec "rm -f /tmp/rfl_shared_dom_lone/t/sym")
 (.db.splayed.get "/tmp/rfl_shared_dom_lone/t") !- sym
 
+;; ── empty-SYM-table round-trip: 0-row save must still seed the symfile ─
+;; Regression: a fresh empty domain merged zero vocabulary and the flush
+;; no-op'd at 0 == 0, leaving NO symfile — the table was unloadable.
+(.sys.exec "rm -rf /tmp/rfl_shared_dom_empty")
+(set Src (table [s v] (list [aa bb] [1 2])))
+(set Empty (select {from: Src where: (== v 99)}))
+(count Empty) -- 0
+(.db.splayed.set "/tmp/rfl_shared_dom_empty/t" Empty)
+(.sys.exec "test -f /tmp/rfl_shared_dom_empty/t/sym") -- 0
+(set Back (.db.splayed.get "/tmp/rfl_shared_dom_empty/t"))
+(count Back) -- 0
+(count (at Back 's)) -- 0
+
 ;; ── cleanup ────────────────────────────────────────────────────────────
-(.sys.exec "rm -rf /tmp/rfl_shared_dom /tmp/rfl_shared_dom_lone") -- 0
+(.sys.exec "rm -rf /tmp/rfl_shared_dom /tmp/rfl_shared_dom_lone /tmp/rfl_shared_dom_empty") -- 0
