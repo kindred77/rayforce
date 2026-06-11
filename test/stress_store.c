@@ -616,11 +616,29 @@ bool stress_check_invariants(stress_ctx_t* c) {
                      (long long)c->last_sym_count, (long long)cnt);
         return false;
     }
-    /* NOTE(flip): this bound assumes global-dump symfiles; revisit at
-     * Phase-2 Task 7 */
-    if ((uint64_t)cnt > (uint64_t)ray_sym_count()) {
-        dump_failure(c, "invariant: symfile count %lld > in-memory %u",
-                     (long long)cnt, ray_sym_count());
+    /* Post-flip domain invariants: the symfile holds the tables'
+     * VOCABULARY (no relation to the global table's count anymore — the
+     * old `cnt <= ray_sym_count()` bound is gone with the global dump).
+     * Position 0 must be the reserved empty string, and the vocabulary
+     * can never exceed every distinct symbol this run generated plus ""
+     * (sym_uniq fresh names + the null) — a gross upper bound that
+     * catches runaway duplication. */
+    if (cnt > 0) {
+        FILE* f2 = fopen(c->sym_path, "rb");
+        uint32_t len0 = 1;
+        bool ok = f2 && fseek(f2, 12, SEEK_SET) == 0 &&
+                  fread(&len0, sizeof(len0), 1, f2) == 1;
+        if (f2) fclose(f2);
+        if (!ok || len0 != 0) {
+            dump_failure(c, "invariant: symfile position 0 is not \"\" "
+                            "(len=%u ok=%d)", len0, (int)ok);
+            return false;
+        }
+    }
+    if (cnt > (int64_t)c->sym_uniq + 1) {
+        dump_failure(c, "invariant: symfile count %lld > distinct symbols "
+                        "ever generated %d + null", (long long)cnt,
+                     c->sym_uniq);
         return false;
     }
     c->last_sym_count = cnt;

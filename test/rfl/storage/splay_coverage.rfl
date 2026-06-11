@@ -140,25 +140,20 @@
 (at R-Multi 'flag) -- (at T-Multi 'flag)
 
 ;; ════════════════════════════════════════════════════════════════════════
-;; 3. splay_load_impl: bad sym_path causes early return.
+;; 3. splay_load_impl: explicit nonexistent sym_path on a SYMBOL-FREE table.
 ;;
-;; When the sym file at the given path cannot be loaded, splay_load_impl
-;; returns the error from ray_sym_load immediately (line 151).
-;; This is also covered by test/test_store.c::test_read_splayed_bad_sym and
-;; test/test_splay.c::test_load_bad_sym_path, but exercising it from RFL
-;; via the full .db.splayed.get dispatch chain confirms the ops/system.c
-;; wrapper also propagates the error rather than swallowing it.
-;;
-;; Note: splay_default_sym in ops/system.c checks access(buf, F_OK) before
-;; passing sym_path; when the file does not exist, sym_path is set to NULL
-;; and ray_sym_load is never called.  An explicit nonexistent path string
-;; as the second argument bypasses this check.
+;; Post-flip (per-vocabulary symfiles), a MISSING symfile is tolerated for
+;; tables without SYM columns — the spec's no-symbol-columns exemption
+;; applies to reads too (the argument names where the domain would live,
+;; not a promise it exists).  The loud `sym` error is reserved for actual
+;; SYM columns with no resolvable domain (covered by
+;; test_splay.c::test_validate_sym_corrupt and
+;; test_store.c::test_splay_load_sym_missing_corrupt).
 ;; ════════════════════════════════════════════════════════════════════════
 (.sys.exec "rm -f /tmp/rfl_splay_cov_badsym")
 
-;; Second argument to .db.splayed.get is an explicit sym path that does not
-;; exist — should fail with an I/O or corrupt error from ray_sym_load.
-(.db.splayed.get "/tmp/rfl_splay_cov/" "/tmp/rfl_splay_cov_badsym") !- io
+;; T-Multi (id/val/flag — no SYM columns) loads fine despite the bogus path.
+(count (.db.splayed.get "/tmp/rfl_splay_cov/" "/tmp/rfl_splay_cov_badsym")) -- 5
 
 ;; ── teardown ──────────────────────────────────────────────────────────────
 (.sys.exec "rm -rf /tmp/rfl_splay_cov")

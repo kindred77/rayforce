@@ -1,0 +1,65 @@
+;; The client layout, end-to-end through the language surface (sym-domain
+;; architecture, Task 7b): a parted `hist` plus a splayed `live` sharing
+;; ONE symfile (root/sym) — write, read, query, join (same-domain fast
+;; path), and reload.  On-disk SYM cells are positions in root/sym; loads
+;; attach the shared FILE domain to every SYM column of both tables.
+(.sys.exec "rm -rf /tmp/rfl_shared_dom")
+
+;; ── write: two hist partitions ─────────────────────────────────────────
+;; No explicit sym argument: the partition-shaped parent (2024.01.0x)
+;; derives the parted root, so both partitions encode against
+;; /tmp/rfl_shared_dom/sym by convention.
+(set H0 (table [s v] (list [ibm aapl msft] [1 2 3])))
+(set H1 (table [s v] (list [aapl goog] [4 5])))
+(.db.splayed.set "/tmp/rfl_shared_dom/2024.01.01/hist/" H0)
+(.db.splayed.set "/tmp/rfl_shared_dom/2024.01.02/hist/" H1)
+
+;; ── write: live splayed table SHARES root/sym via the explicit arg ─────
+(set L (table [s p] (list [msft goog tsla] [10.0 20.0 30.0])))
+(.db.splayed.set "/tmp/rfl_shared_dom/live" L "/tmp/rfl_shared_dom/sym")
+
+;; exactly one symfile exists — at the root, none inside the dirs
+(.sys.exec "test -f /tmp/rfl_shared_dom/sym") -- 0
+(.sys.exec "test ! -f /tmp/rfl_shared_dom/live/sym") -- 0
+(.sys.exec "test ! -f /tmp/rfl_shared_dom/2024.01.01/hist/sym") -- 0
+
+;; ── read back ──────────────────────────────────────────────────────────
+(set Hist (.db.parted.get "/tmp/rfl_shared_dom/" 'hist))
+(set Live (.db.splayed.get "/tmp/rfl_shared_dom/live" "/tmp/rfl_shared_dom/sym"))
+(count Hist) -- 5
+(count Live) -- 3
+
+;; cell-level resolution through the shared FILE domain
+(at (at Live 's) 0) -- 'msft
+(at (at Live 's) 2) -- 'tsla
+(sum (at Hist 'v)) -- 15
+
+;; literal-vs-column filter on the loaded live table (reverse lookup)
+(count (select {from: Live where: (== s 'goog)})) -- 1
+(at (at (select {p: p from: Live where: (== s 'msft)}) 'p) 0) -- 10.0
+
+;; group-by over the parted SYM column (raw-index keys, resolved on exit)
+(count (select {n: (count v) from: Hist by: s})) -- 4
+
+;; ── join: hist x live on the SHARED domain (raw-index fast path) ───────
+;; overlap is msft (v=3, p=10.0) and goog (v=5, p=20.0).
+(set HistFlat (select {s: s v: v from: Hist}))
+(set IJ (inner-join [s] HistFlat Live))
+(count IJ) -- 2
+(sum (at IJ 'v)) -- 8
+(sum (at IJ 'p)) -- 30.0
+
+;; ── reload: fresh handles see identical data ───────────────────────────
+(set Live2 (.db.splayed.get "/tmp/rfl_shared_dom/live" "/tmp/rfl_shared_dom/sym"))
+(at Live2 's) -- (at Live 's)
+(count (.db.parted.get "/tmp/rfl_shared_dom/" 'hist)) -- 5
+
+;; ── loud `sym` error: SYM columns with no resolvable symfile ───────────
+(.sys.exec "rm -rf /tmp/rfl_shared_dom_lone")
+(set Lone (table [s] (list [aa bb])))
+(.db.splayed.set "/tmp/rfl_shared_dom_lone/t" Lone)
+(.sys.exec "rm -f /tmp/rfl_shared_dom_lone/t/sym")
+(.db.splayed.get "/tmp/rfl_shared_dom_lone/t") !- sym
+
+;; ── cleanup ────────────────────────────────────────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_shared_dom /tmp/rfl_shared_dom_lone") -- 0

@@ -361,10 +361,11 @@ static test_result_t test_validate_sym_corrupt(void) {
 
     /* Reset again — now load WITHOUT sym_path.
      * The .d is self-describing (column names as strings), so "scol2"
-     * interns fine during the load.  The load still fails "corrupt":
-     * the sym count snapshotted BEFORE the load loop shows no real
-     * symbols while the table carries a RAY_SYM column
-     * (validate_sym_columns), or earlier via column sym-bounds checks. */
+     * interns fine during the load.  Post-flip the load fails with the
+     * loud "sym" error: a stored SYM column's cells are positions in
+     * its symfile, so loading one with no resolvable symfile must never
+     * resolve against incidental state (sym-domain spec, Load §3 —
+     * replaces the old validate_sym_columns "corrupt"). */
     ray_sym_destroy();
     (void)ray_sym_init();
     TEST_ASSERT_EQ_U(ray_sym_count(), 1);  /* "" reserved */
@@ -372,7 +373,7 @@ static test_result_t test_validate_sym_corrupt(void) {
     ray_t* bad = ray_splay_load(dir, NULL);
     TEST_ASSERT_TRUE(!bad || RAY_IS_ERR(bad));
     if (bad && RAY_IS_ERR(bad)) {
-        TEST_ASSERT_STR_EQ(ray_err_code(bad), "corrupt");
+        TEST_ASSERT_STR_EQ(ray_err_code(bad), "sym");
     }
     if (bad) ray_release(bad);
 
@@ -389,8 +390,9 @@ static test_result_t test_validate_sym_corrupt(void) {
  *     This is very hard to achieve via public API (table_add_col always
  *     succeeds for valid inputs); skip and mark as known gap.
  *
- * 11. splay_load_impl: non-NULL sym_path that fails to load (bad path) →
- *     error code from ray_sym_load.
+ * 11. splay_load_impl: non-NULL sym_path that doesn't exist — tolerated
+ *     for symbol-free tables (post-flip semantics; the loud "sym" error
+ *     is reserved for actual SYM columns without a domain).
  * ========================================================================= */
 static test_result_t test_load_bad_sym_path(void) {
     const char* dir = TMP_SPLAY_BASE "/bad_sym";
@@ -408,15 +410,23 @@ static test_result_t test_load_bad_sym_path(void) {
     ray_err_t err = ray_splay_save(tbl, dir, NULL);
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
-    /* Pass a nonexistent sym_path to both loaders */
+    /* Pass a nonexistent sym_path to both loaders.  Post-flip a MISSING
+     * symfile is tolerated for symbol-free tables (the spec's
+     * no-symbol-columns exemption applies to reads too: the sym
+     * argument names where the domain WOULD live, not a promise it
+     * exists) — the loud "sym" error fires only when a SYM column is
+     * actually encountered (covered by splay/validate_sym_corrupt). */
     const char* bad_sym = "/tmp/rayforce_splay_nonexistent_sym_XXXXXX";
     ray_t* r1 = ray_splay_load(dir, bad_sym);
-    TEST_ASSERT_TRUE(!r1 || RAY_IS_ERR(r1));
-    if (r1) ray_release(r1);
+    TEST_ASSERT_NOT_NULL(r1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r1));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r1), 1);
+    ray_release(r1);
 
     ray_t* r2 = ray_read_splayed(dir, bad_sym);
-    TEST_ASSERT_TRUE(!r2 || RAY_IS_ERR(r2));
-    if (r2) ray_release(r2);
+    TEST_ASSERT_NOT_NULL(r2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r2));
+    ray_release(r2);
 
     ray_release(col);
     ray_release(tbl);
@@ -1280,10 +1290,12 @@ static test_result_t test_torn_write_heals(void) {
 }
 
 /* =========================================================================
- * 31. Nested symbols in LIST columns force a symfile: a table whose only
- *     symbol data lives inside a list column must persist the dictionary
- *     (regression: the no-symfile exemption checked top-level types only
- *     and reloaded such tables with silently wrong symbols).
+ * 31. Nested symbols in LIST columns are SELF-CONTAINED post-flip: the
+ *     recursive column format serializes SYM atoms/vectors as strings
+ *     (store/col.c), so a table whose only symbol data lives inside a
+ *     list column writes NO symfile, and the symbols survive a full sym
+ *     table reset (the original silently-wrong-symbols incident class,
+ *     now closed by construction rather than by dictionary dumping).
  * ========================================================================= */
 static test_result_t test_nested_sym_list_symfile(void) {
     const char* dir  = TMP_SPLAY_BASE "/nested_sym";
@@ -1309,8 +1321,33 @@ static test_result_t test_nested_sym_list_symfile(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
 
     TEST_ASSERT_EQ_I(ray_splay_save(tbl, dir, symp), RAY_OK);
-    /* the dictionary MUST have been persisted */
-    TEST_ASSERT_EQ_I(access(symp, F_OK), 0);
+    /* no top-level SYM columns -> no symfile (nested data is strings) */
+    TEST_ASSERT_EQ_I(access(symp, F_OK), -1);
+
+    /* fresh process: nested symbols must round-trip via re-interning */
+    ray_sym_destroy();
+    (void)ray_sym_init();
+    TEST_ASSERT_EQ_U(ray_sym_count(), 1);  /* "" reserved */
+
+    ray_t* loaded = ray_splay_load(dir, NULL);
+    TEST_ASSERT_NOT_NULL(loaded);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    ray_t* lcol = ray_table_get_col_idx(loaded, 0);
+    TEST_ASSERT_NOT_NULL(lcol);
+    TEST_ASSERT_EQ_I(lcol->type, RAY_LIST);
+    ray_t* linner = ((ray_t**)ray_data(lcol))[0];
+    TEST_ASSERT_NOT_NULL(linner);
+    TEST_ASSERT_EQ_I(linner->type, RAY_SYM);
+    TEST_ASSERT_EQ_I(linner->len, 2);
+    ray_t* a0 = ray_sym_vec_cell(linner, 0);
+    ray_t* a1 = ray_sym_vec_cell(linner, 1);
+    TEST_ASSERT_NOT_NULL(a0);
+    TEST_ASSERT_NOT_NULL(a1);
+    TEST_ASSERT_EQ_U(ray_str_len(a0), 2);
+    TEST_ASSERT_MEM_EQ(2, ray_str_ptr(a0), "aa");
+    TEST_ASSERT_EQ_U(ray_str_len(a1), 2);
+    TEST_ASSERT_MEM_EQ(2, ray_str_ptr(a1), "bb");
+    ray_release(loaded);
 
     ray_release(inner);
     ray_release(lst);
@@ -1443,6 +1480,231 @@ static test_result_t test_untrusted_attrs_masked(void) {
     PASS();
 }
 
+/* =========================================================================
+ * 34. THE FLIP: per-table vocabulary symfile.  The symfile holds exactly
+ *     the table's distinct symbols ("" reserved at position 0), NOT the
+ *     process dictionary; column width derives from the vocabulary.
+ * ========================================================================= */
+static test_result_t test_per_table_symfile_vocabulary(void) {
+    const char* dir  = TMP_SPLAY_BASE "/vocab";
+    const char* symp = TMP_SPLAY_BASE "/vocab_sym";
+    rm_rf(dir);
+    unlink(symp);
+    unlink(TMP_SPLAY_BASE "/vocab_sym.lk");
+
+    /* Bloat the global dictionary with unrelated session symbols — the
+     * v2 dump would have persisted all of them. */
+    for (int i = 0; i < 500; i++) {
+        char nm[32];
+        int n = snprintf(nm, sizeof(nm), "unrelated_%d", i);
+        ray_sym_intern(nm, (size_t)n);
+    }
+
+    int64_t id_s = ray_sym_intern("s", 1);
+    int64_t v1 = ray_sym_intern("vocab_aa", 8);
+    int64_t v2 = ray_sym_intern("vocab_bb", 8);
+    ray_t* col = ray_sym_vec_new(RAY_SYM_W64, 3);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(col));
+    col->len = 3;
+    int64_t* cd = (int64_t*)ray_data(col);
+    cd[0] = v1; cd[1] = v2; cd[2] = v1;
+
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, id_s, col);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    TEST_ASSERT_EQ_I(ray_splay_save(tbl, dir, symp), RAY_OK);
+
+    /* symfile count == vocabulary ("" + vocab_aa + vocab_bb), not the
+     * 500+ global dictionary */
+    {
+        FILE* f = fopen(symp, "rb");
+        TEST_ASSERT_NOT_NULL(f);
+        uint32_t magic = 0;
+        int64_t cnt = -1;
+        TEST_ASSERT_EQ_I(fread(&magic, 4, 1, f), 1);
+        TEST_ASSERT_EQ_I(fread(&cnt, 8, 1, f), 1);
+        fclose(f);
+        TEST_ASSERT_EQ_U(magic, 0x4C525453u);
+        TEST_ASSERT_EQ_I(cnt, 3);
+        TEST_ASSERT_TRUE((uint32_t)cnt < ray_sym_count());
+    }
+
+    /* loaded column: FILE domain attached, width from the vocabulary
+     * (3 entries -> W8), cells resolve to the original strings */
+    ray_t* loaded = ray_splay_load(dir, symp);
+    TEST_ASSERT_NOT_NULL(loaded);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    ray_t* lc = ray_table_get_col_idx(loaded, 0);
+    TEST_ASSERT_NOT_NULL(lc);
+    TEST_ASSERT_EQ_I(lc->type, RAY_SYM);
+    TEST_ASSERT_EQ_U(lc->attrs & RAY_SYM_W_MASK, RAY_SYM_W8);
+    struct ray_sym_domain_s* dom = ray_sym_vec_domain(lc);
+    TEST_ASSERT(dom != ray_sym_runtime_domain(), "FILE domain attached");
+    TEST_ASSERT_EQ_I(ray_sym_domain_count(dom), 3);
+    ray_t* c0 = ray_sym_vec_cell(lc, 0);
+    ray_t* c1 = ray_sym_vec_cell(lc, 1);
+    ray_t* c2 = ray_sym_vec_cell(lc, 2);
+    TEST_ASSERT_NOT_NULL(c0);
+    TEST_ASSERT_NOT_NULL(c1);
+    TEST_ASSERT_NOT_NULL(c2);
+    TEST_ASSERT_MEM_EQ(8, ray_str_ptr(c0), "vocab_aa");
+    TEST_ASSERT_MEM_EQ(8, ray_str_ptr(c1), "vocab_bb");
+    TEST_ASSERT_EQ_PTR(c0, c2);
+    ray_release(loaded);
+
+    ray_release(col);
+    ray_release(tbl);
+    rm_rf(dir);
+    unlink(symp);
+    unlink(TMP_SPLAY_BASE "/vocab_sym.lk");
+    PASS();
+}
+
+/* =========================================================================
+ * 35. Restart/reload correctness — the original incident class: a fresh
+ *     process interns UNRELATED symbols first (global ids diverge from
+ *     file positions), then loads.  Cells must resolve to the original
+ *     strings through the FILE domain regardless of global state; both
+ *     the heap and mmap loaders.
+ * ========================================================================= */
+static test_result_t test_restart_reload_divergent_global(void) {
+    const char* dir  = TMP_SPLAY_BASE "/restart";
+    const char* symp = TMP_SPLAY_BASE "/restart_sym";
+    rm_rf(dir);
+    unlink(symp);
+    unlink(TMP_SPLAY_BASE "/restart_sym.lk");
+
+    int64_t id_s = ray_sym_intern("s", 1);
+    int64_t v1 = ray_sym_intern("rst_aa", 6);
+    int64_t v2 = ray_sym_intern("rst_bb", 6);
+    ray_t* col = ray_sym_vec_new(RAY_SYM_W64, 2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(col));
+    col->len = 2;
+    ((int64_t*)ray_data(col))[0] = v1;
+    ((int64_t*)ray_data(col))[1] = v2;
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, id_s, col);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    TEST_ASSERT_EQ_I(ray_splay_save(tbl, dir, symp), RAY_OK);
+    ray_release(col);
+    ray_release(tbl);
+
+    /* "restart": wipe the dictionary, then DIVERGE it before loading */
+    ray_sym_destroy();
+    (void)ray_sym_init();
+    ray_sym_intern("divergent_x", 11);
+    ray_sym_intern("divergent_y", 11);
+    ray_sym_intern("divergent_z", 11);
+
+    for (int mm = 0; mm <= 1; mm++) {
+        ray_t* loaded = mm ? ray_read_splayed(dir, symp)
+                           : ray_splay_load(dir, symp);
+        TEST_ASSERT_NOT_NULL(loaded);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+        ray_t* lc = ray_table_get_col_idx(loaded, 0);
+        TEST_ASSERT_NOT_NULL(lc);
+        ray_t* c0 = ray_sym_vec_cell(lc, 0);
+        ray_t* c1 = ray_sym_vec_cell(lc, 1);
+        TEST_ASSERT_NOT_NULL(c0);
+        TEST_ASSERT_NOT_NULL(c1);
+        TEST_ASSERT_EQ_U(ray_str_len(c0), 6);
+        TEST_ASSERT_MEM_EQ(6, ray_str_ptr(c0), "rst_aa");
+        TEST_ASSERT_EQ_U(ray_str_len(c1), 6);
+        TEST_ASSERT_MEM_EQ(6, ray_str_ptr(c1), "rst_bb");
+        ray_release(loaded);
+    }
+
+    rm_rf(dir);
+    unlink(symp);
+    unlink(TMP_SPLAY_BASE "/restart_sym.lk");
+    PASS();
+}
+
+/* =========================================================================
+ * 36. Shared symfile = shared domain OBJECT: two splayed tables written
+ *     against one symfile attach the SAME domain pointer on load (the
+ *     raw-index join fast path's precondition), and the symfile grows
+ *     append-only across the two saves (first table's positions stable).
+ * ========================================================================= */
+static test_result_t test_shared_symfile_domain_identity(void) {
+    const char* dir1 = TMP_SPLAY_BASE "/share_a";
+    const char* dir2 = TMP_SPLAY_BASE "/share_b";
+    const char* symp = TMP_SPLAY_BASE "/share_sym";
+    rm_rf(dir1);
+    rm_rf(dir2);
+    unlink(symp);
+    unlink(TMP_SPLAY_BASE "/share_sym.lk");
+
+    int64_t id_s = ray_sym_intern("s", 1);
+    int64_t va = ray_sym_intern("shr_aa", 6);
+    int64_t vb = ray_sym_intern("shr_bb", 6);
+    int64_t vc = ray_sym_intern("shr_cc", 6);
+
+    ray_t* c1 = ray_sym_vec_new(RAY_SYM_W64, 2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(c1));
+    c1->len = 2;
+    ((int64_t*)ray_data(c1))[0] = va;
+    ((int64_t*)ray_data(c1))[1] = vb;
+    ray_t* t1 = ray_table_new(2);
+    t1 = ray_table_add_col(t1, id_s, c1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t1));
+    TEST_ASSERT_EQ_I(ray_splay_save(t1, dir1, symp), RAY_OK);
+
+    /* second table overlaps (shr_bb) and extends (shr_cc) the vocabulary */
+    ray_t* c2 = ray_sym_vec_new(RAY_SYM_W64, 2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(c2));
+    c2->len = 2;
+    ((int64_t*)ray_data(c2))[0] = vb;
+    ((int64_t*)ray_data(c2))[1] = vc;
+    ray_t* t2 = ray_table_new(2);
+    t2 = ray_table_add_col(t2, id_s, c2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t2));
+    TEST_ASSERT_EQ_I(ray_splay_save(t2, dir2, symp), RAY_OK);
+
+    /* append-only merge: "", aa, bb (+ cc appended) = 4 entries */
+    {
+        FILE* f = fopen(symp, "rb");
+        TEST_ASSERT_NOT_NULL(f);
+        int64_t cnt = -1;
+        TEST_ASSERT_EQ_I(fseek(f, 4, SEEK_SET), 0);
+        TEST_ASSERT_EQ_I(fread(&cnt, 8, 1, f), 1);
+        fclose(f);
+        TEST_ASSERT_EQ_I(cnt, 4);
+    }
+
+    ray_t* l1 = ray_read_splayed(dir1, symp);
+    ray_t* l2 = ray_read_splayed(dir2, symp);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(l1));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(l2));
+    ray_t* k1 = ray_table_get_col_idx(l1, 0);
+    ray_t* k2 = ray_table_get_col_idx(l2, 0);
+    TEST_ASSERT_NOT_NULL(k1);
+    TEST_ASSERT_NOT_NULL(k2);
+    /* domain identity = pointer equality (raw-index fast path gate) */
+    TEST_ASSERT_EQ_PTR(ray_sym_vec_domain(k1), ray_sym_vec_domain(k2));
+    TEST_ASSERT(ray_sym_vec_domain(k1) != ray_sym_runtime_domain(),
+                "FILE domain, not the singleton");
+    /* the shared symbol resolves to the SAME position in both tables */
+    int64_t p1 = ray_read_sym(ray_data(k1), 1, RAY_SYM, k1->attrs); /* shr_bb */
+    int64_t p2 = ray_read_sym(ray_data(k2), 0, RAY_SYM, k2->attrs); /* shr_bb */
+    TEST_ASSERT_EQ_I(p1, p2);
+    ray_t* sb = ray_sym_vec_cell(k2, 0);
+    TEST_ASSERT_NOT_NULL(sb);
+    TEST_ASSERT_MEM_EQ(6, ray_str_ptr(sb), "shr_bb");
+
+    ray_release(l1);
+    ray_release(l2);
+    ray_release(c1);
+    ray_release(c2);
+    ray_release(t1);
+    ray_release(t2);
+    rm_rf(dir1);
+    rm_rf(dir2);
+    unlink(symp);
+    unlink(TMP_SPLAY_BASE "/share_sym.lk");
+    PASS();
+}
+
 /* ---- Suite definition -------------------------------------------------- */
 
 const test_entry_t splay_entries[] = {
@@ -1477,5 +1739,8 @@ const test_entry_t splay_entries[] = {
     { "splay/nested_sym_list_symfile",    test_nested_sym_list_symfile,         splay_setup, splay_teardown },
     { "splay/ragged_columns_corrupt",     test_ragged_columns_corrupt,          splay_setup, splay_teardown },
     { "splay/untrusted_attrs_masked",     test_untrusted_attrs_masked,          splay_setup, splay_teardown },
+    { "splay/per_table_symfile_vocab",    test_per_table_symfile_vocabulary,    splay_setup, splay_teardown },
+    { "splay/restart_reload_divergent",   test_restart_reload_divergent_global, splay_setup, splay_teardown },
+    { "splay/shared_symfile_identity",    test_shared_symfile_domain_identity,  splay_setup, splay_teardown },
     { NULL, NULL, NULL, NULL },
 };

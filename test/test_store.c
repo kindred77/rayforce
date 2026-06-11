@@ -1451,13 +1451,14 @@ static test_result_t test_splay_load_sym_missing_corrupt(void) {
     (void)ray_sym_init();
     TEST_ASSERT_EQ_U(ray_sym_count(), 1);  /* "" reserved */
 
-    /* Load with NULL sym_path — should fail because RAY_SYM column exists
-     * but sym table is empty. Note: col.c bounds check catches this first
-     * since sym_count==0 skips validation, but the post-load check in
-     * ray_splay_load catches RAY_SYM + empty sym table. */
+    /* Load with NULL sym_path — fails with the loud "sym" error: the
+     * column's cells are positions in its symfile, and a SYM column with
+     * no resolvable domain must never resolve against incidental state
+     * (sym-domain spec, Load §3; replaces the old validate_sym_columns
+     * "corrupt" which keyed off the global table being empty). */
     ray_t* loaded = ray_splay_load(TMP_SPLAY_SYM_DIR, NULL);
     TEST_ASSERT_TRUE(RAY_IS_ERR(loaded));
-    TEST_ASSERT_STR_EQ(ray_err_code(loaded), "corrupt");
+    TEST_ASSERT_STR_EQ(ray_err_code(loaded), "sym");
     ray_release(loaded);
 
     ray_release(col);
@@ -1484,9 +1485,17 @@ static test_result_t test_read_splayed_bad_sym_fatal(void) {
     ray_err_t err = ray_splay_save(tbl, TMP_SPLAY_SYM_DIR, NULL);
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
-    /* ray_read_splayed with nonexistent sym_path — should fail fatally */
+    /* ray_read_splayed with a nonexistent sym_path on a SYMBOL-FREE
+     * table — post-flip a missing symfile is tolerated (the spec's
+     * no-symbol-columns exemption applies to reads: the argument names
+     * where the domain would live, not a promise it exists).  The loud
+     * "sym" error is reserved for actual SYM columns without a domain
+     * (test_splay_load_sym_missing_corrupt above). */
     ray_t* loaded = ray_read_splayed(TMP_SPLAY_SYM_DIR, "/tmp/rayforce_nonexistent_sym_xyz");
-    TEST_ASSERT_TRUE(RAY_IS_ERR(loaded));
+    TEST_ASSERT_NOT_NULL(loaded);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    TEST_ASSERT_EQ_I(ray_table_nrows(loaded), 3);
+    ray_release(loaded);
 
     ray_release(col_x);
     ray_release(tbl);
@@ -3895,18 +3904,26 @@ static test_result_t test_col_recursive_atoms(void) {
 
 /* ---- test_col_recursive_sym_in_list -------------------------------------- */
 /* Covers col_write_recursive and col_read_recursive: RAY_SYM vector inside a
- * generic list exercises the "type == RAY_SYM" attrs branch. */
+ * generic list.  Post-flip the recursive format serializes nested SYM data
+ * as STRINGS (no symfile applies to nested payloads): the load re-interns
+ * into the global table and rebuilds the vec as runtime-domain W64 — the
+ * on-disk width of the source vec is NOT preserved (representation detail),
+ * the RESOLVED STRINGS are. */
 static test_result_t test_col_recursive_sym_in_list(void) {
     ray_sym_intern("rsl_x", 5);
     ray_sym_intern("rsl_y", 5);
     uint32_t sc = ray_sym_count();
 
-    /* Build W8 sym column */
+    /* Build W8 sym column: ["", <first interned sym>] */
     ray_t* sym_vec = ray_sym_vec_new(RAY_SYM_W8, 2);
     TEST_ASSERT_FALSE(RAY_IS_ERR(sym_vec));
     sym_vec->len = 2;
     uint8_t* sd = (uint8_t*)ray_data(sym_vec);
     sd[0] = 0; sd[1] = 1;
+    ray_t* want0 = ray_sym_str(0);
+    ray_t* want1 = ray_sym_str(1);
+    TEST_ASSERT_NOT_NULL(want0);
+    TEST_ASSERT_NOT_NULL(want1);
 
     /* Wrap in a list (not is_str_list, so uses col_save_list -> col_write_recursive) */
     ray_t* list = ray_list_new(1);
@@ -3926,7 +3943,14 @@ static test_result_t test_col_recursive_sym_in_list(void) {
     ray_t** slots = (ray_t**)ray_data(loaded);
     TEST_ASSERT_EQ_I(slots[0]->type, RAY_SYM);
     TEST_ASSERT_EQ_I(slots[0]->len, 2);
-    TEST_ASSERT_EQ_U(slots[0]->attrs & RAY_SYM_W_MASK, RAY_SYM_W8);
+    /* strings round-trip cell-for-cell (runtime-domain rebuild) */
+    ray_t* got0 = ray_sym_vec_cell(slots[0], 0);
+    ray_t* got1 = ray_sym_vec_cell(slots[0], 1);
+    TEST_ASSERT_NOT_NULL(got0);
+    TEST_ASSERT_NOT_NULL(got1);
+    TEST_ASSERT_EQ_U(ray_str_len(got0), ray_str_len(want0));
+    TEST_ASSERT_EQ_U(ray_str_len(got1), ray_str_len(want1));
+    TEST_ASSERT_MEM_EQ(ray_str_len(got1), ray_str_ptr(got1), ray_str_ptr(want1));
 
     ray_release(loaded);
     ray_release(sym_vec);

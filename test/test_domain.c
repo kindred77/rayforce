@@ -104,8 +104,9 @@ static test_result_t test_domain_runtime_delegation(void) {
     int64_t id_c = ray_sym_domain_intern(d, "dom_gamma", 9);
     TEST_ASSERT_EQ_I(id_c, ray_sym_find("dom_gamma", 9));
 
-    /* flush is Phase 2 */
-    TEST_ASSERT_EQ_I(ray_sym_domain_flush(d, false), RAY_ERR_NYI);
+    /* flush is a no-op on the runtime domain (sym.c owns its own
+     * persistence) — RAY_OK, never an error (post-flip semantics). */
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush(d, false), RAY_OK);
     PASS();
 }
 
@@ -369,13 +370,94 @@ static test_result_t test_domain_open_basic(void) {
     TEST_ASSERT(strstr(ray_sym_domain_path(dom), "rayforce_test_domain_sym") != NULL,
                 "path mentions the symfile");
 
-    /* Phase-2 stubs: FILE intern / flush are NYI */
-    TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom, "file_new", 8), -1);
-    TEST_ASSERT_EQ_I(ray_sym_domain_flush(dom, true), RAY_ERR_NYI);
+    /* The flip (Task 7b): FILE domains are writable — find-or-append
+     * into the in-memory tail, persisted by flush (append-only:
+     * existing positions never move). */
+    int64_t new_pos = ray_sym_domain_intern(dom, "file_new", 8);
+    TEST_ASSERT_EQ_I(new_pos, (int64_t)count_at_save);
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom, "file_new", 8), new_pos);
+    TEST_ASSERT_EQ_I(ray_sym_domain_count(dom), (int64_t)count_at_save + 1);
+    TEST_ASSERT_EQ_I(ray_sym_domain_find(dom, "file_new", 8), new_pos);
+    ray_t* ns = ray_sym_domain_str(dom, new_pos);
+    TEST_ASSERT_NOT_NULL(ns);
+    TEST_ASSERT_EQ_U(ray_str_len(ns), 8);
+    TEST_ASSERT_MEM_EQ(8, ray_str_ptr(ns), "file_new");
+    /* append-only: prior positions and their borrowed atoms unchanged */
+    TEST_ASSERT_EQ_PTR(ray_sym_domain_str(dom, id_h), s);
+
+    /* flush persists base+tail; a fresh open sees the grown vocabulary */
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush(dom, true), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush(dom, true), RAY_OK); /* idempotent */
+    ray_sym_domain_release(dom);
+    ray_sym_domain_t* re = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    TEST_ASSERT_NOT_NULL(re);
+    TEST_ASSERT_EQ_I(ray_sym_domain_count(re), (int64_t)count_at_save + 1);
+    TEST_ASSERT_EQ_I(ray_sym_domain_find(re, "file_new", 8), new_pos);
+    ray_sym_domain_release(re);
+
+    unlink(TMP_DOM_SYM_PATH);
+    unlink(TMP_DOM_SYM_PATH ".lk");
+    PASS();
+}
+
+/* Task 7b: open_or_create on a missing file yields an empty writable
+ * domain; "" is seeded at position 0 by the first intern; flush creates
+ * the file; verify-base-unchanged makes a racing writer LOUD. */
+static test_result_t test_domain_create_flush_concurrent(void) {
+    unlink(TMP_DOM_SYM_PATH);
+    unlink(TMP_DOM_SYM_PATH ".lk");
+
+    /* plain open of a missing file still fails */
+    TEST_ASSERT_NULL(ray_sym_domain_open(TMP_DOM_SYM_PATH));
+
+    ray_sym_domain_t* dom = ray_sym_domain_open_or_create(TMP_DOM_SYM_PATH);
+    TEST_ASSERT_NOT_NULL(dom);
+    TEST_ASSERT_EQ_I(ray_sym_domain_count(dom), 0);
+
+    /* first intern of a real symbol seeds "" at position 0 */
+    int64_t p = ray_sym_domain_intern(dom, "cre_a", 5);
+    TEST_ASSERT_EQ_I(p, 1);
+    TEST_ASSERT_EQ_I(ray_sym_domain_count(dom), 2);
+    ray_t* s0 = ray_sym_domain_str(dom, 0);
+    TEST_ASSERT_NOT_NULL(s0);
+    TEST_ASSERT_EQ_U(ray_str_len(s0), 0);
+
+    /* flush creates the file with "" first */
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush(dom, false), RAY_OK);
+    {
+        FILE* f = fopen(TMP_DOM_SYM_PATH, "rb");
+        TEST_ASSERT_NOT_NULL(f);
+        uint32_t magic = 0, len0 = 1;
+        int64_t cnt = -1;
+        TEST_ASSERT_EQ_I(fread(&magic, 4, 1, f), 1);
+        TEST_ASSERT_EQ_I(fread(&cnt, 8, 1, f), 1);
+        TEST_ASSERT_EQ_I(fread(&len0, 4, 1, f), 1);
+        fclose(f);
+        TEST_ASSERT_EQ_U(magic, 0x4C525453u);
+        TEST_ASSERT_EQ_I(cnt, 2);
+        TEST_ASSERT_EQ_U(len0, 0);
+    }
+
+    /* concurrent-writer detection: another writer replaces the file
+     * under us; the next flush of OUR dirty tail must fail loudly. */
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom, "cre_b", 5), 2);
+    {
+        FILE* f = fopen(TMP_DOM_SYM_PATH, "wb");
+        TEST_ASSERT_NOT_NULL(f);
+        uint32_t magic = 0x4C525453u;
+        int64_t cnt = 1;
+        uint32_t len0 = 0;
+        fwrite(&magic, 4, 1, f);
+        fwrite(&cnt, 8, 1, f);
+        fwrite(&len0, 4, 1, f);
+        fclose(f);
+    }
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush(dom, false), RAY_ERR_CORRUPT);
 
     ray_sym_domain_release(dom);
     unlink(TMP_DOM_SYM_PATH);
     unlink(TMP_DOM_SYM_PATH ".lk");
+    unlink(TMP_DOM_SYM_PATH ".tmp");
     PASS();
 }
 
@@ -1745,6 +1827,7 @@ const test_entry_t domain_entries[] = {
     { "domain/serde_roundtrip",         test_domain_serde_roundtrip,         domain_setup, domain_teardown },
     { "domain/col_save_load_mmap",      test_domain_col_save_load_mmap,      domain_setup, domain_teardown },
     { "domain/open_basic",              test_domain_open_basic,              domain_setup, domain_teardown },
+    { "domain/create_flush_concurrent", test_domain_create_flush_concurrent, domain_setup, domain_teardown },
     { "domain/open_identity_release",   test_domain_open_identity_and_release, domain_setup, domain_teardown },
     { "domain/vec_cell_runtime_equiv",  test_domain_vec_cell_runtime_equiv,  domain_setup, domain_teardown },
     { "domain/vec_lookup_hit_miss",     test_domain_vec_lookup_hit_miss,     domain_setup, domain_teardown },
