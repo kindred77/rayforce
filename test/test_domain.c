@@ -39,6 +39,7 @@
 #include "table/domain.h"
 #include "store/col.h"
 #include "store/serde.h"
+#include "ops/ops.h"   /* RAY_PARTED_BASE (parted-flatten adoption test) */
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -1385,6 +1386,111 @@ static test_result_t test_domain_asof_join_across_domains(void) {
     PASS();
 }
 
+/* Parted-flatten / filter-compact materializers (ops/exec.c OP_SCAN cold
+ * path + flatten_parted_col, ops/query.c query_materialize_parted_col,
+ * ops/filter.c sel_compact): every one of them memcpy's SYM cell ids
+ * verbatim out of the partition segments, so the flat output must adopt
+ * the partitions' shared FILE domain.  Divergent fixture: without the
+ * adopt, the raw ids resolve through the (swapped) runtime table and the
+ * output names come back WRONG. */
+static test_result_t test_domain_parted_flatten_adopts(void) {
+    ray_sym_domain_t* dom = NULL;
+    int64_t pos_a = -1, pos_b = -1;
+    TEST_ASSERT_TRUE(build_divergent_qsym_fixture(&dom, &pos_a, &pos_b));
+    TEST_ASSERT(pos_a != ray_sym_intern("dq_a", 4), "fixture diverges");
+
+    /* PARTED SYM column k: 2 segments over the FILE domain.
+     *   seg0 = ["dq_a" "dq_b"], seg1 = ["dq_b"]  (3 rows total) */
+    ray_t* seg0 = ray_sym_vec_new(RAY_SYM_W64, 2);
+    ray_t* seg1 = ray_sym_vec_new(RAY_SYM_W64, 1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(seg0));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(seg1));
+    seg0->len = 2; seg1->len = 1;
+    ((int64_t*)ray_data(seg0))[0] = pos_a;
+    ((int64_t*)ray_data(seg0))[1] = pos_b;
+    ((int64_t*)ray_data(seg1))[0] = pos_b;
+    ray_sym_domain_retain(dom); seg0->sym_domain = dom;
+    ray_sym_domain_retain(dom); seg1->sym_domain = dom;
+
+    ray_t* k = ray_alloc(2 * sizeof(ray_t*));
+    TEST_ASSERT_NOT_NULL(k);
+    k->type = (int8_t)(RAY_PARTED_BASE + RAY_SYM);
+    k->len = 2;
+    k->attrs = 0;
+    memset(k->aux, 0, 16);
+    ((ray_t**)ray_data(k))[0] = seg0;   /* ownership moves to the carrier */
+    ((ray_t**)ray_data(k))[1] = seg1;
+
+    /* PARTED I64 column v: segments [1 2] and [3]. */
+    ray_t* vs0 = ray_vec_new(RAY_I64, 2);
+    ray_t* vs1 = ray_vec_new(RAY_I64, 1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vs0));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vs1));
+    vs0->len = 2; vs1->len = 1;
+    ((int64_t*)ray_data(vs0))[0] = 1;
+    ((int64_t*)ray_data(vs0))[1] = 2;
+    ((int64_t*)ray_data(vs1))[0] = 3;
+    ray_t* v = ray_alloc(2 * sizeof(ray_t*));
+    TEST_ASSERT_NOT_NULL(v);
+    v->type = (int8_t)(RAY_PARTED_BASE + RAY_I64);
+    v->len = 2;
+    v->attrs = 0;
+    memset(v->aux, 0, 16);
+    ((ray_t**)ray_data(v))[0] = vs0;
+    ((ray_t**)ray_data(v))[1] = vs1;
+
+    ray_t* t = ray_table_new(2);
+    t = ray_table_add_col(t, ray_sym_intern("k", 1), k);
+    t = ray_table_add_col(t, ray_sym_intern("v", 1), v);
+    ray_release(k); ray_release(v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+    TEST_ASSERT_EQ_I(ray_env_set(ray_sym_intern("dpf_t", 5), t), RAY_OK);
+
+    /* (a) Projection over the parted column: the scan-side flatten
+     * memcpy's segment cells into one flat vec.  All 3 rows pass. */
+    ray_t* r1 = ray_eval_str("(select {k: k v: v from: dpf_t})");
+    TEST_ASSERT_NOT_NULL(r1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r1));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r1), 3);
+    ray_t* k1 = ray_table_get_col(r1, ray_sym_intern("k", 1));
+    TEST_ASSERT_NOT_NULL(k1);
+    TEST_ASSERT_EQ_I(k1->type, RAY_SYM);
+    TEST_ASSERT_TRUE(sym_cell_is(k1, 0, "dq_a"));
+    TEST_ASSERT_TRUE(sym_cell_is(k1, 1, "dq_b"));
+    TEST_ASSERT_TRUE(sym_cell_is(k1, 2, "dq_b"));
+    ray_release(r1);
+
+    /* (b) Partial WHERE over the parted table: the filter installs a
+     * rowsel and the boundary materializer (sel_compact / the parted
+     * gather) compacts the SYM column row-by-row. */
+    ray_t* r2 = ray_eval_str("(select {k: k v: v from: dpf_t where: (> v 1)})");
+    TEST_ASSERT_NOT_NULL(r2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r2));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r2), 2);
+    ray_t* k2 = ray_table_get_col(r2, ray_sym_intern("k", 1));
+    ray_t* v2 = ray_table_get_col(r2, ray_sym_intern("v", 1));
+    TEST_ASSERT_NOT_NULL(k2);
+    TEST_ASSERT_NOT_NULL(v2);
+    TEST_ASSERT_EQ_I(k2->type, RAY_SYM);
+    TEST_ASSERT_TRUE(sym_cell_is(k2, 0, "dq_b"));
+    TEST_ASSERT_TRUE(sym_cell_is(k2, 1, "dq_b"));
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(v2))[0], 2);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(v2))[1], 3);
+    ray_release(r2);
+
+    ray_release(ray_eval_str("(set dpf_t 0)"));
+    ray_release(t);
+    ray_sym_domain_release(dom);
+
+    ray_sym_domain_t* d2 = ray_sym_domain_open(TMP_DOM_QSYM_PATH);
+    TEST_ASSERT_NOT_NULL(d2);
+    ray_sym_domain_release(d2);
+
+    unlink(TMP_DOM_QSYM_PATH);
+    unlink(TMP_DOM_QSYM_PATH ".lk");
+    PASS();
+}
+
 /* ---- registration -------------------------------------------------------- */
 
 const test_entry_t domain_entries[] = {
@@ -1411,5 +1517,6 @@ const test_entry_t domain_entries[] = {
     { "domain/serde_sym_file_domain",   test_domain_serde_sym_file_domain,   domain_rt_setup, domain_rt_teardown },
     { "domain/join_across_domains",     test_domain_join_across_domains,     domain_rt_setup, domain_rt_teardown },
     { "domain/asof_join_across_domains", test_domain_asof_join_across_domains, domain_rt_setup, domain_rt_teardown },
+    { "domain/parted_flatten_adopts",   test_domain_parted_flatten_adopts,   domain_rt_setup, domain_rt_teardown },
     { NULL, NULL, NULL, NULL },
 };
