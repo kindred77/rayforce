@@ -177,9 +177,18 @@ restored
 
 The deserialized table is identical to the original — all types, column names, and values are preserved.
 
-## 6. Splayed Tables
+## 6. Splayed and Partitioned Tables
 
-Splayed tables store each column as a separate file on disk. This is Rayforce's native columnar format — faster than CSV and preserving exact types. Use `.db.splayed.set` to save and `.db.splayed.get` to load:
+Splayed tables store each column as a separate file on disk. This is Rayforce's native columnar format — faster than CSV and preserving exact types. Three functions cover on-disk tables:
+
+```lisp
+(.db.splayed.set "dir" Table)            ; write a splayed dir (also: a partition)
+(.db.splayed.set "dir" Table "sympath")  ; explicit shared symfile
+(.db.splayed.get "dir")                  ; open one splayed table (zero-copy mmap)
+(.db.parted.get  "root" 'name)           ; open a partitioned table (root/sym)
+```
+
+Save and load a table:
 
 ```lisp
 (.db.splayed.set "/tmp/rayforce-test/trades_db" trades)
@@ -200,12 +209,14 @@ Splayed tables store each column as a separate file on disk. This is Rayforce's 
 └─────────────────────────────────────┘
 ```
 
-On disk, this creates one file per column plus a symbol table:
+On disk, this creates one file per column, the schema marker `.d`, and a symbol vocabulary file (plus its writer lock `sym.lk`):
 
 ```text
 /tmp/rayforce-test/trades_db/
-  Symbol    Price    Qty    sym    sym.lk
+  .d    Symbol    Price    Qty    sym    sym.lk
 ```
+
+`.d` holds the column names (a string vector — the schema is self-describing), and `sym` is the table's **vocabulary**: the distinct symbols its `sym` columns use, in the file's own enumeration order. On-disk `sym` cells are positions in that vocabulary — never process-global ids — so the file is valid in any session and any process. A table without symbol columns never requires (or writes) a symfile; symbols nested inside list columns are stored as strings and need no symfile either.
 
 Load it back in a new session (or the same one) with `.db.splayed.get`:
 
@@ -230,6 +241,24 @@ loaded
 ```
 
 All types are preserved exactly — `f64` stays `f64`, `sym` stays `sym`. No type inference needed on reload.
+
+### Symfile resolution
+
+When no sym path is given, both `.set` and `.get` resolve the vocabulary by convention: `dir/sym` for a standalone splayed dir; for a partition-shaped dir (`/db/2024.01.15/t/`, `/db/100/t/`) the parted **root**'s `sym`. Writing a partition therefore lands its symbols in the root symfile automatically, and `.db.parted.get` opens `root/sym` once and attaches it across every partition — the parted view is index-coherent by construction. An explicit third argument to `.db.splayed.set` (or second to `.db.splayed.get`) always wins.
+
+A read that finds no symfile for a table that *has* symbol columns fails loudly with `error: sym` — it never resolves against whatever symbols happen to be in memory.
+
+### Sharing a vocabulary
+
+Several tables may use one symfile — pass the same explicit sym path, or simply place them under one parted root. Tables that share a vocabulary compare and join their `sym` columns on raw indices (the same-file fast path); tables with different vocabularies still work together, paying a one-time translation of each vocabulary (proportional to its distinct symbols, never to row count).
+
+Because a symfile only ever **appends** — a symbol's position is permanent, never removed or reordered — previously written column files stay valid as the vocabulary grows, and a re-opened reader is at worst momentarily behind, never wrong. The flip side is a single-writer contract: exactly one process may write to a given symfile (the writer holds `sym.lk` exclusively); readers are unlimited.
+
+Column index width follows the table's own vocabulary (`u8` up to 255 symbols, then `u16`, `u32`, …) — not the process dictionary — so files stay as narrow as the data allows.
+
+### Crash safety
+
+Writes are ordered: the symfile is flushed first, then the columns, then `.d` as the commit marker; files from a previous wider schema are swept. A crash mid-write leaves a directory without `.d`, which reads as missing — never as corrupt data — and the next `.db.splayed.set` heals it.
 
 ## 7. Writing CSV
 
@@ -320,6 +349,7 @@ End-to-end workflow: create data, save as CSV, reload, filter, serialize, deseri
 | CSV | `.csv.read` / `.csv.write` | No (re-inferred on load) | Interoperability, human-readable data |
 | Binary | `ser` / `de` | Yes | Caching, IPC, embedding in messages |
 | Splayed | `.db.splayed.set` / `.db.splayed.get` | Yes | Persistent storage, fast reload, mmap |
+| Partitioned | `.db.splayed.set` per partition / `.db.parted.get` | Yes | Large datasets split by date or key |
 
 ## Next Steps
 

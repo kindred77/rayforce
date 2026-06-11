@@ -706,9 +706,10 @@ static test_result_t test_validate_sym_zero_col_table(void) {
 
 /* =========================================================================
  * 18. ray_splay_save_bulk: durable=false + sym_path != NULL → hits the
- *     ray_sym_save_bulk branch.  The table must carry a RAY_SYM column:
- *     symbol-free tables skip the symfile entirely (no-symbol-columns
- *     exemption), so a SYM column is required to reach the bulk sym save.
+ *     non-durable ray_sym_domain_flush branch.  The table must carry a
+ *     RAY_SYM column: symbol-free tables skip the symfile entirely
+ *     (no-symbol-columns exemption), so a SYM column is required to
+ *     reach the bulk symfile flush.
  * ========================================================================= */
 static test_result_t test_save_bulk_with_sym_path(void) {
     const char* dir      = TMP_SPLAY_BASE "/bulk_sym";
@@ -733,7 +734,7 @@ static test_result_t test_save_bulk_with_sym_path(void) {
     tbl = ray_table_add_col(tbl, id_s, scol);
     TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
 
-    /* durable=false (bulk) + sym_path + SYM col → exercises ray_sym_save_bulk */
+    /* durable=false (bulk) + sym_path + SYM col → non-durable domain flush */
     ray_err_t err = ray_splay_save_bulk(tbl, dir, sym_path);
     TEST_ASSERT_EQ_I(err, RAY_OK);
 

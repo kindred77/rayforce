@@ -17,8 +17,8 @@
 ;;   sym_intern_nolock seg_len==0 (line 713)
 ;;     — Adjacent dots "a..b": empty segment → valid=false, not dotted.
 ;;
-;;   sym_save_impl durable=false branch (line 1208 false arm)
-;;     — ray_sym_save_bulk called from .csv.splayed.
+;;   non-durable symfile flush (ray_sym_domain_flush durable=false)
+;;     — exercised from .csv.splayed.
 ;;
 ;;   ray_sym_load STRL magic mismatch (line 1318-1322)
 ;;     — Load a 12-byte file with wrong magic word.
@@ -192,9 +192,9 @@
 (at _s9a 0) -- (at _s9b 0)
 
 ;; ═══════════════════════════════════════════════════════════════════
-;; 10. sym_save_impl "already up to date" path (line 1048-1051).
-;;     Second .db.splayed.set with no new syms: persisted_count == str_count
-;;     → sym_save_impl returns RAY_OK immediately without writing.
+;; 10. symfile flush "already up to date" path: a second .db.splayed.set
+;;     with no new syms → ray_sym_domain_flush no-ops at
+;;     count == disk_count and the save succeeds without rewriting.
 ;; ═══════════════════════════════════════════════════════════════════
 (set _T10 (table ['id 's] (list [1 2] (as 'SYMBOL ["pa" "pb"]))))
 (.db.splayed.set "/tmp/rfl_sym_cov_plain/" _T10)

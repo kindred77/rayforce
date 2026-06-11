@@ -19,7 +19,7 @@
 ;;   splay_save_impl line 74 true   — mkdir_p failure — REACHABLE (covered
 ;;                                    below via /proc/ path).
 ;;
-;;   splay_save_impl line 78        — ray_sym_save_bulk: COVERED by
+;;   splay_save_impl line 78        — non-durable symfile flush: COVERED by
 ;;                                    test/test_splay.c::test_save_bulk_with_sym_path
 ;;                                    which calls ray_splay_save_bulk() with
 ;;                                    sym_path != NULL (the only way to reach

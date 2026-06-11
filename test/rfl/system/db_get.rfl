@@ -90,5 +90,17 @@
 (count (key Trades2)) -- 1
 (at (at Trades2 's) 0) -- 'ZZZ
 
+;; ────────────── cross-partition schema validation ──────────────
+;; Names, order, and types must match the first partition; the error
+;; names the divergent partition + column (code "corrupt").
+(.sys.exec "rm -rf /tmp/rfl_get_badschema")
+(.db.splayed.set "/tmp/rfl_get_badschema/2024.01.01/t/" (table [a b] (list [1 2] [3 4])))
+(.db.splayed.set "/tmp/rfl_get_badschema/2024.01.02/t/" (table [a c] (list [5 6] [7 8])))
+(.db.parted.get "/tmp/rfl_get_badschema/" 't) !- corrupt
+;; Type divergence at same name is rejected too.
+(.db.splayed.set "/tmp/rfl_get_badschema/2024.01.02/t/" (table [a b] (list [5 6] [7.0 8.0])))
+(.db.parted.get "/tmp/rfl_get_badschema/" 't) !- corrupt
+(.sys.exec "rm -rf /tmp/rfl_get_badschema")
+
 ;; ────────────── cleanup ──────────────
 (.sys.exec "rm -rf /tmp/rfl_get_splayed /tmp/rfl_get_parted") -- 0
