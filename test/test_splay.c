@@ -34,6 +34,9 @@
 #include "test.h"
 #include <rayforce.h>
 #include "store/splay.h"
+#include "store/part.h"     /* ray_read_parted (resolution tests) */
+#include "ops/ops.h"        /* RAY_IS_PARTED */
+#include "lang/internal.h"  /* ray_set/get_splayed_fn (surface resolver) */
 #include "mem/heap.h"
 #include "table/sym.h"
 #include <string.h>
@@ -1769,6 +1772,229 @@ static test_result_t test_empty_sym_table_roundtrip(void) {
     PASS();
 }
 
+/* =========================================================================
+ * 38. Resolution order-independence: a mixed root (the client layout) —
+ *     /db/sym (shared), /db/live (splayed, saved against the ROOT sym),
+ *     /db/2024.01.01/hist (partition) — read in two fresh-process orders
+ *     (global dictionary wiped + DIVERGED between): parted-first vs
+ *     splayed-first must produce identical strings.  Post-flip, loads
+ *     attach the symfile's FILE domain to every SYM column, so global
+ *     intern state cannot influence resolution in either order.
+ * ========================================================================= */
+static test_result_t test_resolution_order_independence(void) {
+    const char* root = TMP_SPLAY_BASE "/ordroot";
+    rm_rf(root);
+    char live[600], part[600], symp[600];
+    snprintf(live, sizeof(live), "%s/live", root);
+    snprintf(part, sizeof(part), "%s/2024.01.01/hist", root);
+    snprintf(symp, sizeof(symp), "%s/sym", root);
+
+    int64_t id_s = ray_sym_intern("s", 1);
+    int64_t va = ray_sym_intern("ord_acme", 8);
+    int64_t vb = ray_sym_intern("ord_beta", 8);
+    int64_t vg = ray_sym_intern("ord_gama", 8);
+
+    /* live: [acme, beta]; partition: [beta, gama] — overlapping vocab */
+    ray_t* c1 = ray_sym_vec_new(RAY_SYM_W64, 2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(c1));
+    c1->len = 2;
+    ((int64_t*)ray_data(c1))[0] = va;
+    ((int64_t*)ray_data(c1))[1] = vb;
+    ray_t* t1 = ray_table_new(2);
+    t1 = ray_table_add_col(t1, id_s, c1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t1));
+    TEST_ASSERT_EQ_I(ray_splay_save(t1, live, symp), RAY_OK);
+
+    ray_t* c2 = ray_sym_vec_new(RAY_SYM_W64, 2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(c2));
+    c2->len = 2;
+    ((int64_t*)ray_data(c2))[0] = vb;
+    ((int64_t*)ray_data(c2))[1] = vg;
+    ray_t* t2 = ray_table_new(2);
+    t2 = ray_table_add_col(t2, id_s, c2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t2));
+    TEST_ASSERT_EQ_I(ray_splay_save(t2, part, symp), RAY_OK);
+
+    ray_release(c1);
+    ray_release(t1);
+    ray_release(c2);
+    ray_release(t2);
+
+    for (int order = 0; order < 2; order++) {
+        /* fresh process: wipe the global dictionary, then DIVERGE it so
+         * any accidental global-id resolution would produce wrong
+         * strings rather than coincidentally right ones */
+        ray_sym_destroy();
+        (void)ray_sym_init();
+        ray_sym_intern("ord_divergence_a", 16);
+        ray_sym_intern("ord_divergence_b", 16);
+
+        ray_t* spl = NULL;
+        ray_t* prt = NULL;
+        if (order == 0) {
+            spl = ray_read_splayed(live, symp);
+            prt = ray_read_parted(root, "hist");
+        } else {
+            prt = ray_read_parted(root, "hist");
+            spl = ray_read_splayed(live, symp);
+        }
+        TEST_ASSERT_FMT(spl && !RAY_IS_ERR(spl), "splayed load order=%d",
+                        order);
+        TEST_ASSERT_FMT(prt && !RAY_IS_ERR(prt), "parted load order=%d",
+                        order);
+
+        /* splayed strings — via the column's domain, never global ids */
+        ray_t* sc = ray_table_get_col_idx(spl, 0); /* borrowed */
+        TEST_ASSERT_NOT_NULL(sc);
+        ray_t* s0 = ray_sym_vec_cell(sc, 0);
+        ray_t* s1 = ray_sym_vec_cell(sc, 1);
+        TEST_ASSERT_NOT_NULL(s0);
+        TEST_ASSERT_NOT_NULL(s1);
+        TEST_ASSERT_MEM_EQ(8, ray_str_ptr(s0), "ord_acme");
+        TEST_ASSERT_MEM_EQ(8, ray_str_ptr(s1), "ord_beta");
+
+        /* parted strings — the s column is a parted wrapper; resolve
+         * through the segment's attached domain */
+        int64_t s_name = ray_sym_intern("s", 1);
+        ray_t* pc = ray_table_get_col(prt, s_name); /* borrowed */
+        TEST_ASSERT_NOT_NULL(pc);
+        TEST_ASSERT_TRUE(RAY_IS_PARTED(pc->type));
+        TEST_ASSERT_EQ_I(pc->len, 1); /* one partition */
+        ray_t** segs = (ray_t**)ray_data(pc);
+        TEST_ASSERT_NOT_NULL(segs[0]);
+        ray_t* p0 = ray_sym_vec_cell(segs[0], 0);
+        ray_t* p1 = ray_sym_vec_cell(segs[0], 1);
+        TEST_ASSERT_NOT_NULL(p0);
+        TEST_ASSERT_NOT_NULL(p1);
+        TEST_ASSERT_MEM_EQ(8, ray_str_ptr(p0), "ord_beta");
+        TEST_ASSERT_MEM_EQ(8, ray_str_ptr(p1), "ord_gama");
+
+        /* one symfile => ONE domain object across both tables, in both
+         * orders (the raw-index join fast path's precondition) */
+        TEST_ASSERT_EQ_PTR(ray_sym_vec_domain(sc),
+                           ray_sym_vec_domain(segs[0]));
+        TEST_ASSERT(ray_sym_vec_domain(sc) != ray_sym_runtime_domain(),
+                    "FILE domain, not the runtime singleton");
+
+        ray_release(spl);
+        ray_release(prt);
+    }
+
+    rm_rf(root);
+    PASS();
+}
+
+/* =========================================================================
+ * 39. Explicit sym always wins, through the surface resolver: a dir
+ *     whose dir/sym is a DECOY (left over from an earlier default save
+ *     of a different table — save sweeps stale columns but never
+ *     symfiles).  Loading with the explicit path must resolve the
+ *     current table's vocabulary; the default load documents the
+ *     dir/sym precedence rule the explicit argument wins over.
+ * ========================================================================= */
+static test_result_t test_resolution_explicit_wins(void) {
+    const char* dir  = TMP_SPLAY_BASE "/explwin";
+    const char* osym = TMP_SPLAY_BASE "/explwin_other";
+    rm_rf(dir);
+    unlink(osym);
+    unlink(TMP_SPLAY_BASE "/explwin_other.lk");
+
+    int64_t id_s = ray_sym_intern("s", 1);
+    ray_t* a_dir  = ray_str(dir, strlen(dir));
+    ray_t* a_osym = ray_str(osym, strlen(osym));
+    TEST_ASSERT_FALSE(!a_dir || RAY_IS_ERR(a_dir));
+    TEST_ASSERT_FALSE(!a_osym || RAY_IS_ERR(a_osym));
+
+    /* table A saved with the DEFAULT resolution -> creates dir/sym */
+    int64_t da = ray_sym_intern("decoy_aa", 8);
+    int64_t db = ray_sym_intern("decoy_bb", 8);
+    ray_t* ca = ray_sym_vec_new(RAY_SYM_W64, 2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ca));
+    ca->len = 2;
+    ((int64_t*)ray_data(ca))[0] = da;
+    ((int64_t*)ray_data(ca))[1] = db;
+    ray_t* ta = ray_table_new(2);
+    ta = ray_table_add_col(ta, id_s, ca);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ta));
+    {
+        ray_t* args[2] = { a_dir, ta };
+        ray_t* r = ray_set_splayed_fn(args, 2);
+        TEST_ASSERT_FALSE(!r || RAY_IS_ERR(r));
+        ray_release(r);
+    }
+    char dsym[600];
+    snprintf(dsym, sizeof(dsym), "%s/sym", dir);
+    TEST_ASSERT_EQ_I(access(dsym, F_OK), 0);
+
+    /* table B saved to the SAME dir with an EXPLICIT other symfile —
+     * dir/sym stays behind as the decoy */
+    int64_t wx = ray_sym_intern("win_xx", 6);
+    int64_t wy = ray_sym_intern("win_yy", 6);
+    ray_t* cb = ray_sym_vec_new(RAY_SYM_W64, 2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(cb));
+    cb->len = 2;
+    ((int64_t*)ray_data(cb))[0] = wx;
+    ((int64_t*)ray_data(cb))[1] = wy;
+    ray_t* tb = ray_table_new(2);
+    tb = ray_table_add_col(tb, id_s, cb);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tb));
+    {
+        ray_t* args[3] = { a_dir, tb, a_osym };
+        ray_t* r = ray_set_splayed_fn(args, 3);
+        TEST_ASSERT_FALSE(!r || RAY_IS_ERR(r));
+        ray_release(r);
+    }
+    TEST_ASSERT_EQ_I(access(dsym, F_OK), 0); /* decoy survived */
+    TEST_ASSERT_EQ_I(access(osym, F_OK), 0);
+
+    /* explicit wins: the 2-arg get resolves B's vocabulary through the
+     * explicit symfile even though dir/sym is ALSO present */
+    {
+        ray_t* args[2] = { a_dir, a_osym };
+        ray_t* lb = ray_get_splayed_fn(args, 2);
+        TEST_ASSERT_FALSE(!lb || RAY_IS_ERR(lb));
+        ray_t* lc = ray_table_get_col_idx(lb, 0);
+        TEST_ASSERT_NOT_NULL(lc);
+        ray_t* w0 = ray_sym_vec_cell(lc, 0);
+        ray_t* w1 = ray_sym_vec_cell(lc, 1);
+        TEST_ASSERT_NOT_NULL(w0);
+        TEST_ASSERT_NOT_NULL(w1);
+        TEST_ASSERT_MEM_EQ(6, ray_str_ptr(w0), "win_xx");
+        TEST_ASSERT_MEM_EQ(6, ray_str_ptr(w1), "win_yy");
+        TEST_ASSERT(ray_sym_vec_domain(lc) != ray_sym_runtime_domain(),
+                    "FILE domain attached");
+        ray_release(lb);
+    }
+
+    /* default read pins what the explicit argument wins OVER: rule 2
+     * (dir/sym) resolves the DECOY — same positions, A's vocabulary.
+     * This is the documented hazard of pointing a default read at a dir
+     * whose table was saved against another symfile, and exactly why
+     * sharing requires the explicit argument everywhere. */
+    {
+        ray_t* args[1] = { a_dir };
+        ray_t* ld = ray_get_splayed_fn(args, 1);
+        TEST_ASSERT_FALSE(!ld || RAY_IS_ERR(ld));
+        ray_t* lc = ray_table_get_col_idx(ld, 0);
+        TEST_ASSERT_NOT_NULL(lc);
+        ray_t* d0 = ray_sym_vec_cell(lc, 0);
+        TEST_ASSERT_NOT_NULL(d0);
+        TEST_ASSERT_MEM_EQ(8, ray_str_ptr(d0), "decoy_aa");
+        ray_release(ld);
+    }
+
+    ray_release(a_dir);
+    ray_release(a_osym);
+    ray_release(ca);
+    ray_release(ta);
+    ray_release(cb);
+    ray_release(tb);
+    rm_rf(dir);
+    unlink(osym);
+    unlink(TMP_SPLAY_BASE "/explwin_other.lk");
+    PASS();
+}
+
 /* ---- Suite definition -------------------------------------------------- */
 
 const test_entry_t splay_entries[] = {
@@ -1807,5 +2033,7 @@ const test_entry_t splay_entries[] = {
     { "splay/restart_reload_divergent",   test_restart_reload_divergent_global, splay_setup, splay_teardown },
     { "splay/shared_symfile_identity",    test_shared_symfile_domain_identity,  splay_setup, splay_teardown },
     { "splay/empty_sym_table_roundtrip",  test_empty_sym_table_roundtrip,       splay_setup, splay_teardown },
+    { "splay/resolution_order_independence", test_resolution_order_independence, splay_setup, splay_teardown },
+    { "splay/resolution_explicit_wins",   test_resolution_explicit_wins,        splay_setup, splay_teardown },
     { NULL, NULL, NULL, NULL },
 };

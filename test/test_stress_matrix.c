@@ -341,6 +341,118 @@ static test_result_t test_matrix_shared_domain_layout(void) {
     return r;
 }
 
+/* ---- raw on-disk readers (no API, mirroring stress_check_invariants) ---- */
+
+/* SYM width bits from a splayed column file's header attrs byte
+ * (bytes 0-15 aux, then mmod/order/type/attrs — store/col.c "Column file
+ * format").  Returns RAY_SYM_W8/W16/W32/W64 or -1 on I/O failure. */
+static int disk_sym_width(const char* col_path) {
+    FILE* f = fopen(col_path, "rb");
+    if (!f) return -1;
+    if (fseek(f, (long)offsetof(ray_t, attrs), SEEK_SET) != 0) {
+        fclose(f);
+        return -1;
+    }
+    int b = fgetc(f);
+    fclose(f);
+    if (b == EOF) return -1;
+    return b & RAY_SYM_W_MASK;
+}
+
+/* Symfile entry count from the raw header ([4B "STRL"][8B count]).
+ * Returns -1 on I/O failure or bad magic. */
+static int64_t disk_symfile_count(const char* sym_path) {
+    FILE* f = fopen(sym_path, "rb");
+    if (!f) return -1;
+    uint32_t magic = 0;
+    int64_t  cnt   = -1;
+    size_t ok = fread(&magic, sizeof(magic), 1, f);
+    ok += fread(&cnt, sizeof(cnt), 1, f);
+    fclose(f);
+    if (ok != 2 || magic != 0x4C525453u) return -1;
+    return cnt;
+}
+
+/* Vocabulary-width stress (sym-domain spec: "width-from-vocabulary"):
+ * the on-disk SYM column width tracks the SHARED symfile's vocabulary —
+ * not the process dictionary — and mixed-width eras coexist in one
+ * parted view: a partition written while the vocabulary fit W8 stays W8
+ * on disk and keeps reading correctly after the live table crosses into
+ * W16 (its positions are all < 256, still valid in the grown domain).
+ * The symfile count equals the tables' vocabulary exactly (every fresh
+ * ticker ever generated + the reserved "" at position 0). */
+static test_result_t test_matrix_vocab_width_impl(stress_ctx_t* c) {
+    char live_col[600], part_col[600];
+    snprintf(live_col, sizeof(live_col), "%s/live/ticker", c->db_root);
+
+    /* ── W8 era: small fixture, vocabulary well under 256 ─────────────── */
+    TEST_ASSERT(stress_seed_initial(c, 96, 1, 32), "seed");
+    /* a partition WRITTEN in the W8 era (before any growth) */
+    TEST_ASSERT(stress_op_part_new(c, 24, STRESS_SYMS_MIXED),
+                "part_new (W8 era)");
+    snprintf(part_col, sizeof(part_col), "%s/%s/hist/ticker", c->db_root,
+             c->part_dates[1]);
+    TEST_ASSERT(stress_verify_all(c, false), "verify(heap) W8 era");
+    TEST_ASSERT(stress_verify_all(c, true), "verify(mmap) W8 era");
+
+    int64_t vocab8 = disk_symfile_count(c->sym_path);
+    TEST_ASSERT_FMT(vocab8 > 0 && vocab8 <= 255,
+                    "W8-era vocabulary out of range: %lld", (long long)vocab8);
+    /* symfile count == the tables' vocabulary, NOT the global dictionary
+     * (which also holds column names, builtins, session noise) */
+    TEST_ASSERT_EQ_I(vocab8, (int64_t)c->sym_uniq + 1);
+    TEST_ASSERT_EQ_I(disk_sym_width(live_col), RAY_SYM_W8);
+    TEST_ASSERT_EQ_I(disk_sym_width(part_col), RAY_SYM_W8);
+
+    /* ── cross 255: 256 fresh tickers guarantee the W16 boundary ──────── */
+    TEST_ASSERT(stress_op_sym_grow(c, 256), "sym_grow -> W16");
+    int64_t vocab16 = disk_symfile_count(c->sym_path);
+    TEST_ASSERT_EQ_I(vocab16, vocab8 + 256);
+    TEST_ASSERT_FMT(vocab16 > 255, "no W16 crossing: %lld",
+                    (long long)vocab16);
+    TEST_ASSERT_EQ_I(vocab16, (int64_t)c->sym_uniq + 1);
+    /* live re-encoded at W16; the W8-era partition file is UNTOUCHED */
+    TEST_ASSERT_EQ_I(disk_sym_width(live_col), RAY_SYM_W16);
+    TEST_ASSERT_EQ_I(disk_sym_width(part_col), RAY_SYM_W8);
+    /* ...and the W8-era partition reads correctly alongside W16 data */
+    TEST_ASSERT(stress_verify_all(c, false), "verify(heap) mixed W8/W16");
+    TEST_ASSERT(stress_verify_all(c, true), "verify(mmap) mixed W8/W16");
+    TEST_ASSERT(stress_op_restart(c), "restart in W16 era");
+    TEST_ASSERT(stress_verify_all(c, false), "verify(heap) post-restart W16");
+    TEST_ASSERT(stress_verify_all(c, true), "verify(mmap) post-restart W16");
+
+    /* ── appending to the W8-era partition rewrites it at W16 ─────────── */
+    TEST_ASSERT(stress_op_part_append(c, 1, 8, STRESS_SYMS_EXISTING),
+                "part_append in W16 era");
+    TEST_ASSERT_EQ_I(disk_sym_width(part_col), RAY_SYM_W16);
+    TEST_ASSERT(stress_verify_all(c, false), "verify(heap) after rewrite");
+    TEST_ASSERT(stress_verify_all(c, true), "verify(mmap) after rewrite");
+
+    /* ── cross 65535 the same way (W32) ───────────────────────────────── */
+    TEST_ASSERT(stress_op_sym_grow(c, 65536 - vocab16 + 8), "sym_grow -> W32");
+    int64_t vocab32 = disk_symfile_count(c->sym_path);
+    TEST_ASSERT_FMT(vocab32 > 65535, "no W32 crossing: %lld",
+                    (long long)vocab32);
+    TEST_ASSERT_EQ_I(vocab32, (int64_t)c->sym_uniq + 1);
+    TEST_ASSERT_EQ_I(disk_sym_width(live_col), RAY_SYM_W32);
+    /* the partition last written in the W16 era stays W16 on disk */
+    TEST_ASSERT_EQ_I(disk_sym_width(part_col), RAY_SYM_W16);
+    TEST_ASSERT(stress_verify_all(c, false), "verify(heap) mixed W16/W32");
+    TEST_ASSERT(stress_verify_all(c, true), "verify(mmap) mixed W16/W32");
+    TEST_ASSERT(stress_op_restart(c), "restart in W32 era");
+    TEST_ASSERT(stress_verify_all(c, false), "verify(heap) post-restart W32");
+
+    PASS();
+}
+
+static test_result_t test_matrix_vocab_width(void) {
+    stress_ctx_t c;
+    TEST_ASSERT(stress_init(&c, STRESS_DB, 107), "init");
+    test_result_t r = test_matrix_vocab_width_impl(&c);
+    stress_destroy(&c);
+    return r;
+}
+
 const test_entry_t stress_matrix_entries[] = {
     { "stress/fixture_roundtrip", test_fixture_roundtrip, stress_setup, stress_teardown },
     { "stress/verify_clean",             test_verify_clean,             stress_setup, stress_teardown },
@@ -351,5 +463,6 @@ const test_entry_t stress_matrix_entries[] = {
     { "stress/matrix_parted_ops", test_matrix_parted_ops, stress_setup, stress_teardown },
     { "stress/matrix_restart_after_each_op", test_matrix_restart_after_each_op, stress_setup, stress_teardown },
     { "stress/matrix_shared_domain_layout", test_matrix_shared_domain_layout, stress_setup, stress_teardown },
+    { "stress/matrix_vocab_width", test_matrix_vocab_width, stress_setup, stress_teardown },
     { NULL, NULL, NULL, NULL },
 };

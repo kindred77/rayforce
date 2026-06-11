@@ -495,6 +495,13 @@ bool stress_op_part_new(stress_ctx_t* c, int64_t n, stress_sym_pattern_t pat) {
     return true;
 }
 
+/* -- vocabulary growth: fresh tickers through the live table -- */
+
+bool stress_op_sym_grow(stress_ctx_t* c, int64_t n) {
+    op_logf(c, "sym_grow n=%lld", (long long)n);
+    return stress_op_insert(c, n, STRESS_SYMS_NEW, false, false);
+}
+
 /* -- simulated process restart -------------------------------------------
  * Tear down the global sym table and reload it from the shared symfile,
  * exactly what a fresh process sees.  Every sym ID minted before this
