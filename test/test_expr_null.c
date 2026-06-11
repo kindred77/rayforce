@@ -776,6 +776,99 @@ static test_result_t test_diff_f64_max2(void) {
     return r;
 }
 
+/* ---- Task 7 guard: non-parted len-1 scalar-broadcast column bails fused compile ----
+ *
+ * ray_table_add_col does NOT validate column length — a len-1 column can be
+ * appended to a 5-row table.  ray_table_nrows() uses the FIRST column's length,
+ * so nrows=5 but b->len=1.  The guard in expr_compile (SCAN branch) detects
+ * col->len != nrows for non-parted columns and fires EXPR_BAIL_OTHER, preventing
+ * the fused evaluator from overreading b.  The fallback exec_elementwise_binary
+ * handles the len-1 column correctly as a scalar broadcast (r_scalar=true path).
+ *
+ * Table:
+ *   x: {10, 20, 30, 40, 50}          — 5 rows, no nulls
+ *   b: {7}                            — 1 row (scalar-broadcast, no nulls)
+ *
+ * expr_compile called directly on x+b: must return false, EXPR_BAIL_OTHER++
+ * ray_execute (fused bails → fallback): result == {17, 27, 37, 47, 57}
+ * diff_run (expect_fused=false): fused-via-fallback == forced-fallback */
+static test_result_t test_scalar_broadcast_col_bails(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* x: 5-row column — drives ray_table_nrows() == 5 */
+    int64_t xv[] = {10, 20, 30, 40, 50};
+    ray_t* xcol = ray_vec_from_raw(RAY_I64, xv, 5);
+    /* b: len-1 column — legitimate scalar-broadcast, but not an atom (type > 0) */
+    int64_t bv[] = {7};
+    ray_t* bcol = ray_vec_from_raw(RAY_I64, bv, 1);
+
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("x", 1), xcol);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("b", 1), bcol);
+    ray_release(xcol);
+    ray_release(bcol);
+
+    /* --- Part 1: expr_compile directly must bail with EXPR_BAIL_OTHER --- */
+    ray_graph_t* gc = ray_graph_new(tbl);
+    ray_op_t* sx = ray_scan(gc, "x");
+    ray_op_t* sb = ray_scan(gc, "b");
+    ray_op_t* add = ray_add(gc, sx, sb);
+
+    uint64_t bail_other_before = ray_expr_bail_counts[EXPR_BAIL_OTHER];
+    ray_expr_t ex;
+    bool compiled = expr_compile(gc, tbl, add, &ex);
+    TEST_ASSERT_FALSE(compiled);
+    TEST_ASSERT_FMT(ray_expr_bail_counts[EXPR_BAIL_OTHER] > bail_other_before,
+                    "EXPR_BAIL_OTHER must increment (was %llu, now %llu)",
+                    (unsigned long long)bail_other_before,
+                    (unsigned long long)ray_expr_bail_counts[EXPR_BAIL_OTHER]);
+    ray_graph_free(gc);
+
+    /* --- Part 2: ray_execute bails fused and falls back to scalar-broadcast path ---
+     * The fallback exec_elementwise_binary treats len-1 as r_scalar=true;
+     * result should be {17, 27, 37, 47, 57}. */
+    ray_graph_t* g1 = ray_graph_new(tbl);
+    ray_t* res = ray_execute(g1, ray_add(g1, ray_scan(g1, "x"), ray_scan(g1, "b")));
+    TEST_ASSERT(res && !RAY_IS_ERR(res), "ray_execute fallback succeeded");
+    TEST_ASSERT_FMT(res->type == RAY_I64, "result type I64, got %d", (int)res->type);
+    TEST_ASSERT_FMT(res->len == 5, "result len 5, got %lld", (long long)res->len);
+    int64_t* rd = (int64_t*)ray_data(res);
+    for (int64_t i = 0; i < 5; i++) {
+        int64_t expected = xv[i] + bv[0];
+        TEST_ASSERT_FMT(rd[i] == expected,
+                        "row %lld: expected %lld got %lld",
+                        (long long)i, (long long)expected, (long long)rd[i]);
+    }
+    ray_release(res);
+    ray_graph_free(g1);
+
+    /* --- Part 3: diff_run — fused-via-fallback == forced-fallback (expect_fused=false) --- */
+    {
+        /* reuse tbl — build fresh graph inside diff_run via builder */
+        ray_graph_t* gf = ray_graph_new(tbl);
+        ray_t* fused_res = ray_execute(gf, ray_add(gf, ray_scan(gf, "x"), ray_scan(gf, "b")));
+
+        ray_expr_disable = true;
+        ray_graph_t* gfall = ray_graph_new(tbl);
+        ray_t* fall_res = ray_execute(gfall, ray_add(gfall, ray_scan(gfall, "x"), ray_scan(gfall, "b")));
+        ray_expr_disable = false;
+
+        test_result_t cmp = vec_expect_equal(fused_res, fall_res);
+        ray_release(fused_res); ray_release(fall_res);
+        ray_graph_free(gf); ray_graph_free(gfall);
+        if (cmp.status != TEST_PASS) {
+            ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+            return cmp;
+        }
+    }
+
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t expr_null_entries[] = {
     { "expr_null/bail_counter",            test_expr_bail_counter_nulls,          NULL, NULL },
     { "expr_null/nullfree_invariance",     test_nullfree_stream_unchanged,        NULL, NULL },
@@ -813,5 +906,7 @@ const test_entry_t expr_null_entries[] = {
     /* Task 7: null-aware f64 min2/max2 */
     { "expr_null/diff_f64_min2",           test_diff_f64_min2,                    NULL, NULL },
     { "expr_null/diff_f64_max2",           test_diff_f64_max2,                    NULL, NULL },
+    /* Task 7 guard: non-parted len-1 scalar-broadcast column bails fused compile */
+    { "expr_null/scalar_broadcast_bails",  test_scalar_broadcast_col_bails,       NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
