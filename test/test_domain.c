@@ -1035,6 +1035,162 @@ static test_result_t test_domain_group_by_adopts_domain(void) {
     PASS();
 }
 
+/* ---- Phase 2 Task 5: kernel sweep ----------------------------------------- */
+
+/* The R7 SYM eq/ne fast path (lang/eval.c): `(== col 'lit)` compares the
+ * literal atom's id RAW against the column's cell ids in tight per-width
+ * loops.  Over a FILE-domain column the literal must first be re-expressed
+ * as a position in the COLUMN's domain; a literal absent from the domain
+ * matches nothing (== all-false, != all-true).  With the divergent fixture
+ * the legacy raw runtime-id compare selects the WRONG rows. */
+static test_result_t test_domain_r7_eq_fast_path(void) {
+    ray_sym_domain_t* dom = NULL;
+    int64_t pos_a = -1, pos_b = -1;
+    TEST_ASSERT_TRUE(build_divergent_qsym_fixture(&dom, &pos_a, &pos_b));
+    /* discrimination precondition: file positions != runtime ids */
+    TEST_ASSERT(pos_a != ray_sym_intern("dq_a", 4), "fixture diverges");
+
+    ray_t* v = ray_sym_vec_new(RAY_SYM_W64, 3);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    v->len = 3;
+    int64_t* vd = (int64_t*)ray_data(v);
+    vd[0] = pos_a; vd[1] = pos_a; vd[2] = pos_b;
+    ray_sym_domain_retain(dom);
+    v->sym_domain = dom;
+    TEST_ASSERT_EQ_I(ray_env_set(ray_sym_intern("dmr7v", 5), v), RAY_OK);
+
+    /* present literal, == : exactly the dq_a cells */
+    ray_t* r = ray_eval_str("(== dmr7v 'dq_a)");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->type, RAY_BOOL);
+    TEST_ASSERT_EQ_I(r->len, 3);
+    {
+        const bool* b = (const bool*)ray_data(r);
+        TEST_ASSERT_TRUE(b[0]);
+        TEST_ASSERT_TRUE(b[1]);
+        TEST_ASSERT_FALSE(b[2]);
+    }
+    ray_release(r);
+
+    /* present literal, != : complement */
+    r = ray_eval_str("(!= dmr7v 'dq_b)");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->len, 3);
+    {
+        const bool* b = (const bool*)ray_data(r);
+        TEST_ASSERT_TRUE(b[0]);
+        TEST_ASSERT_TRUE(b[1]);
+        TEST_ASSERT_FALSE(b[2]);
+    }
+    ray_release(r);
+
+    /* absent literal ('dq_zz interns into the RUNTIME at parse but is
+     * not in the FILE domain): == matches nothing, != matches all */
+    r = ray_eval_str("(== dmr7v 'dq_zz)");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->len, 3);
+    {
+        const bool* b = (const bool*)ray_data(r);
+        TEST_ASSERT_FALSE(b[0]);
+        TEST_ASSERT_FALSE(b[1]);
+        TEST_ASSERT_FALSE(b[2]);
+    }
+    ray_release(r);
+
+    r = ray_eval_str("(!= dmr7v 'dq_zz)");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->len, 3);
+    {
+        const bool* b = (const bool*)ray_data(r);
+        TEST_ASSERT_TRUE(b[0]);
+        TEST_ASSERT_TRUE(b[1]);
+        TEST_ASSERT_TRUE(b[2]);
+    }
+    ray_release(r);
+
+    ray_release(ray_eval_str("(set dmr7v 0)"));
+    ray_release(v);
+    ray_sym_domain_release(dom);
+
+    /* ref balance: the cache entry must be gone (fresh open rebuilds) */
+    ray_sym_domain_t* d2 = ray_sym_domain_open(TMP_DOM_QSYM_PATH);
+    TEST_ASSERT_NOT_NULL(d2);
+    ray_sym_domain_release(d2);
+
+    unlink(TMP_DOM_QSYM_PATH);
+    unlink(TMP_DOM_QSYM_PATH ".lk");
+    PASS();
+}
+
+/* Sort over a FILE-domain SYM key (ops/sort.c): both the lex rank LUT
+ * (build_enum_rank) and the multi-key comparator materialize strings,
+ * which must come from the COLUMN's domain.  With the divergent fixture
+ * the legacy global resolution ranks the two symbols in the WRONG order
+ * (file cells resolve to the swapped global strings), leaving the rows
+ * unsorted; the converted path reorders them lexicographically.  Also
+ * proves the sorted output adopts the key column's domain, and that
+ * `(upper k)` (sym_elem in ops/internal.h) materializes through it. */
+static test_result_t test_domain_sort_and_upper_resolve_domain(void) {
+    ray_sym_domain_t* dom = NULL;
+    int64_t pos_a = -1, pos_b = -1;
+    TEST_ASSERT_TRUE(build_divergent_qsym_fixture(&dom, &pos_a, &pos_b));
+    TEST_ASSERT(pos_a != ray_sym_intern("dq_a", 4), "fixture diverges");
+
+    /* k = ["dq_b" "dq_a"] by FILE strings; v = [1 2] tracks the rows */
+    ray_t* t = build_qsym_table(dom, pos_b, pos_a, 1, 2, "dmsrt_t");
+    TEST_ASSERT_NOT_NULL(t);
+
+    ray_t* r = ray_eval_str("(xasc dmsrt_t 'k)");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 2);
+
+    ray_t* out_k = ray_table_get_col(r, ray_sym_intern("k", 1));
+    TEST_ASSERT_NOT_NULL(out_k);
+    TEST_ASSERT_EQ_I(out_k->type, RAY_SYM);
+    /* lex order by the FILE domain's strings */
+    TEST_ASSERT_TRUE(sym_cell_is(out_k, 0, "dq_a"));
+    TEST_ASSERT_TRUE(sym_cell_is(out_k, 1, "dq_b"));
+    /* sorted key output resolves over the key column's dictionary */
+    TEST_ASSERT_EQ_PTR(ray_sym_vec_domain(out_k), dom);
+
+    /* the payload moved with its key row */
+    ray_t* out_v = ray_table_get_col(r, ray_sym_intern("v", 1));
+    TEST_ASSERT_NOT_NULL(out_v);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(out_v))[0], 2);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(out_v))[1], 1);
+    ray_release(r);
+
+    /* (upper k): exec_string_unary resolves each cell via sym_elem —
+     * the strings must come from the FILE domain (legacy: swapped). */
+    ray_t* r2 = ray_eval_str("(select {r: (upper k) from: dmsrt_t})");
+    TEST_ASSERT_NOT_NULL(r2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r2));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r2), 2);
+    ray_t* out_r = ray_table_get_col(r2, ray_sym_intern("r", 1));
+    TEST_ASSERT_NOT_NULL(out_r);
+    TEST_ASSERT_EQ_I(out_r->type, RAY_SYM);
+    TEST_ASSERT_TRUE(sym_cell_is(out_r, 0, "DQ_B"));  /* row order of t */
+    TEST_ASSERT_TRUE(sym_cell_is(out_r, 1, "DQ_A"));
+    ray_release(r2);
+
+    ray_release(ray_eval_str("(set dmsrt_t 0)"));
+    ray_release(t);
+    ray_sym_domain_release(dom);
+
+    ray_sym_domain_t* d2 = ray_sym_domain_open(TMP_DOM_QSYM_PATH);
+    TEST_ASSERT_NOT_NULL(d2);
+    ray_sym_domain_release(d2);
+
+    unlink(TMP_DOM_QSYM_PATH);
+    unlink(TMP_DOM_QSYM_PATH ".lk");
+    PASS();
+}
+
 /* ---- registration -------------------------------------------------------- */
 
 const test_entry_t domain_entries[] = {
@@ -1056,5 +1212,7 @@ const test_entry_t domain_entries[] = {
     { "domain/query_insert_reexpress",  test_domain_query_insert_cell_reexpress, domain_rt_setup, domain_rt_teardown },
     { "domain/gather_adopts_domain",    test_domain_gather_adopts_domain,    domain_rt_setup, domain_rt_teardown },
     { "domain/group_by_adopts_domain",  test_domain_group_by_adopts_domain,  domain_rt_setup, domain_rt_teardown },
+    { "domain/r7_eq_fast_path",         test_domain_r7_eq_fast_path,         domain_rt_setup, domain_rt_teardown },
+    { "domain/sort_upper_resolve",      test_domain_sort_and_upper_resolve_domain, domain_rt_setup, domain_rt_teardown },
     { NULL, NULL, NULL, NULL },
 };
