@@ -52,6 +52,8 @@ static test_result_t test_eval_matrix_ops_impl(stress_ctx_t* c) {
                         what, (int)(pidx));                                   \
         TEST_ASSERT_FMT(stress_verify_all(c, true), "verify(mmap) %s p=%d",  \
                         what, (int)(pidx));                                   \
+        TEST_ASSERT_FMT(stress_eval_verify_queries(c),                        \
+                        "query oracle %s p=%d", what, (int)(pidx));           \
     } while (0)
 
     VERIFY_BOTH("after seed", -1);
@@ -92,6 +94,50 @@ static test_result_t test_eval_matrix_ops(void) {
     stress_ctx_t c;
     TEST_ASSERT(stress_init(&c, STRESS_EVAL_DB, 201), "init");
     test_result_t r = test_eval_matrix_ops_impl(&c);
+    stress_destroy(&c);
+    return r;
+}
+
+/* ---- query-oracle self-check: a shadow/disk divergence MUST fail ---------- */
+
+/* Clean fixture passes the query oracle; corrupting ONE shadow qty under
+ * the ticker the oracle's (a) query will pick must make it FAIL (the sum
+ * diverges while per-row count does not — pins that the oracle compares
+ * VALUES, not just shapes).  The stderr dump is expected output, phase-1
+ * style. */
+static test_result_t test_eval_query_oracle_detects_impl(stress_ctx_t* c) {
+    TEST_ASSERT(stress_eval_seed_initial(c, 64, 2, 24), "seed");
+    TEST_ASSERT(stress_eval_verify_queries(c), "clean queries first");
+
+    /* Peek which pooled ticker the NEXT oracle call picks: query (a)
+     * consumes exactly one stress_rand, so draw it, then restore the rng
+     * so the oracle re-draws the same value. */
+    uint64_t saved_rng = c->rng;
+    uint64_t draw      = stress_rand(c);
+    c->rng             = saved_rng;
+    int span = c->pool_len < STRESS_POOL_CAP ? c->pool_len : STRESS_POOL_CAP;
+    const char* tkr = c->pool[draw % (uint64_t)span];
+    int64_t     hit = stress_find_first_by_ticker(&c->live, tkr);
+    /* seed 203 + (64,2,24) MIXED seeding makes the picked ticker live;
+     * if this trips after an engine change, adjust seed/sizes */
+    TEST_ASSERT_FMT(hit >= 0, "picked ticker '%s' has live rows", tkr);
+
+    fprintf(stderr, "\n[stress] NOTE: the next STRESS FAILURE dump is an "
+                    "intentional query-oracle self-check\n");
+    int64_t saved_qty = c->live.rows[hit].qty;
+    c->live.rows[hit].qty = saved_qty + 7; /* qty < 100000: no overflow */
+    TEST_ASSERT_FALSE(stress_eval_verify_queries(c));
+    c->live.rows[hit].qty = saved_qty;
+    c->failed = false; /* undo the keep-dir flag; this was synthetic */
+
+    TEST_ASSERT(stress_eval_verify_queries(c), "clean again after restore");
+    PASS();
+}
+
+static test_result_t test_eval_query_oracle_detects(void) {
+    stress_ctx_t c;
+    TEST_ASSERT(stress_init(&c, STRESS_EVAL_DB, 203), "init");
+    test_result_t r = test_eval_query_oracle_detects_impl(&c);
     stress_destroy(&c);
     return r;
 }
@@ -208,6 +254,8 @@ const test_entry_t stress_eval_entries[] = {
     { "stress_eval/fixture_roundtrip", test_eval_fixture_roundtrip,
       stress_eval_setup, stress_eval_teardown },
     { "stress_eval/matrix_ops", test_eval_matrix_ops,
+      stress_eval_setup, stress_eval_teardown },
+    { "stress_eval/query_oracle_detects", test_eval_query_oracle_detects,
       stress_eval_setup, stress_eval_teardown },
     { "stress_eval/equiv_with_c_driver", test_eval_equiv_with_c_driver,
       stress_eval_setup, stress_eval_teardown },

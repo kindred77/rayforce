@@ -18,6 +18,7 @@
 
 #include "stress_eval.h"
 #include <rayforce.h>
+#include "table/sym.h" /* ray_sym_vec_cell: group keys may carry FILE domains */
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -47,15 +48,19 @@ void stress_eval_runtime_down(void) {
 
 /* ---- eval ----------------------------------------------------------------- */
 
-bool stress_eval_exec(stress_ctx_t* c, const char* src) {
-    /* Log every source line first (op_logf truncates to the 128-byte log
-     * line) so any failure is replayable by hand in the REPL. */
+/* Log every source line first (op_logf truncates to the 128-byte log
+ * line) so any failure is replayable by hand in the REPL. */
+static void log_src_lines(stress_ctx_t* c, const char* src) {
     for (const char* p = src; *p;) {
         const char* nl  = strchr(p, '\n');
         size_t      len = nl ? (size_t)(nl - p) : strlen(p);
         stress_op_logf(c, "eval %.*s", (int)len, p);
         p += len + (nl ? 1 : 0);
     }
+}
+
+bool stress_eval_exec(stress_ctx_t* c, const char* src) {
+    log_src_lines(c, src);
     if (!g_rt) {
         stress_dump_failure(c, "eval: no runtime (stress_eval_runtime_up "
                                "not called?)");
@@ -423,4 +428,253 @@ bool stress_eval_op_restart(stress_ctx_t* c) {
         return false;
     }
     return true;
+}
+
+/* ---- query oracle -----------------------------------------------------------
+ * Shadow-computed expectations vs the SAME queries evaluated by the
+ * language over the persisted fixture.  The shadow mirrors the LANGUAGE's
+ * null semantics, all REPL-probed (never guessed):
+ *
+ *   (sum v)    skips null sentinels; empty / all-null sum = 0 (i64), NOT null
+ *   (count v)  = vector length — COUNT(*) semantics, null cells counted
+ *   group-by   buckets the null sym ("" = 0Ns = sym 0) as its OWN group
+ *   inner-join matches null sym keys like any other key
+ *
+ * Aggregates are over QTY (int64) ONLY — exact under any summation order.
+ * Price (f64) is deliberately NOT summed: double addition is
+ * order-dependent and the language's group/scan order is not the shadow's
+ * row order, so a price-sum oracle would need an epsilon that could mask
+ * real off-by-one-row bugs (disclosed decision; per-cell price equality is
+ * already pinned bit-for-bit by stress_verify_all).
+ *
+ * Every query eval is SELF-CONTAINED (starts with its own .db get), so a
+ * failing query replays as one REPL paste from the op log even right after
+ * a restart. */
+
+/* Eval one query; returns an owned non-error result, or NULL after dumping
+ * the failure (a query never legitimately returns void/null here). */
+static ray_t* eval_query(stress_ctx_t* c, const char* src) {
+    log_src_lines(c, src);
+    if (!g_rt) {
+        stress_dump_failure(c, "query: no runtime");
+        return NULL;
+    }
+    ray_t* r = ray_eval_str(src);
+    if (!r || RAY_IS_NULL(r)) {
+        stress_dump_failure(c, "query: void/null result for: %.300s", src);
+        return NULL;
+    }
+    if (RAY_IS_ERR(r)) {
+        stress_dump_failure(c, "query: error '%s' for: %.300s",
+                            ray_err_code(r), src);
+        ray_release(r);
+        return NULL;
+    }
+    return r;
+}
+
+/* Eval a query whose result must be an I64 atom (count/sum results). */
+static bool eval_query_i64(stress_ctx_t* c, const char* src, int64_t* out) {
+    ray_t* r = eval_query(c, src);
+    if (!r) return false;
+    if (r->type != -RAY_I64) {
+        stress_dump_failure(c, "query: expected i64 atom, got type %d for: "
+                               "%.300s", (int)r->type, src);
+        ray_release(r);
+        return false;
+    }
+    *out = r->i64;
+    ray_release(r);
+    return true;
+}
+
+/* Shadow scans (the pool is <=256 entries and fixtures are small; O(n^2)
+ * array scans are deliberate — no hash map to get subtly wrong). */
+
+static int64_t rows_key_count(const stress_rows_t* r, const char* key) {
+    int64_t n = 0;
+    for (int64_t i = 0; i < r->len; i++)
+        if (strcmp(r->rows[i].ticker, key) == 0) n++;
+    return n;
+}
+
+static int64_t rows_distinct_tickers(const stress_rows_t* r) {
+    int64_t d = 0;
+    for (int64_t i = 0; i < r->len; i++) {
+        bool seen = false;
+        for (int64_t j = 0; j < i && !seen; j++)
+            seen = strcmp(r->rows[i].ticker, r->rows[j].ticker) == 0;
+        if (!seen) d++;
+    }
+    return d;
+}
+
+/* hist = union of the partition shadows */
+static int64_t hist_key_count(const stress_ctx_t* c, const char* key) {
+    int64_t n = 0;
+    for (int p = 0; p < c->nparts; p++)
+        n += rows_key_count(&c->parts[p], key);
+    return n;
+}
+
+/* (a) filtered aggregate: one pooled ticker, language-side
+ * count(qty)/sum(qty) over `where ticker == k` vs the shadow. */
+static bool verify_filtered_agg(stress_ctx_t* c, const char* live_dir) {
+    if (c->pool_len == 0) {
+        stress_op_logf(c, "query-oracle (a) skipped: ticker pool empty");
+        return true;
+    }
+    int span = c->pool_len < STRESS_POOL_CAP ? c->pool_len : STRESS_POOL_CAP;
+    const char* tkr = c->pool[stress_rand(c) % (uint64_t)span];
+    int64_t exp_cnt = 0, exp_sum = 0;
+    for (int64_t i = 0; i < c->live.len; i++) {
+        if (strcmp(c->live.rows[i].ticker, tkr) != 0) continue;
+        exp_cnt++;                           /* count = COUNT(*), nulls in */
+        if (c->live.rows[i].qty != NULL_I64) /* sum skips nulls; empty = 0 */
+            exp_sum += c->live.rows[i].qty;
+    }
+    stress_op_logf(c, "query-oracle (a) ticker=%s expect cnt=%lld sum=%lld",
+                   tkr, (long long)exp_cnt, (long long)exp_sum);
+    char    src[2048];
+    int64_t got;
+    snprintf(src, sizeof(src),
+             "(set QT (.db.splayed.get \"%s\" \"%s\"))\n"
+             "(count (at (select {from: QT where: (== ticker '%s)}) 'qty))",
+             live_dir, c->sym_path, tkr);
+    if (!eval_query_i64(c, src, &got)) return false;
+    if (got != exp_cnt) {
+        stress_dump_failure(c, "query (a) count: got %lld, shadow %lld for "
+                               "ticker '%s'",
+                            (long long)got, (long long)exp_cnt, tkr);
+        return false;
+    }
+    snprintf(src, sizeof(src),
+             "(set QT (.db.splayed.get \"%s\" \"%s\"))\n"
+             "(sum (at (select {from: QT where: (== ticker '%s)}) 'qty))",
+             live_dir, c->sym_path, tkr);
+    if (!eval_query_i64(c, src, &got)) return false;
+    if (got != exp_sum) {
+        stress_dump_failure(c, "query (a) sum(qty): got %lld, shadow %lld "
+                               "for ticker '%s'",
+                            (long long)got, (long long)exp_sum, tkr);
+        return false;
+    }
+    return true;
+}
+
+/* (b) group-by counts: every returned (key, count) pair vs the shadow,
+ * order-independent (per-row shadow lookup), plus total group count vs
+ * shadow distinct tickers (the "" null group counts like any other). */
+static bool verify_group_counts(stress_ctx_t* c, const char* live_dir) {
+    char src[2048];
+    snprintf(src, sizeof(src),
+             "(set QT (.db.splayed.get \"%s\" \"%s\"))\n"
+             "(select {from: QT by: ticker c: (count qty)})",
+             live_dir, c->sym_path);
+    ray_t* g = eval_query(c, src);
+    if (!g) return false;
+    bool ok = false;
+    if (g->type != RAY_TABLE) {
+        stress_dump_failure(c, "query (b): expected table, got type %d",
+                            (int)g->type);
+        goto done;
+    }
+    {
+        int64_t ngroups   = ray_table_nrows(g);
+        int64_t edistinct = rows_distinct_tickers(&c->live);
+        if (ngroups != edistinct) {
+            stress_dump_failure(c, "query (b): %lld groups, shadow has %lld "
+                                   "distinct tickers",
+                                (long long)ngroups, (long long)edistinct);
+            goto done;
+        }
+        ray_t* kcol = ray_table_get_col(g, ray_sym_intern("ticker", 6));
+        ray_t* ccol = ray_table_get_col(g, ray_sym_intern("c", 1));
+        if (!kcol || !ccol) {
+            stress_dump_failure(c, "query (b): result lacks ticker/c column");
+            goto done;
+        }
+        for (int64_t i = 0; i < ngroups; i++) {
+            /* group keys may resolve through a FILE domain — never raw ids */
+            ray_t* s = ray_sym_vec_cell(kcol, i);
+            if (!s) {
+                stress_dump_failure(c, "query (b): unresolvable group key at "
+                                       "row %lld", (long long)i);
+                goto done;
+            }
+            const char* kp = ray_str_ptr(s);
+            size_t      kl = ray_str_len(s);
+            char        key[STRESS_SYM_MAX];
+            if (kl >= sizeof(key)) {
+                stress_dump_failure(c, "query (b): group key %.40s... longer "
+                                       "than any generated ticker", kp);
+                goto done;
+            }
+            memcpy(key, kp, kl);
+            key[kl] = '\0';
+            int64_t want = rows_key_count(&c->live, key);
+            int64_t got  = ray_vec_get_i64(ccol, i);
+            /* want == 0 (phantom group) also lands here: got >= 1 always */
+            if (got != want) {
+                stress_dump_failure(c, "query (b): group '%s' count %lld, "
+                                       "shadow %lld",
+                                    key, (long long)got, (long long)want);
+                goto done;
+            }
+        }
+        /* counts summing to live.len is implied: groups are exactly the
+         * shadow's distinct keys and each count matched the shadow scan */
+        ok = true;
+    }
+done:
+    ray_release(g);
+    return ok;
+}
+
+/* (c) join cardinality: count of the language's inner-join live x hist on
+ * ticker vs the shadow's sum over distinct live tickers of
+ * live_count(k) * hist_count(k) — including the "" null key, which the
+ * join matches like any other (probed).  Sides are projected to disjoint
+ * non-key column names first (live/hist share price+qty names). */
+static bool verify_join_cardinality(stress_ctx_t* c, const char* live_dir) {
+    if (c->nparts == 0) {
+        stress_op_logf(c, "query-oracle (c) skipped: no hist partitions");
+        return true;
+    }
+    int64_t expect = 0;
+    for (int64_t i = 0; i < c->live.len; i++) {
+        const char* k = c->live.rows[i].ticker;
+        bool seen = false;
+        for (int64_t j = 0; j < i && !seen; j++)
+            seen = strcmp(k, c->live.rows[j].ticker) == 0;
+        if (seen) continue; /* count each distinct live ticker once */
+        expect += rows_key_count(&c->live, k) * hist_key_count(c, k);
+    }
+    stress_op_logf(c, "query-oracle (c) expect |live ij hist| = %lld",
+                   (long long)expect);
+    char src[2048];
+    snprintf(src, sizeof(src),
+             "(set QT (.db.splayed.get \"%s\" \"%s\"))\n"
+             "(set HT (.db.parted.get \"%s/\" 'hist))\n"
+             "(set LJ (select {ticker: ticker lq: qty from: QT}))\n"
+             "(set RJ (select {ticker: ticker rq: qty from: HT}))\n"
+             "(count (inner-join [ticker] LJ RJ))",
+             live_dir, c->sym_path, c->db_root);
+    int64_t got;
+    if (!eval_query_i64(c, src, &got)) return false;
+    if (got != expect) {
+        stress_dump_failure(c, "query (c): inner-join cardinality %lld, "
+                               "shadow expects %lld",
+                            (long long)got, (long long)expect);
+        return false;
+    }
+    return true;
+}
+
+bool stress_eval_verify_queries(stress_ctx_t* c) {
+    char live_dir[512];
+    stress_live_dir(c, live_dir, sizeof(live_dir));
+    return verify_filtered_agg(c, live_dir) &&
+           verify_group_counts(c, live_dir) &&
+           verify_join_cardinality(c, live_dir);
 }
