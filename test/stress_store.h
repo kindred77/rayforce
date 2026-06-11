@@ -11,6 +11,7 @@
 
 #include <rayforce.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #define STRESS_SYM_MAX    32    /* ticker string buffer (incl. NUL) */
@@ -96,5 +97,39 @@ bool stress_check_invariants(stress_ctx_t* c);
 
 /* prng (xorshift64*), exposed for the random runner */
 uint64_t stress_rand(stress_ctx_t* c);
+
+/* ---- engine internals exported for the eval driver (stress_eval.c) ----
+ * Minimal surface so eval-mode executors REUSE the shadow logic (row
+ * generation, shadow mutation, path layout, op log, failure dump) and the
+ * two drivers cannot drift.  Everything else in stress_store.c stays
+ * static. */
+
+#if defined(__GNUC__) || defined(__clang__)
+#define STRESS_PRINTF(a, b) __attribute__((format(printf, a, b)))
+#else
+#define STRESS_PRINTF(a, b)
+#endif
+
+/* row generation (consumes the ctx rng; updates the ticker pool) */
+void stress_gen_row(stress_ctx_t* c, stress_sym_pattern_t pat,
+                    stress_row_t* out);
+
+/* shadow row-array mutations (plain malloc, oracle side) */
+bool stress_rows_append(stress_rows_t* r, const stress_row_t* row);
+void stress_rows_trim(stress_rows_t* r, bool tail, int64_t n);
+
+/* upsert key semantics: index of LAST row matching ticker, or -1 */
+int64_t stress_find_last_by_ticker(const stress_rows_t* rows,
+                                   const char* ticker);
+
+/* fixture path layout */
+void stress_live_dir(const stress_ctx_t* c, char* buf, size_t n);
+void stress_part_dir(const stress_ctx_t* c, int i, char* buf, size_t n);
+
+/* op log + failure dump (dump sets c->failed, keeps the db dir) */
+void stress_op_logf(stress_ctx_t* c, const char* fmt, ...)
+    STRESS_PRINTF(2, 3);
+void stress_dump_failure(stress_ctx_t* c, const char* fmt, ...)
+    STRESS_PRINTF(2, 3);
 
 #endif /* RAY_TEST_STRESS_STORE_H */

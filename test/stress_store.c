@@ -27,17 +27,30 @@ uint64_t stress_rand(stress_ctx_t* c) {
 
 /* ---- op log + failure dump --------------------------------------------- */
 
-static void op_logf(stress_ctx_t* c, const char* fmt, ...) {
+static void op_logv(stress_ctx_t* c, const char* fmt, va_list ap) {
     if (!c->oplog) return;
     char* slot = c->oplog[c->oplog_len % STRESS_OPLOG_CAP];
-    va_list ap;
-    va_start(ap, fmt);
     vsnprintf(slot, 128, fmt, ap);
-    va_end(ap);
     c->oplog_len++;
 }
 
-static void dump_failure(stress_ctx_t* c, const char* fmt, ...) {
+static void op_logf(stress_ctx_t* c, const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    op_logv(c, fmt, ap);
+    va_end(ap);
+}
+
+/* exported variadic wrapper over the op log for the eval driver
+ * (stress_eval.c logs every generated source line through this). */
+void stress_op_logf(stress_ctx_t* c, const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    op_logv(c, fmt, ap);
+    va_end(ap);
+}
+
+void stress_dump_failure(stress_ctx_t* c, const char* fmt, ...) {
     char why[512];
     va_list ap;
     va_start(ap, fmt);
@@ -68,13 +81,13 @@ static bool rows_reserve(stress_rows_t* r, int64_t need) {
     return true;
 }
 
-static bool rows_append(stress_rows_t* r, const stress_row_t* row) {
+bool stress_rows_append(stress_rows_t* r, const stress_row_t* row) {
     if (!rows_reserve(r, r->len + 1)) return false;
     r->rows[r->len++] = *row;
     return true;
 }
 
-static void rows_trim(stress_rows_t* r, bool tail, int64_t n) {
+void stress_rows_trim(stress_rows_t* r, bool tail, int64_t n) {
     if (n > r->len) n = r->len;
     if (n <= 0) return; /* nothing to do; also avoids memmove(NULL, NULL, 0) UB */
     if (!tail)
@@ -91,7 +104,7 @@ static void rows_free(stress_rows_t* r) {
 
 /* ---- row generation ----------------------------------------------------- */
 
-static void gen_row(stress_ctx_t* c, stress_sym_pattern_t pat,
+void stress_gen_row(stress_ctx_t* c, stress_sym_pattern_t pat,
                     stress_row_t* out) {
     memset(out, 0, sizeof(*out));
     if (pat == STRESS_SYMS_NULLS && (stress_rand(c) & 1)) {
@@ -120,11 +133,11 @@ static void gen_row(stress_ctx_t* c, stress_sym_pattern_t pat,
 
 /* ---- paths --------------------------------------------------------------- */
 
-static void live_dir(const stress_ctx_t* c, char* buf, size_t n) {
+void stress_live_dir(const stress_ctx_t* c, char* buf, size_t n) {
     snprintf(buf, n, "%s/live", c->db_root);
 }
 
-static void part_dir(const stress_ctx_t* c, int i, char* buf, size_t n) {
+void stress_part_dir(const stress_ctx_t* c, int i, char* buf, size_t n) {
     snprintf(buf, n, "%s/%s/hist", c->db_root, c->part_dates[i]);
 }
 
@@ -284,20 +297,20 @@ bool stress_seed_initial(stress_ctx_t* c, int64_t live_rows, int nparts,
             nparts, (long long)rows_per_part);
     stress_row_t row;
     for (int64_t i = 0; i < live_rows; i++) {
-        gen_row(c, STRESS_SYMS_MIXED, &row);
-        if (!rows_append(&c->live, &row)) return false;
+        stress_gen_row(c, STRESS_SYMS_MIXED, &row);
+        if (!stress_rows_append(&c->live, &row)) return false;
     }
     char dir[512];
-    live_dir(c, dir, sizeof(dir));
+    stress_live_dir(c, dir, sizeof(dir));
     if (!save_rows(c, dir, &c->live, false)) return false;
     for (int p = 0; p < nparts; p++) {
         snprintf(c->part_dates[p], sizeof(c->part_dates[p]), "2024.01.%02d",
                  p + 1);
         for (int64_t i = 0; i < rows_per_part; i++) {
-            gen_row(c, STRESS_SYMS_MIXED, &row);
-            if (!rows_append(&c->parts[p], &row)) return false;
+            stress_gen_row(c, STRESS_SYMS_MIXED, &row);
+            if (!stress_rows_append(&c->parts[p], &row)) return false;
         }
-        part_dir(c, p, dir, sizeof(dir));
+        stress_part_dir(c, p, dir, sizeof(dir));
         if (!save_rows(c, dir, &c->parts[p], false)) return false;
     }
     c->nparts = nparts;
@@ -344,7 +357,7 @@ static bool cb_insert(stress_ctx_t* c, stress_rows_t* disk, void* a) {
     (void)c;
     insert_arg_t* arg = (insert_arg_t*)a;
     for (int64_t i = 0; i < arg->n; i++)
-        if (!rows_append(disk, &arg->rows[i])) return false;
+        if (!stress_rows_append(disk, &arg->rows[i])) return false;
     return true;
 }
 
@@ -355,15 +368,15 @@ bool stress_op_insert(stress_ctx_t* c, int64_t n, stress_sym_pattern_t pat,
     if (!fresh) return false;
     op_logf(c, "insert n=%lld pat=%d bulk=%d mmap=%d", (long long)n, (int)pat,
             (int)bulk, (int)via_mmap);
-    for (int64_t i = 0; i < n; i++) gen_row(c, pat, &fresh[i]);
+    for (int64_t i = 0; i < n; i++) stress_gen_row(c, pat, &fresh[i]);
 
     char dir[512];
-    live_dir(c, dir, sizeof(dir));
+    stress_live_dir(c, dir, sizeof(dir));
     insert_arg_t arg = { fresh, n };
     bool ok = mutate_dir(c, dir, via_mmap, bulk, cb_insert, &arg);
     if (ok)
         for (int64_t i = 0; i < n; i++)
-            if (!rows_append(&c->live, &fresh[i])) { ok = false; break; }
+            if (!stress_rows_append(&c->live, &fresh[i])) { ok = false; break; }
     free(fresh);
     return ok;
 }
@@ -374,7 +387,7 @@ bool stress_op_insert(stress_ctx_t* c, int64_t n, stress_sym_pattern_t pat,
  * collates onto the last null row — intentional test semantics, applied
  * identically to disk and shadow. */
 /* Returns index of last row whose ticker matches, or -1. */
-static int64_t find_last_by_ticker(const stress_rows_t* rows,
+int64_t stress_find_last_by_ticker(const stress_rows_t* rows,
                                    const char* ticker) {
     for (int64_t i = rows->len - 1; i >= 0; i--)
         if (strcmp(rows->rows[i].ticker, ticker) == 0) return i;
@@ -384,29 +397,29 @@ static int64_t find_last_by_ticker(const stress_rows_t* rows,
 static bool cb_upsert(stress_ctx_t* c, stress_rows_t* disk, void* a) {
     (void)c;
     const stress_row_t* row = (const stress_row_t*)a;
-    int64_t hit = find_last_by_ticker(disk, row->ticker);
+    int64_t hit = stress_find_last_by_ticker(disk, row->ticker);
     if (hit >= 0) {
         disk->rows[hit] = *row;
         return true;
     }
-    return rows_append(disk, row);
+    return stress_rows_append(disk, row);
 }
 
 bool stress_op_upsert(stress_ctx_t* c, stress_sym_pattern_t pat,
                       bool via_mmap) {
     stress_row_t row;
-    gen_row(c, pat, &row);
+    stress_gen_row(c, pat, &row);
     op_logf(c, "upsert ticker=%s pat=%d mmap=%d", row.ticker, (int)pat,
             (int)via_mmap);
     char dir[512];
-    live_dir(c, dir, sizeof(dir));
+    stress_live_dir(c, dir, sizeof(dir));
     if (!mutate_dir(c, dir, via_mmap, false, cb_upsert, &row)) return false;
-    int64_t hit = find_last_by_ticker(&c->live, row.ticker);
+    int64_t hit = stress_find_last_by_ticker(&c->live, row.ticker);
     if (hit >= 0) {
         c->live.rows[hit] = row;
         return true;
     }
-    return rows_append(&c->live, &row);
+    return stress_rows_append(&c->live, &row);
 }
 
 /* -- trim: drop head/tail n rows of live (-1) or a partition -- */
@@ -419,7 +432,7 @@ typedef struct {
 static bool cb_trim(stress_ctx_t* c, stress_rows_t* disk, void* a) {
     (void)c;
     trim_arg_t* t = (trim_arg_t*)a;
-    rows_trim(disk, t->tail, t->n);
+    stress_rows_trim(disk, t->tail, t->n);
     return true;
 }
 
@@ -429,16 +442,16 @@ bool stress_op_trim(stress_ctx_t* c, int part_idx, bool tail, int64_t n) {
     char dir[512];
     stress_rows_t* shadow;
     if (part_idx < 0) {
-        live_dir(c, dir, sizeof(dir));
+        stress_live_dir(c, dir, sizeof(dir));
         shadow = &c->live;
     } else {
         if (part_idx >= c->nparts) return false;
-        part_dir(c, part_idx, dir, sizeof(dir));
+        stress_part_dir(c, part_idx, dir, sizeof(dir));
         shadow = &c->parts[part_idx];
     }
     trim_arg_t t = { tail, n };
     if (!mutate_dir(c, dir, false, false, cb_trim, &t)) return false;
-    rows_trim(shadow, tail, n);
+    stress_rows_trim(shadow, tail, n);
     return true;
 }
 
@@ -452,15 +465,15 @@ bool stress_op_part_append(stress_ctx_t* c, int part_idx, int64_t n,
     if (!fresh) return false;
     op_logf(c, "part_append part=%d n=%lld pat=%d", part_idx, (long long)n,
             (int)pat);
-    for (int64_t i = 0; i < n; i++) gen_row(c, pat, &fresh[i]);
+    for (int64_t i = 0; i < n; i++) stress_gen_row(c, pat, &fresh[i]);
 
     char dir[512];
-    part_dir(c, part_idx, dir, sizeof(dir));
+    stress_part_dir(c, part_idx, dir, sizeof(dir));
     insert_arg_t arg = { fresh, n };
     bool ok = mutate_dir(c, dir, false, false, cb_insert, &arg);
     if (ok)
         for (int64_t i = 0; i < n; i++)
-            if (!rows_append(&c->parts[part_idx], &fresh[i])) {
+            if (!stress_rows_append(&c->parts[part_idx], &fresh[i])) {
                 ok = false;
                 break;
             }
@@ -479,14 +492,14 @@ bool stress_op_part_new(stress_ctx_t* c, int64_t n, stress_sym_pattern_t pat) {
             (long long)n, (int)pat);
     stress_row_t row;
     for (int64_t i = 0; i < n; i++) {
-        gen_row(c, pat, &row);
-        if (!rows_append(&c->parts[p], &row)) {
+        stress_gen_row(c, pat, &row);
+        if (!stress_rows_append(&c->parts[p], &row)) {
             rows_free(&c->parts[p]);
             return false;
         }
     }
     char dir[512];
-    part_dir(c, p, dir, sizeof(dir));
+    stress_part_dir(c, p, dir, sizeof(dir));
     if (!save_rows(c, dir, &c->parts[p], false)) {
         rows_free(&c->parts[p]);
         return false;
@@ -518,7 +531,7 @@ bool stress_op_restart(stress_ctx_t* c) {
     }
     e = ray_sym_load(c->sym_path);
     if (e != RAY_OK) {
-        dump_failure(c, "restart: ray_sym_load err=%d — symfile unreadable "
+        stress_dump_failure(c, "restart: ray_sym_load err=%d — symfile unreadable "
                         "by a fresh process", (int)e);
         return false;
     }
@@ -539,13 +552,13 @@ static bool compare_dir(stress_ctx_t* c, const char* dir,
                         const char* label) {
     ray_t* tbl = load_dir(c, dir, use_mmap);
     if (!tbl || RAY_IS_ERR(tbl)) {
-        dump_failure(c, "%s: load failed (%s)", label,
+        stress_dump_failure(c, "%s: load failed (%s)", label,
                      tbl ? ray_err_code(tbl) : "null");
         if (tbl) ray_release(tbl);
         return false;
     }
     if (ray_table_ncols(tbl) != 3 || ray_table_nrows(tbl) != shadow->len) {
-        dump_failure(c, "%s: shape %lldx%lld, expected %lldx3", label,
+        stress_dump_failure(c, "%s: shape %lldx%lld, expected %lldx3", label,
                      (long long)ray_table_nrows(tbl),
                      (long long)ray_table_ncols(tbl), (long long)shadow->len);
         ray_release(tbl);
@@ -556,7 +569,7 @@ static bool compare_dir(stress_ctx_t* c, const char* dir,
     ray_t* qty   = ray_table_get_col_idx(tbl, 2);
     if (!tick || !price || !qty || tick->len != shadow->len ||
         price->len != shadow->len || qty->len != shadow->len) {
-        dump_failure(c, "%s: column lengths disagree with row count", label);
+        stress_dump_failure(c, "%s: column lengths disagree with row count", label);
         ray_release(tbl);
         return false;
     }
@@ -569,7 +582,7 @@ static bool compare_dir(stress_ctx_t* c, const char* dir,
         int64_t want_id = ray_sym_vec_lookup(tick, ex->ticker, strlen(ex->ticker));
         if (disk_id != want_id) {
             ray_t* s = ray_sym_vec_cell(tick, i); /* borrowed; may be NULL */
-            dump_failure(c,
+            stress_dump_failure(c,
                 "%s row %lld: ticker id %lld ('%.*s') != expected '%s' (id %lld)",
                 label, (long long)i, (long long)disk_id,
                 s ? (int)ray_str_len(s) : 1, s ? ray_str_ptr(s) : "?",
@@ -580,13 +593,13 @@ static bool compare_dir(stress_ctx_t* c, const char* dir,
         bool price_eq = (pd[i] == ex->price) ||
                         (isnan(pd[i]) && isnan(ex->price));
         if (!price_eq) {
-            dump_failure(c, "%s row %lld: price %g != expected %g", label,
+            stress_dump_failure(c, "%s row %lld: price %g != expected %g", label,
                          (long long)i, pd[i], ex->price);
             ray_release(tbl);
             return false;
         }
         if (qd[i] != ex->qty) {
-            dump_failure(c, "%s row %lld: qty %lld != expected %lld", label,
+            stress_dump_failure(c, "%s row %lld: qty %lld != expected %lld", label,
                          (long long)i, (long long)qd[i], (long long)ex->qty);
             ray_release(tbl);
             return false;
@@ -601,7 +614,7 @@ static bool compare_dir(stress_ctx_t* c, const char* dir,
 bool stress_check_invariants(stress_ctx_t* c) {
     FILE* f = fopen(c->sym_path, "rb");
     if (!f) {
-        dump_failure(c, "invariant: symfile %s missing", c->sym_path);
+        stress_dump_failure(c, "invariant: symfile %s missing", c->sym_path);
         return false;
     }
     uint32_t magic = 0;
@@ -610,16 +623,16 @@ bool stress_check_invariants(stress_ctx_t* c) {
     ok += fread(&cnt, sizeof(cnt), 1, f);
     fclose(f);
     if (ok != 2) {
-        dump_failure(c, "invariant: symfile header truncated (read %zu/2 fields)",
+        stress_dump_failure(c, "invariant: symfile header truncated (read %zu/2 fields)",
                      ok);
         return false;
     }
     if (magic != 0x4C525453u) { /* "STRL" */
-        dump_failure(c, "invariant: symfile bad magic 0x%x", magic);
+        stress_dump_failure(c, "invariant: symfile bad magic 0x%x", magic);
         return false;
     }
     if (cnt < c->last_sym_count) {
-        dump_failure(c, "invariant: symfile count shrank %lld -> %lld",
+        stress_dump_failure(c, "invariant: symfile count shrank %lld -> %lld",
                      (long long)c->last_sym_count, (long long)cnt);
         return false;
     }
@@ -637,13 +650,13 @@ bool stress_check_invariants(stress_ctx_t* c) {
                   fread(&len0, sizeof(len0), 1, f2) == 1;
         if (f2) fclose(f2);
         if (!ok || len0 != 0) {
-            dump_failure(c, "invariant: symfile position 0 is not \"\" "
+            stress_dump_failure(c, "invariant: symfile position 0 is not \"\" "
                             "(len=%u ok=%d)", len0, (int)ok);
             return false;
         }
     }
     if (cnt > (int64_t)c->sym_uniq + 1) {
-        dump_failure(c, "invariant: symfile count %lld > distinct symbols "
+        stress_dump_failure(c, "invariant: symfile count %lld > distinct symbols "
                         "ever generated %d + null", (long long)cnt,
                      c->sym_uniq);
         return false;
@@ -656,10 +669,10 @@ bool stress_verify_all(stress_ctx_t* c, bool use_mmap) {
     op_logf(c, "verify mmap=%d", (int)use_mmap);
     if (!stress_check_invariants(c)) return false;
     char dir[512];
-    live_dir(c, dir, sizeof(dir));
+    stress_live_dir(c, dir, sizeof(dir));
     if (!compare_dir(c, dir, &c->live, use_mmap, "live")) return false;
     for (int p = 0; p < c->nparts; p++) {
-        part_dir(c, p, dir, sizeof(dir));
+        stress_part_dir(c, p, dir, sizeof(dir));
         char label[32];
         snprintf(label, sizeof(label), "part[%s]", c->part_dates[p]);
         if (!compare_dir(c, dir, &c->parts[p], use_mmap, label)) return false;
@@ -668,7 +681,7 @@ bool stress_verify_all(stress_ctx_t* c, bool use_mmap) {
     if (c->nparts > 0) {
         ray_t* parted = ray_read_parted(c->db_root, "hist");
         if (!parted || RAY_IS_ERR(parted)) {
-            dump_failure(c, "ray_read_parted failed (%s)",
+            stress_dump_failure(c, "ray_read_parted failed (%s)",
                          parted ? ray_err_code(parted) : "null");
             if (parted) ray_release(parted);
             return false;
