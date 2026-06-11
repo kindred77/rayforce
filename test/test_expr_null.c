@@ -539,6 +539,32 @@ static ray_op_t* build_or_raw(ray_graph_t* g) {
     return ray_or(g, ray_scan(g, "x"), ray_scan(g, "y"));
 }
 
+/* x < 5 — LT with a constant, exercises the null-aware LT comparison cell */
+static ray_op_t* build_x_lt_const(ray_graph_t* g) {
+    return ray_lt(g, ray_scan(g, "x"), ray_const_i64(g, 5));
+}
+
+/* x >= y — GE between two nullable i64 columns */
+static ray_op_t* build_x_ge_y(ray_graph_t* g) {
+    return ray_ge(g, ray_scan(g, "x"), ray_scan(g, "y"));
+}
+
+static test_result_t test_diff_i64_lt_const(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* tbl = make_task6_table();
+    test_result_t r = diff_run(tbl, build_x_lt_const, true);
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
+static test_result_t test_diff_i64_ge_y(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* tbl = make_task6_table();
+    test_result_t r = diff_run(tbl, build_x_ge_y, true);
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
 static test_result_t test_diff_i64_and_raw(void) {
     ray_heap_init(); (void)ray_sym_init();
     ray_t* tbl = make_raw_andor_table();
@@ -573,6 +599,9 @@ const test_entry_t expr_null_entries[] = {
     { "expr_null/diff_i64_or",             test_diff_i64_or,                      NULL, NULL },
     { "expr_null/diff_isnull_x",           test_diff_isnull_x,                    NULL, NULL },
     { "expr_null/isnull_nonnullable",      test_isnull_nonnullable_fused,          NULL, NULL },
+    /* LT/GE: additional null-aware comparison cells */
+    { "expr_null/diff_i64_lt_const",       test_diff_i64_lt_const,                NULL, NULL },
+    { "expr_null/diff_i64_ge_y",           test_diff_i64_ge_y,                    NULL, NULL },
     /* Raw nullable i64 AND/OR: exercises the null_aware I64 BOOL kernel directly */
     { "expr_null/diff_i64_and_raw",        test_diff_i64_and_raw,                 NULL, NULL },
     { "expr_null/diff_i64_or_raw",         test_diff_i64_or_raw,                  NULL, NULL },
