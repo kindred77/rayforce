@@ -869,6 +869,81 @@ static test_result_t test_scalar_broadcast_col_bails(void) {
     PASS();
 }
 
+/* ---- Task 8: null-aware narrow demotion casts (I64→I32, I64→I16, F64→I32) ----
+ *
+ * Builders:
+ *   (cast I32 (x + 1)) — i64 arithmetic then narrow; x values 1-10 (fit i16),
+ *                         nulls at {0,4,9}; uses make_task7_table() single-col slice
+ *   (cast I16 (x + 1)) — identical shape, I16 destination
+ *   (cast I32 f)        — direct f64→I32; f values 1.0-10.0, nulls at {1,6};
+ *                         uses make_f64_minmax_table()
+ *
+ * Fallback semantics (Step 2 finding):
+ *   exec_elementwise_unary does plain truncation for non-null values, then calls
+ *   propagate_nulls which writes the type-correct NULL_I32/NULL_I16 sentinel via
+ *   ray_vec_set_null at null positions.  ray_vec_is_null is sentinel-based, so the
+ *   fused null_aware kernel must write NULL_I32/NULL_I16 for null input lanes to
+ *   match the fallback's output exactly.  F64 null-check: NaN detection (a[j]!=a[j]).
+ *   No out-of-range handling in fallback (values are small in this fixture); plain
+ *   (int32_t) / (int16_t) truncation is the contract for non-null lanes.
+ *
+ * Narrow dt (I32/I16) only appears in the fused compile via an explicit OP_CAST node;
+ * the ot derivation for non-CAST ops produces only I64/F64/BOOL (confirmed in
+ * expr.c:636–647).  So no arithmetic produces narrow scratch registers — only CAST. */
+
+static ray_t* make_cast_narrow_table(void) {
+    int64_t xv[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+    int64_t xi[] = {0, 4, 9};
+    ray_t* xcol = vec_i64_with_nulls(xv, 10, xi, 3);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("x", 1), xcol);
+    ray_release(xcol);
+    return tbl;
+}
+
+/* (cast I32 (x + 1)) */
+static ray_op_t* build_cast_i32(ray_graph_t* g) {
+    ray_op_t* x  = ray_scan(g, "x");
+    ray_op_t* s  = ray_add(g, x, ray_const_i64(g, 1));
+    return ray_cast(g, s, RAY_I32);
+}
+
+/* (cast I16 (x + 1)) */
+static ray_op_t* build_cast_i16(ray_graph_t* g) {
+    ray_op_t* x  = ray_scan(g, "x");
+    ray_op_t* s  = ray_add(g, x, ray_const_i64(g, 1));
+    return ray_cast(g, s, RAY_I16);
+}
+
+/* (cast I32 f) — direct f64→I32 narrow */
+static ray_op_t* build_cast_f64_to_i32(ray_graph_t* g) {
+    return ray_cast(g, ray_scan(g, "f"), RAY_I32);
+}
+
+static test_result_t test_diff_cast_i32(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* tbl = make_cast_narrow_table();
+    test_result_t r = diff_run(tbl, build_cast_i32, true);
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
+static test_result_t test_diff_cast_i16(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* tbl = make_cast_narrow_table();
+    test_result_t r = diff_run(tbl, build_cast_i16, true);
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
+static test_result_t test_diff_cast_f64_to_i32(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* tbl = make_f64_minmax_table();
+    test_result_t r = diff_run(tbl, build_cast_f64_to_i32, true);
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
 const test_entry_t expr_null_entries[] = {
     { "expr_null/bail_counter",            test_expr_bail_counter_nulls,          NULL, NULL },
     { "expr_null/nullfree_invariance",     test_nullfree_stream_unchanged,        NULL, NULL },
@@ -908,5 +983,9 @@ const test_entry_t expr_null_entries[] = {
     { "expr_null/diff_f64_max2",           test_diff_f64_max2,                    NULL, NULL },
     /* Task 7 guard: non-parted len-1 scalar-broadcast column bails fused compile */
     { "expr_null/scalar_broadcast_bails",  test_scalar_broadcast_col_bails,       NULL, NULL },
+    /* Task 8: null-aware narrow demotion casts */
+    { "expr_null/diff_cast_i32",           test_diff_cast_i32,                    NULL, NULL },
+    { "expr_null/diff_cast_i16",           test_diff_cast_i16,                    NULL, NULL },
+    { "expr_null/diff_cast_f64_to_i32",    test_diff_cast_f64_to_i32,             NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
