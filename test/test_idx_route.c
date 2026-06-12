@@ -160,13 +160,17 @@ static int v_cols_equal(ray_t* ra, ray_t* rb) {
 
 /* Differential helper: run the same filter on two table instances — one
  * with an index (side A) and one without (side B).  Asserts identical row
- * counts and v-column values.  When expect_zone_hit >= 0, asserts
- * ray_idx_hits[IDX_SITE_FILTER_ZONE] advanced by exactly that amount on
- * side A (pass 1 to require a hit, 0 to require no advance). */
+ * counts and v-column values.
+ *
+ * expect_zone_hit     >= 0: assert hits delta equals this value (1 = hit, 0 = no hit)
+ *                      < 0: skip hits check
+ * expect_zone_consult >= 0: assert consults delta equals this value
+ *                      < 0: skip consults check */
 static test_result_t diff_idx_filter(pred_builder_t build_pred,
                                      int attach_zone,
                                      int expect_rows,
-                                     int expect_zone_hit) {
+                                     int expect_zone_hit,
+                                     int expect_zone_consult) {
     /* Side A — with index */
     ray_heap_init();
     ray_t* tbl_a = make_idx_table();
@@ -176,7 +180,8 @@ static test_result_t diff_idx_filter(pred_builder_t build_pred,
         TEST_ASSERT(ok == 0, "attach_zone_to_col k (side A)");
     }
 
-    uint64_t hits_before = ray_idx_hits[IDX_SITE_FILTER_ZONE];
+    uint64_t hits_before     = ray_idx_hits[IDX_SITE_FILTER_ZONE];
+    uint64_t consults_before = ray_idx_consults[IDX_SITE_FILTER_ZONE];
     ray_t* ra = run_filter(tbl_a, build_pred);
     TEST_ASSERT_FALSE(RAY_IS_ERR(ra));
     TEST_ASSERT_EQ_I(ray_table_nrows(ra), expect_rows);
@@ -184,6 +189,10 @@ static test_result_t diff_idx_filter(pred_builder_t build_pred,
     if (expect_zone_hit >= 0) {
         uint64_t delta = ray_idx_hits[IDX_SITE_FILTER_ZONE] - hits_before;
         TEST_ASSERT_EQ_I((int64_t)delta, (int64_t)expect_zone_hit);
+    }
+    if (expect_zone_consult >= 0) {
+        uint64_t delta = ray_idx_consults[IDX_SITE_FILTER_ZONE] - consults_before;
+        TEST_ASSERT_EQ_I((int64_t)delta, (int64_t)expect_zone_consult);
     }
 
     /* Side B — without index */
@@ -220,6 +229,48 @@ static ray_op_t* pred_gt_0(ray_graph_t* g) {
 /* (> k 5) — k∈{9,7,9,7} satisfy → 4 rows */
 static ray_op_t* pred_gt_5(ray_graph_t* g) {
     return ray_gt(g, ray_scan(g, "k"), ray_const_i64(g, 5));
+}
+
+/* (<= k 9) — max==key boundary → all 10 rows (ALL) */
+static ray_op_t* pred_le_9(ray_graph_t* g) {
+    return ray_le(g, ray_scan(g, "k"), ray_const_i64(g, 9));
+}
+
+/* (>= k 1) — min==key boundary → all 10 rows (ALL) */
+static ray_op_t* pred_ge_1(ray_graph_t* g) {
+    return ray_ge(g, ray_scan(g, "k"), ray_const_i64(g, 1));
+}
+
+/* (!= k 100) — key outside [1,9] → all 10 rows (ALL) */
+static ray_op_t* pred_ne_100(ray_graph_t* g) {
+    return ray_ne(g, ray_scan(g, "k"), ray_const_i64(g, 100));
+}
+
+/* (== k 0) — key just below min=1 → 0 rows (NONE) */
+static ray_op_t* pred_eq_0(ray_graph_t* g) {
+    return ray_eq(g, ray_scan(g, "k"), ray_const_i64(g, 0));
+}
+
+/* (> f 100.0) on F64 column f∈[1.5,10.5] → 0 rows (NONE) */
+static ray_op_t* pred_f_gt_100(ray_graph_t* g) {
+    return ray_gt(g, ray_scan(g, "f"), ray_const_f64(g, 100.0));
+}
+
+/* ─── F64 zone fixture ─────────────────────────────────────────────── */
+
+/* Build a zone-test table with an F64 column f {1.5..10.5} and I64 row id r. */
+static ray_t* make_f64_zone_table(void) {
+    (void)ray_sym_init();
+    double fd[] = {1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5, 10.5};
+    int64_t rd[] = {0,1,2,3,4,5,6,7,8,9};
+    ray_t* fv = ray_vec_from_raw(RAY_F64, fd, 10);
+    ray_t* rv = ray_vec_from_raw(RAY_I64, rd, 10);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("f", 1), fv);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("r", 1), rv);
+    ray_release(fv);
+    ray_release(rv);
+    return tbl;
 }
 
 /* ─── Tests ────────────────────────────────────────────────────────── */
@@ -265,20 +316,23 @@ static test_result_t test_hash_eq_still_works(void) {
 /* Zone all/none: (> k 100) with zone index → 0 rows, hit fires. */
 static test_result_t test_zone_none(void) {
     return diff_idx_filter(pred_gt_100, /*attach_zone=*/1,
-                           /*expect_rows=*/0, /*expect_zone_hit=*/1);
+                           /*expect_rows=*/0, /*expect_zone_hit=*/1,
+                           /*expect_zone_consult=*/-1);
 }
 
 /* Zone all/none: (> k 0) with zone index → 10 rows, hit fires. */
 static test_result_t test_zone_all(void) {
     return diff_idx_filter(pred_gt_0, /*attach_zone=*/1,
-                           /*expect_rows=*/10, /*expect_zone_hit=*/1);
+                           /*expect_rows=*/10, /*expect_zone_hit=*/1,
+                           /*expect_zone_consult=*/-1);
 }
 
 /* Zone unknown: (> k 5) with zone index → 4 rows; min=1 max=9, so
- * the consult cannot decide → hit counter must NOT advance. */
+ * the zone cannot decide → consult advances but hit must NOT. */
 static test_result_t test_zone_unknown(void) {
     return diff_idx_filter(pred_gt_5, /*attach_zone=*/1,
-                           /*expect_rows=*/4, /*expect_zone_hit=*/0);
+                           /*expect_rows=*/4, /*expect_zone_hit=*/0,
+                           /*expect_zone_consult=*/1);
 }
 
 /* Zone null exclusion: attach zone to a column with a null, query (> k 0).
@@ -309,10 +363,14 @@ static test_result_t test_zone_nulls_excluded(void) {
     int ok = attach_zone_to_col(tbl, "k");
     TEST_ASSERT(ok == 0, "attach_zone_to_col k");
 
-    /* Now set null at row 2 in the live column.  This marks HAS_NULLS but
-     * does NOT drop the index — the index is now stale (HAS_NULLS set but
-     * zone was built without that null).  idx_fresh_nonull will reject it
-     * on both the stale check and the HAS_NULLS check. */
+    /* Now set null at row 2 in the live column.
+     * ray_vec_set_null → ray_vec_set_null_checked → vec_drop_index_inplace:
+     * mutation auto-drops the index, so after this call kcol has no index at
+     * all.  idx_fresh_nonull therefore never fires — the consult short-circuits
+     * at the "no zone attached" check before it even reaches the HAS_NULLS
+     * guard.  idx_fresh_nonull's HAS_NULLS clause is a second line of defence
+     * for the hypothetical case of a stale-but-surviving index, but that
+     * survivor cannot exist here because drop is unconditional on mutation. */
     int64_t k_sym = ray_sym_intern("k", 1);
     int64_t ncols  = ray_table_ncols(tbl);
     int64_t slot   = -1;
@@ -346,11 +404,86 @@ static test_result_t test_zone_nulls_excluded(void) {
     PASS();
 }
 
+/* (<= k 9): max==key boundary → ALL → 10 rows, hit advances. */
+static test_result_t test_zone_le_all_boundary(void) {
+    return diff_idx_filter(pred_le_9, /*attach_zone=*/1,
+                           /*expect_rows=*/10, /*expect_zone_hit=*/1,
+                           /*expect_zone_consult=*/-1);
+}
+
+/* (>= k 1): min==key boundary → ALL → 10 rows, hit advances. */
+static test_result_t test_zone_ge_all_boundary(void) {
+    return diff_idx_filter(pred_ge_1, /*attach_zone=*/1,
+                           /*expect_rows=*/10, /*expect_zone_hit=*/1,
+                           /*expect_zone_consult=*/-1);
+}
+
+/* (!= k 100): key outside [1,9] → ALL → 10 rows, hit advances. */
+static test_result_t test_zone_ne_all(void) {
+    return diff_idx_filter(pred_ne_100, /*attach_zone=*/1,
+                           /*expect_rows=*/10, /*expect_zone_hit=*/1,
+                           /*expect_zone_consult=*/-1);
+}
+
+/* (== k 0): key just below min=1 → NONE → 0 rows, hit advances. */
+static test_result_t test_zone_eq_none_boundary(void) {
+    return diff_idx_filter(pred_eq_0, /*attach_zone=*/1,
+                           /*expect_rows=*/0, /*expect_zone_hit=*/1,
+                           /*expect_zone_consult=*/-1);
+}
+
+/* Zone F64: (> f 100.0) on f∈[1.5,10.5] → NONE → 0 rows, hit advances.
+ * Exercises the float min_f/max_f path in ray_index_zone_class. */
+static test_result_t test_zone_f64_none(void) {
+    ray_heap_init();
+    ray_t* tbl = make_f64_zone_table();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+
+    /* Attach zone index to the F64 column. */
+    int64_t sym_id = ray_sym_intern("f", 1);
+    int64_t ncols  = ray_table_ncols(tbl);
+    int64_t slot   = -1;
+    for (int64_t i = 0; i < ncols; i++) {
+        if (ray_table_col_name(tbl, i) == sym_id) { slot = i; break; }
+    }
+    TEST_ASSERT(slot >= 0, "f column not found");
+    ray_t* fv = ray_table_get_col_idx(tbl, slot);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(fv));
+    ray_t* fw = fv;
+    ray_retain(fw);
+    ray_t* zr = ray_index_attach_zone(&fw);
+    TEST_ASSERT(zr && !RAY_IS_ERR(zr), "attach_zone f64");
+    ray_table_set_col_idx(tbl, slot, fw);
+    ray_release(fw);
+
+    uint64_t hits_before     = ray_idx_hits[IDX_SITE_FILTER_ZONE];
+    uint64_t consults_before = ray_idx_consults[IDX_SITE_FILTER_ZONE];
+
+    ray_t* r = run_filter(tbl, pred_f_gt_100);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 0);
+
+    /* Zone classified NONE: consult and hit both advance. */
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_consults[IDX_SITE_FILTER_ZONE] - consults_before), 1);
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_hits[IDX_SITE_FILTER_ZONE] - hits_before), 1);
+
+    ray_release(r);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t idx_route_entries[] = {
-    { "idx_route/hash_eq_still_works", test_hash_eq_still_works,  NULL, NULL },
-    { "idx_route/zone_none",           test_zone_none,            NULL, NULL },
-    { "idx_route/zone_all",            test_zone_all,             NULL, NULL },
-    { "idx_route/zone_unknown",        test_zone_unknown,         NULL, NULL },
-    { "idx_route/zone_nulls_excluded", test_zone_nulls_excluded,  NULL, NULL },
+    { "idx_route/hash_eq_still_works",   test_hash_eq_still_works,   NULL, NULL },
+    { "idx_route/zone_none",             test_zone_none,             NULL, NULL },
+    { "idx_route/zone_all",              test_zone_all,              NULL, NULL },
+    { "idx_route/zone_unknown",          test_zone_unknown,          NULL, NULL },
+    { "idx_route/zone_nulls_excluded",   test_zone_nulls_excluded,   NULL, NULL },
+    { "idx_route/zone_le_all_boundary",  test_zone_le_all_boundary,  NULL, NULL },
+    { "idx_route/zone_ge_all_boundary",  test_zone_ge_all_boundary,  NULL, NULL },
+    { "idx_route/zone_ne_all",           test_zone_ne_all,           NULL, NULL },
+    { "idx_route/zone_eq_none_boundary", test_zone_eq_none_boundary, NULL, NULL },
+    { "idx_route/zone_f64_none",         test_zone_f64_none,         NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
