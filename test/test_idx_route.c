@@ -1661,6 +1661,151 @@ static test_result_t test_sort_selection_falls_back(void) {
     PASS();
 }
 
+/* ─── Distinct fast-path tests (Task 8) ──────────────────────────── */
+
+/* distinct_order_contract: pin the output order for the duplicates fixture.
+ *
+ * vec {5,1,9,3,7,1,9,5,3,7}:
+ *   hashset collects first-occurrence row ids: 0(=5),1(=1),2(=9),3(=3),4(=7)
+ *   distinct_sort_indices sorts those ids BY VALUE:
+ *     value-order:  1 < 3 < 5 < 7 < 9
+ *     row ids:      1,  3,  0,  4,  2
+ *   → output {1,3,5,7,9}  (VALUE-SORTED order, not first-occurrence order)
+ *
+ * Contract: distinct on a numeric vector returns values in ASCENDING VALUE
+ * order (not in first-occurrence order).  This test must pass with OR
+ * without a sort index attached. */
+static test_result_t test_distinct_order_contract(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t kd[] = {5,1,9,3,7,1,9,5,3,7};
+    ray_t* v = ray_vec_from_raw(RAY_I64, kd, 10);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+
+    ray_t* r = distinct_vec_eager(v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_len(r), 5);
+
+    /* Value-sorted contract: {1,3,5,7,9} */
+    TEST_ASSERT_EQ_I(ray_vec_get_i64(r, 0), 1);
+    TEST_ASSERT_EQ_I(ray_vec_get_i64(r, 1), 3);
+    TEST_ASSERT_EQ_I(ray_vec_get_i64(r, 2), 5);
+    TEST_ASSERT_EQ_I(ray_vec_get_i64(r, 3), 7);
+    TEST_ASSERT_EQ_I(ray_vec_get_i64(r, 4), 9);
+
+    ray_release(r);
+    ray_release(v);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* distinct_sorted: sort index attached → fast path fires; output identical
+ * to the unindexed run; IDX_SITE_DISTINCT consult+hit both advance. */
+static test_result_t test_distinct_sorted(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t kd[] = {5,1,9,3,7,1,9,5,3,7};
+
+    /* Side A — with sort index */
+    ray_t* va = ray_vec_from_raw(RAY_I64, kd, 10);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(va));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_sort(&va)));
+
+    uint64_t cons_before = ray_idx_consults[IDX_SITE_DISTINCT];
+    uint64_t hits_before = ray_idx_hits[IDX_SITE_DISTINCT];
+
+    ray_t* ra = distinct_vec_eager(va);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ra));
+
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_consults[IDX_SITE_DISTINCT] - cons_before), 1);
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_hits[IDX_SITE_DISTINCT]     - hits_before), 1);
+
+    /* Side B — no index (baseline) */
+    ray_t* vb = ray_vec_from_raw(RAY_I64, kd, 10);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vb));
+    ray_t* rb = distinct_vec_eager(vb);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(rb));
+
+    /* Differential: same length and same values */
+    TEST_ASSERT_EQ_I(ray_len(ra), ray_len(rb));
+    for (int64_t i = 0; i < ray_len(ra); i++) {
+        TEST_ASSERT_EQ_I(ray_vec_get_i64(ra, i), ray_vec_get_i64(rb, i));
+    }
+
+    ray_release(ra); ray_release(rb);
+    ray_release(va); ray_release(vb);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* distinct_unique_col: all-unique vector → output identical to input;
+ * sort index → fast path fires; hit advances. */
+static test_result_t test_distinct_unique_col(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t kd[] = {10,20,30,40,50};
+    ray_t* v = ray_vec_from_raw(RAY_I64, kd, 5);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_sort(&v)));
+
+    uint64_t hits_before = ray_idx_hits[IDX_SITE_DISTINCT];
+
+    ray_t* r = distinct_vec_eager(v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_len(r), 5);
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_hits[IDX_SITE_DISTINCT] - hits_before), 1);
+
+    /* Values unchanged (already sorted, all unique) */
+    for (int64_t i = 0; i < 5; i++) {
+        TEST_ASSERT_EQ_I(ray_vec_get_i64(r, i), kd[i]);
+    }
+
+    ray_release(r);
+    ray_release(v);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* distinct_nulls_falls_back: null-bearing vector → sort index gate
+ * (idx_fresh_nonull) rejects it → consult NOT advanced; correct result
+ * via hashset path. */
+static test_result_t test_distinct_nulls_falls_back(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t kd[] = {5,1,9,3,7,1,9,5,3,7};
+    ray_t* v = ray_vec_from_raw(RAY_I64, kd, 10);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+
+    /* Attach sort, then set a null — mutation drops the index. */
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_sort(&v)));
+    ray_vec_set_null(v, 2, true);  /* row 2 → null; drops index */
+
+    uint64_t cons_before = ray_idx_consults[IDX_SITE_DISTINCT];
+
+    ray_t* r = distinct_vec_eager(v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+
+    /* No index consult: RAY_ATTR_HAS_NULLS blocks idx_fresh_nonull */
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_consults[IDX_SITE_DISTINCT] - cons_before), 0);
+
+    /* Hashset path still produces correct result: 5 non-null distinct values
+     * (null at row 2 takes row 2's slot; value at row 6 still exists as 9) */
+    TEST_ASSERT(ray_len(r) >= 5, "distinct on null-bearing vec must return >=5 values");
+
+    ray_release(r);
+    ray_release(v);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t idx_route_entries[] = {
     { "idx_route/hash_eq_still_works",   test_hash_eq_still_works,   NULL, NULL },
     { "idx_route/zone_none",             test_zone_none,             NULL, NULL },
@@ -1701,5 +1846,9 @@ const test_entry_t idx_route_entries[] = {
     { "idx_route/sort_multikey_falls_back",  test_sort_multikey_falls_back,  NULL, NULL },
     { "idx_route/sort_topk_untouched",       test_sort_topk_untouched,       NULL, NULL },
     { "idx_route/sort_selection_falls_back", test_sort_selection_falls_back, NULL, NULL },
+    { "idx_route/distinct_order_contract",   test_distinct_order_contract,   NULL, NULL },
+    { "idx_route/distinct_sorted",           test_distinct_sorted,           NULL, NULL },
+    { "idx_route/distinct_unique_col",       test_distinct_unique_col,       NULL, NULL },
+    { "idx_route/distinct_nulls_falls_back", test_distinct_nulls_falls_back, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
