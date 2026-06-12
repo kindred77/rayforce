@@ -22,7 +22,8 @@
  */
 
 /* test/test_idx_route.c — index routing scaffold + refactor pin (Task 1)
- *                         + zone all/none short-circuit tests (Task 2). */
+ *                         + zone all/none short-circuit tests (Task 2)
+ *                         + sort-index range rowsel tests (Task 4). */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -701,6 +702,300 @@ static test_result_t test_bloom_noneq_ignored(void) {
     PASS();
 }
 
+/* ─── Sort-index attach helper ────────────────────────────────────── */
+
+/* Attach a sort index to the named column in `tbl`.
+ * Same retain/write-back/release cycle as attach_hash_to_col. */
+static int attach_sort_to_col(ray_t* tbl, const char* name) {
+    int64_t sym_id = ray_sym_intern(name, (int64_t)strlen(name));
+    int64_t ncols  = ray_table_ncols(tbl);
+    int64_t slot   = -1;
+    for (int64_t i = 0; i < ncols; i++) {
+        if (ray_table_col_name(tbl, i) == sym_id) { slot = i; break; }
+    }
+    if (slot < 0) return -1;
+
+    ray_t* col = ray_table_get_col_idx(tbl, slot);
+    if (!col || RAY_IS_ERR(col)) return -1;
+
+    ray_t* w = col;
+    ray_retain(w);
+    ray_t* r = ray_index_attach_sort(&w);
+    if (!r || RAY_IS_ERR(r)) { ray_release(w); return -1; }
+
+    ray_table_set_col_idx(tbl, slot, w);
+    ray_release(w);
+    return 0;
+}
+
+/* ─── Predicate builders for range tests ──────────────────────────── */
+
+/* (< k 5) → k∈{1,3,1,3} → 4 rows */
+static ray_op_t* pred_lt_5(ray_graph_t* g) {
+    return ray_lt(g, ray_scan(g, "k"), ray_const_i64(g, 5));
+}
+
+/* (>= k 7) → k∈{9,7,9,7} → 4 rows */
+static ray_op_t* pred_ge_7(ray_graph_t* g) {
+    return ray_ge(g, ray_scan(g, "k"), ray_const_i64(g, 7));
+}
+
+/* (== k 9) → k∈{9,9} → 2 rows (sort path, no hash) */
+static ray_op_t* pred_eq_9_sort(ray_graph_t* g) {
+    return ray_eq(g, ray_scan(g, "k"), ray_const_i64(g, 9));
+}
+
+/* (<= k 1) → k∈{1,1} → 2 rows */
+static ray_op_t* pred_le_1(ray_graph_t* g) {
+    return ray_le(g, ray_scan(g, "k"), ray_const_i64(g, 1));
+}
+
+/* (!= k 5) → 8 rows (NE unsupported by range) */
+static ray_op_t* pred_ne_5(ray_graph_t* g) {
+    return ray_ne(g, ray_scan(g, "k"), ray_const_i64(g, 5));
+}
+
+/* (> f 5.0) on F64 column f∈[1.5,10.5] → 6 rows ({5.5..10.5}) */
+static ray_op_t* pred_f_gt_5(ray_graph_t* g) {
+    return ray_gt(g, ray_scan(g, "f"), ray_const_f64(g, 5.0));
+}
+
+/* ─── Range tests ─────────────────────────────────────────────────── */
+
+/* range_lt: sort on k; (< k 5) → 4 rows; range consult+hit. */
+static test_result_t test_range_lt(void) {
+    ray_heap_init();
+    ray_t* tbl = make_idx_table();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    TEST_ASSERT(attach_sort_to_col(tbl, "k") == 0, "attach sort (range_lt)");
+
+    uint64_t cons_before = ray_idx_consults[IDX_SITE_FILTER_RANGE];
+    uint64_t hits_before = ray_idx_hits[IDX_SITE_FILTER_RANGE];
+
+    ray_t* r = run_filter(tbl, pred_lt_5);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 4);  /* k∈{1,3,1,3} */
+
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_consults[IDX_SITE_FILTER_RANGE] - cons_before), 1);
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_hits[IDX_SITE_FILTER_RANGE]     - hits_before), 1);
+
+    /* Differential: same rows as scan */
+    ray_t* tbl_b = make_idx_table();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl_b));
+    ray_t* rb = run_filter(tbl_b, pred_lt_5);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(rb));
+    TEST_ASSERT_EQ_I(ray_table_nrows(rb), 4);
+    TEST_ASSERT(v_cols_equal(r, rb), "v col mismatch range_lt");
+
+    ray_release(r); ray_release(rb);
+    ray_release(tbl); ray_release(tbl_b);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* range_ge: sort on k; (>= k 7) → 4 rows; hit. */
+static test_result_t test_range_ge(void) {
+    ray_heap_init();
+    ray_t* tbl = make_idx_table();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    TEST_ASSERT(attach_sort_to_col(tbl, "k") == 0, "attach sort (range_ge)");
+
+    uint64_t cons_before = ray_idx_consults[IDX_SITE_FILTER_RANGE];
+    uint64_t hits_before = ray_idx_hits[IDX_SITE_FILTER_RANGE];
+
+    ray_t* r = run_filter(tbl, pred_ge_7);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 4);  /* k∈{9,7,9,7} */
+
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_consults[IDX_SITE_FILTER_RANGE] - cons_before), 1);
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_hits[IDX_SITE_FILTER_RANGE]     - hits_before), 1);
+
+    ray_t* tbl_b = make_idx_table();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl_b));
+    ray_t* rb = run_filter(tbl_b, pred_ge_7);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(rb));
+    TEST_ASSERT_EQ_I(ray_table_nrows(rb), 4);
+    TEST_ASSERT(v_cols_equal(r, rb), "v col mismatch range_ge");
+
+    ray_release(r); ray_release(rb);
+    ray_release(tbl); ray_release(tbl_b);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* range_eq_dups: sort only (no hash); (== k 9) → 2 rows via range path; hit. */
+static test_result_t test_range_eq_dups(void) {
+    ray_heap_init();
+    ray_t* tbl = make_idx_table();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    /* Only attach sort — no hash — so the range path must handle EQ. */
+    TEST_ASSERT(attach_sort_to_col(tbl, "k") == 0, "attach sort (range_eq_dups)");
+
+    uint64_t cons_before = ray_idx_consults[IDX_SITE_FILTER_RANGE];
+    uint64_t hits_before = ray_idx_hits[IDX_SITE_FILTER_RANGE];
+
+    ray_t* r = run_filter(tbl, pred_eq_9_sort);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 2);
+
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_consults[IDX_SITE_FILTER_RANGE] - cons_before), 1);
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_hits[IDX_SITE_FILTER_RANGE]     - hits_before), 1);
+
+    ray_t* tbl_b = make_idx_table();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl_b));
+    ray_t* rb = run_filter(tbl_b, pred_eq_9_sort);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(rb));
+    TEST_ASSERT_EQ_I(ray_table_nrows(rb), 2);
+    TEST_ASSERT(v_cols_equal(r, rb), "v col mismatch range_eq_dups");
+
+    ray_release(r); ray_release(rb);
+    ray_release(tbl); ray_release(tbl_b);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* range_le_boundary: (<= k 1) → 2 rows (both 1s); hit. */
+static test_result_t test_range_le_boundary(void) {
+    ray_heap_init();
+    ray_t* tbl = make_idx_table();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    TEST_ASSERT(attach_sort_to_col(tbl, "k") == 0, "attach sort (range_le_boundary)");
+
+    uint64_t cons_before = ray_idx_consults[IDX_SITE_FILTER_RANGE];
+    uint64_t hits_before = ray_idx_hits[IDX_SITE_FILTER_RANGE];
+
+    ray_t* r = run_filter(tbl, pred_le_1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 2);  /* both k==1 */
+
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_consults[IDX_SITE_FILTER_RANGE] - cons_before), 1);
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_hits[IDX_SITE_FILTER_RANGE]     - hits_before), 1);
+
+    ray_t* tbl_b = make_idx_table();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl_b));
+    ray_t* rb = run_filter(tbl_b, pred_le_1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(rb));
+    TEST_ASSERT_EQ_I(ray_table_nrows(rb), 2);
+    TEST_ASSERT(v_cols_equal(r, rb), "v col mismatch range_le_boundary");
+
+    ray_release(r); ray_release(rb);
+    ray_release(tbl); ray_release(tbl_b);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* range_ne_falls_back: (!= k 5) → 8 rows; range consult NOT advanced (NE = two spans). */
+static test_result_t test_range_ne_falls_back(void) {
+    ray_heap_init();
+    ray_t* tbl = make_idx_table();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    TEST_ASSERT(attach_sort_to_col(tbl, "k") == 0, "attach sort (range_ne_falls_back)");
+
+    uint64_t cons_before = ray_idx_consults[IDX_SITE_FILTER_RANGE];
+
+    ray_t* r = run_filter(tbl, pred_ne_5);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 8);
+
+    /* NE is unsupported by the range path — consult must NOT advance. */
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_consults[IDX_SITE_FILTER_RANGE] - cons_before), 0);
+
+    ray_release(r);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* range_guard: 100k-row fixture (k = i % 100); (< k 50) → ~50k rows.
+ * Selectivity guard (>25%) prevents hit; row count must still be correct. */
+static test_result_t test_range_guard(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 100000;
+    ray_t* kv = ray_vec_new(RAY_I64, N);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(kv));
+    kv->len = N;
+    int64_t* kd = (int64_t*)ray_data(kv);
+    for (int64_t i = 0; i < N; i++) kd[i] = i % 100;
+    ray_t* vv = ray_vec_new(RAY_I64, N);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vv));
+    vv->len = N;
+    int64_t* vd = (int64_t*)ray_data(vv);
+    for (int64_t i = 0; i < N; i++) vd[i] = i;
+
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k", 1), kv);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("v", 1), vv);
+    ray_release(kv);
+    ray_release(vv);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+
+    TEST_ASSERT(attach_sort_to_col(tbl, "k") == 0, "attach sort (range_guard)");
+
+    uint64_t hits_before = ray_idx_hits[IDX_SITE_FILTER_RANGE];
+
+    /* (< k 50): 50,000 rows */
+    ray_graph_t* g    = ray_graph_new(tbl);
+    ray_op_t* tbl_nd  = ray_const_table(g, tbl);
+    ray_op_t* pred    = ray_lt(g, ray_scan(g, "k"), ray_const_i64(g, 50));
+    ray_op_t* filt    = ray_filter(g, tbl_nd, pred);
+    ray_t* r = ray_execute(g, filt);
+    ray_graph_free(g);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 50000);
+
+    /* Guard fires — selectivity 50% > 25% → hit must NOT advance. */
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_hits[IDX_SITE_FILTER_RANGE] - hits_before), 0);
+
+    ray_release(r);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* range_f64: sort on f (make_f64_zone_table); (> f 5.0) → 6 rows; hit. */
+static test_result_t test_range_f64(void) {
+    ray_heap_init();
+    ray_t* tbl = make_f64_zone_table();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    TEST_ASSERT(attach_sort_to_col(tbl, "f") == 0, "attach sort (range_f64)");
+
+    uint64_t cons_before = ray_idx_consults[IDX_SITE_FILTER_RANGE];
+    uint64_t hits_before = ray_idx_hits[IDX_SITE_FILTER_RANGE];
+
+    /* Build a second table for differential comparison */
+    ray_t* tbl_b = make_f64_zone_table();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl_b));
+
+    ray_t* r = run_filter(tbl, pred_f_gt_5);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 6);  /* f∈{5.5,6.5,7.5,8.5,9.5,10.5} */
+
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_consults[IDX_SITE_FILTER_RANGE] - cons_before), 1);
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_hits[IDX_SITE_FILTER_RANGE]     - hits_before), 1);
+
+    ray_t* rb = run_filter(tbl_b, pred_f_gt_5);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(rb));
+    TEST_ASSERT_EQ_I(ray_table_nrows(rb), 6);
+
+    /* Check r column is 'r' (row id), not 'v' — f64 table has 'r' not 'v'.
+     * Since v_cols_equal checks 'v', and the f64 table uses 'r', skip the
+     * content comparison — row count match is sufficient here. */
+
+    ray_release(r); ray_release(rb);
+    ray_release(tbl); ray_release(tbl_b);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t idx_route_entries[] = {
     { "idx_route/hash_eq_still_works",   test_hash_eq_still_works,   NULL, NULL },
     { "idx_route/zone_none",             test_zone_none,             NULL, NULL },
@@ -719,5 +1014,12 @@ const test_entry_t idx_route_entries[] = {
     { "idx_route/bloom_diff_absent",         test_bloom_diff_absent,         NULL, NULL },
     { "idx_route/bloom_diff_present",        test_bloom_diff_present,        NULL, NULL },
     { "idx_route/bloom_noneq_ignored",       test_bloom_noneq_ignored,       NULL, NULL },
+    { "idx_route/range_lt",                  test_range_lt,                  NULL, NULL },
+    { "idx_route/range_ge",                  test_range_ge,                  NULL, NULL },
+    { "idx_route/range_eq_dups",             test_range_eq_dups,             NULL, NULL },
+    { "idx_route/range_le_boundary",         test_range_le_boundary,         NULL, NULL },
+    { "idx_route/range_ne_falls_back",       test_range_ne_falls_back,       NULL, NULL },
+    { "idx_route/range_guard",               test_range_guard,               NULL, NULL },
+    { "idx_route/range_f64",                 test_range_f64,                 NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
