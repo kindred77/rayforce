@@ -48,6 +48,7 @@
 #include "lang/eval.h"
 #include "lang/format.h"
 #include "ops/internal.h"
+#include "ops/idxop.h"
 
 /* Forward-declare runtime API — mirrors existing test_lang.c pattern. */
 struct ray_runtime_s;
@@ -119,6 +120,7 @@ extern const test_entry_t fused_topk_entries[];
 extern const test_entry_t hash_entries[];
 extern const test_entry_t heap_entries[];
 extern const test_entry_t heap_parallel_entries[];
+extern const test_entry_t idx_route_entries[];
 extern const test_entry_t index_entries[];
 extern const test_entry_t ipc_entries[];
 extern const test_entry_t journal_entries[];
@@ -170,6 +172,7 @@ static const test_entry_t* const compiled_groups[] = {
     hash_entries,
     heap_entries,
     heap_parallel_entries,
+    idx_route_entries,
     index_entries,    ipc_entries,
     journal_entries,
     lang_entries,     link_entries,
@@ -663,6 +666,7 @@ static int name_matches_filter(const char* name, const char* filter) {
 
 int main(int argc, char** argv) {
     ray_expr_stats_init();
+    ray_idx_stats_init();
     g_color = isatty(fileno(stdout));
 
     const char* filter = NULL;
