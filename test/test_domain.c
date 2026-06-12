@@ -158,8 +158,9 @@ static test_result_t test_domain_append_growth_and_cow(void) {
     TEST_ASSERT_EQ_PTR(w->sym_domain, rt);
     TEST_ASSERT_EQ_PTR(v->sym_domain, rt);
 
+    /* ray_vec_append COW'd the shared vec and already dropped the extra
+     * retain via ray_cow's release — one release here drops our ref. */
     ray_release(w);
-    ray_release(v);  /* drops the extra retain */
     ray_release(v);
     PASS();
 }

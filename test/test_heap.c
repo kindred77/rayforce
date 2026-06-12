@@ -673,7 +673,9 @@ static test_result_t test_mapcommon_owned_ref(void) {
     ray_t** slots = (ray_t**)ray_data(mc);
     slots[0] = a;
     slots[1] = b;
-    /* mc takes the only refs; we already own one each. */
+    /* mc owns a ref to each child (released on free); keep our own too. */
+    ray_retain(a);
+    ray_retain(b);
 
     uint32_t a_rc = a->rc, b_rc = b->rc;
 
@@ -801,7 +803,9 @@ static test_result_t test_alloc_copy_table_block(void) {
     tbl->len  = 0;
     ray_t** slots = (ray_t**)ray_data(tbl);
     slots[0] = schema; slots[1] = cols;
-    /* tbl owns one ref each — we already have one ref each from alloc. */
+    /* tbl owns a ref to each child (released on free); keep our own too. */
+    ray_retain(schema);
+    ray_retain(cols);
 
     uint32_t s_rc = schema->rc, c_rc = cols->rc;
 
@@ -1020,6 +1024,9 @@ static test_result_t test_alloc_copy_dict_block(void) {
     dict->len  = 0;
     ray_t** sl = (ray_t**)ray_data(dict);
     sl[0] = keys; sl[1] = vals;
+    /* dict owns a ref to each child (released on free); keep our own too. */
+    ray_retain(keys);
+    ray_retain(vals);
 
     uint32_t k_rc = keys->rc, v_rc = vals->rc;
 

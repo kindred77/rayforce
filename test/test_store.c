@@ -2048,7 +2048,7 @@ static test_result_t test_serde_table_roundtrip(void) {
     TEST_ASSERT_EQ_I(outd[0], 10);
     TEST_ASSERT_EQ_I(outd[1], 20);
     TEST_ASSERT_EQ_I(outd[2], 30);
-    ray_release(col_out);
+    /* col_out is a borrowed pointer (ray_table_get_col does not retain) */
 
     ray_release(b); ray_release(w); ray_release(tbl);
     PASS();
@@ -2358,10 +2358,8 @@ static test_result_t test_serde_list_with_null_elem(void) {
     TEST_ASSERT_TRUE(RAY_IS_NULL(be[1]));
 
     ray_release(b); ray_release(w);
-    /* Release list elements manually since list owns them */
-    ray_release(elems[0]);
-    /* elems[1] is RAY_NULL_OBJ — do not release */
-    ray_release(elems[2]);
+    /* The list owns the element refs — releasing it releases them.
+     * (RAY_NULL_OBJ at [1] is ARENA-flagged; release is a no-op.) */
     ray_release(list);
     PASS();
 }
