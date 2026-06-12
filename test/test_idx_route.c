@@ -214,6 +214,30 @@ static test_result_t diff_idx_filter(pred_builder_t build_pred,
     PASS();
 }
 
+/* Attach a bloom index to the named column in `tbl`.
+ * Same retain/write-back/release cycle as attach_hash_to_col. */
+static int attach_bloom_to_col(ray_t* tbl, const char* name) {
+    int64_t sym_id = ray_sym_intern(name, (int64_t)strlen(name));
+    int64_t ncols  = ray_table_ncols(tbl);
+    int64_t slot   = -1;
+    for (int64_t i = 0; i < ncols; i++) {
+        if (ray_table_col_name(tbl, i) == sym_id) { slot = i; break; }
+    }
+    if (slot < 0) return -1;
+
+    ray_t* col = ray_table_get_col_idx(tbl, slot);
+    if (!col || RAY_IS_ERR(col)) return -1;
+
+    ray_t* w = col;
+    ray_retain(w);
+    ray_t* r = ray_index_attach_bloom(&w);
+    if (!r || RAY_IS_ERR(r)) { ray_release(w); return -1; }
+
+    ray_table_set_col_idx(tbl, slot, w);
+    ray_release(w);
+    return 0;
+}
+
 /* ─── Predicate builders for zone tests ──────────────────────────── */
 
 /* (> k 100) — no k in [1,9] satisfies this → 0 rows */
@@ -513,6 +537,170 @@ static test_result_t test_zone_int_col_float_literal(void) {
                            /*expect_zone_consult=*/0);
 }
 
+/* ─── Predicate builders for bloom tests ─────────────────────────── */
+
+/* (== k 4) — k∈{1,3,5,7,9}: 4 is absent, inside [min=1,max=9].
+ * Bloom must prove absence; zone alone cannot (zone [1,9] contains 4). */
+static ray_op_t* pred_eq_4(ray_graph_t* g) {
+    return ray_eq(g, ray_scan(g, "k"), ray_const_i64(g, 4));
+}
+
+/* (== k 9) — k∈{5,1,9,3,7,1,9,5,3,7}: 9 is present at rows 2 and 6 → 2 rows. */
+static ray_op_t* pred_eq_9(ray_graph_t* g) {
+    return ray_eq(g, ray_scan(g, "k"), ray_const_i64(g, 9));
+}
+
+/* (> k 4) — k∈{5,9,7,9,5,7}: 6 rows.  Bloom is EQ-only, must not be consulted. */
+static ray_op_t* pred_gt_4(ray_graph_t* g) {
+    return ray_gt(g, ray_scan(g, "k"), ray_const_i64(g, 4));
+}
+
+/* ─── Bloom tests ─────────────────────────────────────────────────── */
+
+/* bloom_absent: bloom on k; pred (== k 4); k∈{1,3,5,7,9} so 4 is absent.
+ * Bloom proves absent → 0 rows, consult and hit both advance. */
+static test_result_t test_bloom_absent(void) {
+    ray_heap_init();
+    ray_t* tbl = make_idx_table();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+
+    int ok = attach_bloom_to_col(tbl, "k");
+    TEST_ASSERT(ok == 0, "attach_bloom_to_col k");
+
+    uint64_t consults_before = ray_idx_consults[IDX_SITE_FILTER_BLOOM];
+    uint64_t hits_before     = ray_idx_hits[IDX_SITE_FILTER_BLOOM];
+
+    ray_t* r = run_filter(tbl, pred_eq_4);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 0);
+
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_consults[IDX_SITE_FILTER_BLOOM] - consults_before), 1);
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_hits[IDX_SITE_FILTER_BLOOM]     - hits_before),     1);
+
+    ray_release(r);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* bloom_present_falls_through: bloom on k; pred (== k 9); 9 is present.
+ * Bloom cannot prove absence → falls through to scan → 2 rows.
+ * Consult advances, hit must NOT. */
+static test_result_t test_bloom_present_falls_through(void) {
+    ray_heap_init();
+    ray_t* tbl = make_idx_table();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+
+    int ok = attach_bloom_to_col(tbl, "k");
+    TEST_ASSERT(ok == 0, "attach_bloom_to_col k");
+
+    uint64_t consults_before = ray_idx_consults[IDX_SITE_FILTER_BLOOM];
+    uint64_t hits_before     = ray_idx_hits[IDX_SITE_FILTER_BLOOM];
+
+    ray_t* r = run_filter(tbl, pred_eq_9);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 2);
+
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_consults[IDX_SITE_FILTER_BLOOM] - consults_before), 1);
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_hits[IDX_SITE_FILTER_BLOOM]     - hits_before),     0);
+
+    ray_release(r);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* bloom_diff_absent: differential — bloom-indexed vs no-index for (== k 4).
+ * Bloom fires, same 0 rows, same v-values (trivially). */
+static test_result_t test_bloom_diff_absent(void) {
+    /* Side A — with bloom */
+    ray_heap_init();
+    ray_t* tbl_a = make_idx_table();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl_a));
+    TEST_ASSERT(attach_bloom_to_col(tbl_a, "k") == 0, "attach bloom (side A)");
+
+    uint64_t hits_before     = ray_idx_hits[IDX_SITE_FILTER_BLOOM];
+    uint64_t consults_before = ray_idx_consults[IDX_SITE_FILTER_BLOOM];
+    ray_t* ra = run_filter(tbl_a, pred_eq_4);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ra));
+    TEST_ASSERT_EQ_I(ray_table_nrows(ra), 0);
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_hits[IDX_SITE_FILTER_BLOOM]     - hits_before),     1);
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_consults[IDX_SITE_FILTER_BLOOM] - consults_before), 1);
+
+    /* Side B — no index */
+    ray_t* tbl_b = make_idx_table();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl_b));
+    ray_t* rb = run_filter(tbl_b, pred_eq_4);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(rb));
+    TEST_ASSERT_EQ_I(ray_table_nrows(rb), 0);
+    TEST_ASSERT(v_cols_equal(ra, rb), "v column mismatch");
+
+    ray_release(ra); ray_release(rb);
+    ray_release(tbl_a); ray_release(tbl_b);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* bloom_diff_present: differential — bloom-indexed vs no-index for (== k 9).
+ * Bloom does NOT hit (present), scan produces same 2 rows. */
+static test_result_t test_bloom_diff_present(void) {
+    /* Side A — with bloom */
+    ray_heap_init();
+    ray_t* tbl_a = make_idx_table();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl_a));
+    TEST_ASSERT(attach_bloom_to_col(tbl_a, "k") == 0, "attach bloom (side A)");
+
+    uint64_t hits_before     = ray_idx_hits[IDX_SITE_FILTER_BLOOM];
+    uint64_t consults_before = ray_idx_consults[IDX_SITE_FILTER_BLOOM];
+    ray_t* ra = run_filter(tbl_a, pred_eq_9);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ra));
+    TEST_ASSERT_EQ_I(ray_table_nrows(ra), 2);
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_hits[IDX_SITE_FILTER_BLOOM]     - hits_before),     0);
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_consults[IDX_SITE_FILTER_BLOOM] - consults_before), 1);
+
+    /* Side B — no index */
+    ray_t* tbl_b = make_idx_table();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl_b));
+    ray_t* rb = run_filter(tbl_b, pred_eq_9);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(rb));
+    TEST_ASSERT_EQ_I(ray_table_nrows(rb), 2);
+    TEST_ASSERT(v_cols_equal(ra, rb), "v column mismatch");
+
+    ray_release(ra); ray_release(rb);
+    ray_release(tbl_a); ray_release(tbl_b);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* bloom_noneq_ignored: bloom on k; pred (> k 4).
+ * Bloom is EQ-only: consult must NOT advance; correct 6 rows via scan. */
+static test_result_t test_bloom_noneq_ignored(void) {
+    ray_heap_init();
+    ray_t* tbl = make_idx_table();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+
+    int ok = attach_bloom_to_col(tbl, "k");
+    TEST_ASSERT(ok == 0, "attach_bloom_to_col k");
+
+    uint64_t consults_before = ray_idx_consults[IDX_SITE_FILTER_BLOOM];
+
+    ray_t* r = run_filter(tbl, pred_gt_4);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 6);   /* k∈{5,9,7,9,5,7} */
+
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_consults[IDX_SITE_FILTER_BLOOM] - consults_before), 0);
+
+    ray_release(r);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t idx_route_entries[] = {
     { "idx_route/hash_eq_still_works",   test_hash_eq_still_works,   NULL, NULL },
     { "idx_route/zone_none",             test_zone_none,             NULL, NULL },
@@ -526,5 +714,10 @@ const test_entry_t idx_route_entries[] = {
     { "idx_route/zone_f64_none",         test_zone_f64_none,         NULL, NULL },
     { "idx_route/zone_f64_int_literal",  test_zone_f64_int_literal,  NULL, NULL },
     { "idx_route/zone_int_col_float_literal", test_zone_int_col_float_literal, NULL, NULL },
+    { "idx_route/bloom_absent",              test_bloom_absent,              NULL, NULL },
+    { "idx_route/bloom_present_falls_through", test_bloom_present_falls_through, NULL, NULL },
+    { "idx_route/bloom_diff_absent",         test_bloom_diff_absent,         NULL, NULL },
+    { "idx_route/bloom_diff_present",        test_bloom_diff_present,        NULL, NULL },
+    { "idx_route/bloom_noneq_ignored",       test_bloom_noneq_ignored,       NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
