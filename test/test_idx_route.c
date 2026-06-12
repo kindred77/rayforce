@@ -1453,6 +1453,214 @@ static test_result_t test_find_nulls_falls_back(void) {
     PASS();
 }
 
+/* ─── Sort-index ORDER BY tests (Task 7) ─────────────────────────── */
+
+/* Run ORDER BY on `tbl` using sort key col_name (asc when desc==0,
+ * desc when desc==1).  Returns a new table (owned by caller). */
+static ray_t* run_sort(ray_t* tbl, const char* col_name, uint8_t is_desc) {
+    ray_graph_t* g   = ray_graph_new(tbl);
+    ray_op_t* tbl_nd = ray_const_table(g, tbl);
+    ray_op_t* skeys[1] = { ray_scan(g, col_name) };
+    uint8_t descs[1]   = { is_desc };
+    ray_op_t* sorted   = ray_sort_op(g, tbl_nd, skeys, descs, NULL, 1);
+    ray_t* result      = ray_execute(g, sorted);
+    ray_graph_free(g);
+    return result;
+}
+
+/* Run ORDER BY two keys on `tbl`.  Returns a new table (owned by caller). */
+static ray_t* run_sort2(ray_t* tbl, const char* col_a, const char* col_b) {
+    ray_graph_t* g    = ray_graph_new(tbl);
+    ray_op_t* tbl_nd  = ray_const_table(g, tbl);
+    ray_op_t* skeys[2] = { ray_scan(g, col_a), ray_scan(g, col_b) };
+    uint8_t descs[2]   = { 0, 0 };
+    ray_op_t* sorted   = ray_sort_op(g, tbl_nd, skeys, descs, NULL, 2);
+    ray_t* result      = ray_execute(g, sorted);
+    ray_graph_free(g);
+    return result;
+}
+
+/* Compare two result tables row-by-row across ALL columns.
+ * Returns 1 iff every column value matches in every row. */
+static int tables_equal(ray_t* ra, ray_t* rb) {
+    int64_t nr_a = ray_table_nrows(ra);
+    int64_t nr_b = ray_table_nrows(rb);
+    if (nr_a != nr_b) return 0;
+    int64_t nc = ray_table_ncols(ra);
+    if (nc != ray_table_ncols(rb)) return 0;
+    for (int64_t c = 0; c < nc; c++) {
+        ray_t* va = ray_table_get_col_idx(ra, c);
+        ray_t* vb = ray_table_get_col_idx(rb, c);
+        if (!va || !vb) continue;
+        for (int64_t r = 0; r < nr_a; r++) {
+            if (ray_vec_get_i64(va, r) != ray_vec_get_i64(vb, r)) return 0;
+        }
+    }
+    return 1;
+}
+
+/* sort_asc: sort index on k; ORDER BY k ASC → indexed path reuses perm;
+ * consult+hit advance; results identical to unindexed sort. */
+static test_result_t test_sort_asc(void) {
+    ray_heap_init();
+    ray_t* tbl_idx = make_idx_table();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl_idx));
+    TEST_ASSERT(attach_sort_to_col(tbl_idx, "k") == 0, "attach sort (sort_asc)");
+
+    uint64_t cons_before = ray_idx_consults[IDX_SITE_SORT];
+    uint64_t hits_before = ray_idx_hits[IDX_SITE_SORT];
+
+    ray_t* r_idx = run_sort(tbl_idx, "k", 0);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r_idx));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r_idx), 10);
+
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_consults[IDX_SITE_SORT] - cons_before), 1);
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_hits[IDX_SITE_SORT]     - hits_before), 1);
+
+    /* Differential: results must match unindexed sort */
+    ray_t* tbl_ref = make_idx_table();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl_ref));
+    ray_t* r_ref = run_sort(tbl_ref, "k", 0);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r_ref));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r_ref), 10);
+    TEST_ASSERT(tables_equal(r_idx, r_ref), "indexed asc sort must match reference");
+
+    ray_release(r_idx); ray_release(r_ref);
+    ray_release(tbl_idx); ray_release(tbl_ref);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* sort_desc: ORDER BY k DESC → fast path NOT taken (asc-only restriction);
+ * consult NOT advanced; results identical to unindexed desc sort. */
+static test_result_t test_sort_desc(void) {
+    ray_heap_init();
+    ray_t* tbl_idx = make_idx_table();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl_idx));
+    TEST_ASSERT(attach_sort_to_col(tbl_idx, "k") == 0, "attach sort (sort_desc)");
+
+    uint64_t cons_before = ray_idx_consults[IDX_SITE_SORT];
+
+    ray_t* r_idx = run_sort(tbl_idx, "k", 1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r_idx));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r_idx), 10);
+
+    /* No consult: DESC is excluded from the fast path */
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_consults[IDX_SITE_SORT] - cons_before), 0);
+
+    /* Differential: results must still match unindexed desc sort */
+    ray_t* tbl_ref = make_idx_table();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl_ref));
+    ray_t* r_ref = run_sort(tbl_ref, "k", 1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r_ref));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r_ref), 10);
+    TEST_ASSERT(tables_equal(r_idx, r_ref), "indexed desc sort must match reference");
+
+    ray_release(r_idx); ray_release(r_ref);
+    ray_release(tbl_idx); ray_release(tbl_ref);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* sort_multikey_falls_back: two sort keys → fast path not taken;
+ * consult NOT advanced. */
+static test_result_t test_sort_multikey_falls_back(void) {
+    ray_heap_init();
+    ray_t* tbl = make_idx_table();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    TEST_ASSERT(attach_sort_to_col(tbl, "k") == 0, "attach sort (multikey)");
+
+    uint64_t cons_before = ray_idx_consults[IDX_SITE_SORT];
+
+    ray_t* r = run_sort2(tbl, "k", "v");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 10);
+
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_consults[IDX_SITE_SORT] - cons_before), 0);
+
+    ray_release(r);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* sort_topk_untouched: HEAD(SORT) triggers top-K path which returns before
+ * our sort-index fast path; consult NOT advanced. */
+static test_result_t test_sort_topk_untouched(void) {
+    ray_heap_init();
+    ray_t* tbl = make_idx_table();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    TEST_ASSERT(attach_sort_to_col(tbl, "k") == 0, "attach sort (topk)");
+
+    uint64_t cons_before = ray_idx_consults[IDX_SITE_SORT];
+
+    /* HEAD(3, SORT(k ASC)) — triggers top-K bounded-heap shortcut */
+    ray_graph_t* g   = ray_graph_new(tbl);
+    ray_op_t* tbl_nd = ray_const_table(g, tbl);
+    ray_op_t* skeys[1] = { ray_scan(g, "k") };
+    uint8_t descs[1]   = { 0 };
+    ray_op_t* sorted   = ray_sort_op(g, tbl_nd, skeys, descs, NULL, 1);
+    ray_op_t* headed   = ray_head(g, sorted, 3);
+    ray_t* r           = ray_execute(g, headed);
+    ray_graph_free(g);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 3);
+
+    /* top-K returns before reaching the sort-index fast path */
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_consults[IDX_SITE_SORT] - cons_before), 0);
+
+    ray_release(r);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* sort_selection_falls_back: FILTER then SORT — filter materialises a
+ * selection; exec.c compacts it before exec_sort, so by the time exec_sort
+ * runs g->selection is NULL and the check is vacuous.  The important thing
+ * is that the result is correct (filter + sort produces the right rows). */
+static test_result_t test_sort_selection_falls_back(void) {
+    ray_heap_init();
+    ray_t* tbl = make_idx_table();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    TEST_ASSERT(attach_sort_to_col(tbl, "k") == 0, "attach sort (selection)");
+
+    /* FILTER k >= 5 → {5,9,7,9,5,7} (6 rows), then SORT k ASC */
+    ray_graph_t* g   = ray_graph_new(tbl);
+    ray_op_t* tbl_nd = ray_const_table(g, tbl);
+    ray_op_t* pred   = ray_ge(g, ray_scan(g, "k"), ray_const_i64(g, 5));
+    ray_op_t* filt   = ray_filter(g, tbl_nd, pred);
+    ray_op_t* skeys[1] = { ray_scan(g, "k") };
+    uint8_t descs[1]   = { 0 };
+    ray_op_t* sorted   = ray_sort_op(g, filt, skeys, descs, NULL, 1);
+    ray_t* r           = ray_execute(g, sorted);
+    ray_graph_free(g);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    /* k >= 5 gives rows: {5,9,7,9,5,7} = 6 rows */
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 6);
+
+    /* Verify k column is sorted ascending */
+    int64_t k_sym = ray_sym_intern("k", 1);
+    ray_t* kc = ray_table_get_col(r, k_sym);
+    TEST_ASSERT(kc != NULL, "k column in sort result");
+    for (int64_t i = 1; i < 6; i++) {
+        TEST_ASSERT(ray_vec_get_i64(kc, i-1) <= ray_vec_get_i64(kc, i),
+                    "sorted order violated after filter+sort");
+    }
+
+    ray_release(r);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t idx_route_entries[] = {
     { "idx_route/hash_eq_still_works",   test_hash_eq_still_works,   NULL, NULL },
     { "idx_route/zone_none",             test_zone_none,             NULL, NULL },
@@ -1488,5 +1696,10 @@ const test_entry_t idx_route_entries[] = {
     { "idx_route/find_miss",                 test_find_miss,                 NULL, NULL },
     { "idx_route/find_diff",                 test_find_diff,                 NULL, NULL },
     { "idx_route/find_nulls_falls_back",     test_find_nulls_falls_back,     NULL, NULL },
+    { "idx_route/sort_asc",                  test_sort_asc,                  NULL, NULL },
+    { "idx_route/sort_desc",                 test_sort_desc,                 NULL, NULL },
+    { "idx_route/sort_multikey_falls_back",  test_sort_multikey_falls_back,  NULL, NULL },
+    { "idx_route/sort_topk_untouched",       test_sort_topk_untouched,       NULL, NULL },
+    { "idx_route/sort_selection_falls_back", test_sort_selection_falls_back, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
