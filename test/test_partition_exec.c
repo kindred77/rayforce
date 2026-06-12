@@ -66,20 +66,32 @@ static ray_t* make_mapcommon(ray_t* key_values, ray_t* row_counts) {
     if (!mc) return NULL;
     mc->type = RAY_MAPCOMMON;
     mc->len = 2;
+    /* The container owns a ref to each child (ray_release_owned_refs
+     * releases them on free), so take one — the caller keeps its own
+     * ref and releases it in teardown. */
+    if (key_values) ray_retain(key_values);
+    if (row_counts) ray_retain(row_counts);
     ((ray_t**)ray_data(mc))[0] = key_values;
+    ray_retain(key_values);  /* container owns a ref; teardown releases ours */
     ((ray_t**)ray_data(mc))[1] = row_counts;
+    ray_retain(row_counts);  /* container owns a ref; teardown releases ours */
     return mc;
 }
 
 /* Build a parted column wrapping `n_segs` segment vectors of `base` type.
- * Segments are referenced (not retained) so caller still owns them. */
+ * Each segment is retained — the parted container owns a ref per segment
+ * (released by ray_release_owned_refs on free), and the caller still owns
+ * and releases its own refs in teardown. */
 static ray_t* make_parted(int8_t base, ray_t** segs, int64_t n_segs) {
     ray_t* p = ray_alloc((size_t)n_segs * sizeof(ray_t*));
     if (!p) return NULL;
     p->type = RAY_PARTED_BASE + base;
     p->len = n_segs;
     ray_t** out = (ray_t**)ray_data(p);
-    for (int64_t i = 0; i < n_segs; i++) out[i] = segs[i];
+    for (int64_t i = 0; i < n_segs; i++) {
+        if (segs[i] && !RAY_IS_ERR(segs[i])) ray_retain(segs[i]);
+        out[i] = segs[i];
+    }
     return p;
 }
 
@@ -1831,7 +1843,9 @@ static test_result_t test_filter_parted_esz_mismatch(void) {
     parted_em->type = RAY_PARTED_BASE + RAY_SYM;
     parted_em->len = 2;
     ((ray_t**)ray_data(parted_em))[0] = segs_em[0];
+    ray_retain(segs_em[0]);  /* container owns a ref; teardown releases ours */
     ((ray_t**)ray_data(parted_em))[1] = segs_em[1];
+    ray_retain(segs_em[1]);
 
     /* Flat I64 companion */
     ray_t* flat_em = ray_vec_new(RAY_I64, 10); flat_em->len = 10;
@@ -2384,7 +2398,11 @@ static test_result_t test_parted_gather_col_null_seg(void) {
     parted_ns->type = RAY_PARTED_BASE + RAY_I64;
     parted_ns->len  = N_SEGS;
     ray_t** slot_ns = (ray_t**)ray_data(parted_ns);
-    for (int s = 0; s < N_SEGS; s++) slot_ns[s] = segs_ns[s];
+    for (int s = 0; s < N_SEGS; s++) {
+        slot_ns[s] = segs_ns[s];
+        /* container owns a ref per (non-NULL) segment; teardown releases ours */
+        if (segs_ns[s]) ray_retain(segs_ns[s]);
+    }
 
     /* ray_parted_nrows counts only non-null segs = 75000.
      * The flat companion and pred must also be 75000. */
@@ -2505,7 +2523,9 @@ static test_result_t test_filter_head_parted_esz_skip(void) {
     parted_he->type = RAY_PARTED_BASE + RAY_SYM;
     parted_he->len  = 2;
     ((ray_t**)ray_data(parted_he))[0] = seg_h0;
+    ray_retain(seg_h0);  /* container owns a ref; teardown releases ours */
     ((ray_t**)ray_data(parted_he))[1] = seg_h1;
+    ray_retain(seg_h1);  /* container owns a ref; teardown releases ours */
 
     ray_t* flat_he = ray_vec_new(RAY_I64, 10); flat_he->len = 10;
     int64_t* fhed = (int64_t*)ray_data(flat_he);
@@ -2583,6 +2603,8 @@ static test_result_t test_parted_gather_col_esz_mismatch(void) {
     parted_em2->len  = 4;
     ray_t** slot_em2 = (ray_t**)ray_data(parted_em2);
     slot_em2[0] = seg_a; slot_em2[1] = seg_b; slot_em2[2] = seg_c; slot_em2[3] = seg_d;
+    /* container owns a ref per segment; teardown releases ours */
+    ray_retain(seg_a); ray_retain(seg_b); ray_retain(seg_c); ray_retain(seg_d);
 
     /* Total rows from ray_parted_nrows = 75000 + 100 = 75100 > 65536 */
     const int64_t N = SEG_W16 * 3 + SEG_W8;

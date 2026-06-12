@@ -574,9 +574,12 @@ static test_result_t test_sip_expand(void) {
     ray_op_t* src = ray_const_vec(g, start_vec);
     ray_op_t* expand = ray_expand(g, src, rel, 0);
 
-    /* Attach SIP selection to the expand ext node */
+    /* Attach SIP selection to the expand ext node.  The graph owns a ref
+     * to sip_sel (ray_graph_free releases it), so retain here — the test
+     * keeps and releases its own ref below. */
     for (uint32_t i = 0; i < g->ext_count; i++) {
         if (g->ext_nodes[i] && g->ext_nodes[i]->base.id == expand->id) {
+            ray_retain(src_sel);
             g->ext_nodes[i]->graph.sip_sel = src_sel;
             break;
         }

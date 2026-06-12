@@ -7499,8 +7499,15 @@ static ray_t* exec_make_mapcommon(ray_t* key_values, ray_t* row_counts) {
     if (!mc) return NULL;
     mc->type = RAY_MAPCOMMON;
     mc->len  = 2;
+    /* The container owns a ref to each child (ray_release_owned_refs
+     * releases them on free), so take one — the caller keeps its own
+     * ref and releases it in teardown. */
+    if (key_values) ray_retain(key_values);
+    if (row_counts) ray_retain(row_counts);
     ((ray_t**)ray_data(mc))[0] = key_values;
+    ray_retain(key_values);  /* container owns a ref; teardown releases ours */
     ((ray_t**)ray_data(mc))[1] = row_counts;
+    ray_retain(row_counts);  /* container owns a ref; teardown releases ours */
     return mc;
 }
 
@@ -7952,7 +7959,9 @@ static test_result_t test_exec_streaming_concat_scan(void) {
     pcol_str->type = (int8_t)(RAY_PARTED_BASE + RAY_STR);
     pcol_str->len  = 2;
     ((ray_t**)ray_data(pcol_str))[0] = seg0_str;
+    ray_retain(seg0_str);  /* container owns a ref; teardown releases ours */
     ((ray_t**)ray_data(pcol_str))[1] = seg1_str;
+    ray_retain(seg1_str);  /* container owns a ref; teardown releases ours */
 
     /* MAPCOMMON key column */
     int64_t mc_keys[]   = {1, 2};
@@ -8028,6 +8037,7 @@ static test_result_t test_exec_streaming_all_segments_pruned(void) {
     pcol->type = (int8_t)(RAY_PARTED_BASE + RAY_I64);
     pcol->len  = 1;
     ((ray_t**)ray_data(pcol))[0] = seg0;
+    ray_retain(seg0);  /* container owns a ref; teardown releases ours */
 
     ray_t* kv = ray_vec_from_raw(RAY_I64, mc_keys, 1);
     ray_t* rc = ray_vec_from_raw(RAY_I64, mc_counts, 1);
@@ -8279,7 +8289,9 @@ static test_result_t test_exec_streaming_select_root(void) {
     pcol->type = (int8_t)(RAY_PARTED_BASE + RAY_I64);
     pcol->len  = 2;
     ((ray_t**)ray_data(pcol))[0] = seg0;
+    ray_retain(seg0);  /* container owns a ref; teardown releases ours */
     ((ray_t**)ray_data(pcol))[1] = seg1;
+    ray_retain(seg1);  /* container owns a ref; teardown releases ours */
 
     /* MAPCOMMON key column: 2 segments of sizes 3, 2 */
     int64_t mc_keys[]   = {10, 20};
@@ -8352,7 +8364,9 @@ static test_result_t test_exec_streaming_if_root(void) {
     pcol->type = (int8_t)(RAY_PARTED_BASE + RAY_I64);
     pcol->len  = 2;
     ((ray_t**)ray_data(pcol))[0] = seg0;
+    ray_retain(seg0);  /* container owns a ref; teardown releases ours */
     ((ray_t**)ray_data(pcol))[1] = seg1;
+    ray_retain(seg1);  /* container owns a ref; teardown releases ours */
 
     int64_t mc_keys[]   = {1, 2};
     int64_t mc_counts[] = {3, 2};
@@ -8425,7 +8439,9 @@ static test_result_t test_exec_streaming_mapcommon_i32_key(void) {
     pcol->type = (int8_t)(RAY_PARTED_BASE + RAY_I64);
     pcol->len  = 2;
     ((ray_t**)ray_data(pcol))[0] = seg0;
+    ray_retain(seg0);  /* container owns a ref; teardown releases ours */
     ((ray_t**)ray_data(pcol))[1] = seg1;
+    ray_retain(seg1);  /* container owns a ref; teardown releases ours */
 
     /* MAPCOMMON with I32 keys (esz==4): triggers build_segment_table L1892 */
     int32_t kv_data[] = {100, 200};
@@ -8486,8 +8502,11 @@ static test_result_t test_exec_streaming_mapcommon_kv_too_short(void) {
     pcol->type = (int8_t)(RAY_PARTED_BASE + RAY_I64);
     pcol->len  = 3;
     ((ray_t**)ray_data(pcol))[0] = seg0;
+    ray_retain(seg0);  /* container owns a ref; teardown releases ours */
     ((ray_t**)ray_data(pcol))[1] = seg1;
+    ray_retain(seg1);  /* container owns a ref; teardown releases ours */
     ((ray_t**)ray_data(pcol))[2] = seg2;
+    ray_retain(seg2);  /* container owns a ref; teardown releases ours */
 
     /* MAPCOMMON with only 2 keys — mismatches the 3-segment column */
     int64_t kv_data[] = {10, 20};
@@ -8548,7 +8567,9 @@ static test_result_t test_exec_streaming_mismatched_seg_counts(void) {
     pcol_a->type = (int8_t)(RAY_PARTED_BASE + RAY_I64);
     pcol_a->len  = 2;
     ((ray_t**)ray_data(pcol_a))[0] = a0;
+    ray_retain(a0);  /* container owns a ref; teardown releases ours */
     ((ray_t**)ray_data(pcol_a))[1] = a1;
+    ray_retain(a1);  /* container owns a ref; teardown releases ours */
 
     /* Parted column B: 3 segments — mismatches column A's seg count */
     int64_t b0d[] = {10};
@@ -8562,8 +8583,11 @@ static test_result_t test_exec_streaming_mismatched_seg_counts(void) {
     pcol_b->type = (int8_t)(RAY_PARTED_BASE + RAY_I64);
     pcol_b->len  = 3;
     ((ray_t**)ray_data(pcol_b))[0] = b0;
+    ray_retain(b0);  /* container owns a ref; teardown releases ours */
     ((ray_t**)ray_data(pcol_b))[1] = b1;
+    ray_retain(b1);  /* container owns a ref; teardown releases ours */
     ((ray_t**)ray_data(pcol_b))[2] = b2;
+    ray_retain(b2);  /* container owns a ref; teardown releases ours */
 
     int64_t col_a = ray_sym_intern("a", 1);
     int64_t col_b = ray_sym_intern("b", 1);
@@ -8612,7 +8636,9 @@ static test_result_t test_exec_streaming_mapcommon_too_short(void) {
     pcol->type = (int8_t)(RAY_PARTED_BASE + RAY_I64);
     pcol->len  = 2;
     ((ray_t**)ray_data(pcol))[0] = seg0;
+    ray_retain(seg0);  /* container owns a ref; teardown releases ours */
     ((ray_t**)ray_data(pcol))[1] = seg1;
+    ray_retain(seg1);  /* container owns a ref; teardown releases ours */
 
     /* Malformed MAPCOMMON: len=1 (expects 2 pointers [kv, rc]).
      * build_segment_table checks col->len < 2 → schema error (L1864).  */
@@ -8623,6 +8649,7 @@ static test_result_t test_exec_streaming_mapcommon_too_short(void) {
     mc->type = RAY_MAPCOMMON;
     mc->len  = 1;                                /* < 2 → triggers L1864 */
     ((ray_t**)ray_data(mc))[0] = kv;
+    ray_retain(kv);  /* container owns a ref; teardown releases ours */
 
     int64_t col_k = ray_sym_intern("k", 1);
     int64_t col_v = ray_sym_intern("v", 1);
@@ -8667,6 +8694,7 @@ static test_result_t test_exec_streaming_parted_null_segment(void) {
     pcol->type = (int8_t)(RAY_PARTED_BASE + RAY_I64);
     pcol->len  = 2;
     ((ray_t**)ray_data(pcol))[0] = seg0;
+    ray_retain(seg0);  /* container owns a ref; teardown releases ours */
     ((ray_t**)ray_data(pcol))[1] = NULL;  /* NULL segment at index 1 */
 
     /* Valid MAPCOMMON with 2 keys */
@@ -8725,7 +8753,9 @@ static test_result_t test_exec_streaming_mapcommon_i16_key(void) {
     pcol->type = (int8_t)(RAY_PARTED_BASE + RAY_I64);
     pcol->len  = 2;
     ((ray_t**)ray_data(pcol))[0] = seg0;
+    ray_retain(seg0);  /* container owns a ref; teardown releases ours */
     ((ray_t**)ray_data(pcol))[1] = seg1;
+    ray_retain(seg1);  /* container owns a ref; teardown releases ours */
 
     /* MAPCOMMON with I16 keys (esz==2): triggers L1896 else path */
     int16_t kv_data[] = {100, 200};
@@ -8948,7 +8978,9 @@ static test_result_t test_exec_streaming_large_dag(void) {
     pcol->type = (int8_t)(RAY_PARTED_BASE + RAY_I64);
     pcol->len  = 2;
     ((ray_t**)ray_data(pcol))[0] = seg0;
+    ray_retain(seg0);  /* container owns a ref; teardown releases ours */
     ((ray_t**)ray_data(pcol))[1] = seg1;
+    ray_retain(seg1);  /* container owns a ref; teardown releases ours */
 
     int64_t mc_keys[]   = {1, 2};
     int64_t mc_counts[] = {2, 2};
@@ -9015,6 +9047,7 @@ static test_result_t test_exec_filter_group_parted_empty(void) {
     pcol->type = (int8_t)(RAY_PARTED_BASE + RAY_I64);
     pcol->len  = 1;  /* 1 segment, but 0 rows total */
     ((ray_t**)ray_data(pcol))[0] = empty_seg;
+    ray_retain(empty_seg);  /* container owns a ref; teardown releases ours */
 
     int64_t col_a = ray_sym_intern("a", 1);
     ray_t* tbl = ray_table_new(1);
@@ -9086,7 +9119,9 @@ static test_result_t test_exec_head_parted_sym_wrong_esz(void) {
     pcol->type = (int8_t)(RAY_PARTED_BASE + RAY_SYM);
     pcol->len  = 2;
     ((ray_t**)ray_data(pcol))[0] = seg0;
+    ray_retain(seg0);  /* container owns a ref; teardown releases ours */
     ((ray_t**)ray_data(pcol))[1] = seg1;
+    ray_retain(seg1);  /* container owns a ref; teardown releases ours */
 
     int64_t col_s = ray_sym_intern("s", 1);
     ray_t* tbl = ray_table_new(1);
@@ -9148,7 +9183,9 @@ static test_result_t test_exec_tail_parted_sym_wrong_esz(void) {
     pcol->type = (int8_t)(RAY_PARTED_BASE + RAY_SYM);
     pcol->len  = 2;
     ((ray_t**)ray_data(pcol))[0] = seg0;
+    ray_retain(seg0);  /* container owns a ref; teardown releases ours */
     ((ray_t**)ray_data(pcol))[1] = seg1;
+    ray_retain(seg1);  /* container owns a ref; teardown releases ours */
 
     int64_t col_s = ray_sym_intern("s", 1);
     ray_t* tbl = ray_table_new(1);
@@ -9241,7 +9278,9 @@ static test_result_t test_exec_streaming_seg_mask_mismatch(void) {
     pcol->type = (int8_t)(RAY_PARTED_BASE + RAY_I64);
     pcol->len  = 2;
     ((ray_t**)ray_data(pcol))[0] = seg0;
+    ray_retain(seg0);  /* container owns a ref; teardown releases ours */
     ((ray_t**)ray_data(pcol))[1] = seg1;
+    ray_retain(seg1);  /* container owns a ref; teardown releases ours */
 
     int64_t mc_keys[]   = {1, 2};
     int64_t mc_counts[] = {2, 2};
@@ -9329,7 +9368,9 @@ static test_result_t test_exec_scan_parted_sym_wrong_esz(void) {
     pcol->type = (int8_t)(RAY_PARTED_BASE + RAY_SYM);
     pcol->len  = 2;
     ((ray_t**)ray_data(pcol))[0] = seg0;
+    ray_retain(seg0);  /* container owns a ref; teardown releases ours */
     ((ray_t**)ray_data(pcol))[1] = seg1;
+    ray_retain(seg1);  /* container owns a ref; teardown releases ours */
 
     int64_t col_s = ray_sym_intern("s", 1);
     ray_t* tbl = ray_table_new(1);
@@ -9376,7 +9417,9 @@ static test_result_t test_exec_streaming_mapcommon_sel_key(void) {
     pcol->type = (int8_t)(RAY_PARTED_BASE + RAY_I64);
     pcol->len  = 2;
     ((ray_t**)ray_data(pcol))[0] = seg0;
+    ray_retain(seg0);  /* container owns a ref; teardown releases ours */
     ((ray_t**)ray_data(pcol))[1] = seg1;
+    ray_retain(seg1);  /* container owns a ref; teardown releases ours */
 
     /* MAPCOMMON where kv->type = RAY_SEL (type 14, esz=0) */
     int64_t mc_counts[] = {2, 2};
@@ -9393,7 +9436,9 @@ static test_result_t test_exec_streaming_mapcommon_sel_key(void) {
     mc->type = RAY_MAPCOMMON;
     mc->len  = 2;
     ((ray_t**)ray_data(mc))[0] = kv;
+    ray_retain(kv);  /* container owns a ref; teardown releases ours */
     ((ray_t**)ray_data(mc))[1] = rc;
+    ray_retain(rc);  /* container owns a ref; teardown releases ours */
 
     int64_t col_grp = ray_sym_intern("grp", 3);
     int64_t col_v   = ray_sym_intern("v",   1);
@@ -9443,7 +9488,9 @@ static test_result_t test_exec_streaming_mapcommon_list_kv_type(void) {
     pcol->type = (int8_t)(RAY_PARTED_BASE + RAY_I64);
     pcol->len  = 2;
     ((ray_t**)ray_data(pcol))[0] = seg0;
+    ray_retain(seg0);  /* container owns a ref; teardown releases ours */
     ((ray_t**)ray_data(pcol))[1] = seg1;
+    ray_retain(seg1);  /* container owns a ref; teardown releases ours */
 
     /* MAPCOMMON where kv->type = RAY_LIST(0): esz=8, but ray_vec_new(0,n)
      * fails because type<=0 is rejected → L1882 fires.                */
@@ -9461,7 +9508,9 @@ static test_result_t test_exec_streaming_mapcommon_list_kv_type(void) {
     mc->type = RAY_MAPCOMMON;
     mc->len  = 2;
     ((ray_t**)ray_data(mc))[0] = kv;
+    ray_retain(kv);  /* container owns a ref; teardown releases ours */
     ((ray_t**)ray_data(mc))[1] = rc;
+    ray_retain(rc);  /* container owns a ref; teardown releases ours */
 
     int64_t col_grp = ray_sym_intern("grp", 3);
     int64_t col_v   = ray_sym_intern("v",   1);
@@ -9518,7 +9567,9 @@ static test_result_t test_exec_streaming_mapcommon_list_key_empty(void) {
     pcol->type = (int8_t)(RAY_PARTED_BASE + RAY_I64);
     pcol->len  = 2;
     ((ray_t**)ray_data(pcol))[0] = seg0;
+    ray_retain(seg0);  /* container owns a ref; teardown releases ours */
     ((ray_t**)ray_data(pcol))[1] = seg1;
+    ray_retain(seg1);  /* container owns a ref; teardown releases ours */
 
     /* Create a MAPCOMMON where kv (mc[0]) has type=RAY_LIST=0.
      * rc (mc[1]) is a normal I64 counts vector.                        */
@@ -9538,7 +9589,9 @@ static test_result_t test_exec_streaming_mapcommon_list_key_empty(void) {
     mc->type = RAY_MAPCOMMON;
     mc->len  = 2;
     ((ray_t**)ray_data(mc))[0] = kv;
+    ray_retain(kv);  /* container owns a ref; teardown releases ours */
     ((ray_t**)ray_data(mc))[1] = rc;
+    ray_retain(rc);  /* container owns a ref; teardown releases ours */
 
     int64_t col_grp = ray_sym_intern("grp", 3);
     int64_t col_v   = ray_sym_intern("v",   1);
