@@ -775,10 +775,14 @@ static test_result_t test_dispatch_workers_participate(void) {
 
     TEST_ASSERT_EQ_I(atomic_load(&ctx.calls), n);
     TEST_ASSERT_EQ_I(atomic_load(&ctx.elem_sum), n);
-    /* Worker 0 (main) always sees activity; we don't hard-assert worker 1+
-     * participation as it depends on scheduling — but the test still
-     * exercises the multi-worker claim contention. */
-    TEST_ASSERT_TRUE((atomic_load(&ctx.saw_worker) & 0x1u) != 0);
+    /* No per-id participation assert: WHICH claimants win is pure
+     * scheduling.  Workers 1+ may never wake on a loaded runner — and
+     * the inverse race is just as real: on a fast box the workers can
+     * drain all 256 tasks before main enters its claim loop, leaving
+     * bit 0 (main) unset — observed on macOS CI.  The test's value is
+     * driving the multi-claimant contention paths; completion is
+     * asserted above, and some bit is necessarily set once calls == n. */
+    TEST_ASSERT_TRUE(atomic_load(&ctx.saw_worker) != 0);
 
     ray_pool_free(&pool);
     ray_heap_destroy();
