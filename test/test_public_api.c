@@ -544,7 +544,9 @@ static test_result_t test_public_eval_nfo_roundtrip(void) {
     PASS();
 }
 
-/* Restricted-mode API — pure data store with no side effects on benign arith. */
+/* Restricted-mode API — round-trips through the per-thread VM
+ * (__VM->restricted), so a runtime must be live; without a bound VM the
+ * setter is a no-op and the getter reports false. */
 static test_result_t test_public_eval_restricted_setget(void) {
     ray_eval_set_restricted(false);
     TEST_ASSERT_FALSE(ray_eval_get_restricted());
@@ -655,7 +657,7 @@ const test_entry_t public_api_entries[] = {
     { "public/eval_interrupt_wrappers",        test_public_eval_interrupt_wrappers,        NULL, NULL },
     { "public/interrupt_cross_path",           test_public_interrupt_cross_path,           NULL, NULL },
     { "public/eval_nfo_roundtrip",             test_public_eval_nfo_roundtrip,             public_api_setup, public_api_teardown },
-    { "public/eval_restricted_setget",         test_public_eval_restricted_setget,         NULL, NULL },
+    { "public/eval_restricted_setget",         test_public_eval_restricted_setget,         public_api_setup, public_api_teardown },
     { "public/eval_restricted_allows_arith",   test_public_eval_restricted_allows_arith,   public_api_setup, public_api_teardown },
     { "public/get_error_trace_populated",      test_public_get_error_trace_populated,      public_api_setup, public_api_teardown },
     { "public/get_error_trace_cleared_on_eval",test_public_get_error_trace_cleared_on_eval,public_api_setup, public_api_teardown },

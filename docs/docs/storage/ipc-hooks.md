@@ -2,6 +2,8 @@
 
 Five user-installable lambdas under `.ipc.on.*` that intercept the server-side connection lifecycle, plus the `.ipc.handle` accessor for the current connection's handle.
 
+The handle a hook receives is a first-class connection handle — the same namespace `.ipc.open` allocates from. Pass it to `.ipc.post` (async push to the connected client), `.ipc.send` (sync round-trip), or `.ipc.close` (kick the client), from inside the hook or any time later. Lifecycle hooks fire for **inbound** connections only; connections the process itself opened via `.ipc.open` never trigger `on.open`/`on.close`.
+
 !!! note "See also"
     The [IPC & Serialization](ipc.md) page documents the client-side `.ipc.open` / `.ipc.send` / `.ipc.close` and the wire format. Hooks live on the server and fire in response to inbound connections.
 
@@ -25,6 +27,11 @@ Install with plain `set` or the colon binder:
 ```lisp
 (set .ipc.on.open  (fn [h] (println "+ " h)))
 (set .ipc.on.close (fn [h] (println "- " h)))
+
+;; Server push: greet every client as soon as it connects, and remember
+;; the handle for later pushes from anywhere on the server.
+(set .ipc.on.open
+     (fn [h] (set last-client h) (.ipc.post h "(println \"welcome\")")))
 
 ;; Sync hook receives the raw deserialised payload.  Strings need an
 ;; explicit parse before eval; the default in-server dispatch does this
@@ -77,3 +84,5 @@ Inside any hook, `(.ipc.handle)` returns the handle of the connection that trigg
 ```
 
 The argument `h` passed to `on.open` / `on.close` always equals `(.ipc.handle)` at the moment the hook fires — the builtin is the only way to reach the handle from `on.sync` / `on.async` / `on.auth`, whose signatures don't include it directly.
+
+A handle read here stays valid for the connection's lifetime: store it and `.ipc.post` to it later (publish/subscribe), or `.ipc.close` it to drop the client. After the connection closes, the integer may be reused by a future connection — don't cache handles across `on.close`.

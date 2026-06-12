@@ -1,6 +1,9 @@
-# `.ipc.*` — client IPC
+# `.ipc.*` — connection IPC
 
-Connect to a Rayforce server (`./rayforce -p <port>`) and exchange messages over TCP. The wire format is the same compact binary serialisation used for `ser`/`de`, with automatic delta+RLE compression for payloads larger than 2,000 bytes. All five client builtins live here; the server-side connection hooks (`.ipc.on.open` / `.on.close` / `.on.sync` / `.on.async` / `.on.auth`) live on the [IPC Connection Hooks](../storage/ipc-hooks.md) page — they are user-settable lambda slots, not registered builtins, so they don't appear in the reference table below.
+Connect to a Rayforce server (`./rayforce -p <port>`) and exchange messages over TCP. The wire format is the same compact binary serialisation used for `ser`/`de`, with automatic delta+RLE compression for payloads larger than 2,000 bytes. All five connection builtins live here; the server-side connection hooks (`.ipc.on.open` / `.on.close` / `.on.sync` / `.on.async` / `.on.auth`) live on the [IPC Connection Hooks](../storage/ipc-hooks.md) page — they are user-settable lambda slots, not registered builtins, so they don't appear in the reference table below.
+
+!!! note "One handle namespace"
+    A handle is a handle, whichever side of the wire you are on: the `i64` returned by `.ipc.open` and the `h` a server-side hook receives (or reads via `.ipc.handle`) name connections in the same namespace, and `.ipc.send`, `.ipc.post`, and `.ipc.close` accept either. A server can therefore push messages back through the handle its hooks were given — from inside the hook or any time later — kdb-style. Handles are only meaningful inside the process that owns the connection; they are not stable identifiers across processes or reconnects.
 
 !!! note "Restricted under `-U`"
     `.ipc.open`, `.ipc.close`, `.ipc.send`, and `.ipc.post` are `RAY_FN_RESTRICTED` — IPC chaining is blocked on a `-U` server (a peer cannot dial outward to a third server). `.ipc.handle` is always available so hooks can read the current connection ID.
@@ -38,16 +41,18 @@ The handshake exchanges a 2-byte `{wire_version, auth_flag}` greeting. A wire-ve
 
 ## `.ipc.send` { #ipc-send }
 
-Signature: `(.ipc.send h msg)`. Sends `msg` synchronously — blocks until the server replies.
+Signature: `(.ipc.send h msg)`. Sends `msg` synchronously — blocks until the peer replies.
 
-The server's behaviour depends on `msg`'s type:
+The receiving side's behaviour depends on `msg`'s type:
 
-| Payload | Server behaviour |
+| Payload | Peer behaviour |
 |---|---|
 | `STR` | Parsed as Rayfall, evaluated, result returned. |
 | anything else | Passed straight into `ray_eval` — identity for plain data, execution for an expression list. |
 
-Errors: `type` (`h` not an `i64`/`i32`, or `msg` not serialisable). Server-side errors are returned as error objects too — `.ipc.send` does not raise them, the caller decides what to do.
+Errors: `type` (`h` not an `i64`/`i32`, or `msg` not serialisable), `io` (handle does not name an open connection). Server-side errors are returned as error objects too — `.ipc.send` does not raise them, the caller decides what to do.
+
+While waiting for its response, `.ipc.send` keeps servicing the connection: an async message pushed by the peer in the meantime is dispatched (evaluated, or routed through `.ipc.on.async`) before the round-trip returns, and a sync request arriving from the peer is answered. Frames are never silently swallowed by the wait.
 
 ```lisp
 ;; String-form query
@@ -65,21 +70,26 @@ For async fire-and-forget, see `.ipc.post` below. See [IPC & Serialization](../s
 
 ## `.ipc.post` { #ipc-post }
 
-Signature: `(.ipc.post h msg)`. Sends `msg` asynchronously — fire-and-forget. Unlike `.ipc.send`, it does **not** wait for a reply: the server runs the message through its `.ipc.on.async` hook (or default evaluation) and sends nothing back.
+Signature: `(.ipc.post h msg)`. Sends `msg` asynchronously — fire-and-forget. Unlike `.ipc.send`, it does **not** wait for a reply: the peer runs the message through its `.ipc.on.async` hook (or default evaluation) and sends nothing back.
 
-Because no response is returned, the only failures the caller can observe are **local** ones. A server-side evaluation error is logged on the server and dropped — it never reaches the sender.
+Because no response is returned, the only failures the caller can observe are **local** ones. A remote evaluation error is logged on the receiving side and dropped — it never reaches the sender.
 
 Returns the null object on a successful local send. Errors: `type` (`h` not an `i64`/`i32`, or `msg` not serialisable), `io` (handle invalid / connection closed / socket write failed).
 
 ```lisp
-;; Push a state update to the server and move on — no round-trip.
-;; The string payload is parsed and evaluated server-side, just like `.ipc.send`.
+;; Client → server: push a state update and move on — no round-trip.
+;; The string payload is parsed and evaluated remotely, just like `.ipc.send`.
 (.ipc.post h "(set last-update 42)")
+
+;; Server → client: push through the handle a hook received.  The client
+;; evaluates the message when it next services the connection — in its
+;; poll loop, or while blocked inside one of its own `.ipc.send` waits.
+(set .ipc.on.open (fn [h] (.ipc.post h "(println \"welcome\")")))
 ```
 
 ## `.ipc.close` { #ipc-close }
 
-Signature: `(.ipc.close h)`. Closes the socket for the handle. Returns the null object.
+Signature: `(.ipc.close h)`. Closes the connection for the handle — either an outbound handle from `.ipc.open` or an inbound one a server-side hook received (a server can kick a client). Closing an inbound connection fires `.ipc.on.close` as usual. Returns the null object.
 
 ```lisp
 (.ipc.close h)
