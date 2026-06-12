@@ -567,33 +567,37 @@ static test_result_t test_no_push_const_pred(void) {
  * AND-of-keys pushdown — diff + plan-shape probe.
  *
  * pred = AND(k >= 2, k <= 3): both conjuncts are keys-only, so pass-6
- * pushes the whole AND-filter below GROUP.  Pass-7 (split_and_filter) then
- * splits FILTER(AND, CONST_TABLE) into two nodes:
+ * pushes the whole AND-filter below GROUP: GROUP(FILTER(AND, CONST_TABLE)).
+ *
+ * BUG (fixed): pass-7 (split_and_filter) used to split the pushed AND into
  *   inner (orig id):   FILTER(k>=2, CONST_TABLE)
  *   outer (new id):    FILTER(k<=3, inner)
- * and calls redirect_consumers(g, orig_id, outer, ...) to rewire all
- * consumers of the inner-filter id to the outer.
+ * and relied on redirect_consumers to re-point GROUP at the outer filter.
+ * But GROUP's arity is 0 (its inputs[0] is an alias kept outside the arity
+ * contract), so redirect_consumers' `k < c->arity` gate never fired for it:
+ * GROUP->inputs[0] kept pointing at the inner filter, the outer filter was
+ * orphaned, and the k<=3 conjunct was silently dropped — 3 groups instead
+ * of 2.
  *
- * FINDING (empirically verified): GROUP has ext->base.arity = 0, so
- * redirect_consumers's loop `for (k < c->arity)` never fires for the GROUP
- * node.  GROUP->inputs[0] stays pointing at the inner filter (orig id).
- * The outer split-off FILTER is allocated but never wired into the GROUP.
- * Post-optimize shape is therefore 1-deep, not 2-deep:
+ * GUARD: pass-6 now tags the interposed filter with OP_FLAG_PUSHED and
+ * pass-7 skips flagged filters entirely (no AND-split, no chain reorder).
+ * A pushed AND evaluates as one fused BOOL pass through the lazy-selection
+ * path; splitting it below the group would need a GROUP.inputs[0]
+ * redirection that redirect_consumers' arity gate doesn't perform, and
+ * would also cost two rowsel passes instead of one.
  *
- *   GROUP( FILTER(k>=2, CONST_TABLE) )    ← only the GE conjunct survives
+ * This test asserts pushed ≡ unpushed (2 rows: k=2 sum 15, k=3 sum 24)
+ * via an un-optimized FILTER(AND, GROUP) baseline, plus the plan shape:
+ * root GROUP, inputs[0] an OP_FILTER carrying OP_FLAG_PUSHED whose pred is
+ * still the un-split AND and whose data input is the const-table (chain
+ * depth 1).
  *
- * Consequence: the k<=3 conjunct is silently dropped.  The pushed result
- * returns groups k=2 (sum=15), k=3 (sum=24), k=4 (sum=33) — 3 rows, not 2.
- * The un-optimized FILTER(AND, GROUP) baseline (via HAVING-fusion) returns
- * the correct 2 rows.  This test pins that divergence as a regression
- * anchor: pushed vs unpushed results differ, and both are verified.
- *
- * Differential: baseline is built WITHOUT ray_optimize so the AND is never
- * split.  ray_optimize with pushdown disabled is not used for the baseline
- * because pass-7 would still run and create the orphaned-outer problem on
- * top of GROUP (FILTER(k<=3, FILTER(k>=2, GROUP))), where the outer FILTER
- * evaluates k<=3 against g->table (12-row original table) and applies the
- * result to the 2-row GROUP output — a row-count mismatch error.
+ * The knob-based diff helper (diff_having) is NOT usable here: with
+ * pushdown disabled, pass-7 still splits the AND above GROUP into
+ * FILTER(k<=3, FILTER(k>=2, GROUP)); the outer filter's pred evaluates
+ * against g->table (12 rows) but its input is the 2-row group output —
+ * a row-count mismatch error (empirically verified, pre-existing and
+ * independent of the pushdown bug).
  * =================================================================== */
 
 /* (and (>= k 2) (<= k 3)) — keys-only AND, nominally groups k=2 and k=3 */
@@ -618,21 +622,19 @@ static test_result_t test_diff_and_of_keys(void) {
         TEST_ASSERT(plan_pushed(g, root),
             "AND-of-keys pred must push below GROUP (pass-6)");
 
-        /* Plan-shape: root->inputs[0] is OP_FILTER (outer pushed filter). */
-        TEST_ASSERT(root->inputs[0] != NULL &&
-                    root->inputs[0]->opcode == OP_FILTER,
-            "GROUP inputs[0] must be OP_FILTER after AND-split");
-
-        /* Chain-depth probe.
-         * FINDING: root->inputs[0]->inputs[0] is OP_CONST (not OP_FILTER).
-         * Chain depth = 1.  Pass-7 split the AND into two FILTER nodes, but
-         * redirect_consumers skips GROUP (arity=0) so the outer split FILTER
-         * is orphaned.  Only the inner conjunct (k>=2) stays wired below GROUP.
-         * The k<=3 conjunct is silently dropped — a known optimizer limitation. */
+        /* Plan-shape: root->inputs[0] is the pushed OP_FILTER, flagged. */
         ray_op_t* f0 = root->inputs[0];
-        ray_op_t* f1 = f0 ? f0->inputs[0] : NULL;
-        TEST_ASSERT(f1 != NULL && f1->opcode != OP_FILTER,
-            "chain depth is 1 after AND-split (outer split filter is orphaned)");
+        TEST_ASSERT(f0 != NULL && f0->opcode == OP_FILTER,
+            "GROUP inputs[0] must be OP_FILTER");
+        TEST_ASSERT(f0->flags & OP_FLAG_PUSHED,
+            "pushed filter must carry OP_FLAG_PUSHED");
+
+        /* The pred must still be the un-split AND … */
+        TEST_ASSERT(f0->inputs[1] != NULL && f0->inputs[1]->opcode == OP_AND,
+            "pushed filter pred must remain the un-split AND");
+        /* … and the data input the const-table: chain depth 1, no split. */
+        TEST_ASSERT(f0->inputs[0] != NULL && f0->inputs[0]->opcode != OP_FILTER,
+            "pushed filter input must be the const-table (chain depth 1)");
 
         ray_op_t* skeys[1] = {ray_scan(g, "k")};
         uint8_t descs[1] = {0};
@@ -663,25 +665,34 @@ static test_result_t test_diff_and_of_keys(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(pushed_res));
     TEST_ASSERT_FALSE(RAY_IS_ERR(base_res));
 
-    /* Pushed result: only k>=2 conjunct applied → k=2,3,4 survive (3 rows).
-     * Baseline result: full AND applied via HAVING-fusion → k=2,3 (2 rows).
-     * These differ because the optimizer drops the k<=3 conjunct (see FINDING). */
-    TEST_ASSERT_EQ_I(ray_table_nrows(pushed_res), 3);  /* k=2(15), k=3(24), k=4(33) */
-    TEST_ASSERT_EQ_I(ray_table_nrows(base_res),   2);  /* k=2(15), k=3(24) only */
+    /* Pushed ≡ unpushed: both conjuncts applied → k=2 (sum 15), k=3 (sum 24). */
+    TEST_ASSERT_EQ_I(ray_table_nrows(pushed_res), 2);
+    TEST_ASSERT_EQ_I(ray_table_nrows(base_res),   2);
 
-    /* Spot-check pushed result values (sorted by k ascending). */
+    /* Cell-by-cell diff (sorted by k ascending), same as diff_having_ex. */
+    int64_t ncols = ray_table_ncols(pushed_res);
+    int64_t nrows = ray_table_nrows(pushed_res);
+    for (int64_t c = 0; c < ncols; c++) {
+        int64_t col_name = ray_table_col_name(pushed_res, c);
+        ray_t* v0 = ray_table_get_col(pushed_res, col_name);
+        ray_t* v1 = ray_table_get_col(base_res, col_name);
+        TEST_ASSERT(v0 != NULL && v1 != NULL, "column present in both results");
+        for (int64_t row = 0; row < nrows; row++) {
+            bool n0 = ray_vec_is_null(v0, row);
+            bool n1 = ray_vec_is_null(v1, row);
+            TEST_ASSERT(n0 == n1, "null mismatch between pushed and baseline");
+            if (!n0)
+                TEST_ASSERT(ray_vec_get_i64(v0, row) == ray_vec_get_i64(v1, row),
+                    "value mismatch between pushed and baseline");
+        }
+    }
+
+    /* Spot-check the absolute values (sorted by k ascending). */
     int64_t sum_col = ray_sym_intern("v_sum", 5);
     ray_t* sv = ray_table_get_col(pushed_res, sum_col);
     TEST_ASSERT(sv != NULL, "v_sum column present in pushed result");
     TEST_ASSERT_EQ_I(ray_vec_get_i64(sv, 0), 15);  /* k=2 */
     TEST_ASSERT_EQ_I(ray_vec_get_i64(sv, 1), 24);  /* k=3 */
-    TEST_ASSERT_EQ_I(ray_vec_get_i64(sv, 2), 33);  /* k=4 — extra row due to dropped k<=3 */
-
-    /* Spot-check baseline values (sorted by k ascending). */
-    ray_t* bsv = ray_table_get_col(base_res, sum_col);
-    TEST_ASSERT(bsv != NULL, "v_sum column present in baseline result");
-    TEST_ASSERT_EQ_I(ray_vec_get_i64(bsv, 0), 15);  /* k=2 */
-    TEST_ASSERT_EQ_I(ray_vec_get_i64(bsv, 1), 24);  /* k=3 */
 
     ray_release(pushed_res); ray_release(base_res);
     ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
