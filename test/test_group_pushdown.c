@@ -48,6 +48,7 @@ static ray_t* make_gp_table(void) {
 }
 
 typedef ray_op_t* (*gp_pred_builder_t)(ray_graph_t* g);
+typedef ray_op_t* (*gp_plan_builder_t)(ray_graph_t* g, gp_pred_builder_t pb);
 
 /* Build FILTER(pred, GROUP(sum v by k)), run ray_optimize, return root. */
 static ray_op_t* build_having_plan(ray_graph_t* g, gp_pred_builder_t pb,
@@ -131,7 +132,8 @@ static test_result_t test_exec_group_with_pushed_filter(void) {
  * Task-3 optimizer tests
  * =================================================================== */
 
-static ray_op_t* pred_on_key(ray_graph_t* g) {
+/* k >= 3 — canonical predicate used across all single- and multi-key tests */
+static ray_op_t* pred_key_ge3(ray_graph_t* g) {
     return ray_ge(g, ray_scan(g, "k"), ray_const_i64(g, 3));
 }
 
@@ -139,7 +141,7 @@ static test_result_t test_having_on_key_pushed(void) {
     ray_heap_init();
     ray_t* tbl = make_gp_table();
     ray_graph_t* g = ray_graph_new(tbl);
-    ray_op_t* root = build_having_plan(g, pred_on_key, NULL);
+    ray_op_t* root = build_having_plan(g, pred_key_ge3, NULL);
     TEST_ASSERT(plan_pushed(g, root), "keys-only pred must push below GROUP");
 
     /* Dual-slot sync check after optimizer rewrite */
@@ -156,18 +158,24 @@ static test_result_t test_having_on_key_pushed(void) {
 }
 
 /* ===================================================================
- * Differential helper: run same plan with pushdown ON (pass=0) and
- * OFF (pass=1, knob), sort by k, compare results cell-by-cell.
+ * Differential helpers: run same plan with pushdown ON (pass=0) and
+ * OFF (pass=1, knob), sort by sort_col, compare results cell-by-cell.
  * All test tables use I64 columns only.
  * =================================================================== */
-static test_result_t diff_having(ray_t* tbl, gp_pred_builder_t pb) {
+
+/* Wrapper type so build_multikey_plan matches gp_plan_builder_t. */
+static ray_op_t* plan_builder_having(ray_graph_t* g, gp_pred_builder_t pb) {
+    return build_having_plan(g, pb, NULL);
+}
+
+static test_result_t diff_having_ex(ray_t* tbl, gp_plan_builder_t plan_fn,
+                                    gp_pred_builder_t pb, const char* sort_col) {
     ray_t* res[2] = {NULL, NULL};
     for (int pass = 0; pass < 2; pass++) {
         ray_opt_no_group_pushdown = (pass == 1);
         ray_graph_t* g = ray_graph_new(tbl);
-        ray_op_t* root = build_having_plan(g, pb, NULL);
-        /* Sort by k after optimize (both paths produce k column in output) */
-        ray_op_t* skeys[1] = {ray_scan(g, "k")};
+        ray_op_t* root = plan_fn(g, pb);
+        ray_op_t* skeys[1] = {ray_scan(g, sort_col)};
         uint8_t descs[1] = {0};
         root = ray_sort_op(g, root, skeys, descs, NULL, 1);
         res[pass] = ray_execute(g, root);
@@ -201,10 +209,12 @@ static test_result_t diff_having(ray_t* tbl, gp_pred_builder_t pb) {
     PASS();
 }
 
-/* k >= 3 */
-static ray_op_t* pred_key_ge3(ray_graph_t* g) {
-    return ray_ge(g, ray_scan(g, "k"), ray_const_i64(g, 3));
+/* Thin wrapper for single-key plans that sort by k. */
+static test_result_t diff_having(ray_t* tbl, gp_pred_builder_t pb) {
+    return diff_having_ex(tbl, plan_builder_having, pb, "k");
 }
+
+/* k >= 3 (pred_key_ge3 defined above) */
 static test_result_t test_diff_key_ge(void) {
     ray_heap_init();
     ray_t* tbl = make_gp_table();
@@ -255,13 +265,10 @@ static ray_t* make_null_key_table(void) {
     return tbl;
 }
 
-static ray_op_t* pred_null_key_ge3(ray_graph_t* g) {
-    return ray_ge(g, ray_scan(g, "k"), ray_const_i64(g, 3));
-}
 static test_result_t test_diff_null_keys(void) {
     ray_heap_init();
     ray_t* tbl = make_null_key_table();
-    test_result_t r = diff_having(tbl, pred_null_key_ge3);
+    test_result_t r = diff_having(tbl, pred_key_ge3);
     ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
     return r;
 }
@@ -284,7 +291,7 @@ static ray_t* make_multi_key_table(void) {
     return tbl;
 }
 
-/* Build FILTER(k >= 3, GROUP(sum v by {k,j})), run ray_optimize. */
+/* Build FILTER(pred, GROUP(sum v by {k,j})), run ray_optimize. */
 static ray_op_t* build_multikey_plan(ray_graph_t* g, gp_pred_builder_t pb) {
     ray_op_t* k = ray_scan(g, "k");
     ray_op_t* j = ray_scan(g, "j");
@@ -297,34 +304,12 @@ static ray_op_t* build_multikey_plan(ray_graph_t* g, gp_pred_builder_t pb) {
     return ray_optimize(g, filt);
 }
 
-static ray_op_t* pred_mk_key_ge3(ray_graph_t* g) {
-    return ray_ge(g, ray_scan(g, "k"), ray_const_i64(g, 3));
-}
-
 static test_result_t test_diff_multi_key(void) {
     ray_heap_init();
     ray_t* tbl = make_multi_key_table();
-
-    ray_t* res[2] = {NULL, NULL};
-    for (int pass = 0; pass < 2; pass++) {
-        ray_opt_no_group_pushdown = (pass == 1);
-        ray_graph_t* g = ray_graph_new(tbl);
-        ray_op_t* root = build_multikey_plan(g, pred_mk_key_ge3);
-        ray_op_t* skeys[1] = {ray_scan(g, "k")};
-        uint8_t descs[1] = {0};
-        root = ray_sort_op(g, root, skeys, descs, NULL, 1);
-        res[pass] = ray_execute(g, root);
-        ray_graph_free(g);
-    }
-    ray_opt_no_group_pushdown = false;
-
-    TEST_ASSERT_FALSE(RAY_IS_ERR(res[0]));
-    TEST_ASSERT_FALSE(RAY_IS_ERR(res[1]));
-    TEST_ASSERT_EQ_I(ray_table_nrows(res[0]), ray_table_nrows(res[1]));
-
-    ray_release(res[0]); ray_release(res[1]);
+    test_result_t r = diff_having_ex(tbl, build_multikey_plan, pred_key_ge3, "k");
     ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
-    PASS();
+    return r;
 }
 
 /* k IN {2, 4} */
@@ -352,7 +337,7 @@ static test_result_t test_head_group_pushed_filter(void) {
 
     /* Build FILTER(k >= 3, GROUP(sum v by k)) and optimize.
      * After optimization the shape should be GROUP(FILTER(...)). */
-    ray_op_t* root = build_having_plan(g, pred_on_key, NULL);
+    ray_op_t* root = build_having_plan(g, pred_key_ge3, NULL);
     TEST_ASSERT(plan_pushed(g, root), "must push for HEAD test");
 
     /* Wrap in HEAD(3): k=3 and k=4 pass the filter (2 rows), head keeps both */
