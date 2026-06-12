@@ -1168,6 +1168,119 @@ static test_result_t test_in_float_col_falls_back(void) {
     PASS();
 }
 
+/* ─── TIME width regression (hash-eq) ─────────────────────────────── */
+
+/* Build a table with a TIME column t (4-byte int32 storage, seconds) and
+ * an I64 row-id column v.  t==3600 at rows 0, 2 and 6. */
+static ray_t* make_time_table(void) {
+    (void)ray_sym_init();
+    int32_t td[] = {3600, 7200, 3600, 86399, 0, 7200, 3600, 1, 2, 3};
+    int64_t vd[] = {0,1,2,3,4,5,6,7,8,9};
+    ray_t* tv = ray_vec_from_raw(RAY_TIME, td, 10);
+    ray_t* vv = ray_vec_from_raw(RAY_I64, vd, 10);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("t", 1), tv);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("v", 1), vv);
+    ray_release(tv);
+    ray_release(vv);
+    return tbl;
+}
+
+/* (== t 09:00... well, 3600s) — TIME literal atom against the TIME column. */
+static ray_op_t* pred_eq_time_3600(ray_graph_t* g) {
+    ray_t* lit = ray_time(3600);
+    ray_op_t* c = ray_const_atom(g, lit);
+    ray_release(lit);
+    return ray_eq(g, ray_scan(g, "t"), c);
+}
+
+/* hash_eq_time: regression for the TIME width disagreement.  The hash
+ * builder (numeric_key_word) reads TIME rows as 4-byte int32 — the
+ * canonical storage width (ray_type_sizes[RAY_TIME] == 4) — but
+ * hash_col_read_i64 used to read TIME as 8-byte, so the chain-walk
+ * verify compared garbage (and read past the data area) and the index
+ * path returned 0 rows where the scan returns 3.  Differential: indexed
+ * result must equal the dropped-index scan, and the hash consult+hit
+ * must fire. */
+static test_result_t test_hash_eq_time(void) {
+    /* Side A — with hash index on t */
+    ray_heap_init();
+    ray_t* tbl_a = make_time_table();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl_a));
+    TEST_ASSERT(attach_hash_to_col(tbl_a, "t") == 0, "attach hash (hash_eq_time)");
+
+    uint64_t cons_before = ray_idx_consults[IDX_SITE_FILTER_HASH];
+    uint64_t hits_before = ray_idx_hits[IDX_SITE_FILTER_HASH];
+
+    ray_t* ra = run_filter(tbl_a, pred_eq_time_3600);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ra));
+    TEST_ASSERT_EQ_I(ray_table_nrows(ra), 3);  /* rows 0, 2, 6 */
+
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_consults[IDX_SITE_FILTER_HASH] - cons_before), 1);
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_hits[IDX_SITE_FILTER_HASH]     - hits_before), 1);
+
+    /* Side B — no index (scan path) */
+    ray_t* tbl_b = make_time_table();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl_b));
+    ray_t* rb = run_filter(tbl_b, pred_eq_time_3600);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(rb));
+    TEST_ASSERT_EQ_I(ray_table_nrows(rb), 3);
+
+    TEST_ASSERT(v_cols_equal(ra, rb), "v column mismatch between indexed and scan (hash_eq_time)");
+
+    ray_release(ra); ray_release(rb);
+    ray_release(tbl_a); ray_release(tbl_b);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── IN with empty set ───────────────────────────────────────────── */
+
+/* (in k []) — empty I64 set → no row can match. */
+static ray_op_t* pred_in_empty(ray_graph_t* g) {
+    ray_t* sv = ray_vec_from_raw(RAY_I64, NULL, 0);
+    ray_op_t* set_op = ray_const_vec(g, sv);
+    ray_release(sv);
+    return ray_in(g, ray_scan(g, "k"), set_op);
+}
+
+/* in_empty_set: hash on k; FILTER(IN(k, [])) → ray_index_in_rowsel must
+ * return a VALID all-NONE rowsel (NULL would mean "no fast path"), so the
+ * IN consult AND hit both advance and the result has 0 rows.  Differential
+ * vs the unindexed scan (also 0 rows). */
+static test_result_t test_in_empty_set(void) {
+    /* Side A — with hash index */
+    ray_heap_init();
+    ray_t* tbl_a = make_idx_table();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl_a));
+    TEST_ASSERT(attach_hash_to_col(tbl_a, "k") == 0, "attach hash (in_empty_set)");
+
+    uint64_t cons_before = ray_idx_consults[IDX_SITE_IN];
+    uint64_t hits_before = ray_idx_hits[IDX_SITE_IN];
+
+    ray_t* ra = run_filter(tbl_a, pred_in_empty);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ra));
+    TEST_ASSERT_EQ_I(ray_table_nrows(ra), 0);
+
+    /* Empty set is a HIT (valid all-NONE rowsel), not a fall-through. */
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_consults[IDX_SITE_IN] - cons_before), 1);
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_hits[IDX_SITE_IN]     - hits_before), 1);
+
+    /* Side B — no index (scan path) */
+    ray_t* tbl_b = make_idx_table();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl_b));
+    ray_t* rb = run_filter(tbl_b, pred_in_empty);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(rb));
+    TEST_ASSERT_EQ_I(ray_table_nrows(rb), 0);
+
+    ray_release(ra); ray_release(rb);
+    ray_release(tbl_a); ray_release(tbl_b);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t idx_route_entries[] = {
     { "idx_route/hash_eq_still_works",   test_hash_eq_still_works,   NULL, NULL },
     { "idx_route/zone_none",             test_zone_none,             NULL, NULL },
@@ -1197,5 +1310,7 @@ const test_entry_t idx_route_entries[] = {
     { "idx_route/in_dup_set",                test_in_dup_set,                NULL, NULL },
     { "idx_route/in_absent_elems",           test_in_absent_elems,           NULL, NULL },
     { "idx_route/in_float_col_falls_back",   test_in_float_col_falls_back,   NULL, NULL },
+    { "idx_route/hash_eq_time",              test_hash_eq_time,              NULL, NULL },
+    { "idx_route/in_empty_set",              test_in_empty_set,              NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };

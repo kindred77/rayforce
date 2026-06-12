@@ -762,11 +762,9 @@ static test_result_t test_index_f32_zone_and_hash(void) {
 static test_result_t test_index_time_timestamp_zone(void) {
     ray_heap_init();
 
-    /* RAY_TIME: stored as int32_t (4 bytes), but zone_scan routes via
-     * zone_scan_int(v, ix, 8) — we just check that attach succeeds and
-     * that the zone kind is correct (value assertions omitted because
-     * zone_scan reads 8 bytes but storage is 4, producing implementation-
-     * defined results for the min/max numbers). */
+    /* RAY_TIME: stored as int32_t (4 bytes); zone_scan routes via
+     * zone_scan_int(v, ix, 4) matching the storage width, so min/max
+     * are exact. */
     int32_t times[] = { 0, 3600, 86399, 1000 };
     ray_t* tv = ray_vec_new(RAY_TIME, 4);
     for (int i = 0; i < 4; i++) tv = ray_vec_append(tv, &times[i]);
@@ -776,6 +774,8 @@ static test_result_t test_index_time_timestamp_zone(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     ray_index_t* itz = ray_index_payload(tw->index);
     TEST_ASSERT_EQ_I((int)itz->kind, RAY_IDX_ZONE);
+    TEST_ASSERT_EQ_I(itz->u.zone.min_i, 0);
+    TEST_ASSERT_EQ_I(itz->u.zone.max_i, 86399);
     TEST_ASSERT_EQ_I(itz->u.zone.n_nulls, 0);
     ray_release(tw);
 
@@ -3430,6 +3430,16 @@ static test_result_t test_index_hash_eq_rowsel_out_of_range(void) {
     TEST_ASSERT_NULL(ray_index_hash_eq_rowsel(wi, (int64_t)INT32_MIN - 1));
     ray_release(wi);
 
+    /* TIME column (int32 storage), key out of i32 range → NULL */
+    int32_t tx[] = { 0, 3600, 86399 };
+    ray_t* vt = ray_vec_new(RAY_TIME, 3);
+    for (int i = 0; i < 3; i++) vt = ray_vec_append(vt, &tx[i]);
+    ray_t* wt = vt;
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_hash(&wt)));
+    TEST_ASSERT_NULL(ray_index_hash_eq_rowsel(wt, (int64_t)INT32_MAX + 1));
+    TEST_ASSERT_NULL(ray_index_hash_eq_rowsel(wt, (int64_t)INT32_MIN - 1));
+    ray_release(wt);
+
     ray_heap_destroy();
     PASS();
 }
@@ -3500,22 +3510,18 @@ static test_result_t test_index_hash_eq_rowsel_type_matrix(void) {
     ray_rowsel_release(sd);
     ray_release(wd);
 
-    /* TIME — idxop treats this as es=8 (numeric_elem_size routes RAY_TIME
-     * through the int64 arm) but vec.c stores TIME as int32 (4 bytes per
-     * row, NULL_I32 sentinel).  See test_index_time_timestamp_zone for the
-     * pre-existing acknowledgement of this width mismatch.  The hash-eq
-     * fast path is consequently NOT reliable on TIME columns until the
-     * width disagreement is resolved upstream — we exercise the dispatch
-     * arm only enough to drive coverage on hash_key_in_range/
-     * hash_col_read_i64 case RAY_TIME, without asserting match counts. */
-    int64_t tx[] = { 1000, 2000, 1000 };  /* int64 storage to match es=8 read */
+    /* TIME (es=4, int32 storage with NULL_I32 sentinel).  All idxop
+     * readers now agree with the builder on the 4-byte width, so the
+     * hash-eq fast path is exact on TIME columns. */
+    int32_t tx[] = { 1000, 2000, 1000 };
     ray_t* vt = ray_vec_new(RAY_TIME, 3);
     for (int i = 0; i < 3; i++) vt = ray_vec_append(vt, &tx[i]);
     ray_t* wt = vt;
     TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_hash(&wt)));
-    /* Probe just drives the type-arm dispatch; result not asserted. */
     ray_t* st = ray_index_hash_eq_rowsel(wt, 1000);
-    if (st) ray_rowsel_release(st);
+    TEST_ASSERT_NOT_NULL(st);
+    TEST_ASSERT_EQ_I(rowsel_count_pass(st), 2);
+    ray_rowsel_release(st);
     ray_release(wt);
 
     /* TIMESTAMP (es=8, storage matches) */
