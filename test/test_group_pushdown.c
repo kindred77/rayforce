@@ -359,11 +359,22 @@ static test_result_t test_head_group_pushed_filter(void) {
     ray_op_t* head_op = ray_head(g, root, 3);
     TEST_ASSERT(head_op != NULL, "ray_head alloc");
 
-    ray_t* r = ray_execute(g, head_op);
+    /* Sort by v_sum ascending so row order is deterministic (24 then 33). */
+    ray_op_t* skeys[1] = {ray_scan(g, "v_sum")};
+    uint8_t descs[1] = {0};
+    ray_op_t* sorted = ray_sort_op(g, head_op, skeys, descs, NULL, 1);
+    TEST_ASSERT(sorted != NULL, "ray_sort_op alloc");
+
+    ray_t* r = ray_execute(g, sorted);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
-    /* Only k=3 and k=4 survive the filter, so at most 2 rows */
-    int64_t nr = ray_table_nrows(r);
-    TEST_ASSERT(nr <= 2, "head result <= 2 rows after filter");
+    /* Only k=3 (sum=24) and k=4 (sum=33) survive the filter; HEAD(3) keeps both. */
+    int64_t nrows = ray_table_nrows(r);
+    TEST_ASSERT_EQ_I(nrows, 2);
+    int64_t sum_col = ray_sym_intern("v_sum", 5);
+    ray_t* sv = ray_table_get_col(r, sum_col);
+    TEST_ASSERT(sv != NULL, "v_sum column present");
+    TEST_ASSERT_EQ_I(ray_vec_get_i64(sv, 0), 24);
+    TEST_ASSERT_EQ_I(ray_vec_get_i64(sv, 1), 33);
 
     ray_release(r); ray_graph_free(g); ray_release(tbl);
     ray_sym_destroy(); ray_heap_destroy();
