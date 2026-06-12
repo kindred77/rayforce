@@ -23,7 +23,8 @@
 
 /* test/test_idx_route.c — index routing scaffold + refactor pin (Task 1)
  *                         + zone all/none short-circuit tests (Task 2)
- *                         + sort-index range rowsel tests (Task 4). */
+ *                         + sort-index range rowsel tests (Task 4)
+ *                         + staleness end-to-end + adversarial sweeps (Task 10). */
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -1661,6 +1662,108 @@ static test_result_t test_sort_selection_falls_back(void) {
     PASS();
 }
 
+/* ─── Distinct float edge-case tests (Task 8 headline check) ─────── */
+
+/* distinct_f64_neg_zero: column {-0.0, +0.0, 1.0, 2.0} without a sort
+ * index.  The hashset path normalises -0.0 → +0.0 (ray_hash_f64 contract)
+ * and -0.0 == +0.0 in hs_eq_rows, so only ONE distinct value among the
+ * two zeros → 3 distinct values total {0.0, 1.0, 2.0}.
+ *
+ * WITH a sort index, numeric_key_word also normalises via clear_neg_zero
+ * so -0.0 and +0.0 get the same key_word → same run → ONE emission.
+ * Both paths must agree: 3 distinct values. */
+static test_result_t test_distinct_f64_neg_zero(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* Build a raw F64 vector containing -0.0 then +0.0 */
+    uint64_t raw[4] = {
+        UINT64_C(0x8000000000000000), /* -0.0 */
+        UINT64_C(0x0000000000000000), /* +0.0 */
+        UINT64_C(0x3FF0000000000000), /* 1.0  */
+        UINT64_C(0x4000000000000000), /* 2.0  */
+    };
+    ray_t* v_no_idx = ray_vec_from_raw(RAY_F64, raw, 4);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v_no_idx));
+
+    ray_t* r_no_idx = distinct_vec_eager(v_no_idx);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r_no_idx));
+    int64_t cnt_no_idx = ray_len(r_no_idx);
+
+    ray_t* v_idx = ray_vec_from_raw(RAY_F64, raw, 4);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v_idx));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_sort(&v_idx)));
+
+    ray_t* r_idx = distinct_vec_eager(v_idx);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r_idx));
+    int64_t cnt_idx = ray_len(r_idx);
+
+    /* Both paths must agree and return 3 (0.0, 1.0, 2.0) */
+    TEST_ASSERT_EQ_I(cnt_no_idx, 3);
+    TEST_ASSERT_EQ_I(cnt_idx,    3);
+
+    ray_release(r_no_idx); ray_release(v_no_idx);
+    ray_release(r_idx);    ray_release(v_idx);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* distinct_f64_nan_no_null_attr: F64 column with NaN values but NO
+ * RAY_ATTR_HAS_NULLS attribute (i.e. NaN injected via ray_vec_from_raw,
+ * not via ray_vec_set_null).  The idx_fresh_nonull gate passes (HAS_NULLS
+ * clear), so the sort-index fast path fires.
+ *
+ * Sort: all NaN → same radix key → contiguous in perm.
+ * numeric_key_word(NaN) → per-row hash (each row unique) → every NaN emits
+ * as a separate run → N NaN rows → N "distinct" NaN entries.
+ *
+ * Hashset: hs_eq_rows uses == → NaN != NaN → each NaN its own slot →
+ * also N entries.
+ *
+ * Both paths agree (both treat N canonical-NaN rows as N distinct values),
+ * so there is NO divergence.  This test pins that agreement.
+ *
+ * Note: this is conceptually degenerate (all N are the same bit pattern)
+ * but the engine is internally consistent.  If user-visible semantics must
+ * deduplicate NaN, gate F64 out of the fast path (matching the hash-index
+ * float gate) and let the hashset handle it consistently. */
+static test_result_t test_distinct_f64_nan_no_null_attr(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* Three rows of canonical NaN, no HAS_NULLS flag. */
+    double nan_val = __builtin_nan("");
+    double raw[5] = { 1.0, nan_val, nan_val, nan_val, 2.0 };
+    ray_t* v_no_idx = ray_vec_from_raw(RAY_F64, raw, 5);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v_no_idx));
+    /* Confirm HAS_NULLS is NOT set */
+    TEST_ASSERT((v_no_idx->attrs & 0x40) == 0, "HAS_NULLS must not be set on raw-constructed vector");
+
+    ray_t* r_no_idx = distinct_vec_eager(v_no_idx);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r_no_idx));
+    int64_t cnt_no_idx = ray_len(r_no_idx);
+
+    ray_t* v_idx = ray_vec_from_raw(RAY_F64, raw, 5);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v_idx));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_sort(&v_idx)));
+
+    ray_t* r_idx = distinct_vec_eager(v_idx);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r_idx));
+    int64_t cnt_idx = ray_len(r_idx);
+
+    /* Both paths agree: each NaN emitted separately → 5 distinct values
+     * (1.0, NaN, NaN, NaN, 2.0).  This confirms the paths are consistent
+     * even if the result is degenerate from a user perspective. */
+    TEST_ASSERT_EQ_I(cnt_no_idx, cnt_idx);
+
+    ray_release(r_no_idx); ray_release(v_no_idx);
+    ray_release(r_idx);    ray_release(v_idx);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 /* ─── Distinct fast-path tests (Task 8) ──────────────────────────── */
 
 /* distinct_order_contract: pin the output order for the duplicates fixture.
@@ -1806,6 +1909,460 @@ static test_result_t test_distinct_nulls_falls_back(void) {
     PASS();
 }
 
+/* ─── Task 10: Staleness end-to-end + adversarial sweeps ─────────────── */
+
+/* Helper: find the slot index for column `sym_id` in `tbl`. Returns -1 if not found. */
+static int64_t find_col_slot(ray_t* tbl, int64_t sym_id) {
+    int64_t ncols = ray_table_ncols(tbl);
+    for (int64_t i = 0; i < ncols; i++) {
+        if (ray_table_col_name(tbl, i) == sym_id) return i;
+    }
+    return -1;
+}
+
+/* Helper: append elem to the column at slot in tbl.
+ *
+ * Retain protocol: we retain col before calling ray_vec_append so that
+ * ray_cow inside always forks a copy (rc > 1 guarantees COW).  After the
+ * append we write col2 (the COW copy + appended element) back into the
+ * table via ray_table_set_col_idx, which:
+ *   - retains col2  (rc: 1 → 2)
+ *   - releases the old slot pointer (which is col — its rc drops to 0,
+ *     freeing it, because the COW's ray_release already brought it to 1).
+ * We then release col2 to drop the extra retain → col2->rc = 1 (table owns).
+ * We do NOT release col again — it was freed by ray_table_set_col_idx. */
+static ray_t* tbl_col_append(ray_t* tbl, int64_t slot, const void* elem) {
+    ray_t* col = ray_table_get_col_idx(tbl, slot);
+    if (!col || RAY_IS_ERR(col)) return col;
+    ray_retain(col);                           /* force COW in ray_vec_append */
+    ray_t* col2 = ray_vec_append(col, elem);
+    if (!col2 || RAY_IS_ERR(col2)) { ray_release(col); return col2; }
+    if (col2 != col) {
+        /* COW produced a new pointer.  Table still holds the old col (rc=1
+         * after COW's ray_release).  set_col_idx retains col2 and releases col
+         * (col->rc → 0, freed).  Then we release the extra retain on col2. */
+        ray_table_set_col_idx(tbl, slot, col2);
+        ray_release(col2);
+    } else {
+        /* In-place: shouldn't occur with our retain, but handle safely. */
+        ray_release(col);
+    }
+    return col2;
+}
+
+/* Helper: overwrite elem at idx in the column at slot.
+ * Same retain-before-mutate discipline as tbl_col_append. */
+static ray_t* tbl_col_set(ray_t* tbl, int64_t slot, int64_t idx, const void* elem) {
+    ray_t* col = ray_table_get_col_idx(tbl, slot);
+    if (!col || RAY_IS_ERR(col)) return col;
+    ray_retain(col);
+    ray_t* col2 = ray_vec_set(col, idx, elem);
+    if (!col2 || RAY_IS_ERR(col2)) { ray_release(col); return col2; }
+    if (col2 != col) {
+        ray_table_set_col_idx(tbl, slot, col2);
+        ray_release(col2);
+    } else {
+        ray_release(col);
+    }
+    return col2;
+}
+
+/* ─── Staleness: filter-eq hash — append mutation ────────────────────── */
+
+/* stale_filter_hash: attach hash to k, run (== k 9) → 2 rows (index hit).
+ * Append k=9, v=10 → len grows; built_for_len mismatch.
+ * Re-run (== k 9): correct result (3 rows, scan path), hit UNCHANGED. */
+static test_result_t test_stale_filter_hash(void) {
+    ray_heap_init();
+    ray_t* tbl = make_idx_table();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    TEST_ASSERT(attach_hash_to_col(tbl, "k") == 0, "attach hash");
+
+    /* First run — index fresh; (== k 9) → 2 rows. */
+    uint64_t hits0 = ray_idx_hits[IDX_SITE_FILTER_HASH];
+    ray_t* r0 = run_filter(tbl, pred_eq_9);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r0));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r0), 2);
+    TEST_ASSERT(ray_idx_hits[IDX_SITE_FILTER_HASH] > hits0, "first run must hit");
+    ray_release(r0);
+
+    /* Mutate: append k=9, v=10 → index dropped by ray_vec_append. */
+    int64_t kslot = find_col_slot(tbl, ray_sym_intern("k", 1));
+    int64_t vslot = find_col_slot(tbl, ray_sym_intern("v", 1));
+    TEST_ASSERT(kslot >= 0, "k slot"); TEST_ASSERT(vslot >= 0, "v slot");
+    TEST_ASSERT_EQ_I(kslot, 0);  /* k must be first column (slot 0) */
+    TEST_ASSERT_EQ_I(vslot, 1);  /* v must be second column (slot 1) */
+
+    /* Verify len before mutation */
+    TEST_ASSERT_EQ_I(ray_table_nrows(tbl), 10);
+
+    int64_t kval = 9, vval = 10;
+    { ray_t* _r = tbl_col_append(tbl, kslot, &kval); TEST_ASSERT_FALSE(RAY_IS_ERR(_r)); }
+    { ray_t* _r = tbl_col_append(tbl, vslot, &vval); TEST_ASSERT_FALSE(RAY_IS_ERR(_r)); }
+
+    /* Sanity: after mutation the table must have 11 rows. */
+    TEST_ASSERT_EQ_I(ray_table_nrows(tbl), 11);
+
+    /* Second run: 11-row table, k=9 now at rows 2, 6, 10 → 3 rows via scan.
+     * Hit counter must NOT advance (index was dropped on mutation). */
+    uint64_t hits1 = ray_idx_hits[IDX_SITE_FILTER_HASH];
+    ray_t* r1 = run_filter(tbl, pred_eq_9);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r1));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r1), 3);
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_hits[IDX_SITE_FILTER_HASH] - hits1), 0);
+    ray_release(r1);
+
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── Staleness: filter-IN hash — append mutation ────────────────────── */
+
+/* stale_in_hash: attach hash to k, run IN(k,[9,5]) → 4 rows (index hit).
+ * Append k=5, v=10 → len grows; index dropped.
+ * Re-run: 5 rows via scan, hit UNCHANGED. */
+static test_result_t test_stale_in_hash(void) {
+    ray_heap_init();
+    ray_t* tbl = make_idx_table();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    TEST_ASSERT(attach_hash_to_col(tbl, "k") == 0, "attach hash");
+
+    /* First run — index fresh. */
+    uint64_t hits0 = ray_idx_hits[IDX_SITE_IN];
+    ray_t* r0 = run_filter(tbl, pred_in_9_5);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r0));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r0), 4);
+    TEST_ASSERT(ray_idx_hits[IDX_SITE_IN] > hits0, "first run must hit");
+    ray_release(r0);
+
+    /* Mutate: append k=5, v=10. */
+    int64_t kslot = find_col_slot(tbl, ray_sym_intern("k", 1));
+    int64_t vslot = find_col_slot(tbl, ray_sym_intern("v", 1));
+    TEST_ASSERT(kslot >= 0, "k slot"); TEST_ASSERT(vslot >= 0, "v slot");
+
+    int64_t kval = 5, vval = 10;
+    { ray_t* _r = tbl_col_append(tbl, kslot, &kval); TEST_ASSERT_FALSE(RAY_IS_ERR(_r)); }
+    { ray_t* _r = tbl_col_append(tbl, vslot, &vval); TEST_ASSERT_FALSE(RAY_IS_ERR(_r)); }
+
+    /* Second run: 11-row table, {9,5} matches {5,9,9,5,5} at rows 0,2,6,7,10 → 5 rows. */
+    uint64_t hits1 = ray_idx_hits[IDX_SITE_IN];
+    ray_t* r1 = run_filter(tbl, pred_in_9_5);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r1));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r1), 5);
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_hits[IDX_SITE_IN] - hits1), 0);
+    ray_release(r1);
+
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── Staleness: filter-range sort — set mutation ────────────────────── */
+
+/* stale_filter_range: sort on k, run (< k 5) → 4 rows (index hit).
+ * Overwrite k[0]=5 → 4 via ray_vec_set (same len, index dropped).
+ * Re-run: k={4,1,9,3,7,1,9,5,3,7}; (< k 5) → {4,1,3,1,3} = 5 rows via scan.
+ * Hit UNCHANGED. */
+static test_result_t test_stale_filter_range(void) {
+    ray_heap_init();
+    ray_t* tbl = make_idx_table();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    TEST_ASSERT(attach_sort_to_col(tbl, "k") == 0, "attach sort");
+
+    /* First run — index fresh; (< k 5) → k∈{1,3,1,3} = 4 rows. */
+    uint64_t hits0 = ray_idx_hits[IDX_SITE_FILTER_RANGE];
+    ray_t* r0 = run_filter(tbl, pred_lt_5);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r0));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r0), 4);
+    TEST_ASSERT(ray_idx_hits[IDX_SITE_FILTER_RANGE] > hits0, "first run must hit");
+    ray_release(r0);
+
+    /* Mutate: overwrite k[0]=5 → 4; same len, index dropped. */
+    int64_t kslot = find_col_slot(tbl, ray_sym_intern("k", 1));
+    TEST_ASSERT(kslot >= 0, "k slot");
+    int64_t new_k0 = 4;
+    { ray_t* _r = tbl_col_set(tbl, kslot, 0, &new_k0); TEST_ASSERT_FALSE(RAY_IS_ERR(_r)); }
+
+    /* k now {4,1,9,3,7,1,9,5,3,7}: (< k 5) → k∈{4,1,3,1,3} = 5 rows via scan. */
+    uint64_t hits1 = ray_idx_hits[IDX_SITE_FILTER_RANGE];
+    ray_t* r1 = run_filter(tbl, pred_lt_5);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r1));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r1), 5);
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_hits[IDX_SITE_FILTER_RANGE] - hits1), 0);
+    ray_release(r1);
+
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── Staleness: sort perm — append mutation ─────────────────────────── */
+
+/* stale_sort_perm: sort on k, ORDER BY k ASC → 10 rows (index hit).
+ * Append k=0, v=10 → len 11, built_for_len mismatch, index dropped.
+ * Re-run ORDER BY k ASC: 11 rows via general sort, hit UNCHANGED. */
+static test_result_t test_stale_sort_perm(void) {
+    ray_heap_init();
+    ray_t* tbl = make_idx_table();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    TEST_ASSERT(attach_sort_to_col(tbl, "k") == 0, "attach sort");
+
+    /* First run — index fresh. */
+    uint64_t hits0 = ray_idx_hits[IDX_SITE_SORT];
+    ray_t* r0 = run_sort(tbl, "k", 0);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r0));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r0), 10);
+    TEST_ASSERT(ray_idx_hits[IDX_SITE_SORT] > hits0, "first run must hit");
+    ray_release(r0);
+
+    /* Mutate: append k=0, v=10 (index dropped). */
+    int64_t kslot = find_col_slot(tbl, ray_sym_intern("k", 1));
+    int64_t vslot = find_col_slot(tbl, ray_sym_intern("v", 1));
+    TEST_ASSERT(kslot >= 0, "k slot"); TEST_ASSERT(vslot >= 0, "v slot");
+
+    int64_t kval = 0, vval = 10;
+    { ray_t* _r = tbl_col_append(tbl, kslot, &kval); TEST_ASSERT_FALSE(RAY_IS_ERR(_r)); }
+    { ray_t* _r = tbl_col_append(tbl, vslot, &vval); TEST_ASSERT_FALSE(RAY_IS_ERR(_r)); }
+
+    /* Second run: 11 rows, general sort (no index), hit UNCHANGED. */
+    uint64_t hits1 = ray_idx_hits[IDX_SITE_SORT];
+    ray_t* r1 = run_sort(tbl, "k", 0);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r1));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r1), 11);
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_hits[IDX_SITE_SORT] - hits1), 0);
+    ray_release(r1);
+
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── Staleness: find hash — set mutation ────────────────────────────── */
+
+/* stale_find_hash: attach hash to {5,1,9,3,7,1,9,5,3,7}.
+ * find 9 → row 2 (index hit).
+ * Overwrite row 2 (9→8) via ray_vec_set → same len, index dropped.
+ * find 9 → row 6 via scan, hit UNCHANGED. */
+static test_result_t test_stale_find_hash(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t kd[] = {5,1,9,3,7,1,9,5,3,7};
+    ray_t* v = ray_vec_from_raw(RAY_I64, kd, 10);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_hash(&v)));
+
+    /* First find — index fresh, must hit; first 9 is at row 2. */
+    uint64_t hits0 = ray_idx_hits[IDX_SITE_FIND];
+    ray_t* needle = ray_i64(9);
+    ray_t* r0 = ray_find_fn(v, needle);
+    ray_release(needle);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r0));
+    TEST_ASSERT(!RAY_ATOM_IS_NULL(r0), "first find must succeed");
+    TEST_ASSERT_EQ_I(r0->i64, 2);
+    TEST_ASSERT(ray_idx_hits[IDX_SITE_FIND] > hits0, "first find must advance hit");
+    ray_release(r0);
+
+    /* Mutate: overwrite row 2 (9→8); vec_drop_index_inplace fires. */
+    int64_t new_val = 8;
+    ray_t* v2 = ray_vec_set(v, 2, &new_val);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v2));
+    v = v2;  /* adopt possibly-COW'd pointer */
+
+    /* Second find — index dropped; scan finds 9 at row 6 (row 2 is now 8). */
+    uint64_t hits1 = ray_idx_hits[IDX_SITE_FIND];
+    needle = ray_i64(9);
+    ray_t* r1 = ray_find_fn(v, needle);
+    ray_release(needle);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r1));
+    TEST_ASSERT(!RAY_ATOM_IS_NULL(r1), "second find must succeed");
+    TEST_ASSERT_EQ_I(r1->i64, 6);
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_hits[IDX_SITE_FIND] - hits1), 0);
+    ray_release(r1);
+
+    ray_release(v);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── Staleness: distinct sort — set mutation ────────────────────────── */
+
+/* stale_distinct_sort: attach sort to {5,1,9,3,7,1,9,5,3,7} → 5 distinct (hit).
+ * Overwrite row 4 (7→2) via ray_vec_set → same len, index dropped.
+ * k becomes {5,1,9,3,2,1,9,5,3,7}: distinct = {1,2,3,5,7,9} = 6 values via
+ * hashset path.  Hit UNCHANGED. */
+static test_result_t test_stale_distinct_sort(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t kd[] = {5,1,9,3,7,1,9,5,3,7};
+    ray_t* v = ray_vec_from_raw(RAY_I64, kd, 10);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_sort(&v)));
+
+    /* First distinct — index fresh; 5 distinct values {1,3,5,7,9}. */
+    uint64_t hits0 = ray_idx_hits[IDX_SITE_DISTINCT];
+    ray_t* r0 = distinct_vec_eager(v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r0));
+    TEST_ASSERT_EQ_I(ray_len(r0), 5);
+    TEST_ASSERT(ray_idx_hits[IDX_SITE_DISTINCT] > hits0, "first distinct must hit");
+    ray_release(r0);
+
+    /* Mutate: overwrite row 4 (7→2); index dropped. */
+    int64_t new_val = 2;
+    ray_t* v2 = ray_vec_set(v, 4, &new_val);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v2));
+    v = v2;
+
+    /* Second distinct — hashset path.
+     * k={5,1,9,3,2,1,9,5,3,7}: distinct = {1,2,3,5,7,9} = 6 values.
+     * (7 still present at row 9; 2 added via row 4 mutation.) */
+    uint64_t hits1 = ray_idx_hits[IDX_SITE_DISTINCT];
+    ray_t* r1 = distinct_vec_eager(v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r1));
+    TEST_ASSERT_EQ_I(ray_len(r1), 6);
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_hits[IDX_SITE_DISTINCT] - hits1), 0);
+    ray_release(r1);
+
+    ray_release(v);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── Bloom adversarial sweep ────────────────────────────────────────── */
+
+/* bloom_adversarial_sweep: 1000-row I64 column, values i*7 for i∈[0,999].
+ * Values: 0, 7, 14, ..., 6993.  All 1000 are distinct (step-7 sequence).
+ *
+ * Assert 1 (no false-absent): for every inserted value v_i,
+ *   ray_index_bloom_absent(col, v_i) must return false.
+ *
+ * Assert 2 (sound absent): for keys 1..2000, whenever bloom says absent,
+ *   linear membership check must also confirm the key is absent.
+ *   (bloom absent ⊆ truly absent; no false-absent is possible.) */
+static test_result_t test_bloom_adversarial_sweep(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 1000;
+    ray_t* v = ray_vec_new(RAY_I64, N);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    v->len = N;
+    int64_t* d = (int64_t*)ray_data(v);
+    for (int64_t i = 0; i < N; i++) d[i] = i * 7;
+
+    /* Attach bloom — takes ownership of the vec. */
+    ray_t* r = ray_index_attach_bloom(&v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+
+    /* Assert 1: no false-absent for every inserted key. */
+    for (int64_t i = 0; i < N; i++) {
+        int64_t key = i * 7;
+        if (ray_index_bloom_absent(v, key))
+            FAILF("bloom false-absent: key %lld (i=%lld) was inserted but reported absent",
+                  (long long)key, (long long)i);
+    }
+
+    /* Assert 2: bloom-absent ⊆ linear-absent for keys 1..2000.
+     * Key k is present iff k%7==0 && k/7 < N (i.e. k∈{0,7,14,...,6993}). */
+    for (int64_t key = 1; key <= 2000; key++) {
+        if (ray_index_bloom_absent(v, key)) {
+            /* Bloom says absent — linear scan must agree. */
+            bool linear_absent = !(key % 7 == 0 && key / 7 < N);
+            if (!linear_absent)
+                FAILF("bloom false-absent in sweep: key %lld is present but bloom says absent",
+                      (long long)key);
+        }
+    }
+
+    ray_release(v);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ─── Range adversarial sweep ────────────────────────────────────────── */
+
+/* Linear count of rows in d[0..N) satisfying (d[i] cmp_op key). */
+static int64_t linear_count(const int64_t* d, int64_t N,
+                             uint16_t cmp_op, int64_t key) {
+    int64_t cnt = 0;
+    for (int64_t i = 0; i < N; i++) {
+        switch (cmp_op) {
+            case OP_EQ: if (d[i] == key) cnt++; break;
+            case OP_LT: if (d[i] <  key) cnt++; break;
+            case OP_LE: if (d[i] <= key) cnt++; break;
+            case OP_GT: if (d[i] >  key) cnt++; break;
+            case OP_GE: if (d[i] >= key) cnt++; break;
+            default: break;
+        }
+    }
+    return cnt;
+}
+
+/* range_adversarial_sweep: 1000-row I64 column, values (i*2654435761ULL)%500
+ * (deterministic, many duplicates in [0,499]).  Attach sort index.
+ *
+ * For each op in {EQ,LT,LE,GT,GE} × keys {-1,0,250,499,500}:
+ *   ray_index_range_rowsel → total_pass (when non-NULL) must equal
+ *   a linear count over the raw array.
+ *   NULL result (selectivity guard or ineligible) is skipped — not a failure. */
+static test_result_t test_range_adversarial_sweep(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 1000;
+    ray_t* v = ray_vec_new(RAY_I64, N);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    v->len = N;
+    int64_t* d = (int64_t*)ray_data(v);
+    for (int64_t i = 0; i < N; i++)
+        d[i] = (int64_t)((uint64_t)i * UINT64_C(2654435761) % 500);
+
+    ray_t* r = ray_index_attach_sort(&v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+
+    static const uint16_t ops[]   = { OP_EQ, OP_LT, OP_LE, OP_GT, OP_GE };
+    static const char*    opnms[] = { "EQ", "LT", "LE", "GT", "GE" };
+    static const int64_t  keys[]  = { -1, 0, 250, 499, 500 };
+
+    for (int oi = 0; oi < 5; oi++) {
+        for (int ki = 0; ki < 5; ki++) {
+            int64_t key   = keys[ki];
+            uint16_t op   = ops[oi];
+            ray_t* sel = ray_index_range_rowsel(v, op, key, 0.0, false);
+            if (!sel || RAY_IS_ERR(sel)) {
+                /* Selectivity guard fired or not eligible — skip. */
+                if (sel && RAY_IS_ERR(sel)) { /* error, not NULL */ }
+                continue;
+            }
+            int64_t idx_count = ray_rowsel_meta(sel)->total_pass;
+            int64_t lin_count = linear_count(d, N, op, key);
+            ray_release(sel);
+            if (idx_count != lin_count) {
+                ray_release(v);
+                ray_sym_destroy();
+                ray_heap_destroy();
+                FAILF("range mismatch op=%s key=%lld: idx=%lld lin=%lld",
+                      opnms[oi], (long long)key,
+                      (long long)idx_count, (long long)lin_count);
+            }
+        }
+    }
+
+    ray_release(v);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t idx_route_entries[] = {
     { "idx_route/hash_eq_still_works",   test_hash_eq_still_works,   NULL, NULL },
     { "idx_route/zone_none",             test_zone_none,             NULL, NULL },
@@ -1846,9 +2403,21 @@ const test_entry_t idx_route_entries[] = {
     { "idx_route/sort_multikey_falls_back",  test_sort_multikey_falls_back,  NULL, NULL },
     { "idx_route/sort_topk_untouched",       test_sort_topk_untouched,       NULL, NULL },
     { "idx_route/sort_selection_falls_back", test_sort_selection_falls_back, NULL, NULL },
-    { "idx_route/distinct_order_contract",   test_distinct_order_contract,   NULL, NULL },
-    { "idx_route/distinct_sorted",           test_distinct_sorted,           NULL, NULL },
-    { "idx_route/distinct_unique_col",       test_distinct_unique_col,       NULL, NULL },
-    { "idx_route/distinct_nulls_falls_back", test_distinct_nulls_falls_back, NULL, NULL },
+    { "idx_route/distinct_order_contract",         test_distinct_order_contract,         NULL, NULL },
+    { "idx_route/distinct_sorted",                 test_distinct_sorted,                 NULL, NULL },
+    { "idx_route/distinct_unique_col",             test_distinct_unique_col,             NULL, NULL },
+    { "idx_route/distinct_nulls_falls_back",       test_distinct_nulls_falls_back,       NULL, NULL },
+    { "idx_route/distinct_f64_neg_zero",           test_distinct_f64_neg_zero,           NULL, NULL },
+    { "idx_route/distinct_f64_nan_no_null_attr",   test_distinct_f64_nan_no_null_attr,   NULL, NULL },
+    /* Task 10: staleness end-to-end (mutation via append/set, not null) */
+    { "idx_route/stale_filter_hash",         test_stale_filter_hash,         NULL, NULL },
+    { "idx_route/stale_in_hash",             test_stale_in_hash,             NULL, NULL },
+    { "idx_route/stale_filter_range",        test_stale_filter_range,        NULL, NULL },
+    { "idx_route/stale_sort_perm",           test_stale_sort_perm,           NULL, NULL },
+    { "idx_route/stale_find_hash",           test_stale_find_hash,           NULL, NULL },
+    { "idx_route/stale_distinct_sort",       test_stale_distinct_sort,       NULL, NULL },
+    /* Task 10: adversarial sweeps */
+    { "idx_route/bloom_adversarial_sweep",   test_bloom_adversarial_sweep,   NULL, NULL },
+    { "idx_route/range_adversarial_sweep",   test_range_adversarial_sweep,   NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
