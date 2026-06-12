@@ -1,0 +1,46 @@
+;; Runtime special forms (alter / and / or / select / insert / ...)
+;; re-evaluate their argument ASTs through the tree walker.  Inside a
+;; COMPILED lambda the params and let-locals live in bytecode slots, so
+;; the compiler materializes them into a scope frame around the dynamic
+;; eval (OP_SCOPE_BEGIN / OP_SCOPE_END) and syncs let-updates back.
+;; Regression test for "name: 'v' undefined" on (alter 'data concat v)
+;; inside a lambda.
+
+;; alter with a let-local and with a param
+(set data (list))
+((fn [] (let v 42) (alter 'data concat v)))
+(count data) -- 1
+(at data 0)  -- 42
+((fn [x] (alter 'data concat x)) 7)
+(count data) -- 2
+(at data 1)  -- 7
+
+;; and/or with params — must match the top-level (tree-walk) results:
+;; scalar-falsy short-circuit returns the accumulator, otherwise the
+;; element-wise combine yields a boolean
+((fn [x] (and x 1)) 5) -- true
+((fn [x] (and x 1)) 0) -- 0
+((fn [x] (or x 9)) 0)  -- true
+((fn [x] (or x 9)) 3)  -- 3
+
+;; nested: local used in a special form deeper in the body
+((fn [x] (let y (+ x 1)) (and y (or y 0))) 4) -- true
+
+;; parameterized queries — table as a lambda argument
+(set tbl (table [k v] (list (til 3) (til 3))))
+(count (at ((fn [t] (select {from: t take: 2})) tbl) 'k)) -- 2
+
+;; local scalar in a where clause
+(count (at ((fn [n] (select {from: tbl where: (> v n)})) 0) 'k)) -- 2
+
+;; insert with a local row
+((fn [r] (insert 'tbl r)) (list 9 9))
+(count (at tbl 'k)) -- 4
+
+;; let-update inside a special form syncs back to the slot
+((fn [] (let v 1) (and (let v 2) 1) v)) -- 2
+
+;; errors inside the dynamic eval unwind the materialized frame: the
+;; trap handler runs with a balanced scope stack, and the local slots
+;; are still intact afterwards
+((fn [x] (try (and x (undefined-name-xyz)) (fn [e] 0)) x) 6) -- 6
