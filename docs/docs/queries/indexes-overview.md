@@ -4,7 +4,7 @@ A map of every index-like structure Rayforce ships — per-column accelerators, 
 
 ## What an "index" means in Rayforce
 
-An **index** in Rayforce is a precomputed, optional structure that *rides alongside* the data it's built for. It is not a separate database object: it lives on the column or table it indexes, survives copy / refcount semantics, and travels with the data through the query pipeline. Whether queries actually *consult* that structure varies by kind — HNSW, linked columns, partition pruning, and CSR are read by their query paths today; the four `.idx.*` accelerators are built and inspectable but not yet consumed by any operator. See the [status section](#whats-wired-today-whats-not) below.
+An **index** in Rayforce is a precomputed, optional structure that *rides alongside* the data it's built for. It is not a separate database object: it lives on the column or table it indexes, survives copy / refcount semantics, and travels with the data through the query pipeline. Whether queries actually *consult* that structure varies by kind — HNSW, linked columns, partition pruning, CSR, and the four `.idx.*` accelerators are all read by their respective query paths. See the [status section](#whats-wired-today) below.
 
 Three properties hold for every kind of index documented on this page:
 
@@ -18,7 +18,7 @@ Three properties hold for every kind of index documented on this page:
 
 Attach one of four kinds to a numeric vector. Each kind builds a structure suited to a different query shape: hash for equality lookups, sort for binary search and ordered access, zone for column-level min/max/null pruning, bloom for cheap probabilistic membership rejection. All four occupy the same per-column slot — one kind at a time today.
 
-**Today's status:** all four *build correctly* and are *inspectable* via `(.idx.info)`, but no query operator consults them. Building one does not change `filter` / `in` / `find` / `distinct` / SIP behavior; the optimizer routing pass that wires the consumers up is the next phase. See the [status section](#whats-wired-today-whats-not) below.
+**Today's status:** all four are *built, inspectable via `(.idx.info)`, and consulted by the executor at six routing sites* — filter comparisons, filter IN, ORDER BY (single ascending key), distinct, and find.  The routing is transparent: a query against an indexed column uses the fast path; the same query without the index falls back to the linear scan and returns identical results.
 
 **Surface:** `(.idx.zone v)`, `(.idx.hash v)`, `(.idx.sort v)`, `(.idx.bloom v)`, `(.idx.drop v)`, `(.idx.has? v)`, `(.idx.info v)`. Numeric only in v1 (`RAY_BOOL` through `RAY_TIMESTAMP` at the C level; integer / float / date / time / timestamp vectors are the practical reach from Rayfall); `RAY_SYM` / `RAY_STR` are deferred.
 
@@ -60,24 +60,24 @@ A double-indexed Compressed Sparse Row adjacency structure (forward + reverse) a
 
 ## Pick the right kind
 
-Match the shape of your query to the structure that fits it. Read the **Active today** column carefully — the four `.idx.*` kinds are *built and inspectable* today but no query operator consults them yet, so they don't change observable query latency until the optimizer routing pass lands. HNSW, linked columns, partition pruning, and CSR are all consumed by their respective query paths today.
+Match the shape of your query to the structure that fits it.
 
 | Want to… | Structure | Active today? |
 |---|---|---|
-| Skip whole columns or segments where a predicate constant lies outside the value range | `.idx.zone` — min/max plus null count | No — structure built; `.idx.info` only |
-| Make repeated `=` / `in` / `find` / `distinct` over a numeric column O(1) instead of O(n) | `.idx.hash` — chained open-addressing table | No — structure built; `.idx.info` only |
-| Binary-search a numeric column for ranges, sorted scans, or `limit` queries | `.idx.sort` — ascending row-id permutation | No — structure built; `.idx.info` only |
-| Cheaply reject "definitely not in this set" probes — e.g. for SIP into a join | `.idx.bloom` — m-bit probabilistic filter | No — structure built; `.idx.info` only (the SIP pass does not yet consult bloom) |
+| Skip whole columns where a predicate constant lies outside the value range | `.idx.zone` — min/max plus null count | Yes — O(1) all/none short-circuit at the filter site (int + float) |
+| Make repeated `=` / `in` / `find` over a numeric column O(matches) instead of O(n) | `.idx.hash` — chained open-addressing table | Yes — hash probe at filter EQ, filter IN, and find sites |
+| Binary-search a numeric column for range predicates or reuse the permutation for ORDER BY / distinct | `.idx.sort` — ascending row-id permutation | Yes — filter range (EQ/LT/LE/GT/GE), single-key ASC ORDER BY, distinct |
+| Cheaply reject "definitely not in this set" probes for integer EQ filters | `.idx.bloom` — m-bit probabilistic filter | Yes — definite-absent proof at the filter EQ site (integer-family only) |
 | Find the k nearest neighbors of an embedding vector by cosine, L2, or inner product | HNSW — `(hnsw-build)` + `(ann)` | Yes — `(ann)` consults the index |
 | Resolve a cross-table reference at query time without a materialized join | Linked column — `(.col.link)` | Yes — column dereference resolves through the link |
 | Skip whole sub-tables in a parted dataset based on the partition discriminator | Partition pruning — date / int / sym partitioning | Yes — optimizer pass rewrites filters |
 | Traverse a graph — BFS, shortest path, betweenness, MST | CSR — transparent under graph opcodes | Yes — every graph opcode reads CSR directly |
 
-## What's wired today, what's not
+## What's wired today
 
-Rayforce is honest about phasing. The structures above all *build* correctly; integration with the optimizer is staged.
+Rayforce is honest about phasing. The structures above all *build* correctly; integration depth varies by kind.
 
-- **Per-column accelerators** — build kernels and the `(.idx.*)` surface are shipped and tested. Auto-routing — rewriting `filter (= col const)`, `in`, `find`, `distinct`, and join build sides to consult the index instead of a linear scan — is the next phase. Until then, treat indexes as inspectable metadata; they don't yet auto-accelerate queries. See [caveats](indexes.md#caveats-and-limits).
+- **Per-column accelerators** — build kernels, the `(.idx.*)` surface, and executor routing are all shipped and tested. The executor consults indexes at six sites (filter comparisons, filter IN, ORDER BY, distinct, find); every fast path falls back to the scan on any miss and returns identical results. See [Routing Table](indexes.md#routing-table) for the full matrix and eligibility conditions. Set `RAY_IDX_STATS=1` to observe consult/hit counts at exit.
 - **HNSW** — fully wired. `(ann)` consults the index immediately.
 - **Linked columns** — fully wired. Dereference resolves through the link at query time.
 - **Partition pruning** — the optimizer's pruning pass skips partitions whose discriminator falls outside a filter predicate's range. See [Pipeline & Optimizer](../architecture/pipeline.md).
@@ -86,7 +86,7 @@ Rayforce is honest about phasing. The structures above all *build* correctly; in
 ## Where to go next
 
 - [**Indexes Guide**](../guides/indexes.md) — procedural walk-through: when to build, how to choose, common workflows, lifecycle gotchas.
-- [**Accelerator Indexes**](indexes.md) — full reference for the `.idx.*` family.
+- [**Accelerator Indexes**](indexes.md) — full reference for the `.idx.*` family, including the routing table, eligibility conditions, and observability.
 - [**Vector Search & HNSW**](../graph/vector-search.md) — ANN reference and worked examples.
 - [**Linked Columns**](links.md) — cross-table reference reference.
 - [**Columnar Storage**](../storage/index.md) — partitioning and on-disk layout.
