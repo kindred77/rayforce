@@ -919,8 +919,7 @@ static int repl_start_server(repl_server_t* s) {
     if (s->port == 0) { ray_ipc_server_destroy(&s->srv); return -1; }
     s->srv_vm = (ray_vm_t*)ray_sys_alloc(sizeof(ray_vm_t));
     if (!s->srv_vm) { ray_ipc_server_destroy(&s->srv); return -1; }
-    memset(s->srv_vm, 0, sizeof(ray_vm_t));
-    s->srv_vm->id = 1;
+    ray_vm_init(s->srv_vm, 1);
     s->ctx.srv = &s->srv;
     s->ctx.vm  = s->srv_vm;
     if (ray_thread_create(&s->tid, repl_server_thread_fn, &s->ctx) != RAY_OK) {

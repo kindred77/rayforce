@@ -65,10 +65,9 @@
 #include "store/journal.h"
 #include "ops/ops.h"
 
-/* `.ipc.post` C wrapper — declared in src/lang/internal.h, but that header
- * pulls in a conflicting ray_vm_t (via lang/eval.h) that clashes with the
- * core/runtime.h ray_vm_t already included above, so forward-declare just
- * the one symbol the guard tests call. */
+/* `.ipc.post` C wrapper — declared in src/lang/internal.h; forward-
+ * declare just the one symbol the guard tests call instead of pulling
+ * that whole header in. */
 extern ray_t* ray_hpost_fn(ray_t* handle, ray_t* msg);
 
 #ifndef RAY_OS_WINDOWS
@@ -159,8 +158,7 @@ static void poll_stop(ray_poll_t* poll, uint16_t port) {
 static ray_vm_t* make_server_vm(void) {
     ray_vm_t* vm = (ray_vm_t*)ray_sys_alloc(sizeof(ray_vm_t));
     if (!vm) return NULL;
-    memset(vm, 0, sizeof(ray_vm_t));
-    vm->id = 99;
+    ray_vm_init(vm, 99);
     return vm;
 }
 

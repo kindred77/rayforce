@@ -3221,8 +3221,7 @@ static test_result_t test_ipc_sync_roundtrip(void) {
     /* Create a VM for the server thread */
     ray_vm_t* srv_vm = (ray_vm_t*)ray_sys_alloc(sizeof(ray_vm_t));
     TEST_ASSERT_NOT_NULL(srv_vm);
-    memset(srv_vm, 0, sizeof(ray_vm_t));
-    srv_vm->id = 1;
+    ray_vm_init(srv_vm, 1);
 
     ipc_thread_ctx_t ctx = { .srv = &srv, .vm = srv_vm };
 
@@ -3275,8 +3274,7 @@ static test_result_t test_ipc_async_send(void) {
 
     ray_vm_t* srv_vm = (ray_vm_t*)ray_sys_alloc(sizeof(ray_vm_t));
     TEST_ASSERT_NOT_NULL(srv_vm);
-    memset(srv_vm, 0, sizeof(ray_vm_t));
-    srv_vm->id = 1;
+    ray_vm_init(srv_vm, 1);
 
     ipc_thread_ctx_t ctx = { .srv = &srv, .vm = srv_vm };
 
@@ -3322,8 +3320,7 @@ static test_result_t test_ipc_auth_success(void) {
 
     ray_vm_t* srv_vm = (ray_vm_t*)ray_sys_alloc(sizeof(ray_vm_t));
     TEST_ASSERT_NOT_NULL(srv_vm);
-    memset(srv_vm, 0, sizeof(ray_vm_t));
-    srv_vm->id = 1;
+    ray_vm_init(srv_vm, 1);
 
     ipc_thread_ctx_t ctx = { .srv = &srv, .vm = srv_vm };
     ray_thread_t tid;
@@ -3368,8 +3365,7 @@ static test_result_t test_ipc_auth_reject(void) {
 
     ray_vm_t* srv_vm = (ray_vm_t*)ray_sys_alloc(sizeof(ray_vm_t));
     TEST_ASSERT_NOT_NULL(srv_vm);
-    memset(srv_vm, 0, sizeof(ray_vm_t));
-    srv_vm->id = 1;
+    ray_vm_init(srv_vm, 1);
 
     ipc_thread_ctx_t ctx = { .srv = &srv, .vm = srv_vm };
     ray_thread_t tid;
@@ -3404,8 +3400,7 @@ static test_result_t test_ipc_auth_no_creds(void) {
 
     ray_vm_t* srv_vm = (ray_vm_t*)ray_sys_alloc(sizeof(ray_vm_t));
     TEST_ASSERT_NOT_NULL(srv_vm);
-    memset(srv_vm, 0, sizeof(ray_vm_t));
-    srv_vm->id = 1;
+    ray_vm_init(srv_vm, 1);
 
     ipc_thread_ctx_t ctx = { .srv = &srv, .vm = srv_vm };
     ray_thread_t tid;
@@ -3441,8 +3436,7 @@ static test_result_t test_ipc_restricted(void) {
 
     ray_vm_t* srv_vm = (ray_vm_t*)ray_sys_alloc(sizeof(ray_vm_t));
     TEST_ASSERT_NOT_NULL(srv_vm);
-    memset(srv_vm, 0, sizeof(ray_vm_t));
-    srv_vm->id = 1;
+    ray_vm_init(srv_vm, 1);
 
     ipc_thread_ctx_t ctx = { .srv = &srv, .vm = srv_vm };
     ray_thread_t tid;
@@ -3516,8 +3510,7 @@ static test_result_t test_ipc_handshake_version_mismatch(void) {
 
     ray_vm_t* srv_vm = (ray_vm_t*)ray_sys_alloc(sizeof(ray_vm_t));
     TEST_ASSERT_NOT_NULL(srv_vm);
-    memset(srv_vm, 0, sizeof(ray_vm_t));
-    srv_vm->id = 1;
+    ray_vm_init(srv_vm, 1);
 
     ipc_thread_ctx_t ctx = { .srv = &srv, .vm = srv_vm };
     ray_thread_t tid;
