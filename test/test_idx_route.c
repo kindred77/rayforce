@@ -256,6 +256,18 @@ static ray_op_t* pred_f_gt_100(ray_graph_t* g) {
     return ray_gt(g, ray_scan(g, "f"), ray_const_f64(g, 100.0));
 }
 
+/* (> f 100) — INTEGER literal against the F64 column.  Decode must
+ * coerce the key into the column's float family before zone consult. */
+static ray_op_t* pred_f_gt_100_int(ray_graph_t* g) {
+    return ray_gt(g, ray_scan(g, "f"), ray_const_i64(g, 100));
+}
+
+/* (> k 5.5) — FLOAT literal against the I64 column.  Decode must reject
+ * (return 0) so the scan fallback's promotion semantics apply. */
+static ray_op_t* pred_k_gt_5p5(ray_graph_t* g) {
+    return ray_gt(g, ray_scan(g, "k"), ray_const_f64(g, 5.5));
+}
+
 /* ─── F64 zone fixture ─────────────────────────────────────────────── */
 
 /* Build a zone-test table with an F64 column f {1.5..10.5} and I64 row id r. */
@@ -440,21 +452,8 @@ static test_result_t test_zone_f64_none(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
 
     /* Attach zone index to the F64 column. */
-    int64_t sym_id = ray_sym_intern("f", 1);
-    int64_t ncols  = ray_table_ncols(tbl);
-    int64_t slot   = -1;
-    for (int64_t i = 0; i < ncols; i++) {
-        if (ray_table_col_name(tbl, i) == sym_id) { slot = i; break; }
-    }
-    TEST_ASSERT(slot >= 0, "f column not found");
-    ray_t* fv = ray_table_get_col_idx(tbl, slot);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(fv));
-    ray_t* fw = fv;
-    ray_retain(fw);
-    ray_t* zr = ray_index_attach_zone(&fw);
-    TEST_ASSERT(zr && !RAY_IS_ERR(zr), "attach_zone f64");
-    ray_table_set_col_idx(tbl, slot, fw);
-    ray_release(fw);
+    int ok = attach_zone_to_col(tbl, "f");
+    TEST_ASSERT(ok == 0, "attach_zone_to_col f");
 
     uint64_t hits_before     = ray_idx_hits[IDX_SITE_FILTER_ZONE];
     uint64_t consults_before = ray_idx_consults[IDX_SITE_FILTER_ZONE];
@@ -474,6 +473,46 @@ static test_result_t test_zone_f64_none(void) {
     PASS();
 }
 
+/* Cross-type: F64 zone column, INTEGER literal — (> f 100) on f∈[1.5,10.5].
+ * Decode must reconcile the literal into the column's float family so the
+ * zone classifies against key_f=100.0 (NONE), not the zero-filled key_f.
+ * Expect 0 rows with the zone NONE hit advancing. */
+static test_result_t test_zone_f64_int_literal(void) {
+    ray_heap_init();
+    ray_t* tbl = make_f64_zone_table();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+
+    int ok = attach_zone_to_col(tbl, "f");
+    TEST_ASSERT(ok == 0, "attach_zone_to_col f");
+
+    uint64_t hits_before     = ray_idx_hits[IDX_SITE_FILTER_ZONE];
+    uint64_t consults_before = ray_idx_consults[IDX_SITE_FILTER_ZONE];
+
+    ray_t* r = run_filter(tbl, pred_f_gt_100_int);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 0);
+
+    /* Zone classified NONE: consult and hit both advance. */
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_consults[IDX_SITE_FILTER_ZONE] - consults_before), 1);
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_hits[IDX_SITE_FILTER_ZONE] - hits_before), 1);
+
+    ray_release(r);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* Cross-type: I64 zone column, FLOAT literal — (> k 5.5) on k∈[1,9].
+ * Decode must REJECT the shape (integer-family column, float key): the
+ * fallback's promotion semantics own it.  No consult, no hit; correct
+ * 4 rows (k∈{9,7,9,7}) via scan. */
+static test_result_t test_zone_int_col_float_literal(void) {
+    return diff_idx_filter(pred_k_gt_5p5, /*attach_zone=*/1,
+                           /*expect_rows=*/4, /*expect_zone_hit=*/0,
+                           /*expect_zone_consult=*/0);
+}
+
 const test_entry_t idx_route_entries[] = {
     { "idx_route/hash_eq_still_works",   test_hash_eq_still_works,   NULL, NULL },
     { "idx_route/zone_none",             test_zone_none,             NULL, NULL },
@@ -485,5 +524,7 @@ const test_entry_t idx_route_entries[] = {
     { "idx_route/zone_ne_all",           test_zone_ne_all,           NULL, NULL },
     { "idx_route/zone_eq_none_boundary", test_zone_eq_none_boundary, NULL, NULL },
     { "idx_route/zone_f64_none",         test_zone_f64_none,         NULL, NULL },
+    { "idx_route/zone_f64_int_literal",  test_zone_f64_int_literal,  NULL, NULL },
+    { "idx_route/zone_int_col_float_literal", test_zone_int_col_float_literal, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
