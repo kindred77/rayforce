@@ -37,6 +37,7 @@
 #include "ops/rowsel.h"
 #include "ops/ops.h"
 #include "ops/internal.h"
+#include "lang/internal.h"  /* ray_find_fn */
 #include "table/table.h"
 #include <string.h>
 #include <stdlib.h>
@@ -1281,6 +1282,177 @@ static test_result_t test_in_empty_set(void) {
     PASS();
 }
 
+/* ─── find() hash point lookup tests ────────────────────────────────── */
+
+/* find_hit_first_occurrence: vec {5,1,9,3,7,1,9,5,3,7}, (find vec 9) → 2.
+ * The hash chain surfaces rows 2 and 6; ray_index_find_row must return the
+ * minimum row id (2).  IDX_SITE_FIND consult and hit both advance. */
+static test_result_t test_find_hit_first_occurrence(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t kd[] = {5,1,9,3,7,1,9,5,3,7};
+    ray_t* v = ray_vec_from_raw(RAY_I64, kd, 10);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+
+    ray_t* r = ray_index_attach_hash(&v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+
+    uint64_t cons_before = ray_idx_consults[IDX_SITE_FIND];
+    uint64_t hits_before = ray_idx_hits[IDX_SITE_FIND];
+
+    ray_t* needle = ray_i64(9);
+    ray_t* result = ray_find_fn(v, needle);
+    ray_release(needle);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT(!RAY_ATOM_IS_NULL(result), "find hit must not be null");
+    TEST_ASSERT(ray_is_atom(result) && result->type == -RAY_I64,
+                "find hit must be i64 atom");
+    TEST_ASSERT_EQ_I(result->i64, 2);  /* first occurrence of 9 is row 2 */
+
+    /* Both counters must advance */
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_consults[IDX_SITE_FIND] - cons_before), 1);
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_hits[IDX_SITE_FIND]     - hits_before), 1);
+
+    ray_release(result);
+    ray_release(v);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* find_miss: vec {5,1,9,3,7,1,9,5,3,7}, (find vec 4) → 0Nl.
+ * 4 is absent; the index proves absence.  Both consult and hit advance
+ * (the index "answered" the query definitively). */
+static test_result_t test_find_miss(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t kd[] = {5,1,9,3,7,1,9,5,3,7};
+    ray_t* v = ray_vec_from_raw(RAY_I64, kd, 10);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+
+    ray_t* r = ray_index_attach_hash(&v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+
+    uint64_t cons_before = ray_idx_consults[IDX_SITE_FIND];
+    uint64_t hits_before = ray_idx_hits[IDX_SITE_FIND];
+
+    ray_t* needle = ray_i64(4);
+    ray_t* result = ray_find_fn(v, needle);
+    ray_release(needle);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT(RAY_ATOM_IS_NULL(result), "find miss must be null (0Nl)");
+
+    /* Index answered → both consult and hit advance */
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_consults[IDX_SITE_FIND] - cons_before), 1);
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_hits[IDX_SITE_FIND]     - hits_before), 1);
+
+    ray_release(result);
+    ray_release(v);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* find_diff: differential attach/drop — indexed and unindexed must produce
+ * identical results for both a hit and a miss. */
+static test_result_t test_find_diff(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t kd[] = {5,1,9,3,7,1,9,5,3,7};
+
+    /* ── Hit: key 9 → row 2 ── */
+    /* Side A — indexed */
+    ray_t* va = ray_vec_from_raw(RAY_I64, kd, 10);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(va));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_hash(&va)));
+
+    ray_t* needle_hit = ray_i64(9);
+    ray_t* ra = ray_find_fn(va, needle_hit);
+    ray_release(needle_hit);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ra));
+
+    /* Side B — plain vector (no index) */
+    ray_t* vb = ray_vec_from_raw(RAY_I64, kd, 10);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vb));
+    needle_hit = ray_i64(9);
+    ray_t* rb = ray_find_fn(vb, needle_hit);
+    ray_release(needle_hit);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(rb));
+
+    TEST_ASSERT(!RAY_ATOM_IS_NULL(ra) && !RAY_ATOM_IS_NULL(rb), "both hit must be non-null");
+    TEST_ASSERT_EQ_I(ra->i64, rb->i64);  /* same row index */
+
+    ray_release(ra); ray_release(rb);
+    ray_release(va); ray_release(vb);
+
+    /* ── Miss: key 4 → 0Nl ── */
+    ray_t* vc = ray_vec_from_raw(RAY_I64, kd, 10);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vc));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_hash(&vc)));
+
+    ray_t* needle_miss = ray_i64(4);
+    ray_t* rc = ray_find_fn(vc, needle_miss);
+    ray_release(needle_miss);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(rc));
+
+    ray_t* vd = ray_vec_from_raw(RAY_I64, kd, 10);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vd));
+    needle_miss = ray_i64(4);
+    ray_t* rd = ray_find_fn(vd, needle_miss);
+    ray_release(needle_miss);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(rd));
+
+    TEST_ASSERT(RAY_ATOM_IS_NULL(rc) && RAY_ATOM_IS_NULL(rd), "both miss must be null");
+
+    ray_release(rc); ray_release(rd);
+    ray_release(vc); ray_release(vd);
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* find_nulls_falls_back: null-bearing vec → consult NOT advanced
+ * (idx_fresh_nonull rejects it), correct result via scan.
+ * vec {5,1,NULL,3,7,1,9,5,3,7}; find 9 → row 6 (scan path). */
+static test_result_t test_find_nulls_falls_back(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t kd[] = {5,1,9,3,7,1,9,5,3,7};
+    ray_t* v = ray_vec_from_raw(RAY_I64, kd, 10);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+
+    /* Attach hash first, then set a null — mutation drops the index. */
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_hash(&v)));
+    ray_vec_set_null(v, 2, true);  /* sets row 2 to null; drops index */
+
+    uint64_t cons_before = ray_idx_consults[IDX_SITE_FIND];
+
+    ray_t* needle = ray_i64(9);
+    ray_t* result = ray_find_fn(v, needle);
+    ray_release(needle);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    /* Scan finds 9 at row 6 (row 2 is now null, 9 remains at row 6). */
+    TEST_ASSERT(!RAY_ATOM_IS_NULL(result), "scan must find 9");
+    TEST_ASSERT_EQ_I(result->i64, 6);
+
+    /* No index consult should have occurred */
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_consults[IDX_SITE_FIND] - cons_before), 0);
+
+    ray_release(result);
+    ray_release(v);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t idx_route_entries[] = {
     { "idx_route/hash_eq_still_works",   test_hash_eq_still_works,   NULL, NULL },
     { "idx_route/zone_none",             test_zone_none,             NULL, NULL },
@@ -1312,5 +1484,9 @@ const test_entry_t idx_route_entries[] = {
     { "idx_route/in_float_col_falls_back",   test_in_float_col_falls_back,   NULL, NULL },
     { "idx_route/hash_eq_time",              test_hash_eq_time,              NULL, NULL },
     { "idx_route/in_empty_set",              test_in_empty_set,              NULL, NULL },
+    { "idx_route/find_hit_first_occurrence", test_find_hit_first_occurrence, NULL, NULL },
+    { "idx_route/find_miss",                 test_find_miss,                 NULL, NULL },
+    { "idx_route/find_diff",                 test_find_diff,                 NULL, NULL },
+    { "idx_route/find_nulls_falls_back",     test_find_nulls_falls_back,     NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
