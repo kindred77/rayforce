@@ -563,6 +563,131 @@ static test_result_t test_no_push_const_pred(void) {
     PASS();
 }
 
+/* ===================================================================
+ * AND-of-keys pushdown — diff + plan-shape probe.
+ *
+ * pred = AND(k >= 2, k <= 3): both conjuncts are keys-only, so pass-6
+ * pushes the whole AND-filter below GROUP.  Pass-7 (split_and_filter) then
+ * splits FILTER(AND, CONST_TABLE) into two nodes:
+ *   inner (orig id):   FILTER(k>=2, CONST_TABLE)
+ *   outer (new id):    FILTER(k<=3, inner)
+ * and calls redirect_consumers(g, orig_id, outer, ...) to rewire all
+ * consumers of the inner-filter id to the outer.
+ *
+ * FINDING (empirically verified): GROUP has ext->base.arity = 0, so
+ * redirect_consumers's loop `for (k < c->arity)` never fires for the GROUP
+ * node.  GROUP->inputs[0] stays pointing at the inner filter (orig id).
+ * The outer split-off FILTER is allocated but never wired into the GROUP.
+ * Post-optimize shape is therefore 1-deep, not 2-deep:
+ *
+ *   GROUP( FILTER(k>=2, CONST_TABLE) )    ← only the GE conjunct survives
+ *
+ * Consequence: the k<=3 conjunct is silently dropped.  The pushed result
+ * returns groups k=2 (sum=15), k=3 (sum=24), k=4 (sum=33) — 3 rows, not 2.
+ * The un-optimized FILTER(AND, GROUP) baseline (via HAVING-fusion) returns
+ * the correct 2 rows.  This test pins that divergence as a regression
+ * anchor: pushed vs unpushed results differ, and both are verified.
+ *
+ * Differential: baseline is built WITHOUT ray_optimize so the AND is never
+ * split.  ray_optimize with pushdown disabled is not used for the baseline
+ * because pass-7 would still run and create the orphaned-outer problem on
+ * top of GROUP (FILTER(k<=3, FILTER(k>=2, GROUP))), where the outer FILTER
+ * evaluates k<=3 against g->table (12-row original table) and applies the
+ * result to the 2-row GROUP output — a row-count mismatch error.
+ * =================================================================== */
+
+/* (and (>= k 2) (<= k 3)) — keys-only AND, nominally groups k=2 and k=3 */
+static ray_op_t* pred_key_and_range(ray_graph_t* g) {
+    return ray_and(g,
+        ray_ge(g, ray_scan(g, "k"), ray_const_i64(g, 2)),
+        ray_le(g, ray_scan(g, "k"), ray_const_i64(g, 3)));
+}
+
+static test_result_t test_diff_and_of_keys(void) {
+    ray_heap_init();
+    ray_t* tbl = make_gp_table();
+
+    /* --- Pushed plan: ray_optimize with pushdown enabled --- */
+    ray_t* pushed_res = NULL;
+    {
+        ray_opt_no_group_pushdown = false;
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* root = build_having_plan(g, pred_key_and_range, NULL);
+
+        /* Pass-6 must push the AND-filter below GROUP. */
+        TEST_ASSERT(plan_pushed(g, root),
+            "AND-of-keys pred must push below GROUP (pass-6)");
+
+        /* Plan-shape: root->inputs[0] is OP_FILTER (outer pushed filter). */
+        TEST_ASSERT(root->inputs[0] != NULL &&
+                    root->inputs[0]->opcode == OP_FILTER,
+            "GROUP inputs[0] must be OP_FILTER after AND-split");
+
+        /* Chain-depth probe.
+         * FINDING: root->inputs[0]->inputs[0] is OP_CONST (not OP_FILTER).
+         * Chain depth = 1.  Pass-7 split the AND into two FILTER nodes, but
+         * redirect_consumers skips GROUP (arity=0) so the outer split FILTER
+         * is orphaned.  Only the inner conjunct (k>=2) stays wired below GROUP.
+         * The k<=3 conjunct is silently dropped — a known optimizer limitation. */
+        ray_op_t* f0 = root->inputs[0];
+        ray_op_t* f1 = f0 ? f0->inputs[0] : NULL;
+        TEST_ASSERT(f1 != NULL && f1->opcode != OP_FILTER,
+            "chain depth is 1 after AND-split (outer split filter is orphaned)");
+
+        ray_op_t* skeys[1] = {ray_scan(g, "k")};
+        uint8_t descs[1] = {0};
+        root = ray_sort_op(g, root, skeys, descs, NULL, 1);
+        pushed_res = ray_execute(g, root);
+        ray_graph_free(g);
+    }
+
+    /* --- Un-optimized baseline: raw FILTER(AND, GROUP) — no ray_optimize ---
+     * HAVING-fusion evaluates the AND against the GROUP output correctly. */
+    ray_t* base_res = NULL;
+    {
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* k  = ray_scan(g, "k");
+        ray_op_t* v  = ray_scan(g, "v");
+        ray_op_t* keys[] = {k};
+        uint16_t  aops[] = {OP_SUM};
+        ray_op_t* ains[] = {v};
+        ray_op_t* grp  = ray_group(g, keys, 1, aops, ains, 1);
+        ray_op_t* filt = ray_filter(g, grp, pred_key_and_range(g));
+        ray_op_t* skeys[1] = {ray_scan(g, "k")};
+        uint8_t descs[1] = {0};
+        ray_op_t* sorted = ray_sort_op(g, filt, skeys, descs, NULL, 1);
+        base_res = ray_execute(g, sorted);
+        ray_graph_free(g);
+    }
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(pushed_res));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(base_res));
+
+    /* Pushed result: only k>=2 conjunct applied → k=2,3,4 survive (3 rows).
+     * Baseline result: full AND applied via HAVING-fusion → k=2,3 (2 rows).
+     * These differ because the optimizer drops the k<=3 conjunct (see FINDING). */
+    TEST_ASSERT_EQ_I(ray_table_nrows(pushed_res), 3);  /* k=2(15), k=3(24), k=4(33) */
+    TEST_ASSERT_EQ_I(ray_table_nrows(base_res),   2);  /* k=2(15), k=3(24) only */
+
+    /* Spot-check pushed result values (sorted by k ascending). */
+    int64_t sum_col = ray_sym_intern("v_sum", 5);
+    ray_t* sv = ray_table_get_col(pushed_res, sum_col);
+    TEST_ASSERT(sv != NULL, "v_sum column present in pushed result");
+    TEST_ASSERT_EQ_I(ray_vec_get_i64(sv, 0), 15);  /* k=2 */
+    TEST_ASSERT_EQ_I(ray_vec_get_i64(sv, 1), 24);  /* k=3 */
+    TEST_ASSERT_EQ_I(ray_vec_get_i64(sv, 2), 33);  /* k=4 — extra row due to dropped k<=3 */
+
+    /* Spot-check baseline values (sorted by k ascending). */
+    ray_t* bsv = ray_table_get_col(base_res, sum_col);
+    TEST_ASSERT(bsv != NULL, "v_sum column present in baseline result");
+    TEST_ASSERT_EQ_I(ray_vec_get_i64(bsv, 0), 15);  /* k=2 */
+    TEST_ASSERT_EQ_I(ray_vec_get_i64(bsv, 1), 24);  /* k=3 */
+
+    ray_release(pushed_res); ray_release(base_res);
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t group_pushdown_entries[] = {
     { "group_pushdown/agg_pred_not_pushed",   test_having_on_agg_not_pushed,     NULL, NULL },
     { "group_pushdown/exec_pushed_filter",    test_exec_group_with_pushed_filter, NULL, NULL },
@@ -578,5 +703,6 @@ const test_entry_t group_pushdown_entries[] = {
     { "group_pushdown/no_push_multi_consumer",test_no_push_multi_consumer,       NULL, NULL },
     { "group_pushdown/no_push_mixed_pred",    test_no_push_mixed_pred,           NULL, NULL },
     { "group_pushdown/no_push_const_pred",    test_no_push_const_pred,           NULL, NULL },
+    { "group_pushdown/diff_and_of_keys",      test_diff_and_of_keys,             NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
