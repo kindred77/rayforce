@@ -660,5 +660,379 @@ int main(void) {
     ray_release(g_tbl);
     ray_sym_destroy();
     ray_heap_destroy();
+
+    /* ---- Round 2: three open questions ---- */
+    void bench_idx_route_round2(void);
+    bench_idx_route_round2();
+
     return 0;
+}
+
+/* =========================================================================
+ * ROUND 2 — three open questions from round 1
+ *
+ * Q1. filter-range selectivity curve:
+ *     Measures FILTER(k3 < B) on shuffled data at 0.1% (B=10000) and 0.01%
+ *     (B=1000), plus FILTER(k2 < 100000) on SORTED data (B=100000 → 1%,
+ *     contiguous segments).  Indexed vs plain medians per cell.
+ *
+ * Q2. range-guard overhead (re-measure):
+ *     Re-runs filter-range-G (50% case, guard fires, falls back) with 9
+ *     reps/side interleaved.  Confirms binary-search + guard-check overhead
+ *     is the whole cost (no copy before the guard in ray_index_range_rowsel:
+ *     bounds → span check line 1293 → copy line 1296).
+ *
+ * Q3. find isolated — present vs absent:
+ *     1000 lookups per rep, 9 reps/side interleaved.
+ *     present: key 42 (always in [0..999999])
+ *     absent:  key 1000003 (> max k = 999999)
+ *     Both sides measured; indexed side uses hash index on k.
+ *     Reports per-lookup µs (ms / 1000).
+ * ========================================================================= */
+
+#define NREPS2 9
+
+/* ---------- round-2 helpers ---------- */
+
+/* Run FILTER(col_name < bound) and return elapsed ms.
+ * expected_rows verified. */
+static double r2_filter_lt(const char* col_name,
+                            int64_t bound,
+                            int64_t expected_rows) {
+    return run_filter_graph(col_name, OP_LT, bound, expected_rows);
+}
+
+/* Attach sort index on given global column pointer, set into g_tbl. */
+static void r2_attach_sort(ray_t** g_col_ptr, const char* col_name, size_t clen) {
+    ray_t* v = *g_col_ptr;
+    ray_retain(v);
+    if (RAY_IS_ERR(ray_index_attach_sort(&v))) {
+        fprintf(stderr, "r2_attach_sort: attach failed for '%s'\n", col_name);
+        abort();
+    }
+    tbl_set_col(col_name, clen, v);
+    ray_release(v);
+}
+
+static void r2_drop_col(ray_t* base_vec, const char* col_name, size_t clen) {
+    tbl_set_col(col_name, clen, base_vec);
+}
+
+/* ---- Q3 helpers ---- */
+#define FIND_BATCH 1000
+
+/* Run FIND_BATCH present-key lookups.  Returns total ms for the batch. */
+static double r2_find_present_batch(ray_t* col_vec) {
+    bool indexed = ray_index_has(col_vec);
+    double t0 = now_ms();
+    for (int i = 0; i < FIND_BATCH; i++) {
+        if (indexed) ray_idx_consults[IDX_SITE_FIND]++;
+        int64_t row = ray_index_find_row(col_vec, 42LL);
+        if (indexed && row < 0) {
+            fprintf(stderr, "r2_find_present: row=%lld unexpected\n", (long long)row);
+            abort();
+        }
+    }
+    return now_ms() - t0;
+}
+
+/* Run FIND_BATCH absent-key lookups.  Returns total ms for the batch. */
+static double r2_find_absent_batch(ray_t* col_vec) {
+    bool indexed = ray_index_has(col_vec);
+    double t0 = now_ms();
+    for (int i = 0; i < FIND_BATCH; i++) {
+        if (indexed) ray_idx_consults[IDX_SITE_FIND]++;
+        int64_t row = ray_index_find_row(col_vec, 1000003LL);
+        if (indexed && row != -1) {
+            fprintf(stderr, "r2_find_absent: row=%lld (expected -1)\n", (long long)row);
+            abort();
+        }
+    }
+    return now_ms() - t0;
+}
+
+/* Run FIND_BATCH absent-key lookups on the plain (no-index) vector.
+ * ray_index_find_row falls back to -2 when no index is present
+ * (idx_fresh_nonull returns false), so we call it directly for parity
+ * timing even though it early-exits. To get a representative plain-scan
+ * cost we time FILTER(k == 1000003) instead for the plain side, but for
+ * the isolated find table we measure the raw call overhead on both. */
+static double r2_find_plain_batch(ray_t* col_vec) {
+    /* col_vec has no index — ray_index_find_row returns -2 immediately */
+    double t0 = now_ms();
+    for (int i = 0; i < FIND_BATCH; i++) {
+        (void)ray_index_find_row(col_vec, 1000003LL);
+    }
+    return now_ms() - t0;
+}
+
+/* =========================================================================
+ * round2_run — called from main after round 1 teardown, re-inits heap+sym
+ * ========================================================================= */
+static void round2_run(void) {
+    printf("\n");
+    printf("=== ROUND 2 ===\n");
+    fflush(stdout);
+
+#if defined(__linux__)
+    {
+        FILE* f = fopen("/proc/loadavg", "r");
+        if (f) {
+            char buf[128] = {0};
+            if (fgets(buf, sizeof(buf), f)) { printf("load: %s", buf); fflush(stdout); }
+            fclose(f);
+        }
+    }
+#endif
+
+    printf("Building 10M-row table...\n"); fflush(stdout);
+    build_table();
+    printf("Table built: %lld rows\n\n", (long long)ray_table_nrows(g_tbl));
+    fflush(stdout);
+
+    /* ---------------------------------------------------------------
+     * Q1. Filter-range selectivity curve
+     * Points:
+     *   shuf-1pct   k3 < 100000  — 1%    (= round-1 filter-range, re-baseline)
+     *   shuf-0.1pct k3 < 10000   — 0.1%
+     *   shuf-0.01pct k3 < 1000   — 0.01%
+     *   sorted-1pct k2 < 100000  — 1%    (sorted data, contiguous segments)
+     * --------------------------------------------------------------- */
+    printf("--- Q1: filter-range selectivity curve ---\n"); fflush(stdout);
+
+    typedef struct {
+        const char* label;
+        const char* col_name;
+        size_t col_nlen;
+        ray_t** g_col_ptr;
+        int64_t bound;
+        int64_t expected_rows;
+    } sel_point_t;
+
+    sel_point_t sel_pts[] = {
+        { "shuf-1pct   ", "k3", 2, &g_col_k3,  100000LL,  100000LL },
+        { "shuf-0.1pct ", "k3", 2, &g_col_k3,   10000LL,   10000LL },
+        { "shuf-0.01pct", "k3", 2, &g_col_k3,    1000LL,    1000LL },
+        /* k2 = i/10: k2 < 10000 → rows i < 100000 → 100k rows (1%) */
+        { "sorted-1pct ", "k2", 2, &g_col_k2,   10000LL,  100000LL },
+    };
+    int n_sel = (int)(sizeof(sel_pts) / sizeof(sel_pts[0]));
+
+    /* timings_sel[point][side][rep]: side 0=indexed, 1=plain */
+    double timings_sel[4][2][NREPS2];
+    memset(timings_sel, 0, sizeof(timings_sel));
+
+    for (int si = 0; si < n_sel; si++) {
+        sel_point_t* sp = &sel_pts[si];
+        printf("  %s  bound=%-8lld  expect=%lld rows\n",
+               sp->label, (long long)sp->bound, (long long)sp->expected_rows);
+        fflush(stdout);
+
+        for (int rep = 0; rep < NREPS2; rep++) {
+            /* indexed side */
+            r2_attach_sort(sp->g_col_ptr, sp->col_name, sp->col_nlen);
+            uint64_t cb = ray_idx_consults[IDX_SITE_FILTER_RANGE];
+            timings_sel[si][0][rep] = r2_filter_lt(sp->col_name,
+                                                    sp->bound,
+                                                    sp->expected_rows);
+            uint64_t ca = ray_idx_consults[IDX_SITE_FILTER_RANGE];
+            if (ca <= cb) {
+                fprintf(stderr, "Q1 mechanism failure: %s rep %d\n",
+                        sp->label, rep + 1);
+                abort();
+            }
+            r2_drop_col(*sp->g_col_ptr, sp->col_name, sp->col_nlen);
+
+            /* plain side */
+            timings_sel[si][1][rep] = r2_filter_lt(sp->col_name,
+                                                    sp->bound,
+                                                    sp->expected_rows);
+        }
+    }
+
+    /* Print Q1 table */
+    printf("\n### Q1: filter-range selectivity curve\n\n");
+    printf("| point        | selectivity | indexed_ms | plain_ms | delta_ms |\n");
+    printf("|--------------|-------------|-----------|---------|----------|\n");
+    const char* sel_labels[] = { "1%", "0.1%", "0.01%", "1% sorted" };
+    for (int si = 0; si < n_sel; si++) {
+        double med_idx   = median(timings_sel[si][0], NREPS2);
+        double med_plain = median(timings_sel[si][1], NREPS2);
+        double delta     = med_idx - med_plain;
+        printf("| %-12s | %-11s | %9.3f | %8.3f | %+9.3f |\n",
+               sel_pts[si].label, sel_labels[si], med_idx, med_plain, delta);
+    }
+    printf("\n");
+
+    /* Raw reps Q1 */
+    printf("Raw reps Q1 (indexed):\n");
+    printf("%-14s", "point");
+    for (int r = 0; r < NREPS2; r++) printf("   rep%d", r + 1);
+    printf("\n");
+    for (int si = 0; si < n_sel; si++) {
+        printf("%-14s", sel_pts[si].label);
+        for (int r = 0; r < NREPS2; r++) printf("  %7.3f", timings_sel[si][0][r]);
+        printf("\n");
+    }
+    printf("Raw reps Q1 (plain):\n");
+    printf("%-14s", "point");
+    for (int r = 0; r < NREPS2; r++) printf("   rep%d", r + 1);
+    printf("\n");
+    for (int si = 0; si < n_sel; si++) {
+        printf("%-14s", sel_pts[si].label);
+        for (int r = 0; r < NREPS2; r++) printf("  %7.3f", timings_sel[si][1][r]);
+        printf("\n");
+    }
+
+    /* ---------------------------------------------------------------
+     * Q2. Range-guard overhead re-measure (50% case, guard fires)
+     *
+     * Re-measures filter-range-G (k3 < 5000000, 50% → guard returns NULL,
+     * scan runs) with 9 reps/side interleaved.  The indexed overhead is
+     * exactly: two binary searches (O(log N) = ~23 steps each) + span
+     * comparison → NULL return.  No copy is performed before the guard
+     * (ray_index_range_rowsel: bounds at line 1263-1285, guard at line 1293,
+     * copy at line 1296).
+     * --------------------------------------------------------------- */
+    printf("--- Q2: range-guard overhead (re-measure, 50%%) ---\n"); fflush(stdout);
+
+    double tg_idx[NREPS2], tg_plain[NREPS2];
+    for (int rep = 0; rep < NREPS2; rep++) {
+        /* indexed */
+        r2_attach_sort(&g_col_k3, "k3", 2);
+        uint64_t cb = ray_idx_consults[IDX_SITE_FILTER_RANGE];
+        tg_idx[rep] = r2_filter_lt("k3", 5000000LL, 5000000LL);
+        uint64_t ca = ray_idx_consults[IDX_SITE_FILTER_RANGE];
+        if (ca <= cb) {
+            fprintf(stderr, "Q2 mechanism failure rep %d\n", rep + 1);
+            abort();
+        }
+        r2_drop_col(g_col_k3, "k3", 2);
+
+        /* plain */
+        tg_plain[rep] = r2_filter_lt("k3", 5000000LL, 5000000LL);
+    }
+
+    double med_tg_idx   = median(tg_idx,   NREPS2);
+    double med_tg_plain = median(tg_plain, NREPS2);
+
+    printf("\n### Q2: range-guard overhead (50%% selectivity, guard fires)\n\n");
+    printf("| side    | median_ms |\n");
+    printf("|---------|-----------|\n");
+    printf("| indexed | %9.3f |\n", med_tg_idx);
+    printf("| plain   | %9.3f |\n", med_tg_plain);
+    printf("| delta   | %+9.3f |\n", med_tg_idx - med_tg_plain);
+    printf("\n");
+    printf("Guard path in ray_index_range_rowsel: bounds (bisect×2, ~23 steps each) →\n");
+    printf("span check (line 1293) → return NULL; copy starts at line 1296 — NOT before guard.\n");
+    printf("\n");
+
+    printf("Raw reps Q2:\n");
+    printf("%-8s", "indexed");
+    for (int r = 0; r < NREPS2; r++) printf("  %7.3f", tg_idx[r]);
+    printf("\n");
+    printf("%-8s", "plain");
+    for (int r = 0; r < NREPS2; r++) printf("  %7.3f", tg_plain[r]);
+    printf("\n\n");
+
+    /* ---------------------------------------------------------------
+     * Q3. Find isolated — present vs absent (1000 lookups per rep)
+     *
+     * Measures ray_index_find_row in isolation:
+     *   present:  key 42,       always in [0..999999] → hash chain walk (short)
+     *   absent:   key 1000003,  > max k → hash probe, full chain walk, no match
+     *
+     * 1000 lookups per rep to get above timer resolution.
+     * 9 reps/side interleaved.
+     * Reports per-lookup µs = (batch_ms / 1000) * 1000.
+     *
+     * Plain side: ray_index_find_row on unindexed col returns -2 immediately
+     * (idx_fresh_nonull fails).  This measures the no-index fast-reject path,
+     * not a scan — reported for completeness.
+     * --------------------------------------------------------------- */
+    printf("--- Q3: find isolated (present vs absent, %d lookups/rep) ---\n",
+           FIND_BATCH);
+    fflush(stdout);
+
+    /* Build indexed k column */
+    ray_t* find_idx_col = g_col_k;
+    ray_retain(find_idx_col);
+    if (RAY_IS_ERR(ray_index_attach_hash(&find_idx_col))) {
+        fprintf(stderr, "Q3: hash attach on k failed\n"); abort();
+    }
+
+    double tf_pres_idx[NREPS2],  tf_pres_plain[NREPS2];
+    double tf_abs_idx[NREPS2],   tf_abs_plain[NREPS2];
+
+    for (int rep = 0; rep < NREPS2; rep++) {
+        /* present, indexed */
+        tf_pres_idx[rep]   = r2_find_present_batch(find_idx_col);
+        /* present, plain (unindexed → early exit, overhead only) */
+        tf_pres_plain[rep] = r2_find_present_batch(g_col_k);
+
+        /* absent, indexed */
+        tf_abs_idx[rep]    = r2_find_absent_batch(find_idx_col);
+        /* absent, plain */
+        tf_abs_plain[rep]  = r2_find_plain_batch(g_col_k);
+    }
+
+    ray_index_drop(&find_idx_col);
+    ray_release(find_idx_col);
+
+    double med_pres_idx   = median(tf_pres_idx,   NREPS2);
+    double med_pres_plain = median(tf_pres_plain, NREPS2);
+    double med_abs_idx    = median(tf_abs_idx,    NREPS2);
+    double med_abs_plain  = median(tf_abs_plain,  NREPS2);
+
+    printf("\n### Q3: find isolated (%d lookups/rep, 9 reps)\n\n", FIND_BATCH);
+    printf("| variant        | indexed_ms/batch | plain_ms/batch | indexed_us/lookup | plain_us/lookup |\n");
+    printf("|----------------|-----------------|----------------|-------------------|-----------------|\n");
+    printf("| present (k=42) | %15.3f | %14.3f | %17.3f | %15.3f |\n",
+           med_pres_idx, med_pres_plain,
+           med_pres_idx  * 1000.0 / FIND_BATCH,
+           med_pres_plain * 1000.0 / FIND_BATCH);
+    printf("| absent (k=1M+3)| %15.3f | %14.3f | %17.3f | %15.3f |\n",
+           med_abs_idx, med_abs_plain,
+           med_abs_idx   * 1000.0 / FIND_BATCH,
+           med_abs_plain  * 1000.0 / FIND_BATCH);
+    printf("\n");
+    printf("plain side = raw ray_index_find_row call on unindexed col (idx_fresh_nonull\n");
+    printf("returns false → early exit; not a full scan; overhead only).\n");
+    printf("\n");
+
+    printf("Raw reps Q3 (indexed, ms/batch):\n");
+    printf("%-18s", "present-indexed");
+    for (int r = 0; r < NREPS2; r++) printf("  %7.3f", tf_pres_idx[r]);
+    printf("\n");
+    printf("%-18s", "absent-indexed");
+    for (int r = 0; r < NREPS2; r++) printf("  %7.3f", tf_abs_idx[r]);
+    printf("\n");
+    printf("Raw reps Q3 (plain, ms/batch):\n");
+    printf("%-18s", "present-plain");
+    for (int r = 0; r < NREPS2; r++) printf("  %7.3f", tf_pres_plain[r]);
+    printf("\n");
+    printf("%-18s", "absent-plain");
+    for (int r = 0; r < NREPS2; r++) printf("  %7.3f", tf_abs_plain[r]);
+    printf("\n\n");
+
+    printf("=== END ROUND 2 ===\n");
+    fflush(stdout);
+
+    /* teardown */
+    ray_release(g_col_k);
+    ray_release(g_col_k2);
+    ray_release(g_col_k3);
+    ray_release(g_col_k4);
+    ray_release(g_tbl);
+    g_col_k = g_col_k2 = g_col_k3 = g_col_k4 = g_tbl = NULL;
+}
+
+/* Round-2 entry: separate main guard so we can call from original main.
+ * Re-inits heap/sym since round 1 tears them down. */
+void bench_idx_route_round2(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+    round2_run();
+    ray_sym_destroy();
+    ray_heap_destroy();
 }

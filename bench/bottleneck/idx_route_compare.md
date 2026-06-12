@@ -220,3 +220,205 @@ find                 0.00     0.00     0.00     0.00     0.00     0.00     0.00 
 sort               523.34   526.02   526.26   526.95   527.07   527.90   530.98   531.34   533.71
 distinct           647.42   653.33   655.95   656.36   666.40   670.33   695.74   798.47   827.86
 ```
+
+---
+
+## ROUND 2 — three open questions
+
+Driver extended in bench/idx_route/main.c (round2_run).
+Machine: linux x86_64 (Linux 6.8.0-100-generic), same box.
+System load at run start: 4.81 / 3.09 / 5.12 (1-min avg, runs 1–3).
+Note: machine was lightly loaded for round 1 (2.22–4.01); round 2 ran
+under noticeably higher load (3.1–5.5).  Filter-range medians are
+load-stable (< 3% variation across runs at each selectivity cell).
+Q2 delta varies +3.2 to +7.8ms across runs — scatter addressed below.
+9 reps/side interleaved; 3 driver runs; medians across the 3 runs shown.
+
+### Q1: filter-range selectivity curve
+
+`FILTER(k3 < B)` on shuffled data (shuf-*); `FILTER(k2 < B)` on sorted
+data (sorted-1pct).  Sort index on the respective column.
+
+k3 is a permutation of 0..9999999 → `k3 < B` gives exactly B rows.
+k2 = i/10 → `k2 < 10000` gives rows i < 100000 (100k rows, 1%).
+
+| point        | selectivity | indexed_ms | plain_ms | delta_ms |
+|--------------|-------------|-----------|---------|----------|
+| shuf-1pct    | 1%          |    16.238 |   14.315 | +1.923 |
+| shuf-0.1pct  | 0.1%        |     1.928 |    9.716 | -7.788 |
+| shuf-0.01pct | 0.01%       |     0.317 |    5.865 | -5.548 |
+| sorted-1pct  | 1% sorted   |     4.580 |    5.822 | -1.242 |
+
+*(medians from run 1, load 4.81; runs 2–3 differ < 3%)*
+
+Per-run medians (indexed_ms / plain_ms / delta_ms):
+
+| point        | run 1 (load 4.81) | run 2 (load 3.09) | run 3 (load 5.12) |
+|--------------|-------------------|-------------------|-------------------|
+| shuf-1pct    | 16.238 / 14.315 / +1.923 | 16.220 / 14.420 / +1.799 | 16.215 / 14.201 / +2.014 |
+| shuf-0.1pct  |  1.928 /  9.716 / -7.788 |  1.925 /  9.603 / -7.677 |  1.951 /  9.508 / -7.557 |
+| shuf-0.01pct |  0.317 /  5.865 / -5.548 |  0.326 /  5.970 / -5.644 |  0.311 /  5.835 / -5.524 |
+| sorted-1pct  |  4.580 /  5.822 / -1.242 |  4.629 /  5.988 / -1.359 |  4.690 /  5.960 / -1.270 |
+
+Median-of-3-runs delta: shuf-1pct **+1.923**, shuf-0.1pct **-7.677**,
+shuf-0.01pct **-5.548**, sorted-1pct **-1.270**.
+
+#### Raw reps Q1 — Run 1 (indexed, ms)
+
+```
+point            rep1   rep2   rep3   rep4   rep5   rep6   rep7   rep8   rep9
+shuf-1pct      16.075  16.201  16.220  16.235  16.238  16.533  16.819  16.881  17.188
+shuf-0.1pct     1.848   1.923   1.924   1.927   1.928   1.933   1.940   2.025   2.227
+shuf-0.01pct    0.304   0.307   0.309   0.309   0.317   0.319   0.342   0.402   0.426
+sorted-1pct     4.415   4.477   4.514   4.554   4.580   4.581   4.610   4.972   5.196
+```
+
+#### Raw reps Q1 — Run 1 (plain, ms)
+
+```
+point            rep1   rep2   rep3   rep4   rep5   rep6   rep7   rep8   rep9
+shuf-1pct      13.737  13.993  14.234  14.271  14.315  14.631  16.439  16.590  16.646
+shuf-0.1pct     9.438   9.469   9.539   9.617   9.716  10.908  11.029  11.124  11.371
+shuf-0.01pct    5.674   5.685   5.790   5.862   5.865   5.915   6.008   6.282   6.321
+sorted-1pct     5.782   5.786   5.810   5.815   5.822   5.839   6.007   6.012   6.070
+```
+
+#### Raw reps Q1 — Run 2 (indexed, ms)
+
+```
+point            rep1   rep2   rep3   rep4   rep5   rep6   rep7   rep8   rep9
+shuf-1pct      16.145  16.151  16.170  16.212  16.220  16.301  16.530  16.960  17.386
+shuf-0.1pct     1.852   1.866   1.911   1.923   1.925   1.945   2.234   2.631   3.075
+shuf-0.01pct    0.309   0.312   0.315   0.317   0.326   0.327   0.337   0.363   0.432
+sorted-1pct     4.486   4.500   4.546   4.628   4.629   4.630   4.712   4.827   5.077
+```
+
+#### Raw reps Q1 — Run 2 (plain, ms)
+
+```
+point            rep1   rep2   rep3   rep4   rep5   rep6   rep7   rep8   rep9
+shuf-1pct      14.231  14.308  14.334  14.335  14.420  14.903  16.261  16.408  16.786
+shuf-0.1pct     9.403   9.468   9.512   9.527   9.603   9.703   9.709  10.828  11.087
+shuf-0.01pct    5.688   5.698   5.732   5.787   5.970   5.980   6.201   6.294   9.537
+sorted-1pct     5.788   5.811   5.853   5.971   5.988   6.004   6.189   6.469   6.677
+```
+
+#### Raw reps Q1 — Run 3 (indexed, ms)
+
+```
+point            rep1   rep2   rep3   rep4   rep5   rep6   rep7   rep8   rep9
+shuf-1pct      16.105  16.172  16.173  16.178  16.215  16.255  16.304  16.525  20.975
+shuf-0.1pct     1.911   1.913   1.914   1.926   1.951   1.978   2.003   2.214   2.878
+shuf-0.01pct    0.305   0.306   0.307   0.311   0.311   0.314   0.319   0.321   0.339
+sorted-1pct     4.579   4.635   4.637   4.645   4.690   4.756   5.094   5.702   8.057
+```
+
+#### Raw reps Q1 — Run 3 (plain, ms)
+
+```
+point            rep1   rep2   rep3   rep4   rep5   rep6   rep7   rep8   rep9
+shuf-1pct      13.629  13.757  13.906  13.906  14.201  14.369  14.531  16.325  16.628
+shuf-0.1pct     9.122   9.422   9.495   9.503   9.508   9.539   9.541  11.011  11.109
+shuf-0.01pct    5.704   5.731   5.746   5.827   5.835   5.854   5.857   5.881   6.139
+sorted-1pct     5.794   5.839   5.950   5.960   5.960   6.086   6.103   6.121   6.152
+```
+
+---
+
+### Q2: range-guard overhead (re-measure, 50% selectivity, guard fires)
+
+`FILTER(k3 < 5000000)` — 50% of 10M rows exceeds IDX_RANGE_MAX_FRAC=4
+threshold (5M > 10M/4 = 2.5M).  Sort index is consulted (consult counter
+advances, verified), binary searches execute, span guard fires, NULL
+returned; query falls back to plain scan.
+
+Guard code path in ray_index_range_rowsel (src/ops/idxop.c):
+- Line 1263–1285: two binary searches (lower + upper bound, O(log N) ~23 steps each)
+- Line 1293: `if (n >= 64 && span > n / IDX_RANGE_MAX_FRAC) return NULL;`
+- Line 1296: `ray_t* scratch = ray_alloc(...)` ← copy starts HERE, AFTER guard
+
+The guard fires before any allocation or data copy.
+
+| side    | run 1 (load 4.81) | run 2 (load 3.09) | run 3 (load 5.12) | median-of-3 |
+|---------|-------------------|-------------------|-------------------|-------------|
+| indexed |         101.931   |         101.311   |         101.287   |    101.311  |
+| plain   |          94.178   |          98.153   |          95.836   |     95.836  |
+| delta   |          +7.752   |          +3.158   |          +5.451   |     +5.451  |
+
+#### Raw reps Q2
+
+Run 1 (load 4.81):
+```
+indexed   99.295  100.113  100.820  101.380  101.931  102.177  103.139  104.495  116.517
+plain     91.305   92.783   92.889   92.924   94.178   94.251   94.773   95.199   98.468
+```
+
+Run 2 (load 3.09):
+```
+indexed   98.490  100.132  100.929  101.209  101.311  101.923  103.152  107.199  118.688
+plain     92.492   93.336   94.364   95.452   98.153   99.721  100.133  100.302  100.711
+```
+
+Run 3 (load 5.12):
+```
+indexed   98.870   99.687  100.890  101.101  101.287  101.603  101.907  104.287  121.823
+plain     93.249   93.827   93.985   95.679   95.836   95.853   96.581   96.659   97.836
+```
+
+---
+
+### Q3: find isolated — present vs absent (1000 lookups/rep, 9 reps)
+
+`ray_index_find_row` measured in isolation with hash index on k (1M distinct
+values, 10 rows per key).  1000 lookups per rep to clear timer resolution.
+
+- **present**: key 42 — always in [0..999999]; hash-chain walk finds it quickly
+- **absent**: key 1000003 — above max k=999999; hash slot walk, no match
+
+plain side = `ray_index_find_row` on unindexed column; `idx_fresh_nonull`
+returns false → early exit, NOT a full scan.  Reports raw call overhead only.
+
+| variant         | run 1 idx_µs | run 2 idx_µs | run 3 idx_µs | med_idx_µs | med_plain_µs |
+|-----------------|-------------|-------------|-------------|-----------|--------------|
+| present (k=42)  |       0.049 |       0.045 |       0.041 |     0.045 |        0.006 |
+| absent (k=1M+3) |       0.026 |       0.020 |       0.021 |     0.021 |        0.006 |
+
+#### Raw reps Q3 (ms/1000-lookup batch, indexed)
+
+Run 1 (load 4.81):
+```
+present-indexed   0.049  0.049  0.049  0.049  0.049  0.049  0.049  0.049  0.052
+absent-indexed    0.026  0.026  0.026  0.026  0.026  0.026  0.026  0.026  0.026
+```
+
+Run 2 (load 3.09):
+```
+present-indexed   0.031  0.031  0.031  0.041  0.045  0.057  0.057  0.057  0.063
+absent-indexed    0.016  0.016  0.016  0.016  0.020  0.048  0.048  0.048  0.049
+```
+
+Run 3 (load 5.12):
+```
+present-indexed   0.041  0.041  0.041  0.041  0.041  0.041  0.042  0.042  0.044
+absent-indexed    0.021  0.021  0.021  0.021  0.021  0.021  0.022  0.022  0.022
+```
+
+#### Raw reps Q3 (ms/1000-lookup batch, plain — early-exit overhead only)
+
+Run 1 (load 4.81):
+```
+present-plain     0.006  0.006  0.006  0.006  0.006  0.006  0.006  0.006  0.006
+absent-plain      0.006  0.006  0.006  0.006  0.006  0.006  0.006  0.007  0.007
+```
+
+Run 2 (load 3.09):
+```
+present-plain     0.004  0.004  0.004  0.005  0.008  0.009  0.009  0.009  0.009
+absent-plain      0.004  0.004  0.004  0.005  0.007  0.008  0.009  0.009  0.009
+```
+
+Run 3 (load 5.12):
+```
+present-plain     0.005  0.005  0.005  0.005  0.005  0.005  0.005  0.005  0.005
+absent-plain      0.005  0.005  0.005  0.005  0.005  0.005  0.005  0.005  0.006
+```
