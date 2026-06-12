@@ -422,3 +422,78 @@ Run 3 (load 5.12):
 present-plain     0.005  0.005  0.005  0.005  0.005  0.005  0.005  0.005  0.005
 absent-plain      0.005  0.005  0.005  0.005  0.005  0.005  0.005  0.005  0.006
 ```
+
+---
+
+## ROUND 3 — guard tightened to 1/128; confirmation measurements
+
+Guard changed: `IDX_RANGE_MAX_FRAC 4` → `128`.  New threshold: span > n/128
+(~0.78% of 10M = 78125 rows).
+
+Two confirmation points (single driver run, load 3.10, same box):
+
+| point       | selectivity | indexed_ms | plain_ms | delta_ms | verdict         |
+|-------------|-------------|-----------|---------|----------|-----------------|
+| shuf-0.1pct | 0.1%        |     1.957 |    9.961 |   -8.004 | HIT — span 10000 < 78125 ✓ |
+| shuf-1pct   | 1%          |    16.828 |   15.402 |   +1.427 | BAIL — span 100000 > 78125; delta within scan noise ✓ |
+
+shuf-0.1pct: index path taken, -8ms win preserved.
+shuf-1pct: guard fires, indexed falls back to scan; +1.4ms is scan-variance noise
+(identical code path as plain after guard fires).
+
+sorted-1pct (incidental): was -1.27ms win with old guard (sorted data, contiguous
+segments); now +0.26ms (guard fires, win forfeited).  Expected — guard is
+layout-blind; revisit if RAY_ATTR_SORTED signal is ever available.
+
+---
+
+## CONTROLLER VERDICTS
+
+### zone (filter-zone-N / filter-zone-A): WIN — keep
+
+-4.5ms median across all 3 runs, stable.  Zone map prunes NONE/ALL segments
+before any row evaluation.
+
+### bloom (filter-bloom): WIN — keep
+
+-5.4ms median.  Bloom absent-key prune fires on 0 matching rows in the 1M-key
+column; consult cost ~0.013ms is negligible vs 5.4ms scan.
+
+### in (in_hash): WIN — keep
+
+-16ms median (~16x speedup vs scan for 1M-key column lookup).
+
+### sort (sort_asc / sort_desc): WIN — keep
+
+~105ms win on 500ms baseline (~20% speedup); O(N) perm-gather replaces O(N log N)
+sort.
+
+### distinct (distinct_sorted): WIN — keep
+
+~460–640ms win (2–4x speedup); sort index walk replaces full sort+dedup.
+
+### find (find_hit / find_miss): WIN — keep
+
+O(1) hash probe vs O(n) absent-key scan.  Both sides register 0.000ms in the
+bench timer (sub-microsecond per lookup); the "plain" column measured the
+`idx_fresh_nonull` early-exit path (~6ns/call) — i.e. zero overhead on
+unindexed columns, not a full scan baseline.  Win by construction: hash probe
+≈0.04µs vs absent-key scan ≈5.9ms (Q3 isolation measurement, 1000 lookups/rep).
+
+### filter-range: WIN with guard tightened to 1/128
+
+Guard IDX_RANGE_MAX_FRAC tightened from 4 (25%) to 128 (~0.78%) per the
+measured selectivity curve (ROUND 2 Q1): loses +1.9ms at 1% shuffled,
+wins -7.8ms at 0.1% shuffled.  1/128 admits the 0.1% win region and rejects
+the loss region.  Round 3 confirms: shuf-0.1pct still hits (-8ms); shuf-1pct
+bails (+1.4ms noise).
+
+Sorted-layout 1% wins (previously -1.27ms) are forfeited; the guard is
+layout-blind (no RAY_ATTR_SORTED signal).  Revisit if that attribute is added.
+
+### guard-overhead question (Q2): CLOSED — scan-variance noise
+
+50% selectivity case adds +3.2 to +7.8ms across 3 runs; variance equals the
+plain-scan run-to-run scatter.  After the guard fires the code path is
+identical to a plain scan; the delta measures only OS jitter on the 10M-row
+FILTER, not guard overhead per se.  No action needed.

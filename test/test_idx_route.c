@@ -914,7 +914,8 @@ static test_result_t test_range_ne_falls_back(void) {
 }
 
 /* range_guard: 100k-row fixture (k = i % 100); (< k 50) → ~50k rows.
- * Selectivity guard (>25%) prevents hit; row count must still be correct. */
+ * Selectivity 50% far exceeds IDX_RANGE_MAX_FRAC=128 threshold (~0.78%);
+ * guard prevents hit; row count must still be correct via plain scan. */
 static test_result_t test_range_guard(void) {
     ray_heap_init();
     (void)ray_sym_init();
@@ -952,7 +953,7 @@ static test_result_t test_range_guard(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     TEST_ASSERT_EQ_I(ray_table_nrows(r), 50000);
 
-    /* Guard fires — selectivity 50% > 25% → hit must NOT advance. */
+    /* Guard fires — selectivity 50% far exceeds ~0.78% threshold → hit must NOT advance. */
     TEST_ASSERT_EQ_I((int64_t)(ray_idx_hits[IDX_SITE_FILTER_RANGE] - hits_before), 0);
 
     ray_release(r);
@@ -1000,25 +1001,26 @@ static test_result_t test_range_f64(void) {
 
 /* ─── Rowsel ALL-segment regression (corrupted offsets) ───────────── */
 
-/* (< k 3000) on the 16384-row sorted fixture below. */
-static ray_op_t* pred_lt_3000(ray_graph_t* g) {
-    return ray_lt(g, ray_scan(g, "k"), ray_const_i64(g, 3000));
+/* (< k 1500) on the 262144-row sorted fixture below. */
+static ray_op_t* pred_lt_1500(ray_graph_t* g) {
+    return ray_lt(g, ray_scan(g, "k"), ray_const_i64(g, 1500));
 }
 
-/* range_sorted_all_segments: 16384-row SORTED I64 column k=i (v=i);
- * (< k 3000) → 3000 rows.  Span 3000 <= n/4 = 4096 so the selectivity
- * guard admits the range path.  Match layout: segments 0 and 1 are
- * 100% matched (ALL), segment 2 is partial (MIX, 952 rows), the rest
- * NONE.  Regression pin for the rowsel_from_sorted_ids ALL-segment
- * rollback bug: the old sweep did `cum -= pc` for ALL segments even
- * though cum was never advanced for them, wrapping the uint32 write
- * cursor and sending every subsequent idx_arr write out of bounds
- * (ASan heap-buffer-overflow; silent corruption in release). */
+/* range_sorted_all_segments: 262144-row SORTED I64 column k=i (v=i);
+ * (< k 1500) → 1500 rows.  Span 1500 <= n/128 = 2048 so the selectivity
+ * guard admits the range path.  Match layout: segment 0 (rows 0-1023) is
+ * 100% matched (ALL), segment 1 (rows 1024-2047) has 476 matches (MIX),
+ * the rest are NONE — ensuring at least one full ALL segment is exercised.
+ * Regression pin for the rowsel_from_sorted_ids ALL-segment rollback bug:
+ * the old sweep did `cum -= pc` for ALL segments even though cum was never
+ * advanced for them, wrapping the uint32 write cursor and sending every
+ * subsequent idx_arr write out of bounds (ASan heap-buffer-overflow;
+ * silent corruption in release). */
 static test_result_t test_range_sorted_all_segments(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    int64_t N = 16384;
+    int64_t N = 262144;
     ray_t* kv = ray_vec_new(RAY_I64, N);
     TEST_ASSERT_FALSE(RAY_IS_ERR(kv));
     kv->len = N;
@@ -1042,9 +1044,9 @@ static test_result_t test_range_sorted_all_segments(void) {
     uint64_t cons_before = ray_idx_consults[IDX_SITE_FILTER_RANGE];
     uint64_t hits_before = ray_idx_hits[IDX_SITE_FILTER_RANGE];
 
-    ray_t* r = run_filter(tbl, pred_lt_3000);
+    ray_t* r = run_filter(tbl, pred_lt_1500);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
-    TEST_ASSERT_EQ_I(ray_table_nrows(r), 3000);
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 1500);
 
     /* The index path must actually be taken — otherwise this test
      * silently stops covering the rowsel builder. */
@@ -1069,9 +1071,9 @@ static test_result_t test_range_sorted_all_segments(void) {
     ray_release(vv_b);
     TEST_ASSERT_FALSE(RAY_IS_ERR(tbl_b));
 
-    ray_t* rb = run_filter(tbl_b, pred_lt_3000);
+    ray_t* rb = run_filter(tbl_b, pred_lt_1500);
     TEST_ASSERT_FALSE(RAY_IS_ERR(rb));
-    TEST_ASSERT_EQ_I(ray_table_nrows(rb), 3000);
+    TEST_ASSERT_EQ_I(ray_table_nrows(rb), 1500);
     TEST_ASSERT(v_cols_equal(r, rb), "v col mismatch range_sorted_all_segments");
 
     ray_release(r); ray_release(rb);
@@ -2455,7 +2457,12 @@ static int64_t linear_count(const int64_t* d, int64_t N,
  * For each op in {EQ,LT,LE,GT,GE} × keys {-1,0,250,499,500}:
  *   ray_index_range_rowsel → total_pass (when non-NULL) must equal
  *   a linear count over the raw array.
- *   NULL result (selectivity guard or ineligible) is skipped — not a failure. */
+ *   NULL result (selectivity guard or ineligible) is skipped — not a failure.
+ *
+ * Guard threshold IDX_RANGE_MAX_FRAC=128 → guard fires at span > 1000/128≈7.
+ * Combos that pass: EQ=2-row hits (keys 0,250,499); zero-span cases return
+ * empty rowsel before the guard (keys -1, 0-LT, 499-GT, 500-GT/GE/LT/LE).
+ * ≥9 combos exercise the rowsel path despite the tighter guard. */
 static test_result_t test_range_adversarial_sweep(void) {
     ray_heap_init();
     (void)ray_sym_init();
