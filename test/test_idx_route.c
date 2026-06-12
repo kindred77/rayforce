@@ -998,6 +998,148 @@ static test_result_t test_range_f64(void) {
     PASS();
 }
 
+/* ─── Rowsel ALL-segment regression (corrupted offsets) ───────────── */
+
+/* (< k 3000) on the 16384-row sorted fixture below. */
+static ray_op_t* pred_lt_3000(ray_graph_t* g) {
+    return ray_lt(g, ray_scan(g, "k"), ray_const_i64(g, 3000));
+}
+
+/* range_sorted_all_segments: 16384-row SORTED I64 column k=i (v=i);
+ * (< k 3000) → 3000 rows.  Span 3000 <= n/4 = 4096 so the selectivity
+ * guard admits the range path.  Match layout: segments 0 and 1 are
+ * 100% matched (ALL), segment 2 is partial (MIX, 952 rows), the rest
+ * NONE.  Regression pin for the rowsel_from_sorted_ids ALL-segment
+ * rollback bug: the old sweep did `cum -= pc` for ALL segments even
+ * though cum was never advanced for them, wrapping the uint32 write
+ * cursor and sending every subsequent idx_arr write out of bounds
+ * (ASan heap-buffer-overflow; silent corruption in release). */
+static test_result_t test_range_sorted_all_segments(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 16384;
+    ray_t* kv = ray_vec_new(RAY_I64, N);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(kv));
+    kv->len = N;
+    int64_t* kd = (int64_t*)ray_data(kv);
+    for (int64_t i = 0; i < N; i++) kd[i] = i;
+    ray_t* vv = ray_vec_new(RAY_I64, N);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vv));
+    vv->len = N;
+    int64_t* vd = (int64_t*)ray_data(vv);
+    for (int64_t i = 0; i < N; i++) vd[i] = i;
+
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k", 1), kv);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("v", 1), vv);
+    ray_release(kv);
+    ray_release(vv);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    TEST_ASSERT(attach_sort_to_col(tbl, "k") == 0,
+                "attach sort (range_sorted_all_segments)");
+
+    uint64_t cons_before = ray_idx_consults[IDX_SITE_FILTER_RANGE];
+    uint64_t hits_before = ray_idx_hits[IDX_SITE_FILTER_RANGE];
+
+    ray_t* r = run_filter(tbl, pred_lt_3000);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 3000);
+
+    /* The index path must actually be taken — otherwise this test
+     * silently stops covering the rowsel builder. */
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_consults[IDX_SITE_FILTER_RANGE] - cons_before), 1);
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_hits[IDX_SITE_FILTER_RANGE]     - hits_before), 1);
+
+    /* Differential: identical v values vs the unindexed scan. */
+    ray_t* tbl_b = ray_table_new(2);
+    ray_t* kv_b = ray_vec_new(RAY_I64, N);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(kv_b));
+    kv_b->len = N;
+    int64_t* kdb = (int64_t*)ray_data(kv_b);
+    for (int64_t i = 0; i < N; i++) kdb[i] = i;
+    ray_t* vv_b = ray_vec_new(RAY_I64, N);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vv_b));
+    vv_b->len = N;
+    int64_t* vdb = (int64_t*)ray_data(vv_b);
+    for (int64_t i = 0; i < N; i++) vdb[i] = i;
+    tbl_b = ray_table_add_col(tbl_b, ray_sym_intern("k", 1), kv_b);
+    tbl_b = ray_table_add_col(tbl_b, ray_sym_intern("v", 1), vv_b);
+    ray_release(kv_b);
+    ray_release(vv_b);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl_b));
+
+    ray_t* rb = run_filter(tbl_b, pred_lt_3000);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(rb));
+    TEST_ASSERT_EQ_I(ray_table_nrows(rb), 3000);
+    TEST_ASSERT(v_cols_equal(r, rb), "v col mismatch range_sorted_all_segments");
+
+    ray_release(r); ray_release(rb);
+    ray_release(tbl); ray_release(tbl_b);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* (== k 7) on the dense-dup fixture below. */
+static ray_op_t* pred_eq_7_dups(ray_graph_t* g) {
+    return ray_eq(g, ray_scan(g, "k"), ray_const_i64(g, 7));
+}
+
+/* hash_eq_dense_dups: 4096-row column where EVERY row is k=7; hash
+ * index attached; (== k 7) → all 4096 rows.  Every one of the 4
+ * segments classifies ALL, so the buggy rollback fired on the very
+ * first segment (cum 0 → uint32 wrap) and segment 1's idx writes
+ * landed ~8 GB past the allocation.  Pre-existing in the hash path
+ * before the Task-1 extraction (same arithmetic at 3a0cf2f1~1) —
+ * it just needed >=1024 consecutive duplicates to trigger. */
+static test_result_t test_hash_eq_dense_dups(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t N = 4096;
+    ray_t* kv = ray_vec_new(RAY_I64, N);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(kv));
+    kv->len = N;
+    int64_t* kd = (int64_t*)ray_data(kv);
+    for (int64_t i = 0; i < N; i++) kd[i] = 7;
+    ray_t* vv = ray_vec_new(RAY_I64, N);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vv));
+    vv->len = N;
+    int64_t* vd = (int64_t*)ray_data(vv);
+    for (int64_t i = 0; i < N; i++) vd[i] = i;
+
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k", 1), kv);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("v", 1), vv);
+    ray_release(kv);
+    ray_release(vv);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    TEST_ASSERT(attach_hash_to_col(tbl, "k") == 0,
+                "attach hash (hash_eq_dense_dups)");
+
+    uint64_t hits_before = ray_idx_hits[IDX_SITE_FILTER_HASH];
+
+    ray_t* r = run_filter(tbl, pred_eq_7_dups);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 4096);
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_hits[IDX_SITE_FILTER_HASH] - hits_before), 1);
+
+    /* All rows pass in order → v must be exactly 0..4095. */
+    int64_t v_sym = ray_sym_intern("v", 1);
+    ray_t* rv = ray_table_get_col(r, v_sym);
+    TEST_ASSERT_FALSE(!rv || RAY_IS_ERR(rv));
+    for (int64_t i = 0; i < N; i++) {
+        TEST_ASSERT_EQ_I(ray_vec_get_i64(rv, i), i);
+    }
+
+    ray_release(r);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 /* ─── Predicate builders for IN tests ───────────────────────────── */
 
 /* (in k [9 5]) → k∈{5,9,9,5} at rows {0,2,6,7} → 4 rows */
@@ -2388,6 +2530,8 @@ const test_entry_t idx_route_entries[] = {
     { "idx_route/range_ne_falls_back",       test_range_ne_falls_back,       NULL, NULL },
     { "idx_route/range_guard",               test_range_guard,               NULL, NULL },
     { "idx_route/range_f64",                 test_range_f64,                 NULL, NULL },
+    { "idx_route/range_sorted_all_segments", test_range_sorted_all_segments, NULL, NULL },
+    { "idx_route/hash_eq_dense_dups",        test_hash_eq_dense_dups,        NULL, NULL },
     { "idx_route/in_hash",                   test_in_hash,                   NULL, NULL },
     { "idx_route/in_dup_set",                test_in_dup_set,                NULL, NULL },
     { "idx_route/in_absent_elems",           test_in_absent_elems,           NULL, NULL },

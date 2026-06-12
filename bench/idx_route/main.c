@@ -24,10 +24,12 @@
  *   k3  = LCG-shuffled permutation of 0..10M-1 (sort/range/distinct target)
  *   k4  = k3 % 100000       — 100k distinct shuffled (distinct sort target)
  *
- * Using the shuffled k3 for filter-range avoids the rowsel ALL-segment
- * rollback corner case (cum underflow) that triggers with perfectly-sorted
- * data where matching rows all land in the first N segments at 100% fill.
- * Random distribution → MIX segments → no cumulative rollback issue.
+ * k3 is shuffled for representative sort/range/distinct cost (a presorted
+ * permutation would make ORDER BY trivial).  Historical note: the shuffle
+ * also used to dodge the rowsel ALL-segment rollback bug (cum underflow on
+ * 100%-filled segments with perfectly-sorted data); that bug is fixed in
+ * rowsel_from_sorted_ids (classify-then-emit sweep) and pinned by the ASan
+ * test idx_route/range_sorted_all_segments, so sorted-range inputs are safe.
  */
 #if defined(__APPLE__)
 #  define _DARWIN_C_SOURCE
