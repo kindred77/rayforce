@@ -80,11 +80,20 @@ extern ray_runtime_t* ray_runtime_create(int argc, char** argv);
 extern void           ray_runtime_destroy(ray_runtime_t* rt);
 extern ray_runtime_t* __RUNTIME;
 extern void           ray_runtime_set_poll(void* poll);
+extern void*          ray_runtime_get_poll(void);
 
 /* ─── Setup / Teardown ────────────────────────────────────────────── */
 
+/* Unified IPC handles are poll selector ids resolved in the runtime
+ * poll, so the remote-REPL tests' ray_repl_connect_fn needs one
+ * published — mirroring main.c.  Teardown order also mirrors main.c:
+ * poll first (closes any leftover conns), runtime second. */
 static void repl_setup(void) {
     ray_runtime_create(0, NULL);
+#ifndef RAY_OS_WINDOWS
+    ray_poll_t* p = ray_poll_create();
+    if (p) ray_runtime_set_poll(p);
+#endif
 }
 
 static void repl_teardown(void) {
@@ -96,6 +105,15 @@ static void repl_teardown(void) {
         ray_t* args = NULL;
         ray_release(ray_repl_disconnect_fn(&args, 0));
     }
+#ifndef RAY_OS_WINDOWS
+    {
+        ray_poll_t* p = (ray_poll_t*)ray_runtime_get_poll();
+        if (p) {
+            ray_runtime_set_poll(NULL);
+            ray_poll_destroy(p);
+        }
+    }
+#endif
     ray_runtime_destroy(__RUNTIME);
 }
 

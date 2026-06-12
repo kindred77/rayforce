@@ -56,6 +56,16 @@ extern ray_runtime_t* ray_runtime_create(int argc, char** argv);
 extern void           ray_runtime_destroy(ray_runtime_t* rt);
 extern ray_runtime_t* __RUNTIME;
 
+/* Runtime poll accessors (core/runtime.h) + poll lifecycle (core/poll.h),
+ * forward-declared the same way to avoid the ray_vm_t clash between
+ * core/runtime.h and lang/eval.h (included above). */
+struct ray_poll;
+typedef struct ray_poll ray_poll_t;
+extern ray_poll_t* ray_poll_create(void);
+extern void        ray_poll_destroy(ray_poll_t* poll);
+extern void        ray_runtime_set_poll(void* poll);
+extern void*       ray_runtime_get_poll(void);
+
 /* ─── Shared state ────────────────────────────────────────────────── */
 
 char    ray_test_fail_buf[2048];
@@ -432,8 +442,22 @@ static test_result_t run_rfl_at(int idx) {
     return run_rfl_file(g_rfl_paths[idx]);
 }
 
-static void rfl_setup(void)    { ray_runtime_create(0, NULL); }
-static void rfl_teardown(void) { ray_runtime_destroy(__RUNTIME); }
+/* The runtime poll mirrors main.c: unified IPC handles are selector ids
+ * resolved in it, so .rfl scripts that `.ipc.open` need one published.
+ * Destroy order also mirrors main.c — poll first, runtime second. */
+static void rfl_setup(void) {
+    ray_runtime_create(0, NULL);
+    ray_poll_t* p = ray_poll_create();
+    if (p) ray_runtime_set_poll(p);
+}
+static void rfl_teardown(void) {
+    ray_poll_t* p = (ray_poll_t*)ray_runtime_get_poll();
+    if (p) {
+        ray_runtime_set_poll(NULL);
+        ray_poll_destroy(p);
+    }
+    ray_runtime_destroy(__RUNTIME);
+}
 
 /* Thunk pool — one function per potential .rfl slot. */
 #define RFL_THUNKS(X) \

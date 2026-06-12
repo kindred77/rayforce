@@ -91,8 +91,24 @@ extern ray_runtime_t* __RUNTIME;
 
 /* ---- Setup / Teardown ---------------------------------------------------- */
 
-static void ipc_setup(void)    { ray_runtime_create(0, NULL); }
-static void ipc_teardown(void) { ray_runtime_destroy(__RUNTIME); }
+/* Unified IPC handles are poll selector ids, so the client side needs a
+ * runtime poll for ray_ipc_connect to register outbound connections in —
+ * mirrors what main.c does at startup.  Destroy order mirrors main.c too:
+ * poll first (fires close hooks while the env is still alive), then the
+ * runtime. */
+static void ipc_setup(void) {
+    ray_runtime_create(0, NULL);
+    ray_poll_t* p = ray_poll_create();
+    if (p) ray_runtime_set_poll(p);
+}
+static void ipc_teardown(void) {
+    ray_poll_t* p = (ray_poll_t*)ray_runtime_get_poll();
+    if (p) {
+        ray_runtime_set_poll(NULL);
+        ray_poll_destroy(p);
+    }
+    ray_runtime_destroy(__RUNTIME);
+}
 
 /* ---- Helpers ------------------------------------------------------------- */
 
@@ -1780,6 +1796,100 @@ static test_result_t test_ipc_post_non_serializable(void) {
     PASS();
 }
 
+/* ---- test_ipc_server_push ------------------------------------------------ */
+/*
+ * Unified-handle server push: the handle a server-side hook receives is a
+ * first-class connection handle, so `.ipc.post` on it delivers an async
+ * message BACK to the connecting client — both from inside `.ipc.on.open`
+ * and later from any other server-side eval that kept the handle around.
+ *
+ * Flow:
+ *   1. Server `.ipc.on.open` saves the handle in `_srvh` and posts
+ *      `(set _pushed 7)` back through it.
+ *   2. The client connects, then issues a sync round-trip.  The server is
+ *      single-threaded and processes one connection's frames in order, so
+ *      the pushed ASYNC frame precedes the sync RESP on the wire and the
+ *      client's sync wait dispatches (evals) the push before the barrier
+ *      returns.
+ *   3. A second round-trip calls `_doit`, which posts AGAIN through the
+ *      saved `_srvh` — the "post outside any hook" path.  Same ordering
+ *      argument: that push is drained before the round-trip returns.
+ *
+ * `_pushed` / `_pushed2` are written by the CLIENT thread (this thread)
+ * while it pumps its own connection, so reading them back after the join
+ * is race-free; `_srvh` is written by the server thread, read only after
+ * ray_thread_join.
+ */
+static test_result_t test_ipc_server_push(void) {
+    const char* setup =
+        "(set _pushed 0)"
+        "(set _pushed2 0)"
+        "(set _srvh (- 0 1))"
+        "(set .ipc.on.open (fn [h] (set _srvh h) (.ipc.post h \"(set _pushed 7)\")))"
+        "(set _doit (fn [x] (.ipc.post _srvh \"(set _pushed2 9)\") 42))";
+    ray_t* r = ray_eval_str(setup);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    if (r != RAY_NULL_OBJ) ray_release(r);
+
+    ray_poll_t* poll = ray_poll_create();
+    TEST_ASSERT_NOT_NULL(poll);
+
+    int64_t listener_id = ray_ipc_listen(poll, 0);
+    TEST_ASSERT((listener_id) >= (0), "listener_id >= 0");
+    ray_selector_t* listener_sel = ray_poll_get(poll, listener_id);
+    TEST_ASSERT_NOT_NULL(listener_sel);
+    uint16_t port = get_listen_port((ray_sock_t)listener_sel->fd);
+    TEST_ASSERT((port) > (0), "port > 0");
+
+    ray_vm_t* srv_vm = make_server_vm();
+    TEST_ASSERT_NOT_NULL(srv_vm);
+
+    poll_thread_ctx_t pctx = { .poll = poll, .vm = srv_vm, .running = 1 };
+    ray_thread_t tid;
+    ray_thread_create(&tid, (void(*)(void*))poll_server_thread_fn, &pctx);
+    sleep_ms(20);
+
+    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL);
+    TEST_ASSERT((h) >= (0), "h >= 0");
+
+    /* Barrier 1: drains the on.open push before returning. */
+    ray_t* msg = ray_str("(+ 0 0)", 7);
+    ray_t* resp = ray_ipc_send(h, msg);
+    ray_release(msg);
+    bool resp1_ok = (resp != NULL) && !RAY_IS_ERR(resp);
+    if (resp && !RAY_IS_ERR(resp)) ray_release(resp);
+
+    /* Barrier 2: server posts through the SAVED handle, outside any
+     * lifecycle hook, then returns 42. */
+    ray_t* msg2 = ray_str("(_doit 0)", 9);
+    ray_t* resp2 = ray_ipc_send(h, msg2);
+    ray_release(msg2);
+    bool resp2_ok = (resp2 != NULL) && !RAY_IS_ERR(resp2)
+                    && resp2->type == -RAY_I64 && resp2->i64 == 42;
+    if (resp2 && !RAY_IS_ERR(resp2)) ray_release(resp2);
+
+    ray_ipc_close(h);
+    poll_stop(poll, port);
+    ray_thread_join(tid);
+    ray_poll_destroy(poll);
+    ray_sys_free(srv_vm);
+
+    TEST_ASSERT_TRUE(resp1_ok);
+    TEST_ASSERT_TRUE(resp2_ok);
+
+    int64_t sym1 = ray_sym_intern("_pushed",  strlen("_pushed"));
+    int64_t sym2 = ray_sym_intern("_pushed2", strlen("_pushed2"));
+    int64_t symh = ray_sym_intern("_srvh",    strlen("_srvh"));
+    ray_t* vh = ray_env_get(symh); TEST_ASSERT_NOT_NULL(vh);
+    ray_t* v1 = ray_env_get(sym1); TEST_ASSERT_NOT_NULL(v1);
+    ray_t* v2 = ray_env_get(sym2); TEST_ASSERT_NOT_NULL(v2);
+    TEST_ASSERT((vh->i64) >= (0), "server hook handle >= 0");
+    TEST_ASSERT_EQ_I(v1->i64, 7);
+    TEST_ASSERT_EQ_I(v2->i64, 9);
+    PASS();
+}
+
 /* ---- Registry ------------------------------------------------------------ */
 
 const test_entry_t ipc_entries[] = {
@@ -1816,5 +1926,6 @@ const test_entry_t ipc_entries[] = {
     { "ipc/post_delivery",               test_ipc_post_delivery,                  ipc_setup, ipc_teardown },
     { "ipc/post_invalid_handle",         test_ipc_post_invalid_handle,            ipc_setup, ipc_teardown },
     { "ipc/post_non_serializable",       test_ipc_post_non_serializable,          ipc_setup, ipc_teardown },
+    { "ipc/server_push",                 test_ipc_server_push,                    ipc_setup, ipc_teardown },
     { NULL, NULL, NULL, NULL },
 };

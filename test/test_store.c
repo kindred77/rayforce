@@ -3192,9 +3192,23 @@ static void server_thread_fn(void* arg) {
         ray_ipc_poll(ctx->srv, 10);
 }
 
+/* Unified IPC handles are poll selector ids resolved in the runtime
+ * poll, so every client-side ray_ipc_connect below needs one published —
+ * mirroring what main.c does at startup. */
+static ray_poll_t* ipc_client_poll(void) {
+    ray_poll_t* p = ray_poll_create();
+    if (p) ray_runtime_set_poll(p);
+    return p;
+}
+static void ipc_client_poll_done(void) {
+    ray_poll_t* p = (ray_poll_t*)ray_runtime_get_poll();
+    if (p) { ray_runtime_set_poll(NULL); ray_poll_destroy(p); }
+}
+
 static test_result_t test_ipc_sync_roundtrip(void) {
     /* Full runtime needed for ray_eval_str in server thread */
     ray_runtime_t* rt = ray_runtime_create(0, NULL);
+    ipc_client_poll();
     TEST_ASSERT_NOT_NULL(rt);
 
     ray_ipc_server_t srv;
@@ -3240,6 +3254,7 @@ static test_result_t test_ipc_sync_roundtrip(void) {
     ray_thread_join(tid);
     ray_ipc_server_destroy(&srv);
     ray_sys_free(srv_vm);
+    ipc_client_poll_done();
     ray_runtime_destroy(rt);
 
     PASS();
@@ -3250,6 +3265,7 @@ static test_result_t test_ipc_sync_roundtrip(void) {
 static test_result_t test_ipc_async_send(void) {
     /* Full runtime needed for eval on server side */
     ray_runtime_t* rt = ray_runtime_create(0, NULL);
+    ipc_client_poll();
     TEST_ASSERT_NOT_NULL(rt);
 
     ray_ipc_server_t srv;
@@ -3284,6 +3300,7 @@ static test_result_t test_ipc_async_send(void) {
     ray_thread_join(tid);
     ray_ipc_server_destroy(&srv);
     ray_sys_free(srv_vm);
+    ipc_client_poll_done();
     ray_runtime_destroy(rt);
 
     PASS();
@@ -3293,6 +3310,7 @@ static test_result_t test_ipc_async_send(void) {
 
 static test_result_t test_ipc_auth_success(void) {
     ray_runtime_t* rt = ray_runtime_create(0, NULL);
+    ipc_client_poll();
     TEST_ASSERT_NOT_NULL(rt);
 
     ray_ipc_server_t srv;
@@ -3328,6 +3346,7 @@ static test_result_t test_ipc_auth_success(void) {
     ray_thread_join(tid);
     ray_ipc_server_destroy(&srv);
     ray_sys_free(srv_vm);
+    ipc_client_poll_done();
     ray_runtime_destroy(rt);
 
     PASS();
@@ -3337,6 +3356,7 @@ static test_result_t test_ipc_auth_success(void) {
 
 static test_result_t test_ipc_auth_reject(void) {
     ray_runtime_t* rt = ray_runtime_create(0, NULL);
+    ipc_client_poll();
     TEST_ASSERT_NOT_NULL(rt);
 
     ray_ipc_server_t srv;
@@ -3362,6 +3382,7 @@ static test_result_t test_ipc_auth_reject(void) {
     ray_thread_join(tid);
     ray_ipc_server_destroy(&srv);
     ray_sys_free(srv_vm);
+    ipc_client_poll_done();
     ray_runtime_destroy(rt);
 
     PASS();
@@ -3371,6 +3392,7 @@ static test_result_t test_ipc_auth_reject(void) {
 
 static test_result_t test_ipc_auth_no_creds(void) {
     ray_runtime_t* rt = ray_runtime_create(0, NULL);
+    ipc_client_poll();
     TEST_ASSERT_NOT_NULL(rt);
 
     ray_ipc_server_t srv;
@@ -3396,6 +3418,7 @@ static test_result_t test_ipc_auth_no_creds(void) {
     ray_thread_join(tid);
     ray_ipc_server_destroy(&srv);
     ray_sys_free(srv_vm);
+    ipc_client_poll_done();
     ray_runtime_destroy(rt);
 
     PASS();
@@ -3405,6 +3428,7 @@ static test_result_t test_ipc_auth_no_creds(void) {
 
 static test_result_t test_ipc_restricted(void) {
     ray_runtime_t* rt = ray_runtime_create(0, NULL);
+    ipc_client_poll();
     TEST_ASSERT_NOT_NULL(rt);
 
     ray_ipc_server_t srv;
@@ -3467,6 +3491,7 @@ static test_result_t test_ipc_restricted(void) {
     ray_thread_join(tid);
     ray_ipc_server_destroy(&srv);
     ray_sys_free(srv_vm);
+    ipc_client_poll_done();
     ray_runtime_destroy(rt);
 
     PASS();
@@ -3480,6 +3505,7 @@ static test_result_t test_ipc_handshake_version_mismatch(void) {
      * to any framed payload.  This is the defense-in-depth layer that
      * protects an old peer from ever seeing a new-format message. */
     ray_runtime_t* rt = ray_runtime_create(0, NULL);
+    ipc_client_poll();
     TEST_ASSERT_NOT_NULL(rt);
 
     ray_ipc_server_t srv;
@@ -3528,6 +3554,7 @@ static test_result_t test_ipc_handshake_version_mismatch(void) {
     ray_thread_join(tid);
     ray_ipc_server_destroy(&srv);
     ray_sys_free(srv_vm);
+    ipc_client_poll_done();
     ray_runtime_destroy(rt);
     PASS();
 }
