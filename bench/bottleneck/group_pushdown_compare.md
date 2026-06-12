@@ -37,9 +37,14 @@ Query: `FILTER(pred, GROUP(sum v by k))` → after push: `GROUP(FILTER(pred, tab
 | CONTROL (k>=0) | unpushed | 974.5 | 0.004 | 1,000,000 |
 
 WIN speedup (pushed / unpushed exec): **~23x** (992 / 42.8).
-CONTROL pushed vs unpushed: within noise (~4%), confirming the overhead is only the
-filter evaluation cost, which is negligible vs the full-hash-build cost saved by the
-selectivity reduction.
+CONTROL pushed vs unpushed: parity. The pushed control pays an O(10M) predicate
+evaluation + rowsel classification sweep (`ray_rowsel_from_pred`, which returns
+NULL for all-pass so the group itself runs unmodified) versus the unpushed plan's
+O(1M) predicate over the group output. Run 1's apparent +4% (1014.9 vs 974.5) did
+not reproduce on a quieter re-run (974.7 vs 973.3 — effectively zero); it was
+contention noise, consistent with the load-average caveat above. The true
+worst-case cost of pushing a pass-everything predicate is the O(N) pred+sweep,
+~1-2% here and bounded by memory bandwidth.
 
 ## Mechanism Evidence
 
@@ -98,3 +103,18 @@ absolute gap (~950ms) is large enough that the sign cannot flip.
 | WIN (k<10000) | unpushed | 0.003 | 0.004 | 0.004 | 0.004 | 0.004 | 0.004 | 0.004 | 0.004 | 0.005 |
 | CONTROL (k>=0) | pushed | 0.008 | 0.009 | 0.009 | 0.009 | 0.009 | 0.009 | 0.009 | 0.010 | 0.012 |
 | CONTROL (k>=0) | unpushed | 0.004 | 0.004 | 0.004 | 0.004 | 0.004 | 0.004 | 0.005 | 0.005 | 0.005 |
+
+## VERDICT: WIN — merge
+
+Per the spec gate (docs/superpowers/specs/2026-06-12-group-predicate-pushdown-design.md):
+~23x measured speedup on the HAVING-on-key win case at 10M scale (release build,
+in-process interleaved A/B, mechanism-asserted on every pushed rep); control at
+parity (worst case an O(N) pred+rowsel sweep for pass-everything predicates,
+within noise on a quiet box); full suite + sanitizers green; differential
+equality pushed-vs-unpushed pinned across key shapes including null keys.
+
+Honest scope note: the pushable FILTER(GROUP) shape is produced only by the C
+graph API today — the language layer's nested selects evaluate the inner select
+eagerly, and where+by queries are already served by OP_FILTERED_GROUP / lazy
+selection. The optimization pays off for DAG-level consumers now and for any
+future query-layer change that builds nested selects lazily.
