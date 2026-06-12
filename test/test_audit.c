@@ -1162,9 +1162,16 @@ static test_result_t test_const_fold_int_overflow(void) {
     PASS();
 }
 
-/* Predicate pushdown must NOT push filter past GROUP BY.
+/* Predicate pushdown behaviour with GROUP BY HAVING.
  * GROUP BY id, SUM(val) → FILTER(GROUP, sum_col > 40).
- * Groups: {1:30, 2:70, 3:50}. After filter >40: {2:70, 3:50} → nrows==2. */
+ * Groups: {1:30, 2:70, 3:50}. After filter >40: {2:70, 3:50} → nrows==2.
+ *
+ * The pred scans "val_sum" (an agg-output column, not a key column).
+ * pass_predicate_pushdown in opt.c only pushes FILTER past GROUP when
+ * EVERY pred scan matches a plain-OP_SCAN group KEY column; agg-output
+ * references (val_sum etc.) are never pushed.  This HAVING-on-agg shape
+ * therefore stays FILTER(GROUP) regardless of the keys-only arm added in
+ * the GROUP pushdown task. */
 static test_result_t test_predicate_pushdown_group(void) {
     ray_heap_init();
     ray_t* tbl = make_audit_table();

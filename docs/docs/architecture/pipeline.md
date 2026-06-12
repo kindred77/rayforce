@@ -105,7 +105,13 @@ Marks multi-hop graph expansions for factorized execution. Sets the `factorized`
 
 ### 6. Predicate Pushdown
 
-Pushes filter predicates as close to the data source as possible. A filter above a join is split into components that can be evaluated on individual join inputs, reducing the number of rows entering the join. Filters above scans are pushed directly onto the scan, eliminating rows before any computation.
+Pushes `OP_FILTER` nodes closer to data sources by walking the DAG up to four times until no further rewrites are possible. The pass has three arms:
+
+**SELECT/ALIAS arm.** A filter above a `SELECT` or `ALIAS` node is swapped below it — `FILTER(pred, SELECT(x))` becomes `SELECT(FILTER(pred, x))` — provided the `SELECT`/`ALIAS` node has only a single consumer (a multi-consumer rewrite would corrupt shared branches).
+
+**GROUP arm.** A HAVING-style filter above a `GROUP` node is pushed below the group when every scan referenced by the predicate maps to a plain `OP_SCAN` group-key column (same symbol name, not an aggregate output). Because every row in a group shares its key value, a row passes the HAVING predicate if and only if the original source row passes the equivalent filter, making the rewrite semantics-preserving. Predicates that reference aggregate outputs (`v_sum`, `v_count`, etc.) match no key and remain above the group as true HAVING filters. The GROUP arm also refuses to push into factorized-expand pipelines (detected by a `_src` key scan). At execution time the executor runs the interposed pushed filter through the same selection bitmap it already honors for every `OP_GROUP` dispatch. At most one filter is pushed per group; a second chained HAVING predicate stays above.
+
+**EXPAND arm.** A filter above an `OP_EXPAND` node is pushed to the expand's source input when all scans in the predicate are reachable from that source subtree, reducing source rows before the graph traversal. The single-consumer guard applies here too.
 
 ### 7. Filter Reorder
 

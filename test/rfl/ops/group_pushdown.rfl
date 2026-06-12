@@ -1,0 +1,71 @@
+;; Pins the query-layer HAVING-filtering VALUES produced by the nested-select
+;; outer-where shape:
+;;   (select {from: (select {... by: k}) where: pred})
+;;
+;; IMPORTANT: the inner select is evaluated EAGERLY by query.c (ray_eval of
+;; from:), so the outer graph is FILTER(CONST_TABLE, pred) — not
+;; FILTER(GROUP, pred).  The GROUP pushdown arm in opt.c is therefore NOT
+;; exercised here.  The pushdown mechanism itself is covered by the C tests
+;; in test/test_group_pushdown.c.
+;;
+;; What this file guards: the numeric results below must remain correct
+;; whether or not future query-layer changes (e.g. lazy from: evaluation)
+;; start producing pushable FILTER(GROUP) shapes in one DAG.
+
+;; ────────────── Fixture — 4 keys, 3 rows each ──────────────
+;;   k: 1 1 1 2 2 2 3 3 3 4 4 4
+;;   v: 1 2 3 4 5 6 7 8 9 10 11 12
+;;   Per-group sums: k=1→6, k=2→15, k=3→24, k=4→33
+(set Tk (table [k v] (list [1 1 1 2 2 2 3 3 3 4 4 4] [1 2 3 4 5 6 7 8 9 10 11 12])))
+
+;; ────────────── 1. Keys-only HAVING pushdown ──────────────
+;;    Outer predicate is on the group key column k — opt.c pushes the
+;;    FILTER below the GROUP node.  The executor groups only the qualifying
+;;    rows rather than the full table.
+;;    (>= k 3) keeps k=3 (sum=24) and k=4 (sum=33) → 2 groups, sum = 57.
+(set Gpush (select {from: (select {s: (sum v) from: Tk by: k}) where: (>= k 3)}))
+(count Gpush) -- 2
+(sum (at Gpush 's)) -- 57
+
+;; ────────────── 2. Agg-output HAVING — predicate stays above GROUP (no push) ──────────────
+;;    Outer predicate references the aggregated column s (sum alias), not a
+;;    group key.  opt.c detects that s is not a plain-OP_SCAN key column and
+;;    leaves the plan as FILTER(GROUP).
+;;    (> s 10) keeps k=2 (15), k=3 (24), k=4 (33) → 3 groups, sum = 72.
+(set Ghaving (select {from: (select {s: (sum v) from: Tk by: k}) where: (> s 10)}))
+(count Ghaving) -- 3
+(sum (at Ghaving 's)) -- 72
+
+;; ────────────── 3. Null-key group — null excluded by key pushdown ──────────────
+;;    Null is the minimum value in Rayforce comparison semantics:
+;;      (>= 0N 3) → false  (null < everything non-null)
+;;      (>= 3 3)  → true
+;;      (>= 5 3)  → true
+;;    The null group is therefore excluded when the filter is pushed below
+;;    GROUP, matching the outer-WHERE semantics.
+;;
+;;    Table: k=[0N 0N 3 3 5 5], v=[10 20 30 40 50 60]
+;;    Groups: null→30, k=3→70, k=5→110
+;;    (>= k 3): null→false (excluded), k=3→true, k=5→true → 2 groups, sum=180
+(set Tnull (table [k v] (list [0N 0N 3 3 5 5] [10 20 30 40 50 60])))
+;; Confirm 3 total groups including the null group:
+(count (select {s: (sum v) from: Tnull by: k})) -- 3
+;; After (>= k 3), null group is excluded (null treated as minimum):
+(set Gnull (select {from: (select {s: (sum v) from: Tnull by: k}) where: (>= k 3)}))
+(count Gnull) -- 2
+(sum (at Gnull 's)) -- 180
+
+;; ────────────── 4. Mixed key+agg AND predicate through the query layer ──────────────
+;;    Outer: (and (>= k 3) (> s 10))
+;;    Through query.c the outer where is compiled over the GROUP result
+;;    table, so both column references (k and s) resolve correctly.
+;;    opt.c sees the mixed AND, does not push, but exec_filter evaluates the
+;;    full conjunct against the HAVING-path table swap — no schema error.
+;;
+;;    Values (same Tk fixture):
+;;      k=3: 3>=3 true AND 24>10 true  → keep
+;;      k=4: 4>=3 true AND 33>10 true  → keep
+;;    → 2 groups, sum of sums = 24+33 = 57.
+(set Gmixed (select {from: (select {s: (sum v) from: Tk by: k}) where: (and (>= k 3) (> s 10))}))
+(count Gmixed) -- 2
+(sum (at Gmixed 's)) -- 57

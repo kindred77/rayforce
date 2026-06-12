@@ -358,11 +358,12 @@
 (count (select {from: T4 where: (== (- 10 2.5) 7.5)})) -- 4
 
 ;; ════════════════════════════════════════════════════════════════════════
-;; 27. Nested select with GROUP having — tests predicate pushdown
-;;     stops at GROUP (opt.c:1370-1372 — GROUP pushdown disabled)
+;; 27. Nested select with GROUP having — predicate is on agg-output (s),
+;;     not on a group key, so it stays HAVING (opt.c GROUP arm only pushes
+;;     when every pred scan matches a plain-OP_SCAN key column).
 ;; ════════════════════════════════════════════════════════════════════════
 (set Tgrp (table [g v] (list ['a 'b 'c 'a 'b 'c] [10 20 30 40 50 60])))
-;; HAVING: filter on group result — pushdown must NOT move below GROUP
+;; HAVING: pred scans "s" (agg-output alias), not key "g" — no push
 ;; sums: a=10+40=50, b=20+50=70, c=30+60=90 → all > 40 → 3 groups
 (set Ghaving (select {from: (select {s: (sum v) from: Tgrp by: g}) where: (> s 40)}))
 (count Ghaving) -- 3
