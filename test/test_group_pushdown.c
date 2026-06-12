@@ -366,6 +366,203 @@ static test_result_t test_head_group_pushed_filter(void) {
     PASS();
 }
 
+/* ===================================================================
+ * Task-4 negative edge tests — each verifies pushdown is suppressed
+ * =================================================================== */
+
+/* a. GROUP key is a computed expression (* k 2) — key op is OP_MUL, not
+ * OP_SCAN, so the pushdown guard `kop->opcode != OP_SCAN` rejects it.
+ *
+ * Output column name for a computed key: key_ext->sym == 0 (empty string,
+ * because graph_alloc_ext_node zero-initialises the ext and only ray_scan
+ * sets ext->sym to an interned name).  We cannot reliably name-scan the
+ * computed key column from the HAVING predicate, so we assert !plan_pushed
+ * and correct row counts instead of a value comparison.
+ *
+ * Data: k 1 1 1 2 2 2 3 3 3 4 4 4; computed key = k*2 → groups 2,4,6,8.
+ * Predicate `v_sum > 10`: group sums for these groups are 6,15,24,33.
+ * sums 15,24,33 > 10 → 3 groups pass (groups with k=2,3,4 → key*2=4,6,8). */
+static test_result_t test_no_push_computed_key(void) {
+    ray_heap_init();
+    ray_t* tbl = make_gp_table();
+    ray_graph_t* g = ray_graph_new(tbl);
+
+    /* key = (* k 2): OP_MUL, not OP_SCAN — must not push */
+    ray_op_t* k2 = ray_mul(g, ray_scan(g, "k"), ray_const_i64(g, 2));
+    ray_op_t* v  = ray_scan(g, "v");
+    ray_op_t* keys[] = {k2};
+    uint16_t  aops[] = {OP_SUM};
+    ray_op_t* ains[] = {v};
+    ray_op_t* grp  = ray_group(g, keys, 1, aops, ains, 1);
+    /* pred on agg output column — stays HAVING regardless */
+    ray_op_t* pred = ray_gt(g, ray_scan(g, "v_sum"), ray_const_i64(g, 10));
+    ray_op_t* filt = ray_filter(g, grp, pred);
+    ray_op_t* root = ray_optimize(g, filt);
+
+    TEST_ASSERT(!plan_pushed(g, root), "computed-key GROUP must not push");
+
+    ray_t* r = ray_execute(g, root);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 3); /* sums 15,24,33 > 10; 6 fails */
+
+    ray_release(r); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* b. One GROUP feeding TWO filters.
+ *
+ * count_node_consumers walks ALL live nodes in g->nodes[] and g->ext_nodes[],
+ * not just nodes reachable from root.  So adding f2 as a live node that
+ * references grp is sufficient to make the consumer count > 1, even when
+ * root = f1 (f2 unreachable from root).  Pushdown is thus correctly blocked.
+ *
+ * We do NOT call ray_execute(g, f2); executing f1 only is enough to verify
+ * correct results.  f2 is intentionally kept alive to trigger the guard. */
+static test_result_t test_no_push_multi_consumer(void) {
+    ray_heap_init();
+    ray_t* tbl = make_gp_table();
+    ray_graph_t* g = ray_graph_new(tbl);
+
+    ray_op_t* k = ray_scan(g, "k");
+    ray_op_t* v = ray_scan(g, "v");
+    ray_op_t* keys[] = {k};
+    uint16_t  aops[] = {OP_SUM};
+    ray_op_t* ains[] = {v};
+    ray_op_t* grp = ray_group(g, keys, 1, aops, ains, 1);
+
+    /* Two filters both consuming grp — optimizer sees consumer count == 2 */
+    ray_op_t* f1 = ray_filter(g, grp,
+                        ray_ge(g, ray_scan(g, "k"), ray_const_i64(g, 2)));
+    /* f2 stays alive but is not executed */
+    (void)ray_filter(g, grp,
+                        ray_ge(g, ray_scan(g, "k"), ray_const_i64(g, 3)));
+
+    ray_op_t* root = ray_optimize(g, f1);
+    TEST_ASSERT(!plan_pushed(g, root), "multi-consumer GROUP must not push");
+
+    ray_t* r = ray_execute(g, root);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    /* k >= 2: groups 2(sum=15), 3(sum=24), 4(sum=33) → 3 rows */
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 3);
+
+    ray_release(r); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* c. AND predicate mixing a key-scan conjunct and an agg-output conjunct.
+ *
+ * pred = AND(k >= 3, v_sum > 10).  collect_pred_scans traverses the full AND
+ * subtree and finds both `k` and `v_sum` scans.  `v_sum` is not a group key
+ * (it is an agg output), so keys_only=false → pushdown skipped at pass 6.
+ *
+ * At pass 7 (filter_reorder) split_and_filter decomposes the AND-filter into
+ * two chained filters: FILTER(v_sum>10, FILTER(k>=3, GROUP(...))).  Passes
+ * run once (ray_optimize makes a single linear sweep, pass 6 before pass 7),
+ * so the k>=3 filter is NOT re-attempted for pushdown after the split.
+ * The optimised shape is therefore FILTER(FILTER(GROUP)), not GROUP(FILTER).
+ *
+ * Execution note: the outer FILTER evaluates its predicate (v_sum > 10) via
+ * exec_node, which reads SCAN nodes from g->table (the original table).  The
+ * original table has no `v_sum` column, so executing the OPTIMIZED plan
+ * returns a schema error.  The plan-shape assert is the meaningful check for
+ * the optimised path.
+ *
+ * Value correctness is verified on the UN-OPTIMIZED plan (no ray_optimize
+ * call): FILTER(GROUP) preserves the single-filter exec path (line ~1230 in
+ * exec.c) that swaps g->table to the GROUP output before evaluating the pred.
+ * Values: k=3 sum=24, k=4 sum=33 both satisfy AND(k>=3, v_sum>10) → 2 rows. */
+static test_result_t test_no_push_mixed_pred(void) {
+    ray_heap_init();
+    ray_t* tbl = make_gp_table();
+
+    /* Plan-shape check: optimise and assert no push */
+    {
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* k = ray_scan(g, "k");
+        ray_op_t* v = ray_scan(g, "v");
+        ray_op_t* keys[] = {k};
+        uint16_t  aops[] = {OP_SUM};
+        ray_op_t* ains[] = {v};
+        ray_op_t* grp  = ray_group(g, keys, 1, aops, ains, 1);
+        ray_op_t* pred = ray_and(g,
+            ray_ge(g, ray_scan(g, "k"),     ray_const_i64(g, 3)),
+            ray_gt(g, ray_scan(g, "v_sum"), ray_const_i64(g, 10)));
+        ray_op_t* filt = ray_filter(g, grp, pred);
+        ray_op_t* root = ray_optimize(g, filt);
+        TEST_ASSERT(!plan_pushed(g, root), "mixed-pred AND must not push");
+        ray_graph_free(g);
+    }
+
+    /* Value check: un-optimized FILTER(GROUP) preserves the executor's
+     * special HAVING path (filter_child->opcode == OP_GROUP) so scans in
+     * the pred correctly resolve against the GROUP output, not g->table. */
+    {
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* k = ray_scan(g, "k");
+        ray_op_t* v = ray_scan(g, "v");
+        ray_op_t* keys[] = {k};
+        uint16_t  aops[] = {OP_SUM};
+        ray_op_t* ains[] = {v};
+        ray_op_t* grp  = ray_group(g, keys, 1, aops, ains, 1);
+        ray_op_t* pred = ray_and(g,
+            ray_ge(g, ray_scan(g, "k"),     ray_const_i64(g, 3)),
+            ray_gt(g, ray_scan(g, "v_sum"), ray_const_i64(g, 10)));
+        ray_op_t* filt = ray_filter(g, grp, pred);
+        ray_t* r = ray_execute(g, filt);  /* no ray_optimize — keeps FILTER(GROUP) */
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        /* k=3 sum=24, k=4 sum=33 both pass both conjuncts → 2 rows */
+        TEST_ASSERT_EQ_I(ray_table_nrows(r), 2);
+        ray_release(r); ray_graph_free(g);
+    }
+
+    ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* d. Constant predicate — no scan references at all.
+ *
+ * pred = (> (+ 1 1) 0).  Pass 2 (constant folding) evaluates (+ 1 1) → 2
+ * then (> 2 0) → true.  fold_filter_const_predicate replaces the FILTER with
+ * OP_MATERIALIZE(GROUP), so the root node is OP_MATERIALIZE, not OP_FILTER.
+ * plan_pushed returns false (root is not OP_GROUP).
+ *
+ * All 4 groups survive (predicate is always true → 0 rows filtered). */
+static test_result_t test_no_push_const_pred(void) {
+    ray_heap_init();
+    ray_t* tbl = make_gp_table();
+    ray_graph_t* g = ray_graph_new(tbl);
+
+    ray_op_t* k = ray_scan(g, "k");
+    ray_op_t* v = ray_scan(g, "v");
+    ray_op_t* keys[] = {k};
+    uint16_t  aops[] = {OP_SUM};
+    ray_op_t* ains[] = {v};
+    ray_op_t* grp  = ray_group(g, keys, 1, aops, ains, 1);
+
+    /* (> (+ 1 1) 0) — constant expression, no scans.
+     * After const-fold this becomes a true literal; fold_filter_const_predicate
+     * rewrites FILTER → MATERIALIZE, so root->opcode == OP_MATERIALIZE. */
+    ray_op_t* pred = ray_gt(g,
+        ray_add(g, ray_const_i64(g, 1), ray_const_i64(g, 1)),
+        ray_const_i64(g, 0));
+    ray_op_t* filt = ray_filter(g, grp, pred);
+    ray_op_t* root = ray_optimize(g, filt);
+
+    TEST_ASSERT(!plan_pushed(g, root), "const-pred filter must not push");
+
+    ray_t* r = ray_execute(g, root);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    /* Predicate always true → all 4 groups */
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 4);
+
+    ray_release(r); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t group_pushdown_entries[] = {
     { "group_pushdown/agg_pred_not_pushed",   test_having_on_agg_not_pushed,     NULL, NULL },
     { "group_pushdown/exec_pushed_filter",    test_exec_group_with_pushed_filter, NULL, NULL },
@@ -377,5 +574,9 @@ const test_entry_t group_pushdown_entries[] = {
     { "group_pushdown/diff_multi_key",        test_diff_multi_key,               NULL, NULL },
     { "group_pushdown/diff_key_in",           test_diff_key_in,                  NULL, NULL },
     { "group_pushdown/head_group_pushed",     test_head_group_pushed_filter,     NULL, NULL },
+    { "group_pushdown/no_push_computed_key",  test_no_push_computed_key,         NULL, NULL },
+    { "group_pushdown/no_push_multi_consumer",test_no_push_multi_consumer,       NULL, NULL },
+    { "group_pushdown/no_push_mixed_pred",    test_no_push_mixed_pred,           NULL, NULL },
+    { "group_pushdown/no_push_const_pred",    test_no_push_const_pred,           NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
