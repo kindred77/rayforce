@@ -90,7 +90,43 @@ static test_result_t test_having_on_agg_not_pushed(void) {
     PASS();
 }
 
+/* Hand-build the post-rewrite DAG (Task-3 optimizer shape) and execute:
+ * GROUP.inputs[0] = FILTER(k >= 3, const_table).  Without the executor
+ * hook the filter never runs and all 4 groups appear. */
+static test_result_t test_exec_group_with_pushed_filter(void) {
+    ray_heap_init();
+    ray_t* tbl = make_gp_table();
+    ray_graph_t* g = ray_graph_new(tbl);
+
+    ray_op_t* k = ray_scan(g, "k");
+    ray_op_t* v = ray_scan(g, "v");
+    ray_op_t* keys[] = {k};
+    uint16_t aops[] = {OP_SUM};
+    ray_op_t* ains[] = {v};
+    ray_op_t* grp = ray_group(g, keys, 1, aops, ains, 1);
+
+    ray_op_t* tbl_node = ray_const_table(g, tbl);
+    ray_op_t* pred = ray_ge(g, ray_scan(g, "k"), ray_const_i64(g, 3));
+    ray_op_t* filt = ray_filter(g, tbl_node, pred);
+
+    /* Wire filt as GROUP's inputs[0] (Task-3 optimizer shape).
+     * grp points into g->nodes[] — that's the live node exec_node sees. */
+    grp->inputs[0] = filt;
+    ray_op_ext_t* gext = find_ext(g, grp->id);
+    TEST_ASSERT(gext != NULL, "group ext");
+    gext->base.inputs[0] = filt;   /* keep ext copy in sync */
+
+    ray_t* r = ray_execute(g, grp);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 2);  /* k=3 (sum 24), k=4 (sum 33) only */
+
+    ray_release(r); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t group_pushdown_entries[] = {
     { "group_pushdown/agg_pred_not_pushed", test_having_on_agg_not_pushed, NULL, NULL },
+    { "group_pushdown/exec_pushed_filter",  test_exec_group_with_pushed_filter, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
