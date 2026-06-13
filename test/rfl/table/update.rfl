@@ -136,3 +136,38 @@ t -- (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0]))
 (set t (table [id ts] (list [1 2 3] [2024.01.01D00:00:00.0 2024.01.02D00:00:00.0 2024.01.03D00:00:00.0])))(update {ts: 2000.01.01D00:00:00.0 from: 't})t -- (table [id ts] (list [1 2 3] [2000.01.01D00:00:00.000000000 2000.01.01D00:00:00.000000000 2000.01.01D00:00:00.000000000]))
 ;; Test 48: Update both symbol and timestamp columns in same update
 (set t (table [id name ts] (list [1 2] ['alice 'bob] [2024.01.01D00:00:00.0 2024.01.02D00:00:00.0])))(update {name: 'updated ts: 2025.01.01D00:00:00.0 from: 't where: (== id 1)})t -- (table [id name ts] (list [1 2] [updated bob] [2025.01.01D00:00:00.000000000 2024.01.02D00:00:00.000000000]))
+
+;; ══════════════════════════════════════════════════════════════════
+;; INSERT INTO TYPED COLUMNS — regression for append_atom_to_col only
+;; supporting I64/SYM/F64/BOOL/STR (temporal/guid/narrow-int columns
+;; rejected valid atoms) and for generic-list payloads promoting a
+;; typed column to LIST via concat instead of keeping its own type.
+;; ══════════════════════════════════════════════════════════════════
+
+;; Reported bug 1: a timestamp atom into an empty TIMESTAMP column.
+(insert (table [a] (list (as 'Timestamp (list)))) (list 2024.01.01D00:00:00.0)) -- (table [a] (list [2024.01.01D00:00:00.000000000]))
+
+;; Reported bug 2: a generic list into an I64 column inserts multiple
+;; rows and KEEPS the I64 type (previously promoted to LIST via concat).
+(insert (table [a] (list (list))) (list (list 1 2 3))) -- (table [a] (list [1 2 3]))
+;; First an atom row, then a generic-list multi-row payload — stays I64.
+(set t (table [a] (list (list))))(insert 't (list 42))(insert 't (list (list 1 2 3)))t -- (table [a] (list [42 1 2 3]))
+
+;; A generic list of timestamps splices into a TIMESTAMP column (no LIST).
+(insert (table [a] (list (as 'Timestamp (list)))) (list (list 2024.01.01D00:00:00.0 2024.01.02D00:00:00.0))) -- (table [a] (list [2024.01.01D00:00:00.000000000 2024.01.02D00:00:00.000000000]))
+
+;; Narrow integer / temporal column atom inserts.
+(insert (table [a] (list (as 'I32 (list)))) (list 7i)) -- (table [a] (list [7i]))
+(insert (table [a] (list (as 'I16 (list)))) (list 5h)) -- (table [a] (list [5h]))
+(insert (table [a] (list (as 'Date (list)))) (list 2020.01.01)) -- (table [a] (list [2020.01.01]))
+(insert (table [a] (list (as 'Time (list)))) (list 12:30:00.0)) -- (table [a] (list [12:30:00.000]))
+
+;; Multi-row insert into a narrow-int column copies existing rows with the
+;; correct element stride (was hard-coded to 8 bytes, corrupting I32/I16).
+(set w (table [a] (list (as 'I32 (list)))))(insert 'w (list 7i))(insert 'w (list 9i))w -- (table [a] (list [7i 9i]))
+(set h (table [a] (list (as 'I16 (list)))))(insert 'h (list 1h))(insert 'h (list 2h))(insert 'h (list 3h))h -- (table [a] (list [1h 2h 3h]))
+(set d (table [a] (list (as 'Date (list)))))(insert 'd (list 2020.01.01))(insert 'd (list 2020.01.02))d -- (table [a] (list [2020.01.01 2020.01.02]))
+
+;; Wrong-type atoms into typed columns still rejected.
+(insert (table [a] (list (as 'Timestamp (list)))) (list 'bad)) !- type
+(insert (table [a] (list (as 'Date (list)))) (list 1)) !- type
