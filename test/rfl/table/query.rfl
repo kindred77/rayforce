@@ -8,7 +8,7 @@
 (set n 10)(set gds (take (guid 3) n))(set t (table [OrderId Symbol Price Size Tape Timestamp](list gds(take [apll good msfk ibmd amznt fbad baba] n)(as 'F64 (til n))(take (+ 1 (til 3)) n)(map (fn [x] (as 'STR x)) (take (til 10) n))(as 'TIMESTAMP (til n)))))null -- null
 (select {from: t by: Symbol}) -- (table [Symbol OrderId Price Size Tape Timestamp](list [apll good msfk ibmd amznt fbad baba](at gds (til 7)) [0 1 2 3 4 5 6.0] [1 2 3 1 2 3 1](list "0""1""2""3""4""5""6")(at (at t 'Timestamp) (til 7))))
 (select {from: t by: Symbol where: (== Price 3)}) -- (table [Symbol OrderId Price Size Tape Timestamp](list [ibmd] (at gds 3) [3.00] [1] (list "3") [2000.01.01D00:00:00.000000003]))
-(select {from: t by: Symbol where: (== Price 99)}) -- (table [Symbol OrderId Price Size Tape Timestamp](list (as 'SYMBOL []) (as 'GUID []) (as 'F64 []) (as 'I64 []) (list) (as 'TIMESTAMP [])))
+(select {from: t by: Symbol where: (== Price 99)}) -- (table [Symbol OrderId Price Size Tape Timestamp](list (as 'SYMBOL []) (as 'GUID []) (as 'F64 []) (as 'I64 []) (as 'STR []) (as 'TIMESTAMP [])))
 (select {s: (sum Price) from: t by: Symbol}) -- (table [Symbol s](list [apll good msfk ibmd amznt fbad baba][7.00 9.00 11.00 3.00 4.00 5.00 6.00]))
 ;; by: (xbar Ts 10000) groups rows into 10-second buckets; the Ts
 ;; key column surfaces the bucket start (09:00:00, 09:00:10), not
