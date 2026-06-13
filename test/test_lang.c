@@ -2408,8 +2408,9 @@ static test_result_t test_eval_insert(void) {
 static test_result_t test_eval_insert_vec_append(void) {
     ASSERT_EQ("(do (set v (til 5)) (insert 'v 99) v)", "[0 1 2 3 4 99]");
     ASSERT_EQ("(do (set v (til 3)) (insert 'v [10 20 30]) v)", "[0 1 2 10 20 30]");
-    /* Return value mirrors the rebound v */
-    ASSERT_EQ("(do (set v (til 3)) (insert 'v 9))", "[0 1 2 9]");
+    /* In-place amend (symbol target) returns the symbol, not the rebound vec */
+    ASSERT_EQ("(do (set v (til 3)) (insert 'v 9))", "'v");
+    ASSERT_EQ("(do (set v (til 3)) (insert 'v 9) v)", "[0 1 2 9]");
     PASS();
 }
 

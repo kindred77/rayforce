@@ -185,7 +185,7 @@ Window join with per-row time intervals. `intervals` is a list of two vectors `[
           [928 528 648 914 918 626 577 817 620 698])))
 
 ; Build per-row intervals: [lo, hi] for each trade
-(set intervals (map-left + [-1000 1000] (at trades 'Time)))
+(set intervals (map-right + [-1000 1000] (at trades 'Time)))
 
 ; Window join: min bid and max ask within each window
 (window-join [Sym Time] intervals trades quotes
@@ -202,7 +202,7 @@ Window join with per-row time intervals. `intervals` is a list of two vectors `[
     (list bsym btime bid ask)))
 
 ; Build intervals from the trades timestamp
-(set intervals (map-left + [-1000 1000] (at trades 'Ts)))
+(set intervals (map-right + [-1000 1000] (at trades 'Ts)))
 
 (window-join [Sym Ts] intervals trades quotes
     {bid: (min Bid) ask: (max Ask)})

@@ -1,0 +1,71 @@
+;; insert_inplace_symbol.rfl — in-place amend via a symbol VALUE, not just a
+;; literal 'sym.  The amend's first argument is evaluated; if it yields a
+;; symbol, the amend targets the named global in place and returns that
+;; symbol (matching v1 / the reference dialect).  If it yields a table/vec,
+;; the amend is functional: it returns a fresh value and leaves the
+;; variable untouched.
+;;
+;; Regression: (insert name row) with name holding 't raised `type` because
+;; only a literal 't (ATTR_QUOTED on the raw parse node) was recognised — a
+;; symbol produced by evaluation slipped through to the vec/list path.
+
+;; ── insert: a variable holding a symbol drives in-place append ────────
+(set t (table [a] (list [])))
+(set name 't)
+(insert name (list 1))
+(at t 'a) -- [1]
+;; the reported bug: a second insert through the same variable
+(insert name (list 2))
+(at t 'a) -- [1 2]
+
+;; in-place insert returns the SYMBOL, not the amended table
+(insert name (list 3)) -- 't
+(insert 't (list 4))   -- 't
+(at t 'a) -- [1 2 3 4]
+
+;; (quote t) is equivalent to 't and also drives in-place insert
+(insert (quote t) (list 5))
+(at t 'a) -- [1 2 3 4 5]
+
+;; functional form (value first arg) returns the table and does NOT mutate
+;; the bound variable
+(set u (table [a] (list [10])))
+(insert u (list 20)) -- (table [a] (list [10 20]))
+(at u 'a) -- [10]
+
+;; ── upsert: a variable holding a symbol ──────────────────────────────
+(set kt (table [id v] (list [1 2] [10 20])))
+(set kn 'kt)
+(upsert kn 1 (list 3 30)) -- 'kt
+(at kt 'id) -- [1 2 3]
+(upsert kn 1 (list 2 99)) -- 'kt
+(at (at kt 'v) 1) -- 99
+
+;; ── update: from-table named through a variable ──────────────────────
+(set ut (table [id v] (list [1 2 3] [10 20 30])))
+(set un 'ut)
+(update {from: un v: 99}) -- 'ut
+(at ut 'v) -- [99 99 99]
+;; literal 'sym update still returns the symbol
+(update {from: 'ut v: 7}) -- 'ut
+(at ut 'v) -- [7 7 7]
+
+;; ── works the same way inside a lambda ───────────────────────────────
+(set lt (table [a] (list [])))
+((fn [s r] (insert s r)) 'lt (list 7))
+(at lt 'a) -- [7]
+;; symbol passed through a lambda PARAM, in-place, returns the symbol
+((fn [s r] (insert s r)) 'lt (list 8)) -- 'lt
+(at lt 'a) -- [7 8]
+
+;; ── alter (in-place vector/list amend) also returns the symbol ────────
+(set av [1 2 3])
+(alter 'av concat 4) -- 'av
+(at av 3) -- 4
+(alter 'av set 0 99) -- 'av
+(at av 0) -- 99
+;; alter through a variable holding the symbol, and through a lambda param
+(set an 'av)
+(alter an concat 5) -- 'av
+((fn [s] (alter s concat 6)) 'av) -- 'av
+(count av) -- 6
