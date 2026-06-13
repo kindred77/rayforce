@@ -604,9 +604,42 @@ static test_result_t test_jb_left_bigger_no_swap(void) {
     return rr;
 }
 
+/* ── Forced dup-fallback on ordinary data ──────────────────────────────────
+ * The force knob makes every radix partition bail to the chained path before
+ * allocating anything.  On ordinary low-duplication data the chained-build
+ * result must be multiset-identical to the radix-build result, AND the
+ * dup-fallback counter must advance (proving the routing fired).
+ * ──────────────────────────────────────────────────────────────────────── */
+static test_result_t test_jb_force_fallback_ordinary(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t n_r = RAY_PARALLEL_THRESHOLD + 5000, n_l = 4000;   /* right > threshold → radix */
+    int64_t* rv = malloc((size_t)n_r*sizeof(int64_t));
+    int64_t* lv = malloc((size_t)n_l*sizeof(int64_t));
+    TEST_ASSERT(rv && lv, "malloc key arrays");
+    for (int64_t i=0;i<n_r;i++) rv[i]=i%2000;      /* low dup ~35/key */
+    for (int64_t i=0;i<n_l;i++) lv[i]=i%2000;
+    ray_t* rt = jb_table1("rk", rv, n_r);
+    ray_t* lt = jb_table1("lk", lv, n_l);
+    uint64_t before = ray_join_dup_fallbacks;
+    ray_join_force_dup_fallback = true;            /* → chained */
+    ray_t* chained = jb_inner_join(lt,"lk",rt,"rk");
+    bool fired = ray_join_dup_fallbacks > before;
+    ray_join_force_dup_fallback = false;           /* → radix */
+    ray_t* radix = jb_inner_join(lt,"lk",rt,"rk");
+    test_result_t rr = jb_results_equal(chained, radix);
+    if (rr.status == TEST_PASS && !fired)
+        rr = (test_result_t){ TEST_FAIL, "forced dup-fallback did not fire" };
+    ray_release(chained); ray_release(radix); ray_release(lt); ray_release(rt);
+    free(lv); free(rv); ray_sym_destroy(); ray_heap_destroy();
+    return rr;
+}
+
 /* ── Entry table ─────────────────────────────────────────────────────────── */
 
 const test_entry_t join_buildside_entries[] = {
+    { "join_buildside/force_fallback_ordinary", test_jb_force_fallback_ordinary, NULL, NULL },
     { "join_buildside/baseline_radix_inner", test_jb_baseline_radix_inner, NULL, NULL },
     { "join_buildside/swap_inner_matches", test_jb_swap_inner_matches, NULL, NULL },
     { "join_buildside/many_to_many", test_jb_many_to_many, NULL, NULL },
