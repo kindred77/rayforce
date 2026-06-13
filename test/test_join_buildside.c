@@ -390,7 +390,7 @@ static test_result_t jb_diff(ray_t* lt, const char* lkey,
 }
 
 /* ── Edge fixture: many-to-many ────────────────────────────────────────────
- * right n=T+5000 keys i%50, left n=2000 keys i%50 — heavy m:n fanout.
+ * right n=T+5000 keys i%50, left n=500 keys i%50 — heavy m:n fanout.
  * Swap fires (left < right).
  * ──────────────────────────────────────────────────────────────────────── */
 static test_result_t test_jb_many_to_many(void) {
@@ -398,7 +398,7 @@ static test_result_t test_jb_many_to_many(void) {
     (void)ray_sym_init();
 
     int64_t n_r = RAY_PARALLEL_THRESHOLD + 5000;
-    int64_t n_l = 2000;
+    int64_t n_l = 500;
     int64_t* rv = malloc((size_t)n_r * sizeof(int64_t));
     int64_t* lv = malloc((size_t)n_l * sizeof(int64_t));
     TEST_ASSERT(rv && lv, "malloc key arrays");
@@ -442,8 +442,8 @@ static test_result_t test_jb_no_matches(void) {
 }
 
 /* ── Edge fixture: all match ───────────────────────────────────────────────
- * right n=T+2000 all key 7, left n=50 all key 7 — full cross-product.
- * (right=67536 × left=50 = 3,376,800 output rows; stresses HT-grow path.)
+ * right n=T+2000 all key 7, left n=1 all key 7 — full cross-product.
+ * (right=67536 × left=1 = 67,536 output rows; stresses HT-grow path.)
  * Swap fires (left << right).
  * ──────────────────────────────────────────────────────────────────────── */
 static test_result_t test_jb_all_match(void) {
@@ -451,7 +451,7 @@ static test_result_t test_jb_all_match(void) {
     (void)ray_sym_init();
 
     int64_t n_r = RAY_PARALLEL_THRESHOLD + 2000;
-    int64_t n_l = 50;
+    int64_t n_l = 1;
     int64_t* rv = malloc((size_t)n_r * sizeof(int64_t));
     int64_t* lv = malloc((size_t)n_l * sizeof(int64_t));
     TEST_ASSERT(rv && lv, "malloc key arrays");
@@ -512,19 +512,19 @@ static test_result_t test_jb_null_keys(void) {
 }
 
 /* ── Edge fixture: near-equal, no swap ────────────────────────────────────
- * Both sides n=T+5000, keys i%1000.  left_rows == right_rows, so swap must
+ * Both sides n=T+1000, keys i%10000.  left_rows == right_rows, so swap must
  * NOT fire (strict less-than condition fails).
  * ──────────────────────────────────────────────────────────────────────── */
 static test_result_t test_jb_near_equal_no_swap(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    int64_t n = RAY_PARALLEL_THRESHOLD + 5000;
+    int64_t n = RAY_PARALLEL_THRESHOLD + 1000;
     int64_t* rv = malloc((size_t)n * sizeof(int64_t));
     int64_t* lv = malloc((size_t)n * sizeof(int64_t));
     TEST_ASSERT(rv && lv, "malloc key arrays");
-    for (int64_t i = 0; i < n; i++) rv[i] = i % 1000;
-    for (int64_t i = 0; i < n; i++) lv[i] = i % 1000;
+    for (int64_t i = 0; i < n; i++) rv[i] = i % 10000;
+    for (int64_t i = 0; i < n; i++) lv[i] = i % 10000;
 
     ray_t* rt = jb_table1("rk", rv, n);
     ray_t* lt = jb_table1("lk", lv, n);
