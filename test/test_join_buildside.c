@@ -636,10 +636,45 @@ static test_result_t test_jb_force_fallback_ordinary(void) {
     return rr;
 }
 
+/* A join whose BUILD side has heavy per-key duplication (run > RADIX_DUP_RUN_MAX)
+ * must auto-fall-back to the chained path and produce correct results.
+ *
+ * The radix path builds on the SMALLER side (INNER build-side swap), so to trip
+ * the build-loop run counter the duplication must live on that smaller side:
+ * the left side here has only 4 distinct keys (~2000 rows/key → run > 512), and
+ * stays smaller than the right (so it is the build side and the right > the
+ * parallel threshold to select the radix path).  The right side is low-dup with
+ * few matching keys, keeping the PRE-FIX quadratic build and the join output
+ * small (sub-0.1s, no catastrophic blow-up). */
+static test_result_t test_jb_auto_fallback_dup(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+    int64_t n_r = RAY_PARALLEL_THRESHOLD + 5000, n_l = 8000;
+    int64_t* rv = malloc(n_r*sizeof(int64_t)); int64_t* lv = malloc(n_l*sizeof(int64_t));
+    TEST_ASSERT(rv && lv, "malloc");
+    for (int64_t i=0;i<n_r;i++) rv[i]=i%2000;      /* probe side: low dup, ~35/key */
+    for (int64_t i=0;i<n_l;i++) lv[i]=i%4;          /* build side: ~2000/key → run > 512 → trips */
+    ray_t* rt = jb_table1("rk", rv, n_r);
+    ray_t* lt = jb_table1("lk", lv, n_l);
+    uint64_t before = ray_join_dup_fallbacks;
+    ray_t* got = jb_inner_join(lt,"lk",rt,"rk");   /* knob off; auto-trip expected */
+    bool fired = ray_join_dup_fallbacks > before;
+    ray_join_force_dup_fallback = true;            /* oracle: forced chained */
+    ray_t* oracle = jb_inner_join(lt,"lk",rt,"rk");
+    ray_join_force_dup_fallback = false;
+    test_result_t rr = jb_results_equal(got, oracle);
+    if (rr.status == TEST_PASS && !fired)
+        rr = (test_result_t){ TEST_FAIL, "expected auto dup-fallback to fire" };
+    ray_release(got); ray_release(oracle); ray_release(lt); ray_release(rt);
+    free(lv); free(rv); ray_sym_destroy(); ray_heap_destroy();
+    return rr;
+}
+
 /* ── Entry table ─────────────────────────────────────────────────────────── */
 
 const test_entry_t join_buildside_entries[] = {
     { "join_buildside/force_fallback_ordinary", test_jb_force_fallback_ordinary, NULL, NULL },
+    { "join_buildside/auto_fallback_dup", test_jb_auto_fallback_dup, NULL, NULL },
     { "join_buildside/baseline_radix_inner", test_jb_baseline_radix_inner, NULL, NULL },
     { "join_buildside/swap_inner_matches", test_jb_swap_inner_matches, NULL, NULL },
     { "join_buildside/many_to_many", test_jb_many_to_many, NULL, NULL },
