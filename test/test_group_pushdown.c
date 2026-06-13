@@ -736,19 +736,23 @@ static test_result_t test_diff_and_of_keys(void) {
      * guard suppresses the split, so this now executes correctly (it was the
      * documented row-count-mismatch failure before the fix). --- */
     ray_t* nopush_res = NULL;
+    bool   nopush_unsplit = false;
     {
         ray_opt_no_group_pushdown = true;
         ray_graph_t* g = ray_graph_new(tbl);
         ray_op_t* root = build_having_plan(g, pred_key_and_range, NULL);
-        TEST_ASSERT(plan_having_unsplit(g, root),
-            "disabled-pushdown AND over GROUP must stay un-split FILTER(AND, GROUP)");
+        nopush_unsplit = plan_having_unsplit(g, root);   /* capture before free */
         ray_op_t* skeys[1] = {ray_scan(g, "k")};
         uint8_t descs[1] = {0};
         root = ray_sort_op(g, root, skeys, descs, NULL, 1);
         nopush_res = ray_execute(g, root);
         ray_graph_free(g);
-        ray_opt_no_group_pushdown = false;
+        ray_opt_no_group_pushdown = false;   /* reset before any assert */
     }
+    /* Asserts run only after the knob is restored — a failure here can't leak
+     * the disabled-pushdown state into later tests. */
+    TEST_ASSERT(nopush_unsplit,
+        "disabled-pushdown AND over GROUP must stay un-split FILTER(AND, GROUP)");
     TEST_ASSERT_FALSE(RAY_IS_ERR(nopush_res));
     TEST_ASSERT_EQ_I(ray_table_nrows(nopush_res), 2);
     ray_release(nopush_res);
