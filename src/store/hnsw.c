@@ -30,6 +30,10 @@
 #include <sys/stat.h>
 #include <errno.h>
 
+#if defined(RAY_OS_WINDOWS)
+#include <direct.h>
+#endif
+
 /* --------------------------------------------------------------------------
  * Distance dispatch — each metric maps to a scalar where lower = closer,
  * as required by the HNSW beam search.
@@ -779,7 +783,11 @@ typedef struct {
 ray_err_t ray_hnsw_save(const ray_hnsw_t* idx, const char* dir) {
     if (!idx || !dir) return RAY_ERR_IO;
 
+#if defined(RAY_OS_WINDOWS)
+    if (mkdir(dir) != 0 && errno != EEXIST) return RAY_ERR_IO;
+#else
     if (mkdir(dir, 0755) != 0 && errno != EEXIST) return RAY_ERR_IO;
+#endif
 
     char path[1024];
     FILE* f;

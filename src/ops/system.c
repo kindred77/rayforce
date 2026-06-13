@@ -44,9 +44,9 @@ void* ray_runtime_get_sys_args(void);
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
-#if !defined(RAY_OS_WINDOWS)
+//#if !defined(RAY_OS_WINDOWS)
 #include <unistd.h>
-#endif
+//#endif
 
 /* ══════════════════════════════════════════
  * Serialization / storage

@@ -68,6 +68,14 @@
 #include <libgen.h>
 #include <sys/stat.h>
 
+#ifdef RAY_OS_WINDOWS
+#include <direct.h>
+static char *realpath(const char *path, char *resolved)
+{
+    return _fullpath(resolved, path, _MAX_PATH);
+}
+#endif
+
 /* Same on-disk format constant as src/table/sym.c (private there). */
 #define DOMAIN_STRL_MAGIC 0x4C525453U /* "STRL" */
 

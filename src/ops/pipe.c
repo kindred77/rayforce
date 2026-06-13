@@ -24,9 +24,9 @@
 #include "pipe.h"
 #include "mem/sys.h"
 #include <string.h>
-#ifndef RAY_OS_WINDOWS
+//#ifndef RAY_OS_WINDOWS
 #include <unistd.h>
-#endif
+//#endif
 
 /* --------------------------------------------------------------------------
  * ray_pipe_new

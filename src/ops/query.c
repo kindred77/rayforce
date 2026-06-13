@@ -8299,7 +8299,7 @@ by_dict_done:
                  * comparable scalar key into an int64_t so linear
                  * scans can use equality.  For floats we bitcast so
                  * NaN and -0/+0 match the DAG's hash-equality. */
-                #define KEY_READ(dst, vec, base_type, idx) do {                \
+                #define RAYFORCE_KEY_READ(dst, vec, base_type, idx) do {                \
                     const void* _d = ray_data(vec);                            \
                     switch (base_type) {                                       \
                     case RAY_BOOL:                                             \
@@ -8386,7 +8386,7 @@ by_dict_done:
 
                 /* Copy group key values from the (possibly sliced) result */
                 for (int64_t gi = 0; gi < n_groups; gi++)
-                    KEY_READ(gk[gi], grp_key, gkt, gi);
+                    RAYFORCE_KEY_READ(gk[gi], grp_key, gkt, gi);
 
                 /* Build row→group_id map.  Rows whose key isn't in the
                  * surviving group set get row_gid = -1 and are skipped.
@@ -8500,7 +8500,7 @@ by_dict_done:
                     } else {
                         for (int64_t r = 0; r < nrows; r++) {
                             int64_t rv;
-                            KEY_READ(rv, scan_key, okt, r);
+                            RAYFORCE_KEY_READ(rv, scan_key, okt, r);
                             uint64_t h = (uint64_t)rv * 0x9E3779B97F4A7C15ULL;
                             h ^= h >> 33;
                             uint64_t s = h & mask;
@@ -8520,7 +8520,7 @@ by_dict_done:
                     scratch_free(gk_idx_hdr);
                     if (gk64_hdr) scratch_free(gk64_hdr);
                 }
-                #undef KEY_READ
+                #undef RAYFORCE_KEY_READ
 
                 /* When path A was taken (no materialisation), the probe
                  * above looked up gids for every row in the original

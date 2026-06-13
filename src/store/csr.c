@@ -30,6 +30,10 @@
 #include <sys/stat.h>
 #include <errno.h>
 
+#if defined(RAY_OS_WINDOWS)
+#include <direct.h>
+#endif
+
 /* Forward declaration */
 static void csr_free(ray_csr_t* csr);
 
@@ -454,7 +458,11 @@ ray_err_t ray_rel_save(ray_rel_t* rel, const char* dir) {
     if (!rel || !dir) return RAY_ERR_IO;
 
     /* Create directory */
+#if defined(RAY_OS_WINDOWS)
+    if (mkdir(dir) != 0 && errno != EEXIST) return RAY_ERR_IO;
+#else
     if (mkdir(dir, 0755) != 0 && errno != EEXIST) return RAY_ERR_IO;
+#endif
 
     ray_err_t err = csr_save(&rel->fwd, dir, "fwd");
     if (err != RAY_OK) return err;

@@ -39,8 +39,8 @@
 #include <string.h>
 #include <time.h>
 
+#include <unistd.h>
 #ifndef RAY_OS_WINDOWS
-#  include <unistd.h>
 #  include <sys/stat.h>
 #endif
 
