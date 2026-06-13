@@ -89,28 +89,23 @@ static ray_t* jb_inner_join(ray_t* lt, const char* lkey,
     return result;
 }
 
-/* ── Multiset comparison ───────────────────────────────────────────────────
- * jb_results_equal: compare two I64-only result tables as multisets.
- * Sort each by a lexicographic row order (column 0 primary, column 1
- * secondary, …) then compare cell-by-cell in sorted order.
+/* ── Row sort (no globals) ─────────────────────────────────────────────────
+ * jb_sort_rows: sort index array idx[0..n) by lexicographic row order over
+ * cols[0..ncols).  NULLs sort before non-NULLs.
  *
- * NULLs sort before non-NULLs (consistent within both tables).
+ * Implementation: iterative bottom-up merge sort.  O(n log n) time,
+ * O(n) scratch space (tmp array allocated by the caller and passed in).
+ * No file-scope globals — cols/ncols are threaded through every call.
  * ──────────────────────────────────────────────────────────────────────── */
-
-/* Context threaded through qsort comparator */
-static ray_t**  jb_cmp_cols   = NULL;
-static int64_t  jb_cmp_ncols  = 0;
-
-static int jb_row_cmp(const void* pa, const void* pb) {
-    int64_t ra = *(const int64_t*)pa;
-    int64_t rb = *(const int64_t*)pb;
-    for (int64_t c = 0; c < jb_cmp_ncols; c++) {
-        ray_t* col = jb_cmp_cols[c];
+static int jb_row_compare(int64_t ra, int64_t rb,
+                           ray_t** cols, int64_t ncols) {
+    for (int64_t c = 0; c < ncols; c++) {
+        ray_t* col = cols[c];
         bool na = ray_vec_is_null(col, ra);
         bool nb = ray_vec_is_null(col, rb);
         if (na && nb) continue;
-        if (na) return -1;
-        if (nb) return  1;
+        if (na)       return -1;
+        if (nb)       return  1;
         int64_t va = ray_vec_get_i64(col, ra);
         int64_t vb = ray_vec_get_i64(col, rb);
         if (va < vb) return -1;
@@ -119,41 +114,92 @@ static int jb_row_cmp(const void* pa, const void* pb) {
     return 0;
 }
 
+/* Merge two sorted runs [lo, mid) and [mid, hi) in idx[], using tmp[] as
+ * scratch.  cols/ncols provide the row comparison context. */
+static void jb_merge(int64_t* idx, int64_t* tmp,
+                     int64_t lo, int64_t mid, int64_t hi,
+                     ray_t** cols, int64_t ncols) {
+    int64_t i = lo, j = mid, k = lo;
+    while (i < mid && j < hi) {
+        if (jb_row_compare(idx[i], idx[j], cols, ncols) <= 0)
+            tmp[k++] = idx[i++];
+        else
+            tmp[k++] = idx[j++];
+    }
+    while (i < mid) tmp[k++] = idx[i++];
+    while (j < hi)  tmp[k++] = idx[j++];
+    for (int64_t x = lo; x < hi; x++) idx[x] = tmp[x];
+}
+
+/* Iterative bottom-up merge sort.  tmp must be at least n elements. */
+static void jb_sort_rows(ray_t** cols, int64_t ncols,
+                         int64_t* idx, int64_t* tmp, int64_t n) {
+    for (int64_t width = 1; width < n; width *= 2) {
+        for (int64_t lo = 0; lo < n; lo += 2 * width) {
+            int64_t mid = lo + width;
+            int64_t hi  = lo + 2 * width;
+            if (mid > n) mid = n;
+            if (hi  > n) hi  = n;
+            if (mid < hi)
+                jb_merge(idx, tmp, lo, mid, hi, cols, ncols);
+        }
+    }
+}
+
+/* ── Multiset comparison ───────────────────────────────────────────────────
+ * jb_results_equal: compare two I64-only result tables as multisets.
+ * Sort each by a lexicographic row order (column 0 primary, column 1
+ * secondary, …) then compare cell-by-cell in sorted order.
+ *
+ * NULLs sort before non-NULLs (consistent within both tables).
+ * ──────────────────────────────────────────────────────────────────────── */
 static test_result_t jb_results_equal(ray_t* a, ray_t* b) {
     int64_t ncols = ray_table_ncols(a);
     int64_t nrows = ray_table_nrows(a);
     TEST_ASSERT_EQ_I(ncols, ray_table_ncols(b));
     TEST_ASSERT_EQ_I(nrows, ray_table_nrows(b));
 
-    /* Build row-index arrays for sorting */
-    int64_t* ia = (int64_t*)malloc((size_t)nrows * sizeof(int64_t));
-    int64_t* ib = (int64_t*)malloc((size_t)nrows * sizeof(int64_t));
-    TEST_ASSERT(ia && ib, "jb_results_equal: malloc");
+    int64_t* ia      = NULL;
+    int64_t* ib      = NULL;
+    int64_t* tmp     = NULL;
+    ray_t**  cols_a  = NULL;
+    ray_t**  cols_b  = NULL;
+
+    test_result_t result = { TEST_PASS, NULL };
+
+    ia = (int64_t*)malloc((size_t)nrows * sizeof(int64_t));
+    ib = (int64_t*)malloc((size_t)nrows * sizeof(int64_t));
+    if (!ia || !ib) {
+        result = (test_result_t){ TEST_FAIL, "jb_results_equal: malloc ia/ib" };
+        goto cleanup;
+    }
     for (int64_t r = 0; r < nrows; r++) { ia[r] = r; ib[r] = r; }
 
-    /* Sort table a */
-    ray_t** cols_a = (ray_t**)malloc((size_t)ncols * sizeof(ray_t*));
-    TEST_ASSERT(cols_a != NULL, "jb_results_equal: malloc cols_a");
+    tmp = (int64_t*)malloc((size_t)nrows * sizeof(int64_t));
+    if (!tmp) {
+        result = (test_result_t){ TEST_FAIL, "jb_results_equal: malloc tmp" };
+        goto cleanup;
+    }
+
+    cols_a = (ray_t**)malloc((size_t)ncols * sizeof(ray_t*));
+    if (!cols_a) {
+        result = (test_result_t){ TEST_FAIL, "jb_results_equal: malloc cols_a" };
+        goto cleanup;
+    }
     for (int64_t c = 0; c < ncols; c++)
         cols_a[c] = ray_table_get_col_idx(a, c);
-    jb_cmp_cols  = cols_a;
-    jb_cmp_ncols = ncols;
-    qsort(ia, (size_t)nrows, sizeof(int64_t), jb_row_cmp);
+    jb_sort_rows(cols_a, ncols, ia, tmp, nrows);
 
-    /* Sort table b */
-    ray_t** cols_b = (ray_t**)malloc((size_t)ncols * sizeof(ray_t*));
-    TEST_ASSERT(cols_b != NULL, "jb_results_equal: malloc cols_b");
+    cols_b = (ray_t**)malloc((size_t)ncols * sizeof(ray_t*));
+    if (!cols_b) {
+        result = (test_result_t){ TEST_FAIL, "jb_results_equal: malloc cols_b" };
+        goto cleanup;
+    }
     for (int64_t c = 0; c < ncols; c++)
         cols_b[c] = ray_table_get_col_idx(b, c);
-    jb_cmp_cols  = cols_b;
-    jb_cmp_ncols = ncols;
-    qsort(ib, (size_t)nrows, sizeof(int64_t), jb_row_cmp);
-
-    jb_cmp_cols  = NULL;
-    jb_cmp_ncols = 0;
+    jb_sort_rows(cols_b, ncols, ib, tmp, nrows);
 
     /* Compare sorted rows cell-by-cell */
-    test_result_t result = { TEST_PASS, NULL };
     for (int64_t r = 0; r < nrows && result.status == TEST_PASS; r++) {
         int64_t ra = ia[r], rb = ib[r];
         for (int64_t c = 0; c < ncols; c++) {
@@ -181,15 +227,19 @@ static test_result_t jb_results_equal(ray_t* a, ray_t* b) {
         }
     }
 
-    free(ia); free(ib);
-    free(cols_a); free(cols_b);
+cleanup:
+    free(ia);
+    free(ib);
+    free(tmp);
+    free(cols_a);
+    free(cols_b);
     return result;
 }
 
 /* ── Baseline test ─────────────────────────────────────────────────────────
- * Build a right-side table larger than RAY_PARALLEL_THRESHOLD (64*1024) to
- * trigger the radix path.  Run the join twice: once with the no-swap knob
- * set (legacy build-on-right) and once with it cleared (future swap logic).
+ * Build a right-side table larger than RAY_PARALLEL_THRESHOLD to trigger
+ * the radix path.  Run the join twice: once with the no-swap knob set
+ * (legacy build-on-right) and once with it cleared (future swap logic).
  * Today both runs are identical, so jb_results_equal passes trivially.
  * This test pins the harness shape for Task 2.
  * ──────────────────────────────────────────────────────────────────────── */
@@ -197,7 +247,7 @@ static test_result_t test_jb_baseline_radix_inner(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
-    int64_t n_r = (64 * 1024) + 5000;   /* right > RAY_PARALLEL_THRESHOLD */
+    int64_t n_r = RAY_PARALLEL_THRESHOLD + 5000;   /* right > RAY_PARALLEL_THRESHOLD */
     int64_t n_l = 2000;
 
     int64_t* rv = (int64_t*)malloc((size_t)n_r * sizeof(int64_t));
