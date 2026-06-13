@@ -250,3 +250,30 @@ CONTROL           swap     1865.826  1841.534  1948.671  1854.722  1942.966  195
 MANY-TO-MANY      swap      168.174  150.634  165.381  163.139  190.703  165.451  152.290  164.149  153.455  159.366  222.164  167.555  158.498  156.277  152.885
                   legacy    369.834  310.879  319.009  314.401  314.928  348.581  318.818  311.451  331.450  328.876  361.020  316.547  327.220  328.117  344.521
 ```
+
+## CONTROLLER VERDICT: KEEP — net win with a small, bounded regression
+
+The size-only swap rule (`INNER && left_rows < right_rows`, radix path) is **kept**.
+Rationale, from the measured duplication-scaling curve:
+
+- **Win where it matters:** 2× at 100 rows/key, **8× at 10,000 rows/key** — the
+  fact×dimension join shape (many fact rows per dimension key) that dominates
+  analytic workloads. The 8× case goes 9.8s → 1.2s.
+- **Regression is small and bounded:** near-unique-key joins (~10 rows/key,
+  e.g. primary-key joins) lose ~4% best-case / ~15% median — a few ms on a
+  ~70ms join. Never catastrophic.
+- **No regression on near-equal sizes:** the swap correctly does not fire when
+  `left_rows >= right_rows` (CONTROL: counter unchanged, deltas in noise).
+
+**Why size alone can't separate win from loss:** radix partitioning already
+makes per-partition hash builds cache-resident, muting the classic
+"smaller-hash-fits-cache" benefit. The real win is avoiding an O(n×dup) build
+on a heavily-duplicated large side (long open-addressing collision chains).
+The *size ratio* doesn't predict duplication — both the 8× win and the 4% loss
+occur at the same 1000:1 ratio — and the large side's distinct-key count is not
+cheaply known before the join. So a refined predictor (decide-after-partition
+on partition skew, or fixing the O(n×dup) build degeneracy) is recorded as
+future work; the size heuristic ships as a strong net positive.
+
+Suite green under ASan+UBSan; differential multiset equality holds across all
+edge fixtures (m:n, nulls, multi-key, no-match, all-match).
