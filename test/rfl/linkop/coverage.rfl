@@ -77,7 +77,7 @@ linked_i32.age                  -- [42 18 25 42]
 
 ;; I32 link column with a null link row (null row propagates to result)
 (set rids_i32n (as 'I32 [0 1 2 0]))
-(set rids_i32n (alter 'rids_i32n set 1 0Ni))
+(alter 'rids_i32n set 1 0Ni)
 (set linked_i32n (.col.link 'dim_i32 rids_i32n))
 (set res_i32n linked_i32n.age)
 (nil? (at res_i32n 1))          -- true
@@ -120,7 +120,7 @@ linked_i32.age                  -- [42 18 25 42]
 
 (set dim_f64 (table [id score] (list [100 200 300] (as 'F64 [1.5 2.5 3.5]))))
 (set rids_f64 [0 1 2 0])
-(set rids_f64n (alter 'rids_f64 set 1 0Nl))
+(alter 'rids_f64 set 1 0Nl)(set rids_f64n rids_f64)
 (set linked_f64 (.col.link 'dim_f64 rids_f64n))
 (set res_f64 linked_f64.score)
 (nil? (at res_f64 1))           -- true
@@ -135,7 +135,7 @@ linked_i32.age                  -- [42 18 25 42]
 
 (set dim_i32t (table [id score32] (list [100 200 300] (as 'I32 [10 20 30]))))
 (set rids_i32t [0 1 2 0])
-(set rids_i32tn (alter 'rids_i32t set 1 0Nl))
+(alter 'rids_i32t set 1 0Nl)(set rids_i32tn rids_i32t)
 (set linked_i32t (.col.link 'dim_i32t rids_i32tn))
 (set res_i32t linked_i32t.score32)
 (nil? (at res_i32t 1))          -- true
@@ -149,7 +149,7 @@ linked_i32.age                  -- [42 18 25 42]
 
 (set dim_dt (table [id dt] (list [100 200 300] [2024.01.01 2024.06.15 2024.12.31])))
 (set rids_dt [0 1 2 0])
-(set rids_dtn (alter 'rids_dt set 2 0Nl))
+(alter 'rids_dt set 2 0Nl)(set rids_dtn rids_dt)
 (set linked_dt (.col.link 'dim_dt rids_dtn))
 (set res_dt linked_dt.dt)
 (nil? (at res_dt 2))            -- true
@@ -163,7 +163,7 @@ linked_i32.age                  -- [42 18 25 42]
 
 (set dim_tm (table [id tm] (list [100 200 300] (as 'TIME [3600000000000 7200000000000 10800000000000]))))
 (set rids_tm [0 1 2 1])
-(set rids_tmn (alter 'rids_tm set 0 0Nl))
+(alter 'rids_tm set 0 0Nl)(set rids_tmn rids_tm)
 (set linked_tm (.col.link 'dim_tm rids_tmn))
 (set res_tm linked_tm.tm)
 ;; row 0 is null link -> null TIME
@@ -176,7 +176,7 @@ linked_i32.age                  -- [42 18 25 42]
 
 (set dim_i16 (table [id val16] (list [100 200 300] (as 'I16 [10 20 30]))))
 (set rids_i16 [0 1 2 0])
-(set rids_i16n (alter 'rids_i16 set 1 0Nl))
+(alter 'rids_i16 set 1 0Nl)(set rids_i16n rids_i16)
 (set linked_i16 (.col.link 'dim_i16 rids_i16n))
 (set res_i16 linked_i16.val16)
 (nil? (at res_i16 1))           -- true
@@ -199,7 +199,7 @@ linked_sd.name                  -- (list 'carol 'alice 'bob 'alice)
 
 ;; sym_dict propagation: null in link -> null SYM in result
 (set rids_sdn [2 0 1 0])
-(set rids_sdn (alter 'rids_sdn set 1 0Nl))
+(alter 'rids_sdn set 1 0Nl)
 (set linked_sdn (.col.link 'dim_sd rids_sdn))
 (set res_sdn linked_sdn.name)
 (.col.link? linked_sdn)         -- true

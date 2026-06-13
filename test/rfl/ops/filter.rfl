@@ -74,6 +74,19 @@
 (count (select {from: Tstr where: (> k 999)})) -- 0
 (count (select {from: Tstr where: (> k 0)})) -- 5
 
+;; ────────────── LIST column survives an empty filter (sel_compact none-pass) ──────────────
+;; The none-pass branch built empty columns with ray_vec_new(ct,0), but
+;; RAY_LIST == 0 and ray_vec_new rejects type <= 0 — so the column was
+;; silently dropped and the 0-row result lost a column relative to the
+;; non-empty result.  Schema must be identical regardless of match count.
+(set Tlist (table [k nested] (list [1 2 3] (list (list 1 2) (list 3 4) (list 5 6)))))
+(key (select {from: Tlist where: (> k 999)})) -- [k nested]
+(key (select {from: Tlist where: (> k 0)}))   -- [k nested]
+(at (select {from: Tlist where: (> k 999)}) 'nested) -- (list)
+(count (select {from: Tlist where: (> k 999)})) -- 0
+;; same invariant through a by-group with an empty WHERE
+(key (select {from: Tlist by: k where: (> k 999)})) -- [k nested]
+
 ;; ────────────── 3. morsel-boundary sizes: 1023 / 1024 / 1025 ──────────────
 ;; sel_compact walks segments of RAY_MORSEL_ELEMS=1024 rows.  These three
 ;; sizes hit the partial-last-segment / exact-boundary / one-row-overflow
