@@ -632,12 +632,10 @@ static test_result_t test_no_push_const_pred(void) {
  * still the un-split AND and whose data input is the const-table (chain
  * depth 1).
  *
- * The knob-based diff helper (diff_having) is NOT usable here: with
- * pushdown disabled, pass-7 still splits the AND above GROUP into
- * FILTER(k<=3, FILTER(k>=2, GROUP)); the outer filter's pred evaluates
- * against g->table (12 rows) but its input is the 2-row group output —
- * a row-count mismatch error (empirically verified, pre-existing and
- * independent of the pushdown bug).
+ * With pushdown DISABLED the AND stays above GROUP as FILTER(AND, GROUP);
+ * split_and_filter's GROUP guard leaves it un-split, so the HAVING fusion
+ * evaluates the whole AND against the GROUP output and the disabled-pushdown
+ * path returns the same 2 rows as the pushed path (asserted below).
  * =================================================================== */
 
 /* (and (>= k 2) (<= k 3)) — keys-only AND, nominally groups k=2 and k=3 */
@@ -733,6 +731,27 @@ static test_result_t test_diff_and_of_keys(void) {
     TEST_ASSERT(sv != NULL, "v_sum column present in pushed result");
     TEST_ASSERT_EQ_I(ray_vec_get_i64(sv, 0), 15);  /* k=2 */
     TEST_ASSERT_EQ_I(ray_vec_get_i64(sv, 1), 24);  /* k=3 */
+
+    /* --- Disabled-pushdown path: FILTER(AND, GROUP) optimised; the GROUP
+     * guard suppresses the split, so this now executes correctly (it was the
+     * documented row-count-mismatch failure before the fix). --- */
+    ray_t* nopush_res = NULL;
+    {
+        ray_opt_no_group_pushdown = true;
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* root = build_having_plan(g, pred_key_and_range, NULL);
+        TEST_ASSERT(plan_having_unsplit(g, root),
+            "disabled-pushdown AND over GROUP must stay un-split FILTER(AND, GROUP)");
+        ray_op_t* skeys[1] = {ray_scan(g, "k")};
+        uint8_t descs[1] = {0};
+        root = ray_sort_op(g, root, skeys, descs, NULL, 1);
+        nopush_res = ray_execute(g, root);
+        ray_graph_free(g);
+        ray_opt_no_group_pushdown = false;
+    }
+    TEST_ASSERT_FALSE(RAY_IS_ERR(nopush_res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(nopush_res), 2);
+    ray_release(nopush_res);
 
     ray_release(pushed_res); ray_release(base_res);
     ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
