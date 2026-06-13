@@ -521,71 +521,43 @@ static test_result_t test_no_push_multi_consumer(void) {
 
 /* c. AND predicate mixing a key-scan conjunct and an agg-output conjunct.
  *
- * pred = AND(k >= 3, v_sum > 10).  collect_pred_scans traverses the full AND
- * subtree and finds both `k` and `v_sum` scans.  `v_sum` is not a group key
- * (it is an agg output), so keys_only=false → pushdown skipped at pass 6.
+ * pred = AND(k >= 3, v_sum > 10).  v_sum is an agg output, not a group key, so
+ * keys_only=false → pushdown skipped at pass 6 (root stays FILTER, not GROUP).
  *
- * At pass 7 (filter_reorder) split_and_filter decomposes the AND-filter into
- * two chained filters: FILTER(v_sum>10, FILTER(k>=3, GROUP(...))).  Passes
- * run once (ray_optimize makes a single linear sweep, pass 6 before pass 7),
- * so the k>=3 filter is NOT re-attempted for pushdown after the split.
- * The optimised shape is therefore FILTER(FILTER(GROUP)), not GROUP(FILTER).
- *
- * Execution note: the outer FILTER evaluates its predicate (v_sum > 10) via
- * exec_node, which reads SCAN nodes from g->table (the original table).  The
- * original table has no `v_sum` column, so executing the OPTIMIZED plan
- * returns a schema error.  The plan-shape assert is the meaningful check for
- * the optimised path.
- *
- * Value correctness is verified on the UN-OPTIMIZED plan (no ray_optimize
- * call): FILTER(GROUP) preserves the single-filter exec path (line ~1230 in
- * exec.c) that swaps g->table to the GROUP output before evaluating the pred.
- * Values: k=3 sum=24, k=4 sum=33 both satisfy AND(k>=3, v_sum>10) → 2 rows. */
+ * At pass 7 the AND-filter sits directly over GROUP, so split_and_filter's
+ * GROUP guard leaves it intact: the optimised shape is FILTER(AND, GROUP).
+ * The executor's HAVING fusion swaps g->table to the GROUP output and
+ * evaluates the whole AND there: k=3 sum=24 and k=4 sum=33 satisfy both
+ * conjuncts → 2 rows.  We assert this on the OPTIMISED plan. */
 static test_result_t test_no_push_mixed_pred(void) {
     ray_heap_init();
     ray_t* tbl = make_gp_table();
+    ray_graph_t* g = ray_graph_new(tbl);
 
-    /* Plan-shape check: optimise and assert no push */
-    {
-        ray_graph_t* g = ray_graph_new(tbl);
-        ray_op_t* k = ray_scan(g, "k");
-        ray_op_t* v = ray_scan(g, "v");
-        ray_op_t* keys[] = {k};
-        uint16_t  aops[] = {OP_SUM};
-        ray_op_t* ains[] = {v};
-        ray_op_t* grp  = ray_group(g, keys, 1, aops, ains, 1);
-        ray_op_t* pred = ray_and(g,
-            ray_ge(g, ray_scan(g, "k"),     ray_const_i64(g, 3)),
-            ray_gt(g, ray_scan(g, "v_sum"), ray_const_i64(g, 10)));
-        ray_op_t* filt = ray_filter(g, grp, pred);
-        ray_op_t* root = ray_optimize(g, filt);
-        TEST_ASSERT(!plan_pushed(g, root), "mixed-pred AND must not push");
-        ray_graph_free(g);
-    }
+    ray_op_t* k = ray_scan(g, "k");
+    ray_op_t* v = ray_scan(g, "v");
+    ray_op_t* keys[] = {k};
+    uint16_t  aops[] = {OP_SUM};
+    ray_op_t* ains[] = {v};
+    ray_op_t* grp  = ray_group(g, keys, 1, aops, ains, 1);
+    ray_op_t* pred = ray_and(g,
+        ray_ge(g, ray_scan(g, "k"),     ray_const_i64(g, 3)),
+        ray_gt(g, ray_scan(g, "v_sum"), ray_const_i64(g, 10)));
+    ray_op_t* filt = ray_filter(g, grp, pred);
+    ray_op_t* root = ray_optimize(g, filt);
 
-    /* Value check: un-optimized FILTER(GROUP) preserves the executor's
-     * special HAVING path (filter_child->opcode == OP_GROUP) so scans in
-     * the pred correctly resolve against the GROUP output, not g->table. */
-    {
-        ray_graph_t* g = ray_graph_new(tbl);
-        ray_op_t* k = ray_scan(g, "k");
-        ray_op_t* v = ray_scan(g, "v");
-        ray_op_t* keys[] = {k};
-        uint16_t  aops[] = {OP_SUM};
-        ray_op_t* ains[] = {v};
-        ray_op_t* grp  = ray_group(g, keys, 1, aops, ains, 1);
-        ray_op_t* pred = ray_and(g,
-            ray_ge(g, ray_scan(g, "k"),     ray_const_i64(g, 3)),
-            ray_gt(g, ray_scan(g, "v_sum"), ray_const_i64(g, 10)));
-        ray_op_t* filt = ray_filter(g, grp, pred);
-        ray_t* r = ray_execute(g, filt);  /* no ray_optimize — keeps FILTER(GROUP) */
-        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
-        /* k=3 sum=24, k=4 sum=33 both pass both conjuncts → 2 rows */
-        TEST_ASSERT_EQ_I(ray_table_nrows(r), 2);
-        ray_release(r); ray_graph_free(g);
-    }
+    /* Mixed AND is not pushable, and the GROUP guard prevents the split: the
+     * optimised shape is the intact FILTER(AND, GROUP). */
+    TEST_ASSERT(!plan_pushed(g, root), "mixed-pred AND must not push");
+    TEST_ASSERT(plan_having_unsplit(g, root),
+        "mixed-pred AND over GROUP must stay un-split FILTER(AND, GROUP)");
 
-    ray_release(tbl);
+    ray_t* r = ray_execute(g, root);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    /* k=3 sum=24, k=4 sum=33 satisfy AND(k>=3, v_sum>10) → 2 rows. */
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 2);
+
+    ray_release(r); ray_graph_free(g); ray_release(tbl);
     ray_sym_destroy(); ray_heap_destroy();
     PASS();
 }
