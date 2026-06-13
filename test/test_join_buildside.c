@@ -89,6 +89,55 @@ static ray_t* jb_inner_join(ray_t* lt, const char* lkey,
     return result;
 }
 
+/* ── Two-column table helper ──────────────────────────────────────────────
+ * jb_table2: allocate a two-column I64 table with column names n0/n1.
+ * v0[]/v1[] must have `n` elements each.  Caller owns the returned table.
+ * ──────────────────────────────────────────────────────────────────────── */
+static ray_t* jb_table2(const char* n0, const int64_t* v0,
+                         const char* n1, const int64_t* v1, int64_t n) {
+    ray_t* c0 = ray_vec_from_raw(RAY_I64, v0, n);
+    ray_t* c1 = ray_vec_from_raw(RAY_I64, v1, n);
+    ray_t* tbl = ray_table_new(2);
+    int64_t s0 = ray_sym_intern(n0, strlen(n0));
+    int64_t s1 = ray_sym_intern(n1, strlen(n1));
+    tbl = ray_table_add_col(tbl, s0, c0);
+    tbl = ray_table_add_col(tbl, s1, c1);
+    ray_release(c0);
+    ray_release(c1);
+    return tbl;
+}
+
+/* ── Two-key inner join ────────────────────────────────────────────────────
+ * jb_inner_join2: like jb_inner_join but for two composite keys.
+ * ──────────────────────────────────────────────────────────────────────── */
+static ray_t* jb_inner_join2(ray_t* lt, const char* lk0, const char* lk1,
+                              ray_t* rt, const char* rk0, const char* rk1) {
+    ray_graph_t* g = ray_graph_new(lt);
+    if (!g) return ray_error("oom", "jb_inner_join2: graph alloc");
+
+    ray_op_t* lt_node = ray_const_table(g, lt);
+    ray_op_t* rt_node = ray_const_table(g, rt);
+    ray_op_t* lk0_op  = ray_scan(g, lk0);
+    ray_op_t* lk1_op  = ray_scan(g, lk1);
+    ray_op_t* rk0_op  = ray_scan(g, rk0);
+    ray_op_t* rk1_op  = ray_scan(g, rk1);
+
+    if (!lt_node || !rt_node || !lk0_op || !lk1_op || !rk0_op || !rk1_op) {
+        ray_graph_free(g);
+        return ray_error("oom", "jb_inner_join2: node alloc");
+    }
+
+    ray_op_t* lk_arr[2] = { lk0_op, lk1_op };
+    ray_op_t* rk_arr[2] = { rk0_op, rk1_op };
+    ray_op_t* jn = ray_join(g, lt_node, lk_arr, rt_node, rk_arr, 2, 0);
+    if (!jn) { ray_graph_free(g); return ray_error("oom", "jb_inner_join2: join node"); }
+
+    jn = ray_optimize(g, jn);
+    ray_t* result = ray_execute(g, jn);
+    ray_graph_free(g);
+    return result;
+}
+
 /* ── Row sort (no globals) ─────────────────────────────────────────────────
  * jb_sort_rows: sort index array idx[0..n) by lexicographic row order over
  * cols[0..ncols).  NULLs sort before non-NULLs.
@@ -158,6 +207,10 @@ static test_result_t jb_results_equal(ray_t* a, ray_t* b) {
     int64_t nrows = ray_table_nrows(a);
     TEST_ASSERT_EQ_I(ncols, ray_table_ncols(b));
     TEST_ASSERT_EQ_I(nrows, ray_table_nrows(b));
+
+    /* 0-row result: ncols already verified equal; nothing to sort/compare. */
+    if (nrows == 0)
+        return (test_result_t){ TEST_PASS, NULL };
 
     int64_t* ia      = NULL;
     int64_t* ib      = NULL;
@@ -315,10 +368,253 @@ static test_result_t test_jb_swap_inner_matches(void) {
     return rr;
 }
 
+/* ── Differential wrapper ──────────────────────────────────────────────────
+ * jb_diff: run the inner join swap-enabled vs knob-forced-no-swap and assert
+ * multiset equality.  When expect_swap is true the counter must advance.
+ * ──────────────────────────────────────────────────────────────────────── */
+static test_result_t jb_diff(ray_t* lt, const char* lkey,
+                              ray_t* rt, const char* rkey, bool expect_swap) {
+    uint64_t before = ray_join_build_swaps;
+    ray_join_no_build_swap = false;
+    ray_t* sw = jb_inner_join(lt, lkey, rt, rkey);
+    bool fired = ray_join_build_swaps > before;
+    ray_join_no_build_swap = true;
+    ray_t* pl = jb_inner_join(lt, lkey, rt, rkey);
+    ray_join_no_build_swap = false;
+    test_result_t rr = jb_results_equal(sw, pl);
+    if (rr.status == TEST_PASS && expect_swap != fired)
+        rr = (test_result_t){ TEST_FAIL,
+            expect_swap ? "expected swap to fire" : "swap fired unexpectedly" };
+    ray_release(sw); ray_release(pl);
+    return rr;
+}
+
+/* ── Edge fixture: many-to-many ────────────────────────────────────────────
+ * right n=T+5000 keys i%50, left n=2000 keys i%50 — heavy m:n fanout.
+ * Swap fires (left < right).
+ * ──────────────────────────────────────────────────────────────────────── */
+static test_result_t test_jb_many_to_many(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t n_r = RAY_PARALLEL_THRESHOLD + 5000;
+    int64_t n_l = 2000;
+    int64_t* rv = malloc((size_t)n_r * sizeof(int64_t));
+    int64_t* lv = malloc((size_t)n_l * sizeof(int64_t));
+    TEST_ASSERT(rv && lv, "malloc key arrays");
+    for (int64_t i = 0; i < n_r; i++) rv[i] = i % 50;
+    for (int64_t i = 0; i < n_l; i++) lv[i] = i % 50;
+
+    ray_t* rt = jb_table1("rk", rv, n_r);
+    ray_t* lt = jb_table1("lk", lv, n_l);
+    test_result_t rr = jb_diff(lt, "lk", rt, "rk", /*expect_swap=*/true);
+
+    ray_release(lt); ray_release(rt);
+    free(lv); free(rv);
+    ray_sym_destroy(); ray_heap_destroy();
+    return rr;
+}
+
+/* ── Edge fixture: no matches ──────────────────────────────────────────────
+ * right keys i%1000, left keys 1000+(i%1000) — disjoint, 0 output rows.
+ * Swap fires (left < right); jb_results_equal handles 0-row result.
+ * ──────────────────────────────────────────────────────────────────────── */
+static test_result_t test_jb_no_matches(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t n_r = RAY_PARALLEL_THRESHOLD + 5000;
+    int64_t n_l = 2000;
+    int64_t* rv = malloc((size_t)n_r * sizeof(int64_t));
+    int64_t* lv = malloc((size_t)n_l * sizeof(int64_t));
+    TEST_ASSERT(rv && lv, "malloc key arrays");
+    for (int64_t i = 0; i < n_r; i++) rv[i] = i % 1000;
+    for (int64_t i = 0; i < n_l; i++) lv[i] = 1000 + (i % 1000);
+
+    ray_t* rt = jb_table1("rk", rv, n_r);
+    ray_t* lt = jb_table1("lk", lv, n_l);
+    test_result_t rr = jb_diff(lt, "lk", rt, "rk", /*expect_swap=*/true);
+
+    ray_release(lt); ray_release(rt);
+    free(lv); free(rv);
+    ray_sym_destroy(); ray_heap_destroy();
+    return rr;
+}
+
+/* ── Edge fixture: all match ───────────────────────────────────────────────
+ * right n=T+2000 all key 7, left n=50 all key 7 — full cross-product.
+ * (right=67536 × left=50 = 3,376,800 output rows; stresses HT-grow path.)
+ * Swap fires (left << right).
+ * ──────────────────────────────────────────────────────────────────────── */
+static test_result_t test_jb_all_match(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t n_r = RAY_PARALLEL_THRESHOLD + 2000;
+    int64_t n_l = 50;
+    int64_t* rv = malloc((size_t)n_r * sizeof(int64_t));
+    int64_t* lv = malloc((size_t)n_l * sizeof(int64_t));
+    TEST_ASSERT(rv && lv, "malloc key arrays");
+    for (int64_t i = 0; i < n_r; i++) rv[i] = 7;
+    for (int64_t i = 0; i < n_l; i++) lv[i] = 7;
+
+    ray_t* rt = jb_table1("rk", rv, n_r);
+    ray_t* lt = jb_table1("lk", lv, n_l);
+    test_result_t rr = jb_diff(lt, "lk", rt, "rk", /*expect_swap=*/true);
+
+    ray_release(lt); ray_release(rt);
+    free(lv); free(rv);
+    ray_sym_destroy(); ray_heap_destroy();
+    return rr;
+}
+
+/* ── Edge fixture: null keys ───────────────────────────────────────────────
+ * right n=T+5000 keys i%1000 (some null), left n=2000 keys i%1000 (some
+ * null).  Swap path must match no-swap for whatever null-key semantics the
+ * engine applies (NULLs never match NULLs in SQL inner join).
+ *
+ * Nulling a table column: get the column vec via ray_table_get_col_idx
+ * (returns the live vec owned by the table), then call ray_vec_set_null on
+ * it directly — the table owns the vec so the mutation is in-place.
+ * ──────────────────────────────────────────────────────────────────────── */
+static test_result_t test_jb_null_keys(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t n_r = RAY_PARALLEL_THRESHOLD + 5000;
+    int64_t n_l = 2000;
+    int64_t* rv = malloc((size_t)n_r * sizeof(int64_t));
+    int64_t* lv = malloc((size_t)n_l * sizeof(int64_t));
+    TEST_ASSERT(rv && lv, "malloc key arrays");
+    for (int64_t i = 0; i < n_r; i++) rv[i] = i % 1000;
+    for (int64_t i = 0; i < n_l; i++) lv[i] = i % 1000;
+
+    ray_t* rt = jb_table1("rk", rv, n_r);
+    ray_t* lt = jb_table1("lk", lv, n_l);
+
+    /* Null a handful of rows in each table's key column via the live vec. */
+    ray_t* rc = ray_table_get_col_idx(rt, 0);
+    ray_t* lc = ray_table_get_col_idx(lt, 0);
+    TEST_ASSERT(rc && !RAY_IS_ERR(rc), "rt col 0");
+    TEST_ASSERT(lc && !RAY_IS_ERR(lc), "lt col 0");
+    ray_vec_set_null(rc, 0, true);
+    ray_vec_set_null(rc, 100, true);
+    ray_vec_set_null(rc, 999, true);
+    ray_vec_set_null(lc, 1, true);
+    ray_vec_set_null(lc, 500, true);
+
+    test_result_t rr = jb_diff(lt, "lk", rt, "rk", /*expect_swap=*/true);
+
+    ray_release(lt); ray_release(rt);
+    free(lv); free(rv);
+    ray_sym_destroy(); ray_heap_destroy();
+    return rr;
+}
+
+/* ── Edge fixture: near-equal, no swap ────────────────────────────────────
+ * Both sides n=T+5000, keys i%1000.  left_rows == right_rows, so swap must
+ * NOT fire (strict less-than condition fails).
+ * ──────────────────────────────────────────────────────────────────────── */
+static test_result_t test_jb_near_equal_no_swap(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t n = RAY_PARALLEL_THRESHOLD + 5000;
+    int64_t* rv = malloc((size_t)n * sizeof(int64_t));
+    int64_t* lv = malloc((size_t)n * sizeof(int64_t));
+    TEST_ASSERT(rv && lv, "malloc key arrays");
+    for (int64_t i = 0; i < n; i++) rv[i] = i % 1000;
+    for (int64_t i = 0; i < n; i++) lv[i] = i % 1000;
+
+    ray_t* rt = jb_table1("rk", rv, n);
+    ray_t* lt = jb_table1("lk", lv, n);
+    test_result_t rr = jb_diff(lt, "lk", rt, "rk", /*expect_swap=*/false);
+
+    ray_release(lt); ray_release(rt);
+    free(lv); free(rv);
+    ray_sym_destroy(); ray_heap_destroy();
+    return rr;
+}
+
+/* ── Edge fixture: multi-key ───────────────────────────────────────────────
+ * Two-column inner join (k0=i%100, k1=i%7).  right n=T+5000, left n=2000.
+ * Swap fires (left < right).
+ * ──────────────────────────────────────────────────────────────────────── */
+static test_result_t test_jb_multi_key(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t n_r = RAY_PARALLEL_THRESHOLD + 5000;
+    int64_t n_l = 2000;
+    int64_t* rv0 = malloc((size_t)n_r * sizeof(int64_t));
+    int64_t* rv1 = malloc((size_t)n_r * sizeof(int64_t));
+    int64_t* lv0 = malloc((size_t)n_l * sizeof(int64_t));
+    int64_t* lv1 = malloc((size_t)n_l * sizeof(int64_t));
+    TEST_ASSERT(rv0 && rv1 && lv0 && lv1, "malloc key arrays");
+    for (int64_t i = 0; i < n_r; i++) { rv0[i] = i % 100; rv1[i] = i % 7; }
+    for (int64_t i = 0; i < n_l; i++) { lv0[i] = i % 100; lv1[i] = i % 7; }
+
+    ray_t* rt = jb_table2("rk0", rv0, "rk1", rv1, n_r);
+    ray_t* lt = jb_table2("lk0", lv0, "lk1", lv1, n_l);
+
+    /* jb_diff only handles single-key; run two-key inline. */
+    uint64_t before = ray_join_build_swaps;
+    ray_join_no_build_swap = false;
+    ray_t* sw = jb_inner_join2(lt, "lk0", "lk1", rt, "rk0", "rk1");
+    bool fired = ray_join_build_swaps > before;
+    ray_join_no_build_swap = true;
+    ray_t* pl = jb_inner_join2(lt, "lk0", "lk1", rt, "rk0", "rk1");
+    ray_join_no_build_swap = false;
+
+    test_result_t rr = jb_results_equal(sw, pl);
+    if (rr.status == TEST_PASS && !fired)
+        rr = (test_result_t){ TEST_FAIL, "expected swap to fire (multi-key)" };
+    ray_release(sw); ray_release(pl);
+
+    ray_release(lt); ray_release(rt);
+    free(lv0); free(lv1); free(rv0); free(rv1);
+    ray_sym_destroy(); ray_heap_destroy();
+    return rr;
+}
+
+/* ── Edge fixture: left bigger, no swap ───────────────────────────────────
+ * right n=2000 (below RAY_PARALLEL_THRESHOLD → chained path, radix never
+ * entered).  left n=T+5000.  Swap never fires; result is correct via the
+ * chained path.
+ * ──────────────────────────────────────────────────────────────────────── */
+static test_result_t test_jb_left_bigger_no_swap(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t n_r = 2000;
+    int64_t n_l = RAY_PARALLEL_THRESHOLD + 5000;
+    int64_t* rv = malloc((size_t)n_r * sizeof(int64_t));
+    int64_t* lv = malloc((size_t)n_l * sizeof(int64_t));
+    TEST_ASSERT(rv && lv, "malloc key arrays");
+    for (int64_t i = 0; i < n_r; i++) rv[i] = i % 1000;
+    for (int64_t i = 0; i < n_l; i++) lv[i] = i % 1000;
+
+    ray_t* rt = jb_table1("rk", rv, n_r);
+    ray_t* lt = jb_table1("lk", lv, n_l);
+    test_result_t rr = jb_diff(lt, "lk", rt, "rk", /*expect_swap=*/false);
+
+    ray_release(lt); ray_release(rt);
+    free(lv); free(rv);
+    ray_sym_destroy(); ray_heap_destroy();
+    return rr;
+}
+
 /* ── Entry table ─────────────────────────────────────────────────────────── */
 
 const test_entry_t join_buildside_entries[] = {
     { "join_buildside/baseline_radix_inner", test_jb_baseline_radix_inner, NULL, NULL },
     { "join_buildside/swap_inner_matches", test_jb_swap_inner_matches, NULL, NULL },
+    { "join_buildside/many_to_many", test_jb_many_to_many, NULL, NULL },
+    { "join_buildside/no_matches", test_jb_no_matches, NULL, NULL },
+    { "join_buildside/all_match", test_jb_all_match, NULL, NULL },
+    { "join_buildside/null_keys", test_jb_null_keys, NULL, NULL },
+    { "join_buildside/near_equal_no_swap", test_jb_near_equal_no_swap, NULL, NULL },
+    { "join_buildside/multi_key", test_jb_multi_key, NULL, NULL },
+    { "join_buildside/left_bigger_no_swap", test_jb_left_bigger_no_swap, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
