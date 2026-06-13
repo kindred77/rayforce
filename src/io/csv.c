@@ -51,6 +51,9 @@
 #include "table/sym.h"
 #include "table/domain.h"
 #include "vec/str.h"
+#ifdef RAY_OS_WINDOWS
+#include "core/win/mman.h"
+#endif
 
 #include <inttypes.h>
 #include <math.h>
@@ -63,8 +66,8 @@
 #include <fcntl.h>
 #ifndef RAY_OS_WINDOWS
 #include <unistd.h>
-#endif
 #include <sys/mman.h>
+#endif
 
 /* --------------------------------------------------------------------------
  * Constants

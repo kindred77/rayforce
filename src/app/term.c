@@ -38,6 +38,7 @@
 #include <errno.h>
 
 #if defined(RAY_OS_WINDOWS)
+#include <windows.h>
 #include <io.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -71,6 +72,17 @@ typedef struct stat hist_stat_t;
 static inline void term_write(const void* buf, size_t len) {
     ssize_t r = write(STDOUT_FILENO, buf, len);
     (void)r;
+}
+#else
+static inline void term_write(const void* buf, size_t len) {
+    DWORD written;
+    WriteFile(
+        GetStdHandle(STD_OUTPUT_HANDLE),
+        buf,
+        (DWORD)len,
+        &written,
+        NULL
+    );
 }
 #endif
 

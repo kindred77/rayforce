@@ -323,7 +323,15 @@ static void print_banner(void) {
     char cpu[256];
     get_cpu_name(cpu, sizeof(cpu));
     int64_t mem_mb = get_total_mem_mb();
+#if defined(RAY_OS_WINDOWS)
+    SYSTEM_INFO info;
+    GetSystemInfo(&info);
+    int ncores = info.dwNumberOfProcessors;
+#else
     int ncores = (int)sysconf(_SC_NPROCESSORS_ONLN);
+#endif
+
+
 
     /* "Using" count reflects the actual worker-pool size, not ncores.
      * ray_pool_get() is a lazy initializer — callers might not have

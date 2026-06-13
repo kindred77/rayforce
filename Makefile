@@ -1,4 +1,4 @@
-CC      ?= clang
+CC      ?= gcc
 STD     = c17
 AR      = ar
 TARGET  = rayforce
@@ -10,7 +10,7 @@ VERSION       = $(VERSION_MAJOR).$(VERSION_MINOR).$(VERSION_PATCH)
 GIT_HASH := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 BUILD_DATE := $(shell date -u +%Y-%m-%d)
 
-WARNS   = -Wall -Wextra -Werror -Wstrict-prototypes -Wno-unused-parameter
+WARNS   = -Wall -Wextra -Werror -Wstrict-prototypes -Wno-unused-parameter -Wno-unterminated-string-initialization
 DEFS    = -DRAYFORCE_GIT_COMMIT=\"$(GIT_HASH)\" -DRAYFORCE_BUILD_DATE=\"$(BUILD_DATE)\"
 INCLUDES = -Iinclude -Isrc
 # Header-dependency tracking: -MMD emits a .d makefile fragment next to
@@ -62,6 +62,11 @@ LDFLAGS = $(DEBUG_LDFLAGS)
 # Sources
 LIB_SRC  = $(wildcard src/*/*.c)
 LIB_SRC := $(filter-out src/app/main.c, $(LIB_SRC))
+
+ifeq (,$(findstring MSYS_NT,$(shell uname -s)))
+LIB_SRC := $(filter-out src/core/win/mman.c, $(LIB_SRC))
+endif
+
 LIB_OBJ  = $(LIB_SRC:.c=.o)
 MAIN_SRC = src/app/main.c
 MAIN_OBJ = $(MAIN_SRC:.c=.o)

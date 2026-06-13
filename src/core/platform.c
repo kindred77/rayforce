@@ -269,7 +269,6 @@ void ray_sem_signal(ray_sem_t* s) {
   #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
-
 /* --------------------------------------------------------------------------
  * Virtual memory
  * -------------------------------------------------------------------------- */
@@ -316,19 +315,86 @@ void ray_vm_unmap_file(void* ptr, size_t size) {
     if (ptr) UnmapViewOfFile(ptr);
 }
 
-void ray_vm_advise_seq(void* ptr, size_t size) {
-    /* PrefetchVirtualMemory is Win8.1+. Best-effort; ignore failure. */
-    WIN32_MEMORY_RANGE_ENTRY entry;
-    entry.VirtualAddress = ptr;
-    entry.NumberOfBytes  = size;
-    PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0);
+#ifndef RAY_DEF_WIN32_MEMORY_RANGE_ENTRY
+#define RAY_DEF_WIN32_MEMORY_RANGE_ENTRY
+typedef struct _WIN32_MEMORY_RANGE_ENTRY {
+    PVOID VirtualAddress;
+    SIZE_T NumberOfBytes;
+} WIN32_MEMORY_RANGE_ENTRY, *PWIN32_MEMORY_RANGE_ENTRY;
+#endif
+
+typedef BOOL(WINAPI *PFN_PrefetchVirtualMemory)(
+    HANDLE hProcess,
+    ULONG_PTR NumberOfEntries,
+    PWIN32_MEMORY_RANGE_ENTRY VirtualAddresses,
+    ULONG Flags
+);
+
+typedef BOOL(WINAPI *PFN_DiscardVirtualMemory)(
+    PVOID VirtualAddress,
+    SIZE_T Size
+);
+
+// 延迟加载函数指针，全局静态只初始化一次
+static PFN_PrefetchVirtualMemory g_pfnPrefetch = NULL;
+static PFN_DiscardVirtualMemory g_pfnDiscard = NULL;
+
+static void ray_vm_init_api(void)
+{
+    static int inited = 0;
+    if (inited) return;
+    inited = 1;
+
+    HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+    g_pfnPrefetch = (PFN_PrefetchVirtualMemory)
+    (void *)GetProcAddress(hKernel32, "PrefetchVirtualMemory");
+    g_pfnDiscard = (PFN_DiscardVirtualMemory)
+    (void *)GetProcAddress(hKernel32, "DiscardVirtualMemory");
 }
 
-void ray_vm_release(void* ptr, size_t size) {
-    if (!ptr) return;
-    /* DiscardVirtualMemory (Win8.1+) or fallback to decommit+recommit */
-    DiscardVirtualMemory(ptr, size);
+void ray_vm_advise_seq(void* ptr, size_t size)
+{
+    if (ptr == NULL || size == 0)
+        return;
+
+    ray_vm_init_api();
+    if (g_pfnPrefetch == NULL)
+        return;
+
+    WIN32_MEMORY_RANGE_ENTRY entry;
+    entry.VirtualAddress = ptr;
+    entry.NumberOfBytes = size;
+    (void)g_pfnPrefetch(GetCurrentProcess(), 1, &entry, 0);
 }
+
+void ray_vm_release(void* ptr, size_t size)
+{
+    if (ptr == NULL || size == 0)
+        return;
+
+    ray_vm_init_api();
+    if (g_pfnDiscard != NULL)
+    {
+        (void)g_pfnDiscard(ptr, size);
+        return;
+    }
+    VirtualUnlock(ptr, size);
+    (void)VirtualFree(ptr, size, MEM_DECOMMIT);
+}
+
+//void ray_vm_advise_seq(void* ptr, size_t size) {
+//    /* PrefetchVirtualMemory is Win8.1+. Best-effort; ignore failure. */
+//    WIN32_MEMORY_RANGE_ENTRY entry;
+//    entry.VirtualAddress = ptr;
+//    entry.NumberOfBytes  = size;
+//    PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0);
+//}
+
+//void ray_vm_release(void* ptr, size_t size) {
+//    if (!ptr) return;
+//    /* DiscardVirtualMemory (Win8.1+) or fallback to decommit+recommit */
+//    DiscardVirtualMemory(ptr, size);
+//}
 
 void ray_vm_release_block(void* blk, size_t bsize, bool hugepage) {
     (void)hugepage;

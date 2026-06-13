@@ -29,6 +29,18 @@
 #include <stddef.h>
 #include <assert.h>
 
+#if defined(__EMSCRIPTEN__)
+  #define RAY_OS_WASM    1
+#elif defined(__linux__)
+  #define RAY_OS_LINUX   1
+#elif defined(__APPLE__) && defined(__MACH__)
+  #define RAY_OS_MACOS   1
+#elif defined(_WIN32)
+  #define RAY_OS_WINDOWS 1
+#else
+  #error "Unsupported platform"
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif

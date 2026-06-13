@@ -43,7 +43,13 @@
 #include <unistd.h>     /* getpid, close, ftruncate, unlink */
 #include <fcntl.h>      /* open, fcntl, F_PREALLOCATE on macOS */
 #include <errno.h>
+#ifndef RAY_OS_WINDOWS
 #include <sys/mman.h>   /* mmap, munmap */
+#else
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include "core/win/mman.h"
+#endif
 #include <sys/stat.h>   /* O_*  modes */
 #include <sys/types.h>
 #include <stdatomic.h>
@@ -63,7 +69,12 @@
  * choice for chasing double releases (found while debugging #240).
  * RAY_DFD_NO_ABORT=1 reports without aborting.
  * ===================================================================== */
+#ifndef RAY_OS_WINDOWS
 #include <execinfo.h>
+#else
+#include <dbghelp.h>
+#endif
+
 
 #define DFD_CAP_BITS 20
 #define DFD_CAP      (1u << DFD_CAP_BITS)
@@ -147,6 +158,63 @@ static void dfd_purge_range(uintptr_t lo, uintptr_t hi) {
     dfd_unlock();
 }
 
+#ifdef RAY_OS_WINDOWS
+static BOOL sym_init_done = FALSE;
+
+static void init_dbg_symbols(void)
+{
+    if (sym_init_done) return;
+    SymInitialize(GetCurrentProcess(), NULL, TRUE);
+    sym_init_done = TRUE;
+}
+
+static void print_backtrace_stderr(void** frames, int frame_count)
+{
+    init_dbg_symbols();
+
+    SYMBOL_INFO* sym = (SYMBOL_INFO*)calloc(1, sizeof(SYMBOL_INFO) + 256);
+    sym->MaxNameLen = 255;
+    sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+
+    IMAGEHLP_LINE64 line_info;
+    DWORD line_disp;
+    line_info.SizeOfStruct = sizeof(IMAGEHLP_LINE64);
+
+    for (int i = 0; i < frame_count; i++)
+    {
+        DWORD64 addr = (DWORD64)frames[i];
+        if (SymFromAddr(GetCurrentProcess(), addr, NULL, sym))
+        {
+            fprintf(stderr, "#%d 0x%llX %s", i, addr, sym->Name);
+            if (SymGetLineFromAddr64(GetCurrentProcess(), addr, &line_disp, &line_info))
+            {
+                fprintf(stderr, " (%s:%lu)", line_info.FileName, line_info.LineNumber);
+            }
+            fprintf(stderr, "\n");
+        }
+        else
+        {
+            fprintf(stderr, "#%d 0x%llX <unknown>\n", i, addr);
+        }
+    }
+
+    free(sym);
+}
+
+static void dfd_report(const char* who, const void* p)
+{
+    void* frames[64];
+    // Capture stack backtrace
+    USHORT n = CaptureStackBackTrace(1, 64, frames, NULL);
+
+    fprintf(stderr, "\n=== DFD: %s on FREED block %p ===\n", who, p);
+    print_backtrace_stderr(frames, n);
+    fflush(stderr);
+
+    if (!getenv("RAY_DFD_NO_ABORT"))
+        abort();
+}
+#else
 static void dfd_report(const char* who, const void* p) {
     void* frames[64];
     int n = backtrace(frames, 64);
@@ -155,6 +223,7 @@ static void dfd_report(const char* who, const void* p) {
     fflush(stderr);
     if (!getenv("RAY_DFD_NO_ABORT")) abort();
 }
+#endif
 
 /* Called from cow.c (ray_release / ray_retain). */
 void ray_dfd_check_live(const void* p, const char* who);
@@ -178,6 +247,38 @@ static void dfd_validate_freelists(void);
  * contiguous first, fall back to non-contiguous, then ftruncate to
  * extend the file size if needed (F_PREALLOCATE doesn't grow the file
  * beyond its current size). */
+
+#if defined(RAY_OS_WINDOWS)
+static int posix_fallocate(int fd, off_t offset, off_t len) {
+    HANDLE hFile = (HANDLE)_get_osfhandle(fd);
+    if (hFile == INVALID_HANDLE_VALUE)
+        return EBADF;
+
+    LARGE_INTEGER file_offset;
+    file_offset.QuadPart = offset + len;
+
+    // 移动文件指针到要预分配的末尾位置
+    if (!SetFilePointerEx(hFile, file_offset, NULL, FILE_BEGIN))
+        return ENOSPC;
+
+    // 扩展文件长度，系统预分配磁盘空间
+    if (!SetEndOfFile(hFile))
+    {
+        DWORD err = GetLastError();
+        if (err == ERROR_DISK_FULL)
+            return ENOSPC;
+        return EIO;
+    }
+
+    // 可选：把文件指针移回原位置，不改变业务当前读写位置
+    LARGE_INTEGER reset_ptr;
+    reset_ptr.QuadPart = offset;
+    SetFilePointerEx(hFile, reset_ptr, NULL, FILE_BEGIN);
+
+    return 0;
+}
+#endif
+
 static int heap_preallocate(int fd, off_t offset, off_t len) {
 #if defined(__APPLE__)
     fstore_t fs = {
