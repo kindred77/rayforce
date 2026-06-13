@@ -11,7 +11,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define STRESS_EVAL_DB "/tmp/rayforce_stress_eval"
 
 /* ray_runtime_create() implies ray_heap_init() + ray_sym_init(), and
  * ray_runtime_destroy() tears both down (src/core/runtime.c) — so setup/
@@ -33,7 +32,7 @@ static test_result_t test_eval_fixture_roundtrip_impl(stress_ctx_t* c) {
 
 static test_result_t test_eval_fixture_roundtrip(void) {
     stress_ctx_t c;
-    TEST_ASSERT(stress_init(&c, STRESS_EVAL_DB, 200), "init");
+    TEST_ASSERT(stress_init(&c, stress_db_path("eval"), 200), "init");
     test_result_t r = test_eval_fixture_roundtrip_impl(&c);
     stress_destroy(&c);
     return r;
@@ -93,7 +92,7 @@ static test_result_t test_eval_matrix_ops_impl(stress_ctx_t* c) {
 
 static test_result_t test_eval_matrix_ops(void) {
     stress_ctx_t c;
-    TEST_ASSERT(stress_init(&c, STRESS_EVAL_DB, 201), "init");
+    TEST_ASSERT(stress_init(&c, stress_db_path("eval"), 201), "init");
     test_result_t r = test_eval_matrix_ops_impl(&c);
     stress_destroy(&c);
     return r;
@@ -137,7 +136,7 @@ static test_result_t test_eval_query_oracle_detects_impl(stress_ctx_t* c) {
 
 static test_result_t test_eval_query_oracle_detects(void) {
     stress_ctx_t c;
-    TEST_ASSERT(stress_init(&c, STRESS_EVAL_DB, 203), "init");
+    TEST_ASSERT(stress_init(&c, stress_db_path("eval"), 203), "init");
     test_result_t r = test_eval_query_oracle_detects_impl(&c);
     stress_destroy(&c);
     return r;
@@ -240,8 +239,8 @@ static test_result_t test_eval_equiv_impl(stress_ctx_t* cc, stress_ctx_t* ce) {
 
 static test_result_t test_eval_equiv_with_c_driver(void) {
     stress_ctx_t cc, ce;
-    TEST_ASSERT(stress_init(&cc, STRESS_EVAL_DB "_eqc", 202), "init C fixture");
-    if (!stress_init(&ce, STRESS_EVAL_DB "_eqe", 202)) {
+    TEST_ASSERT(stress_init(&cc, stress_db_path("eval_eqc"), 202), "init C fixture");
+    if (!stress_init(&ce, stress_db_path("eval_eqe"), 202)) {
         stress_destroy(&cc);
         TEST_ASSERT(false, "init eval fixture");
     }
@@ -299,7 +298,7 @@ static test_result_t test_eval_client_layout_impl(stress_ctx_t* c) {
 
 static test_result_t test_eval_client_layout(void) {
     stress_ctx_t c;
-    TEST_ASSERT(stress_init(&c, STRESS_EVAL_DB, 204), "init");
+    TEST_ASSERT(stress_init(&c, stress_db_path("eval"), 204), "init");
     test_result_t r = test_eval_client_layout_impl(&c);
     stress_destroy(&c);
     return r;
@@ -443,7 +442,7 @@ static test_result_t test_eval_determinism(void) {
     memset(&s, 0, sizeof(s));
 
     stress_ctx_t c1;
-    TEST_ASSERT(stress_init(&c1, STRESS_EVAL_DB, 205), "init run 1");
+    TEST_ASSERT(stress_init(&c1, stress_db_path("eval"), 205), "init run 1");
     bool ok1 = det_run(&c1) && !c1.failed && det_snapshot(&c1, &s);
     stress_destroy(&c1);
     if (!ok1) {
@@ -460,7 +459,7 @@ static test_result_t test_eval_determinism(void) {
     }
 
     stress_ctx_t c2;
-    if (!stress_init(&c2, STRESS_EVAL_DB, 205)) {
+    if (!stress_init(&c2, stress_db_path("eval"), 205)) {
         det_snap_free(&s);
         TEST_ASSERT(false, "init run 2");
     }

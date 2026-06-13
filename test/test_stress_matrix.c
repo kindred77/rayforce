@@ -11,7 +11,6 @@
 #include "mem/heap.h"
 #include "table/sym.h"
 
-#define STRESS_DB "/tmp/rayforce_stress_matrix"
 
 static void stress_setup(void) {
     ray_heap_init();
@@ -32,7 +31,9 @@ static test_result_t test_fixture_roundtrip_impl(stress_ctx_t* c) {
     TEST_ASSERT(stress_seed_initial(c, 100, 3, 50), "seed");
 
     /* live splayed table loads with the shared symfile */
-    ray_t* live = ray_splay_load(STRESS_DB "/live", STRESS_DB "/sym");
+    char livedir[512];
+    stress_live_dir(c, livedir, sizeof(livedir));
+    ray_t* live = ray_splay_load(livedir, c->sym_path);
     TEST_ASSERT_NOT_NULL(live);
     TEST_ASSERT_FALSE(RAY_IS_ERR(live));
     TEST_ASSERT_EQ_I(ray_table_nrows(live), 100);
@@ -40,7 +41,7 @@ static test_result_t test_fixture_roundtrip_impl(stress_ctx_t* c) {
     ray_release(live);
 
     /* parted table loads and skips the non-date `live` dir */
-    ray_t* parted = ray_read_parted(STRESS_DB, "hist");
+    ray_t* parted = ray_read_parted(c->db_root, "hist");
     TEST_ASSERT_NOT_NULL(parted);
     TEST_ASSERT_FALSE(RAY_IS_ERR(parted));
     ray_release(parted);
@@ -50,7 +51,7 @@ static test_result_t test_fixture_roundtrip_impl(stress_ctx_t* c) {
 
 static test_result_t test_fixture_roundtrip(void) {
     stress_ctx_t c;
-    TEST_ASSERT(stress_init(&c, STRESS_DB, 42), "init");
+    TEST_ASSERT(stress_init(&c, stress_db_path("matrix"), 42), "init");
     test_result_t r = test_fixture_roundtrip_impl(&c);
     stress_destroy(&c);
     return r;
@@ -66,7 +67,7 @@ static test_result_t test_verify_clean_impl(stress_ctx_t* c) {
 
 static test_result_t test_verify_clean(void) {
     stress_ctx_t c;
-    TEST_ASSERT(stress_init(&c, STRESS_DB, 43), "init");
+    TEST_ASSERT(stress_init(&c, stress_db_path("matrix"), 43), "init");
     test_result_t r = test_verify_clean_impl(&c);
     stress_destroy(&c);
     return r;
@@ -102,7 +103,7 @@ static test_result_t test_verify_detects_divergence_impl(stress_ctx_t* c) {
 
 static test_result_t test_verify_detects_divergence(void) {
     stress_ctx_t c;
-    TEST_ASSERT(stress_init(&c, STRESS_DB, 44), "init");
+    TEST_ASSERT(stress_init(&c, stress_db_path("matrix"), 44), "init");
     test_result_t r = test_verify_detects_divergence_impl(&c);
     stress_destroy(&c);
     return r;
@@ -136,7 +137,7 @@ static test_result_t test_matrix_insert_impl(stress_ctx_t* c) {
 
 static test_result_t test_matrix_insert(void) {
     stress_ctx_t c;
-    TEST_ASSERT(stress_init(&c, STRESS_DB, 100), "init");
+    TEST_ASSERT(stress_init(&c, stress_db_path("matrix"), 100), "init");
     test_result_t r = test_matrix_insert_impl(&c);
     stress_destroy(&c);
     return r;
@@ -160,7 +161,7 @@ static test_result_t test_matrix_upsert_impl(stress_ctx_t* c) {
 
 static test_result_t test_matrix_upsert(void) {
     stress_ctx_t c;
-    TEST_ASSERT(stress_init(&c, STRESS_DB, 101), "init");
+    TEST_ASSERT(stress_init(&c, stress_db_path("matrix"), 101), "init");
     test_result_t r = test_matrix_upsert_impl(&c);
     stress_destroy(&c);
     return r;
@@ -189,7 +190,7 @@ static test_result_t test_matrix_trim_impl(stress_ctx_t* c) {
 
 static test_result_t test_matrix_trim(void) {
     stress_ctx_t c;
-    TEST_ASSERT(stress_init(&c, STRESS_DB, 102), "init");
+    TEST_ASSERT(stress_init(&c, stress_db_path("matrix"), 102), "init");
     test_result_t r = test_matrix_trim_impl(&c);
     stress_destroy(&c);
     return r;
@@ -215,7 +216,7 @@ static test_result_t test_matrix_parted_ops_impl(stress_ctx_t* c) {
 
 static test_result_t test_matrix_parted_ops(void) {
     stress_ctx_t c;
-    TEST_ASSERT(stress_init(&c, STRESS_DB, 103), "init");
+    TEST_ASSERT(stress_init(&c, stress_db_path("matrix"), 103), "init");
     test_result_t r = test_matrix_parted_ops_impl(&c);
     stress_destroy(&c);
     return r;
@@ -262,7 +263,7 @@ static test_result_t test_matrix_restart_after_each_op_impl(stress_ctx_t* c) {
 
 static test_result_t test_matrix_restart_after_each_op(void) {
     stress_ctx_t c;
-    TEST_ASSERT(stress_init(&c, STRESS_DB, 104), "init");
+    TEST_ASSERT(stress_init(&c, stress_db_path("matrix"), 104), "init");
     test_result_t r = test_matrix_restart_after_each_op_impl(&c);
     stress_destroy(&c);
     return r;
@@ -335,7 +336,7 @@ static test_result_t test_matrix_shared_domain_layout_impl(stress_ctx_t* c) {
 
 static test_result_t test_matrix_shared_domain_layout(void) {
     stress_ctx_t c;
-    TEST_ASSERT(stress_init(&c, STRESS_DB, 106), "init");
+    TEST_ASSERT(stress_init(&c, stress_db_path("matrix"), 106), "init");
     test_result_t r = test_matrix_shared_domain_layout_impl(&c);
     stress_destroy(&c);
     return r;
@@ -447,7 +448,7 @@ static test_result_t test_matrix_vocab_width_impl(stress_ctx_t* c) {
 
 static test_result_t test_matrix_vocab_width(void) {
     stress_ctx_t c;
-    TEST_ASSERT(stress_init(&c, STRESS_DB, 107), "init");
+    TEST_ASSERT(stress_init(&c, stress_db_path("matrix"), 107), "init");
     test_result_t r = test_matrix_vocab_width_impl(&c);
     stress_destroy(&c);
     return r;
