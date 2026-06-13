@@ -172,6 +172,17 @@ t -- (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0]))
 (insert (table [a] (list (as 'Timestamp (list)))) (list 'bad)) !- type
 (insert (table [a] (list (as 'Date (list)))) (list 1)) !- type
 
+;; Typeless empty () column: adopts the type of the first inserted value
+;; (q-style () column) instead of defaulting to I64 and rejecting non-ints.
+(insert (table [a] (list (list))) (list 3.14)) -- (table [a] (list [3.14]))
+(insert (table [a] (list (list))) (list 'x)) -- (table [a] (list ['x]))
+(insert (table [a] (list (list))) (list "s")) -- (table [a] (list (list "s")))
+(insert (table [a] (list (list))) (list 2020.01.01)) -- (table [a] (list [2020.01.01]))
+(insert (table [a] (list (list))) (list 12:30:00.0)) -- (table [a] (list [12:30:00.000]))
+;; Type is adopted once, then enforced on subsequent inserts.
+(set tl (table [a] (list (list))))(insert 'tl (list 3.14))(insert 'tl (list 2.71))tl -- (table [a] (list [3.14 2.71]))
+(set ts (table [a] (list (list))))(insert 'ts (list 'a))(insert 'ts (list 'b))ts -- (table [a] (list ['a 'b]))
+
 ;; ══════════════════════════════════════════════════════════════════
 ;; UPDATE scalar-broadcast into typed columns — regression for the
 ;; broadcast sites that copied the scalar through an 8-byte `elem`
