@@ -2,20 +2,23 @@
  * Build: make bench-join-buildside
  *
  * Measures the speedup from building the hash table on the smaller (left)
- * side when left < right in a radix inner join.  Three cases, each run
+ * side when left < right in a radix inner join.  Four cases, each run
  * with swap enabled (knob off) and swap forced-off (legacy, knob on),
- * 9 reps interleaved per case, median exec wall time reported.
+ * NREPS reps interleaved per case, median+min exec wall time reported.
  *
  * Cases:
- *   WIN       right=10M key i%1000000, left=10K key i%1000000.
- *             swap builds 10K hash + probes 10M; legacy builds 10M hash.
- *   CONTROL   right=10M, left=10M (key i%1000000).
- *             swap must NOT fire (equal sizes); knob-on/off medians within noise.
+ *   WIN          right=10M key i%1000000 (10 dup/key), left=10K key i%1000000.
+ *                swap builds 10K hash + probes 10M; legacy builds 10M hash.
+ *   HEAVY-DUP-WIN right=10M key i%1000 (10000 dup/key), left=10K key i%1000.
+ *                swap builds 10K hash + probes 10M; legacy builds 10M hash.
+ *                Probes deeper chains in the big hash. Tests duplication scaling.
+ *   CONTROL      right=10M, left=10M (key i%1000000).
+ *                swap must NOT fire (equal sizes); knob-on/off medians within noise.
  *   MANY-TO-MANY right=10M key i%100000 (~100/key), left=100K key i%100000
- *             (~1/key) → output ~10M rows.  Swap fires; must not pessimize.
+ *                (~1/key) → output ~10M rows.  Swap fires; must not pessimize.
  *
- * Mechanism: assert ray_join_build_swaps advanced on WIN and MANY-TO-MANY;
- * assert it did NOT advance on CONTROL.
+ * Mechanism: assert ray_join_build_swaps advanced on WIN, HEAVY-DUP-WIN, and
+ * MANY-TO-MANY; assert it did NOT advance on CONTROL.
  *
  * Timing: CLOCK_MONOTONIC around ray_execute only.  Tables built once outside
  * the timed loop; graph rebuilt per rep.
@@ -44,16 +47,21 @@ static double now_ms(void) {
     return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec * 1e-6;
 }
 
-/* ---------- median (qsort on small N) ---------- */
+/* ---------- median/min (qsort on small N, max 64 elements) ---------- */
 static int cmp_double(const void* a, const void* b) {
     double x = *(const double*)a, y = *(const double*)b;
     return (x > y) - (x < y);
 }
-static double median9(double arr[9]) {
-    double tmp[9];
-    memcpy(tmp, arr, 9 * sizeof(double));
-    qsort(tmp, 9, sizeof(double), cmp_double);
-    return tmp[4];   /* n=9 → element at index 4 */
+static double medianN(double arr[], int n) {
+    double tmp[64];
+    memcpy(tmp, arr, (size_t)n * sizeof(double));
+    qsort(tmp, (size_t)n, sizeof(double), cmp_double);
+    return tmp[n / 2];
+}
+static double minN(double arr[], int n) {
+    double m = arr[0];
+    for (int i = 1; i < n; i++) if (arr[i] < m) m = arr[i];
+    return m;
 }
 
 /* ---------- build a single-column I64 table ---------- */
@@ -114,7 +122,7 @@ static double run_join_rep(ray_t* lt, ray_t* rt, int64_t* rows_out) {
     return t1 - t0;
 }
 
-#define NREPS 9
+#define NREPS 15
 
 /* ---------- per-case runner ---------- */
 typedef struct {
@@ -272,36 +280,64 @@ int main(void) {
     fflush(stdout);
 
     /* ---------------------------------------------------------------
-     * Run all three cases
+     * HEAVY-DUP-WIN case: right=10M key i%1000 (10000 dup/key),
+     *                     left=10K key i%1000 (10 dup/key)
+     *   Swap builds 10K hash + probes 10M; legacy builds 10M hash.
+     *   Heavy chains in the big hash when using legacy path.
+     *   Tests whether the swap win scales with large-side key duplication.
      * --------------------------------------------------------------- */
-    case_result_t cr_win, cr_ctl, cr_m2m;
-
-    run_case("WIN",          win_lt, win_rt, /*expect_swap=*/true,  &cr_win);
-    run_case("CONTROL",      ctl_lt, ctl_rt, /*expect_swap=*/false, &cr_ctl);
-    run_case("MANY-TO-MANY", m2m_lt, m2m_rt, /*expect_swap=*/true,  &cr_m2m);
+    printf("Building HEAVY-DUP-WIN tables (right=10M, left=10K)...\n"); fflush(stdout);
+    int64_t hdw_nr = 10000000L;
+    int64_t hdw_nl =    10000L;
+    int64_t* hdw_rv = (int64_t*)malloc((size_t)hdw_nr * sizeof(int64_t));
+    int64_t* hdw_lv = (int64_t*)malloc((size_t)hdw_nl * sizeof(int64_t));
+    if (!hdw_rv || !hdw_lv) { fprintf(stderr, "OOM HEAVY-DUP-WIN tables\n"); abort(); }
+    for (int64_t i = 0; i < hdw_nr; i++) hdw_rv[i] = i % 1000L;    /* 10000 dup/key */
+    for (int64_t i = 0; i < hdw_nl; i++) hdw_lv[i] = i % 1000L;    /* 10 dup/key */
+    ray_t* hdw_rt = make_table1("rk", hdw_rv, hdw_nr);
+    ray_t* hdw_lt = make_table1("lk", hdw_lv, hdw_nl);
+    free(hdw_rv); free(hdw_lv);
+    printf("  right=%lld rows (10000 dup/key), left=%lld rows (10 dup/key)\n\n",
+           (long long)ray_table_nrows(hdw_rt),
+           (long long)ray_table_nrows(hdw_lt));
+    fflush(stdout);
 
     /* ---------------------------------------------------------------
-     * Results table
+     * Run all four cases
+     * --------------------------------------------------------------- */
+    case_result_t cr_win, cr_hdw, cr_ctl, cr_m2m;
+
+    run_case("WIN",           win_lt, win_rt, /*expect_swap=*/true,  &cr_win);
+    run_case("HEAVY-DUP-WIN", hdw_lt, hdw_rt, /*expect_swap=*/true,  &cr_hdw);
+    run_case("CONTROL",       ctl_lt, ctl_rt, /*expect_swap=*/false, &cr_ctl);
+    run_case("MANY-TO-MANY",  m2m_lt, m2m_rt, /*expect_swap=*/true,  &cr_m2m);
+
+    /* ---------------------------------------------------------------
+     * Results table (median + min)
      * --------------------------------------------------------------- */
     printf("\n");
-    printf("%-16s  %-8s  %14s  %14s  %12s  %12s\n",
-           "case", "side", "median_ms", "delta_ms", "rows_out", "swap_fired");
-    printf("%-16s  %-8s  %14s  %14s  %12s  %12s\n",
+    printf("%-16s  %-8s  %14s  %10s  %14s  %10s  %12s  %12s\n",
+           "case", "side", "median_ms", "min_ms", "delta_med_ms", "delta_min_ms", "rows_out", "swap_fired");
+    printf("%-16s  %-8s  %14s  %10s  %14s  %10s  %12s  %12s\n",
            "----------------", "--------",
-           "--------------", "------------",
+           "--------------", "--------",
+           "------------", "----------",
            "------------", "----------");
 
-    case_result_t* cases[3] = { &cr_win, &cr_ctl, &cr_m2m };
-    const char* expect_swap[3] = { "YES", "NO", "YES" };
-    for (int ci = 0; ci < 3; ci++) {
+    case_result_t* cases[4] = { &cr_win, &cr_hdw, &cr_ctl, &cr_m2m };
+    const char* expect_swap[4] = { "YES", "YES", "NO", "YES" };
+    for (int ci = 0; ci < 4; ci++) {
         case_result_t* cr = cases[ci];
-        double med_swap   = median9(cr->swap_ms);
-        double med_legacy = median9(cr->legacy_ms);
-        double delta      = med_swap - med_legacy;   /* negative = swap is faster */
-        printf("%-16s  %-8s  %14.3f  %14s  %12lld  %12s\n",
-               cr->name, "swap",   med_swap,   "", (long long)cr->rows_out_swap, expect_swap[ci]);
-        printf("%-16s  %-8s  %14.3f  %14.3f  %12lld  %12s\n",
-               "",        "legacy", med_legacy, delta, (long long)cr->rows_out_legacy, "");
+        double med_swap   = medianN(cr->swap_ms, NREPS);
+        double med_legacy = medianN(cr->legacy_ms, NREPS);
+        double min_swap   = minN(cr->swap_ms, NREPS);
+        double min_legacy = minN(cr->legacy_ms, NREPS);
+        double delta_med  = med_swap - med_legacy;   /* negative = swap is faster */
+        double delta_min  = min_swap - min_legacy;
+        printf("%-16s  %-8s  %14.3f  %10.3f  %14s  %10s  %12lld  %12s\n",
+               cr->name, "swap", med_swap, min_swap, "", "", (long long)cr->rows_out_swap, expect_swap[ci]);
+        printf("%-16s  %-8s  %14.3f  %10.3f  %14.3f  %10.3f  %12lld  %12s\n",
+               "", "legacy", med_legacy, min_legacy, delta_med, delta_min, (long long)cr->rows_out_legacy, "");
     }
 
     /* ---------------------------------------------------------------
@@ -320,12 +356,12 @@ int main(void) {
      * --------------------------------------------------------------- */
     printf("\n--- raw per-rep ms ---\n");
     printf("%-16s  %-8s", "case", "side");
-    for (int r = 0; r < NREPS; r++) printf("   rep%d", r + 1);
+    for (int r = 0; r < NREPS; r++) printf("   rep%02d", r + 1);
     printf("\n");
 
-    case_result_t* all3[3] = { &cr_win, &cr_ctl, &cr_m2m };
-    for (int ci = 0; ci < 3; ci++) {
-        case_result_t* cr = all3[ci];
+    case_result_t* all4[4] = { &cr_win, &cr_hdw, &cr_ctl, &cr_m2m };
+    for (int ci = 0; ci < 4; ci++) {
+        case_result_t* cr = all4[ci];
         printf("%-16s  %-8s", cr->name, "swap");
         for (int r = 0; r < NREPS; r++) printf("  %7.3f", cr->swap_ms[r]);
         printf("\n");
@@ -339,6 +375,7 @@ int main(void) {
 
     /* cleanup */
     ray_release(win_lt); ray_release(win_rt);
+    ray_release(hdw_lt); ray_release(hdw_rt);
     ray_release(ctl_lt); ray_release(ctl_rt);
     ray_release(m2m_lt); ray_release(m2m_rt);
     ray_sym_destroy();

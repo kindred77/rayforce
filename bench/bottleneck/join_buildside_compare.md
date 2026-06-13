@@ -193,3 +193,60 @@ MANY-TO-MANY      swap      245.060  147.458  175.081  158.200  160.899  165.038
 - **WIN case is inconclusive**: delta reverses sign across runs (−3.5 ms in run 1, +7–9 ms in runs 2–3). System load too high for a reliable sub-10% measurement.  
 - **CONTROL mechanism is correct**: swap counter never advanced; no abort; both sides similar within load noise.  
 - **Verdict input**: the optimization delivers a clear 2× benefit on the many-to-many case. The WIN case (10K build vs 10M build) requires a quieter box or more reps to confirm the expected gain; under the current load it is not distinguishable from noise.
+
+---
+
+## ROUND 2 — Quiet-box re-measure + duplication-scaling probe
+
+**System load at measurement**: 1-min 1.70 / 5-min 1.87 / 15-min 2.36 (significantly quieter than Round 1: 4.8–5.9).  
+**NREPS**: 15 (up from 9). Swap-counter assertions passed on all four cases.
+
+### Case definitions (round 2)
+
+| case | right | left | right key | left key | dup/key (right) | swap expected |
+|------|-------|------|-----------|----------|-----------------|---------------|
+| WIN | 10,000,000 | 10,000 | `i % 1000000` | `i % 1000000` | 10 | YES |
+| HEAVY-DUP-WIN | 10,000,000 | 10,000 | `i % 1000` | `i % 1000` | 10,000 | YES |
+| CONTROL | 10,000,000 | 10,000,000 | `i % 1000000` | `i % 1000000` | 10 | NO |
+| MANY-TO-MANY | 10,000,000 | 100,000 | `i % 100000` | `i % 100000` | 100 | YES |
+
+### Medians and minimums table
+
+| case | side | median_ms | min_ms | delta_med_ms | delta_min_ms | rows_out |
+|------|------|-----------|--------|--------------|--------------|----------|
+| WIN | swap | 78.439 | 70.047 | | | 100,000 |
+| WIN | legacy | 68.470 | 67.292 | +9.969 | +2.755 | 100,000 |
+| HEAVY-DUP-WIN | swap | 1,218.672 | 1,088.182 | | | 100,000,000 |
+| HEAVY-DUP-WIN | legacy | 9,835.726 | 9,750.034 | **-8,617.055** | **-8,661.851** | 100,000,000 |
+| CONTROL | swap | 1,948.671 | 1,841.534 | | | 100,000,000 |
+| CONTROL | legacy | 1,932.271 | 1,867.267 | +16.400 | -25.733 | 100,000,000 |
+| MANY-TO-MANY | swap | 163.139 | 150.634 | | | 10,000,000 |
+| MANY-TO-MANY | legacy | 327.220 | 310.879 | **-164.081** | **-160.245** | 10,000,000 |
+
+*(delta = swap_ms − legacy_ms; negative = swap wins)*
+
+### WIN case (round 2)
+
+At load 1.70 (vs 4.8–5.9 in round 1), legacy is still faster: swap median 78.4 ms, legacy median 68.5 ms, delta_med = +10.0 ms (legacy wins ~15%). Minimum also goes to legacy: swap min 70.0 ms, legacy min 67.3 ms, delta_min = +2.8 ms. This is a stable result under quiet conditions: with 10 dup/key on the right (10M) side, building the large-side hash is faster despite its size, because the probe loop against the 10K-hash accesses each of 10M right-side rows sequentially while the 10K-hash has high collision density (10K rows distributed across ~10K buckets = chains of average length 1).
+
+### HEAVY-DUP-WIN case (round 2)
+
+With 10,000 dup/key on the right side: swap median 1,218.7 ms, legacy median 9,835.7 ms, delta_med = **-8,617 ms** (swap wins ~8.1×). Minimum: swap 1,088.2 ms, legacy 9,750.0 ms, delta_min = **-8,662 ms**. Output is 100M rows (1,000 keys × 10,000 right/key × 10 left/key). The output fan-out is very large; the 8× gap reflects both hash-build cost (10K vs 10M) and probe-chain traversal: legacy must follow 10,000-row chains in the 10M-bucket hash per output row.
+
+### Duplication-scaling observation
+
+The swap win scales strongly with large-side key duplication: at 10 dup/key (WIN) swap loses (legacy faster by ~10 ms); at 100 dup/key (MANY-TO-MANY) swap wins by ~164 ms (~2×); at 10,000 dup/key (HEAVY-DUP-WIN) swap wins by ~8,617 ms (~8×).
+
+### Raw per-rep numbers (round 2)
+
+```
+case              side       rep01   rep02   rep03   rep04   rep05   rep06   rep07   rep08   rep09   rep10   rep11   rep12   rep13   rep14   rep15
+WIN               swap       88.049   82.236   79.295   81.535   80.839   70.047   78.439   82.525   73.389   72.177   73.635   79.715   72.920   76.083   74.270
+                  legacy     81.540   71.117   69.885   71.010   67.753   68.299   70.257   68.180   69.817   68.470   68.381   68.195   68.258   74.429   67.292
+HEAVY-DUP-WIN     swap     1853.694  1218.672  1388.087  1398.513  1088.947  1215.236  1088.182  1116.155  1225.546  1127.843  1111.761  1303.884  1186.649  1632.247  1229.656
+                  legacy   9858.120  10233.416  10847.602  9750.034  9865.900  9831.022  9778.619  10957.208  9795.598  9820.259  9789.746  9814.713  10699.711  10324.484  9835.726
+CONTROL           swap     1865.826  1841.534  1948.671  1854.722  1942.966  1951.175  1903.590  1962.794  2291.110  2220.735  2177.393  2180.941  1900.926  1982.935  1899.523
+                  legacy   1867.267  1895.258  1907.535  1937.255  1927.432  1932.271  1936.678  2057.345  2207.303  2183.425  2183.529  2205.904  1891.102  1893.791  1920.141
+MANY-TO-MANY      swap      168.174  150.634  165.381  163.139  190.703  165.451  152.290  164.149  153.455  159.366  222.164  167.555  158.498  156.277  152.885
+                  legacy    369.834  310.879  319.009  314.401  314.928  348.581  318.818  311.451  331.450  328.876  361.020  316.547  327.220  328.117  344.521
+```
