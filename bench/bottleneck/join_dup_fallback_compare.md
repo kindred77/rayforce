@@ -331,3 +331,30 @@ but has low per-key dup no longer trips.
 
 Suite: `make test` → 3451/3453 pass (2 skipped, 0 failed); `join_buildside`
 18/18, `join` 57/57 — all dup trip/no-trip fixtures unchanged. asan: 0.
+
+## CONTROLLER VERDICT: WIN — merge
+
+After two trigger iterations (the load-factor hypothesis was disproven; the
+same-hash per-key counter is the correct signal), the win-or-revert bar is met
+across the full duplication spectrum:
+
+- **Catastrophic (one giant build key): ~16× faster** — INNER-no-swap and
+  **LEFT** both drop ~2200ms → ~135ms. LEFT is the headline new coverage:
+  piece 1's INNER-only build-side swap cannot help it; this fix does.
+- **Moderate (~100 rows/key): neutral, no trip** — the premature-fallback
+  regression that the load-factor approach couldn't fix is GONE. The same-hash
+  counter measures true per-key duplication, immune to the dense-cluster
+  collision-merge that inflated the total-run-length signal.
+- **Near-unique control + ~10/key: neutral, no trip** — the per-insert
+  branchless `same += (hash==h)` and single post-loop check cost nothing
+  (the loop-cloning codegen trap from reading the knob in the hot loop was
+  found and avoided).
+- Full suite green under ASan+UBSan (3451/3453, 2 pre-existing skips); the
+  abort/fallback paths exercised; differential multiset equality (auto-fallback
+  vs forced-chained) holds for INNER/LEFT/FULL.
+
+The trigger is correctness-safe by construction: falling back is always
+correct (the chained path is the trusted reference), so even an over-eager
+trip on a rare hash collision only costs a path choice, never a wrong result.
+RADIX_DUP_RUN_MAX=512 cleanly separates moderate from catastrophic; ANTI joins
+use a separate exec path (own chained build) and are unaffected.
