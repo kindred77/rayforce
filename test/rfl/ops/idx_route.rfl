@@ -1,0 +1,150 @@
+;; End-to-end index routing: language-level attach + query, with drop-differential
+;; and staleness case.  Each query group is immediately repeated with .idx.drop to
+;; pin that the correct values come from the scan fallback as well.
+;;
+;; Honesty note (mirrors ops/group_pushdown.rfl conventions):
+;;   The query layer has several fast paths that intercept (count (select ...))
+;;   BEFORE the exec.c index-routing layer:
+;;     • try_count_simple_compare — handles (count (select {where: (op col K)}))
+;;       as a branchless SIMD count over the raw column; never consults the index.
+;;     • ray_try_count_select_expr — handles (count (select {from: T where: pred}))
+;;       by evaluating pred as a BOOL vec via exec_node(pred) directly, not via
+;;       OP_FILTER on the TABLE; never consults the index.
+;;   To actually reach the exec.c OP_FILTER path (lines 1336-1434) — where all
+;;   five index sites (filter-zone, filter-bloom, filter-hash, filter-range, in)
+;;   live — the outer expression must materialize the full TABLE result, e.g.:
+;;     (sum (at (select ...) 'col))   ← forces the select TABLE → exec.c fires
+;;   All assertions below use this pattern for the indexed arm, so the mechanism
+;;   note below each case is accurate to what RAY_IDX_STATS=1 reports.
+;;
+;; IMPORTANT: only the SELECT-WHERE mechanism is affected by this intercept.
+;; ORDER BY (sort index), distinct (sort index), and find (hash index) are
+;; invoked directly on the column vector and always reach the exec/collection-
+;; level routing regardless of how the result is consumed.
+
+;; ─────────────────────────── fixture ────────────────────────────────────────
+;; 10-row table:
+;;   h = [10 20 30 10 50 10 70 10 90 100]  (4× 10 → EQ match count = 4)
+;;   s = [10  9  8  7  6  5  4  3  2   1]  (descending → s<5 = 4 rows)
+;;   k = [ 1  2  3  4  5  6  7  8  9  10]  (k in [2 4 6 8] = 4 rows)
+;;   v = [ 1  2  3  4  5  6  7  8  9  10]  (identity weight for sum checks)
+
+(set h_raw [10 20 30 10 50 10 70 10 90 100])
+(set s_raw [10  9  8  7  6  5  4  3  2  1])
+(set k_raw [1   2  3  4  5  6  7  8  9  10])
+(set v_raw [1   2  3  4  5  6  7  8  9  10])
+
+;; Attach indices
+(set h_idx (.idx.hash h_raw))
+(set s_idx (.idx.sort s_raw))
+(set k_idx (.idx.hash k_raw))
+
+;; Table carries indexed columns
+(set T (table [h s k v] (list h_idx s_idx k_idx v_raw)))
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 1.  SELECT-WHERE EQ on a hash-indexed column
+;; ════════════════════════════════════════════════════════════════════════════
+;; routes through exec fast path: YES — filter-hash fires (consults=1 hits=1)
+;; when the outer expression materializes the TABLE result (sum/first/last)
+;; rather than using the count(select) short-circuit.
+;;
+;; rows where h==10: indices 0,3,5,7 → v = 1,4,6,8 → sum = 19
+(sum (at (select {from: T where: (== h 10)}) 'v)) -- 19
+
+;; drop-differential: same query after .idx.drop → correct values via scan
+(set T_nd_h (table [h s k v] (list (.idx.drop h_idx) s_idx k_idx v_raw)))
+(sum (at (select {from: T_nd_h where: (== h 10)}) 'v)) -- 19
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 2.  SELECT-WHERE range (<) on a sort-indexed column
+;; ════════════════════════════════════════════════════════════════════════════
+;; routes through exec fast path: YES — filter-range fires (consults=1 hits=1).
+;; n=10 is below the selectivity guard's n>=64 threshold, so no span eviction.
+;;
+;; rows where s<5: s=4(row6), s=3(row7), s=2(row8), s=1(row9)
+;; v at those rows: 7, 8, 9, 10 → sum = 34
+(sum (at (select {from: T where: (< s 5)}) 'v)) -- 34
+
+;; drop-differential
+(set T_nd_s (table [h s k v] (list h_idx (.idx.drop s_idx) k_idx v_raw)))
+(sum (at (select {from: T_nd_s where: (< s 5)}) 'v)) -- 34
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 3.  SELECT-WHERE IN on a hash-indexed column
+;; ════════════════════════════════════════════════════════════════════════════
+;; routes through exec fast path: YES — in site fires (consults=1 hits=1).
+;; idx_filter_in_decode matches OP_IN(SCAN(k), CONST([2 4 6 8])).
+;;
+;; rows where k in [2,4,6,8]: indices 1,3,5,7 → v = 2,4,6,8 → sum = 20
+(sum (at (select {from: T where: (in k [2 4 6 8])}) 'v)) -- 20
+
+;; drop-differential
+(set T_nd_k (table [h s k v] (list h_idx s_idx (.idx.drop k_idx) v_raw)))
+(sum (at (select {from: T_nd_k where: (in k [2 4 6 8])}) 'v)) -- 20
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 4.  ORDER BY (single ascending key) on a sort-indexed column
+;; ════════════════════════════════════════════════════════════════════════════
+;; routes through exec fast path: YES — sort site fires (consults=1 hits=1)
+;; in exec_sort (sort.c:3436) when n_sort==1, ASC, no pre-existing selection,
+;; and the key is a direct OP_SCAN of a null-free column with a fresh sort index.
+;;
+;; s is [10 9 8 7 6 5 4 3 2 1]; ASC → first=1, last=10
+(first (at (select {from: T asc: s}) 's)) -- 1
+(last  (at (select {from: T asc: s}) 's)) -- 10
+
+;; drop-differential: sort still produces same order (recomputes perm)
+(first (at (select {from: T_nd_s asc: s}) 's)) -- 1
+(last  (at (select {from: T_nd_s asc: s}) 's)) -- 10
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 5.  DISTINCT on a sort-indexed column
+;; ════════════════════════════════════════════════════════════════════════════
+;; routes through exec fast path: YES — distinct site fires (consults=1 hits=1)
+;; in distinct_vec_eager (collection.c:779) when the vector has a sort index
+;; and no HAS_NULLS.  s_raw = [10 9 8 7 6 5 4 3 2 1] — all 10 values unique.
+(count (distinct s_idx)) -- 10
+(distinct s_idx) -- [1 2 3 4 5 6 7 8 9 10]
+
+;; drop-differential: same results via hashset path
+(count (distinct (.idx.drop s_idx))) -- 10
+(distinct (.idx.drop s_idx)) -- [1 2 3 4 5 6 7 8 9 10]
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 6.  FIND on a hash-indexed column
+;; ════════════════════════════════════════════════════════════════════════════
+;; routes through exec fast path: YES — find site fires (consults=2 hits=2)
+;; in ray_find_fn (collection.c:1887) when the vector has no HAS_NULLS and an
+;; index, and the needle is an integer-family atom.
+;;
+;; k_raw = [1 2 3 4 5 6 7 8 9 10]; 7 is at index 6; 99 is absent → 0Nl
+(find k_idx 7)  -- 6
+(find k_idx 99) -- 0Nl
+
+;; drop-differential: correct values via linear scan
+(find (.idx.drop k_idx) 7)  -- 6
+(find (.idx.drop k_idx) 99) -- 0Nl
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 7.  STALENESS — attach, then mutate (alter drops the index), then query
+;; ════════════════════════════════════════════════════════════════════════════
+;; routes through exec fast path: NO after the mutation.
+;; `alter set` calls ray_index_drop() before writing the new value, so after
+;; the alter the column has HAS_INDEX cleared.  Subsequent queries fall through
+;; to the scan path and still return correct values.
+;;
+;; Before: st_vec = [10 20 30 10 50], hash index attached.
+;; After alter: st_idx = [999 20 30 10 50], index dropped.
+;; Table has one row where v==10 and sum(v) = 999+20+30+10+50 = 1109.
+
+(set st_vec [10 20 30 10 50])
+(set st_idx (.idx.hash st_vec))
+(.idx.has? st_idx) -- true
+
+(alter 'st_idx set 0 999)
+(.idx.has? st_idx) -- false
+
+(set T_st (table [v] (list st_idx)))
+(sum (at (select {from: T_st where: (== v 10)}) 'v)) -- 10
+(sum (at T_st 'v)) -- 1109
