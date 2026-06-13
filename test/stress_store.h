@@ -56,6 +56,15 @@ typedef struct {
     bool          failed;          /* set on verify failure; keeps db dir */
 } stress_ctx_t;
 
+/* Per-process scratch db path: "/tmp/rayforce_stress_<name>.<pid>".
+ * Each stress test rm -rf's its db_root in stress_init, so two test
+ * binaries sharing a fixed path race destructively (one deletes the
+ * other's dir mid-save → spurious CORRUPT/IO failures).  The pid suffix
+ * keeps concurrent runs isolated.  Returns a pointer to a static buffer
+ * reused on every call; stress_init copies the string immediately, so
+ * back-to-back calls (e.g. two fixtures in one test) are safe. */
+const char* stress_db_path(const char* name);
+
 /* lifecycle */
 bool stress_init(stress_ctx_t* c, const char* db_root, uint64_t seed);
 void stress_destroy(stress_ctx_t* c);  /* rm -rf db_root unless c->failed */

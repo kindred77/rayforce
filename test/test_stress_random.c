@@ -26,7 +26,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#define STRESS_RND_DB     "/tmp/rayforce_stress_random"
 #define DEFAULT_ITERS     500
 #define FULL_VERIFY_EVERY 25
 
@@ -128,7 +127,7 @@ static test_result_t run_seed(uint64_t seed) {
     int64_t iters = env_i64("RAY_STRESS_ITERS", DEFAULT_ITERS);
     bool    ev    = eval_mode(); /* read once; fixed for the whole run */
     stress_ctx_t c;
-    if (!stress_init(&c, STRESS_RND_DB, seed)) FAILF("init failed");
+    if (!stress_init(&c, stress_db_path("random"), seed)) FAILF("init failed");
     if (!(ev ? stress_eval_seed_initial(&c, 64, 3, 32)
              : stress_seed_initial(&c, 64, 3, 32))) {
         stress_destroy(&c);

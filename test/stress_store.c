@@ -13,6 +13,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>  /* getpid — per-process scratch paths */
+
+const char* stress_db_path(const char* name) {
+    static char buf[256];
+    snprintf(buf, sizeof(buf), "/tmp/rayforce_stress_%s.%d", name, (int)getpid());
+    return buf;
+}
 
 /* ---- prng (xorshift64*) ------------------------------------------------ */
 
