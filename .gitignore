@@ -43,6 +43,7 @@ bench-alloc
 bench-group-pushdown
 bench-idx-route
 bench-join-buildside
+bench-join-dup
 
 # Rayforce REPL history
 .rayhist.dat
