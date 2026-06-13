@@ -284,9 +284,41 @@ static test_result_t test_jb_baseline_radix_inner(void) {
     return rr;
 }
 
+/* ── Differential swap test ────────────────────────────────────────────────
+ * Left side (2000 rows) is much smaller than the right side (>threshold), so
+ * the build-side decision must fire and build the hash on the small left side.
+ * The swapped result must be a multiset-identical match to the forced-legacy
+ * (build-on-right) result, AND the swap counter must increment.
+ * ──────────────────────────────────────────────────────────────────────── */
+static test_result_t test_jb_swap_inner_matches(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t n_r = RAY_PARALLEL_THRESHOLD + 5000, n_l = 2000;
+    int64_t* rv = malloc(n_r*sizeof(int64_t)); int64_t* lv = malloc(n_l*sizeof(int64_t));
+    for (int64_t i=0;i<n_r;i++) rv[i]=i%1000;
+    for (int64_t i=0;i<n_l;i++) lv[i]=i%1000;
+    ray_t* rt = jb_table1("rk", rv, n_r);
+    ray_t* lt = jb_table1("lk", lv, n_l);
+    uint64_t before = ray_join_build_swaps;
+    ray_join_no_build_swap = false;          /* allow swap */
+    ray_t* swapped = jb_inner_join(lt,"lk",rt,"rk");
+    bool fired = ray_join_build_swaps > before;
+    ray_join_no_build_swap = true;           /* force no swap */
+    ray_t* plain = jb_inner_join(lt,"lk",rt,"rk");
+    ray_join_no_build_swap = false;
+    test_result_t rr = jb_results_equal(swapped, plain);
+    if (rr.status == TEST_PASS && !fired)
+        rr = (test_result_t){ TEST_FAIL, "expected build-side swap to fire" };
+    ray_release(swapped); ray_release(plain); ray_release(lt); ray_release(rt);
+    free(lv); free(rv); ray_sym_destroy(); ray_heap_destroy();
+    return rr;
+}
+
 /* ── Entry table ─────────────────────────────────────────────────────────── */
 
 const test_entry_t join_buildside_entries[] = {
     { "join_buildside/baseline_radix_inner", test_jb_baseline_radix_inner, NULL, NULL },
+    { "join_buildside/swap_inner_matches", test_jb_swap_inner_matches, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
