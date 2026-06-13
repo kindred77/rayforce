@@ -34,6 +34,7 @@
 #include "ops/ops.h"
 #include "ops/internal.h"
 #include "table/sym.h"
+#include <assert.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -311,6 +312,24 @@ int main(void) {
     run_case("HEAVY-DUP-WIN", hdw_lt, hdw_rt, /*expect_swap=*/true,  &cr_hdw);
     run_case("CONTROL",       ctl_lt, ctl_rt, /*expect_swap=*/false, &cr_ctl);
     run_case("MANY-TO-MANY",  m2m_lt, m2m_rt, /*expect_swap=*/true,  &cr_m2m);
+
+    /* Sanity: swap must not change output cardinality. */
+#define CHECK_ROWS(cr) do { \
+    if ((cr).rows_out_swap != (cr).rows_out_legacy) { \
+        fprintf(stderr, \
+            "CARDINALITY MISMATCH case %s: swap=%lld legacy=%lld\n", \
+            (cr).name, \
+            (long long)(cr).rows_out_swap, \
+            (long long)(cr).rows_out_legacy); \
+        abort(); \
+    } \
+    assert((cr).rows_out_swap == (cr).rows_out_legacy); \
+} while (0)
+    CHECK_ROWS(cr_win);
+    CHECK_ROWS(cr_hdw);
+    CHECK_ROWS(cr_ctl);
+    CHECK_ROWS(cr_m2m);
+#undef CHECK_ROWS
 
     /* ---------------------------------------------------------------
      * Results table (median + min)
