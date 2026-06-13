@@ -173,7 +173,7 @@ t -- (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0]))
 (insert (table [a] (list (as 'Date (list)))) (list 1)) !- type
 
 ;; Typeless empty () column: adopts the type of the first inserted value
-;; (q-style () column) instead of defaulting to I64 and rejecting non-ints.
+;; instead of defaulting to I64 and rejecting non-ints.
 (insert (table [a] (list (list))) (list 3.14)) -- (table [a] (list [3.14]))
 (insert (table [a] (list (list))) (list 'x)) -- (table [a] (list ['x]))
 (insert (table [a] (list (list))) (list "s")) -- (table [a] (list (list "s")))

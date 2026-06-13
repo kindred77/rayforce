@@ -93,8 +93,8 @@ Functions that take other functions as arguments.
 | `scan-left` | variadic | Left-to-right running fold | `(scan-left + (enlist 1 2 3))` → `[1 3 6]` |
 | `scan-right` | variadic | Right-to-left running fold | `(scan-right + (enlist 1 2 3))` → `[6 5 3]` |
 | `apply` | variadic | Zip-apply function pairwise over two lists | `(apply + (enlist 1 2) (enlist 3 4))` → `[4 6]` |
-| `map-left` | variadic | Map with left argument fixed | `(map-left + 10 [1 2 3])` → `[11 12 13]` |
-| `map-right` | variadic | Map with right argument fixed | `(map-right - [10 20 30] 5)` → `[5 15 25]` |
+| `map-left` | variadic | Map each element of the left over the whole right | `(map-left + 10 [1 2 3])` → `[11 12 13]` |
+| `map-right` | variadic | Map the whole left over each element of the right | `(map-right - [10 20 30] 5)` → `[5 15 25]` |
 
 ## Collection Operations
 
