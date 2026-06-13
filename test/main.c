@@ -133,6 +133,7 @@ extern const test_entry_t heap_parallel_entries[];
 extern const test_entry_t idx_route_entries[];
 extern const test_entry_t index_entries[];
 extern const test_entry_t ipc_entries[];
+extern const test_entry_t join_buildside_entries[];
 extern const test_entry_t journal_entries[];
 extern const test_entry_t lang_entries[];
 extern const test_entry_t link_entries[];
@@ -184,6 +185,7 @@ static const test_entry_t* const compiled_groups[] = {
     heap_parallel_entries,
     idx_route_entries,
     index_entries,    ipc_entries,
+    join_buildside_entries,
     journal_entries,
     lang_entries,     link_entries,
     lftj_entries,     list_entries,     meta_entries,     morsel_entries,

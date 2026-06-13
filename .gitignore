@@ -42,6 +42,7 @@ site/
 bench-alloc
 bench-group-pushdown
 bench-idx-route
+bench-join-buildside
 
 # Rayforce REPL history
 .rayhist.dat
