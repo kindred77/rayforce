@@ -71,6 +71,15 @@ static bool plan_pushed(ray_graph_t* g, ray_op_t* root) {
            root->inputs[0] && root->inputs[0]->opcode == OP_FILTER;
 }
 
+/* Un-split HAVING shape: root is FILTER whose direct child is GROUP and whose
+ * predicate is still an intact AND (the split would have made inputs[0] a FILTER). */
+static bool plan_having_unsplit(ray_graph_t* g, ray_op_t* root) {
+    (void)g;
+    return root && root->opcode == OP_FILTER &&
+           root->inputs[0] && root->inputs[0]->opcode == OP_GROUP &&
+           root->inputs[1] && root->inputs[1]->opcode == OP_AND;
+}
+
 /* Pred on the AGG OUTPUT column — HAVING proper; must never push.
  * After GROUP BY k, SUM(v), the agg output column is named "v_sum". */
 static ray_op_t* pred_on_agg(ray_graph_t* g) {
@@ -86,6 +95,41 @@ static test_result_t test_having_on_agg_not_pushed(void) {
     ray_t* r = ray_execute(g, root);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     TEST_ASSERT_EQ_I(ray_table_nrows(r), 3); /* sums 15,24,33 pass; 6 fails */
+    ray_release(r); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* Shape (a): HAVING AND where BOTH conjuncts reference the agg output v_sum.
+ * pred = AND(v_sum > 10, v_sum < 30).  Neither conjunct is a group key, so
+ * pushdown is skipped; the AND must NOT be split over GROUP (split would make
+ * the outer conjunct evaluate against the base table → schema error).
+ * Per-group v_sum: 6,15,24,33 → 15 and 24 satisfy (>10 AND <30) → 2 rows. */
+static test_result_t test_having_and_agg_executes(void) {
+    ray_heap_init();
+    ray_t* tbl = make_gp_table();
+    ray_graph_t* g = ray_graph_new(tbl);
+
+    ray_op_t* k = ray_scan(g, "k");
+    ray_op_t* v = ray_scan(g, "v");
+    ray_op_t* keys[] = {k};
+    uint16_t  aops[] = {OP_SUM};
+    ray_op_t* ains[] = {v};
+    ray_op_t* grp  = ray_group(g, keys, 1, aops, ains, 1);
+    ray_op_t* pred = ray_and(g,
+        ray_gt(g, ray_scan(g, "v_sum"), ray_const_i64(g, 10)),
+        ray_lt(g, ray_scan(g, "v_sum"), ray_const_i64(g, 30)));
+    ray_op_t* filt = ray_filter(g, grp, pred);
+    ray_op_t* root = ray_optimize(g, filt);
+
+    /* Guard keeps FILTER(AND, GROUP) intact — not a split chain. */
+    TEST_ASSERT(plan_having_unsplit(g, root),
+        "AND(agg,agg) over GROUP must stay un-split FILTER(AND, GROUP)");
+
+    ray_t* r = ray_execute(g, root);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 2);  /* v_sum 15 and 24 */
+
     ray_release(r); ray_graph_free(g); ray_release(tbl);
     ray_sym_destroy(); ray_heap_destroy();
     PASS();
@@ -701,6 +745,7 @@ static test_result_t test_diff_and_of_keys(void) {
 
 const test_entry_t group_pushdown_entries[] = {
     { "group_pushdown/agg_pred_not_pushed",   test_having_on_agg_not_pushed,     NULL, NULL },
+    { "group_pushdown/having_and_agg_exec",   test_having_and_agg_executes,      NULL, NULL },
     { "group_pushdown/exec_pushed_filter",    test_exec_group_with_pushed_filter, NULL, NULL },
     { "group_pushdown/having_on_key_pushed",  test_having_on_key_pushed,         NULL, NULL },
     { "group_pushdown/diff_key_ge",           test_diff_key_ge,                  NULL, NULL },
