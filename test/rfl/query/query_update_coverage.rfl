@@ -323,13 +323,14 @@
 
 ;; Lines 9720-9722: upsert with I32 key col (tests the I32 match branch)
 ;; The I32 key match branch (kt==RAY_I32) exercises lines 9720-9722.
-;; Key 2 not found in table (I32 col) → inserts. append_atom_to_col fails for I32 col.
-;; NOTE: apply_sort_take error paths and match for I32 are covered by match loop
-;; execution even when the subsequent update fails with type error.
+;; Key 2i matches an existing row → update succeeds: append_atom_to_col now
+;; handles I32 (and every other) column type, so the rebuild keeps the I32
+;; key column and writes v=99 instead of erroring.
 (set Ti32key (table [k v] (list (as 'I32 [1 2 3]) [10 20 30])))
-;; I32 key col, key=2i (I32 atom), list row: match loop at lines 9717-9722 runs
-;; (match for k=2 found), but update via append_atom_to_col fails for I32 col
-(upsert Ti32key 1 (list 2i 99)) !- type
+;; I32 key col, key=2i (I32 atom), list row: match loop finds k=2 and updates v.
+(at (at (upsert Ti32key 1 (list 2i 99)) 'v) 1) -- 99
+;; The rebuilt key column stays I32 (not promoted) and keeps every row.
+(at (at (upsert Ti32key 1 (list 2i 99)) 'k) 2) -- 3i
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; window-join malformed intervals (lines 10615-10622)
