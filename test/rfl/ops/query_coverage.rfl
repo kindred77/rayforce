@@ -319,7 +319,7 @@
 ;; (mask=true → expr_vec, mask=false → orig_col) hit the
 ;; ray_read_sym dispatch.
 (set TupL (table [id name] (list [1 2 3] ['alice 'bob 'charlie])))
-(set TupL2 (update {name: 'XXX from: 'TupL where: (== id 2)}))
+(set TupL2 (update {name: 'XXX from: TupL where: (== id 2)}))
 (at (at TupL2 'name) 0) -- 'alice
 (at (at TupL2 'name) 1) -- 'XXX
 (at (at TupL2 'name) 2) -- 'charlie
@@ -343,12 +343,12 @@
 ;; ====================================================================
 
 (set TupS (table [id s] (list [1 2 3 4] (list "a" "b" "c" "d"))))
-(set TupS2 (update {s: "XX" from: 'TupS where: (> id 2)}))
+(set TupS2 (update {s: "XX" from: TupS where: (> id 2)}))
 (first (at TupS2 's)) -- "a"
 (at (at TupS2 's) 2) -- "XX"
 
 (set TupSy (table [id k] (list [1 2 3] ['a 'b 'c])))
-(set TupSy2 (update {k: 'XX from: 'TupSy where: (== id 2)}))
+(set TupSy2 (update {k: 'XX from: TupSy where: (== id 2)}))
 (at (at TupSy2 'k) 0) -- 'a
 (at (at TupSy2 'k) 1) -- 'XX
 
