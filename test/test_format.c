@@ -965,7 +965,8 @@ static test_result_t test_fmt_vec_str_null(void) {
 }
 
 static test_result_t test_fmt_list_empty_strs(void) {
-    /* A list holding empty-string atoms renders ["" "x" ""], not [0Nc ...]. */
+    /* A list holding empty-string atoms renders ("" "x" ""), not (0Nc ...).
+     * mode 1 (REPL) renders a generic list with parens, distinct from a vec. */
     ray_t* lst = ray_list_new(3);
     TEST_ASSERT_NOT_NULL(lst);
     lst = ray_list_append(lst, ray_str("", 0));
@@ -977,7 +978,7 @@ static test_result_t test_fmt_list_empty_strs(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
     const char* s = ray_str_ptr(result);
     TEST_ASSERT_NULL(strstr(s, "0Nc"));
-    TEST_ASSERT_STR_EQ("[\"\" \"x\" \"\"]", s);
+    TEST_ASSERT_STR_EQ("(\"\" \"x\" \"\")", s);
     ray_release(result);
     ray_release(lst);
     PASS();
@@ -1056,6 +1057,28 @@ static test_result_t test_fmt_list_empty(void) {
     const char* s = ray_str_ptr(result);
     TEST_ASSERT_NOT_NULL(strstr(s, "()"));
     ray_release(result);
+    ray_release(list);
+    PASS();
+}
+
+/* A homogeneous-atom LIST must render with parens so it is distinct from a
+ * typed vector — not collapsed to [..] which looks like a vector. */
+static test_result_t test_fmt_list_homogeneous_parens(void) {
+    ray_t* list = ray_list_new(3);
+    list = ray_list_append(list, ray_i64(1));
+    list = ray_list_append(list, ray_i64(2));
+    list = ray_list_append(list, ray_i64(3));
+    /* mode 1 (REPL display): distinct from a vector → parens */
+    ray_t* r1 = ray_fmt(list, 1);
+    TEST_ASSERT_NOT_NULL(r1);
+    TEST_ASSERT_STR_EQ(ray_str_ptr(r1), "(1 2 3)");
+    ray_release(r1);
+    /* mode 0 (round-trip): legacy homogeneous-list/vector display
+     * equivalence preserved — renders as [..] so fmt_eq stays consistent. */
+    ray_t* r0 = ray_fmt(list, 0);
+    TEST_ASSERT_NOT_NULL(r0);
+    TEST_ASSERT_STR_EQ(ray_str_ptr(r0), "[1 2 3]");
+    ray_release(r0);
     ray_release(list);
     PASS();
 }
@@ -1575,9 +1598,72 @@ static test_result_t test_fmt_null_obj(void) {
     PASS();
 }
 
+/* ---- Pretty-printer (ray_fmt_pp) tests ---- */
+
+/* Helper: eval src, pretty-print it, compare to expected, then reset width. */
+static int pp_eq(const char* src, const char* expected) {
+    ray_t* v = ray_eval_str(src);
+    if (!v || RAY_IS_ERR(v)) { if (v) ray_error_free(v); return 0; }
+    ray_t* s = ray_fmt_pp(v);
+    int ok = s && !RAY_IS_ERR(s)
+          && strlen(expected) == (size_t)ray_str_len(s)
+          && memcmp(expected, ray_str_ptr(s), ray_str_len(s)) == 0;
+    if (s) ray_release(s);
+    ray_release(v);
+    return ok;
+}
+
+/* A small dict that fits the width stays on one line. */
+static test_result_t test_fmt_pp_dict_fits(void) {
+    ray_fmt_set_width(80);
+    TEST_ASSERT_TRUE(pp_eq("(dict [a b] (list 1 2))", "{a:1 b:2}"));
+    PASS();
+}
+
+/* A dict wider than the limit breaks one pair per line, indented 2 spaces. */
+static test_result_t test_fmt_pp_dict_breaks(void) {
+    ray_fmt_set_width(10);
+    int ok = pp_eq("(dict [a b c] (list 1 2 3))",
+                   "{\n  a: 1\n  b: 2\n  c: 3\n}");
+    ray_fmt_set_width(80);
+    TEST_ASSERT_TRUE(ok);
+    PASS();
+}
+
+/* When the outer breaks but a nested dict still fits on its line, the nested
+ * one stays compact (JSON-pp behavior). */
+static test_result_t test_fmt_pp_nested_compact(void) {
+    ray_fmt_set_width(12);
+    int ok = pp_eq("(dict [a b c] (list (dict [x] (list 1)) 2 3))",
+                   "{\n  a: {x:1}\n  b: 2\n  c: 3\n}");
+    ray_fmt_set_width(80);
+    TEST_ASSERT_TRUE(ok);
+    PASS();
+}
+
+/* A list that fits renders compact with parens (distinct from a vector). */
+static test_result_t test_fmt_pp_list_fits(void) {
+    ray_fmt_set_width(80);
+    TEST_ASSERT_TRUE(pp_eq("(list 1 (list 2 3))", "(1 (2 3))"));
+    PASS();
+}
+
+/* Scalars and vectors pretty-print exactly as ray_fmt mode 1 (no breaking). */
+static test_result_t test_fmt_pp_scalar_passthrough(void) {
+    ray_fmt_set_width(80);
+    TEST_ASSERT_TRUE(pp_eq("42", "42"));
+    TEST_ASSERT_TRUE(pp_eq("[1 2 3]", "[1 2 3]"));
+    PASS();
+}
+
 /* ---- Suite definition ---- */
 
 const test_entry_t format_entries[] = {
+    { "format/pp/dict_fits", test_fmt_pp_dict_fits, fmt_setup_full, fmt_teardown_full },
+    { "format/pp/dict_breaks", test_fmt_pp_dict_breaks, fmt_setup_full, fmt_teardown_full },
+    { "format/pp/nested_compact", test_fmt_pp_nested_compact, fmt_setup_full, fmt_teardown_full },
+    { "format/pp/list_fits", test_fmt_pp_list_fits, fmt_setup_full, fmt_teardown_full },
+    { "format/pp/scalar_passthrough", test_fmt_pp_scalar_passthrough, fmt_setup_full, fmt_teardown_full },
     { "format/atom/i64", test_fmt_i64, fmt_setup, fmt_teardown },
     { "format/atom/i64_neg", test_fmt_i64_neg, fmt_setup, fmt_teardown },
     { "format/atom/f64", test_fmt_f64, fmt_setup, fmt_teardown },
@@ -1637,6 +1723,7 @@ const test_entry_t format_entries[] = {
     { "format/vec/truncate", test_fmt_vec_truncate, fmt_setup, fmt_teardown },
     { "format/list/hetero", test_fmt_list_hetero, fmt_setup, fmt_teardown },
     { "format/list/empty", test_fmt_list_empty, fmt_setup, fmt_teardown },
+    { "format/list/homogeneous_parens", test_fmt_list_homogeneous_parens, fmt_setup, fmt_teardown },
     { "format/dict/sym_i64", test_fmt_dict_sym_i64, fmt_setup, fmt_teardown },
     { "format/dict/i64_f64", test_fmt_dict_i64_f64, fmt_setup, fmt_teardown },
     { "format/dict/empty", test_fmt_dict_empty, fmt_setup, fmt_teardown },
