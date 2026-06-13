@@ -462,6 +462,70 @@ static test_result_t test_domain_create_flush_concurrent(void) {
     PASS();
 }
 
+/* Heap-recycle isolation for the process-global FILE-domain cache.
+ *
+ * A domain's atoms are ray_str objects on the buddy heap, but the cache
+ * (g_domains) is process-global and outlives a per-test
+ * ray_heap_destroy.  Without the ray_sym_domain_drop_heap() hook the
+ * cache keeps an entry whose atoms were freed with their heap, so the
+ * next open of that path on a fresh heap reuses the stale domain — a
+ * use-after-free that surfaces as the next open/extend reading freed
+ * atoms (NULL/garbage domain, or a SEGV once the pages are reused).
+ *
+ * This exercises that path directly (own heap lifecycle, hence NULL
+ * setup/teardown): open a FILE domain, leak it into the cache, recycle
+ * the heap, churn allocations to reuse the freed region, then re-open
+ * the same path with a divergent file.  Note: the UAF does not fault
+ * deterministically (freed pages often stay mapped), so this is not a
+ * hard pre/post oracle — it is an ASan-backed guard that the recycle +
+ * reopen stays clean and the drop hook keeps the cache coherent. */
+#define TMP_DOM_RECYCLE_PATH "/tmp/rayforce_test_domain_recycle_sym"
+static test_result_t test_domain_survives_heap_recycle(void) {
+    unlink(TMP_DOM_RECYCLE_PATH);
+    unlink(TMP_DOM_RECYCLE_PATH ".lk");
+
+    /* --- heap A: open a domain with a SMALL vocabulary --- */
+    ray_heap_init();
+    (void)ray_sym_init();
+    (void)ray_sym_intern("recyc_a", 7);
+    TEST_ASSERT_EQ_I(ray_sym_save(TMP_DOM_RECYCLE_PATH), RAY_OK);
+    ray_sym_domain_t* d1 = ray_sym_domain_open(TMP_DOM_RECYCLE_PATH);
+    TEST_ASSERT_NOT_NULL(d1);          /* atoms now live on heap A */
+    /* Deliberately DO NOT release d1 — it stays in the global cache,
+     * exactly the leak that exposed the dangling bug. */
+    ray_sym_destroy();
+    ray_heap_destroy();                /* must drop d1 from the cache */
+
+    /* --- heap B (fresh): churn allocations to reuse heap A's freed
+     * pages, then write a DIVERGENT (larger) file at the same path --- */
+    ray_heap_init();
+    (void)ray_sym_init();
+    for (int i = 0; i < 256; i++) {    /* overwrite heap A's freed region */
+        char b[32]; int n = snprintf(b, sizeof b, "churn_%d", i);
+        ray_t* v = ray_str(b, (size_t)n);
+        if (v && !RAY_IS_ERR(v)) ray_release(v);
+    }
+    (void)ray_sym_intern("recyc_a", 7);
+    (void)ray_sym_intern("recyc_b", 7);     /* different vocabulary/size */
+    TEST_ASSERT_EQ_I(ray_sym_save(TMP_DOM_RECYCLE_PATH), RAY_OK);
+    /* Re-open the SAME path.  Pre-fix: cache hit on the stale d1; the
+     * size differs so dom_extend dereferences d1's atoms (freed, now
+     * overwritten by the churn above) → SEGV or garbage.  Post-fix: the
+     * stale entry is gone, so this builds a fresh domain. */
+    ray_sym_domain_t* d2 = ray_sym_domain_open(TMP_DOM_RECYCLE_PATH);
+    TEST_ASSERT_NOT_NULL(d2);
+    ray_t* s0 = ray_sym_domain_str(d2, 0);  /* touch the atoms */
+    TEST_ASSERT_NOT_NULL(s0);
+    TEST_ASSERT_EQ_U(ray_str_len(s0), 0);   /* position 0 is "" */
+    ray_sym_domain_release(d2);
+
+    unlink(TMP_DOM_RECYCLE_PATH);
+    unlink(TMP_DOM_RECYCLE_PATH ".lk");
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 static test_result_t test_domain_open_identity_and_release(void) {
     unlink(TMP_DOM_SYM_PATH);
     unlink(TMP_DOM_SYM_PATH ".lk");
@@ -1829,6 +1893,7 @@ const test_entry_t domain_entries[] = {
     { "domain/col_save_load_mmap",      test_domain_col_save_load_mmap,      domain_setup, domain_teardown },
     { "domain/open_basic",              test_domain_open_basic,              domain_setup, domain_teardown },
     { "domain/create_flush_concurrent", test_domain_create_flush_concurrent, domain_setup, domain_teardown },
+    { "domain/survives_heap_recycle",   test_domain_survives_heap_recycle,   NULL, NULL },
     { "domain/open_identity_release",   test_domain_open_identity_and_release, domain_setup, domain_teardown },
     { "domain/vec_cell_runtime_equiv",  test_domain_vec_cell_runtime_equiv,  domain_setup, domain_teardown },
     { "domain/vec_lookup_hit_miss",     test_domain_vec_lookup_hit_miss,     domain_setup, domain_teardown },

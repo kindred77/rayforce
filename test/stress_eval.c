@@ -210,6 +210,9 @@ bool stress_eval_seed_initial(stress_ctx_t* c, int64_t live_rows, int nparts,
     stress_live_dir(c, dir, sizeof(dir));
     if (!eval_set_dir(c, dir, &c->live)) return false;
     for (int p = 0; p < nparts; p++) {
+        /* Publish before filling so an early failure frees parts[p] (see
+         * stress_seed_initial for the rationale). */
+        c->nparts = p + 1;
         snprintf(c->part_dates[p], sizeof(c->part_dates[p]), "2024.01.%02d",
                  (p + 1) % 100); /* % keeps -Wformat-truncation in range */
         for (int64_t i = 0; i < rows_per_part; i++) {
@@ -220,7 +223,6 @@ bool stress_eval_seed_initial(stress_ctx_t* c, int64_t live_rows, int nparts,
         stress_part_dir(c, p, dir, sizeof(dir));
         if (!eval_set_dir(c, dir, &c->parts[p])) return false;
     }
-    c->nparts = nparts;
     return true;
 }
 
