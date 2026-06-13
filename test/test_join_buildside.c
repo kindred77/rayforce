@@ -89,6 +89,39 @@ static ray_t* jb_inner_join(ray_t* lt, const char* lkey,
     return result;
 }
 
+/* ── Join-type-parameterized helper ────────────────────────────────────────
+ * jb_join: identical to jb_inner_join but threads an explicit join_type
+ * (0=INNER, 1=LEFT, 2=FULL) into ray_join.  Used by the dup-fallback edge
+ * fixtures, which must exercise LEFT/FULL (where build is always the right
+ * side) as well as INNER.  jb_results_equal already tolerates NULL cells
+ * from LEFT/FULL unmatched rows.
+ * ──────────────────────────────────────────────────────────────────────── */
+static ray_t* jb_join(ray_t* lt, const char* lkey,
+                      ray_t* rt, const char* rkey, uint8_t join_type) {
+    ray_graph_t* g = ray_graph_new(lt);
+    if (!g) return ray_error("oom", "jb_join: graph alloc");
+
+    ray_op_t* lt_node = ray_const_table(g, lt);
+    ray_op_t* rt_node = ray_const_table(g, rt);
+    ray_op_t* lk_op   = ray_scan(g, lkey);
+    ray_op_t* rk_op   = ray_scan(g, rkey);
+
+    if (!lt_node || !rt_node || !lk_op || !rk_op) {
+        ray_graph_free(g);
+        return ray_error("oom", "jb_join: node alloc");
+    }
+
+    ray_op_t* lk_arr[1] = { lk_op };
+    ray_op_t* rk_arr[1] = { rk_op };
+    ray_op_t* jn = ray_join(g, lt_node, lk_arr, rt_node, rk_arr, 1, join_type);
+    if (!jn) { ray_graph_free(g); return ray_error("oom", "jb_join: join node"); }
+
+    jn = ray_optimize(g, jn);
+    ray_t* result = ray_execute(g, jn);
+    ray_graph_free(g);
+    return result;
+}
+
 /* ── Two-column table helper ──────────────────────────────────────────────
  * jb_table2: allocate a two-column I64 table with column names n0/n1.
  * v0[]/v1[] must have `n` elements each.  Caller owns the returned table.
@@ -287,6 +320,39 @@ cleanup:
     free(cols_a);
     free(cols_b);
     return result;
+}
+
+/* ── Dup-fallback differential wrapper ──────────────────────────────────────
+ * jb_diff_dup: run a join with the force knob OFF (auto path); assert the
+ * dup-fallback counter advanced iff expect_trip.  Then run with the force
+ * knob ON (forced-chained oracle) and assert multiset equality.  Reused by
+ * every dup-fallback edge fixture.  Does NOT init/destroy the heap — caller
+ * owns the session (so not_sticky can chain two joins in one heap).
+ * ──────────────────────────────────────────────────────────────────────── */
+static test_result_t jb_diff_dup(ray_t* lt, const char* lkey,
+                                  ray_t* rt, const char* rkey,
+                                  uint8_t join_type, bool expect_trip) {
+    uint64_t before = ray_join_dup_fallbacks;
+    ray_join_force_dup_fallback = false;                 /* auto path */
+    ray_t* got = jb_join(lt, lkey, rt, rkey, join_type);
+    bool fired = ray_join_dup_fallbacks > before;
+
+    ray_join_force_dup_fallback = true;                  /* forced-chained oracle */
+    ray_t* oracle = jb_join(lt, lkey, rt, rkey, join_type);
+    ray_join_force_dup_fallback = false;
+
+    if (!got || RAY_IS_ERR(got) || !oracle || RAY_IS_ERR(oracle)) {
+        ray_release(got); ray_release(oracle);
+        return (test_result_t){ TEST_FAIL, "jb_diff_dup: join returned error" };
+    }
+
+    test_result_t rr = jb_results_equal(got, oracle);
+    if (rr.status == TEST_PASS && fired != expect_trip)
+        rr = (test_result_t){ TEST_FAIL,
+            expect_trip ? "expected dup-fallback to trip"
+                        : "dup-fallback tripped unexpectedly" };
+    ray_release(got); ray_release(oracle);
+    return rr;
 }
 
 /* ── Baseline test ─────────────────────────────────────────────────────────
@@ -670,6 +736,235 @@ static test_result_t test_jb_auto_fallback_dup(void) {
     return rr;
 }
 
+/* ── LEFT join, duplicated build side ──────────────────────────────────────
+ * For LEFT (join_type=1) the build-side swap never fires (swap is INNER-only),
+ * so the BUILD side is ALWAYS the physical right.  To enter the radix path the
+ * right must be > RAY_PARALLEL_THRESHOLD; to trip the dup run-length guard the
+ * right (build) must be heavily duplicated.
+ *
+ *   right = 70536 rows, key i%64  → ~1102 rows/key → run > 512 → trips.
+ *   left  = 4000 rows: a small matched subset (keys 0..7, even i) plus a large
+ *           left-only remainder (key i%64+100) → unmatched LEFT rows emitted
+ *           with NULL right cell.  The narrow matched key set keeps the join
+ *           output bounded (~280K rows) so the forced-chained oracle stays fast.
+ * expect_trip = true.  Build side = right (70536, dup).
+ * ──────────────────────────────────────────────────────────────────────── */
+static test_result_t test_jb_dup_left_join(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t n_r = RAY_PARALLEL_THRESHOLD + 5000;   /* 70536 > threshold → radix */
+    int64_t n_l = 4000;
+    int64_t* rv = malloc((size_t)n_r * sizeof(int64_t));
+    int64_t* lv = malloc((size_t)n_l * sizeof(int64_t));
+    TEST_ASSERT(rv && lv, "malloc key arrays");
+    for (int64_t i = 0; i < n_r; i++) rv[i] = i % 64;            /* build: ~1102/key → trips */
+    for (int64_t i = 0; i < n_l; i++)
+        lv[i] = (i < 256) ? (i % 8) : (i % 64 + 100);           /* 256 matched (keys 0..7) + left-only */
+
+    ray_t* rt = jb_table1("rk", rv, n_r);
+    ray_t* lt = jb_table1("lk", lv, n_l);
+    test_result_t rr = jb_diff_dup(lt, "lk", rt, "rk", /*join_type=*/1, /*expect_trip=*/true);
+
+    ray_release(lt); ray_release(rt);
+    free(lv); free(rv);
+    ray_sym_destroy(); ray_heap_destroy();
+    return rr;
+}
+
+/* ── FULL join, duplicated build side ──────────────────────────────────────
+ * Same shape as dup_left_join but join_type=2 (FULL OUTER).  Build side is the
+ * physical right (70536, key i%64 → ~1102/key → trips).  Left has a narrow
+ * matched subset (keys 0..7) plus left-only keys (i%64+100); right keys 8..63
+ * have no left match, so both unmatched-left and unmatched-right rows appear.
+ * expect_trip = true.  Build side = right (70536, dup).
+ * ──────────────────────────────────────────────────────────────────────── */
+static test_result_t test_jb_dup_full_join(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t n_r = RAY_PARALLEL_THRESHOLD + 5000;
+    int64_t n_l = 4000;
+    int64_t* rv = malloc((size_t)n_r * sizeof(int64_t));
+    int64_t* lv = malloc((size_t)n_l * sizeof(int64_t));
+    TEST_ASSERT(rv && lv, "malloc key arrays");
+    for (int64_t i = 0; i < n_r; i++) rv[i] = i % 64;           /* build: ~1102/key → trips */
+    for (int64_t i = 0; i < n_l; i++)
+        lv[i] = (i < 256) ? (i % 8) : (i % 64 + 100);          /* 256 matched (0..7) + left-only */
+
+    ray_t* rt = jb_table1("rk", rv, n_r);
+    ray_t* lt = jb_table1("lk", lv, n_l);
+    test_result_t rr = jb_diff_dup(lt, "lk", rt, "rk", /*join_type=*/2, /*expect_trip=*/true);
+
+    ray_release(lt); ray_release(rt);
+    free(lv); free(rv);
+    ray_sym_destroy(); ray_heap_destroy();
+    return rr;
+}
+
+/* ── INNER join, no-swap, duplicated build side ────────────────────────────
+ * With ray_join_no_build_swap = true the INNER swap is suppressed, so the
+ * BUILD side is the physical right.  right = 70536 key i%64 (~1102/key, trips),
+ * left = 4000 key i%8 (probe, narrow matched set to bound output).  Knob reset
+ * after the run.  expect_trip = true.  Build side = right (70536, dup).
+ * ──────────────────────────────────────────────────────────────────────── */
+static test_result_t test_jb_dup_inner_no_swap(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t n_r = RAY_PARALLEL_THRESHOLD + 5000;
+    int64_t n_l = 4000;
+    int64_t* rv = malloc((size_t)n_r * sizeof(int64_t));
+    int64_t* lv = malloc((size_t)n_l * sizeof(int64_t));
+    TEST_ASSERT(rv && lv, "malloc key arrays");
+    for (int64_t i = 0; i < n_r; i++) rv[i] = i % 64;          /* build: ~1102/key → trips */
+    for (int64_t i = 0; i < n_l; i++)
+        lv[i] = (i < 256) ? (i % 8) : (i % 8 + 1000);         /* 256 matched, rest non-matching */
+
+    ray_t* rt = jb_table1("rk", rv, n_r);
+    ray_t* lt = jb_table1("lk", lv, n_l);
+
+    ray_join_no_build_swap = true;                              /* build = right */
+    test_result_t rr = jb_diff_dup(lt, "lk", rt, "rk", /*join_type=*/0, /*expect_trip=*/true);
+    ray_join_no_build_swap = false;                            /* reset */
+
+    ray_release(lt); ray_release(rt);
+    free(lv); free(rv);
+    ray_sym_destroy(); ray_heap_destroy();
+    return rr;
+}
+
+/* ── INNER join, low duplication, no trip ──────────────────────────────────
+ * The zero-regression correctness path: a large near-unique build side never
+ * produces a probe run > RADIX_DUP_RUN_MAX, so the auto path stays on radix
+ * (counter does NOT advance) and still matches the forced-chained oracle.
+ *
+ * Both sides near-unique so whichever becomes the build side after the INNER
+ * swap is fine: right = 70536 key i%70000 (~1/key), left = 4000 key i%4000.
+ * expect_trip = false.  Build side = left (4000) after swap, near-unique.
+ * ──────────────────────────────────────────────────────────────────────── */
+static test_result_t test_jb_no_trip_low_dup(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t n_r = RAY_PARALLEL_THRESHOLD + 5000;
+    int64_t n_l = 4000;
+    int64_t* rv = malloc((size_t)n_r * sizeof(int64_t));
+    int64_t* lv = malloc((size_t)n_l * sizeof(int64_t));
+    TEST_ASSERT(rv && lv, "malloc key arrays");
+    for (int64_t i = 0; i < n_r; i++) rv[i] = i % 70000;       /* near-unique */
+    for (int64_t i = 0; i < n_l; i++) lv[i] = i % 4000;        /* unique */
+
+    ray_t* rt = jb_table1("rk", rv, n_r);
+    ray_t* lt = jb_table1("lk", lv, n_l);
+    test_result_t rr = jb_diff_dup(lt, "lk", rt, "rk", /*join_type=*/0, /*expect_trip=*/false);
+
+    ray_release(lt); ray_release(rt);
+    free(lv); free(rv);
+    ray_sym_destroy(); ray_heap_destroy();
+    return rr;
+}
+
+/* ── Trip boundary ─────────────────────────────────────────────────────────
+ * Two siblings straddling RADIX_DUP_RUN_MAX (512), both via INNER no-swap so
+ * the build side is the physical right (the dup side).  The build loop's run
+ * counter tracks the open-addressing linear-probe run length, which for M
+ * duplicates of one key reaches ~M (same-hash duplicates chain from the same
+ * start slot) PLUS inter-key collisions within the partition — so the run can
+ * exceed M somewhat.  Sizes are chosen with margin on both sides:
+ *   trips:    right = 70536 key i%64   → ~1102/key  → run ≫ 512 → trips.
+ *   no-trip:  right = 70536 key i%2000 → ~35/key    → run ≪ 512 → no trip.
+ * Both must match the forced-chained oracle; counter fires only on the dup case.
+ * Build side = right (70536) for both.
+ * ──────────────────────────────────────────────────────────────────────── */
+static test_result_t test_jb_trip_boundary(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t n_r = RAY_PARALLEL_THRESHOLD + 5000;   /* 70536 */
+    int64_t n_l = 4000;
+    int64_t* rv = malloc((size_t)n_r * sizeof(int64_t));
+    int64_t* lv = malloc((size_t)n_l * sizeof(int64_t));
+    TEST_ASSERT(rv && lv, "malloc key arrays");
+    for (int64_t i = 0; i < n_l; i++) lv[i] = i % 2000;        /* probe, low dup */
+
+    ray_join_no_build_swap = true;                            /* build = right */
+
+    /* Above boundary: ~1102/key → trips. */
+    for (int64_t i = 0; i < n_r; i++) rv[i] = i % 64;
+    ray_t* rt_hi = jb_table1("rk", rv, n_r);
+    ray_t* lt_hi = jb_table1("lk", lv, n_l);
+    test_result_t rr = jb_diff_dup(lt_hi, "lk", rt_hi, "rk", /*join_type=*/0, /*expect_trip=*/true);
+    ray_release(lt_hi); ray_release(rt_hi);
+
+    /* Below boundary: ~35/key → no trip. */
+    if (rr.status == TEST_PASS) {
+        for (int64_t i = 0; i < n_r; i++) rv[i] = i % 2000;
+        ray_t* rt_lo = jb_table1("rk", rv, n_r);
+        ray_t* lt_lo = jb_table1("lk", lv, n_l);
+        rr = jb_diff_dup(lt_lo, "lk", rt_lo, "rk", /*join_type=*/0, /*expect_trip=*/false);
+        ray_release(lt_lo); ray_release(rt_lo);
+    }
+
+    ray_join_no_build_swap = false;                           /* reset */
+    free(lv); free(rv);
+    ray_sym_destroy(); ray_heap_destroy();
+    return rr;
+}
+
+/* ── Not sticky ────────────────────────────────────────────────────────────
+ * The pathological flag is per-join (reset each exec_join), not a sticky
+ * global.  Run a tripping join then a non-tripping join in the SAME heap
+ * session and assert the dup-fallback counter advanced by EXACTLY 1.
+ *
+ * Both INNER no-swap (build = right).  Trip: right key i%64 (~1102/key).
+ * No-trip: right key i%70000 (near-unique).  Probe key i%8 (narrow, bounded
+ * output).
+ * ──────────────────────────────────────────────────────────────────────── */
+static test_result_t test_jb_not_sticky(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t n_r = RAY_PARALLEL_THRESHOLD + 5000;
+    int64_t n_l = 4000;
+    int64_t* rv = malloc((size_t)n_r * sizeof(int64_t));
+    int64_t* lv = malloc((size_t)n_l * sizeof(int64_t));
+    TEST_ASSERT(rv && lv, "malloc key arrays");
+    for (int64_t i = 0; i < n_l; i++)
+        lv[i] = (i < 256) ? (i % 8) : (i % 8 + 1000);        /* 256 matched, rest non-matching */
+
+    ray_join_no_build_swap = true;                            /* build = right */
+    uint64_t before = ray_join_dup_fallbacks;
+
+    /* Pathological run first. */
+    for (int64_t i = 0; i < n_r; i++) rv[i] = i % 64;         /* ~1102/key → trips */
+    ray_t* rt_a = jb_table1("rk", rv, n_r);
+    ray_t* lt_a = jb_table1("lk", lv, n_l);
+    ray_t* got_a = jb_join(lt_a, "lk", rt_a, "rk", 0);
+    ray_release(got_a); ray_release(lt_a); ray_release(rt_a);
+
+    /* Low-dup run second, same session. */
+    for (int64_t i = 0; i < n_r; i++) rv[i] = i % 70000;       /* no trip */
+    ray_t* rt_b = jb_table1("rk", rv, n_r);
+    ray_t* lt_b = jb_table1("lk", lv, n_l);
+    ray_t* got_b = jb_join(lt_b, "lk", rt_b, "rk", 0);
+    ray_release(got_b); ray_release(lt_b); ray_release(rt_b);
+
+    uint64_t advanced = ray_join_dup_fallbacks - before;
+
+    ray_join_no_build_swap = false;                           /* reset */
+    free(lv); free(rv);
+    ray_sym_destroy(); ray_heap_destroy();
+
+    if (advanced != 1) {
+        snprintf(ray_test_fail_buf, sizeof ray_test_fail_buf,
+                 "expected dup-fallback counter to advance by exactly 1, got %llu",
+                 (unsigned long long)advanced);
+        return (test_result_t){ TEST_FAIL, ray_test_fail_buf };
+    }
+    return (test_result_t){ TEST_PASS, NULL };
+}
+
 /* ── Entry table ─────────────────────────────────────────────────────────── */
 
 const test_entry_t join_buildside_entries[] = {
@@ -684,5 +979,11 @@ const test_entry_t join_buildside_entries[] = {
     { "join_buildside/near_equal_no_swap", test_jb_near_equal_no_swap, NULL, NULL },
     { "join_buildside/multi_key", test_jb_multi_key, NULL, NULL },
     { "join_buildside/left_bigger_no_swap", test_jb_left_bigger_no_swap, NULL, NULL },
+    { "join_buildside/dup_left_join", test_jb_dup_left_join, NULL, NULL },
+    { "join_buildside/dup_full_join", test_jb_dup_full_join, NULL, NULL },
+    { "join_buildside/dup_inner_no_swap", test_jb_dup_inner_no_swap, NULL, NULL },
+    { "join_buildside/no_trip_low_dup", test_jb_no_trip_low_dup, NULL, NULL },
+    { "join_buildside/trip_boundary", test_jb_trip_boundary, NULL, NULL },
+    { "join_buildside/not_sticky", test_jb_not_sticky, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
