@@ -560,7 +560,7 @@
 
 (set wjl (table [Sym Time] (list ['a 'a] [10:00:01.000 10:00:05.000])))
 (set wjr (table [Sym Time Price] (list ['a 'a 'a] [10:00:00.000 10:00:02.000 10:00:04.000] (as 'F64 [99.5 100.5 101.5]))))
-(set wjiv (map-left + [-2000 2000] (at wjl 'Time)))
+(set wjiv (map-right + [-2000 2000] (at wjl 'Time)))
 ;; F64 sum: row0 interval [09:59:59,10:00:03] → prices 99.5+100.5=200.0
 ;;          row1 interval [10:00:03,10:00:07] → price 101.5 only
 (at (window-join [Sym Time] wjiv wjl wjr {total: (sum Price)}) 'total) -- [200.0 101.5]
@@ -633,7 +633,7 @@
 
 (set wjl2 (table [Sym Time] (list ['a 'a] [10:00:01.000 10:00:05.000])))
 (set wjr2 (table [Sym Time Price] (list ['a 'a 'a] [10:00:00.000 10:00:02.000 10:00:04.000] (as 'F64 [99.5 100.5 101.5]))))
-(set wjiv2 (map-left + [-2000 2000] (at wjl2 'Time)))
+(set wjiv2 (map-right + [-2000 2000] (at wjl2 'Time)))
 (at (window-join [Sym Time] wjiv2 wjl2 wjr2 {f: (first Price)}) 'f) -- [99.5 101.5]
 (at (window-join [Sym Time] wjiv2 wjl2 wjr2 {l: (last Price)}) 'l) -- [100.5 101.5]
 
