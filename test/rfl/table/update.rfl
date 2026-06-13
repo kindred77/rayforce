@@ -193,13 +193,14 @@ t -- (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0]))
 ;; ══════════════════════════════════════════════════════════════════
 
 ;; Narrow-int and temporal columns keep their type after a scalar update.
-(set t (table [k a] (list [1 2 3] (as 'I32 [10 20 30]))))(at (update {a: 99i from: 't}) 'a) -- [99i 99i 99i]
-(set t (table [k a] (list [1 2 3] (as 'I16 [1 2 3]))))(at (update {a: 7h from: 't}) 'a) -- [7h 7h 7h]
-(set t (table [k a] (list [1 2 3] (as 'Date [2020.01.01 2020.01.02 2020.01.03]))))(at (update {a: 2030.06.15 from: 't}) 'a) -- [2030.06.15 2030.06.15 2030.06.15]
-(set t (table [k a] (list [1 2 3] (as 'Timestamp [2024.01.01D00:00:00.0 2024.01.02D00:00:00.0 2024.01.03D00:00:00.0]))))(at (update {a: 2030.01.01D00:00:00.0 from: 't}) 'a) -- [2030.01.01D00:00:00.000000000 2030.01.01D00:00:00.000000000 2030.01.01D00:00:00.000000000]
+;; In-place update (from: 't) returns the symbol, so read the column back off t.
+(set t (table [k a] (list [1 2 3] (as 'I32 [10 20 30]))))(update {a: 99i from: 't})(at t 'a) -- [99i 99i 99i]
+(set t (table [k a] (list [1 2 3] (as 'I16 [1 2 3]))))(update {a: 7h from: 't})(at t 'a) -- [7h 7h 7h]
+(set t (table [k a] (list [1 2 3] (as 'Date [2020.01.01 2020.01.02 2020.01.03]))))(update {a: 2030.06.15 from: 't})(at t 'a) -- [2030.06.15 2030.06.15 2030.06.15]
+(set t (table [k a] (list [1 2 3] (as 'Timestamp [2024.01.01D00:00:00.0 2024.01.02D00:00:00.0 2024.01.03D00:00:00.0]))))(update {a: 2030.01.01D00:00:00.0 from: 't})(at t 'a) -- [2030.01.01D00:00:00.000000000 2030.01.01D00:00:00.000000000 2030.01.01D00:00:00.000000000]
 
 ;; GUID column scalar update (all-rows): every row becomes the scalar guid.
 ;; (guid is random, so compare cells to the scalar rather than a literal.)
-(set g (first (guid 1)))(set t (table [k a] (list [1 2 3] (guid 3))))(== (at (at (update {a: g from: 't}) 'a) 2) g) -- true
+(set g (first (guid 1)))(set t (table [k a] (list [1 2 3] (guid 3))))(update {a: g from: 't})(== (at (at t 'a) 2) g) -- true
 ;; GUID column scalar update (WHERE): only matching rows change, no overflow.
-(set g (first (guid 1)))(set t (table [k a] (list [1 2 3] (guid 3))))(== (at (at (update {a: g from: 't where: (== k 2)}) 'a) 1) g) -- true
+(set g (first (guid 1)))(set t (table [k a] (list [1 2 3] (guid 3))))(update {a: g from: 't where: (== k 2)})(== (at (at t 'a) 1) g) -- true
