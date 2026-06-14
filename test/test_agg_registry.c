@@ -127,9 +127,50 @@ static test_result_t test_f64_match(void) {
     PASS();
 }
 
+static test_result_t test_nulls_match_reduction(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* 3 live values, 2 sentinels; mark the column HAS_NULLS so the current
+     * reductions take their null-skipping path. */
+    int64_t xs[] = { 10, NULL_I64, 20, NULL_I64, 30 };
+    ray_t* col = vec_i64(xs, 5);
+    TEST_ASSERT_NOT_NULL(col);
+    col->attrs |= RAY_ATTR_HAS_NULLS;
+
+    struct { uint16_t op; ray_t* (*ref)(ray_t*); } cases[] = {
+        { OP_SUM, ray_sum_fn }, { OP_MIN, ray_min_fn }, { OP_MAX, ray_max_fn },
+    };
+    for (size_t c = 0; c < 3; c++) {
+        const agg_vtable_t* vt = agg_resolve(cases[c].op, RAY_I64);
+        TEST_ASSERT_NOT_NULL(vt);
+        ray_t* got = run_single_group(vt, col);
+        ray_t* want = ray_lazy_materialize(cases[c].ref(col));
+        TEST_ASSERT_NOT_NULL(got);
+        TEST_ASSERT_NOT_NULL(want);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(want));
+        TEST_ASSERT_EQ_I(got->i64, want->i64);   /* sentinels skipped identically */
+        ray_release(got); ray_release(want);
+    }
+    /* count over a HAS_NULLS column = live rows only = 3.
+     * This is the redesign's COMMITTED behavior (live-rows-only). We assert the
+     * literal 3, NOT a comparison to the legacy count (which counts slots incl.
+     * nulls per design §2.10) — this is an intentional corrected-behavior pin. */
+    const agg_vtable_t* vt = agg_resolve(OP_COUNT, RAY_I64);
+    TEST_ASSERT_NOT_NULL(vt);
+    ray_t* got = run_single_group(vt, col);
+    TEST_ASSERT_EQ_I(got->i64, 3);
+    ray_release(got); ray_release(col);
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t agg_registry_entries[] = {
     { "agg_registry/sum_i64_matches_reduction", test_sum_i64_matches_reduction, NULL, NULL },
     { "agg_registry/minmax_count_i64_match", test_minmax_count_i64_match, NULL, NULL },
     { "agg_registry/f64_match", test_f64_match, NULL, NULL },
+    { "agg_registry/nulls_match_reduction", test_nulls_match_reduction, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
