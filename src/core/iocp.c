@@ -21,10 +21,10 @@
  *   SOFTWARE.
  */
 
-#if defined(RAY_OS_WINDOWS)
-
 #include "core/poll.h"
 #include <stdio.h>
+
+#if defined(RAY_OS_WINDOWS)
 
 /* Windows IOCP implementation — stub for now.
  * Full IOCP support is deferred to a future release. */
