@@ -73,7 +73,9 @@ extern ray_t* ray_hpost_fn(ray_t* handle, ray_t* msg);
 #ifndef RAY_OS_WINDOWS
   #include <sys/socket.h>
   #include <netinet/in.h>
-  #include <unistd.h>
+#else
+  #include <winsock2.h>
+  #include <ws2tcpip.h>
 #endif
 
 #include <string.h>

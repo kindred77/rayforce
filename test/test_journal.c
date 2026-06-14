@@ -40,6 +40,9 @@
 #include <sys/stat.h>
 #include <stdint.h>
 #include <fcntl.h>
+#ifdef RAY_OS_WINDOWS
+#include <direct.h>
+#endif
 
 /* ── Runtime fixture (same pattern as test_link.c) ─────────────────── */
 
@@ -1594,7 +1597,11 @@ static test_result_t test_journal_snapshot_rename_fails(void) {
     TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
 
     /* Create the .qdb path as a DIRECTORY — rename(tmp, dir) will fail with EISDIR. */
+#if defined(RAY_OS_WINDOWS)
+    if (_mkdir(qpath) != 0) {
+#else
     if (mkdir(qpath, 0755) != 0) {
+#endif
         /* Can't create dir — skip gracefully. */
         ray_journal_close();
         cleanup_base(base);

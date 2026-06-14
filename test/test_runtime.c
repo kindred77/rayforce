@@ -31,14 +31,22 @@
 #include "core/poll.h"      /* ray_poll_t, ray_poll_create/destroy */
 #include "core/timer.h"     /* ray_timers_t, ray_timers_pump_for */
 #include "lang/format.h"    /* ray_fmt for eval_err */
+#if defined(RAY_OS_WINDOWS)
+#include "core/win/winenv.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
+#ifndef RAY_OS_WINDOWS
+  #include <sys/socket.h>
+  #include <netinet/in.h>
+#else
+  #include <winsock2.h>
+  #include <ws2tcpip.h>
+#endif
 
 static char* make_tmpdir(void) {
     char tmpl[] = "/tmp/rayforce-rt-test-XXXXXX";

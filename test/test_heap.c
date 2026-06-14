@@ -45,7 +45,11 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdatomic.h>
+#if defined(RAY_OS_WINDOWS)
+#include "core/win/mman.h"
+#else
 #include <sys/mman.h>
+#endif
 
 /* ---- Setup / Teardown -------------------------------------------------- */
 

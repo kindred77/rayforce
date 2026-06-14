@@ -26,6 +26,9 @@
 #include <rayforce.h>
 #include <rayforce.h>
 #include "mem/heap.h"
+#if defined(RAY_OS_WINDOWS)
+#include "core/win/winenv.h"
+#endif
 #include <string.h>
 #include <stdlib.h>
 #include <stdatomic.h>
