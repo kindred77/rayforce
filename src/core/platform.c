@@ -315,14 +315,6 @@ void ray_vm_unmap_file(void* ptr, size_t size) {
     if (ptr) UnmapViewOfFile(ptr);
 }
 
-#ifndef RAY_DEF_WIN32_MEMORY_RANGE_ENTRY
-#define RAY_DEF_WIN32_MEMORY_RANGE_ENTRY
-typedef struct _WIN32_MEMORY_RANGE_ENTRY {
-    PVOID VirtualAddress;
-    SIZE_T NumberOfBytes;
-} WIN32_MEMORY_RANGE_ENTRY, *PWIN32_MEMORY_RANGE_ENTRY;
-#endif
-
 typedef BOOL(WINAPI *PFN_PrefetchVirtualMemory)(
     HANDLE hProcess,
     ULONG_PTR NumberOfEntries,
