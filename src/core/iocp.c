@@ -27,9 +27,7 @@
 #if defined(RAY_OS_WINDOWS)
 
 #include <winsock2.h>
-#include <ws2tcpip.h>
 #include <windows.h>
-#include <mswsock.h>
 
 #include "mem/sys.h"
 #include "core/timer.h"
@@ -37,7 +35,6 @@
 #define RAY_POLL_MAX_EVENTS 64
 #define RAY_POLL_INITIAL_CAP 16
 
-// IOCP 每个异步操作的重叠上下文
 typedef struct {
     OVERLAPPED overlapped;
     ray_selector_t* sel;
@@ -46,7 +43,6 @@ typedef struct {
 } ray_iocp_ov_t;
 
 ray_poll_t* ray_poll_create(void) {
-    // 创建完成端口
     HANDLE iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
     if (iocp == NULL) {
         fprintf(stderr, "CreateIoCompletionPort failed %lu\n", GetLastError());
@@ -60,7 +56,6 @@ ray_poll_t* ray_poll_create(void) {
     }
     memset(poll, 0, sizeof(*poll));
 
-    // Linux下poll->fd存epoll fd，Windows复用该字段存IOCP句柄
     poll->fd = (uint64_t)iocp;
     poll->code = -1;
     poll->sel_cap = RAY_POLL_INITIAL_CAP;
@@ -75,11 +70,9 @@ ray_poll_t* ray_poll_create(void) {
     return poll;
 }
 
-void ray_poll_destroy(ray_poll_t* poll)
-{
+void ray_poll_destroy(ray_poll_t* poll) {
     if (!poll) return;
 
-    // 遍历释放所有selector，对齐Linux清理逻辑
     for (uint32_t i = 0; i < poll->n_sels; ++i) {
         ray_selector_t* sel = poll->sels[i];
         if (!sel) continue;
@@ -87,7 +80,6 @@ void ray_poll_destroy(ray_poll_t* poll)
         if (sel->close_fn)
             sel->close_fn(poll, sel);
 
-        // 关闭socket自动从IOCP解绑
         if ((SOCKET)sel->fd != INVALID_SOCKET)
             closesocket((SOCKET)sel->fd);
 
@@ -112,9 +104,7 @@ void ray_poll_destroy(ray_poll_t* poll)
     ray_sys_free(poll);
 }
 
-// 内部：给socket投递异步WSARecv，监听可读事件
-static int ray_poll_post_recv(ray_poll_t* poll, ray_selector_t* sel)
-{
+static int ray_poll_post_recv(ray_poll_t* poll, ray_selector_t* sel) {
     ray_iocp_ov_t* ov = (ray_iocp_ov_t*)ray_sys_alloc(sizeof(ray_iocp_ov_t));
     if (!ov) return -1;
 
@@ -140,11 +130,9 @@ static int ray_poll_post_recv(ray_poll_t* poll, ray_selector_t* sel)
     return 0;
 }
 
-int64_t ray_poll_register(ray_poll_t* poll, ray_poll_reg_t* reg)
-{
+int64_t ray_poll_register(ray_poll_t* poll, ray_poll_reg_t* reg) {
     if (!poll || !reg) return -1;
 
-    // 查找空闲槽位
     int64_t id = -1;
     for (uint32_t i = 0; i < poll->n_sels; ++i) {
         if (!poll->sels[i]) {
@@ -153,7 +141,6 @@ int64_t ray_poll_register(ray_poll_t* poll, ray_poll_reg_t* reg)
         }
     }
 
-    // 容量不足则扩容
     if (id < 0) {
         if (poll->n_sels >= poll->sel_cap) {
             uint32_t new_cap = poll->sel_cap * 2;
@@ -187,7 +174,6 @@ int64_t ray_poll_register(ray_poll_t* poll, ray_poll_reg_t* reg)
 
     poll->sels[id] = sel;
 
-    // Socket绑定IOCP
     HANDLE ret = CreateIoCompletionPort((HANDLE)sel->fd, (HANDLE)poll->fd, (ULONG_PTR)sel, 0);
     if (ret == NULL) {
         poll->sels[id] = NULL;
@@ -195,7 +181,6 @@ int64_t ray_poll_register(ray_poll_t* poll, ray_poll_reg_t* reg)
         return -1;
     }
 
-    // 投递异步recv，监听可读（等价epoll EPOLLIN）
     if (ray_poll_post_recv(poll, sel) != 0) {
         poll->sels[id] = NULL;
         ray_sys_free(sel);
@@ -208,13 +193,11 @@ int64_t ray_poll_register(ray_poll_t* poll, ray_poll_reg_t* reg)
     return id;
 }
 
-void ray_poll_deregister(ray_poll_t* poll, int64_t id)
-{
+void ray_poll_deregister(ray_poll_t* poll, int64_t id) {
     if (!poll || id < 0 || (uint32_t)id >= poll->n_sels) return;
     ray_selector_t* sel = poll->sels[id];
     if (!sel) return;
 
-    // IOCP无需手动删除句柄，关闭socket自动解绑
     if (sel->close_fn)
         sel->close_fn(poll, sel);
 
@@ -228,14 +211,12 @@ void ray_poll_deregister(ray_poll_t* poll, int64_t id)
     poll->sels[id] = NULL;
 }
 
-int64_t ray_poll_run(ray_poll_t* poll)
-{
+int64_t ray_poll_run(ray_poll_t* poll) {
     if (!poll) return -1;
     HANDLE iocp = (HANDLE)poll->fd;
 
     while (poll->code < 0) {
         DWORD wait_ms = INFINITE;
-        // 计算定时器超时时间，对齐Linux逻辑
         if (poll->timers) {
             int64_t deadline = ray_timers_next_deadline_ms((ray_timers_t*)poll->timers);
             if (deadline != INT64_MAX) {
@@ -254,12 +235,10 @@ int64_t ray_poll_run(ray_poll_t* poll)
         BOOL ok = GetQueuedCompletionStatus(iocp, &bytes_xfer, &key, &ov_ptr, wait_ms);
         if (!ok) {
             DWORD err = GetLastError();
-            // 超时，触发定时器
             if (err == WAIT_TIMEOUT) {
                 ray_timers_fire_expired((ray_timers_t*)poll->timers);
                 continue;
             }
-            // 其他错误直接退出
             return -1;
         }
 
@@ -267,13 +246,11 @@ int64_t ray_poll_run(ray_poll_t* poll)
         ray_selector_t* sel = ov->sel;
         uint64_t eid = sel->id;
 
-        // 校验selector是否已经被销毁
         if (eid >= poll->n_sels || poll->sels[eid] != sel) {
             ray_sys_free(ov);
             goto fire_timer;
         }
 
-        // 连接关闭 / 读取异常
         if (bytes_xfer == 0) {
             if (sel->error_fn)
                 sel->error_fn(poll, sel);
@@ -283,7 +260,6 @@ int64_t ray_poll_run(ray_poll_t* poll)
             goto fire_timer;
         }
 
-        // 把本次读到的数据写入rx buffer，复用你原有读循环逻辑
         if (sel->rx.buf && sel->rx.recv_fn) {
             size_t copy_len = bytes_xfer;
             size_t off = sel->rx.buf->offset;
@@ -293,7 +269,6 @@ int64_t ray_poll_run(ray_poll_t* poll)
             memcpy(sel->rx.buf->data + off, ov->buf, copy_len);
             sel->rx.buf->offset += copy_len;
 
-            // 原Linux业务循环：反复读、状态机、回调
             for (;;) {
                 if (sel->rx.buf->offset < sel->rx.buf->size)
                     break;
@@ -317,7 +292,6 @@ int64_t ray_poll_run(ray_poll_t* poll)
             }
         }
 
-        // 重新投递异步Recv，持续监听下一次可读事件
         ZeroMemory(&ov->overlapped, sizeof(OVERLAPPED));
         ov->wsabuf.len = sizeof(ov->buf);
         DWORD flags = 0;
@@ -325,7 +299,6 @@ int64_t ray_poll_run(ray_poll_t* poll)
         WSARecv((SOCKET)sel->fd, &ov->wsabuf, 1, &dummy, &flags, &ov->overlapped, NULL);
 
 fire_timer:
-        // 执行到期定时器
         if (poll->timers)
             ray_timers_fire_expired((ray_timers_t*)poll->timers);
     }
