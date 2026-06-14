@@ -57,7 +57,42 @@ static test_result_t test_sum_i64_matches_reduction(void) {
     PASS();
 }
 
+static test_result_t test_minmax_count_i64_match(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t xs[] = { 10, 20, 30, -5, 7 };
+    ray_t* col = vec_i64(xs, 5);
+    TEST_ASSERT_NOT_NULL(col);
+    struct { uint16_t op; ray_t* (*ref)(ray_t*); } cases[] = {
+        { OP_MIN, ray_min_fn }, { OP_MAX, ray_max_fn },
+    };
+    for (size_t c = 0; c < 2; c++) {
+        const agg_vtable_t* vt = agg_resolve(cases[c].op, RAY_I64);
+        TEST_ASSERT_NOT_NULL(vt);
+        ray_t* got = run_single_group(vt, col);
+        /* ray_min_fn/ray_max_fn on an I64 vector return a lazy DAG wrapper —
+         * force to a concrete scalar atom before comparing. */
+        ray_t* want = ray_lazy_materialize(cases[c].ref(col));
+        TEST_ASSERT_NOT_NULL(got);
+        TEST_ASSERT_NOT_NULL(want);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(want));
+        TEST_ASSERT_EQ_I(got->i64, want->i64);
+        ray_release(got); ray_release(want);
+    }
+    const agg_vtable_t* vt = agg_resolve(OP_COUNT, RAY_I64);
+    TEST_ASSERT_NOT_NULL(vt);
+    ray_t* got = run_single_group(vt, col);
+    TEST_ASSERT_EQ_I(got->i64, 5);     /* 5 live rows, no nulls */
+    ray_release(got); ray_release(col);
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t agg_registry_entries[] = {
     { "agg_registry/sum_i64_matches_reduction", test_sum_i64_matches_reduction, NULL, NULL },
+    { "agg_registry/minmax_count_i64_match", test_minmax_count_i64_match, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
