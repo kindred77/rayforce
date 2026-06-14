@@ -91,8 +91,45 @@ static test_result_t test_minmax_count_i64_match(void) {
     PASS();
 }
 
+static ray_t* vec_f64(const double* xs, int64_t n) {
+    ray_t* v = ray_vec_new(RAY_F64, n);
+    if (!v || RAY_IS_ERR(v)) return NULL;
+    v->len = n; memcpy(ray_data(v), xs, (size_t)n * sizeof(double));
+    return v;
+}
+
+static test_result_t test_f64_match(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    double xs[] = { 1.5, 2.0, -3.25, 10.0 };
+    ray_t* col = vec_f64(xs, 4);
+    TEST_ASSERT_NOT_NULL(col);
+    struct { uint16_t op; ray_t* (*ref)(ray_t*); } cases[] = {
+        { OP_SUM, ray_sum_fn }, { OP_MIN, ray_min_fn },
+        { OP_MAX, ray_max_fn }, { OP_AVG, ray_avg_fn },
+    };
+    for (size_t c = 0; c < 4; c++) {
+        const agg_vtable_t* vt = agg_resolve(cases[c].op, RAY_F64);
+        TEST_ASSERT_NOT_NULL(vt);
+        ray_t* got = run_single_group(vt, col);
+        ray_t* want = ray_lazy_materialize(cases[c].ref(col));
+        TEST_ASSERT_NOT_NULL(got);
+        TEST_ASSERT_NOT_NULL(want);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(want));
+        TEST_ASSERT_EQ_F(got->f64, want->f64, 1e-12);
+        ray_release(got); ray_release(want);
+    }
+    ray_release(col);
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t agg_registry_entries[] = {
     { "agg_registry/sum_i64_matches_reduction", test_sum_i64_matches_reduction, NULL, NULL },
     { "agg_registry/minmax_count_i64_match", test_minmax_count_i64_match, NULL, NULL },
+    { "agg_registry/f64_match", test_f64_match, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
