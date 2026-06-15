@@ -16,6 +16,8 @@
 #include "ops/ops.h"
 #include "ops/internal.h"
 #include "ops/agg_engine.h"
+#include "ops/agg_acc.h"
+#include "ops/agg_registry.h"
 #include "table/sym.h"
 #include <stdlib.h>
 #include <string.h>
@@ -235,6 +237,58 @@ static test_result_t test_group_keys_i_i32(void) {
     PASS();
 }
 
+/* Direct unit test for agg_run_one: key {1,1,2}, value {10,20,30}.
+ * gids {0,0,1}, ngroups 2. SUM={30,30} MIN={10,30} MAX={20,30} COUNT={2,1}. */
+static test_result_t test_agg_run_one_i64(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    const int64_t ksrc[] = { 1, 1, 2 };
+    const int64_t vsrc[] = { 10, 20, 30 };
+    const int64_t n = 3;
+
+    ray_t* kcol = ray_vec_new(RAY_I64, n);
+    ray_t* vcol = ray_vec_new(RAY_I64, n);
+    TEST_ASSERT_NOT_NULL(kcol);
+    TEST_ASSERT_NOT_NULL(vcol);
+    kcol->len = n; vcol->len = n;
+    memcpy(ray_data(kcol), ksrc, sizeof(ksrc));
+    memcpy(ray_data(vcol), vsrc, sizeof(vsrc));
+
+    agg_groups_t gr;
+    TEST_ASSERT_EQ_I((0), (agg_group_keys_i(kcol, &gr)));
+    TEST_ASSERT_EQ_I((2), (gr.ngroups));
+
+    struct { uint16_t op; ray_t* val; int64_t e0; int64_t e1; } cases[] = {
+        { OP_SUM,   vcol, 30, 30 },
+        { OP_MIN,   vcol, 10, 30 },
+        { OP_MAX,   vcol, 20, 30 },
+        { OP_COUNT, NULL,  2,  1 },
+    };
+
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        const agg_vtable_t* vt = agg_resolve(cases[c].op, RAY_I64);
+        TEST_ASSERT_NOT_NULL(vt);
+        ray_t* out = agg_run_one(vt, cases[c].val, gr.gids, n, gr.ngroups);
+        TEST_ASSERT_NOT_NULL(out);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+        TEST_ASSERT_EQ_I((RAY_I64), (out->type));
+        TEST_ASSERT_EQ_I((2), ((int)out->len));
+        const int64_t* d = (const int64_t*)ray_data(out);
+        TEST_ASSERT_EQ_I((cases[c].e0), (d[0]));
+        TEST_ASSERT_EQ_I((cases[c].e1), (d[1]));
+        ray_release(out);
+    }
+
+    free(gr.gids);
+    free(gr.keys);
+    ray_release(kcol);
+    ray_release(vcol);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t agg_engine_entries[] = {
     { "gate_admits_i64_key_sum_i64", test_gate_admits_i64_key_sum_i64, NULL, NULL },
     { "gate_defers_two_keys",        test_gate_defers_two_keys,        NULL, NULL },
@@ -242,5 +296,6 @@ const test_entry_t agg_engine_entries[] = {
     { "gate_admits_count",           test_gate_admits_count,           NULL, NULL },
     { "group_keys_i_first_occurrence", test_group_keys_i_first_occurrence, NULL, NULL },
     { "group_keys_i_i32",            test_group_keys_i_i32,            NULL, NULL },
+    { "agg_run_one_i64",             test_agg_run_one_i64,             NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
