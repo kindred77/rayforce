@@ -272,7 +272,7 @@ static test_result_t test_agg_run_one_i64(void) {
     for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
         const agg_vtable_t* vt = agg_resolve(cases[c].op, RAY_I64);
         TEST_ASSERT_NOT_NULL(vt);
-        ray_t* out = agg_run_one(vt, cases[c].val, gr.gids, n, gr.ngroups);
+        ray_t* out = agg_run_one(vt, cases[c].val, gr.gids, n, gr.ngroups, 0);
         TEST_ASSERT_NOT_NULL(out);
         TEST_ASSERT_FALSE(RAY_IS_ERR(out));
         TEST_ASSERT_EQ_I((RAY_I64), (out->type));

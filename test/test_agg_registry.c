@@ -26,7 +26,7 @@ static ray_t* run_single_group(const agg_vtable_t* vt, ray_t* col) {
     ray_valid_t valid = { ray_data(col), col->type,
                           (col->attrs & RAY_ATTR_HAS_NULLS) != 0 };
     vt->update_batch(state, vt->state_size, gids, ray_data(col), &valid, col->len, NULL);
-    ray_t* out = vt->finalize(state, NULL);
+    ray_t* out = vt->finalize(state, NULL, 0);
     if (vt->destroy) vt->destroy(state);  /* buffered accumulators own heap state */
     free(gids); free(state);
     return out;
@@ -178,7 +178,7 @@ static ray_t* run_single_group_bin(const agg_vtable_t* vt, ray_t* x, ray_t* y) {
     ray_valid_t vy = { ray_data(y), y->type, (y->attrs & RAY_ATTR_HAS_NULLS) != 0 };
     vt->update_batch2(state, vt->state_size, gids,
                       ray_data(x), ray_data(y), &vx, &vy, len, NULL);
-    ray_t* out = vt->finalize(state, NULL);
+    ray_t* out = vt->finalize(state, NULL, 0);
     free(gids); free(state);
     return out;
 }
