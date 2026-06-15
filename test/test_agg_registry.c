@@ -27,6 +27,7 @@ static ray_t* run_single_group(const agg_vtable_t* vt, ray_t* col) {
                           (col->attrs & RAY_ATTR_HAS_NULLS) != 0 };
     vt->update_batch(state, vt->state_size, gids, ray_data(col), &valid, col->len, NULL);
     ray_t* out = vt->finalize(state, NULL);
+    if (vt->destroy) vt->destroy(state);  /* buffered accumulators own heap state */
     free(gids); free(state);
     return out;
 }
@@ -271,6 +272,59 @@ static test_result_t test_variance_matches_oracle(void) {
     PASS();
 }
 
+static test_result_t test_median(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* I64 odd, I64 even, F64 — differential vs ray_med_fn (F64 output). */
+    {
+        int64_t xs[] = { 1, 3, 2, 5, 4 };  /* odd → 3.0 */
+        ray_t* col = vec_i64(xs, 5);
+        const agg_vtable_t* vt = agg_resolve(OP_MEDIAN, RAY_I64);
+        TEST_ASSERT_NOT_NULL(vt);
+        ray_t* got = run_single_group(vt, col);
+        ray_t* want = ray_lazy_materialize(ray_med_fn(col));
+        TEST_ASSERT_NOT_NULL(got);
+        TEST_ASSERT_NOT_NULL(want);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(want));
+        TEST_ASSERT_EQ_F(got->f64, 3.0, 1e-9);
+        TEST_ASSERT_EQ_F(got->f64, want->f64, 1e-9);
+        ray_release(got); ray_release(want); ray_release(col);
+    }
+    {
+        int64_t xs[] = { 1, 2, 3, 4 };  /* even → 2.5 */
+        ray_t* col = vec_i64(xs, 4);
+        const agg_vtable_t* vt = agg_resolve(OP_MEDIAN, RAY_I64);
+        TEST_ASSERT_NOT_NULL(vt);
+        ray_t* got = run_single_group(vt, col);
+        ray_t* want = ray_lazy_materialize(ray_med_fn(col));
+        TEST_ASSERT_NOT_NULL(got);
+        TEST_ASSERT_NOT_NULL(want);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(want));
+        TEST_ASSERT_EQ_F(got->f64, 2.5, 1e-9);
+        TEST_ASSERT_EQ_F(got->f64, want->f64, 1e-9);
+        ray_release(got); ray_release(want); ray_release(col);
+    }
+    {
+        double fs[] = { 1.5, 2.5, 0.5 };  /* → 1.5 */
+        ray_t* col = vec_f64(fs, 3);
+        const agg_vtable_t* vt = agg_resolve(OP_MEDIAN, RAY_F64);
+        TEST_ASSERT_NOT_NULL(vt);
+        ray_t* got = run_single_group(vt, col);
+        ray_t* want = ray_lazy_materialize(ray_med_fn(col));
+        TEST_ASSERT_NOT_NULL(got);
+        TEST_ASSERT_NOT_NULL(want);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(want));
+        TEST_ASSERT_EQ_F(got->f64, 1.5, 1e-9);
+        TEST_ASSERT_EQ_F(got->f64, want->f64, 1e-9);
+        ray_release(got); ray_release(want); ray_release(col);
+    }
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t agg_registry_entries[] = {
     { "agg_registry/sum_i64_matches_reduction", test_sum_i64_matches_reduction, NULL, NULL },
     { "agg_registry/minmax_count_i64_match", test_minmax_count_i64_match, NULL, NULL },
@@ -278,5 +332,6 @@ const test_entry_t agg_registry_entries[] = {
     { "agg_registry/nulls_match_reduction", test_nulls_match_reduction, NULL, NULL },
     { "agg_registry/variance_matches_oracle", test_variance_matches_oracle, NULL, NULL },
     { "agg_registry/pearson_signed_r", test_pearson_signed_r, NULL, NULL },
+    { "agg_registry/median", test_median, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
