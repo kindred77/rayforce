@@ -748,6 +748,64 @@ static ray_t* diff_make_2i64_keynull(int64_t n, int64_t nk) {
     return tbl;
 }
 
+/* ── var/stddev builders: SMALL-range deterministic values ──────────────
+ * v = i % 97 keeps per-group variances small so v2's running {sum,sumsq,cnt}
+ * formula and the old engine agree to within the comparator's 1e-12 ABSOLUTE
+ * F64 epsilon (cell_equal). nk small ⇒ cnt≥2 per group ⇒ sample var/stddev
+ * are defined (no singleton-group nulls). */
+
+/* Single I64 key "k" + I64 value "v" = i % 97. */
+static ray_t* diff_make_i64_small(int64_t n, int64_t nk) {
+    ray_t* kvec = ray_vec_new(RAY_I64, n); kvec->len = n;
+    ray_t* vvec = ray_vec_new(RAY_I64, n); vvec->len = n;
+    int64_t* kd = (int64_t*)ray_data(kvec);
+    int64_t* vd = (int64_t*)ray_data(vvec);
+    for (int64_t i = 0; i < n; i++) {
+        kd[i] = (i * 3 + 1) % nk;
+        vd[i] = i % 97;
+    }
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k", 1), kvec); ray_release(kvec);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("v", 1), vvec); ray_release(vvec);
+    return tbl;
+}
+
+/* Single I64 key "k" + F64 value "v" = (i % 97) * 0.25. */
+static ray_t* diff_make_i64_f64_small(int64_t n, int64_t nk) {
+    ray_t* kvec = ray_vec_new(RAY_I64, n); kvec->len = n;
+    ray_t* vvec = ray_vec_new(RAY_F64, n); vvec->len = n;
+    int64_t* kd = (int64_t*)ray_data(kvec);
+    double*  vd = (double*)ray_data(vvec);
+    for (int64_t i = 0; i < n; i++) {
+        kd[i] = (i * 3 + 1) % nk;
+        vd[i] = (double)(i % 97) * 0.25;
+    }
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k", 1), kvec); ray_release(kvec);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("v", 1), vvec); ray_release(vvec);
+    return tbl;
+}
+
+/* Two I64 keys "k1","k2" + I64 value "v" = i % 97 (small range). */
+static ray_t* diff_make_2i64_small(int64_t n, int64_t nk) {
+    ray_t* k1 = ray_vec_new(RAY_I64, n); k1->len = n;
+    ray_t* k2 = ray_vec_new(RAY_I64, n); k2->len = n;
+    ray_t* vv = ray_vec_new(RAY_I64, n); vv->len = n;
+    int64_t* d1 = (int64_t*)ray_data(k1);
+    int64_t* d2 = (int64_t*)ray_data(k2);
+    int64_t* vd = (int64_t*)ray_data(vv);
+    for (int64_t i = 0; i < n; i++) {
+        d1[i] = (i * 3 + 1) % nk;
+        d2[i] = (i * 5 + 2) % (nk + 1);
+        vd[i] = i % 97;
+    }
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k1", 2), k1); ray_release(k1);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k2", 2), k2); ray_release(k2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("v",  1), vv); ray_release(vv);
+    return tbl;
+}
+
 /* ── per-shape group builders (graph-local) ─────────────────────────── */
 static ray_op_t* gb_sum(ray_graph_t* g) {
     ray_op_t* k = ray_scan(g, "k"); ray_op_t* v = ray_scan(g, "v");
@@ -782,6 +840,31 @@ static ray_op_t* gb_sum_count(ray_graph_t* g) {
     uint16_t ops[] = { OP_SUM, OP_COUNT };
     ray_op_t* ins[] = { v, v }; ray_op_t* keys[] = { k };
     return ray_group(g, keys, 1, ops, ins, 2);
+}
+/* ── var/stddev group builders ──────────────────────────────────────── */
+static ray_op_t* gb_stddev(ray_graph_t* g) {
+    ray_op_t* k = ray_scan(g, "k"); ray_op_t* v = ray_scan(g, "v");
+    uint16_t ops[] = { OP_STDDEV }; ray_op_t* ins[] = { v }; ray_op_t* keys[] = { k };
+    return ray_group(g, keys, 1, ops, ins, 1);
+}
+static ray_op_t* gb_var_all(ray_graph_t* g) {
+    ray_op_t* k = ray_scan(g, "k"); ray_op_t* v = ray_scan(g, "v");
+    uint16_t ops[] = { OP_VAR, OP_VAR_POP, OP_STDDEV, OP_STDDEV_POP };
+    ray_op_t* ins[] = { v, v, v, v }; ray_op_t* keys[] = { k };
+    return ray_group(g, keys, 1, ops, ins, 4);
+}
+static ray_op_t* gb_2k_stddev_pop(ray_graph_t* g) {
+    ray_op_t* k1 = ray_scan(g, "k1"); ray_op_t* k2 = ray_scan(g, "k2");
+    ray_op_t* v = ray_scan(g, "v");
+    uint16_t ops[] = { OP_STDDEV_POP }; ray_op_t* ins[] = { v };
+    ray_op_t* keys[] = { k1, k2 };
+    return ray_group(g, keys, 2, ops, ins, 1);
+}
+static ray_op_t* gb_sum_stddev_count(ray_graph_t* g) {
+    ray_op_t* k = ray_scan(g, "k"); ray_op_t* v = ray_scan(g, "v");
+    uint16_t ops[] = { OP_SUM, OP_STDDEV, OP_COUNT };
+    ray_op_t* ins[] = { v, v, v }; ray_op_t* keys[] = { k };
+    return ray_group(g, keys, 1, ops, ins, 3);
 }
 static ray_op_t* gb_nulls(ray_graph_t* g) {
     ray_op_t* k = ray_scan(g, "k"); ray_op_t* v = ray_scan(g, "v");
@@ -842,6 +925,13 @@ DIFF_SHAPE(test_diff_group_i64_four,     diff_make_i64,      gb_four,  1)
 DIFF_SHAPE(test_diff_group_sym_sum,      diff_make_sym_i64,  gb_sum,   1)
 DIFF_SHAPE(test_diff_group_f64_four,     diff_make_i64_f64,  gb_f64_four, 1)
 DIFF_SHAPE(test_diff_group_nulls_minmax, diff_make_i64_nulls, gb_nulls, 1)
+
+/* var/stddev differential shapes (serial small + parallel N=70000) */
+DIFF_SHAPE(test_diff_group_i64_stddev,    diff_make_i64_small,     gb_stddev,           1)
+DIFF_SHAPE(test_diff_group_i64_var_all,   diff_make_i64_small,     gb_var_all,          1)
+DIFF_SHAPE(test_diff_group_f64_stddev,    diff_make_i64_f64_small, gb_stddev,           1)
+DIFF_SHAPE(test_diff_group_2k_stddev_pop, diff_make_2i64_small,    gb_2k_stddev_pop,    2)
+DIFF_SHAPE(test_diff_group_mixed_stddev,  diff_make_i64_small,     gb_sum_stddev_count, 1)
 
 /* multi-key shapes (Phase 1b) */
 DIFF_SHAPE(test_diff_group_2k_sum,    diff_make_2i64,        gb_2k_sum,   2)
@@ -976,6 +1066,11 @@ const test_entry_t agg_engine_entries[] = {
     { "diff_group_sym_sum",          test_diff_group_sym_sum,      NULL, NULL },
     { "diff_group_f64_four",         test_diff_group_f64_four,     NULL, NULL },
     { "diff_group_nulls_minmax",     test_diff_group_nulls_minmax, NULL, NULL },
+    { "diff_group_i64_stddev",       test_diff_group_i64_stddev,    NULL, NULL },
+    { "diff_group_i64_var_all",      test_diff_group_i64_var_all,   NULL, NULL },
+    { "diff_group_f64_stddev",       test_diff_group_f64_stddev,    NULL, NULL },
+    { "diff_group_2k_stddev_pop",    test_diff_group_2k_stddev_pop, NULL, NULL },
+    { "diff_group_mixed_stddev",     test_diff_group_mixed_stddev,  NULL, NULL },
     { "diff_group_2k_sum",           test_diff_group_2k_sum,       NULL, NULL },
     { "diff_group_2k_four",          test_diff_group_2k_four,      NULL, NULL },
     { "diff_group_3k_count",         test_diff_group_3k_count,     NULL, NULL },
