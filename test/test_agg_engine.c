@@ -397,8 +397,9 @@ static int64_t* sort_perm_by_keys(ray_t* tbl, int n_keys) {
     return perm;
 }
 
-/* Compare one column cell ra[ia] vs rb[ib] (same type asserted by caller). */
-static bool cell_equal(ray_t* a, int64_t ia, ray_t* b, int64_t ib) {
+/* Compare one scalar element a[ia] vs b[ib] (same type assumed). F64 → epsilon;
+ * everything else widened to int64. NOT for LIST cells (see list_cell_equal). */
+static bool scalar_elem_equal(ray_t* a, int64_t ia, ray_t* b, int64_t ib) {
     bool na = ray_vec_is_null(a, ia), nb = ray_vec_is_null(b, ib);
     if (na != nb) return false;
     if (na) return true;
@@ -408,6 +409,29 @@ static bool cell_equal(ray_t* a, int64_t ia, ray_t* b, int64_t ib) {
         return fabs(xa - xb) < 1e-12 || (xa != xa && xb != xb);
     }
     return col_read_i64(a, ia) == col_read_i64(b, ib);
+}
+
+/* Compare two LIST cells (each a native-typed vector produced by topk_take_vec:
+ * top=desc, bot=asc).  Element ORDER must match exactly — both engines order
+ * each cell identically — so compare element-by-element in order, NOT as a set.
+ * A NULL slot (empty/absent cell) on one side must be NULL on the other. */
+static bool list_cell_equal(ray_t* ca, ray_t* cb) {
+    if ((ca == NULL) != (cb == NULL)) return false;
+    if (ca == NULL) return true;
+    if (RAY_IS_ERR(ca) || RAY_IS_ERR(cb)) return false;
+    if (ca->type != cb->type) return false;
+    if (ca->len != cb->len) return false;
+    for (int64_t e = 0; e < ca->len; e++)
+        if (!scalar_elem_equal(ca, e, cb, e)) return false;
+    return true;
+}
+
+/* Compare one column cell ra[ia] vs rb[ib] (same type asserted by caller).
+ * For RAY_LIST columns recurse into the per-cell vectors via list_cell_equal. */
+static bool cell_equal(ray_t* a, int64_t ia, ray_t* b, int64_t ib) {
+    if (a->type == RAY_LIST)
+        return list_cell_equal(ray_list_get(a, ia), ray_list_get(b, ib));
+    return scalar_elem_equal(a, ia, b, ib);
 }
 
 /* Compare two grouped result tables as multisets keyed on the COMPOSITE of
@@ -858,6 +882,89 @@ static ray_t* diff_make_pearson_2k(int64_t n, int64_t nk) {
     return tbl;
 }
 
+/* ── top_n / bot_n (LIST-cell) table builders ───────────────────────────
+ * VARIED group sizes: keys are skewed so that with nk small/large some groups
+ * hold FEWER than K rows (→ short LIST cell, no padding) and some hold MANY
+ * more (→ K-length cell).  Value range is wide and signed so top (desc) vs
+ * bot (asc) orderings are non-trivial, and distinct (i*37 % big) so the kept
+ * set + element order are deterministic and the two engines must agree.
+ *
+ * Group-size skew: key = (i % (1 + i % nk)) keeps group 0 huge and higher
+ * groups progressively smaller — but to also produce groups SMALLER than K we
+ * use a triangular assignment: row i → group (i*i) % nk, which gives a very
+ * uneven histogram (some groups get 1-2 rows, others dozens). */
+
+/* single I64 key "k" (skewed sizes) + I64 value "v" (wide, signed, distinct). */
+static ray_t* diff_make_topk_i64(int64_t n, int64_t nk) {
+    ray_t* kvec = ray_vec_new(RAY_I64, n); kvec->len = n;
+    ray_t* vvec = ray_vec_new(RAY_I64, n); vvec->len = n;
+    int64_t* kd = (int64_t*)ray_data(kvec);
+    int64_t* vd = (int64_t*)ray_data(vvec);
+    for (int64_t i = 0; i < n; i++) {
+        kd[i] = ((i * i) + i) % nk;       /* uneven histogram → varied sizes */
+        vd[i] = (i * 37) % 9973 - 4986;   /* wide, signed, distinct-ish */
+    }
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k", 1), kvec); ray_release(kvec);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("v", 1), vvec); ray_release(vvec);
+    return tbl;
+}
+
+/* single I64 key "k" (skewed sizes) + F64 value "v". */
+static ray_t* diff_make_topk_i64_f64(int64_t n, int64_t nk) {
+    ray_t* kvec = ray_vec_new(RAY_I64, n); kvec->len = n;
+    ray_t* vvec = ray_vec_new(RAY_F64, n); vvec->len = n;
+    int64_t* kd = (int64_t*)ray_data(kvec);
+    double*  vd = (double*)ray_data(vvec);
+    for (int64_t i = 0; i < n; i++) {
+        kd[i] = ((i * i) + i) % nk;
+        vd[i] = (double)((i * 37) % 9973) * 0.25 - 1246.5;
+    }
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k", 1), kvec); ray_release(kvec);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("v", 1), vvec); ray_release(vvec);
+    return tbl;
+}
+
+/* single I64 key "k" (skewed sizes) + I64 value "v" GLOBALLY DISTINCT (= i*7+1,
+ * strictly increasing → no ties anywhere).  Used for K > group-size so each cell
+ * is the full sorted group with an UNAMBIGUOUS element order (no tie-break skew
+ * between the old radix path and v2). */
+static ray_t* diff_make_topk_i64_distinctv(int64_t n, int64_t nk) {
+    ray_t* kvec = ray_vec_new(RAY_I64, n); kvec->len = n;
+    ray_t* vvec = ray_vec_new(RAY_I64, n); vvec->len = n;
+    int64_t* kd = (int64_t*)ray_data(kvec);
+    int64_t* vd = (int64_t*)ray_data(vvec);
+    for (int64_t i = 0; i < n; i++) {
+        kd[i] = ((i * i) + i) % nk;       /* uneven histogram → varied sizes */
+        vd[i] = i * 7 + 1;                /* strictly increasing → all distinct */
+    }
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k", 1), kvec); ray_release(kvec);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("v", 1), vvec); ray_release(vvec);
+    return tbl;
+}
+
+/* two I64 keys "k1","k2" (skewed composite sizes) + I64 value "v". */
+static ray_t* diff_make_topk_2i64(int64_t n, int64_t nk) {
+    ray_t* k1 = ray_vec_new(RAY_I64, n); k1->len = n;
+    ray_t* k2 = ray_vec_new(RAY_I64, n); k2->len = n;
+    ray_t* vv = ray_vec_new(RAY_I64, n); vv->len = n;
+    int64_t* d1 = (int64_t*)ray_data(k1);
+    int64_t* d2 = (int64_t*)ray_data(k2);
+    int64_t* vd = (int64_t*)ray_data(vv);
+    for (int64_t i = 0; i < n; i++) {
+        d1[i] = ((i * i) + i) % nk;
+        d2[i] = (i * 5 + 2) % (nk + 1);
+        vd[i] = (i * 37) % 9973 - 4986;
+    }
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k1", 2), k1); ray_release(k1);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k2", 2), k2); ray_release(k2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("v",  1), vv); ray_release(vv);
+    return tbl;
+}
+
 /* ── per-shape group builders (graph-local) ─────────────────────────── */
 static ray_op_t* gb_sum(ray_graph_t* g) {
     ray_op_t* k = ray_scan(g, "k"); ray_op_t* v = ray_scan(g, "v");
@@ -945,6 +1052,48 @@ static ray_op_t* gb_sum_median_count(ray_graph_t* g) {
     uint16_t ops[] = { OP_SUM, OP_MEDIAN, OP_COUNT };
     ray_op_t* ins[] = { v, v, v }; ray_op_t* keys[] = { k };
     return ray_group(g, keys, 1, ops, ins, 3);
+}
+
+/* ── top_n / bot_n group builders (LIST-cell, ACC_BUFFERED) ──────────────
+ * Built via ray_group3 so the OP_GROUP node carries ext->agg_k[a]=K.  The OLD
+ * engine (flag-off) executes OP_TOP_N/OP_BOT_N on this OP_GROUP node via the
+ * LIST-cell path (ray_topk_per_group_buf); v2 (flag-on, gate admits agg_k) via
+ * the ACC_BUFFERED top/bot accumulators.  Both emit one LIST-typed output
+ * column, cells = native-typed vectors ordered top=desc / bot=asc. */
+static ray_op_t* gb_top2(ray_graph_t* g) {
+    ray_op_t* k = ray_scan(g, "k"); ray_op_t* v = ray_scan(g, "v");
+    uint16_t ops[] = { OP_TOP_N }; ray_op_t* ins[] = { v };
+    int64_t  kk[]  = { 2 };        ray_op_t* keys[] = { k };
+    return ray_group3(g, keys, 1, ops, ins, NULL, kk, 1);
+}
+static ray_op_t* gb_bot3(ray_graph_t* g) {
+    ray_op_t* k = ray_scan(g, "k"); ray_op_t* v = ray_scan(g, "v");
+    uint16_t ops[] = { OP_BOT_N }; ray_op_t* ins[] = { v };
+    int64_t  kk[]  = { 3 };        ray_op_t* keys[] = { k };
+    return ray_group3(g, keys, 1, ops, ins, NULL, kk, 1);
+}
+static ray_op_t* gb_2k_top2(ray_graph_t* g) {
+    ray_op_t* k1 = ray_scan(g, "k1"); ray_op_t* k2 = ray_scan(g, "k2");
+    ray_op_t* v = ray_scan(g, "v");
+    uint16_t ops[] = { OP_TOP_N }; ray_op_t* ins[] = { v };
+    int64_t  kk[]  = { 2 };        ray_op_t* keys[] = { k1, k2 };
+    return ray_group3(g, keys, 2, ops, ins, NULL, kk, 1);
+}
+/* K=100 > every group → each cell = the full sorted group (no padding). */
+static ray_op_t* gb_top100(ray_graph_t* g) {
+    ray_op_t* k = ray_scan(g, "k"); ray_op_t* v = ray_scan(g, "v");
+    uint16_t ops[] = { OP_TOP_N }; ray_op_t* ins[] = { v };
+    int64_t  kk[]  = { 100 };      ray_op_t* keys[] = { k };
+    return ray_group3(g, keys, 1, ops, ins, NULL, kk, 1);
+}
+/* heterogeneous: sum + top2 (LIST col) + count, single I64 key. */
+static ray_op_t* gb_sum_top2_count(ray_graph_t* g) {
+    ray_op_t* k = ray_scan(g, "k"); ray_op_t* v = ray_scan(g, "v");
+    uint16_t ops[] = { OP_SUM, OP_TOP_N, OP_COUNT };
+    ray_op_t* ins[] = { v, v, v };
+    int64_t   kk[]  = { 0, 2, 0 };
+    ray_op_t* keys[] = { k };
+    return ray_group3(g, keys, 1, ops, ins, NULL, kk, 3);
 }
 
 /* ── multi-key group builders ───────────────────────────────────────── */
@@ -1049,6 +1198,32 @@ DIFF_SHAPE(test_diff_group_f64_median,   diff_make_i64_f64,   gb_median,   1)
 DIFF_SHAPE(test_diff_group_2k_median,    diff_make_2i64,      gb_2k_median, 2)
 DIFF_SHAPE(test_diff_group_mixed_median, diff_make_i64,       gb_sum_median_count, 1)
 DIFF_SHAPE(test_diff_group_nulls_median, diff_make_i64_nulls, gb_median,   1)
+
+/* ── top_n / bot_n LIST-cell differential shapes (serial small + parallel) ──
+ * Small (N=13, nk=4) exercises the SERIAL buffered top/bot lifecycle and short
+ * cells (groups smaller than K).  N=70000 (≥ RAY_PARALLEL_THRESHOLD) forces the
+ * PARALLEL buffered path that assembles the LIST column from per-worker buffers.
+ * The comparator compares each LIST cell element-by-element IN ORDER. */
+DIFF_SHAPE(test_diff_group_top2,      diff_make_topk_i64,     gb_top2,  1)
+DIFF_SHAPE(test_diff_group_bot3_f64,  diff_make_topk_i64_f64, gb_bot3,  1)
+DIFF_SHAPE(test_diff_group_2k_top2,   diff_make_topk_2i64,    gb_2k_top2, 2)
+DIFF_SHAPE(test_diff_group_mixed_top2, diff_make_topk_i64,    gb_sum_top2_count, 1)
+
+/* K=100 larger than EVERY group → each cell is the full sorted group.
+ * Custom runner: use MANY keys (nk huge) at N=70000 so groups stay < 100
+ * even on the parallel path.  Small table (N=13) trivially has groups < 100. */
+static test_result_t test_diff_group_top100(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    test_result_t r;
+    ray_t* small = diff_make_topk_i64_distinctv(13, 4);
+    r = diff_group(small, gb_top100, 1); ray_release(small);
+    if (r.status != TEST_PASS) { ray_sym_destroy(); ray_heap_destroy(); return r; }
+    /* nk=4000 ⇒ ~17 rows/group average at N=70000, all groups < 100. */
+    ray_t* big = diff_make_topk_i64_distinctv(70000, 4000);
+    r = diff_group(big, gb_top100, 1); ray_release(big);
+    ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
 
 /* multi-key shapes (Phase 1b) */
 DIFF_SHAPE(test_diff_group_2k_sum,    diff_make_2i64,        gb_2k_sum,   2)
@@ -1253,6 +1428,11 @@ const test_entry_t agg_engine_entries[] = {
     { "diff_group_f64_stddev",       test_diff_group_f64_stddev,    NULL, NULL },
     { "diff_group_2k_stddev_pop",    test_diff_group_2k_stddev_pop, NULL, NULL },
     { "diff_group_mixed_stddev",     test_diff_group_mixed_stddev,  NULL, NULL },
+    { "diff_group_top2",             test_diff_group_top2,         NULL, NULL },
+    { "diff_group_bot3_f64",         test_diff_group_bot3_f64,     NULL, NULL },
+    { "diff_group_2k_top2",          test_diff_group_2k_top2,      NULL, NULL },
+    { "diff_group_mixed_top2",       test_diff_group_mixed_top2,   NULL, NULL },
+    { "diff_group_top100",           test_diff_group_top100,       NULL, NULL },
     { "diff_group_2k_sum",           test_diff_group_2k_sum,       NULL, NULL },
     { "diff_group_2k_four",          test_diff_group_2k_four,      NULL, NULL },
     { "diff_group_3k_count",         test_diff_group_3k_count,     NULL, NULL },
