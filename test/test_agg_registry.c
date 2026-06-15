@@ -167,6 +167,63 @@ static test_result_t test_nulls_match_reduction(void) {
     PASS();
 }
 
+/* Run a BINARY vtable accumulator over two columns as a single group (gid 0). */
+static ray_t* run_single_group_bin(const agg_vtable_t* vt, ray_t* x, ray_t* y) {
+    int64_t len = x->len;
+    void* state = calloc(1, vt->state_size);
+    vt->init(state);
+    uint32_t* gids = calloc((size_t)len, sizeof(uint32_t));  /* all zero */
+    ray_valid_t vx = { ray_data(x), x->type, (x->attrs & RAY_ATTR_HAS_NULLS) != 0 };
+    ray_valid_t vy = { ray_data(y), y->type, (y->attrs & RAY_ATTR_HAS_NULLS) != 0 };
+    vt->update_batch2(state, vt->state_size, gids,
+                      ray_data(x), ray_data(y), &vx, &vy, len, NULL);
+    ray_t* out = vt->finalize(state, NULL);
+    free(gids); free(state);
+    return out;
+}
+
+static test_result_t test_pearson_signed_r(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    const agg_vtable_t* vt = agg_resolve(OP_PEARSON_CORR, RAY_F64);
+    TEST_ASSERT_NOT_NULL(vt);
+
+    /* Perfect positive correlation → r = 1.0. */
+    {
+        double xs[] = { 1, 2, 3, 4 }, ys[] = { 2, 4, 6, 8 };
+        ray_t* x = vec_f64(xs, 4); ray_t* y = vec_f64(ys, 4);
+        ray_t* got = run_single_group_bin(vt, x, y);
+        TEST_ASSERT_NOT_NULL(got);
+        TEST_ASSERT_EQ_F(got->f64, 1.0, 1e-6);
+        ray_release(got); ray_release(x); ray_release(y);
+    }
+    /* Perfect anti-correlation → r = -1.0 (confirms SIGNED r, not r²). */
+    {
+        double xs[] = { 1, 2, 3, 4 }, ys[] = { 4, 3, 2, 1 };
+        ray_t* x = vec_f64(xs, 4); ray_t* y = vec_f64(ys, 4);
+        ray_t* got = run_single_group_bin(vt, x, y);
+        TEST_ASSERT_NOT_NULL(got);
+        TEST_ASSERT_EQ_F(got->f64, -1.0, 1e-6);
+        ray_release(got); ray_release(x); ray_release(y);
+    }
+    /* Mixed: x={1,2,3,4,5}, y={2,1,4,3,5}.
+     * sx=15,sy=15,sxx=55,syy=55,sxy=2+2+12+12+25=53,n=5.
+     * num=5*53-225=40, dx=5*55-225=50, dy=50, r=40/sqrt(2500)=40/50=0.8. */
+    {
+        double xs[] = { 1, 2, 3, 4, 5 }, ys[] = { 2, 1, 4, 3, 5 };
+        ray_t* x = vec_f64(xs, 5); ray_t* y = vec_f64(ys, 5);
+        ray_t* got = run_single_group_bin(vt, x, y);
+        TEST_ASSERT_NOT_NULL(got);
+        TEST_ASSERT_EQ_F(got->f64, 0.8, 1e-6);
+        ray_release(got); ray_release(x); ray_release(y);
+    }
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 static test_result_t test_variance_matches_oracle(void) {
     ray_heap_init();
     (void)ray_sym_init();
@@ -220,5 +277,6 @@ const test_entry_t agg_registry_entries[] = {
     { "agg_registry/f64_match", test_f64_match, NULL, NULL },
     { "agg_registry/nulls_match_reduction", test_nulls_match_reduction, NULL, NULL },
     { "agg_registry/variance_matches_oracle", test_variance_matches_oracle, NULL, NULL },
+    { "agg_registry/pearson_signed_r", test_pearson_signed_r, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
