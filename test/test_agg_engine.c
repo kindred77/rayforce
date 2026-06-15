@@ -806,6 +806,58 @@ static ray_t* diff_make_2i64_small(int64_t n, int64_t nk) {
     return tbl;
 }
 
+/* ── pearson (binary-agg) table builders ────────────────────────────────
+ * Pearson needs TWO F64 value columns x,y.  The OP_GROUP node is built via
+ * ray_group2 (the public builder that populates ext->agg_ins2[a] = y).  Both
+ * engines read ext->agg_ins2 for the y-side, so the SAME built node executes
+ * pearson under flag-off (old engine) and flag-on (v2).  Data: x,y vary at
+ * different rates so per-group correlation is well-defined and varied; each
+ * group spans ≥2 rows with non-constant x and y ⇒ dx,dy≠0 ⇒ finite r. */
+
+/* single I64 key "k" + F64 "x" + F64 "y". */
+static ray_t* diff_make_pearson_1k(int64_t n, int64_t nk) {
+    ray_t* kvec = ray_vec_new(RAY_I64, n); kvec->len = n;
+    ray_t* xvec = ray_vec_new(RAY_F64, n); xvec->len = n;
+    ray_t* yvec = ray_vec_new(RAY_F64, n); yvec->len = n;
+    int64_t* kd = (int64_t*)ray_data(kvec);
+    double*  xd = (double*)ray_data(xvec);
+    double*  yd = (double*)ray_data(yvec);
+    for (int64_t i = 0; i < n; i++) {
+        kd[i] = (i * 3 + 1) % nk;
+        xd[i] = (double)((i % 89) * 1.0);
+        yd[i] = (double)(((i * 7) % 83) * 1.0);
+    }
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k", 1), kvec); ray_release(kvec);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("x", 1), xvec); ray_release(xvec);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("y", 1), yvec); ray_release(yvec);
+    return tbl;
+}
+
+/* two I64 keys "k1","k2" + F64 "x" + F64 "y". */
+static ray_t* diff_make_pearson_2k(int64_t n, int64_t nk) {
+    ray_t* k1 = ray_vec_new(RAY_I64, n); k1->len = n;
+    ray_t* k2 = ray_vec_new(RAY_I64, n); k2->len = n;
+    ray_t* xvec = ray_vec_new(RAY_F64, n); xvec->len = n;
+    ray_t* yvec = ray_vec_new(RAY_F64, n); yvec->len = n;
+    int64_t* d1 = (int64_t*)ray_data(k1);
+    int64_t* d2 = (int64_t*)ray_data(k2);
+    double*  xd = (double*)ray_data(xvec);
+    double*  yd = (double*)ray_data(yvec);
+    for (int64_t i = 0; i < n; i++) {
+        d1[i] = (i * 3 + 1) % nk;
+        d2[i] = (i * 5 + 2) % (nk + 1);
+        xd[i] = (double)((i % 89) * 1.0);
+        yd[i] = (double)(((i * 7) % 83) * 1.0);
+    }
+    ray_t* tbl = ray_table_new(4);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k1", 2), k1); ray_release(k1);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k2", 2), k2); ray_release(k2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("x", 1), xvec); ray_release(xvec);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("y", 1), yvec); ray_release(yvec);
+    return tbl;
+}
+
 /* ── per-shape group builders (graph-local) ─────────────────────────── */
 static ray_op_t* gb_sum(ray_graph_t* g) {
     ray_op_t* k = ray_scan(g, "k"); ray_op_t* v = ray_scan(g, "v");
@@ -901,6 +953,36 @@ static ray_op_t* gb_2k_avg(ray_graph_t* g) {
     uint16_t ops[] = { OP_AVG }; ray_op_t* ins[] = { v };
     ray_op_t* keys[] = { k1, k2 };
     return ray_group(g, keys, 2, ops, ins, 1);
+}
+
+/* ── pearson (binary-agg) group builders: use ray_group2 to set agg_ins2 ── */
+static ray_op_t* gb_pearson_1k(ray_graph_t* g) {
+    ray_op_t* k = ray_scan(g, "k");
+    ray_op_t* x = ray_scan(g, "x"); ray_op_t* y = ray_scan(g, "y");
+    uint16_t  ops[]  = { OP_PEARSON_CORR };
+    ray_op_t* ins[]  = { x };
+    ray_op_t* ins2[] = { y };
+    ray_op_t* keys[] = { k };
+    return ray_group2(g, keys, 1, ops, ins, ins2, 1);
+}
+static ray_op_t* gb_pearson_2k(ray_graph_t* g) {
+    ray_op_t* k1 = ray_scan(g, "k1"); ray_op_t* k2 = ray_scan(g, "k2");
+    ray_op_t* x = ray_scan(g, "x"); ray_op_t* y = ray_scan(g, "y");
+    uint16_t  ops[]  = { OP_PEARSON_CORR };
+    ray_op_t* ins[]  = { x };
+    ray_op_t* ins2[] = { y };
+    ray_op_t* keys[] = { k1, k2 };
+    return ray_group2(g, keys, 2, ops, ins, ins2, 1);
+}
+/* heterogeneous: sum(x) + pearson(x,y) + count over single I64 key. */
+static ray_op_t* gb_sum_pearson_count(ray_graph_t* g) {
+    ray_op_t* k = ray_scan(g, "k");
+    ray_op_t* x = ray_scan(g, "x"); ray_op_t* y = ray_scan(g, "y");
+    uint16_t  ops[]  = { OP_SUM, OP_PEARSON_CORR, OP_COUNT };
+    ray_op_t* ins[]  = { x, x, x };
+    ray_op_t* ins2[] = { NULL, y, NULL };
+    ray_op_t* keys[] = { k };
+    return ray_group2(g, keys, 1, ops, ins, ins2, 3);
 }
 
 /* ── runner: each shape over a small AND a large (N=70000) table ────── */
@@ -1058,7 +1140,67 @@ static test_result_t test_diff_group_determinism_workers(void) {
     return res;
 }
 
+/* ══════════════════════════════════════════════════════════════════════
+ * PEARSON r-vs-r² DISCOVERY + v2/old differential.
+ *
+ * DISCOVERY: build a single perfectly anti-correlated group — key all same,
+ * x={1,2,3,4}, y={4,3,2,1} — and run it flag-OFF (old engine).  Signed r = -1
+ * for this data; r² = +1.  Inspect the single result value to settle which
+ * the old engine emits, so v2 (signed r) can be confirmed/adjusted to match.
+ * ══════════════════════════════════════════════════════════════════════ */
+static test_result_t test_pearson_old_engine_r_vs_r2(void) {
+    ray_heap_init(); (void)ray_sym_init();
+
+    const int64_t n = 4;
+    ray_t* kvec = ray_vec_new(RAY_I64, n); kvec->len = n;
+    ray_t* xvec = ray_vec_new(RAY_F64, n); xvec->len = n;
+    ray_t* yvec = ray_vec_new(RAY_F64, n); yvec->len = n;
+    int64_t* kd = (int64_t*)ray_data(kvec);
+    double*  xd = (double*)ray_data(xvec);
+    double*  yd = (double*)ray_data(yvec);
+    const double xs[] = { 1, 2, 3, 4 };
+    const double ys[] = { 4, 3, 2, 1 };
+    for (int64_t i = 0; i < n; i++) { kd[i] = 7; xd[i] = xs[i]; yd[i] = ys[i]; }
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k", 1), kvec); ray_release(kvec);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("x", 1), xvec); ray_release(xvec);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("y", 1), yvec); ray_release(yvec);
+
+    /* Flag OFF → old engine. */
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_t* out = ray_execute(g, gb_pearson_1k(g));
+    if (ray_is_lazy(out)) out = ray_lazy_materialize(out);
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+    TEST_ASSERT_EQ_I((1), ((int)ray_table_nrows(out)));
+    /* result layout {k, pearson}; agg col is last. */
+    ray_t* rc = ray_table_get_col_idx(out, ray_table_ncols(out) - 1);
+    TEST_ASSERT_EQ_I((RAY_F64), (rc->type));
+    double r = ((double*)ray_data(rc))[0];
+    /* Anti-correlated: signed r → ≈ -1.0; r² → ≈ +1.0. */
+    TEST_ASSERT_FMT(fabs(r - (-1.0)) < 1e-9,
+                    "old engine pearson = %.15g (expected signed r = -1.0; "
+                    "if ~+1.0 it produces r^2)", r);
+
+    ray_release(out);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* Shape 1: single I64 key, pearson(x,y).  small + N=70000 (parallel). */
+DIFF_SHAPE(test_diff_group_pearson_1k, diff_make_pearson_1k, gb_pearson_1k, 1)
+/* Shape 2: two I64 keys, pearson(x,y). */
+DIFF_SHAPE(test_diff_group_pearson_2k, diff_make_pearson_2k, gb_pearson_2k, 2)
+/* Shape 3: heterogeneous sum(x)+pearson(x,y)+count over single I64 key. */
+DIFF_SHAPE(test_diff_group_pearson_mixed, diff_make_pearson_1k, gb_sum_pearson_count, 1)
+
 const test_entry_t agg_engine_entries[] = {
+    { "pearson_old_engine_r_vs_r2",  test_pearson_old_engine_r_vs_r2, NULL, NULL },
+    { "diff_group_pearson_1k",       test_diff_group_pearson_1k,    NULL, NULL },
+    { "diff_group_pearson_2k",       test_diff_group_pearson_2k,    NULL, NULL },
+    { "diff_group_pearson_mixed",    test_diff_group_pearson_mixed, NULL, NULL },
     { "diff_group_i64_sum",          test_diff_group_i64_sum,      NULL, NULL },
     { "diff_group_i64_count",        test_diff_group_i64_count,    NULL, NULL },
     { "diff_group_i64_minmax",       test_diff_group_i64_minmax,   NULL, NULL },
