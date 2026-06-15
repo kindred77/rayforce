@@ -17,6 +17,7 @@
 #include "ops/internal.h"
 #include "ops/agg_engine.h"
 #include "table/sym.h"
+#include <stdlib.h>
 #include <string.h>
 
 /* Build a single-column table with the given type, name, n rows = 8. */
@@ -164,10 +165,82 @@ static test_result_t test_gate_admits_count(void) {
     PASS();
 }
 
+/* Direct unit test for agg_group_keys_i: single I64 key, first-occurrence
+ * dense gid assignment. Key column {5,3,5,3,5,7} → gids {0,1,0,1,0,2},
+ * keys {5,3,7}, ngroups 3. */
+static test_result_t test_group_keys_i_first_occurrence(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    const int64_t src[] = { 5, 3, 5, 3, 5, 7 };
+    const int64_t n = (int64_t)(sizeof(src) / sizeof(src[0]));
+    ray_t* col = ray_vec_new(RAY_I64, n);
+    TEST_ASSERT_NOT_NULL(col);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(col));
+    col->len = n;
+    memcpy(ray_data(col), src, sizeof(src));
+
+    agg_groups_t out;
+    TEST_ASSERT_EQ_I((0), (agg_group_keys_i(col, &out)));
+
+    TEST_ASSERT_EQ_I((3), (out.ngroups));
+    TEST_ASSERT_EQ_I((5), (out.keys[0]));
+    TEST_ASSERT_EQ_I((3), (out.keys[1]));
+    TEST_ASSERT_EQ_I((7), (out.keys[2]));
+
+    const uint32_t expect[] = { 0, 1, 0, 1, 0, 2 };
+    for (int64_t i = 0; i < n; i++) {
+        TEST_ASSERT_EQ_I(((int)expect[i]), ((int)out.gids[i]));
+    }
+
+    free(out.gids);
+    free(out.keys);
+    ray_release(col);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* Direct unit test exercising the narrow-width path: I32 key column. */
+static test_result_t test_group_keys_i_i32(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    const int32_t src[] = { 100, 200, 100, 300, 200, 100 };
+    const int64_t n = (int64_t)(sizeof(src) / sizeof(src[0]));
+    ray_t* col = ray_vec_new(RAY_I32, n);
+    TEST_ASSERT_NOT_NULL(col);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(col));
+    col->len = n;
+    memcpy(ray_data(col), src, sizeof(src));
+
+    agg_groups_t out;
+    TEST_ASSERT_EQ_I((0), (agg_group_keys_i(col, &out)));
+
+    TEST_ASSERT_EQ_I((3), (out.ngroups));
+    TEST_ASSERT_EQ_I((100), (out.keys[0]));
+    TEST_ASSERT_EQ_I((200), (out.keys[1]));
+    TEST_ASSERT_EQ_I((300), (out.keys[2]));
+
+    const uint32_t expect[] = { 0, 1, 0, 2, 1, 0 };
+    for (int64_t i = 0; i < n; i++) {
+        TEST_ASSERT_EQ_I(((int)expect[i]), ((int)out.gids[i]));
+    }
+
+    free(out.gids);
+    free(out.keys);
+    ray_release(col);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t agg_engine_entries[] = {
     { "gate_admits_i64_key_sum_i64", test_gate_admits_i64_key_sum_i64, NULL, NULL },
     { "gate_defers_two_keys",        test_gate_defers_two_keys,        NULL, NULL },
     { "gate_defers_sum_i32",         test_gate_defers_sum_i32,         NULL, NULL },
     { "gate_admits_count",           test_gate_admits_count,           NULL, NULL },
+    { "group_keys_i_first_occurrence", test_group_keys_i_first_occurrence, NULL, NULL },
+    { "group_keys_i_i32",            test_group_keys_i_i32,            NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
