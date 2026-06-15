@@ -5,6 +5,7 @@
 #include "ops/agg_registry.h"
 #include "ops/ops.h"
 #include "lang/eval.h"
+#include "lang/internal.h"  /* topk_take_vec — top_n/bot_n differential oracle */
 #include "mem/heap.h"
 #include "table/sym.h"
 #include <string.h>
@@ -325,6 +326,108 @@ static test_result_t test_median(void) {
     PASS();
 }
 
+/* Run a vtable accumulator over a vector as a single group (gid 0), passing K
+ * to finalize.  For LIST-returning buffered accumulators (top_n/bot_n). */
+static ray_t* run_single_group_k(const agg_vtable_t* vt, ray_t* col, int64_t k) {
+    void* state = calloc(1, vt->state_size);
+    vt->init(state);
+    uint32_t* gids = calloc((size_t)col->len, sizeof(uint32_t));  /* all zero */
+    ray_valid_t valid = { ray_data(col), col->type,
+                          (col->attrs & RAY_ATTR_HAS_NULLS) != 0 };
+    vt->update_batch(state, vt->state_size, gids, ray_data(col), &valid, col->len, NULL);
+    ray_t* out = vt->finalize(state, NULL, k);
+    if (vt->destroy) vt->destroy(state);  /* buffered accumulators own heap state */
+    free(gids); free(state);
+    return out;
+}
+
+static test_result_t test_topn_botn_i64(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t xs[] = { 30, 10, 20, 40 };
+    ray_t* col = vec_i64(xs, 4);
+    TEST_ASSERT_NOT_NULL(col);
+
+    struct { uint16_t op; uint8_t desc; int64_t k; int64_t expect_len; } cases[] = {
+        { OP_TOP_N, 1, 2,  2 },   /* [40 30] */
+        { OP_BOT_N, 0, 2,  2 },   /* [10 20] */
+        { OP_TOP_N, 1, 10, 4 },   /* K>len → [40 30 20 10] */
+    };
+    for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
+        const agg_vtable_t* vt = agg_resolve(cases[c].op, RAY_I64);
+        TEST_ASSERT_NOT_NULL(vt);
+        TEST_ASSERT_EQ_I(vt->out_type, RAY_LIST);
+        ray_t* got = run_single_group_k(vt, col, cases[c].k);
+        TEST_ASSERT_NOT_NULL(got);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(got));
+        TEST_ASSERT_EQ_I(got->type, RAY_I64);
+        TEST_ASSERT_EQ_I(got->len, cases[c].expect_len);
+        /* Differential vs topk_take_vec on a fresh copy. The K>=len path returns
+         * a LAZY handle over `copy`; materialize consumes it (releasing copy), so
+         * we don't release copy separately in that case. */
+        ray_t* copy = vec_i64(xs, 4);
+        ray_t* want = topk_take_vec(copy, cases[c].k, cases[c].desc);
+        TEST_ASSERT_NOT_NULL(want);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(want));
+        bool want_was_lazy = ray_is_lazy(want);
+        if (want_was_lazy) want = ray_lazy_materialize(want);
+        TEST_ASSERT_EQ_I(got->len, want->len);
+        const int64_t* g = ray_data(got);
+        const int64_t* w = ray_data(want);
+        for (int64_t i = 0; i < got->len; i++)
+            TEST_ASSERT_EQ_I(g[i], w[i]);
+        ray_release(got); ray_release(want);
+        if (!want_was_lazy) ray_release(copy);
+    }
+    ray_release(col);
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+static test_result_t test_topn_botn_f64(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    double fs[] = { 3.5, 1.5, 2.5, 4.5 };
+    ray_t* col = vec_f64(fs, 4);
+    TEST_ASSERT_NOT_NULL(col);
+
+    /* TOP_N K=2 → [4.5 3.5] ; BOT_N K=2 → [1.5 2.5]. */
+    struct { uint16_t op; uint8_t desc; int64_t k; } cases[] = {
+        { OP_TOP_N, 1, 2 }, { OP_BOT_N, 0, 2 },
+    };
+    for (size_t c = 0; c < 2; c++) {
+        const agg_vtable_t* vt = agg_resolve(cases[c].op, RAY_F64);
+        TEST_ASSERT_NOT_NULL(vt);
+        TEST_ASSERT_EQ_I(vt->out_type, RAY_LIST);
+        ray_t* got = run_single_group_k(vt, col, cases[c].k);
+        TEST_ASSERT_NOT_NULL(got);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(got));
+        TEST_ASSERT_EQ_I(got->type, RAY_F64);
+        TEST_ASSERT_EQ_I(got->len, 2);
+        ray_t* copy = vec_f64(fs, 4);
+        ray_t* want = topk_take_vec(copy, cases[c].k, cases[c].desc);
+        TEST_ASSERT_NOT_NULL(want);
+        bool want_was_lazy = ray_is_lazy(want);
+        if (want_was_lazy) want = ray_lazy_materialize(want);
+        TEST_ASSERT_EQ_I(got->len, want->len);
+        const double* g = ray_data(got);
+        const double* w = ray_data(want);
+        for (int64_t i = 0; i < got->len; i++)
+            TEST_ASSERT_EQ_F(g[i], w[i], 1e-12);
+        ray_release(got); ray_release(want);
+        if (!want_was_lazy) ray_release(copy);
+    }
+    ray_release(col);
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t agg_registry_entries[] = {
     { "agg_registry/sum_i64_matches_reduction", test_sum_i64_matches_reduction, NULL, NULL },
     { "agg_registry/minmax_count_i64_match", test_minmax_count_i64_match, NULL, NULL },
@@ -333,5 +436,7 @@ const test_entry_t agg_registry_entries[] = {
     { "agg_registry/variance_matches_oracle", test_variance_matches_oracle, NULL, NULL },
     { "agg_registry/pearson_signed_r", test_pearson_signed_r, NULL, NULL },
     { "agg_registry/median", test_median, NULL, NULL },
+    { "agg_registry/topn_botn_i64", test_topn_botn_i64, NULL, NULL },
+    { "agg_registry/topn_botn_f64", test_topn_botn_f64, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
