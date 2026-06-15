@@ -925,6 +925,28 @@ static ray_op_t* gb_nulls(ray_graph_t* g) {
     return ray_group(g, keys, 1, ops, ins, 3);
 }
 
+/* ── median group builders (ACC_BUFFERED) ───────────────────────────── */
+static ray_op_t* gb_median(ray_graph_t* g) {
+    ray_op_t* k = ray_scan(g, "k"); ray_op_t* v = ray_scan(g, "v");
+    uint16_t ops[] = { OP_MEDIAN }; ray_op_t* ins[] = { v }; ray_op_t* keys[] = { k };
+    return ray_group(g, keys, 1, ops, ins, 1);
+}
+static ray_op_t* gb_2k_median(ray_graph_t* g) {
+    ray_op_t* k1 = ray_scan(g, "k1"); ray_op_t* k2 = ray_scan(g, "k2");
+    ray_op_t* v = ray_scan(g, "v");
+    uint16_t ops[] = { OP_MEDIAN }; ray_op_t* ins[] = { v };
+    ray_op_t* keys[] = { k1, k2 };
+    return ray_group(g, keys, 2, ops, ins, 1);
+}
+/* heterogeneous: streaming sum + buffered median + streaming count over 1 I64 key
+ * (puts a BUFFERED agg alongside streaming ones in the same AoS block). */
+static ray_op_t* gb_sum_median_count(ray_graph_t* g) {
+    ray_op_t* k = ray_scan(g, "k"); ray_op_t* v = ray_scan(g, "v");
+    uint16_t ops[] = { OP_SUM, OP_MEDIAN, OP_COUNT };
+    ray_op_t* ins[] = { v, v, v }; ray_op_t* keys[] = { k };
+    return ray_group(g, keys, 1, ops, ins, 3);
+}
+
 /* ── multi-key group builders ───────────────────────────────────────── */
 static ray_op_t* gb_2k_sum(ray_graph_t* g) {
     ray_op_t* k1 = ray_scan(g, "k1"); ray_op_t* k2 = ray_scan(g, "k2");
@@ -1014,6 +1036,19 @@ DIFF_SHAPE(test_diff_group_i64_var_all,   diff_make_i64_small,     gb_var_all,  
 DIFF_SHAPE(test_diff_group_f64_stddev,    diff_make_i64_f64_small, gb_stddev,           1)
 DIFF_SHAPE(test_diff_group_2k_stddev_pop, diff_make_2i64_small,    gb_2k_stddev_pop,    2)
 DIFF_SHAPE(test_diff_group_mixed_stddev,  diff_make_i64_small,     gb_sum_stddev_count, 1)
+
+/* ── median differential shapes (serial small + parallel N=70000) ──────
+ * ACC_BUFFERED median: small table exercises the SERIAL buffered lifecycle
+ * (init → update → finalize → destroy); N=70000 (≥ RAY_PARALLEL_THRESHOLD)
+ * forces the PARALLEL path (per-worker local buffers → merge/concatenate →
+ * global finalize → destroy). The data builders give VARIED group sizes —
+ * both EVEN and ODD counts — so even-count median = mean of two middles is
+ * exercised. v2 MEDIAN out_type is F64 (matches scalar ray_med_fn). */
+DIFF_SHAPE(test_diff_group_i64_median,   diff_make_i64,       gb_median,   1)
+DIFF_SHAPE(test_diff_group_f64_median,   diff_make_i64_f64,   gb_median,   1)
+DIFF_SHAPE(test_diff_group_2k_median,    diff_make_2i64,      gb_2k_median, 2)
+DIFF_SHAPE(test_diff_group_mixed_median, diff_make_i64,       gb_sum_median_count, 1)
+DIFF_SHAPE(test_diff_group_nulls_median, diff_make_i64_nulls, gb_median,   1)
 
 /* multi-key shapes (Phase 1b) */
 DIFF_SHAPE(test_diff_group_2k_sum,    diff_make_2i64,        gb_2k_sum,   2)
@@ -1208,6 +1243,11 @@ const test_entry_t agg_engine_entries[] = {
     { "diff_group_sym_sum",          test_diff_group_sym_sum,      NULL, NULL },
     { "diff_group_f64_four",         test_diff_group_f64_four,     NULL, NULL },
     { "diff_group_nulls_minmax",     test_diff_group_nulls_minmax, NULL, NULL },
+    { "diff_group_i64_median",       test_diff_group_i64_median,    NULL, NULL },
+    { "diff_group_f64_median",       test_diff_group_f64_median,    NULL, NULL },
+    { "diff_group_2k_median",        test_diff_group_2k_median,     NULL, NULL },
+    { "diff_group_mixed_median",     test_diff_group_mixed_median,  NULL, NULL },
+    { "diff_group_nulls_median",     test_diff_group_nulls_median,  NULL, NULL },
     { "diff_group_i64_stddev",       test_diff_group_i64_stddev,    NULL, NULL },
     { "diff_group_i64_var_all",      test_diff_group_i64_var_all,   NULL, NULL },
     { "diff_group_f64_stddev",       test_diff_group_f64_stddev,    NULL, NULL },
