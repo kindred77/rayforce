@@ -362,21 +362,32 @@ static int64_t col_read_i64(ray_t* c, int64_t i) {
     return v;
 }
 
-/* Build a row permutation that sorts `tbl` ascending by key column 0
- * (int-coded), stable by original index. Caller frees. */
-static int64_t* sort_perm_by_key0(ray_t* tbl) {
+/* Composite less-than over key columns 0..n_keys-1 of `tbl`: compare column 0,
+ * on tie column 1, etc.; final tie broken by original index for stability.
+ * Nulls (sentinel-coded) sort by their int-coded value, which is deterministic
+ * and identical in both engines, so they canonicalize consistently. */
+static bool row_lt_composite(ray_t* tbl, int n_keys, int64_t pa, int64_t pb) {
+    for (int c = 0; c < n_keys; c++) {
+        ray_t* key = ray_table_get_col_idx(tbl, c);
+        int64_t ka = col_read_i64(key, pa);
+        int64_t kb = col_read_i64(key, pb);
+        if (ka < kb) return true;
+        if (ka > kb) return false;
+    }
+    return pa < pb;  /* stable tie-break */
+}
+
+/* Build a row permutation that sorts `tbl` ascending by the COMPOSITE of key
+ * columns 0..n_keys-1 (int-coded), stable by original index. Caller frees. */
+static int64_t* sort_perm_by_keys(ray_t* tbl, int n_keys) {
     int64_t n = ray_table_nrows(tbl);
-    ray_t* key = ray_table_get_col_idx(tbl, 0);
     int64_t* perm = malloc((size_t)(n > 0 ? n : 1) * sizeof(int64_t));
     for (int64_t i = 0; i < n; i++) perm[i] = i;
     /* insertion sort — n = ngroups is small for our shapes; stable */
     for (int64_t i = 1; i < n; i++) {
         int64_t p = perm[i];
-        int64_t kp = col_read_i64(key, p);
         int64_t j = i - 1;
-        while (j >= 0) {
-            int64_t kj = col_read_i64(key, perm[j]);
-            if (kj < kp || (kj == kp && perm[j] < p)) break;
+        while (j >= 0 && row_lt_composite(tbl, n_keys, p, perm[j])) {
             perm[j + 1] = perm[j];
             j--;
         }
@@ -398,8 +409,11 @@ static bool cell_equal(ray_t* a, int64_t ia, ray_t* b, int64_t ib) {
     return col_read_i64(a, ia) == col_read_i64(b, ib);
 }
 
-/* Compare two grouped result tables as multisets keyed on column 0. */
-static test_result_t table_expect_equal(ray_t* a, ray_t* b) {
+/* Compare two grouped result tables as multisets keyed on the COMPOSITE of
+ * key columns 0..n_keys-1.  The result layout is {key cols [0..n_keys-1],
+ * agg cols [n_keys..]}; the composite row-permutation preserves the
+ * key<->aggregate association by applying the SAME permutation to all columns. */
+static test_result_t table_expect_equal(ray_t* a, ray_t* b, int n_keys) {
     TEST_ASSERT(a && b && !RAY_IS_ERR(a) && !RAY_IS_ERR(b), "valid tables");
     int64_t nca = ray_table_ncols(a), ncb = ray_table_ncols(b);
     TEST_ASSERT_FMT(nca == ncb, "ncols %lld != %lld",
@@ -415,8 +429,8 @@ static test_result_t table_expect_equal(ray_t* a, ray_t* b) {
         TEST_ASSERT_FMT(ca->type == cb->type, "col %lld type %d != %d",
                         (long long)c, ca->type, cb->type);
     }
-    int64_t* pa = sort_perm_by_key0(a);
-    int64_t* pb = sort_perm_by_key0(b);
+    int64_t* pa = sort_perm_by_keys(a, n_keys);
+    int64_t* pb = sort_perm_by_keys(b, n_keys);
     test_result_t res = (test_result_t){ TEST_PASS, NULL };
     for (int64_t r = 0; r < nra && res.status == TEST_PASS; r++) {
         for (int64_t c = 0; c < nca; c++) {
@@ -435,8 +449,9 @@ static test_result_t table_expect_equal(ray_t* a, ray_t* b) {
 
 typedef ray_op_t* (*group_builder_t)(ray_graph_t* g);
 
-/* Execute build() with the v2 flag OFF then ON; compare results. */
-static test_result_t diff_group(ray_t* tbl, group_builder_t build) {
+/* Execute build() with the v2 flag OFF then ON; compare results as multisets
+ * over the first `n_keys` key columns. */
+static test_result_t diff_group(ray_t* tbl, group_builder_t build, int n_keys) {
     ray_graph_t* g1 = ray_graph_new(tbl);
     ray_t* old_r = ray_execute(g1, build(g1));
     if (ray_is_lazy(old_r)) old_r = ray_lazy_materialize(old_r);
@@ -447,7 +462,7 @@ static test_result_t diff_group(ray_t* tbl, group_builder_t build) {
     if (ray_is_lazy(new_r)) new_r = ray_lazy_materialize(new_r);
     ray_agg_engine_v2 = false;
 
-    test_result_t res = table_expect_equal(old_r, new_r);
+    test_result_t res = table_expect_equal(old_r, new_r, n_keys);
     ray_release(old_r); ray_release(new_r);
     ray_graph_free(g1); ray_graph_free(g2);
     return res;
@@ -527,6 +542,125 @@ static ray_t* diff_make_i64_nulls(int64_t n, int64_t nk) {
     return tbl;
 }
 
+/* ── multi-key table builders ───────────────────────────────────────── */
+
+/* Two I64 keys "k1","k2" + I64 value "v".  Keys vary at different rates so
+ * many (k1,k2) tuples exist and some tuples share k1 (composite-sort coverage). */
+static ray_t* diff_make_2i64(int64_t n, int64_t nk) {
+    ray_t* k1 = ray_vec_new(RAY_I64, n); k1->len = n;
+    ray_t* k2 = ray_vec_new(RAY_I64, n); k2->len = n;
+    ray_t* vv = ray_vec_new(RAY_I64, n); vv->len = n;
+    int64_t* d1 = (int64_t*)ray_data(k1);
+    int64_t* d2 = (int64_t*)ray_data(k2);
+    int64_t* vd = (int64_t*)ray_data(vv);
+    for (int64_t i = 0; i < n; i++) {
+        d1[i] = (i * 3 + 1) % nk;
+        d2[i] = (i * 5 + 2) % (nk + 1);
+        vd[i] = (i * 7) % 101 - 50;
+    }
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k1", 2), k1); ray_release(k1);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k2", 2), k2); ray_release(k2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("v",  1), vv); ray_release(vv);
+    return tbl;
+}
+
+/* Two I64 keys + F64 value "v" (for AVG/SUM parity). */
+static ray_t* diff_make_2i64_f64(int64_t n, int64_t nk) {
+    ray_t* k1 = ray_vec_new(RAY_I64, n); k1->len = n;
+    ray_t* k2 = ray_vec_new(RAY_I64, n); k2->len = n;
+    ray_t* vv = ray_vec_new(RAY_F64, n); vv->len = n;
+    int64_t* d1 = (int64_t*)ray_data(k1);
+    int64_t* d2 = (int64_t*)ray_data(k2);
+    double*  vd = (double*)ray_data(vv);
+    for (int64_t i = 0; i < n; i++) {
+        d1[i] = (i * 3 + 1) % nk;
+        d2[i] = (i * 5 + 2) % (nk + 1);
+        vd[i] = (double)((i * 7) % 101) * 0.5 - 12.25;
+    }
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k1", 2), k1); ray_release(k1);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k2", 2), k2); ray_release(k2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("v",  1), vv); ray_release(vv);
+    return tbl;
+}
+
+/* Three keys: I64 "k1", I32 "k2", SYM "k3" + I64 value "v". */
+static ray_t* diff_make_3keys(int64_t n, int64_t nk) {
+    ray_t* k1 = ray_vec_new(RAY_I64, n); k1->len = n;
+    ray_t* k2 = ray_vec_new(RAY_I32, n); k2->len = n;
+    ray_t* k3 = ray_sym_vec_new(RAY_SYM_W64, n); k3->len = n;
+    ray_t* vv = ray_vec_new(RAY_I64, n); vv->len = n;
+    int64_t* d1 = (int64_t*)ray_data(k1);
+    int32_t* d2 = (int32_t*)ray_data(k2);
+    int64_t* vd = (int64_t*)ray_data(vv);
+    int64_t gid[64];
+    for (int64_t j = 0; j < nk; j++) {
+        char b[16]; int m = snprintf(b, sizeof(b), "g%lld", (long long)j);
+        gid[j] = ray_sym_intern(b, (size_t)m);
+    }
+    for (int64_t i = 0; i < n; i++) {
+        d1[i] = (i * 3 + 1) % nk;
+        d2[i] = (int32_t)((i * 5 + 2) % (nk + 1));
+        int64_t j = (i * 2 + 1) % nk;
+        ray_write_sym(ray_data(k3), i, (uint64_t)gid[j], RAY_SYM, k3->attrs);
+        vd[i] = (i * 7) % 101 - 50;
+    }
+    ray_t* tbl = ray_table_new(4);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k1", 2), k1); ray_release(k1);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k2", 2), k2); ray_release(k2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k3", 2), k3); ray_release(k3);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("v",  1), vv); ray_release(vv);
+    return tbl;
+}
+
+/* SYM key "k1" + I64 key "k2" + I64 value "v". */
+static ray_t* diff_make_sym_i64_keys(int64_t n, int64_t nk) {
+    ray_t* k1 = ray_sym_vec_new(RAY_SYM_W64, n); k1->len = n;
+    ray_t* k2 = ray_vec_new(RAY_I64, n); k2->len = n;
+    ray_t* vv = ray_vec_new(RAY_I64, n); vv->len = n;
+    int64_t* d2 = (int64_t*)ray_data(k2);
+    int64_t* vd = (int64_t*)ray_data(vv);
+    int64_t gid[64];
+    for (int64_t j = 0; j < nk; j++) {
+        char b[16]; int m = snprintf(b, sizeof(b), "g%lld", (long long)j);
+        gid[j] = ray_sym_intern(b, (size_t)m);
+    }
+    for (int64_t i = 0; i < n; i++) {
+        int64_t j = (i * 3 + 1) % nk;
+        ray_write_sym(ray_data(k1), i, (uint64_t)gid[j], RAY_SYM, k1->attrs);
+        d2[i] = (i * 5 + 2) % (nk + 1);
+        vd[i] = (i * 7) % 101 - 50;
+    }
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k1", 2), k1); ray_release(k1);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k2", 2), k2); ray_release(k2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("v",  1), vv); ray_release(vv);
+    return tbl;
+}
+
+/* Two I64 keys where key column "k2" has HAS_NULLS (sentinel + attr set):
+ * every 3rd row's k2 is null → null-key grouping parity. */
+static ray_t* diff_make_2i64_keynull(int64_t n, int64_t nk) {
+    ray_t* k1 = ray_vec_new(RAY_I64, n); k1->len = n;
+    ray_t* k2 = ray_vec_new(RAY_I64, n); k2->len = n;
+    ray_t* vv = ray_vec_new(RAY_I64, n); vv->len = n;
+    int64_t* d1 = (int64_t*)ray_data(k1);
+    int64_t* d2 = (int64_t*)ray_data(k2);
+    int64_t* vd = (int64_t*)ray_data(vv);
+    for (int64_t i = 0; i < n; i++) {
+        d1[i] = (i * 3 + 1) % nk;
+        d2[i] = (i * 5 + 2) % (nk + 1);
+        vd[i] = (i * 7) % 101 - 50;
+    }
+    for (int64_t i = 0; i < n; i += 3) ray_vec_set_null(k2, i, true);
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k1", 2), k1); ray_release(k1);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k2", 2), k2); ray_release(k2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("v",  1), vv); ray_release(vv);
+    return tbl;
+}
+
 /* ── per-shape group builders (graph-local) ─────────────────────────── */
 static ray_op_t* gb_sum(ray_graph_t* g) {
     ray_op_t* k = ray_scan(g, "k"); ray_op_t* v = ray_scan(g, "v");
@@ -563,28 +697,66 @@ static ray_op_t* gb_nulls(ray_graph_t* g) {
     return ray_group(g, keys, 1, ops, ins, 3);
 }
 
+/* ── multi-key group builders ───────────────────────────────────────── */
+static ray_op_t* gb_2k_sum(ray_graph_t* g) {
+    ray_op_t* k1 = ray_scan(g, "k1"); ray_op_t* k2 = ray_scan(g, "k2");
+    ray_op_t* v = ray_scan(g, "v");
+    uint16_t ops[] = { OP_SUM }; ray_op_t* ins[] = { v };
+    ray_op_t* keys[] = { k1, k2 };
+    return ray_group(g, keys, 2, ops, ins, 1);
+}
+static ray_op_t* gb_2k_four(ray_graph_t* g) {
+    ray_op_t* k1 = ray_scan(g, "k1"); ray_op_t* k2 = ray_scan(g, "k2");
+    ray_op_t* v = ray_scan(g, "v");
+    uint16_t ops[] = { OP_SUM, OP_COUNT, OP_MIN, OP_MAX };
+    ray_op_t* ins[] = { v, v, v, v }; ray_op_t* keys[] = { k1, k2 };
+    return ray_group(g, keys, 2, ops, ins, 4);
+}
+static ray_op_t* gb_3k_count(ray_graph_t* g) {
+    ray_op_t* k1 = ray_scan(g, "k1"); ray_op_t* k2 = ray_scan(g, "k2");
+    ray_op_t* k3 = ray_scan(g, "k3");
+    uint16_t ops[] = { OP_COUNT }; ray_op_t* ins[] = { k1 };
+    ray_op_t* keys[] = { k1, k2, k3 };
+    return ray_group(g, keys, 3, ops, ins, 1);
+}
+static ray_op_t* gb_2k_avg(ray_graph_t* g) {
+    ray_op_t* k1 = ray_scan(g, "k1"); ray_op_t* k2 = ray_scan(g, "k2");
+    ray_op_t* v = ray_scan(g, "v");
+    uint16_t ops[] = { OP_AVG }; ray_op_t* ins[] = { v };
+    ray_op_t* keys[] = { k1, k2 };
+    return ray_group(g, keys, 2, ops, ins, 1);
+}
+
 /* ── runner: each shape over a small AND a large (N=70000) table ────── */
-#define DIFF_SHAPE(name, maker, builder)                                  \
+#define DIFF_SHAPE(name, maker, builder, nkeys)                           \
     static test_result_t name(void) {                                     \
         ray_heap_init(); (void)ray_sym_init();                            \
         test_result_t r;                                                  \
         ray_t* small = maker(13, 4);                                      \
-        r = diff_group(small, builder); ray_release(small);               \
+        r = diff_group(small, builder, (nkeys)); ray_release(small);      \
         if (r.status != TEST_PASS) {                                      \
             ray_sym_destroy(); ray_heap_destroy(); return r; }            \
         ray_t* big = maker(70000, 37);                                    \
-        r = diff_group(big, builder); ray_release(big);                   \
+        r = diff_group(big, builder, (nkeys)); ray_release(big);          \
         ray_sym_destroy(); ray_heap_destroy();                            \
         return r;                                                         \
     }
 
-DIFF_SHAPE(test_diff_group_i64_sum,      diff_make_i64,      gb_sum)
-DIFF_SHAPE(test_diff_group_i64_count,    diff_make_i64,      gb_count)
-DIFF_SHAPE(test_diff_group_i64_minmax,   diff_make_i64,      gb_minmax)
-DIFF_SHAPE(test_diff_group_i64_four,     diff_make_i64,      gb_four)
-DIFF_SHAPE(test_diff_group_sym_sum,      diff_make_sym_i64,  gb_sum)
-DIFF_SHAPE(test_diff_group_f64_four,     diff_make_i64_f64,  gb_f64_four)
-DIFF_SHAPE(test_diff_group_nulls_minmax, diff_make_i64_nulls, gb_nulls)
+DIFF_SHAPE(test_diff_group_i64_sum,      diff_make_i64,      gb_sum,   1)
+DIFF_SHAPE(test_diff_group_i64_count,    diff_make_i64,      gb_count, 1)
+DIFF_SHAPE(test_diff_group_i64_minmax,   diff_make_i64,      gb_minmax, 1)
+DIFF_SHAPE(test_diff_group_i64_four,     diff_make_i64,      gb_four,  1)
+DIFF_SHAPE(test_diff_group_sym_sum,      diff_make_sym_i64,  gb_sum,   1)
+DIFF_SHAPE(test_diff_group_f64_four,     diff_make_i64_f64,  gb_f64_four, 1)
+DIFF_SHAPE(test_diff_group_nulls_minmax, diff_make_i64_nulls, gb_nulls, 1)
+
+/* multi-key shapes (Phase 1b) */
+DIFF_SHAPE(test_diff_group_2k_sum,    diff_make_2i64,        gb_2k_sum,   2)
+DIFF_SHAPE(test_diff_group_2k_four,   diff_make_2i64,        gb_2k_four,  2)
+DIFF_SHAPE(test_diff_group_3k_count,  diff_make_3keys,       gb_3k_count, 3)
+DIFF_SHAPE(test_diff_group_symk_sum,  diff_make_sym_i64_keys, gb_2k_sum,  2)
+DIFF_SHAPE(test_diff_group_2k_avg,    diff_make_2i64_f64,    gb_2k_avg,   2)
+DIFF_SHAPE(test_diff_group_2k_keynull, diff_make_2i64_keynull, gb_2k_sum, 2)
 
 const test_entry_t agg_engine_entries[] = {
     { "diff_group_i64_sum",          test_diff_group_i64_sum,      NULL, NULL },
@@ -594,6 +766,12 @@ const test_entry_t agg_engine_entries[] = {
     { "diff_group_sym_sum",          test_diff_group_sym_sum,      NULL, NULL },
     { "diff_group_f64_four",         test_diff_group_f64_four,     NULL, NULL },
     { "diff_group_nulls_minmax",     test_diff_group_nulls_minmax, NULL, NULL },
+    { "diff_group_2k_sum",           test_diff_group_2k_sum,       NULL, NULL },
+    { "diff_group_2k_four",          test_diff_group_2k_four,      NULL, NULL },
+    { "diff_group_3k_count",         test_diff_group_3k_count,     NULL, NULL },
+    { "diff_group_symk_sum",         test_diff_group_symk_sum,     NULL, NULL },
+    { "diff_group_2k_avg",           test_diff_group_2k_avg,       NULL, NULL },
+    { "diff_group_2k_keynull",       test_diff_group_2k_keynull,   NULL, NULL },
     { "gate_admits_i64_key_sum_i64", test_gate_admits_i64_key_sum_i64, NULL, NULL },
     { "gate_admits_two_keys",        test_gate_admits_two_keys,        NULL, NULL },
     { "gate_defers_sum_i32",         test_gate_defers_sum_i32,         NULL, NULL },
