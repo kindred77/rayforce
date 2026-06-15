@@ -78,8 +78,8 @@ static test_result_t test_gate_admits_i64_key_sum_i64(void) {
     PASS();
 }
 
-/* Case 2: two keys → defer. */
-static test_result_t test_gate_defers_two_keys(void) {
+/* Case 2: two supported-type keys → admit (1b multi-key). */
+static test_result_t test_gate_admits_two_keys(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
@@ -107,7 +107,7 @@ static test_result_t test_gate_defers_two_keys(void) {
     ray_op_t* grp = ray_group(g, keys, 2, ops, ins, 1);
     TEST_ASSERT_NOT_NULL(grp);
 
-    TEST_ASSERT_FALSE(agg_v2_can_handle(g, grp, tbl));
+    TEST_ASSERT_TRUE(agg_v2_can_handle(g, grp, tbl));
 
     ray_graph_free(g);
     ray_release(tbl);
@@ -169,9 +169,9 @@ static test_result_t test_gate_admits_count(void) {
     PASS();
 }
 
-/* Direct unit test for agg_group_keys_i: single I64 key, first-occurrence
- * dense gid assignment. Key column {5,3,5,3,5,7} → gids {0,1,0,1,0,2},
- * keys {5,3,7}, ngroups 3. */
+/* Direct unit test for agg_group_keys (single key): first-occurrence dense gid
+ * assignment. Key column {5,3,5,3,5,7} → gids {0,1,0,1,0,2},
+ * first_row {0,1,5}, ngroups 3. */
 static test_result_t test_group_keys_i_first_occurrence(void) {
     ray_heap_init();
     (void)ray_sym_init();
@@ -185,12 +185,12 @@ static test_result_t test_group_keys_i_first_occurrence(void) {
     memcpy(ray_data(col), src, sizeof(src));
 
     agg_groups_t out;
-    TEST_ASSERT_EQ_I((0), (agg_group_keys_i(col, &out)));
+    TEST_ASSERT_EQ_I((0), (agg_group_keys(&col, 1, n, &out)));
 
     TEST_ASSERT_EQ_I((3), (out.ngroups));
-    TEST_ASSERT_EQ_I((5), (out.keys[0]));
-    TEST_ASSERT_EQ_I((3), (out.keys[1]));
-    TEST_ASSERT_EQ_I((7), (out.keys[2]));
+    TEST_ASSERT_EQ_I((0), (out.first_row[0]));
+    TEST_ASSERT_EQ_I((1), (out.first_row[1]));
+    TEST_ASSERT_EQ_I((5), (out.first_row[2]));
 
     const uint32_t expect[] = { 0, 1, 0, 1, 0, 2 };
     for (int64_t i = 0; i < n; i++) {
@@ -198,7 +198,7 @@ static test_result_t test_group_keys_i_first_occurrence(void) {
     }
 
     free(out.gids);
-    free(out.keys);
+    free(out.first_row);
     ray_release(col);
     ray_sym_destroy();
     ray_heap_destroy();
@@ -219,12 +219,12 @@ static test_result_t test_group_keys_i_i32(void) {
     memcpy(ray_data(col), src, sizeof(src));
 
     agg_groups_t out;
-    TEST_ASSERT_EQ_I((0), (agg_group_keys_i(col, &out)));
+    TEST_ASSERT_EQ_I((0), (agg_group_keys(&col, 1, n, &out)));
 
     TEST_ASSERT_EQ_I((3), (out.ngroups));
-    TEST_ASSERT_EQ_I((100), (out.keys[0]));
-    TEST_ASSERT_EQ_I((200), (out.keys[1]));
-    TEST_ASSERT_EQ_I((300), (out.keys[2]));
+    TEST_ASSERT_EQ_I((0), (out.first_row[0]));
+    TEST_ASSERT_EQ_I((1), (out.first_row[1]));
+    TEST_ASSERT_EQ_I((3), (out.first_row[2]));
 
     const uint32_t expect[] = { 0, 1, 0, 2, 1, 0 };
     for (int64_t i = 0; i < n; i++) {
@@ -232,7 +232,7 @@ static test_result_t test_group_keys_i_i32(void) {
     }
 
     free(out.gids);
-    free(out.keys);
+    free(out.first_row);
     ray_release(col);
     ray_sym_destroy();
     ray_heap_destroy();
@@ -258,7 +258,7 @@ static test_result_t test_agg_run_one_i64(void) {
     memcpy(ray_data(vcol), vsrc, sizeof(vsrc));
 
     agg_groups_t gr;
-    TEST_ASSERT_EQ_I((0), (agg_group_keys_i(kcol, &gr)));
+    TEST_ASSERT_EQ_I((0), (agg_group_keys(&kcol, 1, n, &gr)));
     TEST_ASSERT_EQ_I((2), (gr.ngroups));
 
     struct { uint16_t op; ray_t* val; int64_t e0; int64_t e1; } cases[] = {
@@ -283,9 +283,49 @@ static test_result_t test_agg_run_one_i64(void) {
     }
 
     free(gr.gids);
-    free(gr.keys);
+    free(gr.first_row);
     ray_release(kcol);
     ray_release(vcol);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* Direct unit test for agg_group_keys with two I64 keys: tuple-hash grouping.
+ * kA={1,1,2,1}, kB={9,9,8,8} → tuples (1,9),(1,9),(2,8),(1,8)
+ * → ngroups 3, gids {0,0,1,2}, first_row {0,2,3}. */
+static test_result_t test_group_keys_multi(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    const int64_t a_src[] = { 1, 1, 2, 1 };
+    const int64_t b_src[] = { 9, 9, 8, 8 };
+    const int64_t n = (int64_t)(sizeof(a_src) / sizeof(a_src[0]));
+    ray_t* ka = ray_vec_new(RAY_I64, n);
+    ray_t* kb = ray_vec_new(RAY_I64, n);
+    TEST_ASSERT_NOT_NULL(ka);
+    TEST_ASSERT_NOT_NULL(kb);
+    ka->len = n; kb->len = n;
+    memcpy(ray_data(ka), a_src, sizeof(a_src));
+    memcpy(ray_data(kb), b_src, sizeof(b_src));
+
+    ray_t* cols[2] = { ka, kb };
+    agg_groups_t out;
+    TEST_ASSERT_EQ_I((0), (agg_group_keys(cols, 2, n, &out)));
+
+    TEST_ASSERT_EQ_I((3), (out.ngroups));
+    const uint32_t expect_gids[] = { 0, 0, 1, 2 };
+    for (int64_t i = 0; i < n; i++) {
+        TEST_ASSERT_EQ_I(((int)expect_gids[i]), ((int)out.gids[i]));
+    }
+    TEST_ASSERT_EQ_I((0), (out.first_row[0]));
+    TEST_ASSERT_EQ_I((2), (out.first_row[1]));
+    TEST_ASSERT_EQ_I((3), (out.first_row[2]));
+
+    free(out.gids);
+    free(out.first_row);
+    ray_release(ka);
+    ray_release(kb);
     ray_sym_destroy();
     ray_heap_destroy();
     PASS();
@@ -300,7 +340,7 @@ static test_result_t test_agg_run_one_i64(void) {
  * `for (s = 0; s < n_slots; s++)`, and slot = key - key_min, so output is
  * ordered by key value (group.c:6828).  At N=70000 the OLD engine also takes
  * a hash/parallel path which is NOT first-occurrence either.  The v2 engine
- * emits *first-occurrence* order (agg_group_keys_i).  These orders genuinely
+ * emits *first-occurrence* order (agg_group_keys).  These orders genuinely
  * differ, so table_expect_equal compares the two results as MULTISETS keyed
  * on the (single) key column: it builds a permutation of each table sorted by
  * the key column's int-coded value, then compares row-by-row through that
@@ -555,11 +595,12 @@ const test_entry_t agg_engine_entries[] = {
     { "diff_group_f64_four",         test_diff_group_f64_four,     NULL, NULL },
     { "diff_group_nulls_minmax",     test_diff_group_nulls_minmax, NULL, NULL },
     { "gate_admits_i64_key_sum_i64", test_gate_admits_i64_key_sum_i64, NULL, NULL },
-    { "gate_defers_two_keys",        test_gate_defers_two_keys,        NULL, NULL },
+    { "gate_admits_two_keys",        test_gate_admits_two_keys,        NULL, NULL },
     { "gate_defers_sum_i32",         test_gate_defers_sum_i32,         NULL, NULL },
     { "gate_admits_count",           test_gate_admits_count,           NULL, NULL },
     { "group_keys_i_first_occurrence", test_group_keys_i_first_occurrence, NULL, NULL },
     { "group_keys_i_i32",            test_group_keys_i_i32,            NULL, NULL },
+    { "group_keys_multi",            test_group_keys_multi,            NULL, NULL },
     { "agg_run_one_i64",             test_agg_run_one_i64,             NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
