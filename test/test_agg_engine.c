@@ -18,6 +18,7 @@
 #include "ops/agg_engine.h"
 #include "ops/agg_acc.h"
 #include "ops/agg_registry.h"
+#include "core/pool.h"
 #include "table/sym.h"
 #include <stdlib.h>
 #include <string.h>
@@ -447,6 +448,33 @@ static test_result_t table_expect_equal(ray_t* a, ray_t* b, int n_keys) {
     return res;
 }
 
+/* STRICT row-order comparison: tables must match in EMIT order (no sort).
+ * Used by the determinism gate — v2's first-occurrence ordering (sort groups
+ * by min row index) is claimed worker-count-independent, so two runs that
+ * differ only in worker count must be byte-identical row-for-row. */
+static test_result_t table_expect_identical(ray_t* a, ray_t* b) {
+    TEST_ASSERT(a && b && !RAY_IS_ERR(a) && !RAY_IS_ERR(b), "valid tables");
+    int64_t nca = ray_table_ncols(a), ncb = ray_table_ncols(b);
+    TEST_ASSERT_FMT(nca == ncb, "ncols %lld != %lld",
+                    (long long)nca, (long long)ncb);
+    int64_t nra = ray_table_nrows(a), nrb = ray_table_nrows(b);
+    TEST_ASSERT_FMT(nra == nrb, "nrows %lld != %lld",
+                    (long long)nra, (long long)nrb);
+    for (int64_t c = 0; c < nca; c++) {
+        TEST_ASSERT_FMT(ray_table_col_name(a, c) == ray_table_col_name(b, c),
+                        "col %lld name sym mismatch", (long long)c);
+        ray_t* ca = ray_table_get_col_idx(a, c);
+        ray_t* cb = ray_table_get_col_idx(b, c);
+        TEST_ASSERT_FMT(ca->type == cb->type, "col %lld type %d != %d",
+                        (long long)c, ca->type, cb->type);
+        for (int64_t r = 0; r < nra; r++)
+            TEST_ASSERT_FMT(cell_equal(ca, r, cb, r),
+                            "row %lld col %lld differs (not row-order identical)",
+                            (long long)r, (long long)c);
+    }
+    PASS();
+}
+
 typedef ray_op_t* (*group_builder_t)(ray_graph_t* g);
 
 /* Execute build() with the v2 flag OFF then ON; compare results as multisets
@@ -539,6 +567,65 @@ static ray_t* diff_make_i64_nulls(int64_t n, int64_t nk) {
     ray_t* tbl = ray_table_new(2);
     tbl = ray_table_add_col(tbl, ray_sym_intern("k", 1), kvec); ray_release(kvec);
     tbl = ray_table_add_col(tbl, ray_sym_intern("v", 1), vvec); ray_release(vvec);
+    return tbl;
+}
+
+/* ── HIGH-CARDINALITY builders (stress the per-worker→global merge) ──────
+ * These deliberately produce MANY groups so each per-worker local hash table
+ * holds many groups and Phase B does real merging work. */
+
+/* Single I64 key "k" = i % nk (≈nk groups) + I64 value "v" = i. SUM/COUNT. */
+static ray_t* diff_make_i64_hc(int64_t n, int64_t nk) {
+    ray_t* kvec = ray_vec_new(RAY_I64, n); kvec->len = n;
+    ray_t* vvec = ray_vec_new(RAY_I64, n); vvec->len = n;
+    int64_t* kd = (int64_t*)ray_data(kvec);
+    int64_t* vd = (int64_t*)ray_data(vvec);
+    for (int64_t i = 0; i < n; i++) {
+        kd[i] = i % nk;               /* ≈nk distinct groups */
+        vd[i] = i - n / 2;            /* deterministic, spans negatives */
+    }
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k", 1), kvec); ray_release(kvec);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("v", 1), vvec); ray_release(vvec);
+    return tbl;
+}
+
+/* Single I64 key "k" = i (ALL DISTINCT → n groups, extreme cardinality)
+ * + I64 value "v" = i. COUNT. */
+static ray_t* diff_make_i64_distinct(int64_t n, int64_t nk) {
+    (void)nk;
+    ray_t* kvec = ray_vec_new(RAY_I64, n); kvec->len = n;
+    ray_t* vvec = ray_vec_new(RAY_I64, n); vvec->len = n;
+    int64_t* kd = (int64_t*)ray_data(kvec);
+    int64_t* vd = (int64_t*)ray_data(vvec);
+    for (int64_t i = 0; i < n; i++) { kd[i] = i; vd[i] = i; }
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k", 1), kvec); ray_release(kvec);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("v", 1), vvec); ray_release(vvec);
+    return tbl;
+}
+
+/* Two I64 keys "k1"=i%200, "k2"=(i/200)%150 + I64 value "v" = i. SUM.
+ * The two keys vary at independent rates so the pair space is fully covered:
+ * ≈30000 composite groups at N=70000 (NOT i%200/i%150, which collapse to 600
+ * because lcm(200,150)=600 aligns the two residues). */
+static ray_t* diff_make_2i64_hc(int64_t n, int64_t nk) {
+    (void)nk;
+    ray_t* k1 = ray_vec_new(RAY_I64, n); k1->len = n;
+    ray_t* k2 = ray_vec_new(RAY_I64, n); k2->len = n;
+    ray_t* vv = ray_vec_new(RAY_I64, n); vv->len = n;
+    int64_t* d1 = (int64_t*)ray_data(k1);
+    int64_t* d2 = (int64_t*)ray_data(k2);
+    int64_t* vd = (int64_t*)ray_data(vv);
+    for (int64_t i = 0; i < n; i++) {
+        d1[i] = i % 200;
+        d2[i] = (i / 200) % 150;
+        vd[i] = i - n / 2;
+    }
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k1", 2), k1); ray_release(k1);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k2", 2), k2); ray_release(k2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("v",  1), vv); ray_release(vv);
     return tbl;
 }
 
@@ -690,6 +777,12 @@ static ray_op_t* gb_f64_four(ray_graph_t* g) {
     ray_op_t* ins[] = { v, v, v, v }; ray_op_t* keys[] = { k };
     return ray_group(g, keys, 1, ops, ins, 4);
 }
+static ray_op_t* gb_sum_count(ray_graph_t* g) {
+    ray_op_t* k = ray_scan(g, "k"); ray_op_t* v = ray_scan(g, "v");
+    uint16_t ops[] = { OP_SUM, OP_COUNT };
+    ray_op_t* ins[] = { v, v }; ray_op_t* keys[] = { k };
+    return ray_group(g, keys, 1, ops, ins, 2);
+}
 static ray_op_t* gb_nulls(ray_graph_t* g) {
     ray_op_t* k = ray_scan(g, "k"); ray_op_t* v = ray_scan(g, "v");
     uint16_t ops[] = { OP_SUM, OP_MIN, OP_MAX };
@@ -758,6 +851,123 @@ DIFF_SHAPE(test_diff_group_symk_sum,  diff_make_sym_i64_keys, gb_2k_sum,  2)
 DIFF_SHAPE(test_diff_group_2k_avg,    diff_make_2i64_f64,    gb_2k_avg,   2)
 DIFF_SHAPE(test_diff_group_2k_keynull, diff_make_2i64_keynull, gb_2k_sum, 2)
 
+/* ══════════════════════════════════════════════════════════════════════
+ * HIGH-CARDINALITY differentials (Phase 1c). N=70000 (≥ RAY_PARALLEL_THRESHOLD
+ * 65536) with the v2 flag ON forces the parallel two-phase path; MANY groups
+ * mean each per-worker local table holds many groups and Phase B merges real
+ * work. Compared as MULTISET (key-sorted) vs the OLD engine.
+ * ══════════════════════════════════════════════════════════════════════ */
+
+#define HC_N 70000
+
+/* Execute build() on tbl with the v2 engine and return the group count
+ * (result nrows).  Confirms a shape truly is high-cardinality before we lean
+ * on it to stress the parallel merge. */
+static int64_t v2_group_count(ray_t* tbl, group_builder_t build) {
+    ray_agg_engine_v2 = true;
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_t* out = ray_execute(g, build(g));
+    if (ray_is_lazy(out)) out = ray_lazy_materialize(out);
+    ray_agg_engine_v2 = false;
+    int64_t ng = (out && !RAY_IS_ERR(out)) ? ray_table_nrows(out) : -1;
+    if (out) ray_release(out);
+    ray_graph_free(g);
+    return ng;
+}
+
+/* ≈20000 groups: k = i % 20000, SUM + COUNT. */
+static test_result_t test_diff_group_hc_i64_sumcount(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* big = diff_make_i64_hc(HC_N, 20000);
+    int64_t ng = v2_group_count(big, gb_sum_count);
+    TEST_ASSERT_FMT(ng == 20000, "expected 20000 groups, got %lld", (long long)ng);
+    test_result_t r = diff_group(big, gb_sum_count, 1);
+    ray_release(big);
+    ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
+/* ≈30000 composite groups: (i%200, (i/200)%150), SUM. */
+static test_result_t test_diff_group_hc_2k_sum(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* big = diff_make_2i64_hc(HC_N, 0);
+    int64_t ng = v2_group_count(big, gb_2k_sum);
+    TEST_ASSERT_FMT(ng == 30000, "expected 30000 groups, got %lld", (long long)ng);
+    test_result_t r = diff_group(big, gb_2k_sum, 2);
+    ray_release(big);
+    ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
+/* Extreme: k = i (all 70000 distinct), COUNT. */
+static test_result_t test_diff_group_hc_distinct_count(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* big = diff_make_i64_distinct(HC_N, 0);
+    int64_t ng = v2_group_count(big, gb_count);
+    TEST_ASSERT_FMT(ng == HC_N, "expected %d groups, got %lld", HC_N, (long long)ng);
+    test_result_t r = diff_group(big, gb_count, 1);
+    ray_release(big);
+    ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+ * DETERMINISM: v2's first-occurrence order is "sort groups by min(row index)",
+ * claimed worker-count-independent by construction (agg_engine.c Phase A tracks
+ * MIN first_row per local group, Phase B keeps the global MIN, Phase C sorts by
+ * it).  exec_group_v2_parallel allocates exactly ray_pool_total_workers()
+ * per-worker locals and agg_phaseA_fn indexes locals[wid] — so worker count
+ * DIRECTLY changes how rows partition into local tables and how the merge runs.
+ *
+ * The pool worker count IS controllable from a test: ray_pool_destroy() +
+ * ray_pool_init(n) reconfigures the singleton (precedent: test_pool.c).
+ * ray_pool_total_workers(p) = n_workers + 1 (the calling thread counts), so to
+ * get total worker counts {1,2,8} we init with n_workers {0,1,7}.
+ *
+ * We run the SAME high-card query at N=70000 across those worker counts and
+ * assert ALL results are byte-identical INCLUDING EMIT ROW ORDER
+ * (table_expect_identical) — proving first-occurrence order is worker-count-
+ * independent.  A full {1,2,8}-worker CI matrix (design §9 / GAPS) is the
+ * proper gate; this single-process version reaches it via pool reinit.
+ * ══════════════════════════════════════════════════════════════════════ */
+static test_result_t test_diff_group_determinism_workers(void) {
+    ray_heap_init(); (void)ray_sym_init();
+
+    const uint32_t worker_cfgs[] = { 0, 1, 7 };  /* total workers 1, 2, 8 */
+    const int      ncfg = (int)(sizeof(worker_cfgs) / sizeof(worker_cfgs[0]));
+    ray_t* results[3] = { NULL, NULL, NULL };
+    test_result_t res = (test_result_t){ TEST_PASS, NULL };
+
+    ray_agg_engine_v2 = true;
+    for (int c = 0; c < ncfg; c++) {
+        ray_pool_destroy();
+        ray_pool_init(worker_cfgs[c]);
+
+        ray_t* tbl = diff_make_i64_hc(HC_N, 20000);
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_t* out = ray_execute(g, gb_sum_count(g));
+        if (ray_is_lazy(out)) out = ray_lazy_materialize(out);
+        results[c] = out;
+        ray_graph_free(g);
+        ray_release(tbl);
+    }
+    ray_agg_engine_v2 = false;
+
+    /* Restore default pool for subsequent tests. */
+    ray_pool_destroy();
+    ray_pool_init(0);
+
+    /* All three must be row-order identical to the first. */
+    for (int c = 1; c < ncfg && res.status == TEST_PASS; c++)
+        res = table_expect_identical(results[0], results[c]);
+
+    for (int c = 0; c < ncfg; c++)
+        if (results[c]) ray_release(results[c]);
+
+    ray_sym_destroy(); ray_heap_destroy();
+    return res;
+}
+
 const test_entry_t agg_engine_entries[] = {
     { "diff_group_i64_sum",          test_diff_group_i64_sum,      NULL, NULL },
     { "diff_group_i64_count",        test_diff_group_i64_count,    NULL, NULL },
@@ -772,6 +982,10 @@ const test_entry_t agg_engine_entries[] = {
     { "diff_group_symk_sum",         test_diff_group_symk_sum,     NULL, NULL },
     { "diff_group_2k_avg",           test_diff_group_2k_avg,       NULL, NULL },
     { "diff_group_2k_keynull",       test_diff_group_2k_keynull,   NULL, NULL },
+    { "diff_group_hc_i64_sumcount",  test_diff_group_hc_i64_sumcount,  NULL, NULL },
+    { "diff_group_hc_2k_sum",        test_diff_group_hc_2k_sum,        NULL, NULL },
+    { "diff_group_hc_distinct_count", test_diff_group_hc_distinct_count, NULL, NULL },
+    { "diff_group_determinism_workers", test_diff_group_determinism_workers, NULL, NULL },
     { "gate_admits_i64_key_sum_i64", test_gate_admits_i64_key_sum_i64, NULL, NULL },
     { "gate_admits_two_keys",        test_gate_admits_two_keys,        NULL, NULL },
     { "gate_defers_sum_i32",         test_gate_defers_sum_i32,         NULL, NULL },
