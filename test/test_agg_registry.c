@@ -167,10 +167,58 @@ static test_result_t test_nulls_match_reduction(void) {
     PASS();
 }
 
+static test_result_t test_variance_matches_oracle(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* I64 col: pop var=4, pop stddev=2, sample var=32/7, sample stddev=sqrt(32/7). */
+    int64_t xs[] = { 2, 4, 4, 4, 5, 5, 7, 9 };
+    ray_t* col = vec_i64(xs, 8);
+    TEST_ASSERT_NOT_NULL(col);
+    struct { uint16_t op; ray_t* (*ref)(ray_t*); } cases[] = {
+        { OP_VAR, ray_var_fn }, { OP_VAR_POP, ray_var_pop_fn },
+        { OP_STDDEV, ray_stddev_fn }, { OP_STDDEV_POP, ray_stddev_pop_fn },
+    };
+    for (size_t c = 0; c < 4; c++) {
+        const agg_vtable_t* vt = agg_resolve(cases[c].op, RAY_I64);
+        TEST_ASSERT_NOT_NULL(vt);
+        ray_t* got = run_single_group(vt, col);
+        ray_t* want = ray_lazy_materialize(cases[c].ref(col));
+        TEST_ASSERT_NOT_NULL(got);
+        TEST_ASSERT_NOT_NULL(want);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(want));
+        TEST_ASSERT_EQ_F(got->f64, want->f64, 1e-9);   /* v2 ≡ old oracle */
+        ray_release(got); ray_release(want);
+    }
+    ray_release(col);
+
+    /* F64 case: differential against the same oracles. */
+    double fs[] = { 1.5, 2.0, -3.25, 10.0, 4.0 };
+    ray_t* fcol = vec_f64(fs, 5);
+    TEST_ASSERT_NOT_NULL(fcol);
+    for (size_t c = 0; c < 4; c++) {
+        const agg_vtable_t* vt = agg_resolve(cases[c].op, RAY_F64);
+        TEST_ASSERT_NOT_NULL(vt);
+        ray_t* got = run_single_group(vt, fcol);
+        ray_t* want = ray_lazy_materialize(cases[c].ref(fcol));
+        TEST_ASSERT_NOT_NULL(got);
+        TEST_ASSERT_NOT_NULL(want);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(want));
+        TEST_ASSERT_EQ_F(got->f64, want->f64, 1e-9);
+        ray_release(got); ray_release(want);
+    }
+    ray_release(fcol);
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t agg_registry_entries[] = {
     { "agg_registry/sum_i64_matches_reduction", test_sum_i64_matches_reduction, NULL, NULL },
     { "agg_registry/minmax_count_i64_match", test_minmax_count_i64_match, NULL, NULL },
     { "agg_registry/f64_match", test_f64_match, NULL, NULL },
     { "agg_registry/nulls_match_reduction", test_nulls_match_reduction, NULL, NULL },
+    { "agg_registry/variance_matches_oracle", test_variance_matches_oracle, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
