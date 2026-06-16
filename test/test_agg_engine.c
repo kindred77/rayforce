@@ -1351,6 +1351,26 @@ static ray_op_t* gb_sum_pearson_count(ray_graph_t* g) {
         return r;                                                         \
     }
 
+/* ── dense-serial differential shapes (small low-card table ONLY) ──────
+ * Single small (N<RAY_PARALLEL_THRESHOLD) low-cardinality int-key table → the
+ * SERIAL path with a dense plan: agg_group_keys_dense (direct index, no hash).
+ * Asserts the dense result is byte-identical to the old hash engine. */
+#define DIFF_SHAPE_SMALL(name, maker, builder, nkeys, n, nk)              \
+    static test_result_t name(void) {                                    \
+        ray_heap_init(); (void)ray_sym_init();                           \
+        ray_t* small = maker((n), (nk));                                 \
+        test_result_t r = diff_group(small, builder, (nkeys));           \
+        ray_release(small);                                              \
+        ray_sym_destroy(); ray_heap_destroy();                           \
+        return r;                                                        \
+    }
+/* single I64 key, sum+count+min+max (gb_four), small low-card → dense serial */
+DIFF_SHAPE_SMALL(test_dense_serial_i64_four,  diff_make_i64_small,  gb_four,  1, 40, 5)
+/* single I64 key, min+max only, small low-card → dense serial */
+DIFF_SHAPE_SMALL(test_dense_serial_i64_minmax, diff_make_i64_small, gb_minmax, 1, 40, 5)
+/* two I64 keys, sum, small low-card composite → dense serial (mixed-radix) */
+DIFF_SHAPE_SMALL(test_dense_serial_2k_sum,    diff_make_2i64_small, gb_2k_sum, 2, 40, 5)
+
 DIFF_SHAPE(test_diff_group_i64_sum,      diff_make_i64,      gb_sum,   1)
 DIFF_SHAPE(test_diff_group_i64_count,    diff_make_i64,      gb_count, 1)
 DIFF_SHAPE(test_diff_group_i64_minmax,   diff_make_i64,      gb_minmax, 1)
@@ -1593,6 +1613,9 @@ const test_entry_t agg_engine_entries[] = {
     { "diff_group_pearson_1k",       test_diff_group_pearson_1k,    NULL, NULL },
     { "diff_group_pearson_2k",       test_diff_group_pearson_2k,    NULL, NULL },
     { "diff_group_pearson_mixed",    test_diff_group_pearson_mixed, NULL, NULL },
+    { "dense_serial_i64_four",       test_dense_serial_i64_four,   NULL, NULL },
+    { "dense_serial_i64_minmax",     test_dense_serial_i64_minmax, NULL, NULL },
+    { "dense_serial_2k_sum",         test_dense_serial_2k_sum,     NULL, NULL },
     { "diff_group_i64_sum",          test_diff_group_i64_sum,      NULL, NULL },
     { "diff_group_i64_count",        test_diff_group_i64_count,    NULL, NULL },
     { "diff_group_i64_minmax",       test_diff_group_i64_minmax,   NULL, NULL },
