@@ -293,7 +293,10 @@ static test_result_t test_dense_plan_f64_key(void) {
     PASS();
 }
 
-/* (e) a MEDIAN agg (ACC_BUFFERED) present → not dense (buffered → defer). */
+/* (e) a MEDIAN agg (ACC_BUFFERED) over a dense-eligible key → dense IS allowed:
+ * the dense serial driver (agg_run_one) and the dense parallel path both carry
+ * the per-group destroy lifecycle, so buffered state is handled.  Agg kind no
+ * longer gates dense eligibility — only key type/range/null does. */
 static test_result_t test_dense_plan_buffered_agg(void) {
     ray_heap_init();
     (void)ray_sym_init();
@@ -311,8 +314,9 @@ static test_result_t test_dense_plan_buffered_agg(void) {
     dense_plan_t pl = {0};
     bool ok = agg_dense_plan(keys, 1, vts, 1, 8, &pl);
 
-    TEST_ASSERT_FALSE(ok);
-    TEST_ASSERT_FALSE(pl.ok);
+    TEST_ASSERT_TRUE(ok);
+    TEST_ASSERT_TRUE(pl.ok);
+    TEST_ASSERT_TRUE(pl.total_slots == 4);   /* key range [0,3] → 4 dense slots */
 
     ray_release(k);
     ray_sym_destroy();
