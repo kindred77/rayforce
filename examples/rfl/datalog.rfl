@@ -75,7 +75,7 @@
 ; ── 10. sym-name: readable output ───────────────────────
 (println "--- sym-name: convert intern IDs ---")
 (set p (pull db 1))
-(set name-id (get p 1))
+(set name-id (get p 'name))
 (println name-id)
 (println (sym-name name-id))
 
