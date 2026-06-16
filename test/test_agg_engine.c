@@ -504,15 +504,18 @@ typedef ray_op_t* (*group_builder_t)(ray_graph_t* g);
 /* Execute build() with the v2 flag OFF then ON; compare results as multisets
  * over the first `n_keys` key columns. */
 static test_result_t diff_group(ray_t* tbl, group_builder_t build, int n_keys) {
+    ray_agg_engine_v2 = false;            /* old path */
     ray_graph_t* g1 = ray_graph_new(tbl);
     ray_t* old_r = ray_execute(g1, build(g1));
     if (ray_is_lazy(old_r)) old_r = ray_lazy_materialize(old_r);
 
-    ray_agg_engine_v2 = true;
+    ray_agg_engine_v2 = true;             /* v2 path */
     ray_graph_t* g2 = ray_graph_new(tbl);
     ray_t* new_r = ray_execute(g2, build(g2));
     if (ray_is_lazy(new_r)) new_r = ray_lazy_materialize(new_r);
-    ray_agg_engine_v2 = false;
+    /* restore the default (v2 on) so later tests don't inherit a disabled
+     * engine — leaving it false caused a cross-test leak. */
+    ray_agg_engine_v2 = true;
 
     test_result_t res = table_expect_equal(old_r, new_r, n_keys);
     ray_release(old_r); ray_release(new_r);
@@ -1250,7 +1253,8 @@ static int64_t v2_group_count(ray_t* tbl, group_builder_t build) {
     ray_graph_t* g = ray_graph_new(tbl);
     ray_t* out = ray_execute(g, build(g));
     if (ray_is_lazy(out)) out = ray_lazy_materialize(out);
-    ray_agg_engine_v2 = false;
+    /* leave v2 on (the default) — restoring avoids a cross-test leak. */
+    ray_agg_engine_v2 = true;
     int64_t ng = (out && !RAY_IS_ERR(out)) ? ray_table_nrows(out) : -1;
     if (out) ray_release(out);
     ray_graph_free(g);
@@ -1333,7 +1337,8 @@ static test_result_t test_diff_group_determinism_workers(void) {
         ray_graph_free(g);
         ray_release(tbl);
     }
-    ray_agg_engine_v2 = false;
+    /* leave v2 on (the default) — restoring avoids a cross-test leak. */
+    ray_agg_engine_v2 = true;
 
     /* Restore default pool for subsequent tests. */
     ray_pool_destroy();

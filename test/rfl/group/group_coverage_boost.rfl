@@ -260,8 +260,10 @@
 
 ;; ─── 13. exec_group_pearson_rowform — F64 + parallel, large ──────────────
 ;; Large-scale Pearson rowform with F64 vals to exercise parallel phases.
-;; x and 2*x per group → perfect correlation = 1.0.
-(set Tprf_lg (table [k x y] (list (as 'I64 (% (til 30000) 500)) (as 'F64 (% (til 30000) 100)) (* 2.0 (as 'F64 (% (til 30000) 100))))))
+;; x and 2*x per group → perfect correlation = 1.0.  x must VARY within each
+;; group: with x=(% i 100) and key=(% i 500) (500=5*100), every row in a group
+;; shares the same x → zero variance → undefined r.  Use x=i so x varies.
+(set Tprf_lg (table [k x y] (list (as 'I64 (% (til 30000) 500)) (as 'F64 (til 30000)) (* 2.0 (as 'F64 (til 30000))))))
 (set Rprf_lg (select {r: (pearson_corr x y) by: k from: Tprf_lg}))
 (count Rprf_lg) -- 500
 ;; Each group has x=2*x, correlation should be 1.0 → sum = 500.0

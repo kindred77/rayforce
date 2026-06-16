@@ -57,22 +57,24 @@
 ;; val_is_f64=0 and dispatches grpt_val_read's RAY_DATE arm (I32 width).
 (set Tdv (table [k v] (list (as 'I64 [1 1 1 2 2 2]) (as 'DATE [7305 7307 7306 7400 7402 7401]))))
 (set Rdv (select {t: (top v 2) by: k from: Tdv}))
-(count Rdv) -- 4
-;; type preserved: DATE
-(type (at Rdv 't)) -- 'DATE
+;; v2 emits one row per group with a LIST cell; 2 groups → 2 rows.
+(count Rdv) -- 2
+;; v2 top/bot col is LIST; the kept DATE vectors keep DATE type after raze.
+(type (at Rdv 't)) -- 'LIST
+(type (raze (at Rdv 't))) -- 'DATE
 ;; k=1 top-2 dates: 7307,7306 ; k=2 top-2: 7402,7401 (order-independent checks;
 ;; SUM is a type error on DATE, so use min/max + distinct-count instead).
-(max (at Rdv 't)) -- (as 'DATE 7402)
-(min (at Rdv 't)) -- (as 'DATE 7306)
+(max (raze (at Rdv 't))) -- (as 'DATE 7402)
+(min (raze (at Rdv 't))) -- (as 'DATE 7306)
 ;; the four kept dates are all distinct (7307,7306,7402,7401)
-(count (distinct (at Rdv 't))) -- 4
+(count (distinct (raze (at Rdv 't)))) -- 4
 
 ;; bot on DATE value (desc=0, RAY_DATE val arm again)
 (set Rdvb (select {t: (bot v 1) by: k from: Tdv}))
 (count Rdvb) -- 2
 ;; bot-1: min date per group → 7305, 7400
-(min (at Rdvb 't)) -- (as 'DATE 7305)
-(max (at Rdvb 't)) -- (as 'DATE 7400)
+(min (raze (at Rdvb 't))) -- (as 'DATE 7305)
+(max (raze (at Rdvb 't))) -- (as 'DATE 7400)
 
 ;; ════════════════════════════════════════════════════════════════════
 ;; 2. grpt rowform — TIME value column (grpt_val_read RAY_TIME arm)
@@ -80,10 +82,11 @@
 (set Ttv (table [k v] (list (as 'I64 [1 1 1 2 2]) (as 'TIME [1000 3000 2000 5000 4000]))))
 (set Rtv (select {t: (top v 1) by: k from: Ttv}))
 (count Rtv) -- 2
-(type (at Rtv 't)) -- 'TIME
+(type (at Rtv 't)) -- 'LIST
+(type (raze (at Rtv 't))) -- 'TIME
 ;; top-1: max time per group → 3000, 5000 (order-independent)
-(min (at Rtv 't)) -- (as 'TIME 3000)
-(max (at Rtv 't)) -- (as 'TIME 5000)
+(min (raze (at Rtv 't))) -- (as 'TIME 3000)
+(max (raze (at Rtv 't))) -- (as 'TIME 5000)
 
 ;; ════════════════════════════════════════════════════════════════════
 ;; 3. grpt rowform — TIMESTAMP value column (grpt_val_read I64 arm reuse)
@@ -91,10 +94,11 @@
 (set Ttsv (table [k v] (list (as 'I64 [1 1 2 2]) (as 'TIMESTAMP [1000 3000 2000 4000]))))
 (set Rtsv (select {t: (bot v 1) by: k from: Ttsv}))
 (count Rtsv) -- 2
-(type (at Rtsv 't)) -- 'TIMESTAMP
+(type (at Rtsv 't)) -- 'LIST
+(type (raze (at Rtsv 't))) -- 'TIMESTAMP
 ;; bot-1: min timestamp per group → 1000, 2000 (order-independent)
-(min (at Rtsv 't)) -- (as 'TIMESTAMP 1000)
-(max (at Rtsv 't)) -- (as 'TIMESTAMP 2000)
+(min (raze (at Rtsv 't))) -- (as 'TIMESTAMP 1000)
+(max (raze (at Rtsv 't))) -- (as 'TIMESTAMP 2000)
 
 ;; ════════════════════════════════════════════════════════════════════
 ;; 4. grpt rowform — DATE / TIME / TIMESTAMP KEY (grpt_key_read arms)
@@ -104,7 +108,7 @@
 (set Rdk2 (select {t: (top v 1) by: k from: Tdk2}))
 (count Rdk2) -- 2
 (type (at Rdk2 'k)) -- 'DATE
-(sum (at Rdk2 't)) -- 60
+(sum (raze (at Rdk2 't))) -- 60
 ;; verify the actual DATE key values survive (order-independent: sum of
 ;; source dates equals sum of result dates × number of duplicate rows).
 (min (at Rdk2 'k)) -- (as 'DATE 7305)
@@ -116,7 +120,7 @@
 (count Rtk2) -- 2
 (type (at Rtk2 'k)) -- 'TIME
 ;; bot-1: min v per group → 5, 15
-(sum (at Rtk2 't)) -- 20
+(sum (raze (at Rtk2 't))) -- 20
 ;; verify actual TIME key values survived (the two distinct keys are 1000ms and 2000ms)
 (min (at Rtk2 'k)) -- (as 'TIME 1000)
 (max (at Rtk2 'k)) -- (as 'TIME 2000)
@@ -127,7 +131,7 @@
 (count Rtsk2) -- 3
 (type (at Rtsk2 'k)) -- 'TIMESTAMP
 ;; top-1 per ts group → 2,4,5 ; sum=11
-(sum (at Rtsk2 't)) -- 11
+(sum (raze (at Rtsk2 't))) -- 11
 ;; verify actual TIMESTAMP key bytes survive
 (min (at Rtsk2 'k)) -- (as 'TIMESTAMP 100)
 (max (at Rtsk2 'k)) -- (as 'TIMESTAMP 300)
@@ -139,7 +143,7 @@
 (set Ri16k2 (select {t: (top v 1) by: k from: Ti16k2}))
 (count Ri16k2) -- 3
 (type (at Ri16k2 'k)) -- 'I16
-(sum (at Ri16k2 't)) -- 11
+(sum (raze (at Ri16k2 't))) -- 11
 ;; verify the actual I16 key values: distinct keys are 10, 20, 30
 (min (at Ri16k2 'k)) -- (as 'I16 10)
 (max (at Ri16k2 'k)) -- (as 'I16 30)
@@ -151,7 +155,7 @@
 (count Ru8k2) -- 3
 (type (at Ru8k2 'k)) -- 'U8
 ;; bot-1 per group → 10,30,50 ; sum=90
-(sum (at Ru8k2 't)) -- 90
+(sum (raze (at Ru8k2 't))) -- 90
 ;; verify the actual U8 key bytes: distinct keys are 1, 2, 3
 (min (at Ru8k2 'k)) -- (as 'U8 1)
 (max (at Ru8k2 'k)) -- (as 'U8 3)
@@ -162,7 +166,7 @@
 (set Rboolk2 (select {t: (top v 1) by: k from: Tboolk2}))
 (count Rboolk2) -- 2
 ;; true group rows {1,3,5} → max 5 ; false group rows {2,4} → max 4 ; sum=9
-(sum (at Rboolk2 't)) -- 9
+(sum (raze (at Rboolk2 't))) -- 9
 
 ;; ════════════════════════════════════════════════════════════════════
 ;; 6. grpt rowform — null DATE / TIME KEY rows (grpt_is_null key path)
@@ -172,16 +176,18 @@
 ;; check against the *key* (group.c:9393).
 (set Tdkn (table [k v] (list (as 'DATE [7305 0N 7305 7306 0N]) (as 'I64 [10 20 30 40 50]))))
 (set Rdkn (select {t: (top v 1) by: k from: Tdkn}))
-;; 2 non-null DATE groups (7305, 7306); null-key rows dropped
-(count Rdkn) -- 2
-;; top-1: 7305 group {10,30}→30 ; 7306 group {40}→40 ; sum=70
-(sum (at Rdkn 't)) -- 70
+;; v2 treats the null DATE key as its own group (like every group-by path):
+;; groups 7305, 7306, and null (rows v=20,50).
+(count Rdkn) -- 3
+;; top-1: 7305 {10,30}→30 ; 7306 {40}→40 ; null {20,50}→50 ; sum=120
+(sum (raze (at Rdkn 't))) -- 120
 
 (set Ttkn (table [k v] (list (as 'TIME [1000 2000 0N 1000] ) (as 'I64 [5 10 15 20]))))
 (set Rtkn (select {t: (top v 1) by: k from: Ttkn}))
-;; non-null TIME groups: 1000 {5,20}→20 ; 2000 {10}→10 ; null-key row dropped
-(count Rtkn) -- 2
-(sum (at Rtkn 't)) -- 30
+;; v2: null TIME key is its own group (row v=15).
+;; groups: 1000 {5,20}→20 ; 2000 {10}→10 ; null {15}→15 ; sum=45
+(count Rtkn) -- 3
+(sum (raze (at Rtkn 't))) -- 45
 
 ;; ════════════════════════════════════════════════════════════════════
 ;; 7. DA-path SYM aggregate value column — MIN / MAX / FIRST / LAST
@@ -261,14 +267,16 @@
 ;; (existing tests assert sums only; confirm element type round-trips).
 (set Ti16v2 (table [k v] (list (as 'I64 [1 1 2 2]) (as 'I16 [10 30 20 40]))))
 (set Ri16v2 (select {t: (top v 1) by: k from: Ti16v2}))
-(type (at Ri16v2 't)) -- 'I16
-(sum (at Ri16v2 't)) -- 70
+(type (at Ri16v2 't)) -- 'LIST
+(type (raze (at Ri16v2 't))) -- 'I16
+(sum (raze (at Ri16v2 't))) -- 70
 
 (set Tu8v2 (table [k v] (list (as 'I64 [1 1 2 2]) (as 'U8 [5 25 15 35]))))
 (set Ru8v2 (select {t: (bot v 1) by: k from: Tu8v2}))
-(type (at Ru8v2 't)) -- 'U8
+(type (at Ru8v2 't)) -- 'LIST
+(type (raze (at Ru8v2 't))) -- 'U8
 ;; bot-1: min per group → 5, 15 ; sum=20
-(sum (at Ru8v2 't)) -- 20
+(sum (raze (at Ru8v2 't))) -- 20
 
 ;; ════════════════════════════════════════════════════════════════════
 ;; 12. grpt rowform — TIMESTAMP key parallel (>=16384 rows)
@@ -285,7 +293,7 @@
 (max (at Rtspar 'k)) -- (as 'TIMESTAMP 499)
 ;; top-1 per group keeps the last v in 0..19999 with v%500==k; row v=19500+k
 ;; gives top-1, so sum of t = sum_{k=0..499}(19500+k) = 500*19500 + 124750 = 9874750.
-(sum (at Rtspar 't)) -- 9874750
+(sum (raze (at Rtspar 't))) -- 9874750
 
 ;; ════════════════════════════════════════════════════════════════════
 ;; 13. grpt rowform — DATE value parallel (>=16384 rows, F64-vs-int arm)
@@ -295,13 +303,14 @@
 (set Tdvpar (table [k v] (list (as 'I64 (% (til 20000) 1000)) (as 'DATE (+ 7000 (% (til 20000) 365))))))
 (set Rdvpar (select {t: (top v 1) by: k from: Tdvpar}))
 (count Rdvpar) -- 1000
-(type (at Rdvpar 't)) -- 'DATE
+(type (at Rdvpar 't)) -- 'LIST
+(type (raze (at Rdvpar 't))) -- 'DATE
 ;; key column is I64 0..999; sum = 999*1000/2 = 499500.
 (sum (at Rdvpar 'k)) -- 499500
 ;; v column = DATE(7000 + i%365); over 20000 rows the value at index
 ;; spans 7000..7364.  top-1 per k must pick a DATE in [7000,7364].
-(>= (min (at Rdvpar 't)) (as 'DATE 7000)) -- true
-(<= (max (at Rdvpar 't)) (as 'DATE 7364)) -- true
+(>= (min (raze (at Rdvpar 't))) (as 'DATE 7000)) -- true
+(<= (max (raze (at Rdvpar 't))) (as 'DATE 7364)) -- true
 
 ;; ════════════════════════════════════════════════════════════════════
 ;; 14. Per-(worker, partition) fused-radix HT direct-insert
@@ -748,26 +757,27 @@
 ;; min y per group: 5,35,65 → 105
 (sum (at R21a 'mn)) -- 105
 
-;; ─── 21b. maxmin_rowform with NULL y rows (grpmm_phase1_fn 11390) ──────
-;; In grpmm rowform, y-null skip drops the *entire row*, so groups only
-;; see x from surviving rows.  k=1 has only one survivor (x=20,y=5);
-;; k=2 has only one survivor (x=50,y=25).
+;; ─── 21b. max+min with NULL y rows ────────────────────────────────────
+;; v2 applies standard per-aggregate null semantics (matching every other
+;; group-by path): max x skips only null-x rows, min y skips only null-y
+;; rows — a null y does NOT drop the row from the x aggregate.
+;; k=1 x={10,20,30}→max 30, y={5}→min 5 ; k=2 x={40,50,60}→max 60, y={25}→min 25.
 (set T21b (table [k x y] (list (as 'I64 [1 1 1 2 2 2]) (as 'I64 [10 20 30 40 50 60]) (as 'I64 [0N 5 0N 0N 25 0N]))))
 (set R21b (select {mx: (max x) mn: (min y) by: k from: T21b}))
 (count R21b) -- 2
-;; surviving rows per group: k=1 {(20,5)} → mx=20, mn=5 ; k=2 {(50,25)} → mx=50, mn=25
-(sum (at R21b 'mx)) -- 70
+;; max x: 30,60 → 90 ; min y: 5,25 → 30
+(sum (at R21b 'mx)) -- 90
 (sum (at R21b 'mn)) -- 30
 
-;; ─── 21c. maxmin_rowform with NULL key rows (grpmm_phase1_fn 11391) ────
-;; Null-key rows are dropped before scatter.
+;; ─── 21c. max+min with NULL key rows ──────────────────────────────────
+;; v2 treats the null key as its own group (like every other group-by path).
 (set T21c (table [k x y] (list (as 'I64 [1 0N 1 2 0N 2 3 3]) (as 'I64 [10 20 30 40 50 60 70 80]) (as 'I64 [15 25 35 45 55 65 75 85]))))
 (set R21c (select {mx: (max x) mn: (min y) by: k from: T21c}))
-;; Non-null key groups: 1, 2, 3 → 3
-(count R21c) -- 3
-;; per non-null key: max x = {30, 60, 80}, min y = {15, 45, 75}
-(sum (at R21c 'mx)) -- 170
-(sum (at R21c 'mn)) -- 135
+;; key groups: 1, 2, 3 + null → 4
+(count R21c) -- 4
+;; per group (incl. null): max x = {30,60,80,50}=220, min y = {15,45,75,25}=160
+(sum (at R21c 'mx)) -- 220
+(sum (at R21c 'mn)) -- 160
 
 ;; ─── 21d. maxmin_rowform parallel (20000 rows → parallel grpmm) ────────
 ;; Parallel dispatch in grpmm_phase1/phase2 with single-key max(x)+min(y).
