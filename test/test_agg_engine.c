@@ -170,6 +170,183 @@ static test_result_t test_gate_admits_count(void) {
     PASS();
 }
 
+/* ── Dense-grouping eligibility selector (agg_dense_plan) ──────────────── */
+
+/* Resolve the streaming SUM(I64) vtable used by most dense-plan cases. */
+static const agg_vtable_t* dense_sum_i64_vt(void) {
+    return agg_resolve(OP_SUM, RAY_I64);
+}
+
+/* (a) single I64 key, values in [0,99] → dense, slots 100, stride 1. */
+static test_result_t test_dense_plan_single_i64(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    ray_t* k = ray_vec_new(RAY_I64, 100); k->len = 100;
+    int64_t* kd = (int64_t*)ray_data(k);
+    for (int64_t i = 0; i < 100; i++) kd[i] = i;   /* range [0,99] */
+
+    const agg_vtable_t* vt = dense_sum_i64_vt();
+    TEST_ASSERT_NOT_NULL(vt);
+
+    ray_t* keys[] = { k };
+    const agg_vtable_t* vts[] = { vt };
+    dense_plan_t pl = {0};
+    bool ok = agg_dense_plan(keys, 1, vts, 1, 100, &pl);
+
+    TEST_ASSERT_TRUE(ok);
+    TEST_ASSERT_TRUE(pl.ok);
+    TEST_ASSERT_EQ_I(pl.total_slots, 100);
+    TEST_ASSERT_EQ_I(pl.mins[0], 0);
+    TEST_ASSERT_EQ_I(pl.ranges[0], 100);
+    TEST_ASSERT_EQ_I(pl.strides[0], 1);
+
+    ray_release(k);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* (b) two I64 keys, ranges 100 and 50 → dense, slots 5000, strides {1,100}. */
+static test_result_t test_dense_plan_two_keys(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    ray_t* k1 = ray_vec_new(RAY_I64, 100); k1->len = 100;
+    ray_t* k2 = ray_vec_new(RAY_I64, 100); k2->len = 100;
+    int64_t* d1 = (int64_t*)ray_data(k1);
+    int64_t* d2 = (int64_t*)ray_data(k2);
+    for (int64_t i = 0; i < 100; i++) { d1[i] = i; d2[i] = i % 50; } /* ranges 100, 50 */
+
+    const agg_vtable_t* vt = dense_sum_i64_vt();
+    TEST_ASSERT_NOT_NULL(vt);
+
+    ray_t* keys[] = { k1, k2 };
+    const agg_vtable_t* vts[] = { vt };
+    dense_plan_t pl = {0};
+    bool ok = agg_dense_plan(keys, 2, vts, 1, 100, &pl);
+
+    TEST_ASSERT_TRUE(ok);
+    TEST_ASSERT_TRUE(pl.ok);
+    TEST_ASSERT_EQ_I(pl.total_slots, 5000);
+    TEST_ASSERT_EQ_I(pl.ranges[0], 100);
+    TEST_ASSERT_EQ_I(pl.ranges[1], 50);
+    TEST_ASSERT_EQ_I(pl.strides[0], 1);
+    TEST_ASSERT_EQ_I(pl.strides[1], 100);
+
+    ray_release(k1);
+    ray_release(k2);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* (c) single I64 key with huge range (0 and 10,000,000) → not dense (over cap). */
+static test_result_t test_dense_plan_huge_range(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    ray_t* k = ray_vec_new(RAY_I64, 2); k->len = 2;
+    int64_t* kd = (int64_t*)ray_data(k);
+    kd[0] = 0; kd[1] = 10000000;   /* range > DENSE_MAX_SLOTS */
+
+    const agg_vtable_t* vt = dense_sum_i64_vt();
+    TEST_ASSERT_NOT_NULL(vt);
+
+    ray_t* keys[] = { k };
+    const agg_vtable_t* vts[] = { vt };
+    dense_plan_t pl = {0};
+    bool ok = agg_dense_plan(keys, 1, vts, 1, 2, &pl);
+
+    TEST_ASSERT_FALSE(ok);
+    TEST_ASSERT_FALSE(pl.ok);
+
+    ray_release(k);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* (d) F64 key → not dense (unsupported key type). */
+static test_result_t test_dense_plan_f64_key(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    ray_t* k = ray_vec_new(RAY_F64, 8); k->len = 8;
+    double* kd = (double*)ray_data(k);
+    for (int64_t i = 0; i < 8; i++) kd[i] = (double)i;
+
+    const agg_vtable_t* vt = dense_sum_i64_vt();
+    TEST_ASSERT_NOT_NULL(vt);
+
+    ray_t* keys[] = { k };
+    const agg_vtable_t* vts[] = { vt };
+    dense_plan_t pl = {0};
+    bool ok = agg_dense_plan(keys, 1, vts, 1, 8, &pl);
+
+    TEST_ASSERT_FALSE(ok);
+    TEST_ASSERT_FALSE(pl.ok);
+
+    ray_release(k);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* (e) a MEDIAN agg (ACC_BUFFERED) present → not dense (buffered → defer). */
+static test_result_t test_dense_plan_buffered_agg(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    ray_t* k = ray_vec_new(RAY_I64, 8); k->len = 8;
+    int64_t* kd = (int64_t*)ray_data(k);
+    for (int64_t i = 0; i < 8; i++) kd[i] = i % 4;   /* small range, dense-eligible key */
+
+    const agg_vtable_t* med = agg_resolve(OP_MEDIAN, RAY_I64);
+    TEST_ASSERT_NOT_NULL(med);
+    TEST_ASSERT_TRUE(med->kind == ACC_BUFFERED);
+
+    ray_t* keys[] = { k };
+    const agg_vtable_t* vts[] = { med };
+    dense_plan_t pl = {0};
+    bool ok = agg_dense_plan(keys, 1, vts, 1, 8, &pl);
+
+    TEST_ASSERT_FALSE(ok);
+    TEST_ASSERT_FALSE(pl.ok);
+
+    ray_release(k);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* (f) I64 key with RAY_ATTR_HAS_NULLS → not dense (nullable key). */
+static test_result_t test_dense_plan_nullable_key(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    ray_t* k = ray_vec_new(RAY_I64, 8); k->len = 8;
+    int64_t* kd = (int64_t*)ray_data(k);
+    for (int64_t i = 0; i < 8; i++) kd[i] = i % 4;
+    k->attrs |= RAY_ATTR_HAS_NULLS;
+
+    const agg_vtable_t* vt = dense_sum_i64_vt();
+    TEST_ASSERT_NOT_NULL(vt);
+
+    ray_t* keys[] = { k };
+    const agg_vtable_t* vts[] = { vt };
+    dense_plan_t pl = {0};
+    bool ok = agg_dense_plan(keys, 1, vts, 1, 8, &pl);
+
+    TEST_ASSERT_FALSE(ok);
+    TEST_ASSERT_FALSE(pl.ok);
+
+    ray_release(k);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 /* Direct unit test for agg_group_keys (single key): first-occurrence dense gid
  * assignment. Key column {5,3,5,3,5,7} → gids {0,1,0,1,0,2},
  * first_row {0,1,5}, ngroups 3. */
@@ -1452,6 +1629,12 @@ const test_entry_t agg_engine_entries[] = {
     { "gate_admits_two_keys",        test_gate_admits_two_keys,        NULL, NULL },
     { "gate_defers_sum_i32",         test_gate_defers_sum_i32,         NULL, NULL },
     { "gate_admits_count",           test_gate_admits_count,           NULL, NULL },
+    { "dense_plan_single_i64",       test_dense_plan_single_i64,       NULL, NULL },
+    { "dense_plan_two_keys",         test_dense_plan_two_keys,         NULL, NULL },
+    { "dense_plan_huge_range",       test_dense_plan_huge_range,       NULL, NULL },
+    { "dense_plan_f64_key",          test_dense_plan_f64_key,          NULL, NULL },
+    { "dense_plan_buffered_agg",     test_dense_plan_buffered_agg,     NULL, NULL },
+    { "dense_plan_nullable_key",     test_dense_plan_nullable_key,     NULL, NULL },
     { "group_keys_i_first_occurrence", test_group_keys_i_first_occurrence, NULL, NULL },
     { "group_keys_i_i32",            test_group_keys_i_i32,            NULL, NULL },
     { "group_keys_multi",            test_group_keys_multi,            NULL, NULL },
