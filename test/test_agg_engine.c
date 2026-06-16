@@ -833,6 +833,140 @@ static ray_t* diff_make_2i64_hc(int64_t n, int64_t nk) {
     return tbl;
 }
 
+/* ── RADIX-FORCING builders (Phase 1c radix) ─────────────────────────────
+ * The radix path is selected for high-card STREAMING int/SYM-key queries whose
+ * DENSE plan is rejected (total_slots > DENSE_MAX_SLOTS=262144, or per-worker
+ * slab > 8MB).  These builders give a WIDE key value range so the dense plan
+ * fails and the selector routes to exec_group_v2_parallel_radix; the resulting
+ * table is still compared byte-for-byte (as a key-sorted multiset) vs the old
+ * engine.  At N=70000 (≥ RAY_PARALLEL_THRESHOLD) the parallel dispatch runs. */
+
+/* Single I64 key "k" = (i % 50000) * 7  (≈50000 groups, range ≈350000 >
+ * DENSE_MAX_SLOTS → dense plan rejected → radix).  I64 value "v" = i. */
+static ray_t* diff_make_i64_radix(int64_t n, int64_t nk) {
+    (void)nk;
+    ray_t* kvec = ray_vec_new(RAY_I64, n); kvec->len = n;
+    ray_t* vvec = ray_vec_new(RAY_I64, n); vvec->len = n;
+    int64_t* kd = (int64_t*)ray_data(kvec);
+    int64_t* vd = (int64_t*)ray_data(vvec);
+    for (int64_t i = 0; i < n; i++) {
+        kd[i] = (i % 50000) * 7;      /* wide range → dense rejected → radix */
+        vd[i] = i - n / 2;
+    }
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k", 1), kvec); ray_release(kvec);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("v", 1), vvec); ray_release(vvec);
+    return tbl;
+}
+
+/* Two I64 keys with WIDE composite range → dense plan rejected → radix.
+ * k1 = (i%4000)*5 (range ≈20000), k2 = ((i/4000)%4000)*5 → product of ranges
+ * ≫ DENSE_MAX_SLOTS.  ≈ up to 16M composite slots but only ~17500 live tuples
+ * at N=70000.  I64 value "v" = i. */
+static ray_t* diff_make_2i64_radix(int64_t n, int64_t nk) {
+    (void)nk;
+    ray_t* k1 = ray_vec_new(RAY_I64, n); k1->len = n;
+    ray_t* k2 = ray_vec_new(RAY_I64, n); k2->len = n;
+    ray_t* vv = ray_vec_new(RAY_I64, n); vv->len = n;
+    int64_t* d1 = (int64_t*)ray_data(k1);
+    int64_t* d2 = (int64_t*)ray_data(k2);
+    int64_t* vd = (int64_t*)ray_data(vv);
+    for (int64_t i = 0; i < n; i++) {
+        d1[i] = (i % 4000) * 5;
+        d2[i] = ((i / 4000) % 4000) * 5;
+        vd[i] = i - n / 2;
+    }
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k1", 2), k1); ray_release(k1);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k2", 2), k2); ray_release(k2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("v",  1), vv); ray_release(vv);
+    return tbl;
+}
+
+/* Single I64 key "k" = (i%50000)*7 + min/max value "v" = i*13 % 100003 - 50000.
+ * SUM+COUNT+MIN+MAX over a radix-routed key (init-on-first-sight for min/max). */
+static ray_t* diff_make_i64_radix_mm(int64_t n, int64_t nk) {
+    (void)nk;
+    ray_t* kvec = ray_vec_new(RAY_I64, n); kvec->len = n;
+    ray_t* vvec = ray_vec_new(RAY_I64, n); vvec->len = n;
+    int64_t* kd = (int64_t*)ray_data(kvec);
+    int64_t* vd = (int64_t*)ray_data(vvec);
+    for (int64_t i = 0; i < n; i++) {
+        kd[i] = (i % 50000) * 7;
+        vd[i] = (i * 13) % 100003 - 50000;
+    }
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k", 1), kvec); ray_release(kvec);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("v", 1), vvec); ray_release(vvec);
+    return tbl;
+}
+
+/* High-card pearson: single I64 key "k" = (i%20000)*17 (wide range → radix),
+ * F64 "x","y" varying at different rates so per-group r is finite. */
+static ray_t* diff_make_pearson_radix(int64_t n, int64_t nk) {
+    (void)nk;
+    ray_t* kvec = ray_vec_new(RAY_I64, n); kvec->len = n;
+    ray_t* xvec = ray_vec_new(RAY_F64, n); xvec->len = n;
+    ray_t* yvec = ray_vec_new(RAY_F64, n); yvec->len = n;
+    int64_t* kd = (int64_t*)ray_data(kvec);
+    double*  xd = (double*)ray_data(xvec);
+    double*  yd = (double*)ray_data(yvec);
+    for (int64_t i = 0; i < n; i++) {
+        kd[i] = (i % 20000) * 17;         /* range ≈340000 > DENSE_MAX_SLOTS */
+        xd[i] = (double)((i % 89) * 1.0);
+        yd[i] = (double)(((i * 7) % 83) * 1.0);
+    }
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k", 1), kvec); ray_release(kvec);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("x", 1), xvec); ray_release(xvec);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("y", 1), yvec); ray_release(yvec);
+    return tbl;
+}
+
+/* Q10-shape 6-key tuple (high card → radix): six int/SYM keys k1..k6 + I64 "v".
+ * Keys vary at independent rates so the 6-tuple space is broad (≈ thousands of
+ * live tuples at N=70000) and the composite range is astronomically larger than
+ * DENSE_MAX_SLOTS → dense rejected → radix exercises the 6-key tuple hash/eq. */
+static ray_t* diff_make_6keys_radix(int64_t n, int64_t nk) {
+    (void)nk;
+    ray_t* k1 = ray_vec_new(RAY_I64, n); k1->len = n;
+    ray_t* k2 = ray_vec_new(RAY_I32, n); k2->len = n;
+    ray_t* k3 = ray_vec_new(RAY_I16, n); k3->len = n;
+    ray_t* k4 = ray_sym_vec_new(RAY_SYM_W64, n); k4->len = n;
+    ray_t* k5 = ray_vec_new(RAY_I64, n); k5->len = n;
+    ray_t* k6 = ray_vec_new(RAY_I32, n); k6->len = n;
+    ray_t* vv = ray_vec_new(RAY_I64, n); vv->len = n;
+    int64_t* d1 = (int64_t*)ray_data(k1);
+    int32_t* d2 = (int32_t*)ray_data(k2);
+    int16_t* d3 = (int16_t*)ray_data(k3);
+    int64_t* d5 = (int64_t*)ray_data(k5);
+    int32_t* d6 = (int32_t*)ray_data(k6);
+    int64_t* vd = (int64_t*)ray_data(vv);
+    int64_t gid[16];
+    for (int64_t j = 0; j < 12; j++) {
+        char b[16]; int m = snprintf(b, sizeof(b), "s%lld", (long long)j);
+        gid[j] = ray_sym_intern(b, (size_t)m);
+    }
+    for (int64_t i = 0; i < n; i++) {
+        d1[i] = (i * 7 + 1) % 13;
+        d2[i] = (int32_t)((i * 5 + 2) % 11);
+        d3[i] = (int16_t)((i * 3 + 1) % 7);
+        ray_write_sym(ray_data(k4), i, (uint64_t)gid[(i * 2 + 1) % 12], RAY_SYM, k4->attrs);
+        d5[i] = (i / 4) % 17;
+        d6[i] = (int32_t)((i / 8) % 5);
+        vd[i] = i - n / 2;
+    }
+    ray_t* tbl = ray_table_new(7);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k1", 2), k1); ray_release(k1);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k2", 2), k2); ray_release(k2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k3", 2), k3); ray_release(k3);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k4", 2), k4); ray_release(k4);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k5", 2), k5); ray_release(k5);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k6", 2), k6); ray_release(k6);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("v",  1), vv); ray_release(vv);
+    return tbl;
+}
+
 /* ── multi-key table builders ───────────────────────────────────────── */
 
 /* Two I64 keys "k1","k2" + I64 value "v".  Keys vary at different rates so
@@ -1298,6 +1432,16 @@ static ray_op_t* gb_3k_count(ray_graph_t* g) {
     ray_op_t* keys[] = { k1, k2, k3 };
     return ray_group(g, keys, 3, ops, ins, 1);
 }
+/* Q10-shape: six keys k1..k6, single SUM(v). */
+static ray_op_t* gb_6k_sum(ray_graph_t* g) {
+    ray_op_t* k1 = ray_scan(g, "k1"); ray_op_t* k2 = ray_scan(g, "k2");
+    ray_op_t* k3 = ray_scan(g, "k3"); ray_op_t* k4 = ray_scan(g, "k4");
+    ray_op_t* k5 = ray_scan(g, "k5"); ray_op_t* k6 = ray_scan(g, "k6");
+    ray_op_t* v = ray_scan(g, "v");
+    uint16_t ops[] = { OP_SUM }; ray_op_t* ins[] = { v };
+    ray_op_t* keys[] = { k1, k2, k3, k4, k5, k6 };
+    return ray_group(g, keys, 6, ops, ins, 1);
+}
 static ray_op_t* gb_2k_avg(ray_graph_t* g) {
     ray_op_t* k1 = ray_scan(g, "k1"); ray_op_t* k2 = ray_scan(g, "k2");
     ray_op_t* v = ray_scan(g, "v");
@@ -1495,6 +1639,77 @@ static test_result_t test_diff_group_hc_distinct_count(void) {
 }
 
 /* ══════════════════════════════════════════════════════════════════════
+ * RADIX differentials (Phase 1c).  Wide key value ranges force the DENSE plan
+ * to be rejected so the selector routes these high-card STREAMING int/SYM-key
+ * queries to exec_group_v2_parallel_radix (256 disjoint hash partitions, no
+ * serial merge).  N=70000 ≥ RAY_PARALLEL_THRESHOLD → parallel.  Compared as a
+ * key-sorted MULTISET vs the OLD engine.  The group-count asserts double as the
+ * "high-card" guarantee (so dense is genuinely rejected).
+ * ══════════════════════════════════════════════════════════════════════ */
+
+/* ≈50000 groups: k=(i%50000)*7, SUM+COUNT → radix. */
+static test_result_t test_diff_group_radix_sumcount(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* big = diff_make_i64_radix(HC_N, 0);
+    int64_t ng = v2_group_count(big, gb_sum_count);
+    TEST_ASSERT_FMT(ng == 50000, "expected 50000 groups, got %lld", (long long)ng);
+    test_result_t r = diff_group(big, gb_sum_count, 1);
+    ray_release(big);
+    ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
+/* ≈50000 groups: k=(i%50000)*7, SUM+COUNT+MIN+MAX → radix (min/max init-on-sight). */
+static test_result_t test_diff_group_radix_minmax(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* big = diff_make_i64_radix_mm(HC_N, 0);
+    int64_t ng = v2_group_count(big, gb_four);
+    TEST_ASSERT_FMT(ng == 50000, "expected 50000 groups, got %lld", (long long)ng);
+    test_result_t r = diff_group(big, gb_four, 1);
+    ray_release(big);
+    ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
+/* Two I64 keys, wide composite range → radix, SUM. */
+static test_result_t test_diff_group_radix_2k_sum(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* big = diff_make_2i64_radix(HC_N, 0);
+    int64_t ng = v2_group_count(big, gb_2k_sum);
+    /* All (i%4000, i/4000) pairs distinct at N=70000 → 70000 groups; the wide
+     * composite range (≈1.7M slots > DENSE_MAX_SLOTS) is what forces radix. */
+    TEST_ASSERT_FMT(ng == 70000, "expected 70000 groups, got %lld", (long long)ng);
+    test_result_t r = diff_group(big, gb_2k_sum, 2);
+    ray_release(big);
+    ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
+/* High-card PEARSON over a radix-routed single I64 key. */
+static test_result_t test_diff_group_radix_pearson(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* big = diff_make_pearson_radix(HC_N, 0);
+    int64_t ng = v2_group_count(big, gb_pearson_1k);
+    TEST_ASSERT_FMT(ng == 20000, "expected 20000 groups, got %lld", (long long)ng);
+    test_result_t r = diff_group(big, gb_pearson_1k, 1);
+    ray_release(big);
+    ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
+/* Q10-shape 6-key tuple, high card → radix, SUM. */
+static test_result_t test_diff_group_radix_6k(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* big = diff_make_6keys_radix(HC_N, 0);
+    int64_t ng = v2_group_count(big, gb_6k_sum);
+    TEST_ASSERT_FMT(ng > 1000, "expected high-card 6-key tuple, got %lld", (long long)ng);
+    test_result_t r = diff_group(big, gb_6k_sum, 6);
+    ray_release(big);
+    ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
  * DETERMINISM: v2's first-occurrence order is "sort groups by min(row index)",
  * claimed worker-count-independent by construction (agg_engine.c Phase A tracks
  * MIN first_row per local group, Phase B keeps the global MIN, Phase C sorts by
@@ -1647,6 +1862,11 @@ const test_entry_t agg_engine_entries[] = {
     { "diff_group_hc_i64_sumcount",  test_diff_group_hc_i64_sumcount,  NULL, NULL },
     { "diff_group_hc_2k_sum",        test_diff_group_hc_2k_sum,        NULL, NULL },
     { "diff_group_hc_distinct_count", test_diff_group_hc_distinct_count, NULL, NULL },
+    { "diff_group_radix_sumcount",   test_diff_group_radix_sumcount,   NULL, NULL },
+    { "diff_group_radix_minmax",     test_diff_group_radix_minmax,     NULL, NULL },
+    { "diff_group_radix_2k_sum",     test_diff_group_radix_2k_sum,     NULL, NULL },
+    { "diff_group_radix_pearson",    test_diff_group_radix_pearson,    NULL, NULL },
+    { "diff_group_radix_6k",         test_diff_group_radix_6k,         NULL, NULL },
     { "diff_group_determinism_workers", test_diff_group_determinism_workers, NULL, NULL },
     { "gate_admits_i64_key_sum_i64", test_gate_admits_i64_key_sum_i64, NULL, NULL },
     { "gate_admits_two_keys",        test_gate_admits_two_keys,        NULL, NULL },
