@@ -29,6 +29,10 @@ add_executable(main ${CMAKE_SOURCE_DIR}/src/app/main.c)
 
 target_link_libraries(main rayforce)
 
+if (NOT WIN32)
+    target_link_libraries(main m pthread)
+endif()
+
 # test
 #file(GLOB_RECURSE TEST_SRC_FILES
 #        "${CMAKE_SOURCE_DIR}/test/*.c"
