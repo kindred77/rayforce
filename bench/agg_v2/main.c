@@ -20,6 +20,16 @@
  *   Q8  top(v3,2)                      by id6 (HIGH card)     (TOPK)
  *   S1  sum(v1)                        by id1  (low card)
  *   S2  sum(v1)                        by id6  (HIGH card)
+ *
+ * High-reduction always-scatter probe (adversarial): hold the group COUNT
+ * fixed and vary ONLY key DENSITY to isolate the radix "scatter all N rows"
+ * tax for shapes with very few groups but keys too wide for the dense cap.
+ *   R1d sum(v1),count by rk1d  (64 groups, key=i%64        → DENSE)
+ *   R1s sum(v1),count by rk1s  (64 groups, key=(i%64)*1e8  → RADIX, range>cap)
+ *   R2d sum(v1),count by rk2d  (4096 groups, key=i%4096     → DENSE)
+ *   R2s sum(v1),count by rk2s  (4096 groups, key=(i%4096)*1e8→ RADIX, range>cap)
+ * R*d and R*s produce identical group counts & aggregate results; only the
+ * key VALUES (hence the chosen strategy) differ.  sparse/dense time = the tax.
  */
 #if defined(__APPLE__)
 #  define _DARWIN_C_SOURCE
@@ -134,7 +144,14 @@ static void build_table(void) {
     int64_t* w1 = malloc((size_t)NROWS * sizeof(int64_t));
     int64_t* w2 = malloc((size_t)NROWS * sizeof(int64_t));
     double*  w3 = malloc((size_t)NROWS * sizeof(double));
-    if (!s1||!s2||!s3||!i4||!i5||!i6||!w1||!w2||!w3) { fprintf(stderr,"OOM gen\n"); abort(); }
+    /* High-reduction probe keys: same group COUNT, different key density. */
+    int64_t* r1d = malloc((size_t)NROWS * sizeof(int64_t));  /* i%64        */
+    int64_t* r1s = malloc((size_t)NROWS * sizeof(int64_t));  /* (i%64)*1e8  */
+    int64_t* r2d = malloc((size_t)NROWS * sizeof(int64_t));  /* i%4096      */
+    int64_t* r2s = malloc((size_t)NROWS * sizeof(int64_t));  /* (i%4096)*1e8*/
+    if (!s1||!s2||!s3||!i4||!i5||!i6||!w1||!w2||!w3||!r1d||!r1s||!r2d||!r2s) {
+        fprintf(stderr,"OOM gen\n"); abort();
+    }
 
     g_rng = 0xD1CE5EEDULL;  /* fixed seed */
     for (int64_t r = 0; r < NROWS; r++) {
@@ -147,9 +164,16 @@ static void build_table(void) {
         w1[r] = 1 + rng_range(V1_RANGE);
         w2[r] = 1 + rng_range(V2_RANGE);
         w3[r] = (double)rng_range(100000000LL) * 1e-3;  /* ~[0,1e5) */
+        /* deterministic dense/sparse key pairs (no PRNG: row-derived) */
+        int64_t g64   = r % 64;
+        int64_t g4096 = r % 4096;
+        r1d[r] = g64;                          /* range 0..63    → dense  */
+        r1s[r] = g64   * 100000001LL;          /* range 0..~6.3e9 → radix */
+        r2d[r] = g4096;                        /* range 0..4095  → dense  */
+        r2s[r] = g4096 * 100000001LL;          /* range 0..~4.1e11→ radix */
     }
 
-    g_tbl = ray_table_new(9);
+    g_tbl = ray_table_new(13);
     add_col("id1", build_sym_col(s1));
     add_col("id2", build_sym_col(s2));
     add_col("id3", build_sym_col(s3));
@@ -159,8 +183,13 @@ static void build_table(void) {
     add_col("v1",  build_i64_col(w1));
     add_col("v2",  build_i64_col(w2));
     add_col("v3",  build_f64_col(w3));
+    add_col("rk1d", build_i64_col(r1d));
+    add_col("rk1s", build_i64_col(r1s));
+    add_col("rk2d", build_i64_col(r2d));
+    add_col("rk2s", build_i64_col(r2s));
 
     free(s1);free(s2);free(s3);free(i4);free(i5);free(i6);free(w1);free(w2);free(w3);
+    free(r1d);free(r1s);free(r2d);free(r2s);
 }
 
 /* ---------- checksum: fold a result table into a single double ---------
@@ -249,7 +278,21 @@ static ray_op_t* s2_sum_id6(ray_graph_t* g) {    /* sum(v1) by id6 (HIGH card) *
     return ray_group(g, keys, 1, ops, ins, 1);
 }
 
-#define N_SHAPES 7
+/* High-reduction always-scatter probe: sum(v1),count by a fixed-group-count key.
+ * R1d/R2d use compact keys (→ DENSE); R1s/R2s use the SAME group count but
+ * sparse keys whose range exceeds DENSE_MAX_SLOTS (→ RADIX, scatters all N). */
+static ray_op_t* r_sumcount(ray_graph_t* g, const char* keycol) {
+    ray_op_t* keys[] = { ray_scan(g, keycol) };
+    uint16_t  ops[]  = { OP_SUM, OP_COUNT };
+    ray_op_t* ins[]  = { ray_scan(g,"v1"), ray_scan(g,"v1") };
+    return ray_group(g, keys, 1, ops, ins, 2);
+}
+static ray_op_t* r1_dense(ray_graph_t* g) { return r_sumcount(g, "rk1d"); }
+static ray_op_t* r1_sparse(ray_graph_t* g){ return r_sumcount(g, "rk1s"); }
+static ray_op_t* r2_dense(ray_graph_t* g) { return r_sumcount(g, "rk2d"); }
+static ray_op_t* r2_sparse(ray_graph_t* g){ return r_sumcount(g, "rk2s"); }
+
+#define N_SHAPES 11
 static const shape_meta_t SHAPES[N_SHAPES] = {
     {"Q7  max,min by id3",        "MAXMIN"},
     {"Q10 sum,count by id1..6",   "SUM_COUNT 6key"},
@@ -258,9 +301,14 @@ static const shape_meta_t SHAPES[N_SHAPES] = {
     {"Q8  top(v3,2) by id6",      "TOPK high-card"},
     {"S1  sum(v1) by id1",        "low-card"},
     {"S2  sum(v1) by id6",        "high-card"},
+    {"R1d sum,count 64g dense",   "64 groups DENSE"},
+    {"R1s sum,count 64g sparse",  "64 groups RADIX"},
+    {"R2d sum,count 4096g dense", "4096 groups DENSE"},
+    {"R2s sum,count 4096g sparse","4096 groups RADIX"},
 };
 static const build_fn BUILDERS[N_SHAPES] = {
     q7_maxmin, q10_sumcount, q9_pearson, q6_medstd, q8_top2, s1_sum_id1, s2_sum_id6,
+    r1_dense, r1_sparse, r2_dense, r2_sparse,
 };
 
 #define N_WARM 2
