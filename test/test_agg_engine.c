@@ -653,33 +653,6 @@ static test_result_t table_expect_equal(ray_t* a, ray_t* b, int n_keys) {
     return res;
 }
 
-/* STRICT row-order comparison: tables must match in EMIT order (no sort).
- * Used by the determinism gate — v2's first-occurrence ordering (sort groups
- * by min row index) is claimed worker-count-independent, so two runs that
- * differ only in worker count must be byte-identical row-for-row. */
-static test_result_t table_expect_identical(ray_t* a, ray_t* b) {
-    TEST_ASSERT(a && b && !RAY_IS_ERR(a) && !RAY_IS_ERR(b), "valid tables");
-    int64_t nca = ray_table_ncols(a), ncb = ray_table_ncols(b);
-    TEST_ASSERT_FMT(nca == ncb, "ncols %lld != %lld",
-                    (long long)nca, (long long)ncb);
-    int64_t nra = ray_table_nrows(a), nrb = ray_table_nrows(b);
-    TEST_ASSERT_FMT(nra == nrb, "nrows %lld != %lld",
-                    (long long)nra, (long long)nrb);
-    for (int64_t c = 0; c < nca; c++) {
-        TEST_ASSERT_FMT(ray_table_col_name(a, c) == ray_table_col_name(b, c),
-                        "col %lld name sym mismatch", (long long)c);
-        ray_t* ca = ray_table_get_col_idx(a, c);
-        ray_t* cb = ray_table_get_col_idx(b, c);
-        TEST_ASSERT_FMT(ca->type == cb->type, "col %lld type %d != %d",
-                        (long long)c, ca->type, cb->type);
-        for (int64_t r = 0; r < nra; r++)
-            TEST_ASSERT_FMT(cell_equal(ca, r, cb, r),
-                            "row %lld col %lld differs (not row-order identical)",
-                            (long long)r, (long long)c);
-    }
-    PASS();
-}
-
 typedef ray_op_t* (*group_builder_t)(ray_graph_t* g);
 
 /* Execute build() with the v2 flag OFF then ON; compare results as multisets
@@ -1776,10 +1749,12 @@ static test_result_t test_diff_group_radix_top2(void) {
  * get total worker counts {1,2,8} we init with n_workers {0,1,7}.
  *
  * We run the SAME high-card query at N=70000 across those worker counts and
- * assert ALL results are byte-identical INCLUDING EMIT ROW ORDER
- * (table_expect_identical) — proving first-occurrence order is worker-count-
- * independent.  A full {1,2,8}-worker CI matrix (design §9 / GAPS) is the
- * proper gate; this single-process version reaches it via pool reinit.
+ * assert ALL results carry the SAME GROUPS + VALUES, compared as a MULTISET
+ * (table_expect_equal sorts both sides by key first).  Group-by output ROW
+ * ORDER is now UNSPECIFIED (callers ORDER BY for order), so it may legitimately
+ * vary with worker count — only the {group, value} content must be invariant.
+ * A full {1,2,8}-worker CI matrix (design §9 / GAPS) is the proper gate; this
+ * single-process version reaches it via pool reinit.
  * ══════════════════════════════════════════════════════════════════════ */
 static test_result_t test_diff_group_determinism_workers(void) {
     ray_heap_init(); (void)ray_sym_init();
@@ -1809,9 +1784,10 @@ static test_result_t test_diff_group_determinism_workers(void) {
     ray_pool_destroy();
     ray_pool_init(0);
 
-    /* All three must be row-order identical to the first. */
+    /* All three must carry the same groups + values (multiset; row order is
+     * unspecified and may vary with worker count). gb_sum_count has 1 key col. */
     for (int c = 1; c < ncfg && res.status == TEST_PASS; c++)
-        res = table_expect_identical(results[0], results[c]);
+        res = table_expect_equal(results[0], results[c], 1);
 
     for (int c = 0; c < ncfg; c++)
         if (results[c]) ray_release(results[c]);
