@@ -295,7 +295,7 @@
 ;; Every TR1 row gets at least one matching TQ1 row in its window.
 (set TR1 (table [Sym Time Price] (list ['a 'a 'b] [10:00:01.000 10:00:05.000 10:00:01.000] [100 200 400])))
 (set TQ1 (table [Sym Time Bid]   (list ['a 'a 'a 'b] [10:00:00.000 10:00:02.000 10:00:04.000 10:00:00.000] [99 100 101 199])))
-(set IV  (map-right + [-2000 2000] (at TR1 'Time)))
+(set IV  (map-left + [-2000 2000] (at TR1 'Time)))
 (count (at (window-join [Sym Time] IV TR1 TQ1 {m: (min Bid)}) 'm)) -- 3
 
 ;; ====================================================================

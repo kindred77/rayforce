@@ -360,7 +360,7 @@
 ;; ────────────────────────────────────────────────────────────────────
 (set wjt_null (table [Sym Time] (list ['a] [10:00:03.000])))
 (set wjq_f64null (table [Sym Time Price] (list ['a 'a 'a 'a] [10:00:00.000 10:00:01.000 10:00:02.000 10:00:04.000] [0Nf 2.0 0Nf 4.0])))
-(set wji_null (map-right + [-3000 3000] (at wjt_null 'Time)))
+(set wji_null (map-left + [-3000 3000] (at wjt_null 'Time)))
 
 ;; F64 null sum (line 10059): nn != NULL → sum skips nulls → 2+4=6
 (at (window-join [Sym Time] wji_null wjt_null wjq_f64null {s: (sum Price)}) 's) -- [6.0]
@@ -433,7 +433,7 @@
 ;; ────────────────────────────────────────────────────────────────────
 (set wjt_i32 (table [Sym Time] (list ['a] [10:00:01.000])))
 (set wjq_i32 (table [Sym Time Price] (list ['a 'a] [10:00:00.000 10:00:02.000] (as 'I32 [10 20]))))
-(set wji_i32 (map-right + [-2000 2000] (at wjt_i32 'Time)))
+(set wji_i32 (map-left + [-2000 2000] (at wjt_i32 'Time)))
 
 ;; I32 result type (lines 10273-10274): first/max on I32 col → I32 output
 ;; Element at [0] of result is I32 atom 10i (first Price = 10i, max Price = 20i)
@@ -447,7 +447,7 @@
 ;; I64 null var/stddev (lines 10140-10141): null in I64 col + var → nn != NULL
 (set wjt_nullv (table [Sym Time] (list ['a] [10:00:03.000])))
 (set wjq_i64nv (table [Sym Time Price] (list ['a 'a 'a 'a] [10:00:00.000 10:00:01.000 10:00:02.000 10:00:04.000] [0Nl 2 0Nl 4])))
-(set wji_nullv (map-right + [-3000 3000] (at wjt_nullv 'Time)))
+(set wji_nullv (map-left + [-3000 3000] (at wjt_nullv 'Time)))
 ;; var of non-null [2, 4] = 2.0 (sample variance)
 (at (window-join [Sym Time] wji_nullv wjt_nullv wjq_i64nv {v: (var Price)}) 'v) -- [2.0]
 ;; stddev of non-null [2, 4] = sqrt(2.0) ≈ 1.41
