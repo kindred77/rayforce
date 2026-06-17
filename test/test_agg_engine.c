@@ -1713,6 +1713,55 @@ static test_result_t test_diff_group_radix_6k(void) {
     return r;
 }
 
+/* ── RADIX + BUFFERED differentials (Q8-shape) ───────────────────────────
+ * High-card int key (wide range → dense rejected) with a BUFFERED agg
+ * (median F64 / top_n LIST).  Routes through exec_group_v2_parallel_radix,
+ * which now runs the buffered init/update_batch/finalize/destroy lifecycle and
+ * (for top_n) the LIST-column emit.  Compared byte-for-byte vs the OLD hash
+ * engine — the new radix-buffered result must match exactly. */
+
+/* Single I64 key "k"=(i%50000)*7 (≈50000 groups → radix) + I64 value "v" wide,
+ * signed, distinct-ish (so top ordering is non-trivial). */
+static ray_t* diff_make_i64_radix_buf(int64_t n, int64_t nk) {
+    (void)nk;
+    ray_t* kvec = ray_vec_new(RAY_I64, n); kvec->len = n;
+    ray_t* vvec = ray_vec_new(RAY_I64, n); vvec->len = n;
+    int64_t* kd = (int64_t*)ray_data(kvec);
+    int64_t* vd = (int64_t*)ray_data(vvec);
+    for (int64_t i = 0; i < n; i++) {
+        kd[i] = (i % 50000) * 7;          /* wide range → dense rejected → radix */
+        vd[i] = (i * 37) % 9973 - 4986;   /* wide, signed, distinct-ish */
+    }
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k", 1), kvec); ray_release(kvec);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("v", 1), vvec); ray_release(vvec);
+    return tbl;
+}
+
+/* ≈50000 groups, MEDIAN (buffered, F64 out) → radix-buffered scalar emit. */
+static test_result_t test_diff_group_radix_median(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* big = diff_make_i64_radix_buf(HC_N, 0);
+    int64_t ng = v2_group_count(big, gb_median);
+    TEST_ASSERT_FMT(ng == 50000, "expected 50000 groups, got %lld", (long long)ng);
+    test_result_t r = diff_group(big, gb_median, 1);
+    ray_release(big);
+    ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
+/* ≈50000 groups, TOP2 (buffered, LIST out) → radix-buffered LIST emit. */
+static test_result_t test_diff_group_radix_top2(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* big = diff_make_i64_radix_buf(HC_N, 0);
+    int64_t ng = v2_group_count(big, gb_top2);
+    TEST_ASSERT_FMT(ng == 50000, "expected 50000 groups, got %lld", (long long)ng);
+    test_result_t r = diff_group(big, gb_top2, 1);
+    ray_release(big);
+    ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
 /* ══════════════════════════════════════════════════════════════════════
  * DETERMINISM: v2's first-occurrence order is "sort groups by min(row index)",
  * claimed worker-count-independent by construction (agg_engine.c Phase A tracks
@@ -1871,6 +1920,8 @@ const test_entry_t agg_engine_entries[] = {
     { "diff_group_radix_2k_sum",     test_diff_group_radix_2k_sum,     NULL, NULL },
     { "diff_group_radix_pearson",    test_diff_group_radix_pearson,    NULL, NULL },
     { "diff_group_radix_6k",         test_diff_group_radix_6k,         NULL, NULL },
+    { "diff_group_radix_median",     test_diff_group_radix_median,     NULL, NULL },
+    { "diff_group_radix_top2",       test_diff_group_radix_top2,       NULL, NULL },
     { "diff_group_determinism_workers", test_diff_group_determinism_workers, NULL, NULL },
     { "gate_admits_i64_key_sum_i64", test_gate_admits_i64_key_sum_i64, NULL, NULL },
     { "gate_admits_two_keys",        test_gate_admits_two_keys,        NULL, NULL },
