@@ -67,3 +67,20 @@
 (sum (at (ungroup R) 't)) -- 150
 ;; Each id replicated by its group size: two 1's and three 2's → sum 8.
 (sum (at (ungroup R) 'id)) -- 8
+
+;; ─── 9. All-empty nested cells → 0-row table, columns/names intact ───
+;; Every nested cell is [] → total == 0; flat key drops out entirely but
+;; the column set and names are preserved (valid empty result, no crash).
+(set T9 (table ['k 'v] (list [10 20] (list [] []))))
+(count (ungroup T9)) -- 0
+(key (ungroup T9)) -- (key T9)
+(count (at (ungroup T9) 'k)) -- 0
+(count (at (ungroup T9) 'v)) -- 0
+
+;; ─── 10. All-nested table (no flat/atom column) → flattened correctly ─
+;; No flat-replication path is exercised; both LIST columns are razed.
+(set T10 (table ['a 'b] (list (list [1 2] [3]) (list [10 20] [30]))))
+(count (ungroup T10)) -- 3
+(at (ungroup T10) 'a) -- [1 2 3]
+(at (ungroup T10) 'b) -- [10 20 30]
+(key (ungroup T10)) -- (key T10)

@@ -6177,6 +6177,52 @@ static test_result_t test_builtin_ungroup_fn(void) {
     ray_error_free(re);
     ray_release(atom);
 
+    /* Malformed nested cell #1: a NULL (unfilled) list slot.  ray_list_new
+     * zero-fills slots; pre-sizing len without filling leaves a NULL cell.
+     * ray_len(cell) would deref NULL (crash) — ungroup must reject it. */
+    {
+        ray_t* mk = ray_vec_new(RAY_I64, 1);
+        int64_t one = 1; mk = ray_vec_append(mk, &one);
+        ray_t* mv = ray_list_new(1);
+        mv->len = 1;  /* one slot, left NULL (zero-filled by ray_list_new) */
+        ray_t* mt = ray_table_new(2);
+        mt = ray_table_add_col(mt, ray_sym_intern("k", 1), mk);
+        mt = ray_table_add_col(mt, ray_sym_intern("v", 1), mv);
+        ray_t* mr = ray_ungroup_fn(mt);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(mr));
+        TEST_ASSERT_STR_EQ(ray_err_code(mr), "type");
+        ray_error_free(mr);
+        ray_release(mt);
+        ray_release(mk);
+        ray_release(mv);
+    }
+
+    /* Malformed nested cell #2: a boxed RAY_LIST cell.  Its top-level len
+     * would disagree with the scalar count raze emits → silent corruption.
+     * ungroup must reject it with a "type" error. */
+    {
+        ray_t* bk = ray_vec_new(RAY_I64, 1);
+        int64_t one = 1; bk = ray_vec_append(bk, &one);
+        ray_t* inner = ray_list_new(1);   /* boxed RAY_LIST nested cell */
+        ray_t* leaf = ray_vec_new(RAY_I64, 1);
+        leaf = ray_vec_append(leaf, &one);
+        inner = ray_list_append(inner, leaf);
+        ray_t* bv = ray_list_new(1);
+        bv = ray_list_append(bv, inner);  /* column cell is itself a RAY_LIST */
+        ray_t* bt = ray_table_new(2);
+        bt = ray_table_add_col(bt, ray_sym_intern("k", 1), bk);
+        bt = ray_table_add_col(bt, ray_sym_intern("v", 1), bv);
+        ray_t* br = ray_ungroup_fn(bt);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(br));
+        TEST_ASSERT_STR_EQ(ray_err_code(br), "type");
+        ray_error_free(br);
+        ray_release(bt);
+        ray_release(bk);
+        ray_release(inner);
+        ray_release(leaf);
+        ray_release(bv);
+    }
+
     ray_release(t);
     ray_release(k);
     ray_release(v);
