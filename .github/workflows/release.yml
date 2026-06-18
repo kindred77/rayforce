@@ -1,0 +1,94 @@
+name: Release
+
+# Fires when a release PR (dev -> master, titled vX.Y.Z) is merged. The git
+# tag is the single source of truth: this workflow CREATES the tag from the PR
+# title, builds the optimized binary per platform with the version injected at
+# compile time (make ... RAY_VERSION=X.Y.Z), and publishes a GitHub Release.
+# No source file is bumped and nothing is pushed to the protected master branch
+# — only a tag ref and a release are created, which GITHUB_TOKEN can do without
+# any bypass token. Non-release merges to master (title not vX.Y.Z) are ignored.
+
+on:
+  pull_request:
+    branches: [master]
+    types: [closed]
+
+permissions:
+  contents: write   # create the tag + the GitHub Release
+
+jobs:
+  prepare:
+    # Only on an actual merge whose title declares a release version.
+    if: >-
+      github.event.pull_request.merged == true &&
+      startsWith(github.event.pull_request.title, 'v')
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.parse.outputs.version }}
+    steps:
+      - name: Parse version from PR title
+        id: parse
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$PR_TITLE" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "Merged PR title '$PR_TITLE' is not a release version — skipping."
+            exit 1
+          fi
+          echo "version=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+
+      - name: Create tag and draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.parse.outputs.version }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        run: |
+          set -euo pipefail
+          # Creates tag vX.Y.Z at the merge commit AND a draft release in one
+          # step. Draft so artifacts attach before the release goes public.
+          gh release create "v$VERSION" \
+            --target "$MERGE_SHA" \
+            --title "v$VERSION" \
+            --generate-notes \
+            --draft
+
+  build:
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: macos-latest
+          # Windows is not build-ready yet (IOCP stub, unguarded POSIX in
+          # main.c/heap.c, no Makefile path). Add once the port lands:
+          # - os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v${{ needs.prepare.outputs.version }}
+
+      - name: Build release artifact
+        run: make dist RAY_VERSION=${{ needs.prepare.outputs.version }}
+
+      - name: Upload artifacts to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release upload "v${{ needs.prepare.outputs.version }}" \
+            dist/*.tar.gz dist/*.sha256 --clobber
+
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "v${{ needs.prepare.outputs.version }}" --draft=false
