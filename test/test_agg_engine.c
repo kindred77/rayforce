@@ -18,6 +18,7 @@
 #include "ops/agg_engine.h"
 #include "ops/agg_acc.h"
 #include "ops/agg_registry.h"
+#include "ops/rowsel.h"      /* ray_rowsel_from_pred, ray_rowsel_release */
 #include "core/pool.h"
 #include "table/sym.h"
 #include <stdlib.h>
@@ -561,20 +562,25 @@ static bool row_lt_composite(ray_t* tbl, int n_keys, int64_t pa, int64_t pb) {
 
 /* Build a row permutation that sorts `tbl` ascending by the COMPOSITE of key
  * columns 0..n_keys-1 (int-coded), stable by original index. Caller frees. */
+/* qsort context (the test runner is single-threaded). Group-by results have
+ * unique composite key tuples → no ties → qsort's instability is irrelevant. */
+static ray_t* g_perm_tbl;
+static int    g_perm_nkeys;
+static int perm_cmp(const void* pa, const void* pb) {
+    int64_t a = *(const int64_t*)pa, b = *(const int64_t*)pb;
+    if (row_lt_composite(g_perm_tbl, g_perm_nkeys, a, b)) return -1;
+    if (row_lt_composite(g_perm_tbl, g_perm_nkeys, b, a)) return 1;
+    return 0;
+}
+
 static int64_t* sort_perm_by_keys(ray_t* tbl, int n_keys) {
     int64_t n = ray_table_nrows(tbl);
     int64_t* perm = malloc((size_t)(n > 0 ? n : 1) * sizeof(int64_t));
     for (int64_t i = 0; i < n; i++) perm[i] = i;
-    /* insertion sort — n = ngroups is small for our shapes; stable */
-    for (int64_t i = 1; i < n; i++) {
-        int64_t p = perm[i];
-        int64_t j = i - 1;
-        while (j >= 0 && row_lt_composite(tbl, n_keys, p, perm[j])) {
-            perm[j + 1] = perm[j];
-            j--;
-        }
-        perm[j + 1] = p;
-    }
+    /* O(n log n) — n = ngroups reaches ~30000 on high-card radix shapes, where
+     * the previous O(n^2) insertion sort dominated the suite (300s+ per test). */
+    g_perm_tbl = tbl; g_perm_nkeys = n_keys;
+    qsort(perm, (size_t)(n > 0 ? n : 0), sizeof(int64_t), perm_cmp);
     return perm;
 }
 
@@ -674,6 +680,54 @@ static test_result_t diff_group(ray_t* tbl, group_builder_t build, int n_keys) {
     test_result_t res = table_expect_equal(old_r, new_r, n_keys);
     ray_release(old_r); ray_release(new_r);
     ray_graph_free(g1); ray_graph_free(g2);
+    return res;
+}
+
+/* ── WHERE-filtered differential (g->selection set) ─────────────────────
+ * The architectural-enabler path: a pushed WHERE filter installs a rowsel on
+ * g->selection before OP_GROUP.  We replicate exactly what the planner produces
+ * (FILTER → installs g->selection → OP_GROUP) by building a rowsel from a
+ * predicate vector and setting it directly, then dispatching OP_GROUP via
+ * exec_group with the v2 flag OFF (legacy applies the selection) then ON (the
+ * new compact-table prologue applies it).  Both honor g->selection; the results
+ * must match as a key-sorted MULTISET.
+ *
+ * `mask` is a caller-supplied predicate over [0,nrows): mask[i]!=0 ⇒ row i
+ * passes.  This deliberately bypasses the fused OP_FILTERED_GROUP op (we call
+ * the OP_GROUP executor directly), so even fused-accepted shapes exercise the
+ * general FILTER+OP_GROUP→exec_group_v2 selection path.  Empty selection
+ * (no row passes) yields a rowsel with total_pass==0 → correct empty result. */
+static ray_t* run_group_with_sel(ray_t* tbl, group_builder_t build,
+                                 const uint8_t* mask, int64_t nrows, bool v2) {
+    ray_agg_engine_v2 = v2;
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* grp = build(g);
+
+    /* Build a RAY_BOOL predicate vec → rowsel.  from_pred returns NULL when
+     * ALL rows pass (the "no selection" convention); we keep selection NULL in
+     * that case, which both engines treat as full-table. */
+    ray_t* pred = ray_vec_new(RAY_BOOL, nrows); pred->len = nrows;
+    uint8_t* pd = (uint8_t*)ray_data(pred);
+    for (int64_t i = 0; i < nrows; i++) pd[i] = mask[i] ? 1 : 0;
+    ray_t* sel = ray_rowsel_from_pred(pred);
+    ray_release(pred);
+    g->selection = sel;                   /* borrowed: released below */
+
+    ray_t* out = exec_group(g, grp, tbl, 0);
+    if (out && ray_is_lazy(out)) out = ray_lazy_materialize(out);
+
+    if (g->selection) { ray_rowsel_release(g->selection); g->selection = NULL; }
+    ray_graph_free(g);
+    ray_agg_engine_v2 = true;             /* restore default */
+    return out;
+}
+
+static test_result_t diff_group_sel(ray_t* tbl, group_builder_t build,
+                                    const uint8_t* mask, int64_t nrows, int n_keys) {
+    ray_t* old_r = run_group_with_sel(tbl, build, mask, nrows, false);
+    ray_t* new_r = run_group_with_sel(tbl, build, mask, nrows, true);
+    test_result_t res = table_expect_equal(old_r, new_r, n_keys);
+    ray_release(old_r); ray_release(new_r);
     return res;
 }
 
@@ -1546,6 +1600,73 @@ static test_result_t test_diff_group_top100(void) {
     return r;
 }
 
+/* ══════════════════════════════════════════════════════════════════════
+ * WHERE-FILTERED differentials (architectural enabler: g->selection routes
+ * through exec_group_v2's compact-table prologue).  Each runs OP_GROUP with a
+ * rowsel installed, flag OFF (legacy) vs ON (v2 compact path), and asserts the
+ * results match as a key-sorted MULTISET.  Selectivity, key arity, key type
+ * (incl. SYM domain), F64 values, fused-rejected aggs (var/median) and the
+ * empty selection (0 rows pass) are all covered across serial (N=13) and
+ * parallel (N=70000) sizes.
+ * ══════════════════════════════════════════════════════════════════════ */
+
+/* Selectivity predicates over row index i (deterministic, table-agnostic). */
+static uint8_t sel_high(int64_t i) { return (i % 17 == 0); }   /* ≈6% pass  */
+static uint8_t sel_low(int64_t i)  { return (i % 7 != 0); }    /* ≈86% pass */
+static uint8_t sel_none(int64_t i) { (void)i; return 0; }      /* 0% pass   */
+
+typedef uint8_t (*sel_pred_t)(int64_t);
+
+/* Build a mask of length n from a predicate; caller frees. */
+static uint8_t* sel_mask(sel_pred_t p, int64_t n) {
+    uint8_t* m = malloc((size_t)(n > 0 ? n : 1));
+    for (int64_t i = 0; i < n; i++) m[i] = p(i);
+    return m;
+}
+
+/* Run one filtered differential over a freshly-built table.  maker(n,nk) builds
+ * the table; builder builds the OP_GROUP; pred selects rows. */
+static test_result_t run_sel_case(ray_t* (*maker)(int64_t, int64_t),
+                                  int64_t n, int64_t nk, group_builder_t builder,
+                                  int n_keys, sel_pred_t pred) {
+    ray_t* tbl = maker(n, nk);
+    uint8_t* mask = sel_mask(pred, n);
+    test_result_t r = diff_group_sel(tbl, builder, mask, n, n_keys);
+    free(mask);
+    ray_release(tbl);
+    return r;
+}
+
+/* Generate a test running serial (N=13) + parallel (N=70000) at the three
+ * selectivities (high, low, none/empty). */
+#define SEL_SHAPE(name, maker, builder, nkeys, nk_small, nk_big)              \
+    static test_result_t name(void) {                                        \
+        ray_heap_init(); (void)ray_sym_init();                               \
+        test_result_t r = { TEST_PASS, NULL };                               \
+        sel_pred_t preds[] = { sel_high, sel_low, sel_none };                 \
+        for (int p = 0; p < 3 && r.status == TEST_PASS; p++)                  \
+            r = run_sel_case(maker, 13, (nk_small), builder, (nkeys), preds[p]); \
+        for (int p = 0; p < 3 && r.status == TEST_PASS; p++)                  \
+            r = run_sel_case(maker, 70000, (nk_big), builder, (nkeys), preds[p]); \
+        ray_sym_destroy(); ray_heap_destroy();                               \
+        return r;                                                            \
+    }
+
+/* single-key, fused-accepted aggs (sum/count/min/max/avg) */
+SEL_SHAPE(test_sel_i64_sum,     diff_make_i64,     gb_sum,    1, 4, 37)
+SEL_SHAPE(test_sel_i64_count,   diff_make_i64,     gb_count,  1, 4, 37)
+SEL_SHAPE(test_sel_i64_four,    diff_make_i64,     gb_four,   1, 4, 37)
+SEL_SHAPE(test_sel_f64_four,    diff_make_i64_f64, gb_f64_four, 1, 4, 37)
+/* single-key, fused-REJECTED aggs (var family, median) → general FILTER path */
+SEL_SHAPE(test_sel_i64_var,     diff_make_i64,     gb_var_all, 1, 4, 37)
+SEL_SHAPE(test_sel_i64_median,  diff_make_i64,     gb_median,  1, 4, 37)
+SEL_SHAPE(test_sel_mixed_med,   diff_make_i64,     gb_sum_median_count, 1, 4, 37)
+/* SYM key (domain must survive the gather) */
+SEL_SHAPE(test_sel_sym_sum,     diff_make_sym_i64, gb_sum,    1, 4, 37)
+/* multi-key */
+SEL_SHAPE(test_sel_2k_sum,      diff_make_2i64,    gb_2k_sum,  2, 4, 37)
+SEL_SHAPE(test_sel_2k_median,   diff_make_2i64,    gb_2k_median, 2, 4, 37)
+
 /* multi-key shapes (Phase 1b) */
 DIFF_SHAPE(test_diff_group_2k_sum,    diff_make_2i64,        gb_2k_sum,   2)
 DIFF_SHAPE(test_diff_group_2k_four,   diff_make_2i64,        gb_2k_four,  2)
@@ -1938,6 +2059,16 @@ const test_entry_t agg_engine_entries[] = {
     { "diff_group_radix_median",     test_diff_group_radix_median,     NULL, NULL },
     { "diff_group_radix_top2",       test_diff_group_radix_top2,       NULL, NULL },
     { "diff_group_determinism_workers", test_diff_group_determinism_workers, NULL, NULL },
+    { "sel_i64_sum",                 test_sel_i64_sum,                 NULL, NULL },
+    { "sel_i64_count",               test_sel_i64_count,               NULL, NULL },
+    { "sel_i64_four",                test_sel_i64_four,                NULL, NULL },
+    { "sel_f64_four",                test_sel_f64_four,                NULL, NULL },
+    { "sel_i64_var",                 test_sel_i64_var,                 NULL, NULL },
+    { "sel_i64_median",              test_sel_i64_median,              NULL, NULL },
+    { "sel_mixed_med",               test_sel_mixed_med,               NULL, NULL },
+    { "sel_sym_sum",                 test_sel_sym_sum,                 NULL, NULL },
+    { "sel_2k_sum",                  test_sel_2k_sum,                  NULL, NULL },
+    { "sel_2k_median",               test_sel_2k_median,               NULL, NULL },
     { "gate_admits_i64_key_sum_i64", test_gate_admits_i64_key_sum_i64, NULL, NULL },
     { "gate_admits_two_keys",        test_gate_admits_two_keys,        NULL, NULL },
     { "gate_defers_sum_i32",         test_gate_defers_sum_i32,         NULL, NULL },
