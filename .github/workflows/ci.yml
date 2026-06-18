@@ -38,3 +38,19 @@ jobs:
 
       - name: Test
         run: make test
+
+  # Single stable check to require in branch protection, instead of the four
+  # brittle matrix names (which break if the matrix is renamed). `if: always()`
+  # makes this job run even when a matrix leg fails, and the explicit result
+  # check fails it — without that, a failed matrix would SKIP this job, and a
+  # skipped required check can be treated as passed, silently opening the gate.
+  ci-success:
+    needs: build-and-test
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify all matrix jobs passed
+        run: |
+          result='${{ needs.build-and-test.result }}'
+          echo "build-and-test result: $result"
+          [ "$result" = "success" ] || exit 1

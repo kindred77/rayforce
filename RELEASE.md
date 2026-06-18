@@ -49,8 +49,13 @@ make dist RAY_VERSION=2.1.3
 ## One-time repository setup (GitHub)
 
 - **Branch protection / ruleset on `master`**: require a pull request before
-  merging; require the **CI** matrix and **Version Guard** status checks to pass;
-  disallow direct pushes.
+  merging; require these two status checks to pass, and disallow direct pushes:
+  - **`ci-success`** — a single aggregator job in `ci.yml` that goes green only
+    when every CI matrix leg (ubuntu/macOS × debug/release) passed. Require this
+    one instead of the four matrix names so renaming the matrix can't silently
+    drop the gate.
+  - **`check-version`** — the Version Guard job that validates the release
+    version in the PR title.
 - No release secret or bypass token is needed — the default `GITHUB_TOKEN`
   (`contents: write`) creates the tag and the release. The release workflow never
   pushes a commit to `master`, only a tag ref.
