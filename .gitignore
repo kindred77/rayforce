@@ -22,6 +22,7 @@ rf_test_*.csv
 CLAUDE.md
 docs/plans/
 docs/superpowers/
+docs/design/
 
 # IDE state
 .idea/
@@ -44,6 +45,7 @@ bench-group-pushdown
 bench-idx-route
 bench-join-buildside
 bench-join-dup
+bench-agg-v2
 
 # Rayforce REPL history
 .rayhist.dat
