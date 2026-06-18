@@ -46,19 +46,22 @@
 ;; ────────────────────────────────────────────────────────────────────
 (set Tmi (table [g h v] (list ['A 'B 'A 'B 'A] ['X 'X 'Y 'Y 'X] [1 2 3 4 5])))
 ;; Groups: (A,X)=[1,5], (B,X)=[2], (A,Y)=[3], (B,Y)=[4]
-;; Output group order (sorted by g then h): (A,X) (A,Y) (B,X) (B,Y)
-(at (select {m: (first (asc v)) by: [g h] from: Tmi}) 'g) -- ['A 'A 'B 'B]
-(at (select {m: (first (asc v)) by: [g h] from: Tmi}) 'h) -- ['X 'Y 'X 'Y]
+;; v2 emits in first-occurrence order of the (g,h) tuple, not sorted:
+;; rows give (A,X) (B,X) (A,Y) (B,Y).
+(at (select {m: (first (asc v)) by: [g h] from: Tmi}) 'g) -- ['A 'B 'A 'B]
+(at (select {m: (first (asc v)) by: [g h] from: Tmi}) 'h) -- ['X 'X 'Y 'Y]
 
-;; (first (asc v)): (A,X)=1 (A,Y)=3 (B,X)=2 (B,Y)=4 → sum=10
+;; (first (asc v)) per group: (A,X)=1 (B,X)=2 (A,Y)=3 (B,Y)=4 → sum=10.
+;; v2 first-occurrence order gives m=[1 2 3 4].
 (count (select {m: (first (asc v)) by: [g h] from: Tmi})) -- 4
 (sum (at (select {m: (first (asc v)) by: [g h] from: Tmi}) 'm)) -- 10
-(at (select {m: (first (asc v)) by: [g h] from: Tmi}) 'm) -- [1 3 2 4]
+(at (select {m: (first (asc v)) by: [g h] from: Tmi}) 'm) -- [1 2 3 4]
 
-;; (last (asc v)): (A,X)=5 (A,Y)=3 (B,X)=2 (B,Y)=4 → sum=14
+;; (last (asc v)) per group: (A,X)=5 (B,X)=2 (A,Y)=3 (B,Y)=4 → sum=14.
+;; v2 first-occurrence order gives m=[5 2 3 4].
 (count (select {m: (last (asc v)) by: [g h] from: Tmi})) -- 4
 (sum (at (select {m: (last (asc v)) by: [g h] from: Tmi}) 'm)) -- 14
-(at (select {m: (last (asc v)) by: [g h] from: Tmi}) 'm) -- [5 3 2 4]
+(at (select {m: (last (asc v)) by: [g h] from: Tmi}) 'm) -- [5 2 3 4]
 
 ;; (count (desc v)): (A,X)=2 (A,Y)=1 (B,X)=1 (B,Y)=1 → sum=5
 (count (select {n: (count (desc v)) by: [g h] from: Tmi})) -- 4

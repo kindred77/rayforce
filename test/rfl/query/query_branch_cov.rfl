@@ -762,9 +762,11 @@
 (set TMA (table [k v] (list ['a 'b 'a 'b 'a 'b] [1 2 3 4 5 6])))
 ;; Many aggregate outputs (≤ 8 for the fused gate's n_aggs_ok cap at 4712).
 (count (key (select {s: (sum v) mn: (min v) mx: (max v) av: (avg v) c: (count v) by: k from: TMA}))) -- 6
-;; > 8 agg outputs hits the planner's hard cap → 'nyi' error.  This
-;; exercises the cap-rejection branch in the multi-agg routing.
-(select {s1: (sum v) s2: (sum v) s3: (sum v) s4: (sum v) s5: (sum v) s6: (sum v) s7: (sum v) s8: (sum v) s9: (sum v) by: k from: TMA}) !- nyi
+;; > 8 agg outputs: the v2 engine has no such cap (the old multi-agg path's
+;; 'nyi' rejection is gone).  9 identical sums → 9 result columns + the key,
+;; each group's sum repeated: a→9 ([1,3,5]), b→12 ([2,4,6]).
+(count (key (select {s1: (sum v) s2: (sum v) s3: (sum v) s4: (sum v) s5: (sum v) s6: (sum v) s7: (sum v) s8: (sum v) s9: (sum v) by: k from: TMA}))) -- 10
+(at (select {s1: (sum v) s2: (sum v) s3: (sum v) s4: (sum v) s5: (sum v) s6: (sum v) s7: (sum v) s8: (sum v) s9: (sum v) by: k from: TMA}) 's9) -- [9 12]
 
 ;; ====================================================================
 ;; §33  Identity by-projection {k: k} interleaved with aggs — exercises

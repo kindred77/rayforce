@@ -1,0 +1,86 @@
+;; ════════════════════════════════════════════════════════════════════
+;; ungroup — flatten nested-list columns, replicate atom columns
+;; (row-form expansion; src/ops/builtins.c: ray_ungroup_fn)
+;;
+;; Grouping a non-aggregate (e.g. `top(2) by k`) yields a table with a
+;; nested LIST column (one list-of-values per group) alongside ATOM key
+;; columns.  `ungroup` flattens that to SQL/row-form shape: each nested
+;; cell at row i has length n_i; the flat columns are replicated n_i
+;; times and the nested columns are razed (concatenated) in row order.
+;; Output rows = Σ_i n_i.  A length-0 cell drops its row.
+;; ════════════════════════════════════════════════════════════════════
+
+;; ─── 1. Basic: I64 key replicated, F64-like vals flattened in order ───
+(set T1 (table ['k 'v] (list [10 20] (list [1 2 3] [4 5]))))
+(count (ungroup T1)) -- 5
+(at (ungroup T1) 'k) -- [10 10 10 20 20]
+(at (ungroup T1) 'v) -- [1 2 3 4 5]
+;; Column names and order preserved.
+(key (ungroup T1)) -- (key T1)
+
+;; ─── 2. SYM key column: domain preserved across replication ──────────
+(set T2 (table ['s 'v] (list (as 'SYMBOL ["x" "y"]) (list [1 2 3] [4 5]))))
+(count (ungroup T2)) -- 5
+(at (ungroup T2) 's) -- (as 'SYMBOL ["x" "x" "x" "y" "y"])
+(at (ungroup T2) 'v) -- [1 2 3 4 5]
+
+;; ─── 3. Variable lengths incl. length-1 and length-0 (row drops out) ──
+(set T3 (table ['k 'v] (list [10 20 30] (list [1 2] [] [3]))))
+;; Σ lengths = 2 + 0 + 1 = 3 ; row k=20 (empty cell) contributes nothing.
+(count (ungroup T3)) -- 3
+(at (ungroup T3) 'k) -- [10 10 30]
+(at (ungroup T3) 'v) -- [1 2 3]
+
+;; ─── 4. Multiple nested columns of EQUAL per-row length, lockstep ─────
+(set T4 (table ['k 'a 'b] (list [10 20] (list [1 2 3] [4 5]) (list [100 200 300] [400 500]))))
+(count (ungroup T4)) -- 5
+(at (ungroup T4) 'k) -- [10 10 10 20 20]
+(at (ungroup T4) 'a) -- [1 2 3 4 5]
+(at (ungroup T4) 'b) -- [100 200 300 400 500]
+
+;; ─── 5. Multiple nested columns of UNEQUAL length in a row → error ───
+(set T5 (table ['k 'a 'b] (list [10 20] (list [1 2 3] [4 5]) (list [100 200] [400 500]))))
+(ungroup T5) !- length
+
+;; ─── 6. No nested column → identity (returned unchanged) ─────────────
+(set T6 (table ['k 'v] (list [1 2 3] [10 20 30])))
+(ungroup T6) -- T6
+(count (ungroup T6)) -- 3
+
+;; ─── 7. Null preservation ────────────────────────────────────────────
+;; Flat column with a null in a replicated row keeps null across copies.
+(set T7 (table ['k 'v] (list (as 'I64 [10 0N]) (list [1 2] [3]))))
+(at (ungroup T7) 'k) -- [10 10 0Nl]
+(at (ungroup T7) 'v) -- [1 2 3]
+;; Nested column with a null element keeps it after flatten.
+(set T7b (table ['k 'v] (list [10 20] (list (as 'I64 [1 0N]) [3]))))
+(at (ungroup T7b) 'v) -- [1 0Nl 3]
+(at (ungroup T7b) 'k) -- [10 10 20]
+
+;; ─── 8. Round-trip: grouped top-K → LIST column → ungroup ────────────
+(set Tg (table ['id 'val] (list (as 'I64 [1 1 2 2 2]) (as 'I64 [10 20 30 40 50]))))
+(set R (select {t: (top val 5) by: id from: Tg}))
+;; R has 2 group rows; group id=1 holds 2 vals, id=2 holds 3 → 5 flat rows.
+(type (at R 't)) -- 'LIST
+(count (ungroup R)) -- 5
+;; Flattened values cover all of val (order is partition-induced; use sum).
+(sum (at (ungroup R) 't)) -- 150
+;; Each id replicated by its group size: two 1's and three 2's → sum 8.
+(sum (at (ungroup R) 'id)) -- 8
+
+;; ─── 9. All-empty nested cells → 0-row table, columns/names intact ───
+;; Every nested cell is [] → total == 0; flat key drops out entirely but
+;; the column set and names are preserved (valid empty result, no crash).
+(set T9 (table ['k 'v] (list [10 20] (list [] []))))
+(count (ungroup T9)) -- 0
+(key (ungroup T9)) -- (key T9)
+(count (at (ungroup T9) 'k)) -- 0
+(count (at (ungroup T9) 'v)) -- 0
+
+;; ─── 10. All-nested table (no flat/atom column) → flattened correctly ─
+;; No flat-replication path is exercised; both LIST columns are razed.
+(set T10 (table ['a 'b] (list (list [1 2] [3]) (list [10 20] [30]))))
+(count (ungroup T10)) -- 3
+(at (ungroup T10) 'a) -- [1 2 3]
+(at (ungroup T10) 'b) -- [10 20 30]
+(key (ungroup T10)) -- (key T10)

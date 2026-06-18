@@ -217,14 +217,13 @@
 (count Rprf_const) -- 3
 ;; all three groups have r2=NaN (undefined) since either dx=0 or dy=0
 
-;; ─── Pearson rowform: nullable I64 key (grpc_is_null I64 path) ─────────
-;; The planner routes nullable I64 key through exec_group_pearson_rowform
-;; (no HAS_NULLS check in prf_ok gate). grpc_phase1_fn calls grpc_is_null
-;; for each row with k0_has_nulls=true, skipping null-key rows.
+;; ─── Pearson: nullable I64 key ────────────────────────────────────────
+;; v2 treats the null key as its own group (like every other group-by path):
+;; keys 1, 2, and null → 3 groups.
 (set Tprf_nk (table [k x y] (list (as 'I64 [1 0N 2 1 0N 2]) (as 'F64 [1.0 2.0 3.0 4.0 5.0 6.0]) (as 'F64 [2.0 4.0 6.0 8.0 10.0 12.0]))))
 (set Rprf_nk (select {r: (pearson_corr x y) by: k from: Tprf_nk}))
-;; null-key rows are skipped; k=1 and k=2 each have 2 non-null rows.
-(count Rprf_nk) -- 2
-;; k=1: (1.0,2.0)(4.0,8.0) → y=2*x → r=1.0
-;; k=2: (3.0,6.0)(6.0,12.0) → y=2*x → r=1.0
+;; k=1, k=2, and the null group each have 2 rows, all with y=2*x → r=1.0.
+(count Rprf_nk) -- 3
+;; k=1: (1.0,2.0)(4.0,8.0) → r=1.0 ; k=2: (3.0,6.0)(6.0,12.0) → r=1.0
+;; null: (2.0,4.0)(5.0,10.0) → r=1.0
 (< (abs (- (min (at Rprf_nk 'r)) 1.0)) 0.001) -- true

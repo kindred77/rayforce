@@ -23,37 +23,40 @@
 ;; I64 val with nulls: 2 groups × 3 rows each, one null per group.
 ;; Top-1 per group keeps the max non-null → g=0 max=30, g=1 max=60.
 (set T_gt_i64 (table [k v] (list (as 'I64 [0 0 0 1 1 1]) (as 'I64 [10 0N 30 40 0N 60]))))
-(sum (at (select {t: (top v 1) by: k from: T_gt_i64}) 't)) -- 90
+;; v2 top/bot col is LIST (one cell per group); flatten to sum.
+(sum (raze (at (select {t: (top v 1) by: k from: T_gt_i64}) 't))) -- 90
 
 ;; F64 val with nulls: NaN-sentinel arm of grpt_is_null.
 (set T_gt_f64 (table [k v] (list (as 'I64 [0 0 0 1 1 1]) (as 'F64 [1.5 0N 3.5 4.5 0N 6.5]))))
-(sum (at (select {t: (top v 1) by: k from: T_gt_f64}) 't)) -- 10.0
+(sum (raze (at (select {t: (top v 1) by: k from: T_gt_f64}) 't))) -- 10.0
 
 ;; I32 val with nulls: I32/DATE/TIME arm.
 (set T_gt_i32 (table [k v] (list (as 'I64 [0 0 1 1]) (as 'I32 [100 0N 0N 400]))))
-(sum (at (select {t: (top v 1) by: k from: T_gt_i32}) 't)) -- 500
+(sum (raze (at (select {t: (top v 1) by: k from: T_gt_i32}) 't))) -- 500
 
 ;; I16 val with nulls: I16 arm.
 (set T_gt_i16 (table [k v] (list (as 'I64 [0 0 1 1]) (as 'I16 [7 0N 0N 11]))))
-(sum (at (select {t: (top v 1) by: k from: T_gt_i16}) 't)) -- 18
+(sum (raze (at (select {t: (top v 1) by: k from: T_gt_i16}) 't))) -- 18
 
-;; I64 KEY with nulls: hits the knulls branch (line 9228) — null-key rows
-;; are dropped, so the result row count drops below n_distinct_keys.
-;; Two non-null keys (0, 1) + one null key → 2 output rows, not 3.
+;; I64 KEY with nulls: v2 treats the null key as its own group (like every
+;; other group-by path) → keys 0, 1, and null → 3 output rows.
 (set T_gt_kn (table [k v] (list (as 'I64 [0 0N 1]) (as 'I64 [5 9 7]))))
-(count (select {t: (top v 1) by: k from: T_gt_kn})) -- 2
-(sum (at (select {t: (top v 1) by: k from: T_gt_kn}) 't)) -- 12
+(count (select {t: (top v 1) by: k from: T_gt_kn})) -- 3
+;; top-1: k=0→5, k=1→7, null→9 → sum = 21
+(sum (raze (at (select {t: (top v 1) by: k from: T_gt_kn}) 't))) -- 21
 
 ;; TIMESTAMP val with nulls: shares the I64/TIMESTAMP switch arm but the
 ;; column type is RAY_TIMESTAMP so the (kt, vt) acceptance check at
 ;; src/ops/group.c:9474 lets it through with TIMESTAMP val.
 (set T_gt_ts (table [k v] (list (as 'I64 [0 0 1 1]) (as 'TIMESTAMP [1000 0N 0N 4000]))))
+;; null VALUES (not key) are skipped within groups; 2 key groups → 2 rows.
 (count (select {t: (top v 1) by: k from: T_gt_ts})) -- 2
 
 ;; DATE key with nulls: hits the I32/DATE/TIME arm via key path.
 ;; (DATE is the I32 sentinel; key dispatch reads via grpt_is_null with kt=DATE.)
 (set T_gt_dk (table [k v] (list (as 'DATE [7305 0N 7306]) (as 'I64 [11 22 33]))))
-(count (select {t: (top v 1) by: k from: T_gt_dk})) -- 2
+;; v2: null DATE key is its own group → 7305, 7306, null → 3 rows.
+(count (select {t: (top v 1) by: k from: T_gt_dk})) -- 3
 
 ;; ─── grpc_is_null: pearson_corr rowform with null-bearing val column ──
 ;; Shape: (pearson_corr x y) by k  → routes to exec_group_pearson_rowform.
@@ -83,15 +86,15 @@
 (set T_gp_i16 (table [g x y] (list [A A A A B B B B] (as 'I16 [1 0N 3 4 1 0N 3 4]) (as 'I64 [2 4 6 8 5 4 3 2]))))
 (count (select {r: (pearson_corr x y) by: g from: T_gp_i16})) -- 2
 
-;; I64 key with nulls: hits c->k0_has_nulls branch (line 9918) — null
-;; key rows are skipped.  2 non-null keys + 1 null → 2 result groups.
+;; I64 key with nulls: v2 treats the null key as its own group (like every
+;; other group-by path) → keys 0, 1, and null → 3 result groups.
 (set T_gp_kn (table [k x y] (list (as 'I64 [0 0 0N 0N 1 1]) (as 'F64 [1.0 2.0 9.0 9.0 3.0 4.0]) (as 'F64 [2.0 4.0 9.0 9.0 6.0 8.0]))))
-(count (select {r: (pearson_corr x y) by: k from: T_gp_kn})) -- 2
+(count (select {r: (pearson_corr x y) by: k from: T_gp_kn})) -- 3
 
-;; Two-key path (n_keys=2): k1_has_nulls check (line 9919-9920).
-;; Both keys carry HAS_NULLS; rows with EITHER key null are skipped.
+;; Two-key path (n_keys=2): v2 treats null key components as regular values,
+;; so distinct tuples are (0,10),(0N,20),(1,0N),(1,20) → 4 groups.
 (set T_gp_2k (table [k0 k1 x y] (list (as 'I64 [0 0 0N 1 1]) (as 'I32 [10 10 20 0N 20]) (as 'F64 [1.0 2.0 9.0 9.0 3.0]) (as 'F64 [2.0 4.0 9.0 9.0 6.0]))))
-(count (select {r: (pearson_corr x y) by: [k0 k1] from: T_gp_2k})) -- 2
+(count (select {r: (pearson_corr x y) by: [k0 k1] from: T_gp_2k})) -- 4
 
 ;; ─── cdpg_is_null: count(distinct v) per group, n_rows >= 200000 ─────
 ;; Routes through ray_count_distinct_per_group →
