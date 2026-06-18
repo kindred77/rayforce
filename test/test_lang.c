@@ -6107,6 +6107,130 @@ static test_result_t test_builtin_raze_fn(void) {
     PASS();
 }
 
+/* ── builtins.c coverage: ray_ungroup_fn ────────────────────────────────────
+ * ray_ungroup_fn flattens nested-list columns and replicates flat columns. */
+static test_result_t test_builtin_ungroup_fn(void) {
+    /* Build {k: I64 [10 20], v: LIST [(1 2 3); (4 5)]} */
+    ray_t* k = ray_vec_new(RAY_I64, 2);
+    int64_t kv[2] = {10, 20};
+    k = ray_vec_append(k, &kv[0]);
+    k = ray_vec_append(k, &kv[1]);
+
+    ray_t* c0 = ray_vec_new(RAY_I64, 3);
+    int64_t a0[3] = {1, 2, 3};
+    for (int i = 0; i < 3; i++) c0 = ray_vec_append(c0, &a0[i]);
+    ray_t* c1 = ray_vec_new(RAY_I64, 2);
+    int64_t a1[2] = {4, 5};
+    for (int i = 0; i < 2; i++) c1 = ray_vec_append(c1, &a1[i]);
+    ray_t* v = ray_list_new(2);
+    v = ray_list_append(v, c0);
+    v = ray_list_append(v, c1);
+
+    ray_t* t = ray_table_new(2);
+    t = ray_table_add_col(t, ray_sym_intern("k", 1), k);
+    t = ray_table_add_col(t, ray_sym_intern("v", 1), v);
+
+    ray_t* r = ray_ungroup_fn(t);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->type, RAY_TABLE);
+    TEST_ASSERT_EQ_I(ray_table_ncols(r), 2);
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 5);
+
+    /* k replicated 3+2 = [10 10 10 20 20] */
+    ray_t* rk = ray_table_get_col_idx(r, 0);
+    TEST_ASSERT_EQ_I(rk->type, RAY_I64);
+    TEST_ASSERT_EQ_I(rk->len, 5);
+    int64_t* rkd = (int64_t*)ray_data(rk);
+    TEST_ASSERT_EQ_I(rkd[0], 10); TEST_ASSERT_EQ_I(rkd[1], 10);
+    TEST_ASSERT_EQ_I(rkd[2], 10); TEST_ASSERT_EQ_I(rkd[3], 20);
+    TEST_ASSERT_EQ_I(rkd[4], 20);
+    /* v flattened = [1 2 3 4 5] */
+    ray_t* rv = ray_table_get_col_idx(r, 1);
+    TEST_ASSERT_EQ_I(rv->type, RAY_I64);
+    TEST_ASSERT_EQ_I(rv->len, 5);
+    int64_t* rvd = (int64_t*)ray_data(rv);
+    for (int i = 0; i < 5; i++) TEST_ASSERT_EQ_I(rvd[i], i + 1);
+    ray_release(r);
+
+    /* No nested column → identity (same pointer, retained). */
+    ray_t* k2 = ray_vec_new(RAY_I64, 2);
+    k2 = ray_vec_append(k2, &kv[0]);
+    k2 = ray_vec_append(k2, &kv[1]);
+    ray_t* w = ray_vec_new(RAY_I64, 2);
+    w = ray_vec_append(w, &kv[0]);
+    w = ray_vec_append(w, &kv[1]);
+    ray_t* flat = ray_table_new(2);
+    flat = ray_table_add_col(flat, ray_sym_intern("k", 1), k2);
+    flat = ray_table_add_col(flat, ray_sym_intern("w", 1), w);
+    ray_t* ri = ray_ungroup_fn(flat);
+    TEST_ASSERT_EQ_PTR(ri, flat);  /* identity returns the same table */
+    ray_release(ri);
+    ray_release(flat);
+    ray_release(k2);
+    ray_release(w);
+
+    /* Non-table operand → type error. */
+    ray_t* atom = ray_i64(7);
+    ray_t* re = ray_ungroup_fn(atom);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(re));
+    ray_error_free(re);
+    ray_release(atom);
+
+    /* Malformed nested cell #1: a NULL (unfilled) list slot.  ray_list_new
+     * zero-fills slots; pre-sizing len without filling leaves a NULL cell.
+     * ray_len(cell) would deref NULL (crash) — ungroup must reject it. */
+    {
+        ray_t* mk = ray_vec_new(RAY_I64, 1);
+        int64_t one = 1; mk = ray_vec_append(mk, &one);
+        ray_t* mv = ray_list_new(1);
+        mv->len = 1;  /* one slot, left NULL (zero-filled by ray_list_new) */
+        ray_t* mt = ray_table_new(2);
+        mt = ray_table_add_col(mt, ray_sym_intern("k", 1), mk);
+        mt = ray_table_add_col(mt, ray_sym_intern("v", 1), mv);
+        ray_t* mr = ray_ungroup_fn(mt);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(mr));
+        TEST_ASSERT_STR_EQ(ray_err_code(mr), "type");
+        ray_error_free(mr);
+        ray_release(mt);
+        ray_release(mk);
+        ray_release(mv);
+    }
+
+    /* Malformed nested cell #2: a boxed RAY_LIST cell.  Its top-level len
+     * would disagree with the scalar count raze emits → silent corruption.
+     * ungroup must reject it with a "type" error. */
+    {
+        ray_t* bk = ray_vec_new(RAY_I64, 1);
+        int64_t one = 1; bk = ray_vec_append(bk, &one);
+        ray_t* inner = ray_list_new(1);   /* boxed RAY_LIST nested cell */
+        ray_t* leaf = ray_vec_new(RAY_I64, 1);
+        leaf = ray_vec_append(leaf, &one);
+        inner = ray_list_append(inner, leaf);
+        ray_t* bv = ray_list_new(1);
+        bv = ray_list_append(bv, inner);  /* column cell is itself a RAY_LIST */
+        ray_t* bt = ray_table_new(2);
+        bt = ray_table_add_col(bt, ray_sym_intern("k", 1), bk);
+        bt = ray_table_add_col(bt, ray_sym_intern("v", 1), bv);
+        ray_t* br = ray_ungroup_fn(bt);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(br));
+        TEST_ASSERT_STR_EQ(ray_err_code(br), "type");
+        ray_error_free(br);
+        ray_release(bt);
+        ray_release(bk);
+        ray_release(inner);
+        ray_release(leaf);
+        ray_release(bv);
+    }
+
+    ray_release(t);
+    ray_release(k);
+    ray_release(v);
+    ray_release(c0);
+    ray_release(c1);
+    PASS();
+}
+
 /* ── builtins.c coverage: ray_within_fn ─────────────────────────────────────
  * ray_within_fn returns bool vec: true where lo <= val <= hi. */
 static test_result_t test_builtin_within_fn(void) {
@@ -7072,6 +7196,7 @@ const test_entry_t lang_entries[] = {
     { "lang/builtin/where_fn",            test_builtin_where_fn,            lang_setup, lang_teardown },
     { "lang/builtin/format_fn",           test_builtin_format_fn,           lang_setup, lang_teardown },
     { "lang/builtin/raze_fn",             test_builtin_raze_fn,             lang_setup, lang_teardown },
+    { "lang/builtin/ungroup_fn",          test_builtin_ungroup_fn,          lang_setup, lang_teardown },
     { "lang/builtin/within_fn",           test_builtin_within_fn,           lang_setup, lang_teardown },
     { "lang/builtin/idiv_fn",             test_builtin_idiv_fn,             lang_setup, lang_teardown },
     { "lang/builtin/concat_fn",           test_builtin_concat_fn,           lang_setup, lang_teardown },

@@ -30,10 +30,11 @@
 ;; All 4 rows have unique (k1,k2,k3) tuples, so 4 groups each of size 1.
 (count (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: T})) -- 4
 ;; Sum across all groups = sum of v = 100; count total = 4.
-(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: T}) 'tot)) -- 100.0
+(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: T}) 'tot)) -- 100
 (sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: T}) 'cnt)) -- 4
-;; Sum column is F64 (executor always emits F64 sum); count is I64.
-(type (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: T}) 'tot)) -- 'F64
+;; v2 sum preserves the input type (I64 sum of I64), matching the standard
+;; group-by sum path (the old rowform executor forced F64); count is I64.
+(type (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: T}) 'tot)) -- 'I64
 (type (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: T}) 'cnt)) -- 'I64
 ;; PER-GROUP: pin the actual scatter.  Group emission order is partition-induced
 ;; and NOT guaranteed stable across runs, so each group is looked up by its
@@ -41,10 +42,10 @@
 ;; changes these per-group sums while leaving the total (100) untouched, so the
 ;; total check alone is blind.  v=[10,20,30,40] keyed by k1=[0,0,1,1] k2=[0,1,0,1].
 (set Rb (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: T}))
-(first (at (at Rb 'tot) (where (and (== 0 (at Rb 'k1)) (== 0 (at Rb 'k2)))))) -- 10.0
-(first (at (at Rb 'tot) (where (and (== 0 (at Rb 'k1)) (== 1 (at Rb 'k2)))))) -- 20.0
-(first (at (at Rb 'tot) (where (and (== 1 (at Rb 'k1)) (== 0 (at Rb 'k2)))))) -- 30.0
-(first (at (at Rb 'tot) (where (and (== 1 (at Rb 'k1)) (== 1 (at Rb 'k2)))))) -- 40.0
+(first (at (at Rb 'tot) (where (and (== 0 (at Rb 'k1)) (== 0 (at Rb 'k2)))))) -- 10
+(first (at (at Rb 'tot) (where (and (== 0 (at Rb 'k1)) (== 1 (at Rb 'k2)))))) -- 20
+(first (at (at Rb 'tot) (where (and (== 1 (at Rb 'k1)) (== 0 (at Rb 'k2)))))) -- 30
+(first (at (at Rb 'tot) (where (and (== 1 (at Rb 'k1)) (== 1 (at Rb 'k2)))))) -- 40
 ;; every group is a singleton
 (min (at Rb 'cnt)) -- 1
 (max (at Rb 'cnt)) -- 1
@@ -53,11 +54,11 @@
 (set Tg (table [k1 k2 k3 v] (list (as 'I64 [0 0 0 1 1]) (as 'I64 [0 0 1 0 0]) (as 'I64 [0 0 0 0 0]) (as 'I64 [10 20 30 40 50]))))
 ;; Distinct (k1,k2,k3): (0,0,0)->v={10,20}=30, (0,1,0)->v=30, (1,0,0)->v={40,50}=90.
 (count (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tg})) -- 3
-(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tg}) 'tot)) -- 150.0
+(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tg}) 'tot)) -- 150
 (sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tg}) 'cnt)) -- 5
 ;; Verify max per-group sum is 90 (from (1,0,0)) and min 30 (from one of the singletons).
-(max (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tg}) 'tot)) -- 90.0
-(min (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tg}) 'tot)) -- 30.0
+(max (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tg}) 'tot)) -- 90
+(min (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tg}) 'tot)) -- 30
 (max (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tg}) 'cnt)) -- 2
 (min (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tg}) 'cnt)) -- 1
 ;; PER-GROUP: min/max can't tell the two 30-sum groups apart, nor bind sum to
@@ -67,25 +68,25 @@
 (set gm00 (and (== 0 (at Rgv 'k1)) (== 0 (at Rgv 'k2))))
 (set gm01 (and (== 0 (at Rgv 'k1)) (== 1 (at Rgv 'k2))))
 (set gm10 (and (== 1 (at Rgv 'k1)) (== 0 (at Rgv 'k2))))
-(first (at (at Rgv 'tot) (where gm00))) -- 30.0
+(first (at (at Rgv 'tot) (where gm00))) -- 30
 (first (at (at Rgv 'cnt) (where gm00))) -- 2
-(first (at (at Rgv 'tot) (where gm01))) -- 30.0
+(first (at (at Rgv 'tot) (where gm01))) -- 30
 (first (at (at Rgv 'cnt) (where gm01))) -- 1
-(first (at (at Rgv 'tot) (where gm10))) -- 90.0
+(first (at (at Rgv 'tot) (where gm10))) -- 90
 (first (at (at Rgv 'cnt) (where gm10))) -- 2
 
 ;; ─── 4 keys ─────────────────────────────────────────────────────────
 (set T4 (table [k1 k2 k3 k4 v] (list (as 'I64 [0 0 1 1]) (as 'I64 [0 1 0 1]) (as 'I64 [0 0 0 0]) (as 'I64 [0 0 0 0]) (as 'I64 [1 2 3 4]))))
 (count (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4] from: T4})) -- 4
-(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4] from: T4}) 'tot)) -- 10.0
+(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4] from: T4}) 'tot)) -- 10
 (sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4] from: T4}) 'cnt)) -- 4
 ;; PER-GROUP: 4 singletons; look up each tot by its (k1,k2) tuple.
 ;; v=[1,2,3,4] keyed by k1=[0,0,1,1] k2=[0,1,0,1].
 (set R4v (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4] from: T4}))
-(first (at (at R4v 'tot) (where (and (== 0 (at R4v 'k1)) (== 0 (at R4v 'k2)))))) -- 1.0
-(first (at (at R4v 'tot) (where (and (== 0 (at R4v 'k1)) (== 1 (at R4v 'k2)))))) -- 2.0
-(first (at (at R4v 'tot) (where (and (== 1 (at R4v 'k1)) (== 0 (at R4v 'k2)))))) -- 3.0
-(first (at (at R4v 'tot) (where (and (== 1 (at R4v 'k1)) (== 1 (at R4v 'k2)))))) -- 4.0
+(first (at (at R4v 'tot) (where (and (== 0 (at R4v 'k1)) (== 0 (at R4v 'k2)))))) -- 1
+(first (at (at R4v 'tot) (where (and (== 0 (at R4v 'k1)) (== 1 (at R4v 'k2)))))) -- 2
+(first (at (at R4v 'tot) (where (and (== 1 (at R4v 'k1)) (== 0 (at R4v 'k2)))))) -- 3
+(first (at (at R4v 'tot) (where (and (== 1 (at R4v 'k1)) (== 1 (at R4v 'k2)))))) -- 4
 (min (at R4v 'cnt)) -- 1
 (max (at R4v 'cnt)) -- 1
 
@@ -93,7 +94,7 @@
 (set T5 (table [k1 k2 k3 k4 k5 v] (list (as 'I64 [0 0 1 1 0]) (as 'I64 [0 1 0 1 0]) (as 'I64 [0 0 0 0 0]) (as 'I64 [0 0 0 0 0]) (as 'I64 [0 0 0 0 0]) (as 'I64 [10 20 30 40 100]))))
 ;; (0,0,0,0,0) seen twice (rows 0 and 4) -> sum 110, count 2.  Three other singletons.
 (count (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4 k5] from: T5})) -- 4
-(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4 k5] from: T5}) 'tot)) -- 200.0
+(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4 k5] from: T5}) 'tot)) -- 200
 (sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4 k5] from: T5}) 'cnt)) -- 5
 (max (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4 k5] from: T5}) 'cnt)) -- 2
 ;; PER-GROUP: max-count alone doesn't bind the 110-sum to the count-2 group.
@@ -101,50 +102,50 @@
 ;; other three are singletons.  Look up each group by its (k1,k2) tuple.
 (set R5v (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4 k5] from: T5}))
 (set m500 (and (== 0 (at R5v 'k1)) (== 0 (at R5v 'k2))))
-(first (at (at R5v 'tot) (where m500))) -- 110.0
+(first (at (at R5v 'tot) (where m500))) -- 110
 (first (at (at R5v 'cnt) (where m500))) -- 2
-(first (at (at R5v 'tot) (where (and (== 0 (at R5v 'k1)) (== 1 (at R5v 'k2)))))) -- 20.0
-(first (at (at R5v 'tot) (where (and (== 1 (at R5v 'k1)) (== 0 (at R5v 'k2)))))) -- 30.0
-(first (at (at R5v 'tot) (where (and (== 1 (at R5v 'k1)) (== 1 (at R5v 'k2)))))) -- 40.0
+(first (at (at R5v 'tot) (where (and (== 0 (at R5v 'k1)) (== 1 (at R5v 'k2)))))) -- 20
+(first (at (at R5v 'tot) (where (and (== 1 (at R5v 'k1)) (== 0 (at R5v 'k2)))))) -- 30
+(first (at (at R5v 'tot) (where (and (== 1 (at R5v 'k1)) (== 1 (at R5v 'k2)))))) -- 40
 
 ;; ─── 6 keys ─────────────────────────────────────────────────────────
 (set T6 (table [k1 k2 k3 k4 k5 k6 v] (list (as 'I64 [0 0 1 1]) (as 'I64 [0 1 0 1]) (as 'I64 [0 0 0 0]) (as 'I64 [0 0 0 0]) (as 'I64 [0 0 0 0]) (as 'I64 [0 0 0 0]) (as 'I64 [11 22 33 44]))))
 (count (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4 k5 k6] from: T6})) -- 4
-(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4 k5 k6] from: T6}) 'tot)) -- 110.0
+(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4 k5 k6] from: T6}) 'tot)) -- 110
 (sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4 k5 k6] from: T6}) 'cnt)) -- 4
 ;; PER-GROUP: 4 singletons; v=[11,22,33,44] keyed by k1=[0,0,1,1] k2=[0,1,0,1].
 ;; Look up each tot by its (k1,k2) tuple.
 (set R6v (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4 k5 k6] from: T6}))
-(first (at (at R6v 'tot) (where (and (== 0 (at R6v 'k1)) (== 0 (at R6v 'k2)))))) -- 11.0
-(first (at (at R6v 'tot) (where (and (== 0 (at R6v 'k1)) (== 1 (at R6v 'k2)))))) -- 22.0
-(first (at (at R6v 'tot) (where (and (== 1 (at R6v 'k1)) (== 0 (at R6v 'k2)))))) -- 33.0
-(first (at (at R6v 'tot) (where (and (== 1 (at R6v 'k1)) (== 1 (at R6v 'k2)))))) -- 44.0
+(first (at (at R6v 'tot) (where (and (== 0 (at R6v 'k1)) (== 0 (at R6v 'k2)))))) -- 11
+(first (at (at R6v 'tot) (where (and (== 0 (at R6v 'k1)) (== 1 (at R6v 'k2)))))) -- 22
+(first (at (at R6v 'tot) (where (and (== 1 (at R6v 'k1)) (== 0 (at R6v 'k2)))))) -- 33
+(first (at (at R6v 'tot) (where (and (== 1 (at R6v 'k1)) (== 1 (at R6v 'k2)))))) -- 44
 
 ;; ─── 7 keys ─────────────────────────────────────────────────────────
 (set T7 (table [k1 k2 k3 k4 k5 k6 k7 v] (list (as 'I64 [0 0 1 1]) (as 'I64 [0 1 0 1]) (as 'I64 [0 0 0 0]) (as 'I64 [0 0 0 0]) (as 'I64 [0 0 0 0]) (as 'I64 [0 0 0 0]) (as 'I64 [0 0 0 0]) (as 'I64 [5 6 7 8]))))
 (count (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4 k5 k6 k7] from: T7})) -- 4
-(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4 k5 k6 k7] from: T7}) 'tot)) -- 26.0
+(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4 k5 k6 k7] from: T7}) 'tot)) -- 26
 (sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4 k5 k6 k7] from: T7}) 'cnt)) -- 4
 ;; PER-GROUP: 4 singletons; v=[5,6,7,8] keyed by k1=[0,0,1,1] k2=[0,1,0,1].
 ;; Look up each tot by its (k1,k2) tuple.
 (set R7v (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4 k5 k6 k7] from: T7}))
-(first (at (at R7v 'tot) (where (and (== 0 (at R7v 'k1)) (== 0 (at R7v 'k2)))))) -- 5.0
-(first (at (at R7v 'tot) (where (and (== 0 (at R7v 'k1)) (== 1 (at R7v 'k2)))))) -- 6.0
-(first (at (at R7v 'tot) (where (and (== 1 (at R7v 'k1)) (== 0 (at R7v 'k2)))))) -- 7.0
-(first (at (at R7v 'tot) (where (and (== 1 (at R7v 'k1)) (== 1 (at R7v 'k2)))))) -- 8.0
+(first (at (at R7v 'tot) (where (and (== 0 (at R7v 'k1)) (== 0 (at R7v 'k2)))))) -- 5
+(first (at (at R7v 'tot) (where (and (== 0 (at R7v 'k1)) (== 1 (at R7v 'k2)))))) -- 6
+(first (at (at R7v 'tot) (where (and (== 1 (at R7v 'k1)) (== 0 (at R7v 'k2)))))) -- 7
+(first (at (at R7v 'tot) (where (and (== 1 (at R7v 'k1)) (== 1 (at R7v 'k2)))))) -- 8
 
 ;; ─── 8 keys (gate upper bound) ──────────────────────────────────────
 (set T8 (table [k1 k2 k3 k4 k5 k6 k7 k8 v] (list (as 'I64 [0 0 1 1]) (as 'I64 [0 1 0 1]) (as 'I64 [0 0 0 0]) (as 'I64 [0 0 0 0]) (as 'I64 [0 0 0 0]) (as 'I64 [0 0 0 0]) (as 'I64 [0 0 0 0]) (as 'I64 [0 0 0 0]) (as 'I64 [10 20 30 40]))))
 (count (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4 k5 k6 k7 k8] from: T8})) -- 4
-(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4 k5 k6 k7 k8] from: T8}) 'tot)) -- 100.0
+(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4 k5 k6 k7 k8] from: T8}) 'tot)) -- 100
 (sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4 k5 k6 k7 k8] from: T8}) 'cnt)) -- 4
 ;; PER-GROUP: 4 singletons; v=[10,20,30,40] keyed by k1=[0,0,1,1] k2=[0,1,0,1].
 ;; Look up each tot by its (k1,k2) tuple (8-key gate upper bound).
 (set R8v (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3 k4 k5 k6 k7 k8] from: T8}))
-(first (at (at R8v 'tot) (where (and (== 0 (at R8v 'k1)) (== 0 (at R8v 'k2)))))) -- 10.0
-(first (at (at R8v 'tot) (where (and (== 0 (at R8v 'k1)) (== 1 (at R8v 'k2)))))) -- 20.0
-(first (at (at R8v 'tot) (where (and (== 1 (at R8v 'k1)) (== 0 (at R8v 'k2)))))) -- 30.0
-(first (at (at R8v 'tot) (where (and (== 1 (at R8v 'k1)) (== 1 (at R8v 'k2)))))) -- 40.0
+(first (at (at R8v 'tot) (where (and (== 0 (at R8v 'k1)) (== 0 (at R8v 'k2)))))) -- 10
+(first (at (at R8v 'tot) (where (and (== 0 (at R8v 'k1)) (== 1 (at R8v 'k2)))))) -- 20
+(first (at (at R8v 'tot) (where (and (== 1 (at R8v 'k1)) (== 0 (at R8v 'k2)))))) -- 30
+(first (at (at R8v 'tot) (where (and (== 1 (at R8v 'k1)) (== 1 (at R8v 'k2)))))) -- 40
 
 ;; ─── F64 v column ───────────────────────────────────────────────────
 (set Tf (table [k1 k2 k3 v] (list (as 'I64 [0 0 1 1]) (as 'I64 [0 1 0 1]) (as 'I64 [0 0 0 0]) (as 'F64 [1.5 2.5 3.5 4.5]))))
@@ -161,44 +162,44 @@
 
 ;; ─── narrow integer v (I32 / I16 / U8) ──────────────────────────────
 (set Ti32 (table [k1 k2 k3 v] (list (as 'I64 [0 0 1 1]) (as 'I64 [0 1 0 1]) (as 'I64 [0 0 0 0]) (as 'I32 [10 20 30 40]))))
-(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Ti32}) 'tot)) -- 100.0
+(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Ti32}) 'tot)) -- 100
 ;; PER-GROUP: I32 v widened to F64 per group (not just in the total).
 ;; v=[10,20,30,40]; look up each group's tot by its (k1,k2) tuple.
 (set Riv (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Ti32}))
-(first (at (at Riv 'tot) (where (and (== 0 (at Riv 'k1)) (== 0 (at Riv 'k2)))))) -- 10.0
-(first (at (at Riv 'tot) (where (and (== 0 (at Riv 'k1)) (== 1 (at Riv 'k2)))))) -- 20.0
-(first (at (at Riv 'tot) (where (and (== 1 (at Riv 'k1)) (== 0 (at Riv 'k2)))))) -- 30.0
-(first (at (at Riv 'tot) (where (and (== 1 (at Riv 'k1)) (== 1 (at Riv 'k2)))))) -- 40.0
+(first (at (at Riv 'tot) (where (and (== 0 (at Riv 'k1)) (== 0 (at Riv 'k2)))))) -- 10
+(first (at (at Riv 'tot) (where (and (== 0 (at Riv 'k1)) (== 1 (at Riv 'k2)))))) -- 20
+(first (at (at Riv 'tot) (where (and (== 1 (at Riv 'k1)) (== 0 (at Riv 'k2)))))) -- 30
+(first (at (at Riv 'tot) (where (and (== 1 (at Riv 'k1)) (== 1 (at Riv 'k2)))))) -- 40
 (set Tu8 (table [k1 k2 k3 v] (list (as 'I64 [0 0 1 1]) (as 'I64 [0 1 0 1]) (as 'I64 [0 0 0 0]) (as 'U8 [1 2 3 4]))))
-(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tu8}) 'tot)) -- 10.0
+(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tu8}) 'tot)) -- 10
 ;; PER-GROUP: U8 v widened to F64 per group.  v=[1,2,3,4]; look up each group's
 ;; tot by its (k1,k2) tuple.
 (set Ruv (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tu8}))
-(first (at (at Ruv 'tot) (where (and (== 0 (at Ruv 'k1)) (== 0 (at Ruv 'k2)))))) -- 1.0
-(first (at (at Ruv 'tot) (where (and (== 0 (at Ruv 'k1)) (== 1 (at Ruv 'k2)))))) -- 2.0
-(first (at (at Ruv 'tot) (where (and (== 1 (at Ruv 'k1)) (== 0 (at Ruv 'k2)))))) -- 3.0
-(first (at (at Ruv 'tot) (where (and (== 1 (at Ruv 'k1)) (== 1 (at Ruv 'k2)))))) -- 4.0
+(first (at (at Ruv 'tot) (where (and (== 0 (at Ruv 'k1)) (== 0 (at Ruv 'k2)))))) -- 1
+(first (at (at Ruv 'tot) (where (and (== 0 (at Ruv 'k1)) (== 1 (at Ruv 'k2)))))) -- 2
+(first (at (at Ruv 'tot) (where (and (== 1 (at Ruv 'k1)) (== 0 (at Ruv 'k2)))))) -- 3
+(first (at (at Ruv 'tot) (where (and (== 1 (at Ruv 'k1)) (== 1 (at Ruv 'k2)))))) -- 4
 
 ;; ─── SYM keys (canonical H2O q10 shape) ─────────────────────────────
 (set Ts (table [k1 k2 k3 v] (list [A A B B] [X Y X Y] [P P P P] (as 'I64 [10 20 30 40]))))
 (count (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Ts})) -- 4
-(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Ts}) 'tot)) -- 100.0
+(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Ts}) 'tot)) -- 100
 (sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Ts}) 'cnt)) -- 4
 ;; PER-GROUP: SYM keys hash to bucket order, which is NOT stable across runs, so
 ;; positional asserts are not safe here.  Look up each group by its symbol key
 ;; tuple via a mask.  v=[10,20,30,40] keyed by k1=[A,A,B,B] k2=[X,Y,X,Y]:
 ;;   (A,X)->10  (A,Y)->20  (B,X)->30  (B,Y)->40.
 (set Rsv (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Ts}))
-(first (at (at Rsv 'tot) (where (and (== 'A (at Rsv 'k1)) (== 'X (at Rsv 'k2)))))) -- 10.0
-(first (at (at Rsv 'tot) (where (and (== 'A (at Rsv 'k1)) (== 'Y (at Rsv 'k2)))))) -- 20.0
-(first (at (at Rsv 'tot) (where (and (== 'B (at Rsv 'k1)) (== 'X (at Rsv 'k2)))))) -- 30.0
-(first (at (at Rsv 'tot) (where (and (== 'B (at Rsv 'k1)) (== 'Y (at Rsv 'k2)))))) -- 40.0
+(first (at (at Rsv 'tot) (where (and (== 'A (at Rsv 'k1)) (== 'X (at Rsv 'k2)))))) -- 10
+(first (at (at Rsv 'tot) (where (and (== 'A (at Rsv 'k1)) (== 'Y (at Rsv 'k2)))))) -- 20
+(first (at (at Rsv 'tot) (where (and (== 'B (at Rsv 'k1)) (== 'X (at Rsv 'k2)))))) -- 30
+(first (at (at Rsv 'tot) (where (and (== 'B (at Rsv 'k1)) (== 'Y (at Rsv 'k2)))))) -- 40
 
 ;; SYM keys with collapses
 (set Tsc (table [k1 k2 k3 v] (list [A A A B] [X X Y Y] [P P P P] (as 'I64 [10 20 30 40]))))
 ;; Distinct: (A,X,P) -> {10,20}=30, (A,Y,P) -> 30, (B,Y,P) -> 40.
 (count (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tsc})) -- 3
-(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tsc}) 'tot)) -- 100.0
+(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tsc}) 'tot)) -- 100
 (max (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tsc}) 'cnt)) -- 2
 ;; PER-GROUP: two groups have sum 30 -- max-count can't bind sum 30 to the
 ;; collapsed (A,X) count-2 group vs the (A,Y) count-1 group.  SYM bucket order
@@ -208,26 +209,26 @@
 (set mAX (and (== 'A (at Rscv 'k1)) (== 'X (at Rscv 'k2))))
 (set mAY (and (== 'A (at Rscv 'k1)) (== 'Y (at Rscv 'k2))))
 (set mBY (and (== 'B (at Rscv 'k1)) (== 'Y (at Rscv 'k2))))
-(first (at (at Rscv 'tot) (where mAX))) -- 30.0
+(first (at (at Rscv 'tot) (where mAX))) -- 30
 (first (at (at Rscv 'cnt) (where mAX))) -- 2
-(first (at (at Rscv 'tot) (where mAY))) -- 30.0
+(first (at (at Rscv 'tot) (where mAY))) -- 30
 (first (at (at Rscv 'cnt) (where mAY))) -- 1
-(first (at (at Rscv 'tot) (where mBY))) -- 40.0
+(first (at (at Rscv 'tot) (where mBY))) -- 40
 (first (at (at Rscv 'cnt) (where mBY))) -- 1
 
 ;; ─── mixed key types: I64 + SYM + I32 ───────────────────────────────
 (set Tmix (table [k1 k2 k3 v] (list (as 'I64 [0 0 1 1]) [A B A B] (as 'I32 [0 0 0 0]) (as 'I64 [10 20 30 40]))))
 (count (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tmix})) -- 4
-(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tmix}) 'tot)) -- 100.0
+(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tmix}) 'tot)) -- 100
 ;; PER-GROUP: mixed I64+SYM+I32 keys; 4 singletons.  The SYM key makes bucket
 ;; order unstable, so look up each group by its (k1,k2) tuple via a mask.
 ;; v=[10,20,30,40] keyed by k1=[0,0,1,1] k2=[A,B,A,B]:
 ;;   (0,A)->10  (0,B)->20  (1,A)->30  (1,B)->40.
 (set Rmv (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tmix}))
-(first (at (at Rmv 'tot) (where (and (== 0 (at Rmv 'k1)) (== 'A (at Rmv 'k2)))))) -- 10.0
-(first (at (at Rmv 'tot) (where (and (== 0 (at Rmv 'k1)) (== 'B (at Rmv 'k2)))))) -- 20.0
-(first (at (at Rmv 'tot) (where (and (== 1 (at Rmv 'k1)) (== 'A (at Rmv 'k2)))))) -- 30.0
-(first (at (at Rmv 'tot) (where (and (== 1 (at Rmv 'k1)) (== 'B (at Rmv 'k2)))))) -- 40.0
+(first (at (at Rmv 'tot) (where (and (== 0 (at Rmv 'k1)) (== 'A (at Rmv 'k2)))))) -- 10
+(first (at (at Rmv 'tot) (where (and (== 0 (at Rmv 'k1)) (== 'B (at Rmv 'k2)))))) -- 20
+(first (at (at Rmv 'tot) (where (and (== 1 (at Rmv 'k1)) (== 'A (at Rmv 'k2)))))) -- 30
+(first (at (at Rmv 'tot) (where (and (== 1 (at Rmv 'k1)) (== 'B (at Rmv 'k2)))))) -- 40
 
 ;; ─── parallel path: nrows >= 16384 ──────────────────────────────────
 ;; 20000 rows; 3 keys whose product cardinalities are 5 * 4 * 3 = 60 groups.
@@ -235,7 +236,7 @@
 (set Tbig (table [k1 k2 k3 v] (list (% (til N) 5) (% (til N) 4) (% (til N) 3) (til N))))
 (count (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tbig})) -- 60
 ;; Total sum of v across all groups = N*(N-1)/2 = 199990000.
-(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tbig}) 'tot)) -- 199990000.0
+(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tbig}) 'tot)) -- 199990000
 (sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tbig}) 'cnt)) -- 20000
 ;; PER-GROUP (parallel path): each group is one residue class mod 60.  N=20000
 ;; gives 20 classes of size 334 and 40 of size 333 (40*333+20*334=20000).  A
@@ -247,17 +248,17 @@
 ;; Group (k1,k2,k3)=(0,0,0) holds i where i%60==0: v=60*[0..333], sum
 ;; = 60 * (333*334/2) = 3336660, count 334.
 (set mb0 (and (and (== 0 (at Rbig 'k1)) (== 0 (at Rbig 'k2))) (== 0 (at Rbig 'k3))))
-(first (at (at Rbig 'tot) (where mb0))) -- 3336660.0
+(first (at (at Rbig 'tot) (where mb0))) -- 3336660
 (first (at (at Rbig 'cnt) (where mb0))) -- 334
 ;; Group (1,1,1) holds i where i%60==1: v=1+60*[0..333], sum = 334 + 3336660.
 (set mb1 (and (and (== 1 (at Rbig 'k1)) (== 1 (at Rbig 'k2))) (== 1 (at Rbig 'k3))))
-(first (at (at Rbig 'tot) (where mb1))) -- 3336994.0
+(first (at (at Rbig 'tot) (where mb1))) -- 3336994
 (first (at (at Rbig 'cnt) (where mb1))) -- 334
 
 ;; ─── parallel + SYM key ─────────────────────────────────────────────
 (set Tsbig (table [k1 k2 k3 v] (list (as 'SYMBOL (% (til N) 5)) (as 'SYMBOL (% (til N) 4)) (% (til N) 3) (til N))))
 (count (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tsbig})) -- 60
-(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tsbig}) 'tot)) -- 199990000.0
+(sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tsbig}) 'tot)) -- 199990000
 (sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tsbig}) 'cnt)) -- 20000
 ;; PER-GROUP (parallel + SYM keys): same residue-class structure as Tbig.
 (set Rsbig (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Tsbig}))
@@ -265,7 +266,7 @@
 (sum (== 334 (at Rsbig 'cnt))) -- 20
 ;; Group ('0','0',0) is i%60==0: sum 3336660, count 334.
 (set ms0 (and (and (== '0 (at Rsbig 'k1)) (== '0 (at Rsbig 'k2))) (== 0 (at Rsbig 'k3))))
-(first (at (at Rsbig 'tot) (where ms0))) -- 3336660.0
+(first (at (at Rsbig 'tot) (where ms0))) -- 3336660
 (first (at (at Rsbig 'cnt) (where ms0))) -- 334
 
 ;; ─── parallel + 6 keys + F64 v ──────────────────────────────────────

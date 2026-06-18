@@ -387,8 +387,9 @@
 (set Ttrk_i16 (table [k v] (list (as 'I16 [100 100 200 200 300 300]) (as 'I64 [1 2 3 4 5 6]))))
 (set Rtrk_i16 (select {t: (top v 1) by: k from: Ttrk_i16}))
 (count Rtrk_i16) -- 3
+;; v2 top/bot col is LIST (one cell per group); flatten to sum.
 ;; top-1 per group: k=100→max(1,2)=2; k=200→max(3,4)=4; k=300→max(5,6)=6 → sum=12
-(sum (at Rtrk_i16 't)) -- 12
+(sum (raze (at Rtrk_i16 't))) -- 12
 
 ;; ════════════════════════════════════════════════════════════════════════
 ;; 24. exec_group_topk_rowform: U8 key type (grpt_key_read U8 arm,
@@ -401,7 +402,7 @@
 (set Rtrk_u8 (select {t: (top v 1) by: k from: Ttrk_u8}))
 (count Rtrk_u8) -- 3
 ;; top-1 per group: 2, 4, 6 → sum = 12
-(sum (at Rtrk_u8 't)) -- 12
+(sum (raze (at Rtrk_u8 't))) -- 12
 
 ;; ════════════════════════════════════════════════════════════════════════
 ;; 25. exec_group_topk_rowform: I16 val type (grpt_val_read I16 arm)
@@ -413,7 +414,7 @@
 (set Rtrk_vi16 (select {t: (top v 1) by: k from: Ttrk_vi16}))
 (count Rtrk_vi16) -- 3
 ;; top-1 per group: 20, 40, 60 → sum = 120
-(sum (at Rtrk_vi16 't)) -- 120
+(sum (raze (at Rtrk_vi16 't))) -- 120
 
 ;; ════════════════════════════════════════════════════════════════════════
 ;; 26. exec_group_topk_rowform: U8 val type (grpt_val_read U8 arm)
@@ -424,7 +425,7 @@
 (set Rtrk_vu8 (select {t: (top v 1) by: k from: Ttrk_vu8}))
 (count Rtrk_vu8) -- 2
 ;; top-1 per group: 15, 35 → sum = 50
-(sum (at Rtrk_vu8 't)) -- 50
+(sum (raze (at Rtrk_vu8 't))) -- 50
 
 ;; ════════════════════════════════════════════════════════════════════════
 ;; 27. exec_group_topk_rowform: null I64 keys (grpt_is_null I64 arm)
@@ -436,9 +437,11 @@
 ;; ════════════════════════════════════════════════════════════════════════
 (set Ttrk_nki64 (table [k v] (list (as 'I64 [1 0N 2 1 0N]) (as 'I64 [10 20 30 40 50]))))
 (set Rtrk_nki64 (select {t: (top v 1) by: k from: Ttrk_nki64}))
-(count Rtrk_nki64) -- 2
-;; top-1: k=1→40; k=2→30 → sum = 70
-(sum (at Rtrk_nki64 't)) -- 70
+;; v2 (unlike the old rowform) treats a null key as its own group, like
+;; every other group-by path: k=1, k=2, and the null group (rows 20,50).
+(count Rtrk_nki64) -- 3
+;; top-1: k=1→40; k=2→30; null→50 → sum = 120
+(sum (raze (at Rtrk_nki64 't))) -- 120
 
 ;; ════════════════════════════════════════════════════════════════════════
 ;; 28. exec_group_topk_rowform: I32 null key (grpt_is_null I32 arm, line 9282)
@@ -447,9 +450,10 @@
 ;; ════════════════════════════════════════════════════════════════════════
 (set Ttrk_nki32 (table [k v] (list (as 'I32 [100 0N 200 100]) (as 'I64 [1 2 3 4]))))
 (set Rtrk_nki32 (select {t: (top v 1) by: k from: Ttrk_nki32}))
-(count Rtrk_nki32) -- 2
-;; k=100: top-1 of [1,4]=4; k=200: top-1 of [3]=3 → sum = 7
-(sum (at Rtrk_nki32 't)) -- 7
+;; v2: null key is its own group (row v=2).
+(count Rtrk_nki32) -- 3
+;; k=100: top-1 of [1,4]=4; k=200: [3]=3; null: [2] → sum = 9
+(sum (raze (at Rtrk_nki32 't))) -- 9
 
 ;; ════════════════════════════════════════════════════════════════════════
 ;; 29. exec_group_topk_rowform: I16 null key (grpt_is_null I16 arm, line 9285)
@@ -458,9 +462,10 @@
 ;; ════════════════════════════════════════════════════════════════════════
 (set Ttrk_nki16 (table [k v] (list (as 'I16 [10 0N 20 10]) (as 'I64 [1 2 3 4]))))
 (set Rtrk_nki16 (select {t: (top v 1) by: k from: Ttrk_nki16}))
-(count Rtrk_nki16) -- 2
-;; k=10: top-1 of [1,4]=4; k=20: top-1=[3] → sum = 7
-(sum (at Rtrk_nki16 't)) -- 7
+;; v2: null key is its own group (row v=2).
+(count Rtrk_nki16) -- 3
+;; k=10: top-1 of [1,4]=4; k=20: [3]=3; null: [2] → sum = 9
+(sum (raze (at Rtrk_nki16 't))) -- 9
 
 ;; ════════════════════════════════════════════════════════════════════════
 ;; 30. exec_group_topk_rowform: F64 null key (grpt_is_null F64 arm, line 9278)
@@ -470,9 +475,10 @@
 ;; ════════════════════════════════════════════════════════════════════════
 (set Ttrk_nkf64 (table [k v] (list (as 'F64 [1.0 0N 2.0 1.0]) (as 'I64 [10 20 30 40]))))
 (set Rtrk_nkf64 (select {t: (top v 1) by: k from: Ttrk_nkf64}))
-(count Rtrk_nkf64) -- 2
-;; k=1.0: top-1 of [10,40]=40; k=2.0: top-1=[30] → sum = 70
-(sum (at Rtrk_nkf64 't)) -- 70
+;; v2: null (NaN) key is its own group (row v=20).
+(count Rtrk_nkf64) -- 3
+;; k=1.0: top-1 of [10,40]=40; k=2.0: [30]=30; null: [20] → sum = 90
+(sum (raze (at Rtrk_nkf64 't))) -- 90
 
 ;; ════════════════════════════════════════════════════════════════════════
 ;; 31. exec_group_topk_rowform: BOOL key type
@@ -484,7 +490,7 @@
 (set Rtrk_bool (select {t: (top v 1) by: k from: Ttrk_bool}))
 (count Rtrk_bool) -- 2
 ;; k=false: [1,3] → top-1=3; k=true: [2,4,5] → top-1=5 → sum=8
-(sum (at Rtrk_bool 't)) -- 8
+(sum (raze (at Rtrk_bool 't))) -- 8
 
 ;; ════════════════════════════════════════════════════════════════════════
 ;; 32. exec_group_topk_rowform: BOOL val type (grpt_val_read BOOL arm)
@@ -496,7 +502,7 @@
 (set Rtrk_vbool (select {t: (top v 1) by: k from: Ttrk_vbool}))
 (count Rtrk_vbool) -- 2
 ;; k=1: top-1 of [0,1]=1; k=2: top-1 of [0]=0 → sum=1
-(sum (at Rtrk_vbool 't)) -- 1
+(sum (raze (at Rtrk_vbool 't))) -- 1
 
 ;; ════════════════════════════════════════════════════════════════════════
 ;; 33. group_rows_range_existing with strlen agg (line 2697)

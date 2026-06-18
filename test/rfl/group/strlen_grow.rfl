@@ -94,9 +94,9 @@
 ;; group has exactly one row, so top-1 == bot-1 == that row's value.
 (count (select {t: (top v 1) by: k from: Ttk})) -- 1200000
 ;; Sum of top-1 per group = sum of all v = N*(N-1)/2 = 1200000*1199999/2.
-(sum (at (select {t: (top v 1) by: k from: Ttk}) 't)) -- 719999400000
+(sum (raze (at (select {t: (top v 1) by: k from: Ttk}) 't))) -- 719999400000
 ;; Bot-1 sum identical (group size 1).
-(sum (at (select {b: (bot v 1) by: k from: Ttk}) 'b)) -- 719999400000
+(sum (raze (at (select {b: (bot v 1) by: k from: Ttk}) 'b))) -- 719999400000
 ;; Per-group value checks via key-masked SOURCE lookup — the grand sums above
 ;; collapse all 1.2M groups and can pass even if a key picked the wrong row's
 ;; value.  v == k for every row, so top-1/bot-1 of the masked group is the key.
