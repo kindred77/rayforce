@@ -1,8 +1,16 @@
 name: CI
 
 on:
+  # Pushes: only the dev integration branch needs a standing green signal
+  # (releases are cut from it). Master is intentionally absent — a push to
+  # master only happens via a merged PR, whose pull_request run already
+  # tested the exact merge result, so re-testing post-merge is redundant
+  # (and can't gate anything anyway).
   push:
-    branches: [master, dev]
+    branches: [dev]
+  # PRs into dev AND master are tested. The pull_request->master run tests
+  # dev merged into master and is the check that branch protection requires
+  # to reject a failing release merge — keep it.
   pull_request:
     branches: [master, dev]
 
