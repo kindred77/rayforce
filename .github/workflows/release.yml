@@ -1,59 +1,88 @@
 name: Release
 
-# Fires when a release PR (dev -> master, titled vX.Y.Z) is merged. The git
-# tag is the single source of truth: this workflow CREATES the tag from the PR
-# title, builds the optimized binary per platform with the version injected at
-# compile time (make ... RAY_VERSION=X.Y.Z), and publishes a GitHub Release.
-# No source file is bumped and nothing is pushed to the protected master branch
-# — only a tag ref and a release are created, which GITHUB_TOKEN can do without
-# any bypass token. Non-release merges to master (title not vX.Y.Z) are ignored.
+# Fires when a release PR (dev -> master, titled vX.Y.Z) is merged, or via manual
+# dispatch (re-run / bootstrap). The git tag is the single source of truth: this
+# workflow builds the optimized binary per platform with the version injected at
+# compile time (make ... RAY_VERSION=X.Y.Z) and publishes a GitHub Release. No
+# source file is bumped and nothing is pushed to the protected master branch —
+# only a tag ref and a release, which GITHUB_TOKEN can do without a bypass token.
+# Non-release merges to master (title not vX.Y.Z) are ignored.
+#
+# IMPORTANT: a DRAFT release does NOT create its git tag yet — the tag is only
+# materialized when the release is published (the `publish` job, draft=false). So
+# the `build` job must check out the target COMMIT, never the not-yet-existing
+# tag. (This is the bug that broke the first v2.1.0 attempt.)
 
 on:
   pull_request:
     branches: [master]
     types: [closed]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, no leading v (e.g. 2.1.0)"
+        required: true
 
 permissions:
   contents: write   # create the tag + the GitHub Release
 
 jobs:
   prepare:
-    # Only on an actual merge whose title declares a release version.
+    # Manual dispatch always runs; the PR path only on an actual merge whose
+    # title declares a release version.
     if: >-
-      github.event.pull_request.merged == true &&
-      startsWith(github.event.pull_request.title, 'v')
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.merged == true &&
+       startsWith(github.event.pull_request.title, 'v'))
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.parse.outputs.version }}
+      sha: ${{ steps.parse.outputs.sha }}
     steps:
-      - name: Parse version from PR title
+      - name: Resolve version + target, ensure draft release
         id: parse
         env:
-          PR_TITLE: ${{ github.event.pull_request.title }}
-        run: |
-          set -euo pipefail
-          if [[ ! "$PR_TITLE" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
-            echo "Merged PR title '$PR_TITLE' is not a release version — skipping."
-            exit 1
-          fi
-          echo "version=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
-
-      - uses: actions/checkout@v4
-
-      - name: Create tag and draft release
-        env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ steps.parse.outputs.version }}
+          GH_REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
           MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          DISPATCH_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          # Creates tag vX.Y.Z at the merge commit AND a draft release in one
-          # step. Draft so artifacts attach before the release goes public.
-          gh release create "v$VERSION" \
-            --target "$MERGE_SHA" \
-            --title "v$VERSION" \
-            --generate-notes \
-            --draft
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            VERSION="$INPUT_VERSION"
+            SHA="$DISPATCH_SHA"
+          else
+            if [[ ! "$PR_TITLE" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+              echo "Merged PR title '$PR_TITLE' is not a release version — skipping."
+              exit 1
+            fi
+            VERSION="${BASH_REMATCH[1]}"
+            SHA="$MERGE_SHA"
+          fi
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Version '$VERSION' is not X.Y.Z"; exit 1
+          fi
+
+          # Idempotent: reuse an existing draft (so re-runs don't error), and
+          # always build from the release's OWN target so the artifacts match the
+          # tag that publish will create at that commit.
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            SHA="$(gh release view "v$VERSION" --json targetCommitish -q .targetCommitish)"
+            echo "Release v$VERSION already exists — building from its target $SHA."
+          else
+            gh release create "v$VERSION" \
+              --target "$SHA" \
+              --title "v$VERSION" \
+              --generate-notes \
+              --draft
+            echo "Created draft release v$VERSION at $SHA."
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA"        >> "$GITHUB_OUTPUT"
 
   build:
     needs: prepare
@@ -68,9 +97,11 @@ jobs:
           # main.c/heap.c, no Makefile path). Add once the port lands:
           # - os: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      # The tag does not exist yet (the release is still a draft); check out the
+      # target COMMIT directly — never `ref: v$VERSION`.
+      - uses: actions/checkout@v5
         with:
-          ref: v${{ needs.prepare.outputs.version }}
+          ref: ${{ needs.prepare.outputs.sha }}
 
       - name: Build release artifact
         run: make dist RAY_VERSION=${{ needs.prepare.outputs.version }}
@@ -78,6 +109,7 @@ jobs:
       - name: Upload artifacts to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           gh release upload "v${{ needs.prepare.outputs.version }}" \
@@ -87,8 +119,10 @@ jobs:
     needs: [prepare, build]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # Flipping the draft to public is what creates the git tag vX.Y.Z at the
+      # release's target commit — the single source of truth for the version.
       - name: Publish release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         run: gh release edit "v${{ needs.prepare.outputs.version }}" --draft=false
