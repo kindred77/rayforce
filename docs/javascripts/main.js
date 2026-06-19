@@ -180,7 +180,7 @@ function rfUpdateBannerOffset() {
 
   const REPO = 'RayforceDB/rayforce';
   const CACHE_KEY = 'gh-release:' + REPO;
-  const CACHE_TTL = 60 * 60 * 1000; /* 1 hour */
+  const REVALIDATE_AFTER = 5 * 60 * 1000; /* refetch the latest release at most this often */
 
   /* Only Linux x86_64 and macOS (arm64) ship today; Windows/mobile/unknown fall
    * through to the releases page. navigator.platform can't tell Apple Silicon
@@ -236,34 +236,46 @@ function rfUpdateBannerOffset() {
   function readCache() {
     try {
       const v = JSON.parse(localStorage.getItem(CACHE_KEY));
-      if (!v || (Date.now() - v.t) > CACHE_TTL) return null;
-      return v.rel;
+      return (v && v.rel && v.rel.tag) ? v : null;
     } catch (e) { return null; }
   }
   function writeCache(rel) {
     try { localStorage.setItem(CACHE_KEY, JSON.stringify({ t: Date.now(), rel: rel })); } catch (e) {}
   }
+  /* Persist always, but repaint only when the latest tag actually changed — so
+     a fresh release shows up without re-flipping the banner on every load. */
+  function update(rel) {
+    const changed = !cached || cached.rel.tag !== rel.tag;
+    writeCache(rel);
+    if (changed) apply(rel);
+  }
 
+  /* Stale-while-revalidate: paint the cached release instantly (may be slightly
+     stale), then revalidate in the background and repaint only if it changed.
+     Without this, a cached value froze the banner on the old version until its
+     TTL — a new release wouldn't show for up to an hour. */
   const cached = readCache();
-  if (cached) { apply(cached); return; }
+  if (cached) apply(cached.rel);
+  if (cached && (Date.now() - cached.t) < REVALIDATE_AFTER) return; /* fresh enough; skip the network */
 
-  /* Primary: ungh.cc. Shape: { release: { tag, assets: [{ downloadUrl }] } }. */
-  fetch('https://ungh.cc/repos/' + REPO + '/releases/latest')
-    .then(r => r.ok ? r.json() : Promise.reject(new Error('ungh ' + r.status)))
+  /* GitHub's API is authoritative and fresh; ungh.cc (CDN-cached, can lag
+     GitHub by ~a day) is the fallback when the direct API is unreachable. */
+  fetch('https://api.github.com/repos/' + REPO + '/releases/latest', { headers: { Accept: 'application/vnd.github+json' } })
+    .then(r => r.ok ? r.json() : Promise.reject(new Error('gh ' + r.status)))
     .then(d => {
-      const r = d.release || d;
-      const rel = { tag: r.tag, urls: (r.assets || []).map(a => a.downloadUrl).filter(Boolean) };
-      if (!rel.tag) throw new Error('ungh shape');
-      writeCache(rel); apply(rel);
+      const rel = { tag: d.tag_name, urls: (d.assets || []).map(a => a.browser_download_url).filter(Boolean) };
+      if (!rel.tag) throw new Error('gh shape');
+      update(rel);
     })
     .catch(() => {
-      /* Fallback: GitHub API. Shape: { tag_name, assets: [{ browser_download_url }] }. */
-      return fetch('https://api.github.com/repos/' + REPO + '/releases/latest', { headers: { Accept: 'application/vnd.github+json' } })
-        .then(r => r.ok ? r.json() : Promise.reject(new Error('gh ' + r.status)))
+      /* Fallback: ungh.cc. Shape: { release: { tag, assets: [{ downloadUrl }] } }. */
+      return fetch('https://ungh.cc/repos/' + REPO + '/releases/latest')
+        .then(r => r.ok ? r.json() : Promise.reject(new Error('ungh ' + r.status)))
         .then(d => {
-          const rel = { tag: d.tag_name, urls: (d.assets || []).map(a => a.browser_download_url).filter(Boolean) };
-          if (!rel.tag) throw new Error('gh shape');
-          writeCache(rel); apply(rel);
+          const r = d.release || d;
+          const rel = { tag: r.tag, urls: (r.assets || []).map(a => a.downloadUrl).filter(Boolean) };
+          if (!rel.tag) throw new Error('ungh shape');
+          update(rel);
         });
     })
     .catch(() => { /* CTAs stay on /releases/latest; banner keeps its default text. */ });
