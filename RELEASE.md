@@ -30,6 +30,21 @@ truth for the version** — no version literal is ever hand-edited in source.
 That's the whole ritual. **Never edit the version in source to make a release** —
 the tag is authoritative.
 
+### Manual / re-run path
+
+The Release workflow also has a `workflow_dispatch` trigger. Run it from the
+Actions tab (or `gh workflow run release.yml -f version=X.Y.Z`) to re-drive a
+release that half-finished, or to seed the very first release before the
+automatic `pull_request: closed` path can fire. It is idempotent: if a draft
+`vX.Y.Z` already exists it is reused and built from its own target commit; a
+manual dispatch with no prior draft tags the current `master` HEAD.
+
+> **Why the build checks out a commit, not the tag:** a *draft* GitHub release
+> does **not** create its git tag — the tag ref only appears when the release is
+> published (`--draft=false`). So `build` checks out the release's target
+> **commit**; the `publish` job is what creates the tag `vX.Y.Z`. Checking out
+> `ref: vX.Y.Z` during build would fail (the tag does not exist yet).
+
 ## How the version reaches the binary
 
 The Makefile resolves the version (CI override `RAY_VERSION=` > latest git tag >
