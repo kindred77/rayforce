@@ -33,6 +33,7 @@
 
 #include "test.h"
 #include <rayforce.h>
+#include "store/col.h"      /* RAY_COL_FORMAT_MAJOR (forged-header tests) */
 #include "store/splay.h"
 #include "store/part.h"     /* ray_read_parted (resolution tests) */
 #include "ops/ops.h"        /* RAY_IS_PARTED */
@@ -1433,16 +1434,19 @@ static test_result_t test_untrusted_attrs_masked(void) {
         snprintf(apath, sizeof(apath), "%s/a", dir);
         FILE* f = fopen(apath, "rb+");
         TEST_ASSERT_NOT_NULL(f);
-        /* Keep the format magic+version (aux[0..5]) so the file passes the
-         * version gate; plant garbage "pointer" bytes in aux[6..15] — the
-         * loaders must still mask runtime attr bits and never route those
-         * bytes as owned pointers. */
+        /* aux (bytes 0-15) is now fully attacker-controlled garbage — no
+         * magic lives there.  Plant invalid "pointer" bytes across the whole
+         * slot; the loaders must mask runtime attr bits and never route those
+         * bytes as owned pointers.  The version gate is satisfied separately
+         * via the `order` byte (offset 17), set below. */
         uint8_t garbage[16];
         memset(garbage, 0xA5, sizeof(garbage)); /* invalid non-NULL ptr bytes */
-        memcpy(garbage, "RFCL", 4);
-        garbage[4] = 1; garbage[5] = 0;
         TEST_ASSERT_EQ_I(fseek(f, 0, SEEK_SET), 0);
         TEST_ASSERT_EQ_I(fwrite(garbage, 1, 16, f), 16);
+        /* `order` byte = the major version so the file passes the gate. */
+        uint8_t ver = RAY_COL_FORMAT_MAJOR;
+        TEST_ASSERT_EQ_I(fseek(f, (long)offsetof(ray_t, order), SEEK_SET), 0);
+        TEST_ASSERT_EQ_I(fwrite(&ver, 1, 1, f), 1);
         long attrs_off = (long)offsetof(ray_t, attrs);
         TEST_ASSERT_EQ_I(fseek(f, attrs_off, SEEK_SET), 0);
         uint8_t attrs = 0;
