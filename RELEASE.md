@@ -89,6 +89,13 @@ make dist RAY_VERSION=2.1.3
 - No release secret or bypass token is needed — the default `GITHUB_TOKEN`
   (`contents: write`) creates the tag and the release. The release workflow never
   pushes a commit to `master`, only a tag ref.
+- **Optional — Zulip announcement**: add a repository secret **`ZULIP_API_KEY`**
+  (the API key of the `releases-bot@rayforcedb.zulipchat.com` bot). The `announce`
+  job then posts each published release — title + changelog highlights + link —
+  to **#Announcements** under the **Rayforce** topic. Without the secret the job
+  is skipped, and a Zulip error never fails the release (`continue-on-error`).
+  If Zulip rejects the post, the bot may need to be a *Generic bot* (not just an
+  incoming-webhook) and subscribed to the Announcements channel.
 
 ## Platform support
 

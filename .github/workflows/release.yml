@@ -137,3 +137,35 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: gh release edit "v${{ needs.prepare.outputs.version }}" --draft=false
+
+  # Post the release announcement to Zulip (#Announcements > Rayforce) once the
+  # release is public. Best-effort: skipped when ZULIP_API_KEY isn't configured,
+  # and continue-on-error so a Zulip hiccup never reds an already-shipped release.
+  announce:
+    needs: [prepare, publish]
+    runs-on: ubuntu-latest
+    env:
+      ZULIP_API_KEY: ${{ secrets.ZULIP_API_KEY }}
+    steps:
+      - name: Announce on Zulip
+        if: ${{ env.ZULIP_API_KEY != '' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          url="https://github.com/${GH_REPO}/releases/tag/v${VERSION}"
+          # Changelog highlights = the release body minus the collapsed
+          # "Maintenance & internal" <details> block (Zulip won't render it).
+          notes="$(gh release view "v$VERSION" --json body -q .body | sed '/<details>/,/<\/details>/d')"
+          content="$(printf '🚀 **Rayforce v%s** is out!\n\n%s\n\n📦 Release & downloads: %s' "$VERSION" "$notes" "$url")"
+          resp="$(curl -sS -X POST 'https://rayforcedb.zulipchat.com/api/v1/messages' \
+            -u "releases-bot@rayforcedb.zulipchat.com:${ZULIP_API_KEY}" \
+            --data-urlencode 'type=stream' \
+            --data-urlencode 'to=Announcements' \
+            --data-urlencode 'topic=Rayforce' \
+            --data-urlencode "content=${content}")"
+          echo "Zulip response: $resp"
+          echo "$resp" | grep -q '"result": *"success"'
