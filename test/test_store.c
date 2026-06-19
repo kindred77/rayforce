@@ -3767,6 +3767,10 @@ static test_result_t test_col_validate_mapped_bad_type(void) {
     TEST_ASSERT_NOT_NULL(f);
     uint8_t hdr[32];
     memset(hdr, 0, 32);
+    /* Stamp the format magic+version (aux[0..5]) so validation reaches the
+     * type check (the bytes under test) rather than the version gate. */
+    memcpy(hdr, "RFCL", 4);
+    hdr[4] = 1; hdr[5] = 0;  /* version = 1 (u16 LE) */
     hdr[18] = 127;    /* type = RAY_ERROR -- not in serializable allowlist */
     hdr[19] = 0;      /* attrs */
     /* rc=1 at bytes 20-23 */
@@ -3793,6 +3797,8 @@ static test_result_t test_col_validate_mapped_neg_len(void) {
     TEST_ASSERT_NOT_NULL(f);
     uint8_t hdr[32];
     memset(hdr, 0, 32);
+    memcpy(hdr, "RFCL", 4);        /* format magic (aux[0..3]) */
+    hdr[4] = 1; hdr[5] = 0;        /* version = 1 — pass the version gate */
     hdr[18] = RAY_I64;  /* valid type */
     hdr[19] = 0;
     hdr[20] = 1;        /* rc = 1 */
@@ -3818,6 +3824,8 @@ static test_result_t test_col_validate_mapped_data_truncated(void) {
     TEST_ASSERT_NOT_NULL(f);
     uint8_t hdr[40];  /* 32-byte header + 8 bytes of data (but claim 10 I64 elems) */
     memset(hdr, 0, 40);
+    memcpy(hdr, "RFCL", 4);        /* format magic (aux[0..3]) */
+    hdr[4] = 1; hdr[5] = 0;        /* version = 1 — pass the version gate */
     hdr[18] = RAY_I64;  /* esz = 8 */
     hdr[20] = 1;        /* rc = 1 */
     int64_t len = 10;   /* 10 * 8 = 80 bytes needed, but only 8 written => truncated */
@@ -4087,6 +4095,107 @@ static test_result_t test_col_str_pool_roundtrip(void) {
     TEST_ASSERT_EQ_U(ln, strlen(s1));
     TEST_ASSERT_TRUE(memcmp(m1, s1, ln) == 0);
     ray_release(mapped);
+
+    ray_release(vec);
+    unlink(TMP_COL_PATH);
+    PASS();
+}
+
+/* ---- test_col_format_magic_roundtrip ------------------------------------ */
+/* FRESH-SWAP format: a saved column carries the magic+version in the
+ * 32-byte header's aux region (bytes 0-5), and round-trips through both
+ * ray_col_load (deep copy) and ray_col_mmap (zero-copy) with value + attrs
+ * intact.  The on-disk magic must NOT leak into the in-memory aux (plain
+ * column => aux all-zero after load). */
+static test_result_t test_col_format_magic_roundtrip(void) {
+    int32_t raw[] = {11, 22, 33, 44};
+    ray_t* vec = ray_vec_from_raw(RAY_I32, raw, 4);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+    TEST_ASSERT_EQ_I(ray_col_save(vec, TMP_COL_PATH), RAY_OK);
+
+    /* On disk: aux[0..3] == "RFCL", aux[4..5] == version (u16 LE = 1). */
+    {
+        FILE* f = fopen(TMP_COL_PATH, "rb");
+        TEST_ASSERT_NOT_NULL(f);
+        uint8_t hd[6];
+        TEST_ASSERT_EQ_U(fread(hd, 1, 6, f), 6);
+        fclose(f);
+        uint32_t magic; uint16_t ver;
+        memcpy(&magic, hd, 4);
+        memcpy(&ver, hd + 4, 2);
+        TEST_ASSERT_EQ_U(magic, RAY_COL_MAGIC);
+        TEST_ASSERT_EQ_U(ver, RAY_COL_FORMAT_VERSION);
+    }
+
+    /* save -> load (deep copy): values intact, runtime aux reconstructed. */
+    ray_t* loaded = ray_col_load(TMP_COL_PATH);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    TEST_ASSERT_EQ_I(loaded->type, RAY_I32);
+    TEST_ASSERT_EQ_I(loaded->len, 4);
+    int32_t* ld = (int32_t*)ray_data(loaded);
+    TEST_ASSERT_EQ_I(ld[0], 11);
+    TEST_ASSERT_EQ_I(ld[3], 44);
+    /* magic must not survive into runtime aux (plain column => zero). */
+    for (int i = 0; i < 16; i++) TEST_ASSERT_EQ_U(loaded->aux[i], 0);
+    ray_release(loaded);
+
+    /* save -> mmap (zero-copy): values intact, runtime aux reconstructed. */
+    ray_t* mapped = ray_col_mmap(TMP_COL_PATH);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(mapped));
+    TEST_ASSERT_EQ_U(mapped->mmod, 1);
+    TEST_ASSERT_EQ_I(mapped->len, 4);
+    int32_t* md = (int32_t*)ray_data(mapped);
+    TEST_ASSERT_EQ_I(md[1], 22);
+    TEST_ASSERT_EQ_I(md[2], 33);
+    for (int i = 0; i < 16; i++) TEST_ASSERT_EQ_U(mapped->aux[i], 0);
+    ray_release(mapped);
+
+    ray_release(vec);
+    unlink(TMP_COL_PATH);
+    PASS();
+}
+
+/* ---- test_col_format_bad_magic_version ---------------------------------- */
+/* A file whose aux magic is absent/zeroed, or whose version exceeds the
+ * reader's, must be rejected with a "version" error by both load + mmap. */
+static test_result_t test_col_format_bad_magic_version(void) {
+    int64_t raw[] = {1, 2, 3};
+    ray_t* vec = ray_vec_from_raw(RAY_I64, raw, 3);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+
+    /* (a) zeroed magic => "version". */
+    TEST_ASSERT_EQ_I(ray_col_save(vec, TMP_COL_PATH), RAY_OK);
+    {
+        FILE* f = fopen(TMP_COL_PATH, "r+b");
+        TEST_ASSERT_NOT_NULL(f);
+        uint8_t zero[6] = {0};
+        TEST_ASSERT_EQ_I(fseek(f, 0, SEEK_SET), 0);
+        TEST_ASSERT_EQ_U(fwrite(zero, 1, 6, f), 6);
+        fclose(f);
+    }
+    ray_t* r1 = ray_col_load(TMP_COL_PATH);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r1));
+    TEST_ASSERT_STR_EQ(ray_err_code(r1), "version");
+    ray_release(r1);
+    ray_t* r2 = ray_col_mmap(TMP_COL_PATH);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r2));
+    TEST_ASSERT_STR_EQ(ray_err_code(r2), "version");
+    ray_release(r2);
+
+    /* (b) good magic, version bumped past the reader => "version". */
+    TEST_ASSERT_EQ_I(ray_col_save(vec, TMP_COL_PATH), RAY_OK);
+    {
+        FILE* f = fopen(TMP_COL_PATH, "r+b");
+        TEST_ASSERT_NOT_NULL(f);
+        uint16_t bad_ver = (uint16_t)(RAY_COL_FORMAT_VERSION + 1);
+        TEST_ASSERT_EQ_I(fseek(f, 4, SEEK_SET), 0);
+        TEST_ASSERT_EQ_U(fwrite(&bad_ver, 1, 2, f), 2);
+        fclose(f);
+    }
+    ray_t* r3 = ray_col_mmap(TMP_COL_PATH);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r3));
+    TEST_ASSERT_STR_EQ(ray_err_code(r3), "version");
+    ray_release(r3);
 
     ray_release(vec);
     unlink(TMP_COL_PATH);
@@ -4721,6 +4830,8 @@ const test_entry_t store_entries[] = {
     { "store/col_recursive_sym_in_list", test_col_recursive_sym_in_list, store_setup, store_teardown },
     { "store/col_sym_w64_neg_index", test_col_sym_w64_negative_index, store_setup, store_teardown },
     { "store/col_str_pool_roundtrip", test_col_str_pool_roundtrip, store_setup, store_teardown },
+    { "store/col_format_magic_roundtrip", test_col_format_magic_roundtrip, store_setup, store_teardown },
+    { "store/col_format_bad_magic_version", test_col_format_bad_magic_version, store_setup, store_teardown },
     { "store/col_str_empty_roundtrip", test_col_str_empty_roundtrip, store_setup, store_teardown },
     { "store/col_str_inline_only", test_col_str_inline_only_roundtrip, store_setup, store_teardown },
     { "store/col_slice_save", test_col_slice_save, store_setup, store_teardown },
