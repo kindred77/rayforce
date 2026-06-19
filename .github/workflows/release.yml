@@ -39,11 +39,19 @@ jobs:
       version: ${{ steps.parse.outputs.version }}
       sha: ${{ steps.parse.outputs.sha }}
     steps:
+      # Full history + tags so the changelog generator can scope to the previous
+      # release tag.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
       - name: Resolve version + target, ensure draft release
         id: parse
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
           EVENT: ${{ github.event_name }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
@@ -73,10 +81,13 @@ jobs:
             SHA="$(gh release view "v$VERSION" --json targetCommitish -q .targetCommitish)"
             echo "Release v$VERSION already exists — building from its target $SHA."
           else
+            # Feature-oriented changelog (grouped by conventional-commit type),
+            # not GitHub's default author/PR ledger.
+            bash .github/release-notes.sh "$VERSION" "$SHA" > "$RUNNER_TEMP/notes.md"
             gh release create "v$VERSION" \
               --target "$SHA" \
               --title "v$VERSION" \
-              --generate-notes \
+              --notes-file "$RUNNER_TEMP/notes.md" \
               --draft
             echo "Created draft release v$VERSION at $SHA."
           fi
