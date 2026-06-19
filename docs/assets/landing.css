@@ -261,7 +261,14 @@ code {
   max-width: 580px; line-height: 1.7; margin-bottom: 36px;
 }
 .hero-desc a { color: var(--accent); font-weight: 600; }
-.hero-actions { display: flex; gap: 14px; }
+.hero-actions { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; }
+
+/* OS-detected download note under the hero CTAs (filled in by landing.js;
+   stays hidden until a latest release resolves). */
+.hero-download-meta {
+  margin: 14px 0 0; font-family: var(--mono);
+  font-size: .8rem; color: var(--text-muted);
+}
 
 /* Buttons */
 .btn-hero {
@@ -627,7 +634,7 @@ code {
 .cta-terminal-body code {
   background: none; padding: 0; font-size: inherit; color: inherit;
 }
-.cta-buttons { display: flex; gap: 14px; justify-content: center; }
+.cta-buttons { display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; }
 
 /* ── Footer ──────────────────────────────────── */
 .footer {
