@@ -4,7 +4,7 @@
   font-style: normal;
   font-weight: 400;
   font-display: swap;
-  src: url('assets/fonts/inter-400.woff2') format('woff2');
+  src: url('/assets/fonts/inter-400.woff2') format('woff2');
   unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
 }
 @font-face {
@@ -12,7 +12,7 @@
   font-style: normal;
   font-weight: 600;
   font-display: swap;
-  src: url('assets/fonts/inter-600.woff2') format('woff2');
+  src: url('/assets/fonts/inter-600.woff2') format('woff2');
   unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
 }
 @font-face {
@@ -20,7 +20,7 @@
   font-style: normal;
   font-weight: 700;
   font-display: swap;
-  src: url('assets/fonts/inter-700.woff2') format('woff2');
+  src: url('/assets/fonts/inter-700.woff2') format('woff2');
   unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
 }
 @font-face {
@@ -28,7 +28,7 @@
   font-style: normal;
   font-weight: 600;
   font-display: swap;
-  src: url('assets/fonts/oswald-600.woff2') format('woff2');
+  src: url('/assets/fonts/oswald-600.woff2') format('woff2');
   unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
 }
 @font-face {
@@ -36,7 +36,7 @@
   font-style: normal;
   font-weight: 700;
   font-display: swap;
-  src: url('assets/fonts/oswald-700.woff2') format('woff2');
+  src: url('/assets/fonts/oswald-700.woff2') format('woff2');
   unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
 }
 @font-face {
@@ -44,7 +44,7 @@
   font-style: normal;
   font-weight: 400;
   font-display: swap;
-  src: url('assets/fonts/jbmono-400.woff2') format('woff2');
+  src: url('/assets/fonts/jbmono-400.woff2') format('woff2');
   unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
 }
 @font-face {
@@ -52,7 +52,7 @@
   font-style: normal;
   font-weight: 600;
   font-display: swap;
-  src: url('assets/fonts/jbmono-600.woff2') format('woff2');
+  src: url('/assets/fonts/jbmono-600.woff2') format('woff2');
   unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
 }
 
@@ -151,7 +151,11 @@ code {
 /* ── Nav ─────────────────────────────────────── */
 .nav {
   position: fixed;
-  top: 16px; left: 50%; transform: translateX(-50%);
+  /* Clear the in-flow release banner: main.js publishes --rf-banner-h as the
+     still-visible banner height (shrinks to 0 as it scrolls away / on dismiss),
+     so the floating pill drops just beneath it and rises back to 16px after. */
+  top: calc(16px + var(--rf-banner-h, 0px));
+  left: 50%; transform: translateX(-50%);
   z-index: 1000;
   background: rgba(10, 14, 19, 0.8);
   backdrop-filter: blur(20px);
@@ -162,7 +166,7 @@ code {
   /* Don't transition `all` — width changes inside the nav (e.g. the
      count-up GitHub widget) would otherwise animate the centered bar
      sliding sideways. Restrict to scroll-state visuals only. */
-  transition: background .3s, border-color .3s, box-shadow .3s;
+  transition: background .3s, border-color .3s, box-shadow .3s, top .25s ease;
 }
 .nav.nav-scrolled {
   box-shadow: 0 4px 30px rgba(0, 0, 0, 0.4);
@@ -261,7 +265,14 @@ code {
   max-width: 580px; line-height: 1.7; margin-bottom: 36px;
 }
 .hero-desc a { color: var(--accent); font-weight: 600; }
-.hero-actions { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; }
+/* Keep the three hero CTAs on a single row: nowrap + compact sizing so
+   Download / Docs / GitHub fit the (grid-narrowed) hero column. The full-size
+   .btn-hero padding stays on the centered CTA section, which has room. */
+.hero-actions { display: flex; gap: 10px; align-items: center; flex-wrap: nowrap; }
+.hero-actions .btn-hero,
+.hero-actions .btn-hero-ghost {
+  padding: 12px 20px; font-size: .9rem; gap: 7px; white-space: nowrap;
+}
 
 /* OS-detected download note under the hero CTAs (filled in by landing.js;
    stays hidden until a latest release resolves). */

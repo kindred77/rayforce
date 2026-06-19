@@ -37,7 +37,37 @@ document.addEventListener('DOMContentLoaded', () => {
     window.addEventListener('scroll', updateNav, { passive: true });
     updateNav();
   }
+
+  // ── Release banner: pill-nav offset + dismiss ─
+  // The floating pill nav (landing/about) is position:fixed and would overlap
+  // the in-flow banner. rfUpdateBannerOffset() publishes the still-visible
+  // banner height as --rf-banner-h so the nav sits just below it and rises back
+  // as it scrolls away. Dismissal is keyed to the release tag (set on the
+  // element by the resolver) so a new release re-shows the banner.
+  const rfBanner = document.querySelector('[data-rf-banner]');
+  if (rfBanner) {
+    rfUpdateBannerOffset();
+    window.addEventListener('scroll', rfUpdateBannerOffset, { passive: true });
+    window.addEventListener('resize', rfUpdateBannerOffset, { passive: true });
+    const close = rfBanner.querySelector('[data-rf-dismiss]');
+    if (close) close.addEventListener('click', () => {
+      const tag = rfBanner.dataset.tag;
+      if (tag) { try { localStorage.setItem('rf-banner-dismissed', tag); } catch (e) {} }
+      rfBanner.hidden = true;
+      rfUpdateBannerOffset();
+    });
+  }
 });
+
+/* Publish the still-visible release-banner height as --rf-banner-h (0 when the
+ * banner is hidden/absent or fully scrolled past). Pure — safe to call anywhere. */
+function rfUpdateBannerOffset() {
+  const banner = document.querySelector('[data-rf-banner]');
+  const visible = (banner && !banner.hidden)
+    ? Math.max(0, banner.offsetHeight - (window.scrollY || 0))
+    : 0;
+  document.documentElement.style.setProperty('--rf-banner-h', visible + 'px');
+}
 
 /* GitHub widget: live stars/forks from the authoritative GitHub API, with
  * ungh.cc (a CDN-cached proxy) as a fallback.  Uses a stale-while-revalidate
@@ -182,6 +212,18 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     tagEls.forEach(el => { el.textContent = 'Rayforce ' + rel.tag + ' is out'; });
+
+    /* Show the banner unless it was dismissed for THIS exact release tag — a
+     * newer release re-shows it. The tag is stashed on the element for the
+     * dismiss handler. */
+    const banner = document.querySelector('[data-rf-banner]');
+    if (banner) {
+      banner.dataset.tag = rel.tag;
+      let dismissed = null;
+      try { dismissed = localStorage.getItem('rf-banner-dismissed'); } catch (e) {}
+      banner.hidden = (dismissed === rel.tag);
+      if (typeof rfUpdateBannerOffset === 'function') rfUpdateBannerOffset();
+    }
 
     if (metaEl) {
       metaEl.textContent = assetUrl

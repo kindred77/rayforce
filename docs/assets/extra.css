@@ -332,32 +332,41 @@
   color: #f0b954;
 }
 
-/* ── Buttons (.md-button) ────────────────────────────────────── */
+/* ── Buttons (.md-button) ──────────────────────────────────────
+   Match the marketing pill buttons (.btn-hero / .btn-hero-ghost in
+   landing.css) so docs CTAs read identically to the landing page:
+     .md-button          → outlined "ghost" pill
+     .md-button--primary → filled gradient pill with glow lift. */
 
 .md-typeset .md-button {
-  font-family: 'Oswald', sans-serif;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  border: 1px solid #e9a033;
-  color: #f0b954;
-  transition: all .15s;
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 13px 30px; border-radius: 100px;
+  font-weight: 600; font-size: .9rem;
+  text-transform: none; letter-spacing: 0;
+  color: var(--text-muted, #7b8fa0);
+  border: 1.5px solid var(--border, rgba(233, 160, 51, 0.2));
+  background: none;
+  transition: color .2s, border-color .2s, background .2s, box-shadow .2s, transform .2s;
 }
 
 .md-typeset .md-button:hover {
-  background: rgba(233, 160, 51, 0.1);
-  border-color: #f0b954;
-  color: #f5d080;
+  color: var(--text, #f1f5f9);
+  border-color: var(--border-hover, rgba(233, 160, 51, 0.4));
+  background: rgba(233, 160, 51, 0.05);
 }
 
 .md-typeset .md-button--primary {
-  background: #e9a033;
-  color: #0a0e13;
+  color: var(--text, #f1f5f9);
+  border: 0;
+  background: linear-gradient(135deg, var(--primary, #e9a033), var(--primary-light, #f0b954));
+  box-shadow: 0 4px 20px rgba(233, 160, 51, 0.35);
 }
 
 .md-typeset .md-button--primary:hover {
-  background: #f0b954;
-  color: #0a0e13;
+  color: var(--text, #f1f5f9);
+  background: linear-gradient(135deg, var(--primary, #e9a033), var(--primary-light, #f0b954));
+  box-shadow: 0 8px 32px rgba(233, 160, 51, 0.5);
+  transform: translateY(-2px);
 }
 
 /* ── Search ──────────────────────────────────────────────────── */
@@ -495,27 +504,41 @@ html.landing-page body .footer.landing-footer { display: block; }
    (the landing page).  Keeping them here was shadowing the original
    marketing values. */
 
-/* ── Release announcement bar ──────────────────────────────────
-   The announce block (overrides/main.html) renders inside Material's
-   .md-banner.  Brand-tinted background + inline Download link; main.js
-   fills the live version and rewrites the link to the OS-matched binary. */
-.md-banner {
+/* ── Release banner (our own component) ─────────────────────────
+   Mounted in Material's announce slot; flatten Material's .md-banner /
+   .md-banner__inner wrappers so .rf-banner is the only styled box.  In normal
+   flow at the very top of every page: on docs it scrolls away above the sticky
+   header (Material-native), on the landing/about pages main.js offsets the
+   floating pill nav below it via --rf-banner-h. */
+.md-banner, .md-banner__inner { display: contents; }
+
+.rf-banner {
+  display: flex; align-items: center; justify-content: center; gap: 10px;
+  position: relative; padding: 8px 46px; min-height: 38px;
   background: linear-gradient(90deg, var(--navy, #0e1b24), #122430);
   color: var(--text, #f1f5f9);
   border-bottom: 1px solid var(--border, rgba(233, 160, 51, 0.18));
+  font-size: .82rem; text-align: center;
 }
-.md-banner__inner { font-size: .78rem; }
-.rf-announce {
+.rf-banner[hidden] { display: none; }
+.rf-banner-msg {
   display: inline-flex; align-items: center; gap: 8px;
   flex-wrap: wrap; justify-content: center;
 }
-.rf-announce-spark { color: var(--primary, #e9a033); }
-.rf-announce-link {
+.rf-banner-spark { color: var(--primary, #e9a033); }
+.rf-banner-link {
   display: inline-flex; align-items: center; gap: 5px;
   color: var(--primary-light, #f0b954); font-weight: 700;
   text-decoration: none; border-bottom: 1px solid transparent;
 }
-.rf-announce-link:hover {
+.rf-banner-link:hover {
   color: var(--primary-lighter, #f5d080); border-bottom-color: currentColor;
 }
+.rf-banner-close {
+  position: absolute; right: 12px; top: 50%; transform: translateY(-50%);
+  display: inline-flex; padding: 4px; border: 0; background: none;
+  color: var(--text-muted, #7b8fa0); cursor: pointer; border-radius: 6px;
+  line-height: 0; transition: color .2s, background .2s;
+}
+.rf-banner-close:hover { color: var(--text, #f1f5f9); background: rgba(255, 255, 255, 0.08); }
 
