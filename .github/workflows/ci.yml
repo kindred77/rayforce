@@ -36,7 +36,13 @@ jobs:
       - name: Build (${{ matrix.target }})
         run: make ${{ matrix.target }}
 
+      # Tests build their own debug+ASan objects, so they only make sense after a
+      # debug build. Running `make test` after `make release` reuses the
+      # release-compiled src objects (no -DDEBUG), which omits DEBUG-only symbols
+      # like ray_check_null_invariant and fails to link. The release legs still
+      # verify the optimized build compiles + links; the debug legs run the tests.
       - name: Test
+        if: matrix.target == 'debug'
         run: make test
 
   # Single stable check to require in branch protection, instead of the four
