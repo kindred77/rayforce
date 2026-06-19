@@ -25,7 +25,8 @@ truth for the version** — no version literal is ever hand-edited in source.
    - builds the optimized binary for Linux and macOS with the version injected
      at compile time (`make dist RAY_VERSION=X.Y.Z`),
    - packages `rayforce-X.Y.Z-<os>-<arch>.tar.gz` + a `.sha256` checksum,
-   - publishes a GitHub Release with auto-generated notes and the artifacts.
+   - publishes a GitHub Release with a feature-oriented changelog and the
+     artifacts.
 
 That's the whole ritual. **Never edit the version in source to make a release** —
 the tag is authoritative.
@@ -44,6 +45,20 @@ manual dispatch with no prior draft tags the current `master` HEAD.
 > published (`--draft=false`). So `build` checks out the release's target
 > **commit**; the `publish` job is what creates the tag `vX.Y.Z`. Checking out
 > `ref: vX.Y.Z` during build would fail (the tag does not exist yet).
+
+## Release notes
+
+Notes are a **feature changelog, not a contributor ledger**. The `prepare` job
+runs [`.github/release-notes.sh`](.github/release-notes.sh), which groups
+conventional-commit subjects since the previous release tag into sections —
+**✨ Features** (`feat`), **🐛 Bug fixes** (`fix`), **⚡ Performance** (`perf`),
+**📚 Documentation** (`docs`) — with everything else collapsed under
+*Maintenance & internal*. Author names and merge-commit noise are dropped; a
+**Full changelog** compare link at the bottom is the exhaustive per-commit view.
+
+Because notes are scoped to `previousTag..thisRelease`, they only read well once
+there is a previous release tag to diff against — the first release (`v2.1.0`)
+spans the entire v2 line and was given a hand-written highlights summary instead.
 
 ## How the version reaches the binary
 
