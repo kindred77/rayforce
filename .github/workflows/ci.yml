@@ -1,16 +1,15 @@
 name: CI
 
 on:
-  # Pushes: only the dev integration branch needs a standing green signal
-  # (releases are cut from it). Master is intentionally absent — a push to
-  # master only happens via a merged PR, whose pull_request run already
-  # tested the exact merge result, so re-testing post-merge is redundant
-  # (and can't gate anything anyway).
-  push:
-    branches: [dev]
-  # PRs into dev AND master are tested. The pull_request->master run tests
-  # dev merged into master and is the check that branch protection requires
-  # to reject a failing release merge — keep it.
+  # PR-only. Every change reaches dev and master through a pull request, and
+  # the pull_request run tests the exact merge result — so one run gates each
+  # hop:
+  #   • PR -> dev    : gates feature/fix work landing on the integration branch
+  #   • PR -> master : the required gate for a release (dev -> master, vX.Y.Z)
+  # No push triggers: a post-merge `push` run only re-tests what the PR run
+  # already validated (the redundant on-merge-to-dev run we were paying for).
+  # Direct pushes to a branch are not expected — the flow is PRs onto dev,
+  # then dev baked to master as a release.
   pull_request:
     branches: [master, dev]
 
