@@ -37,6 +37,7 @@ theme:
     # via overrides/home.html).  Clicking the logo from a docs page
     # would otherwise render the landing inside the docs shell until
     # the user hard-refreshes.
+    - announce.dismiss
     - navigation.tracking
     - navigation.sections
     - navigation.expand

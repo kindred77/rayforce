@@ -8,3 +8,18 @@
   (sidebar / TOC / footer) is otherwise Material's default until we move
   marketing pages into MkDocs in Wave 3.
 #}
+
+{# Site-wide release announcement bar.  Static text names the project and links
+   to /releases/latest so it works with no JS; main.js fills in the live version
+   ("Rayforce vX.Y.Z is out") and rewrites the Download link to the OS-matched
+   binary.  Dismissible via the announce.dismiss theme feature. #}
+{% block announce %}
+  <span class="rf-announce">
+    <span class="rf-announce-spark" aria-hidden="true">✨</span>
+    <span data-release-tag>Rayforce — latest release</span>
+    <a class="rf-announce-link" href="https://github.com/RayforceDB/rayforce/releases/latest" data-download-cta>
+      <span data-download-label>Download</span>
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+    </a>
+  </span>
+{% endblock %}

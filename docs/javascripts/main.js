@@ -134,3 +134,95 @@ document.addEventListener('DOMContentLoaded', () => {
     })
     .catch(() => { /* leave whatever is painted (cache or em-dash placeholders) */ });
 })();
+
+/* Latest-release resolver: powers the OS-aware Download CTAs (landing) and the
+ * site-wide release announcement banner from a single fetch. ungh.cc primary
+ * (CDN-cached, no rate limit), GitHub API fallback, 1h localStorage cache.
+ * ungh leaves asset `name` null, so we match on the download URL, which carries
+ * the platform token (linux-x86_64 / darwin-arm64). Progressive enhancement:
+ * the CTAs already link to /releases/latest and the banner already names the
+ * project, so it all works with no JS, on Windows/mobile, or if APIs are down. */
+(function () {
+  const ctas = document.querySelectorAll('[data-download-cta]');
+  const tagEls = document.querySelectorAll('[data-release-tag]');
+  const metaEl = document.querySelector('[data-download-meta]');
+  if (ctas.length === 0 && tagEls.length === 0) return;
+
+  const REPO = 'RayforceDB/rayforce';
+  const CACHE_KEY = 'gh-release:' + REPO;
+  const CACHE_TTL = 60 * 60 * 1000; /* 1 hour */
+
+  /* Only Linux x86_64 and macOS (arm64) ship today; Windows/mobile/unknown fall
+   * through to the releases page. navigator.platform can't tell Apple Silicon
+   * from Intel, but arm64 is the only macOS artifact, so 'darwin' is correct. */
+  function detectTarget() {
+    const s = (navigator.userAgent || '') + ' ' + (navigator.platform || '');
+    if (/Android/i.test(s)) return null;
+    if (/Mac/i.test(s))     return { token: 'darwin', os: 'macOS' };
+    if (/Linux|X11/i.test(s)) return { token: 'linux', os: 'Linux' };
+    return null;
+  }
+
+  function apply(rel) {
+    if (!rel || !rel.tag) return;
+    const tgt = detectTarget();
+    const assetUrl = tgt
+      ? (rel.urls || []).find(u => /\.tar\.gz$/.test(u) && u.indexOf(tgt.token) !== -1)
+      : null;
+
+    ctas.forEach(a => {
+      const label = a.querySelector('[data-download-label]');
+      if (assetUrl) {
+        a.href = assetUrl;
+        if (label) label.textContent = 'Download for ' + tgt.os;
+        a.setAttribute('title', 'Rayforce ' + rel.tag + ' · ' + tgt.os);
+      } else if (label) {
+        label.textContent = 'Download';   /* keep the /releases/latest page href */
+      }
+    });
+
+    tagEls.forEach(el => { el.textContent = 'Rayforce ' + rel.tag + ' is out'; });
+
+    if (metaEl) {
+      metaEl.textContent = assetUrl
+        ? 'Latest ' + rel.tag + ' · ' + tgt.os
+        : 'Latest release: ' + rel.tag;
+      metaEl.hidden = false;
+    }
+  }
+
+  function readCache() {
+    try {
+      const v = JSON.parse(localStorage.getItem(CACHE_KEY));
+      if (!v || (Date.now() - v.t) > CACHE_TTL) return null;
+      return v.rel;
+    } catch (e) { return null; }
+  }
+  function writeCache(rel) {
+    try { localStorage.setItem(CACHE_KEY, JSON.stringify({ t: Date.now(), rel: rel })); } catch (e) {}
+  }
+
+  const cached = readCache();
+  if (cached) { apply(cached); return; }
+
+  /* Primary: ungh.cc. Shape: { release: { tag, assets: [{ downloadUrl }] } }. */
+  fetch('https://ungh.cc/repos/' + REPO + '/releases/latest')
+    .then(r => r.ok ? r.json() : Promise.reject(new Error('ungh ' + r.status)))
+    .then(d => {
+      const r = d.release || d;
+      const rel = { tag: r.tag, urls: (r.assets || []).map(a => a.downloadUrl).filter(Boolean) };
+      if (!rel.tag) throw new Error('ungh shape');
+      writeCache(rel); apply(rel);
+    })
+    .catch(() => {
+      /* Fallback: GitHub API. Shape: { tag_name, assets: [{ browser_download_url }] }. */
+      return fetch('https://api.github.com/repos/' + REPO + '/releases/latest', { headers: { Accept: 'application/vnd.github+json' } })
+        .then(r => r.ok ? r.json() : Promise.reject(new Error('gh ' + r.status)))
+        .then(d => {
+          const rel = { tag: d.tag_name, urls: (d.assets || []).map(a => a.browser_download_url).filter(Boolean) };
+          if (!rel.tag) throw new Error('gh shape');
+          writeCache(rel); apply(rel);
+        });
+    })
+    .catch(() => { /* CTAs stay on /releases/latest; banner keeps its default text. */ });
+})();

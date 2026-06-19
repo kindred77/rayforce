@@ -495,3 +495,27 @@ html.landing-page body .footer.landing-footer { display: block; }
    (the landing page).  Keeping them here was shadowing the original
    marketing values. */
 
+/* ── Release announcement bar ──────────────────────────────────
+   The announce block (overrides/main.html) renders inside Material's
+   .md-banner.  Brand-tinted background + inline Download link; main.js
+   fills the live version and rewrites the link to the OS-matched binary. */
+.md-banner {
+  background: linear-gradient(90deg, var(--navy, #0e1b24), #122430);
+  color: var(--text, #f1f5f9);
+  border-bottom: 1px solid var(--border, rgba(233, 160, 51, 0.18));
+}
+.md-banner__inner { font-size: .78rem; }
+.rf-announce {
+  display: inline-flex; align-items: center; gap: 8px;
+  flex-wrap: wrap; justify-content: center;
+}
+.rf-announce-spark { color: var(--primary, #e9a033); }
+.rf-announce-link {
+  display: inline-flex; align-items: center; gap: 5px;
+  color: var(--primary-light, #f0b954); font-weight: 700;
+  text-decoration: none; border-bottom: 1px solid transparent;
+}
+.rf-announce-link:hover {
+  color: var(--primary-lighter, #f5d080); border-bottom-color: currentColor;
+}
+
