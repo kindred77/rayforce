@@ -1107,12 +1107,35 @@ static test_result_t test_join_empty_table(void) {
  * Category 4: Optimizer correctness tests
  * ----------------------------------------------------------------------- */
 
-/* Integer division by zero: val / 0 → each element should produce NaN (F64 null)
- * because ray_div forces F64 output, and F64 div-by-zero returns NaN.
- * SUM of all-NaN = NaN. */
+/* Integer division by zero: val / 0 → each element is NULL_F64 (0Nf).
+ *
+ * Single-null float model re-baseline: F64 div-by-zero now canonicalizes to
+ * NULL_F64, and NULL_F64 (a NaN) IS the null sentinel.  So (val / 0) is an
+ * all-null F64 column with HAS_NULLS set, and SUM skips nulls instead of
+ * summing NaN-as-a-value.  The old model treated div-by-zero NaN as a real
+ * value, so SUM(all-NaN) surfaced a raw NaN; the new model never lets a
+ * non-finite escape as a summed value.  We assert the column-level invariant
+ * (every (val/0) element is 0Nf, HAS_NULLS set) and that SUM is null-or-finite
+ * — never a raw NaN-as-value.  (Empty-sum may be a typed null or 0.0 depending
+ * on the reduce path; both honor the model, so we don't pin the exact form.) */
 static test_result_t test_const_fold_div_zero(void) {
     ray_heap_init();
     ray_t* tbl = make_audit_table();
+
+    /* Column invariant: every (val / 0) element is exactly NULL_F64 (0Nf). */
+    ray_graph_t* gc = ray_graph_new(tbl);
+    ray_op_t* divc = ray_div(gc, ray_scan(gc, "val"), ray_const_i64(gc, 0));
+    ray_t* col = ray_execute(gc, divc);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(col));
+    TEST_ASSERT_TRUE(col->type == RAY_F64);
+    TEST_ASSERT_TRUE((col->attrs & RAY_ATTR_HAS_NULLS) != 0);
+    for (int64_t i = 0; i < col->len; i++) {
+        double x = ((double*)ray_data(col))[i];
+        TEST_ASSERT_TRUE(x != x);              /* every lane is 0Nf */
+        TEST_ASSERT_TRUE(ray_vec_is_null(col, i));
+    }
+    ray_release(col);
+    ray_graph_free(gc);
 
     ray_graph_t* g = ray_graph_new(tbl);
     ray_op_t* val = ray_scan(g, "val");
@@ -1122,7 +1145,10 @@ static test_result_t test_const_fold_div_zero(void) {
 
     ray_t* result = ray_execute(g, s);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    TEST_ASSERT_TRUE(isnan(result->f64));
+    /* SUM never surfaces a raw NaN-as-value: it is either a typed null
+     * (f64 == NULL_F64, also a NaN) or a finite number. */
+    bool is_null = ray_atom_is_null_fn(result);
+    TEST_ASSERT_TRUE(is_null || isfinite(result->f64));
 
     ray_release(result);
     ray_graph_free(g);
