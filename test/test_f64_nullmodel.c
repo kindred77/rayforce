@@ -49,7 +49,11 @@
 #include "lang/internal.h"   /* ray_sqrt_fn / ray_log_fn / ... / ray_pearson_corr_fn */
 #include "mem/heap.h"
 #include "table/sym.h"
+#include "io/csv.h"          /* STAGE 2: ray_read_csv_opts — CSV ingest entry point */
+#include "store/serde.h"     /* STAGE 2: ray_ser_raw / ray_de_raw — deserialize entry point */
 #include <string.h>
+#include <stdio.h>
+#include <unistd.h>
 #include <math.h>
 #include <float.h>
 
@@ -393,11 +397,177 @@ static test_result_t test_prop_vm_in_select(void) {
     return r;
 }
 
+/* ════════════════════════════════════════════════════════════════════════
+ * Stage 2 — INGEST / PERSISTENCE entry points close the model
+ *
+ * Stage 1 closed the COMPUTE surface (kernels/aggregates).  Stage 2 closes
+ * the three ways a raw ±Inf / non-canonical NaN can still ENTER a column:
+ *   1. CSV / numeric parse (ray_parse_f64 → csv fast_f64)
+ *   2. STR→F64 cast (ray_cast_fn)
+ *   3. deserialize (ray_de_raw F64 atom + vector)
+ * ════════════════════════════════════════════════════════════════════════ */
+
+static char tmp_f64_csv_path[64];
+static const char* tmp_f64_csv(void) {
+    if (!tmp_f64_csv_path[0])
+        snprintf(tmp_f64_csv_path, sizeof(tmp_f64_csv_path),
+                 "/tmp/rayforce_f64nm_%d.csv", (int)getpid());
+    return tmp_f64_csv_path;
+}
+
+/* CSV ingest: cells "inf","-inf","nan","1e400","1e-400",0 → every F64
+ * element is finite-or-0Nf, HAS_NULLS set, nil? true on the non-finite rows.
+ * "1e-400" underflows to 0.0 (a finite value, NOT null). */
+static test_result_t test_ingest_csv_nonfinite(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    const char* path = tmp_f64_csv();
+    FILE* f = fopen(path, "w");
+    TEST_ASSERT_NOT_NULL(f);
+    fprintf(f, "v\ninf\n-inf\nnan\n1e400\n1e-400\n0\n");
+    fclose(f);
+
+    int8_t schema[1] = { RAY_F64 };
+    ray_t* loaded = ray_read_csv_opts(path, 0, true, schema, 1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    ray_t* col = ray_table_get_col_idx(loaded, 0);
+    TEST_ASSERT_NOT_NULL(col);
+    TEST_ASSERT_EQ_I(col->type, RAY_F64);
+    TEST_ASSERT_EQ_I(col->len, 6);
+
+    const double* d = (const double*)ray_data(col);
+    /* Rows 0..3 (inf,-inf,nan,1e400) are non-finite → must be 0Nf + null. */
+    for (int i = 0; i < 4; i++) {
+        TEST_ASSERT_FMT(d[i] != d[i], "csv row %d not canonicalized to 0Nf (%g)", i, d[i]);
+        TEST_ASSERT_FMT(ray_vec_is_null(col, i), "csv row %d 0Nf not seen as null", i);
+    }
+    /* Row 4 (1e-400) underflows to a finite 0.0 — a value, not a null. */
+    TEST_ASSERT_TRUE(isfinite(d[4]));
+    TEST_ASSERT_FALSE(ray_vec_is_null(col, 4));
+    /* Row 5 (0) — finite value. */
+    TEST_ASSERT_TRUE(isfinite(d[5]) && d[5] == 0.0);
+    TEST_ASSERT_FALSE(ray_vec_is_null(col, 5));
+    /* Model invariant + HAS_NULLS set because non-finite cells produced 0Nf. */
+    TEST_ASSERT_TRUE((col->attrs & RAY_ATTR_HAS_NULLS) != 0);
+
+    test_result_t r = assert_finite_or_null(col, "csv_ingest");
+    ray_release(loaded);
+    unlink(path);
+    ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
+/* STR→F64 scalar cast: "inf"/"nan"/"1e400" → 0Nf atom; "2.5" finite. */
+static test_result_t test_ingest_cast_scalar(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    test_result_t r = { TEST_PASS, NULL };
+    ray_t* f64ty = ray_sym(ray_sym_intern("F64", 3));
+
+    const char* nonfin[] = { "inf", "-inf", "nan", "1e400" };
+    for (size_t i = 0; i < sizeof(nonfin)/sizeof(nonfin[0]); i++) {
+        ray_t* s = ray_str(nonfin[i], strlen(nonfin[i]));
+        ray_t* c = ray_cast_fn(f64ty, s);
+        r = check_scalar_atom(c, nonfin[i]);
+        if (r.status == TEST_PASS)
+            TEST_ASSERT_FMT(c->f64 != c->f64, "cast %s not 0Nf", nonfin[i]);
+        ray_release(c); ray_release(s);
+        if (r.status != TEST_PASS) goto done;
+    }
+    /* Finite string stays finite. */
+    {
+        ray_t* s = ray_str("2.5", 3);
+        ray_t* c = ray_cast_fn(f64ty, s);
+        TEST_ASSERT(c && !RAY_IS_ERR(c) && c->f64 == 2.5, "cast 2.5 preserved");
+        ray_release(c); ray_release(s);
+    }
+done:
+    ray_release(f64ty);
+    ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
+/* STR vector→F64 vector cast: non-finite cells → 0Nf, HAS_NULLS set. */
+static test_result_t test_ingest_cast_vector(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* f64ty = ray_sym(ray_sym_intern("F64", 3));
+
+    const char* cells[] = { "1.5", "inf", "nan", "1e400", "3.0" };
+    ray_t* sv = ray_vec_new(RAY_STR, 5);
+    for (size_t i = 0; i < sizeof(cells)/sizeof(cells[0]); i++)
+        sv = ray_str_vec_append(sv, cells[i], strlen(cells[i]));
+
+    ray_t* out = ray_cast_fn(f64ty, sv);
+    test_result_t r = assert_finite_or_null(out, "cast_vec");
+    if (r.status == TEST_PASS) {
+        const double* d = (const double*)ray_data(out);
+        TEST_ASSERT(isfinite(d[0]) && d[0] == 1.5, "cast_vec[0]==1.5");
+        TEST_ASSERT(d[1] != d[1] && d[2] != d[2] && d[3] != d[3],
+                    "cast_vec non-finite cells are 0Nf");
+        TEST_ASSERT(isfinite(d[4]) && d[4] == 3.0, "cast_vec[4]==3.0");
+        TEST_ASSERT((out->attrs & RAY_ATTR_HAS_NULLS) != 0,
+                    "cast_vec HAS_NULLS set");
+    }
+    ray_release(out); ray_release(sv); ray_release(f64ty);
+    ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
+/* Serialize↔deserialize round-trip: a column of finite + 0Nf values is
+ * bit-stable across ser/de (0Nf stays 0Nf, finite stays finite, HAS_NULLS
+ * preserved).  No legacy on-disk canonicalization: the engine only ever
+ * writes finite-or-0Nf (single-null model), so the load path trusts it. */
+static test_result_t test_ingest_serde_roundtrip(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    test_result_t r = { TEST_PASS, NULL };
+
+    /* (a) finite + 0Nf round-trip — bit-stable. */
+    double vals[5] = { 1.0, NULL_F64, -2.5, NULL_F64, 1e300 };
+    ray_t* col = ray_vec_from_raw(RAY_F64, vals, 5);
+    ray_vec_set_null(col, 1, true);
+    ray_vec_set_null(col, 3, true);
+
+    int64_t sz = ray_serde_size(col);
+    TEST_ASSERT_FMT(sz > 0, "serde_size > 0 (got %lld)", (long long)sz);
+    ray_t* bufblk = ray_alloc((size_t)sz);
+    TEST_ASSERT_NOT_NULL(bufblk);
+    uint8_t* buf = (uint8_t*)ray_data(bufblk);
+    int64_t wrote = ray_ser_raw(buf, col);
+    TEST_ASSERT_FMT(wrote == sz, "ser_raw wrote %lld != size %lld",
+                    (long long)wrote, (long long)sz);
+
+    int64_t rlen = sz;
+    ray_t* back = ray_de_raw(buf, &rlen);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(back));
+    TEST_ASSERT_EQ_I(back->type, RAY_F64);
+    TEST_ASSERT_EQ_I(back->len, 5);
+    {
+        const double* a = (const double*)ray_data(col);
+        const double* b = (const double*)ray_data(back);
+        for (int i = 0; i < 5; i++) {
+            int na = (a[i] != a[i]), nb = (b[i] != b[i]);
+            if (na || nb) {
+                TEST_ASSERT_FMT(na && nb, "roundtrip null divergence at %d", i);
+            } else {
+                uint64_t ba, bb; memcpy(&ba, &a[i], 8); memcpy(&bb, &b[i], 8);
+                TEST_ASSERT_FMT(ba == bb, "roundtrip bit mismatch at %d", i);
+            }
+        }
+        TEST_ASSERT_TRUE((back->attrs & RAY_ATTR_HAS_NULLS) != 0);
+    }
+    r = assert_finite_or_null(back, "serde_roundtrip");
+    ray_free(bufblk); ray_release(back); ray_release(col);
+    ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
 const test_entry_t f64_nullmodel_entries[] = {
     { "f64_nullmodel/diff_vm_eq_fallback", test_diff_all_f64_ops,  NULL, NULL },
     { "f64_nullmodel/prop_elementwise",   test_prop_elementwise,   NULL, NULL },
     { "f64_nullmodel/prop_pow_unary",     test_prop_pow_and_unary, NULL, NULL },
     { "f64_nullmodel/prop_aggregates",    test_prop_aggregates,    NULL, NULL },
     { "f64_nullmodel/prop_vm_in_select",  test_prop_vm_in_select,  NULL, NULL },
+    { "f64_nullmodel/ingest_csv_nonfinite", test_ingest_csv_nonfinite, NULL, NULL },
+    { "f64_nullmodel/ingest_cast_scalar",   test_ingest_cast_scalar,   NULL, NULL },
+    { "f64_nullmodel/ingest_cast_vector",   test_ingest_cast_vector,   NULL, NULL },
+    { "f64_nullmodel/ingest_serde_roundtrip", test_ingest_serde_roundtrip, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };

@@ -75,10 +75,13 @@
 ;; ════════════════════════════════════════════════════════════════════════════
 (.sys.exec "printf 'a\nNaN\nInf\n+Inf\n-Inf\nnan\ninf\n1.5\n' > rf_test_csv_types_naninf.csv") -- 0
 (set Tni (.csv.read "rf_test_csv_types_naninf.csv"))
-;; NaN/Inf literals all infer as F64
+;; NaN/Inf literals all infer as F64 (detect_type still recognizes the tokens)
 (count Tni) -- 7
-;; 1.5 is the only finite non-special value; others are NaN/±Inf
+;; STAGE 2 (single-null float model): the special tokens canonicalize to 0Nf
+;; at ingest, so rows 0..5 are null; 1.5 (row 6) is the only finite value.
 (at (at Tni 'a) 6) -- 1.5
+(nil? (at (at Tni 'a) 0)) -- true
+(nil? (at (at Tni 'a) 1)) -- true
 
 ;; ════════════════════════════════════════════════════════════════════════════
 ;; 7. Null sentinel strings: N/A, n/a, NA, na, null, NULL, None, none, .

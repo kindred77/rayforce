@@ -11,8 +11,7 @@
 ;;   detect_type numeric scan : exponent sign (182), trailing junk → STR (185/223),
 ;;                              negative numbers, double-dot, bare sign/exponent
 ;;   promote_csv_type         : obs==UNKNOWN after cur set (228), I64→F64 widen (238)
-;;   fast_f64 inf/-inf parse  : ray_parse_f64 inf path → non-null inf
-;;   csv_write_f64 isinf      : 2542 — inf / -inf round-trip writes "inf"/"-inf"
+;;   fast_f64 inf/-inf parse  : ray_parse_f64 inf path → 0Nf null (Stage 2 model)
 ;;   csv_write_time sign      : 2503-2510 — negative ms-of-day → leading "-"
 ;;   csv_write_timestamp neg  : 2523 — pre-2000 ns_in<0 day-borrow fixup
 ;;   csv_write_date pre-epoch : 2485+ — negative day count
@@ -110,29 +109,27 @@
 (sum (at Ti2f 'v)) -- 10.5
 
 ;; ════════════════════════════════════════════════════════════════════════════
-;; 7. fast_f64 inf / -inf parse + csv_write_f64 isinf branch (line 2542).
-;;    Explicit [F64] schema parses "inf"/"-inf" to real (non-null) infinities;
-;;    they survive a write round-trip as the literal text "inf"/"-inf".
-;;    An empty 4th cell parses with is_null=true → stored as NULL_F64, which
-;;    sets HAS_NULLS and round-trips back out as an empty field.
+;; 7. fast_f64 inf / -inf parse  (STAGE 2 single-null float model re-baseline).
+;;    The F64 domain is {finite} ∪ {0Nf}; ±Inf and NaN are NOT values.  The
+;;    explicit [F64] schema still parses the "inf"/"-inf" tokens, but each
+;;    canonicalizes to NULL_F64 (0Nf) at ingest — they read back as nil? and
+;;    set HAS_NULLS, exactly like the empty 4th cell.  1.5 stays finite.
+;;    (Was: "inf"/"-inf" loaded as real non-null infinities and round-tripped
+;;    as the literal text "inf"/"-inf"; that contradicted the closed model.)
 ;; ════════════════════════════════════════════════════════════════════════════
 (.sys.exec "printf 'x\ninf\n-inf\n1.5\n\n' > rf_test_csvbc_inf.csv") -- 0
 (set Tinf (.csv.read [F64] "rf_test_csvbc_inf.csv"))
 (count Tinf) -- 4
-;; inf and -inf are NOT null (parse succeeds, payload is finite-infinity);
-;; 1.5 finite; the empty cell IS null (NULL_F64 sentinel + HAS_NULLS).
-(nil? (at (at Tinf 'x) 0)) -- false
-(nil? (at (at Tinf 'x) 1)) -- false
-;; Value-check the infinities directly, not just non-null: +inf exceeds every
-;; finite double, -inf is below every finite double, and inf+(-inf) is nan.
-(> (at (at Tinf 'x) 0) 1.0e308) -- true
-(< (at (at Tinf 'x) 1) -1.0e308) -- true
+;; inf and -inf now canonicalize to 0Nf → null; 1.5 finite; empty cell null.
+(nil? (at (at Tinf 'x) 0)) -- true
+(nil? (at (at Tinf 'x) 1)) -- true
 (at (at Tinf 'x) 2) -- 1.5
 (nil? (at (at Tinf 'x) 3)) -- true
-;; Write back: the isinf branch emits literal "inf" / "-inf"; the null row
-;; emits an empty field.  Assert on the exact bytes.
+;; Write back: every null F64 (rows 0,1,3) emits an empty field; only the
+;; finite 1.5 prints.  No column can hold an Inf, so the old isinf write
+;; branch never fires for ingested data.  Assert on the exact bytes.
 (.csv.write Tinf "rf_test_csvbc_inf_out.csv") -- 0
-(read "rf_test_csvbc_inf_out.csv") -- "x\ninf\n-inf\n1.5\n\n"
+(read "rf_test_csvbc_inf_out.csv") -- "x\n\n\n1.5\n\n"
 
 ;; ════════════════════════════════════════════════════════════════════════════
 ;; 8. csv_write_time — negative ms-of-day (leading '-', lines 2503-2510) and
