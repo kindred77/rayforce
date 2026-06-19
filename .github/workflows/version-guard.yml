@@ -1,0 +1,58 @@
+name: Version Guard
+
+# Fast feedback on release PRs (dev -> master): the PR title must declare a
+# clean, unused, strictly-increasing semver "vX.Y.Z". The git tag is the
+# single source of truth for the version (see RELEASE.md); this check stops a
+# bad number from ever reaching release.yml. Make this a required status check
+# on master so a malformed/duplicate version can't be merged.
+
+on:
+  pull_request:
+    branches: [master]
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # need all tags for the monotonicity check
+
+      - name: Validate release version in PR title
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+
+          # 1. Format: title must be exactly vX.Y.Z
+          if [[ ! "$PR_TITLE" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "::error::PR title must be a release version 'vX.Y.Z' (e.g. v2.1.3), got: '$PR_TITLE'"
+            exit 1
+          fi
+          version="${BASH_REMATCH[1]}"
+          echo "Release version: $version"
+
+          git fetch --tags --quiet
+
+          # 2. Tag must not already exist
+          if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+            echo "::error::tag v$version already exists — pick a higher version"
+            exit 1
+          fi
+
+          # 3. Must be strictly greater than the latest existing vX.Y.Z tag
+          latest="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' | sed 's/^v//' | sort -V | tail -1)"
+          if [[ -z "$latest" ]]; then
+            echo "No prior release tag found; $version is the first release."
+            exit 0
+          fi
+          highest="$(printf '%s\n%s\n' "$latest" "$version" | sort -V | tail -1)"
+          if [[ "$highest" != "$version" || "$version" == "$latest" ]]; then
+            echo "::error::version $version must be strictly greater than the latest release $latest"
+            exit 1
+          fi
+          echo "OK: $version > $latest"

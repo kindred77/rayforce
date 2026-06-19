@@ -1,10 +1,18 @@
 name: CI
 
 on:
+  # Pushes: only the dev integration branch needs a standing green signal
+  # (releases are cut from it). Master is intentionally absent — a push to
+  # master only happens via a merged PR, whose pull_request run already
+  # tested the exact merge result, so re-testing post-merge is redundant
+  # (and can't gate anything anyway).
   push:
-    branches: [master]
+    branches: [dev]
+  # PRs into dev AND master are tested. The pull_request->master run tests
+  # dev merged into master and is the check that branch protection requires
+  # to reject a failing release merge — keep it.
   pull_request:
-    branches: [master]
+    branches: [master, dev]
 
 jobs:
   build-and-test:
@@ -30,3 +38,19 @@ jobs:
 
       - name: Test
         run: make test
+
+  # Single stable check to require in branch protection, instead of the four
+  # brittle matrix names (which break if the matrix is renamed). `if: always()`
+  # makes this job run even when a matrix leg fails, and the explicit result
+  # check fails it — without that, a failed matrix would SKIP this job, and a
+  # skipped required check can be treated as passed, silently opening the gate.
+  ci-success:
+    needs: build-and-test
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify all matrix jobs passed
+        run: |
+          result='${{ needs.build-and-test.result }}'
+          echo "build-and-test result: $result"
+          [ "$result" = "success" ] || exit 1
