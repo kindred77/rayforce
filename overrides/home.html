@@ -43,16 +43,24 @@
     <div class="container">
       <div class="hero-top">
         <div class="hero-content">
-          <div class="hero-eyebrow">PURE C17 &middot; ZERO DEPS &middot; GRAPH + ANALYTICS</div>
+          <div class="hero-eyebrow">PURE C &middot; ZERO DEPS &middot; GRAPH + ANALYTICS</div>
           <h1>Columnar analytics and<br>graph traversal in <span class="highlight">one pipeline</span></h1>
-          <p class="hero-desc">Rayforce is a zero-dependency embeddable engine where columnar analytics and graph operations share a single operation DAG, pass through a multi-pass optimizer, and execute as fused morsel-driven bytecode. Pure C17. No malloc.</p>
+          <p class="hero-desc">Rayforce is a zero-dependency embeddable engine where columnar analytics and graph operations share a single operation DAG, pass through a multi-pass optimizer, and execute as fused morsel-driven bytecode. Pure C. No malloc.</p>
           <div class="hero-actions">
-            <a href="{{ 'docs/getting-started/quick-start/' | url }}" class="btn-hero">
-              Get Started
+            {# Primary CTA. Defaults to the releases page (works with no JS);
+               landing.js detects the OS and rewrites href + label to the
+               matching binary asset of the latest release. #}
+            <a href="https://github.com/RayforceDB/rayforce/releases/latest" class="btn-hero" data-download-cta>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+              <span data-download-label>Download</span>
+            </a>
+            <a href="{{ 'docs/' | url }}" class="btn-hero-ghost">
+              Docs
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
             </a>
-            <a href="https://github.com/RayforceDB/rayforce" class="btn-hero-ghost" target="_blank" rel="noopener">View on GitHub</a>
+            <a href="https://github.com/RayforceDB/rayforce" class="btn-hero-ghost" target="_blank" rel="noopener">GitHub</a>
           </div>
+          <p class="hero-download-meta" data-download-meta hidden></p>
         </div>
 
         <aside class="hero-python" aria-labelledby="hero-python-label">
@@ -201,7 +209,7 @@ out = (t.where(rf.col(<span class="hl-str">"price"</span>) &gt; <span class="hl-
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 00-1-1.73l-7-4a2 2 0 00-2 0l-7 4A2 2 0 003 8v8a2 2 0 001 1.73l7 4a2 2 0 002 0l7-4A2 2 0 0021 16z"/></svg>
             <h3>Zero Dependencies</h3>
           </div>
-          <p>Pure C17, single public header. Builds with <code>make</code>. ~16K lines of engine code. Embeds into any C/C++ project.</p>
+          <p>Pure C, single public header. Builds with <code>make</code>. ~16K lines of engine code. Embeds into any C/C++ project.</p>
         </div>
       </div>
     </div>
@@ -312,8 +320,12 @@ out = (t.where(rf.col(<span class="hl-str">"price"</span>) &gt; <span class="hl-
 <span class="t-cmd">&#8227;</span> (pivot t 'Symbol 'Side 'Qty sum)</code></pre>
         </div>
         <div class="cta-buttons">
-          <a href="{{ 'docs/getting-started/quick-start/' | url }}" class="btn-hero">
-            Get Started
+          <a href="https://github.com/RayforceDB/rayforce/releases/latest" class="btn-hero" data-download-cta>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            <span data-download-label>Download</span>
+          </a>
+          <a href="{{ 'docs/' | url }}" class="btn-hero-ghost">
+            Docs
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
           </a>
           <a href="https://github.com/RayforceDB/rayforce" class="btn-hero-ghost" target="_blank" rel="noopener">View on GitHub</a>

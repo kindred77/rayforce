@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>About — Rayforce</title>
-  <meta name="description" content="About Rayforce — an embeddable analytics and graph engine in pure C17 by Anton Kundenko. Project background, design principles, license, and community.">
+  <meta name="description" content="About Rayforce — an embeddable analytics and graph engine in pure C by Anton Kundenko. Project background, design principles, license, and community.">
   <link rel="preload" as="font" type="font/woff2" href="assets/fonts/oswald-600.woff2" crossorigin>
   <link rel="preload" as="font" type="font/woff2" href="assets/fonts/oswald-700.woff2" crossorigin>
   <link rel="preload" as="font" type="font/woff2" href="assets/fonts/inter-400.woff2" crossorigin>
@@ -18,12 +18,12 @@
   <meta property="og:type" content="profile">
   <meta property="og:site_name" content="Rayforce">
   <meta property="og:title" content="About">
-  <meta property="og:description" content="About Rayforce — an embeddable analytics and graph engine in pure C17 by Anton Kundenko. Project background, design principles, license, and community.">
+  <meta property="og:description" content="About Rayforce — an embeddable analytics and graph engine in pure C by Anton Kundenko. Project background, design principles, license, and community.">
   <meta property="og:url" content="https://rayforcedb.com/about.html">
   <meta property="og:image" content="https://rayforcedb.com/assets/og-image.png">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="About">
-  <meta name="twitter:description" content="About Rayforce — an embeddable analytics and graph engine in pure C17 by Anton Kundenko. Project background, design principles, license, and community.">
+  <meta name="twitter:description" content="About Rayforce — an embeddable analytics and graph engine in pure C by Anton Kundenko. Project background, design principles, license, and community.">
   <meta name="twitter:image" content="https://rayforcedb.com/assets/og-image.png">
   <script type="application/ld+json">
 {
@@ -91,7 +91,7 @@
 
       <header>
         <h1>About Rayforce</h1>
-        <p class="about-lede">Rayforce is an embeddable analytics and graph engine written in pure C17 with zero external dependencies. It was built to close the gap between systems that excel at columnar analytics and systems that excel at graph traversal — by treating both as operations on the same query DAG.</p>
+        <p class="about-lede">Rayforce is an embeddable analytics and graph engine written in pure C with zero external dependencies. It was built to close the gap between systems that excel at columnar analytics and systems that excel at graph traversal — by treating both as operations on the same query DAG.</p>
       </header>
 
       <h2>Why it exists</h2>
@@ -99,7 +99,7 @@
 
       <h2>Design principles</h2>
       <ul>
-        <li><strong>Zero external dependencies.</strong> The whole engine is pure C17 with the standard library only. No third-party allocator, no Boost, no Arrow. The single header <code>rayforce.h</code> is the entire public API.</li>
+        <li><strong>Zero external dependencies.</strong> The whole engine is pure C with the standard library only. No third-party allocator, no Boost, no Arrow. The single header <code>rayforce.h</code> is the entire public API.</li>
         <li><strong>One DAG for everything.</strong> Filters, joins, aggregations, window functions, and graph traversals all build into the same lazy operation DAG. The optimizer rewrites the full graph before execution begins.</li>
         <li><strong>Morsel-driven execution.</strong> Element-wise operations fuse into single-pass pipelines that operate on 1024-element morsels and stay L1-resident. Pipeline breakers — joins, sort, group-by, window — materialize once and hand off cleanly.</li>
         <li><strong>Custom memory model.</strong> A buddy allocator with slab caches replaces malloc; per-thread heaps remove allocator contention; deferred cross-heap merge handles worker-thread results without locks on the hot path.</li>

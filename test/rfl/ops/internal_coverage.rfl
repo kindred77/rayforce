@@ -173,8 +173,10 @@
 ;; When exec.c processes HEAD/TAIL/flatten on a parted SYM column it
 ;; calls parted_first_attrs (to get the symbol width attrs from the
 ;; first non-NULL segment) and parted_seg_esz_ok.
-(set SC (table [id sym] (list [1 2 3] ['foo 'bar 'baz])))
-(set SD (table [id sym] (list [4 5]   ['qux 'quux])))
+;; NB: the SYM column is named `tag`, not `sym` — "sym"/"sym.lk" are
+;; reserved splayed-table column names (collide with the symfile).
+(set SC (table [id tag] (list [1 2 3] ['foo 'bar 'baz])))
+(set SD (table [id tag] (list [4 5]   ['qux 'quux])))
 (.db.splayed.set "/tmp/rfl_int_cov_sym/2024.01.01/s/" SC)
 (.db.splayed.set "/tmp/rfl_int_cov_sym/2024.01.02/s/" SD)
 
@@ -182,16 +184,16 @@
 (count PS) -- 5
 ;; HEAD of parted SYM → parted_first_attrs + typed_vec_new + parted_seg_esz_ok.
 (count (select {from: PS take: 3})) -- 3
-(first (at (select {from: PS take: 3}) 'sym)) -- 'foo
+(first (at (select {from: PS take: 3}) 'tag)) -- 'foo
 ;; TAIL of parted SYM → parted_first_attrs + parted_seg_esz_ok.
 (count (select {from: PS take: -2})) -- 2
 ;; Value-check the last two SYMs: qux,quux (from partition 2).
-(first (at (select {from: PS take: -2}) 'sym)) -- 'qux
-(at (at (select {from: PS take: -2}) 'sym) 1) -- 'quux
+(first (at (select {from: PS take: -2}) 'tag)) -- 'qux
+(at (at (select {from: PS take: -2}) 'tag) 1) -- 'quux
 ;; FILTER of parted SYM — exercise parted_first_attrs in filter.c path.
 (count (select {from: PS where: (> id 2)})) -- 3
 ;; Value-check: rows with id>2 are baz,qux,quux.
-(first (at (select {from: PS where: (> id 2)}) 'sym)) -- 'baz
+(first (at (select {from: PS where: (> id 2)}) 'tag)) -- 'baz
 
 ;; ======================================================================
 ;; 3.  Narrow SYM column from CSV  — read_col_i64 W8 / W16 branches.

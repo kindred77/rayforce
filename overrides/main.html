@@ -8,3 +8,25 @@
   (sidebar / TOC / footer) is otherwise Material's default until we move
   marketing pages into MkDocs in Wave 3.
 #}
+
+{# Site-wide release banner — our own component, mounted in Material's top-of-body
+   announce slot (its .md-banner wrapper is flattened to display:contents in
+   extra.css so only .rf-banner is styled).  Static text works with no JS; main.js
+   fills the live version ("Rayforce vX.Y.Z is out"), rewrites the Download link to
+   the OS-matched binary, offsets the floating pill nav below it, and handles
+   dismissal — keyed to the release tag, so a NEW release re-shows the banner. #}
+{% block announce %}
+  <div class="rf-banner" data-rf-banner>
+    <span class="rf-banner-msg">
+      <span class="rf-banner-spark" aria-hidden="true">✨</span>
+      <span data-release-tag>Rayforce — latest release</span>
+      <a class="rf-banner-link" href="https://github.com/RayforceDB/rayforce/releases/latest" data-download-cta>
+        <span data-download-label>Download</span>
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+      </a>
+    </span>
+    <button class="rf-banner-close" type="button" data-rf-dismiss aria-label="Dismiss release announcement">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+    </button>
+  </div>
+{% endblock %}

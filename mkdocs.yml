@@ -1,5 +1,5 @@
 site_name: Rayforce
-site_description: Rayforce — embeddable columnar analytics and graph traversal engine in pure C17. Built-in Rayfall query language, IPC, datalog, and vector search.
+site_description: Rayforce — embeddable columnar analytics and graph traversal engine in pure C. Built-in Rayfall query language, IPC, datalog, and vector search.
 site_url: https://rayforcedb.com/
 site_author: Anton Kundenko
 copyright: Copyright &copy; 2025-2026 Anton Kundenko · MIT licensed

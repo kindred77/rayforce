@@ -33,6 +33,7 @@
 
 #include "test.h"
 #include <rayforce.h>
+#include "store/col.h"      /* RAY_COL_FORMAT_MAJOR (forged-header tests) */
 #include "store/splay.h"
 #include "store/part.h"     /* ray_read_parted (resolution tests) */
 #include "ops/ops.h"        /* RAY_IS_PARTED */
@@ -1433,10 +1434,19 @@ static test_result_t test_untrusted_attrs_masked(void) {
         snprintf(apath, sizeof(apath), "%s/a", dir);
         FILE* f = fopen(apath, "rb+");
         TEST_ASSERT_NOT_NULL(f);
+        /* aux (bytes 0-15) is now fully attacker-controlled garbage — no
+         * magic lives there.  Plant invalid "pointer" bytes across the whole
+         * slot; the loaders must mask runtime attr bits and never route those
+         * bytes as owned pointers.  The version gate is satisfied separately
+         * via the `order` byte (offset 17), set below. */
         uint8_t garbage[16];
         memset(garbage, 0xA5, sizeof(garbage)); /* invalid non-NULL ptr bytes */
         TEST_ASSERT_EQ_I(fseek(f, 0, SEEK_SET), 0);
         TEST_ASSERT_EQ_I(fwrite(garbage, 1, 16, f), 16);
+        /* `order` byte = the major version so the file passes the gate. */
+        uint8_t ver = RAY_COL_FORMAT_MAJOR;
+        TEST_ASSERT_EQ_I(fseek(f, (long)offsetof(ray_t, order), SEEK_SET), 0);
+        TEST_ASSERT_EQ_I(fwrite(&ver, 1, 1, f), 1);
         long attrs_off = (long)offsetof(ray_t, attrs);
         TEST_ASSERT_EQ_I(fseek(f, attrs_off, SEEK_SET), 0);
         uint8_t attrs = 0;
@@ -1481,6 +1491,54 @@ static test_result_t test_untrusted_attrs_masked(void) {
     ray_release(col);
     ray_release(tbl);
     rm_rf(dir);
+    PASS();
+}
+
+/* =========================================================================
+ * 33b. Reserved column names: a splayed table with a column named "sym" or
+ *      "sym.lk" (which would collide with the on-disk symfile / its lock)
+ *      must be rejected with a "reserve" error BEFORE writing anything —
+ *      no directory / files created (MUST-prohibit, not silent skip).
+ * ========================================================================= */
+static test_result_t test_reserved_sym_col_name(void) {
+    int64_t raw[] = {1, 2, 3};
+
+    /* "sym" rejected; no dir created. */
+    {
+        const char* dir = TMP_SPLAY_BASE "/reserved_sym";
+        rm_rf(dir);
+        int64_t id_sym = ray_sym_intern("sym", 3);
+        ray_t* col = ray_vec_from_raw(RAY_I64, raw, 3);
+        TEST_ASSERT_NOT_NULL(col);
+        ray_t* tbl = ray_table_new(1);
+        tbl = ray_table_add_col(tbl, id_sym, col);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+        ray_err_t err = ray_splay_save(tbl, dir, TMP_SPLAY_BASE "/reserved_sym_sf");
+        TEST_ASSERT_EQ_I(err, RAY_ERR_RESERVED);
+        /* Nothing written: the directory must not exist. */
+        TEST_ASSERT_EQ_I(access(dir, F_OK), -1);
+        ray_release(col);
+        ray_release(tbl);
+        rm_rf(dir);
+    }
+
+    /* "sym.lk" rejected too. */
+    {
+        const char* dir = TMP_SPLAY_BASE "/reserved_symlk";
+        rm_rf(dir);
+        int64_t id_lk = ray_sym_intern("sym.lk", 6);
+        ray_t* col = ray_vec_from_raw(RAY_I64, raw, 3);
+        TEST_ASSERT_NOT_NULL(col);
+        ray_t* tbl = ray_table_new(1);
+        tbl = ray_table_add_col(tbl, id_lk, col);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+        ray_err_t err = ray_splay_save(tbl, dir, TMP_SPLAY_BASE "/reserved_symlk_sf");
+        TEST_ASSERT_EQ_I(err, RAY_ERR_RESERVED);
+        TEST_ASSERT_EQ_I(access(dir, F_OK), -1);
+        ray_release(col);
+        ray_release(tbl);
+        rm_rf(dir);
+    }
     PASS();
 }
 
@@ -2029,6 +2087,7 @@ const test_entry_t splay_entries[] = {
     { "splay/nested_sym_list_symfile",    test_nested_sym_list_symfile,         splay_setup, splay_teardown },
     { "splay/ragged_columns_corrupt",     test_ragged_columns_corrupt,          splay_setup, splay_teardown },
     { "splay/untrusted_attrs_masked",     test_untrusted_attrs_masked,          splay_setup, splay_teardown },
+    { "splay/reserved_sym_col_name",      test_reserved_sym_col_name,           splay_setup, splay_teardown },
     { "splay/per_table_symfile_vocab",    test_per_table_symfile_vocabulary,    splay_setup, splay_teardown },
     { "splay/restart_reload_divergent",   test_restart_reload_divergent_global, splay_setup, splay_teardown },
     { "splay/shared_symfile_identity",    test_shared_symfile_domain_identity,  splay_setup, splay_teardown },

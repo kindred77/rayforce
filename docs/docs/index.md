@@ -1,6 +1,6 @@
 # Rayforce
 
-Embeddable columnar analytics and graph traversal engine in pure C17.
+Embeddable columnar analytics and graph traversal engine in pure C.
 
 Rayforce combines morsel-driven vectorized execution, a multi-pass query optimizer, and a native CSR graph engine in a single pipeline. It is queried through the **Rayfall** language, exposes a C API for embedding, and targets Linux, macOS, and Windows.
 
@@ -11,7 +11,7 @@ Rayforce combines morsel-driven vectorized execution, a multi-pass query optimiz
 
 ## At a glance
 
-- **Pure C17, zero external dependencies.** Single binary, single shared library, single header.
+- **Pure C, zero external dependencies.** Single binary, single shared library, single header.
 - **Columnar with morsels.** Vectorized execution over fixed-size morsels; SIMD where possible.
 - **Multi-pass optimizer.** Predicate pushdown, join reordering, accelerator-index selection.
 - **Graph engine.** Native CSR storage, PageRank, Dijkstra, betweenness, Louvain, MST.
