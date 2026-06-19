@@ -55,6 +55,13 @@ t -- (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0]))
 (set t (table [ID Name Value] (list [1 2 3] [alice bob charlie] [10.0 20.0 30.0])))(update {from: 't Value: 99.0 where: (== ID 2)})t -- (table [ID Name Value] (list [1 2 3] [alice bob charlie] [10.0 99.0 30.0]))
 ;; Test 24: Update with groupby
 (set t (table [Group ID Value] (list [a a b b] [1 2 3 4] [10.0 20.0 30.0 40.0])))(update {from: 't Total: (sum Value) by: Group})t -- (table [Group ID Value Total] (list [a a b b] [1 2 3 4] [10.0 20.0 30.0 40.0] [30.0 30.0 70.0 70.0]))
+;; Test 24b: update with BOTH by: and where: is a LOUD error (review 2.10
+;; sub-item 3).  Previously the `by:` branch was gated on `!where_expr`, so
+;; combining them SILENTLY dropped `by:` and applied an ungrouped update —
+;; a silent wrong result.  Honoring both is a larger feature (compose the
+;; where-filter + group pipeline like select does); until then we reject.
+(set t (table [Group ID Value] (list [a a b b] [1 2 3 4] [10.0 20.0 30.0 40.0])))
+(update {from: 't Total: (sum Value) by: Group where: (> ID 1)}) !- nyi
 ;; ========== FLEXIBLE COLUMN ORDERING TESTS ==========
 ;; Test 25: Insert via dict with columns in different order (single record)
 (set t (table [a b c] (list [1 2] [10 20] [x y])))(insert t (dict [c a b] (list 'z 3 30))) -- (table [a b c] (list [1 2 3] [10 20 30] [x y z]))

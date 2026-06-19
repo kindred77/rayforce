@@ -72,3 +72,22 @@
 (set Tv (table [v g] (list [0N 0N 1 2 3] [0 0 1 1 1])))
 (nil? (at (at (select {s: (stddev v) from: Tv by: g where: (== g 0)}) 's) 0)) -- true
 (nil? (at (at (select {s: (var v) from: Tv by: g where: (== g 0)}) 's) 0)) -- true
+
+;; ----- COUNT INCLUDES nulls (review 2.10 sub-item 2) -----
+;; While AVG/MIN/MAX/PROD/STDDEV above SKIP nulls, `count` is the row/slot
+;; tally: it counts ALL rows in a group, nulls included (COUNT(*)-style),
+;; matching the documented contract in test/rfl/agg/null_aware.rfl ("counts
+;; include them") and the scalar `count` (which is vector length).  This is
+;; consistent across the scalar, legacy, and v2 group engines.
+(set Tc (table [v g] (list [10 0N 0N 0N 50] [0 0 0 1 1])))
+;; g=0: rows [10,0N,0N] -> count 3 (all rows, not just the 1 live value)
+(at (at (select {c: (count v) from: Tc by: g where: (== g 0)}) 'c) 0) -- 3
+;; g=1: rows [0N,50] -> count 2 (all rows, not just the 1 live value)
+(at (at (select {c: (count v) from: Tc by: g where: (== g 1)}) 'c) 0) -- 2
+;; all-null group still counts its rows
+(set Tc2 (table [v g] (list [0N 0N 0N] [0 0 0])))
+(at (at (select {c: (count v) from: Tc2 by: g}) 'c) 0) -- 3
+;; ungrouped count over a null-bearing column = total rows (slots)
+(at (at (select {c: (count v) from: Tc}) 'c) 0) -- 5
+;; agrees with scalar count (vector length, nulls included)
+(count [10 0N 0N 0N 50]) -- 5
