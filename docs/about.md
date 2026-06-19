@@ -1,6 +1,6 @@
 ---
 title: "About — Rayforce"
-description: "About Rayforce — an embeddable analytics and graph engine in pure C17 by Anton Kundenko. Project background, design principles, license, and community."
+description: "About Rayforce — an embeddable analytics and graph engine in pure C by Anton Kundenko. Project background, design principles, license, and community."
 template: about.html
 hide:
   - navigation
@@ -10,7 +10,7 @@ hide:
 
 # About Rayforce
 
-Rayforce is an embeddable analytics and graph engine written in pure C17 with zero external dependencies. It was built to close the gap between systems that excel at columnar analytics and systems that excel at graph traversal — by treating both as operations on the same query DAG.
+Rayforce is an embeddable analytics and graph engine written in pure C with zero external dependencies. It was built to close the gap between systems that excel at columnar analytics and systems that excel at graph traversal — by treating both as operations on the same query DAG.
 
 ## Why it exists
 
@@ -18,7 +18,7 @@ The typical analytics stack splits work across two runtimes: a columnar engine f
 
 ## Design principles
 
-- **Zero external dependencies.** The whole engine is pure C17 with the standard library only. No third-party allocator, no Boost, no Arrow. The single header `rayforce.h` is the entire public API.
+- **Zero external dependencies.** The whole engine is pure C with the standard library only. No third-party allocator, no Boost, no Arrow. The single header `rayforce.h` is the entire public API.
 - **One DAG for everything.** Filters, joins, aggregations, window functions, and graph traversals all build into the same lazy operation DAG. The optimizer rewrites the full graph before execution begins.
 - **Morsel-driven execution.** Element-wise operations fuse into single-pass pipelines that operate on 1024-element morsels and stay L1-resident. Pipeline breakers — joins, sort, group-by, window — materialize once and hand off cleanly.
 - **Custom memory model.** A buddy allocator with slab caches replaces malloc; per-thread heaps remove allocator contention; deferred cross-heap merge handles worker-thread results without locks on the hot path.
