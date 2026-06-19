@@ -4379,11 +4379,10 @@ static test_result_t test_eval_vec_add_broadcast(void) {
 }
 
 /* --- vector add shorter length uses min --- */
-static test_result_t test_eval_vec_add_mismatch_ok(void) {
-    /* zip stops at shorter length */
-    ray_t* r = ray_eval_str("(+ [1 2 3] [10 20])");
-    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
-    ray_release(r);
+static test_result_t test_eval_vec_add_mismatch_err(void) {
+    /* vector+vector length mismatch is a length error -- no silent
+     * truncation to the shorter operand (matches the compiled/VM path). */
+    ASSERT_ER("(+ [1 2 3] [10 20])", "length");
     PASS();
 }
 
@@ -7067,7 +7066,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/cmp_eq_sym", test_eval_cmp_eq_sym, lang_setup, lang_teardown },
     { "lang/eval/cmp_lt_str", test_eval_cmp_lt_str, lang_setup, lang_teardown },
     { "lang/eval/vec_add_broadcast", test_eval_vec_add_broadcast, lang_setup, lang_teardown },
-    { "lang/eval/vec_add_mismatch_ok", test_eval_vec_add_mismatch_ok, lang_setup, lang_teardown },
+    { "lang/eval/vec_add_mismatch_err", test_eval_vec_add_mismatch_err, lang_setup, lang_teardown },
     { "lang/eval/type_err_add_str", test_eval_type_err_add_str, lang_setup, lang_teardown },
     { "lang/eval/cond_form", test_eval_cond_form, lang_setup, lang_teardown },
     { "lang/eval/and_or_forms", test_eval_and_or_forms, lang_setup, lang_teardown },
