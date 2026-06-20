@@ -66,18 +66,16 @@ static ray_op_t* build_having_plan(ray_graph_t* g, gp_pred_builder_t pb,
 
 /* Plan-shape probe: pushed = root is GROUP with an OP_FILTER inputs[0]. */
 static bool plan_pushed(ray_graph_t* g, ray_op_t* root) {
-    (void)g;
     return root && root->opcode == OP_GROUP &&
-           root->inputs[0] && root->inputs[0]->opcode == OP_FILTER;
+           op_child(g, root, 0) && op_child(g, root, 0)->opcode == OP_FILTER;
 }
 
 /* Un-split HAVING shape: root is FILTER whose direct child is GROUP and whose
  * predicate is still an intact AND (the split would have made inputs[0] a FILTER). */
 static bool plan_having_unsplit(ray_graph_t* g, ray_op_t* root) {
-    (void)g;
     return root && root->opcode == OP_FILTER &&
-           root->inputs[0] && root->inputs[0]->opcode == OP_GROUP &&
-           root->inputs[1] && root->inputs[1]->opcode == OP_AND;
+           op_child(g, root, 0) && op_child(g, root, 0)->opcode == OP_GROUP &&
+           op_child(g, root, 1) && op_child(g, root, 1)->opcode == OP_AND;
 }
 
 /* Pred on the AGG OUTPUT column — HAVING proper; must never push.
@@ -151,7 +149,7 @@ static test_result_t test_and_split_non_group_still_splits(void) {
 
     /* Split still happens: root is the outer FILTER, its input another FILTER. */
     TEST_ASSERT(root && root->opcode == OP_FILTER, "root is FILTER");
-    TEST_ASSERT(root->inputs[0] && root->inputs[0]->opcode == OP_FILTER,
+    TEST_ASSERT(op_child(g, root, 0) && op_child(g, root, 0)->opcode == OP_FILTER,
         "non-GROUP AND-filter must still split into a chain");
 
     ray_graph_free(g); ray_release(tbl);
@@ -180,12 +178,12 @@ static test_result_t test_exec_group_with_pushed_filter(void) {
 
     /* Wire filt as GROUP's inputs[0] (Task-3 optimizer shape).
      * grp points into g->nodes[] — that's the live node exec_node sees. */
-    grp->inputs[0] = filt;
+    grp->in_id[0] = filt->id;
     ray_op_ext_t* gext = find_ext(g, grp->id);
     TEST_ASSERT(gext != NULL, "group ext");
-    gext->base.inputs[0] = filt;   /* keep ext copy in sync */
+    gext->base.in_id[0] = filt->id;   /* keep ext copy in sync */
     /* Dual-slot sync check */
-    TEST_ASSERT(grp->inputs[0] == gext->base.inputs[0], "dense/ext inputs in sync");
+    TEST_ASSERT(grp->in_id[0] == gext->base.in_id[0], "dense/ext inputs in sync");
 
     ray_t* r = ray_execute(g, grp);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
@@ -215,7 +213,7 @@ static test_result_t test_having_on_key_pushed(void) {
     /* Dual-slot sync check after optimizer rewrite */
     ray_op_ext_t* gext = find_ext(g, root->id);
     TEST_ASSERT(gext != NULL, "group ext after push");
-    TEST_ASSERT(root->inputs[0] == gext->base.inputs[0], "dense/ext inputs in sync after push");
+    TEST_ASSERT(root->in_id[0] == gext->base.in_id[0], "dense/ext inputs in sync after push");
 
     ray_t* r = ray_execute(g, root);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
@@ -661,17 +659,17 @@ static test_result_t test_diff_and_of_keys(void) {
             "AND-of-keys pred must push below GROUP (pass-6)");
 
         /* Plan-shape: root->inputs[0] is the pushed OP_FILTER, flagged. */
-        ray_op_t* f0 = root->inputs[0];
+        ray_op_t* f0 = op_child(g, root, 0);
         TEST_ASSERT(f0 != NULL && f0->opcode == OP_FILTER,
             "GROUP inputs[0] must be OP_FILTER");
         TEST_ASSERT(f0->flags & OP_FLAG_PUSHED,
             "pushed filter must carry OP_FLAG_PUSHED");
 
         /* The pred must still be the un-split AND … */
-        TEST_ASSERT(f0->inputs[1] != NULL && f0->inputs[1]->opcode == OP_AND,
+        TEST_ASSERT(op_child(g, f0, 1) != NULL && op_child(g, f0, 1)->opcode == OP_AND,
             "pushed filter pred must remain the un-split AND");
         /* … and the data input the const-table: chain depth 1, no split. */
-        TEST_ASSERT(f0->inputs[0] != NULL && f0->inputs[0]->opcode != OP_FILTER,
+        TEST_ASSERT(op_child(g, f0, 0) != NULL && op_child(g, f0, 0)->opcode != OP_FILTER,
             "pushed filter input must be the const-table (chain depth 1)");
 
         ray_op_t* skeys[1] = {ray_scan(g, "k")};
