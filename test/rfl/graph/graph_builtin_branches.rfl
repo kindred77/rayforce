@@ -474,10 +474,10 @@
 ;; non-bool/non-int track -> type error (line 741-742)
 (.graph.var-expand Uw 0 1 2 0 "bad")                     !- type
 
-;; track as integer (1) -> exercises atom_to_i64 path (line 744)
-(>= (count (.graph.var-expand Uw 0 1 2 0 1)) 1)         -- true
+;; track as integer (1) -> truthy -> path tracking unsupported -> nyi error
+(.graph.var-expand Uw 0 1 2 0 1)                        !- nyi
 
-;; track as integer (0) -> exercises atom_to_i64 path (line 744)
+;; track as integer (0) -> falsy -> exercises atom_to_i64 path, succeeds
 (>= (count (.graph.var-expand Uw 0 1 2 0 0)) 1)         -- true
 
 ;; ====================================================================

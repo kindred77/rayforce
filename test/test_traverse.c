@@ -5422,6 +5422,146 @@ static test_result_t test_degree_cent_asym(void) {
 }
 
 /* --------------------------------------------------------------------------
+ * Review §2.9 #1 — non-square relation precondition (memory safety).
+ *
+ * A relation built with rev.n_nodes < fwd.n_nodes makes algorithms that
+ * iterate i in [0, fwd.n_nodes) while dereferencing rev_off[i+1] read out of
+ * bounds.  After the fix these ops must return a bounded "domain" error
+ * (not OOB).  Run under ASAN this confirms no overflow.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_nonsquare_rel_bounded_error(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* 6 src nodes, 3 dst nodes → fwd.n_nodes=6 > rev.n_nodes=3.
+     * Pre-fix, exec_pagerank/louvain/etc. read rev_off[4..6] OOB. */
+    int64_t se[] = {0, 1, 2, 5};
+    int64_t de[] = {0, 1, 2, 0};
+    ray_rel_t* rel = make_rel_asym(se, de, 4, /*n_src*/6, /*n_dst*/3);
+    TEST_ASSERT_NOT_NULL(rel);
+    /* Confirm the dangerous shape: fwd strictly larger than rev. */
+    TEST_ASSERT_EQ_I(ray_rel_n_nodes(rel, 0), 6);
+    TEST_ASSERT_EQ_I(ray_rel_n_nodes(rel, 1), 3);
+
+    /* Every both-CSR algorithm must reject with a loud, bounded error. */
+
+    /* pagerank */
+    { ray_graph_t* g = ray_graph_new(NULL);
+      ray_t* r = ray_execute(g, ray_pagerank(g, rel, 5, 0.85));
+      TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+      TEST_ASSERT_STR_EQ(ray_err_code(r), "domain");
+      ray_release(r); ray_graph_free(g); }
+
+    /* louvain */
+    { ray_graph_t* g = ray_graph_new(NULL);
+      ray_t* r = ray_execute(g, ray_louvain(g, rel, 5));
+      TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+      TEST_ASSERT_STR_EQ(ray_err_code(r), "domain");
+      ray_release(r); ray_graph_free(g); }
+
+    /* connected components */
+    { ray_graph_t* g = ray_graph_new(NULL);
+      ray_t* r = ray_execute(g, ray_connected_comp(g, rel));
+      TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+      TEST_ASSERT_STR_EQ(ray_err_code(r), "domain");
+      ray_release(r); ray_graph_free(g); }
+
+    /* degree centrality */
+    { ray_graph_t* g = ray_graph_new(NULL);
+      ray_t* r = ray_execute(g, ray_degree_cent(g, rel));
+      TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+      TEST_ASSERT_STR_EQ(ray_err_code(r), "domain");
+      ray_release(r); ray_graph_free(g); }
+
+    /* topsort */
+    { ray_graph_t* g = ray_graph_new(NULL);
+      ray_t* r = ray_execute(g, ray_topsort(g, rel));
+      TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+      TEST_ASSERT_STR_EQ(ray_err_code(r), "domain");
+      ray_release(r); ray_graph_free(g); }
+
+    /* cluster coefficient */
+    { ray_graph_t* g = ray_graph_new(NULL);
+      ray_t* r = ray_execute(g, ray_cluster_coeff(g, rel));
+      TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+      TEST_ASSERT_STR_EQ(ray_err_code(r), "domain");
+      ray_release(r); ray_graph_free(g); }
+
+    /* betweenness */
+    { ray_graph_t* g = ray_graph_new(NULL);
+      ray_t* r = ray_execute(g, ray_betweenness(g, rel, 0));
+      TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+      TEST_ASSERT_STR_EQ(ray_err_code(r), "domain");
+      ray_release(r); ray_graph_free(g); }
+
+    /* closeness */
+    { ray_graph_t* g = ray_graph_new(NULL);
+      ray_t* r = ray_execute(g, ray_closeness(g, rel, 0));
+      TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+      TEST_ASSERT_STR_EQ(ray_err_code(r), "domain");
+      ray_release(r); ray_graph_free(g); }
+
+    ray_rel_free(rel);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Review §2.9 #2 — Dijkstra max-depth is honored (was accepted-and-ignored).
+ *
+ * On a 5-node chain 0->1->2->3->4 with unit weights, max_depth=2 must reach
+ * only nodes within 2 hops of the source (0,1,2) and never relax node 3/4.
+ * Pre-fix the whole chain was returned regardless of max_depth.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_dijkstra_max_depth_honored(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t se[] = {0, 1, 2, 3};
+    int64_t de[] = {1, 2, 3, 4};
+    double  wts[] = {1.0, 1.0, 1.0, 1.0};
+    ray_t* edges;
+    ray_rel_t* rel = make_weighted_rel(se, de, wts, 4, 5, &edges);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    /* max_depth = 2: expect nodes {0,1,2} only. */
+    ray_graph_t* g = ray_graph_new(NULL);
+    ray_op_t* s = ray_const_i64(g, 0);
+    ray_op_t* op = ray_dijkstra(g, s, NULL, rel, "weight", 2);
+    TEST_ASSERT_NOT_NULL(op);
+    ray_t* r = ray_execute(g, op);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->type, RAY_TABLE);
+    /* 3 reachable nodes within 2 hops. */
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 3);
+    /* Max depth column value must be <= 2. */
+    ray_t* depth_col = ray_table_get_col(r, ray_sym_intern("_depth", 6));
+    TEST_ASSERT_NOT_NULL(depth_col);
+    int64_t* dd = (int64_t*)ray_data(depth_col);
+    for (int64_t i = 0; i < depth_col->len; i++) {
+        TEST_ASSERT_TRUE(dd[i] <= 2);
+    }
+    ray_release(r);
+    ray_graph_free(g);
+
+    /* Sanity: max_depth = 10 (>= diameter) returns the whole chain (5 nodes). */
+    ray_graph_t* g2 = ray_graph_new(NULL);
+    ray_op_t* s2 = ray_const_i64(g2, 0);
+    ray_t* r2 = ray_execute(g2, ray_dijkstra(g2, s2, NULL, rel, "weight", 10));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r2));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r2), 5);
+    ray_release(r2);
+    ray_graph_free(g2);
+
+    ray_rel_free(rel);
+    ray_release(edges);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
  * Test: exec_shortest_path direction==0 (explicit forward) over a 3-node
  * chain with src and dst as vec inputs.  Belt-and-braces against the
  * existing test_shortest_path_vec_input which uses different topology.
@@ -5625,5 +5765,8 @@ const test_entry_t traverse_entries[] = {
     { "traverse/degree_cent_asym",            test_degree_cent_asym,               NULL, NULL },
     { "traverse/shortest_path_vec_chain",     test_shortest_path_vec_chain,        NULL, NULL },
     { "traverse/k_shortest_only_one_path",    test_k_shortest_only_one_path,       NULL, NULL },
+    /* Review §2.9 fixes (June 2026). */
+    { "traverse/nonsquare_rel_bounded_error", test_nonsquare_rel_bounded_error,    NULL, NULL },
+    { "traverse/dijkstra_max_depth_honored",  test_dijkstra_max_depth_honored,     NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
