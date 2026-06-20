@@ -108,23 +108,22 @@ make dist RAY_VERSION=2.1.3
 Each release publishes, in addition to the source:
 
 - **Tarballs** — `rayforce-X.Y.Z-linux-x86_64.tar.gz` and
-  `…-darwin-arm64.tar.gz` (+ `.sha256`), built `-march=native` for *that*
-  runner. Fast, but per-machine — fine to download and run on a similar box.
-- **`.deb`** (`rayforce_X.Y.Z_amd64.deb`) — built **portable** via the Makefile
-  `RAY_MARCH=x86-64-v3` knob ([`packaging/nfpm.yaml`](packaging/nfpm.yaml)), so
-  it runs on any AVX2-era (~2013+) x86-64 CPU instead of SIGILL'ing on a
-  mismatch. No setup needed (uses `GITHUB_TOKEN`).
+  `…-darwin-arm64.tar.gz` (+ `.sha256`). The Linux one is **portable**
+  (`RAY_MARCH=x86-64-v3`, AVX2/~2013+) so it can't SIGILL on a different/older
+  CPU. macOS stays `-march=native`: the runner is the oldest Apple-Silicon
+  class, so it's already a safe floor (arm64 has no x86-style optional-ISA
+  traps, and baselining to `armv8-a` would only cost M1 tuning).
+- **`.deb`** (`rayforce_X.Y.Z_amd64.deb`) — the same portable Linux binary,
+  packaged with nfpm ([`packaging/nfpm.yaml`](packaging/nfpm.yaml)). No setup
+  (uses `GITHUB_TOKEN`).
 - **Homebrew** (`rayforcedb/tap`) — a **build-from-source** formula
   ([`packaging/homebrew-formula.rb.tmpl`](packaging/homebrew-formula.rb.tmpl)),
   auto-bumped by the `homebrew` job. Compiling on the user's machine means all
   Mac arches work and there's no redistribution-portability footgun.
 
-> **Note — the tarballs are still `-march=native`.** That's a latent
-> SIGILL-on-a-different-CPU risk if someone downloads one for a machine unlike
-> the runner. If you'd rather they were portable too, build them with
-> `RAY_MARCH=x86-64-v3` in the `build` job (like the `.deb`); the trade-off is
-> losing `-march=native`'s last bit of per-CPU tuning. Source builds (`make`,
-> Homebrew) always get native.
+> Want maximum per-CPU performance instead of a portable binary? Build from
+> source — `make` and Homebrew both default to `-march=native`. Only the
+> *distributed* x86-64 artifacts use the `x86-64-v3` baseline.
 
 ## Platform support
 
