@@ -96,6 +96,35 @@ make dist RAY_VERSION=2.1.3
   is skipped, and a Zulip error never fails the release (`continue-on-error`).
   If Zulip rejects the post, the bot may need to be a *Generic bot* (not just an
   incoming-webhook) and subscribed to the Announcements channel.
+- **Optional — Homebrew tap**: create an empty repo **`RayforceDB/homebrew-tap`**
+  and add a repository secret **`HOMEBREW_TAP_TOKEN`** (a PAT — fine-grained or
+  classic — with **contents: write** on `homebrew-tap`; the default
+  `GITHUB_TOKEN` can't push to a *different* repo). The `homebrew` job then
+  rewrites `Formula/rayforce.rb` in the tap on every release. Without the secret
+  the job is skipped. Users install with `brew install rayforcedb/tap/rayforce`.
+
+## Packaging / install channels
+
+Each release publishes, in addition to the source:
+
+- **Tarballs** — `rayforce-X.Y.Z-linux-x86_64.tar.gz` and
+  `…-darwin-arm64.tar.gz` (+ `.sha256`), built `-march=native` for *that*
+  runner. Fast, but per-machine — fine to download and run on a similar box.
+- **`.deb`** (`rayforce_X.Y.Z_amd64.deb`) — built **portable** via the Makefile
+  `RAY_MARCH=x86-64-v3` knob ([`packaging/nfpm.yaml`](packaging/nfpm.yaml)), so
+  it runs on any AVX2-era (~2013+) x86-64 CPU instead of SIGILL'ing on a
+  mismatch. No setup needed (uses `GITHUB_TOKEN`).
+- **Homebrew** (`rayforcedb/tap`) — a **build-from-source** formula
+  ([`packaging/homebrew-formula.rb.tmpl`](packaging/homebrew-formula.rb.tmpl)),
+  auto-bumped by the `homebrew` job. Compiling on the user's machine means all
+  Mac arches work and there's no redistribution-portability footgun.
+
+> **Note — the tarballs are still `-march=native`.** That's a latent
+> SIGILL-on-a-different-CPU risk if someone downloads one for a machine unlike
+> the runner. If you'd rather they were portable too, build them with
+> `RAY_MARCH=x86-64-v3` in the `build` job (like the `.deb`); the trade-off is
+> losing `-march=native`'s last bit of per-CPU tuning. Source builds (`make`,
+> Homebrew) always get native.
 
 ## Platform support
 
