@@ -424,14 +424,12 @@
 ;; ordering for the BR_FAST coverage table).
 
 ;; ════════════════════════════════════════════════════════════════════
-;; 16. LENGTH MISMATCH — eval.c routes lists of different lengths
-;;     through a per-element loop that truncates to the shorter side
-;;     (atomic semantics).  The expr.c-level length guard at
-;;     expr.c:1848 is only reached when both sides are typed numeric
-;;     vectors of equal type that take the DAG path.  Pin the
-;;     observed truncation here.
-(+ [1 2 3] [1 2 3 4])      -- [2 4 6]
-(+ [1 2 3 4] [1 2 3])      -- [2 4 6]
+;; 16. LENGTH MISMATCH — vector+vector ops of different lengths are a
+;;     LENGTH ERROR (no silent truncation to the shorter side), matching
+;;     the compiled/DAG path in expr.c.  Scalar broadcast (vec + atom)
+;;     is unaffected.  A 1-element vector does NOT broadcast.
+(+ [1 2 3] [1 2 3 4])      !- length
+(+ [1 2 3 4] [1 2 3])      !- length
 
 ;; Reachability notes:
 ;;   - F32 cannot be constructed from RFL source (idxop_coverage.rfl

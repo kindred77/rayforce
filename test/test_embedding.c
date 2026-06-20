@@ -329,6 +329,60 @@ static test_result_t test_ann_recall(void) {
     PASS();
 }
 
+/* Review §2.9 #4/#5 — HNSW back-link saturation must keep the M closest
+ * neighbors instead of silently dropping every back-link once a list is full.
+ *
+ * With a small M (=4) and many clustered vectors, back-link lists saturate
+ * frequently during build.  Before the fix, prune was a dead no-op (M_keep ==
+ * M_max), so a full list dropped the new back-link → degraded connectivity.
+ * After the fix the saturated list keeps the M closest, so self-queries must
+ * still resolve to the node itself (recall@1 == 1.0). */
+static test_result_t test_ann_recall_saturated(void) {
+    srand(1234);
+    const int N = 150, D = 8, K = 5, QUERIES = 40;
+
+    ray_t* list = ray_list_new(N);
+    TEST_ASSERT_NOT_NULL(list);
+    for (int i = 0; i < N; i++) {
+        ray_t* v = ray_vec_new(RAY_F32, D);
+        v->len = D;
+        float* d = (float*)ray_data(v);
+        /* Spread vectors so duplicates are unlikely (each row is a distinct
+         * nearest neighbor of itself), but dense enough that the small-M
+         * neighbor lists saturate and exercise the back-link replacement. */
+        for (int j = 0; j < D; j++)
+            d[j] = (float)rand() / (float)RAND_MAX - 0.5f;
+        list = ray_list_append(list, v);
+        ray_release(v);
+    }
+    int64_t sym = ray_sym_intern("__sat_list", 10);
+    TEST_ASSERT_EQ_I(ray_env_set(sym, list), RAY_OK);
+    ray_release(list);
+
+    /* Small M (=4) forces back-link saturation during build.  With the
+     * "keep M closest" replacement in place the graph stays well connected,
+     * so self-queries resolve to the node itself with high recall.  Before
+     * the fix, saturated lists silently dropped every back-link, fragmenting
+     * the graph and degrading recall@1. */
+    ray_eval_str("(set __sat_idx (hnsw-build __sat_list 'l2 4 80))");
+
+    int hits = 0, total = 0;
+    for (int q = 0; q < QUERIES; q++) {
+        char expr[256];
+        snprintf(expr, sizeof(expr),
+                 "(at (at (ann __sat_idx (at __sat_list %d) %d) '_rowid) 0)", q, K);
+        int64_t top_ann = eval_i64(expr);
+        if (top_ann == q) hits++;
+        total++;
+    }
+    ray_eval_str("(hnsw-free __sat_idx)");
+    /* Self-query recall@1: the fix keeps this high even at M=4.  Assert a
+     * conservative floor (90%) that the fixed connectivity comfortably meets
+     * but the silent-drop regression would fall below. */
+    TEST_ASSERT_TRUE(hits * 100 >= total * 90);
+    PASS();
+}
+
 /* ============ Persistence round-trip ============ */
 
 static test_result_t test_hnsw_save_load(void) {
@@ -352,8 +406,14 @@ static test_result_t test_hnsw_save_load(void) {
     TEST_ASSERT_EQ_U(metric_eq->b8, 1);
     ray_release(metric_eq);
 
-    /* ann on a known vector should still return row 0 first. */
-    TEST_ASSERT_EQ_I(eval_i64("(at (at (ann __idx2 [1.0 0.0 0.0] 1) '_rowid) 0)"), 0);
+    /* ann on a known vector must return an inner-product-optimal row.
+     * Under 'ip, query [1,0,0] ties IP=1 across rows 0=[1,0,0], 3=[1,1,0]
+     * and 4=[1,0,1], so the approximate top-1 is any of {0,3,4} depending on
+     * graph connectivity — assert membership, not a specific (unstable) row.
+     * (Re-baselined from a hard-coded 0, which pinned a build-order tie that
+     * the HNSW saturation/back-link fix legitimately perturbs.) */
+    int64_t ip_top = eval_i64("(at (at (ann __idx2 [1.0 0.0 0.0] 1) '_rowid) 0)");
+    TEST_ASSERT_TRUE(ip_top == 0 || ip_top == 3 || ip_top == 4);
     ray_eval_str("(hnsw-free __idx2)");
     PASS();
 }
@@ -1879,6 +1939,7 @@ const test_entry_t embedding_entries[] = {
     { "embedding/ann_topk", test_ann_topk, emb_setup, emb_teardown },
     { "embedding/ann_each_metric", test_ann_each_metric, emb_setup, emb_teardown },
     { "embedding/ann_recall", test_ann_recall, emb_setup, emb_teardown },
+    { "embedding/ann_recall_saturated", test_ann_recall_saturated, emb_setup, emb_teardown },
     { "embedding/hnsw_save_load", test_hnsw_save_load, emb_setup, emb_teardown },
     { "embedding/hnsw_free_twice", test_hnsw_free_twice, emb_setup, emb_teardown },
     { "embedding/hnsw_rebind_no_leak", test_hnsw_rebind_no_leak, emb_setup, emb_teardown },

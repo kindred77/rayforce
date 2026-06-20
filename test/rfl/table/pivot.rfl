@@ -20,9 +20,10 @@
 ;; GOOG Buy = 30, GOOG Sell = 50
 (at (at Pivot-Sum 'Buy) 1)  -- 30
 (at (at Pivot-Sum 'Sell) 1) -- 50
-;; MSFT Buy = 200, MSFT Sell = 0 (zero-filled missing cell)
+;; MSFT Buy = 200, MSFT Sell has no source row -> NULL (review 2.10: missing
+;; cells are null, not a real 0, so "no data" stays distinguishable)
 (at (at Pivot-Sum 'Buy) 2)  -- 200
-(at (at Pivot-Sum 'Sell) 2) -- 0
+(nil? (at (at Pivot-Sum 'Sell) 2)) -- true
 
 ;; total across pivoted columns equals total across the source value col
 (+ (sum (at Pivot-Sum 'Buy)) (sum (at Pivot-Sum 'Sell))) -- (sum (at trades 'qty))
@@ -39,11 +40,13 @@
 ;; GOOG: Buy once (30), Sell once (50)
 (at (at Pivot-Count 'Buy) 1)  -- 1
 (at (at Pivot-Count 'Sell) 1) -- 1
-;; MSFT: Buy once (200), Sell zero-filled
+;; MSFT: Buy once (200), Sell has no source row -> NULL (review 2.10: a
+;; missing count cell is "no rows here" = null, distinct from a real 0; a
+;; group only exists when >=1 row matched, so present count cells are >=1)
 (at (at Pivot-Count 'Buy) 2)  -- 1
-(at (at Pivot-Count 'Sell) 2) -- 0
+(nil? (at (at Pivot-Count 'Sell) 2)) -- true
 
-;; total cells == total source rows
+;; total cells == total source rows (sum skips the null missing cells)
 (+ (sum (at Pivot-Count 'Buy)) (sum (at Pivot-Count 'Sell))) -- (count trades)
 
 ;; ────────────── pivot with avg / min / max aggregators ──────────────
@@ -73,8 +76,10 @@
 (at (at Pf 'x) 0) -- 1.5
 (at (at Pf 'y) 0) -- 2.5
 (at (at Pf 'x) 1) -- 3.5
-;; B has no 'y row → zero-filled (additive identity), NOT null
-(at (at Pf 'y) 1) -- 0.0
+;; B has no 'y row → NULL (review 2.10: missing F64 cell is NULL_F64, not a
+;; real 0.0).  The column is HAS_NULLS so null-aware ops + the §2.1 validator
+;; are satisfied.
+(nil? (at (at Pf 'y) 1)) -- true
 
 ;; ────────────── pivot with negative-zero F64 value (zero-fill identity) ──────────────
 ;; A pivot VALUE column containing -0.0 alongside real values: sum keeps them.
@@ -144,9 +149,25 @@
 (at (at Pd 'x) 0) -- 10
 (at (at Pd 'y) 1) -- 40
 
-;; ────────────── pivot count vs sum on missing cells ──────────────
+;; ────────────── pivot count vs sum on missing cells (review 2.10) ──────
+;; B has an 'x row but no 'y row, so the (B,'y) cell is missing for both the
+;; sum and count pivots.  A missing cell is NULL (no data), never a real 0 —
+;; "no data" must stay distinguishable from a genuine 0.
 (set Ts (table [r c v] (list ['A 'A 'B] ['x 'y 'x] [1 2 3])))
 (set Pcs (pivot Ts 'r 'c 'v sum))
-(at (at Pcs 'y) 1) -- 0
+(nil? (at (at Pcs 'y) 1)) -- true
+;; present cell that genuinely sums to a value stays a value (not nulled)
+(at (at Pcs 'x) 1) -- 3
 (set Pcc (pivot Ts 'r 'c 'v count))
-(at (at Pcc 'y) 1) -- 0
+(nil? (at (at Pcc 'y) 1)) -- true
+(at (at Pcc 'x) 1) -- 1
+
+;; ── present real-0 SUM cell stays 0, missing stays null (the core 2.10 ──
+;; distinction: a real 0 and "no data" must not collapse to the same value) ──
+(set Tz (table [r c v] (list ['A 'A 'B] ['x 'y 'x] [0 5 7])))
+(set Pz (pivot Tz 'r 'c 'v sum))
+;; (A,'x) summed a real 0 -> stays 0 (NOT null)
+(at (at Pz 'x) 0) -- 0
+(nil? (at (at Pz 'x) 0)) -- false
+;; (B,'y) is missing -> null
+(nil? (at (at Pz 'y) 1)) -- true

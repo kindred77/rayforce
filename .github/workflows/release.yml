@@ -101,9 +101,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Distributables must be PORTABLE, not -march=native: a native binary
+        # built on a runner can SIGILL on a different/older CPU. x86-64-v3 =
+        # AVX2 baseline (~2013+), which keeps the engine's vectorized reductions
+        # fast. The macOS runner is the oldest Apple-Silicon class, so native
+        # there is effectively a safe floor (arm64 has no x86-style optional-ISA
+        # traps, and baselining to armv8-a would only lose M1 tuning).
         include:
           - os: ubuntu-latest
+            march: x86-64-v3
           - os: macos-latest
+            march: native
           # Windows is not build-ready yet (IOCP stub, unguarded POSIX in
           # main.c/heap.c, no Makefile path). Add once the port lands:
           # - os: windows-latest
@@ -114,8 +122,8 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.sha }}
 
-      - name: Build release artifact
-        run: make dist RAY_VERSION=${{ needs.prepare.outputs.version }}
+      - name: Build release artifact (portable)
+        run: make dist RAY_VERSION=${{ needs.prepare.outputs.version }} RAY_MARCH=${{ matrix.march }}
 
       - name: Upload artifacts to release
         env:
@@ -125,6 +133,28 @@ jobs:
           set -euo pipefail
           gh release upload "v${{ needs.prepare.outputs.version }}" \
             dist/*.tar.gz dist/*.sha256 --clobber
+
+      # Package the just-built (already-portable) Linux binary as a .deb —
+      # `make dist` left ./rayforce in place, so no rebuild is needed.
+      - name: Build .deb (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          RAY_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          ver="$(curl -fsSL https://api.github.com/repos/goreleaser/nfpm/releases/latest | grep -oP '"tag_name":\s*"\K[^"]+')"
+          curl -fsSL "https://github.com/goreleaser/nfpm/releases/download/${ver}/nfpm_${ver#v}_amd64.deb" -o /tmp/nfpm.deb
+          sudo dpkg -i /tmp/nfpm.deb
+          mkdir -p dist
+          nfpm pkg --packager deb --config packaging/nfpm.yaml --target dist/
+          ls -l dist/*.deb
+
+      - name: Upload .deb to release (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release upload "v${{ needs.prepare.outputs.version }}" dist/*.deb --clobber
 
   publish:
     needs: [prepare, build]
@@ -169,3 +199,40 @@ jobs:
             --data-urlencode "content=${content}")"
           echo "Zulip response: $resp"
           echo "$resp" | grep -q '"result": *"success"'
+
+  # Bump the Homebrew tap (RayforceDB/homebrew-tap → Formula/rayforce.rb) to this
+  # release. Best-effort: skipped when HOMEBREW_TAP_TOKEN isn't configured, and
+  # continue-on-error so a tap hiccup never reds an already-shipped release.
+  homebrew:
+    needs: [prepare, publish]
+    runs-on: ubuntu-latest
+    env:
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - name: Update tap formula
+        if: ${{ env.HOMEBREW_TAP_TOKEN != '' }}
+        continue-on-error: true
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          GH_REPO: ${{ github.repository }}
+          TAP_REPO: RayforceDB/homebrew-tap
+        run: |
+          set -euo pipefail
+          # Build-from-source formula: point at the GitHub source tarball for the
+          # tag and pin its sha256.
+          url="https://github.com/${GH_REPO}/archive/refs/tags/v${VERSION}.tar.gz"
+          sha="$(curl -fsSL "$url" | sha256sum | cut -d' ' -f1)"
+          tmp="$(mktemp -d)"
+          git clone --depth 1 "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/${TAP_REPO}.git" "$tmp"
+          mkdir -p "$tmp/Formula"
+          sed -e "s|__URL__|${url}|" -e "s|__SHA256__|${sha}|" \
+            packaging/homebrew-formula.rb.tmpl > "$tmp/Formula/rayforce.rb"
+          cd "$tmp"
+          git config user.name  "rayforce-release"
+          git config user.email "release@rayforcedb.com"
+          git add Formula/rayforce.rb
+          git commit -m "rayforce ${VERSION}" || { echo "formula unchanged — nothing to push"; exit 0; }
+          git push origin HEAD

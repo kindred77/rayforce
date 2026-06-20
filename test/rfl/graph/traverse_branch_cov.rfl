@@ -228,9 +228,10 @@
 (>= (sum (at PrFC '_rank)) 0.99)                     -- true
 (<= (sum (at PrFC '_rank)) 1.01)                     -- true
 
-;; (5) var-expand track-path integer-true 6-arg form (schema unchanged).
-(>= (count (.graph.var-expand FC 0 1 2 2 1)) 1)     -- true
-;; track-path integer-false also accepted.
+;; (5) var-expand track-path integer-true 6-arg form: path tracking is
+;;     unimplemented, so a truthy track-path flag is rejected loudly (nyi).
+(.graph.var-expand FC 0 1 2 2 1)                    !- nyi
+;; track-path integer-false is accepted (no tracking requested).
 (>= (count (.graph.var-expand FC 0 1 2 2 0)) 1)     -- true
 
 ;; =====================================================================

@@ -182,10 +182,12 @@
 ;; The reverse-CSR predecessors of sink node 5 are exactly {3,4}.
 (at VeRev '_end)                                 -- [3 4]
 
-;; track-path = true accepts the boolean form without changing schema
-;; (the underlying op records paths internally; the result table is the
-;; same {_start,_end,_depth} shape per the wrapper).
-(>= (count (.graph.var-expand G 0 1 2 0 true)) 4) -- true
+;; track-path = true is rejected loudly: path tracking is unimplemented
+;; (only {_start,_end,_depth} endpoints are returned), so rather than
+;; silently ignore the flag the wrapper returns a 'nyi error.
+(.graph.var-expand G 0 1 2 0 true)               !- nyi
+;; track-path = false still succeeds.
+(>= (count (.graph.var-expand G 0 1 2 0 false)) 4) -- true
 
 ;; ====================================================================
 ;; (.graph.betweenness h [sample])

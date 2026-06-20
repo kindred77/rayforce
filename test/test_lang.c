@@ -1264,10 +1264,15 @@ static test_result_t test_eval_pivot_multi_index(void) {
     TEST_ASSERT_EQ_I(b_col->type, RAY_I64);
     TEST_ASSERT_EQ_I(x_col->type, RAY_I64);
     TEST_ASSERT_EQ_I(y_col->type, RAY_I64);
-    /* Expected per-row: (A,10)→x=100,y=0; (A,20)→x=500,y=200;
-     *                   (B,10)→x=300,y=600; (B,20)→x=0,y=400.
-     * Build a lookup (a_sym, b) → (x, y) so we're independent of
-     * group-output row order. */
+    /* Expected per-row: (A,10)→x=100,y=NULL; (A,20)→x=500,y=200;
+     *                   (B,10)→x=300,y=600; (B,20)→x=NULL,y=400.
+     * Review 2.10 sub-item 1: a pivot cell with NO source row is the typed
+     * NULL sentinel ("no data"), NOT a real 0 — (A,10) has no 'y row and
+     * (B,20) has no 'x row, so those cells are null and the columns carry
+     * RAY_ATTR_HAS_NULLS.  Build a lookup (a_sym, b) → (x, y) so we're
+     * independent of group-output row order. */
+    TEST_ASSERT_TRUE((x_col->attrs & RAY_ATTR_HAS_NULLS) != 0);
+    TEST_ASSERT_TRUE((y_col->attrs & RAY_ATTR_HAS_NULLS) != 0);
     int64_t sym_A = ray_sym_intern("A", 1);
     int64_t sym_B = ray_sym_intern("B", 1);
     int64_t* bd = (int64_t*)ray_data(b_col);
@@ -1277,10 +1282,10 @@ static test_result_t test_eval_pivot_multi_index(void) {
     for (int64_t i = 0; i < 4; i++) {
         int64_t a = (int64_t)ray_read_sym(ray_data(a_col), i, a_col->type, a_col->attrs);
         int64_t b = bd[i];
-        if (a == sym_A && b == 10) { seen_A10 = 1; TEST_ASSERT_EQ_I(xd[i], 100); TEST_ASSERT_EQ_I(yd[i], 0);   }
+        if (a == sym_A && b == 10) { seen_A10 = 1; TEST_ASSERT_EQ_I(xd[i], 100); TEST_ASSERT_TRUE(ray_vec_is_null(y_col, i)); }
         else if (a == sym_A && b == 20) { seen_A20 = 1; TEST_ASSERT_EQ_I(xd[i], 500); TEST_ASSERT_EQ_I(yd[i], 200); }
         else if (a == sym_B && b == 10) { seen_B10 = 1; TEST_ASSERT_EQ_I(xd[i], 300); TEST_ASSERT_EQ_I(yd[i], 600); }
-        else if (a == sym_B && b == 20) { seen_B20 = 1; TEST_ASSERT_EQ_I(xd[i], 0);   TEST_ASSERT_EQ_I(yd[i], 400); }
+        else if (a == sym_B && b == 20) { seen_B20 = 1; TEST_ASSERT_TRUE(ray_vec_is_null(x_col, i)); TEST_ASSERT_EQ_I(yd[i], 400); }
         else TEST_ASSERT_TRUE(false);
     }
     TEST_ASSERT_TRUE(seen_A10 && seen_A20 && seen_B10 && seen_B20);
@@ -4379,11 +4384,10 @@ static test_result_t test_eval_vec_add_broadcast(void) {
 }
 
 /* --- vector add shorter length uses min --- */
-static test_result_t test_eval_vec_add_mismatch_ok(void) {
-    /* zip stops at shorter length */
-    ray_t* r = ray_eval_str("(+ [1 2 3] [10 20])");
-    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
-    ray_release(r);
+static test_result_t test_eval_vec_add_mismatch_err(void) {
+    /* vector+vector length mismatch is a length error -- no silent
+     * truncation to the shorter operand (matches the compiled/VM path). */
+    ASSERT_ER("(+ [1 2 3] [10 20])", "length");
     PASS();
 }
 
@@ -7067,7 +7071,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/cmp_eq_sym", test_eval_cmp_eq_sym, lang_setup, lang_teardown },
     { "lang/eval/cmp_lt_str", test_eval_cmp_lt_str, lang_setup, lang_teardown },
     { "lang/eval/vec_add_broadcast", test_eval_vec_add_broadcast, lang_setup, lang_teardown },
-    { "lang/eval/vec_add_mismatch_ok", test_eval_vec_add_mismatch_ok, lang_setup, lang_teardown },
+    { "lang/eval/vec_add_mismatch_err", test_eval_vec_add_mismatch_err, lang_setup, lang_teardown },
     { "lang/eval/type_err_add_str", test_eval_type_err_add_str, lang_setup, lang_teardown },
     { "lang/eval/cond_form", test_eval_cond_form, lang_setup, lang_teardown },
     { "lang/eval/and_or_forms", test_eval_and_or_forms, lang_setup, lang_teardown },

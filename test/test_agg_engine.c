@@ -1553,6 +1553,13 @@ DIFF_SHAPE(test_diff_group_i64_four,     diff_make_i64,      gb_four,  1)
 DIFF_SHAPE(test_diff_group_sym_sum,      diff_make_sym_i64,  gb_sum,   1)
 DIFF_SHAPE(test_diff_group_f64_four,     diff_make_i64_f64,  gb_f64_four, 1)
 DIFF_SHAPE(test_diff_group_nulls_minmax, diff_make_i64_nulls, gb_nulls, 1)
+/* review 2.10 sub-item 2: count(v) where v HAS NULLS — pins that the legacy
+ * and v2 group engines AGREE, and (given the documented rule "counts include
+ * nulls", test/rfl/agg/null_aware.rfl) both count ALL group rows (COUNT(*)
+ * semantics), not just live/non-null values.  v2 treats COUNT as input-less
+ * (NULL valid mask ⇒ every row counted); legacy increments per row
+ * unconditionally.  This differential guards that agreement against regression. */
+DIFF_SHAPE(test_diff_group_nulls_count,  diff_make_i64_nulls, gb_sum_count, 1)
 
 /* var/stddev differential shapes (serial small + parallel N=70000) */
 DIFF_SHAPE(test_diff_group_i64_stddev,    diff_make_i64_small,     gb_stddev,           1)
@@ -2026,6 +2033,7 @@ const test_entry_t agg_engine_entries[] = {
     { "diff_group_sym_sum",          test_diff_group_sym_sum,      NULL, NULL },
     { "diff_group_f64_four",         test_diff_group_f64_four,     NULL, NULL },
     { "diff_group_nulls_minmax",     test_diff_group_nulls_minmax, NULL, NULL },
+    { "diff_group_nulls_count",      test_diff_group_nulls_count,  NULL, NULL },
     { "diff_group_i64_median",       test_diff_group_i64_median,    NULL, NULL },
     { "diff_group_f64_median",       test_diff_group_f64_median,    NULL, NULL },
     { "diff_group_2k_median",        test_diff_group_2k_median,     NULL, NULL },

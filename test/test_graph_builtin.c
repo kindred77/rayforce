@@ -1187,12 +1187,23 @@ static test_result_t test_graph_var_expand_direct(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(r2));
     ray_release(r2);
 
-    /* with track=true (bool atom) */
+    /* with track=true (bool atom): path tracking is unimplemented — must be a
+     * LOUD error, not silently ignored.  (Re-baselined: previously this
+     * asserted success while the flag was accepted-and-ignored.) */
     ray_t* track_atom = ray_alloc(0); track_atom->type = -RAY_BOOL; track_atom->b8 = 1;
     ray_t* ve_args3[6] = { h, src_atom, min_atom, max_atom, dir_atom, track_atom };
     ray_t* r3 = ray_graph_var_expand_fn(ve_args3, 6);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(r3));
-    ray_release(r3);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r3));
+    TEST_ASSERT_STR_EQ(ray_err_code(r3), "nyi");
+    ray_error_free(r3);
+
+    /* track=false (int 0) must still succeed */
+    ray_t* notrack_atom = ray_alloc(0); notrack_atom->type = -RAY_I64; notrack_atom->i64 = 0;
+    ray_t* ve_args3b[6] = { h, src_atom, min_atom, max_atom, dir_atom, notrack_atom };
+    ray_t* r3b = ray_graph_var_expand_fn(ve_args3b, 6);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r3b));
+    ray_release(r3b);
+    ray_release(notrack_atom);
     ray_release(track_atom);
     ray_release(dir_atom);
 
@@ -2099,12 +2110,14 @@ static test_result_t test_var_expand_extra_errors(void) {
     ray_error_free(r4);
     ray_release(str_track);
 
-    /* track as integer (1) → exercises atom_to_i64 path (line 744) */
+    /* track as integer (1) → exercises atom_to_i64 path, then loud nyi
+     * (path tracking unimplemented).  Re-baselined: was accepted-and-ignored. */
     ray_t* int_track = ray_alloc(0); int_track->type = -RAY_I64; int_track->i64 = 1;
     ray_t* ve_args5[6] = { h, src_a, min_a, max_a, dir_ok, int_track };
     ray_t* r5 = ray_graph_var_expand_fn(ve_args5, 6);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(r5));
-    ray_release(r5);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r5));
+    TEST_ASSERT_STR_EQ(ray_err_code(r5), "nyi");
+    ray_error_free(r5);
     ray_release(int_track);
 
     /* track as integer (0) → track=false path */

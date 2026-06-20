@@ -96,6 +96,34 @@ make dist RAY_VERSION=2.1.3
   is skipped, and a Zulip error never fails the release (`continue-on-error`).
   If Zulip rejects the post, the bot may need to be a *Generic bot* (not just an
   incoming-webhook) and subscribed to the Announcements channel.
+- **Optional — Homebrew tap**: create an empty repo **`RayforceDB/homebrew-tap`**
+  and add a repository secret **`HOMEBREW_TAP_TOKEN`** (a PAT — fine-grained or
+  classic — with **contents: write** on `homebrew-tap`; the default
+  `GITHUB_TOKEN` can't push to a *different* repo). The `homebrew` job then
+  rewrites `Formula/rayforce.rb` in the tap on every release. Without the secret
+  the job is skipped. Users install with `brew install rayforcedb/tap/rayforce`.
+
+## Packaging / install channels
+
+Each release publishes, in addition to the source:
+
+- **Tarballs** — `rayforce-X.Y.Z-linux-x86_64.tar.gz` and
+  `…-darwin-arm64.tar.gz` (+ `.sha256`). The Linux one is **portable**
+  (`RAY_MARCH=x86-64-v3`, AVX2/~2013+) so it can't SIGILL on a different/older
+  CPU. macOS stays `-march=native`: the runner is the oldest Apple-Silicon
+  class, so it's already a safe floor (arm64 has no x86-style optional-ISA
+  traps, and baselining to `armv8-a` would only cost M1 tuning).
+- **`.deb`** (`rayforce_X.Y.Z_amd64.deb`) — the same portable Linux binary,
+  packaged with nfpm ([`packaging/nfpm.yaml`](packaging/nfpm.yaml)). No setup
+  (uses `GITHUB_TOKEN`).
+- **Homebrew** (`rayforcedb/tap`) — a **build-from-source** formula
+  ([`packaging/homebrew-formula.rb.tmpl`](packaging/homebrew-formula.rb.tmpl)),
+  auto-bumped by the `homebrew` job. Compiling on the user's machine means all
+  Mac arches work and there's no redistribution-portability footgun.
+
+> Want maximum per-CPU performance instead of a portable binary? Build from
+> source — `make` and Homebrew both default to `-march=native`. Only the
+> *distributed* x86-64 artifacts use the `x86-64-v3` baseline.
 
 ## Platform support
 
