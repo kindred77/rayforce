@@ -185,7 +185,7 @@ Splayed tables store each column as a separate file on disk. This is Rayforce's 
 (.db.splayed.set "dir" Table)            ; write a splayed dir (also: a partition)
 (.db.splayed.set "dir" Table "sympath")  ; explicit shared symfile
 (.db.splayed.get "dir")                  ; open one splayed table (zero-copy mmap)
-(.db.parted.get  "root" 'name)           ; open a partitioned table (root/sym)
+(.db.parted.get  "root" 'name)           ; open a partitioned table (root/.sym)
 ```
 
 Save and load a table:
@@ -244,7 +244,7 @@ All types are preserved exactly — `f64` stays `f64`, `sym` stays `sym`. No typ
 
 ### Symfile resolution
 
-When no sym path is given, both `.set` and `.get` resolve the vocabulary by convention: `dir/sym` for a standalone splayed dir; for a partition-shaped dir (`/db/2024.01.15/t/`, `/db/100/t/`) the parted **root**'s `sym`. Writing a partition therefore lands its symbols in the root symfile automatically, and `.db.parted.get` opens `root/sym` once and attaches it across every partition — the parted view is index-coherent by construction. An explicit third argument to `.db.splayed.set` (or second to `.db.splayed.get`) always wins.
+When no sym path is given, both `.set` and `.get` resolve the vocabulary by convention: `dir/.sym` for a standalone splayed dir; for a partition-shaped dir (`/db/2024.01.15/t/`, `/db/100/t/`) the parted **root**'s `.sym`. The symbol table is a dotfile (`.sym`), so it never collides with a user column — a table may carry an ordinary column named `sym`. Writing a partition therefore lands its symbols in the root symfile automatically, and `.db.parted.get` opens `root/.sym` once and attaches it across every partition — the parted view is index-coherent by construction. An explicit third argument to `.db.splayed.set` (or second to `.db.splayed.get`) always wins.
 
 A read that finds no symfile for a table that *has* symbol columns fails loudly with `error: sym` — it never resolves against whatever symbols happen to be in memory.
 

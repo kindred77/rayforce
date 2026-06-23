@@ -1495,17 +1495,25 @@ static test_result_t test_untrusted_attrs_masked(void) {
 }
 
 /* =========================================================================
- * 33b. Reserved column names: a splayed table with a column named "sym" or
- *      "sym.lk" (which would collide with the on-disk symfile / its lock)
- *      must be rejected with a "reserve" error BEFORE writing anything —
- *      no directory / files created (MUST-prohibit, not silent skip).
+ * 33b. A column named "sym" is NOT reserved.  The on-disk symfile is the
+ *      dotfile ".sym" (lock ".sym.lk"), so it can never collide with a
+ *      user column — a column named "sym" round-trips like any other,
+ *      including the canonical q "sym" ticker column (issue #280).
+ *
+ *      The collision guard is now path-based: it fires ONLY when an
+ *      EXPLICIT sym_path would land on a real column file (or that file's
+ *      ".lk" lock) in the same dir, and only when a symfile is actually
+ *      written (the table has SYM columns).  A user can name the symfile
+ *      anything via the 3-arg form, so this collision must still be
+ *      caught BEFORE any write (MUST-prohibit, not silent skip).
  * ========================================================================= */
-static test_result_t test_reserved_sym_col_name(void) {
+static test_result_t test_sym_col_name_allowed(void) {
     int64_t raw[] = {1, 2, 3};
 
-    /* "sym" rejected; no dir created. */
+    /* (a) issue #280: an I64 column literally named "sym", no SYM columns
+     *     -> saves and round-trips; no ".sym" symfile is written. */
     {
-        const char* dir = TMP_SPLAY_BASE "/reserved_sym";
+        const char* dir = TMP_SPLAY_BASE "/symcol_i64";
         rm_rf(dir);
         int64_t id_sym = ray_sym_intern("sym", 3);
         ray_t* col = ray_vec_from_raw(RAY_I64, raw, 3);
@@ -1513,31 +1521,159 @@ static test_result_t test_reserved_sym_col_name(void) {
         ray_t* tbl = ray_table_new(1);
         tbl = ray_table_add_col(tbl, id_sym, col);
         TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
-        ray_err_t err = ray_splay_save(tbl, dir, TMP_SPLAY_BASE "/reserved_sym_sf");
-        TEST_ASSERT_EQ_I(err, RAY_ERR_RESERVED);
-        /* Nothing written: the directory must not exist. */
-        TEST_ASSERT_EQ_I(access(dir, F_OK), -1);
+        TEST_ASSERT_EQ_I(ray_splay_save(tbl, dir, NULL), RAY_OK);
+
+        char p[600];
+        snprintf(p, sizeof(p), "%s/sym", dir);   /* the column file exists */
+        TEST_ASSERT_EQ_I(access(p, F_OK), 0);
+        snprintf(p, sizeof(p), "%s/.sym", dir);  /* no symfile (no SYM cols) */
+        TEST_ASSERT_EQ_I(access(p, F_OK), -1);
+
+        ray_t* loaded = ray_splay_load(dir, NULL);
+        TEST_ASSERT_FALSE(!loaded || RAY_IS_ERR(loaded));
+        ray_t* lc = ray_table_get_col_idx(loaded, 0);
+        TEST_ASSERT_NOT_NULL(lc);
+        TEST_ASSERT_EQ_I(lc->type, RAY_I64);
+        TEST_ASSERT_EQ_I(lc->len, 3);
+        const int64_t* lv = (const int64_t*)ray_data(lc);
+        TEST_ASSERT_EQ_I(lv[0], 1);
+        TEST_ASSERT_EQ_I(lv[1], 2);
+        TEST_ASSERT_EQ_I(lv[2], 3);
+        ray_release(loaded);
         ray_release(col);
         ray_release(tbl);
         rm_rf(dir);
     }
 
-    /* "sym.lk" rejected too. */
+    /* (b) a SYM-typed column named "sym" coexists with the ".sym" symfile
+     *     and round-trips (the canonical q "sym" ticker column). */
     {
-        const char* dir = TMP_SPLAY_BASE "/reserved_symlk";
+        const char* dir = TMP_SPLAY_BASE "/symcol_sym";
         rm_rf(dir);
-        int64_t id_lk = ray_sym_intern("sym.lk", 6);
-        ray_t* col = ray_vec_from_raw(RAY_I64, raw, 3);
-        TEST_ASSERT_NOT_NULL(col);
+        int64_t id_sym = ray_sym_intern("sym", 3);
+        int64_t aapl = ray_sym_intern("AAPL", 4);
+        int64_t msft = ray_sym_intern("MSFT", 4);
+        ray_t* col = ray_sym_vec_new(RAY_SYM_W64, 2);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(col));
+        col->len = 2;
+        ((int64_t*)ray_data(col))[0] = aapl;
+        ((int64_t*)ray_data(col))[1] = msft;
         ray_t* tbl = ray_table_new(1);
-        tbl = ray_table_add_col(tbl, id_lk, col);
+        tbl = ray_table_add_col(tbl, id_sym, col);
         TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
-        ray_err_t err = ray_splay_save(tbl, dir, TMP_SPLAY_BASE "/reserved_symlk_sf");
-        TEST_ASSERT_EQ_I(err, RAY_ERR_RESERVED);
-        TEST_ASSERT_EQ_I(access(dir, F_OK), -1);
+
+        char symp[600];
+        snprintf(symp, sizeof(symp), "%s/.sym", dir);
+        TEST_ASSERT_EQ_I(ray_splay_save(tbl, dir, symp), RAY_OK);
+
+        char p[600];
+        snprintf(p, sizeof(p), "%s/sym", dir);    /* "sym" column file */
+        TEST_ASSERT_EQ_I(access(p, F_OK), 0);
+        TEST_ASSERT_EQ_I(access(symp, F_OK), 0);  /* ".sym" symfile */
+
+        ray_t* loaded = ray_splay_load(dir, symp);
+        TEST_ASSERT_FALSE(!loaded || RAY_IS_ERR(loaded));
+        ray_t* lc = ray_table_get_col_idx(loaded, 0);
+        TEST_ASSERT_NOT_NULL(lc);
+        TEST_ASSERT_EQ_I(lc->type, RAY_SYM);
+        ray_t* s0 = ray_sym_vec_cell(lc, 0);
+        ray_t* s1 = ray_sym_vec_cell(lc, 1);
+        TEST_ASSERT_NOT_NULL(s0);
+        TEST_ASSERT_NOT_NULL(s1);
+        TEST_ASSERT_MEM_EQ(4, ray_str_ptr(s0), "AAPL");
+        TEST_ASSERT_MEM_EQ(4, ray_str_ptr(s1), "MSFT");
+        ray_release(loaded);
         ray_release(col);
         ray_release(tbl);
         rm_rf(dir);
+    }
+
+    /* (c) explicit sym_path that lands ON a column file (SYM columns
+     *     present) is rejected before any write. */
+    {
+        const char* dir = TMP_SPLAY_BASE "/symcol_collide";
+        rm_rf(dir);
+        int64_t id_s  = ray_sym_intern("s", 1);
+        int64_t id_px = ray_sym_intern("px", 2);
+        int64_t aapl  = ray_sym_intern("AAPL", 4);
+        ray_t* cs = ray_sym_vec_new(RAY_SYM_W64, 1);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(cs));
+        cs->len = 1;
+        ((int64_t*)ray_data(cs))[0] = aapl;
+        ray_t* cpx = ray_vec_from_raw(RAY_I64, raw, 1);
+        TEST_ASSERT_NOT_NULL(cpx);
+        ray_t* tbl = ray_table_new(2);
+        tbl = ray_table_add_col(tbl, id_s, cs);
+        tbl = ray_table_add_col(tbl, id_px, cpx);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+
+        char symp[600];
+        snprintf(symp, sizeof(symp), "%s/px", dir); /* == "px" column path */
+        TEST_ASSERT_EQ_I(ray_splay_save(tbl, dir, symp), RAY_ERR_RESERVED);
+        TEST_ASSERT_EQ_I(access(dir, F_OK), -1);     /* nothing written */
+        ray_release(cs);
+        ray_release(cpx);
+        ray_release(tbl);
+        rm_rf(dir);
+    }
+
+    /* (d) explicit sym_path whose ".lk" lock lands on a column file is
+     *     rejected too: symfile "px" -> lock "px.lk" vs a column "px.lk". */
+    {
+        const char* dir = TMP_SPLAY_BASE "/symcol_collide_lk";
+        rm_rf(dir);
+        int64_t id_s  = ray_sym_intern("s", 1);
+        int64_t id_lk = ray_sym_intern("px.lk", 5);
+        int64_t aapl  = ray_sym_intern("AAPL", 4);
+        ray_t* cs = ray_sym_vec_new(RAY_SYM_W64, 1);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(cs));
+        cs->len = 1;
+        ((int64_t*)ray_data(cs))[0] = aapl;
+        ray_t* clk = ray_vec_from_raw(RAY_I64, raw, 1);
+        TEST_ASSERT_NOT_NULL(clk);
+        ray_t* tbl = ray_table_new(2);
+        tbl = ray_table_add_col(tbl, id_s, cs);
+        tbl = ray_table_add_col(tbl, id_lk, clk);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+
+        char symp[600];
+        snprintf(symp, sizeof(symp), "%s/px", dir);
+        TEST_ASSERT_EQ_I(ray_splay_save(tbl, dir, symp), RAY_ERR_RESERVED);
+        TEST_ASSERT_EQ_I(access(dir, F_OK), -1);
+        ray_release(cs);
+        ray_release(clk);
+        ray_release(tbl);
+        rm_rf(dir);
+    }
+
+    /* (e) NO false positive: a column "px" with the symfile in a DIFFERENT
+     *     directory saves fine even though a SYM column exists. */
+    {
+        const char* dir  = TMP_SPLAY_BASE "/symcol_nocollide";
+        const char* symp = TMP_SPLAY_BASE "/symcol_nocollide_dom";
+        rm_rf(dir);
+        unlink(symp);
+        unlink(TMP_SPLAY_BASE "/symcol_nocollide_dom.lk");
+        int64_t id_s  = ray_sym_intern("s", 1);
+        int64_t id_px = ray_sym_intern("px", 2);
+        int64_t aapl  = ray_sym_intern("AAPL", 4);
+        ray_t* cs = ray_sym_vec_new(RAY_SYM_W64, 1);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(cs));
+        cs->len = 1;
+        ((int64_t*)ray_data(cs))[0] = aapl;
+        ray_t* cpx = ray_vec_from_raw(RAY_I64, raw, 1);
+        TEST_ASSERT_NOT_NULL(cpx);
+        ray_t* tbl = ray_table_new(2);
+        tbl = ray_table_add_col(tbl, id_s, cs);
+        tbl = ray_table_add_col(tbl, id_px, cpx);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+        TEST_ASSERT_EQ_I(ray_splay_save(tbl, dir, symp), RAY_OK);
+        ray_release(cs);
+        ray_release(cpx);
+        ray_release(tbl);
+        rm_rf(dir);
+        unlink(symp);
+        unlink(TMP_SPLAY_BASE "/symcol_nocollide_dom.lk");
     }
     PASS();
 }
@@ -1845,7 +1981,7 @@ static test_result_t test_resolution_order_independence(void) {
     char live[600], part[600], symp[600];
     snprintf(live, sizeof(live), "%s/live", root);
     snprintf(part, sizeof(part), "%s/2024.01.01/hist", root);
-    snprintf(symp, sizeof(symp), "%s/sym", root);
+    snprintf(symp, sizeof(symp), "%s/.sym", root);
 
     int64_t id_s = ray_sym_intern("s", 1);
     int64_t va = ray_sym_intern("ord_acme", 8);
@@ -1944,11 +2080,11 @@ static test_result_t test_resolution_order_independence(void) {
 
 /* =========================================================================
  * 39. Explicit sym always wins, through the surface resolver: a dir
- *     whose dir/sym is a DECOY (left over from an earlier default save
+ *     whose dir/.sym is a DECOY (left over from an earlier default save
  *     of a different table — save sweeps stale columns but never
  *     symfiles).  Loading with the explicit path must resolve the
  *     current table's vocabulary; the default load documents the
- *     dir/sym precedence rule the explicit argument wins over.
+ *     dir/.sym precedence rule the explicit argument wins over.
  * ========================================================================= */
 static test_result_t test_resolution_explicit_wins(void) {
     const char* dir  = TMP_SPLAY_BASE "/explwin";
@@ -1963,7 +2099,7 @@ static test_result_t test_resolution_explicit_wins(void) {
     TEST_ASSERT_FALSE(!a_dir || RAY_IS_ERR(a_dir));
     TEST_ASSERT_FALSE(!a_osym || RAY_IS_ERR(a_osym));
 
-    /* table A saved with the DEFAULT resolution -> creates dir/sym */
+    /* table A saved with the DEFAULT resolution -> creates dir/.sym */
     int64_t da = ray_sym_intern("decoy_aa", 8);
     int64_t db = ray_sym_intern("decoy_bb", 8);
     ray_t* ca = ray_sym_vec_new(RAY_SYM_W64, 2);
@@ -1981,11 +2117,11 @@ static test_result_t test_resolution_explicit_wins(void) {
         ray_release(r);
     }
     char dsym[600];
-    snprintf(dsym, sizeof(dsym), "%s/sym", dir);
+    snprintf(dsym, sizeof(dsym), "%s/.sym", dir);
     TEST_ASSERT_EQ_I(access(dsym, F_OK), 0);
 
     /* table B saved to the SAME dir with an EXPLICIT other symfile —
-     * dir/sym stays behind as the decoy */
+     * dir/.sym stays behind as the decoy */
     int64_t wx = ray_sym_intern("win_xx", 6);
     int64_t wy = ray_sym_intern("win_yy", 6);
     ray_t* cb = ray_sym_vec_new(RAY_SYM_W64, 2);
@@ -2006,7 +2142,7 @@ static test_result_t test_resolution_explicit_wins(void) {
     TEST_ASSERT_EQ_I(access(osym, F_OK), 0);
 
     /* explicit wins: the 2-arg get resolves B's vocabulary through the
-     * explicit symfile even though dir/sym is ALSO present */
+     * explicit symfile even though dir/.sym is ALSO present */
     {
         ray_t* args[2] = { a_dir, a_osym };
         ray_t* lb = ray_get_splayed_fn(args, 2);
@@ -2025,7 +2161,7 @@ static test_result_t test_resolution_explicit_wins(void) {
     }
 
     /* default read pins what the explicit argument wins OVER: rule 2
-     * (dir/sym) resolves the DECOY — same positions, A's vocabulary.
+     * (dir/.sym) resolves the DECOY — same positions, A's vocabulary.
      * This is the documented hazard of pointing a default read at a dir
      * whose table was saved against another symfile, and exactly why
      * sharing requires the explicit argument everywhere. */
@@ -2087,7 +2223,7 @@ const test_entry_t splay_entries[] = {
     { "splay/nested_sym_list_symfile",    test_nested_sym_list_symfile,         splay_setup, splay_teardown },
     { "splay/ragged_columns_corrupt",     test_ragged_columns_corrupt,          splay_setup, splay_teardown },
     { "splay/untrusted_attrs_masked",     test_untrusted_attrs_masked,          splay_setup, splay_teardown },
-    { "splay/reserved_sym_col_name",      test_reserved_sym_col_name,           splay_setup, splay_teardown },
+    { "splay/sym_col_name_allowed",       test_sym_col_name_allowed,            splay_setup, splay_teardown },
     { "splay/per_table_symfile_vocab",    test_per_table_symfile_vocabulary,    splay_setup, splay_teardown },
     { "splay/restart_reload_divergent",   test_restart_reload_divergent_global, splay_setup, splay_teardown },
     { "splay/shared_symfile_identity",    test_shared_symfile_domain_identity,  splay_setup, splay_teardown },

@@ -927,7 +927,7 @@ static test_result_t test_link_parted_load_propagates(void) {
     int64_t q2[] = { 40, 50 };
     TEST_ASSERT_EQ_I(write_link_partition("2024.01.02", r2, 2, q2, 2, custs_sym), RAY_OK);
 
-    TEST_ASSERT_EQ_I(ray_sym_save(TMP_LINK_PART_DB "/sym"), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_sym_save(TMP_LINK_PART_DB "/.sym"), RAY_OK);
 
     ray_t* parted = ray_read_parted(TMP_LINK_PART_DB, TMP_LINK_PART_TBL);
     TEST_ASSERT_NOT_NULL(parted);
@@ -1003,7 +1003,7 @@ static test_result_t test_link_attach_rejects_parted_target(void) {
     int64_t r2[] = { 2, 1 };
     int64_t q2[] = { 40, 50 };
     TEST_ASSERT_EQ_I(write_link_partition("2024.01.02", r2, 2, q2, 2, custs_sym), RAY_OK);
-    TEST_ASSERT_EQ_I(ray_sym_save(TMP_LINK_PART_DB "/sym"), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_sym_save(TMP_LINK_PART_DB "/.sym"), RAY_OK);
 
     ray_t* parted = ray_read_parted(TMP_LINK_PART_DB, TMP_LINK_PART_TBL);
     TEST_ASSERT_NOT_NULL(parted);
@@ -1065,7 +1065,7 @@ static test_result_t test_link_deref_rejects_parted_after_rebind(void) {
     int64_t r2[] = { 1, 0 };
     int64_t q2[] = { 30, 40 };
     TEST_ASSERT_EQ_I(write_link_partition("2024.01.02", r2, 2, q2, 2, custs_sym), RAY_OK);
-    TEST_ASSERT_EQ_I(ray_sym_save(TMP_LINK_PART_DB "/sym"), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_sym_save(TMP_LINK_PART_DB "/.sym"), RAY_OK);
 
     ray_t* parted = ray_read_parted(TMP_LINK_PART_DB, TMP_LINK_PART_TBL);
     TEST_ASSERT_NOT_NULL(parted);
@@ -1125,7 +1125,7 @@ static test_result_t test_link_dotted_resolve_propagates_parted_error(void) {
     int64_t r2[] = { 1, 0 };
     int64_t q2[] = { 30, 40 };
     TEST_ASSERT_EQ_I(write_link_partition("2024.01.02", r2, 2, q2, 2, custs_sym), RAY_OK);
-    TEST_ASSERT_EQ_I(ray_sym_save(TMP_LINK_PART_DB "/sym"), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_sym_save(TMP_LINK_PART_DB "/.sym"), RAY_OK);
     ray_t* parted = ray_read_parted(TMP_LINK_PART_DB, TMP_LINK_PART_TBL);
     TEST_ASSERT_NOT_NULL(parted);
     TEST_ASSERT_FALSE(RAY_IS_ERR(parted));
@@ -1182,7 +1182,7 @@ static test_result_t test_link_vm_eval_propagates_parted_error(void) {
     int64_t r2[] = { 1, 0 };
     int64_t q2[] = { 30, 40 };
     TEST_ASSERT_EQ_I(write_link_partition("2024.01.02", r2, 2, q2, 2, custs_sym), RAY_OK);
-    TEST_ASSERT_EQ_I(ray_sym_save(TMP_LINK_PART_DB "/sym"), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_sym_save(TMP_LINK_PART_DB "/.sym"), RAY_OK);
     ray_t* parted = ray_read_parted(TMP_LINK_PART_DB, TMP_LINK_PART_TBL);
     TEST_ASSERT_NOT_NULL(parted);
     TEST_ASSERT_FALSE(RAY_IS_ERR(parted));

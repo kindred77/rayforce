@@ -629,7 +629,7 @@ static test_result_t test_part_open(void) {
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
     /* Save symfile */
-    err = ray_sym_save(TMP_PART_DB "/sym");
+    err = ray_sym_save(TMP_PART_DB "/.sym");
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
     /* Cleanup in-memory tables */

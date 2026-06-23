@@ -11,7 +11,7 @@
  *     f64 null = `0Nf`; i64 null = `0Nl`.  All three are accepted inside
  *     plain vector literals, including in leading position.
  *   - the .db trio (test/rfl/system/db_get.rfl, db_sym_resolution.rfl):
- *     `(.db.splayed.set "<dir>" <table> "<root>/sym")` — the EXPLICIT
+ *     `(.db.splayed.set "<dir>" <table> "<root>/.sym")` — the EXPLICIT
  *     third argument is required for the shared root symfile (no
  *     root-walk for plain dirs post-flip).
  */

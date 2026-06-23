@@ -42,7 +42,7 @@ Errors: `type` (dir/sym not strings, tbl not a table), `domain` (paths empty / t
 
 Signatures:
 
-- `(.db.splayed.get "dir")` — look for `dir/sym` automatically.
+- `(.db.splayed.get "dir")` — look for `dir/.sym` automatically.
 - `(.db.splayed.get "dir" "sym_path")` — use a custom symbol-table path (e.g. a shared db-root sym).
 
 Returns a `table` with every column memory-mapped — zero allocation per row.

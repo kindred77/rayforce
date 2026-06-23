@@ -2,7 +2,7 @@
  * stress_store.h — shared engine for parted/splayed shared-symfile stress
  * tests.  Fixture mirrors the production layout: one db root with a
  * date-parted table `hist`, a splayed table `live`, and a single shared
- * symfile `db_root/sym`.  An independent shadow model (plain malloc, syms
+ * symfile `db_root/.sym`.  An independent shadow model (plain malloc, syms
  * as strings) is the oracle; see test_stress_matrix.c / test_stress_random.c.
  */
 
@@ -93,7 +93,7 @@ bool stress_op_part_new(stress_ctx_t* c, int64_t n, stress_sym_pattern_t pat);
 bool stress_op_sym_grow(stress_ctx_t* c, int64_t n);
 
 /* simulated process restart: destroy + re-init the global sym table, then
- * re-load db_root/sym from disk.  Invalidates every live sym ID. */
+ * re-load db_root/.sym from disk.  Invalidates every live sym ID. */
 bool stress_op_restart(stress_ctx_t* c);
 
 /* verification — true if clean.  On mismatch: dumps seed + op log to
