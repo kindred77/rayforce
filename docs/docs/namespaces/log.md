@@ -5,7 +5,7 @@ A binary append-only journal of serialised Rayfall expressions. The runtime keep
 The journal is intentionally minimal: there's no per-entry timestamp or transaction grouping at the journal layer. Snapshot + replay is the only recovery model.
 
 !!! note "Restricted under `-U`"
-    `.log.open`, `.log.replay`, `.log.roll`, `.log.snapshot`, `.log.close` are `RAY_FN_RESTRICTED`. The introspection / I/O-only entries (`.log.write`, `.log.sync`, `.log.validate`) are unrestricted — they cannot escalate privilege beyond what the IPC peer could already do.
+    `.log.open`, `.log.replay`, `.log.roll`, `.log.snapshot`, `.log.close`, `.log.purge` are `RAY_FN_RESTRICTED`. The introspection / I/O-only entries (`.log.write`, `.log.sync`, `.log.validate`) are unrestricted — they cannot escalate privilege beyond what the IPC peer could already do.
 
 ## Reference
 
@@ -19,6 +19,7 @@ The journal is intentionally minimal: there's no per-entry timestamp or transact
 | [`.log.replay`](#log-replay) | unary | restricted | Replay a journal file; return entry count. |
 | [`.log.validate`](#log-validate) | unary | — | Scan a journal file; return `(chunks valid_bytes)`. |
 | [`.log.close`](#log-close) | variadic | restricted | Flush and close the active journal. |
+| [`.log.purge`](#log-purge) | variadic | restricted | Close the active journal and delete all its files. |
 
 ## `.log.open` { #log-open }
 
@@ -98,6 +99,15 @@ Signature: `(.log.validate "path")`. Scans the file framing-only — does not de
 ## `.log.close` { #log-close }
 
 Signature: `(.log.close)`. Flushes and closes the active journal. Returns null. No-op if no journal is open.
+
+## `.log.purge` { #log-purge }
+
+Signature: `(.log.purge)`. Closes the active journal (if open) and deletes its **entire** on-disk footprint: the active `<base>.log`, every rolled `<base>.<stamp>.log` archive, the `<base>.qdb` snapshot, and a stray `<base>.qdb.tmp`. Takes no path argument — it acts on the current journal, the same one `.log.open` / `.log.write` / `.log.close` operate on (the base survives `.log.close`, so purge works after a close). Returns null on success; errors with `domain` if no journal has been opened in this process. Best-effort delete: a missing file is not an error.
+
+```
+(.log.close)
+(.log.purge)   ;; no path needed — deletes every segment + snapshot of the active journal
+```
 
 ## See also
 
