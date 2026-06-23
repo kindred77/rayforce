@@ -3280,7 +3280,7 @@ static test_result_t test_ipc_sync_roundtrip(void) {
     ray_thread_create(&tid, server_thread_fn, &ctx);
 
     /* Client: connect */
-    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL);
+    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
 
     /* Client: send sync query "(+ 1 2)" — expects result 3 */
@@ -3331,7 +3331,7 @@ static test_result_t test_ipc_async_send(void) {
     ray_thread_t tid;
     ray_thread_create(&tid, server_thread_fn, &ctx);
 
-    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL);
+    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
 
     /* Send async — should not block or error */
@@ -3376,7 +3376,7 @@ static test_result_t test_ipc_auth_success(void) {
     ray_thread_t tid;
     ray_thread_create(&tid, server_thread_fn, &ctx);
 
-    int64_t h = ray_ipc_connect("127.0.0.1", port, "admin", "secret123");
+    int64_t h = ray_ipc_connect("127.0.0.1", port, "admin", "secret123", 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
 
     ray_t* msg = ray_str("(+ 10 20)", 9);
@@ -3421,7 +3421,7 @@ static test_result_t test_ipc_auth_reject(void) {
     ray_thread_t tid;
     ray_thread_create(&tid, server_thread_fn, &ctx);
 
-    int64_t h = ray_ipc_connect("127.0.0.1", port, "admin", "wrong");
+    int64_t h = ray_ipc_connect("127.0.0.1", port, "admin", "wrong", 0);
     TEST_ASSERT_EQ_I(h, -3);
 
     srv.running = false;
@@ -3456,7 +3456,7 @@ static test_result_t test_ipc_auth_no_creds(void) {
     ray_thread_t tid;
     ray_thread_create(&tid, server_thread_fn, &ctx);
 
-    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL);
+    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT_EQ_I(h, -2);
 
     srv.running = false;
@@ -3492,7 +3492,7 @@ static test_result_t test_ipc_restricted(void) {
     ray_thread_t tid;
     ray_thread_create(&tid, server_thread_fn, &ctx);
 
-    int64_t h = ray_ipc_connect("127.0.0.1", port, "admin", "secret123");
+    int64_t h = ray_ipc_connect("127.0.0.1", port, "admin", "secret123", 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
 
     /* Arithmetic should work */
@@ -3589,7 +3589,7 @@ static test_result_t test_ipc_handshake_version_mismatch(void) {
 
     /* A subsequent well-behaved client must still succeed, proving the
      * server is still running and only the bad handshake was rejected. */
-    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL);
+    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
     ray_ipc_close(h);
 

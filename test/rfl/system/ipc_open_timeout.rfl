@@ -1,0 +1,51 @@
+;; Connect timeout argument for `.ipc.open` (issue #286).
+;;
+;; `.ipc.open` is now a variadic builtin accepting an optional second
+;; argument — a connect/handshake timeout in milliseconds:
+;;
+;;   (.ipc.open "host:port")
+;;   (.ipc.open "host:port" 2000)
+;;
+;; The timeout bounds the TCP connect (driven non-blocking + poll in
+;; src/core/sock.c) and the handshake I/O.  A blocking connect() ignores
+;; SO_*TIMEO, so without this a dead/filtered peer would hang for the OS
+;; default (~minutes).
+;;
+;; Port 19998 is fixed and unprivileged; distinct from ipc_diff.rfl's
+;; 19999 so the two never collide.  `make test` is sequential anyway.
+
+;; ── argument validation (no server needed) ─────────────────────────
+;; The harness `!-` operator matches the error tag (ray_fmt(err, 0)),
+;; so assert on the tag; the human-readable detail is exercised by the
+;; REPL.  Wrong arity → rank.
+(.ipc.open "127.0.0.1:19998" 1 2) !- rank
+;; Non-integer timeout → type.
+(.ipc.open "127.0.0.1:19998" "soon") !- type
+;; Negative timeout → domain.
+(.ipc.open "127.0.0.1:19998" -5) !- domain
+;; A refused peer reports an error promptly rather than hanging — port
+;; 19997 has no listener, so the connect is refused (RST) → io.
+(.ipc.open "127.0.0.1:19997" 500) !- io
+
+;; ── lifecycle: spawn server ────────────────────────────────────────
+(.sys.exec "pkill -TERM -f 'rayforce -p 19998' 2>/dev/null; true")
+(.sys.exec "./rayforce -p 19998 </dev/null >/dev/null 2>&1 &")
+(.sys.exec "for i in $(seq 30); do bash -c '(echo > /dev/tcp/127.0.0.1/19998) 2>/dev/null' && exit 0; sleep 0.1; done; exit 1") -- 0
+
+;; ── happy path: timeout arg does not break a real connect ──────────
+(set h (.ipc.open "127.0.0.1:19998" 2000))
+(>= h 0) -- true
+;; Round-trip over the wire to prove the handshake completed normally.
+(+ 3 4)           -- (.ipc.send h "(+ 3 4)")
+(sum [1 2 3 4 5]) -- (.ipc.send h "(sum [1 2 3 4 5])")
+(.ipc.close h)
+
+;; ── backward compatibility: 1-arg form still works ────────────────
+(set h2 (.ipc.open "127.0.0.1:19998"))
+(>= h2 0) -- true
+(* 6 7) -- (.ipc.send h2 "(* 6 7)")
+
+;; ── teardown ───────────────────────────────────────────────────────
+(try (.ipc.send h2 "(exit 0)") (fn [e] 0))
+(.ipc.close h2)
+(.sys.exec "sleep 0.1; pkill -KILL -f 'rayforce -p 19998' 2>/dev/null; true")

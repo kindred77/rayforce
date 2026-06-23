@@ -305,15 +305,15 @@ captured_x -- 77
 (nil? null) -- true
 
 ;; ═══════════════════════════════════════════════════════════════════
-;; 13. ray_try_fn handler dispatch (eval.c 289-301).
-;;     Handler can be LAMBDA (line 289), UNARY (line 292), else type.
-;;     The LAMBDA path is heavily covered; UNARY exercise via builtin
-;;     unary fn as handler (also covered by try_raise.rfl §3).  The
-;;     `else` arm (line 295-297) requires a non-fn handler value.
-;;     A VARY (list) handler reaches the else arm.
+;; 13. ray_try_handle dispatch (eval.c).
+;;     A 1-arg-callable handler (LAMBDA or UNARY builtin) is invoked with
+;;     the error; ANY other 2nd arg — including multi-arg builtins (VARY
+;;     `list`, BINARY `+`) and plain values — is returned as a fallback
+;;     value (a function is a first-class value).  This is the fallback
+;;     arm; the LAMBDA/UNARY call arms are covered by try_raise.rfl.
 ;; ═══════════════════════════════════════════════════════════════════
-(try (raise 5) list) !- type
-(try (raise 5) +) !- type
+(type (try (raise 5) list)) -- (type list)
+(type (try (raise 5) +)) -- (type +)
 ;; Handler that itself raises → recursive error path inside the handler.
 (try (raise 5) (fn [e] (raise (* e 10)))) !- domain
 

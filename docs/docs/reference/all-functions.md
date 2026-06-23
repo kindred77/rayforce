@@ -231,7 +231,7 @@ Special forms receive their arguments unevaluated. These are the core language p
 | `if` | variadic | special | Conditional: (if cond then else) | `(if (> x 0) "pos" "neg")` |
 | `do` | variadic | special | Sequential execution, returns last value | `(do (set x 1) (set y 2) (+ x y))` |
 | `fn` | variadic | special | Create lambda function | `(fn [x y] (+ x y))` |
-| `try` | binary | special | Error handling: (try expr handler-fn) | `(try (/ 1 0) (fn [e] 0))` |
+| `try` | binary | special | Error handling: (try expr handler-fn-or-fallback-value) | `(try (/ 1 0) (fn [e] 0))` |
 | `raise` | unary | — | Throw an error with message | `(raise "bad input")` |
 | `return` | unary | — | Early return from function body | `(return 42)` |
 | `quote` | variadic | special | Return argument unevaluated; a bare name yields a literal symbol (`(quote x)` ≡ `'x`) | `(quote (+ 1 2))` → `(+ 1 2)` |
@@ -530,7 +530,7 @@ TCP-based IPC for connecting to remote Rayforce instances. Uses binary serializa
 
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
-| `.ipc.open` | unary | restricted | Open TCP connection to host:port, returns handle | `(.ipc.open "localhost:5000")` |
+| `.ipc.open` | variadic | restricted | Open TCP connection to host:port (optional connect timeout in ms), returns handle | `(.ipc.open "localhost:5000" 2000)` |
 | `.ipc.close` | unary | restricted | Close an IPC connection handle | `(.ipc.close h)` |
 | `.ipc.send` | binary | restricted | Send a value over an IPC handle (sync request) | `(.ipc.send h "(sum (til 100))")` |
 | `.ipc.handle` | variadic | — | Current connection handle inside any `.ipc.on.*` hook, `-1` outside | `(.ipc.handle)` |

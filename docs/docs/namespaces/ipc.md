@@ -12,7 +12,7 @@ Connect to a Rayforce server (`./rayforce -p <port>`) and exchange messages over
 
 | Function | Arity | Flags | Description |
 |---|---|---|---|
-| [`.ipc.open`](#ipc-open) | unary | restricted | Open a TCP connection; return an i64 handle. |
+| [`.ipc.open`](#ipc-open) | variadic | restricted | Open a TCP connection (optional connect timeout); return an i64 handle. |
 | [`.ipc.send`](#ipc-send) | binary | restricted | Send a message synchronously; return the server's result. |
 | [`.ipc.post`](#ipc-post) | binary | restricted | Send a message asynchronously (fire-and-forget); return the null object. |
 | [`.ipc.close`](#ipc-close) | unary | restricted | Close a connection handle. |
@@ -20,14 +20,17 @@ Connect to a Rayforce server (`./rayforce -p <port>`) and exchange messages over
 
 ## `.ipc.open` { #ipc-open }
 
-Signature: `(.ipc.open "host:port")` or `(.ipc.open "host:port:user:password")`.
+Signature: `(.ipc.open "host:port")` or `(.ipc.open "host:port:user:password")`, with an optional trailing connect timeout in milliseconds: `(.ipc.open "host:port" 2000)`.
 
 Returns: an `i64` handle. Negative handles never escape — errors are surfaced as Rayfall error objects:
 
-- `type` — argument is not a string.
-- `domain` — malformed address (missing port, port out of `(0, 65535]`, oversized host/user/password).
+- `type` — address argument is not a string, or the timeout argument is not an integer.
+- `rank` — called with fewer than 1 or more than 2 arguments.
+- `domain` — malformed address (missing port, port out of `(0, 65535]`, oversized host/user/password), or a negative timeout.
 - `access` — server requires auth and you didn't supply credentials, **or** the password is wrong.
-- `io` — connection refused / network error.
+- `io` — connection refused / network error, or `connection timed out` when the connect did not complete within the timeout.
+
+The optional timeout bounds **both** the TCP connect and the handshake I/O. A blocking `connect()` ignores socket send/receive timeouts, so without an explicit bound a dead or packet-filtered peer would otherwise hang for the operating-system default (often minutes). When omitted, a default budget of 5 seconds applies.
 
 The handshake exchanges a 2-byte `{wire_version, auth_flag}` greeting. A wire-version mismatch closes the connection before any payload is exchanged.
 
@@ -37,6 +40,9 @@ The handshake exchanges a 2-byte `{wire_version, auth_flag}` greeting. A wire-ve
 
 ;; With credentials (server started with -u or -U)
 (set h (.ipc.open "127.0.0.1:5000:admin:secret123"))
+
+;; Fail fast if the peer doesn't answer within 2 seconds
+(set h (.ipc.open "127.0.0.1:5000" 2000))
 ```
 
 ## `.ipc.send` { #ipc-send }

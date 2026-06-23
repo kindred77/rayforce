@@ -27,8 +27,31 @@
 ;; ── handler expression itself fails → propagates that error ─────────────────
 (try (raise 1) no_such_fn) !- name
 
-;; ── type error handler: invalid handler type ────────────────────────────────
-(try (raise 1) "not-a-fn") !- type
+;; ── non-callable handler → returned as a fallback VALUE ─────────────────────
+;; A 2nd arg that is not a function is the value to return on failure.  This
+;; is the only way to surface an outer binding from the failure branch, since
+;; Rayfall lambdas do not capture closures.  (Interpreter path.)
+(try (raise 1) "not-a-fn") -- "not-a-fn"
+(try (raise 1) 42) -- 42
+(try (raise 1) [1 2 3]) -- [1 2 3]
+(try (raise 1) "") -- ""
+;; A list expression in the handler slot is evaluated; its value is the
+;; fallback (empty list, list ctor, and an arbitrary value-expression).
+(try (raise 1) ()) -- ()
+(try (raise 1) (list 1 2 3)) -- (list 1 2 3)
+(try (raise 1) (+ 2 3)) -- 5
+;; The fallback is only evaluated on failure; the success result wins.
+(try 7 "fallback") -- 7
+(try 7 ()) -- 7
+;; The fallback expression is evaluated in the current scope.
+(set outer 123)
+(try (raise "x") outer) -- 123
+
+;; ── compiled path: fallback returns the outer lambda parameter ──────────────
+;; The reported case — `data` is the lambda's bound param, returned on failure.
+((fn [data] (try (raise "Oops") data)) 123) -- 123
+((fn [data] (try (+ data 1) data)) 5) -- 6
+((fn [a b] (try (raise 0) b)) 1 2) -- 2
 
 ;; ── nested try ──────────────────────────────────────────────────────────────
 (try (try (raise 5) (fn [e] (raise (+ e 10)))) (fn [e] e)) -- 15
