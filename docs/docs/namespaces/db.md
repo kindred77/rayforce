@@ -17,6 +17,7 @@ The `get` builtins memory-map every column file — load is constant-time regard
 | [`.db.splayed.set`](#db-splayed-set) | variadic | restricted | Save a table to a splayed directory. |
 | [`.db.splayed.get`](#db-splayed-get) | variadic | — | Load a splayed table (columns mmap'd). |
 | [`.db.parted.get`](#db-parted-get) | variadic | — | Load a partitioned table by name from a db root. |
+| [`.db.parted.tables`](#db-parted-tables) | variadic | — | List the table names available under a parted db root. |
 
 ## `.db.splayed.set` { #db-splayed-set }
 
@@ -64,6 +65,22 @@ Returns a single logical table assembled from every partition directory under `d
 ```
 
 Errors: `domain` (arity != 2 or `tbl_name` invalid), `type` (root not a string or name not a sym), `name` (sym ID unknown).
+
+## `.db.parted.tables` { #db-parted-tables }
+
+Signature: `(.db.parted.tables "db_root")`.
+
+Returns a sorted `sym` vector of the table names available under a parted `db_root` — the splayed-table subdirectories (those with a `.d` schema) of the first partition. Each name can be passed straight to `.db.parted.get`; nothing is loaded or bound by this call.
+
+```lisp
+(.db.parted.tables "/data/db")
+;; => [`quotes `trades]
+
+;; load each discovered table by name
+(map (fn [t] (.db.parted.get "/data/db" t)) (.db.parted.tables "/data/db"))
+```
+
+Errors: `domain` (arity != 1), `type` (root not a string), `io` (root unreadable or not a parted root — no partition directories).
 
 ## See also
 

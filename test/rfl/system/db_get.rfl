@@ -82,6 +82,17 @@
 (min (at B 'v)) -- 5
 (max (at B 'v)) -- 8
 
+;; ────────────── .db.parted.tables: discover the table names ──────────────
+;; Returns the splayed-table subdirectories of the first partition as a
+;; sorted SYM vector — usable directly with .db.parted.get, no binding.
+(.db.parted.tables "/tmp/rfl_get_parted/")        -- ['A 'B]
+(count (.db.parted.tables "/tmp/rfl_get_parted/")) -- 2
+;; a discovered name feeds straight back into .db.parted.get.
+(count (.db.parted.get "/tmp/rfl_get_parted/" (at (.db.parted.tables "/tmp/rfl_get_parted/") 0))) -- 4
+;; not a parted root (splayed root has no partition dirs) -> io error.
+(.db.parted.tables "/tmp/rfl_get_splayed/")        !- io
+(.db.parted.tables "/tmp/rfl_get_does_not_exist/") !- io
+
 ;; ────────────── error path: not a parted root ──────────────
 ;; The splayed root from the first test has no partition directories,
 ;; so .db.parted.get on it must fail rather than returning an empty

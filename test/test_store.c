@@ -705,6 +705,56 @@ static test_result_t test_part_open(void) {
     PASS();
 }
 
+/* ---- test_parted_tables ------------------------------------------------ */
+/* ray_parted_tables lists the splayed-table subdirectories of the first
+ * partition as a sorted SYM vector usable with ray_read_parted. */
+static test_result_t test_parted_tables(void) {
+    (void)!system("rm -rf " TMP_PART_DB);
+    /* Two tables (trades, quotes) across two partitions. */
+    const char* dirs[] = {
+        TMP_PART_DB "/2024.01.01/trades", TMP_PART_DB "/2024.01.01/quotes",
+        TMP_PART_DB "/2024.01.02/trades", TMP_PART_DB "/2024.01.02/quotes",
+    };
+    int64_t a[] = {1, 2, 3};
+    for (int i = 0; i < 4; i++) {
+        ray_t* col = ray_vec_from_raw(RAY_I64, a, 3);
+        TEST_ASSERT_NOT_NULL(col);
+        ray_t* t = ray_table_new(1);
+        t = ray_table_add_col(t, ray_sym_intern("v", 1), col);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+        TEST_ASSERT_EQ_I(ray_splay_save(t, dirs[i], NULL), RAY_OK);
+        ray_release(col);
+        ray_release(t);
+    }
+
+    /* Sorted SYM vector: quotes, trades. */
+    ray_t* names = ray_parted_tables(TMP_PART_DB);
+    TEST_ASSERT_NOT_NULL(names);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(names));
+    TEST_ASSERT_EQ_I(names->type, RAY_SYM);
+    TEST_ASSERT_EQ_I(names->len, 2);
+    const int64_t* ids = (const int64_t*)ray_data(names);
+    TEST_ASSERT_EQ_I(ids[0], ray_sym_intern("quotes", 6));
+    TEST_ASSERT_EQ_I(ids[1], ray_sym_intern("trades", 6));
+    ray_release(names);
+
+    /* A returned name feeds straight back into ray_read_parted. */
+    ray_t* tbl = ray_read_parted(TMP_PART_DB, "trades");
+    TEST_ASSERT_NOT_NULL(tbl);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    ray_release(tbl);
+
+    /* A non-parted root (no partition dirs) is an error, not empty. */
+    (void)!system("rm -rf " TMP_PART_DB "_np && mkdir -p " TMP_PART_DB "_np");
+    ray_t* err = ray_parted_tables(TMP_PART_DB "_np");
+    TEST_ASSERT_TRUE(err != NULL && RAY_IS_ERR(err));
+    ray_error_free(err);
+    (void)!system("rm -rf " TMP_PART_DB "_np");
+
+    (void)!system("rm -rf " TMP_PART_DB);
+    PASS();
+}
+
 /* ---- test_group_parted ------------------------------------------------- */
 
 static test_result_t test_group_parted(void) {
@@ -4809,6 +4859,7 @@ const test_entry_t store_entries[] = {
     { "store/table_nrows_parted", test_table_nrows_parted, store_setup, store_teardown },
     { "store/parted_release", test_parted_release, store_setup, store_teardown },
     { "store/part_open", test_part_open, store_setup, store_teardown },
+    { "store/parted_tables", test_parted_tables, store_setup, store_teardown },
     { "store/group_parted", test_group_parted, store_setup, store_teardown },
     { "store/col_large_nullable_roundtrip", test_col_large_nullable_roundtrip, store_setup, store_teardown },
     { "store/col_save_load_str", test_col_save_load_str, store_setup, store_teardown },
