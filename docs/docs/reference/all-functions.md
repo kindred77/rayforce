@@ -530,7 +530,7 @@ TCP-based IPC for connecting to remote Rayforce instances. Uses binary serializa
 
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
-| `.ipc.open` | unary | restricted | Open TCP connection to host:port, returns handle | `(.ipc.open "localhost:5000")` |
+| `.ipc.open` | variadic | restricted | Open TCP connection to host:port (optional connect timeout in ms), returns handle | `(.ipc.open "localhost:5000" 2000)` |
 | `.ipc.close` | unary | restricted | Close an IPC connection handle | `(.ipc.close h)` |
 | `.ipc.send` | binary | restricted | Send a value over an IPC handle (sync request) | `(.ipc.send h "(sum (til 100))")` |
 | `.ipc.handle` | variadic | — | Current connection handle inside any `.ipc.on.*` hook, `-1` outside | `(.ipc.handle)` |

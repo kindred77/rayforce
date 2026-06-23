@@ -44,7 +44,7 @@ static void public_api_setup(void)    { ray_runtime_create(0, NULL); }
 static void public_api_teardown(void) { ray_runtime_destroy(__RUNTIME); }
 
 static test_result_t test_public_ipc_client_symbols(void) {
-    int64_t   (*connect_fn)(const char*, uint16_t, const char*, const char*) = ray_ipc_connect;
+    int64_t   (*connect_fn)(const char*, uint16_t, const char*, const char*, int) = ray_ipc_connect;
     void      (*close_fn)(int64_t) = ray_ipc_close;
     ray_t*    (*send_fn)(int64_t, ray_t*) = ray_ipc_send;
     ray_err_t (*async_fn)(int64_t, ray_t*) = ray_ipc_send_async;
