@@ -1,0 +1,41 @@
+;; `within` as a select WHERE predicate (issue #284).
+;;
+;; `within` works as a plain vector op but used to be rejected by the DAG
+;; WHERE compiler.  It is now lowered to `(and (>= col lo) (<= col hi))`
+;; inside `compile_expr_dag` (src/ops/query.c), so it compiles to the same
+;; comparison opcodes any hand-written range predicate would — inheriting
+;; range-index rowsel, partition pruning, null handling and type promotion.
+;;
+;; The range operand must be a compile-time-constant 2-element vector, the
+;; same literal constraint OP_IN's set operand has.
+
+;; --------------------------------------------------------------------
+;; I64 column — inclusive on both ends.
+;; --------------------------------------------------------------------
+(set t (table [sn] (list [1 2 3 4 5])))
+;; sn in [2 4] → {2,3,4}.
+(at (select {from: t where: (within sn [2 4]) c: sn}) 'c) -- [2 3 4]
+;; Equivalent hand-written range predicate produces the same rows.
+(at (select {from: t where: (and (>= sn 2) (<= sn 4)) c: sn}) 'c) -- [2 3 4]
+;; Lower bound inclusive: [1 1] keeps exactly row 1.
+(at (select {from: t where: (within sn [1 1]) c: sn}) 'c) -- [1]
+;; Whole range keeps everything.
+(count (select {from: t where: (within sn [1 5])})) -- 5
+;; Empty range keeps nothing.
+(count (select {from: t where: (within sn [4 2])})) -- 0
+
+;; --------------------------------------------------------------------
+;; F64 column — promotion path (F64 col vs integer-literal bounds).
+;; --------------------------------------------------------------------
+(set tf (table [p] (list [1.0 2.5 3.5 4.5 9.0])))
+(at (select {from: tf where: (within p [2 5]) c: p}) 'c) -- [2.5 3.5 4.5]
+
+;; --------------------------------------------------------------------
+;; Inside an AND chain alongside other conjuncts (chained-filter path).
+;; --------------------------------------------------------------------
+(set Nrow 1000)
+(set T0 (table [k v] (list (take ['A 'B 'C] Nrow) (til Nrow))))
+;; (and (within v [100 500]) (!= k 'C)) — v in {100..500} minus r%3==2.
+;; Oracle via explicit comparisons must match (single line per the DSL).
+(count (select {from: T0 where: (and (within v [100 500]) (!= k 'C))})) -- (count (select {from: T0 where: (and (>= v 100) (<= v 500) (!= k 'C))}))
+(sum (at (select {from: T0 where: (and (within v [100 500]) (!= k 'C))}) 'v)) -- (sum (at (select {from: T0 where: (and (>= v 100) (<= v 500) (!= k 'C))}) 'v))
