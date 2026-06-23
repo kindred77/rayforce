@@ -31,7 +31,7 @@
 (.db.splayed.set "/tmp/rfl_sys_bc_a/" null) !- type
 
 ;; 3-arg form: explicit sym_path
-(.db.splayed.set "/tmp/rfl_sys_bc_sym3/" (table [s v] (list ['A 'B] [1 2])) "/tmp/rfl_sys_bc_sym3/sym")
+(.db.splayed.set "/tmp/rfl_sys_bc_sym3/" (table [s v] (list ['A 'B] [1 2])) "/tmp/rfl_sys_bc_sym3/.sym")
 (count (.db.splayed.get "/tmp/rfl_sys_bc_sym3/")) -- 2
 (.db.splayed.get "/tmp/rfl_sys_bc_sym3/") -- (table [s v] (list ['A 'B] [1 2]))
 ;; 3-arg form: non-string third arg falls back to default sym path
@@ -43,10 +43,10 @@
 ;; ray_get_splayed_fn  (lines 102-116) — arity / type guards
 ;; ══════════════════════════════════════════════════════════════════════
 (.db.splayed.get) !- domain
-(.db.splayed.get "/tmp/rfl_sys_bc_sym3/" "/tmp/rfl_sys_bc_sym3/sym" "extra") !- domain
+(.db.splayed.get "/tmp/rfl_sys_bc_sym3/" "/tmp/rfl_sys_bc_sym3/.sym" "extra") !- domain
 (.db.splayed.get 42) !- type
-(count (.db.splayed.get "/tmp/rfl_sys_bc_sym3/" "/tmp/rfl_sys_bc_sym3/sym")) -- 2
-(.db.splayed.get "/tmp/rfl_sys_bc_sym3/" "/tmp/rfl_sys_bc_sym3/sym") -- (table [s v] (list ['A 'B] [1 2]))
+(count (.db.splayed.get "/tmp/rfl_sys_bc_sym3/" "/tmp/rfl_sys_bc_sym3/.sym")) -- 2
+(.db.splayed.get "/tmp/rfl_sys_bc_sym3/" "/tmp/rfl_sys_bc_sym3/.sym") -- (table [s v] (list ['A 'B] [1 2]))
 (count (.db.splayed.get "/tmp/rfl_sys_bc_sym3/" 42)) -- 2
 (.db.splayed.get "/tmp/rfl_sys_bc_sym3/" 42) -- (table [s v] (list ['A 'B] [1 2]))
 

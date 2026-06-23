@@ -270,7 +270,7 @@ static ray_t* load_dir(stress_ctx_t* c, const char* dir, bool use_mmap) {
 bool stress_init(stress_ctx_t* c, const char* db_root, uint64_t seed) {
     memset(c, 0, sizeof(*c));
     snprintf(c->db_root, sizeof(c->db_root), "%s", db_root);
-    snprintf(c->sym_path, sizeof(c->sym_path), "%s/sym", db_root);
+    snprintf(c->sym_path, sizeof(c->sym_path), "%s/.sym", db_root);
     c->seed = seed;
     c->rng  = seed | 1; /* xorshift state must be nonzero */
     c->oplog = (char(*)[128])malloc((size_t)STRESS_OPLOG_CAP * 128);

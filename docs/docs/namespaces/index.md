@@ -8,7 +8,7 @@ Rayfall's builtins are organised under dotted namespaces. Names beginning with `
 |---|---|
 | [`.col.*`](col.md) | Foreign-key style column-to-table linking and dotted dereference. |
 | [`.csv.*`](csv.md) | CSV import/export — in-memory, splayed-on-disk, and partitioned variants. |
-| [`.db.*`](db.md) | On-disk table I/O: splayed and partitioned `get` / `set` / `mount`. |
+| [`.db.*`](db.md) | On-disk table I/O: splayed and partitioned `get` / `set`. |
 | [`.graph.*`](graph.md) | Graph builders and algorithms (PageRank, Louvain, Dijkstra, MST, BFS/DFS, expand, …). |
 | [`.idx.*`](idx.md) | Accelerator indexes: bloom, hash, sort, zone. |
 | [`.ipc.*`](ipc.md) | TCP client IPC and the server connection-hook accessor. |
@@ -31,4 +31,4 @@ When the server is started with `-U <password>`, the following dotted builtins a
 - `.sys.exec`, `.sys.cmd`, `.sys.listen`
 - `.time.timer.set`, `.time.timer.del`
 
-`.col.*`, `.graph.*`, `.idx.*`, and pure read/inspect builtins (`.db.splayed.get`, `.db.parted.get`, `.os.size`, `.os.list`, `.log.write`, `.log.sync`, `.log.validate`, `.sys.build`, `.sys.info`, `.sys.mem`, `.sys.gc`, `.sys.env`, `.sys.timeit`, `.ipc.handle`, `.time.now`) are always available.
+`.col.*`, `.graph.*`, `.idx.*`, and pure read/inspect builtins (`.db.splayed.get`, `.db.parted.get`, `.db.parted.tables`, `.os.size`, `.os.list`, `.log.write`, `.log.sync`, `.log.validate`, `.sys.build`, `.sys.info`, `.sys.mem`, `.sys.gc`, `.sys.env`, `.sys.timeit`, `.ipc.handle`, `.time.now`) are always available.

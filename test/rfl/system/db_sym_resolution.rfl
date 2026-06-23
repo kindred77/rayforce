@@ -1,48 +1,48 @@
 ;; SYM-domain symfile resolution precedence, end-to-end (sym-domain
 ;; architecture spec, "Surface"):
-;;   explicit argument | dir/sym | partition-shaped parent -> root/sym
+;;   explicit argument | dir/.sym | partition-shaped parent -> root/.sym
 ;; There is NO root-walk for plain dirs — a splayed dir under a root with
-;; a root/sym does NOT pick it up implicitly; sharing requires the
+;; a root/.sym does NOT pick it up implicitly; sharing requires the
 ;; explicit argument.  A SYM column with no resolvable symfile is a loud
 ;; `sym` error, never silent resolution against incidental state.
 (.sys.exec "rm -rf /tmp/rfl_symres /tmp/rfl_symres_solo /tmp/rfl_symres_nosym /tmp/rfl_symres_loud /tmp/rfl_symres_vocab")
 
 ;; ── 1. partition writes land in the parted ROOT's sym ──────────────────
 ;; No explicit sym argument: the partition-shaped parent (2024.01.0x)
-;; derives the parted root; both partitions encode against root/sym.
+;; derives the parted root; both partitions encode against root/.sym.
 (set H0 (table [s v] (list [ibm aapl msft] [1 2 3])))
 (set H1 (table [s v] (list [aapl goog] [4 5])))
 (.db.splayed.set "/tmp/rfl_symres/2024.01.01/hist/" H0)
 (.db.splayed.set "/tmp/rfl_symres/2024.01.02/hist/" H1)
-(> (.os.size "/tmp/rfl_symres/sym") 0) -- true
+(> (.os.size "/tmp/rfl_symres/.sym") 0) -- true
 ;; no per-partition symfiles exist (partitions have no own domain)
-(.os.size "/tmp/rfl_symres/2024.01.01/hist/sym") !- io
-(.os.size "/tmp/rfl_symres/2024.01.02/hist/sym") !- io
+(.os.size "/tmp/rfl_symres/2024.01.01/hist/.sym") !- io
+(.os.size "/tmp/rfl_symres/2024.01.02/hist/.sym") !- io
 (count (.db.parted.get "/tmp/rfl_symres/" 'hist)) -- 5
 
-;; ── 2. a standalone splayed table writes dir/sym ────────────────────────
+;; ── 2. a standalone splayed table writes dir/.sym ────────────────────────
 (set Solo (table [s] (list [solo_a solo_b])))
 (.db.splayed.set "/tmp/rfl_symres_solo/t" Solo)
-(> (.os.size "/tmp/rfl_symres_solo/t/sym") 0) -- true
+(> (.os.size "/tmp/rfl_symres_solo/t/.sym") 0) -- true
 (at (at (.db.splayed.get "/tmp/rfl_symres_solo/t") 's) 1) -- 'solo_b
 
 ;; ── 3. NO ROOT-WALK for plain dirs (the post-flip difference) ───────────
-;; A splayed table at a root that already has root/sym does NOT pick it
-;; up implicitly.  Default write -> dir/sym created next to the data:
+;; A splayed table at a root that already has root/.sym does NOT pick it
+;; up implicitly.  Default write -> dir/.sym created next to the data:
 (set L (table [s p] (list [msft tsla] [10.0 30.0])))
 (.db.splayed.set "/tmp/rfl_symres/live" L)
-(> (.os.size "/tmp/rfl_symres/live/sym") 0) -- true
+(> (.os.size "/tmp/rfl_symres/live/.sym") 0) -- true
 (at (at (.db.splayed.get "/tmp/rfl_symres/live") 's) 1) -- 'tsla
 
 ;; Sharing the root sym requires the EXPLICIT argument:
-(.db.splayed.set "/tmp/rfl_symres/live2" L "/tmp/rfl_symres/sym")
+(.db.splayed.set "/tmp/rfl_symres/live2" L "/tmp/rfl_symres/.sym")
 ;; no dir-local symfile was written for the shared table...
-(.os.size "/tmp/rfl_symres/live2/sym") !- io
+(.os.size "/tmp/rfl_symres/live2/.sym") !- io
 ;; ...and the default READ must not walk to the root either: nothing
-;; resolves -> loud sym error, even though /tmp/rfl_symres/sym exists
+;; resolves -> loud sym error, even though /tmp/rfl_symres/.sym exists
 (.db.splayed.get "/tmp/rfl_symres/live2") !- sym
 ;; with the explicit argument it loads and shares the root domain
-(set L2 (.db.splayed.get "/tmp/rfl_symres/live2" "/tmp/rfl_symres/sym"))
+(set L2 (.db.splayed.get "/tmp/rfl_symres/live2" "/tmp/rfl_symres/.sym"))
 (at (at L2 's) 0) -- 'msft
 
 ;; joins across the shared domain work: hist x live2 overlap on msft
@@ -52,26 +52,26 @@
 (sum (at IJ 'v)) -- 3
 (sum (at IJ 'p)) -- 10.0
 
-;; ── 4. explicit sym always wins over a present dir/sym ──────────────────
+;; ── 4. explicit sym always wins over a present dir/.sym ──────────────────
 ;; live still has its dir-local symfile from the default write above.
-;; Re-save it against the ROOT sym: the old live/sym remains on disk as
+;; Re-save it against the ROOT sym: the old live/.sym remains on disk as
 ;; a decoy (save sweeps stale columns but never symfiles); an explicit
 ;; read must use the explicit path, not the decoy.
-(.db.splayed.set "/tmp/rfl_symres/live" L "/tmp/rfl_symres/sym")
-(> (.os.size "/tmp/rfl_symres/live/sym") 0) -- true
-(at (at (.db.splayed.get "/tmp/rfl_symres/live" "/tmp/rfl_symres/sym") 's) 1) -- 'tsla
+(.db.splayed.set "/tmp/rfl_symres/live" L "/tmp/rfl_symres/.sym")
+(> (.os.size "/tmp/rfl_symres/live/.sym") 0) -- true
+(at (at (.db.splayed.get "/tmp/rfl_symres/live" "/tmp/rfl_symres/.sym") 's) 1) -- 'tsla
 
 ;; ── 5. symbol-free table: no symfile written, loads fine ────────────────
 (set N (table [a b] (list [1 2 3] [1.5 2.5 3.5])))
 (.db.splayed.set "/tmp/rfl_symres_nosym/t" N)
-(.os.size "/tmp/rfl_symres_nosym/t/sym") !- io
+(.os.size "/tmp/rfl_symres_nosym/t/.sym") !- io
 (count (.db.splayed.get "/tmp/rfl_symres_nosym/t")) -- 3
 (sum (at (.db.splayed.get "/tmp/rfl_symres_nosym/t") 'a)) -- 6
 
 ;; ── 6. loud `sym` error when the symfile is removed under SYM data ──────
 (set Loud (table [s] (list [aa bb])))
 (.db.splayed.set "/tmp/rfl_symres_loud/t" Loud)
-(.sys.exec "rm -f /tmp/rfl_symres_loud/t/sym") -- 0
+(.sys.exec "rm -f /tmp/rfl_symres_loud/t/.sym") -- 0
 (.db.splayed.get "/tmp/rfl_symres_loud/t") !- sym
 
 ;; ── 7. the symfile holds the TABLE's vocabulary, not the dictionary ─────
@@ -81,7 +81,7 @@
 (count (distinct (as 'symbol (til 500)))) -- 500
 (set V (table [s] (list [va vb vc])))
 (.db.splayed.set "/tmp/rfl_symres_vocab/t" V)
-(< (.os.size "/tmp/rfl_symres_vocab/t/sym") 100) -- true
+(< (.os.size "/tmp/rfl_symres_vocab/t/.sym") 100) -- true
 (at (at (.db.splayed.get "/tmp/rfl_symres_vocab/t") 's) 2) -- 'vc
 
 ;; ── cleanup ──────────────────────────────────────────────────────────────
