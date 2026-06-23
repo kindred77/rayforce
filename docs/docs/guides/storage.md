@@ -154,7 +154,7 @@ db/
 
 The loader:
 
-1. Loads the shared `sym` file from `db_root`
+1. Loads the shared `.sym` file from `db_root`
 2. Discovers date directories (sorted numerically)
 3. Loads each partition as a splayed table
 4. Adds a virtual `Date` column from the directory name

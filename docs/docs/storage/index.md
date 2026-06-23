@@ -284,9 +284,19 @@ Loads a date-partitioned table. The first argument is the database root director
 
 This scans all date-named subdirectories under `db/trades/`, memory-maps every column, and returns a single table with a virtual date column. Partition pruning applies to subsequent queries.
 
+### `.db.parted.tables` — List a Root's Table Names
+
+Returns a sorted `sym` vector of the table names available under a partitioned database root — the table subdirectories of the first partition. Each name can be passed straight to `.db.parted.get`; nothing is loaded by this call.
+
+```lisp
+; Discover which tables live under db/, then load each one
+(.db.parted.tables "db")                ; => [`quotes `trades]
+(map (fn [t] (.db.parted.get "db" t)) (.db.parted.tables "db"))
+```
+
 ## Symbol Table Management
 
-Symbol tables are persisted automatically when you use `.db.splayed.set`. A `sym` file is written into the table directory containing all interned symbol strings. When loading with `.db.splayed.get` or `.db.parted.get`, the symbol table is loaded first so that symbol columns decode correctly.
+Symbol tables are persisted automatically when you use `.db.splayed.set`. A `.sym` file is written into the table directory containing all interned symbol strings. When loading with `.db.splayed.get` or `.db.parted.get`, the symbol table is loaded first so that symbol columns decode correctly.
 
 At the C API level, `ray_sym_save(path)` and `ray_sym_load(path)` handle persistence directly. The format is append-only — new symbols are appended without rewriting existing entries, making concurrent access safe.
 
