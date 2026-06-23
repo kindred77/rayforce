@@ -14,7 +14,7 @@ on:
       - 'docs/**'
       - 'overrides/**'
       - 'mkdocs.yml'
-      - 'requirements-docs.txt'
+      - '.github/requirements-docs.txt'
       - '.github/workflows/pages.yml'
   workflow_dispatch:
 
@@ -36,9 +36,9 @@ jobs:
         with:
           python-version: '3.12'
           cache: pip
-          cache-dependency-path: requirements-docs.txt
+          cache-dependency-path: .github/requirements-docs.txt
       - name: Install MkDocs Material
-        run: pip install -r requirements-docs.txt
+        run: pip install -r .github/requirements-docs.txt
       - name: Build site (MkDocs)
         run: mkdocs build --strict
       - uses: actions/configure-pages@v4
