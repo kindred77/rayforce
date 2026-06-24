@@ -18,12 +18,15 @@
 ;; with leading-dot magic" bookkeeping.
 (type .sys) -- 'DICT
 (type .os) -- 'DICT
+(type .fs) -- 'DICT
 (type .ipc) -- 'DICT
 (type .csv) -- 'DICT
 (count .sys) -- 10
 ;; gc, exec, build, mem, info, cmd, timeit, listen, env, args
-(count .os) -- 4
-;; getenv, setenv, size, list
+(count .os) -- 2
+;; getenv, setenv
+(count .fs) -- 2
+;; size, list
 (count .ipc) -- 5
 ;; open, close, send, post, handle
 (count .csv) -- 4
@@ -53,6 +56,8 @@
 (nil? (resolve '.sys.gc)) -- false
 (nil? (resolve '.sys.info)) -- false
 (nil? (resolve '.os.getenv)) -- false
+(nil? (resolve '.fs.size)) -- false
+(nil? (resolve '.fs.list)) -- false
 (nil? (resolve '.csv.read)) -- false
 (nil? (resolve '.csv.splayed)) -- false
 (nil? (resolve '.csv.parted)) -- false

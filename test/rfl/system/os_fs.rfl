@@ -1,4 +1,4 @@
-;; .os.size and .os.list — filesystem metadata primitives, issue #36.
+;; .fs.size and .fs.list — filesystem metadata primitives, issue #36.
 ;;
 ;; Two functions on purpose: every other predicate (exists, is-file,
 ;; is-dir) is reachable via `try` against these or via the shell
@@ -15,41 +15,41 @@
 (.sys.exec "printf 'hello world\\n' > /tmp/rf_os_fs_test/file.txt")
 (.sys.exec "touch /tmp/rf_os_fs_test/sub/a /tmp/rf_os_fs_test/sub/c /tmp/rf_os_fs_test/sub/b")
 
-;; ────────────── .os.size: regular file ──────────────
-(.os.size "/tmp/rf_os_fs_test/file.txt") -- 12   ;; "hello world\n"
+;; ────────────── .fs.size: regular file ──────────────
+(.fs.size "/tmp/rf_os_fs_test/file.txt") -- 12   ;; "hello world\n"
 
-;; ────────────── .os.size: directory and missing both error ──────────────
+;; ────────────── .fs.size: directory and missing both error ──────────────
 ;; Same error category ("io") so try/catch can treat them uniformly
 ;; — the error message distinguishes when a human is looking.
-(.os.size "/tmp/rf_os_fs_test")           !- io
-(.os.size "/tmp/rf_os_fs_test/nope.txt")  !- io
+(.fs.size "/tmp/rf_os_fs_test")           !- io
+(.fs.size "/tmp/rf_os_fs_test/nope.txt")  !- io
 
-;; ────────────── .os.list: directory entries, sorted ──────────────
+;; ────────────── .fs.list: directory entries, sorted ──────────────
 ;; readdir order is filesystem-defined; we sort so tests are stable
 ;; and `..` / `.` are filtered.  The fixture above writes a c b in
 ;; non-sorted order to prove the sort actually runs.
-(.os.list "/tmp/rf_os_fs_test/sub")  -- ['a 'b 'c]
-(.os.list "/tmp/rf_os_fs_test")      -- ['file.txt 'sub]
+(.fs.list "/tmp/rf_os_fs_test/sub")  -- ['a 'b 'c]
+(.fs.list "/tmp/rf_os_fs_test")      -- ['file.txt 'sub]
 
-;; ────────────── .os.list: file and missing both error ──────────────
-(.os.list "/tmp/rf_os_fs_test/file.txt") !- io
-(.os.list "/tmp/rf_os_fs_test/nope")     !- io
+;; ────────────── .fs.list: file and missing both error ──────────────
+(.fs.list "/tmp/rf_os_fs_test/file.txt") !- io
+(.fs.list "/tmp/rf_os_fs_test/nope")     !- io
 
 ;; ────────────── existence-check via try ──────────────
 ;; The motivating idiom: probe size, swallow the error.  Truthy →
 ;; the path is a regular file with a knowable size.
-(try (>= (.os.size "/tmp/rf_os_fs_test/file.txt") 0) (fn [_] false))  -- true
-(try (>= (.os.size "/tmp/rf_os_fs_test/nope")     0) (fn [_] false))  -- false
+(try (>= (.fs.size "/tmp/rf_os_fs_test/file.txt") 0) (fn [_] false))  -- true
+(try (>= (.fs.size "/tmp/rf_os_fs_test/nope")     0) (fn [_] false))  -- false
 
 ;; ────────────── is-dir discriminator via try ──────────────
-;; .os.list errors on non-directories, so a successful list (even
+;; .fs.list errors on non-directories, so a successful list (even
 ;; empty) is the directory marker.
-(try (do (.os.list "/tmp/rf_os_fs_test/sub") true) (fn [_] false))  -- true
-(try (do (.os.list "/tmp/rf_os_fs_test/file.txt") true) (fn [_] false))  -- false
+(try (do (.fs.list "/tmp/rf_os_fs_test/sub") true) (fn [_] false))  -- true
+(try (do (.fs.list "/tmp/rf_os_fs_test/file.txt") true) (fn [_] false))  -- false
 
 ;; ────────────── argument validation ──────────────
-(.os.size 5)      !- type
-(.os.list 'foo)   !- type
+(.fs.size 5)      !- type
+(.fs.list 'foo)   !- type
 
 ;; ────────────── teardown ──────────────
 (.sys.exec "rm -rf /tmp/rf_os_fs_test")
