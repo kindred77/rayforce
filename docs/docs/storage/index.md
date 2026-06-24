@@ -6,6 +6,8 @@ Columnar file I/O, splayed tables, date-partitioned storage, symbol table persis
 
 Rayforce's native binary format stores a single vector per file. Each file contains a 32-byte header followed by the raw element data and an optional null bitmap. The format is designed for direct memory mapping — no deserialization needed.
 
+The header carries a single-byte format generation. The current generation is `0`, and data written by any prior engine that produced the same layout (also generation `0`) loads unchanged — no migration required. A file whose generation the reader does not recognize is refused with a `version` error rather than mis-read; a future breaking layout change bumps the generation so old files are rejected for migration instead of silently misinterpreted.
+
 ### File Structure
 
 ```c
