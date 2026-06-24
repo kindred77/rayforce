@@ -286,12 +286,23 @@ This scans all date-named subdirectories under `db/trades/`, memory-maps every c
 
 ### `.db.parted.tables` — List a Root's Table Names
 
-Returns a sorted `sym` vector of the table names available under a partitioned database root — the table subdirectories of the first partition. Each name can be passed straight to `.db.parted.get`; nothing is loaded by this call.
+Returns a sorted `sym` vector of the table names available under a partitioned database root — the table subdirectories of the **most recent** (last, sorted) partition, which reflects the current table set. Each name can be passed straight to `.db.parted.get`; nothing is loaded by this call.
 
 ```lisp
 ; Discover which tables live under db/, then load each one
 (.db.parted.tables "db")                ; => [`quotes `trades]
 (map (fn [t] (.db.parted.get "db" t)) (.db.parted.tables "db"))
+```
+
+### `.db.parted.fill` — Backfill Missing Tables Across Partitions
+
+For every table present in **any** partition, ensures **every** partition has it: a partition missing the table gets an **empty** copy whose schema is taken from the most recent partition that has it. This keeps queries that span partitions from failing on a partition where a table is absent — typically a table added partway through the database's life. Returns a sorted `sym` vector of the partition names it filled (empty when nothing needed fixing, so a repeat call is a no-op). Requires write permission on the root.
+
+```lisp
+; `news` was only added from 2024.01.10 onward; backfill the earlier days.
+(.db.parted.fill "db")                  ; => [`2024.01.01 … `2024.01.09]
+; now every partition has every table — the empty copies add no rows.
+(count (.db.parted.get "db" 'news))     ; unchanged
 ```
 
 ## Symbol Table Management

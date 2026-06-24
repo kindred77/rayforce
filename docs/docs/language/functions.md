@@ -352,6 +352,8 @@ Cross-temporal comparisons are supported: dates, times, and timestamps are all c
 | `.db.splayed.set` | variadic | Save table as splayed columns to directory | `(.db.splayed.set "db/trades" trades)` |
 | `.db.splayed.get` | variadic | Load splayed table from directory | `(.db.splayed.get "db/trades")` |
 | `.db.parted.get` | variadic | Load partitioned table by name from root directory | `(.db.parted.get "db" 'trades)` |
+| `.db.parted.tables` | variadic | List table names under a parted root | `(.db.parted.tables "db")` |
+| `.db.parted.fill` | variadic | Backfill missing tables across partitions | `(.db.parted.fill "db")` |
 
 ## EAV (Entity-Attribute-Value)
 

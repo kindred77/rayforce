@@ -44,8 +44,16 @@
 (set h2 (.ipc.open "127.0.0.1:19998"))
 (>= h2 0) -- true
 (* 6 7) -- (.ipc.send h2 "(* 6 7)")
+(.ipc.close h2)
+
+;; ── "localhost" must connect even though the server is IPv4-only ──
+;; localhost often resolves to ::1 (IPv6) first; ray_sock_connect now tries
+;; every resolved address, so it falls through to 127.0.0.1.
+(set h3 (.ipc.open "localhost:19998"))
+(>= h3 0) -- true
+(- 9 4) -- (.ipc.send h3 "(- 9 4)")
 
 ;; ── teardown ───────────────────────────────────────────────────────
-(try (.ipc.send h2 "(exit 0)") (fn [e] 0))
-(.ipc.close h2)
+(try (.ipc.send h3 "(exit 0)") (fn [e] 0))
+(.ipc.close h3)
 (.sys.exec "sleep 0.1; pkill -KILL -f 'rayforce -p 19998' 2>/dev/null; true")

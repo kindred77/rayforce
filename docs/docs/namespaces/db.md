@@ -18,6 +18,7 @@ The `get` builtins memory-map every column file — load is constant-time regard
 | [`.db.splayed.get`](#db-splayed-get) | variadic | — | Load a splayed table (columns mmap'd). |
 | [`.db.parted.get`](#db-parted-get) | variadic | — | Load a partitioned table by name from a db root. |
 | [`.db.parted.tables`](#db-parted-tables) | variadic | — | List the table names available under a parted db root. |
+| [`.db.parted.fill`](#db-parted-fill) | variadic | restricted | Fill missing tables across a parted db's partitions. |
 
 ## `.db.splayed.set` { #db-splayed-set }
 
@@ -70,7 +71,7 @@ Errors: `domain` (arity != 2 or `tbl_name` invalid), `type` (root not a string o
 
 Signature: `(.db.parted.tables "db_root")`.
 
-Returns a sorted `sym` vector of the table names available under a parted `db_root` — the splayed-table subdirectories (those with a `.d` schema) of the first partition. Each name can be passed straight to `.db.parted.get`; nothing is loaded or bound by this call.
+Returns a sorted `sym` vector of the table names available under a parted `db_root` — the splayed-table subdirectories (those with a `.d` schema) of the **most recent** (last, sorted) partition, which reflects the current table set. Each name can be passed straight to `.db.parted.get`; nothing is loaded or bound by this call.
 
 ```lisp
 (.db.parted.tables "/data/db")
@@ -81,6 +82,25 @@ Returns a sorted `sym` vector of the table names available under a parted `db_ro
 ```
 
 Errors: `domain` (arity != 1), `type` (root not a string), `io` (root unreadable or not a parted root — no partition directories).
+
+## `.db.parted.fill` { #db-parted-fill }
+
+Signature: `(.db.parted.fill "db_root")`.
+
+For every table that appears in **any** partition, ensures **every** partition has it: a partition missing the table gets an **empty** copy whose schema is taken from the most recent partition that does have it. This keeps `select`s that span partitions from failing on a partition where a table is absent — the typical case being a table added partway through the database's life, or a partition written before that table existed.
+
+Returns a sorted `sym` vector of the partition names that were filled (an **empty** vector when nothing needed fixing, so a repeat call is a no-op). Requires write permission on the db root.
+
+```lisp
+;; trades exists in every day, but `news` was only added from 2024.01.10 on.
+(.db.parted.fill "/data/db")
+;; => [`2024.01.01 `2024.01.02 … `2024.01.09]   ; days that gained an empty `news`
+
+;; now every partition has every table; cross-partition queries are safe.
+(select {from: (.db.parted.get "/data/db" 'news)})
+```
+
+The filled copies are empty, so aggregate results across the db are unchanged — only the on-disk uniformity is. Errors: `domain` (arity != 1), `type` (root not a string), `io` (not a parted root), plus any `oom`/`corrupt` surfaced while reading a template or writing a copy.
 
 ## See also
 

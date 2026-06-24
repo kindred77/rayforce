@@ -7,7 +7,7 @@
 
 ;; .db.splayed.set sweeps stale files and commits .d last, so re-setting
 ;; over a previous run is safe; the wipe below just isolates fixtures.
-(.sys.exec "rm -rf /tmp/rfl_get_splayed /tmp/rfl_get_parted")
+(.sys.exec "rm -rf /tmp/rfl_get_splayed /tmp/rfl_get_parted /tmp/rfl_get_parted2")
 
 ;; ────────────── several splayed tables under one root ──────────────
 (set Trades  (table [s p] (list ['AAPL 'GOOG] [100.0 200.0])))
@@ -83,8 +83,8 @@
 (max (at B 'v)) -- 8
 
 ;; ────────────── .db.parted.tables: discover the table names ──────────────
-;; Returns the splayed-table subdirectories of the first partition as a
-;; sorted SYM vector — usable directly with .db.parted.get, no binding.
+;; Returns the splayed-table subdirectories of the LAST (most recent)
+;; partition as a sorted SYM vector — usable directly with .db.parted.get.
 (.db.parted.tables "/tmp/rfl_get_parted/")        -- ['A 'B]
 (count (.db.parted.tables "/tmp/rfl_get_parted/")) -- 2
 ;; a discovered name feeds straight back into .db.parted.get.
@@ -92,6 +92,16 @@
 ;; not a parted root (splayed root has no partition dirs) -> io error.
 (.db.parted.tables "/tmp/rfl_get_splayed/")        !- io
 (.db.parted.tables "/tmp/rfl_get_does_not_exist/") !- io
+
+;; .db.parted.tables reads the LAST partition, so a table added in a later
+;; partition is discovered, and one present only in the OLDEST partition is
+;; not listed.  Root: 01.01 = {A, OLD}; 01.02 (last) = {A, NEW}.
+(set TX (table [s v] (list ['a] [1])))
+(.db.splayed.set "/tmp/rfl_get_parted2/2024.01.01/A/"   TX)
+(.db.splayed.set "/tmp/rfl_get_parted2/2024.01.01/OLD/" TX)
+(.db.splayed.set "/tmp/rfl_get_parted2/2024.01.02/A/"   TX)
+(.db.splayed.set "/tmp/rfl_get_parted2/2024.01.02/NEW/" TX)
+(.db.parted.tables "/tmp/rfl_get_parted2/") -- ['A 'NEW]
 
 ;; ────────────── error path: not a parted root ──────────────
 ;; The splayed root from the first test has no partition directories,

@@ -1,0 +1,46 @@
+;; .db.parted.fill — fill missing tables across a parted db's partitions.
+;;
+;; For every table present in ANY partition, write an empty copy (schema
+;; from the most recent partition that has it) into every partition that
+;; lacks it, so cross-partition queries never fail on a missing table.
+;; Returns a sorted SYM vector of the partition names that were filled.
+
+(.sys.exec "rm -rf /tmp/rfl_fill")
+
+;; Layout (A everywhere; B only in the oldest; C only in the newest):
+;;   2024.01.01 : {A, B}
+;;   2024.01.02 : {A}
+;;   2024.01.03 : {A, C}
+(set TA (table [s v] (list ['x 'y] [1 2])))
+(set TB (table [s v] (list ['p 'q] [10 20])))
+(set TC (table [s v] (list ['m] [99])))
+(.db.splayed.set "/tmp/rfl_fill/2024.01.01/A/" TA)
+(.db.splayed.set "/tmp/rfl_fill/2024.01.01/B/" TB)
+(.db.splayed.set "/tmp/rfl_fill/2024.01.02/A/" TA)
+(.db.splayed.set "/tmp/rfl_fill/2024.01.03/A/" TA)
+(.db.splayed.set "/tmp/rfl_fill/2024.01.03/C/" TC)
+
+;; Before fill, the newest partition only knows A and C.
+(.db.parted.tables "/tmp/rfl_fill/") -- ['A 'C]
+
+;; Fill: B is missing from 01.02 and 01.03; C is missing from 01.01 and
+;; 01.02 — so all three partitions get at least one table created.
+(.db.parted.fill "/tmp/rfl_fill/") -- ['2024.01.01 '2024.01.02 '2024.01.03]
+
+;; The newest partition now carries every table.
+(.db.parted.tables "/tmp/rfl_fill/") -- ['A 'B 'C]
+
+;; Filled copies are EMPTY, so cross-partition totals are unchanged:
+;; B has only the 2 rows from 01.01, C only the 1 row from 01.03, A all 6.
+(count (.db.parted.get "/tmp/rfl_fill/" 'B)) -- 2
+(sum (at (.db.parted.get "/tmp/rfl_fill/" 'B) 'v)) -- 30
+(count (.db.parted.get "/tmp/rfl_fill/" 'C)) -- 1
+(count (.db.parted.get "/tmp/rfl_fill/" 'A)) -- 6
+
+;; Idempotent: a second fill finds nothing missing → empty result.
+(.db.parted.fill "/tmp/rfl_fill/") -- []
+
+;; Error paths: missing root and a non-parted (splayed) root.
+(.db.parted.fill "/tmp/rfl_fill_nope/") !- io
+
+(.sys.exec "rm -rf /tmp/rfl_fill")

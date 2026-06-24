@@ -6,8 +6,9 @@
 ;; comparison opcodes any hand-written range predicate would — inheriting
 ;; range-index rowsel, partition pruning, null handling and type promotion.
 ;;
-;; The range operand must be a compile-time-constant 2-element vector, the
-;; same literal constraint OP_IN's set operand has.
+;; The range is either a constant 2-element vector literal (e.g. [2 4]) or
+;; a 2-element `(list …)` / `(enlist …)` constructor — the latter lets the
+;; bounds be variables / runtime expressions (issue follow-up).
 
 ;; --------------------------------------------------------------------
 ;; I64 column — inclusive on both ends.
@@ -15,6 +16,14 @@
 (set t (table [sn] (list [1 2 3 4 5])))
 ;; sn in [2 4] → {2,3,4}.
 (at (select {from: t where: (within sn [2 4]) c: sn}) 'c) -- [2 3 4]
+;; Variable bounds via (list lo hi) and (enlist lo hi) — NOT a const vec,
+;; so these exercise the constructor-decomposition path.  (`[lo hi]` is a
+;; symbol-vector literal by design and is intentionally NOT supported.)
+(set lo 2) (set hi 4)
+(at (select {from: t where: (within sn (list lo hi)) c: sn}) 'c) -- [2 3 4]
+(at (select {from: t where: (within sn (enlist lo hi)) c: sn}) 'c) -- [2 3 4]
+;; Literal args inside the constructor work too.
+(at (select {from: t where: (within sn (list 2 4)) c: sn}) 'c) -- [2 3 4]
 ;; Equivalent hand-written range predicate produces the same rows.
 (at (select {from: t where: (and (>= sn 2) (<= sn 4)) c: sn}) 'c) -- [2 3 4]
 ;; Lower bound inclusive: [1 1] keeps exactly row 1.
