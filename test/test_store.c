@@ -744,11 +744,15 @@ static test_result_t test_parted_tables(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
     ray_release(tbl);
 
-    /* A non-parted root (no partition dirs) is an error, not empty. */
+    /* An existing-but-empty root (no partition dirs) lists no tables —
+     * an empty SYM vector, not an error. */
     (void)!system("rm -rf " TMP_PART_DB "_np && mkdir -p " TMP_PART_DB "_np");
-    ray_t* err = ray_parted_tables(TMP_PART_DB "_np");
-    TEST_ASSERT_TRUE(err != NULL && RAY_IS_ERR(err));
-    ray_error_free(err);
+    ray_t* empty = ray_parted_tables(TMP_PART_DB "_np");
+    TEST_ASSERT_NOT_NULL(empty);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(empty));
+    TEST_ASSERT_EQ_I(empty->type, RAY_SYM);
+    TEST_ASSERT_EQ_I(empty->len, 0);
+    ray_release(empty);
     (void)!system("rm -rf " TMP_PART_DB "_np");
 
     (void)!system("rm -rf " TMP_PART_DB);

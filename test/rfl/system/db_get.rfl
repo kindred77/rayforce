@@ -89,8 +89,15 @@
 (count (.db.parted.tables "/tmp/rfl_get_parted/")) -- 2
 ;; a discovered name feeds straight back into .db.parted.get.
 (count (.db.parted.get "/tmp/rfl_get_parted/" (at (.db.parted.tables "/tmp/rfl_get_parted/") 0))) -- 4
-;; not a parted root (splayed root has no partition dirs) -> io error.
-(.db.parted.tables "/tmp/rfl_get_splayed/")        !- io
+;; existing-but-empty root (splayed root has no partition dirs) -> empty
+;; list, not an error.  A directory that simply isn't a parted db lists
+;; zero tables; that's friendlier than failing.
+(count (.db.parted.tables "/tmp/rfl_get_splayed/")) -- 0
+;; a freshly-created empty directory likewise lists nothing.
+(.sys.exec "mkdir -p /tmp/rfl_get_empty")
+(count (.db.parted.tables "/tmp/rfl_get_empty")) -- 0
+(.sys.exec "rm -rf /tmp/rfl_get_empty")
+;; a genuinely missing directory is still an io error (opendir fails).
 (.db.parted.tables "/tmp/rfl_get_does_not_exist/") !- io
 
 ;; .db.parted.tables reads the LAST partition, so a table added in a later

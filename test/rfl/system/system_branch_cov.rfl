@@ -62,40 +62,40 @@
 ;; ══════════════════════════════════════════════════════════════════════
 ;; ray_os_size_fn  (lines 338-349)
 ;; ══════════════════════════════════════════════════════════════════════
-(.os.size [1 2 3]) !- type
-(.os.size 'foo) !- type
-(.os.size "/tmp/rfl_sys_bc_nofile.txt") !- io
-(.os.size "/tmp") !- io
+(.fs.size [1 2 3]) !- type
+(.fs.size 'foo) !- type
+(.fs.size "/tmp/rfl_sys_bc_nofile.txt") !- io
+(.fs.size "/tmp") !- io
 (.sys.exec "touch /tmp/rfl_sys_bc_empty.txt")
-(.os.size "/tmp/rfl_sys_bc_empty.txt") -- 0
+(.fs.size "/tmp/rfl_sys_bc_empty.txt") -- 0
 (.sys.exec "printf 'abcdef' > /tmp/rfl_sys_bc_6bytes.txt")
-(.os.size "/tmp/rfl_sys_bc_6bytes.txt") -- 6
+(.fs.size "/tmp/rfl_sys_bc_6bytes.txt") -- 6
 
 ;; ══════════════════════════════════════════════════════════════════════
 ;; ray_os_list_fn  (lines 365-425)
 ;; ══════════════════════════════════════════════════════════════════════
-(.os.list [1 2]) !- type
-(.os.list 42) !- type
-(.os.list "/tmp/rfl_sys_bc_nosuchdir/") !- io
-(.os.list "/tmp/rfl_sys_bc_empty.txt") !- io
+(.fs.list [1 2]) !- type
+(.fs.list 42) !- type
+(.fs.list "/tmp/rfl_sys_bc_nosuchdir/") !- io
+(.fs.list "/tmp/rfl_sys_bc_empty.txt") !- io
 ;; Directory with a single file
 (.sys.exec "mkdir -p /tmp/rfl_sys_bc_onefile/ && touch /tmp/rfl_sys_bc_onefile/x")
-(count (.os.list "/tmp/rfl_sys_bc_onefile/")) -- 1
-(.os.list "/tmp/rfl_sys_bc_onefile/") -- [x]
+(count (.fs.list "/tmp/rfl_sys_bc_onefile/")) -- 1
+(.fs.list "/tmp/rfl_sys_bc_onefile/") -- [x]
 ;; dot-prefixed entries (not . or ..) ARE listed
 (.sys.exec "touch /tmp/rfl_sys_bc_onefile/.hidden")
-(count (.os.list "/tmp/rfl_sys_bc_onefile/")) -- 2
+(count (.fs.list "/tmp/rfl_sys_bc_onefile/")) -- 2
 ;; sorted symbol vector: ".hidden" sorts before "x"
-(.os.list "/tmp/rfl_sys_bc_onefile/") -- ['.hidden 'x]
+(.fs.list "/tmp/rfl_sys_bc_onefile/") -- ['.hidden 'x]
 ;; > 16 entries triggers realloc growth path
 (.sys.exec "mkdir -p /tmp/rfl_sys_bc_bigdir && cd /tmp/rfl_sys_bc_bigdir && for i in $(seq 1 20); do touch f_$(printf '%02d' $i); done")
-(count (.os.list "/tmp/rfl_sys_bc_bigdir/")) -- 20
+(count (.fs.list "/tmp/rfl_sys_bc_bigdir/")) -- 20
 ;; entries are sorted: first is f_01, last is f_20
-(first (.os.list "/tmp/rfl_sys_bc_bigdir/")) -- 'f_01
-(last (.os.list "/tmp/rfl_sys_bc_bigdir/")) -- 'f_20
+(first (.fs.list "/tmp/rfl_sys_bc_bigdir/")) -- 'f_01
+(last (.fs.list "/tmp/rfl_sys_bc_bigdir/")) -- 'f_20
 ;; Empty directory — previously triggered qsort(NULL, 0, ...) UB.
 (.sys.exec "mkdir -p /tmp/rfl_sys_bc_emptydir")
-(count (.os.list "/tmp/rfl_sys_bc_emptydir/")) -- 0
+(count (.fs.list "/tmp/rfl_sys_bc_emptydir/")) -- 0
 (.sys.exec "rm -rf /tmp/rfl_sys_bc_emptydir")
 
 ;; ══════════════════════════════════════════════════════════════════════

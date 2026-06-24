@@ -14,16 +14,16 @@
 (set H1 (table [s v] (list [aapl goog] [4 5])))
 (.db.splayed.set "/tmp/rfl_symres/2024.01.01/hist/" H0)
 (.db.splayed.set "/tmp/rfl_symres/2024.01.02/hist/" H1)
-(> (.os.size "/tmp/rfl_symres/.sym") 0) -- true
+(> (.fs.size "/tmp/rfl_symres/.sym") 0) -- true
 ;; no per-partition symfiles exist (partitions have no own domain)
-(.os.size "/tmp/rfl_symres/2024.01.01/hist/.sym") !- io
-(.os.size "/tmp/rfl_symres/2024.01.02/hist/.sym") !- io
+(.fs.size "/tmp/rfl_symres/2024.01.01/hist/.sym") !- io
+(.fs.size "/tmp/rfl_symres/2024.01.02/hist/.sym") !- io
 (count (.db.parted.get "/tmp/rfl_symres/" 'hist)) -- 5
 
 ;; ── 2. a standalone splayed table writes dir/.sym ────────────────────────
 (set Solo (table [s] (list [solo_a solo_b])))
 (.db.splayed.set "/tmp/rfl_symres_solo/t" Solo)
-(> (.os.size "/tmp/rfl_symres_solo/t/.sym") 0) -- true
+(> (.fs.size "/tmp/rfl_symres_solo/t/.sym") 0) -- true
 (at (at (.db.splayed.get "/tmp/rfl_symres_solo/t") 's) 1) -- 'solo_b
 
 ;; ── 3. NO ROOT-WALK for plain dirs (the post-flip difference) ───────────
@@ -31,13 +31,13 @@
 ;; up implicitly.  Default write -> dir/.sym created next to the data:
 (set L (table [s p] (list [msft tsla] [10.0 30.0])))
 (.db.splayed.set "/tmp/rfl_symres/live" L)
-(> (.os.size "/tmp/rfl_symres/live/.sym") 0) -- true
+(> (.fs.size "/tmp/rfl_symres/live/.sym") 0) -- true
 (at (at (.db.splayed.get "/tmp/rfl_symres/live") 's) 1) -- 'tsla
 
 ;; Sharing the root sym requires the EXPLICIT argument:
 (.db.splayed.set "/tmp/rfl_symres/live2" L "/tmp/rfl_symres/.sym")
 ;; no dir-local symfile was written for the shared table...
-(.os.size "/tmp/rfl_symres/live2/.sym") !- io
+(.fs.size "/tmp/rfl_symres/live2/.sym") !- io
 ;; ...and the default READ must not walk to the root either: nothing
 ;; resolves -> loud sym error, even though /tmp/rfl_symres/.sym exists
 (.db.splayed.get "/tmp/rfl_symres/live2") !- sym
@@ -58,13 +58,13 @@
 ;; a decoy (save sweeps stale columns but never symfiles); an explicit
 ;; read must use the explicit path, not the decoy.
 (.db.splayed.set "/tmp/rfl_symres/live" L "/tmp/rfl_symres/.sym")
-(> (.os.size "/tmp/rfl_symres/live/.sym") 0) -- true
+(> (.fs.size "/tmp/rfl_symres/live/.sym") 0) -- true
 (at (at (.db.splayed.get "/tmp/rfl_symres/live" "/tmp/rfl_symres/.sym") 's) 1) -- 'tsla
 
 ;; ── 5. symbol-free table: no symfile written, loads fine ────────────────
 (set N (table [a b] (list [1 2 3] [1.5 2.5 3.5])))
 (.db.splayed.set "/tmp/rfl_symres_nosym/t" N)
-(.os.size "/tmp/rfl_symres_nosym/t/.sym") !- io
+(.fs.size "/tmp/rfl_symres_nosym/t/.sym") !- io
 (count (.db.splayed.get "/tmp/rfl_symres_nosym/t")) -- 3
 (sum (at (.db.splayed.get "/tmp/rfl_symres_nosym/t") 'a)) -- 6
 
@@ -81,7 +81,7 @@
 (count (distinct (as 'symbol (til 500)))) -- 500
 (set V (table [s] (list [va vb vc])))
 (.db.splayed.set "/tmp/rfl_symres_vocab/t" V)
-(< (.os.size "/tmp/rfl_symres_vocab/t/.sym") 100) -- true
+(< (.fs.size "/tmp/rfl_symres_vocab/t/.sym") 100) -- true
 (at (at (.db.splayed.get "/tmp/rfl_symres_vocab/t") 's) 2) -- 'vc
 
 ;; ── cleanup ──────────────────────────────────────────────────────────────
