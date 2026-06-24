@@ -23,7 +23,7 @@ Rayfall's builtins are organised under dotted namespaces. Names beginning with `
 When the server is started with `-U <password>`, the following dotted builtins are blocked (return an `access` error) for IPC peers — see [IPC restricted mode](../storage/ipc.md). Page-level admonitions on each namespace flag the exact builtins that carry the `RAY_FN_RESTRICTED` attribute.
 
 - `.csv.read`, `.csv.write`, `.csv.splayed`, `.csv.parted`
-- `.db.splayed.set`
+- `.db.splayed.set`, `.db.parted.fill`
 - `.ipc.open`, `.ipc.close`, `.ipc.send`
 - `.log.open`, `.log.replay`, `.log.roll`, `.log.snapshot`, `.log.close`
 - `.os.getenv`, `.os.setenv`

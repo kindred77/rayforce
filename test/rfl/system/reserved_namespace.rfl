@@ -37,11 +37,12 @@
 (type .db.parted) -- 'DICT
 (count .db) -- 2          ;; splayed, parted
 (count .db.splayed) -- 2  ;; set, get
-(count .db.parted) -- 2   ;; get, tables
+(count .db.parted) -- 3   ;; get, tables, fill
 (nil? (resolve '.db.splayed.set))    -- false
 (nil? (resolve '.db.splayed.get))    -- false
 (nil? (resolve '.db.parted.get))     -- false
 (nil? (resolve '.db.parted.tables))  -- false
+(nil? (resolve '.db.parted.fill))    -- false
 ;; REPL completion + syntax highlighting go through
 ;; ray_env_lookup_prefix scanning flat g_env keys.  The namespace
 ;; dicts alone don't satisfy that path, so every reserved builtin
