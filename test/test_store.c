@@ -4150,9 +4150,9 @@ static test_result_t test_col_str_pool_roundtrip(void) {
 }
 
 /* ---- test_col_format_version_roundtrip ---------------------------------- */
-/* FRESH-SWAP format: a saved column carries the format MAJOR version in the
- * 32-byte header's `order` byte (offset 17), with aux (bytes 0-15) ZERO on
- * disk (no magic — aux is reserved for postponed index persistence).  It
+/* A saved column carries the format generation in the 32-byte header's
+ * `order` byte (offset 17), with aux (bytes 0-15) ZERO on disk (no magic —
+ * aux is reserved for postponed index persistence).  It
  * round-trips through both ray_col_load (deep copy) and ray_col_mmap
  * (zero-copy) with value + attrs intact, and the on-disk version byte must
  * NOT leak into the in-memory runtime aux. */
@@ -4202,14 +4202,18 @@ static test_result_t test_col_format_version_roundtrip(void) {
 }
 
 /* ---- test_col_format_bad_version ---------------------------------------- */
-/* A file whose `order` byte (offset 17) does not match the reader's major
- * version must be rejected with a "version" error by both load + mmap. */
+/* The current format generation is 0 (RAY_COL_FORMAT_MAJOR).  Generation 0 is
+ * the shipped/legacy layout, so a zeroed order byte (offset 17) — pre-stamp
+ * data written by earlier engines — MUST load (regression: an earlier build
+ * demanded 1 and orphaned every pre-existing database with a "version" error).
+ * A file whose `order` byte is an UNRECOGNIZED generation is still rejected
+ * with a "version" error by both load + mmap. */
 static test_result_t test_col_format_bad_version(void) {
     int64_t raw[] = {1, 2, 3};
     ray_t* vec = ray_vec_from_raw(RAY_I64, raw, 3);
     TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
 
-    /* (a) zeroed version byte => "version". */
+    /* (a) generation 0 (legacy/unstamped order byte) => loads, value intact. */
     TEST_ASSERT_EQ_I(ray_col_save(vec, TMP_COL_PATH), RAY_OK);
     {
         FILE* f = fopen(TMP_COL_PATH, "r+b");
@@ -4220,15 +4224,16 @@ static test_result_t test_col_format_bad_version(void) {
         fclose(f);
     }
     ray_t* r1 = ray_col_load(TMP_COL_PATH);
-    TEST_ASSERT_TRUE(RAY_IS_ERR(r1));
-    TEST_ASSERT_STR_EQ(ray_err_code(r1), "version");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r1));
+    TEST_ASSERT_EQ_I(r1->len, 3);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(r1))[2], 3);
     ray_release(r1);
     ray_t* r2 = ray_col_mmap(TMP_COL_PATH);
-    TEST_ASSERT_TRUE(RAY_IS_ERR(r2));
-    TEST_ASSERT_STR_EQ(ray_err_code(r2), "version");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r2));
+    TEST_ASSERT_EQ_I(r2->len, 3);
     ray_release(r2);
 
-    /* (b) version bumped past the reader's major => "version". */
+    /* (b) an unrecognized generation => "version" (both load + mmap). */
     TEST_ASSERT_EQ_I(ray_col_save(vec, TMP_COL_PATH), RAY_OK);
     {
         FILE* f = fopen(TMP_COL_PATH, "r+b");
@@ -4238,10 +4243,14 @@ static test_result_t test_col_format_bad_version(void) {
         TEST_ASSERT_EQ_U(fwrite(&bad_ver, 1, 1, f), 1);
         fclose(f);
     }
-    ray_t* r3 = ray_col_mmap(TMP_COL_PATH);
+    ray_t* r3 = ray_col_load(TMP_COL_PATH);
     TEST_ASSERT_TRUE(RAY_IS_ERR(r3));
     TEST_ASSERT_STR_EQ(ray_err_code(r3), "version");
     ray_release(r3);
+    ray_t* r4 = ray_col_mmap(TMP_COL_PATH);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r4));
+    TEST_ASSERT_STR_EQ(ray_err_code(r4), "version");
+    ray_release(r4);
 
     ray_release(vec);
     unlink(TMP_COL_PATH);
