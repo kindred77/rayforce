@@ -81,7 +81,9 @@ Returns a sorted `sym` vector of the table names available under a parted `db_ro
 (map (fn [t] (.db.parted.get "/data/db" t)) (.db.parted.tables "/data/db"))
 ```
 
-Errors: `domain` (arity != 1), `type` (root not a string), `io` (root unreadable or not a parted root — no partition directories).
+An existing root with no partition directories (a freshly-created or non-parted directory) lists **no tables** — the call returns an empty `sym` vector rather than failing.
+
+Errors: `domain` (arity != 1), `type` (root not a string), `io` (root missing or unreadable — `opendir` fails).
 
 ## `.db.parted.fill` { #db-parted-fill }
 
@@ -100,7 +102,7 @@ Returns a sorted `sym` vector of the partition names that were filled (an **empt
 (select {from: (.db.parted.get "/data/db" 'news)})
 ```
 
-The filled copies are empty, so aggregate results across the db are unchanged — only the on-disk uniformity is. Errors: `domain` (arity != 1), `type` (root not a string), `io` (not a parted root), plus any `oom`/`corrupt` surfaced while reading a template or writing a copy.
+The filled copies are empty, so aggregate results across the db are unchanged — only the on-disk uniformity is. An existing root with no partition directories is a no-op: the call returns an empty `sym` vector. Errors: `domain` (arity != 1), `type` (root not a string), `io` (root missing or unreadable), plus any `oom`/`corrupt` surfaced while reading a template or writing a copy.
 
 ## See also
 
