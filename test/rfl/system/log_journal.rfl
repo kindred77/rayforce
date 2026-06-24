@@ -10,6 +10,15 @@
 ;; 19999 — `make test` is sequential so two server processes cannot
 ;; coexist on the same port anyway).
 ;;
+;; Readiness probe: each restart waits for the server by COMPLETING AN IPC
+;; HANDSHAKE (send the 2-byte version frame, read a response byte), not by a
+;; bare TCP connect.  A bare `echo > /dev/tcp` only proves listen(2) succeeded,
+;; which is reached before the server is actually accepting+handshaking; on the
+;; slow macOS-debug runner that gap let the probe report "ready" while the very
+;; next (set h .ipc.open) raced and failed with `io`.  Polling the real
+;; handshake makes the readiness signal match what .ipc.open needs.  `read -t2`
+;; bounds each attempt without the non-portable `timeout(1)` (absent on macOS).
+;;
 ;; Base path: /tmp/rftest_journal — anything starting with that prefix
 ;; is fair game for cleanup; we wipe it before AND after the run.
 ;;
@@ -30,7 +39,7 @@
 
 ;; ── phase 1: spawn server with -l, send mutations, kill ─────────────
 (.sys.exec "./rayforce -l /tmp/rftest_journal -p 19990 </dev/null >/dev/null 2>&1 &")
-(.sys.exec "for i in $(seq 30); do bash -c '(echo > /dev/tcp/127.0.0.1/19990) 2>/dev/null' && exit 0; sleep 0.1; done; exit 1") -- 0
+(.sys.exec "for i in $(seq 50); do bash -c 'exec 3<>/dev/tcp/127.0.0.1/19990 2>/dev/null && printf \"\\003\\000\" >&3 && read -t2 -n1 -u3 _' 2>/dev/null && exit 0; sleep 0.1; done; exit 1") -- 0
 
 (set h (.ipc.open "127.0.0.1:19990"))
 (>= h 0) -- true
@@ -60,7 +69,7 @@
 
 ;; ── phase 2: restart, assert replay restored a/b/c/d ────────────────
 (.sys.exec "./rayforce -l /tmp/rftest_journal -p 19990 </dev/null >/dev/null 2>&1 &")
-(.sys.exec "for i in $(seq 30); do bash -c '(echo > /dev/tcp/127.0.0.1/19990) 2>/dev/null' && exit 0; sleep 0.1; done; exit 1") -- 0
+(.sys.exec "for i in $(seq 50); do bash -c 'exec 3<>/dev/tcp/127.0.0.1/19990 2>/dev/null && printf \"\\003\\000\" >&3 && read -t2 -n1 -u3 _' 2>/dev/null && exit 0; sleep 0.1; done; exit 1") -- 0
 
 (set h2 (.ipc.open "127.0.0.1:19990"))
 (>= h2 0) -- true
@@ -101,7 +110,7 @@
 
 ;; ── phase 3: restart, assert state survived via .qdb (not .log) ─────
 (.sys.exec "./rayforce -l /tmp/rftest_journal -p 19990 </dev/null >/dev/null 2>&1 &")
-(.sys.exec "for i in $(seq 30); do bash -c '(echo > /dev/tcp/127.0.0.1/19990) 2>/dev/null' && exit 0; sleep 0.1; done; exit 1") -- 0
+(.sys.exec "for i in $(seq 50); do bash -c 'exec 3<>/dev/tcp/127.0.0.1/19990 2>/dev/null && printf \"\\003\\000\" >&3 && read -t2 -n1 -u3 _' 2>/dev/null && exit 0; sleep 0.1; done; exit 1") -- 0
 
 (set h3 (.ipc.open "127.0.0.1:19990"))
 (.ipc.send h3 "a") -- 100
