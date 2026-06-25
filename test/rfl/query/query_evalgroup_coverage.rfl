@@ -324,23 +324,20 @@
 ;; Order-independent multiset of per-group sums (emission non-det → sort):
 ;; a→[1,3]=4, b→[2,4]=6 → sorted {4,6}
 (asc (at (select {r: (sum ext_v) by: k from: Teg_sk}) 'r)) -- [4 6]
-;; Order-independent per-group key check via key-masked source lookup.
-;; NOTE: the agg arg `ext_v` is a GLOBAL vector, not a table column. The
-;; eval-fallback indexes ext_v by the group's row positions in the table
-;; FED TO THE GROUP. A `where:` mask reindexes the surviving rows to a
-;; dense 0..m-1 range, so ext_v is sampled at the POST-FILTER positions,
-;; not the original ones. Masked "a" keeps original rows {0,2} → dense
-;; {0,1} → ext_v[0]+ext_v[1]=1+2=3 (NOT the unmasked 1+3=4); masked "b"
-;; keeps {1,3} → dense {0,1} → 1+2=3 too. We therefore pin the LIVE
-;; masked values and assert only the group KEY for order-independence;
-;; the unmasked total (10) above still proves the full decomposition.
+;; NOTE: the agg arg `ext_v` is a GLOBAL vector, not a table column.  STR
+;; group keys now run on the wide-key DAG path (not the eval fallback), which
+;; samples ext_v at the group's ORIGINAL table-row positions — consistent with
+;; the unmasked case above (line 326: a→[1,3]=4).  So masked "a" keeps original
+;; rows {0,2} → ext_v[0]+ext_v[2]=1+3=4; masked "b" keeps {1,3} →
+;; ext_v[1]+ext_v[3]=2+4=6.  (The retired eval fallback dense-reindexed surviving
+;; rows to 0..m-1, giving an inconsistent 3 under a filter.)
 (set Geg_a (select {r: (sum ext_v) by: k from: Teg_sk where: (== k "a")}))
 (count Geg_a)            -- 1
 (at (at Geg_a 'k) 0)     -- "a"
-(at (at Geg_a 'r) 0)     -- 3
+(at (at Geg_a 'r) 0)     -- 4
 (set Geg_b (select {r: (sum ext_v) by: k from: Teg_sk where: (== k "b")}))
 (at (at Geg_b 'k) 0)     -- "b"
-(at (at Geg_b 'r) 0)     -- 3
+(at (at Geg_b 'r) 0)     -- 6
 
 ;; Multi-key eval path (lines 4955-4962):
 ;; [k1 k2] with k1=STR → use_eval_group=1 → multi-key path (len>1)

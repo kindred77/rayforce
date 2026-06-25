@@ -32,16 +32,18 @@
 (.sys.exec "rm -rf /tmp/rfl_tblop_branch")
 
 ;; ══════════════════════════════════════════════════════════════════
-;; Section 1: STR columns force dag_ok=false (L124) but the GROUP BY
-;;            DAG path does not support STR keys → "nyi" error.
-;;            These test the error propagation, not the happy path.
+;; Section 1: STR group KEYS are now supported via the wide-key path,
+;;            so a STR pivot INDEX works.  A STR pivot COLUMN still errors
+;;            "nyi" because pivot values become column NAMES (syms), which
+;;            STR cannot supply.
 ;; ══════════════════════════════════════════════════════════════════
 
-;; STR index column → nyi in GROUP BY DAG.
+;; STR index column → supported: idx=[alice,bob], alice{x:10,y:20} bob{x:30,y:40}.
 (set Tstr_idx (table [idx pv val] (list (list "alice" "alice" "bob" "bob") ['x 'y 'x 'y] [10 20 30 40])))
-(pivot Tstr_idx 'idx 'pv 'val sum) !- nyi
+(at (at (pivot Tstr_idx 'idx 'pv 'val sum) 'x) 0) -- 10
+(at (at (pivot Tstr_idx 'idx 'pv 'val sum) 'y) 1) -- 40
 
-;; STR pivot column → nyi in GROUP BY DAG.
+;; STR pivot column → still nyi (column names cannot come from STR values).
 (set Tstr_pv (table [k pv val] (list ['A 'A 'B 'B] (list "x" "y" "x" "y") [10 20 30 40])))
 (pivot Tstr_pv 'k 'pv 'val sum) !- nyi
 
