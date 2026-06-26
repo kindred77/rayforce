@@ -42,6 +42,7 @@
 #include "mem/heap.h"
 #include "ops/ops.h"
 #include "core/profile.h"
+#include "lang/sql_parse.h"
 #include "table/sym.h"
 #include <inttypes.h>
 #include <stdio.h>
@@ -704,7 +705,12 @@ static void eval_and_print(ray_term_t* term, const char* input,
     ray_t* nfo = ray_nfo_create("repl", 4, input, strlen(input));
     ray_clear_error_trace();
 
-    ray_t* parsed = ray_parse_with_nfo(input, nfo);
+    ray_t* parsed;
+    if (ray_is_sql(input)) {
+        parsed = ray_sql_parse(input, nfo);
+    } else {
+        parsed = ray_parse_with_nfo(input, nfo);
+    }
     if (profiling) ray_profile_tick("parse");
 
     ray_t* result;
