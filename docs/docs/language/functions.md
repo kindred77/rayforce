@@ -93,8 +93,8 @@ Functions that take other functions as arguments.
 | `scan-left` | variadic | Left-to-right running fold | `(scan-left + (enlist 1 2 3))` → `[1 3 6]` |
 | `scan-right` | variadic | Right-to-left running fold | `(scan-right + (enlist 1 2 3))` → `[6 5 3]` |
 | `apply` | variadic | Zip-apply function pairwise over two lists | `(apply + (enlist 1 2) (enlist 3 4))` → `[4 6]` |
-| `map-left` | variadic | Map with left argument fixed | `(map-left + 10 [1 2 3])` → `[11 12 13]` |
-| `map-right` | variadic | Map with right argument fixed | `(map-right - [10 20 30] 5)` → `[5 15 25]` |
+| `map-left` | variadic | Map each element of the left over the whole right | `(map-left + 10 [1 2 3])` → `[11 12 13]` |
+| `map-right` | variadic | Map the whole left over each element of the right | `(map-right - [10 20 30] 5)` → `[5 15 25]` |
 
 ## Collection Operations
 
@@ -316,7 +316,7 @@ Cross-temporal comparisons are supported: dates, times, and timestamps are all c
 | `if` | variadic, special | Conditional (if/then/else) | `(if (> x 0) "pos" "neg")` |
 | `do` | variadic, special | Sequential execution, returns last | `(do (set x 1) (set y 2) (+ x y))` |
 | `fn` | variadic, special | Create lambda function | `(fn [x] (* x x))` |
-| `try` | binary, special | Error handling (expr handler) | `(try (/ 1 0) (fn [e] 0))` |
+| `try` | binary, special | Error handling (expr handler-or-fallback) | `(try (/ 1 0) (fn [e] 0))` |
 | `raise` | unary | Throw an error | `(raise "bad input")` |
 | `return` | variadic | Early return from compiled lambda (0 args → null) | `(return 42)` |
 | `quote` | variadic, special | Return argument unevaluated; a bare name becomes a literal symbol (`(quote x)` ≡ `'x`) | `(quote (+ 1 2))` → `(+ 1 2)` |
@@ -352,6 +352,8 @@ Cross-temporal comparisons are supported: dates, times, and timestamps are all c
 | `.db.splayed.set` | variadic | Save table as splayed columns to directory | `(.db.splayed.set "db/trades" trades)` |
 | `.db.splayed.get` | variadic | Load splayed table from directory | `(.db.splayed.get "db/trades")` |
 | `.db.parted.get` | variadic | Load partitioned table by name from root directory | `(.db.parted.get "db" 'trades)` |
+| `.db.parted.tables` | variadic | List table names under a parted root | `(.db.parted.tables "db")` |
+| `.db.parted.fill` | variadic | Backfill missing tables across partitions | `(.db.parted.fill "db")` |
 
 ## EAV (Entity-Attribute-Value)
 

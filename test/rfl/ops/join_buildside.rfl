@@ -1,0 +1,35 @@
+;; join_buildside.rfl — end-to-end rfl coverage of the radix build-side-swap path.
+;;
+;; Context: the radix inner-join path (right > 65536 rows) builds the hash
+;; on the SMALLER side when left_rows < right_rows.  The C-level mechanism is
+;; counter-verified by the join_buildside C test suite; this file exercises the
+;; same path through the query layer to confirm the full stack produces correct
+;; results.  Row ORDER is not a contract on the radix path, so all assertions
+;; here are order-insensitive (count, sum).
+;;
+;; Table definitions:
+;;   right (70000 rows): key = i % 1000, payload = i
+;;     Each key 0..999 appears exactly 70 times.
+;;     right-payload sum for key k: k + (k+1000) + ... + (k+69000)
+;;       = 70k + 1000*(0+1+...+69) = 70k + 2415000
+;;
+;;   left (2000 rows):  key = i % 1000, val = i
+;;     Each key 0..999 appears exactly 2 times (positions k and k+1000).
+;;
+;; Expected output:
+;;   count = 2000 * 70 = 140000
+;;   sum(payload) = sum_{k=0}^{999} [2 * (70k + 2415000)]
+;;               = 140 * (0+1+...+999) + 1000 * 4830000
+;;               = 140 * 499500 + 4830000000
+;;               = 69930000 + 4830000000
+;;               = 4899930000
+
+(set RJright (table [key payload] (list (% (til 70000) 1000) (til 70000))))
+(set LJleft  (table [key val]     (list (% (til 2000)  1000) (til 2000))))
+(set BSjoin  (inner-join [key] LJleft RJright))
+
+;; count: 2000 left rows × 70 matching right rows each = 140000
+(count BSjoin) -- 140000
+
+;; sum of right-side payload column (order-insensitive)
+(sum (at BSjoin 'payload)) -- 4899930000

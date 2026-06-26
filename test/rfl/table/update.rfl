@@ -55,6 +55,13 @@ t -- (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0]))
 (set t (table [ID Name Value] (list [1 2 3] [alice bob charlie] [10.0 20.0 30.0])))(update {from: 't Value: 99.0 where: (== ID 2)})t -- (table [ID Name Value] (list [1 2 3] [alice bob charlie] [10.0 99.0 30.0]))
 ;; Test 24: Update with groupby
 (set t (table [Group ID Value] (list [a a b b] [1 2 3 4] [10.0 20.0 30.0 40.0])))(update {from: 't Total: (sum Value) by: Group})t -- (table [Group ID Value Total] (list [a a b b] [1 2 3 4] [10.0 20.0 30.0 40.0] [30.0 30.0 70.0 70.0]))
+;; Test 24b: update with BOTH by: and where: is a LOUD error (review 2.10
+;; sub-item 3).  Previously the `by:` branch was gated on `!where_expr`, so
+;; combining them SILENTLY dropped `by:` and applied an ungrouped update —
+;; a silent wrong result.  Honoring both is a larger feature (compose the
+;; where-filter + group pipeline like select does); until then we reject.
+(set t (table [Group ID Value] (list [a a b b] [1 2 3 4] [10.0 20.0 30.0 40.0])))
+(update {from: 't Total: (sum Value) by: Group where: (> ID 1)}) !- nyi
 ;; ========== FLEXIBLE COLUMN ORDERING TESTS ==========
 ;; Test 25: Insert via dict with columns in different order (single record)
 (set t (table [a b c] (list [1 2] [10 20] [x y])))(insert t (dict [c a b] (list 'z 3 30))) -- (table [a b c] (list [1 2 3] [10 20 30] [x y z]))
@@ -136,3 +143,71 @@ t -- (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0]))
 (set t (table [id ts] (list [1 2 3] [2024.01.01D00:00:00.0 2024.01.02D00:00:00.0 2024.01.03D00:00:00.0])))(update {ts: 2000.01.01D00:00:00.0 from: 't})t -- (table [id ts] (list [1 2 3] [2000.01.01D00:00:00.000000000 2000.01.01D00:00:00.000000000 2000.01.01D00:00:00.000000000]))
 ;; Test 48: Update both symbol and timestamp columns in same update
 (set t (table [id name ts] (list [1 2] ['alice 'bob] [2024.01.01D00:00:00.0 2024.01.02D00:00:00.0])))(update {name: 'updated ts: 2025.01.01D00:00:00.0 from: 't where: (== id 1)})t -- (table [id name ts] (list [1 2] [updated bob] [2025.01.01D00:00:00.000000000 2024.01.02D00:00:00.000000000]))
+
+;; ══════════════════════════════════════════════════════════════════
+;; INSERT INTO TYPED COLUMNS — regression for append_atom_to_col only
+;; supporting I64/SYM/F64/BOOL/STR (temporal/guid/narrow-int columns
+;; rejected valid atoms) and for generic-list payloads promoting a
+;; typed column to LIST via concat instead of keeping its own type.
+;; ══════════════════════════════════════════════════════════════════
+
+;; Reported bug 1: a timestamp atom into an empty TIMESTAMP column.
+(insert (table [a] (list (as 'Timestamp (list)))) (list 2024.01.01D00:00:00.0)) -- (table [a] (list [2024.01.01D00:00:00.000000000]))
+
+;; Reported bug 2: a generic list into an I64 column inserts multiple
+;; rows and KEEPS the I64 type (previously promoted to LIST via concat).
+(insert (table [a] (list (list))) (list (list 1 2 3))) -- (table [a] (list [1 2 3]))
+;; First an atom row, then a generic-list multi-row payload — stays I64.
+(set t (table [a] (list (list))))(insert 't (list 42))(insert 't (list (list 1 2 3)))t -- (table [a] (list [42 1 2 3]))
+
+;; A generic list of timestamps splices into a TIMESTAMP column (no LIST).
+(insert (table [a] (list (as 'Timestamp (list)))) (list (list 2024.01.01D00:00:00.0 2024.01.02D00:00:00.0))) -- (table [a] (list [2024.01.01D00:00:00.000000000 2024.01.02D00:00:00.000000000]))
+
+;; Narrow integer / temporal column atom inserts.
+(insert (table [a] (list (as 'I32 (list)))) (list 7i)) -- (table [a] (list [7i]))
+(insert (table [a] (list (as 'I16 (list)))) (list 5h)) -- (table [a] (list [5h]))
+(insert (table [a] (list (as 'Date (list)))) (list 2020.01.01)) -- (table [a] (list [2020.01.01]))
+(insert (table [a] (list (as 'Time (list)))) (list 12:30:00.0)) -- (table [a] (list [12:30:00.000]))
+
+;; Multi-row insert into a narrow-int column copies existing rows with the
+;; correct element stride (was hard-coded to 8 bytes, corrupting I32/I16).
+(set w (table [a] (list (as 'I32 (list)))))(insert 'w (list 7i))(insert 'w (list 9i))w -- (table [a] (list [7i 9i]))
+(set h (table [a] (list (as 'I16 (list)))))(insert 'h (list 1h))(insert 'h (list 2h))(insert 'h (list 3h))h -- (table [a] (list [1h 2h 3h]))
+(set d (table [a] (list (as 'Date (list)))))(insert 'd (list 2020.01.01))(insert 'd (list 2020.01.02))d -- (table [a] (list [2020.01.01 2020.01.02]))
+
+;; Wrong-type atoms into typed columns still rejected.
+(insert (table [a] (list (as 'Timestamp (list)))) (list 'bad)) !- type
+(insert (table [a] (list (as 'Date (list)))) (list 1)) !- type
+
+;; Typeless empty () column: adopts the type of the first inserted value
+;; instead of defaulting to I64 and rejecting non-ints.
+(insert (table [a] (list (list))) (list 3.14)) -- (table [a] (list [3.14]))
+(insert (table [a] (list (list))) (list 'x)) -- (table [a] (list ['x]))
+(insert (table [a] (list (list))) (list "s")) -- (table [a] (list (list "s")))
+(insert (table [a] (list (list))) (list 2020.01.01)) -- (table [a] (list [2020.01.01]))
+(insert (table [a] (list (list))) (list 12:30:00.0)) -- (table [a] (list [12:30:00.000]))
+;; Type is adopted once, then enforced on subsequent inserts.
+(set tl (table [a] (list (list))))(insert 'tl (list 3.14))(insert 'tl (list 2.71))tl -- (table [a] (list [3.14 2.71]))
+(set ts (table [a] (list (list))))(insert 'ts (list 'a))(insert 'ts (list 'b))ts -- (table [a] (list ['a 'b]))
+
+;; ══════════════════════════════════════════════════════════════════
+;; UPDATE scalar-broadcast into typed columns — regression for the
+;; broadcast sites that copied the scalar through an 8-byte `elem`
+;; buffer with a (ct==BOOL?1:8) stride. That over-read the buffer for
+;; GUID columns (16-byte payload, stored in ->obj) — an ASan stack-
+;; buffer-overflow / crash — and relied on union aliasing for the
+;; narrow-int / temporal types.
+;; ══════════════════════════════════════════════════════════════════
+
+;; Narrow-int and temporal columns keep their type after a scalar update.
+;; In-place update (from: 't) returns the symbol, so read the column back off t.
+(set t (table [k a] (list [1 2 3] (as 'I32 [10 20 30]))))(update {a: 99i from: 't})(at t 'a) -- [99i 99i 99i]
+(set t (table [k a] (list [1 2 3] (as 'I16 [1 2 3]))))(update {a: 7h from: 't})(at t 'a) -- [7h 7h 7h]
+(set t (table [k a] (list [1 2 3] (as 'Date [2020.01.01 2020.01.02 2020.01.03]))))(update {a: 2030.06.15 from: 't})(at t 'a) -- [2030.06.15 2030.06.15 2030.06.15]
+(set t (table [k a] (list [1 2 3] (as 'Timestamp [2024.01.01D00:00:00.0 2024.01.02D00:00:00.0 2024.01.03D00:00:00.0]))))(update {a: 2030.01.01D00:00:00.0 from: 't})(at t 'a) -- [2030.01.01D00:00:00.000000000 2030.01.01D00:00:00.000000000 2030.01.01D00:00:00.000000000]
+
+;; GUID column scalar update (all-rows): every row becomes the scalar guid.
+;; (guid is random, so compare cells to the scalar rather than a literal.)
+(set g (first (guid 1)))(set t (table [k a] (list [1 2 3] (guid 3))))(update {a: g from: 't})(== (at (at t 'a) 2) g) -- true
+;; GUID column scalar update (WHERE): only matching rows change, no overflow.
+(set g (first (guid 1)))(set t (table [k a] (list [1 2 3] (guid 3))))(update {a: g from: 't where: (== k 2)})(== (at (at t 'a) 1) g) -- true

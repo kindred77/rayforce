@@ -26,6 +26,7 @@
 #include <rayforce.h>
 #include "mem/heap.h"
 #include "ops/ops.h"
+#include "ops/internal.h"
 #include "store/csr.h"
 #include <string.h>
 
@@ -185,12 +186,12 @@ static test_result_t test_filter_reorder_dag(void) {
      *   chain[0] (outer) gets the higher cost pred
      *   chain[1] (inner) gets the lower cost pred */
     TEST_ASSERT_EQ_I(opt->opcode, OP_FILTER);
-    ray_op_t* inner = opt->inputs[0];
+    ray_op_t* inner = op_child(g, opt, 0);
     TEST_ASSERT_EQ_I(inner->opcode, OP_FILTER);
 
     /* Inner pred should be eq (cheaper), outer pred should be gt (more expensive) */
-    TEST_ASSERT_EQ_I(inner->inputs[1]->id, eq_pred_id);
-    TEST_ASSERT_EQ_I(opt->inputs[1]->id, gt_pred_id);
+    TEST_ASSERT_EQ_I(inner->in_id[1], eq_pred_id);
+    TEST_ASSERT_EQ_I(opt->in_id[1], gt_pred_id);
 
     ray_graph_free(g);
     ray_release(tbl);
@@ -231,14 +232,14 @@ static test_result_t test_pushdown_past_select(void) {
     /* Verify DAG structure: filter should have been pushed below select */
     ray_op_t* sel_after = &g->nodes[sel_id];
     TEST_ASSERT_EQ_I(sel_after->opcode, OP_SELECT);
-    TEST_ASSERT_EQ_I(sel_after->inputs[0]->opcode, OP_FILTER);
+    TEST_ASSERT_EQ_I(op_child(g, sel_after, 0)->opcode, OP_FILTER);
 
     /* Verify the optimized root is the select node (filter was pushed below) */
     TEST_ASSERT_EQ_U(opt_root->id, sel_id);
 
     /* Execute COUNT from the pushed-down filter to validate correctness.
      * The filter (now below select) should still produce the right row count. */
-    ray_op_t* cnt = ray_count(g, sel_after->inputs[0]);
+    ray_op_t* cnt = ray_count(g, op_child(g, sel_after, 0));
     ray_t* result = ray_execute(g, cnt);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
     TEST_ASSERT_EQ_I(result->i64, 4);
@@ -871,8 +872,8 @@ static test_result_t test_opt_pushdown_past_expand(void) {
     TEST_ASSERT_EQ_U(opt->id, expand_id);
     TEST_ASSERT_EQ_I(opt->opcode, OP_EXPAND);
     /* EXPAND.inputs[0] should now be a FILTER node (the pushed filter). */
-    TEST_ASSERT_NOT_NULL(opt->inputs[0]);
-    TEST_ASSERT_EQ_I(opt->inputs[0]->opcode, OP_FILTER);
+    TEST_ASSERT_NOT_NULL(op_child(g, opt, 0));
+    TEST_ASSERT_EQ_I(op_child(g, opt, 0)->opcode, OP_FILTER);
 
     ray_graph_free(g);
     ray_rel_free(rel);
@@ -954,7 +955,7 @@ static test_result_t test_opt_pushdown_expand_blocked(void) {
     /* Pushdown blocked: filter remains the root, expand stays below. */
     TEST_ASSERT_EQ_U(opt->id, filt_id);
     TEST_ASSERT_EQ_I(opt->opcode, OP_FILTER);
-    TEST_ASSERT_EQ_U(opt->inputs[0]->id, expand_id);
+    TEST_ASSERT_EQ_U(opt->in_id[0], expand_id);
 
     ray_graph_free(g);
     ray_rel_free(rel);
@@ -1066,16 +1067,16 @@ static test_result_t test_opt_realloc_during_split(void) {
     /* Walk from new root: must be FILTER -> FILTER -> SCAN(v1) chain,
      * with predicates pointing at eq and gt (post-fix-up). */
     TEST_ASSERT_EQ_I(opt->opcode, OP_FILTER);
-    TEST_ASSERT_NOT_NULL(opt->inputs[0]);
-    TEST_ASSERT_EQ_I(opt->inputs[0]->opcode, OP_FILTER);
+    TEST_ASSERT_NOT_NULL(op_child(g, opt, 0));
+    TEST_ASSERT_EQ_I(op_child(g, opt, 0)->opcode, OP_FILTER);
 
     /* After AND-split + reorder, the inner predicate is the cheaper
      * (eq on i64) and outer predicate is gt on f64 — but here we just
      * need the predicates to point to valid live nodes (no use-after-
      * realloc).  Both pred nodes' IDs must still resolve to live ops. */
-    ray_op_t* outer_pred = opt->inputs[1];
-    ray_op_t* inner = opt->inputs[0];
-    ray_op_t* inner_pred = inner->inputs[1];
+    ray_op_t* outer_pred = op_child(g, opt, 1);
+    ray_op_t* inner = op_child(g, opt, 0);
+    ray_op_t* inner_pred = op_child(g, inner, 1);
     TEST_ASSERT_NOT_NULL(outer_pred);
     TEST_ASSERT_NOT_NULL(inner_pred);
     TEST_ASSERT_TRUE(outer_pred->id == eq_id || outer_pred->id == gt_id);
@@ -1087,7 +1088,7 @@ static test_result_t test_opt_realloc_during_split(void) {
 
     /* And the filter chain bottoms out at SCAN(v1) — verifying the
      * input-pointer fix-up walked the whole chain correctly. */
-    ray_op_t* scan_node = inner->inputs[0];
+    ray_op_t* scan_node = op_child(g, inner, 0);
     TEST_ASSERT_NOT_NULL(scan_node);
     TEST_ASSERT_EQ_I(scan_node->opcode, OP_SCAN);
 
@@ -1834,8 +1835,8 @@ static test_result_t test_factorize_expand_group_src(void) {
     TEST_ASSERT_NOT_NULL(grp);
 
     /* Attach group as consumer of expand */
-    grp->inputs[0] = expand;
-    g->nodes[grp->id].inputs[0] = expand;
+    grp->in_id[0] = expand->id;
+    g->nodes[grp->id].in_id[0] = expand->id;
 
     ray_op_t* opt = ray_optimize(g, grp);
     TEST_ASSERT_NOT_NULL(opt);
@@ -1923,8 +1924,8 @@ static test_result_t test_idiom_first_last_asc_scan_no_nulls(void) {
     ray_op_t* opt = ray_optimize(g, root);
     TEST_ASSERT_NOT_NULL(opt);
     TEST_ASSERT_EQ_I(opt->opcode, OP_ADD);
-    TEST_ASSERT_EQ_I(opt->inputs[0]->opcode, OP_MIN);
-    TEST_ASSERT_EQ_I(opt->inputs[1]->opcode, OP_MAX);
+    TEST_ASSERT_EQ_I(op_child(g, opt, 0)->opcode, OP_MIN);
+    TEST_ASSERT_EQ_I(op_child(g, opt, 1)->opcode, OP_MAX);
 
     ray_graph_free(g);
     ray_release(tbl);
@@ -1953,8 +1954,8 @@ static test_result_t test_idiom_first_asc_scan_with_nulls_stays_safe(void) {
     ray_op_t* opt = ray_optimize(g, root);
     TEST_ASSERT_NOT_NULL(opt);
     TEST_ASSERT_EQ_I(opt->opcode, OP_ADD);
-    TEST_ASSERT_EQ_I(opt->inputs[0]->opcode, OP_FIRST);
-    TEST_ASSERT_EQ_I(opt->inputs[0]->inputs[0]->opcode, OP_ASC);
+    TEST_ASSERT_EQ_I(op_child(g, opt, 0)->opcode, OP_FIRST);
+    TEST_ASSERT_EQ_I(op_child(g, op_child(g, opt, 0), 0)->opcode, OP_ASC);
 
     ray_graph_free(g);
     ray_release(tbl);
@@ -2318,8 +2319,8 @@ static test_result_t test_opt_pushdown_expand_if_pred(void) {
     /* After pushdown, root should be EXPAND with FILTER as its source input */
     TEST_ASSERT_EQ_U(opt->id, expand_id);
     TEST_ASSERT_EQ_I(opt->opcode, OP_EXPAND);
-    TEST_ASSERT_NOT_NULL(opt->inputs[0]);
-    TEST_ASSERT_EQ_I(opt->inputs[0]->opcode, OP_FILTER);
+    TEST_ASSERT_NOT_NULL(op_child(g, opt, 0));
+    TEST_ASSERT_EQ_I(op_child(g, opt, 0)->opcode, OP_FILTER);
 
     ray_graph_free(g);
     ray_rel_free(rel);
@@ -2449,8 +2450,8 @@ static test_result_t test_factorize_expand_group_non_src(void) {
     ray_op_t* agg_ins[] = { val_scan };
     ray_op_t* grp = ray_group(g, keys, 1, agg_ops, agg_ins, 1);
     TEST_ASSERT_NOT_NULL(grp);
-    grp->inputs[0] = expand;
-    g->nodes[grp->id].inputs[0] = expand;
+    grp->in_id[0] = expand->id;
+    g->nodes[grp->id].in_id[0] = expand->id;
 
     ray_op_t* opt = ray_optimize(g, grp);
     TEST_ASSERT_NOT_NULL(opt);

@@ -4196,6 +4196,81 @@ static test_result_t test_window_i32_plain_order_key(void) {
     PASS();
 }
 
+/* Review 2.10 sub-item 4: an unsupported window frame must be a LOUD error,
+ * not silently degraded to the running frame.  The compute path honors only
+ * the whole partition (UNBOUNDED PRECEDING .. UNBOUNDED FOLLOWING) and the
+ * running frame (ROWS, UNBOUNDED PRECEDING .. CURRENT ROW).  Any other frame
+ * (N_PRECEDING / N_FOLLOWING bounds, RANGE-mode CURRENT ROW, a non-unbounded
+ * start) was previously accepted and IGNORED — yielding the wrong window.
+ * exec_window now rejects these. */
+static test_result_t test_window_unsupported_frame_errors(void) {
+    ray_heap_init(); (void)ray_sym_init();
+
+    int64_t n = 4;
+    int64_t gd[] = {1, 1, 1, 1};
+    int64_t vd[] = {10, 20, 30, 40};
+    ray_t* gv = ray_vec_from_raw(RAY_I64, gd, n);
+    ray_t* vv = ray_vec_from_raw(RAY_I64, vd, n);
+    int64_t ng = ray_sym_intern("g", 1);
+    int64_t nv = ray_sym_intern("v", 1);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ng, gv);
+    tbl = ray_table_add_col(tbl, nv, vv);
+    ray_release(gv); ray_release(vv);
+
+    /* Helper: run a SUM window with the given frame and expect an error. */
+    struct { uint8_t ftype, fstart, fend; int64_t sn, en; } bad[] = {
+        /* ROWS BETWEEN 1 PRECEDING AND CURRENT ROW — sliding, NOT honored */
+        { RAY_FRAME_ROWS,  RAY_BOUND_N_PRECEDING,         RAY_BOUND_CURRENT_ROW,        1, 0 },
+        /* ROWS BETWEEN UNBOUNDED PRECEDING AND 1 FOLLOWING — NOT honored */
+        { RAY_FRAME_ROWS,  RAY_BOUND_UNBOUNDED_PRECEDING, RAY_BOUND_N_FOLLOWING,        0, 1 },
+        /* RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW — RANGE not honored */
+        { RAY_FRAME_RANGE, RAY_BOUND_UNBOUNDED_PRECEDING, RAY_BOUND_CURRENT_ROW,        0, 0 },
+        /* ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING — non-unbounded start */
+        { RAY_FRAME_ROWS,  RAY_BOUND_CURRENT_ROW,         RAY_BOUND_UNBOUNDED_FOLLOWING,0, 0 },
+    };
+    for (size_t i = 0; i < sizeof(bad)/sizeof(bad[0]); i++) {
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* tbl_op = ray_const_table(g, tbl);
+        ray_op_t* g_op = ray_scan(g, "g");
+        ray_op_t* v_op = ray_scan(g, "v");
+        ray_op_t* parts[] = { g_op };
+        uint8_t   kinds[] = { RAY_WIN_SUM };
+        ray_op_t* fins[]  = { v_op };
+        int64_t   params[] = { 0 };
+        ray_op_t* w = ray_window_op(g, tbl_op, parts, 1, NULL, NULL, 0,
+                                    kinds, fins, params, 1,
+                                    bad[i].ftype, bad[i].fstart, bad[i].fend,
+                                    bad[i].sn, bad[i].en);
+        ray_t* result = ray_execute(g, w);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(result));
+        ray_release(result); ray_graph_free(g);
+    }
+
+    /* Sanity: the two HONORED frames still succeed. */
+    {
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* tbl_op = ray_const_table(g, tbl);
+        ray_op_t* g_op = ray_scan(g, "g");
+        ray_op_t* v_op = ray_scan(g, "v");
+        ray_op_t* parts[] = { g_op };
+        uint8_t   kinds[] = { RAY_WIN_SUM };
+        ray_op_t* fins[]  = { v_op };
+        int64_t   params[] = { 0 };
+        ray_op_t* w = ray_window_op(g, tbl_op, parts, 1, NULL, NULL, 0,
+                                    kinds, fins, params, 1, RAY_FRAME_ROWS,
+                                    RAY_BOUND_UNBOUNDED_PRECEDING,
+                                    RAY_BOUND_CURRENT_ROW, 0, 0);
+        ray_t* result = ray_execute(g, w);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        ray_release(result); ray_graph_free(g);
+    }
+
+    ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
 /* ─── Suite registration ──────────────────────────────────────────── */
 
 const test_entry_t window_entries[] = {
@@ -4279,5 +4354,6 @@ const test_entry_t window_entries[] = {
     { "window/running_min_i64_decreasing", test_window_running_min_i64_decreasing, NULL, NULL },
     { "window/running_max_f64_increasing", test_window_running_max_f64_increasing, NULL, NULL },
     { "window/i32_order_key_plain",     test_window_i32_plain_order_key,     NULL, NULL },
+    { "window/unsupported_frame_errors", test_window_unsupported_frame_errors, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };

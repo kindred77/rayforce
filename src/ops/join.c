@@ -26,6 +26,22 @@
 #include "ops/idxop.h"
 #include "lang/internal.h"  /* sym_id_runtime, sym_domain_rep (sym-domain Phase 2) */
 
+/* Test knob: force the legacy build-on-right behavior so the differential
+ * harness can compare swap vs no-swap in one binary. */
+bool ray_join_no_build_swap = false;
+/* Diagnostic: how many radix inner-joins built on the smaller (left) side. */
+uint64_t ray_join_build_swaps = 0;
+/* Test knob: force every radix join to fall back to the chained path, so the
+ * differential harness can compare radix-build vs chained-build on ordinary data. */
+bool ray_join_force_dup_fallback = false;
+/* Perf-gate bypass: disable the auto dup-fallback so the differential harness
+ * can measure the pre-fix O(dup²) build in the same binary.  Independent of
+ * ray_join_force_dup_fallback (which forces the fallback); this disables the
+ * auto-trip only. */
+bool ray_join_no_dup_fallback = false;
+/* Diagnostic: radix joins that fell back due to pathological key duplication. */
+uint64_t ray_join_dup_fallbacks = 0;
+
 /* ── Hash helper (shared by radix and chained HT join paths) ──────────── */
 
 static uint64_t hash_row_keys(ray_t** key_vecs, uint8_t n_keys, int64_t row) {
@@ -438,6 +454,11 @@ static inline bool join_keys_eq(ray_t* const* l_vecs, ray_t* const* r_vecs, uint
 
 #define RADIX_HT_EMPTY UINT32_MAX
 
+/* A build key with more than this many duplicate rows is pathological
+ * (O(dup²) build); abort to the chained path.  Counts same-hash slots, so
+ * dense moderate keys whose clusters merge into a long run don't trip. */
+#define RADIX_DUP_RUN_MAX 512
+
 /* Per-partition single-pass build+probe context.
  * Each partition writes to its own local output buffer, then results
  * are consolidated into contiguous arrays afterward. */
@@ -457,6 +478,7 @@ typedef struct {
     uint32_t*      pp_cap;       /* capacity per partition */
     _Atomic(uint8_t)* matched_right;
     _Atomic(uint8_t)  had_error;  /* set by any partition on OOM */
+    _Atomic(uint8_t)  pathological;  /* set on long-run duplication or forced */
 } join_radix_bp_ctx_t;
 
 /* Grow per-partition output buffers (matched pair arrays).
@@ -488,6 +510,10 @@ static inline bool bp_grow_bufs(join_radix_bp_ctx_t* c, uint32_t p,
     return true;
 }
 
+/* NOTE: l_xx/r_xx (l_parts/r_parts/l_key_vecs/r_key_vecs) and lr/rr/pl/pr denote
+ * PROBE/BUILD roles, not logical left/right.  Under the build-side swap the
+ * physical right becomes the build side and physical left the probe side.
+ * Logical left/right is restored at the consolidation remap in exec_join. */
 static void join_radix_build_probe_fn(void* raw, uint32_t wid, int64_t task_start, int64_t task_end) {
     (void)wid; (void)task_end;
     join_radix_bp_ctx_t* c = (join_radix_bp_ctx_t*)raw;
@@ -495,6 +521,13 @@ static void join_radix_build_probe_fn(void* raw, uint32_t wid, int64_t task_star
 
     join_radix_part_t* rp = &c->r_parts[p];
     join_radix_part_t* lp = &c->l_parts[p];
+
+    /* Test knob: force the chained-path fallback.  Bail before allocating
+     * anything (pp headers are still NULL → cleanup-safe). */
+    if (ray_join_force_dup_fallback) {
+        atomic_store_explicit(&c->pathological, 1, memory_order_relaxed);
+        return;
+    }
 
     if (rp->count == 0) {
         /* No right rows — emit unmatched left rows for LEFT/FULL */
@@ -569,8 +602,26 @@ static void join_radix_build_probe_fn(void* raw, uint32_t wid, int64_t task_star
         uint32_t slot = h & ht_mask;
         if (i + 4 < rp->count)
             __builtin_prefetch(&ht[(rp->entries[i + 4].hash & ht_mask) * 2], 1, 1);
-        while (ht[slot * 2 + 1] != RADIX_HT_EMPTY)
+        /* Count rows of THIS key (same hash) already inserted — the true
+         * per-key duplication.  Total run length would conflate one giant
+         * key (pathological O(dup²) build) with many moderate keys whose
+         * dense clusters merge into a long run (fine); counting same-hash
+         * slots is immune to that collision-merge.  Accumulate `same`
+         * branchlessly with NO global read / NO goto in the loop body: an
+         * in-loop trip check makes the compiler clone the probe loop on the
+         * (loop-invariant) bypass knob and pessimise the production variant
+         * (~55% regression at moderate dup, measured).  Trip once, after. */
+        uint32_t same = 0;
+        while (ht[slot * 2 + 1] != RADIX_HT_EMPTY) {
+            same += (ht[slot * 2] == h);
             slot = (slot + 1) & ht_mask;
+        }
+        if (same > RADIX_DUP_RUN_MAX && !ray_join_no_dup_fallback) {
+            /* Pathological duplication — abort to the chained path.
+             * `done:` frees ht_hdr and leaves pp buffers cleanup-safe. */
+            atomic_store_explicit(&c->pathological, 1, memory_order_relaxed);
+            goto done;
+        }
         ht[slot * 2] = h;
         ht[slot * 2 + 1] = rp->entries[i].row_idx;
     }
@@ -820,8 +871,8 @@ ray_t* exec_join(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ray_t* right_t
     memset(r_key_vecs, 0, key_slots * sizeof(ray_t*));
 
     for (uint8_t k = 0; k < n_keys; k++) {
-        ray_op_ext_t* lk = find_ext(g, ext->join.left_keys[k]->id);
-        ray_op_ext_t* rk = find_ext(g, ext->join.right_keys[k]->id);
+        ray_op_ext_t* lk = find_ext(g, ext->join.left_keys[k]);
+        ray_op_ext_t* rk = find_ext(g, ext->join.right_keys[k]);
         if (lk && lk->base.opcode == OP_SCAN)
             l_key_vecs[k] = ray_table_get_col(left_table, lk->sym);
         if (rk && rk->base.opcode == OP_SCAN)
@@ -860,29 +911,41 @@ ray_t* exec_join(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ray_t* right_t
 
     /* ── Radix-partitioned path (large joins) ──────────────────────── */
     if (right_rows > RAY_PARALLEL_THRESHOLD) {
-        uint8_t radix_bits = radix_join_bits(right_rows);
+        /* Build on the smaller side for INNER joins (radix path).  Other
+         * join types stay build-on-right (LEFT/FULL/ANTI are asymmetric — a
+         * swap would change their result).  SWAP_MARGIN ≥ 1: require LEFT
+         * (×margin) strictly smaller; default 1.  Knob forces legacy. */
+        #define JOIN_SWAP_MARGIN 1
+        bool swap = (join_type == 0) && !ray_join_no_build_swap &&
+                    (left_rows * (int64_t)JOIN_SWAP_MARGIN < right_rows);
+        if (swap) ray_join_build_swaps++;
+        int64_t  build_rows = swap ? left_rows : right_rows;
+        int64_t  probe_rows = swap ? right_rows : left_rows;
+        ray_t**  build_keys = swap ? l_key_vecs : r_key_vecs;
+        ray_t**  probe_keys = swap ? r_key_vecs : l_key_vecs;
+        uint8_t radix_bits = radix_join_bits(build_rows);
         uint32_t n_rparts = (uint32_t)1 << radix_bits;
 
         /* Pre-compute hashes for both sides (once, reused by histogram+scatter) */
         ray_t* r_hash_hdr = NULL;
         uint32_t* r_hashes = (uint32_t*)scratch_alloc(&r_hash_hdr,
-                                (size_t)right_rows * sizeof(uint32_t));
+                                (size_t)build_rows * sizeof(uint32_t));
         ray_t* l_hash_hdr = NULL;
         uint32_t* l_hashes = (uint32_t*)scratch_alloc(&l_hash_hdr,
-                                (size_t)left_rows * sizeof(uint32_t));
+                                (size_t)probe_rows * sizeof(uint32_t));
         if (!r_hashes || !l_hashes) {
             if (r_hash_hdr) scratch_free(r_hash_hdr);
             if (l_hash_hdr) scratch_free(l_hash_hdr);
             goto chained_ht_fallback;
         }
-        join_radix_hash_ctx_t rhctx = { .key_vecs = r_key_vecs, .n_keys = n_keys, .hashes = r_hashes };
-        join_radix_hash_ctx_t lhctx = { .key_vecs = l_key_vecs, .n_keys = n_keys, .hashes = l_hashes };
+        join_radix_hash_ctx_t rhctx = { .key_vecs = build_keys, .n_keys = n_keys, .hashes = r_hashes };
+        join_radix_hash_ctx_t lhctx = { .key_vecs = probe_keys, .n_keys = n_keys, .hashes = l_hashes };
         if (pool) {
-            ray_pool_dispatch(pool, join_radix_hash_fn, &rhctx, right_rows);
-            ray_pool_dispatch(pool, join_radix_hash_fn, &lhctx, left_rows);
+            ray_pool_dispatch(pool, join_radix_hash_fn, &rhctx, build_rows);
+            ray_pool_dispatch(pool, join_radix_hash_fn, &lhctx, probe_rows);
         } else {
-            join_radix_hash_fn(&rhctx, 0, 0, right_rows);
-            join_radix_hash_fn(&lhctx, 0, 0, left_rows);
+            join_radix_hash_fn(&rhctx, 0, 0, build_rows);
+            join_radix_hash_fn(&lhctx, 0, 0, probe_rows);
         }
 
         if (pool_cancelled(pool)) {
@@ -892,10 +955,10 @@ ray_t* exec_join(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ray_t* right_t
 
         /* Partition both sides using cached hashes */
         ray_t* r_parts_hdr = NULL;
-        join_radix_part_t* r_parts = join_radix_partition(pool, right_rows,
+        join_radix_part_t* r_parts = join_radix_partition(pool, build_rows,
                                                           radix_bits, r_hashes, &r_parts_hdr);
         ray_t* l_parts_hdr = NULL;
-        join_radix_part_t* l_parts = join_radix_partition(pool, left_rows,
+        join_radix_part_t* l_parts = join_radix_partition(pool, probe_rows,
                                                           radix_bits, l_hashes, &l_parts_hdr);
         scratch_free(r_hash_hdr);
         scratch_free(l_hash_hdr);
@@ -966,13 +1029,14 @@ ray_t* exec_join(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ray_t* right_t
 
         join_radix_bp_ctx_t bp_ctx = {
             .l_parts = l_parts, .r_parts = r_parts,
-            .l_key_vecs = l_key_vecs, .r_key_vecs = r_key_vecs,
+            .l_key_vecs = probe_keys, .r_key_vecs = build_keys,
             .n_keys = n_keys, .join_type = join_type,
             .pp_l = pp_l, .pp_r = pp_r,
             .pp_l_hdr = pp_l_hdr, .pp_r_hdr = pp_r_hdr,
             .part_counts = part_counts, .pp_cap = pp_cap,
             .matched_right = matched_right,
             .had_error = 0,
+            .pathological = 0,
         };
         if (pool && n_rparts > 1)
             ray_pool_dispatch_n(pool, join_radix_build_probe_fn, &bp_ctx, n_rparts);
@@ -983,7 +1047,8 @@ ray_t* exec_join(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ray_t* right_t
         /* Check cancellation and errors during build+probe */
         bool bp_cancelled = pool_cancelled(pool);
         bool bp_error = atomic_load_explicit(&bp_ctx.had_error, memory_order_relaxed);
-        if (bp_cancelled || bp_error) {
+        bool bp_pathological = atomic_load_explicit(&bp_ctx.pathological, memory_order_relaxed);
+        if (bp_cancelled || bp_error || bp_pathological) {
             /* Free all per-partition buffers */
             for (uint32_t rp2 = 0; rp2 < n_rparts; rp2++) {
                 if (r_parts[rp2].entries_hdr) scratch_free(r_parts[rp2].entries_hdr);
@@ -996,6 +1061,7 @@ ray_t* exec_join(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ray_t* right_t
             if (matched_right_hdr) { scratch_free(matched_right_hdr); matched_right_hdr = NULL; }
             matched_right = NULL;
             if (bp_cancelled) return ray_error("cancel", NULL);
+            if (bp_pathological) ray_join_dup_fallbacks++;
             goto chained_ht_fallback;
         }
 
@@ -1042,8 +1108,10 @@ ray_t* exec_join(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ray_t* right_t
                 int64_t cnt = part_counts[rp2];
                 if (cnt > 0 && pp_l[rp2] && pp_r[rp2]) {
                     for (int64_t j = 0; j < cnt; j++) {
-                        l_idx[off + j] = (int64_t)pp_l[rp2][j];
-                        r_idx[off + j] = (int64_t)pp_r[rp2][j];
+                        int32_t probe_row = pp_l[rp2][j];   /* PROBE side row */
+                        int32_t build_row = pp_r[rp2][j];   /* BUILD side row */
+                        l_idx[off + j] = (int64_t)(swap ? build_row : probe_row);
+                        r_idx[off + j] = (int64_t)(swap ? probe_row : build_row);
                     }
                     off += cnt;
                 }
@@ -1320,7 +1388,7 @@ join_gather:;
         if (!col) continue;
         bool is_key = false;
         for (uint8_t k = 0; k < n_keys; k++) {
-            ray_op_ext_t* rk = find_ext(g, ext->join.right_keys[k]->id);
+            ray_op_ext_t* rk = find_ext(g, ext->join.right_keys[k]);
             if (rk && rk->base.opcode == OP_SCAN && rk->sym == name_id) {
                 is_key = true; break;
             }
@@ -1483,8 +1551,8 @@ ray_t* exec_antijoin(ray_graph_t* g, ray_op_t* op,
     memset(r_key_vecs, 0, n_keys * sizeof(ray_t*));
 
     for (uint8_t k = 0; k < n_keys; k++) {
-        ray_op_ext_t* lk = find_ext(g, ext->join.left_keys[k]->id);
-        ray_op_ext_t* rk = find_ext(g, ext->join.right_keys[k]->id);
+        ray_op_ext_t* lk = find_ext(g, ext->join.left_keys[k]);
+        ray_op_ext_t* rk = find_ext(g, ext->join.right_keys[k]);
         if (lk && lk->base.opcode == OP_SCAN)
             l_key_vecs[k] = ray_table_get_col(left_table, lk->sym);
         if (rk && rk->base.opcode == OP_SCAN)
@@ -1605,6 +1673,11 @@ ray_t* exec_antijoin(ray_graph_t* g, ray_op_t* op,
                 gather_fn(&gctx, 0, 0, out_count);
 
             col_propagate_str_pool(new_col, col);
+            /* Null-model invariant 16.4: the gather copies sentinel cells
+             * verbatim (e.g. an anti-join preserves a null-key left row) but
+             * gather_fn does not flag HAS_NULLS — propagate it from the
+             * source, mirroring the inner/outer join gather path. */
+            col_propagate_nulls_gather(new_col, col, out_idx, out_count);
             /* SYM output gathers raw cell ids from `col` — resolve over
              * the same dictionary (sym-domain Phase 2). */
             if (new_col->type == RAY_SYM)
@@ -1687,7 +1760,7 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
     int64_t right_n = ray_table_nrows(right_table);
 
     /* Resolve time key */
-    ray_op_ext_t* time_ext = find_ext(g, ext->asof.time_key->id);
+    ray_op_ext_t* time_ext = find_ext(g, ext->asof.time_key);
     if (!time_ext || time_ext->base.opcode != OP_SCAN)
         return ray_error("nyi", NULL);
     int64_t time_sym = time_ext->sym;
@@ -1695,7 +1768,7 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
     /* Resolve equality keys */
     int64_t eq_syms[256];
     for (uint8_t k = 0; k < n_eq; k++) {
-        ray_op_ext_t* ek = find_ext(g, ext->asof.eq_keys[k]->id);
+        ray_op_ext_t* ek = find_ext(g, ext->asof.eq_keys[k]);
         if (!ek || ek->base.opcode != OP_SCAN)
             return ray_error("nyi", NULL);
         eq_syms[k] = ek->sym;

@@ -39,7 +39,7 @@
 (count (.db.splayed.get "/tmp/rfl_splayed_nested/2024.01.01/t/")) -- 3
 
 ;; ────────────── .db.parted.get: 2-partition reconstruction ──────────────
-;; Pre-fix: .db.parted.get required a /<root>/sym file (which .db.splayed.set
+;; Pre-fix: .db.parted.get required a /<root>/.sym file (which .db.splayed.set
 ;; doesn't write for symbol-less tables) and unconditionally errored.
 (set T-P0 (table [id val] (list [0 1 2 3 4] [0.0 1.0 2.0 3.0 4.0])))
 (set T-P1 (table [id val] (list [100 101 102 103 104] [10.0 11.0 12.0 13.0 14.0])))

@@ -18,12 +18,15 @@
 ;; with leading-dot magic" bookkeeping.
 (type .sys) -- 'DICT
 (type .os) -- 'DICT
+(type .fs) -- 'DICT
 (type .ipc) -- 'DICT
 (type .csv) -- 'DICT
 (count .sys) -- 10
 ;; gc, exec, build, mem, info, cmd, timeit, listen, env, args
-(count .os) -- 4
-;; getenv, setenv, size, list
+(count .os) -- 2
+;; getenv, setenv
+(count .fs) -- 2
+;; size, list
 (count .ipc) -- 5
 ;; open, close, send, post, handle
 (count .csv) -- 4
@@ -37,10 +40,12 @@
 (type .db.parted) -- 'DICT
 (count .db) -- 2          ;; splayed, parted
 (count .db.splayed) -- 2  ;; set, get
-(count .db.parted) -- 1   ;; get  (set is future)
-(nil? (resolve '.db.splayed.set))   -- false
-(nil? (resolve '.db.splayed.get))   -- false
-(nil? (resolve '.db.parted.get))    -- false
+(count .db.parted) -- 3   ;; get, tables, fill
+(nil? (resolve '.db.splayed.set))    -- false
+(nil? (resolve '.db.splayed.get))    -- false
+(nil? (resolve '.db.parted.get))     -- false
+(nil? (resolve '.db.parted.tables))  -- false
+(nil? (resolve '.db.parted.fill))    -- false
 ;; REPL completion + syntax highlighting go through
 ;; ray_env_lookup_prefix scanning flat g_env keys.  The namespace
 ;; dicts alone don't satisfy that path, so every reserved builtin
@@ -51,6 +56,8 @@
 (nil? (resolve '.sys.gc)) -- false
 (nil? (resolve '.sys.info)) -- false
 (nil? (resolve '.os.getenv)) -- false
+(nil? (resolve '.fs.size)) -- false
+(nil? (resolve '.fs.list)) -- false
 (nil? (resolve '.csv.read)) -- false
 (nil? (resolve '.csv.splayed)) -- false
 (nil? (resolve '.csv.parted)) -- false

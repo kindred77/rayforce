@@ -7,7 +7,7 @@
 
 ;; .db.splayed.set sweeps stale files and commits .d last, so re-setting
 ;; over a previous run is safe; the wipe below just isolates fixtures.
-(.sys.exec "rm -rf /tmp/rfl_get_splayed /tmp/rfl_get_parted")
+(.sys.exec "rm -rf /tmp/rfl_get_splayed /tmp/rfl_get_parted /tmp/rfl_get_parted2")
 
 ;; ────────────── several splayed tables under one root ──────────────
 (set Trades  (table [s p] (list ['AAPL 'GOOG] [100.0 200.0])))
@@ -18,22 +18,22 @@
 ;; multi-table root keeps a single vocabulary so cross-table SYM ops
 ;; (joins, comparisons) stay on the same-domain fast path instead of
 ;; re-encoding positions between per-table domains.
-(.db.splayed.set "/tmp/rfl_get_splayed/Trades"  Trades  "/tmp/rfl_get_splayed/sym")
-(.db.splayed.set "/tmp/rfl_get_splayed/Quotes"  Quotes  "/tmp/rfl_get_splayed/sym")
-(.db.splayed.set "/tmp/rfl_get_splayed/Returns" Returns "/tmp/rfl_get_splayed/sym")
+(.db.splayed.set "/tmp/rfl_get_splayed/Trades"  Trades  "/tmp/rfl_get_splayed/.sym")
+(.db.splayed.set "/tmp/rfl_get_splayed/Quotes"  Quotes  "/tmp/rfl_get_splayed/.sym")
+(.db.splayed.set "/tmp/rfl_get_splayed/Returns" Returns "/tmp/rfl_get_splayed/.sym")
 
 ;; exactly one symfile — at the root, none per table dir
-(.sys.exec "test -f /tmp/rfl_get_splayed/sym")        -- 0
-(.sys.exec "test ! -f /tmp/rfl_get_splayed/Trades/sym") -- 0
+(.sys.exec "test -f /tmp/rfl_get_splayed/.sym")        -- 0
+(.sys.exec "test ! -f /tmp/rfl_get_splayed/Trades/.sym") -- 0
 
 ;; Wipe the originals so the post-get bindings provably came from disk.
 (set Trades  0)
 (set Quotes  0)
 (set Returns 0)
 
-(set Trades  (.db.splayed.get "/tmp/rfl_get_splayed/Trades/"  "/tmp/rfl_get_splayed/sym"))
-(set Quotes  (.db.splayed.get "/tmp/rfl_get_splayed/Quotes/"  "/tmp/rfl_get_splayed/sym"))
-(set Returns (.db.splayed.get "/tmp/rfl_get_splayed/Returns/" "/tmp/rfl_get_splayed/sym"))
+(set Trades  (.db.splayed.get "/tmp/rfl_get_splayed/Trades/"  "/tmp/rfl_get_splayed/.sym"))
+(set Quotes  (.db.splayed.get "/tmp/rfl_get_splayed/Quotes/"  "/tmp/rfl_get_splayed/.sym"))
+(set Returns (.db.splayed.get "/tmp/rfl_get_splayed/Returns/" "/tmp/rfl_get_splayed/.sym"))
 
 (type Trades)  -- 'TABLE
 (type Quotes)  -- 'TABLE
@@ -82,6 +82,34 @@
 (min (at B 'v)) -- 5
 (max (at B 'v)) -- 8
 
+;; ────────────── .db.parted.tables: discover the table names ──────────────
+;; Returns the splayed-table subdirectories of the LAST (most recent)
+;; partition as a sorted SYM vector — usable directly with .db.parted.get.
+(.db.parted.tables "/tmp/rfl_get_parted/")        -- ['A 'B]
+(count (.db.parted.tables "/tmp/rfl_get_parted/")) -- 2
+;; a discovered name feeds straight back into .db.parted.get.
+(count (.db.parted.get "/tmp/rfl_get_parted/" (at (.db.parted.tables "/tmp/rfl_get_parted/") 0))) -- 4
+;; existing-but-empty root (splayed root has no partition dirs) -> empty
+;; list, not an error.  A directory that simply isn't a parted db lists
+;; zero tables; that's friendlier than failing.
+(count (.db.parted.tables "/tmp/rfl_get_splayed/")) -- 0
+;; a freshly-created empty directory likewise lists nothing.
+(.sys.exec "mkdir -p /tmp/rfl_get_empty")
+(count (.db.parted.tables "/tmp/rfl_get_empty")) -- 0
+(.sys.exec "rm -rf /tmp/rfl_get_empty")
+;; a genuinely missing directory is still an io error (opendir fails).
+(.db.parted.tables "/tmp/rfl_get_does_not_exist/") !- io
+
+;; .db.parted.tables reads the LAST partition, so a table added in a later
+;; partition is discovered, and one present only in the OLDEST partition is
+;; not listed.  Root: 01.01 = {A, OLD}; 01.02 (last) = {A, NEW}.
+(set TX (table [s v] (list ['a] [1])))
+(.db.splayed.set "/tmp/rfl_get_parted2/2024.01.01/A/"   TX)
+(.db.splayed.set "/tmp/rfl_get_parted2/2024.01.01/OLD/" TX)
+(.db.splayed.set "/tmp/rfl_get_parted2/2024.01.02/A/"   TX)
+(.db.splayed.set "/tmp/rfl_get_parted2/2024.01.02/NEW/" TX)
+(.db.parted.tables "/tmp/rfl_get_parted2/") -- ['A 'NEW]
+
 ;; ────────────── error path: not a parted root ──────────────
 ;; The splayed root from the first test has no partition directories,
 ;; so .db.parted.get on it must fail rather than returning an empty
@@ -95,8 +123,8 @@
 ;; ────────────── overwrite heal: narrower re-set sweeps stale columns ──────────────
 ;; Re-set against the same shared symfile: 'ZZZ appends to the root
 ;; vocabulary (append-only), the stale p column is swept.
-(.db.splayed.set "/tmp/rfl_get_splayed/Trades" (table [s] (list ['ZZZ])) "/tmp/rfl_get_splayed/sym")
-(set Trades2 (.db.splayed.get "/tmp/rfl_get_splayed/Trades/" "/tmp/rfl_get_splayed/sym"))
+(.db.splayed.set "/tmp/rfl_get_splayed/Trades" (table [s] (list ['ZZZ])) "/tmp/rfl_get_splayed/.sym")
+(set Trades2 (.db.splayed.get "/tmp/rfl_get_splayed/Trades/" "/tmp/rfl_get_splayed/.sym"))
 (count (key Trades2)) -- 1
 (at (at Trades2 's) 0) -- 'ZZZ
 

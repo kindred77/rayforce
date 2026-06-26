@@ -278,7 +278,7 @@
 ;; top/bot rowform with I32 val type (grpt_val_read I32 arm, line 9175)
 (set T_t_i32v (table [k v] (list (as 'I64 [1 1 2 2 3 3]) (as 'I32 [100 50 200 150 300 250]))))
 ;; top-1 per group: k=1→[100], k=2→[200], k=3→[300]; recursive sum = 600
-(sum (at (select {t: (top v 1) by: k from: T_t_i32v}) 't)) -- 600
+(sum (raze (at (select {t: (top v 1) by: k from: T_t_i32v}) 't))) -- 600
 ;; Recursive-sum total above cannot detect a per-group top value swap;
 ;; key-masked top/bot lookups pin each group's chosen I32 value + key. The 't
 ;; column is a nested list ([v] per group), so triple-at extracts the scalar.
@@ -291,7 +291,7 @@
 ;; top/bot rowform with I16 val type (grpt_val_read I16 arm)
 (set T_t_i16v (table [k v] (list (as 'I64 [1 1 2 2]) (as 'I16 [10 20 30 40]))))
 ;; top-1 per group: k=1→20, k=2→40
-(sum (at (select {t: (top v 1) by: k from: T_t_i16v}) 't)) -- 60
+(sum (raze (at (select {t: (top v 1) by: k from: T_t_i16v}) 't))) -- 60
 ;; Key-masked top/bot pin each group's I16 value order-independently.
 (at (at (at (select {t: (top v 1) by: k from: T_t_i16v where: (== k 1)}) 't) 0) 0) -- 20
 (at (at (select {t: (top v 1) by: k from: T_t_i16v where: (== k 1)}) 'k) 0) -- 1
@@ -301,7 +301,7 @@
 ;; top/bot rowform with U8 val type (grpt_val_read U8 arm)
 (set T_t_u8v (table [k v] (list (as 'I64 [1 1 2 2]) (as 'U8 [5 15 25 35]))))
 ;; top-1 per group: k=1→15, k=2→35
-(sum (at (select {t: (top v 1) by: k from: T_t_u8v}) 't)) -- 50
+(sum (raze (at (select {t: (top v 1) by: k from: T_t_u8v}) 't))) -- 50
 ;; Key-masked top/bot pin each group's U8 value order-independently.
 ;; U8 scalar elements render in hex (0x0f=15, 0x23=35, 0x19=25).
 (at (at (at (select {t: (top v 1) by: k from: T_t_u8v where: (== k 1)}) 't) 0) 0) -- 0x0f
@@ -313,7 +313,7 @@
 ;; top-1 by key where val is BOOL
 (set T_t_boolv (table [k v] (list (as 'I64 [1 1 2 2 3 3]) (as 'BOOL [true false true true false false]))))
 ;; top-1 per group: k=1→true(1), k=2→true(1), k=3→false(0) → sum=2
-(sum (at (select {t: (top v 1) by: k from: T_t_boolv}) 't)) -- 2
+(sum (raze (at (select {t: (top v 1) by: k from: T_t_boolv}) 't))) -- 2
 ;; Key-masked top/bot pin each group's BOOL value order-independently; the
 ;; recursive sum above could not distinguish which group holds the false top.
 (at (at (at (select {t: (top v 1) by: k from: T_t_boolv where: (== k 1)}) 't) 0) 0) -- true
@@ -324,7 +324,7 @@
 ;; top/bot rowform with I32 key type (grpt_key_read I32 arm, line 9115)
 (set T_t_i32k (table [k v] (list (as 'I32 [10 10 20 20 30 30]) (as 'I64 [100 200 300 400 500 600]))))
 (count (select {t: (top v 1) by: k from: T_t_i32k})) -- 3
-(sum (at (select {t: (top v 1) by: k from: T_t_i32k}) 't)) -- 1200
+(sum (raze (at (select {t: (top v 1) by: k from: T_t_i32k}) 't))) -- 1200
 ;; Cardinality + recursive-sum above; key-masked lookups pin each I32-key
 ;; group's top value and key order-independently.
 (at (at (at (select {t: (top v 1) by: k from: T_t_i32k where: (== k 10)}) 't) 0) 0) -- 200
@@ -337,7 +337,7 @@
 (set T_t_i16k (table [k v] (list (as 'I16 [5 5 10 10]) (as 'I64 [10 20 30 40]))))
 ;; top-1 per group: k=5→20, k=10→40
 (count (select {t: (top v 1) by: k from: T_t_i16k})) -- 2
-(sum (at (select {t: (top v 1) by: k from: T_t_i16k}) 't)) -- 60
+(sum (raze (at (select {t: (top v 1) by: k from: T_t_i16k}) 't))) -- 60
 ;; Key-masked lookups pin each I16-key group's top value and key.
 (at (at (at (select {t: (top v 1) by: k from: T_t_i16k where: (== k 5)}) 't) 0) 0) -- 20
 (at (at (select {t: (top v 1) by: k from: T_t_i16k where: (== k 5)}) 'k) 0) -- 5
@@ -345,7 +345,7 @@
 
 ;; top/bot with U8 key type (grpt_key_read U8 arm)
 (set T_t_u8k (table [k v] (list (as 'U8 [1 1 2 2]) (as 'I64 [10 20 30 40]))))
-(sum (at (select {t: (top v 1) by: k from: T_t_u8k}) 't)) -- 60
+(sum (raze (at (select {t: (top v 1) by: k from: T_t_u8k}) 't))) -- 60
 ;; Key-masked lookups pin each U8-key group's top value and key.
 (at (at (at (select {t: (top v 1) by: k from: T_t_u8k where: (== k 1)}) 't) 0) 0) -- 20
 (at (at (select {t: (top v 1) by: k from: T_t_u8k where: (== k 1)}) 'k) 0) -- 0x01
@@ -354,7 +354,7 @@
 ;; bot (min) rowform with F64 key (grpt_key_read F64 arm, line 9108)
 (set T_b_f64k (table [k v] (list (as 'F64 [1.0 1.0 2.0 2.0]) (as 'I64 [10 20 30 40]))))
 ;; bot-1 per group: k=1.0→10, k=2.0→30
-(sum (at (select {b: (bot v 1) by: k from: T_b_f64k}) 'b)) -- 40
+(sum (raze (at (select {b: (bot v 1) by: k from: T_b_f64k}) 'b))) -- 40
 ;; Key-masked lookups pin each F64-key group's bot value and key.
 (at (at (at (select {b: (bot v 1) by: k from: T_b_f64k where: (== k 1.0)}) 'b) 0) 0) -- 10
 (at (at (select {b: (bot v 1) by: k from: T_b_f64k where: (== k 1.0)}) 'k) 0) -- 1.0
@@ -363,7 +363,7 @@
 
 ;; grpt_key_read DATE arm (I32 width)
 (set T_t_datek (table [k v] (list (as 'DATE [7305 7305 7306 7306]) (as 'I64 [10 20 30 40]))))
-(sum (at (select {t: (top v 1) by: k from: T_t_datek}) 't)) -- 60
+(sum (raze (at (select {t: (top v 1) by: k from: T_t_datek}) 't))) -- 60
 ;; Key-masked lookups pin each DATE-key group's top value and key.
 (at (at (at (select {t: (top v 1) by: k from: T_t_datek where: (== k 7305)}) 't) 0) 0) -- 20
 (at (at (select {t: (top v 1) by: k from: T_t_datek where: (== k 7305)}) 'k) 0) -- 2020.01.01
@@ -371,7 +371,7 @@
 
 ;; grpt_key_read TIME arm
 (set T_t_timek (table [k v] (list (as 'TIME [1000 1000 2000 2000]) (as 'I64 [5 10 15 20]))))
-(sum (at (select {t: (top v 1) by: k from: T_t_timek}) 't)) -- 30
+(sum (raze (at (select {t: (top v 1) by: k from: T_t_timek}) 't))) -- 30
 ;; Key-masked lookups pin each TIME-key group's top value and key.
 (at (at (at (select {t: (top v 1) by: k from: T_t_timek where: (== k 1000)}) 't) 0) 0) -- 10
 (at (at (select {t: (top v 1) by: k from: T_t_timek where: (== k 1000)}) 'k) 0) -- 00:00:01.000

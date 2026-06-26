@@ -6,6 +6,8 @@ Columnar file I/O, splayed tables, date-partitioned storage, symbol table persis
 
 Rayforce's native binary format stores a single vector per file. Each file contains a 32-byte header followed by the raw element data and an optional null bitmap. The format is designed for direct memory mapping — no deserialization needed.
 
+The header carries a single-byte format generation. The current generation is `0`, and data written by any prior engine that produced the same layout (also generation `0`) loads unchanged — no migration required. A file whose generation the reader does not recognize is refused with a `version` error rather than mis-read; a future breaking layout change bumps the generation so old files are rejected for migration instead of silently misinterpreted.
+
 ### File Structure
 
 ```c
@@ -52,11 +54,16 @@ A splayed table stores each column as a separate file in a directory. This is th
 ```text
 db/trades/
   .d                 — I64 vector of column name symbol IDs
+  .sym               — symbol table (domain for SYM columns; dotfile)
   sym                — SYM column (stock tickers)
   price              — F64 column (trade prices)
   qty                — I64 column (quantities)
   time               — TIMESTAMP column
 ```
+
+The symbol table is a dotfile (`.sym`, lock `.sym.lk`), so it never collides
+with a user column — a table may have an ordinary column named `sym` (the
+canonical ticker column), as shown above.
 
 ### C API
 
@@ -67,10 +74,10 @@ db/trades/
 
 ```c
 // Save table to disk
-ray_err_t err = ray_splay_save(table, "db/trades", "db/sym");
+ray_err_t err = ray_splay_save(table, "db/trades", "db/.sym");
 
 // Load table (columns are mmap'd)
-ray_t* trades = ray_splay_load("db/trades", "db/sym");
+ray_t* trades = ray_splay_load("db/trades", "db/.sym");
 ```
 
 !!! note "Rayfall builtins"
@@ -84,7 +91,7 @@ For large time-series datasets, Rayforce supports date-partitioned storage. Data
 
 ```text
 db/trades/
-  sym                 — shared symbol table
+  .sym                — shared symbol table (domain for all partitions)
   2024.01.15/
     sym
     price
@@ -98,6 +105,10 @@ db/trades/
   2024.01.17/
     ...
 ```
+
+The shared symbol table lives in the parted root as the dotfile `.sym`;
+partitions have no own symfile and encode their SYM columns (e.g. `sym`)
+against it.
 
 ### Loading Partitioned Data
 
@@ -138,10 +149,10 @@ Symbol files use an append-only format. New symbols are appended to the end of t
 
 ```c
 // Save symbol table alongside data
-ray_sym_save("db/sym");
+ray_sym_save("db/.sym");
 
 // On startup, load symbols before loading data
-ray_sym_load("db/sym");
+ray_sym_load("db/.sym");
 ```
 
 ### Concurrency and Integrity
@@ -275,9 +286,30 @@ Loads a date-partitioned table. The first argument is the database root director
 
 This scans all date-named subdirectories under `db/trades/`, memory-maps every column, and returns a single table with a virtual date column. Partition pruning applies to subsequent queries.
 
+### `.db.parted.tables` — List a Root's Table Names
+
+Returns a sorted `sym` vector of the table names available under a partitioned database root — the table subdirectories of the **most recent** (last, sorted) partition, which reflects the current table set. Each name can be passed straight to `.db.parted.get`; nothing is loaded by this call.
+
+```lisp
+; Discover which tables live under db/, then load each one
+(.db.parted.tables "db")                ; => [`quotes `trades]
+(map (fn [t] (.db.parted.get "db" t)) (.db.parted.tables "db"))
+```
+
+### `.db.parted.fill` — Backfill Missing Tables Across Partitions
+
+For every table present in **any** partition, ensures **every** partition has it: a partition missing the table gets an **empty** copy whose schema is taken from the most recent partition that has it. This keeps queries that span partitions from failing on a partition where a table is absent — typically a table added partway through the database's life. Returns a sorted `sym` vector of the partition names it filled (empty when nothing needed fixing, so a repeat call is a no-op). Requires write permission on the root.
+
+```lisp
+; `news` was only added from 2024.01.10 onward; backfill the earlier days.
+(.db.parted.fill "db")                  ; => [`2024.01.01 … `2024.01.09]
+; now every partition has every table — the empty copies add no rows.
+(count (.db.parted.get "db" 'news))     ; unchanged
+```
+
 ## Symbol Table Management
 
-Symbol tables are persisted automatically when you use `.db.splayed.set`. A `sym` file is written into the table directory containing all interned symbol strings. When loading with `.db.splayed.get` or `.db.parted.get`, the symbol table is loaded first so that symbol columns decode correctly.
+Symbol tables are persisted automatically when you use `.db.splayed.set`. A `.sym` file is written into the table directory containing all interned symbol strings. When loading with `.db.splayed.get` or `.db.parted.get`, the symbol table is loaded first so that symbol columns decode correctly.
 
 At the C API level, `ray_sym_save(path)` and `ray_sym_load(path)` handle persistence directly. The format is append-only — new symbols are appended without rewriting existing entries, making concurrent access safe.
 

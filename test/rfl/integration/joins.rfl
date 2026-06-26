@@ -74,11 +74,11 @@
 (sum (at ijmk 'val1)) -- 400
 (sum (at ijmk 'val2)) -- 4000
 ;; window-join
-(set trades (table [Sym Time Price] (list [a a] [10:00:01.000 10:00:05.000] [100 200])))(set quotes (table [Sym Time Bid] (list [a a a] [10:00:00.000 10:00:02.000 10:00:04.000] [99 100 101])))(set intervals (map-left + [-2000 2000] (at trades 'Time)))(at (window-join [Sym Time] intervals trades quotes {minBid: (min Bid)}) 'minBid) -- [99 101]
+(set trades (table [Sym Time Price] (list [a a] [10:00:01.000 10:00:05.000] [100 200])))(set quotes (table [Sym Time Bid] (list [a a a] [10:00:00.000 10:00:02.000 10:00:04.000] [99 100 101])))(set intervals (map-left + [-2000 2000] (at trades 'Time)))(at (window-join [Sym Time] intervals trades quotes {minBid: (min Bid)}) 'minBid) -- [99 100]
 ;; window-join1
 (set trades (table [Sym Time Price] (list [a a] [10:00:01.000 10:00:05.000] [100 200])))(set quotes (table [Sym Time Bid] (list [a a a] [10:00:00.000 10:00:02.000 10:00:04.000] [99 100 101])))(set intervals (map-left + [-2000 2000] (at trades 'Time)))(at (window-join1 [Sym Time] intervals trades quotes {minBid: (min Bid)}) 'minBid) -- [99 101]
 ;; window-join with multiple aggregations — both columns must be present
-(set trades (table [Sym Time Price] (list [a a] [10:00:01.000 10:00:05.000] [100 200])))(set quotes (table [Sym Time Bid Ask] (list [a a a] [10:00:00.000 10:00:02.000 10:00:04.000] [99 100 101] [110 111 112])))(set intervals (map-left + [-2000 2000] (at trades 'Time)))(set r (window-join [Sym Time] intervals trades quotes {lo: (min Bid) hi: (max Ask)}))(at r 'lo) -- [99 101]
+(set trades (table [Sym Time Price] (list [a a] [10:00:01.000 10:00:05.000] [100 200])))(set quotes (table [Sym Time Bid Ask] (list [a a a] [10:00:00.000 10:00:02.000 10:00:04.000] [99 100 101] [110 111 112])))(set intervals (map-left + [-2000 2000] (at trades 'Time)))(set r (window-join [Sym Time] intervals trades quotes {lo: (min Bid) hi: (max Ask)}))(at r 'lo) -- [99 100]
 (set trades (table [Sym Time Price] (list [a a] [10:00:01.000 10:00:05.000] [100 200])))(set quotes (table [Sym Time Bid Ask] (list [a a a] [10:00:00.000 10:00:02.000 10:00:04.000] [99 100 101] [110 111 112])))(set intervals (map-left + [-2000 2000] (at trades 'Time)))(set r (window-join [Sym Time] intervals trades quotes {lo: (min Bid) hi: (max Ask)}))(at r 'hi) -- [111 112]
 ;; window-join rayforce1 canonical example (docs/queries-joins.html)
 ;;   trades at 12:00:01, 12:00:04, 12:00:06 ± 1s windows
@@ -143,7 +143,7 @@
 ;; window-join1 with raw column (TYPE_MAPGROUP)
 (set trades (table [Sym Time Price] (list [a a] [10:00:01.000 10:00:05.000] [100 200])))(set quotes (table [Sym Time Bid] (list [a a a] [10:00:00.000 10:00:02.000 10:00:04.000] [99 100 101])))(set intervals (map-left + [-2000 2000] (at trades 'Time)))(count (at (window-join1 [Sym Time] intervals trades quotes {bids: Bid}) 'bids)) -- 2
 ;; window-join with Enum columns (xasc converts Enum to Symbol)
-(set trades (table [s time price] (list ['a 'a 'b] [10:00:01.000 10:00:05.000 10:00:03.000] [100 200 150])))(set quotes (table [s time bid] (list ['a 'a 'a 'b 'b] [10:00:00.000 10:00:02.000 10:00:04.000 10:00:01.000 10:00:04.000] [99 100 101 149 151])))(set intervals (map-left + [-2000 2000] (at trades 'time)))(at (window-join [s time] intervals trades quotes {minBid: (min bid)}) 'minBid) -- [99 101 149]
+(set trades (table [s time price] (list ['a 'a 'b] [10:00:01.000 10:00:05.000 10:00:03.000] [100 200 150])))(set quotes (table [s time bid] (list ['a 'a 'a 'b 'b] [10:00:00.000 10:00:02.000 10:00:04.000 10:00:01.000 10:00:04.000] [99 100 101 149 151])))(set intervals (map-left + [-2000 2000] (at trades 'time)))(at (window-join [s time] intervals trades quotes {minBid: (min bid)}) 'minBid) -- [99 100 149]
 ;; empty left table
 (set t1 (table [id val1] (list (take [1] 0) (take [1] 0))))(set t2 (table [id val2] (list [1 2 3] [100 200 300])))(count (left-join [id] t1 t2)) -- 0
 ;; empty right table — left-join keeps all 3 left rows with val2 = Null.

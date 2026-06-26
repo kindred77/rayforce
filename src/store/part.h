@@ -29,4 +29,17 @@
 /* Partitioned table */
 ray_t*    ray_read_parted(const char* db_root, const char* table_name);
 
+/* Enumerate the table names under a parted db root — the splayed-table
+ * subdirectories (those with a `.d` schema) of the first partition.
+ * Returns a sorted RAY_SYM vector of names suitable for ray_read_parted,
+ * or an error object (e.g. `io` when no partitions exist). */
+ray_t*    ray_parted_tables(const char* db_root);
+
+/* Fill missing tables across a parted db: for every table present in any
+ * partition, write an empty copy — schema taken from the most recent
+ * partition that has it — into every partition that lacks it.  Returns a
+ * sorted RAY_SYM vector of the partition names that were filled (empty when
+ * nothing needed fixing), or an error. */
+ray_t*    ray_parted_fill(const char* db_root);
+
 #endif /* RAY_PART_H */

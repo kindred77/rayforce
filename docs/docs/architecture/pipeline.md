@@ -208,8 +208,8 @@ Hash joins use adaptive radix partitioning to ensure each partition's hash table
 The join pipeline:
 
 1. **Partition** — Radix-partition both inputs by hash key bits
-2. **Build** — Build per-partition hash tables (each fits in L2)
-3. **Probe** — Probe partitions in parallel across worker threads
+2. **Build** — Build per-partition hash tables (each fits in L2). For inner joins, the executor selects the build side at runtime using actual materialized row counts: the smaller input becomes the build side, keeping hash tables as compact as possible. LEFT, FULL, and ANTI joins always build on the right to preserve left-row semantics. The small-input (chained) path also always builds on the right. During the per-partition open-addressing build, the executor tracks per-key duplicate counts; when a single key exceeds the duplication threshold (`RADIX_DUP_RUN_MAX = 512`), it abandons the radix attempt and re-runs the whole join through the chained hash table, which is O(n) regardless of duplication. No join (INNER, LEFT, or FULL) can degrade to quadratic build cost on a skewed key.
+3. **Probe** — Probe partitions in parallel across worker threads. Inner-join output order is partition- and thread-dependent; it is not guaranteed to be stable.
 
 ### Per-Thread Heaps
 

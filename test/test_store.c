@@ -629,7 +629,7 @@ static test_result_t test_part_open(void) {
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
     /* Save symfile */
-    err = ray_sym_save(TMP_PART_DB "/sym");
+    err = ray_sym_save(TMP_PART_DB "/.sym");
     TEST_ASSERT_EQ_I(err, RAY_OK);
 
     /* Cleanup in-memory tables */
@@ -700,6 +700,60 @@ static test_result_t test_part_open(void) {
 
     /* Release — should unmap all segments */
     ray_release(parted);
+
+    (void)!system("rm -rf " TMP_PART_DB);
+    PASS();
+}
+
+/* ---- test_parted_tables ------------------------------------------------ */
+/* ray_parted_tables lists the splayed-table subdirectories of the first
+ * partition as a sorted SYM vector usable with ray_read_parted. */
+static test_result_t test_parted_tables(void) {
+    (void)!system("rm -rf " TMP_PART_DB);
+    /* Two tables (trades, quotes) across two partitions. */
+    const char* dirs[] = {
+        TMP_PART_DB "/2024.01.01/trades", TMP_PART_DB "/2024.01.01/quotes",
+        TMP_PART_DB "/2024.01.02/trades", TMP_PART_DB "/2024.01.02/quotes",
+    };
+    int64_t a[] = {1, 2, 3};
+    for (int i = 0; i < 4; i++) {
+        ray_t* col = ray_vec_from_raw(RAY_I64, a, 3);
+        TEST_ASSERT_NOT_NULL(col);
+        ray_t* t = ray_table_new(1);
+        t = ray_table_add_col(t, ray_sym_intern("v", 1), col);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+        TEST_ASSERT_EQ_I(ray_splay_save(t, dirs[i], NULL), RAY_OK);
+        ray_release(col);
+        ray_release(t);
+    }
+
+    /* Sorted SYM vector: quotes, trades. */
+    ray_t* names = ray_parted_tables(TMP_PART_DB);
+    TEST_ASSERT_NOT_NULL(names);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(names));
+    TEST_ASSERT_EQ_I(names->type, RAY_SYM);
+    TEST_ASSERT_EQ_I(names->len, 2);
+    const int64_t* ids = (const int64_t*)ray_data(names);
+    TEST_ASSERT_EQ_I(ids[0], ray_sym_intern("quotes", 6));
+    TEST_ASSERT_EQ_I(ids[1], ray_sym_intern("trades", 6));
+    ray_release(names);
+
+    /* A returned name feeds straight back into ray_read_parted. */
+    ray_t* tbl = ray_read_parted(TMP_PART_DB, "trades");
+    TEST_ASSERT_NOT_NULL(tbl);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    ray_release(tbl);
+
+    /* An existing-but-empty root (no partition dirs) lists no tables —
+     * an empty SYM vector, not an error. */
+    (void)!system("rm -rf " TMP_PART_DB "_np && mkdir -p " TMP_PART_DB "_np");
+    ray_t* empty = ray_parted_tables(TMP_PART_DB "_np");
+    TEST_ASSERT_NOT_NULL(empty);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(empty));
+    TEST_ASSERT_EQ_I(empty->type, RAY_SYM);
+    TEST_ASSERT_EQ_I(empty->len, 0);
+    ray_release(empty);
+    (void)!system("rm -rf " TMP_PART_DB "_np");
 
     (void)!system("rm -rf " TMP_PART_DB);
     PASS();
@@ -3230,7 +3284,7 @@ static test_result_t test_ipc_sync_roundtrip(void) {
     ray_thread_create(&tid, server_thread_fn, &ctx);
 
     /* Client: connect */
-    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL);
+    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
 
     /* Client: send sync query "(+ 1 2)" — expects result 3 */
@@ -3281,7 +3335,7 @@ static test_result_t test_ipc_async_send(void) {
     ray_thread_t tid;
     ray_thread_create(&tid, server_thread_fn, &ctx);
 
-    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL);
+    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
 
     /* Send async — should not block or error */
@@ -3326,7 +3380,7 @@ static test_result_t test_ipc_auth_success(void) {
     ray_thread_t tid;
     ray_thread_create(&tid, server_thread_fn, &ctx);
 
-    int64_t h = ray_ipc_connect("127.0.0.1", port, "admin", "secret123");
+    int64_t h = ray_ipc_connect("127.0.0.1", port, "admin", "secret123", 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
 
     ray_t* msg = ray_str("(+ 10 20)", 9);
@@ -3371,7 +3425,7 @@ static test_result_t test_ipc_auth_reject(void) {
     ray_thread_t tid;
     ray_thread_create(&tid, server_thread_fn, &ctx);
 
-    int64_t h = ray_ipc_connect("127.0.0.1", port, "admin", "wrong");
+    int64_t h = ray_ipc_connect("127.0.0.1", port, "admin", "wrong", 0);
     TEST_ASSERT_EQ_I(h, -3);
 
     srv.running = false;
@@ -3406,7 +3460,7 @@ static test_result_t test_ipc_auth_no_creds(void) {
     ray_thread_t tid;
     ray_thread_create(&tid, server_thread_fn, &ctx);
 
-    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL);
+    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT_EQ_I(h, -2);
 
     srv.running = false;
@@ -3442,7 +3496,7 @@ static test_result_t test_ipc_restricted(void) {
     ray_thread_t tid;
     ray_thread_create(&tid, server_thread_fn, &ctx);
 
-    int64_t h = ray_ipc_connect("127.0.0.1", port, "admin", "secret123");
+    int64_t h = ray_ipc_connect("127.0.0.1", port, "admin", "secret123", 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
 
     /* Arithmetic should work */
@@ -3539,7 +3593,7 @@ static test_result_t test_ipc_handshake_version_mismatch(void) {
 
     /* A subsequent well-behaved client must still succeed, proving the
      * server is still running and only the bad handshake was rejected. */
-    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL);
+    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
     ray_ipc_close(h);
 
@@ -3767,6 +3821,10 @@ static test_result_t test_col_validate_mapped_bad_type(void) {
     TEST_ASSERT_NOT_NULL(f);
     uint8_t hdr[32];
     memset(hdr, 0, 32);
+    /* Stamp the format major version into byte 17 (`order`) so validation
+     * reaches the type check (the bytes under test) past the version gate.
+     * aux (bytes 0-15) stays zero — no magic lives there. */
+    hdr[17] = RAY_COL_FORMAT_MAJOR;
     hdr[18] = 127;    /* type = RAY_ERROR -- not in serializable allowlist */
     hdr[19] = 0;      /* attrs */
     /* rc=1 at bytes 20-23 */
@@ -3793,6 +3851,7 @@ static test_result_t test_col_validate_mapped_neg_len(void) {
     TEST_ASSERT_NOT_NULL(f);
     uint8_t hdr[32];
     memset(hdr, 0, 32);
+    hdr[17] = RAY_COL_FORMAT_MAJOR; /* `order` = major version — pass the gate */
     hdr[18] = RAY_I64;  /* valid type */
     hdr[19] = 0;
     hdr[20] = 1;        /* rc = 1 */
@@ -3818,6 +3877,7 @@ static test_result_t test_col_validate_mapped_data_truncated(void) {
     TEST_ASSERT_NOT_NULL(f);
     uint8_t hdr[40];  /* 32-byte header + 8 bytes of data (but claim 10 I64 elems) */
     memset(hdr, 0, 40);
+    hdr[17] = RAY_COL_FORMAT_MAJOR; /* `order` = major version — pass the gate */
     hdr[18] = RAY_I64;  /* esz = 8 */
     hdr[20] = 1;        /* rc = 1 */
     int64_t len = 10;   /* 10 * 8 = 80 bytes needed, but only 8 written => truncated */
@@ -4087,6 +4147,114 @@ static test_result_t test_col_str_pool_roundtrip(void) {
     TEST_ASSERT_EQ_U(ln, strlen(s1));
     TEST_ASSERT_TRUE(memcmp(m1, s1, ln) == 0);
     ray_release(mapped);
+
+    ray_release(vec);
+    unlink(TMP_COL_PATH);
+    PASS();
+}
+
+/* ---- test_col_format_version_roundtrip ---------------------------------- */
+/* A saved column carries the format generation in the 32-byte header's
+ * `order` byte (offset 17), with aux (bytes 0-15) ZERO on disk (no magic —
+ * aux is reserved for postponed index persistence).  It
+ * round-trips through both ray_col_load (deep copy) and ray_col_mmap
+ * (zero-copy) with value + attrs intact, and the on-disk version byte must
+ * NOT leak into the in-memory runtime aux. */
+static test_result_t test_col_format_version_roundtrip(void) {
+    int32_t raw[] = {11, 22, 33, 44};
+    ray_t* vec = ray_vec_from_raw(RAY_I32, raw, 4);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+    TEST_ASSERT_EQ_I(ray_col_save(vec, TMP_COL_PATH), RAY_OK);
+
+    /* On disk: aux[0..15] all zero (no magic); byte 17 (order) == major. */
+    {
+        FILE* f = fopen(TMP_COL_PATH, "rb");
+        TEST_ASSERT_NOT_NULL(f);
+        uint8_t hd[18];
+        TEST_ASSERT_EQ_U(fread(hd, 1, 18, f), 18);
+        fclose(f);
+        for (int i = 0; i < 16; i++) TEST_ASSERT_EQ_U(hd[i], 0);  /* aux zeroed */
+        TEST_ASSERT_EQ_U(hd[17], RAY_COL_FORMAT_MAJOR);           /* order = version */
+    }
+
+    /* save -> load (deep copy): values intact, runtime aux reconstructed. */
+    ray_t* loaded = ray_col_load(TMP_COL_PATH);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    TEST_ASSERT_EQ_I(loaded->type, RAY_I32);
+    TEST_ASSERT_EQ_I(loaded->len, 4);
+    int32_t* ld = (int32_t*)ray_data(loaded);
+    TEST_ASSERT_EQ_I(ld[0], 11);
+    TEST_ASSERT_EQ_I(ld[3], 44);
+    /* version byte must not survive into runtime aux (plain column => zero). */
+    for (int i = 0; i < 16; i++) TEST_ASSERT_EQ_U(loaded->aux[i], 0);
+    ray_release(loaded);
+
+    /* save -> mmap (zero-copy): values intact, runtime aux reconstructed. */
+    ray_t* mapped = ray_col_mmap(TMP_COL_PATH);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(mapped));
+    TEST_ASSERT_EQ_U(mapped->mmod, 1);
+    TEST_ASSERT_EQ_I(mapped->len, 4);
+    int32_t* md = (int32_t*)ray_data(mapped);
+    TEST_ASSERT_EQ_I(md[1], 22);
+    TEST_ASSERT_EQ_I(md[2], 33);
+    for (int i = 0; i < 16; i++) TEST_ASSERT_EQ_U(mapped->aux[i], 0);
+    ray_release(mapped);
+
+    ray_release(vec);
+    unlink(TMP_COL_PATH);
+    PASS();
+}
+
+/* ---- test_col_format_bad_version ---------------------------------------- */
+/* The current format generation is 0 (RAY_COL_FORMAT_MAJOR).  Generation 0 is
+ * the shipped/legacy layout, so a zeroed order byte (offset 17) — pre-stamp
+ * data written by earlier engines — MUST load (regression: an earlier build
+ * demanded 1 and orphaned every pre-existing database with a "version" error).
+ * A file whose `order` byte is an UNRECOGNIZED generation is still rejected
+ * with a "version" error by both load + mmap. */
+static test_result_t test_col_format_bad_version(void) {
+    int64_t raw[] = {1, 2, 3};
+    ray_t* vec = ray_vec_from_raw(RAY_I64, raw, 3);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+
+    /* (a) generation 0 (legacy/unstamped order byte) => loads, value intact. */
+    TEST_ASSERT_EQ_I(ray_col_save(vec, TMP_COL_PATH), RAY_OK);
+    {
+        FILE* f = fopen(TMP_COL_PATH, "r+b");
+        TEST_ASSERT_NOT_NULL(f);
+        uint8_t zero = 0;
+        TEST_ASSERT_EQ_I(fseek(f, 17, SEEK_SET), 0);  /* order byte */
+        TEST_ASSERT_EQ_U(fwrite(&zero, 1, 1, f), 1);
+        fclose(f);
+    }
+    ray_t* r1 = ray_col_load(TMP_COL_PATH);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r1));
+    TEST_ASSERT_EQ_I(r1->len, 3);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(r1))[2], 3);
+    ray_release(r1);
+    ray_t* r2 = ray_col_mmap(TMP_COL_PATH);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r2));
+    TEST_ASSERT_EQ_I(r2->len, 3);
+    ray_release(r2);
+
+    /* (b) an unrecognized generation => "version" (both load + mmap). */
+    TEST_ASSERT_EQ_I(ray_col_save(vec, TMP_COL_PATH), RAY_OK);
+    {
+        FILE* f = fopen(TMP_COL_PATH, "r+b");
+        TEST_ASSERT_NOT_NULL(f);
+        uint8_t bad_ver = (uint8_t)(RAY_COL_FORMAT_MAJOR + 1);
+        TEST_ASSERT_EQ_I(fseek(f, 17, SEEK_SET), 0);  /* order byte */
+        TEST_ASSERT_EQ_U(fwrite(&bad_ver, 1, 1, f), 1);
+        fclose(f);
+    }
+    ray_t* r3 = ray_col_load(TMP_COL_PATH);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r3));
+    TEST_ASSERT_STR_EQ(ray_err_code(r3), "version");
+    ray_release(r3);
+    ray_t* r4 = ray_col_mmap(TMP_COL_PATH);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r4));
+    TEST_ASSERT_STR_EQ(ray_err_code(r4), "version");
+    ray_release(r4);
 
     ray_release(vec);
     unlink(TMP_COL_PATH);
@@ -4704,6 +4872,7 @@ const test_entry_t store_entries[] = {
     { "store/table_nrows_parted", test_table_nrows_parted, store_setup, store_teardown },
     { "store/parted_release", test_parted_release, store_setup, store_teardown },
     { "store/part_open", test_part_open, store_setup, store_teardown },
+    { "store/parted_tables", test_parted_tables, store_setup, store_teardown },
     { "store/group_parted", test_group_parted, store_setup, store_teardown },
     { "store/col_large_nullable_roundtrip", test_col_large_nullable_roundtrip, store_setup, store_teardown },
     { "store/col_save_load_str", test_col_save_load_str, store_setup, store_teardown },
@@ -4721,6 +4890,8 @@ const test_entry_t store_entries[] = {
     { "store/col_recursive_sym_in_list", test_col_recursive_sym_in_list, store_setup, store_teardown },
     { "store/col_sym_w64_neg_index", test_col_sym_w64_negative_index, store_setup, store_teardown },
     { "store/col_str_pool_roundtrip", test_col_str_pool_roundtrip, store_setup, store_teardown },
+    { "store/col_format_version_roundtrip", test_col_format_version_roundtrip, store_setup, store_teardown },
+    { "store/col_format_bad_version", test_col_format_bad_version, store_setup, store_teardown },
     { "store/col_str_empty_roundtrip", test_col_str_empty_roundtrip, store_setup, store_teardown },
     { "store/col_str_inline_only", test_col_str_inline_only_roundtrip, store_setup, store_teardown },
     { "store/col_slice_save", test_col_slice_save, store_setup, store_teardown },

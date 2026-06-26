@@ -52,3 +52,16 @@
 (set Tfgu (table [g] (list Gf)))
 (== (first Gf) (at (at (select {r: (first g) from: Tfgu}) 'r) 0)) -- true
 (type (at (select {r: (first g) from: Tfgu}) 'r))      -- 'GUID
+
+;; ── first must return a CONCRETE element, never a lazy DAG wrap, even for
+;; ── I64/F64.  A lazy result bound to a variable and used more than once
+;; ── broke on the second use (it consumed itself on first materialization).
+(type (first [10 20 30]))          -- 'i64
+((fn [] (let v (first [10 20 30])) (if (> v 0) v 0)))     -- 10
+((fn [] (let v (first [1.0 2.0 3.0])) (if (> v 0.0) v 0.0))) -- 1.0
+;; Reported case: first of a select-aggregate column, bound via let, reused.
+(set sesslog (table [sym sn] (list ['c1 'c1] [1 2])))
+((fn [] (let v (first (at (select {from: sesslog max_sn: (max sn)}) 'max_sn))) (if (> v 0) v 0))) -- 2
+;; Same hazard via a lambda PARAMETER (forced on first load, not at bind).
+((fn [v] (if (> v 0) v 0)) (first [10 20 30]))           -- 10
+((fn [v] (+ v v)) (last [10 20 30]))                     -- 60

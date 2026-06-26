@@ -214,6 +214,9 @@ static void win_compute_partition(
                     for (int64_t i = ps; i < pe; i++)
                         if (!ray_vec_is_null(fvec, sorted_idx[i]))
                             t += win_read_f64(fvec, sorted_idx[i]);
+                    /* Single-null float model: window SUM can overflow → ±Inf;
+                     * canonicalize to NULL_F64 (HAS_NULLS via win_finalize_nulls). */
+                    t = ray_f64_fin(t);
                     for (int64_t i = ps; i < pe; i++)
                         out[sorted_idx[i]] = t;
                 } else {
@@ -221,7 +224,7 @@ static void win_compute_partition(
                     for (int64_t i = ps; i < pe; i++) {
                         if (!ray_vec_is_null(fvec, sorted_idx[i]))
                             acc += win_read_f64(fvec, sorted_idx[i]);
-                        out[sorted_idx[i]] = acc;
+                        out[sorted_idx[i]] = ray_f64_fin(acc);
                     }
                 }
             } else {
@@ -255,7 +258,7 @@ static void win_compute_partition(
                         t += win_read_f64(fvec, sorted_idx[i]); cnt++;
                     }
                 if (cnt > 0) {
-                    double avg = t / (double)cnt;
+                    double avg = ray_f64_fin(t / (double)cnt);
                     for (int64_t i = ps; i < pe; i++)
                         out[sorted_idx[i]] = avg;
                 } else {
@@ -270,7 +273,7 @@ static void win_compute_partition(
                         acc += win_read_f64(fvec, sorted_idx[i]); cnt++;
                     }
                     if (cnt > 0)
-                        out[sorted_idx[i]] = acc / (double)cnt;
+                        out[sorted_idx[i]] = ray_f64_fin(acc / (double)cnt);
                     else
                         win_set_null(rvec, sorted_idx[i]);
                 }
@@ -644,6 +647,29 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     ray_op_ext_t* ext = find_ext(g, op->id);
     if (!ext) return ray_error("nyi", NULL);
 
+    /* Frame-spec validation (review 2.10): the compute path honors EXACTLY two
+     * frames — the whole partition (UNBOUNDED PRECEDING .. UNBOUNDED FOLLOWING)
+     * and the running frame (UNBOUNDED PRECEDING .. CURRENT ROW, ROWS mode).
+     * Numeric N_PRECEDING/N_FOLLOWING bounds and RANGE-mode CURRENT ROW were
+     * accepted but SILENTLY degraded to the running frame, yielding the wrong
+     * window.  Reject any unsupported frame LOUDLY instead.
+     *   - whole:   end == UNBOUNDED_FOLLOWING (ROWS == RANGE here, mode moot)
+     *   - running: end == CURRENT_ROW and ROWS mode
+     * Both require start == UNBOUNDED_PRECEDING. */
+    {
+        uint8_t fs = ext->window.frame_start;
+        uint8_t fe = ext->window.frame_end;
+        bool whole_frame   = (fs == RAY_BOUND_UNBOUNDED_PRECEDING &&
+                              fe == RAY_BOUND_UNBOUNDED_FOLLOWING);
+        bool running_frame = (fs == RAY_BOUND_UNBOUNDED_PRECEDING &&
+                              fe == RAY_BOUND_CURRENT_ROW &&
+                              ext->window.frame_type == RAY_FRAME_ROWS);
+        if (!whole_frame && !running_frame)
+            return ray_error("nyi", "unsupported window frame: only "
+                "ROWS BETWEEN UNBOUNDED PRECEDING AND {CURRENT ROW | "
+                "UNBOUNDED FOLLOWING} are honored");
+    }
+
     int64_t nrows = ray_table_nrows(tbl);
     int64_t ncols = ray_table_ncols(tbl);
     uint8_t n_part  = ext->window.n_part_keys;
@@ -669,7 +695,7 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     memset(sort_descs, 0, sizeof(sort_descs));
 
     for (uint8_t k = 0; k < n_part; k++) {
-        sort_vecs[k] = win_resolve_vec(g, ext->window.part_keys[k], tbl,
+        sort_vecs[k] = win_resolve_vec(g, op_node(g, ext->window.part_keys[k]), tbl,
                                         &sort_owned[k]);
         sort_descs[k] = 0;  /* partition keys always ASC */
         if (!sort_vecs[k] || RAY_IS_ERR(sort_vecs[k])) {
@@ -681,7 +707,7 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         }
     }
     for (uint8_t k = 0; k < n_order; k++) {
-        sort_vecs[n_part + k] = win_resolve_vec(g, ext->window.order_keys[k],
+        sort_vecs[n_part + k] = win_resolve_vec(g, op_node(g, ext->window.order_keys[k]),
                                                  tbl, &sort_owned[n_part + k]);
         sort_descs[n_part + k] = ext->window.order_descs[k];
         if (!sort_vecs[n_part + k] || RAY_IS_ERR(sort_vecs[n_part + k])) {
@@ -701,7 +727,7 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     memset(func_owned, 0, sizeof(func_owned));
     memset(result_vecs, 0, sizeof(result_vecs));
     for (uint8_t f = 0; f < n_funcs; f++) {
-        ray_op_t* fi = ext->window.func_inputs[f];
+        ray_op_t* fi = op_node(g, ext->window.func_inputs[f]);
         if (fi) {
             func_vecs[f] = win_resolve_vec(g, fi, tbl, &func_owned[f]);
             if (!func_vecs[f] || RAY_IS_ERR(func_vecs[f])) {

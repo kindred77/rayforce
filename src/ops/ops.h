@@ -195,10 +195,11 @@ void     ray_cancel(void);
 #define OP_GROUP        62
 #define OP_JOIN         63
 #define OP_WINDOW_JOIN  64
-/* Fused filter+group: predicate evaluated on each morsel and group HT
- * updated inline.  Produced by the planner for `(select … where … by …)`
- * when the predicate shape is supported (see src/ops/fused_group.c). */
-#define OP_FILTERED_GROUP 65
+/* Opcode 65 (formerly OP_FILTERED_GROUP) is RETIRED.  The benchmark-tuned
+ * fused filter+group operator was removed once the general FILTER + OP_GROUP
+ * (v2) path became competitive-or-better on every shape it handled; the
+ * planner now routes `(select … where … by …)` through that general path.
+ * The number is left reserved — do not reuse it for a new opcode. */
 #define OP_SELECT       66
 #define OP_HEAD         67
 #define OP_TAIL         68
@@ -217,43 +218,9 @@ void     ray_cancel(void);
 #define OP_MEDIAN       88   /* exact median per group (bucket-scatter + quickselect) */
 #define OP_TOP_N        89   /* per-group largest K values (bounded max-heap) */
 #define OP_BOT_N        90   /* per-group smallest K values (bounded min-heap) */
-/* Dedicated single-pass per-group top-K / bot-K with row-form emission.
- * Replaces the OP_GROUP + radix-HT + LIST<K>-cell + explode pipeline for
- * the canonical shape `(select (top|bot col K) from t by single_key)`.
- * Two-phase parallel: per-worker bounded heaps in phase 1; merge by hash
- * partition in phase 2; emit a 2-column table (key, value) in row form. */
-#define OP_GROUP_TOPK_ROWFORM  91
-#define OP_GROUP_BOTK_ROWFORM 110
-/* Dedicated single-pass per-group Pearson² with row-form emission for
- * the canonical shape `(select (pearson_corr x y) from t by [k0 k1])`.
- * Two-phase parallel: per-worker scatter into RADIX_P partitions in
- * phase 1; per-partition open-addressing HT with fixed Pearson state
- * (Σx, Σy, Σx², Σy², Σxy, cnt) in phase 2; emit a 3-column table
- * (key0, key1, r²) directly.  Bypasses Anton-merge slowdown that
- * affects OP_PEARSON_CORR via the shared radix HT path.  1 or 2 keys. */
-#define OP_GROUP_PEARSON_ROWFORM 111
-/* Dedicated single-pass per-group MAX(x)+MIN(y) with row-form emission
- * for the canonical shape `(select (max x) (min y) from t by k)`.
- * Bypasses Anton-merge slowdown on the shared radix HT path.  Closes
- * the first stage of H2O canonical q7 (max(v1)-min(v2) per id3); the
- * second stage is element-wise arithmetic on the small result.  1 key,
- * 2 fixed-state aggs (MAX, MIN), integer x/y. */
-#define OP_GROUP_MAXMIN_ROWFORM 112
-/* Dedicated single-pass per-group MEDIAN(v)+STDDEV(v) with row-form
- * emission for canonical shape `(select (median v) (std v) from t by
- * k0 k1)`.  Pass 2 builds per-partition HT + group-contiguous F64
- * v_buf in two passes; Pass 3 runs ray_median_dbl_inplace per group.
- * Bypasses the shared OP_GROUP path's reprobe-and-histogram holistic
- * fill.  Closes H2O canonical q6.  2 keys, both aggs on the same
- * column, non-nullable inputs. */
-#define OP_GROUP_MEDIAN_STDDEV_ROWFORM 113
-/* Dedicated multi-key (N=3..8) per-group sum(v)+count(v) with row-form
- * emission for canonical shape `(select (sum v) (count v) from t by
- * k1 k2 .. kN)`.  Bypasses the shared OP_GROUP path's direct-array
- * eligibility scans, rowsel + nullable defensive checks, and Anton-
- * merge regressions.  Closes H2O canonical q10 (6-key composite with
- * ~10M unique groups, essentially a row-dedup workload). */
-#define OP_GROUP_SUM_COUNT_ROWFORM 114
+/* Opcodes 91 and 110-114 are retired (formerly OP_GROUP_*_ROWFORM); the
+ * dedicated row-form group operators were subsumed by the v2 group engine.
+ * Numbers left unreused to avoid renumbering churn. */
 
 /* Canonical aggregand type-admission — shared by the scalar builtins
  * (ray_sum_fn / ray_avg_fn / ray_var_fn / ...) and the DAG/group executors so
@@ -355,16 +322,22 @@ static inline bool agg_type_admitted(uint16_t op, int8_t t) {
 #define OP_FLAG_PUSHED       0x01  /* filter interposed below a GROUP by predicate pushdown */
 #define OP_FLAG_DEAD         0x02
 
-/* Operation node (32 bytes, fits one cache line) */
+/* Sentinel node id for "no input".  Node id 0 is a valid node (the first
+ * one allocated), so zero cannot mean "none" — use the max value.  All
+ * graph edges are stable uint32 ids (indices into g->nodes), never raw
+ * pointers, so g->nodes may realloc freely with no fixup. */
+#define RAY_OP_NONE  ((uint32_t)0xFFFFFFFFu)
+
+/* Operation node (fits one cache line) */
 typedef struct ray_op {
     uint16_t       opcode;     /* OP_ADD, OP_SCAN, OP_FILTER, etc. */
     uint8_t        arity;      /* 0, 1, or 2 */
     uint8_t        flags;      /* PUSHED, DEAD */
     int8_t         out_type;   /* inferred output type */
     uint8_t        pad[3];
-    uint32_t       id;         /* unique node ID */
+    uint32_t       id;         /* unique node ID (== index into g->nodes) */
     uint32_t       est_rows;   /* estimated row count */
-    struct ray_op*  inputs[2];  /* NULL if unused */
+    uint32_t       in_id[2];   /* input node ids; RAY_OP_NONE if unused */
 } ray_op_t;
 
 /* Extended operation node for N-ary ops (heap-allocated, variable size) */
@@ -374,16 +347,16 @@ typedef struct ray_op_ext {
         ray_t*   literal;       /* OP_CONST: inline literal value */
         int64_t sym;           /* OP_SCAN: column name symbol ID */
         struct {               /* OP_GROUP: group-by specification */
-            ray_op_t**  keys;
+            uint32_t*  keys;        /* node ids */
             uint8_t    n_keys;
             uint8_t    n_aggs;
             uint16_t*  agg_ops;
-            ray_op_t**  agg_ins;
+            uint32_t*  agg_ins;     /* node ids */
             /* Optional second input per agg — non-NULL only for binary
              * aggregators (currently: OP_PEARSON_CORR). NULL for all
              * unary aggs and for the whole pointer when no binary agg
              * is present in this group. */
-            ray_op_t**  agg_ins2;
+            uint32_t*  agg_ins2;    /* node ids */
             /* Optional integer parameter per agg — used by holistic
              * aggregators that take a scalar literal alongside the
              * column (currently OP_TOP_N / OP_BOT_N: K).  NULL for
@@ -391,28 +364,28 @@ typedef struct ray_op_ext {
             int64_t*    agg_k;
         };
         struct {               /* OP_SORT: multi-column sort */
-            ray_op_t**  columns;
+            uint32_t*  columns;     /* node ids */
             uint8_t*   desc;
             uint8_t*   nulls_first; /* 1=nulls first, 0=nulls last */
             uint8_t    n_cols;
         } sort;
         struct {               /* OP_JOIN: join specification */
-            ray_op_t**  left_keys;
-            ray_op_t**  right_keys;
+            uint32_t*  left_keys;   /* node ids */
+            uint32_t*  right_keys;  /* node ids */
             uint8_t    n_join_keys;
             uint8_t    join_type;  /* 0=inner, 1=left, 2=full, 3=anti */
         } join;
         struct {               /* OP_WINDOW_JOIN: ASOF join */
-            ray_op_t*   time_key;      /* time/ordered key column */
-            ray_op_t**  eq_keys;       /* equality partition keys */
+            uint32_t   time_key;       /* time/ordered key column (node id) */
+            uint32_t*  eq_keys;        /* equality partition keys (node ids) */
             uint8_t    n_eq_keys;     /* number of equality keys */
             uint8_t    join_type;     /* 0=inner, 1=left outer */
         } asof;
         struct {               /* OP_WINDOW: window functions */
-            ray_op_t**  part_keys;
-            ray_op_t**  order_keys;
+            uint32_t*  part_keys;   /* node ids */
+            uint32_t*  order_keys;  /* node ids */
             uint8_t*   order_descs;
-            ray_op_t**  func_inputs;
+            uint32_t*  func_inputs; /* node ids */
             uint8_t*   func_kinds;    /* RAY_WIN_ROW_NUMBER etc. */
             int64_t*   func_params;   /* NTILE(n), LAG offset, etc. */
             uint8_t    n_part_keys;
@@ -453,13 +426,17 @@ typedef struct ray_op_ext {
             int32_t   ef_search;      /* ANN only */
         } rerank;
         struct {  /* OP_PIVOT */
-            ray_op_t**  index_cols;   /* OP_SCAN nodes for index columns */
-            ray_op_t*   pivot_col;    /* OP_SCAN node for pivot column */
-            ray_op_t*   value_col;    /* OP_SCAN node for value column */
+            uint32_t*   index_cols;   /* OP_SCAN node ids for index columns */
+            uint32_t    pivot_col;    /* OP_SCAN node id for pivot column */
+            uint32_t    value_col;    /* OP_SCAN node id for value column */
             uint16_t    agg_op;       /* OP_SUM, OP_AVG, etc. */
             uint8_t     n_index;      /* number of index columns */
         } pivot;
     };
+    /* Third input node id for 3-ary ops (OP_IF else-branch, OP_SUBSTR length,
+     * table-valued third arg).  RAY_OP_NONE if unused.  Replaces the former
+     * (ray_t*)(uintptr_t) punning of `literal`. */
+    uint32_t  third_in;
     uint64_t* seg_mask;   /* partition pruning bitmap (NULL = all active) */
     int64_t   seg_mask_count; /* number of partitions the mask covers */
 } ray_op_ext_t;
@@ -687,35 +664,6 @@ ray_op_t* ray_group3(ray_graph_t* g, ray_op_t** keys, uint8_t n_keys,
                      uint16_t* agg_ops, ray_op_t** agg_ins,
                      ray_op_t** agg_ins2, const int64_t* agg_k,
                      uint8_t n_aggs);
-/* Dedicated per-group top-K / bot-K with row-form emission.  Replaces
- * the OP_GROUP + post-radix LIST-cell + explode pipeline for the
- * canonical shape `(select (top|bot col K) from t by single_key)`.
- * Pass desc=1 for top-K, desc=0 for bot-K.  Result is a 2-column
- * table: the key column (type-matched to `key`) and the value column
- * (type-matched to `val`), both flat — one row per (group, kept-value). */
-ray_op_t* ray_group_topk_rowform(ray_graph_t* g, ray_op_t* key,
-                                  ray_op_t* val, int64_t k, uint8_t desc);
-/* Dedicated per-group Pearson² with row-form emission.  See
- * OP_GROUP_PEARSON_ROWFORM comment above.  keys[0..n_keys) are the
- * group-by columns (1 or 2); x and y are the two value columns.  Output:
- * (key0, [key1,] r2) table where r² = corr(x, y)² per group. */
-ray_op_t* ray_group_pearson_rowform(ray_graph_t* g, ray_op_t** keys,
-                                     uint8_t n_keys, ray_op_t* x, ray_op_t* y);
-/* Dedicated per-group max(x) + min(y) with row-form emission.  See
- * OP_GROUP_MAXMIN_ROWFORM comment.  Output: (key, max_x, min_y). */
-ray_op_t* ray_group_maxmin_rowform(ray_graph_t* g, ray_op_t* key,
-                                    ray_op_t* x, ray_op_t* y);
-/* Dedicated per-group median(v) + std(v) with row-form emission.  See
- * OP_GROUP_MEDIAN_STDDEV_ROWFORM comment.  keys[0..1] are two group
- * columns; v is the value column for both aggregates.  Output:
- * (key0, key1, v_median, v_std). */
-ray_op_t* ray_group_median_stddev_rowform(ray_graph_t* g, ray_op_t** keys,
-                                           ray_op_t* v, int with_count);
-/* Dedicated multi-key per-group sum(v)+count(v) with row-form emission.
- * See OP_GROUP_SUM_COUNT_ROWFORM comment.  N keys (3..8); v is the
- * value column for sum (count counts non-null v rows). */
-ray_op_t* ray_group_sum_count_rowform(ray_graph_t* g, ray_op_t** keys,
-                                       uint8_t n_keys, ray_op_t* v);
 ray_op_t* ray_distinct(ray_graph_t* g, ray_op_t** keys, uint8_t n_keys);
 ray_op_t* ray_pivot_op(ray_graph_t* g,
                        ray_op_t** index_cols, uint8_t n_index,

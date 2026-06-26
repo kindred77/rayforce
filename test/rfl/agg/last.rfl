@@ -46,3 +46,9 @@
 (set Gl (guid 6))
 (set Tlgu (table [g] (list Gl)))
 (== (last Gl) (at (at (select {r: (last g) from: Tlgu}) 'r) 0)) -- true
+
+;; ── last must return a CONCRETE element (never a lazy DAG wrap) for I64/F64
+;; ── too, so a value bound via let and used twice survives (see first.rfl).
+(type (last [10 20 30]))          -- 'i64
+((fn [] (let v (last [10 20 30])) (if (> v 0) v 0)))     -- 30
+((fn [] (let v (last [1.0 2.0 3.0])) (if (> v 0.0) v 0.0))) -- 3.0

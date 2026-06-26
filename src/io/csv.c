@@ -396,8 +396,14 @@ RAY_INLINE int64_t fast_i64(const char* p, size_t len, bool* is_null) {
 RAY_INLINE double fast_f64(const char* p, size_t len, bool* is_null) {
     double v = 0.0;
     size_t n = ray_parse_f64(p, len, &v);
-    *is_null = (n == 0 || n != len);
-    return *is_null ? 0.0 : v;
+    /* STAGE 2 (single-null float model): ray_parse_f64 already canonicalizes
+     * any non-finite parse ("inf"/"nan"/"1e400") to NULL_F64 (0Nf).  Treat
+     * an unparseable cell OR a canonical 0Nf as null so the column's
+     * HAS_NULLS / null bitmap is marked the same way as a blank cell — the
+     * F64 domain is {finite} ∪ {0Nf}, and a 0Nf row reads as nil?.
+     * `v != v` is the model's null test (true only for the NaN-bit 0Nf). */
+    *is_null = (n == 0 || n != len || v != v);
+    return *is_null ? NULL_F64 : v;
 }
 
 /* --------------------------------------------------------------------------
@@ -459,7 +465,7 @@ RAY_INLINE int32_t fast_time(const char* p, size_t len, bool* is_null) {
  * src/lang/format.c:ts_to_parts and csv_write_timestamp).  Accept up
  * to 9 fractional digits; shorter fractions are right-padded with
  * zeros, longer ones are truncated. */
-RAY_INLINE int64_t fast_time_ns(const char* p, size_t len, bool* is_null) {
+RAY_INLINE int64_t fast_time_ns(const char* p, size_t len, bool* is_null, size_t* consumed) {
     if (RAY_UNLIKELY(len < 8)) { *is_null = true; return 0; }
     *is_null = false;
     int h  = (p[0]-'0')*10 + (p[1]-'0');
@@ -468,18 +474,47 @@ RAY_INLINE int64_t fast_time_ns(const char* p, size_t len, bool* is_null) {
     if (RAY_UNLIKELY(h > 23 || mi > 59 || s > 59)) { *is_null = true; return 0; }
     int64_t ns = (int64_t)h * 3600000000000LL + (int64_t)mi * 60000000000LL +
                  (int64_t)s * 1000000000LL;
+    size_t used = 8;
     if (len > 8 && p[8] == '.') {
         int64_t frac = 0;
         int digits = 0;
-        for (size_t i = 9; i < len && digits < 9; i++, digits++) {
+        size_t i = 9;
+        for (; i < len && digits < 9; i++, digits++) {
             unsigned di = (unsigned char)p[i] - '0';
             if (di > 9) break;
             frac = frac * 10 + (int64_t)di;
         }
         while (digits < 9) { frac *= 10; digits++; }
         ns += frac;
+        used = i;  /* index of the first char past the fractional seconds */
     }
+    if (consumed) *consumed = used;
     return ns;
+}
+
+/* Parse a trailing ISO-8601 UTC offset at p: 'Z'/'z' (== UTC) or
+ * (+|-)HH[[:]MM].  On success sets *out_ns to the signed offset in
+ * nanoseconds (to be SUBTRACTED from the local wall-clock value to get
+ * UTC) and returns true.  Returns false if the suffix is not a
+ * recognized offset (caller then leaves the value unadjusted, preserving
+ * the prior behaviour of ignoring unrecognized trailing characters). */
+RAY_INLINE bool parse_tz_offset(const char* p, size_t len, int64_t* out_ns) {
+    if (len == 0) return false;
+    if (p[0] == 'Z' || p[0] == 'z') { *out_ns = 0; return true; }
+    int sign;
+    if (p[0] == '+') sign = 1;
+    else if (p[0] == '-') sign = -1;
+    else return false;
+    if (len < 3 || p[1] < '0' || p[1] > '9' || p[2] < '0' || p[2] > '9') return false;
+    int hh = (p[1]-'0')*10 + (p[2]-'0');
+    int mm = 0;
+    size_t i = 3;
+    if (len > i && p[i] == ':') i++;            /* optional ':' separator */
+    if (len >= i + 2 && p[i] >= '0' && p[i] <= '9' && p[i+1] >= '0' && p[i+1] <= '9')
+        mm = (p[i]-'0')*10 + (p[i+1]-'0');
+    if (RAY_UNLIKELY(hh > 23 || mm > 59)) return false;
+    *out_ns = (int64_t)sign * ((int64_t)hh * 3600 + (int64_t)mm * 60) * 1000000000LL;
+    return true;
 }
 
 RAY_INLINE int64_t fast_timestamp(const char* p, size_t len, bool* is_null) {
@@ -488,10 +523,20 @@ RAY_INLINE int64_t fast_timestamp(const char* p, size_t len, bool* is_null) {
     int32_t days = fast_date(p, 10, is_null);
     if (*is_null) return 0;
     bool time_null = false;
-    int64_t time_ns = fast_time_ns(p + 11, len - 11, &time_null);
+    size_t time_used = 8;
+    int64_t time_ns = fast_time_ns(p + 11, len - 11, &time_null, &time_used);
     if (time_null) { *is_null = true; return 0; }
     const int64_t NS_PER_DAY = 86400000000000LL;
-    return (int64_t)days * NS_PER_DAY + time_ns;
+    int64_t result = (int64_t)days * NS_PER_DAY + time_ns;
+    /* Optional trailing UTC offset (Z | ±HH:MM | ±HHMM | ±HH).  The common
+     * no-offset case ends exactly at the time component (off == len), so
+     * the hot path pays only this single predicted-not-taken bounds check. */
+    size_t off = 11 + time_used;
+    if (RAY_UNLIKELY(off < len)) {
+        int64_t adj;
+        if (parse_tz_offset(p + off, len - off, &adj)) result -= adj;
+    }
+    return result;
 }
 
 /* --------------------------------------------------------------------------
@@ -1297,16 +1342,19 @@ static int csv_should_attach_hash(ray_t* v) {
      * across ~150 chunks each ~1.8e19 wide overflows; double has
      * ~15 significant decimal digits, plenty for this coarse ratio).
      *
-     * Threshold = 0.2.  The strict 0.5 cut documented in the design
-     * note cleanly catches uniformly-random hashed columns (ratio
-     * ~1.0) but excludes mildly-clustered numeric IDs like UserID
-     * (~0.26 on the ClickBench hits data: user sessions cluster
-     * consecutively so chunk spans don't fully cover the I64 range).
-     * For point lookups on those columns chunk_zone still prunes
-     * most chunks but ~30 % can hold the key — a 30 % full-column
-     * scan, not a real win.  Dropping to 0.2 admits UserID while
-     * still excluding tightly-clustered keys (CounterID/EventDate
-     * at <0.01) where chunk_zone already gives 99 %+ pruning. */
+     * Threshold = 0.5.  mean_ratio measures how much of the global
+     * value range an average chunk spans: it is the entropy/clustering
+     * signal that decides whether a hash index pays off.  A value
+     * near 1.0 means each chunk already covers (almost) the whole
+     * range — the column is effectively uniformly random, chunk_zone
+     * min/max pruning is useless, so every point lookup degenerates
+     * to a full-column scan and a hash index is the only way to make
+     * it cheap.  A small ratio means values are clustered, so
+     * chunk_zone already prunes most chunks and the index buys little.
+     * 0.5 is the natural random-vs-clustered separator: above it a
+     * chunk spans more than half the range (no useful zone pruning,
+     * index it); below it clustering gives the zone map real pruning
+     * power and the index's memory/build cost isn't justified. */
     double dgr = (double)global_range;
     double span_sum = 0.0;
     uint32_t n_eff = 0;
@@ -1318,7 +1366,7 @@ static int csv_should_attach_hash(ray_t* v) {
     }
     if (n_eff < 4) return 0;
     double mean_ratio = (span_sum / (double)n_eff) / dgr;
-    if (mean_ratio <= 0.2) return 0;
+    if (mean_ratio <= 0.5) return 0;
 
     /* Memory cap: ray_index_attach_hash allocates a power-of-two
      * `cap = next_pow2(2*n)` int64 table plus an n-entry int64
@@ -1624,7 +1672,9 @@ ray_t* ray_read_csv_named_opts(const char* path, char delimiter, bool header,
     if (ncols > CSV_MAX_COLS) {
         munmap(buf, file_size);
         /* fd already closed after mmap (line 1044) — do not close again */
-        return ray_error("range", NULL);  /* too many columns */
+        /* too many columns */
+        return ray_error("range", "csv read: header has too many columns, got %lld (max %d)",
+                         (long long)ncols, CSV_MAX_COLS);
     }
 
     /* ---- 5. Parse header row ---- */
@@ -2085,6 +2135,11 @@ static ray_err_t csv_splayed_writer_close(csv_splayed_col_writer_t* w) {
         hdr.rc = (w->type == RAY_SYM)
             ? (uint32_t)ray_sym_domain_count(w->dom) : 0;
         if (w->had_nulls) hdr.attrs |= RAY_ATTR_HAS_NULLS;
+        /* Stamp the on-disk format major version into `order` so the
+         * streamed column file shares the exact identity ray_col_save
+         * writes — the loaders validate it.  aux stays zero (it was
+         * zero-initialized above) — reserved for postponed index data. */
+        ray_col_stamp_format(&hdr);
         if (fseek(w->fp, 0, SEEK_SET) != 0 ||
             fwrite(&hdr, 1, 32, w->fp) != 32)
             err = RAY_ERR_IO;
@@ -2243,11 +2298,12 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
                 munmap(buf, file_size);
                 return tbl ? ray_err_from_obj(tbl) : RAY_ERR_IO;
             }
-            /* Splay save owns the symfile now: dir/sym is the table's
+            /* Splay save owns the symfile now: dir/.sym is the table's
              * domain (distinct-merge + position encoding); symbol-free
-             * tables write none. */
+             * tables write none.  The dotfile name leaves "sym" free as a
+             * user column. */
             char sym_path[1024];
-            int n = snprintf(sym_path, sizeof(sym_path), "%s/sym", dir);
+            int n = snprintf(sym_path, sizeof(sym_path), "%s/.sym", dir);
             if (n < 0 || (size_t)n >= sizeof(sym_path)) {
                 ray_release(tbl);
                 munmap(buf, file_size);
@@ -2280,7 +2336,7 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
     }
     remove(schema_path); /* best-effort; ENOENT is the common case */
 
-    /* SYM columns encode against the table's symfile domain (dir/sym):
+    /* SYM columns encode against the table's symfile domain (dir/.sym):
      * open-or-create it up front; cells intern as they stream. */
     struct ray_sym_domain_s* sym_dom = NULL;
     {
@@ -2289,7 +2345,7 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
             if (resolved_types[c] == RAY_SYM) any_sym = true;
         if (any_sym) {
             char sym_path[1024];
-            int n = snprintf(sym_path, sizeof(sym_path), "%s/sym", dir);
+            int n = snprintf(sym_path, sizeof(sym_path), "%s/.sym", dir);
             if (n < 0 || (size_t)n >= sizeof(sym_path)) {
                 munmap(buf, file_size);
                 return RAY_ERR_RANGE;
@@ -2607,9 +2663,9 @@ ray_err_t ray_csv_save_parted_named_opts(const char* path, char delimiter, bool 
             fprintf(stderr, "csv.parted: save part=%" PRId64 " rows=%" PRId64 " leaf=%s\n",
                     part, cnt, leaf);
         /* Every partition encodes against the parted root's shared
-         * symfile (root/sym) — one domain for the whole table. */
+         * symfile (root/.sym) — one domain for the whole table. */
         char root_sym[1024];
-        int sn = snprintf(root_sym, sizeof(root_sym), "%s/sym", root);
+        int sn = snprintf(root_sym, sizeof(root_sym), "%s/.sym", root);
         if (sn < 0 || (size_t)sn >= sizeof(root_sym)) {
             ray_release(tbl);
             scratch_free(row_offsets_hdr);
@@ -2631,7 +2687,7 @@ ray_err_t ray_csv_save_parted_named_opts(const char* path, char delimiter, bool 
         part++;
     }
 
-    /* root/sym is maintained per-partition by ray_splay_save_bulk
+    /* root/.sym is maintained per-partition by ray_splay_save_bulk
      * (distinct-merge + flush before each partition's columns) — no
      * whole-dictionary dump at the end anymore. */
     munmap(buf, file_size);

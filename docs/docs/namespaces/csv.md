@@ -91,7 +91,7 @@ Constraints on `tbl_name`: must not start with `.`, must not contain `/` or `\\`
 (set t (.csv.parted [SYM F64 I64 DATE] "trades.csv" 10000000 "/data/db" 'trades))
 ```
 
-See [`.db.parted.get` and `.db.parted.mount`](db.md#db-parted-get) for how to reload the resulting layout.
+See [`.db.parted.get`](db.md#db-parted-get) for how to reload the resulting layout.
 
 ## See also
 

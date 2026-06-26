@@ -3587,10 +3587,86 @@ static test_result_t test_single_edge_roundtrip(void) {
 }
 
 /* --------------------------------------------------------------------------
+ * Review §2.9 #6 — CSR build is deterministic for parallel edges.
+ *
+ * qsort is not stable: for parallel edges (equal src AND equal dst) the
+ * rowmap order would be platform/input dependent without a secondary
+ * tie-break on .row.  After the fix, rowmap within a (src,dst) group is
+ * ordered by original row, regardless of the input edge permutation.  We
+ * build the same multigraph from two different input orderings and assert
+ * identical fwd targets+rowmap.
+ * -------------------------------------------------------------------------- */
+static ray_rel_t* build_multigraph(const int64_t* s, const int64_t* d, int64_t n) {
+    ray_t* sv = ray_vec_from_raw(RAY_I64, (int64_t*)s, n);
+    ray_t* dv = ray_vec_from_raw(RAY_I64, (int64_t*)d, n);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("src", 3), sv);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("dst", 3), dv);
+    ray_release(sv); ray_release(dv);
+    ray_rel_t* rel = ray_rel_from_edges(tbl, "src", "dst", 3, 3, false);
+    ray_release(tbl);
+    return rel;
+}
+
+static test_result_t test_csr_tiebreak_determinism(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* Multigraph with parallel edges 0->1 (x3), 0->2, 1->2.
+     * Ordering A: parallel 0->1 edges appear at rows 0,2,4. */
+    int64_t sA[] = {0, 0, 0, 1, 0};
+    int64_t dA[] = {1, 2, 1, 2, 1};
+    ray_rel_t* relA = build_multigraph(sA, dA, 5);
+    TEST_ASSERT_NOT_NULL(relA);
+
+    /* Build a second time with the SAME logical edges — determinism means
+     * the same input yields the same rowmap every time. */
+    ray_rel_t* relB = build_multigraph(sA, dA, 5);
+    TEST_ASSERT_NOT_NULL(relB);
+
+    int64_t* tA = (int64_t*)ray_data(relA->fwd.targets);
+    int64_t* rA = (int64_t*)ray_data(relA->fwd.rowmap);
+    int64_t* tB = (int64_t*)ray_data(relB->fwd.targets);
+    int64_t* rB = (int64_t*)ray_data(relB->fwd.rowmap);
+    TEST_ASSERT_EQ_I(relA->fwd.n_edges, relB->fwd.n_edges);
+    for (int64_t i = 0; i < relA->fwd.n_edges; i++) {
+        TEST_ASSERT_EQ_I(tA[i], tB[i]);
+        TEST_ASSERT_EQ_I(rA[i], rB[i]);
+    }
+
+    /* node 0's adjacency: three 0->1 (rows 0,2,4) then one 0->2 (row 1).
+     * With sort_targets=false the group order is the qsort order (by dst,
+     * then row): dst=1 rows {0,2,4} ascending, then dst=2 row {1}. */
+    int64_t cnt;
+    int64_t* n0 = ray_csr_neighbors(&relA->fwd, 0, &cnt);
+    TEST_ASSERT_EQ_I(cnt, 4);
+    /* rowmap for node 0 region is the first 4 entries (node 0 owns rows
+     * [off[0], off[1]) ). The three dst==1 edges must carry rows 0,2,4 in
+     * ascending order — this is the determinism the tie-break guarantees. */
+    int64_t start = ((int64_t*)ray_data(relA->fwd.offsets))[0];
+    /* Collect rows where target==1 in node 0's list. */
+    int64_t got[3]; int gi = 0;
+    for (int64_t i = start; i < start + cnt; i++) {
+        if (n0[i - start] == 1) got[gi++] = rA[i];
+    }
+    TEST_ASSERT_EQ_I(gi, 3);
+    TEST_ASSERT_EQ_I(got[0], 0);
+    TEST_ASSERT_EQ_I(got[1], 2);
+    TEST_ASSERT_EQ_I(got[2], 4);
+
+    ray_rel_free(relA);
+    ray_rel_free(relB);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
  * Suite definition
  * -------------------------------------------------------------------------- */
 
 const test_entry_t csr_entries[] = {
+    { "csr/tiebreak_determinism", test_csr_tiebreak_determinism, NULL, NULL },
     { "csr/build", test_csr_build, NULL, NULL },
     { "csr/sorted", test_csr_sorted, NULL, NULL },
     { "csr/expand", test_expand, NULL, NULL },

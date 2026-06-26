@@ -1,10 +1,17 @@
 name: CI
 
 on:
-  push:
-    branches: [master]
+  # PR-only. Every change reaches dev and master through a pull request, and
+  # the pull_request run tests the exact merge result — so one run gates each
+  # hop:
+  #   • PR -> dev    : gates feature/fix work landing on the integration branch
+  #   • PR -> master : the required gate for a release (dev -> master, vX.Y.Z)
+  # No push triggers: a post-merge `push` run only re-tests what the PR run
+  # already validated (the redundant on-merge-to-dev run we were paying for).
+  # Direct pushes to a branch are not expected — the flow is PRs onto dev,
+  # then dev baked to master as a release.
   pull_request:
-    branches: [master]
+    branches: [master, dev]
 
 jobs:
   build-and-test:
@@ -28,5 +35,27 @@ jobs:
       - name: Build (${{ matrix.target }})
         run: make ${{ matrix.target }}
 
+      # Tests build their own debug+ASan objects, so they only make sense after a
+      # debug build. Running `make test` after `make release` reuses the
+      # release-compiled src objects (no -DDEBUG), which omits DEBUG-only symbols
+      # like ray_check_null_invariant and fails to link. The release legs still
+      # verify the optimized build compiles + links; the debug legs run the tests.
       - name: Test
+        if: matrix.target == 'debug'
         run: make test
+
+  # Single stable check to require in branch protection, instead of the four
+  # brittle matrix names (which break if the matrix is renamed). `if: always()`
+  # makes this job run even when a matrix leg fails, and the explicit result
+  # check fails it — without that, a failed matrix would SKIP this job, and a
+  # skipped required check can be treated as passed, silently opening the gate.
+  ci-success:
+    needs: build-and-test
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify all matrix jobs passed
+        run: |
+          result='${{ needs.build-and-test.result }}'
+          echo "build-and-test result: $result"
+          [ "$result" = "success" ] || exit 1

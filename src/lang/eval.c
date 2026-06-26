@@ -35,6 +35,7 @@
 #include "ops/idxop.h"
 #include "ops/linkop.h"
 #include "table/sym.h"
+#include "vec/vec.h"            /* ray_check_null_invariant (DEBUG null-model gate) */
 #include "core/profile.h"
 #include "table/sym.h"
 #include "mem/heap.h"
@@ -266,7 +267,27 @@ ray_t* ray_raise_fn(ray_t* val) {
     return ray_error("domain", NULL);
 }
 
-/* (try expr handler) — evaluate expr, if error call handler with error value.
+/* Dispatch a `try` handler value against the error value.  A *callable*
+ * handler (a lambda or a unary builtin) is invoked with the error and its
+ * result returned; ANY other value is returned as-is as a fallback result.
+ *
+ * The fallback form exists because Rayfall lambdas do not capture closures,
+ * so a handler lambda `(fn [e] outer)` cannot see an outer binding.  Passing
+ * the value directly — evaluated in the current scope — is the only way to
+ * surface an outer variable from the failure branch:
+ *     ((fn [data] (try (raise "x") data)) 123)  ->  123
+ *
+ * Borrows both `handler` and `err_val`; returns a new owned ref. */
+ray_t* ray_try_handle(ray_t* handler, ray_t* err_val) {
+    if (handler->type == RAY_LAMBDA || handler->type == RAY_UNARY)
+        return call_fn1(handler, err_val);   /* borrows err_val */
+    ray_retain(handler);
+    return handler;                          /* fallback value */
+}
+
+/* (try expr handler) — evaluate expr; on error, dispatch the (evaluated)
+ * handler via ray_try_handle (callable → invoked with the error value;
+ * otherwise returned as a fallback value).
  * Special form: receives unevaluated args. */
 ray_t* ray_try_fn(ray_t* expr, ray_t* handler_expr) {
     ray_t* result = ray_eval(expr);
@@ -277,25 +298,14 @@ ray_t* ray_try_fn(ray_t* expr, ray_t* handler_expr) {
     __VM->raise_val = NULL;
     if (!err_val) err_val = make_i64(0);
 
-    /* Evaluate handler expression */
+    /* Evaluate handler expression (in the current scope) */
     ray_t* handler = ray_eval(handler_expr);
     if (RAY_IS_ERR(handler)) {
         ray_release(err_val);
         return handler;
     }
 
-    /* Call handler with error value */
-    ray_t* handler_result;
-    if (handler->type == RAY_LAMBDA) {
-        ray_t* args[1] = { err_val };
-        handler_result = call_lambda(handler, args, 1);
-    } else if (handler->type == RAY_UNARY) {
-        ray_unary_fn fn = (ray_unary_fn)(uintptr_t)handler->i64;
-        handler_result = fn(err_val);
-    } else {
-        handler_result = ray_error("type", NULL);
-    }
-
+    ray_t* handler_result = ray_try_handle(handler, err_val);
     ray_release(err_val);
     ray_release(handler);
     return handler_result;
@@ -310,7 +320,7 @@ ray_t* ray_try_fn(ray_t* expr, ray_t* handler_expr) {
 ray_t* to_boxed_list(ray_t* x) {
     if (!x || RAY_IS_ERR(x)) return x;
     if (x->type == RAY_LIST) { ray_retain(x); return x; }
-    if (!ray_is_vec(x)) return ray_error("type", NULL);
+    if (!ray_is_vec(x)) return ray_error("type", "to_boxed_list: expected a vector or list, got %s", ray_type_name(x->type));
 
     int64_t len = ray_len(x);
     ray_t* list = ray_alloc(len * sizeof(ray_t*));
@@ -417,15 +427,17 @@ static ray_t* atomic_map_binary_parted(ray_binary_fn fn, uint16_t dag_opcode,
             return seg ? seg : ray_error("domain", NULL);
         }
         if (!ray_is_vec(seg)) {
+            int8_t st = seg->type;
             ray_release(seg);
             ray_release(out);
-            return ray_error("type", NULL);
+            return ray_error("type", "parted map: segment result must be a vector, got %s", ray_type_name(st));
         }
         if (s == 0) out_base = seg->type;
         if (seg->type != out_base) {
+            int8_t st = seg->type;
             ray_release(seg);
             ray_release(out);
-            return ray_error("type", NULL);
+            return ray_error("type", "parted map: segment result types must match, got %s and %s", ray_type_name(out_base), ray_type_name(st));
         }
         dst[s] = seg;
         out->len = s + 1;
@@ -446,7 +458,19 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
 
     int64_t len;
     if (left_coll && right_coll) {
-        len = ray_len(left) < ray_len(right) ? ray_len(left) : ray_len(right);
+        /* Both operands are vectors: lengths MUST match.  Silently
+         * truncating to the shorter (the prior behaviour) hid a real
+         * error and diverged from the compiled/VM path, which already
+         * rejects the mismatch (src/ops/expr.c).  A 1-element vector
+         * does NOT broadcast (only a true atom does — see the
+         * !left_coll/!right_coll branch). */
+        if (ray_len(left) != ray_len(right)) {
+            const char* opn = ray_opcode_name(dag_opcode);
+            return ray_error("length", "%s: operand lengths must match, got %lld and %lld",
+                             opn ? opn : "binary op",
+                             (long long)ray_len(left), (long long)ray_len(right));
+        }
+        len = ray_len(left);
     } else {
         len = left_coll ? ray_len(left) : ray_len(right);
     }
@@ -1089,7 +1113,7 @@ ray_t* call_fn1(ray_t* fn, ray_t* arg) {
         ray_t* args[1] = { arg };
         return call_lambda(fn, args, 1);
     }
-    return ray_error("type", NULL);
+    return ray_error("type", "call: expected a callable function, got %s", ray_type_name(fn->type));
 }
 
 /* Helper: call a function object with 2 args. Does not release fn or args. */
@@ -1135,7 +1159,7 @@ ray_t* call_fn2(ray_t* fn, ray_t* a, ray_t* b) {
         ray_unary_fn f = (ray_unary_fn)(uintptr_t)fn->i64;
         return f(a);
     }
-    return ray_error("type", NULL);
+    return ray_error("type", "call: expected a callable function, got %s", ray_type_name(fn->type));
 }
 
 
@@ -1264,9 +1288,9 @@ ray_t* ray_table_fn(ray_t* names, ray_t* cols) {
     if (RAY_IS_ERR(names)) return names;
     cols = unbox_vec_arg(cols, &_bxc);
     if (RAY_IS_ERR(cols)) { if (_bxn) ray_release(_bxn); return cols; }
-    if (!is_list(names) || !is_list(cols)) { if (_bxn) ray_release(_bxn); if (_bxc) ray_release(_bxc); return ray_error("type", NULL); }
+    if (!is_list(names) || !is_list(cols)) { int8_t nt = names->type, ct = cols->type; if (_bxn) ray_release(_bxn); if (_bxc) ray_release(_bxc); return ray_error("type", "table: names and columns must be lists, got %s and %s", ray_type_name(nt), ray_type_name(ct)); }
     int64_t ncols = ray_len(names);
-    if (ray_len(cols) != ncols) { if (_bxn) ray_release(_bxn); if (_bxc) ray_release(_bxc); return ray_error("domain", NULL); }
+    if (ray_len(cols) != ncols) { int64_t ncols_got = ray_len(cols); if (_bxn) ray_release(_bxn); if (_bxc) ray_release(_bxc); return ray_error("domain", "table: column count must match name count %lld, got %lld", (long long)ncols, (long long)ncols_got); }
 
     ray_t** name_elems = (ray_t**)ray_data(names);
     ray_t** col_elems = (ray_t**)ray_data(cols);
@@ -1277,7 +1301,7 @@ ray_t* ray_table_fn(ray_t* names, ray_t* cols) {
 
     for (int64_t i = 0; i < ncols; i++) {
         if (name_elems[i]->type != -RAY_SYM)
-            { ray_release(tbl); if (_bxn) ray_release(_bxn); if (_bxc) ray_release(_bxc); return ray_error("type", NULL); }
+            { int8_t nt = name_elems[i]->type; ray_release(tbl); if (_bxn) ray_release(_bxn); if (_bxc) ray_release(_bxc); return ray_error("type", "table: column name must be a symbol, got %s", ray_type_name(nt)); }
         int64_t name_id = name_elems[i]->i64;
 
         /* Convert Rayfall list (or typed vec) to typed column vector */
@@ -1305,7 +1329,14 @@ ray_t* ray_table_fn(ray_t* names, ray_t* cols) {
                 atom_wrap = ray_vec_new(RAY_BOOL, 1);
                 if (!RAY_IS_ERR(atom_wrap)) { ((uint8_t*)ray_data(atom_wrap))[0] = col_src->b8; atom_wrap->len = 1; }
             }
-            if (atom_wrap && !RAY_IS_ERR(atom_wrap)) col_src = atom_wrap;
+            if (atom_wrap && !RAY_IS_ERR(atom_wrap)) {
+                /* Invariant 16.4: a lone typed-null atom (e.g. 0Nl) wrapped
+                 * into a 1-element column carries its sentinel; flag it.
+                 * SYM is no-null by design (excluded). */
+                if (RAY_ATOM_IS_NULL(col_src) && atom_wrap->type != RAY_SYM)
+                    atom_wrap->attrs |= RAY_ATTR_HAS_NULLS;
+                col_src = atom_wrap;
+            }
         }
 
         /* If the column is already a typed vector, use it directly */
@@ -1313,7 +1344,7 @@ ray_t* ray_table_fn(ray_t* names, ray_t* cols) {
             int64_t nrows = ray_len(col_src);
             if (expected_rows < 0) expected_rows = nrows;
             else if (nrows != expected_rows)
-                { ray_release(tbl); if (_bxn) ray_release(_bxn); if (_bxc) ray_release(_bxc); return ray_error("domain", NULL); }
+                { ray_release(tbl); if (_bxn) ray_release(_bxn); if (_bxc) ray_release(_bxc); return ray_error("domain", "table: all columns must have %lld rows, got %lld", (long long)expected_rows, (long long)nrows); }
             ray_retain(col_src);
             tbl = ray_table_add_col(tbl, name_id, col_src);
             ray_release(col_src);
@@ -1322,13 +1353,24 @@ ray_t* ray_table_fn(ray_t* names, ray_t* cols) {
         }
 
         if (!is_list(col_src))
-            { ray_release(tbl); if (_bxn) ray_release(_bxn); if (_bxc) ray_release(_bxc); return ray_error("type", NULL); }
+            { int8_t ct = col_src->type; ray_release(tbl); if (_bxn) ray_release(_bxn); if (_bxc) ray_release(_bxc); return ray_error("type", "table: column must be a vector or list, got %s", ray_type_name(ct)); }
         int64_t nrows = ray_len(col_src);
 
         /* Validate all columns have consistent row count */
         if (expected_rows < 0) expected_rows = nrows;
         else if (nrows != expected_rows)
-            { ray_release(tbl); if (_bxn) ray_release(_bxn); if (_bxc) ray_release(_bxc); return ray_error("domain", NULL); }
+            { ray_release(tbl); if (_bxn) ray_release(_bxn); if (_bxc) ray_release(_bxc); return ray_error("domain", "table: all columns must have %lld rows, got %lld", (long long)expected_rows, (long long)nrows); }
+
+        /* Empty generic list → typeless empty column: keep it as a RAY_LIST
+         * so its storage type is adopted from the first inserted value,
+         * rather than defaulting to I64. */
+        if (nrows == 0) {
+            ray_retain(col_src);
+            tbl = ray_table_add_col(tbl, name_id, col_src);
+            ray_release(col_src);
+            if (RAY_IS_ERR(tbl)) { if (_bxn) ray_release(_bxn); if (_bxc) ray_release(_bxc); return tbl; }
+            continue;
+        }
 
         ray_t** row_elems = (ray_t**)ray_data(col_src);
 
@@ -1367,23 +1409,37 @@ ray_t* ray_table_fn(ray_t* names, ray_t* cols) {
         if (RAY_IS_ERR(col_vec))
             { ray_release(tbl); if (_bxn) ray_release(_bxn); if (_bxc) ray_release(_bxc); return col_vec; }
 
+        /* Null-model invariant 16.4: ray_vec_append copies the atom payload
+         * raw and never sets HAS_NULLS, so a typed-null literal in the list
+         * (e.g. 0Nl = NULL_I64) would land its sentinel in the column with
+         * the flag clear.  Track it and flip HAS_NULLS after the loop. */
+        bool col_has_nulls = false;
+
         for (int64_t j = 0; j < nrows; j++) {
+            /* A null source atom whose sentinel survives into col_vec
+             * unchanged.  (F64 promotion of an I64 null produces a finite
+             * double, not a sentinel — no 16.4 issue there.) */
+            if (RAY_ATOM_IS_NULL(row_elems[j]) &&
+                !(col_type == RAY_F64 && row_elems[j]->type == -RAY_I64))
+                col_has_nulls = true;
             if (col_type == RAY_STR) {
                 if (row_elems[j]->type != -RAY_STR) {
+                    int8_t et = row_elems[j]->type;
                     ray_release(col_vec); ray_release(tbl);
                     if (_bxn) ray_release(_bxn);
                     if (_bxc) ray_release(_bxc);
-                    return ray_error("type", NULL);
+                    return ray_error("type", "table: string column element must be a string, got %s", ray_type_name(et));
                 }
                 const char *sptr = ray_str_ptr(row_elems[j]);
                 size_t slen = ray_str_len(row_elems[j]);
                 col_vec = ray_str_vec_append(col_vec, sptr, slen);
             } else if (col_type == RAY_GUID) {
                 if (row_elems[j]->type != -RAY_GUID || !row_elems[j]->obj) {
+                    int8_t et = row_elems[j]->type;
                     ray_release(col_vec); ray_release(tbl);
                     if (_bxn) ray_release(_bxn);
                     if (_bxc) ray_release(_bxc);
-                    return ray_error("type", NULL);
+                    return ray_error("type", "table: guid column element must be a guid, got %s", ray_type_name(et));
                 }
                 col_vec = ray_vec_append(col_vec, ray_data(row_elems[j]->obj));
             } else {
@@ -1391,10 +1447,11 @@ ray_t* ray_table_fn(ray_t* names, ray_t* cols) {
                 int type_ok = (row_elems[j]->type == -col_type);
                 if (!type_ok && col_type == RAY_F64 && row_elems[j]->type == -RAY_I64) type_ok = 1;
                 if (!type_ok) {
+                    int8_t et = row_elems[j]->type;
                     ray_release(col_vec); ray_release(tbl);
                     if (_bxn) ray_release(_bxn);
                     if (_bxc) ray_release(_bxc);
-                    return ray_error("type", NULL);
+                    return ray_error("type", "table: %s column element type mismatch, got %s", ray_type_name(col_type), ray_type_name(et));
                 }
                 void* val_ptr;
                 double promoted;
@@ -1410,6 +1467,10 @@ ray_t* ray_table_fn(ray_t* names, ray_t* cols) {
             if (RAY_IS_ERR(col_vec))
                 { ray_release(tbl); if (_bxn) ray_release(_bxn); if (_bxc) ray_release(_bxc); return col_vec; }
         }
+
+        /* Invariant 16.4: a sentinel was written into a non-SYM column. */
+        if (col_has_nulls && col_vec->type != RAY_SYM)
+            col_vec->attrs |= RAY_ATTR_HAS_NULLS;
 
         tbl = ray_table_add_col(tbl, name_id, col_vec);
         ray_release(col_vec);
@@ -1429,7 +1490,7 @@ ray_t* ray_key_fn(ray_t* x) {
         ray_retain(keys);
         return keys;
     }
-    if (x->type != RAY_TABLE) return ray_error("type", NULL);
+    if (x->type != RAY_TABLE) return ray_error("type", "key: expected a dict or table, got %s", ray_type_name(x->type));
     int64_t ncols = ray_table_ncols(x);
     ray_t* vec = ray_vec_new(RAY_SYM, ncols);
     if (RAY_IS_ERR(vec)) return vec;
@@ -1455,7 +1516,7 @@ ray_t* ray_value_fn(ray_t* x) {
         }
         return result;
     }
-    if (x->type != RAY_DICT) return ray_error("type", NULL);
+    if (x->type != RAY_DICT) return ray_error("type", "value: expected a dict or table, got %s", ray_type_name(x->type));
     ray_t* vals = ray_dict_vals(x);
     if (!vals) return ray_error("type", NULL);
     ray_retain(vals);
@@ -1477,7 +1538,7 @@ ray_t* ray_value_fn(ray_t* x) {
 /* (set name value) — bind in global env. Receives unevaluated args. */
 ray_t* ray_set_fn(ray_t* name_obj, ray_t* val_expr) {
     if (name_obj->type != -RAY_SYM)
-        return ray_error("type", NULL);
+        return ray_error("type", "set: name must be a symbol, got %s", ray_type_name(name_obj->type));
     ray_t* val = ray_eval(val_expr);
     if (RAY_IS_ERR(val)) return val;
     /* Materialize lazy handles before binding */
@@ -1495,7 +1556,7 @@ ray_t* ray_set_fn(ray_t* name_obj, ray_t* val_expr) {
 /* (let name value) — bind in local scope. Receives unevaluated args. */
 ray_t* ray_let_fn(ray_t* name_obj, ray_t* val_expr) {
     if (name_obj->type != -RAY_SYM)
-        return ray_error("type", NULL);
+        return ray_error("type", "let: name must be a symbol, got %s", ray_type_name(name_obj->type));
     ray_t* val = ray_eval(val_expr);
     if (RAY_IS_ERR(val)) return val;
     /* Materialize lazy handles before binding */
@@ -1509,7 +1570,7 @@ ray_t* ray_let_fn(ray_t* name_obj, ray_t* val_expr) {
 
 /* (if cond then else?) — conditional. Receives unevaluated args. */
 ray_t* ray_cond_fn(ray_t** args, int64_t n) {
-    if (n < 2) return ray_error("domain", NULL);
+    if (n < 2) return ray_error("domain", "if: expected at least 2 args (cond then), got %lld", (long long)n);
     ray_t* cond = ray_eval(args[0]);
     if (RAY_IS_ERR(cond)) return cond;
     /* Materialize lazy handles before testing truthiness */
@@ -1550,7 +1611,7 @@ ray_t* ray_do_fn(ray_t** args, int64_t n) {
 /* (fn [params...] body...) — create a lambda object.
  * Stores params list and body expressions in data area. */
 ray_t* ray_fn(ray_t** args, int64_t n) {
-    if (n < 2) return ray_error("domain", NULL);
+    if (n < 2) return ray_error("domain", "fn: expected at least 2 args (params body), got %lld", (long long)n);
     /* args[0] = param vector (list of name symbols), args[1..n-1] = body exprs */
     ray_t* params_list = args[0];
 
@@ -1781,6 +1842,8 @@ static ray_t* vm_exec(ray_t* lambda, ray_t** call_args, int64_t argc) {
         [OP_STOREGLOBAL_W] = &&op_storeglobal_w,
         [OP_SCOPE_BEGIN]   = &&op_scope_begin,
         [OP_SCOPE_END]     = &&op_scope_end,
+        [OP_TRYH]          = &&op_tryh,
+        [OP_FORCE]         = &&op_force,
     };
 
     /* Arity check before allocating VM state */
@@ -1852,6 +1915,21 @@ op_loadconst_w: {
 op_loadenv: {
     uint8_t slot = code[ip++];
     ray_t *val = LOCAL(slot);
+    if (val && ray_is_lazy(val)) {
+        /* Force a lazy local to a concrete, reusable value on first read,
+         * storing it back into the slot.  A lazy handle is single-use
+         * (materialization consumes its deferred graph), so a second read
+         * would otherwise see a dead handle — e.g. a lazy first/last bound
+         * to a lambda PARAM (which, unlike `let`, is not forced at bind)
+         * and then used twice: `((fn [v] (if (> v 0) v 0)) (first xs))`. */
+        val = ray_lazy_materialize(val);   /* consumes the slot's ref */
+        if (!val || RAY_IS_ERR(val)) {
+            vm_err_obj = val ? val : ray_error("type", NULL);
+            LOCAL(slot) = NULL;            /* ref already consumed */
+            goto vm_error;
+        }
+        LOCAL(slot) = val;                 /* slot now owns the concrete */
+    }
     if (val) ray_retain(val);
     else val = make_i64(0);
     PUSH(val);
@@ -2162,7 +2240,7 @@ op_callf: {
             break;
         default:
             for (int32_t i = 0; i < n; i++) ray_release(fn_args[i]);
-            result = ray_error("type", NULL);
+            result = ray_error("type", "apply: head is not callable, got %s", ray_type_name(fn_obj->type));
             break;
         }
         ray_release(fn_obj);
@@ -2298,6 +2376,31 @@ op_trap_end: {
         vm.tp--;
         ray_release(vm.ts[vm.tp].fn);
     }
+    DISPATCH();
+}
+
+op_tryh: {
+    /* Stack: [.., handler, err_val] (err_val on top).  A callable handler
+     * is invoked with the error; any other value is the fallback result. */
+    ray_t* err_val = POP();
+    ray_t* handler = POP();
+    ray_t* result  = ray_try_handle(handler, err_val);  /* borrows both */
+    ray_release(err_val);
+    ray_release(handler);
+    if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }
+    PUSH(result);
+    DISPATCH();
+}
+
+op_force: {
+    /* Materialize a lazy TOS so a let-bound local holds a concrete,
+     * reusable value (a lazy handle is single-use). */
+    ray_t* v = POP();
+    if (v && ray_is_lazy(v)) {
+        v = ray_lazy_materialize(v);   /* consumes; concrete or error */
+        if (!v || RAY_IS_ERR(v)) { vm_err_obj = v ? v : ray_error("type", NULL); goto vm_error; }
+    }
+    PUSH(v);
     DISPATCH();
 }
 
@@ -2717,7 +2820,7 @@ static void ray_register_builtins(void) {
     register_vary("inner-join",  RAY_FN_NONE, ray_inner_join_fn);
     register_vary("anti-join",   RAY_FN_NONE, ray_anti_join_fn);
     register_vary("window-join", RAY_FN_SPECIAL_FORM, ray_window_join_fn);
-    register_vary("window-join1", RAY_FN_SPECIAL_FORM, ray_window_join_fn);
+    register_vary("window-join1", RAY_FN_SPECIAL_FORM, ray_window_join1_fn);
     register_vary("asof-join",   RAY_FN_NONE, ray_asof_join_fn);
 
     /* I/O builtins */
@@ -2747,6 +2850,7 @@ static void ray_register_builtins(void) {
     register_unary("group",     RAY_FN_NONE, ray_group_fn);
     register_binary("concat",   RAY_FN_NONE, ray_concat_fn);
     register_unary("raze",      RAY_FN_NONE, ray_raze_fn);
+    register_unary("ungroup",   RAY_FN_NONE, ray_ungroup_fn);
     register_binary("within",   RAY_FN_NONE, ray_within_fn);
     register_binary("div",      RAY_FN_ATOMIC, ray_idiv_fn);
     register_binary("rand",     RAY_FN_NONE, ray_rand_fn);
@@ -2770,6 +2874,8 @@ static void ray_register_builtins(void) {
     register_vary(".db.splayed.set",   RAY_FN_RESTRICTED, ray_set_splayed_fn);
     register_vary(".db.splayed.get",   RAY_FN_NONE,       ray_get_splayed_fn);
     register_vary(".db.parted.get",    RAY_FN_NONE,       ray_get_parted_fn);
+    register_vary(".db.parted.tables", RAY_FN_NONE,       ray_get_parted_tables_fn);
+    register_vary(".db.parted.fill",   RAY_FN_RESTRICTED, ray_fill_parted_fn);
 
     /* GUID generation */
     register_unary("guid",       RAY_FN_NONE, ray_guid_fn);
@@ -2823,14 +2929,15 @@ static void ray_register_builtins(void) {
     /* OS env / process interaction under `.os.*` */
     register_unary( ".os.getenv", RAY_FN_RESTRICTED,  ray_getenv_fn);
     register_binary(".os.setenv", RAY_FN_RESTRICTED,  ray_setenv_fn);
-    /* Filesystem metadata (issue #36): size + listing.  Predicates
-     * (exists / is-file / is-dir) are reachable via `try` on these
-     * or via shell fallback through `.sys.cmd`. */
-    register_unary( ".os.size",   RAY_FN_NONE,        ray_os_size_fn);
-    register_unary( ".os.list",   RAY_FN_NONE,        ray_os_list_fn);
+
+    /* Filesystem metadata under `.fs.*` (issue #36): size + listing.
+     * Predicates (exists / is-file / is-dir) are reachable via `try` on
+     * these or via shell fallback through `.sys.cmd`. */
+    register_unary( ".fs.size",   RAY_FN_NONE,        ray_fs_size_fn);
+    register_unary( ".fs.list",   RAY_FN_NONE,        ray_fs_list_fn);
 
     /* IPC client primitives under `.ipc.*` */
-    register_unary( ".ipc.open",  RAY_FN_RESTRICTED,  ray_hopen_fn);
+    register_vary(  ".ipc.open",  RAY_FN_RESTRICTED,  ray_hopen_fn);
     register_unary( ".ipc.close", RAY_FN_RESTRICTED,  ray_hclose_fn);
     register_binary(".ipc.send",  RAY_FN_RESTRICTED,  ray_hsend_fn);
     register_binary(".ipc.post",  RAY_FN_RESTRICTED,  ray_hpost_fn);
@@ -2857,6 +2964,7 @@ static void ray_register_builtins(void) {
     register_vary(".log.snapshot", RAY_FN_RESTRICTED, ray_log_snapshot_fn);
     register_vary(".log.sync",     RAY_FN_NONE,       ray_log_sync_fn);
     register_vary(".log.close",    RAY_FN_RESTRICTED, ray_log_close_fn);
+    register_vary(".log.purge",    RAY_FN_RESTRICTED, ray_log_purge_fn);
 
     /* quote — special form (unevaluated argument) */
     register_vary("quote",       RAY_FN_SPECIAL_FORM, ray_quote_fn);
@@ -2923,6 +3031,7 @@ static void ray_register_builtins(void) {
     register_unary("dl-eval",      RAY_FN_NONE, ray_dl_eval_fn);
     register_binary("dl-query",    RAY_FN_NONE, ray_dl_query_fn);
     register_binary("dl-provenance", RAY_FN_NONE, ray_dl_provenance_fn);
+    register_unary("dl-free",      RAY_FN_NONE, ray_dl_free_fn);
 
     /* Vector similarity / embeddings / HNSW */
     register_binary("cos-dist",    RAY_FN_NONE, ray_cos_dist_fn);
@@ -3220,10 +3329,11 @@ ray_t* ray_eval(ray_t* obj) {
                     ray_release(right);
                     ret = result; goto out;
                 }
+                int8_t lt = left->type, rt = right->type;
                 ray_release(head);
                 ray_release(left);
                 ray_release(right);
-                ret = ray_error("type", NULL); goto out;
+                ret = ray_error("type", "binary op: null operand not supported, got %s and %s", ray_type_name(lt), ray_type_name(rt)); goto out;
             }
             uint16_t fn_opcode = RAY_FN_OPCODE(head);
             ray_release(head);
@@ -3244,7 +3354,7 @@ ray_t* ray_eval(ray_t* obj) {
                 ret = fn(elems + 1, n - 1); goto out;
             }
             int64_t argc = n - 1;
-            if (argc > 64) { ray_release(head); ret = ray_error("domain", NULL); goto out; }
+            if (argc > 64) { ray_release(head); ret = ray_error("domain", "call: too many args, max 64, got %lld", (long long)argc); goto out; }
             ray_t* args[64];
             for (int64_t i = 0; i < argc; i++) {
                 args[i] = ray_eval(elems[i + 1]);
@@ -3266,7 +3376,7 @@ ray_t* ray_eval(ray_t* obj) {
         }
         case RAY_LAMBDA: {
             int64_t argc = n - 1;
-            if (argc > 64) { ray_release(head); ret = ray_error("domain", NULL); goto out; }
+            if (argc > 64) { ray_release(head); ret = ray_error("domain", "call: too many args, max 64, got %lld", (long long)argc); goto out; }
             ray_t* args[64];
             for (int64_t i = 0; i < argc; i++) {
                 args[i] = ray_eval(elems[i + 1]);
@@ -3284,9 +3394,11 @@ ray_t* ray_eval(ray_t* obj) {
                 add_eval_error_frame(__VM->nfo, obj);
             ret = result; goto out;
         }
-        default:
+        default: {
+            int8_t head_type = head->type;
             ray_release(head);
-            ret = ray_error("type", NULL); goto out;
+            ret = ray_error("type", "eval: head of list is not callable, got %s", ray_type_name(head_type)); goto out;
+        }
     }
 
 out:
@@ -3298,6 +3410,11 @@ out:
      * which builtin drove the update (including ray_group_fn etc.
      * that bypass ray_execute). */
     if (__VM->eval_depth == 0) ray_progress_end();
+    /* §2.1 null-model invariant 16.4: every eval/op result flows through
+     * here, so this is the suite-wide chokepoint that enforces "sentinel
+     * present ⇒ HAS_NULLS set" across all tested producers.  Compiled out
+     * in release (see vec.h).  Errors/NULL are no-ops in the validator. */
+    ray_check_null_invariant(ret);
     return ret;
 }
 

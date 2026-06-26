@@ -119,13 +119,15 @@ extern const test_entry_t dump_entries[];
 extern const test_entry_t embedding_entries[];
 extern const test_entry_t exec_entries[];
 extern const test_entry_t expr_null_entries[];
+extern const test_entry_t f64_nullmodel_entries[];
 extern const test_entry_t format_entries[];
 extern const test_entry_t fvec_entries[];
 extern const test_entry_t graph_entries[];
+extern const test_entry_t agg_registry_entries[];
+extern const test_entry_t agg_engine_entries[];
 extern const test_entry_t graph_builtin_entries[];
 extern const test_entry_t group_extra_entries[];
 extern const test_entry_t group_pushdown_entries[];
-extern const test_entry_t fused_group_entries[];
 extern const test_entry_t fused_topk_entries[];
 extern const test_entry_t hash_entries[];
 extern const test_entry_t heap_entries[];
@@ -133,6 +135,7 @@ extern const test_entry_t heap_parallel_entries[];
 extern const test_entry_t idx_route_entries[];
 extern const test_entry_t index_entries[];
 extern const test_entry_t ipc_entries[];
+extern const test_entry_t join_buildside_entries[];
 extern const test_entry_t journal_entries[];
 extern const test_entry_t lang_entries[];
 extern const test_entry_t link_entries[];
@@ -140,6 +143,7 @@ extern const test_entry_t lftj_entries[];
 extern const test_entry_t list_entries[];
 extern const test_entry_t meta_entries[];
 extern const test_entry_t morsel_entries[];
+extern const test_entry_t null_invariant_entries[];
 extern const test_entry_t numparse_entries[];
 extern const test_entry_t opt_entries[];
 extern const test_entry_t partition_exec_entries[];
@@ -174,19 +178,23 @@ static const test_entry_t* const compiled_groups[] = {
     csv_entries,      datalog_entries,  dict_entries,     domain_entries,
     dump_entries,
     embedding_entries, exec_entries,   expr_null_entries,
+    f64_nullmodel_entries,
     format_entries,   fvec_entries,     graph_entries,    graph_builtin_entries,
+    agg_registry_entries,
+    agg_engine_entries,
     group_extra_entries,
     group_pushdown_entries,
-    fused_group_entries,
     fused_topk_entries,
     hash_entries,
     heap_entries,
     heap_parallel_entries,
     idx_route_entries,
     index_entries,    ipc_entries,
+    join_buildside_entries,
     journal_entries,
     lang_entries,     link_entries,
     lftj_entries,     list_entries,     meta_entries,     morsel_entries,
+    null_invariant_entries,
     numparse_entries, opt_entries,      partition_exec_entries,
     pipe_entries,     platform_entries,
     pool_entries,     progress_entries,

@@ -605,10 +605,10 @@
 (count PNullPvt) -- 2
 (count (key PNullPvt)) -- 3
 ;; Value-check: dropping row (A,null,10) means group A has NO c=1 cell.
-;; pivot.c:581-582 zero-fills missing cells (additive identity for sum),
-;; so the absent (A,c=1) cell is 0 — NOT a typed null.  A's c=2→20.
+;; review 2.10: a missing cell is the typed NULL sentinel (no data), NOT a
+;; real 0 — so the absent (A,c=1) cell is null.  A's c=2→20.
 ;; Group B: c=1→30, c=2→40.
-(at (at PNullPvt '1) 0) -- 0
+(nil? (at (at PNullPvt '1) 0)) -- true
 (at (at PNullPvt '2) 0) -- 20
 (at (at PNullPvt '1) 1) -- 30
 (at (at PNullPvt '2) 1) -- 40

@@ -1,0 +1,57 @@
+;; Coverage for .log.purge (src/ops/journal.c ray_log_purge_fn ->
+;; src/store/journal.c ray_journal_purge) — issue #279.
+;;
+;; .log.purge closes the active journal (if open) and unlinks the ENTIRE
+;; on-disk footprint of the current journal base — the active <base>.log,
+;; every rolled <base>.<stamp>.log archive, the <base>.qdb snapshot, and a
+;; stray <base>.qdb.tmp — with NO path argument.  The base survives
+;; .log.close, so purge works after a close (the issue's workflow).
+;;
+;; Base path: /tmp/rfl_ops_journal_purge — distinct from the other journal
+;; RFL suites to avoid cross-test state pollution.  g_journal is a
+;; process-global NOT reset between RFL files, so close defensively first.
+
+;; ── pre-cleanup ─────────────────────────────────────────────────────────
+(nil? (.log.close)) -- true
+(.sys.exec "rm -f /tmp/rfl_ops_journal_purge.log /tmp/rfl_ops_journal_purge.qdb /tmp/rfl_ops_journal_purge.qdb.tmp /tmp/rfl_ops_journal_purge.*.log")
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 1. Build a full footprint: active log + a rolled archive + a snapshot,
+;;    then purge while the journal is still OPEN.
+;; ════════════════════════════════════════════════════════════════════════
+(nil? (.log.open 'async "/tmp/rfl_ops_journal_purge")) -- true
+(nil? (.log.write 1)) -- true
+(nil? (.log.roll))    -- true
+(nil? (.log.write 2)) -- true
+(set jrn_purge_g 99)  -- 99
+(nil? (.log.snapshot)) -- true
+(nil? (.log.write 3)) -- true
+
+;; Footprint exists: active log, the snapshot, and at least one archive.
+(.sys.exec "test -f /tmp/rfl_ops_journal_purge.log") -- 0
+(.sys.exec "test -f /tmp/rfl_ops_journal_purge.qdb") -- 0
+(.sys.exec "test -n \"$(ls /tmp/rfl_ops_journal_purge.*.log 2>/dev/null)\"") -- 0
+
+;; Purge while OPEN: closes + removes everything, returns null.
+(nil? (.log.purge)) -- true
+
+;; Nothing of the base remains on disk.
+(.sys.exec "test $(ls /tmp/rfl_ops_journal_purge.* 2>/dev/null | wc -l) -eq 0") -- 0
+
+;; State was reset: a second purge has no base to act on -> domain error.
+(.log.purge) !- domain
+
+;; ════════════════════════════════════════════════════════════════════════
+;; 2. The issue #279 workflow: open, write, close, then purge WITHOUT
+;;    re-passing the path.  The base persists across .log.close.
+;; ════════════════════════════════════════════════════════════════════════
+(nil? (.log.open 'sync "/tmp/rfl_ops_journal_purge")) -- true
+(nil? (.log.write 42)) -- true
+(nil? (.log.close)) -- true
+(.sys.exec "test -f /tmp/rfl_ops_journal_purge.log") -- 0
+
+(nil? (.log.purge)) -- true
+(.sys.exec "test ! -f /tmp/rfl_ops_journal_purge.log") -- 0
+
+;; ── teardown ─────────────────────────────────────────────────────────────
+(.sys.exec "rm -f /tmp/rfl_ops_journal_purge.log /tmp/rfl_ops_journal_purge.qdb /tmp/rfl_ops_journal_purge.qdb.tmp /tmp/rfl_ops_journal_purge.*.log")

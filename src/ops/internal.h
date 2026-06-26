@@ -486,6 +486,10 @@ static inline bool pool_cancelled(ray_pool_t* pool) {
  * struct.  Use EXT_TRAIL() to find the trailing bytes. */
 ray_op_ext_t* graph_alloc_ext_node_ex(ray_graph_t* g, size_t extra);
 
+/* Allocate a plain 32-byte node, growing g->nodes if needed.  Defined in
+ * graph.c.  Shared with opt.c (no second copy of the realloc logic). */
+ray_op_t* graph_alloc_node(ray_graph_t* g);
+
 /* Compile a Rayfall AST sub-expression to a DAG node.  Defined in
  * query.c.  Used by fused_* operators that need to evaluate a small
  * predicate without going through the full select planner. */
@@ -500,6 +504,19 @@ static inline ray_op_ext_t* find_ext(ray_graph_t* g, uint32_t node_id) {
             return g->ext_nodes[i];
     }
     return NULL;
+}
+
+/* Resolve a node id to its ray_op_t* in g->nodes.  Returns NULL for the
+ * RAY_OP_NONE sentinel.  Node ids are stable indices, so the returned
+ * pointer is only valid until the next g->nodes realloc — never store it
+ * across a node allocation; re-resolve from the id instead. */
+static inline ray_op_t* op_node(ray_graph_t* g, uint32_t id) {
+    return id == RAY_OP_NONE ? NULL : &g->nodes[id];
+}
+
+/* Resolve input edge i (0 or 1) of op to its child node, or NULL if unused. */
+static inline ray_op_t* op_child(ray_graph_t* g, const ray_op_t* op, int i) {
+    return op_node(g, op->in_id[i]);
 }
 
 /* ══════════════════════════════════════════
@@ -620,6 +637,13 @@ extern uint64_t ray_expr_bail_counts[EXPR_BAIL__N];
 extern uint64_t ray_expr_compile_ok;
 extern bool     ray_expr_disable;
 extern bool     ray_opt_no_group_pushdown;
+extern bool     ray_join_no_build_swap;
+extern uint64_t ray_join_build_swaps;
+extern bool     ray_join_force_dup_fallback;
+/* perf-gate bypass: disable the auto dup-fallback to measure the pre-fix O(dup²) build */
+extern bool     ray_join_no_dup_fallback;
+extern uint64_t ray_join_dup_fallbacks;
+extern bool     ray_agg_engine_v2; /* route OP_GROUP through v2 agg engine; default off */
 void ray_expr_stats_init(void);
 
 #define EXPR_MAX_REGS 16
@@ -879,11 +903,6 @@ ray_t* ray_wide_minmax_per_group_buf(ray_t* src, uint16_t op,
                                      int64_t n_groups);
 
 ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit);
-ray_t* exec_group_topk_rowform(ray_graph_t* g, ray_op_t* op);
-ray_t* exec_group_pearson_rowform(ray_graph_t* g, ray_op_t* op);
-ray_t* exec_group_maxmin_rowform(ray_graph_t* g, ray_op_t* op);
-ray_t* exec_group_median_stddev_rowform(ray_graph_t* g, ray_op_t* op);
-ray_t* exec_group_sum_count_rowform(ray_graph_t* g, ray_op_t* op);
 
 /* ── collection.c ── */
 ray_t* distinct_vec_eager(ray_t* x);
@@ -1201,6 +1220,45 @@ static inline void par_finalize_nulls(ray_t* vec) {
             return;
         }
         default: return;
+    }
+}
+
+/* ══════════════════════════════════════════
+ * Single-null float model
+ * ══════════════════════════════════════════
+ * The F64 value domain is {finite} ∪ {0Nf}.  Any non-finite F64 result —
+ * NaN OR ±Inf — canonicalizes to NULL_F64 (= __builtin_nan("")) at the
+ * produce site; Inf is NOT a value.  Null detection is `x != x`.  Apply
+ * ray_f64_fin() to every F64-RESULT produce site (kernels, finalizers,
+ * computed-store sites) so a column never holds a non-finite-non-0Nf value.
+ *
+ * Written compare+select (no early-out branch) so vector loops stay
+ * auto-vectorizable.  For DIV/MOD keep the explicit `divisor==0 → NULL_F64`
+ * guard at the call site (mirrors the int kernels, avoids the FPU NaN slow
+ * path) and wrap only the value-producing branch. */
+static inline double ray_f64_fin(double r) {
+    /* finite ⟺ |r| <= DBL_MAX: this comparison is FALSE for ±Inf (|Inf| >
+     * DBL_MAX) AND for NaN (every NaN compare is false), so it selects exactly
+     * the finite values and maps every non-finite to NULL_F64.  Use this fabs +
+     * compare + select, NOT __builtin_isfinite — the latter lowers to a scalar
+     * fpclassify-style sequence that breaks auto-vectorization and regressed
+     * the hot float kernels ~50% (measured).  fabs is a bitwise-AND mask and
+     * the ternary becomes a vector blend, keeping the kernel loops vectorized
+     * (measured: within noise of baseline). */
+    return (__builtin_fabs(r) <= DBL_MAX) ? r : NULL_F64;
+}
+
+/* Post-pass for fused/fallback F64 kernels that may have canonicalized a
+ * non-finite result to NULL_F64 (NaN) in-buffer: scan [off,off+len) and set
+ * RAY_ATTR_HAS_NULLS if any lane is a NaN sentinel.  Mirrors
+ * mark_i64_overflow_as_null (which relies on the sentinel already being in
+ * the payload — here NULL_F64 is too, so we only flip the attr).  Single
+ * pass, memory-bound, branchless inner test; caller invokes single-threaded
+ * after pool dispatch joins. */
+static inline void mark_f64_nonfinite_as_null(ray_t* result, int64_t off, int64_t len) {
+    const double* d = (const double*)ray_data(result) + off;
+    for (int64_t i = 0; i < len; i++) {
+        if (RAY_UNLIKELY(d[i] != d[i])) { result->attrs |= RAY_ATTR_HAS_NULLS; return; }
     }
 }
 

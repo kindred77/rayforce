@@ -14,7 +14,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
   <a href="include/rayforce.h"><img src="https://img.shields.io/badge/header-rayforce.h-informational" alt="Single Header"></a>
   <a href="https://rayforcedb.github.io/rayforce/"><img src="https://img.shields.io/badge/docs-website-e9a033" alt="Docs"></a>
-  <img src="https://img.shields.io/badge/lang-C17-blue" alt="C17">
+  <img src="https://img.shields.io/badge/lang-C-blue" alt="C">
   <img src="https://img.shields.io/badge/deps-zero-brightgreen" alt="Zero Dependencies">
   <img src="https://img.shields.io/badge/allocator-custom-purple" alt="Custom Allocator">
   <a href="https://github.com/RayforceDB/rayforce"><img src="https://img.shields.io/github/stars/RayforceDB/rayforce?style=social" alt="GitHub Stars"></a>
@@ -22,10 +22,30 @@
 
 ---
 
-Rayforce is a pure C17 zero-dependency embeddable engine where columnar
+Rayforce is a pure C zero-dependency embeddable engine where columnar
 analytics and graph traversals share a single operation DAG, pass through a
 multi-pass optimizer, and execute as morsel-driven bytecode compiled at
 execution time. No malloc.
+
+## Install
+
+**Homebrew** (macOS & Linux):
+
+```bash
+brew install rayforcedb/tap/rayforce
+```
+
+**Debian / Ubuntu** (`.deb`, x86-64) — grab the `.deb` from the
+[latest release](https://github.com/RayforceDB/rayforce/releases/latest):
+
+```bash
+curl -LO https://github.com/RayforceDB/rayforce/releases/download/vX.Y.Z/rayforce_X.Y.Z_amd64.deb
+sudo dpkg -i rayforce_X.Y.Z_amd64.deb
+```
+
+**Prebuilt tarball** (Linux x86-64 / macOS arm64) is also attached to each
+release. Or build [from source](#quick-start) below — zero dependencies, just
+`make`.
 
 ## Quick Start
 

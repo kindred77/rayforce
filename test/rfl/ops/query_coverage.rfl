@@ -319,7 +319,7 @@
 ;; (mask=true → expr_vec, mask=false → orig_col) hit the
 ;; ray_read_sym dispatch.
 (set TupL (table [id name] (list [1 2 3] ['alice 'bob 'charlie])))
-(set TupL2 (update {name: 'XXX from: 'TupL where: (== id 2)}))
+(set TupL2 (update {name: 'XXX from: TupL where: (== id 2)}))
 (at (at TupL2 'name) 0) -- 'alice
 (at (at TupL2 'name) 1) -- 'XXX
 (at (at TupL2 'name) 2) -- 'charlie
@@ -343,12 +343,12 @@
 ;; ====================================================================
 
 (set TupS (table [id s] (list [1 2 3 4] (list "a" "b" "c" "d"))))
-(set TupS2 (update {s: "XX" from: 'TupS where: (> id 2)}))
+(set TupS2 (update {s: "XX" from: TupS where: (> id 2)}))
 (first (at TupS2 's)) -- "a"
 (at (at TupS2 's) 2) -- "XX"
 
 (set TupSy (table [id k] (list [1 2 3] ['a 'b 'c])))
-(set TupSy2 (update {k: 'XX from: 'TupSy where: (== id 2)}))
+(set TupSy2 (update {k: 'XX from: TupSy where: (== id 2)}))
 (at (at TupSy2 'k) 0) -- 'a
 (at (at TupSy2 'k) 1) -- 'XX
 
@@ -561,29 +561,31 @@
 (set wjl (table [Sym Time] (list ['a 'a] [10:00:01.000 10:00:05.000])))
 (set wjr (table [Sym Time Price] (list ['a 'a 'a] [10:00:00.000 10:00:02.000 10:00:04.000] (as 'F64 [99.5 100.5 101.5]))))
 (set wjiv (map-left + [-2000 2000] (at wjl 'Time)))
-;; F64 sum: row0 interval [09:59:59,10:00:03] → prices 99.5+100.5=200.0
-;;          row1 interval [10:00:03,10:00:07] → price 101.5 only
-(at (window-join [Sym Time] wjiv wjl wjr {total: (sum Price)}) 'total) -- [200.0 101.5]
+;; wj seeds the prevailing quote, so row1's window [10:00:03,10:00:07]
+;; includes the @02 quote (100.5) at/before lo plus the @04 quote (101.5).
+;; F64 sum: row0 [09:59:59,10:00:03] → 99.5+100.5=200.0
+;;          row1 [10:00:03,10:00:07] → 100.5+101.5=202.0
+(at (window-join [Sym Time] wjiv wjl wjr {total: (sum Price)}) 'total) -- [200.0 202.0]
 
 ;; F64 avg aggregation in window-join → hits sorted_f OP_AVG arm.
-;; row0: avg(99.5,100.5)=100.0; row1: avg(101.5)=101.5
-(at (window-join [Sym Time] wjiv wjl wjr {avg_p: (avg Price)}) 'avg_p) -- [100.0 101.5]
+;; row0: avg(99.5,100.5)=100.0; row1: avg(100.5,101.5)=101.0
+(at (window-join [Sym Time] wjiv wjl wjr {avg_p: (avg Price)}) 'avg_p) -- [100.0 101.0]
 
 ;; F64 min aggregation → sorted_f OP_MIN arm.
-;; row0: min(99.5,100.5)=99.5; row1: min(101.5)=101.5
-(at (window-join [Sym Time] wjiv wjl wjr {lo: (min Price)}) 'lo) -- [99.5 101.5]
+;; row0: min(99.5,100.5)=99.5; row1: min(100.5,101.5)=100.5
+(at (window-join [Sym Time] wjiv wjl wjr {lo: (min Price)}) 'lo) -- [99.5 100.5]
 
 ;; F64 max aggregation → sorted_f OP_MAX arm.
-;; row0: max(99.5,100.5)=100.5; row1: max(101.5)=101.5
+;; row0: max(99.5,100.5)=100.5; row1: max(100.5,101.5)=101.5
 (at (window-join [Sym Time] wjiv wjl wjr {hi: (max Price)}) 'hi) -- [100.5 101.5]
 
 ;; F64 prod aggregation → sorted_f OP_PROD arm.
-;; row0: prod(99.5,100.5)=10000.0 approx (99.5*100.5=9999.75); row1: prod(101.5)=101.5
-(at (window-join [Sym Time] wjiv wjl wjr {pr: (prod Price)}) 'pr) -- [9999.75 101.5]
+;; row0: prod(99.5,100.5)=9999.75; row1: prod(100.5,101.5)=10200.75
+(at (window-join [Sym Time] wjiv wjl wjr {pr: (prod Price)}) 'pr) -- [9999.75 10200.75]
 
 ;; F64 var/stddev aggregation → sorted_f OP_VAR/OP_STDDEV arm.
-;; row0: var(99.5,100.5) = sample var = 0.5 (2 values)
-;; row1: var([101.5]) = null (undefined for n=1 sample var)
+;; row0: var(99.5,100.5) sample var over 2 values
+;; row1: var(100.5,101.5) sample var over 2 values (prevailing-seeded)
 (count (window-join [Sym Time] wjiv wjl wjr {v: (var Price)})) -- 2
 
 ;; ====================================================================
@@ -634,7 +636,9 @@
 (set wjl2 (table [Sym Time] (list ['a 'a] [10:00:01.000 10:00:05.000])))
 (set wjr2 (table [Sym Time Price] (list ['a 'a 'a] [10:00:00.000 10:00:02.000 10:00:04.000] (as 'F64 [99.5 100.5 101.5]))))
 (set wjiv2 (map-left + [-2000 2000] (at wjl2 'Time)))
-(at (window-join [Sym Time] wjiv2 wjl2 wjr2 {f: (first Price)}) 'f) -- [99.5 101.5]
+;; wj prevailing seed: row1 window [10:00:03,10:00:07] starts at the @02
+;; quote (100.5), so first=100.5 (last still the @04 quote, 101.5).
+(at (window-join [Sym Time] wjiv2 wjl2 wjr2 {f: (first Price)}) 'f) -- [99.5 100.5]
 (at (window-join [Sym Time] wjiv2 wjl2 wjr2 {l: (last Price)}) 'l) -- [100.5 101.5]
 
 ;; window-join integer VAR/PROD/STDDEV — sorted_i OP_VAR/OP_PROD/OP_STDDEV.

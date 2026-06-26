@@ -64,13 +64,13 @@ static inline int64_t sym_scalar_runtime_id(ray_t* v) {
  * ============================================================================ */
 
 ray_t* exec_if(ray_graph_t* g, ray_op_t* op) {
-    /* cond = inputs[0], then = inputs[1], else_id stored in ext->literal */
-    ray_t* cond_v = exec_node(g, op->inputs[0]);
-    ray_t* then_v = exec_node(g, op->inputs[1]);
+    /* cond = inputs[0], then = inputs[1], else_id stored in ext->third_in */
+    ray_t* cond_v = exec_node(g, op_child(g, op, 0));
+    ray_t* then_v = exec_node(g, op_child(g, op, 1));
 
     ray_op_ext_t* ext = find_ext(g, op->id);
-    uint32_t else_id = (uint32_t)(uintptr_t)ext->literal;
-    ray_t* else_v = exec_node(g, &g->nodes[else_id]);
+    uint32_t else_id = ext->third_in;
+    ray_t* else_v = exec_node(g, op_node(g, else_id));
 
     if (!cond_v || RAY_IS_ERR(cond_v)) {
         if (then_v && !RAY_IS_ERR(then_v)) ray_release(then_v);
@@ -277,18 +277,18 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     /* Resolve input columns */
     ray_t* idx_vecs[16];
     for (uint8_t i = 0; i < n_idx; i++) {
-        ray_op_ext_t* ie = find_ext(g, ext->pivot.index_cols[i]->id);
+        ray_op_ext_t* ie = find_ext(g, ext->pivot.index_cols[i]);
         idx_vecs[i] = (ie && ie->base.opcode == OP_SCAN)
                      ? ray_table_get_col(tbl, ie->sym) : NULL;
         if (!idx_vecs[i]) return ray_error("domain", "pivot: index column not found");
     }
 
-    ray_op_ext_t* pe = find_ext(g, ext->pivot.pivot_col->id);
+    ray_op_ext_t* pe = find_ext(g, ext->pivot.pivot_col);
     ray_t* pcol = (pe && pe->base.opcode == OP_SCAN)
                 ? ray_table_get_col(tbl, pe->sym) : NULL;
     if (!pcol) return ray_error("domain", "pivot: pivot column not found");
 
-    ray_op_ext_t* ve = find_ext(g, ext->pivot.value_col->id);
+    ray_op_ext_t* ve = find_ext(g, ext->pivot.value_col);
     ray_t* vcol = (ve && ve->base.opcode == OP_SCAN)
                 ? ray_table_get_col(tbl, ve->sym) : NULL;
     if (!vcol) return ray_error("domain", "pivot: value column not found");
@@ -589,7 +589,7 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         if (new_col->type == RAY_SYM)
             ray_sym_vec_adopt_domain(new_col, idx_vecs[k]);
 
-        ray_op_ext_t* ie = find_ext(g, ext->pivot.index_cols[k]->id);
+        ray_op_ext_t* ie = find_ext(g, ext->pivot.index_cols[k]);
         result = ray_table_add_col(result, ie->sym, new_col);
         ray_release(new_col);
         if (RAY_IS_ERR(result)) goto pivot_cleanup;
@@ -605,8 +605,44 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         if (!new_col || RAY_IS_ERR(new_col)) { ray_release(result); result = ray_error("oom", NULL); goto pivot_cleanup; }
         new_col->len = (int64_t)ix_count;
 
-        /* Initialize with zero (missing cells get 0) */
-        memset(ray_data(new_col), 0, (size_t)ix_count * (out_agg_type == RAY_F64 ? 8 : (size_t)col_esz(new_col)));
+        /* Initialize missing cells with the type-correct NULL sentinel —
+         * a pivot cell with no source row is "no data", which must stay
+         * distinguishable from a real 0 (review 2.10).  Present cells get
+         * overwritten in the scatter loop below; whatever remains is null.
+         * par_finalize_nulls (after scatter) flips HAS_NULLS if any
+         * sentinel survives.  Non-sentinel types (SYM/STR/BOOL/U8/GUID)
+         * fall back to zero-fill: SYM id 0 is the SYM null already; the
+         * others carry no null sentinel. */
+        switch (new_col->type) {
+            case RAY_F64: {
+                double* d = (double*)ray_data(new_col);
+                for (int64_t r = 0; r < (int64_t)ix_count; r++) d[r] = NULL_F64;
+                break;
+            }
+            case RAY_F32: {
+                float* d = (float*)ray_data(new_col);
+                for (int64_t r = 0; r < (int64_t)ix_count; r++) d[r] = NULL_F32;
+                break;
+            }
+            case RAY_I64: case RAY_TIMESTAMP: {
+                int64_t* d = (int64_t*)ray_data(new_col);
+                for (int64_t r = 0; r < (int64_t)ix_count; r++) d[r] = NULL_I64;
+                break;
+            }
+            case RAY_I32: case RAY_DATE: case RAY_TIME: {
+                int32_t* d = (int32_t*)ray_data(new_col);
+                for (int64_t r = 0; r < (int64_t)ix_count; r++) d[r] = NULL_I32;
+                break;
+            }
+            case RAY_I16: {
+                int16_t* d = (int16_t*)ray_data(new_col);
+                for (int64_t r = 0; r < (int64_t)ix_count; r++) d[r] = NULL_I16;
+                break;
+            }
+            default:
+                memset(ray_data(new_col), 0, (size_t)ix_count * (size_t)col_esz(new_col));
+                break;
+        }
 
         for (uint32_t _pp = 0; _pp < pg.n_parts; _pp++) {
             group_ht_t* ph = &pg.part_hts[_pp];
@@ -644,7 +680,10 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                         break;
                     default: v = 0.0; break;
                 }
-                ((double*)ray_data(new_col))[r] = v;
+                /* Single-null float model: canonicalize non-finite (avg
+                 * division, sum overflow) to NULL_F64; HAS_NULLS set by the
+                 * scan below before new_col is added to the result. */
+                ((double*)ray_data(new_col))[r] = ray_f64_fin(v);
             } else {
                 int64_t v;
                 switch (agg_op) {
@@ -713,6 +752,12 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
             col_sym = ray_sym_intern(buf, (size_t)len);
         }
 
+        /* Flip HAS_NULLS if any pivot cell carries the type-correct NULL
+         * sentinel — either a missing cell (no source row) left as null by
+         * the init above, or (F64) a value canonicalized to NULL_F64 by
+         * ray_f64_fin (avg division, sum overflow).  par_finalize_nulls is
+         * a no-op for non-sentinel types (SYM/STR/BOOL/U8/GUID). */
+        par_finalize_nulls(new_col);
         result = ray_table_add_col(result, col_sym, new_col);
         ray_release(new_col);
         if (RAY_IS_ERR(result)) goto pivot_cleanup;

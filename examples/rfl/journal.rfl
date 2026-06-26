@@ -1,15 +1,31 @@
-;; Journaling example
-(set f (fn [x y] (println "RES: %" (+ x y))))
+;; Transaction-log journaling example (the `.log.*` API).
+;;
+;; In production you start the server with `-l <base>` (async) or `-L <base>`
+;; (sync, fsync per write): every mutation that arrives over IPC is appended to
+;; <base>.log and replayed automatically on restart, so user state survives a
+;; crash.  The `.log.*` verbs expose that machinery directly.
 
-;; Write journal
-(set h (.ipc.open "/tmp/jou.log"))
-(write h (list 'f 1 2))
-(write h (list 'f 2 3))
-(write h (list 'f 3 4))
-(.ipc.close h)
+(set base "/tmp/jou_ex")
+(.sys.exec "rm -f /tmp/jou_ex*")
 
-;; Replay journal
-(set h (.ipc.open "/tmp/jou.log"))
-(read h)
-(.ipc.close h)
+;; Open a journal in async mode (writes buffered; use 'sync for fsync-per-write).
+(.log.open 'async base)
+
+;; Append entries.  `.log.write` serializes its (already-evaluated) argument
+;; into the log; replay re-evaluates each payload in order.
+(.log.write 100)
+(.log.write [1 2 3])
+(.log.write {sym: 'AAPL px: 191.5})
+
+;; Flush buffered writes to disk and close.
+(.log.sync)
+(.log.close)
+
+;; Inspect the log: (.log.validate path) -> [chunks valid_bytes].
+(println "validate %.log -> %" base (.log.validate (format "%.log" base)))
+
+;; Replay the journal — returns the number of entries replayed.
+(println "replayed % entries" (.log.replay (format "%.log" base)))
+
+(.sys.exec "rm -f /tmp/jou_ex*")
 (exit 0)

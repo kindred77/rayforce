@@ -30,11 +30,12 @@
 ;; top-2 keeps both values per group → 6 output rows total.
 (set Ttrk_s (table [k v] (list (as 'I64 [1 1 2 2 3 3]) (as 'I64 [10 20 30 40 50 60]))))
 (set Rtrk_s (select {t: (top v 2) by: k from: Ttrk_s}))
-(count Rtrk_s) -- 6
-;; Sum over all k values (each key repeated K times in output): 1+1+2+2+3+3=12
-(sum (at Rtrk_s 'k)) -- 12
-;; Sum over all top-2 v values = 10+20+30+40+50+60=210
-(sum (at Rtrk_s 't)) -- 210
+;; v2 emits one row per group with a LIST cell; 3 groups → 3 rows.
+(count Rtrk_s) -- 3
+;; Sum over the (one-per-group) key column: 1+2+3=6
+(sum (at Rtrk_s 'k)) -- 6
+;; Sum over all top-2 v values (flatten the LIST cells) = 10+20+30+40+50+60=210
+(sum (raze (at Rtrk_s 't))) -- 210
 
 ;; ─── Serial bot-1 by I64 key, I64 value (desc=0 path) ─────────────────
 ;; bot-1: keep minimum value per group.  3 groups, 1 row each → 3 rows.
@@ -44,7 +45,7 @@
 ;; sum k = 1+2+3 = 6
 (sum (at Rtrk_b 'k)) -- 6
 ;; bot-1: min per group = 10, 30, 50 → sum = 90
-(sum (at Rtrk_b 't)) -- 90
+(sum (raze (at Rtrk_b 't))) -- 90
 
 ;; ─── top-1 with K=1 (most common case) ────────────────────────────────
 ;; K=1: heap of size 1, no sift_down needed. 5 groups.
@@ -52,7 +53,7 @@
 (set Rtrk_k1 (select {t: (top v 1) by: k from: Ttrk_k1}))
 (count Rtrk_k1) -- 5
 ;; max per group: 20, 40, 60, 80, 100 → sum = 300
-(sum (at Rtrk_k1 't)) -- 300
+(sum (raze (at Rtrk_k1 't))) -- 300
 
 ;; ─── top-3 forces sift_down with right child (K=3, heap-insert eviction) ──
 ;; When K=3 and group has >3 rows, the heap insert eviction path with right
@@ -61,9 +62,9 @@
 ;; k=2 has 5 rows: v=[10,8,6,9,7] → top-3 = [10,9,8] → sum=27
 (set Ttrk_k3 (table [k v] (list (as 'I64 [1 1 1 1 1 2 2 2 2 2]) (as 'I64 [5 3 1 4 2 10 8 6 9 7]))))
 (set Rtrk_k3 (select {t: (top v 3) by: k from: Ttrk_k3}))
-(count Rtrk_k3) -- 6
+(count Rtrk_k3) -- 2
 ;; sum of all top-3 values: 5+4+3 + 10+9+8 = 39
-(sum (at Rtrk_k3 't)) -- 39
+(sum (raze (at Rtrk_k3 't))) -- 39
 
 ;; ─── F64 value path (val_is_f64=1) ────────────────────────────────────
 ;; top-2 with F64 values: covers grpt_heap_push_dbl + grpt_phase3_fn F64 path
@@ -73,23 +74,23 @@
 ;; k=3: F64 [3.5, 5.5] → top-2: [5.5, 3.5]
 (set Ttrk_f (table [k v] (list (as 'I64 [1 1 2 2 3 3]) (as 'F64 [1.5 3.5 2.5 4.5 3.5 5.5]))))
 (set Rtrk_f (select {t: (top v 2) by: k from: Ttrk_f}))
-(count Rtrk_f) -- 6
+(count Rtrk_f) -- 3
 ;; Sum of all F64 top values = 1.5+3.5+2.5+4.5+3.5+5.5 = 21.0
-(< (abs (- (sum (at Rtrk_f 't)) 21.0)) 0.001) -- true
+(< (abs (- (sum (raze (at Rtrk_f 't))) 21.0)) 0.001) -- true
 
 ;; bot-1 with F64 value: desc=0 + val_is_f64=1 path
 (set Rtrk_fb (select {t: (bot v 1) by: k from: Ttrk_f}))
 (count Rtrk_fb) -- 3
 ;; bot-1 per group: min F64 = 1.5, 2.5, 3.5 → sum = 7.5
-(< (abs (- (sum (at Rtrk_fb 't)) 7.5)) 0.001) -- true
+(< (abs (- (sum (raze (at Rtrk_fb 't))) 7.5)) 0.001) -- true
 
 ;; F64 top-3: forces sift with right child in topk_sift_down_dbl
 ;; k=1: F64 [5.0 3.0 1.0 4.0 2.0] → top-3 = [5.0, 4.0, 3.0] → sum=12.0
 ;; k=2: F64 [10.0 8.0 6.0 9.0 7.0] → top-3 = [10.0, 9.0, 8.0] → sum=27.0
 (set Ttrk_fk3 (table [k v] (list (as 'I64 [1 1 1 1 1 2 2 2 2 2]) (as 'F64 [5.0 3.0 1.0 4.0 2.0 10.0 8.0 6.0 9.0 7.0]))))
 (set Rtrk_fk3 (select {t: (top v 3) by: k from: Ttrk_fk3}))
-(count Rtrk_fk3) -- 6
-(< (abs (- (sum (at Rtrk_fk3 't)) 39.0)) 0.001) -- true
+(count Rtrk_fk3) -- 2
+(< (abs (- (sum (raze (at Rtrk_fk3 't))) 39.0)) 0.001) -- true
 
 ;; ─── Null values path (val_has_nulls=true) ─────────────────────────────
 ;; Null values are skipped in grpt_phase1_fn (vnulls && grpt_is_null check).
@@ -98,7 +99,7 @@
 (set Ttrk_nv (table [k v] (list (as 'I64 [1 1 1 1 2 2 2]) (as 'I64 [10 0N 20 0N 30 40 0N]))))
 (set Rtrk_nv (select {t: (top v 1) by: k from: Ttrk_nv}))
 (count Rtrk_nv) -- 2
-(sum (at Rtrk_nv 't)) -- 60
+(sum (raze (at Rtrk_nv 't))) -- 60
 
 ;; ─── I32 key type (key_esz=4 branch in grpt_write_key) ─────────────────
 ;; I32 key: covers RAY_I32 path in grpt_key_read/grpt_key_hash/grpt_write_key
@@ -106,19 +107,19 @@
 (set Rtrk_i32 (select {t: (top v 1) by: k from: Ttrk_i32}))
 (count Rtrk_i32) -- 3
 ;; top-1 per group: k=100→max(1,2)=2; k=200→max(3,4)=4; k=300→max(5,6)=6 → sum=12
-(sum (at Rtrk_i32 't)) -- 12
+(sum (raze (at Rtrk_i32 't))) -- 12
 
 ;; ─── Parallel path (>= 16384 rows) — grpt parallel phases 1+2+3 ──────
 ;; 20000 rows, k = i%1000 (1000 groups), v = i
 ;; top-2 per group: each group has 20 rows, keeps top 2 → total 2000 rows.
 (set Ttrk_p (table [k v] (list (as 'I64 (% (til 20000) 1000)) (as 'I64 (til 20000)))))
 (set Rtrk_p (select {t: (top v 2) by: k from: Ttrk_p}))
-;; 1000 groups × 2 values each = 2000 rows
-(count Rtrk_p) -- 2000
+;; 1000 groups → 1000 rows, each a 2-element LIST cell.
+(count Rtrk_p) -- 1000
 ;; Sum of all top-2 v values: per group k, the top-2 are (k+19000) and (k+18000)
 ;; sum = Σ_{k=0}^{999} [ (k+19000) + (k+18000) ] = Σ(2k+37000) = 2*(0+...+999) + 37000*1000
 ;; = 2*499500 + 37000000 = 999000 + 37000000 = 37999000
-(sum (at Rtrk_p 't)) -- 37999000
+(sum (raze (at Rtrk_p 't))) -- 37999000
 
 ;; F64 parallel path: 20000 rows with F64 values
 (set Ttrk_pf (table [k v] (list (as 'I64 (% (til 20000) 1000)) (as 'F64 (til 20000)))))
@@ -126,7 +127,7 @@
 ;; 1000 groups × 1 value = 1000 rows
 (count Rtrk_pf) -- 1000
 ;; top-1 per group k: v = k+19000 → sum = Σ_{k=0}^{999} (k+19000) = 499500 + 19000000 = 19499500
-(< (abs (- (sum (at Rtrk_pf 't)) 19499500.0)) 1.0) -- true
+(< (abs (- (sum (raze (at Rtrk_pf 't))) 19499500.0)) 1.0) -- true
 
 ;; ─── grpt_ht_grow_* — many groups per partition ─────────────────────────
 ;; To trigger grpt_ht_grow_slots: need >4096 distinct groups per partition.
@@ -137,7 +138,7 @@
 (set Rtrk_g (select {t: (top v 1) by: k from: Ttrk_g}))
 (count Rtrk_g) -- 50000
 ;; top-1 per group k: only 1 row per group, so v=k → sum = 0+1+...+49999 = 1249975000
-(sum (at Rtrk_g 't)) -- 1249975000
+(sum (raze (at Rtrk_g 't))) -- 1249975000
 
 ;; ─── SYM key path (dispatch check — SYM key NOT supported by rowform) ──
 ;; SYM keys go through ray_group3 (the planner restricts to numeric types).
@@ -150,4 +151,4 @@
 (set Ttrk_fk (table [k v] (list (as 'F64 [1.0 1.0 2.0 2.0]) (as 'I64 [10 20 30 40]))))
 (set Rtrk_fk (select {t: (top v 1) by: k from: Ttrk_fk}))
 (count Rtrk_fk) -- 2
-(sum (at Rtrk_fk 't)) -- 60
+(sum (raze (at Rtrk_fk 't))) -- 60

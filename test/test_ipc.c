@@ -190,7 +190,7 @@ static test_result_t test_ipc_send_verbose(void) {
     ray_thread_t tid;
     ray_thread_create(&tid, server_thread_fn, &ctx);
 
-    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL);
+    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
 
     /* Send via verbose path — server captures stdout/stderr and returns
@@ -247,7 +247,7 @@ static test_result_t test_ipc_send_verbose_captures_output(void) {
     ray_thread_t tid;
     ray_thread_create(&tid, server_thread_fn, &ctx);
 
-    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL);
+    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
 
     /* Use (println 42) — writes "42\n" to stdout via fwrite/fflush.
@@ -405,7 +405,7 @@ static test_result_t test_ipc_send_list_select_msg(void) {
     ray_thread_t tid;
     ray_thread_create(&tid, server_thread_fn, &ctx);
 
-    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL);
+    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
 
     const char* setup_src = "(set t (table [sym px] (list [AAPL GOOG] [10.0 20.0])))";
@@ -445,7 +445,7 @@ static test_result_t test_ipc_send_list_select_msg(void) {
  */
 static test_result_t test_ipc_connect_fail_no_server(void) {
     /* Connect to port 1 (reserved, always refused) */
-    int64_t bad_h = ray_ipc_connect("127.0.0.1", 1, NULL, NULL);
+    int64_t bad_h = ray_ipc_connect("127.0.0.1", 1, NULL, NULL, 0);
     TEST_ASSERT_EQ_I(bad_h, -1);
     PASS();
 }
@@ -472,7 +472,7 @@ static test_result_t test_ipc_connect_auth_no_user(void) {
     ray_thread_create(&tid, server_thread_fn, &ctx);
 
     /* Connect with NULL user but valid password */
-    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, "mypass");
+    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, "mypass", 0);
     TEST_ASSERT((h) >= (0), "h >= 0 (auth with no user)");
 
     ray_t* msg = ray_str("(+ 1 1)", 7);
@@ -563,7 +563,7 @@ static test_result_t test_ipc_poll_based_listen(void) {
     sleep_ms(20);
 
     /* Client: connect and send a query */
-    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL);
+    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((h) >= (0), "poll client h >= 0");
 
     ray_t* msg = ray_str("(+ 3 4)", 7);
@@ -621,7 +621,7 @@ static test_result_t test_ipc_poll_auth_creds_path(void) {
     ray_thread_create(&tid, (void(*)(void*))poll_server_thread_fn, &pctx);
     sleep_ms(20);
 
-    int64_t h = ray_ipc_connect("127.0.0.1", port, "user", "pollpass");
+    int64_t h = ray_ipc_connect("127.0.0.1", port, "user", "pollpass", 0);
     TEST_ASSERT((h) >= (0), "connect with correct password should succeed");
 
     if (h >= 0) ray_ipc_close(h);
@@ -660,11 +660,11 @@ static test_result_t test_ipc_poll_auth_reject(void) {
     sleep_ms(20);
 
     /* Connect with wrong password: should get -3 (auth rejected) */
-    int64_t h = ray_ipc_connect("127.0.0.1", port, "user", "wrongpass");
+    int64_t h = ray_ipc_connect("127.0.0.1", port, "user", "wrongpass", 0);
     TEST_ASSERT_EQ_I(h, -3);
 
     /* Connect with no password: should get -2 (auth required but no creds) */
-    int64_t h2 = ray_ipc_connect("127.0.0.1", port, NULL, NULL);
+    int64_t h2 = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT_EQ_I(h2, -2);
 
     poll_stop(poll, port);
@@ -712,7 +712,7 @@ static test_result_t test_ipc_poll_handshake_version_mismatch(void) {
     ray_sock_close(s);
 
     /* A correct client should still work after the bad handshake */
-    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL);
+    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((h) >= (0), "well-behaved client still connects");
     ray_ipc_close(h);
 
@@ -745,7 +745,7 @@ static test_result_t test_ipc_send_large_compressible(void) {
     ray_thread_t tid;
     ray_thread_create(&tid, server_thread_fn, &ctx);
 
-    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL);
+    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
 
     /* Build a large string with many repeated chars so it serializes large. */
@@ -819,7 +819,7 @@ static test_result_t test_ipc_journal_path(void) {
     ray_thread_t tid;
     ray_thread_create(&tid, server_thread_fn, &ctx);
 
-    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL);
+    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
 
     ray_t* msg = ray_str("(+ 10 5)", 8);
@@ -927,7 +927,7 @@ static test_result_t test_ipc_poll_async_send(void) {
     ray_thread_create(&tid, (void(*)(void*))poll_server_thread_fn, &pctx);
     sleep_ms(20);
 
-    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL);
+    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
 
     ray_t* msg = ray_str("(+ 1 1)", 7);
@@ -971,7 +971,7 @@ static test_result_t test_ipc_poll_multiple_requests(void) {
     ray_thread_create(&tid, (void(*)(void*))poll_server_thread_fn, &pctx);
     sleep_ms(20);
 
-    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL);
+    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
 
     for (int i = 1; i <= 5; i++) {
@@ -1053,7 +1053,7 @@ static test_result_t test_ipc_poll_bad_header(void) {
     ray_sock_close(s);
 
     /* Server should still be running for next client */
-    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL);
+    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((h) >= (0), "server still running after bad header");
     ray_ipc_close(h);
 
@@ -1089,7 +1089,7 @@ static test_result_t test_ipc_send_large_result(void) {
     ray_thread_t tid;
     ray_thread_create(&tid, server_thread_fn, &ctx);
 
-    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL);
+    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
 
     /* Build an expression that generates a large result.
@@ -1146,7 +1146,7 @@ static test_result_t test_ipc_send_large_msg_client_compress(void) {
     ray_thread_t tid;
     ray_thread_create(&tid, server_thread_fn, &ctx);
 
-    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL);
+    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
 
     /* Build a 300-element i64 vector with sequential values 0..299.
@@ -1207,7 +1207,7 @@ static test_result_t test_ipc_send_verbose_large_result(void) {
     ray_thread_t tid;
     ray_thread_create(&tid, server_thread_fn, &ctx);
 
-    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL);
+    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
 
     /* (til 1000) returns a 1000-element i64 vector (~8000 bytes serialized).
@@ -1260,9 +1260,9 @@ static test_result_t test_ipc_server_destroy_active_conns(void) {
     ray_thread_create(&tid, server_thread_fn, &ctx);
 
     /* Connect two clients */
-    int64_t h1 = ray_ipc_connect("127.0.0.1", port, NULL, NULL);
+    int64_t h1 = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((h1) >= (0), "h1 >= 0");
-    int64_t h2 = ray_ipc_connect("127.0.0.1", port, NULL, NULL);
+    int64_t h2 = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((h2) >= (0), "h2 >= 0");
 
     /* Do one round-trip to ensure the server has accepted the connections */
@@ -1356,7 +1356,7 @@ static test_result_t test_ipc_server_conn_swap(void) {
     ray_sock_close(s1);
 
     /* s2 should still work; do a proper round-trip on it */
-    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL);
+    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     if (h >= 0) {
         ray_t* msg = ray_str("(+ 1 1)", 7);
         ray_t* r = ray_ipc_send(h, msg);
@@ -1411,7 +1411,7 @@ static test_result_t test_ipc_journal_restricted(void) {
     ray_thread_t tid;
     ray_thread_create(&tid, server_thread_fn, &ctx);
 
-    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL);
+    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
 
     /* SYNC message → eval_payload_core sets restricted flag on log header */
@@ -1460,7 +1460,7 @@ static test_result_t test_ipc_send_lazy_msg(void) {
     ray_thread_t tid;
     ray_thread_create(&tid, server_thread_fn, &ctx);
 
-    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL);
+    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
 
     /* Build a lazy that materialises to int 15 (sum of 1..5). */
@@ -1569,7 +1569,7 @@ static test_result_t test_ipc_hooks_lifecycle(void) {
     ray_thread_t tid;
     ray_thread_create(&tid, server_thread_fn, &ctx);
 
-    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL);
+    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
 
     /* One SYNC round-trip — drives on.open (after handshake), on.sync
@@ -1663,11 +1663,11 @@ static test_result_t test_ipc_hooks_auth_narrow(void) {
     /* "ban":secret → password is correct, but the hook returns false
      * → handshake rejected with the same 0x01 byte the wrong-password
      * path uses, so the client surfaces -3 (auth rejected). */
-    int64_t h_banned = ray_ipc_connect("127.0.0.1", port, "ban", "secret");
+    int64_t h_banned = ray_ipc_connect("127.0.0.1", port, "ban", "secret", 0);
     TEST_ASSERT_EQ_I(h_banned, -3);
 
     /* "ok":secret → both checks pass, connection succeeds. */
-    int64_t h_ok = ray_ipc_connect("127.0.0.1", port, "ok", "secret");
+    int64_t h_ok = ray_ipc_connect("127.0.0.1", port, "ok", "secret", 0);
     TEST_ASSERT((h_ok) >= (0), "h_ok >= 0");
     if (h_ok >= 0) ray_ipc_close(h_ok);
 
@@ -1712,7 +1712,7 @@ static test_result_t test_ipc_post_delivery(void) {
     ray_thread_t tid;
     ray_thread_create(&tid, server_thread_fn, &ctx);
 
-    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL);
+    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
 
     /* Post async via the BUILTIN — build the call string with the live
@@ -1850,7 +1850,7 @@ static test_result_t test_ipc_server_push(void) {
     ray_thread_create(&tid, (void(*)(void*))poll_server_thread_fn, &pctx);
     sleep_ms(20);
 
-    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL);
+    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
     TEST_ASSERT((h) >= (0), "h >= 0");
 
     /* Barrier 1: drains the on.open push before returning. */

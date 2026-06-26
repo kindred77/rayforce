@@ -304,6 +304,12 @@ static test_result_t test_nullfree_promotion_invariance(void) {
     ray_expr_t ex;
     TEST_ASSERT(expr_compile(g, tbl, build_i64_plus_f64(g), &ex),
                 "null-free promotion compiles");
+    /* No INPUT is nullable, so the compiler marks no instruction null_aware and
+     * no reg nullable.  Single-null float model: an F64 producer that may yield
+     * 0Nf from finite inputs (overflow) gets HAS_NULLS via a PRECISE post-scan
+     * in expr_eval_full (expr_last_op_produces_f64_null +
+     * mark_f64_nonfinite_as_null) — NOT the compile-time nullable flag — so
+     * this null-free-promotion compile invariant is preserved unchanged. */
     for (uint8_t i = 0; i < ex.n_ins; i++)
         TEST_ASSERT(ex.ins[i].null_aware == 0,
                     "no null_aware on null-free promotion");

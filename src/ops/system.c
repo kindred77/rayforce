@@ -42,6 +42,7 @@ void  ray_runtime_set_sys_args(void* dict);
 void* ray_runtime_get_sys_args(void);
 #include <time.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 //#if !defined(RAY_OS_WINDOWS)
@@ -74,18 +75,20 @@ static bool sym_partition_shaped(const char* name, size_t n) {
 
 /* Symfile resolution (sym-domain spec, "Surface"): for a partition dir
  * (/db/2024.01.01/t/) the table root is the PARTED ROOT — derived from
- * the path shape — and the domain is root/sym; for a standalone splayed
- * dir the root is the dir itself (dir/sym).  Writes default to the
- * convention unconditionally; reads prefer an existing dir/sym, then an
- * existing partition root/sym, else NULL (the load layer raises the
+ * the path shape — and the domain is root/.sym; for a standalone splayed
+ * dir the root is the dir itself (dir/.sym).  The symfile is a dotfile so
+ * it can never collide with a user column (e.g. a "sym" ticker column).
+ * Writes default to the convention unconditionally; reads prefer an
+ * existing dir/.sym, then an existing partition root/.sym, else NULL (the
+ * load layer raises the
  * loud "sym" error only if SYM columns actually exist). */
 static const char* splay_resolve_sym(const char* dir, char* buf, size_t bufsz,
                                      bool for_write) {
     size_t dlen = strlen(dir);
     while (dlen > 1 && dir[dlen - 1] == '/') dlen--; /* strip trailing '/' */
 
-    /* dir/sym */
-    int n = snprintf(buf, bufsz, "%.*s/sym", (int)dlen, dir);
+    /* dir/.sym */
+    int n = snprintf(buf, bufsz, "%.*s/.sym", (int)dlen, dir);
     if (n < 0 || (size_t)n >= bufsz) return NULL;
     if (!for_write && access(buf, F_OK) == 0) return buf;
 
@@ -103,7 +106,7 @@ static const char* splay_resolve_sym(const char* dir, char* buf, size_t bufsz,
         if (sym_partition_shaped(pname, pname_len) && pslash) {
             size_t root_len = (size_t)(pslash - dir);
             if (root_len == 0) root_len = 1; /* "/" root */
-            int rn = snprintf(buf, bufsz, "%.*s/sym", (int)root_len, dir);
+            int rn = snprintf(buf, bufsz, "%.*s/.sym", (int)root_len, dir);
             if (rn < 0 || (size_t)rn >= bufsz) return NULL;
             if (for_write || access(buf, F_OK) == 0) return buf;
             return NULL;
@@ -112,7 +115,7 @@ static const char* splay_resolve_sym(const char* dir, char* buf, size_t bufsz,
 
     if (for_write) {
         /* Not partition-shaped: the dir itself is the table root. */
-        n = snprintf(buf, bufsz, "%.*s/sym", (int)dlen, dir);
+        n = snprintf(buf, bufsz, "%.*s/.sym", (int)dlen, dir);
         if (n < 0 || (size_t)n >= bufsz) return NULL;
         return buf;
     }
@@ -133,13 +136,16 @@ static const char* str_to_cpath(ray_t* s, char* buf, size_t bufsz) {
 
 /* (.db.splayed.set "dir" table) or (.db.splayed.set "dir" table "sym_path") */
 ray_t* ray_set_splayed_fn(ray_t** args, int64_t n) {
-    if (n < 2 || n > 3) return ray_error("domain", NULL);
+    if (n < 2 || n > 3)
+        return ray_error("domain", ".db.splayed.set expects 2 or 3 arguments, got %lld", (long long)n);
 
     char dir[1024];
-    if (!str_to_cpath(args[0], dir, sizeof(dir))) return ray_error("type", NULL);
+    if (!str_to_cpath(args[0], dir, sizeof(dir)))
+        return ray_error("type", ".db.splayed.set expects a string dir path, got %s", ray_type_name(args[0]->type));
 
     ray_t* tbl = args[1];
-    if (!tbl || tbl->type != RAY_TABLE) return ray_error("type", NULL);
+    if (!tbl || tbl->type != RAY_TABLE)
+        return ray_error("type", ".db.splayed.set expects a table, got %s", ray_type_name(tbl->type));
 
     char sym[1024];
     const char* sym_path = NULL;
@@ -157,10 +163,12 @@ ray_t* ray_set_splayed_fn(ray_t** args, int64_t n) {
 
 /* (.db.splayed.get "dir") or (.db.splayed.get "dir" "sym_path") */
 ray_t* ray_get_splayed_fn(ray_t** args, int64_t n) {
-    if (n < 1 || n > 2) return ray_error("domain", NULL);
+    if (n < 1 || n > 2)
+        return ray_error("domain", ".db.splayed.get expects 1 or 2 arguments, got %lld", (long long)n);
 
     char dir[1024];
-    if (!str_to_cpath(args[0], dir, sizeof(dir))) return ray_error("type", NULL);
+    if (!str_to_cpath(args[0], dir, sizeof(dir)))
+        return ray_error("type", ".db.splayed.get expects a string dir path, got %s", ray_type_name(args[0]->type));
 
     char sym[1024];
     const char* sym_path = NULL;
@@ -178,34 +186,65 @@ ray_t* ray_get_splayed_fn(ray_t** args, int64_t n) {
 
 /* (.db.parted.get "db_root" `table_name) -- load partitioned table */
 ray_t* ray_get_parted_fn(ray_t** args, int64_t n) {
-    if (n != 2) return ray_error("domain", NULL);
+    if (n != 2)
+        return ray_error("domain", ".db.parted.get expects 2 arguments, got %lld", (long long)n);
 
     char root[1024];
-    if (!str_to_cpath(args[0], root, sizeof(root))) return ray_error("type", NULL);
+    if (!str_to_cpath(args[0], root, sizeof(root)))
+        return ray_error("type", ".db.parted.get expects a string db root path, got %s", ray_type_name(args[0]->type));
 
     /* Table name as symbol atom */
-    if (!args[1] || args[1]->type != -RAY_SYM) return ray_error("type", NULL);
+    if (!args[1] || args[1]->type != -RAY_SYM)
+        return ray_error("type", ".db.parted.get expects a sym table name, got %s", ray_type_name(args[1]->type));
     ray_t* name_atom = ray_sym_str(args[1]->i64);
     if (!name_atom) return ray_error("name", NULL);
 
     char name[256];
     size_t nlen = ray_str_len(name_atom);
-    if (nlen == 0 || nlen >= sizeof(name)) return ray_error("domain", NULL);
+    if (nlen == 0 || nlen >= sizeof(name))
+        return ray_error("domain", ".db.parted.get table name length out of range, got %lld", (long long)nlen);
     memcpy(name, ray_str_ptr(name_atom), nlen);
     name[nlen] = '\0';
 
     return ray_read_parted(root, name);
 }
 
-/* stat/dirent used by the .os.* filesystem metadata builtins below. */
+/* (.db.parted.tables "db_root") → sym vector of table names available under
+ * the root, suitable for passing to .db.parted.get. */
+ray_t* ray_get_parted_tables_fn(ray_t** args, int64_t n) {
+    if (n != 1)
+        return ray_error("domain", ".db.parted.tables expects 1 argument, got %lld", (long long)n);
+
+    char root[1024];
+    if (!str_to_cpath(args[0], root, sizeof(root)))
+        return ray_error("type", ".db.parted.tables expects a string db root path, got %s", ray_type_name(args[0]->type));
+
+    return ray_parted_tables(root);
+}
+
+/* (.db.parted.fill "db_root") → sym vector of partition names that were
+ * filled.  Writes an empty copy of every table into the partitions that lack
+ * it (schema from the most recent partition with it). */
+ray_t* ray_fill_parted_fn(ray_t** args, int64_t n) {
+    if (n != 1)
+        return ray_error("domain", ".db.parted.fill expects 1 argument, got %lld", (long long)n);
+
+    char root[1024];
+    if (!str_to_cpath(args[0], root, sizeof(root)))
+        return ray_error("type", ".db.parted.fill expects a string db root path, got %s", ray_type_name(args[0]->type));
+
+    return ray_parted_fill(root);
+}
+
+/* stat/dirent used by the .fs.* filesystem metadata builtins below. */
 #include <sys/stat.h>
 #include <dirent.h>
 
 /* ══════════════════════════════════════════
- * Filesystem metadata: .os.size / .os.list
+ * Filesystem metadata: .fs.size / .fs.list
  *
  * Issue #36 asked for size + existence + listing primitives.  We
- * keep just two — `.os.size` and `.os.list` — because every other
+ * keep just two — `.fs.size` and `.fs.list` — because every other
  * predicate (exists, is-file, is-dir) is reachable either via
  * try-on-error against these or via the existing shell fallback
  * (`(.sys.cmd "test -e p")` etc.).  Both errors are flagged "io"
@@ -214,15 +253,19 @@ ray_t* ray_get_parted_fn(ray_t** args, int64_t n) {
  * message.
  * ══════════════════════════════════════════ */
 
-/* (.os.size "path") → i64 file size in bytes.  Errors with "io"
+/* (.fs.size "path") → i64 file size in bytes.  Errors with "io"
  * when the path doesn't exist or names a directory — `try` it if
  * the caller wants those treated as "not a file" rather than a
  * hard error. */
-ray_t* ray_os_size_fn(ray_t* x) {
+ray_t* ray_fs_size_fn(ray_t* x) {
     if (!ray_is_atom(x) || x->type != -RAY_STR)
-        return ray_error("type", ".os.size expects a string path");
+        return ray_error("type", ".fs.size expects a string path");
     char path[1024];
-    if (!str_to_cpath(x, path, sizeof(path))) return ray_error("type", NULL);
+    /* x is already a STR atom here; str_to_cpath fails only when the path
+     * is empty or exceeds the buffer — a domain/range issue, not a type
+     * mismatch (old code: "type" → "domain"). */
+    if (!str_to_cpath(x, path, sizeof(path)))
+        return ray_error("domain", ".fs.size path is empty or too long, got %lld bytes", (long long)ray_str_len(x));
 
     struct stat st;
     if (stat(path, &st) != 0)
@@ -241,15 +284,19 @@ static int dir_entry_cmp(const void* a, const void* b) {
     return strcmp(sa, sb);
 }
 
-/* (.os.list "path") → sym vec of entries, sorted, with `.` and `..`
+/* (.fs.list "path") → sym vec of entries, sorted, with `.` and `..`
  * filtered out.  Errors with "io" if the path isn't a directory or
  * doesn't exist — caller can use that as a file/dir discriminator
  * via `try` when they don't want to shell out for the predicate. */
-ray_t* ray_os_list_fn(ray_t* x) {
+ray_t* ray_fs_list_fn(ray_t* x) {
     if (!ray_is_atom(x) || x->type != -RAY_STR)
-        return ray_error("type", ".os.list expects a string path");
+        return ray_error("type", ".fs.list expects a string path");
     char path[1024];
-    if (!str_to_cpath(x, path, sizeof(path))) return ray_error("type", NULL);
+    /* x is already a STR atom here; str_to_cpath fails only when the path
+     * is empty or exceeds the buffer — a domain/range issue, not a type
+     * mismatch (old code: "type" → "domain"). */
+    if (!str_to_cpath(x, path, sizeof(path)))
+        return ray_error("domain", ".fs.list path is empty or too long, got %lld bytes", (long long)ray_str_len(x));
 
     DIR* d = opendir(path);
     if (!d) return ray_error("io", "%s: %s", path, strerror(errno));
@@ -342,9 +389,10 @@ static inline uint64_t guid_rng_next(void) {
 /* (guid n) -> generate n random GUIDs as GUID vector.
  * v4 UUID format: 122 random bits + 4 version-bits (0100) + 2 variant-bits (10). */
 ray_t* ray_guid_fn(ray_t* n_arg) {
-    if (!n_arg || !is_numeric(n_arg)) return ray_error("type", NULL);
+    if (!n_arg || !is_numeric(n_arg))
+        return ray_error("type", "guid expects a numeric count, got %s", ray_type_name(n_arg->type));
     int64_t n = as_i64(n_arg);
-    if (n < 0) return ray_error("domain", NULL);
+    if (n < 0) return ray_error("domain", "guid count must be non-negative, got %lld", (long long)n);
     ray_t* result = ray_vec_new(RAY_GUID, n);
     if (RAY_IS_ERR(result)) return result;
     result->len = n;
@@ -375,7 +423,7 @@ ray_t* ray_eval_builtin_fn(ray_t* x) {
 ray_t* ray_parse_builtin_fn(ray_t* x) {
     if (x->type != -RAY_STR) return ray_error("type", "parse expects a string");
     const char* src = ray_str_ptr(x);
-    if (!src) return ray_error("domain", NULL);
+    if (!src) return ray_error("domain", "parse: empty or invalid source string");
     ray_t* parsed = ray_parse(src);
     return parsed ? parsed : ray_error("parse", NULL);
 }
@@ -385,7 +433,8 @@ ray_t* ray_parse_builtin_fn(ray_t* x) {
 
 /* (meta x) -- return metadata about an object as a dict */
 ray_t* ray_meta_fn(ray_t* x) {
-    if (!x) return ray_error("type", NULL);
+    /* x is NULL here, so no ->type to report. */
+    if (!x) return ray_error("type", "meta expects a value");
 
     const char* tname = ray_type_name(x->type);
     int64_t type_sym = ray_sym_intern("type", 4);
@@ -430,7 +479,7 @@ ray_t* ray_gc_fn(ray_t** args, int64_t n) { (void)args; (void)n; return ray_i64(
 ray_t* ray_system_fn(ray_t* x) {
     if (x->type != -RAY_STR) return ray_error("type", "system expects a string");
     const char* cmd = ray_str_ptr(x);
-    if (!cmd) return ray_error("domain", NULL);
+    if (!cmd) return ray_error("domain", ".sys.exec: empty or invalid command string");
     int rc = system(cmd);
     return make_i64(rc);
 }
@@ -443,7 +492,7 @@ ray_t* ray_getenv_fn(ray_t* x) {
      * to libc getenv directly — copy into a NUL-terminated buffer first. */
     char namebuf[256];
     const char* name = str_to_cpath(x, namebuf, sizeof(namebuf));
-    if (!name) return ray_error("domain", NULL);
+    if (!name) return ray_error("domain", ".os.getenv name is empty or too long, got %lld bytes", (long long)ray_str_len(x));
     const char* val = getenv(name);
     return val ? ray_str(val, strlen(val)) : ray_str("", 0);
 }
@@ -459,12 +508,13 @@ ray_t* ray_setenv_fn(ray_t* name, ray_t* val) {
      * NUL-terminated when pooled (len > RAY_STR_INLINE_MAX). */
     char namebuf[256];
     const char* n = str_to_cpath(name, namebuf, sizeof(namebuf));
-    if (!n) return ray_error("domain", NULL);
+    if (!n) return ray_error("domain", ".os.setenv name is empty or too long, got %lld bytes", (long long)ray_str_len(name));
     char valbuf[4096];
     size_t vlen = ray_str_len(val);
-    if (vlen >= sizeof(valbuf)) return ray_error("range", "setenv value too long");
+    if (vlen >= sizeof(valbuf))
+        return ray_error("range", ".os.setenv value too long, got %lld bytes", (long long)vlen);
     const char* vp = ray_str_ptr(val);
-    if (!vp) return ray_error("domain", NULL);
+    if (!vp) return ray_error("domain", ".os.setenv: invalid value string");
     if (vlen) memcpy(valbuf, vp, vlen);
     valbuf[vlen] = '\0';
 #if defined(RAY_OS_WINDOWS)
@@ -810,10 +860,27 @@ ray_t* ray_sys_args_fn(ray_t** args, int64_t n) {
  * IPC builtins
  * ══════════════════════════════════════════ */
 
-/* (hopen "host:port[:user:password]") → i64 handle */
-ray_t* ray_hopen_fn(ray_t* x) {
+/* (hopen "host:port[:user:password]" [timeout-ms]) → i64 handle.
+ * The optional second argument bounds the TCP connect and handshake in
+ * milliseconds; omitted leaves the default budget. */
+ray_t* ray_hopen_fn(ray_t** args, int64_t n) {
+    if (n < 1 || n > 2)
+        return ray_error("rank", ".ipc.open expects 1 or 2 arguments: \"host:port[:user:password]\" [timeout-ms]");
+
+    ray_t* x = args[0];
     if (!ray_is_atom(x) || x->type != -RAY_STR)
-        return ray_error("type", NULL);
+        return ray_error("type", ".ipc.open expects a string \"host:port[:user:password]\", got %s", ray_type_name(x->type));
+
+    /* Optional connect timeout in milliseconds (0 = use default). */
+    int timeout_ms = 0;
+    if (n == 2) {
+        ray_t* t = args[1];
+        if (!ray_is_atom(t) || (t->type != -RAY_I64 && t->type != -RAY_I32))
+            return ray_error("type", ".ipc.open timeout must be an integer (milliseconds), got %s", ray_type_name(t->type));
+        int64_t tv = (t->type == -RAY_I64) ? t->i64 : t->i32;
+        if (tv < 0) return ray_error("domain", ".ipc.open timeout must be >= 0, got %lld", (long long)tv);
+        timeout_ms = (tv > INT_MAX) ? INT_MAX : (int)tv;
+    }
 
     const char* s = ray_str_ptr(x);
     size_t slen = ray_str_len(x);
@@ -831,19 +898,19 @@ ray_t* ray_hopen_fn(ray_t* x) {
             start = &s[i + 1];
         }
     }
-    if (n_parts < 2) return ray_error("domain", NULL);
+    if (n_parts < 2) return ray_error("domain", ".ipc.open expects \"host:port[:user:password]\", missing port");
 
     char host[256];
-    if (part_lens[0] >= sizeof(host)) return ray_error("domain", NULL);
+    if (part_lens[0] >= sizeof(host)) return ray_error("domain", ".ipc.open host too long, got %lld bytes", (long long)part_lens[0]);
     memcpy(host, parts[0], part_lens[0]);
     host[part_lens[0]] = '\0';
 
     char port_str[8];
-    if (part_lens[1] >= sizeof(port_str)) return ray_error("domain", NULL);
+    if (part_lens[1] >= sizeof(port_str)) return ray_error("domain", ".ipc.open port field too long, got %lld bytes", (long long)part_lens[1]);
     memcpy(port_str, parts[1], part_lens[1]);
     port_str[part_lens[1]] = '\0';
     int port = atoi(port_str);
-    if (port <= 0 || port > 65535) return ray_error("domain", NULL);
+    if (port <= 0 || port > 65535) return ray_error("domain", ".ipc.open port must be in 1..65535, got %d", port);
 
     char user[128] = "";
     char password[128] = "";
@@ -861,9 +928,10 @@ ray_t* ray_hopen_fn(ray_t* x) {
     const char* pw_ptr = (n_parts >= 4) ? password : NULL;
     const char* us_ptr = (n_parts >= 4) ? user : NULL;
 
-    int64_t h = ray_ipc_connect(host, (uint16_t)port, us_ptr, pw_ptr);
+    int64_t h = ray_ipc_connect(host, (uint16_t)port, us_ptr, pw_ptr, timeout_ms);
     if (h == -2) return ray_error("access", "server requires authentication");
     if (h == -3) return ray_error("access", "authentication failed");
+    if (h == -5) return ray_error("io", "connection timed out: %s:%d", host, port);
     if (h < 0) return ray_error("io", "connection refused: %s:%d", host, port);
 
     return make_i64(h);
@@ -872,7 +940,7 @@ ray_t* ray_hopen_fn(ray_t* x) {
 /* (hclose handle) → null */
 ray_t* ray_hclose_fn(ray_t* x) {
     if (!ray_is_atom(x) || (x->type != -RAY_I64 && x->type != -RAY_I32))
-        return ray_error("type", NULL);
+        return ray_error("type", ".ipc.close expects an i64 or i32 handle, got %s", ray_type_name(x->type));
     int64_t h = (x->type == -RAY_I64) ? x->i64 : x->i32;
     ray_ipc_close(h);
     return RAY_NULL_OBJ;
@@ -881,7 +949,7 @@ ray_t* ray_hclose_fn(ray_t* x) {
 /* (hsend handle msg) → result */
 ray_t* ray_hsend_fn(ray_t* handle, ray_t* msg) {
     if (!ray_is_atom(handle) || (handle->type != -RAY_I64 && handle->type != -RAY_I32))
-        return ray_error("type", NULL);
+        return ray_error("type", ".ipc.send expects an i64 or i32 handle, got %s", ray_type_name(handle->type));
     int64_t h = (handle->type == -RAY_I64) ? handle->i64 : handle->i32;
     /* Validate message is serializable (reject builtins, etc.) */
     if (ray_serde_size(msg) <= 0)
@@ -895,7 +963,7 @@ ray_t* ray_hsend_fn(ray_t* handle, ray_t* msg) {
  * response, so only a LOCAL send failure is observable here. */
 ray_t* ray_hpost_fn(ray_t* handle, ray_t* msg) {
     if (!ray_is_atom(handle) || (handle->type != -RAY_I64 && handle->type != -RAY_I32))
-        return ray_error("type", NULL);
+        return ray_error("type", ".ipc.post expects an i64 or i32 handle, got %s", ray_type_name(handle->type));
     int64_t h = (handle->type == -RAY_I64) ? handle->i64 : handle->i32;
     /* Validate message is serializable (reject builtins, etc.) */
     if (ray_serde_size(msg) <= 0)

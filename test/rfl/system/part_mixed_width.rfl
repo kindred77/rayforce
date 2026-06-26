@@ -17,18 +17,18 @@
 (.sys.exec "rm -rf /tmp/rfl_part_mw")
 
 ;; ────────────── partition 1: u8-width symfile ──────────────
-(.db.splayed.set "/tmp/rfl_part_mw/2024.01.01/hist/" (table [ticker qty] (list ['aaa 'bbb 'aaa] [1 2 3])) "/tmp/rfl_part_mw/sym")
+(.db.splayed.set "/tmp/rfl_part_mw/2024.01.01/hist/" (table [ticker qty] (list ['aaa 'bbb 'aaa] [1 2 3])) "/tmp/rfl_part_mw/.sym")
 
 ;; ────────────── partition 2: written after the vocabulary crosses 255 ──────────────
 ;; 300 generated syms '0..'299 push the shared symfile past 255 entries,
 ;; so this partition's ticker column is saved at u16 width.
 (set WIDE (as 'symbol (til 300)))
-(.db.splayed.set "/tmp/rfl_part_mw/2024.01.02/hist/" (table [ticker qty] (list WIDE (+ 1 (til 300)))) "/tmp/rfl_part_mw/sym")
+(.db.splayed.set "/tmp/rfl_part_mw/2024.01.02/hist/" (table [ticker qty] (list WIDE (+ 1 (til 300)))) "/tmp/rfl_part_mw/.sym")
 
 ;; splayed reference table sharing the same root symfile (stress client
 ;; layout: splayed "live" + date partitions + one symfile) — used for the
 ;; join assertion below.
-(.db.splayed.set "/tmp/rfl_part_mw/ref" (table [ticker w] (list ['aaa '7 '299] [10 20 30])) "/tmp/rfl_part_mw/sym")
+(.db.splayed.set "/tmp/rfl_part_mw/ref" (table [ticker w] (list ['aaa '7 '299] [10 20 30])) "/tmp/rfl_part_mw/.sym")
 
 (set HT (.db.parted.get "/tmp/rfl_part_mw/" 'hist))
 (count HT) -- 303
@@ -63,7 +63,7 @@
 
 ;; ────────────── join against the splayed table ──────────────
 ;; ref tickers: aaa (2 hist rows), 7 (1), 299 (1) → 4 inner-join rows.
-(set REF (.db.splayed.get "/tmp/rfl_part_mw/ref" "/tmp/rfl_part_mw/sym"))
+(set REF (.db.splayed.get "/tmp/rfl_part_mw/ref" "/tmp/rfl_part_mw/.sym"))
 (set LJ (select {ticker: ticker w: w from: REF}))
 (set RJ (select {ticker: ticker rq: qty from: HT}))
 (count (inner-join [ticker] LJ RJ)) -- 4

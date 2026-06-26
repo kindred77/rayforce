@@ -185,7 +185,7 @@ Window join with per-row time intervals. `intervals` is a list of two vectors `[
           [928 528 648 914 918 626 577 817 620 698])))
 
 ; Build per-row intervals: [lo, hi] for each trade
-(set intervals (map-left + [-1000 1000] (at trades 'Time)))
+(set intervals (map-right + [-1000 1000] (at trades 'Time)))
 
 ; Window join: min bid and max ask within each window
 (window-join [Sym Time] intervals trades quotes
@@ -202,7 +202,7 @@ Window join with per-row time intervals. `intervals` is a list of two vectors `[
     (list bsym btime bid ask)))
 
 ; Build intervals from the trades timestamp
-(set intervals (map-left + [-1000 1000] (at trades 'Ts)))
+(set intervals (map-right + [-1000 1000] (at trades 'Ts)))
 
 (window-join [Sym Ts] intervals trades quotes
     {bid: (min Bid) ask: (max Ask)})
@@ -214,7 +214,7 @@ All join operations compile to the Rayforce execution DAG. The optimizer and exe
 
 1. **DAG construction** — `inner-join` and `left-join` emit `OP_JOIN` nodes with join type flags. `asof-join` emits `OP_ASOF_JOIN`. `window-join` emits `OP_WINDOW_JOIN`.
 2. **Optimizer** — Predicate pushdown moves filters closer to data sources (past `SELECT`/`ALIAS`, `GROUP`, and `EXPAND` nodes); filters on join inputs are not currently pushed across join boundaries. Type inference propagates column types through join boundaries. SIP (Sideways Information Passing) can prune the build side using selection bitmaps.
-3. **Execution** — Equi-joins use a radix-partitioned hash join: the build side is partitioned by hash, then each morsel from the probe side looks up matches in the corresponding partition. As-of and window joins use sorted merge with binary search on the temporal column — the as-of executor skips the per-join sort when the inputs carry the `sorted` / `parted` [attributes](attributes.md) described above.
+3. **Execution** — Equi-joins use a radix-partitioned hash join: the build side is partitioned by hash, then each morsel from the probe side looks up matches in the corresponding partition. For inner joins on the radix-parallel path, the executor picks the build side at runtime using actual materialized row counts — whichever input has fewer rows becomes the build side, reducing hash-table memory and improving cache utilisation. This selection is most effective when the larger side has many rows per key (e.g. a fact table joining a small dimension); on near-unique keys the benefit is small. LEFT, FULL, and ANTI joins always build on the right because their semantics require preserving every left row. The small-input (chained) path also always builds on the right. During the per-partition build the executor monitors per-key duplicate counts; if any single key exceeds a threshold it abandons the radix attempt and re-runs the whole join through the chained hash table, which is O(n) regardless of duplication. This ensures that no join — INNER, LEFT, or FULL — degrades to quadratic cost when the build side contains a heavily-duplicated key. It complements build-side selection (which handles INNER joins by choosing the smaller side) by covering LEFT and FULL joins, which cannot swap sides, and any INNER case where the forced-build side happens to be skewed. Output row order for inner joins on the radix-parallel path is partition- and thread-dependent and is not guaranteed to be stable. As-of and window joins use sorted merge with binary search on the temporal column — the as-of executor skips the per-join sort when the inputs carry the `sorted` / `parted` [attributes](attributes.md) described above.
 
 !!! note "Performance note"
     For large joins, ensure key columns use efficient types. Symbol columns (`RAY_SYM`) are dictionary-encoded integers and join fastest. String columns (`RAY_STR`) work but require hash comparison of variable-length data.

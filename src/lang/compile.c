@@ -313,6 +313,13 @@ static void compile_list(compiler_t *c, ray_t *ast) {
                 return;
             }
             compile_expr(c, elems[2]);
+            /* Materialize a lazy value before binding — the interpreter's
+             * ray_let_fn does the same.  A lazy handle is single-use
+             * (materialization consumes its deferred graph), so a local
+             * that aliased one would break on its SECOND read (e.g.
+             * `(let v (first xs)) (if (> v 0) v 0)`: the compare consumes
+             * the lazy, the branch then reloads a dead handle). */
+            emit(c, OP_FORCE);
             emit(c, OP_DUP);
             int32_t slot = find_local(c, name_obj->i64);
             if (slot < 0) slot = add_local(c, name_obj->i64);
@@ -381,11 +388,10 @@ static void compile_list(compiler_t *c, ray_t *ast) {
              * Stash it, compile handler fn, reload err_val, call. */
             emit(c, OP_STOREENV);
             emit(c, (uint8_t)err_slot);
-            compile_expr(c, elems[2]);       /* handler fn */
+            compile_expr(c, elems[2]);       /* handler (fn or fallback value) */
             emit(c, OP_LOADENV);
             emit(c, (uint8_t)err_slot);
-            emit(c, OP_CALLF);
-            emit(c, 1);                     /* call handler(err_val) */
+            emit(c, OP_TRYH);                /* callable → call(err); else value */
             patch_jump(c, jmp_pos);          /* end */
             return;
         }

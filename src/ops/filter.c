@@ -80,7 +80,7 @@ static ray_t* exec_filter_vec(ray_t* input, ray_t* pred, int64_t pass_count) {
     ray_morsel_init(&mf, pred);
     int64_t out_idx = 0;
 
-    if (input->len != pred->len) { ray_release(result); return ray_error("length", NULL); }
+    if (input->len != pred->len) { int64_t il = input->len, pl = pred->len; ray_release(result); return ray_error("length", "filter: predicate length must match input, got %lld and %lld", (long long)il, (long long)pl); }
 
     while (ray_morsel_next(&mi) && ray_morsel_next(&mf)) {
         uint8_t* bits = (uint8_t*)mf.morsel_ptr;
@@ -554,7 +554,10 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel) {
             if (!col) continue;
             int8_t ct = RAY_IS_PARTED(col->type)
                       ? (int8_t)RAY_PARTED_BASETYPE(col->type) : col->type;
-            ray_t* nc = ray_vec_new(ct, 0);
+            /* RAY_LIST == 0; ray_vec_new rejects type <= 0, so a LIST
+             * column needs ray_list_new — otherwise the empty result
+             * silently drops it and the 0-row schema loses a column. */
+            ray_t* nc = (ct == RAY_LIST) ? ray_list_new(0) : ray_vec_new(ct, 0);
             if (nc && !RAY_IS_ERR(nc)) {
                 nc->len = 0;
                 empty = ray_table_add_col(empty, ray_table_col_name(tbl, c), nc);

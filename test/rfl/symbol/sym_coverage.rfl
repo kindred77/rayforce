@@ -134,7 +134,7 @@
 ;; ═══════════════════════════════════════════════════════════════════
 (set _T5 (table ['id 's] (list [1] (as 'SYMBOL ["x"]))))
 (.db.splayed.set "/tmp/rfl_sym_cov_lmag/" _T5)
-(.sys.exec "printf '\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00' > /tmp/rfl_sym_cov_lmag/sym") -- 0
+(.sys.exec "printf '\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00' > /tmp/rfl_sym_cov_lmag/.sym") -- 0
 (.db.splayed.get "/tmp/rfl_sym_cov_lmag/") !- corrupt
 (.sys.exec "rm -rf /tmp/rfl_sym_cov_lmag") -- 0
 
@@ -143,7 +143,7 @@
 ;; ═══════════════════════════════════════════════════════════════════
 (set _T6 (table ['id 's] (list [1] (as 'SYMBOL ["y"]))))
 (.db.splayed.set "/tmp/rfl_sym_cov_lts/" _T6)
-(.sys.exec "printf 'STRL' > /tmp/rfl_sym_cov_lts/sym") -- 0
+(.sys.exec "printf 'STRL' > /tmp/rfl_sym_cov_lts/.sym") -- 0
 (.db.splayed.get "/tmp/rfl_sym_cov_lts/") !- corrupt
 (.sys.exec "rm -rf /tmp/rfl_sym_cov_lts") -- 0
 
@@ -156,7 +156,7 @@
 ;; ═══════════════════════════════════════════════════════════════════
 (set _T7 (table ['id 's] (list [1] (as 'SYMBOL ["z"]))))
 (.db.splayed.set "/tmp/rfl_sym_cov_ltr/" _T7)
-(.sys.exec "printf '\\x53\\x54\\x52\\x4c\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\xAA\\xBB\\xCC' > /tmp/rfl_sym_cov_ltr/sym") -- 0
+(.sys.exec "printf '\\x53\\x54\\x52\\x4c\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\xAA\\xBB\\xCC' > /tmp/rfl_sym_cov_ltr/.sym") -- 0
 (.db.splayed.get "/tmp/rfl_sym_cov_ltr/") !- corrupt
 (.sys.exec "rm -rf /tmp/rfl_sym_cov_ltr") -- 0
 

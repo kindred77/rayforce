@@ -75,10 +75,13 @@
 ;; ════════════════════════════════════════════════════════════════════════════
 (.sys.exec "printf 'a\nNaN\nInf\n+Inf\n-Inf\nnan\ninf\n1.5\n' > rf_test_csv_types_naninf.csv") -- 0
 (set Tni (.csv.read "rf_test_csv_types_naninf.csv"))
-;; NaN/Inf literals all infer as F64
+;; NaN/Inf literals all infer as F64 (detect_type still recognizes the tokens)
 (count Tni) -- 7
-;; 1.5 is the only finite non-special value; others are NaN/±Inf
+;; STAGE 2 (single-null float model): the special tokens canonicalize to 0Nf
+;; at ingest, so rows 0..5 are null; 1.5 (row 6) is the only finite value.
 (at (at Tni 'a) 6) -- 1.5
+(nil? (at (at Tni 'a) 0)) -- true
+(nil? (at (at Tni 'a) 1)) -- true
 
 ;; ════════════════════════════════════════════════════════════════════════════
 ;; 7. Null sentinel strings: N/A, n/a, NA, na, null, NULL, None, none, .
@@ -302,6 +305,22 @@
 (key Tnh) -- ['x 'y 'z]
 (sum (at Tnh 'x)) -- 6
 (sum (at Tnh 'y)) -- 10.5
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; N. ISO-8601 UTC offsets on TIMESTAMP cells (issue rayforce-py#14).
+;;    A trailing Z | ±HH:MM | ±HHMM | ±HH is subtracted to normalize the
+;;    local wall-clock value to UTC.  No offset → stored verbatim (UTC).
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "printf 'ts\n2001-01-01 01:01:01+05:30\n2001-01-01 01:01:01\n2001-01-01 01:01:01+01:00\n2001-01-01 01:01:01Z\n2001-01-01 01:01:01+0530\n2001-01-01 06:01:01-05:00\n2001-01-01 01:01:01.500000000+01:00\n' > rf_test_csv_types_tz.csv") -- 0
+(set Ttz (read-csv [TIMESTAMP] "rf_test_csv_types_tz.csv"))
+(count Ttz) -- 7
+(at (at Ttz 'ts) 0) -- 2000.12.31D19:31:01.000000000
+(at (at Ttz 'ts) 1) -- 2001.01.01D01:01:01.000000000
+(at (at Ttz 'ts) 2) -- 2001.01.01D00:01:01.000000000
+(at (at Ttz 'ts) 3) -- 2001.01.01D01:01:01.000000000
+(at (at Ttz 'ts) 4) -- 2000.12.31D19:31:01.000000000
+(at (at Ttz 'ts) 5) -- 2001.01.01D11:01:01.000000000
+(at (at Ttz 'ts) 6) -- 2001.01.01D00:01:01.500000000
 
 ;; ── cleanup ─────────────────────────────────────────────────────────────────
 (.sys.exec "rm -f rf_test_csv_types_*.csv") -- 0

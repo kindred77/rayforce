@@ -182,17 +182,23 @@ static test_result_t test_numparse_f64_basic(void) {
 }
 
 static test_result_t test_numparse_f64_special(void) {
+    /* STAGE 2 (single-null float model) re-baseline: the F64 domain is
+     * {finite} ∪ {0Nf}; ±Inf and NaN are NOT values.  ray_parse_f64 still
+     * recognizes and CONSUMES the "nan"/"inf" tokens (return value = token
+     * length, unchanged), but the produced value canonicalizes to NULL_F64
+     * (a canonical NaN).  So every special token now yields isnan(v) AND
+     * never a finite or ±Inf value — Inf can no longer enter a column. */
     double v = 0.0;
     TEST_ASSERT_EQ_U(ray_parse_f64("nan", 3, &v), 3);
     TEST_ASSERT_TRUE(isnan(v));
     TEST_ASSERT_EQ_U(ray_parse_f64("NaN", 3, &v), 3);
     TEST_ASSERT_TRUE(isnan(v));
     TEST_ASSERT_EQ_U(ray_parse_f64("inf", 3, &v), 3);
-    TEST_ASSERT_TRUE(isinf(v) && v > 0);
+    TEST_ASSERT_TRUE(isnan(v) && !isinf(v));
     TEST_ASSERT_EQ_U(ray_parse_f64("+Inf", 4, &v), 4);
-    TEST_ASSERT_TRUE(isinf(v) && v > 0);
+    TEST_ASSERT_TRUE(isnan(v) && !isinf(v));
     TEST_ASSERT_EQ_U(ray_parse_f64("-INF", 4, &v), 4);
-    TEST_ASSERT_TRUE(isinf(v) && v < 0);
+    TEST_ASSERT_TRUE(isnan(v) && !isinf(v));
     PASS();
 }
 
@@ -249,10 +255,14 @@ static test_result_t test_numparse_f64_dbl_max(void) {
             "1.7976931348623155e308: got %.17g, want %.17g", v, ref);
     }
 
-    /* Genuinely above the rounding threshold → inf is correct. */
+    /* Genuinely above the rounding threshold.  STAGE 2 re-baseline: in the
+     * single-null float model an overflow result is not ±Inf (not a value)
+     * but canonicalizes to NULL_F64 (0Nf).  Was: isinf(v).  Now: isnan(v)
+     * and never an Inf.  The DBL_MAX-exact cases above stay finite==DBL_MAX
+     * (a correctly-rounded finite value is untouched). */
     n = ray_parse_f64("1.8e308", 7, &v);
     TEST_ASSERT_EQ_U(n, 7);
-    TEST_ASSERT_TRUE(isinf(v));
+    TEST_ASSERT_TRUE(isnan(v) && !isinf(v));
 
     /* Long-literal case.  To actually exercise the strtod fall-back we
      * need an input that produces the same (mantissa, dec_offset) as

@@ -47,9 +47,21 @@ extern "C" {
 
 /* ===== Semantic Versioning ===== */
 
-#define RAY_VERSION_MAJOR 2
-#define RAY_VERSION_MINOR 1
+/* The real version is injected at build time via -D from the git tag (the
+ * single source of truth — see the Makefile and RELEASE.md). These are only
+ * fallbacks: 0.0.0 marks an untagged/dev build, and they give downstream code
+ * that includes this header without our -D flags a defined value. They are
+ * #ifndef-guarded so the injected -D wins without a -Wmacro-redefined error
+ * under -Werror. Do NOT hand-edit these to cut a release — tag instead. */
+#ifndef RAY_VERSION_MAJOR
+#define RAY_VERSION_MAJOR 0
+#endif
+#ifndef RAY_VERSION_MINOR
+#define RAY_VERSION_MINOR 0
+#endif
+#ifndef RAY_VERSION_PATCH
 #define RAY_VERSION_PATCH 0
+#endif
 
 /* Packed version number: 0xMMmmpp (MM=major, mm=minor, pp=patch) */
 #define RAY_VERSION_NUMBER \
@@ -115,7 +127,8 @@ typedef enum {
     RAY_ERR_PARSE,
     RAY_ERR_NAME,
     RAY_ERR_LIMIT,
-    RAY_ERR_RESERVED
+    RAY_ERR_RESERVED,
+    RAY_ERR_VERSION
 } ray_err_t;
 
 #define RAY_IS_ERR(p)    ((p) != NULL && (uintptr_t)(p) > 31 && ((ray_t*)(p))->type == RAY_ERROR)
@@ -646,7 +659,8 @@ ray_t* ray_fmt(ray_t* obj, int mode);
  * exchange; ray_ipc_send_async sends a fire-and-forget frame. */
 
 int64_t   ray_ipc_connect(const char* host, uint16_t port,
-                          const char* user, const char* password);
+                          const char* user, const char* password,
+                          int timeout_ms);
 void      ray_ipc_close(int64_t handle);
 ray_t*    ray_ipc_send(int64_t handle, ray_t* msg);
 ray_err_t ray_ipc_send_async(int64_t handle, ray_t* msg);

@@ -86,6 +86,11 @@ enum {
     OP_SCOPE_END,     /* pop sym-id vec; sync frame values back into the
                        * local slots, pop the frame (leaves the CALLD result
                        * on the stack) */
+    OP_TRYH,          /* try-handler dispatch: pop err_val + handler; if
+                       * handler is callable, call it with err_val, else
+                       * push handler as a fallback value */
+    OP_FORCE,         /* materialize TOS if it is a lazy handle (so a
+                       * let-bound local holds a concrete, reusable value) */
     OP__COUNT
 };
 
@@ -278,6 +283,7 @@ ray_t* ray_xbar_fn(ray_t* col, ray_t* bucket);
 ray_t* ray_left_join_fn(ray_t** args, int64_t n);
 ray_t* ray_inner_join_fn(ray_t** args, int64_t n);
 ray_t* ray_window_join_fn(ray_t** args, int64_t n);
+ray_t* ray_window_join1_fn(ray_t** args, int64_t n);
 
 /* I/O */
 ray_t* ray_println_fn(ray_t** args, int64_t n);

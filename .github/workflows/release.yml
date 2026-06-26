@@ -1,0 +1,238 @@
+name: Release
+
+# Fires when a release PR (dev -> master, titled vX.Y.Z) is merged, or via manual
+# dispatch (re-run / bootstrap). The git tag is the single source of truth: this
+# workflow builds the optimized binary per platform with the version injected at
+# compile time (make ... RAY_VERSION=X.Y.Z) and publishes a GitHub Release. No
+# source file is bumped and nothing is pushed to the protected master branch —
+# only a tag ref and a release, which GITHUB_TOKEN can do without a bypass token.
+# Non-release merges to master (title not vX.Y.Z) are ignored.
+#
+# IMPORTANT: a DRAFT release does NOT create its git tag yet — the tag is only
+# materialized when the release is published (the `publish` job, draft=false). So
+# the `build` job must check out the target COMMIT, never the not-yet-existing
+# tag. (This is the bug that broke the first v2.1.0 attempt.)
+
+on:
+  pull_request:
+    branches: [master]
+    types: [closed]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, no leading v (e.g. 2.1.0)"
+        required: true
+
+permissions:
+  contents: write   # create the tag + the GitHub Release
+
+jobs:
+  prepare:
+    # Manual dispatch always runs; the PR path only on an actual merge whose
+    # title declares a release version.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.merged == true &&
+       startsWith(github.event.pull_request.title, 'v'))
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.parse.outputs.version }}
+      sha: ${{ steps.parse.outputs.sha }}
+    steps:
+      # Full history + tags so the changelog generator can scope to the previous
+      # release tag.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Resolve version + target, ensure draft release
+        id: parse
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          DISPATCH_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            VERSION="$INPUT_VERSION"
+            SHA="$DISPATCH_SHA"
+          else
+            if [[ ! "$PR_TITLE" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+              echo "Merged PR title '$PR_TITLE' is not a release version — skipping."
+              exit 1
+            fi
+            VERSION="${BASH_REMATCH[1]}"
+            SHA="$MERGE_SHA"
+          fi
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Version '$VERSION' is not X.Y.Z"; exit 1
+          fi
+
+          # Idempotent: reuse an existing draft (so re-runs don't error), and
+          # always build from the release's OWN target so the artifacts match the
+          # tag that publish will create at that commit.
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            SHA="$(gh release view "v$VERSION" --json targetCommitish -q .targetCommitish)"
+            echo "Release v$VERSION already exists — building from its target $SHA."
+          else
+            # Feature-oriented changelog (grouped by conventional-commit type),
+            # not GitHub's default author/PR ledger.
+            bash .github/release-notes.sh "$VERSION" "$SHA" > "$RUNNER_TEMP/notes.md"
+            gh release create "v$VERSION" \
+              --target "$SHA" \
+              --title "v$VERSION" \
+              --notes-file "$RUNNER_TEMP/notes.md" \
+              --draft
+            echo "Created draft release v$VERSION at $SHA."
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA"        >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Distributables must be PORTABLE, not -march=native: a native binary
+        # built on a runner can SIGILL on a different/older CPU. x86-64-v3 =
+        # AVX2 baseline (~2013+), which keeps the engine's vectorized reductions
+        # fast. The macOS runner is the oldest Apple-Silicon class, so native
+        # there is effectively a safe floor (arm64 has no x86-style optional-ISA
+        # traps, and baselining to armv8-a would only lose M1 tuning).
+        include:
+          - os: ubuntu-latest
+            march: x86-64-v3
+          - os: macos-latest
+            march: native
+          # Windows is not build-ready yet (IOCP stub, unguarded POSIX in
+          # main.c/heap.c, no Makefile path). Add once the port lands:
+          # - os: windows-latest
+    steps:
+      # The tag does not exist yet (the release is still a draft); check out the
+      # target COMMIT directly — never `ref: v$VERSION`.
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+
+      - name: Build release artifact (portable)
+        run: make dist RAY_VERSION=${{ needs.prepare.outputs.version }} RAY_MARCH=${{ matrix.march }}
+
+      - name: Upload artifacts to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh release upload "v${{ needs.prepare.outputs.version }}" \
+            dist/*.tar.gz dist/*.sha256 --clobber
+
+      # Package the just-built (already-portable) Linux binary as a .deb —
+      # `make dist` left ./rayforce in place, so no rebuild is needed.
+      - name: Build .deb (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          RAY_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          ver="$(curl -fsSL https://api.github.com/repos/goreleaser/nfpm/releases/latest | grep -oP '"tag_name":\s*"\K[^"]+')"
+          curl -fsSL "https://github.com/goreleaser/nfpm/releases/download/${ver}/nfpm_${ver#v}_amd64.deb" -o /tmp/nfpm.deb
+          sudo dpkg -i /tmp/nfpm.deb
+          mkdir -p dist
+          nfpm pkg --packager deb --config packaging/nfpm.yaml --target dist/
+          ls -l dist/*.deb
+
+      - name: Upload .deb to release (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release upload "v${{ needs.prepare.outputs.version }}" dist/*.deb --clobber
+
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      # Flipping the draft to public is what creates the git tag vX.Y.Z at the
+      # release's target commit — the single source of truth for the version.
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release edit "v${{ needs.prepare.outputs.version }}" --draft=false
+
+  # Post the release announcement to Zulip (#Announcements > Rayforce) once the
+  # release is public. Best-effort: skipped when ZULIP_API_KEY isn't configured,
+  # and continue-on-error so a Zulip hiccup never reds an already-shipped release.
+  announce:
+    needs: [prepare, publish]
+    runs-on: ubuntu-latest
+    env:
+      ZULIP_API_KEY: ${{ secrets.ZULIP_API_KEY }}
+    steps:
+      - name: Announce on Zulip
+        if: ${{ env.ZULIP_API_KEY != '' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          url="https://github.com/${GH_REPO}/releases/tag/v${VERSION}"
+          # Changelog highlights = the release body minus the collapsed
+          # "Maintenance & internal" <details> block (Zulip won't render it).
+          notes="$(gh release view "v$VERSION" --json body -q .body | sed '/<details>/,/<\/details>/d')"
+          content="$(printf '🚀 **Rayforce v%s** is out!\n\n%s\n\n📦 Release & downloads: %s' "$VERSION" "$notes" "$url")"
+          resp="$(curl -sS -X POST 'https://rayforcedb.zulipchat.com/api/v1/messages' \
+            -u "releases-bot@rayforcedb.zulipchat.com:${ZULIP_API_KEY}" \
+            --data-urlencode 'type=stream' \
+            --data-urlencode 'to=Announcements' \
+            --data-urlencode 'topic=Rayforce' \
+            --data-urlencode "content=${content}")"
+          echo "Zulip response: $resp"
+          echo "$resp" | grep -q '"result": *"success"'
+
+  # Bump the Homebrew tap (RayforceDB/homebrew-tap → Formula/rayforce.rb) to this
+  # release. Best-effort: skipped when HOMEBREW_TAP_TOKEN isn't configured, and
+  # continue-on-error so a tap hiccup never reds an already-shipped release.
+  homebrew:
+    needs: [prepare, publish]
+    runs-on: ubuntu-latest
+    env:
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - name: Update tap formula
+        if: ${{ env.HOMEBREW_TAP_TOKEN != '' }}
+        continue-on-error: true
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          GH_REPO: ${{ github.repository }}
+          TAP_REPO: RayforceDB/homebrew-tap
+        run: |
+          set -euo pipefail
+          # Build-from-source formula: point at the GitHub source tarball for the
+          # tag and pin its sha256.
+          url="https://github.com/${GH_REPO}/archive/refs/tags/v${VERSION}.tar.gz"
+          sha="$(curl -fsSL "$url" | sha256sum | cut -d' ' -f1)"
+          tmp="$(mktemp -d)"
+          git clone --depth 1 "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/${TAP_REPO}.git" "$tmp"
+          mkdir -p "$tmp/Formula"
+          sed -e "s|__URL__|${url}|" -e "s|__SHA256__|${sha}|" \
+            packaging/homebrew-formula.rb.tmpl > "$tmp/Formula/rayforce.rb"
+          cd "$tmp"
+          git config user.name  "rayforce-release"
+          git config user.email "release@rayforcedb.com"
+          git add Formula/rayforce.rb
+          git commit -m "rayforce ${VERSION}" || { echo "formula unchanged — nothing to push"; exit 0; }
+          git push origin HEAD

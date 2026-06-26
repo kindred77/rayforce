@@ -86,7 +86,9 @@
 (set tr (table [s tm p] (list ['a 'a] [10:00:01.000 10:00:05.000] [100 200])))
 (set qt (table [s tm b] (list ['a 'a 'a] [10:00:00.000 10:00:02.000 10:00:04.000] [99 100 101])))
 (set iv (map-left + [-2000 2000] (at tr 'tm)))
-(at (window-join [s tm] iv tr qt {mb: (min b)}) 'mb) -- [99 101]
+;; wj seeds the prevailing quote (row1 picks up the @02 quote at b=100);
+;; wj1 is strict so row1 sees only the @04 quote (b=101).
+(at (window-join [s tm] iv tr qt {mb: (min b)}) 'mb) -- [99 100]
 (at (window-join1 [s tm] iv tr qt {mb: (min b)}) 'mb) -- [99 101]
 
 ;; ──────────── OP_PIVOT (heavy) ────────────

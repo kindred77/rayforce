@@ -54,7 +54,13 @@ static inline ray_t* make_f64(double v) {
     ray_t* obj = ray_alloc(0);
     if (!obj) return ray_error("oom", NULL);
     obj->type = -RAY_F64;
-    obj->f64 = v;
+    /* Single-null float model: any non-finite F64 result (NaN OR ±Inf)
+     * canonicalizes to NULL_F64 at produce time — Inf is not a value.
+     * make_f64 is the atom-construction choke for all scalar/atom math
+     * (arith.c add/sub/mul/div/mod/sqrt/log/exp/pow/neg/abs/round/...),
+     * so canonicalizing here covers every atom produce site.  Known-finite
+     * callers (int→f64 cast) are unaffected: a finite value stays finite. */
+    obj->f64 = __builtin_isfinite(v) ? v : NULL_F64;
     return obj;
 }
 
@@ -399,6 +405,7 @@ ray_t* to_boxed_list(ray_t* x);
 ray_t* unbox_vec_arg(ray_t* x, ray_t** _bx);
 ray_t* call_lambda(ray_t* lambda, ray_t** call_args, int64_t argc);
 ray_t* call_fn1(ray_t* fn, ray_t* arg);
+ray_t* ray_try_handle(ray_t* handler, ray_t* err_val);
 ray_t* call_fn2(ray_t* fn, ray_t* a, ray_t* b);
 ray_t* gather_by_idx(ray_t* vec, int64_t* idx, int64_t n);
 ray_t* ray_sort(ray_t** cols, uint8_t* descs, uint8_t* nulls_first,
@@ -417,6 +424,10 @@ ray_t* ray_exp_fn(ray_t* x);
 ray_t* ray_pow_fn(ray_t* x, ray_t* y);
 ray_t* ray_top_fn(ray_t* v, ray_t* n_obj);
 ray_t* ray_bot_fn(ray_t* v, ray_t* n_obj);
+/* Partial-sort first K largest (desc=1) / smallest (desc=0) elements of a
+ * numeric vector; returns a NEW typed vec of v's type with min(K, len) elems,
+ * ordered. Defined in src/ops/sort.c; reused by top_n/bot_n accumulators. */
+ray_t* topk_take_vec(ray_t* v, int64_t k, uint8_t desc);
 ray_t* ray_pearson_corr_fn(ray_t* x, ray_t* y);
 
 /* In-place median (quickselect).  Caller owns the buffer; we permute
@@ -506,6 +517,7 @@ ray_t* ray_dl_stratify_fn(ray_t* x);
 ray_t* ray_dl_eval_fn(ray_t* x);
 ray_t* ray_dl_query_fn(ray_t* prog_obj, ray_t* pred_obj);
 ray_t* ray_dl_provenance_fn(ray_t* prog_obj, ray_t* pred_obj);
+ray_t* ray_dl_free_fn(ray_t* x);
 void   ray_dl_reset_rules(void);
 
 /* System builtins (formerly static in eval.c, now in system.c) */
@@ -524,11 +536,11 @@ ray_t* ray_sys_listen_fn(ray_t* x);
 ray_t* ray_sys_timeit_fn(ray_t** args, int64_t n);
 ray_t* ray_sys_env_fn(ray_t** args, int64_t n);
 ray_t* ray_getenv_fn(ray_t* x);
-/* Filesystem metadata under .os.* (issue #36).  Lean two: size +
+/* Filesystem metadata under .fs.* (issue #36).  Lean two: size +
  * directory-list.  Existence/is-file/is-dir reachable via try on
  * either of these, or via the shell fallback in .sys.cmd. */
-ray_t* ray_os_size_fn(ray_t* x);
-ray_t* ray_os_list_fn(ray_t* x);
+ray_t* ray_fs_size_fn(ray_t* x);
+ray_t* ray_fs_list_fn(ray_t* x);
 ray_t* ray_setenv_fn(ray_t* name, ray_t* val);
 ray_t* ray_quote_fn(ray_t** args, int64_t n);
 ray_t* ray_return_fn(ray_t** args, int64_t n);
@@ -546,7 +558,7 @@ ray_t* ray_sysinfo_fn(ray_t** args, int64_t n);
 ray_t* ray_sys_args_fn(ray_t** args, int64_t n);
 ray_t* ray_ser_fn(ray_t* val);
 ray_t* ray_de_fn(ray_t* val);
-ray_t* ray_hopen_fn(ray_t* x);
+ray_t* ray_hopen_fn(ray_t** args, int64_t n);
 ray_t* ray_hclose_fn(ray_t* x);
 ray_t* ray_hsend_fn(ray_t* handle, ray_t* msg);
 ray_t* ray_hpost_fn(ray_t* handle, ray_t* msg);
@@ -554,6 +566,8 @@ ray_t* ray_ipc_handle_fn(ray_t** args, int64_t n);
 ray_t* ray_set_splayed_fn(ray_t** args, int64_t n);
 ray_t* ray_get_splayed_fn(ray_t** args, int64_t n);
 ray_t* ray_get_parted_fn(ray_t** args, int64_t n);
+ray_t* ray_get_parted_tables_fn(ray_t** args, int64_t n);
+ray_t* ray_fill_parted_fn(ray_t** args, int64_t n);
 ray_t* ray_guid_fn(ray_t* n_arg);
 
 /* Transaction-log journaling (.log.*) — the -l/-L feature.
@@ -567,6 +581,7 @@ ray_t* ray_log_roll_fn(ray_t** args, int64_t n);
 ray_t* ray_log_snapshot_fn(ray_t** args, int64_t n);
 ray_t* ray_log_sync_fn(ray_t** args, int64_t n);
 ray_t* ray_log_close_fn(ray_t** args, int64_t n);
+ray_t* ray_log_purge_fn(ray_t** args, int64_t n);
 
 /* Group (formerly static in eval.c, now extern for query.c) */
 ray_t* ray_group_fn(ray_t* x);
@@ -593,6 +608,7 @@ ray_t* ray_dict_fn(ray_t* keys, ray_t* vals);
 ray_t* ray_nil_fn(ray_t* x);
 ray_t* ray_where_fn(ray_t* x);
 ray_t* ray_raze_fn(ray_t* x);
+ray_t* ray_ungroup_fn(ray_t* x);
 ray_t* ray_within_fn(ray_t* vals, ray_t* range);
 
 /* Query bridge builtins (formerly in eval.c, now in ops/query.c) */
@@ -606,6 +622,7 @@ ray_t* ray_left_join_fn(ray_t** args, int64_t n);
 ray_t* ray_inner_join_fn(ray_t** args, int64_t n);
 ray_t* ray_anti_join_fn(ray_t** args, int64_t n);
 ray_t* ray_window_join_fn(ray_t** args, int64_t n);
+ray_t* ray_window_join1_fn(ray_t** args, int64_t n);
 ray_t* ray_asof_join_fn(ray_t** args, int64_t n);
 
 /* Graph builtins (.graph.* family).  Implemented in src/ops/graph_builtin.c —

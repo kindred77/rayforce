@@ -104,7 +104,8 @@ static int64_t parse_int_dir(const char* s) {
  * Partitioned table: date-partitioned directory of splayed tables
  *
  * Format:
- *   db_root/sym              — global symbol intern table
+ *   db_root/.sym             — global symbol intern table (dotfile so it
+ *                              never collides with a splayed table dir)
  *   db_root/YYYY.MM.DD/      — partition directories
  *   db_root/YYYY.MM.DD/table — splayed table per partition
  *
@@ -116,12 +117,13 @@ static int64_t parse_int_dir(const char* s) {
  * collect_part_dirs — scan db_root for partition directories
  *
  * Collects directory names that match digit/dot pattern, bubble-sorts them.
- * If skip_sym is true, entries named "sym" are skipped.
+ * The symfile (".sym") and its lock are dotfiles, and partition names are
+ * digit/dot-only, so neither is ever picked up here.
  * Caller must free each entry with ray_sys_free and the array itself.
  * -------------------------------------------------------------------------- */
 
 static ray_err_t collect_part_dirs(const char* db_root, char*** out_dirs,
-                                   int64_t* out_count, bool skip_sym) {
+                                   int64_t* out_count) {
     DIR* d = opendir(db_root);
     if (!d) return RAY_ERR_IO;
 
@@ -133,7 +135,6 @@ static ray_err_t collect_part_dirs(const char* db_root, char*** out_dirs,
     struct dirent* ent;
     while ((ent = readdir(d)) != NULL) {
         if (ent->d_name[0] == '.') continue;
-        if (skip_sym && strcmp(ent->d_name, "sym") == 0) continue;
 
         /* Partition directory name format validation is intentionally loose:
          * accepts any sequence of digits and dots (e.g. "2024.01.15").
@@ -166,8 +167,14 @@ static ray_err_t collect_part_dirs(const char* db_root, char*** out_dirs,
     }
 
     if (part_count == 0) {
+        /* Directory opened fine but holds no partition directories — an
+         * EMPTY (or non-parted) db, not an I/O failure.  Report success
+         * with a zero count and let each caller decide what "empty" means
+         * (tables/fill → empty result; get → error, nothing to read). */
         free(part_dirs);
-        return RAY_ERR_IO;
+        *out_dirs = NULL;
+        *out_count = 0;
+        return RAY_OK;
     }
 
     /* Sort partition names for deterministic order.
@@ -208,7 +215,7 @@ ray_t* ray_read_parted(const char* db_root, const char* table_name) {
 
     /* Build sym_path. */
     char sym_path[1024];
-    int sn = snprintf(sym_path, sizeof(sym_path), "%s/sym", db_root);
+    int sn = snprintf(sym_path, sizeof(sym_path), "%s/.sym", db_root);
     if (sn < 0 || (size_t)sn >= sizeof(sym_path))
         return ray_error("io", NULL);
 
@@ -228,10 +235,10 @@ ray_t* ray_read_parted(const char* db_root, const char* table_name) {
                 "or missing \"\" at position 0)", sym_path);
     }
 
-    /* Scan db_root for partition directories (skip "sym" entry) */
+    /* Scan db_root for partition directories (the ".sym" dotfile is skipped) */
     char** part_dirs = NULL;
     int64_t part_count = 0;
-    ray_err_t collect_err = collect_part_dirs(db_root, &part_dirs, &part_count, true);
+    ray_err_t collect_err = collect_part_dirs(db_root, &part_dirs, &part_count);
     if (collect_err != RAY_OK) {
         if (trace)
             fprintf(stderr, "parted.get: collect dirs failed err=%s\n",
@@ -242,6 +249,14 @@ ray_t* ray_read_parted(const char* db_root, const char* table_name) {
     }
     if (trace)
         fprintf(stderr, "parted.get: parts=%" PRId64 "\n", part_count);
+
+    /* No partitions: there is no named table to read.  Unlike
+     * .db.parted.tables (which lists nothing), reading data from an empty
+     * or non-parted root is a genuine error. */
+    if (part_count <= 0) {
+        if (dom) ray_sym_domain_release(dom);
+        return ray_error("io", "parted %s: no partition directories", db_root);
+    }
 
     /* Open each partition via ray_read_splayed */
     ray_t* part_err = NULL;
@@ -462,4 +477,290 @@ fail_dirs:
     if (dom) ray_sym_domain_release(dom);
 
     return part_err ? part_err : ray_error("io", NULL);
+}
+
+/* --------------------------------------------------------------------------
+ * collect_table_dirs — list the splayed-table subdirectories (those carrying
+ * a `.d` schema) of ONE partition directory `pdir`, as a sorted array of
+ * malloc'd names.  Caller frees each name and the array.  Returns RAY_OK
+ * (count may be 0), RAY_ERR_IO if pdir can't be opened, or RAY_ERR_OOM.
+ * -------------------------------------------------------------------------- */
+static ray_err_t collect_table_dirs(const char* pdir, char*** out_names,
+                                    int64_t* out_count) {
+    *out_names = NULL;
+    *out_count = 0;
+    DIR* d = opendir(pdir);
+    if (!d) return RAY_ERR_IO;
+
+    char** names = NULL;
+    int64_t count = 0, cap = 0;
+    ray_err_t oom = RAY_OK;
+    struct dirent* ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.') continue;   /* ".", "..", and the ".sym" dotfile */
+        char dpath[1024];
+        int dn = snprintf(dpath, sizeof(dpath), "%s/%s/.d", pdir, ent->d_name);
+        if (dn < 0 || (size_t)dn >= sizeof(dpath)) continue;
+        struct stat st;
+        if (stat(dpath, &st) != 0 || !S_ISREG(st.st_mode)) continue; /* not a table */
+        if (count >= cap) {
+            int64_t ncap = cap == 0 ? 16 : cap * 2;
+            char** tmp = (char**)realloc(names, (size_t)ncap * sizeof(char*));
+            if (!tmp) { oom = RAY_ERR_OOM; break; }
+            names = tmp; cap = ncap;
+        }
+        size_t len = strlen(ent->d_name);
+        char* dup = (char*)malloc(len + 1);
+        if (!dup) { oom = RAY_ERR_OOM; break; }
+        memcpy(dup, ent->d_name, len + 1);
+        names[count++] = dup;
+    }
+    closedir(d);
+
+    if (oom != RAY_OK) {
+        for (int64_t i = 0; i < count; i++) free(names[i]);
+        free(names);
+        return RAY_ERR_OOM;
+    }
+
+    /* Deterministic order. */
+    for (int64_t i = 0; i + 1 < count; i++)
+        for (int64_t j = i + 1; j < count; j++)
+            if (strcmp(names[i], names[j]) > 0) {
+                char* t = names[i]; names[i] = names[j]; names[j] = t;
+            }
+
+    *out_names = names;
+    *out_count = count;
+    return RAY_OK;
+}
+
+/* Does partition `part` contain splayed table `tname` (i.e. a `.d` schema)? */
+static bool partition_has_table(const char* db_root, const char* part,
+                                const char* tname) {
+    char dpath[1024];
+    int n = snprintf(dpath, sizeof(dpath), "%s/%s/%s/.d", db_root, part, tname);
+    if (n < 0 || (size_t)n >= sizeof(dpath)) return false;
+    struct stat st;
+    return stat(dpath, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+/* Build a 0-row table with the same column names and types as `tmpl`. */
+static ray_t* empty_table_like(ray_t* tmpl) {
+    int64_t ncols = ray_table_ncols(tmpl);
+    ray_t* out = ray_table_new(ncols);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    for (int64_t c = 0; c < ncols; c++) {
+        ray_t* col = ray_table_get_col_idx(tmpl, c);
+        if (!col) { ray_release(out); return ray_error("type", "empty_table_like: null column"); }
+        ray_t* ecol = ray_vec_new(col->type, 0);
+        if (!ecol || RAY_IS_ERR(ecol)) { ray_release(out); return ecol ? ecol : ray_error("oom", NULL); }
+        ray_t* nout = ray_table_add_col(out, ray_table_col_name(tmpl, c), ecol);
+        ray_release(ecol);
+        if (!nout || RAY_IS_ERR(nout)) { ray_release(out); return nout ? nout : ray_error("oom", NULL); }
+        out = nout;
+    }
+    return out;
+}
+
+/* --------------------------------------------------------------------------
+ * ray_parted_tables — list the table names under a parted db root
+ *
+ * Table names are the splayed-table subdirectories of a partition (those
+ * carrying a `.d` schema).  We read them from the LAST (sorted) partition:
+ * partition dirs sort ascending (e.g. by date), so the last is the most
+ * recent and reflects the current table set — a table added in a later
+ * partition would be invisible if we only looked at the first/oldest.
+ * Returns a sorted RAY_SYM vector suitable for ray_read_parted, or an error.
+ * -------------------------------------------------------------------------- */
+ray_t* ray_parted_tables(const char* db_root) {
+    if (!db_root || !*db_root) return ray_error("io", NULL);
+
+    char** part_dirs = NULL;
+    int64_t part_count = 0;
+    ray_err_t e = collect_part_dirs(db_root, &part_dirs, &part_count);
+    if (e != RAY_OK)
+        return ray_error(ray_err_code_str(e),
+            "parted %s: cannot enumerate partition directories", db_root);
+    if (part_count <= 0) {
+        /* Existing-but-empty (or non-parted) root → no tables.  Return an
+         * empty SYM vector rather than an error: a freshly-created db root
+         * has zero tables, and that's a friendlier answer than failing. */
+        free(part_dirs);
+        ray_t* empty = ray_vec_new(RAY_SYM, 0);
+        return empty ? empty : ray_error("oom", NULL);
+    }
+
+    /* Only the last (most recent) partition is needed; release the rest. */
+    char pdir[1024];
+    int pn = snprintf(pdir, sizeof(pdir), "%s/%s", db_root, part_dirs[part_count - 1]);
+    for (int64_t p = 0; p < part_count; p++) free(part_dirs[p]);
+    free(part_dirs);
+    if (pn < 0 || (size_t)pn >= sizeof(pdir))
+        return ray_error("range", "parted %s: partition path too long", db_root);
+
+    char** names = NULL;
+    int64_t count = 0;
+    ray_err_t te = collect_table_dirs(pdir, &names, &count);
+    if (te != RAY_OK)
+        return ray_error(ray_err_code_str(te),
+            "parted %s: cannot read partition %s", db_root, pdir);
+
+    ray_t* result = ray_vec_new(RAY_SYM, count);
+    if (!result || RAY_IS_ERR(result)) {
+        for (int64_t i = 0; i < count; i++) free(names[i]);
+        free(names);
+        return result ? result : ray_error("oom", NULL);
+    }
+    result->len = count;
+    int64_t* out = (int64_t*)ray_data(result);
+    for (int64_t i = 0; i < count; i++) {
+        out[i] = ray_sym_intern(names[i], strlen(names[i]));
+        free(names[i]);
+    }
+    free(names);
+    return result;
+}
+
+/* --------------------------------------------------------------------------
+ * ray_parted_fill — fill missing tables across a parted db's partitions.
+ *
+ * For every table that appears in ANY partition, ensure every partition has
+ * it: a partition missing the table gets an EMPTY copy whose schema is taken
+ * from the most recent partition that does have it (the same canonical-schema
+ * convention ray_parted_tables / ray_read_parted use).  This keeps queries
+ * that span partitions from failing on a partition where a table is absent.
+ *
+ * Returns a sorted RAY_SYM vector of the partition names that were filled
+ * (empty vector when nothing needed fixing), or an error.
+ * -------------------------------------------------------------------------- */
+ray_t* ray_parted_fill(const char* db_root) {
+    if (!db_root || !*db_root) return ray_error("io", NULL);
+
+    char** part_dirs = NULL;
+    int64_t part_count = 0;
+    ray_err_t e = collect_part_dirs(db_root, &part_dirs, &part_count);
+    if (e != RAY_OK)
+        return ray_error(ray_err_code_str(e),
+            "parted %s: cannot enumerate partition directories", db_root);
+    if (part_count <= 0) {
+        /* Empty (or non-parted) root → nothing to fill.  Matches the
+         * "empty vector when nothing needed fixing" contract, so a fill on
+         * a fresh db root is a friendly no-op rather than an error. */
+        free(part_dirs);
+        ray_t* empty = ray_vec_new(RAY_SYM, 0);
+        return empty ? empty : ray_error("oom", NULL);
+    }
+
+    /* Shared root symfile — pass to load/save so SYM columns intern against
+     * the one vocabulary.  NULL when the DB is symbol-free (no <root>/.sym). */
+    char sym_buf[1024];
+    const char* sym_path = NULL;
+    int sn = snprintf(sym_buf, sizeof(sym_buf), "%s/.sym", db_root);
+    if (sn > 0 && (size_t)sn < sizeof(sym_buf)) {
+        struct stat sst;
+        if (stat(sym_buf, &sst) == 0) sym_path = sym_buf;
+    }
+
+    /* Union of table names across all partitions. */
+    char** all = NULL;
+    int64_t all_count = 0, all_cap = 0;
+    uint8_t* fixed = (uint8_t*)calloc((size_t)part_count, 1);
+    ray_err_t err = fixed ? RAY_OK : RAY_ERR_OOM;
+
+    for (int64_t p = 0; p < part_count && err == RAY_OK; p++) {
+        char pdir[1024];
+        int pn = snprintf(pdir, sizeof(pdir), "%s/%s", db_root, part_dirs[p]);
+        if (pn < 0 || (size_t)pn >= sizeof(pdir)) { err = RAY_ERR_RANGE; break; }
+        char** names = NULL;
+        int64_t cnt = 0;
+        ray_err_t te = collect_table_dirs(pdir, &names, &cnt);
+        if (te != RAY_OK) { err = te; break; }
+        for (int64_t i = 0; i < cnt; i++) {
+            bool seen = false;
+            for (int64_t k = 0; k < all_count; k++)
+                if (strcmp(all[k], names[i]) == 0) { seen = true; break; }
+            if (seen) { free(names[i]); continue; }
+            if (all_count >= all_cap) {
+                int64_t nc = all_cap == 0 ? 16 : all_cap * 2;
+                char** tmp = (char**)realloc(all, (size_t)nc * sizeof(char*));
+                if (!tmp) { err = RAY_ERR_OOM; free(names[i]); continue; }
+                all = tmp; all_cap = nc;
+            }
+            all[all_count++] = names[i];   /* transfer ownership */
+        }
+        free(names);
+    }
+
+    /* For each table: template = last partition with it; fill the rest. */
+    for (int64_t t = 0; t < all_count && err == RAY_OK; t++) {
+        const char* tname = all[t];
+        int64_t templ = -1;
+        for (int64_t p = part_count - 1; p >= 0; p--)
+            if (partition_has_table(db_root, part_dirs[p], tname)) { templ = p; break; }
+        if (templ < 0) continue;            /* unreachable (it's in the union) */
+
+        ray_t* empty_tbl = NULL;            /* built lazily on first miss */
+        for (int64_t p = 0; p < part_count && err == RAY_OK; p++) {
+            if (partition_has_table(db_root, part_dirs[p], tname)) continue;
+
+            if (!empty_tbl) {
+                char tdir[1024];
+                int tn = snprintf(tdir, sizeof(tdir), "%s/%s/%s",
+                                  db_root, part_dirs[templ], tname);
+                if (tn < 0 || (size_t)tn >= sizeof(tdir)) { err = RAY_ERR_RANGE; break; }
+                ray_t* full = ray_read_splayed(tdir, sym_path);
+                if (!full || RAY_IS_ERR(full)) {
+                    if (full) ray_error_free(full);
+                    err = RAY_ERR_IO;
+                    break;
+                }
+                empty_tbl = empty_table_like(full);
+                ray_release(full);
+                if (!empty_tbl || RAY_IS_ERR(empty_tbl)) {
+                    if (empty_tbl) ray_error_free(empty_tbl);
+                    empty_tbl = NULL;
+                    err = RAY_ERR_IO;
+                    break;
+                }
+            }
+
+            char ptdir[1024];
+            int ptn = snprintf(ptdir, sizeof(ptdir), "%s/%s/%s",
+                               db_root, part_dirs[p], tname);
+            if (ptn < 0 || (size_t)ptn >= sizeof(ptdir)) { err = RAY_ERR_RANGE; break; }
+            ray_err_t se = ray_splay_save(empty_tbl, ptdir, sym_path);
+            if (se != RAY_OK) { err = se; break; }
+            fixed[p] = 1;
+        }
+        if (empty_tbl) ray_release(empty_tbl);
+    }
+
+    /* Build the sorted SYM result of fixed partition names. */
+    ray_t* result = NULL;
+    if (err == RAY_OK) {
+        int64_t nfixed = 0;
+        for (int64_t p = 0; p < part_count; p++) if (fixed[p]) nfixed++;
+        result = ray_vec_new(RAY_SYM, nfixed);
+        if (!result || RAY_IS_ERR(result)) { err = RAY_ERR_OOM; }
+        else {
+            result->len = nfixed;
+            int64_t* out = (int64_t*)ray_data(result);
+            int64_t w = 0;
+            for (int64_t p = 0; p < part_count; p++)
+                if (fixed[p]) out[w++] = ray_sym_intern(part_dirs[p], strlen(part_dirs[p]));
+        }
+    }
+
+    for (int64_t i = 0; i < all_count; i++) free(all[i]);
+    free(all);
+    for (int64_t p = 0; p < part_count; p++) free(part_dirs[p]);
+    free(part_dirs);
+    free(fixed);
+
+    if (err != RAY_OK) {
+        if (result && !RAY_IS_ERR(result)) ray_release(result);
+        return ray_error(ray_err_code_str(err), "parted %s: fill failed", db_root);
+    }
+    return result;
 }

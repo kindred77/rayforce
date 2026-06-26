@@ -1,0 +1,28 @@
+;; On-disk column format generation (the header `order` byte, offset 17).
+;;
+;; Regression: an engine build briefly stamped the generation to 1 and demanded
+;; 1 back, which rejected every pre-existing splayed database — written by
+;; earlier engines that left the byte 0 — with a `version` error surfaced as
+;; "cannot read .d schema".  The shipped layout is generation 0, so generation
+;; 0 (legacy/unstamped) data MUST load, and the version gate must still refuse
+;; an unrecognized generation.
+(.sys.exec "rm -rf /tmp/rfl_colgen_*")
+
+(set T-Gen (table [a b] (list [1 2 3] [10.0 20.0 30.0])))
+
+;; ─── generation-0 (legacy/pre-stamp) data loads ───
+;; Force every column file + .d to order==0, mimicking data written before any
+;; version byte existed.  This fails loudly if the generation is ever bumped
+;; back off 0 (writer would stamp non-zero, reader would reject the forced 0s).
+(.db.splayed.set "/tmp/rfl_colgen_legacy/" T-Gen)
+(.sys.exec "for f in /tmp/rfl_colgen_legacy/.d /tmp/rfl_colgen_legacy/a /tmp/rfl_colgen_legacy/b; do printf '\\000' | dd of=$f bs=1 seek=17 count=1 conv=notrunc 2>/dev/null; done") -- 0
+(count (.db.splayed.get "/tmp/rfl_colgen_legacy/")) -- 3
+(at (.db.splayed.get "/tmp/rfl_colgen_legacy/") 'a) -- (at T-Gen 'a)
+(at (.db.splayed.get "/tmp/rfl_colgen_legacy/") 'b) -- (at T-Gen 'b)
+
+;; ─── the version gate still rejects an unknown generation ───
+;; Stamp the .d header's order byte to 0x07 and confirm the load is refused
+;; (proves the check did not regress into accepting everything).
+(.db.splayed.set "/tmp/rfl_colgen_bad/" T-Gen)
+(.sys.exec "printf '\\007' | dd of=/tmp/rfl_colgen_bad/.d bs=1 seek=17 count=1 conv=notrunc 2>/dev/null") -- 0
+(.db.splayed.get "/tmp/rfl_colgen_bad/") !- version

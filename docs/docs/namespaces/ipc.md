@@ -3,7 +3,7 @@
 Connect to a Rayforce server (`./rayforce -p <port>`) and exchange messages over TCP. The wire format is the same compact binary serialisation used for `ser`/`de`, with automatic delta+RLE compression for payloads larger than 2,000 bytes. All five connection builtins live here; the server-side connection hooks (`.ipc.on.open` / `.on.close` / `.on.sync` / `.on.async` / `.on.auth`) live on the [IPC Connection Hooks](../storage/ipc-hooks.md) page — they are user-settable lambda slots, not registered builtins, so they don't appear in the reference table below.
 
 !!! note "One handle namespace"
-    A handle is a handle, whichever side of the wire you are on: the `i64` returned by `.ipc.open` and the `h` a server-side hook receives (or reads via `.ipc.handle`) name connections in the same namespace, and `.ipc.send`, `.ipc.post`, and `.ipc.close` accept either. A server can therefore push messages back through the handle its hooks were given — from inside the hook or any time later — kdb-style. Handles are only meaningful inside the process that owns the connection; they are not stable identifiers across processes or reconnects.
+    A handle is a handle, whichever side of the wire you are on: the `i64` returned by `.ipc.open` and the `h` a server-side hook receives (or reads via `.ipc.handle`) name connections in the same namespace, and `.ipc.send`, `.ipc.post`, and `.ipc.close` accept either. A server can therefore push messages back through the handle its hooks were given — from inside the hook or any time later. Handles are only meaningful inside the process that owns the connection; they are not stable identifiers across processes or reconnects.
 
 !!! note "Restricted under `-U`"
     `.ipc.open`, `.ipc.close`, `.ipc.send`, and `.ipc.post` are `RAY_FN_RESTRICTED` — IPC chaining is blocked on a `-U` server (a peer cannot dial outward to a third server). `.ipc.handle` is always available so hooks can read the current connection ID.
@@ -12,7 +12,7 @@ Connect to a Rayforce server (`./rayforce -p <port>`) and exchange messages over
 
 | Function | Arity | Flags | Description |
 |---|---|---|---|
-| [`.ipc.open`](#ipc-open) | unary | restricted | Open a TCP connection; return an i64 handle. |
+| [`.ipc.open`](#ipc-open) | variadic | restricted | Open a TCP connection (optional connect timeout); return an i64 handle. |
 | [`.ipc.send`](#ipc-send) | binary | restricted | Send a message synchronously; return the server's result. |
 | [`.ipc.post`](#ipc-post) | binary | restricted | Send a message asynchronously (fire-and-forget); return the null object. |
 | [`.ipc.close`](#ipc-close) | unary | restricted | Close a connection handle. |
@@ -20,14 +20,17 @@ Connect to a Rayforce server (`./rayforce -p <port>`) and exchange messages over
 
 ## `.ipc.open` { #ipc-open }
 
-Signature: `(.ipc.open "host:port")` or `(.ipc.open "host:port:user:password")`.
+Signature: `(.ipc.open "host:port")` or `(.ipc.open "host:port:user:password")`, with an optional trailing connect timeout in milliseconds: `(.ipc.open "host:port" 2000)`.
 
 Returns: an `i64` handle. Negative handles never escape — errors are surfaced as Rayfall error objects:
 
-- `type` — argument is not a string.
-- `domain` — malformed address (missing port, port out of `(0, 65535]`, oversized host/user/password).
+- `type` — address argument is not a string, or the timeout argument is not an integer.
+- `rank` — called with fewer than 1 or more than 2 arguments.
+- `domain` — malformed address (missing port, port out of `(0, 65535]`, oversized host/user/password), or a negative timeout.
 - `access` — server requires auth and you didn't supply credentials, **or** the password is wrong.
-- `io` — connection refused / network error.
+- `io` — connection refused / network error, or `connection timed out` when the connect did not complete within the timeout.
+
+The optional timeout bounds **both** the TCP connect and the handshake I/O. A blocking `connect()` ignores socket send/receive timeouts, so without an explicit bound a dead or packet-filtered peer would otherwise hang for the operating-system default (often minutes). When omitted, a default budget of 5 seconds applies.
 
 The handshake exchanges a 2-byte `{wire_version, auth_flag}` greeting. A wire-version mismatch closes the connection before any payload is exchanged.
 
@@ -37,6 +40,9 @@ The handshake exchanges a 2-byte `{wire_version, auth_flag}` greeting. A wire-ve
 
 ;; With credentials (server started with -u or -U)
 (set h (.ipc.open "127.0.0.1:5000:admin:secret123"))
+
+;; Fail fast if the peer doesn't answer within 2 seconds
+(set h (.ipc.open "127.0.0.1:5000" 2000))
 ```
 
 ## `.ipc.send` { #ipc-send }

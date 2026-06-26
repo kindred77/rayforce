@@ -336,9 +336,9 @@ ray_t* ray_show_fn(ray_t** args, int64_t n) {
 
 /* (format "hello % world %" a b) — string formatting with % placeholders */
 ray_t* ray_format_fn(ray_t** args, int64_t n) {
-    if (n < 1) return ray_error("domain", NULL);
+    if (n < 1) return ray_error("domain", "format: expects at least 1 argument, got %lld", (long long)n);
     /* args are pre-materialized by eval — see ray_println_fn. */
-    if (!args[0] || args[0]->type != -RAY_STR) return ray_error("type", NULL);
+    if (!args[0] || args[0]->type != -RAY_STR) return ray_error("type", "format: format string must be str, got %s", args[0] ? ray_type_name(args[0]->type) : "null");
     const char* fmt = ray_str_ptr(args[0]);
     size_t flen = ray_str_len(args[0]);
     size_t out_len = 0;
@@ -457,11 +457,14 @@ ray_t* ray_resolve_fn(ray_t** args, int64_t n) {
 /* (timeit expr) — evaluate expression and return time in ms as F64.
  * SPECIAL_FORM: does not pre-evaluate args. */
 ray_t* ray_timeit_fn(ray_t** args, int64_t n) {
-    if (n < 1) return ray_error("domain", NULL);
+    if (n < 1) return ray_error("arity", "timeit: expects 1 argument, got %lld", (long long)n);
     int64_t t0 = ray_profile_now_ns();
     ray_t* result = ray_eval(args[0]);
     int64_t t1 = ray_profile_now_ns();
-    if (result && !RAY_IS_ERR(result)) ray_release(result);
+    /* Propagate errors instead of swallowing them — otherwise a failing
+     * expression silently reports a timing as if it had succeeded. */
+    if (result && RAY_IS_ERR(result)) return result;
+    if (result) ray_release(result);
     double ms = (double)(t1 - t0) / 1e6;
     return make_f64(ms);
 }
@@ -500,7 +503,7 @@ static int8_t resolve_type_name(int64_t sym_id) {
 }
 
 ray_t* ray_read_csv_fn(ray_t** args, int64_t n) {
-    if (n < 1 || n > 3) return ray_error("domain", NULL);
+    if (n < 1 || n > 3) return ray_error("arity", "read-csv: expects 1 to 3 arguments, got %lld", (long long)n);
 
     /* (read-csv [types] "path"), (read-csv [names] [types] "path"), or (read-csv "path") */
     ray_t* path_obj = NULL;
@@ -522,8 +525,8 @@ ray_t* ray_read_csv_fn(ray_t** args, int64_t n) {
     if (path_obj->type == -RAY_STR)
         path = ray_str_ptr(path_obj);
     else
-        return ray_error("type", NULL);
-    if (!path) return ray_error("domain", NULL);
+        return ray_error("type", "read-csv: path must be str, got %s", ray_type_name(path_obj->type));
+    if (!path) return ray_error("domain", "read-csv: empty path");
 
     if (schema) {
         int64_t ncols = schema->len;
@@ -533,11 +536,11 @@ ray_t* ray_read_csv_fn(ray_t** args, int64_t n) {
         for (int64_t i = 0; i < ncols; i++) {
             int64_t sid = ray_read_sym(sym_data, i, schema->type, schema->attrs);
             col_types[i] = resolve_type_name(sid);
-            if (col_types[i] < 0) return ray_error("type", NULL);
+            if (col_types[i] < 0) return ray_error("type", "read-csv: unknown column type name in schema");
         }
         int64_t col_names[256];
         if (names) {
-            if (names->len != ncols) return ray_error("length", NULL);
+            if (names->len != ncols) return ray_error("length", "read-csv: names and types must match, got %lld names and %lld types", (long long)names->len, (long long)ncols);
             void* name_data = ray_data(names);
             for (int64_t i = 0; i < ncols; i++)
                 col_names[i] = ray_read_sym(name_data, i, names->type, names->attrs);
@@ -589,16 +592,16 @@ static int csv_valid_table_name(const char* name) {
 }
 
 static const char* csv_default_sym_path(const char* dir, char* buf, size_t bufsz) {
-    int n = snprintf(buf, bufsz, "%s/sym", dir);
+    int n = snprintf(buf, bufsz, "%s/.sym", dir);
     if (n < 0 || (size_t)n >= bufsz) return NULL;
     return buf;
 }
 
 ray_t* ray_read_csv_splayed_fn(ray_t** args, int64_t n) {
-    if (n < 2 || n > 4) return ray_error("domain", NULL);
+    if (n < 2 || n > 4) return ray_error("arity", "csv.splayed: expects 2 to 4 arguments, got %lld", (long long)n);
 
     char dir[1024];
-    if (!csv_str_arg(args[n - 1], dir, sizeof(dir))) return ray_error("type", NULL);
+    if (!csv_str_arg(args[n - 1], dir, sizeof(dir))) return ray_error("type", "csv.splayed: target dir must be str, got %s", args[n - 1] ? ray_type_name(args[n - 1]->type) : "null");
 
     int64_t data_n = n - 1;
     ray_t* path_obj = NULL;
@@ -615,11 +618,11 @@ ray_t* ray_read_csv_splayed_fn(ray_t** args, int64_t n) {
     } else if (data_n == 1) {
         path_obj = args[0];
     } else {
-        return ray_error("domain", NULL);
+        return ray_error("domain", "csv.splayed: invalid argument arrangement");
     }
-    if (!path_obj || path_obj->type != -RAY_STR) return ray_error("type", NULL);
+    if (!path_obj || path_obj->type != -RAY_STR) return ray_error("type", "csv.splayed: source path must be str, got %s", path_obj ? ray_type_name(path_obj->type) : "null");
     const char* path = ray_str_ptr(path_obj);
-    if (!path) return ray_error("domain", NULL);
+    if (!path) return ray_error("domain", "csv.splayed: empty source path");
 
     int8_t col_types[256];
     int64_t col_names[256];
@@ -635,11 +638,11 @@ ray_t* ray_read_csv_splayed_fn(ray_t** args, int64_t n) {
         for (int64_t i = 0; i < schema->len; i++) {
             int64_t sid = ray_read_sym(sym_data, i, schema->type, schema->attrs);
             col_types[i] = resolve_type_name(sid);
-            if (col_types[i] < 0) return ray_error("type", NULL);
+            if (col_types[i] < 0) return ray_error("type", "csv.splayed: unknown column type name in schema");
         }
         types_arg = col_types;
         if (names) {
-            if (names->len != schema->len) return ray_error("length", NULL);
+            if (names->len != schema->len) return ray_error("length", "csv.splayed: names and types must match, got %lld names and %lld types", (long long)names->len, (long long)schema->len);
             void* name_data = ray_data(names);
             for (int64_t i = 0; i < names->len; i++)
                 col_names[i] = ray_read_sym(name_data, i, names->type, names->attrs);
@@ -661,21 +664,21 @@ ray_t* ray_read_csv_splayed_fn(ray_t** args, int64_t n) {
 }
 
 ray_t* ray_read_csv_parted_fn(ray_t** args, int64_t n) {
-    if (n < 3 || n > 6) return ray_error("domain", NULL);
+    if (n < 3 || n > 6) return ray_error("arity", "csv.parted: expects 3 to 6 arguments, got %lld", (long long)n);
 
     char root[1024];
-    if (!csv_str_arg(args[n - 2], root, sizeof(root))) return ray_error("type", NULL);
+    if (!csv_str_arg(args[n - 2], root, sizeof(root))) return ray_error("type", "csv.parted: root dir must be str, got %s", args[n - 2] ? ray_type_name(args[n - 2]->type) : "null");
 
     char table_name[256];
     if (!csv_sym_arg(args[n - 1], table_name, sizeof(table_name)))
-        return ray_error("type", NULL);
-    if (!csv_valid_table_name(table_name)) return ray_error("domain", NULL);
+        return ray_error("type", "csv.parted: table name must be sym, got %s", args[n - 1] ? ray_type_name(args[n - 1]->type) : "null");
+    if (!csv_valid_table_name(table_name)) return ray_error("domain", "csv.parted: invalid table name");
 
     int64_t rows_per_part = 0;
     int64_t data_n = n - 2;
     if (data_n >= 2 && is_numeric(args[n - 3])) {
         rows_per_part = as_i64(args[n - 3]);
-        if (rows_per_part <= 0) return ray_error("domain", NULL);
+        if (rows_per_part <= 0) return ray_error("range", "csv.parted: rows per partition must be positive, got %lld", (long long)rows_per_part);
         data_n--;
     }
     ray_t* path_obj = NULL;
@@ -692,12 +695,12 @@ ray_t* ray_read_csv_parted_fn(ray_t** args, int64_t n) {
     } else if (data_n == 1) {
         path_obj = args[0];
     } else {
-        return ray_error("domain", NULL);
+        return ray_error("domain", "csv.parted: invalid argument arrangement");
     }
 
-    if (!path_obj || path_obj->type != -RAY_STR) return ray_error("type", NULL);
+    if (!path_obj || path_obj->type != -RAY_STR) return ray_error("type", "csv.parted: source path must be str, got %s", path_obj ? ray_type_name(path_obj->type) : "null");
     const char* path = ray_str_ptr(path_obj);
-    if (!path) return ray_error("domain", NULL);
+    if (!path) return ray_error("domain", "csv.parted: empty source path");
 
     int8_t col_types[256];
     int64_t col_names[256];
@@ -713,11 +716,11 @@ ray_t* ray_read_csv_parted_fn(ray_t** args, int64_t n) {
         for (int64_t i = 0; i < schema->len; i++) {
             int64_t sid = ray_read_sym(sym_data, i, schema->type, schema->attrs);
             col_types[i] = resolve_type_name(sid);
-            if (col_types[i] < 0) return ray_error("type", NULL);
+            if (col_types[i] < 0) return ray_error("type", "csv.parted: unknown column type name in schema");
         }
         types_arg = col_types;
         if (names) {
-            if (names->len != schema->len) return ray_error("length", NULL);
+            if (names->len != schema->len) return ray_error("length", "csv.parted: names and types must match, got %lld names and %lld types", (long long)names->len, (long long)schema->len);
             void* name_data = ray_data(names);
             for (int64_t i = 0; i < names->len; i++)
                 col_names[i] = ray_read_sym(name_data, i, names->type, names->attrs);
@@ -742,16 +745,16 @@ ray_t* ray_read_csv_parted_fn(ray_t** args, int64_t n) {
 
 /* (write-csv table path) — write table to CSV file */
 ray_t* ray_write_csv_fn(ray_t** args, int64_t n) {
-    if (n < 2) return ray_error("domain", NULL);
+    if (n < 2) return ray_error("arity", "write-csv: expects 2 arguments, got %lld", (long long)n);
     ray_t* tbl = args[0];
     ray_t* path_obj = args[1];
-    if (tbl->type != RAY_TABLE) return ray_error("type", NULL);
+    if (tbl->type != RAY_TABLE) return ray_error("type", "write-csv: first argument must be table, got %s", ray_type_name(tbl->type));
     const char* path = NULL;
     if (path_obj->type == -RAY_STR)
         path = ray_str_ptr(path_obj);
     else
-        return ray_error("type", NULL);
-    if (!path) return ray_error("domain", NULL);
+        return ray_error("type", "write-csv: path must be str, got %s", ray_type_name(path_obj->type));
+    if (!path) return ray_error("domain", "write-csv: empty path");
     ray_err_t err = ray_write_csv(tbl, path);
     if (err != RAY_OK) return ray_error(ray_err_code_str(err), NULL);
     return make_i64(0);
@@ -1127,6 +1130,43 @@ static ray_t* cast_vec_numeric_fast(ray_t* val, ray_t* vec, int8_t out_type) {
  * Handles I64, I32, I16, U8, F64, BOOL, DATE, TIME, TIMESTAMP, SYM.
  * Fast path for typed numeric input vectors (no per-element atoms);
  * generic path for RAY_LIST and other shapes. */
+/* Null-model invariant 16.4: a cast can land the target type's RESERVED
+ * null sentinel in the output without it being a *source* null — e.g.
+ * STR→F64 "inf"→0Nf, or an out-of-domain value mapping to NULL_I64.
+ * cast_vec_copy_nulls only carries source nulls, so scan the output and
+ * flip HAS_NULLS for any reserved sentinel.
+ *
+ * Scope MATCHES the validator (src/vec/validate.c): only F64/F32/I64/
+ * TIMESTAMP sentinels are reserved.  I16/I32 (and I32-backed DATE/TIME) are
+ * DELIBERATELY excluded — narrow-int arithmetic/truncation wraps modulo the
+ * width (documented k/q rule), so INT16_MIN/INT32_MIN are legitimate
+ * computed values, not nulls (see test/rfl/expr/narrow_binary.rfl).  Forcing
+ * HAS_NULLS for them would make a wrapped result read back as null. */
+static void cast_mark_output_sentinels(ray_t* vec, int8_t out_type, int64_t n) {
+    const void* out = ray_data(vec);
+    switch (out_type) {
+        case RAY_F64: {
+            const double* d = (const double*)out;
+            for (int64_t i = 0; i < n; i++)
+                if (d[i] != d[i]) { vec->attrs |= RAY_ATTR_HAS_NULLS; return; }
+            return;
+        }
+        case RAY_F32: {
+            const float* d = (const float*)out;
+            for (int64_t i = 0; i < n; i++)
+                if (d[i] != d[i]) { vec->attrs |= RAY_ATTR_HAS_NULLS; return; }
+            return;
+        }
+        case RAY_I64: case RAY_TIMESTAMP: {
+            const int64_t* d = (const int64_t*)out;
+            for (int64_t i = 0; i < n; i++)
+                if (d[i] == NULL_I64) { vec->attrs |= RAY_ATTR_HAS_NULLS; return; }
+            return;
+        }
+        default: return;
+    }
+}
+
 static ray_t* cast_vec_numeric(ray_t* type_sym, ray_t* val, int8_t out_type) {
     int64_t n2 = val->len;
     ray_t* vec = ray_vec_new(out_type, n2);
@@ -1160,6 +1200,9 @@ static ray_t* cast_vec_numeric(ray_t* type_sym, ray_t* val, int8_t out_type) {
             if (RAY_IS_ERR(result)) return result;
             if (_FP_CANCELLED()) { ray_release(vec); return ray_error("cancel", NULL); }
 #undef _FP_CANCELLED
+            /* Invariant 16.4: a narrowing fast cast may have produced a
+             * reserved sentinel not present in the source. */
+            cast_mark_output_sentinels(vec, out_type, n2);
             return vec;
         }
     }
@@ -1203,13 +1246,23 @@ static ray_t* cast_vec_numeric(ray_t* type_sym, ray_t* val, int8_t out_type) {
         }
         ray_release(cast);
     }
+    /* STAGE 2 (ingest/cast → F64 vector): the per-element recursion routes
+     * STR→F64 through make_f64, which canonicalizes any non-finite parse
+     * (strtod "inf"/"1e400"/"nan") to NULL_F64 (0Nf).  cast_vec_copy_nulls
+     * below only propagates *source* nulls, so a 0Nf produced from a
+     * non-null source cell would not flip HAS_NULLS.  Scan the F64 output
+     * and set HAS_NULLS if any canonical 0Nf was produced. */
+    /* Invariant 16.4: scan the output for any reserved sentinel produced by
+     * the cast (narrowing/truncation, or STR→F64 0Nf canonicalization) that
+     * is not a *source* null cast_vec_copy_nulls would carry. */
+    cast_mark_output_sentinels(vec, out_type, n2);
     ray_t* result = cast_vec_copy_nulls(vec, val);
     if (RAY_IS_ERR(result)) return result;
     return vec;
 }
 
 ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
-    if (type_sym->type != -RAY_SYM) return ray_error("type", NULL);
+    if (type_sym->type != -RAY_SYM) return ray_error("type", "as: target type must be sym, got %s", ray_type_name(type_sym->type));
     /* Null propagation: casting a typed null atom produces a typed null of target type */
     if (ray_is_atom(val) && RAY_ATOM_IS_NULL(val)) {
         ray_t* s2 = ray_sym_str(type_sym->i64);
@@ -1231,7 +1284,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         else if (cast_match(tn, tl, "STR") || cast_match(tn, tl, "str")) { ray_release(s2); return ray_str("", 0); }
         ray_release(s2);
         if (tt) return ray_typed_null(tt);
-        return ray_error("domain", NULL);
+        return ray_error("domain", "as: unknown target type name");
     }
     ray_t* s = ray_sym_str(type_sym->i64);
     if (!s) return ray_error("domain", NULL);
@@ -1251,16 +1304,16 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         if (val->type == -RAY_U8) return make_i64(val->u8);
         if (val->type == -RAY_STR) {
             const char* sp = ray_str_ptr(val);
-            if (!sp) return ray_error("domain", NULL);
+            if (!sp) return ray_error("domain", "as: cannot parse empty str as i64");
             char* end;
             int64_t v = strtoll(sp, &end, 10);
-            if (end == sp) return ray_error("domain", NULL);
+            if (end == sp) return ray_error("domain", "as: cannot parse str as i64");
             return make_i64(v);
         }
         /* Vector/list cast */
         if (ray_is_vec(val) || val->type == RAY_LIST)
             return cast_vec_numeric(type_sym, val, RAY_I64);
-        return ray_error("type", NULL);
+        return ray_error("type", "as: cannot cast %s to i64", ray_type_name(val->type));
     }
     /* Cast to I32 / i32 */
     if (cast_match(tname, tlen, "I32") || cast_match(tname, tlen, "i32")) {
@@ -1276,13 +1329,13 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         if (val->type == -RAY_STR) {
             const char* sp = ray_str_ptr(val); char* end;
             long v = strtol(sp, &end, 10);
-            if (end == sp) return ray_error("domain", NULL);
+            if (end == sp) return ray_error("domain", "as: cannot parse str as i32");
             return ray_i32((int32_t)v);
         }
         /* Vector cast */
         if (ray_is_vec(val) || val->type == RAY_LIST)
             return cast_vec_numeric(type_sym, val, RAY_I32);
-        return ray_error("type", NULL);
+        return ray_error("type", "as: cannot cast %s to i32", ray_type_name(val->type));
     }
     /* Cast to I16 / i16 */
     if (cast_match(tname, tlen, "I16") || cast_match(tname, tlen, "i16")) {
@@ -1298,13 +1351,13 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         if (val->type == -RAY_STR) {
             const char* sp = ray_str_ptr(val); char* end;
             long v = strtol(sp, &end, 10);
-            if (end == sp) return ray_error("domain", NULL);
+            if (end == sp) return ray_error("domain", "as: cannot parse str as i16");
             return ray_i16((int16_t)v);
         }
         /* Vector cast */
         if (ray_is_vec(val) || val->type == RAY_LIST)
             return cast_vec_numeric(type_sym, val, RAY_I16);
-        return ray_error("type", NULL);
+        return ray_error("type", "as: cannot cast %s to i16", ray_type_name(val->type));
     }
     /* Cast to F64 / f64 */
     if (cast_match(tname, tlen, "F64") || cast_match(tname, tlen, "f64")) {
@@ -1319,16 +1372,21 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         if (val->type == -RAY_TIMESTAMP) return make_f64((double)val->i64);
         if (val->type == -RAY_STR) {
             const char* sp = ray_str_ptr(val);
-            if (!sp) return ray_error("domain", NULL);
+            if (!sp) return ray_error("domain", "as: cannot parse empty str as f64");
             char* end;
             double v = strtod(sp, &end);
-            if (end == sp) return ray_error("domain", NULL);
+            if (end == sp) return ray_error("domain", "as: cannot parse str as f64");
+            /* STAGE 2 (ingest/cast STR→F64): canonicalize at the ingest entry
+             * point.  strtod("inf")/strtod("1e400")/strtod("nan") would yield a
+             * non-finite F64; make_f64 maps every non-finite to NULL_F64 (0Nf),
+             * closing the single-null float model on the cast surface.  An atom
+             * 0Nf is itself the null — there is no HAS_NULLS attr to set. */
             return make_f64(v);
         }
         /* Vector cast */
         if (ray_is_vec(val) || val->type == RAY_LIST)
             return cast_vec_numeric(type_sym, val, RAY_F64);
-        return ray_error("type", NULL);
+        return ray_error("type", "as: cannot cast %s to f64", ray_type_name(val->type));
     }
     /* Cast to B8/BOOL/b8 */
     if (cast_match(tname, tlen, "BOOL") || cast_match(tname, tlen, "B8") || cast_match(tname, tlen, "b8")) {
@@ -1346,7 +1404,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         /* Vector cast: b8/B8 */
         if (ray_is_vec(val) || val->type == RAY_LIST)
             return cast_vec_numeric(type_sym, val, RAY_BOOL);
-        return ray_error("type", NULL);
+        return ray_error("type", "as: cannot cast %s to b8", ray_type_name(val->type));
     }
     /* Cast to STR/str */
     if (cast_match(tname, tlen, "STR") || cast_match(tname, tlen, "str")) {
@@ -1405,7 +1463,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
             if (RAY_IS_ERR(result)) return result;
             return vec;
         }
-        return ray_error("type", NULL);
+        return ray_error("type", "as: cannot cast %s to str", ray_type_name(val->type));
     }
     /* Cast to SYMBOL/sym */
     if (cast_match(tname, tlen, "SYMBOL") || cast_match(tname, tlen, "sym") || cast_match(tname, tlen, "symbol")) {
@@ -1450,7 +1508,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         /* Vector cast: SYMBOL vec from other vecs */
         if (ray_is_vec(val) || val->type == RAY_LIST)
             return cast_vec_numeric(type_sym, val, RAY_SYM);
-        return ray_error("type", NULL);
+        return ray_error("type", "as: cannot cast %s to sym", ray_type_name(val->type));
     }
     /* Cast to DATE/date */
     if (cast_match(tname, tlen, "DATE") || cast_match(tname, tlen, "date")) {
@@ -1468,7 +1526,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
             /* Parse "YYYY.MM.DD" format */
             const char* sp = ray_str_ptr(val);
             int y, m, d2;
-            if (sscanf(sp, "%d.%d.%d", &y, &m, &d2) != 3) return ray_error("domain", NULL);
+            if (sscanf(sp, "%d.%d.%d", &y, &m, &d2) != 3) return ray_error("domain", "as: cannot parse str as date, expected YYYY.MM.DD");
             int64_t days = 0;
             { int ty;
               for (ty = 2000; ty < y; ty++) days += (ty % 4 == 0 && (ty % 100 != 0 || ty % 400 == 0)) ? 366 : 365;
@@ -1484,7 +1542,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         /* Vector cast */
         if (ray_is_vec(val) || val->type == RAY_LIST)
             return cast_vec_numeric(type_sym, val, RAY_DATE);
-        return ray_error("type", NULL);
+        return ray_error("type", "as: cannot cast %s to date", ray_type_name(val->type));
     }
     /* Cast to TIME/time */
     if (cast_match(tname, tlen, "TIME") || cast_match(tname, tlen, "time")) {
@@ -1508,7 +1566,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
             const char* sp = ray_str_ptr(val);
             int th = 0, tm = 0, ts = 0, tms = 0;
             int nr = sscanf(sp, "%d:%d:%d", &th, &tm, &ts);
-            if (nr < 2) return ray_error("domain", NULL);
+            if (nr < 2) return ray_error("domain", "as: cannot parse str as time, expected HH:MM:SS[.mmm]");
             const char* dot = strchr(sp, '.');
             if (dot) {
                 dot++;
@@ -1523,7 +1581,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         /* Vector cast */
         if (ray_is_vec(val) || val->type == RAY_LIST)
             return cast_vec_numeric(type_sym, val, RAY_TIME);
-        return ray_error("type", NULL);
+        return ray_error("type", "as: cannot cast %s to time", ray_type_name(val->type));
     }
     /* Cast to TIMESTAMP/timestamp */
     if (cast_match(tname, tlen, "TIMESTAMP") || cast_match(tname, tlen, "timestamp")) {
@@ -1544,7 +1602,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         if (val->type == -RAY_STR) {
             const char* sp = ray_str_ptr(val);
             size_t sl = ray_str_len(val);
-            if (sl < 10) return ray_error("domain", NULL);
+            if (sl < 10) return ray_error("domain", "as: cannot parse str as timestamp, too short, got %lld chars", (long long)sl);
             int y, m, d, hh = 0, mm = 0, ss = 0;
             long long frac = 0;
             /* Try both formats: YYYY-MM-DD and YYYY.MM.DD */
@@ -1554,7 +1612,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
                 parsed = sscanf(sp, "%d.%d.%d", &y, &m, &d);
                 /* YYYY.MM.DD format */
             }
-            if (parsed != 3) return ray_error("domain", NULL);
+            if (parsed != 3) return ray_error("domain", "as: cannot parse str as timestamp, expected YYYY-MM-DD or YYYY.MM.DD");
             /* Parse optional time part */
             if (sl > 10 && (sp[10] == 'T' || sp[10] == ' ' || sp[10] == 'D')) {
                 sscanf(sp + 11, "%d:%d:%d", &hh, &mm, &ss);
@@ -1612,7 +1670,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         /* Vector cast */
         if (ray_is_vec(val) || val->type == RAY_LIST)
             return cast_vec_numeric(type_sym, val, RAY_TIMESTAMP);
-        return ray_error("type", NULL);
+        return ray_error("type", "as: cannot cast %s to timestamp", ray_type_name(val->type));
     }
     /* Cast to GUID/guid */
     if (cast_match(tname, tlen, "GUID") || cast_match(tname, tlen, "guid")) {
@@ -1622,7 +1680,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
             /* Parse UUID string: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" */
             const char* sp = ray_str_ptr(val);
             size_t sl = ray_str_len(val);
-            if (sl < 36) return ray_error("domain", NULL);
+            if (sl < 36) return ray_error("domain", "as: cannot parse str as guid, expected 36 chars, got %lld", (long long)sl);
             uint8_t bytes[16];
             const char* p = sp;
             for (int bi = 0; bi < 16; bi++) {
@@ -1657,7 +1715,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
             if (RAY_IS_ERR(result)) return result;
             return vec;
         }
-        return ray_error("type", NULL);
+        return ray_error("type", "as: cannot cast %s to guid", ray_type_name(val->type));
     }
     /* Cast to U8/u8 */
     if (cast_match(tname, tlen, "U8") || cast_match(tname, tlen, "u8")) {
@@ -1671,13 +1729,13 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         if (val->type == -RAY_STR) {
             const char* sp = ray_str_ptr(val);
             char* end; long v = strtol(sp, &end, 10);
-            if (end == sp) return ray_error("domain", NULL);
+            if (end == sp) return ray_error("domain", "as: cannot parse str as u8");
             return ray_u8((uint8_t)v);
         }
         /* Vector cast */
         if (ray_is_vec(val) || val->type == RAY_LIST)
             return cast_vec_numeric(type_sym, val, RAY_U8);
-        return ray_error("type", NULL);
+        return ray_error("type", "as: cannot cast %s to u8", ray_type_name(val->type));
     }
     /* Cast to DICT */
     if (cast_match(tname, tlen, "DICT")) {
@@ -1700,7 +1758,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
             }
             return ray_dict_new(keys, vals);
         }
-        return ray_error("type", NULL);
+        return ray_error("type", "as: cannot cast %s to dict", ray_type_name(val->type));
     }
     /* Cast to TABLE */
     if (cast_match(tname, tlen, "TABLE")) {
@@ -1712,7 +1770,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
             ray_t* dvals = ray_dict_vals(val);
             int64_t ncols = dkeys ? dkeys->len : 0;
             if (!dkeys || dkeys->type != RAY_SYM || !dvals || dvals->type != RAY_LIST)
-                return ray_error("type", NULL);
+                return ray_error("type", "as: cannot cast dict to table, keys must be sym and values must be list");
             ray_t** col_ptrs = (ray_t**)ray_data(dvals);
             ray_t* tbl = ray_table_new(ncols);
             if (RAY_IS_ERR(tbl)) return tbl;
@@ -1726,10 +1784,10 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
             }
             return tbl;
         }
-        return ray_error("type", NULL);
+        return ray_error("type", "as: cannot cast %s to table", ray_type_name(val->type));
     }
     ray_release(s);
-    return ray_error("domain", NULL);
+    return ray_error("domain", "as: unknown target type name");
 }
 
 /* (type val) — return the type code of a value */
@@ -1745,9 +1803,9 @@ ray_t* ray_type_fn(ray_t* val) {
 
 /* (read path) — read a file's contents as a string */
 ray_t* ray_read_file_fn(ray_t* path_obj) {
-    if (path_obj->type != -RAY_STR) return ray_error("type", NULL);
+    if (path_obj->type != -RAY_STR) return ray_error("type", "read: path must be str, got %s", ray_type_name(path_obj->type));
     const char* path = ray_str_ptr(path_obj);
-    if (!path) return ray_error("domain", NULL);
+    if (!path) return ray_error("domain", "read: empty path");
     FILE* fp = fopen(path, "rb");
     if (!fp) return ray_error("io", NULL);
     fseek(fp, 0, SEEK_END);
@@ -1768,9 +1826,9 @@ ray_t* ray_read_file_fn(ray_t* path_obj) {
 
 /* (load path) — read and evaluate a Rayfall script file via mmap */
 ray_t* ray_load_file_fn(ray_t* path_obj) {
-    if (path_obj->type != -RAY_STR) return ray_error("type", NULL);
+    if (path_obj->type != -RAY_STR) return ray_error("type", "load: path must be str, got %s", ray_type_name(path_obj->type));
     const char* path = ray_str_ptr(path_obj);
-    if (!path) return ray_error("domain", NULL);
+    if (!path) return ray_error("domain", "load: empty path");
     size_t path_len = ray_str_len(path_obj);
 
 #if defined(RAY_OS_WINDOWS)
@@ -1836,12 +1894,12 @@ ray_t* ray_load_file_fn(ray_t* path_obj) {
 
 /* (write path content) — write string to a file */
 ray_t* ray_write_file_fn(ray_t* path_obj, ray_t* content) {
-    if (path_obj->type != -RAY_STR) return ray_error("type", NULL);
-    if (content->type != -RAY_STR) return ray_error("type", NULL);
+    if (path_obj->type != -RAY_STR) return ray_error("type", "write: path must be str, got %s", ray_type_name(path_obj->type));
+    if (content->type != -RAY_STR) return ray_error("type", "write: content must be str, got %s", ray_type_name(content->type));
     const char* path = ray_str_ptr(path_obj);
     const char* data = ray_str_ptr(content);
     size_t len = ray_str_len(content);
-    if (!path || !data) return ray_error("domain", NULL);
+    if (!path || !data) return ray_error("domain", "write: empty path or content");
     FILE* fp = fopen(path, "wb");
     if (!fp) return ray_error("io", NULL);
     size_t written = fwrite(data, 1, len, fp);
@@ -1971,7 +2029,7 @@ as_list:;
  * typed null I64.  Both inputs are copied (refs retained) — caller keeps
  * ownership of the originals. */
 ray_t* ray_dict_fn(ray_t* keys, ray_t* vals) {
-    if (!ray_is_vec(keys)) return ray_error("type", NULL);
+    if (!ray_is_vec(keys)) return ray_error("type", "dict: keys must be a vector, got %s", ray_type_name(keys->type));
     int64_t n = keys->len;
 
     /* Hold a fresh ref to keys so ownership is transferred into the dict. */
@@ -2014,7 +2072,7 @@ ray_t* ray_nil_fn(ray_t* x) {
 /* (where bool-vec) -> indices of true values */
 ray_t* ray_where_fn(ray_t* x) {
     if (!ray_is_vec(x) || x->type != RAY_BOOL)
-        return ray_error("type", NULL);
+        return ray_error("type", "where: argument must be a b8 vector, got %s", ray_type_name(x->type));
     bool* data = (bool*)ray_data(x);
     int64_t n = x->len;
     /* Count trues */
@@ -2253,7 +2311,7 @@ static bool group_grow_listkeys(ray_t** val_block, ray_t** ivblock, ray_t** kblo
 
 ray_t* ray_group_fn(ray_t* x) {
     if (!ray_is_vec(x) && x->type != RAY_LIST)
-        return ray_error("type", NULL);
+        return ray_error("type", "group: argument must be a vector or list, got %s", ray_type_name(x->type));
     int64_t n = x->len;
     if (n == 0) {
         ray_t* keys = ray_list_new(0);
@@ -2489,7 +2547,7 @@ ray_t* ray_group_fn(ray_t* x) {
                 ray_release(idx_vecs[g]);
             }
             ray_free(val_block); ray_free(ivblock); ray_free(skblock);
-            return ray_error("domain", NULL);
+            return ray_error("oom", NULL);
         }
         for (int64_t g = 0; g < ngroups; g++) {
             keys_vec = ray_str_vec_append(keys_vec, ray_str_ptr(str_keys[g]), ray_str_len(str_keys[g]));
@@ -2728,7 +2786,7 @@ gfail:
         if (idx_vecs[g]) ray_release(idx_vecs[g]);
     ray_free(val_block);
     ray_free(ivblock);
-    return ray_error("domain", NULL);
+    return ray_error("oom", NULL);
 }
 
 /* (concat a b) -> concatenate vectors/strings/dicts/tables */
@@ -2845,8 +2903,13 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
             const uint8_t* gd = a->obj ? (const uint8_t*)ray_data(a->obj) : (const uint8_t*)ray_data((ray_t*)a);
             memcpy(ray_data(result), gd, 16); break;
         }
-        default: ray_free(result); return ray_error("type", NULL);
+        default: ray_free(result); return ray_error("type", "concat: unsupported element type %s", ray_type_name(b->type));
         }
+        /* Null-model invariant 16.4: propagate null-ness of the leading atom
+         * (a typed-null sentinel written raw at slot 0) and any nulls in the
+         * trailing vector b. */
+        if (RAY_ATOM_IS_NULL(a) || (b->attrs & RAY_ATTR_HAS_NULLS))
+            result->attrs |= RAY_ATTR_HAS_NULLS;
         if (b->type == RAY_SYM) {
             /* Mixed sources: the atom id is runtime-domain by design, b's
              * cells are b-domain — re-express b per cell into the runtime
@@ -2891,9 +2954,13 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
             const uint8_t* gd = b->obj ? (const uint8_t*)ray_data(b->obj) : (const uint8_t*)ray_data((ray_t*)b);
             memcpy((uint8_t*)ray_data(result) + na * 16, gd, 16); break;
         }
-        default: ray_free(result); return ray_error("type", NULL);
+        default: ray_free(result); return ray_error("type", "concat: unsupported element type %s", ray_type_name(a->type));
         }
         result->len = na + 1;
+        /* Null-model invariant 16.4: propagate nulls in the leading vector a
+         * and null-ness of the trailing atom (sentinel written raw at na). */
+        if ((a->attrs & RAY_ATTR_HAS_NULLS) || RAY_ATOM_IS_NULL(b))
+            result->attrs |= RAY_ATTR_HAS_NULLS;
         return result;
     }
     /* Atom + atom of same type -> 2-element vector */
@@ -2934,8 +3001,14 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
             memcpy((uint8_t*)ray_data(result) + 16, gb, 16);
             break;
         }
-        default: ray_free(result); return ray_error("type", NULL);
+        default: ray_free(result); return ray_error("type", "concat: unsupported element type %s", ray_type_name(vtype));
         }
+        /* Null-model invariant 16.4: a typed-null atom (e.g. the I64 literal
+         * INT64_MIN == NULL_I64) writes its sentinel bit-pattern straight
+         * into the result column.  Flag HAS_NULLS so null-aware ops don't
+         * treat the sentinel as a real value. */
+        if (RAY_ATOM_IS_NULL(a) || RAY_ATOM_IS_NULL(b))
+            result->attrs |= RAY_ATTR_HAS_NULLS;
         return result;
     }
     /* Dict concat: merge — keys/vals from b overwrite a's. */
@@ -3008,7 +3081,7 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
             /* Type check: columns must have the same type */
             if (acol->type != bcol->type) {
                 ray_release(result);
-                return ray_error("type", NULL);
+                return ray_error("type", "concat: column type mismatch, got %s and %s", ray_type_name(acol->type), ray_type_name(bcol->type));
             }
             ray_t* col = ray_concat_fn(acol, bcol);
             if (RAY_IS_ERR(col)) { ray_release(result); return col; }
@@ -3057,7 +3130,7 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
         ray_retain(b); out[1] = b;
         return result;
     }
-    return ray_error("type", NULL);
+    return ray_error("type", "concat: cannot concatenate %s and %s", ray_type_name(a->type), ray_type_name(b->type));
 }
 
 /* (raze list-of-vecs) -> flattened vector */
@@ -3067,7 +3140,7 @@ ray_t* ray_raze_fn(ray_t* x) {
     /* Typed vector passthrough */
     if (ray_is_vec(x)) { ray_retain(x); return x; }
     if (x->type != RAY_LIST)
-        return ray_error("type", NULL);
+        return ray_error("type", "raze: argument must be a list, got %s", ray_type_name(x->type));
     int64_t n = x->len;
     if (n == 0) return ray_list_new(0);
     ray_t** items = (ray_t**)ray_data(x);
@@ -3119,10 +3192,130 @@ ray_t* ray_raze_fn(ray_t* x) {
     return result;
 }
 
+/* ungroup t — flatten nested-list columns, replicate flat columns.
+ *
+ * Grouping a non-aggregate (e.g. `top(2) by k`) yields a table with a
+ * nested LIST column (one list-of-values per group) alongside ATOM key
+ * columns.  `ungroup` expands that to SQL/row-form shape: per row i, the
+ * nested columns' cells have a common length n_i; flat columns are
+ * replicated n_i times and nested columns are razed (concatenated) in
+ * row order.  Total output rows = Σ_i n_i (n_i may be 0 → row drops out).
+ *
+ *   - No nested column → return `t` unchanged (identity).
+ *   - Nested columns disagreeing on a row's length → ray_error("length").
+ *
+ * A nested cell that is an atom counts as length 1 (broadcast); otherwise
+ * its `ray_len` is used.  Flat-column replication uses gather_by_idx
+ * (preserves type/attrs/null bits/SYM domain); nested-column flatten
+ * reuses ray_raze_fn (handles the fast memcpy path, nulls, empties). */
+ray_t* ray_ungroup_fn(ray_t* x) {
+    if (!x || RAY_IS_ERR(x) || x->type != RAY_TABLE)
+        return ray_error("type", "ungroup: argument must be a table, got %s", x ? ray_type_name(x->type) : "null");
+
+    int64_t ncols = ray_table_ncols(x);
+    int64_t nrows = ray_table_nrows(x);
+
+    /* Locate the nested (RAY_LIST) columns. */
+    bool any_nested = false;
+    for (int64_t c = 0; c < ncols; c++) {
+        ray_t* col = ray_table_get_col_idx(x, c);
+        if (col && !RAY_IS_ERR(col) && col->type == RAY_LIST) { any_nested = true; break; }
+    }
+    /* No nested column → identity. */
+    if (!any_nested) { ray_retain(x); return x; }
+
+    /* Per-row expansion count n_i from the nested columns; all nested
+     * columns must agree on n_i for each row.  Build a replication index
+     * vector idx[] = each row i repeated n_i times (for flat gather). */
+    int64_t total = 0;
+    int64_t* counts = (int64_t*)malloc((size_t)(nrows > 0 ? nrows : 1) * sizeof(int64_t));
+    if (!counts) return ray_error("oom", NULL);
+
+    for (int64_t i = 0; i < nrows; i++) {
+        int64_t n_i = -1;
+        for (int64_t c = 0; c < ncols; c++) {
+            ray_t* col = ray_table_get_col_idx(x, c);
+            if (!col || RAY_IS_ERR(col) || col->type != RAY_LIST) continue;
+            ray_t* cell = ray_list_get(col, i);
+            /* A valid nested cell is either an atom (length 1) or a typed
+             * NON-LIST vector (length cell->len).  Anything else — NULL
+             * (unfilled list slot → ray_len would deref NULL) or a boxed
+             * RAY_LIST cell (whose top-level len would disagree with the
+             * scalar count raze emits, corrupting column lengths) — is a
+             * type error. */
+            int64_t len_i;
+            if (cell && ray_is_atom(cell))
+                len_i = 1;
+            else if (cell && ray_is_vec(cell) && cell->type != RAY_LIST)
+                len_i = ray_len(cell);
+            else { free(counts); return ray_error("type", "ungroup: nested cell must be an atom or non-list vector"); }
+            if (n_i < 0) n_i = len_i;
+            else if (n_i != len_i) { free(counts); return ray_error("length", "ungroup: nested columns disagree on row length, got %lld and %lld", (long long)n_i, (long long)len_i); }
+        }
+        if (n_i < 0) n_i = 0;
+        counts[i] = n_i;
+        total += n_i;
+    }
+
+    ray_t* idx = ray_vec_new(RAY_I64, total > 0 ? total : 1);
+    if (!idx || RAY_IS_ERR(idx)) { free(counts); return idx ? idx : ray_error("oom", NULL); }
+    idx->len = total;
+    int64_t* idxd = (int64_t*)ray_data(idx);
+    int64_t pos = 0;
+    for (int64_t i = 0; i < nrows; i++)
+        for (int64_t r = 0; r < counts[i]; r++) idxd[pos++] = i;
+
+    /* Rebuild every column, preserving names and order. */
+    ray_t* out = ray_table_new(ncols);
+    if (!out || RAY_IS_ERR(out)) { free(counts); ray_release(idx); return out ? out : ray_error("oom", NULL); }
+
+    for (int64_t c = 0; c < ncols; c++) {
+        ray_t* col = ray_table_get_col_idx(x, c);
+        int64_t name = ray_table_col_name(x, c);
+        ray_t* newcol;
+        if (col && !RAY_IS_ERR(col) && col->type == RAY_LIST) {
+            /* Nested: raze the per-row cells in row order. */
+            newcol = ray_raze_fn(col);
+            /* raze of an empty/all-empty list yields an empty LIST — leave
+             * it; the column is empty (total == 0) and shapes still align. */
+            /* Defensive: with the up-front nested-cell validation, the razed
+             * column length must equal the row count.  Convert any future
+             * invariant break into a clean error instead of a corrupt table. */
+            if (newcol && !RAY_IS_ERR(newcol) && ray_len(newcol) != total) {
+                ray_release(newcol); ray_release(out); ray_release(idx); free(counts);
+                return ray_error("length", "ungroup: razed column length mismatch, got %lld, expected %lld", (long long)ray_len(newcol), (long long)total);
+            }
+        } else if (col && !RAY_IS_ERR(col)) {
+            /* Flat: gather row i repeated n_i times. */
+            newcol = gather_by_idx(col, idxd, total);
+        } else {
+            ray_release(out); ray_release(idx); free(counts);
+            return ray_error("type", "ungroup: invalid column");
+        }
+        if (!newcol || RAY_IS_ERR(newcol)) {
+            ray_release(out); ray_release(idx); free(counts);
+            return newcol ? newcol : ray_error("oom", NULL);
+        }
+        ray_t* added = ray_table_add_col(out, name, newcol);
+        ray_release(newcol);
+        if (!added || RAY_IS_ERR(added)) {
+            ray_release(idx); free(counts);
+            return added ? added : ray_error("oom", NULL);
+        }
+        out = added;
+    }
+
+    ray_release(idx);
+    free(counts);
+    return out;
+}
+
 /* (within vals [lo hi]) -> bool vector, true where lo <= val <= hi */
 ray_t* ray_within_fn(ray_t* vals, ray_t* range) {
-    if (!ray_is_vec(vals) || !ray_is_vec(range) || range->len != 2)
-        return ray_error("type", NULL);
+    if (!ray_is_vec(vals) || !ray_is_vec(range))
+        return ray_error("type", "within: vals and range must be vectors, got %s and %s", ray_type_name(vals->type), ray_type_name(range->type));
+    if (range->len != 2)
+        return ray_error("length", "within: range must have 2 elements, got %lld", (long long)range->len);
     int64_t n = vals->len;
     ray_t* result = ray_vec_new(RAY_BOOL, n);
     if (RAY_IS_ERR(result)) return result;
@@ -3145,7 +3338,7 @@ ray_t* ray_within_fn(ray_t* vals, ray_t* range) {
         for (int64_t i = 0; i < n; i++) out[i] = (d[i] >= lo && d[i] <= hi);
     } else {
         ray_free(result);
-        return ray_error("type", NULL);
+        return ray_error("type", "within: unsupported value type %s", ray_type_name(vals->type));
     }
     result->len = n;
     return result;

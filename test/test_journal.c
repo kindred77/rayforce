@@ -2149,6 +2149,114 @@ static test_result_t test_journal_de_depth_limit(void) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
+ *  Purge — ray_journal_purge / .log.purge
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+/* Append one self-evaluating i64 entry to the open journal. */
+static bool purge_write_one(int64_t x) {
+    ray_t* v = ray_i64(x);
+    int64_t psize = ray_serde_size(v);
+    if (psize <= 0) { ray_release(v); return false; }
+    uint8_t* buf = (uint8_t*)ray_sys_alloc((size_t)psize);
+    if (!buf) { ray_release(v); return false; }
+    ray_ser_raw(buf, v);
+    ray_release(v);
+    ray_ipc_header_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.prefix  = RAY_SERDE_PREFIX;
+    hdr.version = RAY_SERDE_WIRE_VERSION;
+    hdr.size    = psize;
+    ray_err_t e = ray_journal_write_bytes(&hdr, buf, psize);
+    ray_sys_free(buf);
+    return e == RAY_OK;
+}
+
+/* True iff at least one rolled archive (base.<stamp>.log) exists. */
+static bool archive_exists(const char* base) {
+    char cmd[1200];
+    snprintf(cmd, sizeof(cmd), "test -n \"$(ls '%s'.*.log 2>/dev/null)\"", base);
+    return system(cmd) == 0;
+}
+
+/* P1. Full purge while the journal is OPEN: closes it, unlinks the active
+ * .log, every rolled .<stamp>.log archive, the .qdb snapshot, and resets
+ * state so a second purge has nothing to act on. */
+static test_result_t test_journal_purge_full(void) {
+    char base[256]; make_base(base, sizeof(base), "purge_full");
+    char lpath[270]; log_path(lpath, sizeof(lpath), base);
+    char qpath[270]; qdb_path(qpath, sizeof(qpath), base);
+
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    TEST_ASSERT_TRUE(purge_write_one(1));
+    TEST_ASSERT_EQ_I(ray_journal_roll(), RAY_OK);        /* -> one archive */
+    TEST_ASSERT_TRUE(purge_write_one(2));
+    TEST_ASSERT_EQ_I(ray_journal_snapshot(), RAY_OK);    /* -> .qdb (+ archive) */
+
+    /* Footprint exists before purge. */
+    TEST_ASSERT_EQ_I(access(lpath, F_OK), 0);
+    TEST_ASSERT_EQ_I(access(qpath, F_OK), 0);
+    TEST_ASSERT_TRUE(archive_exists(base));
+
+    /* Purge while open: must close + remove everything. */
+    TEST_ASSERT_TRUE(ray_journal_is_open());
+    TEST_ASSERT_EQ_I(ray_journal_purge(), RAY_OK);
+    TEST_ASSERT_FALSE(ray_journal_is_open());
+
+    TEST_ASSERT_EQ_I(access(lpath, F_OK), -1);
+    TEST_ASSERT_EQ_I(access(qpath, F_OK), -1);
+    TEST_ASSERT_FALSE(archive_exists(base));
+
+    /* State was reset: a second purge has no base to act on. */
+    TEST_ASSERT_EQ_I(ray_journal_purge(), RAY_ERR_DOMAIN);
+
+    cleanup_base(base);
+    PASS();
+}
+
+/* P2. The issue #279 workflow: open, write, close, then purge WITHOUT
+ * re-passing the path — the base survives .log.close. */
+static test_result_t test_journal_purge_after_close(void) {
+    char base[256]; make_base(base, sizeof(base), "purge_close");
+    char lpath[270]; log_path(lpath, sizeof(lpath), base);
+
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    TEST_ASSERT_TRUE(purge_write_one(42));
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    TEST_ASSERT_EQ_I(access(lpath, F_OK), 0);    /* log still on disk */
+
+    /* Purge after close still finds the base and removes the log. */
+    TEST_ASSERT_EQ_I(ray_journal_purge(), RAY_OK);
+    TEST_ASSERT_EQ_I(access(lpath, F_OK), -1);
+
+    cleanup_base(base);
+    PASS();
+}
+
+/* P3. ops wrapper: (.log.purge) returns null on success and a `domain`
+ * error when no journal base is known. */
+static test_result_t test_journal_purge_ops_wrapper(void) {
+    char base[256]; make_base(base, sizeof(base), "purge_ops");
+
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    TEST_ASSERT_TRUE(purge_write_one(7));
+
+    ray_t* r = ray_log_purge_fn(NULL, 0);   /* null on success */
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    TEST_ASSERT_FALSE(ray_journal_is_open());
+
+    /* Base reset -> wrapper surfaces a domain error. */
+    ray_t* e = ray_log_purge_fn(NULL, 0);
+    TEST_ASSERT_TRUE(e != NULL && RAY_IS_ERR(e));
+    TEST_ASSERT_STR_EQ(ray_err_code(e), "domain");
+    ray_error_free(e);
+
+    cleanup_base(base);
+    PASS();
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
  *  Registration
  * ═══════════════════════════════════════════════════════════════════════ */
 
@@ -2247,5 +2355,9 @@ const test_entry_t journal_entries[] = {
     /* Open opens for append only — no replay */
     { "journal/open_does_not_replay",      test_journal_open_does_not_replay,      jrn_setup, jrn_teardown },
     { "journal/de_depth_limit",            test_journal_de_depth_limit,            jrn_setup, jrn_teardown },
+    /* Purge — close + unlink the whole journal footprint */
+    { "journal/purge_full",                test_journal_purge_full,                jrn_setup, jrn_teardown },
+    { "journal/purge_after_close",         test_journal_purge_after_close,         jrn_setup, jrn_teardown },
+    { "journal/purge_ops_wrapper",         test_journal_purge_ops_wrapper,         jrn_setup, jrn_teardown },
     { NULL, NULL, NULL, NULL },
 };

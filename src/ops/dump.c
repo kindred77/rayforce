@@ -33,6 +33,16 @@ static ray_op_ext_t* find_ext(ray_graph_t* g, uint32_t node_id) {
     return NULL;
 }
 
+/* Local node-id accessors (this TU includes neither ops/internal.h nor
+ * ops/opt.h, and it carries its own find_ext above, so we mirror the
+ * internal.h helpers rather than risk a find_ext redefinition). */
+static inline ray_op_t* op_node(ray_graph_t* g, uint32_t id) {
+    return id == RAY_OP_NONE ? NULL : &g->nodes[id];
+}
+static inline ray_op_t* op_child(ray_graph_t* g, const ray_op_t* op, int i) {
+    return op_node(g, op->in_id[i]);
+}
+
 const char* ray_opcode_name(uint16_t op) {
     switch (op) {
         case OP_SCAN:          return "SCAN";
@@ -93,13 +103,6 @@ const char* ray_opcode_name(uint16_t op) {
         case OP_FILTER:        return "FILTER";
         case OP_SORT:          return "SORT";
         case OP_GROUP:         return "GROUP";
-        case OP_GROUP_TOPK_ROWFORM: return "GROUP_TOPK_ROWFORM";
-        case OP_GROUP_BOTK_ROWFORM: return "GROUP_BOTK_ROWFORM";
-        case OP_GROUP_PEARSON_ROWFORM: return "GROUP_PEARSON_ROWFORM";
-        case OP_GROUP_MAXMIN_ROWFORM: return "GROUP_MAXMIN_ROWFORM";
-        case OP_GROUP_MEDIAN_STDDEV_ROWFORM: return "GROUP_MEDIAN_STDDEV_ROWFORM";
-        case OP_GROUP_SUM_COUNT_ROWFORM: return "GROUP_SUM_COUNT_ROWFORM";
-        case OP_FILTERED_GROUP:return "FILTERED_GROUP";
         case OP_PIVOT:         return "PIVOT";
         case OP_ANTIJOIN:      return "ANTIJOIN";
         case OP_JOIN:          return "JOIN";
@@ -236,27 +239,27 @@ static void dump_node(FILE* f, ray_graph_t* g, ray_op_t* node, int depth) {
             if (ext) {
                 /* keys */
                 for (uint8_t i = 0; i < ext->n_keys; i++)
-                    dump_node(f, g, ext->keys[i], depth + 1);
+                    dump_node(f, g, op_node(g, ext->keys[i]), depth + 1);
                 /* agg inputs */
                 for (uint8_t i = 0; i < ext->n_aggs; i++)
-                    dump_node(f, g, ext->agg_ins[i], depth + 1);
+                    dump_node(f, g, op_node(g, ext->agg_ins[i]), depth + 1);
             }
             /* Also recurse into standard inputs */
             for (uint8_t i = 0; i < node->arity && i < 2; i++)
-                dump_node(f, g, node->inputs[i], depth + 1);
+                dump_node(f, g, op_child(g, node, i), depth + 1);
             break;
         case OP_SORT:
         case OP_SELECT:
             if (ext) {
                 for (uint8_t i = 0; i < ext->sort.n_cols; i++)
-                    dump_node(f, g, ext->sort.columns[i], depth + 1);
+                    dump_node(f, g, op_node(g, ext->sort.columns[i]), depth + 1);
             }
             for (uint8_t i = 0; i < node->arity && i < 2; i++)
-                dump_node(f, g, node->inputs[i], depth + 1);
+                dump_node(f, g, op_child(g, node, i), depth + 1);
             break;
         default:
             for (uint8_t i = 0; i < node->arity && i < 2; i++)
-                dump_node(f, g, node->inputs[i], depth + 1);
+                dump_node(f, g, op_child(g, node, i), depth + 1);
             break;
     }
 }

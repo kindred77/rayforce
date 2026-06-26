@@ -501,3 +501,68 @@
 ;; A body-position term that evaluates successfully to a non-i64/sym
 ;; (a list literal here) trips the unsupported-constant-type guard.
 (query Db (find ?e) (where (?e :age 30) (some-rel ?e [1 2 3]))) !- type
+
+;; ════════════════════════ §2.8 review: OOB / silent-drop guards ═════════════════════════
+;; These pin the memory-safety + loud-error fixes for the datalog defect cluster.
+;; Each path was OOB / silently-dropping before the fix; ASAN proves the fix is bounded.
+(set DbG (datoms))
+(set DbG (assert-fact DbG 1 'age 30))
+
+;; --- Claim 3: >16 comparison clauses must error loudly, not silently drop ---
+;; DL_MAX_BODY=16: triple (1) + 16 cmp = 17 body literals.
+(query DbG (find ?e) (where (?e :age ?a) (> ?a 0) (> ?a 1) (> ?a 2) (> ?a 3) (> ?a 4) (> ?a 5) (> ?a 6) (> ?a 7) (> ?a 8) (> ?a 9) (> ?a 10) (> ?a 11) (> ?a 12) (> ?a 13) (> ?a 14) (> ?a 15))) !- domain
+;; 15 cmp (16 body literals total) is the limit and still works.
+(count (query DbG (find ?e) (where (?e :age ?a) (> ?a 0) (> ?a 1) (> ?a 2) (> ?a 3) (> ?a 4) (> ?a 5) (> ?a 6) (> ?a 7) (> ?a 8) (> ?a 9) (> ?a 10) (> ?a 11) (> ?a 12) (> ?a 13) (> ?a 14)))) -- 1
+
+;; --- Claim 3 (assign): >16 assignment clauses must error loudly ---
+(query DbG (find ?e) (where (?e :age ?a) (= ?v0 (+ ?a 1)) (= ?v1 (+ ?a 1)) (= ?v2 (+ ?a 1)) (= ?v3 (+ ?a 1)) (= ?v4 (+ ?a 1)) (= ?v5 (+ ?a 1)) (= ?v6 (+ ?a 1)) (= ?v7 (+ ?a 1)) (= ?v8 (+ ?a 1)) (= ?v9 (+ ?a 1)) (= ?v10 (+ ?a 1)) (= ?v11 (+ ?a 1)) (= ?v12 (+ ?a 1)) (= ?v13 (+ ?a 1)) (= ?v14 (+ ?a 1)) (= ?v15 (+ ?a 1)))) !- domain
+
+;; --- Claim 3b: head arity > DL_MAX_ARITY(16) must error, not OOB-write ---
+(rule (big-head ?v0 ?v1 ?v2 ?v3 ?v4 ?v5 ?v6 ?v7 ?v8 ?v9 ?v10 ?v11 ?v12 ?v13 ?v14 ?v15 ?v16) (?v0 :age 30)) !- domain
+;; --- Claim 3b: body atom arity > DL_MAX_ARITY(16) must error, not OOB-write ---
+(query DbG (find ?v0) (where (big-body ?v0 ?v1 ?v2 ?v3 ?v4 ?v5 ?v6 ?v7 ?v8 ?v9 ?v10 ?v11 ?v12 ?v13 ?v14 ?v15 ?v16)) (rules ((big-body ?v0 ?v1 ?v2 ?v3 ?v4 ?v5 ?v6 ?v7 ?v8 ?v9 ?v10 ?v11 ?v12 ?v13 ?v14 ?v15 ?v16) (?v0 :age 30)))) !- domain
+
+;; --- Claim 2: >256 wildcard vars must error, not OOB-write past the 256-slot map ---
+;; 16 body atoms x 16 wildcards = 256, plus head ?x = 257 > 256.
+(query DbG (find ?x) (where (h ?x)) (rules ((h ?x) (r0 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _) (r1 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _) (r2 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _) (r3 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _) (r4 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _) (r5 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _) (r6 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _) (r7 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _) (r8 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _) (r9 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _) (r10 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _) (r11 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _) (r12 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _) (r13 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _) (r14 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _) (r15 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _)))) !- domain
+
+;; --- Claim 1: > DL_MAX_STRATA(16) strata must error, not OOB-read the strata array ---
+;; 16 strata is the limit and stratifies cleanly (0 rows here).
+(count (query DbG (find ?x) (where (r15 ?x)) (rules ((r0 ?x) (?x :age ?y)) ((r1 ?x) (?x :age ?y) (not (r0 ?x))) ((r2 ?x) (?x :age ?y) (not (r1 ?x))) ((r3 ?x) (?x :age ?y) (not (r2 ?x))) ((r4 ?x) (?x :age ?y) (not (r3 ?x))) ((r5 ?x) (?x :age ?y) (not (r4 ?x))) ((r6 ?x) (?x :age ?y) (not (r5 ?x))) ((r7 ?x) (?x :age ?y) (not (r6 ?x))) ((r8 ?x) (?x :age ?y) (not (r7 ?x))) ((r9 ?x) (?x :age ?y) (not (r8 ?x))) ((r10 ?x) (?x :age ?y) (not (r9 ?x))) ((r11 ?x) (?x :age ?y) (not (r10 ?x))) ((r12 ?x) (?x :age ?y) (not (r11 ?x))) ((r13 ?x) (?x :age ?y) (not (r12 ?x))) ((r14 ?x) (?x :age ?y) (not (r13 ?x))) ((r15 ?x) (?x :age ?y) (not (r14 ?x)))))) -- 0
+;; 17 strata exceeds DL_MAX_STRATA -> loud error (was OOB read of strata[]).
+(query DbG (find ?x) (where (r16 ?x)) (rules ((r0 ?x) (?x :age ?y)) ((r1 ?x) (?x :age ?y) (not (r0 ?x))) ((r2 ?x) (?x :age ?y) (not (r1 ?x))) ((r3 ?x) (?x :age ?y) (not (r2 ?x))) ((r4 ?x) (?x :age ?y) (not (r3 ?x))) ((r5 ?x) (?x :age ?y) (not (r4 ?x))) ((r6 ?x) (?x :age ?y) (not (r5 ?x))) ((r7 ?x) (?x :age ?y) (not (r6 ?x))) ((r8 ?x) (?x :age ?y) (not (r7 ?x))) ((r9 ?x) (?x :age ?y) (not (r8 ?x))) ((r10 ?x) (?x :age ?y) (not (r9 ?x))) ((r11 ?x) (?x :age ?y) (not (r10 ?x))) ((r12 ?x) (?x :age ?y) (not (r11 ?x))) ((r13 ?x) (?x :age ?y) (not (r12 ?x))) ((r14 ?x) (?x :age ?y) (not (r13 ?x))) ((r15 ?x) (?x :age ?y) (not (r14 ?x))) ((r16 ?x) (?x :age ?y) (not (r15 ?x))))) !- domain
+
+;; --- Claim 5: dl-program handle must be freeable; idempotent; UAF-safe ---
+(set FP (dl-program))
+(set FE (table ['from 'to] (list [1 2 3] [2 3 4])))
+(dl-add-edb FP 'edge FE 2) -- true
+(dl-eval FP) -- true
+(dl-free FP) -- true
+;; second free is idempotent (no double-free)
+(dl-free FP) -- false
+;; use-after-free: handle zeroed -> clean type error, not a crash
+(dl-query FP 'edge) !- type
+(dl-free 'notprog) !- type
+
+
+;; --- Claim 4: fixpoint non-convergence must error loudly, not return a partial result ---
+;; Reachability over a linear chain needs ~N iterations. The loop caps at 1000.
+(set DbF (datoms))
+(set seedF (table ['n] (list [0])))
+;; 500-edge chain converges (~500 iters < 1000) -> correct count.
+(set edge500 (table ['from 'to] (list (til 500) (+ (til 500) 1))))
+(count (query DbF (find ?y) (where (reachA ?y)) (rules ((reachA ?y) (seedF ?x) (edge500 ?x ?y)) ((reachA ?y) (reachA ?x) (edge500 ?x ?y))))) -- 500
+;; 1100-edge chain needs >1000 iters -> non-convergence -> loud error (was silent partial).
+(set edge1100 (table ['from 'to] (list (til 1100) (+ (til 1100) 1))))
+(query DbF (find ?y) (where (reachB ?y)) (rules ((reachB ?y) (seedF ?x) (edge1100 ?x ?y)) ((reachB ?y) (reachB ?x) (edge1100 ?x ?y)))) !- domain
+
+;; --- Claim 7: repeated-variable self-join (?x :edge ?x) returns only self-loops ---
+;; Verified-correct behavior (review flagged as possibly asymmetric; it is not).
+(set DbSJ (datoms))
+(set DbSJ (assert-fact DbSJ 1 'edge 1))
+(set DbSJ (assert-fact DbSJ 1 'edge 2))
+(set DbSJ (assert-fact DbSJ 2 'edge 2))
+(set DbSJ (assert-fact DbSJ 3 'edge 3))
+;; self-loops are 1->1, 2->2, 3->3; 1->2 is excluded.
+(asc (at (query DbSJ (find ?x) (where (?x :edge ?x))) '?x)) -- [1 2 3]
+(count (query DbSJ (find ?x) (where (?x :edge ?x)))) -- 3

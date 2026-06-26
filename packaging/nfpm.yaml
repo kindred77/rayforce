@@ -1,0 +1,32 @@
+# nfpm config — produces the Rayforce .deb.
+#
+# Driven by .github/workflows/release.yml on the Linux build, which first
+# rebuilds a PORTABLE binary (`make release RAY_MARCH=x86-64-v3`, NOT the
+# default -march=native) so the package runs on any modern x86-64 CPU, then
+# runs `nfpm pkg --packager deb`.  $RAY_VERSION is expanded from the env.
+#
+# To also emit .rpm / .apk later, just run nfpm with --packager rpm / apk
+# (same config) — no changes needed here.
+name: "rayforce"
+arch: "amd64"
+platform: "linux"
+version: "${RAY_VERSION}"
+maintainer: "Anton Kundenko <anton.kundenko@gmail.com>"
+description: |
+  Embeddable columnar analytics and graph traversal engine in pure C.
+  Built-in Rayfall query language, IPC, datalog, and vector search. Zero deps.
+vendor: "RayforceDB"
+homepage: "https://rayforcedb.com/"
+license: "MIT"
+section: "database"
+priority: "optional"
+
+contents:
+  - src: ./rayforce
+    dst: /usr/bin/rayforce
+  - src: ./include/rayforce.h
+    dst: /usr/include/rayforce.h
+  - src: ./LICENSE
+    dst: /usr/share/doc/rayforce/copyright
+  - src: ./README.md
+    dst: /usr/share/doc/rayforce/README.md

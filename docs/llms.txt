@@ -1,6 +1,6 @@
 # Rayforce
 
-Rayforce is an embeddable columnar analytics and graph traversal engine written in pure C17 with zero external dependencies. It combines morsel-driven vectorized execution, a multi-pass query optimizer, and a native CSR graph engine in a single pipeline. Rayforce is queried through the Rayfall language, exposes a C API for embedding, and targets Linux, macOS, and Windows (WSL) environments.
+Rayforce is an embeddable columnar analytics and graph traversal engine written in pure C with zero external dependencies. It combines morsel-driven vectorized execution, a multi-pass query optimizer, and a native CSR graph engine in a single pipeline. Rayforce is queried through the Rayfall language, exposes a C API for embedding, and targets Linux, macOS, and Windows (WSL) environments.
 
 License: MIT. Author: Anton Kundenko. Source: https://github.com/RayforceDB/rayforce
 

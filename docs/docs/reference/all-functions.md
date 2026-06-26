@@ -140,8 +140,8 @@ Functions that take other functions as arguments for mapping, folding, and filte
 | `scan-right` | variadic | — | Right-to-left running fold | `(scan-right + (enlist 1 2 3))` → `[6 5 3]` |
 | `filter` | binary | — | Keep elements where boolean mask is true | `(filter [1 2 3 4] (> [1 2 3 4] 2))` → `[3 4]` |
 | `apply` | variadic | — | Zip-apply function pairwise over lists | `(apply + (enlist 1 2) (enlist 3 4))` → `[4 6]` |
-| `map-left` | variadic | — | Map with left argument fixed | `(map-left + 10 [1 2 3])` → `[11 12 13]` |
-| `map-right` | variadic | — | Map with right argument fixed | `(map-right - [10 20 30] 5)` → `[5 15 25]` |
+| `map-left` | variadic | — | Map each element of the left over the whole right | `(map-left + 10 [1 2 3])` → `[11 12 13]` |
+| `map-right` | variadic | — | Map the whole left over each element of the right | `(map-right - [10 20 30] 5)` → `[5 15 25]` |
 
 ```lisp
 ; Transform each row with map
@@ -231,7 +231,7 @@ Special forms receive their arguments unevaluated. These are the core language p
 | `if` | variadic | special | Conditional: (if cond then else) | `(if (> x 0) "pos" "neg")` |
 | `do` | variadic | special | Sequential execution, returns last value | `(do (set x 1) (set y 2) (+ x y))` |
 | `fn` | variadic | special | Create lambda function | `(fn [x y] (+ x y))` |
-| `try` | binary | special | Error handling: (try expr handler-fn) | `(try (/ 1 0) (fn [e] 0))` |
+| `try` | binary | special | Error handling: (try expr handler-fn-or-fallback-value) | `(try (/ 1 0) (fn [e] 0))` |
 | `raise` | unary | — | Throw an error with message | `(raise "bad input")` |
 | `return` | unary | — | Early return from function body | `(return 42)` |
 | `quote` | variadic | special | Return argument unevaluated; a bare name yields a literal symbol (`(quote x)` ≡ `'x`) | `(quote (+ 1 2))` → `(+ 1 2)` |
@@ -513,6 +513,8 @@ Persistent columnar storage — splayed (one file per column) and partitioned ta
 | `.db.splayed.set` | variadic | restricted | Save table as splayed columns to a directory | `(.db.splayed.set "db/trades" trades)` |
 | `.db.splayed.get` | variadic | — | Load splayed table from a directory | `(.db.splayed.get "db/trades")` |
 | `.db.parted.get` | variadic | — | Load partitioned table from root directory | `(.db.parted.get "db" 'trades)` |
+| `.db.parted.tables` | variadic | — | List table names under a parted root (from the most recent partition) | `(.db.parted.tables "db")` |
+| `.db.parted.fill` | variadic | restricted | Backfill missing tables across a parted db's partitions | `(.db.parted.fill "db")` |
 
 ```lisp
 ; Save and reload a splayed table
@@ -530,7 +532,7 @@ TCP-based IPC for connecting to remote Rayforce instances. Uses binary serializa
 
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
-| `.ipc.open` | unary | restricted | Open TCP connection to host:port, returns handle | `(.ipc.open "localhost:5000")` |
+| `.ipc.open` | variadic | restricted | Open TCP connection to host:port (optional connect timeout in ms), returns handle | `(.ipc.open "localhost:5000" 2000)` |
 | `.ipc.close` | unary | restricted | Close an IPC connection handle | `(.ipc.close h)` |
 | `.ipc.send` | binary | restricted | Send a value over an IPC handle (sync request) | `(.ipc.send h "(sum (til 100))")` |
 | `.ipc.handle` | variadic | — | Current connection handle inside any `.ipc.on.*` hook, `-1` outside | `(.ipc.handle)` |
