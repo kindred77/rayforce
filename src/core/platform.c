@@ -315,6 +315,15 @@ void ray_vm_unmap_file(void* ptr, size_t size) {
     if (ptr) UnmapViewOfFile(ptr);
 }
 
+/* MinGW-w64 may not define WIN32_MEMORY_RANGE_ENTRY even when targeting
+ * modern Windows.  We load PrefetchVirtualMemory at runtime, so only the
+ * struct layout is needed at compile time. */
+#ifndef WIN32_MEMORY_RANGE_ENTRY
+typedef struct WIN32_MEMORY_RANGE_ENTRY {
+    PVOID VirtualAddress;
+    SIZE_T NumberOfBytes;
+} WIN32_MEMORY_RANGE_ENTRY, *PWIN32_MEMORY_RANGE_ENTRY;
+#endif
 typedef BOOL(WINAPI *PFN_PrefetchVirtualMemory)(
     HANDLE hProcess,
     ULONG_PTR NumberOfEntries,
