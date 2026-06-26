@@ -31,7 +31,6 @@
 
 #include "mem/sys.h"
 #include "core/timer.h"
-
 #define RAY_POLL_MAX_EVENTS 64
 #define RAY_POLL_INITIAL_CAP 16
 
@@ -42,6 +41,71 @@ typedef struct {
     char buf[4096];
 } ray_iocp_ov_t;
 
+
+#include <stddef.h>  /* offsetof */
+
+/* ===== Stdin reader thread =====
+ *
+ * On Windows, stdin is a console handle, not a socket.  Console handles
+ * cannot be associated with an I/O Completion Port via CreateIoCompletionPort,
+ * and WSARecv does not work on them.  Instead, for RAY_SEL_STDIN selectors
+ * we launch a background thread that reads one byte at a time from the
+ * console and posts each byte to the IOCP via PostQueuedCompletionStatus.
+ *
+ * The completion handler in ray_poll_run reads the byte from ov->buf[0],
+ * places it in sel->rx.buf (a 16-byte staging buffer), and calls
+ * sel->rx.read_fn (repl_read) which picks it up from there.
+ */
+
+/* Per-stdin context: one per RAY_SEL_STDIN registration.  The ov struct is
+ * dynamically allocated and freed for each completion (see the reader thread
+ * and the completion handler), so there is no data-race on ov->buf. */
+typedef struct {
+    HANDLE      thread;      /* reader thread handle */
+    HANDLE      stop_event;  /* signaled -> thread must exit */
+    HANDLE      h_stdin;     /* console input handle */
+    HANDLE      input_consumed; /* auto-reset event: main thread signals after reading */
+    ray_poll_t* poll;
+    ray_selector_t* sel;
+} ray_stdin_ctx_t;
+
+static DWORD WINAPI ray_stdin_reader_fn(LPVOID param) {
+    ray_stdin_ctx_t* ctx = (ray_stdin_ctx_t*)param;
+    HANDLE handles[2];
+    handles[0] = ctx->stop_event;
+    handles[1] = ctx->h_stdin;
+
+    for (;;) {
+        DWORD wait = WaitForMultipleObjects(2, handles, FALSE, INFINITE);
+        if (wait == WAIT_OBJECT_0)      /* stop_event */ break;
+        if (wait != WAIT_OBJECT_0 + 1)  /* error */      break;
+
+        /* Console input available — post a wake-up completion to the IOCP.
+         * The main thread's completion handler will call repl_read which
+         * reads from the console directly via ray_term_getc -> ReadFile. */
+        ray_iocp_ov_t* ov = (ray_iocp_ov_t*)ray_sys_alloc(sizeof(ray_iocp_ov_t));
+        if (!ov) break;
+        ZeroMemory(ov, sizeof(*ov));
+        ov->sel = ctx->sel;
+
+        if (!PostQueuedCompletionStatus(
+                (HANDLE)ctx->poll->fd, 1,
+                (ULONG_PTR)ctx->sel,
+                &ov->overlapped)) {
+            ray_sys_free(ov);
+            break;
+        }
+
+        /* Wait for the main thread to consume the input */
+        {
+            HANDLE postHandles[2] = { ctx->stop_event, ctx->input_consumed };
+            DWORD wait2 = WaitForMultipleObjects(2, postHandles, FALSE, INFINITE);
+            if (wait2 == WAIT_OBJECT_0)      /* stop_event */ break;
+            if (wait2 != WAIT_OBJECT_0 + 1)  /* error */      break;
+        }
+    }
+    return 0;
+}
 ray_poll_t* ray_poll_create(void) {
     HANDLE iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
     if (iocp == NULL) {
@@ -77,11 +141,24 @@ void ray_poll_destroy(ray_poll_t* poll) {
         ray_selector_t* sel = poll->sels[i];
         if (!sel) continue;
 
-        if (sel->close_fn)
-            sel->close_fn(poll, sel);
-
-        if ((SOCKET)sel->fd != INVALID_SOCKET)
-            closesocket((SOCKET)sel->fd);
+        if (sel->type == RAY_SEL_STDIN) {
+            ray_stdin_ctx_t* sctx = (ray_stdin_ctx_t*)sel->tx.buf;
+            if (sctx) {
+                SetEvent(sctx->stop_event);
+                if (sctx->thread) {
+                    CancelIoEx(sctx->h_stdin, NULL);
+                    WaitForSingleObject(sctx->thread, INFINITE);
+                    CloseHandle(sctx->thread);
+                }
+                CloseHandle(sctx->stop_event);
+                ray_sys_free(sctx);
+            }
+        } else {
+            if (sel->close_fn)
+                sel->close_fn(poll, sel);
+            if ((SOCKET)sel->fd != INVALID_SOCKET)
+                closesocket((SOCKET)sel->fd);
+        }
 
         if (sel->rx.buf)
             ray_poll_buf_free(sel->rx.buf);
@@ -174,6 +251,61 @@ int64_t ray_poll_register(ray_poll_t* poll, ray_poll_reg_t* reg) {
 
     poll->sels[id] = sel;
 
+    if (reg->type == RAY_SEL_STDIN) {
+        /* Stdin is a console handle -- can't use IOCP socket association.
+         * Launch a reader thread that reads from stdin and posts bytes
+         * to the IOCP via PostQueuedCompletionStatus. */
+        if (sel->rx.buf == NULL)
+            sel->rx.buf = ray_poll_buf_new(16);
+
+        ray_stdin_ctx_t* sctx = (ray_stdin_ctx_t*)ray_sys_alloc(sizeof(ray_stdin_ctx_t));
+        if (!sctx) {
+            poll->sels[id] = NULL;
+            ray_sys_free(sel);
+            return -1;
+        }
+        memset(sctx, 0, sizeof(*sctx));
+
+        sctx->poll = poll;
+        sctx->sel  = sel;
+        sctx->h_stdin = GetStdHandle(STD_INPUT_HANDLE);
+        sctx->stop_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+        if (!sctx->stop_event) {
+            ray_sys_free(sctx);
+            poll->sels[id] = NULL;
+            ray_sys_free(sel);
+            return -1;
+        }
+        sctx->input_consumed = CreateEvent(NULL, FALSE, FALSE, NULL);
+        if (!sctx->input_consumed) {
+            CloseHandle(sctx->stop_event);
+            ray_sys_free(sctx);
+            sel->tx.buf = NULL;
+            poll->sels[id] = NULL;
+            ray_sys_free(sel);
+            return -1;
+        }
+
+        /* Store context pointer in sel->tx.buf (unused for stdin). */
+        sel->tx.buf = (ray_poll_buf_t*)sctx;
+
+        sctx->thread = CreateThread(NULL, 0, ray_stdin_reader_fn, sctx, 0, NULL);
+        if (!sctx->thread) {
+            CloseHandle(sctx->stop_event);
+            CloseHandle(sctx->input_consumed);
+            ray_sys_free(sctx);
+            sel->tx.buf = NULL;
+            poll->sels[id] = NULL;
+            ray_sys_free(sel);
+            return -1;
+        }
+
+        if (sel->open_fn)
+            sel->open_fn(poll, sel);
+
+        return id;
+    }
+
     HANDLE ret = CreateIoCompletionPort((HANDLE)sel->fd, (HANDLE)poll->fd, (ULONG_PTR)sel, 0);
     if (ret == NULL) {
         poll->sels[id] = NULL;
@@ -198,11 +330,26 @@ void ray_poll_deregister(ray_poll_t* poll, int64_t id) {
     ray_selector_t* sel = poll->sels[id];
     if (!sel) return;
 
-    if (sel->close_fn)
-        sel->close_fn(poll, sel);
-
-    if ((SOCKET)sel->fd != INVALID_SOCKET)
-        closesocket((SOCKET)sel->fd);
+    if (sel->type == RAY_SEL_STDIN) {
+        ray_stdin_ctx_t* sctx = (ray_stdin_ctx_t*)sel->tx.buf;
+        if (sctx) {
+            SetEvent(sctx->stop_event);
+            if (sctx->thread) {
+                CancelIoEx(sctx->h_stdin, NULL);
+                WaitForSingleObject(sctx->thread, INFINITE);
+                CloseHandle(sctx->thread);
+            }
+            CloseHandle(sctx->stop_event);
+            CloseHandle(sctx->input_consumed);
+            ray_sys_free(sctx);
+            sel->tx.buf = NULL;
+        }
+    } else {
+        if (sel->close_fn)
+            sel->close_fn(poll, sel);
+        if ((SOCKET)sel->fd != INVALID_SOCKET)
+            closesocket((SOCKET)sel->fd);
+    }
 
     if (sel->rx.buf)
         ray_poll_buf_free(sel->rx.buf);
@@ -252,6 +399,12 @@ int64_t ray_poll_run(ray_poll_t* poll) {
         }
 
         if (bytes_xfer == 0) {
+            if (sel->type == RAY_SEL_STDIN) {
+                if (sel->error_fn)
+                    sel->error_fn(poll, sel);
+                ray_sys_free(ov);
+                goto fire_timer;
+            }
             if (sel->error_fn)
                 sel->error_fn(poll, sel);
             else
@@ -260,6 +413,40 @@ int64_t ray_poll_run(ray_poll_t* poll) {
             goto fire_timer;
         }
 
+        /* ===== Stdin completion =====
+         * The reader thread posted a wake-up completion — console input is
+         * available.  repl_read -> ray_term_getc -> ReadFile reads the byte
+         * directly from the console handle.  After repl_read returns, signal
+         * the reader thread to continue waiting for the next keystroke. */
+        if (sel->type == RAY_SEL_STDIN) {
+            if (sel->rx.read_fn) {
+                ray_t* obj = sel->rx.read_fn(poll, sel);
+
+                if (eid >= poll->n_sels || poll->sels[eid] != sel) {
+                    ray_sys_free(ov);
+                    goto fire_timer;
+                }
+
+                if (obj && sel->data_fn)
+                    sel->data_fn(poll, sel, obj);
+
+                if (eid >= poll->n_sels || poll->sels[eid] != sel) {
+                    ray_sys_free(ov);
+                    goto fire_timer;
+                }
+            }
+
+            /* Signal the reader thread that input was consumed */
+            {
+                ray_stdin_ctx_t* sctx = (ray_stdin_ctx_t*)sel->tx.buf;
+                if (sctx) SetEvent(sctx->input_consumed);
+            }
+
+            ray_sys_free(ov);
+            goto fire_timer;
+        }
+
+        /* ===== Normal socket completion ===== */
         if (sel->rx.buf && sel->rx.recv_fn) {
             size_t copy_len = bytes_xfer;
             size_t off = sel->rx.buf->offset;
