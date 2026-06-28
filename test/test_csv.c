@@ -572,7 +572,11 @@ static test_result_t test_csv_explicit_str_schema(void) {
     s = ray_str_vec_get(note, 1, &l);
     TEST_ASSERT_EQ_I((int)l, 35);
     TEST_ASSERT_MEM_EQ(35, s, "this-is-a-long-string-over-12-bytes");
-    TEST_ASSERT_TRUE(ray_vec_is_null(note, 2));
+    /* A blank CSV field for a STR column is the empty string "" (a value),
+     * not a null — consistent with SYM and with DuckDB's CSV semantics. */
+    TEST_ASSERT_FALSE(ray_vec_is_null(note, 2));
+    s = ray_str_vec_get(note, 2, &l);
+    TEST_ASSERT_EQ_I((int)l, 0);
     s = ray_str_vec_get(note, 3, &l);
     TEST_ASSERT_EQ_I((int)l, 4);
     TEST_ASSERT_MEM_EQ(4, s, "tiny");
