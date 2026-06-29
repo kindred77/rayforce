@@ -1655,6 +1655,60 @@ static test_result_t test_str_vec_from_parts(void) {
     PASS();
 }
 
+/* 12-byte string == RAY_STR_INLINE_MAX → must inline; 13-byte → must pool */
+static test_result_t test_str_vec_from_parts_boundary(void) {
+    ray_heap_init();
+    const char* s12 = "abcdefghijkl";   /* exactly 12 bytes */
+    const char* s13 = "abcdefghijklm";  /* exactly 13 bytes — must pool */
+    const char* ptrs[] = { s12, s13 };
+    uint32_t    lens[] = { 12, 13 };
+    ray_t* v = ray_str_vec_from_parts(ptrs, lens, NULL, 2);
+    TEST_ASSERT_NOT_NULL(v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    TEST_ASSERT_EQ_I(v->len, 2);
+    size_t l; const char* p;
+    p = ray_str_vec_get(v, 0, &l);
+    TEST_ASSERT_EQ_U(l, 12);
+    TEST_ASSERT_EQ_I(memcmp(p, s12, 12), 0);
+    /* inline element: no pool should be needed for a 12-byte string */
+    p = ray_str_vec_get(v, 1, &l);
+    TEST_ASSERT_EQ_U(l, 13);
+    TEST_ASSERT_EQ_I(memcmp(p, s13, 13), 0);
+    TEST_ASSERT_NOT_NULL(v->str_pool); /* 13-byte string must use pool */
+    ray_release(v);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* n==0 must return a valid zero-length STR vec with no crash */
+static test_result_t test_str_vec_from_parts_empty(void) {
+    ray_heap_init();
+    ray_t* v = ray_str_vec_from_parts(NULL, NULL, NULL, 0);
+    TEST_ASSERT_NOT_NULL(v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    TEST_ASSERT_EQ_I(v->len, 0);
+    ray_release(v);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* nulls==NULL path: no null array supplied, elements treated as non-null */
+static test_result_t test_str_vec_from_parts_no_nulls(void) {
+    ray_heap_init();
+    const char* ptrs[] = { "hello", "world_long_pooled_str" };
+    uint32_t    lens[] = { 5, 21 };
+    ray_t* v = ray_str_vec_from_parts(ptrs, lens, NULL, 2);
+    TEST_ASSERT_NOT_NULL(v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    TEST_ASSERT_EQ_I(v->len, 2);
+    size_t l; const char* p;
+    p = ray_str_vec_get(v, 0, &l); TEST_ASSERT_EQ_U(l, 5);  TEST_ASSERT_EQ_I(memcmp(p, "hello", 5), 0);
+    p = ray_str_vec_get(v, 1, &l); TEST_ASSERT_EQ_U(l, 21); TEST_ASSERT_EQ_I(memcmp(p, "world_long_pooled_str", 21), 0);
+    ray_release(v);
+    ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t str_entries[] = {
     { "str/ptr_sso", test_str_ptr_sso, str_setup, str_teardown },
     { "str/ptr_long", test_str_ptr_long, str_setup, str_teardown },
@@ -1719,6 +1773,9 @@ const test_entry_t str_entries[] = {
     { "str/substr_i64_vec_len", test_str_substr_i64_vec_len, NULL, NULL },
     { "str/upper_large_string", test_str_upper_large_string, NULL, NULL },
     { "str/vec_from_parts", test_str_vec_from_parts, NULL, NULL },
+    { "str/vec_from_parts_boundary", test_str_vec_from_parts_boundary, NULL, NULL },
+    { "str/vec_from_parts_empty", test_str_vec_from_parts_empty, NULL, NULL },
+    { "str/vec_from_parts_no_nulls", test_str_vec_from_parts_no_nulls, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
 
