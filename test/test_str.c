@@ -1634,6 +1634,27 @@ static test_result_t test_str_vec_cow_set(void) {
     PASS();
 }
 
+static test_result_t test_str_vec_from_parts(void) {
+    ray_heap_init();
+    const char* ptrs[] = {"",      "abc",  "this_is_long_enough_to_pool", "x",  NULL};
+    uint32_t    lens[] = {0,       3,      (uint32_t)27,                  1,    0};
+    uint8_t     nulls[]= {0,       0,      0,                             0,    1};
+    ray_t* v = ray_str_vec_from_parts(ptrs, lens, nulls, 5);
+    TEST_ASSERT_NOT_NULL(v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    TEST_ASSERT_EQ_I(v->len, 5);
+    size_t l; const char* p;
+    p = ray_str_vec_get(v, 0, &l); TEST_ASSERT_EQ_U(l, 0);
+    p = ray_str_vec_get(v, 1, &l); TEST_ASSERT_EQ_U(l, 3); TEST_ASSERT_EQ_I(memcmp(p,"abc",3), 0);
+    p = ray_str_vec_get(v, 2, &l); TEST_ASSERT_EQ_U(l, 27); TEST_ASSERT_EQ_I(memcmp(p,"this_is_long_enough_to_pool",27), 0);
+    p = ray_str_vec_get(v, 3, &l); TEST_ASSERT_EQ_U(l, 1); TEST_ASSERT_EQ_I(p[0],'x');
+    /* STR has no null distinct from "" (kdb+ model) — null stored as empty string */
+    p = ray_str_vec_get(v, 4, &l); TEST_ASSERT_EQ_U(l, 0); (void)p;
+    ray_release(v);
+    ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t str_entries[] = {
     { "str/ptr_sso", test_str_ptr_sso, str_setup, str_teardown },
     { "str/ptr_long", test_str_ptr_long, str_setup, str_teardown },
@@ -1697,6 +1718,7 @@ const test_entry_t str_entries[] = {
     { "str/substr_i32_vec_len", test_str_substr_i32_vec_len, NULL, NULL },
     { "str/substr_i64_vec_len", test_str_substr_i64_vec_len, NULL, NULL },
     { "str/upper_large_string", test_str_upper_large_string, NULL, NULL },
+    { "str/vec_from_parts", test_str_vec_from_parts, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
 
