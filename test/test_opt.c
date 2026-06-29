@@ -201,6 +201,64 @@ static test_result_t test_filter_reorder_dag(void) {
 }
 
 /*
+ * Test: selectivity-aware reorder. A cheap-to-evaluate but NON-selective
+ * predicate (flag == 0 on a U8 column, filter_cost 0) must NOT beat a
+ * super-selective wide-equality (hkey == K on an I64 column, filter_cost 3)
+ * for the innermost (runs-first) slot. Under cost-only ordering the cheap
+ * flag predicate wins the inner slot; selectivity ordering puts the wide
+ * equality inner.
+ *
+ * Chain built: FILTER(hkey==K, FILTER(flag==0, SCAN(hkey)))
+ * Expected after reorder: inner predicate = hkey==K, outer = flag==0.
+ */
+static test_result_t test_filter_reorder_selectivity(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t n = 8;
+    int64_t hkey_data[] = {10, 20, 30, 40, 50, 60, 70, 80};
+    uint8_t flag_data[] = {0, 1, 0, 1, 0, 1, 0, 1};
+    ray_t* hkey_vec = ray_vec_from_raw(RAY_I64, hkey_data, n);
+    ray_t* flag_vec = ray_vec_from_raw(RAY_U8,  flag_data, n);
+    int64_t name_hkey = ray_sym_intern("hkey", 4);
+    int64_t name_flag = ray_sym_intern("flag", 4);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, name_hkey, hkey_vec);
+    tbl = ray_table_add_col(tbl, name_flag, flag_vec);
+    ray_release(hkey_vec);
+    ray_release(flag_vec);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* base    = ray_scan(g, "hkey");
+    ray_op_t* hkey    = ray_scan(g, "hkey");
+    ray_op_t* flag    = ray_scan(g, "flag");
+    ray_op_t* hkey_eq = ray_eq(g, hkey, ray_const_i64(g, 50));  /* wide eq: selective, cost 3 */
+    ray_op_t* flag_eq = ray_eq(g, flag, ray_const_i64(g, 0));   /* narrow eq: non-selective, cost 0 */
+
+    ray_op_t* filt_inner = ray_filter(g, base, flag_eq);
+    ray_op_t* filt_outer = ray_filter(g, filt_inner, hkey_eq);
+
+    uint32_t hkey_eq_id = hkey_eq->id;
+    uint32_t flag_eq_id = flag_eq->id;
+
+    ray_op_t* opt = ray_optimize(g, filt_outer);
+    TEST_ASSERT_NOT_NULL(opt);
+    TEST_ASSERT_EQ_I(opt->opcode, OP_FILTER);
+    ray_op_t* inner = op_child(g, opt, 0);
+    TEST_ASSERT_EQ_I(inner->opcode, OP_FILTER);
+
+    /* Selective wide-eq must be inner (runs first); flag-eq outer (runs last). */
+    TEST_ASSERT_EQ_I(inner->in_id[1], hkey_eq_id);
+    TEST_ASSERT_EQ_I(opt->in_id[1], flag_eq_id);
+
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/*
  * Test: predicate pushdown past projection.
  *
  * Build: FILTER(id1 = 1, PROJECT([id1, v1], SCAN))
@@ -2579,6 +2637,7 @@ const test_entry_t opt_entries[] = {
     { "opt/filter_reorder_type", test_filter_reorder_by_type, NULL, NULL },
     { "opt/filter_and_split", test_filter_and_split, NULL, NULL },
     { "opt/filter_reorder_dag", test_filter_reorder_dag, NULL, NULL },
+    { "opt/filter_reorder_sel", test_filter_reorder_selectivity, NULL, NULL },
     { "opt/pushdown_select", test_pushdown_past_select, NULL, NULL },
     { "opt/pushdown_group", test_pushdown_past_group, NULL, NULL },
     { "opt/projection_pushdown", test_projection_pushdown, NULL, NULL },
