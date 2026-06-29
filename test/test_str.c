@@ -1472,6 +1472,111 @@ static test_result_t test_str_ne_empty(void) {
     PASS();
 }
 
+static test_result_t test_str_eq_empty(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    /* ["" "a" "" "bc"]  == ""  ->  [1 0 1 0] */
+    ray_t* col = ray_vec_new(RAY_STR, 4);
+    col = ray_str_vec_append(col, "", 0);
+    col = ray_str_vec_append(col, "a", 1);
+    col = ray_str_vec_append(col, "", 0);
+    col = ray_str_vec_append(col, "bc", 2);
+    int64_t nm = ray_sym_intern("s", 1);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, nm, col);
+    ray_release(col);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* sv  = ray_scan(g, "s");
+    ray_op_t* emp = ray_const_str(g, "", 0);
+    ray_op_t* eq  = ray_eq(g, sv, emp);
+    ray_t* r = ray_execute(g, eq);
+
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->len, 4);
+    uint8_t* b = (uint8_t*)ray_data(r);
+    TEST_ASSERT_EQ_I(b[0], 1);
+    TEST_ASSERT_EQ_I(b[1], 0);
+    TEST_ASSERT_EQ_I(b[2], 1);
+    TEST_ASSERT_EQ_I(b[3], 0);
+    ray_release(r);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+static test_result_t test_str_empty_left(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    /* ""  != ["" "a" "" "bc"]  ->  [0 1 0 1]  (scalar on left, vec=r_elems path) */
+    ray_t* col = ray_vec_new(RAY_STR, 4);
+    col = ray_str_vec_append(col, "", 0);
+    col = ray_str_vec_append(col, "a", 1);
+    col = ray_str_vec_append(col, "", 0);
+    col = ray_str_vec_append(col, "bc", 2);
+    int64_t nm = ray_sym_intern("s", 1);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, nm, col);
+    ray_release(col);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* sv  = ray_scan(g, "s");
+    ray_op_t* emp = ray_const_str(g, "", 0);
+    ray_op_t* ne  = ray_ne(g, emp, sv);   /* scalar on LEFT */
+    ray_t* r = ray_execute(g, ne);
+
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->len, 4);
+    uint8_t* b = (uint8_t*)ray_data(r);
+    TEST_ASSERT_EQ_I(b[0], 0);
+    TEST_ASSERT_EQ_I(b[1], 1);
+    TEST_ASSERT_EQ_I(b[2], 0);
+    TEST_ASSERT_EQ_I(b[3], 1);
+    ray_release(r);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+static test_result_t test_str_ne_nonempty(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    /* ["" "a" "" "bc"]  != "a"  ->  [1 0 1 1]  (non-empty scalar must NOT take fast path) */
+    ray_t* col = ray_vec_new(RAY_STR, 4);
+    col = ray_str_vec_append(col, "", 0);
+    col = ray_str_vec_append(col, "a", 1);
+    col = ray_str_vec_append(col, "", 0);
+    col = ray_str_vec_append(col, "bc", 2);
+    int64_t nm = ray_sym_intern("s", 1);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, nm, col);
+    ray_release(col);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* sv  = ray_scan(g, "s");
+    ray_op_t* sc  = ray_const_str(g, "a", 1);
+    ray_op_t* ne  = ray_ne(g, sv, sc);
+    ray_t* r = ray_execute(g, ne);
+
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->len, 4);
+    uint8_t* b = (uint8_t*)ray_data(r);
+    TEST_ASSERT_EQ_I(b[0], 1);
+    TEST_ASSERT_EQ_I(b[1], 0);
+    TEST_ASSERT_EQ_I(b[2], 1);
+    TEST_ASSERT_EQ_I(b[3], 1);
+    ray_release(r);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 /* ---- Suite definition -------------------------------------------------- */
 
 static test_result_t test_str_t_hash_inline(void) {
@@ -1814,6 +1919,9 @@ const test_entry_t str_entries[] = {
     { "str/vec_from_parts_empty", test_str_vec_from_parts_empty, NULL, NULL },
     { "str/vec_from_parts_no_nulls", test_str_vec_from_parts_no_nulls, NULL, NULL },
     { "str/ne_empty", test_str_ne_empty, NULL, NULL },
+    { "str/eq_empty", test_str_eq_empty, NULL, NULL },
+    { "str/empty_left", test_str_empty_left, NULL, NULL },
+    { "str/ne_nonempty", test_str_ne_nonempty, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
 
