@@ -69,3 +69,34 @@
 (sum (at R 'i32))  -- 100010
 
 (.sys.exec "rm -rf rf_test_auto_int rf_test_auto_int.csv") -- 0
+
+;; ── multi-chunk integrity: >1 M rows force ≥2 CSV_PART_ROWS_DEFAULT chunks ──
+;;
+;; A single INT column, 1,100,000 rows.  Values are i%200 (range 0..199) except
+;; row 1,050,000 which is an empty CSV cell (null), placing a null in chunk 2
+;; (rows 1,000,000..1,099,999).  csv_resolve_auto_streamed scans the whole file
+;; once to build global min/max/has_null before the streaming column writer is
+;; opened.  A per-chunk-narrowing regression would diverge: chunk 1 (no null)
+;; → U8 and chunk 2 (has null) → I16, corrupting the fixed-width column file.
+;; The type assertion below catches that divergence.
+(.sys.exec "rm -rf rf_mc_auto rf_mc_auto.csv") -- 0
+(.sys.exec "awk 'BEGIN{print \"val\"; for(i=0;i<1100000;i++){if(i==1050000)print \"\"; else print i%200}}' > rf_mc_auto.csv") -- 0
+(set MC (.csv.splayed [INT] "rf_mc_auto.csv" "rf_mc_auto/"))
+(count MC) -- 1100000
+;; whole-column resolved width must be I16 (nullable; values 0..199; has_null=true;
+;; U8 is excluded when has_null — see csv_resolve_int_width).  A per-chunk
+;; regression produces U8 for chunk 1, breaking this assertion.
+(type (at MC 'val)) -- 'I16
+;; boundary: last row of chunk 1 (index 999999) and first two rows of chunk 2.
+(at (at MC 'val) 999999)  -- 199
+(at (at MC 'val) 1000000) -- 0
+(at (at MC 'val) 1000001) -- 1
+;; null lives in chunk 2 (index 1,050,000 = 1M + 50,000).
+(nil? (at (at MC 'val) 1050000)) -- true
+;; reload: resolved width and null bitmap must survive .db.splayed.get.
+(set MCR (.db.splayed.get "rf_mc_auto/"))
+(type (at MCR 'val)) -- 'I16
+(at (at MCR 'val) 999999)  -- 199
+(at (at MCR 'val) 1000000) -- 0
+(nil? (at (at MCR 'val) 1050000)) -- true
+(.sys.exec "rm -rf rf_mc_auto rf_mc_auto.csv") -- 0
