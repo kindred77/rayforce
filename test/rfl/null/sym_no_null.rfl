@@ -1,0 +1,14 @@
+;; SYM has no null — the empty symbol ' (sym 0) is a value, mirroring STR "".
+;; Parity: empty STR and empty SYM behave identically (no null).
+(nil? ')                       -- false
+(nil? "")                      -- false
+(nil? 0Ns)                     -- false
+;; the empty symbol round-trips through a SYM vector as a value, not null
+(== ' (at (as 'SYM [0Ns a]) 0)) -- true
+(nil? (at (as 'SYM [0Ns a]) 0)) -- false
+;; FIRST of an all-empty-symbol group is the empty symbol, not null
+(set Te (table [k v] (list (as 'SYM [0Ns 0Ns]) [1 2])))
+(nil? (at (at (select {f: (first k) by: v from: Te}) 'f) 0)) -- false
+;; an empty-symbol vector carries no nulls
+(set sv (as 'SYM [a 0Ns c]))
+(nil? (at sv 1))               -- false

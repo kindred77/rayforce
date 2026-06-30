@@ -1738,7 +1738,7 @@ static test_result_t test_serde_typed_null_atoms(void) {
 
     const int8_t atom_types[] = {
         -RAY_I64, -RAY_F64, -RAY_DATE, -RAY_TIME, -RAY_TIMESTAMP,
-        -RAY_I32, -RAY_I16, -RAY_BOOL, -RAY_U8, -RAY_SYM,  /* STR has no null atom */
+        -RAY_I32, -RAY_I16, -RAY_BOOL, -RAY_U8,  /* STR and SYM have no null atom */
     };
     for (size_t i = 0; i < sizeof(atom_types)/sizeof(atom_types[0]); i++) {
         int8_t t = atom_types[i];

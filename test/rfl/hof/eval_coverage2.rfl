@@ -54,11 +54,10 @@
 ;; Rows with null in the sym vec: == 'a → [true, false, true, false]
 (count (where (== col_s 'a))) -- 2
 (count (where (!= col_s 'a))) -- 2
-;; null sym == null sym atom → general path (null ≠ null by null-equality semantics)
-;; BUG: By null-equality semantics, null == null is 0 (false); only 'a == 'a is true.
-;; The general path is hit regardless; the result follows the null-equality rules:
-(sum (as 'I64 (== col_s 0Ns))) -- 0
-(sum (as 'I64 (!= col_s 0Ns))) -- 4
+;; empty sym == empty sym atom → value equality (SYM has no null; ' is a value,
+;; mirroring STR "" == "").  The 0Ns row equals the 0Ns atom → 1 match.
+(sum (as 'I64 (== col_s 0Ns))) -- 1
+(sum (as 'I64 (!= col_s 0Ns))) -- 3
 
 ;; ═══════════════════════════════════════════════════════════════════
 ;; 5. numeric_atom_i64 I32/I16/BOOL branches (lines 139-149 in eval.c)

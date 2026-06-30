@@ -150,8 +150,8 @@
 ;; null → BOOL — produces null BOOL sentinel
 (nil? (as 'BOOL 0Nl)) -- true
 
-;; null → SYMBOL
-(nil? (as 'SYMBOL 0Ns)) -- true
+;; empty sym → SYMBOL (SYM has no null; ' is a value)
+(nil? (as 'SYMBOL 0Ns)) -- false
 
 ;; null → DATE
 (nil? (as 'DATE 0Nd)) -- true
