@@ -2,11 +2,12 @@
 ;;
 ;; A column declared `INT` in a .csv.splayed schema is parsed as int64,
 ;; its min/max/has_null are measured over the whole file, and the column
-;; is written at the narrowest type that holds every value
-;; (BOOL/U8/I16/I32/I64 per csv_resolve_int_width).  Explicit widths are
-;; respected unchanged.  This test exercises one column resolving to each
-;; of BOOL, U8, I16 (forced wider than U8 by a null), and I32, plus an
-;; explicit-I32 control whose small values must NOT narrow.
+;; is written at the narrowest type that holds every value.  The floor is
+;; I16 — U8 renders as hex and BOOL in bool form, so INT integers always
+;; stay decimal (I16/I32/I64 per csv_resolve_int_width).  Explicit widths
+;; are respected unchanged.  This test exercises one column resolving to
+;; I16 (non-null small range), I16 (nullable, forced by null), and I32,
+;; plus an explicit-I32 control whose small values must NOT narrow.
 ;;
 ;; Before the INT wiring `.csv.splayed [INT ...]` errors with
 ;; "unknown column type name in schema", so every assertion below fails.
@@ -14,8 +15,8 @@
 (.sys.exec "rm -rf rf_test_auto_int rf_test_auto_int.csv") -- 0
 
 ;; Columns:
-;;   b    0/1            non-null   -> BOOL
-;;   u8   0..200         non-null   -> U8
+;;   b    0/1            non-null   -> I16 (floor; U8/BOOL excluded — render hex/bool)
+;;   u8   0..200         non-null   -> I16 (floor; U8/BOOL excluded — render hex/bool)
 ;;   i16n 0..200         one null   -> I16 (nullable excludes U8)
 ;;   i32  0..100000      non-null   -> I32
 ;;   ex   small ints, declared I32  -> I32 (explicit width respected)
@@ -26,19 +27,20 @@
 (key T) -- ['b 'u8 'i16n 'i32 'ex]
 
 ;; ── resolved widths ──
-(type (at T 'b))    -- 'B8
-(type (at T 'u8))   -- 'U8
+(type (at T 'b))    -- 'I16
+(type (at T 'u8))   -- 'I16
 (type (at T 'i16n)) -- 'I16
 (type (at T 'i32))  -- 'I32
-;; explicit I32 stays I32 even though 1..5 would fit BOOL/U8.
+;; explicit I32 stays I32 even though 1..5 would fit I16.
 (type (at T 'ex))   -- 'I32
 
 ;; ── values round-trip ──
-(at (at T 'b) 0)   -- false
-(at (at T 'b) 1)   -- true
-;; U8 cells render as hex atoms (0xc8 == 200, 0x32 == 50).
-(at (at T 'u8) 1)  -- 0xc8
-(at (at T 'u8) 3)  -- 0x32
+;; b is I16, so 0/1 round-trip as decimal integers (not bool).
+(at (at T 'b) 0)   -- 0
+(at (at T 'b) 1)   -- 1
+;; u8 is I16, so values render as decimal integers (not hex).
+(at (at T 'u8) 1)  -- 200
+(at (at T 'u8) 3)  -- 50
 (at (at T 'i16n) 0) -- 200
 ;; the blank i16n cell is a typed null at the row the CSV left empty.
 (nil? (at (at T 'i16n) 1)) -- true
@@ -55,12 +57,12 @@
 ;; ── re-load from disk preserves widths, values, and the null bitmap ──
 (set R (.db.splayed.get "rf_test_auto_int/"))
 (count R) -- 5
-(type (at R 'b))    -- 'B8
-(type (at R 'u8))   -- 'U8
+(type (at R 'b))    -- 'I16
+(type (at R 'u8))   -- 'I16
 (type (at R 'i16n)) -- 'I16
 (type (at R 'i32))  -- 'I32
 (type (at R 'ex))   -- 'I32
-(at (at R 'u8) 1)  -- 0xc8
+(at (at R 'u8) 1)  -- 200
 (at (at R 'i16n) 0) -- 200
 (nil? (at (at R 'i16n) 1)) -- true
 (at (at R 'i16n) 2) -- 5

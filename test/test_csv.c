@@ -1490,9 +1490,9 @@ static test_result_t test_csv_infer_high_cardinality_str(void) {
 }
 
 static test_result_t test_csv_resolve_int_width(void) {
-    /* non-nullable: BOOL/U8 allowed */
-    TEST_ASSERT(csv_resolve_int_width(0, 1, false)        == CSV_TYPE_BOOL, "[0,1] non-null -> BOOL");
-    TEST_ASSERT(csv_resolve_int_width(0, 255, false)      == CSV_TYPE_U8,   "[0,255] non-null -> U8");
+    /* non-nullable: floor is I16 (U8/BOOL intentionally excluded — render hex/bool) */
+    TEST_ASSERT(csv_resolve_int_width(0, 1, false)        == CSV_TYPE_I16,  "[0,1] non-null -> I16 (not BOOL; integers stay decimal)");
+    TEST_ASSERT(csv_resolve_int_width(0, 255, false)      == CSV_TYPE_I16,  "[0,255] non-null -> I16 (not U8; integers stay decimal)");
     TEST_ASSERT(csv_resolve_int_width(0, 256, false)      == CSV_TYPE_I16,  "[0,256] non-null -> I16");
     TEST_ASSERT(csv_resolve_int_width(-1, 52, false)      == CSV_TYPE_I16,  "[-1,52] non-null -> I16 (negative excludes U8)");
     TEST_ASSERT(csv_resolve_int_width(0, 131069, false)   == CSV_TYPE_I32,  "[0,131069] non-null -> I32");
