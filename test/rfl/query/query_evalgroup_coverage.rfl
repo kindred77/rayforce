@@ -348,11 +348,11 @@
 ;; Order-independent multiset of per-group sums (sorted): {1,2,3,4}
 (asc (at (select {r: (sum ext_v) by: [k1 k2] from: Teg_mk}) 'r)) -- [1 2 3 4]
 ;; Order-independent per-group KEY check via masked STR+SYM key lookup.
-;; Same GLOBAL-arg reindexing caveat as Teg_sk: each masked group keeps a
-;; single original row that is reindexed to dense position 0 → every
-;; masked group samples ext_v[0]=1 regardless of which key survives. We
-;; assert the group keys for order-independence and pin the live r; the
-;; unmasked total (10) above proves the per-group decomposition.
+;; Like the single-key Teg_sk case above, multi-key STR group keys now run
+;; on the wide-key DAG path, which samples the GLOBAL arg ext_v at each
+;; group's ORIGINAL table-row positions (NOT dense-reindexed).  So each
+;; masked group keeps its single original row: (a,X)=row0 → ext_v[0]=1;
+;; (b,Y)=row3 → ext_v[3]=4 — consistent with the unmasked asc [1 2 3 4].
 (set Gmk_aX (select {r: (sum ext_v) by: [k1 k2] from: Teg_mk where: (and (== k1 "a") (== k2 'X))}))
 (count Gmk_aX)           -- 1
 (at (at Gmk_aX 'k1) 0)   -- "a"
@@ -361,7 +361,7 @@
 (set Gmk_bY (select {r: (sum ext_v) by: [k1 k2] from: Teg_mk where: (and (== k1 "b") (== k2 'Y))}))
 (at (at Gmk_bY 'k1) 0)   -- "b"
 (at (at Gmk_bY 'k2) 0)   -- 'Y
-(at (at Gmk_bY 'r) 0)    -- 1
+(at (at Gmk_bY 'r) 0)    -- 4
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; STR column with HAS_NULLS in single-key eval_group first-of-group
