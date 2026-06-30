@@ -422,6 +422,54 @@ static test_result_t test_rowsel_refine_null_existing(void) {
     PASS();
 }
 
+/* Streaming emitter must produce a block byte-identical to the
+ * whole-vec ray_rowsel_from_pred over the same bools.  Pattern spans
+ * >1 morsel with a NONE seg, an ALL seg, and MIX segs. */
+static test_result_t test_rowsel_emit_equiv(void) {
+    ray_heap_init();
+    /* nrows spanning >1 morsel segment, a NONE seg, an ALL seg, a MIX seg */
+    int64_t nrows = (int64_t)RAY_MORSEL_ELEMS * 3 + 7;
+    ray_t* pred = ray_vec_new(RAY_BOOL, nrows);
+    TEST_ASSERT_NOT_NULL(pred);
+    uint8_t* p = (uint8_t*)ray_data(pred);
+    for (int64_t i = 0; i < nrows; i++) {
+        uint32_t seg = (uint32_t)(i / RAY_MORSEL_ELEMS);
+        p[i] = (seg == 0) ? 0                 /* NONE */
+             : (seg == 1) ? 1                 /* ALL  */
+             : (uint8_t)((i & 3) == 0);       /* MIX  */
+    }
+    pred->len = nrows;
+    ray_t* ref = ray_rowsel_from_pred(pred);
+    TEST_ASSERT_NOT_NULL(ref);
+
+    /* streaming: one builder, emit each segment from the same bool */
+    uint32_t n_segs = (uint32_t)((nrows + RAY_MORSEL_ELEMS - 1) / RAY_MORSEL_ELEMS);
+    rowsel_builder_t b;
+    rowsel_builder_init(&b, n_segs);
+    for (uint32_t s = 0; s < n_segs; s++) {
+        int64_t lo = (int64_t)s * RAY_MORSEL_ELEMS;
+        int64_t n  = (lo + RAY_MORSEL_ELEMS <= nrows) ? RAY_MORSEL_ELEMS : (nrows - lo);
+        rowsel_emit_segment(&b, s, p + lo, n);
+    }
+    ray_t* got = rowsel_builder_finish(&b, 1, nrows);
+    TEST_ASSERT_NOT_NULL(got);
+
+    /* compare meta + the three arrays byte-for-byte */
+    TEST_ASSERT(ray_rowsel_meta(got)->total_pass == ray_rowsel_meta(ref)->total_pass, "total_pass");
+    TEST_ASSERT(ray_rowsel_meta(got)->n_segs    == ray_rowsel_meta(ref)->n_segs, "n_segs");
+    TEST_ASSERT(memcmp(ray_rowsel_flags(got),   ray_rowsel_flags(ref),   n_segs) == 0, "flags");
+    TEST_ASSERT(memcmp(ray_rowsel_offsets(got), ray_rowsel_offsets(ref), (size_t)(n_segs+1)*sizeof(uint32_t)) == 0, "offsets");
+    /* meta has no idx_count field; idx occupancy is offsets[n_segs]. */
+    int64_t ic = ray_rowsel_offsets(ref)[n_segs];
+    TEST_ASSERT(memcmp(ray_rowsel_idx(got), ray_rowsel_idx(ref), (size_t)ic*sizeof(uint16_t)) == 0, "idx");
+
+    ray_release(pred);
+    ray_rowsel_release(ref);
+    ray_rowsel_release(got);
+    ray_heap_destroy();
+    PASS();
+}
+
 /* ──────────────────────────────────────────────────────────────────
  * Suite registration
  * ────────────────────────────────────────────────────────────────── */
@@ -438,6 +486,7 @@ const test_entry_t rowsel_entries[] = {
     { "rowsel/to_indices", test_rowsel_to_indices, NULL, NULL },
     { "rowsel/refine", test_rowsel_refine, NULL, NULL },
     { "rowsel/refine_null_existing", test_rowsel_refine_null_existing, NULL, NULL },
+    { "rowsel/emit_equiv", test_rowsel_emit_equiv, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
 
