@@ -9,7 +9,7 @@
 ;; check.
 
 ;; ─── update arm: nulls in untouched rows must survive the rebuild ───
-(set T (table [ticker price qty] (list [aa 0Ns cc] [1.5 0Nf 4.1] [10 0Nl 40])))
+(set T (table [ticker price qty] (list [aa ' cc] [1.5 0Nf 4.1] [10 0Nl 40])))
 
 ;; Pre-upsert baseline.
 (sum (at T 'qty))   -- 50

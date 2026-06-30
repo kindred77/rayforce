@@ -70,7 +70,7 @@ t -- (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0]))
 ;; Test 27: Insert via dict with partial columns (missing column gets null)
 (set t (table [a b c] (list [1 2] [10 20] [x y])))(insert t (dict [c b] (list 'z 30))) -- (table [a b c] (list [1 2 0Nl] [10 20 30] [x y z]))
 ;; Test 28: Insert via dict with partial columns in different order
-(set t (table [a b c] (list [1 2] [10 20] [x y])))(insert t (dict [b a] (list 30 3))) -- (table [a b c] (list [1 2 3] [10 20 30] [x y 0Ns]))
+(set t (table [a b c] (list [1 2] [10 20] [x y])))(insert t (dict [b a] (list 30 3))) -- (table [a b c] (list [1 2 3] [10 20 30] [x y ']))
 ;; Test 29: Insert multiple records via dict with different column order
 (set t (table [a b c] (list [1] [10] [x])))(insert t (dict [c b a] (list [y z] [20 30] [2 3]))) -- (table [a b c] (list [1 2 3] [10 20 30] [x y z]))
 ;; Test 30: Insert via table with columns in different order
@@ -95,7 +95,7 @@ t -- (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0]))
 (set t (table [ID Name Value] (list [1] [alice] [10.0])))(upsert t 1 (table [ID Name Value Extra] (list [2] [bob] [20.0] ['x]))) !- value
 ;; Table-payload partial updates are intentionally SUPPORTED (missing target cols → null-fill).
 ;; This must not error — the second row of the result has null Name.
-(set t (table [ID Name Value] (list [1] [alice] [10.0])))(upsert t 1 (table [ID Value] (list [2] [20.0]))) -- (table [ID Name Value] (list [1 2] [alice 0Ns] [10.0 20.0]))
+(set t (table [ID Name Value] (list [1] [alice] [10.0])))(upsert t 1 (table [ID Value] (list [2] [20.0]))) -- (table [ID Name Value] (list [1 2] [alice '] [10.0 20.0]))
 ;; Partial updates MUST include the key column(s) — otherwise the match/insert
 ;; logic would dereference a null-filled key and segfault.
 (set t (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0])))(upsert t 1 (table [Name Value] (list [charlie] [30.0]))) !- value

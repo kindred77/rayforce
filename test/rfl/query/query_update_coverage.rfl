@@ -492,7 +492,7 @@
 ;; ────────────────────────────────────────────────────────────────────
 (set Tsym_wh (table [k sym] (list [1 2 3] ['a 'b 'c])))
 ;; Create null SYM at row 0 (k=1) via a prior update
-(set Tsymwhn (update {sym: 0Ns from: Tsym_wh where: (== k 1)}))
+(set Tsymwhn (update {sym: ' from: Tsym_wh where: (== k 1)}))
 ;; Tsymwhn: sym = [null, 'b, 'c] (null at row 0)
 ;; Now update sym WHERE k>0 using the sym column as expression → sym copies itself
 ;; BUT: WHERE k>0 masks rows 1,2 (k=2 and k=3); expr_vec=sym=[null,'b,'c]
@@ -539,7 +539,7 @@
 ;; ────────────────────────────────────────────────────────────────────
 (set Tsym_ins (table [k sym] (list [1 2] ['a 'b])))
 ;; Create null SYM at row 0 (k=1) via no-WHERE update
-(set Tsym_n_ins (update {sym: 0Ns from: Tsym_ins where: (== k 1)}))
+(set Tsym_n_ins (update {sym: ' from: Tsym_ins where: (== k 1)}))
 ;; Insert new row: copies existing rows; row 0 has null SYM
 ;; → line 9349 fires when copying row 0 (null SYM)
 (count (insert Tsym_n_ins (list 3 'c))) -- 3

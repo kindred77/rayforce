@@ -36,7 +36,7 @@
 ;;    Compare a SYM vec (no nulls) against a SYM null atom → every row
 ;;    gets fill=false for ==, fill=true for !=.
 ;; ═══════════════════════════════════════════════════════════════════
-(set snull 0Ns)
+(set snull ')
 (set snv (as 'SYM ['a 'b 'c]))
 ;; == null → all false → count of true is 0
 (sum (as 'I64 (== snv snull))) -- 0
@@ -49,15 +49,15 @@
 ;;    a specific sym atom.
 ;; ═══════════════════════════════════════════════════════════════════
 ;; Create a SYM vec with nulls using where+at
-(set t_sym (table ['s] (list (as 'SYM ['a 0Ns 'a 'b]))))
+(set t_sym (table ['s] (list (as 'SYM ['a ' 'a 'b]))))
 (set col_s (at t_sym 's))
 ;; Rows with null in the sym vec: == 'a → [true, false, true, false]
 (count (where (== col_s 'a))) -- 2
 (count (where (!= col_s 'a))) -- 2
 ;; empty sym == empty sym atom → value equality (SYM has no null; ' is a value,
-;; mirroring STR "" == "").  The 0Ns row equals the 0Ns atom → 1 match.
-(sum (as 'I64 (== col_s 0Ns))) -- 1
-(sum (as 'I64 (!= col_s 0Ns))) -- 3
+;; mirroring STR "" == "").  The ' row equals the ' atom → 1 match.
+(sum (as 'I64 (== col_s '))) -- 1
+(sum (as 'I64 (!= col_s '))) -- 3
 
 ;; ═══════════════════════════════════════════════════════════════════
 ;; 5. numeric_atom_i64 I32/I16/BOOL branches (lines 139-149 in eval.c)

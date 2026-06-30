@@ -92,10 +92,10 @@
 (type 0Nd) -- 'date
 (type 0Nt) -- 'time
 (type 0Np) -- 'timestamp
-;; 0Ns is the canonical empty symbol (sym 0), not a typed null
-0Ns -- 0Ns
-(type 0Ns) -- 'sym
-(== 0Ns ') -- true
+;; ' is the canonical empty symbol (sym 0), not a typed null
+' -- '
+(type ') -- 'sym
+(== ' ') -- true
 ;; bare 0N defaults to i64 null
 (type 0N) -- 'i64
 (nil? 0N) -- true

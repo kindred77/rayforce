@@ -6,8 +6,8 @@
  * shadow.  The phase-1 C verifier (stress_verify_all) is shared.
  *
  * Verified syntax sources of truth (never guessed):
- *   - null literals (test/rfl/null/ + REPL probe): sym null = `0Ns`
- *     (the empty symbol — SYM columns are no-null by design, sym 0 = "");
+ *   - null literals (test/rfl/null/ + REPL probe): empty symbol = `'`
+ *     (SYM columns are no-null by design, sym 0 = "" renders as ');
  *     f64 null = `0Nf`; i64 null = `0Nl`.  All three are accepted inside
  *     plain vector literals, including in leading position.
  *   - the .db trio (test/rfl/system/db_get.rfl, db_sym_resolution.rfl):
@@ -123,13 +123,13 @@ bool stress_eval_table_src(const stress_rows_t* rows, int64_t from, int64_t n,
     if (n == 0)
         return emit(buf, bufsz, &off,
                     "(as 'SYM []) (as 'F64 []) []))");
-    /* ticker column: 'sym literals; null ticker ("") = 0Ns */
+    /* ticker column: 'sym literals; empty ticker ("") = ' (sym 0) */
     if (!emit(buf, bufsz, &off, "[")) return false;
     for (int64_t i = 0; i < n; i++) {
         const stress_row_t* r = &rows->rows[from + i];
         const char* sp = i ? " " : "";
         if (r->ticker[0] == '\0') {
-            if (!emit(buf, bufsz, &off, "%s0Ns", sp)) return false;
+            if (!emit(buf, bufsz, &off, "%s'", sp)) return false;
         } else {
             if (!emit(buf, bufsz, &off, "%s'%s", sp, r->ticker)) return false;
         }
@@ -291,11 +291,11 @@ bool stress_eval_op_insert(stress_ctx_t* c, int64_t n,
 }
 
 /* One row's values as the upsert payload: (list 'tkr 12.34 56), with the
- * verified null literals (0Ns / 0Nf / 0Nl) per cell. */
+ * verified literals (empty sym ' / 0Nf / 0Nl) per cell. */
 static bool emit_row_list(char* buf, size_t cap, size_t* off,
                           const stress_row_t* r) {
     bool ok = r->ticker[0] == '\0'
-                  ? emit(buf, cap, off, "(list 0Ns ")
+                  ? emit(buf, cap, off, "(list ' ")
                   : emit(buf, cap, off, "(list '%s ", r->ticker);
     if (ok)
         ok = isnan(r->price) ? emit(buf, cap, off, "0Nf ")
@@ -439,7 +439,7 @@ bool stress_eval_op_restart(stress_ctx_t* c) {
  *
  *   (sum v)    skips null sentinels; empty / all-null sum = 0 (i64), NOT null
  *   (count v)  = vector length — COUNT(*) semantics, null cells counted
- *   group-by   buckets the null sym ("" = 0Ns = sym 0) as its OWN group
+ *   group-by   buckets the empty sym ("" = ' = sym 0) as its OWN group
  *   inner-join matches null sym keys like any other key
  *
  * Aggregates are over QTY (int64) ONLY — exact under any summation order.
