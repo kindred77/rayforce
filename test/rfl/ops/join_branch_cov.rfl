@@ -115,8 +115,9 @@
 (at (at ajN2 'Bid) 0) -- 99.0
 (at (at ajN2 'Bid) 1) -- 100.0
 
-;; asof-join: null eq key in left → no match (left-outer: row preserved)
-;; Row 0 (a, 10:00:01) → quote @10:00:00 = 99 ; Row 1 (null, 10:00:03) → no match.
+;; asof-join: empty-symbol eq key in left → no match (left-outer: row preserved)
+;; Row 0 (a, 10:00:01) → quote @10:00:00 = 99 ; Row 1 (', 10:00:03): the empty
+;; symbol is a value that doesn't equal 'a → no match (not a null key).
 (set ajL3 (table [Sym Time Price] (list [a '] [10:00:01.000 10:00:03.000] [100.0 200.0])))
 (set ajR3 (table [Sym Time Bid] (list [a a] [10:00:00.000 10:00:02.000] [99.0 100.0])))
 (set ajN3 (asof-join [Sym Time] ajL3 ajR3))
@@ -124,8 +125,9 @@
 (at (at ajN3 'Bid) 0) -- 99.0
 (nil? (at (at ajN3 'Bid) 1)) -- true
 
-;; asof-join: null eq key in right → skipped
-;; Right quotes with null Sym are unreachable; (a,10:00:01)→99, (a,10:00:03)→100.
+;; asof-join: empty-symbol eq key in right → not matched
+;; Right quotes keyed by the empty symbol ' (a value ≠ 'a) match nothing;
+;; (a,10:00:01)→99, (a,10:00:03)→100.
 (set ajL4 (table [Sym Time Price] (list [a a] [10:00:01.000 10:00:03.000] [100.0 200.0])))
 (set ajR4 (table [Sym Time Bid] (list [a ' a] [10:00:00.000 10:00:01.500 10:00:02.000] [99.0 50.0 100.0])))
 (set ajN4 (asof-join [Sym Time] ajL4 ajR4))

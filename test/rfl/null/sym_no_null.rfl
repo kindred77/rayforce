@@ -2,7 +2,6 @@
 ;; Parity: empty STR and empty SYM behave identically (no null).
 (nil? ')                       -- false
 (nil? "")                      -- false
-(nil? ')                       -- false
 ;; the empty symbol round-trips through a SYM vector as a value, not null
 (== ' (at (as 'SYM [' a]) 0)) -- true
 (nil? (at (as 'SYM [' a]) 0)) -- false
