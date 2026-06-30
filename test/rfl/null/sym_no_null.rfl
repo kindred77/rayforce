@@ -19,3 +19,15 @@
 (== ' (eval (parse "'")))      -- true
 ;; 0Ns is no longer a literal — it parses as `0 Ns`; eval raises (undefined name)
 (== 'caught (try (eval (parse "0Ns")) (fn [e] 'caught))) -- true
+;; ── Task 4: empty-symbol count-distinct parity (no-null hardening) ──
+;; Under the old null-skipping behavior, count(distinct [a ' a ' b]) would
+;; give 2 (empty sym skipped as null).  With no-null it must give 3.
+(set Tcd (table [s] (list (as 'SYM ['a ' 'a ' 'b]))))
+;; distinct count: {a, ', b} = 3 distinct values (not 2)
+(count (distinct (at Tcd 's)))                                         -- 3
+;; group-by produces 3 groups (one per distinct key)
+(count (select {c: (count s) by: s from: Tcd}))                       -- 3
+;; STR parity: empty STR "" and empty SYM ' are both values → same distinct count
+(count (distinct (list "a" "" "a" "" "b")))                           -- 3
+;; explicitly assert STR and SYM give the same answer
+(== (count (distinct (at Tcd 's))) (count (distinct (list "a" "" "a" "" "b")))) -- true
