@@ -1502,6 +1502,8 @@ static test_result_t test_csv_resolve_int_width(void) {
     TEST_ASSERT(csv_resolve_int_width(0, 1, true)         == CSV_TYPE_I16,  "[0,1] nullable -> I16 (NOT BOOL)");
     TEST_ASSERT(csv_resolve_int_width(0, 70000, true)     == CSV_TYPE_I32,  "[0,70000] nullable -> I32");
     TEST_ASSERT(csv_resolve_int_width((int64_t)INT16_MIN, 5, true) == CSV_TYPE_I32, "min==sentinel -> widen to I32");
+    TEST_ASSERT(csv_resolve_int_width((int64_t)INT32_MIN, 5, true) == CSV_TYPE_I64,
+                "min==NULL_I32 sentinel -> widen to I64");
     /* edges */
     TEST_ASSERT(csv_resolve_int_width(INT64_MAX, INT64_MIN, false) == CSV_TYPE_I64, "min>max (empty/all-null) -> I64");
     PASS();
