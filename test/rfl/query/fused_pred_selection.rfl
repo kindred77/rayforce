@@ -1,0 +1,90 @@
+;; Equivalence battery for the fused predicate→selection path
+;; (src/ops/expr.c: exec_pred_to_selection / fused_sel_supported,
+;;  routed at src/ops/exec.c OP_FILTER and src/ops/query.c count-select).
+;;
+;; The fused path streams each morsel's WHERE bools straight into a
+;; rowsel builder, skipping the full BOOL vec + the BOOL→rowsel scan.
+;; Every query below is asserted against a hand-computed oracle, so the
+;; SAME assertions must hold whether the binary runs the fused path
+;; (default) or the forced fallback (RAY_NO_FUSED_SEL=1 ./rayforce.test).
+;; Run both ways — results are identical by construction.
+;;
+;; Shapes covered: !=, <, AND, OR, all-pass (>=0), all-none (<0), a
+;; >1-morsel-segment table (200k rows via til, exercises the per-task
+;; builder merge), and a predicate over a NULLABLE column (null rows
+;; must NOT be selected, matching the bool path's expr kernel).
+
+;; ====================================================================
+;; Part A — small table, every shape, both the count-select path
+;; (query.c) and the filter→aggregate path (exec.c OP_FILTER).
+;;
+;;   a = [0 1 0 2 3 0 1]      b = [10 20 30 40 50 60 70]
+;; ====================================================================
+(set T (table [a b] (list [0 1 0 2 3 0 1] [10 20 30 40 50 60 70])))
+(count T) -- 7
+
+;; != 0  -> a!=0 at rows {1,3,4,6} -> count 4, sum b = 20+40+50+70 = 180
+(count (select {from: T where: (!= a 0)})) -- 4
+(sum (at (select {from: T where: (!= a 0)}) 'b)) -- 180
+
+;; < 2   -> a in {0,1} -> rows {0,1,2,5,6} -> count 5, sum b = 10+20+30+60+70 = 190
+(count (select {from: T where: (< a 2)})) -- 5
+(sum (at (select {from: T where: (< a 2)}) 'b)) -- 190
+
+;; AND   -> (!= a 0) AND (< b 65) -> {1,3,4} (b=70 at row6 excluded) -> 3
+(count (select {from: T where: (and (!= a 0) (< b 65))})) -- 3
+(sum (at (select {from: T where: (and (!= a 0) (< b 65))}) 'b)) -- 110
+
+;; OR    -> (== a 3) OR (== a 2) -> rows {4,3} -> 2, sum b = 40+50 = 90
+(count (select {from: T where: (or (== a 3) (== a 2))})) -- 2
+(sum (at (select {from: T where: (or (== a 3) (== a 2))}) 'b)) -- 90
+
+;; all-pass (>= a 0) -> 7 (exercises the all-pass→NULL convention)
+(count (select {from: T where: (>= a 0)})) -- 7
+(sum (at (select {from: T where: (>= a 0)}) 'b)) -- 280
+
+;; all-none (< a 0) -> 0 (exercises the none-pass selection)
+(count (select {from: T where: (< a 0)})) -- 0
+(sum (at (select {from: T where: (< a 0)}) 'b)) -- 0
+
+;; ====================================================================
+;; Part B — >1-morsel-segment table (200k rows) so the per-task builder
+;; merge in rowsel_builder_finish is exercised (TASK_GRAIN = 8 morsels;
+;; 200k rows crosses the parallel threshold = 64 morsels).
+;;
+;;   v = til 200000  (v == row index)
+;; ====================================================================
+(set N 200000)
+(set BigT (table [v] (list (til N))))
+(count BigT) -- 200000
+
+;; != 0 -> all but v==0 -> 199999
+(count (select {from: BigT where: (!= v 0)})) -- 199999
+
+;; < 100000 -> v in {0..99999} -> 100000
+(count (select {from: BigT where: (< v 100000)})) -- 100000
+
+;; sum over a small head slice -> 0+1+..+9 = 45 (filter→aggregate path)
+(sum (at (select {from: BigT where: (< v 10)}) 'v)) -- 45
+
+;; all-pass / all-none at scale
+(count (select {from: BigT where: (>= v 0)})) -- 200000
+(count (select {from: BigT where: (< v 0)})) -- 0
+
+;; ====================================================================
+;; Part C — NULLABLE column.  Null rows must NOT be selected (the fused
+;; path reuses the same expr comparison kernel as the bool path, which
+;; yields false for null operands).
+;;
+;;   a = [1 0N 3 0N 5]   (0N = null int64)
+;; ====================================================================
+(set Tn (table [a] (list [1 0N 3 0N 5])))
+(count Tn) -- 5
+
+;; > 0  -> {1,3,5} pass, nulls excluded -> 3, sum = 9
+(count (select {from: Tn where: (> a 0)})) -- 3
+(sum (at (select {from: Tn where: (> a 0)}) 'a)) -- 9
+
+;; >= 3 -> {3,5} pass, nulls excluded -> 2, sum = 8
+(count (select {from: Tn where: (>= a 3)})) -- 2
+(sum (at (select {from: Tn where: (>= a 3)}) 'a)) -- 8
