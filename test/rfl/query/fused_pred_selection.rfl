@@ -129,7 +129,7 @@
 (count (select {from: BigT where: (in v [0 1 2 3 4 5 6 7 8 9])})) -- 10
 (count (select {from: BigT where: (in v [100000])})) -- 1
 
-;; Mixed expr + kernel: root OP_AND wraps an `in` kernel + a `!=` expr.
+;; Mixed expr + kernel: root OP_AND (not OP_IN), so rides the FALLBACK path, not fused-in.
 ;; Not expr-compilable (in is not an expr op) so this rides the bool
 ;; fallback both ways — the equivalence still holds.
 ;;   (in k ['a 'b]) -> {0,1,3};  (!= k 'b) drops row 1  -> {0,3} -> 2
@@ -155,3 +155,24 @@
 ;; between-as-range over T: (>= a 1) AND (<= a 2) -> a in {1,2} -> 3
 (count (select {from: T where: (and (>= a 1) (<= a 2))})) -- 3
 (sum (at (select {from: T where: (and (>= a 1) (<= a 2))}) 'b)) -- 130
+
+;; ====================================================================
+;; Part F — Nullable column with in predicate (extends Part D coverage).
+;; Verifies NULL rows are correctly NOT selected by `in`. Part D already
+;; exercises multi-morsel dispatch via BigT (200k rows). This part extends
+;; the nullable + in coverage with a larger nullable table.
+;;
+;;   a = [1 0N 2 0N 3 0N 4 0N 5 0N] repeated (10 elements per cycle:
+;;   5 non-null {1..5}, 5 null).  20 rows total.
+;; ====================================================================
+(set TnLarge (table [a] (list [1 0N 2 0N 3 0N 4 0N 5 0N 1 0N 2 0N 3 0N 4 0N 5 0N])))
+(count TnLarge) -- 20
+
+;; in [1 3 5] -> selects {1,3,5} per cycle -> 2 cycles * 3 = 6, nulls excluded
+(count (select {from: TnLarge where: (in a [1 3 5])})) -- 6
+
+;; in [2 4] -> selects {2,4} per cycle -> 2 cycles * 2 = 4
+(count (select {from: TnLarge where: (in a [2 4])})) -- 4
+
+;; not-in [1 3 5] -> {2,4} per cycle -> 2 cycles * 2 = 4
+(count (select {from: TnLarge where: (not-in a [1 3 5])})) -- 4
