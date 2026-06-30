@@ -55,7 +55,6 @@
 (> ['b 'b 'b] ['a 'b 'c]) -- [true false false]
 
 ;; mixed inline (≤ 12 bytes) and pooled (> 12 bytes) — exercises SSO.
-;; Note: hyphens in symbols would be parsed as ops, so use underscore.
 ;; 's' > 'l' so 'short > 'longer_…
 (> 'short 'longer_than_twelve_bytes_symbol) -- true
 (> 'longer_than_twelve_bytes_symbol 'short) -- false
