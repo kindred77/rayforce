@@ -225,6 +225,9 @@
 ;; dotted / underscored symbol chars (parse_symbol loop :456)
 (as 'STR 'a.b.c) -- "a.b.c"
 (as 'STR 'a_b) -- "a_b"
+;; hyphenated quoted symbol chars match the documented symbol syntax
+(as 'STR 'a-b) -- "a-b"
+(== 'a-b 'a-b) -- true
 ;; empty symbol before a closing bracket / brace / paren
 ;; (parse_symbol terminator guard :408-409)
 (count (list ')) -- 1
