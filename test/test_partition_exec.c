@@ -1193,7 +1193,7 @@ static test_result_t test_sel_compact_basic(void) {
     /* all-pass returns NULL; none-all-pass returns a block */
     TEST_ASSERT_NOT_NULL(sel);
 
-    ray_t* result = sel_compact(NULL, tbl, sel);
+    ray_t* result = sel_compact(NULL, tbl, sel, NULL, 0);
     TEST_ASSERT_NOT_NULL(result);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
     TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
@@ -1248,7 +1248,7 @@ static test_result_t test_sel_compact_none_pass(void) {
     ray_t* sel_np = ray_rowsel_from_pred(pred_np);
     TEST_ASSERT_NOT_NULL(sel_np);
 
-    ray_t* result = sel_compact(NULL, tbl, sel_np);
+    ray_t* result = sel_compact(NULL, tbl, sel_np, NULL, 0);
     TEST_ASSERT_NOT_NULL(result);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
     TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
@@ -1307,7 +1307,7 @@ static test_result_t test_sel_compact_parted(void) {
     ray_t* sel2 = ray_rowsel_from_pred(pred_sc2);
     TEST_ASSERT_NOT_NULL(sel2);
 
-    ray_t* result = sel_compact(NULL, tbl, sel2);
+    ray_t* result = sel_compact(NULL, tbl, sel2, NULL, 0);
     TEST_ASSERT_NOT_NULL(result);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
     TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
@@ -1788,7 +1788,7 @@ static test_result_t test_sel_compact_parted_str(void) {
     ray_t* sel_st = ray_rowsel_from_pred(pred_st);
     TEST_ASSERT_NOT_NULL(sel_st);
 
-    ray_t* result = sel_compact(NULL, tbl, sel_st);
+    ray_t* result = sel_compact(NULL, tbl, sel_st, NULL, 0);
     TEST_ASSERT_NOT_NULL(result);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
     TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
@@ -2026,7 +2026,7 @@ static test_result_t test_sel_compact_nrows_mismatch(void) {
     ray_t* sel_mm = ray_rowsel_from_pred(pred_mm);
     TEST_ASSERT_NOT_NULL(sel_mm);
 
-    ray_t* result = sel_compact(NULL, tbl, sel_mm);
+    ray_t* result = sel_compact(NULL, tbl, sel_mm, NULL, 0);
     /* Must return an error (nrows mismatch) */
     TEST_ASSERT_NOT_NULL(result);
     TEST_ASSERT_TRUE(RAY_IS_ERR(result));
@@ -2078,7 +2078,7 @@ static test_result_t test_sel_compact_many_cols(void) {
     ray_t* sel_mc3 = ray_rowsel_from_pred(pred_mc3);
     TEST_ASSERT_NOT_NULL(sel_mc3);
 
-    ray_t* result = sel_compact(NULL, tbl, sel_mc3);
+    ray_t* result = sel_compact(NULL, tbl, sel_mc3, NULL, 0);
     TEST_ASSERT_NOT_NULL(result);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
     TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
@@ -2089,6 +2089,95 @@ static test_result_t test_sel_compact_many_cols(void) {
     ray_release(pred_mc3);
     ray_release(tbl);
     for (int64_t c = 0; c < NCOLS; c++) ray_release(cols2[c]);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * sel_compact — keep-set projection
+ *
+ * Builds a 5-column table + a partial selection, then calls sel_compact with
+ * a keep-set of 2 column syms.  Asserts the result has exactly those 2 columns
+ * (by SYM lookup) with the correctly gathered values, and that a NULL keep-set
+ * returns all 5 columns unchanged.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_sel_compact_keepset(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    const int64_t N     = 100;
+    const int64_t NCOLS = 5;
+
+    ray_t* cols[NCOLS];
+    int64_t cnames[NCOLS];
+    char cn[8];
+    for (int64_t c = 0; c < NCOLS; c++) {
+        cols[c] = ray_vec_new(RAY_I64, N);
+        cols[c]->len = N;
+        int64_t* d = (int64_t*)ray_data(cols[c]);
+        for (int64_t i = 0; i < N; i++) d[i] = c * 1000 + i;
+        snprintf(cn, sizeof(cn), "k%lld", (long long)c);
+        cnames[c] = ray_sym_intern(cn, strlen(cn));
+    }
+
+    ray_t* tbl = ray_table_new(NCOLS);
+    for (int64_t c = 0; c < NCOLS; c++)
+        tbl = ray_table_add_col(tbl, cnames[c], cols[c]);
+
+    /* Partial selection: keep even rows */
+    ray_t* pred = ray_vec_new(RAY_BOOL, N); pred->len = N;
+    uint8_t* pd = (uint8_t*)ray_data(pred);
+    int64_t pass = 0;
+    for (int64_t i = 0; i < N; i++) { pd[i] = (i % 2 == 0); if (pd[i]) pass++; }
+    ray_t* sel = ray_rowsel_from_pred(pred);
+    TEST_ASSERT_NOT_NULL(sel);
+
+    /* keep-set: columns k1 and k3 only */
+    int64_t keep[2] = { cnames[1], cnames[3] };
+    ray_t* proj = sel_compact(NULL, tbl, sel, keep, 2);
+    TEST_ASSERT_NOT_NULL(proj);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(proj));
+    TEST_ASSERT_EQ_I(proj->type, RAY_TABLE);
+    /* exactly the 2 kept columns */
+    TEST_ASSERT_EQ_I(ray_table_ncols(proj), 2);
+    TEST_ASSERT_EQ_I(ray_table_nrows(proj), pass);
+    /* unkept columns absent */
+    TEST_ASSERT_NULL(ray_table_get_col(proj, cnames[0]));
+    TEST_ASSERT_NULL(ray_table_get_col(proj, cnames[2]));
+    TEST_ASSERT_NULL(ray_table_get_col(proj, cnames[4]));
+    /* kept columns present with correct gathered values (even rows) */
+    ray_t* pk1 = ray_table_get_col(proj, cnames[1]);
+    ray_t* pk3 = ray_table_get_col(proj, cnames[3]);
+    TEST_ASSERT_NOT_NULL(pk1);
+    TEST_ASSERT_NOT_NULL(pk3);
+    int64_t* v1 = (int64_t*)ray_data(pk1);
+    int64_t* v3 = (int64_t*)ray_data(pk3);
+    for (int64_t i = 0; i < pass; i++) {
+        TEST_ASSERT_EQ_I(v1[i], 1 * 1000 + (i * 2));
+        TEST_ASSERT_EQ_I(v3[i], 3 * 1000 + (i * 2));
+    }
+    ray_release(proj);
+
+    /* NULL keep-set: all 5 columns, unchanged */
+    ray_t* all = sel_compact(NULL, tbl, sel, NULL, 0);
+    TEST_ASSERT_NOT_NULL(all);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(all));
+    TEST_ASSERT_EQ_I(ray_table_ncols(all), NCOLS);
+    TEST_ASSERT_EQ_I(ray_table_nrows(all), pass);
+    for (int64_t c = 0; c < NCOLS; c++) {
+        ray_t* col = ray_table_get_col(all, cnames[c]);
+        TEST_ASSERT_NOT_NULL(col);
+        int64_t* cv = (int64_t*)ray_data(col);
+        for (int64_t i = 0; i < pass; i++)
+            TEST_ASSERT_EQ_I(cv[i], c * 1000 + (i * 2));
+    }
+    ray_release(all);
+
+    ray_rowsel_release(sel);
+    ray_release(pred);
+    ray_release(tbl);
+    for (int64_t c = 0; c < NCOLS; c++) ray_release(cols[c]);
     ray_sym_destroy();
     ray_heap_destroy();
     PASS();
@@ -2132,7 +2221,7 @@ static test_result_t test_sel_compact_parted_sym(void) {
     ray_t* sel_psy = ray_rowsel_from_pred(pred_psy);
     TEST_ASSERT_NOT_NULL(sel_psy);
 
-    ray_t* result = sel_compact(NULL, tbl, sel_psy);
+    ray_t* result = sel_compact(NULL, tbl, sel_psy, NULL, 0);
     TEST_ASSERT_NOT_NULL(result);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
     TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
@@ -2806,6 +2895,7 @@ const test_entry_t partition_exec_entries[] = {
     { "filter/large_many_cols",      test_filter_large_many_cols,         NULL, NULL },
     { "filter/sel_compact_mismatch", test_sel_compact_nrows_mismatch,     NULL, NULL },
     { "filter/sel_compact_manycols", test_sel_compact_many_cols,          NULL, NULL },
+    { "filter/sel_compact_keepset",  test_sel_compact_keepset,            NULL, NULL },
     { "filter/sel_compact_psym",     test_sel_compact_parted_sym,         NULL, NULL },
     { "filter/head_parted_sym",      test_filter_head_parted_sym,         NULL, NULL },
     { "filter/parted_vec_nulls",     test_filter_parted_vec_nulls,        NULL, NULL },
