@@ -1,0 +1,35 @@
+;; Selection-aware group iteration — equivalence battery.
+;;
+;; Builds a 60,000-row table whose (k1,k2) pairs have high cardinality so the
+;; filtered group-by routes through the radix_v2 engine (the path this change
+;; touches).  Every assertion is a hand-computed oracle: k1 = row/6 (0..9999),
+;; k2 = row mod 6, v = row.  So each (k1,k2) pair is unique per (k1, k2 in 0..5)
+;; and there are exactly 10000*6 = 60000 rows, 60000 distinct (k1,k2) pairs.
+(set N 60000)
+(set k1 (div (til N) 6))          ;; 0,0,0,0,0,0,1,1,... each k1 repeats 6x
+(set k2 (% (til N) 6))            ;; 0,1,2,3,4,5,0,1,...
+(set v  (til N))
+(set T (table [k1 k2 v] (list k1 k2 v)))
+
+;; ── Sparse filter (very few survivors) → gate fires, survivor iteration ──
+;; v < 30 keeps rows 0..29 → 30 rows, each a distinct (k1,k2) pair → 30 groups.
+(count (select {c: (count v) from: T where: (< v 30) by: {k1: k1 k2: k2}})) -- 30
+;; sum of per-group counts = number of surviving rows = 30
+(sum (at (select {c: (count v) from: T where: (< v 30) by: {k1: k1 k2: k2}}) 'c)) -- 30
+;; each surviving group has exactly 1 row (pairs are unique) → max count = 1
+(max (at (select {c: (count v) from: T where: (< v 30) by: {k1: k1 k2: k2}}) 'c)) -- 1
+
+;; ── Selective on a single key value → survivors scattered across the table ──
+;; k2 == 3 selects every 6th row → 10000 rows, 10000 distinct k1 groups.
+(count (select {c: (count v) from: T where: (== k2 3) by: {k1: k1}})) -- 10000
+
+;; ── Dense filter (most rows survive) → gate does NOT fire, scan path ──
+;; v >= 30 keeps 59970 rows → 59970 distinct (k1,k2) groups.
+(count (select {c: (count v) from: T where: (>= v 30) by: {k1: k1 k2: k2}})) -- 59970
+
+;; ── Empty selection (0 survivors) → survivor list is empty, 0 groups ──
+(count (select {c: (count v) from: T where: (< v 0) by: {k1: k1 k2: k2}})) -- 0
+
+;; ── Aggregate over a non-key column under a sparse filter ──
+;; sum(v) for v in 0..29 = 29*30/2 = 435
+(sum (at (select {s: (sum v) from: T where: (< v 30) by: {k1: k1 k2: k2}}) 's)) -- 435
