@@ -290,3 +290,17 @@
 (sum (at (inner-join [id] LJsmall RJbig) 'val)) -- 36
 ;; 200 back-to-back radix joins — a single dropped row anywhere shows as < 1600.
 (sum (map (fn [_] (count (inner-join [id] LJsmall RJbig))) (til 200))) -- 1600
+
+;; ── regression: asof / window-join must carry an adaptive-width SYM equality
+;; key from a splayed (loaded) source.  Splayed SYM columns are W32; the output
+;; gather in exec_window_join used a fixed W64 (ray_type_sizes[RAY_SYM]) stride,
+;; reading ids at the wrong offset and emitting the empty symbol.  Round-trip a
+;; table through splayed storage (→ W32 FILE-domain sym) then join it.
+(.sys.exec "rm -rf /tmp/rfl_asof_symw")
+(set Asw (table [sym time bid] (list [AAPL AAPL MSFT] [100 200 150] [1 2 3])))
+(.db.splayed.set "/tmp/rfl_asof_symw/t" Asw "/tmp/rfl_asof_symw/sym")
+(set Asl (.db.splayed.get "/tmp/rfl_asof_symw/t" "/tmp/rfl_asof_symw/sym"))
+;; asof-join: the left SYM key survives (was [' ' '] before the fix)
+(at (asof-join [sym time] (select {from: Asl sym: sym time: time bid: bid}) (select {from: Asl sym: sym time: time b2: bid})) 'sym) -- [AAPL AAPL MSFT]
+;; window-join: same executor (OP_WINDOW_JOIN), same key-gather path
+(at (window-join [sym time] (map-left + [-50 50] (at Asl 'time)) (select {from: Asl sym: sym time: time}) (select {from: Asl sym: sym time: time bid: bid}) {mb: (min bid)}) 'sym) -- [AAPL AAPL MSFT]
