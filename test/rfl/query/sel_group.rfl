@@ -1,11 +1,14 @@
 ;; Selection-aware group iteration — equivalence battery.
 ;;
-;; Builds a 60,000-row table whose (k1,k2) pairs have high cardinality so the
-;; filtered group-by routes through the radix_v2 engine (the path this change
-;; touches).  Every assertion is a hand-computed oracle: k1 = row/6 (0..9999),
+;; Builds a 120,000-row table (N=120000 > 65536 parallel threshold) so the
+;; multi-key group-by runs on the parallel high-cardinality group path.
+;; Every assertion is a hand-computed oracle: k1 = row/6 (0..19999),
 ;; k2 = row mod 6, v = row.  So each (k1,k2) pair is unique per (k1, k2 in 0..5)
-;; and there are exactly 10000*6 = 60000 rows, 60000 distinct (k1,k2) pairs.
-(set N 60000)
+;; and there are exactly 20000*6 = 120000 rows, 120000 distinct (k1,k2) pairs.
+;; The sparse-filter cases exercise selection-aware survivor iteration.
+;; Byte-identical results vs. the serial path at scale are additionally verified
+;; by the 10M q40/q41 differential (plan Task 1, Step 6).
+(set N 120000)
 (set k1 (div (til N) 6))          ;; 0,0,0,0,0,0,1,1,... each k1 repeats 6x
 (set k2 (% (til N) 6))            ;; 0,1,2,3,4,5,0,1,...
 (set v  (til N))
@@ -20,12 +23,12 @@
 (max (at (select {c: (count v) from: T where: (< v 30) by: {k1: k1 k2: k2}}) 'c)) -- 1
 
 ;; ── Selective on a single key value → survivors scattered across the table ──
-;; k2 == 3 selects every 6th row → 10000 rows, 10000 distinct k1 groups.
-(count (select {c: (count v) from: T where: (== k2 3) by: {k1: k1}})) -- 10000
+;; k2 == 3 selects every 6th row → N/6 = 20000 rows, 20000 distinct k1 groups.
+(count (select {c: (count v) from: T where: (== k2 3) by: {k1: k1}})) -- 20000
 
 ;; ── Dense filter (most rows survive) → gate does NOT fire, scan path ──
-;; v >= 30 keeps 59970 rows → 59970 distinct (k1,k2) groups.
-(count (select {c: (count v) from: T where: (>= v 30) by: {k1: k1 k2: k2}})) -- 59970
+;; v >= 30 keeps N-30 = 119970 rows → 119970 distinct (k1,k2) groups.
+(count (select {c: (count v) from: T where: (>= v 30) by: {k1: k1 k2: k2}})) -- 119970
 
 ;; ── Empty selection (0 survivors) → survivor list is empty, 0 groups ──
 (count (select {c: (count v) from: T where: (< v 0) by: {k1: k1 k2: k2}})) -- 0
