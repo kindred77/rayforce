@@ -2084,8 +2084,48 @@ static test_result_t test_sel_compact_many_cols(void) {
     TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
     TEST_ASSERT_EQ_I(ray_table_nrows(result), 2048);
 
-    ray_rowsel_release(sel_mc3);
+    /* Per-column value check across the batch boundary: surviving rows are
+     * orig indices 1024..3071.  Columns 0-15 land in the first batch and
+     * column 16 in the second — a value mismatch in col 16 would flag a
+     * skipped/double-gathered batch. */
+    for (int64_t c = 0; c < NCOLS; c++) {
+        ray_t* col = ray_table_get_col(result, cnames2[c]);
+        TEST_ASSERT_NOT_NULL(col);
+        int64_t* cv = (int64_t*)ray_data(col);
+        for (int64_t i = 0; i < 2048; i++)
+            TEST_ASSERT_EQ_I(cv[i], c * 1000 + 1024 + i);
+    }
     ray_release(result);
+
+    /* Keep-set spanning the batch boundary: keep cols {2, 5, 16}.
+     * Cols 2 and 5 are in the first gather batch; col 16 is in the second.
+     * Asserts correct column projection AND correct values across batches. */
+    int64_t keep3[3] = { cnames2[2], cnames2[5], cnames2[16] };
+    ray_t* result2 = sel_compact(NULL, tbl, sel_mc3, keep3, 3);
+    TEST_ASSERT_NOT_NULL(result2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result2));
+    TEST_ASSERT_EQ_I(result2->type, RAY_TABLE);
+    TEST_ASSERT_EQ_I(ray_table_ncols(result2), 3);
+    TEST_ASSERT_EQ_I(ray_table_nrows(result2), 2048);
+    /* Unkept columns absent */
+    TEST_ASSERT_NULL(ray_table_get_col(result2, cnames2[0]));
+    TEST_ASSERT_NULL(ray_table_get_col(result2, cnames2[1]));
+    TEST_ASSERT_NULL(ray_table_get_col(result2, cnames2[3]));
+    /* Kept columns present with correct gathered values */
+    {
+        int64_t kidxs[3] = { 2, 5, 16 };
+        for (int k = 0; k < 3; k++) {
+            int64_t c = kidxs[k];
+            ray_t* col = ray_table_get_col(result2, cnames2[c]);
+            TEST_ASSERT_NOT_NULL(col);
+            int64_t* cv = (int64_t*)ray_data(col);
+            for (int64_t i = 0; i < 2048; i++)
+                TEST_ASSERT_EQ_I(cv[i], c * 1000 + 1024 + i);
+        }
+    }
+    ray_release(result2);
+
+    ray_rowsel_release(sel_mc3);
     ray_release(pred_mc3);
     ray_release(tbl);
     for (int64_t c = 0; c < NCOLS; c++) ray_release(cols2[c]);
