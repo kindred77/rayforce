@@ -1,0 +1,58 @@
+;; Projection-aware compaction equivalence battery.
+;;
+;; A filtered `select {where: … by: {k1 k2 …}}` whose result feeds a keys-only
+;; DISTINCT under an active outer projection hint now materialises only the
+;; referenced columns (keys ∪ outer proj_keep) instead of the whole filtered
+;; table — see filt_compact_keep (src/ops/query.c) + the __VM->filt_keep
+;; consumer (src/ops/exec.c, ray_execute_inner finalization).
+;;
+;; Correctness is proven by direct hand-computed oracles: every assertion below
+;; is the exact right answer, so a wrong keep-set (a dropped needed column)
+;; would change a count and fail here.  Shapes cover: a multi-key DISTINCT over a filtered
+;; 6-column table (the q11 inner shape, which the projection actually fires
+;; on); the same nested under an outer count (the full push-down pipeline); a
+;; group whose aggregate input column differs from its key; a nullable integer
+;; key; and a computed key (which bails to all-columns).
+
+;; ── 6-column fixture (so projection can actually drop columns) ──────────────
+;;   k1: a a a b b b c c
+;;   k2: x x y x y y x x
+;;   v : 1 2 3 4 5 6 7 8
+;;   w : 10 10 20 20 30 30 40 40
+;;   g : p q p q p q p q
+;;   h : 1 1 1 1 1 1 1 1
+(set T (table [k1 k2 v w g h] (list ['a 'a 'a 'b 'b 'b 'c 'c] ['x 'x 'y 'x 'y 'y 'x 'x] [1 2 3 4 5 6 7 8] [10 10 20 20 30 30 40 40] ['p 'q 'p 'q 'p 'q 'p 'q] [1 1 1 1 1 1 1 1])))
+
+;; ── Shape 1: multi-key DISTINCT over a filtered table (q11 inner shape) ──────
+;; distinct (k1,k2) pairs = {(a,x),(a,y),(b,x),(b,y),(c,x)} = 5
+(count (select {from: T where: (> v 0) by: {k1: k1 k2: k2}})) -- 5
+;; WHERE drops the two c-rows → pairs among a,b = {(a,x),(a,y),(b,x),(b,y)} = 4
+(count (select {from: T where: (!= k1 'c) by: {k1: k1 k2: k2}})) -- 4
+
+;; ── Shape 2: nested DISTINCT under an outer count (full push-down pipeline) ──
+;; inner distinct(k1,k2)=5 rows; outer groups by k1 → a:2 b:2 c:1
+;; number of outer groups = 3
+(count (select {cnt: (count k1) from: (select {from: T where: (> v 0) by: {k1: k1 k2: k2}}) by: {k1: k1}})) -- 3
+;; sum of per-k1 counts = total distinct pairs = 5
+(sum (at (select {cnt: (count k1) from: (select {from: T where: (> v 0) by: {k1: k1 k2: k2}}) by: {k1: k1}}) 'cnt)) -- 5
+
+;; ── Shape 3: aggregate input column differs from the key ────────────────────
+;; sum(w) by k1: a=10+10+20=40, b=20+30+30=80, c=40+40=80; total = 200
+(sum (at (select {s: (sum w) from: T where: (> v 0) by: {k1: k1}}) 's)) -- 200
+;; group count = 3 distinct k1
+(count (select {s: (sum w) from: T where: (> v 0) by: {k1: k1}})) -- 3
+
+;; ── Shape 4: computed key — bails to all columns, still correct ─────────────
+;; m = v-1 for v in 1..8 → 8 distinct keys
+(count (select {from: T by: {m: (- v 1)}})) -- 8
+
+;; ── Shape 5: nullable integer key ──────────────────────────────────────────
+;;   ik : 1 0N 1 2 0N   val : 10 20 30 40 50
+(set N (table [ik val] (list [1 0N 1 2 0N] [10 20 30 40 50])))
+;; distinct ik groups = {1, 0N, 2} = 3 (null is a value)
+(count (select {from: N by: {ik: ik}})) -- 3
+;; sum of count(val) per ik = total rows = 5
+(sum (at (select {c: (count val) from: N by: {ik: ik}}) 'c)) -- 5
+;; nested multi-key DISTINCT with a nullable key under an outer count:
+;; distinct(ik,val) where val>0 = 5 distinct pairs → sum of per-ik counts = 5
+(sum (at (select {c: (count ik) from: (select {from: N where: (> val 0) by: {ik: ik val: val}}) by: {ik: ik}}) 'c)) -- 5
