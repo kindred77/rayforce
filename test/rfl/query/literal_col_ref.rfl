@@ -66,3 +66,20 @@
 ;; an operand — that atom then resolves, which is why the idiom works.
 (== 'price (quote price)) -- true
 (at (select {o: (quote price) from: Tlit}) 'o) -- ['price 'price 'price]
+
+;; --- regression (fix: (quote X) in a WHERE/DAG predicate).  Before the fix
+;; the (quote X) CALL form reaching compile_expr_dag returned NULL, so an
+;; inline (quote x) worked in a projection (eval fallback) but ERRORED in a
+;; WHERE predicate ("WHERE predicate not supported by DAG compiler").  It now
+;; folds to the literal symbol — WITHOUT the in-query column-shadow rule, so it
+;; stays the literal even when it names a column (the AST-shape boundary above).
+;; T2 has SYM col `s` (['a 'b 'c 'a]) and BOOL col `b`.
+;;   (quote b): literal 'b  -> (== s 'b-literal) matches the 'b row     -> 1
+;;   'b (tick): resolves to col b -> (== s b) sym-vs-bool               -> 0
+(count (select {from: T2 where: (== s (quote b))})) -- 1
+(count (select {from: T2 where: (== s 'b)})) -- 0
+;; a symbol naming NO column: (quote a) and 'a agree (both literal)     -> 2
+(count (select {from: T2 where: (== s (quote a))})) -- 2
+(count (select {from: T2 where: (== s 'a)})) -- 2
+;; and-chained predicate operand also folds (no longer "not supported")
+(count (select {from: T2 where: (and (== s (quote a)) (== s 'a))})) -- 2
