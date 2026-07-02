@@ -332,3 +332,13 @@
 (set LT (table [sym time q] (list ['a] [5] [1])))
 (set RT (table [sym time px] (list ['a 'a 'a] [5 5 5] [1.0 2.0 3.0])))
 (at (asof-join ['sym 'time] LT RT) 'px) -- [3.0]
+;; multi-eq-key with a CSR grouped index on the FIRST key + globally sorted
+;; time -> the slice-walk cursor-merge variant; same rows unindexed take the
+;; full-pass variants.  All must agree.
+(set R2I (table [sym ex time px] (list (.attr.set 'grouped ['a 'a 'b 'a]) ['X 'Y 'X 'X] [1 2 3 4] [10.0 20.0 30.0 11.0])))
+(set R2P (table [sym ex time px] (list ['a 'a 'b 'a] ['X 'Y 'X 'X] [1 2 3 4] [10.0 20.0 30.0 11.0])))
+(at (asof-join ['sym 'ex 'time] L2 R2I) 'px) -- [11.0 20.0 30.0]
+(asof-join ['sym 'ex 'time] L2 R2I) -- (asof-join ['sym 'ex 'time] L2 R2P)
+;; left key absent from the index (sym 'z) -> null fill, not a crash
+(set L2Z (table [sym ex time qty] (list ['z 'a] ['X 'X] [5 5] [1 2])))
+(at (asof-join ['sym 'ex 'time] L2Z R2I) 'px) -- [0N 11.0]

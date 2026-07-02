@@ -1931,6 +1931,180 @@ static bool asof_hash_group_match(uint8_t n_eq,
         /* ineligible / OOM — fall through to the scan variants */
     }
 
+    /* Multi-key index variant — n_eq >= 2 with a fresh CSR index on the
+     * FIRST key (same sorted/no-null preconditions): walk only the probed
+     * first keys' slices, resolving each slice row to its full
+     * (k0,k1,...) group by comparing the remaining keys inline, and drive
+     * the same per-group cursor merge the full-pass variant uses (a slice
+     * is ascending row ids, hence ascending times — every group under one
+     * first key is a subsequence of that one ordered walk).  Cost is
+     * proportional to the PROBED slices; when those cover most of the
+     * table anyway, the sequential full pass is cheaper per row, so bail
+     * upfront on the (known!) slice-length sum. */
+    if (ok && n_eq >= 2 && rt_time_sorted && rt_no_nulls && n_groups > 0 &&
+        ray_index_kind(rt_eq[0]) == RAY_IDX_HASH) {
+        ray_idx_consults[IDX_SITE_ASOF]++;
+        bool served = true;
+
+        /* Distinct FIRST keys among the groups: fk_of[g] = distinct-fk
+         * ordinal, chained via fkg_next[g] so one slice walk serves every
+         * group sharing its first key.  Dedup through a small OA table. */
+        uint64_t fcap = 16;
+        while (fcap < (uint64_t)n_groups * 2u) fcap <<= 1;
+        uint64_t fmask = fcap - 1;
+        ray_t *ftab_hdr = NULL, *fhead_hdr = NULL, *fnext_hdr = NULL,
+              *fsl_hdr = NULL;
+        ray_t *lcnt_hdr = NULL, *ls_hdr = NULL, *cur_hdr = NULL,
+              *prev_hdr = NULL;
+        int32_t* ftab    = (int32_t*)scratch_alloc(&ftab_hdr, fcap * 4);
+        int32_t* fk_head = (int32_t*)scratch_alloc(&fhead_hdr,
+                                                   (size_t)n_groups * 4);
+        int32_t* fkg_next = (int32_t*)scratch_alloc(&fnext_hdr,
+                                                    (size_t)n_groups * 4);
+        int64_t* fsl = (int64_t*)scratch_alloc(&fsl_hdr,
+                                               (size_t)n_groups * 2 *
+                                               sizeof(int64_t));
+        int32_t* lcnt = (int32_t*)scratch_alloc(&lcnt_hdr,
+                                                ((size_t)n_groups + 1) * 4);
+        int32_t* cur  = (int32_t*)scratch_alloc(&cur_hdr,
+                                                ((size_t)n_groups + 1) * 4);
+        int32_t* prev = (int32_t*)scratch_alloc(&prev_hdr,
+                                                ((size_t)n_groups + 1) * 4);
+        asof_lslot_t* ls = (asof_lslot_t*)scratch_alloc(&ls_hdr,
+                              (size_t)left_n * sizeof(asof_lslot_t));
+        int32_t n_fk = 0;
+        if (ftab && fk_head && fkg_next && fsl &&
+            lcnt && cur && prev && ls) {
+            memset(ftab, 0, fcap * 4);
+            for (int32_t g = 0; g < n_groups; g++) {
+                int64_t k0 = gkeys[(int64_t)g * n_eq];
+                uint64_t slot = (uint64_t)ray_hash_i64(k0) & fmask;
+                int32_t fid = -1;
+                for (;;) {
+                    int32_t fp1 = ftab[slot];
+                    if (fp1 == 0) {
+                        ftab[slot] = n_fk + 1;
+                        fk_head[n_fk] = -1;
+                        fid = n_fk++;
+                        break;
+                    }
+                    int32_t rep = fk_head[fp1 - 1];
+                    /* compare against any chained group's first key */
+                    if (rep >= 0 &&
+                        gkeys[(int64_t)rep * n_eq] == k0) { fid = fp1 - 1; break; }
+                    if (rep < 0) {
+                        /* empty chain can't happen after first insert below,
+                         * but stay defensive: treat as fresh slot walk */
+                    }
+                    slot = (slot + 1) & fmask;
+                }
+                fkg_next[g] = fk_head[fid];
+                fk_head[fid] = g;
+            }
+
+            /* Probe each distinct first key once; sum the slice lengths
+             * for the density bail. */
+            int64_t total_slice = 0;
+            for (int32_t f = 0; f < n_fk && served; f++) {
+                int32_t rep = fk_head[f];
+                const int64_t* grows = NULL;
+                int64_t gn = 0;
+                int hit = ray_index_hash_group(rt_eq[0],
+                                               gkeys[(int64_t)rep * n_eq],
+                                               &grows, &gn);
+                if (hit < 0) { served = false; break; }   /* ineligible */
+                fsl[2 * f]     = (int64_t)(intptr_t)grows;
+                fsl[2 * f + 1] = gn;
+                total_slice += gn;
+            }
+            /* Density bail: the sequential full pass reads every row once
+             * with better locality than slice-driven scattered reads. */
+            if (served && total_slice > right_n / 2) served = false;
+
+            if (served) {
+                ray_idx_hits[IDX_SITE_ASOF]++;
+                /* Left cursor structures — identical to the full-pass
+                 * cursor merge. */
+                memset(lcnt, 0, ((size_t)n_groups + 1) * 4);
+                for (int64_t li = 0; li < left_n; li++) {
+                    if (left_gid[li] >= 0) lcnt[left_gid[li]]++;
+                    else match_orig[li] = -1;
+                }
+                int32_t acc = 0;
+                for (int32_t g = 0; g < n_groups; g++) {
+                    int32_t c = lcnt[g];
+                    lcnt[g] = acc;
+                    cur[g] = acc;
+                    acc += c;
+                }
+                lcnt[n_groups] = acc;
+                for (int64_t li = 0; li < left_n; li++) {
+                    int32_t g = left_gid[li];
+                    if (g < 0) continue;
+                    ls[cur[g]].t  = lt_time[li];
+                    ls[cur[g]].li = (int32_t)li;
+                    cur[g]++;
+                }
+                for (int32_t g = 0; g < n_groups; g++) {
+                    int32_t sz = lcnt[g + 1] - lcnt[g];
+                    if (sz > 1)
+                        qsort(ls + lcnt[g], (size_t)sz,
+                              sizeof(asof_lslot_t), asof_lslot_cmp);
+                    cur[g]  = lcnt[g];
+                    prev[g] = -1;
+                }
+
+                /* One ordered walk per probed first key; resolve each
+                 * slice row to its full group by the remaining keys. */
+                for (int32_t f = 0; f < n_fk; f++) {
+                    const int64_t* grows =
+                        (const int64_t*)(intptr_t)fsl[2 * f];
+                    int64_t gn = fsl[2 * f + 1];
+                    int32_t head = fk_head[f];
+                    for (int64_t p = 0; p < gn; p++) {
+                        int64_t i = grows[p];
+                        int32_t gid = head;
+                        while (gid >= 0) {
+                            const int64_t* gk =
+                                gkeys + (int64_t)gid * n_eq;
+                            int eq = 1;
+                            for (uint8_t k = 1; k < n_eq; k++) {
+                                int64_t rv = read_col_i64(
+                                    ray_data(rt_eq[k]), i,
+                                    rt_eq[k]->type, rt_eq[k]->attrs);
+                                if (gk[k] != rv) { eq = 0; break; }
+                            }
+                            if (eq) break;
+                            gid = fkg_next[gid];
+                        }
+                        if (gid < 0) continue;
+                        int64_t rt = rt_time[i];
+                        while (cur[gid] < lcnt[gid + 1] &&
+                               ls[cur[gid]].t < rt) {
+                            match_orig[ls[cur[gid]].li] = prev[gid];
+                            cur[gid]++;
+                        }
+                        prev[gid] = (int32_t)i;
+                    }
+                }
+                for (int32_t g = 0; g < n_groups; g++)
+                    while (cur[g] < lcnt[g + 1])
+                        match_orig[ls[cur[g]++].li] = prev[g];
+
+                scratch_free(ftab_hdr);  scratch_free(fhead_hdr);
+                scratch_free(fnext_hdr); scratch_free(fsl_hdr);
+                scratch_free(lcnt_hdr);  scratch_free(cur_hdr);
+                scratch_free(prev_hdr);  scratch_free(ls_hdr);
+                goto done;
+            }
+        }
+        scratch_free(ftab_hdr);  scratch_free(fhead_hdr);
+        scratch_free(fnext_hdr); scratch_free(fsl_hdr);
+        scratch_free(lcnt_hdr);  scratch_free(cur_hdr);
+        scratch_free(prev_hdr);  scratch_free(ls_hdr);
+        /* ineligible / dense / OOM — fall through to the scan variants */
+    }
+
     if (ok) {
         cnt = (int32_t*)scratch_alloc(&cnt_hdr, ((size_t)n_groups + 1) * 4);
         off = (int32_t*)scratch_alloc(&off_hdr, ((size_t)n_groups + 1) * 4);
