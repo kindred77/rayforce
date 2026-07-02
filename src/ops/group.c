@@ -3977,12 +3977,19 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
                               const int64_t* min_i64,  const int64_t* max_i64,
                               const int64_t* counts,
                               const agg_affine_t* affine,
+                              const agg_prod_t* prod,
                               const double*  sumsq_f64,
                               const int64_t* nn_counts) {
     for (uint8_t a = 0; a < n_aggs; a++) {
         uint16_t agg_op = ext->agg_ops[a];
         ray_t* agg_col = agg_vecs[a];
-        bool is_f64 = agg_col && agg_col->type == RAY_F64;
+        /* agg_col == NULL means a fused input.  The accumulator family
+         * follows the FUSION, not the expression's out_type: a fused
+         * product accumulates F64; the linear i64 plan accumulates i64
+         * even when its compiled expression promotes to F64. */
+        bool is_f64 = agg_col
+            ? (agg_col->type == RAY_F64)
+            : (prod && prod[a].enabled);
         int8_t out_type;
         switch (agg_op) {
             case OP_AVG:
@@ -4179,6 +4186,7 @@ typedef struct {
     int8_t*        agg_types;
     ray_t**        agg_cols;
     uint8_t*       agg_strlen;
+    agg_prod_t*    agg_prod;     /* fused SUM/AVG(a*b) slots (may be NULL) */
     uint16_t*      agg_ops;      /* per-agg operation code */
     uint8_t        n_aggs;
     uint8_t        need_flags;   /* DA_NEED_* bitmask */
@@ -4583,6 +4591,55 @@ static inline int64_t agg_int_null_sentinel_for(int8_t t) {
     }
 }
 
+/* Fused SUM/AVG(a*b) per-row product — both sides promoted to double,
+ * matching the expr path exactly (see try_prod_sumavg_input_f64). */
+static inline double prod_val_f64(const agg_prod_t* p, int64_t r) {
+    double x = (p->ta == RAY_F64) ? ((const double*)p->pa)[r]
+             : (double)read_col_i64(p->pa, r, p->ta, p->aa);
+    double y = (p->tb == RAY_F64) ? ((const double*)p->pb)[r]
+             : (double)read_col_i64(p->pb, r, p->tb, p->ab);
+    return x * y;
+}
+
+/* Pool worker + fallback materializer for fused-product slots.  Group
+ * paths WITHOUT the fused read (radix sp / HT row-layout) call this at
+ * entry: each enabled slot becomes an ordinary owned F64 agg vector and
+ * the slot is disabled — semantics identical to the never-fused flow.
+ * Returns false on OOM (nothing partially converted is leaked: converted
+ * slots are ordinary owned agg_vecs freed by the caller's error path). */
+typedef struct {
+    const agg_prod_t* prod;
+    double*           dst;
+} prod_fill_ctx_t;
+
+static void prod_fill_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    prod_fill_ctx_t* c = (prod_fill_ctx_t*)raw;
+    for (int64_t i = start; i < end; i++)
+        c->dst[i] = prod_val_f64(c->prod, i);
+}
+
+static bool group_materialize_prod_slots(agg_prod_t* prod, ray_t** agg_vecs,
+                                         uint8_t* agg_owned, uint8_t n_aggs,
+                                         int64_t nrows) {
+    for (uint8_t a = 0; a < n_aggs; a++) {
+        if (!prod[a].enabled) continue;
+        ray_t* v = ray_vec_new(RAY_F64, nrows > 0 ? nrows : 1);
+        if (!v || RAY_IS_ERR(v)) return false;
+        v->len = nrows;
+        prod_fill_ctx_t fc = { .prod = &prod[a], .dst = (double*)ray_data(v) };
+        ray_pool_t* pool = ray_pool_get();
+        if (pool && nrows >= RAY_PARALLEL_THRESHOLD)
+            ray_pool_dispatch(pool, prod_fill_fn, &fc, nrows);
+        else
+            prod_fill_fn(&fc, 0, 0, nrows);
+        agg_vecs[a] = v;
+        agg_owned[a] = 1;
+        prod[a].enabled = false;
+    }
+    return true;
+}
+
 /* ---- Scalar aggregate (n_keys==0): one flat scan, no GID, no hash ---- */
 typedef struct {
     void**         agg_ptrs;
@@ -4591,6 +4648,7 @@ typedef struct {
     uint8_t*       agg_strlen;
     uint16_t*      agg_ops;
     agg_linear_t*  agg_linear;
+    agg_prod_t*    agg_prod;     /* fused SUM/AVG(a*b) slots (may be NULL) */
     uint8_t        n_aggs;
     uint8_t        need_flags;
     const int64_t* match_idx;    /* NULL = no selection */
@@ -4667,7 +4725,10 @@ static inline void scalar_accum_row(scalar_ctx_t* c, da_accum_t* acc, int64_t r)
     int64_t* nn = acc->nn_count;
     for (uint8_t a = 0; a < n_aggs; a++) {
         double fv; int64_t iv;
-        if (c->agg_linear && c->agg_linear[a].enabled) {
+        if (c->agg_prod && c->agg_prod[a].enabled) {
+            fv = prod_val_f64(&c->agg_prod[a], r);
+            iv = (int64_t)fv;
+        } else if (c->agg_linear && c->agg_linear[a].enabled) {
             const agg_linear_t* lin = &c->agg_linear[a];
             iv = lin->bias_i64;
             for (uint8_t t = 0; t < lin->n_terms; t++) {
@@ -4789,8 +4850,14 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
         uint32_t inm = c->agg_int_null_mask;
         int64_t* nn = acc->nn_count;
         for (uint8_t a = 0; a < n_aggs; a++) {
-            if (!c->agg_ptrs[a]) continue;
             size_t idx = base + a;
+            if (c->agg_prod && c->agg_prod[a].enabled) {
+                /* Fused product: gated null-free, so every row counts. */
+                acc->sum[idx].f += prod_val_f64(&c->agg_prod[a], r);
+                if (nn) nn[idx]++;
+                continue;
+            }
+            if (!c->agg_ptrs[a]) continue;
             if (c->agg_strlen && c->agg_strlen[a]) {
                 acc->sum[idx].i += group_strlen_at_cached(
                     c->agg_cols[a], r, c->sym_strings, c->sym_count);
@@ -4836,10 +4903,14 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
 
     int64_t* nn = acc->nn_count;
     for (uint8_t a = 0; a < n_aggs; a++) {
-        if (!c->agg_ptrs[a]) continue;
+        if (!c->agg_ptrs[a] && !(c->agg_prod && c->agg_prod[a].enabled))
+            continue;
         size_t idx = base + a;
         double fv; int64_t iv;
-        if (c->agg_strlen && c->agg_strlen[a]) {
+        if (c->agg_prod && c->agg_prod[a].enabled) {
+            fv = prod_val_f64(&c->agg_prod[a], r);
+            iv = (int64_t)fv;
+        } else if (c->agg_strlen && c->agg_strlen[a]) {
             iv = group_strlen_at_cached(c->agg_cols[a], r,
                                         c->sym_strings, c->sym_count);
             fv = (double)iv;
@@ -6036,6 +6107,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     uint8_t agg_strlen[vla_aggs];
     agg_affine_t agg_affine[vla_aggs];
     agg_linear_t agg_linear[vla_aggs];
+    agg_prod_t   agg_prod[vla_aggs];
     memset(agg_vecs, 0, vla_aggs * sizeof(ray_t*));
     memset(agg_vecs2, 0, vla_aggs * sizeof(ray_t*));
     memset(agg_owned, 0, vla_aggs * sizeof(uint8_t));
@@ -6043,6 +6115,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     memset(agg_strlen, 0, vla_aggs * sizeof(uint8_t));
     memset(agg_affine, 0, vla_aggs * sizeof(agg_affine_t));
     memset(agg_linear, 0, vla_aggs * sizeof(agg_linear_t));
+    memset(agg_prod,   0, vla_aggs * sizeof(agg_prod_t));
 
     for (uint8_t a = 0; a < n_aggs; a++) {
         ray_op_t* agg_input_op = op_node(g, ext->agg_ins[a]);
@@ -6066,6 +6139,14 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         if (n_keys == 0 && nrows > 0 &&
             (agg_kind == OP_SUM || agg_kind == OP_AVG) &&
             try_linear_sumavg_input_i64(g, tbl, agg_input_op, &agg_linear[a])) {
+            continue;
+        }
+
+        /* SUM/AVG(a * b) float product: the scalar and DA accumulators
+         * multiply per row; paths without the fused read (radix sp / HT)
+         * materialize on entry via group_materialize_prod_slots. */
+        if ((agg_kind == OP_SUM || agg_kind == OP_AVG) && nrows > 0 &&
+            try_prod_sumavg_input_f64(g, tbl, agg_input_op, &agg_prod[a])) {
             continue;
         }
 
@@ -6242,6 +6323,13 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         uint32_t sc_int_null_mask = 0;
         bool sc_any_nullable = false;
         for (uint8_t a = 0; a < n_aggs; a++) {
+            if (agg_prod[a].enabled) {
+                /* Fused product: F64 accumulate, no source vec. */
+                agg_ptrs[a]  = NULL;
+                agg_types[a] = RAY_F64;
+                sc_int_null_sentinel[a] = 0;
+                continue;
+            }
             if (agg_vecs[a]) {
                 agg_ptrs[a]  = ray_data(agg_vecs[a]);
                 agg_types[a] = agg_vecs[a]->type;
@@ -6336,6 +6424,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             .agg_strlen = agg_strlen,
             .agg_ops    = ext->agg_ops,
             .agg_linear = agg_linear,
+            .agg_prod   = agg_prod,
             .n_aggs     = n_aggs,
             .need_flags = need_flags,
             .match_idx  = match_idx,
@@ -6476,7 +6565,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                          (double*)m->sum, (int64_t*)m->sum,
                          (double*)m->min_val, (double*)m->max_val,
                          (int64_t*)m->min_val, (int64_t*)m->max_val,
-                         m->count, agg_affine, m->sumsq_f64, m->nn_count);
+                         m->count, agg_affine, agg_prod, m->sumsq_f64, m->nn_count);
 
         /* Wide-element (STR/GUID) min/max/first/last overflow emit_agg_columns'
          * fixed-width slots (it truncated them to 1 byte above).  Recompute
@@ -6775,6 +6864,14 @@ da_path:;
              * with HAS_NULLS use sentinel-skip. */
             bool da_any_nullable = false;
             for (uint8_t a = 0; a < n_aggs; a++) {
+                if (agg_prod[a].enabled) {
+                    /* Fused product: F64 accumulate, no source vec. */
+                    agg_ptrs[a]  = NULL;
+                    agg_types[a] = RAY_F64;
+                    agg_f64_mask |= (1u << a);
+                    da_int_null_sentinel[a] = 0;
+                    continue;
+                }
                 if (agg_vecs[a]) {
                     agg_ptrs[a]  = ray_data(agg_vecs[a]);
                     agg_types[a] = agg_vecs[a]->type;
@@ -6920,6 +7017,7 @@ da_path:;
                 .agg_types   = agg_types,
                 .agg_cols    = agg_vecs,
                 .agg_strlen  = agg_strlen,
+                .agg_prod    = agg_prod,
                 .agg_ops     = ext->agg_ops,
                 .n_aggs      = n_aggs,
                 .need_flags  = need_flags,
@@ -7240,7 +7338,7 @@ da_path:;
                              (double*)dense_sum, (int64_t*)dense_sum,
                              (double*)dense_min_val, (double*)dense_max_val,
                              (int64_t*)dense_min_val, (int64_t*)dense_max_val,
-                             dense_counts, agg_affine, dense_sumsq,
+                             dense_counts, agg_affine, agg_prod, dense_sumsq,
                              dense_nn_counts);
 
             scratch_free(_h_dsum); scratch_free(_h_dmin);
@@ -7292,6 +7390,12 @@ da_path:;
         }
 
         if (sp_eligible) {
+            /* The radix entry layout reads agg_vecs directly — convert any
+             * fused-product slots into ordinary materialized inputs.  OOM
+             * here simply skips the sp path; ht_path materializes again. */
+            if (!group_materialize_prod_slots(agg_prod, agg_vecs, agg_owned,
+                                              n_aggs, nrows))
+                goto ht_path;
             void* agg_ptrs[vla_aggs];
             int8_t agg_types[vla_aggs];
             uint32_t agg_f64_mask = 0;
@@ -7568,7 +7672,7 @@ dyn_dense_done:
                     emit_agg_columns(&result, g, ext, agg_vecs, grp_count, n_aggs,
                                      (double*)dense_sum, (int64_t*)dense_sum,
                                      NULL, NULL, NULL, NULL,
-                                     dense_count, agg_affine, NULL, NULL);
+                                     dense_count, agg_affine, agg_prod, NULL, NULL);
 
                     scratch_free(_h_sum); scratch_free(_h_cnt);
                     scratch_free(range_sum_hdr); scratch_free(cnt_hdr);
@@ -7772,7 +7876,7 @@ dyn_dense_done:
                     emit_agg_columns(&result, g, ext, agg_vecs, grp_count, n_aggs,
                                      (double*)dense_sum, (int64_t*)dense_sum,
                                      NULL, NULL, NULL, NULL,
-                                     dense_count, agg_affine, NULL, NULL);
+                                     dense_count, agg_affine, agg_prod, NULL, NULL);
 
                     scratch_free(_h_sum);
                     scratch_free(_h_cnt);
@@ -7998,7 +8102,7 @@ dyn_dense_done:
             emit_agg_columns(&result, g, ext, agg_vecs, grp_count, n_aggs,
                              (double*)dense_sum, (int64_t*)dense_sum,
                              NULL, NULL, NULL, NULL,
-                             dense_count, agg_affine, NULL, NULL);
+                             dense_count, agg_affine, agg_prod, NULL, NULL);
 
             scratch_free(_h_sum);
             scratch_free(_h_cnt);
@@ -8012,6 +8116,18 @@ dyn_dense_done:
     }
 
 ht_path:;
+    /* The HT row-layout reads agg_vecs directly — convert any fused-product
+     * slots into ordinary materialized inputs first. */
+    if (!group_materialize_prod_slots(agg_prod, agg_vecs, agg_owned,
+                                      n_aggs, nrows)) {
+        for (uint8_t a = 0; a < n_aggs; a++)
+            { if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
+              if (agg_owned2[a] && agg_vecs2[a]) ray_release(agg_vecs2[a]); }
+        for (uint8_t k = 0; k < n_keys; k++)
+            if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+        return ray_error("oom", NULL);
+    }
+
     /* Compute which accumulator arrays the HT needs based on agg ops.
      * COUNT only reads group row's count field — no accumulator needed. */
     uint8_t ght_need = 0;

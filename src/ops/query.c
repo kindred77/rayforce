@@ -1568,6 +1568,95 @@ static int expr_contains_agg(ray_t* expr) {
     return 0;
 }
 
+static int is_group_dag_agg_expr(ray_t* expr);  /* defined below */
+
+/* ── Arith-of-aggs decomposition ──────────────────────────────────────────
+ * A select-by output like (/ (sum a) (as 'F64 (sum b))) is not itself a
+ * DAG agg, so it used to fall to the post-DAG scatter, which re-aggregates
+ * every group's rows through the generic evaluator (per-group slices) —
+ * ~10ms/1M rows where the fused group pass costs ~2ms.  Instead: replace
+ * each UNARY DAG-aggregable subcall with a hidden slot symbol, compile the
+ * hidden slots as ordinary DAG aggs (they ride the same single group
+ * pass), and evaluate the rewritten wrapper once over the n_groups-row
+ * result.  Eligibility: >=1 extractable agg; every table-column reference
+ * sits inside one; agg arguments contain no nested aggs; connectives may
+ * be arbitrary calls over literals/globals. */
+static ray_t* agg_arith_rewrite(ray_t* expr, ray_t* tbl,
+                                ray_t** hexprs, int64_t* hnames,
+                                int* n_hidden, int cap, int* ok) {
+    if (!*ok || !expr) { *ok = 0; return NULL; }
+    if (expr->type == RAY_LIST && is_group_dag_agg_expr(expr) &&
+        ray_len(expr) == 2) {
+        ray_t** el = (ray_t**)ray_data(expr);
+        /* nested agg inside the agg argument: not a DAG shape — bail */
+        if (expr_contains_agg(el[1])) { *ok = 0; return NULL; }
+        if (*n_hidden >= cap) { *ok = 0; return NULL; }
+        char buf[24];
+        int bn = snprintf(buf, sizeof buf, "__ha%d", *n_hidden);
+        int64_t hn = ray_sym_intern(buf, (size_t)bn);
+        hexprs[*n_hidden] = expr;      /* borrowed from the query dict */
+        hnames[*n_hidden] = hn;
+        (*n_hidden)++;
+        return ray_sym(hn);            /* non-quoted → resolves via env */
+    }
+    if (expr->type != RAY_LIST) { *ok = 0; return NULL; }
+    int64_t n = ray_len(expr);
+    ray_t** el = (ray_t**)ray_data(expr);
+    /* Lambdas capture their own parameter scope — an agg inside a lambda
+     * body must not be extracted (its argument is a param, not a column).
+     * Reject the whole output; it keeps the per-group scatter path. */
+    if (n > 0 && el[0] && el[0]->type == -RAY_SYM &&
+        el[0]->i64 == ray_sym_intern("fn", 2)) { *ok = 0; return NULL; }
+    ray_t* out = ray_list_new(0);
+    if (!out || RAY_IS_ERR(out)) { *ok = 0; return out && RAY_IS_ERR(out) ? NULL : NULL; }
+    for (int64_t i = 0; i < n && *ok; i++) {
+        ray_t* child = el[i];
+        ray_t* rep = NULL;
+        int rep_owned = 0;
+        if (child && child->type == RAY_LIST) {
+            rep = agg_arith_rewrite(child, tbl, hexprs, hnames,
+                                    n_hidden, cap, ok);
+            rep_owned = 1;
+        } else if (child && child->type == -RAY_SYM &&
+                   !(child->attrs & ATTR_QUOTED) && i > 0) {
+            /* bare symbol argument: a table column reference outside an
+             * agg needs per-row semantics — ineligible.  Dotted names
+             * (ts.yyyy) are column paths we cannot verify here — reject.
+             * Globals (NS_HOUR etc.) resolve identically at post-eval. */
+            if (ray_sym_is_dotted(child->i64) ||
+                ray_table_get_col(tbl, child->i64)) { *ok = 0; }
+            else rep = child;
+        } else {
+            rep = child;   /* call head / literal / quoted sym */
+        }
+        if (*ok && rep) {
+            out = ray_list_append(out, rep);
+            if (RAY_IS_ERR(out)) *ok = 0;
+        }
+        if (rep_owned && rep) ray_release(rep);
+    }
+    if (!*ok) { if (out && !RAY_IS_ERR(out)) ray_release(out); return NULL; }
+    return out;
+}
+
+static ray_t* try_decompose_agg_arith(ray_t* val_expr, ray_t* tbl,
+                                      ray_t** hexprs, int64_t* hnames,
+                                      int* n_hidden, int cap) {
+    if (!val_expr || val_expr->type != RAY_LIST) return NULL;
+    if (is_group_dag_agg_expr(val_expr)) return NULL;  /* plain agg path */
+    if (!expr_contains_agg(val_expr)) return NULL;
+    int ok = 1;
+    int saved = *n_hidden;
+    ray_t* rw = agg_arith_rewrite(val_expr, tbl, hexprs, hnames,
+                                  n_hidden, cap, &ok);
+    if (!ok || !rw || *n_hidden == saved) {
+        *n_hidden = saved;
+        if (rw && !RAY_IS_ERR(rw)) ray_release(rw);
+        return NULL;
+    }
+    return rw;
+}
+
 static int expr_contains_call_named(ray_t* expr, const char* name, size_t name_len) {
     if (!expr) return 0;
     if (expr->type != RAY_LIST) return 0;
@@ -5262,6 +5351,17 @@ by_dict_done:
     int64_t nonagg_names[16];
     ray_t*  nonagg_exprs[16];
     uint8_t n_nonaggs = 0;
+    /* Arith-of-aggs decomposition (see try_decompose_agg_arith): hidden
+     * agg subexpressions ride the DAG group pass as extra slots; each
+     * compound output keeps its rewritten wrapper for one post-group eval
+     * over the n_groups-row result. */
+    ray_t*  hidden_agg_exprs[16];      /* borrowed agg subcalls */
+    int64_t hidden_agg_names[16];      /* __haN symbols */
+    int     n_hidden_aggs = 0;
+    int64_t compound_names[16];        /* user output name (dict kid) */
+    ray_t*  compound_rw[16];           /* owned rewritten wrappers */
+    int     n_compound = 0;
+    int     n_aggs_real = 0;           /* DAG agg slots before hidden ones */
     int synth_count_col = 0;  /* 1 if we synthesized OP_COUNT for group boundaries */
 
     if (where_expr && by_expr && !nearest_expr &&
@@ -7315,10 +7415,54 @@ by_dict_done:
             } else if (!is_group_dag_agg_expr(val_expr) && n_nonaggs < 16) {
                 if (is_single_group_key_projection(by_expr, val_expr))
                     continue;
+                /* Arith-of-aggs: decompose into hidden DAG agg slots + a
+                 * post-group wrapper eval instead of the per-group scatter.
+                 * Capacity: real aggs + hidden slots share the 16-slot DAG
+                 * limit; on ineligibility/overflow the output falls back to
+                 * the scatter unchanged. */
+                if (n_compound < 16) {
+                    int cap = 16 - (int)n_aggs - n_hidden_aggs;
+                    ray_t* rw = try_decompose_agg_arith(
+                        val_expr, tbl, hidden_agg_exprs, hidden_agg_names,
+                        &n_hidden_aggs, n_hidden_aggs + (cap > 0 ? cap : 0));
+                    if (rw) {
+                        compound_names[n_compound] = kid;
+                        compound_rw[n_compound] = rw;
+                        n_compound++;
+                        continue;
+                    }
+                }
                 nonagg_names[n_nonaggs] = kid;
                 nonagg_exprs[n_nonaggs] = val_expr;
                 n_nonaggs++;
             }
+        }
+
+        n_aggs_real = n_aggs;
+        /* Compile the hidden decomposed agg slots (unary DAG aggs by
+         * construction — see agg_arith_rewrite). */
+        for (int hi = 0; hi < n_hidden_aggs; hi++) {
+            ray_t** he = (ray_t**)ray_data(hidden_agg_exprs[hi]);
+            uint16_t hop = resolve_agg_opcode(he[0]->i64);
+            agg_ops[n_aggs] = hop;
+            agg_ins[n_aggs] = compile_expr_dag(g, he[1]);
+            if (!agg_ins[n_aggs]) {
+                for (int ci = 0; ci < n_compound; ci++)
+                    ray_release(compound_rw[ci]);
+                ray_graph_free(g); ray_release(tbl);
+                return ray_error("domain", "select by: failed to compile aggregation argument");
+            }
+            if (agg_ins[n_aggs]->out_type > 0 &&
+                !agg_type_admitted(hop, agg_ins[n_aggs]->out_type)) {
+                int8_t in_t = agg_ins[n_aggs]->out_type;
+                for (int ci = 0; ci < n_compound; ci++)
+                    ray_release(compound_rw[ci]);
+                ray_graph_free(g); ray_release(tbl);
+                return ray_error("type", "select by: aggregation does not admit input type %s", ray_type_name(in_t));
+            }
+            agg_ins2[n_aggs] = NULL;
+            agg_k[n_aggs] = 0;
+            n_aggs++;
         }
 
         if (n_aggs > 0 || n_nonaggs > 0) {
@@ -8379,6 +8523,72 @@ by_dict_done:
                 for (int j = 0; j < n_all_user && n_key_cols + j < ncols; j++)
                     ray_table_set_col_name(result, n_key_cols + j, all_user_names[j]);
             }
+        }
+    }
+
+    /* Arith-of-aggs post-pass: evaluate each rewritten wrapper once over
+     * the n_groups-row result with the hidden agg slots bound as locals,
+     * append the outputs under their user names, then drop the hidden
+     * columns.  (The hidden slots sit right after the real agg columns:
+     * they were compiled after every dict agg, in extraction order.) */
+    if (n_compound > 0 && by_expr && result && !RAY_IS_ERR(result)) {
+        if (ray_is_lazy(result)) result = ray_lazy_materialize(result);
+        if (result && !RAY_IS_ERR(result) && result->type == RAY_TABLE) {
+            int nk2 = 1;
+            if (ray_is_vec(by_expr) && by_expr->type == RAY_SYM)
+                nk2 = (int)ray_len(by_expr);
+            int64_t hbase = (int64_t)nk2 + n_aggs_real;
+            int64_t rnc = ray_table_ncols(result);
+            ray_t* comp_cols[16] = {0};
+            ray_t* cerr = NULL;
+            bool layout_ok = hbase + n_hidden_aggs <= rnc;
+            if (layout_ok) {
+                if (ray_env_push_scope() != RAY_OK) {
+                    cerr = ray_error("oom", NULL);
+                } else {
+                    for (int hi = 0; hi < n_hidden_aggs; hi++)
+                        ray_env_set_local(hidden_agg_names[hi],
+                                          ray_table_get_col_idx(result,
+                                                                hbase + hi));
+                    for (int ci = 0; ci < n_compound && !cerr; ci++) {
+                        ray_t* v = ray_eval(compound_rw[ci]);
+                        if (!v || RAY_IS_ERR(v))
+                            cerr = v ? v : ray_error("domain",
+                                "select by: failed to evaluate aggregate expression");
+                        else comp_cols[ci] = v;
+                    }
+                    ray_env_pop_scope();
+                }
+            }
+            for (int ci = 0; ci < n_compound; ci++)
+                { ray_release(compound_rw[ci]); compound_rw[ci] = NULL; }
+            if (cerr) {
+                for (int ci = 0; ci < n_compound; ci++)
+                    if (comp_cols[ci]) ray_release(comp_cols[ci]);
+                ray_release(result);
+                ray_release(tbl);
+                return cerr;
+            }
+            if (layout_ok) {
+                ray_t* nt = ray_table_new(rnc - n_hidden_aggs + n_compound);
+                for (int64_t c = 0; c < rnc && nt && !RAY_IS_ERR(nt); c++) {
+                    if (c >= hbase && c < hbase + n_hidden_aggs) continue;
+                    nt = ray_table_add_col(nt, ray_table_col_name(result, c),
+                                           ray_table_get_col_idx(result, c));
+                }
+                for (int ci = 0; ci < n_compound && nt && !RAY_IS_ERR(nt); ci++)
+                    nt = ray_table_add_col(nt, compound_names[ci],
+                                           comp_cols[ci]);
+                if (nt && !RAY_IS_ERR(nt)) {
+                    ray_release(result);
+                    result = nt;
+                } else if (nt) {
+                    ray_release(nt);
+                }
+            }
+            for (int ci = 0; ci < n_compound; ci++)
+                if (comp_cols[ci]) ray_release(comp_cols[ci]);
+            n_compound = 0;
         }
     }
 

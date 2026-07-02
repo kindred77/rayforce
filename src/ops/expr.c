@@ -315,6 +315,42 @@ bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
     return true;
 }
 
+/* Detect SUM/AVG inputs of form (scan a * scan b) with a FLOAT product:
+ * both columns flat and null-free, at least one RAY_F64, the other F64 or
+ * integer-family.  int x int stays on the materialized path — its overflow
+ * semantics (expr marks i64 overflow as null) must not silently change.
+ * The fused read promotes each side to double exactly like expr's
+ * promote(), so the accumulated sum is bit-compatible. */
+bool try_prod_sumavg_input_f64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
+                               agg_prod_t* out) {
+    if (!g || !tbl || !input_op || !out) return false;
+    if (input_op->opcode != OP_MUL || input_op->arity != 2) return false;
+    ray_op_t* lhs = op_child(g, input_op, 0);
+    ray_op_t* rhs = op_child(g, input_op, 1);
+    if (!lhs || !rhs) return false;
+    if (lhs->opcode != OP_SCAN || rhs->opcode != OP_SCAN) return false;
+    ray_op_ext_t* lx = find_ext(g, lhs->id);
+    ray_op_ext_t* rx = find_ext(g, rhs->id);
+    if (!lx || !rx) return false;
+    ray_t* ca = ray_table_get_col(tbl, lx->sym);
+    ray_t* cb = ray_table_get_col(tbl, rx->sym);
+    if (!ca || !cb || RAY_IS_ERR(ca) || RAY_IS_ERR(cb)) return false;
+    if (RAY_IS_PARTED(ca->type) || ca->type == RAY_MAPCOMMON) return false;
+    if (RAY_IS_PARTED(cb->type) || cb->type == RAY_MAPCOMMON) return false;
+    if ((ca->attrs & RAY_ATTR_HAS_NULLS) || (cb->attrs & RAY_ATTR_HAS_NULLS))
+        return false;
+    #define PROD_OK_T(t) ((t) == RAY_F64 || (t) == RAY_I64 || (t) == RAY_I32 || \
+                          (t) == RAY_I16 || (t) == RAY_U8  || (t) == RAY_BOOL)
+    if (!PROD_OK_T(ca->type) || !PROD_OK_T(cb->type)) return false;
+    #undef PROD_OK_T
+    if (ca->type != RAY_F64 && cb->type != RAY_F64) return false;
+
+    out->enabled = true;
+    out->pa = ray_data(ca); out->ta = ca->type; out->aa = ca->attrs;
+    out->pb = ray_data(cb); out->tb = cb->type; out->ab = cb->attrs;
+    return true;
+}
+
 /* Detect SUM/AVG affine inputs of form (scan +/- const) and return scan vector
  * plus the additive bias so we can adjust results from (sum,count) directly. */
 bool try_affine_sumavg_input(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,

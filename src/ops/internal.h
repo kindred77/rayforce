@@ -623,6 +623,17 @@ typedef struct {
     int64_t bias_i64;
 } linear_expr_i64_t;
 
+/* SUM/AVG(a * b) fused product input: the group accumulators read both
+ * source columns and multiply per row (as F64, exactly the expr path's
+ * promote-to-double semantics) instead of materializing the product
+ * vector — for a 1M-row group that vector is 8MB of alloc+fault+write
+ * per query.  Gated to flat, null-free columns with a float product. */
+typedef struct {
+    bool        enabled;
+    const void* pa; int8_t ta; uint8_t aa;
+    const void* pb; int8_t tb; uint8_t ab;
+} agg_prod_t;
+
 /* ── Expression compiler types ── */
 
 typedef enum {
@@ -823,6 +834,8 @@ bool try_affine_sumavg_input(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
                              ray_t** out_vec, agg_affine_t* out_affine);
 bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
                                  agg_linear_t* out_plan);
+bool try_prod_sumavg_input_f64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
+                               agg_prod_t* out);
 bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out);
 ray_t* expr_eval_full(const ray_expr_t* expr, int64_t nrows);
 
