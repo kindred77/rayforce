@@ -3598,14 +3598,42 @@ static test_result_t test_index_hash_eq_rowsel_grow_buffer(void) {
     PASS();
 }
 
-/* All rows in a single morsel match → ALL flag set, no idx[] entries.
- * Need every row in some segment to equal the same value; we'll use a
- * column shorter than one morsel so n_segs=1 and seg_end-seg_start = n.
- * For mcnt to count as ALL, pc must equal seg_end - seg_start. */
+/* All rows in one morsel match → that segment gets the ALL flag, no idx[]
+ * entries.  The key must stay SPARSE overall (a dense key aborts to the
+ * scan path — see the dense_aborts test below), so the matching morsel
+ * sits inside a much larger column of distinct values: segment 0 is ALL,
+ * the rest are NONE. */
 static test_result_t test_index_hash_eq_rowsel_all_segment(void) {
     ray_heap_init();
-    /* 1024 rows all equal to 7 → one morsel, ALL flag. */
-    int64_t n = RAY_MORSEL_ELEMS;  /* 1024 */
+    int64_t m = RAY_MORSEL_ELEMS;  /* 1024 */
+    int64_t n = 128 * m;           /* keep the key well under the dense-abort budget (n/64) */
+    ray_t* v = ray_vec_new(RAY_I64, n);
+    for (int64_t i = 0; i < n; i++) {
+        int64_t x = (i < m) ? 7 : 1000 + i;
+        v = ray_vec_append(v, &x);
+    }
+    ray_t* w = v;
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_hash(&w)));
+
+    ray_t* sel = ray_index_hash_eq_rowsel(w, 7);
+    TEST_ASSERT_NOT_NULL(sel);
+    TEST_ASSERT_EQ_I(rowsel_count_pass(sel), m);
+    uint8_t* fl = ray_rowsel_flags(sel);
+    TEST_ASSERT_EQ_I((int)fl[0], RAY_SEL_ALL);
+    TEST_ASSERT_EQ_I((int)fl[1], RAY_SEL_NONE);
+
+    ray_rowsel_release(sel);
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* Dense key: when one key covers a large fraction of the column the probe
+ * must ABORT (return NULL) so the caller falls back to the SIMD scan — the
+ * scattered chain walk loses to the scan at that density. */
+static test_result_t test_index_hash_eq_rowsel_dense_aborts(void) {
+    ray_heap_init();
+    int64_t n = RAY_MORSEL_ELEMS;  /* 1024, all one value → maximally dense */
     ray_t* v = ray_vec_new(RAY_I64, n);
     for (int64_t i = 0; i < n; i++) {
         int64_t x = 7;
@@ -3615,12 +3643,8 @@ static test_result_t test_index_hash_eq_rowsel_all_segment(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_hash(&w)));
 
     ray_t* sel = ray_index_hash_eq_rowsel(w, 7);
-    TEST_ASSERT_NOT_NULL(sel);
-    TEST_ASSERT_EQ_I(rowsel_count_pass(sel), n);
-    uint8_t* fl = ray_rowsel_flags(sel);
-    TEST_ASSERT_EQ_I((int)fl[0], RAY_SEL_ALL);
+    TEST_ASSERT(sel == NULL, "dense key must abort to the scan path");
 
-    ray_rowsel_release(sel);
     ray_release(w);
     ray_heap_destroy();
     PASS();
@@ -3802,6 +3826,7 @@ const test_entry_t index_entries[] = {
     { "index/hash_eq_rowsel_multi_segment",  test_index_hash_eq_rowsel_multi_segment, NULL, NULL },
     { "index/hash_eq_rowsel_grow_buffer",    test_index_hash_eq_rowsel_grow_buffer,   NULL, NULL },
     { "index/hash_eq_rowsel_all_segment",    test_index_hash_eq_rowsel_all_segment,   NULL, NULL },
+    { "index/hash_eq_rowsel_dense_aborts",   test_index_hash_eq_rowsel_dense_aborts,  NULL, NULL },
     { "index/hash_eq_rowsel_with_nulls",     test_index_hash_eq_rowsel_with_nulls,    NULL, NULL },
     { "index/hash_eq_rowsel_stale",          test_index_hash_eq_rowsel_stale,         NULL, NULL },
     { NULL, NULL, NULL, NULL },

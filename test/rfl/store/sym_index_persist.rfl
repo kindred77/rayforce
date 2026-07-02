@@ -45,3 +45,11 @@
 (.idx.has? S2) -- false
 (at S2 0) -- 'a
 (where (== S2 'a)) -- [0 2]
+
+;; `in` filter through the persisted index: the set literal interns in the
+;; polluted GLOBAL domain while the index is keyed in file-local positions —
+;; each element must be resolved through the column's own domain.
+;; a rows 0,2 (v=10,30) + c row 3 (v=40) → 80
+(sum (at (select {from: S where: (in sym ['a 'c])}) 'v)) -- 80
+(sum (at (select {from: S where: (in sym ['b 'z])}) 'v)) -- 20
+(count (at (select {from: S where: (in sym ['z 'q])}) 'v)) -- 0

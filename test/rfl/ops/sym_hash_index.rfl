@@ -42,3 +42,16 @@
 (.idx.has? sd) -- false
 (at sd 0) -- 'a
 (where (== sd 'a)) -- [0 2 4]
+
+;; ── indexed `in` (hash-index IN probe): equality with the scan path ─────────
+;; The set literal may live in a different domain than the column; each
+;; element is resolved through the COLUMN's domain (absent → matches nothing).
+;; k in {a,c}: rows 0,2,3,4 → v=10+30+40+50=130
+(sum (at (select {from: Ti where: (in k ['a 'c])}) 'v)) -- 130
+(sum (at (select {from: Ti where: (in k ['a 'c])}) 'v)) -- (sum (at (select {from: T where: (in k ['a 'c])}) 'v))
+;; absent element mixed in: only c matches → row 3 → 40
+(sum (at (select {from: Ti where: (in k ['z 'c])}) 'v)) -- 40
+;; all absent → empty
+(count (at (select {from: Ti where: (in k ['z 'q])}) 'v)) -- 0
+;; duplicate set elements collapse (dedup) — same as {a,c}
+(sum (at (select {from: Ti where: (in k ['a 'a 'c 'c])}) 'v)) -- 130

@@ -1236,6 +1236,13 @@ ray_t* ray_index_hash_eq_rowsel(ray_t* col, int64_t key) {
     const uint8_t* base = (const uint8_t*)ray_data(col);
     int8_t t = col->type;
 
+    /* Dense-key abort: the chain walk is scattered pointer-chasing, so a
+     * key covering a large fraction of the column loses to the SIMD scan
+     * before the rowsel is even filled.  Bound the walk; on exceeding the
+     * budget return NULL so the caller falls through to the scan path.
+     * Sparse keys (what the index exists for) never approach the bound. */
+    int64_t steps_left = (n >> 6) + 64;
+
     int64_t mcap = 16;
     int64_t mcnt = 0;
     ray_t* match_hdr = ray_alloc(mcap * (int64_t)sizeof(int64_t));
@@ -1243,6 +1250,7 @@ ray_t* ray_index_hash_eq_rowsel(ray_t* col, int64_t key) {
     int64_t* matches = (int64_t*)ray_data(match_hdr);
 
     while (rid >= 0) {
+        if (--steps_left < 0) { ray_release(match_hdr); return NULL; }
         int64_t cell = (t == RAY_SYM)
             ? ray_read_sym(base, rid, RAY_SYM, col->attrs)  /* width-aware id confirm */
             : hash_col_read_i64(base, t, rid);
@@ -1264,12 +1272,16 @@ ray_t* ray_index_hash_eq_rowsel(ray_t* col, int64_t key) {
         rid = chn[rid] - 1;
     }
 
-    /* Sort ascending so we can fill seg_flags / seg_offsets / idx[]
-     * in a single linear pass.  qsort dominates only when matches are
-     * many — in that case the hash probe itself is the larger cost
-     * and this is still O(matches log matches). */
-    if (mcnt > 1)
-        qsort(matches, (size_t)mcnt, sizeof(int64_t), hash_match_cmp_i64);
+    /* The build prepends each row to its bucket head in ascending rid order,
+     * so the walk yields strictly DESCENDING rids; the filtered subsequence
+     * for one key preserves that monotonicity regardless of other keys
+     * sharing the bucket.  Reverse in place — no qsort needed — to get the
+     * ascending order rowsel_from_sorted_ids requires. */
+    for (int64_t lo = 0, hi = mcnt - 1; lo < hi; lo++, hi--) {
+        int64_t tmp = matches[lo];
+        matches[lo] = matches[hi];
+        matches[hi] = tmp;
+    }
 
     ray_t* block = rowsel_from_sorted_ids(n, matches, mcnt);
     ray_release(match_hdr);
@@ -1305,23 +1317,33 @@ static int cmp_i64_plain(const void* a, const void* b) {
 }
 
 ray_t* ray_index_in_rowsel(ray_t* col, ray_t* set_vec) {
-    /* Gate: integer-family column with fresh hash index, no nulls. */
+    /* Gate: integer-family or SYM column with fresh hash index, no nulls. */
     if (!idx_fresh_nonull(col, RAY_IDX_HASH)) return NULL;
     bool col_is_float = (col->type == RAY_F32 || col->type == RAY_F64);
     if (col_is_float) return NULL;
+    bool col_is_sym = (col->type == RAY_SYM);
 
-    /* set_vec must be a non-atom integer-family vec. */
+    /* set_vec must be a non-atom vec of the matching family: SYM set for a
+     * SYM column (each element resolved through the COLUMN's domain — the
+     * index is keyed on column-domain ids, and the set may live in a
+     * different domain), integer-family set for an integer column. */
     if (!set_vec || RAY_IS_ERR(set_vec) || ray_is_atom(set_vec)) return NULL;
     int8_t st = set_vec->type;
-    bool set_is_float = (st == RAY_F32 || st == RAY_F64);
-    if (set_is_float) return NULL;
-    /* Check set type is integer-family (numeric_elem_size covers all int types) */
-    if (numeric_elem_size(st) == 0) return NULL;
+    if (col_is_sym) {
+        if (st != RAY_SYM) return NULL;
+    } else {
+        bool set_is_float = (st == RAY_F32 || st == RAY_F64);
+        if (set_is_float) return NULL;
+        /* Check set type is integer-family (numeric_elem_size covers all int types) */
+        if (numeric_elem_size(st) == 0) return NULL;
+    }
 
     int64_t set_len = set_vec->len;
     int64_t n       = col->len;
 
-    /* Canonicalize set: copy to int64 scratch, sort, unique, drop out-of-range. */
+    /* Canonicalize set: copy to int64 scratch, sort, unique, drop
+     * out-of-range / domain-absent.  SYM: translate each set symbol to the
+     * column's domain id (absent symbol matches no rows — drop it). */
     int64_t* set_scratch = NULL;
     ray_t*   set_hdr     = NULL;
     if (set_len > 0) {
@@ -1331,12 +1353,21 @@ ray_t* ray_index_in_rowsel(ray_t* col, ray_t* set_vec) {
         const uint8_t* sb = (const uint8_t*)ray_data(set_vec);
         int64_t ulen = 0;
         for (int64_t i = 0; i < set_len; i++) {
-            int64_t v = set_vec_read_i64(sb, st, i);
-            if (hash_key_in_range(col->type, v))
-                set_scratch[ulen++] = v;
+            if (col_is_sym) {
+                ray_t* s = ray_sym_vec_cell(set_vec, i);
+                if (!s) continue;
+                int64_t dom_id = ray_sym_vec_lookup(col, ray_str_ptr(s),
+                                                    ray_str_len(s));
+                if (dom_id >= 0)
+                    set_scratch[ulen++] = dom_id;
+            } else {
+                int64_t v = set_vec_read_i64(sb, st, i);
+                if (hash_key_in_range(col->type, v))
+                    set_scratch[ulen++] = v;
+            }
         }
         if (ulen == 0) {
-            /* All elements out of range — no possible matches. */
+            /* All elements out of range / absent — no possible matches. */
             ray_release(set_hdr);
             return rowsel_from_sorted_ids(n, NULL, 0);
         }
@@ -1374,19 +1405,32 @@ ray_t* ray_index_in_rowsel(ray_t* col, ray_t* set_vec) {
     if (!match_hdr) { ray_release(set_hdr); return NULL; }
     int64_t* matches = (int64_t*)ray_data(match_hdr);
 
-    /* Selectivity guard threshold: if total collected > n/4, abandon
-     * (rowsel build + sort overhead approaches scan cost at that point).
-     * For small tables (n <= 64) the guard never fires — the overhead is
-     * trivial regardless of selectivity. */
-    int64_t guard = (n > 64) ? n / 4 : n;
+    /* Dense-union abort: the per-key chain walks are scattered pointer-
+     * chasing, so a set whose matches cover a large fraction of the column
+     * loses to the SIMD membership scan long before the n/4 match count —
+     * and an abandoned walk is pure waste.  Bound TOTAL chain steps across
+     * all keys (mirrors the hash-eq probe's budget); on exceeding it return
+     * NULL so the caller falls back to the scan path.  Sparse sets (what
+     * the index exists for) never approach the bound. */
+    int64_t steps_left = (n >> 6) + 64;
 
     for (int64_t si = 0; si < set_len; si++) {
         int64_t key = set_scratch[si];
-        /* Bucket head for this key — same kbits/mix64 the builder used. */
-        int64_t rid = tbl[mix64(hash_key_bits(es, key)) & mask] - 1;
+        /* Bucket head for this key — same kbits/mix64 the builder used.
+         * SYM hashes the domain id directly (mirrors hash_probe_setup). */
+        uint64_t kbits = col_is_sym ? (uint64_t)key : hash_key_bits(es, key);
+        int64_t rid = tbl[mix64(kbits) & mask] - 1;
 
         while (rid >= 0) {
-            if (hash_col_read_i64(base, t, rid) == key) {
+            if (--steps_left < 0) {
+                ray_release(match_hdr);
+                ray_release(set_hdr);
+                return NULL;
+            }
+            int64_t cell = col_is_sym
+                ? ray_read_sym(base, rid, RAY_SYM, col->attrs)
+                : hash_col_read_i64(base, t, rid);
+            if (cell == key) {
                 /* Grow match buffer if needed. */
                 if (mcnt == mcap) {
                     int64_t new_cap = mcap * 2;
@@ -1405,12 +1449,6 @@ ray_t* ray_index_in_rowsel(ray_t* col, ray_t* set_vec) {
                     mcap      = new_cap;
                 }
                 matches[mcnt++] = rid;
-                /* Selectivity guard: abandon if too many matches. */
-                if (mcnt > guard) {
-                    ray_release(match_hdr);
-                    ray_release(set_hdr);
-                    return NULL;
-                }
             }
             rid = chn[rid] - 1;
         }
