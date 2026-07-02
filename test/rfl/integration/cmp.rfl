@@ -190,3 +190,35 @@
 (== (at FD 's) ['a 'b 'x 'c]) -- [true true false true]
 (!= (at FD 's) ['a 'b 'x 'c]) -- [false false true false]
 (== (at FD 's) (at FD 's)) -- [true true true true]
+
+;; ── SYM ordering compares (R9: rank/verdict LUT kernels) ────────────────────
+(< ['a 'c 'b] ['b 'b 'b]) -- [true false false]
+(>= ['a 'c 'b] ['b 'b 'b]) -- [false true true]
+(< ['a 'c 'b] 'b) -- [true false false]
+(> 'b ['a 'c 'b]) -- [true false false]
+;; prefix + length tiebreak (the char_str_cmp order)
+(< ['ab 'abc 'b] ['abc 'ab 'b]) -- [true false false]
+;; cross-domain ordering: splayed-reloaded (file-domain) vs runtime literals
+(<= (at FD 's) ['a 'a 'b 'z]) -- [true false true true]
+
+;; ── STR compares (R10: parallel bytes kernel, vec-vec and vec-atom) ─────────
+(== ["x" "yy" "z"] ["x" "y" "w"]) -- [true false false]
+(!= ["x" "yy" "z"] ["x" "y" "w"]) -- [false true true]
+(< ["x" "yy" "z"] ["x" "y" "w"]) -- [false false false]
+(<= ["x" "yy" "z"] ["x" "y" "w"]) -- [true false false]
+(> ["ab" "b"] "abc") -- [false true]
+(< "abc" ["ab" "b"]) -- [false true]
+
+;; ── nullable numeric vectors through the DAG (bail removed) ─────────────────
+;; Sentinel semantics end to end: 0N == 0N is true, 0N sorts below any value,
+;; arithmetic propagates null.  These pin the DAG path to the scalar truths.
+(set NV [1 0N 3 0N 5])
+(== NV 3) -- [false false true false false]
+(< NV 3) -- [true true false true false]
+(> NV 3) -- [false false false false true]
+(+ NV 1) -- [2 0N 4 0N 6]
+(* NV 2) -- [2 0N 6 0N 10]
+(== NV [1 0N 3 4 0N]) -- [true true true false false]
+(+ NV [10 10 10 10 10]) -- [11 0N 13 0N 15]
+(< [1.0 0N 3.0] 2.0) -- [true true false]
+(+ [1.0 0N 3.0] 1.0) -- [2.0 0N 4.0]
