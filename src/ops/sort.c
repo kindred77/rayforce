@@ -3740,6 +3740,49 @@ ray_t* ray_rank_fn(ray_t* x) {
     return result;
 }
 
+/* Pool worker for the already-in-order detection scan: each task verifies
+ * consecutive-row order over [start,end) INCLUDING the (start-1,start)
+ * boundary pair, so chunk edges are covered.  The shared flag only ever
+ * transitions 1 -> 0 (benign race) and doubles as a bail signal. */
+typedef struct {
+    ray_t**  key_cols;
+    int64_t  n_keys;
+    uint8_t  descending;
+    volatile int* ordered;
+} sorted_check_ctx_t;
+
+static void sorted_check_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    sorted_check_ctx_t* c = (sorted_check_ctx_t*)raw;
+    if (start < 1) start = 1;
+    for (int64_t i = start; i < end; i++) {
+        if (!*c->ordered) return;   /* another task already found a violation */
+        int cmp = 0;
+        for (int64_t k = 0; k < c->n_keys && cmp == 0; k++) {
+            ray_t* col = c->key_cols[k];
+            if (col->type == RAY_SYM) {
+                int64_t ia = ray_read_sym(ray_data(col), i - 1, RAY_SYM, col->attrs);
+                int64_t ib = ray_read_sym(ray_data(col), i,     RAY_SYM, col->attrs);
+                if (ia != ib) {
+                    struct ray_sym_domain_s* dom = ray_sym_vec_domain(col);
+                    ray_t* sa = ray_sym_domain_str(dom, ia);
+                    ray_t* sb = ray_sym_domain_str(dom, ib);
+                    uint32_t la = sa ? (uint32_t)ray_str_len(sa) : 0;
+                    uint32_t lb = sb ? (uint32_t)ray_str_len(sb) : 0;
+                    uint32_t ml = la < lb ? la : lb;
+                    if (ml > 0) cmp = memcmp(ray_str_ptr(sa), ray_str_ptr(sb), ml);
+                    if (cmp == 0) cmp = (la > lb) - (la < lb);
+                }
+            } else {
+                int64_t va = read_col_i64(ray_data(col), i - 1, col->type, col->attrs);
+                int64_t vb = read_col_i64(ray_data(col), i,     col->type, col->attrs);
+                cmp = (va > vb) - (va < vb);
+            }
+        }
+        if (c->descending ? (cmp < 0) : (cmp > 0)) { *c->ordered = 0; return; }
+    }
+}
+
 /* Helper: resolve key symbols to table columns for xasc/xdesc */
 ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
     if (!tbl || tbl->type != RAY_TABLE)
@@ -3812,38 +3855,16 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
                 detectable = false;
         }
         if (detectable) {
-            bool ordered = true;
-            for (int64_t i = 1; i < nrows && ordered; i++) {
-                int cmp = 0;
-                for (int64_t k = 0; k < n_keys && cmp == 0; k++) {
-                    ray_t* c = key_cols[k];
-                    if (c->type == RAY_SYM) {
-                        int64_t ia = ray_read_sym(ray_data(c), i - 1,
-                                                  RAY_SYM, c->attrs);
-                        int64_t ib = ray_read_sym(ray_data(c), i,
-                                                  RAY_SYM, c->attrs);
-                        if (ia != ib) {
-                            struct ray_sym_domain_s* dom =
-                                ray_sym_vec_domain(c);
-                            ray_t* sa = ray_sym_domain_str(dom, ia);
-                            ray_t* sb = ray_sym_domain_str(dom, ib);
-                            uint32_t la = sa ? (uint32_t)ray_str_len(sa) : 0;
-                            uint32_t lb = sb ? (uint32_t)ray_str_len(sb) : 0;
-                            uint32_t ml = la < lb ? la : lb;
-                            if (ml > 0) cmp = memcmp(ray_str_ptr(sa),
-                                                     ray_str_ptr(sb), ml);
-                            if (cmp == 0) cmp = (la > lb) - (la < lb);
-                        }
-                    } else {
-                        int64_t va = read_col_i64(ray_data(c), i - 1,
-                                                  c->type, c->attrs);
-                        int64_t vb = read_col_i64(ray_data(c), i,
-                                                  c->type, c->attrs);
-                        cmp = (va > vb) - (va < vb);
-                    }
-                }
-                if (descending ? (cmp < 0) : (cmp > 0)) ordered = false;
-            }
+            volatile int ordered = 1;
+            sorted_check_ctx_t sctx = {
+                .key_cols = key_cols, .n_keys = n_keys,
+                .descending = descending, .ordered = &ordered,
+            };
+            ray_pool_t* pool = ray_pool_get();
+            if (pool && nrows >= RAY_PARALLEL_THRESHOLD)
+                ray_pool_dispatch(pool, sorted_check_fn, &sctx, nrows);
+            else
+                sorted_check_fn(&sctx, 0, 1, nrows);
             if (ordered) { ray_retain(tbl); return tbl; }
         }
     }

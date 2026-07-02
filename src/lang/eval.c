@@ -39,6 +39,7 @@
 #include "core/profile.h"
 #include "table/sym.h"
 #include "mem/heap.h"
+#include "core/pool.h"
 #include "mem/sys.h"
 /* store/serde.h, store/splay.h, store/part.h moved to system.c */
 /* ray_lang_print, ray_cast_fn, etc. moved to ops/builtins.c */
@@ -446,6 +447,79 @@ static ray_t* atomic_map_binary_parted(ray_binary_fn fn, uint16_t dag_opcode,
     return out;
 }
 
+/* Pool worker for the R7/R8 SYM compare fast paths.  rd == NULL means the
+ * right side is a scalar target id (R7); otherwise element-wise vec-vec
+ * (R8), optionally translating left ids through a vocabulary LUT when the
+ * domains differ.  SYM has no null: pure value compares. */
+typedef struct {
+    const void* ld;
+    const void* rd;         /* NULL for the vec-vs-atom shape */
+    uint8_t     lattrs;
+    uint8_t     rattrs;
+    int64_t     target;     /* vec-vs-atom: right id in the LEFT domain */
+    const int64_t* lut;     /* vec-vec cross-domain: left pos -> right pos */
+    int64_t     lcount;
+    bool*       obuf;
+    bool        invert;
+} symcmp_ctx_t;
+
+static void symcmp_eq_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    symcmp_ctx_t* c = (symcmp_ctx_t*)raw;
+    const void* ld = c->ld;
+    uint8_t la = c->lattrs;
+    bool inv = c->invert;
+    bool* obuf = c->obuf;
+    if (!c->rd) {
+        /* vec vs scalar: width-specialized loops (R7). */
+        uint8_t w = (uint8_t)(la & RAY_SYM_W_MASK);
+        int64_t target = c->target;
+        if (w == RAY_SYM_W8) {
+            const uint8_t* d = (const uint8_t*)ld;
+            uint8_t t8 = (uint8_t)target;
+            for (int64_t i = start; i < end; i++) obuf[i] = (d[i] == t8) ^ inv;
+        } else if (w == RAY_SYM_W16) {
+            const uint16_t* d = (const uint16_t*)ld;
+            uint16_t t16 = (uint16_t)target;
+            for (int64_t i = start; i < end; i++) obuf[i] = (d[i] == t16) ^ inv;
+        } else if (w == RAY_SYM_W32) {
+            const uint32_t* d = (const uint32_t*)ld;
+            uint32_t t32 = (uint32_t)target;
+            for (int64_t i = start; i < end; i++) obuf[i] = (d[i] == t32) ^ inv;
+        } else {
+            const int64_t* d = (const int64_t*)ld;
+            for (int64_t i = start; i < end; i++) obuf[i] = (d[i] == c->target) ^ inv;
+        }
+        return;
+    }
+    const void* rd = c->rd;
+    uint8_t ra = c->rattrs;
+    if (!c->lut) {
+        for (int64_t i = start; i < end; i++)
+            obuf[i] = (ray_read_sym(ld, i, RAY_SYM, la) ==
+                       ray_read_sym(rd, i, RAY_SYM, ra)) ^ inv;
+    } else {
+        const int64_t* lut = c->lut;
+        int64_t lcount = c->lcount;
+        for (int64_t i = start; i < end; i++) {
+            int64_t lid = ray_read_sym(ld, i, RAY_SYM, la);
+            int64_t tl = (lid >= 0 && lid < lcount) ? lut[lid] : -1;
+            int64_t rid = ray_read_sym(rd, i, RAY_SYM, ra);
+            obuf[i] = (tl >= 0 && tl == rid) ^ inv;
+        }
+    }
+}
+
+/* Run the SYM compare worker over [0,n): pool-parallel above the shared
+ * morsel threshold, serial otherwise. */
+static void symcmp_eq_run(symcmp_ctx_t* ctx, int64_t n) {
+    ray_pool_t* pool = ray_pool_get();
+    if (pool && n >= RAY_PARALLEL_THRESHOLD)
+        ray_pool_dispatch(pool, symcmp_eq_fn, ctx, n);
+    else
+        symcmp_eq_fn(ctx, 0, 0, n);
+}
+
 ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, ray_t* right) {
     if ((left && !RAY_IS_ERR(left) && RAY_IS_PARTED(left->type)) ||
         (right && !RAY_IS_ERR(right) && RAY_IS_PARTED(right->type)))
@@ -711,36 +785,80 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
                     bool fill = invert; /* != absent → true; == absent → false */
                     for (int64_t i = 0; i < n; i++) obuf[i] = fill;
                 } else {
-                    /* SYM has no null: ray_vec_is_null and RAY_ATOM_IS_NULL are
-                     * both constant-false for SYM, so the compare reduces to a
-                     * tight per-width raw-id loop with no per-element null
-                     * checks. */
-                    uint8_t w = (uint8_t)(va & RAY_SYM_W_MASK);
-                    if (w == RAY_SYM_W8) {
-                        const uint8_t* d = (const uint8_t*)src;
-                        uint8_t t8 = (uint8_t)target;
-                        for (int64_t i = 0; i < n; i++)
-                            obuf[i] = (d[i] == t8) ^ invert;
-                    } else if (w == RAY_SYM_W16) {
-                        const uint16_t* d = (const uint16_t*)src;
-                        uint16_t t16 = (uint16_t)target;
-                        for (int64_t i = 0; i < n; i++)
-                            obuf[i] = (d[i] == t16) ^ invert;
-                    } else if (w == RAY_SYM_W32) {
-                        const uint32_t* d = (const uint32_t*)src;
-                        uint32_t t32 = (uint32_t)target;
-                        for (int64_t i = 0; i < n; i++)
-                            obuf[i] = (d[i] == t32) ^ invert;
-                    } else { /* RAY_SYM_W64 */
-                        const int64_t* d = (const int64_t*)src;
-                        for (int64_t i = 0; i < n; i++)
-                            obuf[i] = (d[i] == target) ^ invert;
-                    }
+                    /* SYM has no null: the compare reduces to a tight
+                     * per-width raw-id loop, pool-parallel above the
+                     * shared morsel threshold (symcmp_eq_fn). */
+                    symcmp_ctx_t sctx = {
+                        .ld = src, .rd = NULL, .lattrs = va, .rattrs = 0,
+                        .target = target, .lut = NULL, .lcount = 0,
+                        .obuf = obuf, .invert = invert,
+                    };
+                    symcmp_eq_run(&sctx, n);
                 }
                 ray_release(e0);
                 return out;
             }
             if (out) ray_release(out);
+            /* Fall through to slow path on allocation failure. */
+        }
+    }
+
+    /* R8 fast path: (== or !=) of SYM-vec against SYM-vec.
+     *
+     * Same rationale as R7 — the DAG path excludes SYM, so without this a
+     * vector-vector symbol compare fans out to one boxed compare per row
+     * (measured 53 ms for 596k rows when the raw work is an id compare).
+     * Same-domain vectors (including both-runtime, the common case)
+     * compare raw cell ids width-aware.  Cross-domain pairs translate the
+     * LEFT vocabulary into the RIGHT domain once — positions, not rows —
+     * then compare in the right id space; an untranslatable left id
+     * matches nothing.  SYM has no null: pure value compare. */
+    if (!force_boxed && (dag_opcode == OP_EQ || dag_opcode == OP_NE) &&
+        out_type == RAY_BOOL &&
+        left_coll && right_coll && ray_is_vec(left) && ray_is_vec(right) &&
+        left->type == RAY_SYM && right->type == RAY_SYM) {
+        int64_t n = left->len;  /* lengths verified equal above */
+        struct ray_sym_domain_s* ldom = ray_sym_vec_domain(left);
+        struct ray_sym_domain_s* rdom = ray_sym_vec_domain(right);
+        int64_t lcount = (ldom == rdom) ? 0 : ray_sym_domain_count(ldom);
+        if (ldom == rdom || (lcount >= 0 && lcount <= (int64_t)1 << 22)) {
+            ray_t* out = ray_vec_new(RAY_BOOL, n);
+            ray_t* lut_hdr = NULL;
+            int64_t* lut = NULL;
+            if (ldom != rdom && lcount > 0 && out && !RAY_IS_ERR(out)) {
+                lut_hdr = ray_alloc(lcount * (int64_t)sizeof(int64_t));
+                if (lut_hdr) {
+                    lut = (int64_t*)ray_data(lut_hdr);
+                    for (int64_t p = 0; p < lcount; p++) {
+                        ray_t* sstr = ray_sym_domain_str(ldom, p);
+                        lut[p] = sstr ? ray_sym_domain_find(rdom,
+                                                            ray_str_ptr(sstr),
+                                                            ray_str_len(sstr))
+                                      : -1;
+                    }
+                }
+            }
+            if (out && !RAY_IS_ERR(out) && (ldom == rdom || lcount == 0 || lut)) {
+                out->len = n;
+                bool* obuf = (bool*)ray_data(out);
+                const void* ld = ray_data(left);
+                const void* rd = ray_data(right);
+                uint8_t lattrs = left->attrs, rattrs = right->attrs;
+                bool invert = (dag_opcode == OP_NE);
+                symcmp_ctx_t sctx = {
+                    .ld = ld, .rd = rd, .lattrs = lattrs, .rattrs = rattrs,
+                    .target = 0,
+                    .lut = (ldom == rdom) ? NULL : lut,
+                    .lcount = lcount,
+                    .obuf = obuf, .invert = invert,
+                };
+                symcmp_eq_run(&sctx, n);
+                if (lut_hdr) ray_release(lut_hdr);
+                ray_release(e0);
+                return out;
+            }
+            if (lut_hdr) ray_release(lut_hdr);
+            if (out && !RAY_IS_ERR(out)) ray_release(out);
             /* Fall through to slow path on allocation failure. */
         }
     }

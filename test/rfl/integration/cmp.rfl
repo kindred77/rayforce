@@ -174,3 +174,19 @@
 (set t1 (enlist (as 'guid "d49f18a4-1969-49e8-9b8a-6bb9a4832eea"))) (set t2 (enlist (as 'guid "d49f18a4-196a-49e8-9b8a-6bb9a4832eea"))) (<= t1 t2) -- [true]
 (set t1 (enlist (as 'guid "d49f18a4-1969-49e9-9b8a-6bb9a4832eea"))) (set t2 (as 'guid "d49f18a4-1969-49e8-9b8a-6bb9a4832eea")) (>= t1 t2) -- [true]
 (set t1 (enlist (as 'guid "d49f18a4-1969-49e9-9b8a-6bb9a4832eea"))) (set t2 (enlist (as 'guid "d49f18a4-1969-49e9-9b8a-6bb9a4832eea"))) (>= t1 t2) -- [true]
+
+;; ── SYM vec-vec == / != (R8 vectorized kernel) ──────────────────────────────
+;; Same-domain id compare; must equal the per-element semantics exactly.
+(== ['a 'b 'c 'a] ['a 'x 'c 'b]) -- [true false true false]
+(!= ['a 'b 'c 'a] ['a 'x 'c 'b]) -- [false true false true]
+;; shifted-vector fby shape (q37): self-compare against a rotated copy
+(set SV ['a 'a 'b 'b 'a])
+(== SV (concat (take SV 1) (take SV 4))) -- [true true false true false]
+;; cross-domain: a splayed-reloaded column (file-local domain) compared to a
+;; runtime-domain literal vec — per-element translation through the LUT.
+(.sys.exec "rm -rf /tmp/rfl_symveceq")
+(.db.splayed.set "/tmp/rfl_symveceq/" (table [s v] (list ['a 'b 'a 'c] [1 2 3 4])))
+(set FD (.db.splayed.get "/tmp/rfl_symveceq/"))
+(== (at FD 's) ['a 'b 'x 'c]) -- [true true false true]
+(!= (at FD 's) ['a 'b 'x 'c]) -- [false false true false]
+(== (at FD 's) (at FD 's)) -- [true true true true]
