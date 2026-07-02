@@ -3993,50 +3993,6 @@ typedef struct {
     int64_t*    counts;
 } count_compare_ctx_t;
 
-typedef struct {
-    const ray_t* col;
-    const void*  data;
-    int64_t      len;
-    int8_t       type;
-    uint8_t      attrs;
-    count_cmp_op_t op;
-    int64_t      rhs;
-    int64_t      result;
-} count_compare_cache_entry_t;
-
-#define COUNT_COMPARE_CACHE_N 32
-static _Thread_local count_compare_cache_entry_t count_compare_cache[COUNT_COMPARE_CACHE_N];
-static _Thread_local uint8_t count_compare_cache_next = 0;
-
-static int count_compare_cache_lookup(ray_t* col, count_cmp_op_t op,
-                                      int64_t rhs, int64_t* out) {
-    const void* data = ray_data(col);
-    for (uint8_t i = 0; i < COUNT_COMPARE_CACHE_N; i++) {
-        count_compare_cache_entry_t* e = &count_compare_cache[i];
-        if (e->col == col && e->data == data && e->len == col->len &&
-            e->type == col->type && e->attrs == col->attrs &&
-            e->op == op && e->rhs == rhs) {
-            *out = e->result;
-            return 1;
-        }
-    }
-    return 0;
-}
-
-static void count_compare_cache_store(ray_t* col, count_cmp_op_t op,
-                                      int64_t rhs, int64_t result) {
-    count_compare_cache_entry_t* e = &count_compare_cache[count_compare_cache_next];
-    e->col = col;
-    e->data = ray_data(col);
-    e->len = col->len;
-    e->type = col->type;
-    e->attrs = col->attrs;
-    e->op = op;
-    e->rhs = rhs;
-    e->result = result;
-    count_compare_cache_next = (uint8_t)((count_compare_cache_next + 1) % COUNT_COMPARE_CACHE_N);
-}
-
 static inline int64_t count_atom_i64(ray_t* a) {
     if (a->type == -RAY_BOOL) return (int64_t)a->b8;
     if (a->type == -RAY_U8) return (int64_t)a->u8;
@@ -4208,9 +4164,6 @@ static int try_count_simple_compare(ray_t* tbl, ray_t* where_expr, int64_t* out_
         ray_t* s = ray_sym_str(rhs);
         rhs = s ? ray_sym_vec_lookup(col, ray_str_ptr(s), ray_str_len(s)) : -1;
     }
-    if (count_compare_cache_lookup(col, op, rhs, out_count))
-        return 1;
-
     ray_pool_t* pool = ray_pool_get();
     uint32_t nworkers = pool ? ray_pool_total_workers(pool) : 1;
     ray_t* counts_block = ray_alloc((size_t)nworkers * sizeof(int64_t));
@@ -4232,7 +4185,6 @@ static int try_count_simple_compare(ray_t* tbl, ray_t* where_expr, int64_t* out_
     int64_t total = 0;
     for (uint32_t i = 0; i < nworkers; i++) total += counts[i];
     ray_release(counts_block);
-    count_compare_cache_store(col, op, rhs, total);
     *out_count = total;
     return 1;
 }
