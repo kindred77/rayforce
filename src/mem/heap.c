@@ -1854,38 +1854,62 @@ void ray_heap_gc(void) {
          * GC fires before any large allocation has been freed —
          * complete pass 5 without entering the body. */
         /* Aging: pages are released only after a block SURVIVES several
-         * GC passes on a freelist.  The GC runs per statement and per
-         * parallel_end, so the per-query temporaries of a repeated query
-         * used to be MADV_DONTNEEDed between every two executions and
-         * refaulted from scratch — kernel page-fault frames dominated
-         * repeated-query profiles while the freed block was reused
-         * within milliseconds.  A block re-allocated before reaching
-         * RAY_FREE_AGE_RELEASE keeps its pages; genuinely idle memory
-         * still returns to the OS after a few statements.  The released
-         * marker also stops re-madvising the same idle block on every
-         * subsequent pass (it was O(free blocks) syscalls per GC). */
-        #define RAY_FREE_AGE_RELEASE 3
+         * pass-5 VISITS on a freelist.  This routine runs per statement
+         * and per parallel_end, so the per-query temporaries of a
+         * repeated query used to be MADV_DONTNEEDed between every two
+         * executions and refaulted from scratch — kernel page-fault
+         * frames dominated repeated-query profiles while the freed block
+         * was reused within milliseconds.  A block re-allocated before
+         * reaching RAY_FREE_AGE_RELEASE keeps its pages; genuinely idle
+         * memory still returns to the OS after a few maintenance points.
+         * The released marker also stops re-madvising the same idle
+         * block on every subsequent pass.
+         *
+         * INCREMENTAL CURSOR — bounded work at every maintenance point
+         * (the design contract: heap maintenance must never turn into an
+         * unpredictable pause).  The walk resumes at the (heap, order)
+         * slot where the previous pass stopped and is capped by BOTH a
+         * block-visit budget and a release budget: each madvise batch
+         * costs cross-core TLB-shootdown IPIs, so releases are the
+         * expensive unit, not visits.  The cursor advances BEFORE a slot
+         * is processed, so a list interrupted mid-walk simply waits one
+         * full cycle instead of being double-aged; the cursor never
+         * stores a block pointer — blocks may be reallocated, split or
+         * coalesced between passes, only (heap, order) is stable. */
+        #define RAY_FREE_AGE_RELEASE   3
+        #define RAY_P5_VISIT_BUDGET    2048
+        #define RAY_P5_RELEASE_BUDGET  64
+        static int s_p5_hid = 0;
+        static int s_p5_ord = 13;
         uint64_t large_orders_mask = ~((1ULL << 13) - 1);
-        for (int hid = 0; hid < RAY_HEAP_REGISTRY_SIZE; hid++) {
+        int64_t p5_visited = 0, p5_released = 0;
+        int p5_slots = RAY_HEAP_REGISTRY_SIZE * (RAY_HEAP_FL_SIZE - 13);
+        for (int step = 0; step < p5_slots; step++) {
+            if (p5_visited >= RAY_P5_VISIT_BUDGET ||
+                p5_released >= RAY_P5_RELEASE_BUDGET) break;
+            int hid = s_p5_hid;
+            int ord = s_p5_ord;
+            if (++s_p5_ord >= RAY_HEAP_FL_SIZE) {
+                s_p5_ord = 13;
+                s_p5_hid = (s_p5_hid + 1) % RAY_HEAP_REGISTRY_SIZE;
+            }
             ray_heap_t* gh = ray_heap_registry[hid];
             if (!gh) continue;
-            uint64_t avail = gh->avail & large_orders_mask;
-            if (!avail) continue;
-            for (int i = 13; i < RAY_HEAP_FL_SIZE; i++) {
-                if (!(avail & (1ULL << i))) continue;
-                ray_fl_head_t* head = &gh->freelist[i];
-                ray_t* blk = head->fl_next;
-                while (blk != (ray_t*)head) {
-                    if (blk->attrs < RAY_FREE_AGE_RELEASE) {
-                        blk->attrs++;
-                    } else if (blk->attrs == RAY_FREE_AGE_RELEASE) {
-                        size_t bsize = BSIZEOF(i);
-                        int rpidx = heap_find_pool(gh, blk);
-                        bool hp = (rpidx >= 0) ? (gh->pools[rpidx].hugepage != 0) : false;
-                        ray_vm_release_block(blk, bsize, hp);
-                        blk->attrs = RAY_FREE_AGE_RELEASE + 1;  /* released */
-                    }
-                    blk = blk->fl_next;
+            if (!((gh->avail & large_orders_mask) & (1ULL << ord))) continue;
+            ray_fl_head_t* head = &gh->freelist[ord];
+            for (ray_t* blk = head->fl_next; blk != (ray_t*)head;
+                 blk = blk->fl_next) {
+                if (p5_visited++ >= RAY_P5_VISIT_BUDGET) break;
+                if (blk->attrs < RAY_FREE_AGE_RELEASE) {
+                    blk->attrs++;
+                } else if (blk->attrs == RAY_FREE_AGE_RELEASE) {
+                    size_t bsize = BSIZEOF(ord);
+                    int rpidx = heap_find_pool(gh, blk);
+                    bool hp = (rpidx >= 0) ? (gh->pools[rpidx].hugepage != 0)
+                                           : false;
+                    ray_vm_release_block(blk, bsize, hp);
+                    blk->attrs = RAY_FREE_AGE_RELEASE + 1;  /* released */
+                    if (++p5_released >= RAY_P5_RELEASE_BUDGET) break;
                 }
             }
         }
