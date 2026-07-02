@@ -1589,6 +1589,34 @@ static int expr_contains_call_named(ray_t* expr, const char* name, size_t name_l
 
 static ray_t* query_materialize_parted_col(ray_t* col);
 
+/* True when a projection's TOP-LEVEL call is a "whole-column verb": a
+ * length-changing / reordering builtin (distinct, asc, desc, reverse) that
+ * consumes an entire column vector and returns a vector.  The DAG compiler
+ * has no bucket for these — they are neither element-wise ops nor
+ * scalar-reducing aggregations — so `compile_expr_dag` returns NULL and the
+ * projection lands in the eval fallback.  There the default per-row scatter
+ * feeds the verb one scalar cell at a time: `distinct` errors ("argument must
+ * be a list") and `asc`/`desc`/`reverse` silently return the column untouched
+ * (reordering a 1-element slice is a no-op).  Both are wrong; such a
+ * projection must instead be evaluated once against the full column
+ * (see eval_expr_whole_column).  Matched on the top-level head only —
+ * a whole-column verb nested under an element-wise op has ambiguous length
+ * semantics and is left to the per-row path. */
+static int is_whole_column_projection(ray_t* expr) {
+    if (!expr || expr->type != RAY_LIST) return 0;
+    if (ray_len(expr) < 2) return 0;
+    ray_t* head = ((ray_t**)ray_data(expr))[0];
+    if (!head || head->type != -RAY_SYM) return 0;
+    ray_t* s = ray_sym_str(head->i64);
+    if (!s) return 0;
+    size_t l = ray_str_len(s);
+    const char* p = ray_str_ptr(s);
+    return (l == 8 && memcmp(p, "distinct", 8) == 0) ||
+           (l == 7 && memcmp(p, "reverse", 7) == 0) ||
+           (l == 3 && memcmp(p, "asc", 3) == 0) ||
+           (l == 4 && memcmp(p, "desc", 4) == 0);
+}
+
 /* True when a grouped aggregate expression can be lowered to OP_GROUP.
  * `(count (distinct col))` is semantically an aggregate, but `distinct`
  * is not a row-aligned DAG input inside GROUP.  Route it through the
@@ -2455,6 +2483,30 @@ static ray_t* eval_expr_per_row(ray_t* expr, ray_t* tbl, int64_t nrows) {
         result->type = RAY_LIST;
         result->len = 0;
     }
+    return result;
+}
+
+/* Evaluate a whole-column projection (is_whole_column_projection) ONCE against
+ * the full table: every column is bound as a complete vector (via
+ * bind_all_columns, exactly as the DAG path does) and the expression is
+ * evaluated a single time, so `distinct`/`asc`/`desc`/`reverse` receive the
+ * whole column instead of one scalar cell.  The returned vector (caller owns)
+ * defines its output column's length, which may differ from the table's row
+ * count — the caller enforces cross-column length agreement.  Mirrors
+ * eval_expr_per_row's scope save/restore, including on every error exit. */
+static ray_t* eval_expr_whole_column(ray_t* expr, ray_t* tbl) {
+    if (ray_env_push_scope() != RAY_OK) return ray_error("oom", NULL);
+    ray_t* _aqt = bind_all_columns(tbl);
+    ray_t* result = ray_eval(expr);
+    /* distinct/asc/desc/reverse return a lazy DAG chain (RAY_LAZY) — force it
+     * to a concrete vector while the source columns it captured are still
+     * bound in this scope. */
+    if (result && !RAY_IS_ERR(result))
+        result = ray_lazy_materialize(result);
+    g_active_query_table = _aqt;
+    ray_env_pop_scope();
+    if (!result)
+        return ray_error("domain", "select: whole-column expression evaluation failed");
     return result;
 }
 
@@ -8000,6 +8052,33 @@ by_dict_done:
                 }
             }
             if (use_eval_fallback) {
+                /* The fallback evaluates projections directly over `tbl`,
+                 * bypassing the DAG's ray_execute — so a WHERE clause (wired
+                 * into `root` as ray_filter) would be silently ignored.
+                 * Materialize the filtered table first and project over it,
+                 * mirroring the group-by path's materialize branch. */
+                if (where_expr) {
+                    root = ray_optimize(g, root);
+                    ray_t* fres = ray_execute(g, root);
+                    ray_graph_free(g); g = NULL;
+                    if (fres && !RAY_IS_ERR(fres) && ray_is_lazy(fres))
+                        fres = ray_lazy_materialize(fres);
+                    if (!fres || RAY_IS_ERR(fres)) {
+                        if (nearest_handle_owned) ray_release(nearest_handle_owned);
+                        if (nearest_query_owned)  ray_sys_free(nearest_query_owned);
+                        ray_release(tbl);
+                        return fres ? fres : ray_error("domain", "select: `where:` filter produced no result");
+                    }
+                    ray_release(tbl);
+                    tbl = fres;
+                    g = ray_graph_new(tbl);
+                    if (!g) {
+                        if (nearest_handle_owned) ray_release(nearest_handle_owned);
+                        if (nearest_query_owned)  ray_sys_free(nearest_query_owned);
+                        ray_release(tbl);
+                        return ray_error("oom", NULL);
+                    }
+                }
                 ray_t* result = ray_table_new(0);
                 if (!result || RAY_IS_ERR(result)) {
                     if (nearest_handle_owned) ray_release(nearest_handle_owned);
@@ -8008,12 +8087,18 @@ by_dict_done:
                     return result ? result : ray_error("oom", NULL);
                 }
                 int64_t nrows = ray_table_nrows(tbl);
+                int64_t out_len = -1;   /* length of the first materialized column */
                 for (int64_t i = 0; i + 1 < dict_n; i += 2) {
                     int64_t kid = dict_elems[i]->i64;
                     if (kid == from_id || kid == where_id || kid == by_id ||
                         kid == take_id || kid == asc_id || kid == desc_id ||
                         kid == nearest_id) continue;
-                    ray_t* col = eval_expr_per_row(dict_elems[i + 1], tbl, nrows);
+                    /* Whole-column verbs (distinct/asc/desc/reverse) consume the
+                     * entire column and must be evaluated once, not scattered
+                     * per-row; everything else keeps the row-by-row semantics. */
+                    ray_t* col = is_whole_column_projection(dict_elems[i + 1])
+                        ? eval_expr_whole_column(dict_elems[i + 1], tbl)
+                        : eval_expr_per_row(dict_elems[i + 1], tbl, nrows);
                     if (!col || RAY_IS_ERR(col)) {
                         ray_t* err = col ? col : ray_error("domain", "select: failed to evaluate output column expression");
                         ray_release(result);
@@ -8021,6 +8106,20 @@ by_dict_done:
                         if (nearest_query_owned)  ray_sys_free(nearest_query_owned);
                         ray_graph_free(g); ray_release(tbl);
                         return err;
+                    }
+                    /* All output columns must agree in length — a length-changing
+                     * projection (e.g. distinct) beside a full-length column would
+                     * yield a ragged table.  Reject rather than emit one. */
+                    int64_t col_len = ray_len(col);
+                    if (out_len < 0) {
+                        out_len = col_len;
+                    } else if (col_len != out_len) {
+                        ray_release(col);
+                        ray_release(result);
+                        if (nearest_handle_owned) ray_release(nearest_handle_owned);
+                        if (nearest_query_owned)  ray_sys_free(nearest_query_owned);
+                        ray_graph_free(g); ray_release(tbl);
+                        return ray_error("length", "select: output column length %lld does not match %lld", (long long)col_len, (long long)out_len);
                     }
                     result = ray_table_add_col(result, kid, col);
                     ray_release(col);
