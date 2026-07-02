@@ -2327,16 +2327,18 @@ static test_result_t test_index_fn_error_propagation(void) {
     int64_t s = ray_sym_intern("test", 4);
     v = ray_vec_append(v, &s);
 
-    /* All four fn wrappers should return an error for SYM vec. */
+    /* zone/sort/bloom reject SYM; hash now accepts SYM (domain-id hash index). */
     ray_retain(v);
     ray_t* r1 = ray_idx_zone_fn(v);
     TEST_ASSERT_TRUE(RAY_IS_ERR(r1));
     ray_error_free(r1);
 
+    /* hash on SYM now succeeds — verify the result carries an index. */
     ray_retain(v);
     ray_t* r2 = ray_idx_hash_fn(v);
-    TEST_ASSERT_TRUE(RAY_IS_ERR(r2));
-    ray_error_free(r2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r2));
+    TEST_ASSERT_TRUE(ray_index_has(r2));
+    ray_release(r2);
 
     ray_retain(v);
     ray_t* r3 = ray_idx_sort_fn(v);

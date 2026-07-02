@@ -549,9 +549,11 @@ static ray_t* attach_finalize(ray_t* parent, ray_t* idx) {
      * via ray_vec_is_null (sentinel-based), which is unaffected by the
      * index pointer overlay at bytes 0-7. */
     parent->index    = idx;
-    /* _idx_pad (bytes 8-15) aliases str_pool on a RAY_STR parent — NEVER clear
-     * it there, or we'd null the column's string pool.  HAS_LINK uses it too. */
-    if (!(parent->attrs & RAY_ATTR_HAS_LINK) && parent->type != RAY_STR)
+    /* _idx_pad (bytes 8-15) aliases str_pool on a RAY_STR parent and
+     * sym_domain on a RAY_SYM parent — NEVER clear it for either, or
+     * we'd null the column's pool/domain.  HAS_LINK uses it too. */
+    if (!(parent->attrs & RAY_ATTR_HAS_LINK) &&
+        parent->type != RAY_STR && parent->type != RAY_SYM)
         parent->_idx_pad = NULL;
     parent->attrs   |= RAY_ATTR_HAS_INDEX;
     return parent;
@@ -560,7 +562,8 @@ static ray_t* attach_finalize(ray_t* parent, ray_t* idx) {
 /* Validate + COW + drop existing index.  Returns the (possibly new) parent
  * pointer and updates *vp.  On error returns a RAY_ERROR; caller must
  * propagate without further modifying *vp. */
-static ray_t* prepare_attach_ex(ray_t** vp, const char* what, bool allow_str) {
+static ray_t* prepare_attach_ex(ray_t** vp, const char* what,
+                                bool allow_str, bool allow_sym) {
     if (!vp || !*vp || RAY_IS_ERR(*vp))
         return ray_error("type", "%s: null/error vector", what);
     ray_t* v = *vp;
@@ -576,17 +579,21 @@ static ray_t* prepare_attach_ex(ray_t** vp, const char* what, bool allow_str) {
     v = ray_cow(v);
     if (!v || RAY_IS_ERR(v)) return v;
     *vp = v;
-    /* Numeric vectors carry any index kind; STR carries only RAY_IDX_DICT (the
-     * codes live alongside the descriptors — the column representation is
-     * untouched).  allow_str gates that one exception. */
-    if (numeric_elem_size(v->type) == 0 && !(allow_str && v->type == RAY_STR)) {
-        return ray_error("nyi", "%s: only numeric vectors supported (got type %d)",
+    /* Numeric vectors carry any index kind; STR carries only RAY_IDX_DICT
+     * (codes live alongside the descriptors — the column representation is
+     * untouched).  allow_str gates that one exception.  RAY_SYM carries
+     * RAY_IDX_HASH: id values are numeric ints of adaptive width;
+     * allow_sym gates that exception (hash attach only). */
+    if (numeric_elem_size(v->type) == 0 &&
+        !(allow_str && v->type == RAY_STR) &&
+        !(allow_sym && v->type == RAY_SYM)) {
+        return ray_error("nyi", "%s: only numeric/sym vectors supported (got type %d)",
                          what, (int)v->type);
     }
     return v;
 }
 static ray_t* prepare_attach(ray_t** vp, const char* what) {
-    return prepare_attach_ex(vp, what, false);
+    return prepare_attach_ex(vp, what, false, false);
 }
 
 ray_t* ray_index_attach_zone(ray_t** vp) {
@@ -774,13 +781,14 @@ ray_t* ray_index_attach_built(ray_t** vp, ray_t* idx) {
     if (!idx || RAY_IS_ERR(idx) || idx->type != RAY_INDEX)
         return ray_error("type", "attach_built: not an index object");
     bool is_dict = (ray_index_payload(idx)->kind == RAY_IDX_DICT);
-    ray_t* v = prepare_attach_ex(vp, "index", is_dict);   /* rc=1 → ray_cow no-op */
+    bool is_hash = (ray_index_payload(idx)->kind == RAY_IDX_HASH);
+    ray_t* v = prepare_attach_ex(vp, "index", is_dict, is_hash);   /* rc=1 → ray_cow no-op */
     if (RAY_IS_ERR(v)) return v;
     return attach_finalize(v, idx);
 }
 
 ray_t* ray_index_attach_dict(ray_t** vp) {
-    ray_t* v = prepare_attach_ex(vp, "dict", true);
+    ray_t* v = prepare_attach_ex(vp, "dict", true, false);
     if (RAY_IS_ERR(v)) return v;
     ray_t* idx = ray_index_dict_compute(v);
     if (!idx || RAY_IS_ERR(idx)) return idx ? idx : ray_error("oom", NULL);
@@ -901,7 +909,7 @@ ray_t* ray_index_inline_map(uint8_t* region) {
  * -------------------------------------------------------------------------- */
 
 ray_t* ray_index_attach_hash(ray_t** vp) {
-    ray_t* v = prepare_attach(vp, "hash");
+    ray_t* v = prepare_attach_ex(vp, "hash", false, true);  /* allow_sym: RAY_SYM uses domain ids */
     if (RAY_IS_ERR(v)) return v;
 
     int64_t n = v->len;
@@ -929,8 +937,11 @@ ray_t* ray_index_attach_hash(ray_t** vp) {
     uint64_t mask = cap - 1;
 
     for (int64_t i = 0; i < n; i++) {
-        if (ray_vec_is_null(v, i)) continue;
-        uint64_t h = mix64(numeric_key_word(base, v->type, i));
+        if (ray_vec_is_null(v, i)) continue;   /* SYM is null-free → always false */
+        uint64_t kw = (v->type == RAY_SYM)
+            ? (uint64_t)ray_read_sym(base, i, RAY_SYM, v->attrs)  /* domain id, width-aware */
+            : numeric_key_word(base, v->type, i);
+        uint64_t h = mix64(kw);
         uint64_t slot = h & mask;
         chn[i] = tbl[slot];     /* link previous head into chain */
         tbl[slot] = i + 1;      /* this row becomes new head */
@@ -976,6 +987,7 @@ static int hash_key_in_range(int8_t t, int64_t k) {
     case RAY_TIME:                     return k >= INT32_MIN && k <= INT32_MAX;
     case RAY_I64:
     case RAY_TIMESTAMP:                return 1;
+    case RAY_SYM:                      return k >= 0; /* domain id; non-neg guaranteed by resolve */
     default:                           return 0;
     }
 }
@@ -1024,10 +1036,17 @@ static ray_index_t* hash_probe_setup(ray_t* col, int64_t key,
     if (ix->kind != RAY_IDX_HASH) return NULL;
     if (ix->built_for_len != col->len) return NULL;
     if (!hash_key_in_range(col->type, key)) return NULL;
-    if (numeric_elem_size(col->type) == 0) return NULL;
+    /* SYM ids are valid probe keys (non-negative domain ids); all other
+     * non-numeric types are rejected by hash_key_in_range above. */
+    if (col->type != RAY_SYM && numeric_elem_size(col->type) == 0) return NULL;
     if (!ix->u.hash.table || !ix->u.hash.chain) return NULL;
 
-    uint64_t h = mix64(hash_key_bits(numeric_elem_size(col->type), key));
+    /* SYM: hash the domain id directly (mirrors the builder's cast to uint64_t).
+     * Numeric: fold through the storage width to match the builder's numeric_key_word. */
+    uint64_t kbits = (col->type == RAY_SYM)
+        ? (uint64_t)key
+        : hash_key_bits(numeric_elem_size(col->type), key);
+    uint64_t h = mix64(kbits);
     uint64_t slot = h & ix->u.hash.mask;
     const int64_t* tbl = (const int64_t*)ray_data(ix->u.hash.table);
     *start_rid = tbl[slot] - 1;
@@ -1224,7 +1243,10 @@ ray_t* ray_index_hash_eq_rowsel(ray_t* col, int64_t key) {
     int64_t* matches = (int64_t*)ray_data(match_hdr);
 
     while (rid >= 0) {
-        if (hash_col_read_i64(base, t, rid) == key) {
+        int64_t cell = (t == RAY_SYM)
+            ? ray_read_sym(base, rid, RAY_SYM, col->attrs)  /* width-aware id confirm */
+            : hash_col_read_i64(base, t, rid);
+        if (cell == key) {
             if (mcnt == mcap) {
                 int64_t new_cap = mcap * 2;
                 if (new_cap > n) new_cap = n + 1;  /* defensive bound */

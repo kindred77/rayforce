@@ -1121,7 +1121,8 @@ static int idx_filter_decode(ray_graph_t* g, ray_op_t* pred_op,
     case -RAY_U8:        key_i = (int64_t)cv->b8;          break;
     case -RAY_F64:       key_f = cv->f64;    is_float = 1; break;
     case -RAY_F32:       key_f = cv->f64;    is_float = 1; break; /* F32 atoms use f64 slot */
-    default: return 0;  /* sym / str / guid — not eligible */
+    case -RAY_SYM:       key_i = cv->i64;               break; /* global intern id; domain-resolved at consult */
+    default: return 0;  /* str / guid — not eligible */
     }
 
     /* Reconcile the literal's family with the COLUMN's family.  Index
@@ -1543,19 +1544,40 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                         }
                     }
 
-                    /* 3. Hash-eq: integer EQ only; re-check HAS_NULLS. */
+                    /* 3. Hash-eq: integer or SYM EQ; re-check HAS_NULLS. */
                     if (cmp_op == OP_EQ && !is_float &&
                         !(col->attrs & RAY_ATTR_HAS_NULLS)) {
-                        if (ray_index_kind(col) == RAY_IDX_HASH)
-                            ray_idx_consults[IDX_SITE_FILTER_HASH]++;
-                        ray_t* sel = ray_index_hash_eq_rowsel(col, key_i);
-                        if (sel) {
-                            ray_idx_hits[IDX_SITE_FILTER_HASH]++;
-                            g->selection = sel;
-                            return input;
+                        /* SYM equality: idx_filter_decode passes the global intern id;
+                         * the hash was built over per-column domain ids.  Resolve here. */
+                        bool sym_probe_skip = false;
+                        if (col->type == RAY_SYM) {
+                            ray_t* cs = ray_sym_str(key_i);
+                            int64_t dom_id = cs
+                                ? ray_sym_domain_find(ray_sym_vec_domain(col),
+                                                      ray_str_ptr(cs), ray_str_len(cs))
+                                : -1;
+                            if (dom_id < 0) {
+                                /* Symbol absent from this column's domain → no rows. */
+                                int64_t nrows = ray_table_nrows(input);
+                                ray_t* empty = ray_index_empty_rowsel(nrows);
+                                if (empty) { g->selection = empty; return input; }
+                                sym_probe_skip = true; /* OOM — fall through to scan */
+                            } else {
+                                key_i = dom_id;
+                            }
                         }
-                        /* sel == NULL: ineligible (wrong/stale index kind,
-                         * key out of range) or OOM — fall through to scan. */
+                        if (!sym_probe_skip) {
+                            if (ray_index_kind(col) == RAY_IDX_HASH)
+                                ray_idx_consults[IDX_SITE_FILTER_HASH]++;
+                            ray_t* sel = ray_index_hash_eq_rowsel(col, key_i);
+                            if (sel) {
+                                ray_idx_hits[IDX_SITE_FILTER_HASH]++;
+                                g->selection = sel;
+                                return input;
+                            }
+                            /* sel == NULL: ineligible (wrong/stale index kind,
+                             * key out of range) or OOM — fall through to scan. */
+                        }
                     }
 
                     /* 4. Sort-index range: EQ/LT/LE/GT/GE (NE returns NULL). */
