@@ -1884,11 +1884,15 @@ static bool asof_hash_group_match(uint8_t n_eq,
     }
 
     /* Index variant — single eq key carrying a fresh CSR grouped index,
-     * right time globally sorted, no null-marked right rows: every group
-     * is answered straight from its index slice (ascending row ids, hence
-     * ascending times).  NO pass over the right table at all — this is the
+     * no null-marked right rows: every group is answered straight from its
+     * index slice (ascending row ids).  Ascending TIME along the slice is
+     * either implied by globally sorted right time, or verified per probed
+     * slice with a bail-early scan — on a (sym,time)-sorted (parted)
+     * layout the slice is one contiguous range, so the verify reads
+     * sequential memory and costs a fraction of the binary searches it
+     * unlocks.  NO pass over the right table at all — this is the
      * parted-layout-parity path: cost is per-probed-key, not per-row. */
-    if (ok && n_eq == 1 && rt_time_sorted && rt_no_nulls &&
+    if (ok && n_eq == 1 && rt_no_nulls &&
         ray_index_kind(rt_eq[0]) == RAY_IDX_HASH) {
         ray_idx_consults[IDX_SITE_ASOF]++;
         bool served = true;
@@ -1903,6 +1907,13 @@ static bool asof_hash_group_match(uint8_t n_eq,
                 int hit = ray_index_hash_group(rt_eq[0], gkeys[g],
                                                &grows, &gn);
                 if (hit < 0) { served = false; break; }  /* ineligible */
+                if (!rt_time_sorted)
+                    for (int64_t p = 1; p < gn; p++)
+                        if (rt_time[grows[p]] < rt_time[grows[p - 1]]) {
+                            served = false;   /* slice not time-ordered */
+                            break;
+                        }
+                if (!served) break;
                 gsl[2 * g]     = (int64_t)(intptr_t)grows;
                 gsl[2 * g + 1] = gn;
             }
@@ -1941,7 +1952,7 @@ static bool asof_hash_group_match(uint8_t n_eq,
      * proportional to the PROBED slices; when those cover most of the
      * table anyway, the sequential full pass is cheaper per row, so bail
      * upfront on the (known!) slice-length sum. */
-    if (ok && n_eq >= 2 && rt_time_sorted && rt_no_nulls && n_groups > 0 &&
+    if (ok && n_eq >= 2 && rt_no_nulls && n_groups > 0 &&
         ray_index_kind(rt_eq[0]) == RAY_IDX_HASH) {
         ray_idx_consults[IDX_SITE_ASOF]++;
         bool served = true;
@@ -2013,6 +2024,16 @@ static bool asof_hash_group_match(uint8_t n_eq,
                                                gkeys[(int64_t)rep * n_eq],
                                                &grows, &gn);
                 if (hit < 0) { served = false; break; }   /* ineligible */
+                /* The cursor merge needs ascending time along the walk;
+                 * globally sorted right time implies it, otherwise verify
+                 * this slice (sequential reads on a parted layout). */
+                if (!rt_time_sorted)
+                    for (int64_t p = 1; p < gn; p++)
+                        if (rt_time[grows[p]] < rt_time[grows[p - 1]]) {
+                            served = false;
+                            break;
+                        }
+                if (!served) break;
                 fsl[2 * f]     = (int64_t)(intptr_t)grows;
                 fsl[2 * f + 1] = gn;
                 total_slice += gn;

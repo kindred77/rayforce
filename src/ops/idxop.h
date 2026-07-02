@@ -191,7 +191,7 @@ static inline ray_index_t* ray_index_payload(ray_t* idx) {
 typedef enum {
     IDX_SITE_FILTER_ZONE = 0, IDX_SITE_FILTER_BLOOM, IDX_SITE_FILTER_HASH,
     IDX_SITE_FILTER_RANGE, IDX_SITE_IN, IDX_SITE_FIND, IDX_SITE_SORT,
-    IDX_SITE_DISTINCT, IDX_SITE_ASOF, IDX_SITE__N
+    IDX_SITE_DISTINCT, IDX_SITE_ASOF, IDX_SITE_FILTER_EQRANGE, IDX_SITE__N
 } idx_site_t;
 extern uint64_t ray_idx_consults[IDX_SITE__N];
 extern uint64_t ray_idx_hits[IDX_SITE__N];
@@ -374,6 +374,9 @@ int64_t ray_index_find_row(ray_t* col, int64_t key);
  *   -1 → not eligible (no fresh hash index / bad key) — caller falls back. */
 int ray_index_hash_group(ray_t* col, int64_t key,
                          const int64_t** rows_out, int64_t* n_out);
+
+/* Build a rowsel from ASCENDING row ids (empty n=0 is valid).  NULL on OOM. */
+ray_t* ray_index_rowsel_from_ids(int64_t nrows, const int64_t* ids, int64_t n);
 
 /* ===== Sort-index range probe =====
  *

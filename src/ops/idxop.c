@@ -43,7 +43,7 @@ uint64_t ray_idx_hits[IDX_SITE__N];
 static void idx_stats_dump(void) {
     static const char* names[IDX_SITE__N] = {
         "filter-zone", "filter-bloom", "filter-hash", "filter-range",
-        "in", "find", "sort", "distinct", "asof",
+        "in", "find", "sort", "distinct", "asof", "filter-eq-range",
     };
     for (int i = 0; i < IDX_SITE__N; i++)
         if (ray_idx_consults[i] || ray_idx_hits[i])
@@ -2330,6 +2330,14 @@ int64_t ray_index_find_row(ray_t* col, int64_t key) {
     const int64_t* of = (const int64_t*)ray_data(ix->u.hash.offs);
     const int64_t* rw = (const int64_t*)ray_data(ix->u.hash.rows);
     return rw[of[gid]];
+}
+
+/* Public wrapper over the internal sorted-ids rowsel builder — consult
+ * sites outside this file (the eq+range conjunction in exec.c) construct
+ * selections from index slices. */
+ray_t* ray_index_rowsel_from_ids(int64_t nrows, const int64_t* ids,
+                                 int64_t n) {
+    return rowsel_from_sorted_ids(nrows, ids, n);
 }
 
 int ray_index_hash_group(ray_t* col, int64_t key,

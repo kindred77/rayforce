@@ -1079,6 +1079,30 @@ ray_t* exec_in_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
  *
  * Float literals (F32/F64) decode into *out_key_f; integer literals decode
  * into *out_key_i.  Hash-eq only uses integer keys; zone uses both. */
+/* Flatten an OP_AND tree into its conjunct predicate nodes.  Returns the
+ * count, or 0 when the root is not an AND or the tree exceeds max. */
+static int idx_flatten_and(ray_graph_t* g, ray_op_t* op,
+                           ray_op_t** out, int max) {
+    if (!op || op->opcode != OP_AND) return 0;
+    ray_op_t* stack[8];
+    int sp = 0, n = 0;
+    stack[sp++] = op;
+    while (sp > 0) {
+        ray_op_t* nd = stack[--sp];
+        if (nd->opcode == OP_AND) {
+            ray_op_t* l = op_child(g, nd, 0);
+            ray_op_t* r = op_child(g, nd, 1);
+            if (!l || !r || sp + 2 > 8) return 0;
+            stack[sp++] = l;
+            stack[sp++] = r;
+        } else {
+            if (n >= max) return 0;
+            out[n++] = nd;
+        }
+    }
+    return n;
+}
+
 static int idx_filter_decode(ray_graph_t* g, ray_op_t* pred_op,
                              ray_t** out_col, uint16_t* out_cmp_op,
                              int64_t* out_key_i, double* out_key_f,
@@ -1684,6 +1708,114 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     }
                 }
 
+                /* 4.5 Eq+range conjunction: (col0 == K) AND (range cmps on
+                 * ONE other column).  The eq conjunct's CSR index slice
+                 * gives the candidate rows; when the range column is
+                 * non-descending ALONG that slice — verified with a
+                 * bail-early scan, free on a parted (key,range)-sorted
+                 * layout where the slice is contiguous and the range
+                 * column is the secondary sort key — the bounds binary-
+                 * search to a sub-slice and the whole compound WHERE
+                 * collapses to O(slice-verify + log slice). */
+                {
+                    ray_op_t* conj[4];
+                    int ncj = idx_flatten_and(g, op_child(g, op, 1), conj, 4);
+                    ray_t* eq_col = NULL;
+                    ray_t* rg_col = NULL;
+                    int64_t eq_key = 0;
+                    int64_t lo = INT64_MIN, hi = INT64_MAX;
+                    bool shape_ok = (ncj >= 2);
+                    for (int ci = 0; ci < ncj && shape_ok; ci++) {
+                        ray_t* c = NULL; uint16_t cop = 0;
+                        int64_t ki = 0; double kf = 0.0; int isf = 0;
+                        if (!idx_filter_decode(g, conj[ci], &c, &cop,
+                                               &ki, &kf, &isf) || isf) {
+                            shape_ok = false; break;
+                        }
+                        if (cop == OP_EQ && !eq_col &&
+                            ray_index_kind(c) == RAY_IDX_HASH &&
+                            !(c->attrs & RAY_ATTR_HAS_NULLS)) {
+                            eq_col = c; eq_key = ki;
+                        } else if (cop == OP_GE || cop == OP_GT ||
+                                   cop == OP_LE || cop == OP_LT) {
+                            if (c->attrs & RAY_ATTR_HAS_NULLS) { shape_ok = false; break; }
+                            if (!rg_col) rg_col = c;
+                            else if (rg_col != c) { shape_ok = false; break; }
+                            if (cop == OP_GE)      { if (ki > lo) lo = ki; }
+                            else if (cop == OP_GT) { if (ki == INT64_MAX) { lo = 1; hi = 0; } else if (ki + 1 > lo) lo = ki + 1; }
+                            else if (cop == OP_LE) { if (ki < hi) hi = ki; }
+                            else                   { if (ki == INT64_MIN) { lo = 1; hi = 0; } else if (ki - 1 < hi) hi = ki - 1; }
+                        } else { shape_ok = false; break; }
+                    }
+                    if (shape_ok && eq_col && rg_col && rg_col != eq_col) {
+                        ray_idx_consults[IDX_SITE_FILTER_EQRANGE]++;
+                        /* SYM eq: global intern id -> this column's domain
+                         * (mirrors the single-eq consult above). */
+                        int64_t probe = eq_key;
+                        bool absent = false;
+                        if (eq_col->type == RAY_SYM) {
+                            ray_t* cs = ray_sym_str(eq_key);
+                            int64_t dom_id = cs
+                                ? ray_sym_domain_find(ray_sym_vec_domain(eq_col),
+                                                      ray_str_ptr(cs),
+                                                      ray_str_len(cs))
+                                : -1;
+                            if (dom_id < 0) absent = true;
+                            else probe = dom_id;
+                        }
+                        const int64_t* grows = NULL;
+                        int64_t gn = 0;
+                        int hit = absent ? 0
+                            : ray_index_hash_group(eq_col, probe, &grows, &gn);
+                        if (hit == 0 || (hit > 0 && lo > hi)) {
+                            /* provably empty: absent key or empty range */
+                            int64_t nrows = ray_table_nrows(input);
+                            ray_t* sel = ray_index_rowsel_from_ids(nrows, NULL, 0);
+                            if (sel) {
+                                ray_idx_hits[IDX_SITE_FILTER_EQRANGE]++;
+                                g->selection = sel;
+                                return input;
+                            }
+                        } else if (hit > 0) {
+                            const void* rgd = ray_data(rg_col);
+                            int8_t  rt = rg_col->type;
+                            uint8_t ra = rg_col->attrs;
+                            bool mono = true;
+                            int64_t prevv = INT64_MIN;
+                            for (int64_t pp = 0; pp < gn; pp++) {
+                                int64_t v = read_col_i64(rgd, grows[pp], rt, ra);
+                                if (v < prevv) { mono = false; break; }
+                                prevv = v;
+                            }
+                            if (mono) {
+                                int64_t a = 0, b = gn;   /* first pos >= lo */
+                                while (a < b) {
+                                    int64_t m = a + (b - a) / 2;
+                                    if (read_col_i64(rgd, grows[m], rt, ra) < lo) a = m + 1;
+                                    else b = m;
+                                }
+                                int64_t startp = a;
+                                b = gn;                   /* first pos > hi */
+                                while (a < b) {
+                                    int64_t m = a + (b - a) / 2;
+                                    if (read_col_i64(rgd, grows[m], rt, ra) <= hi) a = m + 1;
+                                    else b = m;
+                                }
+                                int64_t nrows = ray_table_nrows(input);
+                                ray_t* sel = ray_index_rowsel_from_ids(
+                                    nrows, grows + startp, a - startp);
+                                if (sel) {
+                                    ray_idx_hits[IDX_SITE_FILTER_EQRANGE]++;
+                                    g->selection = sel;
+                                    return input;
+                                }
+                            }
+                            /* non-monotone slice / OOM: fall through */
+                        }
+                        /* hit < 0 (stale/ineligible index): fall through */
+                    }
+                }
+
                 /* 5. Hash-index IN probe: FILTER(IN(SCAN col, CONST set_vec))
                  * on an integer-family column with a hash index.  Probes the
                  * hash chain for each unique set element; builds one rowsel
@@ -1725,6 +1857,91 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                         return input;
                     }
                     /* unsupported / OOM at runtime — fall through. */
+                }
+            }
+
+            /* Sparse chained-filter refine: the optimizer splits compound
+             * WHEREs selectivity-first, so a second FILTER arrives here
+             * with the first filter's selection installed — and evaluating
+             * its predicate over ALL rows to refine a few survivors wastes
+             * O(rows).  Gather only the predicate's columns for the
+             * surviving rows, evaluate the predicate over that dense
+             * subset, and rebuild the selection from the passing
+             * survivors — O(survivors).  Any ineligibility (non-scalar
+             * predicate shape, OOM, unexpected result) falls through to
+             * the full-width path unchanged. */
+            if (input->type == RAY_TABLE && g->selection) {
+                ray_rowsel_t* smeta = ray_rowsel_meta(g->selection);
+                int64_t fr_nrows = ray_table_nrows(input);
+                int64_t nsel = smeta ? smeta->total_pass : -1;
+                if (nsel >= 0 && fr_nrows > 0 && nsel * 4 <= fr_nrows) {
+                    ray_op_t* pred_root = op_child(g, op, 1);
+                    int64_t keep[32];
+                    bool has_expr = false;
+                    uint32_t roots[1] = { pred_root->id };
+                    int nkeep = collect_scan_syms(g, roots, 1, keep, 32,
+                                                  &has_expr);
+                    if (nkeep > 0) {
+                        ray_t* sub = sel_compact(g, input, g->selection,
+                                                 keep, nkeep);
+                        if (sub && !RAY_IS_ERR(sub) && sub != input) {
+                            ray_t* saved_tbl = g->table;
+                            ray_t* saved_sel = g->selection;
+                            g->table = sub;
+                            g->selection = NULL;
+                            ray_t* pv = exec_node(g, pred_root);
+                            g->table = saved_tbl;
+                            g->selection = saved_sel;
+                            bool done_refine = false;
+                            if (pv && !RAY_IS_ERR(pv) &&
+                                pv->type == RAY_BOOL && pv->len == nsel) {
+                                ray_t* ids_hdr = NULL;
+                                int64_t* ids = (int64_t*)scratch_alloc(
+                                    &ids_hdr,
+                                    (size_t)(nsel > 0 ? nsel : 1) * 8);
+                                if (ids) {
+                                    const uint8_t*  fl  = ray_rowsel_flags(g->selection);
+                                    const uint32_t* off = ray_rowsel_offsets(g->selection);
+                                    const uint16_t* ix  = ray_rowsel_idx(g->selection);
+                                    const uint8_t*  bv  = (const uint8_t*)ray_data(pv);
+                                    uint32_t n_segs = smeta->n_segs;
+                                    int64_t j = 0, kept = 0;
+                                    for (uint32_t seg = 0; seg < n_segs; seg++) {
+                                        uint8_t f = fl[seg];
+                                        if (f == RAY_SEL_NONE) continue;
+                                        int64_t ss = (int64_t)seg * RAY_MORSEL_ELEMS;
+                                        int64_t se = ss + RAY_MORSEL_ELEMS;
+                                        if (se > fr_nrows) se = fr_nrows;
+                                        if (f == RAY_SEL_ALL) {
+                                            for (int64_t r = ss; r < se; r++, j++)
+                                                if (bv[j]) ids[kept++] = r;
+                                        } else {
+                                            const uint16_t* sl = ix + off[seg];
+                                            uint32_t sn = off[seg + 1] - off[seg];
+                                            for (uint32_t i2 = 0; i2 < sn; i2++, j++)
+                                                if (bv[j]) ids[kept++] = ss + sl[i2];
+                                        }
+                                    }
+                                    ray_t* nsel_blk = ray_index_rowsel_from_ids(
+                                        fr_nrows, ids, kept);
+                                    scratch_free(ids_hdr);
+                                    if (nsel_blk) {
+                                        ray_release(g->selection);
+                                        g->selection = nsel_blk;
+                                        done_refine = true;
+                                    }
+                                }
+                            }
+                            if (pv && !RAY_IS_ERR(pv)) ray_release(pv);
+                            else if (pv) ray_error_free(pv);
+                            ray_release(sub);
+                            if (done_refine) return input;
+                        } else if (sub && sub != input) {
+                            ray_release(sub);
+                        } else if (sub == input) {
+                            ray_release(sub);   /* all-pass retain */
+                        }
+                    }
                 }
             }
 

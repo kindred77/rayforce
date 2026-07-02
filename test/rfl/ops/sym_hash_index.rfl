@@ -55,3 +55,13 @@
 (count (at (select {from: Ti where: (in k ['z 'q])}) 'v)) -- 0
 ;; duplicate set elements collapse (dedup) — same as {a,c}
 (sum (at (select {from: Ti where: (in k ['a 'a 'c 'c])}) 'v)) -- 130
+
+;; ── compound WHERE over an indexed key: eq conjunct + range refine ──────────
+;; The optimizer splits the AND selectivity-first; the second filter must
+;; refine the sparse eq selection over survivors only — same results as scan.
+(set CT  (table [s t v] (list ['a 'b 'a 'b 'a] [1 2 3 4 5] [10 20 30 40 50])))
+(set CTi (table [s t v] (list (.attr.set 'grouped ['a 'b 'a 'b 'a]) [1 2 3 4 5] [10 20 30 40 50])))
+(sum (at (select {from: CTi where: (and (== s 'a) (and (>= t 2) (<= t 4)))}) 'v)) -- 30
+(sum (at (select {from: CTi where: (and (== s 'a) (and (>= t 2) (<= t 4)))}) 'v)) -- (sum (at (select {from: CT where: (and (== s 'a) (and (>= t 2) (<= t 4)))}) 'v))
+(sum (at (select {from: CTi where: (and (== s 'a) (> t 5))}) 'v)) -- 0
+(sum (at (select {from: CTi where: (and (== s 'z) (>= t 0))}) 'v)) -- 0
