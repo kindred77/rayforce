@@ -3943,6 +3943,28 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
         }
     }
 
+    /* Stamp the verified `sorted` marker on the PRIMARY key output column:
+     * an ascending sort makes it non-descending by construction — exactly
+     * the guarantee (.attr.set 'sorted) verifies with an O(n) scan, so the
+     * marker still never lies.  Conservatively gated to null-free
+     * integer-family keys: float NaN takes radix total order (not plain
+     * `<=` order) and SYM sorts in id space, where the marker's comparison
+     * semantics are not what downstream consumers (asof presort/index
+     * paths) assume. */
+    if (!descending &&
+        !(key_cols[0]->attrs & RAY_ATTR_HAS_NULLS) &&
+        (k0_type == RAY_BOOL || k0_type == RAY_U8  || k0_type == RAY_I16 ||
+         k0_type == RAY_I32  || k0_type == RAY_I64 || k0_type == RAY_DATE ||
+         k0_type == RAY_TIME || k0_type == RAY_TIMESTAMP)) {
+        for (int64_t c = 0; c < ncols; c++) {
+            if (col_names[c] == key_ids[0] && new_cols[c] &&
+                !(new_cols[c]->attrs & RAY_ATTR_HAS_NULLS)) {
+                new_cols[c]->attrs |= RAY_ATTR_SORTED;
+                break;
+            }
+        }
+    }
+
     /* Assemble result table */
     ray_t* result = ray_table_new(ncols);
     if (!result || RAY_IS_ERR(result)) {
