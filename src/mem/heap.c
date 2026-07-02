@@ -339,6 +339,12 @@ RAY_INLINE void heap_insert_block(ray_heap_t* h, ray_t* blk, uint8_t order) {
     head->fl_next = blk;
     ray_atomic_store(&blk->rc, 0);  /* free marker */
     blk->order = order;
+    /* Free-block AGE (page-release aging, see GC pass 5).  `attrs` is dead
+     * state while a block is free — splits already leave garbage here and
+     * every allocation rewrites the header — so it carries the number of
+     * GC passes this block has survived on a freelist.  Reset on every
+     * insert (fresh free, coalesce, split). */
+    blk->attrs = 0;
     h->avail |= (1ULL << order);
 }
 
@@ -1847,6 +1853,18 @@ void ray_heap_gc(void) {
          * free block.  Tiny-query workloads — where the per-statement
          * GC fires before any large allocation has been freed —
          * complete pass 5 without entering the body. */
+        /* Aging: pages are released only after a block SURVIVES several
+         * GC passes on a freelist.  The GC runs per statement and per
+         * parallel_end, so the per-query temporaries of a repeated query
+         * used to be MADV_DONTNEEDed between every two executions and
+         * refaulted from scratch — kernel page-fault frames dominated
+         * repeated-query profiles while the freed block was reused
+         * within milliseconds.  A block re-allocated before reaching
+         * RAY_FREE_AGE_RELEASE keeps its pages; genuinely idle memory
+         * still returns to the OS after a few statements.  The released
+         * marker also stops re-madvising the same idle block on every
+         * subsequent pass (it was O(free blocks) syscalls per GC). */
+        #define RAY_FREE_AGE_RELEASE 3
         uint64_t large_orders_mask = ~((1ULL << 13) - 1);
         for (int hid = 0; hid < RAY_HEAP_REGISTRY_SIZE; hid++) {
             ray_heap_t* gh = ray_heap_registry[hid];
@@ -1858,10 +1876,15 @@ void ray_heap_gc(void) {
                 ray_fl_head_t* head = &gh->freelist[i];
                 ray_t* blk = head->fl_next;
                 while (blk != (ray_t*)head) {
-                    size_t bsize = BSIZEOF(i);
-                    int rpidx = heap_find_pool(gh, blk);
-                    bool hp = (rpidx >= 0) ? (gh->pools[rpidx].hugepage != 0) : false;
-                    ray_vm_release_block(blk, bsize, hp);
+                    if (blk->attrs < RAY_FREE_AGE_RELEASE) {
+                        blk->attrs++;
+                    } else if (blk->attrs == RAY_FREE_AGE_RELEASE) {
+                        size_t bsize = BSIZEOF(i);
+                        int rpidx = heap_find_pool(gh, blk);
+                        bool hp = (rpidx >= 0) ? (gh->pools[rpidx].hugepage != 0) : false;
+                        ray_vm_release_block(blk, bsize, hp);
+                        blk->attrs = RAY_FREE_AGE_RELEASE + 1;  /* released */
+                    }
                     blk = blk->fl_next;
                 }
             }
@@ -1871,16 +1894,21 @@ void ray_heap_gc(void) {
 }
 
 void ray_heap_release_pages(void) {
+    /* Explicit release: callers asking for pages back get them NOW —
+     * no aging — but still skip blocks already released. */
     ray_heap_t* h = ray_tl_heap;
     if (!h) return;
     for (int i = 13; i < RAY_HEAP_FL_SIZE; i++) {
         ray_fl_head_t* head = &h->freelist[i];
         ray_t* blk = head->fl_next;
         while (blk != (ray_t*)head) {
-            size_t bsize = BSIZEOF(i);
-            int rpidx = heap_find_pool(h, blk);
-            bool hp = (rpidx >= 0) ? (h->pools[rpidx].hugepage != 0) : false;
-            ray_vm_release_block(blk, bsize, hp);
+            if (blk->attrs <= RAY_FREE_AGE_RELEASE) {
+                size_t bsize = BSIZEOF(i);
+                int rpidx = heap_find_pool(h, blk);
+                bool hp = (rpidx >= 0) ? (h->pools[rpidx].hugepage != 0) : false;
+                ray_vm_release_block(blk, bsize, hp);
+                blk->attrs = RAY_FREE_AGE_RELEASE + 1;
+            }
             blk = blk->fl_next;
         }
     }
