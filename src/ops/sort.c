@@ -3790,6 +3790,64 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
     uint8_t descs[16];
     for (int64_t i = 0; i < n_keys; i++) descs[i] = descending;
 
+    /* Already-in-order detection: one bail-early pass comparing consecutive
+     * rows with EXACTLY the sort's ordering — integer family raw, SYM
+     * lexicographic through the column's domain (build_enum_rank's
+     * comparator: memcmp over the common prefix, then length).  A table
+     * that already sits in the requested order — e.g. an in-query
+     * (xasc t ['sym 'time]) re-asserting the store's layout — returns the
+     * input retained: the sort, the whole-table gather and the null/attr
+     * propagation all vanish.  Restricted to null-free integer-family and
+     * SYM keys: null placement and float NaN ordering belong to the real
+     * sort.  An unsorted input bails at its first violation, so the scan
+     * costs a few comparisons, not O(n). */
+    {
+        bool detectable = true;
+        for (int64_t k = 0; k < n_keys && detectable; k++) {
+            int8_t t = key_cols[k]->type;
+            if (key_cols[k]->attrs & RAY_ATTR_HAS_NULLS) detectable = false;
+            else if (t != RAY_BOOL && t != RAY_U8 && t != RAY_I16 &&
+                     t != RAY_I32 && t != RAY_I64 && t != RAY_DATE &&
+                     t != RAY_TIME && t != RAY_TIMESTAMP && t != RAY_SYM)
+                detectable = false;
+        }
+        if (detectable) {
+            bool ordered = true;
+            for (int64_t i = 1; i < nrows && ordered; i++) {
+                int cmp = 0;
+                for (int64_t k = 0; k < n_keys && cmp == 0; k++) {
+                    ray_t* c = key_cols[k];
+                    if (c->type == RAY_SYM) {
+                        int64_t ia = ray_read_sym(ray_data(c), i - 1,
+                                                  RAY_SYM, c->attrs);
+                        int64_t ib = ray_read_sym(ray_data(c), i,
+                                                  RAY_SYM, c->attrs);
+                        if (ia != ib) {
+                            struct ray_sym_domain_s* dom =
+                                ray_sym_vec_domain(c);
+                            ray_t* sa = ray_sym_domain_str(dom, ia);
+                            ray_t* sb = ray_sym_domain_str(dom, ib);
+                            uint32_t la = sa ? (uint32_t)ray_str_len(sa) : 0;
+                            uint32_t lb = sb ? (uint32_t)ray_str_len(sb) : 0;
+                            uint32_t ml = la < lb ? la : lb;
+                            if (ml > 0) cmp = memcmp(ray_str_ptr(sa),
+                                                     ray_str_ptr(sb), ml);
+                            if (cmp == 0) cmp = (la > lb) - (la < lb);
+                        }
+                    } else {
+                        int64_t va = read_col_i64(ray_data(c), i - 1,
+                                                  c->type, c->attrs);
+                        int64_t vb = read_col_i64(ray_data(c), i,
+                                                  c->type, c->attrs);
+                        cmp = (va > vb) - (va < vb);
+                    }
+                }
+                if (descending ? (cmp < 0) : (cmp > 0)) ordered = false;
+            }
+            if (ordered) { ray_retain(tbl); return tbl; }
+        }
+    }
+
     uint64_t* sorted_keys = NULL;
     ray_t* sorted_keys_hdr = NULL;
     ray_t* idx = sort_indices_ex(key_cols, descs, NULL, (uint8_t)n_keys, nrows,
