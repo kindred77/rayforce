@@ -35,6 +35,36 @@ Select specific columns with computed expressions:
 ; MSFT   378000
 ```
 
+### Whole-column projections
+
+A projection may be a whole-column verb — `distinct`, `asc`, `desc`, or
+`reverse` — applied to a column. Unlike a per-row computed expression, these
+consume the entire column and return a vector, so the result's row count can
+differ from the source table (`distinct` in particular collapses duplicates):
+
+```lisp
+(select {price: (distinct price) from: t})
+; price
+; -----
+;   150
+;   280
+;   420
+
+(select {price: (asc price) from: t})   ; ascending column
+```
+
+A `where:` clause is applied first, so the verb only sees the surviving rows:
+
+```lisp
+(select {price: (distinct price) from: t where: (> volume 400)})
+```
+
+Because a whole-column verb changes the row count, it cannot be mixed with a
+full-length column in the same query — pairing `(distinct price)` with a plain
+`sym` column raises a `length` error. Project the single reshaped column on its
+own, then compose further clauses (`asc:`, `take:`) or an outer `xasc`/`xdesc`
+around it.
+
 ### Filtering with `where:`
 
 The `where:` clause accepts any predicate expression. Predicates are pushed down through the DAG for early elimination of rows:

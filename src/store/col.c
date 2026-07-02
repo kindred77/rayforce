@@ -131,6 +131,13 @@ static size_t col_str_pool_payload_len(const ray_t* vec);
 #define COL_DISK_ATTRS_MASK \
     ((uint8_t)(RAY_SYM_W_MASK | RAY_ATTR_SORTED | RAY_ATTR_HAS_NULLS))
 
+/* "Index present" marker written to the on-disk header's reserved aux[0..3]
+ * (see col.h: aux is reserved for index persistence).  Existing files leave
+ * aux=0, so the marker is absent → those files load through the exact current
+ * path.  Only a file carrying this marker has an inline index region appended
+ * at its 32-aligned tail. */
+#define COL_IDX_AUX_MAGIC ((uint32_t)0x58444958)  /* "XIDX" */
+
 /* Explicit allowlist of types that are safe to serialize as raw bytes.
  * Fixed-size scalar types plus RAY_STR.  RAY_STR has a pointer-bearing pool
  * in memory, but the column format stores the fixed 16-byte descriptors and
@@ -590,6 +597,56 @@ static void try_load_link_sidecar(ray_t* vec, const char* path) {
  * ray_col_save -- write a vector to a column file
  * -------------------------------------------------------------------------- */
 
+/* Append an inline index region to an EXISTING column file (no data rewrite):
+ * pad the payload to 32, write the region, then stamp the aux[0..3] marker.
+ * Used by the streaming .csv.splayed builder, which writes raw columns first.
+ * `col_len`/`col_type` describe the on-disk column (payload = 32 + len*esz). */
+ray_err_t ray_col_append_index(const char* path, const void* ix_v,
+                               int64_t col_len, int8_t col_type) {
+    const ray_index_t* ix = (const ray_index_t*)ix_v;
+    if (!path || !ix) return RAY_ERR_DOMAIN;
+    (void)col_len; (void)col_type;
+
+    FILE* f = fopen(path, "r+b");
+    if (!f) return RAY_ERR_IO;
+    /* Already-indexed guard: the marker is stamped into aux[0..3] LAST, so its
+     * presence means a complete prior append. */
+    uint32_t cur_mg = 0;
+    if (fread(&cur_mg, 1, 4, f) == 4 && cur_mg == COL_IDX_AUX_MAGIC) {
+        fclose(f); return RAY_ERR_CORRUPT;
+    }
+    /* Append at the actual payload end — generic across formats: numeric is
+     * [header][data]; STR is [header][descriptors][pool].  Don't recompute it
+     * from col_len*esz (that ignores the str_pool). */
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return RAY_ERR_IO; }
+    long fsz = ftell(f);
+    if (fsz < 32) { fclose(f); return RAY_ERR_CORRUPT; }
+    int64_t payload_end = fsz;
+
+    int64_t region_off = (payload_end + 31) & ~(int64_t)31;
+    int64_t pad = region_off - payload_end;
+    static const uint8_t zeros[32] = {0};
+    if (pad > 0 && fwrite(zeros, 1, (size_t)pad, f) != (size_t)pad) { fclose(f); return RAY_ERR_IO; }
+
+    int64_t rsize = ray_index_inline_size(ix);
+    uint8_t* rbuf = (uint8_t*)ray_calloc_raw((size_t)(1) * ((size_t)rsize));
+    if (!rbuf) { fclose(f); return RAY_ERR_OOM; }
+    ray_index_inline_write(rbuf, ix);
+    size_t rw = fwrite(rbuf, 1, (size_t)rsize, f);
+    ray_free_raw(rbuf);
+    if (rw != (size_t)rsize) { fclose(f); return RAY_ERR_IO; }
+
+    /* Stamp the marker into aux[0..3] (file offset 0). */
+    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return RAY_ERR_IO; }
+    uint32_t mg = COL_IDX_AUX_MAGIC;
+    if (fwrite(&mg, 1, 4, f) != 4) { fclose(f); return RAY_ERR_IO; }
+    /* The index is a derived accelerator (rebuildable); flush is enough — no
+     * fsync needed, and the marker is written LAST so a torn append never
+     * leaves a half-region that looks indexed. */
+    if (fclose(f) != 0) return RAY_ERR_IO;
+    return RAY_OK;
+}
+
 static ray_err_t col_save_impl(ray_t* vec, const char* path, bool durable) {
     if (!vec || RAY_IS_ERR(vec)) return RAY_ERR_TYPE;
     if (!path) return RAY_ERR_IO;
@@ -652,13 +709,13 @@ static ray_err_t col_save_impl(ray_t* vec, const char* path, bool durable) {
         uint8_t wesz = (uint8_t)(1u << w);
         if (vec->len > 0 && (uint64_t)vec->len > SIZE_MAX / wesz)
             return RAY_ERR_IO;
-        sym_xlate = malloc(vec->len > 0 ? (size_t)vec->len * wesz : 1);
+        sym_xlate = ray_alloc_raw(vec->len > 0 ? (size_t)vec->len * wesz : 1);
         if (!sym_xlate) return RAY_ERR_OOM;
         const void* src = ray_data(vec); /* slice-safe */
         for (int64_t i = 0; i < vec->len; i++) {
             int64_t pos = ray_read_sym(src, i, RAY_SYM, vec->attrs);
             if (pos < 0 || pos >= dcount) {
-                free(sym_xlate);
+                ray_free_raw(sym_xlate);
                 return RAY_ERR_CORRUPT;
             }
             ray_write_sym(sym_xlate, i, (uint64_t)lut[pos], RAY_SYM, w);
@@ -669,7 +726,7 @@ static ray_err_t col_save_impl(ray_t* vec, const char* path, bool durable) {
 
     {
         FILE* f = fopen(tmp_path, "wb");
-        if (!f) { free(sym_xlate); return RAY_ERR_IO; }
+        if (!f) { ray_free_raw(sym_xlate); return RAY_ERR_IO; }
 
         /* Write a clean header (mmod=0, rc=0) */
         ray_t header;
@@ -685,14 +742,16 @@ static ray_err_t col_save_impl(ray_t* vec, const char* path, bool durable) {
         header.rc = (vec->type == RAY_SYM) ? ray_sym_count() : 0;
 
         /* HAS_INDEX rebase: an attached accelerator index displaces the
-         * 16-byte aux union with an index pointer.  Persist the
-         * pre-attach state — strip HAS_INDEX and copy the saved bytes
-         * back into the on-disk header.  Sentinels in the payload
-         * carry the null state, so there is no bitmap to append. */
+         * 16-byte aux union with an index pointer.  Strip HAS_INDEX from the
+         * on-disk attrs and restore the pre-attach aux bytes; the persisted
+         * index (if any) is signaled by the aux marker stamped after all aux
+         * manipulation below, and its data is appended at the 32-aligned tail. */
+        bool persist_index = false;
         if (vec->attrs & RAY_ATTR_HAS_INDEX) {
             ray_index_t* ix = ray_index_payload(vec->index);
             header.attrs &= ~RAY_ATTR_HAS_INDEX;
             memcpy(header.aux, ix->saved_aux, 16);
+            persist_index = (vec->index != NULL);
         }
 
         /* HAS_LINK rebase: target sym ID lives at header.aux[8..15],
@@ -723,19 +782,27 @@ static ray_err_t col_save_impl(ray_t* vec, const char* path, bool durable) {
             header.attrs = (uint8_t)((header.attrs &
                 ~(uint8_t)(RAY_SYM_W_MASK | RAY_ATTR_SORTED)) | sym_xlate_attrs);
 
+        /* Stamp the "index present" marker into the reserved aux (after all
+         * other aux manipulation, which zeroes it for the common cases). */
+        if (persist_index) {
+            memset(header.aux, 0, 16);
+            uint32_t mg = COL_IDX_AUX_MAGIC;
+            memcpy(header.aux, &mg, 4);
+        }
+
         size_t written = fwrite(&header, 1, 32, f);
-        if (written != 32) { fclose(f); remove(tmp_path); free(sym_xlate); return RAY_ERR_IO; }
+        if (written != 32) { fclose(f); remove(tmp_path); ray_free_raw(sym_xlate); return RAY_ERR_IO; }
 
         /* Write data */
-        if (vec->len < 0) { fclose(f); remove(tmp_path); free(sym_xlate); return RAY_ERR_CORRUPT; }
+        if (vec->len < 0) { fclose(f); remove(tmp_path); ray_free_raw(sym_xlate); return RAY_ERR_CORRUPT; }
         uint8_t esz = ray_sym_elem_size(vec->type,
                                         sym_xlate ? sym_xlate_attrs : vec->attrs);
-        if (esz == 0 && vec->len > 0) { fclose(f); remove(tmp_path); free(sym_xlate); return RAY_ERR_TYPE; }
+        if (esz == 0 && vec->len > 0) { fclose(f); remove(tmp_path); ray_free_raw(sym_xlate); return RAY_ERR_TYPE; }
         /* Overflow check: ensure len*esz fits in size_t with 32-byte header room */
         if ((uint64_t)vec->len > (SIZE_MAX - 32) / (esz ? esz : 1)) {
             fclose(f);
             remove(tmp_path);
-            free(sym_xlate);
+            ray_free_raw(sym_xlate);
             return RAY_ERR_IO;
         }
         size_t data_size = (size_t)vec->len * esz;
@@ -759,9 +826,9 @@ static ray_err_t col_save_impl(ray_t* vec, const char* path, bool durable) {
 
         if (data_size > 0) {
             written = fwrite(data, 1, data_size, f);
-            if (written != data_size) { fclose(f); remove(tmp_path); free(sym_xlate); return RAY_ERR_IO; }
+            if (written != data_size) { fclose(f); remove(tmp_path); ray_free_raw(sym_xlate); return RAY_ERR_IO; }
         }
-        free(sym_xlate);
+        ray_free_raw(sym_xlate);
         sym_xlate = NULL;
 
         if (vec->type == RAY_STR) {
@@ -788,6 +855,31 @@ static ray_err_t col_save_impl(ray_t* vec, const char* path, bool durable) {
                 written = fwrite(ray_data(vec->str_pool), 1, pool_size, f);
                 if (written != pool_size) { fclose(f); remove(tmp_path); return RAY_ERR_IO; }
             }
+        }
+
+        /* Inline index region (numeric and SYM columns; STR routes through dict
+         * instead).  SYM carries RAY_IDX_HASH when the grouped attr is set;
+         * the existing `persist_index && vec->type != RAY_STR` guard already
+         * admits it.  Pad the payload to a 32-byte boundary, then append the
+         * raw 32-aligned ray_t blocks (RAY_INDEX object + child vecs) the
+         * loader mmaps in place.  Payload end here is 32 + data_size (no
+         * str_pool on an indexed numeric/SYM column). */
+        if (persist_index && vec->type != RAY_STR) {
+            int64_t payload_end = 32 + (int64_t)data_size;
+            int64_t region_off  = (payload_end + 31) & ~(int64_t)31;
+            int64_t pad         = region_off - payload_end;
+            static const uint8_t zeros[32] = {0};
+            if (pad > 0 && fwrite(zeros, 1, (size_t)pad, f) != (size_t)pad) {
+                fclose(f); remove(tmp_path); return RAY_ERR_IO;
+            }
+            ray_index_t* ix = ray_index_payload(vec->index);
+            int64_t rsize = ray_index_inline_size(ix);
+            uint8_t* rbuf = (uint8_t*)ray_calloc_raw((size_t)(1) * ((size_t)rsize));
+            if (!rbuf) { fclose(f); remove(tmp_path); return RAY_ERR_OOM; }
+            ray_index_inline_write(rbuf, ix);
+            size_t rw = fwrite(rbuf, 1, (size_t)rsize, f);
+            ray_free_raw(rbuf);
+            if (rw != (size_t)rsize) { fclose(f); remove(tmp_path); return RAY_ERR_IO; }
         }
 
         fclose(f);
@@ -994,8 +1086,10 @@ typedef struct {
     bool    has_str_pool;
     size_t  str_pool_offset;
     size_t  str_pool_size;
-    size_t  tail_offset;       /* end of payload — file size must match */
+    size_t  tail_offset;       /* end of payload — file size must match (unless has_index) */
     uint32_t saved_sym_count;
+    bool    has_index;         /* aux marker present → inline index region at tail */
+    size_t  index_offset;      /* 32-aligned start of the index region (has_index) */
 } col_mapped_t;
 
 static size_t col_str_pool_payload_len(const ray_t* vec) {
@@ -1154,6 +1248,28 @@ static ray_t* col_validate_mapped(const char* path, col_mapped_t* out) {
         uint32_t saved_sc;
         memcpy(&saved_sc, (const char*)ptr + offsetof(ray_t, rc), sizeof(saved_sc));
         out->saved_sym_count = saved_sc;
+    }
+
+    /* Inline index region: the reserved aux[0..3] marker (read from the header's
+     * first 4 bytes) distinguishes a file with an appended index from a plain,
+     * current-format column.  Absent (the default, all existing data) → strict
+     * payload-only layout; present → a 32-aligned index region follows. */
+    out->has_index = false;
+    out->index_offset = 0;
+    {
+        /* The marker lives in the header's aux[0..3] (first 4 file bytes) for
+         * every column type — numeric and STR alike.  tail_offset already
+         * accounts for the str_pool on STR, so region_off lands after it. */
+        uint32_t idxmg;
+        memcpy(&idxmg, ptr, 4);
+        if (idxmg == COL_IDX_AUX_MAGIC) {
+            size_t region_off = (out->tail_offset + 31) & ~(size_t)31;
+            /* Need at least one RAY_INDEX block (32 hdr + sizeof payload). */
+            if (region_off + 32 + sizeof(ray_index_t) <= mapped_size) {
+                out->has_index = true;
+                out->index_offset = region_off;
+            }
+        }
     }
 
     out->mapped          = ptr;
@@ -1322,9 +1438,11 @@ static ray_t* col_mmap_impl(const char* path, struct ray_sym_domain_s* dom,
     ray_t* err = col_validate_mapped(path, &cm);
     if (err) return err;
 
-    /* Validate that file size matches expected layout exactly.
-     * ray_free() reconstructs the munmap size using the same formula. */
-    if (cm.tail_offset != cm.mapped_size) {
+    /* Validate that the file size matches the expected layout.  Without an
+     * inline index the payload is the whole file (ray_free reconstructs the
+     * munmap size from the same formula).  With an index, the file extends past
+     * the payload by the 32-aligned index region — that's expected, not a tear. */
+    if (!cm.has_index && cm.tail_offset != cm.mapped_size) {
         ray_vm_unmap_file(cm.mapped, cm.mapped_size);
         return ray_error("io", NULL);
     }
@@ -1423,6 +1541,21 @@ static ray_t* col_mmap_impl(const char* path, struct ray_sym_domain_s* dom,
      * round-tripped through splay-mmap (splay.c:184) lose HAS_LINK
      * even though ray_col_load restores it. */
     try_load_link_sidecar(vec, path);
+
+    /* Attach the inline index region: mapped in place (zero-copy), patched to
+     * absolute child pointers, and flagged RAY_MARK_MMAP so it rides the
+     * column's single mapping.  ray_free reads the full mapping size from the
+     * reserved _idx_pad slot to munmap the whole region (payload + index). */
+    if (cm.has_index) {
+        ray_t* idx = ray_index_inline_map((uint8_t*)cm.mapped + cm.index_offset);
+        if (idx) {   /* NULL = stale index layout generation: load unindexed */
+            ray_t* r = ray_index_attach_built(&vec, idx);
+            if (r && !RAY_IS_ERR(r)) vec = r;
+        }
+        /* The munmap size is derived from the column + index at free time
+         * (ray_free), so no aux slot is needed — leaving str_pool intact on STR. */
+        /* Attach failure → column loads unindexed; correctness unaffected. */
+    }
 
     return vec;
 }

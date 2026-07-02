@@ -1,0 +1,67 @@
+;; SYM hash index — indexed (== sym X) must equal the scan; index must not
+;; corrupt the domain through attach/COW/slice/drop.  SYM literals are 'x.
+
+(set s ['a 'b 'a 'c 'a 'b])          ;; 6 syms, domain {a,b,c}; a×3 b×2 c×1
+
+;; ── attach builds a hash index; domain still resolves ───────────────────────
+(set si (.attr.set 'grouped s))
+(.idx.has? si) -- true
+(at si 0) -- 'a                       ;; cell resolves to its symbol (domain intact)
+(at si 5) -- 'b
+
+;; ── indexed equality == scan equality, for present / once / absent ──────────
+(where (== si 'a)) -- [0 2 4]         ;; frequent symbol
+(where (== si 'c)) -- [3]             ;; once
+(where (== si 'a)) -- (where (== s 'a))   ;; indexed == scan (cross-check)
+(count (where (== si 'z))) -- 0       ;; ABSENT symbol → empty
+
+;; ── table shape: force exec.c OP_FILTER path (outer sum materialises result) ──
+;; count(select) is intercepted before the exec.c index site; use sum+at+select.
+(set T  (table [k v] (list s [10 20 30 40 50 60])))
+(set Ti (table [k v] (list (.attr.set 'grouped s) [10 20 30 40 50 60])))
+;; rows where k=='a: indices 0,2,4 → v=10+30+50=90
+(sum (at (select {from: Ti where: (== k 'a)}) 'v)) -- 90
+;; indexed result equals scan result
+(sum (at (select {from: Ti where: (== k 'a)}) 'v)) -- (sum (at (select {from: T where: (== k 'a)}) 'v))
+;; absent symbol → O(1) empty rowsel → 0 rows
+(count (at (select {from: Ti where: (== k 'z)}) 'v)) -- 0
+
+;; ── aux-lifecycle: index at bytes 0-7 must not clobber domain at 8-15 ────────
+
+;; concat: domain must survive; scan on the extended vector stays correct
+(set c1 (concat si ['a]))             ;; 7-element ['a 'b 'a 'c 'a 'b 'a]
+(at c1 6) -- 'a
+(where (== c1 'b)) -- [1 5]
+
+;; slice via take: domain follows slice_parent; scan over slice is correct
+(at (take si 3) 2) -- 'a             ;; first 3 = ['a 'b 'a]; element 2 is 'a
+(where (== (take si 3) 'a)) -- [0 2]
+
+;; drop round-trip: saved_aux restores domain; scan path still correct
+(set sd (.attr.drop si))
+(.idx.has? sd) -- false
+(at sd 0) -- 'a
+(where (== sd 'a)) -- [0 2 4]
+
+;; ── indexed `in` (hash-index IN probe): equality with the scan path ─────────
+;; The set literal may live in a different domain than the column; each
+;; element is resolved through the COLUMN's domain (absent → matches nothing).
+;; k in {a,c}: rows 0,2,3,4 → v=10+30+40+50=130
+(sum (at (select {from: Ti where: (in k ['a 'c])}) 'v)) -- 130
+(sum (at (select {from: Ti where: (in k ['a 'c])}) 'v)) -- (sum (at (select {from: T where: (in k ['a 'c])}) 'v))
+;; absent element mixed in: only c matches → row 3 → 40
+(sum (at (select {from: Ti where: (in k ['z 'c])}) 'v)) -- 40
+;; all absent → empty
+(count (at (select {from: Ti where: (in k ['z 'q])}) 'v)) -- 0
+;; duplicate set elements collapse (dedup) — same as {a,c}
+(sum (at (select {from: Ti where: (in k ['a 'a 'c 'c])}) 'v)) -- 130
+
+;; ── compound WHERE over an indexed key: eq conjunct + range refine ──────────
+;; The optimizer splits the AND selectivity-first; the second filter must
+;; refine the sparse eq selection over survivors only — same results as scan.
+(set CT  (table [s t v] (list ['a 'b 'a 'b 'a] [1 2 3 4 5] [10 20 30 40 50])))
+(set CTi (table [s t v] (list (.attr.set 'grouped ['a 'b 'a 'b 'a]) [1 2 3 4 5] [10 20 30 40 50])))
+(sum (at (select {from: CTi where: (and (== s 'a) (and (>= t 2) (<= t 4)))}) 'v)) -- 30
+(sum (at (select {from: CTi where: (and (== s 'a) (and (>= t 2) (<= t 4)))}) 'v)) -- (sum (at (select {from: CT where: (and (== s 'a) (and (>= t 2) (<= t 4)))}) 'v))
+(sum (at (select {from: CTi where: (and (== s 'a) (> t 5))}) 'v)) -- 0
+(sum (at (select {from: CTi where: (and (== s 'z) (>= t 0))}) 'v)) -- 0

@@ -91,11 +91,11 @@
 (== syms null) -- false
 (!= syms null) -- true
 
-;; sym vec vs null SYM atom (0Ns): atom_null=true, vec_has_nulls=false path (eval.c 807-811)
-;; 0Ns is a null SYM atom (RAY_SYM type with i64==0 → RAY_ATOM_IS_NULL=true)
-;; → fills result with false (==) or true (!=) without scanning vec
-(sum (== syms 0Ns)) -- 0
-(sum (!= syms 0Ns)) -- 5
+;; sym vec vs the empty-symbol atom ('): ' is a VALUE (sym id 0), not a null.
+;; None of {a,b,c} equals the empty symbol → == all-false, != all-true.
+;; The per-width compare loop runs (no null short-circuit; SYM has no null).
+(sum (== syms ')) -- 0
+(sum (!= syms ')) -- 5
 
 ;; ═══════════════════════════════════════════════════════════════════
 ;; 5. to_boxed_list / unbox_vec_arg
@@ -139,8 +139,8 @@
 (sum (== (at _tsym 'sym) 'foo)) -- 2
 (sum (!= (at _tsym 'sym) 'foo)) -- 3
 ;; W8 SYM vec vs null SYM atom: atom_null=true, vec_has_nulls=false → lines 807-811
-(sum (== (at _tsym 'sym) 0Ns)) -- 0
-(sum (!= (at _tsym 'sym) 0Ns)) -- 5
+(sum (== (at _tsym 'sym) ')) -- 0
+(sum (!= (at _tsym 'sym) ')) -- 5
 ;; Sort W8 SYM column → gather_by_idx W8 path (eval.c lines 1146, case 1)
 (count (asc (at _tsym 'sym))) -- 5
 (at (asc (at _tsym 'sym)) 0) -- 'bar

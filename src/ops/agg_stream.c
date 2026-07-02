@@ -10,6 +10,23 @@
 #include <stdlib.h>         /* realloc/free for the buffered median accumulator */
 #include <string.h>         /* memcpy for the top_n/bot_n native buffer */
 
+/* No-null fast path.  has_nulls is loop-invariant, but the compiler does NOT
+ * reliably hoist ray_valid_at out of the per-row update — it shows up as ~12% of
+ * a sum group-by in profiling.  Branch on it ONCE: the common non-null column
+ * runs a tight, check-free, vectorizable loop; nullable columns keep the
+ * per-row sentinel check.  BODY is the per-row accumulate, using i/gids[i]. */
+#define AGG_UPDATE_LOOP(valid, n, BODY)                            \
+    do {                                                           \
+        if (!(valid)->has_nulls) {                                 \
+            for (int64_t i = 0; i < (n); i++) { BODY; }            \
+        } else {                                                   \
+            for (int64_t i = 0; i < (n); i++) {                    \
+                if (!ray_valid_at((valid), i)) continue;           \
+                BODY;                                              \
+            }                                                      \
+        }                                                          \
+    } while (0)
+
 /* ---- sum, I64 -------------------------------------------------------- */
 typedef struct { int64_t sum; } sum_i64_state;
 
@@ -20,11 +37,10 @@ static void sum_i64_update(void* base, size_t stride, const uint32_t* gids,
                            int64_t n, acc_arena_t* arena) {
     (void)arena;
     const int64_t* d = (const int64_t*)vals;
-    for (int64_t i = 0; i < n; i++) {
-        if (!ray_valid_at(valid, i)) continue;
+    AGG_UPDATE_LOOP(valid, n, {
         sum_i64_state* st = (sum_i64_state*)((char*)base + (size_t)gids[i]*stride);
         st->sum = (int64_t)((uint64_t)st->sum + (uint64_t)d[i]); /* unsigned wrap: group.c:185 */
-    }
+    });
 }
 
 static void sum_i64_merge(void* dst, const void* src, acc_arena_t* a) {
@@ -50,10 +66,8 @@ static void count_update(void* base, size_t stride, const uint32_t* gids,
                          const void* vals, const ray_valid_t* valid,
                          int64_t n, acc_arena_t* a) {
     (void)vals; (void)a;
-    for (int64_t i = 0; i < n; i++) {
-        if (!ray_valid_at(valid, i)) continue;
-        ((count_state*)((char*)base + (size_t)gids[i]*stride))->n++;
-    }
+    AGG_UPDATE_LOOP(valid, n,
+        ((count_state*)((char*)base + (size_t)gids[i]*stride))->n++);
 }
 static void count_merge(void* d, const void* s, acc_arena_t* a) {
     (void)a; ((count_state*)d)->n += ((const count_state*)s)->n;
@@ -75,23 +89,21 @@ static void min_i64_update(void* base, size_t stride, const uint32_t* gids,
                            const void* vals, const ray_valid_t* valid,
                            int64_t n, acc_arena_t* a) {
     (void)a; const int64_t* d = (const int64_t*)vals;
-    for (int64_t i = 0; i < n; i++) {
-        if (!ray_valid_at(valid, i)) continue;
+    AGG_UPDATE_LOOP(valid, n, {
         ext_i64_state* st = (ext_i64_state*)((char*)base + (size_t)gids[i]*stride);
         if (d[i] < st->v) st->v = d[i];
         st->cnt++;
-    }
+    });
 }
 static void max_i64_update(void* base, size_t stride, const uint32_t* gids,
                            const void* vals, const ray_valid_t* valid,
                            int64_t n, acc_arena_t* a) {
     (void)a; const int64_t* d = (const int64_t*)vals;
-    for (int64_t i = 0; i < n; i++) {
-        if (!ray_valid_at(valid, i)) continue;
+    AGG_UPDATE_LOOP(valid, n, {
         ext_i64_state* st = (ext_i64_state*)((char*)base + (size_t)gids[i]*stride);
         if (d[i] > st->v) st->v = d[i];
         st->cnt++;
-    }
+    });
 }
 static void min_i64_merge(void* d, const void* s, acc_arena_t* a) {
     (void)a; const ext_i64_state* src = s; ext_i64_state* dst = d;
@@ -125,10 +137,8 @@ static void sum_f64_update(void* base, size_t stride, const uint32_t* gids,
                            const void* vals, const ray_valid_t* valid,
                            int64_t n, acc_arena_t* a) {
     (void)a; const double* d = (const double*)vals;
-    for (int64_t i = 0; i < n; i++) {
-        if (!ray_valid_at(valid, i)) continue;
-        ((sum_f64_state*)((char*)base + (size_t)gids[i]*stride))->sum += d[i];
-    }
+    AGG_UPDATE_LOOP(valid, n,
+        ((sum_f64_state*)((char*)base + (size_t)gids[i]*stride))->sum += d[i]);
 }
 static void sum_f64_merge(void* d, const void* s, acc_arena_t* a) {
     (void)a; ((sum_f64_state*)d)->sum += ((const sum_f64_state*)s)->sum;
@@ -150,23 +160,21 @@ static void min_f64_update(void* base, size_t stride, const uint32_t* gids,
                            const void* vals, const ray_valid_t* valid,
                            int64_t n, acc_arena_t* a) {
     (void)a; const double* d = (const double*)vals;
-    for (int64_t i = 0; i < n; i++) {
-        if (!ray_valid_at(valid, i)) continue;
+    AGG_UPDATE_LOOP(valid, n, {
         ext_f64_state* st = (ext_f64_state*)((char*)base + (size_t)gids[i]*stride);
         if (d[i] < st->v) st->v = d[i];
         st->cnt++;
-    }
+    });
 }
 static void max_f64_update(void* base, size_t stride, const uint32_t* gids,
                            const void* vals, const ray_valid_t* valid,
                            int64_t n, acc_arena_t* a) {
     (void)a; const double* d = (const double*)vals;
-    for (int64_t i = 0; i < n; i++) {
-        if (!ray_valid_at(valid, i)) continue;
+    AGG_UPDATE_LOOP(valid, n, {
         ext_f64_state* st = (ext_f64_state*)((char*)base + (size_t)gids[i]*stride);
         if (d[i] > st->v) st->v = d[i];
         st->cnt++;
-    }
+    });
 }
 static void min_f64_merge(void* d, const void* s, acc_arena_t* a) {
     (void)a; const ext_f64_state* src = s; ext_f64_state* dst = d;
@@ -202,11 +210,10 @@ static void avg_f64_update(void* base, size_t stride, const uint32_t* gids,
                            const void* vals, const ray_valid_t* valid,
                            int64_t n, acc_arena_t* a) {
     (void)a; const double* d = (const double*)vals;
-    for (int64_t i = 0; i < n; i++) {
-        if (!ray_valid_at(valid, i)) continue;
+    AGG_UPDATE_LOOP(valid, n, {
         avg_f64_state* st = (avg_f64_state*)((char*)base + (size_t)gids[i]*stride);
         st->sum += d[i]; st->cnt++;
-    }
+    });
 }
 static void avg_f64_merge(void* d, const void* s, acc_arena_t* a) {
     (void)a; ((avg_f64_state*)d)->sum += ((const avg_f64_state*)s)->sum;
@@ -229,13 +236,12 @@ static void var_i64_update(void* base, size_t stride, const uint32_t* gids,
                            const void* vals, const ray_valid_t* valid,
                            int64_t n, acc_arena_t* a) {
     (void)a; const int64_t* d = (const int64_t*)vals;
-    for (int64_t i = 0; i < n; i++) {
-        if (!ray_valid_at(valid, i)) continue;
+    AGG_UPDATE_LOOP(valid, n, {
         var_i64_state* st = (var_i64_state*)((char*)base + (size_t)gids[i]*stride);
         int64_t v = d[i]; st->sum += (double)v;
         st->sumsq = (int64_t)((uint64_t)st->sumsq + (uint64_t)v*(uint64_t)v); /* wrap: group.c:185 */
         st->cnt++;
-    }
+    });
 }
 static void var_i64_merge(void* dd, const void* ss, acc_arena_t* a) {
     (void)a; var_i64_state* d = dd; const var_i64_state* s = ss;
@@ -294,11 +300,10 @@ static void var_f64_update(void* base, size_t stride, const uint32_t* gids,
                            const void* vals, const ray_valid_t* valid,
                            int64_t n, acc_arena_t* a) {
     (void)a; const double* d = (const double*)vals;
-    for (int64_t i = 0; i < n; i++) {
-        if (!ray_valid_at(valid, i)) continue;
+    AGG_UPDATE_LOOP(valid, n, {
         var_f64_state* st = (var_f64_state*)((char*)base + (size_t)gids[i]*stride);
         double v = d[i]; st->sum += v; st->sumsq += v*v; st->cnt++;
-    }
+    });
 }
 static void var_f64_merge(void* dd, const void* ss, acc_arena_t* a) {
     (void)a; var_f64_state* d = dd; const var_f64_state* s = ss;
@@ -407,7 +412,7 @@ typedef struct { double* buf; int64_t len; int64_t cap; } median_state;
 static void median_init(void* s){ median_state* st=s; st->buf=NULL; st->len=0; st->cap=0; }
 static inline void median_push(median_state* st, double v){
     if (st->len == st->cap){ int64_t nc = st->cap ? st->cap*2 : 8;
-        double* nb = realloc(st->buf, (size_t)nc*sizeof(double)); st->buf=nb; st->cap=nc; }
+        double* nb = ray_realloc_raw(st->buf, (size_t)nc*sizeof(double)); st->buf=nb; st->cap=nc; }
     st->buf[st->len++] = v;
 }
 static void median_update_i64(void* base, size_t stride, const uint32_t* gids,
@@ -428,7 +433,7 @@ static void median_merge(void* dd, const void* ss, acc_arena_t* a){ (void)a;
 static ray_t* median_final(const void* s, acc_arena_t* a, int64_t param){ (void)a; (void)param; median_state* st=(median_state*)s;
     if (st->len==0) return ray_typed_null(-RAY_F64);
     return ray_f64(ray_median_dbl_inplace(st->buf, st->len)); }
-static void median_destroy(void* s){ median_state* st=s; free(st->buf); st->buf=NULL; st->len=st->cap=0; }
+static void median_destroy(void* s){ median_state* st=s; ray_free_raw(st->buf); st->buf=NULL; st->len=st->cap=0; }
 static const agg_vtable_t MEDIAN_I64 = { .state_size=sizeof(median_state), .kind=ACC_BUFFERED, .out_type=RAY_F64,
     .init=median_init, .update_batch=median_update_i64, .merge=median_merge, .finalize=median_final, .destroy=median_destroy };
 static const agg_vtable_t MEDIAN_F64 = { .state_size=sizeof(median_state), .kind=ACC_BUFFERED, .out_type=RAY_F64,
@@ -443,7 +448,7 @@ typedef struct { int64_t* buf; int64_t len; int64_t cap; } topk_i64_state;
 static void topk_i64_init(void* s){ topk_i64_state* st=s; st->buf=NULL; st->len=0; st->cap=0; }
 static inline void topk_i64_push(topk_i64_state* st, int64_t v){
     if (st->len==st->cap){ int64_t nc=st->cap?st->cap*2:8;
-        int64_t* nb=realloc(st->buf,(size_t)nc*sizeof(int64_t)); st->buf=nb; st->cap=nc; }
+        int64_t* nb=ray_realloc_raw(st->buf,(size_t)nc*sizeof(int64_t)); st->buf=nb; st->cap=nc; }
     st->buf[st->len++]=v; }
 static void topk_i64_update(void* base,size_t stride,const uint32_t* gids,const void* vals,
                             const ray_valid_t* valid,int64_t n,acc_arena_t* a){ (void)a;
@@ -453,7 +458,7 @@ static void topk_i64_update(void* base,size_t stride,const uint32_t* gids,const 
 static void topk_i64_merge(void* dd,const void* ss,acc_arena_t* a){ (void)a;
     topk_i64_state* d=dd; const topk_i64_state* s=ss;
     for(int64_t i=0;i<s->len;i++) topk_i64_push(d,s->buf[i]); }
-static void topk_i64_destroy(void* s){ topk_i64_state* st=s; free(st->buf); st->buf=NULL; st->len=st->cap=0; }
+static void topk_i64_destroy(void* s){ topk_i64_state* st=s; ray_free_raw(st->buf); st->buf=NULL; st->len=st->cap=0; }
 static ray_t* topk_i64_make(const topk_i64_state* st, int64_t k, uint8_t desc){
     if (st->len==0) return ray_vec_new(RAY_I64, 0);  /* empty group → 0-len vec */
     ray_t* v=ray_vec_new(RAY_I64, st->len); v->len=st->len;
@@ -474,7 +479,7 @@ typedef struct { double* buf; int64_t len; int64_t cap; } topk_f64_state;
 static void topk_f64_init(void* s){ topk_f64_state* st=s; st->buf=NULL; st->len=0; st->cap=0; }
 static inline void topk_f64_push(topk_f64_state* st, double v){
     if (st->len==st->cap){ int64_t nc=st->cap?st->cap*2:8;
-        double* nb=realloc(st->buf,(size_t)nc*sizeof(double)); st->buf=nb; st->cap=nc; }
+        double* nb=ray_realloc_raw(st->buf,(size_t)nc*sizeof(double)); st->buf=nb; st->cap=nc; }
     st->buf[st->len++]=v; }
 static void topk_f64_update(void* base,size_t stride,const uint32_t* gids,const void* vals,
                             const ray_valid_t* valid,int64_t n,acc_arena_t* a){ (void)a;
@@ -484,7 +489,7 @@ static void topk_f64_update(void* base,size_t stride,const uint32_t* gids,const 
 static void topk_f64_merge(void* dd,const void* ss,acc_arena_t* a){ (void)a;
     topk_f64_state* d=dd; const topk_f64_state* s=ss;
     for(int64_t i=0;i<s->len;i++) topk_f64_push(d,s->buf[i]); }
-static void topk_f64_destroy(void* s){ topk_f64_state* st=s; free(st->buf); st->buf=NULL; st->len=st->cap=0; }
+static void topk_f64_destroy(void* s){ topk_f64_state* st=s; ray_free_raw(st->buf); st->buf=NULL; st->len=st->cap=0; }
 static ray_t* topk_f64_make(const topk_f64_state* st, int64_t k, uint8_t desc){
     if (st->len==0) return ray_vec_new(RAY_F64, 0);
     ray_t* v=ray_vec_new(RAY_F64, st->len); v->len=st->len;

@@ -32,33 +32,34 @@
 (count (where (!= sv8 'y))) -- 2
 
 ;; ═══════════════════════════════════════════════════════════════════
-;; 3. SYM fast path: atom_null && !vec_has_nulls (lines 807-811)
-;;    Compare a SYM vec (no nulls) against a SYM null atom → every row
-;;    gets fill=false for ==, fill=true for !=.
+;; 3. SYM compare: empty-symbol atom (') is a value absent from the vec
+;;    Compare a SYM vec {a,b,c} against the empty symbol ' (sym id 0).
+;;    ' is a VALUE, not a null (SYM has no null); it matches no row →
+;;    == all-false, != all-true.  Hits the per-width compare loop.
 ;; ═══════════════════════════════════════════════════════════════════
-(set snull 0Ns)
+(set snull ')
 (set snv (as 'SYM ['a 'b 'c]))
-;; == null → all false → count of true is 0
+;; == ' → all false (no row is the empty symbol) → count of true is 0
 (sum (as 'I64 (== snv snull))) -- 0
-;; != null → all true → count is 3
+;; != ' → all true → count is 3
 (sum (as 'I64 (!= snv snull))) -- 3
 
 ;; ═══════════════════════════════════════════════════════════════════
-;; 4. SYM fast path: vec has nulls, atom is non-null (lines 836-851)
-;;    Build a SYM vec with nulls via table+select and compare against
-;;    a specific sym atom.
+;; 4. SYM compare: empty symbol in the vec is a value, not a null
+;;    Build a SYM vec containing the empty symbol ' and compare against
+;;    a specific sym atom.  The vec carries no nulls (SYM has no null);
+;;    the ' cell is just another value.
 ;; ═══════════════════════════════════════════════════════════════════
-;; Create a SYM vec with nulls using where+at
-(set t_sym (table ['s] (list (as 'SYM ['a 0Ns 'a 'b]))))
+;; SYM vec [a ' a b] — the ' cell is the empty-symbol VALUE, not a null
+(set t_sym (table ['s] (list (as 'SYM ['a ' 'a 'b]))))
 (set col_s (at t_sym 's))
-;; Rows with null in the sym vec: == 'a → [true, false, true, false]
+;; == 'a → [true, false, true, false] (the ' cell simply isn't 'a)
 (count (where (== col_s 'a))) -- 2
 (count (where (!= col_s 'a))) -- 2
-;; null sym == null sym atom → general path (null ≠ null by null-equality semantics)
-;; BUG: By null-equality semantics, null == null is 0 (false); only 'a == 'a is true.
-;; The general path is hit regardless; the result follows the null-equality rules:
-(sum (as 'I64 (== col_s 0Ns))) -- 0
-(sum (as 'I64 (!= col_s 0Ns))) -- 4
+;; empty sym == empty sym atom → value equality (SYM has no null; ' is a value,
+;; mirroring STR "" == "").  The ' row equals the ' atom → 1 match.
+(sum (as 'I64 (== col_s '))) -- 1
+(sum (as 'I64 (!= col_s '))) -- 3
 
 ;; ═══════════════════════════════════════════════════════════════════
 ;; 5. numeric_atom_i64 I32/I16/BOOL branches (lines 139-149 in eval.c)

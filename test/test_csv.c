@@ -572,7 +572,11 @@ static test_result_t test_csv_explicit_str_schema(void) {
     s = ray_str_vec_get(note, 1, &l);
     TEST_ASSERT_EQ_I((int)l, 35);
     TEST_ASSERT_MEM_EQ(35, s, "this-is-a-long-string-over-12-bytes");
-    TEST_ASSERT_TRUE(ray_vec_is_null(note, 2));
+    /* A blank CSV field for a STR column is the empty string "" (a value),
+     * not a null — consistent with SYM and with DuckDB's CSV semantics. */
+    TEST_ASSERT_FALSE(ray_vec_is_null(note, 2));
+    s = ray_str_vec_get(note, 2, &l);
+    TEST_ASSERT_EQ_I((int)l, 0);
     s = ray_str_vec_get(note, 3, &l);
     TEST_ASSERT_EQ_I((int)l, 4);
     TEST_ASSERT_MEM_EQ(4, s, "tiny");
@@ -1485,6 +1489,26 @@ static test_result_t test_csv_infer_high_cardinality_str(void) {
     PASS();
 }
 
+static test_result_t test_csv_resolve_int_width(void) {
+    /* non-nullable: floor is I16 (U8/BOOL intentionally excluded — render hex/bool) */
+    TEST_ASSERT(csv_resolve_int_width(0, 1, false)        == CSV_TYPE_I16,  "[0,1] non-null -> I16 (not BOOL; integers stay decimal)");
+    TEST_ASSERT(csv_resolve_int_width(0, 255, false)      == CSV_TYPE_I16,  "[0,255] non-null -> I16 (not U8; integers stay decimal)");
+    TEST_ASSERT(csv_resolve_int_width(0, 256, false)      == CSV_TYPE_I16,  "[0,256] non-null -> I16");
+    TEST_ASSERT(csv_resolve_int_width(-1, 52, false)      == CSV_TYPE_I16,  "[-1,52] non-null -> I16 (negative excludes U8)");
+    TEST_ASSERT(csv_resolve_int_width(0, 131069, false)   == CSV_TYPE_I32,  "[0,131069] non-null -> I32");
+    TEST_ASSERT(csv_resolve_int_width(0, 5000000000LL, false) == CSV_TYPE_I64, "[0,5e9] non-null -> I64");
+    /* nullable: BOOL/U8 forbidden, sentinel (INT_MIN) excluded from data */
+    TEST_ASSERT(csv_resolve_int_width(0, 52, true)        == CSV_TYPE_I16,  "[0,52] nullable -> I16 (NOT U8)");
+    TEST_ASSERT(csv_resolve_int_width(0, 1, true)         == CSV_TYPE_I16,  "[0,1] nullable -> I16 (NOT BOOL)");
+    TEST_ASSERT(csv_resolve_int_width(0, 70000, true)     == CSV_TYPE_I32,  "[0,70000] nullable -> I32");
+    TEST_ASSERT(csv_resolve_int_width((int64_t)INT16_MIN, 5, true) == CSV_TYPE_I32, "min==sentinel -> widen to I32");
+    TEST_ASSERT(csv_resolve_int_width((int64_t)INT32_MIN, 5, true) == CSV_TYPE_I64,
+                "min==NULL_I32 sentinel -> widen to I64");
+    /* edges */
+    TEST_ASSERT(csv_resolve_int_width(INT64_MAX, INT64_MIN, false) == CSV_TYPE_I64, "min>max (empty/all-null) -> I64");
+    PASS();
+}
+
 const test_entry_t csv_entries[] = {
     { "csv/roundtrip_i64", test_csv_roundtrip_i64, NULL, NULL },
     { "csv/roundtrip_guid", test_csv_guid_roundtrip, NULL, NULL },
@@ -1535,5 +1559,6 @@ const test_entry_t csv_entries[] = {
     { "csv/explicit_i32_schema", test_csv_explicit_i32_schema,            NULL, NULL },
     { "csv/explicit_u8_schema_serial",
                                   test_csv_explicit_u8_schema_serial,      NULL, NULL },
+    { "csv/resolve_int_width",    test_csv_resolve_int_width,              NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };

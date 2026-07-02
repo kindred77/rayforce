@@ -27,9 +27,24 @@ typedef struct {
 /* Multi-key grouping (1..16 keys). Reads each key as an int64 (intern id for
  * SYM) and hashes the tuple. Assigns gids incrementally on first sight → gid
  * order == first-occurrence order; first_row[gid] records the row where the
- * group first appeared. Returns 0 on success (caller frees out->gids and
- * out->first_row via free()), -1 on allocation failure. */
+ * group first appeared. Returns 0 on success (caller releases out via
+ * agg_groups_free()), -1 on allocation failure. */
 int agg_group_keys(ray_t** key_cols, uint8_t n_keys, int64_t nrows, agg_groups_t* out);
+
+/* Release the buffers an agg_groups_t holds (buddy-backed, NOT libc malloc — so
+ * callers must use this, not free()).  Idempotent; NULLs the pointers. */
+void agg_groups_free(agg_groups_t* out);
+
+/* Multi-key `select {by: {keys}}` with no aggregates → result table carrying the
+ * first-of-group value of every `tbl` column (keys named by key_syms, then the
+ * non-key columns), SYM columns adopting their source domain (no global
+ * interning).  See agg_engine.c.  Precondition (caller-gated): keys are int/SYM
+ * and every tbl column is fixed-width/SYM/STR/LIST.  Caller owns the table.
+ * keep_syms (or NULL) lists the column syms a consumer references — non-key
+ * columns NOT in it are dropped (projection pushdown); keys are always kept. */
+ray_t* agg_select_distinct(ray_t* tbl, ray_t** key_cols, const int64_t* key_syms,
+                           uint8_t nk, int64_t nrows,
+                           const int64_t* keep_syms, int keep_n);
 
 /* Build a dense SoA per-group state array for one aggregate (vt), run a single
  * update_batch over val_col grouped by gids, and finalize each group into a

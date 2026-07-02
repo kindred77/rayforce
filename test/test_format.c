@@ -280,9 +280,9 @@ static test_result_t test_type_name_sym(void) {
     PASS();
 }
 
-/* ---- Test: fmt_sym fallback (invalid sym id -> "0Ns") ---- */
+/* ---- Test: fmt_sym fallback (invalid sym id -> "'") ---- */
 static test_result_t test_fmt_sym_invalid(void) {
-    /* id -1 is out of range, ray_sym_str returns NULL -> "0Ns" */
+    /* id -1 is out of range, ray_sym_str returns NULL -> empty symbol "'" */
     ray_t* obj = ray_sym(-1);
     TEST_ASSERT_NOT_NULL(obj);
     TEST_ASSERT_FALSE(RAY_IS_ERR(obj));
@@ -290,7 +290,7 @@ static test_result_t test_fmt_sym_invalid(void) {
     TEST_ASSERT_NOT_NULL(result);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
     const char* s = ray_str_ptr(result);
-    TEST_ASSERT_NOT_NULL(strstr(s, "0Ns"));
+    TEST_ASSERT_NOT_NULL(strstr(s, "'"));
     ray_release(result);
     ray_release(obj);
     PASS();
@@ -782,11 +782,13 @@ static test_result_t test_fmt_null_guid(void) {
 }
 
 static test_result_t test_fmt_null_sym(void) {
+    /* SYM has no null: ray_typed_null(-RAY_SYM) is sym 0 (the empty
+     * symbol), which renders as the bare quote literal '. */
     ray_t* result = ray_fmt(ray_typed_null(-RAY_SYM), 1);
     TEST_ASSERT_NOT_NULL(result);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
     const char* s = ray_str_ptr(result);
-    TEST_ASSERT_NOT_NULL(strstr(s, "0Ns"));
+    TEST_ASSERT_NOT_NULL(strstr(s, "'"));
     ray_release(result);
     PASS();
 }

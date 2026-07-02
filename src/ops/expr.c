@@ -25,6 +25,7 @@
 #include "lang/internal.h"  /* sym_domain_rep (sym-domain Phase 2) */
 #include "lang/format.h"    /* ray_type_name */
 #include "ops/rowsel.h"
+#include "ops/idxop.h"      /* RAY_IDX_CHUNK_ZONE per-morsel zone-skip */
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -314,6 +315,42 @@ bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
     return true;
 }
 
+/* Detect SUM/AVG inputs of form (scan a * scan b) with a FLOAT product:
+ * both columns flat and null-free, at least one RAY_F64, the other F64 or
+ * integer-family.  int x int stays on the materialized path — its overflow
+ * semantics (expr marks i64 overflow as null) must not silently change.
+ * The fused read promotes each side to double exactly like expr's
+ * promote(), so the accumulated sum is bit-compatible. */
+bool try_prod_sumavg_input_f64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
+                               agg_prod_t* out) {
+    if (!g || !tbl || !input_op || !out) return false;
+    if (input_op->opcode != OP_MUL || input_op->arity != 2) return false;
+    ray_op_t* lhs = op_child(g, input_op, 0);
+    ray_op_t* rhs = op_child(g, input_op, 1);
+    if (!lhs || !rhs) return false;
+    if (lhs->opcode != OP_SCAN || rhs->opcode != OP_SCAN) return false;
+    ray_op_ext_t* lx = find_ext(g, lhs->id);
+    ray_op_ext_t* rx = find_ext(g, rhs->id);
+    if (!lx || !rx) return false;
+    ray_t* ca = ray_table_get_col(tbl, lx->sym);
+    ray_t* cb = ray_table_get_col(tbl, rx->sym);
+    if (!ca || !cb || RAY_IS_ERR(ca) || RAY_IS_ERR(cb)) return false;
+    if (RAY_IS_PARTED(ca->type) || ca->type == RAY_MAPCOMMON) return false;
+    if (RAY_IS_PARTED(cb->type) || cb->type == RAY_MAPCOMMON) return false;
+    if ((ca->attrs & RAY_ATTR_HAS_NULLS) || (cb->attrs & RAY_ATTR_HAS_NULLS))
+        return false;
+    #define PROD_OK_T(t) ((t) == RAY_F64 || (t) == RAY_I64 || (t) == RAY_I32 || \
+                          (t) == RAY_I16 || (t) == RAY_U8  || (t) == RAY_BOOL)
+    if (!PROD_OK_T(ca->type) || !PROD_OK_T(cb->type)) return false;
+    #undef PROD_OK_T
+    if (ca->type != RAY_F64 && cb->type != RAY_F64) return false;
+
+    out->enabled = true;
+    out->pa = ray_data(ca); out->ta = ca->type; out->aa = ca->attrs;
+    out->pb = ray_data(cb); out->tb = cb->type; out->ab = cb->attrs;
+    return true;
+}
+
 /* Detect SUM/AVG affine inputs of form (scan +/- const) and return scan vector
  * plus the additive bias so we can adjust results from (sum,count) directly. */
 bool try_affine_sumavg_input(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
@@ -591,6 +628,7 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out) {
                     out->regs[r].col_type = base;
                     out->regs[r].data = NULL; /* resolved per-segment */
                     out->regs[r].is_parted = true;
+                    out->regs[r].col_obj = NULL; /* parted: per-segment, no zone-skip */
                     out->regs[r].parted_col = col;
                     out->regs[r].type = (base == RAY_F64) ? RAY_F64 : RAY_I64;
                     out->regs[r].nullable = col_nulls;
@@ -600,6 +638,7 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out) {
                     out->regs[r].col_attrs = col->attrs;
                     out->regs[r].data = ray_data(col);
                     out->regs[r].is_parted = false;
+                    out->regs[r].col_obj = col;
                     out->regs[r].parted_col = NULL;
                     out->regs[r].type = (col->type == RAY_F64) ? RAY_F64 : RAY_I64;
                     out->regs[r].nullable = col_nulls;
@@ -1409,11 +1448,169 @@ static void* expr_eval_morsel(const ray_expr_t* expr, void** scratch,
     return rptrs[expr->out_reg];
 }
 
-/* Context for parallel full-vector expression evaluation */
+/* ── Per-morsel chunk-zone skip for fused BOOL predicates ──────────────────
+ *
+ * A WHERE comparison (or AND/OR tree of comparisons) over chunk-zone-indexed
+ * integer/temporal columns can frequently be decided for a whole morsel from
+ * the per-chunk [min,max] extrema alone — without reading a single column
+ * value.  This recovers the block-skip the deleted OP_FILTERED_GROUP operator
+ * provided, but as a general property of the fused evaluator (every BOOL
+ * expression benefits; nothing is benchmark-shaped).
+ *
+ * The decision is tri-state per register during a walk of the compiled
+ * instruction list:  1 = all-pass, 0 = all-fail, mixed/none = undecided.
+ * Each comparison's tri-state is proven by chunk extrema (mirrors the proven
+ * fp_eval_cmp logic); three-valued AND/OR composition preserves soundness.
+ * Any non-{compare,AND,OR} instruction, or a comparison whose operands aren't
+ * (zone-column, integer-const), degrades that register to "mixed", so the
+ * final answer is conservative by construction — a wrong "all-pass"/"all-fail"
+ * is impossible. */
+#define ZT_MIXED  (-1)   /* boolean, but value varies within the chunk */
+#define ZT_NONE   (-2)   /* register is not a boolean we can reason about */
+
+static inline int zt_and(int a, int b) {
+    if (a == 0 || b == 0) return 0;          /* FALSE dominates AND */
+    if (a == 1 && b == 1) return 1;
+    return ZT_MIXED;
+}
+static inline int zt_or(int a, int b) {
+    if (a == 1 || b == 1) return 1;          /* TRUE dominates OR */
+    if (a == 0 && b == 0) return 0;
+    return ZT_MIXED;
+}
+/* Mirror a comparison operator when the column is the RIGHT operand
+ * (const OP col ≡ col swap(OP) const).  EQ/NE are symmetric. */
+static inline uint16_t zone_swap_op(uint16_t op) {
+    switch (op) {
+    case OP_LT: return OP_GT;
+    case OP_GT: return OP_LT;
+    case OP_LE: return OP_GE;
+    case OP_GE: return OP_LE;
+    default:    return op;
+    }
+}
+
+/* Decide one comparison (col cmp_op cval) over chunk `ch` from its int64
+ * extrema.  cmp_op is normalized so the column is the left operand.  The
+ * all-pass arm is gated on "no nulls in the chunk" (a NULL lane yields BOOL 0,
+ * never 1); the all-fail arm needs no guard (NULL op const is never TRUE). */
+static int zone_cmp_decision(const ray_index_t* ix, int64_t ch,
+                             uint16_t cmp_op, int64_t cval) {
+    const int64_t* mins = (const int64_t*)ray_data(ix->u.chunk_zone.mins);
+    const int64_t* maxs = (const int64_t*)ray_data(ix->u.chunk_zone.maxs);
+    int64_t cmin = mins[ch], cmax = maxs[ch];
+    if (cmin > cmax) return ZT_MIXED;        /* all-null chunk: leave to kernel */
+    const uint8_t* nb = (const uint8_t*)ray_data(ix->u.chunk_zone.null_bits);
+    bool has_nulls = (nb[ch >> 3] >> (ch & 7)) & 1u;
+    switch (cmp_op) {
+    case OP_EQ:
+        if (cval < cmin || cval > cmax)                 return 0;
+        if (!has_nulls && cmin == cmax)                 return 1;
+        break;
+    case OP_NE:
+        if (!has_nulls && (cval < cmin || cval > cmax)) return 1;
+        if (cmin == cmax && cval == cmin)               return 0;
+        break;
+    case OP_LT:
+        if (cmin >= cval)                               return 0;
+        if (!has_nulls && cmax <  cval)                 return 1;
+        break;
+    case OP_LE:
+        if (cmin >  cval)                               return 0;
+        if (!has_nulls && cmax <= cval)                 return 1;
+        break;
+    case OP_GT:
+        if (cmax <= cval)                               return 0;
+        if (!has_nulls && cmin >  cval)                 return 1;
+        break;
+    case OP_GE:
+        if (cmax <  cval)                               return 0;
+        if (!has_nulls && cmin >= cval)                 return 1;
+        break;
+    default: break;
+    }
+    return ZT_MIXED;
+}
+
+/* Does `col` carry a fresh, integer/temporal chunk-zone index? */
+static inline const ray_index_t* zone_fresh_index(const ray_t* col) {
+    if (!col || !(col->attrs & RAY_ATTR_HAS_INDEX) || !col->index) return NULL;
+    const ray_index_t* ix = ray_index_payload(col->index);
+    if (ix->kind != RAY_IDX_CHUNK_ZONE ||
+        ix->built_for_len != col->len ||
+        ix->u.chunk_zone.is_f64) return NULL;
+    return ix;
+}
+
+/* Cheap O(n_regs) pre-check: is any scan register zone-eligible?  Computed
+ * once per evaluation so the per-morsel walk is skipped entirely otherwise. */
+static bool expr_zone_eligible(const ray_expr_t* expr) {
+    if (expr->out_type != RAY_BOOL) return false;
+    for (uint8_t r = 0; r < expr->n_regs; r++)
+        if (expr->regs[r].kind == REG_SCAN && zone_fresh_index(expr->regs[r].col_obj))
+            return true;
+    return false;
+}
+
+/* Decide morsel [ms, me) from chunk-zone extrema without reading column data.
+ * Returns 1 (all-pass), 0 (all-fail), or -1 (undecided — evaluate normally). */
+static int expr_zone_decide(const ray_expr_t* expr, int64_t ms, int64_t me) {
+    int tri[EXPR_MAX_REGS];
+    for (uint8_t r = 0; r < expr->n_regs; r++) tri[r] = ZT_NONE;
+
+    for (uint8_t i = 0; i < expr->n_ins; i++) {
+        const expr_ins_t* in = &expr->ins[i];
+        uint16_t op = in->opcode;
+        if (op >= OP_EQ && op <= OP_GE && in->src2 != 0xFF) {
+            const ray_t* col = NULL; int64_t cval = 0; uint16_t cmp = op;
+            uint8_t a = in->src1, b = in->src2;
+            if (expr->regs[a].kind == REG_SCAN &&
+                expr->regs[b].kind == REG_CONST && expr->regs[b].type == RAY_I64) {
+                col = expr->regs[a].col_obj; cval = expr->regs[b].const_i64;
+            } else if (expr->regs[b].kind == REG_SCAN &&
+                       expr->regs[a].kind == REG_CONST && expr->regs[a].type == RAY_I64) {
+                col = expr->regs[b].col_obj; cval = expr->regs[a].const_i64;
+                cmp = zone_swap_op(op);
+            }
+            int d = ZT_MIXED;
+            const ray_index_t* ix = zone_fresh_index(col);
+            if (ix) {
+                uint8_t log2 = ix->u.chunk_zone.chunk_log2;
+                int64_t s_ch = ms >> log2, e_ch = (me - 1) >> log2;
+                if (s_ch == e_ch && (uint32_t)s_ch < ix->u.chunk_zone.n_chunks)
+                    d = zone_cmp_decision(ix, s_ch, cmp, cval);
+            }
+            tri[in->dst] = d;
+        } else if (op == OP_AND && in->src2 != 0xFF) {
+            tri[in->dst] = zt_and(tri[in->src1], tri[in->src2]);
+        } else if (op == OP_OR && in->src2 != 0xFF) {
+            tri[in->dst] = zt_or(tri[in->src1], tri[in->src2]);
+        } else {
+            tri[in->dst] = ZT_MIXED;            /* unanalyzable op */
+        }
+    }
+    int res = tri[expr->out_reg];
+    return (res == 0 || res == 1) ? res : -1;
+}
+
+/* Context for parallel full-vector expression evaluation.
+ *
+ * Two output modes:
+ *   - Normal (sel_builders == NULL): each morsel's result is memcpy'd into
+ *     out_data at its absolute offset (full materialized output vec).
+ *   - Fused selection (sel_builders != NULL): out_type is RAY_BOOL and each
+ *     morsel's bools are streamed via rowsel_emit_segment into THIS task's
+ *     builder instead of a BOOL vec.  See exec_pred_to_selection.  Task
+ *     boundaries are morsel/grain aligned, so the builder for an invocation
+ *     is sel_builders[start / TASK_GRAIN] and the invocation's first global
+ *     segment is start / RAY_MORSEL_ELEMS (subtracted to get builder-local
+ *     seg indices). */
 typedef struct {
     const ray_expr_t* expr;
     void*  out_data;
     int8_t out_type;
+    rowsel_builder_t* sel_builders;    /* NULL = normal bool/vec output */
+    uint32_t          n_sel_builders;  /* slot count (fused mode only)  */
 } expr_full_ctx_t;
 
 static void expr_full_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
@@ -1431,11 +1628,57 @@ static void expr_full_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t e
     for (uint8_t r = 0; r < expr->n_regs; r++)
         scratch[r] = scratch_mem + (size_t)r * EXPR_MORSEL * 8;
 
+    /* Chunk-zone skip is only possible for a BOOL predicate over a zone-
+     * indexed column; compute the gate once, not per morsel. */
+    bool zone = expr_zone_eligible(expr);
+
+    /* Fused selection-output mode: resolve this task's builder + its first
+     * global segment once.  Task boundaries are morsel-aligned because
+     * TASK_GRAIN is a whole multiple of RAY_MORSEL_ELEMS (the serial path
+     * passes start=0,end=nrows → slot 0). */
+    rowsel_builder_t* sb = NULL;
+    uint32_t local_base_seg = 0;
+    if (c->sel_builders) {
+        const int64_t grain = (int64_t)RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS;
+        _Static_assert((RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS) % RAY_MORSEL_ELEMS == 0,
+                       "TASK_GRAIN must be a whole number of morsels");
+        assert(start % grain == 0 &&
+               "fused-sel: task start not grain/morsel aligned");
+        uint32_t slot = (uint32_t)(start / grain);
+        assert(slot < c->n_sel_builders && "fused-sel: builder slot OOB");
+        sb = &c->sel_builders[slot];
+        local_base_seg = (uint32_t)(start / RAY_MORSEL_ELEMS);
+    }
+
     for (int64_t ms = start; ms < end; ms += EXPR_MORSEL) {
         int64_t me = (ms + EXPR_MORSEL < end) ? ms + EXPR_MORSEL : end;
+        if (zone) {
+            int d = expr_zone_decide(expr, ms, me);
+            if (d >= 0) {  /* whole morsel decided from extrema — skip the read */
+                if (sb) {
+                    /* Emit a uniform ALL (d=1) / NONE (d=0) segment: memset a
+                     * scratch bool buffer (unused on this branch — no eval ran)
+                     * to d and let rowsel_emit_segment classify it. */
+                    uint32_t lseg = (uint32_t)(ms / RAY_MORSEL_ELEMS) - local_base_seg;
+                    memset(scratch[0], d, (size_t)(me - ms));
+                    rowsel_emit_segment(sb, lseg, (const uint8_t*)scratch[0], me - ms);
+                } else {
+                    memset((char*)c->out_data + ms * esz, d, (size_t)(me - ms) * esz);
+                }
+                continue;
+            }
+        }
         void* result = expr_eval_morsel(expr, scratch, ms, me);
-        if (result)
+        if (sb) {
+            /* Selection mode: emit this morsel's bools (or, on the rare
+             * eval-NULL internal error, a none-pass segment so the builder's
+             * strictly-ascending segment sequence stays gap-free). */
+            uint32_t lseg = (uint32_t)(ms / RAY_MORSEL_ELEMS) - local_base_seg;
+            if (!result) { memset(scratch[0], 0, (size_t)(me - ms)); result = scratch[0]; }
+            rowsel_emit_segment(sb, lseg, (const uint8_t*)result, me - ms);
+        } else if (result) {
             memcpy((char*)c->out_data + ms * esz, result, (size_t)(me - ms) * esz);
+        }
     }
     scratch_free(scratch_hdr);
 }
@@ -1636,6 +1879,191 @@ ray_t* expr_eval_full(const ray_expr_t* expr, int64_t nrows) {
     if (expr->regs[expr->out_reg].nullable)
         out->attrs |= RAY_ATTR_HAS_NULLS;
     return out;
+}
+
+/* ============================================================================
+ * Fused predicate → row selection
+ *
+ * Instead of materializing a whole-table BOOL vec (expr_eval_full) and then
+ * scanning it with ray_rowsel_from_pred, stream each morsel's bools directly
+ * into per-task rowsel builders and stitch them into a single selection.
+ * Saves the BOOL allocation + the second full pass.  Strictly additive:
+ * unsupported shapes return to the existing path.
+ *
+ * The per-task-builder scaffolding (allocate one builder per dispatched
+ * grain task, dispatch a worker that streams each morsel's bools via
+ * rowsel_emit_segment, stitch + apply the all-pass→NULL convention) is shared
+ * by two producers: the expr-tree path (expr_full_fn, selection mode) and the
+ * standalone predicate kernels (pred_sel_drive, used by exec_in_to_selection).
+ * pred_sel_builders_alloc / _finish factor that scaffolding so both producers
+ * stay byte-identical to ray_rowsel_from_pred over the same bools.
+ * ============================================================================ */
+
+/* Allocate + init one rowsel builder per dispatched grain task (parallel) or a
+ * single builder over all segments (serial).  ray_pool_dispatch carves task i
+ * as [i*grain, min((i+1)*grain, nrows)); grain is morsel-aligned so each task
+ * owns a contiguous run of whole segments.  On return *parallel and *n_builders
+ * describe the dispatch geometry.  Returns NULL when the table needs more tasks
+ * than the ring holds (pool clamps n_tasks to RAY_POOL_MAX_TASKS and re-derives
+ * a non-morsel-aligned grain, which would trip the worker's `start % grain == 0`
+ * assert) or on OOM — caller falls back to the bool path. */
+static rowsel_builder_t* pred_sel_builders_alloc(int64_t nrows, ray_pool_t* pool,
+                                                 bool* parallel,
+                                                 uint32_t* n_builders_out) {
+    const int64_t grain  = (int64_t)RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS;
+    int64_t       n_segs = (nrows + RAY_MORSEL_ELEMS - 1) / RAY_MORSEL_ELEMS;
+    bool          par    = (pool && nrows >= RAY_PARALLEL_THRESHOLD);
+
+    uint32_t n_builders = par ? (uint32_t)((nrows + grain - 1) / grain) : 1u;
+    if (par && n_builders > RAY_POOL_MAX_TASKS) return NULL;
+
+    rowsel_builder_t* builders =
+        (rowsel_builder_t*)ray_alloc_raw((size_t)n_builders * sizeof(rowsel_builder_t));
+    if (!builders) return NULL;
+
+    if (par) {
+        for (uint32_t i = 0; i < n_builders; i++) {
+            int64_t s = (int64_t)i * grain;
+            int64_t e = s + grain;
+            if (e > nrows) e = nrows;
+            uint32_t segs = (uint32_t)((e - s + RAY_MORSEL_ELEMS - 1) / RAY_MORSEL_ELEMS);
+            rowsel_builder_init(&builders[i], segs);
+        }
+    } else {
+        rowsel_builder_init(&builders[0], (uint32_t)n_segs);
+    }
+
+    *parallel       = par;
+    *n_builders_out = n_builders;
+    return builders;
+}
+
+/* Stitch builders (global segment order = slot order) into one rowsel block,
+ * free the builder array, and apply the all-pass→NULL convention (a selection
+ * that keeps every row is "no selection", matching ray_rowsel_from_pred and
+ * g->selection == NULL).  Returns NULL+*all_pass=1 for all-pass, NULL+*all_pass
+ * unchanged on OOM, else the block. */
+static ray_t* pred_sel_builders_finish(rowsel_builder_t* builders,
+                                       uint32_t n_builders, int64_t nrows,
+                                       bool* all_pass) {
+    ray_t* block = rowsel_builder_finish(builders, n_builders, nrows);
+    ray_free_raw(builders);
+    if (!block) return NULL;  /* OOM — caller falls back to the bool path */
+
+    ray_rowsel_t* m = ray_rowsel_meta(block);
+    if (m->total_pass == nrows) {
+        ray_rowsel_release(block);
+        *all_pass = true;
+        return NULL;
+    }
+    return block;
+}
+
+/* Generic selection-output driver for standalone predicate kernels.  Each
+ * morsel [ms, me) is filled into a morsel-local bool scratch by `fill` (which
+ * runs the kernel's element logic over global rows [ms, me)) then streamed via
+ * rowsel_emit_segment — the same per-task-builder model as expr_full_fn's
+ * selection mode, only the per-morsel COMPUTE differs.  Returns the same
+ * tri-state as exec_pred_to_selection. */
+typedef struct {
+    pred_sel_fill_fn  fill;
+    void*             fill_ctx;
+    rowsel_builder_t* sel_builders;
+    uint32_t          n_sel_builders;
+} pred_sel_drive_ctx_t;
+
+static void pred_sel_worker(void* vctx, uint32_t worker_id,
+                            int64_t start, int64_t end) {
+    (void)worker_id;
+    pred_sel_drive_ctx_t* c = (pred_sel_drive_ctx_t*)vctx;
+
+    ray_t* scratch_hdr = NULL;
+    uint8_t* scratch = (uint8_t*)scratch_alloc(&scratch_hdr, RAY_MORSEL_ELEMS);
+    if (!scratch) return;
+
+    const int64_t grain = (int64_t)RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS;
+    _Static_assert((RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS) % RAY_MORSEL_ELEMS == 0,
+                   "TASK_GRAIN must be a whole number of morsels");
+    assert(start % grain == 0 && "pred-sel: task start not grain/morsel aligned");
+    uint32_t slot = (uint32_t)(start / grain);
+    assert(slot < c->n_sel_builders && "pred-sel: builder slot OOB");
+    rowsel_builder_t* sb = &c->sel_builders[slot];
+    uint32_t local_base_seg = (uint32_t)(start / RAY_MORSEL_ELEMS);
+
+    for (int64_t ms = start; ms < end; ms += RAY_MORSEL_ELEMS) {
+        int64_t me = (ms + RAY_MORSEL_ELEMS < end) ? ms + RAY_MORSEL_ELEMS : end;
+        c->fill(c->fill_ctx, ms, me - ms, scratch);
+        uint32_t lseg = (uint32_t)(ms / RAY_MORSEL_ELEMS) - local_base_seg;
+        rowsel_emit_segment(sb, lseg, scratch, me - ms);
+    }
+    scratch_free(scratch_hdr);
+}
+
+ray_t* pred_sel_drive(int64_t nrows, pred_sel_fill_fn fill, void* fill_ctx,
+                      bool* all_pass) {
+    *all_pass = false;
+    if (nrows <= 0) { *all_pass = true; return NULL; }
+
+    ray_pool_t* pool = ray_pool_get();
+    bool        parallel;
+    uint32_t    n_builders;
+    rowsel_builder_t* builders =
+        pred_sel_builders_alloc(nrows, pool, &parallel, &n_builders);
+    if (!builders) return NULL;
+
+    pred_sel_drive_ctx_t ctx = {
+        .fill           = fill,
+        .fill_ctx       = fill_ctx,
+        .sel_builders   = builders,
+        .n_sel_builders = n_builders,
+    };
+    if (parallel)
+        ray_pool_dispatch(pool, pred_sel_worker, &ctx, nrows);
+    else
+        pred_sel_worker(&ctx, 0, 0, nrows);
+
+    return pred_sel_builders_finish(builders, n_builders, nrows, all_pass);
+}
+
+ray_t* exec_pred_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
+                              bool* all_pass) {
+    *all_pass = false;
+    if (!g || !g->table || !pred) return NULL;          /* unsupported */
+    if (nrows <= 0) { *all_pass = true; return NULL; }  /* empty = all-pass */
+
+    /* Standalone predicate kernels that aren't expr-compilable but have a
+     * selection-output worker.  `in`/`not-in` over a flat column + literal set
+     * stream membership bools straight into the rowsel.  (`like` stays on the
+     * bool fallback: its 4 input-shape paths + dict-LUT pipeline don't reduce
+     * to a clean per-morsel fill.  `between` desugars to >=/<= AND and so
+     * already rides the expr path below.) */
+    if (pred->opcode == OP_IN || pred->opcode == OP_NOT_IN)
+        return exec_in_to_selection(g, pred, nrows, all_pass);
+
+    ray_expr_t ex;
+    if (!expr_compile(g, g->table, pred, &ex)) return NULL;
+    if (ex.out_type != RAY_BOOL || ex.has_parted) return NULL;
+
+    ray_pool_t* pool     = ray_pool_get();
+    bool        parallel;
+    uint32_t    n_builders;
+    rowsel_builder_t* builders =
+        pred_sel_builders_alloc(nrows, pool, &parallel, &n_builders);
+    if (!builders) return NULL;
+
+    expr_full_ctx_t ctx = {
+        .expr           = &ex,
+        .out_data       = NULL,
+        .out_type       = ex.out_type,
+        .sel_builders   = builders,
+        .n_sel_builders = n_builders,
+    };
+    if (parallel)
+        ray_pool_dispatch(pool, expr_full_fn, &ctx, nrows);
+    else
+        expr_full_fn(&ctx, 0, 0, nrows);
+
+    return pred_sel_builders_finish(builders, n_builders, nrows, all_pass);
 }
 
 /* ============================================================================
@@ -2093,6 +2521,19 @@ static void binary_range_str(ray_op_t* op, ray_t* lhs, ray_t* rhs, ray_t* result
     if (r_scalar) {
         atom_to_str_t(rhs, &r_scalar_elem, &r_scalar_pool);
         r_elems = &r_scalar_elem;
+    }
+
+    /* Fast path: EQ/NE against the empty-string constant — a string equals ""
+     * iff len==0.  Evaluate as a length check; no pointer deref or memcmp.
+     * Results are byte-identical to the general STR_CMP_LOOP path. */
+    if ((opc == OP_EQ || opc == OP_NE) &&
+        ((l_scalar && !r_scalar && l_scalar_elem.len == 0) ||
+         (r_scalar && !l_scalar && r_scalar_elem.len == 0))) {
+        const ray_str_t* vec = l_scalar ? r_elems : l_elems;
+        bool is_eq = (opc == OP_EQ);
+        for (int64_t i = 0; i < n; i++)
+            dst[i] = (uint8_t)((vec[i].len == 0) == is_eq);
+        return;
     }
 
     /* Resolve final element pointers and pool pointers outside the loop.

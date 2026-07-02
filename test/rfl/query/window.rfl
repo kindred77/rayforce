@@ -1,0 +1,49 @@
+;; window form — language-surface correctness. Kernel itself is covered by
+;; test/test_window.c; these cover parse + wiring + naming + row/col preservation.
+;;   k : a a a b b b        (partition key)
+;;   g : x x y x y y        (2nd partition key)
+;;   v : 5 2 9 4 4 7        (value; note b/x has a single row=4, and the two
+;;                           a-rows in group x are 5,2 → min 2)
+(set T (table [k g v] (list ['a 'a 'a 'b 'b 'b] ['x 'x 'y 'x 'y 'y] [5 2 9 4 4 7])))
+
+;; ── min over one partition key k: a-group min=2, b-group min=4 ──────────────
+;; broadcast: rows k=a → 2 (x3), k=b → 4 (x3)
+(at (window {from: T part: [k] funcs: {mn: (min v)}}) 'mn) -- [2 2 2 4 4 4]
+;; input columns preserved + row order unchanged
+(at (window {from: T part: [k] funcs: {mn: (min v)}}) 'v) -- [5 2 9 4 4 7]
+(count (window {from: T part: [k] funcs: {mn: (min v)}})) -- 6
+
+;; ── two partition keys (k,g): groups (a,x)=[5,2]→2, (a,y)=[9]→9,
+;;    (b,x)=[4]→4, (b,y)=[4,7]→4 ; rows in order → [2 2 9 4 4 4] ───────────────
+(at (window {from: T part: [k g] funcs: {mn: (min v)}}) 'mn) -- [2 2 9 4 4 4]
+
+;; ── multiple funcs in one call: max and sum over k ──────────────────────────
+;;   a-group v=[5,2,9] max=9 sum=16 ; b-group v=[4,4,7] max=7 sum=15
+(at (window {from: T part: [k] funcs: {mx: (max v) sm: (sum v)}}) 'mx) -- [9 9 9 7 7 7]
+(at (window {from: T part: [k] funcs: {mx: (max v) sm: (sum v)}}) 'sm) -- [16 16 16 15 15 15]
+
+;; ── running frame → cumulative sum within partition k ordered by v ───────────
+;;   partition a v=[5,2,9]: sorted asc → [2,5,9]; running sums 2,7,16 scattered
+;;   back to original positions: row0(v=5)→7, row1(v=2)→2, row2(v=9)→16
+;;   partition b v=[4,4,7]: sorted asc → [4,4,7]; running sums 4,8,15 in order
+;;   full result in original row order: [7 2 16 4 8 15]
+(at (window {from: T part: [k] order: [v] frame: 'running funcs: {cs: (sum v)}}) 'cs) -- [7 2 16 4 8 15]
+
+;; ── fby shape: rows equal to their group's min (keeps ties) ─────────────────
+;; min over k: a→2 (only row v=2), b→4 (rows v=4,4 both) → 3 rows total
+(count (select {from: (window {from: T part: [k] funcs: {mn: (min v)}}) where: (== v mn)})) -- 3
+
+;; ── first/last with order: (Important 1 positive coverage) ──────────────────
+;; part k, order v asc: a=[2,5,9]→first=2,last=9 ; b=[4,4,7]→first=4,last=7
+(at (window {from: T part: [k] order: [v] funcs: {f: (first v) l: (last v)}}) 'f) -- [2 2 2 4 4 4]
+(at (window {from: T part: [k] order: [v] funcs: {f: (first v) l: (last v)}}) 'l) -- [9 9 9 7 7 7]
+
+;; ── errors ────────────────────────────────────────────────────────────────────
+;; (a) unknown func
+(window {from: T funcs: {x: (median v)}}) !- domain
+;; (b) bad frame symbol
+(window {from: T frame: 'bogus funcs: {mn: (min v)}}) !- domain
+;; (c) first without order:
+(window {from: T part: [k] funcs: {f: (first v)}}) !- domain
+;; (d) missing funcs:
+(window {from: T part: [k]}) !- domain

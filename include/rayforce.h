@@ -146,12 +146,16 @@ typedef union ray_t {
              * pointer (see src/table/domain.h) — every non-slice SYM vec
              * carries a non-NULL domain; runtime-created vecs point at
              * the immortal singleton wrapping the global intern table.
-             * Layout audit (2026-06-10): bytes 8-15 are free for SYM —
+             * Layout audit (updated 2026-07): bytes 8-15 hold the domain;
+             * bytes 0-7 are free for a SYM vec to carry an index —
              *   - str_pool uses 8-15 but only for RAY_STR;
-             *   - HAS_INDEX's index/_idx_pad (0-7/8-15) can never be set
-             *     on a SYM vec: prepare_attach (ops/idxop.c) rejects all
-             *     non-numeric types, and SYM/STR/GUID indexing is
-             *     explicitly deferred (ops/idxop.h);
+             *   - HAS_INDEX CAN be set on a SYM vec (as of the SYM hash
+             *     index): the index pointer occupies bytes 0-7 while
+             *     sym_domain stays at bytes 8-15.  attach_finalize
+             *     (ops/idxop.c) preserves _idx_pad (8-15) for RAY_SYM,
+             *     exactly as it does for RAY_STR's str_pool.  That guard is
+             *     the MANDATORY backstop — do NOT restore the _idx_pad
+             *     clearing for SYM or it nulls the domain pointer;
              *   - HAS_LINK's link_target (8-15) is RAY_I32/RAY_I64 only;
              *   - slices use both 0-7 and 8-15, but slice headers do not
              *     store a domain — ray_sym_vec_domain follows
@@ -161,8 +165,9 @@ typedef union ray_t {
             struct { uint8_t _aux_sym_lo[8];     struct ray_sym_domain_s* sym_domain; };
             /* RAY_ATTR_HAS_INDEX (vectors): ray_t* of type RAY_INDEX
              * carrying the accelerator payload and the saved aux
-             * bytes.  _idx_pad is reserved (must be NULL).  See
-             * ops/idxop.h. */
+             * bytes.  _idx_pad (8-15) is NULL for numeric columns, but
+             * holds str_pool for RAY_STR and sym_domain for RAY_SYM
+             * (attach_finalize preserves it there).  See ops/idxop.h. */
             struct { union ray_t* index;         union ray_t* _idx_pad; };
             /* RAY_ATTR_HAS_LINK (vectors, RAY_I32/RAY_I64 only): bytes
              * 8-15 hold an int64 sym ID naming the target table.
@@ -314,6 +319,17 @@ ray_t*    ray_alloc(size_t data_size);
  * when the owning heap flushes foreign blocks. */
 void     ray_free(ray_t* v);
 
+/* ===== Raw buffer allocator (buddy-backed, no libc malloc) =====
+ * malloc/calloc/realloc/free replacements for plain byte/scalar buffers that
+ * are NOT ray_t values — backed by the tuned slab/buddy heap (fast for the many
+ * small per-partition allocations the agg engine makes), thread-safe, with
+ * cross-thread free.  ray_alloc_raw returns uninitialised memory; ray_calloc_raw
+ * zeroes it.  Free with ray_free_raw, grow with ray_realloc_raw. */
+void*    ray_alloc_raw(size_t n);
+void*    ray_calloc_raw(size_t n);
+void*    ray_realloc_raw(void* p, size_t n);
+void     ray_free_raw(void* p);
+
 /* ===== Memory Budget API ===== */
 
 int64_t  ray_mem_budget(void);      /* returns memory budget in bytes */
@@ -430,15 +446,15 @@ static inline bool ray_atom_is_null_fn(const union ray_t* x) {
         case RAY_DATE:
         case RAY_TIME:      return x->i32 == NULL_I32;
         case RAY_I16:       return x->i16 == NULL_I16;
-        case RAY_SYM:       return x->i64 == 0;
+        case RAY_SYM:
+            /* SYM has no null — sym 0 is the empty symbol ' (a value), mirroring
+             * STR's empty "" below.  A SYM atom is never null. */
+            return false;
         case RAY_STR:
-            /* STR atom null = empty string.  Atoms use SSO (slen + sdata)
-             * for len<=7 and a pool pointer (obj) for longer strings; the
-             * union overlap means a non-zero obj pointer has a low byte
-             * that ALSO reads as slen via the SSO arm.  Only when slen==0
-             * AND obj==NULL is the atom genuinely the empty string (see
-             * is_sso in src/vec/str.c). */
-            return x->slen == 0 && x->obj == NULL;
+            /* STR has no null distinct from "" (kdb+ model: char lists have no
+             * null, only symbols do).  A STR atom is never null — the empty
+             * string is a value. */
+            return false;
         case RAY_GUID: {
             /* GUID null = 16 all-zero bytes in obj's U8 buffer.
              * obj is always populated by ray_guid / ray_typed_null —
@@ -485,6 +501,7 @@ bool     ray_vec_is_null(ray_t* vec, int64_t idx);
 /* ===== String Vector API ===== */
 
 ray_t* ray_str_vec_append(ray_t* vec, const char* s, size_t len);
+ray_t* ray_str_vec_from_parts(const char* const* ptrs, const uint32_t* lens, const uint8_t* nulls, int64_t n);
 const char* ray_str_vec_get(ray_t* vec, int64_t idx, size_t* out_len);
 ray_t* ray_str_vec_set(ray_t* vec, int64_t idx, const char* s, size_t len);
 ray_t* ray_str_vec_insert_at(ray_t* vec, int64_t idx, const char* s, size_t len);

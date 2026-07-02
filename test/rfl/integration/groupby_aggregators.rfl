@@ -205,3 +205,25 @@
 ;; so (== k (as 'I32 7)) selects the k=7 group, matching the plain-literal path.
 (min (at (select {from: Ti32 where: (== k (as 'I32 7))}) 'v)) -- 7
 (sum (at (select {from: Ti32 where: (== k (as 'I32 7))}) 'v)) -- 50200
+
+;; ── fused SUM/AVG(a*b) product inputs + arith-of-aggs decomposition ─────────
+(set PT (table [k a b] (list ['x 'y 'x 'y] [1.0 2.0 3.0 4.0] [10 20 30 40])))
+;; fused float product == precomputed product column
+(at (select {n: (sum (* b a)) by: {g: k} from: PT}) 'n) -- [100.0 200.0]
+(set PTP (table [k p] (list (at PT 'k) (* (at PT 'b) (at PT 'a)))))
+(at (select {n: (sum (* b a)) by: {g: k} from: PT}) 'n) -- (at (select {n: (sum p) by: {g: k} from: PTP}) 'n)
+(at (select {m: (avg (* a b)) by: {g: k} from: PT}) 'm) -- [50.0 100.0]
+;; int*int stays exact (unfused path)
+(at (select {n: (sum (* b b)) by: {g: k} from: PT}) 'n) -- [1000 2000]
+;; scalar (no by) shape through the same fusion
+(select {n: (sum (* b a)) from: PT}) -- (table [n] (list [300.0]))
+;; nullable input falls back, same answer
+(set PN (table [k a b] (list ['x 'x 'x] [1.0 0N 3.0] [10 20 30])))
+(at (select {n: (sum (* b a)) by: {g: k} from: PN}) 'n) -- [100.0]
+;; arith-of-aggs decomposition: ratio-of-sums per group
+(at (select {w: (/ (sum (* b a)) (as 'F64 (sum b))) by: {g: k} from: PT}) 'w) -- [2.5 3.33333333333333348]
+;; mixed with plain aggs, constants, and a still-scatter shape
+(at (select {w: (* 2 (sum a)) by: {g: k} from: PT}) 'w) -- [8.0 12.0]
+(at (select {w: (- (max a) (min a)) by: {g: k} from: PT}) 'w) -- [2.0 2.0]
+(at (select {c: (count a) w: (/ (sum (* b a)) (as 'F64 (sum b))) mx: (max a) by: {g: k} from: PT}) 'mx) -- [3.0 4.0]
+(at (select {c: (count a) w: (/ (sum (* b a)) (as 'F64 (sum b))) mx: (max a) by: {g: k} from: PT}) 'w) -- [2.5 3.33333333333333348]

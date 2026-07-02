@@ -623,6 +623,17 @@ typedef struct {
     int64_t bias_i64;
 } linear_expr_i64_t;
 
+/* SUM/AVG(a * b) fused product input: the group accumulators read both
+ * source columns and multiply per row (as F64, exactly the expr path's
+ * promote-to-double semantics) instead of materializing the product
+ * vector — for a 1M-row group that vector is 8MB of alloc+fault+write
+ * per query.  Gated to flat, null-free columns with a float product. */
+typedef struct {
+    bool        enabled;
+    const void* pa; int8_t ta; uint8_t aa;
+    const void* pb; int8_t tb; uint8_t ab;
+} agg_prod_t;
+
 /* ── Expression compiler types ── */
 
 typedef enum {
@@ -675,6 +686,8 @@ typedef struct {
         bool        is_parted;  /* true if this SCAN refs a parted column */
         bool        nullable;   /* lanes may contain NULL_I64 / NaN */
         const void* data;       /* column data pointer (REG_SCAN only) */
+        ray_t*       col_obj;    /* source column vec (REG_SCAN, non-parted) —
+                                  * carries the chunk-zone index for zone-skip */
         ray_t*       parted_col; /* parted wrapper (is_parted only) */
         double      const_f64;  /* scalar value (REG_CONST) */
         int64_t     const_i64;  /* scalar value (REG_CONST) */
@@ -810,15 +823,55 @@ void partitioned_gather(ray_pool_t* pool, const int64_t* idx, int64_t n,
 /* ── filter.c ── */
 ray_t* exec_filter(ray_graph_t* g, ray_op_t* op, ray_t* input, ray_t* pred);
 ray_t* exec_filter_head(ray_t* input, ray_t* pred, int64_t limit);
-ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel);
+/* Typed membership kernel (verdict-LUT / SIMD / pool-parallel); NULL when
+ * the col/set shape is unsupported — caller falls back to its own path. */
+ray_t* ray_in_vec_exec(ray_t* col, ray_t* set, bool negate);
+ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
+                   const int64_t* keep_syms, int keep_n);
 
 /* ── expr.c ── */
 bool try_affine_sumavg_input(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
                              ray_t** out_vec, agg_affine_t* out_affine);
 bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
                                  agg_linear_t* out_plan);
+bool try_prod_sumavg_input_f64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
+                               agg_prod_t* out);
 bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out);
 ray_t* expr_eval_full(const ray_expr_t* expr, int64_t nrows);
+
+/* Fused predicate→selection (skips the full BOOL vec).
+ *
+ * Compiles and evaluates `pred` in selection-output mode (per-task rowsel
+ * builders dispatched over [0,nrows), then finished into one rowsel block).
+ * Handles the parted/non-BOOL guard and the
+ * large-table fallback (>RAY_POOL_MAX_TASKS tasks → non-morsel-aligned grain).
+ * Returns:
+ *   - non-NULL rowsel block  → the selection (caller installs / reads it).
+ *   - NULL with *all_pass=1  → every row passed (all-pass = "no selection").
+ *   - NULL with *all_pass=0  → disabled / unsupported / OOM — caller falls
+ *                              back to exec_node→ray_rowsel_from_pred unchanged. */
+ray_t* exec_pred_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
+                              bool* all_pass);
+
+/* Per-morsel "fill this morsel's bool" callback used by pred_sel_drive.
+ * Writes out[0..n) (1=selected, 0=not) for the kernel's verdict on global
+ * rows [start, start+n).  Null rows must resolve to 0 (not-selected). */
+typedef void (*pred_sel_fill_fn)(void* ctx, int64_t start, int64_t n,
+                                 uint8_t* out);
+
+/* Generic selection-output driver: dispatch `fill` over [0,nrows) in the
+ * per-task rowsel-builder model, stitch into one block.  Same tri-state
+ * return as exec_pred_to_selection (block / NULL+all_pass / NULL).  Used by
+ * the standalone predicate kernels (exec_in_to_selection). */
+ray_t* pred_sel_drive(int64_t nrows, pred_sel_fill_fn fill, void* fill_ctx,
+                      bool* all_pass);
+
+/* `in` selection-output worker: a root OP_IN over a flat column + literal set,
+ * streaming membership bools straight into a rowsel.  Same tri-state return as
+ * exec_pred_to_selection; NULL+all_pass=0 for any unsupported shape (non-CONST
+ * set, parted/MAPCOMMON/STR column, or OP_NOT_IN) → bool-path fallback. */
+ray_t* exec_in_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
+                            bool* all_pass);
 ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input);
 ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* rhs);
 
@@ -904,6 +957,20 @@ ray_t* ray_wide_minmax_per_group_buf(ray_t* src, uint16_t op,
 
 ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit);
 
+/* Dict-code count-distinct row_gid side-channel: exec_group stashes the
+ * per-result-group dict codes so the count-distinct path can build row_gid
+ * by remapping codes (cheap int) instead of re-hashing strings. */
+typedef struct {
+    int32_t*     result_codes;  /* [n_groups] dict code of each result group */
+    int64_t      n_groups;
+    int64_t      key_sym;
+    const ray_t* tbl;
+    int64_t      n_distinct;
+    uint8_t      valid;
+} ray_dict_cd_t;
+ray_dict_cd_t ray_dict_cd_get(void);
+void ray_dict_cd_clear(void);
+
 /* ── collection.c ── */
 ray_t* distinct_vec_eager(ray_t* x);
 ray_t* reverse_vec_eager(ray_t* x);
@@ -984,6 +1051,20 @@ typedef struct {
      * the source column. */
     uint8_t  wide_key_mask;
     uint8_t  wide_key_esz[8];
+    /* Per wide key, the source element type so resolution can branch:
+     * RAY_GUID → fixed wide_key_esz bytes; RAY_STR → ray_str_t descriptor
+     * (16 B) resolved via the string pool (key_pool[k]) with SSO-aware
+     * hash/eq (inline ≤12 B keys need no pool deref). */
+    int8_t   wide_key_type[8];
+    /* Byte offset of each key within the entry/HT-row key region (relative to
+     * the start of the key region, i.e. entry+8 / row+8).  key_off[n_keys] is
+     * the null-mask slot.  Most keys are 8 B (key_off[k]==k*8); a RAY_STR key
+     * stores its ray_str_t descriptor INLINE (16 B) so probe/rehash compare it
+     * cache-locally instead of chasing key_data[k]+row*16 in the source column.
+     * key_inline_str bit k set iff key k stores an inline 16 B STR descriptor. */
+    uint16_t key_off[9];
+    uint16_t key_region;       /* total key region bytes = key_off[n_keys] + 8 */
+    uint8_t  key_inline_str;   /* bitset: key k is an inline STR descriptor */
 } ght_layout_t;
 
 typedef struct {
@@ -998,6 +1079,9 @@ typedef struct {
      * group_probe_entry / group_ht_rehash to resolve row-indexed
      * wide keys. */
     void*        key_data[8];
+    /* String pool base per wide STR key (NULL otherwise) — paired with
+     * key_data[k] (the ray_str_t descriptor array) for SSO-aware resolve. */
+    const void*  key_pool[8];
     ray_t*        _h_slots;
     ray_t*        _h_rows;
     uint8_t       oom;        /* set by group_probe_entry on grow failure */

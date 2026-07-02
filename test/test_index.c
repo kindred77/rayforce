@@ -272,32 +272,23 @@ static test_result_t test_index_hash_attach_drop(void) {
     ray_index_t* ix = ray_index_payload(w->index);
     TEST_ASSERT_EQ_I((int)ix->kind, RAY_IDX_HASH);
     TEST_ASSERT_EQ_I(ix->u.hash.n_keys, 6);
+    TEST_ASSERT_EQ_I(ix->u.hash.n_groups, 4);  /* {7,3,9,1} */
     TEST_ASSERT_NOT_NULL(ix->u.hash.table);
-    TEST_ASSERT_NOT_NULL(ix->u.hash.chain);
-    TEST_ASSERT_EQ_I(ix->u.hash.chain->len, 6);
+    TEST_ASSERT_NOT_NULL(ix->u.hash.gkeys);
+    TEST_ASSERT_NOT_NULL(ix->u.hash.offs);
+    TEST_ASSERT_NOT_NULL(ix->u.hash.rows);
+    TEST_ASSERT_EQ_I(ix->u.hash.rows->len, 6);
+    TEST_ASSERT_EQ_I(ix->u.hash.offs->len, 5);
 
-    /* Walk the chain for key 7: must find rids 0 and 2 (both store 7). */
-    int64_t mask = (int64_t)ix->u.hash.mask;
-    int64_t* tbl = (int64_t*)ray_data(ix->u.hash.table);
-    int64_t* chn = (int64_t*)ray_data(ix->u.hash.chain);
-    /* Inline-recompute the same hash as the builder (numeric_key_word for I64
-     * is the raw 64-bit value, then mix64). */
-    uint64_t h = (uint64_t)7;
-    h ^= h >> 30; h *= 0xbf58476d1ce4e5b9ULL;
-    h ^= h >> 27; h *= 0x94d049bb133111ebULL;
-    h ^= h >> 31;
-    int64_t slot = (int64_t)(h & (uint64_t)mask);
-    int found_at[8] = { 0 };
-    int n_found = 0;
-    for (int64_t rid = tbl[slot] - 1; rid >= 0 && n_found < 8;
-         rid = chn[rid] - 1) {
-        int64_t val;
-        memcpy(&val, (char*)ray_data(w) + rid * 8, 8);
-        if (val == 7) found_at[n_found++] = (int)rid;
-    }
-    TEST_ASSERT_EQ_I(n_found, 2);
-    TEST_ASSERT_TRUE((found_at[0] == 0 && found_at[1] == 2) ||
-                     (found_at[0] == 2 && found_at[1] == 0));
+    /* CSR slice for key 7: rows 0 and 2 (both store 7), ascending. */
+    const int64_t* grows = NULL;
+    int64_t gn = 0;
+    TEST_ASSERT_EQ_I(ray_index_hash_group(w, 7, &grows, &gn), 1);
+    TEST_ASSERT_EQ_I(gn, 2);
+    TEST_ASSERT_EQ_I(grows[0], 0);
+    TEST_ASSERT_EQ_I(grows[1], 2);
+    /* Absent key → provable miss. */
+    TEST_ASSERT_EQ_I(ray_index_hash_group(w, 42, &grows, &gn), 0);
 
     ray_index_drop(&w);
     aux_snap_t after = snap_take(w);
@@ -1046,13 +1037,15 @@ static test_result_t test_index_retain_payload_direct(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_hash(&w)));
     ray_index_t* ix_hash = ray_index_payload(w->index);
 
-    /* Directly call ray_index_retain_payload with a HASH kind index.
-     * This covers lines 211-216 (retain table/chain). */
+    /* Directly call ray_index_retain_payload with a HASH kind index
+     * (retains all four CSR children). */
     ray_index_retain_payload(ix_hash);
-    /* The table and chain now have rc incremented by 1.
+    /* The children now have rc incremented by 1.
      * Decrement them back to avoid leaking. */
     ray_release(ix_hash->u.hash.table);
-    ray_release(ix_hash->u.hash.chain);
+    ray_release(ix_hash->u.hash.gkeys);
+    ray_release(ix_hash->u.hash.offs);
+    ray_release(ix_hash->u.hash.rows);
 
     /* Drop the hash index, then attach sort and bloom for their retain paths. */
     ray_index_drop(&w);
@@ -1833,12 +1826,10 @@ static test_result_t test_index_has_fn_null(void) {
 static test_result_t test_index_release_payload_null_ptrs(void) {
     ray_heap_init();
 
-    /* Hash with NULL table and chain. */
+    /* Hash with all-NULL CSR children. */
     ray_index_t ix_hash;
     memset(&ix_hash, 0, sizeof(ix_hash));
     ix_hash.kind = RAY_IDX_HASH;
-    ix_hash.u.hash.table = NULL;
-    ix_hash.u.hash.chain = NULL;
     ray_index_release_payload(&ix_hash);  /* Should be safe no-op. */
 
     /* Sort with NULL perm. */
@@ -1870,12 +1861,10 @@ static test_result_t test_index_release_payload_null_ptrs(void) {
 static test_result_t test_index_retain_payload_null_ptrs(void) {
     ray_heap_init();
 
-    /* Hash with NULL table and chain — the if checks must skip retain. */
+    /* Hash with all-NULL CSR children — the if checks must skip retain. */
     ray_index_t ix_hash;
     memset(&ix_hash, 0, sizeof(ix_hash));
     ix_hash.kind = RAY_IDX_HASH;
-    ix_hash.u.hash.table = NULL;
-    ix_hash.u.hash.chain = NULL;
     ray_index_retain_payload(&ix_hash);
 
     /* Sort with NULL perm. */
@@ -2327,16 +2316,18 @@ static test_result_t test_index_fn_error_propagation(void) {
     int64_t s = ray_sym_intern("test", 4);
     v = ray_vec_append(v, &s);
 
-    /* All four fn wrappers should return an error for SYM vec. */
+    /* zone/sort/bloom reject SYM; hash now accepts SYM (domain-id hash index). */
     ray_retain(v);
     ray_t* r1 = ray_idx_zone_fn(v);
     TEST_ASSERT_TRUE(RAY_IS_ERR(r1));
     ray_error_free(r1);
 
+    /* hash on SYM now succeeds — verify the result carries an index. */
     ray_retain(v);
     ray_t* r2 = ray_idx_hash_fn(v);
-    TEST_ASSERT_TRUE(RAY_IS_ERR(r2));
-    ray_error_free(r2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r2));
+    TEST_ASSERT_TRUE(ray_index_has(r2));
+    ray_release(r2);
 
     ray_retain(v);
     ray_t* r3 = ray_idx_sort_fn(v);
@@ -2468,7 +2459,7 @@ static test_result_t test_index_attach_atom_error(void) {
     PASS();
 }
 
-/* ─── I64 hash with all-same values (chains build up in single bucket) ─── */
+/* ─── I64 hash with all-same values (one group holding every row) ─────── */
 
 static test_result_t test_index_hash_collisions(void) {
     ray_heap_init();
@@ -2480,15 +2471,15 @@ static test_result_t test_index_hash_collisions(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     ray_index_t* ih = ray_index_payload(w->index);
     TEST_ASSERT_EQ_I(ih->u.hash.n_keys, 5);
+    TEST_ASSERT_EQ_I(ih->u.hash.n_groups, 1);
 
-    /* Verify chain links exist — all 5 rows hash to the same bucket. */
-    int64_t* chn = (int64_t*)ray_data(ih->u.hash.chain);
-    int chain_links = 0;
-    for (int64_t i = 0; i < 5; i++) {
-        if (chn[i] != 0) chain_links++;
-    }
-    /* At least 4 rows should chain (first becomes head, rest chain). */
-    TEST_ASSERT_TRUE(chain_links >= 4);
+    /* One CSR group holding rows 0..4 in ascending order. */
+    const int64_t* grows = NULL;
+    int64_t gn = 0;
+    TEST_ASSERT_EQ_I(ray_index_hash_group(w, 5, &grows, &gn), 1);
+    TEST_ASSERT_EQ_I(gn, 5);
+    for (int64_t i = 0; i < 5; i++)
+        TEST_ASSERT_EQ_I(grows[i], i);
 
     ray_release(w);
     ray_heap_destroy();
@@ -3596,14 +3587,42 @@ static test_result_t test_index_hash_eq_rowsel_grow_buffer(void) {
     PASS();
 }
 
-/* All rows in a single morsel match → ALL flag set, no idx[] entries.
- * Need every row in some segment to equal the same value; we'll use a
- * column shorter than one morsel so n_segs=1 and seg_end-seg_start = n.
- * For mcnt to count as ALL, pc must equal seg_end - seg_start. */
+/* All rows in one morsel match → that segment gets the ALL flag, no idx[]
+ * entries.  The key must stay SPARSE overall (a dense key aborts to the
+ * scan path — see the dense_aborts test below), so the matching morsel
+ * sits inside a much larger column of distinct values: segment 0 is ALL,
+ * the rest are NONE. */
 static test_result_t test_index_hash_eq_rowsel_all_segment(void) {
     ray_heap_init();
-    /* 1024 rows all equal to 7 → one morsel, ALL flag. */
-    int64_t n = RAY_MORSEL_ELEMS;  /* 1024 */
+    int64_t m = RAY_MORSEL_ELEMS;  /* 1024 */
+    int64_t n = 128 * m;           /* keep the key well under the dense-abort budget (n/64) */
+    ray_t* v = ray_vec_new(RAY_I64, n);
+    for (int64_t i = 0; i < n; i++) {
+        int64_t x = (i < m) ? 7 : 1000 + i;
+        v = ray_vec_append(v, &x);
+    }
+    ray_t* w = v;
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_hash(&w)));
+
+    ray_t* sel = ray_index_hash_eq_rowsel(w, 7);
+    TEST_ASSERT_NOT_NULL(sel);
+    TEST_ASSERT_EQ_I(rowsel_count_pass(sel), m);
+    uint8_t* fl = ray_rowsel_flags(sel);
+    TEST_ASSERT_EQ_I((int)fl[0], RAY_SEL_ALL);
+    TEST_ASSERT_EQ_I((int)fl[1], RAY_SEL_NONE);
+
+    ray_rowsel_release(sel);
+    ray_release(w);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* Dense key: when one key covers a large fraction of the column the probe
+ * must ABORT (return NULL) so the caller falls back to the SIMD scan — the
+ * scattered chain walk loses to the scan at that density. */
+static test_result_t test_index_hash_eq_rowsel_dense_aborts(void) {
+    ray_heap_init();
+    int64_t n = RAY_MORSEL_ELEMS;  /* 1024, all one value → maximally dense */
     ray_t* v = ray_vec_new(RAY_I64, n);
     for (int64_t i = 0; i < n; i++) {
         int64_t x = 7;
@@ -3613,12 +3632,8 @@ static test_result_t test_index_hash_eq_rowsel_all_segment(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(ray_index_attach_hash(&w)));
 
     ray_t* sel = ray_index_hash_eq_rowsel(w, 7);
-    TEST_ASSERT_NOT_NULL(sel);
-    TEST_ASSERT_EQ_I(rowsel_count_pass(sel), n);
-    uint8_t* fl = ray_rowsel_flags(sel);
-    TEST_ASSERT_EQ_I((int)fl[0], RAY_SEL_ALL);
+    TEST_ASSERT(sel == NULL, "dense key must abort to the scan path");
 
-    ray_rowsel_release(sel);
     ray_release(w);
     ray_heap_destroy();
     PASS();
@@ -3800,6 +3815,7 @@ const test_entry_t index_entries[] = {
     { "index/hash_eq_rowsel_multi_segment",  test_index_hash_eq_rowsel_multi_segment, NULL, NULL },
     { "index/hash_eq_rowsel_grow_buffer",    test_index_hash_eq_rowsel_grow_buffer,   NULL, NULL },
     { "index/hash_eq_rowsel_all_segment",    test_index_hash_eq_rowsel_all_segment,   NULL, NULL },
+    { "index/hash_eq_rowsel_dense_aborts",   test_index_hash_eq_rowsel_dense_aborts,  NULL, NULL },
     { "index/hash_eq_rowsel_with_nulls",     test_index_hash_eq_rowsel_with_nulls,    NULL, NULL },
     { "index/hash_eq_rowsel_stale",          test_index_hash_eq_rowsel_stale,         NULL, NULL },
     { NULL, NULL, NULL, NULL },

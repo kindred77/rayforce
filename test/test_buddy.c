@@ -26,6 +26,8 @@
 #include <rayforce.h>
 #include <rayforce.h>
 #include "mem/heap.h"
+#include "core/platform.h"
+#include "ops/ops.h"          /* RAY_ORDER_MIN */
 #include <string.h>
 #include <stdlib.h>
 #include <stdatomic.h>
@@ -512,9 +514,58 @@ static test_result_t test_warm_first_local_free(void) {
     PASS();
 }
 
+/* ---- ray_pool_of: oversized-pool interior must not be mis-identified ---- */
+/* Regression for a single-process SIGSEGV in ray_heap_gc -> heap_flush_foreign
+ * -> heap_coalesce.  A foreign block sitting on a 32MB sub-boundary INSIDE an
+ * oversized (>32MB) pool was mis-resolved by ray_pool_of to itself instead of
+ * the real pool header one or more 32MB strides below it.  The fast path and
+ * the oversized early-return trusted the overlaid pool_order byte WITHOUT the
+ * full header signature (order==RAY_ORDER_MIN, mmod==0, rc==1) that the
+ * downward walk enforces.  The bogus oversized pool_order then made
+ * heap_coalesce walk a buddy past the end of the real mapping and fault at
+ * pool_base + 0x14 (the rc field).  Build the exact shape and assert the
+ * resolution lands on the true header. */
+static test_result_t test_pool_of_oversized_interior(void) {
+    const size_t stride = BSIZEOF(RAY_HEAP_POOL_ORDER);        /* 32 MB */
+    const uint8_t po    = RAY_HEAP_POOL_ORDER + 1;            /* order 26 */
+    const size_t  psize = BSIZEOF(po);                        /* 64 MB */
+
+    /* 32MB-aligned 64MB region — same self-alignment real pools use. */
+    void* region = ray_vm_alloc_aligned(psize, stride);
+    TEST_ASSERT_NOT_NULL(region);
+    TEST_ASSERT_EQ_U((uintptr_t)region & (stride - 1), 0);
+
+    /* Real pool header at offset 0: full valid signature. */
+    memset(region, 0, 64);
+    ray_t* hdr = (ray_t*)region;
+    hdr->order = RAY_ORDER_MIN;
+    hdr->mmod  = 0;
+    hdr->rc    = 1;
+    ray_pool_hdr_t* ph = (ray_pool_hdr_t*)region;
+    ph->pool_order = po;
+    ph->heap_id    = 0;
+    ph->vm_base    = region;
+
+    /* Interior block at +32MB: a freed buddy whose overlaid pool_order byte
+     * (offset 2) happens to alias a plausible oversized order — the trap. */
+    ray_t* interior = (ray_t*)((char*)region + stride);
+    memset(interior, 0, 64);
+    interior->order = RAY_HEAP_POOL_ORDER;   /* 25 — NOT RAY_ORDER_MIN */
+    interior->mmod  = 0;
+    interior->rc    = 0;                      /* free */
+    ((ray_pool_hdr_t*)interior)->pool_order = po;   /* aliasing value in (25,38] */
+
+    ray_pool_hdr_t* got = ray_pool_of(interior);
+    TEST_ASSERT_EQ_U((uintptr_t)got, (uintptr_t)region);
+
+    ray_vm_free(region, psize);
+    PASS();
+}
+
 /* ---- Suite definition -------------------------------------------------- */
 
 const test_entry_t buddy_entries[] = {
+    { "buddy/pool_of_oversized_interior", test_pool_of_oversized_interior, NULL, NULL },
     { "buddy/alloc_basic", test_alloc_basic, buddy_setup, buddy_teardown },
     { "buddy/alloc_small_atom", test_alloc_small_atom, buddy_setup, buddy_teardown },
     { "buddy/alloc_medium_vec", test_alloc_medium_vector, buddy_setup, buddy_teardown },

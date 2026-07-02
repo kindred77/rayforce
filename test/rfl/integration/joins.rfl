@@ -290,3 +290,65 @@
 (sum (at (inner-join [id] LJsmall RJbig) 'val)) -- 36
 ;; 200 back-to-back radix joins — a single dropped row anywhere shows as < 1600.
 (sum (map (fn [_] (count (inner-join [id] LJsmall RJbig))) (til 200))) -- 1600
+
+;; ── regression: asof / window-join must carry an adaptive-width SYM equality
+;; key from a splayed (loaded) source.  Splayed SYM columns are W32; the output
+;; gather in exec_window_join used a fixed W64 (ray_type_sizes[RAY_SYM]) stride,
+;; reading ids at the wrong offset and emitting the empty symbol.  Round-trip a
+;; table through splayed storage (→ W32 FILE-domain sym) then join it.
+(.sys.exec "rm -rf /tmp/rfl_asof_symw")
+(set Asw (table [sym time bid] (list [AAPL AAPL MSFT] [100 200 150] [1 2 3])))
+(.db.splayed.set "/tmp/rfl_asof_symw/t" Asw "/tmp/rfl_asof_symw/sym")
+(set Asl (.db.splayed.get "/tmp/rfl_asof_symw/t" "/tmp/rfl_asof_symw/sym"))
+;; asof-join: the left SYM key survives (was [' ' '] before the fix)
+(at (asof-join [sym time] (select {from: Asl sym: sym time: time bid: bid}) (select {from: Asl sym: sym time: time b2: bid})) 'sym) -- [AAPL AAPL MSFT]
+;; window-join: same executor (OP_WINDOW_JOIN), same key-gather path
+(at (window-join [sym time] (map-left + [-50 50] (at Asl 'time)) (select {from: Asl sym: sym time: time}) (select {from: Asl sym: sym time: time bid: bid}) {mb: (min bid)}) 'sym) -- [AAPL AAPL MSFT]
+
+;; ── asof strategy differential: cursor-merge / collect+binsearch / sort-merge ──
+;; The asof exec picks its strategy from the right side's time layout:
+;; globally sorted time -> hash-group + cursor merge; per-group monotone
+;; (but globally unsorted) -> hash-group + binary search; per-group
+;; DESCENDING time -> the sort-merge fallback.  asof-join is semantically
+;; order-independent in the right rows, so the same rows in all three
+;; layouts must produce identical results.
+(set L (table [sym time qty] (list ['a 'b 'a 'c 'a] [5 5 2 1 9] [1 2 3 4 5])))
+;; globally time-sorted -> cursor merge
+(set RG (table [sym time px] (list ['a 'b 'a 'b 'a] [1 2 4 6 8] [10.0 12.0 11.0 13.0 14.0])))
+;; per-group monotone, globally unsorted -> collect + binary search
+(set RS (table [sym time px] (list ['a 'a 'b 'b 'a] [1 4 2 6 8] [10.0 11.0 12.0 13.0 14.0])))
+;; per-group descending -> sort-merge fallback
+(set RU (table [sym time px] (list ['a 'b 'a 'a 'b] [8 6 4 1 2] [14.0 13.0 11.0 10.0 12.0])))
+(at (asof-join ['sym 'time] L RG) 'px) -- [11.0 12.0 10.0 0N 14.0]
+(asof-join ['sym 'time] L RG) -- (asof-join ['sym 'time] L RS)
+(asof-join ['sym 'time] L RG) -- (asof-join ['sym 'time] L RU)
+;; multi-eq-key across the same three layouts (second key breaks LUT groups)
+(set L2 (table [sym ex time qty] (list ['a 'a 'b] ['X 'Y 'X] [5 5 5] [1 2 3])))
+(set R2G (table [sym ex time px] (list ['a 'a 'a 'b] ['X 'Y 'X 'X] [1 2 4 3] [10.0 20.0 11.0 30.0])))
+(set R2U (table [sym ex time px] (list ['a 'a 'a 'b] ['X 'X 'Y 'X] [4 1 2 3] [11.0 10.0 20.0 30.0])))
+(at (asof-join ['sym 'ex 'time] L2 R2G) 'px) -- [11.0 20.0 30.0]
+(asof-join ['sym 'ex 'time] L2 R2G) -- (asof-join ['sym 'ex 'time] L2 R2U)
+;; tie times: the LAST right row with time <= t wins, in every strategy
+(set LT (table [sym time q] (list ['a] [5] [1])))
+(set RT (table [sym time px] (list ['a 'a 'a] [5 5 5] [1.0 2.0 3.0])))
+(at (asof-join ['sym 'time] LT RT) 'px) -- [3.0]
+;; multi-eq-key with a CSR grouped index on the FIRST key + globally sorted
+;; time -> the slice-walk cursor-merge variant; same rows unindexed take the
+;; full-pass variants.  All must agree.
+(set R2I (table [sym ex time px] (list (.attr.set 'grouped ['a 'a 'b 'a]) ['X 'Y 'X 'X] [1 2 3 4] [10.0 20.0 30.0 11.0])))
+(set R2P (table [sym ex time px] (list ['a 'a 'b 'a] ['X 'Y 'X 'X] [1 2 3 4] [10.0 20.0 30.0 11.0])))
+(at (asof-join ['sym 'ex 'time] L2 R2I) 'px) -- [11.0 20.0 30.0]
+(asof-join ['sym 'ex 'time] L2 R2I) -- (asof-join ['sym 'ex 'time] L2 R2P)
+;; left key absent from the index (sym 'z) -> null fill, not a crash
+(set L2Z (table [sym ex time qty] (list ['z 'a] ['X 'X] [5 5] [1 2])))
+(at (asof-join ['sym 'ex 'time] L2Z R2I) 'px) -- [0N 11.0]
+;; per-slice-verified asof index paths (parted layout: right sorted by
+;; (key,time), NOT globally time-sorted).  Indexed == unindexed.
+(set RSI (table [sym time px] (list (.attr.set 'grouped ['a 'a 'b 'b 'a]) [1 4 2 6 8] [10.0 11.0 12.0 13.0 14.0])))
+(asof-join ['sym 'time] L RSI) -- (asof-join ['sym 'time] L RS)
+(set R2SI (table [sym ex time px] (list (.attr.set 'grouped ['a 'a 'a 'b]) ['X 'Y 'X 'X] [1 2 4 3] [10.0 20.0 11.0 30.0])))
+(at (asof-join ['sym 'ex 'time] L2 R2SI) 'px) -- [11.0 20.0 30.0]
+;; per-group DESCENDING time with an index: slice verify must reject and
+;; the sort-merge fallback must still produce the correct result.
+(set R2UI (table [sym ex time px] (list (.attr.set 'grouped ['a 'a 'a 'b]) ['X 'X 'Y 'X] [4 1 2 3] [11.0 10.0 20.0 30.0])))
+(asof-join ['sym 'ex 'time] L2 R2UI) -- (asof-join ['sym 'ex 'time] L2 R2G)

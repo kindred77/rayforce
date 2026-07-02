@@ -1,0 +1,55 @@
+;; Persisted SYM hash index: a grouped sym column keeps its index across a
+;; splayed save/reload, the domain resolves, and (== sym X) is correct.
+;;
+;; CRITICAL: the on-disk column is re-encoded to FILE-LOCAL domain positions
+;; (ray_col_save_sym_encoded), which differ from the in-memory column's domain
+;; ids.  The persisted index must therefore be keyed in FILE-LOCAL space so the
+;; reload-time probe (which resolves the query symbol to a file-local position)
+;; hits the right bucket.  To force that divergence — and to force the exec.c
+;; OP_FILTER hash-consult site (count(select) is intercepted BEFORE it) — this
+;; test (a) pollutes the global sym domain first so a/b/c get large runtime ids
+;; that are NOT their file-local positions, and (b) probes via sum(at(select)).
+(.sys.exec "rm -rf /tmp/rfl_sym_idx_persist")
+
+;; (a) pollute the global domain: a,b,c now intern to ids well past 1,2,3.
+(set junk ['z0 'z1 'z2 'z3 'z4 'z5 'z6 'z7 'z8 'z9 'p 'q 'r 's 't 'u 'w 'x 'y])
+
+(set T (table [sym v] (list (.attr.set 'grouped ['a 'b 'a 'c]) [10 20 30 40])))
+(.db.splayed.set "/tmp/rfl_sym_idx_persist/" T)
+(set S (.db.splayed.get "/tmp/rfl_sym_idx_persist/"))
+
+;; index persisted + re-attached on load
+(.idx.has? (at S 'sym)) -- true
+(at (.idx.info (at S 'sym)) 'kind) -- 'hash
+;; domain intact (cells resolve to their symbols)
+(at (at S 'sym) 0) -- 'a
+(at (at S 'sym) 3) -- 'c
+
+;; (b) filter via the exec.c OP_FILTER hash-consult site (sum+at+select).
+;; a at rows 0,2 -> v=10+30=40 ; b at row 1 -> 20 ; c at row 3 -> 40 ; z absent -> 0.
+;; Under the pre-fix (in-memory-domain-keyed) index these all return 0.
+(sum (at (select {from: S where: (== sym 'a)}) 'v)) -- 40
+(sum (at (select {from: S where: (== sym 'b)}) 'v)) -- 20
+(sum (at (select {from: S where: (== sym 'c)}) 'v)) -- 40
+(count (at (select {from: S where: (== sym 'z)}) 'v)) -- 0
+
+;; persisted-index result equals a fresh runtime-indexed in-memory control
+(sum (at (select {from: S where: (== sym 'a)}) 'v)) -- (sum (at (select {from: T where: (== sym 'a)}) 'v))
+
+;; count(select) path (scan) stays correct too
+(count (select {from: S where: (== sym 'a)})) -- 2
+(count (select {from: S where: (== sym 'z)})) -- 0
+
+;; drop the reloaded index → domain still resolves, filter still correct (scan)
+(set S2 (.attr.drop (at S 'sym)))
+(.idx.has? S2) -- false
+(at S2 0) -- 'a
+(where (== S2 'a)) -- [0 2]
+
+;; `in` filter through the persisted index: the set literal interns in the
+;; polluted GLOBAL domain while the index is keyed in file-local positions —
+;; each element must be resolved through the column's own domain.
+;; a rows 0,2 (v=10,30) + c row 3 (v=40) → 80
+(sum (at (select {from: S where: (in sym ['a 'c])}) 'v)) -- 80
+(sum (at (select {from: S where: (in sym ['b 'z])}) 'v)) -- 20
+(count (at (select {from: S where: (in sym ['z 'q])}) 'v)) -- 0

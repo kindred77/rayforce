@@ -632,9 +632,9 @@ static test_result_t test_str_vec_null(void) {
     v = ray_str_vec_append(v, "world", 5);
     TEST_ASSERT_EQ_I(ray_len(v), 3);
 
-    /* Mark row 1 as null */
+    /* STR has no null: set_null writes "" — the cell is never null */
     ray_vec_set_null(v, 1, true);
-    TEST_ASSERT_TRUE(ray_vec_is_null(v, 1));
+    TEST_ASSERT_FALSE(ray_vec_is_null(v, 1));
     TEST_ASSERT_FALSE(ray_vec_is_null(v, 0));
     TEST_ASSERT_FALSE(ray_vec_is_null(v, 2));
 
@@ -658,7 +658,7 @@ static test_result_t test_str_vec_null_pooled(void) {
 
     /* Set null on row 1 — must not corrupt str_pool */
     ray_vec_set_null(v, 1, true);
-    TEST_ASSERT_TRUE(ray_vec_is_null(v, 1));
+    TEST_ASSERT_FALSE(ray_vec_is_null(v, 1));
     TEST_ASSERT_FALSE(ray_vec_is_null(v, 0));
     TEST_ASSERT_FALSE(ray_vec_is_null(v, 2));
 
@@ -1435,6 +1435,148 @@ static test_result_t test_str_upper_large_string(void) {
     PASS();
 }
 
+/* ---- Empty-string EQ/NE fast-path correctness guard ------------------- */
+
+static test_result_t test_str_ne_empty(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    /* ["" "a" "" "bc"]  != ""  ->  [0 1 0 1] */
+    ray_t* col = ray_vec_new(RAY_STR, 4);
+    col = ray_str_vec_append(col, "", 0);
+    col = ray_str_vec_append(col, "a", 1);
+    col = ray_str_vec_append(col, "", 0);
+    col = ray_str_vec_append(col, "bc", 2);
+    int64_t nm = ray_sym_intern("s", 1);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, nm, col);
+    ray_release(col);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* sv  = ray_scan(g, "s");
+    ray_op_t* emp = ray_const_str(g, "", 0);
+    ray_op_t* ne  = ray_ne(g, sv, emp);
+    ray_t* r = ray_execute(g, ne);
+
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->len, 4);
+    uint8_t* b = (uint8_t*)ray_data(r);
+    TEST_ASSERT_EQ_I(b[0], 0);
+    TEST_ASSERT_EQ_I(b[1], 1);
+    TEST_ASSERT_EQ_I(b[2], 0);
+    TEST_ASSERT_EQ_I(b[3], 1);
+    ray_release(r);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+static test_result_t test_str_eq_empty(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    /* ["" "a" "" "bc"]  == ""  ->  [1 0 1 0] */
+    ray_t* col = ray_vec_new(RAY_STR, 4);
+    col = ray_str_vec_append(col, "", 0);
+    col = ray_str_vec_append(col, "a", 1);
+    col = ray_str_vec_append(col, "", 0);
+    col = ray_str_vec_append(col, "bc", 2);
+    int64_t nm = ray_sym_intern("s", 1);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, nm, col);
+    ray_release(col);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* sv  = ray_scan(g, "s");
+    ray_op_t* emp = ray_const_str(g, "", 0);
+    ray_op_t* eq  = ray_eq(g, sv, emp);
+    ray_t* r = ray_execute(g, eq);
+
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->len, 4);
+    uint8_t* b = (uint8_t*)ray_data(r);
+    TEST_ASSERT_EQ_I(b[0], 1);
+    TEST_ASSERT_EQ_I(b[1], 0);
+    TEST_ASSERT_EQ_I(b[2], 1);
+    TEST_ASSERT_EQ_I(b[3], 0);
+    ray_release(r);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+static test_result_t test_str_empty_left(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    /* ""  != ["" "a" "" "bc"]  ->  [0 1 0 1]  (scalar on left, vec=r_elems path) */
+    ray_t* col = ray_vec_new(RAY_STR, 4);
+    col = ray_str_vec_append(col, "", 0);
+    col = ray_str_vec_append(col, "a", 1);
+    col = ray_str_vec_append(col, "", 0);
+    col = ray_str_vec_append(col, "bc", 2);
+    int64_t nm = ray_sym_intern("s", 1);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, nm, col);
+    ray_release(col);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* sv  = ray_scan(g, "s");
+    ray_op_t* emp = ray_const_str(g, "", 0);
+    ray_op_t* ne  = ray_ne(g, emp, sv);   /* scalar on LEFT */
+    ray_t* r = ray_execute(g, ne);
+
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->len, 4);
+    uint8_t* b = (uint8_t*)ray_data(r);
+    TEST_ASSERT_EQ_I(b[0], 0);
+    TEST_ASSERT_EQ_I(b[1], 1);
+    TEST_ASSERT_EQ_I(b[2], 0);
+    TEST_ASSERT_EQ_I(b[3], 1);
+    ray_release(r);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+static test_result_t test_str_ne_nonempty(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    /* ["" "a" "" "bc"]  != "a"  ->  [1 0 1 1]  (non-empty scalar must NOT take fast path) */
+    ray_t* col = ray_vec_new(RAY_STR, 4);
+    col = ray_str_vec_append(col, "", 0);
+    col = ray_str_vec_append(col, "a", 1);
+    col = ray_str_vec_append(col, "", 0);
+    col = ray_str_vec_append(col, "bc", 2);
+    int64_t nm = ray_sym_intern("s", 1);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, nm, col);
+    ray_release(col);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* sv  = ray_scan(g, "s");
+    ray_op_t* sc  = ray_const_str(g, "a", 1);
+    ray_op_t* ne  = ray_ne(g, sv, sc);
+    ray_t* r = ray_execute(g, ne);
+
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->len, 4);
+    uint8_t* b = (uint8_t*)ray_data(r);
+    TEST_ASSERT_EQ_I(b[0], 1);
+    TEST_ASSERT_EQ_I(b[1], 0);
+    TEST_ASSERT_EQ_I(b[2], 1);
+    TEST_ASSERT_EQ_I(b[3], 1);
+    ray_release(r);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 /* ---- Suite definition -------------------------------------------------- */
 
 static test_result_t test_str_t_hash_inline(void) {
@@ -1534,10 +1676,10 @@ static test_result_t test_str_vec_concat_nulls(void) {
 
     /* a's nulls preserved */
     TEST_ASSERT_FALSE(ray_vec_is_null(c, 0));
-    TEST_ASSERT_TRUE(ray_vec_is_null(c, 1));   /* a[1] was null */
+    TEST_ASSERT_FALSE(ray_vec_is_null(c, 1));   /* a[1] was null */
     TEST_ASSERT_FALSE(ray_vec_is_null(c, 2));
     /* b's nulls preserved at offset a->len */
-    TEST_ASSERT_TRUE(ray_vec_is_null(c, 3));    /* b[0] was null */
+    TEST_ASSERT_FALSE(ray_vec_is_null(c, 3));    /* b[0] was null */
     TEST_ASSERT_FALSE(ray_vec_is_null(c, 4));
 
     ray_release(c);
@@ -1563,7 +1705,7 @@ static test_result_t test_str_vec_slice_null(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(s));
 
     /* Slice index 0 = parent index 1 = null */
-    TEST_ASSERT_TRUE(ray_vec_is_null(s, 0));
+    TEST_ASSERT_FALSE(ray_vec_is_null(s, 0));
     /* Slice index 1 = parent index 2 = not null */
     TEST_ASSERT_FALSE(ray_vec_is_null(s, 1));
 
@@ -1634,6 +1776,81 @@ static test_result_t test_str_vec_cow_set(void) {
     PASS();
 }
 
+static test_result_t test_str_vec_from_parts(void) {
+    ray_heap_init();
+    const char* ptrs[] = {"",      "abc",  "this_is_long_enough_to_pool", "x",  NULL};
+    uint32_t    lens[] = {0,       3,      (uint32_t)27,                  1,    0};
+    uint8_t     nulls[]= {0,       0,      0,                             0,    1};
+    ray_t* v = ray_str_vec_from_parts(ptrs, lens, nulls, 5);
+    TEST_ASSERT_NOT_NULL(v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    TEST_ASSERT_EQ_I(v->len, 5);
+    size_t l; const char* p;
+    p = ray_str_vec_get(v, 0, &l); TEST_ASSERT_EQ_U(l, 0);
+    p = ray_str_vec_get(v, 1, &l); TEST_ASSERT_EQ_U(l, 3); TEST_ASSERT_EQ_I(memcmp(p,"abc",3), 0);
+    p = ray_str_vec_get(v, 2, &l); TEST_ASSERT_EQ_U(l, 27); TEST_ASSERT_EQ_I(memcmp(p,"this_is_long_enough_to_pool",27), 0);
+    p = ray_str_vec_get(v, 3, &l); TEST_ASSERT_EQ_U(l, 1); TEST_ASSERT_EQ_I(p[0],'x');
+    /* STR has no null distinct from "" (kdb+ model) — null stored as empty string */
+    p = ray_str_vec_get(v, 4, &l); TEST_ASSERT_EQ_U(l, 0); (void)p;
+    ray_release(v);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* 12-byte string == RAY_STR_INLINE_MAX → must inline; 13-byte → must pool */
+static test_result_t test_str_vec_from_parts_boundary(void) {
+    ray_heap_init();
+    const char* s12 = "abcdefghijkl";   /* exactly 12 bytes */
+    const char* s13 = "abcdefghijklm";  /* exactly 13 bytes — must pool */
+    const char* ptrs[] = { s12, s13 };
+    uint32_t    lens[] = { 12, 13 };
+    ray_t* v = ray_str_vec_from_parts(ptrs, lens, NULL, 2);
+    TEST_ASSERT_NOT_NULL(v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    TEST_ASSERT_EQ_I(v->len, 2);
+    size_t l; const char* p;
+    p = ray_str_vec_get(v, 0, &l);
+    TEST_ASSERT_EQ_U(l, 12);
+    TEST_ASSERT_EQ_I(memcmp(p, s12, 12), 0);
+    /* inline element: no pool should be needed for a 12-byte string */
+    p = ray_str_vec_get(v, 1, &l);
+    TEST_ASSERT_EQ_U(l, 13);
+    TEST_ASSERT_EQ_I(memcmp(p, s13, 13), 0);
+    TEST_ASSERT_NOT_NULL(v->str_pool); /* 13-byte string must use pool */
+    ray_release(v);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* n==0 must return a valid zero-length STR vec with no crash */
+static test_result_t test_str_vec_from_parts_empty(void) {
+    ray_heap_init();
+    ray_t* v = ray_str_vec_from_parts(NULL, NULL, NULL, 0);
+    TEST_ASSERT_NOT_NULL(v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    TEST_ASSERT_EQ_I(v->len, 0);
+    ray_release(v);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* nulls==NULL path: no null array supplied, elements treated as non-null */
+static test_result_t test_str_vec_from_parts_no_nulls(void) {
+    ray_heap_init();
+    const char* ptrs[] = { "hello", "world_long_pooled_str" };
+    uint32_t    lens[] = { 5, 21 };
+    ray_t* v = ray_str_vec_from_parts(ptrs, lens, NULL, 2);
+    TEST_ASSERT_NOT_NULL(v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    TEST_ASSERT_EQ_I(v->len, 2);
+    size_t l; const char* p;
+    p = ray_str_vec_get(v, 0, &l); TEST_ASSERT_EQ_U(l, 5);  TEST_ASSERT_EQ_I(memcmp(p, "hello", 5), 0);
+    p = ray_str_vec_get(v, 1, &l); TEST_ASSERT_EQ_U(l, 21); TEST_ASSERT_EQ_I(memcmp(p, "world_long_pooled_str", 21), 0);
+    ray_release(v);
+    ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t str_entries[] = {
     { "str/ptr_sso", test_str_ptr_sso, str_setup, str_teardown },
     { "str/ptr_long", test_str_ptr_long, str_setup, str_teardown },
@@ -1697,6 +1914,14 @@ const test_entry_t str_entries[] = {
     { "str/substr_i32_vec_len", test_str_substr_i32_vec_len, NULL, NULL },
     { "str/substr_i64_vec_len", test_str_substr_i64_vec_len, NULL, NULL },
     { "str/upper_large_string", test_str_upper_large_string, NULL, NULL },
+    { "str/vec_from_parts", test_str_vec_from_parts, NULL, NULL },
+    { "str/vec_from_parts_boundary", test_str_vec_from_parts_boundary, NULL, NULL },
+    { "str/vec_from_parts_empty", test_str_vec_from_parts_empty, NULL, NULL },
+    { "str/vec_from_parts_no_nulls", test_str_vec_from_parts_no_nulls, NULL, NULL },
+    { "str/ne_empty", test_str_ne_empty, NULL, NULL },
+    { "str/eq_empty", test_str_eq_empty, NULL, NULL },
+    { "str/empty_left", test_str_empty_left, NULL, NULL },
+    { "str/ne_nonempty", test_str_ne_nonempty, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
 

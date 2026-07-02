@@ -1,0 +1,70 @@
+name: Retarget stray PRs
+
+# `master` is release-only: the sole PR it should ever see is the `dev -> master`
+# release PR (title `vX.Y.Z`, validated by Version Guard). `dev` is the default
+# branch, so most contributors already target it — but a few PRs still land on
+# `master` (someone hand-edits the base, or an old fork still defaults to it).
+# Rather than greet them with a cryptic red Version Guard ✗, this job moves the
+# PR to `dev` and explains why.
+#
+# `pull_request_target` (not `pull_request`) is deliberate: it runs in the base
+# repo's context with a write token even for fork PRs, which `pull_request`
+# cannot do. It is safe here *because we never check out or run the PR's code* —
+# we only call the GitHub API. Do not add a checkout of the PR head to this file.
+#
+# NOTE: like every `pull_request*` workflow, the copy that runs is the one on the
+# PR's *base* branch. This file only takes effect for PRs opened against `master`
+# once it has landed on `master` (i.e. after the next release PR merges).
+
+on:
+  pull_request_target:
+    branches: [master]
+    types: [opened, reopened]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  retarget:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Move non-release PRs to dev
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SERVER: ${{ github.server_url }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          set -euo pipefail
+
+          # The legitimate release PR is `dev -> master` from THIS repo. Leave it
+          # alone so Version Guard can validate the title. Everything else that
+          # targets master is a stray and belongs on dev.
+          if [[ "$HEAD_REF" == "dev" && "$HEAD_REPO" == "$REPO" ]]; then
+            echo "PR #$PR is the release PR (dev -> master); leaving as-is."
+            exit 0
+          fi
+
+          echo "Retargeting PR #$PR ($HEAD_REPO:$HEAD_REF) from master to dev."
+          gh pr edit "$PR" --repo "$REPO" --base dev
+
+          # The body is a quoted heredoc (so backticks stay literal). The two sed
+          # passes (a) strip leading indentation so it renders as prose, not a
+          # Markdown code block, and (b) expand __BASE__ to the absolute repo URL —
+          # comment-relative links don't resolve from a PR page.
+          base="$SERVER/$REPO"
+          body="$(sed -e 's/^ *//' -e "s#__BASE__#${base}#g" <<'EOF'
+          👋 Thanks for the contribution! I've **retargeted this PR to `dev`**.
+
+          `master` is release-only — it only receives the `dev -> master` release
+          PR (titled `vX.Y.Z`). All feature and fix work lands on `dev` first and
+          ships to `master` when a release is cut. See
+          [CONTRIBUTING.md](__BASE__/blob/dev/CONTRIBUTING.md) and
+          [RELEASE.md](__BASE__/blob/dev/RELEASE.md).
+
+          No action needed from you — the base branch has been switched.
+          EOF
+          )"
+          gh pr comment "$PR" --repo "$REPO" --body "$body"

@@ -65,12 +65,26 @@ typedef enum {
      * of ray_index_t.u below. */
     RAY_IDX_CHUNK_ZONE = 5,
     RAY_IDX_PART       = 6,
+    /* Per-column string dictionary: an int32 code per row + the distinct
+     * string values (code -> string).  Lets group-by / distinct run on the
+     * cheap integer-code path instead of hashing 16-byte ray_str_t descriptors
+     * and chasing the string pool.  Built at column ingest / splayed save and
+     * persisted inline like the chunk-zone index; the only accelerator index
+     * permitted on RAY_STR (it stores codes alongside the descriptors, leaving
+     * the column's own representation untouched). */
+    RAY_IDX_DICT       = 7,
 } ray_idx_kind_t;
 
 /* Marker bits stored in ray_index_t.markers (block-resident attributes
  * that have no dedicated attrs bit).  sorted lives in attrs (RAY_ATTR_SORTED),
  * not here. */
 #define RAY_MARK_UNIQUE  0x01
+/* Set when this index and its child vecs are passengers in the parent column's
+ * file mapping (restored in-place from the on-disk inline index region).  The
+ * parent's single munmap frees them; ray_release_owned_refs must NOT free a
+ * passenger index by pointer.  Clear = heap-resident index (freed normally),
+ * including a runtime-built index attached to an mmap'd column. */
+#define RAY_MARK_MMAP    0x02
 
 /* The payload stored inside data[] of a RAY_INDEX ray_t. */
 typedef struct {
@@ -89,25 +103,36 @@ typedef struct {
 
     /* Kind-specific payload.  All ray_t* fields are owning refs. */
     union {
-        struct {                /* RAY_IDX_HASH */
-            /* Chained open-addressing.  table[mask+1] holds the head rid+1
-             * for each bucket (0 = empty bucket).  chain[parent->len] holds
-             * the next rid+1 in the same bucket's chain (0 = end of chain).
-             * Lookup: hash key, read table[hash & mask] for head, walk chain
-             * until 0 comparing parent->data[rid] for equality. */
+        struct {                /* RAY_IDX_HASH — CSR grouped layout */
+            /* Open-addressing bucket table over DISTINCT keys plus a CSR
+             * (offsets + contiguous row lists) grouping of the rows:
+             *   table[mask+1]  slot -> group id + 1 (0 = empty bucket)
+             *   gkeys[n_groups]     key value per group (i64-canonical;
+             *                       SYM stores the column-domain id)
+             *   offs[n_groups+1]    rows[] slice bounds per group
+             *   rows[n_keys]        row ids, ASCENDING within each group
+             * Lookup `k`: slot-walk table comparing gkeys[gid] == k; a hit
+             * yields the group's contiguous rows[offs[gid]..offs[gid+1])
+             * slice — group size is O(1), first occurrence is rows[offs[gid]],
+             * and the ascending order is what rowsel builders and the asof
+             * binary search consume directly. */
             ray_t*   table;     /* RAY_I64 vec, capacity entries */
-            ray_t*   chain;     /* RAY_I64 vec, parent->len entries */
+            ray_t*   gkeys;     /* RAY_I64 vec, n_groups entries */
+            ray_t*   offs;      /* RAY_I64 vec, n_groups+1 entries */
+            ray_t*   rows;      /* RAY_I64 vec, n_keys entries */
             uint64_t mask;      /* capacity - 1 (capacity is power of two) */
             int64_t  n_keys;    /* number of non-null rows indexed */
+            int64_t  n_groups;  /* number of distinct keys */
+            int64_t  _pad;      /* keep ray_index_t a 32-byte multiple */
         } hash;
         struct {                /* RAY_IDX_SORT */
             ray_t* perm;        /* RAY_I64 vec, perm[i] = row id at sorted pos i */
         } sort;
         struct {                /* RAY_IDX_ZONE */
-            int64_t min_i;      /* integer min (used when type is int/date/time) */
-            int64_t max_i;      /* integer max */
-            double  min_f;      /* float min (used when type is f32/f64) */
-            double  max_f;      /* float max */
+            /* A column is integer XOR float, so the int and float extrema share
+             * storage (keeps ray_index_t a 32-byte multiple for mmap layout). */
+            union { int64_t min_i; double min_f; }; /* min (int: date/time too) */
+            union { int64_t max_i; double max_f; }; /* max */
             int64_t n_nulls;    /* number of null rows (0 if no nulls) */
         } zone;
         struct {                /* RAY_IDX_BLOOM */
@@ -136,8 +161,25 @@ typedef struct {
             ray_t*  lens;       /* RAY_I64, row count of each part */
             int64_t n_parts;
         } part;
+        struct {                /* RAY_IDX_DICT */
+            /* Both children are RAY_I32 (numeric — the inline persistence stores
+             * them verbatim, no nested str_pool).  The distinct STRING values
+             * are NOT duplicated: first_occ[c] is the parent-column row index of
+             * code c's first occurrence, so code -> string resolves through the
+             * parent column itself (ray_str_vec_get(col, first_occ[c])). */
+            ray_t*   codes;     /* RAY_I32 vec, parent->len entries: code per row */
+            ray_t*   first_occ; /* RAY_I32 vec, n_distinct entries: first-occ row  */
+            int64_t  n_distinct;
+        } dict;
     } u;
 } ray_index_t;
+
+/* On-disk index persistence stores the RAY_INDEX object and its child vecs as
+ * contiguous 32-byte-aligned ray_t blocks mmap'd in place (no serialization).
+ * For the trailing child blocks to stay 32-aligned, the index payload must be a
+ * 32-byte multiple — enforce it so the layout invariant can't silently break. */
+_Static_assert(sizeof(ray_index_t) % 32 == 0,
+               "ray_index_t must be a 32-byte multiple for in-place mmap layout");
 
 /* Inline accessor — returns ray_index_t* for a RAY_INDEX block. */
 static inline ray_index_t* ray_index_payload(ray_t* idx) {
@@ -149,7 +191,7 @@ static inline ray_index_t* ray_index_payload(ray_t* idx) {
 typedef enum {
     IDX_SITE_FILTER_ZONE = 0, IDX_SITE_FILTER_BLOOM, IDX_SITE_FILTER_HASH,
     IDX_SITE_FILTER_RANGE, IDX_SITE_IN, IDX_SITE_FIND, IDX_SITE_SORT,
-    IDX_SITE_DISTINCT, IDX_SITE__N
+    IDX_SITE_DISTINCT, IDX_SITE_ASOF, IDX_SITE_FILTER_EQRANGE, IDX_SITE__N
 } idx_site_t;
 extern uint64_t ray_idx_consults[IDX_SITE__N];
 extern uint64_t ray_idx_hits[IDX_SITE__N];
@@ -170,6 +212,30 @@ ray_t* ray_index_attach_bloom(ray_t** vp);
  * Passing 0 picks the default (16 → 64 K rows / chunk).  Only valid on
  * numeric and temporal vectors; SYM/STR/GUID return RAY_ERR_NYI. */
 ray_t* ray_index_attach_chunk_zone(ray_t** vp, uint8_t chunk_log2);
+
+/* Build a chunk-zone index WITHOUT attaching it — returns a standalone
+ * RAY_INDEX object (caller releases).  Used by the splayed-store builder to
+ * compute an index for persistence without COWing a shared column. */
+ray_t* ray_index_chunk_zone_compute(ray_t* v, uint8_t chunk_log2);
+
+/* Build a RAY_IDX_DICT (codes + distinct values) for STR vector `v` WITHOUT
+ * attaching it — standalone RAY_INDEX object (caller releases / attaches).
+ * Returns RAY_ERR_NYI for non-STR.  Used at splayed save to persist the dict
+ * and by ray_index_attach_dict for the runtime path. */
+ray_t* ray_index_dict_compute(ray_t* v);
+ray_t* ray_index_attach_dict(ray_t** vp);
+
+/* Attach an already-built standalone RAY_INDEX object (zero-copy on rc=1). */
+ray_t* ray_index_attach_built(ray_t** vp, ray_t* idx);
+
+/* ── Inline on-disk index region (kdb+-style, zero-copy mmap) ──
+ * ray_index_inline_size: bytes the region occupies (32-aligned ray_t blocks).
+ * ray_index_inline_write: serialize `ix` into dst (child ptrs → region offsets).
+ * ray_index_inline_map: patch an mmap'd region's child offsets → absolute ptrs
+ *   in place and return the RAY_INDEX object (flagged RAY_MARK_MMAP). */
+int64_t ray_index_inline_size(const ray_index_t* ix);
+void    ray_index_inline_write(uint8_t* dst, const ray_index_t* ix);
+ray_t*  ray_index_inline_map(uint8_t* region);
 
 /* Drop any attached index from *vp.  No-op if none.  Restores the
  * pre-attach aux state byte-for-byte.  Returns *vp. */
@@ -261,17 +327,21 @@ ray_t* ray_index_hash_eq_rowsel(ray_t* col, int64_t key);
 /* ===== Hash-index IN probe =====
  *
  * Build a rowsel of all rows whose value is in set_vec via per-element
- * hash-chain probes.  Integer-family columns only (same conservatism as
+ * hash-chain probes.  Integer-family and SYM columns (same conservatism as
  * the hash-eq path: F32/F64 NaN/-0 semantics belong to the scan kernel).
  *
- * set_vec must be an integer-family typed vec; other set types → NULL.
+ * set_vec must match the column family: an integer-family typed vec for an
+ * integer column, a SYM vec for a SYM column (each set symbol is resolved
+ * through the COLUMN's domain; domain-absent symbols match no rows).
+ * Other combinations → NULL.
  *
  * Returns:
  *   - A fresh rowsel block (rc=1) on success — install on g->selection.
  *     An empty set yields a valid all-NONE rowsel (NOT NULL).
  *   - NULL when the column is not eligible (no hash index, stale, float-
- *     family column, unsupported set type, OOM, or selectivity > col->len/4).
- *     Caller falls back to the scan path. */
+ *     family column, unsupported set type, OOM) or the union is too dense
+ *     (total chain-step budget exceeded — the SIMD membership scan wins at
+ *     that density).  Caller falls back to the scan path. */
 ray_t* ray_index_in_rowsel(ray_t* col, ray_t* set_vec);
 
 /* ===== Hash-index find (point lookup) =====
@@ -290,6 +360,23 @@ ray_t* ray_index_in_rowsel(ray_t* col, ray_t* set_vec);
  * Uses idx_fresh_nonull: null-bearing columns fall back (-2) so the
  * scan correctly surfaces null-equality searches. */
 int64_t ray_index_find_row(ray_t* col, int64_t key);
+
+/* ===== Hash-index group slice (CSR accessor) =====
+ *
+ * Resolve `key` to its group's contiguous ascending row-id slice.
+ * SYM columns take the COLUMN-DOMAIN id as key; numeric columns take the
+ * value (canonicalized through the storage width like the eq probe).
+ *
+ * Returns:
+ *    1 → hit: *rows_out points at the ascending row ids, *n_out the size.
+ *        The slice borrows the index payload — valid while the index is.
+ *    0 → key provably absent (*rows_out NULL, *n_out 0).
+ *   -1 → not eligible (no fresh hash index / bad key) — caller falls back. */
+int ray_index_hash_group(ray_t* col, int64_t key,
+                         const int64_t** rows_out, int64_t* n_out);
+
+/* Build a rowsel from ASCENDING row ids (empty n=0 is valid).  NULL on OOM. */
+ray_t* ray_index_rowsel_from_ids(int64_t nrows, const int64_t* ids, int64_t n);
 
 /* ===== Sort-index range probe =====
  *

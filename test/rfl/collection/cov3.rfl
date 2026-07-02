@@ -133,13 +133,14 @@
 (at (at [10 20 30] [0 99]) 0) -- 10
 
 ;; ════════════════════════════════════════════════════════════════
-;; 12. find — empty vec (is_collection path, line 1777-1778)
+;; 12. find — empty vec (vector-val path, hash fast path)
 ;; ════════════════════════════════════════════════════════════════
-;; find where source vec is empty and val is collection → returns empty vec
-(count (find [] [1 2 3])) -- 0
+;; find where source vec is empty and val is collection → all not-found
+;; (was: return empty vec — latent bug; now: length-preserving all-0Nl)
+(count (find [] [1 2 3])) -- 3
 (type (find [] [1 2 3])) -- 'I64
-;; empty vec result value-check: explicit empty I64 vec
-(find [] [1 2 3]) -- (as 'I64 [])
+;; all elements are 0Nl since none are found in the empty source
+(find [] [1 2 3]) -- [0Nl 0Nl 0Nl]
 
 ;; ════════════════════════════════════════════════════════════════
 ;; 13. except — boxed list path with scalar vec2 (line 1136-1139)

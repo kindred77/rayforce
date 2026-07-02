@@ -3740,6 +3740,49 @@ ray_t* ray_rank_fn(ray_t* x) {
     return result;
 }
 
+/* Pool worker for the already-in-order detection scan: each task verifies
+ * consecutive-row order over [start,end) INCLUDING the (start-1,start)
+ * boundary pair, so chunk edges are covered.  The shared flag only ever
+ * transitions 1 -> 0 (benign race) and doubles as a bail signal. */
+typedef struct {
+    ray_t**  key_cols;
+    int64_t  n_keys;
+    uint8_t  descending;
+    volatile int* ordered;
+} sorted_check_ctx_t;
+
+static void sorted_check_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    sorted_check_ctx_t* c = (sorted_check_ctx_t*)raw;
+    if (start < 1) start = 1;
+    for (int64_t i = start; i < end; i++) {
+        if (!*c->ordered) return;   /* another task already found a violation */
+        int cmp = 0;
+        for (int64_t k = 0; k < c->n_keys && cmp == 0; k++) {
+            ray_t* col = c->key_cols[k];
+            if (col->type == RAY_SYM) {
+                int64_t ia = ray_read_sym(ray_data(col), i - 1, RAY_SYM, col->attrs);
+                int64_t ib = ray_read_sym(ray_data(col), i,     RAY_SYM, col->attrs);
+                if (ia != ib) {
+                    struct ray_sym_domain_s* dom = ray_sym_vec_domain(col);
+                    ray_t* sa = ray_sym_domain_str(dom, ia);
+                    ray_t* sb = ray_sym_domain_str(dom, ib);
+                    uint32_t la = sa ? (uint32_t)ray_str_len(sa) : 0;
+                    uint32_t lb = sb ? (uint32_t)ray_str_len(sb) : 0;
+                    uint32_t ml = la < lb ? la : lb;
+                    if (ml > 0) cmp = memcmp(ray_str_ptr(sa), ray_str_ptr(sb), ml);
+                    if (cmp == 0) cmp = (la > lb) - (la < lb);
+                }
+            } else {
+                int64_t va = read_col_i64(ray_data(col), i - 1, col->type, col->attrs);
+                int64_t vb = read_col_i64(ray_data(col), i,     col->type, col->attrs);
+                cmp = (va > vb) - (va < vb);
+            }
+        }
+        if (c->descending ? (cmp < 0) : (cmp > 0)) { *c->ordered = 0; return; }
+    }
+}
+
 /* Helper: resolve key symbols to table columns for xasc/xdesc */
 ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
     if (!tbl || tbl->type != RAY_TABLE)
@@ -3789,6 +3832,42 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
     /* Build descs array */
     uint8_t descs[16];
     for (int64_t i = 0; i < n_keys; i++) descs[i] = descending;
+
+    /* Already-in-order detection: one bail-early pass comparing consecutive
+     * rows with EXACTLY the sort's ordering — integer family raw, SYM
+     * lexicographic through the column's domain (build_enum_rank's
+     * comparator: memcmp over the common prefix, then length).  A table
+     * that already sits in the requested order — e.g. an in-query
+     * (xasc t ['sym 'time]) re-asserting the store's layout — returns the
+     * input retained: the sort, the whole-table gather and the null/attr
+     * propagation all vanish.  Restricted to null-free integer-family and
+     * SYM keys: null placement and float NaN ordering belong to the real
+     * sort.  An unsorted input bails at its first violation, so the scan
+     * costs a few comparisons, not O(n). */
+    {
+        bool detectable = true;
+        for (int64_t k = 0; k < n_keys && detectable; k++) {
+            int8_t t = key_cols[k]->type;
+            if (key_cols[k]->attrs & RAY_ATTR_HAS_NULLS) detectable = false;
+            else if (t != RAY_BOOL && t != RAY_U8 && t != RAY_I16 &&
+                     t != RAY_I32 && t != RAY_I64 && t != RAY_DATE &&
+                     t != RAY_TIME && t != RAY_TIMESTAMP && t != RAY_SYM)
+                detectable = false;
+        }
+        if (detectable) {
+            volatile int ordered = 1;
+            sorted_check_ctx_t sctx = {
+                .key_cols = key_cols, .n_keys = n_keys,
+                .descending = descending, .ordered = &ordered,
+            };
+            ray_pool_t* pool = ray_pool_get();
+            if (pool && nrows >= RAY_PARALLEL_THRESHOLD)
+                ray_pool_dispatch(pool, sorted_check_fn, &sctx, nrows);
+            else
+                sorted_check_fn(&sctx, 0, 1, nrows);
+            if (ordered) { ray_retain(tbl); return tbl; }
+        }
+    }
 
     uint64_t* sorted_keys = NULL;
     ray_t* sorted_keys_hdr = NULL;
@@ -3940,6 +4019,28 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
             for (int64_t r = 0; r < nrows; r++)
                 if (ray_vec_is_null(col, idx_data[r]))
                     ray_vec_set_null(new_cols[c], r, true);
+        }
+    }
+
+    /* Stamp the verified `sorted` marker on the PRIMARY key output column:
+     * an ascending sort makes it non-descending by construction — exactly
+     * the guarantee (.attr.set 'sorted) verifies with an O(n) scan, so the
+     * marker still never lies.  Conservatively gated to null-free
+     * integer-family keys: float NaN takes radix total order (not plain
+     * `<=` order) and SYM sorts in id space, where the marker's comparison
+     * semantics are not what downstream consumers (asof presort/index
+     * paths) assume. */
+    if (!descending &&
+        !(key_cols[0]->attrs & RAY_ATTR_HAS_NULLS) &&
+        (k0_type == RAY_BOOL || k0_type == RAY_U8  || k0_type == RAY_I16 ||
+         k0_type == RAY_I32  || k0_type == RAY_I64 || k0_type == RAY_DATE ||
+         k0_type == RAY_TIME || k0_type == RAY_TIMESTAMP)) {
+        for (int64_t c = 0; c < ncols; c++) {
+            if (col_names[c] == key_ids[0] && new_cols[c] &&
+                !(new_cols[c]->attrs & RAY_ATTR_HAS_NULLS)) {
+                new_cols[c]->attrs |= RAY_ATTR_SORTED;
+                break;
+            }
         }
     }
 

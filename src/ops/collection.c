@@ -791,6 +791,57 @@ ray_t* distinct_vec_eager(ray_t* x) {
     int64_t* idx = (len <= 256) ? idx_stack : (int64_t*)ray_sys_alloc((size_t)len * sizeof(int64_t));
     if (!idx) return ray_error("oom", NULL);
 
+    /* SYM presence-bitmap dedup: a SYM code is a position in [0, domain_count),
+     * so for a small domain a domain_count-byte "seen" array collects the
+     * first-occurrence row ids in O(n) with NO hashing — identical first-
+     * appearance order to the hashset path below.  Gate dc<=len so the array
+     * never costs more than the data it replaces; larger domains fall through. */
+    if (x->type == RAY_SYM) {
+        int64_t dc = ray_sym_domain_count(ray_sym_vec_domain(x));
+        if (dc > 0 && dc <= 65536 && dc <= len) {
+            uint8_t* seen = (uint8_t*)ray_sys_alloc((size_t)dc);
+            if (!seen) { if (idx != idx_stack) ray_sys_free(idx); return ray_error("oom", NULL); }
+            memset(seen, 0, (size_t)dc);
+            const void* data = ray_data(x);
+            int8_t ty = x->type; uint16_t at = x->attrs;
+            int64_t count = 0;
+            for (int64_t i = 0; i < len; i++) {
+                int64_t code = ray_read_sym(data, i, ty, at);
+                if (!seen[code]) { seen[code] = 1; idx[count++] = i; }
+            }
+            ray_sys_free(seen);
+            ray_t* result = gather_by_idx(x, idx, count);
+            if (idx != idx_stack) ray_sys_free(idx);
+            return result;
+        }
+    }
+
+    /* Dict-encoded STR: dedup on the int32 dict-code vector (codes in
+     * [0, n_distinct)) via a presence array — first-occurrence order, no
+     * string hashing.  Mirrors the SYM presence path; gated nd<=len so the
+     * seen[] array never costs more than the data it replaces. */
+    if (x->type == RAY_STR && ray_index_kind(x) == RAY_IDX_DICT) {
+        ray_index_t* dix = ray_index_payload(x->index);
+        int64_t nd = dix->u.dict.n_distinct;
+        ray_t* codes_v = dix->u.dict.codes;
+        if (nd > 0 && nd <= len && codes_v && !RAY_IS_ERR(codes_v)
+            && codes_v->len == len) {
+            const int32_t* codes = (const int32_t*)ray_data(codes_v);
+            uint8_t* seen = (uint8_t*)ray_sys_alloc((size_t)nd);
+            if (!seen) { if (idx != idx_stack) ray_sys_free(idx); return ray_error("oom", NULL); }
+            memset(seen, 0, (size_t)nd);
+            int64_t count = 0;
+            for (int64_t i = 0; i < len; i++) {
+                int32_t c = codes[i];
+                if (c >= 0 && c < nd && !seen[c]) { seen[c] = 1; idx[count++] = i; }
+            }
+            ray_sys_free(seen);
+            ray_t* result = gather_by_idx(x, idx, count);
+            if (idx != idx_stack) ray_sys_free(idx);
+            return result;
+        }
+    }
+
     hashset_t hs;
     if (!hashset_init(&hs, x, len)) {
         if (idx != idx_stack) ray_sys_free(idx);
@@ -998,6 +1049,18 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
          * hashset over `vec` once, probe per element of `val`.  Was
          * O(len(val)×len(vec)); now O(len(val)+len(vec)). */
         if (ray_is_vec(val) && ray_is_vec(vec)) {
+            /* Typed kernel first: verdict-LUT for SYM, SIMD small-set for
+             * ints, pool-parallel — the same engine the fused WHERE path
+             * uses.  Gated off null-bearing operands: this hashset path
+             * matches null ∈ {…null…} as TRUE (null equals null), while
+             * the WHERE kernel uses null-matches-nothing semantics — the
+             * two must not be conflated.  NULL result = unsupported shape
+             * (STR etc.): fall through to the hashset probe below. */
+            if (!(val->attrs & RAY_ATTR_HAS_NULLS) &&
+                !(vec->attrs & RAY_ATTR_HAS_NULLS)) {
+                ray_t* fast = ray_in_vec_exec(val, vec, false);
+                if (fast) return fast;
+            }
             ray_t* result = ray_vec_new(RAY_BOOL, vlen);
             if (RAY_IS_ERR(result)) return result;
             result->len = vlen;
@@ -1835,28 +1898,41 @@ ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
         }
         return ray_typed_null(-RAY_I64);
     }
-    /* Vector val: (find vec [v1 v2]) → [idx1 idx2] */
-    if (is_collection(val)) {
-        /* If vec is empty, return empty vector */
-        if (is_collection(vec) && ray_len(vec) == 0)
-            return ray_vec_new(RAY_I64, 0);
+    /* Vector val: (find vec [v1 v2]) → dense I64 [idx1 idx2], O(n+m) via hashset. */
+    if (is_collection(val) && !ray_is_atom(val)) {
         int64_t vlen = ray_len(val);
-        ray_t* result = ray_alloc(vlen * sizeof(ray_t*));
-        if (!result) return ray_error("oom", NULL);
-        result->type = RAY_LIST;
+        ray_t* result = ray_vec_new(RAY_I64, vlen);
+        if (RAY_IS_ERR(result)) return result;
         result->len = vlen;
-        ray_t** out = (ray_t**)ray_data(result);
-        for (int64_t j = 0; j < vlen; j++) {
-            int alloc = 0;
-            ray_t* ve = collection_elem(val, j, &alloc);
-            out[j] = ray_find_fn(vec, ve);
-            if (alloc) ray_release(ve);
-            if (RAY_IS_ERR(out[j])) {
-                for (int64_t k = 0; k < j; k++) ray_release(out[k]);
-                ray_release(result);
-                return out[j];
+        int64_t* out = (int64_t*)ray_data(result);
+        bool any_null = false;
+
+        /* Hash fast path: both sides typed vecs — O(n+m), mirrors ray_in_fn. */
+        if (ray_is_vec(val) && ray_is_vec(vec)) {
+            hashset_t hs;
+            if (!hashset_init(&hs, vec, vec->len)) { ray_release(result); return ray_error("oom", NULL); }
+            for (int64_t j = 0; j < vec->len; j++) hashset_insert(&hs, j);
+            int8_t vt = val->type; void* vd = ray_data(val);
+            for (int64_t i = 0; i < vlen; i++) {
+                int64_t row = hashset_find_xrow(&hs, val, i, vt, vd);
+                if (row == HS_EMPTY) { out[i] = NULL_I64; any_null = true; }
+                else out[i] = row;
+            }
+            hashset_destroy(&hs);
+        } else {
+            /* Fallback (LIST/mixed): per-element scalar find into the dense buffer. */
+            for (int64_t j = 0; j < vlen; j++) {
+                int alloc = 0;
+                ray_t* ve = collection_elem(val, j, &alloc);
+                ray_t* one = ray_find_fn(vec, ve);   /* scalar → i64 atom or 0Nl */
+                if (alloc) ray_release(ve);
+                if (RAY_IS_ERR(one)) { ray_release(result); return one; }
+                if (RAY_ATOM_IS_NULL(one)) { out[j] = NULL_I64; any_null = true; }
+                else out[j] = one->i64;
+                ray_release(one);
             }
         }
+        if (any_null) result->attrs |= RAY_ATTR_HAS_NULLS;
         return result;
     }
     /* Typed vector: search without boxing */

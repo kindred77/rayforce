@@ -29,6 +29,7 @@
 #include "ops/idxop.h"
 #include "mem/heap.h"
 #include "mem/sys.h"
+#include "core/runtime.h"  /* __VM — filter-compaction projection keep-set */
 
 /* Global profiler instance (zero-initialized = inactive) */
 ray_profile_t g_ray_profile;
@@ -569,8 +570,14 @@ typedef struct {
     const double*  svf;
     const int64_t* svi;
     int64_t        sv_len;
-    uint8_t*       ob;
+    uint8_t*       ob;       /* output base; element i writes ob[i - ob_base] */
+    int64_t        ob_base;  /* 0 for full-vec output; morsel start for fused-sel */
     int8_t         ct;
+    /* SYM columns: per-domain-position membership verdict (1 = in set),
+     * built once over the VOCABULARY in in_build_worker_ctx.  Turns the
+     * per-row linear set scan into one byte load — any set size, width-
+     * specialized, vectorizable.  NULL when not applicable. */
+    const uint8_t* symlut;
     bool           col_has_nulls;
     bool           col_atom_null;
     bool           col_is_atom;
@@ -586,7 +593,13 @@ static void exec_in_worker(void* vctx, uint32_t worker_id,
     const void* cd = c->col_is_atom ? NULL : ray_data(col);
     int8_t ct = c->ct;
     uint8_t cattrs = c->col_is_atom ? 0 : col->attrs;
+    /* Output index is relative to ob_base so a fused-selection caller can
+     * point ob at a morsel-local scratch (ob_base = morsel start) while the
+     * column is still read at the absolute row index i: element i writes
+     * ob[i - ob_base], which lands at scratch[0..n).  Full-vec callers set
+     * ob_base = 0, leaving the plain ob[i]. */
     uint8_t* ob = c->ob;
+    int64_t ob_base = c->ob_base;
     int64_t sv_len = c->sv_len;
     int negate = c->negate ? 1 : 0;
 
@@ -621,21 +634,118 @@ static void exec_in_worker(void* vctx, uint32_t worker_id,
      * the per-element null check is a single ray_vec_is_null call when
      * nulls are present, or eliminated entirely when they are not. */
     bool vec_has_nulls = c->col_has_nulls && !c->col_is_atom;
+
+    /* ---- SIMD-friendly fast path -----------------------------------------
+     * Common case: non-atom fixed-width INTEGER column, integer set (not
+     * float), small set (1..8 live elements).  Dispatch once to a loop
+     * specialized per column type so the read is a direct typed pointer
+     * access (no per-element `switch`) and the membership is an unrolled
+     * OR-of-equality over 8 fixed slots (no `break`) — structured so
+     * -O3 -march=native auto-vectorizes it.  Set elements that don't fit
+     * the column type can match nothing and are dropped (kfit); unused
+     * slots are padded with tv[0] (a real member, harmless under OR).
+     * Null rows emit 0 regardless of negate (isn masks after the OR).
+     * Bit-identical to the generic loops below; additive, chosen once. */
+    /* SYM verdict-LUT fast path: one byte load per row, no set scan.
+     * SYM has no null, so there is no per-element null branch either. */
+    if (!c->col_is_atom && c->symlut && ct == RAY_SYM) {
+        const uint8_t* lut = c->symlut;
+        uint8_t neg = (uint8_t)negate;
+        uint8_t w = (uint8_t)(cattrs & RAY_SYM_W_MASK);
+        if (w == RAY_SYM_W8) {
+            const uint8_t* dp = (const uint8_t*)cd;
+            for (int64_t i = start; i < end; i++)
+                ob[i - ob_base] = (uint8_t)(lut[dp[i]] ^ neg);
+        } else if (w == RAY_SYM_W16) {
+            const uint16_t* dp = (const uint16_t*)cd;
+            for (int64_t i = start; i < end; i++)
+                ob[i - ob_base] = (uint8_t)(lut[dp[i]] ^ neg);
+        } else if (w == RAY_SYM_W32) {
+            const uint32_t* dp = (const uint32_t*)cd;
+            for (int64_t i = start; i < end; i++)
+                ob[i - ob_base] = (uint8_t)(lut[dp[i]] ^ neg);
+        } else {
+            const int64_t* dp = (const int64_t*)cd;
+            for (int64_t i = start; i < end; i++)
+                ob[i - ob_base] = (uint8_t)(lut[dp[i]] ^ neg);
+        }
+        return;
+    }
+
+    if (!c->col_is_atom && !c->use_double && sv_len >= 1 && sv_len <= 8) {
+        const int64_t* svi = c->svi;
+        uint8_t neg = (uint8_t)negate;
+        #define IN_FAST(CTYPE, FITS, SENT, HASNULL) do {                     \
+            CTYPE tv[8];                                                     \
+            int kfit = 0;                                                    \
+            for (int64_t j = 0; j < sv_len; j++) {                          \
+                int64_t sj = svi[j];                                         \
+                if (FITS) tv[kfit++] = (CTYPE)sj;                            \
+            }                                                                \
+            if (kfit == 0) break; /* nothing representable → generic path */ \
+            const CTYPE* dp = (const CTYPE*)cd;                              \
+            /* pad unused slots with tv[0] (a real member; harmless under    \
+             * OR) via ternaries so tv is never written/read past kfit. */   \
+            CTYPE t0=tv[0],                                                  \
+                  t1=(kfit>1?tv[1]:t0), t2=(kfit>2?tv[2]:t0),                \
+                  t3=(kfit>3?tv[3]:t0), t4=(kfit>4?tv[4]:t0),                \
+                  t5=(kfit>5?tv[5]:t0), t6=(kfit>6?tv[6]:t0),                \
+                  t7=(kfit>7?tv[7]:t0);                                      \
+            if ((HASNULL) && vec_has_nulls) {                                \
+                CTYPE sent = (CTYPE)(SENT);                                  \
+                for (int64_t i = start; i < end; i++) {                      \
+                    CTYPE v = dp[i];                                         \
+                    uint8_t f = (uint8_t)((v==t0)|(v==t1)|(v==t2)|(v==t3)|   \
+                                          (v==t4)|(v==t5)|(v==t6)|(v==t7));  \
+                    uint8_t isn = (uint8_t)(v == sent);                      \
+                    ob[i - ob_base] = (uint8_t)(isn ? 0 : (f ^ neg));       \
+                }                                                            \
+            } else {                                                         \
+                for (int64_t i = start; i < end; i++) {                      \
+                    CTYPE v = dp[i];                                         \
+                    uint8_t f = (uint8_t)((v==t0)|(v==t1)|(v==t2)|(v==t3)|   \
+                                          (v==t4)|(v==t5)|(v==t6)|(v==t7));  \
+                    ob[i - ob_base] = (uint8_t)(f ^ neg);                    \
+                }                                                            \
+            }                                                                \
+            return;                                                          \
+        } while (0)
+
+        switch (ct) {
+            case RAY_BOOL: case RAY_U8:  /* non-nullable → no isn path */
+                IN_FAST(uint8_t, (sj >= 0 && sj <= UINT8_MAX), 0, 0);
+                break;
+            case RAY_I16:
+                IN_FAST(int16_t, (sj >= INT16_MIN && sj <= INT16_MAX),
+                        NULL_I16, 1);
+                break;
+            case RAY_I32: case RAY_DATE: case RAY_TIME:
+                IN_FAST(int32_t, (sj >= INT32_MIN && sj <= INT32_MAX),
+                        NULL_I32, 1);
+                break;
+            case RAY_I64: case RAY_TIMESTAMP:
+                IN_FAST(int64_t, 1, NULL_I64, 1);  /* all i64 fit */
+                break;
+            default: break;  /* SYM / unsupported → generic below */
+        }
+        #undef IN_FAST
+    }
+
     if (c->use_double) {
         const double* svf = c->svf;
         if (c->col_atom_null) {
             /* All elements are null — fill zeros */
-            for (int64_t i = start; i < end; i++) ob[i] = 0;
+            for (int64_t i = start; i < end; i++) ob[i - ob_base] = 0;
         } else if (vec_has_nulls) {
             for (int64_t i = start; i < end; i++) {
-                if (ray_vec_is_null(col, i)) { ob[i] = 0; continue; }
+                if (ray_vec_is_null(col, i)) { ob[i - ob_base] = 0; continue; }
                 double cv;
                 if (c->col_is_atom) cv = (ct == RAY_F64) ? col->f64 : (double)col->i64;
                 else IN_READ_F64(cv, i);
                 int found = 0;
                 for (int64_t j = 0; j < sv_len; j++)
                     if (cv == svf[j]) { found = 1; break; }
-                ob[i] = (uint8_t)(found ^ negate);
+                ob[i - ob_base] = (uint8_t)(found ^ negate);
             }
         } else {
             for (int64_t i = start; i < end; i++) {
@@ -645,23 +755,23 @@ static void exec_in_worker(void* vctx, uint32_t worker_id,
                 int found = 0;
                 for (int64_t j = 0; j < sv_len; j++)
                     if (cv == svf[j]) { found = 1; break; }
-                ob[i] = (uint8_t)(found ^ negate);
+                ob[i - ob_base] = (uint8_t)(found ^ negate);
             }
         }
     } else {
         const int64_t* svi = c->svi;
         if (c->col_atom_null) {
-            for (int64_t i = start; i < end; i++) ob[i] = 0;
+            for (int64_t i = start; i < end; i++) ob[i - ob_base] = 0;
         } else if (vec_has_nulls) {
             for (int64_t i = start; i < end; i++) {
-                if (ray_vec_is_null(col, i)) { ob[i] = 0; continue; }
+                if (ray_vec_is_null(col, i)) { ob[i - ob_base] = 0; continue; }
                 int64_t cv;
                 if (c->col_is_atom) cv = col->i64;
                 else IN_READ_I64(cv, i);
                 int found = 0;
                 for (int64_t j = 0; j < sv_len; j++)
                     if (cv == svi[j]) { found = 1; break; }
-                ob[i] = (uint8_t)(found ^ negate);
+                ob[i - ob_base] = (uint8_t)(found ^ negate);
             }
         } else {
             for (int64_t i = start; i < end; i++) {
@@ -671,7 +781,7 @@ static void exec_in_worker(void* vctx, uint32_t worker_id,
                 int found = 0;
                 for (int64_t j = 0; j < sv_len; j++)
                     if (cv == svi[j]) { found = 1; break; }
-                ob[i] = (uint8_t)(found ^ negate);
+                ob[i - ob_base] = (uint8_t)(found ^ negate);
             }
         }
     }
@@ -699,34 +809,34 @@ static void exec_in_worker(void* vctx, uint32_t worker_id,
  *     simply produces false).
  *   - RAY_STR: deferred (returns nyi).
  * ============================================================================ */
-static ray_t* exec_in(ray_graph_t* g, ray_op_t* op, ray_t* col, ray_t* set) {
-    (void)g;
-    bool negate = (op->opcode == OP_NOT_IN);
+/* Build the membership probe buffer + in_worker_ctx_t shared by exec_in
+ * (full BOOL output) and exec_in_to_selection (fused row-selection output).
+ * Resolves the column read type, the int/float/sym classification, the
+ * compacted probe buffer (null set elements dropped, cross-domain SYM ids
+ * translated into the column's domain), and the per-column null flags —
+ * everything in in_worker_ctx_t EXCEPT ob/ob_base, which each caller wires
+ * to its own sink.  Assumes the column is non-empty (callers short-circuit
+ * empty cols).  svf_stack/svi_stack are caller-owned 32-element buffers used
+ * when the set has ≤32 live elements; otherwise *sv_hdr_out is heap-allocated
+ * and must be ray_free'd after the dispatch.  Returns a tri-state status so
+ * the bool path can surface nyi/oom while the fused path falls back. */
+typedef enum { IN_CTX_UNSUPPORTED = 0, IN_CTX_OK = 1, IN_CTX_OOM = 2 } in_ctx_status_t;
 
-    int64_t col_len = ray_is_atom(col) ? 1 : col->len;
+static in_ctx_status_t in_build_worker_ctx(ray_t* col, ray_t* set, bool negate,
+                                           double* svf_stack, int64_t* svi_stack,
+                                           in_worker_ctx_t* out_ctx,
+                                           ray_t** sv_hdr_out,
+                                           ray_t** lut_hdr_out) {
+    *sv_hdr_out = NULL;
+    *lut_hdr_out = NULL;
     int64_t set_len = ray_is_atom(set) ? 1 : set->len;
-
-    /* Empty col: the main loop produces an empty BOOL result
-     * correctly, but there's nothing to iterate, so short-circuit. */
-    if (col_len == 0) {
-        ray_t* out = ray_vec_new(RAY_BOOL, 0);
-        if (!out || RAY_IS_ERR(out)) return out;
-        out->len = 0;
-        return out;
-    }
-
-    /* NOTE: we intentionally do NOT short-circuit on set_len == 0.
-     * Even for an empty probe, the main loop still needs to check
-     * each col row's null flag so null rows never leak through as
-     * true for `not-in` (the old memset bypass did exactly that). */
 
     int8_t ct = ray_is_atom(col) ? (int8_t)(-col->type) : col->type;
     int8_t st = ray_is_atom(set) ? (int8_t)(-set->type) : set->type;
     if (RAY_IS_PARTED(ct)) ct = (int8_t)RAY_PARTED_BASETYPE(ct);
     if (RAY_IS_PARTED(st)) st = (int8_t)RAY_PARTED_BASETYPE(st);
 
-    if (ct == RAY_STR || st == RAY_STR)
-        return ray_error("nyi", "OP_IN on RAY_STR not yet implemented");
+    if (ct == RAY_STR || st == RAY_STR) return IN_CTX_UNSUPPORTED;
 
     /* Classify each side: 0=int-family, 1=float-family, 2=sym. */
     #define CLASSIFY(t)                                                    \
@@ -748,11 +858,6 @@ static ray_t* exec_in(ray_graph_t* g, ray_op_t* op, ray_t* col, ray_t* set) {
     /* Float-promoted path: at least one side is float.  Read both as
      * double and compare. */
     int use_double = (col_class == 1 || set_class == 1);
-
-    ray_t* out = ray_vec_new(RAY_BOOL, col_len);
-    if (!out || RAY_IS_ERR(out)) return out;
-    out->len = col_len;
-    uint8_t* ob = (uint8_t*)ray_data(out);
 
     /* Null-aware: null rows in the column never pass either `in` or
      * `not-in`.  Mirrors SQL-style semantics where NULL IN (…) and
@@ -797,15 +902,13 @@ static ray_t* exec_in(ray_graph_t* g, ray_op_t* op, ray_t* col, ray_t* set) {
     /* Compact probe buffer: drop null set elements up front so the
      * inner loop doesn't special-case them. */
     int64_t sv_len = 0;
-    double  svf_stack[32];
-    int64_t svi_stack[32];
     double* svf = svf_stack;
     int64_t* svi = svi_stack;
     ray_t* sv_hdr = NULL;
     if (set_len > 32) {
         size_t bytes = (size_t)set_len * (use_double ? sizeof(double) : sizeof(int64_t));
         sv_hdr = ray_alloc(bytes);
-        if (!sv_hdr) { ray_release(out); return ray_error("oom", NULL); }
+        if (!sv_hdr) { return IN_CTX_OOM; }
         if (use_double) svf = (double*)ray_data(sv_hdr);
         else            svi = (int64_t*)ray_data(sv_hdr);
     }
@@ -874,16 +977,132 @@ static ray_t* exec_in(ray_graph_t* g, ray_op_t* op, ray_t* col, ray_t* set) {
         }
     }
 
-    in_worker_ctx_t in_ctx = {
+    #undef READ_I64
+    #undef READ_F64
+    #undef CLASSIFY
+
+    /* SYM column: build the per-domain-position verdict LUT over the
+     * VOCABULARY (svi is already expressed in the column's domain, so a
+     * verdict is one flag per domain position).  O(D) build, then the
+     * worker does one byte load per row regardless of set size. */
+    const uint8_t* symlut = NULL;
+    if (!ray_is_atom(col) && col_class == 2 && !use_double && sv_len > 0) {
+        ray_t* col_rep2 = sym_domain_rep(col);
+        struct ray_sym_domain_s* cdom = col_rep2
+            ? ray_sym_vec_domain(col_rep2) : ray_sym_runtime_domain();
+        int64_t d = ray_sym_domain_count(cdom);
+        if (d > 0 && d <= (int64_t)1 << 22) {
+            ray_t* lh = ray_alloc(d);
+            if (lh) {
+                uint8_t* lut = (uint8_t*)ray_data(lh);
+                memset(lut, 0, (size_t)d);
+                for (int64_t j = 0; j < sv_len; j++)
+                    if (svi[j] >= 0 && svi[j] < d) lut[svi[j]] = 1;
+                *lut_hdr_out = lh;
+                symlut = lut;
+            }
+        }
+    }
+
+    *out_ctx = (in_worker_ctx_t){
         .col = col,
         .svf = svf, .svi = svi, .sv_len = sv_len,
-        .ob = ob, .ct = ct,
+        .symlut = symlut,
+        .ob = NULL, .ob_base = 0, .ct = ct,
         .col_has_nulls = col_has_nulls,
         .col_atom_null = col_atom_null,
         .col_is_atom = ray_is_atom(col),
         .use_double = use_double,
         .negate = negate,
     };
+    *sv_hdr_out = sv_hdr;
+    return IN_CTX_OK;
+}
+
+/* Public entry for the typed membership kernel — the eval-level `in`
+ * routes typed vec/set shapes here so a bare (in vec set) gets the same
+ * verdict-LUT / SIMD / pool-parallel treatment as the fused WHERE path
+ * instead of a serial per-row hashset probe.  Returns NULL when the shape
+ * is unsupported (STR etc.) — caller falls back. */
+ray_t* ray_in_vec_exec(ray_t* col, ray_t* set, bool negate) {
+    int64_t col_len = ray_is_atom(col) ? 1 : col->len;
+    if (col_len == 0) {
+        ray_t* out = ray_vec_new(RAY_BOOL, 0);
+        if (!out || RAY_IS_ERR(out)) return out;
+        out->len = 0;
+        return out;
+    }
+    double  svf_stack[32];
+    int64_t svi_stack[32];
+    in_worker_ctx_t in_ctx;
+    ray_t* sv_hdr = NULL;
+    ray_t* lut_hdr = NULL;
+    in_ctx_status_t st = in_build_worker_ctx(col, set, negate,
+                                             svf_stack, svi_stack,
+                                             &in_ctx, &sv_hdr, &lut_hdr);
+    if (st != IN_CTX_OK) return NULL;   /* unsupported / OOM: caller falls back */
+
+    ray_t* out = ray_vec_new(RAY_BOOL, col_len);
+    if (!out || RAY_IS_ERR(out)) {
+        if (sv_hdr) ray_free(sv_hdr);
+        if (lut_hdr) ray_free(lut_hdr);
+        return out;
+    }
+    out->len = col_len;
+    in_ctx.ob = (uint8_t*)ray_data(out);
+    in_ctx.ob_base = 0;
+    ray_pool_t* pool = ray_pool_get();
+    if (pool && col_len >= RAY_PARALLEL_THRESHOLD && !ray_is_atom(col))
+        ray_pool_dispatch(pool, exec_in_worker, &in_ctx, col_len);
+    else
+        exec_in_worker(&in_ctx, 0, 0, col_len);
+    if (sv_hdr) ray_free(sv_hdr);
+    if (lut_hdr) ray_free(lut_hdr);
+    return out;
+}
+
+static ray_t* exec_in(ray_graph_t* g, ray_op_t* op, ray_t* col, ray_t* set) {
+    (void)g;
+    bool negate = (op->opcode == OP_NOT_IN);
+
+    int64_t col_len = ray_is_atom(col) ? 1 : col->len;
+
+    /* Empty col: the main loop produces an empty BOOL result
+     * correctly, but there's nothing to iterate, so short-circuit. */
+    if (col_len == 0) {
+        ray_t* out = ray_vec_new(RAY_BOOL, 0);
+        if (!out || RAY_IS_ERR(out)) return out;
+        out->len = 0;
+        return out;
+    }
+
+    /* NOTE: we intentionally do NOT short-circuit on set_len == 0.
+     * Even for an empty probe, the main loop still needs to check
+     * each col row's null flag so null rows never leak through as
+     * true for `not-in` (the old memset bypass did exactly that). */
+
+    double  svf_stack[32];
+    int64_t svi_stack[32];
+    in_worker_ctx_t in_ctx;
+    ray_t* sv_hdr = NULL;
+    ray_t* lut_hdr = NULL;
+    in_ctx_status_t st = in_build_worker_ctx(col, set, negate,
+                                             svf_stack, svi_stack,
+                                             &in_ctx, &sv_hdr, &lut_hdr);
+    if (st == IN_CTX_UNSUPPORTED)
+        return ray_error("nyi", "OP_IN on RAY_STR not yet implemented");
+    if (st == IN_CTX_OOM)
+        return ray_error("oom", NULL);
+
+    ray_t* out = ray_vec_new(RAY_BOOL, col_len);
+    if (!out || RAY_IS_ERR(out)) {
+        if (sv_hdr) ray_free(sv_hdr);
+        if (lut_hdr) ray_free(lut_hdr);
+        return out;
+    }
+    out->len = col_len;
+    in_ctx.ob = (uint8_t*)ray_data(out);
+    in_ctx.ob_base = 0;
 
     ray_pool_t* pool = ray_pool_get();
     if (pool && col_len >= RAY_PARALLEL_THRESHOLD && !ray_is_atom(col))
@@ -892,11 +1111,61 @@ static ray_t* exec_in(ray_graph_t* g, ray_op_t* op, ray_t* col, ray_t* set) {
         exec_in_worker(&in_ctx, 0, 0, col_len);
 
     if (sv_hdr) ray_free(sv_hdr);
-
-    #undef READ_I64
-    #undef READ_F64
-    #undef CLASSIFY
+    if (lut_hdr) ray_free(lut_hdr);
     return out;
+}
+
+/* Fused `in`/`not-in` → row selection.  Decodes a root OP_IN/OP_NOT_IN of the
+ * shape (SCAN flat-col) IN (CONST set) against g->table, builds the same probe
+ * buffer + worker context as exec_in, then drives the per-task rowsel builders
+ * — each morsel runs exec_in_worker into a morsel-local scratch (ob_base =
+ * morsel start) and streams the verdict via rowsel_emit_segment.  Bit-identical
+ * to exec_in's bool output (null rows → 0 → not-selected); only the sink
+ * differs.  Returns NULL+all_pass=0 for any unsupported shape so the caller
+ * falls back to exec_node→ray_rowsel_from_pred unchanged. */
+static int idx_filter_in_decode(ray_graph_t* g, ray_op_t* pred_op,
+                                ray_t** out_col, ray_t** out_set_lit);
+
+typedef struct { in_worker_ctx_t* ic; } in_sel_fill_ctx_t;
+
+static void in_sel_fill(void* vctx, int64_t start, int64_t n, uint8_t* out) {
+    in_sel_fill_ctx_t* c = (in_sel_fill_ctx_t*)vctx;
+    in_worker_ctx_t local = *c->ic;        /* per-call copy: morsel-local sink */
+    local.ob      = out;                    /* element i writes out[i - start] */
+    local.ob_base = start;
+    exec_in_worker(&local, 0, start, start + n);
+}
+
+ray_t* exec_in_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
+                            bool* all_pass) {
+    *all_pass = false;
+    if (pred->opcode != OP_IN && pred->opcode != OP_NOT_IN) return NULL;
+
+    ray_t* col = NULL;
+    ray_t* set_lit = NULL;
+    /* idx_filter_in_decode matches OP_IN of shape (SCAN flat-col) IN (CONST
+     * set) and rejects parted/MAPCOMMON columns + non-CONST sets.  OP_NOT_IN
+     * isn't a decode shape (the shared decode is IN-only), so `not-in` falls
+     * back to the bool path here — still correct, just unfused. */
+    if (!idx_filter_in_decode(g, pred, &col, &set_lit)) return NULL;
+    if (ray_is_atom(col) || col->len != nrows) return NULL;
+
+    bool negate = (pred->opcode == OP_NOT_IN);
+    double  svf_stack[32];
+    int64_t svi_stack[32];
+    in_worker_ctx_t ic;
+    ray_t* sv_hdr = NULL;
+    ray_t* lut_hdr = NULL;
+    if (in_build_worker_ctx(col, set_lit, negate, svf_stack, svi_stack,
+                            &ic, &sv_hdr, &lut_hdr) != IN_CTX_OK)
+        return NULL;  /* STR / OOM → bool-path fallback */
+
+    in_sel_fill_ctx_t fctx = { &ic };
+    ray_t* sel = pred_sel_drive(nrows, in_sel_fill, &fctx, all_pass);
+
+    if (sv_hdr) ray_free(sv_hdr);
+    if (lut_hdr) ray_free(lut_hdr);
+    return sel;
 }
 
 /* ============================================================================
@@ -917,6 +1186,30 @@ static ray_t* exec_in(ray_graph_t* g, ray_op_t* op, ray_t* col, ray_t* set) {
  *
  * Float literals (F32/F64) decode into *out_key_f; integer literals decode
  * into *out_key_i.  Hash-eq only uses integer keys; zone uses both. */
+/* Flatten an OP_AND tree into its conjunct predicate nodes.  Returns the
+ * count, or 0 when the root is not an AND or the tree exceeds max. */
+static int idx_flatten_and(ray_graph_t* g, ray_op_t* op,
+                           ray_op_t** out, int max) {
+    if (!op || op->opcode != OP_AND) return 0;
+    ray_op_t* stack[8];
+    int sp = 0, n = 0;
+    stack[sp++] = op;
+    while (sp > 0) {
+        ray_op_t* nd = stack[--sp];
+        if (nd->opcode == OP_AND) {
+            ray_op_t* l = op_child(g, nd, 0);
+            ray_op_t* r = op_child(g, nd, 1);
+            if (!l || !r || sp + 2 > 8) return 0;
+            stack[sp++] = l;
+            stack[sp++] = r;
+        } else {
+            if (n >= max) return 0;
+            out[n++] = nd;
+        }
+    }
+    return n;
+}
+
 static int idx_filter_decode(ray_graph_t* g, ray_op_t* pred_op,
                              ray_t** out_col, uint16_t* out_cmp_op,
                              int64_t* out_key_i, double* out_key_f,
@@ -959,7 +1252,8 @@ static int idx_filter_decode(ray_graph_t* g, ray_op_t* pred_op,
     case -RAY_U8:        key_i = (int64_t)cv->b8;          break;
     case -RAY_F64:       key_f = cv->f64;    is_float = 1; break;
     case -RAY_F32:       key_f = cv->f64;    is_float = 1; break; /* F32 atoms use f64 slot */
-    default: return 0;  /* sym / str / guid — not eligible */
+    case -RAY_SYM:       key_i = cv->i64;               break; /* global intern id; domain-resolved at consult */
+    default: return 0;  /* str / guid — not eligible */
     }
 
     /* Reconcile the literal's family with the COLUMN's family.  Index
@@ -1048,6 +1342,88 @@ static ray_t* exec_pushed_group_filter(ray_graph_t* g, ray_op_t* filter_op) {
     }
     ray_release(fres);  /* lazy: original table back, selection installed */
     return NULL;
+}
+
+/* Collect the distinct source-column syms referenced by the expression
+ * subtrees under roots[] into syms[] (at most max), and report via
+ * *has_expr whether any root is a computed expression rather than a plain
+ * scan or literal.  Only scalar expression nodes (OP_SCAN/OP_CONST and the
+ * element-wise range OP_ROUND..OP_IDIV) are admitted in the walk; any other
+ * opcode, an oversized graph, or overflow returns -1 — callers must treat
+ * that as "unknown" and skip the optimisation. */
+static int collect_scan_syms(ray_graph_t* g, const uint32_t* roots, int nroots,
+                             int64_t* syms, int max, bool* has_expr) {
+    *has_expr = false;
+    uint32_t nc = g->node_count;
+    if (nc > 4096) return -1;
+
+    uint32_t stack[64];
+    int sp = 0, n = 0;
+    bool visited[4096];
+    memset(visited, 0, nc * sizeof(bool));
+
+    for (int r = 0; r < nroots; r++) {
+        if (roots[r] >= nc) return -1;
+        uint16_t opc = g->nodes[roots[r]].opcode;
+        if (opc != OP_SCAN && opc != OP_CONST) *has_expr = true;
+        if (sp >= 64) return -1;
+        stack[sp++] = roots[r];
+    }
+
+    while (sp > 0) {
+        uint32_t nid = stack[--sp];
+        if (nid >= nc || visited[nid]) continue;
+        visited[nid] = true;
+        ray_op_t* node = &g->nodes[nid];
+        if (node->flags & OP_FLAG_DEAD) continue;
+
+        if (node->opcode == OP_SCAN) {
+            ray_op_ext_t* sx = find_ext(g, nid);
+            if (!sx) return -1;
+            bool dup = false;
+            for (int j = 0; j < n; j++)
+                if (syms[j] == sx->sym) { dup = true; break; }
+            if (!dup) {
+                if (n >= max) return -1;
+                syms[n++] = sx->sym;
+            }
+            continue;
+        }
+        if (node->opcode == OP_CONST) continue;
+        /* Admit only scalar element-wise expression nodes. */
+        if (node->opcode < OP_ROUND || node->opcode > OP_IDIV) return -1;
+
+        for (int i = 0; i < node->arity && i < 2; i++) {
+            if (node->in_id[i] == RAY_OP_NONE) continue;
+            if (sp >= 64) return -1;
+            stack[sp++] = node->in_id[i];
+        }
+        /* 3-ary ops (OP_IF else / OP_SUBSTR len / OP_REPLACE repl) keep the
+         * third operand in ext->third_in — missing it would compact away a
+         * referenced column. */
+        ray_op_ext_t* nx = find_ext(g, nid);
+        if (nx && nx->third_in != RAY_OP_NONE && nx->third_in != 0) {
+            if (sp >= 64) return -1;
+            stack[sp++] = nx->third_in;
+        }
+    }
+    return n;
+}
+
+/* collect_scan_syms over a GROUP's key + agg-input subtrees. */
+static int group_input_scan_syms(ray_graph_t* g, ray_op_ext_t* gx,
+                                 int64_t* syms, int max, bool* has_expr) {
+    uint32_t roots[3 * 16];
+    int nroots = 0;
+    for (uint8_t k = 0; k < gx->n_keys && nroots < 48; k++)
+        roots[nroots++] = gx->keys[k];
+    for (uint8_t a = 0; a < gx->n_aggs && nroots < 48; a++) {
+        if (gx->agg_ins && gx->agg_ins[a] != RAY_OP_NONE)
+            roots[nroots++] = gx->agg_ins[a];
+        if (gx->agg_ins2 && gx->agg_ins2[a] != RAY_OP_NONE && nroots < 48)
+            roots[nroots++] = gx->agg_ins2[a];
+    }
+    return collect_scan_syms(g, roots, nroots, syms, max, has_expr);
 }
 
 /* Is this opcode a "heavy" pipeline breaker worth profiling? */
@@ -1215,7 +1591,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
              * set g->selection without materializing a compacted table. */
             bool own_input = (input != g->table);
             if (g->selection && input->type == RAY_TABLE) {
-                ray_t* compacted = sel_compact(g, input, g->selection);
+                ray_t* compacted = sel_compact(g, input, g->selection, NULL, 0);
                 if (own_input) ray_release(input);
                 ray_release(g->selection);
                 g->selection = NULL;
@@ -1381,19 +1757,46 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                         }
                     }
 
-                    /* 3. Hash-eq: integer EQ only; re-check HAS_NULLS. */
+                    /* 3. Hash-eq: integer or SYM EQ; re-check HAS_NULLS. */
                     if (cmp_op == OP_EQ && !is_float &&
                         !(col->attrs & RAY_ATTR_HAS_NULLS)) {
-                        if (ray_index_kind(col) == RAY_IDX_HASH)
-                            ray_idx_consults[IDX_SITE_FILTER_HASH]++;
-                        ray_t* sel = ray_index_hash_eq_rowsel(col, key_i);
-                        if (sel) {
-                            ray_idx_hits[IDX_SITE_FILTER_HASH]++;
-                            g->selection = sel;
-                            return input;
+                        /* SYM equality: idx_filter_decode passes the global intern id;
+                         * the hash was built over per-column domain ids.  Resolve here. */
+                        bool sym_probe_skip = false;
+                        if (col->type == RAY_SYM) {
+                            ray_t* cs = ray_sym_str(key_i);
+                            int64_t dom_id = cs
+                                ? ray_sym_domain_find(ray_sym_vec_domain(col),
+                                                      ray_str_ptr(cs), ray_str_len(cs))
+                                : -1;
+                            if (dom_id < 0) {
+                                /* Symbol absent from this column's domain → no rows. */
+                                int64_t nrows = ray_table_nrows(input);
+                                ray_t* empty = ray_index_empty_rowsel(nrows);
+                                if (empty) { g->selection = empty; return input; }
+                                /* OOM — fall through to scan.  key_i here is
+                                 * still the GLOBAL intern id, not dom_id; under
+                                 * the current singleton domain these are equal
+                                 * so the scan yields the correct zero matches.
+                                 * If domains ever diverge, this degraded OOM
+                                 * path would need key_i re-mapped. */
+                                sym_probe_skip = true;
+                            } else {
+                                key_i = dom_id;
+                            }
                         }
-                        /* sel == NULL: ineligible (wrong/stale index kind,
-                         * key out of range) or OOM — fall through to scan. */
+                        if (!sym_probe_skip) {
+                            if (ray_index_kind(col) == RAY_IDX_HASH)
+                                ray_idx_consults[IDX_SITE_FILTER_HASH]++;
+                            ray_t* sel = ray_index_hash_eq_rowsel(col, key_i);
+                            if (sel) {
+                                ray_idx_hits[IDX_SITE_FILTER_HASH]++;
+                                g->selection = sel;
+                                return input;
+                            }
+                            /* sel == NULL: ineligible (wrong/stale index kind,
+                             * key out of range) or OOM — fall through to scan. */
+                        }
                     }
 
                     /* 4. Sort-index range: EQ/LT/LE/GT/GE (NE returns NULL). */
@@ -1409,6 +1812,114 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                                 return input;
                             }
                         }
+                    }
+                }
+
+                /* 4.5 Eq+range conjunction: (col0 == K) AND (range cmps on
+                 * ONE other column).  The eq conjunct's CSR index slice
+                 * gives the candidate rows; when the range column is
+                 * non-descending ALONG that slice — verified with a
+                 * bail-early scan, free on a parted (key,range)-sorted
+                 * layout where the slice is contiguous and the range
+                 * column is the secondary sort key — the bounds binary-
+                 * search to a sub-slice and the whole compound WHERE
+                 * collapses to O(slice-verify + log slice). */
+                {
+                    ray_op_t* conj[4];
+                    int ncj = idx_flatten_and(g, op_child(g, op, 1), conj, 4);
+                    ray_t* eq_col = NULL;
+                    ray_t* rg_col = NULL;
+                    int64_t eq_key = 0;
+                    int64_t lo = INT64_MIN, hi = INT64_MAX;
+                    bool shape_ok = (ncj >= 2);
+                    for (int ci = 0; ci < ncj && shape_ok; ci++) {
+                        ray_t* c = NULL; uint16_t cop = 0;
+                        int64_t ki = 0; double kf = 0.0; int isf = 0;
+                        if (!idx_filter_decode(g, conj[ci], &c, &cop,
+                                               &ki, &kf, &isf) || isf) {
+                            shape_ok = false; break;
+                        }
+                        if (cop == OP_EQ && !eq_col &&
+                            ray_index_kind(c) == RAY_IDX_HASH &&
+                            !(c->attrs & RAY_ATTR_HAS_NULLS)) {
+                            eq_col = c; eq_key = ki;
+                        } else if (cop == OP_GE || cop == OP_GT ||
+                                   cop == OP_LE || cop == OP_LT) {
+                            if (c->attrs & RAY_ATTR_HAS_NULLS) { shape_ok = false; break; }
+                            if (!rg_col) rg_col = c;
+                            else if (rg_col != c) { shape_ok = false; break; }
+                            if (cop == OP_GE)      { if (ki > lo) lo = ki; }
+                            else if (cop == OP_GT) { if (ki == INT64_MAX) { lo = 1; hi = 0; } else if (ki + 1 > lo) lo = ki + 1; }
+                            else if (cop == OP_LE) { if (ki < hi) hi = ki; }
+                            else                   { if (ki == INT64_MIN) { lo = 1; hi = 0; } else if (ki - 1 < hi) hi = ki - 1; }
+                        } else { shape_ok = false; break; }
+                    }
+                    if (shape_ok && eq_col && rg_col && rg_col != eq_col) {
+                        ray_idx_consults[IDX_SITE_FILTER_EQRANGE]++;
+                        /* SYM eq: global intern id -> this column's domain
+                         * (mirrors the single-eq consult above). */
+                        int64_t probe = eq_key;
+                        bool absent = false;
+                        if (eq_col->type == RAY_SYM) {
+                            ray_t* cs = ray_sym_str(eq_key);
+                            int64_t dom_id = cs
+                                ? ray_sym_domain_find(ray_sym_vec_domain(eq_col),
+                                                      ray_str_ptr(cs),
+                                                      ray_str_len(cs))
+                                : -1;
+                            if (dom_id < 0) absent = true;
+                            else probe = dom_id;
+                        }
+                        const int64_t* grows = NULL;
+                        int64_t gn = 0;
+                        int hit = absent ? 0
+                            : ray_index_hash_group(eq_col, probe, &grows, &gn);
+                        if (hit == 0 || (hit > 0 && lo > hi)) {
+                            /* provably empty: absent key or empty range */
+                            int64_t nrows = ray_table_nrows(input);
+                            ray_t* sel = ray_index_rowsel_from_ids(nrows, NULL, 0);
+                            if (sel) {
+                                ray_idx_hits[IDX_SITE_FILTER_EQRANGE]++;
+                                g->selection = sel;
+                                return input;
+                            }
+                        } else if (hit > 0) {
+                            const void* rgd = ray_data(rg_col);
+                            int8_t  rt = rg_col->type;
+                            uint8_t ra = rg_col->attrs;
+                            bool mono = true;
+                            int64_t prevv = INT64_MIN;
+                            for (int64_t pp = 0; pp < gn; pp++) {
+                                int64_t v = read_col_i64(rgd, grows[pp], rt, ra);
+                                if (v < prevv) { mono = false; break; }
+                                prevv = v;
+                            }
+                            if (mono) {
+                                int64_t a = 0, b = gn;   /* first pos >= lo */
+                                while (a < b) {
+                                    int64_t m = a + (b - a) / 2;
+                                    if (read_col_i64(rgd, grows[m], rt, ra) < lo) a = m + 1;
+                                    else b = m;
+                                }
+                                int64_t startp = a;
+                                b = gn;                   /* first pos > hi */
+                                while (a < b) {
+                                    int64_t m = a + (b - a) / 2;
+                                    if (read_col_i64(rgd, grows[m], rt, ra) <= hi) a = m + 1;
+                                    else b = m;
+                                }
+                                int64_t nrows = ray_table_nrows(input);
+                                ray_t* sel = ray_index_rowsel_from_ids(
+                                    nrows, grows + startp, a - startp);
+                                if (sel) {
+                                    ray_idx_hits[IDX_SITE_FILTER_EQRANGE]++;
+                                    g->selection = sel;
+                                    return input;
+                                }
+                            }
+                            /* non-monotone slice / OOM: fall through */
+                        }
+                        /* hit < 0 (stale/ineligible index): fall through */
                     }
                 }
 
@@ -1432,6 +1943,110 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                                 return input;
                             }
                             /* NULL: guard fired, ineligible, or OOM — fall through. */
+                        }
+                    }
+                }
+
+                /* 6. Fused predicate→selection: when the WHERE predicate is an
+                 * expr-evaluable BOOL subtree, stream its per-morsel bools
+                 * straight into a rowsel — skipping both the full BOOL vec and
+                 * the second BOOL→rowsel scan.  Any unsupported shape (parted,
+                 * >RAY_POOL_MAX_TASKS, OOM) returns NULL+all_pass=false,
+                 * falling through to the bool path. */
+                ray_op_t* pred_root = op_child(g, op, 1);
+                {
+                    int64_t fnrows = ray_table_nrows(input);
+                    bool all_pass = false;
+                    ray_t* fsel = exec_pred_to_selection(g, pred_root, fnrows,
+                                                         &all_pass);
+                    if (fsel || all_pass) {
+                        g->selection = fsel;  /* NULL when all rows pass */
+                        return input;
+                    }
+                    /* unsupported / OOM at runtime — fall through. */
+                }
+            }
+
+            /* Sparse chained-filter refine: the optimizer splits compound
+             * WHEREs selectivity-first, so a second FILTER arrives here
+             * with the first filter's selection installed — and evaluating
+             * its predicate over ALL rows to refine a few survivors wastes
+             * O(rows).  Gather only the predicate's columns for the
+             * surviving rows, evaluate the predicate over that dense
+             * subset, and rebuild the selection from the passing
+             * survivors — O(survivors).  Any ineligibility (non-scalar
+             * predicate shape, OOM, unexpected result) falls through to
+             * the full-width path unchanged. */
+            if (input->type == RAY_TABLE && g->selection) {
+                ray_rowsel_t* smeta = ray_rowsel_meta(g->selection);
+                int64_t fr_nrows = ray_table_nrows(input);
+                int64_t nsel = smeta ? smeta->total_pass : -1;
+                if (nsel >= 0 && fr_nrows > 0 && nsel * 4 <= fr_nrows) {
+                    ray_op_t* pred_root = op_child(g, op, 1);
+                    int64_t keep[32];
+                    bool has_expr = false;
+                    uint32_t roots[1] = { pred_root->id };
+                    int nkeep = collect_scan_syms(g, roots, 1, keep, 32,
+                                                  &has_expr);
+                    if (nkeep > 0) {
+                        ray_t* sub = sel_compact(g, input, g->selection,
+                                                 keep, nkeep);
+                        if (sub && !RAY_IS_ERR(sub) && sub != input) {
+                            ray_t* saved_tbl = g->table;
+                            ray_t* saved_sel = g->selection;
+                            g->table = sub;
+                            g->selection = NULL;
+                            ray_t* pv = exec_node(g, pred_root);
+                            g->table = saved_tbl;
+                            g->selection = saved_sel;
+                            bool done_refine = false;
+                            if (pv && !RAY_IS_ERR(pv) &&
+                                pv->type == RAY_BOOL && pv->len == nsel) {
+                                ray_t* ids_hdr = NULL;
+                                int64_t* ids = (int64_t*)scratch_alloc(
+                                    &ids_hdr,
+                                    (size_t)(nsel > 0 ? nsel : 1) * 8);
+                                if (ids) {
+                                    const uint8_t*  fl  = ray_rowsel_flags(g->selection);
+                                    const uint32_t* off = ray_rowsel_offsets(g->selection);
+                                    const uint16_t* ix  = ray_rowsel_idx(g->selection);
+                                    const uint8_t*  bv  = (const uint8_t*)ray_data(pv);
+                                    uint32_t n_segs = smeta->n_segs;
+                                    int64_t j = 0, kept = 0;
+                                    for (uint32_t seg = 0; seg < n_segs; seg++) {
+                                        uint8_t f = fl[seg];
+                                        if (f == RAY_SEL_NONE) continue;
+                                        int64_t ss = (int64_t)seg * RAY_MORSEL_ELEMS;
+                                        int64_t se = ss + RAY_MORSEL_ELEMS;
+                                        if (se > fr_nrows) se = fr_nrows;
+                                        if (f == RAY_SEL_ALL) {
+                                            for (int64_t r = ss; r < se; r++, j++)
+                                                if (bv[j]) ids[kept++] = r;
+                                        } else {
+                                            const uint16_t* sl = ix + off[seg];
+                                            uint32_t sn = off[seg + 1] - off[seg];
+                                            for (uint32_t i2 = 0; i2 < sn; i2++, j++)
+                                                if (bv[j]) ids[kept++] = ss + sl[i2];
+                                        }
+                                    }
+                                    ray_t* nsel_blk = ray_index_rowsel_from_ids(
+                                        fr_nrows, ids, kept);
+                                    scratch_free(ids_hdr);
+                                    if (nsel_blk) {
+                                        ray_release(g->selection);
+                                        g->selection = nsel_blk;
+                                        done_refine = true;
+                                    }
+                                }
+                            }
+                            if (pv && !RAY_IS_ERR(pv)) ray_release(pv);
+                            else if (pv) ray_error_free(pv);
+                            ray_release(sub);
+                            if (done_refine) return input;
+                        } else if (sub && sub != input) {
+                            ray_release(sub);
+                        } else if (sub == input) {
+                            ray_release(sub);   /* all-pass retain */
                         }
                     }
                 }
@@ -1477,7 +2092,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
             ray_t* tbl = (input->type == RAY_TABLE) ? input : g->table;
             /* Compact lazy selection before sort (needs dense data) */
             if (g->selection && tbl && !RAY_IS_ERR(tbl) && tbl->type == RAY_TABLE) {
-                ray_t* compacted = sel_compact(g, tbl, g->selection);
+                ray_t* compacted = sel_compact(g, tbl, g->selection, NULL, 0);
                 if (input != g->table) ray_release(input);
                 ray_release(g->selection);
                 g->selection = NULL;
@@ -1543,6 +2158,55 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 /* NULL → lazy path; g->selection installed, tbl unchanged */
             }
 
+            /* Sparse-selection pre-compaction: when the WHERE selection
+             * admits far fewer rows than the table AND some group input is
+             * a computed expression, exec_group would still materialize the
+             * expression over ALL rows (expr_eval_full) and only then skip
+             * non-selected entries.  Gather the referenced columns once
+             * (sel_compact keep-set) and group the dense survivors with no
+             * selection instead.  Plain-scan-only groups stay on the lazy
+             * path — their selection-aware loops are already optimal. */
+            if (g->selection && tbl && tbl->type == RAY_TABLE) {
+                ray_op_ext_t* gx = find_ext(g, op->id);
+                ray_rowsel_t* meta = ray_rowsel_meta(g->selection);
+                int64_t nrows = ray_table_nrows(tbl);
+                /* Contiguity-aware admission: when most surviving rows sit
+                 * in ALL-flagged rowsel segments (contiguous runs — the
+                 * parted-layout shape), sel_compact's gather is nearly
+                 * sequential memcpy, so compaction pays off at much higher
+                 * densities than the scattered-row case. */
+                int64_t all_rows = 0;
+                if (meta) {
+                    const uint8_t* fl = ray_rowsel_flags(g->selection);
+                    for (uint32_t sg = 0; sg < meta->n_segs; sg++)
+                        if (fl[sg] == RAY_SEL_ALL) all_rows += RAY_MORSEL_ELEMS;
+                }
+                bool contig = meta && meta->total_pass > 0 &&
+                              all_rows * 4 >= meta->total_pass * 3;
+                if (gx && meta && nrows > 0 &&
+                    meta->total_pass * (contig ? 2 : 16) <= nrows) {
+                    int64_t keep[32];
+                    bool has_expr = false;
+                    int nkeep = group_input_scan_syms(g, gx, keep, 32, &has_expr);
+                    if (nkeep > 0 && has_expr) {
+                        ray_t* compacted = sel_compact(g, tbl, g->selection,
+                                                       keep, nkeep);
+                        if (compacted && !RAY_IS_ERR(compacted) &&
+                            compacted != tbl) {
+                            if (owned_tbl) ray_release(owned_tbl);
+                            owned_tbl = compacted;
+                            tbl = compacted;
+                            ray_release(g->selection);
+                            g->selection = NULL;
+                        } else if (compacted) {
+                            /* all-pass / alloc-fallback returned tbl retained,
+                             * or an error — drop it and keep the lazy path. */
+                            ray_release(compacted);
+                        }
+                    }
+                }
+            }
+
             /* Lazy selection is consumed by exec_group itself — all
              * paths (sequential, DA, radix-parallel) honour the
              * bitmap via group_rows_range / radix scan loops.  We
@@ -1562,7 +2226,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
             ray_t* tbl = g->table;
             ray_t* owned_tbl = NULL;
             if (g->selection) {
-                ray_t* compacted = sel_compact(g, tbl, g->selection);
+                ray_t* compacted = sel_compact(g, tbl, g->selection, NULL, 0);
                 if (!compacted || RAY_IS_ERR(compacted)) return compacted;
                 ray_release(g->selection);
                 g->selection = NULL;
@@ -1581,7 +2245,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
             if (!right || RAY_IS_ERR(right)) { ray_release(left); return right; }
             /* Compact lazy selection before join (needs dense data) */
             if (g->selection && left && !RAY_IS_ERR(left) && left->type == RAY_TABLE) {
-                ray_t* compacted = sel_compact(g, left, g->selection);
+                ray_t* compacted = sel_compact(g, left, g->selection, NULL, 0);
                 ray_release(left);
                 ray_release(g->selection);
                 g->selection = NULL;
@@ -1599,7 +2263,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
             if (!left || RAY_IS_ERR(left)) { if (right && !RAY_IS_ERR(right)) ray_release(right); return left; }
             if (!right || RAY_IS_ERR(right)) { ray_release(left); return right; }
             if (g->selection && left && !RAY_IS_ERR(left) && left->type == RAY_TABLE) {
-                ray_t* compacted = sel_compact(g, left, g->selection);
+                ray_t* compacted = sel_compact(g, left, g->selection, NULL, 0);
                 ray_release(left);
                 ray_release(g->selection);
                 g->selection = NULL;
@@ -1617,7 +2281,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
             if (!left || RAY_IS_ERR(left)) { if (right && !RAY_IS_ERR(right)) ray_release(right); return left; }
             if (!right || RAY_IS_ERR(right)) { ray_release(left); return right; }
             if (g->selection && left && !RAY_IS_ERR(left) && left->type == RAY_TABLE) {
-                ray_t* compacted = sel_compact(g, left, g->selection);
+                ray_t* compacted = sel_compact(g, left, g->selection, NULL, 0);
                 ray_release(left);
                 ray_release(g->selection);
                 g->selection = NULL;
@@ -1635,7 +2299,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
             ray_t* wdf = (input->type == RAY_TABLE) ? input : g->table;
             /* Compact lazy selection before window (needs dense data) */
             if (g->selection && wdf && !RAY_IS_ERR(wdf) && wdf->type == RAY_TABLE) {
-                ray_t* compacted = sel_compact(g, wdf, g->selection);
+                ray_t* compacted = sel_compact(g, wdf, g->selection, NULL, 0);
                 if (input != g->table) ray_release(input);
                 ray_release(g->selection);
                 g->selection = NULL;
@@ -1659,7 +2323,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 ray_t* tbl = (sort_input->type == RAY_TABLE) ? sort_input : g->table;
                 /* Compact lazy selection before sort */
                 if (g->selection && tbl && !RAY_IS_ERR(tbl) && tbl->type == RAY_TABLE) {
-                    ray_t* compacted = sel_compact(g, tbl, g->selection);
+                    ray_t* compacted = sel_compact(g, tbl, g->selection, NULL, 0);
                     if (sort_input != g->table) ray_release(sort_input);
                     ray_release(g->selection);
                     g->selection = NULL;
@@ -1704,7 +2368,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                         }
                     }
                     if (needs) {
-                        ray_t* compacted = sel_compact(g, tbl, g->selection);
+                        ray_t* compacted = sel_compact(g, tbl, g->selection, NULL, 0);
                         if (!compacted || RAY_IS_ERR(compacted)) return compacted;
                         ray_release(g->selection);
                         g->selection = NULL;
@@ -1729,7 +2393,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 ray_t* ftbl = (filter_input->type == RAY_TABLE)
                            ? filter_input : g->table;
                 if (g->selection && ftbl && ftbl->type == RAY_TABLE) {
-                    ray_t* compacted = sel_compact(g, ftbl, g->selection);
+                    ray_t* compacted = sel_compact(g, ftbl, g->selection, NULL, 0);
                     if (filter_input != g->table) ray_release(filter_input);
                     ray_release(g->selection);
                     g->selection = NULL;
@@ -2033,6 +2697,42 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
             if (!ext) { ray_release(input); return ray_error("nyi", NULL); }
             uint8_t n_cols = ext->sort.n_cols;
             uint32_t* columns = ext->sort.columns;
+
+            /* Sparse-selection pre-compaction (mirrors OP_GROUP): expression
+             * columns would otherwise be evaluated over ALL rows, with the
+             * selection applied only when ray_execute_inner gathers the full-
+             * length result.  Gather the referenced input columns once and
+             * project the dense survivors instead — the final gather then
+             * disappears (the selection is consumed here).  Plain-scan-only
+             * projections stay lazy: they share column refs and the single
+             * final gather is already optimal. */
+            if (g->selection && n_cols > 0) {
+                ray_rowsel_t* smeta = ray_rowsel_meta(g->selection);
+                int64_t in_rows = ray_table_nrows(input);
+                if (smeta && in_rows > 0 && smeta->total_pass * 4 <= in_rows) {
+                    int64_t keep[32];
+                    bool has_expr = false;
+                    int nkeep = collect_scan_syms(g, columns, n_cols,
+                                                  keep, 32, &has_expr);
+                    if (nkeep > 0 && has_expr) {
+                        ray_t* compacted = sel_compact(g, input, g->selection,
+                                                       keep, nkeep);
+                        if (compacted && !RAY_IS_ERR(compacted) &&
+                            compacted != input) {
+                            ray_release(input);
+                            input = compacted;
+                            ray_release(g->selection);
+                            g->selection = NULL;
+                        } else if (compacted) {
+                            /* all-pass / alloc-fallback returned input
+                             * retained, or an error — drop it and keep the
+                             * lazy final-gather path. */
+                            ray_release(compacted);
+                        }
+                    }
+                }
+            }
+
             ray_t* result = ray_table_new(n_cols);
 
             /* Set g->table so SCAN nodes inside expressions resolve correctly */
@@ -2591,7 +3291,16 @@ static ray_t* ray_execute_inner(ray_graph_t* g, ray_op_t* root) {
         ray_t* result = exec_node(g, root);
         if (g->selection && result && !RAY_IS_ERR(result)
             && result->type == RAY_TABLE) {
-            ray_t* compacted = sel_compact(g, result, g->selection);
+            /* Projection-aware compaction: a select publishes the keys-only
+             * keep-set of its distinct downstream via __VM->filt_keep before
+             * this ray_execute; gather only those columns.  Depth-gated so a
+             * nested subquery's own finalization does not consume it. */
+            const int64_t* keep = NULL; int keep_n = 0;
+            if (__VM && __VM->filt_keep && __VM->filt_keep_n > 0
+                && __VM->eval_depth == __VM->filt_depth) {
+                keep = __VM->filt_keep; keep_n = __VM->filt_keep_n;
+            }
+            ray_t* compacted = sel_compact(g, result, g->selection, keep, keep_n);
             ray_release(result);
             ray_release(g->selection);
             g->selection = NULL;
@@ -2690,7 +3399,7 @@ static ray_t* ray_execute_inner(ray_graph_t* g, ray_op_t* root) {
         /* Compact lazy selection for this segment */
         if (g->selection && partial && !RAY_IS_ERR(partial)
             && partial->type == RAY_TABLE) {
-            ray_t* compacted = sel_compact(g, partial, g->selection);
+            ray_t* compacted = sel_compact(g, partial, g->selection, NULL, 0);
             ray_release(partial);
             ray_release(g->selection);
             g->selection = NULL;

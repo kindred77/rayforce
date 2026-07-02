@@ -28,7 +28,7 @@
 ;; --- 2. Nulls produce empty fields, not garbage ---
 ;; Before the fix, null i64 wrote 0 and null sym wrote a phantom
 ;; intern-table value that depended on session state.
-(set tB (table [i s] (list [1 0Nl 3] [aa 0Ns cc])))(.csv.write tB "rf_test_write_b.csv") -- 0
+(set tB (table [i s] (list [1 0Nl 3] [aa ' cc])))(.csv.write tB "rf_test_write_b.csv") -- 0
 (set linesB (split (read "rf_test_write_b.csv") "\n"))(count linesB) -- 5
 ;; header + 3 rows + trailing ""
 (at linesB 0) -- "i,s"

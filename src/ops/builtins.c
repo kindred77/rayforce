@@ -76,7 +76,8 @@ static const char* null_literal_str(int8_t type) {
         case RAY_DATE:      return "0Nd";
         case RAY_TIME:      return "0Nt";
         case RAY_TIMESTAMP: return "0Np";
-        case RAY_SYM:       return "0Ns";
+        /* SYM has no null literal: empty symbol is a value, never reaches
+         * here — callers gate on RAY_ATOM_IS_NULL, always false for SYM. */
         default:            return "null";
     }
 }
@@ -217,6 +218,8 @@ static char* fmt_interpolate(const char* fmt, size_t flen, ray_t** args, int64_t
                 if (ss) {
                     const char* sp = ray_str_ptr(ss);
                     size_t sl = ray_str_len(ss);
+                    /* sym 0 resolves to "" — the empty symbol shows as ' */
+                    if (sl == 0) { sp = "'"; sl = 1; }
                     while (pos + sl + 1 > cap) { cap *= 2; buf = ray_sys_realloc(buf, cap); }
                     memcpy(buf + pos, sp, sl);
                     pos += sl;
@@ -488,6 +491,9 @@ static int8_t resolve_type_name(int64_t sym_id) {
     if (len == 3 && memcmp(name, "I64", 3) == 0) result = RAY_I64;
     else if (len == 3 && memcmp(name, "I32", 3) == 0) result = RAY_I32;
     else if (len == 3 && memcmp(name, "I16", 3) == 0) result = RAY_I16;
+    /* INT — schema-only marker; csv.c resolves it to the narrowest int width
+     * (I16/I32/I64) from the column's parsed min/max/has_null. */
+    else if (len == 3 && memcmp(name, "INT", 3) == 0) result = RAY_CSV_AUTO_TAG;
     else if (len == 3 && memcmp(name, "F64", 3) == 0) result = RAY_F64;
     else if (len == 2 && memcmp(name, "B8", 2) == 0) result = RAY_BOOL;
     else if (len == 2 && memcmp(name, "U8", 2) == 0) result = RAY_U8;
@@ -660,7 +666,18 @@ ray_t* ray_read_csv_splayed_fn(ray_t** args, int64_t n) {
     char sym_path[1024];
     const char* sym = csv_default_sym_path(dir, sym_path, sizeof(sym_path));
     if (!sym) return ray_error("io", NULL);
-    return ray_read_splayed(dir, sym);
+
+    /* The streaming writer emits raw columns; append chunk-zone indexes to the
+     * just-written files, then reload so the returned table carries them
+     * (mmap'd in place).  Without this, an on-disk column would lack the
+     * block-skip an in-memory .csv.read column has. */
+    ray_t* tbl = ray_read_splayed(dir, sym);
+    if (tbl && !RAY_IS_ERR(tbl) && tbl->type == RAY_TABLE) {
+        ray_splay_build_indexes(dir, tbl);
+        ray_release(tbl);
+        tbl = ray_read_splayed(dir, sym);
+    }
+    return tbl;
 }
 
 ray_t* ray_read_csv_parted_fn(ray_t** args, int64_t n) {
@@ -1840,7 +1857,7 @@ ray_t* ray_load_file_fn(ray_t* path_obj) {
     fseek(fp, 0, SEEK_SET);
     if (sz < 0) { fclose(fp); return ray_error("io", NULL); }
     if (sz == 0) { fclose(fp); return ray_i64(0); }
-    char* buf = (char*)malloc((size_t)sz + 1);
+    char* buf = (char*)ray_alloc_raw((size_t)sz + 1);
     if (!buf) { fclose(fp); return ray_error("oom", NULL); }
     size_t rd = fread(buf, 1, (size_t)sz, fp);
     fclose(fp);
@@ -1848,7 +1865,7 @@ ray_t* ray_load_file_fn(ray_t* path_obj) {
 
     ray_t* nfo = ray_nfo_create(path, path_len, buf, rd);
     ray_t* parsed = ray_parse_with_nfo(buf, nfo);
-    if (RAY_IS_ERR(parsed)) { ray_release(nfo); free(buf); return parsed; }
+    if (RAY_IS_ERR(parsed)) { ray_release(nfo); ray_free_raw(buf); return parsed; }
 
     ray_t* prev_nfo = ray_eval_get_nfo();
     ray_eval_set_nfo(nfo);
@@ -1857,7 +1874,7 @@ ray_t* ray_load_file_fn(ray_t* path_obj) {
 
     ray_release(parsed);
     ray_release(nfo);
-    free(buf);
+    ray_free_raw(buf);
     return result;
 #else
     int fd = open(path, O_RDONLY);
@@ -1870,7 +1887,7 @@ ray_t* ray_load_file_fn(ray_t* path_obj) {
     close(fd);
     if (map == MAP_FAILED) return ray_error("io", NULL);
     /* Copy to NUL-terminated buffer -- mmap region may not have a trailing NUL */
-    char* buf = (char*)malloc(sz + 1);
+    char* buf = (char*)ray_alloc_raw(sz + 1);
     if (!buf) { munmap(map, sz); return ray_error("oom", NULL); }
     memcpy(buf, map, sz);
     buf[sz] = '\0';
@@ -1878,7 +1895,7 @@ ray_t* ray_load_file_fn(ray_t* path_obj) {
 
     ray_t* nfo = ray_nfo_create(path, path_len, buf, sz);
     ray_t* parsed = ray_parse_with_nfo(buf, nfo);
-    if (RAY_IS_ERR(parsed)) { ray_release(nfo); free(buf); return parsed; }
+    if (RAY_IS_ERR(parsed)) { ray_release(nfo); ray_free_raw(buf); return parsed; }
 
     ray_t* prev_nfo = ray_eval_get_nfo();
     ray_eval_set_nfo(nfo);
@@ -1887,7 +1904,7 @@ ray_t* ray_load_file_fn(ray_t* path_obj) {
 
     ray_release(parsed);
     ray_release(nfo);
-    free(buf);
+    ray_free_raw(buf);
     return result;
 #endif
 }
@@ -2606,7 +2623,13 @@ ray_t* ray_group_fn(ray_t* x) {
             continue;
         }
         int64_t v;
-        if (x->type == RAY_SYM || x->type == RAY_I64 || x->type == RAY_TIMESTAMP)
+        /* SYM columns have an adaptive dictionary-index width (W8/W16/W32/W64
+         * in attrs); read through ray_read_sym rather than assuming W64, or a
+         * narrow-width column (e.g. a few distinct exchanges => W8) is read at
+         * an 8-byte stride and walks off the end of the buffer. */
+        if (x->type == RAY_SYM)
+            v = ray_read_sym(ray_data(x), i, x->type, x->attrs);
+        else if (x->type == RAY_I64 || x->type == RAY_TIMESTAMP)
             v = ((int64_t*)ray_data(x))[i];
         else if (x->type == RAY_I32 || x->type == RAY_DATE || x->type == RAY_TIME)
             v = ((int32_t*)ray_data(x))[i];
@@ -3228,7 +3251,7 @@ ray_t* ray_ungroup_fn(ray_t* x) {
      * columns must agree on n_i for each row.  Build a replication index
      * vector idx[] = each row i repeated n_i times (for flat gather). */
     int64_t total = 0;
-    int64_t* counts = (int64_t*)malloc((size_t)(nrows > 0 ? nrows : 1) * sizeof(int64_t));
+    int64_t* counts = (int64_t*)ray_alloc_raw((size_t)(nrows > 0 ? nrows : 1) * sizeof(int64_t));
     if (!counts) return ray_error("oom", NULL);
 
     for (int64_t i = 0; i < nrows; i++) {
@@ -3248,9 +3271,9 @@ ray_t* ray_ungroup_fn(ray_t* x) {
                 len_i = 1;
             else if (cell && ray_is_vec(cell) && cell->type != RAY_LIST)
                 len_i = ray_len(cell);
-            else { free(counts); return ray_error("type", "ungroup: nested cell must be an atom or non-list vector"); }
+            else { ray_free_raw(counts); return ray_error("type", "ungroup: nested cell must be an atom or non-list vector"); }
             if (n_i < 0) n_i = len_i;
-            else if (n_i != len_i) { free(counts); return ray_error("length", "ungroup: nested columns disagree on row length, got %lld and %lld", (long long)n_i, (long long)len_i); }
+            else if (n_i != len_i) { ray_free_raw(counts); return ray_error("length", "ungroup: nested columns disagree on row length, got %lld and %lld", (long long)n_i, (long long)len_i); }
         }
         if (n_i < 0) n_i = 0;
         counts[i] = n_i;
@@ -3258,7 +3281,7 @@ ray_t* ray_ungroup_fn(ray_t* x) {
     }
 
     ray_t* idx = ray_vec_new(RAY_I64, total > 0 ? total : 1);
-    if (!idx || RAY_IS_ERR(idx)) { free(counts); return idx ? idx : ray_error("oom", NULL); }
+    if (!idx || RAY_IS_ERR(idx)) { ray_free_raw(counts); return idx ? idx : ray_error("oom", NULL); }
     idx->len = total;
     int64_t* idxd = (int64_t*)ray_data(idx);
     int64_t pos = 0;
@@ -3267,7 +3290,7 @@ ray_t* ray_ungroup_fn(ray_t* x) {
 
     /* Rebuild every column, preserving names and order. */
     ray_t* out = ray_table_new(ncols);
-    if (!out || RAY_IS_ERR(out)) { free(counts); ray_release(idx); return out ? out : ray_error("oom", NULL); }
+    if (!out || RAY_IS_ERR(out)) { ray_free_raw(counts); ray_release(idx); return out ? out : ray_error("oom", NULL); }
 
     for (int64_t c = 0; c < ncols; c++) {
         ray_t* col = ray_table_get_col_idx(x, c);
@@ -3282,31 +3305,31 @@ ray_t* ray_ungroup_fn(ray_t* x) {
              * column length must equal the row count.  Convert any future
              * invariant break into a clean error instead of a corrupt table. */
             if (newcol && !RAY_IS_ERR(newcol) && ray_len(newcol) != total) {
-                ray_release(newcol); ray_release(out); ray_release(idx); free(counts);
+                ray_release(newcol); ray_release(out); ray_release(idx); ray_free_raw(counts);
                 return ray_error("length", "ungroup: razed column length mismatch, got %lld, expected %lld", (long long)ray_len(newcol), (long long)total);
             }
         } else if (col && !RAY_IS_ERR(col)) {
             /* Flat: gather row i repeated n_i times. */
             newcol = gather_by_idx(col, idxd, total);
         } else {
-            ray_release(out); ray_release(idx); free(counts);
+            ray_release(out); ray_release(idx); ray_free_raw(counts);
             return ray_error("type", "ungroup: invalid column");
         }
         if (!newcol || RAY_IS_ERR(newcol)) {
-            ray_release(out); ray_release(idx); free(counts);
+            ray_release(out); ray_release(idx); ray_free_raw(counts);
             return newcol ? newcol : ray_error("oom", NULL);
         }
         ray_t* added = ray_table_add_col(out, name, newcol);
         ray_release(newcol);
         if (!added || RAY_IS_ERR(added)) {
-            ray_release(idx); free(counts);
+            ray_release(idx); ray_free_raw(counts);
             return added ? added : ray_error("oom", NULL);
         }
         out = added;
     }
 
     ray_release(idx);
-    free(counts);
+    ray_free_raw(counts);
     return out;
 }
 

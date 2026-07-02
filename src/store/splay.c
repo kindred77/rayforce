@@ -25,8 +25,12 @@
 #include "core/runtime.h"
 #include "store/col.h"
 #include "store/fileio.h"
+#include "store/serde.h"
 #include "table/sym.h"
+#include "table/table.h"
 #include "table/domain.h"
+#include "ops/idxop.h"
+#include "vec/str.h"
 #include "lang/format.h"
 #include <string.h>
 #include <stdio.h>
@@ -458,6 +462,82 @@ static ray_t* splay_load_impl(const char* dir, const char* sym_path,
 
 ray_t* ray_splay_load(const char* dir, const char* sym_path) {
     return splay_load_impl(dir, sym_path, false);
+}
+
+/* Build + persist accelerator indexes for a freshly-streamed splayed store.
+ * The .csv.splayed writer emits raw columns; this scans each eligible numeric
+ * column once and APPENDS a chunk-zone index region to its file (no data
+ * rewrite), so a later mmap load gets the same block-skip an in-memory build
+ * has.  Best-effort and idempotent-ish: ray_col_append_index refuses a file
+ * that is not exactly payload-sized (already indexed), so re-runs are no-ops. */
+void ray_splay_build_indexes(const char* dir, ray_t* tbl) {
+    if (!dir || !tbl || RAY_IS_ERR(tbl) || tbl->type != RAY_TABLE) return;
+    int64_t nc = ray_table_ncols(tbl);
+    for (int64_t c = 0; c < nc; c++) {
+        ray_t* col = ray_table_get_col_idx(tbl, c);
+        if (!col || RAY_IS_ERR(col)) continue;
+
+        /* Explicit SYM index: a SYM column carrying a grouped (hash) index in
+         * memory gets a hash index persisted inline — regardless of length (the
+         * grouped attr is deliberate intent, unlike the size-gated auto
+         * dict/chunk-zone below).
+         *
+         * The in-memory index (col->index) is keyed by this column's runtime
+         * domain ids, but the raw column was written re-encoded to FILE-LOCAL
+         * domain positions (ray_col_save_sym_encoded).  Persisting the runtime-
+         * keyed index verbatim would make every reload-time equality probe miss:
+         * the probe resolves the query symbol to a file-local position, which
+         * lands in a different bucket than the runtime id the builder hashed.
+         * So rebuild the hash over the just-written file-local column (loaded
+         * back index-stripped) — that index is keyed in the same space the
+         * probe uses.  The raw file is payload-sized here, so append adds only
+         * the region. */
+        if (col->type == RAY_SYM && ray_index_kind(col) == RAY_IDX_HASH) {
+            ray_t* nstr = ray_sym_str(ray_table_col_name(tbl, c));
+            if (nstr && !RAY_IS_ERR(nstr)) {
+                char path[1024];
+                int n = snprintf(path, sizeof(path), "%s/%.*s", dir,
+                                 (int)ray_str_len(nstr), ray_str_ptr(nstr));
+                if (n > 0 && n < (int)sizeof(path)) {
+                    ray_t* fc = ray_col_load(path);  /* file-local codes */
+                    if (fc && !RAY_IS_ERR(fc)) {
+                        ray_t* fi = ray_idx_hash_fn(fc);  /* hash over file-local */
+                        if (fi && !RAY_IS_ERR(fi)) {
+                            (void)ray_col_append_index(path,
+                                ray_index_payload(fi->index), fi->len, RAY_SYM);
+                            ray_release(fi);
+                        } else if (fi) {
+                            ray_error_free(fi);
+                        }
+                        ray_release(fc);
+                    } else if (fc) {
+                        ray_error_free(fc);
+                    }
+                }
+            }
+            continue;
+        }
+
+        if (col->len < (1 << 16)) continue;
+
+        /* STR columns get a dictionary (group on int codes); numeric/temporal
+         * get the per-chunk min/max for block-skip. */
+        ray_t* idx = (col->type == RAY_STR)
+                     ? ray_index_dict_compute(col)
+                     : ray_index_chunk_zone_compute(col, 16);
+        if (!idx || RAY_IS_ERR(idx)) { if (idx) ray_error_free(idx); continue; }
+
+        ray_t* nstr = ray_sym_str(ray_table_col_name(tbl, c));
+        if (nstr && !RAY_IS_ERR(nstr)) {
+            char path[1100];
+            int n = snprintf(path, sizeof(path), "%s/%.*s", dir,
+                             (int)ray_str_len(nstr), ray_str_ptr(nstr));
+            if (n > 0 && n < (int)sizeof(path))
+                (void)ray_col_append_index(path, ray_index_payload(idx),
+                                           col->len, col->type);
+        }
+        ray_release(idx);
+    }
 }
 
 ray_t* ray_read_splayed(const char* dir, const char* sym_path) {
