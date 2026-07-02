@@ -1788,7 +1788,7 @@ static bool asof_hash_group_match(uint8_t n_eq,
                                   const uint8_t* lt_null,
                                   const uint8_t* rt_null,
                                   int64_t left_n, int64_t right_n,
-                                  bool rt_time_sorted,
+                                  bool rt_time_sorted, bool rt_no_nulls,
                                   int64_t* match_orig) {
     if (left_n <= 0) return true;
     if (right_n >= INT32_MAX - 1 || left_n >= INT32_MAX - 1) return false;
@@ -1865,6 +1865,72 @@ static bool asof_hash_group_match(uint8_t n_eq,
         }
     }
 
+    /* Declared before the index variant's `goto done` so the shared frees
+     * see initialized handles on every route. */
+    ray_t *lut_hdr = NULL, *gnx_hdr = NULL;
+    int32_t* sym_lut  = NULL;
+    int32_t* gid_next = NULL;
+    int64_t  lut_d    = 0;
+
+    /* The caller's signal is the verified `sorted` attr, but the canonical
+     * asof right side is time-sorted whether or not anyone stamped the
+     * attr (xasc does not) — check directly, bailing at the first
+     * violation, so the sequential scan is only paid when it's true and
+     * the cursor merge it enables repays it many times over. */
+    if (ok && !rt_time_sorted && right_n > 1) {
+        rt_time_sorted = true;
+        for (int64_t i = 1; i < right_n; i++)
+            if (rt_time[i] < rt_time[i - 1]) { rt_time_sorted = false; break; }
+    }
+
+    /* Index variant — single eq key carrying a fresh CSR grouped index,
+     * right time globally sorted, no null-marked right rows: every group
+     * is answered straight from its index slice (ascending row ids, hence
+     * ascending times).  NO pass over the right table at all — this is the
+     * parted-layout-parity path: cost is per-probed-key, not per-row. */
+    if (ok && n_eq == 1 && rt_time_sorted && rt_no_nulls &&
+        ray_index_kind(rt_eq[0]) == RAY_IDX_HASH) {
+        ray_idx_consults[IDX_SITE_ASOF]++;
+        bool served = true;
+        ray_t* gsl_hdr = NULL;
+        int64_t* gsl = (int64_t*)scratch_alloc(&gsl_hdr,
+                           (size_t)(n_groups > 0 ? n_groups : 1) * 2 *
+                           sizeof(int64_t));
+        if (gsl) {
+            for (int32_t g = 0; g < n_groups && served; g++) {
+                const int64_t* grows = NULL;
+                int64_t gn = 0;
+                int hit = ray_index_hash_group(rt_eq[0], gkeys[g],
+                                               &grows, &gn);
+                if (hit < 0) { served = false; break; }  /* ineligible */
+                gsl[2 * g]     = (int64_t)(intptr_t)grows;
+                gsl[2 * g + 1] = gn;
+            }
+            if (served) {
+                ray_idx_hits[IDX_SITE_ASOF]++;
+                for (int64_t li = 0; li < left_n; li++) {
+                    int32_t g = left_gid[li];
+                    if (g < 0) { match_orig[li] = -1; continue; }
+                    const int64_t* grows =
+                        (const int64_t*)(intptr_t)gsl[2 * g];
+                    int64_t gn = gsl[2 * g + 1];
+                    int64_t t = lt_time[li];
+                    int64_t lo = 0, hi = gn, best = -1;
+                    while (lo < hi) {
+                        int64_t mid = lo + (hi - lo) / 2;
+                        if (rt_time[grows[mid]] <= t) { best = mid; lo = mid + 1; }
+                        else                          { hi = mid; }
+                    }
+                    match_orig[li] = (best >= 0) ? grows[best] : -1;
+                }
+                scratch_free(gsl_hdr);
+                goto done;
+            }
+        }
+        scratch_free(gsl_hdr);
+        /* ineligible / OOM — fall through to the scan variants */
+    }
+
     if (ok) {
         cnt = (int32_t*)scratch_alloc(&cnt_hdr, ((size_t)n_groups + 1) * 4);
         off = (int32_t*)scratch_alloc(&off_hdr, ((size_t)n_groups + 1) * 4);
@@ -1876,10 +1942,6 @@ static bool asof_hash_group_match(uint8_t n_eq,
      * groups that share the first key.  Replaces the per-row hash+probe in
      * the right pass with one array load — the pass is a sequential scan
      * of the key column, so this is what its speed is made of. */
-    ray_t *lut_hdr = NULL, *gnx_hdr = NULL;
-    int32_t* sym_lut  = NULL;
-    int32_t* gid_next = NULL;
-    int64_t  lut_d    = 0;
     if (ok && n_eq >= 1 && rt_eq[0]->type == RAY_SYM) {
         int64_t d = ray_sym_domain_count(ray_sym_vec_domain(rt_eq[0]));
         if (d > 0 && d <= (int64_t)1 << 22) {
@@ -1953,17 +2015,6 @@ static bool asof_hash_group_match(uint8_t n_eq,
     const uint8_t* r0_base  = (n_eq > 0) ? (const uint8_t*)ray_data(rt_eq[0]) : NULL;
     uint8_t        r0_attrs = (n_eq > 0) ? rt_eq[0]->attrs : 0;
     (void)r0_base; (void)r0_attrs;
-
-    /* The caller's signal is the verified `sorted` attr, but the canonical
-     * asof right side is time-sorted whether or not anyone stamped the
-     * attr (xasc does not) — check directly, bailing at the first
-     * violation, so the sequential scan is only paid when it's true and
-     * the cursor merge it enables repays it many times over. */
-    if (ok && !rt_time_sorted && right_n > 1) {
-        rt_time_sorted = true;
-        for (int64_t i = 1; i < right_n; i++)
-            if (rt_time[i] < rt_time[i - 1]) { rt_time_sorted = false; break; }
-    }
 
     /* Cursor-merge variant — right time GLOBALLY sorted (verified attr):
      * sort the left rows of each group by time, then a single right pass
@@ -2354,12 +2405,18 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
     int64_t* match  = NULL;
 
     /* Primary strategy: hash-group the right side + per-left binary search
-     * (no sorting of either side).  Falls back to the sort-merge when the
-     * per-group right-time monotonicity precondition fails. */
+     * (no sorting of either side; a fresh CSR grouped index on a single eq
+     * key answers groups with no right pass at all).  Falls back to the
+     * sort-merge when the per-group right-time monotonicity precondition
+     * fails. */
+    bool rt_no_nulls = !(rt_time_vec->attrs & RAY_ATTR_HAS_NULLS);
+    for (uint8_t k = 0; k < n_eq && rt_no_nulls; k++)
+        if (rt_eq[k]->attrs & RAY_ATTR_HAS_NULLS) rt_no_nulls = false;
     if (asof_hash_group_match(n_eq, lt_eq, rt_eq, eq_xlut, eq_xn,
                               lt_time, rt_time, lt_null, rt_null,
                               left_n, right_n,
-                              ray_attr_is_sorted(rt_time_vec), match_orig))
+                              ray_attr_is_sorted(rt_time_vec), rt_no_nulls,
+                              match_orig))
         goto build_output;
 
     /* Sort both tables by (eq_keys, time_key) using index arrays.  Rows

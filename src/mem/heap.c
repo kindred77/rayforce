@@ -939,7 +939,10 @@ static void ray_detach_owned_refs(ray_t* v) {
     if (v->type == RAY_INDEX) {
         ray_index_t* ix = ray_index_payload(v);
         switch ((ray_idx_kind_t)ix->kind) {
-        case RAY_IDX_HASH:  ix->u.hash.table = ix->u.hash.chain = NULL; break;
+        case RAY_IDX_HASH:
+            ix->u.hash.table = ix->u.hash.gkeys = NULL;
+            ix->u.hash.offs  = ix->u.hash.rows  = NULL;
+            break;
         case RAY_IDX_SORT:  ix->u.sort.perm = NULL; break;
         case RAY_IDX_BLOOM: ix->u.bloom.bits = NULL; break;
         default: break;

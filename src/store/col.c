@@ -1548,8 +1548,10 @@ static ray_t* col_mmap_impl(const char* path, struct ray_sym_domain_s* dom,
      * reserved _idx_pad slot to munmap the whole region (payload + index). */
     if (cm.has_index) {
         ray_t* idx = ray_index_inline_map((uint8_t*)cm.mapped + cm.index_offset);
-        ray_t* r = ray_index_attach_built(&vec, idx);
-        if (r && !RAY_IS_ERR(r)) vec = r;
+        if (idx) {   /* NULL = stale index layout generation: load unindexed */
+            ray_t* r = ray_index_attach_built(&vec, idx);
+            if (r && !RAY_IS_ERR(r)) vec = r;
+        }
         /* The munmap size is derived from the column + index at free time
          * (ray_free), so no aux slot is needed — leaving str_pool intact on STR. */
         /* Attach failure → column loads unindexed; correctness unaffected. */

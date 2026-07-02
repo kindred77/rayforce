@@ -43,7 +43,7 @@ uint64_t ray_idx_hits[IDX_SITE__N];
 static void idx_stats_dump(void) {
     static const char* names[IDX_SITE__N] = {
         "filter-zone", "filter-bloom", "filter-hash", "filter-range",
-        "in", "find", "sort", "distinct",
+        "in", "find", "sort", "distinct", "asof",
     };
     for (int i = 0; i < IDX_SITE__N; i++)
         if (ray_idx_consults[i] || ray_idx_hits[i])
@@ -242,9 +242,14 @@ void ray_index_release_payload(ray_index_t* ix) {
     case RAY_IDX_HASH:
         if (ix->u.hash.table && !RAY_IS_ERR(ix->u.hash.table))
             ray_release(ix->u.hash.table);
-        if (ix->u.hash.chain && !RAY_IS_ERR(ix->u.hash.chain))
-            ray_release(ix->u.hash.chain);
-        ix->u.hash.table = ix->u.hash.chain = NULL;
+        if (ix->u.hash.gkeys && !RAY_IS_ERR(ix->u.hash.gkeys))
+            ray_release(ix->u.hash.gkeys);
+        if (ix->u.hash.offs && !RAY_IS_ERR(ix->u.hash.offs))
+            ray_release(ix->u.hash.offs);
+        if (ix->u.hash.rows && !RAY_IS_ERR(ix->u.hash.rows))
+            ray_release(ix->u.hash.rows);
+        ix->u.hash.table = ix->u.hash.gkeys = NULL;
+        ix->u.hash.offs  = ix->u.hash.rows  = NULL;
         break;
     case RAY_IDX_SORT:
         if (ix->u.sort.perm && !RAY_IS_ERR(ix->u.sort.perm))
@@ -289,8 +294,12 @@ void ray_index_retain_payload(ray_index_t* ix) {
     case RAY_IDX_HASH:
         if (ix->u.hash.table && !RAY_IS_ERR(ix->u.hash.table))
             ray_retain(ix->u.hash.table);
-        if (ix->u.hash.chain && !RAY_IS_ERR(ix->u.hash.chain))
-            ray_retain(ix->u.hash.chain);
+        if (ix->u.hash.gkeys && !RAY_IS_ERR(ix->u.hash.gkeys))
+            ray_retain(ix->u.hash.gkeys);
+        if (ix->u.hash.offs && !RAY_IS_ERR(ix->u.hash.offs))
+            ray_retain(ix->u.hash.offs);
+        if (ix->u.hash.rows && !RAY_IS_ERR(ix->u.hash.rows))
+            ray_retain(ix->u.hash.rows);
         break;
     case RAY_IDX_SORT:
         if (ix->u.sort.perm && !RAY_IS_ERR(ix->u.sort.perm))
@@ -807,12 +816,13 @@ ray_t* ray_index_attach_dict(ray_t** vp) {
 #define IDX_ALIGN32(n) (((n) + 31) & ~(int64_t)31)
 
 /* Addresses of this kind's child ray_t* fields (so write/map read+patch them
- * uniformly).  Returns count 0..3. */
-static int idx_child_slots(ray_index_t* ix, ray_t** slots[3]) {
+ * uniformly).  Returns count 0..4. */
+static int idx_child_slots(ray_index_t* ix, ray_t** slots[4]) {
     int n = 0;
     switch (ix->kind) {
     case RAY_IDX_HASH:
-        slots[n++] = &ix->u.hash.table; slots[n++] = &ix->u.hash.chain; break;
+        slots[n++] = &ix->u.hash.table; slots[n++] = &ix->u.hash.gkeys;
+        slots[n++] = &ix->u.hash.offs;  slots[n++] = &ix->u.hash.rows;  break;
     case RAY_IDX_SORT:
         slots[n++] = &ix->u.sort.perm; break;
     case RAY_IDX_BLOOM:
@@ -838,7 +848,7 @@ static int64_t idx_blk_bytes(const ray_t* v) {
 /* Total byte size of the inline region for `ix` (32-aligned blocks). */
 int64_t ray_index_inline_size(const ray_index_t* ix) {
     int64_t total = IDX_ALIGN32(32 + (int64_t)sizeof(ray_index_t));  /* RAY_INDEX block */
-    ray_t** slots[3];
+    ray_t** slots[4];
     int nch = idx_child_slots((ray_index_t*)ix, slots);
     for (int i = 0; i < nch; i++) {
         ray_t* c = *slots[i];
@@ -847,6 +857,14 @@ int64_t ray_index_inline_size(const ray_index_t* ix) {
     return total;
 }
 
+/* Persisted-index layout generation, carried in the RAY_INDEX block's
+ * on-disk-free `order` byte (mirrors the column-header scheme in col.h).
+ * The index region is a rebuildable ACCELERATOR: a mismatched generation is
+ * simply ignored (column loads unindexed) rather than mis-decoded.
+ * Generation 1 = the CSR grouped hash layout (table/gkeys/offs/rows);
+ * generation-0 regions carried the retired chain layout. */
+#define RAY_IDX_FORMAT_MAJOR ((uint8_t)1)
+
 /* Serialize `ix` into `dst` (>= ray_index_inline_size bytes, pre-zeroed by the
  * caller for clean 32-pad).  Child pointers become region-relative offsets. */
 void ray_index_inline_write(uint8_t* dst, const ray_index_t* ix) {
@@ -854,14 +872,15 @@ void ray_index_inline_write(uint8_t* dst, const ray_index_t* ix) {
     memset(&blkhdr, 0, 32);
     blkhdr.type = RAY_INDEX; blkhdr.len = (int64_t)sizeof(ray_index_t);
     blkhdr.mmod = 1; blkhdr.rc = 1;
+    blkhdr.order = RAY_IDX_FORMAT_MAJOR;
     memcpy(dst, &blkhdr, 32);
 
     ray_index_t* on = (ray_index_t*)(dst + 32);
     memcpy(on, ix, sizeof(ray_index_t));   /* scalars + child ptrs (overwritten below) */
     on->markers |= RAY_MARK_MMAP;           /* on-disk indexes are always mmap-resident */
 
-    ray_t** src_slots[3];
-    ray_t** on_slots[3];
+    ray_t** src_slots[4];
+    ray_t** on_slots[4];
     int nch = idx_child_slots((ray_index_t*)ix, src_slots);
     idx_child_slots(on, on_slots);
     int64_t off = IDX_ALIGN32(32 + (int64_t)sizeof(ray_index_t));
@@ -881,11 +900,15 @@ void ray_index_inline_write(uint8_t* dst, const ray_index_t* ix) {
 
 /* Map an mmap'd inline region in place: patch child offsets to absolute
  * pointers and return the RAY_INDEX object (already RAY_MARK_MMAP).  `region`
- * points at the start of the index region within the column's file mapping. */
+ * points at the start of the index region within the column's file mapping.
+ * Returns NULL for a stale layout generation or a payload-size mismatch —
+ * the caller loads the column unindexed (the index is rebuildable). */
 ray_t* ray_index_inline_map(uint8_t* region) {
     ray_t* idx = (ray_t*)region;
+    if (idx->order != RAY_IDX_FORMAT_MAJOR) return NULL;
+    if (idx->len != (int64_t)sizeof(ray_index_t)) return NULL;
     ray_index_t* ix = ray_index_payload(idx);
-    ray_t** slots[3];
+    ray_t** slots[4];
     int nch = idx_child_slots(ix, slots);
     for (int i = 0; i < nch; i++) {
         int64_t o = (int64_t)(intptr_t)(*slots[i]);
@@ -897,15 +920,18 @@ ray_t* ray_index_inline_map(uint8_t* region) {
 }
 
 /* --------------------------------------------------------------------------
- * Hash index — chained open addressing
+ * Hash index — CSR grouped layout
  *
- * table[capacity]: each slot is rid+1 of the most recent row that hashed
- *   into the bucket (0 = empty bucket).
- * chain[parent->len]: each slot is rid+1 of the next-older row in the same
- *   bucket's chain (0 = end of chain).
+ * Build: one pass assigns every non-null row a group id via an open-
+ * addressing probe on its i64-canonical key (SYM: column-domain id), then a
+ * counting pass lays the row ids out as contiguous ascending slices (CSR:
+ * offs[] + rows[]).  The build-time bucket table is sized by ROW count so
+ * insertion stays O(1); the attached/persisted table is rebuilt at
+ * DISTINCT-key size — it indexes groups, not rows, so a high-duplication
+ * column (the whole point of a grouped index) keeps a tiny footprint.
  *
- * Lookup `k`: rid = table[hash(k) & mask] - 1; while rid >= 0 compare
- * parent->data[rid] == k, on miss step rid = chain[rid] - 1.
+ * Lookup `k`: slot-walk table[hash(k) & mask] comparing gkeys[gid] == k; a
+ * hit yields the contiguous ascending slice rows[offs[gid]..offs[gid+1]).
  * -------------------------------------------------------------------------- */
 
 ray_t* ray_index_attach_hash(ray_t** vp) {
@@ -913,52 +939,112 @@ ray_t* ray_index_attach_hash(ray_t** vp) {
     if (RAY_IS_ERR(v)) return v;
 
     int64_t n = v->len;
-    /* Capacity: at least 8, at most 2*n.  Power of two for cheap masking. */
-    uint64_t cap = next_pow2((uint64_t)(n < 4 ? 8 : 2 * n));
-    if (cap < 8) cap = 8;
+    /* Build-time capacity: sized by rows for O(1) inserts. */
+    uint64_t bcap = next_pow2((uint64_t)(n < 4 ? 8 : 2 * n));
+    if (bcap < 8) bcap = 8;
+    uint64_t bmask = bcap - 1;
 
-    ray_t* table = ray_vec_new(RAY_I64, (int64_t)cap);
-    if (!table || RAY_IS_ERR(table)) return table ? table : ray_error("oom", NULL);
-    table->len = (int64_t)cap;
-    memset(ray_data(table), 0, (size_t)cap * sizeof(int64_t));
-
-    ray_t* chain = ray_vec_new(RAY_I64, n > 0 ? n : 1);
-    if (!chain || RAY_IS_ERR(chain)) {
-        ray_release(table);
-        return chain ? chain : ray_error("oom", NULL);
+    ray_t* btab_hdr = NULL;
+    ray_t* rgid_hdr = NULL;
+    int64_t* btab = (int64_t*)scratch_alloc(&btab_hdr,
+                                            (size_t)bcap * sizeof(int64_t));
+    int64_t* rgid = (int64_t*)scratch_alloc(&rgid_hdr,
+                        (size_t)(n > 0 ? n : 1) * sizeof(int64_t));
+    ray_t* gkeys = ray_vec_new(RAY_I64, n > 0 ? n : 1);   /* worst case: all distinct */
+    if (!btab || !rgid || !gkeys || RAY_IS_ERR(gkeys)) {
+        scratch_free(btab_hdr);
+        scratch_free(rgid_hdr);
+        if (gkeys && !RAY_IS_ERR(gkeys)) ray_release(gkeys);
+        return ray_error("oom", NULL);
     }
-    chain->len = n;
-    if (n > 0) memset(ray_data(chain), 0, (size_t)n * sizeof(int64_t));
+    memset(btab, 0, (size_t)bcap * sizeof(int64_t));
+    int64_t* gk = (int64_t*)ray_data(gkeys);
 
-    int64_t* tbl = (int64_t*)ray_data(table);
-    int64_t* chn = (int64_t*)ray_data(chain);
     const uint8_t* base = (const uint8_t*)ray_data(v);
-    int64_t n_keys = 0;
-    uint64_t mask = cap - 1;
+    int64_t n_keys = 0, n_groups = 0;
 
     for (int64_t i = 0; i < n; i++) {
-        if (ray_vec_is_null(v, i)) continue;   /* SYM is null-free → always false */
-        uint64_t kw = (v->type == RAY_SYM)
-            ? (uint64_t)ray_read_sym(base, i, RAY_SYM, v->attrs)  /* domain id, width-aware */
-            : numeric_key_word(base, v->type, i);
-        uint64_t h = mix64(kw);
-        uint64_t slot = h & mask;
-        chn[i] = tbl[slot];     /* link previous head into chain */
-        tbl[slot] = i + 1;      /* this row becomes new head */
+        if (ray_vec_is_null(v, i)) { rgid[i] = -1; continue; }  /* SYM is null-free → always false */
+        int64_t kw = (v->type == RAY_SYM)
+            ? ray_read_sym(base, i, RAY_SYM, v->attrs)  /* domain id, width-aware */
+            : (int64_t)numeric_key_word(base, v->type, i);
+        uint64_t slot = mix64((uint64_t)kw) & bmask;
+        for (;;) {
+            int64_t gp1 = btab[slot];
+            if (gp1 == 0) {
+                btab[slot] = n_groups + 1;
+                gk[n_groups] = kw;
+                rgid[i] = n_groups;
+                n_groups++;
+                break;
+            }
+            if (gk[gp1 - 1] == kw) { rgid[i] = gp1 - 1; break; }
+            slot = (slot + 1) & bmask;
+        }
         n_keys++;
+    }
+    scratch_free(btab_hdr);
+    gkeys->len = n_groups;
+
+    /* CSR slices: counting pass over rgid.  offs doubles as the fill
+     * cursor; the shift-back restores the slice bounds. */
+    ray_t* offs = ray_vec_new(RAY_I64, n_groups + 1);
+    ray_t* rows = ray_vec_new(RAY_I64, n_keys > 0 ? n_keys : 1);
+    if (!offs || RAY_IS_ERR(offs) || !rows || RAY_IS_ERR(rows)) {
+        scratch_free(rgid_hdr);
+        ray_release(gkeys);
+        if (offs && !RAY_IS_ERR(offs)) ray_release(offs);
+        if (rows && !RAY_IS_ERR(rows)) ray_release(rows);
+        return ray_error("oom", NULL);
+    }
+    offs->len = n_groups + 1;
+    rows->len = n_keys;
+    int64_t* of = (int64_t*)ray_data(offs);
+    int64_t* rw = (int64_t*)ray_data(rows);
+    memset(of, 0, (size_t)(n_groups + 1) * sizeof(int64_t));
+    for (int64_t i = 0; i < n; i++)
+        if (rgid[i] >= 0) of[rgid[i] + 1]++;
+    for (int64_t g = 0; g < n_groups; g++)
+        of[g + 1] += of[g];
+    for (int64_t i = 0; i < n; i++)
+        if (rgid[i] >= 0) rw[of[rgid[i]]++] = i;
+    for (int64_t g = n_groups; g > 0; g--)
+        of[g] = of[g - 1];
+    of[0] = 0;
+    scratch_free(rgid_hdr);
+
+    /* Attached/persisted bucket table: sized by DISTINCT keys. */
+    uint64_t cap = next_pow2((uint64_t)(n_groups < 4 ? 8 : 2 * n_groups));
+    if (cap < 8) cap = 8;
+    uint64_t mask = cap - 1;
+    ray_t* table = ray_vec_new(RAY_I64, (int64_t)cap);
+    if (!table || RAY_IS_ERR(table)) {
+        ray_release(gkeys); ray_release(offs); ray_release(rows);
+        return table ? table : ray_error("oom", NULL);
+    }
+    table->len = (int64_t)cap;
+    int64_t* tbl = (int64_t*)ray_data(table);
+    memset(tbl, 0, (size_t)cap * sizeof(int64_t));
+    for (int64_t g = 0; g < n_groups; g++) {
+        uint64_t slot = mix64((uint64_t)gk[g]) & mask;
+        while (tbl[slot] != 0) slot = (slot + 1) & mask;
+        tbl[slot] = g + 1;
     }
 
     ray_t* idx = ray_index_alloc(RAY_IDX_HASH, v->type, n);
     if (!idx || RAY_IS_ERR(idx)) {
-        ray_release(table);
-        ray_release(chain);
+        ray_release(table); ray_release(gkeys);
+        ray_release(offs);  ray_release(rows);
         return idx ? idx : ray_error("oom", NULL);
     }
     ray_index_t* ix = ray_index_payload(idx);
-    ix->u.hash.table  = table;
-    ix->u.hash.chain  = chain;
-    ix->u.hash.mask   = mask;
-    ix->u.hash.n_keys = n_keys;
+    ix->u.hash.table    = table;
+    ix->u.hash.gkeys    = gkeys;
+    ix->u.hash.offs     = offs;
+    ix->u.hash.rows     = rows;
+    ix->u.hash.mask     = mask;
+    ix->u.hash.n_keys   = n_keys;
+    ix->u.hash.n_groups = n_groups;
 
     return attach_finalize(v, idx);
 }
@@ -1025,11 +1111,12 @@ static uint64_t hash_key_bits(int es, int64_t key) {
     }
 }
 
-/* Validate eligibility, return the index payload + computed start row.
- * On miss leaves *start = -1 so the caller can short-circuit. */
+/* Validate eligibility and resolve `key` to its GROUP id.
+ * On a valid index with no such key leaves *gid = -1 (provably absent) so
+ * the caller can short-circuit; returns NULL only on ineligibility. */
 static ray_index_t* hash_probe_setup(ray_t* col, int64_t key,
-                                     int64_t* start_rid) {
-    *start_rid = -1;
+                                     int64_t* gid) {
+    *gid = -1;
     if (!col || RAY_IS_ERR(col) || !ray_is_vec(col)) return NULL;
     if (!(col->attrs & RAY_ATTR_HAS_INDEX) || !col->index) return NULL;
     ray_index_t* ix = ray_index_payload(col->index);
@@ -1039,17 +1126,25 @@ static ray_index_t* hash_probe_setup(ray_t* col, int64_t key,
     /* SYM ids are valid probe keys (non-negative domain ids); all other
      * non-numeric types are rejected by hash_key_in_range above. */
     if (col->type != RAY_SYM && numeric_elem_size(col->type) == 0) return NULL;
-    if (!ix->u.hash.table || !ix->u.hash.chain) return NULL;
+    if (!ix->u.hash.table || !ix->u.hash.gkeys ||
+        !ix->u.hash.offs  || !ix->u.hash.rows) return NULL;
 
     /* SYM: hash the domain id directly (mirrors the builder's cast to uint64_t).
-     * Numeric: fold through the storage width to match the builder's numeric_key_word. */
-    uint64_t kbits = (col->type == RAY_SYM)
-        ? (uint64_t)key
-        : hash_key_bits(numeric_elem_size(col->type), key);
-    uint64_t h = mix64(kbits);
-    uint64_t slot = h & ix->u.hash.mask;
+     * Numeric: fold through the storage width to match the builder's
+     * numeric_key_word.  gkeys stores exactly these canonical values, so the
+     * slot walk compares i64s — no column reads. */
+    int64_t kw = (col->type == RAY_SYM)
+        ? key
+        : (int64_t)hash_key_bits(numeric_elem_size(col->type), key);
+    uint64_t slot = mix64((uint64_t)kw) & ix->u.hash.mask;
     const int64_t* tbl = (const int64_t*)ray_data(ix->u.hash.table);
-    *start_rid = tbl[slot] - 1;
+    const int64_t* gk  = (const int64_t*)ray_data(ix->u.hash.gkeys);
+    for (;;) {
+        int64_t gp1 = tbl[slot];
+        if (gp1 == 0) break;                 /* key absent */
+        if (gk[gp1 - 1] == kw) { *gid = gp1 - 1; break; }
+        slot = (slot + 1) & ix->u.hash.mask;
+    }
     return ix;
 }
 
@@ -1220,72 +1315,25 @@ ray_t* ray_index_hash_eq_rowsel(ray_t* col, int64_t key) {
      * hash_probe_setup below also validates key-range, elem-size, and
      * payload pointers, so these checks are complementary. */
     if (!idx_fresh(col, RAY_IDX_HASH)) return NULL;
-    int64_t rid = -1;
-    ray_index_t* ix = hash_probe_setup(col, key, &rid);
+    int64_t gid = -1;
+    ray_index_t* ix = hash_probe_setup(col, key, &gid);
     if (!ix) return NULL;
 
     int64_t n = col->len;
-    /* Collect matching row ids.  The chain length is bounded by the
-     * bucket fill factor; for keys appearing rarely the bound is tight
-     * (~1 row).  For highly-duplicated keys it can degenerate to O(n)
-     * — but only if the value really occurs that many times, in which
-     * case the existing scan path also reads the same number of rows.
-     * We size the collect buffer dynamically; cap at n to bound memory
-     * in the pathological case. */
-    const int64_t* chn  = (const int64_t*)ray_data(ix->u.hash.chain);
-    const uint8_t* base = (const uint8_t*)ray_data(col);
-    int8_t t = col->type;
+    if (gid < 0)   /* provably absent → O(1) all-NONE rowsel */
+        return rowsel_from_sorted_ids(n, NULL, 0);
 
-    /* Dense-key abort: the chain walk is scattered pointer-chasing, so a
-     * key covering a large fraction of the column loses to the SIMD scan
-     * before the rowsel is even filled.  Bound the walk; on exceeding the
-     * budget return NULL so the caller falls through to the scan path.
-     * Sparse keys (what the index exists for) never approach the bound. */
-    int64_t steps_left = (n >> 6) + 64;
+    /* CSR: the group's row ids are one contiguous ascending slice — feed
+     * it to the rowsel builder directly.  Group size is known up front;
+     * a dense key (where the SIMD scan would win) returns NULL with zero
+     * wasted work instead of the chain-walk budget the old layout needed. */
+    const int64_t* of = (const int64_t*)ray_data(ix->u.hash.offs);
+    const int64_t* rw = (const int64_t*)ray_data(ix->u.hash.rows);
+    int64_t gsz = of[gid + 1] - of[gid];
+    if (gsz > 64 && gsz > (n >> 3))
+        return NULL;   /* dense: fall through to the scan path */
 
-    int64_t mcap = 16;
-    int64_t mcnt = 0;
-    ray_t* match_hdr = ray_alloc(mcap * (int64_t)sizeof(int64_t));
-    if (!match_hdr) return NULL;
-    int64_t* matches = (int64_t*)ray_data(match_hdr);
-
-    while (rid >= 0) {
-        if (--steps_left < 0) { ray_release(match_hdr); return NULL; }
-        int64_t cell = (t == RAY_SYM)
-            ? ray_read_sym(base, rid, RAY_SYM, col->attrs)  /* width-aware id confirm */
-            : hash_col_read_i64(base, t, rid);
-        if (cell == key) {
-            if (mcnt == mcap) {
-                int64_t new_cap = mcap * 2;
-                if (new_cap > n) new_cap = n + 1;  /* defensive bound */
-                ray_t* new_hdr = ray_alloc(new_cap * (int64_t)sizeof(int64_t));
-                if (!new_hdr) { ray_release(match_hdr); return NULL; }
-                memcpy(ray_data(new_hdr), matches,
-                       (size_t)mcnt * sizeof(int64_t));
-                ray_release(match_hdr);
-                match_hdr = new_hdr;
-                matches = (int64_t*)ray_data(match_hdr);
-                mcap = new_cap;
-            }
-            matches[mcnt++] = rid;
-        }
-        rid = chn[rid] - 1;
-    }
-
-    /* The build prepends each row to its bucket head in ascending rid order,
-     * so the walk yields strictly DESCENDING rids; the filtered subsequence
-     * for one key preserves that monotonicity regardless of other keys
-     * sharing the bucket.  Reverse in place — no qsort needed — to get the
-     * ascending order rowsel_from_sorted_ids requires. */
-    for (int64_t lo = 0, hi = mcnt - 1; lo < hi; lo++, hi--) {
-        int64_t tmp = matches[lo];
-        matches[lo] = matches[hi];
-        matches[hi] = tmp;
-    }
-
-    ray_t* block = rowsel_from_sorted_ids(n, matches, mcnt);
-    ray_release(match_hdr);
-    return block;
+    return rowsel_from_sorted_ids(n, rw + of[gid], gsz);
 }
 
 /* --------------------------------------------------------------------------
@@ -1383,83 +1431,79 @@ ray_t* ray_index_in_rowsel(ray_t* col, ray_t* set_vec) {
         return rowsel_from_sorted_ids(n, NULL, 0);
     }
 
-    /* Fetch the hash payload ONCE; per-key probing below only needs the
-     * bucket-head lookup (every key already passed hash_key_in_range, and
-     * the column-level gates were validated by idx_fresh_nonull above). */
-    ray_index_t* ix = ray_index_payload(col->index);
-    if (!ix->u.hash.table || !ix->u.hash.chain) {
-        ray_release(set_hdr);
-        return NULL;
-    }
-    const int64_t* tbl  = (const int64_t*)ray_data(ix->u.hash.table);
-    const int64_t* chn  = (const int64_t*)ray_data(ix->u.hash.chain);
-    const uint8_t* base = (const uint8_t*)ray_data(col);
-    uint64_t mask = ix->u.hash.mask;
-    int8_t t  = col->type;
-    int    es = numeric_elem_size(t);
+    /* Resolve every set element to its GROUP up front (i64 compares against
+     * gkeys — no column reads), so the union size is known EXACTLY before
+     * any collection work: a dense union (where the SIMD membership scan
+     * wins) returns NULL with zero waste — no chain-walk budget needed. */
+    ray_t* gid_hdr = NULL;
+    int64_t* gids = (int64_t*)scratch_alloc(&gid_hdr,
+                                            (size_t)set_len * sizeof(int64_t));
+    if (!gids) { ray_release(set_hdr); return NULL; }
 
-    /* Shared match buffer: starts at 16, grows by doubling, capped at n. */
-    int64_t mcap = 16;
-    int64_t mcnt = 0;
-    ray_t*   match_hdr  = ray_alloc(mcap * (int64_t)sizeof(int64_t));
-    if (!match_hdr) { ray_release(set_hdr); return NULL; }
-    int64_t* matches = (int64_t*)ray_data(match_hdr);
-
-    /* Dense-union abort: the per-key chain walks are scattered pointer-
-     * chasing, so a set whose matches cover a large fraction of the column
-     * loses to the SIMD membership scan long before the n/4 match count —
-     * and an abandoned walk is pure waste.  Bound TOTAL chain steps across
-     * all keys (mirrors the hash-eq probe's budget); on exceeding it return
-     * NULL so the caller falls back to the scan path.  Sparse sets (what
-     * the index exists for) never approach the bound. */
-    int64_t steps_left = (n >> 6) + 64;
-
-    for (int64_t si = 0; si < set_len; si++) {
-        int64_t key = set_scratch[si];
-        /* Bucket head for this key — same kbits/mix64 the builder used.
-         * SYM hashes the domain id directly (mirrors hash_probe_setup). */
-        uint64_t kbits = col_is_sym ? (uint64_t)key : hash_key_bits(es, key);
-        int64_t rid = tbl[mix64(kbits) & mask] - 1;
-
-        while (rid >= 0) {
-            if (--steps_left < 0) {
-                ray_release(match_hdr);
-                ray_release(set_hdr);
-                return NULL;
-            }
-            int64_t cell = col_is_sym
-                ? ray_read_sym(base, rid, RAY_SYM, col->attrs)
-                : hash_col_read_i64(base, t, rid);
-            if (cell == key) {
-                /* Grow match buffer if needed. */
-                if (mcnt == mcap) {
-                    int64_t new_cap = mcap * 2;
-                    if (new_cap > n) new_cap = n + 1;
-                    ray_t* new_hdr = ray_alloc(new_cap * (int64_t)sizeof(int64_t));
-                    if (!new_hdr) {
-                        ray_release(match_hdr);
-                        ray_release(set_hdr);
-                        return NULL;
-                    }
-                    memcpy(ray_data(new_hdr), matches,
-                           (size_t)mcnt * sizeof(int64_t));
-                    ray_release(match_hdr);
-                    match_hdr = new_hdr;
-                    matches   = (int64_t*)ray_data(match_hdr);
-                    mcap      = new_cap;
-                }
-                matches[mcnt++] = rid;
-            }
-            rid = chn[rid] - 1;
+    int64_t total = 0;
+    const int64_t* of = NULL;
+    const int64_t* rw = NULL;
+    {
+        ray_index_t* ix = ray_index_payload(col->index);
+        if (!ix->u.hash.table || !ix->u.hash.gkeys ||
+            !ix->u.hash.offs  || !ix->u.hash.rows) {
+            scratch_free(gid_hdr);
+            ray_release(set_hdr);
+            return NULL;
         }
+        of = (const int64_t*)ray_data(ix->u.hash.offs);
+        rw = (const int64_t*)ray_data(ix->u.hash.rows);
+        int es = numeric_elem_size(col->type);
+        int64_t ngid = 0;
+        for (int64_t si = 0; si < set_len; si++) {
+            int64_t key = set_scratch[si];
+            int64_t kw = col_is_sym ? key
+                                    : (int64_t)hash_key_bits(es, key);
+            int64_t gid = -1;
+            uint64_t slot = mix64((uint64_t)kw) & ix->u.hash.mask;
+            const int64_t* tbl = (const int64_t*)ray_data(ix->u.hash.table);
+            const int64_t* gk  = (const int64_t*)ray_data(ix->u.hash.gkeys);
+            for (;;) {
+                int64_t gp1 = tbl[slot];
+                if (gp1 == 0) break;
+                if (gk[gp1 - 1] == kw) { gid = gp1 - 1; break; }
+                slot = (slot + 1) & ix->u.hash.mask;
+            }
+            if (gid >= 0) {
+                gids[ngid++] = gid;
+                total += of[gid + 1] - of[gid];
+            }
+        }
+        set_len = ngid;
     }
-
     ray_release(set_hdr);
 
-    /* Sort collected ids (distinct keys → no duplicate row ids across different
-     * probes; a row holds exactly one value so different keys can't hit the
-     * same row). */
-    if (mcnt > 1)
+    /* Dense union: the SIMD membership scan wins — bail with zero waste.
+     * Tighter than the eq probe's n/8: a multi-key union pays an
+     * O(m log m) qsort the single-slice path doesn't. */
+    if (total > 64 && total > (n >> 4)) {
+        scratch_free(gid_hdr);
+        return NULL;
+    }
+    if (total == 0) {
+        scratch_free(gid_hdr);
+        return rowsel_from_sorted_ids(n, NULL, 0);
+    }
+
+    /* Concatenate the groups' ascending slices and sort once — distinct
+     * keys → disjoint slices, no duplicate row ids. */
+    ray_t* match_hdr = ray_alloc(total * (int64_t)sizeof(int64_t));
+    if (!match_hdr) { scratch_free(gid_hdr); return NULL; }
+    int64_t* matches = (int64_t*)ray_data(match_hdr);
+    int64_t mcnt = 0;
+    for (int64_t si = 0; si < set_len; si++) {
+        int64_t gid = gids[si];
+        int64_t gsz = of[gid + 1] - of[gid];
+        memcpy(matches + mcnt, rw + of[gid], (size_t)gsz * sizeof(int64_t));
+        mcnt += gsz;
+    }
+    scratch_free(gid_hdr);
+    if (set_len > 1 && mcnt > 1)
         qsort(matches, (size_t)mcnt, sizeof(int64_t), hash_match_cmp_i64);
 
     ray_t* block = rowsel_from_sorted_ids(n, matches, mcnt);
@@ -2043,6 +2087,8 @@ ray_t* ray_index_info(ray_t* v) {
         if (RAY_IS_ERR(r)) goto fail;
         r = dict_append_sym_i64(&keys, &vals, "n_keys",   ix->u.hash.n_keys);
         if (RAY_IS_ERR(r)) goto fail;
+        r = dict_append_sym_i64(&keys, &vals, "n_groups", ix->u.hash.n_groups);
+        if (RAY_IS_ERR(r)) goto fail;
         break;
     case RAY_IDX_SORT:
         r = dict_append_sym_i64(&keys, &vals, "perm_len",
@@ -2274,21 +2320,34 @@ int64_t ray_index_find_row(ray_t* col, int64_t key) {
     /* Out-of-range key cannot equal any stored value of this type. */
     if (!hash_key_in_range(t, key)) return -1;
 
-    int64_t start_rid = -1;
-    ray_index_t* ix = hash_probe_setup(col, key, &start_rid);
+    int64_t gid = -1;
+    ray_index_t* ix = hash_probe_setup(col, key, &gid);
     if (!ix) return -2;   /* unexpected failure after eligibility passed */
+    if (gid < 0) return -1;  /* key provably absent */
 
-    const int64_t* chn  = (const int64_t*)ray_data(ix->u.hash.chain);
-    const uint8_t* base = (const uint8_t*)ray_data(col);
+    /* CSR: rows are ascending within the group — first slice entry IS the
+     * minimum matching row id.  O(1). */
+    const int64_t* of = (const int64_t*)ray_data(ix->u.hash.offs);
+    const int64_t* rw = (const int64_t*)ray_data(ix->u.hash.rows);
+    return rw[of[gid]];
+}
 
-    int64_t min_rid = -1;
-    int64_t rid = start_rid;
-    while (rid >= 0) {
-        if (hash_col_read_i64(base, t, rid) == key) {
-            if (min_rid < 0 || rid < min_rid)
-                min_rid = rid;
-        }
-        rid = chn[rid] - 1;
+int ray_index_hash_group(ray_t* col, int64_t key,
+                         const int64_t** rows_out, int64_t* n_out) {
+    *rows_out = NULL;
+    *n_out = 0;
+    if (!idx_fresh(col, RAY_IDX_HASH)) return -1;
+    int64_t gid = -1;
+    ray_index_t* ix = hash_probe_setup(col, key, &gid);
+    if (!ix) {
+        /* Out-of-range key on an otherwise-fresh index cannot match any
+         * stored value — that is a provable absence, not ineligibility. */
+        return hash_key_in_range(col->type, key) ? -1 : 0;
     }
-    return min_rid;  /* -1 when nothing matched = key provably absent */
+    if (gid < 0) return 0;
+    const int64_t* of = (const int64_t*)ray_data(ix->u.hash.offs);
+    const int64_t* rw = (const int64_t*)ray_data(ix->u.hash.rows);
+    *rows_out = rw + of[gid];
+    *n_out = of[gid + 1] - of[gid];
+    return 1;
 }

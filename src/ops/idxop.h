@@ -103,16 +103,27 @@ typedef struct {
 
     /* Kind-specific payload.  All ray_t* fields are owning refs. */
     union {
-        struct {                /* RAY_IDX_HASH */
-            /* Chained open-addressing.  table[mask+1] holds the head rid+1
-             * for each bucket (0 = empty bucket).  chain[parent->len] holds
-             * the next rid+1 in the same bucket's chain (0 = end of chain).
-             * Lookup: hash key, read table[hash & mask] for head, walk chain
-             * until 0 comparing parent->data[rid] for equality. */
+        struct {                /* RAY_IDX_HASH — CSR grouped layout */
+            /* Open-addressing bucket table over DISTINCT keys plus a CSR
+             * (offsets + contiguous row lists) grouping of the rows:
+             *   table[mask+1]  slot -> group id + 1 (0 = empty bucket)
+             *   gkeys[n_groups]     key value per group (i64-canonical;
+             *                       SYM stores the column-domain id)
+             *   offs[n_groups+1]    rows[] slice bounds per group
+             *   rows[n_keys]        row ids, ASCENDING within each group
+             * Lookup `k`: slot-walk table comparing gkeys[gid] == k; a hit
+             * yields the group's contiguous rows[offs[gid]..offs[gid+1])
+             * slice — group size is O(1), first occurrence is rows[offs[gid]],
+             * and the ascending order is what rowsel builders and the asof
+             * binary search consume directly. */
             ray_t*   table;     /* RAY_I64 vec, capacity entries */
-            ray_t*   chain;     /* RAY_I64 vec, parent->len entries */
+            ray_t*   gkeys;     /* RAY_I64 vec, n_groups entries */
+            ray_t*   offs;      /* RAY_I64 vec, n_groups+1 entries */
+            ray_t*   rows;      /* RAY_I64 vec, n_keys entries */
             uint64_t mask;      /* capacity - 1 (capacity is power of two) */
             int64_t  n_keys;    /* number of non-null rows indexed */
+            int64_t  n_groups;  /* number of distinct keys */
+            int64_t  _pad;      /* keep ray_index_t a 32-byte multiple */
         } hash;
         struct {                /* RAY_IDX_SORT */
             ray_t* perm;        /* RAY_I64 vec, perm[i] = row id at sorted pos i */
@@ -180,7 +191,7 @@ static inline ray_index_t* ray_index_payload(ray_t* idx) {
 typedef enum {
     IDX_SITE_FILTER_ZONE = 0, IDX_SITE_FILTER_BLOOM, IDX_SITE_FILTER_HASH,
     IDX_SITE_FILTER_RANGE, IDX_SITE_IN, IDX_SITE_FIND, IDX_SITE_SORT,
-    IDX_SITE_DISTINCT, IDX_SITE__N
+    IDX_SITE_DISTINCT, IDX_SITE_ASOF, IDX_SITE__N
 } idx_site_t;
 extern uint64_t ray_idx_consults[IDX_SITE__N];
 extern uint64_t ray_idx_hits[IDX_SITE__N];
@@ -349,6 +360,20 @@ ray_t* ray_index_in_rowsel(ray_t* col, ray_t* set_vec);
  * Uses idx_fresh_nonull: null-bearing columns fall back (-2) so the
  * scan correctly surfaces null-equality searches. */
 int64_t ray_index_find_row(ray_t* col, int64_t key);
+
+/* ===== Hash-index group slice (CSR accessor) =====
+ *
+ * Resolve `key` to its group's contiguous ascending row-id slice.
+ * SYM columns take the COLUMN-DOMAIN id as key; numeric columns take the
+ * value (canonicalized through the storage width like the eq probe).
+ *
+ * Returns:
+ *    1 → hit: *rows_out points at the ascending row ids, *n_out the size.
+ *        The slice borrows the index payload — valid while the index is.
+ *    0 → key provably absent (*rows_out NULL, *n_out 0).
+ *   -1 → not eligible (no fresh hash index / bad key) — caller falls back. */
+int ray_index_hash_group(ray_t* col, int64_t key,
+                         const int64_t** rows_out, int64_t* n_out);
 
 /* ===== Sort-index range probe =====
  *
