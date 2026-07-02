@@ -1213,15 +1213,15 @@ static ray_t* exec_pushed_group_filter(ray_graph_t* g, ray_op_t* filter_op) {
     return NULL;
 }
 
-/* Collect the distinct source-column syms referenced by a GROUP's key and
- * agg-input subtrees into syms[] (at most max), and report via *has_expr
- * whether any root is a computed expression rather than a plain scan or
- * literal.  Only scalar expression nodes (OP_SCAN/OP_CONST and the
+/* Collect the distinct source-column syms referenced by the expression
+ * subtrees under roots[] into syms[] (at most max), and report via
+ * *has_expr whether any root is a computed expression rather than a plain
+ * scan or literal.  Only scalar expression nodes (OP_SCAN/OP_CONST and the
  * element-wise range OP_ROUND..OP_IDIV) are admitted in the walk; any other
  * opcode, an oversized graph, or overflow returns -1 — callers must treat
  * that as "unknown" and skip the optimisation. */
-static int group_input_scan_syms(ray_graph_t* g, ray_op_ext_t* gx,
-                                 int64_t* syms, int max, bool* has_expr) {
+static int collect_scan_syms(ray_graph_t* g, const uint32_t* roots, int nroots,
+                             int64_t* syms, int max, bool* has_expr) {
     *has_expr = false;
     uint32_t nc = g->node_count;
     if (nc > 4096) return -1;
@@ -1231,17 +1231,6 @@ static int group_input_scan_syms(ray_graph_t* g, ray_op_ext_t* gx,
     bool visited[4096];
     memset(visited, 0, nc * sizeof(bool));
 
-    /* Seed roots: group keys + agg inputs (+ binary-agg second inputs). */
-    uint32_t roots[3 * 16];
-    int nroots = 0;
-    for (uint8_t k = 0; k < gx->n_keys && nroots < 48; k++)
-        roots[nroots++] = gx->keys[k];
-    for (uint8_t a = 0; a < gx->n_aggs && nroots < 48; a++) {
-        if (gx->agg_ins && gx->agg_ins[a] != RAY_OP_NONE)
-            roots[nroots++] = gx->agg_ins[a];
-        if (gx->agg_ins2 && gx->agg_ins2[a] != RAY_OP_NONE && nroots < 48)
-            roots[nroots++] = gx->agg_ins2[a];
-    }
     for (int r = 0; r < nroots; r++) {
         if (roots[r] >= nc) return -1;
         uint16_t opc = g->nodes[roots[r]].opcode;
@@ -1288,6 +1277,22 @@ static int group_input_scan_syms(ray_graph_t* g, ray_op_ext_t* gx,
         }
     }
     return n;
+}
+
+/* collect_scan_syms over a GROUP's key + agg-input subtrees. */
+static int group_input_scan_syms(ray_graph_t* g, ray_op_ext_t* gx,
+                                 int64_t* syms, int max, bool* has_expr) {
+    uint32_t roots[3 * 16];
+    int nroots = 0;
+    for (uint8_t k = 0; k < gx->n_keys && nroots < 48; k++)
+        roots[nroots++] = gx->keys[k];
+    for (uint8_t a = 0; a < gx->n_aggs && nroots < 48; a++) {
+        if (gx->agg_ins && gx->agg_ins[a] != RAY_OP_NONE)
+            roots[nroots++] = gx->agg_ins[a];
+        if (gx->agg_ins2 && gx->agg_ins2[a] != RAY_OP_NONE && nroots < 48)
+            roots[nroots++] = gx->agg_ins2[a];
+    }
+    return collect_scan_syms(g, roots, nroots, syms, max, has_expr);
 }
 
 /* Is this opcode a "heavy" pipeline breaker worth profiling? */
@@ -2354,6 +2359,42 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
             if (!ext) { ray_release(input); return ray_error("nyi", NULL); }
             uint8_t n_cols = ext->sort.n_cols;
             uint32_t* columns = ext->sort.columns;
+
+            /* Sparse-selection pre-compaction (mirrors OP_GROUP): expression
+             * columns would otherwise be evaluated over ALL rows, with the
+             * selection applied only when ray_execute_inner gathers the full-
+             * length result.  Gather the referenced input columns once and
+             * project the dense survivors instead — the final gather then
+             * disappears (the selection is consumed here).  Plain-scan-only
+             * projections stay lazy: they share column refs and the single
+             * final gather is already optimal. */
+            if (g->selection && n_cols > 0) {
+                ray_rowsel_t* smeta = ray_rowsel_meta(g->selection);
+                int64_t in_rows = ray_table_nrows(input);
+                if (smeta && in_rows > 0 && smeta->total_pass * 4 <= in_rows) {
+                    int64_t keep[32];
+                    bool has_expr = false;
+                    int nkeep = collect_scan_syms(g, columns, n_cols,
+                                                  keep, 32, &has_expr);
+                    if (nkeep > 0 && has_expr) {
+                        ray_t* compacted = sel_compact(g, input, g->selection,
+                                                       keep, nkeep);
+                        if (compacted && !RAY_IS_ERR(compacted) &&
+                            compacted != input) {
+                            ray_release(input);
+                            input = compacted;
+                            ray_release(g->selection);
+                            g->selection = NULL;
+                        } else if (compacted) {
+                            /* all-pass / alloc-fallback returned input
+                             * retained, or an error — drop it and keep the
+                             * lazy final-gather path. */
+                            ray_release(compacted);
+                        }
+                    }
+                }
+            }
+
             ray_t* result = ray_table_new(n_cols);
 
             /* Set g->table so SCAN nodes inside expressions resolve correctly */
