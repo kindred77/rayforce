@@ -32,3 +32,18 @@
 ;; ── fby shape: rows equal to their group's min (keeps ties) ─────────────────
 ;; min over k: a→2 (only row v=2), b→4 (rows v=4,4 both) → 3 rows total
 (count (select {from: (window {from: T part: [k] funcs: {mn: (min v)}}) where: (== v mn)})) -- 3
+
+;; ── first/last with order: (Important 1 positive coverage) ──────────────────
+;; part k, order v asc: a=[2,5,9]→first=2,last=9 ; b=[4,4,7]→first=4,last=7
+(at (window {from: T part: [k] order: [v] funcs: {f: (first v) l: (last v)}}) 'f) -- [2 2 2 4 4 4]
+(at (window {from: T part: [k] order: [v] funcs: {f: (first v) l: (last v)}}) 'l) -- [9 9 9 7 7 7]
+
+;; ── errors ────────────────────────────────────────────────────────────────────
+;; (a) unknown func
+(window {from: T funcs: {x: (median v)}}) !- domain
+;; (b) bad frame symbol
+(window {from: T frame: 'bogus funcs: {mn: (min v)}}) !- domain
+;; (c) first without order:
+(window {from: T part: [k] funcs: {f: (first v)}}) !- domain
+;; (d) missing funcs:
+(window {from: T part: [k]}) !- domain
