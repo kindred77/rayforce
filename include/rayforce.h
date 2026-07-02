@@ -146,12 +146,16 @@ typedef union ray_t {
              * pointer (see src/table/domain.h) — every non-slice SYM vec
              * carries a non-NULL domain; runtime-created vecs point at
              * the immortal singleton wrapping the global intern table.
-             * Layout audit (2026-06-10): bytes 8-15 are free for SYM —
+             * Layout audit (updated 2026-07): bytes 8-15 hold the domain;
+             * bytes 0-7 are free for a SYM vec to carry an index —
              *   - str_pool uses 8-15 but only for RAY_STR;
-             *   - HAS_INDEX's index/_idx_pad (0-7/8-15) can never be set
-             *     on a SYM vec: prepare_attach (ops/idxop.c) rejects all
-             *     non-numeric types, and SYM/STR/GUID indexing is
-             *     explicitly deferred (ops/idxop.h);
+             *   - HAS_INDEX CAN be set on a SYM vec (as of the SYM hash
+             *     index): the index pointer occupies bytes 0-7 while
+             *     sym_domain stays at bytes 8-15.  attach_finalize
+             *     (ops/idxop.c) preserves _idx_pad (8-15) for RAY_SYM,
+             *     exactly as it does for RAY_STR's str_pool.  That guard is
+             *     the MANDATORY backstop — do NOT restore the _idx_pad
+             *     clearing for SYM or it nulls the domain pointer;
              *   - HAS_LINK's link_target (8-15) is RAY_I32/RAY_I64 only;
              *   - slices use both 0-7 and 8-15, but slice headers do not
              *     store a domain — ray_sym_vec_domain follows
@@ -161,8 +165,9 @@ typedef union ray_t {
             struct { uint8_t _aux_sym_lo[8];     struct ray_sym_domain_s* sym_domain; };
             /* RAY_ATTR_HAS_INDEX (vectors): ray_t* of type RAY_INDEX
              * carrying the accelerator payload and the saved aux
-             * bytes.  _idx_pad is reserved (must be NULL).  See
-             * ops/idxop.h. */
+             * bytes.  _idx_pad (8-15) is NULL for numeric columns, but
+             * holds str_pool for RAY_STR and sym_domain for RAY_SYM
+             * (attach_finalize preserves it there).  See ops/idxop.h. */
             struct { union ray_t* index;         union ray_t* _idx_pad; };
             /* RAY_ATTR_HAS_LINK (vectors, RAY_I32/RAY_I64 only): bytes
              * 8-15 hold an int64 sym ID naming the target table.

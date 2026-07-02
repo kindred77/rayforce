@@ -1561,7 +1561,13 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                                 int64_t nrows = ray_table_nrows(input);
                                 ray_t* empty = ray_index_empty_rowsel(nrows);
                                 if (empty) { g->selection = empty; return input; }
-                                sym_probe_skip = true; /* OOM — fall through to scan */
+                                /* OOM — fall through to scan.  key_i here is
+                                 * still the GLOBAL intern id, not dom_id; under
+                                 * the current singleton domain these are equal
+                                 * so the scan yields the correct zero matches.
+                                 * If domains ever diverge, this degraded OOM
+                                 * path would need key_i re-mapped. */
+                                sym_probe_skip = true;
                             } else {
                                 key_i = dom_id;
                             }
