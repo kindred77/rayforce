@@ -812,6 +812,9 @@ void partitioned_gather(ray_pool_t* pool, const int64_t* idx, int64_t n,
 /* ── filter.c ── */
 ray_t* exec_filter(ray_graph_t* g, ray_op_t* op, ray_t* input, ray_t* pred);
 ray_t* exec_filter_head(ray_t* input, ray_t* pred, int64_t limit);
+/* Typed membership kernel (verdict-LUT / SIMD / pool-parallel); NULL when
+ * the col/set shape is unsupported — caller falls back to its own path. */
+ray_t* ray_in_vec_exec(ray_t* col, ray_t* set, bool negate);
 ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
                    const int64_t* keep_syms, int keep_n);
 

@@ -222,3 +222,11 @@
 (+ NV [10 10 10 10 10]) -- [11 0N 13 0N 15]
 (< [1.0 0N 3.0] 2.0) -- [true true false]
 (+ [1.0 0N 3.0] 1.0) -- [2.0 0N 4.0]
+
+;; ── typed membership kernel at eval level (verdict-LUT for SYM) ─────────────
+;; >8-element sets exercise the domain-verdict LUT; same and cross domain.
+(in ['a 'b 'c 'a] ['b 'c 'x 'y 'z 'q 'w 'e 'r 't]) -- [false true true false]
+(in (at FD 's) ['a 'x 'y 'z 'q 'w 'e 'r 't 'u]) -- [true false true false]
+(in (at FD 's) ['b 'c]) -- [false true false true]
+;; int vec through the same kernel (SIMD small-set path)
+(in [1 5 3 9] [3 9 100]) -- [false false true true]

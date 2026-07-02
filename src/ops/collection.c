@@ -1049,6 +1049,18 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
          * hashset over `vec` once, probe per element of `val`.  Was
          * O(len(val)×len(vec)); now O(len(val)+len(vec)). */
         if (ray_is_vec(val) && ray_is_vec(vec)) {
+            /* Typed kernel first: verdict-LUT for SYM, SIMD small-set for
+             * ints, pool-parallel — the same engine the fused WHERE path
+             * uses.  Gated off null-bearing operands: this hashset path
+             * matches null ∈ {…null…} as TRUE (null equals null), while
+             * the WHERE kernel uses null-matches-nothing semantics — the
+             * two must not be conflated.  NULL result = unsupported shape
+             * (STR etc.): fall through to the hashset probe below. */
+            if (!(val->attrs & RAY_ATTR_HAS_NULLS) &&
+                !(vec->attrs & RAY_ATTR_HAS_NULLS)) {
+                ray_t* fast = ray_in_vec_exec(val, vec, false);
+                if (fast) return fast;
+            }
             ray_t* result = ray_vec_new(RAY_BOOL, vlen);
             if (RAY_IS_ERR(result)) return result;
             result->len = vlen;

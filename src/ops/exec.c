@@ -573,6 +573,11 @@ typedef struct {
     uint8_t*       ob;       /* output base; element i writes ob[i - ob_base] */
     int64_t        ob_base;  /* 0 for full-vec output; morsel start for fused-sel */
     int8_t         ct;
+    /* SYM columns: per-domain-position membership verdict (1 = in set),
+     * built once over the VOCABULARY in in_build_worker_ctx.  Turns the
+     * per-row linear set scan into one byte load — any set size, width-
+     * specialized, vectorizable.  NULL when not applicable. */
+    const uint8_t* symlut;
     bool           col_has_nulls;
     bool           col_atom_null;
     bool           col_is_atom;
@@ -641,6 +646,32 @@ static void exec_in_worker(void* vctx, uint32_t worker_id,
      * slots are padded with tv[0] (a real member, harmless under OR).
      * Null rows emit 0 regardless of negate (isn masks after the OR).
      * Bit-identical to the generic loops below; additive, chosen once. */
+    /* SYM verdict-LUT fast path: one byte load per row, no set scan.
+     * SYM has no null, so there is no per-element null branch either. */
+    if (!c->col_is_atom && c->symlut && ct == RAY_SYM) {
+        const uint8_t* lut = c->symlut;
+        uint8_t neg = (uint8_t)negate;
+        uint8_t w = (uint8_t)(cattrs & RAY_SYM_W_MASK);
+        if (w == RAY_SYM_W8) {
+            const uint8_t* dp = (const uint8_t*)cd;
+            for (int64_t i = start; i < end; i++)
+                ob[i - ob_base] = (uint8_t)(lut[dp[i]] ^ neg);
+        } else if (w == RAY_SYM_W16) {
+            const uint16_t* dp = (const uint16_t*)cd;
+            for (int64_t i = start; i < end; i++)
+                ob[i - ob_base] = (uint8_t)(lut[dp[i]] ^ neg);
+        } else if (w == RAY_SYM_W32) {
+            const uint32_t* dp = (const uint32_t*)cd;
+            for (int64_t i = start; i < end; i++)
+                ob[i - ob_base] = (uint8_t)(lut[dp[i]] ^ neg);
+        } else {
+            const int64_t* dp = (const int64_t*)cd;
+            for (int64_t i = start; i < end; i++)
+                ob[i - ob_base] = (uint8_t)(lut[dp[i]] ^ neg);
+        }
+        return;
+    }
+
     if (!c->col_is_atom && !c->use_double && sv_len >= 1 && sv_len <= 8) {
         const int64_t* svi = c->svi;
         uint8_t neg = (uint8_t)negate;
@@ -794,8 +825,10 @@ typedef enum { IN_CTX_UNSUPPORTED = 0, IN_CTX_OK = 1, IN_CTX_OOM = 2 } in_ctx_st
 static in_ctx_status_t in_build_worker_ctx(ray_t* col, ray_t* set, bool negate,
                                            double* svf_stack, int64_t* svi_stack,
                                            in_worker_ctx_t* out_ctx,
-                                           ray_t** sv_hdr_out) {
+                                           ray_t** sv_hdr_out,
+                                           ray_t** lut_hdr_out) {
     *sv_hdr_out = NULL;
+    *lut_hdr_out = NULL;
     int64_t set_len = ray_is_atom(set) ? 1 : set->len;
 
     int8_t ct = ray_is_atom(col) ? (int8_t)(-col->type) : col->type;
@@ -948,9 +981,33 @@ static in_ctx_status_t in_build_worker_ctx(ray_t* col, ray_t* set, bool negate,
     #undef READ_F64
     #undef CLASSIFY
 
+    /* SYM column: build the per-domain-position verdict LUT over the
+     * VOCABULARY (svi is already expressed in the column's domain, so a
+     * verdict is one flag per domain position).  O(D) build, then the
+     * worker does one byte load per row regardless of set size. */
+    const uint8_t* symlut = NULL;
+    if (!ray_is_atom(col) && col_class == 2 && !use_double && sv_len > 0) {
+        ray_t* col_rep2 = sym_domain_rep(col);
+        struct ray_sym_domain_s* cdom = col_rep2
+            ? ray_sym_vec_domain(col_rep2) : ray_sym_runtime_domain();
+        int64_t d = ray_sym_domain_count(cdom);
+        if (d > 0 && d <= (int64_t)1 << 22) {
+            ray_t* lh = ray_alloc(d);
+            if (lh) {
+                uint8_t* lut = (uint8_t*)ray_data(lh);
+                memset(lut, 0, (size_t)d);
+                for (int64_t j = 0; j < sv_len; j++)
+                    if (svi[j] >= 0 && svi[j] < d) lut[svi[j]] = 1;
+                *lut_hdr_out = lh;
+                symlut = lut;
+            }
+        }
+    }
+
     *out_ctx = (in_worker_ctx_t){
         .col = col,
         .svf = svf, .svi = svi, .sv_len = sv_len,
+        .symlut = symlut,
         .ob = NULL, .ob_base = 0, .ct = ct,
         .col_has_nulls = col_has_nulls,
         .col_atom_null = col_atom_null,
@@ -960,6 +1017,48 @@ static in_ctx_status_t in_build_worker_ctx(ray_t* col, ray_t* set, bool negate,
     };
     *sv_hdr_out = sv_hdr;
     return IN_CTX_OK;
+}
+
+/* Public entry for the typed membership kernel — the eval-level `in`
+ * routes typed vec/set shapes here so a bare (in vec set) gets the same
+ * verdict-LUT / SIMD / pool-parallel treatment as the fused WHERE path
+ * instead of a serial per-row hashset probe.  Returns NULL when the shape
+ * is unsupported (STR etc.) — caller falls back. */
+ray_t* ray_in_vec_exec(ray_t* col, ray_t* set, bool negate) {
+    int64_t col_len = ray_is_atom(col) ? 1 : col->len;
+    if (col_len == 0) {
+        ray_t* out = ray_vec_new(RAY_BOOL, 0);
+        if (!out || RAY_IS_ERR(out)) return out;
+        out->len = 0;
+        return out;
+    }
+    double  svf_stack[32];
+    int64_t svi_stack[32];
+    in_worker_ctx_t in_ctx;
+    ray_t* sv_hdr = NULL;
+    ray_t* lut_hdr = NULL;
+    in_ctx_status_t st = in_build_worker_ctx(col, set, negate,
+                                             svf_stack, svi_stack,
+                                             &in_ctx, &sv_hdr, &lut_hdr);
+    if (st != IN_CTX_OK) return NULL;   /* unsupported / OOM: caller falls back */
+
+    ray_t* out = ray_vec_new(RAY_BOOL, col_len);
+    if (!out || RAY_IS_ERR(out)) {
+        if (sv_hdr) ray_free(sv_hdr);
+        if (lut_hdr) ray_free(lut_hdr);
+        return out;
+    }
+    out->len = col_len;
+    in_ctx.ob = (uint8_t*)ray_data(out);
+    in_ctx.ob_base = 0;
+    ray_pool_t* pool = ray_pool_get();
+    if (pool && col_len >= RAY_PARALLEL_THRESHOLD && !ray_is_atom(col))
+        ray_pool_dispatch(pool, exec_in_worker, &in_ctx, col_len);
+    else
+        exec_in_worker(&in_ctx, 0, 0, col_len);
+    if (sv_hdr) ray_free(sv_hdr);
+    if (lut_hdr) ray_free(lut_hdr);
+    return out;
 }
 
 static ray_t* exec_in(ray_graph_t* g, ray_op_t* op, ray_t* col, ray_t* set) {
@@ -986,16 +1085,21 @@ static ray_t* exec_in(ray_graph_t* g, ray_op_t* op, ray_t* col, ray_t* set) {
     int64_t svi_stack[32];
     in_worker_ctx_t in_ctx;
     ray_t* sv_hdr = NULL;
+    ray_t* lut_hdr = NULL;
     in_ctx_status_t st = in_build_worker_ctx(col, set, negate,
                                              svf_stack, svi_stack,
-                                             &in_ctx, &sv_hdr);
+                                             &in_ctx, &sv_hdr, &lut_hdr);
     if (st == IN_CTX_UNSUPPORTED)
         return ray_error("nyi", "OP_IN on RAY_STR not yet implemented");
     if (st == IN_CTX_OOM)
         return ray_error("oom", NULL);
 
     ray_t* out = ray_vec_new(RAY_BOOL, col_len);
-    if (!out || RAY_IS_ERR(out)) { if (sv_hdr) ray_free(sv_hdr); return out; }
+    if (!out || RAY_IS_ERR(out)) {
+        if (sv_hdr) ray_free(sv_hdr);
+        if (lut_hdr) ray_free(lut_hdr);
+        return out;
+    }
     out->len = col_len;
     in_ctx.ob = (uint8_t*)ray_data(out);
     in_ctx.ob_base = 0;
@@ -1007,6 +1111,7 @@ static ray_t* exec_in(ray_graph_t* g, ray_op_t* op, ray_t* col, ray_t* set) {
         exec_in_worker(&in_ctx, 0, 0, col_len);
 
     if (sv_hdr) ray_free(sv_hdr);
+    if (lut_hdr) ray_free(lut_hdr);
     return out;
 }
 
@@ -1050,14 +1155,16 @@ ray_t* exec_in_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
     int64_t svi_stack[32];
     in_worker_ctx_t ic;
     ray_t* sv_hdr = NULL;
+    ray_t* lut_hdr = NULL;
     if (in_build_worker_ctx(col, set_lit, negate, svf_stack, svi_stack,
-                            &ic, &sv_hdr) != IN_CTX_OK)
+                            &ic, &sv_hdr, &lut_hdr) != IN_CTX_OK)
         return NULL;  /* STR / OOM → bool-path fallback */
 
     in_sel_fill_ctx_t fctx = { &ic };
     ray_t* sel = pred_sel_drive(nrows, in_sel_fill, &fctx, all_pass);
 
     if (sv_hdr) ray_free(sv_hdr);
+    if (lut_hdr) ray_free(lut_hdr);
     return sel;
 }
 
@@ -2063,7 +2170,21 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 ray_op_ext_t* gx = find_ext(g, op->id);
                 ray_rowsel_t* meta = ray_rowsel_meta(g->selection);
                 int64_t nrows = ray_table_nrows(tbl);
-                if (gx && meta && nrows > 0 && meta->total_pass * 16 <= nrows) {
+                /* Contiguity-aware admission: when most surviving rows sit
+                 * in ALL-flagged rowsel segments (contiguous runs — the
+                 * parted-layout shape), sel_compact's gather is nearly
+                 * sequential memcpy, so compaction pays off at much higher
+                 * densities than the scattered-row case. */
+                int64_t all_rows = 0;
+                if (meta) {
+                    const uint8_t* fl = ray_rowsel_flags(g->selection);
+                    for (uint32_t sg = 0; sg < meta->n_segs; sg++)
+                        if (fl[sg] == RAY_SEL_ALL) all_rows += RAY_MORSEL_ELEMS;
+                }
+                bool contig = meta && meta->total_pass > 0 &&
+                              all_rows * 4 >= meta->total_pass * 3;
+                if (gx && meta && nrows > 0 &&
+                    meta->total_pass * (contig ? 2 : 16) <= nrows) {
                     int64_t keep[32];
                     bool has_expr = false;
                     int nkeep = group_input_scan_syms(g, gx, keep, 32, &has_expr);
