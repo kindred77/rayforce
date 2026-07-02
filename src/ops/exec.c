@@ -1213,6 +1213,83 @@ static ray_t* exec_pushed_group_filter(ray_graph_t* g, ray_op_t* filter_op) {
     return NULL;
 }
 
+/* Collect the distinct source-column syms referenced by a GROUP's key and
+ * agg-input subtrees into syms[] (at most max), and report via *has_expr
+ * whether any root is a computed expression rather than a plain scan or
+ * literal.  Only scalar expression nodes (OP_SCAN/OP_CONST and the
+ * element-wise range OP_ROUND..OP_IDIV) are admitted in the walk; any other
+ * opcode, an oversized graph, or overflow returns -1 — callers must treat
+ * that as "unknown" and skip the optimisation. */
+static int group_input_scan_syms(ray_graph_t* g, ray_op_ext_t* gx,
+                                 int64_t* syms, int max, bool* has_expr) {
+    *has_expr = false;
+    uint32_t nc = g->node_count;
+    if (nc > 4096) return -1;
+
+    uint32_t stack[64];
+    int sp = 0, n = 0;
+    bool visited[4096];
+    memset(visited, 0, nc * sizeof(bool));
+
+    /* Seed roots: group keys + agg inputs (+ binary-agg second inputs). */
+    uint32_t roots[3 * 16];
+    int nroots = 0;
+    for (uint8_t k = 0; k < gx->n_keys && nroots < 48; k++)
+        roots[nroots++] = gx->keys[k];
+    for (uint8_t a = 0; a < gx->n_aggs && nroots < 48; a++) {
+        if (gx->agg_ins && gx->agg_ins[a] != RAY_OP_NONE)
+            roots[nroots++] = gx->agg_ins[a];
+        if (gx->agg_ins2 && gx->agg_ins2[a] != RAY_OP_NONE && nroots < 48)
+            roots[nroots++] = gx->agg_ins2[a];
+    }
+    for (int r = 0; r < nroots; r++) {
+        if (roots[r] >= nc) return -1;
+        uint16_t opc = g->nodes[roots[r]].opcode;
+        if (opc != OP_SCAN && opc != OP_CONST) *has_expr = true;
+        if (sp >= 64) return -1;
+        stack[sp++] = roots[r];
+    }
+
+    while (sp > 0) {
+        uint32_t nid = stack[--sp];
+        if (nid >= nc || visited[nid]) continue;
+        visited[nid] = true;
+        ray_op_t* node = &g->nodes[nid];
+        if (node->flags & OP_FLAG_DEAD) continue;
+
+        if (node->opcode == OP_SCAN) {
+            ray_op_ext_t* sx = find_ext(g, nid);
+            if (!sx) return -1;
+            bool dup = false;
+            for (int j = 0; j < n; j++)
+                if (syms[j] == sx->sym) { dup = true; break; }
+            if (!dup) {
+                if (n >= max) return -1;
+                syms[n++] = sx->sym;
+            }
+            continue;
+        }
+        if (node->opcode == OP_CONST) continue;
+        /* Admit only scalar element-wise expression nodes. */
+        if (node->opcode < OP_ROUND || node->opcode > OP_IDIV) return -1;
+
+        for (int i = 0; i < node->arity && i < 2; i++) {
+            if (node->in_id[i] == RAY_OP_NONE) continue;
+            if (sp >= 64) return -1;
+            stack[sp++] = node->in_id[i];
+        }
+        /* 3-ary ops (OP_IF else / OP_SUBSTR len / OP_REPLACE repl) keep the
+         * third operand in ext->third_in — missing it would compact away a
+         * referenced column. */
+        ray_op_ext_t* nx = find_ext(g, nid);
+        if (nx && nx->third_in != RAY_OP_NONE && nx->third_in != 0) {
+            if (sp >= 64) return -1;
+            stack[sp++] = nx->third_in;
+        }
+    }
+    return n;
+}
+
 /* Is this opcode a "heavy" pipeline breaker worth profiling? */
 static inline bool op_is_heavy(uint16_t opc) {
     return opc == OP_FILTER || opc == OP_SORT || opc == OP_GROUP ||
@@ -1750,6 +1827,41 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 if (res && RAY_IS_ERR(res)) return res;
                 if (res) { owned_tbl = res; tbl = res; }
                 /* NULL → lazy path; g->selection installed, tbl unchanged */
+            }
+
+            /* Sparse-selection pre-compaction: when the WHERE selection
+             * admits far fewer rows than the table AND some group input is
+             * a computed expression, exec_group would still materialize the
+             * expression over ALL rows (expr_eval_full) and only then skip
+             * non-selected entries.  Gather the referenced columns once
+             * (sel_compact keep-set) and group the dense survivors with no
+             * selection instead.  Plain-scan-only groups stay on the lazy
+             * path — their selection-aware loops are already optimal. */
+            if (g->selection && tbl && tbl->type == RAY_TABLE) {
+                ray_op_ext_t* gx = find_ext(g, op->id);
+                ray_rowsel_t* meta = ray_rowsel_meta(g->selection);
+                int64_t nrows = ray_table_nrows(tbl);
+                if (gx && meta && nrows > 0 && meta->total_pass * 16 <= nrows) {
+                    int64_t keep[32];
+                    bool has_expr = false;
+                    int nkeep = group_input_scan_syms(g, gx, keep, 32, &has_expr);
+                    if (nkeep > 0 && has_expr) {
+                        ray_t* compacted = sel_compact(g, tbl, g->selection,
+                                                       keep, nkeep);
+                        if (compacted && !RAY_IS_ERR(compacted) &&
+                            compacted != tbl) {
+                            if (owned_tbl) ray_release(owned_tbl);
+                            owned_tbl = compacted;
+                            tbl = compacted;
+                            ray_release(g->selection);
+                            g->selection = NULL;
+                        } else if (compacted) {
+                            /* all-pass / alloc-fallback returned tbl retained,
+                             * or an error — drop it and keep the lazy path. */
+                            ray_release(compacted);
+                        }
+                    }
+                }
             }
 
             /* Lazy selection is consumed by exec_group itself — all
