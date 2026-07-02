@@ -1748,6 +1748,419 @@ static bool asof_time_sorted_within_parts(const ray_t* keycol, const int64_t* tv
     return true;
 }
 
+/* ── Hash-group asof strategy ────────────────────────────────────────────
+ * Build the set of DISTINCT LEFT key tuples, collect the right rows of
+ * those (and only those) groups in one sequential right pass, then answer
+ * each left row with a binary search over its group's (row-ordered)
+ * right-row list for the last right time <= left time.  O(L + R + L·log G)
+ * with NO sorting of either side and no work on unprobed right keys — the
+ * sort-merge below pays O((L+R)·log(L+R)) per query, which for a small
+ * probe against a large right table is almost entirely wasted work.
+ * (Rayforce v1's asof/window joins used this hash-group + binary-search
+ * structure; the v2 sort-merge rewrite is what regressed them.)
+ *
+ * Precondition — VERIFIED, not assumed: right time must be non-descending
+ * within each key group over its non-null rows.  True whenever the right
+ * table is time-sorted (the canonical asof input).  On violation, on OOM,
+ * or for >2^31-row sides this returns false with match_orig untouched and
+ * the caller runs the sort-merge, which is always correct.
+ *
+ * Id spaces mirror the merge exactly: right cells are read raw,
+ * left cells through asof_eq_lread (cross-domain SYM translated into the
+ * right domain), so a hash-probe equality holds iff the merge would place
+ * the rows in the same partition.  Tie times match the merge too: the
+ * binary search takes the LAST group row with time <= t, which is the
+ * merge's final best_ri carry (its sort is stable across equal times). */
+/* Comparator context-free sort element for the cursor-merge variant. */
+typedef struct { int64_t t; int32_t li; } asof_lslot_t;
+static int asof_lslot_cmp(const void* a, const void* b) {
+    int64_t x = ((const asof_lslot_t*)a)->t;
+    int64_t y = ((const asof_lslot_t*)b)->t;
+    return (x > y) - (x < y);
+}
+
+static bool asof_hash_group_match(uint8_t n_eq,
+                                  ray_t* const* lt_eq, ray_t* const* rt_eq,
+                                  const int64_t* const* eq_xlut,
+                                  const int64_t* eq_xn,
+                                  const int64_t* lt_time,
+                                  const int64_t* rt_time,
+                                  const uint8_t* lt_null,
+                                  const uint8_t* rt_null,
+                                  int64_t left_n, int64_t right_n,
+                                  bool rt_time_sorted,
+                                  int64_t* match_orig) {
+    if (left_n <= 0) return true;
+    if (right_n >= INT32_MAX - 1 || left_n >= INT32_MAX - 1) return false;
+    if (right_n == 0) {
+        for (int64_t i = 0; i < left_n; i++) match_orig[i] = -1;
+        return true;
+    }
+
+    /* Groups are the DISTINCT LEFT key tuples — right rows whose keys no
+     * left row probes are never touched beyond one read+miss, so a small
+     * probe against a huge right table costs one sequential right pass,
+     * not a full grouping of it.  Key values are stored translated
+     * (asof_eq_lread), i.e. in the right side's id space; right rows probe
+     * with raw reads — equality holds iff the merge would pair the rows. */
+    uint64_t cap = 16;
+    while (cap < (uint64_t)left_n * 2u) cap <<= 1;
+    uint64_t mask = cap - 1;
+
+    ray_t *tab_hdr = NULL, *keys_hdr = NULL, *gid_hdr = NULL,
+          *cnt_hdr = NULL, *off_hdr = NULL, *rows_hdr = NULL,
+          *lgid_hdr = NULL;
+    int32_t* tab      = NULL;   /* slot -> group id + 1 (0 = empty) */
+    int64_t* gkeys    = NULL;   /* n_groups × n_eq translated key values */
+    int32_t* left_gid = NULL;   /* per left row: its group id (or -1) */
+    int32_t* row_gid  = NULL;   /* per right row: matched group id (or -1) */
+    int32_t* cnt      = NULL;
+    int32_t* off      = NULL;
+    int32_t* rows     = NULL;
+
+    left_gid = (int32_t*)scratch_alloc(&lgid_hdr, (size_t)left_n * 4);
+    row_gid  = (int32_t*)scratch_alloc(&gid_hdr, (size_t)right_n * 4);
+    if (n_eq > 0) {
+        tab   = (int32_t*)scratch_alloc(&tab_hdr, (size_t)cap * 4);
+        gkeys = (int64_t*)scratch_alloc(&keys_hdr,
+                                        (size_t)left_n * n_eq * 8);
+        if (tab) memset(tab, 0, (size_t)cap * 4);
+    }
+    bool ok = left_gid && row_gid && (n_eq == 0 || (tab && gkeys));
+
+    /* Pass 1 — distinct left keys.  n_groups <= left_n. */
+    int32_t n_groups = 0;
+    if (ok && n_eq == 0) {
+        for (int64_t li = 0; li < left_n; li++)
+            left_gid[li] = lt_null[li] ? -1 : 0;
+        n_groups = 1;
+    } else if (ok) {
+        for (int64_t li = 0; li < left_n; li++) {
+            if (lt_null[li]) { left_gid[li] = -1; continue; }
+            int64_t lv[256];
+            uint64_t h = 0;
+            for (uint8_t k = 0; k < n_eq; k++) {
+                lv[k] = asof_eq_lread(lt_eq[k], eq_xlut[k], eq_xn[k], li);
+                uint64_t kh = ray_hash_i64(lv[k]);
+                h = (k == 0) ? kh : ray_hash_combine(h, kh);
+            }
+            uint64_t slot = h & mask;
+            for (;;) {
+                int32_t gp1 = tab[slot];
+                if (gp1 == 0) {
+                    tab[slot] = n_groups + 1;
+                    for (uint8_t k = 0; k < n_eq; k++)
+                        gkeys[(int64_t)n_groups * n_eq + k] = lv[k];
+                    left_gid[li] = n_groups;
+                    n_groups++;
+                    break;
+                }
+                const int64_t* gk = gkeys + (int64_t)(gp1 - 1) * n_eq;
+                int eq = 1;
+                for (uint8_t k = 0; k < n_eq; k++)
+                    if (gk[k] != lv[k]) { eq = 0; break; }
+                if (eq) { left_gid[li] = gp1 - 1; break; }
+                slot = (slot + 1) & mask;
+            }
+        }
+    }
+
+    if (ok) {
+        cnt = (int32_t*)scratch_alloc(&cnt_hdr, ((size_t)n_groups + 1) * 4);
+        off = (int32_t*)scratch_alloc(&off_hdr, ((size_t)n_groups + 1) * 4);
+        ok = cnt && off;
+        if (ok) memset(cnt, 0, ((size_t)n_groups + 1) * 4);
+    }
+
+    /* First-key SYM direct index: gid by domain position, chained across
+     * groups that share the first key.  Replaces the per-row hash+probe in
+     * the right pass with one array load — the pass is a sequential scan
+     * of the key column, so this is what its speed is made of. */
+    ray_t *lut_hdr = NULL, *gnx_hdr = NULL;
+    int32_t* sym_lut  = NULL;
+    int32_t* gid_next = NULL;
+    int64_t  lut_d    = 0;
+    if (ok && n_eq >= 1 && rt_eq[0]->type == RAY_SYM) {
+        int64_t d = ray_sym_domain_count(ray_sym_vec_domain(rt_eq[0]));
+        if (d > 0 && d <= (int64_t)1 << 22) {
+            sym_lut  = (int32_t*)scratch_alloc(&lut_hdr, (size_t)d * 4);
+            gid_next = (int32_t*)scratch_alloc(&gnx_hdr,
+                           (size_t)(n_groups > 0 ? n_groups : 1) * 4);
+            if (sym_lut && gid_next) {
+                lut_d = d;
+                memset(sym_lut, 0xFF, (size_t)d * 4);   /* all -1 */
+                for (int32_t gid = 0; gid < n_groups; gid++) {
+                    int64_t k0 = gkeys[(int64_t)gid * n_eq];
+                    gid_next[gid] = -1;
+                    /* -1 = absent cross-domain translation: matches nothing */
+                    if (k0 < 0 || k0 >= d) continue;
+                    gid_next[gid] = sym_lut[k0];
+                    sym_lut[k0] = gid;
+                }
+            } else {
+                scratch_free(lut_hdr);  lut_hdr = NULL;  sym_lut = NULL;
+                scratch_free(gnx_hdr);  gnx_hdr = NULL;  gid_next = NULL;
+            }
+        }
+    }
+
+    /* Right-row group resolution, shared by both variants below: direct
+     * LUT for a SYM first key, open-addressing probe otherwise. */
+    #define ASOF_RESOLVE_GID(i, gid_out) do {                                  \
+        int32_t _g = -1;                                                       \
+        if (n_eq == 0) {                                                       \
+            _g = 0;                                                            \
+        } else if (sym_lut) {                                                  \
+            int64_t _c0 = ray_read_sym(r0_base, (i), RAY_SYM, r0_attrs);       \
+            _g = (_c0 >= 0 && _c0 < lut_d) ? sym_lut[_c0] : -1;                \
+            while (_g >= 0) {                                                  \
+                const int64_t* _gk = gkeys + (int64_t)_g * n_eq;               \
+                int _eq = 1;                                                   \
+                for (uint8_t _k = 1; _k < n_eq; _k++) {                        \
+                    int64_t _rv = read_col_i64(ray_data(rt_eq[_k]), (i),       \
+                                               rt_eq[_k]->type,                \
+                                               rt_eq[_k]->attrs);              \
+                    if (_gk[_k] != _rv) { _eq = 0; break; }                    \
+                }                                                              \
+                if (_eq) break;                                                \
+                _g = gid_next[_g];                                             \
+            }                                                                  \
+        } else {                                                               \
+            int64_t _rv[256];                                                  \
+            uint64_t _h = 0;                                                   \
+            for (uint8_t _k = 0; _k < n_eq; _k++) {                            \
+                _rv[_k] = read_col_i64(ray_data(rt_eq[_k]), (i),               \
+                                       rt_eq[_k]->type, rt_eq[_k]->attrs);     \
+                uint64_t _kh = ray_hash_i64(_rv[_k]);                          \
+                _h = (_k == 0) ? _kh : ray_hash_combine(_h, _kh);              \
+            }                                                                  \
+            uint64_t _slot = _h & mask;                                        \
+            for (;;) {                                                         \
+                int32_t _gp1 = tab[_slot];                                     \
+                if (_gp1 == 0) break;                                          \
+                const int64_t* _gk = gkeys + (int64_t)(_gp1 - 1) * n_eq;       \
+                int _eq = 1;                                                   \
+                for (uint8_t _k = 0; _k < n_eq; _k++)                          \
+                    if (_gk[_k] != _rv[_k]) { _eq = 0; break; }                \
+                if (_eq) { _g = _gp1 - 1; break; }                             \
+                _slot = (_slot + 1) & mask;                                    \
+            }                                                                  \
+        }                                                                      \
+        (gid_out) = _g;                                                        \
+    } while (0)
+
+    /* Hoisted first-key access for ASOF_RESOLVE_GID (loop-invariant). */
+    const uint8_t* r0_base  = (n_eq > 0) ? (const uint8_t*)ray_data(rt_eq[0]) : NULL;
+    uint8_t        r0_attrs = (n_eq > 0) ? rt_eq[0]->attrs : 0;
+    (void)r0_base; (void)r0_attrs;
+
+    /* The caller's signal is the verified `sorted` attr, but the canonical
+     * asof right side is time-sorted whether or not anyone stamped the
+     * attr (xasc does not) — check directly, bailing at the first
+     * violation, so the sequential scan is only paid when it's true and
+     * the cursor merge it enables repays it many times over. */
+    if (ok && !rt_time_sorted && right_n > 1) {
+        rt_time_sorted = true;
+        for (int64_t i = 1; i < right_n; i++)
+            if (rt_time[i] < rt_time[i - 1]) { rt_time_sorted = false; break; }
+    }
+
+    /* Cursor-merge variant — right time GLOBALLY sorted (verified attr):
+     * sort the left rows of each group by time, then a single right pass
+     * advances per-group cursors, assigning each left row the previous
+     * right row of its group once right time passes it.  No row-list
+     * collection, no per-group monotone sweep, no binary searches. */
+    if (ok && rt_time_sorted) {
+        ray_t *lcnt_hdr = NULL, *ls_hdr = NULL, *cur_hdr = NULL,
+              *prev_hdr = NULL;
+        int32_t* lcnt = (int32_t*)scratch_alloc(&lcnt_hdr,
+                                                ((size_t)n_groups + 1) * 4);
+        int32_t* cur  = (int32_t*)scratch_alloc(&cur_hdr,
+                                                ((size_t)n_groups + 1) * 4);
+        int32_t* prev = (int32_t*)scratch_alloc(&prev_hdr,
+                                                ((size_t)n_groups + 1) * 4);
+        asof_lslot_t* ls = (asof_lslot_t*)scratch_alloc(&ls_hdr,
+                              (size_t)left_n * sizeof(asof_lslot_t));
+        if (lcnt && cur && prev && ls) {
+            memset(lcnt, 0, ((size_t)n_groups + 1) * 4);
+            for (int64_t li = 0; li < left_n; li++) {
+                if (left_gid[li] >= 0) lcnt[left_gid[li]]++;
+                else match_orig[li] = -1;
+            }
+            /* loff lives in lcnt after the prefix pass; cur[] is the fill
+             * cursor and then the merge cursor. */
+            int32_t acc = 0;
+            for (int32_t g = 0; g < n_groups; g++) {
+                int32_t c = lcnt[g];
+                lcnt[g] = acc;
+                cur[g] = acc;
+                acc += c;
+            }
+            lcnt[n_groups] = acc;
+            for (int64_t li = 0; li < left_n; li++) {
+                int32_t g = left_gid[li];
+                if (g < 0) continue;
+                ls[cur[g]].t  = lt_time[li];
+                ls[cur[g]].li = (int32_t)li;
+                cur[g]++;
+            }
+            for (int32_t g = 0; g < n_groups; g++) {
+                int32_t sz = lcnt[g + 1] - lcnt[g];
+                if (sz > 1)
+                    qsort(ls + lcnt[g], (size_t)sz, sizeof(asof_lslot_t),
+                          asof_lslot_cmp);
+                cur[g]  = lcnt[g];
+                prev[g] = -1;
+            }
+
+            for (int64_t i = 0; i < right_n; i++) {
+                if (rt_null[i]) continue;
+                int32_t gid;
+                ASOF_RESOLVE_GID(i, gid);
+                if (gid < 0) continue;
+                int64_t rt = rt_time[i];
+                while (cur[gid] < lcnt[gid + 1] && ls[cur[gid]].t < rt) {
+                    match_orig[ls[cur[gid]].li] = prev[gid];
+                    cur[gid]++;
+                }
+                prev[gid] = (int32_t)i;
+            }
+            for (int32_t g = 0; g < n_groups; g++)
+                while (cur[g] < lcnt[g + 1])
+                    match_orig[ls[cur[g]++].li] = prev[g];
+
+            scratch_free(lcnt_hdr);
+            scratch_free(cur_hdr);
+            scratch_free(prev_hdr);
+            scratch_free(ls_hdr);
+            goto done;
+        }
+        /* scratch OOM — fall through to the collect variant */
+        scratch_free(lcnt_hdr);
+        scratch_free(cur_hdr);
+        scratch_free(prev_hdr);
+        scratch_free(ls_hdr);
+    }
+
+    /* Pass 2 — one sequential right pass: rows whose key tuple matches a
+     * probed group are counted; everything else is a miss.  n_eq==0
+     * admits every non-null row into the single group. */
+    int64_t n_matched = 0;
+    if (ok && n_eq == 0) {
+        for (int64_t i = 0; i < right_n; i++) {
+            if (rt_null[i]) { row_gid[i] = -1; continue; }
+            row_gid[i] = 0;
+            cnt[0]++; n_matched++;
+        }
+    } else if (ok && sym_lut) {
+        const uint8_t* base0  = (const uint8_t*)ray_data(rt_eq[0]);
+        uint8_t        attrs0 = rt_eq[0]->attrs;
+        for (int64_t i = 0; i < right_n; i++) {
+            if (rt_null[i]) { row_gid[i] = -1; continue; }
+            int64_t c0 = ray_read_sym(base0, i, RAY_SYM, attrs0);
+            int32_t gid = (c0 >= 0 && c0 < lut_d) ? sym_lut[c0] : -1;
+            /* Chain across groups sharing the first key; compare the rest. */
+            while (gid >= 0) {
+                const int64_t* gk = gkeys + (int64_t)gid * n_eq;
+                int eq = 1;
+                for (uint8_t k = 1; k < n_eq; k++) {
+                    int64_t rv = read_col_i64(ray_data(rt_eq[k]), i,
+                                              rt_eq[k]->type, rt_eq[k]->attrs);
+                    if (gk[k] != rv) { eq = 0; break; }
+                }
+                if (eq) break;
+                gid = gid_next[gid];
+            }
+            row_gid[i] = gid;
+            if (gid >= 0) { cnt[gid]++; n_matched++; }
+        }
+    } else if (ok) {
+        for (int64_t i = 0; i < right_n; i++) {
+            if (rt_null[i]) { row_gid[i] = -1; continue; }
+            int32_t gid = -1;
+            int64_t rv[256];
+            uint64_t h = 0;
+            for (uint8_t k = 0; k < n_eq; k++) {
+                rv[k] = read_col_i64(ray_data(rt_eq[k]), i,
+                                     rt_eq[k]->type, rt_eq[k]->attrs);
+                uint64_t kh = ray_hash_i64(rv[k]);
+                h = (k == 0) ? kh : ray_hash_combine(h, kh);
+            }
+            uint64_t slot = h & mask;
+            for (;;) {
+                int32_t gp1 = tab[slot];
+                if (gp1 == 0) break;   /* key not probed by any left row */
+                const int64_t* gk = gkeys + (int64_t)(gp1 - 1) * n_eq;
+                int eq = 1;
+                for (uint8_t k = 0; k < n_eq; k++)
+                    if (gk[k] != rv[k]) { eq = 0; break; }
+                if (eq) { gid = gp1 - 1; break; }
+                slot = (slot + 1) & mask;
+            }
+            row_gid[i] = gid;
+            if (gid >= 0) { cnt[gid]++; n_matched++; }
+        }
+    }
+
+    if (ok) {
+        rows = (int32_t*)scratch_alloc(&rows_hdr,
+                                       (size_t)(n_matched > 0 ? n_matched : 1) * 4);
+        ok = rows != NULL;
+    }
+
+    if (ok) {
+        /* Prefix sums -> group slices; fill rows[] in ascending row order
+         * (reusing cnt[] as the per-group fill cursor). */
+        int32_t acc = 0;
+        for (int32_t gid = 0; gid < n_groups; gid++) {
+            off[gid] = acc;
+            acc += cnt[gid];
+            cnt[gid] = off[gid];
+        }
+        off[n_groups] = acc;
+        for (int64_t i = 0; i < right_n; i++) {
+            int32_t gid = row_gid[i];
+            if (gid >= 0) rows[cnt[gid]++] = (int32_t)i;
+        }
+
+        /* Verify right time is non-descending within every probed group —
+         * the binary search below is only valid then. */
+        for (int32_t gid = 0; ok && gid < n_groups; gid++) {
+            for (int32_t p = off[gid] + 1; p < off[gid + 1]; p++)
+                if (rt_time[rows[p]] < rt_time[rows[p - 1]]) { ok = false; break; }
+        }
+    }
+
+    if (ok) {
+        /* Answer each left row: last row of its group with time <= t. */
+        for (int64_t li = 0; li < left_n; li++) {
+            int32_t gid = left_gid[li];
+            if (gid < 0) { match_orig[li] = -1; continue; }
+            int64_t t = lt_time[li];
+            int32_t lo = off[gid], hi = off[gid + 1], best = -1;
+            while (lo < hi) {
+                int32_t mid = lo + (hi - lo) / 2;
+                if (rt_time[rows[mid]] <= t) { best = mid; lo = mid + 1; }
+                else                         { hi = mid; }
+            }
+            match_orig[li] = (best >= 0) ? (int64_t)rows[best] : -1;
+        }
+    }
+
+done:
+    #undef ASOF_RESOLVE_GID
+    scratch_free(tab_hdr);
+    scratch_free(keys_hdr);
+    scratch_free(lgid_hdr);
+    scratch_free(gid_hdr);
+    scratch_free(cnt_hdr);
+    scratch_free(off_hdr);
+    scratch_free(rows_hdr);
+    scratch_free(lut_hdr);
+    scratch_free(gnx_hdr);
+    return ok;
+}
+
 ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
                                ray_t* left_table, ray_t* right_table) {
     ray_op_ext_t* ext = find_ext(g, op->id);
@@ -1788,17 +2201,27 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
             ? (int64_t)((int32_t*)ray_data(vec))[(idx)] \
             : ((int64_t*)ray_data(vec))[(idx)])
 
-    /* Build i64 time arrays for efficient comparison */
+    /* Time values as int64 for uniform comparison.  8-byte storage
+     * (TIMESTAMP / I64) aliases the column data directly; 4-byte storage
+     * (TIME / DATE) widens into a scratch copy. */
+    bool time_is_i64 = !(time_type == RAY_TIME || time_type == RAY_DATE);
     ray_t* lt_time_hdr = NULL, *rt_time_hdr = NULL;
-    int64_t* lt_time = (int64_t*)scratch_alloc(&lt_time_hdr, (size_t)left_n * sizeof(int64_t));
-    int64_t* rt_time = (int64_t*)scratch_alloc(&rt_time_hdr, (size_t)right_n * sizeof(int64_t));
-    if ((!lt_time && left_n > 0) || (!rt_time && right_n > 0)) {
-        if (lt_time_hdr) scratch_free(lt_time_hdr);
-        if (rt_time_hdr) scratch_free(rt_time_hdr);
-        return ray_error("oom", NULL);
+    int64_t* lt_time;
+    int64_t* rt_time;
+    if (time_is_i64) {
+        lt_time = (int64_t*)ray_data(lt_time_vec);
+        rt_time = (int64_t*)ray_data(rt_time_vec);
+    } else {
+        lt_time = (int64_t*)scratch_alloc(&lt_time_hdr, (size_t)left_n * sizeof(int64_t));
+        rt_time = (int64_t*)scratch_alloc(&rt_time_hdr, (size_t)right_n * sizeof(int64_t));
+        if ((!lt_time && left_n > 0) || (!rt_time && right_n > 0)) {
+            if (lt_time_hdr) scratch_free(lt_time_hdr);
+            if (rt_time_hdr) scratch_free(rt_time_hdr);
+            return ray_error("oom", NULL);
+        }
+        for (int64_t i = 0; i < left_n; i++) lt_time[i] = READ_TIME(lt_time_vec, i);
+        for (int64_t i = 0; i < right_n; i++) rt_time[i] = READ_TIME(rt_time_vec, i);
     }
-    for (int64_t i = 0; i < left_n; i++) lt_time[i] = READ_TIME(lt_time_vec, i);
-    for (int64_t i = 0; i < right_n; i++) rt_time[i] = READ_TIME(rt_time_vec, i);
     #undef READ_TIME
 
     /* Get eq key vectors — stored as ray_t* for type-safe access */
@@ -1907,16 +2330,48 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
                 if (ray_vec_is_null(rt_eq[k], i)) rt_null[i] = 1;
     }
 
+    /* match_orig[li] = best right row for ORIGINAL left row li.  Allocated
+     * up front: the hash-group strategy fills it directly; the sort-merge
+     * fallback fills it through its sorted-order remap. */
+    ray_t* mo_hdr = NULL;
+    int64_t* match_orig = left_n > 0
+        ? (int64_t*)scratch_alloc(&mo_hdr, (size_t)left_n * sizeof(int64_t))
+        : NULL;
+    if (!match_orig && left_n > 0) {
+        if (lt_null_hdr) scratch_free(lt_null_hdr);
+        if (rt_null_hdr) scratch_free(rt_null_hdr);
+        if (lt_time_hdr) scratch_free(lt_time_hdr);
+        if (rt_time_hdr) scratch_free(rt_time_hdr);
+        if (eq_xl_hdr) scratch_free(eq_xl_hdr);
+        return ray_error("oom", NULL);
+    }
+
+    /* Slow-path scratch, hoisted above the fast-path skip so the shared
+     * cleanup below stays valid on both routes. */
+    ray_t* li_hdr = NULL, *ri_hdr = NULL, *match_hdr = NULL;
+    int64_t* li_idx = NULL;
+    int64_t* ri_idx = NULL;
+    int64_t* match  = NULL;
+
+    /* Primary strategy: hash-group the right side + per-left binary search
+     * (no sorting of either side).  Falls back to the sort-merge when the
+     * per-group right-time monotonicity precondition fails. */
+    if (asof_hash_group_match(n_eq, lt_eq, rt_eq, eq_xlut, eq_xn,
+                              lt_time, rt_time, lt_null, rt_null,
+                              left_n, right_n,
+                              ray_attr_is_sorted(rt_time_vec), match_orig))
+        goto build_output;
+
     /* Sort both tables by (eq_keys, time_key) using index arrays.  Rows
      * with any null key sort LAST (NULLS LAST) so the merge walk reaches
      * them once all real candidates are consumed and can skip them
      * cheaply. */
-    ray_t* li_hdr = NULL, *ri_hdr = NULL;
-    int64_t* li_idx = (int64_t*)scratch_alloc(&li_hdr, (size_t)left_n * sizeof(int64_t));
-    int64_t* ri_idx = (int64_t*)scratch_alloc(&ri_hdr, (size_t)right_n * sizeof(int64_t));
+    li_idx = (int64_t*)scratch_alloc(&li_hdr, (size_t)left_n * sizeof(int64_t));
+    ri_idx = (int64_t*)scratch_alloc(&ri_hdr, (size_t)right_n * sizeof(int64_t));
     if ((!li_idx && left_n > 0) || (!ri_idx && right_n > 0)) {
         if (li_hdr) scratch_free(li_hdr);
         if (ri_hdr) scratch_free(ri_hdr);
+        if (mo_hdr) scratch_free(mo_hdr);
         if (lt_null_hdr) scratch_free(lt_null_hdr);
         if (rt_null_hdr) scratch_free(rt_null_hdr);
         if (lt_time_hdr) scratch_free(lt_time_hdr);
@@ -1971,6 +2426,7 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
             : NULL;
         if (!tmp && need_tmp) {
             scratch_free(li_hdr); scratch_free(ri_hdr);
+            if (mo_hdr) scratch_free(mo_hdr);
             if (lt_null_hdr) scratch_free(lt_null_hdr);
             if (rt_null_hdr) scratch_free(rt_null_hdr);
             if (lt_time_hdr) scratch_free(lt_time_hdr);
@@ -2051,10 +2507,10 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
     }
 
     /* Build match array: for each left row (sorted), find best right match */
-    ray_t* match_hdr = NULL;
-    int64_t* match = (int64_t*)scratch_alloc(&match_hdr, (size_t)left_n * sizeof(int64_t));
+    match = (int64_t*)scratch_alloc(&match_hdr, (size_t)left_n * sizeof(int64_t));
     if (!match && left_n > 0) {
         scratch_free(li_hdr); scratch_free(ri_hdr);
+        if (mo_hdr) scratch_free(mo_hdr);
         if (lt_null_hdr) scratch_free(lt_null_hdr);
         if (rt_null_hdr) scratch_free(rt_null_hdr);
         if (lt_time_hdr) scratch_free(lt_time_hdr);
@@ -2137,16 +2593,10 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
     /* Remap match[] from sorted order to original left-row order.
      * match[lp] gives the best right row for sorted left position lp.
      * We need match_orig[li] = best right row for original left row li. */
-    ray_t* mo_hdr = NULL;
-    int64_t* match_orig = (int64_t*)scratch_alloc(&mo_hdr, (size_t)left_n * sizeof(int64_t));
-    if (!match_orig && left_n > 0) {
-        scratch_free(match_hdr); scratch_free(li_hdr); scratch_free(ri_hdr);
-        if (eq_xl_hdr) scratch_free(eq_xl_hdr);
-        return ray_error("oom", NULL);
-    }
     for (int64_t lp = 0; lp < left_n; lp++)
         match_orig[li_idx[lp]] = match[lp];
 
+build_output:;
     /* Count output rows */
     int64_t out_n = 0;
     if (join_type == 1) {

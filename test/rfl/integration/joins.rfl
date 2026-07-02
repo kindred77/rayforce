@@ -304,3 +304,31 @@
 (at (asof-join [sym time] (select {from: Asl sym: sym time: time bid: bid}) (select {from: Asl sym: sym time: time b2: bid})) 'sym) -- [AAPL AAPL MSFT]
 ;; window-join: same executor (OP_WINDOW_JOIN), same key-gather path
 (at (window-join [sym time] (map-left + [-50 50] (at Asl 'time)) (select {from: Asl sym: sym time: time}) (select {from: Asl sym: sym time: time bid: bid}) {mb: (min bid)}) 'sym) -- [AAPL AAPL MSFT]
+
+;; ── asof strategy differential: cursor-merge / collect+binsearch / sort-merge ──
+;; The asof exec picks its strategy from the right side's time layout:
+;; globally sorted time -> hash-group + cursor merge; per-group monotone
+;; (but globally unsorted) -> hash-group + binary search; per-group
+;; DESCENDING time -> the sort-merge fallback.  asof-join is semantically
+;; order-independent in the right rows, so the same rows in all three
+;; layouts must produce identical results.
+(set L (table [sym time qty] (list ['a 'b 'a 'c 'a] [5 5 2 1 9] [1 2 3 4 5])))
+;; globally time-sorted -> cursor merge
+(set RG (table [sym time px] (list ['a 'b 'a 'b 'a] [1 2 4 6 8] [10.0 12.0 11.0 13.0 14.0])))
+;; per-group monotone, globally unsorted -> collect + binary search
+(set RS (table [sym time px] (list ['a 'a 'b 'b 'a] [1 4 2 6 8] [10.0 11.0 12.0 13.0 14.0])))
+;; per-group descending -> sort-merge fallback
+(set RU (table [sym time px] (list ['a 'b 'a 'a 'b] [8 6 4 1 2] [14.0 13.0 11.0 10.0 12.0])))
+(at (asof-join ['sym 'time] L RG) 'px) -- [11.0 12.0 10.0 0N 14.0]
+(asof-join ['sym 'time] L RG) -- (asof-join ['sym 'time] L RS)
+(asof-join ['sym 'time] L RG) -- (asof-join ['sym 'time] L RU)
+;; multi-eq-key across the same three layouts (second key breaks LUT groups)
+(set L2 (table [sym ex time qty] (list ['a 'a 'b] ['X 'Y 'X] [5 5 5] [1 2 3])))
+(set R2G (table [sym ex time px] (list ['a 'a 'a 'b] ['X 'Y 'X 'X] [1 2 4 3] [10.0 20.0 11.0 30.0])))
+(set R2U (table [sym ex time px] (list ['a 'a 'a 'b] ['X 'X 'Y 'X] [4 1 2 3] [11.0 10.0 20.0 30.0])))
+(at (asof-join ['sym 'ex 'time] L2 R2G) 'px) -- [11.0 20.0 30.0]
+(asof-join ['sym 'ex 'time] L2 R2G) -- (asof-join ['sym 'ex 'time] L2 R2U)
+;; tie times: the LAST right row with time <= t wins, in every strategy
+(set LT (table [sym time q] (list ['a] [5] [1])))
+(set RT (table [sym time px] (list ['a 'a 'a] [5 5 5] [1.0 2.0 3.0])))
+(at (asof-join ['sym 'time] LT RT) 'px) -- [3.0]
