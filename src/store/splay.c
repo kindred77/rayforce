@@ -478,19 +478,42 @@ void ray_splay_build_indexes(const char* dir, ray_t* tbl) {
         if (!col || RAY_IS_ERR(col)) continue;
 
         /* Explicit SYM index: a SYM column carrying a grouped (hash) index in
-         * memory gets that exact index persisted inline — regardless of length
-         * (the grouped attr is deliberate intent, unlike the size-gated auto
-         * dict/chunk-zone below).  Reuses the attached payload; the raw column
-         * was already written index-stripped, so this appends only the region. */
+         * memory gets a hash index persisted inline — regardless of length (the
+         * grouped attr is deliberate intent, unlike the size-gated auto
+         * dict/chunk-zone below).
+         *
+         * The in-memory index (col->index) is keyed by this column's runtime
+         * domain ids, but the raw column was written re-encoded to FILE-LOCAL
+         * domain positions (ray_col_save_sym_encoded).  Persisting the runtime-
+         * keyed index verbatim would make every reload-time equality probe miss:
+         * the probe resolves the query symbol to a file-local position, which
+         * lands in a different bucket than the runtime id the builder hashed.
+         * So rebuild the hash over the just-written file-local column (loaded
+         * back index-stripped) — that index is keyed in the same space the
+         * probe uses.  The raw file is payload-sized here, so append adds only
+         * the region. */
         if (col->type == RAY_SYM && ray_index_kind(col) == RAY_IDX_HASH) {
             ray_t* nstr = ray_sym_str(ray_table_col_name(tbl, c));
             if (nstr && !RAY_IS_ERR(nstr)) {
-                char path[1100];
+                char path[1024];
                 int n = snprintf(path, sizeof(path), "%s/%.*s", dir,
                                  (int)ray_str_len(nstr), ray_str_ptr(nstr));
-                if (n > 0 && n < (int)sizeof(path))
-                    (void)ray_col_append_index(path,
-                        ray_index_payload(col->index), col->len, col->type);
+                if (n > 0 && n < (int)sizeof(path)) {
+                    ray_t* fc = ray_col_load(path);  /* file-local codes */
+                    if (fc && !RAY_IS_ERR(fc)) {
+                        ray_t* fi = ray_idx_hash_fn(fc);  /* hash over file-local */
+                        if (fi && !RAY_IS_ERR(fi)) {
+                            (void)ray_col_append_index(path,
+                                ray_index_payload(fi->index), fi->len, RAY_SYM);
+                            ray_release(fi);
+                        } else if (fi) {
+                            ray_error_free(fi);
+                        }
+                        ray_release(fc);
+                    } else if (fc) {
+                        ray_error_free(fc);
+                    }
+                }
             }
             continue;
         }
