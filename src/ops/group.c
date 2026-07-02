@@ -5878,6 +5878,447 @@ grp_done:
     return result;
 }
 
+/* ============================================================================
+ * Slice-group path — FILTER(in/eq on key col) + GROUP(by key col) fusion
+ * ============================================================================
+ *
+ * The probe (exec.c ray_slice_group_probe) resolved the WHERE key set
+ * against the group-key column's CSR hash index: g->sg_slices_hdr holds
+ * one (domain-id, rows, n) slice per surviving key, ascending by domain
+ * id — the DA path's emit order.  Aggregate each slice directly: the
+ * filter scan, the survivor gather and group discovery all vanish; per
+ * group the accumulation applies the same all_sum recurrence da_accum_row
+ * applies row-by-row (same read helpers, same in-order accumulate), so
+ * results match the generic path.  Ineligible shapes — non-SUM/AVG/COUNT
+ * aggs, non-scan non-prod-fusable inputs, HAS_NULLS or F32/exotic agg
+ * columns, binary/holistic aggs, HEAD limits, emit filters — return NULL
+ * and the caller folds the slices into the equivalent selection. */
+
+/* Row-chunk task: slice gi, rows [lo, hi) within that slice.  Slices are
+ * chunked so one dominant key (a most-frequent sym can carry ~95% of the
+ * surviving rows) still spreads across the pool; each task accumulates
+ * into its own partial slot and the caller folds partials in task order,
+ * so the per-group accumulation order is chunk-sequential — independent
+ * of worker count. */
+#define SG_CHUNK_ROWS 32768
+typedef struct { int64_t gi, lo, hi; } sg_task_t;
+
+typedef struct {
+    const ray_idx_slice_t* slices;
+    const sg_task_t*  tasks;
+    ray_t* const*     agg_vecs;
+    const agg_prod_t* prod;
+    const uint16_t*   agg_ops;
+    uint8_t           n_aggs;
+    da_val_t*         partials; /* [n_tasks * n_aggs], zeroed */
+    /* Shared-stream fusion: pair_sum[a] = sibling SUM agg slot whose bare
+     * scan is prod[a]'s int side (-1 = none); fused_by[b] = the prod slot
+     * that computes SUM b (-1 = b runs its own loop). */
+    int8_t            pair_sum[16];
+    int8_t            fused_by[16];
+} sg_ctx_t;
+
+/* Fused-product partial over a CONTIGUOUS row range — type-specialized
+ * so the inner loop is a plain FMA-able stream (the per-row type switch
+ * inside prod_val_f64 defeats vectorization).  Falls back to the
+ * per-row reader for uncommon type pairs. */
+static inline double sg_prod_range(const agg_prod_t* p, int64_t r0, int64_t n,
+                                   int64_t* int_side_sum) {
+    const void* pa = p->pa; const void* pb = p->pb;
+    int8_t ta = p->ta, tb = p->tb;
+    /* Canonicalize: put the F64 side (guaranteed by the fusion gate to
+     * exist) in `fa`. */
+    if (tb == RAY_F64 && ta != RAY_F64) {
+        const void* tmp = pa; pa = pb; pb = tmp;
+        int8_t tt = ta; ta = tb; tb = tt;
+    }
+    /* Four independent accumulator chains: the i64→f64 convert has no
+     * packed AVX2 form, so these loops stay scalar — a single
+     * accumulator then serializes at FMA latency (~4-5 cyc/row).  Four
+     * chains keep the FMA and convert ports saturated instead. */
+    double a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+    int64_t j = 0;
+    if (ta == RAY_F64 && tb == RAY_F64) {
+        const double* restrict x = (const double*)pa + r0;
+        const double* restrict y = (const double*)pb + r0;
+        for (; j + 4 <= n; j += 4) {
+            a0 += x[j] * y[j];         a1 += x[j + 1] * y[j + 1];
+            a2 += x[j + 2] * y[j + 2]; a3 += x[j + 3] * y[j + 3];
+        }
+        for (; j < n; j++) a0 += x[j] * y[j];
+    } else if (ta == RAY_F64 && (tb == RAY_I64 || tb == RAY_TIME)) {
+        const double*  restrict x = (const double*)pa + r0;
+        const int64_t* restrict y = (const int64_t*)pb + r0;
+        uint64_t s0 = 0;
+        if (int_side_sum) {
+            /* Shared-stream fusion: a sibling SUM over the product's int
+             * side rides the same loads (row order preserved — the int
+             * sum is order-exact either way). */
+            for (; j + 4 <= n; j += 4) {
+                a0 += x[j] * (double)y[j];         a1 += x[j + 1] * (double)y[j + 1];
+                a2 += x[j + 2] * (double)y[j + 2]; a3 += x[j + 3] * (double)y[j + 3];
+                s0 += (uint64_t)y[j] + (uint64_t)y[j + 1] +
+                      (uint64_t)y[j + 2] + (uint64_t)y[j + 3];
+            }
+            for (; j < n; j++) { a0 += x[j] * (double)y[j]; s0 += (uint64_t)y[j]; }
+            *int_side_sum = (int64_t)s0;
+        } else {
+            for (; j + 4 <= n; j += 4) {
+                a0 += x[j] * (double)y[j];         a1 += x[j + 1] * (double)y[j + 1];
+                a2 += x[j + 2] * (double)y[j + 2]; a3 += x[j + 3] * (double)y[j + 3];
+            }
+            for (; j < n; j++) a0 += x[j] * (double)y[j];
+        }
+    } else if (ta == RAY_F64 && tb == RAY_I32) {
+        const double*  restrict x = (const double*)pa + r0;
+        const int32_t* restrict y = (const int32_t*)pb + r0;
+        uint64_t s0 = 0;
+        if (int_side_sum) {
+            for (; j + 4 <= n; j += 4) {
+                a0 += x[j] * (double)y[j];         a1 += x[j + 1] * (double)y[j + 1];
+                a2 += x[j + 2] * (double)y[j + 2]; a3 += x[j + 3] * (double)y[j + 3];
+                s0 += (uint64_t)(int64_t)y[j] + (uint64_t)(int64_t)y[j + 1] +
+                      (uint64_t)(int64_t)y[j + 2] + (uint64_t)(int64_t)y[j + 3];
+            }
+            for (; j < n; j++) { a0 += x[j] * (double)y[j]; s0 += (uint64_t)(int64_t)y[j]; }
+            *int_side_sum = (int64_t)s0;
+        } else {
+            for (; j + 4 <= n; j += 4) {
+                a0 += x[j] * (double)y[j];         a1 += x[j + 1] * (double)y[j + 1];
+                a2 += x[j + 2] * (double)y[j + 2]; a3 += x[j + 3] * (double)y[j + 3];
+            }
+            for (; j < n; j++) a0 += x[j] * (double)y[j];
+        }
+    } else {
+        if (int_side_sum) *int_side_sum = 0;   /* unreachable by pairing gate */
+        for (; j < n; j++) a0 += prod_val_f64(p, r0 + j);
+    }
+    return (a0 + a1) + (a2 + a3);
+}
+
+static void sg_accum_fn(void* raw, uint32_t wid, int64_t tstart, int64_t tend) {
+    (void)wid;
+    sg_ctx_t* c = (sg_ctx_t*)raw;
+    for (int64_t ti = tstart; ti < tend; ti++) {
+        const sg_task_t* tk = &c->tasks[ti];
+        const ray_idx_slice_t* sl = &c->slices[tk->gi];
+        const int64_t* restrict rows = sl->rows + tk->lo;
+        int64_t n = tk->hi - tk->lo;
+        /* Parted layout: each key's rows form one contiguous run — the
+         * accumulate then streams raw column pointers and vectorizes. */
+        bool contig = (n > 0 && rows[n - 1] - rows[0] + 1 == n);
+        int64_t r0 = (n > 0) ? rows[0] : 0;
+        for (uint8_t a = 0; a < c->n_aggs; a++) {
+            size_t idx = (size_t)ti * c->n_aggs + a;
+            if (c->prod[a].enabled) {
+                /* Fused product: gated null-free, every row counts. */
+                double acc = 0.0;
+                if (contig) {
+                    int8_t pb_slot = c->pair_sum[a];
+                    if (pb_slot >= 0) {
+                        int64_t iss = 0;
+                        acc = sg_prod_range(&c->prod[a], r0, n, &iss);
+                        c->partials[(size_t)ti * c->n_aggs + pb_slot].i = iss;
+                    } else {
+                        acc = sg_prod_range(&c->prod[a], r0, n, NULL);
+                    }
+                } else {
+                    for (int64_t j = 0; j < n; j++)
+                        acc += prod_val_f64(&c->prod[a], rows[j]);
+                }
+                c->partials[idx].f = acc;
+            } else if (contig && c->fused_by[a] >= 0) {
+                /* SUM computed by its paired product loop above (aggs
+                 * iterate ascending and pairing enforces prod < sum? no —
+                 * pairing is order-free: the prod branch writes this slot
+                 * directly whichever order they appear in). */
+            } else if (c->agg_ops[a] == OP_COUNT) {
+                /* counts[gi] above suffices. */
+            } else if (c->agg_vecs[a]->type == RAY_F64) {
+                /* NaN payload = null, skip from sum (mirror all_sum). */
+                const double* restrict d =
+                    (const double*)ray_data(c->agg_vecs[a]);
+                double acc = 0.0;
+                if (contig) {
+                    const double* restrict dr = d + r0;
+                    for (int64_t j = 0; j < n; j++) {
+                        double v = dr[j];
+                        if (RAY_LIKELY(v == v)) acc += v;
+                    }
+                } else {
+                    for (int64_t j = 0; j < n; j++) {
+                        double v = d[rows[j]];
+                        if (RAY_LIKELY(v == v)) acc += v;
+                    }
+                }
+                c->partials[idx].f = acc;
+            } else {
+                /* Integer family, null-free by admission (unsigned wrap
+                 * add mirrors da_accum_row). */
+                ray_t* av = c->agg_vecs[a];
+                const void* p = ray_data(av);
+                int8_t t = av->type;
+                uint8_t at = av->attrs;
+                uint64_t acc = 0;
+                if (contig && (t == RAY_I64 || t == RAY_TIME)) {
+                    const int64_t* restrict x = (const int64_t*)p + r0;
+                    for (int64_t j = 0; j < n; j++) acc += (uint64_t)x[j];
+                } else if (contig && t == RAY_I32) {
+                    const int32_t* restrict x = (const int32_t*)p + r0;
+                    for (int64_t j = 0; j < n; j++) acc += (uint64_t)(int64_t)x[j];
+                } else {
+                    for (int64_t j = 0; j < n; j++)
+                        acc += (uint64_t)read_col_i64(p, rows[j], t, at);
+                }
+                c->partials[idx].i = (int64_t)acc;
+            }
+        }
+    }
+}
+
+static int sg_cmp_i64(const void* a, const void* b) {
+    int64_t x = *(const int64_t*)a, y = *(const int64_t*)b;
+    return (x > y) - (x < y);
+}
+
+static inline void sg_hint_release(ray_graph_t* g) {
+    if (g->sg_col)        { ray_release(g->sg_col); g->sg_col = NULL; }
+    if (g->sg_slices_hdr) { ray_free(g->sg_slices_hdr); g->sg_slices_hdr = NULL; }
+    g->sg_nslices = 0;
+}
+
+/* Ineligible-shape fallback: fold the resolved slices into exactly the
+ * rowsel the skipped FILTER would have produced, so the generic paths
+ * below run unchanged.  Returns an error (hint released) or NULL on
+ * success with g->selection installed. */
+static ray_t* sg_hint_to_selection(ray_graph_t* g, ray_t* tbl) {
+    int64_t nrows = ray_table_nrows(tbl);
+    const ray_idx_slice_t* sl = g->sg_slices_hdr
+        ? (const ray_idx_slice_t*)ray_data(g->sg_slices_hdr) : NULL;
+    int64_t K = g->sg_nslices;
+    int64_t total = 0;
+    for (int64_t i = 0; i < K; i++) total += sl[i].n;
+    ray_t* sel = NULL;
+    if (total == 0) {
+        sel = ray_index_rowsel_from_ids(nrows, NULL, 0);
+    } else {
+        ray_t* hdr = ray_alloc((size_t)total * (int64_t)sizeof(int64_t));
+        if (!hdr) { sg_hint_release(g); return ray_error("oom", NULL); }
+        int64_t* ids = (int64_t*)ray_data(hdr);
+        int64_t w = 0;
+        for (int64_t i = 0; i < K; i++) {
+            memcpy(ids + w, sl[i].rows, (size_t)sl[i].n * sizeof(int64_t));
+            w += sl[i].n;
+        }
+        /* Slices are disjoint and each ascending; a plain sort restores
+         * the global ascending order the rowsel builder requires. */
+        qsort(ids, (size_t)total, sizeof(int64_t), sg_cmp_i64);
+        sel = ray_index_rowsel_from_ids(nrows, ids, total);
+        ray_free(hdr);
+    }
+    sg_hint_release(g);
+    if (!sel) return ray_error("oom", NULL);
+    g->selection = sel;
+    return NULL;
+}
+
+/* Shape/agg admission shared by the kernel and by the early settle hook
+ * (exec.c OP_GROUP runs it BEFORE its sparse pre-compaction so an
+ * ineligible hint folds into a selection in time to benefit from
+ * compaction).  On success fills agg_vecs (bare scan cols or NULL) and
+ * prod (fused product plans). */
+static bool sg_shape_eligible(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
+                              int64_t group_limit,
+                              ray_t** agg_vecs, agg_prod_t* prod) {
+    if (group_limit != 0) return false;
+    if (ray_group_emit_filter_get().enabled) return false;
+    ray_op_ext_t* ext = find_ext(g, op->id);
+    if (!ext || ext->n_keys != 1 || ext->n_aggs < 1 || ext->n_aggs > 16)
+        return false;
+    if (ext->agg_k) return false;
+
+    /* The single group key must be the bare scan of the probed column. */
+    ray_op_ext_t* ke = find_ext(g, ext->keys[0]);
+    if (!ke || ke->base.opcode != OP_SCAN) return false;
+    ray_t* key_col = ray_table_get_col(tbl, ke->sym);
+    if (!key_col || key_col != g->sg_col) return false;
+
+    for (uint8_t a = 0; a < ext->n_aggs; a++) {
+        if (ext->agg_ins2 && ext->agg_ins2[a] != RAY_OP_NONE) return false;
+        uint16_t aop = ext->agg_ops[a];
+        if (aop == OP_COUNT) continue;    /* group size; input unused */
+        if (aop != OP_SUM && aop != OP_AVG) return false;
+        ray_op_t* in = op_node(g, ext->agg_ins[a]);
+        if (!in) return false;
+        if (try_prod_sumavg_input_f64(g, tbl, in, &prod[a])) continue;
+        ray_op_ext_t* ae = find_ext(g, in->id);
+        if (!ae || ae->base.opcode != OP_SCAN) return false;
+        ray_t* col = ray_table_get_col(tbl, ae->sym);
+        if (!col || ray_is_atom(col)) return false;
+        if (col->attrs & RAY_ATTR_HAS_NULLS) return false;
+        switch (col->type) {
+            case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
+            case RAY_TIME: case RAY_F64: break;
+            default: return false;  /* F32 / exotic → generic path */
+        }
+        agg_vecs[a] = col;
+    }
+    return true;
+}
+
+/* Early settle hook — called from exec.c OP_GROUP before its sparse
+ * pre-compaction: an armed hint whose group shape can't take the slice
+ * path folds into the equivalent selection NOW, so downstream sparse
+ * optimizations (pre-compaction, selection-aware iteration) see it.
+ * Returns an error to propagate, or NULL (hint either left armed for
+ * the kernel or folded into g->selection). */
+ray_t* ray_group_slice_hint_settle(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
+                                   int64_t group_limit) {
+    if (!g->sg_col || !tbl || tbl->type != RAY_TABLE) return NULL;
+    ray_t* agg_vecs[16] = {0};
+    agg_prod_t prod[16];
+    memset(prod, 0, sizeof(prod));
+    if (sg_shape_eligible(g, op, tbl, group_limit, agg_vecs, prod))
+        return NULL;                      /* kernel will consume it */
+    return sg_hint_to_selection(g, tbl);  /* fold; NULL on success */
+}
+
+static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
+                                int64_t group_limit) {
+    ray_t* agg_vecs[16] = {0};
+    agg_prod_t prod[16];
+    memset(prod, 0, sizeof(prod));
+    if (!sg_shape_eligible(g, op, tbl, group_limit, agg_vecs, prod))
+        return NULL;
+    ray_op_ext_t* ext = find_ext(g, op->id);
+    ray_op_ext_t* ke = find_ext(g, ext->keys[0]);
+    ray_t* key_col = ray_table_get_col(tbl, ke->sym);
+    uint8_t n_aggs = ext->n_aggs;
+
+    int64_t K = g->sg_nslices;
+    const ray_idx_slice_t* slices = (K > 0)
+        ? (const ray_idx_slice_t*)ray_data(g->sg_slices_hdr) : NULL;
+
+    ray_t *sum_hdr = NULL, *cnt_hdr = NULL, *task_hdr = NULL, *part_hdr = NULL;
+    da_val_t* sums = NULL;
+    int64_t* counts = NULL;
+    if (K > 0) {
+        sums = (da_val_t*)scratch_calloc(&sum_hdr,
+                   (size_t)K * n_aggs * sizeof(da_val_t));
+        counts = (int64_t*)scratch_calloc(&cnt_hdr,
+                   (size_t)K * sizeof(int64_t));
+        /* Chunk slices into row tasks so one dominant key still spreads
+         * across the pool (see sg_task_t). */
+        int64_t n_tasks = 0;
+        for (int64_t i = 0; i < K; i++)
+            n_tasks += (slices[i].n + SG_CHUNK_ROWS - 1) / SG_CHUNK_ROWS;
+        sg_task_t* tasks = NULL;
+        da_val_t* partials = NULL;
+        if (sums && counts) {
+            task_hdr = ray_alloc((size_t)n_tasks * (int64_t)sizeof(sg_task_t));
+            tasks = task_hdr ? (sg_task_t*)ray_data(task_hdr) : NULL;
+            partials = (da_val_t*)scratch_calloc(&part_hdr,
+                           (size_t)n_tasks * n_aggs * sizeof(da_val_t));
+        }
+        if (!sums || !counts || !tasks || !partials) {
+            scratch_free(sum_hdr); scratch_free(cnt_hdr);
+            if (task_hdr) ray_free(task_hdr);
+            scratch_free(part_hdr);
+            return NULL;    /* OOM → generic path via fallback */
+        }
+        int64_t total_rows = 0, tw = 0;
+        for (int64_t i = 0; i < K; i++) {
+            total_rows += slices[i].n;
+            for (int64_t lo = 0; lo < slices[i].n; lo += SG_CHUNK_ROWS) {
+                int64_t hi = lo + SG_CHUNK_ROWS;
+                if (hi > slices[i].n) hi = slices[i].n;
+                tasks[tw].gi = i; tasks[tw].lo = lo; tasks[tw].hi = hi; tw++;
+            }
+        }
+        sg_ctx_t ctx = { slices, tasks, agg_vecs, prod, ext->agg_ops,
+                         n_aggs, partials, {0}, {0} };
+        /* Shared-stream pairing: a bare-scan SUM/AVG over the same column
+         * a product's int side already streams rides the product loop —
+         * one pass over the column instead of two. */
+        for (uint8_t a = 0; a < 16; a++) { ctx.pair_sum[a] = -1; ctx.fused_by[a] = -1; }
+        for (uint8_t a = 0; a < n_aggs; a++) {
+            if (!prod[a].enabled) continue;
+            const void* ip; int8_t it;
+            if (prod[a].ta != RAY_F64)      { ip = prod[a].pa; it = prod[a].ta; }
+            else if (prod[a].tb != RAY_F64) { ip = prod[a].pb; it = prod[a].tb; }
+            else continue;                   /* F64×F64 — no int side */
+            if (it != RAY_I64 && it != RAY_TIME && it != RAY_I32) continue;
+            for (uint8_t b = 0; b < n_aggs; b++) {
+                if (b == a || !agg_vecs[b] || ctx.fused_by[b] >= 0) continue;
+                if (ext->agg_ops[b] != OP_SUM && ext->agg_ops[b] != OP_AVG) continue;
+                if (ray_data(agg_vecs[b]) != ip || agg_vecs[b]->type != it) continue;
+                ctx.pair_sum[a] = (int8_t)b;
+                ctx.fused_by[b] = (int8_t)a;
+                break;
+            }
+        }
+        ray_pool_t* pool = ray_pool_get();
+        if (pool && n_tasks > 1 && total_rows >= RAY_PARALLEL_THRESHOLD)
+            ray_pool_dispatch(pool, sg_accum_fn, &ctx, n_tasks);
+        else
+            sg_accum_fn(&ctx, 0, 0, n_tasks);
+        /* Fold task partials in task order — chunk-sequential per group,
+         * independent of worker count. */
+        for (int64_t ti = 0; ti < n_tasks; ti++) {
+            int64_t gi = tasks[ti].gi;
+            counts[gi] += tasks[ti].hi - tasks[ti].lo;
+            for (uint8_t a = 0; a < n_aggs; a++) {
+                size_t di = (size_t)gi * n_aggs + a;
+                size_t si = (size_t)ti * n_aggs + a;
+                if (prod[a].enabled || ext->agg_ops[a] == OP_COUNT ||
+                    (agg_vecs[a] && agg_vecs[a]->type == RAY_F64))
+                    sums[di].f += partials[si].f;
+                else
+                    sums[di].i = (int64_t)((uint64_t)sums[di].i +
+                                           (uint64_t)partials[si].i);
+            }
+        }
+        ray_free(task_hdr);
+        scratch_free(part_hdr);
+    }
+
+    /* Emit: key column (domain ids in slice order), then the shared agg
+     * emitter — same types, same divisors, same fusion families as the
+     * DA path. */
+    ray_t* result = ray_table_new(1 + n_aggs);
+    if (!result || RAY_IS_ERR(result)) {
+        scratch_free(sum_hdr); scratch_free(cnt_hdr);
+        return NULL;
+    }
+    ray_t* kc = col_vec_new(key_col, K > 0 ? K : 1);
+    if (!kc || RAY_IS_ERR(kc)) {
+        if (kc) ray_release(kc);
+        ray_release(result);
+        scratch_free(sum_hdr); scratch_free(cnt_hdr);
+        return NULL;
+    }
+    if (kc->type == RAY_SYM)
+        ray_sym_vec_adopt_domain(kc, sym_domain_rep(key_col));
+    kc->len = K;
+    for (int64_t gi = 0; gi < K; gi++)
+        write_col_i64(ray_data(kc), gi, slices[gi].dom,
+                      key_col->type, kc->attrs);
+    result = ray_table_add_col(result, ke->sym, kc);
+    ray_release(kc);
+    if (!result || RAY_IS_ERR(result)) {
+        scratch_free(sum_hdr); scratch_free(cnt_hdr);
+        return result;
+    }
+
+    emit_agg_columns(&result, g, ext, agg_vecs, (uint32_t)K, n_aggs,
+                     (double*)sums, (int64_t*)sums,
+                     NULL, NULL, NULL, NULL,
+                     counts, NULL, prod, NULL, NULL);
+
+    scratch_free(sum_hdr); scratch_free(cnt_hdr);
+    return result;
+}
+
 static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                   int64_t group_limit) {
     if (!tbl || RAY_IS_ERR(tbl)) return tbl;
@@ -5895,6 +6336,17 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             return ray_error("domain",
                 "exec_group: selection nrows mismatch (sel=%lld tbl=%lld)",
                 (long long)sm->nrows, (long long)tbl_nrows);
+    }
+
+    /* Slice-group hint (armed instead of the WHERE filter — see
+     * ray_slice_group_probe): aggregate the key slices directly, or
+     * fold them into the selection the skipped filter would have
+     * produced and continue on the generic paths. */
+    if (g->sg_col) {
+        ray_t* sgr = exec_group_slices(g, op, tbl, group_limit);
+        if (sgr) { sg_hint_release(g); return sgr; }
+        ray_t* err = sg_hint_to_selection(g, tbl);
+        if (err) return err;
     }
 
     /* Parted dispatch: detect parted input columns */

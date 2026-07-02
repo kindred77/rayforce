@@ -1581,6 +1581,37 @@ static int is_group_dag_agg_expr(ray_t* expr);  /* defined below */
  * result.  Eligibility: >=1 extractable agg; every table-column reference
  * sits inside one; agg arguments contain no nested aggs; connectives may
  * be arbitrary calls over literals/globals. */
+/* Slice-group arming gate: the exec_group slice kernel takes only
+ * SUM/AVG/COUNT over a bare column or a two-column product.  Arming the
+ * hint for other agg shapes is legal (exec_group folds it back into a
+ * selection) but wasteful — the fold costs a sort of every surviving
+ * row id.  Checked over dag-agg outputs and decomposed hidden slots. */
+static int sg_agg_expr_ok(ray_t* expr) {
+    if (!expr || !is_list(expr) || ray_len(expr) < 2) return 0;
+    ray_t** e = (ray_t**)ray_data(expr);
+    if (!e[0] || e[0]->type != -RAY_SYM) return 0;
+    static int64_t s_sum = -1, s_avg = -1, s_count = -1, s_mul = -1;
+    if (s_sum < 0) {
+        s_sum = ray_sym_intern("sum", 3);
+        s_avg = ray_sym_intern("avg", 3);
+        s_count = ray_sym_intern("count", 5);
+        s_mul = ray_sym_intern("*", 1);
+    }
+    int64_t h = e[0]->i64;
+    if (h != s_sum && h != s_avg && h != s_count) return 0;
+    if (h == s_count) return 1;           /* group size; arg unused */
+    ray_t* arg = e[1];
+    if (arg && arg->type == -RAY_SYM && !(arg->attrs & ATTR_QUOTED)) return 1;
+    if (arg && is_list(arg) && ray_len(arg) == 3) {
+        ray_t** m = (ray_t**)ray_data(arg);
+        if (m[0] && m[0]->type == -RAY_SYM && m[0]->i64 == s_mul &&
+            m[1] && m[1]->type == -RAY_SYM && !(m[1]->attrs & ATTR_QUOTED) &&
+            m[2] && m[2]->type == -RAY_SYM && !(m[2]->attrs & ATTR_QUOTED))
+            return 1;
+    }
+    return 0;
+}
+
 static ray_t* agg_arith_rewrite(ray_t* expr, ray_t* tbl,
                                 ray_t** hexprs, int64_t* hnames,
                                 int* n_hidden, int cap, int* ok) {
@@ -5081,7 +5112,17 @@ ray_t* ray_select(ray_t** args, int64_t n) {
             ray_t* k = d_elems[i * 2];
             ray_t* v = d_elems[i * 2 + 1];
             if (!k || k->type != -RAY_SYM) continue;
-            if (!(v && v->type == -RAY_SYM && v->i64 == k->i64)) {
+            /* A bare unquoted source-column ref ({s: sym}) is a pure
+             * RENAME, not a computed key: the generic by-dict path below
+             * adds the source column under the alias (same vector object,
+             * same attached index) and the query flows down the main
+             * GROUP pipeline.  Routing renames through the computed-key
+             * prefilter forced a filtered materialize of every referenced
+             * column and hid the key column's index from the group side. */
+            bool bare_ref = v && v->type == -RAY_SYM &&
+                            !(v->attrs & ATTR_QUOTED) &&
+                            ray_table_get_col(tbl, v->i64) != NULL;
+            if (!(v && v->type == -RAY_SYM && v->i64 == k->i64) && !bare_ref) {
                 has_computed_by_val = true;
                 break;
             }
@@ -7195,19 +7236,62 @@ by_dict_done:
                 if (col && RAY_IS_PARTED(col->type)) { table_is_parted = 1; break; }
             }
         }
+        /* Classification + arith-of-aggs pre-decomposition.  The
+         * decomposition used to run inside the output-compile loop below,
+         * AFTER has_nonagg_needing_flat was computed — so a decomposable
+         * compound like (/ (sum a) (as 'F64 (sum b))) still forced the
+         * WHERE materialize path (and, on parted sources, a full column
+         * flatten) that its rewritten form no longer needs.  Decompose
+         * here, before the routing decisions, and let the compile loop
+         * consume the precomputed rewrites via compound_pos.  The mirror
+         * counter replicates the compile loop's slot accounting exactly:
+         * dag-aggs claim slots in output order and hidden slots share
+         * the 16-slot cap. */
         int has_nonagg_needing_flat = 0;
-        for (int64_t i = 0; i + 1 < dict_n; i += 2) {
-            int64_t kid = dict_elems[i]->i64;
-            if (kid == from_id || kid == where_id || kid == by_id ||
-                kid == take_id || kid == asc_id || kid == desc_id) continue;
-            ray_t* expr = dict_elems[i + 1];
-            if (is_single_group_key_projection(by_expr, expr))
-                continue;
-            if (is_group_dag_agg_expr(expr)) continue;
-            ray_t* cd_inner = match_count_distinct(expr);
-            int is_simple_cd = cd_inner && cd_inner->type == -RAY_SYM &&
-                               !(cd_inner->attrs & ATTR_QUOTED);
-            if (!is_simple_cd) { has_nonagg_needing_flat = 1; break; }
+        int n_grp_agg_outputs = 0;   /* dag-aggs + decomposed compounds */
+        int has_cd_output = 0;
+        int sg_shapes_ok = 1;        /* every agg slot kernel-shaped */
+        int64_t compound_pos[16];
+        {
+            int mirror_aggs = 0;
+            for (int64_t i = 0; i + 1 < dict_n; i += 2) {
+                int64_t kid = dict_elems[i]->i64;
+                if (kid == from_id || kid == where_id || kid == by_id ||
+                    kid == take_id || kid == asc_id || kid == desc_id) continue;
+                ray_t* expr = dict_elems[i + 1];
+                if (is_single_group_key_projection(by_expr, expr))
+                    continue;
+                if (is_group_dag_agg_expr(expr)) {
+                    /* 17th+ dag-agg is silently dropped by the compile
+                     * loop (slot overflow) — mirror: not a flat forcer. */
+                    if (mirror_aggs < 16) { mirror_aggs++; n_grp_agg_outputs++; }
+                    if (!sg_agg_expr_ok(expr)) sg_shapes_ok = 0;
+                    continue;
+                }
+                ray_t* cd_inner = match_count_distinct(expr);
+                int is_simple_cd = cd_inner && cd_inner->type == -RAY_SYM &&
+                                   !(cd_inner->attrs & ATTR_QUOTED);
+                if (is_simple_cd) { has_cd_output = 1; continue; }
+                if (n_compound < 16) {
+                    int cap = 16 - mirror_aggs - n_hidden_aggs;
+                    int h_before = n_hidden_aggs;
+                    ray_t* rw = try_decompose_agg_arith(
+                        expr, tbl, hidden_agg_exprs, hidden_agg_names,
+                        &n_hidden_aggs, n_hidden_aggs + (cap > 0 ? cap : 0));
+                    if (rw) {
+                        for (int hi = h_before; hi < n_hidden_aggs; hi++)
+                            if (!sg_agg_expr_ok(hidden_agg_exprs[hi]))
+                                sg_shapes_ok = 0;
+                        compound_pos[n_compound] = i;
+                        compound_names[n_compound] = kid;
+                        compound_rw[n_compound] = rw;
+                        n_compound++;
+                        n_grp_agg_outputs++;
+                        continue;
+                    }
+                }
+                has_nonagg_needing_flat = 1;
+            }
         }
 
         /* The post-DAG scatter reads key columns directly and runs ray_eval
@@ -7282,6 +7366,27 @@ by_dict_done:
             bool can_fuse = !has_nonagg_needing_flat && !table_is_parted;
             if (can_fuse) {
                 root = ray_optimize(g, root);
+                /* Slice-group fusion: when the WHERE predicate is exactly
+                 * membership (in/==) on the single bare group-key column
+                 * and that column carries a fresh CSR hash index, skip
+                 * the filter scan entirely — exec_group aggregates the
+                 * key slices directly (or folds them into the equivalent
+                 * selection).  count-distinct outputs stay on the filter
+                 * path: their post-group scatter masks rows through
+                 * saved_selection, which this fusion never produces. */
+                bool sg_armed = false;
+                if (!has_cd_output && n_grp_agg_outputs > 0 && sg_shapes_ok) {
+                    int64_t by_name = -1;
+                    if (by_expr->type == -RAY_SYM && !(by_expr->attrs & ATTR_QUOTED))
+                        by_name = by_expr->i64;
+                    else if (by_expr->type == RAY_SYM && ray_len(by_expr) == 1)
+                        by_name = ((int64_t*)ray_data(by_expr))[0];
+                    ray_t* by_col = (by_name >= 0)
+                        ? ray_table_get_col(tbl, by_name) : NULL;
+                    if (by_col)
+                        sg_armed = ray_slice_group_probe(g, root, by_col);
+                }
+                if (sg_armed) goto where_done;
                 /* exec_node populates g->selection as a side effect
                  * of OP_FILTER on a table input, and returns the
                  * uncompacted table (== g->table).  Discard the
@@ -7321,6 +7426,7 @@ by_dict_done:
                 if (!g) { ray_release(tbl); return ray_error("oom", NULL); }
                 root = ray_const_table(g, tbl);
             }
+        where_done: ;
         }
 
         /* Compile group key(s) */
@@ -7415,22 +7521,15 @@ by_dict_done:
             } else if (!is_group_dag_agg_expr(val_expr) && n_nonaggs < 16) {
                 if (is_single_group_key_projection(by_expr, val_expr))
                     continue;
-                /* Arith-of-aggs: decompose into hidden DAG agg slots + a
-                 * post-group wrapper eval instead of the per-group scatter.
-                 * Capacity: real aggs + hidden slots share the 16-slot DAG
-                 * limit; on ineligibility/overflow the output falls back to
-                 * the scatter unchanged. */
-                if (n_compound < 16) {
-                    int cap = 16 - (int)n_aggs - n_hidden_aggs;
-                    ray_t* rw = try_decompose_agg_arith(
-                        val_expr, tbl, hidden_agg_exprs, hidden_agg_names,
-                        &n_hidden_aggs, n_hidden_aggs + (cap > 0 ? cap : 0));
-                    if (rw) {
-                        compound_names[n_compound] = kid;
-                        compound_rw[n_compound] = rw;
-                        n_compound++;
-                        continue;
-                    }
+                /* Arith-of-aggs: decomposed by the classification pass
+                 * above (hidden DAG agg slots + one post-group wrapper
+                 * eval); consume the precomputed rewrite here.  Outputs
+                 * that failed decomposition fall to the scatter. */
+                {
+                    bool pre_compound = false;
+                    for (int ci = 0; ci < n_compound; ci++)
+                        if (compound_pos[ci] == i) { pre_compound = true; break; }
+                    if (pre_compound) continue;
                 }
                 nonagg_names[n_nonaggs] = kid;
                 nonagg_exprs[n_nonaggs] = val_expr;

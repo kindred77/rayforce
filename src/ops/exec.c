@@ -1168,6 +1168,72 @@ ray_t* exec_in_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
     return sel;
 }
 
+static int idx_filter_decode(ray_graph_t* g, ray_op_t* pred_op,
+                             ray_t** out_col, uint16_t* out_cmp_op,
+                             int64_t* out_key_i, double* out_key_f,
+                             int* out_is_float);
+
+/* ---- Slice-group fusion probe (FILTER(in/eq on c) + GROUP(by c)) ----
+ *
+ * Called from the select-by pipeline (query.c) INSTEAD of executing the
+ * WHERE filter, after ray_optimize.  When the compiled filter's predicate
+ * is exactly membership on the single bare group-key column — (in c SET)
+ * or (== c K), no other conjuncts, no chained filter — and that column
+ * carries a fresh CSR hash index, the surviving groups are exactly the
+ * key set and each group's rows are its full CSR slice: resolve the
+ * slices NOW (freshness verified inside the resolver) and arm the hint
+ * on g.  exec_group consumes it — aggregating the slices directly, or
+ * folding them into the selection the skipped filter would have
+ * produced.  Returns true when armed (caller skips the filter exec). */
+bool ray_slice_group_probe(ray_graph_t* g, ray_op_t* root, ray_t* by_col) {
+    if (!g || !root || !by_col || g->selection || g->sg_col) return false;
+    if (root->opcode != OP_FILTER) return false;
+    ray_op_t* in0 = op_child(g, root, 0);
+    /* A chained FILTER input means the optimizer split a compound WHERE —
+     * this predicate is one conjunct of several, not the whole filter. */
+    if (!in0 || in0->opcode == OP_FILTER) return false;
+    if (by_col->type != RAY_SYM || ray_is_atom(by_col)) return false;
+    if (by_col->attrs & RAY_ATTR_HAS_NULLS) return false;
+    if (ray_index_kind(by_col) != RAY_IDX_HASH) return false;
+    ray_op_t* pred = op_child(g, root, 1);
+    if (!pred) return false;
+
+    ray_t* keys = NULL;      /* borrowed (CONST literal) */
+    ray_t* eq_atom = NULL;   /* owned (built for the eq shape) */
+    if (pred->opcode == OP_IN) {   /* NOT_IN also decodes — reject it */
+        ray_t* c = NULL; ray_t* set = NULL;
+        if (idx_filter_in_decode(g, pred, &c, &set) && c == by_col)
+            keys = set;
+    }
+    if (!keys) {
+        ray_t* c = NULL; uint16_t cop = 0;
+        int64_t ki = 0; double kf = 0.0; int isf = 0;
+        if (idx_filter_decode(g, pred, &c, &cop, &ki, &kf, &isf) &&
+            c == by_col && cop == OP_EQ && !isf) {
+            eq_atom = ray_sym(ki);
+            if (!eq_atom || RAY_IS_ERR(eq_atom)) {
+                if (eq_atom) ray_release(eq_atom);
+                return false;
+            }
+            keys = eq_atom;
+        }
+    }
+    if (!keys) return false;
+
+    ray_idx_consults[IDX_SITE_GROUP_SLICE]++;
+    ray_idx_slice_t* sl = NULL;
+    ray_t* shdr = NULL;
+    int64_t k = ray_index_hash_sym_slices(by_col, keys, &sl, &shdr);
+    if (eq_atom) ray_release(eq_atom);
+    if (k < 0) return false;
+    ray_idx_hits[IDX_SITE_GROUP_SLICE]++;
+    g->sg_col = by_col;
+    ray_retain(by_col);
+    g->sg_slices_hdr = shdr;   /* NULL when k == 0 */
+    g->sg_nslices = k;
+    return true;
+}
+
 /* ============================================================================
  * Recursive executor
  * ============================================================================ */
@@ -2158,6 +2224,19 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 /* NULL → lazy path; g->selection installed, tbl unchanged */
             }
 
+            /* Slice-group hint settle: an armed hint whose group shape is
+             * ineligible for the slice kernel folds into the equivalent
+             * selection HERE — before the sparse pre-compaction below —
+             * so ineligible fused shapes still get compacted instead of
+             * evaluating expression aggs over all rows. */
+            if (g->sg_col) {
+                ray_t* serr = ray_group_slice_hint_settle(g, op, tbl, 0);
+                if (serr) {
+                    if (owned_tbl) ray_release(owned_tbl);
+                    return serr;
+                }
+            }
+
             /* Sparse-selection pre-compaction: when the WHERE selection
              * admits far fewer rows than the table AND some group input is
              * a computed expression, exec_group would still materialize the
@@ -2183,8 +2262,13 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 }
                 bool contig = meta && meta->total_pass > 0 &&
                               all_rows * 4 >= meta->total_pass * 3;
+                /* Admission: compaction only ever fires when an expression
+                 * agg input exists (has_expr below) — the alternative is
+                 * materializing that expression over ALL rows — so the
+                 * scattered gate matches the projection-side compaction
+                 * factor (4x), not the plain-gather tradeoff (16x). */
                 if (gx && meta && nrows > 0 &&
-                    meta->total_pass * (contig ? 2 : 16) <= nrows) {
+                    meta->total_pass * (contig ? 2 : 4) <= nrows) {
                     int64_t keep[32];
                     bool has_expr = false;
                     int nkeep = group_input_scan_syms(g, gx, keep, 32, &has_expr);

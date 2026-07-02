@@ -454,6 +454,21 @@ typedef struct ray_graph {
     uint32_t       ext_cap;     /* capacity of ext_nodes array */
     ray_t*          selection;   /* RAY_SEL bitmap — lazy filter (NULL = all pass) */
 
+    /* Slice-group hint (FILTER(in/eq on c) + GROUP(by c) fusion).
+     * Armed by ray_slice_group_probe (exec.c) INSTEAD of executing the
+     * WHERE filter when the predicate is exactly membership on the
+     * single bare group-key column and that column carries a fresh CSR
+     * hash index: surviving groups are then exactly the key set and
+     * each group's rows are its full CSR slice.  sg_col is the retained
+     * key column; sg_slices_hdr is an alloc block of ray_idx_slice_t
+     * (idxop.h) resolved at probe time, ascending by column-domain id.
+     * exec_group consumes the hint — aggregating the slices directly or
+     * folding them into the equivalent g->selection.  Released by
+     * ray_graph_free on paths that never reach exec_group. */
+    ray_t*          sg_col;
+    ray_t*          sg_slices_hdr;
+    int64_t         sg_nslices;
+
     /* Compile-time local env for lambda / let inlining in
      * compile_expr_dag (src/ops/query.c).  Stack of
      * {formal_sym_id → node_id}.  Pushed on lambda call / let

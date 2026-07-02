@@ -191,7 +191,8 @@ static inline ray_index_t* ray_index_payload(ray_t* idx) {
 typedef enum {
     IDX_SITE_FILTER_ZONE = 0, IDX_SITE_FILTER_BLOOM, IDX_SITE_FILTER_HASH,
     IDX_SITE_FILTER_RANGE, IDX_SITE_IN, IDX_SITE_FIND, IDX_SITE_SORT,
-    IDX_SITE_DISTINCT, IDX_SITE_ASOF, IDX_SITE_FILTER_EQRANGE, IDX_SITE__N
+    IDX_SITE_DISTINCT, IDX_SITE_ASOF, IDX_SITE_FILTER_EQRANGE,
+    IDX_SITE_GROUP_SLICE, IDX_SITE__N
 } idx_site_t;
 extern uint64_t ray_idx_consults[IDX_SITE__N];
 extern uint64_t ray_idx_hits[IDX_SITE__N];
@@ -377,6 +378,28 @@ int ray_index_hash_group(ray_t* col, int64_t key,
 
 /* Build a rowsel from ASCENDING row ids (empty n=0 is valid).  NULL on OOM. */
 ray_t* ray_index_rowsel_from_ids(int64_t nrows, const int64_t* ids, int64_t n);
+
+/* ===== Slice-group resolution (FILTER + GROUP-by-key fusion) =====
+ *
+ * One surviving group of the fused shape: the key's column-domain id and
+ * its CSR row slice (ascending row ids, borrowed from the index payload —
+ * valid while the index is). */
+typedef struct {
+    int64_t        dom;   /* column-domain key id */
+    const int64_t* rows;  /* ascending row ids (borrowed) */
+    int64_t        n;     /* slice length (> 0) */
+} ray_idx_slice_t;
+
+/* Resolve a SYM eq key (sym ATOM, global intern id) or IN set (SYM vec,
+ * any domain) against `col`'s fresh CSR hash index into per-key slices,
+ * canonicalized ascending by column-domain id (duplicates collapsed;
+ * absent / rowless keys dropped).  On success returns K >= 0 and, for
+ * K > 0, *out points into a fresh alloc block returned via *hdr_out
+ * (release with ray_free).  K == 0 → provably no surviving rows (*out
+ * and *hdr_out NULL).  Returns -1 when ineligible: stale or missing
+ * hash index, null-bearing or non-SYM column, wrong key shape. */
+int64_t ray_index_hash_sym_slices(ray_t* col, ray_t* keys,
+                                  ray_idx_slice_t** out, ray_t** hdr_out);
 
 /* ===== Sort-index range probe =====
  *

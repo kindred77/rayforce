@@ -130,6 +130,9 @@ ray_graph_t* ray_graph_new(ray_t* tbl) {
     g->ext_count = 0;
     g->ext_cap = 0;
     g->selection = NULL;
+    g->sg_col = NULL;
+    g->sg_slices_hdr = NULL;
+    g->sg_nslices = 0;
 
     g->cexpr_env_top = 0;  /* compile-time lambda/let env, initially empty */
 
@@ -138,6 +141,11 @@ ray_graph_t* ray_graph_new(ray_t* tbl) {
 
 void ray_graph_free(ray_graph_t* g) {
     if (!g) return;
+
+    /* Unconsumed slice-group hint (error paths / shapes that never
+     * reached exec_group). */
+    if (g->sg_col)        { ray_release(g->sg_col); g->sg_col = NULL; }
+    if (g->sg_slices_hdr) { ray_free(g->sg_slices_hdr); g->sg_slices_hdr = NULL; }
 
     /* M6: Release OP_CONST literal values before freeing ext nodes */
     for (uint32_t i = 0; i < g->ext_count; i++) {

@@ -957,6 +957,19 @@ ray_t* ray_wide_minmax_per_group_buf(ray_t* src, uint16_t op,
 
 ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit);
 
+/* Slice-group fusion probe (exec.c): arm g's slice-group hint instead of
+ * executing the WHERE filter when its predicate is exactly in/eq on the
+ * single bare group-key column with a fresh CSR hash index.  See the
+ * definition for the full contract. */
+bool ray_slice_group_probe(ray_graph_t* g, ray_op_t* root, ray_t* by_col);
+
+/* Early hint settle (group.c): fold an armed slice-group hint whose group
+ * shape is kernel-ineligible into the equivalent g->selection, ahead of
+ * OP_GROUP's sparse pre-compaction.  Returns an error to propagate or
+ * NULL. */
+ray_t* ray_group_slice_hint_settle(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
+                                   int64_t group_limit);
+
 /* Dict-code count-distinct row_gid side-channel: exec_group stashes the
  * per-result-group dict codes so the count-distinct path can build row_gid
  * by remapping codes (cheap int) instead of re-hashing strings. */

@@ -44,6 +44,7 @@ static void idx_stats_dump(void) {
     static const char* names[IDX_SITE__N] = {
         "filter-zone", "filter-bloom", "filter-hash", "filter-range",
         "in", "find", "sort", "distinct", "asof", "filter-eq-range",
+        "group-slice",
     };
     for (int i = 0; i < IDX_SITE__N; i++)
         if (ray_idx_consults[i] || ray_idx_hits[i])
@@ -2335,6 +2336,58 @@ int64_t ray_index_find_row(ray_t* col, int64_t key) {
 /* Public wrapper over the internal sorted-ids rowsel builder — consult
  * sites outside this file (the eq+range conjunction in exec.c) construct
  * selections from index slices. */
+
+int64_t ray_index_hash_sym_slices(ray_t* col, ray_t* keys,
+                                  ray_idx_slice_t** out, ray_t** hdr_out) {
+    *out = NULL; *hdr_out = NULL;
+    if (!col || !keys) return -1;
+    if (col->type != RAY_SYM) return -1;
+    if (!idx_fresh_nonull(col, RAY_IDX_HASH)) return -1;
+
+    bool atom = (keys->type == -RAY_SYM);
+    int64_t nkeys;
+    if (atom) nkeys = 1;
+    else if (keys->type == RAY_SYM && !ray_is_atom(keys)) nkeys = keys->len;
+    else return -1;
+    if (nkeys <= 0) return 0;
+
+    /* Canonicalize: translate to column-domain ids (absent → drop),
+     * sort ascending, collapse duplicates — the DA path's emit order. */
+    ray_t* dhdr = ray_alloc((size_t)nkeys * (int64_t)sizeof(int64_t));
+    if (!dhdr) return -1;
+    int64_t* doms = (int64_t*)ray_data(dhdr);
+    int64_t nd = 0;
+    for (int64_t i = 0; i < nkeys; i++) {
+        ray_t* str = atom ? ray_sym_str(keys->i64) : ray_sym_vec_cell(keys, i);
+        if (!str) continue;
+        int64_t dom = ray_sym_vec_lookup(col, ray_str_ptr(str), ray_str_len(str));
+        if (dom >= 0) doms[nd++] = dom;
+    }
+    if (nd == 0) { ray_free(dhdr); return 0; }
+    qsort(doms, (size_t)nd, sizeof(int64_t), cmp_i64_plain);
+    int64_t w = 1;
+    for (int64_t i = 1; i < nd; i++)
+        if (doms[i] != doms[i - 1]) doms[w++] = doms[i];
+    nd = w;
+
+    ray_t* shdr = ray_alloc((size_t)nd * (int64_t)sizeof(ray_idx_slice_t));
+    if (!shdr) { ray_free(dhdr); return -1; }
+    ray_idx_slice_t* sl = (ray_idx_slice_t*)ray_data(shdr);
+    int64_t k = 0;
+    for (int64_t i = 0; i < nd; i++) {
+        const int64_t* rows = NULL;
+        int64_t n = 0;
+        int hit = ray_index_hash_group(col, doms[i], &rows, &n);
+        if (hit < 0) { ray_free(dhdr); ray_free(shdr); return -1; }
+        if (hit == 0 || n == 0) continue;  /* in domain, no rows */
+        sl[k].dom = doms[i]; sl[k].rows = rows; sl[k].n = n; k++;
+    }
+    ray_free(dhdr);
+    if (k == 0) { ray_free(shdr); return 0; }
+    *out = sl; *hdr_out = shdr;
+    return k;
+}
+
 ray_t* ray_index_rowsel_from_ids(int64_t nrows, const int64_t* ids,
                                  int64_t n) {
     return rowsel_from_sorted_ids(nrows, ids, n);

@@ -1,0 +1,114 @@
+;; Slice-group fusion: FILTER(in/eq on key col) + GROUP(by key col) over a
+;; fresh CSR hash index answers group-by directly from the index slices
+;; (exec.c ray_slice_group_probe → group.c exec_group_slices).  Every pin
+;; below runs the SAME query against TI (grouped-indexed sym) and TP
+;; (plain sym) — the indexed run takes the slice path, the plain run the
+;; generic group paths — and both against hand-computed values.
+;; Ineligible shapes (min/max, F32, nulls, count-distinct, compound
+;; where, not-in) must fall back to the generic result unchanged.
+
+;; Fixture: 8 syms round-robin over 4000 rows (UNSORTED — slices are
+;; non-contiguous, exercising the gather loops), i64 + f64 + i32-ish cols.
+(set N 4000)
+(set SY ['aa 'bb 'cc 'dd 'ee 'ff 'gg 'hh])
+(set KS (as 'SYM (at SY (% (til N) 8))))
+(set V  (til N))
+(set F  (* 0.5 (as 'F64 (til N))))
+(set W  (as 'I32 (% (til N) 100)))
+(set TP (table [s v f w] (list KS V F W)))
+(set TI (table [s v f w] (list (.attr.set 'grouped KS) V F W)))
+(.idx.has? (at TI 's)) -- true
+
+;; Sorted twin (contiguous slices — the streaming fast loops).
+(set TSRT (xasc TP ['s 'v]))
+(set TSI (table [s v f w] (list (.attr.set 'grouped (at TSRT 's)) (at TSRT 'v) (at TSRT 'f) (at TSRT 'w))))
+
+;; group aa sees v ∈ {0,8,…,3992}: count=500, sum=998000; bb: {1,9,…}: 998500
+;; ── IN set: sums/counts/avg, indexed vs plain vs hand values ──
+(set Q1I (select {sv: (sum v) c: (count v) av: (avg v) from: TI by: s where: (in s ['aa 'cc])}))
+(set Q1P (select {sv: (sum v) c: (count v) av: (avg v) from: TP by: s where: (in s ['aa 'cc])}))
+(count Q1I) -- 2
+(at (at Q1I 'sv) 0) -- 998000
+(at (at Q1I 'c) 0) -- 500
+(min (== (at Q1I 'sv) (at Q1P 'sv))) -- true
+(min (== (at Q1I 'c) (at Q1P 'c))) -- true
+(min (== (at Q1I 'av) (at Q1P 'av))) -- true
+(min (== (at Q1I 's) (at Q1P 's))) -- true
+
+;; ── sorted/contiguous twin: identical values ──
+(set Q1S (select {sv: (sum v) c: (count v) av: (avg v) from: TSI by: s where: (in s ['aa 'cc])}))
+(min (== (at Q1S 'sv) (at Q1P 'sv))) -- true
+(min (== (at Q1S 'c) (at Q1P 'c))) -- true
+
+;; ── fused product (sum/avg of scan*scan, one F64 side) ──
+(set Q2I (select {p: (sum (* v f)) q: (avg (* f w)) sw: (sum w) from: TI by: s where: (in s ['bb 'dd 'ff])}))
+(set Q2P (select {p: (sum (* v f)) q: (avg (* f w)) sw: (sum w) from: TP by: s where: (in s ['bb 'dd 'ff])}))
+(min (== (at Q2I 'p) (at Q2P 'p))) -- true
+(min (== (at Q2I 'q) (at Q2P 'q))) -- true
+(min (== (at Q2I 'sw) (at Q2P 'sw))) -- true
+(set Q2S (select {p: (sum (* v f)) q: (avg (* f w)) sw: (sum w) from: TSI by: s where: (in s ['bb 'dd 'ff])}))
+(min (== (at Q2S 'p) (at Q2P 'p))) -- true
+(min (== (at Q2S 'sw) (at Q2P 'sw))) -- true
+
+;; ── shared-stream pairing: sum over the product's int side (q27 shape),
+;;    incl. arith-of-aggs decomposition wrappers ──
+(set Q3I (select {wp: (/ (sum (* w f)) (as 'F64 (sum w))) from: TI by: s where: (in s ['aa 'bb 'cc 'dd])}))
+(set Q3P (select {wp: (/ (sum (* w f)) (as 'F64 (sum w))) from: TP by: s where: (in s ['aa 'bb 'cc 'dd])}))
+(min (== (at Q3I 'wp) (at Q3P 'wp))) -- true
+(min (== (at Q3I 's) (at Q3P 's))) -- true
+
+;; ── eq single key ──
+(set Q4I (select {sv: (sum v) from: TI by: s where: (== s 'ee)}))
+(set Q4P (select {sv: (sum v) from: TP by: s where: (== s 'ee)}))
+(count Q4I) -- 1
+(min (== (at Q4I 'sv) (at Q4P 'sv))) -- true
+
+;; ── absent + duplicate keys in the set; empty intersection ──
+(set Q5I (select {sv: (sum v) from: TI by: s where: (in s ['aa 'zz 'aa])}))
+(count Q5I) -- 1
+(at (at Q5I 'sv) 0) -- 998000
+(count (select {sv: (sum v) from: TI by: s where: (in s ['zz 'yy])})) -- 0
+(count (select {sv: (sum v) from: TI by: s where: (== s 'zz)})) -- 0
+
+;; ── aliased by ({k: s} — rename rides the generic by-dict path) ──
+(set Q6I (select {sv: (sum v) from: TI by: {k: s} where: (in s ['aa 'cc])}))
+(min (== (at Q6I 'sv) (at Q1P 'sv))) -- true
+(min (== (at Q6I 'k) (at Q1P 's))) -- true
+
+;; ── fallback shapes: results must equal the plain-table run exactly ──
+;; min/max (unsupported agg → hint folds to selection)
+(set Q7I (select {mn: (min v) mx: (max v) from: TI by: s where: (in s ['aa 'hh])}))
+(set Q7P (select {mn: (min v) mx: (max v) from: TP by: s where: (in s ['aa 'hh])}))
+(min (== (at Q7I 'mn) (at Q7P 'mn))) -- true
+(min (== (at Q7I 'mx) (at Q7P 'mx))) -- true
+;; compound where (second conjunct → no fusion)
+(set Q8I (select {sv: (sum v) from: TI by: s where: (and (in s ['aa 'bb]) (> v 1000))}))
+(set Q8P (select {sv: (sum v) from: TP by: s where: (and (in s ['aa 'bb]) (> v 1000))}))
+(min (== (at Q8I 'sv) (at Q8P 'sv))) -- true
+;; not-in (never fused)
+(set Q9I (select {sv: (sum v) from: TI by: s where: (not (in s ['aa 'bb 'cc 'dd 'ee 'ff]))}))
+(set Q9P (select {sv: (sum v) from: TP by: s where: (not (in s ['aa 'bb 'cc 'dd 'ee 'ff]))}))
+(min (== (at Q9I 'sv) (at Q9P 'sv))) -- true
+;; where on a NON-key column (no fusion; sanity)
+(set QAI (select {sv: (sum v) from: TI by: s where: (< v 100)}))
+(set QAP (select {sv: (sum v) from: TP by: s where: (< v 100)}))
+(min (== (at QAI 'sv) (at QAP 'sv))) -- true
+;; count-distinct output (stays on the filter path — saved_selection)
+(set QBI (select {cd: (count (distinct w)) from: TI by: s where: (in s ['aa 'bb])}))
+(set QBP (select {cd: (count (distinct w)) from: TP by: s where: (in s ['aa 'bb])}))
+(min (== (at QBI 'cd) (at QBP 'cd))) -- true
+
+;; ── nullable agg column → kernel bails, fallback matches ──
+(set VN (concat (as 'I64 (til (- N 4))) [0N 1 0N 2]))
+(set TNI (table [s v] (list (.attr.set 'grouped KS) VN)))
+(set TNP (table [s v] (list KS VN)))
+(set QCI (select {sv: (sum v) c: (count v) from: TNI by: s where: (in s ['bb 'cc])}))
+(set QCP (select {sv: (sum v) c: (count v) from: TNP by: s where: (in s ['bb 'cc])}))
+(min (== (at QCI 'sv) (at QCP 'sv))) -- true
+(min (== (at QCI 'c) (at QCP 'c))) -- true
+
+;; ── take/sort post-clauses on the fused result ──
+(set QDI (select {sv: (sum v) from: TI by: s where: (in s ['aa 'bb 'cc 'dd]) desc: sv take: 2}))
+(set QDP (select {sv: (sum v) from: TP by: s where: (in s ['aa 'bb 'cc 'dd]) desc: sv take: 2}))
+(count QDI) -- 2
+(min (== (at QDI 'sv) (at QDP 'sv))) -- true
