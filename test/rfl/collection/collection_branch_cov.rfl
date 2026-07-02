@@ -492,8 +492,8 @@
 ;; Vector val find (lines 1762-1783)
 (find [10 20 30] [20 30 40]) -- (list 1 2 0Nl)
 
-;; Empty vec find with vector val (lines 1764-1765)
-(count (find (as 'I64 (list)) [1 2])) -- 0
+;; Empty vec find with vector val → length-preserving all-0Nl (not empty)
+(count (find (as 'I64 (list)) [1 2])) -- 2
 
 ;; Typed vec find with nulls — null val (lines 1790-1793)
 (find (concat [0Nl 1 2] []) 0Nl) -- 0

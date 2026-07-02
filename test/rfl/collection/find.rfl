@@ -28,8 +28,8 @@
 (find [1 2 3] [4 2 5]) -- [0Nl 1 0Nl]
 ;; ========== FIND IN EMPTY ARRAY ==========
 (find [] 1) -- 0Nl
-(find [] [1 2 3]) -- []
-;; Returns empty when source is empty
+(find [] [1 2 3]) -- [0Nl 0Nl 0Nl]
+;; Empty source → all not-found (0Nl per element)
 ;; ========== FIND WITH DIFFERENT TYPE WIDTHS (index_find_i8) ==========
 (find "abc" 'b') -- 1
 (find "abc" 'z') -- 0Nl
