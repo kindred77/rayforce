@@ -475,7 +475,27 @@ void ray_splay_build_indexes(const char* dir, ray_t* tbl) {
     int64_t nc = ray_table_ncols(tbl);
     for (int64_t c = 0; c < nc; c++) {
         ray_t* col = ray_table_get_col_idx(tbl, c);
-        if (!col || RAY_IS_ERR(col) || col->len < (1 << 16)) continue;
+        if (!col || RAY_IS_ERR(col)) continue;
+
+        /* Explicit SYM index: a SYM column carrying a grouped (hash) index in
+         * memory gets that exact index persisted inline — regardless of length
+         * (the grouped attr is deliberate intent, unlike the size-gated auto
+         * dict/chunk-zone below).  Reuses the attached payload; the raw column
+         * was already written index-stripped, so this appends only the region. */
+        if (col->type == RAY_SYM && ray_index_kind(col) == RAY_IDX_HASH) {
+            ray_t* nstr = ray_sym_str(ray_table_col_name(tbl, c));
+            if (nstr && !RAY_IS_ERR(nstr)) {
+                char path[1100];
+                int n = snprintf(path, sizeof(path), "%s/%.*s", dir,
+                                 (int)ray_str_len(nstr), ray_str_ptr(nstr));
+                if (n > 0 && n < (int)sizeof(path))
+                    (void)ray_col_append_index(path,
+                        ray_index_payload(col->index), col->len, col->type);
+            }
+            continue;
+        }
+
+        if (col->len < (1 << 16)) continue;
 
         /* STR columns get a dictionary (group on int codes); numeric/temporal
          * get the per-chunk min/max for block-skip. */

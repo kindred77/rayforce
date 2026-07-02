@@ -857,11 +857,13 @@ static ray_err_t col_save_impl(ray_t* vec, const char* path, bool durable) {
             }
         }
 
-        /* Inline index region (numeric columns only — STR/SYM never carry an
-         * index).  Pad the payload to a 32-byte boundary, then append the raw
-         * 32-aligned ray_t blocks (RAY_INDEX object + child vecs) the loader
-         * mmaps in place.  Payload end here is 32 + data_size (no str_pool on
-         * an indexed numeric column). */
+        /* Inline index region (numeric and SYM columns; STR routes through dict
+         * instead).  SYM carries RAY_IDX_HASH when the grouped attr is set;
+         * the existing `persist_index && vec->type != RAY_STR` guard already
+         * admits it.  Pad the payload to a 32-byte boundary, then append the
+         * raw 32-aligned ray_t blocks (RAY_INDEX object + child vecs) the
+         * loader mmaps in place.  Payload end here is 32 + data_size (no
+         * str_pool on an indexed numeric/SYM column). */
         if (persist_index && vec->type != RAY_STR) {
             int64_t payload_end = 32 + (int64_t)data_size;
             int64_t region_off  = (payload_end + 31) & ~(int64_t)31;

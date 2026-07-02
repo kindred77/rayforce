@@ -1,0 +1,23 @@
+;; Persisted SYM hash index: a grouped sym column keeps its index across a
+;; splayed save/reload, the domain resolves, and (== sym X) is correct.
+(.sys.exec "rm -rf /tmp/rfl_sym_idx_persist")
+(set T (table [sym v] (list (.attr.set 'grouped ['a 'b 'a 'c]) [1 2 3 4])))
+(.db.splayed.set "/tmp/rfl_sym_idx_persist/" T)
+(set S (.db.splayed.get "/tmp/rfl_sym_idx_persist/"))
+;; index persisted + re-attached on load
+(.idx.has? (at S 'sym)) -- true
+(at (.idx.info (at S 'sym)) 'kind) -- 'hash
+;; domain intact (cells resolve to their symbols)
+(at (at S 'sym) 0) -- 'a
+(at (at S 'sym) 3) -- 'c
+;; filter correct via the mmap'd index: a×2, absent→0, present-once→1
+(count (select {from: S where: (== sym 'a)})) -- 2
+(count (select {from: S where: (== sym 'z)})) -- 0
+(count (select {from: S where: (== sym 'b)})) -- 1
+;; result equals a fresh runtime-indexed in-memory control
+(count (select {from: S where: (== sym 'a)})) -- (count (select {from: T where: (== sym 'a)}))
+;; drop the reloaded index → domain still resolves, filter still correct (scan)
+(set S2 (.attr.drop (at S 'sym)))
+(.idx.has? S2) -- false
+(at S2 0) -- 'a
+(where (== S2 'a)) -- [0 2]
