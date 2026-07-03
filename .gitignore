@@ -39,5 +39,9 @@ rayforce.cov
 site/
 .venv-docs/
 
+# Benchmark binaries built into the repo root (the bench/ source dir is
+# unaffected — it has no hyphen).
+/bench-*
+
 # Rayforce REPL history
 .rayhist.dat
