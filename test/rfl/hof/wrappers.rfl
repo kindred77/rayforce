@@ -10,7 +10,7 @@
 ;; result values, lengths, and the wrapper-equals-inner-op invariant.
 
 ;; ─────────────────────────────────────────────────────────────────
-;; pmap — parallel map wrapper (ray_pmap_fn)
+;; pmap — sequential map alias (ray_pmap_fn)
 ;; ─────────────────────────────────────────────────────────────────
 
 ;; I64 happy path — small list, lambda

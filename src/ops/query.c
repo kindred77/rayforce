@@ -4725,6 +4725,12 @@ static int filt_compact_keep(ray_t* dict, ray_t* by_expr, ray_t* tbl,
     return n;
 }
 
+/* Fixed slot capacity for the general group-by compile path: group keys,
+ * aggregate outputs, and non-aggregate outputs each collect into stack arrays
+ * of this size.  Exceeding it is rejected with a clear error rather than
+ * silently dropping the surplus columns (which produced wrong results). */
+#define RAY_GROUP_MAX_SLOTS 16
+
 ray_t* ray_select(ray_t** args, int64_t n) {
     if (n < 1) return ray_error("arity", "select: expects a query dict, got %lld args", (long long)n);
     ray_t* dict = args[0];
@@ -7262,9 +7268,12 @@ by_dict_done:
                 if (is_single_group_key_projection(by_expr, expr))
                     continue;
                 if (is_group_dag_agg_expr(expr)) {
-                    /* 17th+ dag-agg is silently dropped by the compile
-                     * loop (slot overflow) — mirror: not a flat forcer. */
-                    if (mirror_aggs < 16) { mirror_aggs++; n_grp_agg_outputs++; }
+                    /* Mirror the compile loop's slot budget; a query with
+                     * more than RAY_GROUP_MAX_SLOTS aggregates is rejected
+                     * there with a clear error (not silently dropped), so
+                     * this cap only bounds the mirror count.  Not a flat
+                     * forcer. */
+                    if (mirror_aggs < RAY_GROUP_MAX_SLOTS) { mirror_aggs++; n_grp_agg_outputs++; }
                     if (!sg_agg_expr_ok(expr)) sg_shapes_ok = 0;
                     continue;
                 }
@@ -7437,6 +7446,11 @@ by_dict_done:
             /* Multiple keys as SYM vector: [col1 col2 ...] —
              * cell-data resolved through the vec's domain. */
             int64_t nk = ray_len(by_expr);
+            if (nk > RAY_GROUP_MAX_SLOTS) {
+                for (int ci = 0; ci < n_compound; ci++) ray_release(compound_rw[ci]);
+                ray_graph_free(g); ray_release(tbl);
+                return ray_error("range", "select by: too many group keys (max %d)", RAY_GROUP_MAX_SLOTS);
+            }
             for (int64_t i = 0; i < nk && n_keys < 16; i++) {
                 ray_t* name_str = ray_sym_vec_cell(by_expr, i);
                 if (!name_str) { ray_graph_free(g); ray_release(tbl); return ray_error("domain", "select by: unknown group key symbol"); }
@@ -7471,7 +7485,12 @@ by_dict_done:
             if (kid == from_id || kid == where_id || kid == by_id || kid == take_id || kid == asc_id || kid == desc_id) continue;
 
             ray_t* val_expr = dict_elems[i + 1];
-            if (is_group_dag_agg_expr(val_expr) && n_aggs < 16) {
+            if (is_group_dag_agg_expr(val_expr)) {
+                if (n_aggs >= RAY_GROUP_MAX_SLOTS) {
+                    for (int ci = 0; ci < n_compound; ci++) ray_release(compound_rw[ci]);
+                    ray_graph_free(g); ray_release(tbl);
+                    return ray_error("range", "select by: too many aggregate columns (max %d)", RAY_GROUP_MAX_SLOTS);
+                }
                 ray_t** agg_elems = (ray_t**)ray_data(val_expr);
                 uint16_t op = resolve_agg_opcode(agg_elems[0]->i64);
                 ray_t* agg_arg = agg_elems[1];
@@ -7518,7 +7537,7 @@ by_dict_done:
                     has_agg_k = 1;
                 }
                 n_aggs++;
-            } else if (!is_group_dag_agg_expr(val_expr) && n_nonaggs < 16) {
+            } else {
                 if (is_single_group_key_projection(by_expr, val_expr))
                     continue;
                 /* Arith-of-aggs: decomposed by the classification pass
@@ -7531,6 +7550,11 @@ by_dict_done:
                         if (compound_pos[ci] == i) { pre_compound = true; break; }
                     if (pre_compound) continue;
                 }
+                if (n_nonaggs >= RAY_GROUP_MAX_SLOTS) {
+                    for (int ci = 0; ci < n_compound; ci++) ray_release(compound_rw[ci]);
+                    ray_graph_free(g); ray_release(tbl);
+                    return ray_error("range", "select by: too many non-aggregate columns (max %d)", RAY_GROUP_MAX_SLOTS);
+                }
                 nonagg_names[n_nonaggs] = kid;
                 nonagg_exprs[n_nonaggs] = val_expr;
                 n_nonaggs++;
@@ -7541,6 +7565,11 @@ by_dict_done:
         /* Compile the hidden decomposed agg slots (unary DAG aggs by
          * construction — see agg_arith_rewrite). */
         for (int hi = 0; hi < n_hidden_aggs; hi++) {
+            if (n_aggs >= RAY_GROUP_MAX_SLOTS) {
+                for (int ci = 0; ci < n_compound; ci++) ray_release(compound_rw[ci]);
+                ray_graph_free(g); ray_release(tbl);
+                return ray_error("range", "select by: too many aggregate columns (max %d)", RAY_GROUP_MAX_SLOTS);
+            }
             ray_t** he = (ray_t**)ray_data(hidden_agg_exprs[hi]);
             uint16_t hop = resolve_agg_opcode(he[0]->i64);
             agg_ops[n_aggs] = hop;
@@ -7614,6 +7643,12 @@ by_dict_done:
                 n_keys = 0;
                 if (by_expr->type == RAY_SYM) {
                     int64_t nk = ray_len(by_expr);
+                    if (nk > RAY_GROUP_MAX_SLOTS) {
+                        ray_graph_free(g);
+                        if (filtered_tbl != tbl) ray_release(filtered_tbl);
+                        ray_release(tbl);
+                        return ray_error("range", "select by: too many group keys (max %d)", RAY_GROUP_MAX_SLOTS);
+                    }
                     for (int64_t i = 0; i < nk && n_keys < 16; i++) {
                         /* cell-data via the vec's domain */
                         ray_t* ns = ray_sym_vec_cell(by_expr, i);

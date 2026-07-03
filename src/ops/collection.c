@@ -443,7 +443,10 @@ ray_t* ray_map_fn(ray_t** args, int64_t n) {
     return result;
 }
 
-/* (pmap fn val vec) — same as map, parallel not implemented yet (sequential fallback) */
+/* (pmap fn val vec) — sequential alias for map, kept as a distinct builtin so
+ * call sites can signal intent.  Evaluation is NOT parallelised: the applied
+ * function runs on the calling thread's VM (the VM is thread-local and eval is
+ * single-threaded), so results and semantics are identical to map. */
 ray_t* ray_pmap_fn(ray_t** args, int64_t n) {
     return ray_map_fn(args, n);
 }

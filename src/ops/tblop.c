@@ -1002,7 +1002,10 @@ ray_t* ray_table_distinct_fn(ray_t* tbl) {
  * unify
  * ══════════════════════════════════════════ */
 
-/* (unify a b) — return list of two vectors promoted to a common type */
+/* (unify a b) — return a 2-element list holding a and b.  Same-type inputs and
+ * atoms are wrapped as-is; different vector types are wrapped WITHOUT coercion
+ * to a common type (callers that need a shared type convert the operands
+ * themselves).  See test/rfl/table/tblop.rfl for the covered branches. */
 ray_t* ray_unify_fn(ray_t* a, ray_t* b) {
     /* Build a 2-element list containing both values */
     ray_t* result = ray_list_new(2);
@@ -1016,8 +1019,7 @@ ray_t* ray_unify_fn(ray_t* a, ray_t* b) {
         return result;
     }
 
-    /* Different vector types: attempt numeric promotion */
-    /* For now: wrap both without conversion */
+    /* Different vector types: wrapped as-is, no coercion to a common type. */
     ray_retain(a); ray_retain(b);
     result = ray_list_append(result, a); ray_release(a);
     result = ray_list_append(result, b); ray_release(b);

@@ -1,4 +1,4 @@
-;; Invariants for `pmap` — parallel map; same semantics as map.
+;; Invariants for `pmap` — sequential alias for map; identical semantics.
 
 (pmap (fn [x] (* x x)) [1 2 3 4 5]) -- [1 4 9 16 25]
 (pmap (fn [x] x) [10 20 30]) -- [10 20 30]
