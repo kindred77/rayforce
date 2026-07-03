@@ -496,6 +496,65 @@ ray_t* ray_fold_fn(ray_t** args, int64_t n) {
     return acc;
 }
 
+/* Typed prefix-scan kernels for the native arithmetic operators.  The
+ * generic scan below unboxes the vector into a LIST and drives the full
+ * call machinery per element — and, worse, RETURNS a LIST of boxed
+ * atoms, so every downstream vector op on the running sums degrades to
+ * the boxed paths too (the q28 20-row moving average spent ~13ms on
+ * 45k rows this way).  For (scan + vec) / (scan * vec) over numeric
+ * typed vectors, run one tight per-width loop and return a TYPED
+ * vector.  Per-step semantics mirror ray_add_fn / ray_mul_fn exactly:
+ * floats — plain IEEE ops, NaN (the F64 null) propagates and sticks;
+ * ints — same-width wrap-truncate arithmetic (make_typed_int), null
+ * sentinel propagation is sticky, and a wrap that lands on the
+ * sentinel reads as null downstream exactly like the boxed path. */
+static ray_t* scan_typed_arith(ray_t* fn, ray_t* vec) {
+    if (fn->type != RAY_BINARY || !vec || !ray_is_vec(vec) || vec->len <= 0)
+        return NULL;
+    ray_binary_fn bf = (ray_binary_fn)(uintptr_t)fn->i64;
+    bool is_add = (bf == ray_add_fn);
+    if (!is_add && bf != ray_mul_fn) return NULL;
+    int8_t t = vec->type;
+    if (t != RAY_F64 && t != RAY_I64 && t != RAY_I32 && t != RAY_I16)
+        return NULL;
+    int64_t len = vec->len;
+    ray_t* out = ray_vec_new(t, len);
+    if (!out || RAY_IS_ERR(out)) { if (out) ray_release(out); return NULL; }
+    out->len = len;
+    /* Sentinel-bearing partials downstream: mirror the DAG convention —
+     * advertise nulls when the source does. */
+    out->attrs |= (vec->attrs & RAY_ATTR_HAS_NULLS);
+    if (t == RAY_F64) {
+        const double* restrict v = (const double*)ray_data(vec);
+        double* restrict o = (double*)ray_data(out);
+        double acc = v[0];
+        o[0] = acc;
+        if (is_add) for (int64_t i = 1; i < len; i++) { acc += v[i]; o[i] = acc; }
+        else        for (int64_t i = 1; i < len; i++) { acc *= v[i]; o[i] = acc; }
+        return out;
+    }
+    #define SCAN_INT_LOOP(CT, SENT)                                           \
+        do {                                                                  \
+            const CT* restrict v = (const CT*)ray_data(vec);                  \
+            CT* restrict o = (CT*)ray_data(out);                              \
+            CT acc = v[0];                                                    \
+            o[0] = acc;                                                       \
+            for (int64_t i = 1; i < len; i++) {                               \
+                CT x = v[i];                                                  \
+                if (acc == (SENT) || x == (SENT)) acc = (SENT);               \
+                else acc = is_add                                             \
+                    ? (CT)((int64_t)acc + (int64_t)x)                         \
+                    : (CT)((int64_t)acc * (int64_t)x);                        \
+                o[i] = acc;                                                   \
+            }                                                                 \
+        } while (0)
+    if (t == RAY_I64)      SCAN_INT_LOOP(int64_t, NULL_I64);
+    else if (t == RAY_I32) SCAN_INT_LOOP(int32_t, NULL_I32);
+    else                   SCAN_INT_LOOP(int16_t, NULL_I16);
+    #undef SCAN_INT_LOOP
+    return out;
+}
+
 /* (scan fn vec) — running fold, returns vector of partial results */
 ray_t* ray_scan_fn(ray_t** args, int64_t n) {
     if (n < 2) return ray_error("domain", "scan: requires at least 2 args (fn and vec), got %lld", (long long)n);
@@ -503,6 +562,10 @@ ray_t* ray_scan_fn(ray_t** args, int64_t n) {
         if (ray_is_lazy(args[i])) args[i] = ray_lazy_materialize(args[i]);
 
     ray_t* fn = args[0];
+    {
+        ray_t* fast = scan_typed_arith(fn, args[1]);
+        if (fast) return fast;
+    }
     ray_t* _bx = NULL;
     ray_t* vec = unbox_vec_arg(args[1], &_bx);
     if (RAY_IS_ERR(vec)) return vec;
