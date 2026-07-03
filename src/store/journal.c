@@ -209,6 +209,7 @@ ray_err_t ray_journal_replay(const char*           path,
         if (r != sizeof(hdr))                       { status = RAY_JREPLAY_BADTAIL; break; }
         if (hdr.prefix  != RAY_SERDE_PREFIX)        { status = RAY_JREPLAY_BADTAIL; break; }
         if (hdr.version != RAY_SERDE_WIRE_VERSION)  { status = RAY_JREPLAY_BADTAIL; break; }
+        if (hdr.endian  != RAY_SERDE_ENDIAN)        { status = RAY_JREPLAY_BADTAIL; break; }
         if (hdr.size <= 0 || hdr.size > 256LL*1024*1024)
                                                     { status = RAY_JREPLAY_BADTAIL; break; }
 
@@ -307,6 +308,7 @@ ray_err_t ray_journal_validate(const char* path,
         if (r != sizeof(hdr))                       break;
         if (hdr.prefix  != RAY_SERDE_PREFIX)        break;
         if (hdr.version != RAY_SERDE_WIRE_VERSION)  break;
+        if (hdr.endian  != RAY_SERDE_ENDIAN)        break;
         if (hdr.size <= 0 || hdr.size > 256LL*1024*1024) break;
 
         if (hdr.size > cap) {

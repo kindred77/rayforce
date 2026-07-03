@@ -116,6 +116,22 @@
 #endif /* !ray_atomic_inc */
 
 /* --------------------------------------------------------------------------
+ * CPU spin-loop relax hint
+ *
+ * Emit inside busy-wait spin loops (spinlocks, pending-task waits) to cut
+ * contention and power draw on SMT cores: `pause` on x86, `yield` on
+ * aarch64, a no-op elsewhere.  Callers layer their own sched_yield()
+ * escalation on top when a spin may run long.
+ * -------------------------------------------------------------------------- */
+#if defined(__x86_64__) || defined(__i386__)
+  #define RAY_CPU_RELAX() __builtin_ia32_pause()
+#elif defined(__aarch64__)
+  #define RAY_CPU_RELAX() __asm__ volatile("yield" ::: "memory")
+#else
+  #define RAY_CPU_RELAX() ((void)0)
+#endif
+
+/* --------------------------------------------------------------------------
  * Pull in the public header for ray_err_t, ray_t, etc.
  * -------------------------------------------------------------------------- */
 #include <rayforce.h>

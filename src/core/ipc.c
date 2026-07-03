@@ -392,7 +392,7 @@ static void send_response(ray_sock_t fd, ray_t* result)
         .prefix  = RAY_SERDE_PREFIX,
         .version = RAY_SERDE_WIRE_VERSION,
         .flags   = flags,
-        .endian  = 0,
+        .endian  = RAY_SERDE_ENDIAN,
         .msgtype = RAY_IPC_MSG_RESP,
         .size    = (int64_t)send_len,
     };
@@ -787,6 +787,7 @@ static ray_t* ipc_read_header(ray_poll_t* poll, ray_selector_t* sel)
 
     if (cd->hdr.prefix != RAY_SERDE_PREFIX ||
         cd->hdr.version != RAY_SERDE_WIRE_VERSION ||
+        cd->hdr.endian != RAY_SERDE_ENDIAN ||
         cd->hdr.size <= 0 ||
         cd->hdr.size > 256 * 1024 * 1024) {
         ray_poll_deregister(poll, sel->id);
@@ -1001,6 +1002,7 @@ static void conn_on_header(ray_ipc_server_t* srv, ray_ipc_conn_t* c)
 
     if (c->hdr.prefix != RAY_SERDE_PREFIX) { conn_close(srv, c); return; }
     if (c->hdr.version != RAY_SERDE_WIRE_VERSION) { conn_close(srv, c); return; }
+    if (c->hdr.endian != RAY_SERDE_ENDIAN) { conn_close(srv, c); return; }
     if (c->hdr.size <= 0)                  { conn_close(srv, c); return; }
     if (c->hdr.size > 256 * 1024 * 1024)   { conn_close(srv, c); return; }
 
@@ -1410,7 +1412,7 @@ static int64_t conn_write_msg(ray_sock_t fd, ray_t* msg, uint8_t msgtype,
         .prefix  = RAY_SERDE_PREFIX,
         .version = RAY_SERDE_WIRE_VERSION,
         .flags   = (uint8_t)(flags | extra_flags),
-        .endian  = 0,
+        .endian  = RAY_SERDE_ENDIAN,
         .msgtype = msgtype,
         .size    = (int64_t)send_len,
     };

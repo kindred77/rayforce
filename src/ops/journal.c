@@ -119,7 +119,7 @@ ray_t* ray_log_write_fn(ray_t* expr) {
         .prefix  = RAY_SERDE_PREFIX,
         .version = RAY_SERDE_WIRE_VERSION,
         .flags   = 0,
-        .endian  = 0,
+        .endian  = RAY_SERDE_ENDIAN,
         .msgtype = RAY_IPC_MSG_ASYNC,
         .size    = pay_size,
     };

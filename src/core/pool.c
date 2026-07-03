@@ -22,6 +22,7 @@
  */
 
 #include "core/pool.h"
+#include "core/platform.h"   /* RAY_CPU_RELAX */
 #include "mem/cow.h"
 #include "mem/heap.h"
 #include "mem/sys.h"
@@ -337,11 +338,7 @@ void ray_pool_dispatch(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
     {
         unsigned spin_count = 0;
         while (atomic_load_explicit(&pool->pending, memory_order_acquire) > 0) {
-#if defined(__x86_64__) || defined(__i386__)
-            __builtin_ia32_pause();
-#elif defined(__aarch64__)
-            __asm__ volatile("yield" ::: "memory");
-#endif
+            RAY_CPU_RELAX();
             if (++spin_count % 1024 == 0) sched_yield();
         }
     }
@@ -427,11 +424,7 @@ void ray_pool_dispatch_n(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
     {
         unsigned spin_count = 0;
         while (atomic_load_explicit(&pool->pending, memory_order_acquire) > 0) {
-#if defined(__x86_64__) || defined(__i386__)
-            __builtin_ia32_pause();
-#elif defined(__aarch64__)
-            __asm__ volatile("yield" ::: "memory");
-#endif
+            RAY_CPU_RELAX();
             if (++spin_count % 1024 == 0) sched_yield();
         }
     }
@@ -480,11 +473,7 @@ ray_pool_t* ray_pool_get(void) {
             if (s == 2) return &g_pool;
             if (s == 0) return NULL;  /* init failed, not started, or destroy completed */
             /* s == 1: still initializing, s == 3: destroying — spin */
-#if defined(__x86_64__) || defined(__i386__)
-            __builtin_ia32_pause();
-#elif defined(__aarch64__)
-            __asm__ volatile("yield" ::: "memory");
-#endif
+            RAY_CPU_RELAX();
             if (++spin_count % 1024 == 0) sched_yield();
         }
     }

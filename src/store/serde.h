@@ -46,6 +46,15 @@
 /* Wire-only null marker (not a valid ray_t type) */
 #define RAY_SERDE_NULL 126
 
+/* Byte order marker written into ray_ipc_header_t.endian (0 = little, 1 = big).
+ * The payload is native-endian column bytes, so a peer rejects any frame whose
+ * byte order differs from its own rather than silently mis-ordering values. */
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+#define RAY_SERDE_ENDIAN 1
+#else
+#define RAY_SERDE_ENDIAN 0
+#endif
+
 typedef struct ray_ipc_header_t {
     uint32_t prefix;     /* RAY_SERDE_PREFIX */
     uint8_t  version;    /* RAY_VERSION_MAJOR */

@@ -919,7 +919,7 @@ ray_t* ray_ser(ray_t* obj) {
     hdr->prefix  = RAY_SERDE_PREFIX;
     hdr->version = RAY_SERDE_WIRE_VERSION;
     hdr->flags   = 0;
-    hdr->endian  = 0;
+    hdr->endian  = RAY_SERDE_ENDIAN;
     hdr->msgtype = 0;
     hdr->size    = payload;
 
