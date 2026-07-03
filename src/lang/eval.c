@@ -3017,6 +3017,7 @@ static void ray_register_builtins(void) {
     register_vary("pmap",   RAY_FN_NONE, ray_pmap_fn);
     register_vary("fold",   RAY_FN_NONE, ray_fold_fn);
     register_vary("scan",   RAY_FN_NONE, ray_scan_fn);
+    register_vary("prior",  RAY_FN_NONE, ray_prior_fn);
     register_binary("filter", RAY_FN_NONE, ray_filter_fn);
     register_vary("apply",  RAY_FN_NONE, ray_apply_fn);
 

@@ -2090,16 +2090,30 @@ ray_t* ray_nil_fn(ray_t* x) {
 ray_t* ray_where_fn(ray_t* x) {
     if (!ray_is_vec(x) || x->type != RAY_BOOL)
         return ray_error("type", "where: argument must be a b8 vector, got %s", ray_type_name(x->type));
-    bool* data = (bool*)ray_data(x);
+    const uint8_t* data = (const uint8_t*)ray_data(x);
     int64_t n = x->len;
-    /* Count trues */
+    /* Count pass: `cnt += byte != 0` vectorizes; the branchy form costs
+     * a mispredict-prone compare per element. */
     int64_t cnt = 0;
-    for (int64_t i = 0; i < n; i++) if (data[i]) cnt++;
+    for (int64_t i = 0; i < n; i++) cnt += (data[i] != 0);
     ray_t* result = ray_vec_new(RAY_I64, cnt);
     if (RAY_IS_ERR(result)) return result;
     int64_t* out = (int64_t*)ray_data(result);
     int64_t j = 0;
-    for (int64_t i = 0; i < n; i++) if (data[i]) out[j++] = i;
+    /* Emit pass: skip zero 8-byte lanes word-at-a-time (sparse masks —
+     * the common WHERE shape — run at memory speed), fall to per-byte
+     * only inside a live word. */
+    int64_t i = 0;
+    int64_t n8 = n & ~7LL;
+    for (; i < n8; i += 8) {
+        uint64_t w;
+        memcpy(&w, data + i, 8);
+        if (!w) continue;
+        for (int64_t k = 0; k < 8; k++)
+            if (data[i + k]) out[j++] = i + k;
+    }
+    for (; i < n; i++)
+        if (data[i]) out[j++] = i;
     result->len = cnt;
     return result;
 }

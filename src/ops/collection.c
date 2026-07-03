@@ -555,6 +555,135 @@ static ray_t* scan_typed_arith(ray_t* fn, ray_t* vec) {
     return out;
 }
 
+/* (prior fn vec) — pairwise combinator over adjacent elements:
+ * out[i] = (fn v[i] v[i-1]) for i >= 1, out[0] = (fn v[0] v[0]) — the
+ * self-pair start matches the concat/take shift idiom it replaces
+ * (prev[0] = v[0]) and kdb's `f prior x` for comparisons (first slot
+ * compares equal → false).  The six comparison operators over null-free
+ * numeric/temporal typed vectors (plus ==//= over SYM, where adjacent
+ * same-vector ids compare directly) run one fused pass returning a BOOL
+ * vector — no shifted copy, no boxing.  Everything else falls to the
+ * generic per-pair application returning a LIST, mirroring scan. */
+static ray_t* prior_typed_cmp(ray_t* fn, ray_t* vec) {
+    if (fn->type != RAY_BINARY || !vec || !ray_is_vec(vec) || vec->len <= 0)
+        return NULL;
+    if (vec->attrs & RAY_ATTR_HAS_NULLS) return NULL;
+    ray_binary_fn bf = (ray_binary_fn)(uintptr_t)fn->i64;
+    int op;                                   /* 0:< 1:> 2:<= 3:>= 4:== 5:!= */
+    if      (bf == ray_lt_fn)  op = 0;
+    else if (bf == ray_gt_fn)  op = 1;
+    else if (bf == ray_lte_fn) op = 2;
+    else if (bf == ray_gte_fn) op = 3;
+    else if (bf == ray_eq_fn)  op = 4;
+    else if (bf == ray_neq_fn) op = 5;
+    else return NULL;
+    int8_t t = vec->type;
+    bool is_sym = (t == RAY_SYM);
+    if (is_sym && op != 4 && op != 5) return NULL;  /* SYM ordering → generic */
+    if (!is_sym) switch (t) {
+        case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
+        case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP:
+        case RAY_F64: case RAY_F32: break;
+        default: return NULL;
+    }
+    int64_t n = vec->len;
+    ray_t* out = ray_vec_new(RAY_BOOL, n);
+    if (!out || RAY_IS_ERR(out)) { if (out) ray_release(out); return NULL; }
+    out->len = n;
+    uint8_t* restrict o = (uint8_t*)ray_data(out);
+    #define PRIOR_CMP_LOOP(READ)                                          \
+        do {                                                              \
+            int64_t prev = READ(0);                                       \
+            o[0] = (uint8_t)((op == 2) | (op == 3) | (op == 4));          \
+            for (int64_t i = 1; i < n; i++) {                             \
+                int64_t cur = READ(i);                                    \
+                uint8_t r;                                                \
+                switch (op) {                                             \
+                    case 0: r = cur <  prev; break;                       \
+                    case 1: r = cur >  prev; break;                       \
+                    case 2: r = cur <= prev; break;                       \
+                    case 3: r = cur >= prev; break;                       \
+                    case 4: r = cur == prev; break;                       \
+                    default: r = cur != prev; break;                      \
+                }                                                         \
+                o[i] = r;                                                 \
+                prev = cur;                                               \
+            }                                                             \
+        } while (0)
+    if (is_sym) {
+        const void* d = ray_data(vec);
+        uint8_t at = vec->attrs;
+        #define RD_SYM(i) ((int64_t)ray_read_sym(d, (i), RAY_SYM, at))
+        PRIOR_CMP_LOOP(RD_SYM);
+        #undef RD_SYM
+    } else if (t == RAY_F64 || t == RAY_F32) {
+        /* Float compares must stay in the float domain (NaN, fractions). */
+        const void* d = ray_data(vec);
+        double prev = (t == RAY_F64) ? ((const double*)d)[0]
+                                     : (double)((const float*)d)[0];
+        o[0] = (uint8_t)((op == 2) | (op == 3) | (op == 4));
+        /* NaN self-compare: <=/>=/== on a NaN first element is false —
+         * overwrite the constant start for that case. */
+        if (prev != prev) o[0] = (uint8_t)(op == 5);
+        for (int64_t i = 1; i < n; i++) {
+            double cur = (t == RAY_F64) ? ((const double*)d)[i]
+                                        : (double)((const float*)d)[i];
+            uint8_t r;
+            switch (op) {
+                case 0: r = cur <  prev; break;
+                case 1: r = cur >  prev; break;
+                case 2: r = cur <= prev; break;
+                case 3: r = cur >= prev; break;
+                case 4: r = cur == prev; break;
+                default: r = cur != prev; break;
+            }
+            o[i] = r;
+            prev = cur;
+        }
+    } else {
+        const void* d = ray_data(vec);
+        uint8_t at = vec->attrs;
+        #define RD_I(i) read_col_i64(d, (i), t, at)
+        PRIOR_CMP_LOOP(RD_I);
+        #undef RD_I
+    }
+    #undef PRIOR_CMP_LOOP
+    return out;
+}
+
+ray_t* ray_prior_fn(ray_t** args, int64_t n) {
+    if (n < 2) return ray_error("domain", "prior: requires fn and vec args, got %lld", (long long)n);
+    for (int64_t i = 0; i < n; i++)
+        if (ray_is_lazy(args[i])) args[i] = ray_lazy_materialize(args[i]);
+    ray_t* fn = args[0];
+    {
+        ray_t* fast = prior_typed_cmp(fn, args[1]);
+        if (fast) return fast;
+    }
+    ray_t* _bx = NULL;
+    ray_t* vec = unbox_vec_arg(args[1], &_bx);
+    if (RAY_IS_ERR(vec)) return vec;
+    if (!is_list(vec)) { if (_bx) ray_release(_bx); return ray_error("type", "prior: vec arg must be a list, got %s", ray_type_name(vec->type)); }
+    int64_t len = ray_len(vec);
+    ray_t* result = ray_alloc(len > 0 ? len * (int64_t)sizeof(ray_t*) : 0);
+    if (!result) { if (_bx) ray_release(_bx); return ray_error("oom", NULL); }
+    result->type = RAY_LIST;
+    result->len = len;
+    if (len == 0) { if (_bx) ray_release(_bx); return result; }
+    ray_t** out = (ray_t**)ray_data(result);
+    ray_t** elems = (ray_t**)ray_data(vec);
+    for (int64_t i = 0; i < len; i++) {
+        out[i] = call_fn2(fn, elems[i], elems[i > 0 ? i - 1 : 0]);
+        if (RAY_IS_ERR(out[i])) {
+            for (int64_t j = 0; j < i; j++) ray_release(out[j]);
+            result->len = 0; ray_release(result); if (_bx) ray_release(_bx);
+            return out[i];
+        }
+    }
+    if (_bx) ray_release(_bx);
+    return result;
+}
+
 /* (scan fn vec) — running fold, returns vector of partial results */
 ray_t* ray_scan_fn(ray_t** args, int64_t n) {
     if (n < 2) return ray_error("domain", "scan: requires at least 2 args (fn and vec), got %lld", (long long)n);

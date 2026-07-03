@@ -3755,6 +3755,47 @@ static void sorted_check_fn(void* raw, uint32_t wid, int64_t start, int64_t end)
     (void)wid;
     sorted_check_ctx_t* c = (sorted_check_ctx_t*)raw;
     if (start < 1) start = 1;
+
+    /* Specialized (SYM, i64-family) two-key loop — the canonical
+     * (sym, time) shape.  The generic loop below pays a type-switch per
+     * read and a volatile flag load per row; here adjacent sym ids
+     * compare directly (equal ids on ~all rows of a sorted table — the
+     * string comparison only runs at run boundaries), the secondary key
+     * reads raw i64, and the bail flag is polled per 4096-row block. */
+    if (!c->descending && c->n_keys == 2 &&
+        c->key_cols[0]->type == RAY_SYM &&
+        (c->key_cols[1]->type == RAY_I64 ||
+         c->key_cols[1]->type == RAY_TIME ||
+         c->key_cols[1]->type == RAY_TIMESTAMP) &&
+        !(c->key_cols[1]->attrs & RAY_ATTR_HAS_NULLS)) {
+        ray_t* sc = c->key_cols[0];
+        const void* sd = ray_data(sc);
+        uint8_t sattrs = sc->attrs;
+        const int64_t* restrict tv = (const int64_t*)ray_data(c->key_cols[1]);
+        struct ray_sym_domain_s* dom = ray_sym_vec_domain(sc);
+        for (int64_t b = start; b < end; b += 4096) {
+            if (!*c->ordered) return;
+            int64_t e = b + 4096 < end ? b + 4096 : end;
+            for (int64_t i = b; i < e; i++) {
+                int64_t ia = ray_read_sym(sd, i - 1, RAY_SYM, sattrs);
+                int64_t ib = ray_read_sym(sd, i,     RAY_SYM, sattrs);
+                if (RAY_LIKELY(ia == ib)) {
+                    if (tv[i] < tv[i - 1]) { *c->ordered = 0; return; }
+                } else {
+                    ray_t* sa = ray_sym_domain_str(dom, ia);
+                    ray_t* sb = ray_sym_domain_str(dom, ib);
+                    uint32_t la = sa ? (uint32_t)ray_str_len(sa) : 0;
+                    uint32_t lb = sb ? (uint32_t)ray_str_len(sb) : 0;
+                    uint32_t ml = la < lb ? la : lb;
+                    int cmp = ml ? memcmp(ray_str_ptr(sa), ray_str_ptr(sb), ml) : 0;
+                    if (cmp == 0) cmp = (la > lb) - (la < lb);
+                    if (cmp > 0) { *c->ordered = 0; return; }
+                }
+            }
+        }
+        return;
+    }
+
     for (int64_t i = start; i < end; i++) {
         if (!*c->ordered) return;   /* another task already found a violation */
         int cmp = 0;
