@@ -904,6 +904,7 @@ ray_t* exec_join(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ray_t* right_t
     ray_t* asp_sel = NULL;
     ray_t* ht_next_hdr = NULL;
     ray_t* ht_heads_hdr = NULL;
+    ray_t* out_cols_hdr = NULL;
     int64_t* l_idx = NULL;
     int64_t* r_idx = NULL;
     int64_t pair_count = 0;
@@ -1363,11 +1364,30 @@ join_gather:;
     result = ray_table_new(left_ncols + right_ncols);
     if (!result || RAY_IS_ERR(result)) goto join_cleanup;
 
+    /* Output-column arrays sized to the actual table widths — the gather
+     * stage below batches through multi_gather only when a side fits
+     * MGATHER_MAX_COLS and falls back to per-column gather otherwise, so
+     * no column may be dropped here (a fixed [16] cap used to silently
+     * truncate wide-table join results). */
+    {
+        size_t slots = (size_t)(left_ncols * 2 + right_ncols * 3);
+        void* out_mem = scratch_alloc(&out_cols_hdr,
+                                      (slots ? slots : 1) * sizeof(void*));
+        if (!out_mem) {
+            ray_release(result);
+            result = ray_error("oom", NULL);
+            goto join_cleanup;
+        }
+    }
+    ray_t** l_out_cols  = (ray_t**)ray_data(out_cols_hdr);
+    int64_t* l_out_names = (int64_t*)(l_out_cols + left_ncols);
+    ray_t** r_out_cols  = (ray_t**)(l_out_names + left_ncols);
+    ray_t** r_src_cols  = r_out_cols + right_ncols;
+    int64_t* r_out_names = (int64_t*)(r_src_cols + right_ncols);
+
     /* Allocate all output columns upfront for batched gather */
-    ray_t* l_out_cols[MGATHER_MAX_COLS];
-    int64_t l_out_names[MGATHER_MAX_COLS];
     int64_t l_out_count = 0;
-    for (int64_t c = 0; c < left_ncols && l_out_count < MGATHER_MAX_COLS; c++) {
+    for (int64_t c = 0; c < left_ncols; c++) {
         ray_t* col = ray_table_get_col_idx(left_table, c);
         if (!col) continue;
         ray_t* new_col = col_vec_new(col, pair_count);
@@ -1378,9 +1398,6 @@ join_gather:;
         l_out_count++;
     }
 
-    ray_t* r_out_cols[MGATHER_MAX_COLS];
-    ray_t* r_src_cols[MGATHER_MAX_COLS];
-    int64_t r_out_names[MGATHER_MAX_COLS];
     int64_t r_out_count = 0;
     for (int64_t c = 0; c < right_ncols; c++) {
         ray_t* col = ray_table_get_col_idx(right_table, c);
@@ -1394,7 +1411,6 @@ join_gather:;
             }
         }
         if (is_key) continue;
-        if (r_out_count >= MGATHER_MAX_COLS) continue;
         ray_t* new_col = col_vec_new(col, pair_count);
         if (!new_col || RAY_IS_ERR(new_col)) continue;
         new_col->len = pair_count;
@@ -1501,6 +1517,7 @@ join_gather:;
     }
 
 join_cleanup:
+    if (out_cols_hdr) scratch_free(out_cols_hdr);
     if (ht_next_hdr) scratch_free(ht_next_hdr);
     if (ht_heads_hdr) scratch_free(ht_heads_hdr);
     scratch_free(l_idx_hdr);
@@ -2004,7 +2021,8 @@ static bool asof_hash_group_match(uint8_t n_eq,
             /* Resolve every probed group's slice first; the per-slice
              * time-order verify runs over the collected set afterwards
              * so it can go wide.  The verify IS the honest-engine cost
-             * kdb's aj skips by trusting p# — when a query probes the
+             * that trusting a sorted-attribute stamp would skip — when a
+             * query probes the
              * liquid names it walks millions of rows, so it must run at
              * memory speed: contiguous slices (the parted layout) are
              * checked with a sequential compare instead of a gathered

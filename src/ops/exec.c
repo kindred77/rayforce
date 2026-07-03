@@ -401,15 +401,21 @@ static void pg_block_fn(void* arg, uint32_t wid, int64_t start, int64_t end) {
 void partitioned_gather(ray_pool_t* pool, const int64_t* idx, int64_t n,
                         int64_t src_rows, char** srcs, char** dsts,
                         const uint8_t* esz, int64_t ncols) {
-    /* Fallback for small arrays or no pool */
+    /* Fallback for small arrays or no pool.  Chunked by MGATHER_MAX_COLS so
+     * every column is gathered regardless of ncols (current callers batch to
+     * <=MGATHER_MAX_COLS themselves, but a wider call must not silently
+     * leave columns ungathered). */
     if (!pool || n < PG_MIN || n > INT32_MAX || src_rows > INT32_MAX) {
-        multi_gather_ctx_t mg = { .idx = idx, .ncols = 0 };
-        for (int64_t c = 0; c < ncols && c < MGATHER_MAX_COLS; c++) {
-            mg.srcs[c] = srcs[c]; mg.dsts[c] = dsts[c]; mg.esz[c] = esz[c];
-            mg.ncols++;
+        for (int64_t base = 0; base < ncols; base += MGATHER_MAX_COLS) {
+            multi_gather_ctx_t mg = { .idx = idx, .ncols = 0 };
+            for (int64_t c = base; c < ncols && mg.ncols < MGATHER_MAX_COLS; c++) {
+                mg.srcs[mg.ncols] = srcs[c]; mg.dsts[mg.ncols] = dsts[c];
+                mg.esz[mg.ncols] = esz[c];
+                mg.ncols++;
+            }
+            if (pool) ray_pool_dispatch(pool, multi_gather_fn, &mg, n);
+            else      multi_gather_fn(&mg, 0, 0, n);
         }
-        if (pool) ray_pool_dispatch(pool, multi_gather_fn, &mg, n);
-        else      multi_gather_fn(&mg, 0, 0, n);
         return;
     }
 
@@ -436,13 +442,17 @@ void partitioned_gather(ray_pool_t* pool, const int64_t* idx, int64_t n,
         scratch_free(hist_hdr); scratch_free(off_hdr);
         scratch_free(rdest_hdr); scratch_free(rsrc_hdr);
         scratch_free(poff_hdr);
-        /* Fallback to regular gather on allocation failure */
-        multi_gather_ctx_t mg = { .idx = idx, .ncols = 0 };
-        for (int64_t c = 0; c < ncols && c < MGATHER_MAX_COLS; c++) {
-            mg.srcs[c] = srcs[c]; mg.dsts[c] = dsts[c]; mg.esz[c] = esz[c];
-            mg.ncols++;
+        /* Fallback to regular gather on allocation failure (chunked, same
+         * no-column-left-behind contract as the small-input fallback above) */
+        for (int64_t base = 0; base < ncols; base += MGATHER_MAX_COLS) {
+            multi_gather_ctx_t mg = { .idx = idx, .ncols = 0 };
+            for (int64_t c = base; c < ncols && mg.ncols < MGATHER_MAX_COLS; c++) {
+                mg.srcs[mg.ncols] = srcs[c]; mg.dsts[mg.ncols] = dsts[c];
+                mg.esz[mg.ncols] = esz[c];
+                mg.ncols++;
+            }
+            ray_pool_dispatch(pool, multi_gather_fn, &mg, n);
         }
-        ray_pool_dispatch(pool, multi_gather_fn, &mg, n);
         return;
     }
 
