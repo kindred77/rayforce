@@ -6258,8 +6258,11 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             }
         }
         ray_pool_t* pool = ray_pool_get();
+        /* dispatch_n: n_tasks is a task count (tens), far below the
+         * element-grain of ray_pool_dispatch, which would lump them
+         * into ONE serial task. */
         if (pool && n_tasks > 1 && total_rows >= RAY_PARALLEL_THRESHOLD)
-            ray_pool_dispatch(pool, sg_accum_fn, &ctx, n_tasks);
+            ray_pool_dispatch_n(pool, sg_accum_fn, &ctx, (uint32_t)n_tasks);
         else
             sg_accum_fn(&ctx, 0, 0, n_tasks);
         /* Fold task partials in task order — chunk-sequential per group,

@@ -1779,6 +1779,106 @@ static int asof_lslot_cmp(const void* a, const void* b) {
     return (x > y) - (x < y);
 }
 
+/* Per-slice ascending-time verify over a collected probe set (see the
+ * single-eq index variant below).  gsl holds n_groups (grows, gn) pairs.
+ * Contiguous slices verify with a sequential scan over rt_time; scattered
+ * ones fall back to the gathered walk.  Above the parallel threshold the
+ * pairs are chunked across the pool; each chunk covers the adjacent
+ * pairs (i-1, i) for i in [max(start,1), end) within its slice, so
+ * chunk boundaries re-check the crossing pair and no pair is skipped.
+ * Returns false at the first violation (shared bail flag). */
+typedef struct { const int64_t* grows; int64_t lo, hi; } asof_vchunk_t;
+typedef struct {
+    const asof_vchunk_t* chunks;
+    const int64_t* rt_time;
+    volatile int* ok;
+} asof_vctx_t;
+
+static void asof_verify_fn(void* raw, uint32_t wid, int64_t cstart,
+                           int64_t cend) {
+    (void)wid;
+    asof_vctx_t* c = (asof_vctx_t*)raw;
+    const int64_t* restrict t = c->rt_time;
+    for (int64_t ci = cstart; ci < cend; ci++) {
+        if (!*c->ok) return;
+        const asof_vchunk_t* ch = &c->chunks[ci];
+        const int64_t* restrict rows = ch->grows;
+        int64_t lo = ch->lo, hi = ch->hi;
+        if (lo < 1) lo = 1;
+        bool contig = (hi > lo) &&
+                      (rows[hi - 1] - rows[lo - 1] == hi - lo);
+        if (contig) {
+            /* Branchless block accumulation: `bad += (next < cur)` maps to
+             * packed i64 compares (the early-exit form stays scalar), with
+             * a per-block bail so a violation still stops the scan early. */
+            const int64_t* restrict tv = t + rows[lo - 1];
+            int64_t n = hi - lo;
+            int64_t bad = 0;
+            for (int64_t b = 0; b < n; b += 4096) {
+                int64_t e = b + 4096 < n ? b + 4096 : n;
+                for (int64_t i = b; i < e; i++)
+                    bad += (int64_t)(tv[i + 1] < tv[i]);
+                if (bad) { *c->ok = 0; return; }
+            }
+        } else {
+            for (int64_t i = lo; i < hi; i++)
+                if (t[rows[i]] < t[rows[i - 1]]) { *c->ok = 0; return; }
+        }
+    }
+}
+
+#define ASOF_VERIFY_CHUNK 65536
+static bool asof_verify_slices(const int64_t* gsl, int32_t n_groups,
+                               const int64_t* rt_time, int64_t total_rows) {
+    int64_t n_chunks = 0;
+    for (int32_t g = 0; g < n_groups; g++)
+        n_chunks += (gsl[2 * g + 1] + ASOF_VERIFY_CHUNK - 1)
+                    / ASOF_VERIFY_CHUNK;
+    if (n_chunks <= 0) return true;
+    ray_t* ch_hdr = NULL;
+    asof_vchunk_t* chunks = (asof_vchunk_t*)scratch_alloc(&ch_hdr,
+                                (size_t)n_chunks * sizeof(asof_vchunk_t));
+    if (!chunks) {
+        /* OOM — serial gathered walk, no allocation. */
+        for (int32_t g = 0; g < n_groups; g++) {
+            const int64_t* rows = (const int64_t*)(intptr_t)gsl[2 * g];
+            int64_t gn = gsl[2 * g + 1];
+            for (int64_t p = 1; p < gn; p++)
+                if (rt_time[rows[p]] < rt_time[rows[p - 1]]) return false;
+        }
+        return true;
+    }
+    int64_t w = 0;
+    for (int32_t g = 0; g < n_groups; g++) {
+        const int64_t* rows = (const int64_t*)(intptr_t)gsl[2 * g];
+        int64_t gn = gsl[2 * g + 1];
+        for (int64_t lo = 0; lo < gn; lo += ASOF_VERIFY_CHUNK) {
+            int64_t hi = lo + ASOF_VERIFY_CHUNK;
+            if (hi > gn) hi = gn;
+            chunks[w].grows = rows;
+            chunks[w].lo = lo;
+            chunks[w].hi = hi;
+            w++;
+        }
+    }
+    volatile int vok = 1;
+    asof_vctx_t ctx = { chunks, rt_time, &vok };
+    ray_pool_t* pool = ray_pool_get();
+    /* dispatch_n: the element count here is TASKS (a few dozen), far
+     * below ray_pool_dispatch's element grain — the plain dispatch would
+     * collapse them into one serial task. */
+    if (pool && n_chunks > 1 && total_rows >= RAY_PARALLEL_THRESHOLD) {
+        uint32_t nt = (n_chunks > 4096) ? 4096u : (uint32_t)n_chunks;
+        /* fn receives a task-index range; map [ti_start, ti_end) over
+         * chunks directly — dispatch_n hands out [i, i+1) per task. */
+        (void)nt;
+        ray_pool_dispatch_n(pool, asof_verify_fn, &ctx, (uint32_t)n_chunks);
+    } else
+        asof_verify_fn(&ctx, 0, 0, n_chunks);
+    scratch_free(ch_hdr);
+    return vok != 0;
+}
+
 static bool asof_hash_group_match(uint8_t n_eq,
                                   ray_t* const* lt_eq, ray_t* const* rt_eq,
                                   const int64_t* const* eq_xlut,
@@ -1901,21 +2001,30 @@ static bool asof_hash_group_match(uint8_t n_eq,
                            (size_t)(n_groups > 0 ? n_groups : 1) * 2 *
                            sizeof(int64_t));
         if (gsl) {
+            /* Resolve every probed group's slice first; the per-slice
+             * time-order verify runs over the collected set afterwards
+             * so it can go wide.  The verify IS the honest-engine cost
+             * kdb's aj skips by trusting p# — when a query probes the
+             * liquid names it walks millions of rows, so it must run at
+             * memory speed: contiguous slices (the parted layout) are
+             * checked with a sequential compare instead of a gathered
+             * one, and the whole probe set is chunked across the pool
+             * with a shared bail flag (chunks re-check their boundary
+             * pair, so every adjacent pair is covered exactly once). */
+            int64_t verify_rows = 0;
             for (int32_t g = 0; g < n_groups && served; g++) {
                 const int64_t* grows = NULL;
                 int64_t gn = 0;
                 int hit = ray_index_hash_group(rt_eq[0], gkeys[g],
                                                &grows, &gn);
                 if (hit < 0) { served = false; break; }  /* ineligible */
-                if (!rt_time_sorted)
-                    for (int64_t p = 1; p < gn; p++)
-                        if (rt_time[grows[p]] < rt_time[grows[p - 1]]) {
-                            served = false;   /* slice not time-ordered */
-                            break;
-                        }
-                if (!served) break;
                 gsl[2 * g]     = (int64_t)(intptr_t)grows;
                 gsl[2 * g + 1] = gn;
+                verify_rows += gn;
+            }
+            if (served && !rt_time_sorted && verify_rows > 0) {
+                served = asof_verify_slices(gsl, n_groups, rt_time,
+                                            verify_rows);
             }
             if (served) {
                 ray_idx_hits[IDX_SITE_ASOF]++;
