@@ -1459,13 +1459,17 @@ void ray_heap_init(void) {
         }
     }
 
-    /* Resolve swap directory for file-backed pool fallback.  RAY_HEAP_SWAP
-     * env var overrides the default ("./"); we always ensure a trailing
-     * slash so heap_add_pool can concatenate `<swap_path><filename>`
-     * unconditionally.  An empty / over-long env value is rejected and the
-     * default kicks in. */
+    /* Resolve swap directory for the file-backed pool fallback.  Order:
+     * RAY_HEAP_SWAP override → TMPDIR → /tmp.  /tmp is the default rather
+     * than the working directory, which may be read-only or shared (the old
+     * "./" default littered CWD with large sparse files or failed outright);
+     * swap files carry the pid so they never collide.  A trailing slash is
+     * always ensured so heap_add_pool can concatenate `<swap_path><filename>`
+     * unconditionally.  An empty / over-long value is rejected in favour of
+     * the next option. */
     const char* env = getenv("RAY_HEAP_SWAP");
-    const char* sp = (env && *env && strlen(env) < sizeof(h->swap_path) - 16) ? env : "./";
+    if (!(env && *env)) env = getenv("TMPDIR");
+    const char* sp = (env && *env && strlen(env) < sizeof(h->swap_path) - 16) ? env : "/tmp";
     size_t sp_len = strlen(sp);
     memcpy(h->swap_path, sp, sp_len);
     h->swap_path[sp_len] = '\0';
