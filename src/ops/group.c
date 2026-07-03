@@ -6319,6 +6319,120 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     return result;
 }
 
+/* v2 bridge for expression agg inputs — see the call site in
+ * exec_group_run.  Returns the v2 result (or an error), or NULL when the
+ * shape is ineligible and the caller should continue on the legacy path. */
+static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
+    if (!tbl || tbl->type != RAY_TABLE) return NULL;
+    ray_op_ext_t* ext = find_ext(g, op->id);
+    if (!ext || ext->n_keys < 1 || ext->n_keys > 16 ||
+        ext->n_aggs < 1 || ext->n_aggs > 16) return NULL;
+
+    /* At least one agg input must be a compiled-expression node; scans,
+     * COUNT and binary/holistic second inputs pass through untouched. */
+    int64_t nrows = ray_table_nrows(tbl);
+    if (nrows <= 0) return NULL;
+    bool any_expr = false;
+    for (uint8_t a = 0; a < ext->n_aggs; a++) {
+        if (ext->agg_ops[a] == OP_COUNT) continue;
+        ray_op_t* in = op_node(g, ext->agg_ins[a]);
+        if (!in) return NULL;
+        if (in->opcode == OP_SCAN || in->opcode == OP_CONST) continue;
+        any_expr = true;
+    }
+    if (!any_expr) return NULL;
+
+    /* Materialize expression inputs (full length — the selection, if any,
+     * is applied by exec_group_v2 itself). */
+    ray_t* synth[16] = {0};
+    char   names[16][8];
+    ray_t* sub = NULL;
+    bool ok = true;
+    for (uint8_t a = 0; a < ext->n_aggs && ok; a++) {
+        if (ext->agg_ops[a] == OP_COUNT) continue;
+        ray_op_t* in = op_node(g, ext->agg_ins[a]);
+        if (in->opcode == OP_SCAN || in->opcode == OP_CONST) continue;
+        snprintf(names[a], sizeof(names[a]), "_e%u", (unsigned)a);
+        if (ray_table_get_col(tbl, ray_sym_intern(names[a], strlen(names[a])))) {
+            ok = false; break;   /* user column shadows the synthetic name */
+        }
+        ray_expr_t ex;
+        if (!expr_compile(g, tbl, in, &ex)) { ok = false; break; }
+        ray_t* v = expr_eval_full(&ex, nrows);
+        if (!v || RAY_IS_ERR(v) || !ray_is_vec(v) || v->len != nrows) {
+            if (v && !RAY_IS_ERR(v)) ray_release(v);
+            else if (v) ray_release(v);
+            ok = false; break;
+        }
+        synth[a] = v;
+    }
+    if (ok) {
+        int64_t ncols = ray_table_ncols(tbl);
+        sub = ray_table_new(ncols + ext->n_aggs);
+        if (!sub || RAY_IS_ERR(sub)) { ok = false; }
+        for (int64_t c = 0; c < ncols && ok; c++) {
+            sub = ray_table_add_col(sub, ray_table_col_name(tbl, c),
+                                    ray_table_get_col_idx(tbl, c));
+            if (!sub || RAY_IS_ERR(sub)) ok = false;
+        }
+        for (uint8_t a = 0; a < ext->n_aggs && ok; a++) {
+            if (!synth[a]) continue;
+            sub = ray_table_add_col(sub,
+                    ray_sym_intern(names[a], strlen(names[a])), synth[a]);
+            if (!sub || RAY_IS_ERR(sub)) ok = false;
+        }
+    }
+    ray_op_t* op2 = NULL;
+    if (ok) {
+        /* Shadow GROUP node: original key/scan/second inputs by node,
+         * expression inputs replaced by scans of the synthetic columns.
+         * Build all scans BEFORE the group node — node creation may
+         * realloc g->nodes and dangle earlier ray_op_t pointers. */
+        uint32_t in_ids[16];
+        bool has2 = false, hask = false;
+        for (uint8_t a = 0; a < ext->n_aggs && ok; a++) {
+            if (synth[a]) {
+                ray_op_t* sc = ray_scan(g, names[a]);
+                if (!sc) { ok = false; break; }
+                in_ids[a] = sc->id;
+            } else {
+                in_ids[a] = ext->agg_ins[a];
+            }
+            if (ext->agg_ins2 && ext->agg_ins2[a] != RAY_OP_NONE) has2 = true;
+            if (ext->agg_k && ext->agg_k[a]) hask = true;
+        }
+        if (ok) {
+            ray_op_t* keys[16];
+            ray_op_t* ins[16];
+            ray_op_t* ins2[16];
+            for (uint8_t k = 0; k < ext->n_keys; k++)
+                keys[k] = op_node(g, ext->keys[k]);
+            for (uint8_t a = 0; a < ext->n_aggs; a++) {
+                ins[a] = op_node(g, in_ids[a]);
+                ins2[a] = (ext->agg_ins2 && ext->agg_ins2[a] != RAY_OP_NONE)
+                    ? op_node(g, ext->agg_ins2[a]) : NULL;
+            }
+            if (hask)
+                op2 = ray_group3(g, keys, ext->n_keys, ext->agg_ops, ins,
+                                 has2 ? ins2 : NULL, ext->agg_k, ext->n_aggs);
+            else if (has2)
+                op2 = ray_group2(g, keys, ext->n_keys, ext->agg_ops, ins,
+                                 ins2, ext->n_aggs);
+            else
+                op2 = ray_group(g, keys, ext->n_keys, ext->agg_ops, ins,
+                                ext->n_aggs);
+            if (!op2) ok = false;
+        }
+    }
+    ray_t* result = NULL;
+    if (ok && agg_v2_can_handle(g, op2, sub))
+        result = exec_group_v2(g, op2, sub);
+    for (uint8_t a = 0; a < ext->n_aggs; a++)
+        if (synth[a]) ray_release(synth[a]);
+    if (sub) ray_release(sub);
+    return result;   /* NULL → legacy path */
+}
+
 static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                   int64_t group_limit) {
     if (!tbl || RAY_IS_ERR(tbl)) return tbl;
@@ -6369,6 +6483,24 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         && !ray_group_emit_filter_get().enabled
         && agg_v2_can_handle(g, op, tbl))
         return exec_group_v2(g, op, tbl);
+
+    /* v2 with EXPRESSION agg inputs: v2 admission requires plain-column
+     * scans, so a group like {sum(a*b), stddev(c), cor(x,y)} — where ONE
+     * input is a MUL — used to drop the whole 6-agg pass onto the legacy
+     * row-layout path (per-row accum_from_entry + full-width product
+     * materialization: q42's 9.25M-row group ran 540ms where its aggs
+     * individually cost ~7-10ms each under v2).  Materialize each
+     * expression input once (expr_eval_full — pool-parallel), extend the
+     * table with synthetic `_e{a}` columns, point a shadow GROUP node's
+     * inputs at scans of them, and dispatch v2.  `_e{a}` is chosen so
+     * v2's scan-input naming (agg_result_col_name) emits the SAME
+     * `_e{a}_{op}` output names the legacy expression emit produced.
+     * Any ineligibility falls through to the legacy path unchanged. */
+    if (ray_agg_engine_v2 && group_limit == 0
+        && !ray_group_emit_filter_get().enabled) {
+        ray_t* r = exec_group_v2_exprs(g, op, tbl);
+        if (r) return r;
+    }
 
     int64_t nrows = ray_table_nrows(tbl);
     uint8_t n_keys = ext->n_keys;
