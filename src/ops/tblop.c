@@ -979,8 +979,10 @@ ray_t* ray_table_distinct_fn(ray_t* tbl) {
     ray_graph_t* g = ray_graph_new(tbl);
     if (!g) return ray_error("oom", NULL);
 
-    ray_op_t* keys[256];
-    if (ncols > 256) { ray_graph_free(g); return ray_error("range", "table-distinct: too many columns, max 256, got %lld", (long long)ncols); }
+    /* ray_distinct takes a uint8_t key count, so 255 is the true cap —
+     * allowing 256 wrapped the cast to 0 keys and degenerated the query. */
+    ray_op_t* keys[255];
+    if (ncols > 255) { ray_graph_free(g); return ray_error("range", "table-distinct: too many columns, max 255, got %lld", (long long)ncols); }
 
     for (int64_t c = 0; c < ncols; c++) {
         int64_t name_id = ray_table_col_name(tbl, c);
