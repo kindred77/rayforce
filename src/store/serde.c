@@ -955,6 +955,9 @@ ray_t* ray_de(ray_t* bytes) {
         return ray_error("domain", "deserialize: bad ipc header magic prefix");
     if (hdr->version != RAY_SERDE_WIRE_VERSION)
         return ray_error("version", "serde wire version mismatch");
+    if (hdr->endian != RAY_SERDE_ENDIAN)
+        return ray_error("domain", "deserialize: byte-order mismatch (frame endian %d, host %d)",
+                         (int)hdr->endian, (int)RAY_SERDE_ENDIAN);
     if (hdr->size < 0 || hdr->size > 1000000000)
         return ray_error("domain", "deserialize: ipc header payload size %lld out of range", (long long)hdr->size);
     if (hdr->size + (int64_t)sizeof(ray_ipc_header_t) != total)

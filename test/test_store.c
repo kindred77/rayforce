@@ -1727,6 +1727,40 @@ static test_result_t test_serde_null_roundtrip(void) {
     PASS();
 }
 
+/* ---- test_serde_endian_mismatch ------------------------------------------ */
+
+static test_result_t test_serde_endian_mismatch(void) {
+    /* A frame whose header endian byte differs from the host must be
+     * rejected loudly — the payload is native-endian, so decoding a
+     * cross-endian frame would silently transpose every multi-byte
+     * value.  The IPC/journal receive paths already validate this;
+     * ray_de (the `de` builtin and .qdb snapshot load) must too. */
+    ray_t* orig = ray_i64(42);
+    ray_t* wire = ray_ser(orig);
+    TEST_ASSERT_NOT_NULL(wire);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(wire));
+
+    ray_ipc_header_t* hdr = (ray_ipc_header_t*)ray_data(wire);
+    TEST_ASSERT_EQ_I(hdr->endian, RAY_SERDE_ENDIAN);
+    hdr->endian ^= 1;   /* pretend the frame came from the other byte order */
+
+    ray_t* back = ray_de(wire);
+    TEST_ASSERT_NOT_NULL(back);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(back));
+    ray_error_free(back);
+
+    /* Restoring the correct byte makes the same frame decode again. */
+    hdr->endian ^= 1;
+    back = ray_de(wire);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(back));
+    TEST_ASSERT_EQ_I(back->i64, 42);
+
+    ray_release(back);
+    ray_release(wire);
+    ray_release(orig);
+    PASS();
+}
+
 /* ---- test_serde_typed_null_atoms ---------------------------------------- */
 
 static test_result_t test_serde_typed_null_atoms(void) {
@@ -4920,6 +4954,7 @@ const test_entry_t store_entries[] = {
     { "store/read_splayed_bad_sym", test_read_splayed_bad_sym_fatal, store_setup, store_teardown },
     { "store/serde_long_str_roundtrip", test_serde_long_str_roundtrip, store_setup, store_teardown },
     { "store/serde_null_roundtrip", test_serde_null_roundtrip, store_setup, store_teardown },
+    { "store/serde_endian_mismatch", test_serde_endian_mismatch, store_setup, store_teardown },
     { "store/serde_typed_null_atoms", test_serde_typed_null_atoms, store_setup, store_teardown },
     { "store/serde_wire_version_mismatch", test_serde_wire_version_mismatch, store_setup, store_teardown },
     { "store/serde_atom_types",           test_serde_atom_types,           store_setup, store_teardown },
