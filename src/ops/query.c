@@ -50,6 +50,12 @@
 #include <inttypes.h>
 #include <stdlib.h>
 
+/* Fixed slot capacity for the select/group-by compile paths: group keys,
+ * aggregate outputs, non-aggregate outputs, and sort keys each collect into
+ * stack arrays of this size.  Exceeding it is rejected with a clear error
+ * rather than silently dropping the surplus (which produced wrong results). */
+#define RAY_GROUP_MAX_SLOTS 16
+
 /* ══════════════════════════════════════════
  * Select query — DAG bridge
  * ══════════════════════════════════════════ */
@@ -575,7 +581,7 @@ static ray_t* apply_sort_take(ray_t* result, ray_t** dict_elems, int64_t dict_n,
         ray_op_t* sort_keys[16];
         uint8_t   sort_descs[16];
         uint8_t   n_sort = 0;
-        for (int64_t i = 0; i + 1 < dict_n && n_sort < 16; i += 2) {
+        for (int64_t i = 0; i + 1 < dict_n; i += 2) {
             int64_t kid = dict_elems[i]->i64;
             uint8_t is_desc = 0;
             if (kid == asc_id) is_desc = 0;
@@ -583,12 +589,14 @@ static ray_t* apply_sort_take(ray_t* result, ray_t** dict_elems, int64_t dict_n,
             else continue;
             ray_t* val = dict_elems[i + 1];
             if (val->type == -RAY_SYM) {
+                if (n_sort >= RAY_GROUP_MAX_SLOTS) { ray_graph_free(g); ray_release(result); return ray_error("range", "select: too many sort keys (max %d)", RAY_GROUP_MAX_SLOTS); }
                 ray_t* s = ray_sym_str(val->i64);
                 sort_keys[n_sort] = ray_scan(g, ray_str_ptr(s));
                 sort_descs[n_sort] = is_desc;
                 n_sort++;
             } else if (ray_is_vec(val) && val->type == RAY_SYM) {
-                for (int64_t c = 0; c < val->len && n_sort < 16; c++) {
+                for (int64_t c = 0; c < val->len; c++) {
+                    if (n_sort >= RAY_GROUP_MAX_SLOTS) { ray_graph_free(g); ray_release(result); return ray_error("range", "select: too many sort keys (max %d)", RAY_GROUP_MAX_SLOTS); }
                     /* cell-data: resolve through the vec's domain */
                     ray_t* s = ray_sym_vec_cell(val, c);
                     sort_keys[n_sort] = ray_scan(g, ray_str_ptr(s));
@@ -4038,7 +4046,8 @@ ray_t* ray_window_fn(ray_t** args, int64_t n) {
                 ray_t* s = ray_sym_str(pe->i64);
                 if (s) part_ops[n_part++] = ray_scan(g, ray_str_ptr(s));
             } else if (pe->type == RAY_SYM) {
-                for (int64_t i = 0; i < pe->len && n_part < 16; i++) {
+                if (pe->len > RAY_GROUP_MAX_SLOTS) { ray_graph_free(g); ray_release(tbl); return ray_error("range", "window: too many partition columns (max %d)", RAY_GROUP_MAX_SLOTS); }
+                for (int64_t i = 0; i < pe->len; i++) {
                     int64_t sid = sym_cell_runtime_id(pe, i);
                     ray_t*  s   = ray_sym_str(sid);
                     if (s) part_ops[n_part++] = ray_scan(g, ray_str_ptr(s));
@@ -4059,7 +4068,8 @@ ray_t* ray_window_fn(ray_t** args, int64_t n) {
                 ray_t* s = ray_sym_str(oe->i64);
                 if (s) order_ops[n_order++] = ray_scan(g, ray_str_ptr(s));
             } else if (oe->type == RAY_SYM) {
-                for (int64_t i = 0; i < oe->len && n_order < 16; i++) {
+                if (oe->len > RAY_GROUP_MAX_SLOTS) { ray_graph_free(g); ray_release(tbl); return ray_error("range", "window: too many order columns (max %d)", RAY_GROUP_MAX_SLOTS); }
+                for (int64_t i = 0; i < oe->len; i++) {
                     int64_t sid = sym_cell_runtime_id(oe, i);
                     ray_t*  s   = ray_sym_str(sid);
                     if (s) order_ops[n_order++] = ray_scan(g, ray_str_ptr(s));
@@ -4724,12 +4734,6 @@ static int filt_compact_keep(ray_t* dict, ray_t* by_expr, ray_t* tbl,
     }
     return n;
 }
-
-/* Fixed slot capacity for the general group-by compile path: group keys,
- * aggregate outputs, and non-aggregate outputs each collect into stack arrays
- * of this size.  Exceeding it is rejected with a clear error rather than
- * silently dropping the surplus columns (which produced wrong results). */
-#define RAY_GROUP_MAX_SLOTS 16
 
 ray_t* ray_select(ray_t** args, int64_t n) {
     if (n < 1) return ray_error("arity", "select: expects a query dict, got %lld args", (long long)n);
@@ -8320,14 +8324,20 @@ by_dict_done:
             for (int64_t i = 0; i + 1 < dict_n; i += 2) {
                 int64_t kid = dict_elems[i]->i64;
                 if (kid == from_id || kid == where_id || kid == by_id || kid == take_id || kid == asc_id || kid == desc_id || kid == nearest_id) continue;
-                if (nc < 16) {
-                    col_ops[nc] = compile_expr_dag(g, dict_elems[i + 1]);
-                    if (!col_ops[nc]) {
-                        use_eval_fallback = 1;
-                        break;
-                    }
-                    nc++;
+                if (nc >= RAY_GROUP_MAX_SLOTS) {
+                    /* More projection columns than the DAG fast path's fixed
+                     * col_ops[] holds — take the eval fallback, which builds
+                     * the result column-by-column with no fixed cap, rather
+                     * than silently dropping the surplus columns. */
+                    use_eval_fallback = 1;
+                    break;
                 }
+                col_ops[nc] = compile_expr_dag(g, dict_elems[i + 1]);
+                if (!col_ops[nc]) {
+                    use_eval_fallback = 1;
+                    break;
+                }
+                nc++;
             }
             if (use_eval_fallback) {
                 /* The fallback evaluates projections directly over `tbl`,
@@ -8429,7 +8439,7 @@ by_dict_done:
         ray_op_t* sort_keys[16];
         uint8_t   sort_descs[16];
         uint8_t   n_sort = 0;
-        for (int64_t i = 0; i + 1 < dict_n && n_sort < 16; i += 2) {
+        for (int64_t i = 0; i + 1 < dict_n; i += 2) {
             int64_t kid = dict_elems[i]->i64;
             uint8_t is_desc = 0;
             if (kid == asc_id) is_desc = 0;
@@ -8438,13 +8448,15 @@ by_dict_done:
             ray_t* val = dict_elems[i + 1];
             if (val->type == -RAY_SYM) {
                 /* Single column name */
+                if (n_sort >= RAY_GROUP_MAX_SLOTS) { ray_graph_free(g); ray_release(tbl); return ray_error("range", "select: too many sort keys (max %d)", RAY_GROUP_MAX_SLOTS); }
                 ray_t* s = ray_sym_str(val->i64);
                 sort_keys[n_sort] = ray_scan(g, ray_str_ptr(s));
                 sort_descs[n_sort] = is_desc;
                 n_sort++;
             } else if (ray_is_vec(val) && val->type == RAY_SYM) {
                 /* Multiple column names — cell-data via the vec's domain */
-                for (int64_t c = 0; c < val->len && n_sort < 16; c++) {
+                for (int64_t c = 0; c < val->len; c++) {
+                    if (n_sort >= RAY_GROUP_MAX_SLOTS) { ray_graph_free(g); ray_release(tbl); return ray_error("range", "select: too many sort keys (max %d)", RAY_GROUP_MAX_SLOTS); }
                     ray_t* s = ray_sym_vec_cell(val, c);
                     sort_keys[n_sort] = ray_scan(g, ray_str_ptr(s));
                     sort_descs[n_sort] = is_desc;
@@ -8635,27 +8647,35 @@ by_dict_done:
              * Non-agg columns were added by the post-DAG scatter block
              * with correct names already — only agg columns need renaming,
              * in dict-iteration order of the agg entries. */
-            int64_t agg_user_names[16];
-            int64_t all_user_names[16];
-            int n_agg_user = 0;
-            int n_all_user = 0;
-            for (int64_t i = 0; i + 1 < dict_n; i += 2) {
-                int64_t kid = dict_elems[i]->i64;
-                if (kid == from_id || kid == where_id || kid == by_id ||
-                    kid == take_id || kid == asc_id || kid == desc_id) continue;
-                if (n_all_user < 16) all_user_names[n_all_user++] = kid;
-                if (by_expr && !is_group_dag_agg_expr(dict_elems[i + 1])) continue;
-                if (n_agg_user < 16) agg_user_names[n_agg_user++] = kid;
-            }
             if (by_expr) {
                 /* Rename only the agg columns (positions after keys).
-                 * Non-agg LIST columns were named at scatter time. */
+                 * Non-agg LIST columns were named at scatter time.  The agg
+                 * count is bounded by RAY_GROUP_MAX_SLOTS (a query exceeding
+                 * it errored during compilation), so a fixed buffer is safe. */
+                int64_t agg_user_names[RAY_GROUP_MAX_SLOTS];
+                int n_agg_user = 0;
+                for (int64_t i = 0; i + 1 < dict_n; i += 2) {
+                    int64_t kid = dict_elems[i]->i64;
+                    if (kid == from_id || kid == where_id || kid == by_id ||
+                        kid == take_id || kid == asc_id || kid == desc_id) continue;
+                    if (!is_group_dag_agg_expr(dict_elems[i + 1])) continue;
+                    if (n_agg_user < RAY_GROUP_MAX_SLOTS) agg_user_names[n_agg_user++] = kid;
+                }
                 for (int j = 0; j < n_agg_user && n_key_cols + j < ncols; j++)
                     ray_table_set_col_name(result, n_key_cols + j, agg_user_names[j]);
             } else {
-                /* Projection-only: columns are in dict order */
-                for (int j = 0; j < n_all_user && n_key_cols + j < ncols; j++)
-                    ray_table_set_col_name(result, n_key_cols + j, all_user_names[j]);
+                /* Projection-only: columns are in dict order.  Rename each
+                 * output column directly — a projection may have any number
+                 * of columns, so no fixed-capacity buffer is used here. */
+                int j = 0;
+                for (int64_t i = 0; i + 1 < dict_n; i += 2) {
+                    int64_t kid = dict_elems[i]->i64;
+                    if (kid == from_id || kid == where_id || kid == by_id ||
+                        kid == take_id || kid == asc_id || kid == desc_id) continue;
+                    if (n_key_cols + j < ncols)
+                        ray_table_set_col_name(result, n_key_cols + j, kid);
+                    j++;
+                }
             }
         }
     }
