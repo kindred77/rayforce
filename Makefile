@@ -133,53 +133,6 @@ dist: release
 	 ( cd dist && { command -v sha256sum >/dev/null 2>&1 && sha256sum $$name.tar.gz || shasum -a 256 $$name.tar.gz; } > $$name.tar.gz.sha256 ); \
 	 echo "built dist/$$name.tar.gz"
 
-# Allocator micro-benchmark (release-optimized, linked against lib objects).
-# Compile all sources fresh with RELEASE_CFLAGS so the benchmark measures
-# the release allocator, not a sanitizer-instrumented debug build.
-bench-alloc:
-	$(CC) $(RELEASE_CFLAGS) $(DEFS) $(INCLUDES) -o bench-alloc \
-		bench/alloc/main.c $(LIB_SRC) $(LIBS) $(RELEASE_LDFLAGS) -lpthread
-	./bench-alloc
-
-# Group predicate pushdown perf gate (release-optimized, no sanitizers).
-# Measures FILTER(GROUP) with predicate pushed below GROUP vs unpushed.
-bench-group-pushdown:
-	$(CC) $(RELEASE_CFLAGS) $(DEFS) $(INCLUDES) -o bench-group-pushdown \
-		bench/group_pushdown/main.c $(LIB_SRC) $(LIBS) $(RELEASE_LDFLAGS)
-	./bench-group-pushdown
-
-# Aggregation-engine A/B perf microbench (release-optimized, no sanitizers).
-# H2O-style group-by shapes; v2 engine (this branch) vs rowforms (master).
-bench-agg-v2:
-	$(CC) $(RELEASE_CFLAGS) $(DEFS) $(INCLUDES) -o bench-agg-v2 \
-		bench/agg_v2/main.c $(LIB_SRC) $(LIBS) $(RELEASE_LDFLAGS) -lm
-	./bench-agg-v2
-
-# Index routing per-point perf gate (release-optimized, no sanitizers).
-# Measures indexed vs plain side for each of the 9 routing consumption points.
-bench-idx-route:
-	$(CC) $(RELEASE_CFLAGS) $(DEFS) $(INCLUDES) -o bench-idx-route \
-		bench/idx_route/main.c $(LIB_SRC) $(LIBS) $(RELEASE_LDFLAGS)
-	./bench-idx-route
-
-# Join build-side selection perf gate.
-# Measures swap (build hash on smaller left) vs legacy (build on right) for
-# three cases: WIN (10K left vs 10M right), CONTROL (10M==10M, no swap),
-# MANY-TO-MANY (100K left vs 10M right, ~10M output).  Sanitizer-free.
-bench-join-buildside:
-	$(CC) $(RELEASE_CFLAGS) $(DEFS) $(INCLUDES) -o bench-join-buildside \
-		bench/join_buildside/main.c $(LIB_SRC) $(LIBS) $(RELEASE_LDFLAGS)
-	./bench-join-buildside
-
-# Join dup-fallback perf gate.
-# Measures post-fix (auto dup-fallback to chained build) vs pre-fix (O(dup²)
-# build via the ray_join_no_dup_fallback bypass knob) on catastrophic,
-# zero-regression, and moderate-dup cases.  Sanitizer-free.
-bench-join-dup:
-	$(CC) $(RELEASE_CFLAGS) $(DEFS) $(INCLUDES) -o bench-join-dup \
-		bench/join_dup/main.c $(LIB_SRC) $(LIBS) $(RELEASE_LDFLAGS)
-	./bench-join-dup
-
 # Worker threads per process during tests. Without this the runtime
 # auto-sizes to ncpu-1, so on a many-core box the in-process harness AND
 # every server it spawns via .sys.exec each create ~ncpu-1 threads — a lot of
@@ -241,7 +194,7 @@ clean:
 	-rm -f cov-*.profraw default.profraw coverage.profdata
 	-rm -rf coverage_html
 
-.PHONY: default debug release lib dist bench-alloc bench-join-buildside bench-join-dup test coverage clean
+.PHONY: default debug release lib dist test coverage clean
 
 # Header dependencies last: .d fragments only add prerequisites to the
 # object targets above, and being last they can't hijack the default goal.

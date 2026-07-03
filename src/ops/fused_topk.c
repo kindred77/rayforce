@@ -169,7 +169,7 @@ static inline int fpk_cmp(const fpk_par_ctx_t* c, int64_t row_a, int64_t row_b) 
         } else if (ks->type == RAY_STR) {
             /* Variable-length STR key: compare the actual strings (dict
              * codes, if any, are first-occurrence order — not sorted).
-             * No null per the kdb+ STR model; empty "" is a normal value. */
+             * No null in the STR model; empty "" is a normal value. */
             size_t la = 0, lb = 0;
             const char* sa = ray_str_vec_get(ks->col, row_a, &la);
             const char* sb = ray_str_vec_get(ks->col, row_b, &lb);

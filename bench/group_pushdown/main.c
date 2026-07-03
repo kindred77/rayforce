@@ -1,5 +1,4 @@
 /* Group predicate pushdown perf gate.
- * Build: make bench-group-pushdown
  * Runs: FILTER(k < 10000, GROUP(sum v by k)) pushed vs unpushed
  *       FILTER(k >= 0,    GROUP(sum v by k)) as control (no filtering benefit)
  * Reports medians of exec and optimize time, pushed vs unpushed.

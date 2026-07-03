@@ -68,7 +68,7 @@ static inline bool sentinel_is_null(const ray_t* v, int64_t idx) {
             return ((const int32_t*)p)[idx] == NULL_I32;
         case RAY_I16:
             return ((const int16_t*)p)[idx] == NULL_I16;
-        /* SYM has no null (kdb+ model: sym id 0 is the empty value, not null) —
+        /* SYM has no null (sym id 0 is the empty value, not null) —
          * no arm here; ray_vec_is_null short-circuits SYM before this switch. */
         case RAY_STR:
             return ((const ray_str_t*)p)[idx].len == 0;
@@ -973,7 +973,7 @@ ray_err_t ray_vec_set_null_checked(ray_t* vec, int64_t idx, bool is_null) {
             case RAY_I32: case RAY_DATE: case RAY_TIME: ((int32_t*)p)[idx] = NULL_I32; break;
             case RAY_I16:                          ((int16_t*)p)[idx] = NULL_I16; break;
             case RAY_STR:
-                /* STR has no null distinct from "" (kdb+ model): write the
+                /* STR has no null distinct from "": write the
                  * empty string but do NOT mark the column nullable. */
                 memset(&((ray_str_t*)p)[idx], 0, sizeof(ray_str_t));
                 return RAY_OK;
@@ -1146,8 +1146,8 @@ fail_range:
  * Allocates the string pool once (not per-element like ray_str_vec_append).
  * Pass 1 sums pooled bytes; pass 2 fills descriptors and pool in one sweep.
  * ptrs[i] may be NULL when lens[i]==0.  nulls may be NULL (no nulls); when
- * non-NULL, nulls[i]!=0 marks element i null (STR null = empty string,
- * kdb+ model — len==0, no RAY_ATTR_HAS_NULLS set).
+ * non-NULL, nulls[i]!=0 marks element i null (STR null = empty string —
+ * len==0, no RAY_ATTR_HAS_NULLS set).
  * -------------------------------------------------------------------------- */
 
 ray_t* ray_str_vec_from_parts(const char* const* ptrs, const uint32_t* lens,
@@ -1186,7 +1186,7 @@ ray_t* ray_str_vec_from_parts(const char* const* ptrs, const uint32_t* lens,
         ray_str_t* d = &elems[i];
         memset(d, 0, sizeof(ray_str_t));
         if (nulls && nulls[i]) {
-            /* STR null = empty string (kdb+ model): d is already zeroed (len=0) */
+            /* STR null = empty string: d is already zeroed (len=0) */
         } else if (lens[i] <= RAY_STR_INLINE_MAX) {
             d->len = lens[i];
             if (lens[i] > 0) memcpy(d->data, ptrs[i], lens[i]);
@@ -1422,8 +1422,8 @@ bool ray_vec_is_null(ray_t* vec, int64_t idx) {
     if (!vec || RAY_IS_ERR(vec)) return false;
     if (idx < 0 || idx >= vec->len) return false;
 
-    /* SYM and STR columns are no-null by design (kdb+ model: empty "" / sym 0
-     * is the convention — there is no null distinct from empty).  Consumers
+    /* SYM and STR columns are no-null by design (empty "" / sym 0 is the
+     * convention — there is no null distinct from empty).  Consumers
      * that need empty detection test the value (sym id 0 / str len 0) directly. */
     if (vec->type == RAY_SYM || vec->type == RAY_STR) return false;
 

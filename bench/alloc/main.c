@@ -1,4 +1,4 @@
-/* Allocator micro-benchmark.  Build: make bench-alloc; run: ./bench-alloc */
+/* Allocator micro-benchmark. */
 #if defined(__APPLE__)
 #  define _DARWIN_C_SOURCE
 #else

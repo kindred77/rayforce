@@ -805,7 +805,7 @@ ray_t* ray_index_attach_dict(ray_t** vp) {
     return attach_finalize(v, idx);
 }
 
-/* ── Inline on-disk index region (zero-copy mmap, kdb+-style) ───────────────
+/* ── Inline on-disk index region (zero-copy mmap) ───────────────────────────
  * An attached index is persisted at the (32-aligned) tail of its column file as
  * a run of contiguous 32-byte-aligned ray_t blocks:
  *   [RAY_INDEX block: 32B hdr + ray_index_t payload][child vec block]…

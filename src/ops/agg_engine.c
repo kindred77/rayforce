@@ -271,7 +271,7 @@ static ray_t* agg_gather_key_col(ray_t* src_col, const int64_t* first_row, int64
 }
 
 /* ══════════════════════════════════════════════════════════════════════
- * CHUNKED SELECTION CONSUMPTION (mirrors DuckDB's SelectionVector model)
+ * CHUNKED SELECTION CONSUMPTION (selection-vector model)
  *
  * When a pushed WHERE filter is active, g->selection is a rowsel bitmap (see
  * src/ops/rowsel.h: per-segment NONE/ALL/MIX flags + morsel-local idx[] for MIX
@@ -283,13 +283,11 @@ static ray_t* agg_gather_key_col(ray_t* src_col, const int64_t* first_row, int64
  * small reused stack buffer, gathering only that chunk's key/agg-input values
  * into small reused contiguous buffers, then feeding the existing dense-batch
  * kernel (update_batch) over the chunk.  No full index array, no full compact
- * column, no per-call large alloc.  This is exactly DuckDB's chunked AddChunk
- * (STANDARD_VECTOR_SIZE=2048): gather the chunk's selected rows into reused
- * vectors and sink the chunk — see
- *   duckdb/src/include/duckdb/common/types/selection_vector.hpp
- *   duckdb/src/common/types/vector.cpp (Vector::Slice → gather under a sel)
- * but adapted to v2's dense-contiguous batch kernels (which take a vector, not a
- * vector+selection pair) by gathering per chunk instead of slicing references.
+ * column, no per-call large alloc.  This is the standard chunked add-chunk
+ * approach (fixed vector size 2048): gather the chunk's selected rows into
+ * reused vectors and sink the chunk — adapted to v2's dense-contiguous batch
+ * kernels (which take a vector, not a vector+selection pair) by gathering per
+ * chunk instead of slicing references.
  *
  * Representative-row indices (first_row) stay in ORIGINAL-row space: the decoded
  * row index is what gets recorded, so the result key columns gather correctly
@@ -305,7 +303,7 @@ static ray_t* agg_gather_key_col(ray_t* src_col, const int64_t* first_row, int64
 
 #include "core/pool.h"
 
-#define AGG_SEL_CHUNK 2048   /* DuckDB STANDARD_VECTOR_SIZE-equivalent */
+#define AGG_SEL_CHUNK 2048   /* fixed selection-vector chunk size */
 
 /* Build a prefix sum of per-segment selected counts: prefix[s] = number of
  * selected rows in segments [0, s).  prefix[n_segs] == total_pass.  Lets a
@@ -2669,12 +2667,10 @@ static ray_t* agg_build_compact(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
  * smallhash): they decode the selected ORIGINAL rows in fixed-size chunks and
  * gather only each chunk's key/agg values into small reused buffers, feeding the
  * dense-batch kernels — NO full index array (ray_rowsel_to_indices), NO full
- * compact column, NO per-call large alloc.  This mirrors DuckDB's chunked
- * SelectionVector model (gather a STANDARD_VECTOR_SIZE chunk's selected rows
- * into reused vectors and sink the chunk), adapted to v2's dense-contiguous
- * batch kernels by gathering per chunk rather than slicing references — see
- *   duckdb/src/include/duckdb/common/types/selection_vector.hpp
- *   duckdb/src/common/types/vector.cpp (Vector::Slice → gather under a sel).
+ * compact column, NO per-call large alloc.  This is the chunked selection-
+ * vector model (gather a fixed-size chunk's selected rows into reused vectors
+ * and sink the chunk), adapted to v2's dense-contiguous batch kernels by
+ * gathering per chunk rather than slicing references.
  *
  * The HASH-FALLBACK strategy (F64/STR keys) and the SERIAL path are NOT chunked
  * — those shapes were not perf blockers and are rare/small.  exec_group_v2_run
@@ -2966,7 +2962,7 @@ static ray_t* agg_gather_col_at(ray_t* sc, const int64_t* first_row, int64_t n) 
  * column's RAW cell values (positions for SYM — domain-local, NO global
  * interning of the vocabulary), then emit, per group, the FIRST-of-group value
  * of every column of `tbl`: the key columns (named by key_syms, in by: order)
- * followed by every non-key column (kdb `select by` semantics — first row of
+ * followed by every non-key column (group-by semantics — first row of
  * the group).  Columns are gathered via agg_gather_col_at, which handles
  * STR/LIST and adopts SYM source domains, so NOTHING is interned globally.
  * Replaces the legacy path's per-cell runtime-id boxing.  Precondition (gated by
@@ -3004,7 +3000,7 @@ ray_t* agg_select_distinct(ray_t* tbl, ray_t** key_cols, const int64_t* key_syms
         if (is_key) continue;
         /* Projection pushdown: when the consumer published the columns it
          * references (keep_syms), drop the non-key columns it never reads —
-         * keys are always carried.  keep_syms == NULL → carry all (kdb default). */
+         * keys are always carried.  keep_syms == NULL → carry all (default). */
         if (keep_syms) {
             bool req = false;
             for (int j = 0; j < keep_n; j++) if (keep_syms[j] == cn) { req = true; break; }

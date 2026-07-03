@@ -39,13 +39,5 @@ rayforce.cov
 site/
 .venv-docs/
 
-# Allocator micro-benchmark binaries
-bench-alloc
-bench-group-pushdown
-bench-idx-route
-bench-join-buildside
-bench-join-dup
-bench-agg-v2
-
 # Rayforce REPL history
 .rayhist.dat

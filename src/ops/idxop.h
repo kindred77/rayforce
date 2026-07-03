@@ -229,7 +229,7 @@ ray_t* ray_index_attach_dict(ray_t** vp);
 /* Attach an already-built standalone RAY_INDEX object (zero-copy on rc=1). */
 ray_t* ray_index_attach_built(ray_t** vp, ray_t* idx);
 
-/* ── Inline on-disk index region (kdb+-style, zero-copy mmap) ──
+/* ── Inline on-disk index region (zero-copy mmap) ──
  * ray_index_inline_size: bytes the region occupies (32-aligned ray_t blocks).
  * ray_index_inline_write: serialize `ix` into dst (child ptrs → region offsets).
  * ray_index_inline_map: patch an mmap'd region's child offsets → absolute ptrs

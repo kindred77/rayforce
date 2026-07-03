@@ -1,5 +1,4 @@
 /* Join build-side selection perf gate.
- * Build: make bench-join-buildside
  *
  * Measures the speedup from building the hash table on the smaller (left)
  * side when left < right in a radix inner join.  Four cases, each run

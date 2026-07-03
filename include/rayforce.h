@@ -451,8 +451,8 @@ static inline bool ray_atom_is_null_fn(const union ray_t* x) {
              * STR's empty "" below.  A SYM atom is never null. */
             return false;
         case RAY_STR:
-            /* STR has no null distinct from "" (kdb+ model: char lists have no
-             * null, only symbols do).  A STR atom is never null — the empty
+            /* STR has no null distinct from "" (char lists have no null, only
+             * symbols do).  A STR atom is never null — the empty
              * string is a value. */
             return false;
         case RAY_GUID: {

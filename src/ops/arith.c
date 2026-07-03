@@ -402,8 +402,8 @@ ray_t* ray_exp_fn(ray_t* x) {
  * Atomic binary — broadcasts over numeric vectors via the same
  * RAY_FN_ATOMIC dispatch the other binary atomic ops use.  Result is
  * always F64; integer bases with integer exponents still go through
- * libm pow() so semantics match polars/numpy for fractional exponents
- * (e.g. (pow 2 0.5) → 1.41…).
+ * libm pow() so fractional exponents use standard floating-point
+ * semantics (e.g. (pow 2 0.5) → 1.41…).
  *
  * Null propagation: either operand null → typed F64 null. */
 ray_t* ray_pow_fn(ray_t* x, ray_t* y) {
