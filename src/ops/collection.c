@@ -561,8 +561,8 @@ static ray_t* scan_typed_arith(ray_t* fn, ray_t* vec) {
 /* (prior fn vec) — pairwise combinator over adjacent elements:
  * out[i] = (fn v[i] v[i-1]) for i >= 1, out[0] = (fn v[0] v[0]) — the
  * self-pair start matches the concat/take shift idiom it replaces
- * (prev[0] = v[0]) and kdb's `f prior x` for comparisons (first slot
- * compares equal → false).  The six comparison operators over null-free
+ * (prev[0] = v[0]), so a comparison's first slot compares equal → false.
+ * The six comparison operators over null-free
  * numeric/temporal typed vectors (plus ==//= over SYM, where adjacent
  * same-vector ids compare directly) run one fused pass returning a BOOL
  * vector — no shifted copy, no boxing.  Everything else falls to the
