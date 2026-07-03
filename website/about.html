@@ -99,7 +99,7 @@
 
       <h2>Design principles</h2>
       <ul>
-        <li><strong>Zero external dependencies.</strong> The whole engine is pure C with the standard library only. No third-party allocator, no Boost, no Arrow. The single header <code>rayforce.h</code> is the entire public API.</li>
+        <li><strong>Zero external dependencies.</strong> The whole engine is pure C with the standard library only. No third-party allocator, no external utility or columnar-format libraries. The single header <code>rayforce.h</code> is the entire public API.</li>
         <li><strong>One DAG for everything.</strong> Filters, joins, aggregations, window functions, and graph traversals all build into the same lazy operation DAG. The optimizer rewrites the full graph before execution begins.</li>
         <li><strong>Morsel-driven execution.</strong> Element-wise operations fuse into single-pass pipelines that operate on 1024-element morsels and stay L1-resident. Pipeline breakers — joins, sort, group-by, window — materialize once and hand off cleanly.</li>
         <li><strong>Custom memory model.</strong> A buddy allocator with slab caches replaces malloc; per-thread heaps remove allocator contention; deferred cross-heap merge handles worker-thread results without locks on the hot path.</li>
