@@ -29,6 +29,10 @@ bool agg_v2_can_handle(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     if (!ext) return false;
     if (ext->n_keys < 1 || ext->n_keys > 16) return false;  /* 1b: 1..16 keys */
     if (ext->n_aggs == 0) return false;        /* need >=1 aggregate  */
+    /* Defensive mirror of the compile-side RAY_GROUP_MAX_SLOTS cap: the
+     * engine fills [16] per-agg arrays, so bail to the legacy path rather
+     * than rely solely on the upstream invariant. */
+    if (ext->n_aggs > 16) return false;
     if (!tbl) return false;
     /* A pushed WHERE filter (g->selection set) is now handled by exec_group_v2's
      * compact-table prologue: it gathers the selected rows of the keys/agg-inputs

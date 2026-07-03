@@ -5556,8 +5556,12 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
      * Used when query has AVG or expression keys/aggs.
      * Only concatenates the columns actually referenced by the GROUP BY. */
     {
-        /* Collect needed column sym IDs (keys + agg inputs) */
-        int64_t needed[16];
+        /* Collect needed column sym IDs (keys + agg inputs).  Keys and agg
+         * inputs are each capped at RAY_GROUP_MAX_SLOTS by the compile path,
+         * but their deduplicated UNION can reach the sum of both caps —
+         * size for that, not for one cap (a bare [16] here overflowed the
+         * stack with >16 distinct key+agg columns). */
+        int64_t needed[2 * RAY_GROUP_MAX_SLOTS];
         int n_needed = 0;
         for (uint8_t k = 0; k < n_keys; k++) {
             ray_op_ext_t* ke = find_ext(g, ext->keys[k]);

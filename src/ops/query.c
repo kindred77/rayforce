@@ -50,12 +50,6 @@
 #include <inttypes.h>
 #include <stdlib.h>
 
-/* Fixed slot capacity for the select/group-by compile paths: group keys,
- * aggregate outputs, non-aggregate outputs, and sort keys each collect into
- * stack arrays of this size.  Exceeding it is rejected with a clear error
- * rather than silently dropping the surplus (which produced wrong results). */
-#define RAY_GROUP_MAX_SLOTS 16
-
 /* ══════════════════════════════════════════
  * Select query — DAG bridge
  * ══════════════════════════════════════════ */
@@ -6108,14 +6102,18 @@ by_dict_done:
                         }
                     }
                     int n_count_out = 0;
-                    int64_t count_names[16];
+                    int64_t count_names[RAY_GROUP_MAX_SLOTS];
                     bool count_only = true;
-                    for (int64_t i = 0; i + 1 < dict_n && n_count_out < 16; i += 2) {
+                    for (int64_t i = 0; i + 1 < dict_n; i += 2) {
                         int64_t kid = dict_elems[i]->i64;
                         if (kid == from_id || kid == where_id || kid == by_id ||
                             kid == take_id || kid == asc_id || kid == desc_id) continue;
                         ray_t* val_expr_item = dict_elems[i + 1];
-                        if (!is_plain_count_expr(val_expr_item)) {
+                        if (!is_plain_count_expr(val_expr_item) ||
+                            n_count_out >= RAY_GROUP_MAX_SLOTS) {
+                            /* Not a count expr, or too many outputs for this
+                             * fast path's fixed slots — use the general path
+                             * (never silently drop outputs). */
                             count_only = false;
                             break;
                         }
@@ -6337,12 +6335,19 @@ by_dict_done:
                     n_groups, &out_groups);
 
                 int n_agg_out = 0;
-                int64_t agg_names[16];
-                ray_t* agg_results[16] = {0};
-                for (int64_t i = 0; i + 1 < dict_n && n_agg_out < 16; i += 2) {
+                int64_t agg_names[RAY_GROUP_MAX_SLOTS];
+                ray_t* agg_results[RAY_GROUP_MAX_SLOTS] = {0};
+                for (int64_t i = 0; i + 1 < dict_n; i += 2) {
                     int64_t kid = dict_elems[i]->i64;
                     if (kid == from_id || kid == where_id || kid == by_id ||
                         kid == take_id || kid == asc_id || kid == desc_id) continue;
+                    if (n_agg_out >= RAY_GROUP_MAX_SLOTS) {
+                        /* Terminal eval-group path: reject loudly instead of
+                         * silently dropping outputs past the slot cap. */
+                        for (int ai = 0; ai < n_agg_out; ai++) if (agg_results[ai]) ray_release(agg_results[ai]);
+                        ray_release(groups); if (eval_tbl != tbl) ray_release(eval_tbl); ray_release(tbl);
+                        return ray_error("range", "select: too many output columns (max %d)", RAY_GROUP_MAX_SLOTS);
+                    }
                     ray_t* val_expr_item = dict_elems[i + 1];
 
                     /* Per-group count(distinct) — bypass full ray_eval per
@@ -6849,11 +6854,18 @@ by_dict_done:
 
             /* Collect aggregation results */
             int n_agg_out = 0;
-            int64_t agg_names[16];
-            ray_t* agg_results[16];
-            for (int64_t i = 0; i + 1 < dict_n && n_agg_out < 16; i += 2) {
+            int64_t agg_names[RAY_GROUP_MAX_SLOTS];
+            ray_t* agg_results[RAY_GROUP_MAX_SLOTS] = {0};
+            for (int64_t i = 0; i + 1 < dict_n; i += 2) {
                 int64_t kid = dict_elems[i]->i64;
                 if (kid == from_id || kid == where_id || kid == by_id || kid == take_id || kid == asc_id || kid == desc_id) continue;
+                if (n_agg_out >= RAY_GROUP_MAX_SLOTS) {
+                    /* Terminal eval-group path: reject loudly instead of
+                     * silently dropping outputs past the slot cap. */
+                    for (int ai = 0; ai < n_agg_out; ai++) if (agg_results[ai]) ray_release(agg_results[ai]);
+                    ray_release(groups); if (eval_tbl != tbl) ray_release(eval_tbl); ray_release(tbl);
+                    return ray_error("range", "select: too many output columns (max %d)", RAY_GROUP_MAX_SLOTS);
+                }
                 ray_t* val_expr_item = dict_elems[i + 1];
 
                 /* Per-group count(distinct) — bypass full ray_eval per
@@ -8226,8 +8238,8 @@ by_dict_done:
          *       (exec.c: vec->type < 0 → broadcast_scalar), producing
          *       N copies of the same value.
          *   (b) At least one non-agg output → keep the existing
-         *       projection (broadcast-as-column), matching q's
-         *       per-row evaluation semantics.
+         *       projection (broadcast-as-column) with per-row
+         *       evaluation semantics.
          *
          * Mixed agg+non-agg without `by:` continues to flow through (b);
          * the semantics there imply LIST/scalar mixing that is out of
