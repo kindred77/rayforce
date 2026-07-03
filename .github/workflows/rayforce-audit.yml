@@ -6,7 +6,7 @@ on:
 
 permissions:
   contents: read
-  pull-requests: read
+  pull-requests: write
 
 concurrency:
   group: rayforce-audit-${{ github.event.pull_request.number }}
@@ -86,6 +86,44 @@ jobs:
             | tee audit-output/rayforce-audit.md
 
           grep -q '^RAYFORCE_AUDIT_VERDICT: PASS$' audit-output/rayforce-audit.md
+
+      - name: Comment audit failure on PR
+        if: failure() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          report="audit-output/rayforce-audit.md"
+          body="audit-output/rayforce-audit-comment.md"
+          marker="<!-- rayforce-audit-failure-comment -->"
+
+          {
+            echo "$marker"
+            echo "## Rayforce targeted audit failed"
+            echo
+            echo "This PR did not pass the required Rayforce audit gate. Fix the blocking findings below and push an update; the audit will rerun automatically."
+            echo
+            if [ -s "$report" ]; then
+              sed -n '1,220p' "$report"
+            else
+              echo "The audit failed before producing a report. Open the required check logs for details."
+            fi
+          } > "$body"
+
+          comment_id=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            --jq ".[] | select(.body | contains(\"${marker}\")) | .id" \
+            | tail -n 1)
+
+          if [ -n "$comment_id" ]; then
+            gh api -X PATCH "repos/${REPO}/issues/comments/${comment_id}" \
+              -f body="$(cat "$body")" >/dev/null
+          else
+            gh api -X POST "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+              -f body="$(cat "$body")" >/dev/null
+          fi
 
       - name: Upload audit report
         if: always()
