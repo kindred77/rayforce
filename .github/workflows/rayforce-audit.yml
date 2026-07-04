@@ -131,6 +131,7 @@ jobs:
           deadline = time.monotonic() + 40 * 60
           verdict = None
           child_status = None
+          trust_answered = False
 
           try:
               while True:
@@ -150,7 +151,15 @@ jobs:
                           sys.stdout.buffer.write(chunk)
                           sys.stdout.buffer.flush()
                           plain = ansi.sub(b"", bytes(captured)).replace(b"\r\n", b"\n").replace(b"\r", b"\n")
-                          m = verdict_re.search(plain.decode(errors="replace"))
+                          text = plain.decode(errors="replace")
+                          if not trust_answered and "Enter y/n:" in text:
+                              # Interactive Claude asks once whether this runner
+                              # workspace is trusted. This self-hosted job is
+                              # intentionally limited to read-only file/git tools.
+                              os.write(master, b"y\r")
+                              trust_answered = True
+                              continue
+                          m = verdict_re.search(text)
                           if m:
                               verdict = m.group(1)
                               os.killpg(proc.pid, signal.SIGTERM)
