@@ -79,118 +79,14 @@ jobs:
           - Use FAIL only for issues that should block merge.
           EOF
 
-          # Run Claude Code as the normal terminal UI, not `claude -p`.  A small
-          # pty wrapper lets CI capture the terminal output and stop once the
-          # required verdict line is emitted, instead of leaving Claude at the
-          # interactive prompt after the audit is complete.
-          python3 - <<'PY'
-          import os
-          import pty
-          import re
-          import select
-          import signal
-          import subprocess
-          import sys
-          import time
-          from pathlib import Path
+          claude -p "$(cat audit-output/rayforce-audit-prompt.md)" \
+            --plugin-dir "${RAYFORCE_AUDIT_PLUGIN_DIR}" \
+            --permission-mode dontAsk \
+            --allowedTools "Read,Glob,Grep,LS,Bash(git *)" \
+            --no-session-persistence \
+            | tee audit-output/rayforce-audit.md
 
-          prompt = Path("audit-output/rayforce-audit-prompt.md").read_text()
-          raw_path = Path("audit-output/rayforce-audit.raw")
-          md_path = Path("audit-output/rayforce-audit.md")
-          ansi = re.compile(rb"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
-          verdict_re = re.compile(r"^RAYFORCE_AUDIT_VERDICT: (PASS|FAIL)$", re.M)
-
-          argv = [
-              "claude",
-              prompt,
-              "--plugin-dir",
-              os.environ["RAYFORCE_AUDIT_PLUGIN_DIR"],
-              "--permission-mode",
-              "bypassPermissions",
-              "--allowedTools",
-              "Read,Glob,Grep,LS,Bash(git *)",
-              "--ax-screen-reader",
-          ]
-          env = os.environ.copy()
-          env.setdefault("TERM", "xterm-256color")
-          env.setdefault("COLUMNS", "120")
-          env.setdefault("LINES", "40")
-
-          master, slave = pty.openpty()
-          proc = subprocess.Popen(
-              argv,
-              stdin=slave,
-              stdout=slave,
-              stderr=slave,
-              env=env,
-              start_new_session=True,
-          )
-          os.close(slave)
-
-          captured = bytearray()
-          deadline = time.monotonic() + 40 * 60
-          verdict = None
-          child_status = None
-          trust_answered = False
-
-          try:
-              while True:
-                  if time.monotonic() > deadline:
-                      os.killpg(proc.pid, signal.SIGTERM)
-                      child_status = 124
-                      break
-
-                  ready, _, _ = select.select([master], [], [], 1.0)
-                  if ready:
-                      try:
-                          chunk = os.read(master, 8192)
-                      except OSError:
-                          chunk = b""
-                      if chunk:
-                          captured.extend(chunk)
-                          sys.stdout.buffer.write(chunk)
-                          sys.stdout.buffer.flush()
-                          plain = ansi.sub(b"", bytes(captured)).replace(b"\r\n", b"\n").replace(b"\r", b"\n")
-                          text = plain.decode(errors="replace")
-                          if not trust_answered and "Enter y/n:" in text:
-                              # Interactive Claude asks once whether this runner
-                              # workspace is trusted. This self-hosted job is
-                              # intentionally limited to read-only file/git tools.
-                              os.write(master, b"y\r")
-                              trust_answered = True
-                              continue
-                          m = verdict_re.search(text)
-                          if m:
-                              verdict = m.group(1)
-                              os.killpg(proc.pid, signal.SIGTERM)
-                              child_status = 0
-                              break
-
-                  poll = proc.poll()
-                  if poll is not None:
-                      child_status = poll
-                      break
-          finally:
-              try:
-                  os.close(master)
-              except OSError:
-                  pass
-              if proc.poll() is None:
-                  try:
-                      os.killpg(proc.pid, signal.SIGKILL)
-                  except ProcessLookupError:
-                      pass
-                  proc.wait(timeout=5)
-
-          raw_path.write_bytes(captured)
-          plain = ansi.sub(b"", bytes(captured)).replace(b"\r\n", b"\n").replace(b"\r", b"\n")
-          md_path.write_text(plain.decode(errors="replace"))
-
-          if verdict is None and child_status != 0:
-              sys.exit(child_status)
-          PY
-
-          grep -q '^RAYFORCE_AUDIT_VERDICT: PASS$' audit-output/rayforce-audit.md
+          tail -n 1 audit-output/rayforce-audit.md | grep -q '^RAYFORCE_AUDIT_VERDICT: PASS$'
 
       - name: Comment audit failure on PR
         if: failure() && github.event_name == 'pull_request'
