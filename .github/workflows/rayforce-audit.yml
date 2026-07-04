@@ -79,39 +79,108 @@ jobs:
           - Use FAIL only for issues that should block merge.
           EOF
 
-          # Run Claude Code as the normal terminal UI, not `claude -p`.  The
-          # print-mode CLI enforces --max-budget-usd and failed this gate before
-          # producing a verdict; the self-hosted runner already has Claude's
-          # ordinary terminal session/auth available.
-          if ! command -v script >/dev/null 2>&1; then
-            echo "script(1) is required to run Claude with a pseudo-terminal" >&2
-            exit 2
-          fi
-
-          set +e
-          script -q -e -c 'claude "$(cat audit-output/rayforce-audit-prompt.md)" \
-            --plugin-dir "${RAYFORCE_AUDIT_PLUGIN_DIR}" \
-            --permission-mode bypassPermissions \
-            --allowedTools "Read,Glob,Grep,LS,Bash(git *)" \
-            --ax-screen-reader' /dev/null \
-            | tee audit-output/rayforce-audit.raw
-          claude_status=${PIPESTATUS[0]}
-          set -e
-
+          # Run Claude Code as the normal terminal UI, not `claude -p`.  A small
+          # pty wrapper lets CI capture the terminal output and stop once the
+          # required verdict line is emitted, instead of leaving Claude at the
+          # interactive prompt after the audit is complete.
           python3 - <<'PY'
+          import os
+          import pty
           import re
+          import select
+          import signal
+          import subprocess
+          import sys
+          import time
           from pathlib import Path
-          raw = Path("audit-output/rayforce-audit.raw").read_text(errors="replace")
-          # Strip terminal control sequences emitted by the interactive UI while
-          # preserving the plain Markdown report for artifacts/comments/grep.
-          ansi = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
-          text = ansi.sub("", raw).replace("\r\n", "\n").replace("\r", "\n")
-          Path("audit-output/rayforce-audit.md").write_text(text)
+
+          prompt = Path("audit-output/rayforce-audit-prompt.md").read_text()
+          raw_path = Path("audit-output/rayforce-audit.raw")
+          md_path = Path("audit-output/rayforce-audit.md")
+          ansi = re.compile(rb"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+          verdict_re = re.compile(r"^RAYFORCE_AUDIT_VERDICT: (PASS|FAIL)$", re.M)
+
+          argv = [
+              "claude",
+              prompt,
+              "--plugin-dir",
+              os.environ["RAYFORCE_AUDIT_PLUGIN_DIR"],
+              "--permission-mode",
+              "bypassPermissions",
+              "--allowedTools",
+              "Read,Glob,Grep,LS,Bash(git *)",
+              "--ax-screen-reader",
+          ]
+          env = os.environ.copy()
+          env.setdefault("TERM", "xterm-256color")
+          env.setdefault("COLUMNS", "120")
+          env.setdefault("LINES", "40")
+
+          master, slave = pty.openpty()
+          proc = subprocess.Popen(
+              argv,
+              stdin=slave,
+              stdout=slave,
+              stderr=slave,
+              env=env,
+              start_new_session=True,
+          )
+          os.close(slave)
+
+          captured = bytearray()
+          deadline = time.monotonic() + 40 * 60
+          verdict = None
+          child_status = None
+
+          try:
+              while True:
+                  if time.monotonic() > deadline:
+                      os.killpg(proc.pid, signal.SIGTERM)
+                      child_status = 124
+                      break
+
+                  ready, _, _ = select.select([master], [], [], 1.0)
+                  if ready:
+                      try:
+                          chunk = os.read(master, 8192)
+                      except OSError:
+                          chunk = b""
+                      if chunk:
+                          captured.extend(chunk)
+                          sys.stdout.buffer.write(chunk)
+                          sys.stdout.buffer.flush()
+                          plain = ansi.sub(b"", bytes(captured)).replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+                          m = verdict_re.search(plain.decode(errors="replace"))
+                          if m:
+                              verdict = m.group(1)
+                              os.killpg(proc.pid, signal.SIGTERM)
+                              child_status = 0
+                              break
+
+                  poll = proc.poll()
+                  if poll is not None:
+                      child_status = poll
+                      break
+          finally:
+              try:
+                  os.close(master)
+              except OSError:
+                  pass
+              if proc.poll() is None:
+                  try:
+                      os.killpg(proc.pid, signal.SIGKILL)
+                  except ProcessLookupError:
+                      pass
+                  proc.wait(timeout=5)
+
+          raw_path.write_bytes(captured)
+          plain = ansi.sub(b"", bytes(captured)).replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+          md_path.write_text(plain.decode(errors="replace"))
+
+          if verdict is None and child_status != 0:
+              sys.exit(child_status)
           PY
 
-          if [ "${claude_status}" -ne 0 ]; then
-            exit "${claude_status}"
-          fi
           grep -q '^RAYFORCE_AUDIT_VERDICT: PASS$' audit-output/rayforce-audit.md
 
       - name: Comment audit failure on PR
