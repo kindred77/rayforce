@@ -42,7 +42,7 @@ jobs:
           set -euo pipefail
           mkdir -p audit-output
 
-          claude -p "
+          cat > audit-output/rayforce-audit-prompt.md <<EOF
           Use the rayforce-audit:rayforce-audit skill.
 
           Audit this RayforceDB/rayforce pull request as a required merge gate.
@@ -77,14 +77,41 @@ jobs:
             or
             RAYFORCE_AUDIT_VERDICT: FAIL
           - Use FAIL only for issues that should block merge.
-          " \
+          EOF
+
+          # Run Claude Code as the normal terminal UI, not `claude -p`.  The
+          # print-mode CLI enforces --max-budget-usd and failed this gate before
+          # producing a verdict; the self-hosted runner already has Claude's
+          # ordinary terminal session/auth available.
+          if ! command -v script >/dev/null 2>&1; then
+            echo "script(1) is required to run Claude with a pseudo-terminal" >&2
+            exit 2
+          fi
+
+          set +e
+          script -q -e -c 'claude "$(cat audit-output/rayforce-audit-prompt.md)" \
             --plugin-dir "${RAYFORCE_AUDIT_PLUGIN_DIR}" \
             --permission-mode bypassPermissions \
             --allowedTools "Read,Glob,Grep,LS,Bash(git *)" \
-            --max-budget-usd 8 \
-            --no-session-persistence \
-            | tee audit-output/rayforce-audit.md
+            --ax-screen-reader' /dev/null \
+            | tee audit-output/rayforce-audit.raw
+          claude_status=${PIPESTATUS[0]}
+          set -e
 
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+          raw = Path("audit-output/rayforce-audit.raw").read_text(errors="replace")
+          # Strip terminal control sequences emitted by the interactive UI while
+          # preserving the plain Markdown report for artifacts/comments/grep.
+          ansi = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+          text = ansi.sub("", raw).replace("\r\n", "\n").replace("\r", "\n")
+          Path("audit-output/rayforce-audit.md").write_text(text)
+          PY
+
+          if [ "${claude_status}" -ne 0 ]; then
+            exit "${claude_status}"
+          fi
           grep -q '^RAYFORCE_AUDIT_VERDICT: PASS$' audit-output/rayforce-audit.md
 
       - name: Comment audit failure on PR
