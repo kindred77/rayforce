@@ -42,7 +42,7 @@ jobs:
           set -euo pipefail
           mkdir -p audit-output
 
-          claude -p "
+          cat > audit-output/rayforce-audit-prompt.md <<EOF
           Use the rayforce-audit:rayforce-audit skill.
 
           Audit this RayforceDB/rayforce pull request as a required merge gate.
@@ -77,15 +77,16 @@ jobs:
             or
             RAYFORCE_AUDIT_VERDICT: FAIL
           - Use FAIL only for issues that should block merge.
-          " \
+          EOF
+
+          claude -p "$(cat audit-output/rayforce-audit-prompt.md)" \
             --plugin-dir "${RAYFORCE_AUDIT_PLUGIN_DIR}" \
-            --permission-mode bypassPermissions \
+            --permission-mode dontAsk \
             --allowedTools "Read,Glob,Grep,LS,Bash(git *)" \
-            --max-budget-usd 8 \
             --no-session-persistence \
             | tee audit-output/rayforce-audit.md
 
-          grep -q '^RAYFORCE_AUDIT_VERDICT: PASS$' audit-output/rayforce-audit.md
+          tail -n 1 audit-output/rayforce-audit.md | grep -q '^RAYFORCE_AUDIT_VERDICT: PASS$'
 
       - name: Comment audit failure on PR
         if: failure() && github.event_name == 'pull_request'
