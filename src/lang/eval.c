@@ -3419,9 +3419,11 @@ ray_t* ray_eval(ray_t* obj) {
          * ray_execute — also means non-DAG paths (the select special form,
          * direct builtins) get their pool dispatches measured, and keeps
          * capture strictly off (mode 0) when the profiler is disabled. */
-        bool capture = g_ray_profile.active || ray_qlog_enabled();
-        ray_qstats_set_mode(capture ? RAY_QS_PROF : 0);
-        if (capture) ray_qstats_reset(0);
+        bool capture  = g_ray_profile.active || ray_qlog_enabled();
+        bool progress = ray_progress_active();
+        uint32_t qsmode = (capture ? RAY_QS_PROF : 0) | (progress ? RAY_QS_PROGRESS : 0);
+        ray_qstats_set_mode(qsmode);
+        if (qsmode) ray_qstats_reset(0);
     }
 
     /* Check for external interrupt (e.g. Ctrl-C from REPL) */

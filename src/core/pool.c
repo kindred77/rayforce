@@ -318,6 +318,12 @@ void ray_pool_dispatch(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
     /* Main thread enters atomic refcount mode during parallel dispatch */
     ray_rc_sync = true;
 
+    /* Progress: when a callback is listening (PROGRESS bit armed), baseline the
+     * row counter for this dispatch so the main thread can pump a 0→100% bar
+     * from its claim/spin path.  One relaxed load; skipped entirely otherwise. */
+    const bool prog = ray_qstats_mode() & RAY_QS_PROGRESS;
+    if (prog) ray_progress_dispatch_begin((uint64_t)total_elems);
+
     /* Wake worker threads */
     for (uint32_t i = 0; i < pool->n_workers; i++) {
         ray_sem_signal(&pool->work_ready);
@@ -339,6 +345,7 @@ void ray_pool_dispatch(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
             ray_qstats_task_end(_qs_m, 0, t->end - t->start, _qs_t0);
 
             atomic_fetch_sub_explicit(&pool->pending, 1, memory_order_acq_rel);
+            if (prog) ray_progress_pump();
         }
     }
 
@@ -348,7 +355,7 @@ void ray_pool_dispatch(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
         unsigned spin_count = 0;
         while (atomic_load_explicit(&pool->pending, memory_order_acquire) > 0) {
             RAY_CPU_RELAX();
-            if (++spin_count % 1024 == 0) sched_yield();
+            if (++spin_count % 1024 == 0) { sched_yield(); if (prog) ray_progress_pump(); }
         }
     }
 
@@ -407,6 +414,10 @@ void ray_pool_dispatch_n(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
     atomic_store_explicit(&ray_parallel_flag, 1, memory_order_release);
     ray_rc_sync = true;
 
+    /* Progress: baseline this dispatch (one unit per task/partition). */
+    const bool prog = ray_qstats_mode() & RAY_QS_PROGRESS;
+    if (prog) ray_progress_dispatch_begin((uint64_t)n_tasks);
+
     /* Wake worker threads */
     for (uint32_t i = 0; i < pool->n_workers; i++) {
         ray_sem_signal(&pool->work_ready);
@@ -428,6 +439,7 @@ void ray_pool_dispatch_n(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
             ray_qstats_task_end(_qs_m, 0, t->end - t->start, _qs_t0);
 
             atomic_fetch_sub_explicit(&pool->pending, 1, memory_order_acq_rel);
+            if (prog) ray_progress_pump();
         }
     }
 
@@ -436,7 +448,7 @@ void ray_pool_dispatch_n(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
         unsigned spin_count = 0;
         while (atomic_load_explicit(&pool->pending, memory_order_acquire) > 0) {
             RAY_CPU_RELAX();
-            if (++spin_count % 1024 == 0) sched_yield();
+            if (++spin_count % 1024 == 0) { sched_yield(); if (prog) ray_progress_pump(); }
         }
     }
 

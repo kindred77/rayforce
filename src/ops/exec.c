@@ -3359,17 +3359,18 @@ static bool dag_can_stream(ray_graph_t* g, ray_op_t* root) {
 static ray_t* ray_execute_inner(ray_graph_t* g, ray_op_t* root);
 
 ray_t* ray_execute(ray_graph_t* g, ray_op_t* root) {
-    /* Enable per-worker stats capture in the pool for the duration of a
-     * profiled query.  Span payloads take END-minus-START deltas of the
-     * cumulative counters, so no per-query reset is needed; when profiling
-     * is off the mode is 0 and the pool hooks are no-ops. */
-    ray_qstats_set_mode(g_ray_profile.active ? RAY_QS_PROF : 0);
-    ray_t* r = ray_execute_inner(g, root);
-    /* End the current progress tracking session. A no-op when no
-     * callback is registered; otherwise emits the final "100% done"
-     * tick (only if the bar was actually shown). */
-    ray_progress_end();
-    return r;
+    /* The qstats capture mode is armed once per query at the eval boundary
+     * (ray_eval, eval_depth==0) — covering PROF (profiler/query-log) AND the
+     * PROGRESS bit (progress pump).  Do NOT overwrite it here: a bare
+     * set_mode would drop the PROGRESS bit (killing the pump) and the qlog's
+     * PROF bit on a profiling-off query.  Only OR PROF in defensively, so a
+     * direct ray_execute call outside an eval boundary still profiles. */
+    if (g_ray_profile.active)
+        ray_qstats_set_mode(ray_qstats_mode() | RAY_QS_PROF);
+    /* Progress ends at the eval boundary (the true query end), not here —
+     * a query can drive several ray_execute calls, and ending after each
+     * would reset the elapsed clock and fire premature "final" ticks. */
+    return ray_execute_inner(g, root);
 }
 
 /* Flatten one parted/mapcommon column into a dense vector (mirrors the

@@ -32,6 +32,7 @@
 
 #include "rayforce.h"
 #include "mem/heap.h"
+#include "core/qstats.h"   /* ray_qstats_sum_rows — pool-dispatch pump */
 #include <time.h>
 #include <string.h>
 
@@ -50,6 +51,12 @@ static uint64_t    g_rows_total;
 static uint64_t    g_start_ns;
 static uint64_t    g_last_fire_ns;
 static bool        g_showing;
+
+/* Pool-dispatch pump state (main-thread only).  Each parallel dispatch
+ * baselines the cumulative row counter so it reports its own 0→100%. */
+static uint64_t    g_phase_base;     /* qstats rows_done at dispatch start */
+static uint64_t    g_phase_total;    /* elements this dispatch will process */
+static uint64_t    g_last_pump_ns;   /* throttles the 256-slot sum */
 
 static inline uint64_t mono_ns(void) {
     struct timespec ts;
@@ -146,6 +153,43 @@ void ray_progress_label(const char* op_name, const char* phase) {
     uint64_t since_last = g_last_fire_ns ? (now - g_last_fire_ns) / 1000000ull : g_tick_ms;
     if (since_last < g_tick_ms) return;
     fire(now, false);
+}
+
+/* True iff a progress callback is registered — the single gate the executor
+ * uses to decide whether to arm the qstats PROGRESS bit for a query. */
+bool ray_progress_active(void) {
+    return g_cb != NULL;
+}
+
+/* Begin a parallel dispatch phase: baseline the cumulative row counter and
+ * record this dispatch's total, so the pump reports a fraction of THIS phase
+ * (a multi-phase op shows a fresh 0→100% per phase).  Main-thread only. */
+void ray_progress_dispatch_begin(uint64_t phase_rows_total) {
+    if (!g_cb) return;
+    if (g_start_ns == 0) {
+        g_start_ns = mono_ns();
+        g_last_fire_ns = 0;
+        g_showing = false;
+    }
+    g_phase_base   = ray_qstats_sum_rows();
+    g_phase_total  = phase_rows_total;
+    g_last_pump_ns = 0;
+}
+
+/* Sample worker progress and fire the throttled callback.  Called from the
+ * main thread's dispatch claim-loop and spin-wait.  A cheap coarse-clock
+ * pre-check gates the 256-slot sum, so the sum runs at most once per tick
+ * (and never before the show-delay elapses); workers are untouched. */
+void ray_progress_pump(void) {
+    if (!g_cb || g_start_ns == 0) return;
+    uint64_t now = mono_ns();
+    if ((now - g_start_ns) / 1000000ull < g_min_ms) return;   /* show-delay */
+    uint64_t since = g_last_pump_ns ? (now - g_last_pump_ns) / 1000000ull : g_tick_ms;
+    if (since < g_tick_ms) return;
+    g_last_pump_ns = now;
+    uint64_t sum  = ray_qstats_sum_rows();
+    uint64_t done = sum > g_phase_base ? sum - g_phase_base : 0;
+    ray_progress_update(NULL, NULL, done, g_phase_total);   /* keeps op label */
 }
 
 void ray_progress_end(void) {

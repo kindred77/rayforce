@@ -395,6 +395,19 @@ void ray_progress_label(const char* op_name, const char* phase);
  * "100%" tick if the query ran long enough to have shown the bar. */
 void ray_progress_end(void);
 
+/* True iff a progress callback is registered. The executor gates arming the
+ * qstats PROGRESS bit on this, so all progress plumbing stays zero-cost when
+ * nothing is listening. */
+bool ray_progress_active(void);
+
+/* Pool-dispatch pump (main-thread only). ray_progress_dispatch_begin records a
+ * parallel dispatch's element total and baselines the shared qstats row
+ * counter; ray_progress_pump samples it and fires the throttled callback. The
+ * pool calls these from its claim-loop / spin-wait so every morsel-parallel op
+ * reports progress with no per-kernel changes. Both are no-ops with no callback. */
+void ray_progress_dispatch_begin(uint64_t phase_rows_total);
+void ray_progress_pump(void);
+
 /* ===== COW / Ref Counting API ===== */
 
 void     ray_retain(ray_t* v);
