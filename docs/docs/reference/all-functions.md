@@ -476,6 +476,8 @@ System interaction, metaprogramming, diagnostics, and runtime inspection.
 | `.sys.build` | variadic | — | Build metadata dict with `version` + `build-date` | `(.sys.build)` |
 | `.sys.mem` | variadic | — | Memory allocator statistics (alloc / peak / slab hits) | `(.sys.mem)` |
 | `.sys.prof` | variadic | — | Last profiled query's per-step statistics as a table (opt-in via `:t`) | `(.sys.prof)` |
+| `.sys.querylog` | variadic | — | Ambient per-query statistics ring as a table (opt-in via `-Q` / `.sys.querylog.enable`) | `(.sys.querylog)` |
+| `.sys.querylog.enable` | variadic | restricted | Toggle query-statistics logging; returns new state | `(.sys.querylog.enable 1)` |
 | `.sys.info` | variadic | — | System information (cores, page size, total memory) | `(.sys.info)` |
 
 ```lisp

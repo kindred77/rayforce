@@ -29,6 +29,7 @@
 #include "mem/heap.h"
 #include "mem/sys.h"
 #include "core/profile.h"   /* g_ray_profile — (.sys.prof) */
+#include "core/qlog.h"      /* g_qlog — (.sys.querylog) */
 #include "store/serde.h"
 #include "store/splay.h"
 #include "store/part.h"
@@ -892,6 +893,48 @@ ray_t* ray_prof_fn(ray_t** args, int64_t n) {
     return tbl;
 }
 
+/* (.sys.querylog) — the in-memory query-statistics ring as a table.
+ *
+ * One row per completed query (oldest first), capped at the ring capacity.
+ * Ambient server-side statistics à la ClickHouse's system.query_log: read
+ * back with ordinary queries, no extra protocol.  Each call materializes a
+ * fresh snapshot, so anything a caller does to the returned table (upsert,
+ * delete) touches the copy, never the ring.  Empty until logging is enabled
+ * (`-Q` flag or `(.sys.querylog.enable 1)`).  Columns:
+ *
+ *   time         wall-clock time the query finished (timestamp)
+ *   duration-ms  total wall time
+ *   result-rows  rows in the result (scalar => 1)
+ *   output-kib   serialized result footprint, KiB
+ *   memory-kib   net process allocation across the query, KiB
+ *   workers      worker threads that ran a task
+ *   parallelism  worker busy time / wall time
+ *   status       `ok`, or the error kind on failure
+ *   query        source text (truncated)
+ */
+ray_t* ray_qlog_fn(ray_t** args, int64_t n) {
+    (void)args;
+    if (n != 0) return ray_error("domain", ".sys.querylog takes no arguments");
+    return ray_qlog_table();
+}
+
+/* (.sys.querylog.enable [flag]) — toggle query-statistics logging.  No arg
+ * flips the current state; 0 disables; non-zero enables.  Returns the new
+ * state as i64 (0/1).  Restricted: it changes server-wide behaviour. */
+ray_t* ray_qlog_enable_fn(ray_t** args, int64_t n) {
+    bool on;
+    if (n == 0) {
+        on = !ray_qlog_enabled();
+    } else if (n == 1) {
+        if (args[0]->type != -RAY_I64) return ray_error("type", "flag must be i64");
+        on = args[0]->i64 != 0;
+    } else {
+        return ray_error("domain", ".sys.querylog.enable takes 0 or 1 arguments");
+    }
+    ray_qlog_set_enabled(on);
+    return make_i64(on ? 1 : 0);
+}
+
 ray_t* ray_sysinfo_fn(ray_t** args, int64_t n) {
     (void)args; (void)n;
     ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 3);
@@ -934,7 +977,7 @@ ray_t* ray_build_sys_args(int argc, char** argv) {
     const char* file = "";
     const char* log  = "";
     int64_t port = 0, cores = 0;
-    bool timeit = false, interactive = false;
+    bool timeit = false, interactive = false, querylog = false;
     int user_start = -1;
 
     for (int i = 1; i < argc; i++) {
@@ -948,6 +991,8 @@ ray_t* ray_build_sys_args(int argc, char** argv) {
         }
         else if ((strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--timeit") == 0) && i + 1 < argc)
             timeit = (atoll(argv[++i]) != 0);
+        else if ((strcmp(argv[i], "-Q") == 0 || strcmp(argv[i], "--querylog") == 0) && i + 1 < argc)
+            querylog = (atoll(argv[++i]) != 0);
         else if ((strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0) && i + 1 < argc)
             file = argv[++i];
         else if (strcmp(argv[i], "-u") == 0 && i + 1 < argc) i++;   /* skip secret */
@@ -987,9 +1032,9 @@ ray_t* ray_build_sys_args(int argc, char** argv) {
         }
     }
 
-    /* top-level dict: 7 entries (file, port, cores, timeit, interactive, log, user) */
-    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 7);
-    ray_t* vals = ray_list_new(7);
+    /* top-level dict: 8 entries (file, port, cores, timeit, querylog, interactive, log, user) */
+    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 8);
+    ray_t* vals = ray_list_new(8);
 
     int64_t k;
     ray_t* v;
@@ -1001,6 +1046,8 @@ ray_t* ray_build_sys_args(int argc, char** argv) {
     v = ray_i64(cores);                   vals = ray_list_append(vals, v); ray_release(v);
     k = ray_sym_intern("timeit", 6);      keys = ray_vec_append(keys, &k);
     v = ray_bool(timeit);                 vals = ray_list_append(vals, v); ray_release(v);
+    k = ray_sym_intern("querylog", 8);    keys = ray_vec_append(keys, &k);
+    v = ray_bool(querylog);               vals = ray_list_append(vals, v); ray_release(v);
     k = ray_sym_intern("interactive", 11);keys = ray_vec_append(keys, &k);
     v = ray_bool(interactive);            vals = ray_list_append(vals, v); ray_release(v);
     k = ray_sym_intern("log", 3);         keys = ray_vec_append(keys, &k);

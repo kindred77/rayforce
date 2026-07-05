@@ -42,6 +42,7 @@
 #include "mem/heap.h"
 #include "ops/ops.h"
 #include "core/profile.h"
+#include "core/qlog.h"
 #include "table/sym.h"
 #include <inttypes.h>
 #include <stdio.h>
@@ -741,6 +742,11 @@ static void eval_and_print(ray_term_t* term, const char* input,
         ray_profile_span_start("top-level");
     }
 
+    /* Query-statistics ring: bracket the whole parse+eval+materialize so the
+     * logged duration is the time to answer the query.  No-op when disabled. */
+    ray_qlog_ctx_t qc;
+    ray_qlog_begin(&qc);
+
     ray_term_clear_interrupt();
     ray_eval_clear_interrupt();
     if (term) ray_term_eval_begin(term);
@@ -782,6 +788,8 @@ static void eval_and_print(ray_term_t* term, const char* input,
     if (profiling) {
         ray_profile_span_end("top-level");
     }
+
+    ray_qlog_end(&qc, input, strlen(input), result);
 
     if (ray_term_interrupted()) {
         ray_term_clear_interrupt();

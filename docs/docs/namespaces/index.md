@@ -17,7 +17,7 @@ Rayfall's builtins are organised under dotted namespaces. Names beginning with `
 | [`.log.*`](log.md) | Write-ahead log: open, write, sync, snapshot, roll, replay, validate. |
 | [`.os.*`](os.md) | Process environment: `getenv`, `setenv`. |
 | [`.repl.*`](repl.md) | Interactive REPL control — attach the local REPL to a remote server. |
-| [`.sys.*`](sys.md) | System info and shell-style commands: build, info, mem, prof, gc, exec, listen, timeit, env, cmd. |
+| [`.sys.*`](sys.md) | System info and shell-style commands: build, info, mem, prof, querylog, gc, exec, listen, timeit, env, cmd. |
 | [`.time.*`](time.md) | Monotonic clock and timer scheduler. |
 
 ## Restricted-mode summary
@@ -30,7 +30,7 @@ When the server is started with `-U <password>`, the following dotted builtins a
 - `.log.open`, `.log.replay`, `.log.roll`, `.log.snapshot`, `.log.close`, `.log.purge`
 - `.os.getenv`, `.os.setenv`
 - `.repl.connect`, `.repl.disconnect`
-- `.sys.exec`, `.sys.cmd`, `.sys.listen`
+- `.sys.exec`, `.sys.cmd`, `.sys.listen`, `.sys.querylog.enable`
 - `.time.timer.set`, `.time.timer.del`
 
-`.attr.*`, `.col.*`, `.graph.*`, `.idx.*`, and pure read/inspect builtins (`.db.splayed.get`, `.db.parted.get`, `.db.parted.tables`, `.fs.size`, `.fs.list`, `.log.write`, `.log.sync`, `.log.validate`, `.sys.build`, `.sys.info`, `.sys.mem`, `.sys.prof`, `.sys.gc`, `.sys.env`, `.sys.args`, `.sys.timeit`, `.ipc.handle`, `.time.now`) are always available.
+`.attr.*`, `.col.*`, `.graph.*`, `.idx.*`, and pure read/inspect builtins (`.db.splayed.get`, `.db.parted.get`, `.db.parted.tables`, `.fs.size`, `.fs.list`, `.log.write`, `.log.sync`, `.log.validate`, `.sys.build`, `.sys.info`, `.sys.mem`, `.sys.prof`, `.sys.querylog`, `.sys.gc`, `.sys.env`, `.sys.args`, `.sys.timeit`, `.ipc.handle`, `.time.now`) are always available.

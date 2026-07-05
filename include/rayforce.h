@@ -414,6 +414,10 @@ ray_t* ray_sym(int64_t id);
 ray_t* ray_date(int64_t val);
 ray_t* ray_time(int64_t val);
 ray_t* ray_timestamp(int64_t val);
+/* Current UTC wall-clock time as a RAY_TIMESTAMP value (ns since 2000-01-01).
+ * Shared "now as a timestamp" primitive — the single owner of the epoch
+ * conversion; callers must not re-derive it. */
+int64_t ray_timestamp_now_ns(void);
 ray_t* ray_guid(const uint8_t* bytes);
 ray_t* ray_typed_null(int8_t type);
 

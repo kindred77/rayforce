@@ -644,6 +644,13 @@ static time_t ray_epoch_offset(void) {
     return (time_t)946684800;
 }
 
+/* Current UTC wall-clock as a RAY_TIMESTAMP value (ns since 2000-01-01).
+ * The one place the epoch conversion lives; internal callers (query log, …)
+ * reuse it rather than re-deriving the offset. */
+int64_t ray_timestamp_now_ns(void) {
+    return ((int64_t)time(NULL) - (int64_t)ray_epoch_offset()) * 1000000000LL;
+}
+
 /* (date 'local) or (date 'global) — returns current date as DATE atom.
  * Overloaded: if arg is a DATE / TIME / TIMESTAMP value or vector,
  * returns `arg` truncated to the day boundary (RAY_TIMESTAMP result).
@@ -702,16 +709,12 @@ ray_t* ray_timestamp_clock_fn(ray_t* arg) {
     struct tm* t = local ? localtime(&now) : gmtime(&now);
     if (!t) return ray_error("domain", "timestamp: failed to get current time");
 
-    int64_t secs;
-    if (!local) {
-        secs = now - ray_epoch_offset();
-    } else {
-        /* For local, compute offset from rayforce epoch in local terms */
-        struct tm lt = *t;
-        lt.tm_isdst = -1;
-        secs = mktime(&lt) - ray_epoch_offset();
-    }
+    if (!local)
+        return ray_timestamp(ray_timestamp_now_ns());
 
-    int64_t nanos = secs * 1000000000LL;
-    return ray_timestamp(nanos);
+    /* For local, compute offset from rayforce epoch in local terms */
+    struct tm lt = *t;
+    lt.tm_isdst = -1;
+    int64_t secs = mktime(&lt) - ray_epoch_offset();
+    return ray_timestamp(secs * 1000000000LL);
 }

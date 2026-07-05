@@ -52,6 +52,8 @@
 
 #include "core/runtime.h"
 #include "lang/eval.h"
+#include "lang/format.h"   /* ray_fmt — query text for the stats log */
+#include "core/qlog.h"     /* query-statistics ring */
 #include "lang/env.h"
 #include "lang/internal.h"
 #include "table/sym.h"
@@ -473,7 +475,33 @@ static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
         }
     }
 
+    /* Query-statistics ring: bracket the eval so the server records one
+     * summary row per handled query.  No-op when logging is disabled. */
+    ray_qlog_ctx_t qc;
+    ray_qlog_begin(&qc);
+
     ray_t* msg = deser_frame(payload, payload_len, hdr->flags);
+
+    /* Capture the query source for the log before `msg` is released during
+     * dispatch: a string payload is the text verbatim; any other expression
+     * is formatted back to source.  Only when logging is on. */
+    char   qsrc[RAY_QLOG_QUERY_MAX];
+    size_t qsrc_len = 0;
+    if (qc.t0_ns && msg && !RAY_IS_ERR(msg)) {
+        if (msg->type == -RAY_STR) {
+            qsrc_len = ray_str_len(msg);
+            if (qsrc_len > sizeof(qsrc)) qsrc_len = sizeof(qsrc);
+            memcpy(qsrc, ray_str_ptr(msg), qsrc_len);
+        } else {
+            ray_t* s = ray_fmt(msg, 0);
+            if (s && !RAY_IS_ERR(s)) {
+                qsrc_len = ray_str_len(s);
+                if (qsrc_len > sizeof(qsrc)) qsrc_len = sizeof(qsrc);
+                memcpy(qsrc, ray_str_ptr(s), qsrc_len);
+            }
+            if (s) ray_release(s);
+        }
+    }
 
     ray_t* result = NULL;
     if (msg && !RAY_IS_ERR(msg)) {
@@ -525,6 +553,8 @@ static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
      * client blocks forever waiting for a reply (issue #285). */
     if (result && ray_is_lazy(result))
         result = ray_lazy_materialize(result);  /* consumes the retain */
+
+    ray_qlog_end(&qc, qsrc, qsrc_len, result);
     return result ? result : RAY_NULL_OBJ;
 }
 

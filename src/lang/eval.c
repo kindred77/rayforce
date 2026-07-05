@@ -38,6 +38,7 @@
 #include "vec/vec.h"            /* ray_check_null_invariant (DEBUG null-model gate) */
 #include "core/profile.h"
 #include "core/qstats.h"   /* per-worker parallelism counters for eval-path spans */
+#include "core/qlog.h"     /* ray_qlog_enabled — arm capture for query logging */
 #include "store/serde.h"   /* ray_serde_size — result footprint for spans */
 #include "table/sym.h"
 #include "mem/heap.h"
@@ -3258,6 +3259,8 @@ static void ray_register_builtins(void) {
     register_vary(".sys.build", RAY_FN_NONE, ray_internals_fn);
     register_vary(".sys.mem",   RAY_FN_NONE, ray_memstat_fn);
     register_vary(".sys.prof",  RAY_FN_NONE, ray_prof_fn);
+    register_vary(".sys.querylog",        RAY_FN_NONE,       ray_qlog_fn);
+    register_vary(".sys.querylog.enable", RAY_FN_RESTRICTED, ray_qlog_enable_fn);
     register_vary("modify",     RAY_FN_RESTRICTED, ray_modify_fn);
     register_vary("pivot",      RAY_FN_NONE, ray_pivot_fn);
     register_vary(".sys.info",  RAY_FN_NONE, ray_sysinfo_fn);
@@ -3406,8 +3409,20 @@ ray_t* ray_eval(ray_t* obj) {
     if (RAY_UNLIKELY(!__VM))
         return ray_error("state", "no VM bound to this thread");
 
-    if (__VM->eval_depth == 0)
+    if (__VM->eval_depth == 0) {
         affine_sum_cache_clear();
+        /* Scope the parallelism counters to THIS top-level query.  The
+         * slots are process-cumulative otherwise, so a serial op would
+         * inherit the worker count of whatever ran before it (e.g. table
+         * construction), reading as "28 workers, 0 busy".  Resetting at the
+         * query boundary — and setting PROF mode here rather than only in
+         * ray_execute — also means non-DAG paths (the select special form,
+         * direct builtins) get their pool dispatches measured, and keeps
+         * capture strictly off (mode 0) when the profiler is disabled. */
+        bool capture = g_ray_profile.active || ray_qlog_enabled();
+        ray_qstats_set_mode(capture ? RAY_QS_PROF : 0);
+        if (capture) ray_qstats_reset(0);
+    }
 
     /* Check for external interrupt (e.g. Ctrl-C from REPL) */
     if (g_eval_interrupted) return ray_error("limit", "interrupted");
