@@ -26,6 +26,7 @@
 #include "core/ipc.h"
 #include "core/pool.h"
 #include "core/profile.h"
+#include "core/crash.h"
 #include "app/repl.h"
 #include "core/runtime.h"
 #include "store/journal.h"
@@ -40,6 +41,10 @@
 #include <unistd.h>
 
 int main(int argc, char** argv) {
+    /* Install the fatal-signal handler first: a crash during startup
+     * should still produce a symbolized backtrace.  Handles the fault
+     * signals only; term.c owns the graceful-shutdown set. */
+    ray_crash_install();
     ray_expr_stats_init();
     ray_idx_stats_init();
     ray_runtime_t* rt = ray_runtime_create(argc, argv);

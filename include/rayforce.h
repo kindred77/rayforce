@@ -209,7 +209,11 @@ extern ray_t __ray_null;
  * value-null is always RAY_NULL_OBJ. Assert that invariant in debug/ASan builds;
  * compile to nothing in release. Placed BEFORE any null test that may deref,
  * because RAY_ATOM_IS_NULL/ray_atom_is_null_fn deref x->type on non-singleton input. */
-#ifdef DEBUG
+/* Kept live in the hardened cloud tier too (not just DEBUG): the check is a
+ * single pointer compare, and a stray C NULL in a value position is exactly
+ * the class of corruption that must fail fast — routed through the crash
+ * handler's SIGABRT backtrace — rather than segfault deep in a kernel. */
+#if defined(DEBUG) || defined(RAY_HARDENED)
 #define RAY_ASSERT_VALUE(x) assert((x) != NULL && "value-null must be RAY_NULL_OBJ, not C NULL")
 #else
 #define RAY_ASSERT_VALUE(x) ((void)0)

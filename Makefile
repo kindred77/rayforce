@@ -235,6 +235,21 @@ tsan-test: $(TSAN_LIB_OBJ) $(TSAN_TEST_OBJ)
 	$(CLANG) $(TSAN_CFLAGS) -o $(TARGET).test.tsan $(TSAN_LIB_OBJ) $(TSAN_TEST_OBJ) $(LIBS) $(TSAN_LDFLAGS) -Itest
 	RAYFORCE_CORES=$(TSAN_CORES) $(TSAN_ENV) ./$(TARGET).test.tsan $(if $(TSAN_FILTER),-f $(TSAN_FILTER),)
 
+# ─── Hardened cloud tier ────────────────────────────────────────────
+# The build flavour shipped to the cloud: release optimisation and the
+# same FP-reassociation flags as `release` (so the two never diverge
+# numerically), but keeps debug symbols and frame pointers for reliable
+# crash backtraces (~1% cost) and defines RAY_HARDENED, which promotes
+# the cheap invariant checks that a plain release strips.  The fatal-
+# signal handler (src/core/crash.c) is compiled into every flavour and
+# installed unconditionally from main().
+# -rdynamic exports the dynamic symbol table so backtrace_symbols_fd in the
+# crash handler resolves function NAMES (not just module+offset) in a
+# production trace.  Worth the slightly larger symbol table for a cloud
+# binary whose crashes must be diagnosable from logs alone.
+hardened: $(HARD_LIB_OBJ) $(HARD_MAIN_OBJ)
+	$(CC) $(HARDENED_CFLAGS) -o $(TARGET) $(HARD_LIB_OBJ) $(HARD_MAIN_OBJ) $(LIBS) $(RELEASE_LDFLAGS) -rdynamic
+
 # Coverage report.  Builds both binaries with clang source-based
 # instrumentation, runs the test suite (writing one .profraw per
 # process — the test binary AND every IPC server it spawns —
@@ -380,7 +395,7 @@ clean:
 	-rm -f cov-*.profraw default.profraw coverage.profdata
 	-rm -rf coverage_html
 
-.PHONY: default debug release lib dist test coverage compdb tsan tsan-test fuzz-smoke clean
+.PHONY: default debug release lib dist test coverage compdb tsan tsan-test hardened fuzz-smoke tidy cppcheck clean
 
 # Header dependencies last: .d fragments only add prerequisites to the
 # object targets above, and being last they can't hijack the default goal.
