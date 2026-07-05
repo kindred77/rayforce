@@ -117,6 +117,8 @@ char* ray_sys_strdup(const char* s) {
 }
 
 void ray_sys_get_stat(int64_t* out_current, int64_t* out_peak) {
-    *out_current = atomic_load_explicit(&g_sys_current, memory_order_relaxed);
-    *out_peak    = atomic_load_explicit(&g_sys_peak, memory_order_relaxed);
+    if (out_current)
+        *out_current = atomic_load_explicit(&g_sys_current, memory_order_relaxed);
+    if (out_peak)
+        *out_peak = atomic_load_explicit(&g_sys_peak, memory_order_relaxed);
 }

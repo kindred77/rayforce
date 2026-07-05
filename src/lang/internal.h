@@ -554,6 +554,7 @@ ray_t* ray_time_timer_del_fn (ray_t*  id);
 ray_t* ray_env_fn(ray_t* x);
 ray_t* ray_internals_fn(ray_t** args, int64_t n);
 ray_t* ray_memstat_fn(ray_t** args, int64_t n);
+ray_t* ray_prof_fn(ray_t** args, int64_t n);
 ray_t* ray_sysinfo_fn(ray_t** args, int64_t n);
 ray_t* ray_sys_args_fn(ray_t** args, int64_t n);
 ray_t* ray_ser_fn(ray_t* val);

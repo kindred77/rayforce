@@ -226,9 +226,29 @@ static int32_t profile_print_tree(int32_t idx, int32_t indent) {
             idx++;
             idx = profile_print_tree(idx, indent + 1);
             if (idx < g_ray_profile.n) {
-                double ms = (double)(g_ray_profile.spans[idx].ts - sp->ts) / 1e6;
+                ray_prof_span_t* ep = &g_ray_profile.spans[idx];
+                double ms = (double)(ep->ts - sp->ts) / 1e6;
                 for (int32_t i = 0; i < indent; i++) fprintf(stdout, "\xe2\x94\x82 ");
-                fprintf(stdout, "\xe2\x95\xb0\xe2\x94\x80\xe2\x94\xa4 %.3f ms\n", ms);
+                fprintf(stdout, "\xe2\x95\xb0\xe2\x94\x80\xe2\x94\xa4 %.3f ms", ms);
+                /* Append the captured per-operator payload: result rows and
+                 * footprint, net allocation, and parallelism (worker count and
+                 * effective parallelism = worker busy time / wall time). Only
+                 * heavy operators carry a payload; phase spans stay bare. */
+                int64_t dmem = ep->sys_cur - sp->sys_cur;
+                if (ep->rows_out > 0 || ep->qs_workers > 0 || dmem != 0) {
+                    fprintf(stdout, "  rows=%lld", (long long)ep->rows_out);
+                    if (ep->bytes_out > 0)
+                        fprintf(stdout, " out=%.1fKB", (double)ep->bytes_out / 1024.0);
+                    if (dmem != 0)
+                        fprintf(stdout, " mem=%+.1fKB", (double)dmem / 1024.0);
+                    if (ep->qs_workers > 0) {
+                        int64_t wall = ep->ts - sp->ts;
+                        double  par  = wall > 0
+                            ? (double)(ep->qs_busy_ns - sp->qs_busy_ns) / (double)wall : 0.0;
+                        fprintf(stdout, " w=%u par=%.1fx", ep->qs_workers, par);
+                    }
+                }
+                fprintf(stdout, "\n");
                 idx++;
             }
             break;
@@ -685,6 +705,7 @@ static void eval_and_print(ray_term_t* term, const char* input,
     bool profiling = timeit && g_ray_profile.active;
 
     if (profiling) {
+        ray_profile_snapshot();
         ray_profile_reset();
         ray_profile_span_start("top-level");
     }
@@ -1210,6 +1231,7 @@ int ray_repl_run_file(const char* path) {
     bool profiling = g_ray_profile.active;
 
     if (profiling) {
+        ray_profile_snapshot();
         ray_profile_reset();
         ray_profile_span_start("top-level");
     }

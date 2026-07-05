@@ -28,6 +28,7 @@
 #include "ops/ops.h"    /* ray_is_lazy, ray_lazy_materialize */
 #include "mem/heap.h"
 #include "mem/sys.h"
+#include "core/profile.h"   /* g_ray_profile — (.sys.prof) */
 #include "store/serde.h"
 #include "store/splay.h"
 #include "store/part.h"
@@ -738,6 +739,127 @@ ray_t* ray_memstat_fn(ray_t** args, int64_t n) {
     }
 
     return ray_dict_new(keys, vals);
+}
+
+/* (.sys.prof) — materialize the last profiled query's span log as a table.
+ *
+ * One row per completed operator span (START/END pair) and per phase tick
+ * (parse / eval / materialize / optimizer passes), in completion order.
+ * Columns:
+ *   op        the span label (symbol)
+ *   depth     nesting depth (0 = top level)
+ *   dur_us    wall-clock microseconds
+ *   rows      result element/row count (operator spans)
+ *   kb_out    result serialized footprint, KiB (operator spans)
+ *   alloc_kb  net process bytes allocated across the span, KiB
+ *   workers   worker threads that ran a task for this span
+ *   busy_ms   summed worker busy time, ms (parallelism)
+ *   par_eff   effective parallelism = busy time / wall time
+ *
+ * Because it returns an ordinary table, an IPC client gets the profile
+ * with no protocol work.  Empty (0 rows) when the profiler is inactive or
+ * no query has run.  Profiling is toggled with `:t` / the `-t` flag.
+ */
+ray_t* ray_prof_fn(ray_t** args, int64_t n) {
+    (void)args; (void)n;
+
+    /* Read the snapshot of the last completed query — NOT the in-flight
+     * buffer, which currently holds this `(.sys.prof)` call's own spans.
+     * The snapshot is taken at each eval boundary (ray_profile_snapshot),
+     * so it holds the fully-materialized query that ran just before. */
+    const ray_profile_t* p = &g_ray_profile_last;
+    int32_t ns = p->n;
+
+    /* Count output rows: one per END and per TICK span. */
+    int64_t nrows = 0;
+    for (int32_t i = 0; i < ns; i++)
+        if (p->spans[i].type != RAY_PROF_SPAN_START) nrows++;
+
+    ray_t* c_op    = ray_vec_new(RAY_SYM, nrows);
+    ray_t* c_depth = ray_vec_new(RAY_I64, nrows);
+    ray_t* c_dur   = ray_vec_new(RAY_F64, nrows);
+    ray_t* c_rows  = ray_vec_new(RAY_I64, nrows);
+    ray_t* c_kb    = ray_vec_new(RAY_F64, nrows);
+    ray_t* c_alloc = ray_vec_new(RAY_F64, nrows);
+    ray_t* c_wrk   = ray_vec_new(RAY_I64, nrows);
+    ray_t* c_busy  = ray_vec_new(RAY_F64, nrows);
+    ray_t* c_par   = ray_vec_new(RAY_F64, nrows);
+    ray_t* cols[] = { c_op, c_depth, c_dur, c_rows, c_kb, c_alloc, c_wrk, c_busy, c_par };
+    for (size_t i = 0; i < sizeof(cols)/sizeof(cols[0]); i++)
+        if (!cols[i] || RAY_IS_ERR(cols[i])) {
+            for (size_t j = 0; j < sizeof(cols)/sizeof(cols[0]); j++)
+                if (cols[j] && !RAY_IS_ERR(cols[j])) ray_release(cols[j]);
+            return ray_error("oom", "sys.prof: column alloc");
+        }
+
+    int64_t* op_ids  = (int64_t*)ray_data(c_op);
+    int64_t* depths  = (int64_t*)ray_data(c_depth);
+    double*  durs    = (double*)ray_data(c_dur);
+    int64_t* rows    = (int64_t*)ray_data(c_rows);
+    double*  kbs     = (double*)ray_data(c_kb);
+    double*  allocs  = (double*)ray_data(c_alloc);
+    int64_t* wrks    = (int64_t*)ray_data(c_wrk);
+    double*  busys   = (double*)ray_data(c_busy);
+    double*  pars    = (double*)ray_data(c_par);
+
+    /* Walk the flat span log, pairing START/END via a depth stack. */
+    int32_t stack[256];
+    int32_t sp = 0;
+    int64_t prev_ts = ns > 0 ? p->spans[0].ts : 0;
+    int64_t r = 0;
+    for (int32_t i = 0; i < ns; i++) {
+        const ray_prof_span_t* s = &p->spans[i];
+        if (s->type == RAY_PROF_SPAN_START) {
+            if (sp < 256) stack[sp] = i;
+            sp++;
+        } else if (s->type == RAY_PROF_SPAN_END) {
+            if (sp > 0) sp--;
+            const ray_prof_span_t* st = (sp < 256 && sp >= 0) ? &p->spans[stack[sp]] : s;
+            int64_t wall = s->ts - st->ts;
+            int64_t busy = (int64_t)(s->qs_busy_ns - st->qs_busy_ns);
+            const char* nm = s->msg ? s->msg : "?";
+            op_ids[r] = ray_sym_intern(nm, strlen(nm));
+            depths[r] = sp;
+            durs[r]   = (double)wall / 1000.0;
+            rows[r]   = s->rows_out;
+            kbs[r]    = (double)s->bytes_out / 1024.0;
+            allocs[r] = (double)(s->sys_cur - st->sys_cur) / 1024.0;
+            wrks[r]   = (int64_t)s->qs_workers;
+            busys[r]  = (double)busy / 1e6;
+            pars[r]   = wall > 0 ? (double)busy / (double)wall : 0.0;
+            r++;
+        } else { /* TICK */
+            const char* nm = s->msg ? s->msg : "?";
+            op_ids[r] = ray_sym_intern(nm, strlen(nm));
+            depths[r] = sp;
+            durs[r]   = (double)(s->ts - prev_ts) / 1000.0;
+            rows[r]   = 0; kbs[r] = 0.0; allocs[r] = 0.0;
+            wrks[r]   = 0; busys[r] = 0.0; pars[r] = 0.0;
+            r++;
+        }
+        prev_ts = s->ts;
+    }
+
+    /* ray_vec_new allocates capacity but leaves len at 0; publish the
+     * filled row count on every column. */
+    for (size_t i = 0; i < sizeof(cols)/sizeof(cols[0]); i++)
+        cols[i]->len = r;
+
+    /* Assemble the table. */
+    static const char* names[] = { "op","depth","dur_us","rows","kb_out",
+                                   "alloc_kb","workers","busy_ms","par_eff" };
+    ray_t* tbl = ray_table_new(9);
+    if (!tbl || RAY_IS_ERR(tbl)) {
+        for (size_t i = 0; i < sizeof(cols)/sizeof(cols[0]); i++) ray_release(cols[i]);
+        return tbl ? tbl : ray_error("oom", "sys.prof: table");
+    }
+    for (size_t i = 0; i < sizeof(cols)/sizeof(cols[0]); i++) {
+        int64_t nid = ray_sym_intern(names[i], strlen(names[i]));
+        tbl = ray_table_add_col(tbl, nid, cols[i]);
+        ray_release(cols[i]);
+        if (RAY_IS_ERR(tbl)) return tbl;
+    }
+    return tbl;
 }
 
 ray_t* ray_sysinfo_fn(ray_t** args, int64_t n) {

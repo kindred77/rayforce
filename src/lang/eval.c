@@ -3254,6 +3254,7 @@ static void ray_register_builtins(void) {
     register_vary("del",          RAY_FN_SPECIAL_FORM | RAY_FN_RESTRICTED, ray_del_fn);
     register_vary(".sys.build", RAY_FN_NONE, ray_internals_fn);
     register_vary(".sys.mem",   RAY_FN_NONE, ray_memstat_fn);
+    register_vary(".sys.prof",  RAY_FN_NONE, ray_prof_fn);
     register_vary("modify",     RAY_FN_RESTRICTED, ray_modify_fn);
     register_vary("pivot",      RAY_FN_NONE, ray_pivot_fn);
     register_vary(".sys.info",  RAY_FN_NONE, ray_sysinfo_fn);

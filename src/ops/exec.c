@@ -29,10 +29,13 @@
 #include "ops/idxop.h"
 #include "mem/heap.h"
 #include "mem/sys.h"
+#include "core/qstats.h"   /* per-worker parallelism stats for profile spans */
+#include "store/serde.h"   /* ray_serde_size — result footprint for spans */
 #include "core/runtime.h"  /* __VM — filter-compaction projection keep-set */
 
 /* Global profiler instance (zero-initialized = inactive) */
 ray_profile_t g_ray_profile;
+ray_profile_t g_ray_profile_last;
 
 /* --------------------------------------------------------------------------
  * Materialize a MAPCOMMON column into a flat RAY_SYM vector.
@@ -1529,13 +1532,40 @@ ray_t* exec_node(ray_graph_t* g, ray_op_t* op) {
          * don't get a spinner-style indeterminate bar until they
          * either finish or emit their own update. */
         ray_progress_label(oname, NULL);
-        if (profiling) ray_profile_span_start(oname);
+        if (profiling) {
+            ray_prof_span_t* sp = ray_profile_span_start(oname);
+            if (sp) {
+                int64_t cur = 0; ray_sys_get_stat(&cur, NULL);
+                sp->sys_cur    = cur;
+                sp->qs_rows    = ray_qstats_sum_rows();
+                uint64_t sum = 0, mx = 0; uint32_t used = 0;
+                ray_qstats_agg(&used, &sum, &mx);
+                sp->qs_busy_ns = sum;
+            }
+        }
     }
 
     ray_t* _prof_result = exec_node_inner(g, op);
 
-    if (profiling)
-        ray_profile_span_end(oname);
+    if (profiling) {
+        ray_prof_span_t* ep = ray_profile_span_end(oname);
+        if (ep) {
+            int64_t cur = 0; ray_sys_get_stat(&cur, NULL);
+            ep->sys_cur = cur;
+            ep->qs_rows = ray_qstats_sum_rows();
+            uint64_t sum = 0, mx = 0; uint32_t used = 0;
+            ray_qstats_agg(&used, &sum, &mx);
+            ep->qs_busy_ns = sum;
+            ep->qs_workers = used;
+            /* Result footprint — rows and serialized byte size, a proxy for
+             * the bandwidth this operator produced. */
+            if (_prof_result && !RAY_IS_ERR(_prof_result)) {
+                ep->rows_out  = (_prof_result->type == RAY_TABLE)
+                    ? ray_table_nrows(_prof_result) : (int64_t)ray_len(_prof_result);
+                ep->bytes_out = ray_serde_size(_prof_result);
+            }
+        }
+    }
 
     return _prof_result;
 }
@@ -3301,6 +3331,11 @@ static bool dag_can_stream(ray_graph_t* g, ray_op_t* root) {
 static ray_t* ray_execute_inner(ray_graph_t* g, ray_op_t* root);
 
 ray_t* ray_execute(ray_graph_t* g, ray_op_t* root) {
+    /* Enable per-worker stats capture in the pool for the duration of a
+     * profiled query.  Span payloads take END-minus-START deltas of the
+     * cumulative counters, so no per-query reset is needed; when profiling
+     * is off the mode is 0 and the pool hooks are no-ops. */
+    ray_qstats_set_mode(g_ray_profile.active ? RAY_QS_PROF : 0);
     ray_t* r = ray_execute_inner(g, root);
     /* End the current progress tracking session. A no-op when no
      * callback is registered; otherwise emits the final "100% done"

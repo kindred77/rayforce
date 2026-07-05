@@ -23,12 +23,17 @@
 
 #include "core/pool.h"
 #include "core/platform.h"   /* RAY_CPU_RELAX */
+#include "core/qstats.h"     /* per-worker query-stats slab */
 #include "mem/cow.h"
 #include "mem/heap.h"
 #include "mem/sys.h"
 #include <string.h>
 #include <stdlib.h>
 #include <sched.h>
+
+/* Per-worker query-statistics slab (see core/qstats.h).  Zero-initialised;
+ * disabled (mode == 0) until a profiling/progress consumer turns it on. */
+ray_qstats_t g_qstats;
 
 /* Task granularity: RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS elements per task */
 #define TASK_GRAIN  ((int64_t)RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS)
@@ -95,7 +100,9 @@ static void worker_loop(void* arg) {
             }
 
             ray_pool_task_t* t = &pool->tasks[idx & (pool->task_cap - 1)];
+            int64_t _qs_t0; uint32_t _qs_m = ray_qstats_task_begin(&_qs_t0);
             t->fn(t->ctx, wctx.worker_id, t->start, t->end);
+            ray_qstats_task_end(_qs_m, wctx.worker_id, t->end - t->start, _qs_t0);
 
             atomic_fetch_sub_explicit(&pool->pending, 1,
                                       memory_order_acq_rel);
@@ -327,7 +334,9 @@ void ray_pool_dispatch(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
             }
 
             ray_pool_task_t* t = &pool->tasks[idx & (pool->task_cap - 1)];
+            int64_t _qs_t0; uint32_t _qs_m = ray_qstats_task_begin(&_qs_t0);
             t->fn(t->ctx, 0, t->start, t->end);
+            ray_qstats_task_end(_qs_m, 0, t->end - t->start, _qs_t0);
 
             atomic_fetch_sub_explicit(&pool->pending, 1, memory_order_acq_rel);
         }
@@ -414,7 +423,9 @@ void ray_pool_dispatch_n(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
             }
 
             ray_pool_task_t* t = &pool->tasks[idx & (pool->task_cap - 1)];
+            int64_t _qs_t0; uint32_t _qs_m = ray_qstats_task_begin(&_qs_t0);
             t->fn(t->ctx, 0, t->start, t->end);
+            ray_qstats_task_end(_qs_m, 0, t->end - t->start, _qs_t0);
 
             atomic_fetch_sub_explicit(&pool->pending, 1, memory_order_acq_rel);
         }

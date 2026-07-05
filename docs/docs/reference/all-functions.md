@@ -15,7 +15,7 @@
 | [Sorting & Ordering](#sorting) (10) | [Control Flow & Special Forms](#control) (11) | [Table Operations](#table-ops) (14) |
 | [Query](#query) (4) | [Joins](#joins) (6) | [Pivot](#pivot) (1) |
 | [String](#string-ops) (4) | [Temporal](#temporal) (3) | [Type & Introspection](#type-ops) (5) |
-| [I/O & Output](#io) (12) | [System & Utility](#system) (14) | [Serialization](#serialization) (2) |
+| [I/O & Output](#io) (12) | [System & Utility](#system) (15) | [Serialization](#serialization) (2) |
 | [Storage](#storage) (5) | [IPC](#ipc) (9) | [EAV Triple Store](#eav) (5) |
 | [Datalog](#datalog) (2) | [Datalog Program API](#datalog-program) (6) | |
 
@@ -475,6 +475,7 @@ System interaction, metaprogramming, diagnostics, and runtime inspection.
 | `.time.timer.del` | unary | restricted | Cancel a scheduled timer by id; returns null | `(.time.timer.del 0)` |
 | `.sys.build` | variadic | — | Build metadata dict with `version` + `build-date` | `(.sys.build)` |
 | `.sys.mem` | variadic | — | Memory allocator statistics (alloc / peak / slab hits) | `(.sys.mem)` |
+| `.sys.prof` | variadic | — | Last profiled query's per-step statistics as a table (opt-in via `:t`) | `(.sys.prof)` |
 | `.sys.info` | variadic | — | System information (cores, page size, total memory) | `(.sys.info)` |
 
 ```lisp

@@ -3,7 +3,7 @@
 Process-level introspection (build, memory, host info) and command-style operations (shell-out, profiler toggle, IPC listener bind, env dump, GC trigger). The dotted `.sys.<name>` builtins are the typed entry points; `.sys.cmd` parses a colon-style command string and dispatches to the same handlers — used by the REPL's `:listen 5000` style commands.
 
 !!! note "Restricted under `-U`"
-    `.sys.exec`, `.sys.cmd`, and `.sys.listen` are `RAY_FN_RESTRICTED` — they can either run arbitrary shell commands or change the process's network surface. The introspection entries (`.sys.args`, `.sys.build`, `.sys.info`, `.sys.mem`, `.sys.gc`, `.sys.env`, `.sys.timeit`) are unrestricted.
+    `.sys.exec`, `.sys.cmd`, and `.sys.listen` are `RAY_FN_RESTRICTED` — they can either run arbitrary shell commands or change the process's network surface. The introspection entries (`.sys.args`, `.sys.build`, `.sys.info`, `.sys.mem`, `.sys.prof`, `.sys.gc`, `.sys.env`, `.sys.timeit`) are unrestricted.
 
 ## Reference
 
@@ -13,6 +13,7 @@ Process-level introspection (build, memory, host info) and command-style operati
 | [`.sys.build`](#sys-build) | variadic | — | Version + build date as a dict. |
 | [`.sys.info`](#sys-info) | variadic | — | Host facts: cores, page size, total memory. |
 | [`.sys.mem`](#sys-mem) | variadic | — | Allocator statistics. |
+| [`.sys.prof`](#sys-prof) | variadic | — | Last profiled query's per-step statistics as a table. |
 | [`.sys.gc`](#sys-gc) | variadic | — | Garbage-collect hint (no-op; returns 0). |
 | [`.sys.env`](#sys-env) | variadic | — | Count or list of globally bound names. |
 | [`.sys.exec`](#sys-exec) | unary | restricted | Run a shell command; return its exit code. |
@@ -87,6 +88,43 @@ Signature: `(.sys.mem)`. Returns the buddy allocator's running counters:
 (.sys.mem)
 ;; => {alloc-count: 12345, bytes-allocated: 524288, peak-bytes: 2097152, ...}
 ```
+
+## `.sys.prof` { #sys-prof }
+
+Signature: `(.sys.prof)`. Returns the profile of the **most recently
+completed** query as a table — one row per pipeline step (parse, the
+optimizer passes, each heavy operator, and materialize). Because it is an
+ordinary table it can be queried like any other, and an IPC client gets it
+with no extra protocol.
+
+Profiling is opt-in: toggle it with the REPL `:t` command, `.sys.timeit`,
+or the `-t` startup flag. With profiling off the table is empty. Capturing
+the payload adds no measurable cost to a non-profiled query.
+
+| Column | Meaning |
+|---|---|
+| `op` | Step / operator label (symbol). |
+| `depth` | Nesting depth (0 = top level). |
+| `dur_us` | Wall-clock microseconds. |
+| `rows` | Result element / row count (operators). |
+| `kb_out` | Result serialized footprint, KiB (bandwidth produced). |
+| `alloc_kb` | Net process bytes allocated across the step, KiB. |
+| `workers` | Worker threads that ran a task for this step. |
+| `busy_ms` | Summed worker busy time, ms. |
+| `par_eff` | Effective parallelism = `busy_ms` / `dur_us` (worker time ÷ wall time). |
+
+```lisp
+;; run a query with the profiler on (:t 1), then:
+(.sys.prof)
+;; a table: op | depth | dur_us | rows | kb_out | alloc_kb | workers | busy_ms | par_eff
+;; e.g. the GROUP row → rows=5000, kb_out=78.2, workers=28, par_eff=7.2
+
+;; it is a normal table, so query it:
+(select {from: (.sys.prof) where: (> dur_us 1000.0)})
+```
+
+The `:t` command also prints this as an indented tree after each query,
+with the same payload appended to every operator line.
 
 ## `.sys.gc` { #sys-gc }
 

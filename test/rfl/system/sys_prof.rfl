@@ -1,0 +1,19 @@
+;; (.sys.prof) — per-query statistics table.
+;;
+;; Returns the profile of the most recently completed query as a Rayfall
+;; table (so an IPC client gets it with no protocol work).  Profiling is
+;; toggled with the REPL `:t` command / the `-t` flag; the test harness runs
+;; with it off, so here we only assert the table SHAPE — that the accessor
+;; always returns a well-formed, queryable table (empty when off).
+
+;; It is a table.
+(type (.sys.prof)) -- 'TABLE
+
+;; Nine fixed columns, in order.
+(count (key (.sys.prof))) -- 9
+(key (.sys.prof)) -- [op depth dur_us rows kb_out alloc_kb workers busy_ms par_eff]
+
+;; It is an ordinary table — queryable like any other, without error.
+;; (The row count reflects whatever query last ran with profiling on, so we
+;; assert the projection is well-typed rather than a fixed count.)
+(type (select {from: (.sys.prof) where: (> dur_us 0.0)})) -- 'TABLE
