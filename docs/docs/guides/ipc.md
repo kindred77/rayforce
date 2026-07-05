@@ -322,7 +322,7 @@ The IPC layer is also accessible from C, enabling you to embed Rayforce clients 
 
 | Function | Description |
 |---|---|
-| `ray_ipc_connect(host, port, user, password)` | Open a TCP connection. Returns a handle. Pass `NULL` for user/password if no auth. |
+| `ray_ipc_connect(host, port, user, password, timeout_ms)` | Open a TCP connection. Returns a handle. Pass `NULL` for user/password if no auth, and `0` for `timeout_ms` to use the default connect timeout. |
 | `ray_ipc_send(handle, msg)` | Synchronous send: serialize `msg`, send, wait for response, return deserialized result. |
 | `ray_ipc_send_async(handle, msg)` | Fire-and-forget send: serialize and send `msg` without waiting for a response. |
 | `ray_ipc_close(handle)` | Close the connection and free the handle. |
@@ -338,7 +338,7 @@ int main(int argc, char** argv) {
     ray_runtime_t* rt = ray_runtime_create(argc, argv);
 
     // Connect to a running server (returns handle or negative error)
-    int64_t h = ray_ipc_connect("127.0.0.1", 5000, NULL, NULL);
+    int64_t h = ray_ipc_connect("127.0.0.1", 5000, NULL, NULL, 0);
     if (h < 0) { printf("Connection failed\n"); return 1; }
 
     // Send a query string

@@ -17,16 +17,21 @@ The `try` special form evaluates an expression and, if it produces an error, cal
 
 Both arguments are passed unevaluated (`try` is a special form). The handler is only evaluated and called if `expr` produces an error.
 
-### Catching Division by Zero
+### Catching a Type Error
 
 ```lisp
 (try
-  (/ 10 0)
+  (+ 1 "hello")
   (fn [err] (println "caught:" err)))
 ; caught: 0
 ```
 
 When an error occurs without an explicit `raise`, the handler receives a default value of `0`.
+
+!!! note "Division by zero is not an error"
+
+    Unlike many languages, `(/ 10 0)` does **not** raise — it returns a
+    typed null (`0Nf`). Use `nil?` to detect it, not `try`.
 
 ### Raising Custom Errors
 
@@ -43,7 +48,7 @@ With `raise`, the handler receives the exact value you raised — a string, numb
 
 ```lisp
 (try
-  (/ 10 0)
+  (+ 1 "hello")
   (fn [e] -1))
 ; => -1
 ```
@@ -102,11 +107,24 @@ Occur when a function receives the wrong number of arguments:
 Occur when arguments have valid types but invalid values:
 
 ```lisp
-(/ 10 0)
-; error: domain — division by zero
+(as 'i64 "not-a-number")
+; error: domain — cannot parse str as i64
+```
 
-(take 100 [1 2 3])
-; takes as many as available (no error for over-take)
+Note that some operations you might expect to be domain errors are not.
+Division by zero returns a typed null rather than raising:
+
+```lisp
+(/ 10 0)
+; => 0Nf   (not an error)
+```
+
+And `take` has the signature `(take list count)` — list first, count second.
+Over-taking **cycles** the list rather than truncating:
+
+```lisp
+(take [1 2 3] 5)
+; => [1 2 3 1 2]   (wraps around, does not stop at 3)
 ```
 
 ### User-Raised Errors
@@ -135,7 +153,7 @@ In restricted evaluation mode (used for IPC), certain functions are blocked:
 Unhandled errors print with a category prefix:
 
 ```text
-rf> (/ 1 0)
+rf> (as 'i64 "x")
 error: domain
 
 rf> (+ 1 "x")
@@ -200,9 +218,10 @@ Some operations like `println` and `show` return a void null. This is different 
 Vectors track null elements via a compact bitmap. Null elements propagate through vectorized operations:
 
 ```lisp
-(set v [1 0Ni 3 4 0Ni])
+; The null literal must match the vector's element type (0Nl for i64).
+(set v [1 0Nl 3 4 0Nl])
 (+ v 10)
-; => [11 0Ni 13 14 0Ni]
+; => [11 0Nl 13 14 0Nl]
 ```
 
 ### All Nulls Are Falsy
@@ -223,14 +242,14 @@ The `nil?` function detects all null forms:
 
 ```lisp
 (nil? 0Ni)
-; => 1
+; => true
 
 (nil? 42)
-; => 0
+; => false
 
 (nil? (println "x"))
 ; x
-; => 1
+; => true
 ```
 
 `nil?` is one of the few functions that safely handles the void null without producing a type error.
@@ -240,10 +259,10 @@ The `nil?` function detects all null forms:
 Arithmetic with typed nulls propagates the null through:
 
 ```lisp
-(+ [1 0Ni 3] [10 20 30])
-; => [11 0Ni 33]  — null element stays null
+(+ [1 0Nl 3] [10 20 30])
+; => [11 0Nl 33]  — null element stays null
 
-(sum [1 0Ni 3])
+(sum [1 0Nl 3])
 ; => 4  — aggregates skip nulls
 ```
 
@@ -318,7 +337,7 @@ Practical patterns for writing Rayfall code that handles edge cases gracefully.
 (try
   (do
     (validate-cols trades ['sym 'price 'qty])
-    (select {from: trades by: {sym: sym} cols: {total: (sum qty)}}))
+    (select {from: trades by: {sym: sym} total: (sum qty)}))
   (fn [e] (println "validation failed:" e)))
 ```
 
@@ -366,7 +385,7 @@ If a computed column expression fails inside `select`, the entire select produce
     (do
       (set raw (.csv.read "input.csv"))
       (set clean (select {from: raw where: (> price 0)}))
-      (select {from: clean by: {sym: sym} cols: {p: (avg price)}}))
+      (select {from: clean by: {sym: sym} p: (avg price)}))
     (fn [e]
       (println "pipeline failed:" e)
       0Ni)))
@@ -384,7 +403,7 @@ If a computed column expression fails inside `select`, the entire select produce
         (fn [e]
           (println "primary failed, trying backup")
           (.csv.read "backup.csv"))))
-    (select {from: data by: {sym: sym} cols: {total: (sum qty)}}))
+    (select {from: data by: {sym: sym} total: (sum qty)}))
   (fn [e] (println "all attempts failed:" e)))
 ```
 
@@ -394,7 +413,7 @@ If a computed column expression fails inside `select`, the entire select produce
 |---|---|---|
 | Catch errors | `(try expr handler)` | Calls handler with error value on failure |
 | Raise error | `(raise value)` | Triggers error, value passed to nearest try handler |
-| Test for null | `(nil? x)` | Returns 1 for any null form, 0 otherwise |
+| Test for null | `(nil? x)` | Returns `true` for any null form, `false` otherwise |
 | Typed null int | `0Ni` | Propagates through arithmetic |
 | Typed null float | `0Nf` | Propagates through arithmetic |
 | Typed null date | `0Nd` | Propagates through date operations |

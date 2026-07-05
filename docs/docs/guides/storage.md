@@ -1,6 +1,6 @@
 # Data Persistence Guide
 
-Rayforce provides multiple storage layers, from simple CSV for interchange to high-performance columnar files for production workloads. CSV I/O is available from Rayfall; the columnar storage layers are currently accessible through the C API.
+Rayforce provides multiple storage layers, from simple CSV for interchange to high-performance columnar files for production workloads. CSV I/O, splayed tables (`.db.splayed.set`/`.db.splayed.get`), and partitioned tables (`.db.parted.get`/`.db.parted.tables`/`.db.parted.fill`) are all available directly from Rayfall. Only raw single-column persistence (`ray_col_*`) is C-API-only.
 
 ## 1. CSV I/O { #csv-io }
 
@@ -40,7 +40,7 @@ The reader:
 ```text
 ┌─────────┬───────┬───────────────────┐
 │  Name   │ Score │       Grade       │
-│   sym   │  i64  │        sym        │
+│   SYM   │  I64  │        SYM        │
 ├─────────┼───────┼───────────────────┤
 │ Alice   │ 95    │ A                 │
 │ Bob     │ 87    │ B                 │
@@ -74,7 +74,7 @@ In typical usage, you do not call these directly — the splayed and partitioned
 
 !!! note "C API only"
 
-    The functions below are in internal headers (`src/store/col.h`, `src/store/splay.h`, `src/store/part.h`). Compile with `-Isrc` and include the specific header. These are not yet exposed as Rayfall builtins.
+    The single-column functions below (`ray_col_*`, in `src/store/col.h`) are C-API-only — compile with `-Isrc` and include the header. They are not exposed as Rayfall builtins. The higher-level splayed and partitioned tables (next sections) *are* available from Rayfall via `.db.splayed.*` / `.db.parted.*`.
 
 A **column file** stores a single vector (column) in Rayforce's native binary format. This is the building block for all higher-level storage.
 
@@ -124,21 +124,25 @@ trades/
 
 Pass a `sym_path` to automatically save/load the symbol table alongside the data. Pass `NULL` if you manage symbols separately.
 
+From Rayfall, use `(.db.splayed.set "/tmp/weather" t)` to save and `(.db.splayed.get "/tmp/weather")` to load — no C code required.
+
 ## 5. Partitioned Tables { #partitioned-tables }
 
 For very large datasets, Rayforce supports **date-partitioned** storage. Each partition is a splayed table inside a date-named subdirectory.
 
 ```c
 // Load a partitioned table
-ray_t* ray_part_load(const char* db_root,
-                     const char* table_name);
+ray_t* ray_read_parted(const char* db_root,
+                       const char* table_name);
 ```
+
+From Rayfall, load a partitioned table with `(.db.parted.get "db" 'trades)`; list a root's tables with `(.db.parted.tables "db")`.
 
 Expected directory layout:
 
 ```text
 db/
-  sym                  # shared symbol table
+  .sym                 # shared symbol table (dotfile)
   2024.01.01/
     trades/
       Symbol
@@ -194,9 +198,9 @@ Splayed table loading can also use mmap internally. For most analytics workloads
 | Layer | Interface | Best for |
 |---|---|---|
 | CSV | Rayfall | Data interchange, small datasets, prototyping |
-| Columnar | C API | Single-vector persistence, embedding in applications |
-| Splayed tables | C API | Multi-column tables, column-selective loading |
-| Partitioned tables | C API | Large time-series, append-only growth, date-range queries |
+| Columnar | C API (`ray_col_*`) | Single-vector persistence, embedding in applications |
+| Splayed tables | Rayfall (`.db.splayed.*`) + C API | Multi-column tables, column-selective loading |
+| Partitioned tables | Rayfall (`.db.parted.*`) + C API | Large time-series, append-only growth, date-range queries |
 
 ## Next Steps
 

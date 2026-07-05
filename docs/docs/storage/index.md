@@ -90,33 +90,36 @@ For large time-series datasets, Rayforce supports date-partitioned storage. Data
 ### Directory Layout
 
 ```text
-db/trades/
-  .sym                — shared symbol table (domain for all partitions)
+db/
+  .sym                  — shared symbol table (domain for all partitions)
   2024.01.15/
-    sym
-    price
-    qty
-    time
+    trades/
+      sym
+      price
+      qty
+      time
   2024.01.16/
-    sym
-    price
-    qty
-    time
+    trades/
+      sym
+      price
+      qty
+      time
   2024.01.17/
     ...
 ```
 
-The shared symbol table lives in the parted root as the dotfile `.sym`;
-partitions have no own symfile and encode their SYM columns (e.g. `sym`)
-against it.
+The shared symbol table lives in the parted root (`db/`) as the dotfile
+`.sym`; each partition is a date-named directory holding one splayed table
+per table name (`db/<date>/<table>/cols`). Partitions have no own symfile and
+encode their SYM columns (e.g. `sym`) against the shared `.sym`.
 
 ### Loading Partitioned Data
 
-The `ray_part_load()` function scans all partition directories, memory-maps every column file, and assembles them into a single logical table with [parted columns](../data-types/collections.md#parted-types) and a virtual `MAPCOMMON` date column.
+The `ray_read_parted()` function scans all partition directories, memory-maps every column file, and assembles them into a single logical table with [parted columns](../data-types/collections.md#partitioned-columns) and a virtual `MAPCOMMON` date column.
 
 ```c
 // C API: load all partitions
-ray_t* trades = ray_part_load("db", "trades");
+ray_t* trades = ray_read_parted("db", "trades");
 
 // The result is a single table with:
 // - A MAPCOMMON 'date' column derived from directory names
@@ -265,7 +268,7 @@ Loads a splayed table from a directory. Columns are memory-mapped for zero-copy 
 ```text
 ┌─────────┬──────┬────────────────────┐
 │  City   │ Temp │        Rain        │
-│   sym   │ i64  │        f64         │
+│   SYM   │ I64  │        F64         │
 ├─────────┼──────┼────────────────────┤
 │ 'London │ 15   │ 120.5              │
 │ 'Paris  │ 22   │ 60.3               │
@@ -284,7 +287,7 @@ Loads a date-partitioned table. The first argument is the database root director
 (.db.parted.get "db" 'trades)
 ```
 
-This scans all date-named subdirectories under `db/trades/`, memory-maps every column, and returns a single table with a virtual date column. Partition pruning applies to subsequent queries.
+This scans all date-named subdirectories under `db/` (loading `db/<date>/trades/` from each), memory-maps every column, and returns a single table with a virtual date column. Partition pruning applies to subsequent queries.
 
 ### `.db.parted.tables` — List a Root's Table Names
 
@@ -337,7 +340,7 @@ A complete workflow: create a table, save it to disk, load it back, and verify t
 ```text
 ┌────────┬──────┬────────────────────┐
 │  City  │ Temp │        Rain        │
-│  sym   │ i64  │        f64         │
+│  SYM   │ I64  │        F64         │
 ├────────┼──────┼────────────────────┤
 │ 'Paris │ 22   │ 60.3               │
 │ 'Tokyo │ 28   │ 200.1              │

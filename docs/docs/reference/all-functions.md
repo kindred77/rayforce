@@ -10,13 +10,13 @@
 
 | | | |
 |---|---|---|
-| [Arithmetic](#arithmetic) (15) | [Comparison](#comparison) (7) | [Logic](#logic) (3) |
-| [Aggregation](#aggregation) (14) | [Higher-Order](#higher-order) (12) | [Collection](#collection) (19) |
-| [Sorting & Ordering](#sorting) (8) | [Control Flow & Special Forms](#control) (11) | [Table Operations](#table-ops) (13) |
+| [Arithmetic](#arithmetic) (16) | [Comparison](#comparison) (7) | [Logic](#logic) (3) |
+| [Aggregation](#aggregation) (14) | [Higher-Order](#higher-order) (13) | [Collection](#collection) (19) |
+| [Sorting & Ordering](#sorting) (10) | [Control Flow & Special Forms](#control) (11) | [Table Operations](#table-ops) (14) |
 | [Query](#query) (4) | [Joins](#joins) (6) | [Pivot](#pivot) (1) |
-| [String](#string-ops) (3) | [Temporal](#temporal) (3) | [Type & Introspection](#type-ops) (5) |
-| [I/O & Output](#io) (12) | [System & Utility](#system) (15) | [Serialization](#serialization) (2) |
-| [Storage](#storage) (3) | [IPC](#ipc) (3) | [EAV Triple Store](#eav) (5) |
+| [String](#string-ops) (4) | [Temporal](#temporal) (3) | [Type & Introspection](#type-ops) (5) |
+| [I/O & Output](#io) (12) | [System & Utility](#system) (14) | [Serialization](#serialization) (2) |
+| [Storage](#storage) (5) | [IPC](#ipc) (9) | [EAV Triple Store](#eav) (5) |
 | [Datalog](#datalog) (2) | [Datalog Program API](#datalog-program) (6) | |
 
 ## Arithmetic
@@ -28,9 +28,9 @@ All arithmetic operators are **atomic** — they auto-map over vectors and broad
 | `+` | binary | atomic | Addition | `(+ 3 4)` → `7` |
 | `-` | binary | atomic | Subtraction | `(- 10 3)` → `7` |
 | `*` | binary | atomic | Multiplication | `(* 3 4)` → `12` |
-| `/` | binary | atomic | Integer division (floor) | `(/ 7 2)` → `3` |
+| `/` | binary | atomic | Float division (always returns f64) | `(/ 7 2)` → `3.5` |
 | `%` | binary | atomic | Modulo (remainder) | `(% 7 3)` → `1` |
-| `div` | binary | atomic | Float division (always returns f64) | `(div 7 2)` → `3.5` |
+| `div` | binary | atomic | Integer division (floor) | `(div 7 2)` → `3` |
 | `neg` | unary | atomic | Negate value | `(neg 5)` → `-5` |
 | `round` | unary | atomic | Round to nearest integer | `(round 3.7)` → `4.0` |
 | `floor` | unary | atomic | Floor (round down) | `(floor 3.7)` → `3.0` |
@@ -39,6 +39,7 @@ All arithmetic operators are **atomic** — they auto-map over vectors and broad
 | `sqrt` | unary | atomic | Square root (returns f64) | `(sqrt 9)` → `3.0` |
 | `log` | unary | atomic | Natural logarithm | `(log 2.718)` → `~1.0` |
 | `exp` | unary | atomic | Exponential (e^x) | `(exp 1)` → `2.718...` |
+| `pow` | binary | atomic | Power (x^y, returns f64) | `(pow 2 10)` → `1024.0` |
 | `xbar` | binary | atomic | Round down to nearest multiple (bucketing) | `(xbar [3 7 12] 5)` → `[0 5 10]` |
 
 ```lisp
@@ -64,14 +65,14 @@ All comparison operators are **atomic** and return boolean results.
 | `<=` | binary | atomic | Less than or equal | `(<= 3 5)` → `true` |
 | `==` | binary | atomic | Equal | `(== 3 3)` → `true` |
 | `!=` | binary | atomic | Not equal | `(!= 3 4)` → `true` |
-| `within` | binary | — | Check which elements fall within a [lo hi) range | `(within [1 5 10] [3 7])` → `[false true false]` |
+| `within` | binary | — | Check which elements fall within an inclusive `[lo hi]` range | `(within [1 5 10] [3 7])` → `[false true false]` |
 
 ```lisp
 ; Vector comparisons return boolean vectors
 (> [10 20 30] 15)          ; [false true true]
 (== [1 2 3] [1 0 3])       ; [true false true]
 
-; within checks half-open range [lo, hi)
+; within checks the inclusive range [lo, hi]
 (within [1 3 5 7] [3 6])  ; [false true true false]
 ```
 
@@ -104,9 +105,9 @@ Aggregation functions reduce vectors to scalar values. Functions marked **aggr**
 | `max` | unary | aggr | Maximum value | `(max [3 1 2])` → `3` |
 | `first` | unary | — | First element of a vector | `(first [10 20 30])` → `10` |
 | `last` | unary | — | Last element of a vector | `(last [10 20 30])` → `30` |
-| `med` | unary | aggr | Median value | `(med [1 3 2])` → `2` |
-| `dev` | unary | aggr | Sample standard deviation | `(dev [2 4 4 4 5 5 7 9])` → `2.0` |
-| `stddev` | unary | aggr | Sample standard deviation (alias of dev) | `(stddev [1 2 3])` → `0.816...` |
+| `med` | unary | aggr | Median value (returns f64) | `(med [1 3 2])` → `2.0` |
+| `dev` | unary | aggr | Population standard deviation | `(dev [2 4 4 4 5 5 7 9])` → `2.0` |
+| `stddev` | unary | aggr | Sample standard deviation (Bessel-corrected; not an alias of `dev`) | `(stddev [1 2 3])` → `1.0` |
 | `stddev_pop` | unary | aggr | Population standard deviation | `(stddev_pop [1 2 3])` |
 | `dev_pop` | unary | aggr | Population standard deviation (alias) | `(dev_pop [1 2 3])` |
 | `var` | unary | aggr | Sample variance | `(var [1 2 3])` → `1.0` |
@@ -121,7 +122,7 @@ Aggregation functions reduce vectors to scalar values. Functions marked **aggr**
 ; Group-by aggregation in select
 (select {from: trades
          by:   {sym: sym}
-         cols: {hi: (max price) lo: (min price) n: (count price)}})
+         hi: (max price) lo: (min price) n: (count price)})
 ```
 
 ## Higher-Order Functions { #higher-order }
@@ -130,22 +131,23 @@ Functions that take other functions as arguments for mapping, folding, and filte
 
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
-| `map` | variadic | — | Apply function to each element | `(map (fn [x] (* x 2)) [1 2 3])` → `[2 4 6]` |
-| `pmap` | variadic | — | Parallel map (multi-threaded) | `(pmap (fn [x] (* x x)) [1 2 3])` → `[1 4 9]` |
+| `map` | variadic | — | Apply function to each element (returns a list) | `(map (fn [x] (* x 2)) [1 2 3])` → `(2 4 6)` |
+| `pmap` | variadic | — | Parallel map (multi-threaded, returns a list) | `(pmap (fn [x] (* x x)) [1 2 3])` → `(1 4 9)` |
 | `fold` | variadic | — | Reduce with function and initial value | `(fold + 0 [1 2 3])` → `6` |
 | `fold-left` | variadic | — | Left-associative fold | `(fold-left - 10 [1 2 3])` → `4` |
 | `fold-right` | variadic | — | Right-associative fold | `(fold-right - 10 [1 2 3])` → `-8` |
 | `scan` | variadic | — | Running fold (all intermediate results) | `(scan + (enlist 1 2 3))` → `[1 3 6]` |
 | `scan-left` | variadic | — | Left-to-right running fold | `(scan-left + (enlist 1 2 3))` → `[1 3 6]` |
-| `scan-right` | variadic | — | Right-to-left running fold | `(scan-right + (enlist 1 2 3))` → `[6 5 3]` |
+| `scan-right` | variadic | — | Right-to-left running fold (returns a list) | `(scan-right + (enlist 1 2 3))` → `(6 5 3)` |
 | `filter` | binary | — | Keep elements where boolean mask is true | `(filter [1 2 3 4] (> [1 2 3 4] 2))` → `[3 4]` |
-| `apply` | variadic | — | Zip-apply function pairwise over lists | `(apply + (enlist 1 2) (enlist 3 4))` → `[4 6]` |
+| `apply` | variadic | — | Zip-apply function pairwise over lists | `(apply + (enlist 1 2) (enlist 3 4))` → `(4 6)` |
 | `map-left` | variadic | — | Map each element of the left over the whole right | `(map-left + 10 [1 2 3])` → `[11 12 13]` |
 | `map-right` | variadic | — | Map the whole left over each element of the right | `(map-right - [10 20 30] 5)` → `[5 15 25]` |
+| `prior` | variadic | — | Apply a binary fn to each element and its predecessor (first paired with itself); returns a list | `(prior - [1 3 6 10])` → `(0 2 3 4)` |
 
 ```lisp
 ; Transform each row with map
-(map (fn [x] (* x x)) [1 2 3 4])  ; [1 4 9 16]
+(map (fn [x] (* x x)) [1 2 3 4])  ; (1 4 9 16)
 
 ; Parallel map for expensive computation
 (pmap (fn [t] (sum (til t))) [100 200 300])
@@ -204,6 +206,8 @@ Sort vectors, compute sort indices, and rank elements.
 | `iasc` | unary | — | Indices that would sort ascending (grade up) | `(iasc [30 10 20])` → `[1 2 0]` |
 | `idesc` | unary | — | Indices that would sort descending (grade down) | `(idesc [30 10 20])` → `[0 2 1]` |
 | `rank` | unary | — | Rank of each element (0-based) | `(rank [30 10 20])` → `[2 0 1]` |
+| `top` | binary | — | Largest N elements (descending) | `(top [5 1 9 3] 2)` → `[9 5]` |
+| `bot` | binary | — | Smallest N elements (ascending) | `(bot [5 1 9 3] 2)` → `[1 3]` |
 | `xasc` | binary | — | Sort table ascending by column(s) | `(xasc 'price trades)` |
 | `xdesc` | binary | — | Sort table descending by column(s) | `(xdesc 'price trades)` |
 | `xrank` | binary | — | Assign N rank buckets (quantile ranking) | `(xrank 4 [10 20 30 40])` → `[0 1 2 3]` |
@@ -270,7 +274,8 @@ Create and manipulate tables, dictionaries, and their metadata.
 | `union-all` | binary | — | Concatenate two tables (all rows, no dedup) | `(union-all t1 t2)` |
 | `unify` | binary | — | Merge two tables/dicts (second takes precedence) | `(unify d1 d2)` |
 | `modify` | variadic | restricted | Functional table update (returns new table) | `(modify trades 'price (fn [p] (* p 1.1)))` |
-| `pivot` | variadic | — | Pivot table — reshape long to wide format | `(pivot trades 'sym 'date 'price)` |
+| `ungroup` | unary | — | Flatten a grouped table's nested list columns into one row per element | `(ungroup gt)` |
+| `pivot` | variadic | — | Pivot table — reshape long to wide format | `(pivot trades 'sym 'date 'price sum)` |
 
 ```lisp
 ; Create a table
@@ -284,8 +289,8 @@ Create and manipulate tables, dictionaries, and their metadata.
 (get d 'name)              ; "Alice"
 (key d)                      ; [name age]
 
-; Pivot: long to wide
-(pivot trades 'sym 'date 'price)
+; Pivot: long to wide (5th arg is the aggregation fn)
+(pivot trades 'sym 'date 'price sum)
 ```
 
 ## Query Operations { #query }
@@ -294,26 +299,26 @@ Special forms that bridge to the Rayforce DAG executor for high-performance colu
 
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
-| `select` | variadic | special | Query table with optional filter, projection, grouping, and aggregation | `(select {from: t cols: {a: a}})` |
-| `update` | variadic | special, restricted | Add or modify columns in a table (mutates in-place) | `(update {from: t cols: {b: (* a 2)}})` |
+| `select` | variadic | special | Query table with optional filter, projection, grouping, and aggregation | `(select {from: t a: a})` |
+| `update` | variadic | special, restricted | Add or modify columns in a table (mutates in-place) | `(update {from: t b: (* a 2)})` |
 | `insert` | variadic | special, restricted | Insert rows into a table | `(insert t {x: 10 y: 20})` |
-| `upsert` | variadic | special, restricted | Insert or update rows by key match | `(upsert t {x: 10 y: 20})` |
+| `upsert` | variadic | special, restricted | Insert or update rows by key match (target, key, row) | `(upsert t 'x {x: 10 y: 20})` |
 
 ```lisp
 ; Select with filter and projection
 (select {from: trades
          where: (> price 100)
-         cols: {sym: sym notional: (* price size)}})
+         sym: sym notional: (* price size)})
 
 ; Group-by with VWAP
 (select {from: trades
          by:   {sym: sym}
-         cols: {vwap: (/ (sum (* price size)) (sum size))
-                n: (count price)}})
+         vwap: (/ (sum (* price size)) (sum size))
+                n: (count price)})
 
 ; Update: add computed column
 (update {from: trades
-         cols: {notional: (* price size)}})
+         notional: (* price size)})
 ```
 
 ## Joins
@@ -322,54 +327,57 @@ Rayforce supports six join types, including time-series-aware as-of and window j
 
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
-| `left-join` | variadic | — | Left join — all left rows, unmatched filled with null | `(left-join trades quotes 'sym)` |
-| `inner-join` | variadic | — | Inner join — only matching rows from both sides | `(inner-join orders products 'product_id)` |
-| `anti-join` | variadic | — | Anti-semi-join — left rows with no right match | `(anti-join t1 t2 'key)` |
-| `window-join` | variadic | special | Window join — match rows within a time range | `(window-join {left: t1 right: t2 ...})` |
-| `window-join1` | variadic | special | Window join variant (single-row match per window) | `(window-join1 {left: t1 right: t2 ...})` |
-| `asof-join` | variadic | — | As-of join — match most recent preceding value | `(asof-join trades quotes 'sym)` |
+| `left-join` | variadic | — | Left join — all left rows, unmatched filled with null. Keys are a symbol list. | `(left-join trades quotes [sym])` |
+| `inner-join` | variadic | — | Inner join — only matching rows from both sides | `(inner-join orders products [product_id])` |
+| `anti-join` | variadic | — | Anti-semi-join — left rows with no right match | `(anti-join t1 t2 [key])` |
+| `window-join` | variadic | special | Window join — `[eq-keys... time-key]`, intervals, left, right, agg dict | `(window-join [sym time] iv t1 t2 {avg_bid: (avg bid)})` |
+| `window-join1` | variadic | special | Window join variant (strict window, no prevailing quote) | `(window-join1 [sym time] iv t1 t2 {avg_bid: (avg bid)})` |
+| `asof-join` | variadic | — | As-of join — match most recent preceding value. Keys come first, last key is the time key. | `(asof-join [sym time] trades quotes)` |
 
 ```lisp
-; Left join on sym column
-(left-join trades quotes 'sym)
+; Left join on sym column (join keys are a symbol list)
+(left-join trades quotes [sym])
 
-; Window join: match trades to quotes within 1-second window
-(window-join {left: trades  right: quotes
-              on: [sym]  window: [-1000 0]
-              cols: {avg_bid: (avg bid)}})
+; Window join: keys are [equality-keys... time-key]; intervals is
+; (list lo-vec hi-vec) with one [lo hi] window bound per left row.
+(window-join [sym time]
+             (list [8 18] [12 22])
+             trades quotes
+             {avg_bid: (avg bid)})
 
-; As-of join: find most recent quote for each trade
-(asof-join trades quotes 'sym)
+; As-of join: keys come first, the last key is the time key
+(asof-join [sym time] trades quotes)
 ```
 
 ## Pivot
 
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
-| `pivot` | variadic | — | Pivot table — reshape long to wide. Args: table, row-key col, col-key col, value col | `(pivot sales 'region 'product 'revenue)` |
+| `pivot` | variadic | — | Pivot table — reshape long to wide. Args: table, index col, pivot col, value col, agg fn | `(pivot sales 'region 'product 'revenue sum)` |
 
 ```lisp
-; Pivot sales data: rows=region, cols=product, values=revenue
+; Pivot sales data: rows=region, cols=product, values=revenue, aggregated with sum
 (set sales (table [region product revenue]
   (list ['east 'east 'west 'west]
         ['widgets 'gadgets 'widgets 'gadgets]
         [100 200 150 250])))
-(pivot sales 'region 'product 'revenue)
+(pivot sales 'region 'product 'revenue sum)
 ```
 
 ## String Operations { #string-ops }
 
-String functions available as builtins. Additional string operations (UPPER, LOWER, TRIM, SUBSTR, REPLACE, STRLEN) are available at the DAG executor level via `select`/`update`.
+String functions available as builtins. Additional string operations (UPPER, LOWER, TRIM, SUBSTR, REPLACE) are available at the DAG executor level via `select`/`update`.
 
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
-| `split` | binary | — | Split string by delimiter into vector of strings | `(split "a,b,c" ",")` → `["a" "b" "c"]` |
+| `split` | binary | — | Split string by delimiter into a list of strings | `(split "a,b,c" ",")` → `("a" "b" "c")` |
+| `strlen` | unary | — | Length of each string | `(strlen "hello")` → `5` |
 | `like` | binary | — | Glob-style pattern match (* and ? wildcards) | `(like "hello" "hel*")` → `true` |
 | `sym-name` | unary | — | Resolve integer sym IDs to symbols (passthrough for sym atoms) | `(sym-name 0)` → sym at ID 0 |
 
 ```lisp
 ; Split and rejoin
-(split "2026-04-16" "-")    ; ["2026" "04" "16"]
+(split "2026-04-16" "-")    ; ("2026" "04" "16")
 
 ; Pattern matching on a vector of strings
 (like ["apple" "banana" "avocado"] "a*")
@@ -402,16 +410,16 @@ Type checking, casting, null testing, and object inspection.
 
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
-| `type` | unary | — | Get the type name of a value | `(type 42)` → `'i64` |
+| `type` | unary | — | Get the type name of a value | `(type 42)` → `i64` |
 | `as` | binary | — | Cast value to another type | `(as 'i64 "42")` → `42` |
 | `nil?` | unary | — | Test if value is null | `(nil? 0Ni)` → `true` |
 | `rc` | unary | — | Get reference count of an object | `(rc x)` → `1` |
-| `guid` | unary | — | Generate N GUIDs (pass 0 for a single GUID) | `(guid 0)` |
+| `guid` | unary | — | Generate a vector of N GUIDs (`(guid 0)` → `[]`) | `(guid 1)` |
 
 ```lisp
 ; Type checking and casting
-(type [1 2 3])              ; "I64"
-(type "hello")              ; "str"
+(type [1 2 3])              ; I64
+(type "hello")              ; str
 (as 'f64 [1 2 3])          ; [1.0 2.0 3.0]
 (nil? 0Ni)                   ; true
 

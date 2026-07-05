@@ -22,7 +22,7 @@ Output:
 ```text
 ┌────────┬───────┬────────────────────┐
 │ Symbol │ Price │        Qty         │
-│  sym   │  f64  │        i64         │
+│  SYM   │  F64  │        I64         │
 ├────────┼───────┼────────────────────┤
 │ AAPL   │ 150.0 │ 100                │
 │ GOOG   │ 280.0 │ 200                │
@@ -48,7 +48,7 @@ Use `select` with a `where:` clause to filter rows. Find all trades where the pr
 ```text
 ┌────────┬───────┬────────────────────┐
 │ Symbol │ Price │        Qty         │
-│  sym   │  f64  │        i64         │
+│  SYM   │  F64  │        I64         │
 ├────────┼───────┼────────────────────┤
 │ GOOG   │ 280.0 │ 200                │
 │ MSFT   │ 420.0 │ 50                 │
@@ -74,7 +74,7 @@ Group by `Symbol` and compute aggregates. The `by:` clause names the grouping co
 ```text
 ┌────────┬───────┬────────────────────┐
 │ Symbol │ total │     avg_price      │
-│  sym   │  i64  │        f64         │
+│  SYM   │  I64  │        F64         │
 ├────────┼───────┼────────────────────┤
 │ AAPL   │ 400   │ 152.5              │
 │ GOOG   │ 350   │ 277.5              │
@@ -98,7 +98,7 @@ Sort a table by one or more columns using `xasc` (ascending) or `xdesc` (descend
 ```text
 ┌────────┬───────┬────────────────────┐
 │ Symbol │ Price │        Qty         │
-│  sym   │  f64  │        i64         │
+│  SYM   │  F64  │        I64         │
 ├────────┼───────┼────────────────────┤
 │ AAPL   │ 150.0 │ 100                │
 │ AAPL   │ 155.0 │ 300                │
@@ -119,7 +119,7 @@ Sort a table by one or more columns using `xasc` (ascending) or `xdesc` (descend
 ```text
 ┌────────┬───────┬────────────────────┐
 │ Symbol │ Price │        Qty         │
-│  sym   │  f64  │        i64         │
+│  SYM   │  F64  │        I64         │
 ├────────┼───────┼────────────────────┤
 │ MSFT   │ 420.0 │ 50                 │
 │ MSFT   │ 415.0 │ 75                 │
@@ -157,7 +157,7 @@ Create two tables and join them on a shared key column:
 ```text
 ┌─────┬────────┬─────┬────────────────┐
 │ Id  │ Symbol │ Qty │     Price      │
-│ i64 │  sym   │ i64 │      f64       │
+│ I64 │  SYM   │ I64 │      F64       │
 ├─────┼────────┼─────┼────────────────┤
 │ 1   │ AAPL   │ 100 │ 150.0          │
 │ 2   │ GOOG   │ 200 │ 280.0          │
@@ -188,7 +188,7 @@ Cross-tabulate data with `pivot`. The arguments are: table, row key, column key,
 ```text
 ┌────────┬─────┬──────────────────────┐
 │ Symbol │ Buy │         Sell         │
-│  sym   │ i64 │         i64          │
+│  SYM   │ I64 │         I64          │
 ├────────┼─────┼──────────────────────┤
 │ AAPL   │ 100 │ 50                   │
 │ GOOG   │ 200 │ 150                  │
@@ -230,7 +230,7 @@ Write any table to a CSV file with `.csv.write`:
 ```text
 ┌────────┬───────┬────────────────────┐
 │ Symbol │ Price │        Qty         │
-│  sym   │  i64  │        i64         │
+│  SYM   │  I64  │        I64         │
 ├────────┼───────┼────────────────────┤
 │ AAPL   │ 150   │ 100                │
 │ GOOG   │ 280   │ 200                │

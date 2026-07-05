@@ -38,7 +38,7 @@ db
 ```text
 ┌─────┬──────┬────────────────────────┐
 │  e  │  a   │           v            │
-│ i64 │ sym  │          i64           │
+│ I64 │ SYM  │          I64           │
 ├─────┼──────┼────────────────────────┤
 │ 100 │ name │ ...                    │
 │ 100 │ dept │ ...                    │
@@ -68,7 +68,7 @@ Use `query` with `find`/`where` clauses to pattern-match over the triple store. 
 ```text
 ┌─────┬───────────────────────────────┐
 │ ?e  │             ?name             │
-│ i64 │              i64              │
+│ I64 │              I64              │
 ├─────┼───────────────────────────────┤
 │ 100 │ ...                           │
 │ 101 │ ...                           │
@@ -95,7 +95,7 @@ Add a second pattern to filter by department. Constants (like `'Engineering`) co
 ```text
 ┌─────┬───────────────────────────────┐
 │ ?e  │             ?name             │
-│ i64 │              i64              │
+│ I64 │              I64              │
 ├─────┼───────────────────────────────┤
 │ 100 │ ...                           │
 │ 102 │ ...                           │
@@ -119,7 +119,7 @@ Query the `boss` attribute to find reporting relationships. Since `boss` stores 
 ```text
 ┌─────┬───────────────────────────────┐
 │ ?e  │             ?boss             │
-│ i64 │              i64              │
+│ I64 │              I64              │
 ├─────┼───────────────────────────────┤
 │ 100 │ 101                           │
 │ 102 │ 100                           │
@@ -151,7 +151,7 @@ This says: `?mgr` manages `?sub` if `?sub` has a `boss` attribute pointing to `?
 ```text
 ┌──────┬──────────────────────────────┐
 │ ?mgr │             ?sub             │
-│ i64  │             i64              │
+│ I64  │             I64              │
 ├──────┼──────────────────────────────┤
 │ 100  │ 102                          │
 │ 101  │ 100                          │
@@ -188,7 +188,7 @@ Now find everyone who reports to Bob (101), directly or indirectly:
 ```text
 ┌─────────────────────────────────────┐
 │                ?sub                 │
-│                 i64                 │
+│                 I64                 │
 ├─────────────────────────────────────┤
 │ 100                                 │
 │ 102                                 │
@@ -214,7 +214,7 @@ Use `not` to exclude matching patterns. Find all employees who are NOT in Sales:
 ```text
 ┌─────┬───────────────────────────────┐
 │ ?e  │             ?name             │
-│ i64 │              i64              │
+│ I64 │              I64              │
 ├─────┼───────────────────────────────┤
 │ 100 │ ...                           │
 │ 102 │ ...                           │
@@ -258,7 +258,7 @@ You can also use `scan-eav` for attribute-level lookups. Given an attribute, it 
 ```text
 ┌─────┬───────────────────────────────┐
 │  e  │               v               │
-│ i64 │              i64              │
+│ I64 │              I64              │
 ├─────┼───────────────────────────────┤
 │ 100 │ ...                           │
 │ 101 │ ...                           │
@@ -344,7 +344,7 @@ Query everyone who reports to the CEO (100):
 ```text
 ┌─────────────────────────────────────┐
 │                ?sub                 │
-│                 i64                 │
+│                 I64                 │
 ├─────────────────────────────────────┤
 │ 101                                 │
 │ 102                                 │
@@ -373,7 +373,7 @@ Define a rule for department heads (employees with title VP):
 ```text
 ┌─────┬───────────────────────────────┐
 │ ?e  │              ?d               │
-│ i64 │              i64              │
+│ I64 │              I64              │
 ├─────┼───────────────────────────────┤
 │ 101 │ ...                           │
 │ 104 │ ...                           │

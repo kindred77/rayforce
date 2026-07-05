@@ -11,17 +11,36 @@ runtime).
 | `fuzz_parse`    | `ray_parse`            | Rayfall source parser / lexer |
 | `fuzz_numparse` | `ray_parse_i64/f64/u64_hex` | numeric-literal scanners (pure, no runtime) |
 | `fuzz_de`       | `ray_de` / `ray_de_raw` | binary wire-frame / journal-entry decoder |
+| `fuzz_eval`     | `ray_eval_str`         | full parse → eval pipeline (sandboxed) |
+| `fuzz_csv`      | `ray_read_csv*`        | CSV reader (input via memfd) |
+| `fuzz_journal`  | `ray_journal_validate` / `ray_journal_replay` | journal framing walk + replay |
 
 The journal log is a sequence of IPC frames verbatim, so the `de` corpus also
 hardens journal replay's decode step.
+
+`fuzz_eval` runs untrusted programs in-process, so the escape hatches that would
+compromise the fuzzer — shell (`.sys.exec`/`.sys.cmd`), `exit`/`quit`, network
+`listen`/`.ipc.open`, and file writes (`write-csv`, `.log.open`) — are compiled
+out under `-DRAY_FUZZING` (guards in `syscmd.c` / `system.c` / `builtins.c` /
+`journal.c`). `fuzz_csv` and `fuzz_journal` expose their input as an anonymous
+in-memory file (`memfd` → `/proc/self/fd`), so there is no disk I/O.
+
+Two accepted `fuzz_eval` limitations: global state (`set`) leaks across
+iterations, so a rare crash may not reproduce standalone; and loop/recursion
+constructs can run long, so a `timeout-*` artifact is only a finding when the
+input has no such construct.
 
 ## Running
 
 ```sh
 make fuzz-parse                 # 60s (default) run of one target
 make fuzz-parse FUZZ_RUNTIME=0  # run until a crash / Ctrl-C
-make fuzz-smoke                 # short pass over all targets (CI gate)
+make fuzz-smoke                 # short pass over the fast targets (PR CI gate)
 ```
+
+`fuzz-smoke` covers `parse`, `numparse`, and `de` (the fast, stateless
+targets); `eval`, `csv`, and `journal` run in the nightly `fuzz-long` job
+(`.github/workflows/nightly.yml`), 15 minutes each over a cached corpus.
 
 Grown corpora live in `fuzz/corpus/<target>/` (gitignored); committed starter
 inputs live in `fuzz/seeds/<target>/`.  Regenerate the working corpora from the

@@ -19,11 +19,11 @@ All scalar types, their internal constants, storage sizes, and Rayfall literal s
 | **Time** | `RAY_TIME` | 9 | 4 bytes | `0Nt` | `09:30:00.000` |
 | **Timestamp** | `RAY_TIMESTAMP` | 10 | 8 bytes | `0Np` | `2024.01.15D09:30:00.000000000` |
 | **GUID** | `RAY_GUID` | 11 | 16 bytes | Null bitmap | UUID format |
-| **Symbol** | `RAY_SYM` | 12 | Adaptive (8/16/32/64-bit) | `0Ns` | `'AAPL`, `[AAPL GOOG]` |
+| **Symbol** | `RAY_SYM` | 12 | Adaptive (8/16/32/64-bit) | sym id 0 | `'AAPL`, `[AAPL GOOG]` |
 | **String** | `RAY_STR` | 13 | 16 bytes per element | Null flag in bitmap | `"hello"` |
 
 !!! note "Null handling"
-    Nulls are tracked via a per-element bitmap, not sentinel values in the data array. Typed null literals parseable in source (`0Nh`, `0Ni`, `0Nl`, `0Nf`, `0Nd`, `0Nt`, `0Np`, `0Ns`) create atoms of the correct type with the null bit set — the value field is zeroed.  Types without a parseable literal (BOOL/U8/F32/STR/GUID) still render as their canonical null form (`0Nb`/`0Nu`/`0Ne`/`0Nc`/`0Ng`) when the bitmap flags them.  Use `nil?` to test for null.
+    Nulls are sentinel-encoded directly in the data array (`INT64_MIN` for `i64`, `NaN` for `f64`, the type-correct reserved value otherwise), not a separate bitmap; the `HAS_NULLS` attribute is a fast "may contain nulls" hint. Parseable null literals are `0Nh` (i16), `0Ni` (i32), `0Nl` (i64), `0Nf` (f64), `0Nd` (date), `0Nt` (time), and `0Np` (timestamp). Symbols have no null (a `SYM` null is sym id 0, by design — there is no `0Ns` literal). Use `nil?` to test for null.
 
 !!! note "Note"
     RAY_SYM and RAY_STR are both string types but serve different purposes. Symbols are dictionary-encoded (interned integers) — ideal for categorical data with repeated values like stock tickers or country codes. Strings are variable-length and stored inline or in a pool — ideal for free-form text.
@@ -90,10 +90,12 @@ The `attrs` byte carries bit flags that modify behavior:
 
 | Flag | Bit | Meaning |
 |---|---|---|
+| `RAY_ATTR_GRAPH` | `0x02` | `-RAY_I64` atom holds a CSR graph handle |
+| `RAY_ATTR_HNSW` | `0x04` | `-RAY_I64` atom holds an HNSW handle |
+| `RAY_ATTR_HAS_INDEX` | `0x08` | Vector carries an attached accelerator index |
 | `RAY_ATTR_SLICE` | `0x10` | Vector is a zero-copy slice of a parent |
-| `RAY_ATTR_NULLMAP_EXT` | `0x20` | Null bitmap stored in external allocation |
-| `RAY_ATTR_NAME` | `0x20` | Symbol atom is a variable name reference |
-| `RAY_ATTR_HAS_NULLS` | `0x40` | Vector contains null values (check bitmap) |
+| `RAY_ATTR_SORTED` | `0x20` | Vector is known to be in non-descending order |
+| `RAY_ATTR_HAS_NULLS` | `0x40` | Vector may contain null sentinels (hint) |
 | `RAY_ATTR_ARENA` | `0x80` | Arena-allocated; retain/release are no-ops |
 
 ## Type Casting

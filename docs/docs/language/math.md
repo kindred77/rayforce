@@ -36,11 +36,12 @@ Multiplication.
 
 ### `(/ a b)` — atomic
 
-Division. Integer division for integer arguments, float division otherwise.
+Division. Always returns f64, even for integer arguments. Use `div` for
+integer (floor) division.
 
 ```lisp
-(/ 10 3)  ; 3
-(/ 10.0 3)  ; 3.0
+(/ 10 3)  ; 3.33
+(/ 10.0 3)  ; 3.33
 ```
 
 ### `(% a b)` — atomic

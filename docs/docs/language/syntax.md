@@ -64,6 +64,11 @@ Date literals use dot-separated year.month.day format. Stored as days since 2000
 2023.12.31  ; December 31, 2023
 ```
 
+The month must be `1`-`12` and the day `1`-`31`; anything outside those
+ranges is a parse error (e.g. `2024.13.01` or `2024.01.00`). A day past the
+end of its month is normalized by the calendar rather than rejected, so
+`2024.02.30` parses as `2024.03.01`.
+
 ### Times
 
 Time-of-day literals in HH:MM:SS.mmm format. Stored as milliseconds since midnight (i32).
@@ -73,6 +78,9 @@ Time-of-day literals in HH:MM:SS.mmm format. Stored as milliseconds since midnig
 14:15:30.500  ; 2:15:30.5 PM
 ```
 
+Hours must be `0`-`23`, minutes and seconds `0`-`59`; out-of-range
+components are a parse error.
+
 ### Timestamps
 
 Full date+time with nanosecond precision. Stored as nanoseconds since 2000-01-01 (i64). Literal form uses `D` as the date/time separator and requires a fractional-seconds suffix:
@@ -81,6 +89,11 @@ Full date+time with nanosecond precision. Stored as nanoseconds since 2000-01-01
 2024.01.15D09:30:00.000            ; date + time (ms)
 2024.01.15D09:30:00.000000000      ; date + time (ns)
 ```
+
+The date and time parts follow the same range rules as above. Because the
+value is a 64-bit nanosecond count from the epoch, timestamps only span
+roughly ±292 years around 2000 (about 1708 to 2262); a year outside that
+range is a parse error.
 
 ### GUIDs
 
@@ -92,18 +105,24 @@ Full date+time with nanosecond precision. Stored as nanoseconds since 2000-01-01
 
 ### Null Values
 
-Nulls are tracked via a per-element bitmap, not sentinel values. Typed null literals create atoms with the null bit set:
+Nulls are sentinel-encoded directly in the column payload — `INT64_MIN`
+for `i64`, `NaN` for `f64`, and the type-correct reserved value for each
+other type (there is no separate null bitmap). The `HAS_NULLS` attribute
+is a fast "may contain nulls" hint. Typed null literals produce the
+sentinel for their type:
 
 ```lisp
 0Nl   ; i64 null
 0Ni   ; i32 null
+0Nh   ; i16 null
 0Nf   ; f64 null
 0Nd   ; date null
 0Nt   ; time null
 0Np   ; timestamp null
-0Ns   ; symbol null
 (nil? x)   ; true if x is null
 ```
+
+Symbols have no typed null literal (there is no `0Ns`).
 
 ## Vectors
 
@@ -135,6 +154,12 @@ Lists are heterogeneous collections of vectors. Created with the `list` function
 ```lisp
 (list [1 2 3] [A B C])   ; list of two vectors
 ```
+
+!!! note "Nesting depth"
+    The parser caps recursive nesting of container literals and calls at
+    1024 levels. A pathologically deep input (e.g. thousands of nested
+    `[` or `(`) is rejected with `parse: nesting too deep, limit 1024`
+    rather than overflowing the stack. Real queries never approach this.
 
 ## Tables
 
@@ -355,13 +380,13 @@ The `select` and `update` builtins bridge to the Rayforce DAG executor. They acc
 
 ; Project specific columns with expressions
 (select {from: trades
-         cols: {sym: sym  notional: (* price size)}})
+         sym: sym  notional: (* price size)})
 
 ; Group by with aggregation
 (select {from: trades
          by:   {sym: sym}
-         cols: {avg_price: (avg price)
-                total_size: (sum size)}})
+         avg_price: (avg price)
+                total_size: (sum size)})
 ```
 
 ### update
@@ -369,17 +394,24 @@ The `select` and `update` builtins bridge to the Rayforce DAG executor. They acc
 ```lisp
 ; Add a computed column
 (update {from: trades
-          cols: {notional: (* price size)}})
+          notional: (* price size)})
 ```
 
 ### insert / upsert
 
+`insert` takes the target table and a table of new rows, and returns the
+combined table (the two-argument form does not mutate its argument):
+
 ```lisp
-; Insert new rows
-(insert {into: trades
-          values: (table [sym price size]
-                    (list [TSLA] [250.0] [300]))})
+; Append new rows — returns a table with the extra rows
+(insert trades
+        (table [sym price size]
+               (list [TSLA] [250.0] [300])))
 ```
+
+To mutate a named global in place, pass the target as a quoted symbol —
+`(insert 'trades newrows)` — or use `upsert` with an explicit key count,
+`(upsert 'trades 1 newrows)`.
 
 ## C API
 

@@ -6,7 +6,7 @@ Rayforce uses a custom memory subsystem — no calls to `malloc` or `free` ever 
 
 - **Buddy allocator with thread-local heaps** — Each VM thread gets its own heap (identified by a `heap_id`). Allocations are fast, lock-free within a thread. Cross-heap frees are deferred to a lock-free queue and reclaimed lazily.
 - **Slab cache** — Small allocations (common for atoms and short vectors) are served from pre-sized slab pools, avoiding buddy-tree overhead.
-- **COW ref counting** — Vectors use copy-on-write semantics via `ray_retain`/`ray_release`. Shared vectors are only copied when mutated.
+- **COW ref counting** — Vectors use copy-on-write semantics via `ray_retain`/`ray_release`. Shared vectors are only copied when mutated. Note that `ray_retain`/`ray_release`/`ray_cow` are no-ops on `RAY_ERROR` objects, so an error block must be reclaimed with `ray_error_free()` rather than `ray_release()`.
 - **Arena allocator** — For bulk short-lived blocks (e.g., intermediate query results). Arena objects carry an `RAY_ATTR_ARENA` flag that makes retain/release no-ops. The entire arena is freed at once when work completes.
 - **Memory budget** — Auto-detected at initialization as 80% of physical RAM (via `sysconf` on POSIX, `GlobalMemoryStatusEx` on Windows). Queries that approach the budget may trigger spilling or offloading.
 
@@ -120,16 +120,16 @@ The bar displays:
 ;; This query processes 50 million rows -- progress bar appears automatically
 (select {from: trades
          by: {sym: sym}
-         cols: {total: (sum price)
+         total: (sum price)
                 n: (count price)
-                hi: (max price)}})
+                hi: (max price)})
 ```
 
 ```text
 [████████████████]  100% · group: merge · 4.1s · 3.8G/12.8G
 ┌──────┬───────────────┬──────────┬──────────┐
 │  sym │     total     │    n     │    hi    │
-│  sym │      f64      │   i64    │   f64    │
+│  SYM │      F64      │   I64    │   F64    │
 ├──────┼───────────────┼──────────┼──────────┤
 │ AAPL │ 8825431692.50 │ 50120832 │   502.39 │
 │ GOOG │ 6129847201.75 │ 49879168 │   501.97 │
@@ -157,7 +157,7 @@ Wrap any expression in `(timeit ...)` to measure its execution time. It evaluate
 ;; Time a grouped aggregation
 (timeit (select {from: trades
                  by: {sym: sym}
-                 cols: {n: (count price)}}))
+                 n: (count price)}))
 ```
 
 ```text
@@ -274,7 +274,7 @@ Loaded: 4194304000 bytes, peak: 4831838208 bytes
 ;; First analysis pass
 (set result1 (select {from: trades
                        by: {date: date}
-                       cols: {vol: (sum qty)}})
+                       vol: (sum qty)})
 (.csv.write result1 "daily-volume.csv")
 (set result1 0)
 
@@ -284,7 +284,7 @@ Loaded: 4194304000 bytes, peak: 4831838208 bytes
 ;; Second analysis pass with maximum headroom
 (set result2 (select {from: trades
                        by: {sym: sym}
-                       cols: {vwap: (/ (sum (* price qty)) (sum qty))}}))
+                       vwap: (/ (sum (* price qty)) (sum qty))}))
 ```
 
 ### Pattern 3: Profile a Slow Query
@@ -304,8 +304,8 @@ elapsed: 42.1ms
 ```lisp
 (set grouped (select {from: filtered
                         by: {sym: sym}
-                        cols: {avg_price: (avg price)
-                               n: (count price)}}))
+                        avg_price: (avg price)
+                               n: (count price)}))
 ```
 
 ```text

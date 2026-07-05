@@ -6,6 +6,7 @@ Rayfall's builtins are organised under dotted namespaces. Names beginning with `
 
 | Namespace | Purpose |
 |---|---|
+| [`.attr.*`](../queries/attributes.md) | Column attribute control: `set`, `get`, `drop` (e.g. `sorted`). |
 | [`.col.*`](col.md) | Foreign-key style column-to-table linking and dotted dereference. |
 | [`.csv.*`](csv.md) | CSV import/export — in-memory, splayed-on-disk, and partitioned variants. |
 | [`.db.*`](db.md) | On-disk table I/O: splayed and partitioned `get` / `set`. |
@@ -25,11 +26,11 @@ When the server is started with `-U <password>`, the following dotted builtins a
 
 - `.csv.read`, `.csv.write`, `.csv.splayed`, `.csv.parted`
 - `.db.splayed.set`, `.db.parted.fill`
-- `.ipc.open`, `.ipc.close`, `.ipc.send`
-- `.log.open`, `.log.replay`, `.log.roll`, `.log.snapshot`, `.log.close`
+- `.ipc.open`, `.ipc.close`, `.ipc.send`, `.ipc.post`
+- `.log.open`, `.log.replay`, `.log.roll`, `.log.snapshot`, `.log.close`, `.log.purge`
 - `.os.getenv`, `.os.setenv`
 - `.repl.connect`, `.repl.disconnect`
 - `.sys.exec`, `.sys.cmd`, `.sys.listen`
 - `.time.timer.set`, `.time.timer.del`
 
-`.col.*`, `.graph.*`, `.idx.*`, and pure read/inspect builtins (`.db.splayed.get`, `.db.parted.get`, `.db.parted.tables`, `.fs.size`, `.fs.list`, `.log.write`, `.log.sync`, `.log.validate`, `.sys.build`, `.sys.info`, `.sys.mem`, `.sys.gc`, `.sys.env`, `.sys.timeit`, `.ipc.handle`, `.time.now`) are always available.
+`.attr.*`, `.col.*`, `.graph.*`, `.idx.*`, and pure read/inspect builtins (`.db.splayed.get`, `.db.parted.get`, `.db.parted.tables`, `.fs.size`, `.fs.list`, `.log.write`, `.log.sync`, `.log.validate`, `.sys.build`, `.sys.info`, `.sys.mem`, `.sys.gc`, `.sys.env`, `.sys.args`, `.sys.timeit`, `.ipc.handle`, `.time.now`) are always available.

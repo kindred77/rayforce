@@ -207,6 +207,10 @@ Update one or more columns with a new expression. The table is modified in-place
 
 ; Increment volume by 1
 (update {volume: (+ 1 volume) from: 'tab})
+; => tab           (returns the quoted table symbol, not the table)
+
+; The mutation is applied in-place; re-query to see it:
+tab
 ; sym  price volume
 ; ---  ----- ------
 ; AAPL   102    501
@@ -290,7 +294,7 @@ Pass a quoted table symbol for in-place mutation:
 
 ## Upsert
 
-The `upsert` function inserts new rows or updates existing ones based on a key column index. The second argument is the 0-based column index used as the match key.
+The `upsert` function inserts new rows or updates existing ones based on a composite key formed from the table's leading columns. The second argument is the **key count** — the number of leading columns used as the match key. It must be in the range `1..min(ncols, 16)`; passing `0` is an error.
 
 ### Insert New Rows
 
@@ -298,7 +302,7 @@ The `upsert` function inserts new rows or updates existing ones based on a key c
 (set t (table [ID Name Value]
     (list [1 2 3] ['Alice 'Bob 'Charlie] [10.0 20.0 30.0])))
 
-; Upsert on column 1 (ID). ID=4 is new, so insert.
+; Upsert on the first 1 column (ID) as key. ID=4 is new, so insert.
 (set t (upsert t 1 (list 4 'David 40.0)))
 ```
 

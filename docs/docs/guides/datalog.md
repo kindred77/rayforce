@@ -40,7 +40,7 @@ Use `query` with `find` and `where` clauses. Variables start with `?` and are bo
 ```text
 ┌─────┬───────────────────────────────┐
 │ ?e  │              ?n               │
-│ i64 │              i64              │
+│ I64 │              I64              │
 ├─────┼───────────────────────────────┤
 │ 1   │ 158                           │
 │ 2   │ 163                           │
@@ -60,7 +60,7 @@ The value column shows internal symbol IDs (integers). Use `sym-name` to convert
 ```text
 ┌─────┬───────────────────────────────┐
 │ ?n  │              ?d               │
-│ i64 │              i64              │
+│ I64 │              I64              │
 ├─────┼───────────────────────────────┤
 │ 158 │ 162                           │
 │ 163 │ 162                           │
@@ -80,7 +80,7 @@ Filter by constant values in patterns:
 ```text
 ┌─────────────────────────────────────┐
 │                 ?n                  │
-│                 i64                 │
+│                 I64                 │
 ├─────────────────────────────────────┤
 │ 158                                 │
 │ 165                                 │
@@ -106,7 +106,7 @@ Rules define derived relations. The pattern is: "if these patterns match, then t
 ```text
 ┌───────┬─────────────────────────────┐
 │ ?name │            ?dept            │
-│  i64  │             i64             │
+│  I64  │             I64             │
 ├───────┼─────────────────────────────┤
 │ 158   │ 162                         │
 │ 163   │ 162                         │
@@ -143,7 +143,7 @@ Rules can be recursive, enabling transitive closure. Here we model a management 
 ```text
 ┌─────┬───────────────────────────────┐
 │ ?x  │              ?y               │
-│ i64 │              i64              │
+│ I64 │              I64              │
 ├─────┼───────────────────────────────┤
 │ 1   │ 2                             │
 │ 1   │ 3                             │
@@ -177,7 +177,7 @@ Use `not` in a `where` clause to find entities that *lack* a given attribute:
 ```text
 ┌─────────────────────────────────────┐
 │                 ?n                  │
-│                 i64                 │
+│                 I64                 │
 ├─────────────────────────────────────┤
 │ 161                                 │
 ├─────────────────────────────────────┤
@@ -211,7 +211,7 @@ Query results show raw symbol IDs (integers) for string values. Use `sym-name` t
 ```
 
 ```text
-['name 158 'role 160 'dept 162]
+{name:158 role:160 dept:162}
 ```
 
 ```lisp
@@ -220,7 +220,7 @@ Query results show raw symbol IDs (integers) for string values. Use `sym-name` t
 ```
 
 ```text
-['name 158 'role 160]
+{name:158 role:160}
 ```
 
 ```lisp
@@ -232,7 +232,7 @@ Query results show raw symbol IDs (integers) for string values. Use `sym-name` t
 'Alice
 ```
 
-The `pull` function returns a flat list of alternating attribute-symbol and value pairs. For string-valued attributes, the value is a symbol ID that you decode with `sym-name`.
+The `pull` function returns a dict keyed by attribute symbol, with each attribute's value. For symbol-valued attributes, the value is a symbol ID that you decode with `sym-name`; retrieve a single attribute's value with `(get p 'name)`.
 
 ## 8. Real-World Example: Org Chart
 
@@ -281,7 +281,7 @@ Direct reports:
 ```text
 ┌──────┬──────────────────────────────┐
 │ ?mgr │             ?emp             │
-│ i64  │             i64              │
+│ I64  │             I64              │
 ├──────┼──────────────────────────────┤
 │ 1    │ 2                            │
 │ 1    │ 3                            │
@@ -302,7 +302,7 @@ Full chain of command (transitive closure):
 ```text
 ┌──────┬──────────────────────────────┐
 │ ?top │           ?bottom            │
-│ i64  │             i64              │
+│ I64  │             I64              │
 ├──────┼──────────────────────────────┤
 │ 1    │ 2                            │
 │ 1    │ 3                            │
@@ -324,7 +324,7 @@ Who does the CEO (entity 1) manage, directly or indirectly?
 ```text
 ┌─────────────────────────────────────┐
 │                ?emp                 │
-│                 i64                 │
+│                 I64                 │
 ├─────────────────────────────────────┤
 │ 2                                   │
 │ 3                                   │
