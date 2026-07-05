@@ -103,28 +103,38 @@ the payload adds no measurable cost to a non-profiled query.
 
 | Column | Meaning |
 |---|---|
-| `op` | Step / operator label (symbol). |
+| `operator` | Step / operator label (symbol). |
 | `depth` | Nesting depth (0 = top level). |
-| `dur_us` | Wall-clock microseconds. |
+| `cumulative-ms` | Wall-clock milliseconds, **including** child operators. |
+| `exclusive-ms` | Self time — this step minus its children (where time actually went). |
+| `percent` | Share of total query time, exclusive-based (columns sum to ~100). |
 | `rows` | Result element / row count (operators). |
-| `kb_out` | Result serialized footprint, KiB (bandwidth produced). |
-| `alloc_kb` | Net process bytes allocated across the step, KiB. |
+| `output-kib` | Result serialized footprint, KiB (bandwidth produced). |
+| `allocated-kib` | Net process bytes allocated across the step, KiB. |
 | `workers` | Worker threads that ran a task for this step. |
-| `busy_ms` | Summed worker busy time, ms. |
-| `par_eff` | Effective parallelism = `busy_ms` / `dur_us` (worker time ÷ wall time). |
+| `busy-ms` | Summed worker busy time, ms. |
+| `parallelism` | Effective parallelism = `busy-ms` / `cumulative-ms` (worker time ÷ wall time). |
+
+Timing follows the same convention as `EXPLAIN ANALYZE`-style profilers:
+`cumulative-ms` is the wall time of a step *and everything nested under it*,
+while `exclusive-ms` strips the children out so the true hot step stands out
+(a `count` over a huge `til` shows a large cumulative but a tiny exclusive —
+the `til` underneath is the real cost). `percent` ranks steps by exclusive
+time, so scanning that column finds the bottleneck directly.
 
 ```lisp
 ;; run a query with the profiler on (:t 1), then:
 (.sys.prof)
-;; a table: op | depth | dur_us | rows | kb_out | alloc_kb | workers | busy_ms | par_eff
-;; e.g. the GROUP row → rows=5000, kb_out=78.2, workers=28, par_eff=7.2
+;; a table: operator | depth | cumulative-ms | exclusive-ms | percent | rows |
+;;          output-kib | allocated-kib | workers | busy-ms | parallelism
+;; e.g. the GROUP row → rows=5000, output-kib=78.2, workers=28, parallelism=7.2
 
-;; it is a normal table, so query it:
-(select {from: (.sys.prof) where: (> dur_us 1000.0)})
+;; it is a normal table, so query it — rank steps by self time:
+(select {from: (.sys.prof) where: (> exclusive-ms 1.0)})
 ```
 
 The `:t` command also prints this as an indented tree after each query,
-with the same payload appended to every operator line.
+with self time, percent, and the same payload appended to every operator line.
 
 ## `.sys.gc` { #sys-gc }
 

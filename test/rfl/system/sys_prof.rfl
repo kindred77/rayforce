@@ -9,11 +9,11 @@
 ;; It is a table.
 (type (.sys.prof)) -- 'TABLE
 
-;; Nine fixed columns, in order.
-(count (key (.sys.prof))) -- 9
-(key (.sys.prof)) -- [op depth dur_us rows kb_out alloc_kb workers busy_ms par_eff]
+;; Eleven fixed columns, in order.
+(count (key (.sys.prof))) -- 11
+(key (.sys.prof)) -- [operator depth cumulative-ms exclusive-ms percent rows output-kib allocated-kib workers busy-ms parallelism]
 
 ;; It is an ordinary table — queryable like any other, without error.
 ;; (The row count reflects whatever query last ran with profiling on, so we
 ;; assert the projection is well-typed rather than a fixed count.)
-(type (select {from: (.sys.prof) where: (> dur_us 0.0)})) -- 'TABLE
+(type (select {from: (.sys.prof) where: (> cumulative-ms 0.0)})) -- 'TABLE

@@ -37,10 +37,13 @@
 #include "table/sym.h"
 #include "vec/vec.h"            /* ray_check_null_invariant (DEBUG null-model gate) */
 #include "core/profile.h"
+#include "core/qstats.h"   /* per-worker parallelism counters for eval-path spans */
+#include "store/serde.h"   /* ray_serde_size — result footprint for spans */
 #include "table/sym.h"
 #include "mem/heap.h"
 #include "core/pool.h"
 #include "mem/sys.h"
+#include "lang/env.h"      /* ray_fn_name — stable builtin label for spans */
 /* store/serde.h, store/splay.h, store/part.h moved to system.c */
 /* ray_lang_print, ray_cast_fn, etc. moved to ops/builtins.c */
 /* ray_error() is declared in <rayforce.h> (included via eval.h) */
@@ -3370,6 +3373,31 @@ void ray_lang_destroy(void) {
  * Tree-walking evaluator
  * ══════════════════════════════════════════ */
 
+/* Fill a profiler span's payload — memory (sys_cur), bandwidth (bytes_out),
+ * and parallelism (qstats) — from the live counters.  Mirrors exec_node's
+ * capture so direct-builtin ops (arithmetic, aggregation, generators that
+ * run OUTSIDE the DAG) report the same columns as DAG operators.  `result`
+ * is NULL at span START (no footprint to size yet). */
+static inline void eval_span_payload(ray_prof_span_t* s, ray_t* result) {
+    if (!s) return;
+    int64_t cur = 0; ray_sys_get_stat(&cur, NULL);
+    s->sys_cur = cur;
+    s->qs_rows = ray_qstats_sum_rows();
+    uint64_t sum = 0, mx = 0; uint32_t used = 0;
+    ray_qstats_agg(&used, &sum, &mx);
+    s->qs_busy_ns = sum;
+    s->qs_workers = used;
+    if (result && !RAY_IS_ERR(result) && !RAY_IS_NULL(result)) {
+        /* ray_len on a scalar atom returns the stored VALUE (the len field
+         * aliases i64), not an element count — so a `(sum …)` result would
+         * masquerade as a billion-row output.  A scalar is one row. */
+        s->rows_out  = (result->type == RAY_TABLE) ? ray_table_nrows(result)
+                     : ray_is_atom(result)         ? 1
+                     :                                (int64_t)ray_len(result);
+        s->bytes_out = ray_serde_size(result);
+    }
+}
+
 ray_t* ray_eval(ray_t* obj) {
     if (!obj || RAY_IS_ERR(obj)) return obj;
 
@@ -3390,6 +3418,16 @@ ray_t* ray_eval(ray_t* obj) {
     }
 
     ray_t* ret;
+
+    /* Direct-builtin profiling span: opened just before the head-dispatch
+     * switch below (for UNARY/BINARY/VARY builtins), closed at `out:`.
+     * Extends the profiler's coverage to ops that run outside the DAG —
+     * generators (`til`), arithmetic (`+`), aggregation (`count`/`sum`) —
+     * which otherwise leave the whole query opaque in a single `eval` tick.
+     * NULL/-1 on every path that never reaches the switch (atoms, errors). */
+    ray_prof_span_t* ev_span = NULL;
+    const char*      ev_name = NULL;
+    int64_t          ev_idx  = -1;
 
     /* Atoms: return themselves (retain) */
     if (ray_is_atom(obj)) {
@@ -3482,6 +3520,22 @@ ray_t* ray_eval(ray_t* obj) {
     }
 
     int64_t n = ray_len(obj);
+
+    /* Open a profiling span around the builtin invocation.  Gated on the
+     * profiler flag FIRST so the disabled path is a single predicted branch
+     * per call — nothing else runs (pillar-4 zero-cost-off).  When active,
+     * ray_fn_name reads the label inline from the fn object (stable,
+     * NUL-terminated), so there is no allocation. */
+    if (g_ray_profile.active &&
+        (head->type == RAY_UNARY || head->type == RAY_BINARY ||
+         head->type == RAY_VARY)) {
+        ev_name = ray_fn_name(head);
+        ev_span = ray_profile_span_start(ev_name);
+        if (ev_span) {
+            ev_idx = (int64_t)g_ray_profile.n - 1;   /* index of this START */
+            eval_span_payload(ev_span, NULL);
+        }
+    }
 
     switch (head->type) {
         case RAY_UNARY: {
@@ -3651,6 +3705,27 @@ ray_t* ray_eval(ray_t* obj) {
     }
 
 out:
+    /* Close the direct-builtin span opened before the dispatch switch.
+     * ev_span is non-NULL only when profiling is active and we opened one,
+     * so error/atom paths (which never reach the switch) skip this. */
+    if (ev_span) {
+        ray_prof_span_t* ep = ray_profile_span_end(ev_name);
+        if (ep) {
+            eval_span_payload(ep, ret);
+            /* Noise gate: retract a trivial LEAF span so scalar ops
+             * (`(+ 1 2)`, `(count 'x)`) don't flood the log.  A leaf has
+             * its START and END adjacent (no child spans appended between);
+             * keep it only if it moved bulk data (>1 row) or took real time
+             * (≥50µs).  Ops with nested children are always kept — they
+             * carry the tree structure. */
+            if (ev_idx >= 0 && (int64_t)g_ray_profile.n == ev_idx + 2) {
+                ray_prof_span_t* sp = &g_ray_profile.spans[ev_idx];
+                int64_t dur_ns = ep->ts - sp->ts;
+                if (ep->rows_out <= 1 && dur_ns < 50000)
+                    g_ray_profile.n = (uint32_t)ev_idx;   /* drop START+END */
+            }
+        }
+    }
     __VM->eval_depth--;
     /* End-of-top-level-expression cleanup hook. Every path that
      * entered ray_eval — REPL, IPC, ray_eval_str, file mode — exits

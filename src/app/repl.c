@@ -215,7 +215,14 @@ static void repl_query_progress_cb(const ray_progress_t* p, void* user) {
 
 /* ===== Profiler span tree printer (reads from g_ray_profile) ===== */
 
-static int32_t profile_print_tree(int32_t idx, int32_t indent) {
+/* Recursively print the span tree.  `total_ns` is the whole-query wall time
+ * (for the %-of-total figure); `*level_ns` is set on return to the summed
+ * wall time of the spans printed at THIS level, so a parent can subtract it
+ * to get its own EXCLUSIVE (self) time — the DuckDB EXPLAIN-ANALYZE view of
+ * where time actually went, since cumulative time hides it inside the root. */
+static int32_t profile_print_tree(int32_t idx, int32_t indent,
+                                  int64_t total_ns, int64_t* level_ns) {
+    int64_t acc = 0;   /* summed wall of spans printed at this level */
     while (idx < g_ray_profile.n) {
         ray_prof_span_t* sp = &g_ray_profile.spans[idx];
 
@@ -224,12 +231,23 @@ static int32_t profile_print_tree(int32_t idx, int32_t indent) {
             for (int32_t i = 0; i < indent; i++) fprintf(stdout, "\xe2\x94\x82 ");
             fprintf(stdout, "\xe2\x95\xad %s\n", sp->msg);
             idx++;
-            idx = profile_print_tree(idx, indent + 1);
+            int64_t child_ns = 0;
+            idx = profile_print_tree(idx, indent + 1, total_ns, &child_ns);
             if (idx < g_ray_profile.n) {
                 ray_prof_span_t* ep = &g_ray_profile.spans[idx];
-                double ms = (double)(ep->ts - sp->ts) / 1e6;
+                int64_t wall = ep->ts - sp->ts;
+                int64_t self = wall - child_ns; if (self < 0) self = 0;
+                acc += wall;
+                double ms = (double)wall / 1e6;
                 for (int32_t i = 0; i < indent; i++) fprintf(stdout, "\xe2\x94\x82 ");
                 fprintf(stdout, "\xe2\x95\xb0\xe2\x94\x80\xe2\x94\xa4 %.3f ms", ms);
+                /* Exclusive time + share of the whole query — surface these
+                 * whenever a span has children (self < wall) or is a
+                 * meaningful slice, so the bottleneck operator stands out. */
+                if (child_ns > 0)
+                    fprintf(stdout, " self=%.3f ms", (double)self / 1e6);
+                if (total_ns > 0)
+                    fprintf(stdout, " %.0f%%", (double)wall * 100.0 / (double)total_ns);
                 /* Append the captured per-operator payload: result rows and
                  * footprint, net allocation, and parallelism (worker count and
                  * effective parallelism = worker busy time / wall time). Only
@@ -242,7 +260,6 @@ static int32_t profile_print_tree(int32_t idx, int32_t indent) {
                     if (dmem != 0)
                         fprintf(stdout, " mem=%+.1fKB", (double)dmem / 1024.0);
                     if (ep->qs_workers > 0) {
-                        int64_t wall = ep->ts - sp->ts;
                         double  par  = wall > 0
                             ? (double)(ep->qs_busy_ns - sp->qs_busy_ns) / (double)wall : 0.0;
                         fprintf(stdout, " w=%u par=%.1fx", ep->qs_workers, par);
@@ -254,25 +271,31 @@ static int32_t profile_print_tree(int32_t idx, int32_t indent) {
             break;
         }
         case RAY_PROF_SPAN_END:
+            if (level_ns) *level_ns = acc;
             return idx;
         case RAY_PROF_SPAN_TICK: {
-            double ms = 0.0;
+            int64_t wall = 0;
             if (idx > 0)
-                ms = (double)(sp->ts - g_ray_profile.spans[idx - 1].ts) / 1e6;
+                wall = sp->ts - g_ray_profile.spans[idx - 1].ts;
+            acc += wall;
             for (int32_t i = 0; i < indent; i++) fprintf(stdout, "\xe2\x94\x82 ");
-            fprintf(stdout, "\xe2\x9c\xb6  %s: %.3f ms\n", sp->msg, ms);
+            fprintf(stdout, "\xe2\x9c\xb6  %s: %.3f ms\n", sp->msg, (double)wall / 1e6);
             idx++;
             break;
         }
         }
     }
+    if (level_ns) *level_ns = acc;
     return idx;
 }
 
 static void profile_print(bool use_color) {
     if (!g_ray_profile.active || g_ray_profile.n == 0) return;
     if (use_color) fprintf(stdout, "\033[90m");
-    profile_print_tree(0, 0);
+    int64_t total_ns = g_ray_profile.n > 0
+        ? g_ray_profile.spans[g_ray_profile.n - 1].ts - g_ray_profile.spans[0].ts : 0;
+    int64_t root_ns = 0;
+    profile_print_tree(0, 0, total_ns, &root_ns);
     if (use_color) fprintf(stdout, "\033[0m");
     fflush(stdout);
 }
@@ -702,7 +725,15 @@ static void eval_and_print(ray_term_t* term, const char* input,
         }
     }
 
-    bool profiling = timeit && g_ray_profile.active;
+    /* Read the live profiler flag, not the `timeit` parameter: the latter
+     * is a per-loop cached copy of g_ray_profile.active that is only
+     * refreshed after colon-commands, so toggling the profiler from a
+     * normal expression — `(.sys.timeit 1)` — would otherwise leave the
+     * REPL scaffolding disabled.  Remote-REPL mode has already returned
+     * above, so there is no case where profiling should be suppressed
+     * while the flag is set. */
+    (void)timeit;
+    bool profiling = g_ray_profile.active;
 
     if (profiling) {
         ray_profile_snapshot();

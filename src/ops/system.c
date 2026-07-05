@@ -746,15 +746,17 @@ ray_t* ray_memstat_fn(ray_t** args, int64_t n) {
  * One row per completed operator span (START/END pair) and per phase tick
  * (parse / eval / materialize / optimizer passes), in completion order.
  * Columns:
- *   op        the span label (symbol)
- *   depth     nesting depth (0 = top level)
- *   dur_us    wall-clock microseconds
- *   rows      result element/row count (operator spans)
- *   kb_out    result serialized footprint, KiB (operator spans)
- *   alloc_kb  net process bytes allocated across the span, KiB
- *   workers   worker threads that ran a task for this span
- *   busy_ms   summed worker busy time, ms (parallelism)
- *   par_eff   effective parallelism = busy time / wall time
+ *   operator       the span label (symbol)
+ *   depth          nesting depth (0 = top level)
+ *   cumulative-ms  wall-clock milliseconds, including children
+ *   exclusive-ms   self time — this span minus its children
+ *   percent        share of total query time (exclusive-based, sums to ~100)
+ *   rows           result element/row count (operator spans)
+ *   output-kib     result serialized footprint, KiB (operator spans)
+ *   allocated-kib  net process bytes allocated across the span, KiB
+ *   workers        worker threads that ran a task for this span
+ *   busy-ms        summed worker busy time, ms (parallelism)
+ *   parallelism    effective parallelism = busy time / wall time
  *
  * Because it returns an ordinary table, an IPC client gets the profile
  * with no protocol work.  Empty (0 rows) when the profiler is inactive or
@@ -778,13 +780,16 @@ ray_t* ray_prof_fn(ray_t** args, int64_t n) {
     ray_t* c_op    = ray_vec_new(RAY_SYM, nrows);
     ray_t* c_depth = ray_vec_new(RAY_I64, nrows);
     ray_t* c_dur   = ray_vec_new(RAY_F64, nrows);
+    ray_t* c_self  = ray_vec_new(RAY_F64, nrows);
+    ray_t* c_pct   = ray_vec_new(RAY_F64, nrows);
     ray_t* c_rows  = ray_vec_new(RAY_I64, nrows);
     ray_t* c_kb    = ray_vec_new(RAY_F64, nrows);
     ray_t* c_alloc = ray_vec_new(RAY_F64, nrows);
     ray_t* c_wrk   = ray_vec_new(RAY_I64, nrows);
     ray_t* c_busy  = ray_vec_new(RAY_F64, nrows);
     ray_t* c_par   = ray_vec_new(RAY_F64, nrows);
-    ray_t* cols[] = { c_op, c_depth, c_dur, c_rows, c_kb, c_alloc, c_wrk, c_busy, c_par };
+    ray_t* cols[] = { c_op, c_depth, c_dur, c_self, c_pct,
+                      c_rows, c_kb, c_alloc, c_wrk, c_busy, c_par };
     for (size_t i = 0; i < sizeof(cols)/sizeof(cols[0]); i++)
         if (!cols[i] || RAY_IS_ERR(cols[i])) {
             for (size_t j = 0; j < sizeof(cols)/sizeof(cols[0]); j++)
@@ -795,6 +800,8 @@ ray_t* ray_prof_fn(ray_t** args, int64_t n) {
     int64_t* op_ids  = (int64_t*)ray_data(c_op);
     int64_t* depths  = (int64_t*)ray_data(c_depth);
     double*  durs    = (double*)ray_data(c_dur);
+    double*  selfs   = (double*)ray_data(c_self);
+    double*  pcts    = (double*)ray_data(c_pct);
     int64_t* rows    = (int64_t*)ray_data(c_rows);
     double*  kbs     = (double*)ray_data(c_kb);
     double*  allocs  = (double*)ray_data(c_alloc);
@@ -802,25 +809,42 @@ ray_t* ray_prof_fn(ray_t** args, int64_t n) {
     double*  busys   = (double*)ray_data(c_busy);
     double*  pars    = (double*)ray_data(c_par);
 
-    /* Walk the flat span log, pairing START/END via a depth stack. */
+    /* Total wall time = the whole profiled window (first START → last END).
+     * Used for the `pct` share-of-total column, like EXPLAIN ANALYZE. */
+    int64_t total_ns = ns > 0 ? (p->spans[ns-1].ts - p->spans[0].ts) : 0;
+
+    /* Walk the flat span log, pairing START/END via a depth stack.
+     * child_ns[d] accumulates the wall time of the direct children of the
+     * span currently open at depth d, so each span's EXCLUSIVE (self) time
+     * is its own wall minus that sum — mirroring DuckDB's per-operator
+     * exclusive timing (cumulative is derivable by summing the subtree). */
     int32_t stack[256];
+    int64_t child_ns[256] = {0};
     int32_t sp = 0;
     int64_t prev_ts = ns > 0 ? p->spans[0].ts : 0;
     int64_t r = 0;
     for (int32_t i = 0; i < ns; i++) {
         const ray_prof_span_t* s = &p->spans[i];
         if (s->type == RAY_PROF_SPAN_START) {
-            if (sp < 256) stack[sp] = i;
+            if (sp < 256) { stack[sp] = i; child_ns[sp] = 0; }
             sp++;
         } else if (s->type == RAY_PROF_SPAN_END) {
             if (sp > 0) sp--;
             const ray_prof_span_t* st = (sp < 256 && sp >= 0) ? &p->spans[stack[sp]] : s;
             int64_t wall = s->ts - st->ts;
+            int64_t self = (sp < 256 && sp >= 0) ? wall - child_ns[sp] : wall;
+            if (self < 0) self = 0;
+            /* Fold this span's wall into its parent's child accumulator. */
+            if (sp - 1 >= 0 && sp - 1 < 256) child_ns[sp - 1] += wall;
             int64_t busy = (int64_t)(s->qs_busy_ns - st->qs_busy_ns);
             const char* nm = s->msg ? s->msg : "?";
             op_ids[r] = ray_sym_intern(nm, strlen(nm));
             depths[r] = sp;
-            durs[r]   = (double)wall / 1000.0;
+            durs[r]   = (double)wall / 1e6;
+            selfs[r]  = (double)self / 1e6;
+            /* Percent is EXCLUSIVE-based so the column partitions the query
+             * and sums to ~100% — a direct "where did time go" ranking. */
+            pcts[r]   = total_ns > 0 ? (double)self * 100.0 / (double)total_ns : 0.0;
             rows[r]   = s->rows_out;
             kbs[r]    = (double)s->bytes_out / 1024.0;
             allocs[r] = (double)(s->sys_cur - st->sys_cur) / 1024.0;
@@ -828,11 +852,16 @@ ray_t* ray_prof_fn(ray_t** args, int64_t n) {
             busys[r]  = (double)busy / 1e6;
             pars[r]   = wall > 0 ? (double)busy / (double)wall : 0.0;
             r++;
-        } else { /* TICK */
+        } else { /* TICK: a point phase (parse / eval / optimizer pass). */
+            int64_t wall = s->ts - prev_ts;
+            /* A tick is a leaf phase — count it against its parent's self. */
+            if (sp - 1 >= 0 && sp - 1 < 256) child_ns[sp - 1] += wall;
             const char* nm = s->msg ? s->msg : "?";
             op_ids[r] = ray_sym_intern(nm, strlen(nm));
             depths[r] = sp;
-            durs[r]   = (double)(s->ts - prev_ts) / 1000.0;
+            durs[r]   = (double)wall / 1e6;
+            selfs[r]  = (double)wall / 1e6;
+            pcts[r]   = total_ns > 0 ? (double)wall * 100.0 / (double)total_ns : 0.0;
             rows[r]   = 0; kbs[r] = 0.0; allocs[r] = 0.0;
             wrks[r]   = 0; busys[r] = 0.0; pars[r] = 0.0;
             r++;
@@ -846,9 +875,10 @@ ray_t* ray_prof_fn(ray_t** args, int64_t n) {
         cols[i]->len = r;
 
     /* Assemble the table. */
-    static const char* names[] = { "op","depth","dur_us","rows","kb_out",
-                                   "alloc_kb","workers","busy_ms","par_eff" };
-    ray_t* tbl = ray_table_new(9);
+    static const char* names[] = { "operator","depth","cumulative-ms","exclusive-ms",
+                                   "percent","rows","output-kib","allocated-kib",
+                                   "workers","busy-ms","parallelism" };
+    ray_t* tbl = ray_table_new(11);
     if (!tbl || RAY_IS_ERR(tbl)) {
         for (size_t i = 0; i < sizeof(cols)/sizeof(cols[0]); i++) ray_release(cols[i]);
         return tbl ? tbl : ray_error("oom", "sys.prof: table");
