@@ -1505,6 +1505,31 @@ static int group_input_scan_syms(ray_graph_t* g, ray_op_ext_t* gx,
     return collect_scan_syms(g, roots, nroots, syms, max, has_expr);
 }
 
+/* Lowercase display label for profiler spans.  ray_opcode_name returns the
+ * canonical UPPERCASE IR name — right for plan dumps and error messages, but
+ * the profiler tree also carries lowercase phase and builtin labels (parse,
+ * optimize, select, til), so an uppercase GROUP next to them reads as an
+ * arbitrary mix.  Lowercase, and render '_' as a space to match the
+ * space-separated pass labels (predicate pushdown, …).  Cached per opcode so
+ * the returned pointer stays valid for the life of a span. */
+static const char* prof_op_label(uint16_t opc) {
+    if (opc > OP_KNN_RERANK) return ray_opcode_name(opc);
+    static char lc[OP_KNN_RERANK + 1][28];
+    if (!lc[opc][0]) {
+        const char* up = ray_opcode_name(opc);
+        if (!up) return NULL;
+        size_t i = 0;
+        for (; up[i] && i < sizeof(lc[0]) - 1; i++) {
+            char c = up[i];
+            if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+            else if (c == '_')        c = ' ';
+            lc[opc][i] = c;
+        }
+        lc[opc][i] = '\0';
+    }
+    return lc[opc];
+}
+
 /* Is this opcode a "heavy" pipeline breaker worth profiling? */
 static inline bool op_is_heavy(uint16_t opc) {
     return opc == OP_FILTER || opc == OP_SORT || opc == OP_GROUP ||
@@ -1526,7 +1551,7 @@ ray_t* exec_node(ray_graph_t* g, ray_op_t* op) {
     bool profiling = g_ray_profile.active && heavy;
     const char* oname = NULL;
     if (heavy) {
-        oname = ray_opcode_name(op->opcode);
+        oname = prof_op_label(op->opcode);
         /* Relabel progress without touching counters — leaf ops that
          * drive their own rows_done/rows_total still work; ops that
          * don't get a spinner-style indeterminate bar until they

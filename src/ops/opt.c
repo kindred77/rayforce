@@ -2120,7 +2120,7 @@ ray_op_t* ray_optimize(ray_graph_t* g, ray_op_t* root) {
 
     /* Pass 4: SIP (graph-aware sideways information passing) */
     sip_pass(g, root);
-    ray_profile_tick("SIP");
+    ray_profile_tick("sip");
 
     /* Pass 5: Factorized detection (OP_EXPAND → OP_GROUP optimization) */
     factorize_pass(g, root);
@@ -2147,7 +2147,7 @@ ray_op_t* ray_optimize(ray_graph_t* g, ray_op_t* root) {
 
     /* Pass 10: DCE */
     pass_dce(g, root);
-    ray_profile_tick("DCE");
+    ray_profile_tick("dce");
 
     ray_profile_span_end("optimize");
 
