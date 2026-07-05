@@ -53,6 +53,11 @@ static ray_t* err_to_ray(ray_err_t e, const char* fallback) {
  * Accepting the mode as a sym keyword keeps the call self-documenting
  * without needing a second function or a magic int. */
 ray_t* ray_log_open_fn(ray_t** args, int64_t n) {
+#ifdef RAY_FUZZING
+    /* No journal files opened for writing at attacker-controlled paths. */
+    (void)args; (void)n;
+    return ray_error("restricted", "log.open disabled under fuzzing");
+#endif
     if (n != 2)
         return ray_error("rank", ".log.open expects (`async|`sync; \"base\")");
     if (!args[0] || args[0]->type != -RAY_SYM)

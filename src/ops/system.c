@@ -482,11 +482,18 @@ ray_t* ray_gc_fn(ray_t** args, int64_t n) { (void)args; (void)n; return ray_i64(
 
 /* (system cmd) -- run shell command, return exit code */
 ray_t* ray_system_fn(ray_t* x) {
+#ifdef RAY_FUZZING
+    /* Shell escape — disabled under fuzzing so untrusted input can't run
+     * arbitrary commands in the fuzzer process. */
+    (void)x;
+    return ray_error("restricted", "shell disabled under fuzzing");
+#else
     if (x->type != -RAY_STR) return ray_error("type", "system expects a string");
     const char* cmd = ray_str_ptr(x);
     if (!cmd) return ray_error("domain", ".sys.exec: empty or invalid command string");
     int rc = system(cmd);
     return make_i64(rc);
+#endif
 }
 
 /* (getenv name) -- get environment variable */
@@ -869,8 +876,14 @@ ray_t* ray_sys_args_fn(ray_t** args, int64_t n) {
  * The optional second argument bounds the TCP connect and handshake in
  * milliseconds; omitted leaves the default budget. */
 ray_t* ray_hopen_fn(ray_t** args, int64_t n) {
+#ifdef RAY_FUZZING
+    /* No outbound connections under fuzzing. */
+    (void)args; (void)n;
+    return ray_error("restricted", "ipc.open disabled under fuzzing");
+#else
     if (n < 1 || n > 2)
         return ray_error("rank", ".ipc.open expects 1 or 2 arguments: \"host:port[:user:password]\" [timeout-ms]");
+#endif
 
     ray_t* x = args[0];
     if (!ray_is_atom(x) || x->type != -RAY_STR)

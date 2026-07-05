@@ -474,10 +474,17 @@ ray_t* ray_timeit_fn(ray_t** args, int64_t n) {
 
 /* (exit code) — exit the process */
 ray_t* ray_exit_fn(ray_t* arg) {
+#ifdef RAY_FUZZING
+    /* A fuzz driver evaluates untrusted input in-process; letting it call
+     * exit() would tear the fuzzer down mid-run.  Surface it as an error. */
+    (void)arg;
+    return ray_error("restricted", "exit disabled under fuzzing");
+#else
     int code = 0;
     if (arg && is_numeric(arg)) code = (int)as_i64(arg);
     exit(code);
     return NULL; /* unreachable */
+#endif
 }
 
 /* (read-csv path) — read CSV file, return RAY_TABLE */
@@ -762,6 +769,11 @@ ray_t* ray_read_csv_parted_fn(ray_t** args, int64_t n) {
 
 /* (write-csv table path) — write table to CSV file */
 ray_t* ray_write_csv_fn(ray_t** args, int64_t n) {
+#ifdef RAY_FUZZING
+    /* No filesystem writes to attacker-controlled paths under fuzzing. */
+    (void)args; (void)n;
+    return ray_error("restricted", "write-csv disabled under fuzzing");
+#endif
     if (n < 2) return ray_error("arity", "write-csv: expects 2 arguments, got %lld", (long long)n);
     ray_t* tbl = args[0];
     ray_t* path_obj = args[1];

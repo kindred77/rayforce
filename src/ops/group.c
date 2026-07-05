@@ -674,6 +674,14 @@ static int64_t cd_seq_count(int8_t in_type, uint8_t in_attrs,
     if (!c) return -1;
     cap = c;
     uint64_t mask = cap - 1;
+    /* CD_HASH_K1 is the golden-ratio multiplier: it is a Fibonacci hash,
+     * whose well-mixed bits live in the HIGH end of the product, so the
+     * initial slot must come from the top bits (h >> shift), NOT h & mask.
+     * Masking the low bits collapses to a single bucket for keys whose low
+     * bits are all zero — e.g. integer-valued doubles, whose IEEE-754 bit
+     * patterns are large power-of-two multiples — turning the dedup into an
+     * O(n^2) probe storm (a query-reachable DoS on count(distinct f64col)). */
+    int cd_shift = 64 - __builtin_ctzll(cap);
 
     ray_t* set_hdr  = NULL;
     ray_t* used_hdr = NULL;
@@ -696,7 +704,7 @@ static int64_t cd_seq_count(int8_t in_type, uint8_t in_attrs,
             val = read_col_i64(base, i, in_type, in_attrs);
         }
         uint64_t h = (uint64_t)val * CD_HASH_K1;
-        uint64_t slot = h & mask;
+        uint64_t slot = h >> cd_shift;   /* Fibonacci hash: use the high bits */
         while (used[slot]) {
             if (set[slot] == val) goto cd_seq_next;
             slot = (slot + 1) & mask;

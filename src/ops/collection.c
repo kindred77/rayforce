@@ -2039,7 +2039,10 @@ ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
             int alloc = 0;
             ray_t* idx_elem = collection_elem(idx, j, &alloc);
             if (RAY_IS_ERR(idx_elem)) {
-                for (int64_t k = 0; k < j; k++) ray_release(out[k]);
+                /* Only out[0..j) are initialised; shrink len so ray_release
+                 * frees exactly those and never reads the garbage tail
+                 * (out[j..idxlen) is uninitialised). */
+                result->len = j;
                 ray_release(result);
                 return idx_elem;
             }
@@ -2047,7 +2050,7 @@ ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
             ray_t* val = ray_at_fn(vec, sub_idx);
             if (alloc) ray_release(idx_elem);
             if (RAY_IS_ERR(val)) {
-                for (int64_t k = 0; k < j; k++) ray_release(out[k]);
+                result->len = j;
                 ray_release(result);
                 return val;
             }

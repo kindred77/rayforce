@@ -1,0 +1,12 @@
+;; Regression: resolving a dotted name whose head is a builtin (e.g.
+;; `set.s`) drove ray_link_has to read the SLICE/HAS_LINK attribute bits of
+;; a function object and dereference its slice_parent union field as if it
+;; were a vector column — a garbage read / crash.  ray_link_has now returns
+;; false for non-vector values, so the dotted lookup falls through to a
+;; clean "undefined" name error.  Found by the eval fuzz target.
+set.s !- name
+sum.x !- name
+count.y !- name
+
+;; A real linked-column deref path is unaffected (plain names still resolve).
+(+ 1 2) -- 3

@@ -26,6 +26,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -60,6 +61,28 @@ static inline char* ray_fuzz_cstr(const uint8_t* data, size_t size) {
     if (size) memcpy(s, data, size);
     s[size] = '\0';
     return s;
+}
+
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/mman.h>
+
+/* Materialise the input as an anonymous in-memory file and hand back a
+ * /proc/self/fd path for the path-based readers (CSV, journal).  No disk
+ * I/O, no cleanup races.  Returns the fd (>=0) and fills path_out with the
+ * procfs path; the caller closes the fd when done.  Returns -1 on failure. */
+static inline int ray_fuzz_memfd(const uint8_t* data, size_t size,
+                                 char* path_out, size_t path_cap) {
+    int fd = memfd_create("rayfuzz", 0);
+    if (fd < 0) return -1;
+    size_t off = 0;
+    while (off < size) {
+        ssize_t w = write(fd, data + off, size - off);
+        if (w <= 0) { close(fd); return -1; }
+        off += (size_t)w;
+    }
+    snprintf(path_out, path_cap, "/proc/self/fd/%d", fd);
+    return fd;
 }
 
 #endif /* RAY_FUZZ_COMMON_H */

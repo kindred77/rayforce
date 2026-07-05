@@ -1,0 +1,36 @@
+# CSV reader dictionary — delimiters, quoting, line endings, and the
+# token shapes the type-inference path keys on (numbers, dates, nulls).
+
+# delimiters / structure
+","
+"\t"
+";"
+"|"
+"\n"
+"\r\n"
+"\""
+"\"\""
+"\",\""
+
+# quoted field with embedded delimiter / newline
+"\"a,b\""
+"\"a\nb\""
+
+# type-inference triggers
+"0"
+"-1"
+"1.5"
+"1e10"
+"true"
+"false"
+"2024.01.01"
+"12:00:00.000"
+"2024.01.01D12:00:00.000000000"
+
+# null / empty markers
+""
+"0N"
+
+# a plausible header row
+"a,b,c\n"
+"col1,col2,col3\n"

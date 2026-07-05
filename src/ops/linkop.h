@@ -69,6 +69,12 @@ ray_t* ray_link_detach(ray_t** vp);
  * parent and reading it through the slice is safe via slice_parent. */
 static inline bool ray_link_has(const ray_t* v) {
     if (!v || RAY_IS_ERR((ray_t*)v)) return false;
+    /* The HAS_LINK / SLICE attribute bits and the slice_parent pointer are
+     * only meaningful on vector columns; a function, lambda, or atom reuses
+     * those struct bytes for other purposes, so interpreting them as a link
+     * (and dereferencing slice_parent) reads garbage.  A dotted name like
+     * `set.s`, where the head resolves to a builtin, reaches here. */
+    if (!ray_is_vec(v)) return false;
     if (v->attrs & RAY_ATTR_HAS_LINK) return true;
     if (v->attrs & RAY_ATTR_SLICE) {
         const ray_t* p = v->slice_parent;
