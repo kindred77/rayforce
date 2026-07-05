@@ -1120,6 +1120,22 @@ static test_result_t test_epoll_hup_no_errfn(void) {
     int64_t id = ray_poll_register(poll, &reg);
     TEST_ASSERT_FMT(id >= 0, "ray_poll_register failed (id=%lld)", (long long)id);
 
+    /* Register the wake self-pipe BEFORE starting the poll thread.  The poll
+     * selector array is single-owner by design — production only ever
+     * registers/deregisters from the poll-loop thread — so registering here
+     * (while no poll thread is running) keeps this test faithful to that
+     * contract.  Later we only WRITE to wake_pipe[1], never touching the
+     * selector array from the main thread. */
+    int wake_pipe[2];
+    bool have_wake = (pipe(wake_pipe) == 0);
+    if (have_wake) {
+        ray_poll_reg_t wake_reg;
+        memset(&wake_reg, 0, sizeof(wake_reg));
+        wake_reg.fd   = wake_pipe[0];
+        wake_reg.type = RAY_SEL_SOCKET;
+        ray_poll_register(poll, &wake_reg);
+    }
+
     epoll_hup_noerrfn_ctx_t ctx = { .poll = poll, .hup_fired = 0 };
     ray_thread_t tid;
     ray_thread_create(&tid, epoll_hup_noerrfn_poll_thread, &ctx);
@@ -1133,15 +1149,9 @@ static test_result_t test_epoll_hup_no_errfn(void) {
     epoll_sleep_ms(50);
     ray_poll_exit(poll, 0);
 
-    /* Wake epoll_wait by registering a self-pipe and writing a byte */
-    int wake_pipe[2];
-    if (pipe(wake_pipe) == 0) {
-        ray_poll_reg_t wake_reg;
-        memset(&wake_reg, 0, sizeof(wake_reg));
-        wake_reg.fd   = wake_pipe[0];
-        wake_reg.type = RAY_SEL_SOCKET;
-        ray_poll_register(poll, &wake_reg);
-        /* Writing to the pipe wakes epoll_wait so poll->code >= 0 is checked */
+    /* Wake epoll_wait so the loop re-checks poll->code (>= 0) and exits.
+     * Only a write to the pipe — no selector-array mutation from here. */
+    if (have_wake) {
         char b = 'x';
         (void)write(wake_pipe[1], &b, 1);
         epoll_sleep_ms(30);

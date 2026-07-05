@@ -153,8 +153,10 @@ default: debug
 %.fuzz.o: %.c
 	$(CLANG) -c $(FUZZ_CFLAGS) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
 
+# TSan objects build with clang: gcc's -Werror=tsan rejects standalone
+# atomic_thread_fence (src/core/platform.h), which clang instruments fine.
 %.tsan.o: %.c
-	$(CC) -c $(TSAN_CFLAGS) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
+	$(CLANG) -c $(TSAN_CFLAGS) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
 
 %.hard.o: %.c
 	$(CC) -c $(HARDENED_CFLAGS) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
@@ -210,6 +212,28 @@ test: LDFLAGS = $(DEBUG_LDFLAGS)
 test: $(TARGET) $(LIB_OBJ) $(TEST_OBJ)
 	$(CC) $(CFLAGS) -o $(TARGET).test $(LIB_OBJ) $(TEST_OBJ) $(LIBS) $(LDFLAGS) -Itest
 	RAYFORCE_CORES=$(TEST_CORES) ./$(TARGET).test
+
+# ─── ThreadSanitizer ────────────────────────────────────────────────
+# Data-race detection for the lock-free pool/heap paths, which the
+# default ASan build cannot see (ASan and TSan are mutually exclusive,
+# hence the separate .tsan.o object flavour).  TSAN_CORES defaults to 4:
+# the harness default of 2 under-exercises the SPMC work-stealing ring,
+# and TSan wants real contention to observe races.
+#
+# tsan-test runs the IN-PROCESS concurrency suites by default (pool /
+# heap / parallel / stress); the IPC-diff tests spawn ./$(TARGET) as a
+# server and would mix build flavours, so they are out of scope here.
+# Narrow or widen with TSAN_FILTER, e.g. `make tsan-test TSAN_FILTER=pool`.
+TSAN_CORES  ?= 4
+TSAN_FILTER ?= stress
+TSAN_ENV     = TSAN_OPTIONS="suppressions=$(PWD)/.tsan-suppressions history_size=7 second_deadlock_stack=1 halt_on_error=0"
+
+tsan: $(TSAN_LIB_OBJ) $(TSAN_MAIN_OBJ)
+	$(CLANG) $(TSAN_CFLAGS) -o $(TARGET).tsan $(TSAN_LIB_OBJ) $(TSAN_MAIN_OBJ) $(LIBS) $(TSAN_LDFLAGS)
+
+tsan-test: $(TSAN_LIB_OBJ) $(TSAN_TEST_OBJ)
+	$(CLANG) $(TSAN_CFLAGS) -o $(TARGET).test.tsan $(TSAN_LIB_OBJ) $(TSAN_TEST_OBJ) $(LIBS) $(TSAN_LDFLAGS) -Itest
+	RAYFORCE_CORES=$(TSAN_CORES) $(TSAN_ENV) ./$(TARGET).test.tsan $(if $(TSAN_FILTER),-f $(TSAN_FILTER),)
 
 # Coverage report.  Builds both binaries with clang source-based
 # instrumentation, runs the test suite (writing one .profraw per
@@ -324,7 +348,7 @@ clean:
 	-rm -f cov-*.profraw default.profraw coverage.profdata
 	-rm -rf coverage_html
 
-.PHONY: default debug release lib dist test coverage compdb clean
+.PHONY: default debug release lib dist test coverage compdb tsan tsan-test fuzz-smoke clean
 
 # Header dependencies last: .d fragments only add prerequisites to the
 # object targets above, and being last they can't hijack the default goal.

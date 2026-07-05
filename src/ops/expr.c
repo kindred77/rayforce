@@ -2587,14 +2587,20 @@ static void par_binary_str_fn(void* ctx, uint32_t worker_id, int64_t start, int6
 }
 
 /* Inner loop for binary element-wise over a range [start, end) */
+/* rdata is the result's data pointer, resolved ONCE by the caller on the
+ * dispatching thread.  Workers must not call ray_data(result) themselves:
+ * that reads result->attrs to test the slice bit, which races (per TSan)
+ * with the relaxed-atomic OR of HAS_NULLS other workers perform below.
+ * The pointer is stable for the whole op, so resolving it up front is
+ * both correct and one fewer branch per morsel. */
 static void binary_range(ray_op_t* op, int8_t out_type,
-                         ray_t* lhs, ray_t* rhs, ray_t* result,
+                         ray_t* lhs, ray_t* rhs, ray_t* result, void* rdata,
                          bool l_scalar, bool r_scalar,
                          double l_f64, double r_f64,
                          int64_t l_i64, int64_t r_i64,
                          int64_t start, int64_t end) {
     uint8_t out_esz = ray_elem_size(out_type);
-    void* dst = (char*)ray_data(result) + start * out_esz;
+    void* dst = (char*)rdata + start * out_esz;
     int64_t n = end - start;
 
     /* Fast path: integer-family column vs integer scalar → bool comparison.
@@ -2922,6 +2928,7 @@ typedef struct {
     ray_t*    lhs;
     ray_t*    rhs;
     ray_t*    result;
+    void*     result_data;   /* ray_data(result), resolved once by the dispatcher */
     bool     l_scalar;
     bool     r_scalar;
     double   l_f64, r_f64;
@@ -2941,7 +2948,7 @@ static void par_binary_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t 
     (void)worker_id;
     par_binary_ctx_t* c = (par_binary_ctx_t*)ctx;
     if (!c->sel_flg) {
-        binary_range(c->op, c->out_type, c->lhs, c->rhs, c->result,
+        binary_range(c->op, c->out_type, c->lhs, c->rhs, c->result, c->result_data,
                      c->l_scalar, c->r_scalar,
                      c->l_f64, c->r_f64, c->l_i64, c->r_i64,
                      start, end);
@@ -2960,7 +2967,7 @@ static void par_binary_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t 
         if (s_lo < start) s_lo = start;
         if (s_hi > end)   s_hi = end;
         if (c->sel_flg[seg] == RAY_SEL_NONE) continue;
-        binary_range(c->op, c->out_type, c->lhs, c->rhs, c->result,
+        binary_range(c->op, c->out_type, c->lhs, c->rhs, c->result, c->result_data,
                      c->l_scalar, c->r_scalar,
                      c->l_f64, c->r_f64, c->l_i64, c->r_i64,
                      s_lo, s_hi);
@@ -3138,6 +3145,7 @@ ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* 
         par_binary_ctx_t ctx = {
             .op = op, .out_type = out_type,
             .lhs = lhs, .rhs = rhs, .result = result,
+            .result_data = ray_data(result),   /* resolve once on this thread */
             .l_scalar = l_scalar, .r_scalar = r_scalar,
             .l_f64 = l_f64_val, .r_f64 = r_f64_val,
             .l_i64 = l_i64_val, .r_i64 = r_i64_val,
@@ -3157,7 +3165,7 @@ ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* 
         }
         ray_pool_dispatch(pool, par_binary_fn, &ctx, len);
     } else {
-        binary_range(op, out_type, lhs, rhs, result,
+        binary_range(op, out_type, lhs, rhs, result, ray_data(result),
                      l_scalar, r_scalar,
                      l_f64_val, r_f64_val, l_i64_val, r_i64_val,
                      0, len);

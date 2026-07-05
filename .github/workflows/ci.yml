@@ -79,13 +79,29 @@ jobs:
             oom-*
           if-no-files-found: ignore
 
+  # ThreadSanitizer over the concurrency-sensitive suites (the lock-free
+  # pool/heap paths and the parallel operators).  ASan and TSan are mutually
+  # exclusive, so this is a separate build flavour.  TSAN_CORES=4 gives the
+  # work-stealing ring real contention to race against.  Linux + clang only.
+  tsan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: TSan concurrency suites
+        run: |
+          for f in pool heap parallel stress; do
+            echo "::group::tsan -f $f"
+            make tsan-test TSAN_FILTER=$f || exit 1
+            echo "::endgroup::"
+          done
+
   # Single stable check to require in branch protection, instead of the four
   # brittle matrix names (which break if the matrix is renamed). `if: always()`
   # makes this job run even when a matrix leg fails, and the explicit result
   # check fails it — without that, a failed matrix would SKIP this job, and a
   # skipped required check can be treated as passed, silently opening the gate.
   ci-success:
-    needs: [build-and-test, fuzz-smoke]
+    needs: [build-and-test, fuzz-smoke, tsan]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -93,5 +109,6 @@ jobs:
         run: |
           bt='${{ needs.build-and-test.result }}'
           fz='${{ needs.fuzz-smoke.result }}'
-          echo "build-and-test: $bt   fuzz-smoke: $fz"
-          [ "$bt" = "success" ] && [ "$fz" = "success" ] || exit 1
+          ts='${{ needs.tsan.result }}'
+          echo "build-and-test: $bt   fuzz-smoke: $fz   tsan: $ts"
+          [ "$bt" = "success" ] && [ "$fz" = "success" ] && [ "$ts" = "success" ] || exit 1
