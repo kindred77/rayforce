@@ -1,4 +1,13 @@
 CC      ?= clang
+# Some targets need clang specifically regardless of $(CC): the fuzzing
+# runtime (-fsanitize=fuzzer) and -MJ compilation-database fragments are
+# clang-only.  Same precedent as `make coverage`, which pins CC=clang.
+CLANG   ?= clang
+# The fuzzing runtime (-fsanitize=fuzzer) is implemented in C++, so the
+# final link must pull in the C++ standard library.  Using the C++ driver
+# for that one link step is the portable way to get its path right; the
+# translation units themselves stay C.
+CLANGXX ?= clang++
 STD     = c17
 AR      = ar
 TARGET  = rayforce
@@ -73,6 +82,38 @@ endif
 
 DEBUG_LDFLAGS   = -fsanitize=address,undefined
 
+# Extra build flavours (fuzz / tsan / hardened).  Each gets its OWN object
+# suffix (%.fuzz.o, %.tsan.o, %.hard.o) because the primary flavours compile
+# objects in place — mixing, say, thread-sanitized and address-sanitized
+# objects in one link is undefined at best.  The debug/release pair keeps
+# its historical in-place behaviour.
+#
+# fuzz: coverage-guided fuzzing drivers under fuzz/ link against these
+#   objects.  -O1 (not -O0): ~5-10x more executions/sec with still-usable
+#   stack traces.  RAY_FUZZING compiles out shell/network escape hatches
+#   (see src/lang/syscmd.c) so eval-based fuzzing stays sandboxed.
+#   Linux-only: the system toolchain on macOS does not bundle the fuzzer
+#   runtime.
+FUZZ_CFLAGS = -fPIC $(WARNS) -std=$(STD) -g -O1 -march=$(RAY_MARCH) -DDEBUG -DRAY_FUZZING \
+  -fsanitize=fuzzer-no-link,address,undefined -fno-omit-frame-pointer
+
+# tsan: data-race detection for the lock-free pool/heap paths.  Mutually
+# exclusive with address sanitizing, hence its own flavour.  DEBUG is kept
+# so the invariant checks run under it too.
+TSAN_CFLAGS  = -fPIC $(WARNS) -std=$(STD) -g -O1 -march=$(RAY_MARCH) -DDEBUG \
+  -fsanitize=thread -fno-omit-frame-pointer
+TSAN_LDFLAGS = -fsanitize=thread
+
+# hardened: the cloud-deployment tier.  Release optimization levels, but
+# keeps symbols and frame pointers (reliable crash backtraces, ~1% cost)
+# and RAY_HARDENED promotes the cheap invariant checks that DEBUG-only
+# builds would strip.  Same FP-reassociation flags as release — the two
+# flavours must not diverge numerically.
+HARDENED_CFLAGS = -fPIC $(WARNS) -std=$(STD) -O3 -march=$(RAY_MARCH) -g \
+  -fno-omit-frame-pointer -DRAY_HARDENED \
+  -funroll-loops -fno-math-errno -fassociative-math -ffp-contract=fast \
+  -fno-signed-zeros -fno-trapping-math
+
 CFLAGS  = $(DEBUG_CFLAGS)
 LDFLAGS = $(DEBUG_LDFLAGS)
 
@@ -85,11 +126,22 @@ MAIN_OBJ = $(MAIN_SRC:.c=.o)
 TEST_SRC = $(wildcard test/*.c)
 TEST_OBJ = $(TEST_SRC:.c=.o)
 
+# Per-flavour object lists (see the flavour CFLAGS block above).
+FUZZ_LIB_OBJ  = $(LIB_SRC:.c=.fuzz.o)
+TSAN_LIB_OBJ  = $(LIB_SRC:.c=.tsan.o)
+TSAN_MAIN_OBJ = $(MAIN_SRC:.c=.tsan.o)
+TSAN_TEST_OBJ = $(TEST_SRC:.c=.tsan.o)
+HARD_LIB_OBJ  = $(LIB_SRC:.c=.hard.o)
+HARD_MAIN_OBJ = $(MAIN_SRC:.c=.hard.o)
+
 # Auto-generated header dependencies (one .d per .o, see DEPFLAGS).
 # The fragments are -included at the very END of this file — including
 # them here would let a .d's first rule (e.g. `foo.o: ...`) become the
 # default goal, so bare `make` would build one object instead of `debug`.
-DEPS = $(LIB_OBJ:.o=.d) $(MAIN_OBJ:.o=.d) $(TEST_OBJ:.o=.d)
+DEPS = $(LIB_OBJ:.o=.d) $(MAIN_OBJ:.o=.d) $(TEST_OBJ:.o=.d) \
+       $(FUZZ_LIB_OBJ:.o=.d) \
+       $(TSAN_LIB_OBJ:.o=.d) $(TSAN_MAIN_OBJ:.o=.d) $(TSAN_TEST_OBJ:.o=.d) \
+       $(HARD_LIB_OBJ:.o=.d) $(HARD_MAIN_OBJ:.o=.d)
 
 # Default target (pinned so an -included .d fragment can't steal it).
 .DEFAULT_GOAL := default
@@ -97,6 +149,15 @@ default: debug
 
 %.o: %.c
 	$(CC) -c $(CFLAGS) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
+
+%.fuzz.o: %.c
+	$(CLANG) -c $(FUZZ_CFLAGS) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
+
+%.tsan.o: %.c
+	$(CC) -c $(TSAN_CFLAGS) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
+
+%.hard.o: %.c
+	$(CC) -c $(HARDENED_CFLAGS) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
 
 # Main binary — shared by debug/release/test (test/rfl/system/ipc_diff.rfl
 # spawns ./$(TARGET) as a server, so test depends on it too).
@@ -183,18 +244,87 @@ coverage:
 	@echo
 	@echo "→ coverage_html/index.html"
 
+# Compilation database for editors and standalone analyzers.  Flags are
+# uniform across every translation unit, so no build-interception tool is
+# needed: a syntax-only pass with -MJ emits one JSON fragment per file and
+# the fragments concatenate into compile_commands.json.
+compdb:
+	@rm -rf build_compdb && mkdir -p build_compdb
+	@i=0; for f in $(LIB_SRC) $(MAIN_SRC); do \
+	  i=$$((i+1)); \
+	  $(CLANG) -c -o /dev/null -std=$(STD) -DDEBUG $(DEFS) $(INCLUDES) \
+	    -MJ build_compdb/$$i.json $$f || exit 1; \
+	done
+	@{ echo '['; cat build_compdb/*.json | sed '$$s/,$$//'; echo ']'; } > compile_commands.json
+	@rm -rf build_compdb
+	@echo "compile_commands.json: $$(grep -c '"file"' compile_commands.json) entries"
+
+# ─── Fuzzing (coverage-guided; clang + Linux only) ──────────────────
+# Drivers live under fuzz/ and link against the address-sanitized
+# .fuzz.o library objects.  Grown corpora live in fuzz/corpus/<t>/
+# (gitignored); committed starter inputs live in fuzz/seeds/<t>/.
+#
+#   make fuzz-parse                 # 60s (default) run of one target
+#   make fuzz-parse FUZZ_RUNTIME=0  # run until a crash / Ctrl-C
+#   make fuzz-smoke                 # short CI pass over the fast targets
+#
+# The system toolchain on macOS does not ship the fuzzer runtime, so
+# these targets are Linux-only by design; CI gates them to ubuntu.
+FUZZ_RUNTIME ?= 60
+FUZZ_OPTS     = -rss_limit_mb=4096 -timeout=10 -max_len=65536 -print_final_stats=1
+FUZZ_TARGETS  = parse numparse de
+# Escape hatch for hosts where clang auto-selects a gcc toolchain dir that
+# lacks libstdc++ (e.g. a partially-installed newer gcc shadowing the real
+# one).  Normally empty; set on such a box, e.g.
+#   make fuzz-smoke FUZZ_LDEXTRA=--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/11
+FUZZ_LDEXTRA ?=
+
+# Per-target dictionary (defaults to the rayfall token dict; override in
+# the map below).  numparse needs no dictionary.
+DICT_parse    = rayfall
+DICT_de       = frame
+
+# The driver .c is compiled with fuzzer instrumentation; the link goes
+# through the C++ driver so the fuzzer runtime's C++ dependency resolves.
+build_fuzz/fuzz_%: fuzz/fuzz_%.c $(FUZZ_LIB_OBJ)
+	@mkdir -p build_fuzz
+	$(CLANG) -c $(FUZZ_CFLAGS) -fsanitize=fuzzer $(DEFS) $(INCLUDES) -Ifuzz \
+	  -o build_fuzz/$*.o $<
+	$(CLANGXX) -fsanitize=fuzzer,address,undefined $(FUZZ_LDEXTRA) \
+	  -o $@ build_fuzz/$*.o $(FUZZ_LIB_OBJ) $(LIBS)
+
+fuzz-%: build_fuzz/fuzz_%
+	@mkdir -p fuzz/corpus/$*
+	@dict=$(DICT_$*); \
+	 dictopt=$${dict:+-dict=fuzz/dict/$$dict.dict}; \
+	 seeds=$$( [ -d fuzz/seeds/$* ] && echo fuzz/seeds/$* ); \
+	 set -x; \
+	 ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 \
+	   ./build_fuzz/fuzz_$* fuzz/corpus/$* $$seeds \
+	   $$dictopt $(FUZZ_OPTS) -max_total_time=$(FUZZ_RUNTIME)
+
+# Short smoke pass for PR CI — a healthy corpus finds nothing new in a
+# minute, and any crash it surfaces is a genuine regression.
+fuzz-smoke:
+	$(MAKE) fuzz-parse fuzz-numparse fuzz-de FUZZ_RUNTIME=60
+
+.PHONY: fuzz-smoke
+
 clean:
 	-rm -f $(LIB_OBJ) $(MAIN_OBJ) $(TEST_OBJ)
+	-rm -f $(FUZZ_LIB_OBJ) $(TSAN_LIB_OBJ) $(TSAN_MAIN_OBJ) $(TSAN_TEST_OBJ) \
+	       $(HARD_LIB_OBJ) $(HARD_MAIN_OBJ)
 	-rm -f $(DEPS)
 	-rm -f $(TARGET) $(TARGET).test lib$(TARGET).a
-	-rm -rf build build_release dist
+	-rm -f $(TARGET).tsan $(TARGET).test.tsan
+	-rm -rf build build_release build_fuzz build_compdb dist
 	# Test-generated fixtures (see test/rfl/system/*.rfl) — should not linger after a run.
 	-rm -f rf_test_*.csv
 	# Coverage artefacts (see `make coverage`).
 	-rm -f cov-*.profraw default.profraw coverage.profdata
 	-rm -rf coverage_html
 
-.PHONY: default debug release lib dist test coverage clean
+.PHONY: default debug release lib dist test coverage compdb clean
 
 # Header dependencies last: .d fragments only add prerequisites to the
 # object targets above, and being last they can't hijack the default goal.

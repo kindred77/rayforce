@@ -44,18 +44,54 @@ jobs:
         if: matrix.target == 'debug'
         run: make test
 
+  # Coverage-guided fuzz smoke pass over the untrusted-input decoders
+  # (parser, numeric scanners, wire-frame decoder).  A healthy corpus finds
+  # nothing new in a minute, so any crash here is a genuine regression.
+  # Linux + clang only (the fuzzing runtime is not bundled on the macOS
+  # system toolchain).  The working corpus is regenerated from the test
+  # suite each run and cached so coverage accretes across runs.
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache fuzz corpus
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
+      - name: Seed corpora
+        run: |
+          scripts/fuzz-seed-parse.sh
+          make debug            # fuzz-seed-frames.sh drives a real server
+          scripts/fuzz-seed-frames.sh || true
+      - name: Fuzz smoke
+        run: make fuzz-smoke
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: |
+            crash-*
+            leak-*
+            timeout-*
+            oom-*
+          if-no-files-found: ignore
+
   # Single stable check to require in branch protection, instead of the four
   # brittle matrix names (which break if the matrix is renamed). `if: always()`
   # makes this job run even when a matrix leg fails, and the explicit result
   # check fails it — without that, a failed matrix would SKIP this job, and a
   # skipped required check can be treated as passed, silently opening the gate.
   ci-success:
-    needs: build-and-test
+    needs: [build-and-test, fuzz-smoke]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Verify all matrix jobs passed
+      - name: Verify all required jobs passed
         run: |
-          result='${{ needs.build-and-test.result }}'
-          echo "build-and-test result: $result"
-          [ "$result" = "success" ] || exit 1
+          bt='${{ needs.build-and-test.result }}'
+          fz='${{ needs.fuzz-smoke.result }}'
+          echo "build-and-test: $bt   fuzz-smoke: $fz"
+          [ "$bt" = "success" ] && [ "$fz" = "success" ] || exit 1
