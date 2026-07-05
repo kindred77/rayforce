@@ -337,6 +337,35 @@ fuzz-smoke:
 
 .PHONY: fuzz-smoke
 
+# ─── Static analysis ────────────────────────────────────────────────
+# clang-tidy runs OUTSIDE the build: it never touches the real compiler
+# warnings or -Werror.  Flags are uniform across every translation unit,
+# so we pass them after `--` and skip the compilation database entirely
+# (the `.clang-tidy` file selects the correctness-only check set).
+# `make tidy FILES="src/ops/foo.c"` narrows to specific files.
+TIDY_FLAGS = -std=$(STD) -DDEBUG $(DEFS) $(INCLUDES)
+FILES     ?= $(LIB_SRC) $(MAIN_SRC)
+
+tidy:
+	@command -v clang-tidy >/dev/null || { echo "tidy: clang-tidy not found"; exit 1; }
+	clang-tidy --quiet $(FILES) -- $(TIDY_FLAGS)
+
+# cppcheck is a second-opinion linter — advisory only, never a gate.
+cppcheck:
+	@command -v cppcheck >/dev/null || { echo "cppcheck: not found"; exit 1; }
+	cppcheck --enable=warning,portability --inline-suppr --error-exitcode=1 \
+	  -j $(shell nproc 2>/dev/null || echo 4) \
+	  --suppress=missingIncludeSystem \
+	  --suppress=assignBoolToPointer \
+	  --suppress=nullPointerRedundantCheck \
+	  --std=c11 -q $(INCLUDES) src/
+# assignBoolToPointer: cppcheck misparses the GNU computed-goto label
+#   address `&&label` (a void*) as a logical-AND yielding a bool.
+# nullPointerRedundantCheck: a heuristic that fires on the codebase's
+#   deliberate defensive "check then use" ordering; reviewed as benign.
+
+.PHONY: tidy cppcheck
+
 clean:
 	-rm -f $(LIB_OBJ) $(MAIN_OBJ) $(TEST_OBJ)
 	-rm -f $(FUZZ_LIB_OBJ) $(TSAN_LIB_OBJ) $(TSAN_MAIN_OBJ) $(TSAN_TEST_OBJ) \

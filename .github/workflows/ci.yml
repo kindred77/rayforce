@@ -95,11 +95,29 @@ jobs:
             echo "::endgroup::"
           done
 
+  # Static analysis — ADVISORY (continue-on-error): the correctness-only
+  # check sets currently surface only false positives (GNU computed-goto
+  # label addresses, caller-guaranteed non-null params, defensive
+  # redundant-null-check heuristics), so this reports without gating.
+  # cppcheck runs whole-tree here (fast); the heavier clang-tidy pass
+  # (`make tidy`) runs locally and in the nightly workflow.  Flip to a
+  # blocking gate once the baseline is annotated clean.
+  static-analysis:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cppcheck
+        run: sudo apt-get update && sudo apt-get install -y cppcheck
+      - name: cppcheck
+        run: make cppcheck
+
   # Single stable check to require in branch protection, instead of the four
   # brittle matrix names (which break if the matrix is renamed). `if: always()`
   # makes this job run even when a matrix leg fails, and the explicit result
   # check fails it — without that, a failed matrix would SKIP this job, and a
   # skipped required check can be treated as passed, silently opening the gate.
+  # static-analysis is intentionally NOT in `needs` — it is advisory only.
   ci-success:
     needs: [build-and-test, fuzz-smoke, tsan]
     if: always()
