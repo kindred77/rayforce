@@ -2185,12 +2185,17 @@ static test_result_t test_order_overflow_guards(void) {
     /* Just below the overflow boundary still saturates at MAX_ORDER+1. */
     TEST_ASSERT_EQ_U(ray_order_for_size(SIZE_MAX - 16), RAY_HEAP_MAX_ORDER + 1);
 
-    /* A size that maps to order RAY_HEAP_MAX_ORDER (38) — pool_order would
-     * be 39 (> MAX) so heap_add_pool returns false at L271 → alloc NULL.
-     * data = (1<<38) - 32 → total = 1<<38 → ceil_log2 = 38. */
+    /* A size that maps to order RAY_HEAP_MAX_ORDER (38) still resolves to a
+     * real order — no longer a guaranteed NULL: order >= RAY_HEAP_POOL_ORDER
+     * goes the direct path, and a size larger than physical RAM now spills to
+     * a file-backed direct mapping rather than failing.  (We don't allocate it
+     * here — that would fallocate a ~256 GiB spill file.) */
     size_t sz = ((size_t)1 << 38) - 64;
     TEST_ASSERT_EQ_U(ray_order_for_size(sz), RAY_HEAP_MAX_ORDER);
-    ray_t* v = ray_alloc(sz);   /* heap_add_pool(38) → pool_order 39 → false */
+
+    /* The clean-NULL guard is the arithmetic-overflow case: an order ABOVE
+     * RAY_HEAP_MAX_ORDER is rejected up front (before any mapping or spill). */
+    ray_t* v = ray_alloc(SIZE_MAX);   /* order MAX+1 → rejected at the guard */
     TEST_ASSERT_NULL(v);
     PASS();
 }

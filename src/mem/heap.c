@@ -1021,16 +1021,76 @@ static void ray_detach_owned_refs(ray_t* v) {
  * ray_alloc
  * -------------------------------------------------------------------------- */
 
+/* File-backed direct mapping: a disk-spilled standalone allocation, used when
+ * an allocation cannot be RAM-resident (larger than physical RAM) or when the
+ * anonymous mmap was refused.  Mirrors heap_add_pool's swap fallback but at the
+ * exact size — a direct block needs no pool alignment (it is located by its
+ * stored map_size, not by pool-base masking), so a plain mmap suffices.
+ * Returns the mapped base and the fd/path to close+unlink at free; NULL on
+ * failure. */
+static void* heap_direct_map_file(ray_heap_t* h, size_t map_size,
+                                  int* out_fd, char** out_path) {
+    static _Atomic uint64_t direct_swap_counter = 0;
+    uint64_t cnt = atomic_fetch_add_explicit(&direct_swap_counter, 1,
+                                             memory_order_relaxed);
+    size_t plen = strlen(h->swap_path);
+    size_t need = plen + 64;  /* room for "raydirect_<pid>_<heap>_<cnt>.dat" */
+    char*  path = (char*)ray_sys_alloc(need);
+    if (!path) return NULL;
+    snprintf(path, need, "%sraydirect_%d_%u_%llu.dat", h->swap_path,
+             (int)getpid(), (unsigned)h->id, (unsigned long long)cnt);
+
+    int fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) { ray_sys_free(path); return NULL; }
+
+    /* Reserve real disk blocks up front so later stores can't SIGBUS on a
+     * disk-full condition.  ENOSPC here surfaces as a clean NULL -> "oom". */
+    if (heap_preallocate(fd, 0, (off_t)map_size) != 0) {
+        close(fd); unlink(path); ray_sys_free(path); return NULL;
+    }
+    void* mapped = mmap(NULL, map_size, PROT_READ | PROT_WRITE,
+                        MAP_SHARED, fd, 0);
+    if (mapped == MAP_FAILED) {
+        close(fd); unlink(path); ray_sys_free(path); return NULL;
+    }
+    /* Count as committed working set — a RAM substitute with preallocated
+     * blocks (matches heap_add_pool's swap-pool accounting). */
+    ray_sys_track_add((int64_t)map_size);
+    *out_fd   = fd;
+    *out_path = path;
+    return mapped;
+}
+
 /* Direct large allocation: mmap the exact page-rounded size instead of a
- * power-of-2 oversized buddy pool.  Returns a marked ray_t or NULL on mmap
- * failure (caller falls back to the buddy pool + its swap path). */
+ * power-of-2 oversized buddy pool.  Returns a marked ray_t or NULL on failure. */
 static ray_t* heap_alloc_direct(ray_heap_t* h, size_t data_size) {
     if (data_size > SIZE_MAX - RAY_DIRECT_HDR - 32 - 4095) return NULL;
     size_t map_size = (RAY_DIRECT_HDR + 32 + data_size + 4095) & ~(size_t)4095;
-    void* base = ray_vm_alloc(map_size);   /* anon RW, page-aligned, counted */
-    if (!base) return NULL;
 
-    ((ray_direct_hdr_t*)base)->map_size = map_size;
+    void* base      = NULL;
+    int   swap_fd   = -1;
+    char* swap_path = NULL;
+
+    /* An allocation larger than all physical RAM cannot be RAM-resident: back
+     * it with a disk file from the start so it spills instead of being
+     * OOM-killed as its pages fault in.  (Under lenient overcommit an exact
+     * anon mmap this large SUCCEEDS, so a fallback-on-failure alone would not
+     * catch it.)  Otherwise use anonymous RAM, and fall back to a spill file
+     * only if the kernel refuses the mapping. */
+    int64_t total_ram = ray_sys_total_ram();
+    bool force_file = (total_ram > 0 && map_size > (size_t)total_ram);
+    if (!force_file)
+        base = ray_vm_alloc(map_size);   /* anon RW, page-aligned, counted */
+    if (!base) {
+        base = heap_direct_map_file(h, map_size, &swap_fd, &swap_path);
+        if (!base) return NULL;
+    }
+
+    ray_direct_hdr_t* hdr = (ray_direct_hdr_t*)base;
+    hdr->map_size  = map_size;
+    hdr->swap_fd   = swap_fd;
+    hdr->swap_path = swap_path;
+
     ray_t* v = (ray_t*)((char*)base + RAY_DIRECT_HDR);
     memset(v, 0, 32);
     v->mmod  = 0;
@@ -1211,12 +1271,24 @@ void ray_free(ray_t* v) {
      * BEFORE any pool masking (a direct block is not a pool member).  Any
      * thread may free it; the counter is a global atomic. */
     if (RAY_UNLIKELY(v->order > RAY_HEAP_MAX_ORDER)) {
-        char*  base = (char*)v - RAY_DIRECT_HDR;
-        size_t map_size = ((ray_direct_hdr_t*)base)->map_size;
+        char*             base = (char*)v - RAY_DIRECT_HDR;
+        ray_direct_hdr_t* hdr  = (ray_direct_hdr_t*)base;
+        size_t map_size  = hdr->map_size;
+        int    swap_fd   = hdr->swap_fd;
+        char*  swap_path = hdr->swap_path;
         if (h) RAY_STAT(h->stats.free_count++);
         atomic_fetch_sub_explicit(&g_direct_bytes, (int64_t)map_size, memory_order_relaxed);
         atomic_fetch_sub_explicit(&g_direct_count, 1, memory_order_relaxed);
-        ray_vm_free(base, map_size);   /* munmap + committed-RAM counter -= */
+        if (swap_fd >= 0) {
+            /* File-backed spill: mapped directly (not via ray_vm_alloc), so
+             * unmap + uncount by hand, then close and unlink the spill file. */
+            munmap(base, map_size);
+            ray_sys_track_sub((int64_t)map_size);
+            close(swap_fd);
+            if (swap_path) { unlink(swap_path); ray_sys_free(swap_path); }
+        } else {
+            ray_vm_free(base, map_size);   /* munmap + committed-RAM counter -= */
+        }
         return;
     }
 

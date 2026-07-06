@@ -8,7 +8,7 @@ Rayforce uses a custom memory subsystem — no calls to `malloc` or `free` ever 
 - **Slab cache** — Small allocations (common for atoms and short vectors) are served from pre-sized slab pools, avoiding buddy-tree overhead.
 - **COW ref counting** — Vectors use copy-on-write semantics via `ray_retain`/`ray_release`. Shared vectors are only copied when mutated. Note that `ray_retain`/`ray_release`/`ray_cow` are no-ops on `RAY_ERROR` objects, so an error block must be reclaimed with `ray_error_free()` rather than `ray_release()`.
 - **Arena allocator** — For bulk short-lived blocks (e.g., intermediate query results). Arena objects carry an `RAY_ATTR_ARENA` flag that makes retain/release no-ops. The entire arena is freed at once when work completes.
-- **Out-of-core spill** — There is no enforced memory ceiling. When an anonymous `mmap` for a new pool is refused (physical RAM and swap exhausted), the heap falls back to a file-backed mapping on disk, so a working set larger than RAM completes — slowly — instead of failing. Total physical RAM is detected at startup for informational reporting only (see `.sys.info` → `total-mem`).
+- **Out-of-core spill** — There is no enforced memory ceiling. When an anonymous `mmap` for a new pool is *refused* by the OS, the heap falls back to a file-backed mapping on disk, so the working set spills rather than the allocation failing. Note this depends on the OS actually refusing the mapping: under Linux's default memory overcommit (`vm.overcommit_memory=0`), a single allocation larger than RAM+swap is typically *accepted* and then killed by the OOM killer as its pages fault in — spill only saves you when the kernel declines the mapping up front. Total physical RAM is detected at startup for informational reporting only (see `.sys.info` → `total-mem`).
 
 For a deep dive into the allocator internals, see [Memory Model](../architecture/memory.md).
 
@@ -115,6 +115,7 @@ The bar displays:
 - **Percentage** — Estimated completion based on rows processed
 - **Operation name** — The current phase (e.g., `group: hash`, `sort: merge`, `join: probe`)
 - **Elapsed time** — Wall-clock time since query start
+- **Memory** — Live object footprint (`used / total`) against total physical RAM, so you can watch a large query climb toward the point where it no longer fits
 
 ### Example Session
 
@@ -209,10 +210,18 @@ This is the fastest way to identify slow expressions in an interactive session. 
 ## 8. Total RAM and Out-of-Core Spill
 
 Rayforce imposes **no enforced memory ceiling**. Total physical RAM is detected
-at startup purely for reporting. When a query's working set outgrows physical
-RAM (and swap), the heap spills to a file-backed mapping on disk rather than
-failing — the query completes, more slowly. There is no budget threshold that
-rejects work or throttles it.
+at startup purely for reporting; there is no budget threshold that rejects work
+or throttles it.
+
+When the OS *refuses* a new pool mapping, the heap spills that pool to a
+file-backed mapping on disk and the query keeps running (more slowly). This is a
+genuine safety net under strict overcommit (`vm.overcommit_memory=2`) or when
+address space is bounded. Under Linux's **default** heuristic overcommit,
+however, a single result larger than RAM+swap is usually *accepted* by the
+kernel and then killed by the OOM killer as its pages fault in — so a query like
+`(til 10000000000)` (a 74 GiB vector) on a machine with less RAM than that will
+be terminated, not spilled. Watch the progress bar's `used / total` figure to
+see the footprint approach total RAM and cancel with Ctrl-C before it is killed.
 
 ### Checking total RAM
 
