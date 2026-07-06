@@ -342,6 +342,7 @@ ray_t* exec_var_expand(ray_graph_t* g, ray_op_t* op, ray_t* start_vec) {
 
     /* BFS per start node */
     for (int64_t s = 0; s < n_start; s++) {
+        if (ray_interrupted()) { scratch_free(depth_hdr); scratch_free(end_hdr); scratch_free(start_hdr); return ray_error("cancel", NULL); }
         int64_t start_node = start_data[s];
         if (start_node < 0 || start_node >= bfs_n_nodes) continue;
 
@@ -564,6 +565,7 @@ ray_t* exec_shortest_path(ray_graph_t* g, ray_op_t* op,
      * the BFS would spin forever on a disconnected graph (target
      * unreachable, queue settles, but the depth counter never exits). */
     for (int depth = 1; depth <= (int)max_depth && !found; depth++) {
+        if (ray_interrupted()) { scratch_free(queue_hdr); scratch_free(parent_hdr); return ray_error("cancel", NULL); }
         int64_t level_end = q_end;
         for (int64_t qi = q_start; qi < level_end && !found; qi++) {
             int64_t node = queue[qi];
@@ -697,6 +699,7 @@ ray_t* exec_pagerank(ray_graph_t* g, ray_op_t* op) {
     double base = (1.0 - damping) / (double)n;
 
     for (uint16_t iter = 0; iter < iters; iter++) {
+        if (ray_interrupted()) { ray_scratch_arena_reset(&arena); return ray_error("cancel", NULL); }
         /* Dangling node correction: redistribute rank of zero-out-degree nodes */
         double dangling_sum = 0.0;
         for (int64_t u = 0; u < n; u++) {
@@ -798,6 +801,7 @@ ray_t* exec_connected_comp(ray_graph_t* g, ray_op_t* op) {
     /* Iterate until convergence */
     bool changed = true;
     while (changed) {
+        if (ray_interrupted()) { ray_scratch_arena_reset(&arena); return ray_error("cancel", NULL); }
         changed = false;
         for (int64_t v = 0; v < n; v++) {
             int64_t min_label = label[v];
@@ -1018,6 +1022,7 @@ ray_t* exec_dijkstra(ray_graph_t* g, ray_op_t* op,
     int64_t* fwd_row = (int64_t*)ray_data(rel->fwd.rowmap);
 
     while (heap_size > 0) {
+        if (ray_interrupted()) { ray_scratch_arena_reset(&arena); return ray_error("cancel", NULL); }
         dijk_entry_t top = dijk_heap_pop(heap, &heap_size);
         int64_t u = top.node;
         if (visited[u]) continue;
@@ -1250,6 +1255,7 @@ ray_t* exec_louvain(ray_graph_t* g, ray_op_t* op) {
     memset(k_i_in, 0, (size_t)n * sizeof(int64_t));
 
     for (uint16_t iter = 0; iter < max_iter; iter++) {
+        if (ray_interrupted()) { ray_scratch_arena_reset(&arena); return ray_error("cancel", NULL); }
         bool moved = false;
         for (int64_t v = 0; v < n; v++) {
             int64_t old_comm = community[v];
@@ -1459,6 +1465,7 @@ ray_t* exec_topsort(ray_graph_t* g, ray_op_t* op) {
     /* BFS — decrement in-degrees, enqueue new zeros */
     int64_t count = 0;
     while (head < tail) {
+        if (ray_interrupted()) { ray_scratch_arena_reset(&arena); return ray_error("cancel", NULL); }
         int64_t v = queue[head++];
         order[v] = count++;
 
@@ -1557,6 +1564,7 @@ ray_t* exec_cluster_coeff(ray_graph_t* g, ray_op_t* op) {
     double*  ldata = (double*)ray_data(lcc_vec);
 
     for (int64_t v = 0; v < n; v++) {
+        if (ray_interrupted()) { ray_scratch_arena_reset(&arena); ray_release(node_vec); ray_release(lcc_vec); return ray_error("cancel", NULL); }
         ndata[v] = v;
 
         /* Merge forward and reverse neighbors into deduplicated list */
@@ -1668,6 +1676,7 @@ ray_t* exec_betweenness(ray_graph_t* g, ray_op_t* op) {
     int64_t stride = (sample > 0 && (int64_t)sample < n) ? (n / n_sources) : 1;
 
     for (int64_t si = 0; si < n_sources; si++) {
+        if (ray_interrupted()) { ray_scratch_arena_reset(&arena); return ray_error("cancel", NULL); }
         int64_t s = (si * stride) % n;
 
         /* Initialize */
@@ -1839,6 +1848,7 @@ ray_t* exec_closeness(ray_graph_t* g, ray_op_t* op) {
     int64_t stride = (sample > 0 && (int64_t)sample < n) ? (n / n_sources) : 1;
 
     for (int64_t si = 0; si < n_sources; si++) {
+        if (ray_interrupted()) { ray_scratch_arena_reset(&arena); return ray_error("cancel", NULL); }
         int64_t s = (si * stride) % n;
 
         /* Initialize distances */
@@ -1987,6 +1997,7 @@ ray_t* exec_mst(ray_graph_t* g, ray_op_t* op) {
     /* Fill edge array from forward CSR */
     int64_t ei = 0;
     for (int64_t u = 0; u < n; u++) {
+        if (ray_interrupted()) { ray_scratch_arena_reset(&arena); return ray_error("cancel", NULL); }
         for (int64_t j = fwd_off[u]; j < fwd_off[u + 1]; j++) {
             edges_arr[ei].src = u;
             edges_arr[ei].dst = fwd_tgt[j];
@@ -2178,6 +2189,7 @@ ray_t* exec_dfs(ray_graph_t* g, ray_op_t* op, ray_t* src_val) {
     int64_t count = 0;
 
     while (sp > 0) {
+        if (ray_interrupted()) { ray_scratch_arena_reset(&arena); return ray_error("cancel", NULL); }
         sp--;
         int64_t v = stack_node[sp];
         int64_t d = stack_depth[sp];
@@ -2312,6 +2324,7 @@ ray_t* exec_astar(ray_graph_t* g, ray_op_t* op,
     int64_t* fwd_row = (int64_t*)ray_data(rel->fwd.rowmap);
 
     while (heap_size > 0) {
+        if (ray_interrupted()) { ray_scratch_arena_reset(&arena); return ray_error("cancel", NULL); }
         dijk_entry_t top = dijk_heap_pop(heap, &heap_size);
         int64_t u = top.node;
         if (visited[u]) continue;
@@ -2495,6 +2508,7 @@ ray_t* exec_k_shortest(ray_graph_t* g, ray_op_t* op,
 
     /* Step 2: Iteratively find paths P[1]..P[K-1] */
     for (uint16_t k = 1; k < K; k++) {
+        if (ray_interrupted()) { ray_scratch_arena_reset(&arena); return ray_error("cancel", NULL); }
         int64_t* prev_path = &paths_data[(int64_t)(k - 1) * n];
         int64_t prev_len = path_lens[k - 1];
 
