@@ -85,7 +85,13 @@ static void fire(uint64_t now_ns, bool final) {
         .rows_done   = g_rows_done,
         .rows_total  = g_rows_total,
         .elapsed_sec = (double)(now_ns - g_start_ns) / 1e9,
-        .mem_used    = (int64_t)(ms.bytes_allocated + ms.direct_bytes),
+        /* Use the process-wide, atomic sys_current — NOT the per-thread
+         * bytes_allocated: the pump fires mid-parallel-dispatch, where worker
+         * threads mutate the main heap's bytes_allocated via cross-heap frees,
+         * so reading it here is a torn read (it could read far above the
+         * budget).  sys_current (g_sys_current, a release-safe atomic) is
+         * cross-thread-safe and stays a sane fraction of the budget. */
+        .mem_used    = (int64_t)ms.sys_current,
         .mem_budget  = ray_mem_budget(),
         .final       = final,
     };
