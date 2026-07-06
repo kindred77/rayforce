@@ -38,6 +38,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <signal.h>
 #include "mem/sys.h"
 
 /* --------------------------------------------------------------------------
@@ -207,6 +208,15 @@ static void* thread_trampoline(void* raw) {
     /* Free the trampoline struct allocated on the heap. We copied it first
      * so the creating thread can proceed freely.                            */
     ray_sys_free(raw);
+    /* Keep SIGURG (the IPC out-of-band cancel signal) off spawned threads so it
+     * is only ever delivered to the main thread.  A worker's stack can be
+     * nearly full mid-kernel (large per-morsel VLAs in the elementwise ops), and
+     * running the signal handler on top of it would overflow the guard page.
+     * Workers observe cancellation via the pool's cancel flag, not the signal. */
+    sigset_t urg;
+    sigemptyset(&urg);
+    sigaddset(&urg, SIGURG);
+    pthread_sigmask(SIG_BLOCK, &urg, NULL);
     ctx.fn(ctx.arg);
     return NULL;
 }

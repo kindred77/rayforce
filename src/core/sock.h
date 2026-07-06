@@ -51,6 +51,14 @@ int64_t    ray_sock_recv(ray_sock_t s, void* buf, size_t len);
 /* Block until s is readable (or hung up).  timeout_ms < 0 = no timeout.
  * Returns 1 readable, 0 timed out, -1 error. */
 int        ray_sock_wait_readable(ray_sock_t s, int timeout_ms);
+/* Same, but returns -2 when interrupted by a signal (does not retry). */
+int        ray_sock_wait_readable_intr(ray_sock_t s, int timeout_ms);
+/* Send one byte of TCP urgent (out-of-band) data (raises SIGURG on the peer). */
+int        ray_sock_send_oob(ray_sock_t s, char byte);
+/* Route this socket's SIGURG (out-of-band arrival) to our process (POSIX). */
+void       ray_sock_set_oob_owner(ray_sock_t s);
+/* Consume one pending urgent byte on s; returns 1 if present (async-signal-safe). */
+int        ray_sock_take_oob(ray_sock_t s);
 void       ray_sock_close(ray_sock_t s);
 ray_err_t  ray_sock_set_nonblocking(ray_sock_t s);
 ray_err_t  ray_sock_set_blocking(ray_sock_t s);

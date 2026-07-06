@@ -40,6 +40,7 @@
   #include <sys/socket.h>
   #include <sys/time.h>
   #include <arpa/inet.h>
+  #include <unistd.h>
   #include <netinet/tcp.h>
   #include <poll.h>
   #include <unistd.h>
@@ -243,6 +244,57 @@ int ray_sock_wait_readable(ray_sock_t s, int timeout_ms)
         if (n == 0) return 0;
         return 1;  /* POLLIN/POLLHUP/POLLERR all mean "go recv" */
     }
+}
+
+/* Like ray_sock_wait_readable but returns -2 (instead of silently retrying)
+ * when the wait is interrupted by a signal.  A blocking IPC client uses this so
+ * a SIGINT (Ctrl-C) unblocks it promptly and it can forward a cancel to the
+ * server, rather than being stuck in the EINTR-retry loop above. */
+int ray_sock_wait_readable_intr(ray_sock_t s, int timeout_ms)
+{
+    struct pollfd pfd = { .fd = s, .events = POLLIN };
+#ifdef RAY_OS_WINDOWS
+    int n = WSAPoll(&pfd, 1, timeout_ms);
+#else
+    int n = poll(&pfd, 1, timeout_ms);
+#endif
+    if (n < 0) return (errno == EINTR) ? -2 : -1;
+    return n == 0 ? 0 : 1;
+}
+
+/* Send one byte of TCP urgent (out-of-band) data.  A client uses this to signal
+ * a cancel to a server that is busy evaluating and therefore not reading the
+ * normal stream: OOB data raises SIGURG on the peer even mid-compute. */
+int ray_sock_send_oob(ray_sock_t s, char byte)
+{
+    return (int)send(s, &byte, 1, MSG_OOB);
+}
+
+/* Route SIGURG for out-of-band data on this socket to our process, so a peer's
+ * urgent-data cancel raises SIGURG here even while we are busy evaluating and
+ * not reading the normal stream.  POSIX only; a no-op elsewhere. */
+void ray_sock_set_oob_owner(ray_sock_t s)
+{
+#ifndef RAY_OS_WINDOWS
+    fcntl((int)s, F_SETOWN, getpid());
+#else
+    (void)s;
+#endif
+}
+
+/* Consume one pending TCP urgent (out-of-band) byte on a specific socket.
+ * Returns 1 if an urgent byte was present (and taken), 0 otherwise.  Used to
+ * ask "did THIS connection request a cancel?" — so a cancel from one client
+ * can never affect another client's query.  Async-signal-safe (recv). */
+int ray_sock_take_oob(ray_sock_t s)
+{
+#ifndef RAY_OS_WINDOWS
+    char b;
+    return recv((int)s, &b, 1, MSG_OOB) == 1 ? 1 : 0;
+#else
+    (void)s;
+    return 0;
+#endif
 }
 
 void ray_sock_close(ray_sock_t s)

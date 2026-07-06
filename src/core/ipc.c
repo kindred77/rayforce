@@ -32,6 +32,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
+#include <signal.h>
 
 #ifdef RAY_OS_WINDOWS
   #define WIN32_LEAN_AND_MEAN
@@ -674,12 +675,54 @@ static int64_t ipc_recv_fn(int64_t fd, uint8_t* buf, int64_t len) {
     return ray_sock_recv((ray_sock_t)fd, buf, (size_t)len);
 }
 
+/* ── Out-of-band cancel: client Ctrl-C → SIGURG → cancel the running query ──
+ * The server evaluates single-threaded, so while a query runs it is NOT reading
+ * the socket — an ordinary cancel message would sit unread until the query
+ * finished.  A client instead sends one byte of TCP urgent data (see the
+ * sync-send await loop), which raises SIGURG here even mid-eval.  The handler
+ * drains the byte and requests interrupt; the running query's checkpoints then
+ * unwind it and a "cancel" error is returned.  g_ipc_active_fd names the
+ * connection whose payload is currently being evaluated (-1 when idle) so the
+ * handler knows which socket to drain.  Everything here is async-signal-safe:
+ * a sig_atomic_t read, recv(MSG_OOB), and the flag stores in
+ * ray_request_interrupt(). */
+static volatile sig_atomic_t g_ipc_active_fd = -1;
+
+static void ipc_sigurg_handler(int sig)
+{
+    (void)sig;
+    int fd = g_ipc_active_fd;
+    if (fd < 0) return;   /* nothing running — a queued client's cancel is
+                           * honored when its own request is dispatched */
+    /* Cancel ONLY if the urgent byte is on the RUNNING query's connection.
+     * OOB from any OTHER (queued) client must not touch this query; that byte
+     * stays pending on its socket and is honored when that client runs. */
+    if (ray_sock_take_oob((ray_sock_t)fd))
+        ray_request_interrupt();
+}
+
+static void ipc_install_oob_cancel(void)
+{
+    static int installed = 0;
+    if (installed) return;
+    installed = 1;
+#ifndef RAY_OS_WINDOWS
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = ipc_sigurg_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGURG, &sa, NULL);
+#endif
+}
+
 /* Accept callback — called when listener fd is readable */
 static ray_t* ipc_accept(ray_poll_t* poll, ray_selector_t* sel)
 {
     ray_sock_t new_fd = ray_sock_accept((ray_sock_t)sel->fd);
     if (new_fd == RAY_INVALID_SOCK) return NULL;
     ray_sock_set_nonblocking(new_fd);
+    ray_sock_set_oob_owner(new_fd);   /* so a client's OOB cancel raises SIGURG here */
 
     ray_ipc_conn_data_t* cd = (ray_ipc_conn_data_t*)ray_sys_alloc(
                                     sizeof(ray_ipc_conn_data_t));
@@ -883,9 +926,25 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
     ray_poll_t* prev_poll = ipc_ctx_poll();
     ipc_ctx_set(id, poll);
 
-    /* Eval and produce result */
-    ray_t* result = eval_payload(payload->data,
-                                 (size_t)payload->offset, &hdr);
+    /* If THIS client already requested cancel (an OOB byte is pending on its
+     * socket) — e.g. it Ctrl-C'd while its request waited behind another
+     * client's running query — honor it now: return cancel without running,
+     * which unblocks the waiting client.  A cancel is thus always scoped to the
+     * connection that sent it and never affects another client's query. */
+    ray_t* result;
+    if (ray_sock_take_oob((ray_sock_t)sel->fd)) {
+        result = ray_error("cancel", "interrupted");
+    } else {
+        /* Clear any stale cancel first: the server is single-threaded, so each
+         * request starts a fresh query — without this reset a prior cancel
+         * would make every later query fail spuriously (the REPL clears per
+         * line the same way).  Publish the active fd so a SIGURG for THIS
+         * connection cancels this query. */
+        ray_clear_interrupt();
+        g_ipc_active_fd = (int)sel->fd;
+        result = eval_payload(payload->data, (size_t)payload->offset, &hdr);
+        g_ipc_active_fd = -1;
+    }
 
     ipc_ctx_set(prev_handle, prev_poll);
     ray_eval_set_restricted(prev_restricted);
@@ -940,6 +999,7 @@ static void ipc_on_close(ray_poll_t* poll, ray_selector_t* sel)
 int64_t ray_ipc_listen(ray_poll_t* poll, uint16_t port)
 {
     if (!poll) return -1;
+    ipc_install_oob_cancel();   /* enable client Ctrl-C → SIGURG query cancel */
 
     ray_sock_t fd = ray_sock_listen(port);
     if (fd == RAY_INVALID_SOCK) return -1;
@@ -1649,7 +1709,21 @@ static ray_t* sync_send(int64_t handle, ray_t* msg, uint8_t extra_flags)
              * defensive: treat as closed. */
             return ray_error("io", "connection closed");
         }
-        if (ray_sock_wait_readable((ray_sock_t)sel->fd, -1) < 0) {
+        int w = ray_sock_wait_readable_intr((ray_sock_t)sel->fd, -1);
+        if (w == -2) {
+            /* Interrupted by a signal.  If it was a cancel request (Ctrl-C),
+             * forward it to the server as TCP urgent data — the server is busy
+             * in eval and not reading the normal stream, but OOB raises SIGURG
+             * there and cancels the running query.  Then keep awaiting its
+             * cancel reply.  Best-effort: a server without OOB-cancel support
+             * ignores the byte and the query completes as before. */
+            if (ray_interrupted()) {
+                ray_sock_send_oob((ray_sock_t)sel->fd, '!');
+                ray_clear_interrupt();  /* consume; do not resend or cancel locally */
+            }
+            continue;
+        }
+        if (w < 0) {
             cd->sync_waiting = false;
             return ray_error("io", "ipc recv failed");
         }
