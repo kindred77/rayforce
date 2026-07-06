@@ -42,6 +42,7 @@
 #include "mem/sys.h"
 #include "core/numparse.h"
 #include "core/pool.h"
+#include "core/platform.h"   /* ray_vm_map_fd_ro / ray_vm_unmap_file (tracked) */
 #include "lang/format.h"
 #include "ops/hash.h"
 #include "ops/idxop.h"      /* attach per-chunk zone index after load */
@@ -1809,9 +1810,9 @@ ray_t* ray_read_csv_named_opts(const char* path, char delimiter, bool header,
     size_t file_size = (size_t)st.st_size;
 
     /* ---- 2. mmap the file ---- */
-    char* buf = (char*)mmap(NULL, file_size, PROT_READ, MMAP_FLAGS, fd, 0);
+    char* buf = (char*)ray_vm_map_fd_ro(fd, file_size);
     close(fd);
-    if (buf == MAP_FAILED) return ray_error("io", NULL);
+    if (!buf) return ray_error("io", NULL);
 
 #ifdef __APPLE__
     madvise(buf, file_size, MADV_SEQUENTIAL);
@@ -1846,7 +1847,7 @@ ray_t* ray_read_csv_named_opts(const char* path, char delimiter, bool header,
         }
     }
     if (ncols > CSV_MAX_COLS) {
-        munmap(buf, file_size);
+        ray_vm_unmap_file(buf, file_size);
         /* fd already closed after mmap (line 1044) — do not close again */
         /* too many columns */
         return ray_error("range", "csv read: header has too many columns, got %lld (max %d)",
@@ -1905,7 +1906,7 @@ ray_t* ray_read_csv_named_opts(const char* path, char delimiter, bool header,
                 ray_release(empty_vec);
             }
         }
-        munmap(buf, file_size);
+        ray_vm_unmap_file(buf, file_size);
         return tbl;
     }
 
@@ -2205,14 +2206,14 @@ ray_t* ray_read_csv_named_opts(const char* path, char delimiter, bool header,
 
     /* ---- 12. Cleanup ---- */
     scratch_free(row_offsets_hdr);
-    munmap(buf, file_size);
+    ray_vm_unmap_file(buf, file_size);
     return result;
 
     /* Error paths */
 fail_offsets:
     scratch_free(row_offsets_hdr);
 fail_unmap:
-    munmap(buf, file_size);
+    ray_vm_unmap_file(buf, file_size);
     return ray_error("oom", NULL);
 }
 
@@ -2365,9 +2366,9 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
     }
     size_t file_size = (size_t)st.st_size;
 
-    char* buf = (char*)mmap(NULL, file_size, PROT_READ, MMAP_FLAGS, fd, 0);
+    char* buf = (char*)ray_vm_map_fd_ro(fd, file_size);
     close(fd);
-    if (buf == MAP_FAILED) return RAY_ERR_IO;
+    if (!buf) return RAY_ERR_IO;
 
 #ifdef __APPLE__
     madvise(buf, file_size, MADV_SEQUENTIAL);
@@ -2396,7 +2397,7 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
         }
     }
     if (ncols > CSV_MAX_COLS) {
-        munmap(buf, file_size);
+        ray_vm_unmap_file(buf, file_size);
         return RAY_ERR_RANGE;
     }
 
@@ -2438,7 +2439,7 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
             if (t < RAY_BOOL ||
                 (t >= RAY_TYPE_COUNT && t != RAY_CSV_AUTO_TAG) ||
                 t == RAY_TABLE) {
-                munmap(buf, file_size);
+                ray_vm_unmap_file(buf, file_size);
                 return RAY_ERR_TYPE;
             }
             resolved_types[c] = t;
@@ -2480,7 +2481,7 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
                 col_types[c], text_distinct[c], text_non_null[c]);
         }
     } else {
-        munmap(buf, file_size);
+        ray_vm_unmap_file(buf, file_size);
         return RAY_ERR_TYPE;
     }
 
@@ -2490,7 +2491,7 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
                                                  col_types_in, n_types,
                                                  col_names_in, n_names);
             if (!tbl || RAY_IS_ERR(tbl)) {
-                munmap(buf, file_size);
+                ray_vm_unmap_file(buf, file_size);
                 return tbl ? ray_err_from_obj(tbl) : RAY_ERR_IO;
             }
             /* Splay save owns the symfile now: dir/.sym is the table's
@@ -2501,12 +2502,12 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
             int n = snprintf(sym_path, sizeof(sym_path), "%s/.sym", dir);
             if (n < 0 || (size_t)n >= sizeof(sym_path)) {
                 ray_release(tbl);
-                munmap(buf, file_size);
+                ray_vm_unmap_file(buf, file_size);
                 return RAY_ERR_RANGE;
             }
             err = ray_splay_save_bulk(tbl, dir, sym_path);
             ray_release(tbl);
-            munmap(buf, file_size);
+            ray_vm_unmap_file(buf, file_size);
             return err;
         }
     }
@@ -2518,7 +2519,7 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
 
     err = ray_mkdir_p(dir);
     if (err != RAY_OK) {
-        munmap(buf, file_size);
+        ray_vm_unmap_file(buf, file_size);
         return err;
     }
 
@@ -2531,7 +2532,7 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
     char schema_path[1024];
     int sn = snprintf(schema_path, sizeof(schema_path), "%s/.d", dir);
     if (sn < 0 || (size_t)sn >= sizeof(schema_path)) {
-        munmap(buf, file_size);
+        ray_vm_unmap_file(buf, file_size);
         return RAY_ERR_RANGE;
     }
     remove(schema_path); /* best-effort; ENOENT is the common case */
@@ -2547,12 +2548,12 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
             char sym_path[1024];
             int n = snprintf(sym_path, sizeof(sym_path), "%s/.sym", dir);
             if (n < 0 || (size_t)n >= sizeof(sym_path)) {
-                munmap(buf, file_size);
+                ray_vm_unmap_file(buf, file_size);
                 return RAY_ERR_RANGE;
             }
             sym_dom = ray_sym_domain_open_or_create(sym_path);
             if (!sym_dom) {
-                munmap(buf, file_size);
+                ray_vm_unmap_file(buf, file_size);
                 return RAY_ERR_IO;
             }
             /* Empty-vocabulary seeding: a header-only CSV streams no
@@ -2564,7 +2565,7 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
             if (ray_sym_domain_count(sym_dom) == 0 &&
                 ray_sym_domain_intern(sym_dom, "", 0) != 0) {
                 ray_sym_domain_release(sym_dom);
-                munmap(buf, file_size);
+                ray_vm_unmap_file(buf, file_size);
                 return RAY_ERR_OOM;
             }
         }
@@ -2578,7 +2579,7 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
         if (err != RAY_OK) {
             for (int j = 0; j < c; j++) csv_splayed_writer_abort(&writers[j]);
             if (sym_dom) ray_sym_domain_release(sym_dom);
-            munmap(buf, file_size);
+            ray_vm_unmap_file(buf, file_size);
             return err;
         }
     }
@@ -2666,7 +2667,7 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
     }
 
     if (sym_dom) ray_sym_domain_release(sym_dom);
-    munmap(buf, file_size);
+    ray_vm_unmap_file(buf, file_size);
     return err;
 }
 
@@ -2689,9 +2690,9 @@ ray_err_t ray_csv_save_parted_named_opts(const char* path, char delimiter, bool 
     }
     size_t file_size = (size_t)st.st_size;
 
-    char* buf = (char*)mmap(NULL, file_size, PROT_READ, MMAP_FLAGS, fd, 0);
+    char* buf = (char*)ray_vm_map_fd_ro(fd, file_size);
     close(fd);
-    if (buf == MAP_FAILED) return RAY_ERR_IO;
+    if (!buf) return RAY_ERR_IO;
 
 #ifdef __APPLE__
     madvise(buf, file_size, MADV_SEQUENTIAL);
@@ -2720,7 +2721,7 @@ ray_err_t ray_csv_save_parted_named_opts(const char* path, char delimiter, bool 
         }
     }
     if (ncols > CSV_MAX_COLS) {
-        munmap(buf, file_size);
+        ray_vm_unmap_file(buf, file_size);
         return RAY_ERR_RANGE;
     }
 
@@ -2768,7 +2769,7 @@ ray_err_t ray_csv_save_parted_named_opts(const char* path, char delimiter, bool 
             if (t < RAY_BOOL ||
                 (t >= RAY_TYPE_COUNT && t != RAY_CSV_AUTO_TAG) ||
                 t == RAY_TABLE) {
-                munmap(buf, file_size);
+                ray_vm_unmap_file(buf, file_size);
                 return RAY_ERR_TYPE;
             }
             resolved_types[c] = t;
@@ -2810,7 +2811,7 @@ ray_err_t ray_csv_save_parted_named_opts(const char* path, char delimiter, bool 
                 col_types[c], text_distinct[c], text_non_null[c]);
         }
     } else {
-        munmap(buf, file_size);
+        ray_vm_unmap_file(buf, file_size);
         return RAY_ERR_TYPE;
     }
 
@@ -2821,7 +2822,7 @@ ray_err_t ray_csv_save_parted_named_opts(const char* path, char delimiter, bool 
 
     err = ray_mkdir_p(root);
     if (err != RAY_OK) {
-        munmap(buf, file_size);
+        ray_vm_unmap_file(buf, file_size);
         return err;
     }
 
@@ -2900,7 +2901,7 @@ ray_err_t ray_csv_save_parted_named_opts(const char* path, char delimiter, bool 
     /* root/.sym is maintained per-partition by ray_splay_save_bulk
      * (distinct-merge + flush before each partition's columns) — no
      * whole-dictionary dump at the end anymore. */
-    munmap(buf, file_size);
+    ray_vm_unmap_file(buf, file_size);
     if (trace)
         fprintf(stderr, "csv.parted: done err=%s\n", ray_err_code_str(err));
     return err;

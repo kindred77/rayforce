@@ -85,11 +85,19 @@ Signature: `(.sys.mem)`. Returns the buddy allocator's running counters:
 | `bytes-allocated` | Live bytes held by `ray_t` objects. |
 | `peak-bytes` | High-watermark since process start. |
 | `slab-hits` | Cumulative fast-path slab allocations. |
-| `sys-current` | Currently-allocated bytes from the system allocator. |
+| `sys-current` | **Committed RAM**: every anonymous mapping — the buddy pools (where all vectors live), sys allocations, and the swap-fallback pool. The true live-memory figure. |
+| `sys-mapped` | **File-backed** bytes currently mapped (splayed columns, the symbol file, CSV/script parse buffers). Page-cache, evictable, resident only on touch — kept separate from `sys-current` so a read-once column can't masquerade as live RAM. |
+| `sys-mapped-peak` | High-watermark of `sys-mapped`. |
+
+Every mapping — buddy pool or file — is counted exactly once through the VM
+wrapper layer, so `sys-current` reflects the real committed footprint (a large
+`til` shows up here, not as a flat few MB). The progress bar's memory field and
+the memory budget both use `sys-current`.
 
 ```lisp
 (.sys.mem)
-;; => {alloc-count: 12345, bytes-allocated: 524288, peak-bytes: 2097152, ...}
+;; => {alloc-count: 12345, bytes-allocated: 524288, peak-bytes: 2097152,
+;;     sys-current: 34754560, sys-mapped: 0, sys-mapped-peak: 0}
 ```
 
 ## `.sys.prof` { #sys-prof }

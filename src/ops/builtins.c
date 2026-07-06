@@ -27,6 +27,7 @@
 #include "lang/eval.h"
 #include "lang/internal.h"
 #include "lang/env.h"
+#include "core/platform.h"   /* ray_vm_map_fd_ro / ray_vm_unmap_file (tracked) */
 #include "vec/vec.h"
 #include "lang/nfo.h"
 #include "lang/parse.h"
@@ -1895,15 +1896,15 @@ ray_t* ray_load_file_fn(ray_t* path_obj) {
     if (fstat(fd, &st) < 0 || st.st_size < 0) { close(fd); return ray_error("io", NULL); }
     size_t sz = (size_t)st.st_size;
     if (sz == 0) { close(fd); return ray_i64(0); }
-    char* map = (char*)mmap(NULL, sz, PROT_READ, MAP_PRIVATE, fd, 0);
+    char* map = (char*)ray_vm_map_fd_ro(fd, sz);
     close(fd);
-    if (map == MAP_FAILED) return ray_error("io", NULL);
+    if (!map) return ray_error("io", NULL);
     /* Copy to NUL-terminated buffer -- mmap region may not have a trailing NUL */
     char* buf = (char*)ray_alloc_raw(sz + 1);
-    if (!buf) { munmap(map, sz); return ray_error("oom", NULL); }
+    if (!buf) { ray_vm_unmap_file(map, sz); return ray_error("oom", NULL); }
     memcpy(buf, map, sz);
     buf[sz] = '\0';
-    munmap(map, sz);
+    ray_vm_unmap_file(map, sz);
 
     ray_t* nfo = ray_nfo_create(path, path_len, buf, sz);
     ray_t* parsed = ray_parse_with_nfo(buf, nfo);

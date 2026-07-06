@@ -138,8 +138,10 @@ typedef struct {
     size_t slab_hits;        /* slab cache hits */
     size_t direct_count;     /* active direct mmaps */
     size_t direct_bytes;     /* bytes in direct mmaps */
-    size_t sys_current;      /* sys allocator: current mmap'd bytes */
-    size_t sys_peak;         /* sys allocator: peak mmap'd bytes */
+    size_t sys_current;      /* committed RAM: buddy pools + sys allocs (bytes) */
+    size_t sys_peak;         /* committed RAM high-water mark */
+    size_t sys_mapped;       /* file-backed bytes mapped (columns, sym, CSV) */
+    size_t sys_mapped_peak;  /* file-backed mapping high-water mark */
 } ray_mem_stats_t;
 
 /* ===== Forward Declarations (internal types) ===== */

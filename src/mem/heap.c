@@ -510,6 +510,11 @@ static bool heap_add_pool(ray_heap_t* h, uint8_t order) {
             return false;
         }
 
+        /* Count the swap-backed pool as committed working set — it is a RAM
+         * substitute with preallocated blocks, not an evictable file cache.
+         * The PROT_NONE reserve + slack trims above are transient and stay
+         * uncounted.  Freed via ray_vm_free (which subtracts) at pool teardown. */
+        ray_sys_track_add((int64_t)pool_size);
         mem = (void*)aligned;
     }
 
@@ -1395,6 +1400,10 @@ void ray_mem_stats(ray_mem_stats_t* out) {
     ray_sys_get_stat(&sc, &sp);
     out->sys_current = (size_t)sc;
     out->sys_peak    = (size_t)sp;
+    int64_t mc = 0, mp = 0;
+    ray_sys_get_mapped(&mc, &mp);
+    out->sys_mapped      = (size_t)mc;
+    out->sys_mapped_peak = (size_t)mp;
 }
 
 /* --------------------------------------------------------------------------
