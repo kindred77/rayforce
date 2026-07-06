@@ -1151,10 +1151,16 @@ ray_t* exec_wco_join(ray_graph_t* g, ray_op_t* op) {
     ctx.out_count = 0;
     ctx.out_cap = out_cap;
     ctx.oom = false;
+    ctx.cancelled = false;
 
     /* Run general LFTJ enumeration */
     lftj_enumerate(&ctx, 0);
 
+    if (ctx.cancelled) {
+        for (uint8_t v = 0; v < n_vars; v++) ray_free(ctx.buf_hdrs[v]);
+        scratch_free(col_data_block);
+        return ray_error("cancel", NULL);
+    }
     if (ctx.oom) {
         for (uint8_t v = 0; v < n_vars; v++) ray_free(ctx.buf_hdrs[v]);
         scratch_free(col_data_block);

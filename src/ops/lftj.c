@@ -225,9 +225,13 @@ void lftj_enumerate(lftj_enum_ctx_t* ctx, uint8_t depth) {
         if (n_nodes == 0) return;
 
         for (int64_t a = 0; a < n_nodes; a++) {
+            /* Cancellation checkpoint (per root node — the body is a full
+             * recursive descent, so this is coarse).  Signals via ctx; the
+             * caller (exec_wco_join) frees buffers and returns "cancel". */
+            if (ray_interrupted()) { ctx->cancelled = true; return; }
             ctx->bound[0] = a;
             lftj_enumerate(ctx, 1);
-            if (ctx->oom) return;
+            if (ctx->oom || ctx->cancelled) return;
         }
         return;
     }
@@ -248,9 +252,11 @@ void lftj_enumerate(lftj_enum_ctx_t* ctx, uint8_t depth) {
     /* Leapfrog intersect */
     int64_t val;
     while (leapfrog_search(iter_ptrs, vp->n_bindings, &val)) {
+        /* Cancellation checkpoint (per intersect match — the body recurses). */
+        if (ray_interrupted()) { ctx->cancelled = true; return; }
         ctx->bound[depth] = val;
         lftj_enumerate(ctx, depth + 1);
-        if (ctx->oom) return;
+        if (ctx->oom || ctx->cancelled) return;
         /* Advance all iterators past current match */
         for (uint8_t b = 0; b < vp->n_bindings; b++)
             lftj_next(iter_ptrs[b]);

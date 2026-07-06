@@ -1675,6 +1675,16 @@ ray_t* exec_antijoin(ray_graph_t* g, ray_op_t* op,
     uint32_t ht_mask = ht_cap - 1;
     int64_t out_count = 0;
     for (int64_t l = 0; l < left_rows; l++) {
+        /* Cancellation checkpoint — this probe is fully serial (not pool
+         * dispatched), so it needs its own check.  Masked to stay off the
+         * per-row hot path; frees the live scratch on a cancel. */
+        if ((l & 0xFFFF) == 0 && ray_interrupted()) {
+            scratch_free(out_idx_hdr);
+            scratch_free(ht_next_hdr);
+            scratch_free(ht_heads_hdr);
+            scratch_free(key_vecs_hdr);
+            return ray_error("cancel", NULL);
+        }
         uint64_t h = hash_row_keys(l_key_vecs, n_keys, l);
         uint32_t slot = (uint32_t)(h & ht_mask);
         bool matched = false;
