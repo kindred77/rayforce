@@ -136,8 +136,10 @@ static inline void vec_drop_index_inplace(ray_t* v) {
  * -------------------------------------------------------------------------- */
 
 static int64_t vec_capacity(ray_t* vec) {
-    size_t block_size = (size_t)1 << vec->order;
-    size_t data_space = block_size - 32;  /* 32B ray_t header */
+    /* ray_block_data_bytes handles both buddy blocks (1<<order - 32) and direct
+     * mmap'd blocks (exact size - prefix - header); the latter carry a sentinel
+     * order, so 1<<order would be garbage. */
+    size_t data_space = ray_block_data_bytes(vec);
     uint8_t esz = ray_sym_elem_size(vec->type, vec->attrs);
     if (esz == 0) return 0;
     return (int64_t)(data_space / esz);

@@ -329,35 +329,34 @@ static test_result_t test_release_pages(void) {
  * ray_heap_gc that's only reached when an oversized empty pool exists. */
 
 static test_result_t test_gc_reclaim_oversized_pool(void) {
-    /* First, force a standard pool into existence so pool_count >= 2 even
-     * after the oversized pool is reclaimed (the GC skips reclamation
-     * when pool_count <= 1). */
+    /* Oversized allocations (>= RAY_HEAP_POOL_ORDER, 32 MB) now bypass the
+     * buddy pool entirely — they are mmap'd at their EXACT page-rounded size
+     * (the direct path), so they never create an oversized pool to GC-reclaim.
+     * Verify the new contract: a big alloc bumps direct_bytes by ~exactly its
+     * size (not a power-of-2 block), grows no pool, and releases exactly. */
     ray_t* small = ray_alloc(64);
     TEST_ASSERT_NOT_NULL(small);
 
-    /* Now allocate a block that needs more than 32 MB — pool_order will
-     * be order+1 of the request.  RAY_HEAP_POOL_ORDER is 25 (32 MB), so
-     * a request of (1<<26) - 32 = 64 MB - 32 lands in order 26 and
-     * triggers a pool_order 27 (128 MB) pool. */
+    ray_mem_stats_t s0; ray_mem_stats(&s0);
+    uint32_t pools0 = ray_tl_heap->pool_count;
+
     size_t big = (size_t)1 << 26;  /* 64 MB */
     ray_t* huge = ray_alloc(big);
     if (!huge) {
-        /* Environment can't satisfy a 128 MB anon mmap.  Skip rather
-         * than fail — this is environmental, not a code defect. */
         ray_free(small);
-        SKIP("oversized pool alloc unavailable");
+        SKIP("oversized alloc unavailable");
     }
-    /* Verify it really did get an oversized pool. */
-    TEST_ASSERT((ray_tl_heap->pool_count) >= (2), "pool_count >= 2");
 
-    /* Release the huge block — its pool becomes empty.  GC reclaims it. */
+    ray_mem_stats_t s1; ray_mem_stats(&s1);
+    size_t delta = s1.direct_bytes - s0.direct_bytes;
+    TEST_ASSERT(delta >= big, "direct_bytes counts at least the request");
+    TEST_ASSERT(delta < big + 8192, "exact page-rounded size, not a power-of-2 block");
+    TEST_ASSERT(ray_tl_heap->pool_count == pools0, "no oversized pool was created");
+    TEST_ASSERT(huge->order > RAY_HEAP_MAX_ORDER, "direct block carries the sentinel order");
+
     ray_free(huge);
-
-    uint32_t pool_count_before = ray_tl_heap->pool_count;
-    ray_heap_gc();
-
-    /* Oversized pool must have been munmapped. */
-    TEST_ASSERT((ray_tl_heap->pool_count) < (pool_count_before), "pool_count decreased");
+    ray_mem_stats_t s2; ray_mem_stats(&s2);
+    TEST_ASSERT(s2.direct_bytes == s0.direct_bytes, "direct mapping released exactly");
 
     ray_free(small);
     PASS();
@@ -2139,33 +2138,35 @@ static test_result_t test_free_no_heap(void) {
  * calls ray_pool_of and must resolve the header via the walk. */
 
 static test_result_t test_pool_of_oversized_walk(void) {
-    /* Force a standard pool first so the heap is multi-pool. */
+    /* Oversized blocks are direct mmaps (no pool); a sub-32 MB block still
+     * comes from a standard buddy pool.  Verify the two paths coexist: a
+     * direct block and a buddy block are each written, read back, and freed
+     * with no leak or cross-path confusion. */
     ray_t* anchor = ray_alloc(64);
     TEST_ASSERT_NOT_NULL(anchor);
 
-    /* Allocate a >32 MB block → oversized pool (pool_order 27, 128 MB),
-     * with the right-half blocks placed in the freelist. */
-    size_t big = (size_t)1 << 26;   /* 64 MB data */
+    ray_mem_stats_t s0; ray_mem_stats(&s0);
+
+    size_t big = (size_t)1 << 26;   /* 64 MB → direct */
     ray_t* huge = ray_alloc(big);
     if (!huge) {
         ray_free(anchor);
-        SKIP("oversized pool alloc unavailable");
+        SKIP("oversized alloc unavailable");
     }
-    uint32_t pools = ray_tl_heap->pool_count;
-    TEST_ASSERT((pools) >= (2), "oversized pool created");
+    TEST_ASSERT(huge->order > RAY_HEAP_MAX_ORDER, "oversized block is direct");
+    memset(ray_data(huge), 0x5a, 4096);
 
-    /* Free the huge block, then allocate a medium block.  The buddy
-     * allocator will carve it from the oversized pool's freelist — placing
-     * it deep inside the pool (not at the 32 MB-aligned header).  Freeing
-     * it exercises the downward-walk in ray_pool_of. */
-    ray_free(huge);
-    ray_t* mid = ray_alloc((size_t)1 << 24);   /* 16 MB — far from base */
+    ray_t* mid = ray_alloc((size_t)1 << 20);   /* 1 MB → buddy pool (order < 25) */
     TEST_ASSERT_NOT_NULL(mid);
-    /* Writing + freeing both validates the resolved pool header is correct. */
+    TEST_ASSERT(mid->order <= RAY_HEAP_MAX_ORDER, "1 MB block is a buddy block");
     memset(ray_data(mid), 0x5a, 4096);
-    ray_free(mid);
 
-    ray_heap_gc();   /* reclaim the now-empty oversized pool */
+    ray_free(huge);
+    ray_free(mid);
+    ray_heap_gc();
+
+    ray_mem_stats_t s1; ray_mem_stats(&s1);
+    TEST_ASSERT(s1.direct_bytes == s0.direct_bytes, "direct block released, no leak");
     ray_free(anchor);
     PASS();
 }

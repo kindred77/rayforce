@@ -236,6 +236,12 @@ RAY_TLS ray_heap_t*     ray_tl_heap  = NULL;
 static _Atomic(uint64_t) g_heap_id_bitmap[RAY_HEAP_ID_WORDS] = { [0] = 1ULL };
 static _Atomic(uint64_t) g_heap_id_cursor = 0;
 
+/* Direct large-allocation counters (process-wide, exact).  Direct blocks are
+ * standalone mmaps not owned by any per-thread heap, so their bytes live here
+ * rather than in a per-thread stats slot; ray_mem_stats surfaces them. */
+static _Atomic(int64_t) g_direct_bytes = 0;
+static _Atomic(int64_t) g_direct_count = 0;
+
 ray_heap_t* ray_heap_registry[RAY_HEAP_REGISTRY_SIZE];
 
 /* Serializes the registry slot writes (register/unregister) and the
@@ -1015,6 +1021,31 @@ static void ray_detach_owned_refs(ray_t* v) {
  * ray_alloc
  * -------------------------------------------------------------------------- */
 
+/* Direct large allocation: mmap the exact page-rounded size instead of a
+ * power-of-2 oversized buddy pool.  Returns a marked ray_t or NULL on mmap
+ * failure (caller falls back to the buddy pool + its swap path). */
+static ray_t* heap_alloc_direct(ray_heap_t* h, size_t data_size) {
+    if (data_size > SIZE_MAX - RAY_DIRECT_HDR - 32 - 4095) return NULL;
+    size_t map_size = (RAY_DIRECT_HDR + 32 + data_size + 4095) & ~(size_t)4095;
+    void* base = ray_vm_alloc(map_size);   /* anon RW, page-aligned, counted */
+    if (!base) return NULL;
+
+    ((ray_direct_hdr_t*)base)->map_size = map_size;
+    ray_t* v = (ray_t*)((char*)base + RAY_DIRECT_HDR);
+    memset(v, 0, 32);
+    v->mmod  = 0;
+    v->order = RAY_ORDER_DIRECT;
+    if (RAY_UNLIKELY(ray_rc_sync))
+        ray_atomic_store(&v->rc, 1);
+    else
+        v->rc = 1;
+
+    atomic_fetch_add_explicit(&g_direct_bytes, (int64_t)map_size, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_direct_count, 1, memory_order_relaxed);
+    RAY_STAT(h->stats.alloc_count++);
+    return v;
+}
+
 ray_t* ray_alloc(size_t data_size) {
     ray_heap_t* h = ray_tl_heap;
     if (RAY_UNLIKELY(!h)) {
@@ -1025,6 +1056,14 @@ ray_t* ray_alloc(size_t data_size) {
 
     uint8_t order = ray_order_for_size(data_size);
     if (order > RAY_HEAP_MAX_ORDER) return NULL;
+
+    /* Anything that would need a dedicated oversized pool goes direct — exact
+     * size, no power-of-2 rounding, no order+1 pool.  On mmap failure fall
+     * through to the buddy pool (its swap fallback handles RAM exhaustion). */
+    if (RAY_UNLIKELY(order >= RAY_HEAP_POOL_ORDER)) {
+        ray_t* v = heap_alloc_direct(h, data_size);
+        if (v) return v;
+    }
 
     /* Slab fast path */
     if (RAY_LIKELY(IS_SLAB_ORDER(order))) {
@@ -1168,6 +1207,19 @@ void ray_free(ray_t* v) {
     /* Legacy mmod==2 guard */
     if (v->mmod == 2) return;
 
+    /* Direct large allocation: standalone mmap, freed by munmap.  Checked
+     * BEFORE any pool masking (a direct block is not a pool member).  Any
+     * thread may free it; the counter is a global atomic. */
+    if (RAY_UNLIKELY(v->order > RAY_HEAP_MAX_ORDER)) {
+        char*  base = (char*)v - RAY_DIRECT_HDR;
+        size_t map_size = ((ray_direct_hdr_t*)base)->map_size;
+        if (h) RAY_STAT(h->stats.free_count++);
+        atomic_fetch_sub_explicit(&g_direct_bytes, (int64_t)map_size, memory_order_relaxed);
+        atomic_fetch_sub_explicit(&g_direct_count, 1, memory_order_relaxed);
+        ray_vm_free(base, map_size);   /* munmap + committed-RAM counter -= */
+        return;
+    }
+
     if (!h) return;
 
     uint8_t order = v->order;
@@ -1258,7 +1310,7 @@ void ray_free_raw(void* p) {
 void* ray_realloc_raw(void* p, size_t n) {
     if (!p) return ray_alloc_raw(n);
     ray_t* v = (ray_t*)((char*)p - 32);
-    size_t cur = BSIZEOF(v->order) - 32;   /* current block's data capacity */
+    size_t cur = ray_block_data_bytes(v);   /* data capacity (buddy or direct) */
     if (n <= cur) { v->len = (int64_t)n; return p; }
     void* np = ray_alloc_raw(n);
     if (!np) return NULL;
@@ -1364,7 +1416,7 @@ ray_t* ray_scratch_realloc(ray_t* v, size_t new_data_size) {
         }
         /* Clamp old_data to actual allocation size */
         if (v->mmod == 0 && v->order >= RAY_ORDER_MIN) {
-            size_t alloc_data = BSIZEOF(v->order) - 32;
+            size_t alloc_data = ray_block_data_bytes(v);  /* buddy or direct */
             if (old_data > alloc_data) old_data = alloc_data;
         }
         size_t copy_data = old_data < new_data_size ? old_data : new_data_size;
@@ -1404,6 +1456,11 @@ void ray_mem_stats(ray_mem_stats_t* out) {
     ray_sys_get_mapped(&mc, &mp);
     out->sys_mapped      = (size_t)mc;
     out->sys_mapped_peak = (size_t)mp;
+    /* Direct large allocations are process-wide (not per-thread) — overlay the
+     * global counters so bytes_allocated + direct_bytes is the true live
+     * object footprint (buddy blocks + exact direct mmaps). */
+    out->direct_bytes = (size_t)atomic_load_explicit(&g_direct_bytes, memory_order_relaxed);
+    out->direct_count = (size_t)atomic_load_explicit(&g_direct_count, memory_order_relaxed);
 }
 
 /* --------------------------------------------------------------------------

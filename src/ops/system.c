@@ -720,14 +720,15 @@ ray_t* ray_memstat_fn(ray_t** args, int64_t n) {
     ray_mem_stats_t st;
     ray_mem_stats(&st);
 
-    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 7);
+    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 8);
     if (RAY_IS_ERR(keys)) return keys;
-    ray_t* vals = ray_list_new(7);
+    ray_t* vals = ray_list_new(8);
     if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
 
     struct { const char* name; size_t nlen; int64_t v; } rows[] = {
         { "alloc-count",     11, (int64_t)st.alloc_count     },
         { "bytes-allocated", 15, (int64_t)st.bytes_allocated },
+        { "direct-bytes",    12, (int64_t)st.direct_bytes    },
         { "peak-bytes",      10, (int64_t)st.peak_bytes      },
         { "slab-hits",        9, (int64_t)st.slab_hits       },
         { "sys-current",     11, (int64_t)st.sys_current     },

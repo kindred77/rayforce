@@ -180,6 +180,41 @@ void ray_heap_release_pages(void);
 #define BSIZEOF(o)    ((size_t)1 << (o))
 
 /* --------------------------------------------------------------------------
+ * Direct large allocation
+ *
+ * An allocation that would otherwise need a dedicated OVERSIZED buddy pool
+ * (order >= RAY_HEAP_POOL_ORDER) is instead mmap'd at its EXACT page-rounded
+ * size — no power-of-2 block rounding, no order+1 pool doubling.  Layout:
+ * [ray_direct_hdr_t (32B) | ray_t header (32B) | data], page-rounded.  The
+ * ray_t is marked with an order ABOVE the max real order, so every buddy path
+ * (freelist indexing, coalescing, pool masking, capacity) skips it, and it is
+ * freed by a standalone munmap from any thread (address space is
+ * process-wide); its bytes live in a single global atomic.
+ * -------------------------------------------------------------------------- */
+#define RAY_ORDER_DIRECT   (RAY_HEAP_MAX_ORDER + 1)   /* sentinel order */
+#define RAY_DIRECT_HDR     32                          /* prefix before ray_t */
+
+typedef struct {
+    size_t map_size;                            /* total mmap'd bytes */
+    char   _pad[RAY_DIRECT_HDR - sizeof(size_t)];
+} ray_direct_hdr_t;
+_Static_assert(sizeof(ray_direct_hdr_t) == RAY_DIRECT_HDR, "direct hdr must be 32B");
+
+static inline bool ray_is_direct(const ray_t* v) {
+    return v->order > RAY_HEAP_MAX_ORDER;
+}
+static inline size_t ray_direct_map_size(const ray_t* v) {
+    return ((const ray_direct_hdr_t*)((const char*)v - RAY_DIRECT_HDR))->map_size;
+}
+/* Usable data bytes (block minus the 32-byte ray_t header).  Handles both
+ * buddy blocks and direct blocks, so capacity math is uniform. */
+static inline size_t ray_block_data_bytes(const ray_t* v) {
+    return ray_is_direct(v)
+        ? ray_direct_map_size(v) - RAY_DIRECT_HDR - 32
+        : ((size_t)1 << v->order) - 32;
+}
+
+/* --------------------------------------------------------------------------
  * Pool header: first min-block (64B) of each self-aligned pool.
  *
  * Overlaid on bytes 0-15 of the ray_t at pool offset 0.
