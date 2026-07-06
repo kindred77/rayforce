@@ -2735,10 +2735,14 @@ static void binary_range(ray_op_t* op, int8_t out_type,
     int32_t* lp_i32 = NULL; uint32_t* lp_u32 = NULL; int16_t* lp_i16 = NULL;
     int32_t* rp_i32 = NULL; uint32_t* rp_u32 = NULL; int16_t* rp_i16 = NULL;
 
-    /* VLA bound of zero is UB; guarantee >=1 slot.  The fill loops below
-     * are bounded by n so extra slots are harmless. */
-    int64_t _sym_buf_n = n ? n : 1;
-    int64_t lsym_buf[_sym_buf_n], rsym_buf[_sym_buf_n]; /* stack VLA for narrow RAY_SYM (n<=1024) */
+    /* SYM index scratch — needed ONLY by narrow-width (W8/W16) or cross-domain
+     * SYM columns.  Allocated lazily on the heap (freed at `done:`) rather than
+     * as a stack VLA: the pool can hand a worker a morsel far larger than a page
+     * (grain is total/task_cap once the ring saturates), so an n-sized stack
+     * array would overflow the worker stack.  Non-SYM ops (the common case)
+     * allocate nothing. */
+    int64_t* lsym_buf = NULL;
+    int64_t* rsym_buf = NULL;
     /* sym-domain Phase 2: SYM column vs SYM column across DIFFERENT
      * domains cannot compare raw indices — re-express the rhs cells in
      * the lhs's domain via the buffer path (absent → -1: equals no lhs
@@ -2757,7 +2761,12 @@ static void binary_range(ray_op_t* op, int8_t out_type,
             uint8_t w = lhs->attrs & RAY_SYM_W_MASK;
             if (w == RAY_SYM_W64) lp_i64 = (int64_t*)lbase;
             else if (w == RAY_SYM_W32) lp_u32 = (uint32_t*)lbase;
-            else { for (int64_t j = 0; j < n; j++) lsym_buf[j] = ray_read_sym(l_data, l_off+j, lhs->type, lhs->attrs); lp_i64 = lsym_buf; }
+            else {
+                lsym_buf = (int64_t*)ray_alloc_raw((size_t)n * sizeof(int64_t));
+                if (!lsym_buf) goto done;
+                for (int64_t j = 0; j < n; j++) lsym_buf[j] = ray_read_sym(l_data, l_off+j, lhs->type, lhs->attrs);
+                lp_i64 = lsym_buf;
+            }
         }
         else if (lhs->type == RAY_I32 || lhs->type == RAY_DATE || lhs->type == RAY_TIME) lp_i32 = (int32_t*)lbase;
         else if (lhs->type == RAY_I16) lp_i16 = (int16_t*)lbase;
@@ -2773,6 +2782,8 @@ static void binary_range(ray_op_t* op, int8_t out_type,
             uint8_t w = rhs->attrs & RAY_SYM_W_MASK;
             if (sym_xlate) {
                 /* cross-domain: translate every rhs cell (any width) */
+                rsym_buf = (int64_t*)ray_alloc_raw((size_t)n * sizeof(int64_t));
+                if (!rsym_buf) goto done;
                 struct ray_sym_domain_s* ld = ray_sym_vec_domain(lhs);
                 struct ray_sym_domain_s* rd = ray_sym_vec_domain(rhs);
                 for (int64_t j = 0; j < n; j++) {
@@ -2785,7 +2796,12 @@ static void binary_range(ray_op_t* op, int8_t out_type,
             }
             else if (w == RAY_SYM_W64) rp_i64 = (int64_t*)rbase;
             else if (w == RAY_SYM_W32) rp_u32 = (uint32_t*)rbase;
-            else { for (int64_t j = 0; j < n; j++) rsym_buf[j] = ray_read_sym(r_data, r_off+j, rhs->type, rhs->attrs); rp_i64 = rsym_buf; }
+            else {
+                rsym_buf = (int64_t*)ray_alloc_raw((size_t)n * sizeof(int64_t));
+                if (!rsym_buf) goto done;
+                for (int64_t j = 0; j < n; j++) rsym_buf[j] = ray_read_sym(r_data, r_off+j, rhs->type, rhs->attrs);
+                rp_i64 = rsym_buf;
+            }
         }
         else if (rhs->type == RAY_I32 || rhs->type == RAY_DATE || rhs->type == RAY_TIME) rp_i32 = (int32_t*)rbase;
         else if (rhs->type == RAY_I16) rp_i16 = (int16_t*)rbase;
@@ -2919,6 +2935,9 @@ static void binary_range(ray_op_t* op, int8_t out_type,
     }
 #undef LV_READ
 #undef RV_READ
+done:
+    if (lsym_buf) ray_free_raw(lsym_buf);
+    if (rsym_buf) ray_free_raw(rsym_buf);
 }
 
 /* Context for parallel binary dispatch */
