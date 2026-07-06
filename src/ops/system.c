@@ -817,7 +817,7 @@ ray_t* ray_prof_fn(ray_t** args, int64_t n) {
     /* Walk the flat span log, pairing START/END via a depth stack.
      * child_ns[d] accumulates the wall time of the direct children of the
      * span currently open at depth d, so each span's EXCLUSIVE (self) time
-     * is its own wall minus that sum — mirroring DuckDB's per-operator
+     * is its own wall minus that sum — standard per-operator
      * exclusive timing (cumulative is derivable by summing the subtree). */
     int32_t stack[256];
     int64_t child_ns[256] = {0};
@@ -895,7 +895,7 @@ ray_t* ray_prof_fn(ray_t** args, int64_t n) {
 /* (.sys.querylog) — the in-memory query-statistics ring as a table.
  *
  * One row per completed query (oldest first), capped at the ring capacity.
- * Ambient server-side statistics à la ClickHouse's system.query_log: read
+ * Ambient server-side query-log statistics (a system query_log table): read
  * back with ordinary queries, no extra protocol.  Each call materializes a
  * fresh snapshot, so anything a caller does to the returned table (upsert,
  * delete) touches the copy, never the ring.  Empty until logging is enabled
