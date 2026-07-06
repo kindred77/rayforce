@@ -2200,6 +2200,51 @@ static test_result_t test_order_overflow_guards(void) {
     PASS();
 }
 
+/* Anon watermark: once our anonymous (RAM) footprint would cross the watermark,
+ * further large allocations spill to a disk-backed file instead of anonymous
+ * RAM (which the kernel could accept then OOM-kill).  Drive it with a low
+ * watermark so the crossing is deterministic regardless of machine RAM. */
+static test_result_t test_anon_watermark_spill(void) {
+    size_t sz = 40 * 1024 * 1024 - 128;   /* order 26 → direct path */
+    int64_t base = ray_heap_anon_committed();
+    /* Headroom for exactly one ~40 MB block, not two. */
+    ray_heap_set_anon_watermark(base + 48 * 1024 * 1024);
+
+    ray_t* a = ray_alloc(sz);
+    bool a_file = a ? ray_direct_file_backed(a) : true;   /* expect anon (RAM) */
+    ray_t* b = ray_alloc(sz);
+    bool b_file = b ? ray_direct_file_backed(b) : false;  /* expect spill file */
+
+    /* A spilled block must be as usable as an anon one: write a pattern near
+     * the start and end of each and read it back (MAP_SHARED round-trip). */
+    bool rw_ok = (a != NULL && b != NULL);
+    if (rw_ok) {
+        for (int i = 0; i < 2; i++) {
+            ray_t* blk = i ? b : a;
+            uint8_t* d = (uint8_t*)ray_data(blk);
+            d[0] = 0xA5; d[4095] = 0x5A; d[sz - 1] = 0x3C;
+            if (d[0] != 0xA5 || d[4095] != 0x5A || d[sz - 1] != 0x3C)
+                rw_ok = false;
+        }
+    }
+
+    /* Free and reset the watermark BEFORE asserting so a failure can't leak the
+     * blocks or leave the low watermark set for later tests. */
+    if (a) ray_free(a);
+    if (b) ray_free(b);
+    ray_heap_set_anon_watermark(0);
+
+    TEST_ASSERT_NOT_NULL(a);
+    TEST_ASSERT_NOT_NULL(b);
+    TEST_ASSERT(!a_file, "first alloc under watermark stays in anonymous RAM");
+    TEST_ASSERT(b_file, "second alloc over watermark spills to a disk file");
+    TEST_ASSERT(rw_ok, "both anon and spilled blocks round-trip written data");
+
+    /* Counter returns to baseline once both are freed. */
+    TEST_ASSERT_EQ_I(ray_heap_anon_committed(), base);
+    PASS();
+}
+
 /* ---- Slab byte-budget caps -------------------------------------------- *
  *
  * Verify that ray_heap_init computes slab_cap[] correctly from the default
@@ -2420,6 +2465,7 @@ const test_entry_t heap_entries[] = {
     { "heap/free_no_heap",             test_free_no_heap,                      heap_setup, heap_teardown },
     { "heap/pool_of_oversized_walk",   test_pool_of_oversized_walk,            heap_setup, heap_teardown },
     { "heap/order_overflow_guards",    test_order_overflow_guards,             heap_setup, heap_teardown },
+    { "heap/anon_watermark_spill",     test_anon_watermark_spill,              heap_setup, heap_teardown },
     { "heap/slab_byte_budget",         test_slab_byte_budget,            heap_setup, heap_teardown },
     { "heap/slab_gc_drains_wide",      test_slab_gc_drains_wide,         heap_setup, heap_teardown },
     { "heap/retain_atom_obj",          test_retain_owned_refs_atom_obj,  heap_setup, heap_teardown },

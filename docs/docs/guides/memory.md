@@ -8,7 +8,7 @@ Rayforce uses a custom memory subsystem — no calls to `malloc` or `free` ever 
 - **Slab cache** — Small allocations (common for atoms and short vectors) are served from pre-sized slab pools, avoiding buddy-tree overhead.
 - **COW ref counting** — Vectors use copy-on-write semantics via `ray_retain`/`ray_release`. Shared vectors are only copied when mutated. Note that `ray_retain`/`ray_release`/`ray_cow` are no-ops on `RAY_ERROR` objects, so an error block must be reclaimed with `ray_error_free()` rather than `ray_release()`.
 - **Arena allocator** — For bulk short-lived blocks (e.g., intermediate query results). Arena objects carry an `RAY_ATTR_ARENA` flag that makes retain/release no-ops. The entire arena is freed at once when work completes.
-- **Out-of-core spill** — There is no enforced memory ceiling. When an anonymous `mmap` for a new pool is *refused* by the OS, the heap falls back to a file-backed mapping on disk, so the working set spills rather than the allocation failing. Note this depends on the OS actually refusing the mapping: under Linux's default memory overcommit (`vm.overcommit_memory=0`), a single allocation larger than RAM+swap is typically *accepted* and then killed by the OOM killer as its pages fault in — spill only saves you when the kernel declines the mapping up front. Total physical RAM is detected at startup for informational reporting only (see `.sys.info` → `total-mem`).
+- **Out-of-core spill** — There is no enforced memory ceiling. The heap tracks how much anonymous (RAM) memory it has committed; once an allocation would push that past the **anon watermark** (total physical RAM by default), it is backed by a preallocated disk file instead of anonymous RAM. File-backed pages are always reclaimable to disk, so they can't trigger the OOM killer — the working set spills and the query completes (slowly) rather than being killed. This never rejects work. Total physical RAM is detected at startup for this threshold and for reporting (see `.sys.info` → `total-mem`).
 
 For a deep dive into the allocator internals, see [Memory Model](../architecture/memory.md).
 
@@ -209,19 +209,25 @@ This is the fastest way to identify slow expressions in an interactive session. 
 
 ## 8. Total RAM and Out-of-Core Spill
 
-Rayforce imposes **no enforced memory ceiling**. Total physical RAM is detected
-at startup purely for reporting; there is no budget threshold that rejects work
-or throttles it.
+Rayforce imposes **no enforced memory ceiling** — it never rejects or throttles
+work. Instead it is out-of-core: memory that does not fit in RAM spills to disk.
 
-When the OS *refuses* a new pool mapping, the heap spills that pool to a
-file-backed mapping on disk and the query keeps running (more slowly). This is a
-genuine safety net under strict overcommit (`vm.overcommit_memory=2`) or when
-address space is bounded. Under Linux's **default** heuristic overcommit,
-however, a single result larger than RAM+swap is usually *accepted* by the
-kernel and then killed by the OOM killer as its pages fault in — so a query like
-`(til 10000000000)` (a 74 GiB vector) on a machine with less RAM than that will
-be terminated, not spilled. Watch the progress bar's `used / total` figure to
-see the footprint approach total RAM and cancel with Ctrl-C before it is killed.
+**Why not just rely on the OS.** An anonymous (RAM) mapping is dangerous: under
+Linux's default overcommit the kernel *accepts* a mapping larger than it can
+actually back, then invokes the OOM killer when the pages fault in. You cannot
+tell at allocation time whether that will happen. A **file-backed** mapping over
+a preallocated disk file is safe: its pages are always reclaimable to the file,
+so it can never trigger the OOM killer — worst case is slower I/O or a clean
+disk-full error.
+
+**The anon watermark.** So the heap tracks the anonymous (RAM-resident) bytes it
+has committed, and when a new pool or large allocation would push that past the
+watermark — total physical RAM by default — it backs that allocation with a disk
+spill file **instead of** anonymous RAM. This never rejects work; it just routes
+the overflow to disk so it spills rather than getting OOM-killed. A query like
+`(til 10000000000)` (a 74 GiB vector) on a smaller machine now spills to disk and
+completes (slowly) instead of being terminated. The progress bar's `used / total`
+figure shows the footprint approaching total RAM — the point where spill begins.
 
 ### Checking total RAM
 

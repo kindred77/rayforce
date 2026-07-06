@@ -242,6 +242,35 @@ static _Atomic(uint64_t) g_heap_id_cursor = 0;
 static _Atomic(int64_t) g_direct_bytes = 0;
 static _Atomic(int64_t) g_direct_count = 0;
 
+/* Anonymous (RAM-resident) pool + direct bytes we have committed.  File-backed
+ * spill mappings are NOT counted (they can be evicted to disk, never OOM-kill).
+ * When a new anon mapping would push this past the watermark, it is routed to a
+ * spill file instead — this never rejects work, it just picks disk over RAM. */
+static _Atomic(int64_t) g_anon_committed = 0;
+static _Atomic(int64_t) g_anon_watermark = 0;   /* 0 = default to physical RAM */
+
+/* Threshold above which anon allocations spill to disk.  Default keeps our
+ * anon footprint within physical RAM (swap + page cache stay as headroom). */
+static int64_t heap_anon_watermark(void) {
+    int64_t wm = atomic_load_explicit(&g_anon_watermark, memory_order_relaxed);
+    return wm > 0 ? wm : ray_sys_total_ram();
+}
+/* True if committing `bytes` more anonymous RAM would cross the watermark. */
+static bool heap_anon_would_exceed(size_t bytes) {
+    int64_t wm = heap_anon_watermark();
+    if (wm <= 0) return false;   /* unknown RAM → keep the fast anon path */
+    int64_t cur = atomic_load_explicit(&g_anon_committed, memory_order_relaxed);
+    return cur + (int64_t)bytes > wm;
+}
+
+int64_t ray_heap_anon_committed(void) {
+    return atomic_load_explicit(&g_anon_committed, memory_order_relaxed);
+}
+void ray_heap_set_anon_watermark(int64_t bytes) {
+    atomic_store_explicit(&g_anon_watermark, bytes < 0 ? 0 : bytes,
+                          memory_order_relaxed);
+}
+
 ray_heap_t* ray_heap_registry[RAY_HEAP_REGISTRY_SIZE];
 
 /* Serializes the registry slot writes (register/unregister) and the
@@ -435,9 +464,16 @@ static bool heap_add_pool(ray_heap_t* h, uint8_t order) {
     if (pool_order > RAY_HEAP_MAX_ORDER) return false;
     size_t pool_size = BSIZEOF(pool_order);
 
-    void* mem = ray_vm_alloc_aligned(pool_size, pool_size);
+    void* mem = NULL;
     int   swap_fd  = -1;
     char* swap_path = NULL;
+
+    /* Proactively back this pool with a disk spill file if an anon mapping
+     * would push our RAM footprint past the watermark — a file-backed pool
+     * can't be OOM-killed.  Otherwise take the fast anon path (and still fall
+     * back to a spill file below if the kernel refuses the mapping). */
+    if (!heap_anon_would_exceed(pool_size))
+        mem = ray_vm_alloc_aligned(pool_size, pool_size);
 
     if (!mem) {
         /* Anonymous mmap refused — usually means RAM+swap can't satisfy
@@ -565,6 +601,10 @@ static bool heap_add_pool(ray_heap_t* h, uint8_t order) {
     h->pools[h->pool_count].swap_fd    = swap_fd;
     h->pools[h->pool_count].swap_path  = swap_path;  /* NULL when not backed */
     h->pool_count++;
+
+    if (swap_fd < 0)   /* anonymous pool: counts toward the RAM watermark */
+        atomic_fetch_add_explicit(&g_anon_committed, (int64_t)pool_size,
+                                  memory_order_relaxed);
 
     return true;
 }
@@ -1071,20 +1111,23 @@ static ray_t* heap_alloc_direct(ray_heap_t* h, size_t data_size) {
     int   swap_fd   = -1;
     char* swap_path = NULL;
 
-    /* An allocation larger than all physical RAM cannot be RAM-resident: back
-     * it with a disk file from the start so it spills instead of being
-     * OOM-killed as its pages fault in.  (Under lenient overcommit an exact
-     * anon mmap this large SUCCEEDS, so a fallback-on-failure alone would not
-     * catch it.)  Otherwise use anonymous RAM, and fall back to a spill file
-     * only if the kernel refuses the mapping. */
-    int64_t total_ram = ray_sys_total_ram();
-    bool force_file = (total_ram > 0 && map_size > (size_t)total_ram);
+    /* If keeping this in anonymous RAM would push our footprint past the
+     * watermark (default: physical RAM), back it with a disk file from the
+     * start so it spills instead of being OOM-killed as its pages fault in.
+     * (Under lenient overcommit an anon mmap the kernel can't actually back
+     * SUCCEEDS, then kills us at fault time — so a fallback-on-failure alone
+     * would not catch it.)  Otherwise use anonymous RAM, and fall back to a
+     * spill file only if the kernel refuses the mapping. */
+    bool force_file = heap_anon_would_exceed(map_size);
     if (!force_file)
         base = ray_vm_alloc(map_size);   /* anon RW, page-aligned, counted */
     if (!base) {
         base = heap_direct_map_file(h, map_size, &swap_fd, &swap_path);
         if (!base) return NULL;
     }
+    if (swap_fd < 0)   /* anonymous: counts toward the RAM watermark */
+        atomic_fetch_add_explicit(&g_anon_committed, (int64_t)map_size,
+                                  memory_order_relaxed);
 
     ray_direct_hdr_t* hdr = (ray_direct_hdr_t*)base;
     hdr->map_size  = map_size;
@@ -1287,6 +1330,8 @@ void ray_free(ray_t* v) {
             close(swap_fd);
             if (swap_path) { unlink(swap_path); ray_sys_free(swap_path); }
         } else {
+            atomic_fetch_sub_explicit(&g_anon_committed, (int64_t)map_size,
+                                      memory_order_relaxed);
             ray_vm_free(base, map_size);   /* munmap + committed-RAM counter -= */
         }
         return;
@@ -1703,6 +1748,9 @@ void ray_heap_destroy(void) {
                 unlink(h->pools[i].swap_path);
                 ray_sys_free(h->pools[i].swap_path);
             }
+        } else {
+            atomic_fetch_sub_explicit(&g_anon_committed,
+                (int64_t)BSIZEOF(h->pools[i].pool_order), memory_order_relaxed);
         }
     }
 
@@ -1979,6 +2027,9 @@ void ray_heap_gc(void) {
                         unlink(gh->pools[p].swap_path);
                         ray_sys_free(gh->pools[p].swap_path);
                     }
+                } else {
+                    atomic_fetch_sub_explicit(&g_anon_committed,
+                        (int64_t)BSIZEOF(po), memory_order_relaxed);
                 }
                 gh->pools[p] = gh->pools[--gh->pool_count];
                 /* Don't increment p — check swapped entry */

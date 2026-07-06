@@ -216,6 +216,19 @@ static inline size_t ray_block_data_bytes(const ray_t* v) {
         ? ray_direct_map_size(v) - RAY_DIRECT_HDR - 32
         : ((size_t)1 << v->order) - 32;
 }
+/* True if a direct block is backed by a disk spill file (vs anonymous RAM). */
+static inline bool ray_direct_file_backed(const ray_t* v) {
+    return ((const ray_direct_hdr_t*)((const char*)v - RAY_DIRECT_HDR))->swap_fd >= 0;
+}
+
+/* Anonymous (RAM-resident, OOM-killable) pool + direct bytes currently
+ * committed by the heap.  Allocations that would push this past the anon
+ * watermark (default: total physical RAM) are backed by a disk spill file
+ * instead — file-backed pages are always reclaimable, so they cannot trigger
+ * the OOM killer.  ray_heap_set_anon_watermark overrides the threshold (0
+ * restores the default); intended for diagnostics and tests. */
+int64_t ray_heap_anon_committed(void);
+void    ray_heap_set_anon_watermark(int64_t bytes);
 
 /* --------------------------------------------------------------------------
  * Pool header: first min-block (64B) of each self-aligned pool.
