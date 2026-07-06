@@ -363,6 +363,8 @@ typedef struct {
     uint64_t    rows_done;
     uint64_t    rows_total;   /* 0 = indeterminate */
     double      elapsed_sec;
+    int64_t     mem_used;     /* bytes: live object footprint (buddy + direct mmap) */
+    int64_t     mem_total;    /* bytes: total physical RAM (the disk-spill threshold) */
     bool        final;        /* true on the last tick of a query — renderers
                                  use this to clear the line */
 } ray_progress_t;

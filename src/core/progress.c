@@ -77,12 +77,21 @@ void ray_progress_set_callback(ray_progress_cb cb, void* user,
 }
 
 static void fire(uint64_t now_ns, bool final) {
+    ray_mem_stats_t ms;
+    ray_mem_stats(&ms);
     ray_progress_t snap = {
         .op_name     = g_op_name ? g_op_name : "",
         .phase       = g_phase ? g_phase : "",
         .rows_done   = g_rows_done,
         .rows_total  = g_rows_total,
         .elapsed_sec = (double)(now_ns - g_start_ns) / 1e9,
+        /* Live object footprint (per-object buddy block + exact-sized direct
+         * mmaps).  Compared against total physical RAM — the point past which
+         * the working set no longer fits and the heap spills to disk.  Aligned
+         * 64-bit loads are atomic on the supported ISAs, so a mid-dispatch read
+         * is stale-at-worst, not torn. */
+        .mem_used    = (int64_t)(ms.bytes_allocated + ms.direct_bytes),
+        .mem_total   = ray_sys_total_ram(),
         .final       = final,
     };
     g_cb(&snap, g_user);

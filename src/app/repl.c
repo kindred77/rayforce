@@ -118,9 +118,22 @@ static int progress_term_cols(void) {
     return cached;
 }
 
+static const char* fmt_bytes(int64_t bytes, char* buf, size_t bufsz) {
+    if (bytes < 0) bytes = 0;
+    double v = (double)bytes;
+    const char* unit;
+    if      (v >= 1e9) { v /= 1e9; unit = "G"; }
+    else if (v >= 1e6) { v /= 1e6; unit = "M"; }
+    else if (v >= 1e3) { v /= 1e3; unit = "K"; }
+    else               { unit = "B"; }
+    snprintf(buf, bufsz, "%.1f%s", v, unit);
+    return buf;
+}
+
 static void render_progress_full(int64_t done, int64_t total,
                                    const char* op, const char* phase,
-                                   double elapsed_sec) {
+                                   double elapsed_sec,
+                                   int64_t mem_used, int64_t mem_total) {
     int cols = progress_term_cols();
     /* Reserve a chunk for labels + percent + elapsed; give the rest
      * to the bar. Minimum bar is 10 cells, maximum 40. */
@@ -152,6 +165,12 @@ static void render_progress_full(int64_t done, int64_t total,
                        (op && *op) ? ": " : " \xc2\xb7 ", phase);
     if (elapsed_sec > 0.0)
         tp += snprintf(tail + tp, sizeof(tail) - tp, " \xc2\xb7 %.1fs", elapsed_sec);
+    if (mem_used > 0 && mem_total > 0) {
+        char ub[16], tb[16];
+        fmt_bytes(mem_used, ub, sizeof(ub));
+        fmt_bytes(mem_total, tb, sizeof(tb));
+        tp += snprintf(tail + tp, sizeof(tail) - tp, " \xc2\xb7 %s/%s", ub, tb);
+    }
 
     /* Clear the line first, then draw. Using \e[2K avoids leaving
      * stale tail text when a shorter render overwrites a longer one. */
@@ -191,7 +210,8 @@ static void repl_query_progress_cb(const ray_progress_t* p, void* user) {
     (void)user;
     if (p->final) { clear_progress(); return; }
     render_progress_full((int64_t)p->rows_done, (int64_t)p->rows_total,
-                         p->op_name, p->phase, p->elapsed_sec);
+                         p->op_name, p->phase, p->elapsed_sec,
+                         p->mem_used, p->mem_total);
 }
 
 /* ===== Profiler span tree printer (reads from g_ray_profile) ===== */
