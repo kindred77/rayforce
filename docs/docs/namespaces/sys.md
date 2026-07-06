@@ -82,7 +82,8 @@ Signature: `(.sys.mem)`. Returns the buddy allocator's running counters:
 | Key | Meaning |
 |---|---|
 | `alloc-count` | Cumulative `ray_alloc` calls. |
-| `bytes-allocated` | Live bytes held by `ray_t` objects. |
+| `bytes-allocated` | Live bytes in buddy-pool blocks (sub-32 MB objects). |
+| `direct-bytes` | Live bytes in **direct** mmaps — large objects (≥ 32 MB) mapped at their exact page-rounded size, bypassing the power-of-2 buddy pool. `bytes-allocated + direct-bytes` is the true live object footprint. |
 | `peak-bytes` | High-watermark since process start. |
 | `slab-hits` | Cumulative fast-path slab allocations. |
 | `sys-current` | **Committed RAM**: every anonymous mapping — the buddy pools (where all vectors live), sys allocations, and the swap-fallback pool. The true live-memory figure. |
