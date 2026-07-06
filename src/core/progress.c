@@ -85,13 +85,15 @@ static void fire(uint64_t now_ns, bool final) {
         .rows_done   = g_rows_done,
         .rows_total  = g_rows_total,
         .elapsed_sec = (double)(now_ns - g_start_ns) / 1e9,
-        /* Use the process-wide, atomic sys_current — NOT the per-thread
-         * bytes_allocated: the pump fires mid-parallel-dispatch, where worker
-         * threads mutate the main heap's bytes_allocated via cross-heap frees,
-         * so reading it here is a torn read (it could read far above the
-         * budget).  sys_current (g_sys_current, a release-safe atomic) is
-         * cross-thread-safe and stays a sane fraction of the budget. */
-        .mem_used    = (int64_t)ms.sys_current,
+        /* Live buddy-block footprint — the memory actually reserved for live
+         * objects.  NOT sys_current: that counts whole POOL reservations
+         * (order+1 = 2x the block for oversized allocs), which over-reports an
+         * 80 GB vector as ~274 GB.  bytes_allocated is the per-object block
+         * (still power-of-2 rounded, ~1.7x the logical data — inherent to the
+         * buddy), which is the honest "how much is reserved" figure.  Aligned
+         * 64-bit loads are atomic on the supported ISAs, so the mid-dispatch
+         * read is stale-at-worst, not torn. */
+        .mem_used    = (int64_t)(ms.bytes_allocated + ms.direct_bytes),
         .mem_budget  = ray_mem_budget(),
         .final       = final,
     };
