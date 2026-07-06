@@ -546,8 +546,20 @@ void ray_pool_destroy(void) {
     atomic_store_explicit(&g_pool_init_state, 0, memory_order_release);
 }
 
+/* Async-signal-safe: set the running query's worker-cancel flag.  Touches the
+ * pool only when it is already live (state 2) — it must NOT run ray_pool_get's
+ * lazy-init path (malloc/thread create) from a signal handler, and if no pool
+ * exists there are no workers to stop.  Reached from ray_request_interrupt(),
+ * including the SIGINT handler. */
 void ray_cancel(void) {
-    ray_pool_t* pool = ray_pool_get();
-    if (pool)
-        atomic_store_explicit(&pool->cancelled, 1, memory_order_release);
+    if (atomic_load_explicit(&g_pool_init_state, memory_order_acquire) == 2)
+        atomic_store_explicit(&g_pool.cancelled, 1, memory_order_release);
+}
+
+/* Clear the worker-cancel flag at a query boundary — mirror of ray_cancel,
+ * equally signal-safe.  ray_execute also resets it before each parallel
+ * dispatch; this keeps the flag in sync when a query never dispatches. */
+void ray_cancel_reset(void) {
+    if (atomic_load_explicit(&g_pool_init_state, memory_order_acquire) == 2)
+        atomic_store_explicit(&g_pool.cancelled, 0, memory_order_release);
 }

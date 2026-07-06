@@ -88,8 +88,15 @@ static void affine_sum_cache_clear(void) {
 /* Interrupt flag — set by REPL signal handler, checked by eval/VM loops */
 static volatile sig_atomic_t g_eval_interrupted = 0;
 
-void ray_request_interrupt(void)      { g_eval_interrupted = 1; }
-void ray_clear_interrupt(void)        { g_eval_interrupted = 0; }
+/* A cancel request must reach BOTH the main-thread eval/VM loops (this flag)
+ * and any in-flight parallel workers (the pool's cancel flag, via ray_cancel).
+ * Unifying them here means every trigger — the SIGINT handler today, an IPC
+ * cancel message later — stops the whole query, not just the serial half.
+ * ray_cancel/ray_cancel_reset are async-signal-safe, so this stays callable
+ * from the signal handler.  Zero hot-path cost: only runs when a cancel is
+ * actually requested. */
+void ray_request_interrupt(void)      { g_eval_interrupted = 1; ray_cancel(); }
+void ray_clear_interrupt(void)        { g_eval_interrupted = 0; ray_cancel_reset(); }
 bool ray_interrupted(void)            { return g_eval_interrupted != 0; }
 
 /* Legacy internal names — thin wrappers kept for existing callers. */

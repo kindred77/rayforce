@@ -334,6 +334,33 @@ static test_result_t test_cancel(void) {
     PASS();
 }
 
+/* A cancel request must reach BOTH the eval/VM interrupt flag and the pool's
+ * worker-cancel flag through the single ray_request_interrupt() entry point,
+ * and the clear path must reset both.  Before unification ray_cancel() had no
+ * caller, so Ctrl-C set only the eval flag and never stopped parallel workers. */
+static test_result_t test_interrupt_sets_both_flags(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+    ray_pool_t* pool = ray_pool_get();     /* ensure the pool is live (state 2) */
+    TEST_ASSERT_NOT_NULL(pool);
+
+    ray_clear_interrupt();
+    TEST_ASSERT_FALSE(ray_interrupted());
+    TEST_ASSERT_EQ_I((int)atomic_load_explicit(&pool->cancelled, memory_order_relaxed), 0);
+
+    ray_request_interrupt();               /* the unified trigger */
+    TEST_ASSERT_TRUE(ray_interrupted());   /* main-thread eval/VM flag */
+    TEST_ASSERT_EQ_I((int)atomic_load_explicit(&pool->cancelled, memory_order_relaxed), 1); /* worker flag too */
+
+    ray_clear_interrupt();                  /* the unified reset */
+    TEST_ASSERT_FALSE(ray_interrupted());
+    TEST_ASSERT_EQ_I((int)atomic_load_explicit(&pool->cancelled, memory_order_relaxed), 0);
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 /* --------------------------------------------------------------------------
  * Direct ray_pool_dispatch / ray_pool_dispatch_n coverage
  *
@@ -1180,6 +1207,7 @@ const test_entry_t pool_entries[] = {
     { "pool/parallel_group_sum", test_parallel_group_sum, NULL, NULL },
     { "pool/parallel_min_max", test_parallel_min_max, NULL, NULL },
     { "pool/cancel", test_cancel, NULL, NULL },
+    { "pool/interrupt_sets_both_flags", test_interrupt_sets_both_flags, NULL, NULL },
     { "pool/dispatch_zero_elems",   test_dispatch_zero_elems,   NULL, NULL },
     { "pool/dispatch_small",        test_dispatch_small,        NULL, NULL },
     { "pool/dispatch_n_small",      test_dispatch_n_small,      NULL, NULL },

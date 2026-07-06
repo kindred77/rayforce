@@ -59,6 +59,7 @@ ray_t*    ray_lazy_materialize(ray_t* val);
 /* ===== Cancel API ===== */
 
 void     ray_cancel(void);
+void     ray_cancel_reset(void);
 
 /* ===== Parted Types ===== */
 
