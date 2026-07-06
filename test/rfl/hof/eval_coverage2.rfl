@@ -257,7 +257,7 @@ lz_let -- 60
 
 ;; ═══════════════════════════════════════════════════════════════════
 ;; 21. op_jmp backward interrupt check (line 1862 in eval.c)
-;;     offset < 0 && g_eval_interrupted → vm_error_limit.
+;;     offset < 0 && g_eval_interrupted → vm_error_cancel ("cancel" error).
 ;;     This is only reachable from a tight loop when Ctrl-C fires, which
 ;;     cannot be triggered from RFL.  Confirmed structurally unreachable
 ;;     from RFL test inputs.

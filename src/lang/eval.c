@@ -2274,7 +2274,7 @@ op_jmp: {
     int16_t offset = (int16_t)((code[ip] << 8) | code[ip + 1]);
     ip += 2;
     ip += offset;
-    if (offset < 0 && g_eval_interrupted) goto vm_error_limit;
+    if (offset < 0 && g_eval_interrupted) goto vm_error_cancel;
     DISPATCH();
 }
 
@@ -2437,7 +2437,7 @@ op_callf: {
                 ray_release(fn_args[i]);  /* excess args */
 
             /* Check for Ctrl-C interrupt on each compiled call */
-            if (g_eval_interrupted) goto vm_error_limit;
+            if (g_eval_interrupted) goto vm_error_cancel;
 
             /* Switch to callee bytecode */
             code = (uint8_t *)ray_data(LAMBDA_BC(fn_obj));
@@ -2691,6 +2691,11 @@ op_scope_end: {
 vm_error_limit:
     vm_err_str = "limit";
     vm_err_detail = "stack overflow";
+    goto vm_error_cleanup;
+
+vm_error_cancel:
+    vm_err_str = "cancel";
+    vm_err_detail = "interrupted";
     goto vm_error_cleanup;
 
 vm_error_name:
@@ -3434,7 +3439,7 @@ ray_t* ray_eval(ray_t* obj) {
     }
 
     /* Check for external interrupt (e.g. Ctrl-C from REPL) */
-    if (g_eval_interrupted) return ray_error("limit", "interrupted");
+    if (g_eval_interrupted) return ray_error("cancel", "interrupted");
 
     if (++__VM->eval_depth > RAY_EVAL_MAX_DEPTH) {
         __VM->eval_depth--;

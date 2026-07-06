@@ -3960,6 +3960,19 @@ static test_result_t test_eval_clear_interrupt(void) {
     PASS();
 }
 
+/* An eval with a pending interrupt returns a "cancel" error (not "limit" — the
+ * VM's interrupt checks route to vm_error_cancel, distinct from real stack/
+ * recursion limits). */
+static test_result_t test_eval_interrupt_returns_cancel(void) {
+    ray_request_interrupt();
+    ray_t* r = ray_eval_str("(+ 1 2)");
+    ray_clear_interrupt();   /* clear before asserting so it can't leak */
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    TEST_ASSERT_STR_EQ(ray_err_code(r), "cancel");
+    ray_error_free(r);
+    PASS();
+}
+
 /* --- NFO get/set --- */
 static test_result_t test_eval_nfo_getset(void) {
     ray_t* old_nfo = ray_eval_get_nfo();
@@ -7036,6 +7049,7 @@ const test_entry_t lang_entries[] = {
     /* === Coverage pass-8 tests === */
     { "lang/eval/interrupt_flag", test_eval_interrupt_flag, lang_setup, lang_teardown },
     { "lang/eval/clear_interrupt", test_eval_clear_interrupt, lang_setup, lang_teardown },
+    { "lang/eval/interrupt_cancel", test_eval_interrupt_returns_cancel, lang_setup, lang_teardown },
     { "lang/eval/nfo_getset", test_eval_nfo_getset, lang_setup, lang_teardown },
     { "lang/eval/restricted_set_get", test_eval_restricted_set_get, lang_setup, lang_teardown },
     { "lang/eval/try_handler_error", test_eval_try_handler_error, lang_setup, lang_teardown },
