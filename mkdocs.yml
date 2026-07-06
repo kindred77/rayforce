@@ -61,9 +61,11 @@ extra:
 
 extra_css:
   - assets/extra.css
+  - assets/ai-assist-widget.css
 
 extra_javascript:
   - javascripts/main.js
+  - javascripts/ai-assist-widget.js
 
 markdown_extensions:
   - admonition
