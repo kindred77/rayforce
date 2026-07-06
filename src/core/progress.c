@@ -77,24 +77,12 @@ void ray_progress_set_callback(ray_progress_cb cb, void* user,
 }
 
 static void fire(uint64_t now_ns, bool final) {
-    ray_mem_stats_t ms;
-    ray_mem_stats(&ms);
     ray_progress_t snap = {
         .op_name     = g_op_name ? g_op_name : "",
         .phase       = g_phase ? g_phase : "",
         .rows_done   = g_rows_done,
         .rows_total  = g_rows_total,
         .elapsed_sec = (double)(now_ns - g_start_ns) / 1e9,
-        /* Live buddy-block footprint — the memory actually reserved for live
-         * objects.  NOT sys_current: that counts whole POOL reservations
-         * (order+1 = 2x the block for oversized allocs), which over-reports an
-         * 80 GB vector as ~274 GB.  bytes_allocated is the per-object block
-         * (still power-of-2 rounded, ~1.7x the logical data — inherent to the
-         * buddy), which is the honest "how much is reserved" figure.  Aligned
-         * 64-bit loads are atomic on the supported ISAs, so the mid-dispatch
-         * read is stale-at-worst, not torn. */
-        .mem_used    = (int64_t)(ms.bytes_allocated + ms.direct_bytes),
-        .mem_budget  = ray_mem_budget(),
         .final       = final,
     };
     g_cb(&snap, g_user);

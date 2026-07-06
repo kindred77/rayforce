@@ -8,7 +8,7 @@ Rayforce uses a custom memory subsystem — no calls to `malloc` or `free` ever 
 - **Slab cache** — Small allocations (common for atoms and short vectors) are served from pre-sized slab pools, avoiding buddy-tree overhead.
 - **COW ref counting** — Vectors use copy-on-write semantics via `ray_retain`/`ray_release`. Shared vectors are only copied when mutated. Note that `ray_retain`/`ray_release`/`ray_cow` are no-ops on `RAY_ERROR` objects, so an error block must be reclaimed with `ray_error_free()` rather than `ray_release()`.
 - **Arena allocator** — For bulk short-lived blocks (e.g., intermediate query results). Arena objects carry an `RAY_ATTR_ARENA` flag that makes retain/release no-ops. The entire arena is freed at once when work completes.
-- **Memory budget** — Auto-detected at initialization as 80% of physical RAM (via `sysconf` on POSIX, `GlobalMemoryStatusEx` on Windows). Queries that approach the budget may trigger spilling or offloading.
+- **Out-of-core spill** — There is no enforced memory ceiling. When an anonymous `mmap` for a new pool is refused (physical RAM and swap exhausted), the heap falls back to a file-backed mapping on disk, so a working set larger than RAM completes — slowly — instead of failing. Total physical RAM is detected at startup for informational reporting only (see `.sys.info` → `total-mem`).
 
 For a deep dive into the allocator internals, see [Memory Model](../architecture/memory.md).
 
@@ -19,10 +19,13 @@ Call `(.sys.mem 0)` to get a snapshot of the current heap's allocation statistic
 | Field | Type | Description |
 |---|---|---|
 | `alloc-count` | i64 | Total number of allocations performed since init |
-| `bytes-allocated` | i64 | Bytes currently allocated (live objects) |
+| `bytes-allocated` | i64 | Live bytes in buddy-pool blocks (sub-32 MB objects) |
+| `direct-bytes` | i64 | Live bytes in direct mmaps (objects ≥ 32 MB, mapped at exact size) |
 | `peak-bytes` | i64 | High-water mark of bytes-allocated |
 | `slab-hits` | i64 | Number of allocations served from the slab cache |
-| `sys-current` | i64 | Bytes currently mapped from the OS (mmap/VirtualAlloc) |
+| `sys-current` | i64 | Committed RAM: every anonymous mapping (buddy pools, sys allocations, swap-fallback pool) |
+| `sys-mapped` | i64 | File-backed bytes currently mapped (splayed columns, symbol file, parse buffers) |
+| `sys-mapped-peak` | i64 | High-water mark of `sys-mapped` |
 
 ### Basic Usage
 
@@ -112,7 +115,6 @@ The bar displays:
 - **Percentage** — Estimated completion based on rows processed
 - **Operation name** — The current phase (e.g., `group: hash`, `sort: merge`, `join: probe`)
 - **Elapsed time** — Wall-clock time since query start
-- **Memory usage** — Current heap usage vs. the memory budget
 
 ### Example Session
 
@@ -204,11 +206,15 @@ The REPL command `:t` (or `:timeit`) toggles profiling mode. When active, every 
 
 This is the fastest way to identify slow expressions in an interactive session. Combine it with `.sys.mem` snapshots to see both time and memory costs.
 
-## 8. Memory Budget and Pressure
+## 8. Total RAM and Out-of-Core Spill
 
-Rayforce auto-detects the memory budget at startup as 80% of physical RAM. This budget governs when the runtime begins applying back-pressure to avoid exhausting system memory.
+Rayforce imposes **no enforced memory ceiling**. Total physical RAM is detected
+at startup purely for reporting. When a query's working set outgrows physical
+RAM (and swap), the heap spills to a file-backed mapping on disk rather than
+failing — the query completes, more slowly. There is no budget threshold that
+rejects work or throttles it.
 
-### Checking the Budget
+### Checking total RAM
 
 ```lisp
 ;; The total-mem field shows total physical RAM
@@ -221,30 +227,25 @@ page-size | 4096
 total-mem | 16777216000
 ```
 
-On this machine with 16 GB of RAM, the memory budget (80%) is approximately 12.5 GB.
+### Gauging headroom
 
-### How Pressure Works
-
-When heap usage exceeds the memory budget:
-
-- The executor may switch to streaming/morsel-at-a-time processing for large intermediate results
-- Block offloading can spill cold data to disk (see [Block Offloading](../architecture/offloading.md))
-- The progress bar shows current memory relative to the budget so you can see pressure building
-
-You can monitor pressure by comparing `bytes-allocated` from `(.sys.mem 0)` against `total-mem` from `(.sys.info 0)`:
+To see how close a workload is to spilling to disk, compare the live object
+footprint (`bytes-allocated + direct-bytes` from `(.sys.mem)`) against
+`total-mem` from `(.sys.info)`:
 
 ```lisp
-;; Calculate memory pressure as a percentage
+;; Live footprint as a percentage of physical RAM
 (set stats (.sys.mem))
 (set info (.sys.info))
-(* 100.0 (/ (stats bytes-allocated) (info total-mem)))
+(* 100.0 (/ (+ (stats bytes-allocated) (stats direct-bytes)) (info total-mem)))
 ```
 
 ```text
 29.4
 ```
 
-This shows 29.4% of the budget is in use — plenty of headroom.
+This shows 29.4% of physical RAM is in use — plenty of headroom before the heap
+begins spilling to disk.
 
 ## 9. Practical Patterns
 
@@ -353,7 +354,7 @@ This tells you the join needed about 1 GB of temporary memory beyond what was al
 |---|---|---|
 | `(.sys.mem 0)` | Returns heap allocation statistics | Monitor memory usage, detect leaks |
 | `(.sys.gc 0)` | Flushes caches, releases pages | Between heavy queries, before benchmarks |
-| `(.sys.info 0)` | Shows system and runtime info | Check budget, CPU count, OS details |
+| `(.sys.info 0)` | Shows system and runtime info | Check total RAM, CPU count, OS details |
 | `(timeit expr)` | Measures execution time of one expression | Benchmark a specific operation |
 | `:timeit` | Toggles profiling for all REPL expressions | Interactive performance exploration |
 | Progress bar | Automatic during long queries | Visual feedback on query progress |

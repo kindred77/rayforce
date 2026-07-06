@@ -96,8 +96,8 @@ void     ray_cancel(void);
 #define RAY_ORDER_MAX  30
 
 /* Heap statistics are USER-VISIBLE — the `sys` introspection fields
- * (alloc-count / bytes-allocated / peak-bytes / slab-hits) and
- * ray_mem_pressure() read them — so they must be maintained in every build,
+ * (alloc-count / bytes-allocated / peak-bytes / slab-hits, surfaced via
+ * `.sys.mem`) read them — so they must be maintained in every build,
  * including release.  The macro is retained as a single switch (and to keep
  * the RAY_STAT-only `block_size` local guarded) in case a future split makes
  * some counters purely internal; today it is unconditionally on. */

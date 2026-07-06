@@ -55,7 +55,7 @@
 #include <unistd.h>
 #include <stdlib.h>
 
-/* Forward-declare runtime lifecycle for mem_budget test */
+/* Forward-declare runtime lifecycle for total_ram test */
 typedef struct ray_runtime_s ray_runtime_t;
 extern ray_runtime_t* ray_runtime_create(int argc, char** argv);
 extern void           ray_runtime_destroy(ray_runtime_t* rt);
@@ -3174,18 +3174,16 @@ static test_result_t test_serde_de_size_bounds(void) {
     PASS();
 }
 
-/* ---- test_mem_budget --------------------------------------------------- */
+/* ---- test_total_ram ---------------------------------------------------- */
 
-static test_result_t test_mem_budget(void) {
+static test_result_t test_total_ram(void) {
     /* Uses its own runtime since store_setup only does heap/sym init */
     ray_runtime_t* rt = ray_runtime_create(0, NULL);
     TEST_ASSERT_NOT_NULL(rt);
 
-    int64_t budget = ray_mem_budget();
-    /* Budget should be > 0 (detected from OS) */
-    TEST_ASSERT_EQ_I((int)(budget > 0), 1);
-    /* At startup with minimal allocations, should not be under pressure */
-    TEST_ASSERT_FALSE(ray_mem_pressure());
+    /* Total physical RAM should be detected as a positive value from the OS. */
+    int64_t total = ray_sys_total_ram();
+    TEST_ASSERT_EQ_I((int)(total > 0), 1);
 
     ray_runtime_destroy(rt);
     PASS();
@@ -4977,7 +4975,7 @@ const test_entry_t store_entries[] = {
     { "store/serde_table_dict_de_errors", test_serde_table_dict_de_errors, store_setup, store_teardown },
     { "store/serde_table_de_type_mismatch", test_serde_table_de_type_mismatch, store_setup, store_teardown },
     { "store/serde_de_size_bounds",        test_serde_de_size_bounds,        store_setup, store_teardown },
-    { "store/mem_budget", test_mem_budget, NULL, NULL },
+    { "store/total_ram", test_total_ram, NULL, NULL },
     { "store/ipc/compress_rt", test_ipc_compress_rt, NULL, NULL },
     { "store/ipc/compress_threshold", test_ipc_compress_threshold, NULL, NULL },
     { "store/ipc/compress_zeros", test_ipc_compress_zeros, NULL, NULL },

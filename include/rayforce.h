@@ -334,10 +334,9 @@ void*    ray_calloc_raw(size_t n);
 void*    ray_realloc_raw(void* p, size_t n);
 void     ray_free_raw(void* p);
 
-/* ===== Memory Budget API ===== */
+/* ===== System memory ===== */
 
-int64_t  ray_mem_budget(void);      /* returns memory budget in bytes */
-bool     ray_mem_pressure(void);    /* true if calling thread's usage exceeds budget */
+int64_t  ray_sys_total_ram(void);   /* total physical RAM in bytes (informational) */
 
 /* ===== Interrupt API =====
  * Long-running queries poll ray_interrupted() at morsel granularity
@@ -364,8 +363,6 @@ typedef struct {
     uint64_t    rows_done;
     uint64_t    rows_total;   /* 0 = indeterminate */
     double      elapsed_sec;
-    int64_t     mem_used;     /* bytes: buddy + direct mmap */
-    int64_t     mem_budget;   /* bytes: auto-detected memory budget */
     bool        final;        /* true on the last tick of a query — renderers
                                  use this to clear the line */
 } ray_progress_t;

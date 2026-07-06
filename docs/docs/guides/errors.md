@@ -424,5 +424,5 @@ If a computed column expression fails inside `select`, the entire select produce
 
 - [**Control Flow**](../language/control-flow.md) — if/do/fn and other control structures
 - [**Data Types**](../data-types/index.md) — Full type reference including null representations
-- [**Memory & Monitoring**](memory.md) — Understanding memory budgets and GC
+- [**Memory & Monitoring**](memory.md) — Understanding memory usage and GC
 - [**Select Queries**](../queries/select.md) — Building queries with select/update

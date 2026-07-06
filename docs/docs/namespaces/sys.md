@@ -92,8 +92,11 @@ Signature: `(.sys.mem)`. Returns the buddy allocator's running counters:
 
 Every mapping — buddy pool or file — is counted exactly once through the VM
 wrapper layer, so `sys-current` reflects the real committed footprint (a large
-`til` shows up here, not as a flat few MB). The progress bar's memory field and
-the memory budget both use `sys-current`.
+`til` shows up here, not as a flat few MB). There is **no enforced memory
+ceiling**: the heap is out-of-core and spills to a file-backed mapping when
+anonymous `mmap` is refused. Total physical RAM is reported separately by
+[`.sys.info`](#sys-info) as `total-mem`; compare it against
+`bytes-allocated + direct-bytes` to gauge how close a workload is to spilling.
 
 ```lisp
 (.sys.mem)

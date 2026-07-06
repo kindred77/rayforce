@@ -56,8 +56,6 @@ typedef struct {
     uint64_t    rows_done;
     uint64_t    rows_total;
     double      elapsed_sec;
-    int64_t     mem_used;
-    int64_t     mem_budget;
     bool        final;
 } recorded_t;
 
@@ -97,8 +95,6 @@ static void record_cb(const ray_progress_t* snap, void* user) {
     s->rows_done   = snap->rows_done;
     s->rows_total  = snap->rows_total;
     s->elapsed_sec = snap->elapsed_sec;
-    s->mem_used    = snap->mem_used;
-    s->mem_budget  = snap->mem_budget;
     s->final       = snap->final;
 }
 
@@ -118,9 +114,8 @@ static void sleep_ms(unsigned ms) {
 
 /* ---- Setup / Teardown --------------------------------------------------- */
 
-/* progress.c calls ray_mem_stats() / ray_mem_budget() inside fire(); both
- * require the heap to be initialised. Every test does begin/end on the heap
- * so callbacks can fire safely. */
+/* Every test does begin/end on the heap so progress callbacks can fire
+ * safely (the runtime must be initialised for the pull-based API). */
 static void progress_setup(void) {
     ray_heap_init();
     /* Always reset module state from any prior test by clearing the
@@ -313,8 +308,7 @@ static test_result_t test_progress_set_callback_zero_keeps_existing(void) {
     PASS();
 }
 
-/* Snapshot field plumbing: elapsed_sec strictly increases across fires;
- * mem_used and mem_budget are populated. */
+/* Snapshot field plumbing: elapsed_sec is non-decreasing across fires. */
 static test_result_t test_progress_snapshot_fields(void) {
     recorder_t r;
     recorder_reset(&r);
@@ -336,17 +330,6 @@ static test_result_t test_progress_snapshot_fields(void) {
     }
     for (int i = 1; i < r.n; i++) {
         TEST_ASSERT_TRUE(r.snaps[i].elapsed_sec >= r.snaps[i-1].elapsed_sec);
-    }
-
-    /* mem_budget should match the live API result. */
-    int64_t budget_now = ray_mem_budget();
-    for (int i = 0; i < r.n; i++) {
-        TEST_ASSERT_EQ_I(r.snaps[i].mem_budget, budget_now);
-    }
-
-    /* mem_used non-negative — heap is initialized so stats are available. */
-    for (int i = 0; i < r.n; i++) {
-        TEST_ASSERT_TRUE(r.snaps[i].mem_used >= 0);
     }
 
     /* Last fire is final. */

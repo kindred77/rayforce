@@ -114,7 +114,7 @@ void ray_vm_init(ray_vm_t* vm, int32_t id);
 typedef struct ray_runtime_s {
     ray_vm_t       **vms;
     int32_t          n_vms;
-    int64_t          mem_budget;   /* 80% of physical RAM, bytes */
+    int64_t          total_ram;    /* total physical RAM, bytes */
     void            *poll;         /* opaque ray_poll_t* — see ray_runtime_(set|get)_poll */
     void            *sys_args;     /* opaque ray_t* dict — see ray_runtime_(set|get)_sys_args */
 } ray_runtime_t;

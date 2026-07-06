@@ -114,6 +114,7 @@
 (type (.sys.info)) -- 'DICT
 (count (.sys.info)) -- 3
 (> (at (.sys.info) 'cores) 0) -- true
+(> (at (.sys.info) 'total-mem) 0) -- true
 (count (value (.sys.info))) -- 3
 
 ;; ══════════════════════════════════════════════════════════════════════

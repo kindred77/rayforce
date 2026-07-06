@@ -243,7 +243,7 @@ static ray_runtime_t* runtime_create_impl(const char* sym_path,
     ray_heap_init();
     ray_sym_init();
 
-    /* Allocate runtime and set __VM + mem_budget BEFORE any file I/O so
+    /* Allocate runtime and set __VM + total_ram BEFORE any file I/O so
      * that ray_error() has a live VM to record diagnostics against and
      * allocations are bounded by the budget. */
     ray_runtime_t* rt = (ray_runtime_t*)ray_sys_alloc(sizeof(ray_runtime_t));
@@ -259,35 +259,38 @@ static ray_runtime_t* runtime_create_impl(const char* sym_path,
     ray_vm_init(rt->vms[0], 0);
     __VM = rt->vms[0];
 
-    /* Detect memory budget: 80% of physical RAM */
+    /* Detect total physical RAM (informational — surfaced via .sys.mem and
+     * used as a sanity bound for the sym-file pre-load check below). There is
+     * NO enforced memory ceiling: the heap is out-of-core and spills to a
+     * file-backed mapping when anonymous mmap is refused (see heap_add_pool). */
 #ifdef RAY_OS_WINDOWS
     MEMORYSTATUSEX ms;
     ms.dwLength = sizeof(ms);
     if (GlobalMemoryStatusEx(&ms))
-        rt->mem_budget = (int64_t)(ms.ullTotalPhys * 0.8);
+        rt->total_ram = (int64_t)ms.ullTotalPhys;
     else
-        rt->mem_budget = (int64_t)(4ULL << 30);
+        rt->total_ram = (int64_t)(4ULL << 30);
 #else
     long pages = sysconf(_SC_PHYS_PAGES);
     long psize = sysconf(_SC_PAGESIZE);
     if (pages > 0 && psize > 0)
-        rt->mem_budget = (int64_t)((double)pages * (double)psize * 0.8);
+        rt->total_ram = (int64_t)((double)pages * (double)psize);
     else
-        rt->mem_budget = (int64_t)(4ULL << 30);
+        rt->total_ram = (int64_t)(4ULL << 30);
 #endif
 
-    /* __RUNTIME must be visible before ray_sym_load so mem_budget checks
-     * and ray_error() both operate against the live runtime. */
+    /* __RUNTIME must be visible before ray_sym_load so the sym-load size
+     * check and ray_error() both operate against the live runtime. */
     __RUNTIME = rt;
 
     /* Load persisted symbol table BEFORE ray_lang_init interns builtins.
-     * Ordering: __VM + mem_budget are live so file I/O errors surface via
-     * ray_error() and allocations are budget-bounded.  Still before
+     * Ordering: __VM + total_ram are live so file I/O errors surface via
+     * ray_error() and the sym-file size guard has a bound.  Still before
      * ray_lang_init so persisted user symbol IDs keep their slots and
      * builtins append afterwards. */
     if (sym_path) {
-        /* Pre-flight size check: reject files that would blow past the
-         * memory budget before ever touching ray_col_load.
+        /* Pre-flight size check: reject an implausibly large sym file (more
+         * than half of physical RAM) before ever touching ray_col_load.
          *
          * errno handling: ENOENT is the normal first-run case and stays
          * RAY_OK; any *other* stat failure (EACCES, ENOTDIR, EIO, …) is
@@ -302,7 +305,7 @@ static ray_runtime_t* runtime_create_impl(const char* sym_path,
              * in-memory footprint is bounded by file size within a small
              * constant factor. */
             if (st.st_size > 0 &&
-                (int64_t)st.st_size > rt->mem_budget / 2) {
+                (int64_t)st.st_size > rt->total_ram / 2) {
                 if (out_sym_err) *out_sym_err = RAY_ERR_OOM;
                 /* Continue startup with empty sym table; caller decides
                  * whether to treat this as fatal. */
@@ -366,15 +369,8 @@ void* ray_runtime_get_sys_args(void) {
 
 /* ===== Memory Budget API ===== */
 
-int64_t ray_mem_budget(void) {
-    return __RUNTIME ? __RUNTIME->mem_budget : 0;
-}
-
-bool ray_mem_pressure(void) {
-    if (!__RUNTIME) return false;
-    ray_mem_stats_t st;
-    ray_mem_stats(&st);
-    return (int64_t)(st.bytes_allocated + st.direct_bytes) > __RUNTIME->mem_budget;
+int64_t ray_sys_total_ram(void) {
+    return __RUNTIME ? __RUNTIME->total_ram : 0;
 }
 
 int8_t ray_obj_type(ray_t* v) {
