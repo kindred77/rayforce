@@ -219,7 +219,7 @@ static void repl_query_progress_cb(const ray_progress_t* p, void* user) {
 /* Recursively print the span tree.  `total_ns` is the whole-query wall time
  * (for the %-of-total figure); `*level_ns` is set on return to the summed
  * wall time of the spans printed at THIS level, so a parent can subtract it
- * to get its own EXCLUSIVE (self) time — the DuckDB EXPLAIN-ANALYZE view of
+ * to get its own EXCLUSIVE (self) time — the per-operator self-time view of
  * where time actually went, since cumulative time hides it inside the root. */
 static int32_t profile_print_tree(int32_t idx, int32_t indent,
                                   int64_t total_ns, int64_t* level_ns) {

@@ -6,7 +6,7 @@
  *
  *   Ambient, server-side per-query statistics: one summary row per completed
  *   query, held in a fixed-capacity ring and exposed as an ordinary table via
- *   `(.sys.querylog)`.  The model mirrors ClickHouse's system.query_log — the
+ *   `(.sys.querylog)`.  The model is a server-side query_log system table — the
  *   stats are read back with normal queries, no extra protocol — but in its
  *   simplest, durable-free form.  A later phase may flush the ring to a
  *   date-partitioned table; that is out of scope here.
