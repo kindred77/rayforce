@@ -541,6 +541,14 @@ ray_hnsw_t* ray_hnsw_build(const float* vectors, int64_t n_nodes, int32_t dim,
 
     /* Insert nodes one by one */
     for (int64_t i = 1; i < n_nodes; i++) {
+        /* Cancellation checkpoint (boundary-only: one per node, not per beam
+         * step).  Reuse the in-loop OOM unwind — free-and-return-NULL; the
+         * caller surfaces ray_error("cancel", ...). */
+        if (ray_interrupted()) {
+            ray_sys_free(search_buf);
+            ray_hnsw_free(idx);
+            return NULL;
+        }
         const float* vec = vectors + i * dim;
         int32_t node_level = idx->node_level[i];
 

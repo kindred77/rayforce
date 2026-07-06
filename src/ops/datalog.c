@@ -2778,6 +2778,10 @@ int dl_eval(dl_program_t* prog) {
 
     /* Process each stratum */
     for (int s = 0; s < prog->n_strata; s++) {
+        /* Cancellation checkpoint (per stratum — no per-stratum temporaries
+         * live yet, so a bare return leaks nothing). */
+        if (RAY_UNLIKELY(ray_interrupted())) { prog->eval_err = true; return -1; }
+
         /* Collect rules in this stratum */
         dl_rule_t* stratum_rules[DL_MAX_RULES];
         int stratum_rule_idx[DL_MAX_RULES];  /* original index in prog->rules */
@@ -2872,6 +2876,21 @@ int dl_eval(dl_program_t* prog) {
         int max_iter = 1000;
         bool converged = false;
         for (int iter = 0; iter < max_iter; iter++) {
+            /* Cancellation checkpoint (per fixpoint iteration).  prev_tables /
+             * delta_tables are live here, so mirror the stratum cleanup below
+             * before returning to avoid a leak. */
+            if (RAY_UNLIKELY(ray_interrupted())) {
+                for (int p = 0; p < prog->strata_sizes[s]; p++) {
+                    int rel_idx = prog->strata[s][p];
+                    if (prev_tables[rel_idx] && !RAY_IS_ERR(prev_tables[rel_idx]))
+                        ray_release(prev_tables[rel_idx]);
+                    if (delta_tables[rel_idx] && !RAY_IS_ERR(delta_tables[rel_idx]))
+                        ray_release(delta_tables[rel_idx]);
+                }
+                prog->eval_err = true;
+                return -1;
+            }
+
             /* Check convergence: all deltas empty */
             bool any_new = false;
             for (int p = 0; p < prog->strata_sizes[s]; p++) {
@@ -4342,6 +4361,8 @@ ray_t* ray_query_fn(ray_t** args, int64_t n) {
         }
         dl_program_free(prog);
         ray_release(db);
+        if (ray_interrupted())
+            return ray_error("cancel", "interrupted");
         if (prev[0]) {
             return ray_error("domain", "query: evaluation failed: %s", prev);
         }
@@ -4449,7 +4470,9 @@ ray_t* ray_dl_eval_fn(ray_t* x) {
     dl_program_t* prog = dl_unwrap_program(x);
     if (!prog) return ray_error("type", "dl-eval: arg must be a dl-program");
     int rc = dl_eval(prog);
-    return (rc == 0) ? ray_bool(true) : ray_error("domain", "dl-eval: evaluation failed");
+    if (rc == 0) return ray_bool(true);
+    if (ray_interrupted()) return ray_error("cancel", "interrupted");
+    return ray_error("domain", "dl-eval: evaluation failed");
 }
 
 /* (dl-query prog "pred") — get result table */

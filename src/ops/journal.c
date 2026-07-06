@@ -167,6 +167,10 @@ ray_t* ray_log_replay_fn(ray_t* path) {
     case RAY_JREPLAY_IO:
         return ray_error("io",
                          "%s: I/O failure after %lld entries", p, (long long)chunks);
+    case RAY_JREPLAY_CANCEL:
+        return ray_error("cancel",
+                         "%s: replay interrupted after %lld entries (log intact)",
+                         p, (long long)chunks);
     }
     return ray_error("internal", "unknown replay status");
 }
