@@ -1515,6 +1515,101 @@ static ray_t* bind_all_columns(ray_t* tbl) {
     return prev;
 }
 
+static bool query_atom_truthy(ray_t* v, bool* out) {
+    if (!v || !ray_is_atom(v) || RAY_ATOM_IS_NULL(v)) return false;
+    switch (v->type) {
+    case -RAY_BOOL:
+        *out = v->b8 != 0;
+        return true;
+    case -RAY_U8:
+        *out = v->u8 != 0;
+        return true;
+    case -RAY_I16:
+        *out = v->i16 != 0;
+        return true;
+    case -RAY_I32:
+    case -RAY_DATE:
+    case -RAY_TIME:
+        *out = v->i32 != 0;
+        return true;
+    case -RAY_I64:
+    case -RAY_SYM:
+    case -RAY_TIMESTAMP:
+        *out = v->i64 != 0;
+        return true;
+    case -RAY_F32:
+    case -RAY_F64:
+        *out = v->f64 != 0.0;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static ray_t* eval_where_mask(ray_t* where_expr, ray_t* tbl, const char* label) {
+    if (ray_env_push_scope() != RAY_OK) return ray_error("oom", NULL);
+    ray_t* _aqt = bind_all_columns(tbl);
+    ray_t* mask = ray_eval(where_expr);
+    if (mask && !RAY_IS_ERR(mask))
+        mask = ray_lazy_materialize(mask);
+    g_active_query_table = _aqt;
+    ray_env_pop_scope();
+
+    if (!mask)
+        return ray_error("domain", "%s: WHERE predicate evaluation failed", label);
+    if (RAY_IS_ERR(mask))
+        return mask;
+
+    int64_t nrows = ray_table_nrows(tbl);
+    if (mask->type == RAY_BOOL) {
+        if (mask->len != nrows) {
+            int64_t got = mask->len;
+            ray_release(mask);
+            return ray_error("length",
+                "%s: WHERE mask length %lld does not match row count %lld",
+                label, (long long)got, (long long)nrows);
+        }
+        return mask;
+    }
+
+    bool keep = false;
+    if (query_atom_truthy(mask, &keep)) {
+        ray_release(mask);
+        ray_t* out = ray_vec_new(RAY_BOOL, nrows);
+        if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+        out->len = nrows;
+        memset(ray_data(out), keep ? 1 : 0, (size_t)nrows);
+        return out;
+    }
+
+    int8_t got_type = mask->type;
+    ray_release(mask);
+    return ray_error("type",
+        "%s: WHERE must produce a bool mask or truthy scalar, got %s",
+        label, ray_type_name(got_type));
+}
+
+static ray_op_t* compile_where_predicate(ray_graph_t* g, ray_t* tbl,
+                                         ray_t* where_expr,
+                                         const char* label,
+                                         ray_t** out_err) {
+    if (out_err) *out_err = NULL;
+    ray_op_t* pred = compile_expr_dag(g, where_expr);
+    if (pred) return pred;
+
+    ray_t* mask = eval_where_mask(where_expr, tbl, label);
+    if (!mask || RAY_IS_ERR(mask)) {
+        if (out_err) *out_err = mask ? mask :
+            ray_error("domain", "%s: WHERE predicate evaluation failed", label);
+        return NULL;
+    }
+
+    pred = ray_const_vec(g, mask);
+    ray_release(mask);
+    if (!pred && out_err) *out_err = ray_error("oom", NULL);
+    return pred;
+}
+
 static int is_agg_expr(ray_t* expr);  /* defined below */
 
 /* Return 1 if expr references a table column in a position where the
@@ -1959,11 +2054,14 @@ static ray_t* filter_group_result(ray_t* result, ray_t* where_expr) {
         return ray_error("oom", NULL);
     }
     ray_op_t* root = ray_const_table(fg, result);
-    ray_op_t* pred = compile_expr_dag(fg, where_expr);
+    ray_t* pred_err = NULL;
+    ray_op_t* pred = compile_where_predicate(fg, result, where_expr,
+                                             "select having", &pred_err);
     if (!pred) {
         ray_graph_free(fg);
         ray_release(result);
-        return ray_error("domain", "select having: failed to compile group filter predicate");
+        return pred_err ? pred_err :
+            ray_error("domain", "select having: failed to evaluate group filter predicate");
     }
     root = ray_filter(fg, root, pred);
     root = ray_optimize(fg, root);
@@ -4596,9 +4694,25 @@ ray_t* ray_try_count_select_expr(ray_t* expr, int* handled) {
     }
     ray_op_t* pred = compile_expr_dag(g, where_expr);
     if (!pred) {
+        ray_t* pred_vec = eval_where_mask(where_expr, tbl, "select count");
+        if (!pred_vec || RAY_IS_ERR(pred_vec)) {
+            ray_graph_free(g);
+            ray_release(tbl);
+            return pred_vec ? pred_vec :
+                ray_error("type", "select count: WHERE predicate evaluation failed");
+        }
+        if (handled) *handled = 1;
+        int64_t nrows = ray_table_nrows(tbl);
+        ray_t* sel = ray_rowsel_from_pred(pred_vec);
+        if (sel) {
+            ray_rowsel_t* sm = ray_rowsel_meta(sel);
+            nrows = sm ? sm->total_pass : 0;
+            ray_release(sel);
+        }
+        ray_release(pred_vec);
         ray_graph_free(g);
         ray_release(tbl);
-        return ray_error("domain", "WHERE predicate not supported by DAG compiler");
+        return ray_i64(nrows);
     }
     int has_scan = 0;
     ray_op_t* stk[64];
@@ -5497,12 +5611,17 @@ ray_t* ray_select(ray_t** args, int64_t n) {
                 DICT_VIEW_CLOSE(dv); DICT_VIEW_CLOSE(byv); return ray_error("oom", NULL);
             }
             ray_op_t* froot = ray_const_table(fg, prefilter_input);
-            ray_op_t* pred = compile_expr_dag(fg, where_expr);
+            ray_t* pred_err = NULL;
+            ray_op_t* pred = compile_where_predicate(fg, prefilter_input,
+                                                     where_expr, "select",
+                                                     &pred_err);
             if (!pred) {
                 ray_graph_free(fg);
                 if (narrow_tbl) ray_release(narrow_tbl);
                 ray_release(tbl);
-                DICT_VIEW_CLOSE(dv); DICT_VIEW_CLOSE(byv); return ray_error("domain", "select: failed to compile `where:` predicate");
+                DICT_VIEW_CLOSE(dv); DICT_VIEW_CLOSE(byv);
+                return pred_err ? pred_err :
+                    ray_error("domain", "select: failed to evaluate `where:` predicate");
             }
             froot = ray_filter(fg, froot, pred);
             /* Deliberately skip ray_optimize: its predicate pushdown
@@ -5912,15 +6031,14 @@ by_dict_done:
             }
         }
         if (!and_chained) {
-            ray_op_t* pred = compile_expr_dag(g, where_expr);
+            ray_t* pred_err = NULL;
+            ray_op_t* pred = compile_where_predicate(g, tbl, where_expr,
+                                                     "select", &pred_err);
             if (!pred) {
                 ray_graph_free(g); ray_release(tbl);
-                scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain",
-                    "WHERE predicate not supported by DAG compiler — "
-                    "most common causes: arity mismatch "
-                    "(e.g. `(in v)` instead of `(in col v)`), "
-                    "unknown function name, unsupported special form, "
-                    "or a sub-expression the compiler can't lower");
+                scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv);
+                return pred_err ? pred_err :
+                    ray_error("domain", "select: failed to evaluate `where:` predicate");
             }
             root = ray_filter(g, root, pred);
         }
@@ -7807,10 +7925,14 @@ by_dict_done:
             if (!g) { ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL); }
             root = ray_const_table(g, tbl);
             if (where_expr) {
-                ray_op_t* pred = compile_expr_dag(g, where_expr);
+                ray_t* pred_err = NULL;
+                ray_op_t* pred = compile_where_predicate(g, tbl, where_expr,
+                                                         "select", &pred_err);
                 if (!pred) {
                     ray_graph_free(g); ray_release(tbl);
-                    scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain", "select: failed to compile `where:` predicate");
+                    scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv);
+                    return pred_err ? pred_err :
+                        ray_error("domain", "select: failed to evaluate `where:` predicate");
                 }
                 root = ray_filter(g, root, pred);
             }
