@@ -292,6 +292,13 @@ static inline bool agg_type_admitted(uint16_t op, int8_t t) {
 /* Opcodes 110-114 are retired (formerly OP_GROUP_*_ROWFORM). */
 #define OP_DELTAS         115   /* adjacent differences, first row null         */
 #define OP_RATIOS         116   /* adjacent ratios as F64, first row null       */
+#define OP_FILLS          117   /* forward-fill nullable values                 */
+#define OP_SUMS           118   /* running sum                                  */
+#define OP_AVGS           119   /* running average                              */
+#define OP_MINS           120   /* running minimum                              */
+#define OP_MAXS           121   /* running maximum                              */
+#define OP_PRDS           122   /* running product                              */
+#define OP_DIFFER         123   /* change flag vs previous row                  */
 
 /* Opcodes — Misc */
 #define OP_ALIAS        70
@@ -664,6 +671,13 @@ ray_op_t* ray_lag_op(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_lead_op(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_deltas_op(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_ratios_op(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_fills_op(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_sums_op(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_avgs_op(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_mins_op(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_maxs_op(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_prds_op(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_differ_op(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_stddev(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_stddev_pop(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_var(ray_graph_t* g, ray_op_t* a);

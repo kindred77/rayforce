@@ -11,7 +11,7 @@
 | | | |
 |---|---|---|
 | [Arithmetic](#arithmetic) (16) | [Comparison](#comparison) (7) | [Logic](#logic) (3) |
-| [Aggregation](#aggregation) (14) | [Higher-Order](#higher-order) (13) | [Collection](#collection) (19) |
+| [Aggregation](#aggregation) (14) | [Higher-Order](#higher-order) (13) | [Collection](#collection) (30) |
 | [Sorting & Ordering](#sorting) (10) | [Control Flow & Special Forms](#control) (11) | [Table Operations](#table-ops) (14) |
 | [Query](#query) (4) | [Joins](#joins) (6) | [Pivot](#pivot) (1) |
 | [String](#string-ops) (4) | [Temporal](#temporal) (3) | [Type & Introspection](#type-ops) (5) |
@@ -36,13 +36,14 @@ The examples below use these small in-memory fixtures where a table is needed:
 
 ## Registered Builtin Surface
 
-Generated from `src/lang/eval.c` in this checkout: 259 registered builtins (98 unary, 58 binary, 103 variadic/special). The categorized reference below expands the most commonly used functions; this list is the complete registered name surface.
+Generated from `src/lang/eval.c` in this checkout. The categorized reference below expands the most commonly used functions; this list is the complete registered name surface.
 
-### Unary (98)
+### Unary
 
 `not`, `neg`, `round`, `floor`, `ceil`, `abs`, `sqrt`, `log`, `exp`, `sum`, `count`, `avg`, `min`, `max`,
 `first`, `last`, `med`, `dev`, `stddev`, `stddev_pop`, `dev_pop`, `var`, `var_pop`, `raise`, `distinct`,
-`reverse`, `til`, `asc`, `desc`, `iasc`, `idesc`, `rank`, `key`, `value`, `type`, `read`, `load`, `exit`,
+`reverse`, `til`, `lag`, `lead`, `deltas`, `ratios`, `fills`, `sums`, `avgs`, `mins`, `maxs`, `prds`,
+`differ`, `asc`, `desc`, `iasc`, `idesc`, `rank`, `key`, `value`, `type`, `read`, `load`, `exit`,
 `nil?`, `where`, `group`, `raze`, `ungroup`, `ser`, `de`, `guid`, `date`, `time`, `timestamp`, `ss`, `hh`,
 `minute`, `yyyy`, `mm`, `dd`, `dow`, `doy`, `eval`, `parse`, `meta`, `.sys.exec`, `.sys.cmd`, `.sys.listen`,
 `.os.getenv`, `.fs.size`, `.fs.list`, `.ipc.close`, `.repl.connect`, `.log.write`, `.log.replay`,
@@ -51,7 +52,7 @@ Generated from `src/lang/eval.c` in this checkout: 259 registered builtins (98 u
 `.idx.drop`, `.idx.has?`, `.idx.info`, `.attr.get`, `.attr.drop`, `.col.unlink`, `.col.link?`, `.col.target`,
 `.graph.free`, `.graph.info`, `strlen`
 
-### Binary (58)
+### Binary
 
 `+`, `-`, `*`, `/`, `%`, `>`, `<`, `>=`, `<=`, `==`, `!=`, `pow`, `top`, `bot`, `pearson_corr`, `set`, `let`,
 `try`, `filter`, `in`, `except`, `union`, `sect`, `take`, `at`, `find`, `xasc`, `xdesc`, `table`, `union-all`,
@@ -59,7 +60,7 @@ Generated from `src/lang/eval.c` in this checkout: 259 registered builtins (98 u
 `.ipc.send`, `.ipc.post`, `get`, `remove`, `row`, `unify`, `xrank`, `dl-query`, `dl-provenance`, `cos-dist`,
 `inner-prod`, `l2-dist`, `hnsw-save`, `.attr.set`, `.col.link`
 
-### Variadic / Special (103)
+### Variadic / Special
 
 `and`, `or`, `if`, `do`, `fn`, `map`, `pmap`, `fold`, `scan`, `prior`, `apply`, `list`, `select`, `window`,
 `update`, `insert`, `upsert`, `left-join`, `inner-join`, `anti-join`, `window-join`, `window-join1`,
@@ -228,6 +229,17 @@ Operations on vectors and lists as collections — set operations, indexing, sea
 | `find` | binary | — | Find index of first occurrence | `(find [10 20 30] 20)` → `1` |
 | `reverse` | unary | — | Reverse element order | `(reverse [1 2 3])` → `[3 2 1]` |
 | `til` | unary | — | Generate range [0..n) | `(til 5)` → `[0 1 2 3 4]` |
+| `lag` | unary | lazy/DAG | Shift values one row back; first row is null/sentinel | `(lag [10 20 30])` → `[0Nl 10 20]` |
+| `lead` | unary | lazy/DAG | Shift values one row forward; last row is null/sentinel | `(lead [10 20 30])` → `[20 30 0Nl]` |
+| `deltas` | unary | lazy/DAG | Adjacent differences; first row is null | `(deltas [10 15 13])` → `[0Nl 5 -2]` |
+| `ratios` | unary | lazy/DAG | Adjacent ratios as f64; first row is null | `(ratios [2 4 8])` → `[0Nf 2.0 2.0]` |
+| `fills` | unary | lazy/DAG | Forward-fill nullable vectors | `(fills (as 'I64 (list 0N 2 0N)))` → `[0Nl 2 2]` |
+| `sums` | unary | lazy/DAG | Running sum; nulls are skipped | `(sums [1 2 3])` → `[1 3 6]` |
+| `avgs` | unary | lazy/DAG | Running average over non-null values | `(avgs [2 4 6])` → `[2.0 3.0 4.0]` |
+| `mins` | unary | lazy/DAG | Running minimum | `(mins [3 1 2])` → `[3 1 1]` |
+| `maxs` | unary | lazy/DAG | Running maximum | `(maxs [3 1 2])` → `[3 3 3]` |
+| `prds` | unary | lazy/DAG | Running product; nulls are skipped | `(prds [2 3 4])` → `[2 6 24]` |
+| `differ` | unary | lazy/DAG | Boolean change flag versus previous row; first row is true | `(differ [1 1 2])` → `[true false true]` |
 | `enlist` | variadic | — | Wrap value(s) in a vector (list of atoms) | `(enlist 1 2 3)` → `[1 2 3]` |
 | `concat` | binary | — | Concatenate two vectors or strings | `(concat [1 2] [3 4])` → `[1 2 3 4]` |
 | `raze` | unary | — | Flatten a list of vectors into one vector | `(raze (list [1 2] [3 4]))` → `[1 2 3 4]` |
@@ -249,7 +261,15 @@ Operations on vectors and lists as collections — set operations, indexing, sea
 (union [1 2 3] [3 4 5])   ; [1 2 3 4 5]
 (sect [1 2 3] [2 3 4])    ; [2 3]
 (except [1 2 3] [2])      ; [1 3]
+
+; Time-series vector helpers
+(deltas [10 15 13])       ; [0Nl 5 -2]
+(fills (as 'I64 (list 0N 2 0N))) ; [0Nl 2 2]
+(sums [1 2 3 4])          ; [1 3 6 10]
+(differ [1 1 2 2])        ; [true false true false]
 ```
+
+Time-series vector helpers are lazy-aware DAG operations for vector inputs. They materialize through morsel-based kernels, can run in parallel, and poll the query cancellation flag at morsel boundaries.
 
 ## Sorting & Ordering { #sorting }
 

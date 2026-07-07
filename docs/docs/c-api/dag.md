@@ -149,6 +149,24 @@ Reduction operations that collapse a column to a single value (or per-group valu
 | `ray_var(g, a)` | `OP_VAR` | Sample variance |
 | `ray_var_pop(g, a)` | `OP_VAR_POP` | Population variance |
 
+## Time-Series Vector Operations
+
+Unary vector operations that preserve row count. These are lazy DAG nodes in Rayfall and materialize through morsel-based kernels.
+
+| Function | Opcode | Description |
+|---|---|---|
+| `ray_lag_op(g, a)` | `OP_LAG` | Previous row value; first row is null/sentinel |
+| `ray_lead_op(g, a)` | `OP_LEAD` | Next row value; last row is null/sentinel |
+| `ray_deltas_op(g, a)` | `OP_DELTAS` | Adjacent differences; first row is null |
+| `ray_ratios_op(g, a)` | `OP_RATIOS` | Adjacent ratios as `F64`; first row is null |
+| `ray_fills_op(g, a)` | `OP_FILLS` | Forward-fill nullable vectors |
+| `ray_sums_op(g, a)` | `OP_SUMS` | Running sum |
+| `ray_avgs_op(g, a)` | `OP_AVGS` | Running average over non-null values |
+| `ray_mins_op(g, a)` | `OP_MINS` | Running minimum |
+| `ray_maxs_op(g, a)` | `OP_MAXS` | Running maximum |
+| `ray_prds_op(g, a)` | `OP_PRDS` | Running product |
+| `ray_differ_op(g, a)` | `OP_DIFFER` | Boolean change flag versus previous row |
+
 ## Structural Operations
 
 Pipeline breakers that reshape data: filtering, sorting, grouping, joining, and projecting.

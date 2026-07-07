@@ -406,6 +406,18 @@ Running fold (prefix scan). Returns a vector of intermediate accumulation result
 (scan * [1 2 3 4])  ; [1 2 6 24]
 ```
 
+For common time-series scans, prefer the built-in DAG forms. They avoid per-row function calls, run through morsel-based kernels, and can be used directly inside `select` projections:
+
+```lisp
+(sums [1 2 3 4])            ; [1 3 6 10]
+(prds [1 2 3 4])            ; [1 2 6 24]
+(avgs [2 4 6])              ; [2.0 3.0 4.0]
+(mins [3 1 2])              ; [3 1 1]
+(maxs [3 1 2])              ; [3 3 3]
+(fills (as 'I64 (list 0N 2 0N))) ; [0Nl 2 2]
+(differ [1 1 2 2])          ; [true false true false]
+```
+
 ### `(apply f ...args)`
 
 Apply function `f` to the given arguments.

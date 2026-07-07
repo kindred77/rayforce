@@ -138,6 +138,13 @@ const char* ray_opcode_name(uint16_t op) {
         case OP_LEAD:          return "LEAD";
         case OP_DELTAS:        return "DELTAS";
         case OP_RATIOS:        return "RATIOS";
+        case OP_FILLS:         return "FILLS";
+        case OP_SUMS:          return "SUMS";
+        case OP_AVGS:          return "AVGS";
+        case OP_MINS:          return "MINS";
+        case OP_MAXS:          return "MAXS";
+        case OP_PRDS:          return "PRDS";
+        case OP_DIFFER:        return "DIFFER";
         default:               return "UNKNOWN";
     }
 }

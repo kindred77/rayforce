@@ -1512,7 +1512,7 @@ static int group_input_scan_syms(ray_graph_t* g, ray_op_ext_t* gx,
  * space-separated pass labels (predicate pushdown, …).  Cached per opcode so
  * the returned pointer stays valid for the life of a span. */
 static const char* prof_op_label(uint16_t opc) {
-#define PROF_OP_LABEL_MAX OP_RATIOS
+#define PROF_OP_LABEL_MAX OP_DIFFER
     if (opc > PROF_OP_LABEL_MAX) return ray_opcode_name(opc);
     static char lc[PROF_OP_LABEL_MAX + 1][28];
     if (!lc[opc][0]) {
@@ -1538,7 +1538,9 @@ static inline bool op_is_heavy(uint16_t opc) {
            opc == OP_HEAD   || opc == OP_TAIL || opc == OP_WINDOW ||
            opc == OP_PIVOT  ||
            opc == OP_LAG    || opc == OP_LEAD || opc == OP_DELTAS ||
-           opc == OP_RATIOS ||
+           opc == OP_RATIOS || opc == OP_FILLS || opc == OP_SUMS ||
+           opc == OP_AVGS   || opc == OP_MINS  || opc == OP_MAXS ||
+           opc == OP_PRDS   || opc == OP_DIFFER ||
            (opc >= OP_EXPAND && opc <= OP_KNN_RERANK);
 }
 
@@ -1992,7 +1994,9 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
             return result;
         }
 
-        case OP_LAG: case OP_LEAD: case OP_DELTAS: case OP_RATIOS: {
+        case OP_LAG: case OP_LEAD: case OP_DELTAS: case OP_RATIOS:
+        case OP_FILLS: case OP_SUMS: case OP_AVGS: case OP_MINS:
+        case OP_MAXS: case OP_PRDS: case OP_DIFFER: {
             ray_t* input = exec_node(g, op_child(g, op, 0));
             if (!input || RAY_IS_ERR(input)) return input;
             if (!ray_is_vec(input)) {
@@ -2004,7 +2008,14 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 case OP_LAG:    result = lag_vec_eager(input); break;
                 case OP_LEAD:   result = lead_vec_eager(input); break;
                 case OP_DELTAS: result = deltas_vec_eager(input); break;
-                default:        result = ratios_vec_eager(input); break;
+                case OP_RATIOS: result = ratios_vec_eager(input); break;
+                case OP_FILLS:  result = fills_vec_eager(input); break;
+                case OP_SUMS:   result = running_vec_eager(input, OP_SUMS); break;
+                case OP_AVGS:   result = running_vec_eager(input, OP_AVGS); break;
+                case OP_MINS:   result = running_vec_eager(input, OP_MINS); break;
+                case OP_MAXS:   result = running_vec_eager(input, OP_MAXS); break;
+                case OP_PRDS:   result = running_vec_eager(input, OP_PRDS); break;
+                default:        result = differ_vec_eager(input); break;
             }
             ray_release(input);
             return result;

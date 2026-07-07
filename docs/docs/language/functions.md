@@ -123,6 +123,17 @@ Operations on vectors as collections.
 | `find` | binary | Find index of value | `(find [10 20 30] 20)` → `1` |
 | `reverse` | unary | Reverse order | `(reverse [1 2 3])` → `[3 2 1]` |
 | `til` | unary | Range [0..n) | `(til 5)` → `[0 1 2 3 4]` |
+| `lag` | unary | Shift values one row back; first row is null/sentinel | `(lag [10 20 30])` → `[0Nl 10 20]` |
+| `lead` | unary | Shift values one row forward; last row is null/sentinel | `(lead [10 20 30])` → `[20 30 0Nl]` |
+| `deltas` | unary | Adjacent differences; first row is null | `(deltas [10 15 13])` → `[0Nl 5 -2]` |
+| `ratios` | unary | Adjacent ratios as f64; first row is null | `(ratios [2 4 8])` → `[0Nf 2.0 2.0]` |
+| `fills` | unary | Forward-fill nullable vectors | `(fills (as 'I64 (list 0N 2 0N)))` → `[0Nl 2 2]` |
+| `sums` | unary | Running sum; nulls are skipped | `(sums [1 2 3])` → `[1 3 6]` |
+| `avgs` | unary | Running average over non-null values | `(avgs [2 4 6])` → `[2.0 3.0 4.0]` |
+| `mins` | unary | Running minimum | `(mins [3 1 2])` → `[3 1 1]` |
+| `maxs` | unary | Running maximum | `(maxs [3 1 2])` → `[3 3 3]` |
+| `prds` | unary | Running product; nulls are skipped | `(prds [2 3 4])` → `[2 6 24]` |
+| `differ` | unary | Boolean change flag versus previous row; first row is true | `(differ [1 1 2])` → `[true false true]` |
 | `enlist` | variadic | Wrap value(s) in a vector | `(enlist 1 2 3)` → `[1 2 3]` |
 | `concat` | binary | Concatenate two vectors | `(concat [1 2] [3 4])` → `[1 2 3 4]` |
 | `raze` | unary | Flatten a list of vectors into one | `(raze (list [1 2] [3 4]))` → `[1 2 3 4]` |
@@ -133,6 +144,8 @@ Operations on vectors as collections.
 | `bin` | binary | Binary search (left boundary) | `(bin [10 20 30] 25)` → `1` |
 | `binr` | binary | Binary search (right boundary) | `(binr [10 20 30] 25)` → `2` |
 | `unify` | binary | Merge two tables/dicts, second takes precedence | `(unify d1 d2)` |
+
+The time-series vector functions above are lazy-aware DAG operations for vector inputs. They materialize through morsel-based kernels, can run in parallel, and poll the query cancellation flag at morsel boundaries.
 
 ## Sorting & Ordering
 

@@ -613,6 +613,25 @@ ray_op_t* ray_deltas_op(ray_graph_t* g, ray_op_t* a) {
     return make_unary(g, OP_DELTAS, a, (t == RAY_F64 || t == RAY_F32) ? RAY_F64 : RAY_I64);
 }
 ray_op_t* ray_ratios_op(ray_graph_t* g, ray_op_t* a)    { return make_unary(g, OP_RATIOS, a, RAY_F64); }
+ray_op_t* ray_fills_op(ray_graph_t* g, ray_op_t* a)     { return make_unary(g, OP_FILLS, a, a->out_type); }
+ray_op_t* ray_sums_op(ray_graph_t* g, ray_op_t* a) {
+    int8_t t = a->out_type;
+    return make_unary(g, OP_SUMS, a, (t == RAY_F64 || t == RAY_F32) ? RAY_F64 : RAY_I64);
+}
+ray_op_t* ray_avgs_op(ray_graph_t* g, ray_op_t* a)      { return make_unary(g, OP_AVGS, a, RAY_F64); }
+ray_op_t* ray_mins_op(ray_graph_t* g, ray_op_t* a) {
+    int8_t t = a->out_type;
+    return make_unary(g, OP_MINS, a, (t == RAY_F64 || t == RAY_F32) ? RAY_F64 : t);
+}
+ray_op_t* ray_maxs_op(ray_graph_t* g, ray_op_t* a) {
+    int8_t t = a->out_type;
+    return make_unary(g, OP_MAXS, a, (t == RAY_F64 || t == RAY_F32) ? RAY_F64 : t);
+}
+ray_op_t* ray_prds_op(ray_graph_t* g, ray_op_t* a) {
+    int8_t t = a->out_type;
+    return make_unary(g, OP_PRDS, a, (t == RAY_F64 || t == RAY_F32) ? RAY_F64 : RAY_I64);
+}
+ray_op_t* ray_differ_op(ray_graph_t* g, ray_op_t* a)    { return make_unary(g, OP_DIFFER, a, RAY_BOOL); }
 ray_op_t* ray_stddev(ray_graph_t* g, ray_op_t* a)     { return make_unary(g, OP_STDDEV, a, RAY_F64); }
 ray_op_t* ray_stddev_pop(ray_graph_t* g, ray_op_t* a)  { return make_unary(g, OP_STDDEV_POP, a, RAY_F64); }
 ray_op_t* ray_var(ray_graph_t* g, ray_op_t* a)         { return make_unary(g, OP_VAR, a, RAY_F64); }
@@ -1724,6 +1743,20 @@ ray_t* ray_lazy_append(ray_t* lazy, uint16_t opcode) {
             break;
         case OP_RATIOS:
             out_type = RAY_F64; break;
+        case OP_FILLS:
+            out_type = prev->out_type; break;
+        case OP_SUMS:
+        case OP_PRDS:
+            out_type = (prev->out_type == RAY_F64 || prev->out_type == RAY_F32) ? RAY_F64 : RAY_I64;
+            break;
+        case OP_AVGS:
+            out_type = RAY_F64; break;
+        case OP_MINS:
+        case OP_MAXS:
+            out_type = (prev->out_type == RAY_F64 || prev->out_type == RAY_F32) ? RAY_F64 : prev->out_type;
+            break;
+        case OP_DIFFER:
+            out_type = RAY_BOOL; break;
         default:
             out_type = prev->out_type; break;
     }

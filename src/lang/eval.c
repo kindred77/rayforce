@@ -3052,6 +3052,13 @@ static void ray_register_builtins(void) {
     register_unary_op("lead",   RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_lead_fn,   OP_LEAD);
     register_unary_op("deltas", RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_deltas_fn, OP_DELTAS);
     register_unary_op("ratios", RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_ratios_fn, OP_RATIOS);
+    register_unary_op("fills",  RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_fills_fn,  OP_FILLS);
+    register_unary_op("sums",   RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_sums_fn,   OP_SUMS);
+    register_unary_op("avgs",   RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_avgs_fn,   OP_AVGS);
+    register_unary_op("mins",   RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_mins_fn,   OP_MINS);
+    register_unary_op("maxs",   RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_maxs_fn,   OP_MAXS);
+    register_unary_op("prds",   RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_prds_fn,   OP_PRDS);
+    register_unary_op("differ", RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_differ_fn, OP_DIFFER);
 
     /* Sorting operations */
     register_unary("asc",      RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_asc_fn);

@@ -101,8 +101,8 @@ The pattern is: sort descending with `xdesc`, then filter with a threshold. For 
 **Problem:** Compute a cumulative sum over a vector of values.
 
 ```lisp
-; scan applies a function cumulatively
-(scan + [3 1 4 1 5 9 2 6])
+; sums is the DAG-backed running sum
+(sums [3 1 4 1 5 9 2 6])
 ```
 
 ```text
@@ -111,14 +111,14 @@ The pattern is: sort descending with `xdesc`, then filter with a threshold. For 
 
 ```lisp
 ; Running product
-(scan * [1 2 3 4 5])
+(prds [1 2 3 4 5])
 ```
 
 ```text
 [1 2 6 24 120]
 ```
 
-The `scan` function takes a binary function and a vector, returning a vector of the same length where each element is the cumulative application of the function. The related `fold` function returns only the final accumulated value.
+Use the specialized running verbs (`sums`, `prds`, `avgs`, `mins`, `maxs`) for common analytics paths; they lower to DAG vector kernels and are interruptible at morsel boundaries. The generic `scan` function is still available when the accumulator is a custom function. The related `fold` function returns only the final accumulated value.
 
 ## 4. Pivoting (Cross-Tabulation) { #pivot }
 

@@ -270,6 +270,13 @@ ray_t* ray_lag_fn(ray_t* x);
 ray_t* ray_lead_fn(ray_t* x);
 ray_t* ray_deltas_fn(ray_t* x);
 ray_t* ray_ratios_fn(ray_t* x);
+ray_t* ray_fills_fn(ray_t* x);
+ray_t* ray_sums_fn(ray_t* x);
+ray_t* ray_avgs_fn(ray_t* x);
+ray_t* ray_mins_fn(ray_t* x);
+ray_t* ray_maxs_fn(ray_t* x);
+ray_t* ray_prds_fn(ray_t* x);
+ray_t* ray_differ_fn(ray_t* x);
 
 /* Table construction */
 ray_t* ray_list_fn(ray_t** args, int64_t n);

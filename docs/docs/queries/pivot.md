@@ -127,7 +127,7 @@ Window functions compute values across a set of related rows without collapsing 
 
 ### Rolling Computations
 
-Running computations like cumulative sums and moving averages can be computed using `scan` directly on column vectors:
+Running computations like cumulative sums can be computed using the DAG-backed time-series vector helpers directly on column vectors:
 
 ```lisp
 (set trades (table [Sym Time Price]
@@ -136,9 +136,11 @@ Running computations like cumulative sums and moving averages can be computed us
           [89.17 70.5 80.54])))
 
 ; Cumulative sum on the Price column
-(scan + (at trades 'Price))
+(sums (at trades 'Price))
 ; [89.17 159.67 240.21]
 ```
+
+Use `scan` when the accumulator is a custom function. Use `sums`, `avgs`, `mins`, `maxs`, and `prds` for built-in running aggregates; they are lazy-aware and materialize with morsel-based kernels.
 
 ### Rank and Order
 

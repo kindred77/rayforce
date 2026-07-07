@@ -344,10 +344,16 @@ static dag_unary_ctor resolve_unary_dag(int64_t sym_id) {
         if (memcmp(name, "log", 3) == 0) return ray_log_op;
     } else if (len == 4) {
         if (memcmp(name, "lead", 4) == 0) return ray_lead_op;
+        if (memcmp(name, "sums", 4) == 0) return ray_sums_op;
+        if (memcmp(name, "avgs", 4) == 0) return ray_avgs_op;
+        if (memcmp(name, "mins", 4) == 0) return ray_mins_op;
+        if (memcmp(name, "maxs", 4) == 0) return ray_maxs_op;
+        if (memcmp(name, "prds", 4) == 0) return ray_prds_op;
         if (memcmp(name, "ceil",  4) == 0) return ray_ceil_op;
         if (memcmp(name, "sqrt",  4) == 0) return ray_sqrt_op;
         if (memcmp(name, "trim",  4) == 0) return ray_trim_op;
     } else if (len == 5) {
+        if (memcmp(name, "fills", 5) == 0) return ray_fills_op;
         if (memcmp(name, "floor", 5) == 0) return ray_floor_op;
         if (memcmp(name, "round", 5) == 0) return ray_round_op;
         if (memcmp(name, "upper", 5) == 0) return ray_upper;
@@ -355,6 +361,7 @@ static dag_unary_ctor resolve_unary_dag(int64_t sym_id) {
     } else if (len == 6) {
         if (memcmp(name, "deltas", 6) == 0) return ray_deltas_op;
         if (memcmp(name, "ratios", 6) == 0) return ray_ratios_op;
+        if (memcmp(name, "differ", 6) == 0) return ray_differ_op;
         if (memcmp(name, "strlen", 6) == 0) return ray_strlen;
     }
     /* NOTE: no DAG wiring for nil?/isnull yet.  The eval-level

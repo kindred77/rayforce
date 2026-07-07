@@ -991,6 +991,9 @@ ray_t* lag_vec_eager(ray_t* x);
 ray_t* lead_vec_eager(ray_t* x);
 ray_t* deltas_vec_eager(ray_t* x);
 ray_t* ratios_vec_eager(ray_t* x);
+ray_t* fills_vec_eager(ray_t* x);
+ray_t* running_vec_eager(ray_t* x, uint16_t opcode);
+ray_t* differ_vec_eager(ray_t* x);
 
 /* ── sort.c ── */
 ray_t* asc_vec_eager(ray_t* x);
