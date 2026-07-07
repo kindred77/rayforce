@@ -277,6 +277,11 @@ ray_t* ray_mins_fn(ray_t* x);
 ray_t* ray_maxs_fn(ray_t* x);
 ray_t* ray_prds_fn(ray_t* x);
 ray_t* ray_differ_fn(ray_t* x);
+ray_t* ray_msum_fn(ray_t* n, ray_t* x);
+ray_t* ray_mavg_fn(ray_t* n, ray_t* x);
+ray_t* ray_mmin_fn(ray_t* n, ray_t* x);
+ray_t* ray_mmax_fn(ray_t* n, ray_t* x);
+ray_t* ray_mcount_fn(ray_t* n, ray_t* x);
 
 /* Table construction */
 ray_t* ray_list_fn(ray_t** args, int64_t n);

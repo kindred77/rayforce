@@ -134,6 +134,11 @@ Operations on vectors as collections.
 | `maxs` | unary | Running maximum | `(maxs [3 1 2])` → `[3 3 3]` |
 | `prds` | unary | Running product; nulls are skipped | `(prds [2 3 4])` → `[2 6 24]` |
 | `differ` | unary | Boolean change flag versus previous row; first row is true | `(differ [1 1 2])` → `[true false true]` |
+| `msum` | binary | Moving sum over trailing N rows; nulls are skipped | `(msum 3 [1 2 3 4])` → `[1 3 6 9]` |
+| `mavg` | binary | Moving average over trailing N rows and non-null values | `(mavg 3 [1 2 3 4])` → `[1.0 1.5 2.0 3.0]` |
+| `mmin` | binary | Moving minimum over trailing N rows | `(mmin 3 [3 2 4 1])` → `[3 2 2 1]` |
+| `mmax` | binary | Moving maximum over trailing N rows | `(mmax 3 [3 2 4 1])` → `[3 3 4 4]` |
+| `mcount` | binary | Moving non-null count over trailing N rows | `(mcount 3 [1 2 3 4])` → `[1 2 3 3]` |
 | `enlist` | variadic | Wrap value(s) in a vector | `(enlist 1 2 3)` → `[1 2 3]` |
 | `concat` | binary | Concatenate two vectors | `(concat [1 2] [3 4])` → `[1 2 3 4]` |
 | `raze` | unary | Flatten a list of vectors into one | `(raze (list [1 2] [3 4]))` → `[1 2 3 4]` |
@@ -145,7 +150,7 @@ Operations on vectors as collections.
 | `binr` | binary | Binary search (right boundary) | `(binr [10 20 30] 25)` → `2` |
 | `unify` | binary | Merge two tables/dicts, second takes precedence | `(unify d1 d2)` |
 
-The time-series vector functions above are lazy-aware DAG operations for vector inputs. They materialize through morsel-based kernels, can run in parallel, and poll the query cancellation flag at morsel boundaries.
+The time-series vector functions above are lazy-aware DAG operations for vector inputs. Moving-window helpers take a positive integer window first, then the vector. Constant windows inside `select` lower into DAG nodes; dynamic windows evaluate through the normal function path. These functions materialize through morsel-based kernels, can run in parallel, and poll the query cancellation flag during execution.
 
 ## Sorting & Ordering
 

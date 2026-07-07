@@ -31,6 +31,8 @@
 #include "ops/internal.h"   /* col_propagate_str_pool */
 #include "ops/idxop.h"
 #include "ops/ops.h"
+#include <stdatomic.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -3075,12 +3077,441 @@ ray_t* differ_vec_eager(ray_t* x) {
     return out;
 }
 
+typedef struct {
+    uint64_t sum_i;
+    double   sum_f;
+    int64_t  count;
+} ts_mprefix_state_t;
+
+typedef struct {
+    ray_t* src;
+    ray_t* dst;
+    ray_pool_t* pool;
+    uint64_t* prefix_i;
+    double* prefix_f;
+    int64_t* prefix_count;
+    ts_mprefix_state_t* summary;
+    ts_mprefix_state_t* carry;
+    uint16_t opcode;
+    bool has_nulls;
+    int64_t window;
+} ts_mprefix_ctx_t;
+
+static const char* ts_moving_name(uint16_t opcode) {
+    switch (opcode) {
+        case OP_MSUM:   return "msum";
+        case OP_MAVG:   return "mavg";
+        case OP_MMIN:   return "mmin";
+        case OP_MMAX:   return "mmax";
+        case OP_MCOUNT: return "mcount";
+        default:        return "moving";
+    }
+}
+
+static bool ts_moving_type(uint16_t opcode, int8_t t) {
+    switch (opcode) {
+        case OP_MCOUNT:
+            return true;
+        case OP_MMIN:
+        case OP_MMAX:
+            return ts_numeric_type(t) || t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP;
+        default:
+            return ts_numeric_type(t);
+    }
+}
+
+static int8_t ts_moving_out_type(uint16_t opcode, int8_t t) {
+    switch (opcode) {
+        case OP_MCOUNT:
+            return RAY_I64;
+        case OP_MAVG:
+            return RAY_F64;
+        case OP_MSUM:
+            return (t == RAY_F64 || t == RAY_F32) ? RAY_F64 : RAY_I64;
+        case OP_MMIN:
+        case OP_MMAX:
+            return (t == RAY_F64 || t == RAY_F32) ? RAY_F64 : t;
+        default:
+            return RAY_I64;
+    }
+}
+
+static bool ts_size_overflows(int64_t n, size_t esz) {
+    return n < 0 || (uint64_t)n > ((uint64_t)SIZE_MAX / (uint64_t)esz);
+}
+
+static void ts_mprefix_scan_fn(void* vctx, uint32_t worker_id, int64_t start, int64_t end) {
+    (void)worker_id;
+    ts_mprefix_ctx_t* c = (ts_mprefix_ctx_t*)vctx;
+    for (int64_t b = start; b < end; b++) {
+        int64_t lo = b * RAY_MORSEL_ELEMS;
+        int64_t hi = lo + RAY_MORSEL_ELEMS;
+        if (hi > c->src->len) hi = c->src->len;
+
+        uint64_t sum_i = 0;
+        double sum_f = 0.0;
+        int64_t count = 0;
+        for (int64_t r = lo; r < hi; r++) {
+            if (ts_morsel_checkpoint(c->pool, r - lo)) return;
+            bool nn = !(c->has_nulls && ray_vec_is_null(c->src, r));
+            if (nn) {
+                if (c->prefix_i) sum_i += (uint64_t)ts_read_as_i64(c->src, r);
+                if (c->prefix_f) sum_f += ts_read_as_f64(c->src, r);
+                count++;
+            }
+            if (c->prefix_i)     c->prefix_i[r + 1] = sum_i;
+            if (c->prefix_f)     c->prefix_f[r + 1] = sum_f;
+            if (c->prefix_count) c->prefix_count[r + 1] = count;
+        }
+        c->summary[b] = (ts_mprefix_state_t){ .sum_i = sum_i, .sum_f = sum_f, .count = count };
+    }
+}
+
+static void ts_mprefix_adjust_fn(void* vctx, uint32_t worker_id, int64_t start, int64_t end) {
+    (void)worker_id;
+    ts_mprefix_ctx_t* c = (ts_mprefix_ctx_t*)vctx;
+    for (int64_t b = start; b < end; b++) {
+        int64_t lo = b * RAY_MORSEL_ELEMS;
+        int64_t hi = lo + RAY_MORSEL_ELEMS;
+        if (hi > c->src->len) hi = c->src->len;
+        ts_mprefix_state_t carry = c->carry[b];
+
+        for (int64_t r = lo; r < hi; r++) {
+            if (ts_morsel_checkpoint(c->pool, r - lo)) return;
+            if (c->prefix_i)     c->prefix_i[r + 1] += carry.sum_i;
+            if (c->prefix_f)     c->prefix_f[r + 1] += carry.sum_f;
+            if (c->prefix_count) c->prefix_count[r + 1] += carry.count;
+        }
+    }
+}
+
+static void ts_mprefix_emit_fn(void* vctx, uint32_t worker_id, int64_t start, int64_t end) {
+    (void)worker_id;
+    ts_mprefix_ctx_t* c = (ts_mprefix_ctx_t*)vctx;
+    void* out = ray_data(c->dst);
+    for (int64_t r = start; r < end; r++) {
+        if (ts_morsel_checkpoint(c->pool, r - start)) return;
+        int64_t lo = (r >= c->window - 1) ? (r - c->window + 1) : 0;
+        int64_t hi = r + 1;
+        switch (c->opcode) {
+            case OP_MCOUNT:
+                ((int64_t*)out)[r] = c->prefix_count[hi] - c->prefix_count[lo];
+                break;
+            case OP_MSUM:
+                if (c->prefix_f)
+                    ((double*)out)[r] = ray_f64_fin(c->prefix_f[hi] - c->prefix_f[lo]);
+                else
+                    ((int64_t*)out)[r] = (int64_t)(c->prefix_i[hi] - c->prefix_i[lo]);
+                break;
+            case OP_MAVG: {
+                int64_t cnt = c->prefix_count[hi] - c->prefix_count[lo];
+                if (cnt <= 0) {
+                    ray_vec_set_null(c->dst, r, true);
+                } else {
+                    ((double*)out)[r] = ray_f64_fin((c->prefix_f[hi] - c->prefix_f[lo]) / (double)cnt);
+                }
+                break;
+            }
+        }
+    }
+}
+
+static ray_t* moving_prefix_vec_eager(ray_t* x, uint16_t opcode, int64_t window, int8_t out_type) {
+    int64_t n = x->len;
+    ray_t* out = ray_vec_new(out_type, n);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    out->len = n;
+    if (n == 0) return out;
+
+    int64_t nblocks = (n + RAY_MORSEL_ELEMS - 1) / RAY_MORSEL_ELEMS;
+    int64_t entries = n + 1;
+    ray_t *pi_hdr = NULL, *pf_hdr = NULL, *pc_hdr = NULL, *sum_hdr = NULL, *carry_hdr = NULL;
+    uint64_t* prefix_i = NULL;
+    double* prefix_f = NULL;
+    int64_t* prefix_count = NULL;
+
+    bool need_i = (opcode == OP_MSUM && out_type == RAY_I64);
+    bool need_f = (opcode == OP_MAVG || (opcode == OP_MSUM && out_type == RAY_F64));
+    bool need_count = (opcode == OP_MAVG || opcode == OP_MCOUNT);
+
+    if (need_i) {
+        if (ts_size_overflows(entries, sizeof(uint64_t))) { ray_release(out); return ray_error("oom", NULL); }
+        prefix_i = (uint64_t*)scratch_calloc(&pi_hdr, (size_t)entries * sizeof(uint64_t));
+    }
+    if (need_f) {
+        if (ts_size_overflows(entries, sizeof(double))) {
+            if (pi_hdr) scratch_free(pi_hdr);
+            ray_release(out);
+            return ray_error("oom", NULL);
+        }
+        prefix_f = (double*)scratch_calloc(&pf_hdr, (size_t)entries * sizeof(double));
+    }
+    if (need_count) {
+        if (ts_size_overflows(entries, sizeof(int64_t))) {
+            if (pi_hdr) scratch_free(pi_hdr);
+            if (pf_hdr) scratch_free(pf_hdr);
+            ray_release(out);
+            return ray_error("oom", NULL);
+        }
+        prefix_count = (int64_t*)scratch_calloc(&pc_hdr, (size_t)entries * sizeof(int64_t));
+    }
+    ts_mprefix_state_t* summary = (ts_mprefix_state_t*)scratch_calloc(&sum_hdr, (size_t)nblocks * sizeof(ts_mprefix_state_t));
+    ts_mprefix_state_t* carry = (ts_mprefix_state_t*)scratch_calloc(&carry_hdr, (size_t)nblocks * sizeof(ts_mprefix_state_t));
+    if ((need_i && !prefix_i) || (need_f && !prefix_f) || (need_count && !prefix_count) || !summary || !carry) {
+        if (pi_hdr) scratch_free(pi_hdr);
+        if (pf_hdr) scratch_free(pf_hdr);
+        if (pc_hdr) scratch_free(pc_hdr);
+        if (sum_hdr) scratch_free(sum_hdr);
+        if (carry_hdr) scratch_free(carry_hdr);
+        ray_release(out);
+        return ray_error("oom", NULL);
+    }
+
+    ray_pool_t* pool = ray_pool_get();
+    ts_mprefix_ctx_t ctx = {
+        .src = x, .dst = out, .pool = pool,
+        .prefix_i = prefix_i, .prefix_f = prefix_f, .prefix_count = prefix_count,
+        .summary = summary, .carry = carry,
+        .opcode = opcode,
+        .has_nulls = (x->attrs & (RAY_ATTR_HAS_NULLS | RAY_ATTR_SLICE)) != 0,
+        .window = window
+    };
+
+    ray_pool_dispatch(pool, ts_mprefix_scan_fn, &ctx, nblocks);
+    if (pool_cancelled(pool)) goto cancelled;
+
+    ts_mprefix_state_t run = {0};
+    for (int64_t b = 0; b < nblocks; b++) {
+        if ((b & 1023) == 0 && pool_cancelled(pool)) goto cancelled;
+        carry[b] = run;
+        run.sum_i += summary[b].sum_i;
+        run.sum_f += summary[b].sum_f;
+        run.count += summary[b].count;
+    }
+
+    ray_pool_dispatch(pool, ts_mprefix_adjust_fn, &ctx, nblocks);
+    if (pool_cancelled(pool)) goto cancelled;
+    ray_pool_dispatch(pool, ts_mprefix_emit_fn, &ctx, n);
+    if (pool_cancelled(pool)) goto cancelled;
+
+    if (pi_hdr) scratch_free(pi_hdr);
+    if (pf_hdr) scratch_free(pf_hdr);
+    if (pc_hdr) scratch_free(pc_hdr);
+    scratch_free(sum_hdr);
+    scratch_free(carry_hdr);
+    return out;
+
+cancelled:
+    if (pi_hdr) scratch_free(pi_hdr);
+    if (pf_hdr) scratch_free(pf_hdr);
+    if (pc_hdr) scratch_free(pc_hdr);
+    scratch_free(sum_hdr);
+    scratch_free(carry_hdr);
+    ray_release(out);
+    return ray_error("cancel", "interrupted");
+}
+
+typedef struct {
+    ray_t* src;
+    ray_t* dst;
+    ray_pool_t* pool;
+    uint16_t opcode;
+    bool is_float;
+    bool has_nulls;
+    int64_t window;
+    int64_t ntasks;
+    _Atomic(int) oom;
+} ts_mminmax_ctx_t;
+
+static inline int64_t ts_task_lo(int64_t n, int64_t task, int64_t ntasks) {
+    int64_t q = n / ntasks;
+    int64_t r = n % ntasks;
+    return q * task + (r * task) / ntasks;
+}
+
+static bool ts_mminmax_better(ts_mminmax_ctx_t* c, int64_t a, int64_t b) {
+    if (c->is_float) {
+        double av = ts_read_as_f64(c->src, a);
+        double bv = ts_read_as_f64(c->src, b);
+        return c->opcode == OP_MMIN ? av <= bv : av >= bv;
+    }
+    int64_t av = ts_read_as_i64(c->src, a);
+    int64_t bv = ts_read_as_i64(c->src, b);
+    return c->opcode == OP_MMIN ? av <= bv : av >= bv;
+}
+
+static void ts_mminmax_write(ts_mminmax_ctx_t* c, int64_t out_row, int64_t src_row) {
+    void* out = ray_data(c->dst);
+    if (c->is_float) ((double*)out)[out_row] = ray_f64_fin(ts_read_as_f64(c->src, src_row));
+    else write_col_i64(out, out_row, ts_read_as_i64(c->src, src_row), c->dst->type, c->dst->attrs);
+}
+
+static void ts_mminmax_task_fn(void* vctx, uint32_t worker_id, int64_t start, int64_t end) {
+    (void)worker_id;
+    ts_mminmax_ctx_t* c = (ts_mminmax_ctx_t*)vctx;
+    if (atomic_load_explicit(&c->oom, memory_order_relaxed)) return;
+
+    int64_t n = c->src->len;
+    for (int64_t task = start; task < end; task++) {
+        int64_t lo = ts_task_lo(n, task, c->ntasks);
+        int64_t hi = ts_task_lo(n, task + 1, c->ntasks);
+        if (lo >= hi) continue;
+        int64_t scan_lo = (lo >= c->window - 1) ? (lo - c->window + 1) : 0;
+        int64_t scan_len = hi - scan_lo;
+        int64_t cap_i64 = c->window < scan_len ? c->window : scan_len;
+        if (cap_i64 < 1) cap_i64 = 1;
+        if (ts_size_overflows(cap_i64, sizeof(int64_t))) {
+            atomic_store_explicit(&c->oom, 1, memory_order_relaxed);
+            return;
+        }
+
+        ray_t* dq_hdr = NULL;
+        int64_t* dq = (int64_t*)scratch_alloc(&dq_hdr, (size_t)cap_i64 * sizeof(int64_t));
+        if (!dq) {
+            atomic_store_explicit(&c->oom, 1, memory_order_relaxed);
+            return;
+        }
+
+        int64_t head = 0;
+        int64_t len = 0;
+        for (int64_t r = scan_lo; r < hi; r++) {
+            if (ts_morsel_checkpoint(c->pool, r - scan_lo)) { scratch_free(dq_hdr); return; }
+            int64_t expire = (r >= c->window - 1) ? (r - c->window + 1) : 0;
+            while (len > 0 && dq[head] < expire) {
+                head = (head + 1) % cap_i64;
+                len--;
+            }
+
+            bool nn = !(c->has_nulls && ray_vec_is_null(c->src, r));
+            if (nn) {
+                while (len > 0) {
+                    int64_t back_pos = (head + len - 1) % cap_i64;
+                    if (!ts_mminmax_better(c, r, dq[back_pos])) break;
+                    len--;
+                }
+                dq[(head + len) % cap_i64] = r;
+                len++;
+            }
+
+            if (r >= lo) {
+                if (len == 0) ray_vec_set_null(c->dst, r, true);
+                else          ts_mminmax_write(c, r, dq[head]);
+            }
+        }
+        scratch_free(dq_hdr);
+    }
+}
+
+static ray_t* moving_minmax_vec_eager(ray_t* x, uint16_t opcode, int64_t window, int8_t out_type) {
+    int64_t n = x->len;
+    ray_t* out = ray_vec_new(out_type, n);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    out->len = n;
+    if (n == 0) return out;
+
+    ray_pool_t* pool = ray_pool_get();
+    uint32_t workers = pool ? pool->n_workers + 1 : 1;
+    int64_t overlap_tasks = (window > 0) ? (n + window - 1) / window : 1;
+    if (overlap_tasks < 1) overlap_tasks = 1;
+    uint32_t ntasks = workers;
+    if ((int64_t)ntasks > overlap_tasks) ntasks = (uint32_t)overlap_tasks;
+    if (ntasks < 1) ntasks = 1;
+    if (n < RAY_PARALLEL_THRESHOLD) ntasks = 1;
+
+    ts_mminmax_ctx_t ctx = {
+        .src = x, .dst = out, .pool = pool,
+        .opcode = opcode,
+        .is_float = (x->type == RAY_F64 || x->type == RAY_F32),
+        .has_nulls = (x->attrs & (RAY_ATTR_HAS_NULLS | RAY_ATTR_SLICE)) != 0,
+        .window = window,
+        .ntasks = (int64_t)ntasks
+    };
+    atomic_store_explicit(&ctx.oom, 0, memory_order_relaxed);
+
+    if (ntasks == 1) ts_mminmax_task_fn(&ctx, 0, 0, 1);
+    else             ray_pool_dispatch_n(pool, ts_mminmax_task_fn, &ctx, ntasks);
+
+    if (atomic_load_explicit(&ctx.oom, memory_order_relaxed)) {
+        ray_release(out);
+        return ray_error("oom", NULL);
+    }
+    if (pool_cancelled(pool)) {
+        ray_release(out);
+        return ray_error("cancel", "interrupted");
+    }
+    return out;
+}
+
+ray_t* moving_vec_eager(ray_t* x, uint16_t opcode, int64_t window) {
+    if (!x || RAY_IS_ERR(x)) return x;
+    if (!ray_is_vec(x)) return ray_error("type", "%s expects a vector input", ts_moving_name(opcode));
+    if (window < 1) return ray_error("range", "%s window must be >= 1", ts_moving_name(opcode));
+    if (RAY_IS_PARTED(x->type)) {
+        ray_t* flat = parted_to_flat_vec(x);
+        if (!flat || RAY_IS_ERR(flat)) return flat ? flat : ray_error("oom", NULL);
+        ray_t* out = moving_vec_eager(flat, opcode, window);
+        ray_release(flat);
+        return out;
+    }
+    if (!ts_moving_type(opcode, x->type)) {
+        return ray_error("type", "%s expects %s, got %s",
+                         ts_moving_name(opcode),
+                         (opcode == OP_MMIN || opcode == OP_MMAX) ? "a numeric or temporal vector" :
+                         (opcode == OP_MCOUNT) ? "a vector" : "a numeric vector",
+                         ray_type_name(x->type));
+    }
+
+    int8_t out_type = ts_moving_out_type(opcode, x->type);
+    if (opcode == OP_MMIN || opcode == OP_MMAX)
+        return moving_minmax_vec_eager(x, opcode, window, out_type);
+    return moving_prefix_vec_eager(x, opcode, window, out_type);
+}
+
 static ray_t* ts_start_lazy_unary(ray_t* x, ray_op_t* (*ctor)(ray_graph_t*, ray_op_t*)) {
     ray_graph_t* g = ray_graph_new(NULL);
     if (!g) return ray_error("oom", NULL);
     ray_op_t* in = ray_graph_input_vec(g, x);
     ray_op_t* op = ctor(g, in);
     return ray_lazy_wrap(g, op);
+}
+
+static ray_t* ts_start_lazy_moving(ray_t* x, uint16_t opcode, int64_t window) {
+    ray_graph_t* g = ray_graph_new(NULL);
+    if (!g) return ray_error("oom", NULL);
+    ray_op_t* in = ray_graph_input_vec(g, x);
+    ray_op_t* op = NULL;
+    switch (opcode) {
+        case OP_MSUM:   op = ray_msum_op(g, in, window); break;
+        case OP_MAVG:   op = ray_mavg_op(g, in, window); break;
+        case OP_MMIN:   op = ray_mmin_op(g, in, window); break;
+        case OP_MMAX:   op = ray_mmax_op(g, in, window); break;
+        case OP_MCOUNT: op = ray_mcount_op(g, in, window); break;
+    }
+    if (!op) { ray_graph_free(g); return ray_error("oom", NULL); }
+    return ray_lazy_wrap(g, op);
+}
+
+static bool ts_window_arg(ray_t* n, int64_t* out) {
+    if (!n || !ray_is_atom(n) || RAY_ATOM_IS_NULL(n)) return false;
+    switch (n->type) {
+        case -RAY_I64:  *out = n->i64; return true;
+        case -RAY_I32:  *out = (int64_t)n->i32; return true;
+        case -RAY_I16:  *out = (int64_t)n->i16; return true;
+        case -RAY_U8:
+        case -RAY_BOOL: *out = (int64_t)n->u8; return true;
+        default: return false;
+    }
+}
+
+static ray_t* ts_moving_fn(ray_t* n, ray_t* x, uint16_t opcode) {
+    int64_t window = 0;
+    if (!ts_window_arg(n, &window))
+        return ray_error("type", "%s window must be an integer atom", ts_moving_name(opcode));
+    if (window < 1)
+        return ray_error("range", "%s window must be >= 1", ts_moving_name(opcode));
+    if (ray_is_lazy(x)) return ray_lazy_append_param(x, opcode, window);
+    if (ray_is_vec(x)) return ts_start_lazy_moving(x, opcode, window);
+    return ray_error("type", "%s expects a vector input, got %s", ts_moving_name(opcode), ray_type_name(x ? x->type : 0));
 }
 
 ray_t* ray_lag_fn(ray_t* x) {
@@ -3147,6 +3578,26 @@ ray_t* ray_differ_fn(ray_t* x) {
     if (ray_is_lazy(x)) return ray_lazy_append(x, OP_DIFFER);
     if (ray_is_vec(x)) return ts_start_lazy_unary(x, ray_differ_op);
     return ray_error("type", "differ expects a vector input, got %s", ray_type_name(x ? x->type : 0));
+}
+
+ray_t* ray_msum_fn(ray_t* n, ray_t* x) {
+    return ts_moving_fn(n, x, OP_MSUM);
+}
+
+ray_t* ray_mavg_fn(ray_t* n, ray_t* x) {
+    return ts_moving_fn(n, x, OP_MAVG);
+}
+
+ray_t* ray_mmin_fn(ray_t* n, ray_t* x) {
+    return ts_moving_fn(n, x, OP_MMIN);
+}
+
+ray_t* ray_mmax_fn(ray_t* n, ray_t* x) {
+    return ts_moving_fn(n, x, OP_MMAX);
+}
+
+ray_t* ray_mcount_fn(ray_t* n, ray_t* x) {
+    return ts_moving_fn(n, x, OP_MCOUNT);
 }
 
 /* (reverse vec) — reverse a vector */

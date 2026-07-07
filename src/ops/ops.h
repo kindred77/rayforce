@@ -55,6 +55,7 @@ static inline bool ray_is_lazy(ray_t* x) {
 }
 
 ray_t*    ray_lazy_materialize(ray_t* val);
+ray_t*    ray_lazy_append_param(ray_t* lazy, uint16_t opcode, int64_t param);
 
 /* ===== Cancel API ===== */
 
@@ -299,6 +300,11 @@ static inline bool agg_type_admitted(uint16_t op, int8_t t) {
 #define OP_MAXS           121   /* running maximum                              */
 #define OP_PRDS           122   /* running product                              */
 #define OP_DIFFER         123   /* change flag vs previous row                  */
+#define OP_MSUM           124   /* moving sum over trailing N rows              */
+#define OP_MAVG           125   /* moving average over trailing N rows          */
+#define OP_MMIN           126   /* moving minimum over trailing N rows          */
+#define OP_MMAX           127   /* moving maximum over trailing N rows          */
+#define OP_MCOUNT         128   /* moving non-null count over trailing N rows   */
 
 /* Opcodes — Misc */
 #define OP_ALIAS        70
@@ -361,6 +367,7 @@ typedef struct ray_op_ext {
     union {
         ray_t*   literal;       /* OP_CONST: inline literal value */
         int64_t sym;           /* OP_SCAN: column name symbol ID */
+        int64_t param;         /* scalar op parameter (e.g. moving-window N) */
         struct {               /* OP_GROUP: group-by specification */
             uint32_t*  keys;        /* node ids */
             uint32_t   n_keys;
@@ -678,6 +685,11 @@ ray_op_t* ray_mins_op(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_maxs_op(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_prds_op(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_differ_op(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_msum_op(ray_graph_t* g, ray_op_t* a, int64_t window);
+ray_op_t* ray_mavg_op(ray_graph_t* g, ray_op_t* a, int64_t window);
+ray_op_t* ray_mmin_op(ray_graph_t* g, ray_op_t* a, int64_t window);
+ray_op_t* ray_mmax_op(ray_graph_t* g, ray_op_t* a, int64_t window);
+ray_op_t* ray_mcount_op(ray_graph_t* g, ray_op_t* a, int64_t window);
 ray_op_t* ray_stddev(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_stddev_pop(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_var(ray_graph_t* g, ray_op_t* a);

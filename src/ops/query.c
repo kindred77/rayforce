@@ -374,6 +374,37 @@ static dag_unary_ctor resolve_unary_dag(int64_t sym_id) {
     return NULL;
 }
 
+static uint16_t resolve_moving_opcode(int64_t sym_id) {
+    ray_t* s = ray_sym_str(sym_id);
+    if (!s) return 0;
+    const char* name = ray_str_ptr(s);
+    size_t len = ray_str_len(s);
+    if (len == 4) {
+        if (memcmp(name, "msum", 4) == 0) return OP_MSUM;
+        if (memcmp(name, "mavg", 4) == 0) return OP_MAVG;
+        if (memcmp(name, "mmin", 4) == 0) return OP_MMIN;
+        if (memcmp(name, "mmax", 4) == 0) return OP_MMAX;
+    } else if (len == 6) {
+        if (memcmp(name, "mcount", 6) == 0) return OP_MCOUNT;
+    }
+    return 0;
+}
+
+static bool const_op_i64(ray_graph_t* g, ray_op_t* op, int64_t* out) {
+    if (!op || op->opcode != OP_CONST) return false;
+    ray_op_ext_t* ext = find_ext(g, op->id);
+    if (!ext || !ext->literal || RAY_IS_ERR(ext->literal)) return false;
+    ray_t* v = ext->literal;
+    switch (v->type) {
+        case -RAY_I64:  *out = v->i64; return !RAY_ATOM_IS_NULL(v);
+        case -RAY_I32:  *out = (int64_t)v->i32; return !RAY_ATOM_IS_NULL(v);
+        case -RAY_I16:  *out = (int64_t)v->i16; return !RAY_ATOM_IS_NULL(v);
+        case -RAY_U8:
+        case -RAY_BOOL: *out = (int64_t)v->u8; return !RAY_ATOM_IS_NULL(v);
+        default: return false;
+    }
+}
+
 /* Map Rayfall aggregation name to DAG opcode */
 static uint16_t resolve_agg_opcode(int64_t sym_id) {
     ray_t* s = ray_sym_str(sym_id);
@@ -1438,6 +1469,23 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
 
         /* Binary op? */
         if (n == 3) {
+            uint16_t mov_op = resolve_moving_opcode(fn_sym);
+            if (mov_op) {
+                ray_op_t* wop = compile_expr_dag(g, elems[1]);
+                int64_t window = 0;
+                if (!const_op_i64(g, wop, &window) || window < 1)
+                    return NULL;
+                ray_op_t* arg = compile_expr_dag(g, elems[2]);
+                if (!arg) return NULL;
+                switch (mov_op) {
+                    case OP_MSUM:   return ray_msum_op(g, arg, window);
+                    case OP_MAVG:   return ray_mavg_op(g, arg, window);
+                    case OP_MMIN:   return ray_mmin_op(g, arg, window);
+                    case OP_MMAX:   return ray_mmax_op(g, arg, window);
+                    case OP_MCOUNT: return ray_mcount_op(g, arg, window);
+                    default: return NULL;
+                }
+            }
             dag_binary_ctor ctor = resolve_binary_dag(fn_sym);
             if (ctor) {
                 ray_op_t* left = compile_expr_dag(g, elems[1]);

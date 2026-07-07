@@ -416,7 +416,14 @@ For common time-series scans, prefer the built-in DAG forms. They avoid per-row 
 (maxs [3 1 2])              ; [3 3 3]
 (fills (as 'I64 (list 0N 2 0N))) ; [0Nl 2 2]
 (differ [1 1 2 2])          ; [true false true false]
+(msum 3 [1 2 3 4])          ; [1 3 6 9]
+(mavg 3 [1 2 3 4])          ; [1.0 1.5 2.0 3.0]
+(mmin 3 [3 2 4 1])          ; [3 2 2 1]
+(mmax 3 [3 2 4 1])          ; [3 3 4 4]
+(mcount 3 [1 2 3 4])        ; [1 2 3 3]
 ```
+
+The moving forms take a positive integer window first. Constant windows inside query projections lower to DAG operations; dynamic windows still evaluate as ordinary function calls.
 
 ### `(apply f ...args)`
 

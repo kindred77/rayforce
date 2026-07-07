@@ -1,0 +1,45 @@
+;; Moving time-series primitives. Window width is a positive integer atom and
+;; the input is a vector. Vector calls are lazy-aware DAG ops.
+
+;; Basic trailing-window behaviour.
+(msum 3 [1 2 3 4 5]) -- [1 3 6 9 12]
+(mavg 3 [1 2 3 4 5]) -- [1.0 1.5 2.0 3.0 4.0]
+(mmin 3 [3 2 4 1 5]) -- [3 2 2 1 1]
+(mmax 3 [3 2 4 1 5]) -- [3 3 4 4 5]
+(mcount 3 [1 2 3 4 5]) -- [1 2 3 3 3]
+
+;; Nulls are skipped. msum uses zero for all-null windows; mavg/min/max
+;; return typed nulls when the current window has no non-null values.
+(set Mv (as 'I64 (list 0N 1 0N 3)))
+(msum 3 Mv) -- [0 1 1 4]
+(mavg 2 Mv) -- (as 'F64 (list 0Nf 1.0 1.0 3.0))
+(mmin 2 Mv) -- (as 'I64 (list 0N 1 1 3))
+(mmax 2 Mv) -- (as 'I64 (list 0N 1 1 3))
+(mcount 2 Mv) -- [0 1 1 1]
+(mcount 2 ["aa" "bb" "cc"]) -- [1 2 2]
+
+;; Type behaviour.
+(type (msum 2 (as 'I16 [1 2 3]))) -- 'I64
+(type (mavg 2 [1 2 3])) -- 'F64
+(type (mmin 2 (as 'DATE [3 2 1]))) -- 'DATE
+
+;; Query lowering: constant windows compile in select projections.
+(set Tm (table [x] (list [1 2 3 4 5])))
+(at (select {from: Tm sx: (msum 3 x) ax: (mavg 3 x) nx: (mmin 3 x) xx: (mmax 3 x) cx: (mcount 3 x)}) 'sx) -- [1 3 6 9 12]
+(at (select {from: Tm sx: (msum 3 x) ax: (mavg 3 x) nx: (mmin 3 x) xx: (mmax 3 x) cx: (mcount 3 x)}) 'ax) -- [1.0 1.5 2.0 3.0 4.0]
+(at (select {from: Tm sx: (msum 3 x) ax: (mavg 3 x) nx: (mmin 3 x) xx: (mmax 3 x) cx: (mcount 3 x)}) 'cx) -- [1 2 3 3 3]
+(set Wm 2)
+(at (select {from: Tm sx: (msum Wm x)}) 'sx) -- [1 3 5 7 9]
+
+;; Cross-morsel windows.
+(last (msum 1000 (til 5000))) -- 4499500
+(last (mavg 1000 (til 5000))) -- 4499.5
+(last (mmin 1000 (til 5000))) -- 4000
+(last (mmax 1000 (til 5000))) -- 4999
+(last (mcount 1000 (til 5000))) -- 1000
+(last (mmax 2000 (reverse (til 5000)))) -- 1999
+
+;; Error paths.
+(msum 0 [1 2]) !- range
+(mavg 2 ['a 'b]) !- type
+(mmin 2 ['a 'b]) !- type

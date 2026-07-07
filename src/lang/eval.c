@@ -3059,6 +3059,11 @@ static void ray_register_builtins(void) {
     register_unary_op("maxs",   RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_maxs_fn,   OP_MAXS);
     register_unary_op("prds",   RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_prds_fn,   OP_PRDS);
     register_unary_op("differ", RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_differ_fn, OP_DIFFER);
+    register_binary("msum",   RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_msum_fn);
+    register_binary("mavg",   RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_mavg_fn);
+    register_binary("mmin",   RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_mmin_fn);
+    register_binary("mmax",   RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_mmax_fn);
+    register_binary("mcount", RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_mcount_fn);
 
     /* Sorting operations */
     register_unary("asc",      RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_asc_fn);

@@ -118,7 +118,18 @@ The pattern is: sort descending with `xdesc`, then filter with a threshold. For 
 [1 2 6 24 120]
 ```
 
-Use the specialized running verbs (`sums`, `prds`, `avgs`, `mins`, `maxs`) for common analytics paths; they lower to DAG vector kernels and are interruptible at morsel boundaries. The generic `scan` function is still available when the accumulator is a custom function. The related `fold` function returns only the final accumulated value.
+```lisp
+; Fixed trailing window: current row plus the previous two rows
+(msum 3 [3 1 4 1 5 9])
+(mavg 3 [3 1 4 1 5 9])
+```
+
+```text
+[3 4 8 6 10 15]
+[3.0 2.0 2.6666666667 2.0 3.3333333333 5.0]
+```
+
+Use the specialized running verbs (`sums`, `prds`, `avgs`, `mins`, `maxs`) and moving-window verbs (`msum`, `mavg`, `mmin`, `mmax`, `mcount`) for common analytics paths. Constant-window calls lower to DAG vector kernels, run with morsel-based execution, and poll cancellation during execution. The generic `scan` function is still available when the accumulator is a custom function. The related `fold` function returns only the final accumulated value.
 
 ## 4. Pivoting (Cross-Tabulation) { #pivot }
 

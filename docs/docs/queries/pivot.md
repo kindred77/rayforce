@@ -138,9 +138,14 @@ Running computations like cumulative sums can be computed using the DAG-backed t
 ; Cumulative sum on the Price column
 (sums (at trades 'Price))
 ; [89.17 159.67 240.21]
+
+; Three-row trailing sum inside a projection
+(select {from: trades
+         px3: (msum 3 Price)
+         avg3: (mavg 3 Price)})
 ```
 
-Use `scan` when the accumulator is a custom function. Use `sums`, `avgs`, `mins`, `maxs`, and `prds` for built-in running aggregates; they are lazy-aware and materialize with morsel-based kernels.
+Use `scan` when the accumulator is a custom function. Use `sums`, `avgs`, `mins`, `maxs`, and `prds` for built-in running aggregates, and `msum`, `mavg`, `mmin`, `mmax`, and `mcount` for fixed trailing windows. Constant-window calls are lazy-aware DAG operations and materialize with morsel-based kernels.
 
 ### Rank and Order
 

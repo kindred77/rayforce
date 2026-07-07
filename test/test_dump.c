@@ -139,6 +139,8 @@ static test_result_t test_dump_opcode_name_all(void) {
         { OP_ANN_RERANK,"ANN_RERANK"}, { OP_KNN_RERANK,"KNN_RERANK"},
         { OP_LAG,"LAG"}, { OP_LEAD,"LEAD"},
         { OP_DELTAS,"DELTAS"}, { OP_RATIOS,"RATIOS"},
+        { OP_MSUM,"MSUM"}, { OP_MAVG,"MAVG"}, { OP_MMIN,"MMIN"},
+        { OP_MMAX,"MMAX"}, { OP_MCOUNT,"MCOUNT"},
     };
     size_t n = sizeof cases / sizeof cases[0];
     for (size_t i = 0; i < n; i++) {

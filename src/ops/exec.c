@@ -1512,7 +1512,7 @@ static int group_input_scan_syms(ray_graph_t* g, ray_op_ext_t* gx,
  * space-separated pass labels (predicate pushdown, …).  Cached per opcode so
  * the returned pointer stays valid for the life of a span. */
 static const char* prof_op_label(uint16_t opc) {
-#define PROF_OP_LABEL_MAX OP_DIFFER
+#define PROF_OP_LABEL_MAX OP_MCOUNT
     if (opc > PROF_OP_LABEL_MAX) return ray_opcode_name(opc);
     static char lc[PROF_OP_LABEL_MAX + 1][28];
     if (!lc[opc][0]) {
@@ -1541,6 +1541,8 @@ static inline bool op_is_heavy(uint16_t opc) {
            opc == OP_RATIOS || opc == OP_FILLS || opc == OP_SUMS ||
            opc == OP_AVGS   || opc == OP_MINS  || opc == OP_MAXS ||
            opc == OP_PRDS   || opc == OP_DIFFER ||
+           opc == OP_MSUM   || opc == OP_MAVG || opc == OP_MMIN ||
+           opc == OP_MMAX   || opc == OP_MCOUNT ||
            (opc >= OP_EXPAND && opc <= OP_KNN_RERANK);
 }
 
@@ -1996,7 +1998,9 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
 
         case OP_LAG: case OP_LEAD: case OP_DELTAS: case OP_RATIOS:
         case OP_FILLS: case OP_SUMS: case OP_AVGS: case OP_MINS:
-        case OP_MAXS: case OP_PRDS: case OP_DIFFER: {
+        case OP_MAXS: case OP_PRDS: case OP_DIFFER:
+        case OP_MSUM: case OP_MAVG: case OP_MMIN: case OP_MMAX:
+        case OP_MCOUNT: {
             ray_t* input = exec_node(g, op_child(g, op, 0));
             if (!input || RAY_IS_ERR(input)) return input;
             if (!ray_is_vec(input)) {
@@ -2015,7 +2019,13 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 case OP_MINS:   result = running_vec_eager(input, OP_MINS); break;
                 case OP_MAXS:   result = running_vec_eager(input, OP_MAXS); break;
                 case OP_PRDS:   result = running_vec_eager(input, OP_PRDS); break;
-                default:        result = differ_vec_eager(input); break;
+                case OP_DIFFER: result = differ_vec_eager(input); break;
+                default: {
+                    ray_op_ext_t* ext = find_ext(g, op->id);
+                    int64_t window = ext ? ext->param : 0;
+                    result = moving_vec_eager(input, op->opcode, window);
+                    break;
+                }
             }
             ray_release(input);
             return result;

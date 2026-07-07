@@ -365,6 +365,25 @@ static ray_op_t* make_unary(ray_graph_t* g, uint16_t opcode, ray_op_t* a, int8_t
     return n;
 }
 
+static ray_op_t* make_unary_param(ray_graph_t* g, uint16_t opcode, ray_op_t* a,
+                                  int8_t out_type, int64_t param) {
+    uint32_t a_id = a->id;
+    uint32_t est = a->est_rows;
+    ray_op_ext_t* ext = graph_alloc_ext_node(g);
+    if (!ext) return NULL;
+    a = &g->nodes[a_id];
+
+    ext->base.opcode = opcode;
+    ext->base.arity = 1;
+    ext->base.in_id[0] = a->id;
+    ext->base.out_type = out_type;
+    ext->base.est_rows = est;
+    ext->param = param;
+
+    g->nodes[ext->base.id] = ext->base;
+    return &g->nodes[ext->base.id];
+}
+
 static ray_op_t* make_binary(ray_graph_t* g, uint16_t opcode, ray_op_t* a, ray_op_t* b, int8_t out_type) {
     /* Save IDs before alloc — realloc may invalidate the pointers */
     uint32_t a_id = a->id;
@@ -632,6 +651,24 @@ ray_op_t* ray_prds_op(ray_graph_t* g, ray_op_t* a) {
     return make_unary(g, OP_PRDS, a, (t == RAY_F64 || t == RAY_F32) ? RAY_F64 : RAY_I64);
 }
 ray_op_t* ray_differ_op(ray_graph_t* g, ray_op_t* a)    { return make_unary(g, OP_DIFFER, a, RAY_BOOL); }
+ray_op_t* ray_msum_op(ray_graph_t* g, ray_op_t* a, int64_t window) {
+    int8_t t = a->out_type;
+    return make_unary_param(g, OP_MSUM, a, (t == RAY_F64 || t == RAY_F32) ? RAY_F64 : RAY_I64, window);
+}
+ray_op_t* ray_mavg_op(ray_graph_t* g, ray_op_t* a, int64_t window) {
+    return make_unary_param(g, OP_MAVG, a, RAY_F64, window);
+}
+ray_op_t* ray_mmin_op(ray_graph_t* g, ray_op_t* a, int64_t window) {
+    int8_t t = a->out_type;
+    return make_unary_param(g, OP_MMIN, a, (t == RAY_F64 || t == RAY_F32) ? RAY_F64 : t, window);
+}
+ray_op_t* ray_mmax_op(ray_graph_t* g, ray_op_t* a, int64_t window) {
+    int8_t t = a->out_type;
+    return make_unary_param(g, OP_MMAX, a, (t == RAY_F64 || t == RAY_F32) ? RAY_F64 : t, window);
+}
+ray_op_t* ray_mcount_op(ray_graph_t* g, ray_op_t* a, int64_t window) {
+    return make_unary_param(g, OP_MCOUNT, a, RAY_I64, window);
+}
 ray_op_t* ray_stddev(ray_graph_t* g, ray_op_t* a)     { return make_unary(g, OP_STDDEV, a, RAY_F64); }
 ray_op_t* ray_stddev_pop(ray_graph_t* g, ray_op_t* a)  { return make_unary(g, OP_STDDEV_POP, a, RAY_F64); }
 ray_op_t* ray_var(ray_graph_t* g, ray_op_t* a)         { return make_unary(g, OP_VAR, a, RAY_F64); }
@@ -1768,6 +1805,34 @@ ray_t* ray_lazy_append(ray_t* lazy, uint16_t opcode) {
      * ray_lazy_append returns the SAME lazy object it received, the caller
      * would see rc drop to 0 without this retain.  Retain here so the
      * caller's release brings rc back to the pre-call level. */
+    ray_retain(lazy);
+    return lazy;
+}
+
+ray_t* ray_lazy_append_param(ray_t* lazy, uint16_t opcode, int64_t param) {
+    ray_graph_t* g    = RAY_LAZY_GRAPH(lazy);
+    ray_op_t*    prev = RAY_LAZY_OP(lazy);
+
+    int8_t out_type;
+    switch (opcode) {
+        case OP_MCOUNT:
+            out_type = RAY_I64; break;
+        case OP_MAVG:
+            out_type = RAY_F64; break;
+        case OP_MSUM:
+            out_type = (prev->out_type == RAY_F64 || prev->out_type == RAY_F32) ? RAY_F64 : RAY_I64;
+            break;
+        case OP_MMIN:
+        case OP_MMAX:
+            out_type = (prev->out_type == RAY_F64 || prev->out_type == RAY_F32) ? RAY_F64 : prev->out_type;
+            break;
+        default:
+            out_type = prev->out_type; break;
+    }
+
+    ray_op_t* op = make_unary_param(g, opcode, prev, out_type, param);
+    if (!op) return ray_error("oom", NULL);
+    RAY_LAZY_OP(lazy) = op;
     ray_retain(lazy);
     return lazy;
 }

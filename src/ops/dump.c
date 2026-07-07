@@ -145,6 +145,11 @@ const char* ray_opcode_name(uint16_t op) {
         case OP_MAXS:          return "MAXS";
         case OP_PRDS:          return "PRDS";
         case OP_DIFFER:        return "DIFFER";
+        case OP_MSUM:          return "MSUM";
+        case OP_MAVG:          return "MAVG";
+        case OP_MMIN:          return "MMIN";
+        case OP_MMAX:          return "MMAX";
+        case OP_MCOUNT:        return "MCOUNT";
         default:               return "UNKNOWN";
     }
 }
@@ -227,6 +232,14 @@ static void dump_node(FILE* f, ray_graph_t* g, ray_op_t* node, int depth) {
         case OP_TAIL:
             if (ext)
                 fprintf(f, "(N=%lld)", (long long)ext->sym);
+            break;
+        case OP_MSUM:
+        case OP_MAVG:
+        case OP_MMIN:
+        case OP_MMAX:
+        case OP_MCOUNT:
+            if (ext)
+                fprintf(f, "(N=%lld)", (long long)ext->param);
             break;
         default:
             break;
