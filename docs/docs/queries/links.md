@@ -74,7 +74,7 @@ Each dotted-field deref allocates one fresh column and gathers values once.  The
 
 Two sources of nulls in the result:
 
-- If `linked[i]` is itself null (the row-id column has a null bit at row `i`), the result row is null.
+- If `linked[i]` is itself null (the row-id column contains a null sentinel at row `i`), the result row is null.
 - If `linked[i]` is in range but the target's row at that index is null, the result row is null.
 - Out-of-range row IDs (`rid < 0` or `rid >= target.len`) silently become null in the result.  This matches the prior column-store convention — safer than erroring out mid-query.
 

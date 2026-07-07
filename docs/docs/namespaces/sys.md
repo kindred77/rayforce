@@ -237,7 +237,7 @@ Signature: `(.sys.cmd "name args")`. Parses a colon-style command name (without 
 
 `clear`, `help`, and `q` are REPL-only — invoking them from a script returns a `domain` error rather than silently no-op'ing.
 
-```lisp
+```text
 (.sys.cmd "listen 5000")   ;; => listener id
 (.sys.cmd "env")           ;; => binding count
 (.sys.cmd "timeit 1")      ;; => 1   (profiler enabled)
@@ -249,7 +249,7 @@ Signature: `(.sys.listen port)`. Binds an IPC listener on `port` using the runti
 
 Errors: `type` (port not an int / not parseable from string), `domain` (port outside `[1, 65535]`), `nyi` (no main loop — embedded library without a poll), `io` (`bind` failure, e.g. port already in use).
 
-```lisp
+```text
 (.sys.listen 5000)
 ;; => 12  (listener id)
 ```
@@ -260,7 +260,7 @@ Signature: `(.sys.timeit [flag])`. Toggles the per-expression profiler. Calling 
 
 ```lisp
 (.sys.timeit 1)   ;; enable profiling
-(select {from: trades by: sym total: (sum qty)})
+(sum (til 1000))
 ;; (timings printed for each subexpression)
 (.sys.timeit 0)   ;; disable
 ```

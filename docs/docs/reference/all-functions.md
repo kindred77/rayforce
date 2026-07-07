@@ -19,6 +19,62 @@
 | [Storage](#storage) (5) | [IPC](#ipc) (9) | [EAV Triple Store](#eav) (5) |
 | [Datalog](#datalog) (2) | [Datalog Program API](#datalog-program) (6) | |
 
+The examples below use these small in-memory fixtures where a table is needed:
+
+```lisp
+(set trades (table [sym price size time date]
+  (list [AAPL GOOG AAPL]
+        [150.0 2800.0 151.0]
+        [100 50 200]
+        [10 20 15]
+        [2024.01.15 2024.01.16 2024.01.15])))
+(set quotes (table [sym time bid]
+  (list [AAPL GOOG AAPL]
+        [9 19 16]
+        [149.5 2799.5 150.5])))
+```
+
+## Registered Builtin Surface
+
+Generated from `src/lang/eval.c` in this checkout: 259 registered builtins (98 unary, 58 binary, 103 variadic/special). The categorized reference below expands the most commonly used functions; this list is the complete registered name surface.
+
+### Unary (98)
+
+`not`, `neg`, `round`, `floor`, `ceil`, `abs`, `sqrt`, `log`, `exp`, `sum`, `count`, `avg`, `min`, `max`,
+`first`, `last`, `med`, `dev`, `stddev`, `stddev_pop`, `dev_pop`, `var`, `var_pop`, `raise`, `distinct`,
+`reverse`, `til`, `asc`, `desc`, `iasc`, `idesc`, `rank`, `key`, `value`, `type`, `read`, `load`, `exit`,
+`nil?`, `where`, `group`, `raze`, `ungroup`, `ser`, `de`, `guid`, `date`, `time`, `timestamp`, `ss`, `hh`,
+`minute`, `yyyy`, `mm`, `dd`, `dow`, `doy`, `eval`, `parse`, `meta`, `.sys.exec`, `.sys.cmd`, `.sys.listen`,
+`.os.getenv`, `.fs.size`, `.fs.list`, `.ipc.close`, `.repl.connect`, `.log.write`, `.log.replay`,
+`.log.validate`, `rc`, `diverse`, `.time.timer.del`, `env`, `sym-name`, `dl-stratify`, `dl-eval`, `dl-free`,
+`norm`, `hnsw-free`, `hnsw-load`, `hnsw-info`, `.idx.zone`, `.idx.hash`, `.idx.sort`, `.idx.bloom`,
+`.idx.drop`, `.idx.has?`, `.idx.info`, `.attr.get`, `.attr.drop`, `.col.unlink`, `.col.link?`, `.col.target`,
+`.graph.free`, `.graph.info`, `strlen`
+
+### Binary (58)
+
+`+`, `-`, `*`, `/`, `%`, `>`, `<`, `>=`, `<=`, `==`, `!=`, `pow`, `top`, `bot`, `pearson_corr`, `set`, `let`,
+`try`, `filter`, `in`, `except`, `union`, `sect`, `take`, `at`, `find`, `xasc`, `xdesc`, `table`, `union-all`,
+`xbar`, `as`, `write`, `dict`, `concat`, `within`, `div`, `rand`, `bin`, `binr`, `split`, `like`, `.os.setenv`,
+`.ipc.send`, `.ipc.post`, `get`, `remove`, `row`, `unify`, `xrank`, `dl-query`, `dl-provenance`, `cos-dist`,
+`inner-prod`, `l2-dist`, `hnsw-save`, `.attr.set`, `.col.link`
+
+### Variadic / Special (103)
+
+`and`, `or`, `if`, `do`, `fn`, `map`, `pmap`, `fold`, `scan`, `prior`, `apply`, `list`, `select`, `window`,
+`update`, `insert`, `upsert`, `left-join`, `inner-join`, `anti-join`, `window-join`, `window-join1`,
+`asof-join`, `println`, `show`, `format`, `read-csv`, `write-csv`, `.csv.read`, `.csv.splayed`, `.csv.parted`,
+`.csv.write`, `resolve`, `timeit`, `enlist`, `map-left`, `map-right`, `.db.splayed.set`, `.db.splayed.get`,
+`.db.parted.get`, `.db.parted.tables`, `.db.parted.fill`, `alter`, `print`, `.sys.gc`, `.sys.timeit`,
+`.sys.env`, `.sys.args`, `.ipc.open`, `.ipc.handle`, `.repl.disconnect`, `.log.open`, `.log.roll`,
+`.log.snapshot`, `.log.sync`, `.log.close`, `.log.purge`, `quote`, `return`, `.time.now`, `.time.timer.set`,
+`fold-left`, `fold-right`, `scan-left`, `scan-right`, `del`, `.sys.build`, `.sys.mem`, `.sys.prof`,
+`.sys.querylog`, `.sys.querylog.enable`, `modify`, `pivot`, `.sys.info`, `datoms`, `assert-fact`,
+`retract-fact`, `scan-eav`, `pull`, `rule`, `query`, `dl-program`, `dl-add-edb`, `knn`, `hnsw-build`, `ann`,
+`.graph.build`, `.graph.pagerank`, `.graph.connected`, `.graph.dijkstra`, `.graph.louvain`, `.graph.degree`,
+`.graph.topsort`, `.graph.dfs`, `.graph.cluster`, `.graph.betweenness`, `.graph.closeness`, `.graph.mst`,
+`.graph.random-walk`, `.graph.k-shortest`, `.graph.shortest-path`, `.graph.expand`, `.graph.var-expand`
+
 ## Arithmetic
 
 All arithmetic operators are **atomic** — they auto-map over vectors and broadcast scalars.
@@ -208,8 +264,8 @@ Sort vectors, compute sort indices, and rank elements.
 | `rank` | unary | — | Rank of each element (0-based) | `(rank [30 10 20])` → `[2 0 1]` |
 | `top` | binary | — | Largest N elements (descending) | `(top [5 1 9 3] 2)` → `[9 5]` |
 | `bot` | binary | — | Smallest N elements (ascending) | `(bot [5 1 9 3] 2)` → `[1 3]` |
-| `xasc` | binary | — | Sort table ascending by column(s) | `(xasc 'price trades)` |
-| `xdesc` | binary | — | Sort table descending by column(s) | `(xdesc 'price trades)` |
+| `xasc` | binary | — | Sort table ascending by column(s) | `(xasc trades 'price)` |
+| `xdesc` | binary | — | Sort table descending by column(s) | `(xdesc trades 'price)` |
 | `xrank` | binary | — | Assign N rank buckets (quantile ranking) | `(xrank 4 [10 20 30 40])` → `[0 1 2 3]` |
 
 ```lisp
@@ -218,7 +274,7 @@ Sort vectors, compute sort indices, and rank elements.
 (at v (iasc v))              ; [10 20 30]  same as (asc v)
 
 ; Sort a table by price descending
-(xdesc 'price trades)
+(xdesc trades 'price)
 
 ; Quantile buckets
 (xrank 10 (til 100))        ; 10 equal-sized buckets 0..9
@@ -280,16 +336,21 @@ Create and manipulate tables, dictionaries, and their metadata.
 ```lisp
 ; Create a table
 (set trades (table [sym price size]
-  (list ['AAPL 'GOOG 'AAPL]
+  (list [AAPL GOOG AAPL]
         [150.0 2800.0 151.0]
         [100 50 200])))
 
 ; Dictionary operations
-(set d (dict ['name 'age] ["Alice" 30]))
+(set d (dict [name age] (list "Alice" 30)))
 (get d 'name)              ; "Alice"
 (key d)                      ; [name age]
 
 ; Pivot: long to wide (5th arg is the aggregation fn)
+(set trades (table [sym date price size]
+  (list [AAPL GOOG AAPL]
+        [2024.01.15 2024.01.15 2024.01.16]
+        [150.0 2800.0 151.0]
+        [100 50 200])))
 (pivot trades 'sym 'date 'price sum)
 ```
 
@@ -335,13 +396,25 @@ Rayforce supports six join types, including time-series-aware as-of and window j
 | `asof-join` | variadic | — | As-of join — match most recent preceding value. Keys come first, last key is the time key. | `(asof-join [sym time] trades quotes)` |
 
 ```lisp
+; Fixtures for join examples
+(set trades (table [sym price size time]
+  (list [AAPL GOOG AAPL]
+        [150.0 2800.0 151.0]
+        [100 50 200]
+        [10 20 15])))
+(set quotes (table [sym time bid]
+  (list [AAPL GOOG AAPL]
+        [9 19 16]
+        [149.5 2799.5 150.5])))
+
 ; Left join on sym column (join keys are a symbol list)
 (left-join trades quotes [sym])
 
 ; Window join: keys are [equality-keys... time-key]; intervals is
-; (list lo-vec hi-vec) with one [lo hi] window bound per left row.
+; a two-vector list with one [lo hi] window bound per left row.
+(set intervals (map-left + [-2 2] (at trades 'time)))
 (window-join [sym time]
-             (list [8 18] [12 22])
+             intervals
              trades quotes
              {avg_bid: (avg bid)})
 
@@ -448,9 +521,11 @@ Printing, file I/O, CSV loading, and script execution.
 
 ```lisp
 ; Load and query CSV data
-(set trades (.csv.read "trades.csv"))
+(write "/tmp/rayforce-ref-trades.csv"
+  "sym,price,size\nAAPL,150.0,100\nGOOG,2800.0,50\n")
+(set trades (.csv.read "/tmp/rayforce-ref-trades.csv"))
 (show trades)
-(println (format "Loaded % rows" (count (value (first (value trades))))))
+(println (format "Loaded % rows" (count (at trades 'sym))))
 
 ; Benchmark
 (timeit (sum (til 10000000)))
@@ -511,8 +586,7 @@ Binary serialization for any Rayforce object. Useful for IPC, caching, and persi
 (de bytes)                   ; [1 2 3]
 
 ; Serialize a table for caching
-(write "cache.bin" (ser trades))
-(set cached (de (read "cache.bin")))
+(set cached (de (ser trades)))
 ```
 
 ## Storage
@@ -529,10 +603,12 @@ Persistent columnar storage — splayed (one file per column) and partitioned ta
 
 ```lisp
 ; Save and reload a splayed table
-(.db.splayed.set "db/trades" trades)
-(set t (.db.splayed.get "db/trades"))
+(.db.splayed.set "/tmp/rayforce-ref-trades" trades)
+(set t (.db.splayed.get "/tmp/rayforce-ref-trades"))
 (show t)
+```
 
+```text
 ; Load a date-partitioned table
 (set hist (.db.parted.get "db" 'trades))
 ```
@@ -553,7 +629,7 @@ TCP-based IPC for connecting to remote Rayforce instances. Uses binary serializa
 | `.ipc.on.async` | hook | user-settable | Intercepts async messages; return value ignored | `(set .ipc.on.async (fn [m] ...))` |
 | `.ipc.on.auth` | hook | user-settable | Narrows `-u`/`-U` auth; truthy = accept, falsy = reject | `(set .ipc.on.auth (fn [u p] (!= u "ban")))` |
 
-```lisp
+```text
 ; Connect to a remote Rayforce instance
 (set h (.ipc.open "localhost:5000"))
 (set result (.ipc.send h "(select {from: trades where: (> price 100)})"))
@@ -620,7 +696,7 @@ Low-level API for building and evaluating Datalog programs directly, bypassing t
 | `dl-stratify` | unary | — | Compute strata for the program (required before eval) | `(dl-stratify prog)` |
 | `dl-eval` | unary | — | Evaluate program to fixpoint (semi-naive iteration) | `(dl-eval prog)` |
 | `dl-query` | binary | — | Query a derived or base relation by name | `(dl-query prog 'path)` |
-| `dl-provenance` | binary | — | Get derivation provenance tracking for a relation | `(dl-provenance prog 'path)` |
+| `dl-provenance` | binary | — | Reserved provenance hook; currently returns `domain: not available` | `(dl-provenance prog 'path)` |
 
 ```lisp
 ; Build a Datalog program from a table
@@ -628,13 +704,10 @@ Low-level API for building and evaluating Datalog programs directly, bypassing t
 (set prog (dl-program))
 (dl-add-edb prog 'edge edges 2)
 
-; Add rules and evaluate
-(rule (path ?x ?y) (edge ?x ?y))
-(rule (path ?x ?z) (edge ?x ?y) (path ?y ?z))
+; Evaluate registered EDB tables
 (dl-stratify prog)
 (dl-eval prog)
 
 ; Query results
-(dl-query prog 'path)       ; all reachable pairs
-(dl-provenance prog 'path)  ; derivation tracking
+(dl-query prog 'edge)
 ```

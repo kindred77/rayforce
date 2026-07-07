@@ -52,10 +52,11 @@ Errors: `rank` (arity != 3 or 4), `type` (tbl not a table / column refs wrong ty
 
 ## `.graph.free` { #graph-free }
 
-Signature: `(.graph.free g)`. Releases the underlying CSR. Idempotent — a second call returns `type` (the `RAY_ATTR_GRAPH` bit is cleared on the first call), not a double-free.
+Signature: `(.graph.free g)`. Releases the underlying CSR. A second call returns a `type` error because the `RAY_ATTR_GRAPH` bit is cleared on the first call; it does not double-free.
 
 ```lisp
-(.graph.free g)
+(set gtmp (.graph.build edges 'src 'dst 'w))
+(.graph.free gtmp)
 ```
 
 ## `.graph.info` { #graph-info }
@@ -80,11 +81,11 @@ Errors: `rank`, `type`, `domain` (direction out of {0,1,2}).
 
 ## `.graph.var-expand` { #graph-var-expand }
 
-Signature: `(.graph.var-expand g src min-depth max-depth [direction] [track-path])`. BFS to between `min-depth` and `max-depth` hops, returning a node table. When `track-path` is true the per-node path is included as a list column. Depths are clamped to `[0, 255]` and `min-depth ≤ max-depth`.
+Signature: `(.graph.var-expand g src min-depth max-depth [direction] [track-path])`. BFS to between `min-depth` and `max-depth` hops, returning a node table. The current implementation returns endpoint/depth rows only; pass `track-path` as false or omit it. Depths are clamped to `[0, 255]` and `min-depth ≤ max-depth`.
 
 ```lisp
-;; All nodes 1..3 hops from node 2, both directions, paths tracked
-(.graph.var-expand g 2 1 3 2 1)
+;; All nodes 1..3 hops from node 2, both directions
+(.graph.var-expand g 2 1 3 2 0)
 ```
 
 ## `.graph.dfs` { #graph-dfs }

@@ -20,7 +20,7 @@ A CSR index consists of two arrays:
 
 Consider a graph with 4 nodes and 5 edges:
 
-```lisp
+```text
 ; Edges: 0->1, 0->2, 1->2, 2->3, 3->0
 
 offsets:  [0, 2, 3, 4, 5]      ; 5 entries (n_nodes + 1)

@@ -63,7 +63,7 @@ For one-off measurement, use the `timeit` builtin which returns elapsed time in 
 
 The REPL auto-detects incomplete expressions by tracking unmatched brackets `( [ {`. When the current input has unmatched openers, pressing Enter starts a continuation line instead of evaluating:
 
-```lisp
+```text
 ‣ (set double
     (fn [x]
       (* x 2)))

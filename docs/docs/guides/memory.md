@@ -48,14 +48,16 @@ sys-current     | 8388608
 ;; Snapshot before
 (set before (.sys.mem))
 
-;; Load a large CSV
-(set trades (.csv.read "trades-10M.csv"))
+;; Load a CSV
+(write "/tmp/rayforce-memory-trades.csv"
+  "sym,price,qty\nAAPL,150.0,100\nGOOG,280.0,50\n")
+(set trades (.csv.read "/tmp/rayforce-memory-trades.csv"))
 
 ;; Snapshot after
 (set after (.sys.mem))
 
 ;; See how much memory the load consumed
-(- (after 'bytes-allocated) (before 'bytes-allocated))
+(- (get after 'bytes-allocated) (get before 'bytes-allocated))
 ```
 
 ```text
@@ -120,7 +122,10 @@ The bar displays:
 ### Example Session
 
 ```lisp
-;; This query processes 50 million rows -- progress bar appears automatically
+;; A long-running version of this query shows the progress bar automatically
+(set trades (table [sym price]
+  (list [AAPL GOOG AAPL GOOG]
+        [150.0 280.0 151.0 282.0])))
 (select {from: trades
          by: {sym: sym}
          total: (sum price)
@@ -158,6 +163,9 @@ Wrap any expression in `(timeit ...)` to measure its execution time. It evaluate
 
 ```lisp
 ;; Time a grouped aggregation
+(set trades (table [sym price]
+  (list [AAPL GOOG AAPL GOOG]
+        [150.0 280.0 151.0 282.0])))
 (timeit (select {from: trades
                  by: {sym: sym}
                  n: (count price)}))
@@ -252,7 +260,8 @@ footprint (`bytes-allocated + direct-bytes` from `(.sys.mem)`) against
 ;; Live footprint as a percentage of physical RAM
 (set stats (.sys.mem))
 (set info (.sys.info))
-(* 100.0 (/ (+ (stats bytes-allocated) (stats direct-bytes)) (info total-mem)))
+(* 100.0 (/ (+ (get stats 'bytes-allocated) (get stats 'direct-bytes))
+            (get info 'total-mem)))
 ```
 
 ```text
@@ -271,13 +280,15 @@ begins spilling to disk.
 (set m0 (.sys.mem))
 
 ;; Load data
-(set trades (.csv.read "trades-50M.csv"))
+(write "/tmp/rayforce-memory-trades.csv"
+  "sym,price,qty,date\nAAPL,150.0,100,2024.01.15\nGOOG,280.0,50,2024.01.15\n")
+(set trades (.csv.read "/tmp/rayforce-memory-trades.csv"))
 
 ;; Check cost
 (set m1 (.sys.mem))
-(println (format "Loaded: {} bytes, peak: {} bytes"
-  (- (m1 bytes-allocated) (m0 bytes-allocated))
-  (m1 peak-bytes)))
+(println (format "Loaded: % bytes, peak: % bytes"
+  (- (get m1 'bytes-allocated) (get m0 'bytes-allocated))
+  (get m1 'peak-bytes)))
 ```
 
 ```text
@@ -290,7 +301,7 @@ Loaded: 4194304000 bytes, peak: 4831838208 bytes
 ;; First analysis pass
 (set result1 (select {from: trades
                        by: {date: date}
-                       vol: (sum qty)})
+                       vol: (sum qty)}))
 (.csv.write result1 "daily-volume.csv")
 (set result1 0)
 
@@ -305,7 +316,7 @@ Loaded: 4194304000 bytes, peak: 4831838208 bytes
 
 ### Pattern 3: Profile a Slow Query
 
-```lisp
+```text
 ;; Enable REPL profiling
 :timeit
 
@@ -317,7 +328,7 @@ Loaded: 4194304000 bytes, peak: 4831838208 bytes
 elapsed: 42.1ms
 ```
 
-```lisp
+```text
 (set grouped (select {from: filtered
                         by: {sym: sym}
                         avg_price: (avg price)
@@ -328,7 +339,7 @@ elapsed: 42.1ms
 elapsed: 203.7ms
 ```
 
-```lisp
+```text
 (set sorted (select {from: grouped by: {n: (desc n)}}))
 ```
 
@@ -336,7 +347,7 @@ elapsed: 203.7ms
 elapsed: 0.8ms
 ```
 
-```lisp
+```text
 ;; The group-by at 204ms is the bottleneck, not the filter (42ms) or sort (<1ms)
 :timeit
 ```
@@ -346,14 +357,18 @@ elapsed: 0.8ms
 ```lisp
 ;; Reset peak tracking with .sys.gc
 (.sys.gc)
-(set before-peak ((.sys.mem 0) peak-bytes))
+(set before-peak (get (.sys.mem) 'peak-bytes))
 
 ;; Run a memory-intensive join
-(set joined (select {from: trades join: quotes on: [sym time]}))
+(set quotes (table [sym time bid]
+  (list [AAPL GOOG]
+        [10 20]
+        [149.5 279.5])))
+(set joined (left-join [sym] trades quotes))
 
 ;; Check the peak
-(set after-peak ((.sys.mem 0) peak-bytes))
-(println (format "Join peak overhead: {} bytes"
+(set after-peak (get (.sys.mem) 'peak-bytes))
+(println (format "Join peak overhead: % bytes"
   (- after-peak before-peak)))
 ```
 

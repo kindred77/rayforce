@@ -162,7 +162,7 @@ As-of-join treats **NULL keys as never matching**:
 
 - A left row with a null in any equality key or in the time column is kept in the output (left-outer behaviour) but the right-side columns are explicitly null.
 - A right row with a null in any equality key or time column is skipped entirely during the merge walk — it cannot become the best match for any left row.
-- Right-side columns for unmatched rows are filled with null (null bit set on the destination vector), distinguishable from genuine zero values via `(nil? x)`.
+- Right-side columns for unmatched rows are filled with type-correct null sentinels and marked with the null hint, distinguishable from genuine zero values via `(nil? x)`.
 
 This means a null time in the left table is never silently treated as time zero, and two null sym keys on opposite sides do not merge into a spurious match.
 
@@ -205,16 +205,21 @@ Window join with per-row time intervals. `intervals` is a list of two vectors `[
 
 ```lisp
 (set n 100000)
+(set tsym (take [AAPL MSFT] n))
+(set ttime (+ 09:00:00 (as 'TIME (/ (* (til n) 3) 10))))
+(set bsym (take [AAPL MSFT GOOG] (* 2 n)))
+(set btime (+ 09:00:00 (as 'TIME (/ (* (til (* 2 n)) 2) 10))))
+(set bid (+ 8 (/ (til (* 2 n)) 2)))
+(set ask (+ 12 (/ (til (* 2 n)) 2)))
 (set trades (table [Sym Ts Price]
     (list tsym ttime (+ 10 (til n)))))
 (set quotes (table [Sym Ts Bid Ask]
     (list bsym btime bid ask)))
 
-; Build intervals as two vectors (lo, hi) from the trades timestamp
-(set lo (+ (at trades 'Ts) -1000))
-(set hi (+ (at trades 'Ts)  1000))
+; Build intervals from the trades timestamp
+(set intervals (map-left + [-1000 1000] (at trades 'Ts)))
 
-(window-join [Sym Ts] (list lo hi) trades quotes
+(window-join [Sym Ts] intervals trades quotes
     {bid: (min Bid) ask: (max Ask)})
 ```
 

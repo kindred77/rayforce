@@ -205,7 +205,9 @@ The distinct values of `Side` become column headers. You can use any aggregation
 Load a CSV file with automatic type inference and parallel parsing:
 
 ```lisp
-(set data (.csv.read "trades.csv"))
+(write "/tmp/rayforce-tutorial-trades.csv"
+  "Symbol,Price,Qty\nAAPL,150.0,100\nGOOG,280.0,200\nMSFT,420.0,50\n")
+(set data (.csv.read "/tmp/rayforce-tutorial-trades.csv"))
 ```
 
 The first row is treated as column headers. Types are inferred from the data: integers, floats, dates, times, timestamps, and symbols are all detected automatically.

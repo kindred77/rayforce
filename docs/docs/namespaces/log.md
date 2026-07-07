@@ -35,7 +35,8 @@ Opens the journal **for append only** — it does not load a snapshot or replay 
 Errors: `rank` (arity != 2), `type` (mode not a sym / base not a string), `domain` (unknown mode), `io` (open failed).
 
 ```lisp
-(.log.open 'async "/var/lib/rayforce/journal")
+(.log.open 'async "/tmp/rayforce-journal")
+(.log.close)
 ```
 
 The server CLI flags `-l` (async) and `-L` (sync) open the journal at startup and, unlike the bare verb, additionally load the latest snapshot and replay the log first — a full crash-recovery, then open-for-append.
@@ -47,7 +48,7 @@ Signature: `(.log.write expr)`. Serialises `expr` and appends a frame to the ope
 Errors: `noopen` (no journal active — surfaced explicitly so callers don't believe a no-op succeeded), `type` (no arg), `domain` (`expr` has zero serialised size), `oom`, `io`. Lazy values are forced before serialisation.
 
 ```lisp
-(.log.open 'async "/tmp/j")
+(.log.open 'async "/tmp/rayforce-journal")
 (.log.write 42)
 (.log.write [1 2 3 4 5])
 (.log.close)
@@ -83,8 +84,8 @@ Errors are precise enough to distinguish recovery strategies:
 | `oom` / `io` | Resource exhaustion / read failure. | Retry. |
 
 ```lisp
-(.log.replay "/var/lib/rayforce/journal.log")
-;; => 1247   (chunks replayed)
+(.log.replay "/tmp/rayforce-journal.log")
+;; => 2   (chunks replayed)
 ```
 
 ## `.log.validate` { #log-validate }
@@ -92,8 +93,8 @@ Errors are precise enough to distinguish recovery strategies:
 Signature: `(.log.validate "path")`. Scans the file framing-only — does not deserialise payloads. Returns a 2-list `(chunks valid_bytes)` where `valid_bytes` is the offset at which framing breaks (= file size if intact).
 
 ```lisp
-(.log.validate "/var/lib/rayforce/journal.log")
-;; => (1247 524288)
+(.log.validate "/tmp/rayforce-journal.log")
+;; => (2 92)
 ```
 
 ## `.log.close` { #log-close }

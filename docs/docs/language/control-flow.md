@@ -22,7 +22,7 @@ Without an else branch, `if` returns `0`:
 
 `do` evaluates expressions in order and returns the last result. `let` bindings inside `do` are scoped to that block:
 
-```lisp
+```text
 ‣ (do
     (set x 10)
     (set y 20)
@@ -147,14 +147,14 @@ Null rules:
 
 ```lisp
 ‣ (nil? 0Nl)
-true
+; => true
 
 ‣ (+ 0Nl 1)
-0Nl
+; => 0Nl
 
 ‣ (nil? (println "hello"))
-hello
-true
+; prints: hello
+; => true
 ```
 
 ## Higher-Order Functions
@@ -164,21 +164,21 @@ Lambdas are auto-mapped over vectors when called directly. Use `map` for explici
 ```lisp
 ;; map applies a function to each element, returning a list
 ‣ (map (fn [x] (* x x)) [1 2 3 4 5])
-(1 4 9 16 25)
+; => (1 4 9 16 25)
 
 ;; lambdas auto-map over vectors
 ‣ ((fn [x] (* x x)) (til 5))
-[0 1 4 9 16]
+; => [0 1 4 9 16]
 
 ;; fold reduces a vector with a binary function
 ‣ (fold + 0 (til 10))
-45
+; => 45
 
 ;; scan produces running accumulations
 ‣ (scan + [1 2 3 4 5])
-[1 3 6 10 15]
+; => [1 3 6 10 15]
 
 ;; where returns indices matching a condition
 ‣ (where (> (til 10) 3))
-[4 5 6 7 8 9]
+; => [4 5 6 7 8 9]
 ```

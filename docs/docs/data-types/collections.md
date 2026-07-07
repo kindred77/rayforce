@@ -46,21 +46,17 @@ while (ray_morsel_next(&m)) {
 
 ### Null Handling
 
-Nulls are tracked via a per-vector bitmap, not sentinel values in the data array. This means operations can use fast SIMD loops on the data and only check the null bitmap when needed.
+Null state is encoded in-band via a type-correct sentinel in the payload:
+`INT64_MIN` for `i64`, `NaN` for `f64`, `INT32_MIN` for `i32`/`date`/`time`,
+and so on. `RAY_ATTR_HAS_NULLS` is a fast "may contain nulls" hint; when it is
+clear, null-aware code paths are skipped entirely.
 
 ```c
-// C API: null bitmap
+// C API: null state
 ray_vec_set_null(vec, 3, true);   // mark index 3 as null
 ray_vec_is_null(vec, 3);           // returns true
 ray_vec_is_null(vec, 0);           // returns false
 ```
-
-Null state is not a separate bitmap: it is encoded in-band as a
-type-correct reserved sentinel in the payload itself — `INT64_MIN` for
-`i64`, `NaN` for `f64`, `INT32_MIN` for `i32`/`date`/`time`, and so on
-(see `src/vec/vec.c`). The `RAY_ATTR_HAS_NULLS` flag on the vector is a
-fast "may contain nulls" hint — when it is clear, null-aware code paths
-are skipped entirely.
 
 ### COW Semantics
 
@@ -99,11 +95,11 @@ Lists are boxed, heterogeneous containers. Each element is a `ray_t*` pointer to
 ```lisp
 ; Create a list of mixed vectors
 ray> (list [1 2 3] [A B C])
-([1 2 3] [A B C])
+; => ([1 2 3] [A B C])
 
 ; Lists can hold any type
 ray> (list 42 "hello" [1 2])
-(42 "hello" [1 2])
+; => (42 "hello" [1 2])
 ```
 
 ```c
@@ -124,18 +120,9 @@ A table is a collection of named column vectors, all the same length. Tables are
 ```lisp
 ; Create a table with column names and data
 ray> (set t (table [sym price qty] (list [AAPL GOOG MSFT] [150.0 140.0 380.0] [100 200 50])))
-sym  price  qty
------------------
-AAPL 150.0  100
-GOOG 140.0  200
-MSFT 380.0   50
 
 ; Query with select
 ray> (select {from:t where: (> price 145.0)})
-sym  price  qty
------------------
-AAPL 150.0  100
-MSFT 380.0   50
 ```
 
 ### Internal Structure
@@ -172,7 +159,7 @@ Dictionaries share the same physical layout as tables — a 2-pointer block (`ty
 
 Supported *keys* shapes:
 
-- A typed vector — any of `RAY_SYM`, `RAY_BOOL`, `RAY_U8`, `RAY_I16`, `RAY_I32`, `RAY_I64`, `RAY_F32`, `RAY_F64`, `RAY_DATE`, `RAY_TIME`, `RAY_TIMESTAMP`, `RAY_STR`, `RAY_GUID`.  Lookup is value-equality; the keys' null bitmap is honored so `0Nl` doesn't collide with a real `0`.
+- A typed vector — any of `RAY_SYM`, `RAY_BOOL`, `RAY_U8`, `RAY_I16`, `RAY_I32`, `RAY_I64`, `RAY_F32`, `RAY_F64`, `RAY_DATE`, `RAY_TIME`, `RAY_TIMESTAMP`, `RAY_STR`, `RAY_GUID`.  Lookup is value-equality; sentinel nulls are honored so `0Nl` doesn't collide with a real `0`.
 - A `RAY_LIST` of boxed atoms — used for heterogeneous keys (the only shape that can hold both `'sym` and `"str"` keys in the same dict).  Lookup falls back to `atom_eq`.
 
 Supported *vals* shapes:
@@ -202,7 +189,8 @@ Dictionaries are used extensively in Rayfall for passing named arguments to quer
 
 ```lisp
 ; The select argument is a dictionary
-ray> (select {from:t where: (> x 1) x:x x2: (* x x)})
+ray> (set t2 (table [x y] (list [1 2 3] [A B C])))
+ray> (select {from:t2 where: (> x 1) x:x x2: (* x x)})
 ```
 
 ## Selection Bitmaps (RAY_SEL)

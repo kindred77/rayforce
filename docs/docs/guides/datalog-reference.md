@@ -26,6 +26,12 @@ Use `(datoms)` to create an empty EAV database, then `(assert-fact db entity att
 (set db (assert-fact db 1 'name 'Alice))
 (set db (assert-fact db 1 'dept 'Engineering))
 (set db (assert-fact db 1 'salary 80000))
+(set db (assert-fact db 2 'name 'Bob))
+(set db (assert-fact db 2 'dept 'Sales))
+(set db (assert-fact db 2 'salary 60000))
+(set db (assert-fact db 3 'name 'Charlie))
+(set db (assert-fact db 3 'dept 'Engineering))
+(set db (assert-fact db 3 'salary 90000))
 ```
 
 Each call to `assert-fact` returns a new database with the triple added. The underlying storage is a three-column table `[e, a, v]` backed by Rayforce's columnar vectors.
@@ -64,7 +70,7 @@ Entity 3 salary:
 
 Rules define derived relations. A rule has a **head** (the relation being defined) and a **body** (the conditions that must hold):
 
-```lisp
+```text
 (rule (head ?vars...)
   ;; body clauses — all must be satisfied
   (?e :attr ?v)
@@ -95,10 +101,11 @@ Employees (via rule):
 │ ?n  │              ?d               │
 │ I64 │              I64              │
 ├─────┼───────────────────────────────┤
-│ 158 │ 161                           │
-│ 159 │ 162                           │
+│ 340 │ 342                           │
+│ 344 │ 345                           │
+│ 346 │ 342                           │
 ├─────┴───────────────────────────────┤
-│ 2 rows (2 shown) 2 columns (2 shown)│
+│ 3 rows (3 shown) 2 columns (2 shown)│
 └─────────────────────────────────────┘
 ```
 
@@ -116,7 +123,7 @@ Define multiple rules with the **same head** to express disjunction (OR). Each r
 
 Queries retrieve data from the datoms database using pattern matching. The syntax is:
 
-```lisp
+```text
 (query db (find ?vars...) (where clauses...))
 ```
 
@@ -136,9 +143,9 @@ The `find` clause specifies which variables to return. The `where` clause contai
 │ ?e  │              ?n               │
 │ I64 │              I64              │
 ├─────┼───────────────────────────────┤
-│ 1   │ 158                           │
-│ 2   │ 159                           │
-│ 3   │ 160                           │
+│ 1   │ 340                           │
+│ 2   │ 344                           │
+│ 3   │ 346                           │
 ├─────┴───────────────────────────────┤
 │ 3 rows (3 shown) 2 columns (2 shown)│
 └─────────────────────────────────────┘
@@ -162,9 +169,9 @@ When multiple patterns share a variable, Rayforce compiles them into a join:
 │ ?n  │              ?d               │
 │ I64 │              I64              │
 ├─────┼───────────────────────────────┤
-│ 158 │ 162                           │
-│ 159 │ 163                           │
-│ 160 │ 162                           │
+│ 340 │ 342                           │
+│ 344 │ 345                           │
+│ 346 │ 342                           │
 ├─────┴───────────────────────────────┤
 │ 3 rows (3 shown) 2 columns (2 shown)│
 └─────────────────────────────────────┘
@@ -186,8 +193,8 @@ Use a literal value instead of a variable to filter by a specific attribute valu
 │ ?e  │              ?n               │
 │ I64 │              I64              │
 ├─────┼───────────────────────────────┤
-│ 1   │ 158                           │
-│ 3   │ 160                           │
+│ 1   │ 340                           │
+│ 3   │ 346                           │
 ├─────┴───────────────────────────────┤
 │ 2 rows (2 shown) 2 columns (2 shown)│
 └─────────────────────────────────────┘
@@ -248,7 +255,7 @@ Use `(not (pattern))` in a `where` clause to exclude entities matching a pattern
 │ ?e  │              ?n               │
 │ I64 │              I64              │
 ├─────┼───────────────────────────────┤
-│ 2   │ 159                           │
+│ 2   │ 344                           │
 ├─────┴───────────────────────────────┤
 │ 1 rows (1 shown) 2 columns (2 shown)│
 └─────────────────────────────────────┘
@@ -287,10 +294,10 @@ The real power of Datalog is **recursive rules**. Define a rule that references 
 │ I64 │              I64              │
 ├─────┼───────────────────────────────┤
 │ 1   │ 2                             │
-│ 1   │ 3                             │
 │ 2   │ 3                             │
-│ 2   │ 4                             │
 │ 3   │ 4                             │
+│ 1   │ 3                             │
+│ 2   │ 4                             │
 │ 1   │ 4                             │
 ├─────┴───────────────────────────────┤
 │ 6 rows (6 shown) 2 columns (2 shown)│
@@ -334,9 +341,9 @@ Pull queries provide **entity-centric retrieval** — given an entity ID, return
 
 ```text
 Pull all attributes for entity 1:
-{name:158 dept:160 salary:80000}
+{name:340 dept:342 salary:80000 manager:354}
 Pull name + salary for entity 2:
-{name:162 salary:60000}
+{name:344 salary:60000}
 ```
 
 Pull returns a dict keyed by attribute symbol. Symbol attribute values appear as intern IDs — use `(sym-name id)` to convert them to readable names. Non-symbol values (like `salary`) are stored verbatim.
@@ -349,15 +356,14 @@ EAV queries and pull results store symbol values as integer intern IDs for effic
 ;; Get the intern ID from a pull result
 (set p (pull db 1))
 (set name-id (get p 'name))  ;; index the dict by attribute key, not position
-(println name-id)            ;; => 158 (intern ID)
+(println name-id)            ;; => 340 (intern ID)
 (println (sym-name name-id)) ;; => 'Alice
 ```
 
 **Verified output**:
 
 ```text
-{name:158 dept:160}
-158
+340
 'Alice
 ```
 
@@ -374,7 +380,7 @@ For advanced use cases, Rayforce provides a programmatic Datalog API that gives 
 | `(dl-stratify prog)` | Compute evaluation strata for the program |
 | `(dl-eval prog)` | Evaluate the program to fixpoint |
 | `(dl-query prog 'pred)` | Retrieve the result table for a predicate |
-| `(dl-provenance prog 'pred)` | Get provenance information for derived facts |
+| `(dl-provenance prog 'pred)` | Reserved provenance hook; currently returns `domain: not available` |
 
 ### Example
 
@@ -426,8 +432,8 @@ Use `(retract-fact db entity attr value)` to remove a triple from the datoms dat
 │ ?e  │              ?n               │
 │ I64 │              I64              │
 ├─────┼───────────────────────────────┤
-│ 1   │ 158                           │
-│ 3   │ 164                           │
+│ 1   │ 340                           │
+│ 3   │ 346                           │
 ├─────┴───────────────────────────────┤
 │ 2 rows (2 shown) 2 columns (2 shown)│
 └─────────────────────────────────────┘
@@ -571,9 +577,9 @@ Running `./rayforce examples/rfl/datalog.rfl` produces:
 │ ?e  │              ?n               │
 │ I64 │              I64              │
 ├─────┼───────────────────────────────┤
-│ 1   │ 158                           │
-│ 2   │ 162                           │
-│ 3   │ 164                           │
+│ 1   │ 340                           │
+│ 2   │ 344                           │
+│ 3   │ 346                           │
 ├─────┴───────────────────────────────┤
 │ 3 rows (3 shown) 2 columns (2 shown)│
 └─────────────────────────────────────┘
@@ -582,9 +588,9 @@ Running `./rayforce examples/rfl/datalog.rfl` produces:
 │ ?n  │              ?d               │
 │ I64 │              I64              │
 ├─────┼───────────────────────────────┤
-│ 158 │ 160                           │
-│ 162 │ 163                           │
-│ 164 │ 160                           │
+│ 340 │ 342                           │
+│ 344 │ 345                           │
+│ 346 │ 342                           │
 ├─────┴───────────────────────────────┤
 │ 3 rows (3 shown) 2 columns (2 shown)│
 └─────────────────────────────────────┘
@@ -593,8 +599,8 @@ Running `./rayforce examples/rfl/datalog.rfl` produces:
 │ ?e  │              ?n               │
 │ I64 │              I64              │
 ├─────┼───────────────────────────────┤
-│ 1   │ 158                           │
-│ 3   │ 164                           │
+│ 1   │ 340                           │
+│ 3   │ 346                           │
 ├─────┴───────────────────────────────┤
 │ 2 rows (2 shown) 2 columns (2 shown)│
 └─────────────────────────────────────┘
@@ -614,9 +620,9 @@ Running `./rayforce examples/rfl/datalog.rfl` produces:
 │ ?n  │              ?d               │
 │ I64 │              I64              │
 ├─────┼───────────────────────────────┤
-│ 158 │ 160                           │
-│ 162 │ 163                           │
-│ 164 │ 160                           │
+│ 340 │ 342                           │
+│ 344 │ 345                           │
+│ 346 │ 342                           │
 ├─────┴───────────────────────────────┤
 │ 3 rows (3 shown) 2 columns (2 shown)│
 └─────────────────────────────────────┘
@@ -625,7 +631,7 @@ Running `./rayforce examples/rfl/datalog.rfl` produces:
 │ ?e  │              ?n               │
 │ I64 │              I64              │
 ├─────┼───────────────────────────────┤
-│ 2   │ 162                           │
+│ 2   │ 344                           │
 ├─────┴───────────────────────────────┤
 │ 1 rows (1 shown) 2 columns (2 shown)│
 └─────────────────────────────────────┘
@@ -635,29 +641,29 @@ Running `./rayforce examples/rfl/datalog.rfl` produces:
 │ I64 │              I64              │
 ├─────┼───────────────────────────────┤
 │ 1   │ 2                             │
-│ 1   │ 3                             │
 │ 2   │ 3                             │
-│ 2   │ 4                             │
 │ 3   │ 4                             │
+│ 1   │ 3                             │
+│ 2   │ 4                             │
 │ 1   │ 4                             │
 ├─────┴───────────────────────────────┤
 │ 6 rows (6 shown) 2 columns (2 shown)│
 └─────────────────────────────────────┘
 --- Pull entity 1 (all attributes) ---
-{name:158 dept:160 salary:80000 manager:172}
+{name:340 dept:342 salary:80000 manager:354}
 --- Pull entity 2 (name + salary only) ---
-{name:162 salary:60000}
+{name:344 salary:60000}
 --- sym-name: convert intern IDs ---
-158
+340
 'Alice
 --- Before retract ---
 ┌─────┬───────────────────────────────┐
 │ ?e  │              ?n               │
 │ I64 │              I64              │
 ├─────┼───────────────────────────────┤
-│ 1   │ 158                           │
-│ 2   │ 162                           │
-│ 3   │ 164                           │
+│ 1   │ 340                           │
+│ 2   │ 344                           │
+│ 3   │ 346                           │
 ├─────┴───────────────────────────────┤
 │ 3 rows (3 shown) 2 columns (2 shown)│
 └─────────────────────────────────────┘
@@ -666,8 +672,8 @@ Running `./rayforce examples/rfl/datalog.rfl` produces:
 │ ?e  │              ?n               │
 │ I64 │              I64              │
 ├─────┼───────────────────────────────┤
-│ 1   │ 158                           │
-│ 3   │ 164                           │
+│ 1   │ 340                           │
+│ 3   │ 346                           │
 ├─────┴───────────────────────────────┤
 │ 2 rows (2 shown) 2 columns (2 shown)│
 └─────────────────────────────────────┘
@@ -688,4 +694,4 @@ Running `./rayforce examples/rfl/datalog.rfl` produces:
 
 !!! note "Note"
 
-    Symbol intern IDs (like 158 for `'Alice`) are assigned at runtime and may differ between sessions. The row counts and structure are stable. Use `(sym-name id)` to convert any intern ID back to its readable symbol name.
+    Symbol intern IDs (like 340 for `'Alice` in the sample above) are assigned at runtime and may differ between sessions. The row counts and structure are stable. Use `(sym-name id)` to convert any intern ID back to its readable symbol name.

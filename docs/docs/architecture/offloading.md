@@ -97,13 +97,19 @@ The complementary **allocator-side** mechanism is the [file-backed pool fallback
 Consider a partitioned table of trade data with daily partitions spanning a year (365 partitions, each with millions of rows). A query that filters by date and aggregates by symbol:
 
 ```lisp
+; Small verified partitioned fixture
+(set dbroot "/tmp/rayforce-offload-db")
+(set symfile (format "%/.sym" dbroot))
+(set jun01 (table [sym price] (list [AAPL GOOG] [150.5 2800.0])))
+(set jun02 (table [sym price] (list [MSFT] [410.0])))
+(.db.splayed.set (format "%/2024.06.01/trades" dbroot) jun01 symfile)
+(.db.splayed.set (format "%/2024.06.02/trades" dbroot) jun02 symfile)
+
 ; Load the partitioned table (zero-copy, segments stay on disk)
-(set trades (read-parted "db" "trades"))
+(set trades (.db.parted.get dbroot 'trades))
 
 ; Filter by date and select columns
-(select trades
-  (where (>= date 2024.06.01))
-  [sym price])
+(select {from: trades where: (>= date 2024.06.01) sym: sym price: price})
 ```
 
 What happens internally:

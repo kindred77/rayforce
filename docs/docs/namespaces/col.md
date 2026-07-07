@@ -72,7 +72,7 @@ Slice-aware: if `v` is a slice into a linked parent, `.col.target` reads the par
 ```lisp
 (.col.target linked)            ;; => 'custs
 (.col.target rids)              ;; => null
-(.col.target (take 2 linked))   ;; => 'custs  (slice inherits)
+(.col.target (take linked 2))   ;; => 'custs  (slice inherits)
 ```
 
 ## See also

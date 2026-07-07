@@ -80,8 +80,8 @@ Defaults: `metric='cosine`, `M=16`, `ef_construction=200`. The returned handle i
 ### Persistence & Lifecycle
 
 ```lisp
-(hnsw-save idx "/var/index/docs")
-(set idx2 (hnsw-load "/var/index/docs"))
+(hnsw-save idx "/tmp/rayforce-docs-hnsw")
+(set idx2 (hnsw-load "/tmp/rayforce-docs-hnsw"))
 (hnsw-info idx2)     ; dict: {nrows dim metric nlayers M efc}
 (hnsw-free idx2)     ; optional — rc-managed, will free on scope exit too
 ```

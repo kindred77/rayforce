@@ -73,7 +73,7 @@ Float blocks work too, as long as the layout holds:
 
 `.attr.set` is a *checked assertion*, not a hint.  It scans the column and errors if the property does not hold — so any consumer downstream can trust the stamp without re-verifying.
 
-```lisp
+```text
 (.attr.set 'sorted [3 1 2])     ; ⇒ error (domain): not non-descending
 (.attr.set 'unique [1 2 2 4])   ; ⇒ error (domain): duplicate
 (.attr.set 'parted [1 2 1 2])   ; ⇒ error (domain): not block-laid-out
@@ -81,7 +81,7 @@ Float blocks work too, as long as the layout holds:
 
 An unknown attribute name is rejected the same way:
 
-```lisp
+```text
 (.attr.set 'bogus [1 2 3])      ; ⇒ error (domain): unknown attribute
 ```
 
@@ -151,6 +151,10 @@ For a partitioned join `(asof-join [Key Time] L R)`, if the single numeric equal
     (list (.attr.set 'parted [1 1 2 2])
           [10:00:01.000 10:00:03.000 10:00:01.000 10:00:02.000]
           [1.0 2.0 3.0 4.0])))
+(set Rgp (table [ID Time Bid]
+    (list (.attr.set 'parted [1 1 2 2])
+          [10:00:00.000 10:00:02.000 10:00:00.000 10:00:01.000]
+          [0.9 1.8 2.9 3.8])))
 (asof-join [ID Time] Lgp Rgp)
 ```
 

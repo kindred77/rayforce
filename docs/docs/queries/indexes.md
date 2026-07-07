@@ -48,13 +48,13 @@ Match the shape of your *query*, not the shape of the data.
 | Query shape | Kind | Active now |
 |---|---|---|
 | Constant predicate may fall outside the column's value range | `.idx.zone` | Yes — O(1) all/none short-circuit at the filter site |
-| Repeated `=` / `in` / `find` | `.idx.hash` | Yes — O(matches) hash probe at filter EQ, filter IN, and find sites |
+| Repeated `==` / `in` / `find` | `.idx.hash` | Yes — O(matches) hash probe at filter EQ, filter IN, and find sites |
 | Range queries, sorted output | `.idx.sort` | Yes — binary search at filter range site; permutation reuse at ORDER BY and distinct |
 | Cheap probabilistic membership rejection | `.idx.bloom` | Yes — definite-absent proof at filter EQ site (integer-family only) |
 
 ## Why Per-Column Indexes
 
-Rayforce's hot path is morsel-driven columnar execution — every operator scans 1024-element chunks of contiguous values.  That's already fast for full-column work, but it's still O(n) for needle-in-haystack queries: `filter (= col 42)` visits every row even when only one matches, `(in col big-set)` builds a rowsel from a full scan, `(find col k)` linear-scans.
+Rayforce's hot path is morsel-driven columnar execution — every operator scans 1024-element chunks of contiguous values.  That's already fast for full-column work, but it's still O(n) for needle-in-haystack queries: `filter (== col 42)` visits every row even when only one matches, `(in col big-set)` builds a rowsel from a full scan, `(find col k)` linear-scans.
 
 An **accelerator index** is a precomputed data structure attached to the column itself.  The user pays the build cost once; subsequent queries against that column consult the index instead of the raw values at the applicable routing sites.
 
@@ -175,7 +175,7 @@ The original column is unchanged; the sort lives in a row-id permutation alongsi
 ; ⇒ {kind:zone length:5 parent_type:5 saved_attrs:0 min:21 max:42 n_nulls:0}
 ```
 
-A predicate like `(= ages 17)` falls outside `[21, 42]`; the executor short-circuits to 0 rows without scanning.  A predicate like `(>= ages 1)` sees every row must pass and returns the full table without scanning.
+A predicate like `(== ages 17)` falls outside `[21, 42]`; the executor short-circuits to 0 rows without scanning.  A predicate like `(>= ages 1)` sees every row must pass and returns the full table without scanning.
 
 ## Performance Characteristics
 

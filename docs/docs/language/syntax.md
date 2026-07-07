@@ -31,8 +31,8 @@ Atoms are scalar values. Rayfall supports a wide range of types, each with a dis
 ### Booleans
 
 ```lisp
-true        ; boolean true (1b)
-false       ; boolean false (0b)
+true        ; boolean true
+false       ; boolean false
 ```
 
 ### Symbols
@@ -92,7 +92,7 @@ Full date+time with nanosecond precision. Stored as nanoseconds since 2000-01-01
 
 The date and time parts follow the same range rules as above. Because the
 value is a 64-bit nanosecond count from the epoch, timestamps only span
-roughly ±292 years around 2000 (about 1708 to 2262); a year outside that
+roughly ±292 years around 2000 (about 1708 to 2292); a year outside that
 range is a parse error.
 
 ### GUIDs
@@ -100,7 +100,7 @@ range is a parse error.
 128-bit globally unique identifiers.
 
 ```lisp
-(guid 0)   ; generate a new GUID
+(guid 1)   ; generate one GUID
 ```
 
 ### Null Values
@@ -119,7 +119,7 @@ sentinel for their type:
 0Nd   ; date null
 0Nt   ; time null
 0Np   ; timestamp null
-(nil? x)   ; true if x is null
+(nil? 0Nl)   ; true
 ```
 
 Symbols have no typed null literal (there is no `0Ns`).
@@ -249,6 +249,7 @@ Line comments start with a semicolon and extend to the end of the line:
 Evaluates the condition and returns the true or false branch. Supports `if/then/else` chaining:
 
 ```lisp
+(set x 75)
 (if (> x 0) "positive" "non-positive")
 
 ; Multi-branch
@@ -293,7 +294,7 @@ cfg.db.host      ; "localhost"
 ; Deleting a leaf cascades: cfg.db becomes empty, then cfg.db is itself removed
 (del cfg.db.host)
 (del cfg.db.port)
-cfg.db           ; error — cleaned up after last leaf went away
+(nil? (resolve 'cfg.db))   ; true
 ```
 
 When a dotted path lands on a **temporal** value (DATE / TIME / TIMESTAMP atom or vector), the trailing segment dispatches through the temporal extraction API instead of looking for a dict key. This lets you reach calendar fields uniformly:
@@ -311,8 +312,10 @@ ds.yyyy          ; [2024 2024 2024]
 ds.doy           ; [1 167 366]
 
 ; Inside a table, col.yyyy resolves against the column vector
-(select {from: trades by: Ts.date})   ; group by day
-(select {from: trades by: Ts.hh})     ; group by hour of day
+(set ts_table (table [Ts]
+  (list [2024.01.01D10:00:00.000 2024.01.01D11:00:00.000])))
+(select {from: ts_table by: Ts.date})   ; group by day
+(select {from: ts_table by: Ts.hh})     ; group by hour of day
 ```
 
 Recognised temporal segments: `yyyy`, `mm`, `dd`, `hh`, `minute`, `ss`, `dow`, `doy`, plus the two truncations `date` (drop time-of-day) and `time` (drop date). Null input rows propagate to null output rows — the null sentinel bit pattern is not decoded as a bogus calendar value.
@@ -330,7 +333,7 @@ Symbols whose name starts with `.` are a reserved system namespace populated at 
 
 Every `.`-prefixed name is protected: `set`, `let`, lambda parameters, and `del` all refuse such names with `error: reserve`. This keeps user code from shadowing the builtin surface, regardless of where it's bound.
 
-```lisp
+```text
 (set .os.foo 1)        ; error: reserve
 (let .sys.gc 99)       ; error: reserve
 ((fn [.sys.gc] .sys.gc) 7)  ; error: reserve (lambda parameter name)
@@ -344,7 +347,8 @@ Every `.`-prefixed name is protected: `set`, `let`, lambda parameters, and `del`
   (raise "oops")     ; throws an error
   (fn [e] "caught")) ; handler receives error → "caught"
 
-(raise "custom error") ; throw an error
+; Unhandled raise:
+; (raise "custom error") ; error: domain
 ```
 
 ## Lambdas & the VM

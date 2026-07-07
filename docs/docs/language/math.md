@@ -156,6 +156,7 @@ Check if each element of a vector is within a range (inclusive). The second argu
 Logical AND. Works on booleans and boolean vectors.
 
 ```lisp
+(set x 5)
 (and (> x 0) (< x 10))
 ```
 
@@ -164,6 +165,7 @@ Logical AND. Works on booleans and boolean vectors.
 Logical OR.
 
 ```lisp
+(set x 5)
 (or (== x 0) (== x 10))
 ```
 
@@ -296,20 +298,21 @@ Return indices that would sort the vector descending (grade down).
 (idesc [30 10 20])  ; [0 2 1]
 ```
 
-### `(xasc col table)`
+### `(xasc table col)`
 
 Sort a table ascending by the named column.
 
 ```lisp
-(xasc 'price trades)
+(set trades (table [sym price] (list [AAPL GOOG AAPL] [150.0 280.0 151.0])))
+(xasc trades 'price)
 ```
 
-### `(xdesc col table)`
+### `(xdesc table col)`
 
 Sort a table descending by the named column.
 
 ```lisp
-(xdesc 'price trades)
+(xdesc trades 'price)
 ```
 
 ### `(xrank n x)`

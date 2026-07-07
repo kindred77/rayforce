@@ -71,6 +71,16 @@ Aggregation functions are marked **aggr** and reduce vectors to scalar values. U
 | `first` | unary | First element of vector | `(first [10 20 30])` → `10` |
 | `last` | unary | Last element of vector | `(last [10 20 30])` → `30` |
 
+The examples below use this small in-memory table:
+
+```lisp
+(set trades (table [sym price size time]
+  (list [AAPL GOOG AAPL]
+        [150.0 280.0 151.0]
+        [100 50 200]
+        [10 20 15])))
+```
+
 ```lisp
 ; Group-by aggregation example
 (select {from: trades
@@ -133,8 +143,8 @@ Operations on vectors as collections.
 | `iasc` | unary | Indices that would sort ascending | `(iasc [30 10 20])` → `[1 2 0]` |
 | `idesc` | unary | Indices that would sort descending | `(idesc [30 10 20])` → `[0 2 1]` |
 | `rank` | unary | Rank of each element | `(rank [30 10 20])` → `[2 0 1]` |
-| `xasc` | binary | Sort table ascending by column(s) | `(xasc 'price trades)` |
-| `xdesc` | binary | Sort table descending by column(s) | `(xdesc 'price trades)` |
+| `xasc` | binary | Sort table ascending by column(s) | `(xasc trades 'price)` |
+| `xdesc` | binary | Sort table descending by column(s) | `(xdesc trades 'price)` |
 | `xrank` | binary | Assign rank buckets (quantiles) | `(xrank 4 [10 20 30 40])` → `[0 1 2 3]` |
 
 ## Table Operations
@@ -186,7 +196,7 @@ These are **special forms** that bridge to the Rayforce DAG executor.
 
 ```lisp
 ; Append a row to a table
-(insert 'trades (list 'AAPL 150.0 100))
+(insert 'trades (list 'AAPL 150.0 100 12))
 
 ; Vector / list operations
 (set v (til 5))               ; [0 1 2 3 4]
@@ -211,22 +221,36 @@ Rayforce supports four join types, all with time-series-aware semantics.
 | `asof-join` | variadic | As-of join — match the most recent preceding value. |
 
 ```lisp
+; Fixtures for join examples
+(set trades_j (table [sym price size time]
+  (list [AAPL GOOG AAPL]
+        [150.0 280.0 151.0]
+        [100 50 200]
+        [10 20 15])))
+(set quotes (table [sym time bid]
+  (list [AAPL GOOG AAPL]
+        [9 19 16]
+        [149.5 279.5 150.5])))
+(set orders (table [product_id qty] (list [10 20 10] [2 1 5])))
+(set products (table [product_id name] (list [10 20] [widget gadget])))
+
 ; Left join two tables on the sym column (join keys are a symbol list)
-(left-join trades quotes [sym])
+(left-join trades_j quotes [sym])
 
 ; Inner join
 (inner-join orders products [product_id])
 
 ; Window join: keys are [equality-keys... time-key]; intervals is
-; (list lo-vec hi-vec) with one [lo hi] window bound per left row.
+; a two-vector list with one [lo hi] window bound per left row.
 ; For each left row, aggregate the right rows whose time key falls in the window.
+(set intervals (map-left + [-2 2] (at trades_j 'time)))
 (window-join [sym time]
-             (list [8 18] [12 22])
-             trades quotes
+             intervals
+             trades_j quotes
              {avg_bid: (avg bid)})
 
 ; As-of join: keys come first, the last key is the time key
-(asof-join [sym time] trades quotes)
+(asof-join [sym time] trades_j quotes)
 ```
 
 ## Pivot & Window
@@ -432,7 +456,7 @@ Low-level API for building and evaluating Datalog programs directly, bypassing t
 | `dl-stratify` | unary | Compute strata for the program | `(dl-stratify prog)` |
 | `dl-eval` | unary | Evaluate program to fixpoint | `(dl-eval prog)` |
 | `dl-query` | binary | Query a derived or base relation | `(dl-query prog 'edge)` |
-| `dl-provenance` | binary | Get derivation tracking (if available) | `(dl-provenance prog 'rel)` |
+| `dl-provenance` | binary | Reserved provenance hook; currently returns `domain: not available` | `(dl-provenance prog 'rel)` |
 
 ```lisp
 ; Low-level Datalog program

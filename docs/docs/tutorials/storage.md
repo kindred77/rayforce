@@ -182,10 +182,13 @@ The deserialized table is identical to the original — all types, column names,
 Splayed tables store each column as a separate file on disk. This is Rayforce's native columnar format — faster than CSV and preserving exact types. Three functions cover on-disk tables:
 
 ```lisp
-(.db.splayed.set "dir" Table)            ; write a splayed dir (also: a partition)
-(.db.splayed.set "dir" Table "sympath")  ; explicit shared symfile
-(.db.splayed.get "dir")                  ; open one splayed table (zero-copy mmap)
-(.db.parted.get  "root" 'name)           ; open a partitioned table (root/.sym)
+(.db.splayed.set "/tmp/rayforce-tutorial-dir" trades)            ; write a splayed dir
+(.db.splayed.set "/tmp/rayforce-tutorial-dir2" trades "/tmp/rayforce-tutorial.sym")  ; explicit shared symfile
+(.db.splayed.get "/tmp/rayforce-tutorial-dir")                    ; open one splayed table
+```
+
+```text
+(.db.parted.get "root" 'name)           ; open a partitioned table (root/.sym)
 ```
 
 Save and load a table:

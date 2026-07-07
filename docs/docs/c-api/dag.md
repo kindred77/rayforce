@@ -375,7 +375,7 @@ Columnar file I/O for vectors, splayed tables, and CSV.
 
 ### Column I/O
 
-`ray_col_save` / `ray_col_load` / `ray_col_mmap`. Save a vector to a column file, load it back, or memory-map it for zero-copy reads. The file format includes type, length, null bitmap, and element data.
+`ray_col_save` / `ray_col_load` / `ray_col_mmap`. Save a vector to a column file, load it back, or memory-map it for zero-copy reads. The file format includes type, length, attributes, and element data; null state is represented with type-correct sentinel payloads plus the `RAY_ATTR_HAS_NULLS` hint.
 
 ```c
 ray_err_t ray_col_save(ray_t* vec, const char* path);
