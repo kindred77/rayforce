@@ -1178,15 +1178,20 @@ ray_t* ray_alloc(size_t data_size) {
     }
 
     uint8_t order = ray_order_for_size(data_size);
-    if (order > RAY_HEAP_MAX_ORDER) return NULL;
 
     /* Anything that would need a dedicated oversized pool goes direct — exact
-     * size, no power-of-2 rounding, no order+1 pool.  On mmap failure fall
-     * through to the buddy pool (its swap fallback handles RAM exhaustion). */
+     * size, no power-of-2 rounding, no order+1 pool.  This includes sizes
+     * above the largest buddy order: direct blocks carry their exact map_size
+     * in a prefix header, so they are not bounded by RAY_HEAP_MAX_ORDER.  On
+     * mmap failure, fall through to the buddy pool only when the buddy model
+     * can still represent the request. */
     if (RAY_UNLIKELY(order >= RAY_HEAP_POOL_ORDER)) {
         ray_t* v = heap_alloc_direct(h, data_size);
         if (v) return v;
+        if (order > RAY_HEAP_MAX_ORDER) return NULL;
     }
+
+    if (order > RAY_HEAP_MAX_ORDER) return NULL;
 
     /* Slab fast path */
     if (RAY_LIKELY(IS_SLAB_ORDER(order))) {
