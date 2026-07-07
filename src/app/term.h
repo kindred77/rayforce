@@ -51,9 +51,11 @@
 #define KEYCODE_CTRL_E    0x05
 #define KEYCODE_CTRL_F    0x06
 #define KEYCODE_CTRL_K    0x0b
+#define KEYCODE_CTRL_L    0x0c
 #define KEYCODE_CTRL_N    0x0e
 #define KEYCODE_CTRL_P    0x10
 #define KEYCODE_CTRL_R    0x12
+#define KEYCODE_CTRL_T    0x14
 #define KEYCODE_CTRL_U    0x15
 #define KEYCODE_CTRL_W    0x17
 
@@ -111,6 +113,7 @@ typedef struct ray_term {
     int32_t  ghost_word_len;   /* length of the prefix that was matched */
     /* Multi-source completion candidates */
     const char* comp_items[256];  /* borrowed pointers — valid until next collect */
+    int32_t     comp_sources[256];
     int32_t     comp_count;
     /* Tab-cycle completion state */
     int32_t     comp_cycling;     /* 1 if currently cycling completions */
@@ -124,8 +127,9 @@ typedef struct ray_term {
     char        multiline_buf[TERM_BUF_SIZE];
     int32_t     multiline_len;
     /* Escape sequence state machine (for event-driven feed) */
-    int32_t     esc_state;     /* 0=normal, 1=ESC, 2=ESC[, 3=ESCO, 4=ESC[3, 5=unknown CSI */
+    int32_t     esc_state;     /* 0=normal, 1=ESC, 2=ESC[, 3=ESCO, 4=ESC[3, 5=CSI params */
     int32_t     esc_buf_len;   /* bytes accumulated in unknown CSI sequence */
+    char        esc_buf[16];   /* CSI parameter bytes for modified arrows/home/end */
 } ray_term_t;
 
 ray_term_t* ray_term_create(void);
