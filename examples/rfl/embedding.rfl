@@ -1,7 +1,7 @@
 ;; Embedding / vector-similarity / HNSW demo.
 ;;
 ;; A column of embeddings is a RAY_LIST of RAY_F32 vectors.  Distance
-;; builtins follow pgvector naming: cos-dist, l2-dist, inner-prod.
+;; builtins: cos-dist, l2-dist, inner-prod.
 
 ;; Build a 5-row column of 3-dim vectors.
 (set vecs (list [1.0 0.0 0.0]

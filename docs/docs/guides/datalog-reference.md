@@ -48,7 +48,7 @@ Use `(scan-eav db attribute)` to query all entities with a given attribute, or `
 All salaries:
 ┌─────┬───────────────────────────────┐
 │  e  │               v               │
-│ i64 │              i64              │
+│ I64 │              I64              │
 ├─────┼───────────────────────────────┤
 │ 1   │ 80000                         │
 │ 2   │ 60000                         │
@@ -93,7 +93,7 @@ This rule says: "an employee is any entity `?e` that has both a `:name` attribut
 Employees (via rule):
 ┌─────┬───────────────────────────────┐
 │ ?n  │              ?d               │
-│ i64 │              i64              │
+│ I64 │              I64              │
 ├─────┼───────────────────────────────┤
 │ 158 │ 161                           │
 │ 159 │ 162                           │
@@ -134,7 +134,7 @@ The `find` clause specifies which variables to return. The `where` clause contai
 ```text
 ┌─────┬───────────────────────────────┐
 │ ?e  │              ?n               │
-│ i64 │              i64              │
+│ I64 │              I64              │
 ├─────┼───────────────────────────────┤
 │ 1   │ 158                           │
 │ 2   │ 159                           │
@@ -160,7 +160,7 @@ When multiple patterns share a variable, Rayforce compiles them into a join:
 ```text
 ┌─────┬───────────────────────────────┐
 │ ?n  │              ?d               │
-│ i64 │              i64              │
+│ I64 │              I64              │
 ├─────┼───────────────────────────────┤
 │ 158 │ 162                           │
 │ 159 │ 163                           │
@@ -184,7 +184,7 @@ Use a literal value instead of a variable to filter by a specific attribute valu
 ```text
 ┌─────┬───────────────────────────────┐
 │ ?e  │              ?n               │
-│ i64 │              i64              │
+│ I64 │              I64              │
 ├─────┼───────────────────────────────┤
 │ 1   │ 158                           │
 │ 3   │ 160                           │
@@ -207,7 +207,7 @@ Use `_` to match any value without binding it to a variable:
 ```text
 ┌─────────────────────────────────────┐
 │                 ?e                  │
-│                 i64                 │
+│                 I64                 │
 ├─────────────────────────────────────┤
 │ 1                                   │
 │ 2                                   │
@@ -246,7 +246,7 @@ Use `(not (pattern))` in a `where` clause to exclude entities matching a pattern
 ```text
 ┌─────┬───────────────────────────────┐
 │ ?e  │              ?n               │
-│ i64 │              i64              │
+│ I64 │              I64              │
 ├─────┼───────────────────────────────┤
 │ 2   │ 159                           │
 ├─────┴───────────────────────────────┤
@@ -284,7 +284,7 @@ The real power of Datalog is **recursive rules**. Define a rule that references 
 ```text
 ┌─────┬───────────────────────────────┐
 │ ?x  │              ?y               │
-│ i64 │              i64              │
+│ I64 │              I64              │
 ├─────┼───────────────────────────────┤
 │ 1   │ 2                             │
 │ 1   │ 3                             │
@@ -334,12 +334,12 @@ Pull queries provide **entity-centric retrieval** — given an entity ID, return
 
 ```text
 Pull all attributes for entity 1:
-['name 158 'dept 160 'salary 80000]
+{name:158 dept:160 salary:80000}
 Pull name + salary for entity 2:
-['name 162 'salary 60000]
+{name:162 salary:60000}
 ```
 
-Pull returns a dictionary (key-value list). Symbol attribute values appear as intern IDs — use `(sym-name id)` to convert them to readable names.
+Pull returns a dict keyed by attribute symbol. Symbol attribute values appear as intern IDs — use `(sym-name id)` to convert them to readable names. Non-symbol values (like `salary`) are stored verbatim.
 
 ## sym-name
 
@@ -348,7 +348,7 @@ EAV queries and pull results store symbol values as integer intern IDs for effic
 ```lisp
 ;; Get the intern ID from a pull result
 (set p (pull db 1))
-(set name-id (get p 1))    ;; value at index 1 in the dict
+(set name-id (get p 'name))  ;; index the dict by attribute key, not position
 (println name-id)            ;; => 158 (intern ID)
 (println (sym-name name-id)) ;; => 'Alice
 ```
@@ -356,7 +356,7 @@ EAV queries and pull results store symbol values as integer intern IDs for effic
 **Verified output**:
 
 ```text
-['name 158 'dept 160]
+{name:158 dept:160}
 158
 'Alice
 ```
@@ -397,7 +397,7 @@ For advanced use cases, Rayforce provides a programmatic Datalog API that gives 
 ```text
 ┌──────────┬──────────────────────────┐
 │ edge__c0 │         edge__c1         │
-│   i64    │           i64            │
+│   I64    │           I64            │
 ├──────────┼──────────────────────────┤
 │ 1        │ 2                        │
 │ 2        │ 3                        │
@@ -424,7 +424,7 @@ Use `(retract-fact db entity attr value)` to remove a triple from the datoms dat
 ```text
 ┌─────┬───────────────────────────────┐
 │ ?e  │              ?n               │
-│ i64 │              i64              │
+│ I64 │              I64              │
 ├─────┼───────────────────────────────┤
 │ 1   │ 158                           │
 │ 3   │ 164                           │
@@ -539,7 +539,7 @@ The following example demonstrates the full Datalog workflow: EAV storage, queri
 ; -- 10. sym-name: readable output --
 (println "--- sym-name: convert intern IDs ---")
 (set p (pull db 1))
-(set name-id (get p 1))
+(set name-id (get p 'name))
 (println name-id)
 (println (sym-name name-id))
 
@@ -569,7 +569,7 @@ Running `./rayforce examples/rfl/datalog.rfl` produces:
 --- All names ---
 ┌─────┬───────────────────────────────┐
 │ ?e  │              ?n               │
-│ i64 │              i64              │
+│ I64 │              I64              │
 ├─────┼───────────────────────────────┤
 │ 1   │ 158                           │
 │ 2   │ 162                           │
@@ -580,7 +580,7 @@ Running `./rayforce examples/rfl/datalog.rfl` produces:
 --- Name + Department ---
 ┌─────┬───────────────────────────────┐
 │ ?n  │              ?d               │
-│ i64 │              i64              │
+│ I64 │              I64              │
 ├─────┼───────────────────────────────┤
 │ 158 │ 160                           │
 │ 162 │ 163                           │
@@ -591,7 +591,7 @@ Running `./rayforce examples/rfl/datalog.rfl` produces:
 --- Engineers only (constant pattern) ---
 ┌─────┬───────────────────────────────┐
 │ ?e  │              ?n               │
-│ i64 │              i64              │
+│ I64 │              I64              │
 ├─────┼───────────────────────────────┤
 │ 1   │ 158                           │
 │ 3   │ 164                           │
@@ -601,7 +601,7 @@ Running `./rayforce examples/rfl/datalog.rfl` produces:
 --- Entities with any dept (wildcard _) ---
 ┌─────────────────────────────────────┐
 │                 ?e                  │
-│                 i64                 │
+│                 I64                 │
 ├─────────────────────────────────────┤
 │ 1                                   │
 │ 2                                   │
@@ -612,7 +612,7 @@ Running `./rayforce examples/rfl/datalog.rfl` produces:
 --- Employees (via rule) ---
 ┌─────┬───────────────────────────────┐
 │ ?n  │              ?d               │
-│ i64 │              i64              │
+│ I64 │              I64              │
 ├─────┼───────────────────────────────┤
 │ 158 │ 160                           │
 │ 162 │ 163                           │
@@ -623,7 +623,7 @@ Running `./rayforce examples/rfl/datalog.rfl` produces:
 --- Non-managers (negation) ---
 ┌─────┬───────────────────────────────┐
 │ ?e  │              ?n               │
-│ i64 │              i64              │
+│ I64 │              I64              │
 ├─────┼───────────────────────────────┤
 │ 2   │ 162                           │
 ├─────┴───────────────────────────────┤
@@ -632,7 +632,7 @@ Running `./rayforce examples/rfl/datalog.rfl` produces:
 --- Reachable pairs (transitive closure) ---
 ┌─────┬───────────────────────────────┐
 │ ?x  │              ?y               │
-│ i64 │              i64              │
+│ I64 │              I64              │
 ├─────┼───────────────────────────────┤
 │ 1   │ 2                             │
 │ 1   │ 3                             │
@@ -644,16 +644,16 @@ Running `./rayforce examples/rfl/datalog.rfl` produces:
 │ 6 rows (6 shown) 2 columns (2 shown)│
 └─────────────────────────────────────┘
 --- Pull entity 1 (all attributes) ---
-['name 158 'dept 160 'salary 80000 'manager 172]
+{name:158 dept:160 salary:80000 manager:172}
 --- Pull entity 2 (name + salary only) ---
-['name 162 'salary 60000]
+{name:162 salary:60000}
 --- sym-name: convert intern IDs ---
 158
 'Alice
 --- Before retract ---
 ┌─────┬───────────────────────────────┐
 │ ?e  │              ?n               │
-│ i64 │              i64              │
+│ I64 │              I64              │
 ├─────┼───────────────────────────────┤
 │ 1   │ 158                           │
 │ 2   │ 162                           │
@@ -664,7 +664,7 @@ Running `./rayforce examples/rfl/datalog.rfl` produces:
 --- After retract (Bob removed) ---
 ┌─────┬───────────────────────────────┐
 │ ?e  │              ?n               │
-│ i64 │              i64              │
+│ I64 │              I64              │
 ├─────┼───────────────────────────────┤
 │ 1   │ 158                           │
 │ 3   │ 164                           │
@@ -674,7 +674,7 @@ Running `./rayforce examples/rfl/datalog.rfl` produces:
 --- All salaries (scan-eav) ---
 ┌─────┬───────────────────────────────┐
 │  e  │               v               │
-│ i64 │              i64              │
+│ I64 │              I64              │
 ├─────┼───────────────────────────────┤
 │ 1   │ 80000                         │
 │ 2   │ 60000                         │
@@ -683,7 +683,7 @@ Running `./rayforce examples/rfl/datalog.rfl` produces:
 │ 3 rows (3 shown) 2 columns (2 shown)│
 └─────────────────────────────────────┘
 --- Entity 3 salary ---
-9
+90000
 ```
 
 !!! note "Note"

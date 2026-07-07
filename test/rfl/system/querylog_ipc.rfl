@@ -1,0 +1,53 @@
+;; Query-statistics ring end-to-end over IPC (the server / cloud path).
+;;
+;; The capture hook lives in eval_payload_core (src/core/ipc.c), so it only
+;; fires for real server traffic — this spawns a `-Q 1` server, drives queries
+;; over IPC, then reads (.sys.querylog) back over the same connection and
+;; asserts the rows were captured with correct stats.  Mirrors the spawn /
+;; handshake-probe / teardown pattern of log_journal.rfl.
+;;
+;; Port 19988 (fixed; `make test` is sequential so no coexisting server).
+
+;; ── pre-flight: kill any stragglers ─────────────────────────────────
+(.sys.exec "pkill -KILL -f '[r]ayforce -Q 1 -p 19988' 2>/dev/null; true")
+(.sys.exec "sleep 0.2; true")
+
+;; ── spawn server with query logging on ──────────────────────────────
+(.sys.exec "./rayforce -Q 1 -p 19988 </dev/null >/dev/null 2>&1 &")
+(.sys.exec "for i in $(seq 50); do bash -c 'exec 3<>/dev/tcp/127.0.0.1/19988 2>/dev/null && printf \"\\003\\000\" >&3 && read -t2 -n1 -u3 _' 2>/dev/null && exit 0; sleep 0.1; done; exit 1") -- 0
+
+(set h (.ipc.open "127.0.0.1:19988"))
+(>= h 0) -- true
+
+;; ── drive some traffic: a scalar, a many-row result, and an error ───
+(.ipc.send h "(+ 40 2)")              -- 42
+(.ipc.send h "(count (til 2000000))") -- 2000000
+;; A vector result (50000 rows) — logged with result-rows = 50000.  Bare
+;; send (no assertion): the point is the row it records, not the payload.
+(.ipc.send h "(til 50000)")
+(.ipc.send h "(nonexistent-thing)")   !- name
+
+;; ── read the ring back over IPC and assert capture ──────────────────
+;; At least the three queries above were logged.
+(.ipc.send h "(>= (count (.sys.querylog)) 3)") -- true
+
+;; It is an ordinary table over the wire.
+(.ipc.send h "(type (.sys.querylog))") -- 'TABLE
+
+;; The vector query's row was captured with its real result-row count.
+(.ipc.send h "(> (count (select {from: (.sys.querylog) where: (> result-rows 10000)})) 0)") -- true
+
+;; The failed query was captured with a non-ok status: the status column now
+;; holds more than one distinct value (`ok` plus the error kind).  (A symbol
+;; equality in a WHERE clause isn't lowerable by the DAG compiler, so we
+;; assert via distinct instead.)
+(.ipc.send h "(> (count (distinct (at (.sys.querylog) (quote status)))) 1)") -- true
+
+;; Rows carry a non-negative duration (the timing column is populated).
+(.ipc.send h "(> (count (select {from: (.sys.querylog) where: (>= duration-ms 0.0)})) 0)") -- true
+
+(.ipc.close h)
+
+;; ── teardown: SIGTERM the server, wait for exit ─────────────────────
+(.sys.exec "pkill -TERM -f '[r]ayforce -Q 1 -p 19988' 2>/dev/null; true")
+(.sys.exec "for i in $(seq 30); do pgrep -f '[r]ayforce -Q 1 -p 19988' >/dev/null || exit 0; sleep 0.1; done; exit 1") -- 0

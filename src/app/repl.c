@@ -42,6 +42,7 @@
 #include "mem/heap.h"
 #include "ops/ops.h"
 #include "core/profile.h"
+#include "core/qlog.h"
 #include "table/sym.h"
 #include <inttypes.h>
 #include <stdio.h>
@@ -132,7 +133,7 @@ static const char* fmt_bytes(int64_t bytes, char* buf, size_t bufsz) {
 static void render_progress_full(int64_t done, int64_t total,
                                    const char* op, const char* phase,
                                    double elapsed_sec,
-                                   int64_t mem_used, int64_t mem_budget) {
+                                   int64_t mem_used, int64_t mem_total) {
     int cols = progress_term_cols();
     /* Reserve a chunk for labels + percent + elapsed; give the rest
      * to the bar. Minimum bar is 10 cells, maximum 40. */
@@ -164,11 +165,11 @@ static void render_progress_full(int64_t done, int64_t total,
                        (op && *op) ? ": " : " \xc2\xb7 ", phase);
     if (elapsed_sec > 0.0)
         tp += snprintf(tail + tp, sizeof(tail) - tp, " \xc2\xb7 %.1fs", elapsed_sec);
-    if (mem_used > 0 && mem_budget > 0) {
-        char ub[16], bb[16];
+    if (mem_used > 0 && mem_total > 0) {
+        char ub[16], tb[16];
         fmt_bytes(mem_used, ub, sizeof(ub));
-        fmt_bytes(mem_budget, bb, sizeof(bb));
-        tp += snprintf(tail + tp, sizeof(tail) - tp, " \xc2\xb7 %s/%s", ub, bb);
+        fmt_bytes(mem_total, tb, sizeof(tb));
+        tp += snprintf(tail + tp, sizeof(tail) - tp, " \xc2\xb7 %s/%s", ub, tb);
     }
 
     /* Clear the line first, then draw. Using \e[2K avoids leaving
@@ -210,12 +211,19 @@ static void repl_query_progress_cb(const ray_progress_t* p, void* user) {
     if (p->final) { clear_progress(); return; }
     render_progress_full((int64_t)p->rows_done, (int64_t)p->rows_total,
                          p->op_name, p->phase, p->elapsed_sec,
-                         p->mem_used, p->mem_budget);
+                         p->mem_used, p->mem_total);
 }
 
 /* ===== Profiler span tree printer (reads from g_ray_profile) ===== */
 
-static int32_t profile_print_tree(int32_t idx, int32_t indent) {
+/* Recursively print the span tree.  `total_ns` is the whole-query wall time
+ * (for the %-of-total figure); `*level_ns` is set on return to the summed
+ * wall time of the spans printed at THIS level, so a parent can subtract it
+ * to get its own EXCLUSIVE (self) time — the per-operator self-time view of
+ * where time actually went, since cumulative time hides it inside the root. */
+static int32_t profile_print_tree(int32_t idx, int32_t indent,
+                                  int64_t total_ns, int64_t* level_ns) {
+    int64_t acc = 0;   /* summed wall of spans printed at this level */
     while (idx < g_ray_profile.n) {
         ray_prof_span_t* sp = &g_ray_profile.spans[idx];
 
@@ -224,35 +232,69 @@ static int32_t profile_print_tree(int32_t idx, int32_t indent) {
             for (int32_t i = 0; i < indent; i++) fprintf(stdout, "\xe2\x94\x82 ");
             fprintf(stdout, "\xe2\x95\xad %s\n", sp->msg);
             idx++;
-            idx = profile_print_tree(idx, indent + 1);
+            int64_t child_ns = 0;
+            idx = profile_print_tree(idx, indent + 1, total_ns, &child_ns);
             if (idx < g_ray_profile.n) {
-                double ms = (double)(g_ray_profile.spans[idx].ts - sp->ts) / 1e6;
+                ray_prof_span_t* ep = &g_ray_profile.spans[idx];
+                int64_t wall = ep->ts - sp->ts;
+                int64_t self = wall - child_ns; if (self < 0) self = 0;
+                acc += wall;
+                double ms = (double)wall / 1e6;
                 for (int32_t i = 0; i < indent; i++) fprintf(stdout, "\xe2\x94\x82 ");
-                fprintf(stdout, "\xe2\x95\xb0\xe2\x94\x80\xe2\x94\xa4 %.3f ms\n", ms);
+                fprintf(stdout, "\xe2\x95\xb0\xe2\x94\x80\xe2\x94\xa4 %.3f ms", ms);
+                /* Exclusive time + share of the whole query — surface these
+                 * whenever a span has children (self < wall) or is a
+                 * meaningful slice, so the bottleneck operator stands out. */
+                if (child_ns > 0)
+                    fprintf(stdout, " self=%.3f ms", (double)self / 1e6);
+                if (total_ns > 0)
+                    fprintf(stdout, " %.0f%%", (double)wall * 100.0 / (double)total_ns);
+                /* Append the captured per-operator payload: result rows, net
+                 * allocation, and parallelism (worker count and effective
+                 * parallelism = worker busy time / wall time). Only heavy
+                 * operators carry a payload; phase spans stay bare. */
+                int64_t dmem = ep->sys_cur - sp->sys_cur;
+                if (ep->rows_out > 0 || ep->qs_workers > 0 || dmem != 0) {
+                    fprintf(stdout, "  rows=%lld", (long long)ep->rows_out);
+                    if (dmem != 0)
+                        fprintf(stdout, " mem=%+.1fKB", (double)dmem / 1024.0);
+                    if (ep->qs_workers > 0) {
+                        double  par  = wall > 0
+                            ? (double)(ep->qs_busy_ns - sp->qs_busy_ns) / (double)wall : 0.0;
+                        fprintf(stdout, " w=%u par=%.1fx", ep->qs_workers, par);
+                    }
+                }
+                fprintf(stdout, "\n");
                 idx++;
             }
             break;
         }
         case RAY_PROF_SPAN_END:
+            if (level_ns) *level_ns = acc;
             return idx;
         case RAY_PROF_SPAN_TICK: {
-            double ms = 0.0;
+            int64_t wall = 0;
             if (idx > 0)
-                ms = (double)(sp->ts - g_ray_profile.spans[idx - 1].ts) / 1e6;
+                wall = sp->ts - g_ray_profile.spans[idx - 1].ts;
+            acc += wall;
             for (int32_t i = 0; i < indent; i++) fprintf(stdout, "\xe2\x94\x82 ");
-            fprintf(stdout, "\xe2\x9c\xb6  %s: %.3f ms\n", sp->msg, ms);
+            fprintf(stdout, "\xe2\x9c\xb6  %s: %.3f ms\n", sp->msg, (double)wall / 1e6);
             idx++;
             break;
         }
         }
     }
+    if (level_ns) *level_ns = acc;
     return idx;
 }
 
 static void profile_print(bool use_color) {
     if (!g_ray_profile.active || g_ray_profile.n == 0) return;
     if (use_color) fprintf(stdout, "\033[90m");
-    profile_print_tree(0, 0);
+    int64_t total_ns = g_ray_profile.n > 0
+        ? g_ray_profile.spans[g_ray_profile.n - 1].ts - g_ray_profile.spans[0].ts : 0;
+    int64_t root_ns = 0;
+    profile_print_tree(0, 0, total_ns, &root_ns);
     if (use_color) fprintf(stdout, "\033[0m");
     fflush(stdout);
 }
@@ -682,12 +724,26 @@ static void eval_and_print(ray_term_t* term, const char* input,
         }
     }
 
-    bool profiling = timeit && g_ray_profile.active;
+    /* Read the live profiler flag, not the `timeit` parameter: the latter
+     * is a per-loop cached copy of g_ray_profile.active that is only
+     * refreshed after colon-commands, so toggling the profiler from a
+     * normal expression — `(.sys.timeit 1)` — would otherwise leave the
+     * REPL scaffolding disabled.  Remote-REPL mode has already returned
+     * above, so there is no case where profiling should be suppressed
+     * while the flag is set. */
+    (void)timeit;
+    bool profiling = g_ray_profile.active;
 
     if (profiling) {
+        ray_profile_snapshot();
         ray_profile_reset();
         ray_profile_span_start("top-level");
     }
+
+    /* Query-statistics ring: bracket the whole parse+eval+materialize so the
+     * logged duration is the time to answer the query.  No-op when disabled. */
+    ray_qlog_ctx_t qc;
+    ray_qlog_begin(&qc);
 
     ray_term_clear_interrupt();
     ray_eval_clear_interrupt();
@@ -730,6 +786,8 @@ static void eval_and_print(ray_term_t* term, const char* input,
     if (profiling) {
         ray_profile_span_end("top-level");
     }
+
+    ray_qlog_end(&qc, input, strlen(input), result);
 
     if (ray_term_interrupted()) {
         ray_term_clear_interrupt();
@@ -1210,6 +1268,7 @@ int ray_repl_run_file(const char* path) {
     bool profiling = g_ray_profile.active;
 
     if (profiling) {
+        ray_profile_snapshot();
         ray_profile_reset();
         ray_profile_span_start("top-level");
     }

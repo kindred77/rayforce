@@ -1,0 +1,15 @@
+;; Regression: a date literal with an out-of-range month must be rejected,
+;; not indexed into the MONTHDAYS table.  Found by the parser fuzz target:
+;; 2024.81.03 drove ymd_to_date to read MONTHDAYS[leap][80] (a 13-wide
+;; table), a global-buffer-overflow.  Now a clean parse error.
+;; Error assertions match the error CODE ("parse"), per the harness.
+2024.81.03 !- parse
+2024.13.01 !- parse
+2024.00.01 !- parse
+2024.01.00 !- parse
+2024.01.32 !- parse
+
+;; Valid dates still parse.
+2024.01.01 -- 2024.01.01
+2024.12.31 -- 2024.12.31
+2024.02.29 -- 2024.02.29

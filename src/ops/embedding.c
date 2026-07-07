@@ -450,7 +450,8 @@ ray_t* ray_hnsw_build_fn(ray_t** args, int64_t n) {
     ray_hnsw_t* idx = ray_hnsw_build(flat, n_rows, dim, metric, M, ef_c);
     /* ray_hnsw_build COPIES the vectors (idx->owns_data == true), so free our scratch. */
     if (flat) ray_sys_free(flat);
-    if (!idx) return ray_error("oom", NULL);
+    if (!idx) return ray_interrupted() ? ray_error("cancel", "interrupted")
+                                       : ray_error("oom", NULL);
 
     ray_t* h = hnsw_wrap(idx);
     if (!h || RAY_IS_ERR(h)) { ray_hnsw_free(idx); return h; }

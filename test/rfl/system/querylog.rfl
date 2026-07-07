@@ -1,0 +1,30 @@
+;; (.sys.querylog) — in-memory per-query statistics ring as a table.
+;;
+;; The capture hook lives at the REPL / IPC eval boundary (after the result is
+;; materialized), not in the bare ray_eval this harness drives, so populating
+;; the ring here is not possible — end-to-end capture is exercised
+;; interactively and over IPC.  Here we assert the table SHAPE and the enable
+;; toggle's contract, both of which hold regardless of capture.
+
+;; It is a table.
+(type (.sys.querylog)) -- 'TABLE
+
+;; Eight fixed columns, in order.
+(count (key (.sys.querylog))) -- 8
+(key (.sys.querylog)) -- [time duration-ms result-rows memory-kib workers parallelism status query]
+
+;; Empty in the harness (logging capture never fires here).
+(count (.sys.querylog)) -- 0
+
+;; The enable toggle returns the new state as i64; explicit 0/1 set it,
+;; no argument flips it.
+(.sys.querylog.enable 1) -- 1
+(.sys.querylog.enable 0) -- 0
+(.sys.querylog.enable) -- 1
+(.sys.querylog.enable) -- 0
+
+;; It is an ordinary table — queryable like any other, without error.
+(type (select {from: (.sys.querylog) where: (> duration-ms 0.0)})) -- 'TABLE
+
+;; Leave logging off so later tests see no armed capture state.
+(.sys.querylog.enable 0) -- 0

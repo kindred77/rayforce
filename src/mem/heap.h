@@ -138,8 +138,10 @@ typedef struct {
     size_t slab_hits;        /* slab cache hits */
     size_t direct_count;     /* active direct mmaps */
     size_t direct_bytes;     /* bytes in direct mmaps */
-    size_t sys_current;      /* sys allocator: current mmap'd bytes */
-    size_t sys_peak;         /* sys allocator: peak mmap'd bytes */
+    size_t sys_current;      /* committed RAM: buddy pools + sys allocs (bytes) */
+    size_t sys_peak;         /* committed RAM high-water mark */
+    size_t sys_mapped;       /* file-backed bytes mapped (columns, sym, CSV) */
+    size_t sys_mapped_peak;  /* file-backed mapping high-water mark */
 } ray_mem_stats_t;
 
 /* ===== Forward Declarations (internal types) ===== */
@@ -176,6 +178,57 @@ void ray_heap_release_pages(void);
  * Block size helper
  * -------------------------------------------------------------------------- */
 #define BSIZEOF(o)    ((size_t)1 << (o))
+
+/* --------------------------------------------------------------------------
+ * Direct large allocation
+ *
+ * An allocation that would otherwise need a dedicated OVERSIZED buddy pool
+ * (order >= RAY_HEAP_POOL_ORDER) is instead mmap'd at its EXACT page-rounded
+ * size — no power-of-2 block rounding, no order+1 pool doubling.  Layout:
+ * [ray_direct_hdr_t (32B) | ray_t header (32B) | data], page-rounded.  The
+ * ray_t is marked with an order ABOVE the max real order, so every buddy path
+ * (freelist indexing, coalescing, pool masking, capacity) skips it, and it is
+ * freed by a standalone munmap from any thread (address space is
+ * process-wide); its bytes live in a single global atomic.
+ * -------------------------------------------------------------------------- */
+#define RAY_ORDER_DIRECT   (RAY_HEAP_MAX_ORDER + 1)   /* sentinel order */
+#define RAY_DIRECT_HDR     32                          /* prefix before ray_t */
+
+typedef struct {
+    size_t map_size;      /* total mmap'd bytes */
+    int    swap_fd;       /* -1 = anonymous (ray_vm_free); >=0 = file-backed spill */
+    int    _pad0;
+    char*  swap_path;     /* spill file to unlink+free on release; NULL if anon */
+    char   _pad1[RAY_DIRECT_HDR - sizeof(size_t) - 2 * sizeof(int) - sizeof(char*)];
+} ray_direct_hdr_t;
+_Static_assert(sizeof(ray_direct_hdr_t) == RAY_DIRECT_HDR, "direct hdr must be 32B");
+
+static inline bool ray_is_direct(const ray_t* v) {
+    return v->order > RAY_HEAP_MAX_ORDER;
+}
+static inline size_t ray_direct_map_size(const ray_t* v) {
+    return ((const ray_direct_hdr_t*)((const char*)v - RAY_DIRECT_HDR))->map_size;
+}
+/* Usable data bytes (block minus the 32-byte ray_t header).  Handles both
+ * buddy blocks and direct blocks, so capacity math is uniform. */
+static inline size_t ray_block_data_bytes(const ray_t* v) {
+    return ray_is_direct(v)
+        ? ray_direct_map_size(v) - RAY_DIRECT_HDR - 32
+        : ((size_t)1 << v->order) - 32;
+}
+/* True if a direct block is backed by a disk spill file (vs anonymous RAM). */
+static inline bool ray_direct_file_backed(const ray_t* v) {
+    return ((const ray_direct_hdr_t*)((const char*)v - RAY_DIRECT_HDR))->swap_fd >= 0;
+}
+
+/* Anonymous (RAM-resident, OOM-killable) pool + direct bytes currently
+ * committed by the heap.  Allocations that would push this past the anon
+ * watermark (default: total physical RAM) are backed by a disk spill file
+ * instead — file-backed pages are always reclaimable, so they cannot trigger
+ * the OOM killer.  ray_heap_set_anon_watermark overrides the threshold (0
+ * restores the default); intended for diagnostics and tests. */
+int64_t ray_heap_anon_committed(void);
+void    ray_heap_set_anon_watermark(int64_t bytes);
 
 /* --------------------------------------------------------------------------
  * Pool header: first min-block (64B) of each self-aligned pool.

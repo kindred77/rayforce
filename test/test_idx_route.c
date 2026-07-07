@@ -1058,8 +1058,8 @@ static test_result_t test_range_sorted_all_segments(void) {
     ray_t* kv_b = ray_vec_new(RAY_I64, N);
     TEST_ASSERT_FALSE(RAY_IS_ERR(kv_b));
     kv_b->len = N;
-    int64_t* kdb = (int64_t*)ray_data(kv_b);
-    for (int64_t i = 0; i < N; i++) kdb[i] = i;
+    int64_t* kdata = (int64_t*)ray_data(kv_b);
+    for (int64_t i = 0; i < N; i++) kdata[i] = i;
     ray_t* vv_b = ray_vec_new(RAY_I64, N);
     TEST_ASSERT_FALSE(RAY_IS_ERR(vv_b));
     vv_b->len = N;

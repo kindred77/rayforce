@@ -29,10 +29,12 @@
 #include "ops/idxop.h"
 #include "mem/heap.h"
 #include "mem/sys.h"
+#include "core/qstats.h"   /* per-worker parallelism stats for profile spans */
 #include "core/runtime.h"  /* __VM — filter-compaction projection keep-set */
 
 /* Global profiler instance (zero-initialized = inactive) */
 ray_profile_t g_ray_profile;
+ray_profile_t g_ray_profile_last;
 
 /* --------------------------------------------------------------------------
  * Materialize a MAPCOMMON column into a flat RAY_SYM vector.
@@ -401,15 +403,21 @@ static void pg_block_fn(void* arg, uint32_t wid, int64_t start, int64_t end) {
 void partitioned_gather(ray_pool_t* pool, const int64_t* idx, int64_t n,
                         int64_t src_rows, char** srcs, char** dsts,
                         const uint8_t* esz, int64_t ncols) {
-    /* Fallback for small arrays or no pool */
+    /* Fallback for small arrays or no pool.  Chunked by MGATHER_MAX_COLS so
+     * every column is gathered regardless of ncols (current callers batch to
+     * <=MGATHER_MAX_COLS themselves, but a wider call must not silently
+     * leave columns ungathered). */
     if (!pool || n < PG_MIN || n > INT32_MAX || src_rows > INT32_MAX) {
-        multi_gather_ctx_t mg = { .idx = idx, .ncols = 0 };
-        for (int64_t c = 0; c < ncols && c < MGATHER_MAX_COLS; c++) {
-            mg.srcs[c] = srcs[c]; mg.dsts[c] = dsts[c]; mg.esz[c] = esz[c];
-            mg.ncols++;
+        for (int64_t base = 0; base < ncols; base += MGATHER_MAX_COLS) {
+            multi_gather_ctx_t mg = { .idx = idx, .ncols = 0 };
+            for (int64_t c = base; c < ncols && mg.ncols < MGATHER_MAX_COLS; c++) {
+                mg.srcs[mg.ncols] = srcs[c]; mg.dsts[mg.ncols] = dsts[c];
+                mg.esz[mg.ncols] = esz[c];
+                mg.ncols++;
+            }
+            if (pool) ray_pool_dispatch(pool, multi_gather_fn, &mg, n);
+            else      multi_gather_fn(&mg, 0, 0, n);
         }
-        if (pool) ray_pool_dispatch(pool, multi_gather_fn, &mg, n);
-        else      multi_gather_fn(&mg, 0, 0, n);
         return;
     }
 
@@ -436,13 +444,17 @@ void partitioned_gather(ray_pool_t* pool, const int64_t* idx, int64_t n,
         scratch_free(hist_hdr); scratch_free(off_hdr);
         scratch_free(rdest_hdr); scratch_free(rsrc_hdr);
         scratch_free(poff_hdr);
-        /* Fallback to regular gather on allocation failure */
-        multi_gather_ctx_t mg = { .idx = idx, .ncols = 0 };
-        for (int64_t c = 0; c < ncols && c < MGATHER_MAX_COLS; c++) {
-            mg.srcs[c] = srcs[c]; mg.dsts[c] = dsts[c]; mg.esz[c] = esz[c];
-            mg.ncols++;
+        /* Fallback to regular gather on allocation failure (chunked, same
+         * no-column-left-behind contract as the small-input fallback above) */
+        for (int64_t base = 0; base < ncols; base += MGATHER_MAX_COLS) {
+            multi_gather_ctx_t mg = { .idx = idx, .ncols = 0 };
+            for (int64_t c = base; c < ncols && mg.ncols < MGATHER_MAX_COLS; c++) {
+                mg.srcs[mg.ncols] = srcs[c]; mg.dsts[mg.ncols] = dsts[c];
+                mg.esz[mg.ncols] = esz[c];
+                mg.ncols++;
+            }
+            ray_pool_dispatch(pool, multi_gather_fn, &mg, n);
         }
-        ray_pool_dispatch(pool, multi_gather_fn, &mg, n);
         return;
     }
 
@@ -1168,6 +1180,72 @@ ray_t* exec_in_to_selection(ray_graph_t* g, ray_op_t* pred, int64_t nrows,
     return sel;
 }
 
+static int idx_filter_decode(ray_graph_t* g, ray_op_t* pred_op,
+                             ray_t** out_col, uint16_t* out_cmp_op,
+                             int64_t* out_key_i, double* out_key_f,
+                             int* out_is_float);
+
+/* ---- Slice-group fusion probe (FILTER(in/eq on c) + GROUP(by c)) ----
+ *
+ * Called from the select-by pipeline (query.c) INSTEAD of executing the
+ * WHERE filter, after ray_optimize.  When the compiled filter's predicate
+ * is exactly membership on the single bare group-key column — (in c SET)
+ * or (== c K), no other conjuncts, no chained filter — and that column
+ * carries a fresh CSR hash index, the surviving groups are exactly the
+ * key set and each group's rows are its full CSR slice: resolve the
+ * slices NOW (freshness verified inside the resolver) and arm the hint
+ * on g.  exec_group consumes it — aggregating the slices directly, or
+ * folding them into the selection the skipped filter would have
+ * produced.  Returns true when armed (caller skips the filter exec). */
+bool ray_slice_group_probe(ray_graph_t* g, ray_op_t* root, ray_t* by_col) {
+    if (!g || !root || !by_col || g->selection || g->sg_col) return false;
+    if (root->opcode != OP_FILTER) return false;
+    ray_op_t* in0 = op_child(g, root, 0);
+    /* A chained FILTER input means the optimizer split a compound WHERE —
+     * this predicate is one conjunct of several, not the whole filter. */
+    if (!in0 || in0->opcode == OP_FILTER) return false;
+    if (by_col->type != RAY_SYM || ray_is_atom(by_col)) return false;
+    if (by_col->attrs & RAY_ATTR_HAS_NULLS) return false;
+    if (ray_index_kind(by_col) != RAY_IDX_HASH) return false;
+    ray_op_t* pred = op_child(g, root, 1);
+    if (!pred) return false;
+
+    ray_t* keys = NULL;      /* borrowed (CONST literal) */
+    ray_t* eq_atom = NULL;   /* owned (built for the eq shape) */
+    if (pred->opcode == OP_IN) {   /* NOT_IN also decodes — reject it */
+        ray_t* c = NULL; ray_t* set = NULL;
+        if (idx_filter_in_decode(g, pred, &c, &set) && c == by_col)
+            keys = set;
+    }
+    if (!keys) {
+        ray_t* c = NULL; uint16_t cop = 0;
+        int64_t ki = 0; double kf = 0.0; int isf = 0;
+        if (idx_filter_decode(g, pred, &c, &cop, &ki, &kf, &isf) &&
+            c == by_col && cop == OP_EQ && !isf) {
+            eq_atom = ray_sym(ki);
+            if (!eq_atom || RAY_IS_ERR(eq_atom)) {
+                if (eq_atom) ray_release(eq_atom);
+                return false;
+            }
+            keys = eq_atom;
+        }
+    }
+    if (!keys) return false;
+
+    ray_idx_consults[IDX_SITE_GROUP_SLICE]++;
+    ray_idx_slice_t* sl = NULL;
+    ray_t* shdr = NULL;
+    int64_t k = ray_index_hash_sym_slices(by_col, keys, &sl, &shdr);
+    if (eq_atom) ray_release(eq_atom);
+    if (k < 0) return false;
+    ray_idx_hits[IDX_SITE_GROUP_SLICE]++;
+    g->sg_col = by_col;
+    ray_retain(by_col);
+    g->sg_slices_hdr = shdr;   /* NULL when k == 0 */
+    g->sg_nslices = k;
+    return true;
+}
+
 /* ============================================================================
  * Recursive executor
  * ============================================================================ */
@@ -1426,6 +1504,31 @@ static int group_input_scan_syms(ray_graph_t* g, ray_op_ext_t* gx,
     return collect_scan_syms(g, roots, nroots, syms, max, has_expr);
 }
 
+/* Lowercase display label for profiler spans.  ray_opcode_name returns the
+ * canonical UPPERCASE IR name — right for plan dumps and error messages, but
+ * the profiler tree also carries lowercase phase and builtin labels (parse,
+ * optimize, select, til), so an uppercase GROUP next to them reads as an
+ * arbitrary mix.  Lowercase, and render '_' as a space to match the
+ * space-separated pass labels (predicate pushdown, …).  Cached per opcode so
+ * the returned pointer stays valid for the life of a span. */
+static const char* prof_op_label(uint16_t opc) {
+    if (opc > OP_KNN_RERANK) return ray_opcode_name(opc);
+    static char lc[OP_KNN_RERANK + 1][28];
+    if (!lc[opc][0]) {
+        const char* up = ray_opcode_name(opc);
+        if (!up) return NULL;
+        size_t i = 0;
+        for (; i < sizeof(lc[0]) - 1 && up[i]; i++) {
+            char c = up[i];
+            if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+            else if (c == '_')        c = ' ';
+            lc[opc][i] = c;
+        }
+        lc[opc][i] = '\0';
+    }
+    return lc[opc];
+}
+
 /* Is this opcode a "heavy" pipeline breaker worth profiling? */
 static inline bool op_is_heavy(uint16_t opc) {
     return opc == OP_FILTER || opc == OP_SORT || opc == OP_GROUP ||
@@ -1433,6 +1536,197 @@ static inline bool op_is_heavy(uint16_t opc) {
            opc == OP_HEAD   || opc == OP_TAIL || opc == OP_WINDOW ||
            opc == OP_PIVOT  ||
            (opc >= OP_EXPAND && opc <= OP_KNN_RERANK);
+}
+
+/* ── Deep-DAG stack discipline ──────────────────────────────────────
+ * exec_node/exec_node_inner recurse per child, and exec_node_inner's
+ * frame is the union of every case's locals (~35 KB under ASan), so a
+ * deep op chain overflows the 8 MB main stack around depth ~220 —
+ * worker/IPC threads with 512 KB stacks die far sooner.  Two defenses:
+ *
+ *  1. Elementwise chains — the one shape that gets arbitrarily deep in
+ *     practice (machine-generated arithmetic, the >1024-node streaming
+ *     DAG test) — are evaluated iteratively by exec_elementwise_tree
+ *     and consume no recursion depth.
+ *  2. Any other graph nesting past RAY_EXEC_MAX_DEPTH is pathological:
+ *     fail with a clean "limit" error instead of a stack overflow
+ *     (mirrors RAY_EVAL_MAX_DEPTH in lang/eval.c).  The counter is
+ *     per-thread; 64 levels of non-elementwise nesting stays within
+ *     ~2.5 MB even at ASan frame sizes. */
+#define RAY_EXEC_MAX_DEPTH 64
+static _Thread_local int32_t tl_exec_depth = 0;
+
+/* Opcodes handled by the elementwise case of exec_node_inner — must
+ * match its case labels (ROUND sits at 9, outside NEG..CAST; IDIV at
+ * 49, outside ADD..MAX2). */
+static inline bool op_is_elementwise(uint16_t o) {
+    return o == OP_ROUND || (o >= OP_NEG && o <= OP_CAST)
+        || (o >= OP_ADD && o <= OP_MAX2) || o == OP_IDIV;
+}
+
+/* Iterative post-order evaluation of an elementwise subtree.
+ *
+ * Replaces the recursive per-child fallback, which burned one
+ * exec_node+exec_node_inner frame pair per chain link.  The walk uses
+ * an explicit heap stack:
+ *
+ *  - elementwise children are evaluated exactly once (vals[] memo,
+ *    released when their last in-tree consumer has run);
+ *  - non-elementwise children (SCAN/CONST/aggregates/...) remain
+ *    exec_node calls, evaluated per reference like the recursion did,
+ *    and bounded by the depth guard;
+ *  - each node still gets an expr_compile attempt on descent, so
+ *    fuseable sub-windows (within the compiler's depth-64 DFS cap)
+ *    run the fused kernels exactly as before — only the spine above
+ *    them is interpreted node-by-node. */
+static ray_t* exec_elementwise_tree(ray_graph_t* g, ray_op_t* root) {
+    uint32_t nc = g->node_count;
+    int64_t  nr = g->table ? ray_table_nrows(g->table) : 0;
+
+    typedef struct { uint32_t id; uint8_t phase; } ew_ent_t;
+    enum { EW_NEW = 0, EW_PENDING = 1, EW_DONE = 2, EW_SEEN = 3 };
+
+    /* One carve for the id-indexed maps plus the walk stack.  Stack
+     * bound: one discover push per edge (≤ 2·nc) + one emit push per
+     * node (≤ nc).  The byte-wide state map goes last so every wider
+     * field stays naturally aligned. */
+    size_t vals_sz = (size_t)nc * sizeof(ray_t*);
+    size_t uses_sz = (size_t)nc * sizeof(uint32_t);
+    size_t stk_sz  = ((size_t)3 * nc + 2) * sizeof(ew_ent_t);
+    ray_t* hdr = NULL;
+    char* mem = (char*)scratch_calloc(&hdr, vals_sz + uses_sz + stk_sz + (size_t)nc);
+    if (!mem) return ray_error("oom", NULL);
+    ray_t**   vals  = (ray_t**)mem;
+    uint32_t* uses  = (uint32_t*)(mem + vals_sz);
+    ew_ent_t* stk   = (ew_ent_t*)(mem + vals_sz + uses_sz);
+    uint8_t*  state = (uint8_t*)(mem + vals_sz + uses_sz + stk_sz);
+
+    ray_t* result = NULL;
+    int64_t sp = 0;
+
+    /* Prepass: count each node's in-tree consumers (parent edges from
+     * elementwise nodes, +1 for the root's return reference) BEFORE
+     * evaluating anything.  Counting lazily during the walk is wrong
+     * for diamond sharing: the first parent to emit would see the
+     * shared child at 1 use, drop it to 0 and free the value while a
+     * later parent still needs it.  Marks nodes EW_SEEN, which the
+     * evaluation walk below treats as unvisited. */
+    uses[root->id] = 1;
+    stk[sp++] = (ew_ent_t){root->id, 0};
+    while (sp > 0) {
+        uint32_t id = stk[--sp].id;
+        if (state[id] != EW_NEW) continue;
+        state[id] = EW_SEEN;
+        ray_op_t* n = op_node(g, id);
+        if (!n) { result = ray_error("nyi", NULL); goto done; }
+        for (int k = 0; k < n->arity; k++) {
+            ray_op_t* c = op_child(g, n, k);
+            if (c && op_is_elementwise(c->opcode)) {
+                uses[c->id]++;                    /* one per edge */
+                stk[sp++] = (ew_ent_t){c->id, 0};
+            }
+        }
+    }
+
+    stk[sp++] = (ew_ent_t){root->id, 0};
+
+    while (sp > 0) {
+        ew_ent_t e = stk[--sp];
+        ray_op_t* n = op_node(g, e.id);
+        if (!n) { result = ray_error("nyi", NULL); goto done; }
+
+        if (e.phase == 0) {                       /* discover */
+            if (state[e.id] == EW_DONE)           /* shared node, evaluated */
+                continue;
+            if (state[e.id] == EW_PENDING) {
+                /* Re-discovering a node whose emit is still pending means
+                 * the node is its own ancestor — a cyclic graph.  Refuse
+                 * rather than read a missing value. */
+                result = ray_error("nyi", NULL);
+                goto done;
+            }
+            state[e.id] = EW_PENDING;
+
+            /* Fusion attempt on descent (root's was just done by the
+             * caller).  The recursion re-tried expr_compile at every
+             * level; keep that so the deepest fuseable window still
+             * runs compiled. */
+            if (n != root && g->table && nr > 0) {
+                ray_expr_t ex;
+                if (expr_compile(g, g->table, n, &ex)) {
+                    ray_t* vec = expr_eval_full(&ex, nr);
+                    if (vec && !RAY_IS_ERR(vec)) {
+                        vals[e.id]  = vec;
+                        state[e.id] = EW_DONE;
+                        continue;
+                    }
+                    ray_error_free(vec);   /* fall through to per-node eval */
+                }
+            }
+
+            stk[sp++] = (ew_ent_t){e.id, 1};
+            for (int k = 0; k < n->arity; k++) {
+                ray_op_t* c = op_child(g, n, k);
+                if (c && op_is_elementwise(c->opcode))
+                    stk[sp++] = (ew_ent_t){c->id, 0};
+                /* non-elementwise children evaluate at emit time */
+            }
+        } else {                                  /* emit */
+            ray_t* in[2]    = {NULL, NULL};
+            bool   owned[2] = {false, false};     /* boundary refs to release */
+            for (int k = 0; k < n->arity; k++) {
+                ray_op_t* c = op_child(g, n, k);
+                if (c && op_is_elementwise(c->opcode)) {
+                    in[k] = vals[c->id];
+                    if (!in[k]) { result = ray_error("nyi", NULL); goto emit_fail; }
+                } else {
+                    in[k] = exec_node(g, c);      /* may recurse; depth-guarded */
+                    owned[k] = true;
+                    if (!in[k] || RAY_IS_ERR(in[k])) {
+                        result = in[k];
+                        in[k] = NULL;
+                        goto emit_fail;
+                    }
+                }
+            }
+
+            ray_t* out = (n->arity == 1)
+                       ? exec_elementwise_unary(g, n, in[0])
+                       : exec_elementwise_binary(g, n, in[0], in[1]);
+
+            for (int k = 0; k < n->arity; k++) {
+                if (owned[k]) {
+                    ray_release(in[k]);
+                } else {
+                    uint32_t cid = op_child(g, n, k)->id;
+                    if (--uses[cid] == 0) {
+                        ray_release(vals[cid]);
+                        vals[cid] = NULL;
+                    }
+                }
+            }
+            if (!out || RAY_IS_ERR(out)) { result = out; goto done; }
+            vals[e.id]  = out;
+            state[e.id] = EW_DONE;
+            continue;
+
+        emit_fail:
+            for (int k = 0; k < n->arity; k++)
+                if (owned[k] && in[k]) ray_release(in[k]);
+            goto done;
+        }
+    }
+
+    result = vals[root->id];
+    vals[root->id] = NULL;
+
+done:
+    /* Release stragglers: partially-evaluated memo entries on the error
+     * path (the success path has drained all consumers already). */
+    for (uint32_t i = 0; i < nc; i++)
+        if (vals[i]) ray_release(vals[i]);
+    scratch_free(hdr);
+    return result;
 }
 
 ray_t* exec_node(ray_graph_t* g, ray_op_t* op) {
@@ -1443,23 +1737,58 @@ ray_t* exec_node(ray_graph_t* g, ray_op_t* op) {
      * without adding cost to the per-row hot path. */
     if (ray_interrupted()) return ray_error("cancel", "interrupted");
 
+    /* Recursion depth guard — see RAY_EXEC_MAX_DEPTH above. */
+    if (++tl_exec_depth > RAY_EXEC_MAX_DEPTH) {
+        tl_exec_depth--;
+        return ray_error("limit", "exec depth exceeded");
+    }
+
     bool heavy = op_is_heavy(op->opcode);
     bool profiling = g_ray_profile.active && heavy;
     const char* oname = NULL;
     if (heavy) {
-        oname = ray_opcode_name(op->opcode);
+        oname = prof_op_label(op->opcode);
         /* Relabel progress without touching counters — leaf ops that
          * drive their own rows_done/rows_total still work; ops that
          * don't get a spinner-style indeterminate bar until they
          * either finish or emit their own update. */
         ray_progress_label(oname, NULL);
-        if (profiling) ray_profile_span_start(oname);
+        if (profiling) {
+            ray_prof_span_t* sp = ray_profile_span_start(oname);
+            if (sp) {
+                int64_t cur = 0; ray_sys_get_stat(&cur, NULL);
+                sp->sys_cur    = cur;
+                sp->qs_rows    = ray_qstats_sum_rows();
+                uint64_t sum = 0, mx = 0; uint32_t used = 0;
+                ray_qstats_agg(&used, &sum, &mx);
+                sp->qs_busy_ns = sum;
+            }
+        }
     }
 
     ray_t* _prof_result = exec_node_inner(g, op);
+    tl_exec_depth--;
 
-    if (profiling)
-        ray_profile_span_end(oname);
+    if (profiling) {
+        ray_prof_span_t* ep = ray_profile_span_end(oname);
+        if (ep) {
+            int64_t cur = 0; ray_sys_get_stat(&cur, NULL);
+            ep->sys_cur = cur;
+            ep->qs_rows = ray_qstats_sum_rows();
+            uint64_t sum = 0, mx = 0; uint32_t used = 0;
+            ray_qstats_agg(&used, &sum, &mx);
+            ep->qs_busy_ns = sum;
+            ep->qs_workers = used;
+            /* Result footprint — rows this operator produced. */
+            if (_prof_result && !RAY_IS_ERR(_prof_result) && !RAY_IS_NULL(_prof_result)) {
+                /* Scalar atoms alias their value into the len field, so
+                 * ray_len would report the value, not a row count. */
+                ep->rows_out  = (_prof_result->type == RAY_TABLE) ? ray_table_nrows(_prof_result)
+                              : ray_is_atom(_prof_result)         ? 1
+                              :                                      (int64_t)ray_len(_prof_result);
+            }
+        }
+    }
 
     return _prof_result;
 }
@@ -1562,23 +1891,11 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     }
                 }
             }
-            /* Fallback: recursive per-node evaluation */
-            if (op->arity == 1) {
-                ray_t* input = exec_node(g, op_child(g, op, 0));
-                if (!input || RAY_IS_ERR(input)) return input;
-                ray_t* result = exec_elementwise_unary(g, op, input);
-                ray_release(input);
-                return result;
-            } else {
-                ray_t* lhs = exec_node(g, op_child(g, op, 0));
-                ray_t* rhs = exec_node(g, op_child(g, op, 1));
-                if (!lhs || RAY_IS_ERR(lhs)) { if (rhs && !RAY_IS_ERR(rhs)) ray_release(rhs); return lhs; }
-                if (!rhs || RAY_IS_ERR(rhs)) { ray_release(lhs); return rhs; }
-                ray_t* result = exec_elementwise_binary(g, op, lhs, rhs);
-                ray_release(lhs);
-                ray_release(rhs);
-                return result;
-            }
+            /* Fallback: iterative per-node evaluation.  Deep chains
+             * (>1024-node NEG spines, machine-generated arithmetic)
+             * previously recursed one exec_node frame pair per link
+             * and overflowed the stack — see exec_elementwise_tree. */
+            return exec_elementwise_tree(g, op);
         }
 
         /* Reductions */
@@ -2158,6 +2475,19 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 /* NULL → lazy path; g->selection installed, tbl unchanged */
             }
 
+            /* Slice-group hint settle: an armed hint whose group shape is
+             * ineligible for the slice kernel folds into the equivalent
+             * selection HERE — before the sparse pre-compaction below —
+             * so ineligible fused shapes still get compacted instead of
+             * evaluating expression aggs over all rows. */
+            if (g->sg_col) {
+                ray_t* serr = ray_group_slice_hint_settle(g, op, tbl, 0);
+                if (serr) {
+                    if (owned_tbl) ray_release(owned_tbl);
+                    return serr;
+                }
+            }
+
             /* Sparse-selection pre-compaction: when the WHERE selection
              * admits far fewer rows than the table AND some group input is
              * a computed expression, exec_group would still materialize the
@@ -2183,8 +2513,13 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 }
                 bool contig = meta && meta->total_pass > 0 &&
                               all_rows * 4 >= meta->total_pass * 3;
+                /* Admission: compaction only ever fires when an expression
+                 * agg input exists (has_expr below) — the alternative is
+                 * materializing that expression over ALL rows — so the
+                 * scattered gate matches the projection-side compaction
+                 * factor (4x), not the plain-gather tradeoff (16x). */
                 if (gx && meta && nrows > 0 &&
-                    meta->total_pass * (contig ? 2 : 16) <= nrows) {
+                    meta->total_pass * (contig ? 2 : 4) <= nrows) {
                     int64_t keep[32];
                     bool has_expr = false;
                     int nkeep = group_input_scan_syms(g, gx, keep, 32, &has_expr);
@@ -2695,7 +3030,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
             }
             ray_op_ext_t* ext = find_ext(g, op->id);
             if (!ext) { ray_release(input); return ray_error("nyi", NULL); }
-            uint8_t n_cols = ext->sort.n_cols;
+            uint32_t n_cols = ext->sort.n_cols;
             uint32_t* columns = ext->sort.columns;
 
             /* Sparse-selection pre-compaction (mirrors OP_GROUP): expression
@@ -2739,7 +3074,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
             ray_t* saved_table = g->table;
             g->table = input;
 
-            for (uint8_t c = 0; c < n_cols; c++) {
+            for (uint32_t c = 0; c < n_cols; c++) {
                 ray_op_t* col_op = op_node(g, columns[c]);
                 if (col_op->opcode == OP_SCAN) {
                     /* Direct column reference — copy from input table */
@@ -3149,7 +3484,7 @@ static bool subtree_has_default_scan(ray_graph_t* g, ray_op_t* op, bool* ok,
     if (opc == OP_SELECT) {
         ray_op_ext_t* ext = find_ext(g, op->id);
         if (ext) {
-            for (uint8_t c = 0; c < ext->sort.n_cols && *ok; c++)
+            for (uint32_t c = 0; c < ext->sort.n_cols && *ok; c++)
                 found |= subtree_has_default_scan(g, op_node(g, ext->sort.columns[c]), ok, visited);
         }
     } else if (opc == OP_IF || opc == OP_SUBSTR || opc == OP_REPLACE) {
@@ -3207,12 +3542,18 @@ static bool dag_can_stream(ray_graph_t* g, ray_op_t* root) {
 static ray_t* ray_execute_inner(ray_graph_t* g, ray_op_t* root);
 
 ray_t* ray_execute(ray_graph_t* g, ray_op_t* root) {
-    ray_t* r = ray_execute_inner(g, root);
-    /* End the current progress tracking session. A no-op when no
-     * callback is registered; otherwise emits the final "100% done"
-     * tick (only if the bar was actually shown). */
-    ray_progress_end();
-    return r;
+    /* The qstats capture mode is armed once per query at the eval boundary
+     * (ray_eval, eval_depth==0) — covering PROF (profiler/query-log) AND the
+     * PROGRESS bit (progress pump).  Do NOT overwrite it here: a bare
+     * set_mode would drop the PROGRESS bit (killing the pump) and the qlog's
+     * PROF bit on a profiling-off query.  Only OR PROF in defensively, so a
+     * direct ray_execute call outside an eval boundary still profiles. */
+    if (g_ray_profile.active)
+        ray_qstats_set_mode(ray_qstats_mode() | RAY_QS_PROF);
+    /* Progress ends at the eval boundary (the true query end), not here —
+     * a query can drive several ray_execute calls, and ending after each
+     * would reset the elapsed clock and fire premature "final" ticks. */
+    return ray_execute_inner(g, root);
 }
 
 /* Flatten one parted/mapcommon column into a dense vector (mirrors the

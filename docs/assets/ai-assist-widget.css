@@ -1,0 +1,327 @@
+/* Rayforce AI Assist embeddable widget */
+:root {
+  --rfai-bg: #0a0e13;
+  --rfai-bg-section: #0d1219;
+  --rfai-bg-card: #111820;
+  --rfai-border: rgba(233, 160, 51, 0.1);
+  --rfai-border-hover: rgba(233, 160, 51, 0.25);
+  --rfai-primary: #e9a033;
+  --rfai-primary-light: #f0b856;
+  --rfai-primary-lighter: #f5cc7f;
+  --rfai-accent: #5eead4;
+  --rfai-text: #f1f5f9;
+  --rfai-text-muted: #7b8fa0;
+  --rfai-text-dim: #3a4f5c;
+  --rfai-font: var(--font, 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif);
+  --rfai-font-heading: var(--font-heading, 'Oswald', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif);
+  --rfai-mono: var(--mono, 'JetBrains Mono', 'SF Mono', SFMono-Regular, ui-monospace, Menlo, Consolas, monospace);
+}
+
+.rfai-launcher,
+.rfai-dialog,
+.rfai-dialog * { box-sizing: border-box; }
+
+.rfai-launcher {
+  position: fixed;
+  right: max(28px, env(safe-area-inset-right));
+  bottom: max(28px, env(safe-area-inset-bottom));
+  z-index: 2147483000;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  min-width: 172px;
+  min-height: 64px;
+  padding: 0 24px 0 16px;
+  border: 1px solid rgba(233, 160, 51, 0.36);
+  border-radius: 999px;
+  background: radial-gradient(circle at 20% 20%, rgba(255,255,255,.26), transparent 30%), linear-gradient(135deg, var(--rfai-primary), var(--rfai-primary-light));
+  color: var(--rfai-text);
+  box-shadow: 0 10px 34px rgba(233, 160, 51, 0.34), 0 18px 70px rgba(0,0,0,.46);
+  font-family: var(--rfai-font);
+  font-size: 1rem;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+  transition: transform .18s, box-shadow .18s, border-color .18s;
+}
+.rfai-launcher:hover {
+  transform: translateY(-2px);
+  border-color: rgba(245, 204, 127, 0.66);
+  box-shadow: 0 14px 42px rgba(233, 160, 51, 0.42), 0 24px 84px rgba(0,0,0,.54);
+}
+.rfai-launcher:focus-visible { outline: 2px solid var(--rfai-primary-lighter); outline-offset: 4px; }
+.rfai-launcher-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 42px;
+  height: 42px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: rgba(10, 14, 19, .24);
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,.18);
+}
+.rfai-launcher-icon svg { width: 25px; height: 25px; fill: currentColor; filter: drop-shadow(0 1px 6px rgba(255,255,255,.28)); }
+
+.rfai-dialog {
+  position: fixed;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 2147483001;
+  width: min(900px, calc(100vw - 40px));
+  height: min(760px, calc(100vh - 56px));
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  overflow: hidden;
+  background: rgba(13, 18, 25, .985);
+  border: 1px solid rgba(233, 160, 51, 0.18);
+  border-radius: 20px;
+  box-shadow: 0 30px 110px rgba(0,0,0,.68);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  font-family: var(--rfai-font);
+  color: var(--rfai-text);
+}
+.rfai-dialog[hidden] { display: none; }
+
+.rfai-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--rfai-border);
+  background: radial-gradient(ellipse 100% 90% at 16% 0%, rgba(233,160,51,.13), transparent 64%), rgba(10, 14, 19, .92);
+}
+.rfai-title-row { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.rfai-logo { display: block; width: 132px; height: auto; flex: 0 0 auto; }
+.rfai-header h2 {
+  margin: 0;
+  color: var(--rfai-text);
+  font-family: var(--rfai-font-heading);
+  font-size: 1.18rem;
+  font-weight: 700;
+  line-height: 1.1;
+}
+.rfai-header p { margin: 2px 0 0; color: var(--rfai-text-muted); font-size: .78rem; line-height: 1.35; }
+.rfai-icon-button {
+  width: 34px;
+  height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(233, 160, 51, 0.16);
+  border-radius: 999px;
+  background: rgba(233, 160, 51, 0.055);
+  color: var(--rfai-text-muted);
+  cursor: pointer;
+  transition: color .15s, border-color .15s, background .15s, transform .15s;
+}
+.rfai-icon-button svg {
+  width: 17px;
+  height: 17px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2.2;
+  stroke-linecap: round;
+}
+.rfai-icon-button:hover { color: var(--rfai-text); border-color: rgba(233, 160, 51, 0.36); background: rgba(233, 160, 51, .11); transform: rotate(90deg); }
+
+.rfai-messages {
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(233, 160, 51, 0.15) transparent;
+  background: radial-gradient(ellipse 80% 55% at 100% 0%, rgba(94, 234, 212, .045), transparent 58%), var(--rfai-bg-section);
+}
+.rfai-messages::-webkit-scrollbar { width: 5px; }
+.rfai-messages::-webkit-scrollbar-track { background: transparent; }
+.rfai-messages::-webkit-scrollbar-thumb { background: rgba(233, 160, 51, .16); border-radius: 3px; }
+
+.rfai-msg {
+  max-width: min(92%, 760px);
+  min-width: 0;
+  border: 1px solid var(--rfai-border);
+  border-radius: 14px;
+  padding: 11px 13px;
+  line-height: 1.62;
+  box-shadow: 0 10px 30px rgba(0,0,0,.16);
+  overflow-wrap: anywhere;
+}
+.rfai-msg .rfai-content { color: var(--rfai-text); }
+.rfai-msg .rfai-content p { margin: 8px 0; color: var(--rfai-text-muted); font-size: .9rem; }
+.rfai-msg .rfai-content p:first-child { margin-top: 0; }
+.rfai-msg .rfai-content p:last-child { margin-bottom: 0; }
+.rfai-msg .rfai-content a { color: var(--rfai-primary-light); text-decoration: none; border-bottom: 1px solid rgba(233, 160, 51, .35); }
+.rfai-msg .rfai-content a:hover { color: var(--rfai-accent); border-bottom-color: rgba(94, 234, 212, .45); }
+.rfai-msg .rfai-content ul { margin: 8px 0 8px 20px; padding: 0; color: var(--rfai-text-muted); font-size: .9rem; }
+.rfai-msg .rfai-content li { margin: 5px 0; }
+.rfai-msg .rfai-content h3,
+.rfai-msg .rfai-content h4,
+.rfai-msg .rfai-content h5 { margin: 12px 0 6px; color: var(--rfai-text); font-family: var(--rfai-font-heading); }
+.rfai-msg .rfai-content code {
+  font-family: var(--rfai-mono);
+  font-size: .85em;
+  background: rgba(233, 160, 51, 0.12);
+  color: var(--rfai-primary-lighter);
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+.rfai-msg .rfai-content pre {
+  overflow-x: hidden;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: var(--rfai-bg);
+  color: #e2e8f0;
+  border: 1px solid var(--rfai-border);
+  border-radius: 12px;
+  padding: 14px;
+  font-family: var(--rfai-mono);
+  font-size: .82rem;
+  line-height: 1.7;
+}
+.rfai-msg .rfai-content pre code { background: none; border: 0; padding: 0; color: inherit; }
+.rfai-table-wrap { overflow-x: hidden; margin: 12px 0; border: 1px solid var(--rfai-border); border-radius: 12px; }
+.rfai-msg table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: .85rem; background: rgba(17, 24, 32, .82); }
+.rfai-msg th {
+  text-align: left;
+  padding: 9px 12px;
+  background: rgba(233, 160, 51, 0.06);
+  color: var(--rfai-text-muted);
+  border-bottom: 1px solid var(--rfai-border);
+  font-family: var(--rfai-font-heading);
+  font-size: .7rem;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  overflow-wrap: anywhere;
+}
+.rfai-msg td { padding: 8px 12px; border-bottom: 1px solid rgba(233,160,51,.06); color: var(--rfai-text-muted); vertical-align: top; overflow-wrap: anywhere; }
+.rfai-msg tr:last-child td { border-bottom: 0; }
+
+.rfai-msg-user {
+  align-self: flex-end;
+  background: linear-gradient(135deg, rgba(233, 160, 51, .16), rgba(233, 160, 51, .07));
+  border-color: rgba(233, 160, 51, .25);
+  white-space: pre-wrap;
+}
+.rfai-msg-user .rfai-content p { color: var(--rfai-text); }
+.rfai-msg-assistant { align-self: stretch; max-width: 100%; background: var(--rfai-bg-card); }
+.rfai-msg-assistant.rfai-welcome .rfai-content p { color: var(--rfai-text-muted); }
+.rfai-msg-error {
+  align-self: flex-start;
+  border-color: rgba(248, 113, 113, .35);
+  background: rgba(127, 29, 29, .16);
+  white-space: normal;
+}
+.rfai-error-content { display: flex; align-items: center; gap: 10px; }
+.rfai-error-content p { flex: 1; min-width: 0; }
+.rfai-retry-button {
+  width: 34px;
+  height: 34px;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(248, 113, 113, .36);
+  border-radius: 999px;
+  background: rgba(248, 113, 113, .10);
+  color: #fecaca;
+  cursor: pointer;
+  transition: color .15s, border-color .15s, background .15s, transform .15s;
+}
+.rfai-retry-button svg {
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2.2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.rfai-retry-button:hover { color: var(--rfai-text); border-color: rgba(248, 113, 113, .62); background: rgba(248, 113, 113, .18); transform: rotate(-28deg); }
+
+.rfai-suggestions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 2px; }
+.rfai-suggestions button {
+  border: 1px solid var(--rfai-border);
+  border-radius: 999px;
+  padding: 7px 10px;
+  background: rgba(233, 160, 51, 0.05);
+  color: var(--rfai-text-muted);
+  font-family: var(--rfai-font);
+  font-size: .78rem;
+  cursor: pointer;
+  transition: color .15s, border-color .15s, background .15s;
+}
+.rfai-suggestions button:hover { color: var(--rfai-text); border-color: var(--rfai-border-hover); background: rgba(233, 160, 51, .09); }
+
+.rfai-form {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: stretch;
+  gap: 10px;
+  padding: 14px;
+  border-top: 1px solid var(--rfai-border);
+  background: rgba(10, 14, 19, .94);
+}
+.rfai-question {
+  resize: none;
+  min-height: 50px;
+  max-height: 120px;
+  border: 1px solid var(--rfai-border);
+  background: rgba(233, 160, 51, 0.055);
+  color: var(--rfai-text);
+  border-radius: 12px;
+  padding: 11px 12px;
+  font-family: var(--rfai-font);
+  font-size: .9rem;
+  outline: none;
+}
+.rfai-question::placeholder { color: var(--rfai-text-dim); }
+.rfai-question:focus { border-color: var(--rfai-primary); box-shadow: 0 0 0 3px rgba(233,160,51,.08); }
+.rfai-send {
+  width: 52px;
+  min-height: 50px;
+  height: 100%;
+  align-self: stretch;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(233, 160, 51, .35);
+  border-radius: 12px;
+  background: linear-gradient(135deg, var(--rfai-primary), var(--rfai-primary-light));
+  color: var(--rfai-text);
+  font-size: 20px;
+  font-weight: 700;
+  cursor: pointer;
+  box-shadow: 0 3px 14px rgba(233, 160, 51, .24);
+}
+.rfai-send[disabled] { opacity: .55; cursor: wait; }
+
+@media (max-width: 768px) {
+  .rfai-launcher {
+    right: max(16px, env(safe-area-inset-right));
+    bottom: max(16px, env(safe-area-inset-bottom));
+    min-width: 156px;
+    min-height: 60px;
+  }
+  .rfai-dialog {
+    left: 50%;
+    top: 50%;
+    right: auto;
+    bottom: auto;
+    transform: translate(-50%, -50%);
+    width: calc(100vw - 20px);
+    height: calc(100vh - 32px);
+    border-radius: 16px;
+  }
+  .rfai-header { padding: 12px; }
+  .rfai-logo { width: 116px; }
+  .rfai-messages { padding: 12px; }
+  .rfai-msg { max-width: 100%; }
+}

@@ -3,7 +3,7 @@
 Process-level introspection (build, memory, host info) and command-style operations (shell-out, profiler toggle, IPC listener bind, env dump, GC trigger). The dotted `.sys.<name>` builtins are the typed entry points; `.sys.cmd` parses a colon-style command string and dispatches to the same handlers — used by the REPL's `:listen 5000` style commands.
 
 !!! note "Restricted under `-U`"
-    `.sys.exec`, `.sys.cmd`, and `.sys.listen` are `RAY_FN_RESTRICTED` — they can either run arbitrary shell commands or change the process's network surface. The introspection entries (`.sys.args`, `.sys.build`, `.sys.info`, `.sys.mem`, `.sys.gc`, `.sys.env`, `.sys.timeit`) are unrestricted.
+    `.sys.exec`, `.sys.cmd`, `.sys.listen`, and `.sys.querylog.enable` are `RAY_FN_RESTRICTED` — they can run arbitrary shell commands, change the process's network surface, or change server-wide logging behaviour. The introspection entries (`.sys.args`, `.sys.build`, `.sys.info`, `.sys.mem`, `.sys.prof`, `.sys.querylog`, `.sys.gc`, `.sys.env`, `.sys.timeit`) are unrestricted.
 
 ## Reference
 
@@ -13,6 +13,9 @@ Process-level introspection (build, memory, host info) and command-style operati
 | [`.sys.build`](#sys-build) | variadic | — | Version + build date as a dict. |
 | [`.sys.info`](#sys-info) | variadic | — | Host facts: cores, page size, total memory. |
 | [`.sys.mem`](#sys-mem) | variadic | — | Allocator statistics. |
+| [`.sys.prof`](#sys-prof) | variadic | — | Last profiled query's per-step statistics as a table. |
+| [`.sys.querylog`](#sys-querylog) | variadic | — | Ambient per-query statistics ring as a table. |
+| [`.sys.querylog.enable`](#sys-querylog-enable) | variadic | restricted | Toggle query-statistics logging. |
 | [`.sys.gc`](#sys-gc) | variadic | — | Garbage-collect hint (no-op; returns 0). |
 | [`.sys.env`](#sys-env) | variadic | — | Count or list of globally bound names. |
 | [`.sys.exec`](#sys-exec) | unary | restricted | Run a shell command; return its exit code. |
@@ -30,6 +33,7 @@ Signature: `(.sys.args)`. Returns the process's command-line arguments as a dict
 | `port` | i64 | `-p` | IPC listen port; `0` if unset. |
 | `cores` | i64 | `-c` | Worker-pool size; `0` = auto. |
 | `timeit` | bool | `-t` | Profiler enabled at startup. |
+| `querylog` | bool | `-Q` | Query-statistics logging enabled at startup. |
 | `interactive` | bool | `-i` | Force the REPL after a script. |
 | `log` | str | `-l` / `-L` | Journal base path; empty if none. |
 | `user` | dict | after `--` | The application's own arguments. |
@@ -78,15 +82,130 @@ Signature: `(.sys.mem)`. Returns the buddy allocator's running counters:
 | Key | Meaning |
 |---|---|
 | `alloc-count` | Cumulative `ray_alloc` calls. |
-| `bytes-allocated` | Live bytes held by `ray_t` objects. |
+| `bytes-allocated` | Live bytes in buddy-pool blocks (sub-32 MB objects). |
+| `direct-bytes` | Live bytes in **direct** mmaps — large objects (≥ 32 MB) mapped at their exact page-rounded size, bypassing the power-of-2 buddy pool. `bytes-allocated + direct-bytes` is the true live object footprint. |
 | `peak-bytes` | High-watermark since process start. |
 | `slab-hits` | Cumulative fast-path slab allocations. |
-| `sys-current` | Currently-allocated bytes from the system allocator. |
+| `sys-current` | **Committed RAM**: every anonymous mapping — the buddy pools (where all vectors live), sys allocations, and the swap-fallback pool. The true live-memory figure. |
+| `sys-mapped` | **File-backed** bytes currently mapped (splayed columns, the symbol file, CSV/script parse buffers). Page-cache, evictable, resident only on touch — kept separate from `sys-current` so a read-once column can't masquerade as live RAM. |
+| `sys-mapped-peak` | High-watermark of `sys-mapped`. |
+
+Every mapping — buddy pool or file — is counted exactly once through the VM
+wrapper layer, so `sys-current` reflects the real committed footprint (a large
+`til` shows up here, not as a flat few MB). There is **no enforced memory
+ceiling**: the heap is out-of-core and spills to a file-backed mapping when
+anonymous `mmap` is refused. Total physical RAM is reported separately by
+[`.sys.info`](#sys-info) as `total-mem`; compare it against
+`bytes-allocated + direct-bytes` to gauge how close a workload is to spilling.
 
 ```lisp
 (.sys.mem)
-;; => {alloc-count: 12345, bytes-allocated: 524288, peak-bytes: 2097152, ...}
+;; => {alloc-count: 12345, bytes-allocated: 524288, peak-bytes: 2097152,
+;;     sys-current: 34754560, sys-mapped: 0, sys-mapped-peak: 0}
 ```
+
+## `.sys.prof` { #sys-prof }
+
+Signature: `(.sys.prof)`. Returns the profile of the **most recently
+completed** query as a table — one row per pipeline step (parse, the
+optimizer passes, each heavy operator, and materialize). Because it is an
+ordinary table it can be queried like any other, and an IPC client gets it
+with no extra protocol.
+
+Profiling is opt-in: toggle it with the REPL `:t` command, `.sys.timeit`,
+or the `-t` startup flag. With profiling off the table is empty. Capturing
+the payload adds no measurable cost to a non-profiled query.
+
+| Column | Meaning |
+|---|---|
+| `operator` | Step / operator label (symbol). |
+| `depth` | Nesting depth (0 = top level). |
+| `cumulative-ms` | Wall-clock milliseconds, **including** child operators. |
+| `exclusive-ms` | Self time — this step minus its children (where time actually went). |
+| `percent` | Share of total query time, exclusive-based (columns sum to ~100). |
+| `rows` | Result element / row count (operators). |
+| `output-kib` | Result serialized footprint, KiB (bandwidth produced). |
+| `allocated-kib` | Net process bytes allocated across the step, KiB. |
+| `workers` | Worker threads that ran a task for this step. |
+| `busy-ms` | Summed worker busy time, ms. |
+| `parallelism` | Effective parallelism = `busy-ms` / `cumulative-ms` (worker time ÷ wall time). |
+
+Timing follows the same convention as `EXPLAIN ANALYZE`-style profilers:
+`cumulative-ms` is the wall time of a step *and everything nested under it*,
+while `exclusive-ms` strips the children out so the true hot step stands out
+(a `count` over a huge `til` shows a large cumulative but a tiny exclusive —
+the `til` underneath is the real cost). `percent` ranks steps by exclusive
+time, so scanning that column finds the bottleneck directly.
+
+```lisp
+;; run a query with the profiler on (:t 1), then:
+(.sys.prof)
+;; a table: operator | depth | cumulative-ms | exclusive-ms | percent | rows |
+;;          output-kib | allocated-kib | workers | busy-ms | parallelism
+;; e.g. the GROUP row → rows=5000, output-kib=78.2, workers=28, parallelism=7.2
+
+;; it is a normal table, so query it — rank steps by self time:
+(select {from: (.sys.prof) where: (> exclusive-ms 1.0)})
+```
+
+The `:t` command also prints this as an indented tree after each query,
+with self time, percent, and the same payload appended to every operator line.
+
+## `.sys.querylog` { #sys-querylog }
+
+Signature: `(.sys.querylog)`. Returns the **query-statistics ring** as a table —
+one row per completed query, oldest first, capped at the ring capacity (4096).
+This is the ambient, server-side statistics feed: when logging is enabled the
+server records a summary of every query it handles, and you read it back with an
+ordinary query (an IPC client needs no extra protocol). The model mirrors a
+`system.query_log` table.
+
+Because each call returns a fresh materialized snapshot, anything you do to the
+returned table (filter, sort, `upsert`) touches the copy, never the ring; and
+`.sys.querylog` is a reserved name, so user code cannot rebind it. Empty until
+logging is enabled with the `-Q` startup flag or `(.sys.querylog.enable 1)`.
+
+| Column | Meaning |
+|---|---|
+| `time` | Wall-clock time the query finished (timestamp). |
+| `duration-ms` | Total wall time to answer the query. |
+| `result-rows` | Rows in the result (a scalar counts as 1). |
+| `output-kib` | Serialized result footprint, KiB. |
+| `memory-kib` | Net process allocation across the query, KiB. |
+| `workers` | Worker threads that ran a task. |
+| `parallelism` | Effective parallelism = worker busy time ÷ wall time. |
+| `status` | `ok`, or the error kind (e.g. `type`, `name`) on failure. |
+| `query` | Source text (truncated to 256 chars). |
+
+```lisp
+;; start the server with -Q 1 (or toggle at runtime), then:
+(.sys.querylog)
+;; a table: time | duration-ms | result-rows | output-kib | memory-kib |
+;;          workers | parallelism | status | query
+
+;; it is a normal table, so query it — slowest queries first:
+(select {from: (.sys.querylog) where: (> duration-ms 100.0)})
+
+;; error rate:
+(select {from: (.sys.querylog) by: status total: (count status)})
+```
+
+Capturing a row adds no measurable cost to a query, and logging is off by
+default — the disabled path is a single predicted branch.
+
+## `.sys.querylog.enable` { #sys-querylog-enable }
+
+Signature: `(.sys.querylog.enable [flag])`. Toggles query-statistics logging.
+No argument flips the current state; `0` disables; anything non-zero enables.
+Returns the new state as `i64` (0/1). Restricted under `-U` — it changes
+server-wide behaviour.
+
+```lisp
+(.sys.querylog.enable 1)   ;; => 1  (logging on)
+(.sys.querylog.enable)     ;; => 0  (flip: now off)
+```
+
+The `-Q` startup flag is the equivalent for enabling logging from launch.
 
 ## `.sys.gc` { #sys-gc }
 

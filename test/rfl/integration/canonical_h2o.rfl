@@ -63,7 +63,7 @@
 ;; recognises "non-agg expression containing aggregates" and routes
 ;; through nonagg_eval_per_group_buf.
 
-;; Single-key q7 — the canonical polars shape.
+;; Single-key q7 — the canonical shape.
 (set Tq7s (table [id3 v1 v2] (list [A A B B C C] [10 20 30 40 50 60] [5 15 25 35 45 55])))
 (count (select {r: (- (max v1) (min v2)) by: id3 from: Tq7s})) -- 3
 ;; (A) max=20 min=5  → 15
@@ -93,8 +93,8 @@
 
 ;; ─── q8: per-group top-N via existing primitives ──────────────────
 ;;
-;; Polars canonical:
-;;   df.sort("v3", reverse=True).groupby("id6").agg(Col("v3").head(2))
+;; Canonical shape:
+;;   sort v3 descending, group by id6, take head(2) of v3 per group
 ;; Engine equivalent — express as nonagg:
 ;;   (select {top2: (take (desc v3) 2) by: id6 from: t})
 (set Tq8 (table [id6 v3] (list [A A A B B C C C C] [3 1 5 2 7 4 9 6 8])))

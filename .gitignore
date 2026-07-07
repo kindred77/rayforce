@@ -39,13 +39,23 @@ rayforce.cov
 site/
 .venv-docs/
 
-# Allocator micro-benchmark binaries
-bench-alloc
-bench-group-pushdown
-bench-idx-route
-bench-join-buildside
-bench-join-dup
-bench-agg-v2
+# Benchmark binaries built into the repo root (the bench/ source dir is
+# unaffected — it has no hyphen).
+/bench-*
 
 # Rayforce REPL history
 .rayhist.dat
+
+# Editor/analyzer compilation database (machine-specific paths)
+compile_commands.json
+
+# Extra build flavours (see Makefile)
+rayforce.tsan
+rayforce.test.tsan
+
+# Fuzzing: grown corpus and crash artifacts stay local; only fuzz/seeds/ is committed
+fuzz/corpus/
+crash-*
+leak-*
+timeout-*
+oom-*

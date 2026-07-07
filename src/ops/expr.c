@@ -988,14 +988,14 @@ static void expr_exec_binary(uint8_t opcode, uint8_t null_aware, int8_t dt, void
                  * then zero-divisor pass marks null — same observable result). */
                 case OP_DIV: for (int64_t j=0;j<n;j++) {
                     if (I64_ISN(a[j])||I64_ISN(b[j])) { d[j]=NULL_I64; continue; }
-                    if (b[j]==0||(b[j]==-1&&a[j]==((int64_t)1<<63))) { d[j]=NULL_I64; continue; }
+                    if (b[j]==0||(b[j]==-1&&a[j]==INT64_MIN)) { d[j]=NULL_I64; continue; }
                     int64_t q=a[j]/b[j];
                     if ((a[j]^b[j])<0&&q*b[j]!=a[j]) q--;
                     d[j]=q;
                 } break;
                 case OP_MOD: for (int64_t j=0;j<n;j++) {
                     if (I64_ISN(a[j])||I64_ISN(b[j])) { d[j]=NULL_I64; continue; }
-                    if (b[j]==0||(b[j]==-1&&a[j]==((int64_t)1<<63))) { d[j]=NULL_I64; continue; }
+                    if (b[j]==0||(b[j]==-1&&a[j]==INT64_MIN)) { d[j]=NULL_I64; continue; }
                     int64_t m=a[j]%b[j];
                     if (m&&(m^b[j])<0) m+=b[j];
                     d[j]=m;
@@ -1014,13 +1014,13 @@ static void expr_exec_binary(uint8_t opcode, uint8_t null_aware, int8_t dt, void
                 case OP_SUB: for (int64_t j = 0; j < n; j++) d[j] = (int64_t)((uint64_t)a[j] - (uint64_t)b[j]); break;
                 case OP_MUL: for (int64_t j = 0; j < n; j++) d[j] = (int64_t)((uint64_t)a[j] * (uint64_t)b[j]); break;
                 case OP_DIV: for (int64_t j = 0; j < n; j++) {
-                    if (b[j]==0 || (b[j]==-1 && a[j]==((int64_t)1<<63))) { d[j]=0; continue; }
+                    if (b[j]==0 || (b[j]==-1 && a[j]==INT64_MIN)) { d[j]=0; continue; }
                     int64_t q = a[j]/b[j];
                     if ((a[j]^b[j])<0 && q*b[j]!=a[j]) q--;
                     d[j] = q;
                 } break;
                 case OP_MOD: for (int64_t j = 0; j < n; j++) {
-                    if (b[j]==0 || (b[j]==-1 && a[j]==((int64_t)1<<63))) { d[j]=0; continue; }
+                    if (b[j]==0 || (b[j]==-1 && a[j]==INT64_MIN)) { d[j]=0; continue; }
                     int64_t m = a[j]%b[j];
                     if (m && (m^b[j])<0) m+=b[j];
                     d[j] = m;
@@ -1042,13 +1042,13 @@ static void expr_exec_binary(uint8_t opcode, uint8_t null_aware, int8_t dt, void
             case OP_SUB: for (int64_t j = 0; j < n; j++) d[j] = (int32_t)((uint32_t)a[j] - (uint32_t)b[j]); break;
             case OP_MUL: for (int64_t j = 0; j < n; j++) d[j] = (int32_t)((uint32_t)a[j] * (uint32_t)b[j]); break;
             case OP_DIV: for (int64_t j = 0; j < n; j++) {
-                if (b[j]==0 || (b[j]==-1 && a[j]==((int32_t)1<<31))) { d[j]=0; continue; }
+                if (b[j]==0 || (b[j]==-1 && a[j]==INT32_MIN)) { d[j]=0; continue; }
                 int32_t q = a[j]/b[j];
                 if ((a[j]^b[j])<0 && q*b[j]!=a[j]) q--;
                 d[j] = q;
             } break;
             case OP_MOD: for (int64_t j = 0; j < n; j++) {
-                if (b[j]==0 || (b[j]==-1 && a[j]==((int32_t)1<<31))) { d[j]=0; continue; }
+                if (b[j]==0 || (b[j]==-1 && a[j]==INT32_MIN)) { d[j]=0; continue; }
                 int32_t m = a[j]%b[j];
                 if (m && (m^b[j])<0) m+=b[j];
                 d[j] = m;
@@ -2220,13 +2220,27 @@ static void propagate_nulls_binary(ray_t* lhs, ray_t* rhs, ray_t* result,
  * Element-wise execution
  * ============================================================================ */
 
+/* Graph type-inference stamps elementwise nodes with the scanned
+ * column's raw STORAGE tag — RAY_PARTED_* / RAY_MAPCOMMON propagate
+ * verbatim through NEG/ABS/... and promote().  At exec time OP_SCAN
+ * always hands the kernels a flat vector (segment tables in streaming
+ * mode, the flatten cold path otherwise), so a storage-tagged out_type
+ * would make ray_vec_new reject the allocation ("type" error).
+ * Normalize to the runtime element type: parted → its base type,
+ * mapcommon → the materialized operand's type. */
+static inline int8_t ew_runtime_out_type(int8_t out_type, int8_t operand_type) {
+    if (RAY_IS_PARTED(out_type)) return (int8_t)RAY_PARTED_BASETYPE(out_type);
+    if (out_type == RAY_MAPCOMMON) return operand_type;
+    return out_type;
+}
+
 ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
     (void)g;
     if (!input || RAY_IS_ERR(input)) return input;
     if (!ray_is_vec(input)) return ray_error("type", "expr eval: unary op expects a vector, got %s", ray_type_name(input->type));
     int64_t len = input->len;
     int8_t in_type = input->type;
-    int8_t out_type = op->out_type;
+    int8_t out_type = ew_runtime_out_type(op->out_type, in_type);
 
     ray_t* result = ray_vec_new(out_type, len);
     if (!result || RAY_IS_ERR(result)) return result;
@@ -2244,7 +2258,7 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
         while (ray_morsel_next(&m)) {
             int64_t n = m.morsel_len;
             double* src = (double*)m.morsel_ptr;
-            double* dst = (double*)((char*)ray_data(result) + out_off * sizeof(double));
+            double* dst = (double*)ray_data(result) + out_off;
             switch (opc) {
                 /* Single-null float model: SQRT/LOG/EXP can map finite→non-finite
                  * → canonicalize to NULL_F64 (HAS_NULLS via post-scan below).
@@ -2296,7 +2310,7 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
         while (ray_morsel_next(&m)) {
             int64_t n = m.morsel_len;
             int64_t* src = (int64_t*)m.morsel_ptr;
-            double* dst = (double*)((char*)ray_data(result) + out_off * sizeof(double));
+            double* dst = (double*)ray_data(result) + out_off;
             switch (opc) {
                 case OP_NEG:  for (int64_t i=0;i<n;i++) dst[i]=-(double)src[i]; break;
                 case OP_SQRT: for (int64_t i=0;i<n;i++) dst[i]=ray_f64_fin(sqrt((double)src[i])); break;
@@ -2353,7 +2367,7 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
                 while (ray_morsel_next(&m)) {
                     int64_t n = m.morsel_len;
                     int32_t* src = (int32_t*)m.morsel_ptr;
-                    double* dst = (double*)((char*)ray_data(result) + out_off * sizeof(double));
+                    double* dst = (double*)ray_data(result) + out_off;
                     for (int64_t i = 0; i < n; i++) dst[i] = (double)src[i];
                     out_off += n;
                 }
@@ -2371,7 +2385,7 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
                 while (ray_morsel_next(&m)) {
                     int64_t n = m.morsel_len;
                     int16_t* src = (int16_t*)m.morsel_ptr;
-                    double* dst = (double*)((char*)ray_data(result) + out_off * sizeof(double));
+                    double* dst = (double*)ray_data(result) + out_off;
                     for (int64_t i = 0; i < n; i++) dst[i] = (double)src[i];
                     out_off += n;
                 }
@@ -2389,7 +2403,7 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
                 while (ray_morsel_next(&m)) {
                     int64_t n = m.morsel_len;
                     uint8_t* src = (uint8_t*)m.morsel_ptr;
-                    double* dst = (double*)((char*)ray_data(result) + out_off * sizeof(double));
+                    double* dst = (double*)ray_data(result) + out_off;
                     for (int64_t i = 0; i < n; i++) dst[i] = (double)src[i];
                     out_off += n;
                 }
@@ -2587,14 +2601,20 @@ static void par_binary_str_fn(void* ctx, uint32_t worker_id, int64_t start, int6
 }
 
 /* Inner loop for binary element-wise over a range [start, end) */
+/* rdata is the result's data pointer, resolved ONCE by the caller on the
+ * dispatching thread.  Workers must not call ray_data(result) themselves:
+ * that reads result->attrs to test the slice bit, which races (per TSan)
+ * with the relaxed-atomic OR of HAS_NULLS other workers perform below.
+ * The pointer is stable for the whole op, so resolving it up front is
+ * both correct and one fewer branch per morsel. */
 static void binary_range(ray_op_t* op, int8_t out_type,
-                         ray_t* lhs, ray_t* rhs, ray_t* result,
+                         ray_t* lhs, ray_t* rhs, ray_t* result, void* rdata,
                          bool l_scalar, bool r_scalar,
                          double l_f64, double r_f64,
                          int64_t l_i64, int64_t r_i64,
                          int64_t start, int64_t end) {
     uint8_t out_esz = ray_elem_size(out_type);
-    void* dst = (char*)ray_data(result) + start * out_esz;
+    void* dst = (char*)rdata + start * out_esz;
     int64_t n = end - start;
 
     /* Fast path: integer-family column vs integer scalar → bool comparison.
@@ -2729,10 +2749,14 @@ static void binary_range(ray_op_t* op, int8_t out_type,
     int32_t* lp_i32 = NULL; uint32_t* lp_u32 = NULL; int16_t* lp_i16 = NULL;
     int32_t* rp_i32 = NULL; uint32_t* rp_u32 = NULL; int16_t* rp_i16 = NULL;
 
-    /* VLA bound of zero is UB; guarantee >=1 slot.  The fill loops below
-     * are bounded by n so extra slots are harmless. */
-    int64_t _sym_buf_n = n ? n : 1;
-    int64_t lsym_buf[_sym_buf_n], rsym_buf[_sym_buf_n]; /* stack VLA for narrow RAY_SYM (n<=1024) */
+    /* SYM index scratch — needed ONLY by narrow-width (W8/W16) or cross-domain
+     * SYM columns.  Allocated lazily on the heap (freed at `done:`) rather than
+     * as a stack VLA: the pool can hand a worker a morsel far larger than a page
+     * (grain is total/task_cap once the ring saturates), so an n-sized stack
+     * array would overflow the worker stack.  Non-SYM ops (the common case)
+     * allocate nothing. */
+    int64_t* lsym_buf = NULL;
+    int64_t* rsym_buf = NULL;
     /* sym-domain Phase 2: SYM column vs SYM column across DIFFERENT
      * domains cannot compare raw indices — re-express the rhs cells in
      * the lhs's domain via the buffer path (absent → -1: equals no lhs
@@ -2751,7 +2775,12 @@ static void binary_range(ray_op_t* op, int8_t out_type,
             uint8_t w = lhs->attrs & RAY_SYM_W_MASK;
             if (w == RAY_SYM_W64) lp_i64 = (int64_t*)lbase;
             else if (w == RAY_SYM_W32) lp_u32 = (uint32_t*)lbase;
-            else { for (int64_t j = 0; j < n; j++) lsym_buf[j] = ray_read_sym(l_data, l_off+j, lhs->type, lhs->attrs); lp_i64 = lsym_buf; }
+            else {
+                lsym_buf = (int64_t*)ray_alloc_raw((size_t)n * sizeof(int64_t));
+                if (!lsym_buf) goto done;
+                for (int64_t j = 0; j < n; j++) lsym_buf[j] = ray_read_sym(l_data, l_off+j, lhs->type, lhs->attrs);
+                lp_i64 = lsym_buf;
+            }
         }
         else if (lhs->type == RAY_I32 || lhs->type == RAY_DATE || lhs->type == RAY_TIME) lp_i32 = (int32_t*)lbase;
         else if (lhs->type == RAY_I16) lp_i16 = (int16_t*)lbase;
@@ -2767,6 +2796,8 @@ static void binary_range(ray_op_t* op, int8_t out_type,
             uint8_t w = rhs->attrs & RAY_SYM_W_MASK;
             if (sym_xlate) {
                 /* cross-domain: translate every rhs cell (any width) */
+                rsym_buf = (int64_t*)ray_alloc_raw((size_t)n * sizeof(int64_t));
+                if (!rsym_buf) goto done;
                 struct ray_sym_domain_s* ld = ray_sym_vec_domain(lhs);
                 struct ray_sym_domain_s* rd = ray_sym_vec_domain(rhs);
                 for (int64_t j = 0; j < n; j++) {
@@ -2779,7 +2810,12 @@ static void binary_range(ray_op_t* op, int8_t out_type,
             }
             else if (w == RAY_SYM_W64) rp_i64 = (int64_t*)rbase;
             else if (w == RAY_SYM_W32) rp_u32 = (uint32_t*)rbase;
-            else { for (int64_t j = 0; j < n; j++) rsym_buf[j] = ray_read_sym(r_data, r_off+j, rhs->type, rhs->attrs); rp_i64 = rsym_buf; }
+            else {
+                rsym_buf = (int64_t*)ray_alloc_raw((size_t)n * sizeof(int64_t));
+                if (!rsym_buf) goto done;
+                for (int64_t j = 0; j < n; j++) rsym_buf[j] = ray_read_sym(r_data, r_off+j, rhs->type, rhs->attrs);
+                rp_i64 = rsym_buf;
+            }
         }
         else if (rhs->type == RAY_I32 || rhs->type == RAY_DATE || rhs->type == RAY_TIME) rp_i32 = (int32_t*)rbase;
         else if (rhs->type == RAY_I16) rp_i16 = (int16_t*)rbase;
@@ -2850,7 +2886,7 @@ static void binary_range(ray_op_t* op, int8_t out_type,
             /* OP_DIV omitted — ray_binop hard-codes F64 for OP_DIV, so
              * narrow-output OP_DIV is unreachable through any caller. */
             case OP_IDIV:for(int64_t i=0;i<n;i++){double lv=LV_READ(i),rv=RV_READ(i);odst[i]=rv!=0.0?(int32_t)floor(lv/rv):0;}break;
-            case OP_MOD: for(int64_t i=0;i<n;i++){int32_t li=(int32_t)LV_READ(i),ri=(int32_t)RV_READ(i);int32_t r;if(ri==0||(ri==-1&&li==((int32_t)1<<31))){r=0;}else{r=li%ri;if(r&&(r^ri)<0)r+=ri;}odst[i]=r;}break;
+            case OP_MOD: for(int64_t i=0;i<n;i++){int32_t li=(int32_t)LV_READ(i),ri=(int32_t)RV_READ(i);int32_t r;if(ri==0||(ri==-1&&li==INT32_MIN)){r=0;}else{r=li%ri;if(r&&(r^ri)<0)r+=ri;}odst[i]=r;}break;
             case OP_MIN2:for(int64_t i=0;i<n;i++){int32_t li=(int32_t)LV_READ(i),ri=(int32_t)RV_READ(i);odst[i]=li<ri?li:ri;}break;
             case OP_MAX2:for(int64_t i=0;i<n;i++){int32_t li=(int32_t)LV_READ(i),ri=(int32_t)RV_READ(i);odst[i]=li>ri?li:ri;}break;
             default:     for(int64_t i=0;i<n;i++)odst[i]=0;break;
@@ -2913,6 +2949,9 @@ static void binary_range(ray_op_t* op, int8_t out_type,
     }
 #undef LV_READ
 #undef RV_READ
+done:
+    if (lsym_buf) ray_free_raw(lsym_buf);
+    if (rsym_buf) ray_free_raw(rsym_buf);
 }
 
 /* Context for parallel binary dispatch */
@@ -2922,6 +2961,7 @@ typedef struct {
     ray_t*    lhs;
     ray_t*    rhs;
     ray_t*    result;
+    void*     result_data;   /* ray_data(result), resolved once by the dispatcher */
     bool     l_scalar;
     bool     r_scalar;
     double   l_f64, r_f64;
@@ -2941,7 +2981,7 @@ static void par_binary_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t 
     (void)worker_id;
     par_binary_ctx_t* c = (par_binary_ctx_t*)ctx;
     if (!c->sel_flg) {
-        binary_range(c->op, c->out_type, c->lhs, c->rhs, c->result,
+        binary_range(c->op, c->out_type, c->lhs, c->rhs, c->result, c->result_data,
                      c->l_scalar, c->r_scalar,
                      c->l_f64, c->r_f64, c->l_i64, c->r_i64,
                      start, end);
@@ -2960,7 +3000,7 @@ static void par_binary_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t 
         if (s_lo < start) s_lo = start;
         if (s_hi > end)   s_hi = end;
         if (c->sel_flg[seg] == RAY_SEL_NONE) continue;
-        binary_range(c->op, c->out_type, c->lhs, c->rhs, c->result,
+        binary_range(c->op, c->out_type, c->lhs, c->rhs, c->result, c->result_data,
                      c->l_scalar, c->r_scalar,
                      c->l_f64, c->r_f64, c->l_i64, c->r_i64,
                      s_lo, s_hi);
@@ -2984,7 +3024,10 @@ ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* 
         len = lhs->len;
     }
 
-    int8_t out_type = op->out_type;
+    int8_t out_type = ew_runtime_out_type(op->out_type,
+                                          !l_scalar ? lhs->type
+                                        : !r_scalar ? rhs->type
+                                        : (int8_t)(lhs->type < 0 ? -lhs->type : lhs->type));
     ray_t* result = ray_vec_new(out_type, len);
     if (!result || RAY_IS_ERR(result)) return result;
     result->len = len;
@@ -3138,6 +3181,7 @@ ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* 
         par_binary_ctx_t ctx = {
             .op = op, .out_type = out_type,
             .lhs = lhs, .rhs = rhs, .result = result,
+            .result_data = ray_data(result),   /* resolve once on this thread */
             .l_scalar = l_scalar, .r_scalar = r_scalar,
             .l_f64 = l_f64_val, .r_f64 = r_f64_val,
             .l_i64 = l_i64_val, .r_i64 = r_i64_val,
@@ -3157,7 +3201,7 @@ ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* 
         }
         ray_pool_dispatch(pool, par_binary_fn, &ctx, len);
     } else {
-        binary_range(op, out_type, lhs, rhs, result,
+        binary_range(op, out_type, lhs, rhs, result, ray_data(result),
                      l_scalar, r_scalar,
                      l_f64_val, r_f64_val, l_i64_val, r_i64_val,
                      0, len);

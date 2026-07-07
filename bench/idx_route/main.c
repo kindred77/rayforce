@@ -1,5 +1,4 @@
 /* Index routing per-point perf gate.
- * Build: make bench-idx-route
  *
  * Measures 9 index-routing consumption points on 10M-row tables.
  * Each point is timed with index attached (indexed side) and dropped

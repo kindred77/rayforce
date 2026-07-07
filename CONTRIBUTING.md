@@ -35,7 +35,8 @@ See [RELEASE.md](RELEASE.md) for how releases are cut.
    make test       # runs the test suite
    ```
 
-4. Open the PR against **`dev`**. CI runs on every PR and push.
+4. Open the PR against **`dev`**. CI runs on every pull request (there are no
+   push-triggered runs — the PR run tests the exact merge result).
 
 ## Local build notes
 
@@ -44,6 +45,19 @@ See [RELEASE.md](RELEASE.md) for how releases are cut.
   errors (`-Werror -Wall -Wextra`). A warning will fail CI, so fix them locally.
 - The version reported by a local build is derived from git tags (`0.0.0` on an
   untagged checkout) — never hand-edit a version literal in source.
+
+### Build flavours
+
+Each flavour compiles to its own object files, so they never clobber one another.
+
+| Target | What it produces |
+|---|---|
+| `make` / `make debug` | default: `-O0 -g` with ASan + UBSan (the flavour tests run under) |
+| `make release` | `-O3 -march=native` with FP-reassociation flags |
+| `make hardened` | the cloud tier: release optimisation, but keeps `-g`/frame pointers and links `-rdynamic` so the crash handler (`src/core/crash.c`) prints a symbolized backtrace; defines `RAY_HARDENED` (keeps cheap invariant checks live) |
+| `make tsan` / `make tsan-test` | ThreadSanitizer build (clang; mutually exclusive with ASan) — see below |
+| `make coverage` | clang source-based coverage → `coverage_html/` |
+| `make compdb` | `compile_commands.json` for editors/analyzers |
 
 ## Tests
 
@@ -54,3 +68,22 @@ a focused subset with:
 ```sh
 ./rayforce.test -f <substring>
 ```
+
+## Stability tooling
+
+Beyond the ASan/UBSan test run, the repo carries a stability toolset. These
+gate CI (fuzz smoke + TSan on every PR) and run deeper overnight.
+
+- **Fuzzing** (Linux + clang): coverage-guided targets under `fuzz/` cover the
+  parser, numeric scanners, the binary wire/journal decoder, and the sandboxed
+  evaluator, CSV, and journal-replay paths. `make fuzz-smoke` is the PR gate;
+  `make fuzz-<target> FUZZ_RUNTIME=<secs>` runs one locally. See
+  [`fuzz/README.md`](fuzz/README.md), including the crash-triage workflow.
+- **ThreadSanitizer**: `make tsan-test TSAN_FILTER=<pool|heap|parallel|stress>`
+  runs the concurrency suites under TSan at 4 cores. Every entry in
+  `.tsan-suppressions` must justify why the report is benign.
+- **Static analysis** (advisory): `make tidy` (clang-tidy, correctness-only
+  checks) and `make cppcheck`.
+- **Nightly** (`.github/workflows/nightly.yml`): deep randomized stress, the full
+  suite under TSan, long fuzz runs, and a server soak (`scripts/soak.sh`) that
+  kill/restarts the server and watches resident memory for leaks.

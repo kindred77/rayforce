@@ -1,0 +1,1123 @@
+;; Width matrix (spec: unbounded-slots cut 1).  Each section proves a select
+;; path produces ALL requested outputs at widths beyond the former 16 cap,
+;; with values checked against per-column oracles.
+
+(set t (table [k g v] (list [1 1 2 2] [5 5 6 6] [10 20 30 40])))
+
+;; ── DAG path: single sym key, 17 aggregates ──
+(set r17 (select {from: t a01: (sum v) a02: (count v) a03: (min v) a04: (max v) a05: (sum v) a06: (count v) a07: (min v) a08: (max v) a09: (sum v) a10: (count v) a11: (min v) a12: (max v) a13: (sum v) a14: (count v) a15: (min v) a16: (max v) a17: (sum v) by: {k: k}}))
+(at (meta r17) 'len) -- 18
+(at r17 'k) -- [1 2]
+(at r17 'a01) -- [30 70]
+(at r17 'a16) -- [20 40]
+(at r17 'a17) -- [30 70]
+
+;; ── DAG path: boundary widths around the former 16-agg cap (15/16/17).
+;; The 17-agg case is r17 above; these two pin the immediate neighbours so
+;; a future regression that reintroduces an off-by-one at the boundary
+;; (rather than a hard 16 cap) is still caught. ──
+(at (meta (select {from: t a01: (sum v) a02: (sum v) a03: (sum v) a04: (sum v) a05: (sum v) a06: (sum v) a07: (sum v) a08: (sum v) a09: (sum v) a10: (sum v) a11: (sum v) a12: (sum v) a13: (sum v) a14: (sum v) a15: (sum v) by: {k: k}})) 'len) -- 16
+(at (meta (select {from: t a01: (sum v) a02: (sum v) a03: (sum v) a04: (sum v) a05: (sum v) a06: (sum v) a07: (sum v) a08: (sum v) a09: (sum v) a10: (sum v) a11: (sum v) a12: (sum v) a13: (sum v) a14: (sum v) a15: (sum v) a16: (sum v) by: {k: k}})) 'len) -- 17
+
+;; ── DAG path: composition oracle — 33 outputs, single sym key, cycling
+;; sum/count/min/max every 4 columns (a01=sum, a02=count, a03=min, a04=max,
+;; a05=sum, ...).  Values are the same 2-group fixture as r17 (k=[1 1 2 2]
+;; v=[10 20 30 40]): group k=1 has v=[10 20], group k=2 has v=[30 40], so
+;; sum=[30 70] count=[2 2] min=[10 30] max=[20 40] regardless of which
+;; column position asks for them.  Position p's function is
+;; [sum count min max][(p-1) mod 4]: a01 (p=1) -> sum, a17 (p=17,
+;; (17-1) mod 4 = 0) -> sum, a32 (p=32, (32-1) mod 4 = 3) -> max, a33
+;; (p=33, (33-1) mod 4 = 0) -> sum.  meta len = 1 key col + 33 outputs = 34. ──
+(set r33 (select {from: t a01: (sum v) a02: (count v) a03: (min v) a04: (max v) a05: (sum v) a06: (count v) a07: (min v) a08: (max v) a09: (sum v) a10: (count v) a11: (min v) a12: (max v) a13: (sum v) a14: (count v) a15: (min v) a16: (max v) a17: (sum v) a18: (count v) a19: (min v) a20: (max v) a21: (sum v) a22: (count v) a23: (min v) a24: (max v) a25: (sum v) a26: (count v) a27: (min v) a28: (max v) a29: (sum v) a30: (count v) a31: (min v) a32: (max v) a33: (sum v) by: {k: k}}))
+(at (meta r33) 'len) -- 34
+(at r33 'k) -- [1 2]
+(at r33 'a01) -- [30 70]
+(at r33 'a02) -- [2 2]
+(at r33 'a03) -- [10 30]
+(at r33 'a04) -- [20 40]
+(at r33 'a17) -- [30 70]
+(at r33 'a32) -- [20 40]
+(at r33 'a33) -- [30 70]
+
+;; ── DAG path: 10 compound outputs, each decomposing into 2 hidden agg slots (20 hidden > 16) ──
+(set rc (select {from: t c01: (+ (sum v) (count v)) c02: (+ (sum v) (count v)) c03: (+ (sum v) (count v)) c04: (+ (sum v) (count v)) c05: (+ (sum v) (count v)) c06: (+ (sum v) (count v)) c07: (+ (sum v) (count v)) c08: (+ (sum v) (count v)) c09: (+ (sum v) (count v)) c10: (+ (sum v) (count v)) by: {k: k}}))
+(at (meta rc) 'len) -- 11
+(at rc 'c01) -- [32 72]
+(at rc 'c10) -- [32 72]
+
+;; ── v2 engine: 17 aggs, low-card dense (serial dense path: nrows=4 is far
+;; below RAY_PARALLEL_THRESHOLD = 64*RAY_MORSEL_ELEMS = 65536, so this always
+;; runs the serial agg_group_keys_dense driver, never the pool) ──
+(set bt (table [k v] (list [1 1 2 2] [1.5 2.5 3.5 4.5])))
+(set rv (select {from: bt b01: (sum v) b02: (min v) b03: (max v) b04: (count v) b05: (avg v) b06: (sum v) b07: (min v) b08: (max v) b09: (count v) b10: (avg v) b11: (sum v) b12: (min v) b13: (max v) b14: (count v) b15: (avg v) b16: (sum v) b17: (sum v) by: {k: k}}))
+(at (meta rv) 'len) -- 18
+(at rv 'b17) -- [4.0 8.0]
+
+;; ── v2 engine: same width, higher-card key, still serial dense path (not
+;; hash/radix: nrows=5000 stays below the 65536 parallel threshold, so the
+;; serial branch runs; key range here is 0..4999, comfortably within
+;; DENSE_MAX_SLOTS, so agg_dense_plan succeeds and agg_group_keys_dense
+;; drives it — the serial-vs-parallel choice tracks nrows, not key
+;; cardinality, but agg_dense_plan's own range check still applies) ──
+(set ht (table [k v] (list (til 5000) (til 5000))))
+(set rh (select {from: ht b01: (sum v) b02: (min v) b03: (max v) b04: (count v) b05: (sum v) b06: (min v) b07: (max v) b08: (count v) b09: (sum v) b10: (min v) b11: (max v) b12: (count v) b13: (sum v) b14: (min v) b15: (max v) b16: (count v) b17: (sum v) by: {k: k}}))
+(at (meta rh) 'len) -- 18
+(sum (at rh 'b17)) -- 12497500
+
+;; ── v2 engine: 17 aggs, PARALLEL DENSE path ──
+;; Routing (src/ops/agg_engine.c exec_group_v2_run, ~line 2569 on): once
+;; `pool && eff_n >= RAY_PARALLEL_THRESHOLD` (65536), dense_par_ok is tried
+;; FIRST and wins whenever agg_dense_plan succeeds (product of key ranges <=
+;; DENSE_MAX_SLOTS = 262144) and the per-worker slab fits the 8MB/worker cap.
+;; k = (% (til 100000) 1000): nrows=100000 >= 65536 and key range is exactly
+;; 1000 (values 0..999) <= 262144, and total_slots(1000)*(block+8) is far
+;; under 8MB for any block size — so this provably takes
+;; exec_group_v2_parallel_dense.
+;; Each group g in 0..999 has exactly 100 members {g, g+1000, ..., g+99000}
+;; (v = til 100000, so v_i = i = k-column's own row index).
+;; sum(v) over group g = 100*g + 1000*(0+1+...+99) = 100*g + 4950000.
+;; Sum of that across all 1000 groups = 100*(0+...+999) + 1000*4950000
+;;   = 100*499500 + 4950000000 = 49950000 + 4950000000 = 4999950000
+;;   = sum(til 100000) = 99999*100000/2, as expected (every v is counted
+;;   exactly once, partitioned across groups).
+(set pt (table [k v] (list (% (til 100000) 1000) (til 100000))))
+(set rp (select {from: pt p01: (sum v) p02: (min v) p03: (max v) p04: (count v) p05: (sum v) p06: (min v) p07: (max v) p08: (count v) p09: (sum v) p10: (min v) p11: (max v) p12: (count v) p13: (sum v) p14: (min v) p15: (max v) p16: (count v) p17: (sum v) by: {k: k}}))
+(at (meta rp) 'len) -- 18
+(count (at rp 'k)) -- 1000
+(sum (at rp 'p17)) -- 4999950000
+
+;; ── v2 engine: 17 aggs, RADIX path ──
+;; k = (* 5 (til 100000)) is UNIQUE per row: min=0, max=499995, range=499996,
+;; which exceeds DENSE_MAX_SLOTS (262144) — agg_dense_plan's overflow-safe
+;; product check (`total > DENSE_MAX_SLOTS / rng`) rejects it, so dp.ok=false
+;; and dense_par_ok is false (short-circuited on dp.ok before the byte-budget
+;; check). keys_intsym is true (I64 key, no nulls), and every aggregate below
+;; is ACC_STREAMING, so the router takes the cardinality-estimate branch:
+;; agg_estimate_card samples up to 65536 rows and early-exits the moment
+;; distinct count passes T_ROUTE=16384. Since every key in the sampled prefix
+;; is distinct (unique per row), the sample hits 16385 distinct groups well
+;; before exhausting its 65536-row budget and returns t_route+1 (16385) >
+;; T_ROUTE — so `est <= T_ROUTE` is false and the router falls through to
+;; exec_group_v2_parallel_radix. This provably exercises the radix path, not
+;; small-hash.
+;; Every group has exactly 1 member (keys are unique), so sum(v) per group is
+;; just that row's v = its row index; summed over all 100000 groups that is
+;; sum(til 100000) = 4999950000 again, and the result has exactly 100000
+;; groups (one per input row).
+(set xt (table [k v] (list (* 5 (til 100000)) (til 100000))))
+(set rx (select {from: xt x01: (sum v) x02: (min v) x03: (max v) x04: (count v) x05: (sum v) x06: (min v) x07: (max v) x08: (count v) x09: (sum v) x10: (min v) x11: (max v) x12: (count v) x13: (sum v) x14: (min v) x15: (max v) x16: (count v) x17: (sum v) by: {k: k}}))
+(at (meta rx) 'len) -- 18
+(count (at rx 'k)) -- 100000
+(sum (at rx 'x17)) -- 4999950000
+
+;; ── eval-group path (multi-key + non-agg output): 17 outputs ──
+(set re (select {from: t a01: (sum v) a02: (sum v) a03: (sum v) a04: (sum v) a05: (sum v) a06: (sum v) a07: (sum v) a08: (sum v) a09: (sum v) a10: (sum v) a11: (sum v) a12: (sum v) a13: (sum v) a14: (sum v) a15: (sum v) a16: (sum v) n1: v by: {k: k g: g}}))
+(at (meta re) 'len) -- 19
+(at re 'a16) -- [30 70]
+
+;; ── count-only with take:: 17 count outputs, single by-key (DAG path;
+;; the eval-level count-only pre-take block is multi-key-only — see the
+;; ROUTING NOTE below) ──
+(set rt (select {from: t c01: (count v) c02: (count v) c03: (count v) c04: (count v) c05: (count v) c06: (count v) c07: (count v) c08: (count v) c09: (count v) c10: (count v) c11: (count v) c12: (count v) c13: (count v) c14: (count v) c15: (count v) c16: (count v) c17: (count v) by: {k: k} take: 2}))
+(at (meta rt) 'len) -- 18
+(at rt 'c17) -- [2 2]
+
+;; ── multi-key count-only take: 17 count outputs, TWO by-keys, take: 2.
+;; Fixture: t has k=[1 1 2 2] g=[5 5 6 6] v=[10 20 30 40], so the composite
+;; groups are (k=1,g=5) and (k=2,g=6), each of size 2; take: 2 keeps both.
+;; Expected: nk(2) + 17 count columns = 19 columns total, every cNN=[2 2].
+;;
+;; ROUTING NOTE (verified by reading src/ops/query.c's by: routing, lines
+;; ~6101-6231, PLUS empirically by temporarily instrumenting that routing
+;; with an stderr probe, rebuilding, and running this exact query — the
+;; instrumentation was reverted before committing, not shipped):
+;; this shape does NOT reach the eval-group multi-key count-only pre-take
+;; block (query.c ~6353-6480, sized in commit f9c5cae7 "select: exact-size
+;; eval-group and count-only collectors").  That block only runs inside
+;; `if (use_eval_group)`, and for a >1-key by: with EVERY output a plain
+;; DAG-aggregable expr (is_group_dag_agg_expr — true for a bare `(count
+;; v)`), `use_eval_group` has no path to become true: the only multi-key
+;; trigger is a by-key column of type RAY_LIST (query.c ~6186-6189); the
+;; `n_out == 0` and `any_nonagg` triggers both require zero outputs or a
+;; non-agg output, neither of which holds for an all-count shape.  Probed
+;; directly: `use_eval_group=0` for this exact query.  A comment at query.c
+;; ~6191-6202 confirms this is intentional — a prior routing that sent
+;; bounded multi-key count-take queries to this eval-level block was
+;; removed because the parallel multi-key DAG/v2-agg path measured faster
+;; at every sampled size, so plain int/sym multi-key count-only + take:
+;; queries are answered by that DAG/v2 path instead (the same engine the
+;; rv/rh/rp/rx cells above already exercise).  Forcing entry via a
+;; RAY_LIST-typed by-key column DOES reach the count-only block
+;; (count_only=1 probed), but that block then hits an unrelated
+;; pre-existing bug building the LIST-typed key output column ("type:
+;; vec_new: type must be a positive concrete vector type, got LIST") —
+;; so no shape both reaches that exact block AND returns a correct
+;; result. This cell instead pins the width-retirement guarantee for
+;; whichever multi-key count-only path IS live (the DAG/v2 engine),
+;; which is the coverage gap an earlier review actually flagged as
+;; missing; the eval-group block itself is presently dead code for any
+;; correctness-preserving multi-key shape. ──
+(set rmk (select {from: t c01: (count v) c02: (count v) c03: (count v) c04: (count v) c05: (count v) c06: (count v) c07: (count v) c08: (count v) c09: (count v) c10: (count v) c11: (count v) c12: (count v) c13: (count v) c14: (count v) c15: (count v) c16: (count v) c17: (count v) by: {k: k g: g} take: 2}))
+(at (meta rmk) 'len) -- 19
+(at rmk 'k) -- [1 2]
+(at rmk 'g) -- [5 6]
+(at rmk 'c01) -- [2 2]
+(at rmk 'c17) -- [2 2]
+
+;; ── scalar reduction (no by:): 17 aggregates — was a SILENT drop past 16 ──
+(set rs (select {from: t s01: (sum v) s02: (count v) s03: (min v) s04: (max v) s05: (sum v) s06: (count v) s07: (min v) s08: (max v) s09: (sum v) s10: (count v) s11: (min v) s12: (max v) s13: (sum v) s14: (count v) s15: (min v) s16: (max v) s17: (sum v)}))
+(at (meta rs) 'len) -- 17
+(at rs 's17) -- [100]
+
+;; ── projection (no by:, no agg): 20 columns ──
+(set wt (table [c01 c02 c03 c04 c05 c06 c07 c08 c09 c10 c11 c12 c13 c14 c15 c16 c17 c18 c19 c20] (list [1] [2] [3] [4] [5] [6] [7] [8] [9] [10] [11] [12] [13] [14] [15] [16] [17] [18] [19] [20])))
+(set rp (select {from: wt p01: c01 p20: c20 p17: c17 p02: c02 p03: c03 p04: c04 p05: c05 p06: c06 p07: c07 p08: c08 p09: c09 p10: c10 p11: c11 p12: c12 p13: c13 p14: c14 p15: c15 p16: c16 p18: c18 p19: c19}))
+(at (meta rp) 'len) -- 20
+(at rp 'p20) -- [20]
+
+;; ── sort: 17 sort keys, no by: (DAG-compiled path, src/ops/query.c ~line
+;; 574) — exact-size scratch carve replaces the fixed sort_keys[16]/
+;; sort_descs[16] stack arrays.  16 all-equal dummy keys (d01..d16) plus a
+;; discriminator `sk` last: sorting ascending by [d01..d16 sk] is fully
+;; decided by `sk` (1 before 2) since every d0N tie-breaks to nothing.
+;; No output projection dict here (plain pass-through of every source
+;; column) — a narrowed projection that drops the sort-key columns hits an
+;; unrelated, pre-existing bug in exec_sort's OP_SCAN shortcut (it resolves
+;; scan nodes against the post-projection table instead of g->table; already
+;; reproducible on unmodified code with a single sort key, out of scope here).
+(set st (table [d01 d02 d03 d04 d05 d06 d07 d08 d09 d10 d11 d12 d13 d14 d15 d16 sk pay] (list [0 0] [0 0] [0 0] [0 0] [0 0] [0 0] [0 0] [0 0] [0 0] [0 0] [0 0] [0 0] [0 0] [0 0] [0 0] [0 0] [2 1] [20 10])))
+(at (select {from: st asc: [d01 d02 d03 d04 d05 d06 d07 d08 d09 d10 d11 d12 d13 d14 d15 d16 sk]}) 'pay) -- [10 20]
+
+;; ── sort: 17 sort keys, WITH by: (apply_sort_take path, src/ops/query.c
+;; ~line 8647 in this file's numbering pre-fix — post-agg sort, group-by
+;; changes the output schema so this can't be added to the DAG and instead
+;; sorts the materialized group-by result).  17 aggregate outputs a01..a17
+;; are each (sum v): within one group every a0N is numerically identical, so
+;; sorting ascending by all 17 is fully decided by that one value.  Source
+;; row order is k=2 (v=20) before k=1 (v=10) — the opposite of sorted order —
+;; so a genuine reorder (not a no-op pass-through) is required to get [10 20].
+(set gt (table [k v] (list [2 1] [20 10])))
+(set rg (select {from: gt a01: (sum v) a02: (sum v) a03: (sum v) a04: (sum v) a05: (sum v) a06: (sum v) a07: (sum v) a08: (sum v) a09: (sum v) a10: (sum v) a11: (sum v) a12: (sum v) a13: (sum v) a14: (sum v) a15: (sum v) a16: (sum v) a17: (sum v) by: {k: k} asc: [a01 a02 a03 a04 a05 a06 a07 a08 a09 a10 a11 a12 a13 a14 a15 a16 a17]}))
+(at rg 'a17) -- [10 20]
+(at rg 'k) -- [1 2]
+
+;; ── window: 17 partition columns (src/ops/query.c ray_window_fn — exact-size
+;; scratch carve replaces the fixed part_ops[16]/order_ops[16]/order_descs[16]
+;; and func_kinds[32]/func_inputs[32]/func_params[32]/out_name_ids[32] stack
+;; arrays). p01..p17 are all constant (value 1 in both rows), so both rows
+;; fall into a single partition; v = [3.0 5.0], and `min` over the whole
+;; partition broadcasts min(3.0, 5.0) = 3.0 to every row in that partition.
+(set wp (table [p01 p02 p03 p04 p05 p06 p07 p08 p09 p10 p11 p12 p13 p14 p15 p16 p17 v] (list [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [3.0 5.0])))
+(at (window {from: wp part: [p01 p02 p03 p04 p05 p06 p07 p08 p09 p10 p11 p12 p13 p14 p15 p16 p17] funcs: {mn: (min v)}}) 'mn) -- [3.0 3.0]
+
+;; ── window exec: 17 partition keys over >64 rows (src/ops/window.c
+;; multi-key composite radix gate).  The exec-side radix_encode_ctx_t
+;; (src/ops/internal.h) carries fixed 16-key mins/ranges/bit_shifts/descs/
+;; enum_ranks arrays; 17 narrow keys (total_bits = 17 <= 64) used to pass
+;; the `fits` check alone and overrun them — stack corruption in
+;; exec_window's frame.  Post-fix the gate is `fits && n_sort <= 16`
+;; (mirroring src/ops/sort.c), so this shape takes the unbounded
+;; merge-sort fallback instead.  100 rows forces past the nrows <= 64
+;; insertion-sort path that the 2-row wp cell above stops at.  p01..p16
+;; are constant (range 0 → 1 bit each) and p17 alternates 0/1, so the
+;; rows split into two 50-row partitions: even v (min 0) and odd v
+;; (min 1), broadcast back per row in source order → mn = [0 1 0 1 ...].
+(set wq (table [p01 p02 p03 p04 p05 p06 p07 p08 p09 p10 p11 p12 p13 p14 p15 p16 p17 v] (list (take [1] 100) (take [1] 100) (take [1] 100) (take [1] 100) (take [1] 100) (take [1] 100) (take [1] 100) (take [1] 100) (take [1] 100) (take [1] 100) (take [1] 100) (take [1] 100) (take [1] 100) (take [1] 100) (take [1] 100) (take [1] 100) (% (til 100) 2) (til 100))))
+(set wr (at (window {from: wq part: [p01 p02 p03 p04 p05 p06 p07 p08 p09 p10 p11 p12 p13 p14 p15 p16 p17] funcs: {mn: (min v)}}) 'mn))
+(count wr) -- 100
+(at wr 0) -- 0
+(at wr 1) -- 1
+(sum wr) -- 50
+
+;; ── nonagg scatter path: 17 pure non-agg outputs, single key.  Retires the
+;; DAG-compile `n_nonaggs >= 16` cap in src/ops/query.c ray_select_fn (the
+;; last of the fixed 16-slot behaviour caps): with by: {k: k} and no aggregate
+;; outputs, each nNN: v collapses to a per-group LIST column.  Group k=1
+;; collects v=[10 20], group k=2 collects v=[30 40]; the 17th output n17
+;; proves the surplus past the former cap survives, not just the head.
+(set rna (select {from: t n01: v n02: v n03: v n04: v n05: v n06: v n07: v n08: v n09: v n10: v n11: v n12: v n13: v n14: v n15: v n16: v n17: v by: {k: k}}))
+(at (meta rna) 'len) -- 18
+(at rna 'k) -- [1 2]
+(at (at rna 'n17) 0) -- [10 20]
+(at (at rna 'n17) 1) -- [30 40]
+
+;; ── nonagg per-group output: pure-arithmetic expression referencing 17
+;; columns, single group (src/ops/query.c collect_col_refs callers in
+;; nonagg_eval_per_group_core/eval_expr_per_row — exact-size scratch carve
+;; replaces the fixed col_syms[16]/cols[16]).  This shape is a PIN, not a
+;; regression probe: a pure-arithmetic nonagg expression with no nested
+;; aggregate is evaluated ONCE against the whole table via bind_all_columns
+;; (src/ops/query.c ray_select_fn's DAG nonagg-fill, ~"R8 fallback" region)
+;; and then split per group by row index — that fast path binds every
+;; column unconditionally and never calls collect_col_refs, so this exact
+;; shape was already correct pre-fix (verified by running it against the
+;; pre-fix binary: identical output). x sums c01..c17 per row: row0 =
+;; 16*1+2=18, row1 = 16*1+3=19; a = (sum c01) = 1+1 = 2.
+(set nw (table [k c01 c02 c03 c04 c05 c06 c07 c08 c09 c10 c11 c12 c13 c14 c15 c16 c17] (list [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [2 3])))
+(set rn (select {from: nw a: (sum c01) x: (+ c01 (+ c02 (+ c03 (+ c04 (+ c05 (+ c06 (+ c07 (+ c08 (+ c09 (+ c10 (+ c11 (+ c12 (+ c13 (+ c14 (+ c15 (+ c16 c17)))))))))))))))) by: {k: k}}))
+(at (meta rn) 'len) -- 3
+(at rn 'a) -- [2]
+(at (at rn 'x) 0) -- [18 19]
+
+;; ── nonagg per-group eval, GENUINE regression probe: same 17-column
+;; arithmetic expression but with a NESTED aggregate ((max c01)) wrapping
+;; the first operand, over TWO groups.  expr_contains_agg forces this
+;; through nonagg_eval_per_group_buf → nonagg_eval_per_group_core (a
+;; single whole-table eval would collapse (max c01) globally instead of
+;; per-group) — exactly the collect_col_refs-capped path the pin above
+;; doesn't reach.  Confirmed pre-fix: collect_col_refs truncates at 16
+;; refs (c01 via `max`, plus c02..c16), drops c17 from col_syms/cols, and
+;; since bind_col_slice only binds the first 16 refs as locals, the
+;; per-group ray_eval of `c17` raised "name: 'c17' undefined" — a hard
+;; error, not a silently wrong value (reproduced against the pre-fix
+;; binary).  Post-fix, ncols(tbl) sizes the carve so all 17 refs are
+;; collected and bound, and the group evaluates cleanly.
+;; Oracle: group k=1 (rows with c17=[2 3]): max(c01)=1, c02..c16 sum to
+;; 15, x = 1+15+c17 = [18 19].  Group k=2 (rows with c17=[4 5]): x =
+;; 1+15+c17 = [20 21].  a = (sum c01) = [2 2] (two rows of c01=1 per group).
+(set nwg (table [k c01 c02 c03 c04 c05 c06 c07 c08 c09 c10 c11 c12 c13 c14 c15 c16 c17] (list [1 1 2 2] [1 1 1 1] [1 1 1 1] [1 1 1 1] [1 1 1 1] [1 1 1 1] [1 1 1 1] [1 1 1 1] [1 1 1 1] [1 1 1 1] [1 1 1 1] [1 1 1 1] [1 1 1 1] [1 1 1 1] [1 1 1 1] [1 1 1 1] [1 1 1 1] [2 3 4 5])))
+(set rng (select {from: nwg a: (sum c01) x: (+ (max c01) (+ c02 (+ c03 (+ c04 (+ c05 (+ c06 (+ c07 (+ c08 (+ c09 (+ c10 (+ c11 (+ c12 (+ c13 (+ c14 (+ c15 (+ c16 c17)))))))))))))))) by: {k: k}}))
+(at (meta rng) 'len) -- 3
+(at rng 'k) -- [1 2]
+(at rng 'a) -- [2 2]
+(at (at rng 'x) 0) -- [18 19]
+(at (at rng 'x) 1) -- [20 21]
+
+;; ── compact-fallback sym buffer, GENUINE regression probe: WHERE + GROUP
+;; with 16 keys and 33 distinct-column aggs (src/ops/agg_engine.c
+;; agg_build_compact's want[] scratch, formerly a fixed want[48]).  A WHERE
+;; clause forces exec_group_v2_run down AGG_RUN_COMPACT_FALLBACK, which
+;; de-dups every key sym + every agg-input sym into want[]: 16 keys + 33
+;; agg inputs = 49 distinct syms here, one past the old fixed want[48] —
+;; UBSan reported "index 48 out of bounds for type 'int64_t [48]'" and ASan
+;; a stack-buffer-overflow WRITE at agg_engine.c:2768 (agg_build_compact),
+;; called from exec_group_v2_run (agg_engine.c:2692). Fixed by sizing want[]
+;; from an exact carve (n_keys + 2*n_aggs, the structural max before dedup)
+;; instead of a fixed array.
+;; Oracle (hand-derived): all 16 keys are (% (til 100) 2), so every row's
+;; full key tuple is just (row%2) repeated 16x — exactly 2 groups. WHERE
+;; (> v01 10) keeps rows 11..99 (v01 = til 100). Group parity 1 (odd rows
+;; 11,13,...,99) and parity 0 (even rows 12,14,...,98); v33 = til 100, so
+;; sum(s33) over kept rows = sum(11..99) = sum(0..99) - sum(0..10)
+;; = 4950 - 55 = 4895.
+(set wide48 (table [k01 k02 k03 k04 k05 k06 k07 k08 k09 k10 k11 k12 k13 k14 k15 k16 v01 v02 v03 v04 v05 v06 v07 v08 v09 v10 v11 v12 v13 v14 v15 v16 v17 v18 v19 v20 v21 v22 v23 v24 v25 v26 v27 v28 v29 v30 v31 v32 v33] (list (% (til 100) 2) (% (til 100) 2) (% (til 100) 2) (% (til 100) 2) (% (til 100) 2) (% (til 100) 2) (% (til 100) 2) (% (til 100) 2) (% (til 100) 2) (% (til 100) 2) (% (til 100) 2) (% (til 100) 2) (% (til 100) 2) (% (til 100) 2) (% (til 100) 2) (% (til 100) 2) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100))))
+(set r48 (select {from: wide48 s01: (sum v01) s02: (sum v02) s03: (sum v03) s04: (sum v04) s05: (sum v05) s06: (sum v06) s07: (sum v07) s08: (sum v08) s09: (sum v09) s10: (sum v10) s11: (sum v11) s12: (sum v12) s13: (sum v13) s14: (sum v14) s15: (sum v15) s16: (sum v16) s17: (sum v17) s18: (sum v18) s19: (sum v19) s20: (sum v20) s21: (sum v21) s22: (sum v22) s23: (sum v23) s24: (sum v24) s25: (sum v25) s26: (sum v26) s27: (sum v27) s28: (sum v28) s29: (sum v29) s30: (sum v30) s31: (sum v31) s32: (sum v32) s33: (sum v33) where: (> v01 10) by: {k01: k01 k02: k02 k03: k03 k04: k04 k05: k05 k06: k06 k07: k07 k08: k08 k09: k09 k10: k10 k11: k11 k12: k12 k13: k13 k14: k14 k15: k15 k16: k16}}))
+(count (at r48 's33)) -- 2
+(sum (at r48 's33)) -- 4895
+
+;; ── raw sym-vector by:, GENUINE regression probe: a 17-key raw sym-vector
+;; `by: ['k1 'k2 ... 'k17]` reaches the keys-only-distinct fast path
+;; (agg_select_distinct -> agg_group_keys, src/ops/agg_engine.c).  Before cut-3
+;; that path filled a fixed `const void* data[16]` behind a uint8_t count, so
+;; 17 keys overran it (ASan stack-buffer-overflow), and query.c gated it off at
+;; `nk > 16` to divert 17+ keys to the composite grouper.  Cut-3 makes
+;; agg_group_keys carve its key-data table and take a uint32_t key count, and
+;; drops that query.c gate — so this now takes the FAST distinct grouper at any
+;; key count, no diversion.  Oracle: 17 int columns k01..k17, each [1 1 2]
+;; (3 rows) — every key column is identical, so exactly 2 distinct group tuples.
+(set t17 (table [k01 k02 k03 k04 k05 k06 k07 k08 k09 k10 k11 k12 k13 k14 k15 k16 k17] (list [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2])))
+(set r17 (select {from: t17 by: ['k01 'k02 'k03 'k04 'k05 'k06 'k07 'k08 'k09 'k10 'k11 'k12 'k13 'k14 'k15 'k16 'k17]}))
+(count (at r17 'k17)) -- 2
+
+;; ── raw sym-vector by:, boundary companion: same shape at exactly 16 keys
+;; still takes the keys-only-distinct fast path (agg_select_distinct /
+;; agg_group_keys, data[16] at capacity, no overflow) — pins the fast path
+;; stays correct right at the cut-3 boundary this gate protects.
+(set t16v (table [k01 k02 k03 k04 k05 k06 k07 k08 k09 k10 k11 k12 k13 k14 k15 k16] (list [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2])))
+(set r16v (select {from: t16v by: ['k01 'k02 'k03 'k04 'k05 'k06 'k07 'k08 'k09 'k10 'k11 'k12 'k13 'k14 'k15 'k16]}))
+(count (at r16v 'k16)) -- 2
+
+;; ── raw sym-vector by:, 256-key distinct SENTINEL: exactly the uint8 wrap
+;; boundary.  agg_select_distinct / agg_group_keys take a uint32_t key count
+;; (cut-3); a residual uint8_t truncation would read 256 -> 0 keys and collapse
+;; every row into one group (dropping 'k255 entirely), so 2 distinct tuples
+;; over 256 identical [1 1 2] key columns pins the widening.  Columns built via
+;; take (list builder caps at 64 args); the name/sym vectors are lexer-parsed. ──
+(set t256v (table [k000 k001 k002 k003 k004 k005 k006 k007 k008 k009 k010 k011 k012 k013 k014 k015 k016 k017 k018 k019 k020 k021 k022 k023 k024 k025 k026 k027 k028 k029 k030 k031 k032 k033 k034 k035 k036 k037 k038 k039 k040 k041 k042 k043 k044 k045 k046 k047 k048 k049 k050 k051 k052 k053 k054 k055 k056 k057 k058 k059 k060 k061 k062 k063 k064 k065 k066 k067 k068 k069 k070 k071 k072 k073 k074 k075 k076 k077 k078 k079 k080 k081 k082 k083 k084 k085 k086 k087 k088 k089 k090 k091 k092 k093 k094 k095 k096 k097 k098 k099 k100 k101 k102 k103 k104 k105 k106 k107 k108 k109 k110 k111 k112 k113 k114 k115 k116 k117 k118 k119 k120 k121 k122 k123 k124 k125 k126 k127 k128 k129 k130 k131 k132 k133 k134 k135 k136 k137 k138 k139 k140 k141 k142 k143 k144 k145 k146 k147 k148 k149 k150 k151 k152 k153 k154 k155 k156 k157 k158 k159 k160 k161 k162 k163 k164 k165 k166 k167 k168 k169 k170 k171 k172 k173 k174 k175 k176 k177 k178 k179 k180 k181 k182 k183 k184 k185 k186 k187 k188 k189 k190 k191 k192 k193 k194 k195 k196 k197 k198 k199 k200 k201 k202 k203 k204 k205 k206 k207 k208 k209 k210 k211 k212 k213 k214 k215 k216 k217 k218 k219 k220 k221 k222 k223 k224 k225 k226 k227 k228 k229 k230 k231 k232 k233 k234 k235 k236 k237 k238 k239 k240 k241 k242 k243 k244 k245 k246 k247 k248 k249 k250 k251 k252 k253 k254 k255] (take (list [1 1 2]) 256)))
+(set r256v (select {from: t256v by: ['k000 'k001 'k002 'k003 'k004 'k005 'k006 'k007 'k008 'k009 'k010 'k011 'k012 'k013 'k014 'k015 'k016 'k017 'k018 'k019 'k020 'k021 'k022 'k023 'k024 'k025 'k026 'k027 'k028 'k029 'k030 'k031 'k032 'k033 'k034 'k035 'k036 'k037 'k038 'k039 'k040 'k041 'k042 'k043 'k044 'k045 'k046 'k047 'k048 'k049 'k050 'k051 'k052 'k053 'k054 'k055 'k056 'k057 'k058 'k059 'k060 'k061 'k062 'k063 'k064 'k065 'k066 'k067 'k068 'k069 'k070 'k071 'k072 'k073 'k074 'k075 'k076 'k077 'k078 'k079 'k080 'k081 'k082 'k083 'k084 'k085 'k086 'k087 'k088 'k089 'k090 'k091 'k092 'k093 'k094 'k095 'k096 'k097 'k098 'k099 'k100 'k101 'k102 'k103 'k104 'k105 'k106 'k107 'k108 'k109 'k110 'k111 'k112 'k113 'k114 'k115 'k116 'k117 'k118 'k119 'k120 'k121 'k122 'k123 'k124 'k125 'k126 'k127 'k128 'k129 'k130 'k131 'k132 'k133 'k134 'k135 'k136 'k137 'k138 'k139 'k140 'k141 'k142 'k143 'k144 'k145 'k146 'k147 'k148 'k149 'k150 'k151 'k152 'k153 'k154 'k155 'k156 'k157 'k158 'k159 'k160 'k161 'k162 'k163 'k164 'k165 'k166 'k167 'k168 'k169 'k170 'k171 'k172 'k173 'k174 'k175 'k176 'k177 'k178 'k179 'k180 'k181 'k182 'k183 'k184 'k185 'k186 'k187 'k188 'k189 'k190 'k191 'k192 'k193 'k194 'k195 'k196 'k197 'k198 'k199 'k200 'k201 'k202 'k203 'k204 'k205 'k206 'k207 'k208 'k209 'k210 'k211 'k212 'k213 'k214 'k215 'k216 'k217 'k218 'k219 'k220 'k221 'k222 'k223 'k224 'k225 'k226 'k227 'k228 'k229 'k230 'k231 'k232 'k233 'k234 'k235 'k236 'k237 'k238 'k239 'k240 'k241 'k242 'k243 'k244 'k245 'k246 'k247 'k248 'k249 'k250 'k251 'k252 'k253 'k254 'k255]}))
+(count (at r256v 'k255)) -- 2
+(at r256v 'k000) -- [1 2]
+(at r256v 'k255) -- [1 2]
+
+;; ── 300-key by-DICT with a sum agg: 299 constant keys k000..k298 (all 1) +
+;; a discriminator key disc, plus sm: (sum v).  Bare-ref keys are OP_SCANs and
+;; an agg is present, so this routes through the DAG GROUP -> v2 agg engine
+;; (not the distinct path).  Serial exec_group_v2_run at nrows=2 exercises its
+;; carved key_cols[] and agg_group_keys' carved key-data table at 300 keys.
+;; The disc key sits at tuple position 299 (>255): a mod-256 key count would
+;; stop before it and MERGE the two rows into one group, so count 2 and
+;; sum [10 30] both break under any uint8 wrap.  Table built via take/concat. ──
+(set t300d (table [k000 k001 k002 k003 k004 k005 k006 k007 k008 k009 k010 k011 k012 k013 k014 k015 k016 k017 k018 k019 k020 k021 k022 k023 k024 k025 k026 k027 k028 k029 k030 k031 k032 k033 k034 k035 k036 k037 k038 k039 k040 k041 k042 k043 k044 k045 k046 k047 k048 k049 k050 k051 k052 k053 k054 k055 k056 k057 k058 k059 k060 k061 k062 k063 k064 k065 k066 k067 k068 k069 k070 k071 k072 k073 k074 k075 k076 k077 k078 k079 k080 k081 k082 k083 k084 k085 k086 k087 k088 k089 k090 k091 k092 k093 k094 k095 k096 k097 k098 k099 k100 k101 k102 k103 k104 k105 k106 k107 k108 k109 k110 k111 k112 k113 k114 k115 k116 k117 k118 k119 k120 k121 k122 k123 k124 k125 k126 k127 k128 k129 k130 k131 k132 k133 k134 k135 k136 k137 k138 k139 k140 k141 k142 k143 k144 k145 k146 k147 k148 k149 k150 k151 k152 k153 k154 k155 k156 k157 k158 k159 k160 k161 k162 k163 k164 k165 k166 k167 k168 k169 k170 k171 k172 k173 k174 k175 k176 k177 k178 k179 k180 k181 k182 k183 k184 k185 k186 k187 k188 k189 k190 k191 k192 k193 k194 k195 k196 k197 k198 k199 k200 k201 k202 k203 k204 k205 k206 k207 k208 k209 k210 k211 k212 k213 k214 k215 k216 k217 k218 k219 k220 k221 k222 k223 k224 k225 k226 k227 k228 k229 k230 k231 k232 k233 k234 k235 k236 k237 k238 k239 k240 k241 k242 k243 k244 k245 k246 k247 k248 k249 k250 k251 k252 k253 k254 k255 k256 k257 k258 k259 k260 k261 k262 k263 k264 k265 k266 k267 k268 k269 k270 k271 k272 k273 k274 k275 k276 k277 k278 k279 k280 k281 k282 k283 k284 k285 k286 k287 k288 k289 k290 k291 k292 k293 k294 k295 k296 k297 k298 disc v] (concat (take (list [1 1]) 299) (list [1 2] [10 30]))))
+(set r300d (select {from: t300d sm: (sum v) by: {k000: k000 k001: k001 k002: k002 k003: k003 k004: k004 k005: k005 k006: k006 k007: k007 k008: k008 k009: k009 k010: k010 k011: k011 k012: k012 k013: k013 k014: k014 k015: k015 k016: k016 k017: k017 k018: k018 k019: k019 k020: k020 k021: k021 k022: k022 k023: k023 k024: k024 k025: k025 k026: k026 k027: k027 k028: k028 k029: k029 k030: k030 k031: k031 k032: k032 k033: k033 k034: k034 k035: k035 k036: k036 k037: k037 k038: k038 k039: k039 k040: k040 k041: k041 k042: k042 k043: k043 k044: k044 k045: k045 k046: k046 k047: k047 k048: k048 k049: k049 k050: k050 k051: k051 k052: k052 k053: k053 k054: k054 k055: k055 k056: k056 k057: k057 k058: k058 k059: k059 k060: k060 k061: k061 k062: k062 k063: k063 k064: k064 k065: k065 k066: k066 k067: k067 k068: k068 k069: k069 k070: k070 k071: k071 k072: k072 k073: k073 k074: k074 k075: k075 k076: k076 k077: k077 k078: k078 k079: k079 k080: k080 k081: k081 k082: k082 k083: k083 k084: k084 k085: k085 k086: k086 k087: k087 k088: k088 k089: k089 k090: k090 k091: k091 k092: k092 k093: k093 k094: k094 k095: k095 k096: k096 k097: k097 k098: k098 k099: k099 k100: k100 k101: k101 k102: k102 k103: k103 k104: k104 k105: k105 k106: k106 k107: k107 k108: k108 k109: k109 k110: k110 k111: k111 k112: k112 k113: k113 k114: k114 k115: k115 k116: k116 k117: k117 k118: k118 k119: k119 k120: k120 k121: k121 k122: k122 k123: k123 k124: k124 k125: k125 k126: k126 k127: k127 k128: k128 k129: k129 k130: k130 k131: k131 k132: k132 k133: k133 k134: k134 k135: k135 k136: k136 k137: k137 k138: k138 k139: k139 k140: k140 k141: k141 k142: k142 k143: k143 k144: k144 k145: k145 k146: k146 k147: k147 k148: k148 k149: k149 k150: k150 k151: k151 k152: k152 k153: k153 k154: k154 k155: k155 k156: k156 k157: k157 k158: k158 k159: k159 k160: k160 k161: k161 k162: k162 k163: k163 k164: k164 k165: k165 k166: k166 k167: k167 k168: k168 k169: k169 k170: k170 k171: k171 k172: k172 k173: k173 k174: k174 k175: k175 k176: k176 k177: k177 k178: k178 k179: k179 k180: k180 k181: k181 k182: k182 k183: k183 k184: k184 k185: k185 k186: k186 k187: k187 k188: k188 k189: k189 k190: k190 k191: k191 k192: k192 k193: k193 k194: k194 k195: k195 k196: k196 k197: k197 k198: k198 k199: k199 k200: k200 k201: k201 k202: k202 k203: k203 k204: k204 k205: k205 k206: k206 k207: k207 k208: k208 k209: k209 k210: k210 k211: k211 k212: k212 k213: k213 k214: k214 k215: k215 k216: k216 k217: k217 k218: k218 k219: k219 k220: k220 k221: k221 k222: k222 k223: k223 k224: k224 k225: k225 k226: k226 k227: k227 k228: k228 k229: k229 k230: k230 k231: k231 k232: k232 k233: k233 k234: k234 k235: k235 k236: k236 k237: k237 k238: k238 k239: k239 k240: k240 k241: k241 k242: k242 k243: k243 k244: k244 k245: k245 k246: k246 k247: k247 k248: k248 k249: k249 k250: k250 k251: k251 k252: k252 k253: k253 k254: k254 k255: k255 k256: k256 k257: k257 k258: k258 k259: k259 k260: k260 k261: k261 k262: k262 k263: k263 k264: k264 k265: k265 k266: k266 k267: k267 k268: k268 k269: k269 k270: k270 k271: k271 k272: k272 k273: k273 k274: k274 k275: k275 k276: k276 k277: k277 k278: k278 k279: k279 k280: k280 k281: k281 k282: k282 k283: k283 k284: k284 k285: k285 k286: k286 k287: k287 k288: k288 k289: k289 k290: k290 k291: k291 k292: k292 k293: k293 k294: k294 k295: k295 k296: k296 k297: k297 k298: k298 disc: disc}}))
+(count (at r300d 'disc)) -- 2
+(at r300d 'disc) -- [1 2]
+(at r300d 'sm) -- [10 30]
+
+;; ── 17-key PARALLEL radix scatter: >16 keys through the high-row v2 path that
+;; packs each row's keys via the per-worker kv-staging carve (agg_engine.c
+;; agg_radix_scatter_one).  k00 is unique per row (70000 distinct) so the card
+;; estimate exceeds T_ROUTE and the router takes exec_group_v2_parallel_radix;
+;; k01..k16 are constant.  Every group has one member, so sum(v)=that row's v;
+;; summed over all groups = sum(til 70000) = 69999*70000/2 = 2449965000, with
+;; exactly 70000 groups.  Guards the unbounded-key radix kv carve under ASan. ──
+(set t17r (table [k00 k01 k02 k03 k04 k05 k06 k07 k08 k09 k10 k11 k12 k13 k14 k15 k16 v] (list (til 70000) (take [1] 70000) (take [1] 70000) (take [1] 70000) (take [1] 70000) (take [1] 70000) (take [1] 70000) (take [1] 70000) (take [1] 70000) (take [1] 70000) (take [1] 70000) (take [1] 70000) (take [1] 70000) (take [1] 70000) (take [1] 70000) (take [1] 70000) (take [1] 70000) (til 70000))))
+(set r17r (select {from: t17r sm: (sum v) by: ['k00 'k01 'k02 'k03 'k04 'k05 'k06 'k07 'k08 'k09 'k10 'k11 'k12 'k13 'k14 'k15 'k16]}))
+(count (at r17r 'k00)) -- 70000
+(sum (at r17r 'sm)) -- 2449965000
+;; ── asof/window-join right-column overflow, GENUINE regression probe:
+;; exec_window_join's right_out_idx[] (src/ops/join.c) was a fixed
+;; int64_t[256] filled by a loop over the RIGHT table's column count
+;; (right_ncols), skipping only the time key (and any eq keys) — a right
+;; table with >256 columns overflows it. WR below has 260 columns (Time +
+;; d001..d259); only Time is the join key, so the loop writes
+;; right_out_count = 259 entries into what was a 256-slot array, 3 past
+;; the old cap. ASan (pre-fix): stack-buffer-overflow WRITE in
+;; exec_window_join, join.c:3029.
+;; d001..d258 all share one replicated filler column ([0]) — built via
+;; (take (list [0]) 258) so the literal itself stays small (`list`/table
+;; literals are capped at 64 args by the VM's calln opcodes; the bracket
+;; name-vector literal below is parsed directly by the lexer with its own
+;; much larger cap, so a 260-symbol names vector is fine, but the *values*
+;; list has to be built via take+concat instead of a 260-arg `list` call).
+;; d259 — past the former 256-column boundary — carries a distinct value
+;; (777) precisely so a truncation/overflow that merely drops or corrupts
+;; trailing columns (rather than crashing outright) still surfaces as a
+;; wrong value here instead of silently passing.
+(set wj_names [Time d001 d002 d003 d004 d005 d006 d007 d008 d009 d010 d011 d012 d013 d014 d015 d016 d017 d018 d019 d020 d021 d022 d023 d024 d025 d026 d027 d028 d029 d030 d031 d032 d033 d034 d035 d036 d037 d038 d039 d040 d041 d042 d043 d044 d045 d046 d047 d048 d049 d050 d051 d052 d053 d054 d055 d056 d057 d058 d059 d060 d061 d062 d063 d064 d065 d066 d067 d068 d069 d070 d071 d072 d073 d074 d075 d076 d077 d078 d079 d080 d081 d082 d083 d084 d085 d086 d087 d088 d089 d090 d091 d092 d093 d094 d095 d096 d097 d098 d099 d100 d101 d102 d103 d104 d105 d106 d107 d108 d109 d110 d111 d112 d113 d114 d115 d116 d117 d118 d119 d120 d121 d122 d123 d124 d125 d126 d127 d128 d129 d130 d131 d132 d133 d134 d135 d136 d137 d138 d139 d140 d141 d142 d143 d144 d145 d146 d147 d148 d149 d150 d151 d152 d153 d154 d155 d156 d157 d158 d159 d160 d161 d162 d163 d164 d165 d166 d167 d168 d169 d170 d171 d172 d173 d174 d175 d176 d177 d178 d179 d180 d181 d182 d183 d184 d185 d186 d187 d188 d189 d190 d191 d192 d193 d194 d195 d196 d197 d198 d199 d200 d201 d202 d203 d204 d205 d206 d207 d208 d209 d210 d211 d212 d213 d214 d215 d216 d217 d218 d219 d220 d221 d222 d223 d224 d225 d226 d227 d228 d229 d230 d231 d232 d233 d234 d235 d236 d237 d238 d239 d240 d241 d242 d243 d244 d245 d246 d247 d248 d249 d250 d251 d252 d253 d254 d255 d256 d257 d258 d259])
+(set wj_filler [0])
+(set wj_last [777])
+(set wj_cols (concat (list [10:00:00.000]) (concat (take (list wj_filler) 258) (list wj_last))))
+(set WR (table wj_names wj_cols))
+(set WL (table [Time V] (list [10:00:01.000] [1.0])))
+(set wj_out (asof-join [Time] WL WR))
+(count (at wj_out 'd259)) -- 1
+(at wj_out 'd259) -- [777]
+
+;; ══════════════════════════════════════════════════════════════════
+;; cut-3: window-join eq-key / agg-count carves (retire WJ_MAX_AGG [16])
+;; The 5-arg window-join fast path computed n_eq unbounded but filled
+;; fixed [16]/[WJ_MAX_AGG] arrays with ungated e < n_eq loops (ASan
+;; stack-buffer-overflow at 18 keys) and silently dropped aggs past 16.
+;; ══════════════════════════════════════════════════════════════════
+
+;; ── 17 equality keys (18-key vector, n_eq=17 > former [16] cap).  GENUINE
+;; partitioning oracle (review gap: an all-constant-key sentinel can't tell
+;; a correct 17-key partition from a truncated eq count that collapses to a
+;; single partition, since a single 'a' partition already IS the answer).
+;; Here k01..k16 are constant 'a for both left rows (so they alone would
+;; merge everything into one partition), and ONLY the 17th key partitions:
+;; row0 -> k17='p, row1 -> k17='q. R17 mirrors that: 3 'p' rows carrying the
+;; ORIGINAL 1-key oracle's bids [99 100 101] at [00:00 00:02 00:04], and 3
+;; 'q' rows carrying LOW bids [1 2 3] at the same times — deliberately below
+;; every 'p' bid, so if a regression silently drops k17 (e.g. an eq-count
+;; truncation) the merged partition's min would leak a 'q' value into row0's
+;; result. Verified empirically against a k17-dropped call on this exact
+;; fixture: it returns [1 2] instead of the correct [99 2].
+;; Oracle (per-partition, unaffected by the other group):
+;;  row0 (partition 'p', Time=10:00:01, window=[09:59:59,10:00:03]):
+;;   identical to the original single-group derivation -> min=99 both modes.
+;;  row1 (partition 'q', Time=10:00:05, window=[10:00:03,10:00:07]):
+;;   mode0 (prevailing quote): lb seeds from the last 'q' row with time<=lo
+;;   (10:00:02, bid=2), ub runs to the end (all q times<=hi) -> range={2,3}
+;;   -> min=2.  mode1 (strict, time>=lo): lb is the first 'q' row with
+;;   time>=10:00:03, i.e. 10:00:04 (bid=3) -> range={3} -> min=3.
+(set L17 (table [k01 k02 k03 k04 k05 k06 k07 k08 k09 k10 k11 k12 k13 k14 k15 k16 k17 Time V] (list [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [p q] [10:00:01.000 10:00:05.000] [100 200])))
+(set R17 (table [k01 k02 k03 k04 k05 k06 k07 k08 k09 k10 k11 k12 k13 k14 k15 k16 k17 Time Bid] (list [a a a a a a] [a a a a a a] [a a a a a a] [a a a a a a] [a a a a a a] [a a a a a a] [a a a a a a] [a a a a a a] [a a a a a a] [a a a a a a] [a a a a a a] [a a a a a a] [a a a a a a] [a a a a a a] [a a a a a a] [a a a a a a] [p p p q q q] [10:00:00.000 10:00:02.000 10:00:04.000 10:00:00.000 10:00:02.000 10:00:04.000] [99 100 101 1 2 3])))
+(set iv17 (map-left + [-2000 2000] (at L17 'Time)))
+(at (window-join [k01 k02 k03 k04 k05 k06 k07 k08 k09 k10 k11 k12 k13 k14 k15 k16 k17 Time] iv17 L17 R17 {minBid: (min Bid)}) 'minBid) -- [99 2]
+(at (window-join1 [k01 k02 k03 k04 k05 k06 k07 k08 k09 k10 k11 k12 k13 k14 k15 k16 k17 Time] iv17 L17 R17 {minBid: (min Bid)}) 'minBid) -- [99 3]
+
+;; ── 17 aggregates. Pre-fix the collection loop `n_agg < WJ_MAX_AGG` silently
+;; DROPPED the 17th agg — result had 19 cols not 20 and 'a17 was absent.
+(set tr17 (table [Sym Time Price] (list [x x x] [12:00:01 12:00:04 12:00:06] [89.17 70.5 80.54])))
+(set qu17 (table [Sym Time Size] (list [x x x x x x x x x x] [12:00:00 12:00:01 12:00:02 12:00:03 12:00:04 12:00:05 12:00:06 12:00:07 12:00:08 12:00:09] [928 528 648 914 918 626 577 817 620 698])))
+(set ivq17 (map-left + [-1000 1000] (at tr17 'Time)))
+(set rq17 (window-join [Sym Time] ivq17 tr17 qu17 {a01: (min Size) a02: (min Size) a03: (min Size) a04: (min Size) a05: (min Size) a06: (min Size) a07: (min Size) a08: (min Size) a09: (min Size) a10: (min Size) a11: (min Size) a12: (min Size) a13: (min Size) a14: (min Size) a15: (min Size) a16: (min Size) a17: (max Size)}))
+(at (meta rq17) 'len) -- 20
+(at rq17 'a17) -- [928 918 817]
+
+;; ── 256 equality keys (257-key vector, n_eq=256) — exact-size eq carve, far
+;; past the former cap.  GENUINE partitioning oracle (same review gap as the
+;; 17-key sentinel above): k001..k255 are constant int 1 for every row, and
+;; ONLY k256 partitions: L row0 -> k256=1, row1 -> k256=2.  R256 carries 3
+;; rows per group at the ORIGINAL [00:00 00:02 00:04] times — group 1 with
+;; the original bids [99 100 101], group 2 with LOW bids [1 2 3], again
+;; strictly below every group-1 bid so a truncation that drops k256 (over-
+;; matching into one partition) leaks a group-2 value into row0's min.
+;; Oracle mirrors the 17-key derivation exactly (identical time geometry):
+;; row0 (group 1) -> min=99 (unaffected by group 2); row1 (group 2, mode0
+;; prevailing-quote) -> lb seeds from the last group-2 row with time<=lo
+;; (10:00:02, bid=2), ub runs to the end -> range={2,3} -> min=2.
+(set L256 (table [k001 k002 k003 k004 k005 k006 k007 k008 k009 k010 k011 k012 k013 k014 k015 k016 k017 k018 k019 k020 k021 k022 k023 k024 k025 k026 k027 k028 k029 k030 k031 k032 k033 k034 k035 k036 k037 k038 k039 k040 k041 k042 k043 k044 k045 k046 k047 k048 k049 k050 k051 k052 k053 k054 k055 k056 k057 k058 k059 k060 k061 k062 k063 k064 k065 k066 k067 k068 k069 k070 k071 k072 k073 k074 k075 k076 k077 k078 k079 k080 k081 k082 k083 k084 k085 k086 k087 k088 k089 k090 k091 k092 k093 k094 k095 k096 k097 k098 k099 k100 k101 k102 k103 k104 k105 k106 k107 k108 k109 k110 k111 k112 k113 k114 k115 k116 k117 k118 k119 k120 k121 k122 k123 k124 k125 k126 k127 k128 k129 k130 k131 k132 k133 k134 k135 k136 k137 k138 k139 k140 k141 k142 k143 k144 k145 k146 k147 k148 k149 k150 k151 k152 k153 k154 k155 k156 k157 k158 k159 k160 k161 k162 k163 k164 k165 k166 k167 k168 k169 k170 k171 k172 k173 k174 k175 k176 k177 k178 k179 k180 k181 k182 k183 k184 k185 k186 k187 k188 k189 k190 k191 k192 k193 k194 k195 k196 k197 k198 k199 k200 k201 k202 k203 k204 k205 k206 k207 k208 k209 k210 k211 k212 k213 k214 k215 k216 k217 k218 k219 k220 k221 k222 k223 k224 k225 k226 k227 k228 k229 k230 k231 k232 k233 k234 k235 k236 k237 k238 k239 k240 k241 k242 k243 k244 k245 k246 k247 k248 k249 k250 k251 k252 k253 k254 k255 k256 Time V] (concat (take (list [1 1]) 255) (list [1 2] [10:00:01.000 10:00:05.000] [100 200]))))
+(set R256 (table [k001 k002 k003 k004 k005 k006 k007 k008 k009 k010 k011 k012 k013 k014 k015 k016 k017 k018 k019 k020 k021 k022 k023 k024 k025 k026 k027 k028 k029 k030 k031 k032 k033 k034 k035 k036 k037 k038 k039 k040 k041 k042 k043 k044 k045 k046 k047 k048 k049 k050 k051 k052 k053 k054 k055 k056 k057 k058 k059 k060 k061 k062 k063 k064 k065 k066 k067 k068 k069 k070 k071 k072 k073 k074 k075 k076 k077 k078 k079 k080 k081 k082 k083 k084 k085 k086 k087 k088 k089 k090 k091 k092 k093 k094 k095 k096 k097 k098 k099 k100 k101 k102 k103 k104 k105 k106 k107 k108 k109 k110 k111 k112 k113 k114 k115 k116 k117 k118 k119 k120 k121 k122 k123 k124 k125 k126 k127 k128 k129 k130 k131 k132 k133 k134 k135 k136 k137 k138 k139 k140 k141 k142 k143 k144 k145 k146 k147 k148 k149 k150 k151 k152 k153 k154 k155 k156 k157 k158 k159 k160 k161 k162 k163 k164 k165 k166 k167 k168 k169 k170 k171 k172 k173 k174 k175 k176 k177 k178 k179 k180 k181 k182 k183 k184 k185 k186 k187 k188 k189 k190 k191 k192 k193 k194 k195 k196 k197 k198 k199 k200 k201 k202 k203 k204 k205 k206 k207 k208 k209 k210 k211 k212 k213 k214 k215 k216 k217 k218 k219 k220 k221 k222 k223 k224 k225 k226 k227 k228 k229 k230 k231 k232 k233 k234 k235 k236 k237 k238 k239 k240 k241 k242 k243 k244 k245 k246 k247 k248 k249 k250 k251 k252 k253 k254 k255 k256 Time Bid] (concat (take (list [1 1 1 1 1 1]) 255) (list [1 1 1 2 2 2] [10:00:00.000 10:00:02.000 10:00:04.000 10:00:00.000 10:00:02.000 10:00:04.000] [99 100 101 1 2 3]))))
+(set iv256 (map-left + [-2000 2000] (at L256 'Time)))
+(at (window-join [k001 k002 k003 k004 k005 k006 k007 k008 k009 k010 k011 k012 k013 k014 k015 k016 k017 k018 k019 k020 k021 k022 k023 k024 k025 k026 k027 k028 k029 k030 k031 k032 k033 k034 k035 k036 k037 k038 k039 k040 k041 k042 k043 k044 k045 k046 k047 k048 k049 k050 k051 k052 k053 k054 k055 k056 k057 k058 k059 k060 k061 k062 k063 k064 k065 k066 k067 k068 k069 k070 k071 k072 k073 k074 k075 k076 k077 k078 k079 k080 k081 k082 k083 k084 k085 k086 k087 k088 k089 k090 k091 k092 k093 k094 k095 k096 k097 k098 k099 k100 k101 k102 k103 k104 k105 k106 k107 k108 k109 k110 k111 k112 k113 k114 k115 k116 k117 k118 k119 k120 k121 k122 k123 k124 k125 k126 k127 k128 k129 k130 k131 k132 k133 k134 k135 k136 k137 k138 k139 k140 k141 k142 k143 k144 k145 k146 k147 k148 k149 k150 k151 k152 k153 k154 k155 k156 k157 k158 k159 k160 k161 k162 k163 k164 k165 k166 k167 k168 k169 k170 k171 k172 k173 k174 k175 k176 k177 k178 k179 k180 k181 k182 k183 k184 k185 k186 k187 k188 k189 k190 k191 k192 k193 k194 k195 k196 k197 k198 k199 k200 k201 k202 k203 k204 k205 k206 k207 k208 k209 k210 k211 k212 k213 k214 k215 k216 k217 k218 k219 k220 k221 k222 k223 k224 k225 k226 k227 k228 k229 k230 k231 k232 k233 k234 k235 k236 k237 k238 k239 k240 k241 k242 k243 k244 k245 k246 k247 k248 k249 k250 k251 k252 k253 k254 k255 k256 Time] iv256 L256 R256 {minBid: (min Bid)}) 'minBid) -- [99 2]
+
+;; ── 256 aggregates. meta len = 3 left + 256 = 259; last = (max Size).
+(set tr256 (table [Sym Time Price] (list [x x x] [12:00:01 12:00:04 12:00:06] [89.17 70.5 80.54])))
+(set qu256 (table [Sym Time Size] (list [x x x x x x x x x x] [12:00:00 12:00:01 12:00:02 12:00:03 12:00:04 12:00:05 12:00:06 12:00:07 12:00:08 12:00:09] [928 528 648 914 918 626 577 817 620 698])))
+(set ivq256 (map-left + [-1000 1000] (at tr256 'Time)))
+(set rq256 (window-join [Sym Time] ivq256 tr256 qu256 {a000: (min Size) a001: (min Size) a002: (min Size) a003: (min Size) a004: (min Size) a005: (min Size) a006: (min Size) a007: (min Size) a008: (min Size) a009: (min Size) a010: (min Size) a011: (min Size) a012: (min Size) a013: (min Size) a014: (min Size) a015: (min Size) a016: (min Size) a017: (min Size) a018: (min Size) a019: (min Size) a020: (min Size) a021: (min Size) a022: (min Size) a023: (min Size) a024: (min Size) a025: (min Size) a026: (min Size) a027: (min Size) a028: (min Size) a029: (min Size) a030: (min Size) a031: (min Size) a032: (min Size) a033: (min Size) a034: (min Size) a035: (min Size) a036: (min Size) a037: (min Size) a038: (min Size) a039: (min Size) a040: (min Size) a041: (min Size) a042: (min Size) a043: (min Size) a044: (min Size) a045: (min Size) a046: (min Size) a047: (min Size) a048: (min Size) a049: (min Size) a050: (min Size) a051: (min Size) a052: (min Size) a053: (min Size) a054: (min Size) a055: (min Size) a056: (min Size) a057: (min Size) a058: (min Size) a059: (min Size) a060: (min Size) a061: (min Size) a062: (min Size) a063: (min Size) a064: (min Size) a065: (min Size) a066: (min Size) a067: (min Size) a068: (min Size) a069: (min Size) a070: (min Size) a071: (min Size) a072: (min Size) a073: (min Size) a074: (min Size) a075: (min Size) a076: (min Size) a077: (min Size) a078: (min Size) a079: (min Size) a080: (min Size) a081: (min Size) a082: (min Size) a083: (min Size) a084: (min Size) a085: (min Size) a086: (min Size) a087: (min Size) a088: (min Size) a089: (min Size) a090: (min Size) a091: (min Size) a092: (min Size) a093: (min Size) a094: (min Size) a095: (min Size) a096: (min Size) a097: (min Size) a098: (min Size) a099: (min Size) a100: (min Size) a101: (min Size) a102: (min Size) a103: (min Size) a104: (min Size) a105: (min Size) a106: (min Size) a107: (min Size) a108: (min Size) a109: (min Size) a110: (min Size) a111: (min Size) a112: (min Size) a113: (min Size) a114: (min Size) a115: (min Size) a116: (min Size) a117: (min Size) a118: (min Size) a119: (min Size) a120: (min Size) a121: (min Size) a122: (min Size) a123: (min Size) a124: (min Size) a125: (min Size) a126: (min Size) a127: (min Size) a128: (min Size) a129: (min Size) a130: (min Size) a131: (min Size) a132: (min Size) a133: (min Size) a134: (min Size) a135: (min Size) a136: (min Size) a137: (min Size) a138: (min Size) a139: (min Size) a140: (min Size) a141: (min Size) a142: (min Size) a143: (min Size) a144: (min Size) a145: (min Size) a146: (min Size) a147: (min Size) a148: (min Size) a149: (min Size) a150: (min Size) a151: (min Size) a152: (min Size) a153: (min Size) a154: (min Size) a155: (min Size) a156: (min Size) a157: (min Size) a158: (min Size) a159: (min Size) a160: (min Size) a161: (min Size) a162: (min Size) a163: (min Size) a164: (min Size) a165: (min Size) a166: (min Size) a167: (min Size) a168: (min Size) a169: (min Size) a170: (min Size) a171: (min Size) a172: (min Size) a173: (min Size) a174: (min Size) a175: (min Size) a176: (min Size) a177: (min Size) a178: (min Size) a179: (min Size) a180: (min Size) a181: (min Size) a182: (min Size) a183: (min Size) a184: (min Size) a185: (min Size) a186: (min Size) a187: (min Size) a188: (min Size) a189: (min Size) a190: (min Size) a191: (min Size) a192: (min Size) a193: (min Size) a194: (min Size) a195: (min Size) a196: (min Size) a197: (min Size) a198: (min Size) a199: (min Size) a200: (min Size) a201: (min Size) a202: (min Size) a203: (min Size) a204: (min Size) a205: (min Size) a206: (min Size) a207: (min Size) a208: (min Size) a209: (min Size) a210: (min Size) a211: (min Size) a212: (min Size) a213: (min Size) a214: (min Size) a215: (min Size) a216: (min Size) a217: (min Size) a218: (min Size) a219: (min Size) a220: (min Size) a221: (min Size) a222: (min Size) a223: (min Size) a224: (min Size) a225: (min Size) a226: (min Size) a227: (min Size) a228: (min Size) a229: (min Size) a230: (min Size) a231: (min Size) a232: (min Size) a233: (min Size) a234: (min Size) a235: (min Size) a236: (min Size) a237: (min Size) a238: (min Size) a239: (min Size) a240: (min Size) a241: (min Size) a242: (min Size) a243: (min Size) a244: (min Size) a245: (min Size) a246: (min Size) a247: (min Size) a248: (min Size) a249: (min Size) a250: (min Size) a251: (min Size) a252: (min Size) a253: (min Size) a254: (min Size) a255: (max Size)}))
+(at (meta rq256) 'len) -- 259
+(at rq256 'a255) -- [928 918 817]
+
+;; ── parallel window-join, GENUINE regression probe (review gap: every wj
+;; cell above uses 2-3 left rows, so none ever exercises the parallel worker
+;; — src/ops/query.c's dispatch predicate `pool && left_nrows >= 2048`
+;; (~query.c:13209/13256) is only live once left_nrows crosses 2048; below
+;; that the whole scan runs on worker 0 via a direct wj_scan_fn(&wctx, 0, 0,
+;; left_nrows) call, same as no pool at all).  The per-worker scratch this
+;; cut carved out of a fixed cap — acc_base + worker_id*n_agg (wj_acc_t
+;; slab) and target_base + worker_id*n_eq (int64 eq-tuple slab), disjoint
+;; slices indexed by worker_id — is untouched by every other cell here.
+;; left_nrows=65536: at TASK_GRAIN=8192 ELEMENTS, 65536 rows = 8 dispatch
+;; tasks, providing genuine multi-worker slicing of the per-worker acc/target_eq
+;; carve. This machine's default pool (ray_pool_get(), auto ncpu-1 workers) is
+;; non-NULL, so this call provably takes ray_pool_dispatch(pool, wj_scan_fn,
+;; &wctx, left_nrows) with parallel task scheduling, not the serial fallback.
+;;
+;; Fixture: 65536 left rows, two eq keys (k1, k2, both (% (til 65536) 2)) so
+;; row parity gives exactly 2 partitions interleaved across the ENTIRE row
+;; range (not one contiguous block per group) — every worker's morsel spans
+;; both partitions, so a worker-slice aliasing bug (two worker_ids sharing
+;; one acc/target_eq slice) and an eq-group cross-talk bug (a row reading
+;; the wrong partition's matches) would both show up as a wrong value
+;; somewhere in the 65536-row output, not just at the edges.
+;; Each left row's interval is a generous ±160000ms around its own Time (Time
+;; spans 0..65535ms = 0..65.5s), so lo<0 and hi>65535 for every row: the window
+;; unconditionally spans the ENTIRE right table for both modes, making the
+;; per-row aggregate a closed-form function of eq-group alone, independent
+;; of which specific left row it is. The right table (300 rows, "a few
+;; hundred") is split asymmetrically by the same eq pattern: 100 rows in
+;; group 0 (Bid=111 constant), 200 rows in group 1 (Bid=222 constant) — group
+;; sizes differ too, so a count mismatch alone would also catch cross-talk.
+;; Oracle per left row r (group = r mod 2):
+;;   group 0: count=100, sum=100*111=11100, min=max=111
+;;   group 1: count=200, sum=200*222=44400, min=max=222
+;; Expressed via `take`'s cycling (take [x0 x1] 65536)[i] = [x0 x1][i mod 2],
+;; which matches k1/k2's own (% (til 65536) 2) pattern row-for-row.
+(set Lwjp (table [k1 k2 Time V] (list (% (til 65536) 2) (% (til 65536) 2) (+ 10:00:00.000 (til 65536)) (til 65536))))
+(set Rwjp (table [k1 k2 Time Bid] (list (concat (take [0] 100) (take [1] 200)) (concat (take [0] 100) (take [1] 200)) (+ 10:00:00.000 (til 300)) (concat (take [111] 100) (take [222] 200)))))
+(set ivwjp (map-left + [-160000 160000] (at Lwjp 'Time)))
+(set rwjp (window-join [k1 k2 Time] ivwjp Lwjp Rwjp {c: (count Bid) s: (sum Bid) mn: (min Bid) mx: (max Bid)}))
+(at rwjp 'c) -- (take [100 200] 65536)
+(at rwjp 's) -- (take [11100 44400] 65536)
+(at rwjp 'mn) -- (take [111 222] 65536)
+(at rwjp 'mx) -- (take [111 222] 65536)
+
+;; ══════════════════════════════════════════════════════════════════
+;; cut-3 task 2: asof-join/window-join LEGACY carriers + join.c [256] family
+;; query.c's ray_asof_join_fn and the 4-arg window_join_impl fall-through
+;; (asof-join / window-join with a table-form eq-keys arg, NOT the 5-arg
+;; window-join fast path task 1 already fixed) narrowed the eq-key count
+;; through a uint8_t local before feeding it to ray_asof_join — overflow at
+;; 17+ eq keys, silent WRAP TO 0 at exactly 256 (256 truncates to 0 in an
+;; 8-bit local).  join.c's exec_window_join / asof_hash_group_match then
+;; sized eq_syms/lt_eq/rt_eq/eq_xlut/eq_xn/xcnt/lv/_rv/rv at a fixed [256]
+;; to match that (accidental) ceiling.  Both sides now carry the exact
+;; eq-key count with exact-size carves — no arbitrary cap.
+;; ══════════════════════════════════════════════════════════════════
+
+;; ── 17-eq-key asof-join, reusing the L17/R17 fixture defined above (same
+;; genuine-partitioning oracle: k01..k16 constant 'a for every row, ONLY
+;; k17 partitions 'p vs 'q).  Plain asof (no window, no aggregation): each
+;; left row matches the LATEST same-partition right row with time <= its
+;; own time.
+;;  row0 (partition p, Time=10:00:01): latest p-row time<=10:00:01 is
+;;   10:00:00 -> Bid=99.
+;;  row1 (partition q, Time=10:00:05): latest q-row time<=10:00:05 is
+;;   10:00:04 -> Bid=3.
+;; A dropped k17 (collapse to the 16-key partition, or worse the surviving
+;; uint8_t narrowing bug) merges p and q into one partition, so row1 could
+;; leak a p-side value or otherwise diverge from 3.
+(at (asof-join [k01 k02 k03 k04 k05 k06 k07 k08 k09 k10 k11 k12 k13 k14 k15 k16 k17 Time] L17 R17) 'Bid) -- [99 3]
+
+;; ── 256-eq-key asof-join, reusing the L256/R256 fixture defined above.
+;; This is the SENTINEL cell: 256 is exactly where the retired uint8_t
+;; local wrapped to 0 (256 mod 256 == 0), which used to feed ray_asof_join
+;; n_eq_keys=0 — i.e. "no equality keys", matching EVERY right row
+;; against every left row regardless of k001..k256.  Group 1 (row0) and
+;; group 2 (row1) carry IDENTICAL right-side timestamps but group 2's bids
+;; are deliberately far below group 1's, so an n_eq=0 collapse mixes them
+;; and this oracle fails loudly rather than passing by accident.
+;;  row0 (group 1, Time=10:00:01): latest group-1 row time<=10:00:01 is
+;;   10:00:00 -> Bid=99.
+;;  row1 (group 2, Time=10:00:05): latest group-2 row time<=10:00:05 is
+;;   10:00:04 -> Bid=3.
+(at (asof-join [k001 k002 k003 k004 k005 k006 k007 k008 k009 k010 k011 k012 k013 k014 k015 k016 k017 k018 k019 k020 k021 k022 k023 k024 k025 k026 k027 k028 k029 k030 k031 k032 k033 k034 k035 k036 k037 k038 k039 k040 k041 k042 k043 k044 k045 k046 k047 k048 k049 k050 k051 k052 k053 k054 k055 k056 k057 k058 k059 k060 k061 k062 k063 k064 k065 k066 k067 k068 k069 k070 k071 k072 k073 k074 k075 k076 k077 k078 k079 k080 k081 k082 k083 k084 k085 k086 k087 k088 k089 k090 k091 k092 k093 k094 k095 k096 k097 k098 k099 k100 k101 k102 k103 k104 k105 k106 k107 k108 k109 k110 k111 k112 k113 k114 k115 k116 k117 k118 k119 k120 k121 k122 k123 k124 k125 k126 k127 k128 k129 k130 k131 k132 k133 k134 k135 k136 k137 k138 k139 k140 k141 k142 k143 k144 k145 k146 k147 k148 k149 k150 k151 k152 k153 k154 k155 k156 k157 k158 k159 k160 k161 k162 k163 k164 k165 k166 k167 k168 k169 k170 k171 k172 k173 k174 k175 k176 k177 k178 k179 k180 k181 k182 k183 k184 k185 k186 k187 k188 k189 k190 k191 k192 k193 k194 k195 k196 k197 k198 k199 k200 k201 k202 k203 k204 k205 k206 k207 k208 k209 k210 k211 k212 k213 k214 k215 k216 k217 k218 k219 k220 k221 k222 k223 k224 k225 k226 k227 k228 k229 k230 k231 k232 k233 k234 k235 k236 k237 k238 k239 k240 k241 k242 k243 k244 k245 k246 k247 k248 k249 k250 k251 k252 k253 k254 k255 k256 Time] L256 R256) 'Bid) -- [99 3]
+
+;; ── 300-eq-key asof-join.  Past both the former uint8_t ceiling (255) and
+;; the 256-wrap sentinel above — proves the carve is genuinely unbounded,
+;; not just widened to cover 256.  Same genuine-partitioning derivation as
+;; the 256-key cell: k001..k299 constant 1 for every row, ONLY k300
+;; partitions group 1 (row0) vs group 2 (row1); group 2's right-side bids
+;; are far below group 1's at identical timestamps.
+(set L300 (table [k001 k002 k003 k004 k005 k006 k007 k008 k009 k010 k011 k012 k013 k014 k015 k016 k017 k018 k019 k020 k021 k022 k023 k024 k025 k026 k027 k028 k029 k030 k031 k032 k033 k034 k035 k036 k037 k038 k039 k040 k041 k042 k043 k044 k045 k046 k047 k048 k049 k050 k051 k052 k053 k054 k055 k056 k057 k058 k059 k060 k061 k062 k063 k064 k065 k066 k067 k068 k069 k070 k071 k072 k073 k074 k075 k076 k077 k078 k079 k080 k081 k082 k083 k084 k085 k086 k087 k088 k089 k090 k091 k092 k093 k094 k095 k096 k097 k098 k099 k100 k101 k102 k103 k104 k105 k106 k107 k108 k109 k110 k111 k112 k113 k114 k115 k116 k117 k118 k119 k120 k121 k122 k123 k124 k125 k126 k127 k128 k129 k130 k131 k132 k133 k134 k135 k136 k137 k138 k139 k140 k141 k142 k143 k144 k145 k146 k147 k148 k149 k150 k151 k152 k153 k154 k155 k156 k157 k158 k159 k160 k161 k162 k163 k164 k165 k166 k167 k168 k169 k170 k171 k172 k173 k174 k175 k176 k177 k178 k179 k180 k181 k182 k183 k184 k185 k186 k187 k188 k189 k190 k191 k192 k193 k194 k195 k196 k197 k198 k199 k200 k201 k202 k203 k204 k205 k206 k207 k208 k209 k210 k211 k212 k213 k214 k215 k216 k217 k218 k219 k220 k221 k222 k223 k224 k225 k226 k227 k228 k229 k230 k231 k232 k233 k234 k235 k236 k237 k238 k239 k240 k241 k242 k243 k244 k245 k246 k247 k248 k249 k250 k251 k252 k253 k254 k255 k256 k257 k258 k259 k260 k261 k262 k263 k264 k265 k266 k267 k268 k269 k270 k271 k272 k273 k274 k275 k276 k277 k278 k279 k280 k281 k282 k283 k284 k285 k286 k287 k288 k289 k290 k291 k292 k293 k294 k295 k296 k297 k298 k299 k300 Time V] (concat (take (list [1 1]) 299) (list [1 2] [10:00:01.000 10:00:05.000] [100 200]))))
+(set R300 (table [k001 k002 k003 k004 k005 k006 k007 k008 k009 k010 k011 k012 k013 k014 k015 k016 k017 k018 k019 k020 k021 k022 k023 k024 k025 k026 k027 k028 k029 k030 k031 k032 k033 k034 k035 k036 k037 k038 k039 k040 k041 k042 k043 k044 k045 k046 k047 k048 k049 k050 k051 k052 k053 k054 k055 k056 k057 k058 k059 k060 k061 k062 k063 k064 k065 k066 k067 k068 k069 k070 k071 k072 k073 k074 k075 k076 k077 k078 k079 k080 k081 k082 k083 k084 k085 k086 k087 k088 k089 k090 k091 k092 k093 k094 k095 k096 k097 k098 k099 k100 k101 k102 k103 k104 k105 k106 k107 k108 k109 k110 k111 k112 k113 k114 k115 k116 k117 k118 k119 k120 k121 k122 k123 k124 k125 k126 k127 k128 k129 k130 k131 k132 k133 k134 k135 k136 k137 k138 k139 k140 k141 k142 k143 k144 k145 k146 k147 k148 k149 k150 k151 k152 k153 k154 k155 k156 k157 k158 k159 k160 k161 k162 k163 k164 k165 k166 k167 k168 k169 k170 k171 k172 k173 k174 k175 k176 k177 k178 k179 k180 k181 k182 k183 k184 k185 k186 k187 k188 k189 k190 k191 k192 k193 k194 k195 k196 k197 k198 k199 k200 k201 k202 k203 k204 k205 k206 k207 k208 k209 k210 k211 k212 k213 k214 k215 k216 k217 k218 k219 k220 k221 k222 k223 k224 k225 k226 k227 k228 k229 k230 k231 k232 k233 k234 k235 k236 k237 k238 k239 k240 k241 k242 k243 k244 k245 k246 k247 k248 k249 k250 k251 k252 k253 k254 k255 k256 k257 k258 k259 k260 k261 k262 k263 k264 k265 k266 k267 k268 k269 k270 k271 k272 k273 k274 k275 k276 k277 k278 k279 k280 k281 k282 k283 k284 k285 k286 k287 k288 k289 k290 k291 k292 k293 k294 k295 k296 k297 k298 k299 k300 Time Bid] (concat (take (list [1 1 1 1 1 1]) 299) (list [1 1 1 2 2 2] [10:00:00.000 10:00:02.000 10:00:04.000 10:00:00.000 10:00:02.000 10:00:04.000] [99 100 101 1 2 3]))))
+(at (asof-join [k001 k002 k003 k004 k005 k006 k007 k008 k009 k010 k011 k012 k013 k014 k015 k016 k017 k018 k019 k020 k021 k022 k023 k024 k025 k026 k027 k028 k029 k030 k031 k032 k033 k034 k035 k036 k037 k038 k039 k040 k041 k042 k043 k044 k045 k046 k047 k048 k049 k050 k051 k052 k053 k054 k055 k056 k057 k058 k059 k060 k061 k062 k063 k064 k065 k066 k067 k068 k069 k070 k071 k072 k073 k074 k075 k076 k077 k078 k079 k080 k081 k082 k083 k084 k085 k086 k087 k088 k089 k090 k091 k092 k093 k094 k095 k096 k097 k098 k099 k100 k101 k102 k103 k104 k105 k106 k107 k108 k109 k110 k111 k112 k113 k114 k115 k116 k117 k118 k119 k120 k121 k122 k123 k124 k125 k126 k127 k128 k129 k130 k131 k132 k133 k134 k135 k136 k137 k138 k139 k140 k141 k142 k143 k144 k145 k146 k147 k148 k149 k150 k151 k152 k153 k154 k155 k156 k157 k158 k159 k160 k161 k162 k163 k164 k165 k166 k167 k168 k169 k170 k171 k172 k173 k174 k175 k176 k177 k178 k179 k180 k181 k182 k183 k184 k185 k186 k187 k188 k189 k190 k191 k192 k193 k194 k195 k196 k197 k198 k199 k200 k201 k202 k203 k204 k205 k206 k207 k208 k209 k210 k211 k212 k213 k214 k215 k216 k217 k218 k219 k220 k221 k222 k223 k224 k225 k226 k227 k228 k229 k230 k231 k232 k233 k234 k235 k236 k237 k238 k239 k240 k241 k242 k243 k244 k245 k246 k247 k248 k249 k250 k251 k252 k253 k254 k255 k256 k257 k258 k259 k260 k261 k262 k263 k264 k265 k266 k267 k268 k269 k270 k271 k272 k273 k274 k275 k276 k277 k278 k279 k280 k281 k282 k283 k284 k285 k286 k287 k288 k289 k290 k291 k292 k293 k294 k295 k296 k297 k298 k299 k300 Time] L300 R300) 'Bid) -- [99 3]
+
+
+;; ═══ cut-2: 255/256/300 widths (generated; see plan Task 8) ═══
+;; The cut-2 flip (query.c) deletes the nine compile-side UINT8_MAX slot
+;; gates.  These cells pin select/window/sort/update output widths at 255,
+;; 256 and 300.  256 is the anti-truncation pin: a resurrected uint8 count
+;; carrier reads 256 as 0 and collapses the shape (it caught a genuine
+;; (uint8_t) cast on window part/func counts at query.c's ray_window_op call
+;; site, fixed in this commit).  Fixture t (k=[1 1 2 2] v=[10 20 30 40]) is
+;; the one defined at the top of this file: group k=1 has v=[10 20] (sum 30),
+;; k=2 has v=[30 40] (sum 70), so every sum-agg column is [30 70].
+
+;; ── F1 aggregate outputs, single sym key, all sum-aggs, at 255/256/300.
+;; meta len = n aggs + 1 key column; last agg column = [30 70]. ──
+(set r255 (select {from: t a000: (sum v) a001: (sum v) a002: (sum v) a003: (sum v) a004: (sum v) a005: (sum v) a006: (sum v) a007: (sum v) a008: (sum v) a009: (sum v) a010: (sum v) a011: (sum v) a012: (sum v) a013: (sum v) a014: (sum v) a015: (sum v) a016: (sum v) a017: (sum v) a018: (sum v) a019: (sum v) a020: (sum v) a021: (sum v) a022: (sum v) a023: (sum v) a024: (sum v) a025: (sum v) a026: (sum v) a027: (sum v) a028: (sum v) a029: (sum v) a030: (sum v) a031: (sum v) a032: (sum v) a033: (sum v) a034: (sum v) a035: (sum v) a036: (sum v) a037: (sum v) a038: (sum v) a039: (sum v) a040: (sum v) a041: (sum v) a042: (sum v) a043: (sum v) a044: (sum v) a045: (sum v) a046: (sum v) a047: (sum v) a048: (sum v) a049: (sum v) a050: (sum v) a051: (sum v) a052: (sum v) a053: (sum v) a054: (sum v) a055: (sum v) a056: (sum v) a057: (sum v) a058: (sum v) a059: (sum v) a060: (sum v) a061: (sum v) a062: (sum v) a063: (sum v) a064: (sum v) a065: (sum v) a066: (sum v) a067: (sum v) a068: (sum v) a069: (sum v) a070: (sum v) a071: (sum v) a072: (sum v) a073: (sum v) a074: (sum v) a075: (sum v) a076: (sum v) a077: (sum v) a078: (sum v) a079: (sum v) a080: (sum v) a081: (sum v) a082: (sum v) a083: (sum v) a084: (sum v) a085: (sum v) a086: (sum v) a087: (sum v) a088: (sum v) a089: (sum v) a090: (sum v) a091: (sum v) a092: (sum v) a093: (sum v) a094: (sum v) a095: (sum v) a096: (sum v) a097: (sum v) a098: (sum v) a099: (sum v) a100: (sum v) a101: (sum v) a102: (sum v) a103: (sum v) a104: (sum v) a105: (sum v) a106: (sum v) a107: (sum v) a108: (sum v) a109: (sum v) a110: (sum v) a111: (sum v) a112: (sum v) a113: (sum v) a114: (sum v) a115: (sum v) a116: (sum v) a117: (sum v) a118: (sum v) a119: (sum v) a120: (sum v) a121: (sum v) a122: (sum v) a123: (sum v) a124: (sum v) a125: (sum v) a126: (sum v) a127: (sum v) a128: (sum v) a129: (sum v) a130: (sum v) a131: (sum v) a132: (sum v) a133: (sum v) a134: (sum v) a135: (sum v) a136: (sum v) a137: (sum v) a138: (sum v) a139: (sum v) a140: (sum v) a141: (sum v) a142: (sum v) a143: (sum v) a144: (sum v) a145: (sum v) a146: (sum v) a147: (sum v) a148: (sum v) a149: (sum v) a150: (sum v) a151: (sum v) a152: (sum v) a153: (sum v) a154: (sum v) a155: (sum v) a156: (sum v) a157: (sum v) a158: (sum v) a159: (sum v) a160: (sum v) a161: (sum v) a162: (sum v) a163: (sum v) a164: (sum v) a165: (sum v) a166: (sum v) a167: (sum v) a168: (sum v) a169: (sum v) a170: (sum v) a171: (sum v) a172: (sum v) a173: (sum v) a174: (sum v) a175: (sum v) a176: (sum v) a177: (sum v) a178: (sum v) a179: (sum v) a180: (sum v) a181: (sum v) a182: (sum v) a183: (sum v) a184: (sum v) a185: (sum v) a186: (sum v) a187: (sum v) a188: (sum v) a189: (sum v) a190: (sum v) a191: (sum v) a192: (sum v) a193: (sum v) a194: (sum v) a195: (sum v) a196: (sum v) a197: (sum v) a198: (sum v) a199: (sum v) a200: (sum v) a201: (sum v) a202: (sum v) a203: (sum v) a204: (sum v) a205: (sum v) a206: (sum v) a207: (sum v) a208: (sum v) a209: (sum v) a210: (sum v) a211: (sum v) a212: (sum v) a213: (sum v) a214: (sum v) a215: (sum v) a216: (sum v) a217: (sum v) a218: (sum v) a219: (sum v) a220: (sum v) a221: (sum v) a222: (sum v) a223: (sum v) a224: (sum v) a225: (sum v) a226: (sum v) a227: (sum v) a228: (sum v) a229: (sum v) a230: (sum v) a231: (sum v) a232: (sum v) a233: (sum v) a234: (sum v) a235: (sum v) a236: (sum v) a237: (sum v) a238: (sum v) a239: (sum v) a240: (sum v) a241: (sum v) a242: (sum v) a243: (sum v) a244: (sum v) a245: (sum v) a246: (sum v) a247: (sum v) a248: (sum v) a249: (sum v) a250: (sum v) a251: (sum v) a252: (sum v) a253: (sum v) a254: (sum v) by: {k: k}}))
+(at (meta r255) 'len) -- 256
+(at r255 'a254) -- [30 70]
+(set r256 (select {from: t a000: (sum v) a001: (sum v) a002: (sum v) a003: (sum v) a004: (sum v) a005: (sum v) a006: (sum v) a007: (sum v) a008: (sum v) a009: (sum v) a010: (sum v) a011: (sum v) a012: (sum v) a013: (sum v) a014: (sum v) a015: (sum v) a016: (sum v) a017: (sum v) a018: (sum v) a019: (sum v) a020: (sum v) a021: (sum v) a022: (sum v) a023: (sum v) a024: (sum v) a025: (sum v) a026: (sum v) a027: (sum v) a028: (sum v) a029: (sum v) a030: (sum v) a031: (sum v) a032: (sum v) a033: (sum v) a034: (sum v) a035: (sum v) a036: (sum v) a037: (sum v) a038: (sum v) a039: (sum v) a040: (sum v) a041: (sum v) a042: (sum v) a043: (sum v) a044: (sum v) a045: (sum v) a046: (sum v) a047: (sum v) a048: (sum v) a049: (sum v) a050: (sum v) a051: (sum v) a052: (sum v) a053: (sum v) a054: (sum v) a055: (sum v) a056: (sum v) a057: (sum v) a058: (sum v) a059: (sum v) a060: (sum v) a061: (sum v) a062: (sum v) a063: (sum v) a064: (sum v) a065: (sum v) a066: (sum v) a067: (sum v) a068: (sum v) a069: (sum v) a070: (sum v) a071: (sum v) a072: (sum v) a073: (sum v) a074: (sum v) a075: (sum v) a076: (sum v) a077: (sum v) a078: (sum v) a079: (sum v) a080: (sum v) a081: (sum v) a082: (sum v) a083: (sum v) a084: (sum v) a085: (sum v) a086: (sum v) a087: (sum v) a088: (sum v) a089: (sum v) a090: (sum v) a091: (sum v) a092: (sum v) a093: (sum v) a094: (sum v) a095: (sum v) a096: (sum v) a097: (sum v) a098: (sum v) a099: (sum v) a100: (sum v) a101: (sum v) a102: (sum v) a103: (sum v) a104: (sum v) a105: (sum v) a106: (sum v) a107: (sum v) a108: (sum v) a109: (sum v) a110: (sum v) a111: (sum v) a112: (sum v) a113: (sum v) a114: (sum v) a115: (sum v) a116: (sum v) a117: (sum v) a118: (sum v) a119: (sum v) a120: (sum v) a121: (sum v) a122: (sum v) a123: (sum v) a124: (sum v) a125: (sum v) a126: (sum v) a127: (sum v) a128: (sum v) a129: (sum v) a130: (sum v) a131: (sum v) a132: (sum v) a133: (sum v) a134: (sum v) a135: (sum v) a136: (sum v) a137: (sum v) a138: (sum v) a139: (sum v) a140: (sum v) a141: (sum v) a142: (sum v) a143: (sum v) a144: (sum v) a145: (sum v) a146: (sum v) a147: (sum v) a148: (sum v) a149: (sum v) a150: (sum v) a151: (sum v) a152: (sum v) a153: (sum v) a154: (sum v) a155: (sum v) a156: (sum v) a157: (sum v) a158: (sum v) a159: (sum v) a160: (sum v) a161: (sum v) a162: (sum v) a163: (sum v) a164: (sum v) a165: (sum v) a166: (sum v) a167: (sum v) a168: (sum v) a169: (sum v) a170: (sum v) a171: (sum v) a172: (sum v) a173: (sum v) a174: (sum v) a175: (sum v) a176: (sum v) a177: (sum v) a178: (sum v) a179: (sum v) a180: (sum v) a181: (sum v) a182: (sum v) a183: (sum v) a184: (sum v) a185: (sum v) a186: (sum v) a187: (sum v) a188: (sum v) a189: (sum v) a190: (sum v) a191: (sum v) a192: (sum v) a193: (sum v) a194: (sum v) a195: (sum v) a196: (sum v) a197: (sum v) a198: (sum v) a199: (sum v) a200: (sum v) a201: (sum v) a202: (sum v) a203: (sum v) a204: (sum v) a205: (sum v) a206: (sum v) a207: (sum v) a208: (sum v) a209: (sum v) a210: (sum v) a211: (sum v) a212: (sum v) a213: (sum v) a214: (sum v) a215: (sum v) a216: (sum v) a217: (sum v) a218: (sum v) a219: (sum v) a220: (sum v) a221: (sum v) a222: (sum v) a223: (sum v) a224: (sum v) a225: (sum v) a226: (sum v) a227: (sum v) a228: (sum v) a229: (sum v) a230: (sum v) a231: (sum v) a232: (sum v) a233: (sum v) a234: (sum v) a235: (sum v) a236: (sum v) a237: (sum v) a238: (sum v) a239: (sum v) a240: (sum v) a241: (sum v) a242: (sum v) a243: (sum v) a244: (sum v) a245: (sum v) a246: (sum v) a247: (sum v) a248: (sum v) a249: (sum v) a250: (sum v) a251: (sum v) a252: (sum v) a253: (sum v) a254: (sum v) a255: (sum v) by: {k: k}}))
+(at (meta r256) 'len) -- 257
+(at r256 'a255) -- [30 70]
+(set r300 (select {from: t a000: (sum v) a001: (sum v) a002: (sum v) a003: (sum v) a004: (sum v) a005: (sum v) a006: (sum v) a007: (sum v) a008: (sum v) a009: (sum v) a010: (sum v) a011: (sum v) a012: (sum v) a013: (sum v) a014: (sum v) a015: (sum v) a016: (sum v) a017: (sum v) a018: (sum v) a019: (sum v) a020: (sum v) a021: (sum v) a022: (sum v) a023: (sum v) a024: (sum v) a025: (sum v) a026: (sum v) a027: (sum v) a028: (sum v) a029: (sum v) a030: (sum v) a031: (sum v) a032: (sum v) a033: (sum v) a034: (sum v) a035: (sum v) a036: (sum v) a037: (sum v) a038: (sum v) a039: (sum v) a040: (sum v) a041: (sum v) a042: (sum v) a043: (sum v) a044: (sum v) a045: (sum v) a046: (sum v) a047: (sum v) a048: (sum v) a049: (sum v) a050: (sum v) a051: (sum v) a052: (sum v) a053: (sum v) a054: (sum v) a055: (sum v) a056: (sum v) a057: (sum v) a058: (sum v) a059: (sum v) a060: (sum v) a061: (sum v) a062: (sum v) a063: (sum v) a064: (sum v) a065: (sum v) a066: (sum v) a067: (sum v) a068: (sum v) a069: (sum v) a070: (sum v) a071: (sum v) a072: (sum v) a073: (sum v) a074: (sum v) a075: (sum v) a076: (sum v) a077: (sum v) a078: (sum v) a079: (sum v) a080: (sum v) a081: (sum v) a082: (sum v) a083: (sum v) a084: (sum v) a085: (sum v) a086: (sum v) a087: (sum v) a088: (sum v) a089: (sum v) a090: (sum v) a091: (sum v) a092: (sum v) a093: (sum v) a094: (sum v) a095: (sum v) a096: (sum v) a097: (sum v) a098: (sum v) a099: (sum v) a100: (sum v) a101: (sum v) a102: (sum v) a103: (sum v) a104: (sum v) a105: (sum v) a106: (sum v) a107: (sum v) a108: (sum v) a109: (sum v) a110: (sum v) a111: (sum v) a112: (sum v) a113: (sum v) a114: (sum v) a115: (sum v) a116: (sum v) a117: (sum v) a118: (sum v) a119: (sum v) a120: (sum v) a121: (sum v) a122: (sum v) a123: (sum v) a124: (sum v) a125: (sum v) a126: (sum v) a127: (sum v) a128: (sum v) a129: (sum v) a130: (sum v) a131: (sum v) a132: (sum v) a133: (sum v) a134: (sum v) a135: (sum v) a136: (sum v) a137: (sum v) a138: (sum v) a139: (sum v) a140: (sum v) a141: (sum v) a142: (sum v) a143: (sum v) a144: (sum v) a145: (sum v) a146: (sum v) a147: (sum v) a148: (sum v) a149: (sum v) a150: (sum v) a151: (sum v) a152: (sum v) a153: (sum v) a154: (sum v) a155: (sum v) a156: (sum v) a157: (sum v) a158: (sum v) a159: (sum v) a160: (sum v) a161: (sum v) a162: (sum v) a163: (sum v) a164: (sum v) a165: (sum v) a166: (sum v) a167: (sum v) a168: (sum v) a169: (sum v) a170: (sum v) a171: (sum v) a172: (sum v) a173: (sum v) a174: (sum v) a175: (sum v) a176: (sum v) a177: (sum v) a178: (sum v) a179: (sum v) a180: (sum v) a181: (sum v) a182: (sum v) a183: (sum v) a184: (sum v) a185: (sum v) a186: (sum v) a187: (sum v) a188: (sum v) a189: (sum v) a190: (sum v) a191: (sum v) a192: (sum v) a193: (sum v) a194: (sum v) a195: (sum v) a196: (sum v) a197: (sum v) a198: (sum v) a199: (sum v) a200: (sum v) a201: (sum v) a202: (sum v) a203: (sum v) a204: (sum v) a205: (sum v) a206: (sum v) a207: (sum v) a208: (sum v) a209: (sum v) a210: (sum v) a211: (sum v) a212: (sum v) a213: (sum v) a214: (sum v) a215: (sum v) a216: (sum v) a217: (sum v) a218: (sum v) a219: (sum v) a220: (sum v) a221: (sum v) a222: (sum v) a223: (sum v) a224: (sum v) a225: (sum v) a226: (sum v) a227: (sum v) a228: (sum v) a229: (sum v) a230: (sum v) a231: (sum v) a232: (sum v) a233: (sum v) a234: (sum v) a235: (sum v) a236: (sum v) a237: (sum v) a238: (sum v) a239: (sum v) a240: (sum v) a241: (sum v) a242: (sum v) a243: (sum v) a244: (sum v) a245: (sum v) a246: (sum v) a247: (sum v) a248: (sum v) a249: (sum v) a250: (sum v) a251: (sum v) a252: (sum v) a253: (sum v) a254: (sum v) a255: (sum v) a256: (sum v) a257: (sum v) a258: (sum v) a259: (sum v) a260: (sum v) a261: (sum v) a262: (sum v) a263: (sum v) a264: (sum v) a265: (sum v) a266: (sum v) a267: (sum v) a268: (sum v) a269: (sum v) a270: (sum v) a271: (sum v) a272: (sum v) a273: (sum v) a274: (sum v) a275: (sum v) a276: (sum v) a277: (sum v) a278: (sum v) a279: (sum v) a280: (sum v) a281: (sum v) a282: (sum v) a283: (sum v) a284: (sum v) a285: (sum v) a286: (sum v) a287: (sum v) a288: (sum v) a289: (sum v) a290: (sum v) a291: (sum v) a292: (sum v) a293: (sum v) a294: (sum v) a295: (sum v) a296: (sum v) a297: (sum v) a298: (sum v) a299: (sum v) by: {k: k}}))
+(at (meta r300) 'len) -- 301
+(at r300 'a299) -- [30 70]
+
+;; ── F2 projection outputs (no by:, no agg): 300 columns, each = v.
+;; meta len = 300; last column p299 = the whole v column [10 20 30 40]. ──
+(set rp300 (select {from: t p000: v p001: v p002: v p003: v p004: v p005: v p006: v p007: v p008: v p009: v p010: v p011: v p012: v p013: v p014: v p015: v p016: v p017: v p018: v p019: v p020: v p021: v p022: v p023: v p024: v p025: v p026: v p027: v p028: v p029: v p030: v p031: v p032: v p033: v p034: v p035: v p036: v p037: v p038: v p039: v p040: v p041: v p042: v p043: v p044: v p045: v p046: v p047: v p048: v p049: v p050: v p051: v p052: v p053: v p054: v p055: v p056: v p057: v p058: v p059: v p060: v p061: v p062: v p063: v p064: v p065: v p066: v p067: v p068: v p069: v p070: v p071: v p072: v p073: v p074: v p075: v p076: v p077: v p078: v p079: v p080: v p081: v p082: v p083: v p084: v p085: v p086: v p087: v p088: v p089: v p090: v p091: v p092: v p093: v p094: v p095: v p096: v p097: v p098: v p099: v p100: v p101: v p102: v p103: v p104: v p105: v p106: v p107: v p108: v p109: v p110: v p111: v p112: v p113: v p114: v p115: v p116: v p117: v p118: v p119: v p120: v p121: v p122: v p123: v p124: v p125: v p126: v p127: v p128: v p129: v p130: v p131: v p132: v p133: v p134: v p135: v p136: v p137: v p138: v p139: v p140: v p141: v p142: v p143: v p144: v p145: v p146: v p147: v p148: v p149: v p150: v p151: v p152: v p153: v p154: v p155: v p156: v p157: v p158: v p159: v p160: v p161: v p162: v p163: v p164: v p165: v p166: v p167: v p168: v p169: v p170: v p171: v p172: v p173: v p174: v p175: v p176: v p177: v p178: v p179: v p180: v p181: v p182: v p183: v p184: v p185: v p186: v p187: v p188: v p189: v p190: v p191: v p192: v p193: v p194: v p195: v p196: v p197: v p198: v p199: v p200: v p201: v p202: v p203: v p204: v p205: v p206: v p207: v p208: v p209: v p210: v p211: v p212: v p213: v p214: v p215: v p216: v p217: v p218: v p219: v p220: v p221: v p222: v p223: v p224: v p225: v p226: v p227: v p228: v p229: v p230: v p231: v p232: v p233: v p234: v p235: v p236: v p237: v p238: v p239: v p240: v p241: v p242: v p243: v p244: v p245: v p246: v p247: v p248: v p249: v p250: v p251: v p252: v p253: v p254: v p255: v p256: v p257: v p258: v p259: v p260: v p261: v p262: v p263: v p264: v p265: v p266: v p267: v p268: v p269: v p270: v p271: v p272: v p273: v p274: v p275: v p276: v p277: v p278: v p279: v p280: v p281: v p282: v p283: v p284: v p285: v p286: v p287: v p288: v p289: v p290: v p291: v p292: v p293: v p294: v p295: v p296: v p297: v p298: v p299: v}))
+(at (meta rp300) 'len) -- 300
+(at rp300 'p299) -- [10 20 30 40]
+
+;; ── F3 sort keys at 256 and 300 (no-by DAG sort → exec_sort, uint32
+;; ext->sort.n_cols).  n-1 constant dummy keys d000.. plus a discriminator
+;; sk=[2 1] last; asc over all n keys is decided by sk (1 before 2), so a
+;; genuine reorder maps pay=[20 10] → [10 20].  A truncated-to-0 sort would
+;; return source order [20 10]. Table built via take/concat (the list()
+;; builder caps at 64 args; the bracket name-vector is lexer-parsed). ──
+(set st256 (table [d000 d001 d002 d003 d004 d005 d006 d007 d008 d009 d010 d011 d012 d013 d014 d015 d016 d017 d018 d019 d020 d021 d022 d023 d024 d025 d026 d027 d028 d029 d030 d031 d032 d033 d034 d035 d036 d037 d038 d039 d040 d041 d042 d043 d044 d045 d046 d047 d048 d049 d050 d051 d052 d053 d054 d055 d056 d057 d058 d059 d060 d061 d062 d063 d064 d065 d066 d067 d068 d069 d070 d071 d072 d073 d074 d075 d076 d077 d078 d079 d080 d081 d082 d083 d084 d085 d086 d087 d088 d089 d090 d091 d092 d093 d094 d095 d096 d097 d098 d099 d100 d101 d102 d103 d104 d105 d106 d107 d108 d109 d110 d111 d112 d113 d114 d115 d116 d117 d118 d119 d120 d121 d122 d123 d124 d125 d126 d127 d128 d129 d130 d131 d132 d133 d134 d135 d136 d137 d138 d139 d140 d141 d142 d143 d144 d145 d146 d147 d148 d149 d150 d151 d152 d153 d154 d155 d156 d157 d158 d159 d160 d161 d162 d163 d164 d165 d166 d167 d168 d169 d170 d171 d172 d173 d174 d175 d176 d177 d178 d179 d180 d181 d182 d183 d184 d185 d186 d187 d188 d189 d190 d191 d192 d193 d194 d195 d196 d197 d198 d199 d200 d201 d202 d203 d204 d205 d206 d207 d208 d209 d210 d211 d212 d213 d214 d215 d216 d217 d218 d219 d220 d221 d222 d223 d224 d225 d226 d227 d228 d229 d230 d231 d232 d233 d234 d235 d236 d237 d238 d239 d240 d241 d242 d243 d244 d245 d246 d247 d248 d249 d250 d251 d252 d253 d254 sk pay] (concat (take (list [0 0]) 255) (list [2 1] [20 10]))))
+(at (select {from: st256 asc: [d000 d001 d002 d003 d004 d005 d006 d007 d008 d009 d010 d011 d012 d013 d014 d015 d016 d017 d018 d019 d020 d021 d022 d023 d024 d025 d026 d027 d028 d029 d030 d031 d032 d033 d034 d035 d036 d037 d038 d039 d040 d041 d042 d043 d044 d045 d046 d047 d048 d049 d050 d051 d052 d053 d054 d055 d056 d057 d058 d059 d060 d061 d062 d063 d064 d065 d066 d067 d068 d069 d070 d071 d072 d073 d074 d075 d076 d077 d078 d079 d080 d081 d082 d083 d084 d085 d086 d087 d088 d089 d090 d091 d092 d093 d094 d095 d096 d097 d098 d099 d100 d101 d102 d103 d104 d105 d106 d107 d108 d109 d110 d111 d112 d113 d114 d115 d116 d117 d118 d119 d120 d121 d122 d123 d124 d125 d126 d127 d128 d129 d130 d131 d132 d133 d134 d135 d136 d137 d138 d139 d140 d141 d142 d143 d144 d145 d146 d147 d148 d149 d150 d151 d152 d153 d154 d155 d156 d157 d158 d159 d160 d161 d162 d163 d164 d165 d166 d167 d168 d169 d170 d171 d172 d173 d174 d175 d176 d177 d178 d179 d180 d181 d182 d183 d184 d185 d186 d187 d188 d189 d190 d191 d192 d193 d194 d195 d196 d197 d198 d199 d200 d201 d202 d203 d204 d205 d206 d207 d208 d209 d210 d211 d212 d213 d214 d215 d216 d217 d218 d219 d220 d221 d222 d223 d224 d225 d226 d227 d228 d229 d230 d231 d232 d233 d234 d235 d236 d237 d238 d239 d240 d241 d242 d243 d244 d245 d246 d247 d248 d249 d250 d251 d252 d253 d254 sk]}) 'pay) -- [10 20]
+(set st300 (table [d000 d001 d002 d003 d004 d005 d006 d007 d008 d009 d010 d011 d012 d013 d014 d015 d016 d017 d018 d019 d020 d021 d022 d023 d024 d025 d026 d027 d028 d029 d030 d031 d032 d033 d034 d035 d036 d037 d038 d039 d040 d041 d042 d043 d044 d045 d046 d047 d048 d049 d050 d051 d052 d053 d054 d055 d056 d057 d058 d059 d060 d061 d062 d063 d064 d065 d066 d067 d068 d069 d070 d071 d072 d073 d074 d075 d076 d077 d078 d079 d080 d081 d082 d083 d084 d085 d086 d087 d088 d089 d090 d091 d092 d093 d094 d095 d096 d097 d098 d099 d100 d101 d102 d103 d104 d105 d106 d107 d108 d109 d110 d111 d112 d113 d114 d115 d116 d117 d118 d119 d120 d121 d122 d123 d124 d125 d126 d127 d128 d129 d130 d131 d132 d133 d134 d135 d136 d137 d138 d139 d140 d141 d142 d143 d144 d145 d146 d147 d148 d149 d150 d151 d152 d153 d154 d155 d156 d157 d158 d159 d160 d161 d162 d163 d164 d165 d166 d167 d168 d169 d170 d171 d172 d173 d174 d175 d176 d177 d178 d179 d180 d181 d182 d183 d184 d185 d186 d187 d188 d189 d190 d191 d192 d193 d194 d195 d196 d197 d198 d199 d200 d201 d202 d203 d204 d205 d206 d207 d208 d209 d210 d211 d212 d213 d214 d215 d216 d217 d218 d219 d220 d221 d222 d223 d224 d225 d226 d227 d228 d229 d230 d231 d232 d233 d234 d235 d236 d237 d238 d239 d240 d241 d242 d243 d244 d245 d246 d247 d248 d249 d250 d251 d252 d253 d254 d255 d256 d257 d258 d259 d260 d261 d262 d263 d264 d265 d266 d267 d268 d269 d270 d271 d272 d273 d274 d275 d276 d277 d278 d279 d280 d281 d282 d283 d284 d285 d286 d287 d288 d289 d290 d291 d292 d293 d294 d295 d296 d297 d298 sk pay] (concat (take (list [0 0]) 299) (list [2 1] [20 10]))))
+(at (select {from: st300 asc: [d000 d001 d002 d003 d004 d005 d006 d007 d008 d009 d010 d011 d012 d013 d014 d015 d016 d017 d018 d019 d020 d021 d022 d023 d024 d025 d026 d027 d028 d029 d030 d031 d032 d033 d034 d035 d036 d037 d038 d039 d040 d041 d042 d043 d044 d045 d046 d047 d048 d049 d050 d051 d052 d053 d054 d055 d056 d057 d058 d059 d060 d061 d062 d063 d064 d065 d066 d067 d068 d069 d070 d071 d072 d073 d074 d075 d076 d077 d078 d079 d080 d081 d082 d083 d084 d085 d086 d087 d088 d089 d090 d091 d092 d093 d094 d095 d096 d097 d098 d099 d100 d101 d102 d103 d104 d105 d106 d107 d108 d109 d110 d111 d112 d113 d114 d115 d116 d117 d118 d119 d120 d121 d122 d123 d124 d125 d126 d127 d128 d129 d130 d131 d132 d133 d134 d135 d136 d137 d138 d139 d140 d141 d142 d143 d144 d145 d146 d147 d148 d149 d150 d151 d152 d153 d154 d155 d156 d157 d158 d159 d160 d161 d162 d163 d164 d165 d166 d167 d168 d169 d170 d171 d172 d173 d174 d175 d176 d177 d178 d179 d180 d181 d182 d183 d184 d185 d186 d187 d188 d189 d190 d191 d192 d193 d194 d195 d196 d197 d198 d199 d200 d201 d202 d203 d204 d205 d206 d207 d208 d209 d210 d211 d212 d213 d214 d215 d216 d217 d218 d219 d220 d221 d222 d223 d224 d225 d226 d227 d228 d229 d230 d231 d232 d233 d234 d235 d236 d237 d238 d239 d240 d241 d242 d243 d244 d245 d246 d247 d248 d249 d250 d251 d252 d253 d254 d255 d256 d257 d258 d259 d260 d261 d262 d263 d264 d265 d266 d267 d268 d269 d270 d271 d272 d273 d274 d275 d276 d277 d278 d279 d280 d281 d282 d283 d284 d285 d286 d287 d288 d289 d290 d291 d292 d293 d294 d295 d296 d297 d298 sk]}) 'pay) -- [10 20]
+
+;; ── F4 window: 300 partition columns (299 constant + p299 alternating 0/1
+;; over 100 rows). Partitions split even/odd → min 0 / min 1, broadcast back
+;; in source order → mn = [0 1 0 1 ...]; sum = 50, count = 100. ──
+(set wq300 (table [p000 p001 p002 p003 p004 p005 p006 p007 p008 p009 p010 p011 p012 p013 p014 p015 p016 p017 p018 p019 p020 p021 p022 p023 p024 p025 p026 p027 p028 p029 p030 p031 p032 p033 p034 p035 p036 p037 p038 p039 p040 p041 p042 p043 p044 p045 p046 p047 p048 p049 p050 p051 p052 p053 p054 p055 p056 p057 p058 p059 p060 p061 p062 p063 p064 p065 p066 p067 p068 p069 p070 p071 p072 p073 p074 p075 p076 p077 p078 p079 p080 p081 p082 p083 p084 p085 p086 p087 p088 p089 p090 p091 p092 p093 p094 p095 p096 p097 p098 p099 p100 p101 p102 p103 p104 p105 p106 p107 p108 p109 p110 p111 p112 p113 p114 p115 p116 p117 p118 p119 p120 p121 p122 p123 p124 p125 p126 p127 p128 p129 p130 p131 p132 p133 p134 p135 p136 p137 p138 p139 p140 p141 p142 p143 p144 p145 p146 p147 p148 p149 p150 p151 p152 p153 p154 p155 p156 p157 p158 p159 p160 p161 p162 p163 p164 p165 p166 p167 p168 p169 p170 p171 p172 p173 p174 p175 p176 p177 p178 p179 p180 p181 p182 p183 p184 p185 p186 p187 p188 p189 p190 p191 p192 p193 p194 p195 p196 p197 p198 p199 p200 p201 p202 p203 p204 p205 p206 p207 p208 p209 p210 p211 p212 p213 p214 p215 p216 p217 p218 p219 p220 p221 p222 p223 p224 p225 p226 p227 p228 p229 p230 p231 p232 p233 p234 p235 p236 p237 p238 p239 p240 p241 p242 p243 p244 p245 p246 p247 p248 p249 p250 p251 p252 p253 p254 p255 p256 p257 p258 p259 p260 p261 p262 p263 p264 p265 p266 p267 p268 p269 p270 p271 p272 p273 p274 p275 p276 p277 p278 p279 p280 p281 p282 p283 p284 p285 p286 p287 p288 p289 p290 p291 p292 p293 p294 p295 p296 p297 p298 p299 v] (concat (take (list (take [1] 100)) 299) (list (% (til 100) 2) (til 100)))))
+(set wr300 (at (window {from: wq300 part: [p000 p001 p002 p003 p004 p005 p006 p007 p008 p009 p010 p011 p012 p013 p014 p015 p016 p017 p018 p019 p020 p021 p022 p023 p024 p025 p026 p027 p028 p029 p030 p031 p032 p033 p034 p035 p036 p037 p038 p039 p040 p041 p042 p043 p044 p045 p046 p047 p048 p049 p050 p051 p052 p053 p054 p055 p056 p057 p058 p059 p060 p061 p062 p063 p064 p065 p066 p067 p068 p069 p070 p071 p072 p073 p074 p075 p076 p077 p078 p079 p080 p081 p082 p083 p084 p085 p086 p087 p088 p089 p090 p091 p092 p093 p094 p095 p096 p097 p098 p099 p100 p101 p102 p103 p104 p105 p106 p107 p108 p109 p110 p111 p112 p113 p114 p115 p116 p117 p118 p119 p120 p121 p122 p123 p124 p125 p126 p127 p128 p129 p130 p131 p132 p133 p134 p135 p136 p137 p138 p139 p140 p141 p142 p143 p144 p145 p146 p147 p148 p149 p150 p151 p152 p153 p154 p155 p156 p157 p158 p159 p160 p161 p162 p163 p164 p165 p166 p167 p168 p169 p170 p171 p172 p173 p174 p175 p176 p177 p178 p179 p180 p181 p182 p183 p184 p185 p186 p187 p188 p189 p190 p191 p192 p193 p194 p195 p196 p197 p198 p199 p200 p201 p202 p203 p204 p205 p206 p207 p208 p209 p210 p211 p212 p213 p214 p215 p216 p217 p218 p219 p220 p221 p222 p223 p224 p225 p226 p227 p228 p229 p230 p231 p232 p233 p234 p235 p236 p237 p238 p239 p240 p241 p242 p243 p244 p245 p246 p247 p248 p249 p250 p251 p252 p253 p254 p255 p256 p257 p258 p259 p260 p261 p262 p263 p264 p265 p266 p267 p268 p269 p270 p271 p272 p273 p274 p275 p276 p277 p278 p279 p280 p281 p282 p283 p284 p285 p286 p287 p288 p289 p290 p291 p292 p293 p294 p295 p296 p297 p298 p299] funcs: {mn: (min v)}}) 'mn))
+(sum wr300) -- 50
+(count wr300) -- 100
+
+;; ── F4 window: 256 funcs: entries over a single-partition 2-row fixture.
+;; p01/p02 constant → one partition; v=[3.0 5.0]; each min broadcasts 3.0.
+;; meta len = 3 source cols + 256 func cols = 259; every mnNNN = [3.0 3.0].
+;; At a uint8-truncated 256→0 this collapsed to 3 cols with mn = raw v. ──
+(set wp2 (table [p01 p02 v] (list [1 1] [1 1] [3.0 5.0])))
+(set wpr256 (window {from: wp2 part: [p01 p02] funcs: {mn000: (min v) mn001: (min v) mn002: (min v) mn003: (min v) mn004: (min v) mn005: (min v) mn006: (min v) mn007: (min v) mn008: (min v) mn009: (min v) mn010: (min v) mn011: (min v) mn012: (min v) mn013: (min v) mn014: (min v) mn015: (min v) mn016: (min v) mn017: (min v) mn018: (min v) mn019: (min v) mn020: (min v) mn021: (min v) mn022: (min v) mn023: (min v) mn024: (min v) mn025: (min v) mn026: (min v) mn027: (min v) mn028: (min v) mn029: (min v) mn030: (min v) mn031: (min v) mn032: (min v) mn033: (min v) mn034: (min v) mn035: (min v) mn036: (min v) mn037: (min v) mn038: (min v) mn039: (min v) mn040: (min v) mn041: (min v) mn042: (min v) mn043: (min v) mn044: (min v) mn045: (min v) mn046: (min v) mn047: (min v) mn048: (min v) mn049: (min v) mn050: (min v) mn051: (min v) mn052: (min v) mn053: (min v) mn054: (min v) mn055: (min v) mn056: (min v) mn057: (min v) mn058: (min v) mn059: (min v) mn060: (min v) mn061: (min v) mn062: (min v) mn063: (min v) mn064: (min v) mn065: (min v) mn066: (min v) mn067: (min v) mn068: (min v) mn069: (min v) mn070: (min v) mn071: (min v) mn072: (min v) mn073: (min v) mn074: (min v) mn075: (min v) mn076: (min v) mn077: (min v) mn078: (min v) mn079: (min v) mn080: (min v) mn081: (min v) mn082: (min v) mn083: (min v) mn084: (min v) mn085: (min v) mn086: (min v) mn087: (min v) mn088: (min v) mn089: (min v) mn090: (min v) mn091: (min v) mn092: (min v) mn093: (min v) mn094: (min v) mn095: (min v) mn096: (min v) mn097: (min v) mn098: (min v) mn099: (min v) mn100: (min v) mn101: (min v) mn102: (min v) mn103: (min v) mn104: (min v) mn105: (min v) mn106: (min v) mn107: (min v) mn108: (min v) mn109: (min v) mn110: (min v) mn111: (min v) mn112: (min v) mn113: (min v) mn114: (min v) mn115: (min v) mn116: (min v) mn117: (min v) mn118: (min v) mn119: (min v) mn120: (min v) mn121: (min v) mn122: (min v) mn123: (min v) mn124: (min v) mn125: (min v) mn126: (min v) mn127: (min v) mn128: (min v) mn129: (min v) mn130: (min v) mn131: (min v) mn132: (min v) mn133: (min v) mn134: (min v) mn135: (min v) mn136: (min v) mn137: (min v) mn138: (min v) mn139: (min v) mn140: (min v) mn141: (min v) mn142: (min v) mn143: (min v) mn144: (min v) mn145: (min v) mn146: (min v) mn147: (min v) mn148: (min v) mn149: (min v) mn150: (min v) mn151: (min v) mn152: (min v) mn153: (min v) mn154: (min v) mn155: (min v) mn156: (min v) mn157: (min v) mn158: (min v) mn159: (min v) mn160: (min v) mn161: (min v) mn162: (min v) mn163: (min v) mn164: (min v) mn165: (min v) mn166: (min v) mn167: (min v) mn168: (min v) mn169: (min v) mn170: (min v) mn171: (min v) mn172: (min v) mn173: (min v) mn174: (min v) mn175: (min v) mn176: (min v) mn177: (min v) mn178: (min v) mn179: (min v) mn180: (min v) mn181: (min v) mn182: (min v) mn183: (min v) mn184: (min v) mn185: (min v) mn186: (min v) mn187: (min v) mn188: (min v) mn189: (min v) mn190: (min v) mn191: (min v) mn192: (min v) mn193: (min v) mn194: (min v) mn195: (min v) mn196: (min v) mn197: (min v) mn198: (min v) mn199: (min v) mn200: (min v) mn201: (min v) mn202: (min v) mn203: (min v) mn204: (min v) mn205: (min v) mn206: (min v) mn207: (min v) mn208: (min v) mn209: (min v) mn210: (min v) mn211: (min v) mn212: (min v) mn213: (min v) mn214: (min v) mn215: (min v) mn216: (min v) mn217: (min v) mn218: (min v) mn219: (min v) mn220: (min v) mn221: (min v) mn222: (min v) mn223: (min v) mn224: (min v) mn225: (min v) mn226: (min v) mn227: (min v) mn228: (min v) mn229: (min v) mn230: (min v) mn231: (min v) mn232: (min v) mn233: (min v) mn234: (min v) mn235: (min v) mn236: (min v) mn237: (min v) mn238: (min v) mn239: (min v) mn240: (min v) mn241: (min v) mn242: (min v) mn243: (min v) mn244: (min v) mn245: (min v) mn246: (min v) mn247: (min v) mn248: (min v) mn249: (min v) mn250: (min v) mn251: (min v) mn252: (min v) mn253: (min v) mn254: (min v) mn255: (min v)}}))
+(at (meta wpr256) 'len) -- 259
+(at wpr256 'mn000) -- [3.0 3.0]
+(at wpr256 'mn255) -- [3.0 3.0]
+
+;; ── F4 window: order: at 256 and 300 keys (src/ops/query.c n_order ->
+;; ray_window_op, window.c ext->window.n_order_keys) — the one widened
+;; count carrier the branch left without a 256/300 anti-truncation cell.
+;; Single partition (part: [p], p constant 1 for all 100 rows) so ordering,
+;; not partitioning, decides row rank. All order keys but the LAST are
+;; constant (tied); the last key oNNN = 99 - (til 100), i.e. row i carries
+;; oNNN_i = 99-i, so ascending order puts i=99 first (oNNN=0) and i=0 last
+;; (oNNN=99) — a full reversal of source order, decided ENTIRELY by that
+;; final key. v = til 100 (v_i = i), so within the one partition first(v)
+;; = v at the sorted-first row = 99 and last(v) = v at the sorted-last row
+;; = 0, both broadcast to every one of the 100 output rows: sum(f) =
+;; 99*100 = 9900, sum(l) = 0. 100 rows clears the nrows<=64 insertion-sort
+;; cutoff (window.c:802), exercising the radix/merge composite-sort path.
+;;
+;; Truncation check: a uint8_t cast on n_order collapses 256 -> 0 order keys
+;; (order dropped entirely) and 300 -> 44 (only o000..o043 survive, all
+;; constant/tied) — either way the discriminating final key is lost,
+;; ordering degenerates to a no-op over the single tied partition, and
+;; first(v)/last(v) stop being 99/0 (verified: reintroducing the cast at
+;; query.c's ray_window_op call site flips these cells red). ──
+(set to256 (table [p o000 o001 o002 o003 o004 o005 o006 o007 o008 o009 o010 o011 o012 o013 o014 o015 o016 o017 o018 o019 o020 o021 o022 o023 o024 o025 o026 o027 o028 o029 o030 o031 o032 o033 o034 o035 o036 o037 o038 o039 o040 o041 o042 o043 o044 o045 o046 o047 o048 o049 o050 o051 o052 o053 o054 o055 o056 o057 o058 o059 o060 o061 o062 o063 o064 o065 o066 o067 o068 o069 o070 o071 o072 o073 o074 o075 o076 o077 o078 o079 o080 o081 o082 o083 o084 o085 o086 o087 o088 o089 o090 o091 o092 o093 o094 o095 o096 o097 o098 o099 o100 o101 o102 o103 o104 o105 o106 o107 o108 o109 o110 o111 o112 o113 o114 o115 o116 o117 o118 o119 o120 o121 o122 o123 o124 o125 o126 o127 o128 o129 o130 o131 o132 o133 o134 o135 o136 o137 o138 o139 o140 o141 o142 o143 o144 o145 o146 o147 o148 o149 o150 o151 o152 o153 o154 o155 o156 o157 o158 o159 o160 o161 o162 o163 o164 o165 o166 o167 o168 o169 o170 o171 o172 o173 o174 o175 o176 o177 o178 o179 o180 o181 o182 o183 o184 o185 o186 o187 o188 o189 o190 o191 o192 o193 o194 o195 o196 o197 o198 o199 o200 o201 o202 o203 o204 o205 o206 o207 o208 o209 o210 o211 o212 o213 o214 o215 o216 o217 o218 o219 o220 o221 o222 o223 o224 o225 o226 o227 o228 o229 o230 o231 o232 o233 o234 o235 o236 o237 o238 o239 o240 o241 o242 o243 o244 o245 o246 o247 o248 o249 o250 o251 o252 o253 o254 o255 v] (concat (take (list (take [1] 100)) 256) (list (- 99 (til 100)) (til 100)))))
+(set wo256 (window {from: to256 part: [p] order: [o000 o001 o002 o003 o004 o005 o006 o007 o008 o009 o010 o011 o012 o013 o014 o015 o016 o017 o018 o019 o020 o021 o022 o023 o024 o025 o026 o027 o028 o029 o030 o031 o032 o033 o034 o035 o036 o037 o038 o039 o040 o041 o042 o043 o044 o045 o046 o047 o048 o049 o050 o051 o052 o053 o054 o055 o056 o057 o058 o059 o060 o061 o062 o063 o064 o065 o066 o067 o068 o069 o070 o071 o072 o073 o074 o075 o076 o077 o078 o079 o080 o081 o082 o083 o084 o085 o086 o087 o088 o089 o090 o091 o092 o093 o094 o095 o096 o097 o098 o099 o100 o101 o102 o103 o104 o105 o106 o107 o108 o109 o110 o111 o112 o113 o114 o115 o116 o117 o118 o119 o120 o121 o122 o123 o124 o125 o126 o127 o128 o129 o130 o131 o132 o133 o134 o135 o136 o137 o138 o139 o140 o141 o142 o143 o144 o145 o146 o147 o148 o149 o150 o151 o152 o153 o154 o155 o156 o157 o158 o159 o160 o161 o162 o163 o164 o165 o166 o167 o168 o169 o170 o171 o172 o173 o174 o175 o176 o177 o178 o179 o180 o181 o182 o183 o184 o185 o186 o187 o188 o189 o190 o191 o192 o193 o194 o195 o196 o197 o198 o199 o200 o201 o202 o203 o204 o205 o206 o207 o208 o209 o210 o211 o212 o213 o214 o215 o216 o217 o218 o219 o220 o221 o222 o223 o224 o225 o226 o227 o228 o229 o230 o231 o232 o233 o234 o235 o236 o237 o238 o239 o240 o241 o242 o243 o244 o245 o246 o247 o248 o249 o250 o251 o252 o253 o254 o255] funcs: {f: (first v) l: (last v)}}))
+(at (meta wo256) 'len) -- 260
+(sum (at wo256 'f)) -- 9900
+(sum (at wo256 'l)) -- 0
+(count (at wo256 'f)) -- 100
+
+(set to300 (table [p o000 o001 o002 o003 o004 o005 o006 o007 o008 o009 o010 o011 o012 o013 o014 o015 o016 o017 o018 o019 o020 o021 o022 o023 o024 o025 o026 o027 o028 o029 o030 o031 o032 o033 o034 o035 o036 o037 o038 o039 o040 o041 o042 o043 o044 o045 o046 o047 o048 o049 o050 o051 o052 o053 o054 o055 o056 o057 o058 o059 o060 o061 o062 o063 o064 o065 o066 o067 o068 o069 o070 o071 o072 o073 o074 o075 o076 o077 o078 o079 o080 o081 o082 o083 o084 o085 o086 o087 o088 o089 o090 o091 o092 o093 o094 o095 o096 o097 o098 o099 o100 o101 o102 o103 o104 o105 o106 o107 o108 o109 o110 o111 o112 o113 o114 o115 o116 o117 o118 o119 o120 o121 o122 o123 o124 o125 o126 o127 o128 o129 o130 o131 o132 o133 o134 o135 o136 o137 o138 o139 o140 o141 o142 o143 o144 o145 o146 o147 o148 o149 o150 o151 o152 o153 o154 o155 o156 o157 o158 o159 o160 o161 o162 o163 o164 o165 o166 o167 o168 o169 o170 o171 o172 o173 o174 o175 o176 o177 o178 o179 o180 o181 o182 o183 o184 o185 o186 o187 o188 o189 o190 o191 o192 o193 o194 o195 o196 o197 o198 o199 o200 o201 o202 o203 o204 o205 o206 o207 o208 o209 o210 o211 o212 o213 o214 o215 o216 o217 o218 o219 o220 o221 o222 o223 o224 o225 o226 o227 o228 o229 o230 o231 o232 o233 o234 o235 o236 o237 o238 o239 o240 o241 o242 o243 o244 o245 o246 o247 o248 o249 o250 o251 o252 o253 o254 o255 o256 o257 o258 o259 o260 o261 o262 o263 o264 o265 o266 o267 o268 o269 o270 o271 o272 o273 o274 o275 o276 o277 o278 o279 o280 o281 o282 o283 o284 o285 o286 o287 o288 o289 o290 o291 o292 o293 o294 o295 o296 o297 o298 o299 v] (concat (take (list (take [1] 100)) 300) (list (- 99 (til 100)) (til 100)))))
+(set wo300 (window {from: to300 part: [p] order: [o000 o001 o002 o003 o004 o005 o006 o007 o008 o009 o010 o011 o012 o013 o014 o015 o016 o017 o018 o019 o020 o021 o022 o023 o024 o025 o026 o027 o028 o029 o030 o031 o032 o033 o034 o035 o036 o037 o038 o039 o040 o041 o042 o043 o044 o045 o046 o047 o048 o049 o050 o051 o052 o053 o054 o055 o056 o057 o058 o059 o060 o061 o062 o063 o064 o065 o066 o067 o068 o069 o070 o071 o072 o073 o074 o075 o076 o077 o078 o079 o080 o081 o082 o083 o084 o085 o086 o087 o088 o089 o090 o091 o092 o093 o094 o095 o096 o097 o098 o099 o100 o101 o102 o103 o104 o105 o106 o107 o108 o109 o110 o111 o112 o113 o114 o115 o116 o117 o118 o119 o120 o121 o122 o123 o124 o125 o126 o127 o128 o129 o130 o131 o132 o133 o134 o135 o136 o137 o138 o139 o140 o141 o142 o143 o144 o145 o146 o147 o148 o149 o150 o151 o152 o153 o154 o155 o156 o157 o158 o159 o160 o161 o162 o163 o164 o165 o166 o167 o168 o169 o170 o171 o172 o173 o174 o175 o176 o177 o178 o179 o180 o181 o182 o183 o184 o185 o186 o187 o188 o189 o190 o191 o192 o193 o194 o195 o196 o197 o198 o199 o200 o201 o202 o203 o204 o205 o206 o207 o208 o209 o210 o211 o212 o213 o214 o215 o216 o217 o218 o219 o220 o221 o222 o223 o224 o225 o226 o227 o228 o229 o230 o231 o232 o233 o234 o235 o236 o237 o238 o239 o240 o241 o242 o243 o244 o245 o246 o247 o248 o249 o250 o251 o252 o253 o254 o255 o256 o257 o258 o259 o260 o261 o262 o263 o264 o265 o266 o267 o268 o269 o270 o271 o272 o273 o274 o275 o276 o277 o278 o279 o280 o281 o282 o283 o284 o285 o286 o287 o288 o289 o290 o291 o292 o293 o294 o295 o296 o297 o298 o299] funcs: {f: (first v) l: (last v)}}))
+(at (meta wo300) 'len) -- 304
+(sum (at wo300 'f)) -- 9900
+(sum (at wo300 'l)) -- 0
+(count (at wo300 'f)) -- 100
+
+;; ── F5 count-only with take: 256 count outputs, single by-key (DAG path).
+;; meta len = 256 + 1 key = 257; every count column = [2 2]. ──
+(set rt256 (select {from: t c000: (count v) c001: (count v) c002: (count v) c003: (count v) c004: (count v) c005: (count v) c006: (count v) c007: (count v) c008: (count v) c009: (count v) c010: (count v) c011: (count v) c012: (count v) c013: (count v) c014: (count v) c015: (count v) c016: (count v) c017: (count v) c018: (count v) c019: (count v) c020: (count v) c021: (count v) c022: (count v) c023: (count v) c024: (count v) c025: (count v) c026: (count v) c027: (count v) c028: (count v) c029: (count v) c030: (count v) c031: (count v) c032: (count v) c033: (count v) c034: (count v) c035: (count v) c036: (count v) c037: (count v) c038: (count v) c039: (count v) c040: (count v) c041: (count v) c042: (count v) c043: (count v) c044: (count v) c045: (count v) c046: (count v) c047: (count v) c048: (count v) c049: (count v) c050: (count v) c051: (count v) c052: (count v) c053: (count v) c054: (count v) c055: (count v) c056: (count v) c057: (count v) c058: (count v) c059: (count v) c060: (count v) c061: (count v) c062: (count v) c063: (count v) c064: (count v) c065: (count v) c066: (count v) c067: (count v) c068: (count v) c069: (count v) c070: (count v) c071: (count v) c072: (count v) c073: (count v) c074: (count v) c075: (count v) c076: (count v) c077: (count v) c078: (count v) c079: (count v) c080: (count v) c081: (count v) c082: (count v) c083: (count v) c084: (count v) c085: (count v) c086: (count v) c087: (count v) c088: (count v) c089: (count v) c090: (count v) c091: (count v) c092: (count v) c093: (count v) c094: (count v) c095: (count v) c096: (count v) c097: (count v) c098: (count v) c099: (count v) c100: (count v) c101: (count v) c102: (count v) c103: (count v) c104: (count v) c105: (count v) c106: (count v) c107: (count v) c108: (count v) c109: (count v) c110: (count v) c111: (count v) c112: (count v) c113: (count v) c114: (count v) c115: (count v) c116: (count v) c117: (count v) c118: (count v) c119: (count v) c120: (count v) c121: (count v) c122: (count v) c123: (count v) c124: (count v) c125: (count v) c126: (count v) c127: (count v) c128: (count v) c129: (count v) c130: (count v) c131: (count v) c132: (count v) c133: (count v) c134: (count v) c135: (count v) c136: (count v) c137: (count v) c138: (count v) c139: (count v) c140: (count v) c141: (count v) c142: (count v) c143: (count v) c144: (count v) c145: (count v) c146: (count v) c147: (count v) c148: (count v) c149: (count v) c150: (count v) c151: (count v) c152: (count v) c153: (count v) c154: (count v) c155: (count v) c156: (count v) c157: (count v) c158: (count v) c159: (count v) c160: (count v) c161: (count v) c162: (count v) c163: (count v) c164: (count v) c165: (count v) c166: (count v) c167: (count v) c168: (count v) c169: (count v) c170: (count v) c171: (count v) c172: (count v) c173: (count v) c174: (count v) c175: (count v) c176: (count v) c177: (count v) c178: (count v) c179: (count v) c180: (count v) c181: (count v) c182: (count v) c183: (count v) c184: (count v) c185: (count v) c186: (count v) c187: (count v) c188: (count v) c189: (count v) c190: (count v) c191: (count v) c192: (count v) c193: (count v) c194: (count v) c195: (count v) c196: (count v) c197: (count v) c198: (count v) c199: (count v) c200: (count v) c201: (count v) c202: (count v) c203: (count v) c204: (count v) c205: (count v) c206: (count v) c207: (count v) c208: (count v) c209: (count v) c210: (count v) c211: (count v) c212: (count v) c213: (count v) c214: (count v) c215: (count v) c216: (count v) c217: (count v) c218: (count v) c219: (count v) c220: (count v) c221: (count v) c222: (count v) c223: (count v) c224: (count v) c225: (count v) c226: (count v) c227: (count v) c228: (count v) c229: (count v) c230: (count v) c231: (count v) c232: (count v) c233: (count v) c234: (count v) c235: (count v) c236: (count v) c237: (count v) c238: (count v) c239: (count v) c240: (count v) c241: (count v) c242: (count v) c243: (count v) c244: (count v) c245: (count v) c246: (count v) c247: (count v) c248: (count v) c249: (count v) c250: (count v) c251: (count v) c252: (count v) c253: (count v) c254: (count v) c255: (count v) by: {k: k} take: 2}))
+(at (meta rt256) 'len) -- 257
+(at rt256 'c255) -- [2 2]
+
+;; ── F5 eval-group (multi-key + non-agg output): 256 sum outputs + n1: v,
+;; two by-keys.  meta len = 256 aggs + 1 non-agg + 2 keys = 259. ──
+(set re256 (select {from: t a000: (sum v) a001: (sum v) a002: (sum v) a003: (sum v) a004: (sum v) a005: (sum v) a006: (sum v) a007: (sum v) a008: (sum v) a009: (sum v) a010: (sum v) a011: (sum v) a012: (sum v) a013: (sum v) a014: (sum v) a015: (sum v) a016: (sum v) a017: (sum v) a018: (sum v) a019: (sum v) a020: (sum v) a021: (sum v) a022: (sum v) a023: (sum v) a024: (sum v) a025: (sum v) a026: (sum v) a027: (sum v) a028: (sum v) a029: (sum v) a030: (sum v) a031: (sum v) a032: (sum v) a033: (sum v) a034: (sum v) a035: (sum v) a036: (sum v) a037: (sum v) a038: (sum v) a039: (sum v) a040: (sum v) a041: (sum v) a042: (sum v) a043: (sum v) a044: (sum v) a045: (sum v) a046: (sum v) a047: (sum v) a048: (sum v) a049: (sum v) a050: (sum v) a051: (sum v) a052: (sum v) a053: (sum v) a054: (sum v) a055: (sum v) a056: (sum v) a057: (sum v) a058: (sum v) a059: (sum v) a060: (sum v) a061: (sum v) a062: (sum v) a063: (sum v) a064: (sum v) a065: (sum v) a066: (sum v) a067: (sum v) a068: (sum v) a069: (sum v) a070: (sum v) a071: (sum v) a072: (sum v) a073: (sum v) a074: (sum v) a075: (sum v) a076: (sum v) a077: (sum v) a078: (sum v) a079: (sum v) a080: (sum v) a081: (sum v) a082: (sum v) a083: (sum v) a084: (sum v) a085: (sum v) a086: (sum v) a087: (sum v) a088: (sum v) a089: (sum v) a090: (sum v) a091: (sum v) a092: (sum v) a093: (sum v) a094: (sum v) a095: (sum v) a096: (sum v) a097: (sum v) a098: (sum v) a099: (sum v) a100: (sum v) a101: (sum v) a102: (sum v) a103: (sum v) a104: (sum v) a105: (sum v) a106: (sum v) a107: (sum v) a108: (sum v) a109: (sum v) a110: (sum v) a111: (sum v) a112: (sum v) a113: (sum v) a114: (sum v) a115: (sum v) a116: (sum v) a117: (sum v) a118: (sum v) a119: (sum v) a120: (sum v) a121: (sum v) a122: (sum v) a123: (sum v) a124: (sum v) a125: (sum v) a126: (sum v) a127: (sum v) a128: (sum v) a129: (sum v) a130: (sum v) a131: (sum v) a132: (sum v) a133: (sum v) a134: (sum v) a135: (sum v) a136: (sum v) a137: (sum v) a138: (sum v) a139: (sum v) a140: (sum v) a141: (sum v) a142: (sum v) a143: (sum v) a144: (sum v) a145: (sum v) a146: (sum v) a147: (sum v) a148: (sum v) a149: (sum v) a150: (sum v) a151: (sum v) a152: (sum v) a153: (sum v) a154: (sum v) a155: (sum v) a156: (sum v) a157: (sum v) a158: (sum v) a159: (sum v) a160: (sum v) a161: (sum v) a162: (sum v) a163: (sum v) a164: (sum v) a165: (sum v) a166: (sum v) a167: (sum v) a168: (sum v) a169: (sum v) a170: (sum v) a171: (sum v) a172: (sum v) a173: (sum v) a174: (sum v) a175: (sum v) a176: (sum v) a177: (sum v) a178: (sum v) a179: (sum v) a180: (sum v) a181: (sum v) a182: (sum v) a183: (sum v) a184: (sum v) a185: (sum v) a186: (sum v) a187: (sum v) a188: (sum v) a189: (sum v) a190: (sum v) a191: (sum v) a192: (sum v) a193: (sum v) a194: (sum v) a195: (sum v) a196: (sum v) a197: (sum v) a198: (sum v) a199: (sum v) a200: (sum v) a201: (sum v) a202: (sum v) a203: (sum v) a204: (sum v) a205: (sum v) a206: (sum v) a207: (sum v) a208: (sum v) a209: (sum v) a210: (sum v) a211: (sum v) a212: (sum v) a213: (sum v) a214: (sum v) a215: (sum v) a216: (sum v) a217: (sum v) a218: (sum v) a219: (sum v) a220: (sum v) a221: (sum v) a222: (sum v) a223: (sum v) a224: (sum v) a225: (sum v) a226: (sum v) a227: (sum v) a228: (sum v) a229: (sum v) a230: (sum v) a231: (sum v) a232: (sum v) a233: (sum v) a234: (sum v) a235: (sum v) a236: (sum v) a237: (sum v) a238: (sum v) a239: (sum v) a240: (sum v) a241: (sum v) a242: (sum v) a243: (sum v) a244: (sum v) a245: (sum v) a246: (sum v) a247: (sum v) a248: (sum v) a249: (sum v) a250: (sum v) a251: (sum v) a252: (sum v) a253: (sum v) a254: (sum v) a255: (sum v) n1: v by: {k: k g: g}}))
+(at (meta re256) 'len) -- 259
+(at re256 'a255) -- [30 70]
+
+;; ── F6 composition oracle: r300 (300 all-sum outputs) at position 032
+;; equals the cut-1 33-output r33 result's sum column a01 over the same
+;; fixture (RHS is evaluated as Rayfall too — genuine cross-check, both
+;; [30 70]). ──
+(at r300 'a032) -- [30 70]
+(at r300 'a032) -- (at r33 'a01)
+
+;; ── F7 update: 300-key update dict (Task-7 probe, folded permanent).
+;; 300 columns each [1 2]; each assignment adds 1 → [2 3]; sum c299 = 5.
+;; Table built via take/concat (list builder caps at 64 args). ──
+(set uup (table [c000 c001 c002 c003 c004 c005 c006 c007 c008 c009 c010 c011 c012 c013 c014 c015 c016 c017 c018 c019 c020 c021 c022 c023 c024 c025 c026 c027 c028 c029 c030 c031 c032 c033 c034 c035 c036 c037 c038 c039 c040 c041 c042 c043 c044 c045 c046 c047 c048 c049 c050 c051 c052 c053 c054 c055 c056 c057 c058 c059 c060 c061 c062 c063 c064 c065 c066 c067 c068 c069 c070 c071 c072 c073 c074 c075 c076 c077 c078 c079 c080 c081 c082 c083 c084 c085 c086 c087 c088 c089 c090 c091 c092 c093 c094 c095 c096 c097 c098 c099 c100 c101 c102 c103 c104 c105 c106 c107 c108 c109 c110 c111 c112 c113 c114 c115 c116 c117 c118 c119 c120 c121 c122 c123 c124 c125 c126 c127 c128 c129 c130 c131 c132 c133 c134 c135 c136 c137 c138 c139 c140 c141 c142 c143 c144 c145 c146 c147 c148 c149 c150 c151 c152 c153 c154 c155 c156 c157 c158 c159 c160 c161 c162 c163 c164 c165 c166 c167 c168 c169 c170 c171 c172 c173 c174 c175 c176 c177 c178 c179 c180 c181 c182 c183 c184 c185 c186 c187 c188 c189 c190 c191 c192 c193 c194 c195 c196 c197 c198 c199 c200 c201 c202 c203 c204 c205 c206 c207 c208 c209 c210 c211 c212 c213 c214 c215 c216 c217 c218 c219 c220 c221 c222 c223 c224 c225 c226 c227 c228 c229 c230 c231 c232 c233 c234 c235 c236 c237 c238 c239 c240 c241 c242 c243 c244 c245 c246 c247 c248 c249 c250 c251 c252 c253 c254 c255 c256 c257 c258 c259 c260 c261 c262 c263 c264 c265 c266 c267 c268 c269 c270 c271 c272 c273 c274 c275 c276 c277 c278 c279 c280 c281 c282 c283 c284 c285 c286 c287 c288 c289 c290 c291 c292 c293 c294 c295 c296 c297 c298 c299] (take (list [1 2]) 300)))
+(update {from: 'uup c000: (+ c000 1) c001: (+ c001 1) c002: (+ c002 1) c003: (+ c003 1) c004: (+ c004 1) c005: (+ c005 1) c006: (+ c006 1) c007: (+ c007 1) c008: (+ c008 1) c009: (+ c009 1) c010: (+ c010 1) c011: (+ c011 1) c012: (+ c012 1) c013: (+ c013 1) c014: (+ c014 1) c015: (+ c015 1) c016: (+ c016 1) c017: (+ c017 1) c018: (+ c018 1) c019: (+ c019 1) c020: (+ c020 1) c021: (+ c021 1) c022: (+ c022 1) c023: (+ c023 1) c024: (+ c024 1) c025: (+ c025 1) c026: (+ c026 1) c027: (+ c027 1) c028: (+ c028 1) c029: (+ c029 1) c030: (+ c030 1) c031: (+ c031 1) c032: (+ c032 1) c033: (+ c033 1) c034: (+ c034 1) c035: (+ c035 1) c036: (+ c036 1) c037: (+ c037 1) c038: (+ c038 1) c039: (+ c039 1) c040: (+ c040 1) c041: (+ c041 1) c042: (+ c042 1) c043: (+ c043 1) c044: (+ c044 1) c045: (+ c045 1) c046: (+ c046 1) c047: (+ c047 1) c048: (+ c048 1) c049: (+ c049 1) c050: (+ c050 1) c051: (+ c051 1) c052: (+ c052 1) c053: (+ c053 1) c054: (+ c054 1) c055: (+ c055 1) c056: (+ c056 1) c057: (+ c057 1) c058: (+ c058 1) c059: (+ c059 1) c060: (+ c060 1) c061: (+ c061 1) c062: (+ c062 1) c063: (+ c063 1) c064: (+ c064 1) c065: (+ c065 1) c066: (+ c066 1) c067: (+ c067 1) c068: (+ c068 1) c069: (+ c069 1) c070: (+ c070 1) c071: (+ c071 1) c072: (+ c072 1) c073: (+ c073 1) c074: (+ c074 1) c075: (+ c075 1) c076: (+ c076 1) c077: (+ c077 1) c078: (+ c078 1) c079: (+ c079 1) c080: (+ c080 1) c081: (+ c081 1) c082: (+ c082 1) c083: (+ c083 1) c084: (+ c084 1) c085: (+ c085 1) c086: (+ c086 1) c087: (+ c087 1) c088: (+ c088 1) c089: (+ c089 1) c090: (+ c090 1) c091: (+ c091 1) c092: (+ c092 1) c093: (+ c093 1) c094: (+ c094 1) c095: (+ c095 1) c096: (+ c096 1) c097: (+ c097 1) c098: (+ c098 1) c099: (+ c099 1) c100: (+ c100 1) c101: (+ c101 1) c102: (+ c102 1) c103: (+ c103 1) c104: (+ c104 1) c105: (+ c105 1) c106: (+ c106 1) c107: (+ c107 1) c108: (+ c108 1) c109: (+ c109 1) c110: (+ c110 1) c111: (+ c111 1) c112: (+ c112 1) c113: (+ c113 1) c114: (+ c114 1) c115: (+ c115 1) c116: (+ c116 1) c117: (+ c117 1) c118: (+ c118 1) c119: (+ c119 1) c120: (+ c120 1) c121: (+ c121 1) c122: (+ c122 1) c123: (+ c123 1) c124: (+ c124 1) c125: (+ c125 1) c126: (+ c126 1) c127: (+ c127 1) c128: (+ c128 1) c129: (+ c129 1) c130: (+ c130 1) c131: (+ c131 1) c132: (+ c132 1) c133: (+ c133 1) c134: (+ c134 1) c135: (+ c135 1) c136: (+ c136 1) c137: (+ c137 1) c138: (+ c138 1) c139: (+ c139 1) c140: (+ c140 1) c141: (+ c141 1) c142: (+ c142 1) c143: (+ c143 1) c144: (+ c144 1) c145: (+ c145 1) c146: (+ c146 1) c147: (+ c147 1) c148: (+ c148 1) c149: (+ c149 1) c150: (+ c150 1) c151: (+ c151 1) c152: (+ c152 1) c153: (+ c153 1) c154: (+ c154 1) c155: (+ c155 1) c156: (+ c156 1) c157: (+ c157 1) c158: (+ c158 1) c159: (+ c159 1) c160: (+ c160 1) c161: (+ c161 1) c162: (+ c162 1) c163: (+ c163 1) c164: (+ c164 1) c165: (+ c165 1) c166: (+ c166 1) c167: (+ c167 1) c168: (+ c168 1) c169: (+ c169 1) c170: (+ c170 1) c171: (+ c171 1) c172: (+ c172 1) c173: (+ c173 1) c174: (+ c174 1) c175: (+ c175 1) c176: (+ c176 1) c177: (+ c177 1) c178: (+ c178 1) c179: (+ c179 1) c180: (+ c180 1) c181: (+ c181 1) c182: (+ c182 1) c183: (+ c183 1) c184: (+ c184 1) c185: (+ c185 1) c186: (+ c186 1) c187: (+ c187 1) c188: (+ c188 1) c189: (+ c189 1) c190: (+ c190 1) c191: (+ c191 1) c192: (+ c192 1) c193: (+ c193 1) c194: (+ c194 1) c195: (+ c195 1) c196: (+ c196 1) c197: (+ c197 1) c198: (+ c198 1) c199: (+ c199 1) c200: (+ c200 1) c201: (+ c201 1) c202: (+ c202 1) c203: (+ c203 1) c204: (+ c204 1) c205: (+ c205 1) c206: (+ c206 1) c207: (+ c207 1) c208: (+ c208 1) c209: (+ c209 1) c210: (+ c210 1) c211: (+ c211 1) c212: (+ c212 1) c213: (+ c213 1) c214: (+ c214 1) c215: (+ c215 1) c216: (+ c216 1) c217: (+ c217 1) c218: (+ c218 1) c219: (+ c219 1) c220: (+ c220 1) c221: (+ c221 1) c222: (+ c222 1) c223: (+ c223 1) c224: (+ c224 1) c225: (+ c225 1) c226: (+ c226 1) c227: (+ c227 1) c228: (+ c228 1) c229: (+ c229 1) c230: (+ c230 1) c231: (+ c231 1) c232: (+ c232 1) c233: (+ c233 1) c234: (+ c234 1) c235: (+ c235 1) c236: (+ c236 1) c237: (+ c237 1) c238: (+ c238 1) c239: (+ c239 1) c240: (+ c240 1) c241: (+ c241 1) c242: (+ c242 1) c243: (+ c243 1) c244: (+ c244 1) c245: (+ c245 1) c246: (+ c246 1) c247: (+ c247 1) c248: (+ c248 1) c249: (+ c249 1) c250: (+ c250 1) c251: (+ c251 1) c252: (+ c252 1) c253: (+ c253 1) c254: (+ c254 1) c255: (+ c255 1) c256: (+ c256 1) c257: (+ c257 1) c258: (+ c258 1) c259: (+ c259 1) c260: (+ c260 1) c261: (+ c261 1) c262: (+ c262 1) c263: (+ c263 1) c264: (+ c264 1) c265: (+ c265 1) c266: (+ c266 1) c267: (+ c267 1) c268: (+ c268 1) c269: (+ c269 1) c270: (+ c270 1) c271: (+ c271 1) c272: (+ c272 1) c273: (+ c273 1) c274: (+ c274 1) c275: (+ c275 1) c276: (+ c276 1) c277: (+ c277 1) c278: (+ c278 1) c279: (+ c279 1) c280: (+ c280 1) c281: (+ c281 1) c282: (+ c282 1) c283: (+ c283 1) c284: (+ c284 1) c285: (+ c285 1) c286: (+ c286 1) c287: (+ c287 1) c288: (+ c288 1) c289: (+ c289 1) c290: (+ c290 1) c291: (+ c291 1) c292: (+ c292 1) c293: (+ c293 1) c294: (+ c294 1) c295: (+ c295 1) c296: (+ c296 1) c297: (+ c297 1) c298: (+ c298 1) c299: (+ c299 1)})
+(sum (at uup 'c299)) -- 5
+
+;; ── F8 group-key admission lift: a 17-key by-DICT now GROUPS correctly (cut-3
+;; retires query.c's 'by-dict must have 1..16 keys' gate at the RAY_DICT by:
+;; shape, and agg_group_keys' data[16] became a carve).  Bare-column-ref keys
+;; are renames → the no-agg by-dict routes to the keys-only-distinct grouper.
+;; Fixture: 17 int columns k01..k17, each [1 1 2] (rows 0,1 share tuple, row 2
+;; differs) → exactly 2 distinct group tuples; each key column's first-of-group
+;; value is [1 2].  (The 17-key raw sym-VECTOR by: form above takes the same
+;; distinct grouper.) ──
+(set t17d (table [k01 k02 k03 k04 k05 k06 k07 k08 k09 k10 k11 k12 k13 k14 k15 k16 k17] (list [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2])))
+(set r17d (select {from: t17d by: {k01: k01 k02: k02 k03: k03 k04: k04 k05: k05 k06: k06 k07: k07 k08: k08 k09: k09 k10: k10 k11: k11 k12: k12 k13: k13 k14: k14 k15: k15 k16: k16 k17: k17}}))
+(count (at r17d 'k17)) -- 2
+(at r17d 'k01) -- [1 2]
+(at r17d 'k17) -- [1 2]
+
+;; ── F9 table-distinct: 0-agg wide routing (cut-3 Task 5).
+;; `(distinct t)` compiles to `ray_group(keys, n_keys, NULL, NULL, 0)` — a
+;; GROUP node with ZERO aggregates.  agg_v2_can_handle used to decline any
+;; n_aggs == 0 shape outright, so every table-distinct fell through to the
+;; legacy exec_group_run tail, whose `n_keys > 8` guard (group.c) died
+;; `nyi` on any 9+ column table — VERIFIED empirically pre-fix: 8-col
+;; distinct returned correctly, 9-col and 17-col both errored `nyi`. Fixed
+;; by admitting n_aggs == 0 into v2 (agg_engine.c agg_v2_can_handle): every
+;; strategy below sizes its per-agg state from ext->n_aggs with no agg
+;; assumed to exist, so a 0-agg run just emits the grouped key columns —
+;; exactly table-distinct's shape.  tblop.c's own keys[255] stack array +
+;; its `ncols > 255` range error (a second, independent cap) are lifted
+;; alongside it via an exact ncols carve. ──
+
+;; 9-column distinct, 3 rows: rows 0,1 share every key value, row 2 differs
+;; -> 2 distinct tuples.  This exact shape returned `nyi` before this fix.
+(set td9 (table [k01 k02 k03 k04 k05 k06 k07 k08 k09] (list [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2])))
+(set rd9 (distinct td9))
+(at (meta rd9) 'len) -- 9
+(count (at rd9 'k09)) -- 2
+(at rd9 'k01) -- [1 2]
+(at rd9 'k09) -- [1 2]
+
+;; 17-column distinct: same duplicate-row shape, past both the old exec_group
+;; dict-code n_keys<=8 wrapper AND the legacy exec_group_run n_keys<=8 guard.
+(set td17 (table [k01 k02 k03 k04 k05 k06 k07 k08 k09 k10 k11 k12 k13 k14 k15 k16 k17] (list [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2])))
+(set rd17 (distinct td17))
+(at (meta rd17) 'len) -- 17
+(count (at rd17 'k17)) -- 2
+(at rd17 'k01) -- [1 2]
+(at rd17 'k17) -- [1 2]
+
+;; 256-column distinct, uint8-wrap SENTINEL: 255 constant columns (both rows
+;; [1 1]) plus a LAST column that differs ([1 2]).  A residual uint8_t key-
+;; count truncation (256 -> 0) would make this a 0-KEY distinct — a scalar
+;; reduction over the whole table, collapsing both rows into ONE and losing
+;; k255's variation entirely.  Correct behavior: 2 distinct tuples, meta len
+;; stays 256 (every column retained), and k255's value survives as [1 2].
+;; Built via take/concat since the list literal builder caps at 64 args. ──
+(set td256 (table [k000 k001 k002 k003 k004 k005 k006 k007 k008 k009 k010 k011 k012 k013 k014 k015 k016 k017 k018 k019 k020 k021 k022 k023 k024 k025 k026 k027 k028 k029 k030 k031 k032 k033 k034 k035 k036 k037 k038 k039 k040 k041 k042 k043 k044 k045 k046 k047 k048 k049 k050 k051 k052 k053 k054 k055 k056 k057 k058 k059 k060 k061 k062 k063 k064 k065 k066 k067 k068 k069 k070 k071 k072 k073 k074 k075 k076 k077 k078 k079 k080 k081 k082 k083 k084 k085 k086 k087 k088 k089 k090 k091 k092 k093 k094 k095 k096 k097 k098 k099 k100 k101 k102 k103 k104 k105 k106 k107 k108 k109 k110 k111 k112 k113 k114 k115 k116 k117 k118 k119 k120 k121 k122 k123 k124 k125 k126 k127 k128 k129 k130 k131 k132 k133 k134 k135 k136 k137 k138 k139 k140 k141 k142 k143 k144 k145 k146 k147 k148 k149 k150 k151 k152 k153 k154 k155 k156 k157 k158 k159 k160 k161 k162 k163 k164 k165 k166 k167 k168 k169 k170 k171 k172 k173 k174 k175 k176 k177 k178 k179 k180 k181 k182 k183 k184 k185 k186 k187 k188 k189 k190 k191 k192 k193 k194 k195 k196 k197 k198 k199 k200 k201 k202 k203 k204 k205 k206 k207 k208 k209 k210 k211 k212 k213 k214 k215 k216 k217 k218 k219 k220 k221 k222 k223 k224 k225 k226 k227 k228 k229 k230 k231 k232 k233 k234 k235 k236 k237 k238 k239 k240 k241 k242 k243 k244 k245 k246 k247 k248 k249 k250 k251 k252 k253 k254 k255] (concat (take (list [1 1]) 255) (list [1 2]))))
+(set rd256 (distinct td256))
+(at (meta rd256) 'len) -- 256
+(count (at rd256 'k255)) -- 2
+(at rd256 'k000) -- [1 1]
+(at rd256 'k255) -- [1 2]
+
+;; 300-column distinct: same sentinel shape further past the 256 boundary —
+;; a mod-256 wrap (300 -> 44) would stop short of k299 and merge the rows.
+(set td300 (table [k000 k001 k002 k003 k004 k005 k006 k007 k008 k009 k010 k011 k012 k013 k014 k015 k016 k017 k018 k019 k020 k021 k022 k023 k024 k025 k026 k027 k028 k029 k030 k031 k032 k033 k034 k035 k036 k037 k038 k039 k040 k041 k042 k043 k044 k045 k046 k047 k048 k049 k050 k051 k052 k053 k054 k055 k056 k057 k058 k059 k060 k061 k062 k063 k064 k065 k066 k067 k068 k069 k070 k071 k072 k073 k074 k075 k076 k077 k078 k079 k080 k081 k082 k083 k084 k085 k086 k087 k088 k089 k090 k091 k092 k093 k094 k095 k096 k097 k098 k099 k100 k101 k102 k103 k104 k105 k106 k107 k108 k109 k110 k111 k112 k113 k114 k115 k116 k117 k118 k119 k120 k121 k122 k123 k124 k125 k126 k127 k128 k129 k130 k131 k132 k133 k134 k135 k136 k137 k138 k139 k140 k141 k142 k143 k144 k145 k146 k147 k148 k149 k150 k151 k152 k153 k154 k155 k156 k157 k158 k159 k160 k161 k162 k163 k164 k165 k166 k167 k168 k169 k170 k171 k172 k173 k174 k175 k176 k177 k178 k179 k180 k181 k182 k183 k184 k185 k186 k187 k188 k189 k190 k191 k192 k193 k194 k195 k196 k197 k198 k199 k200 k201 k202 k203 k204 k205 k206 k207 k208 k209 k210 k211 k212 k213 k214 k215 k216 k217 k218 k219 k220 k221 k222 k223 k224 k225 k226 k227 k228 k229 k230 k231 k232 k233 k234 k235 k236 k237 k238 k239 k240 k241 k242 k243 k244 k245 k246 k247 k248 k249 k250 k251 k252 k253 k254 k255 k256 k257 k258 k259 k260 k261 k262 k263 k264 k265 k266 k267 k268 k269 k270 k271 k272 k273 k274 k275 k276 k277 k278 k279 k280 k281 k282 k283 k284 k285 k286 k287 k288 k289 k290 k291 k292 k293 k294 k295 k296 k297 k298 k299] (concat (take (list [1 1]) 299) (list [1 2]))))
+(set rd300 (distinct td300))
+(at (meta rd300) 'len) -- 300
+(count (at rd300 'k299)) -- 2
+(at rd300 'k000) -- [1 1]
+(at rd300 'k299) -- [1 2]
+
+;; ══════════════════════════════════════════════════════════════════
+;; cut-4: LEGACY group path serves ANY key/agg count — width guards retired
+;; The exec_group_run width guard (n_keys>8 || (n_keys>0 && n_aggs>8)), the
+;; ht_path keyless n_aggs>8 guard, the exec_group dict-STR wrapper n_keys>8
+;; bail, and the exec_group_v2_exprs >16 caps are all removed.  Every entry-
+;; staging buffer on the legacy path is layout-sized (stack when it fits, one
+;; per-call/per-worker heap block when wider); per-key null tracking uses
+;; ceil(n_keys/64) mask words.  These shapes all `nyi`d before this cut.
+;; ══════════════════════════════════════════════════════════════════
+
+;; ── 9-key group with an F64 key (v2-ineligible: F64 keys decline the v2
+;; engine, forcing the legacy ght path) + sum agg.  k0 is F64 [1.0 1.0 2.0 2.0],
+;; k1..k8 int, all rows share the group discriminator so there are exactly 2
+;; groups: (1.0,...) over rows 0,1 -> sum 10+20=30; (2.0,...) over rows 2,3 ->
+;; sum 30+40=70.  Exercises the 9-key legacy scatter (key_region 80 > the old
+;; 8-key stack; group_ht wide-table spill carve at n_keys>8). ──
+(set wm_f9 (table [k0 k1 k2 k3 k4 k5 k6 k7 k8 v] (list [1.0 1.0 2.0 2.0] [1 1 2 2] [1 1 2 2] [1 1 2 2] [1 1 2 2] [1 1 2 2] [1 1 2 2] [1 1 2 2] [1 1 2 2] [10 20 30 40])))
+(set wm_rf9 (select {from: wm_f9 s: (sum v) by: {k0: k0 k1: k1 k2: k2 k3: k3 k4: k4 k5: k5 k6: k6 k7: k7 k8: k8}}))
+(at wm_rf9 'k0) -- [1.0 2.0]
+(at wm_rf9 's) -- [30 70]
+
+;; ── 2-key group with 9 aggs including FIRST and LAST (both v2-ineligible —
+;; not in the agg_resolve registry — so the whole group drops to legacy, and
+;; n_aggs>8 with n_keys>0 was the second guard clause).  Fixture k=[1 1 2 2]
+;; g=[5 5 6 6] v=[10 20 30 40]: group (1,5) rows 0,1; group (2,6) rows 2,3.
+;; first v = first row's v per group = [10 30]; last v = [20 40];
+;; sum=[30 70] count=[2 2] min=[10 30] max=[20 40] avg=[15.0 35.0]. ──
+(set wm_fl (table [k g v] (list [1 1 2 2] [5 5 6 6] [10 20 30 40])))
+(set wm_rfl (select {from: wm_fl a1: (sum v) a2: (count v) a3: (min v) a4: (max v) a5: (avg v) a6: (sum v) a7: (min v) a8: (first v) a9: (last v) by: {k: k g: g}}))
+(at (meta wm_rfl) 'len) -- 11
+(at wm_rfl 'a8) -- [10 30]
+(at wm_rfl 'a9) -- [20 40]
+(at wm_rfl 'a1) -- [30 70]
+(at wm_rfl 'a5) -- [15.0 35.0]
+
+;; ── keyless group with pearson_corr + 8 other aggs (9 total).  Keyless groups
+;; always decline v2; a PEARSON_CORR agg sets sc_has_binary so the scalar
+;; fast path is skipped and it lands on ht_path, whose n_aggs>8 guard is now
+;; retired.  x=[1..5] y=[2 4 6 8 10]=2x: pearson=1.0 (perfect positive);
+;; sum(x)=15 min(x)=1 max(x)=5 count(x)=5 sum(y)=30 min(y)=2 max(y)=10 avg(y)=6.0 ──
+(set wm_tp (table [x y] (list [1.0 2.0 3.0 4.0 5.0] [2.0 4.0 6.0 8.0 10.0])))
+(set wm_rp (select {from: wm_tp c: (pearson_corr x y) a1: (sum x) a2: (min x) a3: (max x) a4: (count x) a5: (sum y) a6: (min y) a7: (max y) a8: (avg y)}))
+(at (meta wm_rp) 'len) -- 9
+(at wm_rp 'c) -- [1.0]
+(at wm_rp 'a1) -- [15.0]
+(at wm_rp 'a5) -- [30.0]
+(at wm_rp 'a8) -- [6.0]
+
+;; ── 17-key group with an expression-input agg (sum(a*b)).  The expression
+;; input routes to exec_group_v2_exprs, whose n_keys>16 cap is retired (its
+;; [16] scratch is now VLA-sized).  17 identical key columns [1 1 2] -> 2
+;; groups (rows 0,1 key 1; row 2 key 2).  a=[2 3 4] b=[5 6 7] a*b=[10 18 28]:
+;; group1 (rows 0,1) sum=10+18=28; group2 (row 2) sum=28.  So sm=[28 28]. ──
+(set wm_te (table [k00 k01 k02 k03 k04 k05 k06 k07 k08 k09 k10 k11 k12 k13 k14 k15 k16 a b] (list [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [2 3 4] [5 6 7])))
+(set wm_re (select {from: wm_te sm: (sum (* a b)) by: ['k00 'k01 'k02 'k03 'k04 'k05 'k06 'k07 'k08 'k09 'k10 'k11 'k12 'k13 'k14 'k15 'k16]}))
+(at wm_re 'sm) -- [28 28]
+
+;; ── 1-key group with 17 total aggs, mixing an expression-input agg
+;; (sum(a*b)) with a v2-ineligible agg (first(v)) — genuinely legacy-routed,
+;; unlike the naive "sum(a*b) + 16 plain sums" shape this cell used to test.
+;; That all-SUM shape was checked by runtime trace (temporary fprintf at
+;; exec_group_v2_exprs's success return + at the `da_path:`/`ht_path:` labels
+;; in exec_group_run, group.c, debug rebuild, removed after) and turned out
+;; to be served by v2 end to end, NOT legacy: v2 declines directly on the
+;; expr-input agg (agg_v2_can_handle requires OP_SCAN inputs), but
+;; exec_group_v2_exprs materializes a*b into a synthetic `_e0` column and
+;; rebuilds a shadow GROUP node of 17 plain-scan SUMs — every one of which
+;; `agg_resolve` supports — so its own agg_v2_can_handle(op2, sub) admits it
+;; and v2 runs the shadow.  The stale comment claiming "legacy ht_path" here
+;; was false on this branch (the v2-exprs >16-agg cap it cited was already
+;; retired, group.c ~6892).
+;;
+;; Adding first(v) — OP_FIRST is not in agg_resolve at all, so no scan-input
+;; shape admits it — forces BOTH declines: the direct v2 check now fails on
+;; two counts, and the shadow node's own agg_v2_can_handle(op2, sub) fails
+;; too (the FIRST persists into the shadow unchanged), so v2-exprs returns
+;; NULL and exec_group_run falls through to its post-v2 body.  Making v
+;; (first's input) STR — a wide element type — additionally disqualifies the
+;; DA direct-index fast path (group.c ~7910: wide-type FIRST/LAST forces the
+;; HT row-layout, which tracks the winning min/max ROW INDEX instead of
+;; truncating to a byte) so the shape reaches ht_path specifically, not just
+;; "legacy" generically — confirmed by the same trace technique (`ht_path:`
+;; fired; `da_path:` also fired first since da_eligible is only cleared
+;; partway through that block, but da_fits ends up false and control falls
+;; through to ht_path, which returns the result).
+;; FIRST is defined by original ROW INDEX, not iteration/thread order.  v is a
+;; wide (STR) column, so its first(v) is resolved holistically by the post-radix
+;; per-group pass (wide_winner_row), which keeps the smallest winning row index
+;; across per-worker merges — NOT the DA min/max-index block; so
+;; first(v) is deterministic here regardless of scheduling: k=[1 1 2 2] means
+;; group1 = rows 0,1 (first row 0), group2 = rows 2,3 (first row 2).
+;; a=[2 3 4 5] b=[5 6 7 8] w=[10 20 30 40]: a*b=[10 18 28 40] ->
+;; group1(rows0,1) sum=28, group2(rows2,3) sum=68; sum(w) group1=30 group2=70;
+;; v=["p" "q" "r" "s"]: first(v) group1="p" (row0), group2="r" (row2). ──
+(set wm_tg (table [k a b v w] (list [1 1 2 2] [2 3 4 5] [5 6 7 8] ["p" "q" "r" "s"] [10 20 30 40])))
+(set wm_rg (select {from: wm_tg a01: (sum (* a b)) f01: (first v) a02: (sum w) a03: (sum w) a04: (sum w) a05: (sum w) a06: (sum w) a07: (sum w) a08: (sum w) a09: (sum w) a10: (sum w) a11: (sum w) a12: (sum w) a13: (sum w) a14: (sum w) a15: (sum w) a16: (sum w) by: {k: k}}))
+(at (meta wm_rg) 'len) -- 18
+(at wm_rg 'k) -- [1 2]
+(at wm_rg 'a01) -- [28 68]
+(at wm_rg 'f01) -- ["p" "r"]
+(at wm_rg 'a02) -- [30 70]
+(at wm_rg 'a16) -- [30 70]
+
+;; ── 65-key group (F64 key forces legacy; 65 keys -> ceil(65/64)=2 null-mask
+;; words) with nulls in key 0 (word 0) and key 64 (word 1) — proves per-key
+;; null tracking PAST word 0.  k00 F64 [1.0 1.0 0Nf 1.0] (null at row 2);
+;; k01..k63 all 0; k64 int [0 0N 0 0] (null at row 1); v=[10 20 30 40].
+;; Tuples: row0=(1.0, 0*63, 0); row1=(1.0, 0*63, NULL@k64); row2=(NULL@k00,
+;; 0*63, 0); row3==row0.  Distinct groups: {0,3}, {1}, {2} = 3.  If the
+;; word-1 null bit for k64 were dropped, row1 would merge into row0 -> 2
+;; groups; the k00 null (word 0) splits row2.  count==3 pins both null words;
+;; sum over all group sums = 10+40 + 20 + 30 = 100 (every row counted once). ──
+(set wm_t65 (table [k00 k01 k02 k03 k04 k05 k06 k07 k08 k09 k10 k11 k12 k13 k14 k15 k16 k17 k18 k19 k20 k21 k22 k23 k24 k25 k26 k27 k28 k29 k30 k31 k32 k33 k34 k35 k36 k37 k38 k39 k40 k41 k42 k43 k44 k45 k46 k47 k48 k49 k50 k51 k52 k53 k54 k55 k56 k57 k58 k59 k60 k61 k62 k63 k64 v] (concat (list [1.0 1.0 0Nf 1.0]) (concat (take (list [0 0 0 0]) 63) (list [0 0N 0 0] [10 20 30 40])))))
+(set wm_r65 (select {from: wm_t65 s: (sum v) by: ['k00 'k01 'k02 'k03 'k04 'k05 'k06 'k07 'k08 'k09 'k10 'k11 'k12 'k13 'k14 'k15 'k16 'k17 'k18 'k19 'k20 'k21 'k22 'k23 'k24 'k25 'k26 'k27 'k28 'k29 'k30 'k31 'k32 'k33 'k34 'k35 'k36 'k37 'k38 'k39 'k40 'k41 'k42 'k43 'k44 'k45 'k46 'k47 'k48 'k49 'k50 'k51 'k52 'k53 'k54 'k55 'k56 'k57 'k58 'k59 'k60 'k61 'k62 'k63 'k64]}))
+(count (at wm_r65 'k00)) -- 3
+(sum (at wm_r65 's)) -- 100
+
+;; ── 256-key sentinel on the legacy path (F64 key k000 forces legacy;
+;; k001..k254 constant int; k255 the discriminator [1 2]).  256 keys -> 4
+;; null-mask words, and key index 255 exercises the k&63==63 shift bits (now
+;; unsigned-safe).  The two rows differ ONLY in k255, so there are 2 groups;
+;; a mod-256 truncation of the key count (256 -> 0) would collapse both rows
+;; into one and drop k255 -> count 1.  count==2, s=[10 30], k255=[1 2]. ──
+(set wm_t256 (table [k000 k001 k002 k003 k004 k005 k006 k007 k008 k009 k010 k011 k012 k013 k014 k015 k016 k017 k018 k019 k020 k021 k022 k023 k024 k025 k026 k027 k028 k029 k030 k031 k032 k033 k034 k035 k036 k037 k038 k039 k040 k041 k042 k043 k044 k045 k046 k047 k048 k049 k050 k051 k052 k053 k054 k055 k056 k057 k058 k059 k060 k061 k062 k063 k064 k065 k066 k067 k068 k069 k070 k071 k072 k073 k074 k075 k076 k077 k078 k079 k080 k081 k082 k083 k084 k085 k086 k087 k088 k089 k090 k091 k092 k093 k094 k095 k096 k097 k098 k099 k100 k101 k102 k103 k104 k105 k106 k107 k108 k109 k110 k111 k112 k113 k114 k115 k116 k117 k118 k119 k120 k121 k122 k123 k124 k125 k126 k127 k128 k129 k130 k131 k132 k133 k134 k135 k136 k137 k138 k139 k140 k141 k142 k143 k144 k145 k146 k147 k148 k149 k150 k151 k152 k153 k154 k155 k156 k157 k158 k159 k160 k161 k162 k163 k164 k165 k166 k167 k168 k169 k170 k171 k172 k173 k174 k175 k176 k177 k178 k179 k180 k181 k182 k183 k184 k185 k186 k187 k188 k189 k190 k191 k192 k193 k194 k195 k196 k197 k198 k199 k200 k201 k202 k203 k204 k205 k206 k207 k208 k209 k210 k211 k212 k213 k214 k215 k216 k217 k218 k219 k220 k221 k222 k223 k224 k225 k226 k227 k228 k229 k230 k231 k232 k233 k234 k235 k236 k237 k238 k239 k240 k241 k242 k243 k244 k245 k246 k247 k248 k249 k250 k251 k252 k253 k254 k255 v] (concat (list [1.0 1.0]) (concat (take (list [1 1]) 254) (list [1 2] [10 30])))))
+(set wm_r256 (select {from: wm_t256 s: (sum v) by: ['k000 'k001 'k002 'k003 'k004 'k005 'k006 'k007 'k008 'k009 'k010 'k011 'k012 'k013 'k014 'k015 'k016 'k017 'k018 'k019 'k020 'k021 'k022 'k023 'k024 'k025 'k026 'k027 'k028 'k029 'k030 'k031 'k032 'k033 'k034 'k035 'k036 'k037 'k038 'k039 'k040 'k041 'k042 'k043 'k044 'k045 'k046 'k047 'k048 'k049 'k050 'k051 'k052 'k053 'k054 'k055 'k056 'k057 'k058 'k059 'k060 'k061 'k062 'k063 'k064 'k065 'k066 'k067 'k068 'k069 'k070 'k071 'k072 'k073 'k074 'k075 'k076 'k077 'k078 'k079 'k080 'k081 'k082 'k083 'k084 'k085 'k086 'k087 'k088 'k089 'k090 'k091 'k092 'k093 'k094 'k095 'k096 'k097 'k098 'k099 'k100 'k101 'k102 'k103 'k104 'k105 'k106 'k107 'k108 'k109 'k110 'k111 'k112 'k113 'k114 'k115 'k116 'k117 'k118 'k119 'k120 'k121 'k122 'k123 'k124 'k125 'k126 'k127 'k128 'k129 'k130 'k131 'k132 'k133 'k134 'k135 'k136 'k137 'k138 'k139 'k140 'k141 'k142 'k143 'k144 'k145 'k146 'k147 'k148 'k149 'k150 'k151 'k152 'k153 'k154 'k155 'k156 'k157 'k158 'k159 'k160 'k161 'k162 'k163 'k164 'k165 'k166 'k167 'k168 'k169 'k170 'k171 'k172 'k173 'k174 'k175 'k176 'k177 'k178 'k179 'k180 'k181 'k182 'k183 'k184 'k185 'k186 'k187 'k188 'k189 'k190 'k191 'k192 'k193 'k194 'k195 'k196 'k197 'k198 'k199 'k200 'k201 'k202 'k203 'k204 'k205 'k206 'k207 'k208 'k209 'k210 'k211 'k212 'k213 'k214 'k215 'k216 'k217 'k218 'k219 'k220 'k221 'k222 'k223 'k224 'k225 'k226 'k227 'k228 'k229 'k230 'k231 'k232 'k233 'k234 'k235 'k236 'k237 'k238 'k239 'k240 'k241 'k242 'k243 'k244 'k245 'k246 'k247 'k248 'k249 'k250 'k251 'k252 'k253 'k254 'k255]}))
+(count (at wm_r256 'k255)) -- 2
+(at wm_r256 's) -- [10 30]
+(at wm_r256 'k255) -- [1 2]
+
+;; ── 256-key PARALLEL emit (65536 rows forces the radix path): the sequential
+;; cell above never reaches radix_phase3_fn, whose ctx carried the key/agg
+;; counts in uint8 — 256 wrapped to (uint8)256==0, so the phase-3 key SCATTER
+;; loop ran zero iterations and the emitted key columns kept their zero-fill.
+;; COUNT and SUMS come from phase1/2 grouping and stay correct; only the key
+;; VALUES were silently zeroed — a wrong answer with no error.  F64 k000 forces
+;; legacy; k255 = [1 2 1 2 ...] (even rows -> group with k255=1, odd -> k255=2).
+;; v = til 65536: even-row sum = 2*(0+..+32767) = 1073709056; odd-row sum =
+;; 2147450880 - 1073709056 = 1073741824.  Order-independent discriminators
+;; (radix emits in partition order, not value order): sum of the k255 column ==
+;; 1+2 == 3 (pre-fix all-zero -> 0), and sum of the F64 k000 column == 2.0
+;; (pre-fix -> 0.0).  Grouping proof: count == 2, total sum preserved. ──
+(set wm_k000p (take [1.0] 65536))
+(set wm_kintp (take [1] 65536))
+(set wm_kdisp (+ 1 (% (til 65536) 2)))
+(set wm_kvp (til 65536))
+(set wm_tp256 (table [k000 k001 k002 k003 k004 k005 k006 k007 k008 k009 k010 k011 k012 k013 k014 k015 k016 k017 k018 k019 k020 k021 k022 k023 k024 k025 k026 k027 k028 k029 k030 k031 k032 k033 k034 k035 k036 k037 k038 k039 k040 k041 k042 k043 k044 k045 k046 k047 k048 k049 k050 k051 k052 k053 k054 k055 k056 k057 k058 k059 k060 k061 k062 k063 k064 k065 k066 k067 k068 k069 k070 k071 k072 k073 k074 k075 k076 k077 k078 k079 k080 k081 k082 k083 k084 k085 k086 k087 k088 k089 k090 k091 k092 k093 k094 k095 k096 k097 k098 k099 k100 k101 k102 k103 k104 k105 k106 k107 k108 k109 k110 k111 k112 k113 k114 k115 k116 k117 k118 k119 k120 k121 k122 k123 k124 k125 k126 k127 k128 k129 k130 k131 k132 k133 k134 k135 k136 k137 k138 k139 k140 k141 k142 k143 k144 k145 k146 k147 k148 k149 k150 k151 k152 k153 k154 k155 k156 k157 k158 k159 k160 k161 k162 k163 k164 k165 k166 k167 k168 k169 k170 k171 k172 k173 k174 k175 k176 k177 k178 k179 k180 k181 k182 k183 k184 k185 k186 k187 k188 k189 k190 k191 k192 k193 k194 k195 k196 k197 k198 k199 k200 k201 k202 k203 k204 k205 k206 k207 k208 k209 k210 k211 k212 k213 k214 k215 k216 k217 k218 k219 k220 k221 k222 k223 k224 k225 k226 k227 k228 k229 k230 k231 k232 k233 k234 k235 k236 k237 k238 k239 k240 k241 k242 k243 k244 k245 k246 k247 k248 k249 k250 k251 k252 k253 k254 k255 v] (concat (list wm_k000p) (concat (take (list wm_kintp) 254) (list wm_kdisp wm_kvp)))))
+(set wm_rp256 (select {from: wm_tp256 s: (sum v) by: ['k000 'k001 'k002 'k003 'k004 'k005 'k006 'k007 'k008 'k009 'k010 'k011 'k012 'k013 'k014 'k015 'k016 'k017 'k018 'k019 'k020 'k021 'k022 'k023 'k024 'k025 'k026 'k027 'k028 'k029 'k030 'k031 'k032 'k033 'k034 'k035 'k036 'k037 'k038 'k039 'k040 'k041 'k042 'k043 'k044 'k045 'k046 'k047 'k048 'k049 'k050 'k051 'k052 'k053 'k054 'k055 'k056 'k057 'k058 'k059 'k060 'k061 'k062 'k063 'k064 'k065 'k066 'k067 'k068 'k069 'k070 'k071 'k072 'k073 'k074 'k075 'k076 'k077 'k078 'k079 'k080 'k081 'k082 'k083 'k084 'k085 'k086 'k087 'k088 'k089 'k090 'k091 'k092 'k093 'k094 'k095 'k096 'k097 'k098 'k099 'k100 'k101 'k102 'k103 'k104 'k105 'k106 'k107 'k108 'k109 'k110 'k111 'k112 'k113 'k114 'k115 'k116 'k117 'k118 'k119 'k120 'k121 'k122 'k123 'k124 'k125 'k126 'k127 'k128 'k129 'k130 'k131 'k132 'k133 'k134 'k135 'k136 'k137 'k138 'k139 'k140 'k141 'k142 'k143 'k144 'k145 'k146 'k147 'k148 'k149 'k150 'k151 'k152 'k153 'k154 'k155 'k156 'k157 'k158 'k159 'k160 'k161 'k162 'k163 'k164 'k165 'k166 'k167 'k168 'k169 'k170 'k171 'k172 'k173 'k174 'k175 'k176 'k177 'k178 'k179 'k180 'k181 'k182 'k183 'k184 'k185 'k186 'k187 'k188 'k189 'k190 'k191 'k192 'k193 'k194 'k195 'k196 'k197 'k198 'k199 'k200 'k201 'k202 'k203 'k204 'k205 'k206 'k207 'k208 'k209 'k210 'k211 'k212 'k213 'k214 'k215 'k216 'k217 'k218 'k219 'k220 'k221 'k222 'k223 'k224 'k225 'k226 'k227 'k228 'k229 'k230 'k231 'k232 'k233 'k234 'k235 'k236 'k237 'k238 'k239 'k240 'k241 'k242 'k243 'k244 'k245 'k246 'k247 'k248 'k249 'k250 'k251 'k252 'k253 'k254 'k255]}))
+(count (at wm_rp256 'k255)) -- 2
+(sum (at wm_rp256 's)) -- 2147450880
+(sum (at wm_rp256 'k255)) -- 3
+(sum (at wm_rp256 'k000)) -- 2.0
+
+;; ── 9-key group with a group emit-filter (desc/take) — v2 and v2-exprs are
+;; both skipped when a group emit-filter is armed, so this stays on the legacy
+;; ght path, which the width-guard lift now serves at 9 keys.  F64 k0 gives 3
+;; groups (k0=1.0 sum 30, k0=2.0 sum 70, k0=3.0 sum 50); desc: s take: 2 keeps
+;; the two largest sums -> [70 50]. ──
+(set wm_tf (table [k0 k1 k2 k3 k4 k5 k6 k7 k8 v] (list [1.0 1.0 2.0 2.0 3.0] [1 1 2 2 3] [1 1 2 2 3] [1 1 2 2 3] [1 1 2 2 3] [1 1 2 2 3] [1 1 2 2 3] [1 1 2 2 3] [1 1 2 2 3] [10 20 30 40 50])))
+(set wm_ref (select {from: wm_tf s: (sum v) by: {k0: k0 k1: k1 k2: k2 k3: k3 k4: k4 k5: k5 k6: k6 k7: k7 k8: k8} desc: s take: 2}))
+(count (at wm_ref 's)) -- 2
+(at wm_ref 's) -- [70 50]
+
+;; ── 9-key DICT-STR group (the exec_group wrapper shape; n_keys>8 bail
+;; retired).  Splayed STR columns >= 65536 rows carry a RAY_IDX_DICT, so the
+;; wrapper substitutes each key's int32 code vector and the rewritten integer
+;; group is served by v2 at 9 keys.  s = repeated ["a" "b"] over 70000 rows:
+;; even rows "a", odd rows "b"; v = til 70000.  Group "a" = even indices
+;; 0,2,..,69998: sum = 2*(0+1+..+34999) = 34999*35000 = 1224965000.
+;; Group "b" = odd indices: sum(til 70000) - 1224965000 = 2449965000 -
+;; 1224965000 = 1225000000.  Dict codes "a"->0 "b"->1 so groups emit [a b]. ──
+(set wm_ds (take ["a" "b"] 70000))
+(set wm_dt (table [k0 k1 k2 k3 k4 k5 k6 k7 k8 v] (list wm_ds wm_ds wm_ds wm_ds wm_ds wm_ds wm_ds wm_ds wm_ds (til 70000))))
+(.db.splayed.set "/tmp/rfl_wm_dict9/t/" wm_dt)
+(set wm_dg (.db.splayed.get "/tmp/rfl_wm_dict9/t/"))
+(set wm_rd (select {from: wm_dg sm: (sum v) by: {k0: k0 k1: k1 k2: k2 k3: k3 k4: k4 k5: k5 k6: k6 k7: k7 k8: k8}}))
+(at wm_rd 'k0) -- ["a" "b"]
+(at wm_rd 'sm) -- [1224965000 1225000000]
+
+;; ── 9-key PLAIN-STR (non-dict) group: the width-guard lift means this shape
+;; no longer `nyi`s and the legacy ght inline-STR scatter groups it correctly
+;; (identical key tuples hash-collide and merge in group_ht).  Value-asserted:
+;; the pre-existing query-layer multi-STR misroute (>=2 STR/wide key cols AND
+;; >=3 total keys -> one group per row) that once masked this shape no longer
+;; reproduces at HEAD — the branch fixed it as a side effect (base-vs-HEAD
+;; verified in review; base@3b6ff13e gave 4 groups, HEAD merges to 2).
+;; k0..k8 STR ["a" "a" "b" "b"], v=[10 20 30 40] -> 2 groups: {rows0,1}="a"
+;; sum 30, {rows2,3}="b" sum 70. ──
+(set wm_ps (table [k0 k1 k2 k3 k4 k5 k6 k7 k8 v] (list ["a" "a" "b" "b"] ["a" "a" "b" "b"] ["a" "a" "b" "b"] ["a" "a" "b" "b"] ["a" "a" "b" "b"] ["a" "a" "b" "b"] ["a" "a" "b" "b"] ["a" "a" "b" "b"] ["a" "a" "b" "b"] [10 20 30 40])))
+(set wm_rps (select {from: wm_ps s: (sum v) by: {k0: k0 k1: k1 k2: k2 k3: k3 k4: k4 k5: k5 k6: k6 k7: k7 k8: k8}}))
+(at (meta wm_rps) 'len) -- 10
+(at wm_rps 'k0) -- ["a" "b"]
+(at wm_rps 's) -- [30 70]
+
+;; ── 3-key 2-STR + 1-int merge pin: the exact shape the pre-existing query-layer
+;; misroute mangled on base (2 STR keys + >=3 total keys -> one group per row).
+;; Fixed on-branch as a side effect (see above); the identical (k0,k1,k2) tuples
+;; now merge.  k0=k1 STR ["a" "a" "b" "b"], k2 int [1 1 2 2], v=[10 20 30 40] ->
+;; 2 groups {rows0,1} sum 30, {rows2,3} sum 70. ──
+(set wm_p2s (table [k0 k1 k2 v] (list ["a" "a" "b" "b"] ["a" "a" "b" "b"] [1 1 2 2] [10 20 30 40])))
+(set wm_rp2s (select {from: wm_p2s s: (sum v) by: {k0: k0 k1: k1 k2: k2}}))
+(at (meta wm_rp2s) 'len) -- 4
+(at wm_rp2s 'k0) -- ["a" "b"]
+(at wm_rp2s 's) -- [30 70]
+
+;; ── 1 plain-STR key + N int keys, 70000 rows forcing the PARALLEL radix_v2
+;; path (>= RAY_PARALLEL_THRESHOLD = 64*1024 = 65536).  Review Critical:
+;; radix_v2_phase2_ctx_t's key_pool was left a fixed `const void* key_pool[8]`
+;; while every sibling ctx was widened to a carved `const void**`;
+;; derive_key_pool writes out[k] for ALL k < n_keys, so any_wide_key (the STR
+;; key) + >8 total keys overflows the [8] at exec_group_run's v2p2 setup
+;; (~9338).  Two cells pin the two failure modes (both ASan-verified pre-fix):
+;;   * 9 keys (1 STR + 8 int): out[8] lands on the adjacent _Atomic oom field
+;;     — an INTRA-struct overflow ASan cannot see; silent corruption boundary.
+;;   * 10 keys (1 STR + 9 int): out[9] crosses the struct end into the stack
+;;     redzone — ASan stack-buffer-overflow WRITE in derive_key_pool via
+;;     exec_group_run (verified crashing pre-fix, passing post-fix).
+;; Only 1 wide/STR key is used (k0) — a second wide key would hit the
+;; separate, pre-existing, cut-4-orthogonal eval-misroute bug noted above and
+;; is deliberately avoided here.  k0 STR cycles ["a" "b"] non-splayed (stays
+;; PLAIN, not RAY_IDX_DICT — dict conversion is a splayed-storage attribute);
+;; the int keys are all constant 0 so grouping is solely by k0 -> exactly 2
+;; groups.  v = til 70000.  Group "a" = even indices 0,2,..,69998: sum =
+;; 2*(0+1+..+34999) = 34999*35000 = 1224965000.  Group "b" = odd indices:
+;; sum(til 70000) - 1224965000 = 69999*70000/2 - 1224965000 =
+;; 2449965000 - 1224965000 = 1225000000. ──
+(set wm_wk (take ["a" "b"] 70000))
+(set wm_wz (take [0] 70000))
+(set wm_wt (table [k0 k1 k2 k3 k4 k5 k6 k7 k8 v] (list wm_wk wm_wz wm_wz wm_wz wm_wz wm_wz wm_wz wm_wz wm_wz (til 70000))))
+(set wm_wr (select {from: wm_wt sm: (sum v) by: {k0: k0 k1: k1 k2: k2 k3: k3 k4: k4 k5: k5 k6: k6 k7: k7 k8: k8}}))
+(at wm_wr 'k0) -- ["a" "b"]
+(at wm_wr 'sm) -- [1224965000 1225000000]
+
+;; 10-key variant: the ASan-visible redzone crossing (crashed pre-fix).
+(set wm_xt (table [k0 k1 k2 k3 k4 k5 k6 k7 k8 k9 v] (list wm_wk wm_wz wm_wz wm_wz wm_wz wm_wz wm_wz wm_wz wm_wz wm_wz (til 70000))))
+(set wm_xr (select {from: wm_xt sm: (sum v) by: {k0: k0 k1: k1 k2: k2 k3: k3 k4: k4 k5: k5 k6: k6 k7: k7 k8: k8 k9: k9}}))
+(at wm_xr 'k0) -- ["a" "b"]
+(at wm_xr 'sm) -- [1224965000 1225000000]
+
+;; ══════════════════════════════════════════════════════════════════
+;; Task 5 (unbounded-slots cut 4): DA/sp-path per-agg bitmasks widened
+;; uint32_t -> uint64_t (da_ctx_t agg_f64_mask/agg_int_null_mask; the
+;; independent agg_f64_mask in the single-key sparse (sp) macro path).
+;; Post-Task-4 the legacy group path serves any n_aggs at all, so the
+;; DA path (n_keys<=8, admitted at group.c da_eligible) could for the
+;; first time see n_aggs > 32 — a uint32_t bitmask's bit `a` for a>=32
+;; is a variable shift-by->=32, which x86 hardware evaluates modulo 32
+;; (SHL/SHR only ever use the low 5 bits of the count register), so bit
+;; 32 silently aliases bit 0, bit 33 aliases bit 1, etc.  This section
+;; gates admission at n_aggs<=64 (the width of the new uint64_t masks)
+;; and pins three shapes: the exact historical alias point (33 aggs,
+;; bit 32 vs bit 0), the new upper boundary (64 aggs, bit 63), and one
+;; past it (65 aggs, forced to the hash/ht_path — ght_layout_t's
+;; per-agg metadata is per-element flag BYTES, not a bitmask, so it has
+;; no width cap to alias against).
+;;
+;; Shared fixture, single I64 key, two groups (k=1 rows 0-1, k=2 rows
+;; 2-3):
+;;   wm5_va (I32, no nulls): row0 is 2147483647i + 1i, which WRAPS to
+;;     -2147483648 (INT32_MIN) — a real, non-null data value per the
+;;     documented I16/I32 wraparound exception (src/vec/validate.c
+;;     invariant 16.4: narrow-int sentinels are NOT reserved because
+;;     modulo arithmetic legitimately produces them; see also
+;;     test/rfl/expr/narrow_binary.rfl's `(+ [2147483647i] [1i]) --
+;;     [-2147483648]`).  It is chosen because it exactly equals
+;;     NULL_I32 — the value da_ctx_t's int-null sentinel check compares
+;;     against — so if agg 0's mask bit is ever wrongly turned on by an
+;;     unrelated agg's alias, this row is wrongly dropped from the sum.
+;;     Row1 = 100 (untainted control value); rows2-3 = 10, 20 for the
+;;     second group (no wraparound there, plain control values).
+;;   wm5_vf (I32, no nulls): filler agg input, DISTINCT per group
+;;     (7,7 / 3,3) so any cross-group corruption is visible too.
+;;   wm5_vn (I32, WITH a genuine null): 0Ni at the first row of each
+;;     group, a real value at the second — placed at the boundary agg
+;;     position in the 33-agg and 64-agg tests below (both admitted to
+;;     the DA path, which correctly int-null-skips), so its own mask
+;;     bit is legitimately set from real HAS_NULLS.  NOT used at the
+;;     65-agg boundary — see wm5_vd below and the comment at that test.
+;;   wm5_vd (F64, no nulls): used only by the 65-agg test's boundary
+;;     position, in place of wm5_vn — see that test's comment for why.
+;;
+;; Group k=1 (rows 0,1): a01 (wm5_va) correct sum = -2147483648 + 100 =
+;;   -2147483548; buggy (bit-32-aliased-to-0) sum = 100 (row0 wrongly
+;;   treated as null and dropped).  Filler sum = 7+7 = 14.  wm5_vn
+;;   correct sum = 5 (row0 null skipped).  wm5_vd sum = 1.5+2.5 = 4.0.
+;; Group k=2 (rows 2,3): a01 sum = 10+20 = 30 (no wraparound row, so
+;;   this group is unaffected by the alias either way — a control).
+;;   Filler sum = 3+3 = 6.  wm5_vn sum = 8.  wm5_vd sum = 10.5+20.5=31.0.
+;; ══════════════════════════════════════════════════════════════════
+
+(set wm5_va (+ [2147483647i 99i 10i 20i] [1i 1i 0i 0i]))
+;; The vector itself carries no HAS_NULLS (the wraparound row is a real
+;; value, not a null) even though extracting it as a bare scalar via
+;; `at` renders as `0Ni` — nil?/format on an ATOM re-derives nullness
+;; from the sentinel bit pattern alone (an atom has no attrs byte to
+;; carry HAS_NULLS), so that quirk is scalar-context-only and does NOT
+;; reflect how the vector's own consumers (sum, the DA accumulator)
+;; treat it: they gate on the VECTOR's HAS_NULLS attribute first, which
+;; is correctly unset here.
+(nil? wm5_va) -- false
+(sum wm5_va) -- -2147483518
+(at wm5_va 1) -- 100
+(set wm5_vf [7i 7i 3i 3i])
+(set wm5_vn [0Ni 5i 0Ni 8i])
+(set wm5_t (table [k va vf vn] (list [1 1 2 2] wm5_va wm5_vf wm5_vn)))
+
+;; ── 33 aggs: pins the exact historical alias point.  a33 (agg index
+;; 32) is the nulls column — bit 32 of a uint32_t mask aliases bit 0
+;; (a01's).  Pre-Task-5 this would corrupt a01's group-1 sum to 100;
+;; post-Task-5 (uint64_t masks) bits 0 and 32 are independent. ──
+(set wm5_r33 (select {from: wm5_t a01: (sum wm5_va) a02: (sum wm5_vf) a03: (sum wm5_vf) a04: (sum wm5_vf) a05: (sum wm5_vf) a06: (sum wm5_vf) a07: (sum wm5_vf) a08: (sum wm5_vf) a09: (sum wm5_vf) a10: (sum wm5_vf) a11: (sum wm5_vf) a12: (sum wm5_vf) a13: (sum wm5_vf) a14: (sum wm5_vf) a15: (sum wm5_vf) a16: (sum wm5_vf) a17: (sum wm5_vf) a18: (sum wm5_vf) a19: (sum wm5_vf) a20: (sum wm5_vf) a21: (sum wm5_vf) a22: (sum wm5_vf) a23: (sum wm5_vf) a24: (sum wm5_vf) a25: (sum wm5_vf) a26: (sum wm5_vf) a27: (sum wm5_vf) a28: (sum wm5_vf) a29: (sum wm5_vf) a30: (sum wm5_vf) a31: (sum wm5_vf) a32: (sum wm5_vf) a33: (sum wm5_vn) by: {gk: k}}))
+(at (meta wm5_r33) 'len) -- 34
+(at wm5_r33 'gk) -- [1 2]
+(at wm5_r33 'a01) -- [-2147483548 30]
+(at wm5_r33 'a02) -- [14 6]
+(at wm5_r33 'a32) -- [14 6]
+(at wm5_r33 'a33) -- [5 8]
+
+;; ── 64 aggs: upper boundary of the new uint64_t mask width.  a64 (agg
+;; index 63, the top bit) is the nulls column — this pins that the full
+;; widened range 33..64 is admitted to the DA path and computed
+;; correctly, not just the head of the range. ──
+(set wm5_r64 (select {from: wm5_t a01: (sum wm5_va) a02: (sum wm5_vf) a03: (sum wm5_vf) a04: (sum wm5_vf) a05: (sum wm5_vf) a06: (sum wm5_vf) a07: (sum wm5_vf) a08: (sum wm5_vf) a09: (sum wm5_vf) a10: (sum wm5_vf) a11: (sum wm5_vf) a12: (sum wm5_vf) a13: (sum wm5_vf) a14: (sum wm5_vf) a15: (sum wm5_vf) a16: (sum wm5_vf) a17: (sum wm5_vf) a18: (sum wm5_vf) a19: (sum wm5_vf) a20: (sum wm5_vf) a21: (sum wm5_vf) a22: (sum wm5_vf) a23: (sum wm5_vf) a24: (sum wm5_vf) a25: (sum wm5_vf) a26: (sum wm5_vf) a27: (sum wm5_vf) a28: (sum wm5_vf) a29: (sum wm5_vf) a30: (sum wm5_vf) a31: (sum wm5_vf) a32: (sum wm5_vf) a33: (sum wm5_vf) a34: (sum wm5_vf) a35: (sum wm5_vf) a36: (sum wm5_vf) a37: (sum wm5_vf) a38: (sum wm5_vf) a39: (sum wm5_vf) a40: (sum wm5_vf) a41: (sum wm5_vf) a42: (sum wm5_vf) a43: (sum wm5_vf) a44: (sum wm5_vf) a45: (sum wm5_vf) a46: (sum wm5_vf) a47: (sum wm5_vf) a48: (sum wm5_vf) a49: (sum wm5_vf) a50: (sum wm5_vf) a51: (sum wm5_vf) a52: (sum wm5_vf) a53: (sum wm5_vf) a54: (sum wm5_vf) a55: (sum wm5_vf) a56: (sum wm5_vf) a57: (sum wm5_vf) a58: (sum wm5_vf) a59: (sum wm5_vf) a60: (sum wm5_vf) a61: (sum wm5_vf) a62: (sum wm5_vf) a63: (sum wm5_vf) a64: (sum wm5_vn) by: {gk: k}}))
+(at (meta wm5_r64) 'len) -- 65
+(at wm5_r64 'gk) -- [1 2]
+(at wm5_r64 'a01) -- [-2147483548 30]
+(at wm5_r64 'a02) -- [14 6]
+(at wm5_r64 'a63) -- [14 6]
+(at wm5_r64 'a64) -- [5 8]
+
+;; ── 65 aggs: one past the mask width.  n_aggs=65 fails both
+;; da_eligible's and sp_eligible's `n_aggs <= 64` gate (group.c, added
+;; this task), so this shape is forced onto the legacy ht_path — a
+;; completely different mechanism (ght_layout_t's agg_flags[a] is a
+;; per-element uint8_t array, not a bitmask, per src/ops/internal.h) —
+;; not exercised by this task's fix at all.
+;;
+;; a65 (agg index 64) is wm5_vd, an F64 column with NO nulls — chosen
+;; instead of reusing wm5_vn's int-null trick because the legacy
+;; ht_path's accum_from_entry has no int-null-sentinel skip at all for
+;; narrow-int SUM (a separate, pre-existing gap, confirmed independently
+;; via a 9-key/1-agg repro that is orthogonal to this task's masks — see
+;; task report); an F64 agg with no nulls sidesteps that gap entirely
+;; while still exercising the alias position. Bit 64 does not exist in
+;; a uint64_t (the shift itself is UB), so agg index 64 is exactly what
+;; a future regression that loosened the 64 cap without further
+;; widening da_ctx_t's agg_f64_mask would corrupt the SAME way a33 was
+;; corrupted above: index 64 mod 64 = index 0 (a01's slot), so a01 (an
+;; I32, non-F64 agg) would be wrongly reinterpreted as F64 raw bits —
+;; a drastically wrong number, not a subtle one. Correct results here
+;; both confirm the hash-path fallback is right AND stand as a
+;; regression guard on the gate itself. ──
+(set wm5_vd [1.5 2.5 10.5 20.5])
+(set wm5_r65 (select {from: wm5_t a01: (sum wm5_va) a02: (sum wm5_vf) a03: (sum wm5_vf) a04: (sum wm5_vf) a05: (sum wm5_vf) a06: (sum wm5_vf) a07: (sum wm5_vf) a08: (sum wm5_vf) a09: (sum wm5_vf) a10: (sum wm5_vf) a11: (sum wm5_vf) a12: (sum wm5_vf) a13: (sum wm5_vf) a14: (sum wm5_vf) a15: (sum wm5_vf) a16: (sum wm5_vf) a17: (sum wm5_vf) a18: (sum wm5_vf) a19: (sum wm5_vf) a20: (sum wm5_vf) a21: (sum wm5_vf) a22: (sum wm5_vf) a23: (sum wm5_vf) a24: (sum wm5_vf) a25: (sum wm5_vf) a26: (sum wm5_vf) a27: (sum wm5_vf) a28: (sum wm5_vf) a29: (sum wm5_vf) a30: (sum wm5_vf) a31: (sum wm5_vf) a32: (sum wm5_vf) a33: (sum wm5_vf) a34: (sum wm5_vf) a35: (sum wm5_vf) a36: (sum wm5_vf) a37: (sum wm5_vf) a38: (sum wm5_vf) a39: (sum wm5_vf) a40: (sum wm5_vf) a41: (sum wm5_vf) a42: (sum wm5_vf) a43: (sum wm5_vf) a44: (sum wm5_vf) a45: (sum wm5_vf) a46: (sum wm5_vf) a47: (sum wm5_vf) a48: (sum wm5_vf) a49: (sum wm5_vf) a50: (sum wm5_vf) a51: (sum wm5_vf) a52: (sum wm5_vf) a53: (sum wm5_vf) a54: (sum wm5_vf) a55: (sum wm5_vf) a56: (sum wm5_vf) a57: (sum wm5_vf) a58: (sum wm5_vf) a59: (sum wm5_vf) a60: (sum wm5_vf) a61: (sum wm5_vf) a62: (sum wm5_vf) a63: (sum wm5_vf) a64: (sum wm5_vf) a65: (sum wm5_vd) by: {gk: k}}))
+(at (meta wm5_r65) 'len) -- 66
+(at wm5_r65 'gk) -- [1 2]
+(at wm5_r65 'a01) -- [-2147483548 30]
+(at wm5_r65 'a02) -- [14 6]
+(at wm5_r65 'a64) -- [14 6]
+(at wm5_r65 'a65) -- [4.0 31.0]
+
+;; ── keyless, EMPTY table (0 rows), 9 total aggs — n_keys==0 so the DA
+;; path's `n_keys > 0` gate excludes it outright and the scalar fast path's
+;; own `nrows > 0` guard (group.c ~7503, the same guard the `wm_tp`
+;; PEARSON_CORR cell above skips via `sc_has_binary` instead) also excludes
+;; it here since nrows==0 — both routes decline for the SAME reason nrows
+;; gives them nothing to scan, landing on ht_path unconditionally, same as
+;; every other keyless shape in this file. Verified today's deterministic
+;; behavior is a 9-column, 0-ROW result (not a 1-row all-null/zero scalar
+;; row) — identical in shape to the always-legal 2-agg keyless-empty case,
+;; just wider; a mix of SUM/COUNT/MIN/MAX/AVG confirms the shape holds
+;; across agg kinds, not just one. ──
+(set wm_e0 (table [x] (list (take [1] 0))))
+(count (at wm_e0 'x)) -- 0
+(set wm_e0_r9 (select {from: wm_e0 a01: (sum x) a02: (count x) a03: (min x) a04: (max x) a05: (avg x) a06: (sum x) a07: (min x) a08: (max x) a09: (count x)}))
+(at (meta wm_e0_r9) 'len) -- 9
+(count (at wm_e0_r9 'a01)) -- 0
+(count (at wm_e0_r9 'a09)) -- 0
+

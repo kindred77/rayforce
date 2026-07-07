@@ -47,7 +47,7 @@ typedef union ray_t {
 |---|---|---|
 | 0-15 | `nullmap[16]` | Inline null bitmap for vectors with up to 128 elements. For longer vectors, `ext_nullmap` points to a separate bitmap vector. For `RAY_SYM` columns, `sym_dict` points to the dictionary. For `RAY_STR` columns, `str_pool` points to the string pool. For slices, stores parent pointer and offset. |
 | 16 | `mmod` | Memory mode: 0 = heap-allocated, 1 = file memory-mapped |
-| 17 | `order` | Buddy allocator block order. Block size = 2^order bytes. Range: 6..30 (64 bytes to 1 GB). |
+| 17 | `order` | Buddy allocator block order. Block size = 2^order bytes. Range: 6..38 (64 bytes to 256 GB). |
 | 18 | `type` | Signed byte: negative = atom, 0 = LIST, 1-13 = vector types (BOOL through STR), 98 = TABLE, 99 = DICT, 100-103 = function types, 127 = ERROR |
 | 19 | `attrs` | Attribute flags: `RAY_ATTR_ARENA` (arena-allocated, retain/release are no-ops), slice flag, sorted flag |
 | 20-23 | `rc` | Reference count. 0 = free block. Incremented by `ray_retain`, decremented by `ray_release`. |
@@ -59,7 +59,7 @@ typedef union ray_t {
 
 ## Buddy Allocator
 
-The primary allocator uses a classic buddy system with order-based free lists. Block sizes are powers of two, ranging from order 6 (64 bytes, enough for a `ray_t` header + 32 bytes of data) to order 30 (1 GB).
+The primary allocator uses a classic buddy system with order-based free lists. Block sizes are powers of two, ranging from order 6 (64 bytes, enough for a `ray_t` header + 32 bytes of data) to order 38 (256 GB).
 
 ### Allocation
 
@@ -78,8 +78,8 @@ The primary allocator uses a classic buddy system with order-based free lists. B
 Constants governing the allocator:
 
 ```c
-#define RAY_ORDER_MIN  6   /* minimum block: 64 bytes  */
-#define RAY_ORDER_MAX  30  /* maximum block: 1 GB      */
+#define RAY_ORDER_MIN       6   /* minimum block: 64 bytes  */
+#define RAY_HEAP_MAX_ORDER  38  /* maximum pool: 256 GB     */
 ```
 
 ### File-Backed Pool Fallback
@@ -88,7 +88,7 @@ Pools are normally backed by anonymous `mmap` — fast, lazy-committed by the ke
 
 The fallback is transparent to every `ray_alloc` caller. Pages never written stay as holes in the sparse backing file, so the over-allocate-and-trim alignment trick costs zero real disk space; only the pages you actually touch consume disk pages. On heap teardown the fd is closed and the tempfile is unlinked, so the swap directory doesn't accumulate orphans.
 
-- **Configurable swap directory.** Set `RAY_HEAP_SWAP` to override the default (`./`). Trailing slash is added automatically. The directory must exist and be writable by the running process.
+- **Configurable swap directory.** The directory is resolved as `RAY_HEAP_SWAP` → `TMPDIR` → `/tmp`. `/tmp` is the default rather than the working directory, which may be read-only or shared. Trailing slash is added automatically. The chosen directory must exist and be writable by the running process.
 - **Tempfile naming.** Format is `rayheap_<pid>_<heap_id>_<counter>.dat`. Files are opened `O_EXCL` so no clashes between concurrent processes; the counter is per-process atomic so no clashes within a process.
 - **POSIX only today.** The fallback path uses `open` / `ftruncate` / `mmap MAP_SHARED` / `munmap` / `unlink`. Windows pools currently take only the anonymous `VirtualAlloc` path.
 - **Distinct from block offloading.** Block offloading (see [Block Offloading](offloading.md)) streams pre-existing parted-table data through queries one segment at a time. The file-backed pool fallback handles fresh anonymous allocations that exceed RAM. Both let workloads exceed RAM, but at different layers and for different shapes of work.
@@ -98,11 +98,11 @@ The fallback is transparent to every `ray_alloc` caller. Pages never written sta
 For the most common allocation sizes, a slab cache provides O(1) allocation and deallocation by maintaining per-order stacks of pre-split blocks.
 
 ```c
-#define RAY_SLAB_CACHE_SIZE  64   /* max blocks cached per order */
-#define RAY_SLAB_ORDERS      5    /* orders 6..10 (64B to 1KB)  */
+#define RAY_SLAB_CACHE_SIZE  64   /* max blocks cached per order   */
+#define RAY_SLAB_ORDERS      11   /* orders 6..16 (64B to 64KB)    */
 ```
 
-The slab cache covers orders 6 through 10 (64 bytes to 1 KB), which account for the vast majority of allocations: scalar atoms, short vectors, list nodes, and string pool chunks. When a slab is empty, it refills from the buddy allocator. When full, freed blocks fall through to buddy deallocation.
+The slab cache covers orders 6 through 16 (64 bytes to 64 KB), which account for the vast majority of allocations: scalar atoms, short vectors, list nodes, string pool chunks, and morsel-sized buffers. When a slab is empty, it refills from the buddy allocator. When full, freed blocks fall through to buddy deallocation.
 
 ## Thread-Local Heaps
 
@@ -164,9 +164,12 @@ Rayforce uses **copy-on-write (COW)** semantics to allow safe sharing of data be
 
 | Function | Behavior |
 |---|---|
-| `ray_retain(v)` | Increment reference count. If `RAY_ATTR_ARENA` is set, this is a no-op. |
-| `ray_release(v)` | Decrement reference count. If it reaches zero, free the block (and recursively release children for lists/tables). No-op for arena blocks. |
-| `ray_cow(v)` | If `rc > 1`, allocate a new block and copy the data, returning the new block (caller owns it). If `rc == 1`, return the same block (caller already has exclusive ownership). |
+| `ray_retain(v)` | Increment reference count. No-op if `RAY_ATTR_ARENA` is set, or if `v` is a `RAY_ERROR` object. |
+| `ray_release(v)` | Decrement reference count. If it reaches zero, free the block (and recursively release children for lists/tables). No-op for arena blocks, and for `RAY_ERROR` objects (see caveat below). |
+| `ray_cow(v)` | If `rc > 1`, allocate a new block and copy the data, returning the new block (caller owns it). If `rc == 1`, return the same block (caller already has exclusive ownership). Returns `v` unchanged if it is a `RAY_ERROR` object. |
+
+!!! warning "`ray_release` is a no-op on error objects"
+    `ray_retain`, `ray_release`, and `ray_cow` all early-return when handed a `RAY_ERROR` object (`RAY_IS_ERR(v)` is true). This means `ray_release` will **not** reclaim an error — a caller that holds the sole reference and wants the block freed must call `ray_error_free(err)` instead. Releasing an error is silently ignored, so the block leaks until heap teardown.
 
 ### COW Cleanup Pattern
 
@@ -200,14 +203,17 @@ fail:
 |---|---|---|
 | `ray_alloc(size)` | General allocation (buddy + slab) | Thread-local (no locks) |
 | `ray_free(v)` | General deallocation (may defer cross-heap) | Lock-free CAS for cross-heap |
-| `ray_retain(v)` | Increment ref count | Atomic increment |
-| `ray_release(v)` | Decrement ref count, free at zero | Atomic decrement + free |
-| `ray_cow(v)` | Copy-on-write (copy if shared) | Safe (reads rc atomically) |
+| `ray_retain(v)` | Increment ref count | Plain inc; atomic only when the thread-local `ray_rc_sync` flag is set |
+| `ray_release(v)` | Decrement ref count, free at zero | Plain dec + free; atomic only when `ray_rc_sync` is set |
+| `ray_cow(v)` | Copy-on-write (copy if shared) | Plain rc read; atomic load only when `ray_rc_sync` is set |
 | `ray_arena_alloc(a, size)` | Bump allocation from arena | Not thread-safe (per-arena) |
 | `ray_arena_reset(a)` | Reset arena (reuse memory) | Not thread-safe |
 | `ray_arena_destroy(a)` | Free all arena memory | Not thread-safe |
 | `ray_sys_alloc(size)` | System allocator (mmap/VirtualAlloc) | Thread-safe (OS-level) |
 | `ray_sys_free(ptr, size)` | System deallocator (munmap/VirtualFree) | Thread-safe (OS-level) |
+
+!!! note "Refcount atomicity is conditional"
+    `ray_retain`/`ray_release`/`ray_cow` use plain non-atomic increments/decrements on the fast path. They upgrade to atomic operations only when the thread-local `ray_rc_sync` flag is set, which the pool sets while dispatching work across worker threads (parallel query execution). Single-threaded evaluation never pays the atomic cost.
 
 ## Memory Layout Visualization
 

@@ -266,6 +266,13 @@ ray_t* ray_read_parted(const char* db_root, const char* table_name) {
 
     char path[1024];
     for (int64_t p = 0; p < part_count; p++) {
+        /* Cancellation checkpoint (per partition — each loads a whole splayed
+         * table).  part_tables[p] is still NULL; the fail_tables ladder
+         * releases already-loaded partitions, part_dirs and the sym domain. */
+        if (ray_interrupted()) {
+            part_err = ray_error("cancel", "interrupted");
+            goto fail_tables;
+        }
         int pn = snprintf(path, sizeof(path), "%s/%s/%s", db_root, part_dirs[p], table_name);
         if (pn < 0 || (size_t)pn >= sizeof(path)) {
             part_tables[p] = NULL;

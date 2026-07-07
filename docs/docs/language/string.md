@@ -55,7 +55,7 @@ In the C API DAG, null propagation is handled automatically per morsel. String t
 ## String Functions
 
 !!! note "DAG-only operations"
-    The following string operations are available in the C API DAG but are **not** currently exposed as Rayfall builtins: `upper`, `lower`, `strlen`, `trim`, `substr`, `replace`, `ilike`. They can be used through the C API's DAG opcodes (see table below).
+    The following string operations are available in the C API DAG but are **not** currently exposed as Rayfall builtins: `upper`, `lower`, `trim`, `substr`, `replace`, `ilike`. They can be used through the C API's DAG opcodes (see table below). (`strlen` *is* a Rayfall builtin — `(strlen "hello")` → `5`.)
 
 ### concat
 

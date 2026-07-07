@@ -44,9 +44,9 @@ uint64_t ray_join_dup_fallbacks = 0;
 
 /* ── Hash helper (shared by radix and chained HT join paths) ──────────── */
 
-static uint64_t hash_row_keys(ray_t** key_vecs, uint8_t n_keys, int64_t row) {
+static uint64_t hash_row_keys(ray_t** key_vecs, uint32_t n_keys, int64_t row) {
     uint64_t h = 0;
-    for (uint8_t k = 0; k < n_keys; k++) {
+    for (uint32_t k = 0; k < n_keys; k++) {
         ray_t* col = key_vecs[k];
         if (!col) continue;
         /* NULL key — produce unique hash that won't match any other row */
@@ -82,8 +82,8 @@ static uint64_t hash_row_keys(ray_t** key_vecs, uint8_t n_keys, int64_t row) {
  * abort the join: silent -1 translations downstream would make
  * cross-domain keys spuriously equal (7a-review hardening). */
 static bool join_warm_sym_luts(ray_t* const* l_vecs, ray_t* const* r_vecs,
-                               uint8_t n_keys) {
-    for (uint8_t k = 0; k < n_keys; k++) {
+                               uint32_t n_keys) {
+    for (uint32_t k = 0; k < n_keys; k++) {
         ray_t* sides[2] = { l_vecs[k], r_vecs[k] };
         for (int s = 0; s < 2; s++) {
             ray_t* v = sides[s];
@@ -141,7 +141,7 @@ static uint8_t radix_join_bits(int64_t right_rows) {
 /* Context for parallel hash pre-computation */
 typedef struct {
     ray_t**    key_vecs;
-    uint8_t   n_keys;
+    uint32_t  n_keys;
     uint32_t* hashes;    /* output: hash[row] */
 } join_radix_hash_ctx_t;
 
@@ -419,9 +419,9 @@ static join_radix_part_t* join_radix_partition(ray_pool_t* pool, int64_t nrows,
  * ============================================================================ */
 
 /* Key equality helper — shared by count + fill phases */
-static inline bool join_keys_eq(ray_t* const* l_vecs, ray_t* const* r_vecs, uint8_t n_keys,
+static inline bool join_keys_eq(ray_t* const* l_vecs, ray_t* const* r_vecs, uint32_t n_keys,
                                  int64_t l, int64_t r) {
-    for (uint8_t k = 0; k < n_keys; k++) {
+    for (uint32_t k = 0; k < n_keys; k++) {
         ray_t* lc = l_vecs[k];
         ray_t* rc = r_vecs[k];
         if (!lc || !rc) return false;
@@ -467,7 +467,7 @@ typedef struct {
     join_radix_part_t*  r_parts;
     ray_t**         l_key_vecs;
     ray_t**         r_key_vecs;
-    uint8_t        n_keys;
+    uint32_t       n_keys;
     uint8_t        join_type;
     /* Per-partition output: pp_l[p], pp_r[p] are local buffers */
     int32_t**      pp_l;         /* per-partition left indices (int32_t) */
@@ -683,7 +683,7 @@ typedef struct {
     uint32_t* ht_next;            /* per-row, no contention */
     uint32_t ht_mask;       /* ht_cap - 1 */
     ray_t**   r_key_vecs;
-    uint8_t  n_keys;
+    uint32_t n_keys;
     /* ASP-Join: semijoin filter from factorized left side (NULL if N/A) */
     uint64_t* asp_bits;
     int64_t   asp_key_max;
@@ -731,7 +731,7 @@ typedef struct {
     uint32_t     ht_cap;
     ray_t**       l_key_vecs;
     ray_t**       r_key_vecs;
-    uint8_t      n_keys;
+    uint32_t     n_keys;
     uint8_t      join_type;
     int64_t      left_rows;
     /* Per-morsel counts/offsets (allocated by main thread) */
@@ -858,19 +858,23 @@ ray_t* exec_join(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ray_t* right_t
      * Chained HT path uses uint32_t.  Cap at INT32_MAX for correctness. */
     if (right_rows > (int64_t)INT32_MAX || left_rows > (int64_t)INT32_MAX)
         return ray_error("nyi", NULL);
-    uint8_t n_keys = ext->join.n_join_keys;
+    uint32_t n_keys = ext->join.n_join_keys;
     uint8_t join_type = ext->join.join_type;
 
-    /* VLA bound of zero is UB under -fsanitize=undefined.  Guarantee >=1
-     * slot; iterations below are bounded by n_keys so the extra slot is
-     * untouched when n_keys == 0. */
+    /* n_keys is unbounded post-lift (no fixed key-count ceiling) — a stack
+     * VLA here would be a stack blow for a wide join.  One zero-inited
+     * carve holds both l_key_vecs and r_key_vecs (key_slots each); guard
+     * >=1 slot so the carve is never zero-sized when n_keys == 0.  Freed
+     * on every return between here and the end of the function (join_cleanup
+     * covers the fall-through paths; direct returns free it explicitly). */
     size_t key_slots = n_keys ? n_keys : 1;
-    ray_t* l_key_vecs[key_slots];
-    ray_t* r_key_vecs[key_slots];
-    memset(l_key_vecs, 0, key_slots * sizeof(ray_t*));
-    memset(r_key_vecs, 0, key_slots * sizeof(ray_t*));
+    ray_t* key_vecs_hdr = NULL;
+    ray_t** key_vecs = (ray_t**)scratch_calloc(&key_vecs_hdr, key_slots * 2 * sizeof(ray_t*));
+    if (!key_vecs) return ray_error("oom", NULL);
+    ray_t** l_key_vecs = key_vecs;
+    ray_t** r_key_vecs = key_vecs + key_slots;
 
-    for (uint8_t k = 0; k < n_keys; k++) {
+    for (uint32_t k = 0; k < n_keys; k++) {
         ray_op_ext_t* lk = find_ext(g, ext->join.left_keys[k]);
         ray_op_ext_t* rk = find_ext(g, ext->join.right_keys[k]);
         if (lk && lk->base.opcode == OP_SCAN)
@@ -882,15 +886,19 @@ ray_t* exec_join(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ray_t* right_t
     }
 
     /* RAY_STR keys not yet supported (16-byte elements vs 8-byte hash/eq slots) */
-    for (uint8_t k = 0; k < n_keys; k++) {
+    for (uint32_t k = 0; k < n_keys; k++) {
         if ((l_key_vecs[k] && l_key_vecs[k]->type == RAY_STR) ||
-            (r_key_vecs[k] && r_key_vecs[k]->type == RAY_STR))
+            (r_key_vecs[k] && r_key_vecs[k]->type == RAY_STR)) {
+            scratch_free(key_vecs_hdr);
             return ray_error("nyi", NULL);
+        }
     }
 
     /* Sequential LUT warm-up BEFORE any dispatch (see join_warm_sym_luts). */
-    if (!join_warm_sym_luts(l_key_vecs, r_key_vecs, n_keys))
+    if (!join_warm_sym_luts(l_key_vecs, r_key_vecs, n_keys)) {
+        scratch_free(key_vecs_hdr);
         return ray_error("oom", "join: sym domain runtime-id LUT build failed");
+    }
 
     ray_pool_t* pool = ray_pool_get();
 
@@ -904,6 +912,7 @@ ray_t* exec_join(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ray_t* right_t
     ray_t* asp_sel = NULL;
     ray_t* ht_next_hdr = NULL;
     ray_t* ht_heads_hdr = NULL;
+    ray_t* out_cols_hdr = NULL;
     int64_t* l_idx = NULL;
     int64_t* r_idx = NULL;
     int64_t pair_count = 0;
@@ -950,6 +959,7 @@ ray_t* exec_join(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ray_t* right_t
 
         if (pool_cancelled(pool)) {
             scratch_free(r_hash_hdr); scratch_free(l_hash_hdr);
+            scratch_free(key_vecs_hdr);
             return ray_error("cancel", NULL);
         }
 
@@ -983,11 +993,13 @@ ray_t* exec_join(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ray_t* right_t
                 if (l_parts[rp2].entries_hdr) scratch_free(l_parts[rp2].entries_hdr);
             }
             scratch_free(r_parts_hdr); scratch_free(l_parts_hdr);
+            scratch_free(key_vecs_hdr);
             return ray_error("cancel", NULL);
         }
 
         /* FULL OUTER: allocate matched_right tracker */
         if (join_type == 2 && right_rows > 0) {
+            // cppcheck-suppress internalAstError // _Atomic(T)* cast breaks cppcheck parser (see :1167)
             matched_right = (_Atomic(uint8_t)*)scratch_calloc(&matched_right_hdr,
                                                                (size_t)right_rows);
             if (!matched_right) {
@@ -1060,7 +1072,7 @@ ray_t* exec_join(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ray_t* right_t
             scratch_free(pp_meta_hdr); scratch_free(pcounts_hdr);
             if (matched_right_hdr) { scratch_free(matched_right_hdr); matched_right_hdr = NULL; }
             matched_right = NULL;
-            if (bp_cancelled) return ray_error("cancel", NULL);
+            if (bp_cancelled) { scratch_free(key_vecs_hdr); return ray_error("cancel", NULL); }
             if (bp_pathological) ray_join_dup_fallbacks++;
             goto chained_ht_fallback;
         }
@@ -1099,6 +1111,7 @@ ray_t* exec_join(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ray_t* right_t
                 scratch_free(pcounts_hdr);
                 if (matched_right_hdr) scratch_free(matched_right_hdr);
                 matched_right_hdr = NULL;
+                scratch_free(key_vecs_hdr);
                 return ray_error("oom", NULL);
             }
 
@@ -1157,6 +1170,7 @@ chained_ht_fallback:;
     _Atomic(uint32_t)* ht_heads = (_Atomic(uint32_t)*)scratch_alloc(&ht_heads_hdr, ht_cap * sizeof(uint32_t));
     if (!ht_next || !ht_heads) {
         scratch_free(ht_next_hdr); scratch_free(ht_heads_hdr);
+        scratch_free(key_vecs_hdr);
         return ray_error("oom", NULL);
     }
     memset(ht_heads, 0xFF, ht_cap * sizeof(uint32_t));  /* JHT_EMPTY = 0xFFFFFFFF */
@@ -1246,6 +1260,7 @@ chained_ht_fallback:;
                               (size_t)(n_tasks + 1) * sizeof(int64_t));
     if (!morsel_counts) {
         scratch_free(ht_next_hdr); scratch_free(ht_heads_hdr);
+        scratch_free(key_vecs_hdr);
         return ray_error("oom", NULL);
     }
 
@@ -1363,11 +1378,30 @@ join_gather:;
     result = ray_table_new(left_ncols + right_ncols);
     if (!result || RAY_IS_ERR(result)) goto join_cleanup;
 
+    /* Output-column arrays sized to the actual table widths — the gather
+     * stage below batches through multi_gather only when a side fits
+     * MGATHER_MAX_COLS and falls back to per-column gather otherwise, so
+     * no column may be dropped here (a fixed [16] cap used to silently
+     * truncate wide-table join results). */
+    {
+        size_t slots = (size_t)(left_ncols * 2 + right_ncols * 3);
+        void* out_mem = scratch_alloc(&out_cols_hdr,
+                                      (slots ? slots : 1) * sizeof(void*));
+        if (!out_mem) {
+            ray_release(result);
+            result = ray_error("oom", NULL);
+            goto join_cleanup;
+        }
+    }
+    ray_t** l_out_cols  = (ray_t**)ray_data(out_cols_hdr);
+    int64_t* l_out_names = (int64_t*)(l_out_cols + left_ncols);
+    ray_t** r_out_cols  = (ray_t**)(l_out_names + left_ncols);
+    ray_t** r_src_cols  = r_out_cols + right_ncols;
+    int64_t* r_out_names = (int64_t*)(r_src_cols + right_ncols);
+
     /* Allocate all output columns upfront for batched gather */
-    ray_t* l_out_cols[MGATHER_MAX_COLS];
-    int64_t l_out_names[MGATHER_MAX_COLS];
     int64_t l_out_count = 0;
-    for (int64_t c = 0; c < left_ncols && l_out_count < MGATHER_MAX_COLS; c++) {
+    for (int64_t c = 0; c < left_ncols; c++) {
         ray_t* col = ray_table_get_col_idx(left_table, c);
         if (!col) continue;
         ray_t* new_col = col_vec_new(col, pair_count);
@@ -1378,23 +1412,19 @@ join_gather:;
         l_out_count++;
     }
 
-    ray_t* r_out_cols[MGATHER_MAX_COLS];
-    ray_t* r_src_cols[MGATHER_MAX_COLS];
-    int64_t r_out_names[MGATHER_MAX_COLS];
     int64_t r_out_count = 0;
     for (int64_t c = 0; c < right_ncols; c++) {
         ray_t* col = ray_table_get_col_idx(right_table, c);
         int64_t name_id = ray_table_col_name(right_table, c);
         if (!col) continue;
         bool is_key = false;
-        for (uint8_t k = 0; k < n_keys; k++) {
+        for (uint32_t k = 0; k < n_keys; k++) {
             ray_op_ext_t* rk = find_ext(g, ext->join.right_keys[k]);
             if (rk && rk->base.opcode == OP_SCAN && rk->sym == name_id) {
                 is_key = true; break;
             }
         }
         if (is_key) continue;
-        if (r_out_count >= MGATHER_MAX_COLS) continue;
         ray_t* new_col = col_vec_new(col, pair_count);
         if (!new_col || RAY_IS_ERR(new_col)) continue;
         new_col->len = pair_count;
@@ -1501,12 +1531,14 @@ join_gather:;
     }
 
 join_cleanup:
+    if (out_cols_hdr) scratch_free(out_cols_hdr);
     if (ht_next_hdr) scratch_free(ht_next_hdr);
     if (ht_heads_hdr) scratch_free(ht_heads_hdr);
     scratch_free(l_idx_hdr);
     scratch_free(r_idx_hdr);
     if (counts_hdr) scratch_free(counts_hdr);
     scratch_free(matched_right_hdr);
+    scratch_free(key_vecs_hdr);
     if (sjoin_sel) ray_release(sjoin_sel);
     if (asp_sel) ray_release(asp_sel);
 
@@ -1532,7 +1564,7 @@ ray_t* exec_antijoin(ray_graph_t* g, ray_op_t* op,
     if (right_rows > (int64_t)INT32_MAX || left_rows > (int64_t)INT32_MAX)
         return ray_error("nyi", NULL);
 
-    uint8_t n_keys = ext->join.n_join_keys;
+    uint32_t n_keys = ext->join.n_join_keys;
 
     /* Trivial case: empty right → all left rows pass */
     if (right_rows == 0) {
@@ -1545,12 +1577,19 @@ ray_t* exec_antijoin(ray_graph_t* g, ray_op_t* op,
         return left_table;
     }
 
-    ray_t* l_key_vecs[16];
-    ray_t* r_key_vecs[16];
-    memset(l_key_vecs, 0, n_keys * sizeof(ray_t*));
-    memset(r_key_vecs, 0, n_keys * sizeof(ray_t*));
+    /* n_keys is unbounded post-lift (query.c join_impl/antijoin_impl no
+     * longer cap at 16; datalog.c callers stay bounded by DL_MAX_ARITY,
+     * a separate cap on a different call path) — carve instead of a fixed
+     * [16] or a stack VLA (both wrong for an unbounded key count).  One
+     * zero-inited carve holds both l_key_vecs and r_key_vecs. */
+    ray_t* key_vecs_hdr = NULL;
+    ray_t** key_vecs = (ray_t**)scratch_calloc(&key_vecs_hdr,
+                            (size_t)(n_keys ? n_keys : 1) * 2 * sizeof(ray_t*));
+    if (!key_vecs) return ray_error("oom", NULL);
+    ray_t** l_key_vecs = key_vecs;
+    ray_t** r_key_vecs = key_vecs + n_keys;
 
-    for (uint8_t k = 0; k < n_keys; k++) {
+    for (uint32_t k = 0; k < n_keys; k++) {
         ray_op_ext_t* lk = find_ext(g, ext->join.left_keys[k]);
         ray_op_ext_t* rk = find_ext(g, ext->join.right_keys[k]);
         if (lk && lk->base.opcode == OP_SCAN)
@@ -1562,15 +1601,19 @@ ray_t* exec_antijoin(ray_graph_t* g, ray_op_t* op,
     }
 
     /* RAY_STR keys not yet supported */
-    for (uint8_t k = 0; k < n_keys; k++) {
+    for (uint32_t k = 0; k < n_keys; k++) {
         if ((l_key_vecs[k] && l_key_vecs[k]->type == RAY_STR) ||
-            (r_key_vecs[k] && r_key_vecs[k]->type == RAY_STR))
+            (r_key_vecs[k] && r_key_vecs[k]->type == RAY_STR)) {
+            scratch_free(key_vecs_hdr);
             return ray_error("nyi", NULL);
+        }
     }
 
     /* Sequential LUT warm-up BEFORE the parallel build dispatch. */
-    if (!join_warm_sym_luts(l_key_vecs, r_key_vecs, n_keys))
+    if (!join_warm_sym_luts(l_key_vecs, r_key_vecs, n_keys)) {
+        scratch_free(key_vecs_hdr);
         return ray_error("oom", "join: sym domain runtime-id LUT build failed");
+    }
 
     /* Build chained hash table from right side */
     ray_t* ht_next_hdr = NULL;
@@ -1589,6 +1632,7 @@ ray_t* exec_antijoin(ray_graph_t* g, ray_op_t* op,
     if (!ht_next || !ht_heads) {
         if (ht_next_hdr) scratch_free(ht_next_hdr);
         if (ht_heads_hdr) scratch_free(ht_heads_hdr);
+        scratch_free(key_vecs_hdr);
         return ray_error("oom", NULL);
     }
     memset(ht_heads, 0xFF, ht_cap * sizeof(uint32_t));  /* JHT_EMPTY */
@@ -1614,6 +1658,7 @@ ray_t* exec_antijoin(ray_graph_t* g, ray_op_t* op,
     if (pool_cancelled(pool)) {
         scratch_free(ht_next_hdr);
         scratch_free(ht_heads_hdr);
+        scratch_free(key_vecs_hdr);
         return ray_error("cancel", NULL);
     }
 
@@ -1624,12 +1669,23 @@ ray_t* exec_antijoin(ray_graph_t* g, ray_op_t* op,
     if (!out_idx) {
         scratch_free(ht_next_hdr);
         scratch_free(ht_heads_hdr);
+        scratch_free(key_vecs_hdr);
         return ray_error("oom", NULL);
     }
 
     uint32_t ht_mask = ht_cap - 1;
     int64_t out_count = 0;
     for (int64_t l = 0; l < left_rows; l++) {
+        /* Cancellation checkpoint — this probe is fully serial (not pool
+         * dispatched), so it needs its own check.  Masked to stay off the
+         * per-row hot path; frees the live scratch on a cancel. */
+        if ((l & 0xFFFF) == 0 && ray_interrupted()) {
+            scratch_free(out_idx_hdr);
+            scratch_free(ht_next_hdr);
+            scratch_free(ht_heads_hdr);
+            scratch_free(key_vecs_hdr);
+            return ray_error("cancel", NULL);
+        }
         uint64_t h = hash_row_keys(l_key_vecs, n_keys, l);
         uint32_t slot = (uint32_t)(h & ht_mask);
         bool matched = false;
@@ -1646,6 +1702,7 @@ ray_t* exec_antijoin(ray_graph_t* g, ray_op_t* op,
 
     scratch_free(ht_next_hdr);
     scratch_free(ht_heads_hdr);
+    scratch_free(key_vecs_hdr);
 
     /* Gather: build result table with only left columns */
     int64_t left_ncols = ray_table_ncols(left_table);
@@ -1779,7 +1836,107 @@ static int asof_lslot_cmp(const void* a, const void* b) {
     return (x > y) - (x < y);
 }
 
-static bool asof_hash_group_match(uint8_t n_eq,
+/* Per-slice ascending-time verify over a collected probe set (see the
+ * single-eq index variant below).  gsl holds n_groups (grows, gn) pairs.
+ * Contiguous slices verify with a sequential scan over rt_time; scattered
+ * ones fall back to the gathered walk.  Above the parallel threshold the
+ * pairs are chunked across the pool; each chunk covers the adjacent
+ * pairs (i-1, i) for i in [max(start,1), end) within its slice, so
+ * chunk boundaries re-check the crossing pair and no pair is skipped.
+ * Returns false at the first violation (shared bail flag). */
+typedef struct { const int64_t* grows; int64_t lo, hi; } asof_vchunk_t;
+typedef struct {
+    const asof_vchunk_t* chunks;
+    const int64_t* rt_time;
+    volatile int* ok;
+} asof_vctx_t;
+
+static void asof_verify_fn(void* raw, uint32_t wid, int64_t cstart,
+                           int64_t cend) {
+    (void)wid;
+    asof_vctx_t* c = (asof_vctx_t*)raw;
+    const int64_t* restrict t = c->rt_time;
+    for (int64_t ci = cstart; ci < cend; ci++) {
+        if (!*c->ok) return;
+        const asof_vchunk_t* ch = &c->chunks[ci];
+        const int64_t* restrict rows = ch->grows;
+        int64_t lo = ch->lo, hi = ch->hi;
+        if (lo < 1) lo = 1;
+        bool contig = (hi > lo) &&
+                      (rows[hi - 1] - rows[lo - 1] == hi - lo);
+        if (contig) {
+            /* Branchless block accumulation: `bad += (next < cur)` maps to
+             * packed i64 compares (the early-exit form stays scalar), with
+             * a per-block bail so a violation still stops the scan early. */
+            const int64_t* restrict tv = t + rows[lo - 1];
+            int64_t n = hi - lo;
+            int64_t bad = 0;
+            for (int64_t b = 0; b < n; b += 4096) {
+                int64_t e = b + 4096 < n ? b + 4096 : n;
+                for (int64_t i = b; i < e; i++)
+                    bad += (int64_t)(tv[i + 1] < tv[i]);
+                if (bad) { *c->ok = 0; return; }
+            }
+        } else {
+            for (int64_t i = lo; i < hi; i++)
+                if (t[rows[i]] < t[rows[i - 1]]) { *c->ok = 0; return; }
+        }
+    }
+}
+
+#define ASOF_VERIFY_CHUNK 65536
+static bool asof_verify_slices(const int64_t* gsl, int32_t n_groups,
+                               const int64_t* rt_time, int64_t total_rows) {
+    int64_t n_chunks = 0;
+    for (int32_t g = 0; g < n_groups; g++)
+        n_chunks += (gsl[2 * g + 1] + ASOF_VERIFY_CHUNK - 1)
+                    / ASOF_VERIFY_CHUNK;
+    if (n_chunks <= 0) return true;
+    ray_t* ch_hdr = NULL;
+    asof_vchunk_t* chunks = (asof_vchunk_t*)scratch_alloc(&ch_hdr,
+                                (size_t)n_chunks * sizeof(asof_vchunk_t));
+    if (!chunks) {
+        /* OOM — serial gathered walk, no allocation. */
+        for (int32_t g = 0; g < n_groups; g++) {
+            const int64_t* rows = (const int64_t*)(intptr_t)gsl[2 * g];
+            int64_t gn = gsl[2 * g + 1];
+            for (int64_t p = 1; p < gn; p++)
+                if (rt_time[rows[p]] < rt_time[rows[p - 1]]) return false;
+        }
+        return true;
+    }
+    int64_t w = 0;
+    for (int32_t g = 0; g < n_groups; g++) {
+        const int64_t* rows = (const int64_t*)(intptr_t)gsl[2 * g];
+        int64_t gn = gsl[2 * g + 1];
+        for (int64_t lo = 0; lo < gn; lo += ASOF_VERIFY_CHUNK) {
+            int64_t hi = lo + ASOF_VERIFY_CHUNK;
+            if (hi > gn) hi = gn;
+            chunks[w].grows = rows;
+            chunks[w].lo = lo;
+            chunks[w].hi = hi;
+            w++;
+        }
+    }
+    volatile int vok = 1;
+    asof_vctx_t ctx = { chunks, rt_time, &vok };
+    ray_pool_t* pool = ray_pool_get();
+    /* dispatch_n: the element count here is TASKS (a few dozen), far
+     * below ray_pool_dispatch's element grain — the plain dispatch would
+     * collapse them into one serial task. */
+    if (pool && n_chunks > 1 && total_rows >= RAY_PARALLEL_THRESHOLD) {
+        uint32_t nt = (n_chunks > 4096) ? 4096u : (uint32_t)n_chunks;
+        /* fn receives a task-index range; map [ti_start, ti_end) over
+         * chunks directly — dispatch_n hands out [i, i+1) per task. */
+        (void)nt;
+        ray_pool_dispatch_n(pool, asof_verify_fn, &ctx, (uint32_t)n_chunks);
+    } else
+        asof_verify_fn(&ctx, 0, 0, n_chunks);
+    scratch_free(ch_hdr);
+    return vok != 0;
+}
+
+static bool asof_hash_group_match(uint32_t n_eq,
                                   ray_t* const* lt_eq, ray_t* const* rt_eq,
                                   const int64_t* const* eq_xlut,
                                   const int64_t* eq_xn,
@@ -1809,7 +1966,7 @@ static bool asof_hash_group_match(uint8_t n_eq,
 
     ray_t *tab_hdr = NULL, *keys_hdr = NULL, *gid_hdr = NULL,
           *cnt_hdr = NULL, *off_hdr = NULL, *rows_hdr = NULL,
-          *lgid_hdr = NULL;
+          *lgid_hdr = NULL, *rowkey_hdr = NULL;
     int32_t* tab      = NULL;   /* slot -> group id + 1 (0 = empty) */
     int64_t* gkeys    = NULL;   /* n_groups × n_eq translated key values */
     int32_t* left_gid = NULL;   /* per left row: its group id (or -1) */
@@ -1817,6 +1974,17 @@ static bool asof_hash_group_match(uint8_t n_eq,
     int32_t* cnt      = NULL;
     int32_t* off      = NULL;
     int32_t* rows     = NULL;
+    /* Single per-row eq-key scratch buffer, reused sequentially by Pass 1
+     * below, the Pass 2 hash-scan fallback, and the ASOF_RESOLVE_GID macro's
+     * OA-probe branch — none of those three loops is ever live at the same
+     * time as another, so one buffer covers all of them.  For the common
+     * bounded case (n_eq <= 16) stage into a STACK array (matches the
+     * pre-cut-3 per-loop `int64_t lv[256]`/`rv[256]`/`_rv[256]` provenance a
+     * unified heap carve gave up); wide keys (>16, unbounded — no fixed
+     * ceiling) fall back to the exact-sized heap carve.  The pointer is chosen
+     * ONCE here (no per-row branch). */
+    int64_t  rowkey_stk[16];
+    int64_t* rowkey_heap = NULL;
 
     left_gid = (int32_t*)scratch_alloc(&lgid_hdr, (size_t)left_n * 4);
     row_gid  = (int32_t*)scratch_alloc(&gid_hdr, (size_t)right_n * 4);
@@ -1824,9 +1992,13 @@ static bool asof_hash_group_match(uint8_t n_eq,
         tab   = (int32_t*)scratch_alloc(&tab_hdr, (size_t)cap * 4);
         gkeys = (int64_t*)scratch_alloc(&keys_hdr,
                                         (size_t)left_n * n_eq * 8);
+        if (n_eq > 16)
+            rowkey_heap = (int64_t*)scratch_alloc(&rowkey_hdr, (size_t)n_eq * 8);
         if (tab) memset(tab, 0, (size_t)cap * 4);
     }
-    bool ok = left_gid && row_gid && (n_eq == 0 || (tab && gkeys));
+    int64_t* rowkey = (n_eq <= 16) ? rowkey_stk : rowkey_heap;
+    bool ok = left_gid && row_gid &&
+              (n_eq == 0 || (tab && gkeys && (n_eq <= 16 || rowkey_heap)));
 
     /* Pass 1 — distinct left keys.  n_groups <= left_n. */
     int32_t n_groups = 0;
@@ -1837,11 +2009,12 @@ static bool asof_hash_group_match(uint8_t n_eq,
     } else if (ok) {
         for (int64_t li = 0; li < left_n; li++) {
             if (lt_null[li]) { left_gid[li] = -1; continue; }
-            int64_t lv[256];
+            /* rowkey: carved once above this loop, sized n_eq — see the
+             * declaration comment. */
             uint64_t h = 0;
-            for (uint8_t k = 0; k < n_eq; k++) {
-                lv[k] = asof_eq_lread(lt_eq[k], eq_xlut[k], eq_xn[k], li);
-                uint64_t kh = ray_hash_i64(lv[k]);
+            for (uint32_t k = 0; k < n_eq; k++) {
+                rowkey[k] = asof_eq_lread(lt_eq[k], eq_xlut[k], eq_xn[k], li);
+                uint64_t kh = ray_hash_i64(rowkey[k]);
                 h = (k == 0) ? kh : ray_hash_combine(h, kh);
             }
             uint64_t slot = h & mask;
@@ -1849,16 +2022,16 @@ static bool asof_hash_group_match(uint8_t n_eq,
                 int32_t gp1 = tab[slot];
                 if (gp1 == 0) {
                     tab[slot] = n_groups + 1;
-                    for (uint8_t k = 0; k < n_eq; k++)
-                        gkeys[(int64_t)n_groups * n_eq + k] = lv[k];
+                    for (uint32_t k = 0; k < n_eq; k++)
+                        gkeys[(int64_t)n_groups * n_eq + k] = rowkey[k];
                     left_gid[li] = n_groups;
                     n_groups++;
                     break;
                 }
                 const int64_t* gk = gkeys + (int64_t)(gp1 - 1) * n_eq;
                 int eq = 1;
-                for (uint8_t k = 0; k < n_eq; k++)
-                    if (gk[k] != lv[k]) { eq = 0; break; }
+                for (uint32_t k = 0; k < n_eq; k++)
+                    if (gk[k] != rowkey[k]) { eq = 0; break; }
                 if (eq) { left_gid[li] = gp1 - 1; break; }
                 slot = (slot + 1) & mask;
             }
@@ -1901,21 +2074,31 @@ static bool asof_hash_group_match(uint8_t n_eq,
                            (size_t)(n_groups > 0 ? n_groups : 1) * 2 *
                            sizeof(int64_t));
         if (gsl) {
+            /* Resolve every probed group's slice first; the per-slice
+             * time-order verify runs over the collected set afterwards
+             * so it can go wide.  The verify IS the honest-engine cost
+             * that trusting a sorted-attribute stamp would skip — when a
+             * query probes the
+             * liquid names it walks millions of rows, so it must run at
+             * memory speed: contiguous slices (the parted layout) are
+             * checked with a sequential compare instead of a gathered
+             * one, and the whole probe set is chunked across the pool
+             * with a shared bail flag (chunks re-check their boundary
+             * pair, so every adjacent pair is covered exactly once). */
+            int64_t verify_rows = 0;
             for (int32_t g = 0; g < n_groups && served; g++) {
                 const int64_t* grows = NULL;
                 int64_t gn = 0;
                 int hit = ray_index_hash_group(rt_eq[0], gkeys[g],
                                                &grows, &gn);
                 if (hit < 0) { served = false; break; }  /* ineligible */
-                if (!rt_time_sorted)
-                    for (int64_t p = 1; p < gn; p++)
-                        if (rt_time[grows[p]] < rt_time[grows[p - 1]]) {
-                            served = false;   /* slice not time-ordered */
-                            break;
-                        }
-                if (!served) break;
                 gsl[2 * g]     = (int64_t)(intptr_t)grows;
                 gsl[2 * g + 1] = gn;
+                verify_rows += gn;
+            }
+            if (served && !rt_time_sorted && verify_rows > 0) {
+                served = asof_verify_slices(gsl, n_groups, rt_time,
+                                            verify_rows);
             }
             if (served) {
                 ray_idx_hits[IDX_SITE_ASOF]++;
@@ -2089,7 +2272,7 @@ static bool asof_hash_group_match(uint8_t n_eq,
                             const int64_t* gk =
                                 gkeys + (int64_t)gid * n_eq;
                             int eq = 1;
-                            for (uint8_t k = 1; k < n_eq; k++) {
+                            for (uint32_t k = 1; k < n_eq; k++) {
                                 int64_t rv = read_col_i64(
                                     ray_data(rt_eq[k]), i,
                                     rt_eq[k]->type, rt_eq[k]->attrs);
@@ -2173,7 +2356,7 @@ static bool asof_hash_group_match(uint8_t n_eq,
             while (_g >= 0) {                                                  \
                 const int64_t* _gk = gkeys + (int64_t)_g * n_eq;               \
                 int _eq = 1;                                                   \
-                for (uint8_t _k = 1; _k < n_eq; _k++) {                        \
+                for (uint32_t _k = 1; _k < n_eq; _k++) {                        \
                     int64_t _rv = read_col_i64(ray_data(rt_eq[_k]), (i),       \
                                                rt_eq[_k]->type,                \
                                                rt_eq[_k]->attrs);              \
@@ -2183,12 +2366,14 @@ static bool asof_hash_group_match(uint8_t n_eq,
                 _g = gid_next[_g];                                             \
             }                                                                  \
         } else {                                                               \
-            int64_t _rv[256];                                                  \
+            /* rowkey: the same per-row scratch buffer Pass 1 uses above,     \
+             * carved once at function entry, sized n_eq — no per-row alloc. \
+             */                                                                \
             uint64_t _h = 0;                                                   \
-            for (uint8_t _k = 0; _k < n_eq; _k++) {                            \
-                _rv[_k] = read_col_i64(ray_data(rt_eq[_k]), (i),               \
+            for (uint32_t _k = 0; _k < n_eq; _k++) {                            \
+                rowkey[_k] = read_col_i64(ray_data(rt_eq[_k]), (i),            \
                                        rt_eq[_k]->type, rt_eq[_k]->attrs);     \
-                uint64_t _kh = ray_hash_i64(_rv[_k]);                          \
+                uint64_t _kh = ray_hash_i64(rowkey[_k]);                       \
                 _h = (_k == 0) ? _kh : ray_hash_combine(_h, _kh);              \
             }                                                                  \
             uint64_t _slot = _h & mask;                                        \
@@ -2197,8 +2382,8 @@ static bool asof_hash_group_match(uint8_t n_eq,
                 if (_gp1 == 0) break;                                          \
                 const int64_t* _gk = gkeys + (int64_t)(_gp1 - 1) * n_eq;       \
                 int _eq = 1;                                                   \
-                for (uint8_t _k = 0; _k < n_eq; _k++)                          \
-                    if (_gk[_k] != _rv[_k]) { _eq = 0; break; }                \
+                for (uint32_t _k = 0; _k < n_eq; _k++)                          \
+                    if (_gk[_k] != rowkey[_k]) { _eq = 0; break; }             \
                 if (_eq) { _g = _gp1 - 1; break; }                             \
                 _slot = (_slot + 1) & mask;                                    \
             }                                                                  \
@@ -2309,7 +2494,7 @@ static bool asof_hash_group_match(uint8_t n_eq,
             while (gid >= 0) {
                 const int64_t* gk = gkeys + (int64_t)gid * n_eq;
                 int eq = 1;
-                for (uint8_t k = 1; k < n_eq; k++) {
+                for (uint32_t k = 1; k < n_eq; k++) {
                     int64_t rv = read_col_i64(ray_data(rt_eq[k]), i,
                                               rt_eq[k]->type, rt_eq[k]->attrs);
                     if (gk[k] != rv) { eq = 0; break; }
@@ -2321,15 +2506,17 @@ static bool asof_hash_group_match(uint8_t n_eq,
             if (gid >= 0) { cnt[gid]++; n_matched++; }
         }
     } else if (ok) {
+        /* rowkey: same carve as Pass 1 (function-entry, sized n_eq) — Pass 1
+         * over left rows has already finished by the time this right-row
+         * pass runs, so reusing it here adds no aliasing. */
         for (int64_t i = 0; i < right_n; i++) {
             if (rt_null[i]) { row_gid[i] = -1; continue; }
             int32_t gid = -1;
-            int64_t rv[256];
             uint64_t h = 0;
-            for (uint8_t k = 0; k < n_eq; k++) {
-                rv[k] = read_col_i64(ray_data(rt_eq[k]), i,
+            for (uint32_t k = 0; k < n_eq; k++) {
+                rowkey[k] = read_col_i64(ray_data(rt_eq[k]), i,
                                      rt_eq[k]->type, rt_eq[k]->attrs);
-                uint64_t kh = ray_hash_i64(rv[k]);
+                uint64_t kh = ray_hash_i64(rowkey[k]);
                 h = (k == 0) ? kh : ray_hash_combine(h, kh);
             }
             uint64_t slot = h & mask;
@@ -2338,8 +2525,8 @@ static bool asof_hash_group_match(uint8_t n_eq,
                 if (gp1 == 0) break;   /* key not probed by any left row */
                 const int64_t* gk = gkeys + (int64_t)(gp1 - 1) * n_eq;
                 int eq = 1;
-                for (uint8_t k = 0; k < n_eq; k++)
-                    if (gk[k] != rv[k]) { eq = 0; break; }
+                for (uint32_t k = 0; k < n_eq; k++)
+                    if (gk[k] != rowkey[k]) { eq = 0; break; }
                 if (eq) { gid = gp1 - 1; break; }
                 slot = (slot + 1) & mask;
             }
@@ -2404,6 +2591,7 @@ done:
     scratch_free(rows_hdr);
     scratch_free(lut_hdr);
     scratch_free(gnx_hdr);
+    scratch_free(rowkey_hdr);
     return ok;
 }
 
@@ -2412,7 +2600,7 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
     ray_op_ext_t* ext = find_ext(g, op->id);
     if (!ext) return ray_error("nyi", NULL);
 
-    uint8_t n_eq      = ext->asof.n_eq_keys;
+    uint32_t n_eq     = ext->asof.n_eq_keys;
     uint8_t join_type = ext->asof.join_type;
 
     int64_t left_n  = ray_table_nrows(left_table);
@@ -2424,12 +2612,28 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
         return ray_error("nyi", NULL);
     int64_t time_sym = time_ext->sym;
 
-    /* Resolve equality keys */
-    int64_t eq_syms[256];
-    for (uint8_t k = 0; k < n_eq; k++) {
+    /* Resolve equality keys.
+     * eq_syms/lt_eq/rt_eq/eq_xlut/eq_xn/xcnt: one exact-size carve, all
+     * 8-byte elements (int64 or pointer) so one n_eq-wide (?: 1) block —
+     * naturally 8-byte-aligned — covers all six arrays by offset.  This
+     * replaces six fixed [256] arrays that were sized to query.c's
+     * uint8_t eq-count narrowing (removed in this same commit); n_eq is
+     * unbounded from here down.  Freed on every return below. */
+    ray_t* eqbuf_hdr = NULL;
+    size_t eq_cap = (size_t)(n_eq ? n_eq : 1);
+    int64_t* eq_syms = (int64_t*)scratch_alloc(&eqbuf_hdr, eq_cap * 6 * sizeof(int64_t));
+    if (!eq_syms) return ray_error("oom", NULL);
+    ray_t**          lt_eq   = (ray_t**)(eq_syms + eq_cap);
+    ray_t**          rt_eq   = (ray_t**)(lt_eq + eq_cap);
+    const int64_t** eq_xlut  = (const int64_t**)(rt_eq + eq_cap);
+    int64_t*         eq_xn   = (int64_t*)(eq_xlut + eq_cap);
+    int64_t*         xcnt    = eq_xn + eq_cap;
+    for (uint32_t k = 0; k < n_eq; k++) {
         ray_op_ext_t* ek = find_ext(g, ext->asof.eq_keys[k]);
-        if (!ek || ek->base.opcode != OP_SCAN)
+        if (!ek || ek->base.opcode != OP_SCAN) {
+            scratch_free(eqbuf_hdr);
             return ray_error("nyi", NULL);
+        }
         eq_syms[k] = ek->sym;
     }
 
@@ -2438,7 +2642,10 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
      * We expand to a temporary i64 array for uniform comparison. */
     ray_t* lt_time_vec = ray_table_get_col(left_table, time_sym);
     ray_t* rt_time_vec = ray_table_get_col(right_table, time_sym);
-    if (!lt_time_vec || !rt_time_vec) return ray_error("schema", NULL);
+    if (!lt_time_vec || !rt_time_vec) {
+        scratch_free(eqbuf_hdr);
+        return ray_error("schema", NULL);
+    }
     int8_t time_type = lt_time_vec->type;
 
     /* Helper macro to read time value as int64_t regardless of storage type */
@@ -2463,6 +2670,7 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
         if ((!lt_time && left_n > 0) || (!rt_time && right_n > 0)) {
             if (lt_time_hdr) scratch_free(lt_time_hdr);
             if (rt_time_hdr) scratch_free(rt_time_hdr);
+            scratch_free(eqbuf_hdr);
             return ray_error("oom", NULL);
         }
         for (int64_t i = 0; i < left_n; i++) lt_time[i] = READ_TIME(lt_time_vec, i);
@@ -2470,14 +2678,15 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
     }
     #undef READ_TIME
 
-    /* Get eq key vectors — stored as ray_t* for type-safe access */
-    ray_t* lt_eq[256], *rt_eq[256];
-    for (uint8_t k = 0; k < n_eq; k++) {
+    /* Get eq key vectors — stored as ray_t* for type-safe access.
+     * lt_eq/rt_eq point into the eqbuf carve above (no separate alloc). */
+    for (uint32_t k = 0; k < n_eq; k++) {
         ray_t* lv = ray_table_get_col(left_table, eq_syms[k]);
         ray_t* rv = ray_table_get_col(right_table, eq_syms[k]);
         if (!lv || !rv) {
             if (lt_time_hdr) scratch_free(lt_time_hdr);
             if (rt_time_hdr) scratch_free(rt_time_hdr);
+            scratch_free(eqbuf_hdr);
             return ray_error("schema", NULL);
         }
         lt_eq[k] = lv;
@@ -2489,14 +2698,12 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
      * vocabulary (never the rows) replacing the old per-read str+find
      * hash lookups in asof_eq_lread.  Pre-flip both sides are the
      * runtime singleton: no table is built, the reader's raw fast path
-     * is byte-identical. */
-    const int64_t* eq_xlut[256];
-    int64_t eq_xn[256];
+     * is byte-identical.  eq_xlut/eq_xn/xcnt point into the eqbuf carve
+     * above (no separate alloc). */
     ray_t* eq_xl_hdr = NULL;
     {
-        int64_t xcnt[256];
         size_t  xtotal = 0;
-        for (uint8_t k = 0; k < n_eq; k++) {
+        for (uint32_t k = 0; k < n_eq; k++) {
             eq_xlut[k] = NULL;
             eq_xn[k]   = 0;
             xcnt[k]    = -1; /* -1 = same domain / non-SYM: raw reads */
@@ -2515,11 +2722,12 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
             if (!blk) {
                 if (lt_time_hdr) scratch_free(lt_time_hdr);
                 if (rt_time_hdr) scratch_free(rt_time_hdr);
+                scratch_free(eqbuf_hdr);
                 return ray_error("oom", NULL);
             }
         }
         size_t xoff = 0;
-        for (uint8_t k = 0; k < n_eq; k++) {
+        for (uint32_t k = 0; k < n_eq; k++) {
             if (xcnt[k] < 0) continue;       /* raw reads */
             if (xcnt[k] == 0) {              /* empty left vocabulary */
                 eq_xlut[k] = g_asof_empty_xlut;
@@ -2557,6 +2765,7 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
         if (lt_time_hdr) scratch_free(lt_time_hdr);
         if (rt_time_hdr) scratch_free(rt_time_hdr);
         if (eq_xl_hdr) scratch_free(eq_xl_hdr);
+        scratch_free(eqbuf_hdr);
         return ray_error("oom", NULL);
     }
     if (left_n > 0) memset(lt_null, 0, (size_t)left_n);
@@ -2567,7 +2776,7 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
     if (rt_time_vec->attrs & RAY_ATTR_HAS_NULLS)
         for (int64_t i = 0; i < right_n; i++)
             if (ray_vec_is_null(rt_time_vec, i)) rt_null[i] = 1;
-    for (uint8_t k = 0; k < n_eq; k++) {
+    for (uint32_t k = 0; k < n_eq; k++) {
         if (lt_eq[k]->attrs & RAY_ATTR_HAS_NULLS)
             for (int64_t i = 0; i < left_n; i++)
                 if (ray_vec_is_null(lt_eq[k], i)) lt_null[i] = 1;
@@ -2589,6 +2798,7 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
         if (lt_time_hdr) scratch_free(lt_time_hdr);
         if (rt_time_hdr) scratch_free(rt_time_hdr);
         if (eq_xl_hdr) scratch_free(eq_xl_hdr);
+        scratch_free(eqbuf_hdr);
         return ray_error("oom", NULL);
     }
 
@@ -2605,7 +2815,7 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
      * sort-merge when the per-group right-time monotonicity precondition
      * fails. */
     bool rt_no_nulls = !(rt_time_vec->attrs & RAY_ATTR_HAS_NULLS);
-    for (uint8_t k = 0; k < n_eq && rt_no_nulls; k++)
+    for (uint32_t k = 0; k < n_eq && rt_no_nulls; k++)
         if (rt_eq[k]->attrs & RAY_ATTR_HAS_NULLS) rt_no_nulls = false;
     if (asof_hash_group_match(n_eq, lt_eq, rt_eq, eq_xlut, eq_xn,
                               lt_time, rt_time, lt_null, rt_null,
@@ -2629,6 +2839,7 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
         if (lt_time_hdr) scratch_free(lt_time_hdr);
         if (rt_time_hdr) scratch_free(rt_time_hdr);
         if (eq_xl_hdr) scratch_free(eq_xl_hdr);
+        scratch_free(eqbuf_hdr);
         return ray_error("oom", NULL);
     }
     for (int64_t i = 0; i < left_n; i++) li_idx[i] = i;
@@ -2649,7 +2860,7 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
      * its OWN id space is not usable — disable the left presort shortcut.
      * Right-side reads stay raw: its shortcut is unaffected. */
     bool eq_xdomain = false;
-    for (uint8_t k = 0; k < n_eq; k++)
+    for (uint32_t k = 0; k < n_eq; k++)
         if (eq_xlut[k]) eq_xdomain = true;
 
     bool l_presorted = !eq_xdomain
@@ -2684,6 +2895,7 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
             if (lt_time_hdr) scratch_free(lt_time_hdr);
             if (rt_time_hdr) scratch_free(rt_time_hdr);
             if (eq_xl_hdr) scratch_free(eq_xl_hdr);
+            scratch_free(eqbuf_hdr);
             return ray_error("oom", NULL);
         }
 
@@ -2701,7 +2913,7 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
                     int cmp = 0;
                     if (lt_null[ai] != lt_null[bi])
                         cmp = lt_null[ai] - lt_null[bi]; /* 1 > 0 → nulls last */
-                    for (uint8_t k2 = 0; k2 < n_eq && cmp == 0; k2++) {
+                    for (uint32_t k2 = 0; k2 < n_eq && cmp == 0; k2++) {
                         /* asof_eq_lread: left sorts in the RIGHT side's
                          * id space when a SYM key pair spans domains. */
                         int64_t va = asof_eq_lread(lt_eq[k2], eq_xlut[k2], eq_xn[k2], ai);
@@ -2736,7 +2948,7 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
                     int cmp = 0;
                     if (rt_null[ai] != rt_null[bi])
                         cmp = rt_null[ai] - rt_null[bi];
-                    for (uint8_t k2 = 0; k2 < n_eq && cmp == 0; k2++) {
+                    for (uint32_t k2 = 0; k2 < n_eq && cmp == 0; k2++) {
                         int64_t va = read_col_i64(ray_data(rt_eq[k2]), ai, rt_eq[k2]->type, rt_eq[k2]->attrs);
                         int64_t vb = read_col_i64(ray_data(rt_eq[k2]), bi, rt_eq[k2]->type, rt_eq[k2]->attrs);
                         if (va < vb) cmp = -1;
@@ -2768,6 +2980,7 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
         if (lt_time_hdr) scratch_free(lt_time_hdr);
         if (rt_time_hdr) scratch_free(rt_time_hdr);
         if (eq_xl_hdr) scratch_free(eq_xl_hdr);
+        scratch_free(eqbuf_hdr);
         return ray_error("oom", NULL);
     }
 
@@ -2795,7 +3008,7 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
          * correctly in any single domain — no translation needed. */
         if (prev_non_null_li >= 0) {
             int changed = 0;
-            for (uint8_t k = 0; k < n_eq; k++) {
+            for (uint32_t k = 0; k < n_eq; k++) {
                 int64_t cv = read_col_i64(ray_data(lt_eq[k]), li, lt_eq[k]->type, lt_eq[k]->attrs);
                 int64_t pv = read_col_i64(ray_data(lt_eq[k]), prev_non_null_li, lt_eq[k]->type, lt_eq[k]->attrs);
                 if (cv != pv) { changed = 1; break; }
@@ -2807,7 +3020,7 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
                     int64_t ri_prev = ri_idx[rp - 1];
                     if (rt_null[ri_prev]) break;
                     int eq_match = 1;
-                    for (uint8_t k = 0; k < n_eq; k++) {
+                    for (uint32_t k = 0; k < n_eq; k++) {
                         int64_t rv = read_col_i64(ray_data(rt_eq[k]), ri_prev, rt_eq[k]->type, rt_eq[k]->attrs);
                         int64_t lv = asof_eq_lread(lt_eq[k], eq_xlut[k], eq_xn[k], li);
                         if (rv < lv) { eq_match = 0; break; }
@@ -2823,7 +3036,7 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
             int64_t ri = ri_idx[rp];
             if (rt_null[ri]) { rp++; continue; }  /* null keys never match */
             int eq_cmp = 0;
-            for (uint8_t k = 0; k < n_eq && eq_cmp == 0; k++) {
+            for (uint32_t k = 0; k < n_eq && eq_cmp == 0; k++) {
                 int64_t rv = read_col_i64(ray_data(rt_eq[k]), ri, rt_eq[k]->type, rt_eq[k]->attrs);
                 int64_t lv = asof_eq_lread(lt_eq[k], eq_xlut[k], eq_xn[k], li);
                 if (rv < lv) eq_cmp = -1;
@@ -2863,13 +3076,29 @@ build_output:;
     int64_t right_ncols = ray_table_ncols(right_table);
 
     /* Collect right column indices, excluding duplicate key columns */
-    int64_t right_out_idx[256];
+    ray_t* right_out_idx_hdr = NULL;
+    int64_t* right_out_idx = right_ncols > 0
+        ? (int64_t*)scratch_alloc(&right_out_idx_hdr, (size_t)right_ncols * sizeof(int64_t))
+        : NULL;
+    if (right_ncols > 0 && !right_out_idx) {
+        scratch_free(mo_hdr);
+        scratch_free(match_hdr);
+        scratch_free(li_hdr);
+        scratch_free(ri_hdr);
+        if (lt_null_hdr) scratch_free(lt_null_hdr);
+        if (rt_null_hdr) scratch_free(rt_null_hdr);
+        if (lt_time_hdr) scratch_free(lt_time_hdr);
+        if (rt_time_hdr) scratch_free(rt_time_hdr);
+        if (eq_xl_hdr) scratch_free(eq_xl_hdr);
+        scratch_free(eqbuf_hdr);
+        return ray_error("oom", NULL);
+    }
     int64_t right_out_count = 0;
     for (int64_t c = 0; c < right_ncols; c++) {
         int64_t rname = ray_table_col_name(right_table, c);
         int skip = 0;
         if (rname == time_sym) skip = 1;
-        for (uint8_t k = 0; k < n_eq && !skip; k++)
+        for (uint32_t k = 0; k < n_eq && !skip; k++)
             if (rname == eq_syms[k]) skip = 1;
         if (!skip) right_out_idx[right_out_count++] = c;
     }
@@ -2889,6 +3118,7 @@ build_output:;
     if (out_n > 0 && (!lidx || !ridx)) {
         if (lidx_hdr) scratch_free(lidx_hdr);
         if (ridx_hdr) scratch_free(ridx_hdr);
+        if (right_out_idx_hdr) scratch_free(right_out_idx_hdr);
         scratch_free(mo_hdr);
         scratch_free(match_hdr);
         scratch_free(li_hdr);
@@ -2898,6 +3128,7 @@ build_output:;
         if (lt_time_hdr) scratch_free(lt_time_hdr);
         if (rt_time_hdr) scratch_free(rt_time_hdr);
         if (eq_xl_hdr) scratch_free(eq_xl_hdr);
+        scratch_free(eqbuf_hdr);
         return ray_error("oom", NULL);
     }
     {
@@ -2971,6 +3202,7 @@ build_output:;
 
     if (lidx_hdr) scratch_free(lidx_hdr);
     if (ridx_hdr) scratch_free(ridx_hdr);
+    if (right_out_idx_hdr) scratch_free(right_out_idx_hdr);
     scratch_free(mo_hdr);
     scratch_free(match_hdr);
     scratch_free(li_hdr);
@@ -2980,5 +3212,6 @@ build_output:;
     if (lt_time_hdr) scratch_free(lt_time_hdr);
     if (rt_time_hdr) scratch_free(rt_time_hdr);
     if (eq_xl_hdr) scratch_free(eq_xl_hdr);
+    scratch_free(eqbuf_hdr);
     return out;
 }

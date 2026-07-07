@@ -55,7 +55,7 @@
 #include <unistd.h>
 #include <stdlib.h>
 
-/* Forward-declare runtime lifecycle for mem_budget test */
+/* Forward-declare runtime lifecycle for total_ram test */
 typedef struct ray_runtime_s ray_runtime_t;
 extern ray_runtime_t* ray_runtime_create(int argc, char** argv);
 extern void           ray_runtime_destroy(ray_runtime_t* rt);
@@ -1727,6 +1727,40 @@ static test_result_t test_serde_null_roundtrip(void) {
     PASS();
 }
 
+/* ---- test_serde_endian_mismatch ------------------------------------------ */
+
+static test_result_t test_serde_endian_mismatch(void) {
+    /* A frame whose header endian byte differs from the host must be
+     * rejected loudly — the payload is native-endian, so decoding a
+     * cross-endian frame would silently transpose every multi-byte
+     * value.  The IPC/journal receive paths already validate this;
+     * ray_de (the `de` builtin and .qdb snapshot load) must too. */
+    ray_t* orig = ray_i64(42);
+    ray_t* wire = ray_ser(orig);
+    TEST_ASSERT_NOT_NULL(wire);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(wire));
+
+    ray_ipc_header_t* hdr = (ray_ipc_header_t*)ray_data(wire);
+    TEST_ASSERT_EQ_I(hdr->endian, RAY_SERDE_ENDIAN);
+    hdr->endian ^= 1;   /* pretend the frame came from the other byte order */
+
+    ray_t* back = ray_de(wire);
+    TEST_ASSERT_NOT_NULL(back);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(back));
+    ray_error_free(back);
+
+    /* Restoring the correct byte makes the same frame decode again. */
+    hdr->endian ^= 1;
+    back = ray_de(wire);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(back));
+    TEST_ASSERT_EQ_I(back->i64, 42);
+
+    ray_release(back);
+    ray_release(wire);
+    ray_release(orig);
+    PASS();
+}
+
 /* ---- test_serde_typed_null_atoms ---------------------------------------- */
 
 static test_result_t test_serde_typed_null_atoms(void) {
@@ -3140,18 +3174,16 @@ static test_result_t test_serde_de_size_bounds(void) {
     PASS();
 }
 
-/* ---- test_mem_budget --------------------------------------------------- */
+/* ---- test_total_ram ---------------------------------------------------- */
 
-static test_result_t test_mem_budget(void) {
+static test_result_t test_total_ram(void) {
     /* Uses its own runtime since store_setup only does heap/sym init */
     ray_runtime_t* rt = ray_runtime_create(0, NULL);
     TEST_ASSERT_NOT_NULL(rt);
 
-    int64_t budget = ray_mem_budget();
-    /* Budget should be > 0 (detected from OS) */
-    TEST_ASSERT_EQ_I((int)(budget > 0), 1);
-    /* At startup with minimal allocations, should not be under pressure */
-    TEST_ASSERT_FALSE(ray_mem_pressure());
+    /* Total physical RAM should be detected as a positive value from the OS. */
+    int64_t total = ray_sys_total_ram();
+    TEST_ASSERT_EQ_I((int)(total > 0), 1);
 
     ray_runtime_destroy(rt);
     PASS();
@@ -4920,6 +4952,7 @@ const test_entry_t store_entries[] = {
     { "store/read_splayed_bad_sym", test_read_splayed_bad_sym_fatal, store_setup, store_teardown },
     { "store/serde_long_str_roundtrip", test_serde_long_str_roundtrip, store_setup, store_teardown },
     { "store/serde_null_roundtrip", test_serde_null_roundtrip, store_setup, store_teardown },
+    { "store/serde_endian_mismatch", test_serde_endian_mismatch, store_setup, store_teardown },
     { "store/serde_typed_null_atoms", test_serde_typed_null_atoms, store_setup, store_teardown },
     { "store/serde_wire_version_mismatch", test_serde_wire_version_mismatch, store_setup, store_teardown },
     { "store/serde_atom_types",           test_serde_atom_types,           store_setup, store_teardown },
@@ -4942,7 +4975,7 @@ const test_entry_t store_entries[] = {
     { "store/serde_table_dict_de_errors", test_serde_table_dict_de_errors, store_setup, store_teardown },
     { "store/serde_table_de_type_mismatch", test_serde_table_de_type_mismatch, store_setup, store_teardown },
     { "store/serde_de_size_bounds",        test_serde_de_size_bounds,        store_setup, store_teardown },
-    { "store/mem_budget", test_mem_budget, NULL, NULL },
+    { "store/total_ram", test_total_ram, NULL, NULL },
     { "store/ipc/compress_rt", test_ipc_compress_rt, NULL, NULL },
     { "store/ipc/compress_threshold", test_ipc_compress_threshold, NULL, NULL },
     { "store/ipc/compress_zeros", test_ipc_compress_zeros, NULL, NULL },

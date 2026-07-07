@@ -24,7 +24,7 @@ The two knobs are independent: `ray_join_force_dup_fallback` *forces* the
 fallback; `ray_join_no_dup_fallback` *disables the auto-trip*. The gate uses
 only the latter.
 
-Driver: `bench/join_dup/main.c`, target `make bench-join-dup`. Mirrors
+Driver: `bench/join_dup/main.c` (built release, no sanitizers). Mirrors
 `bench/join_buildside` (release flags, CLOCK_MONOTONIC around `ray_execute`
 only, tables built once, graph rebuilt per rep, medians, interleaved post/pre).
 
@@ -35,14 +35,14 @@ only, tables built once, graph rebuilt per rep, medians, interleaved post/pre).
   earlier attempts at load ~2-4 were discarded).
 - Build: `RELEASE_CFLAGS` = `-O3 -march=native -funroll-loops` etc. **No
   sanitizers** — `-fsanitize=...` appears only in `DEBUG_CFLAGS`/`DEBUG_LDFLAGS`;
-  the `bench-join-dup` recipe uses `RELEASE_CFLAGS`/`RELEASE_LDFLAGS` only.
+  the benchmark is built with `RELEASE_CFLAGS`/`RELEASE_LDFLAGS` only.
   Commit: `9b278585` (`feat(join): bypass knob to disable dup-fallback ...`).
 - `NREPS=9`, `PREFIX_SLOW_REPS=3`, `RADIX_DUP_RUN_MAX=512`,
   `RAY_PARALLEL_THRESHOLD=65536`.
 
 ### Sanitizer-free proof
 
-The `bench-join-dup` Makefile recipe compiles with `$(RELEASE_CFLAGS)` /
+The benchmark compiles with `$(RELEASE_CFLAGS)` /
 `$(RELEASE_LDFLAGS)`; the only `-fsanitize` occurrences in the Makefile are in
 `DEBUG_CFLAGS` (line ~25) and `DEBUG_LDFLAGS` (line ~57), neither of which the
 release/bench path references. The compile command logged for the recorded run

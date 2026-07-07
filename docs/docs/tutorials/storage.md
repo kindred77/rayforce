@@ -29,7 +29,7 @@ Output:
 ```text
 ┌────────┬───────┬────────────────────┐
 │ Symbol │ Price │        Qty         │
-│  sym   │  f64  │        i64         │
+│  SYM   │  F64  │        I64         │
 ├────────┼───────┼────────────────────┤
 │ AAPL   │ 150.5 │ 100                │
 │ GOOG   │ 280.0 │ 200                │
@@ -82,7 +82,7 @@ TABLE
 ```text
 ┌────────┬───────┬────────────────────┐
 │ Symbol │ Price │        Qty         │
-│  sym   │  f64  │        i64         │
+│  SYM   │  F64  │        I64         │
 ├────────┼───────┼────────────────────┤
 │ AAPL   │ 150.5 │ 100                │
 │ GOOG   │ 280.0 │ 200                │
@@ -105,7 +105,7 @@ Use `select` with a `where:` clause to filter rows. Find all trades where the pr
 ```text
 ┌────────┬───────┬────────────────────┐
 │ Symbol │ Price │        Qty         │
-│  sym   │  f64  │        i64         │
+│  SYM   │  F64  │        I64         │
 ├────────┼───────┼────────────────────┤
 │ GOOG   │ 280.0 │ 200                │
 │ MSFT   │ 420.0 │ 50                 │
@@ -128,7 +128,7 @@ Group by a column and compute aggregates with `by:`:
 ```text
 ┌────────┬───────────┬────────────────┐
 │ Symbol │ total_qty │   avg_price    │
-│  sym   │    i64    │      f64       │
+│  SYM   │    I64    │      F64       │
 ├────────┼───────────┼────────────────┤
 │ AAPL   │ 400       │ 152.75         │
 │ GOOG   │ 350       │ 277.75         │
@@ -150,10 +150,10 @@ Use `ser` to serialize any Rayforce object to a compact binary format (a U8 byte
 ```
 
 ```text
-197
+190
 ```
 
-The entire table is encoded in 197 bytes. Deserialize with `de`:
+The entire table is encoded in 190 bytes. Deserialize with `de`:
 
 ```lisp
 (set restored (de bytes))
@@ -163,7 +163,7 @@ restored
 ```text
 ┌────────┬───────┬────────────────────┐
 │ Symbol │ Price │        Qty         │
-│  sym   │  f64  │        i64         │
+│  SYM   │  F64  │        I64         │
 ├────────┼───────┼────────────────────┤
 │ AAPL   │ 150.5 │ 100                │
 │ GOOG   │ 280.0 │ 200                │
@@ -197,7 +197,7 @@ Save and load a table:
 ```text
 ┌────────┬───────┬────────────────────┐
 │ Symbol │ Price │        Qty         │
-│  sym   │  f64  │        i64         │
+│  SYM   │  F64  │        I64         │
 ├────────┼───────┼────────────────────┤
 │ AAPL   │ 150.5 │ 100                │
 │ GOOG   │ 280.0 │ 200                │
@@ -228,7 +228,7 @@ loaded
 ```text
 ┌────────┬───────┬────────────────────┐
 │ Symbol │ Price │        Qty         │
-│  sym   │  f64  │        i64         │
+│  SYM   │  F64  │        I64         │
 ├────────┼───────┼────────────────────┤
 │ AAPL   │ 150.5 │ 100                │
 │ GOOG   │ 280.0 │ 200                │
@@ -282,7 +282,7 @@ Verify by reading it back:
 ```text
 ┌────────┬───────┬────────────────────┐
 │ Symbol │ Price │        Qty         │
-│  sym   │  f64  │        i64         │
+│  SYM   │  F64  │        I64         │
 ├────────┼───────┼────────────────────┤
 │ GOOG   │ 280.0 │ 200                │
 │ MSFT   │ 420.0 │ 50                 │
@@ -332,7 +332,7 @@ End-to-end workflow: create data, save as CSV, reload, filter, serialize, deseri
 ```text
 ┌────────┬───────┬────────────────────┐
 │ Symbol │ Price │        Qty         │
-│  sym   │  f64  │        i64         │
+│  SYM   │  F64  │        I64         │
 ├────────┼───────┼────────────────────┤
 │ GOOG   │ 280.0 │ 200                │
 │ MSFT   │ 420.0 │ 50                 │

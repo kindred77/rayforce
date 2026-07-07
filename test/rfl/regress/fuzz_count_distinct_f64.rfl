@@ -1,0 +1,17 @@
+;; Regression: (count (distinct v)) fuses to OP_COUNT_DISTINCT, whose small-
+;; input kernel (cd_seq_count) hashed with the golden-ratio multiplier but
+;; then masked the LOW bits of the product.  For integer-valued doubles the
+;; IEEE-754 bit patterns are large power-of-two multiples (low bits zero), so
+;; every value landed in one bucket → O(n^2) probing (a query-reachable DoS,
+;; found by the eval fuzz target timing out on `count distinct` of til 65535
+;; cast to F64).  Fixed to take the HIGH bits (Fibonacci hash).  These assert
+;; the counts are exact — a clustered/broken hash would miscount.
+(count (distinct (as (quote F64) [1 1 2 2 3 3 3]))) -- 3
+(count (distinct (as (quote F64) (til 1000)))) -- 1000
+(count (distinct (as (quote F64) (til 40000)))) -- 40000
+
+;; Duplicated integer-valued doubles collapse correctly.
+(count (distinct (as (quote F64) (% (til 5000) 100)))) -- 100
+
+;; Integer count(distinct) still correct (unchanged path).
+(count (distinct (til 40000))) -- 40000

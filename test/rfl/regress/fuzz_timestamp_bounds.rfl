@@ -1,0 +1,21 @@
+;; Regression: timestamp literal parsing must bounds-check its time fields
+;; and reject out-of-range years.  Found by the parser fuzz target:
+;;   - a truncated timestamp "2025.03.04D15:41:" over-read the source buffer
+;;     because the minute/second field reads were not digit/bounds-checked;
+;;   - a far-future year overflowed (days * nanoseconds-per-day) in int64.
+;; Error assertions match the error CODE ("parse"), per the harness.
+
+;; Truncated timestamp — no seconds field.
+2025.03.04D15:41: !- parse
+
+;; Out-of-range time components.
+2024.01.01D25:00:00.0 !- parse
+2024.01.01D12:60:00.0 !- parse
+2024.01.01D12:00:60.0 !- parse
+
+;; Year outside the representable nanosecond-timestamp window.
+9999.01.01D00:00:00.0 !- parse
+
+;; Valid timestamps still parse.
+2024.01.01D12:00:00.0 -- 2024.01.01D12:00:00.000000000
+2024.01.01D00:00:00.5 -- 2024.01.01D00:00:00.500000000

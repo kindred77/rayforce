@@ -489,14 +489,29 @@ static test_result_t test_swap_path_env(void) {
 }
 
 static test_result_t test_swap_path_default(void) {
-    /* Manage runtime explicitly: with no env set, the default "./" must
-     * apply.  This test owns its own heap lifecycle (entries registered
-     * with NULL setup/teardown). */
+    /* Manage runtime explicitly: with neither RAY_HEAP_SWAP nor TMPDIR set,
+     * the default "/tmp/" must apply (not the working directory).  This test
+     * owns its own heap lifecycle (entries registered with NULL setup/
+     * teardown). */
     unsetenv("RAY_HEAP_SWAP");
+    unsetenv("TMPDIR");
     ray_heap_init();
     extern RAY_TLS ray_heap_t* ray_tl_heap;
     TEST_ASSERT_NOT_NULL(ray_tl_heap);
-    TEST_ASSERT_EQ_I(strcmp(ray_tl_heap->swap_path, "./"), 0);
+    TEST_ASSERT_EQ_I(strcmp(ray_tl_heap->swap_path, "/tmp/"), 0);
+    ray_heap_destroy();
+    PASS();
+}
+
+static test_result_t test_swap_path_tmpdir(void) {
+    /* With RAY_HEAP_SWAP unset, TMPDIR is the fallback before /tmp. */
+    unsetenv("RAY_HEAP_SWAP");
+    setenv("TMPDIR", "/tmp/rayforce_tmpdir_test", 1);
+    ray_heap_init();
+    extern RAY_TLS ray_heap_t* ray_tl_heap;
+    TEST_ASSERT_NOT_NULL(ray_tl_heap);
+    TEST_ASSERT_EQ_I(strcmp(ray_tl_heap->swap_path, "/tmp/rayforce_tmpdir_test/"), 0);
+    unsetenv("TMPDIR");
     ray_heap_destroy();
     PASS();
 }
@@ -585,6 +600,7 @@ const test_entry_t buddy_entries[] = {
     { "buddy/pending_merge", test_heap_pending_merge, buddy_setup, buddy_teardown },
     { "buddy/swap_path_env", test_swap_path_env, buddy_setup, buddy_teardown },
     { "buddy/swap_path_default", test_swap_path_default, NULL, NULL },
+    { "buddy/swap_path_tmpdir", test_swap_path_tmpdir, NULL, NULL },
     { "buddy/warm_first_free", test_warm_first_local_free, buddy_setup, buddy_teardown },
     { NULL, NULL, NULL, NULL },
 };

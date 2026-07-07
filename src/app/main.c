@@ -26,6 +26,8 @@
 #include "core/ipc.h"
 #include "core/pool.h"
 #include "core/profile.h"
+#include "core/qlog.h"
+#include "core/crash.h"
 #include "app/repl.h"
 #include "core/runtime.h"
 #include "store/journal.h"
@@ -40,6 +42,10 @@
 #include <unistd.h>
 
 int main(int argc, char** argv) {
+    /* Install the fatal-signal handler first: a crash during startup
+     * should still produce a symbolized backtrace.  Handles the fault
+     * signals only; term.c owns the graceful-shutdown set. */
+    ray_crash_install();
     ray_expr_stats_init();
     ray_idx_stats_init();
     ray_runtime_t* rt = ray_runtime_create(argc, argv);
@@ -51,6 +57,7 @@ int main(int argc, char** argv) {
     uint16_t port = 0;
     int n_cores = -1;      /* -1 = leave pool at lazy ncpu-1 default */
     int timeit_init = 0;   /* -t N: enable profiler at startup */
+    int qlog_init = 0;     /* -Q N: enable query-statistics logging at startup */
     const char* auth_pw = NULL;
     bool auth_restricted = false;
     const char* log_base = NULL;
@@ -61,6 +68,7 @@ int main(int argc, char** argv) {
      *   -p PORT          IPC listen port
      *   -c N             worker-pool size (0 = auto: ncpu - 1)
      *   -t N             enable timeit at startup (N != 0 turns on)
+     *   -Q N             enable query-statistics logging (N != 0 turns on)
      *   -i               interactive
      * Plus rayforce-specific:
      *   -u PW / -U PW    auth password (plain / restricted)
@@ -79,6 +87,10 @@ int main(int argc, char** argv) {
         else if ((strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--timeit") == 0) && i + 1 < argc) {
             int v = atoi(argv[++i]);
             timeit_init = (v != 0);
+        }
+        else if ((strcmp(argv[i], "-Q") == 0 || strcmp(argv[i], "--querylog") == 0) && i + 1 < argc) {
+            int v = atoi(argv[++i]);
+            qlog_init = (v != 0);
         }
         else if ((strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0) && i + 1 < argc) {
             file = argv[++i];
@@ -152,6 +164,10 @@ int main(int argc, char** argv) {
      * g_ray_profile.active into repl->timeit on create. */
     if (timeit_init)
         g_ray_profile.active = true;
+
+    /* -Q at startup arms the ambient query-statistics ring (.sys.querylog). */
+    if (qlog_init)
+        ray_qlog_set_enabled(true);
 
     ray_poll_t* poll = ray_poll_create();
     /* Publish the main poll into the runtime so runtime-level builtins

@@ -55,7 +55,12 @@ ray_vec_is_null(vec, 3);           // returns true
 ray_vec_is_null(vec, 0);           // returns false
 ```
 
-The bitmap is stored inline in the first 16 bytes of the `ray_t` header for vectors with up to 128 elements. Larger vectors use an external bitmap allocation (flagged with `RAY_ATTR_NULLMAP_EXT`). The `RAY_ATTR_HAS_NULLS` flag on the vector indicates whether any nulls exist at all — when clear, the bitmap is never checked.
+Null state is not a separate bitmap: it is encoded in-band as a
+type-correct reserved sentinel in the payload itself — `INT64_MIN` for
+`i64`, `NaN` for `f64`, `INT32_MIN` for `i32`/`date`/`time`, and so on
+(see `src/vec/vec.c`). The `RAY_ATTR_HAS_NULLS` flag on the vector is a
+fast "may contain nulls" hint — when it is clear, null-aware code paths
+are skipped entirely.
 
 ### COW Semantics
 
@@ -197,7 +202,7 @@ Dictionaries are used extensively in Rayfall for passing named arguments to quer
 
 ```lisp
 ; The select argument is a dictionary
-ray> (select {from:t where: (> x 1) cols: {x:x x2: (* x x)}})
+ray> (select {from:t where: (> x 1) x:x x2: (* x x)})
 ```
 
 ## Selection Bitmaps (RAY_SEL)

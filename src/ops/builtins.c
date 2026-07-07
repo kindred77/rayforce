@@ -27,6 +27,7 @@
 #include "lang/eval.h"
 #include "lang/internal.h"
 #include "lang/env.h"
+#include "core/platform.h"   /* ray_vm_map_fd_ro / ray_vm_unmap_file (tracked) */
 #include "vec/vec.h"
 #include "lang/nfo.h"
 #include "lang/parse.h"
@@ -474,10 +475,17 @@ ray_t* ray_timeit_fn(ray_t** args, int64_t n) {
 
 /* (exit code) — exit the process */
 ray_t* ray_exit_fn(ray_t* arg) {
+#ifdef RAY_FUZZING
+    /* A fuzz driver evaluates untrusted input in-process; letting it call
+     * exit() would tear the fuzzer down mid-run.  Surface it as an error. */
+    (void)arg;
+    return ray_error("restricted", "exit disabled under fuzzing");
+#else
     int code = 0;
     if (arg && is_numeric(arg)) code = (int)as_i64(arg);
     exit(code);
     return NULL; /* unreachable */
+#endif
 }
 
 /* (read-csv path) — read CSV file, return RAY_TABLE */
@@ -762,6 +770,11 @@ ray_t* ray_read_csv_parted_fn(ray_t** args, int64_t n) {
 
 /* (write-csv table path) — write table to CSV file */
 ray_t* ray_write_csv_fn(ray_t** args, int64_t n) {
+#ifdef RAY_FUZZING
+    /* No filesystem writes to attacker-controlled paths under fuzzing. */
+    (void)args; (void)n;
+    return ray_error("restricted", "write-csv disabled under fuzzing");
+#endif
     if (n < 2) return ray_error("arity", "write-csv: expects 2 arguments, got %lld", (long long)n);
     ray_t* tbl = args[0];
     ray_t* path_obj = args[1];
@@ -1883,15 +1896,15 @@ ray_t* ray_load_file_fn(ray_t* path_obj) {
     if (fstat(fd, &st) < 0 || st.st_size < 0) { close(fd); return ray_error("io", NULL); }
     size_t sz = (size_t)st.st_size;
     if (sz == 0) { close(fd); return ray_i64(0); }
-    char* map = (char*)mmap(NULL, sz, PROT_READ, MAP_PRIVATE, fd, 0);
+    char* map = (char*)ray_vm_map_fd_ro(fd, sz);
     close(fd);
-    if (map == MAP_FAILED) return ray_error("io", NULL);
+    if (!map) return ray_error("io", NULL);
     /* Copy to NUL-terminated buffer -- mmap region may not have a trailing NUL */
     char* buf = (char*)ray_alloc_raw(sz + 1);
-    if (!buf) { munmap(map, sz); return ray_error("oom", NULL); }
+    if (!buf) { ray_vm_unmap_file(map, sz); return ray_error("oom", NULL); }
     memcpy(buf, map, sz);
     buf[sz] = '\0';
-    munmap(map, sz);
+    ray_vm_unmap_file(map, sz);
 
     ray_t* nfo = ray_nfo_create(path, path_len, buf, sz);
     ray_t* parsed = ray_parse_with_nfo(buf, nfo);
@@ -2090,16 +2103,30 @@ ray_t* ray_nil_fn(ray_t* x) {
 ray_t* ray_where_fn(ray_t* x) {
     if (!ray_is_vec(x) || x->type != RAY_BOOL)
         return ray_error("type", "where: argument must be a b8 vector, got %s", ray_type_name(x->type));
-    bool* data = (bool*)ray_data(x);
+    const uint8_t* data = (const uint8_t*)ray_data(x);
     int64_t n = x->len;
-    /* Count trues */
+    /* Count pass: `cnt += byte != 0` vectorizes; the branchy form costs
+     * a mispredict-prone compare per element. */
     int64_t cnt = 0;
-    for (int64_t i = 0; i < n; i++) if (data[i]) cnt++;
+    for (int64_t i = 0; i < n; i++) cnt += (data[i] != 0);
     ray_t* result = ray_vec_new(RAY_I64, cnt);
     if (RAY_IS_ERR(result)) return result;
     int64_t* out = (int64_t*)ray_data(result);
     int64_t j = 0;
-    for (int64_t i = 0; i < n; i++) if (data[i]) out[j++] = i;
+    /* Emit pass: skip zero 8-byte lanes word-at-a-time (sparse masks —
+     * the common WHERE shape — run at memory speed), fall to per-byte
+     * only inside a live word. */
+    int64_t i = 0;
+    int64_t n8 = n & ~7LL;
+    for (; i < n8; i += 8) {
+        uint64_t w;
+        memcpy(&w, data + i, 8);
+        if (!w) continue;
+        for (int64_t k = 0; k < 8; k++)
+            if (data[i + k]) out[j++] = i + k;
+    }
+    for (; i < n; i++)
+        if (data[i]) out[j++] = i;
     result->len = cnt;
     return result;
 }

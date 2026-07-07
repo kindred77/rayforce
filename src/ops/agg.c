@@ -721,7 +721,7 @@ ray_t* ray_var_pop_fn(ray_t* x)    { return var_stddev_core(x, 0, 0); }
  * coerces narrow ints / temporal types to F64 via as_f64 so the
  * single fp accumulator handles every numeric column type.  Nulls in
  * either vector skip the row from BOTH sums (pairwise complete-case
- * deletion, matching polars / pandas pearson_corr default).
+ * deletion, the conventional pearson-correlation default).
  *
  * Per-group usage: routed through the eval-level scatter — the
  * planner's expr_refs_row_column sees x and y as column refs, the

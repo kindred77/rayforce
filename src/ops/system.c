@@ -28,6 +28,8 @@
 #include "ops/ops.h"    /* ray_is_lazy, ray_lazy_materialize */
 #include "mem/heap.h"
 #include "mem/sys.h"
+#include "core/profile.h"   /* g_ray_profile — (.sys.prof) */
+#include "core/qlog.h"      /* g_qlog — (.sys.querylog) */
 #include "store/serde.h"
 #include "store/splay.h"
 #include "store/part.h"
@@ -482,11 +484,18 @@ ray_t* ray_gc_fn(ray_t** args, int64_t n) { (void)args; (void)n; return ray_i64(
 
 /* (system cmd) -- run shell command, return exit code */
 ray_t* ray_system_fn(ray_t* x) {
+#ifdef RAY_FUZZING
+    /* Shell escape — disabled under fuzzing so untrusted input can't run
+     * arbitrary commands in the fuzzer process. */
+    (void)x;
+    return ray_error("restricted", "shell disabled under fuzzing");
+#else
     if (x->type != -RAY_STR) return ray_error("type", "system expects a string");
     const char* cmd = ray_str_ptr(x);
     if (!cmd) return ray_error("domain", ".sys.exec: empty or invalid command string");
     int rc = system(cmd);
     return make_i64(rc);
+#endif
 }
 
 /* (getenv name) -- get environment variable */
@@ -711,17 +720,20 @@ ray_t* ray_memstat_fn(ray_t** args, int64_t n) {
     ray_mem_stats_t st;
     ray_mem_stats(&st);
 
-    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 5);
+    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 8);
     if (RAY_IS_ERR(keys)) return keys;
-    ray_t* vals = ray_list_new(5);
+    ray_t* vals = ray_list_new(8);
     if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
 
     struct { const char* name; size_t nlen; int64_t v; } rows[] = {
         { "alloc-count",     11, (int64_t)st.alloc_count     },
         { "bytes-allocated", 15, (int64_t)st.bytes_allocated },
+        { "direct-bytes",    12, (int64_t)st.direct_bytes    },
         { "peak-bytes",      10, (int64_t)st.peak_bytes      },
         { "slab-hits",        9, (int64_t)st.slab_hits       },
         { "sys-current",     11, (int64_t)st.sys_current     },
+        { "sys-mapped",      10, (int64_t)st.sys_mapped      },
+        { "sys-mapped-peak", 15, (int64_t)st.sys_mapped_peak },
     };
     for (size_t i = 0; i < sizeof(rows)/sizeof(rows[0]); i++) {
         int64_t s = ray_sym_intern(rows[i].name, rows[i].nlen);
@@ -731,6 +743,194 @@ ray_t* ray_memstat_fn(ray_t** args, int64_t n) {
     }
 
     return ray_dict_new(keys, vals);
+}
+
+/* (.sys.prof) — materialize the last profiled query's span log as a table.
+ *
+ * One row per completed operator span (START/END pair) and per phase tick
+ * (parse / eval / materialize / optimizer passes), in completion order.
+ * Columns:
+ *   operator       the span label (symbol)
+ *   depth          nesting depth (0 = top level)
+ *   cumulative-ms  wall-clock milliseconds, including children
+ *   exclusive-ms   self time — this span minus its children
+ *   percent        share of total query time (exclusive-based, sums to ~100)
+ *   rows           result element/row count (operator spans)
+ *   allocated-kib  net process bytes allocated across the span, KiB
+ *   workers        worker threads that ran a task for this span
+ *   busy-ms        summed worker busy time, ms (parallelism)
+ *   parallelism    effective parallelism = busy time / wall time
+ *
+ * Because it returns an ordinary table, an IPC client gets the profile
+ * with no protocol work.  Empty (0 rows) when the profiler is inactive or
+ * no query has run.  Profiling is toggled with `:t` / the `-t` flag.
+ */
+ray_t* ray_prof_fn(ray_t** args, int64_t n) {
+    (void)args; (void)n;
+
+    /* Read the snapshot of the last completed query — NOT the in-flight
+     * buffer, which currently holds this `(.sys.prof)` call's own spans.
+     * The snapshot is taken at each eval boundary (ray_profile_snapshot),
+     * so it holds the fully-materialized query that ran just before. */
+    const ray_profile_t* p = &g_ray_profile_last;
+    int32_t ns = p->n;
+
+    /* Count output rows: one per END and per TICK span. */
+    int64_t nrows = 0;
+    for (int32_t i = 0; i < ns; i++)
+        if (p->spans[i].type != RAY_PROF_SPAN_START) nrows++;
+
+    ray_t* c_op    = ray_vec_new(RAY_SYM, nrows);
+    ray_t* c_depth = ray_vec_new(RAY_I64, nrows);
+    ray_t* c_dur   = ray_vec_new(RAY_F64, nrows);
+    ray_t* c_self  = ray_vec_new(RAY_F64, nrows);
+    ray_t* c_pct   = ray_vec_new(RAY_F64, nrows);
+    ray_t* c_rows  = ray_vec_new(RAY_I64, nrows);
+    ray_t* c_alloc = ray_vec_new(RAY_F64, nrows);
+    ray_t* c_wrk   = ray_vec_new(RAY_I64, nrows);
+    ray_t* c_busy  = ray_vec_new(RAY_F64, nrows);
+    ray_t* c_par   = ray_vec_new(RAY_F64, nrows);
+    ray_t* cols[] = { c_op, c_depth, c_dur, c_self, c_pct,
+                      c_rows, c_alloc, c_wrk, c_busy, c_par };
+    for (size_t i = 0; i < sizeof(cols)/sizeof(cols[0]); i++)
+        if (!cols[i] || RAY_IS_ERR(cols[i])) {
+            for (size_t j = 0; j < sizeof(cols)/sizeof(cols[0]); j++)
+                if (cols[j] && !RAY_IS_ERR(cols[j])) ray_release(cols[j]);
+            return ray_error("oom", "sys.prof: column alloc");
+        }
+
+    int64_t* op_ids  = (int64_t*)ray_data(c_op);
+    int64_t* depths  = (int64_t*)ray_data(c_depth);
+    double*  durs    = (double*)ray_data(c_dur);
+    double*  selfs   = (double*)ray_data(c_self);
+    double*  pcts    = (double*)ray_data(c_pct);
+    int64_t* rows    = (int64_t*)ray_data(c_rows);
+    double*  allocs  = (double*)ray_data(c_alloc);
+    int64_t* wrks    = (int64_t*)ray_data(c_wrk);
+    double*  busys   = (double*)ray_data(c_busy);
+    double*  pars    = (double*)ray_data(c_par);
+
+    /* Total wall time = the whole profiled window (first START → last END).
+     * Used for the `pct` share-of-total column, like EXPLAIN ANALYZE. */
+    int64_t total_ns = ns > 0 ? (p->spans[ns-1].ts - p->spans[0].ts) : 0;
+
+    /* Walk the flat span log, pairing START/END via a depth stack.
+     * child_ns[d] accumulates the wall time of the direct children of the
+     * span currently open at depth d, so each span's EXCLUSIVE (self) time
+     * is its own wall minus that sum — standard per-operator
+     * exclusive timing (cumulative is derivable by summing the subtree). */
+    int32_t stack[256];
+    int64_t child_ns[256] = {0};
+    int32_t sp = 0;
+    int64_t prev_ts = ns > 0 ? p->spans[0].ts : 0;
+    int64_t r = 0;
+    for (int32_t i = 0; i < ns; i++) {
+        const ray_prof_span_t* s = &p->spans[i];
+        if (s->type == RAY_PROF_SPAN_START) {
+            if (sp < 256) { stack[sp] = i; child_ns[sp] = 0; }
+            sp++;
+        } else if (s->type == RAY_PROF_SPAN_END) {
+            if (sp > 0) sp--;
+            const ray_prof_span_t* st = (sp < 256 && sp >= 0) ? &p->spans[stack[sp]] : s;
+            int64_t wall = s->ts - st->ts;
+            int64_t self = (sp < 256 && sp >= 0) ? wall - child_ns[sp] : wall;
+            if (self < 0) self = 0;
+            /* Fold this span's wall into its parent's child accumulator. */
+            if (sp - 1 >= 0 && sp - 1 < 256) child_ns[sp - 1] += wall;
+            int64_t busy = (int64_t)(s->qs_busy_ns - st->qs_busy_ns);
+            const char* nm = s->msg ? s->msg : "?";
+            op_ids[r] = ray_sym_intern(nm, strlen(nm));
+            depths[r] = sp;
+            durs[r]   = (double)wall / 1e6;
+            selfs[r]  = (double)self / 1e6;
+            /* Percent is EXCLUSIVE-based so the column partitions the query
+             * and sums to ~100% — a direct "where did time go" ranking. */
+            pcts[r]   = total_ns > 0 ? (double)self * 100.0 / (double)total_ns : 0.0;
+            rows[r]   = s->rows_out;
+            allocs[r] = (double)(s->sys_cur - st->sys_cur) / 1024.0;
+            wrks[r]   = (int64_t)s->qs_workers;
+            busys[r]  = (double)busy / 1e6;
+            pars[r]   = wall > 0 ? (double)busy / (double)wall : 0.0;
+            r++;
+        } else { /* TICK: a point phase (parse / eval / optimizer pass). */
+            int64_t wall = s->ts - prev_ts;
+            /* A tick is a leaf phase — count it against its parent's self. */
+            if (sp - 1 >= 0 && sp - 1 < 256) child_ns[sp - 1] += wall;
+            const char* nm = s->msg ? s->msg : "?";
+            op_ids[r] = ray_sym_intern(nm, strlen(nm));
+            depths[r] = sp;
+            durs[r]   = (double)wall / 1e6;
+            selfs[r]  = (double)wall / 1e6;
+            pcts[r]   = total_ns > 0 ? (double)wall * 100.0 / (double)total_ns : 0.0;
+            rows[r]   = 0; allocs[r] = 0.0;
+            wrks[r]   = 0; busys[r] = 0.0; pars[r] = 0.0;
+            r++;
+        }
+        prev_ts = s->ts;
+    }
+
+    /* ray_vec_new allocates capacity but leaves len at 0; publish the
+     * filled row count on every column. */
+    for (size_t i = 0; i < sizeof(cols)/sizeof(cols[0]); i++)
+        cols[i]->len = r;
+
+    /* Assemble the table. */
+    static const char* names[] = { "operator","depth","cumulative-ms","exclusive-ms",
+                                   "percent","rows","allocated-kib",
+                                   "workers","busy-ms","parallelism" };
+    ray_t* tbl = ray_table_new(10);
+    if (!tbl || RAY_IS_ERR(tbl)) {
+        for (size_t i = 0; i < sizeof(cols)/sizeof(cols[0]); i++) ray_release(cols[i]);
+        return tbl ? tbl : ray_error("oom", "sys.prof: table");
+    }
+    for (size_t i = 0; i < sizeof(cols)/sizeof(cols[0]); i++) {
+        int64_t nid = ray_sym_intern(names[i], strlen(names[i]));
+        tbl = ray_table_add_col(tbl, nid, cols[i]);
+        ray_release(cols[i]);
+        if (RAY_IS_ERR(tbl)) return tbl;
+    }
+    return tbl;
+}
+
+/* (.sys.querylog) — the in-memory query-statistics ring as a table.
+ *
+ * One row per completed query (oldest first), capped at the ring capacity.
+ * Ambient server-side query-log statistics (a system query_log table): read
+ * back with ordinary queries, no extra protocol.  Each call materializes a
+ * fresh snapshot, so anything a caller does to the returned table (upsert,
+ * delete) touches the copy, never the ring.  Empty until logging is enabled
+ * (`-Q` flag or `(.sys.querylog.enable 1)`).  Columns:
+ *
+ *   time         wall-clock time the query finished (timestamp)
+ *   duration-ms  total wall time
+ *   result-rows  rows in the result (scalar => 1)
+ *   memory-kib   net process allocation across the query, KiB
+ *   workers      worker threads that ran a task
+ *   parallelism  worker busy time / wall time
+ *   status       `ok`, or the error kind on failure
+ *   query        source text (truncated)
+ */
+ray_t* ray_qlog_fn(ray_t** args, int64_t n) {
+    (void)args;
+    if (n != 0) return ray_error("domain", ".sys.querylog takes no arguments");
+    return ray_qlog_table();
+}
+
+/* (.sys.querylog.enable [flag]) — toggle query-statistics logging.  No arg
+ * flips the current state; 0 disables; non-zero enables.  Returns the new
+ * state as i64 (0/1).  Restricted: it changes server-wide behaviour. */
+ray_t* ray_qlog_enable_fn(ray_t** args, int64_t n) {
+    bool on;
+    if (n == 0) {
+        on = !ray_qlog_enabled();
+    } else if (n == 1) {
+        if (args[0]->type != -RAY_I64) return ray_error("type", "flag must be i64");
+        on = args[0]->i64 != 0;
+    } else {
+        return ray_error("domain", ".sys.querylog.enable takes 0 or 1 arguments");
+    }
+    ray_qlog_set_enabled(on);
+    return make_i64(on ? 1 : 0);
 }
 
 ray_t* ray_sysinfo_fn(ray_t** args, int64_t n) {
@@ -751,11 +951,9 @@ ray_t* ray_sysinfo_fn(ray_t** args, int64_t n) {
     ray_t* v2 = make_i64(sysconf(_SC_PAGESIZE));
     vals = ray_list_append(vals, v2); ray_release(v2);
 
-    long pages = sysconf(_SC_PHYS_PAGES);
-    long psize = sysconf(_SC_PAGESIZE);
     int64_t s3 = ray_sym_intern("total-mem", 9);
     keys = ray_vec_append(keys, &s3);
-    ray_t* v3 = make_i64((int64_t)pages * (int64_t)psize);
+    ray_t* v3 = make_i64(ray_sys_total_ram());
     vals = ray_list_append(vals, v3); ray_release(v3);
 #else
     int64_t s1 = ray_sym_intern("cores", 5);
@@ -775,7 +973,7 @@ ray_t* ray_build_sys_args(int argc, char** argv) {
     const char* file = "";
     const char* log  = "";
     int64_t port = 0, cores = 0;
-    bool timeit = false, interactive = false;
+    bool timeit = false, interactive = false, querylog = false;
     int user_start = -1;
 
     for (int i = 1; i < argc; i++) {
@@ -789,6 +987,8 @@ ray_t* ray_build_sys_args(int argc, char** argv) {
         }
         else if ((strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--timeit") == 0) && i + 1 < argc)
             timeit = (atoll(argv[++i]) != 0);
+        else if ((strcmp(argv[i], "-Q") == 0 || strcmp(argv[i], "--querylog") == 0) && i + 1 < argc)
+            querylog = (atoll(argv[++i]) != 0);
         else if ((strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0) && i + 1 < argc)
             file = argv[++i];
         else if (strcmp(argv[i], "-u") == 0 && i + 1 < argc) i++;   /* skip secret */
@@ -828,9 +1028,9 @@ ray_t* ray_build_sys_args(int argc, char** argv) {
         }
     }
 
-    /* top-level dict: 7 entries (file, port, cores, timeit, interactive, log, user) */
-    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 7);
-    ray_t* vals = ray_list_new(7);
+    /* top-level dict: 8 entries (file, port, cores, timeit, querylog, interactive, log, user) */
+    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 8);
+    ray_t* vals = ray_list_new(8);
 
     int64_t k;
     ray_t* v;
@@ -842,6 +1042,8 @@ ray_t* ray_build_sys_args(int argc, char** argv) {
     v = ray_i64(cores);                   vals = ray_list_append(vals, v); ray_release(v);
     k = ray_sym_intern("timeit", 6);      keys = ray_vec_append(keys, &k);
     v = ray_bool(timeit);                 vals = ray_list_append(vals, v); ray_release(v);
+    k = ray_sym_intern("querylog", 8);    keys = ray_vec_append(keys, &k);
+    v = ray_bool(querylog);               vals = ray_list_append(vals, v); ray_release(v);
     k = ray_sym_intern("interactive", 11);keys = ray_vec_append(keys, &k);
     v = ray_bool(interactive);            vals = ray_list_append(vals, v); ray_release(v);
     k = ray_sym_intern("log", 3);         keys = ray_vec_append(keys, &k);
@@ -869,8 +1071,14 @@ ray_t* ray_sys_args_fn(ray_t** args, int64_t n) {
  * The optional second argument bounds the TCP connect and handshake in
  * milliseconds; omitted leaves the default budget. */
 ray_t* ray_hopen_fn(ray_t** args, int64_t n) {
+#ifdef RAY_FUZZING
+    /* No outbound connections under fuzzing. */
+    (void)args; (void)n;
+    return ray_error("restricted", "ipc.open disabled under fuzzing");
+#else
     if (n < 1 || n > 2)
         return ray_error("rank", ".ipc.open expects 1 or 2 arguments: \"host:port[:user:password]\" [timeout-ms]");
+#endif
 
     ray_t* x = args[0];
     if (!ray_is_atom(x) || x->type != -RAY_STR)

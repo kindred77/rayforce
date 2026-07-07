@@ -1,5 +1,4 @@
 /* Join dup-fallback perf gate.
- * Build: make bench-join-dup
  *
  * The radix per-partition open-addressing build trips RADIX_DUP_RUN_MAX (512)
  * when a linear-probe run grows too long, sets the `pathological` flag, and

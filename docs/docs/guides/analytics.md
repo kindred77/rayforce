@@ -15,7 +15,7 @@
 ```text
 ┌────────────┬─────────┬──────────────┐
 │    Date    │ Product │    Amount    │
-│    date    │   sym   │     i64      │
+│    DATE    │   SYM   │     I64      │
 ├────────────┼─────────┼──────────────┤
 │ 2024.01.01 │ Widget  │ 100          │
 │ 2024.01.01 │ Gadget  │ 200          │
@@ -36,7 +36,7 @@
 ```text
 ┌────────────┬────────────────────────┐
 │    Date    │         total          │
-│    date    │          i64           │
+│    DATE    │          I64           │
 ├────────────┼────────────────────────┤
 │ 2024.01.01 │ 300                    │
 │ 2024.01.02 │ 450                    │
@@ -61,7 +61,7 @@ Date arithmetic uses the format `YYYY.MM.DD`. Adding an integer vector to a date
 ```text
 ┌─────────┬───────────────────────────┐
 │  Name   │          Revenue          │
-│   sym   │            i64            │
+│   SYM   │            I64            │
 ├─────────┼───────────────────────────┤
 │ Alpha   │ 500                       │
 │ Beta    │ 1200                      │
@@ -84,7 +84,7 @@ Date arithmetic uses the format `YYYY.MM.DD`. Adding an integer vector to a date
 ```text
 ┌─────────┬───────────────────────────┐
 │  Name   │          Revenue          │
-│   sym   │            i64            │
+│   SYM   │            I64            │
 ├─────────┼───────────────────────────┤
 │ Beta    │ 1200                      │
 │ Epsilon │ 950                       │
@@ -134,7 +134,7 @@ The `scan` function takes a binary function and a vector, returning a vector of 
 ```text
 ┌────────┬─────────┬──────────────────┐
 │ Region │ Product │      Sales       │
-│  sym   │   sym   │       i64        │
+│  SYM   │   SYM   │       I64        │
 ├────────┼─────────┼──────────────────┤
 │ East   │ Widget  │ 100              │
 │ East   │ Gadget  │ 200              │
@@ -155,7 +155,7 @@ The `scan` function takes a binary function and a vector, returning a vector of 
 ```text
 ┌────────┬────────┬───────────────────┐
 │ Region │ Widget │      Gadget       │
-│  sym   │  i64   │        i64        │
+│  SYM   │  I64   │        I64        │
 ├────────┼────────┼───────────────────┤
 │ East   │ 220    │ 200               │
 │ West   │ 150    │ 480               │
@@ -191,7 +191,7 @@ The distinct values of the column key (`Product`) become the new column headers.
 ```text
 ┌──────┬──────────────┬───────┬─────┬─────┐
 │ Sym  │      Ts      │ Price │ Bid │ Ask │
-│ sym  │     time     │  i64  │ i64 │ i64 │
+│ SYM  │     TIME     │  I64  │ I64 │ I64 │
 ├──────┼──────────────┼───────┼─────┼─────┤
 │ AAPL │ 09:30:00.000 │ 150   │ 149 │ 151 │
 │ AAPL │ 09:31:00.000 │ 151   │ 150 │ 152 │
@@ -225,7 +225,7 @@ The key list `[Sym Ts]` specifies equality columns followed by the time column (
 ```text
 ┌──────┬──────────────┬───────┬───────┐
 │ Sym  │     Time     │ Price │ Size  │
-│ sym  │     time     │  f64  │  i64  │
+│ SYM  │     TIME     │  F64  │  I64  │
 ├──────┼──────────────┼───────┼───────┤
 │ AAPL │ 12:00:01.000 │ 89.17 │ 528   │
 │ AAPL │ 12:00:04.000 │ 70.5  │ 918   │
@@ -258,7 +258,7 @@ The `window-join` function matches rows from the right table within a time windo
 ```text
 ┌─────────┬───────┬───────────────────┐
 │  Name   │ Score │       Grade       │
-│   sym   │  i64  │        sym        │
+│   SYM   │  I64  │        SYM        │
 ├─────────┼───────┼───────────────────┤
 │ Alice   │ 95    │ A                 │
 │ Bob     │ 87    │ B                 │
@@ -319,10 +319,10 @@ Use `nil?` to check for null values:
 ```lisp
 (nil? 0Nl)            ; true
 (nil? 42)             ; false
-(map nil? (list 10 0Nl 30))  ; [false true false]
+(map nil? (list 10 0Nl 30))  ; (false true false)
 ```
 
-Null literals are type-suffixed: `0Nl` (i64), `0Nf` (f64), `0Ns` (sym), `0Nd` (date), `0Nt` (time), `0Np` (timestamp).
+Null literals are type-suffixed: `0Nl` (i64), `0Nf` (f64), `0Nd` (date), `0Nt` (time), `0Np` (timestamp).
 
 ## 10. Performance Tips { #performance-tips }
 
@@ -337,7 +337,7 @@ Null literals are type-suffixed: `0Nl` (i64), `0Nf` (f64), `0Ns` (sym), `0Nd` (d
         ```
 
         ```text
-        [1 4 9 16 25]
+        (1 4 9 16 25)
         ```
 
 ## Next Steps

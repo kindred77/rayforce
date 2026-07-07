@@ -202,6 +202,11 @@ ray_err_t ray_journal_replay(const char*           path,
     ray_jreplay_status_t status = RAY_JREPLAY_OK;
 
     for (;;) {
+        /* Cancellation checkpoint (per frame — no per-frame allocation live
+         * yet).  A clean abort: the log is intact and partially replayed, so
+         * this must NOT be treated as a truncatable BADTAIL. */
+        if (ray_interrupted()) { status = RAY_JREPLAY_CANCEL; break; }
+
         ray_ipc_header_t hdr;
         size_t r = read_full(f, &hdr, sizeof(hdr));
         if (r == 0) break;                          /* clean EOF */
@@ -209,6 +214,7 @@ ray_err_t ray_journal_replay(const char*           path,
         if (r != sizeof(hdr))                       { status = RAY_JREPLAY_BADTAIL; break; }
         if (hdr.prefix  != RAY_SERDE_PREFIX)        { status = RAY_JREPLAY_BADTAIL; break; }
         if (hdr.version != RAY_SERDE_WIRE_VERSION)  { status = RAY_JREPLAY_BADTAIL; break; }
+        if (hdr.endian  != RAY_SERDE_ENDIAN)        { status = RAY_JREPLAY_BADTAIL; break; }
         if (hdr.size <= 0 || hdr.size > 256LL*1024*1024)
                                                     { status = RAY_JREPLAY_BADTAIL; break; }
 
@@ -276,7 +282,8 @@ ray_err_t ray_journal_replay(const char*           path,
     if (out_eval_errors) *out_eval_errors = errs;
     if (out_status)      *out_status      = status;
 
-    if (status == RAY_JREPLAY_OK)  return RAY_OK;
+    if (status == RAY_JREPLAY_OK)     return RAY_OK;
+    if (status == RAY_JREPLAY_CANCEL) return RAY_ERR_CANCEL;
     if (status == RAY_JREPLAY_IO ||
         status == RAY_JREPLAY_OOM) return RAY_ERR_IO;
     return RAY_ERR_DOMAIN;
@@ -307,6 +314,7 @@ ray_err_t ray_journal_validate(const char* path,
         if (r != sizeof(hdr))                       break;
         if (hdr.prefix  != RAY_SERDE_PREFIX)        break;
         if (hdr.version != RAY_SERDE_WIRE_VERSION)  break;
+        if (hdr.endian  != RAY_SERDE_ENDIAN)        break;
         if (hdr.size <= 0 || hdr.size > 256LL*1024*1024) break;
 
         if (hdr.size > cap) {
@@ -466,6 +474,14 @@ ray_err_t ray_journal_recover(const char* base) {
                     (long long)chunks, log_path,
                     status == RAY_JREPLAY_OOM ? "out of memory" : "I/O failure");
             return RAY_ERR_IO;
+        }
+        case RAY_JREPLAY_CANCEL: {
+            /* Interrupted: the log is intact and partially applied.  Report a
+             * clean abort — must NOT advise truncation like BADTAIL. */
+            fprintf(stderr, "log: replay interrupted after %lld entries in %s "
+                    "(log intact, partially applied)\n",
+                    (long long)chunks, log_path);
+            return RAY_ERR_CANCEL;
         }
         }
     }

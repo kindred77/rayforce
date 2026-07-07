@@ -57,6 +57,17 @@ typedef struct {
     ray_prof_span_type_t type;
     const char*          msg;
     int64_t              ts;   /* nanoseconds (monotonic) */
+
+    /* Optional per-span payload, populated by the executor when profiling
+     * is active (0 otherwise).  Snapshots are recorded at both the START
+     * and END of a span; the consumer takes END-minus-START deltas.  These
+     * fields carry no cost when inactive — the span is simply not created. */
+    int64_t  sys_cur;     /* process bytes in use (ray_sys) at this instant */
+    int64_t  rows_out;    /* result element/row count (END spans)            */
+    uint64_t qs_rows;     /* cumulative qstats rows_done at this instant      */
+    uint64_t qs_busy_ns;  /* cumulative qstats worker busy-ns at this instant */
+    uint64_t qs_tasks;    /* cumulative qstats tasks_run at this instant      */
+    uint32_t qs_workers;  /* qstats workers that had run a task (END spans)   */
 } ray_prof_span_t;
 
 typedef struct {
@@ -65,8 +76,20 @@ typedef struct {
     ray_prof_span_t   spans[RAY_PROFILE_SPANS_MAX];
 } ray_profile_t;
 
-/* Single global instance */
+/* Single global instance (the in-flight query) plus a snapshot of the
+ * most recently completed profiled query.  Because query execution is
+ * lazy, `(.sys.prof)` typed after a query must read the snapshot, not the
+ * live buffer (which the next eval resets): the snapshot is taken at the
+ * start of each eval, preserving the query that just finished. */
 extern ray_profile_t g_ray_profile;
+extern ray_profile_t g_ray_profile_last;
+
+/* Preserve the just-completed query into the snapshot.  Cheap no-op when
+ * inactive.  Called at eval boundaries, before ray_profile_reset(). */
+static inline void ray_profile_snapshot(void) {
+    if (g_ray_profile.active && g_ray_profile.n > 0)
+        g_ray_profile_last = g_ray_profile;
+}
 
 static inline int64_t ray_profile_now_ns(void) {
 #if defined(RAY_OS_WINDOWS)
@@ -85,31 +108,34 @@ static inline void ray_profile_reset(void) {
     g_ray_profile.n = 0;
 }
 
-static inline void ray_profile_span_start(const char* name) {
-    if (!g_ray_profile.active) return;
-    if (g_ray_profile.n >= RAY_PROFILE_SPANS_MAX) return;
+/* Append a span and return it so the caller may fill the payload fields
+ * (via core/qstats.h and mem/sys.h, which profile.h must not include —
+ * qstats.h includes profile.h).  Returns NULL when inactive or the log is
+ * full, so callers that only need timing can ignore the result. */
+static inline ray_prof_span_t* ray_profile_span_start(const char* name) {
+    if (!g_ray_profile.active) return NULL;
+    if (g_ray_profile.n >= RAY_PROFILE_SPANS_MAX) return NULL;
     ray_prof_span_t* s = &g_ray_profile.spans[g_ray_profile.n++];
-    s->type = RAY_PROF_SPAN_START;
-    s->msg  = name;
-    s->ts   = ray_profile_now_ns();
+    *s = (ray_prof_span_t){ .type = RAY_PROF_SPAN_START, .msg = name,
+                            .ts = ray_profile_now_ns() };
+    return s;
 }
 
-static inline void ray_profile_span_end(const char* name) {
-    if (!g_ray_profile.active) return;
-    if (g_ray_profile.n >= RAY_PROFILE_SPANS_MAX) return;
+static inline ray_prof_span_t* ray_profile_span_end(const char* name) {
+    if (!g_ray_profile.active) return NULL;
+    if (g_ray_profile.n >= RAY_PROFILE_SPANS_MAX) return NULL;
     ray_prof_span_t* s = &g_ray_profile.spans[g_ray_profile.n++];
-    s->type = RAY_PROF_SPAN_END;
-    s->msg  = name;
-    s->ts   = ray_profile_now_ns();
+    *s = (ray_prof_span_t){ .type = RAY_PROF_SPAN_END, .msg = name,
+                            .ts = ray_profile_now_ns() };
+    return s;
 }
 
 static inline void ray_profile_tick(const char* msg) {
     if (!g_ray_profile.active) return;
     if (g_ray_profile.n >= RAY_PROFILE_SPANS_MAX) return;
     ray_prof_span_t* s = &g_ray_profile.spans[g_ray_profile.n++];
-    s->type = RAY_PROF_SPAN_TICK;
-    s->msg  = msg;
-    s->ts   = ray_profile_now_ns();
+    *s = (ray_prof_span_t){ .type = RAY_PROF_SPAN_TICK, .msg = msg,
+                            .ts = ray_profile_now_ns() };
 }
 
 #endif /* RAY_PROFILE_H */

@@ -110,6 +110,7 @@ typedef struct lftj_enum_ctx {
     int64_t         out_cap;
     ray_t*           buf_hdrs[LFTJ_MAX_VARS]; /* scratch headers for realloc */
     bool            oom;         /* set on allocation failure */
+    bool            cancelled;   /* set when enumeration is interrupted (Ctrl-C) */
 } lftj_enum_ctx_t;
 
 /* Build binding plan from relationship array.

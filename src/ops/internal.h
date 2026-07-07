@@ -730,7 +730,7 @@ typedef struct {
     ray_t**       vecs;
     uint8_t*     desc;
     uint8_t*     nulls_first;
-    uint8_t      n_sort;
+    uint32_t     n_sort;
 } sort_cmp_ctx_t;
 
 /* Radix pass context (shared across histogram + scatter phases) */
@@ -760,7 +760,7 @@ typedef struct {
     /* SYM rank mapping (NULL if not sym): */
     const uint32_t* enum_rank; /* intern_id → sort rank */
     /* Composite-key fields (n_keys > 1): */
-    uint8_t         n_keys;
+    uint8_t         n_keys; /* uint8: filled only under the <=16 radix gates (sort.c/window.c) */
     ray_t**          vecs;
     int64_t         mins[16];
     int64_t         ranges[16];
@@ -773,7 +773,7 @@ typedef struct {
 typedef struct {
     ray_t*     const* vecs;
     uint32_t* const* enum_ranks;
-    uint8_t          n_keys;
+    uint32_t         n_keys;
     int64_t          nrows;
     uint32_t         n_workers;
     int64_t*         pw_mins;
@@ -957,6 +957,19 @@ ray_t* ray_wide_minmax_per_group_buf(ray_t* src, uint16_t op,
 
 ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit);
 
+/* Slice-group fusion probe (exec.c): arm g's slice-group hint instead of
+ * executing the WHERE filter when its predicate is exactly in/eq on the
+ * single bare group-key column with a fresh CSR hash index.  See the
+ * definition for the full contract. */
+bool ray_slice_group_probe(ray_graph_t* g, ray_op_t* root, ray_t* by_col);
+
+/* Early hint settle (group.c): fold an armed slice-group hint whose group
+ * shape is kernel-ineligible into the equivalent g->selection, ahead of
+ * OP_GROUP's sparse pre-compaction.  Returns an error to propagate or
+ * NULL. */
+ray_t* ray_group_slice_hint_settle(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
+                                   int64_t group_limit);
+
 /* Dict-code count-distinct row_gid side-channel: exec_group stashes the
  * per-result-group dict codes so the count-distinct path can build row_gid
  * by remapping codes (cheap int) instead of re-hashing strings. */
@@ -988,25 +1001,48 @@ ray_t* desc_vec_eager(ray_t* x);
  * SUMSQ blocks; this flag enables the y-side blocks (Σy, Σy², Σxy). */
 #define GHT_NEED_PEARSON 0x10
 
+/* ── ght_layout_t — inline-or-spill, fixed-size, by-value embeddable ──
+ *
+ * The per-agg and per-key metadata that used to live in fixed [8] arrays +
+ * uint8 bitmasks now lives behind BASE POINTERS.  Widths ≤ GHT_INLINE (8)
+ * point the bases at the in-struct inline arrays (same cache lines, same
+ * memory locality as the old fixed [8] fields); wider layouts point them at
+ * one owned heap spill block (spill_hdr).  Because a struct with pointers to
+ * its own members does NOT survive a raw memcpy / by-value return, every
+ * by-value materialisation MUST fix the bases: ght_compute_layout aims them
+ * at the caller-provided out struct, and ght_layout_copy re-aims them at the
+ * destination's own inline arrays (inline) or shares the source's spill
+ * (spilled — the ORIGINAL owns/frees it, copies must not outlive it).
+ *
+ * The eight former per-agg / per-key bitmasks become per-element FLAG BYTES
+ * (agg_flags[a] / key_flags[k]); agg_flags_any / any_wide_key / any_inline_str
+ * are OR-summaries kept as scalar fast guards for the old `mask != 0` shape
+ * tests. */
+#define GHT_INLINE 8
+/* agg_flags bits */
+#define GHT_AF_F64      1u
+#define GHT_AF_SYM      2u   /* lex compare for MIN/MAX (sym_lex_lt) */
+#define GHT_AF_FIRST    4u
+#define GHT_AF_LAST     8u
+#define GHT_AF_PROD     16u
+#define GHT_AF_BINARY   32u  /* two inputs (OP_PEARSON_CORR): packs (x,y) */
+#define GHT_AF_HOLISTIC 64u  /* OP_MEDIAN/TOP/BOT/wide-mm: no accum slot */
+#define GHT_AF_WIDE     128u /* subset of HOLISTIC: wide-element min/max/first/last */
+/* agg_flags2 bits (agg_flags is full — 8 bits used) */
+#define GHT_AF2_NULLABLE 1u  /* agg input column advertises HAS_NULLS: the row-layout
+                              * accumulators skip F64 NaN / NULL_I* sentinels and track
+                              * a per-slot non-null count (off_nn) for the divisor and
+                              * all-null → typed-null finalization. */
+/* key_flags bits */
+#define GHT_KEYF_WIDE       1u  /* key does not fit in 8 B (RAY_GUID / RAY_STR) */
+#define GHT_KEYF_INLINE_STR 2u  /* key stores a 16 B ray_str_t descriptor inline */
 typedef struct {
     uint16_t entry_stride;
     uint16_t row_stride;
-    uint8_t  n_keys;
-    uint8_t  n_aggs;
-    uint8_t  n_agg_vals;
+    uint16_t n_keys;           /* widened from uint8_t (unbounded-ready) */
+    uint16_t n_aggs;
+    uint16_t n_agg_vals;
     uint8_t  need_flags;
-    uint8_t  agg_is_f64;
-    uint8_t  agg_is_sym;   /* lex compare for MIN/MAX (sym_lex_lt) */
-    /* Per-agg SYM resolution domain (sym-domain Phase 2): the domain of
-     * agg_vecs[a] when it is a SYM column, NULL otherwise.  Borrowed —
-     * the agg input vec outlives every layout use.  accum_from_entry's
-     * lex MIN/MAX resolves cell ids through it (cell ids are positions
-     * in the COLUMN's domain, not the global intern table). */
-    struct ray_sym_domain_s* agg_dom[8];
-    uint8_t  agg_is_first;
-    uint8_t  agg_is_last;
-    uint8_t  agg_is_prod;
-    int8_t   agg_val_slot[8];
     uint16_t off_sum;
     uint16_t off_min;
     uint16_t off_max;
@@ -1028,43 +1064,78 @@ typedef struct {
     uint16_t off_sum_y;
     uint16_t off_sumsq_y;
     uint16_t off_sumxy;
-    /* Per-agg "binary input" bitset: bit a set iff agg a takes two
-     * inputs (OP_PEARSON_CORR).  Drives phase-1 packing — binary aggs
-     * pack TWO consecutive 8-byte values per row (x then y) starting at
-     * agg_val_slot[a]. */
-    uint8_t  agg_is_binary;
-    /* Holistic aggregators (OP_MEDIAN): no accumulator slot reserved,
-     * agg_val_slot[a] == -1, phase-1 doesn't pack a value, phase-3
-     * skips emitting from the row layout.  A separate post-radix pass
-     * runs ray_median_per_group_buf over the source column using a
-     * row_gid+grp_cnt-derived idx_buf. */
-    uint8_t  agg_is_holistic;
-    /* Subset of agg_is_holistic: bit a set iff agg a is a wide-element
-     * (STR/GUID) min/max/first/last resolved via the per-group winner
-     * scan (ray_wide_minmax_per_group_buf) instead of a numeric kernel. */
-    uint8_t  agg_is_wide;
-    /* Wide-key support: bit k set iff key k does not fit in 8 bytes
-     * (e.g. RAY_GUID = 16 B).  For wide keys the 8-byte key slot
-     * stores a source-row index and the actual key bytes live in the
-     * original column, so probe/rehash/scatter must redirect through
-     * key_data[k].  wide_key_esz[k] is the per-element byte size of
-     * the source column. */
-    uint8_t  wide_key_mask;
-    uint8_t  wide_key_esz[8];
+    /* Per-slot non-null count block (n_agg_vals int64 slots), allocated only
+     * when any_agg_null (any agg input column HAS_NULLS).  Zero otherwise —
+     * finalize then divides by the group row count exactly as before, so
+     * every null-free shape is byte-identical.  When present, AVG/VAR/STDDEV
+     * use nn[s] as the divisor and MIN/MAX/PROD/FIRST/LAST/AVG/VAR/STDDEV
+     * emit a typed null for nn[s]==0 (all-null group), matching the DA path. */
+    uint16_t off_nn;
+    uint16_t key_region;       /* total key region bytes = key_off[n_keys] + null_words*8 */
+    /* Number of int64 null-mask words carried after the keys: ceil(n_keys/64)
+     * (floored at 1 so the n_keys==0 fallback keeps a null slot).  Key null
+     * bit k lives at word (k>>6), bit (k&63); word w is at key_off[n_keys]+w*8.
+     * ≤64 keys use exactly one word — byte-identical to the legacy single-int64
+     * null slot, so every reachable (≤8-key) shape is unchanged. */
+    uint16_t null_words;
+    uint8_t  agg_flags_any;    /* OR of all agg_flags[a] — scalar shape guard */
+    uint8_t  any_wide_key;     /* replaces wide_key_mask != 0 */
+    uint8_t  any_inline_str;   /* replaces key_inline_str != 0 */
+    uint8_t  any_agg_null;     /* OR of GHT_AF2_NULLABLE over aggs — hoisted hot-loop gate */
+    /* ── base pointers: aim at the *_in inline arrays (≤8) or the spill block ── */
+    int8_t*  agg_val_slot;     /* [n_aggs] accum slot per agg, -1 = none */
+    uint8_t* agg_flags;        /* [n_aggs] GHT_AF_* per agg */
+    /* Per-agg SYM resolution domain (sym-domain Phase 2): the domain of
+     * agg_vecs[a] when it is a SYM column, NULL otherwise.  Borrowed —
+     * the agg input vec outlives every layout use.  accum_from_entry's
+     * lex MIN/MAX resolves cell ids through it (cell ids are positions
+     * in the COLUMN's domain, not the global intern table). */
+    struct ray_sym_domain_s** agg_dom;   /* [n_aggs] */
+    /* Per-agg null metadata (populated only when any_agg_null).  agg_flags2[a]
+     * bit GHT_AF2_NULLABLE marks a HAS_NULLS agg input; agg_null_sentinel[a]
+     * is the NULL_I* sentinel for its integer/temporal type (0 for F64, which
+     * detects null via NaN, and for non-nullable aggs).  Same inline-or-spill
+     * base-pointer discipline as agg_flags/agg_val_slot. */
+    uint8_t*  agg_flags2;      /* [n_aggs] GHT_AF2_* per agg */
+    int64_t*  agg_null_sentinel; /* [n_aggs] integer null sentinel per agg */
+    /* Byte offset of each key within the entry/HT-row key region (relative to
+     * the start of the key region, i.e. entry+8 / row+8).  key_off[n_keys] is
+     * the offset of null-mask word 0 (null_words words follow contiguously).
+     * Most keys are 8 B (key_off[k]==k*8); a RAY_STR key
+     * stores its ray_str_t descriptor INLINE (16 B) so probe/rehash compare it
+     * cache-locally instead of chasing key_data[k]+row*16 in the source column. */
+    uint16_t* key_off;         /* [n_keys + 1] */
+    uint8_t*  key_flags;       /* [n_keys] GHT_KEYF_* per key */
+    uint8_t*  wide_key_esz;    /* [n_keys] per-element byte size of source col */
     /* Per wide key, the source element type so resolution can branch:
      * RAY_GUID → fixed wide_key_esz bytes; RAY_STR → ray_str_t descriptor
      * (16 B) resolved via the string pool (key_pool[k]) with SSO-aware
      * hash/eq (inline ≤12 B keys need no pool deref). */
-    int8_t   wide_key_type[8];
-    /* Byte offset of each key within the entry/HT-row key region (relative to
-     * the start of the key region, i.e. entry+8 / row+8).  key_off[n_keys] is
-     * the null-mask slot.  Most keys are 8 B (key_off[k]==k*8); a RAY_STR key
-     * stores its ray_str_t descriptor INLINE (16 B) so probe/rehash compare it
-     * cache-locally instead of chasing key_data[k]+row*16 in the source column.
-     * key_inline_str bit k set iff key k stores an inline 16 B STR descriptor. */
-    uint16_t key_off[9];
-    uint16_t key_region;       /* total key region bytes = key_off[n_keys] + 8 */
-    uint8_t  key_inline_str;   /* bitset: key k is an inline STR descriptor */
+    int8_t*   wide_key_type;   /* [n_keys] */
+    /* ── inline storage (used when n_keys ≤ 8 AND n_aggs ≤ 8) ── */
+    int8_t    agg_val_slot_in[GHT_INLINE];
+    uint8_t   agg_flags_in[GHT_INLINE];
+    uint8_t   agg_flags2_in[GHT_INLINE];
+    int64_t   agg_null_sentinel_in[GHT_INLINE];
+    struct ray_sym_domain_s* agg_dom_in[GHT_INLINE];
+    uint16_t  key_off_in[GHT_INLINE + 2];
+    uint8_t   key_flags_in[GHT_INLINE];
+    uint8_t   wide_key_esz_in[GHT_INLINE];
+    int8_t    wide_key_type_in[GHT_INLINE];
+    /* Owned heap spill block for wider layouts; NULL when inline OR when
+     * this instance is a borrower (a copy of a spilled layout — its bases
+     * point into the ORIGINAL owner's spill block, but spill_hdr stays NULL
+     * so ght_layout_free is a no-op on it).  Because a borrower's own
+     * spill_hdr reads NULL exactly like true-inline storage, ght_layout_copy
+     * cannot dispatch on spill_hdr == NULL — it must test STORAGE identity
+     * (agg_val_slot == agg_val_slot_in) instead; see ght_layout_copy.  That
+     * test is depth-invariant: master -> borrower -> borrower -> ... all
+     * correctly re-borrow the one shared block, however many copies deep.
+     * Freed by ght_layout_free (the owning master only).  Lifetime rule:
+     * the owning master must outlive every borrower transitively copied
+     * from it — all borrowers, at any depth, must be done with before the
+     * master frees the spill. */
+    ray_t*    spill_hdr;
 } ght_layout_t;
 
 typedef struct {
@@ -1074,14 +1145,21 @@ typedef struct {
     uint32_t     grp_count;
     uint32_t     grp_cap;
     ght_layout_t layout;
-    /* Non-NULL only when layout.wide_key_mask != 0.  Pointers into
-     * the original key columns (slice-unaware raw data), used by
-     * group_probe_entry / group_ht_rehash to resolve row-indexed
-     * wide keys. */
-    void*        key_data[8];
-    /* String pool base per wide STR key (NULL otherwise) — paired with
-     * key_data[k] (the ray_str_t descriptor array) for SSO-aware resolve. */
-    const void*  key_pool[8];
+    /* Wide-key source-column resolution (non-NULL slots only when
+     * layout.any_wide_key != 0).  key_data[k] = raw data pointer into the
+     * original key column (slice-unaware) for group_probe_entry /
+     * group_ht_rehash to resolve row-indexed wide keys; key_pool[k] = its
+     * str-pool base for SSO-aware STR resolve.  BASE POINTERS (unbounded-
+     * slots cut 4): aimed at the in-struct inline [8] arrays when n_keys ≤ 8
+     * (byte-identical to the legacy fixed layout), or at one owned heap spill
+     * (key_wide_hdr) carved by group_ht_init_sized when n_keys > 8.  Because
+     * group_ht_t is only ever memset-then-init'd in place (never memcpy'd by
+     * value), self-referential inline bases are safe.  Freed with the HT. */
+    void**       key_data;
+    const void** key_pool;
+    void*        key_data_in[8];
+    const void*  key_pool_in[8];
+    ray_t*       key_wide_hdr;   /* owned spill for the >8-key key_data+key_pool block */
     ray_t*        _h_slots;
     ray_t*        _h_rows;
     uint8_t       oom;        /* set by group_probe_entry on grow failure */
@@ -1099,10 +1177,42 @@ typedef struct {
 #define ROW_WR_F64(row, off, slot) (((double*)((void*)((row) + (off))))[(slot)])
 #define ROW_WR_I64(row, off, slot) (((int64_t*)((void*)((row) + (off))))[(slot)])
 
-ght_layout_t ght_compute_layout(uint8_t n_keys, uint8_t n_aggs,
-                                ray_t** agg_vecs, uint8_t need_flags,
-                                const uint16_t* agg_ops,
-                                const int8_t* key_types);
+/* Fill *out with the row/entry layout.  Returns false on unrecoverable
+ * failure (key stride budget overflow, or spill-block OOM for wide layouts);
+ * on false *out carries no owned spill.  On success *out owns its spill_hdr
+ * (NULL when inline) and every base pointer aims at *out's own storage. */
+/* Per-type integer null sentinel for an aggregation column.  Returns 0 for
+ * non-nullable / non-integer types (BOOL, U8, SYM, F64) since 0 will never
+ * match a value flagged as null via HAS_NULLS.  Shared by the group row-layout
+ * accumulators/finalizers and the pivot finalizer. */
+static inline int64_t agg_int_null_sentinel_for(int8_t t) {
+    switch (t) {
+        case RAY_I64: case RAY_TIMESTAMP:            return NULL_I64;
+        case RAY_I32: case RAY_DATE: case RAY_TIME:  return (int64_t)NULL_I32;
+        case RAY_I16:                                return (int64_t)NULL_I16;
+        default:                                     return 0;
+    }
+}
+
+bool ght_compute_layout(ght_layout_t* out, uint32_t n_keys, uint32_t n_aggs,
+                        ray_t** agg_vecs, uint8_t need_flags,
+                        const uint16_t* agg_ops,
+                        const int8_t* key_types);
+/* By-value copy that fixes the base pointers.  Dispatches on STORAGE, not
+ * ownership (src->spill_hdr == NULL is true both for genuine inline layouts
+ * AND for borrowers, so it cannot be the test): when src->agg_val_slot ==
+ * src->agg_val_slot_in, src's bases are self-referential inline storage and
+ * dst's bases are re-aimed at dst's OWN inline arrays (self-contained).
+ * Otherwise dst BORROWS the shared spill block that src's bases already
+ * point into (dst->spill_hdr = NULL, so ght_layout_free(dst) is a no-op).
+ * This makes the copy depth-invariant: master -> borrower -> borrower -> ...
+ * all correctly borrow the one spill block regardless of copy depth.
+ * Lifetime rule: the owning master MUST outlive every borrower copied from
+ * it, transitively — all borrowers at any depth must be done with / freed
+ * before the master frees the spill. */
+void ght_layout_copy(ght_layout_t* dst, const ght_layout_t* src);
+/* NULL-safe; frees the owned spill block (no-op when inline / already freed). */
+void ght_layout_free(ght_layout_t* ly);
 bool group_ht_init(group_ht_t* ht, uint32_t cap, const ght_layout_t* ly);
 void group_ht_free(group_ht_t* ht);
 typedef struct {

@@ -123,17 +123,19 @@ The zero-arg form returns null:
 
 ## Null Semantics
 
-Nulls are tracked via a per-element bitmap, not sentinel values. Typed null literals create atoms with the null bit set:
+Nulls are sentinel-encoded in the payload (`INT64_MIN` for `i64`, `NaN` for
+`f64`, and so on), not a separate bitmap. Typed null literals produce the
+sentinel for their type:
 
 | Literal | Type |
 |---|---|
 | `0Nl` | i64 null |
 | `0Nf` | f64 null |
 | `0Ni` | i32 null |
+| `0Nh` | i16 null |
 | `0Nd` | date null |
 | `0Nt` | time null |
 | `0Np` | timestamp null |
-| `0Ns` | symbol null |
 
 Null rules:
 
@@ -160,9 +162,9 @@ true
 Lambdas are auto-mapped over vectors when called directly. Use `map` for explicit element-wise application, `fold` for reductions, and `scan` for running accumulations:
 
 ```lisp
-;; map applies a function to each element
+;; map applies a function to each element, returning a list
 ‣ (map (fn [x] (* x x)) [1 2 3 4 5])
-[1 4 9 16 25]
+(1 4 9 16 25)
 
 ;; lambdas auto-map over vectors
 ‣ ((fn [x] (* x x)) (til 5))

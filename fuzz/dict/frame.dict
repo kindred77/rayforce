@@ -1,0 +1,23 @@
+# Binary wire-frame dictionary for the fuzz_de / fuzz_journal targets.
+# The 16-byte header is: prefix(u32) version(u8) flags(u8) endian(u8)
+# msgtype(u8) size(i64).  Feeding the mutator the real magic and the
+# valid field values lets it get past header validation and reach the
+# column decoder, where the interesting bugs live.
+
+# prefix RAY_SERDE_PREFIX = 0xcefadefa, little-endian on the wire
+"\xfa\xde\xfa\xce"
+# full 16-byte header with prefix + version=2 + zero flags/endian + msgtype
+"\xfa\xde\xfa\xce\x02\x00\x00\x00"
+"\xfa\xde\xfa\xce\x02\x00\x00\x01"
+"\xfa\xde\xfa\xce\x02\x00\x00\x02"
+# flag bytes
+"\x01"
+"\x02"
+"\x04"
+# msgtype values: async / sync / response
+"\x00"
+"\x01"
+"\x02"
+# small little-endian sizes for the i64 length field
+"\x08\x00\x00\x00\x00\x00\x00\x00"
+"\x10\x00\x00\x00\x00\x00\x00\x00"

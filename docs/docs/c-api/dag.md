@@ -169,7 +169,7 @@ Multi-column sort. Pass arrays of key nodes, sort directions (1=descending), and
 ```c
 ray_op_t* ray_sort_op(ray_graph_t* g, ray_op_t* table_node,
                     ray_op_t** keys, uint8_t* descs,
-                    uint8_t* nulls_first, uint8_t n_cols);
+                    uint8_t* nulls_first, uint32_t n_cols);
 ```
 
 ### ray_group
@@ -178,9 +178,9 @@ Group-by with aggregation. Groups by `n_keys` key columns, applying `n_aggs` agg
 
 ```c
 ray_op_t* ray_group(ray_graph_t* g,
-                   ray_op_t** keys, uint8_t n_keys,
+                   ray_op_t** keys, uint32_t n_keys,
                    uint16_t* agg_ops, ray_op_t** agg_ins,
-                   uint8_t n_aggs);
+                   uint32_t n_aggs);
 ```
 
 ### ray_distinct
@@ -188,7 +188,7 @@ ray_op_t* ray_group(ray_graph_t* g,
 Returns distinct rows based on the given key columns.
 
 ```c
-ray_op_t* ray_distinct(ray_graph_t* g, ray_op_t** keys, uint8_t n_keys);
+ray_op_t* ray_distinct(ray_graph_t* g, ray_op_t** keys, uint32_t n_keys);
 ```
 
 ### ray_join
@@ -199,7 +199,7 @@ Hash join between two tables on matching key columns. Join types: 0=inner, 1=lef
 ray_op_t* ray_join(ray_graph_t* g,
                   ray_op_t* left_table, ray_op_t** left_keys,
                   ray_op_t* right_table, ray_op_t** right_keys,
-                  uint8_t n_keys, uint8_t join_type);
+                  uint32_t n_keys, uint8_t join_type);
 ```
 
 ### ray_asof_join
@@ -210,7 +210,7 @@ As-of join for time-series alignment. Matches each left row to the most recent r
 ray_op_t* ray_asof_join(ray_graph_t* g,
                        ray_op_t* left_table, ray_op_t* right_table,
                        ray_op_t* time_key,
-                       ray_op_t** eq_keys, uint8_t n_eq_keys,
+                       ray_op_t** eq_keys, uint32_t n_eq_keys,
                        uint8_t join_type);
 ```
 
@@ -220,24 +220,24 @@ Window functions with partition keys, order keys, frame specification, and multi
 
 ```c
 ray_op_t* ray_window_op(ray_graph_t* g, ray_op_t* table_node,
-    ray_op_t** part_keys, uint8_t n_part,
-    ray_op_t** order_keys, uint8_t* order_descs, uint8_t n_order,
+    ray_op_t** part_keys, uint32_t n_part,
+    ray_op_t** order_keys, uint8_t* order_descs, uint32_t n_order,
     uint8_t* func_kinds, ray_op_t** func_inputs,
-    int64_t* func_params, uint8_t n_funcs,
+    int64_t* func_params, uint32_t n_funcs,
     uint8_t frame_type, uint8_t frame_start,
     uint8_t frame_end,
     int64_t frame_start_n, int64_t frame_end_n);
 ```
 
-### ray_head / ray_tail / ray_select
+### ray_head / ray_tail / ray_select_op
 
-`ray_head` returns the first N rows, `ray_tail` returns the last N rows. `ray_select` projects specific columns from a table node.
+`ray_head` returns the first N rows, `ray_tail` returns the last N rows. `ray_select_op` projects specific columns from a table node.
 
 ```c
 ray_op_t* ray_head(ray_graph_t* g, ray_op_t* input, int64_t n);
 ray_op_t* ray_tail(ray_graph_t* g, ray_op_t* input, int64_t n);
-ray_op_t* ray_select(ray_graph_t* g, ray_op_t* input,
-                    ray_op_t** cols, uint8_t n_cols);
+ray_op_t* ray_select_op(ray_graph_t* g, ray_op_t* input,
+                        ray_op_t** cols, uint32_t n_cols);
 ```
 
 ## Graph Operations
@@ -396,19 +396,19 @@ ray_t*    ray_splay_load(const char* dir,
 
 ### CSV I/O
 
-`ray_read_csv` / `ray_read_csv_opts` / `ray_write_csv`. `ray_read_csv` loads a CSV file with automatic type inference, parallel parsing, and null handling. `ray_read_csv_opts` allows custom delimiter, header flag, and null string. `ray_write_csv` writes a table to CSV.
+`ray_read_csv` / `ray_read_csv_opts` / `ray_write_csv`. `ray_read_csv` loads a CSV file with automatic type inference, parallel parsing, and null handling. `ray_read_csv_opts` allows a custom delimiter, header flag, and per-column type overrides (`col_types` is an array of `n_types` type codes; pass `NULL`/`0` to keep automatic inference). `ray_write_csv` writes a table to CSV.
 
 ```c
 ray_t*    ray_read_csv(const char* path);
 ray_t*    ray_read_csv_opts(const char* path,
               char delimiter, bool header,
-              const char* null_str);
+              const int8_t* col_types, int32_t n_types);
 ray_err_t ray_write_csv(ray_t* table, const char* path);
 ```
 
 ## Datalog API
 
-Build, stratify, and evaluate Datalog programs over Rayforce tables. Include `"datalog/datalog.h"` for all Datalog types and functions.
+Build, stratify, and evaluate Datalog programs over Rayforce tables. Include `"ops/datalog.h"` for all Datalog types and functions.
 
 ### dl_program_new / dl_program_free
 
@@ -481,7 +481,7 @@ int  dl_rule_add_cmp_const(dl_rule_t* rule, int cmp_op,
 #include <rayforce.h>
 #include "ops/ops.h"
 #include "mem/heap.h"
-#include "datalog/datalog.h"
+#include "ops/datalog.h"
 
 int main(void) {
     ray_heap_init();
@@ -551,6 +551,9 @@ int main(void) {
 
 ```c
 #include <rayforce.h>
+#include "ops/ops.h"
+#include "mem/heap.h"
+#include "io/csv.h"
 
 int main(void) {
     ray_heap_init();
@@ -590,6 +593,8 @@ int main(void) {
 
 ```c
 #include <rayforce.h>
+#include "ops/ops.h"
+#include "mem/heap.h"
 
 int main(void) {
     ray_heap_init();
@@ -648,6 +653,9 @@ int main(void) {
 
 ```c
 #include <rayforce.h>
+#include "ops/ops.h"
+#include "mem/heap.h"
+#include "io/csv.h"
 
 int main(void) {
     ray_heap_init();

@@ -53,8 +53,8 @@
 
 ;; ─── q9 canonical: pearson² per group (regression metric) ─────────
 ;;
-;; Polars canonical:
-;;   df.groupby(["id2","id4"]).agg((pl.pearson_corr("v1","v2")**2).alias("r2"))
+;; Canonical shape:
+;;   group by (id2, id4) → per group r2 = pearson_corr(v1, v2)²
 ;; Engine equivalent: routes through eval-level scatter for the
 ;; per-group computation (the planner sees a non-agg expression with
 ;; column refs that collapses to a scalar; the non-row-aligned

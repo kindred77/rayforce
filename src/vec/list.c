@@ -31,8 +31,8 @@
  * -------------------------------------------------------------------------- */
 
 static int64_t list_capacity(ray_t* list) {
-    size_t block_size = (size_t)1 << list->order;
-    size_t data_space = block_size - 32;  /* 32B ray_t header */
+    /* Direct-block aware (sentinel order → exact mmap size, not 1<<order). */
+    size_t data_space = ray_block_data_bytes(list);
     return (int64_t)(data_space / sizeof(ray_t*));
 }
 

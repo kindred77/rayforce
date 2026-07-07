@@ -34,7 +34,7 @@ The `as` function performs explicit type conversion. It takes a type symbol and 
 | `'str` | String | Variable-length text |
 | `'sym` | Symbol | Dictionary-encoded string |
 | `'date` | Date | Days since 2000-01-01 |
-| `'time` | Time | Nanoseconds since midnight |
+| `'time` | Time | Milliseconds since midnight |
 | `'timestamp` | Timestamp | Nanoseconds since 2000-01-01T00:00:00 |
 | `'guid` | GUID | 16-byte unique identifier |
 
@@ -82,8 +82,8 @@ The `as` function performs explicit type conversion. It takes a type symbol and 
 ; Parse time from string
 (as 'time "12:30:00")           ; 12:30:00.000
 
-; Parse timestamp
-(as 'timestamp "2024-01-15T12:30:00.000")  ; 2024.01.15T12:30:00.000
+; Parse timestamp (ISO 8601 input accepted; display uses the `D` separator)
+(as 'timestamp "2024-01-15T12:30:00.000")  ; 2024.01.15D12:30:00.000000000
 ```
 
 **Vector casts:** `as` maps element-wise over vectors.
@@ -104,9 +104,10 @@ The `type` function returns the type name of a value as a symbol. For vectors, i
 (type 42)                ; 'i64
 (type 3.14)              ; 'f64
 (type "hello")           ; 'str
-(type 'hello)            ; 'symbol
+(type 'hello)            ; 'sym
 (type true)               ; 'b8
 (type [1 2 3])           ; 'I64  (uppercase = vector type)
+(type [AAPL GOOG])       ; 'SYM
 (type [1.0 2.0])         ; 'F64
 (type 2024.01.15)        ; 'date
 (type 12:30:00.000)      ; 'time
@@ -114,7 +115,7 @@ The `type` function returns the type name of a value as a symbol. For vectors, i
 
 !!! note "Note"
 
-    `type` returns lowercase for atoms (`'i64`, `'f64`, `'symbol`, `'b8`) and uppercase for vectors (`'I64`, `'F64`, `'SYMBOL`). The cast function `as` accepts both `'sym` and `'symbol`.
+    `type` returns lowercase for atoms (`'i64`, `'f64`, `'sym`, `'b8`) and uppercase for vectors (`'I64`, `'F64`, `'SYM`). The cast function `as` accepts both `'sym` and `'symbol`.
 
 For tables, `type` returns `'TABLE`:
 
@@ -175,8 +176,8 @@ Strings can be parsed into numeric, temporal, and symbol types with `as`. Conver
 ; Parse time (HH:MM:SS.mmm)
 (as 'time "12:30:00.000")        ; 12:30:00.000
 
-; Parse timestamp (ISO 8601)
-(as 'timestamp "2024-01-15T12:30:00.000")  ; 2024.01.15T12:30:00.000
+; Parse timestamp (ISO 8601 input accepted; display uses the `D` separator)
+(as 'timestamp "2024-01-15T12:30:00.000")  ; 2024.01.15D12:30:00.000000000
 
 ; Boolean to/from string
 (as 'str true)           ; "true"
@@ -206,21 +207,23 @@ Null values propagate through casts. A typed null in one type becomes a typed nu
     - `0Ni` — null i32
     - `0Nl` — null i64
     - `0Nh` — null i16
-    - `0Ns` — null sym
     - `0Nf` — null f64
     - `0Nd` — null date
     - `0Nt` — null time
     - `0Np` — null timestamp
 
+    `SYM` has no typed null literal (`0Ns` does not parse).
+
     Use `nil?` to test for null values: `(nil? 0Ni)` returns `true`.
 
 ```lisp
 ; Null propagation through arithmetic
-(+ 0Ni 10)              ; 0Ni  (null propagates)
+(+ 0Ni 10)              ; 0Nl  (null propagates; i32 + i64 → i64)
 (* 0Nf 2.0)             ; 0Nf
 
-; Null in vectors — null bitmap elements stay null
-(+ [1 0Ni 3] 10)          ; [11 0Ni 13]
+; Null in vectors — null bitmap elements stay null.
+; The null literal must match the vector's element type (0Nl for i64).
+(+ [1 0Nl 3] 10)          ; [11 0Nl 13]
 ```
 
 ## 6. Symbol vs String { #sym-vs-str }
@@ -246,7 +249,7 @@ Rayforce has two string representations with different performance characteristi
 
 ; Symbol vectors (common in tables)
 (set statuses ['Active 'Inactive 'Active 'Pending])
-(type statuses)          ; 'SYMBOL  (uppercase = vector)
+(type statuses)          ; 'SYM  (uppercase = vector)
 ```
 
 !!! note "Rule of thumb"
@@ -260,8 +263,8 @@ Rayforce has three temporal types, all stored as integers internally:
 | Type | Internal | Epoch | Literal Format |
 |---|---|---|---|
 | `date` | i32 | Days since 2000-01-01 | `2024.01.15` |
-| `time` | i64 | Nanoseconds since midnight | `12:30:00.000` |
-| `timestamp` | i64 | Nanoseconds since 2000-01-01T00:00:00 | `2024.01.15T12:30:00.000` |
+| `time` | i32 | Milliseconds since midnight | `12:30:00.000` |
+| `timestamp` | i64 | Nanoseconds since 2000-01-01 midnight | `2024.01.15D12:30:00.000000000` |
 
 **Date arithmetic:**
 
@@ -281,10 +284,10 @@ Rayforce has three temporal types, all stored as integers internally:
 
 ```lisp
 ; Date to timestamp (midnight)
-(as 'timestamp 2024.01.15)  ; 2024.01.15T00:00:00.000
+(as 'timestamp 2024.01.15)  ; 2024.01.15D00:00:00.000000000
 
-; Timestamp to date (strips time)
-(as 'date 2024.01.15T12:30:00.000)  ; 2024.01.15
+; Timestamp to date (strips time) — note the `D` separator in the literal
+(as 'date 2024.01.15D12:30:00.000)  ; 2024.01.15
 
 ; Date to integer (days since epoch)
 (as 'i64 2024.01.15)      ; 8780
@@ -294,17 +297,20 @@ Rayforce has three temporal types, all stored as integers internally:
 
 GUIDs are 16-byte unique identifiers displayed as hex strings. They are useful for primary keys, correlation IDs, and distributed systems.
 
+`guid` takes a **count** and returns a GUID *vector* of that length:
+
 ```lisp
-; Generate a random GUID
-(guid 0)
-; 8c6b8861-81dc-8e36-22a0-c5b1e9c0484e  (random each time)
+; Generate N random GUIDs
+(guid 0)                  ; []                      (empty vector)
+(guid 1)                  ; [daa76c35-...-dfb2fcab]  (one random GUID; random each time)
+(guid 3)                  ; three random GUIDs
 
 ; GUIDs support equality comparison
-(set g (guid 0))
-(== g g)                  ; true
+(set g (guid 1))
+(== g g)                  ; [true]
 
 ; Type check
-(type (guid 0))           ; 'guid
+(type (guid 1))           ; 'GUID  (uppercase = vector)
 ```
 
 ## 9. `sym-name` Function { #sym-name }
@@ -333,10 +339,10 @@ After loading a CSV, columns often arrive as strings. Cast them to proper types:
 ; Cast columns to proper types
 (set trades
   (update {from: raw
-    cols: {price:  (as 'f64 price)
+    price:  (as 'f64 price)
            qty:    (as 'i64 qty)
            date:   (as 'date date)
-           sym:    (as 'sym sym)}}))
+           sym:    (as 'sym sym)}))
 ```
 
 ### Date Arithmetic for Analytics
@@ -373,9 +379,13 @@ After loading a CSV, columns often arrive as strings. Cast them to proper types:
     [9.99 24.50 9.99]
     (+ 2024.01.01 [0 1 2]))))
 
-; Verify column types
+; Inspect the table shape. On a table, `meta` reports only the kind and the
+; column count — it does not return per-column types.
 (meta orders)
-; Shows: id (i64), product (sym), price (f64), date (date)
+; {type:TABLE len:4}   (len = number of columns)
+
+; To see a single column's element type, use `type`:
+(type (at orders 'price))   ; 'F64
 ```
 
 ## Next Steps

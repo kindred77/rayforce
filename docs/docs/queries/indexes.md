@@ -3,13 +3,13 @@
 Per-column accelerator structures — `zone`, `hash`, `sort`, `bloom` — attached directly to numeric vectors.  Build once at user request; survive copy / refcount semantics; ride alongside the column through the pipeline.
 
 !!! note "v1 status"
-    The four index kinds, their build kernels, and the `(.idx.*)` Rayfall surface are shipped.  The executor consults indexes at six sites: filter comparisons, filter IN, ORDER BY, distinct, and find.  See the [routing table](#routing-table) below.
+    The four index kinds, their build kernels, and the `(.idx.*)` Rayfall surface are shipped.  The executor consults indexes at five sites: filter comparisons, filter IN, ORDER BY, distinct, and find.  See the [routing table](#routing-table) below.
 
 This page is the **reference** for the `.idx.*` family. For the broader index landscape (HNSW, linked columns, partition pruning, CSR), see [Indexes Overview](indexes-overview.md). For decision walk-throughs and worked workflows, see the [Indexes Guide](../guides/indexes.md).
 
 ## Routing Table
 
-The executor consults indexes at six sites.  Each site has a specific consumption point, eligibility contract, and fallback guarantee — results never differ from the scan path (verified by drop-differential tests in `test/rfl/ops/idx_route.rfl`).
+The executor consults indexes at five sites.  Each site has a specific consumption point, eligibility contract, and fallback guarantee — results never differ from the scan path (verified by drop-differential tests in `test/rfl/ops/idx_route.rfl`).
 
 | Index kind | Consumption site | What happens |
 |---|---|---|
@@ -24,7 +24,7 @@ The executor consults indexes at six sites.  Each site has a specific consumptio
 
 ### Eligibility conditions (uniform)
 
-All six sites apply the same prechecks before consulting an index:
+All five sites apply the same prechecks before consulting an index:
 
 - **Fresh:** the index's `built_for_len` must match the column's current length (mismatch → stale → fallback).
 - **No nulls (new paths):** `HAS_NULLS` set on the column → fallback for all paths except hash-EQ at the filter site, which also re-checks `HAS_NULLS` explicitly.
@@ -88,7 +88,7 @@ Each kind has a one-arg attach builtin.  Attaching is idempotent — if a differ
 
 `(.idx.zone v)   (.idx.hash v)   (.idx.sort v)   (.idx.bloom v)`
 
-Attach an index of the named kind to a numeric vector `v`.  Returns the column with the new index attached (the underlying values are unchanged).  Type errors out for non-numeric columns — `RAY_BOOL`, `RAY_U8`, `RAY_I16`, `RAY_I32`, `RAY_I64`, `RAY_F32`, `RAY_F64`, `RAY_DATE`, `RAY_TIME`, `RAY_TIMESTAMP`.  `RAY_SYM` / `RAY_STR` targets are deferred to v2.
+Attach an index of the named kind to a vector `v`.  Returns the column with the new index attached (the underlying values are unchanged).  All kinds accept the numeric/boolean types `RAY_BOOL`, `RAY_U8`, `RAY_I16`, `RAY_I32`, `RAY_I64`, `RAY_F32`, `RAY_F64`, `RAY_DATE`, `RAY_TIME`, `RAY_TIMESTAMP`; `.idx.hash` **additionally** accepts `RAY_SYM`.  `RAY_STR` (and `RAY_SYM` on the non-hash kinds) is deferred to v2.
 
 ### Examples
 
@@ -200,7 +200,7 @@ This design has three useful properties:
 
 ## Caveats and Limits
 
-- **Numeric types only (v1).**  The four kinds accept `RAY_BOOL`, `RAY_U8`, `RAY_I16`, `RAY_I32`, `RAY_I64`, `RAY_F32`, `RAY_F64`, `RAY_DATE`, `RAY_TIME`, `RAY_TIMESTAMP`.  `RAY_SYM` / `RAY_STR` are not yet supported — their nullmap-union byte 8–15 collisions with the `sym_dict` / `str_pool` pointers haven't been swept.
+- **Type support.**  All four kinds accept `RAY_BOOL`, `RAY_U8`, `RAY_I16`, `RAY_I32`, `RAY_I64`, `RAY_F32`, `RAY_F64`, `RAY_DATE`, `RAY_TIME`, `RAY_TIMESTAMP`; `.idx.hash` additionally accepts `RAY_SYM` (indexing the symbol domain ids).  `RAY_STR` — and `RAY_SYM` on the zone/sort/bloom kinds — is not yet supported: the `sym_dict` / `str_pool` pointers in aux bytes 8–15 collide with the index layout and the displacement sweep is pending.
 - **One slot per column.**  A column carries at most one index kind at a time.  Calling a different kind's attach replaces the existing one.  Multiple indexes per column are deferred — the slot can point to a list-of-indexes in v2 if real workloads want both eq and range fast paths.
 - **In-memory only.**  Indexes do not persist across `ray_col_save` / `ray_col_load`; users rebuild explicitly after a load.  Unlike the HNSW handle (see [Vector Search](../graph/vector-search.md)), which has dedicated `hnsw-save` / `hnsw-load` builtins for explicit persistence, `.idx.*` has no on-disk format at all — rebuild is the only option.
 - **Float equality not indexed.**  Hash-EQ and hash-IN routes are integer-family only — float equality has NaN / -0 semantics that the unfused compare kernel handles; the index paths intentionally don't replicate that.

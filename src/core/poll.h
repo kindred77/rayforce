@@ -85,7 +85,13 @@ typedef struct ray_poll_reg {
 
 struct ray_poll {
     int64_t          fd;       /* epoll/kqueue/iocp handle */
-    int64_t          code;     /* exit code (-1 = running) */
+    /* Exit code / stop flag (-1 = running).  Atomic because ray_poll_exit
+     * may set it from a different thread than the one spinning in
+     * ray_poll_run's `while (code < 0)` loop (the production poll loop is
+     * single-threaded, but the API permits — and tests exercise — a
+     * cross-thread stop); a plain field there is a data race and lets the
+     * compiler hoist the load out of the loop. */
+    _Atomic int64_t  code;     /* exit code (-1 = running) */
     ray_selector_t** sels;     /* selector array */
     uint32_t         n_sels;
     uint32_t         sel_cap;

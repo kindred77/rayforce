@@ -209,7 +209,11 @@ extern ray_t __ray_null;
  * value-null is always RAY_NULL_OBJ. Assert that invariant in debug/ASan builds;
  * compile to nothing in release. Placed BEFORE any null test that may deref,
  * because RAY_ATOM_IS_NULL/ray_atom_is_null_fn deref x->type on non-singleton input. */
-#ifdef DEBUG
+/* Kept live in the hardened cloud tier too (not just DEBUG): the check is a
+ * single pointer compare, and a stray C NULL in a value position is exactly
+ * the class of corruption that must fail fast — routed through the crash
+ * handler's SIGABRT backtrace — rather than segfault deep in a kernel. */
+#if defined(DEBUG) || defined(RAY_HARDENED)
 #define RAY_ASSERT_VALUE(x) assert((x) != NULL && "value-null must be RAY_NULL_OBJ, not C NULL")
 #else
 #define RAY_ASSERT_VALUE(x) ((void)0)
@@ -330,10 +334,9 @@ void*    ray_calloc_raw(size_t n);
 void*    ray_realloc_raw(void* p, size_t n);
 void     ray_free_raw(void* p);
 
-/* ===== Memory Budget API ===== */
+/* ===== System memory ===== */
 
-int64_t  ray_mem_budget(void);      /* returns memory budget in bytes */
-bool     ray_mem_pressure(void);    /* true if calling thread's usage exceeds budget */
+int64_t  ray_sys_total_ram(void);   /* total physical RAM in bytes (informational) */
 
 /* ===== Interrupt API =====
  * Long-running queries poll ray_interrupted() at morsel granularity
@@ -360,8 +363,8 @@ typedef struct {
     uint64_t    rows_done;
     uint64_t    rows_total;   /* 0 = indeterminate */
     double      elapsed_sec;
-    int64_t     mem_used;     /* bytes: buddy + direct mmap */
-    int64_t     mem_budget;   /* bytes: auto-detected memory budget */
+    int64_t     mem_used;     /* bytes: live object footprint (buddy + direct mmap) */
+    int64_t     mem_total;    /* bytes: total physical RAM (the disk-spill threshold) */
     bool        final;        /* true on the last tick of a query — renderers
                                  use this to clear the line */
 } ray_progress_t;
@@ -391,6 +394,19 @@ void ray_progress_label(const char* op_name, const char* phase);
  * "100%" tick if the query ran long enough to have shown the bar. */
 void ray_progress_end(void);
 
+/* True iff a progress callback is registered. The executor gates arming the
+ * qstats PROGRESS bit on this, so all progress plumbing stays zero-cost when
+ * nothing is listening. */
+bool ray_progress_active(void);
+
+/* Pool-dispatch pump (main-thread only). ray_progress_dispatch_begin records a
+ * parallel dispatch's element total and baselines the shared qstats row
+ * counter; ray_progress_pump samples it and fires the throttled callback. The
+ * pool calls these from its claim-loop / spin-wait so every morsel-parallel op
+ * reports progress with no per-kernel changes. Both are no-ops with no callback. */
+void ray_progress_dispatch_begin(uint64_t phase_rows_total);
+void ray_progress_pump(void);
+
 /* ===== COW / Ref Counting API ===== */
 
 void     ray_retain(ray_t* v);
@@ -410,6 +426,10 @@ ray_t* ray_sym(int64_t id);
 ray_t* ray_date(int64_t val);
 ray_t* ray_time(int64_t val);
 ray_t* ray_timestamp(int64_t val);
+/* Current UTC wall-clock time as a RAY_TIMESTAMP value (ns since 2000-01-01).
+ * Shared "now as a timestamp" primitive — the single owner of the epoch
+ * conversion; callers must not re-derive it. */
+int64_t ray_timestamp_now_ns(void);
 ray_t* ray_guid(const uint8_t* bytes);
 ray_t* ray_typed_null(int8_t type);
 
@@ -451,8 +471,8 @@ static inline bool ray_atom_is_null_fn(const union ray_t* x) {
              * STR's empty "" below.  A SYM atom is never null. */
             return false;
         case RAY_STR:
-            /* STR has no null distinct from "" (kdb+ model: char lists have no
-             * null, only symbols do).  A STR atom is never null — the empty
+            /* STR has no null distinct from "" (char lists have no null, only
+             * symbols do).  A STR atom is never null — the empty
              * string is a value. */
             return false;
         case RAY_GUID: {
@@ -670,6 +690,78 @@ void      ray_ipc_close(int64_t handle);
 ray_t*    ray_ipc_send(int64_t handle, ray_t* msg);
 ray_err_t ray_ipc_send_async(int64_t handle, ray_t* msg);
 ray_t*    ray_ipc_send_verbose(int64_t handle, ray_t* msg);
+
+/* ===== Append-Only Log (AOF) API =====
+ *
+ * Embeddable durable event log for host applications: opaque payloads,
+ * monotonic contiguous LSNs, explicit commit barriers, segment rotation,
+ * crash recovery.  Independent of the ray_runtime_t lifecycle — usable
+ * before ray_runtime_create and after ray_runtime_destroy.
+ *
+ * Durability model: ray_aof_append() buffers and returns the reserved
+ * LSN; ray_aof_commit() writes a commit frame into the stream and
+ * fsyncs — every append issued before it is durable and becomes
+ * observable once it returns RAY_OK.  Scans deliver only records that
+ * precede the last commit frame, so uncommitted appends are invisible
+ * BY CONSTRUCTION (not as an accident of buffering), no matter how
+ * large the append or what reached the page cache.  A crash discards
+ * only the un-committed suffix: on the next open, bytes after the last
+ * commit frame are truncated and the LSN sequence continues from the
+ * last committed record — LSNs of truncated records are reused, but
+ * only ever for records no scan could have observed.  A CRC failure
+ * BEFORE the last commit frame is damage to acknowledged data and
+ * fails ray_aof_open with RAY_ERR_CORRUPT rather than truncating.
+ * (The torn-tail tolerance is deliberate and differs from the
+ * transaction journal, where a torn tail is fatal: AOF payloads are
+ * opaque data the writer was never acknowledged for, not replayable
+ * commands.)
+ *
+ * Threading: one writer handle per directory, no internal locking.
+ * Concurrent ray_aof_scan() calls are safe, including against a live
+ * writer — a scan observes the committed prefix and stops cleanly at
+ * the first incomplete tail record.
+ *
+ * Errors: RAY_ERR_DOMAIN on bad arguments, RAY_ERR_IO on filesystem
+ * failure, RAY_ERR_LIMIT on payload >= 2^32-1 bytes, RAY_ERR_CORRUPT
+ * from open or scan when acknowledged (committed) data fails its CRC.
+ */
+
+typedef struct ray_aof_s ray_aof_t;
+
+#define RAY_AOF_DEFAULT_SEGMENT_LIMIT ((int64_t)256 * 1024 * 1024)
+
+/* Open (creating the directory if needed) and recover the log at `dir`.
+ * `segment_limit` <= 0 selects RAY_AOF_DEFAULT_SEGMENT_LIMIT.  On
+ * failure returns NULL and sets *out_err (out_err may be NULL). */
+ray_aof_t* ray_aof_open(const char* dir, int64_t segment_limit,
+                        ray_err_t* out_err);
+
+/* Buffered append of `len` bytes; returns the reserved LSN (>= 0), or
+ * -1 with *out_err set.  Durable only after ray_aof_commit(). */
+int64_t    ray_aof_append(ray_aof_t* log, const void* payload,
+                          int64_t len, ray_err_t* out_err);
+
+/* Durability barrier: flush + fsync the active segment. */
+ray_err_t  ray_aof_commit(ray_aof_t* log);
+
+/* The LSN the next append will receive. */
+int64_t    ray_aof_next_lsn(const ray_aof_t* log);
+
+/* Scan callback: return true to continue, false to stop the scan. */
+typedef bool (*ray_aof_scan_cb_t)(int64_t lsn, const void* payload,
+                                  int64_t len, void* ctx);
+
+/* Scan committed records with lsn >= from_lsn in LSN order, invoking
+ * `cb` per record.  Needs no ray_aof_t handle — reads directly from
+ * `dir`, concurrently with a live writer.  Returns the number of
+ * records delivered, or -1 with *out_err set. */
+int64_t    ray_aof_scan(const char* dir, int64_t from_lsn,
+                        ray_aof_scan_cb_t cb, void* ctx,
+                        ray_err_t* out_err);
+
+/* Flush, fsync and close; frees the handle.  Returns the commit error
+ * if the final flush fails (the handle is freed either way). */
+ray_err_t  ray_aof_close(ray_aof_t* log);
 
 #ifdef __cplusplus
 }

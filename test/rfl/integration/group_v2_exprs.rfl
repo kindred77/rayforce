@@ -1,0 +1,46 @@
+;; v2 bridge for expression agg inputs (exec_group_v2_exprs, group.c):
+;; a group mixing expression-input aggs (sum(a*b)) with scan-input aggs
+;; (stddev, pearson_corr) used to drop wholesale onto the legacy row path;
+;; the bridge materializes the expressions as synthetic _e{a} columns and
+;; dispatches v2.  Pins: mixed-agg values vs single-agg runs and hand
+;; values, null propagation, and where-selection interaction.
+
+(set N 1000)
+(set G (% (til N) 4))
+(set A (as 'F64 (+ (til N) 1)))
+(set B (as 'I64 (% (til N) 7)))
+(set X (as 'F64 (* 2 (til N))))
+(set T (table [g a b x] (list G A B X)))
+
+;; mixed shape (the q42 class): sum(product) + stddev + cor together
+(set M (select {p: (sum (* a b)) sd: (stddev b) c: (pearson_corr a x) n: (count b) from: T by: g}))
+(count M) -- 4
+;; vs single-agg queries (each takes its own best path)
+(set S1 (select {p: (sum (* a b)) from: T by: g}))
+(set S2 (select {sd: (stddev b) from: T by: g}))
+(set S3 (select {c: (pearson_corr a x) from: T by: g}))
+(min (== (at M 'p) (at S1 'p))) -- true
+(min (== (at M 'sd) (at S2 'sd))) -- true
+(min (== (at M 'c) (at S3 'c))) -- true
+(min (== (at M 'g) (at S1 'g))) -- true
+;; hand value: group 0 rows have b = (4k)%7 cycle; count = 250
+(at (at M 'n) 0) -- 250
+
+;; expression input with nulls: null rows drop from the sum (null-aware)
+(set BN (concat (as 'I64 (list 0N)) (as 'I64 (til (- N 1)))))
+(set TN (table [g a bn] (list G A BN)))
+(set MN (select {p: (sum (* a bn)) sd: (stddev a) from: TN by: g}))
+(set SN (select {p: (sum (* a bn)) from: TN by: g}))
+(min (== (at MN 'p) (at SN 'p))) -- true
+
+;; under a WHERE selection
+(set MW (select {p: (sum (* a b)) c: (pearson_corr a x) from: T by: g where: (> a 500.0)}))
+(set SW1 (select {p: (sum (* a b)) from: T by: g where: (> a 500.0)}))
+(set SW2 (select {c: (pearson_corr a x) from: T by: g where: (> a 500.0)}))
+(min (== (at MW 'p) (at SW1 'p))) -- true
+(min (== (at MW 'c) (at SW2 'c))) -- true
+
+;; nested expression (affine inside product operand)
+(set ME (select {p: (sum (* (+ a 1.0) b)) sd: (stddev x) from: T by: g}))
+(set SE (select {p: (sum (* (+ a 1.0) b)) from: T by: g}))
+(min (== (at ME 'p) (at SE 'p))) -- true

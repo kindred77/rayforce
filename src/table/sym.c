@@ -97,9 +97,7 @@ static bool sym_lazy_materialize_to_locked(uint32_t target_id);
 static _Atomic(int) g_sym_lock = 0;
 static inline void sym_lock(void) {
     while (atomic_exchange_explicit(&g_sym_lock, 1, memory_order_acquire)) {
-#if defined(__x86_64__) || defined(__i386__)
-        __builtin_ia32_pause();
-#endif
+        RAY_CPU_RELAX();
     }
 }
 static inline void sym_unlock(void) {

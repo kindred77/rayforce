@@ -654,20 +654,31 @@ static test_result_t test_eval_fold(void) {
     PASS();
 }
 
-/* ---- Test: scan (running fold) ---- */
+/* ---- Test: scan (running fold) ----
+ * (scan + typed-vec) returns a TYPED vector (scan_typed_arith kernel);
+ * LIST inputs keep the boxed LIST shape. */
 static test_result_t test_eval_scan(void) {
     ray_t* result = ray_eval_str("(scan + [1 2 3 4 5])");
     TEST_ASSERT_NOT_NULL(result);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    TEST_ASSERT_EQ_I(result->type, RAY_LIST);
+    TEST_ASSERT_EQ_I(result->type, RAY_I64);
     TEST_ASSERT_EQ_I(ray_len(result), 5);
-    ray_t** elems = (ray_t**)ray_data(result);
-    TEST_ASSERT_EQ_I(elems[0]->i64, 1);
-    TEST_ASSERT_EQ_I(elems[1]->i64, 3);
-    TEST_ASSERT_EQ_I(elems[2]->i64, 6);
-    TEST_ASSERT_EQ_I(elems[3]->i64, 10);
-    TEST_ASSERT_EQ_I(elems[4]->i64, 15);
+    int64_t* d = (int64_t*)ray_data(result);
+    TEST_ASSERT_EQ_I(d[0], 1);
+    TEST_ASSERT_EQ_I(d[1], 3);
+    TEST_ASSERT_EQ_I(d[2], 6);
+    TEST_ASSERT_EQ_I(d[3], 10);
+    TEST_ASSERT_EQ_I(d[4], 15);
     ray_release(result);
+
+    ray_t* boxed = ray_eval_str("(scan + (list 1 2 3))");
+    TEST_ASSERT_NOT_NULL(boxed);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(boxed));
+    TEST_ASSERT_EQ_I(boxed->type, RAY_LIST);
+    TEST_ASSERT_EQ_I(ray_len(boxed), 3);
+    ray_t** elems = (ray_t**)ray_data(boxed);
+    TEST_ASSERT_EQ_I(elems[2]->i64, 6);
+    ray_release(boxed);
     PASS();
 }
 
@@ -3949,6 +3960,19 @@ static test_result_t test_eval_clear_interrupt(void) {
     PASS();
 }
 
+/* An eval with a pending interrupt returns a "cancel" error (not "limit" — the
+ * VM's interrupt checks route to vm_error_cancel, distinct from real stack/
+ * recursion limits). */
+static test_result_t test_eval_interrupt_returns_cancel(void) {
+    ray_request_interrupt();
+    ray_t* r = ray_eval_str("(+ 1 2)");
+    ray_clear_interrupt();   /* clear before asserting so it can't leak */
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    TEST_ASSERT_STR_EQ(ray_err_code(r), "cancel");
+    ray_error_free(r);
+    PASS();
+}
+
 /* --- NFO get/set --- */
 static test_result_t test_eval_nfo_getset(void) {
     ray_t* old_nfo = ray_eval_get_nfo();
@@ -7025,6 +7049,7 @@ const test_entry_t lang_entries[] = {
     /* === Coverage pass-8 tests === */
     { "lang/eval/interrupt_flag", test_eval_interrupt_flag, lang_setup, lang_teardown },
     { "lang/eval/clear_interrupt", test_eval_clear_interrupt, lang_setup, lang_teardown },
+    { "lang/eval/interrupt_cancel", test_eval_interrupt_returns_cancel, lang_setup, lang_teardown },
     { "lang/eval/nfo_getset", test_eval_nfo_getset, lang_setup, lang_teardown },
     { "lang/eval/restricted_set_get", test_eval_restricted_set_get, lang_setup, lang_teardown },
     { "lang/eval/try_handler_error", test_eval_try_handler_error, lang_setup, lang_teardown },

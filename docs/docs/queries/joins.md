@@ -33,13 +33,15 @@ Join two tables on shared key columns. Returns a table with all columns from bot
 Join on multiple keys:
 
 ```lisp
+; Key columns must be symbol (or numeric) — string key columns are not
+; supported for joins.
 (set x (table [a b c]
-    (list (take (list "aa" "bb" "cc") 10)
+    (list (take [aa bb cc] 10)
           (take [I J K] 10)
           (til 10))))
 
 (set y (table [a b d]
-    (list (take (list "aa" "bb") 10)
+    (list (take [aa bb] 10)
           (take [I J K] 10)
           (til 10))))
 
@@ -65,7 +67,7 @@ Left outer join. All left rows are preserved; unmatched right columns are null.
 ; -- ---  --- -----
 ;  1 AAPL 100   150
 ;  2 GOOG 200   280
-;  3 MSFT  50     0  ← 0 (no MSFT in prices)
+;  3 MSFT  50   0Nl  ← null (no MSFT in prices)
 ;  4 AAPL 150   150
 ```
 
@@ -133,6 +135,10 @@ These are pure opt-in acceleration: when the attribute is absent the executor fa
     (list (.attr.set 'parted [1 1 2 2])
           [10:00:01.000 10:00:03.000 10:00:01.000 10:00:02.000]
           [1.0 2.0 3.0 4.0])))
+(set Rgp (table [ID Time Bid]
+    (list [1 1 2 2]
+          [10:00:00.000 10:00:02.000 10:00:00.000 10:00:01.000]
+          [1.1 2.2 3.3 4.4])))
 (asof-join [ID Time] Lgp Rgp)
 ```
 
@@ -184,11 +190,14 @@ Window join with per-row time intervals. `intervals` is a list of two vectors `[
            12:00:05 12:00:06 12:00:07 12:00:08 12:00:09]
           [928 528 648 914 918 626 577 817 620 698])))
 
-; Build per-row intervals: [lo, hi] for each trade
-(set intervals (map-right + [-1000 1000] (at trades 'Time)))
+; Build the intervals as two vectors: a `lo` and a `hi` bound per left row.
+; `intervals` is a two-element list `(list lo hi)`, each vector matching the
+; left row count.
+(set lo (+ (at trades 'Time) -1000))
+(set hi (+ (at trades 'Time)  1000))
 
 ; Window join: min bid and max ask within each window
-(window-join [Sym Time] intervals trades quotes
+(window-join [Sym Time] (list lo hi) trades quotes
     {size_min: (min Size) size_max: (max Size)})
 ```
 
@@ -201,10 +210,11 @@ Window join with per-row time intervals. `intervals` is a list of two vectors `[
 (set quotes (table [Sym Ts Bid Ask]
     (list bsym btime bid ask)))
 
-; Build intervals from the trades timestamp
-(set intervals (map-right + [-1000 1000] (at trades 'Ts)))
+; Build intervals as two vectors (lo, hi) from the trades timestamp
+(set lo (+ (at trades 'Ts) -1000))
+(set hi (+ (at trades 'Ts)  1000))
 
-(window-join [Sym Ts] intervals trades quotes
+(window-join [Sym Ts] (list lo hi) trades quotes
     {bid: (min Bid) ask: (max Ask)})
 ```
 
@@ -217,7 +227,7 @@ All join operations compile to the Rayforce execution DAG. The optimizer and exe
 3. **Execution** — Equi-joins use a radix-partitioned hash join: the build side is partitioned by hash, then each morsel from the probe side looks up matches in the corresponding partition. For inner joins on the radix-parallel path, the executor picks the build side at runtime using actual materialized row counts — whichever input has fewer rows becomes the build side, reducing hash-table memory and improving cache utilisation. This selection is most effective when the larger side has many rows per key (e.g. a fact table joining a small dimension); on near-unique keys the benefit is small. LEFT, FULL, and ANTI joins always build on the right because their semantics require preserving every left row. The small-input (chained) path also always builds on the right. During the per-partition build the executor monitors per-key duplicate counts; if any single key exceeds a threshold it abandons the radix attempt and re-runs the whole join through the chained hash table, which is O(n) regardless of duplication. This ensures that no join — INNER, LEFT, or FULL — degrades to quadratic cost when the build side contains a heavily-duplicated key. It complements build-side selection (which handles INNER joins by choosing the smaller side) by covering LEFT and FULL joins, which cannot swap sides, and any INNER case where the forced-build side happens to be skewed. Output row order for inner joins on the radix-parallel path is partition- and thread-dependent and is not guaranteed to be stable. As-of and window joins use sorted merge with binary search on the temporal column — the as-of executor skips the per-join sort when the inputs carry the `sorted` / `parted` [attributes](attributes.md) described above.
 
 !!! note "Performance note"
-    For large joins, ensure key columns use efficient types. Symbol columns (`RAY_SYM`) are dictionary-encoded integers and join fastest. String columns (`RAY_STR`) work but require hash comparison of variable-length data.
+    Join key columns must be symbol (`RAY_SYM`) or numeric. Symbol columns are dictionary-encoded integers and join fastest. String (`RAY_STR`) key columns are **not** supported — a join keyed on a string column raises `nyi`. Convert string keys to symbols (`(as 'sym col)`) before joining.
 
 ## Quick Reference
 

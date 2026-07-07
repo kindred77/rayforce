@@ -194,27 +194,27 @@ static test_result_t test_create_with_sym_load_preserves_user_ids(void) {
     PASS();
 }
 
-/* Sym file whose stat st_size exceeds mem_budget/2 must trigger the
+/* Sym file whose stat st_size exceeds half of physical RAM must trigger the
  * pre-flight OOM guard and surface RAY_ERR_OOM through out_sym_err.
  * We use ftruncate to create a SPARSE file (no backing bytes), sized from
- * the same budget the runtime computes (80% of physical RAM) so it lands
- * just over the half-budget ceiling on any host — and stays ~RAM-sized
- * (~tens of GB), well under every real filesystem's max-file limit.  The
- * earlier fixed 4 EB (1<<62) size exceeded ext4's 16 TB cap → EFBIG →
- * the test silently skipped on every Linux dev/CI host. */
+ * the same total physical RAM the runtime detects so it lands just over the
+ * half-RAM ceiling on any host — and stays ~RAM-sized (~tens of GB), well
+ * under every real filesystem's max-file limit.  The earlier fixed 4 EB
+ * (1<<62) size exceeded ext4's 16 TB cap → EFBIG → the test silently skipped
+ * on every Linux dev/CI host. */
 static test_result_t test_create_with_sym_oversized_file(void) {
     char* dir = make_tmpdir();
     TEST_ASSERT_NOT_NULL(dir);
 
-    /* Mirror runtime.c's budget: 80% of physical RAM.  half + 1 MB just
-     * trips the > mem_budget/2 guard.  Sparse, so those bytes are never
-     * backed and the pre-flight stat check short-circuits before any read. */
+    /* Mirror runtime.c's guard: total physical RAM.  half + 1 MB just trips
+     * the > total_ram/2 guard.  Sparse, so those bytes are never backed and
+     * the pre-flight stat check short-circuits before any read. */
     long pages = sysconf(_SC_PHYS_PAGES);
     long psize = sysconf(_SC_PAGE_SIZE);
     TEST_ASSERT((pages) > (0), "sysconf(_SC_PHYS_PAGES)");
     TEST_ASSERT((psize) > (0), "sysconf(_SC_PAGE_SIZE)");
-    int64_t budget = (int64_t)((double)pages * (double)psize * 0.8);
-    off_t huge = (off_t)(budget / 2 + (1 << 20));
+    int64_t total_ram = (int64_t)((double)pages * (double)psize);
+    off_t huge = (off_t)(total_ram / 2 + (1 << 20));
 
     char path[256];
     snprintf(path, sizeof(path), "%s/huge.sym", dir);

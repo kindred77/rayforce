@@ -34,7 +34,11 @@
 /* ----------------------------------------------------------------------------
  * SWAR digit detection
  *
- * Load 8 bytes as a little-endian u64 and use the standard Lemire trick:
+ * The range check is byte-order independent (every lane is tested the
+ * same way).  The accumulation helpers below normalise the loaded word to
+ * little-endian first, so both are correct on big-endian hosts too.
+ *
+ * Load 8 bytes and use the standard Lemire trick:
  *   - subtract 0x30 from each byte → if any byte was < '0' the result
  *     underflows and the high bit of that lane is set
  *   - add 0x46 (= 0x7F - 0x39) to each byte → if any byte was > '9'
@@ -72,12 +76,17 @@ bool ray_is_4_digits(const void *p) {
 uint64_t ray_parse_8_digits(const void *p) {
     uint64_t chunk;
     memcpy(&chunk, p, 8);
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    /* The fold below assumes the memory-low byte lands in the low bits.
+     * Normalise a big-endian load to that layout. */
+    chunk = __builtin_bswap64(chunk);
+#endif
     chunk -= 0x3030303030303030ULL;                   /* now each byte ∈ 0..9 */
 
     /* Fold pairs of digits into 16-bit words: tens*10 + ones.  The
      * memory-low byte of each pair holds the tens digit (it printed
-     * first), so on a little-endian load the tens are at chunk's even
-     * bytes and the ones are at the odd bytes. */
+     * first), so after the little-endian-normalised load the tens are at
+     * chunk's even bytes and the ones are at the odd bytes. */
     uint64_t tens  = chunk        & 0x000F000F000F000FULL;
     uint64_t ones  = (chunk >> 8) & 0x000F000F000F000FULL;
     uint64_t pairs = tens * 10 + ones;                /* 4 × 16-bit values 0..99 */
@@ -95,6 +104,9 @@ uint64_t ray_parse_8_digits(const void *p) {
 uint32_t ray_parse_4_digits(const void *p) {
     uint32_t chunk;
     memcpy(&chunk, p, 4);
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    chunk = __builtin_bswap32(chunk);
+#endif
     chunk -= 0x30303030U;
     uint32_t tens  = chunk        & 0x000F000FU;
     uint32_t ones  = (chunk >> 8) & 0x000F000FU;

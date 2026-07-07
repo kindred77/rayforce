@@ -75,7 +75,7 @@ of builtins. The REPL prompt is `‣`:
 ‣ (select {from:t by: Symbol Qty: (sum Qty)})
 +--------+----------------------------+
 | Symbol |            Qty             |
-|  sym   |            i64             |
+|  SYM   |            I64             |
 +--------+----------------------------+
 | AAPL   | 400                        |
 | GOOG   | 450                        |
@@ -87,11 +87,11 @@ of builtins. The REPL prompt is `‣`:
 ‣ (pivot t 'Symbol 'Side 'Qty sum)
 +--------+-----+----------------------+
 | Symbol | Buy |         Sell         |
-|  sym   | i64 |         i64          |
+|  SYM   | I64 |         I64          |
 +--------+-----+----------------------+
 | AAPL   | 100 | 300                  |
 | GOOG   | 250 | 200                  |
-| MSFT   | 150 | 0                    |
+| MSFT   | 150 | 0Nl                  |
 +-------------------------------------+
 | 3 rows (3 shown) 3 columns (3 shown)|
 +-------------------------------------+

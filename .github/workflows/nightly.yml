@@ -1,0 +1,95 @@
+name: Nightly stability
+
+# Heavy, long-running stability jobs that are too slow for the per-PR gate:
+# deep randomized stress, the full suite under ThreadSanitizer, long fuzz
+# runs with an accreting corpus, and a server soak that watches for leaks
+# across kill/restart cycles.  Runs on the dev branch overnight and on
+# manual dispatch.  Failures upload artifacts for triage.
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  stress-random:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: dev }
+      - name: Build (debug + ASan)
+        run: make debug
+      - name: Build test binary
+        run: make test TEST_CORES=4 || true   # builds rayforce.test; run below with knobs
+      - name: Deep randomized stress
+        run: |
+          # 10 date-derived seeds, 50k ops each, printed for reproduction.
+          for s in $(seq 1 10); do
+            echo "::group::stress seed $s"
+            RAYFORCE_CORES=4 RAY_STRESS_SEED=$s RAY_STRESS_ITERS=50000 \
+              ./rayforce.test -f stress || exit 1
+            echo "::endgroup::"
+          done
+
+  tsan-full:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: dev }
+      - name: Build server binary (IPC tests spawn ./rayforce)
+        run: make release
+      - name: Full suite under ThreadSanitizer
+        run: |
+          # Empty filter = the whole in-process suite; 4 cores for contention.
+          # ./rayforce (release) is the server the IPC-diff tests spawn.
+          make tsan-test TSAN_CORES=4 TSAN_FILTER=""
+
+  fuzz-long:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [parse, numparse, de, eval, csv, journal]
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: dev }
+      - name: Cache fuzz corpus
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      - name: Seed corpora
+        run: |
+          make debug
+          scripts/fuzz-seed-parse.sh || true
+          scripts/fuzz-seed-frames.sh || true
+      - name: Fuzz ${{ matrix.target }} (15 min)
+        run: make fuzz-${{ matrix.target }} FUZZ_RUNTIME=900
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes-${{ matrix.target }}
+          path: |
+            crash-*
+            leak-*
+            timeout-*
+            oom-*
+          if-no-files-found: ignore
+
+  soak-server:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: dev }
+      - name: Build (release — realistic RSS)
+        run: make release
+      - name: Server soak (45 min, kill/restart, RSS-slope leak watch)
+        run: SOAK_SECONDS=2700 SOAK_CLIENTS=4 bash scripts/soak.sh
+      - name: Upload RSS trace
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-rss
+          path: /tmp/rf_soak_*_rss.csv
+          if-no-files-found: ignore
