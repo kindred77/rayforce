@@ -1045,6 +1045,7 @@ ray_t* desc_vec_eager(ray_t* x);
                               * accumulators skip F64 NaN / NULL_I* sentinels and track
                               * a per-slot non-null count (off_nn) for the divisor and
                               * all-null → typed-null finalization. */
+#define GHT_AF2_TRUTHY   2u  /* OP_ALL/OP_ANY: off_sum stores truthy count */
 /* key_flags bits */
 #define GHT_KEYF_WIDE       1u  /* key does not fit in 8 B (RAY_GUID / RAY_STR) */
 #define GHT_KEYF_INLINE_STR 2u  /* key stores a 16 B ray_str_t descriptor inline */

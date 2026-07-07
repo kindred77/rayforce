@@ -198,6 +198,24 @@ Product of all non-null numeric elements.
 (prod [2 3 4])  ; 24
 ```
 
+### `(all x)` — aggregate
+
+Returns `true` when every non-null numeric element is truthy. Empty and all-null inputs return `true`.
+
+```lisp
+(all [1 2 3])  ; true
+(all [1 0 3])  ; false
+```
+
+### `(any x)` — aggregate
+
+Returns `true` when at least one non-null numeric element is truthy. Empty and all-null inputs return `false`.
+
+```lisp
+(any [0 0 3])  ; true
+(any [0 0 0])  ; false
+```
+
 ### `(count x)` — aggregate
 
 Number of elements. Counts total vector length, including nulls.
@@ -240,11 +258,64 @@ Median value.
 
 ### `(dev x)` — aggregate
 
-Standard deviation.
+Population standard deviation.
 
 ```lisp
 (dev [2 4 4 4 5 5 7 9])  ; 2.0
 ```
+
+### `(stddev x)` — aggregate
+
+Sample standard deviation.
+
+```lisp
+(stddev [1 2 3])  ; 1.0
+```
+
+### `(stddev_pop x)` / `(dev_pop x)` — aggregate
+
+Population standard deviation.
+
+```lisp
+(stddev_pop [1 2 3])  ; 0.816...
+```
+
+### `(var x)` / `(var_pop x)` — aggregate
+
+Sample and population variance.
+
+```lisp
+(var [1 2 3])      ; 1.0
+(var_pop [1 2 3])  ; 0.666...
+```
+
+### `(pearson_corr x y)` — aggregate
+
+Pearson correlation over paired non-null numeric inputs.
+
+```lisp
+(pearson_corr [1 2 3] [2 4 6])  ; 1.0
+```
+
+### `(cov x y)` / `(scov x y)` — aggregate
+
+Population and sample covariance over paired non-null numeric inputs.
+
+```lisp
+(cov [1 3] [2 6])   ; 2.0
+(scov [1 3] [2 6])  ; 4.0
+```
+
+### `(wsum weights values)` / `(wavg weights values)` — aggregate
+
+Weighted sum and weighted average over paired non-null inputs. `wavg` returns null when there are no valid pairs or the total weight is zero.
+
+```lisp
+(wsum [1 3] [10 20])  ; 70.0
+(wavg [1 3] [10 20])  ; 17.5
+```
+
+Unary numeric reducers skip nulls where applicable. Binary reducers skip a row when either input is null. Inside `select`/`by:`, aggregate reducers lower to morsel-based DAG paths that can run in parallel and poll for cancellation.
 
 ### `(first x)` — aggregate
 
@@ -466,7 +537,7 @@ Parallel map. Like `map` but distributes work across threads for large inputs.
 | **Arithmetic** | `+` `-` `*` `/` `%` `neg` `round` `floor` `ceil` |
 | **Comparison** | `==` `!=` `<` `<=` `>` `>=` `within` |
 | **Logic** | `and` `or` `not` |
-| **Aggregation** | `sum` `prod` `count` `avg` `min` `max` `med` `dev` `first` `last` `distinct` |
+| **Aggregation** | `sum` `prod` `all` `any` `count` `avg` `min` `max` `med` `dev` `stddev` `var` `pearson_corr` `cov` `scov` `wsum` `wavg` `first` `last` `distinct` |
 | **Ordering** | `asc` `desc` `iasc` `idesc` `xasc` `xdesc` `xrank` |
 | **Generation** | `til` `take` `reverse` `where` `find` `xbar` |
 | **Higher-order** | `map` `fold` `scan` `apply` `filter` `pmap` |

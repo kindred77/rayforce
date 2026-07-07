@@ -87,6 +87,8 @@ const char* ray_opcode_name(uint16_t op) {
         case OP_DATE_TRUNC:    return "DATE_TRUNC";
         case OP_SUM:           return "SUM";
         case OP_PROD:          return "PROD";
+        case OP_ALL:           return "ALL";
+        case OP_ANY:           return "ANY";
         case OP_MIN:           return "MIN";
         case OP_MAX:           return "MAX";
         case OP_COUNT:         return "COUNT";
@@ -99,6 +101,10 @@ const char* ray_opcode_name(uint16_t op) {
         case OP_VAR:           return "VAR";
         case OP_VAR_POP:       return "VAR_POP";
         case OP_PEARSON_CORR:  return "PEARSON_CORR";
+        case OP_COV:           return "COV";
+        case OP_SCOV:          return "SCOV";
+        case OP_WSUM:          return "WSUM";
+        case OP_WAVG:          return "WAVG";
         case OP_MEDIAN:        return "MEDIAN";
         case OP_FILTER:        return "FILTER";
         case OP_SORT:          return "SORT";

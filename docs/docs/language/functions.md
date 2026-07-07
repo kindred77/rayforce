@@ -63,14 +63,28 @@ Aggregation functions are marked **aggr** and reduce vectors to scalar values. U
 |---|---|---|---|
 | `sum` | unary, aggr | Sum of all elements | `(sum [1 2 3])` → `6` |
 | `prod` | unary, aggr | Product of all non-null numeric elements | `(prod [2 3 4])` → `24` |
+| `all` | unary, aggr | True if every non-null numeric element is truthy; empty/all-null returns `true` | `(all [1 2 3])` → `true` |
+| `any` | unary, aggr | True if any non-null numeric element is truthy; empty/all-null returns `false` | `(any [0 0 3])` → `true` |
 | `count` | unary, aggr | Count of elements | `(count [1 2 3])` → `3` |
 | `avg` | unary, aggr | Arithmetic mean | `(avg [1 2 3])` → `2.0` |
 | `min` | unary, aggr | Minimum value | `(min [3 1 2])` → `1` |
 | `max` | unary, aggr | Maximum value | `(max [3 1 2])` → `3` |
 | `med` | unary, aggr | Median value (returns f64) | `(med [1 3 2])` → `2.0` |
 | `dev` | unary, aggr | Population standard deviation | `(dev [1 2 3])` → `0.816...` |
+| `stddev` | unary, aggr | Sample standard deviation | `(stddev [1 2 3])` → `1.0` |
+| `stddev_pop` | unary, aggr | Population standard deviation | `(stddev_pop [1 2 3])` |
+| `dev_pop` | unary, aggr | Population standard deviation alias | `(dev_pop [1 2 3])` |
+| `var` | unary, aggr | Sample variance | `(var [1 2 3])` → `1.0` |
+| `var_pop` | unary, aggr | Population variance | `(var_pop [1 2 3])` |
+| `pearson_corr` | binary, aggr | Pearson correlation over paired non-null numeric inputs | `(pearson_corr [1 2 3] [2 4 6])` → `1.0` |
+| `cov` | binary, aggr | Population covariance over paired non-null numeric inputs | `(cov [1 3] [2 6])` → `2.0` |
+| `scov` | binary, aggr | Sample covariance over paired non-null numeric inputs | `(scov [1 3] [2 6])` → `4.0` |
+| `wsum` | binary, aggr | Weighted sum, `sum(weights * values)`, skipping null pairs | `(wsum [1 3] [10 20])` → `70.0` |
+| `wavg` | binary, aggr | Weighted average, `wsum / sum(weights)`; null for zero total weight | `(wavg [1 3] [10 20])` → `17.5` |
 | `first` | unary | First element of vector | `(first [10 20 30])` → `10` |
 | `last` | unary | Last element of vector | `(last [10 20 30])` → `30` |
+
+Unary numeric reducers skip nulls where applicable. Binary reducers skip a row when either input is null. Inside `select`/`by:`, aggregate reducers lower to morsel-based DAG paths that can run in parallel and poll for cancellation.
 
 The examples below use this small in-memory table:
 

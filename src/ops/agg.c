@@ -23,6 +23,7 @@
 
 #include "lang/internal.h"
 #include "ops/ops.h"
+#include "ops/internal.h"
 #include "ops/idxop.h"   /* RAY_IDX_CHUNK_ZONE fast path for min/max */
 #include "mem/heap.h"
 
@@ -251,6 +252,143 @@ static ray_t* agg_parted_minmax(ray_t* x, int want_max) {
     return agg_atom_i64_for_type(base, best_i);
 }
 
+static int agg_numeric_flat_type(int8_t t) {
+    return t == RAY_BOOL || t == RAY_U8 || t == RAY_I16 ||
+           t == RAY_I32 || t == RAY_I64 || t == RAY_F64;
+}
+
+static int agg_read_vec_f64(ray_t* v, int64_t i, double* out) {
+    void* d = ray_data(v);
+    switch (v->type) {
+    case RAY_F64: *out = ((double*)d)[i]; return 1;
+    case RAY_I64: *out = (double)((int64_t*)d)[i]; return 1;
+    case RAY_I32: *out = (double)((int32_t*)d)[i]; return 1;
+    case RAY_I16: *out = (double)((int16_t*)d)[i]; return 1;
+    case RAY_U8:
+    case RAY_BOOL: *out = (double)((uint8_t*)d)[i]; return 1;
+    default: return 0;
+    }
+}
+
+static ray_t* agg_parted_truth(ray_t* x, int want_all) {
+    int8_t base = (int8_t)RAY_PARTED_BASETYPE(x->type);
+    if (!agg_numeric_flat_type(base))
+        return ray_error("type", want_all ? "all expects a numeric parted column, got %s"
+                                          : "any expects a numeric parted column, got %s",
+                         ray_type_name(base));
+    ray_t** segs = (ray_t**)ray_data(x);
+    int64_t seen = 0, truthy = 0;
+    for (int64_t s = 0; s < x->len; s++) {
+        ray_t* seg = segs[s];
+        if (!seg) continue;
+        int has_nulls = (seg->attrs & RAY_ATTR_HAS_NULLS) != 0;
+        for (int64_t i = 0; i < seg->len; i++) {
+            if (((i | s) & 65535) == 0 && ray_interrupted())
+                return ray_error("cancel", "interrupted");
+            if (has_nulls && ray_vec_is_null(seg, i)) continue;
+            double v = 0.0;
+            if (!agg_read_vec_f64(seg, i, &v)) continue;
+            seen++;
+            if (v != 0.0) truthy++;
+        }
+    }
+    return ray_bool(want_all ? (truthy == seen) : (truthy > 0));
+}
+
+static ray_t* agg_truth_vec(ray_t* x, int want_all) {
+    if (!ray_is_vec(x))
+        return ray_error("type", want_all ? "all expects a numeric vector, got %s"
+                                          : "any expects a numeric vector, got %s",
+                         ray_type_name(x->type));
+    if (!agg_numeric_flat_type(x->type))
+        return ray_error("type", want_all ? "all expects a numeric vector, got %s"
+                                          : "any expects a numeric vector, got %s",
+                         ray_type_name(x->type));
+    bool has_nulls = (x->attrs & RAY_ATTR_HAS_NULLS) != 0;
+    int64_t seen = 0, truthy = 0;
+    for (int64_t i = 0; i < x->len; i++) {
+        if ((i & 65535) == 0 && ray_interrupted())
+            return ray_error("cancel", "interrupted");
+        if (has_nulls && ray_vec_is_null(x, i)) continue;
+        double v = 0.0;
+        agg_read_vec_f64(x, i, &v);
+        seen++;
+        if (v != 0.0) truthy++;
+    }
+    return ray_bool(want_all ? (truthy == seen) : (truthy > 0));
+}
+
+static ray_t* agg_truth_list(ray_t* x, int want_all) {
+    int64_t n = ray_len(x);
+    int64_t seen = 0, truthy = 0;
+    ray_t** elems = (ray_t**)ray_data(x);
+    for (int64_t i = 0; i < n; i++) {
+        if ((i & 65535) == 0 && ray_interrupted())
+            return ray_error("cancel", "interrupted");
+        if (!is_numeric(elems[i]))
+            return ray_error("type", want_all ? "all: list elements must be numeric, got %s"
+                                              : "any: list elements must be numeric, got %s",
+                             ray_type_name(elems[i]->type));
+        if (RAY_ATOM_IS_NULL(elems[i])) continue;
+        seen++;
+        if (as_f64(elems[i]) != 0.0) truthy++;
+    }
+    return ray_bool(want_all ? (truthy == seen) : (truthy > 0));
+}
+
+static ray_t* agg_pair_vec(ray_t* x, ray_t* y, uint16_t op) {
+    const char* name = op == OP_COV ? "cov" :
+                       op == OP_SCOV ? "scov" :
+                       op == OP_WSUM ? "wsum" :
+                       op == OP_WAVG ? "wavg" : "pearson_corr";
+    if (!x || RAY_IS_ERR(x) || !y || RAY_IS_ERR(y))
+        return ray_error("type", "%s: both arguments must be valid values", name);
+    if (!ray_is_vec(x) || !ray_is_vec(y))
+        return ray_error("type", "%s expects two numeric vectors, got %s and %s", name, ray_type_name(x->type), ray_type_name(y->type));
+    if (x->len != y->len)
+        return ray_error("length", "%s: vectors must have equal length, got %lld and %lld", name, (long long)x->len, (long long)y->len);
+    if (!agg_numeric_flat_type(x->type) || !agg_numeric_flat_type(y->type))
+        return ray_error("type", "%s expects numeric vectors, got %s and %s", name, ray_type_name(x->type), ray_type_name(y->type));
+
+    bool xn = (x->attrs & RAY_ATTR_HAS_NULLS) != 0;
+    bool yn = (y->attrs & RAY_ATTR_HAS_NULLS) != 0;
+    int64_t cnt = 0;
+    double sx = 0.0, sy = 0.0, sxx = 0.0, syy = 0.0, sxy = 0.0;
+    for (int64_t i = 0; i < x->len; i++) {
+        if ((i & 65535) == 0 && ray_interrupted())
+            return ray_error("cancel", "interrupted");
+        if ((xn && ray_vec_is_null(x, i)) || (yn && ray_vec_is_null(y, i)))
+            continue;
+        double xv = 0.0, yv = 0.0;
+        agg_read_vec_f64(x, i, &xv);
+        agg_read_vec_f64(y, i, &yv);
+        sx += xv; sy += yv; sxx += xv * xv; syy += yv * yv; sxy += xv * yv; cnt++;
+    }
+
+    if (op == OP_WSUM) return ray_f64(ray_f64_fin(sxy));
+    if (op == OP_WAVG) {
+        if (cnt <= 0 || sx == 0.0) return ray_typed_null(-RAY_F64);
+        return ray_f64(ray_f64_fin(sxy / sx));
+    }
+    if (op == OP_COV) {
+        if (cnt <= 0) return ray_typed_null(-RAY_F64);
+        double dn = (double)cnt;
+        return ray_f64(ray_f64_fin((sxy - sx * sy / dn) / dn));
+    }
+    if (op == OP_SCOV) {
+        if (cnt <= 1) return ray_typed_null(-RAY_F64);
+        double dn = (double)cnt;
+        return ray_f64(ray_f64_fin((sxy - sx * sy / dn) / (dn - 1.0)));
+    }
+    if (cnt < 2) return ray_typed_null(-RAY_F64);
+    double dn = (double)cnt;
+    double num = dn * sxy - sx * sy;
+    double dx = dn * sxx - sx * sx;
+    double dy = dn * syy - sy * sy;
+    if (dx <= 0.0 || dy <= 0.0) return ray_typed_null(-RAY_F64);
+    return ray_f64(ray_f64_fin(num / sqrt(dx * dy)));
+}
+
 ray_t* ray_sum_fn(ray_t* x) {
     if (ray_is_lazy(x)) return ray_lazy_append(x, OP_SUM);
     if (RAY_IS_PARTED(x->type)) return agg_parted_sum(x);
@@ -354,6 +492,30 @@ ray_t* ray_prod_fn(ray_t* x) {
         }
     }
     return has_float ? make_f64(fprod) : make_i64(iprod);
+}
+
+ray_t* ray_all_fn(ray_t* x) {
+    if (ray_is_lazy(x)) return ray_lazy_append(x, OP_ALL);
+    if (RAY_IS_PARTED(x->type)) return agg_parted_truth(x, 1);
+    if (ray_is_atom(x)) {
+        if (!is_numeric(x)) return ray_error("type", "all expects numeric values, got %s", ray_type_name(x->type));
+        if (RAY_ATOM_IS_NULL(x)) return ray_bool(true);
+        return ray_bool(as_f64(x) != 0.0);
+    }
+    if (is_list(x)) return agg_truth_list(x, 1);
+    return agg_truth_vec(x, 1);
+}
+
+ray_t* ray_any_fn(ray_t* x) {
+    if (ray_is_lazy(x)) return ray_lazy_append(x, OP_ANY);
+    if (RAY_IS_PARTED(x->type)) return agg_parted_truth(x, 0);
+    if (ray_is_atom(x)) {
+        if (!is_numeric(x)) return ray_error("type", "any expects numeric values, got %s", ray_type_name(x->type));
+        if (RAY_ATOM_IS_NULL(x)) return ray_bool(false);
+        return ray_bool(as_f64(x) != 0.0);
+    }
+    if (is_list(x)) return agg_truth_list(x, 0);
+    return agg_truth_vec(x, 0);
 }
 
 ray_t* ray_count_fn(ray_t* x) {
@@ -798,56 +960,10 @@ ray_t* ray_var_pop_fn(ray_t* x)    { return var_stddev_core(x, 0, 0); }
  * non-agg full-table eval collapses the call to a scalar, and the
  * non-row-aligned fallback re-runs the call on each group's slice. */
 ray_t* ray_pearson_corr_fn(ray_t* x, ray_t* y) {
-    if (!x || RAY_IS_ERR(x) || !y || RAY_IS_ERR(y))
-        return ray_error("type", "pearson_corr: both arguments must be valid (non-error) values");
-    if (!ray_is_vec(x) || !ray_is_vec(y))
-        return ray_error("type", "pearson_corr expects two vectors, got %s and %s", ray_type_name(x->type), ray_type_name(y->type));
-    if (ray_len(x) != ray_len(y))
-        return ray_error("length", "pearson_corr: vectors must have equal length, got %lld and %lld", (long long)ray_len(x), (long long)ray_len(y));
-
-    int64_t n = ray_len(x);
-    /* Boxed read covers every numeric/temporal type at the cost of an
-     * atom alloc per row.  First-pass simplicity matters more than
-     * peak throughput; type-specialised loops are a perf follow-up.
-     * We bail with type error on the first non-numeric cell. */
-    int64_t cnt = 0;
-    double sx = 0.0, sy = 0.0, sxy = 0.0, sxx = 0.0, syy = 0.0;
-    for (int64_t i = 0; i < n; i++) {
-        int xa = 0, ya = 0;
-        ray_t* xe = collection_elem(x, i, &xa);
-        ray_t* ye = collection_elem(y, i, &ya);
-        if (!xe || !ye || RAY_IS_ERR(xe) || RAY_IS_ERR(ye)) {
-            if (xa && xe) ray_release(xe);
-            if (ya && ye) ray_release(ye);
-            return ray_error("type", "pearson_corr: failed to read element pair");
-        }
-        int xn = RAY_ATOM_IS_NULL(xe);
-        int yn = RAY_ATOM_IS_NULL(ye);
-        if (!xn && !yn) {
-            if (!is_numeric(xe) || !is_numeric(ye)) {
-                int8_t xt = xe->type, yt = ye->type;
-                if (xa) ray_release(xe);
-                if (ya) ray_release(ye);
-                return ray_error("type", "pearson_corr: numeric vectors only, got %s and %s", ray_type_name(xt), ray_type_name(yt));
-            }
-            double xv = as_f64(xe);
-            double yv = as_f64(ye);
-            sx  += xv;
-            sy  += yv;
-            sxy += xv * yv;
-            sxx += xv * xv;
-            syy += yv * yv;
-            cnt++;
-        }
-        if (xa) ray_release(xe);
-        if (ya) ray_release(ye);
-    }
-
-    if (cnt < 2) return make_f64(NAN);
-    double dn = (double)cnt;
-    double num = dn * sxy - sx * sy;
-    double dx  = dn * sxx - sx * sx;
-    double dy  = dn * syy - sy * sy;
-    if (dx <= 0.0 || dy <= 0.0) return make_f64(NAN);
-    return make_f64(num / sqrt(dx * dy));
+    return agg_pair_vec(x, y, OP_PEARSON_CORR);
 }
+
+ray_t* ray_cov_fn(ray_t* x, ray_t* y)  { return agg_pair_vec(x, y, OP_COV); }
+ray_t* ray_scov_fn(ray_t* x, ray_t* y) { return agg_pair_vec(x, y, OP_SCOV); }
+ray_t* ray_wsum_fn(ray_t* x, ray_t* y) { return agg_pair_vec(x, y, OP_WSUM); }
+ray_t* ray_wavg_fn(ray_t* x, ray_t* y) { return agg_pair_vec(x, y, OP_WAVG); }

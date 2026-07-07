@@ -11,7 +11,7 @@
 | | | |
 |---|---|---|
 | [Arithmetic](#arithmetic) (16) | [Comparison](#comparison) (7) | [Logic](#logic) (3) |
-| [Aggregation](#aggregation) (15) | [Higher-Order](#higher-order) (13) | [Collection](#collection) (37) |
+| [Aggregation](#aggregation) (22) | [Higher-Order](#higher-order) (13) | [Collection](#collection) (37) |
 | [Sorting & Ordering](#sorting) (10) | [Control Flow & Special Forms](#control) (11) | [Table Operations](#table-ops) (14) |
 | [Query](#query) (4) | [Joins](#joins) (6) | [Pivot](#pivot) (1) |
 | [String](#string-ops) (4) | [Temporal](#temporal) (3) | [Type & Introspection](#type-ops) (5) |
@@ -40,7 +40,7 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 
 ### Unary
 
-`not`, `neg`, `round`, `floor`, `ceil`, `abs`, `sqrt`, `log`, `exp`, `sum`, `prod`, `count`, `avg`, `min`, `max`,
+`not`, `neg`, `round`, `floor`, `ceil`, `abs`, `sqrt`, `log`, `exp`, `sum`, `prod`, `all`, `any`, `count`, `avg`, `min`, `max`,
 `first`, `last`, `med`, `dev`, `stddev`, `stddev_pop`, `dev_pop`, `var`, `var_pop`, `raise`, `distinct`,
 `reverse`, `til`, `lag`, `lead`, `deltas`, `ratios`, `fills`, `sums`, `avgs`, `mins`, `maxs`, `prds`,
 `differ`, `asc`, `desc`, `iasc`, `idesc`, `rank`, `key`, `value`, `type`, `read`, `load`, `exit`,
@@ -54,7 +54,7 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 
 ### Binary
 
-`+`, `-`, `*`, `/`, `%`, `>`, `<`, `>=`, `<=`, `==`, `!=`, `pow`, `top`, `bot`, `pearson_corr`, `set`, `let`,
+`+`, `-`, `*`, `/`, `%`, `>`, `<`, `>=`, `<=`, `==`, `!=`, `pow`, `top`, `bot`, `pearson_corr`, `cov`, `scov`, `wsum`, `wavg`, `set`, `let`,
 `try`, `filter`, `in`, `except`, `union`, `sect`, `take`, `at`, `find`, `msum`, `mavg`, `mmin`, `mmax`,
 `mcount`, `mvar`, `mdev`, `xasc`, `xdesc`, `table`, `union-all`, `xbar`, `as`, `write`, `dict`, `concat`, `within`, `div`,
 `rand`, `bin`, `binr`, `split`, `like`, `.os.setenv`, `.ipc.send`, `.ipc.post`, `get`, `remove`, `row`,
@@ -158,6 +158,8 @@ Aggregation functions reduce vectors to scalar values. Functions marked **aggr**
 |---|---|---|---|---|
 | `sum` | unary | aggr | Sum of all elements | `(sum [1 2 3])` → `6` |
 | `prod` | unary | aggr | Product of all non-null numeric elements | `(prod [2 3 4])` → `24` |
+| `all` | unary | aggr | True if every non-null numeric element is truthy; empty/all-null returns `true` | `(all [1 2 3])` → `true` |
+| `any` | unary | aggr | True if any non-null numeric element is truthy; empty/all-null returns `false` | `(any [0 0 3])` → `true` |
 | `count` | unary | aggr | Count of elements | `(count [1 2 3])` → `3` |
 | `avg` | unary | aggr | Arithmetic mean | `(avg [1 2 3])` → `2.0` |
 | `min` | unary | aggr | Minimum value | `(min [3 1 2])` → `1` |
@@ -171,6 +173,13 @@ Aggregation functions reduce vectors to scalar values. Functions marked **aggr**
 | `dev_pop` | unary | aggr | Population standard deviation (alias) | `(dev_pop [1 2 3])` |
 | `var` | unary | aggr | Sample variance | `(var [1 2 3])` → `1.0` |
 | `var_pop` | unary | aggr | Population variance | `(var_pop [1 2 3])` |
+| `pearson_corr` | binary | aggr | Pearson correlation over paired non-null numeric inputs | `(pearson_corr [1 2 3] [2 4 6])` → `1.0` |
+| `cov` | binary | aggr | Population covariance over paired non-null numeric inputs | `(cov [1 3] [2 6])` → `2.0` |
+| `scov` | binary | aggr | Sample covariance over paired non-null numeric inputs | `(scov [1 3] [2 6])` → `4.0` |
+| `wsum` | binary | aggr | Weighted sum, `sum(weights * values)`, skipping null pairs | `(wsum [1 3] [10 20])` → `70.0` |
+| `wavg` | binary | aggr | Weighted average, `wsum / sum(weights)`; null for zero total weight | `(wavg [1 3] [10 20])` → `17.5` |
+
+Unary numeric reducers skip nulls where applicable. Binary reducers skip a row when either input is null. Inside `select`/`by:`, these reducers lower to morsel-based DAG aggregation paths that can run in parallel and poll for cancellation.
 
 ```lisp
 ; Basic aggregation

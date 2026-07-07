@@ -137,6 +137,8 @@ Reduction operations that collapse a column to a single value (or per-group valu
 |---|---|---|
 | `ray_sum(g, a)` | `OP_SUM` | Sum of values |
 | `ray_prod(g, a)` | `OP_PROD` | Product of values |
+| `ray_all(g, a)` | `OP_ALL` | True when every non-null numeric value is truthy |
+| `ray_any(g, a)` | `OP_ANY` | True when any non-null numeric value is truthy |
 | `ray_count(g, a)` | `OP_COUNT` | Count of non-null values |
 | `ray_avg(g, a)` | `OP_AVG` | Average (mean) |
 | `ray_min_op(g, a)` | `OP_MIN` | Minimum value |
@@ -148,6 +150,8 @@ Reduction operations that collapse a column to a single value (or per-group valu
 | `ray_stddev_pop(g, a)` | `OP_STDDEV_POP` | Population standard deviation |
 | `ray_var(g, a)` | `OP_VAR` | Sample variance |
 | `ray_var_pop(g, a)` | `OP_VAR_POP` | Population variance |
+
+Binary aggregate opcodes are used through `ray_group2`/`ray_group3`: `OP_PEARSON_CORR`, `OP_COV`, `OP_SCOV`, `OP_WSUM`, and `OP_WAVG`. They consume `agg_ins[a]` plus `agg_ins2[a]`, skip rows where either input is null, and produce `RAY_F64`.
 
 ## Time-Series Vector Operations
 
@@ -208,6 +212,15 @@ ray_op_t* ray_group(ray_graph_t* g,
                    ray_op_t** keys, uint32_t n_keys,
                    uint16_t* agg_ops, ray_op_t** agg_ins,
                    uint32_t n_aggs);
+```
+
+Use `ray_group2` or `ray_group3` when an aggregate needs a second input column. `agg_ins2` is parallel to `agg_ins`; slots are `NULL` for unary reducers and non-`NULL` for binary reducers such as `OP_PEARSON_CORR`, `OP_COV`, `OP_SCOV`, `OP_WSUM`, and `OP_WAVG`.
+
+```c
+ray_op_t* ray_group2(ray_graph_t* g,
+                    ray_op_t** keys, uint32_t n_keys,
+                    uint16_t* agg_ops, ray_op_t** agg_ins,
+                    ray_op_t** agg_ins2, uint32_t n_aggs);
 ```
 
 ### ray_distinct

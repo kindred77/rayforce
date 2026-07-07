@@ -614,6 +614,8 @@ ray_op_t* ray_concat(ray_graph_t* g, ray_op_t** args, int n) {
 
 ray_op_t* ray_sum(ray_graph_t* g, ray_op_t* a)    { return make_unary(g, OP_SUM, a, a->out_type == RAY_F64 ? RAY_F64 : RAY_I64); }
 ray_op_t* ray_prod(ray_graph_t* g, ray_op_t* a)   { return make_unary(g, OP_PROD, a, a->out_type == RAY_F64 ? RAY_F64 : RAY_I64); }
+ray_op_t* ray_all(ray_graph_t* g, ray_op_t* a)    { return make_unary(g, OP_ALL, a, RAY_BOOL); }
+ray_op_t* ray_any(ray_graph_t* g, ray_op_t* a)    { return make_unary(g, OP_ANY, a, RAY_BOOL); }
 ray_op_t* ray_min_op(ray_graph_t* g, ray_op_t* a) { return make_unary(g, OP_MIN, a, a->out_type); }
 ray_op_t* ray_max_op(ray_graph_t* g, ray_op_t* a) { return make_unary(g, OP_MAX, a, a->out_type); }
 ray_op_t* ray_count(ray_graph_t* g, ray_op_t* a)  { return make_unary(g, OP_COUNT, a, RAY_I64); }
@@ -1761,6 +1763,9 @@ ray_t* ray_lazy_append(ray_t* lazy, uint16_t opcode) {
         case OP_COUNT:
         case OP_COUNT_DISTINCT:
             out_type = RAY_I64; break;
+        case OP_ALL:
+        case OP_ANY:
+            out_type = RAY_BOOL; break;
         case OP_AVG:
         case OP_STDDEV:
         case OP_STDDEV_POP:

@@ -428,6 +428,10 @@ ray_t* ray_bot_fn(ray_t* v, ray_t* n_obj);
  * ordered. Defined in src/ops/sort.c; reused by top_n/bot_n accumulators. */
 ray_t* topk_take_vec(ray_t* v, int64_t k, uint8_t desc);
 ray_t* ray_pearson_corr_fn(ray_t* x, ray_t* y);
+ray_t* ray_cov_fn(ray_t* x, ray_t* y);
+ray_t* ray_scov_fn(ray_t* x, ray_t* y);
+ray_t* ray_wsum_fn(ray_t* x, ray_t* y);
+ray_t* ray_wavg_fn(ray_t* x, ray_t* y);
 
 /* In-place median (quickselect).  Caller owns the buffer; we permute
  * elements.  Returns NaN if n <= 0.  Used by aggr_med_per_group_buf in

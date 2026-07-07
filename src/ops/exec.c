@@ -1512,7 +1512,7 @@ static int group_input_scan_syms(ray_graph_t* g, ray_op_ext_t* gx,
  * space-separated pass labels (predicate pushdown, …).  Cached per opcode so
  * the returned pointer stays valid for the life of a span. */
 static const char* prof_op_label(uint16_t opc) {
-#define PROF_OP_LABEL_MAX OP_MDEV
+#define PROF_OP_LABEL_MAX OP_WAVG
     if (opc > PROF_OP_LABEL_MAX) return ray_opcode_name(opc);
     static char lc[PROF_OP_LABEL_MAX + 1][28];
     if (!lc[opc][0]) {
@@ -1908,7 +1908,8 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
         }
 
         /* Reductions */
-        case OP_SUM: case OP_PROD: case OP_MIN: case OP_MAX:
+        case OP_SUM: case OP_PROD: case OP_ALL: case OP_ANY:
+        case OP_MIN: case OP_MAX:
         case OP_COUNT: case OP_AVG: case OP_FIRST: case OP_LAST:
         case OP_STDDEV: case OP_STDDEV_POP: case OP_VAR: case OP_VAR_POP: {
             ray_t* input = exec_node(g, op_child(g, op, 0));

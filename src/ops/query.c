@@ -419,8 +419,14 @@ static uint16_t resolve_agg_opcode(int64_t sym_id) {
     if (len == 3 && memcmp(name, "max",   3) == 0) return OP_MAX;
     if (len == 3 && memcmp(name, "dev",   3) == 0) return OP_STDDEV_POP;
     if (len == 3 && memcmp(name, "var",   3) == 0) return OP_VAR;
+    if (len == 3 && memcmp(name, "all",   3) == 0) return OP_ALL;
+    if (len == 3 && memcmp(name, "any",   3) == 0) return OP_ANY;
+    if (len == 3 && memcmp(name, "cov",   3) == 0) return OP_COV;
     if (len == 4 && memcmp(name, "prod",  4) == 0) return OP_PROD;
     if (len == 4 && memcmp(name, "last",  4) == 0) return OP_LAST;
+    if (len == 4 && memcmp(name, "scov",  4) == 0) return OP_SCOV;
+    if (len == 4 && memcmp(name, "wsum",  4) == 0) return OP_WSUM;
+    if (len == 4 && memcmp(name, "wavg",  4) == 0) return OP_WAVG;
     if (len == 5 && memcmp(name, "count", 5) == 0) return OP_COUNT;
     if (len == 5 && memcmp(name, "first", 5) == 0) return OP_FIRST;
     if (len == 6 && memcmp(name, "stddev",6) == 0) return OP_STDDEV;
@@ -1529,6 +1535,8 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
                     case OP_MIN:         return ray_min_op(g, arg);
                     case OP_MAX:         return ray_max_op(g, arg);
                     case OP_COUNT:       return ray_count(g, arg);
+                    case OP_ALL:         return ray_all(g, arg);
+                    case OP_ANY:         return ray_any(g, arg);
                     case OP_FIRST:       return ray_first(g, arg);
                     case OP_LAST:        return ray_last(g, arg);
                     case OP_PROD:        return ray_prod(g, arg);
@@ -8315,10 +8323,15 @@ by_dict_done:
                 }
                 agg_ins2[n_aggs] = NULL;
                 agg_k[n_aggs] = 0;
-                if (op == OP_PEARSON_CORR) {
-                    if (ray_len(val_expr) < 3) { ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("arity", "select by: cor aggregation requires two column arguments"); }
+                if (agg_is_binary_agg(op)) {
+                    if (ray_len(val_expr) < 3) { ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("arity", "select by: binary aggregation requires two column arguments"); }
                     agg_ins2[n_aggs] = compile_expr_dag(g, agg_elems[2]);
-                    if (!agg_ins2[n_aggs]) { ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain", "select by: failed to compile cor second argument"); }
+                    if (!agg_ins2[n_aggs]) { ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain", "select by: failed to compile binary aggregation second argument"); }
+                    if (agg_ins2[n_aggs]->out_type > 0 &&
+                        !agg_type_admitted(op, agg_ins2[n_aggs]->out_type)) {
+                        int8_t in_t = agg_ins2[n_aggs]->out_type;
+                        ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("type", "select by: binary aggregation does not admit second input type %s", ray_type_name(in_t));
+                    }
                     has_binary_agg = 1;
                 } else if (op == OP_TOP_N || op == OP_BOT_N) {
                     if (ray_len(val_expr) < 3) { ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("arity", "select by: top/bot aggregation requires a K argument"); }
@@ -9087,19 +9100,27 @@ by_dict_done:
                     scratch_free(sagg_hdr);
                     scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("type", "select: aggregation does not admit input type %s", ray_type_name(in_t));
                 }
-                if (op == OP_PEARSON_CORR) {
+                if (agg_is_binary_agg(op)) {
                     if (ray_len(val_expr) < 3) {
                         if (g->selection) { ray_release(g->selection); g->selection = NULL; }
                         ray_graph_free(g); ray_release(tbl);
                         scratch_free(sagg_hdr);
-                        scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("arity", "select: cor aggregation requires two column arguments");
+                        scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("arity", "select: binary aggregation requires two column arguments");
                     }
                     s_agg_ins2[s_n_aggs] = compile_expr_dag(g, agg_elems[2]);
                     if (!s_agg_ins2[s_n_aggs]) {
                         if (g->selection) { ray_release(g->selection); g->selection = NULL; }
                         ray_graph_free(g); ray_release(tbl);
                         scratch_free(sagg_hdr);
-                        scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain", "select: failed to compile cor second argument");
+                        scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain", "select: failed to compile binary aggregation second argument");
+                    }
+                    if (s_agg_ins2[s_n_aggs]->out_type > 0 &&
+                        !agg_type_admitted(op, s_agg_ins2[s_n_aggs]->out_type)) {
+                        int8_t in_t = s_agg_ins2[s_n_aggs]->out_type;
+                        if (g->selection) { ray_release(g->selection); g->selection = NULL; }
+                        ray_graph_free(g); ray_release(tbl);
+                        scratch_free(sagg_hdr);
+                        scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("type", "select: binary aggregation does not admit second input type %s", ray_type_name(in_t));
                     }
                     s_has_binary = 1;
                 }

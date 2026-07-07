@@ -89,17 +89,15 @@ bool agg_v2_can_handle(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
             continue;  /* admitted */
         }
         if (ext->agg_ins2 && ext->agg_ins2[a] != RAY_OP_NONE) {
-            if (ext->agg_ops[a] != OP_PEARSON_CORR) return false; /* only pearson in 2b */
+            if (!agg_is_binary_agg(ext->agg_ops[a])) return false;
             ray_op_t* xin = op_node(g, ext->agg_ins[a]); ray_op_t* yin = op_node(g, ext->agg_ins2[a]);
             if (!xin || xin->opcode != OP_SCAN || !yin || yin->opcode != OP_SCAN) return false;
             ray_op_ext_t* xe = find_ext(g, xin->id); ray_op_ext_t* ye = find_ext(g, yin->id);
             ray_t* xc = xe ? ray_table_get_col(tbl, xe->sym) : NULL;
             ray_t* yc = ye ? ray_table_get_col(tbl, ye->sym) : NULL;
-            /* pearson reads x/y per type (pearson_read_f64): admit any numeric/
-             * temporal pair, not just F64.  agg_resolve gates the exact set. */
             if (!xc || !yc) return false;
-            if (!agg_resolve(OP_PEARSON_CORR, xc->type)) return false;
-            if (!agg_resolve(OP_PEARSON_CORR, yc->type)) return false;
+            if (!agg_resolve(ext->agg_ops[a], xc->type)) return false;
+            if (!agg_resolve(ext->agg_ops[a], yc->type)) return false;
             continue;  /* admitted */
         }
         if (ext->agg_ops[a] == OP_COUNT) {
@@ -236,6 +234,8 @@ static const char* agg_name_suffix(uint16_t agg_op, size_t* slen_out) {
     switch (agg_op) {
         case OP_SUM:   sfx = "_sum";   slen = 4; break;
         case OP_PROD:  sfx = "_prod";  slen = 5; break;
+        case OP_ALL:   sfx = "_all";   slen = 4; break;
+        case OP_ANY:   sfx = "_any";   slen = 4; break;
         case OP_COUNT: sfx = "_count"; slen = 6; break;
         case OP_AVG:   sfx = "_mean";  slen = 5; break;
         case OP_MIN:   sfx = "_min";   slen = 4; break;
@@ -247,6 +247,10 @@ static const char* agg_name_suffix(uint16_t agg_op, size_t* slen_out) {
         case OP_VAR:        sfx = "_var";        slen = 4; break;
         case OP_VAR_POP:    sfx = "_var_pop";    slen = 8; break;
         case OP_MEDIAN:     sfx = "_median";     slen = 7; break;
+        case OP_COV:        sfx = "_cov";        slen = 4; break;
+        case OP_SCOV:       sfx = "_scov";       slen = 5; break;
+        case OP_WSUM:       sfx = "_wsum";       slen = 5; break;
+        case OP_WAVG:       sfx = "_wavg";       slen = 5; break;
         case OP_TOP_N:      sfx = "_top";        slen = 4; break;
         case OP_BOT_N:      sfx = "_bot";        slen = 4; break;
         default: break;

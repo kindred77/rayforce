@@ -60,6 +60,7 @@ typedef struct {
     double sum_d;
     int64_t cnt;
     int64_t null_count;
+    int64_t zero_count;
     bool has_first;
 } reduce_acc_t;
 
@@ -69,7 +70,7 @@ static void reduce_acc_init(reduce_acc_t* acc) {
     acc->sum_i = 0; acc->min_i = INT64_MAX; acc->max_i = INT64_MIN;
     acc->prod_i = 1; acc->first_i = 0; acc->last_i = 0; acc->sum_sq_i = 0;
     acc->sum_d = 0;
-    acc->cnt = 0; acc->null_count = 0; acc->has_first = false;
+    acc->cnt = 0; acc->null_count = 0; acc->zero_count = 0; acc->has_first = false;
 }
 
 /* Lexicographic SYM compare — resolves both sym_ids to strings and
@@ -216,6 +217,7 @@ static ray_t* agg_wide_reduce(ray_t* input, uint16_t op,
             (acc)->sum_sq_i = (int64_t)((uint64_t)(acc)->sum_sq_i + (uint64_t)v * (uint64_t)v); \
             (acc)->prod_i   = (int64_t)((uint64_t)(acc)->prod_i   * (uint64_t)v); \
             (acc)->sum_d   += (double)v; \
+            if (v == 0) (acc)->zero_count++; \
             if (v < (acc)->min_i) (acc)->min_i = v; \
             if (v > (acc)->max_i) (acc)->max_i = v; \
             if (!(acc)->has_first) { (acc)->first_i = v; (acc)->has_first = true; } \
@@ -233,6 +235,7 @@ static ray_t* agg_wide_reduce(ray_t* input, uint16_t op,
             double v = d[row]; \
             if ((HAS_NULLS) && v != v) { (acc)->null_count++; continue; } \
             (acc)->sum_f += v; (acc)->sum_sq_f += v * v; (acc)->prod_f *= v; \
+            if (v == 0.0) (acc)->zero_count++; \
             if (v < (acc)->min_f) (acc)->min_f = v; \
             if (v > (acc)->max_f) (acc)->max_f = v; \
             if (!(acc)->has_first) { (acc)->first_f = v; (acc)->has_first = true; } \
@@ -306,6 +309,7 @@ static void reduce_range(ray_t* input, int64_t start, int64_t end,
             acc->sum_sq_i = (int64_t)((uint64_t)acc->sum_sq_i + (uint64_t)v * (uint64_t)v);
             acc->prod_i   = (int64_t)((uint64_t)acc->prod_i   * (uint64_t)v);
             acc->sum_d   += (double)v;
+            if (v == 0) acc->zero_count++;
             if (v < acc->min_i) acc->min_i = v;
             if (v > acc->max_i) acc->max_i = v;
             if (!acc->has_first) { acc->first_i = v; acc->has_first = true; }
@@ -426,6 +430,7 @@ static void reduce_merge(reduce_acc_t* dst, const reduce_acc_t* src, int8_t in_t
     }
     dst->cnt += src->cnt;
     dst->null_count += src->null_count;
+    dst->zero_count += src->zero_count;
     /* reduce_merge does not merge first/last; caller handles these separately.
      * Since workers process sequential ranges, worker 0's first is the global first,
      * and the last worker's last is the global last. */
@@ -2108,6 +2113,8 @@ ray_t* exec_reduction(ray_graph_t* g, ray_op_t* op, ray_t* input) {
                     return ray_i64((int64_t)ray_str_len(input));
                 return ray_i64(1);
             case OP_SUM:        return ray_sum_fn(input);
+            case OP_ALL:        return ray_all_fn(input);
+            case OP_ANY:        return ray_any_fn(input);
             case OP_AVG:        return ray_avg_fn(input);
             case OP_MIN:        return ray_min_fn(input);
             case OP_MAX:        return ray_max_fn(input);
@@ -2239,6 +2246,8 @@ ray_t* exec_reduction(ray_graph_t* g, ray_op_t* op, ray_t* input) {
         switch (op->opcode) {
             case OP_SUM:   result = in_type == RAY_F64 ? ray_f64(ray_f64_fin(merged.sum_f)) : (in_type == RAY_TIME ? ray_time(merged.sum_i) : ray_i64(merged.sum_i)); break;
             case OP_PROD:  result = in_type == RAY_F64 ? ray_f64(ray_f64_fin(merged.prod_f)) : ray_i64(merged.prod_i); break;
+            case OP_ALL:   result = ray_bool(merged.zero_count == 0); break;
+            case OP_ANY:   result = ray_bool(merged.cnt > merged.zero_count); break;
             case OP_MIN:   result = reduction_extreme_result(op, in_type, merged.cnt > 0, merged.min_f, merged.min_i, input); break;
             case OP_MAX:   result = reduction_extreme_result(op, in_type, merged.cnt > 0, merged.max_f, merged.max_i, input); break;
             /* COUNT returns total length including nulls — matches ray_count_fn's
@@ -2278,6 +2287,8 @@ ray_t* exec_reduction(ray_graph_t* g, ray_op_t* op, ray_t* input) {
     switch (op->opcode) {
         case OP_SUM:   return in_type == RAY_F64 ? ray_f64(ray_f64_fin(acc.sum_f)) : (in_type == RAY_TIME ? ray_time(acc.sum_i) : ray_i64(acc.sum_i));
         case OP_PROD:  return in_type == RAY_F64 ? ray_f64(ray_f64_fin(acc.prod_f)) : ray_i64(acc.prod_i);
+        case OP_ALL:   return ray_bool(acc.zero_count == 0);
+        case OP_ANY:   return ray_bool(acc.cnt > acc.zero_count);
         case OP_MIN:   return reduction_extreme_result(op, in_type, acc.cnt > 0, acc.min_f, acc.min_i, input);
         case OP_MAX:   return reduction_extreme_result(op, in_type, acc.cnt > 0, acc.max_f, acc.max_i, input);
         /* COUNT returns total length including nulls — matches ray_count_fn's
@@ -2487,7 +2498,7 @@ bool ght_compute_layout(ght_layout_t* out, uint32_t n_keys, uint32_t n_aggs,
             /* Binary aggregator (OP_PEARSON_CORR): the y-side input
              * occupies the very next slot so phase1 packs (x, y)
              * consecutively.  GHT_AF_BINARY drives that packing. */
-            if (agg_ops && agg_ops[a] == OP_PEARSON_CORR) {
+            if (agg_ops && agg_is_binary_agg(agg_ops[a])) {
                 af |= GHT_AF_BINARY;
                 nv++;
             }
@@ -2515,6 +2526,8 @@ bool ght_compute_layout(ght_layout_t* out, uint32_t n_keys, uint32_t n_aggs,
         uint8_t af2 = 0;
         int64_t sent = 0;
         int8_t vslot = out->agg_val_slot[a];
+        if (agg_ops && (agg_ops[a] == OP_ALL || agg_ops[a] == OP_ANY))
+            af2 |= GHT_AF2_TRUTHY;
         if (vslot >= 0 && agg_vecs[a]) {
             ray_t* src = (agg_vecs[a]->attrs & RAY_ATTR_SLICE)
                          ? agg_vecs[a]->slice_parent : agg_vecs[a];
@@ -2981,12 +2994,22 @@ static inline void init_accum_from_entry(char* row, const char* entry,
      * loads. */
     const int8_t*  const vslot  = ly->agg_val_slot;
     const uint8_t* const aflags = ly->agg_flags;
+    const uint8_t* const aflags2 = ly->agg_flags2;
     for (uint32_t a = 0; a < na; a++) {
         int8_t s = vslot[a];
         if (s < 0) continue;
         uint8_t af = aflags[a];
         /* Copy raw 8 bytes from entry into each enabled accumulator block */
-        if (nf & GHT_NEED_SUM) memcpy(row + ly->off_sum + s * 8, agg_data + s * 8, 8);
+        if (nf & GHT_NEED_SUM) {
+            if (aflags2[a] & GHT_AF2_TRUTHY) {
+                int64_t tv;
+                if (af & GHT_AF_F64) { double v; memcpy(&v, agg_data + s * 8, 8); tv = (v != 0.0); }
+                else { int64_t v; memcpy(&v, agg_data + s * 8, 8); tv = (v != 0); }
+                memcpy(row + ly->off_sum + s * 8, &tv, 8);
+            } else {
+                memcpy(row + ly->off_sum + s * 8, agg_data + s * 8, 8);
+            }
+        }
         if (nf & GHT_NEED_MIN) memcpy(row + ly->off_min + s * 8, agg_data + s * 8, 8);
         if (nf & GHT_NEED_MAX) memcpy(row + ly->off_max + s * 8, agg_data + s * 8, 8);
         if (nf & GHT_NEED_SUMSQ) {
@@ -3062,6 +3085,7 @@ static inline void accum_from_entry(char* row, const char* entry,
      * (agg_is_f64/first/last/prod/sym/binary). */
     const int8_t*  const vslot  = ly->agg_val_slot;
     const uint8_t* const aflags = ly->agg_flags;
+    const uint8_t* const aflags2 = ly->agg_flags2;
     struct ray_sym_domain_s* const* const adom = ly->agg_dom;
     for (uint32_t a = 0; a < na; a++) {
         int8_t s = vslot[a];
@@ -3084,6 +3108,7 @@ static inline void accum_from_entry(char* row, const char* entry,
             if (nf & GHT_NEED_SUM) {
                 if (af & GHT_AF_FIRST) { if (take_first) memcpy(row + ly->off_sum + s * 8, val, 8); }
                 else if (af & GHT_AF_LAST) { if (take_last) memcpy(row + ly->off_sum + s * 8, val, 8); }
+                else if (aflags2[a] & GHT_AF2_TRUTHY) { ROW_WR_I64(row, ly->off_sum, s) += (v != 0.0); }
                 else if (af & GHT_AF_PROD) { ROW_WR_F64(row, ly->off_sum, s) *= v; }
                 else { ROW_WR_F64(row, ly->off_sum, s) += v; }
             }
@@ -3104,6 +3129,7 @@ static inline void accum_from_entry(char* row, const char* entry,
             if (nf & GHT_NEED_SUM) {
                 if (af & GHT_AF_FIRST) { if (take_first) memcpy(row + ly->off_sum + s * 8, val, 8); }
                 else if (af & GHT_AF_LAST) { if (take_last) memcpy(row + ly->off_sum + s * 8, val, 8); }
+                else if (aflags2[a] & GHT_AF2_TRUTHY) { ROW_WR_I64(row, ly->off_sum, s) += (v != 0); }
                 else if (af & GHT_AF_PROD) { ROW_WR_I64(row, ly->off_sum, s) = (int64_t)((uint64_t)ROW_RD_I64(row, ly->off_sum, s) * (uint64_t)v); }
                 else { ROW_WR_I64(row, ly->off_sum, s) += v; }
             }
@@ -3191,7 +3217,8 @@ static void accum_from_entry_nullable(char* row, const char* entry,
                         memcpy(row + ly->off_sum + s * 8, val, 8);
                         ROW_WR_I64(row, ly->off_last_row, s) = entry_row;
                     }
-                } else if (af & GHT_AF_PROD) { ROW_WR_F64(row, ly->off_sum, s) *= v; }
+                } else if (aflags2[a] & GHT_AF2_TRUTHY) { ROW_WR_I64(row, ly->off_sum, s) += (v != 0.0); }
+                else if (af & GHT_AF_PROD) { ROW_WR_F64(row, ly->off_sum, s) *= v; }
                 else { ROW_WR_F64(row, ly->off_sum, s) += v; }
             }
             if (nf & GHT_NEED_MIN) { double* p = &ROW_WR_F64(row, ly->off_min, s); if (v < *p) *p = v; }
@@ -3216,7 +3243,8 @@ static void accum_from_entry_nullable(char* row, const char* entry,
                         memcpy(row + ly->off_sum + s * 8, val, 8);
                         ROW_WR_I64(row, ly->off_last_row, s) = entry_row;
                     }
-                } else if (af & GHT_AF_PROD) { ROW_WR_I64(row, ly->off_sum, s) = (int64_t)((uint64_t)ROW_RD_I64(row, ly->off_sum, s) * (uint64_t)v); }
+                } else if (aflags2[a] & GHT_AF2_TRUTHY) { ROW_WR_I64(row, ly->off_sum, s) += (v != 0); }
+                else if (af & GHT_AF_PROD) { ROW_WR_I64(row, ly->off_sum, s) = (int64_t)((uint64_t)ROW_RD_I64(row, ly->off_sum, s) * (uint64_t)v); }
                 else { ROW_WR_I64(row, ly->off_sum, s) += v; }
             }
             if (nf & GHT_NEED_MIN) {
@@ -3954,13 +3982,18 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                             else v = sqrt(var_pop * nn / (nn - 1));
                             break;
                         }
-                        case OP_PEARSON_CORR: {
+                        case OP_PEARSON_CORR:
+                        case OP_COV:
+                        case OP_SCOV:
+                        case OP_WSUM:
+                        case OP_WAVG: {
                             /* Single-pass formula (same as ray_pearson_corr_fn):
                              *   r = (n·Σxy − Σx·Σy) /
                              *       sqrt((n·Σx² − Σx²)(n·Σy² − Σy²))
                              * Undefined for n<2 or constant side → emit
                              * NaN (canonicalize folds to null upstream). */
-                            if (cnt < 2) { v = 0.0; grp_set_null(ao->vec, di); break; }
+                            if ((op == OP_PEARSON_CORR || op == OP_SCOV) && cnt < 2) { v = 0.0; grp_set_null(ao->vec, di); break; }
+                            if ((op == OP_COV || op == OP_WAVG) && cnt < 1) { v = 0.0; grp_set_null(ao->vec, di); break; }
                             double sx  = sf ? ROW_RD_F64(row, ly->off_sum,    s)
                                             : (double)ROW_RD_I64(row, ly->off_sum, s);
                             double sxx = ly->off_sumsq ? ROW_RD_F64(row, ly->off_sumsq, s) : 0.0;
@@ -3971,6 +4004,10 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                             double num = dn * sxy - sx * sy;
                             double dx  = dn * sxx - sx * sx;
                             double dy  = dn * syy - sy * sy;
+                            if (op == OP_WSUM) { v = sxy; break; }
+                            if (op == OP_WAVG) { if (sx == 0.0) { v = NULL_F64; break; } v = sxy / sx; break; }
+                            if (op == OP_COV) { v = (sxy - sx * sy / dn) / dn; break; }
+                            if (op == OP_SCOV) { v = (sxy - sx * sy / dn) / (dn - 1.0); break; }
                             if (dx <= 0.0 || dy <= 0.0) { v = NULL_F64; break; }
                             v = num / sqrt(dx * dy);
                             break;
@@ -3995,6 +4032,8 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                             if (nn == 0) { v = int_null; grp_set_null(ao->vec, di); break; }
                             v = ROW_RD_I64(row, ly->off_sum, s); break;
                         case OP_COUNT: v = cnt; break;
+                        case OP_ALL:   v = (ROW_RD_I64(row, ly->off_sum, s) == nn) ? 1 : 0; break;
+                        case OP_ANY:   v = (ROW_RD_I64(row, ly->off_sum, s) > 0) ? 1 : 0; break;
                         case OP_MIN:
                             if (nn == 0) { v = int_null; grp_set_null(ao->vec, di); break; }
                             v = ROW_RD_I64(row, ly->off_min, s); break;
@@ -4522,6 +4561,9 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
             case OP_STDDEV: case OP_STDDEV_POP:
             case OP_VAR: case OP_VAR_POP:
                 out_type = RAY_F64; break;
+            case OP_ALL:
+            case OP_ANY:
+                out_type = RAY_BOOL; break;
             case OP_COUNT: out_type = RAY_I64; break;
             case OP_SUM: {
                 /* sum preserves TIME (a duration-like temporal): time+time is
@@ -4623,6 +4665,8 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
                         if (nn == 0) { v = int_null; ray_vec_set_null(new_col, gi, true); break; }
                         v = sum_i64[idx]; break;
                     case OP_COUNT: v = counts[gi]; break;
+                    case OP_ALL:   v = (sum_i64[idx] == nn) ? 1 : 0; break;
+                    case OP_ANY:   v = (sum_i64[idx] > 0) ? 1 : 0; break;
                     case OP_MIN:
                         if (nn == 0) { v = int_null; ray_vec_set_null(new_col, gi, true); break; }
                         v = min_i64[idx]; break;
@@ -4665,6 +4709,8 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
             switch (agg_op) {
                 case OP_SUM:   nsfx = "_sum";   nslen = 4; break;
                 case OP_PROD:  nsfx = "_prod";  nslen = 5; break;
+                case OP_ALL:   nsfx = "_all";   nslen = 4; break;
+                case OP_ANY:   nsfx = "_any";   nslen = 4; break;
                 case OP_COUNT: nsfx = "_count"; nslen = 6; break;
                 case OP_AVG:   nsfx = "_mean";  nslen = 5; break;
                 case OP_MIN:   nsfx = "_min";   nslen = 4; break;
@@ -4676,6 +4722,10 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
                 case OP_VAR:        nsfx = "_var";        nslen = 4; break;
                 case OP_VAR_POP:    nsfx = "_var_pop";    nslen = 8; break;
                 case OP_MEDIAN:     nsfx = "_median";     nslen = 7; break;
+                case OP_COV:        nsfx = "_cov";        nslen = 4; break;
+                case OP_SCOV:       nsfx = "_scov";       nslen = 5; break;
+                case OP_WSUM:       nsfx = "_wsum";       nslen = 5; break;
+                case OP_WAVG:       nsfx = "_wavg";       nslen = 5; break;
                 case OP_TOP_N:      nsfx = "_top";        nslen = 4; break;
                 case OP_BOT_N:      nsfx = "_bot";        nslen = 4; break;
             }
@@ -5276,7 +5326,12 @@ static inline void scalar_accum_row(scalar_ctx_t* c, da_accum_t* acc, int64_t r)
         bool int_null = !is_f && c->agg_int_null_has[a] &&
                         iv == c->agg_int_null_sentinel[a];
         bool is_null = is_f ? !(fv == fv) : int_null;
-        if (op == OP_SUM || op == OP_AVG || op == OP_STDDEV || op == OP_STDDEV_POP || op == OP_VAR || op == OP_VAR_POP) {
+        if (op == OP_ALL || op == OP_ANY) {
+            if (!is_null) {
+                acc->sum[a].i += (is_f ? (fv != 0.0) : (iv != 0)) ? 1 : 0;
+                if (nn) nn[a]++;
+            }
+        } else if (op == OP_SUM || op == OP_AVG || op == OP_STDDEV || op == OP_STDDEV_POP || op == OP_VAR || op == OP_VAR_POP) {
             if (is_f) {
                 /* NaN payload = null, skip from sum/sumsq. */
                 if (RAY_LIKELY(fv == fv)) {
@@ -5450,7 +5505,12 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
         bool int_null = (c->agg_int_null_mask & ((uint64_t)1 << a)) &&
                         iv == c->agg_int_null_sentinel[a];
         bool is_null = is_f ? !(fv == fv) : int_null;
-        if (op == OP_SUM || op == OP_AVG || op == OP_STDDEV || op == OP_STDDEV_POP || op == OP_VAR || op == OP_VAR_POP) {
+        if (op == OP_ALL || op == OP_ANY) {
+            if (!is_null) {
+                acc->sum[idx].i += (is_f ? (fv != 0.0) : (iv != 0)) ? 1 : 0;
+                if (nn) nn[idx]++;
+            }
+        } else if (op == OP_SUM || op == OP_AVG || op == OP_STDDEV || op == OP_STDDEV_POP || op == OP_VAR || op == OP_VAR_POP) {
             if (is_f) {
                 /* NaN payload = null, skip from sum/sumsq. */
                 if (RAY_LIKELY(fv == fv)) {
@@ -8153,13 +8213,13 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
      * falls to its integer default, returning 0. */
     bool sc_has_binary = false;
     for (uint32_t a = 0; a < n_aggs; a++)
-        if (ext->agg_ops[a] == OP_PEARSON_CORR) { sc_has_binary = true; break; }
+        if (agg_is_binary_agg(ext->agg_ops[a])) { sc_has_binary = true; break; }
     if (n_keys == 0 && nrows > 0 && !sc_has_binary) {
         uint8_t need_flags = DA_NEED_COUNT;
         bool has_first_last = false;
         for (uint32_t a = 0; a < n_aggs; a++) {
             uint16_t aop = ext->agg_ops[a];
-            if (aop == OP_SUM || aop == OP_PROD || aop == OP_AVG || aop == OP_FIRST || aop == OP_LAST)
+            if (aop == OP_SUM || aop == OP_PROD || aop == OP_AVG || aop == OP_ALL || aop == OP_ANY || aop == OP_FIRST || aop == OP_LAST)
                 need_flags |= DA_NEED_SUM;
             else if (aop == OP_STDDEV || aop == OP_STDDEV_POP || aop == OP_VAR || aop == OP_VAR_POP)
                 { need_flags |= DA_NEED_SUM; need_flags |= DA_NEED_SUMSQ; }
@@ -8555,7 +8615,7 @@ da_path:;
          * row_gid+grp_cnt pass which only the HT path provides. */
         for (uint32_t a = 0; a < n_aggs && da_eligible; a++) {
             uint16_t aop = ext->agg_ops[a];
-            if (aop == OP_PEARSON_CORR) da_eligible = false;
+            if (agg_is_binary_agg(aop)) da_eligible = false;
             if (aop == OP_MEDIAN)       da_eligible = false;
             if (aop == OP_TOP_N)        da_eligible = false;
             if (aop == OP_BOT_N)        da_eligible = false;
@@ -8673,7 +8733,7 @@ da_path:;
             uint8_t need_flags = DA_NEED_COUNT; /* always need count */
             for (uint32_t a = 0; a < n_aggs; a++) {
                 uint16_t aop = ext->agg_ops[a];
-                if (aop == OP_SUM || aop == OP_PROD || aop == OP_AVG || aop == OP_FIRST || aop == OP_LAST) need_flags |= DA_NEED_SUM;
+                if (aop == OP_SUM || aop == OP_PROD || aop == OP_AVG || aop == OP_ALL || aop == OP_ANY || aop == OP_FIRST || aop == OP_LAST) need_flags |= DA_NEED_SUM;
                 else if (aop == OP_STDDEV || aop == OP_STDDEV_POP || aop == OP_VAR || aop == OP_VAR_POP)
                     { need_flags |= DA_NEED_SUM; need_flags |= DA_NEED_SUMSQ; }
                 else if (aop == OP_MIN) need_flags |= DA_NEED_MIN;
@@ -8701,7 +8761,7 @@ da_path:;
             bool da_has_first_last = false;
             for (uint32_t a = 0; a < n_aggs; a++) {
                 uint16_t aop = ext->agg_ops[a];
-                if (aop == OP_SUM || aop == OP_PROD || aop == OP_AVG || aop == OP_FIRST || aop == OP_LAST) need_flags |= DA_NEED_SUM;
+                if (aop == OP_SUM || aop == OP_PROD || aop == OP_AVG || aop == OP_ALL || aop == OP_ANY || aop == OP_FIRST || aop == OP_LAST) need_flags |= DA_NEED_SUM;
                 else if (aop == OP_STDDEV || aop == OP_STDDEV_POP || aop == OP_VAR || aop == OP_VAR_POP)
                     { need_flags |= DA_NEED_SUM; need_flags |= DA_NEED_SUMSQ; }
                 else if (aop == OP_MIN) need_flags |= DA_NEED_MIN;
@@ -8951,7 +9011,7 @@ da_path:;
                             for (uint32_t a = 0; a < n_aggs; a++) {
                                 size_t idx = base + a;
                                 uint16_t aop = ext->agg_ops[a];
-                                if (aop == OP_SUM || aop == OP_AVG || aop == OP_STDDEV || aop == OP_STDDEV_POP || aop == OP_VAR || aop == OP_VAR_POP) {
+                                if (aop == OP_SUM || aop == OP_AVG || aop == OP_ALL || aop == OP_ANY || aop == OP_STDDEV || aop == OP_STDDEV_POP || aop == OP_VAR || aop == OP_VAR_POP) {
                                     if (agg_types[a] == RAY_F64) merged->sum[idx].f += wa->sum[idx].f;
                                     else merged->sum[idx].i += wa->sum[idx].i;
                                 } else if (aop == OP_PROD) {
@@ -9790,11 +9850,11 @@ ht_path:;
     uint8_t ght_need = 0;
     for (uint32_t a = 0; a < n_aggs; a++) {
         uint16_t aop = ext->agg_ops[a];
-        if (aop == OP_SUM || aop == OP_PROD || aop == OP_AVG || aop == OP_FIRST || aop == OP_LAST)
+        if (aop == OP_SUM || aop == OP_PROD || aop == OP_AVG || aop == OP_ALL || aop == OP_ANY || aop == OP_FIRST || aop == OP_LAST)
             ght_need |= GHT_NEED_SUM;
         if (aop == OP_STDDEV || aop == OP_STDDEV_POP || aop == OP_VAR || aop == OP_VAR_POP)
             { ght_need |= GHT_NEED_SUM; ght_need |= GHT_NEED_SUMSQ; }
-        if (aop == OP_PEARSON_CORR)
+        if (agg_is_binary_agg(aop))
             { ght_need |= GHT_NEED_SUM; ght_need |= GHT_NEED_SUMSQ;
               ght_need |= GHT_NEED_PEARSON; }
         if (aop == OP_MIN) ght_need |= GHT_NEED_MIN;
@@ -10382,8 +10442,13 @@ v2_emit:;
                 case OP_STDDEV: case OP_STDDEV_POP:
                 case OP_VAR: case OP_VAR_POP:
                 case OP_PEARSON_CORR:
+                case OP_COV: case OP_SCOV:
+                case OP_WSUM: case OP_WAVG:
                 case OP_MEDIAN:
                     out_type = RAY_F64; break;
+                case OP_ALL:
+                case OP_ANY:
+                    out_type = RAY_BOOL; break;
                 case OP_COUNT: out_type = RAY_I64; break;
                 case OP_SUM:
                     /* sum preserves TIME (duration-like); other integer
@@ -10664,6 +10729,9 @@ v2_emit:;
                 size_t slen = 0;
                 switch (agg_op) {
                     case OP_SUM:   sfx = "_sum";   slen = 4; break;
+                    case OP_PROD:  sfx = "_prod";  slen = 5; break;
+                    case OP_ALL:   sfx = "_all";   slen = 4; break;
+                    case OP_ANY:   sfx = "_any";   slen = 4; break;
                     case OP_COUNT: sfx = "_count"; slen = 6; break;
                     case OP_AVG:   sfx = "_mean";  slen = 5; break;
                     case OP_MIN:   sfx = "_min";   slen = 4; break;
@@ -10675,6 +10743,10 @@ v2_emit:;
                     case OP_VAR:        sfx = "_var";        slen = 4; break;
                     case OP_VAR_POP:    sfx = "_var_pop";    slen = 8; break;
                     case OP_MEDIAN:     sfx = "_median";     slen = 7; break;
+                    case OP_COV:        sfx = "_cov";        slen = 4; break;
+                    case OP_SCOV:       sfx = "_scov";       slen = 5; break;
+                    case OP_WSUM:       sfx = "_wsum";       slen = 5; break;
+                    case OP_WAVG:       sfx = "_wavg";       slen = 5; break;
                     case OP_TOP_N:      sfx = "_top";        slen = 4; break;
                     case OP_BOT_N:      sfx = "_bot";        slen = 4; break;
                 }
@@ -10965,8 +11037,13 @@ sequential_fallback:;
             case OP_STDDEV: case OP_STDDEV_POP:
             case OP_VAR: case OP_VAR_POP:
             case OP_PEARSON_CORR:
+            case OP_COV: case OP_SCOV:
+            case OP_WSUM: case OP_WAVG:
             case OP_MEDIAN:
                 out_type = RAY_F64; break;
+            case OP_ALL:
+            case OP_ANY:
+                out_type = RAY_BOOL; break;
             case OP_COUNT: out_type = RAY_I64; break;
             case OP_SUM: {
                 /* sum preserves TIME (a duration-like temporal): time+time is
@@ -11070,8 +11147,13 @@ sequential_fallback:;
                         else v = sqrt(var_pop * nn / (nn - 1));
                         break;
                     }
-                    case OP_PEARSON_CORR: {
-                        if (cnt < 2) { v = 0.0; ray_vec_set_null(new_col, gi, true); break; }
+                    case OP_PEARSON_CORR:
+                    case OP_COV:
+                    case OP_SCOV:
+                    case OP_WSUM:
+                    case OP_WAVG: {
+                        if ((agg_op == OP_PEARSON_CORR || agg_op == OP_SCOV) && cnt < 2) { v = 0.0; ray_vec_set_null(new_col, gi, true); break; }
+                        if ((agg_op == OP_COV || agg_op == OP_WAVG) && cnt < 1) { v = 0.0; ray_vec_set_null(new_col, gi, true); break; }
                         double sx  = is_f64 ? ROW_RD_F64(row, ly->off_sum,    s)
                                             : (double)ROW_RD_I64(row, ly->off_sum, s);
                         double sxx = ly->off_sumsq ? ROW_RD_F64(row, ly->off_sumsq, s) : 0.0;
@@ -11082,6 +11164,10 @@ sequential_fallback:;
                         double num = dn * sxy - sx * sy;
                         double dx  = dn * sxx - sx * sx;
                         double dy  = dn * syy - sy * sy;
+                        if (agg_op == OP_WSUM) { v = sxy; break; }
+                        if (agg_op == OP_WAVG) { if (sx == 0.0) { v = NULL_F64; break; } v = sxy / sx; break; }
+                        if (agg_op == OP_COV) { v = (sxy - sx * sy / dn) / dn; break; }
+                        if (agg_op == OP_SCOV) { v = (sxy - sx * sy / dn) / (dn - 1.0); break; }
                         if (dx <= 0.0 || dy <= 0.0) { v = NULL_F64; break; }
                         v = num / sqrt(dx * dy);
                         break;
@@ -11105,6 +11191,8 @@ sequential_fallback:;
                         if (nn == 0) { v = int_null; ray_vec_set_null(new_col, gi, true); break; }
                         v = ROW_RD_I64(row, ly->off_sum, s); break;
                     case OP_COUNT: v = cnt; break;
+                    case OP_ALL:   v = (ROW_RD_I64(row, ly->off_sum, s) == nn) ? 1 : 0; break;
+                    case OP_ANY:   v = (ROW_RD_I64(row, ly->off_sum, s) > 0) ? 1 : 0; break;
                     case OP_MIN:
                         if (nn == 0) { v = int_null; ray_vec_set_null(new_col, gi, true); break; }
                         v = ROW_RD_I64(row, ly->off_min, s); break;
@@ -11147,6 +11235,8 @@ sequential_fallback:;
             switch (agg_op) {
                 case OP_SUM:   nsfx = "_sum";   nslen = 4; break;
                 case OP_PROD:  nsfx = "_prod";  nslen = 5; break;
+                case OP_ALL:   nsfx = "_all";   nslen = 4; break;
+                case OP_ANY:   nsfx = "_any";   nslen = 4; break;
                 case OP_COUNT: nsfx = "_count"; nslen = 6; break;
                 case OP_AVG:   nsfx = "_mean";  nslen = 5; break;
                 case OP_MIN:   nsfx = "_min";   nslen = 4; break;
@@ -11158,6 +11248,10 @@ sequential_fallback:;
                 case OP_VAR:        nsfx = "_var";        nslen = 4; break;
                 case OP_VAR_POP:    nsfx = "_var_pop";    nslen = 8; break;
                 case OP_MEDIAN:     nsfx = "_median";     nslen = 7; break;
+                case OP_COV:        nsfx = "_cov";        nslen = 4; break;
+                case OP_SCOV:       nsfx = "_scov";       nslen = 5; break;
+                case OP_WSUM:       nsfx = "_wsum";       nslen = 5; break;
+                case OP_WAVG:       nsfx = "_wavg";       nslen = 5; break;
                 case OP_TOP_N:      nsfx = "_top";        nslen = 4; break;
                 case OP_BOT_N:      nsfx = "_bot";        nslen = 4; break;
             }

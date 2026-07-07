@@ -220,7 +220,13 @@ void     ray_cancel_reset(void);
 #define OP_MEDIAN       88   /* exact median per group (bucket-scatter + quickselect) */
 #define OP_TOP_N        89   /* per-group largest K values (bounded max-heap) */
 #define OP_BOT_N        90   /* per-group smallest K values (bounded min-heap) */
-/* Opcodes 91 and 110-114 are retired (formerly OP_GROUP_*_ROWFORM); the
+#define OP_ALL          131  /* truthy-all reduction (nulls skipped) */
+#define OP_ANY          132  /* truthy-any reduction (nulls skipped) */
+#define OP_COV          133  /* population covariance per group (binary input) */
+#define OP_SCOV         134  /* sample covariance per group (binary input) */
+#define OP_WSUM         135  /* weighted sum: sum(weight * value) */
+#define OP_WAVG         136  /* weighted average: sum(weight * value) / sum(weight) */
+/* Opcodes 110-114 are retired (formerly OP_GROUP_*_ROWFORM); the
  * dedicated row-form group operators were subsumed by the v2 group engine.
  * Numbers left unreused to avoid renumbering churn. */
 
@@ -229,6 +235,8 @@ void     ray_cancel_reset(void);
  * BOTH paths accept exactly the same element types for each aggregate:
  *   sum  : numeric (BOOL/U8/I16/I32/I64/F64) + TIME (a duration-like ms count)
  *   prod : numeric only
+ *   all / any : numeric only, result BOOL
+ *   cov / scov / wsum / wavg / pearson_corr : numeric only, result F64
  *   avg / var / var_pop / stddev / stddev_pop : numeric + temporal (result F64)
  *   min / max / first / last / count and everything else : any type
  * `t` is the positive element/column type.  DATE/TIMESTAMP are absolute points
@@ -248,6 +256,12 @@ static inline bool agg_type_admitted(uint16_t op, int8_t t) {
         case OP_SUM:  return !(nonnum || t == RAY_DATE || t == RAY_TIMESTAMP);
         /* prod: numeric only — reject non-numeric and every temporal. */
         case OP_PROD: return !(nonnum || temporal);
+        /* truth and pairwise stats operate on numeric values only. */
+        case OP_ALL: case OP_ANY:
+        case OP_COV: case OP_SCOV:
+        case OP_WSUM: case OP_WAVG:
+        case OP_PEARSON_CORR:
+            return !(nonnum || temporal);
         /* avg / var / stddev: numeric + temporal → F64; reject SYM/STR/GUID. */
         case OP_AVG:
         case OP_VAR: case OP_VAR_POP:
@@ -255,6 +269,15 @@ static inline bool agg_type_admitted(uint16_t op, int8_t t) {
             return !nonnum;
         default: return true;
     }
+}
+
+static inline bool agg_is_binary_agg(uint16_t op) {
+    return op == OP_PEARSON_CORR || op == OP_COV || op == OP_SCOV ||
+           op == OP_WSUM || op == OP_WAVG;
+}
+
+static inline bool agg_is_truth_agg(uint16_t op) {
+    return op == OP_ALL || op == OP_ANY;
 }
 
 /* Opcodes — Graph */
@@ -377,7 +400,7 @@ typedef struct ray_op_ext {
             uint16_t*  agg_ops;
             uint32_t*  agg_ins;     /* node ids */
             /* Optional second input per agg — non-NULL only for binary
-             * aggregators (currently: OP_PEARSON_CORR). NULL for all
+             * aggregators (pearson/cov/scov/wsum/wavg). NULL for all
              * unary aggs and for the whole pointer when no binary agg
              * is present in this group. */
             uint32_t*  agg_ins2;    /* node ids */
@@ -665,6 +688,8 @@ ray_op_t* ray_date_trunc(ray_graph_t* g, ray_op_t* col, int64_t field);
 /* Reduction ops */
 ray_op_t* ray_sum(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_prod(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_all(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_any(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_min_op(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_max_op(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_count(ray_graph_t* g, ray_op_t* a);
@@ -709,7 +734,7 @@ ray_op_t* ray_group(ray_graph_t* g, ray_op_t** keys, uint32_t n_keys,
                    uint16_t* agg_ops, ray_op_t** agg_ins, uint32_t n_aggs);
 /* Variant accepting an optional second-input column per agg.  agg_ins2
  * is parallel to agg_ins (length n_aggs); slots are NULL for unary aggs
- * and non-NULL only for binary aggregators (currently OP_PEARSON_CORR). */
+ * and non-NULL only for binary aggregators (pearson/cov/scov/wsum/wavg). */
 ray_op_t* ray_group2(ray_graph_t* g, ray_op_t** keys, uint32_t n_keys,
                      uint16_t* agg_ops, ray_op_t** agg_ins,
                      ray_op_t** agg_ins2, uint32_t n_aggs);

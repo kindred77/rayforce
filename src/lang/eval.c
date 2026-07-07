@@ -2997,6 +2997,10 @@ static void ray_register_builtins(void) {
      * that it rejected with a bogus "expects two vectors" type error.
      * Without the flag eval materializes lazy args before the call. */
     register_binary("pearson_corr", RAY_FN_AGGR, ray_pearson_corr_fn);
+    register_binary("cov",  RAY_FN_AGGR, ray_cov_fn);
+    register_binary("scov", RAY_FN_AGGR, ray_scov_fn);
+    register_binary("wsum", RAY_FN_AGGR, ray_wsum_fn);
+    register_binary("wavg", RAY_FN_AGGR, ray_wavg_fn);
 
     /* Special forms */
     register_binary("set", RAY_FN_SPECIAL_FORM | RAY_FN_RESTRICTED, ray_set_fn);
@@ -3010,6 +3014,8 @@ static void ray_register_builtins(void) {
      * and must NOT have their args materialised by the dispatcher. */
     register_unary("sum",   RAY_FN_AGGR | RAY_FN_LAZY_AWARE, ray_sum_fn);
     register_unary("prod",  RAY_FN_AGGR | RAY_FN_LAZY_AWARE, ray_prod_fn);
+    register_unary("all",   RAY_FN_AGGR | RAY_FN_LAZY_AWARE, ray_all_fn);
+    register_unary("any",   RAY_FN_AGGR | RAY_FN_LAZY_AWARE, ray_any_fn);
     register_unary("count", RAY_FN_AGGR | RAY_FN_LAZY_AWARE, ray_count_fn);
     register_unary("avg",   RAY_FN_AGGR | RAY_FN_LAZY_AWARE, ray_avg_fn);
     register_unary("min",   RAY_FN_AGGR | RAY_FN_LAZY_AWARE, ray_min_fn);
