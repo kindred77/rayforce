@@ -137,6 +137,8 @@ static test_result_t test_dump_opcode_name_all(void) {
         { OP_DFS,"DFS"}, { OP_ASTAR,"ASTAR"}, { OP_K_SHORTEST,"K_SHORTEST"},
         { OP_CLUSTER_COEFF,"CLUSTER_COEFF"}, { OP_RANDOM_WALK,"RANDOM_WALK"},
         { OP_ANN_RERANK,"ANN_RERANK"}, { OP_KNN_RERANK,"KNN_RERANK"},
+        { OP_LAG,"LAG"}, { OP_LEAD,"LEAD"},
+        { OP_DELTAS,"DELTAS"}, { OP_RATIOS,"RATIOS"},
     };
     size_t n = sizeof cases / sizeof cases[0];
     for (size_t i = 0; i < n; i++) {

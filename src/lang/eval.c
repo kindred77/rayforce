@@ -3048,6 +3048,10 @@ static void ray_register_builtins(void) {
     register_binary("find",    RAY_FN_NONE, ray_find_fn);
     register_unary("reverse",  RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_reverse_fn);
     register_unary("til",      RAY_FN_NONE, ray_til_fn);
+    register_unary_op("lag",    RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_lag_fn,    OP_LAG);
+    register_unary_op("lead",   RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_lead_fn,   OP_LEAD);
+    register_unary_op("deltas", RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_deltas_fn, OP_DELTAS);
+    register_unary_op("ratios", RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_ratios_fn, OP_RATIOS);
 
     /* Sorting operations */
     register_unary("asc",      RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_asc_fn);

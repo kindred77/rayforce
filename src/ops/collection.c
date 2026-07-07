@@ -2287,6 +2287,305 @@ ray_t* reverse_vec_eager(ray_t* x) {
     return result;
 }
 
+typedef struct {
+    ray_t*  src;
+    ray_t*  dst;
+    ray_pool_t* pool;
+    int64_t src_off;
+    int64_t dst_off;
+    int     esz;
+} ts_shift_ctx_t;
+
+static inline bool ts_morsel_checkpoint(ray_pool_t* pool, int64_t local_idx) {
+    return (local_idx % RAY_MORSEL_ELEMS) == 0 && pool_cancelled(pool);
+}
+
+static void ts_shift_copy_fn(void* vctx, uint32_t worker_id, int64_t start, int64_t end) {
+    (void)worker_id;
+    ts_shift_ctx_t* c = (ts_shift_ctx_t*)vctx;
+    const char* src = (const char*)ray_data(c->src) + (c->src_off + start) * c->esz;
+    char* dst = (char*)ray_data(c->dst) + (c->dst_off + start) * c->esz;
+    size_t esz = (size_t)c->esz;
+    for (int64_t i = start; i < end; i++, src += esz, dst += esz) {
+        if (ts_morsel_checkpoint(c->pool, i - start)) return;
+        memcpy(dst, src, esz);
+    }
+}
+
+static ray_t* ts_alloc_like(ray_t* x) {
+    if (x->type == RAY_STR)
+        return ray_error("type", "time-series shift: string vectors are not supported yet");
+    ray_t* out = (x->type == RAY_SYM)
+               ? ray_sym_vec_new(x->attrs & RAY_SYM_W_MASK, x->len)
+               : ray_vec_new(x->type, x->len);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    out->len = x->len;
+    if (x->type == RAY_SYM) ray_sym_vec_adopt_domain(out, x);
+    return out;
+}
+
+static void ts_set_boundary(ray_t* out, int64_t idx) {
+    if (!out || idx < 0 || idx >= out->len) return;
+    switch (out->type) {
+        case RAY_BOOL:
+        case RAY_U8:
+            ((uint8_t*)ray_data(out))[idx] = 0;
+            return;
+        case RAY_SYM:
+            ray_write_sym(ray_data(out), idx, 0, out->type, out->attrs);
+            return;
+        default:
+            ray_vec_set_null(out, idx, true);
+            return;
+    }
+}
+
+static ray_t* shift_vec_eager(ray_t* x, bool lead) {
+    if (!x || RAY_IS_ERR(x)) return x;
+    if (!ray_is_vec(x)) return ray_error("type", "time-series shift expects a vector input");
+    if (RAY_IS_PARTED(x->type)) {
+        ray_t* flat = parted_to_flat_vec(x);
+        if (!flat || RAY_IS_ERR(flat)) return flat ? flat : ray_error("oom", NULL);
+        ray_t* out = shift_vec_eager(flat, lead);
+        ray_release(flat);
+        return out;
+    }
+
+    int64_t n = x->len;
+    ray_t* out = ts_alloc_like(x);
+    if (!out || RAY_IS_ERR(out)) return out;
+    if (n == 0) return out;
+    if (n == 1) {
+        ts_set_boundary(out, 0);
+        return out;
+    }
+
+    int esz = (x->type == RAY_SYM)
+            ? ray_sym_elem_size(x->type, x->attrs)
+            : ray_elem_size(x->type);
+    ray_pool_t* pool = ray_pool_get();
+    ts_shift_ctx_t ctx = {
+        .src = x,
+        .dst = out,
+        .pool = pool,
+        .src_off = lead ? 1 : 0,
+        .dst_off = lead ? 0 : 1,
+        .esz = esz
+    };
+    ray_pool_dispatch(pool, ts_shift_copy_fn, &ctx, n - 1);
+    if (pool_cancelled(pool)) { ray_release(out); return ray_error("cancel", "interrupted"); }
+    ts_set_boundary(out, lead ? n - 1 : 0);
+    if (x->attrs & RAY_ATTR_HAS_NULLS) out->attrs |= RAY_ATTR_HAS_NULLS;
+    return out;
+}
+
+ray_t* lag_vec_eager(ray_t* x) {
+    return shift_vec_eager(x, false);
+}
+
+ray_t* lead_vec_eager(ray_t* x) {
+    return shift_vec_eager(x, true);
+}
+
+static bool ts_delta_type(int8_t t) {
+    switch (t) {
+        case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
+        case RAY_F32: case RAY_F64:
+        case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool ts_ratio_type(int8_t t) {
+    switch (t) {
+        case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
+        case RAY_F32: case RAY_F64:
+            return true;
+        default:
+            return false;
+    }
+}
+
+typedef struct {
+    ray_t* src;
+    ray_t* dst;
+    ray_pool_t* pool;
+    bool   has_nulls;
+} ts_delta_ctx_t;
+
+static void ts_deltas_fn(void* vctx, uint32_t worker_id, int64_t start, int64_t end) {
+    (void)worker_id;
+    ts_delta_ctx_t* c = (ts_delta_ctx_t*)vctx;
+    ray_t* src = c->src;
+    int8_t t = src->type;
+    const void* d = ray_data(src);
+
+    if (c->dst->type == RAY_F64) {
+        double* out = (double*)ray_data(c->dst);
+        for (int64_t r = start + 1; r < end + 1; r++) {
+            if (ts_morsel_checkpoint(c->pool, r - (start + 1))) return;
+            if (c->has_nulls && (ray_vec_is_null(src, r) || ray_vec_is_null(src, r - 1))) {
+                out[r] = NULL_F64;
+                continue;
+            }
+            double cur = (t == RAY_F64) ? ((const double*)d)[r]
+                       : (t == RAY_F32) ? (double)((const float*)d)[r]
+                       : (double)read_col_i64(d, r, t, src->attrs);
+            double prev = (t == RAY_F64) ? ((const double*)d)[r - 1]
+                        : (t == RAY_F32) ? (double)((const float*)d)[r - 1]
+                        : (double)read_col_i64(d, r - 1, t, src->attrs);
+            out[r] = ray_f64_fin(cur - prev);
+        }
+    } else {
+        int64_t* out = (int64_t*)ray_data(c->dst);
+        for (int64_t r = start + 1; r < end + 1; r++) {
+            if (ts_morsel_checkpoint(c->pool, r - (start + 1))) return;
+            if (c->has_nulls && (ray_vec_is_null(src, r) || ray_vec_is_null(src, r - 1))) {
+                out[r] = NULL_I64;
+                continue;
+            }
+            int64_t cur = read_col_i64(d, r, t, src->attrs);
+            int64_t prev = read_col_i64(d, r - 1, t, src->attrs);
+            out[r] = (int64_t)((uint64_t)cur - (uint64_t)prev);
+        }
+    }
+}
+
+ray_t* deltas_vec_eager(ray_t* x) {
+    if (!x || RAY_IS_ERR(x)) return x;
+    if (!ray_is_vec(x)) return ray_error("type", "deltas expects a vector input");
+    if (RAY_IS_PARTED(x->type)) {
+        ray_t* flat = parted_to_flat_vec(x);
+        if (!flat || RAY_IS_ERR(flat)) return flat ? flat : ray_error("oom", NULL);
+        ray_t* out = deltas_vec_eager(flat);
+        ray_release(flat);
+        return out;
+    }
+    if (!ts_delta_type(x->type))
+        return ray_error("type", "deltas expects a numeric or temporal vector, got %s", ray_type_name(x->type));
+
+    int64_t n = x->len;
+    int8_t out_type = (x->type == RAY_F64 || x->type == RAY_F32) ? RAY_F64 : RAY_I64;
+    ray_t* out = ray_vec_new(out_type, n);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    out->len = n;
+    if (n == 0) return out;
+    out->attrs |= RAY_ATTR_HAS_NULLS;
+    if (out_type == RAY_F64) ((double*)ray_data(out))[0] = NULL_F64;
+    else                     ((int64_t*)ray_data(out))[0] = NULL_I64;
+    if (n == 1) return out;
+
+    ray_pool_t* pool = ray_pool_get();
+    ts_delta_ctx_t ctx = {
+        .src = x,
+        .dst = out,
+        .pool = pool,
+        .has_nulls = (x->attrs & RAY_ATTR_HAS_NULLS) != 0
+    };
+    ray_pool_dispatch(pool, ts_deltas_fn, &ctx, n - 1);
+    if (pool_cancelled(pool)) { ray_release(out); return ray_error("cancel", "interrupted"); }
+    return out;
+}
+
+typedef struct {
+    ray_t* src;
+    ray_t* dst;
+    ray_pool_t* pool;
+    bool   has_nulls;
+} ts_ratio_ctx_t;
+
+static void ts_ratios_fn(void* vctx, uint32_t worker_id, int64_t start, int64_t end) {
+    (void)worker_id;
+    ts_ratio_ctx_t* c = (ts_ratio_ctx_t*)vctx;
+    ray_t* src = c->src;
+    int8_t t = src->type;
+    const void* d = ray_data(src);
+    double* out = (double*)ray_data(c->dst);
+
+    for (int64_t r = start + 1; r < end + 1; r++) {
+        if (ts_morsel_checkpoint(c->pool, r - (start + 1))) return;
+        if (c->has_nulls && (ray_vec_is_null(src, r) || ray_vec_is_null(src, r - 1))) {
+            out[r] = NULL_F64;
+            continue;
+        }
+        double cur = (t == RAY_F64) ? ((const double*)d)[r]
+                   : (t == RAY_F32) ? (double)((const float*)d)[r]
+                   : (double)read_col_i64(d, r, t, src->attrs);
+        double prev = (t == RAY_F64) ? ((const double*)d)[r - 1]
+                    : (t == RAY_F32) ? (double)((const float*)d)[r - 1]
+                    : (double)read_col_i64(d, r - 1, t, src->attrs);
+        out[r] = (prev != 0.0) ? ray_f64_fin(cur / prev) : NULL_F64;
+    }
+}
+
+ray_t* ratios_vec_eager(ray_t* x) {
+    if (!x || RAY_IS_ERR(x)) return x;
+    if (!ray_is_vec(x)) return ray_error("type", "ratios expects a vector input");
+    if (RAY_IS_PARTED(x->type)) {
+        ray_t* flat = parted_to_flat_vec(x);
+        if (!flat || RAY_IS_ERR(flat)) return flat ? flat : ray_error("oom", NULL);
+        ray_t* out = ratios_vec_eager(flat);
+        ray_release(flat);
+        return out;
+    }
+    if (!ts_ratio_type(x->type))
+        return ray_error("type", "ratios expects a numeric vector, got %s", ray_type_name(x->type));
+
+    int64_t n = x->len;
+    ray_t* out = ray_vec_new(RAY_F64, n);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    out->len = n;
+    if (n == 0) return out;
+    out->attrs |= RAY_ATTR_HAS_NULLS;
+    ((double*)ray_data(out))[0] = NULL_F64;
+    if (n == 1) return out;
+
+    ray_pool_t* pool = ray_pool_get();
+    ts_ratio_ctx_t ctx = {
+        .src = x,
+        .dst = out,
+        .pool = pool,
+        .has_nulls = (x->attrs & RAY_ATTR_HAS_NULLS) != 0
+    };
+    ray_pool_dispatch(pool, ts_ratios_fn, &ctx, n - 1);
+    if (pool_cancelled(pool)) { ray_release(out); return ray_error("cancel", "interrupted"); }
+    return out;
+}
+
+static ray_t* ts_start_lazy_unary(ray_t* x, ray_op_t* (*ctor)(ray_graph_t*, ray_op_t*)) {
+    ray_graph_t* g = ray_graph_new(NULL);
+    if (!g) return ray_error("oom", NULL);
+    ray_op_t* in = ray_graph_input_vec(g, x);
+    ray_op_t* op = ctor(g, in);
+    return ray_lazy_wrap(g, op);
+}
+
+ray_t* ray_lag_fn(ray_t* x) {
+    if (ray_is_lazy(x)) return ray_lazy_append(x, OP_LAG);
+    if (ray_is_vec(x)) return ts_start_lazy_unary(x, ray_lag_op);
+    return ray_error("type", "lag expects a vector input, got %s", ray_type_name(x ? x->type : 0));
+}
+
+ray_t* ray_lead_fn(ray_t* x) {
+    if (ray_is_lazy(x)) return ray_lazy_append(x, OP_LEAD);
+    if (ray_is_vec(x)) return ts_start_lazy_unary(x, ray_lead_op);
+    return ray_error("type", "lead expects a vector input, got %s", ray_type_name(x ? x->type : 0));
+}
+
+ray_t* ray_deltas_fn(ray_t* x) {
+    if (ray_is_lazy(x)) return ray_lazy_append(x, OP_DELTAS);
+    if (ray_is_vec(x)) return ts_start_lazy_unary(x, ray_deltas_op);
+    return ray_error("type", "deltas expects a vector input, got %s", ray_type_name(x ? x->type : 0));
+}
+
+ray_t* ray_ratios_fn(ray_t* x) {
+    if (ray_is_lazy(x)) return ray_lazy_append(x, OP_RATIOS);
+    if (ray_is_vec(x)) return ts_start_lazy_unary(x, ray_ratios_op);
+    return ray_error("type", "ratios expects a vector input, got %s", ray_type_name(x ? x->type : 0));
+}
+
 /* (reverse vec) — reverse a vector */
 ray_t* ray_reverse_fn(ray_t* x) {
     if (!x || RAY_IS_ERR(x)) return x;

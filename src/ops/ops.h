@@ -287,6 +287,11 @@ static inline bool agg_type_admitted(uint16_t op, int8_t t) {
 #define OP_ASC            105   /* sort vector ascending                        */
 #define OP_DESC           106   /* sort vector descending                       */
 #define OP_REVERSE        107   /* reverse vector order                         */
+#define OP_LAG            108   /* previous row value, first row null/sentinel  */
+#define OP_LEAD           109   /* next row value, last row null/sentinel       */
+/* Opcodes 110-114 are retired (formerly OP_GROUP_*_ROWFORM). */
+#define OP_DELTAS         115   /* adjacent differences, first row null         */
+#define OP_RATIOS         116   /* adjacent ratios as F64, first row null       */
 
 /* Opcodes — Misc */
 #define OP_ALIAS        70
@@ -655,6 +660,10 @@ ray_op_t* ray_distinct_op(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_asc_op(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_desc_op(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_reverse_op(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_lag_op(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_lead_op(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_deltas_op(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_ratios_op(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_stddev(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_stddev_pop(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_var(ray_graph_t* g, ray_op_t* a);

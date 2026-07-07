@@ -336,12 +336,14 @@ static dag_unary_ctor resolve_unary_dag(int64_t sym_id) {
     const char* name = ray_str_ptr(s);
     size_t len = ray_str_len(s);
     if (len == 3) {
+        if (memcmp(name, "lag", 3) == 0) return ray_lag_op;
         if (memcmp(name, "neg", 3) == 0) return ray_neg;
         if (memcmp(name, "not", 3) == 0) return ray_not;
         if (memcmp(name, "abs", 3) == 0) return ray_abs;
         if (memcmp(name, "exp", 3) == 0) return ray_exp_op;
         if (memcmp(name, "log", 3) == 0) return ray_log_op;
     } else if (len == 4) {
+        if (memcmp(name, "lead", 4) == 0) return ray_lead_op;
         if (memcmp(name, "ceil",  4) == 0) return ray_ceil_op;
         if (memcmp(name, "sqrt",  4) == 0) return ray_sqrt_op;
         if (memcmp(name, "trim",  4) == 0) return ray_trim_op;
@@ -351,6 +353,8 @@ static dag_unary_ctor resolve_unary_dag(int64_t sym_id) {
         if (memcmp(name, "upper", 5) == 0) return ray_upper;
         if (memcmp(name, "lower", 5) == 0) return ray_lower;
     } else if (len == 6) {
+        if (memcmp(name, "deltas", 6) == 0) return ray_deltas_op;
+        if (memcmp(name, "ratios", 6) == 0) return ray_ratios_op;
         if (memcmp(name, "strlen", 6) == 0) return ray_strlen;
     }
     /* NOTE: no DAG wiring for nil?/isnull yet.  The eval-level

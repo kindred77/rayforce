@@ -1512,8 +1512,9 @@ static int group_input_scan_syms(ray_graph_t* g, ray_op_ext_t* gx,
  * space-separated pass labels (predicate pushdown, …).  Cached per opcode so
  * the returned pointer stays valid for the life of a span. */
 static const char* prof_op_label(uint16_t opc) {
-    if (opc > OP_KNN_RERANK) return ray_opcode_name(opc);
-    static char lc[OP_KNN_RERANK + 1][28];
+#define PROF_OP_LABEL_MAX OP_RATIOS
+    if (opc > PROF_OP_LABEL_MAX) return ray_opcode_name(opc);
+    static char lc[PROF_OP_LABEL_MAX + 1][28];
     if (!lc[opc][0]) {
         const char* up = ray_opcode_name(opc);
         if (!up) return NULL;
@@ -1527,6 +1528,7 @@ static const char* prof_op_label(uint16_t opc) {
         lc[opc][i] = '\0';
     }
     return lc[opc];
+#undef PROF_OP_LABEL_MAX
 }
 
 /* Is this opcode a "heavy" pipeline breaker worth profiling? */
@@ -1535,6 +1537,8 @@ static inline bool op_is_heavy(uint16_t opc) {
            opc == OP_JOIN   || opc == OP_WINDOW_JOIN || opc == OP_SELECT ||
            opc == OP_HEAD   || opc == OP_TAIL || opc == OP_WINDOW ||
            opc == OP_PIVOT  ||
+           opc == OP_LAG    || opc == OP_LEAD || opc == OP_DELTAS ||
+           opc == OP_RATIOS ||
            (opc >= OP_EXPAND && opc <= OP_KNN_RERANK);
 }
 
@@ -1984,6 +1988,24 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 return ray_error("type", "OP_REVERSE expects a vector input");
             }
             ray_t* result = reverse_vec_eager(input);
+            ray_release(input);
+            return result;
+        }
+
+        case OP_LAG: case OP_LEAD: case OP_DELTAS: case OP_RATIOS: {
+            ray_t* input = exec_node(g, op_child(g, op, 0));
+            if (!input || RAY_IS_ERR(input)) return input;
+            if (!ray_is_vec(input)) {
+                ray_release(input);
+                return ray_error("type", "%s expects a vector input", ray_opcode_name(op->opcode));
+            }
+            ray_t* result = NULL;
+            switch (op->opcode) {
+                case OP_LAG:    result = lag_vec_eager(input); break;
+                case OP_LEAD:   result = lead_vec_eager(input); break;
+                case OP_DELTAS: result = deltas_vec_eager(input); break;
+                default:        result = ratios_vec_eager(input); break;
+            }
             ray_release(input);
             return result;
         }

@@ -987,6 +987,10 @@ void ray_dict_cd_clear(void);
 /* ── collection.c ── */
 ray_t* distinct_vec_eager(ray_t* x);
 ray_t* reverse_vec_eager(ray_t* x);
+ray_t* lag_vec_eager(ray_t* x);
+ray_t* lead_vec_eager(ray_t* x);
+ray_t* deltas_vec_eager(ray_t* x);
+ray_t* ratios_vec_eager(ray_t* x);
 
 /* ── sort.c ── */
 ray_t* asc_vec_eager(ray_t* x);

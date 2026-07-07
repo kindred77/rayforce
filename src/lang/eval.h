@@ -266,6 +266,10 @@ ray_t* ray_at_fn(ray_t* vec, ray_t* idx);
 ray_t* ray_find_fn(ray_t* vec, ray_t* val);
 ray_t* ray_til_fn(ray_t* x);
 ray_t* ray_reverse_fn(ray_t* x);
+ray_t* ray_lag_fn(ray_t* x);
+ray_t* ray_lead_fn(ray_t* x);
+ray_t* ray_deltas_fn(ray_t* x);
+ray_t* ray_ratios_fn(ray_t* x);
 
 /* Table construction */
 ray_t* ray_list_fn(ray_t** args, int64_t n);

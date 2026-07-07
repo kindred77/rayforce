@@ -606,6 +606,13 @@ ray_op_t* ray_distinct_op(ray_graph_t* g, ray_op_t* a)   { return make_unary(g, 
 ray_op_t* ray_asc_op(ray_graph_t* g, ray_op_t* a)       { return make_unary(g, OP_ASC, a, a->out_type); }
 ray_op_t* ray_desc_op(ray_graph_t* g, ray_op_t* a)      { return make_unary(g, OP_DESC, a, a->out_type); }
 ray_op_t* ray_reverse_op(ray_graph_t* g, ray_op_t* a)   { return make_unary(g, OP_REVERSE, a, a->out_type); }
+ray_op_t* ray_lag_op(ray_graph_t* g, ray_op_t* a)       { return make_unary(g, OP_LAG, a, a->out_type); }
+ray_op_t* ray_lead_op(ray_graph_t* g, ray_op_t* a)      { return make_unary(g, OP_LEAD, a, a->out_type); }
+ray_op_t* ray_deltas_op(ray_graph_t* g, ray_op_t* a) {
+    int8_t t = a->out_type;
+    return make_unary(g, OP_DELTAS, a, (t == RAY_F64 || t == RAY_F32) ? RAY_F64 : RAY_I64);
+}
+ray_op_t* ray_ratios_op(ray_graph_t* g, ray_op_t* a)    { return make_unary(g, OP_RATIOS, a, RAY_F64); }
 ray_op_t* ray_stddev(ray_graph_t* g, ray_op_t* a)     { return make_unary(g, OP_STDDEV, a, RAY_F64); }
 ray_op_t* ray_stddev_pop(ray_graph_t* g, ray_op_t* a)  { return make_unary(g, OP_STDDEV_POP, a, RAY_F64); }
 ray_op_t* ray_var(ray_graph_t* g, ray_op_t* a)         { return make_unary(g, OP_VAR, a, RAY_F64); }
@@ -1709,6 +1716,14 @@ ray_t* ray_lazy_append(ray_t* lazy, uint16_t opcode) {
             out_type = prev->out_type; break;     /* desc preserves type */
         case OP_REVERSE:
             out_type = prev->out_type; break;     /* reverse preserves type */
+        case OP_LAG:
+        case OP_LEAD:
+            out_type = prev->out_type; break;     /* shifts preserve type */
+        case OP_DELTAS:
+            out_type = (prev->out_type == RAY_F64 || prev->out_type == RAY_F32) ? RAY_F64 : RAY_I64;
+            break;
+        case OP_RATIOS:
+            out_type = RAY_F64; break;
         default:
             out_type = prev->out_type; break;
     }

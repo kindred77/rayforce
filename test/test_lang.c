@@ -41,6 +41,7 @@
 #include "lang/eval.h"
 #include "lang/nfo.h"
 #include "lang/format.h"
+#include "ops/internal.h"
 #include "ops/ops.h"
 #include "ops/temporal.h"
 
@@ -897,6 +898,124 @@ static test_result_t test_eval_reverse(void) {
     TEST_ASSERT_EQ_I(data[1], 2);
     TEST_ASSERT_EQ_I(data[2], 1);
     ray_release(result);
+    PASS();
+}
+
+/* ---- Test: time-series vector primitives ---- */
+static test_result_t test_eval_timeseries_primitives(void) {
+    ray_t* lag = ray_eval_str("(lag [10 20 35])");
+    TEST_ASSERT_NOT_NULL(lag);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(lag));
+    TEST_ASSERT_EQ_I(lag->type, RAY_I64);
+    TEST_ASSERT_EQ_I(ray_len(lag), 3);
+    TEST_ASSERT_TRUE(ray_vec_is_null(lag, 0));
+    int64_t* ld = (int64_t*)ray_data(lag);
+    TEST_ASSERT_EQ_I(ld[1], 10);
+    TEST_ASSERT_EQ_I(ld[2], 20);
+    ray_release(lag);
+
+    ray_t* lead = ray_eval_str("(lead [10 20 35])");
+    TEST_ASSERT_NOT_NULL(lead);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(lead));
+    TEST_ASSERT_EQ_I(lead->type, RAY_I64);
+    TEST_ASSERT_EQ_I(ray_len(lead), 3);
+    int64_t* led = (int64_t*)ray_data(lead);
+    TEST_ASSERT_EQ_I(led[0], 20);
+    TEST_ASSERT_EQ_I(led[1], 35);
+    TEST_ASSERT_TRUE(ray_vec_is_null(lead, 2));
+    ray_release(lead);
+
+    ray_t* deltas = ray_eval_str("(deltas [10 20 35])");
+    TEST_ASSERT_NOT_NULL(deltas);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(deltas));
+    TEST_ASSERT_EQ_I(deltas->type, RAY_I64);
+    TEST_ASSERT_EQ_I(ray_len(deltas), 3);
+    TEST_ASSERT_TRUE(ray_vec_is_null(deltas, 0));
+    int64_t* dd = (int64_t*)ray_data(deltas);
+    TEST_ASSERT_EQ_I(dd[1], 10);
+    TEST_ASSERT_EQ_I(dd[2], 15);
+    ray_release(deltas);
+
+    ray_t* ratios = ray_eval_str("(ratios [10.0 20.0 10.0])");
+    TEST_ASSERT_NOT_NULL(ratios);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ratios));
+    TEST_ASSERT_EQ_I(ratios->type, RAY_F64);
+    TEST_ASSERT_EQ_I(ray_len(ratios), 3);
+    TEST_ASSERT_TRUE(ray_vec_is_null(ratios, 0));
+    double* rd = (double*)ray_data(ratios);
+    TEST_ASSERT_EQ_F(rd[1], 2.0, 1e-12);
+    TEST_ASSERT_EQ_F(rd[2], 0.5, 1e-12);
+    ray_release(ratios);
+
+    ray_t* zero = ray_eval_str("(ratios [0 10])");
+    TEST_ASSERT_NOT_NULL(zero);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(zero));
+    TEST_ASSERT_EQ_I(zero->type, RAY_F64);
+    TEST_ASSERT_EQ_I(ray_len(zero), 2);
+    TEST_ASSERT_TRUE(ray_vec_is_null(zero, 0));
+    TEST_ASSERT_TRUE(ray_vec_is_null(zero, 1));
+    ray_release(zero);
+
+    PASS();
+}
+
+/* ---- Test: time-series primitives lower inside select DAGs ---- */
+static test_result_t test_eval_select_timeseries_primitives(void) {
+    ray_t* result = ray_eval_str(
+        "(do (set t (table ['price] (list [10 20 35]))) "
+        "(select {from: t d: (deltas price) l: (lag price) r: (ratios price)}))");
+    TEST_ASSERT_NOT_NULL(result);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
+    TEST_ASSERT_EQ_I(ray_table_nrows(result), 3);
+
+    ray_t* d_col = ray_table_get_col(result, ray_sym_intern("d", 1));
+    TEST_ASSERT_NOT_NULL(d_col);
+    TEST_ASSERT_EQ_I(d_col->type, RAY_I64);
+    TEST_ASSERT_TRUE(ray_vec_is_null(d_col, 0));
+    int64_t* dd = (int64_t*)ray_data(d_col);
+    TEST_ASSERT_EQ_I(dd[1], 10);
+    TEST_ASSERT_EQ_I(dd[2], 15);
+
+    ray_t* l_col = ray_table_get_col(result, ray_sym_intern("l", 1));
+    TEST_ASSERT_NOT_NULL(l_col);
+    TEST_ASSERT_EQ_I(l_col->type, RAY_I64);
+    TEST_ASSERT_TRUE(ray_vec_is_null(l_col, 0));
+    int64_t* ld = (int64_t*)ray_data(l_col);
+    TEST_ASSERT_EQ_I(ld[1], 10);
+    TEST_ASSERT_EQ_I(ld[2], 20);
+
+    ray_t* r_col = ray_table_get_col(result, ray_sym_intern("r", 1));
+    TEST_ASSERT_NOT_NULL(r_col);
+    TEST_ASSERT_EQ_I(r_col->type, RAY_F64);
+    TEST_ASSERT_TRUE(ray_vec_is_null(r_col, 0));
+    double* rd = (double*)ray_data(r_col);
+    TEST_ASSERT_EQ_F(rd[1], 2.0, 1e-12);
+    TEST_ASSERT_EQ_F(rd[2], 1.75, 1e-12);
+
+    ray_release(result);
+    PASS();
+}
+
+/* ---- Test: time-series kernels surface pool cancellation ---- */
+static test_result_t test_eval_timeseries_interrupt_cancel(void) {
+    int64_t n = RAY_MORSEL_ELEMS * 2;
+    ray_t* v = ray_vec_new(RAY_I64, n);
+    TEST_ASSERT_NOT_NULL(v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    v->len = n;
+    int64_t* data = (int64_t*)ray_data(v);
+    for (int64_t i = 0; i < n; i++) data[i] = i;
+
+    ray_cancel();
+    ray_t* r = deltas_vec_eager(v);
+    ray_cancel_reset();
+    ray_release(v);
+
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    TEST_ASSERT_STR_EQ(ray_err_code(r), "cancel");
+    ray_error_free(r);
     PASS();
 }
 
@@ -6907,6 +7026,9 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/at", test_eval_at, lang_setup, lang_teardown },
     { "lang/eval/find", test_eval_find, lang_setup, lang_teardown },
     { "lang/eval/reverse", test_eval_reverse, lang_setup, lang_teardown },
+    { "lang/eval/timeseries_primitives", test_eval_timeseries_primitives, lang_setup, lang_teardown },
+    { "lang/eval/select_timeseries_primitives", test_eval_select_timeseries_primitives, lang_setup, lang_teardown },
+    { "lang/eval/timeseries_interrupt_cancel", test_eval_timeseries_interrupt_cancel, lang_setup, lang_teardown },
     { "lang/eval/table", test_eval_table, lang_setup, lang_teardown },
     { "lang/eval/at_table", test_eval_at_table, lang_setup, lang_teardown },
     { "lang/eval/key_table", test_eval_key_table, lang_setup, lang_teardown },

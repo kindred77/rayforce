@@ -134,6 +134,10 @@ const char* ray_opcode_name(uint16_t op) {
         case OP_ASC:           return "ASC";
         case OP_DESC:          return "DESC";
         case OP_REVERSE:       return "REVERSE";
+        case OP_LAG:           return "LAG";
+        case OP_LEAD:          return "LEAD";
+        case OP_DELTAS:        return "DELTAS";
+        case OP_RATIOS:        return "RATIOS";
         default:               return "UNKNOWN";
     }
 }
