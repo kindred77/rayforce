@@ -168,6 +168,14 @@ void     ray_cancel_reset(void);
 #define OP_IN           47   /* binary: col in set_vec -> BOOL */
 #define OP_NOT_IN       48   /* binary: col not in set_vec -> BOOL */
 #define OP_IDIV         49   /* binary: integer floor division -> I64 */
+#define OP_SIN          137  /* unary: sine -> F64 */
+#define OP_ASIN         138  /* unary: arcsine -> F64 */
+#define OP_COS          139  /* unary: cosine -> F64 */
+#define OP_ACOS         140  /* unary: arccosine -> F64 */
+#define OP_TAN          141  /* unary: tangent -> F64 */
+#define OP_ATAN         142  /* unary: arctangent -> F64 */
+#define OP_RECIPROCAL   143  /* unary: reciprocal -> F64 */
+#define OP_SIGNUM       144  /* unary: signum -> I64 */
 
 /* EXTRACT / DATE_TRUNC field identifiers */
 #define RAY_EXTRACT_YEAR    0
@@ -643,6 +651,14 @@ ray_op_t* ray_not(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_sqrt_op(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_log_op(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_exp_op(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_sin_op(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_asin_op(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_cos_op(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_acos_op(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_tan_op(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_atan_op(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_reciprocal_op(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_signum_op(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_ceil_op(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_floor_op(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_round_op(ray_graph_t* g, ray_op_t* a);

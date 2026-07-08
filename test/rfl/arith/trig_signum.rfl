@@ -1,0 +1,55 @@
+;; Direct stateless math ops: trigonometry, reciprocal, signum.
+
+;; concrete scalar values
+(sin 0.0) -- 0.0
+(cos 0.0) -- 1.0
+(tan 0.0) -- 0.0
+(asin 0.0) -- 0.0
+(acos 1.0) -- 0.0
+(atan 0.0) -- 0.0
+(reciprocal 2) -- 0.5
+(signum -7) -- -1
+(signum 0) -- 0
+(signum 3.5) -- 1
+(type (signum 3.5)) -- 'i64
+
+;; inverse identities inside their stable domains
+(< (abs (- (sin (asin 0.5)) 0.5)) 0.000001) -- true
+(< (abs (- (cos (acos 0.5)) 0.5)) 0.000001) -- true
+(< (abs (- (tan (atan 0.5)) 0.5)) 0.000001) -- true
+(< (abs (- (* 4.0 (atan 1.0)) 3.141592653589793)) 0.000001) -- true
+
+;; vector execution uses typed vector/DAG paths
+(at (sin [0.0 0.0 0.0]) 1) -- 0.0
+(at (cos [0.0 0.0 0.0]) 2) -- 1.0
+(at (reciprocal [2 4 8]) 2) -- 0.125
+(at (signum [-3 0 4]) 0) -- -1
+(at (signum [-3 0 4]) 1) -- 0
+(at (signum [-3 0 4]) 2) -- 1
+(at (signum (as 'I16 [-3 0 4])) 2) -- 1
+(at (signum (as 'U8 [0 1 2])) 0) -- 0
+(at (signum (as 'U8 [0 1 2])) 2) -- 1
+
+;; null and domain semantics
+(nil? (sin 0Nf)) -- true
+(nil? (signum 0Nf)) -- true
+(nil? (signum 0Nl)) -- true
+(nil? (asin 2.0)) -- true
+(nil? (acos -2.0)) -- true
+(nil? (reciprocal 0)) -- true
+(nil? (at (reciprocal [2 0 4]) 1)) -- true
+(nil? (at (asin [0.0 2.0]) 1)) -- true
+
+;; query DAG lowering in projection and WHERE
+(set Tmath (table [x] (list [0.0 1.0 -1.0 2.0])))
+(count (select {from: Tmath where: (> (cos x) 0.5)})) -- 3
+(sum (at (select {s: (signum x) from: Tmath}) 's)) -- 1
+(at (at (select {r: (reciprocal (+ x 2.0)) from: Tmath}) 'r) 0) -- 0.5
+(nil? (at (at (select {a: (asin x) from: Tmath}) 'a) 3)) -- true
+
+;; type errors
+(sin "abc") !- type
+(cos 'foo) !- type
+(reciprocal "abc") !- type
+(signum 'foo) !- type
+(sin (as 'DATE 7305)) !- type

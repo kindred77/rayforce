@@ -53,6 +53,14 @@ const char* ray_opcode_name(uint16_t op) {
         case OP_SQRT:          return "SQRT";
         case OP_LOG:           return "LOG";
         case OP_EXP:           return "EXP";
+        case OP_SIN:           return "SIN";
+        case OP_ASIN:          return "ASIN";
+        case OP_COS:           return "COS";
+        case OP_ACOS:          return "ACOS";
+        case OP_TAN:           return "TAN";
+        case OP_ATAN:          return "ATAN";
+        case OP_RECIPROCAL:    return "RECIPROCAL";
+        case OP_SIGNUM:        return "SIGNUM";
         case OP_CEIL:          return "CEIL";
         case OP_FLOOR:         return "FLOOR";
         case OP_ISNULL:        return "ISNULL";

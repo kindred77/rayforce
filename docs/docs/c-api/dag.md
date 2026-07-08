@@ -65,6 +65,14 @@ Element-wise unary operations. These are fuseable — the optimizer merges chain
 | `ray_sqrt_op(g, a)` | `OP_SQRT` | Square root |
 | `ray_log_op(g, a)` | `OP_LOG` | Natural logarithm |
 | `ray_exp_op(g, a)` | `OP_EXP` | Exponential (e^x) |
+| `ray_sin_op(g, a)` | `OP_SIN` | Sine, radians; returns F64 |
+| `ray_asin_op(g, a)` | `OP_ASIN` | Arcsine, radians; out-of-domain values become null |
+| `ray_cos_op(g, a)` | `OP_COS` | Cosine, radians; returns F64 |
+| `ray_acos_op(g, a)` | `OP_ACOS` | Arccosine, radians; out-of-domain values become null |
+| `ray_tan_op(g, a)` | `OP_TAN` | Tangent, radians; returns F64 |
+| `ray_atan_op(g, a)` | `OP_ATAN` | Arctangent, radians; returns F64 |
+| `ray_reciprocal_op(g, a)` | `OP_RECIPROCAL` | Reciprocal `1/x`; zero becomes null |
+| `ray_signum_op(g, a)` | `OP_SIGNUM` | Sign as I64: -1, 0, or 1 |
 | `ray_ceil_op(g, a)` | `OP_CEIL` | Ceiling |
 | `ray_floor_op(g, a)` | `OP_FLOOR` | Floor |
 | `ray_isnull(g, a)` | `OP_ISNULL` | Returns BOOL: true if null |

@@ -2984,6 +2984,14 @@ static void ray_register_builtins(void) {
     register_unary_op("sqrt",  RAY_FN_ATOMIC, ray_sqrt_fn, OP_SQRT);
     register_unary_op("log",   RAY_FN_ATOMIC, ray_log_fn,  OP_LOG);
     register_unary_op("exp",   RAY_FN_ATOMIC, ray_exp_fn,  OP_EXP);
+    register_unary_op("sin",        RAY_FN_NONE, ray_sin_fn,        OP_SIN);
+    register_unary_op("asin",       RAY_FN_NONE, ray_asin_fn,       OP_ASIN);
+    register_unary_op("cos",        RAY_FN_NONE, ray_cos_fn,        OP_COS);
+    register_unary_op("acos",       RAY_FN_NONE, ray_acos_fn,       OP_ACOS);
+    register_unary_op("tan",        RAY_FN_NONE, ray_tan_fn,        OP_TAN);
+    register_unary_op("atan",       RAY_FN_NONE, ray_atan_fn,       OP_ATAN);
+    register_unary_op("reciprocal", RAY_FN_NONE, ray_reciprocal_fn, OP_RECIPROCAL);
+    register_unary_op("signum",     RAY_FN_NONE, ray_signum_fn,     OP_SIGNUM);
     register_binary_op("pow", RAY_FN_ATOMIC, ray_pow_fn, OP_POW);
     /* Partial-sort top/bottom-N: O(N log K) bounded-heap fast path
      * via topk_indices_single, falls back to full sort for unsupported

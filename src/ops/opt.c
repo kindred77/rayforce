@@ -30,6 +30,7 @@
 #include "core/profile.h"
 #include "mem/sys.h"
 #include "mem/heap.h"
+#include <float.h>
 #include <math.h>
 #include <string.h>
 
@@ -48,6 +49,10 @@ static inline ray_op_t* op_node(ray_graph_t* g, uint32_t id) {
 }
 static inline ray_op_t* op_child(ray_graph_t* g, const ray_op_t* op, int i) {
     return op_node(g, op->in_id[i]);
+}
+
+static inline double opt_f64_fin(double r) {
+    return (__builtin_fabs(r) <= DBL_MAX) ? r : NULL_F64;
 }
 
 /* Test knob: disable the GROUP predicate-pushdown arm so the differential
@@ -384,6 +389,34 @@ static bool fold_unary_const(ray_graph_t* g, ray_op_t* node) {
         case OP_EXP:
             folded = ray_f64(exp(is_f64 ? vf : (double)vi));
             break;
+        case OP_SIN:
+            folded = ray_f64(opt_f64_fin(sin(is_f64 ? vf : (double)vi)));
+            break;
+        case OP_ASIN:
+            folded = ray_f64(opt_f64_fin(asin(is_f64 ? vf : (double)vi)));
+            break;
+        case OP_COS:
+            folded = ray_f64(opt_f64_fin(cos(is_f64 ? vf : (double)vi)));
+            break;
+        case OP_ACOS:
+            folded = ray_f64(opt_f64_fin(acos(is_f64 ? vf : (double)vi)));
+            break;
+        case OP_TAN:
+            folded = ray_f64(opt_f64_fin(tan(is_f64 ? vf : (double)vi)));
+            break;
+        case OP_ATAN:
+            folded = ray_f64(opt_f64_fin(atan(is_f64 ? vf : (double)vi)));
+            break;
+        case OP_RECIPROCAL: {
+            double v = is_f64 ? vf : (double)vi;
+            folded = v != 0.0 ? ray_f64(opt_f64_fin(1.0 / v)) : ray_typed_null(-RAY_F64);
+            break;
+        }
+        case OP_SIGNUM: {
+            double v = is_f64 ? vf : (double)vi;
+            folded = ray_i64((v > 0.0) - (v < 0.0));
+            break;
+        }
         case OP_CEIL:
             folded = is_f64 ? ray_f64(ceil(vf)) : ray_i64(vi);
             break;
@@ -625,7 +658,9 @@ static bool fold_filter_const_predicate(ray_graph_t* g, ray_op_t* node) {
 
 static void fold_node(ray_graph_t* g, ray_op_t* node) {
     /* Fold unary element-wise ops with constant input */
-    if (node->arity == 1 && node->opcode >= OP_NEG && node->opcode <= OP_FLOOR) {
+    if (node->arity == 1 &&
+        ((node->opcode >= OP_NEG && node->opcode <= OP_FLOOR) ||
+         (node->opcode >= OP_SIN && node->opcode <= OP_SIGNUM))) {
         (void)fold_unary_const(g, node);
     }
     /* Fold binary element-wise ops with two const inputs */

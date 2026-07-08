@@ -7,7 +7,7 @@ Complete reference for all Rayfall built-in functions. Each entry shows the func
 
 ## Arithmetic
 
-All arithmetic operators are **atomic** — they auto-map over vectors and broadcast scalars.
+Arithmetic operators auto-map over vectors and broadcast scalars. Numeric typed-vector calls and query expressions lower to morsel-based DAG kernels where available.
 
 | Function | Type | Description | Example |
 |---|---|---|---|
@@ -21,6 +21,18 @@ All arithmetic operators are **atomic** — they auto-map over vectors and broad
 | `round` | unary | Round to nearest integer | `(round 3.7)` → `4.0` |
 | `floor` | unary | Floor (round down) | `(floor 3.7)` → `3.0` |
 | `ceil` | unary | Ceiling (round up) | `(ceil 3.2)` → `4.0` |
+| `abs` | unary | Absolute value | `(abs -7)` → `7` |
+| `sqrt` | unary | Square root (returns f64) | `(sqrt 9)` → `3.0` |
+| `log` | unary | Natural logarithm | `(log 2.718)` → `~1.0` |
+| `exp` | unary | Exponential (e^x) | `(exp 1)` → `2.718...` |
+| `sin` | unary | Sine, radians; returns f64 | `(sin 0.0)` → `0.0` |
+| `asin` | unary | Arcsine, radians; out-of-domain values return `0Nf` | `(asin 1.0)` → `1.570...` |
+| `cos` | unary | Cosine, radians; returns f64 | `(cos 0.0)` → `1.0` |
+| `acos` | unary | Arccosine, radians; out-of-domain values return `0Nf` | `(acos 1.0)` → `0.0` |
+| `tan` | unary | Tangent, radians; returns f64 | `(tan 0.0)` → `0.0` |
+| `atan` | unary | Arctangent, radians; returns f64 | `(atan 1.0)` → `0.785...` |
+| `reciprocal` | unary | Reciprocal `1/x`; zero returns `0Nf` | `(reciprocal 4)` → `0.25` |
+| `signum` | unary | Sign as i64: `-1`, `0`, or `1`; null stays null | `(signum -3.5)` → `-1` |
 | `pow` | binary | Power (x^y, returns f64; DAG-lowered in queries) | `(pow 2 10)` → `1024.0` |
 | `xbar` | binary | Round down to nearest multiple (bucketing) | `(xbar [3 7 12] 5)` → `[0 5 10]` |
 
@@ -30,6 +42,10 @@ Vector examples:
 (+ [1 2 3] [10 20 30])   ; [11 22 33]
 (* [1 2 3] 10)            ; [10 20 30]  scalar broadcast
 (neg [1 -2 3])             ; [-1 2 -3]
+(sqrt [4 9 16])             ; [2.0 3.0 4.0]
+(sin [0.0 1.57079632679])   ; [0.0 1.0]
+(reciprocal [2 0 4])        ; [0.5 0Nf 0.25]
+(signum [-2.5 0.0 4.0])     ; [-1 0 1]
 (xbar [3 15 27] 10)      ; [0 10 20]
 ```
 

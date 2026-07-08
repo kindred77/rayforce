@@ -427,6 +427,14 @@ ray_op_t* ray_not(ray_graph_t* g, ray_op_t* a)     { return make_unary(g, OP_NOT
 ray_op_t* ray_sqrt_op(ray_graph_t* g, ray_op_t* a) { return make_unary(g, OP_SQRT, a, RAY_F64); }
 ray_op_t* ray_log_op(ray_graph_t* g, ray_op_t* a)  { return make_unary(g, OP_LOG, a, RAY_F64); }
 ray_op_t* ray_exp_op(ray_graph_t* g, ray_op_t* a)  { return make_unary(g, OP_EXP, a, RAY_F64); }
+ray_op_t* ray_sin_op(ray_graph_t* g, ray_op_t* a)  { return make_unary(g, OP_SIN, a, RAY_F64); }
+ray_op_t* ray_asin_op(ray_graph_t* g, ray_op_t* a) { return make_unary(g, OP_ASIN, a, RAY_F64); }
+ray_op_t* ray_cos_op(ray_graph_t* g, ray_op_t* a)  { return make_unary(g, OP_COS, a, RAY_F64); }
+ray_op_t* ray_acos_op(ray_graph_t* g, ray_op_t* a) { return make_unary(g, OP_ACOS, a, RAY_F64); }
+ray_op_t* ray_tan_op(ray_graph_t* g, ray_op_t* a)  { return make_unary(g, OP_TAN, a, RAY_F64); }
+ray_op_t* ray_atan_op(ray_graph_t* g, ray_op_t* a) { return make_unary(g, OP_ATAN, a, RAY_F64); }
+ray_op_t* ray_reciprocal_op(ray_graph_t* g, ray_op_t* a) { return make_unary(g, OP_RECIPROCAL, a, RAY_F64); }
+ray_op_t* ray_signum_op(ray_graph_t* g, ray_op_t* a) { return make_unary(g, OP_SIGNUM, a, RAY_I64); }
 ray_op_t* ray_ceil_op(ray_graph_t* g, ray_op_t* a) { return make_unary(g, OP_CEIL, a, a->out_type); }
 ray_op_t* ray_floor_op(ray_graph_t* g, ray_op_t* a){ return make_unary(g, OP_FLOOR, a, a->out_type); }
 ray_op_t* ray_round_op(ray_graph_t* g, ray_op_t* a){ return make_unary(g, OP_ROUND, a, a->out_type); }

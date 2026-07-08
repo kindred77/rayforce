@@ -6022,8 +6022,8 @@ static ray_t* exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl,
  * is either a bare OP_SCAN or a PURE ROW-LOCAL scalar expression.  The pass-3
  * merge re-GROUPs on the materialized key VALUE, so equal logical keys across
  * partitions must produce BIT-IDENTICAL materialized values — this holds for
- * deterministic element-wise ops (OP_ROUND..OP_IDIV, e.g. xbar which lowers
- * to `t - t%n` = OP_SUB/OP_MOD) and ONLY those.  No cross-row operator (rank /
+ * deterministic element-wise ops (the scalar element-wise core plus direct
+ * unary math) and ONLY those.  No cross-row operator (rank /
  * window / aggregate) or table-shape-dependent op lives in that opcode range,
  * so admitting exactly that range is both sufficient and safe.  None of those
  * ops produce SYM output (casts target numeric types; concat/upper/lower/trim
@@ -6037,6 +6037,11 @@ static ray_t* exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl,
  * non-default table (stored_table_id != 0 — a joined table that would NOT
  * resolve against the per-partition sub-table), overflows, or an oversized
  * graph.  A -1 result means "decline per-partition streaming for this key". */
+static inline bool group_expr_rowlocal_opcode(uint16_t opcode) {
+    return (opcode >= OP_ROUND && opcode <= OP_IDIV) ||
+           (opcode >= OP_SIN && opcode <= OP_SIGNUM);
+}
+
 static int group_expr_src_syms(ray_graph_t* g, uint32_t root_id,
                                int64_t* out_syms, int max) {
     uint32_t nc = g->node_count;
@@ -6072,7 +6077,7 @@ static int group_expr_src_syms(ray_graph_t* g, uint32_t root_id,
         }
         if (node->opcode == OP_CONST) continue;
         /* Admit ONLY pure row-local element-wise ops (see header). */
-        if (node->opcode < OP_ROUND || node->opcode > OP_IDIV) return -1;
+        if (!group_expr_rowlocal_opcode(node->opcode)) return -1;
         for (int i = 0; i < node->arity && i < 2; i++) {
             if (node->in_id[i] == RAY_OP_NONE) continue;
             if (sp >= 64) return -1;

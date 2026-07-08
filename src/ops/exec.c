@@ -1429,6 +1429,15 @@ static ray_t* exec_pushed_group_filter(ray_graph_t* g, ray_op_t* filter_op) {
  * element-wise range OP_ROUND..OP_IDIV) are admitted in the walk; any other
  * opcode, an oversized graph, or overflow returns -1 — callers must treat
  * that as "unknown" and skip the optimisation. */
+/* Opcodes handled by the elementwise case of exec_node_inner — must
+ * match its case labels (ROUND sits at 9, outside NEG..CAST; IDIV at
+ * 49, outside ADD..MAX2; extra unary math starts at 137). */
+static inline bool op_is_elementwise(uint16_t o) {
+    return o == OP_ROUND || (o >= OP_NEG && o <= OP_CAST)
+        || (o >= OP_ADD && o <= OP_MAX2) || o == OP_POW || o == OP_IDIV
+        || (o >= OP_SIN && o <= OP_SIGNUM);
+}
+
 static int collect_scan_syms(ray_graph_t* g, const uint32_t* roots, int nroots,
                              int64_t* syms, int max, bool* has_expr) {
     *has_expr = false;
@@ -1469,7 +1478,7 @@ static int collect_scan_syms(ray_graph_t* g, const uint32_t* roots, int nroots,
         }
         if (node->opcode == OP_CONST) continue;
         /* Admit only scalar element-wise expression nodes. */
-        if (node->opcode < OP_ROUND || node->opcode > OP_IDIV) return -1;
+        if (!op_is_elementwise(node->opcode)) return -1;
 
         for (int i = 0; i < node->arity && i < 2; i++) {
             if (node->in_id[i] == RAY_OP_NONE) continue;
@@ -1564,14 +1573,6 @@ static inline bool op_is_heavy(uint16_t opc) {
  *     ~2.5 MB even at ASan frame sizes. */
 #define RAY_EXEC_MAX_DEPTH 64
 static _Thread_local int32_t tl_exec_depth = 0;
-
-/* Opcodes handled by the elementwise case of exec_node_inner — must
- * match its case labels (ROUND sits at 9, outside NEG..CAST; IDIV at
- * 49, outside ADD..MAX2). */
-static inline bool op_is_elementwise(uint16_t o) {
-    return o == OP_ROUND || (o >= OP_NEG && o <= OP_CAST)
-        || (o >= OP_ADD && o <= OP_MAX2) || o == OP_POW || o == OP_IDIV;
-}
 
 /* Iterative post-order evaluation of an elementwise subtree.
  *
@@ -1883,6 +1884,8 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
         /* Unary element-wise */
         case OP_NEG: case OP_ABS: case OP_NOT: case OP_SQRT:
         case OP_LOG: case OP_EXP: case OP_CEIL: case OP_FLOOR: case OP_ROUND:
+        case OP_SIN: case OP_ASIN: case OP_COS: case OP_ACOS:
+        case OP_TAN: case OP_ATAN: case OP_RECIPROCAL: case OP_SIGNUM:
         case OP_ISNULL: case OP_CAST:
         /* Binary element-wise */
         case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_IDIV: case OP_MOD:
@@ -3463,6 +3466,8 @@ static bool op_streamable(uint16_t opc) {
         /* Element-wise unary */
         case OP_NEG: case OP_ABS: case OP_NOT: case OP_SQRT:
         case OP_LOG: case OP_EXP: case OP_CEIL: case OP_FLOOR: case OP_ROUND:
+        case OP_SIN: case OP_ASIN: case OP_COS: case OP_ACOS:
+        case OP_TAN: case OP_ATAN: case OP_RECIPROCAL: case OP_SIGNUM:
         case OP_ISNULL: case OP_CAST:
         /* Element-wise binary */
         case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_IDIV: case OP_MOD:

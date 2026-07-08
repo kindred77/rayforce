@@ -296,11 +296,31 @@ static bool query_key_reader_read(query_key_reader_t* r, int64_t row,
 typedef ray_op_t* (*dag_binary_ctor)(ray_graph_t*, ray_op_t*, ray_op_t*);
 typedef ray_op_t* (*dag_unary_ctor)(ray_graph_t*, ray_op_t*);
 
-static bool dag_pow_type_admitted(int8_t t) {
+static bool dag_numeric_type_admitted(int8_t t) {
     if (t <= 0) return true;  /* unknown/uninferred: let executor validate */
     if (RAY_IS_PARTED(t)) t = (int8_t)RAY_PARTED_BASETYPE(t);
     return t == RAY_BOOL || t == RAY_U8 || t == RAY_I16 ||
            t == RAY_I32 || t == RAY_I64 || t == RAY_F64;
+}
+
+static bool dag_pow_type_admitted(int8_t t) {
+    return dag_numeric_type_admitted(t);
+}
+
+static bool dag_unary_numeric_name(const char* name, size_t len) {
+    if (len == 3)
+        return memcmp(name, "sin", 3) == 0 ||
+               memcmp(name, "cos", 3) == 0 ||
+               memcmp(name, "tan", 3) == 0;
+    if (len == 4)
+        return memcmp(name, "asin", 4) == 0 ||
+               memcmp(name, "acos", 4) == 0 ||
+               memcmp(name, "atan", 4) == 0;
+    if (len == 6)
+        return memcmp(name, "signum", 6) == 0;
+    if (len == 10)
+        return memcmp(name, "reciprocal", 10) == 0;
+    return false;
 }
 
 static dag_binary_ctor resolve_binary_dag(int64_t sym_id) {
@@ -351,6 +371,9 @@ static dag_unary_ctor resolve_unary_dag(int64_t sym_id) {
         if (memcmp(name, "abs", 3) == 0) return ray_abs;
         if (memcmp(name, "exp", 3) == 0) return ray_exp_op;
         if (memcmp(name, "log", 3) == 0) return ray_log_op;
+        if (memcmp(name, "sin", 3) == 0) return ray_sin_op;
+        if (memcmp(name, "cos", 3) == 0) return ray_cos_op;
+        if (memcmp(name, "tan", 3) == 0) return ray_tan_op;
     } else if (len == 4) {
         if (memcmp(name, "lead", 4) == 0) return ray_lead_op;
         if (memcmp(name, "sums", 4) == 0) return ray_sums_op;
@@ -358,6 +381,9 @@ static dag_unary_ctor resolve_unary_dag(int64_t sym_id) {
         if (memcmp(name, "mins", 4) == 0) return ray_mins_op;
         if (memcmp(name, "maxs", 4) == 0) return ray_maxs_op;
         if (memcmp(name, "prds", 4) == 0) return ray_prds_op;
+        if (memcmp(name, "asin", 4) == 0) return ray_asin_op;
+        if (memcmp(name, "acos", 4) == 0) return ray_acos_op;
+        if (memcmp(name, "atan", 4) == 0) return ray_atan_op;
         if (memcmp(name, "ceil",  4) == 0) return ray_ceil_op;
         if (memcmp(name, "sqrt",  4) == 0) return ray_sqrt_op;
         if (memcmp(name, "trim",  4) == 0) return ray_trim_op;
@@ -373,6 +399,9 @@ static dag_unary_ctor resolve_unary_dag(int64_t sym_id) {
         if (memcmp(name, "ratios", 6) == 0) return ray_ratios_op;
         if (memcmp(name, "differ", 6) == 0) return ray_differ_op;
         if (memcmp(name, "strlen", 6) == 0) return ray_strlen;
+        if (memcmp(name, "signum", 6) == 0) return ray_signum_op;
+    } else if (len == 10) {
+        if (memcmp(name, "reciprocal", 10) == 0) return ray_reciprocal_op;
     }
     return NULL;
 }
@@ -1521,7 +1550,11 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
             dag_unary_ctor uctor = resolve_unary_dag(fn_sym);
             if (uctor) {
                 ray_op_t* arg = compile_expr_dag(g, elems[1]);
-                return arg ? uctor(g, arg) : NULL;
+                if (!arg) return NULL;
+                if (dag_unary_numeric_name(fname, fname_len) &&
+                    !dag_numeric_type_admitted(arg->out_type))
+                    return NULL;
+                return uctor(g, arg);
             }
             /* Aggregation functions return DAG agg nodes */
             uint16_t agg_op = resolve_agg_opcode(fn_sym);

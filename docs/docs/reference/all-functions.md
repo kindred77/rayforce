@@ -10,7 +10,7 @@
 
 | | | |
 |---|---|---|
-| [Arithmetic](#arithmetic) (16) | [Comparison](#comparison) (7) | [Logic](#logic) (3) |
+| [Arithmetic](#arithmetic) (24) | [Comparison](#comparison) (7) | [Logic](#logic) (3) |
 | [Aggregation](#aggregation) (22) | [Higher-Order](#higher-order) (13) | [Collection](#collection) (37) |
 | [Sorting & Ordering](#sorting) (10) | [Control Flow & Special Forms](#control) (11) | [Table Operations](#table-ops) (14) |
 | [Query](#query) (4) | [Joins](#joins) (6) | [Pivot](#pivot) (1) |
@@ -40,7 +40,8 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 
 ### Unary
 
-`not`, `neg`, `round`, `floor`, `ceil`, `abs`, `sqrt`, `log`, `exp`, `sum`, `prod`, `all`, `any`, `count`, `avg`, `min`, `max`,
+`not`, `neg`, `round`, `floor`, `ceil`, `abs`, `sqrt`, `log`, `exp`, `sin`, `asin`, `cos`, `acos`, `tan`, `atan`, `reciprocal`,
+`signum`, `sum`, `prod`, `all`, `any`, `count`, `avg`, `min`, `max`,
 `first`, `last`, `med`, `dev`, `stddev`, `stddev_pop`, `dev_pop`, `var`, `var_pop`, `raise`, `distinct`,
 `reverse`, `til`, `lag`, `lead`, `deltas`, `ratios`, `fills`, `sums`, `avgs`, `mins`, `maxs`, `prds`,
 `differ`, `asc`, `desc`, `iasc`, `idesc`, `rank`, `key`, `value`, `type`, `read`, `load`, `exit`,
@@ -79,7 +80,7 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 
 ## Arithmetic
 
-All arithmetic operators are **atomic** — they auto-map over vectors and broadcast scalars.
+Arithmetic operators auto-map over vectors and broadcast scalars. Numeric typed-vector calls and query expressions lower to morsel-based DAG kernels where available.
 
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
@@ -97,6 +98,14 @@ All arithmetic operators are **atomic** — they auto-map over vectors and broad
 | `sqrt` | unary | atomic | Square root (returns f64) | `(sqrt 9)` → `3.0` |
 | `log` | unary | atomic | Natural logarithm | `(log 2.718)` → `~1.0` |
 | `exp` | unary | atomic | Exponential (e^x) | `(exp 1)` → `2.718...` |
+| `sin` | unary | atomic/DAG | Sine, radians; returns f64 | `(sin 0.0)` → `0.0` |
+| `asin` | unary | atomic/DAG | Arcsine, radians; out-of-domain values return `0Nf` | `(asin 1.0)` → `1.570...` |
+| `cos` | unary | atomic/DAG | Cosine, radians; returns f64 | `(cos 0.0)` → `1.0` |
+| `acos` | unary | atomic/DAG | Arccosine, radians; out-of-domain values return `0Nf` | `(acos 1.0)` → `0.0` |
+| `tan` | unary | atomic/DAG | Tangent, radians; returns f64 | `(tan 0.0)` → `0.0` |
+| `atan` | unary | atomic/DAG | Arctangent, radians; returns f64 | `(atan 1.0)` → `0.785...` |
+| `reciprocal` | unary | atomic/DAG | Reciprocal `1/x`; zero returns `0Nf` | `(reciprocal 4)` → `0.25` |
+| `signum` | unary | atomic/DAG | Sign as i64: `-1`, `0`, or `1`; null stays null | `(signum -3.5)` → `-1` |
 | `pow` | binary | atomic/DAG | Power (x^y, returns f64; lowers in query expressions) | `(pow 2 10)` → `1024.0` |
 | `xbar` | binary | atomic | Round down to nearest multiple (bucketing) | `(xbar [3 7 12] 5)` → `[0 5 10]` |
 
@@ -106,6 +115,9 @@ All arithmetic operators are **atomic** — they auto-map over vectors and broad
 (* [1 2 3] 10)            ; [10 20 30]  scalar broadcast
 (abs [-3 0 5])              ; [3 0 5]
 (sqrt [4 9 16])             ; [2.0 3.0 4.0]
+(sin [0.0 1.57079632679])   ; [0.0 1.0]
+(reciprocal [2 0 4])        ; [0.5 0Nf 0.25]
+(signum [-2.5 0.0 4.0])     ; [-1 0 1]
 
 ; Time bucketing for OHLC bars
 (xbar [3 15 27] 10)        ; [0 10 20]

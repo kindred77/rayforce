@@ -4,7 +4,7 @@ All numeric, logical, aggregation, ordering, generation, and higher-order operat
 
 ## Arithmetic
 
-All arithmetic operations are atomic — they work on scalars and auto-map element-wise over vectors.
+Arithmetic operations work on scalars and auto-map element-wise over vectors. Numeric typed-vector calls and query expressions lower to morsel-based DAG kernels where available.
 
 ### `(+ a b)` — atomic
 
@@ -96,6 +96,80 @@ Round up to nearest integer.
 ```lisp
 (ceil 3.1)  ; 4.0
 ```
+
+### `(abs x)` — atomic
+
+Absolute value.
+
+```lisp
+(abs -7)  ; 7
+(abs [-3 0 5])  ; [3 0 5]
+```
+
+### `(sqrt x)` — atomic
+
+Square root. Always returns f64; negative inputs return `0Nf`.
+
+```lisp
+(sqrt 9)  ; 3.0
+(sqrt [4 9 16])  ; [2.0 3.0 4.0]
+```
+
+### `(log x)` — atomic
+
+Natural logarithm. Always returns f64; non-positive inputs return `0Nf`.
+
+```lisp
+(log 2.718281828459045)  ; 1.0
+```
+
+### `(exp x)` — atomic
+
+Exponential, `e^x`. Always returns f64.
+
+```lisp
+(exp 1)  ; 2.718...
+```
+
+### `(sin x)` / `(cos x)` / `(tan x)` — atomic
+
+Trigonometric functions in radians. Always return f64.
+
+```lisp
+(sin 0.0)  ; 0.0
+(cos 0.0)  ; 1.0
+(sin [0.0 1.57079632679])  ; [0.0 1.0]
+```
+
+### `(asin x)` / `(acos x)` / `(atan x)` — atomic
+
+Inverse trigonometric functions in radians. `asin` and `acos` return `0Nf` for values outside `[-1, 1]`.
+
+```lisp
+(asin 1.0)  ; 1.570...
+(acos 1.0)  ; 0.0
+(nil? (asin 2.0))  ; true
+```
+
+### `(reciprocal x)` — atomic
+
+Reciprocal, `1/x`. Always returns f64; zero returns `0Nf`.
+
+```lisp
+(reciprocal 4)  ; 0.25
+(reciprocal [2 0 4])  ; [0.5 0Nf 0.25]
+```
+
+### `(signum x)` — atomic
+
+Return the sign as i64: `-1`, `0`, or `1`. Null input stays null.
+
+```lisp
+(signum -3.5)  ; -1
+(signum [-2.5 0.0 4.0])  ; [-1 0 1]
+```
+
+The direct numeric unary functions accept `BOOL`, `U8`, `I16`, `I32`, `I64`, and `F64` inputs. They do not treat temporal encodings as numbers.
 
 ## Comparison
 
@@ -544,7 +618,7 @@ Parallel map. Like `map` but distributes work across threads for large inputs.
 
 | Category | Functions |
 |---|---|
-| **Arithmetic** | `+` `-` `*` `/` `%` `neg` `round` `floor` `ceil` `pow` |
+| **Arithmetic** | `+` `-` `*` `/` `%` `div` `neg` `round` `floor` `ceil` `abs` `sqrt` `log` `exp` `sin` `asin` `cos` `acos` `tan` `atan` `reciprocal` `signum` `pow` |
 | **Comparison** | `==` `!=` `<` `<=` `>` `>=` `within` |
 | **Logic** | `and` `or` `not` |
 | **Aggregation** | `sum` `prod` `all` `any` `count` `avg` `min` `max` `med` `dev` `stddev` `var` `pearson_corr` `cov` `scov` `wsum` `wavg` `first` `last` `distinct` |
@@ -553,4 +627,4 @@ Parallel map. Like `map` but distributes work across threads for large inputs.
 | **Higher-order** | `map` `fold` `scan` `apply` `filter` `pmap` |
 
 !!! note "Auto-mapping"
-    All operations tagged `FN_ATOMIC` (arithmetic, comparison, logic) automatically map over vectors element-wise. You do not need explicit `map` calls for these — `(+ [1 2 3] 10)` works directly.
+    Arithmetic, comparison, and logic functions automatically map over vectors element-wise. You do not need explicit `map` calls for these — `(+ [1 2 3] 10)` works directly.

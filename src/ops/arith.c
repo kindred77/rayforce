@@ -27,6 +27,47 @@
 /* Arithmetic builtins (atom-only).
  * Vector dispatch goes through the DAG executor. */
 
+typedef ray_op_t* (*arith_unary_ctor)(ray_graph_t*, ray_op_t*);
+
+static bool arith_numeric_vec_type(int8_t t) {
+    if (RAY_IS_PARTED(t)) t = (int8_t)RAY_PARTED_BASETYPE(t);
+    return t == RAY_BOOL || t == RAY_U8 || t == RAY_I16 ||
+           t == RAY_I32 || t == RAY_I64 || t == RAY_F64;
+}
+
+static ray_t* arith_unary_dag_vec(ray_t* x, arith_unary_ctor ctor) {
+    ray_graph_t* g = ray_graph_new(NULL);
+    if (!g) return ray_error("oom", "unary math: graph alloc failed");
+    ray_op_t* in = ray_const_vec(g, x);
+    ray_op_t* root = in ? ctor(g, in) : NULL;
+    if (!root) {
+        ray_graph_free(g);
+        return ray_error("oom", "unary math: graph node alloc failed");
+    }
+    ray_t* r = ray_execute(g, root);
+    ray_graph_free(g);
+    return r ? r : ray_error("oom", "unary math: execution failed");
+}
+
+static ray_t* ray_f64_unary_math_fn(ray_t* x, ray_unary_fn self,
+                                    arith_unary_ctor ctor,
+                                    double (*fn)(double),
+                                    const char* name) {
+    if (ray_is_vec(x)) {
+        if (!arith_numeric_vec_type(x->type))
+            return ray_error("type", "%s: expects a numeric argument, got %s",
+                             name, ray_type_name(x->type));
+        return arith_unary_dag_vec(x, ctor);
+    }
+    if (x->type == RAY_LIST)
+        return atomic_map_unary(self, x);
+    if (RAY_ATOM_IS_NULL(x)) return ray_typed_null(-RAY_F64);
+    if (!is_numeric(x))
+        return ray_error("type", "%s: expects a numeric argument, got %s",
+                         name, ray_type_name(x->type));
+    return make_f64(fn(as_f64(x)));
+}
+
 ray_t* ray_add_fn(ray_t* a, ray_t* b) {
     if ((a && RAY_IS_PARTED(a->type)) || (b && RAY_IS_PARTED(b->type)))
         return atomic_map_binary_op(ray_add_fn, OP_ADD, a, b);
@@ -395,6 +436,64 @@ ray_t* ray_exp_fn(ray_t* x) {
     if (x->type == -RAY_F64) return make_f64(exp(x->f64));
     if (is_numeric(x)) return make_f64(exp(as_f64(x)));
     return ray_error("type", "exp: expects a numeric argument, got %s", ray_type_name(x->type));
+}
+
+ray_t* ray_sin_fn(ray_t* x) {
+    return ray_f64_unary_math_fn(x, ray_sin_fn, ray_sin_op, sin, "sin");
+}
+
+ray_t* ray_asin_fn(ray_t* x) {
+    return ray_f64_unary_math_fn(x, ray_asin_fn, ray_asin_op, asin, "asin");
+}
+
+ray_t* ray_cos_fn(ray_t* x) {
+    return ray_f64_unary_math_fn(x, ray_cos_fn, ray_cos_op, cos, "cos");
+}
+
+ray_t* ray_acos_fn(ray_t* x) {
+    return ray_f64_unary_math_fn(x, ray_acos_fn, ray_acos_op, acos, "acos");
+}
+
+ray_t* ray_tan_fn(ray_t* x) {
+    return ray_f64_unary_math_fn(x, ray_tan_fn, ray_tan_op, tan, "tan");
+}
+
+ray_t* ray_atan_fn(ray_t* x) {
+    return ray_f64_unary_math_fn(x, ray_atan_fn, ray_atan_op, atan, "atan");
+}
+
+ray_t* ray_reciprocal_fn(ray_t* x) {
+    if (ray_is_vec(x)) {
+        if (!arith_numeric_vec_type(x->type))
+            return ray_error("type", "reciprocal: expects a numeric argument, got %s",
+                             ray_type_name(x->type));
+        return arith_unary_dag_vec(x, ray_reciprocal_op);
+    }
+    if (x->type == RAY_LIST)
+        return atomic_map_unary(ray_reciprocal_fn, x);
+    if (RAY_ATOM_IS_NULL(x)) return ray_typed_null(-RAY_F64);
+    if (!is_numeric(x))
+        return ray_error("type", "reciprocal: expects a numeric argument, got %s",
+                         ray_type_name(x->type));
+    double v = as_f64(x);
+    return v != 0.0 ? make_f64(1.0 / v) : ray_typed_null(-RAY_F64);
+}
+
+ray_t* ray_signum_fn(ray_t* x) {
+    if (ray_is_vec(x)) {
+        if (!arith_numeric_vec_type(x->type))
+            return ray_error("type", "signum: expects a numeric argument, got %s",
+                             ray_type_name(x->type));
+        return arith_unary_dag_vec(x, ray_signum_op);
+    }
+    if (x->type == RAY_LIST)
+        return atomic_map_unary(ray_signum_fn, x);
+    if (RAY_ATOM_IS_NULL(x)) return ray_typed_null(-RAY_I64);
+    if (!is_numeric(x))
+        return ray_error("type", "signum: expects a numeric argument, got %s",
+                         ray_type_name(x->type));
+    double v = as_f64(x);
+    return make_i64((v > 0.0) - (v < 0.0));
 }
 
 /* pow: x raised to y, returns f64.
