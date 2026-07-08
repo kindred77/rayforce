@@ -1920,6 +1920,236 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
     return result;
 }
 
+static bool collection_count(ray_t* x, int64_t* out) {
+    if (!x || RAY_IS_ERR(x)) return false;
+    if (ray_is_lazy(x)) {
+        ray_t* mat = ray_lazy_materialize(x);
+        if (!mat || RAY_IS_ERR(mat)) return false;
+        bool ok = collection_count(mat, out);
+        ray_release(mat);
+        return ok;
+    }
+    if (ray_is_atom(x) && x->type == -RAY_STR) {
+        *out = (int64_t)ray_str_len(x);
+        return true;
+    }
+    if (ray_is_vec(x) || x->type == RAY_LIST) {
+        *out = x->len;
+        return true;
+    }
+    if (x->type == RAY_TABLE) {
+        *out = ray_table_nrows(x);
+        return true;
+    }
+    if (x->type == RAY_DICT) {
+        ray_t* keys = ray_dict_keys(x);
+        *out = keys ? keys->len : 0;
+        return true;
+    }
+    return false;
+}
+
+static ray_t* range_vec(int64_t start, int64_t amount) {
+    ray_t* r = ray_vec_new(RAY_I64, 2);
+    if (!r || RAY_IS_ERR(r)) return r ? r : ray_error("oom", NULL);
+    r->len = 2;
+    int64_t* d = (int64_t*)ray_data(r);
+    d[0] = start;
+    d[1] = amount;
+    return r;
+}
+
+static ray_t* collection_slice(ray_t* x, int64_t start, int64_t amount) {
+    ray_t* r = range_vec(start, amount);
+    if (!r || RAY_IS_ERR(r)) return r ? r : ray_error("oom", NULL);
+    ray_t* out = ray_take_fn(x, r);
+    ray_release(r);
+    return out;
+}
+
+ray_t* ray_drop_fn(ray_t* vec, ray_t* n_obj) {
+    if (ray_is_lazy(vec)) vec = ray_lazy_materialize(vec);
+    if (!n_obj || !ray_is_atom(n_obj) ||
+        (n_obj->type != -RAY_I64 && n_obj->type != -RAY_I32 &&
+         n_obj->type != -RAY_I16 && n_obj->type != -RAY_U8))
+        return ray_error("type", "drop: count must be an integer atom");
+
+    int64_t len = 0;
+    if (!collection_count(vec, &len))
+        return ray_error("type", "drop: expected a collection, got %s", vec ? ray_type_name(vec->type) : "null");
+
+    int64_t n = as_i64(n_obj);
+    int64_t start = 0;
+    int64_t amount = len;
+    if (n >= 0) {
+        start = n < len ? n : len;
+        amount = len - start;
+    } else {
+        int64_t cut = -n;
+        amount = cut < len ? len - cut : 0;
+    }
+    return collection_slice(vec, start, amount);
+}
+
+ray_t* ray_rotate_fn(ray_t* vec, ray_t* n_obj) {
+    if (ray_is_lazy(vec)) vec = ray_lazy_materialize(vec);
+    if (!n_obj || !ray_is_atom(n_obj) ||
+        (n_obj->type != -RAY_I64 && n_obj->type != -RAY_I32 &&
+         n_obj->type != -RAY_I16 && n_obj->type != -RAY_U8))
+        return ray_error("type", "rotate: count must be an integer atom");
+
+    int64_t len = 0;
+    if (!collection_count(vec, &len))
+        return ray_error("type", "rotate: expected a collection, got %s", vec ? ray_type_name(vec->type) : "null");
+    if (len == 0) return collection_slice(vec, 0, 0);
+
+    int64_t n = as_i64(n_obj) % len;
+    if (n < 0) n += len;
+    if (n == 0) {
+        ray_retain(vec);
+        return vec;
+    }
+
+    ray_t* a = collection_slice(vec, n, len - n);
+    if (!a || RAY_IS_ERR(a)) return a ? a : ray_error("oom", NULL);
+    ray_t* b = collection_slice(vec, 0, n);
+    if (!b || RAY_IS_ERR(b)) { ray_release(a); return b ? b : ray_error("oom", NULL); }
+    ray_t* out = ray_concat_fn(a, b);
+    ray_release(a);
+    ray_release(b);
+    return out;
+}
+
+ray_t* ray_cut_fn(ray_t* vec, ray_t* idxs) {
+    if (ray_is_lazy(vec)) vec = ray_lazy_materialize(vec);
+    int64_t len = 0;
+    if (!collection_count(vec, &len))
+        return ray_error("type", "cut: expected a collection, got %s", vec ? ray_type_name(vec->type) : "null");
+    if (!is_collection(idxs) || idxs->type == RAY_STR || idxs->type == RAY_SYM)
+        return ray_error("type", "cut: indices must be an integer vector or list");
+
+    int64_t nidx = idxs->len;
+    ray_t* out = ray_list_new(nidx + 1);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    int64_t prev = 0;
+
+    for (int64_t i = 0; i < nidx; i++) {
+        if ((i & 65535) == 0 && ray_interrupted()) {
+            ray_release(out);
+            return ray_error("cancel", "interrupted");
+        }
+        int alloc = 0;
+        ray_t* ie = collection_elem(idxs, i, &alloc);
+        if (!ie || RAY_IS_ERR(ie)) { ray_release(out); return ie ? ie : ray_error("type", NULL); }
+        if (!ray_is_atom(ie) ||
+            (ie->type != -RAY_I64 && ie->type != -RAY_I32 &&
+             ie->type != -RAY_I16 && ie->type != -RAY_U8)) {
+            if (alloc) ray_release(ie);
+            ray_release(out);
+            return ray_error("type", "cut: indices must be integers");
+        }
+        int64_t idx = as_i64(ie);
+        if (alloc) ray_release(ie);
+        if (idx < 0 || idx > len || idx < prev) {
+            ray_release(out);
+            return ray_error("domain", "cut: indices must be sorted and within collection length");
+        }
+        if (idx > prev) {
+            ray_t* seg = collection_slice(vec, prev, idx - prev);
+            if (!seg || RAY_IS_ERR(seg)) { ray_release(out); return seg ? seg : ray_error("oom", NULL); }
+            out = ray_list_append(out, seg);
+            ray_release(seg);
+            if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+        }
+        prev = idx;
+    }
+
+    ray_t* tail = collection_slice(vec, prev, len - prev);
+    if (!tail || RAY_IS_ERR(tail)) { ray_release(out); return tail ? tail : ray_error("oom", NULL); }
+    out = ray_list_append(out, tail);
+    ray_release(tail);
+    return out;
+}
+
+static bool cross_len(ray_t* x, int64_t* out) {
+    if (ray_is_atom(x)) { *out = 1; return true; }
+    if (is_collection(x) && x->type != RAY_TABLE && x->type != RAY_DICT) {
+        *out = x->len;
+        return true;
+    }
+    return false;
+}
+
+static ray_t* cross_elem(ray_t* x, int64_t i, int* allocated) {
+    if (ray_is_atom(x)) {
+        *allocated = 0;
+        return x;
+    }
+    return collection_elem(x, i, allocated);
+}
+
+ray_t* ray_cross_fn(ray_t* a, ray_t* b) {
+    if (ray_is_lazy(a)) a = ray_lazy_materialize(a);
+    if (ray_is_lazy(b)) b = ray_lazy_materialize(b);
+
+    int64_t na = 0, nb = 0;
+    if (!cross_len(a, &na) || !cross_len(b, &nb))
+        return ray_error("type", "cross: expected atoms or vectors/lists");
+    if (na > 0 && nb > INT64_MAX / na)
+        return ray_error("length", "cross: result too large");
+    int64_t total = na * nb;
+
+    ray_t* out = ray_list_new(total);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    for (int64_t i = 0; i < na; i++) {
+        if ((i & 1023) == 0 && ray_interrupted()) {
+            ray_release(out);
+            return ray_error("cancel", "interrupted");
+        }
+        int alloc_a = 0;
+        ray_t* ae = cross_elem(a, i, &alloc_a);
+        if (!ae || RAY_IS_ERR(ae)) { ray_release(out); return ae ? ae : ray_error("type", NULL); }
+        for (int64_t j = 0; j < nb; j++) {
+            int alloc_b = 0;
+            ray_t* be = cross_elem(b, j, &alloc_b);
+            if (!be || RAY_IS_ERR(be)) {
+                if (alloc_a) ray_release(ae);
+                ray_release(out);
+                return be ? be : ray_error("type", NULL);
+            }
+            ray_t* pair = ray_list_new(2);
+            if (!pair || RAY_IS_ERR(pair)) {
+                if (alloc_a) ray_release(ae);
+                if (alloc_b) ray_release(be);
+                ray_release(out);
+                return pair ? pair : ray_error("oom", NULL);
+            }
+            pair = ray_list_append(pair, ae);
+            if (!pair || RAY_IS_ERR(pair)) {
+                if (alloc_a) ray_release(ae);
+                if (alloc_b) ray_release(be);
+                ray_release(out);
+                return pair ? pair : ray_error("oom", NULL);
+            }
+            pair = ray_list_append(pair, be);
+            if (alloc_b) ray_release(be);
+            if (!pair || RAY_IS_ERR(pair)) {
+                if (alloc_a) ray_release(ae);
+                ray_release(out);
+                return pair ? pair : ray_error("oom", NULL);
+            }
+            out = ray_list_append(out, pair);
+            ray_release(pair);
+            if (!out || RAY_IS_ERR(out)) {
+                if (alloc_a) ray_release(ae);
+                return out ? out : ray_error("oom", NULL);
+            }
+        }
+        if (alloc_a) ray_release(ae);
+    }
+    return out;
+}
+
 /* (at vec idx) or (at table 'col) — index into vector or table */
 ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
     if (ray_is_lazy(vec)) vec = ray_lazy_materialize(vec);

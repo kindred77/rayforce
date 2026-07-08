@@ -150,6 +150,10 @@ Operations on vectors as collections.
 | `union` | binary | Set union | `(union [1 2] [2 3])` → `[1 2 3]` |
 | `sect` | binary | Set intersection | `(sect [1 2 3] [2 3 4])` → `[2 3]` |
 | `take` | binary | Take first/last N elements | `(take [10 20 30] 2)` → `[10 20]` |
+| `drop` | binary | Drop first/last N elements | `(drop [10 20 30] 1)` → `[20 30]` |
+| `rotate` | binary | Rotate left by N positions; negative rotates right | `(rotate [1 2 3 4] 1)` → `[2 3 4 1]` |
+| `cut` | binary | Split at sorted 0-based indices | `(cut [1 2 3 4] [2])` → `([1 2] [3 4])` |
+| `cross` | binary | Cartesian product as pairs | `(cross [1 2] ['a 'b])` → `((1 'a) (1 'b) (2 'a) (2 'b))` |
 | `at` | binary | Index into vector | `(at [10 20 30] 1)` → `20` |
 | `find` | binary | Find index of value | `(find [10 20 30] 20)` → `1` |
 | `reverse` | unary | Reverse order | `(reverse [1 2 3])` → `[3 2 1]` |
@@ -337,12 +341,17 @@ Rayforce supports four join types, all with time-series-aware semantics.
 |---|---|---|---|
 | `split` | binary | Split string by delimiter (returns a list) | `(split "a,b,c" ",")` → `("a" "b" "c")` |
 | `strlen` | unary | Length of each string | `(strlen "hello")` → `5` |
+| `upper` | unary | Uppercase string or symbol atoms/vectors; lazy/DAG for vectors | `(upper ["ab" "Cd"])` → `["AB" "CD"]` |
+| `lower` | unary | Lowercase string or symbol atoms/vectors; lazy/DAG for vectors | `(lower 'AbC)` → `'abc` |
+| `trim` | unary | Strip leading/trailing whitespace; lazy/DAG for vectors | `(trim "  abc  ")` → `"abc"` |
+| `substr` | variadic | Substring by 1-based start and length; lazy/DAG for vectors | `(substr "abcdef" 2 3)` → `"bcd"` |
+| `replace` | variadic | Replace all occurrences; lazy/DAG for vectors | `(replace "a-b" "-" "_")` → `"a_b"` |
 | `like` | binary | Glob pattern match: `*` any, `?` one, `[abc]`/`[a-z]`/`[!abc]` char class | `(like "hello" "hel*")` → `true` |
 | `concat` | binary | Concatenate two strings or vectors | `(concat "hello" " world")` → `"hello world"` |
 | `format` | variadic | Format values as string (% is placeholder) | `(format "x=%" 42)` → `"x=42"` |
 
 !!! note "Note"
-    The executor supports additional string opcodes (UPPER, LOWER, TRIM, SUBSTR, REPLACE, CONCAT) at the DAG level. All string transformations propagate nulls: null input rows produce null output rows.
+    String transforms are available as direct builtins and use the same DAG opcodes inside `select`/`update`. All string transformations propagate nulls: null input rows produce null output rows.
 
 ## Date & Time
 

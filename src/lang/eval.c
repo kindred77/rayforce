@@ -3063,6 +3063,10 @@ static void ray_register_builtins(void) {
     register_binary("union",   RAY_FN_NONE, ray_union_fn);
     register_binary("sect",    RAY_FN_NONE, ray_sect_fn);
     register_binary("take",    RAY_FN_NONE, ray_take_fn);
+    register_binary("drop",    RAY_FN_NONE, ray_drop_fn);
+    register_binary("rotate",  RAY_FN_NONE, ray_rotate_fn);
+    register_binary("cut",     RAY_FN_NONE, ray_cut_fn);
+    register_binary("cross",   RAY_FN_NONE, ray_cross_fn);
     register_binary("at",      RAY_FN_NONE, ray_at_fn);
     register_binary("find",    RAY_FN_NONE, ray_find_fn);
     register_unary("reverse",  RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_reverse_fn);
@@ -3171,6 +3175,11 @@ static void ray_register_builtins(void) {
 
     /* String operations */
     register_binary("split",     RAY_FN_NONE, ray_split_fn);
+    register_unary ("upper",     RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_upper_fn);
+    register_unary ("lower",     RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_lower_fn);
+    register_unary ("trim",      RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_trim_fn);
+    register_vary  ("substr",    RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_substr_fn);
+    register_vary  ("replace",   RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_replace_fn);
 
     /* Serialization */
     register_unary("ser",        RAY_FN_NONE, ray_ser_fn);

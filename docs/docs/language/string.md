@@ -54,8 +54,7 @@ In the C API DAG, null propagation is handled automatically per morsel. String t
 
 ## String Functions
 
-!!! note "DAG-only operations"
-    The following string operations are available in the C API DAG but are **not** currently exposed as Rayfall builtins: `upper`, `lower`, `trim`, `substr`, `replace`, `ilike`. They can be used through the C API's DAG opcodes (see table below). (`strlen` *is* a Rayfall builtin — `(strlen "hello")` → `5`.)
+Rayfall exposes the common string transforms as direct builtins. On vector inputs, `upper`, `lower`, `trim`, `substr`, and `replace` are lazy-aware and use the same morsel-based DAG opcodes that query expressions use. `ilike` remains a C API DAG opcode.
 
 ### concat
 
@@ -80,6 +79,46 @@ Case-sensitive glob pattern matching. Returns a boolean (or boolean vector for v
 
 (select {from: t where: (like name "A*")})
 ; Returns all rows where name starts with "A"
+```
+
+### upper / lower / trim
+
+**`(upper x)`**, **`(lower x)`**, **`(trim x)`** — unary · atom/vector · lazy-aware
+
+Transforms string or symbol atoms and vectors. `trim` removes leading and trailing whitespace.
+
+```lisp
+(upper "Abc42")
+(lower 'AbC)
+(trim [" a " "\tb\t" ""])
+```
+
+### substr
+
+**`(substr str start len)`** — variadic · atom/vector · lazy-aware
+
+Extracts a substring using a 1-based start position and a length. Start values below 1 clamp to the first byte. Negative lengths consume through the end. `start` and `len` may be integer atoms or `I64`/`I32` vectors for vector inputs.
+
+```lisp
+(substr "abcdef" 2 3)
+; "bcd"
+
+(substr ["abcdef" "xyz"] [1 2] [3 9])
+; ["abc" "yz"]
+```
+
+### replace
+
+**`(replace str from to)`** — variadic · atom/vector · lazy-aware
+
+Replaces all occurrences of `from` with `to`. The `from` and `to` arguments must be string or symbol atoms.
+
+```lisp
+(replace "banana" "na" "NA")
+; "baNANA"
+
+(replace (upper ["a-b" "c-d"]) "-" "_")
+; ["A_B" "C_D"]
 ```
 
 ### split

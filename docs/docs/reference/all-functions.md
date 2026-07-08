@@ -11,10 +11,10 @@
 | | | |
 |---|---|---|
 | [Arithmetic](#arithmetic) (24) | [Comparison](#comparison) (7) | [Logic](#logic) (3) |
-| [Aggregation](#aggregation) (22) | [Higher-Order](#higher-order) (13) | [Collection](#collection) (37) |
+| [Aggregation](#aggregation) (22) | [Higher-Order](#higher-order) (13) | [Collection](#collection) (41) |
 | [Sorting & Ordering](#sorting) (10) | [Control Flow & Special Forms](#control) (11) | [Table Operations](#table-ops) (20) |
 | [Query](#query) (4) | [Joins](#joins) (6) | [Pivot](#pivot) (1) |
-| [String](#string-ops) (4) | [Temporal](#temporal) (3) | [Type & Introspection](#type-ops) (5) |
+| [String](#string-ops) (9) | [Temporal](#temporal) (3) | [Type & Introspection](#type-ops) (5) |
 | [I/O & Output](#io) (12) | [System & Utility](#system) (15) | [Serialization](#serialization) (2) |
 | [Storage](#storage) (5) | [IPC](#ipc) (9) | [EAV Triple Store](#eav) (5) |
 | [Datalog](#datalog) (2) | [Datalog Program API](#datalog-program) (6) | |
@@ -51,12 +51,12 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 `.log.validate`, `rc`, `diverse`, `.time.timer.del`, `env`, `sym-name`, `dl-stratify`, `dl-eval`, `dl-free`,
 `norm`, `hnsw-free`, `hnsw-load`, `hnsw-info`, `.idx.zone`, `.idx.hash`, `.idx.sort`, `.idx.bloom`,
 `.idx.drop`, `.idx.has?`, `.idx.info`, `.attr.get`, `.attr.drop`, `.col.unlink`, `.col.link?`, `.col.target`,
-`.graph.free`, `.graph.info`, `strlen`
+`.graph.free`, `.graph.info`, `strlen`, `upper`, `lower`, `trim`
 
 ### Binary
 
 `+`, `-`, `*`, `/`, `%`, `>`, `<`, `>=`, `<=`, `==`, `!=`, `pow`, `top`, `bot`, `pearson_corr`, `cov`, `scov`, `wsum`, `wavg`, `set`, `let`,
-`try`, `filter`, `in`, `except`, `union`, `sect`, `take`, `at`, `find`, `msum`, `mavg`, `mmin`, `mmax`,
+`try`, `filter`, `in`, `except`, `union`, `sect`, `take`, `drop`, `rotate`, `cut`, `cross`, `at`, `find`, `msum`, `mavg`, `mmin`, `mmax`,
 `mcount`, `mvar`, `mdev`, `xasc`, `xdesc`, `table`, `union-all`, `xbar`, `as`, `write`, `dict`, `concat`, `within`, `div`,
 `rand`, `bin`, `binr`, `split`, `like`, `.os.setenv`, `.ipc.send`, `.ipc.post`, `get`, `remove`, `row`,
 `unify`, `xcol`, `xcols`, `xkey`, `xgroup`, `xrank`, `dl-query`, `dl-provenance`, `cos-dist`, `inner-prod`, `l2-dist`, `hnsw-save`, `.attr.set`,
@@ -76,7 +76,8 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 `retract-fact`, `scan-eav`, `pull`, `rule`, `query`, `dl-program`, `dl-add-edb`, `knn`, `hnsw-build`, `ann`,
 `.graph.build`, `.graph.pagerank`, `.graph.connected`, `.graph.dijkstra`, `.graph.louvain`, `.graph.degree`,
 `.graph.topsort`, `.graph.dfs`, `.graph.cluster`, `.graph.betweenness`, `.graph.closeness`, `.graph.mst`,
-`.graph.random-walk`, `.graph.k-shortest`, `.graph.shortest-path`, `.graph.expand`, `.graph.var-expand`
+`.graph.random-walk`, `.graph.k-shortest`, `.graph.shortest-path`, `.graph.expand`, `.graph.var-expand`,
+`substr`, `replace`
 
 ## Arithmetic
 
@@ -248,6 +249,10 @@ Operations on vectors and lists as collections — set operations, indexing, sea
 | `union` | binary | — | Set union (deduplicated) | `(union [1 2] [2 3])` → `[1 2 3]` |
 | `sect` | binary | — | Set intersection | `(sect [1 2 3] [2 3 4])` → `[2 3]` |
 | `take` | binary | — | Take first N elements (negative N takes from end) | `(take [10 20 30] 2)` → `[10 20]` |
+| `drop` | binary | — | Drop first N elements (negative N drops from end) | `(drop [10 20 30] 1)` → `[20 30]` |
+| `rotate` | binary | — | Rotate left by N positions (negative rotates right) | `(rotate [1 2 3 4] 1)` → `[2 3 4 1]` |
+| `cut` | binary | — | Split a collection at sorted 0-based indices | `(cut [1 2 3 4] [2])` → `([1 2] [3 4])` |
+| `cross` | binary | — | Cartesian product as pairs | `(cross [1 2] ['a 'b])` → `((1 'a) (1 'b) (2 'a) (2 'b))` |
 | `at` | binary | — | Index into vector (0-based) | `(at [10 20 30] 1)` → `20` |
 | `find` | binary | — | Find index of first occurrence | `(find [10 20 30] 20)` → `1` |
 | `reverse` | unary | — | Reverse element order | `(reverse [1 2 3])` → `[3 2 1]` |
@@ -285,6 +290,9 @@ Operations on vectors and lists as collections — set operations, indexing, sea
 (set v (til 10))             ; [0 1 2 3 4 5 6 7 8 9]
 (take v 3)                  ; [0 1 2]
 (take v -3)                 ; [7 8 9]
+(drop v 2)                  ; [2 3 4 5 6 7 8 9]
+(rotate v 3)                ; [3 4 5 6 7 8 9 0 1 2]
+(cut v [3 7])               ; ([0 1 2] [3 4 5 6] [7 8 9])
 (at v (where (> v 5)))      ; [6 7 8 9]
 
 ; Set operations
@@ -507,12 +515,17 @@ Rayforce supports six join types, including time-series-aware as-of and window j
 
 ## String Operations { #string-ops }
 
-String functions available as builtins. Additional string operations (UPPER, LOWER, TRIM, SUBSTR, REPLACE) are available at the DAG executor level via `select`/`update`.
+String functions are available as direct builtins. The transform functions are lazy-aware for vector inputs and share the same DAG opcodes used by `select`/`update`.
 
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
 | `split` | binary | — | Split string by delimiter into a list of strings | `(split "a,b,c" ",")` → `("a" "b" "c")` |
 | `strlen` | unary | — | Length of each string | `(strlen "hello")` → `5` |
+| `upper` | unary | lazy/DAG | Uppercase string or symbol atoms/vectors | `(upper ["ab" "Cd"])` → `["AB" "CD"]` |
+| `lower` | unary | lazy/DAG | Lowercase string or symbol atoms/vectors | `(lower 'AbC)` → `'abc` |
+| `trim` | unary | lazy/DAG | Strip leading/trailing whitespace | `(trim "  abc  ")` → `"abc"` |
+| `substr` | variadic | lazy/DAG | Substring by 1-based start and length; 0 clamps to start | `(substr "abcdef" 2 3)` → `"bcd"` |
+| `replace` | variadic | lazy/DAG | Replace all occurrences of a string/symbol atom | `(replace "a-b" "-" "_")` → `"a_b"` |
 | `like` | binary | — | Glob-style pattern match (* and ? wildcards) | `(like "hello" "hel*")` → `true` |
 | `sym-name` | unary | — | Resolve integer sym IDs to symbols (passthrough for sym atoms) | `(sym-name 0)` → sym at ID 0 |
 
@@ -523,6 +536,9 @@ String functions available as builtins. Additional string operations (UPPER, LOW
 ; Pattern matching on a vector of strings
 (like ["apple" "banana" "avocado"] "a*")
 ; [true false true]
+
+; Lazy vector transforms can be chained
+(replace (upper ["a-b" "c-d"]) "-" "_") ; ["A_B" "C_D"]
 
 ; String concat also works on strings
 (concat "hello" " world")  ; "hello world"

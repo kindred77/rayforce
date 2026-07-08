@@ -464,6 +464,10 @@ ray_t* ray_except_fn(ray_t* vec1, ray_t* vec2);
 ray_t* ray_union_fn(ray_t* vec1, ray_t* vec2);
 ray_t* ray_sect_fn(ray_t* vec1, ray_t* vec2);
 ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj);
+ray_t* ray_drop_fn(ray_t* vec, ray_t* n_obj);
+ray_t* ray_rotate_fn(ray_t* vec, ray_t* n_obj);
+ray_t* ray_cut_fn(ray_t* vec, ray_t* idxs);
+ray_t* ray_cross_fn(ray_t* a, ray_t* b);
 ray_t* ray_at_fn(ray_t* vec, ray_t* idx);
 ray_t* ray_find_fn(ray_t* vec, ray_t* val);
 ray_t* ray_til_fn(ray_t* x);
@@ -501,6 +505,11 @@ ray_t* ray_enlist_fn(ray_t** args, int64_t n);
 ray_t* ray_split_fn(ray_t* str, ray_t* delim);
 ray_t* ray_strlen_fn(ray_t* x);
 ray_t* ray_like_fn(ray_t* x, ray_t* pattern);
+ray_t* ray_upper_fn(ray_t* x);
+ray_t* ray_lower_fn(ray_t* x);
+ray_t* ray_trim_fn(ray_t* x);
+ray_t* ray_substr_fn(ray_t** args, int64_t n);
+ray_t* ray_replace_fn(ray_t** args, int64_t n);
 ray_t* ray_sym_name_fn(ray_t* x);
 
 /* Table builtins (formerly static in eval.c, now in table_builtin.c) */

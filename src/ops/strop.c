@@ -28,6 +28,7 @@
 #include "table/table.h"
 #include "ops/glob.h"
 #include "lang/format.h"   /* ray_type_name (error context) */
+#include <ctype.h>
 
 /* ══════════════════════════════════════════
  * String builtins
@@ -135,6 +136,315 @@ ray_t* ray_strlen_fn(ray_t* x) {
     if (x->type == RAY_MAPCOMMON) return strlen_mapcommon(x);
     if (RAY_IS_PARTED(x->type)) return strlen_parted(x);
     return ray_error("type", "strlen: expected string or symbol");
+}
+
+static bool str_atom_bytes(ray_t* x, const char** out, size_t* out_len,
+                           bool* out_sym) {
+    if (x->type == -RAY_STR) {
+        *out = ray_str_ptr(x);
+        *out_len = ray_str_len(x);
+        if (out_sym) *out_sym = false;
+        return true;
+    }
+    if (x->type == -RAY_SYM) {
+        ray_t* s = ray_sym_str(x->i64);
+        if (!s) {
+            *out = "";
+            *out_len = 0;
+        } else {
+            *out = ray_str_ptr(s);
+            *out_len = ray_str_len(s);
+        }
+        if (out_sym) *out_sym = true;
+        return true;
+    }
+    return false;
+}
+
+static bool str_atom_arg(ray_t* x, const char** out, size_t* out_len) {
+    bool is_sym = false;
+    return str_atom_bytes(x, out, out_len, &is_sym);
+}
+
+static bool intish_atom_value(ray_t* x, int64_t* out) {
+    switch (x->type) {
+    case -RAY_I64: case -RAY_I32: case -RAY_I16: case -RAY_U8:
+    case -RAY_BOOL:
+        *out = as_i64(x);
+        return true;
+    case -RAY_F64:
+        *out = (int64_t)x->f64;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool substr_count_arg_ok(ray_t* x) {
+    if (!x || RAY_IS_ERR(x)) return false;
+    if (ray_is_atom(x)) {
+        int64_t tmp = 0;
+        return intish_atom_value(x, &tmp);
+    }
+    if (!ray_is_vec(x)) return false;
+    switch (x->type) {
+    case RAY_I64: case RAY_I32:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static ray_op_t* const_node_from_obj(ray_graph_t* g, ray_t* x) {
+    if (ray_is_vec(x)) return ray_const_vec(g, x);
+    if (ray_is_atom(x)) return ray_const_atom(g, x);
+    return NULL;
+}
+
+static ray_t* string_unary_atom(ray_t* x, uint16_t opcode) {
+    const char* sp = NULL;
+    size_t sl = 0;
+    bool is_sym = false;
+    if (!str_atom_bytes(x, &sp, &sl, &is_sym))
+        return ray_error("type", "string transform: expected string or symbol, got %s", ray_type_name(x->type));
+
+    char sbuf[8192];
+    char* buf = sbuf;
+    ray_t* dyn_hdr = NULL;
+    if (sl + 1 > sizeof(sbuf)) {
+        buf = (char*)scratch_alloc(&dyn_hdr, sl + 1);
+        if (!buf) return ray_error("oom", NULL);
+    }
+
+    size_t out_len = sl;
+    if (opcode == OP_UPPER) {
+        for (size_t i = 0; i < sl; i++) buf[i] = (char)toupper((unsigned char)sp[i]);
+    } else if (opcode == OP_LOWER) {
+        for (size_t i = 0; i < sl; i++) buf[i] = (char)tolower((unsigned char)sp[i]);
+    } else {
+        size_t start = 0, end = sl;
+        while (start < sl && isspace((unsigned char)sp[start])) start++;
+        while (end > start && isspace((unsigned char)sp[end - 1])) end--;
+        out_len = end - start;
+        memcpy(buf, sp + start, out_len);
+    }
+
+    ray_t* out;
+    if (is_sym) {
+        int64_t sid = ray_sym_intern(buf, out_len);
+        out = sid >= 0 ? ray_sym(sid) : ray_error("oom", NULL);
+    } else {
+        out = ray_str(buf, out_len);
+    }
+    scratch_free(dyn_hdr);
+    return out;
+}
+
+static ray_t* string_unary_fn(ray_t* x, uint16_t opcode,
+                              ray_op_t* (*ctor)(ray_graph_t*, ray_op_t*)) {
+    if (!x || RAY_IS_ERR(x)) return x;
+    if (ray_is_lazy(x)) {
+        ray_op_t* prev = RAY_LAZY_OP(x);
+        if (!prev || (prev->out_type != RAY_STR && prev->out_type != RAY_SYM))
+            return ray_error("type", "string transform: expected string or symbol vector");
+        return ray_lazy_append(x, opcode);
+    }
+    if (ray_is_atom(x))
+        return string_unary_atom(x, opcode);
+    if (!ray_is_vec(x) || (x->type != RAY_STR && x->type != RAY_SYM))
+        return ray_error("type", "string transform: expected string or symbol, got %s", ray_type_name(x->type));
+
+    ray_graph_t* g = ray_graph_new(NULL);
+    if (!g) return ray_error("oom", NULL);
+    ray_op_t* in = ray_graph_input_vec(g, x);
+    ray_op_t* op = in ? ctor(g, in) : NULL;
+    if (!op) {
+        ray_graph_free(g);
+        return ray_error("oom", NULL);
+    }
+    return ray_lazy_wrap(g, op);
+}
+
+ray_t* ray_upper_fn(ray_t* x) {
+    return string_unary_fn(x, OP_UPPER, ray_upper);
+}
+
+ray_t* ray_lower_fn(ray_t* x) {
+    return string_unary_fn(x, OP_LOWER, ray_lower);
+}
+
+ray_t* ray_trim_fn(ray_t* x) {
+    return string_unary_fn(x, OP_TRIM, ray_trim_op);
+}
+
+static ray_t* substr_atom(ray_t* str, ray_t* start_obj, ray_t* len_obj) {
+    const char* sp = NULL;
+    size_t sl = 0;
+    bool is_sym = false;
+    int64_t start = 0, amount = 0;
+    if (!str_atom_bytes(str, &sp, &sl, &is_sym))
+        return ray_error("type", "substr: expected string or symbol, got %s", ray_type_name(str->type));
+    if (!intish_atom_value(start_obj, &start))
+        return ray_error("type", "substr: start must be an integer atom");
+    if (!intish_atom_value(len_obj, &amount))
+        return ray_error("type", "substr: length must be an integer atom");
+
+    int64_t st = start - 1;
+    if (st < 0) st = 0;
+    if ((size_t)st >= sl) {
+        if (is_sym) {
+            int64_t sid = ray_sym_intern("", 0);
+            return sid >= 0 ? ray_sym(sid) : ray_error("oom", NULL);
+        }
+        return ray_str("", 0);
+    }
+    if (amount < 0 || amount > (int64_t)(sl - (size_t)st))
+        amount = (int64_t)sl - st;
+    if (is_sym) {
+        int64_t sid = ray_sym_intern(sp + st, (size_t)amount);
+        return sid >= 0 ? ray_sym(sid) : ray_error("oom", NULL);
+    }
+    return ray_str(sp + st, (size_t)amount);
+}
+
+ray_t* ray_substr_fn(ray_t** args, int64_t n) {
+    if (n != 3)
+        return ray_error("arity", "substr: expected 3 args, got %lld", (long long)n);
+    ray_t* str = args[0];
+    ray_t* start = args[1];
+    ray_t* len = args[2];
+    if (!substr_count_arg_ok(start))
+        return ray_error("type", "substr: start must be an integer atom or I64/I32 vector");
+    if (!substr_count_arg_ok(len))
+        return ray_error("type", "substr: length must be an integer atom or I64/I32 vector");
+
+    if (ray_is_lazy(str)) {
+        ray_graph_t* g = RAY_LAZY_GRAPH(str);
+        ray_op_t* prev = RAY_LAZY_OP(str);
+        if (!prev || (prev->out_type != RAY_STR && prev->out_type != RAY_SYM))
+            return ray_error("type", "substr: expected string or symbol vector");
+        ray_op_t* s = const_node_from_obj(g, start);
+        ray_op_t* l = const_node_from_obj(g, len);
+        ray_op_t* op = (s && l) ? ray_substr(g, prev, s, l) : NULL;
+        if (!op) return ray_error("oom", NULL);
+        RAY_LAZY_OP(str) = op;
+        ray_retain(str);
+        return str;
+    }
+
+    if (ray_is_atom(str))
+        return substr_atom(str, start, len);
+
+    if (!ray_is_vec(str) || (str->type != RAY_STR && str->type != RAY_SYM))
+        return ray_error("type", "substr: expected string or symbol, got %s", ray_type_name(str->type));
+    ray_graph_t* g = ray_graph_new(NULL);
+    if (!g) return ray_error("oom", NULL);
+    ray_op_t* in = ray_graph_input_vec(g, str);
+    ray_op_t* s = const_node_from_obj(g, start);
+    ray_op_t* l = const_node_from_obj(g, len);
+    ray_op_t* op = (in && s && l) ? ray_substr(g, in, s, l) : NULL;
+    if (!op) {
+        ray_graph_free(g);
+        return ray_error("oom", NULL);
+    }
+    return ray_lazy_wrap(g, op);
+}
+
+static ray_t* replace_atom(ray_t* str, ray_t* from, ray_t* to) {
+    const char* sp = NULL;
+    const char* fp = NULL;
+    const char* tp = NULL;
+    size_t sl = 0, fl = 0, tl = 0;
+    bool is_sym = false;
+    if (!str_atom_bytes(str, &sp, &sl, &is_sym))
+        return ray_error("type", "replace: expected string or symbol input, got %s", ray_type_name(str->type));
+    if (!str_atom_arg(from, &fp, &fl))
+        return ray_error("type", "replace: from must be string or symbol atom");
+    if (!str_atom_arg(to, &tp, &tl))
+        return ray_error("type", "replace: to must be string or symbol atom");
+
+    size_t n_matches = (fl > 0) ? sl / fl : 0;
+    size_t worst;
+    if (fl > 0 && tl > fl && n_matches > SIZE_MAX / tl)
+        return ray_error("oom", NULL);
+    if (fl > 0 && tl >= fl)
+        worst = n_matches * tl + (sl % fl) + 1;
+    else
+        worst = sl + 1;
+
+    char sbuf[8192];
+    char* buf = sbuf;
+    ray_t* dyn_hdr = NULL;
+    if (worst > sizeof(sbuf)) {
+        buf = (char*)scratch_alloc(&dyn_hdr, worst);
+        if (!buf) return ray_error("oom", NULL);
+    }
+
+    size_t bi = 0;
+    for (size_t j = 0; j < sl; ) {
+        if (fl > 0 && j + fl <= sl && memcmp(sp + j, fp, fl) == 0) {
+            memcpy(buf + bi, tp, tl);
+            bi += tl;
+            j += fl;
+        } else {
+            buf[bi++] = sp[j++];
+        }
+    }
+
+    ray_t* out;
+    if (is_sym) {
+        int64_t sid = ray_sym_intern(buf, bi);
+        out = sid >= 0 ? ray_sym(sid) : ray_error("oom", NULL);
+    } else {
+        out = ray_str(buf, bi);
+    }
+    scratch_free(dyn_hdr);
+    return out;
+}
+
+ray_t* ray_replace_fn(ray_t** args, int64_t n) {
+    if (n != 3)
+        return ray_error("arity", "replace: expected 3 args, got %lld", (long long)n);
+    ray_t* str = args[0];
+    ray_t* from = args[1];
+    ray_t* to = args[2];
+    const char* tmp_s = NULL;
+    size_t tmp_len = 0;
+    if (!str_atom_arg(from, &tmp_s, &tmp_len))
+        return ray_error("type", "replace: from must be string or symbol atom");
+    if (!str_atom_arg(to, &tmp_s, &tmp_len))
+        return ray_error("type", "replace: to must be string or symbol atom");
+
+    if (ray_is_lazy(str)) {
+        ray_graph_t* g = RAY_LAZY_GRAPH(str);
+        ray_op_t* prev = RAY_LAZY_OP(str);
+        if (!prev || (prev->out_type != RAY_STR && prev->out_type != RAY_SYM))
+            return ray_error("type", "replace: expected string or symbol vector");
+        ray_op_t* f = const_node_from_obj(g, from);
+        ray_op_t* t = const_node_from_obj(g, to);
+        ray_op_t* op = (f && t) ? ray_replace(g, prev, f, t) : NULL;
+        if (!op) return ray_error("oom", NULL);
+        RAY_LAZY_OP(str) = op;
+        ray_retain(str);
+        return str;
+    }
+
+    if (ray_is_atom(str))
+        return replace_atom(str, from, to);
+
+    if (!ray_is_vec(str) || (str->type != RAY_STR && str->type != RAY_SYM))
+        return ray_error("type", "replace: expected string or symbol, got %s", ray_type_name(str->type));
+    ray_graph_t* g = ray_graph_new(NULL);
+    if (!g) return ray_error("oom", NULL);
+    ray_op_t* in = ray_graph_input_vec(g, str);
+    ray_op_t* f = const_node_from_obj(g, from);
+    ray_op_t* t = const_node_from_obj(g, to);
+    ray_op_t* op = (in && f && t) ? ray_replace(g, in, f, t) : NULL;
+    if (!op) {
+        ray_graph_free(g);
+        return ray_error("oom", NULL);
+    }
+    return ray_lazy_wrap(g, op);
 }
 
 ray_t* ray_split_fn(ray_t* str, ray_t* delim) {
