@@ -447,7 +447,7 @@ ray_op_t* ray_binop(ray_graph_t* g, uint16_t opcode, ray_op_t* a, ray_op_t* b) {
     case OP_EQ: case OP_NE: case OP_LT: case OP_LE:
     case OP_GT: case OP_GE: case OP_AND: case OP_OR:
         out = RAY_BOOL; break;
-    case OP_DIV:
+    case OP_DIV: case OP_POW:
         out = RAY_F64; break;
     default:
         out = promote(a->out_type, b->out_type); break;
@@ -461,6 +461,7 @@ ray_op_t* ray_mul(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_binary
 ray_op_t* ray_div(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_binary(g, OP_DIV, a, b, RAY_F64); }
 ray_op_t* ray_idiv(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_binary(g, OP_IDIV, a, b, RAY_I64); }
 ray_op_t* ray_mod(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_binary(g, OP_MOD, a, b, promote(a->out_type, b->out_type)); }
+ray_op_t* ray_pow_op(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_binary(g, OP_POW, a, b, RAY_F64); }
 
 ray_op_t* ray_eq(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_binary(g, OP_EQ, a, b, RAY_BOOL); }
 ray_op_t* ray_ne(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_binary(g, OP_NE, a, b, RAY_BOOL); }

@@ -804,16 +804,20 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
     if (!force_boxed && dag_opcode > 0) {
         int is_idiv = (dag_opcode == OP_MOD);
         int is_cmp  = (dag_opcode >= OP_EQ && dag_opcode <= OP_GE);
+        int is_pow  = (dag_opcode == OP_POW);
 
         /* Classify operands: numeric/temporal vectors or scalars */
         int8_t lt = left_coll ? left->type : -(left->type);
         int8_t rt = right_coll ? right->type : -(right->type);
         #define IS_NUM_TYPE(t) ((t)==RAY_I64||(t)==RAY_F64||(t)==RAY_I32||(t)==RAY_I16|| \
                                 (t)==RAY_U8||(t)==RAY_DATE||(t)==RAY_TIME||(t)==RAY_TIMESTAMP)
-        int l_num_vec = left_coll && ray_is_vec(left) && IS_NUM_TYPE(lt);
-        int r_num_vec = right_coll && ray_is_vec(right) && IS_NUM_TYPE(rt);
-        int l_num_scalar = !left_coll && IS_NUM_TYPE(lt);
-        int r_num_scalar = !right_coll && IS_NUM_TYPE(rt);
+        #define IS_POW_TYPE(t) ((t)==RAY_BOOL||(t)==RAY_U8||(t)==RAY_I16||(t)==RAY_I32|| \
+                                (t)==RAY_I64||(t)==RAY_F64)
+        int l_num_vec = left_coll && ray_is_vec(left) && (is_pow ? IS_POW_TYPE(lt) : IS_NUM_TYPE(lt));
+        int r_num_vec = right_coll && ray_is_vec(right) && (is_pow ? IS_POW_TYPE(rt) : IS_NUM_TYPE(rt));
+        int l_num_scalar = !left_coll && (is_pow ? IS_POW_TYPE(lt) : IS_NUM_TYPE(lt));
+        int r_num_scalar = !right_coll && (is_pow ? IS_POW_TYPE(rt) : IS_NUM_TYPE(rt));
+        #undef IS_POW_TYPE
         #undef IS_NUM_TYPE
 
         int can_dag = (l_num_vec || r_num_vec) &&
@@ -831,10 +835,13 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
         if (is_idiv && !(lt == RAY_I64 && rt == RAY_I64)) can_dag = 0;
         /* Comparisons: same-type only (cross-type promotion loses type info) */
         if (is_cmp && lt != rt) can_dag = 0;
-        /* Cross-type temporal: DAG promote() loses type tag (int+TIMESTAMP→I64 not TIMESTAMP) */
+        /* Cross-type temporal: DAG promote() loses type tag (int+TIMESTAMP→I64 not TIMESTAMP).
+         * POW rejects temporals entirely; its scalar builtin treats power as
+         * a numeric-only operation and returns F64. */
         {   int lt_temp = (lt==RAY_DATE||lt==RAY_TIME||lt==RAY_TIMESTAMP);
             int rt_temp = (rt==RAY_DATE||rt==RAY_TIME||rt==RAY_TIMESTAMP);
-            if ((lt_temp || rt_temp) && lt != rt) can_dag = 0;
+            if (is_pow && (lt_temp || rt_temp)) can_dag = 0;
+            else if ((lt_temp || rt_temp) && lt != rt) can_dag = 0;
         }
 
         if (can_dag) {
@@ -2977,10 +2984,7 @@ static void ray_register_builtins(void) {
     register_unary_op("sqrt",  RAY_FN_ATOMIC, ray_sqrt_fn, OP_SQRT);
     register_unary_op("log",   RAY_FN_ATOMIC, ray_log_fn,  OP_LOG);
     register_unary_op("exp",   RAY_FN_ATOMIC, ray_exp_fn,  OP_EXP);
-    /* No DAG opcode yet — registered as plain binary atomic.  Vector
-     * broadcasting goes through the ray_eval atomic dispatch.  Adding
-     * OP_POW + libm-vectorised expr.c arms is a perf follow-up. */
-    register_binary("pow", RAY_FN_ATOMIC, ray_pow_fn);
+    register_binary_op("pow", RAY_FN_ATOMIC, ray_pow_fn, OP_POW);
     /* Partial-sort top/bottom-N: O(N log K) bounded-heap fast path
      * via topk_indices_single, falls back to full sort for unsupported
      * types.  Per-group usage works through the eval-level scatter. */

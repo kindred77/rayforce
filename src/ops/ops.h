@@ -162,6 +162,7 @@ void     ray_cancel_reset(void);
 #define OP_REPLACE      41
 #define OP_TRIM         42
 #define OP_CONCAT       43
+#define OP_POW          44   /* binary: numeric power -> F64 */
 #define OP_EXTRACT      45
 #define OP_DATE_TRUNC   46
 #define OP_IN           47   /* binary: col in set_vec -> BOOL */
@@ -658,6 +659,7 @@ ray_op_t* ray_mul(ray_graph_t* g, ray_op_t* a, ray_op_t* b);
 ray_op_t* ray_div(ray_graph_t* g, ray_op_t* a, ray_op_t* b);
 ray_op_t* ray_idiv(ray_graph_t* g, ray_op_t* a, ray_op_t* b);
 ray_op_t* ray_mod(ray_graph_t* g, ray_op_t* a, ray_op_t* b);
+ray_op_t* ray_pow_op(ray_graph_t* g, ray_op_t* a, ray_op_t* b);
 ray_op_t* ray_eq(ray_graph_t* g, ray_op_t* a, ray_op_t* b);
 ray_op_t* ray_ne(ray_graph_t* g, ray_op_t* a, ray_op_t* b);
 ray_op_t* ray_lt(ray_graph_t* g, ray_op_t* a, ray_op_t* b);

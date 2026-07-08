@@ -104,7 +104,8 @@ static bool eval_const_numeric_expr(ray_graph_t* g, ray_op_t* op,
     }
 
     if (op->arity != 2 || !op_child(g, op, 0) || !op_child(g, op, 1)) return false;
-    if ((op->opcode < OP_ADD || op->opcode > OP_MAX2) && op->opcode != OP_IDIV) return false;
+    if ((op->opcode < OP_ADD || op->opcode > OP_MAX2) &&
+        op->opcode != OP_IDIV && op->opcode != OP_POW) return false;
 
     double lf = 0.0, rf = 0.0;
     int64_t li = 0, ri = 0;
@@ -112,7 +113,8 @@ static bool eval_const_numeric_expr(ray_graph_t* g, ray_op_t* op,
     if (!eval_const_numeric_expr(g, op_child(g, op, 0), &lf, &li, &l_is_f64)) return false;
     if (!eval_const_numeric_expr(g, op_child(g, op, 1), &rf, &ri, &r_is_f64)) return false;
 
-    if (op->out_type == RAY_F64 || l_is_f64 || r_is_f64 || op->opcode == OP_DIV) {
+    if (op->out_type == RAY_F64 || l_is_f64 || r_is_f64 ||
+        op->opcode == OP_DIV || op->opcode == OP_POW) {
         double lv = l_is_f64 ? lf : (double)li;
         double rv = r_is_f64 ? rf : (double)ri;
         double r = 0.0;
@@ -123,6 +125,7 @@ static bool eval_const_numeric_expr(ray_graph_t* g, ray_op_t* op,
             case OP_DIV: r = rv != 0.0 ? lv / rv : NAN; break;
             case OP_IDIV: r = rv != 0.0 ? floor(lv / rv) : NAN; break;
             case OP_MOD: { if (rv != 0.0) { r = fmod(lv, rv); if (r && ((r > 0) != (rv > 0))) r += rv; } else { r = NAN; } } break;
+            case OP_POW: r = (lv != lv || rv != rv) ? NAN : pow(lv, rv); break;
             case OP_MIN2: r = lv < rv ? lv : rv; break;
             case OP_MAX2: r = lv > rv ? lv : rv; break;
             default: return false;
@@ -475,7 +478,9 @@ void ray_expr_stats_init(void) {
 
 /* Is this opcode an element-wise op suitable for expression compilation? */
 static inline bool expr_is_elementwise(uint16_t op) {
-    return (op >= OP_NEG && op <= OP_CAST) || (op >= OP_ADD && op <= OP_MAX2);
+    return (op >= OP_NEG && op <= OP_CAST) ||
+           (op >= OP_ADD && op <= OP_MAX2) ||
+           op == OP_POW;
 }
 
 /* Insert CAST instruction to promote register to target type */
@@ -534,6 +539,8 @@ static bool expr_null_capable(uint8_t op, int8_t dt, int8_t t1) {
         return true;
     /* Task 7: F64 MIN2/MAX2 — null-aware kernel variant added (NaN propagation). */
     if (dt == RAY_F64 && (op == OP_MIN2 || op == OP_MAX2)) return true;
+    /* POW needs explicit null awareness: libm pow(NaN, 0) returns 1. */
+    if (dt == RAY_F64 && op == OP_POW) return true;
     return false;
 }
 
@@ -691,6 +698,7 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out) {
                     op == OP_ISNULL)
                     ot = RAY_BOOL;
                 else if (t1 == RAY_F64 || t2 == RAY_F64 || op == OP_DIV ||
+                         op == OP_POW ||
                          op == OP_SQRT || op == OP_LOG || op == OP_EXP)
                     ot = RAY_F64;
                 else
@@ -753,6 +761,8 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out) {
                         /* Arithmetic:
                          * F64 standard ops (ADD/SUB/MUL/DIV/MOD, NEG/ABS/SQRT/LOG/EXP/CEIL/FLOOR/ROUND): NaN propagates
                          *   via IEEE for free — no kernel variant needed.
+                         * F64 POW is excluded: pow(NaN, 0) yields 1, but
+                         *   null-any-operand semantics require NULL_F64.
                          * F64 MIN2/MAX2: NOT IEEE-propagating — mark null_aware;
                          *   null-aware kernel variant now live (Task 7).
                          * F64 AND/OR/NOT: mark null_aware → capability choke fires → fallback.
@@ -932,8 +942,18 @@ static void expr_exec_binary(uint8_t opcode, uint8_t null_aware, int8_t dt, void
         const double* b = (const double*)bp;
         /* F64 MIN2/MAX2 null-aware variant: NaN (null sentinel) in either
          * operand → NaN output.  IEEE min/max comparisons return false for NaN
-         * so we must check explicitly.  All other F64 ops rely on IEEE NaN
-         * propagation and need no null_aware variant. */
+         * so we must check explicitly.  POW also needs an explicit check:
+         * libm pow(NaN, 0) returns 1, while Rayfall null semantics require
+         * any null operand to yield NULL_F64. */
+        if (null_aware && opcode == OP_POW) {
+            #define F64_ISN(x) ((x) != (x))
+            for (int64_t j = 0; j < n; j++)
+                d[j] = (F64_ISN(a[j]) || F64_ISN(b[j]))
+                     ? NULL_F64
+                     : ray_f64_fin(pow(a[j], b[j]));
+            #undef F64_ISN
+            return;
+        }
         if (null_aware && (opcode == OP_MIN2 || opcode == OP_MAX2)) {
             #define F64_ISN(x) ((x) != (x))
             /* null in either operand → NULL_F64 (single-null model: write the
@@ -965,6 +985,7 @@ static void expr_exec_binary(uint8_t opcode, uint8_t null_aware, int8_t dt, void
                 m = (m && ((m > 0) != (b[j] > 0))) ? m + b[j] : m;
                 d[j] = ray_f64_fin(m);
             } break;
+            case OP_POW: for (int64_t j = 0; j < n; j++) d[j] = ray_f64_fin(pow(a[j], b[j])); break;
             case OP_MIN2: for (int64_t j = 0; j < n; j++) d[j] = a[j] < b[j] ? a[j] : b[j]; break;
             case OP_MAX2: for (int64_t j = 0; j < n; j++) d[j] = a[j] > b[j] ? a[j] : b[j]; break;
             default: break;
@@ -1742,7 +1763,7 @@ static bool expr_last_op_produces_f64_null(const ray_expr_t* expr) {
     const expr_ins_t* last = &expr->ins[expr->n_ins - 1];
     switch (last->opcode) {
         case OP_ADD: case OP_SUB: case OP_MUL:
-        case OP_DIV: case OP_IDIV: case OP_MOD:
+        case OP_DIV: case OP_IDIV: case OP_MOD: case OP_POW:
         case OP_SQRT: case OP_LOG: case OP_EXP:
             return true;
         default:
@@ -2099,6 +2120,17 @@ static bool scalar_is_null(ray_t* x) {
 /* Check if a vector might contain nulls (accounts for slices). */
 static bool vec_may_have_nulls(ray_t* v) {
     return (v->attrs & (RAY_ATTR_HAS_NULLS | RAY_ATTR_SLICE)) != 0;
+}
+
+static int8_t ew_value_base_type(ray_t* x) {
+    int8_t t = ray_is_atom(x) ? (int8_t)(-(int)x->type) : x->type;
+    if (RAY_IS_PARTED(t)) t = (int8_t)RAY_PARTED_BASETYPE(t);
+    return t;
+}
+
+static bool ew_pow_type_admitted(int8_t t) {
+    return t == RAY_BOOL || t == RAY_U8 || t == RAY_I16 ||
+           t == RAY_I32 || t == RAY_I64 || t == RAY_F64;
 }
 
 /* Resolve data pointer for a vector, accounting for slices.
@@ -2846,6 +2878,7 @@ static void binary_range(ray_op_t* op, int8_t out_type,
             case OP_DIV:  for (int64_t i=0;i<n;i++) { double lv=LV_READ(i),rv=RV_READ(i); odst[i]=rv!=0.0?ray_f64_fin(lv/rv):NULL_F64; } break;
             case OP_IDIV: for (int64_t i=0;i<n;i++) { double lv=LV_READ(i),rv=RV_READ(i); odst[i]=rv!=0.0?ray_f64_fin(floor(lv/rv)):NULL_F64; } break;
             case OP_MOD:  for (int64_t i=0;i<n;i++) { double lv=LV_READ(i),rv=RV_READ(i); double r; if(rv!=0.0){r=fmod(lv,rv);if(r&&((r>0)!=(rv>0)))r+=rv; r=ray_f64_fin(r);}else r=NULL_F64; odst[i]=r; } break;
+            case OP_POW:  for (int64_t i=0;i<n;i++) { double lv=LV_READ(i),rv=RV_READ(i); odst[i]=(lv!=lv||rv!=rv)?NULL_F64:ray_f64_fin(pow(lv,rv)); } break;
             case OP_MIN2: for (int64_t i=0;i<n;i++) { double lv=LV_READ(i),rv=RV_READ(i); odst[i]=lv<rv?lv:rv; } break;
             case OP_MAX2: for (int64_t i=0;i<n;i++) { double lv=LV_READ(i),rv=RV_READ(i); odst[i]=lv>rv?lv:rv; } break;
             default:      for (int64_t i=0;i<n;i++) odst[i]=0.0; break;
@@ -2858,7 +2891,8 @@ static void binary_range(ray_op_t* op, int8_t out_type,
          * exists.  Precise (no input poisoning) AND no separate pass — keeps
          * the hot float kernels within noise and matches the fused path. */
         if (op->opcode == OP_ADD || op->opcode == OP_SUB || op->opcode == OP_MUL ||
-            op->opcode == OP_DIV || op->opcode == OP_IDIV || op->opcode == OP_MOD) {
+            op->opcode == OP_DIV || op->opcode == OP_IDIV || op->opcode == OP_MOD ||
+            op->opcode == OP_POW) {
             int any_nan = 0;
             for (int64_t i = 0; i < n; i++) any_nan |= (odst[i] != odst[i]);
             if (any_nan)
@@ -3022,6 +3056,16 @@ ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* 
         len = rhs->len;
     } else if (!l_scalar && r_scalar) {
         len = lhs->len;
+    }
+
+    if (op->opcode == OP_POW) {
+        int8_t lt = ew_value_base_type(lhs);
+        int8_t rt = ew_value_base_type(rhs);
+        if (!ew_pow_type_admitted(lt) || !ew_pow_type_admitted(rt)) {
+            return ray_error("type",
+                             "pow: expects numeric base and exponent, got %s and %s",
+                             ray_type_name(lhs->type), ray_type_name(rhs->type));
+        }
     }
 
     int8_t out_type = ew_runtime_out_type(op->out_type,

@@ -79,6 +79,16 @@ Round down to nearest integer.
 (floor 3.9)  ; 3.0
 ```
 
+### `(pow x y)` — atomic
+
+Power. Always returns f64. Vector and query expressions lower to the DAG
+executor for morsel-based execution; null in either operand yields `0Nf`.
+
+```lisp
+(pow 2 10)  ; 1024.0
+(pow [1 2 3] 2)  ; [1.0 4.0 9.0]
+```
+
 ### `(ceil x)` — atomic
 
 Round up to nearest integer.
@@ -534,7 +544,7 @@ Parallel map. Like `map` but distributes work across threads for large inputs.
 
 | Category | Functions |
 |---|---|
-| **Arithmetic** | `+` `-` `*` `/` `%` `neg` `round` `floor` `ceil` |
+| **Arithmetic** | `+` `-` `*` `/` `%` `neg` `round` `floor` `ceil` `pow` |
 | **Comparison** | `==` `!=` `<` `<=` `>` `>=` `within` |
 | **Logic** | `and` `or` `not` |
 | **Aggregation** | `sum` `prod` `all` `any` `count` `avg` `min` `max` `med` `dev` `stddev` `var` `pearson_corr` `cov` `scov` `wsum` `wavg` `first` `last` `distinct` |

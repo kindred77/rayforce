@@ -296,6 +296,13 @@ static bool query_key_reader_read(query_key_reader_t* r, int64_t row,
 typedef ray_op_t* (*dag_binary_ctor)(ray_graph_t*, ray_op_t*, ray_op_t*);
 typedef ray_op_t* (*dag_unary_ctor)(ray_graph_t*, ray_op_t*);
 
+static bool dag_pow_type_admitted(int8_t t) {
+    if (t <= 0) return true;  /* unknown/uninferred: let executor validate */
+    if (RAY_IS_PARTED(t)) t = (int8_t)RAY_PARTED_BASETYPE(t);
+    return t == RAY_BOOL || t == RAY_U8 || t == RAY_I16 ||
+           t == RAY_I32 || t == RAY_I64 || t == RAY_F64;
+}
+
 static dag_binary_ctor resolve_binary_dag(int64_t sym_id) {
     ray_t* s = ray_sym_str(sym_id);
     if (!s) return NULL;
@@ -321,6 +328,7 @@ static dag_binary_ctor resolve_binary_dag(int64_t sym_id) {
     } else if (len == 3) {
         if (memcmp(name, "and",  3) == 0) return ray_and;
         if (memcmp(name, "div",  3) == 0) return ray_idiv;
+        if (memcmp(name, "pow",  3) == 0) return ray_pow_op;
     } else if (len == 4) {
         if (memcmp(name, "like", 4) == 0) return ray_like;
     } else if (len == 5) {
@@ -353,6 +361,7 @@ static dag_unary_ctor resolve_unary_dag(int64_t sym_id) {
         if (memcmp(name, "ceil",  4) == 0) return ray_ceil_op;
         if (memcmp(name, "sqrt",  4) == 0) return ray_sqrt_op;
         if (memcmp(name, "trim",  4) == 0) return ray_trim_op;
+        if (memcmp(name, "nil?",  4) == 0) return ray_isnull;
     } else if (len == 5) {
         if (memcmp(name, "fills", 5) == 0) return ray_fills_op;
         if (memcmp(name, "floor", 5) == 0) return ray_floor_op;
@@ -365,13 +374,6 @@ static dag_unary_ctor resolve_unary_dag(int64_t sym_id) {
         if (memcmp(name, "differ", 6) == 0) return ray_differ_op;
         if (memcmp(name, "strlen", 6) == 0) return ray_strlen;
     }
-    /* NOTE: no DAG wiring for nil?/isnull yet.  The eval-level
-     * builtin `nil?` (src/lang/eval.c:2029) is atom-only — it
-     * returns false when applied to a column vec.  OP_ISNULL in
-     * the DAG is per-element.  Wiring `nil?` here would diverge
-     * from the eval fallback.  A proper pass should first add an
-     * element-wise null-check builtin at eval level, then map it
-     * here. */
     return NULL;
 }
 
@@ -1505,6 +1507,10 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
                 ray_op_t* right = compile_expr_dag(g, elems[2]);
                 if (!right) return NULL;
                 left = &g->nodes[left_id];
+                if (fname_len == 3 && memcmp(fname, "pow", 3) == 0 &&
+                    (!dag_pow_type_admitted(left->out_type) ||
+                     !dag_pow_type_admitted(right->out_type)))
+                    return NULL;
                 return ctor(g, left, right);
             }
         }

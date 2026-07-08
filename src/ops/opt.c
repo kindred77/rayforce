@@ -318,6 +318,13 @@ static bool atom_to_numeric(ray_t* v, double* out_f, int64_t* out_i, bool* is_f6
     }
 }
 
+static bool pow_atom_type_admitted(ray_t* v) {
+    if (!v || !ray_is_atom(v)) return false;
+    return v->type == -RAY_BOOL || v->type == -RAY_U8 ||
+           v->type == -RAY_I16 || v->type == -RAY_I32 ||
+           v->type == -RAY_I64 || v->type == -RAY_F64;
+}
+
 static bool replace_with_const(ray_graph_t* g, ray_op_t* node, ray_t* literal) {
     /* H3: If the node already has an ext node (GROUP, SORT, JOIN, etc.),
        skip constant replacement — overwriting the ext union would clobber
@@ -423,6 +430,12 @@ static bool fold_binary_const(ray_graph_t* g, ray_op_t* node) {
                 case OP_MUL: r = lv * rv; break;
                 case OP_DIV: r = lv / rv; break;  /* IEEE 754: ±Inf or NaN */
                 case OP_MOD: r = fmod(lv, rv); break;  /* IEEE 754: NaN for rv==0 */
+                case OP_POW:
+                    if (!pow_atom_type_admitted(le->literal) ||
+                        !pow_atom_type_admitted(re->literal))
+                        return false;
+                    r = (lv != lv || rv != rv) ? NULL_F64 : pow(lv, rv);
+                    break;
                 case OP_MIN2: r = fmin(lv, rv); break;  /* NaN-propagating */
                 case OP_MAX2: r = fmax(lv, rv); break;  /* NaN-propagating */
                 default: return false;
@@ -616,7 +629,9 @@ static void fold_node(ray_graph_t* g, ray_op_t* node) {
         (void)fold_unary_const(g, node);
     }
     /* Fold binary element-wise ops with two const inputs */
-    if (node->arity == 2 && node->opcode >= OP_ADD && node->opcode <= OP_MAX2) {
+    if (node->arity == 2 &&
+        ((node->opcode >= OP_ADD && node->opcode <= OP_MAX2) ||
+         node->opcode == OP_POW)) {
         (void)fold_binary_const(g, node);
     }
     /* Partial-fold AND/OR when one operand is a const scalar bool.  Must run

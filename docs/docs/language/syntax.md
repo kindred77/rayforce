@@ -124,6 +124,10 @@ sentinel for their type:
 
 Symbols have no typed null literal (there is no `0Ns`).
 
+Inside `select` and `update` expressions, `(nil? col)` lowers to the DAG
+null-check opcode and returns a boolean per row, so it can be used directly in
+`where:` predicates and projections.
+
 ## Vectors
 
 Vectors are homogeneous, typed, columnar arrays. Created with square brackets. The type is inferred from the first element.

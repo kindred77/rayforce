@@ -1570,7 +1570,7 @@ static _Thread_local int32_t tl_exec_depth = 0;
  * 49, outside ADD..MAX2). */
 static inline bool op_is_elementwise(uint16_t o) {
     return o == OP_ROUND || (o >= OP_NEG && o <= OP_CAST)
-        || (o >= OP_ADD && o <= OP_MAX2) || o == OP_IDIV;
+        || (o >= OP_ADD && o <= OP_MAX2) || o == OP_POW || o == OP_IDIV;
 }
 
 /* Iterative post-order evaluation of an elementwise subtree.
@@ -1886,6 +1886,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
         case OP_ISNULL: case OP_CAST:
         /* Binary element-wise */
         case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_IDIV: case OP_MOD:
+        case OP_POW:
         case OP_EQ: case OP_NE: case OP_LT: case OP_LE:
         case OP_GT: case OP_GE: case OP_AND: case OP_OR:
         case OP_MIN2: case OP_MAX2: {
@@ -3465,6 +3466,7 @@ static bool op_streamable(uint16_t opc) {
         case OP_ISNULL: case OP_CAST:
         /* Element-wise binary */
         case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_IDIV: case OP_MOD:
+        case OP_POW:
         case OP_EQ: case OP_NE: case OP_LT: case OP_LE:
         case OP_GT: case OP_GE: case OP_AND: case OP_OR:
         case OP_MIN2: case OP_MAX2: case OP_IF: case OP_IN: case OP_NOT_IN:

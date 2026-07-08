@@ -95,6 +95,7 @@ Element-wise binary operations. All are fuseable into morsel passes.
 | `ray_mul(g, a, b)` | `OP_MUL` | Multiplication |
 | `ray_div(g, a, b)` | `OP_DIV` | Division |
 | `ray_mod(g, a, b)` | `OP_MOD` | Modulo |
+| `ray_pow_op(g, a, b)` | `OP_POW` | Power, numeric operands only, returns F64 |
 | `ray_eq(g, a, b)` | `OP_EQ` | Equal |
 | `ray_ne(g, a, b)` | `OP_NE` | Not equal |
 | `ray_lt(g, a, b)` | `OP_LT` | Less than |

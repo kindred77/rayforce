@@ -97,7 +97,7 @@ All arithmetic operators are **atomic** — they auto-map over vectors and broad
 | `sqrt` | unary | atomic | Square root (returns f64) | `(sqrt 9)` → `3.0` |
 | `log` | unary | atomic | Natural logarithm | `(log 2.718)` → `~1.0` |
 | `exp` | unary | atomic | Exponential (e^x) | `(exp 1)` → `2.718...` |
-| `pow` | binary | atomic | Power (x^y, returns f64) | `(pow 2 10)` → `1024.0` |
+| `pow` | binary | atomic/DAG | Power (x^y, returns f64; lowers in query expressions) | `(pow 2 10)` → `1024.0` |
 | `xbar` | binary | atomic | Round down to nearest multiple (bucketing) | `(xbar [3 7 12] 5)` → `[0 5 10]` |
 
 ```lisp
@@ -528,7 +528,7 @@ Type checking, casting, null testing, and object inspection.
 |---|---|---|---|---|
 | `type` | unary | — | Get the type name of a value | `(type 42)` → `i64` |
 | `as` | binary | — | Cast value to another type | `(as 'i64 "42")` → `42` |
-| `nil?` | unary | — | Test if value is null | `(nil? 0Ni)` → `true` |
+| `nil?` | unary | DAG in queries | Test if value is null; element-wise in query expressions | `(nil? 0Ni)` → `true` |
 | `rc` | unary | — | Get reference count of an object | `(rc x)` → `1` |
 | `guid` | unary | — | Generate a vector of N GUIDs (`(guid 0)` → `[]`) | `(guid 1)` |
 

@@ -21,7 +21,7 @@ All arithmetic operators are **atomic** — they auto-map over vectors and broad
 | `round` | unary | Round to nearest integer | `(round 3.7)` → `4.0` |
 | `floor` | unary | Floor (round down) | `(floor 3.7)` → `3.0` |
 | `ceil` | unary | Ceiling (round up) | `(ceil 3.2)` → `4.0` |
-| `pow` | binary | Power (x^y, returns f64) | `(pow 2 10)` → `1024.0` |
+| `pow` | binary | Power (x^y, returns f64; DAG-lowered in queries) | `(pow 2 10)` → `1024.0` |
 | `xbar` | binary | Round down to nearest multiple (bucketing) | `(xbar [3 7 12] 5)` → `[0 5 10]` |
 
 Vector examples:
@@ -353,7 +353,7 @@ Cross-temporal comparisons are supported: dates, times, and timestamps are all c
 |---|---|---|---|
 | `type` | unary | Get type name of a value | `(type 42)` → `i64` |
 | `as` | binary | Cast value to another type | `(as 'i64 "42")` → `42` |
-| `nil?` | unary | Test if value is null | `(nil? x)` |
+| `nil?` | unary | Test if value is null; element-wise inside query expressions | `(nil? x)` |
 | `rc` | unary | Reference count of an object | `(rc x)` → `1` |
 | `guid` | unary | Generate a vector of N GUIDs (`(guid 0)` → `[]`) | `(guid 1)` |
 

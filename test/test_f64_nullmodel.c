@@ -97,6 +97,22 @@ static ray_t* edge_table2(void) {
     return tbl;
 }
 
+/* Build a 2-column F64 table for pow-specific null semantics.  The first
+ * lane is deliberately 0Nf^0 because libm returns 1 for NaN^0, while Rayfall
+ * null-any-operand semantics require 0Nf. */
+static ray_t* pow_table(void) {
+    double fraw[5] = { NULL_F64, 2.0, -1.0, DBL_MAX, 1e300 };
+    double graw[5] = { 0.0,      3.0,  0.5, 2.0,     2.0   };
+    ray_t* f = ray_vec_from_raw(RAY_F64, fraw, 5);
+    ray_t* g = ray_vec_from_raw(RAY_F64, graw, 5);
+    ray_vec_set_null(f, 0, true);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("f", 1), f);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("g", 1), g);
+    ray_release(f); ray_release(g);
+    return tbl;
+}
+
 /* THE invariant: every F64 element is finite OR exactly 0Nf (x != x). */
 static test_result_t assert_finite_or_null(ray_t* v, const char* what) {
     TEST_ASSERT_FMT(v && !RAY_IS_ERR(v), "%s: valid result", what);
@@ -189,6 +205,7 @@ static ray_op_t* b_div (ray_graph_t* g){ return ray_div (g, ray_scan(g,"f"), ray
  * keeps the result F64 (the floor-divide path that can produce 0Nf). */
 static ray_op_t* b_idiv(ray_graph_t* g){ return ray_binop(g, OP_IDIV, ray_scan(g,"f"), ray_scan(g,"g")); }
 static ray_op_t* b_mod (ray_graph_t* g){ return ray_mod (g, ray_scan(g,"f"), ray_scan(g,"g")); }
+static ray_op_t* b_pow (ray_graph_t* g){ return ray_pow_op(g, ray_scan(g,"f"), ray_scan(g,"g")); }
 static ray_op_t* b_min (ray_graph_t* g){ return ray_min2(g, ray_scan(g,"f"), ray_scan(g,"g")); }
 static ray_op_t* b_max (ray_graph_t* g){ return ray_max2(g, ray_scan(g,"f"), ray_scan(g,"g")); }
 static ray_op_t* b_neg (ray_graph_t* g){ return ray_neg (g, ray_scan(g,"f")); }
@@ -201,10 +218,12 @@ static test_result_t test_diff_all_f64_ops(void) {
     ray_heap_init(); (void)ray_sym_init();
     ray_t* t1 = edge_table();
     ray_t* t2 = edge_table2();
+    ray_t* tp = pow_table();
     test_result_t r = { TEST_PASS, NULL };
     struct { ray_t* tbl; expr_builder_t b; const char* name; } cases[] = {
         { t2, b_add,  "add"  }, { t2, b_sub,  "sub"  }, { t2, b_mul,  "mul"  },
         { t2, b_div,  "div"  }, { t2, b_idiv, "idiv" }, { t2, b_mod,  "mod"  },
+        { tp, b_pow,  "pow"  },
         { t2, b_min,  "min2" }, { t2, b_max,  "max2" },
         { t1, b_neg,  "neg"  }, { t1, b_abs,  "abs"  }, { t1, b_sqrt, "sqrt" },
         { t1, b_log,  "log"  }, { t1, b_exp,  "exp"  },
@@ -213,7 +232,7 @@ static test_result_t test_diff_all_f64_ops(void) {
         r = diff_f64(cases[i].tbl, cases[i].b, cases[i].name);
         if (r.status != TEST_PASS) break;
     }
-    ray_release(t1); ray_release(t2);
+    ray_release(t1); ray_release(t2); ray_release(tp);
     ray_sym_destroy(); ray_heap_destroy();
     return r;
 }
@@ -227,10 +246,12 @@ static test_result_t test_prop_elementwise(void) {
     ray_heap_init(); (void)ray_sym_init();
     ray_t* t1 = edge_table();
     ray_t* t2 = edge_table2();
+    ray_t* tp = pow_table();
     test_result_t r = { TEST_PASS, NULL };
     struct { ray_t* tbl; expr_builder_t b; const char* name; } cases[] = {
         { t2, b_add,  "add"  }, { t2, b_sub,  "sub"  }, { t2, b_mul,  "mul"  },
         { t2, b_div,  "div"  }, { t2, b_idiv, "idiv" }, { t2, b_mod,  "mod"  },
+        { tp, b_pow,  "pow"  },
         { t2, b_min,  "min2" }, { t2, b_max,  "max2" },
         { t1, b_neg,  "neg"  }, { t1, b_abs,  "abs"  }, { t1, b_sqrt, "sqrt" },
         { t1, b_log,  "log"  }, { t1, b_exp,  "exp"  },
@@ -242,7 +263,7 @@ static test_result_t test_prop_elementwise(void) {
         ray_release(out); ray_graph_free(g);
         if (r.status != TEST_PASS) break;
     }
-    ray_release(t1); ray_release(t2);
+    ray_release(t1); ray_release(t2); ray_release(tp);
     ray_sym_destroy(); ray_heap_destroy();
     return r;
 }
