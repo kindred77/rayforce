@@ -512,6 +512,12 @@ ray_t* ray_del_fn(ray_t** args, int64_t n);
 ray_t* ray_row_fn(ray_t* tbl, ray_t* idx);
 ray_t* ray_union_all_fn(ray_t* t1, ray_t* t2);
 ray_t* ray_table_distinct_fn(ray_t* tbl);
+ray_t* ray_cols_fn(ray_t* tbl);
+ray_t* ray_xcol_fn(ray_t* tbl, ray_t* names);
+ray_t* ray_xcols_fn(ray_t* tbl, ray_t* cols);
+ray_t* ray_xkey_fn(ray_t* tbl, ray_t* keys);
+ray_t* ray_xgroup_fn(ray_t* tbl, ray_t* keys);
+ray_t* ray_fkeys_fn(ray_t* tbl);
 ray_t* ray_unify_fn(ray_t* a, ray_t* b);
 
 /* Concat (formerly static in eval.c, now extern for table_builtin.c) */

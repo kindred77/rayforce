@@ -29,6 +29,7 @@
 #include "ops/internal.h"
 #include "ops/hash.h"
 #include "ops/idxop.h"
+#include "ops/linkop.h"
 #include "table/sym.h"
 #include "mem/heap.h"
 #include <stdio.h>
@@ -676,6 +677,469 @@ ray_t* ray_pivot_fn(ray_t** args, int64_t n) {
         }
     }
     return pivot_fn_impl(tbl, args[1], pivot_col_name, args[3], args[4]);
+}
+
+/* ══════════════════════════════════════════
+ * table schema utilities
+ * ══════════════════════════════════════════ */
+
+static ray_t* table_sym_arg(ray_t* arg, const char* fn,
+                            int64_t** out_syms, int64_t* out_n) {
+    *out_syms = NULL;
+    *out_n = 0;
+    if (!arg || RAY_IS_ERR(arg))
+        return arg ? arg : ray_error("type", "%s: symbol list is null", fn);
+
+    int64_t n = 0;
+    if (arg->type == -RAY_SYM) {
+        n = 1;
+    } else if (arg->type == RAY_SYM || arg->type == RAY_LIST) {
+        n = arg->len;
+    } else {
+        return ray_error("type", "%s: expected a symbol or symbol list, got %s",
+                         fn, ray_type_name(arg->type));
+    }
+
+    int64_t* syms = (int64_t*)ray_alloc_raw((size_t)(n > 0 ? n : 1) * sizeof(int64_t));
+    if (!syms) return ray_error("oom", NULL);
+
+    if (arg->type == -RAY_SYM) {
+        syms[0] = arg->i64;
+    } else {
+        for (int64_t i = 0; i < n; i++) {
+            int alloc = 0;
+            ray_t* e = collection_elem(arg, i, &alloc);
+            if (!e || RAY_IS_ERR(e)) {
+                ray_free_raw(syms);
+                return e ? e : ray_error("type", "%s: invalid symbol at index %lld",
+                                         fn, (long long)i);
+            }
+            if (e->type != -RAY_SYM) {
+                int8_t et = e->type;
+                if (alloc) ray_release(e);
+                ray_free_raw(syms);
+                return ray_error("type", "%s: expected symbol at index %lld, got %s",
+                                 fn, (long long)i, ray_type_name(et));
+            }
+            syms[i] = e->i64;
+            if (alloc) ray_release(e);
+        }
+    }
+
+    *out_syms = syms;
+    *out_n = n;
+    return NULL;
+}
+
+static bool table_sym_in_list(const int64_t* xs, int64_t n, int64_t sym) {
+    for (int64_t i = 0; i < n; i++)
+        if (xs[i] == sym) return true;
+    return false;
+}
+
+static ray_t* table_row_key(ray_t** key_cols, int64_t nkeys, int64_t row) {
+    if (nkeys == 1) {
+        int alloc = 0;
+        ray_t* k = collection_elem(key_cols[0], row, &alloc);
+        if (!k || RAY_IS_ERR(k)) return k ? k : ray_error("type", "xkey: invalid key cell");
+        if (!alloc) ray_retain(k);
+        return k;
+    }
+
+    ray_t* k = ray_list_new(nkeys);
+    if (!k || RAY_IS_ERR(k)) return k ? k : ray_error("oom", NULL);
+    for (int64_t c = 0; c < nkeys; c++) {
+        int alloc = 0;
+        ray_t* cell = collection_elem(key_cols[c], row, &alloc);
+        if (!cell || RAY_IS_ERR(cell)) {
+            ray_release(k);
+            return cell ? cell : ray_error("type", "xkey: invalid key cell");
+        }
+        ray_t* nk = ray_list_append(k, cell);
+        if (alloc) ray_release(cell);
+        if (!nk || RAY_IS_ERR(nk)) {
+            ray_release(k);
+            return nk ? nk : ray_error("oom", NULL);
+        }
+        k = nk;
+    }
+    return k;
+}
+
+static ray_t* table_row_value_dict(ray_t* tbl, const int64_t* key_syms,
+                                   int64_t nkeys, int64_t row) {
+    int64_t ncols = ray_table_ncols(tbl);
+    int64_t nvals = 0;
+    for (int64_t c = 0; c < ncols; c++)
+        if (!table_sym_in_list(key_syms, nkeys, ray_table_col_name(tbl, c)))
+            nvals++;
+
+    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, nvals);
+    if (!keys || RAY_IS_ERR(keys)) return keys ? keys : ray_error("oom", NULL);
+    ray_t* vals = ray_list_new(nvals);
+    if (!vals || RAY_IS_ERR(vals)) { ray_release(keys); return vals ? vals : ray_error("oom", NULL); }
+
+    for (int64_t c = 0; c < ncols; c++) {
+        int64_t name = ray_table_col_name(tbl, c);
+        if (table_sym_in_list(key_syms, nkeys, name)) continue;
+        ray_t* nkeys_obj = ray_vec_append(keys, &name);
+        if (!nkeys_obj || RAY_IS_ERR(nkeys_obj)) {
+            ray_release(keys);
+            ray_release(vals);
+            return nkeys_obj ? nkeys_obj : ray_error("oom", NULL);
+        }
+        keys = nkeys_obj;
+        ray_t* col = ray_table_get_col_idx(tbl, c);
+        int alloc = 0;
+        ray_t* cell = collection_elem(col, row, &alloc);
+        if (!cell || RAY_IS_ERR(cell)) {
+            ray_release(keys);
+            ray_release(vals);
+            return cell ? cell : ray_error("type", "xkey: invalid value cell");
+        }
+        ray_t* nvals_obj = ray_list_append(vals, cell);
+        if (alloc) ray_release(cell);
+        if (!nvals_obj || RAY_IS_ERR(nvals_obj)) {
+            ray_release(keys);
+            ray_release(vals);
+            return nvals_obj ? nvals_obj : ray_error("oom", NULL);
+        }
+        vals = nvals_obj;
+    }
+    return ray_dict_new(keys, vals);
+}
+
+/* (cols table) — return column names. */
+ray_t* ray_cols_fn(ray_t* tbl) {
+    if (!tbl || tbl->type != RAY_TABLE)
+        return ray_error("type", "cols expects a table, got %s",
+                         tbl ? ray_type_name(tbl->type) : "null");
+    return ray_key_fn(tbl);
+}
+
+/* (xcol table names) — rename all columns, preserving order and data. */
+ray_t* ray_xcol_fn(ray_t* tbl, ray_t* names) {
+    if (!tbl || tbl->type != RAY_TABLE)
+        return ray_error("type", "xcol: first arg must be a table, got %s",
+                         tbl ? ray_type_name(tbl->type) : "null");
+    int64_t* syms = NULL;
+    int64_t n = 0;
+    ray_t* err = table_sym_arg(names, "xcol", &syms, &n);
+    if (err) return err;
+
+    int64_t ncols = ray_table_ncols(tbl);
+    if (n != ncols) {
+        ray_free_raw(syms);
+        return ray_error("length", "xcol: expected %lld names, got %lld",
+                         (long long)ncols, (long long)n);
+    }
+
+    ray_t* out = ray_table_new(ncols);
+    if (!out || RAY_IS_ERR(out)) { ray_free_raw(syms); return out ? out : ray_error("oom", NULL); }
+    for (int64_t c = 0; c < ncols; c++) {
+        ray_t* col = ray_table_get_col_idx(tbl, c);
+        out = ray_table_add_col(out, syms[c], col);
+        if (!out || RAY_IS_ERR(out)) { ray_free_raw(syms); return out ? out : ray_error("oom", NULL); }
+    }
+    ray_free_raw(syms);
+    return out;
+}
+
+/* (xcols table cols) — project/reorder columns exactly as requested. */
+ray_t* ray_xcols_fn(ray_t* tbl, ray_t* cols) {
+    if (!tbl || tbl->type != RAY_TABLE)
+        return ray_error("type", "xcols: first arg must be a table, got %s",
+                         tbl ? ray_type_name(tbl->type) : "null");
+    int64_t* syms = NULL;
+    int64_t n = 0;
+    ray_t* err = table_sym_arg(cols, "xcols", &syms, &n);
+    if (err) return err;
+
+    ray_t* out = ray_table_new(n);
+    if (!out || RAY_IS_ERR(out)) { ray_free_raw(syms); return out ? out : ray_error("oom", NULL); }
+    for (int64_t i = 0; i < n; i++) {
+        ray_t* col = ray_table_get_col(tbl, syms[i]);
+        if (!col) {
+            ray_release(out);
+            ray_free_raw(syms);
+            return ray_error("domain", "xcols: unknown table column");
+        }
+        out = ray_table_add_col(out, syms[i], col);
+        if (!out || RAY_IS_ERR(out)) { ray_free_raw(syms); return out ? out : ray_error("oom", NULL); }
+    }
+    ray_free_raw(syms);
+    return out;
+}
+
+/* (xkey table keys) — dictionary projection keyed by one or more columns. */
+ray_t* ray_xkey_fn(ray_t* tbl, ray_t* keys_arg) {
+    if (!tbl || tbl->type != RAY_TABLE)
+        return ray_error("type", "xkey: first arg must be a table, got %s",
+                         tbl ? ray_type_name(tbl->type) : "null");
+    int64_t* key_syms = NULL;
+    int64_t nkeys = 0;
+    ray_t* err = table_sym_arg(keys_arg, "xkey", &key_syms, &nkeys);
+    if (err) return err;
+    if (nkeys <= 0) { ray_free_raw(key_syms); return ray_error("domain", "xkey: at least one key column is required"); }
+
+    ray_t** key_cols = (ray_t**)ray_alloc_raw((size_t)nkeys * sizeof(ray_t*));
+    if (!key_cols) { ray_free_raw(key_syms); return ray_error("oom", NULL); }
+    for (int64_t k = 0; k < nkeys; k++) {
+        key_cols[k] = ray_table_get_col(tbl, key_syms[k]);
+        if (!key_cols[k]) {
+            ray_free_raw(key_cols);
+            ray_free_raw(key_syms);
+            return ray_error("domain", "xkey: unknown key column");
+        }
+    }
+
+    int64_t nrows = ray_table_nrows(tbl);
+    ray_t* keys = ray_list_new(nrows);
+    ray_t* vals = ray_list_new(nrows);
+    if (!keys || RAY_IS_ERR(keys) || !vals || RAY_IS_ERR(vals)) {
+        if (keys && !RAY_IS_ERR(keys)) ray_release(keys);
+        if (vals && !RAY_IS_ERR(vals)) ray_release(vals);
+        ray_free_raw(key_cols);
+        ray_free_raw(key_syms);
+        return keys && RAY_IS_ERR(keys) ? keys : (vals && RAY_IS_ERR(vals) ? vals : ray_error("oom", NULL));
+    }
+
+    for (int64_t r = 0; r < nrows; r++) {
+        ray_t* k = table_row_key(key_cols, nkeys, r);
+        if (!k || RAY_IS_ERR(k)) { ray_release(keys); ray_release(vals); ray_free_raw(key_cols); ray_free_raw(key_syms); return k ? k : ray_error("oom", NULL); }
+        ray_t** key_items = (ray_t**)ray_data(keys);
+        for (int64_t i = 0; i < keys->len; i++) {
+            if (atom_eq(key_items[i], k)) {
+                ray_release(k);
+                ray_release(keys);
+                ray_release(vals);
+                ray_free_raw(key_cols);
+                ray_free_raw(key_syms);
+                return ray_error("domain", "xkey: duplicate key at row %lld", (long long)r);
+            }
+        }
+        ray_t* v = table_row_value_dict(tbl, key_syms, nkeys, r);
+        if (!v || RAY_IS_ERR(v)) { ray_release(k); ray_release(keys); ray_release(vals); ray_free_raw(key_cols); ray_free_raw(key_syms); return v ? v : ray_error("oom", NULL); }
+        ray_t* nkeys_obj = ray_list_append(keys, k);
+        if (!nkeys_obj || RAY_IS_ERR(nkeys_obj)) {
+            ray_release(k);
+            ray_release(v);
+            ray_release(keys);
+            ray_release(vals);
+            ray_free_raw(key_cols);
+            ray_free_raw(key_syms);
+            return nkeys_obj ? nkeys_obj : ray_error("oom", NULL);
+        }
+        keys = nkeys_obj;
+
+        ray_t* nvals_obj = ray_list_append(vals, v);
+        if (!nvals_obj || RAY_IS_ERR(nvals_obj)) {
+            ray_release(k);
+            ray_release(v);
+            ray_release(keys);
+            ray_release(vals);
+            ray_free_raw(key_cols);
+            ray_free_raw(key_syms);
+            return nvals_obj ? nvals_obj : ray_error("oom", NULL);
+        }
+        vals = nvals_obj;
+        ray_release(k);
+        ray_release(v);
+    }
+
+    ray_free_raw(key_cols);
+    ray_free_raw(key_syms);
+    return ray_dict_new(keys, vals);
+}
+
+/* (xgroup table keys) — dict from key value/tuple to the matching table slice. */
+ray_t* ray_xgroup_fn(ray_t* tbl, ray_t* keys_arg) {
+    if (!tbl || tbl->type != RAY_TABLE)
+        return ray_error("type", "xgroup: first arg must be a table, got %s",
+                         tbl ? ray_type_name(tbl->type) : "null");
+    int64_t* key_syms = NULL;
+    int64_t nkeys = 0;
+    ray_t* err = table_sym_arg(keys_arg, "xgroup", &key_syms, &nkeys);
+    if (err) return err;
+    if (nkeys <= 0) { ray_free_raw(key_syms); return ray_error("domain", "xgroup: at least one key column is required"); }
+
+    ray_t** key_cols = (ray_t**)ray_alloc_raw((size_t)nkeys * sizeof(ray_t*));
+    if (!key_cols) { ray_free_raw(key_syms); return ray_error("oom", NULL); }
+    for (int64_t k = 0; k < nkeys; k++) {
+        key_cols[k] = ray_table_get_col(tbl, key_syms[k]);
+        if (!key_cols[k]) {
+            ray_free_raw(key_cols);
+            ray_free_raw(key_syms);
+            return ray_error("domain", "xgroup: unknown key column");
+        }
+    }
+
+    int64_t nrows = ray_table_nrows(tbl);
+    ray_t* keys = ray_list_new(16);
+    if (!keys || RAY_IS_ERR(keys)) {
+        ray_free_raw(key_cols);
+        ray_free_raw(key_syms);
+        return keys ? keys : ray_error("oom", NULL);
+    }
+
+    int64_t* gids = NULL;
+    int64_t* counts = NULL;
+    if (nrows > 0) {
+        gids = (int64_t*)ray_alloc_raw((size_t)nrows * sizeof(int64_t));
+        counts = (int64_t*)ray_alloc_raw((size_t)nrows * sizeof(int64_t));
+        if (!gids || !counts) {
+            ray_release(keys);
+            ray_free_raw(gids);
+            ray_free_raw(counts);
+            ray_free_raw(key_cols);
+            ray_free_raw(key_syms);
+            return ray_error("oom", NULL);
+        }
+    }
+
+    int64_t ngroups = 0;
+    for (int64_t r = 0; r < nrows; r++) {
+        ray_t* k = table_row_key(key_cols, nkeys, r);
+        if (!k || RAY_IS_ERR(k)) {
+            ray_release(keys);
+            ray_free_raw(gids);
+            ray_free_raw(counts);
+            ray_free_raw(key_cols);
+            ray_free_raw(key_syms);
+            return k ? k : ray_error("oom", NULL);
+        }
+
+        int64_t gi = -1;
+        ray_t** key_items = (ray_t**)ray_data(keys);
+        for (int64_t i = 0; i < ngroups; i++) {
+            if (atom_eq(key_items[i], k)) { gi = i; break; }
+        }
+
+        if (gi < 0) {
+            gi = ngroups++;
+            ray_t* nkeys_obj = ray_list_append(keys, k);
+            if (!nkeys_obj || RAY_IS_ERR(nkeys_obj)) {
+                ray_release(k);
+                ray_release(keys);
+                ray_free_raw(gids);
+                ray_free_raw(counts);
+                ray_free_raw(key_cols);
+                ray_free_raw(key_syms);
+                return nkeys_obj ? nkeys_obj : ray_error("oom", NULL);
+            }
+            keys = nkeys_obj;
+            counts[gi] = 0;
+        }
+
+        gids[r] = gi;
+        counts[gi]++;
+        ray_release(k);
+    }
+
+    ray_t* vals = ray_list_new(ngroups);
+    if (!vals || RAY_IS_ERR(vals)) {
+        ray_release(keys);
+        ray_free_raw(gids);
+        ray_free_raw(counts);
+        ray_free_raw(key_cols);
+        ray_free_raw(key_syms);
+        return vals ? vals : ray_error("oom", NULL);
+    }
+    for (int64_t i = 0; i < ngroups; i++) {
+        ray_t* ridx = ray_vec_new(RAY_I64, counts[i]);
+        if (!ridx || RAY_IS_ERR(ridx)) {
+            ray_release(keys);
+            ray_release(vals);
+            ray_free_raw(gids);
+            ray_free_raw(counts);
+            ray_free_raw(key_cols);
+            ray_free_raw(key_syms);
+            return ridx ? ridx : ray_error("oom", NULL);
+        }
+        int64_t* rid = (int64_t*)ray_data(ridx);
+        int64_t pos = 0;
+        for (int64_t r = 0; r < nrows; r++) {
+            if (gids[r] == i) rid[pos++] = r;
+        }
+        ridx->len = counts[i];
+
+        ray_t* slice = ray_at_fn(tbl, ridx);
+        ray_release(ridx);
+        if (!slice || RAY_IS_ERR(slice)) {
+            ray_release(keys);
+            ray_release(vals);
+            ray_free_raw(gids);
+            ray_free_raw(counts);
+            ray_free_raw(key_cols);
+            ray_free_raw(key_syms);
+            return slice ? slice : ray_error("oom", NULL);
+        }
+        ray_t* nvals_obj = ray_list_append(vals, slice);
+        ray_release(slice);
+        if (!nvals_obj || RAY_IS_ERR(nvals_obj)) {
+            ray_release(keys);
+            ray_release(vals);
+            ray_free_raw(gids);
+            ray_free_raw(counts);
+            ray_free_raw(key_cols);
+            ray_free_raw(key_syms);
+            return nvals_obj ? nvals_obj : ray_error("oom", NULL);
+        }
+        vals = nvals_obj;
+    }
+
+    ray_free_raw(gids);
+    ray_free_raw(counts);
+    ray_free_raw(key_cols);
+    ray_free_raw(key_syms);
+    return ray_dict_new(keys, vals);
+}
+
+/* (fkeys table) — linked-column metadata as col->target dict. */
+ray_t* ray_fkeys_fn(ray_t* tbl) {
+    if (!tbl || tbl->type != RAY_TABLE)
+        return ray_error("type", "fkeys expects a table, got %s",
+                         tbl ? ray_type_name(tbl->type) : "null");
+    int64_t ncols = ray_table_ncols(tbl);
+    int64_t count = 0;
+    for (int64_t c = 0; c < ncols; c++) {
+        ray_t* col = ray_table_get_col_idx(tbl, c);
+        if (ray_link_has(col)) count++;
+    }
+
+    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, count);
+    if (!keys || RAY_IS_ERR(keys)) return keys ? keys : ray_error("oom", NULL);
+    ray_t* vals = ray_list_new(count);
+    if (!vals || RAY_IS_ERR(vals)) { ray_release(keys); return vals ? vals : ray_error("oom", NULL); }
+
+    for (int64_t c = 0; c < ncols; c++) {
+        ray_t* col = ray_table_get_col_idx(tbl, c);
+        if (!ray_link_has(col)) continue;
+        int64_t name = ray_table_col_name(tbl, c);
+        int64_t target = ray_link_target_id(col);
+        ray_t* nkeys_obj = ray_vec_append(keys, &name);
+        if (!nkeys_obj || RAY_IS_ERR(nkeys_obj)) {
+            ray_release(keys);
+            ray_release(vals);
+            return nkeys_obj ? nkeys_obj : ray_error("oom", NULL);
+        }
+        keys = nkeys_obj;
+        ray_t* target_sym = ray_sym(target);
+        if (!target_sym || RAY_IS_ERR(target_sym)) {
+            ray_release(keys);
+            ray_release(vals);
+            return target_sym ? target_sym : ray_error("oom", NULL);
+        }
+        ray_t* nvals_obj = ray_list_append(vals, target_sym);
+        ray_release(target_sym);
+        if (!nvals_obj || RAY_IS_ERR(nvals_obj)) {
+            ray_release(keys);
+            ray_release(vals);
+            return nvals_obj ? nvals_obj : ray_error("oom", NULL);
+        }
+        vals = nvals_obj;
+    }
+    return ray_dict_new(keys, vals);
 }
 
 /* ══════════════════════════════════════════

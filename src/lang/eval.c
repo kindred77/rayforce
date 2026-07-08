@@ -3100,6 +3100,12 @@ static void ray_register_builtins(void) {
     register_binary("table",   RAY_FN_NONE, ray_table_fn);
     register_unary("key",      RAY_FN_NONE, ray_key_fn);
     register_unary("value",    RAY_FN_NONE, ray_value_fn);
+    register_unary("cols",     RAY_FN_NONE, ray_cols_fn);
+    register_binary("xcol",    RAY_FN_NONE, ray_xcol_fn);
+    register_binary("xcols",   RAY_FN_NONE, ray_xcols_fn);
+    register_binary("xkey",    RAY_FN_NONE, ray_xkey_fn);
+    register_binary("xgroup",  RAY_FN_NONE, ray_xgroup_fn);
+    register_unary("fkeys",    RAY_FN_NONE, ray_fkeys_fn);
     register_binary("union-all",      RAY_FN_NONE, ray_union_all_fn);
     /* table-distinct removed — distinct dispatches on type */
 

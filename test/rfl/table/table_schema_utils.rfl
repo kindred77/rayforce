@@ -1,0 +1,49 @@
+;; Table/schema utility builtins: cols, xcol, xcols, xkey, xgroup, fkeys.
+
+(set Tsu (table [id sym price qty] (list [1 2 3 4] ['A 'B 'C 'D] [10 20 30 40] [100 200 300 400])))
+
+(cols Tsu) -- [id sym price qty]
+(cols 42) !- type
+
+(set Tren (xcol Tsu [rid ticker px sz]))
+(cols Tren) -- [rid ticker px sz]
+(at Tren 'ticker) -- ['A 'B 'C 'D]
+(at Tren 'px) -- [10 20 30 40]
+(xcol Tsu [a b]) !- length
+(xcol Tsu (list 'a 2 'c 'd)) !- type
+
+(set Tproj (xcols Tsu [qty sym]))
+(cols Tproj) -- [qty sym]
+(at Tproj 'qty) -- [100 200 300 400]
+(at Tproj 'sym) -- ['A 'B 'C 'D]
+(xcols Tsu [qty missing]) !- domain
+(xcols Tsu 42) !- type
+
+(set K1 (xkey Tsu 'id))
+(at (at K1 2) 'sym) -- 'B
+(at (at K1 3) 'qty) -- 300
+
+(set K2 (xkey Tsu [sym id]))
+(at (at K2 (list 'C 3)) 'price) -- 30
+(xkey Tsu 'missing) !- domain
+(xkey Tsu (list)) !- domain
+
+(set Tdup (table [k v] (list ['A 'A 'B] [1 2 3])))
+(xkey Tdup 'k) !- domain
+
+(set G1 (xgroup Tdup 'k))
+(count (at G1 'A)) -- 2
+(sum (at (at G1 'A) 'v)) -- 3
+(sum (at (at G1 'B) 'v)) -- 3
+
+(set G2 (xgroup Tsu [sym id]))
+(count (at G2 (list 'D 4))) -- 1
+(at (at (at G2 (list 'D 4)) 'price) 0) -- 40
+(xgroup Tsu 'missing) !- domain
+
+(set DimSU (table [name age] (list ['alice 'bob 'carol] [18 25 42])))
+(set FactSU (table [rid amount] (list (.col.link 'DimSU [2 0 1]) [5 6 7])))
+(at (fkeys FactSU) 'rid) -- 'DimSU
+(nil? (at (fkeys FactSU) 'amount)) -- true
+(fkeys Tsu) -- {}
+(fkeys 42) !- type

@@ -12,7 +12,7 @@
 |---|---|---|
 | [Arithmetic](#arithmetic) (24) | [Comparison](#comparison) (7) | [Logic](#logic) (3) |
 | [Aggregation](#aggregation) (22) | [Higher-Order](#higher-order) (13) | [Collection](#collection) (37) |
-| [Sorting & Ordering](#sorting) (10) | [Control Flow & Special Forms](#control) (11) | [Table Operations](#table-ops) (14) |
+| [Sorting & Ordering](#sorting) (10) | [Control Flow & Special Forms](#control) (11) | [Table Operations](#table-ops) (20) |
 | [Query](#query) (4) | [Joins](#joins) (6) | [Pivot](#pivot) (1) |
 | [String](#string-ops) (4) | [Temporal](#temporal) (3) | [Type & Introspection](#type-ops) (5) |
 | [I/O & Output](#io) (12) | [System & Utility](#system) (15) | [Serialization](#serialization) (2) |
@@ -44,9 +44,9 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 `signum`, `sum`, `prod`, `all`, `any`, `count`, `avg`, `min`, `max`,
 `first`, `last`, `med`, `dev`, `stddev`, `stddev_pop`, `dev_pop`, `var`, `var_pop`, `raise`, `distinct`,
 `reverse`, `til`, `lag`, `lead`, `deltas`, `ratios`, `fills`, `sums`, `avgs`, `mins`, `maxs`, `prds`,
-`differ`, `asc`, `desc`, `iasc`, `idesc`, `rank`, `key`, `value`, `type`, `read`, `load`, `exit`,
+`differ`, `asc`, `desc`, `iasc`, `idesc`, `rank`, `key`, `cols`, `value`, `type`, `read`, `load`, `exit`,
 `nil?`, `where`, `group`, `raze`, `ungroup`, `ser`, `de`, `guid`, `date`, `time`, `timestamp`, `ss`, `hh`,
-`minute`, `yyyy`, `mm`, `dd`, `dow`, `doy`, `eval`, `parse`, `meta`, `.sys.exec`, `.sys.cmd`, `.sys.listen`,
+`minute`, `yyyy`, `mm`, `dd`, `dow`, `doy`, `eval`, `parse`, `meta`, `fkeys`, `.sys.exec`, `.sys.cmd`, `.sys.listen`,
 `.os.getenv`, `.fs.size`, `.fs.list`, `.ipc.close`, `.repl.connect`, `.log.write`, `.log.replay`,
 `.log.validate`, `rc`, `diverse`, `.time.timer.del`, `env`, `sym-name`, `dl-stratify`, `dl-eval`, `dl-free`,
 `norm`, `hnsw-free`, `hnsw-load`, `hnsw-info`, `.idx.zone`, `.idx.hash`, `.idx.sort`, `.idx.bloom`,
@@ -59,7 +59,7 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 `try`, `filter`, `in`, `except`, `union`, `sect`, `take`, `at`, `find`, `msum`, `mavg`, `mmin`, `mmax`,
 `mcount`, `mvar`, `mdev`, `xasc`, `xdesc`, `table`, `union-all`, `xbar`, `as`, `write`, `dict`, `concat`, `within`, `div`,
 `rand`, `bin`, `binr`, `split`, `like`, `.os.setenv`, `.ipc.send`, `.ipc.post`, `get`, `remove`, `row`,
-`unify`, `xrank`, `dl-query`, `dl-provenance`, `cos-dist`, `inner-prod`, `l2-dist`, `hnsw-save`, `.attr.set`,
+`unify`, `xcol`, `xcols`, `xkey`, `xgroup`, `xrank`, `dl-query`, `dl-provenance`, `cos-dist`, `inner-prod`, `l2-dist`, `hnsw-save`, `.attr.set`,
 `.col.link`
 
 ### Variadic / Special
@@ -377,16 +377,24 @@ Create and manipulate tables, dictionaries, and their metadata.
 | `table` | binary | — | Create table from column names and list of vectors | `(table [x y] (list [1 2] ['a 'b]))` |
 | `dict` | binary | — | Create dictionary from keys and values vectors | `(dict ['a 'b] [1 2])` |
 | `key` | unary | — | Get column names (table) or keys (dict) | `(key trades)` → `[sym price size]` |
+| `cols` | unary | — | Get table column names | `(cols trades)` → `[sym price size time date]` |
 | `value` | unary | — | Get column data (table) or values (dict) | `(value d)` |
 | `get` | binary | — | Lookup key in dict or column in table | `(get d 'a)` → `1` |
 | `remove` | binary | — | Remove key from dictionary | `(remove d 'a)` |
 | `row` | binary | — | Extract single row from table as dict | `(row trades 0)` |
 | `meta` | unary | — | Get table metadata (column types, lengths) | `(meta trades)` |
+| `xcol` | binary | — | Rename all table columns; names must match column count | `(xcol trades [ticker px sz tm dt])` |
+| `xcols` | binary | — | Project/reorder named columns | `(xcols trades [size sym])` |
+| `xkey` | binary | — | Build a dict keyed by unique column value(s), with row dict values for remaining columns | `(xkey trades 'time)` |
+| `xgroup` | binary | — | Group rows by column value(s), returning dict key -> table slice | `(xgroup trades 'sym)` |
+| `fkeys` | unary | — | Inspect linked-column metadata as `column -> target table` | `(fkeys fact)` |
 | `union-all` | binary | — | Concatenate two tables (all rows, no dedup) | `(union-all t1 t2)` |
 | `unify` | binary | — | Merge two tables/dicts (second takes precedence) | `(unify d1 d2)` |
 | `modify` | variadic | restricted | Functional table update (returns new table) | `(modify trades 'price (fn [p] (* p 1.1)))` |
 | `ungroup` | unary | — | Flatten a grouped table's nested list columns into one row per element | `(ungroup gt)` |
 | `pivot` | variadic | — | Pivot table — reshape long to wide format | `(pivot trades 'sym 'date 'price sum)` |
+
+`xcol` requires exactly one new name for each existing column. `xcols`, `xkey`, and `xgroup` accept a symbol atom, a symbol vector, or a list of symbol atoms. `xkey` is a dictionary projection, not a native keyed-table type: key columns must be unique, and each value is a row dictionary containing the non-key columns. Use `xgroup` when keys may repeat; each dictionary value is a table slice for that group.
 
 ```lisp
 ; Create a table
@@ -399,6 +407,11 @@ Create and manipulate tables, dictionaries, and their metadata.
 (set d (dict [name age] (list "Alice" 30)))
 (get d 'name)              ; "Alice"
 (key d)                      ; [name age]
+
+; Schema/projection helpers
+(cols trades)                ; [sym price size]
+(xcols trades [size sym])
+(xgroup trades 'sym)         ; dict: sym -> table slice
 
 ; Pivot: long to wide (5th arg is the aggregation fn)
 (set trades (table [sym date price size]

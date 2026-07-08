@@ -205,15 +205,23 @@ The time-series vector functions above are lazy-aware DAG operations for vector 
 | `list` | variadic | Create a list from vectors | `(list [1 2] [A B])` |
 | `table` | binary | Create table from column names + list of vectors | `(table [x y] (list [1 2] [A B]))` |
 | `key` | unary | Get column names (table) or keys (dict) | `(key trades)` → `[sym price size]` |
+| `cols` | unary | Get table column names | `(cols trades)` → `[sym price size]` |
 | `value` | unary | Get column data (table) or values (dict) | `(value trades)` |
 | `dict` | binary | Create dictionary from keys and values | `(dict [a b] [1 2])` |
 | `get` | binary | Lookup key in dict/table | `(get d 'a)` → `1` |
 | `remove` | binary | Remove key from dict | `(remove d 'a)` |
 | `row` | binary | Extract single row from table as dict | `(row trades 0)` |
 | `meta` | unary | Get metadata (column types, lengths) | `(meta trades)` |
+| `xcol` | binary | Rename all table columns | `(xcol trades [ticker px sz])` |
+| `xcols` | binary | Project/reorder named columns | `(xcols trades [size sym])` |
+| `xkey` | binary | Build a dict keyed by unique column value(s), with row dict values for remaining columns | `(xkey trades 'time)` |
+| `xgroup` | binary | Group rows by column value(s), returning dict key -> table slice | `(xgroup trades 'sym)` |
+| `fkeys` | unary | Inspect linked-column metadata as `column -> target table` | `(fkeys fact)` |
 | `alter` | variadic, special | In-place mutation of table column | `(alter trades 'price (* price 1.1))` |
 | `del` | variadic, special | Delete columns or rows from table | `(del trades 'temp_col)` |
 | `modify` | variadic | Functional table update (returns new table) | `(modify trades 'price (fn [p] (* p 1.1)))` |
+
+`xkey` returns a dictionary keyed by unique key column value(s). Duplicate keys are a domain error; use `xgroup` to get a dictionary whose values are grouped table slices.
 
 ## Query Operations
 
