@@ -83,7 +83,19 @@ typedef struct {
     int32_t line;
     int32_t col;
     ray_t  *nfo;
+    int32_t depth;   /* recursion depth guard (see RAY_PARSE_MAX_DEPTH) */
 } ray_parser_t;
+
+/* Recursive-descent depth ceiling.  Container literals (lists, vectors,
+ * dicts) recurse through parse_expr, so a deeply nested input such as
+ * "[[[[..." would otherwise exhaust the C stack and crash the process —
+ * a remotely reachable denial of service.  The container parsers keep
+ * their element buffers on the heap, so each recursive frame is small
+ * (a few hundred bytes); 1024 levels therefore stays comfortably within
+ * the 8 MB main-thread stack even under ASan's larger instrumented
+ * frames, while far exceeding any realistic nesting (hand-written or
+ * machine-generated, e.g. 130-deep arithmetic chains). */
+#define RAY_PARSE_MAX_DEPTH 1024
 
 static void advance(ray_parser_t *p, int32_t n) {
     for (int32_t i = 0; i < n; i++) {
@@ -201,17 +213,8 @@ static ray_t* parse_number(ray_parser_t *p) {
         case 'p': p->pos += 3; return ray_typed_null(-RAY_TIMESTAMP);
         case 'l': p->pos += 3; return ray_typed_null(-RAY_I64);
         case 'f': p->pos += 3; return ray_typed_null(-RAY_F64);
-        /* SYM has no typed null — sym 0 (the empty string, reserved
-         * by ray_sym_init) is the canonical "missing" value.  Parse
-         * `0Ns` as the empty symbol so legacy literal text stays
-         * accepted; new code should write `'` (parse_symbol below)
-         * for the same value. */
-        case 's': {
-            p->pos += 3;
-            ray_t* s = ray_sym(0);  /* 0Ns is the literal empty symbol (legacy spelling of ') */
-            if (!RAY_IS_ERR(s)) s->attrs |= ATTR_QUOTED;
-            return s;
-        }
+        /* SYM has no typed null and no `0Ns` literal.  The empty symbol
+         * (sym 0) is written `'` (parse_symbol below). */
         }
         /* Bare 0N: only if the next char is not an identifier continuation
          * (letter/digit/underscore), else fall through to plain number. */
@@ -246,6 +249,13 @@ static ray_t* parse_number(ray_parser_t *p) {
         int day = (p->pos[0] - '0') * 10 + (p->pos[1] - '0');
         p->pos += 2;
 
+        /* Two ASCII digits admit month/day up to 99; reject anything
+         * outside the calendar range before encoding.  ymd_to_date indexes
+         * MONTHDAYS[leap][month-1], so an unvalidated month (e.g. the
+         * literal 2024.81.03) reads off the end of that table. */
+        if (month < 1 || month > 12 || day < 1 || day > 31)
+            return ray_error("parse", "invalid date %04d.%02d.%02d: month must be 1-12, day 1-31", year, month, day);
+
         int32_t days = ymd_to_date(year, month, day);
 
         /* Check for timestamp separator 'D' */
@@ -258,12 +268,23 @@ static ray_t* parse_number(ray_parser_t *p) {
             int hh = (p->pos[0] - '0') * 10 + (p->pos[1] - '0'); p->pos += 2;
             if (*p->pos != ':') return ray_error("parse", NULL);
             p->pos++;
+            /* Each field must be two ASCII digits.  The minute/second reads
+             * previously trusted p->pos[0..1] without checking, so a
+             * truncated timestamp (e.g. "...D15:41:") read past the end of
+             * the source buffer.  The digit test also stops at the NUL
+             * terminator, so it doubles as the bounds check. */
+            if (!(p->pos[0] >= '0' && p->pos[0] <= '9' && p->pos[1] >= '0' && p->pos[1] <= '9'))
+                return ray_error("parse", NULL);
             int mi = (p->pos[0] - '0') * 10 + (p->pos[1] - '0'); p->pos += 2;
             if (*p->pos != ':') return ray_error("parse", NULL);
             p->pos++;
+            if (!(p->pos[0] >= '0' && p->pos[0] <= '9' && p->pos[1] >= '0' && p->pos[1] <= '9'))
+                return ray_error("parse", NULL);
             int ss = (p->pos[0] - '0') * 10 + (p->pos[1] - '0'); p->pos += 2;
             if (*p->pos != '.') return ray_error("parse", NULL);
             p->pos++;
+            if (hh > 23 || mi > 59 || ss > 59)
+                return ray_error("parse", "invalid time %02d:%02d:%02d", hh, mi, ss);
             /* Parse fractional seconds (up to 9 digits for nanoseconds) */
             const char* fstart = p->pos;
             while (*p->pos >= '0' && *p->pos <= '9') p->pos++;
@@ -274,6 +295,11 @@ static ray_t* parse_number(ray_parser_t *p) {
             /* Pad to 9 digits */
             for (int i = flen; i < 9; i++) nanos *= 10;
 
+            /* A nanosecond timestamp only spans roughly ±292 years around
+             * the epoch before the day count overflows int64; reject years
+             * outside that window instead of computing UB. */
+            if (days > INT64_MAX / PARSE_NSECS_IN_DAY || days < INT64_MIN / PARSE_NSECS_IN_DAY)
+                return ray_error("parse", "timestamp year out of representable range");
             int64_t day_ns = (int64_t)days * PARSE_NSECS_IN_DAY;
             int64_t time_ns = ((int64_t)hh * 3600 + mi * 60 + ss) * 1000000000LL + (int64_t)nanos;
             return ray_timestamp(day_ns + time_ns);
@@ -446,7 +472,10 @@ static ray_t* parse_symbol(ray_parser_t *p) {
         }
         default: ch = *esc; break;
         }
-        if (esc[esc_len] == '\'') {
+        /* A backslash at end of input has no escaped char (`*esc` is the
+         * NUL terminator); reading esc[esc_len] would run past the buffer.
+         * Only look for the closing quote when there is a real escape. */
+        if (*esc != '\0' && esc[esc_len] == '\'') {
             /* Closing quote found — it's a char literal */
             p->pos = esc + esc_len + 1;
             return ray_str(&ch, 1);
@@ -460,7 +489,8 @@ static ray_t* parse_symbol(ray_parser_t *p) {
     }
 
     /* Regular symbol */
-    while (PA(*p->pos) == PA_ALPHA || PA(*p->pos) == PA_DIGIT || *p->pos == '_' || *p->pos == '.')
+    while (PA(*p->pos) == PA_ALPHA || PA(*p->pos) == PA_DIGIT
+           || *p->pos == '_' || *p->pos == '.' || *p->pos == '-')
         p->pos++;
     size_t len = (size_t)(p->pos - start);
     int64_t id = (len == 0) ? 0 : ray_sym_intern(start, len);  /* empty symbol — sym 0 */
@@ -499,19 +529,27 @@ static ray_t* parse_name(ray_parser_t *p) {
 static ray_t* parse_vector(ray_parser_t *p) {
     advance(p, 1); /* skip [ */
 
-    /* Collect parsed elements into a temporary array */
-    ray_t* elems[4096];
+    /* Collect parsed elements into a temporary array.  This lives on the
+     * HEAP, not the stack: parse_expr recurses back into parse_vector for
+     * each element, so a stack-resident 4096-pointer buffer (32 KB) per
+     * frame would let a nested "[[[[..." input exhaust the C stack.  A
+     * heap buffer keeps the recursive frame small (see RAY_PARSE_MAX_DEPTH). */
+    ray_t* elems_buf = ray_alloc(4096 * sizeof(ray_t*));
+    if (RAY_IS_ERR(elems_buf)) return elems_buf;
+    ray_t** elems = (ray_t**)ray_data(elems_buf);
     int32_t count = 0;
 
     skip_ws_and_comments(p);
     while (*p->pos && *p->pos != ']') {
         if (count >= 4096) {
             for (int32_t i = 0; i < count; i++) ray_release(elems[i]);
+            ray_free(elems_buf);
             return ray_error("limit", NULL);
         }
         ray_t* elem = parse_expr(p);
         if (RAY_IS_ERR(elem)) {
             for (int32_t i = 0; i < count; i++) ray_release(elems[i]);
+            ray_free(elems_buf);
             return elem;
         }
         elems[count++] = elem;
@@ -519,12 +557,14 @@ static ray_t* parse_vector(ray_parser_t *p) {
     }
     if (*p->pos != ']') {
         for (int32_t i = 0; i < count; i++) ray_release(elems[i]);
+        ray_free(elems_buf);
         return ray_error("parse", NULL);
     }
     advance(p, 1); /* skip ] */
 
     if (count == 0) {
         /* Empty vector -> empty i64 vector */
+        ray_free(elems_buf);
         return ray_vec_new(RAY_I64, 0);
     }
 
@@ -557,6 +597,7 @@ static ray_t* parse_vector(ray_parser_t *p) {
         ray_t* vec = ray_vec_new(vec_type, count);
         if (RAY_IS_ERR(vec)) {
             for (int32_t i = 0; i < count; i++) ray_release(elems[i]);
+            ray_free(elems_buf);
             return vec;
         }
         switch (vec_type) {
@@ -601,6 +642,7 @@ static ray_t* parse_vector(ray_parser_t *p) {
                 if (RAY_IS_ERR(svec)) {
                     ray_free(vec);
                     for (int32_t i = 0; i < count; i++) ray_release(elems[i]);
+                    ray_free(elems_buf);
                     return svec;
                 }
                 for (int32_t i = 0; i < count; i++) {
@@ -610,11 +652,13 @@ static ray_t* parse_vector(ray_parser_t *p) {
                     if (RAY_IS_ERR(svec)) {
                         for (int32_t j = 0; j < count; j++) ray_release(elems[j]);
                         ray_free(vec);
+                        ray_free(elems_buf);
                         return svec;
                     }
                 }
                 ray_free(vec);
                 for (int32_t i = 0; i < count; i++) ray_release(elems[i]);
+                ray_free(elems_buf);
                 return svec;
             }
             default: ray_free(vec); goto boxed_list;
@@ -625,6 +669,7 @@ static ray_t* parse_vector(ray_parser_t *p) {
                 ray_vec_set_null(vec, i, true);
             ray_release(elems[i]);
         }
+        ray_free(elems_buf);
         return vec;
     }
 
@@ -633,6 +678,7 @@ static ray_t* parse_vector(ray_parser_t *p) {
         ray_t* vec = ray_vec_new(RAY_F64, count);
         if (RAY_IS_ERR(vec)) {
             for (int32_t i = 0; i < count; i++) ray_release(elems[i]);
+            ray_free(elems_buf);
             return vec;
         }
         double* d = (double*)ray_data(vec);
@@ -652,12 +698,14 @@ static ray_t* parse_vector(ray_parser_t *p) {
             }
             ray_release(elems[i]);
         }
+        ray_free(elems_buf);
         return vec;
     }
 
 boxed_list:
     /* Mixed types in vector literal — domain error */
     for (int32_t i = 0; i < count; i++) ray_release(elems[i]);
+    ray_free(elems_buf);
     return ray_error("domain", "parse: vector literal mixes incompatible element types");
 }
 
@@ -776,7 +824,23 @@ static ray_t* parse_list(ray_parser_t *p) {
 }
 
 /* ── Main expression dispatch ── */
+static ray_t* parse_expr_inner(ray_parser_t *p);
+
+/* Depth-guarded entry point.  Container literals recurse back here through
+ * parse_expr, so a single ceiling check on the way in bounds the whole
+ * recursive-descent stack; without it a pathological "[[[[..." input
+ * overflows the C stack and crashes the process. */
 static ray_t* parse_expr(ray_parser_t *p) {
+    if (++p->depth > RAY_PARSE_MAX_DEPTH) {
+        p->depth--;
+        return ray_error("parse", "nesting too deep, limit %d", RAY_PARSE_MAX_DEPTH);
+    }
+    ray_t* r = parse_expr_inner(p);
+    p->depth--;
+    return r;
+}
+
+static ray_t* parse_expr_inner(ray_parser_t *p) {
     skip_ws_and_comments(p);
 
     int32_t sl = p->line, sc = p->col;

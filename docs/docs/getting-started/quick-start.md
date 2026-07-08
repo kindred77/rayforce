@@ -43,11 +43,11 @@ Rayforce ships with a comprehensive test suite covering every subsystem:
 # Run all tests
 make test
 
-# Run a single test suite
-./rayforce.test --suite /vec
+# Run only the tests whose name contains a substring
+./rayforce.test -f vec
 
-# Run tests matching a pattern
-./rayforce.test --suite /lang
+# e.g. just the language tests
+./rayforce.test -f lang
 ```
 
 ## Start the REPL
@@ -72,7 +72,7 @@ Create a table with two columns using the `table` function. Column names are sym
 ‣ (set t (table [x y] (list [1 2 3] [A B C])))
 ┌─────┬───────────────────────────────┐
 │  x  │               y               │
-│ i64 │              sym              │
+│ I64 │              SYM              │
 ├─────┼───────────────────────────────┤
 │ 1   │ A                             │
 │ 2   │ B                             │
@@ -90,7 +90,7 @@ Use `select` to query the table. The `where:` clause filters rows, and you can p
 ‣ (select {from:t where: (> x 1)})
 ┌─────┬───────────────────────────────┐
 │  x  │               y               │
-│ i64 │              sym              │
+│ I64 │              SYM              │
 ├─────┼───────────────────────────────┤
 │ 2   │ B                             │
 │ 3   │ C                             │
@@ -106,7 +106,7 @@ Add computed columns and aggregations:
 ‣ (select {from:t x:x x2: (* x x)})
 ┌─────┬───────────────────────────────┐
 │  x  │              x2               │
-│ i64 │              i64              │
+│ I64 │              I64              │
 ├─────┼───────────────────────────────┤
 │ 1   │ 1                             │
 │ 2   │ 4                             │
@@ -119,7 +119,7 @@ Add computed columns and aggregations:
 ‣ (select {from:t by: y total: (sum x)})
 ┌─────┬───────────────────────────────┐
 │  y  │             total             │
-│ sym │              i64              │
+│ SYM │              I64              │
 ├─────┼───────────────────────────────┤
 │ A   │ 1                             │
 │ B   │ 2                             │
@@ -172,7 +172,7 @@ The REPL supports several built-in commands:
 | Command | Description |
 |---|---|
 | `:help` | Show available commands |
-| `:timeit expr` | Benchmark an expression |
+| `:timeit` (alias `:t`) | Toggle profiling on/off (or `:t 0`/`:t 1`) |
 | `:env` | List all global bindings |
 | `:clear` | Clear the screen |
 | `:quit` | Exit the REPL |

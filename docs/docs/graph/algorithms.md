@@ -343,69 +343,13 @@ ray_op_t* mst = ray_mst(g, rel, "weight");
 
 ## Vector Similarity
 
-### OP_COSINE_SIM — Cosine Similarity
-
-Computes cosine similarity between a query vector and each row of an embedding column.
-
-| Property | Value |
-|---|---|
-| Opcode | `OP_COSINE_SIM (88)` |
-| Complexity | O(N * D) where N = rows, D = dimension |
-| Use case | Semantic search, recommendation, duplicate detection |
-
-```c
-float query[128] = { /* ... */ };
-ray_op_t* sim = ray_cosine_sim(g, emb_col, query, 128);
-```
-
-### OP_EUCLIDEAN_DIST — Euclidean Distance
-
-Computes Euclidean (L2) distance between a query vector and each row of an embedding column.
-
-| Property | Value |
-|---|---|
-| Opcode | `OP_EUCLIDEAN_DIST (89)` |
-| Complexity | O(N * D) |
-| Use case | Spatial queries, clustering, anomaly detection |
-
-```c
-ray_op_t* dist = ray_euclidean_dist(g, emb_col, query, 128);
-```
-
-### OP_KNN — Brute-Force K Nearest Neighbors
-
-Finds the K nearest neighbors by exhaustive comparison. Returns the top-K rows sorted by distance.
-
-| Property | Value |
-|---|---|
-| Opcode | `OP_KNN (90)` |
-| Complexity | O(N * D + N log K) |
-| Use case | Exact nearest neighbor search on small to medium datasets |
-
-```c
-ray_op_t* neighbors = ray_knn(g, emb_col, query, 128, 10); /* top-10 */
-```
-
-### OP_HNSW_KNN — HNSW Approximate KNN
-
-Approximate K nearest neighbors using a pre-built HNSW (Hierarchical Navigable Small World) index. Orders of magnitude faster than brute-force for large datasets.
-
-| Property | Value |
-|---|---|
-| Opcode | `OP_HNSW_KNN (91)` |
-| Complexity | O(D * log N) approximate |
-| Use case | Large-scale semantic search, real-time recommendation, RAG retrieval |
-
-```c
-ray_op_t* neighbors = ray_hnsw_knn(g, hnsw_idx,
-    query, 128,   /* query vector + dimension */
-    10,            /* k */
-    200            /* ef_search (beam width, higher = more accurate) */
-);
-```
-
-!!! note "C API only"
-    HNSW index construction and approximate KNN search operate on raw float arrays and are not available as Rayfall builtins. Use the [C API](#vector-similarity) shown above for vector similarity workloads.
+Vector similarity and nearest-neighbour search are documented separately, in
+[Vector Search](vector-search.md). They are exposed as Rayfall builtins —
+`cos-dist` / `l2-dist` / `inner-prod` / `norm` for direct distances, `knn` for
+brute-force top-K, and `hnsw-build` / `ann` for HNSW-accelerated approximate
+search — and as the `select … nearest:` clause for filter-aware retrieval.
+Internally the filtered top-K paths lower to `OP_ANN_RERANK (102)` and
+`OP_KNN_RERANK (103)`.
 
 ## Ordering
 
@@ -484,8 +428,6 @@ When `factorized = 1` is set on a graph op's extended node, the executor emits f
 | Community | `OP_CLUSTER_COEFF` | Local clustering | O(V*d^2) |
 | Optimal join | `OP_WCO_JOIN` | Leapfrog TrieJoin | O(E^{3/2}) |
 | Spanning | `OP_MST` | Kruskal | O(E log E) |
-| Similarity | `OP_COSINE_SIM` | Cosine similarity | O(ND) |
-| Similarity | `OP_EUCLIDEAN_DIST` | L2 distance | O(ND) |
-| Similarity | `OP_KNN` | Brute-force KNN | O(ND + N log K) |
-| Similarity | `OP_HNSW_KNN` | HNSW approximate KNN | O(D log N) |
+| Similarity | `OP_ANN_RERANK` | Filter-aware HNSW top-K (see [Vector Search](vector-search.md)) | O(D log N) |
+| Similarity | `OP_KNN_RERANK` | Filter-aware brute-force top-K (see [Vector Search](vector-search.md)) | O(ND + N log K) |
 | Ordering | `OP_TOPSORT` | Kahn's topological sort | O(V+E) |

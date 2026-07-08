@@ -41,6 +41,7 @@
 #include <rayforce.h>
 #include "mem/heap.h"
 #include "core/profile.h"
+#include "core/qstats.h"   /* pool-dispatch pump substrate */
 
 #include <string.h>
 #include <time.h>
@@ -55,8 +56,6 @@ typedef struct {
     uint64_t    rows_done;
     uint64_t    rows_total;
     double      elapsed_sec;
-    int64_t     mem_used;
-    int64_t     mem_budget;
     bool        final;
 } recorded_t;
 
@@ -96,8 +95,6 @@ static void record_cb(const ray_progress_t* snap, void* user) {
     s->rows_done   = snap->rows_done;
     s->rows_total  = snap->rows_total;
     s->elapsed_sec = snap->elapsed_sec;
-    s->mem_used    = snap->mem_used;
-    s->mem_budget  = snap->mem_budget;
     s->final       = snap->final;
 }
 
@@ -117,9 +114,8 @@ static void sleep_ms(unsigned ms) {
 
 /* ---- Setup / Teardown --------------------------------------------------- */
 
-/* progress.c calls ray_mem_stats() / ray_mem_budget() inside fire(); both
- * require the heap to be initialised. Every test does begin/end on the heap
- * so callbacks can fire safely. */
+/* Every test does begin/end on the heap so progress callbacks can fire
+ * safely (the runtime must be initialised for the pull-based API). */
 static void progress_setup(void) {
     ray_heap_init();
     /* Always reset module state from any prior test by clearing the
@@ -312,8 +308,7 @@ static test_result_t test_progress_set_callback_zero_keeps_existing(void) {
     PASS();
 }
 
-/* Snapshot field plumbing: elapsed_sec strictly increases across fires;
- * mem_used and mem_budget are populated. */
+/* Snapshot field plumbing: elapsed_sec is non-decreasing across fires. */
 static test_result_t test_progress_snapshot_fields(void) {
     recorder_t r;
     recorder_reset(&r);
@@ -335,17 +330,6 @@ static test_result_t test_progress_snapshot_fields(void) {
     }
     for (int i = 1; i < r.n; i++) {
         TEST_ASSERT_TRUE(r.snaps[i].elapsed_sec >= r.snaps[i-1].elapsed_sec);
-    }
-
-    /* mem_budget should match the live API result. */
-    int64_t budget_now = ray_mem_budget();
-    for (int i = 0; i < r.n; i++) {
-        TEST_ASSERT_EQ_I(r.snaps[i].mem_budget, budget_now);
-    }
-
-    /* mem_used non-negative — heap is initialized so stats are available. */
-    for (int i = 0; i < r.n; i++) {
-        TEST_ASSERT_TRUE(r.snaps[i].mem_used >= 0);
     }
 
     /* Last fire is final. */
@@ -523,6 +507,48 @@ static test_result_t test_progress_end_branch_no_show(void) {
     PASS();
 }
 
+/* Pool-dispatch pump: baseline a dispatch, inject worker progress through the
+ * qstats hook (as pool.c does around each task), then pump — and confirm the
+ * callback reports this phase's rows_done / total.  Deterministic: no reliance
+ * on a real op's runtime; the end-to-end pool.c wiring is smoke-tested in the
+ * REPL (a long parallel query shows a moving bar). */
+static test_result_t test_progress_pump_dispatch(void) {
+    recorder_t rec;
+    recorder_reset(&rec);
+    ray_progress_set_callback(record_cb, &rec, 1, 1);   /* min 1ms, tick 1ms */
+
+    ray_qstats_set_mode(RAY_QS_PROGRESS);
+    ray_qstats_reset(0);
+    ray_progress_dispatch_begin(1000);
+    ray_qstats_task_end(RAY_QS_PROGRESS, 0, 500, 0);    /* slot 0: rows_done += 500 */
+
+    /* Exceed the show-delay + tick; CLOCK_MONOTONIC_COARSE can be coarse. */
+    sleep_ms(10);
+    ray_progress_pump();
+
+    ray_qstats_set_mode(0);
+
+    TEST_ASSERT_TRUE(rec.n >= 1);                        /* the pump fired */
+    recorded_t* last = &rec.snaps[rec.n - 1];
+    TEST_ASSERT_EQ_U(last->rows_done, 500);              /* sampled worker rows */
+    TEST_ASSERT_EQ_U(last->rows_total, 1000);            /* phase total reported */
+    PASS();
+}
+
+/* Off-path: with a dispatch armed but NO callback registered, the pump must be
+ * an inert no-op (the zero-cost-when-off contract). */
+static test_result_t test_progress_pump_no_callback(void) {
+    ray_progress_set_callback(NULL, NULL, 0, 0);
+    ray_qstats_set_mode(RAY_QS_PROGRESS);
+    ray_qstats_reset(0);
+    ray_progress_dispatch_begin(1000);                  /* no-op, no g_cb */
+    ray_qstats_task_end(RAY_QS_PROGRESS, 0, 500, 0);
+    sleep_ms(2);
+    ray_progress_pump();                                /* must not crash / fire */
+    ray_qstats_set_mode(0);
+    PASS();
+}
+
 /* ---- Suite definition --------------------------------------------------- */
 
 const test_entry_t progress_entries[] = {
@@ -555,6 +581,10 @@ const test_entry_t progress_entries[] = {
     { "progress/user_pointer_plumbing",    test_progress_user_pointer_plumbing,
       progress_setup, progress_teardown },
     { "progress/end_branch_no_show",       test_progress_end_branch_no_show,
+      progress_setup, progress_teardown },
+    { "progress/pump_dispatch",            test_progress_pump_dispatch,
+      progress_setup, progress_teardown },
+    { "progress/pump_no_callback",         test_progress_pump_no_callback,
       progress_setup, progress_teardown },
 
     { NULL, NULL, NULL, NULL },

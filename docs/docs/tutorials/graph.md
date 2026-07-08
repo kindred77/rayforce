@@ -44,7 +44,7 @@ Verify the graph by listing all edges:
 ```text
 ┌─────┬───────────────────────────────┐
 │  e  │               v               │
-│ i64 │              i64              │
+│ I64 │              I64              │
 ├─────┼───────────────────────────────┤
 │ 1   │ 2                             │
 │ 1   │ 3                             │
@@ -76,16 +76,16 @@ Query who Alice (entity 1) directly follows. The constant `1` in the entity posi
 ```text
 ┌─────────┬───────────────────────────┐
 │ ?target │           ?name           │
-│   i64   │            i64            │
+│   I64   │            I64            │
 ├─────────┼───────────────────────────┤
-│ 2       │ 165                       │
-│ 3       │ 166                       │
+│ 2       │ ...                       │
+│ 3       │ ...                       │
 ├─────────┴───────────────────────────┤
 │ 2 rows (2 shown) 2 columns (2 shown)│
 └─────────────────────────────────────┘
 ```
 
-Alice follows Bob (2) and Charlie (3). The `?name` column shows symbol IDs — use `sym-name` to decode them (e.g. `(sym-name 165)` returns `Bob`).
+Alice follows Bob (2) and Charlie (3). The `?name` column shows symbol IDs (the exact integers are assigned at runtime and differ between sessions, shown here as `...`) — use `sym-name` to decode them: `(sym-name id)` on the value in a `?name` row returns the readable symbol (e.g. `'Bob`).
 
 You can also query in the reverse direction — who follows Eve (entity 5)?
 
@@ -97,7 +97,7 @@ You can also query in the reverse direction — who follows Eve (entity 5)?
 ```text
 ┌─────────────────────────────────────┐
 │              ?follower              │
-│                 i64                 │
+│                 I64                 │
 ├─────────────────────────────────────┤
 │ 3                                   │
 │ 4                                   │
@@ -122,7 +122,7 @@ Chain multiple patterns to traverse 2 hops. Find Alice's friends-of-friends — 
 ```text
 ┌──────┬──────────────────────────────┐
 │ ?mid │             ?end             │
-│ i64  │             i64              │
+│ I64  │             I64              │
 ├──────┼──────────────────────────────┤
 │ 2    │ 3                            │
 │ 2    │ 4                            │
@@ -150,7 +150,7 @@ For arbitrary-depth traversal, define a recursive rule. The `reaches` rule compu
 ```text
 ┌─────────────────────────────────────┐
 │                 ?b                  │
-│                 i64                 │
+│                 I64                 │
 ├─────────────────────────────────────┤
 │ 1                                   │
 │ 2                                   │
@@ -183,7 +183,7 @@ To find a specific path between two people, use a `friends-of-friends` rule that
 ```text
 ┌─────────────────────────────────────┐
 │                ?mid                 │
-│                 i64                 │
+│                 I64                 │
 ├─────────────────────────────────────┤
 │ 3                                   │
 ├─────────────────────────────────────┤
@@ -201,7 +201,7 @@ There is one 2-hop path: Alice → Charlie (3) → Eve. You can also check wheth
 ```text
 ┌─────────────────────────────────────┐
 │                 ?x                  │
-│                 i64                 │
+│                 I64                 │
 ├─────────────────────────────────────┤
 ├─────────────────────────────────────┤
 │ 0 rows (0 shown) 1 columns (1 shown)│
@@ -230,7 +230,7 @@ Who has the most followers? Extract the edge list with `query`, then use `select
 ```text
 ┌──────┬──────────────────────────────┐
 │ ?dst │          followers           │
-│ i64  │             i64              │
+│ I64  │             I64              │
 ├──────┼──────────────────────────────┤
 │ 1    │ 2                            │
 │ 3    │ 2                            │
@@ -256,7 +256,7 @@ You can also find people who both Alice and Bob follow (common connections):
 ```text
 ┌─────────────────────────────────────┐
 │               ?common               │
-│                 i64                 │
+│                 I64                 │
 ├─────────────────────────────────────┤
 │ 3                                   │
 ├─────────────────────────────────────┤
@@ -284,7 +284,7 @@ Find tightly-connected groups by detecting **triangles** — three people who al
 ```text
 ┌─────┬─────┬─────────────────────────┐
 │ ?a  │ ?b  │           ?c            │
-│ i64 │ i64 │           i64           │
+│ I64 │ I64 │           I64           │
 ├─────┼─────┼─────────────────────────┤
 │ 1   │ 2   │ 3                       │
 │ 2   │ 3   │ 1                       │
@@ -310,7 +310,7 @@ You can also find **mutual follows** (bidirectional edges) — the strongest sig
 ```text
 ┌─────┬───────────────────────────────┐
 │ ?a  │              ?b               │
-│ i64 │              i64              │
+│ I64 │              I64              │
 ├─────┼───────────────────────────────┤
 │ 1   │ 3                             │
 │ 3   │ 1                             │

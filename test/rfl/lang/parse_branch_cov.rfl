@@ -92,10 +92,10 @@
 (type 0Nd) -- 'date
 (type 0Nt) -- 'time
 (type 0Np) -- 'timestamp
-;; 0Ns is the canonical empty symbol (sym 0), not a typed null
-0Ns -- 0Ns
-(type 0Ns) -- 'sym
-(== 0Ns ') -- true
+;; ' is the canonical empty symbol (sym 0), not a typed null
+' -- '
+(type ') -- 'sym
+(== ' ') -- true
 ;; bare 0N defaults to i64 null
 (type 0N) -- 'i64
 (nil? 0N) -- true
@@ -225,6 +225,9 @@
 ;; dotted / underscored symbol chars (parse_symbol loop :456)
 (as 'STR 'a.b.c) -- "a.b.c"
 (as 'STR 'a_b) -- "a_b"
+;; hyphenated quoted symbol chars match the documented symbol syntax
+(as 'STR 'a-b) -- "a-b"
+(== 'a-b 'a-b) -- true
 ;; empty symbol before a closing bracket / brace / paren
 ;; (parse_symbol terminator guard :408-409)
 (count (list ')) -- 1

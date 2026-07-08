@@ -78,3 +78,14 @@
 (set _s (.attr.set 'sorted [1 2 3]))(.attr.get _s) -- ['sorted]
 ;; a plain rebind PRESERVES the backing index too
 (set _g (.attr.set 'grouped [1 1 2 3 3]))(.idx.has? _g) -- true
+
+;; ── xasc stamps the verified `sorted` marker on the primary key column ──────
+;; Ascending sort makes the key non-descending by construction — same
+;; guarantee (.attr.set 'sorted) verifies, so the marker never lies.
+(.attr.get (at (xasc (table [t v] (list [3 1 2] [10 20 30])) 't) 't)) -- ['sorted]
+;; non-key columns are NOT stamped
+(.attr.get (at (xasc (table [t v] (list [3 1 2] [10 20 30])) 't) 'v)) -- []
+;; descending sort is NOT non-descending — no stamp
+(.attr.get (at (xdesc (table [t v] (list [3 1 2] [10 20 30])) 't) 't)) -- []
+;; float keys are excluded (NaN total-order caveat)
+(.attr.get (at (xasc (table [t v] (list [3.0 1.0 2.0] [10 20 30])) 't) 't)) -- []

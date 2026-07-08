@@ -5,10 +5,12 @@ truth for the version** — no version literal is ever hand-edited in source.
 
 ## Branch model
 
-- **`dev`** — integration upstream. Feature/fix branches merge here. CI runs on
-  every push and PR.
+- **`dev`** — integration upstream and the **repository default branch**.
+  Feature/fix branches merge here; all contributions target `dev` (see
+  [CONTRIBUTING.md](CONTRIBUTING.md)). CI runs on every push and PR.
 - **`master`** — protected, stable releases only. The only way in is a merged
-  release PR.
+  release PR. A PR opened against `master` that isn't the `dev -> master` release
+  PR is automatically moved to `dev` by the **Retarget stray PRs** workflow.
 
 ## Cutting a release
 
@@ -78,6 +80,13 @@ make dist RAY_VERSION=2.1.3
 
 ## One-time repository setup (GitHub)
 
+- **Default branch = `dev`**: so `git clone` and the "New pull request" button
+  steer contributors at the integration branch, not `master`. This is the
+  primary nudge; Version Guard is the backstop, and **Retarget stray PRs**
+  (`.github/workflows/retarget-prs.yml`) catches the few that still land on
+  `master` and moves them to `dev`. Because it is a `pull_request*` workflow, it
+  only governs `master` once the file is present on `master` — i.e. after the
+  first release PR that carries it merges.
 - **Branch protection / ruleset on `master`**: require a pull request before
   merging; require these two status checks to pass, and disallow direct pushes:
   - **`ci-success`** — a single aggregator job in `ci.yml` that goes green only

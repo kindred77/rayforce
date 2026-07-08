@@ -18,7 +18,7 @@ The typical analytics stack splits work across two runtimes: a columnar engine f
 
 ## Design principles
 
-- **Zero external dependencies.** The whole engine is pure C with the standard library only. No third-party allocator, no Boost, no Arrow. The single header `rayforce.h` is the entire public API.
+- **Zero external dependencies.** The whole engine is pure C with the standard library only. No third-party allocator and no external columnar or serialization libraries. The single header `rayforce.h` is the entire public API.
 - **One DAG for everything.** Filters, joins, aggregations, window functions, and graph traversals all build into the same lazy operation DAG. The optimizer rewrites the full graph before execution begins.
 - **Morsel-driven execution.** Element-wise operations fuse into single-pass pipelines that operate on 1024-element morsels and stay L1-resident. Pipeline breakers — joins, sort, group-by, window — materialize once and hand off cleanly.
 - **Custom memory model.** A buddy allocator with slab caches replaces malloc; per-thread heaps remove allocator contention; deferred cross-heap merge handles worker-thread results without locks on the hot path.

@@ -1,0 +1,16 @@
+;; Regression: (at vec idxvec) builds a RAY_LIST result of the index length
+;; and fills it element by element.  When an element lookup errors mid-loop,
+;; the cleanup path used to release the already-filled prefix AND then
+;; ray_release the whole result (double-freeing the prefix and reading the
+;; uninitialised tail) → crash in ray_release_owned_refs.  Found by the eval
+;; fuzz target with (at [true] [false]) (a bool index is not an integer, so
+;; the very first element errors, leaving the whole result uninitialised).
+;; Now it errors cleanly.
+;; A bool index vector makes the very first element error, leaving the whole
+;; result list uninitialised — the case that crashed.
+(at [true] [false]) !- type
+(at [1 2 3] [true]) !- type
+
+;; Valid integer indexing still works.
+(at [10 20 30] [0 2]) -- [10 30]
+(at [10 20 30] 1) -- 20

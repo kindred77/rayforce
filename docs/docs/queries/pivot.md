@@ -78,6 +78,7 @@ Pass a lambda for custom aggregation logic:
 Pass a vector of column symbols as the index to create a multi-level row grouping:
 
 ```lisp
+(set n 12)
 (set trades (table [Date Symbol Sector Side Price Quantity]
     (list
         (+ 2024.01.01 (take (til 30) n))

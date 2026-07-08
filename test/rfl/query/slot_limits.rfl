@@ -1,0 +1,40 @@
+;; Slot-width guards for the select/group-by paths (src/ops/query.c).  The
+;; former fixed 16-slot caps on aggregate outputs, non-aggregate outputs, and
+;; sort keys are all retired (exact-size scratch carves): more than 16 entries
+;; of any kind in one `select` now compile and execute correctly instead of
+;; erroring or silently truncating the surplus (which returned wrong results).
+;; Plain projections have no cap either — they compile through the same
+;; exact-size collectors and keep every column.
+
+(set t (table [k v] (list [1 1 2 2] (as 'F64 [10 20 30 40]))))
+
+;; ─── aggregate outputs ──────────────────────────────────────────────
+;; 16 aggregates — exactly at the cap: compiles and returns both groups.
+(count (select {by: k a: (sum v) b: (max v) c: (min v) d: (avg v) e: (sum v) f: (max v) g: (min v) h: (avg v) i: (sum v) j: (max v) l: (min v) m: (avg v) n: (sum v) o: (max v) p: (min v) q: (avg v) from: t})) -- 2
+
+;; 17 aggregates — one over the former cap: the DAG group-by compile cap and
+;; the exec-side agg-width caps are all retired, so this compiles, runs, and
+;; returns both groups.
+(count (select {by: k a: (sum v) b: (max v) c: (min v) d: (avg v) e: (sum v) f: (max v) g: (min v) h: (avg v) i: (sum v) j: (max v) l: (min v) m: (avg v) n: (sum v) o: (max v) p: (min v) q: (avg v) s: (sum v) from: t})) -- 2
+
+;; ─── non-aggregate outputs ──────────────────────────────────────────
+;; 17 non-aggregate outputs exercise the scatter path past the former cap:
+;; each aliased expression becomes a per-group LIST column.  The 17th output
+;; `s: (+ v 17)` proves the surplus survives — group k=1 (v=[10 20]) yields
+;; [27.0 37.0], group k=2 (v=[30 40]) yields [47.0 57.0].
+(at (at (select {by: k a: (+ v 1) b: (+ v 2) c: (+ v 3) d: (+ v 4) e: (+ v 5) f: (+ v 6) g: (+ v 7) h: (+ v 8) i: (+ v 9) j: (+ v 10) l: (+ v 11) m: (+ v 12) n: (+ v 13) o: (+ v 14) p: (+ v 15) q: (+ v 16) s: (+ v 17) from: t}) 's) 1) -- [47.0 57.0]
+
+;; ─── sort keys ──────────────────────────────────────────────────────
+;; 17 sort keys — the DAG sort-key collector cap is retired: exact-size
+;; scratch carve (query.c) sizes to the real bound and ray_sort_op /
+;; exec_sort take all 17.  t is [k v] = [1 1 2 2]/[10 20 30 40], already
+;; in ascending (k,v) order, so this proves no-error + a correct
+;; pass-through result (not a genuine reorder — see width_matrix.rfl for
+;; a reorder-proving case on both the DAG and post-agg sort sites).
+(at (select {from: t asc: [k v k v k v k v k v k v k v k v k]}) 'v) -- [10.0 20.0 30.0 40.0]
+
+;; ─── plain projection — NO cap (routes to the eval fallback) ─────────
+(set w (table [c0 c1 c2 c3 c4 c5 c6 c7 c8 c9 c10 c11 c12 c13 c14 c15 c16] (list [1 2] [1 2] [1 2] [1 2] [1 2] [1 2] [1 2] [1 2] [1 2] [1 2] [1 2] [1 2] [1 2] [1 2] [1 2] [1 2] [9 8])))
+;; 17 aliased projection columns: every column survives and is renamed —
+;; the 17th alias `o16` resolves to the source column c16 = [9 8].
+(at (select {from: w o0: c0 o1: c1 o2: c2 o3: c3 o4: c4 o5: c5 o6: c6 o7: c7 o8: c8 o9: c9 o10: c10 o11: c11 o12: c12 o13: c13 o14: c14 o15: c15 o16: c16}) 'o16) -- [9 8]

@@ -53,6 +53,11 @@ static ray_t* err_to_ray(ray_err_t e, const char* fallback) {
  * Accepting the mode as a sym keyword keeps the call self-documenting
  * without needing a second function or a magic int. */
 ray_t* ray_log_open_fn(ray_t** args, int64_t n) {
+#ifdef RAY_FUZZING
+    /* No journal files opened for writing at attacker-controlled paths. */
+    (void)args; (void)n;
+    return ray_error("restricted", "log.open disabled under fuzzing");
+#endif
     if (n != 2)
         return ray_error("rank", ".log.open expects (`async|`sync; \"base\")");
     if (!args[0] || args[0]->type != -RAY_SYM)
@@ -119,7 +124,7 @@ ray_t* ray_log_write_fn(ray_t* expr) {
         .prefix  = RAY_SERDE_PREFIX,
         .version = RAY_SERDE_WIRE_VERSION,
         .flags   = 0,
-        .endian  = 0,
+        .endian  = RAY_SERDE_ENDIAN,
         .msgtype = RAY_IPC_MSG_ASYNC,
         .size    = pay_size,
     };
@@ -162,6 +167,10 @@ ray_t* ray_log_replay_fn(ray_t* path) {
     case RAY_JREPLAY_IO:
         return ray_error("io",
                          "%s: I/O failure after %lld entries", p, (long long)chunks);
+    case RAY_JREPLAY_CANCEL:
+        return ray_error("cancel",
+                         "%s: replay interrupted after %lld entries (log intact)",
+                         p, (long long)chunks);
     }
     return ray_error("internal", "unknown replay status");
 }

@@ -20,7 +20,7 @@ false -- false
 -10001230000i !- domain
 "" -- ""
 'asd -- 'asd
-' -- 0Ns
+' -- '
 (as 'STR ') -- ""
 (as 'STR ' ) -- ""
 "asd" -- "asd"

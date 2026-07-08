@@ -251,10 +251,13 @@ static void fmt_guid(fmt_buf_t* b, const uint8_t* bytes) {
 /* Render a resolved sym string atom (borrowed — sym/domain atoms are
  * owned by their table/domain; never released here). */
 static void fmt_sym_atom(fmt_buf_t* b, ray_t* s) {
-    if (s && !RAY_IS_ERR(s)) {
+    if (s && !RAY_IS_ERR(s) && ray_str_len(s) > 0) {
         fmt_putn(b, ray_str_ptr(s), (int32_t)ray_str_len(s));
     } else {
-        fmt_puts(b, "0Ns");
+        /* sym 0 (the empty symbol, resolves to "") and any unresolvable
+         * id render as the bare quote literal `'` — the canonical spelling
+         * of the empty symbol.  SYM has no null, so there is no `0Ns`. */
+        fmt_putc(b, '\'');
     }
 }
 
@@ -269,7 +272,7 @@ static void fmt_sym(fmt_buf_t* b, int64_t sym_id) {
 #include "lang/cal.h"
 
 static void time_to_hms(int32_t ms, int* h, int* min, int* s, int* ms_out) {
-    int32_t mask = ms >> 31;
+    int32_t mask = -(int32_t)((uint32_t)ms >> 31);  /* 0 or -1, without the impl-defined signed shift */
     int32_t val  = (mask ^ ms) - mask;  /* absolute value */
 
     int32_t secs = val / 1000;
@@ -349,9 +352,10 @@ static const char* null_literal(int8_t type) {
     case RAY_DATE:      return "0Nd";
     case RAY_TIME:      return "0Nt";
     case RAY_TIMESTAMP: return "0Np";
-    case RAY_SYM:       return "0Ns";
-    /* RAY_STR has no null literal: empty and null strings both render
-     * as "" (handled directly by the STR paths, never via this table). */
+    /* SYM has no null literal: the empty symbol is a value (renders as ')
+     * and never reaches this table — callers gate on null, false for SYM.
+     * RAY_STR likewise has no null literal: empty and null strings both
+     * render as "" (handled directly by the STR paths, never via this table). */
     case RAY_GUID:      return "0Ng";
     default:            return "null";
     }

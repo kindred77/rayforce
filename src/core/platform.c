@@ -38,6 +38,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <signal.h>
 #include "mem/sys.h"
 
 /* --------------------------------------------------------------------------
@@ -46,11 +47,15 @@
 void* ray_vm_alloc(size_t size) {
     void* p = mmap(NULL, size, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    return (p == MAP_FAILED) ? NULL : p;
+    if (p == MAP_FAILED) return NULL;
+    ray_sys_track_add((int64_t)size);   /* committed RAM */
+    return p;
 }
 
 void ray_vm_free(void* ptr, size_t size) {
-    if (ptr) munmap(ptr, size);
+    if (!ptr) return;
+    munmap(ptr, size);
+    ray_sys_track_sub((int64_t)size);
 }
 
 void* ray_vm_map_file(const char* path, size_t* out_size) {
@@ -75,12 +80,27 @@ void* ray_vm_map_file(const char* path, size_t* out_size) {
 
     if (p == MAP_FAILED) return NULL;
 
+    ray_sys_track_file_add((int64_t)len);   /* file-backed mapping */
     if (out_size) *out_size = len;
     return p;
 }
 
 void ray_vm_unmap_file(void* ptr, size_t size) {
-    if (ptr) munmap(ptr, size);
+    if (!ptr) return;
+    munmap(ptr, size);
+    ray_sys_track_file_sub((int64_t)size);
+}
+
+/* Read-only, private map of an already-open fd — the zero-copy parse buffer
+ * for CSV / script loads.  Counted in the file-mapping total; the caller
+ * still owns the fd (close as before).  Free with ray_vm_unmap_file.
+ * Returns NULL on failure (not MAP_FAILED). */
+void* ray_vm_map_fd_ro(int fd, size_t size) {
+    if (size == 0) return NULL;
+    void* p = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (p == MAP_FAILED) return NULL;
+    ray_sys_track_file_add((int64_t)size);
+    return p;
 }
 
 void ray_vm_advise_seq(void* ptr, size_t size) {
@@ -157,6 +177,9 @@ void* ray_vm_alloc_aligned(size_t size, size_t alignment) {
     if (end > aligned_end)
         munmap((void*)aligned_end, end - aligned_end);
 
+    /* Count only the KEPT region, so the two trim munmaps above never touch
+     * the counter — ray_vm_free(ptr, size) later subtracts the same `size`. */
+    ray_sys_track_add((int64_t)size);
     return (void*)aligned;
 }
 
@@ -185,6 +208,15 @@ static void* thread_trampoline(void* raw) {
     /* Free the trampoline struct allocated on the heap. We copied it first
      * so the creating thread can proceed freely.                            */
     ray_sys_free(raw);
+    /* Keep SIGURG (the IPC out-of-band cancel signal) off spawned threads so it
+     * is only ever delivered to the main thread.  A worker's stack can be
+     * nearly full mid-kernel (large per-morsel VLAs in the elementwise ops), and
+     * running the signal handler on top of it would overflow the guard page.
+     * Workers observe cancellation via the pool's cancel flag, not the signal. */
+    sigset_t urg;
+    sigemptyset(&urg);
+    sigaddset(&urg, SIGURG);
+    pthread_sigmask(SIG_BLOCK, &urg, NULL);
     ctx.fn(ctx.arg);
     return NULL;
 }
@@ -269,16 +301,20 @@ void ray_sem_signal(ray_sem_t* s) {
   #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+
 /* --------------------------------------------------------------------------
  * Virtual memory
  * -------------------------------------------------------------------------- */
 void* ray_vm_alloc(size_t size) {
-    return VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    void* p = VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (p) ray_sys_track_add((int64_t)size);
+    return p;
 }
 
 void ray_vm_free(void* ptr, size_t size) {
-    (void)size;
-    if (ptr) VirtualFree(ptr, 0, MEM_RELEASE);
+    if (!ptr) return;
+    VirtualFree(ptr, 0, MEM_RELEASE);
+    ray_sys_track_sub((int64_t)size);
 }
 
 void* ray_vm_map_file(const char* path, size_t* out_size) {
@@ -306,14 +342,20 @@ void* ray_vm_map_file(const char* path, size_t* out_size) {
 
     if (!p) return NULL;
 
+    ray_sys_track_file_add((int64_t)file_size.QuadPart);
     if (out_size) *out_size = (size_t)file_size.QuadPart;
     return p;
 }
 
 void ray_vm_unmap_file(void* ptr, size_t size) {
-    (void)size;
-    if (ptr) UnmapViewOfFile(ptr);
+    if (!ptr) return;
+    UnmapViewOfFile(ptr);
+    ray_sys_track_file_sub((int64_t)size);
 }
+
+/* Windows never reaches the fd/mmap CSV path (#ifndef RAY_OS_WINDOWS), so this
+ * is an unused stub kept only for API completeness. */
+void* ray_vm_map_fd_ro(int fd, size_t size) { (void)fd; (void)size; return NULL; }
 
 /* MinGW-w64 may not define WIN32_MEMORY_RANGE_ENTRY even when targeting
  * modern Windows.  We load PrefetchVirtualMemory at runtime, so only the
@@ -409,6 +451,9 @@ void* ray_vm_alloc_aligned(size_t size, size_t alignment) {
                              MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (!mem) return NULL;
     uintptr_t aligned = ((uintptr_t)mem + alignment - 1) & ~(alignment - 1);
+    /* Count the kept `size` to balance ray_vm_free(ptr, size); the alignment
+     * slack Windows cannot trim is left uncounted (parity with POSIX). */
+    ray_sys_track_add((int64_t)size);
     return (void*)aligned;
 }
 
@@ -508,14 +553,15 @@ void* ray_vm_alloc(size_t size) {
          * Round up to a 64KB WASM page. */
         size_t aligned = (size + 65535u) & ~(size_t)65535u;
         p = aligned_alloc(65536, aligned);
-        return p;
     }
+    if (p) ray_sys_track_add((int64_t)size);
     return p;
 }
 
 void ray_vm_free(void* ptr, size_t size) {
     if (!ptr) return;
-    if (munmap(ptr, size) != 0) free(ptr);
+    if (munmap(ptr, size) != 0) ray_free_raw(ptr);
+    ray_sys_track_sub((int64_t)size);
 }
 
 void* ray_vm_map_file(const char* path, size_t* out_size) {
@@ -534,12 +580,23 @@ void* ray_vm_map_file(const char* path, size_t* out_size) {
     close(fd);
 
     if (p == MAP_FAILED) return NULL;
+    ray_sys_track_file_add((int64_t)len);
     if (out_size) *out_size = len;
     return p;
 }
 
 void ray_vm_unmap_file(void* ptr, size_t size) {
-    if (ptr) munmap(ptr, size);
+    if (!ptr) return;
+    munmap(ptr, size);
+    ray_sys_track_file_sub((int64_t)size);
+}
+
+void* ray_vm_map_fd_ro(int fd, size_t size) {
+    if (size == 0) return NULL;
+    void* p = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (p == MAP_FAILED) return NULL;
+    ray_sys_track_file_add((int64_t)size);
+    return p;
 }
 
 /* madvise hints are advisory and have no analog on WASM — no-ops. */
@@ -554,7 +611,10 @@ void ray_vm_release_block(void* blk, size_t bsize, bool hugepage) {
 void* ray_vm_alloc_aligned(size_t size, size_t alignment) {
     /* aligned_alloc requires size to be a multiple of alignment per C17. */
     size_t aligned_size = (size + alignment - 1) & ~(alignment - 1);
-    return aligned_alloc(alignment, aligned_size);
+    void* p = aligned_alloc(alignment, aligned_size);
+    /* Count the requested `size` to balance ray_vm_free(ptr, size). */
+    if (p) ray_sys_track_add((int64_t)size);
+    return p;
 }
 
 bool ray_vm_hugepage(void* ptr, size_t size) { (void)ptr; (void)size; return false; }

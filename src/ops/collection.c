@@ -443,7 +443,10 @@ ray_t* ray_map_fn(ray_t** args, int64_t n) {
     return result;
 }
 
-/* (pmap fn val vec) — same as map, parallel not implemented yet (sequential fallback) */
+/* (pmap fn val vec) — sequential alias for map, kept as a distinct builtin so
+ * call sites can signal intent.  Evaluation is NOT parallelised: the applied
+ * function runs on the calling thread's VM (the VM is thread-local and eval is
+ * single-threaded), so results and semantics are identical to map. */
 ray_t* ray_pmap_fn(ray_t** args, int64_t n) {
     return ray_map_fn(args, n);
 }
@@ -496,6 +499,194 @@ ray_t* ray_fold_fn(ray_t** args, int64_t n) {
     return acc;
 }
 
+/* Typed prefix-scan kernels for the native arithmetic operators.  The
+ * generic scan below unboxes the vector into a LIST and drives the full
+ * call machinery per element — and, worse, RETURNS a LIST of boxed
+ * atoms, so every downstream vector op on the running sums degrades to
+ * the boxed paths too (the q28 20-row moving average spent ~13ms on
+ * 45k rows this way).  For (scan + vec) / (scan * vec) over numeric
+ * typed vectors, run one tight per-width loop and return a TYPED
+ * vector.  Per-step semantics mirror ray_add_fn / ray_mul_fn exactly:
+ * floats — plain IEEE ops, NaN (the F64 null) propagates and sticks;
+ * ints — same-width wrap-truncate arithmetic (make_typed_int), null
+ * sentinel propagation is sticky, and a wrap that lands on the
+ * sentinel reads as null downstream exactly like the boxed path. */
+static ray_t* scan_typed_arith(ray_t* fn, ray_t* vec) {
+    if (fn->type != RAY_BINARY || !vec || !ray_is_vec(vec) || vec->len <= 0)
+        return NULL;
+    ray_binary_fn bf = (ray_binary_fn)(uintptr_t)fn->i64;
+    bool is_add = (bf == ray_add_fn);
+    if (!is_add && bf != ray_mul_fn) return NULL;
+    int8_t t = vec->type;
+    if (t != RAY_F64 && t != RAY_I64 && t != RAY_I32 && t != RAY_I16)
+        return NULL;
+    int64_t len = vec->len;
+    ray_t* out = ray_vec_new(t, len);
+    if (!out || RAY_IS_ERR(out)) { if (out) ray_release(out); return NULL; }
+    out->len = len;
+    /* Sentinel-bearing partials downstream: mirror the DAG convention —
+     * advertise nulls when the source does. */
+    out->attrs |= (vec->attrs & RAY_ATTR_HAS_NULLS);
+    if (t == RAY_F64) {
+        const double* restrict v = (const double*)ray_data(vec);
+        double* restrict o = (double*)ray_data(out);
+        double acc = v[0];
+        o[0] = acc;
+        if (is_add) for (int64_t i = 1; i < len; i++) { acc += v[i]; o[i] = acc; }
+        else        for (int64_t i = 1; i < len; i++) { acc *= v[i]; o[i] = acc; }
+        return out;
+    }
+    #define SCAN_INT_LOOP(CT, SENT)                                           \
+        do {                                                                  \
+            const CT* restrict v = (const CT*)ray_data(vec);                  \
+            CT* restrict o = (CT*)ray_data(out);                              \
+            CT acc = v[0];                                                    \
+            o[0] = acc;                                                       \
+            for (int64_t i = 1; i < len; i++) {                               \
+                CT x = v[i];                                                  \
+                if (acc == (SENT) || x == (SENT)) acc = (SENT);               \
+                else acc = is_add                                             \
+                    ? (CT)((int64_t)acc + (int64_t)x)                         \
+                    : (CT)((int64_t)acc * (int64_t)x);                        \
+                o[i] = acc;                                                   \
+            }                                                                 \
+        } while (0)
+    if (t == RAY_I64)      SCAN_INT_LOOP(int64_t, NULL_I64);
+    else if (t == RAY_I32) SCAN_INT_LOOP(int32_t, NULL_I32);
+    else                   SCAN_INT_LOOP(int16_t, NULL_I16);
+    #undef SCAN_INT_LOOP
+    return out;
+}
+
+/* (prior fn vec) — pairwise combinator over adjacent elements:
+ * out[i] = (fn v[i] v[i-1]) for i >= 1, out[0] = (fn v[0] v[0]) — the
+ * self-pair start matches the concat/take shift idiom it replaces
+ * (prev[0] = v[0]), so a comparison's first slot compares equal → false.
+ * The six comparison operators over null-free
+ * numeric/temporal typed vectors (plus ==//= over SYM, where adjacent
+ * same-vector ids compare directly) run one fused pass returning a BOOL
+ * vector — no shifted copy, no boxing.  Everything else falls to the
+ * generic per-pair application returning a LIST, mirroring scan. */
+static ray_t* prior_typed_cmp(ray_t* fn, ray_t* vec) {
+    if (fn->type != RAY_BINARY || !vec || !ray_is_vec(vec) || vec->len <= 0)
+        return NULL;
+    if (vec->attrs & RAY_ATTR_HAS_NULLS) return NULL;
+    ray_binary_fn bf = (ray_binary_fn)(uintptr_t)fn->i64;
+    int op;                                   /* 0:< 1:> 2:<= 3:>= 4:== 5:!= */
+    if      (bf == ray_lt_fn)  op = 0;
+    else if (bf == ray_gt_fn)  op = 1;
+    else if (bf == ray_lte_fn) op = 2;
+    else if (bf == ray_gte_fn) op = 3;
+    else if (bf == ray_eq_fn)  op = 4;
+    else if (bf == ray_neq_fn) op = 5;
+    else return NULL;
+    int8_t t = vec->type;
+    bool is_sym = (t == RAY_SYM);
+    if (is_sym && op != 4 && op != 5) return NULL;  /* SYM ordering → generic */
+    if (!is_sym) switch (t) {
+        case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
+        case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP:
+        case RAY_F64: case RAY_F32: break;
+        default: return NULL;
+    }
+    int64_t n = vec->len;
+    ray_t* out = ray_vec_new(RAY_BOOL, n);
+    if (!out || RAY_IS_ERR(out)) { if (out) ray_release(out); return NULL; }
+    out->len = n;
+    uint8_t* restrict o = (uint8_t*)ray_data(out);
+    #define PRIOR_CMP_LOOP(READ)                                          \
+        do {                                                              \
+            int64_t prev = READ(0);                                       \
+            o[0] = (uint8_t)((op == 2) | (op == 3) | (op == 4));          \
+            for (int64_t i = 1; i < n; i++) {                             \
+                int64_t cur = READ(i);                                    \
+                uint8_t r;                                                \
+                switch (op) {                                             \
+                    case 0: r = cur <  prev; break;                       \
+                    case 1: r = cur >  prev; break;                       \
+                    case 2: r = cur <= prev; break;                       \
+                    case 3: r = cur >= prev; break;                       \
+                    case 4: r = cur == prev; break;                       \
+                    default: r = cur != prev; break;                      \
+                }                                                         \
+                o[i] = r;                                                 \
+                prev = cur;                                               \
+            }                                                             \
+        } while (0)
+    if (is_sym) {
+        const void* d = ray_data(vec);
+        uint8_t at = vec->attrs;
+        #define RD_SYM(i) ((int64_t)ray_read_sym(d, (i), RAY_SYM, at))
+        PRIOR_CMP_LOOP(RD_SYM);
+        #undef RD_SYM
+    } else if (t == RAY_F64 || t == RAY_F32) {
+        /* Float compares must stay in the float domain (NaN, fractions). */
+        const void* d = ray_data(vec);
+        double prev = (t == RAY_F64) ? ((const double*)d)[0]
+                                     : (double)((const float*)d)[0];
+        o[0] = (uint8_t)((op == 2) | (op == 3) | (op == 4));
+        /* NaN self-compare: <=/>=/== on a NaN first element is false —
+         * overwrite the constant start for that case. */
+        if (prev != prev) o[0] = (uint8_t)(op == 5);
+        for (int64_t i = 1; i < n; i++) {
+            double cur = (t == RAY_F64) ? ((const double*)d)[i]
+                                        : (double)((const float*)d)[i];
+            uint8_t r;
+            switch (op) {
+                case 0: r = cur <  prev; break;
+                case 1: r = cur >  prev; break;
+                case 2: r = cur <= prev; break;
+                case 3: r = cur >= prev; break;
+                case 4: r = cur == prev; break;
+                default: r = cur != prev; break;
+            }
+            o[i] = r;
+            prev = cur;
+        }
+    } else {
+        const void* d = ray_data(vec);
+        uint8_t at = vec->attrs;
+        #define RD_I(i) read_col_i64(d, (i), t, at)
+        PRIOR_CMP_LOOP(RD_I);
+        #undef RD_I
+    }
+    #undef PRIOR_CMP_LOOP
+    return out;
+}
+
+ray_t* ray_prior_fn(ray_t** args, int64_t n) {
+    if (n < 2) return ray_error("domain", "prior: requires fn and vec args, got %lld", (long long)n);
+    for (int64_t i = 0; i < n; i++)
+        if (ray_is_lazy(args[i])) args[i] = ray_lazy_materialize(args[i]);
+    ray_t* fn = args[0];
+    {
+        ray_t* fast = prior_typed_cmp(fn, args[1]);
+        if (fast) return fast;
+    }
+    ray_t* _bx = NULL;
+    ray_t* vec = unbox_vec_arg(args[1], &_bx);
+    if (RAY_IS_ERR(vec)) return vec;
+    if (!is_list(vec)) { if (_bx) ray_release(_bx); return ray_error("type", "prior: vec arg must be a list, got %s", ray_type_name(vec->type)); }
+    int64_t len = ray_len(vec);
+    ray_t* result = ray_alloc(len > 0 ? len * (int64_t)sizeof(ray_t*) : 0);
+    if (!result) { if (_bx) ray_release(_bx); return ray_error("oom", NULL); }
+    result->type = RAY_LIST;
+    result->len = len;
+    if (len == 0) { if (_bx) ray_release(_bx); return result; }
+    ray_t** out = (ray_t**)ray_data(result);
+    ray_t** elems = (ray_t**)ray_data(vec);
+    for (int64_t i = 0; i < len; i++) {
+        out[i] = call_fn2(fn, elems[i], elems[i > 0 ? i - 1 : 0]);
+        if (RAY_IS_ERR(out[i])) {
+            for (int64_t j = 0; j < i; j++) ray_release(out[j]);
+            result->len = 0; ray_release(result); if (_bx) ray_release(_bx);
+            return out[i];
+        }
+    }
+    if (_bx) ray_release(_bx);
+    return result;
+}
+
 /* (scan fn vec) — running fold, returns vector of partial results */
 ray_t* ray_scan_fn(ray_t** args, int64_t n) {
     if (n < 2) return ray_error("domain", "scan: requires at least 2 args (fn and vec), got %lld", (long long)n);
@@ -503,6 +694,10 @@ ray_t* ray_scan_fn(ray_t** args, int64_t n) {
         if (ray_is_lazy(args[i])) args[i] = ray_lazy_materialize(args[i]);
 
     ray_t* fn = args[0];
+    {
+        ray_t* fast = scan_typed_arith(fn, args[1]);
+        if (fast) return fast;
+    }
     ray_t* _bx = NULL;
     ray_t* vec = unbox_vec_arg(args[1], &_bx);
     if (RAY_IS_ERR(vec)) return vec;
@@ -791,6 +986,57 @@ ray_t* distinct_vec_eager(ray_t* x) {
     int64_t* idx = (len <= 256) ? idx_stack : (int64_t*)ray_sys_alloc((size_t)len * sizeof(int64_t));
     if (!idx) return ray_error("oom", NULL);
 
+    /* SYM presence-bitmap dedup: a SYM code is a position in [0, domain_count),
+     * so for a small domain a domain_count-byte "seen" array collects the
+     * first-occurrence row ids in O(n) with NO hashing — identical first-
+     * appearance order to the hashset path below.  Gate dc<=len so the array
+     * never costs more than the data it replaces; larger domains fall through. */
+    if (x->type == RAY_SYM) {
+        int64_t dc = ray_sym_domain_count(ray_sym_vec_domain(x));
+        if (dc > 0 && dc <= 65536 && dc <= len) {
+            uint8_t* seen = (uint8_t*)ray_sys_alloc((size_t)dc);
+            if (!seen) { if (idx != idx_stack) ray_sys_free(idx); return ray_error("oom", NULL); }
+            memset(seen, 0, (size_t)dc);
+            const void* data = ray_data(x);
+            int8_t ty = x->type; uint16_t at = x->attrs;
+            int64_t count = 0;
+            for (int64_t i = 0; i < len; i++) {
+                int64_t code = ray_read_sym(data, i, ty, at);
+                if (!seen[code]) { seen[code] = 1; idx[count++] = i; }
+            }
+            ray_sys_free(seen);
+            ray_t* result = gather_by_idx(x, idx, count);
+            if (idx != idx_stack) ray_sys_free(idx);
+            return result;
+        }
+    }
+
+    /* Dict-encoded STR: dedup on the int32 dict-code vector (codes in
+     * [0, n_distinct)) via a presence array — first-occurrence order, no
+     * string hashing.  Mirrors the SYM presence path; gated nd<=len so the
+     * seen[] array never costs more than the data it replaces. */
+    if (x->type == RAY_STR && ray_index_kind(x) == RAY_IDX_DICT) {
+        ray_index_t* dix = ray_index_payload(x->index);
+        int64_t nd = dix->u.dict.n_distinct;
+        ray_t* codes_v = dix->u.dict.codes;
+        if (nd > 0 && nd <= len && codes_v && !RAY_IS_ERR(codes_v)
+            && codes_v->len == len) {
+            const int32_t* codes = (const int32_t*)ray_data(codes_v);
+            uint8_t* seen = (uint8_t*)ray_sys_alloc((size_t)nd);
+            if (!seen) { if (idx != idx_stack) ray_sys_free(idx); return ray_error("oom", NULL); }
+            memset(seen, 0, (size_t)nd);
+            int64_t count = 0;
+            for (int64_t i = 0; i < len; i++) {
+                int32_t c = codes[i];
+                if (c >= 0 && c < nd && !seen[c]) { seen[c] = 1; idx[count++] = i; }
+            }
+            ray_sys_free(seen);
+            ray_t* result = gather_by_idx(x, idx, count);
+            if (idx != idx_stack) ray_sys_free(idx);
+            return result;
+        }
+    }
+
     hashset_t hs;
     if (!hashset_init(&hs, x, len)) {
         if (idx != idx_stack) ray_sys_free(idx);
@@ -998,6 +1244,18 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
          * hashset over `vec` once, probe per element of `val`.  Was
          * O(len(val)×len(vec)); now O(len(val)+len(vec)). */
         if (ray_is_vec(val) && ray_is_vec(vec)) {
+            /* Typed kernel first: verdict-LUT for SYM, SIMD small-set for
+             * ints, pool-parallel — the same engine the fused WHERE path
+             * uses.  Gated off null-bearing operands: this hashset path
+             * matches null ∈ {…null…} as TRUE (null equals null), while
+             * the WHERE kernel uses null-matches-nothing semantics — the
+             * two must not be conflated.  NULL result = unsupported shape
+             * (STR etc.): fall through to the hashset probe below. */
+            if (!(val->attrs & RAY_ATTR_HAS_NULLS) &&
+                !(vec->attrs & RAY_ATTR_HAS_NULLS)) {
+                ray_t* fast = ray_in_vec_exec(val, vec, false);
+                if (fast) return fast;
+            }
             ray_t* result = ray_vec_new(RAY_BOOL, vlen);
             if (RAY_IS_ERR(result)) return result;
             result->len = vlen;
@@ -1781,7 +2039,10 @@ ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
             int alloc = 0;
             ray_t* idx_elem = collection_elem(idx, j, &alloc);
             if (RAY_IS_ERR(idx_elem)) {
-                for (int64_t k = 0; k < j; k++) ray_release(out[k]);
+                /* Only out[0..j) are initialised; shrink len so ray_release
+                 * frees exactly those and never reads the garbage tail
+                 * (out[j..idxlen) is uninitialised). */
+                result->len = j;
                 ray_release(result);
                 return idx_elem;
             }
@@ -1789,7 +2050,7 @@ ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
             ray_t* val = ray_at_fn(vec, sub_idx);
             if (alloc) ray_release(idx_elem);
             if (RAY_IS_ERR(val)) {
-                for (int64_t k = 0; k < j; k++) ray_release(out[k]);
+                result->len = j;
                 ray_release(result);
                 return val;
             }
@@ -1835,28 +2096,41 @@ ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
         }
         return ray_typed_null(-RAY_I64);
     }
-    /* Vector val: (find vec [v1 v2]) → [idx1 idx2] */
-    if (is_collection(val)) {
-        /* If vec is empty, return empty vector */
-        if (is_collection(vec) && ray_len(vec) == 0)
-            return ray_vec_new(RAY_I64, 0);
+    /* Vector val: (find vec [v1 v2]) → dense I64 [idx1 idx2], O(n+m) via hashset. */
+    if (is_collection(val) && !ray_is_atom(val)) {
         int64_t vlen = ray_len(val);
-        ray_t* result = ray_alloc(vlen * sizeof(ray_t*));
-        if (!result) return ray_error("oom", NULL);
-        result->type = RAY_LIST;
+        ray_t* result = ray_vec_new(RAY_I64, vlen);
+        if (RAY_IS_ERR(result)) return result;
         result->len = vlen;
-        ray_t** out = (ray_t**)ray_data(result);
-        for (int64_t j = 0; j < vlen; j++) {
-            int alloc = 0;
-            ray_t* ve = collection_elem(val, j, &alloc);
-            out[j] = ray_find_fn(vec, ve);
-            if (alloc) ray_release(ve);
-            if (RAY_IS_ERR(out[j])) {
-                for (int64_t k = 0; k < j; k++) ray_release(out[k]);
-                ray_release(result);
-                return out[j];
+        int64_t* out = (int64_t*)ray_data(result);
+        bool any_null = false;
+
+        /* Hash fast path: both sides typed vecs — O(n+m), mirrors ray_in_fn. */
+        if (ray_is_vec(val) && ray_is_vec(vec)) {
+            hashset_t hs;
+            if (!hashset_init(&hs, vec, vec->len)) { ray_release(result); return ray_error("oom", NULL); }
+            for (int64_t j = 0; j < vec->len; j++) hashset_insert(&hs, j);
+            int8_t vt = val->type; void* vd = ray_data(val);
+            for (int64_t i = 0; i < vlen; i++) {
+                int64_t row = hashset_find_xrow(&hs, val, i, vt, vd);
+                if (row == HS_EMPTY) { out[i] = NULL_I64; any_null = true; }
+                else out[i] = row;
+            }
+            hashset_destroy(&hs);
+        } else {
+            /* Fallback (LIST/mixed): per-element scalar find into the dense buffer. */
+            for (int64_t j = 0; j < vlen; j++) {
+                int alloc = 0;
+                ray_t* ve = collection_elem(val, j, &alloc);
+                ray_t* one = ray_find_fn(vec, ve);   /* scalar → i64 atom or 0Nl */
+                if (alloc) ray_release(ve);
+                if (RAY_IS_ERR(one)) { ray_release(result); return one; }
+                if (RAY_ATOM_IS_NULL(one)) { out[j] = NULL_I64; any_null = true; }
+                else out[j] = one->i64;
+                ray_release(one);
             }
         }
+        if (any_null) result->attrs |= RAY_ATTR_HAS_NULLS;
         return result;
     }
     /* Typed vector: search without boxing */

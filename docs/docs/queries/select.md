@@ -35,6 +35,36 @@ Select specific columns with computed expressions:
 ; MSFT   378000
 ```
 
+### Whole-column projections
+
+A projection may be a whole-column verb — `distinct`, `asc`, `desc`, or
+`reverse` — applied to a column. Unlike a per-row computed expression, these
+consume the entire column and return a vector, so the result's row count can
+differ from the source table (`distinct` in particular collapses duplicates):
+
+```lisp
+(select {price: (distinct price) from: t})
+; price
+; -----
+;   150
+;   280
+;   420
+
+(select {price: (asc price) from: t})   ; ascending column
+```
+
+A `where:` clause is applied first, so the verb only sees the surviving rows:
+
+```lisp
+(select {price: (distinct price) from: t where: (> volume 400)})
+```
+
+Because a whole-column verb changes the row count, it cannot be mixed with a
+full-length column in the same query — pairing `(distinct price)` with a plain
+`sym` column raises a `length` error. Project the single reshaped column on its
+own, then compose further clauses (`asc:`, `take:`) or an outer `xasc`/`xdesc`
+around it.
+
 ### Filtering with `where:`
 
 The `where:` clause accepts any predicate expression. Predicates are pushed down through the DAG for early elimination of rows:
@@ -177,6 +207,10 @@ Update one or more columns with a new expression. The table is modified in-place
 
 ; Increment volume by 1
 (update {volume: (+ 1 volume) from: 'tab})
+; => tab           (returns the quoted table symbol, not the table)
+
+; The mutation is applied in-place; re-query to see it:
+tab
 ; sym  price volume
 ; ---  ----- ------
 ; AAPL   102    501
@@ -260,7 +294,7 @@ Pass a quoted table symbol for in-place mutation:
 
 ## Upsert
 
-The `upsert` function inserts new rows or updates existing ones based on a key column index. The second argument is the 0-based column index used as the match key.
+The `upsert` function inserts new rows or updates existing ones based on a composite key formed from the table's leading columns. The second argument is the **key count** — the number of leading columns used as the match key. It must be in the range `1..min(ncols, 16)`; passing `0` is an error.
 
 ### Insert New Rows
 
@@ -268,7 +302,7 @@ The `upsert` function inserts new rows or updates existing ones based on a key c
 (set t (table [ID Name Value]
     (list [1 2 3] ['Alice 'Bob 'Charlie] [10.0 20.0 30.0])))
 
-; Upsert on column 1 (ID). ID=4 is new, so insert.
+; Upsert on the first 1 column (ID) as key. ID=4 is new, so insert.
 (set t (upsert t 1 (list 4 'David 40.0)))
 ```
 

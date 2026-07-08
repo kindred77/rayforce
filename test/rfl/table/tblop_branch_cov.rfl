@@ -9,7 +9,8 @@
 ;;
 ;; Reachable branches targeted:
 ;;   L85   — ray_is_vec(index_arg) true (SYM vec index arg, lambda agg)
-;;   L87   — len > 16 index columns guard
+;;   (was L87: len > 7 index columns guard — REMOVED, task 6; pivot's
+;;    index-column count is unbounded now.  See Section 8/8c below.)
 ;;   L124  — STR index column forces dag_ok=false (tested via !- nyi)
 ;;   L253  — gid_cap while-loop for large n_grps
 ;;   L265  — hash collision during grouped-HT insert
@@ -32,16 +33,18 @@
 (.sys.exec "rm -rf /tmp/rfl_tblop_branch")
 
 ;; ══════════════════════════════════════════════════════════════════
-;; Section 1: STR columns force dag_ok=false (L124) but the GROUP BY
-;;            DAG path does not support STR keys → "nyi" error.
-;;            These test the error propagation, not the happy path.
+;; Section 1: STR group KEYS are now supported via the wide-key path,
+;;            so a STR pivot INDEX works.  A STR pivot COLUMN still errors
+;;            "nyi" because pivot values become column NAMES (syms), which
+;;            STR cannot supply.
 ;; ══════════════════════════════════════════════════════════════════
 
-;; STR index column → nyi in GROUP BY DAG.
+;; STR index column → supported: idx=[alice,bob], alice{x:10,y:20} bob{x:30,y:40}.
 (set Tstr_idx (table [idx pv val] (list (list "alice" "alice" "bob" "bob") ['x 'y 'x 'y] [10 20 30 40])))
-(pivot Tstr_idx 'idx 'pv 'val sum) !- nyi
+(at (at (pivot Tstr_idx 'idx 'pv 'val sum) 'x) 0) -- 10
+(at (at (pivot Tstr_idx 'idx 'pv 'val sum) 'y) 1) -- 40
 
-;; STR pivot column → nyi in GROUP BY DAG.
+;; STR pivot column → still nyi (column names cannot come from STR values).
 (set Tstr_pv (table [k pv val] (list ['A 'A 'B 'B] (list "x" "y" "x" "y") [10 20 30 40])))
 (pivot Tstr_pv 'k 'pv 'val sum) !- nyi
 
@@ -148,16 +151,122 @@
 (at (at Pmk_fb 'q) 1) -- 20
 
 ;; ══════════════════════════════════════════════════════════════════
-;; Section 8: pivot with >16 index columns → L87 ("too many index
-;;            columns" error)
+;; Section 8: pivot index-column cap LIFTED (task 6, ght rework complete)
+;;
+;;            Both the honest cut-3 boundary (7 index columns, tblop.c's
+;;            caller-side check) and exec_pivot's own n_keys > 8 gate are
+;;            gone: index_vecs/idx_wide/key_data/key_types/key_attrs/
+;;            key_vecs (pivot.c) and idx_syms/icols/idx_ops/key_ops/g_icols
+;;            (tblop.c) are all exact-size carves now, and
+;;            ght_compute_layout spills to an owned heap block whenever
+;;            n_keys exceeds its GHT_INLINE (8) inline capacity — the same
+;;            mechanism group.c's exec_group_run already relies on.  The
+;;            8- and 17-index cells that used to `!- limit` under the old
+;;            (and, before that, the even-older 16-column) cap now FLIP to
+;;            SUCCESS with hand-derived oracles: one shared 8-/17-tuple
+;;            index key across two rows differing only in (pv, val), so
+;;            exec_pivot groups them into a single index row with two
+;;            distinct pivot-value columns — no row-order ambiguity.
 ;; ══════════════════════════════════════════════════════════════════
 
-;; The pivot limit is 16 index columns.  We test via a list (not vec)
-;; of 17 symbols as the index arg.  Any table with 17+ named columns
-;; would work; the error fires during index-arg parsing before the
-;; table is examined.
-(set T17 (table [a b c pv val] (list [1] [1] [1] ['x] [42])))
-(pivot T17 (list 'a 'b 'c 'a 'b 'c 'a 'b 'c 'a 'b 'c 'a 'b 'c 'a 'b) 'pv 'val sum) !- limit
+;; 8 index columns -> n_keys = 9, one past the historical [8]-slot inline
+;; capacity -> first shape that must exercise the ght layout's heap SPILL
+;; (ght_compute_layout / ly.spill_hdr), not just the inline fast path.
+(set T8 (table [j1 j2 j3 j4 j5 j6 j7 j8 pv val] (list [1 1] [2 2] [3 3] [4 4] [5 5] [6 6] [7 7] [8 8] ['x 'y] [10 20])))
+(set P8 (pivot T8 ['j1 'j2 'j3 'j4 'j5 'j6 'j7 'j8] 'pv 'val sum))
+(count P8) -- 1
+(count (key P8)) -- 10
+(at (at P8 'j1) 0) -- 1
+(at (at P8 'j8) 0) -- 8
+(at (at P8 'x) 0) -- 10
+(at (at P8 'y) 0) -- 20
+
+;; 17 index columns -> n_keys = 18, well past the old 16-column AND 7-column
+;; caps alike (regression pin: both historical limits are gone, not just
+;; moved to a new number).
+(set T17w (table [m1 m2 m3 m4 m5 m6 m7 m8 m9 m10 m11 m12 m13 m14 m15 m16 m17 pv val] (list [1 1] [2 2] [3 3] [4 4] [5 5] [6 6] [7 7] [8 8] [9 9] [10 10] [11 11] [12 12] [13 13] [14 14] [15 15] [16 16] [17 17] ['x 'y] [10 20])))
+(set P17 (pivot T17w ['m1 'm2 'm3 'm4 'm5 'm6 'm7 'm8 'm9 'm10 'm11 'm12 'm13 'm14 'm15 'm16 'm17] 'pv 'val sum))
+(count P17) -- 1
+(count (key P17)) -- 19
+(at (at P17 'm1) 0) -- 1
+(at (at P17 'm17) 0) -- 17
+(at (at P17 'x) 0) -- 10
+(at (at P17 'y) 0) -- 20
+
+;; ══════════════════════════════════════════════════════════════════
+;; Section 8b: pivot at exactly 7 index columns -> SUCCESS (small-index
+;;             boundary companion to the 8-/17-index cells above: n_idx =
+;;             7 -> n_keys = 8 is exactly the historical [8]-slot INLINE
+;;             capacity, not the heap-spill path 8b's neighbors exercise).
+;;             Exercises the DAG fast path (sum is a known agg builtin,
+;;             all columns are non-STR) straight into exec_pivot, i.e.
+;;             the exact pivot.c code this task widened
+;;             (pvt_null_bit / the null-word read / the 1<<k null-mask
+;;             read, all now word-indexed).
+;;
+;;             Oracle derivation: both rows share the same 7-tuple index
+;;             key (1,2,3,4,5,6,7), so exec_pivot groups them into a
+;;             SINGLE index row regardless of internal hash-table
+;;             iteration order (no row-order ambiguity to reason about).
+;;             Row1 pv='x val=10, row2 pv='y val=20 are two distinct
+;;             pivot values -> two output value columns, x=10 and y=20,
+;;             looked up by name (also order-independent).  Output shape:
+;;             7 index cols + 2 pivot value cols = 9 columns, 1 row.
+;; ══════════════════════════════════════════════════════════════════
+
+(set T7 (table [k1 k2 k3 k4 k5 k6 k7 pv val] (list [1 1] [2 2] [3 3] [4 4] [5 5] [6 6] [7 7] ['x 'y] [10 20])))
+(set P7 (pivot T7 ['k1 'k2 'k3 'k4 'k5 'k6 'k7] 'pv 'val sum))
+(count P7) -- 1
+(count (key P7)) -- 9
+(at (at P7 'k1) 0) -- 1
+(at (at P7 'k7) 0) -- 7
+(at (at P7 'x) 0) -- 10
+(at (at P7 'y) 0) -- 20
+
+;; ══════════════════════════════════════════════════════════════════
+;; Section 8c: 65-index pivot — the REQUIRED null-word conflation detector
+;;             (Task-3 review carryover, binding for this task).  Before
+;;             this task, pivot's ix-dedupe entry stored/compared/hashed
+;;             ONE int64 null word (word 0, bits 0-63) no matter how many
+;;             keys existed — pvt_null_bit/idx_null_bits were UB past
+;;             n_idx>=64 (1<<n_idx with n_idx>=64) and the entry's null
+;;             region could never see bit 64+ at all.  65 index columns
+;;             (k00..k64) -> n_keys = 66 -> ceil(66/64) = 2 null-mask
+;;             words: word 0 covers index keys 0-63, word 1 covers index
+;;             key 64 (bit 64) and the pivot key itself (bit 65).
+;;
+;;             Fixture: k00 = NULL for BOTH rows (so word 0's null bit
+;;             pattern is IDENTICAL between the two rows: bit 0 set,
+;;             bits 1-63 clear in both, since k01..k63 = 0 for both).
+;;             k64 differs: row A = 0 (not null), row B = 0N (null) — the
+;;             ONLY difference lives in word 1.  Both rows share pv='x
+;;             (not null, so neither is dropped by the pivot-null check)
+;;             with distinct val 10/20.  A word-0-only implementation
+;;             would see identical dedupe keys for A and B (word 0 ties,
+;;             word 1 never compared) and wrongly conflate them into ONE
+;;             index row; the fixed, word-indexed implementation must
+;;             keep them as TWO distinct index rows.
+;; ══════════════════════════════════════════════════════════════════
+
+(set T65 (table [k00 k01 k02 k03 k04 k05 k06 k07 k08 k09 k10 k11 k12 k13 k14 k15 k16 k17 k18 k19 k20 k21 k22 k23 k24 k25 k26 k27 k28 k29 k30 k31 k32 k33 k34 k35 k36 k37 k38 k39 k40 k41 k42 k43 k44 k45 k46 k47 k48 k49 k50 k51 k52 k53 k54 k55 k56 k57 k58 k59 k60 k61 k62 k63 k64 pv val] (concat (list [0N 0N]) (concat (take (list [0 0]) 63) (list [0 0N] ['x 'x] [10 20])))))
+(set P65 (pivot T65 ['k00 'k01 'k02 'k03 'k04 'k05 'k06 'k07 'k08 'k09 'k10 'k11 'k12 'k13 'k14 'k15 'k16 'k17 'k18 'k19 'k20 'k21 'k22 'k23 'k24 'k25 'k26 'k27 'k28 'k29 'k30 'k31 'k32 'k33 'k34 'k35 'k36 'k37 'k38 'k39 'k40 'k41 'k42 'k43 'k44 'k45 'k46 'k47 'k48 'k49 'k50 'k51 'k52 'k53 'k54 'k55 'k56 'k57 'k58 'k59 'k60 'k61 'k62 'k63 'k64] 'pv 'val sum))
+
+;; The conflation detector: count==2 proves A and B stayed DISTINCT index
+;; rows (a word-0-only dedupe would collapse both into one, count==1).
+(count P65) -- 2
+(count (key P65)) -- 66
+;; Both source rows contribute (no data loss / silent drop): 10+20 = 30,
+;; order-independent (single pivot value 'x', so this is a straight sum
+;; over the two output rows).
+(sum (at P65 'x)) -- 30
+;; k00 reads back NULL on both output rows (word-0 null bit correctly
+;; propagated to the emitted index column, order-independent).
+(sum (map nil? (at P65 'k00))) -- 2
+;; k64 reads back NULL on EXACTLY ONE output row — the word-1 null bit
+;; correctly isolated to the row that carried it (order-independent: if
+;; the emit read were still word-0-only, k64 would never read null at
+;; all, giving 0 here instead of 1).
+(sum (map nil? (at P65 'k64))) -- 1
 
 ;; ══════════════════════════════════════════════════════════════════
 ;; Section 9: Larger pivot to exercise HT probe walks past non-matching
@@ -441,6 +550,56 @@ Lset -- (list 'a 'b 'Z 'd)
 (count Pf64v) -- 2
 (at (at Pf64v 'x) 0) -- 1.5
 (at (at Pf64v 'y) 1) -- 4.5
+
+;; ══════════════════════════════════════════════════════════════════
+;; Section 29: pivot — USER-LENGTH index arg no longer a stack VLA
+;;             (rayforce-audit finding, unbounded-slots cut 4).  n_idx =
+;;             ray_len(index_arg) is a RUNTIME value the caller controls
+;;             directly (index_arg is just a vector of column-name syms —
+;;             nothing requires it to be short, or even to name distinct
+;;             columns).  Before this fix, tblop.c's idx_syms/icols/
+;;             idx_ops/key_ops/g_icols and pivot.c's idx_vecs/idx_wide/
+;;             key_data/key_types/key_attrs/key_vecs were STACK VLAs sized
+;;             by n_idx.  Confirmed (pre-fix, via git stash, default 8 MiB
+;;             ulimit -s): 8200 copies of the valid column sym 'k SIGSEGV'd
+;;             with the fault inside ray_pivot_op's `index_cols[i]->id`
+;;             read (graph.c) — idx_ops, the STACK VLA holding those
+;;             pointers, corrupted by the stack-clash — instead of a clean
+;;             error.  All eleven arrays across both functions are heap
+;;             scratch-carves now, so this either runs or fails cleanly —
+;;             never crashes.
+;;
+;;             A SECOND, independent hazard surfaced while pinning this:
+;;             ray_scan() grows g->nodes (realloc) as scan nodes are
+;;             appended, so a ray_op_t* returned by an early ray_scan call
+;;             in tblop.c's idx_ops/key_ops fill loops went stale once a
+;;             later call in the same loop crossed a capacity boundary
+;;             (GRAPH_INIT_CAP=4096) — unreachable pre-cut-4 (n_idx capped
+;;             well under 4096), reachable now.  Fixed alongside the VLA
+;;             carve: both loops collect each scan's stable ->id and
+;;             resolve id -> pointer in one pass after the LAST scan call,
+;;             per op_node's own contract ("never store a node pointer
+;;             across a node allocation; re-resolve from the id instead").
+;;
+;;             Oracle: 8200 index columns (all the same 'k, repeated —
+;;             pivot does not require distinct index-column names) plus
+;;             the pivot column gives n_keys = 8201, past
+;;             ght_compute_layout's uint16 byte-offset stride budget
+;;             (~8192 plain 8-byte keys before the offset accumulator
+;;             would overflow UINT16_MAX) — so this must fail with the
+;;             SAME clean "limit" domain error ght_compute_layout already
+;;             returns for any over-budget key set, not crash and not
+;;             silently truncate.  (A much larger n_idx, e.g. 200000, also
+;;             fails cleanly but is excluded here on runtime grounds: a
+;;             separate, pre-existing O(n^2) exec_pivot cost — repeated
+;;             find_ext() linear scans over the DAG's ext-node list, one
+;;             per index column — makes it minutes slow rather than a
+;;             fast, deterministic test cell; that algorithmic-complexity
+;;             issue is out of scope for this memory-safety fix.) ──
+;; ══════════════════════════════════════════════════════════════════
+
+(set Tbig29 (table [k p v] (list [1 2] ['x 'y] [10 20])))
+(pivot Tbig29 (take ['k] 8200) 'p 'v sum) !- limit
 
 ;; ══════════════════════════════════════════════════════════════════
 ;; Unreachable branches documentation (OOM guards, internal-only):

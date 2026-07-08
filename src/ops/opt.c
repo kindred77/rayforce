@@ -148,21 +148,21 @@ static void pass_type_inference(ray_graph_t* g, ray_op_t* root) {
         if (ext) {
             switch (n->opcode) {
                 case OP_GROUP:
-                    for (uint8_t k = 0; k < ext->n_keys; k++)
+                    for (uint32_t k = 0; k < ext->n_keys; k++)
                         if (op_node(g, ext->keys[k]) && !visited[ext->keys[k]] && sp < (int)stack_cap)
                             stack[sp++] = ext->keys[k];
-                    for (uint8_t a = 0; a < ext->n_aggs; a++)
+                    for (uint32_t a = 0; a < ext->n_aggs; a++)
                         if (op_node(g, ext->agg_ins[a]) && !visited[ext->agg_ins[a]] && sp < (int)stack_cap)
                             stack[sp++] = ext->agg_ins[a];
                     break;
                 case OP_SORT:
                 case OP_SELECT:
-                    for (uint8_t k = 0; k < ext->sort.n_cols; k++)
+                    for (uint32_t k = 0; k < ext->sort.n_cols; k++)
                         if (op_node(g, ext->sort.columns[k]) && !visited[ext->sort.columns[k]] && sp < (int)stack_cap)
                             stack[sp++] = ext->sort.columns[k];
                     break;
                 case OP_JOIN:
-                    for (uint8_t k = 0; k < ext->join.n_join_keys; k++) {
+                    for (uint32_t k = 0; k < ext->join.n_join_keys; k++) {
                         if (op_node(g, ext->join.left_keys[k]) && !visited[ext->join.left_keys[k]] && sp < (int)stack_cap)
                             stack[sp++] = ext->join.left_keys[k];
                         if (ext->join.right_keys && op_node(g, ext->join.right_keys[k]) &&
@@ -175,7 +175,7 @@ static void pass_type_inference(ray_graph_t* g, ray_op_t* root) {
                     if (wj_ext) {
                         if (op_node(g, wj_ext->asof.time_key) && !visited[wj_ext->asof.time_key] && sp < (int)stack_cap)
                             stack[sp++] = wj_ext->asof.time_key;
-                        for (uint8_t k = 0; k < wj_ext->asof.n_eq_keys; k++) {
+                        for (uint32_t k = 0; k < wj_ext->asof.n_eq_keys; k++) {
                             if (op_node(g, wj_ext->asof.eq_keys[k]) && !visited[wj_ext->asof.eq_keys[k]] && sp < (int)stack_cap)
                                 stack[sp++] = wj_ext->asof.eq_keys[k];
                         }
@@ -183,13 +183,13 @@ static void pass_type_inference(ray_graph_t* g, ray_op_t* root) {
                     break;
                 }
                 case OP_WINDOW:
-                    for (uint8_t k = 0; k < ext->window.n_part_keys; k++)
+                    for (uint32_t k = 0; k < ext->window.n_part_keys; k++)
                         if (op_node(g, ext->window.part_keys[k]) && !visited[ext->window.part_keys[k]] && sp < (int)stack_cap)
                             stack[sp++] = ext->window.part_keys[k];
-                    for (uint8_t k = 0; k < ext->window.n_order_keys; k++)
+                    for (uint32_t k = 0; k < ext->window.n_order_keys; k++)
                         if (op_node(g, ext->window.order_keys[k]) && !visited[ext->window.order_keys[k]] && sp < (int)stack_cap)
                             stack[sp++] = ext->window.order_keys[k];
-                    for (uint8_t f = 0; f < ext->window.n_funcs; f++)
+                    for (uint32_t f = 0; f < ext->window.n_funcs; f++)
                         if (op_node(g, ext->window.func_inputs[f]) && !visited[ext->window.func_inputs[f]] && sp < (int)stack_cap)
                             stack[sp++] = ext->window.func_inputs[f];
                     break;
@@ -670,21 +670,21 @@ static void pass_constant_fold(ray_graph_t* g, ray_op_t* root) {
         if (ext) {
             switch (n->opcode) {
                 case OP_GROUP:
-                    for (uint8_t k = 0; k < ext->n_keys; k++)
+                    for (uint32_t k = 0; k < ext->n_keys; k++)
                         if (op_node(g, ext->keys[k]) && !visited[ext->keys[k]] && sp < (int)stack_cap)
                             stack[sp++] = ext->keys[k];
-                    for (uint8_t a = 0; a < ext->n_aggs; a++)
+                    for (uint32_t a = 0; a < ext->n_aggs; a++)
                         if (op_node(g, ext->agg_ins[a]) && !visited[ext->agg_ins[a]] && sp < (int)stack_cap)
                             stack[sp++] = ext->agg_ins[a];
                     break;
                 case OP_SORT:
                 case OP_SELECT:
-                    for (uint8_t k = 0; k < ext->sort.n_cols; k++)
+                    for (uint32_t k = 0; k < ext->sort.n_cols; k++)
                         if (op_node(g, ext->sort.columns[k]) && !visited[ext->sort.columns[k]] && sp < (int)stack_cap)
                             stack[sp++] = ext->sort.columns[k];
                     break;
                 case OP_JOIN:
-                    for (uint8_t k = 0; k < ext->join.n_join_keys; k++) {
+                    for (uint32_t k = 0; k < ext->join.n_join_keys; k++) {
                         if (op_node(g, ext->join.left_keys[k]) && !visited[ext->join.left_keys[k]] && sp < (int)stack_cap)
                             stack[sp++] = ext->join.left_keys[k];
                         if (ext->join.right_keys && op_node(g, ext->join.right_keys[k]) &&
@@ -697,7 +697,7 @@ static void pass_constant_fold(ray_graph_t* g, ray_op_t* root) {
                     if (wj_ext) {
                         if (op_node(g, wj_ext->asof.time_key) && !visited[wj_ext->asof.time_key] && sp < (int)stack_cap)
                             stack[sp++] = wj_ext->asof.time_key;
-                        for (uint8_t k = 0; k < wj_ext->asof.n_eq_keys; k++) {
+                        for (uint32_t k = 0; k < wj_ext->asof.n_eq_keys; k++) {
                             if (op_node(g, wj_ext->asof.eq_keys[k]) && !visited[wj_ext->asof.eq_keys[k]] && sp < (int)stack_cap)
                                 stack[sp++] = wj_ext->asof.eq_keys[k];
                         }
@@ -705,13 +705,13 @@ static void pass_constant_fold(ray_graph_t* g, ray_op_t* root) {
                     break;
                 }
                 case OP_WINDOW:
-                    for (uint8_t k = 0; k < ext->window.n_part_keys; k++)
+                    for (uint32_t k = 0; k < ext->window.n_part_keys; k++)
                         if (op_node(g, ext->window.part_keys[k]) && !visited[ext->window.part_keys[k]] && sp < (int)stack_cap)
                             stack[sp++] = ext->window.part_keys[k];
-                    for (uint8_t k = 0; k < ext->window.n_order_keys; k++)
+                    for (uint32_t k = 0; k < ext->window.n_order_keys; k++)
                         if (op_node(g, ext->window.order_keys[k]) && !visited[ext->window.order_keys[k]] && sp < (int)stack_cap)
                             stack[sp++] = ext->window.order_keys[k];
-                    for (uint8_t f = 0; f < ext->window.n_funcs; f++)
+                    for (uint32_t f = 0; f < ext->window.n_funcs; f++)
                         if (op_node(g, ext->window.func_inputs[f]) && !visited[ext->window.func_inputs[f]] && sp < (int)stack_cap)
                             stack[sp++] = ext->window.func_inputs[f];
                     break;
@@ -814,25 +814,25 @@ static void mark_live(ray_graph_t* g, ray_op_t* root, bool* live) {
             if (ext) {
                 switch (n->opcode) {
                     case OP_GROUP:
-                        for (uint8_t k = 0; k < ext->n_keys; k++) {
+                        for (uint32_t k = 0; k < ext->n_keys; k++) {
                             if (op_node(g, ext->keys[k]) && !live[ext->keys[k]] && sp < (int)stack_cap)
                                 stack[sp++] = ext->keys[k];
                         }
-                        for (uint8_t a = 0; a < ext->n_aggs; a++) {
+                        for (uint32_t a = 0; a < ext->n_aggs; a++) {
                             if (op_node(g, ext->agg_ins[a]) && !live[ext->agg_ins[a]] && sp < (int)stack_cap)
                                 stack[sp++] = ext->agg_ins[a];
                         }
                         break;
                     case OP_SORT:
                     case OP_SELECT:
-                        for (uint8_t k = 0; k < ext->sort.n_cols; k++) {
+                        for (uint32_t k = 0; k < ext->sort.n_cols; k++) {
                             if (op_node(g, ext->sort.columns[k]) && !live[ext->sort.columns[k]] && sp < (int)stack_cap)
                                 stack[sp++] = ext->sort.columns[k];
                         }
                         break;
                     case OP_JOIN:
                     case OP_ANTIJOIN:
-                        for (uint8_t k = 0; k < ext->join.n_join_keys; k++) {
+                        for (uint32_t k = 0; k < ext->join.n_join_keys; k++) {
                             if (op_node(g, ext->join.left_keys[k]) && !live[ext->join.left_keys[k]] && sp < (int)stack_cap)
                                 stack[sp++] = ext->join.left_keys[k];
                             if (ext->join.right_keys && op_node(g, ext->join.right_keys[k]) &&
@@ -841,7 +841,7 @@ static void mark_live(ray_graph_t* g, ray_op_t* root, bool* live) {
                         }
                         break;
                     case OP_PIVOT:
-                        for (uint8_t k = 0; k < ext->pivot.n_index; k++) {
+                        for (uint32_t k = 0; k < ext->pivot.n_index; k++) {
                             if (op_node(g, ext->pivot.index_cols[k]) && !live[ext->pivot.index_cols[k]] && sp < (int)stack_cap)
                                 stack[sp++] = ext->pivot.index_cols[k];
                         }
@@ -855,7 +855,7 @@ static void mark_live(ray_graph_t* g, ray_op_t* root, bool* live) {
                         if (wj_ext) {
                             if (op_node(g, wj_ext->asof.time_key) && !live[wj_ext->asof.time_key] && sp < (int)stack_cap)
                                 stack[sp++] = wj_ext->asof.time_key;
-                            for (uint8_t k = 0; k < wj_ext->asof.n_eq_keys; k++) {
+                            for (uint32_t k = 0; k < wj_ext->asof.n_eq_keys; k++) {
                                 if (op_node(g, wj_ext->asof.eq_keys[k]) && !live[wj_ext->asof.eq_keys[k]] && sp < (int)stack_cap)
                                     stack[sp++] = wj_ext->asof.eq_keys[k];
                             }
@@ -863,15 +863,15 @@ static void mark_live(ray_graph_t* g, ray_op_t* root, bool* live) {
                         break;
                     }
                     case OP_WINDOW:
-                        for (uint8_t k = 0; k < ext->window.n_part_keys; k++) {
+                        for (uint32_t k = 0; k < ext->window.n_part_keys; k++) {
                             if (op_node(g, ext->window.part_keys[k]) && !live[ext->window.part_keys[k]] && sp < (int)stack_cap)
                                 stack[sp++] = ext->window.part_keys[k];
                         }
-                        for (uint8_t k = 0; k < ext->window.n_order_keys; k++) {
+                        for (uint32_t k = 0; k < ext->window.n_order_keys; k++) {
                             if (op_node(g, ext->window.order_keys[k]) && !live[ext->window.order_keys[k]] && sp < (int)stack_cap)
                                 stack[sp++] = ext->window.order_keys[k];
                         }
-                        for (uint8_t f = 0; f < ext->window.n_funcs; f++) {
+                        for (uint32_t f = 0; f < ext->window.n_funcs; f++) {
                             if (op_node(g, ext->window.func_inputs[f]) && !live[ext->window.func_inputs[f]] && sp < (int)stack_cap)
                                 stack[sp++] = ext->window.func_inputs[f];
                         }
@@ -1296,7 +1296,7 @@ static ray_op_t* pass_predicate_pushdown(ray_graph_t* g, ray_op_t* root) {
                 {
                     int64_t src_sym = ray_sym_intern("_src", 4);
                     bool is_fact = false;
-                    for (uint8_t kk = 0; kk < gext->n_keys; kk++) {
+                    for (uint32_t kk = 0; kk < gext->n_keys; kk++) {
                         ray_op_ext_t* ke = op_node(g, gext->keys[kk])
                             ? find_ext(g, gext->keys[kk]) : NULL;
                         if (ke && ke->base.opcode == OP_SCAN &&
@@ -1312,7 +1312,7 @@ static ray_op_t* pass_predicate_pushdown(ray_graph_t* g, ray_op_t* root) {
                     ray_op_ext_t* sext = find_ext(g, scan_ids[s]);
                     if (!sext) { keys_only = false; break; }
                     bool matched = false;
-                    for (uint8_t kk = 0; kk < gext->n_keys; kk++) {
+                    for (uint32_t kk = 0; kk < gext->n_keys; kk++) {
                         ray_op_t* kop = op_node(g, gext->keys[kk]);
                         if (!kop || kop->opcode != OP_SCAN) continue;
                         ray_op_ext_t* kext = find_ext(g, gext->keys[kk]);
@@ -1429,6 +1429,72 @@ static int filter_cost(ray_graph_t* g, ray_op_t* pred) {
     }
 
     return cost;
+}
+
+/* Static selectivity rank for a filter predicate: lower = more selective =
+ * should run earlier (inner).  filter_cost above orders by per-row eval cost
+ * only, which runs a cheap but non-selective predicate (e.g. a BOOL/U8 flag
+ * `== 0`, ~half the rows) before a super-selective one (e.g. an I64 hash
+ * `== K`, a handful of rows), bloating every later filter's input and gather.
+ * This estimates the pass-fraction from the predicate's static shape so the
+ * reorder runs the most-selective predicate first.  Direction-only, not a
+ * calibrated fraction (data-backed estimation is a separate change). */
+/* Only a high-cardinality equality is a CONFIDENT static selectivity signal.
+ * Range / != / LIKE / narrow-flag-equality have data-dependent selectivity we
+ * cannot estimate statically, so they map to SEL_NEUTRAL and the composite key
+ * defers their ordering to filter_cost (which already runs expensive predicates
+ * like LIKE last). An earlier table that ranked LIKE/!= as distinct buckets
+ * regressed LIKE-heavy queries by running the substring scan first. */
+enum {
+    SEL_EQ_WIDE = 0,   /* == / in on I64/F64/STR: inherently large value space */
+    SEL_EQ_MED  = 2,   /* == / in on I32/DATE/TIME: usually selective */
+    SEL_NEUTRAL = 5,   /* everything else: unknown/data-dependent — defer to filter_cost */
+};
+
+static int filter_selectivity_rank(ray_graph_t* g, ray_op_t* pred) {
+    if (!pred) return SEL_NEUTRAL;
+
+    /* Find the column operand (the non-const side) and whether a constant is
+     * present at all.  Without a constant there is nothing to estimate. */
+    bool has_const = false;
+    int8_t col_type = pred->out_type;
+    for (int i = 0; i < pred->arity && i < 2; i++) {
+        ray_op_t* in = op_child(g, pred, i);
+        if (!in) continue;
+        if (in->opcode == OP_CONST) has_const = true;
+        else col_type = in->out_type;
+    }
+    if (!has_const) return SEL_NEUTRAL;
+
+    /* SYM is deliberately excluded from `wide`: it is dictionary-encoded, so
+     * its cardinality is the domain size (a low-card categorical may store as
+     * W8, a high-card one as W64).  That width/cardinality lives on the bound
+     * column, which this pass cannot see — only the logical RAY_SYM type — so
+     * assuming SYM equality is selective is unjustified.  Treat it as neutral
+     * and let filter_cost order it (consistent with the conservative rule:
+     * reorder only on a CONFIDENT static signal). */
+    bool wide   = (col_type == RAY_I64 || col_type == RAY_F64 ||
+                   col_type == RAY_STR);
+    bool narrow = (col_type == RAY_BOOL || col_type == RAY_U8 ||
+                   col_type == RAY_I16);
+
+    switch (pred->opcode) {
+        case OP_EQ:
+        case OP_IN:
+            if (wide)   return SEL_EQ_WIDE;     /* I64/F64/STR */
+            if (narrow) return SEL_NEUTRAL;     /* BOOL/U8/I16 flags: non-selective */
+            if (col_type == RAY_SYM) return SEL_NEUTRAL;  /* card unknown statically */
+            return SEL_EQ_MED;                  /* I32/DATE/TIME and other mid types */
+        default:
+            return SEL_NEUTRAL;                 /* range, !=, like/ilike, col-col, unknown */
+    }
+}
+
+/* Composite reorder key: selectivity dominates, filter_cost breaks ties.
+ * K (100) exceeds any filter_cost (max ~11), so equal-selectivity predicates
+ * fall back to the prior cheap-first ordering. */
+static int filter_rank_key(ray_graph_t* g, ray_op_t* pred) {
+    return filter_selectivity_rank(g, pred) * 100 + filter_cost(g, pred);
 }
 
 /* Split FILTER(AND(a, b), input) into FILTER(a, FILTER(b, input)).
@@ -1584,14 +1650,18 @@ static ray_op_t* pass_filter_reorder(ray_graph_t* g, ray_op_t* root) {
         }
         if (has_shared) continue;
 
-        /* Score each filter's predicate */
+        /* Score each filter's predicate: selectivity-primary, eval-cost tiebreak.
+         * The insertion sort below is unchanged — it sorts these keys
+         * descending, so least-selective lands outer (runs last) and
+         * most-selective lands inner (runs first). */
         int costs[64];
         for (int c = 0; c < chain_len; c++)
-            costs[c] = filter_cost(g, op_child(g, chain[c], 1));
+            costs[c] = filter_rank_key(g, op_child(g, chain[c], 1));
 
-        /* Insertion sort predicates by cost descending (stable: preserves
-         * original order for equal costs). Expensive predicates go to
-         * chain[0] (outer, runs last), cheap go to chain[N-1] (inner,
+        /* Insertion sort predicates by rank key descending (stable: preserves
+         * original order for equal keys). Highest key — least selective, or
+         * equally selective but costlier — goes to chain[0] (outer, runs
+         * last); lowest key — most selective — goes to chain[N-1] (inner,
          * runs first). We swap predicates, not filter nodes. */
         for (int c = 1; c < chain_len; c++) {
             uint32_t pred_id = chain[c]->in_id[1];
@@ -1652,12 +1722,12 @@ static bool pass_projection_pushdown(ray_graph_t* g, ray_op_t* root) {
         if (ext) {
             switch (n->opcode) {
                 case OP_GROUP:
-                    for (uint8_t k = 0; k < ext->n_keys; k++)
+                    for (uint32_t k = 0; k < ext->n_keys; k++)
                         if (op_node(g, ext->keys[k]) && !live[ext->keys[k]]) {
                             live[ext->keys[k]] = true;
                             if (qt < (int)nc) q[qt++] = ext->keys[k];
                         }
-                    for (uint8_t a = 0; a < ext->n_aggs; a++)
+                    for (uint32_t a = 0; a < ext->n_aggs; a++)
                         if (op_node(g, ext->agg_ins[a]) && !live[ext->agg_ins[a]]) {
                             live[ext->agg_ins[a]] = true;
                             if (qt < (int)nc) q[qt++] = ext->agg_ins[a];
@@ -1665,14 +1735,14 @@ static bool pass_projection_pushdown(ray_graph_t* g, ray_op_t* root) {
                     break;
                 case OP_SORT:
                 case OP_SELECT:
-                    for (uint8_t k = 0; k < ext->sort.n_cols; k++)
+                    for (uint32_t k = 0; k < ext->sort.n_cols; k++)
                         if (op_node(g, ext->sort.columns[k]) && !live[ext->sort.columns[k]]) {
                             live[ext->sort.columns[k]] = true;
                             if (qt < (int)nc) q[qt++] = ext->sort.columns[k];
                         }
                     break;
                 case OP_JOIN:
-                    for (uint8_t k = 0; k < ext->join.n_join_keys; k++) {
+                    for (uint32_t k = 0; k < ext->join.n_join_keys; k++) {
                         if (op_node(g, ext->join.left_keys[k]) && !live[ext->join.left_keys[k]]) {
                             live[ext->join.left_keys[k]] = true;
                             if (qt < (int)nc) q[qt++] = ext->join.left_keys[k];
@@ -1691,7 +1761,7 @@ static bool pass_projection_pushdown(ray_graph_t* g, ray_op_t* root) {
                             live[wj_ext->asof.time_key] = true;
                             if (qt < (int)nc) q[qt++] = wj_ext->asof.time_key;
                         }
-                        for (uint8_t k = 0; k < wj_ext->asof.n_eq_keys; k++) {
+                        for (uint32_t k = 0; k < wj_ext->asof.n_eq_keys; k++) {
                             if (op_node(g, wj_ext->asof.eq_keys[k]) && !live[wj_ext->asof.eq_keys[k]]) {
                                 live[wj_ext->asof.eq_keys[k]] = true;
                                 if (qt < (int)nc) q[qt++] = wj_ext->asof.eq_keys[k];
@@ -1701,17 +1771,17 @@ static bool pass_projection_pushdown(ray_graph_t* g, ray_op_t* root) {
                     break;
                 }
                 case OP_WINDOW:
-                    for (uint8_t k = 0; k < ext->window.n_part_keys; k++)
+                    for (uint32_t k = 0; k < ext->window.n_part_keys; k++)
                         if (op_node(g, ext->window.part_keys[k]) && !live[ext->window.part_keys[k]]) {
                             live[ext->window.part_keys[k]] = true;
                             if (qt < (int)nc) q[qt++] = ext->window.part_keys[k];
                         }
-                    for (uint8_t k = 0; k < ext->window.n_order_keys; k++)
+                    for (uint32_t k = 0; k < ext->window.n_order_keys; k++)
                         if (op_node(g, ext->window.order_keys[k]) && !live[ext->window.order_keys[k]]) {
                             live[ext->window.order_keys[k]] = true;
                             if (qt < (int)nc) q[qt++] = ext->window.order_keys[k];
                         }
-                    for (uint8_t f = 0; f < ext->window.n_funcs; f++)
+                    for (uint32_t f = 0; f < ext->window.n_funcs; f++)
                         if (op_node(g, ext->window.func_inputs[f]) && !live[ext->window.func_inputs[f]]) {
                             live[ext->window.func_inputs[f]] = true;
                             if (qt < (int)nc) q[qt++] = ext->window.func_inputs[f];
@@ -2050,7 +2120,7 @@ ray_op_t* ray_optimize(ray_graph_t* g, ray_op_t* root) {
 
     /* Pass 4: SIP (graph-aware sideways information passing) */
     sip_pass(g, root);
-    ray_profile_tick("SIP");
+    ray_profile_tick("sip");
 
     /* Pass 5: Factorized detection (OP_EXPAND → OP_GROUP optimization) */
     factorize_pass(g, root);
@@ -2077,7 +2147,7 @@ ray_op_t* ray_optimize(ray_graph_t* g, ray_op_t* root) {
 
     /* Pass 10: DCE */
     pass_dce(g, root);
-    ray_profile_tick("DCE");
+    ray_profile_tick("dce");
 
     ray_profile_span_end("optimize");
 

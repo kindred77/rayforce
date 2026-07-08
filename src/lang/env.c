@@ -23,6 +23,7 @@
 
 #include "lang/env.h"
 #include "core/runtime.h"
+#include "core/platform.h"   /* RAY_CPU_RELAX */
 #include "table/sym.h"
 #include "table/dict.h"
 #include "ops/temporal.h"
@@ -79,9 +80,7 @@ ray_t* ray_fn_vary(const char* name, uint8_t fn_attrs, ray_vary_fn fn) {
 static _Atomic(int) g_env_lock = 0;
 static inline void env_lock(void) {
     while (atomic_exchange_explicit(&g_env_lock, 1, memory_order_acquire)) {
-#if defined(__x86_64__) || defined(__i386__)
-        __builtin_ia32_pause();
-#endif
+        RAY_CPU_RELAX();
     }
 }
 static inline void env_unlock(void) {

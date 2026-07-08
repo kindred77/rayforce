@@ -102,7 +102,7 @@ See [Vector Search & HNSW](../graph/vector-search.md) for the full reference, in
 
 A *linked column* stores row-id references into another table; dereferencing follows the link and pulls the target row at query time. Useful when you have a large fact column whose values are dictionary-style references into a smaller dimension table.
 
-The full surface and worked examples live on the [Linked Columns](../queries/links.md) page. From an indexing perspective, the link *is* the cross-table index: there is no separate structure to build, query, or invalidate. With parted facts, the link points at a non-parted dim — per-segment `HAS_LINK` is preserved through `ray_read_parted` and segment streaming, so deref works inside streamed queries without extra plumbing. Parted-target dims are rejected at attach time; see [Linked Columns: Parted-Table Interaction](../queries/links.md#parted).
+The full surface and worked examples live on the [Linked Columns](../queries/links.md) page. From an indexing perspective, the link *is* the cross-table index: there is no separate structure to build, query, or invalidate. With parted facts, the link points at a non-parted dim — per-segment `HAS_LINK` is preserved through `ray_read_parted` and segment streaming, so deref works inside streamed queries without extra plumbing. Parted-target dims are rejected at attach time; see [Linked Columns: Parted-Table Interaction](../queries/links.md#parted-table-interaction).
 
 ## 6. Workflow: partition pruning on parted tables { #workflow-parted }
 
@@ -122,7 +122,7 @@ Five things that bite first-time users.
 - **Slices can't carry an index.** Internally, slicing a column produces a fresh slice header without `RAY_ATTR_HAS_INDEX`; `(.idx.*)` attach refuses to operate on a slice ("cannot index a slice; materialize first"). The Rayfall surface for slices today is C-API-only — this is mostly relevant when calling Rayforce from your own C code.
 - **One slot per column, one kind at a time.** Calling `.idx.hash` on a column that already has `.idx.zone` drops the zone first. Multiple coexisting kinds per column is a v2 feature.
 - **No persistence for `.idx.*`.** The on-disk column format never carries an index; `ray_col_save` serializes a clean column. Rebuild after a load. HNSW handles can be persisted explicitly with `hnsw-save` / `hnsw-load`.
-- **Numeric only (v1).** Internally `.idx.*` accept boolean and numeric element types through `RAY_TIMESTAMP`. From Rayfall, integer / float / date / time / timestamp vectors are the practical reach. Symbol or string columns are explicitly rejected with `error: nyi: only numeric vectors supported in v1` — their nullmap-union layout collides with the `sym_dict` / `str_pool` pointers and the displacement sweep is pending.
+- **Type support.** `.idx.hash` accepts numeric/boolean columns **and `RAY_SYM`** (it indexes the symbol domain ids). `.idx.zone`, `.idx.sort`, and `.idx.bloom` are numeric/boolean only. `RAY_STR` is deferred for all kinds, and `RAY_SYM` is deferred for the non-hash kinds — an unsupported column is rejected with `error: nyi: <kind>: only numeric/sym vectors supported (got type N)`, because the string/sym pool pointers collide with the index aux bytes and the displacement sweep is pending.
 
 ## 8. Performance characteristics { #perf }
 

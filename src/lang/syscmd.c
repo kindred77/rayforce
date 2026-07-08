@@ -125,6 +125,11 @@ static ray_t* h_timeit(ray_t* arg, ray_syscmd_ctx_t* ctx) {
  * the listener id on success. */
 static ray_t* h_listen(ray_t* arg, ray_syscmd_ctx_t* ctx) {
     (void)ctx;
+#ifdef RAY_FUZZING
+    /* No network listeners under fuzzing. */
+    (void)arg;
+    return ray_error("restricted", "listen disabled under fuzzing");
+#endif
     int err = 0;
     int64_t port = arg_as_i64(arg, &err);
     if (err) return ray_error("type", "listen expects a port number");
@@ -218,9 +223,13 @@ static ray_t* h_help(ray_t* arg, ray_syscmd_ctx_t* ctx) {
 /* q/quit — REPL-only graceful exit. */
 static ray_t* h_quit(ray_t* arg, ray_syscmd_ctx_t* ctx) {
     (void)arg; (void)ctx;
+#ifdef RAY_FUZZING
+    return ray_error("restricted", "quit disabled under fuzzing");
+#else
     /* Defer to the standard exit path so atexit handlers run. */
     exit(0);
     return NULL;
+#endif
 }
 
 /* ══════════════════════════════════════════
@@ -287,6 +296,10 @@ ray_t* ray_syscmd_dispatch(const char* str, size_t len,
 
     const ray_syscmd_t* e = ray_syscmd_lookup(str + name_start, name_len);
     if (!e) {
+#ifdef RAY_FUZZING
+        /* No shell escape under fuzzing. */
+        return ray_error("restricted", "shell disabled under fuzzing");
+#endif
         if (!allow_shell)
             return ray_error("domain", "unknown command");
         /* Shell fallback — pass the entire original string verbatim

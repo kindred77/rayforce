@@ -267,7 +267,6 @@ ray_t* exec_filter(ray_graph_t* g, ray_op_t* op, ray_t* input, ray_t* pred) {
     /* Pre-allocate output columns */
     ray_t* new_cols[ncols];
     int64_t col_names[ncols];
-    int64_t valid_ncols = 0;
 
     bool has_parted_cols = false;
     for (int64_t c = 0; c < ncols; c++) {
@@ -277,8 +276,7 @@ ray_t* exec_filter(ray_graph_t* g, ray_op_t* op, ray_t* input, ray_t* pred) {
         if (col->type == RAY_MAPCOMMON) {
             /* Materialize MAPCOMMON through filter predicate */
             new_cols[c] = materialize_mapcommon_filter(col, pred, pass_count);
-            if (new_cols[c] && !RAY_IS_ERR(new_cols[c])) valid_ncols++;
-            else new_cols[c] = NULL;
+            if (!new_cols[c] || RAY_IS_ERR(new_cols[c])) new_cols[c] = NULL;
             continue;
         }
         int8_t out_type = RAY_IS_PARTED(col->type)
@@ -298,7 +296,6 @@ ray_t* exec_filter(ray_graph_t* g, ray_op_t* op, ray_t* input, ray_t* pred) {
         if (!nc || RAY_IS_ERR(nc)) { new_cols[c] = NULL; continue; }
         nc->len = pass_count;
         new_cols[c] = nc;
-        valid_ncols++;
     }
 
     if (has_parted_cols) {
@@ -326,8 +323,8 @@ ray_t* exec_filter(ray_graph_t* g, ray_op_t* op, ray_t* input, ray_t* pred) {
                     memcpy(dst + i * esz, src + match_idx[i] * esz, esz);
             }
         }
-    } else if (pool && valid_ncols > 0 && valid_ncols <= MGATHER_MAX_COLS) {
-        /* Fused multi-column gather */
+    } else if (pool) {
+        /* Batched fused multi-column gather (≤MGATHER_MAX_COLS per dispatch) */
         multi_gather_ctx_t mgctx = { .idx = match_idx, .ncols = 0 };
         for (int64_t c = 0; c < ncols; c++) {
             if (!new_cols[c]) continue;
@@ -338,19 +335,13 @@ ray_t* exec_filter(ray_graph_t* g, ray_op_t* op, ray_t* input, ray_t* pred) {
             mgctx.dsts[ci] = (char*)ray_data(new_cols[c]);
             mgctx.esz[ci]  = col_esz(col);
             mgctx.ncols++;
+            if (mgctx.ncols == MGATHER_MAX_COLS) {
+                ray_pool_dispatch(pool, multi_gather_fn, &mgctx, pass_count);
+                mgctx.ncols = 0;
+            }
         }
-        ray_pool_dispatch(pool, multi_gather_fn, &mgctx, pass_count);
-    } else if (pool) {
-        /* Per-column parallel gather */
-        for (int64_t c = 0; c < ncols; c++) {
-            ray_t* col = ray_table_get_col_idx(input, c);
-            if (!col || !new_cols[c]) continue;
-            gather_ctx_t gctx = {
-                .idx = match_idx, .src_col = col, .dst_col = new_cols[c],
-                .esz = col_esz(col), .nullable = false,
-            };
-            ray_pool_dispatch(pool, gather_fn, &gctx, pass_count);
-        }
+        if (mgctx.ncols > 0)
+            ray_pool_dispatch(pool, multi_gather_fn, &mgctx, pass_count);
     } else {
         /* Sequential gather with index */
         for (int64_t c = 0; c < ncols; c++) {
@@ -520,9 +511,21 @@ ray_t* exec_filter_head(ray_t* input, ray_t* pred, int64_t limit) {
  * Reuses the same parallel multi-column gather as exec_filter.
  * ============================================================================ */
 
-ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel) {
+/* keep-set membership: is column name-sym `nm` present in keep_syms? */
+static inline bool sel_compact_keep(int64_t nm, const int64_t* keep_syms, int keep_n) {
+    for (int j = 0; j < keep_n; j++)
+        if (keep_syms[j] == nm) return true;
+    return false;
+}
+
+ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
+                   const int64_t* keep_syms, int keep_n) {
     (void)g;
     if (!tbl || RAY_IS_ERR(tbl) || !sel) return tbl;
+
+    /* keep-set: when provided, materialize only columns whose name-sym is in
+     * keep_syms (order preserved); NULL/0 => materialize all columns. */
+    bool use_keep = (keep_syms != NULL && keep_n > 0);
 
     int64_t nrows = ray_table_nrows(tbl);
     ray_rowsel_t* meta = ray_rowsel_meta(sel);
@@ -550,6 +553,9 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel) {
         ray_t* empty = ray_table_new(ncols);
         if (!empty || RAY_IS_ERR(empty)) return empty;
         for (int64_t c = 0; c < ncols; c++) {
+            if (use_keep &&
+                !sel_compact_keep(ray_table_col_name(tbl, c), keep_syms, keep_n))
+                continue;
             ray_t* col = ray_table_get_col_idx(tbl, c);
             if (!col) continue;
             int8_t ct = RAY_IS_PARTED(col->type)
@@ -610,12 +616,14 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel) {
 
     ray_t* new_cols[ncols];
     int64_t col_names[ncols];
-    int64_t valid_ncols = 0;
     bool has_parted = false;
 
     for (int64_t c = 0; c < ncols; c++) {
         ray_t* col = ray_table_get_col_idx(tbl, c);
         col_names[c] = ray_table_col_name(tbl, c);
+        if (use_keep && !sel_compact_keep(col_names[c], keep_syms, keep_n)) {
+            new_cols[c] = NULL; continue;
+        }
         if (!col || RAY_IS_ERR(col)) { new_cols[c] = NULL; continue; }
         if (col->type == RAY_MAPCOMMON) {
             ray_t** mc_ptrs = (ray_t**)ray_data(col);
@@ -642,7 +650,6 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel) {
                 memcpy(out_mc + (size_t)i * esz, kdata + (size_t)pi * esz, esz);
             }
             new_cols[c] = flat;
-            valid_ncols++;
             continue;
         }
         int8_t ct = RAY_IS_PARTED(col->type)
@@ -665,7 +672,6 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel) {
         if (!nc || RAY_IS_ERR(nc)) { new_cols[c] = NULL; continue; }
         nc->len = pass_count;
         new_cols[c] = nc;
-        valid_ncols++;
     }
 
     /* LIST columns: gather element pointers with a retain.  The byte-copy
@@ -708,30 +714,31 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel) {
                     memcpy(dst + i * esz, src + match_idx[i] * esz, esz);
             }
         }
-    } else if (pool && valid_ncols > 0 && valid_ncols <= MGATHER_MAX_COLS) {
+    } else if (pool) {
+        /* Batched multi-column gather: fill mgctx with up to MGATHER_MAX_COLS
+         * kept columns, dispatch, then continue with the next batch.  This is
+         * column-count-agnostic — no per-column fallback. */
         multi_gather_ctx_t mgctx = { .idx = match_idx, .ncols = 0 };
         for (int64_t c = 0; c < ncols; c++) {
             if (!new_cols[c]) continue;
             ray_t* col = ray_table_get_col_idx(tbl, c);
             if (col->type == RAY_LIST) continue;  /* gathered above with retain */
+            /* RAY_MAPCOMMON is not skipped here: the pre-alloc loop above already
+             * materialized it to a flat new_cols[c], so col_esz returns 0 and the
+             * gather is a no-op.  exec_filter adds an explicit continue for clarity;
+             * sel_compact relies on the 0-byte no-op instead. */
             int64_t ci = mgctx.ncols;
             mgctx.srcs[ci] = (char*)ray_data(col);
             mgctx.dsts[ci] = (char*)ray_data(new_cols[c]);
             mgctx.esz[ci]  = col_esz(col);
             mgctx.ncols++;
+            if (mgctx.ncols == MGATHER_MAX_COLS) {
+                ray_pool_dispatch(pool, multi_gather_fn, &mgctx, pass_count);
+                mgctx.ncols = 0;
+            }
         }
-        ray_pool_dispatch(pool, multi_gather_fn, &mgctx, pass_count);
-    } else if (pool) {
-        for (int64_t c = 0; c < ncols; c++) {
-            ray_t* col = ray_table_get_col_idx(tbl, c);
-            if (!col || !new_cols[c]) continue;
-            if (col->type == RAY_LIST) continue;  /* gathered above with retain */
-            gather_ctx_t gctx = {
-                .idx = match_idx, .src_col = col, .dst_col = new_cols[c],
-                .esz = col_esz(col), .nullable = false,
-            };
-            ray_pool_dispatch(pool, gather_fn, &gctx, pass_count);
-        }
+        if (mgctx.ncols > 0)
+            ray_pool_dispatch(pool, multi_gather_fn, &mgctx, pass_count);
     } else {
         for (int64_t c = 0; c < ncols; c++) {
             ray_t* col = ray_table_get_col_idx(tbl, c);

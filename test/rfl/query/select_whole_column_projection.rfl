@@ -1,0 +1,37 @@
+;; Whole-column verbs (distinct / asc / desc / reverse) as SELECT projections.
+;;
+;; These builtins consume an entire column and return a vector; the DAG has no
+;; bucket for them, so the projection lands in the eval fallback.  Previously the
+;; fallback scattered the verb per-row: `distinct` errored ("argument must be a
+;; list, got <type>") and asc/desc/reverse SILENTLY returned the column
+;; untouched (reordering a 1-element slice is a no-op).  They are now evaluated
+;; once against the full column (src/ops/query.c: eval_expr_whole_column).
+;;
+;; Oracle: a whole-column projection must equal the standalone verb applied to
+;; the column, so each assertion compares against the eager form rather than a
+;; hardcoded order (distinct is sorted for ints, first-occurrence for syms).
+
+(set T (table [v] (list [3 1 2 2 1])))
+
+;; ── projection result == standalone verb over the column ────────────────────
+(at (select {v: (distinct v) from: T}) 'v) -- (distinct [3 1 2 2 1])
+(at (select {v: (asc v)      from: T}) 'v) -- (asc [3 1 2 2 1])
+(at (select {v: (desc v)     from: T}) 'v) -- (desc [3 1 2 2 1])
+(at (select {v: (reverse v)  from: T}) 'v) -- (reverse [3 1 2 2 1])
+
+;; ── a single distinct column defines the output length ──────────────────────
+(count (select {v: (distinct v) from: T})) -- 3
+
+;; ── WHERE filters BEFORE the whole-column verb sees the column ───────────────
+;;   rows where v>1 → [3 2 2] → distinct of that
+(at (select {v: (distinct v) from: T where: (> v 1)}) 'v) -- (distinct [3 2 2])
+
+;; ── order the distinct result (single fluent query, issue #16 shape) ─────────
+(at (xasc  (select {v: (distinct v) from: T}) 'v) 'v) -- [1 2 3]
+(at (xdesc (select {v: (distinct v) from: T}) 'v) 'v) -- [3 2 1]
+
+;; ── SYM column distinct (first-occurrence order) ────────────────────────────
+(at (select {d: (distinct d) from: (table [d] (list ['zebra 'apple 'mango 'apple]))}) 'd) -- ['zebra 'apple 'mango]
+
+;; ── ragged result rejected: a length-changing column beside a full column ────
+(select {a: (distinct v) b: v from: T}) !- length

@@ -68,13 +68,8 @@ static inline bool sentinel_is_null(const ray_t* v, int64_t idx) {
             return ((const int32_t*)p)[idx] == NULL_I32;
         case RAY_I16:
             return ((const int16_t*)p)[idx] == NULL_I16;
-        case RAY_SYM:
-            switch (v->attrs & 0x3) {
-                case RAY_SYM_W8:  return ((const uint8_t*)p)[idx]  == 0;
-                case RAY_SYM_W16: return ((const uint16_t*)p)[idx] == 0;
-                case RAY_SYM_W32: return ((const uint32_t*)p)[idx] == 0;
-                default:          return ((const int64_t*)p)[idx]  == 0;
-            }
+        /* SYM has no null (sym id 0 is the empty value, not null) —
+         * no arm here; ray_vec_is_null short-circuits SYM before this switch. */
         case RAY_STR:
             return ((const ray_str_t*)p)[idx].len == 0;
         case RAY_GUID: {
@@ -141,8 +136,10 @@ static inline void vec_drop_index_inplace(ray_t* v) {
  * -------------------------------------------------------------------------- */
 
 static int64_t vec_capacity(ray_t* vec) {
-    size_t block_size = (size_t)1 << vec->order;
-    size_t data_space = block_size - 32;  /* 32B ray_t header */
+    /* ray_block_data_bytes handles both buddy blocks (1<<order - 32) and direct
+     * mmap'd blocks (exact size - prefix - header); the latter carry a sentinel
+     * order, so 1<<order would be garbage. */
+    size_t data_space = ray_block_data_bytes(vec);
     uint8_t esz = ray_sym_elem_size(vec->type, vec->attrs);
     if (esz == 0) return 0;
     return (int64_t)(data_space / esz);
@@ -978,8 +975,10 @@ ray_err_t ray_vec_set_null_checked(ray_t* vec, int64_t idx, bool is_null) {
             case RAY_I32: case RAY_DATE: case RAY_TIME: ((int32_t*)p)[idx] = NULL_I32; break;
             case RAY_I16:                          ((int16_t*)p)[idx] = NULL_I16; break;
             case RAY_STR:
+                /* STR has no null distinct from "": write the
+                 * empty string but do NOT mark the column nullable. */
                 memset(&((ray_str_t*)p)[idx], 0, sizeof(ray_str_t));
-                break;
+                return RAY_OK;
             case RAY_GUID:
                 memset((uint8_t*)p + idx * 16, 0, 16);
                 break;
@@ -1141,6 +1140,75 @@ fail_oom:
 fail_range:
     if (vec != original) ray_release(vec);
     return ray_error("range", "str_vec_append: pool offset exceeds %lld bytes", (long long)UINT32_MAX);
+}
+
+/* --------------------------------------------------------------------------
+ * ray_str_vec_from_parts — bulk-build a RAY_STR vec in two passes (no COW)
+ *
+ * Allocates the string pool once (not per-element like ray_str_vec_append).
+ * Pass 1 sums pooled bytes; pass 2 fills descriptors and pool in one sweep.
+ * ptrs[i] may be NULL when lens[i]==0.  nulls may be NULL (no nulls); when
+ * non-NULL, nulls[i]!=0 marks element i null (STR null = empty string —
+ * len==0, no RAY_ATTR_HAS_NULLS set).
+ * -------------------------------------------------------------------------- */
+
+ray_t* ray_str_vec_from_parts(const char* const* ptrs, const uint32_t* lens,
+                               const uint8_t* nulls, int64_t n) {
+    if (n < 0) return ray_error("range", "str_vec_from_parts: n must be non-negative, got %lld", (long long)n);
+
+    ray_t* v = ray_vec_new(RAY_STR, n);
+    if (!v || RAY_IS_ERR(v)) return v;
+
+    /* Pass 1: count pool bytes needed for elements that don't inline */
+    size_t total = 0;
+    for (int64_t i = 0; i < n; i++) {
+        if ((!nulls || !nulls[i]) && lens[i] > RAY_STR_INLINE_MAX) {
+            total += lens[i];
+        }
+    }
+
+    /* Allocate pool once — mirrors the setup in ray_str_vec_append */
+    if (total > 0) {
+        v->str_pool = ray_alloc(total + 32);
+        if (!v->str_pool || RAY_IS_ERR(v->str_pool)) {
+            v->str_pool = NULL;
+            ray_release(v);
+            return ray_error("oom", NULL);
+        }
+        v->str_pool->type = RAY_U8;
+        v->str_pool->len  = 0;
+    }
+
+    /* Pass 2: fill descriptors and pool */
+    ray_str_t* elems     = (ray_str_t*)ray_data(v);
+    char*      pool_base = v->str_pool ? (char*)ray_data(v->str_pool) : NULL;
+    int64_t    pool_used = 0;
+
+    for (int64_t i = 0; i < n; i++) {
+        ray_str_t* d = &elems[i];
+        memset(d, 0, sizeof(ray_str_t));
+        if (nulls && nulls[i]) {
+            /* STR null = empty string: d is already zeroed (len=0) */
+        } else if (lens[i] <= RAY_STR_INLINE_MAX) {
+            d->len = lens[i];
+            if (lens[i] > 0) memcpy(d->data, ptrs[i], lens[i]);
+        } else {
+            if ((uint64_t)pool_used > UINT32_MAX) {
+                ray_release(v);
+                return ray_error("range", "str_vec_from_parts: pool offset exceeds %lld bytes", (long long)UINT32_MAX);
+            }
+            memcpy(pool_base + pool_used, ptrs[i], lens[i]);
+            d->len      = lens[i];
+            d->pool_off = (uint32_t)pool_used;
+            memcpy(d->prefix, ptrs[i], 4);
+            pool_used  += (int64_t)lens[i];
+        }
+    }
+
+    if (v->str_pool) v->str_pool->len = pool_used;
+    v->len = n;
+
+    return v;
 }
 
 /* --------------------------------------------------------------------------
@@ -1356,11 +1424,10 @@ bool ray_vec_is_null(ray_t* vec, int64_t idx) {
     if (!vec || RAY_IS_ERR(vec)) return false;
     if (idx < 0 || idx >= vec->len) return false;
 
-    /* SYM columns are no-null by design — see ray_vec_set_null_checked
-     * for the rationale.  Sentinel check is bypassed here; consumers
-     * that need sym-null detection (e.g. dict.c key handling) test the
-     * sym id directly. */
-    if (vec->type == RAY_SYM) return false;
+    /* SYM and STR columns are no-null by design (empty "" / sym 0 is the
+     * convention — there is no null distinct from empty).  Consumers
+     * that need empty detection test the value (sym id 0 / str len 0) directly. */
+    if (vec->type == RAY_SYM || vec->type == RAY_STR) return false;
 
     /* Slice: delegate to parent with adjusted index */
     if (vec->attrs & RAY_ATTR_SLICE) {

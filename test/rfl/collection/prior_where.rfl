@@ -1,0 +1,38 @@
+;; (prior fn vec) — pairwise combinator (collection.c): out[i] = (fn v[i]
+;; v[i-1]), out[0] = (fn v[0] v[0]).  Comparison operators over null-free
+;; typed vectors (incl. ==//= over SYM) run the fused BOOL kernel; other
+;; fns/LIST inputs take the generic boxed path.  Plus vectorized-where pins.
+
+;; typed compare kernels
+(prior < [3 1 4 1 5]) -- [false true false true false]
+(prior > [3 1 4 1 5]) -- [false false true false true]
+(prior <= [1 1 2]) -- [true true false]
+(prior >= [1 1 2]) -- [true true true]
+(prior == ['a 'a 'b 'b 'a]) -- [true true false true false]
+(prior != ['a 'a 'b 'b 'a]) -- [false false true false true]
+(prior != [1.5 1.5 2.0]) -- [false false true]
+(type (prior < [3 1 4])) -- 'B8
+;; first slot: self-pair
+(prior < [7]) -- [false]
+(prior == [7]) -- [true]
+;; matches the concat/take shift idiom exactly
+(set V [5 3 8 8 2 9])
+(set N (count V))
+(set PREV (concat (take V 1) (take V (- N 1))))
+(min (== (prior < V) (< V PREV))) -- true
+(min (== (prior != V) (!= V PREV))) -- true
+;; TIME/temporal family
+(prior < (as 'TIME [3 1 4])) -- [false true false]
+;; nullable input → generic boxed path (LIST), null compares mirror atoms
+(set VN (as 'I64 (list 1 0N 3)))
+(type (prior < VN)) -- 'LIST
+;; generic path: arbitrary fn and LIST input
+(prior - (list 10 13 9)) -- (list 0 3 -4)
+(prior (fn [a b] (+ a b)) [1 2 3]) -- (list 2 3 5)
+
+;; ── where: word-skip emit parity ──
+(where [false true false true]) -- [1 3]
+(count (where (> (til 100000) 99997))) -- 2
+(where (> (til 100000) 99997)) -- [99998 99999]
+(count (where (>= (til 32) 0))) -- 32
+(where [false false false]) -- (as 'I64 (list))

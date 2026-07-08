@@ -539,6 +539,41 @@ static test_result_t test_graph_pagerank_direct(void) {
 }
 
 /* --------------------------------------------------------------------------
+ * Cancellation: a checkpointed graph algorithm run with a pending interrupt
+ * must return a clean "cancel" error — the per-iteration checkpoint fires on
+ * the first iteration and unwinds (arena reset) with no leak (ASan verifies).
+ * -------------------------------------------------------------------------- */
+static test_result_t test_graph_cancel(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    ray_t* tbl = make_i64_edge_table();
+    ray_t* sym_src = ray_sym(ray_sym_intern("src", 3));
+    ray_t* sym_dst = ray_sym(ray_sym_intern("dst", 3));
+    ray_t* build_args[3] = { tbl, sym_src, sym_dst };
+    ray_t* h = ray_graph_build_fn(build_args, 3);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(h));
+
+    /* Arm a cancel, then run pagerank; clear the flag before asserting so a
+     * failure can't leak the pending interrupt into later tests. */
+    ray_request_interrupt();
+    ray_t* pr_args[1] = { h };
+    ray_t* result = ray_graph_pagerank_fn(pr_args, 1);
+    ray_clear_interrupt();
+
+    TEST_ASSERT_TRUE(RAY_IS_ERR(result));
+    TEST_ASSERT_STR_EQ(ray_err_code(result), "cancel");
+    ray_error_free(result);
+
+    ray_release(h);
+    ray_release(sym_src); ray_release(sym_dst);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
  * Bonus: I64 weight column → F64 coercion path (line 250-251 in build).
  *     Confirms the build succeeds with non-F64 weights and reports
  *     has_weights:true through info.
@@ -2577,6 +2612,7 @@ const test_entry_t graph_builtin_entries[] = {
     { "graph_builtin/handle_in_release",    test_graph_handle_in_release,    NULL, NULL },
     { "graph_builtin/handle_block_copy",    test_graph_handle_block_copy,    NULL, NULL },
     { "graph_builtin/pagerank_direct",      test_graph_pagerank_direct,      NULL, NULL },
+    { "graph_builtin/cancel",               test_graph_cancel,               NULL, NULL },
     { "graph_builtin/build_widen_i64_w",    test_graph_build_widen_i64_weight, NULL, NULL },
     { "graph_builtin/atom_to_i64_narrow",   test_atom_to_i64_narrow,         NULL, NULL },
     { "graph_builtin/pagerank_bad_iter",    test_pagerank_bad_iter_type,     NULL, NULL },

@@ -1,0 +1,104 @@
+;; `INT` schema token → auto narrowest integer width on .csv.splayed.
+;;
+;; A column declared `INT` in a .csv.splayed schema is parsed as int64,
+;; its min/max/has_null are measured over the whole file, and the column
+;; is written at the narrowest type that holds every value.  The floor is
+;; I16 — U8 renders as hex and BOOL in bool form, so INT integers always
+;; stay decimal (I16/I32/I64 per csv_resolve_int_width).  Explicit widths
+;; are respected unchanged.  This test exercises one column resolving to
+;; I16 (non-null small range), I16 (nullable, forced by null), and I32,
+;; plus an explicit-I32 control whose small values must NOT narrow.
+;;
+;; Before the INT wiring `.csv.splayed [INT ...]` errors with
+;; "unknown column type name in schema", so every assertion below fails.
+
+(.sys.exec "rm -rf rf_test_auto_int rf_test_auto_int.csv") -- 0
+
+;; Columns:
+;;   b    0/1            non-null   -> I16 (floor; U8/BOOL excluded — render hex/bool)
+;;   u8   0..200         non-null   -> I16 (floor; U8/BOOL excluded — render hex/bool)
+;;   i16n 0..200         one null   -> I16 (nullable excludes U8)
+;;   i32  0..100000      non-null   -> I32
+;;   ex   small ints, declared I32  -> I32 (explicit width respected)
+(.sys.exec "printf 'b,u8,i16n,i32,ex\\n0,0,200,100000,1\\n1,200,,1,2\\n1,100,5,2,3\\n0,50,7,3,4\\n1,200,9,4,5\\n' > rf_test_auto_int.csv") -- 0
+
+(set T (.csv.splayed [INT INT INT INT I32] "rf_test_auto_int.csv" "rf_test_auto_int/"))
+(count T) -- 5
+(key T) -- ['b 'u8 'i16n 'i32 'ex]
+
+;; ── resolved widths ──
+(type (at T 'b))    -- 'I16
+(type (at T 'u8))   -- 'I16
+(type (at T 'i16n)) -- 'I16
+(type (at T 'i32))  -- 'I32
+;; explicit I32 stays I32 even though 1..5 would fit I16.
+(type (at T 'ex))   -- 'I32
+
+;; ── values round-trip ──
+;; b is I16, so 0/1 round-trip as decimal integers (not bool).
+(at (at T 'b) 0)   -- 0
+(at (at T 'b) 1)   -- 1
+;; u8 is I16, so values render as decimal integers (not hex).
+(at (at T 'u8) 1)  -- 200
+(at (at T 'u8) 3)  -- 50
+(at (at T 'i16n) 0) -- 200
+;; the blank i16n cell is a typed null at the row the CSV left empty.
+(nil? (at (at T 'i16n) 1)) -- true
+(at (at T 'i16n) 2) -- 5
+(at (at T 'i32) 0) -- 100000
+
+;; ── aggregates skip the null ──
+(sum (at T 'b))    -- 3
+(sum (at T 'u8))   -- 550
+(sum (at T 'i16n)) -- 221
+(sum (at T 'i32))  -- 100010
+(sum (at T 'ex))   -- 15
+
+;; ── re-load from disk preserves widths, values, and the null bitmap ──
+(set R (.db.splayed.get "rf_test_auto_int/"))
+(count R) -- 5
+(type (at R 'b))    -- 'I16
+(type (at R 'u8))   -- 'I16
+(type (at R 'i16n)) -- 'I16
+(type (at R 'i32))  -- 'I32
+(type (at R 'ex))   -- 'I32
+(at (at R 'u8) 1)  -- 200
+(at (at R 'i16n) 0) -- 200
+(nil? (at (at R 'i16n) 1)) -- true
+(at (at R 'i16n) 2) -- 5
+(at (at R 'i32) 0) -- 100000
+(sum (at R 'i16n)) -- 221
+(sum (at R 'i32))  -- 100010
+
+(.sys.exec "rm -rf rf_test_auto_int rf_test_auto_int.csv") -- 0
+
+;; ── multi-chunk integrity: >1 M rows force ≥2 CSV_PART_ROWS_DEFAULT chunks ──
+;;
+;; A single INT column, 1,100,000 rows.  Values are i%200 (range 0..199) except
+;; row 1,050,000 which is an empty CSV cell (null), placing a null in chunk 2
+;; (rows 1,000,000..1,099,999).  csv_resolve_auto_streamed scans the whole file
+;; once to build global min/max/has_null before the streaming column writer is
+;; opened.  A per-chunk-narrowing regression would diverge: chunk 1 (no null)
+;; → U8 and chunk 2 (has null) → I16, corrupting the fixed-width column file.
+;; The type assertion below catches that divergence.
+(.sys.exec "rm -rf rf_mc_auto rf_mc_auto.csv") -- 0
+(.sys.exec "awk 'BEGIN{print \"val\"; for(i=0;i<1100000;i++){if(i==1050000)print \"\"; else print i%200}}' > rf_mc_auto.csv") -- 0
+(set MC (.csv.splayed [INT] "rf_mc_auto.csv" "rf_mc_auto/"))
+(count MC) -- 1100000
+;; whole-column resolved width must be I16 (nullable; values 0..199; has_null=true;
+;; U8 is excluded when has_null — see csv_resolve_int_width).  A per-chunk
+;; regression produces U8 for chunk 1, breaking this assertion.
+(type (at MC 'val)) -- 'I16
+;; boundary: last row of chunk 1 (index 999999) and first two rows of chunk 2.
+(at (at MC 'val) 999999)  -- 199
+(at (at MC 'val) 1000000) -- 0
+(at (at MC 'val) 1000001) -- 1
+;; null lives in chunk 2 (index 1,050,000 = 1M + 50,000).
+(nil? (at (at MC 'val) 1050000)) -- true
+;; reload: resolved width and null bitmap must survive .db.splayed.get.
+(set MCR (.db.splayed.get "rf_mc_auto/"))
+(type (at MCR 'val)) -- 'I16
+(at (at MCR 'val) 999999)  -- 199
+(at (at MCR 'val) 1000000) -- 0
+(nil? (at (at MCR 'val) 1050000)) -- true
+(.sys.exec "rm -rf rf_mc_auto rf_mc_auto.csv") -- 0

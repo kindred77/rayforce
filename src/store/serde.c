@@ -73,6 +73,20 @@
  *   NULL (type=0 with len=0): just the type byte
  * -------------------------------------------------------------------------- */
 
+/* Attribute bits that may cross the wire and be reconstructed verbatim on
+ * an object built by the deserializer.  Every OTHER attr bit — SLICE,
+ * HAS_INDEX, HAS_LINK, GRAPH, HNSW, ARENA — implies a backing pointer or
+ * an allocation arena that a freshly-deserialized object does not own.
+ * Trusting those from an untrusted frame is a memory-safety hole: e.g. a
+ * LIST payload with SLICE set makes ray_data() follow an uninitialised
+ * slice_parent and segfault (a remotely reachable crash over IPC, and a
+ * corrupt-journal crash on replay).  The scalar-vector paths already mask
+ * down to HAS_NULLS; this covers the aggregate types (LIST/TABLE/DICT/
+ * LAMBDA) which historically copied the raw byte.  SORTED is a pure,
+ * self-describing marker and is safe to carry.  Applied on BOTH ends so
+ * we never emit a dangerous bit and never trust one on input. */
+#define RAY_SERDE_ATTR_WIRE_MASK ((uint8_t)(RAY_ATTR_HAS_NULLS | RAY_ATTR_SORTED))
+
 /* Helper: strlen with bounds */
 static size_t safe_strlen(const uint8_t* buf, int64_t max) {
     for (int64_t i = 0; i < max; i++)
@@ -422,7 +436,7 @@ int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
     }
 
     case RAY_LIST: {
-        buf[0] = obj->attrs;
+        buf[0] = obj->attrs & RAY_SERDE_ATTR_WIRE_MASK;
         buf++;
         memcpy(buf, &obj->len, 8);
         buf += 8;
@@ -435,7 +449,7 @@ int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
 
     case RAY_TABLE: {
         /* Layout: type + attrs + schema(recursive) + cols(recursive RAY_LIST) */
-        buf[0] = obj->attrs;
+        buf[0] = obj->attrs & RAY_SERDE_ATTR_WIRE_MASK;
         buf++;
         ray_t** slots = (ray_t**)ray_data(obj);
         c = ser_schema_names(buf, slots[0]);     /* schema names as RAY_SYM vector */
@@ -444,7 +458,7 @@ int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
     }
 
     case RAY_DICT: {
-        buf[0] = obj->attrs;
+        buf[0] = obj->attrs & RAY_SERDE_ATTR_WIRE_MASK;
         buf++;
         ray_t** slots = (ray_t**)ray_data(obj);
         c = ray_ser_raw(buf, slots[0]);
@@ -453,7 +467,7 @@ int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
     }
 
     case RAY_LAMBDA: {
-        buf[0] = obj->attrs;
+        buf[0] = obj->attrs & RAY_SERDE_ATTR_WIRE_MASK;
         buf++;
         ray_t** slots = (ray_t**)ray_data(obj);
         c = ray_ser_raw(buf, slots[0]);     /* params */
@@ -643,6 +657,10 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len) {
         *len -= 9;
 
         if (l < 0 || l > 1000000000) return ray_error("domain", "deserialize sym vector: length %lld out of range", (long long)l);
+        /* Every element occupies at least one wire byte (its NUL), so a
+         * declared count larger than the bytes left cannot be real — reject
+         * it BEFORE allocating so a tiny frame can't force a huge alloc. */
+        if (l > *len) return ray_error("domain", "deserialize sym vector: length %lld exceeds %lld remaining bytes", (long long)l, (long long)*len);
 
         /* Decode interns each string into the GLOBAL table and builds a
          * W64 runtime-domain vec — correct: a freshly materialized wire
@@ -676,6 +694,10 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len) {
         *len -= 9;
 
         if (l < 0 || l > 1000000000) return ray_error("domain", "deserialize str vector: length %lld out of range", (long long)l);
+        /* Each element carries at least an 8-byte length prefix, so more
+         * elements than remaining bytes is impossible — bound the up-front
+         * allocation to the actual input size. */
+        if (l > *len) return ray_error("domain", "deserialize str vector: length %lld exceeds %lld remaining bytes", (long long)l, (long long)*len);
 
         /* Build STR vector by appending each string via ray_str_vec_append */
         ray_t* vec = ray_vec_new(RAY_STR, l);
@@ -706,11 +728,15 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len) {
         *len -= 9;
 
         if (l < 0 || l > 1000000000) return ray_error("domain", "deserialize list: length %lld out of range", (long long)l);
+        /* Each element serializes to at least one wire byte (its type tag),
+         * so a declared count above the remaining byte count is impossible —
+         * reject before allocating l pointers. */
+        if (l > *len) return ray_error("domain", "deserialize list: length %lld exceeds %lld remaining bytes", (long long)l, (long long)*len);
 
         ray_t* list = ray_alloc(l * sizeof(ray_t*));
         if (!list || RAY_IS_ERR(list)) return list;
         list->type = RAY_LIST;
-        list->attrs = list_attrs;
+        list->attrs = list_attrs & RAY_SERDE_ATTR_WIRE_MASK;
         list->len = l;
         ray_t** elems = (ray_t**)ray_data(list);
 
@@ -819,7 +845,7 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len) {
             return dict;
         }
         dict->type = RAY_DICT;
-        dict->attrs = dict_attrs;
+        dict->attrs = dict_attrs & RAY_SERDE_ATTR_WIRE_MASK;
         dict->len = 2;
         ((ray_t**)ray_data(dict))[0] = keys;
         ((ray_t**)ray_data(dict))[1] = vals;
@@ -850,7 +876,7 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len) {
             return lambda;
         }
         lambda->type = RAY_LAMBDA;
-        lambda->attrs = lam_attrs;
+        lambda->attrs = lam_attrs & RAY_SERDE_ATTR_WIRE_MASK;
         lambda->len = 0;
         memset(ray_data(lambda), 0, 7 * sizeof(ray_t*));
         ((ray_t**)ray_data(lambda))[0] = params;
@@ -875,7 +901,14 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len) {
 
     case RAY_ERROR: {
         if (*len < 8) return ray_error("domain", "deserialize error: truncated error code, need 8 bytes");
-        ray_t* err = ray_error((const char*)buf, NULL);
+        /* A well-formed writer NUL-terminates the 8-byte code field (byte
+         * 7 == 0), but a corrupt or hostile frame may fill all 8 bytes.
+         * Copy into a bounded, always-terminated buffer so ray_error's
+         * strlen cannot read past the field. */
+        char code[9];
+        memcpy(code, buf, 8);
+        code[8] = '\0';
+        ray_t* err = ray_error(code, NULL);
         *len -= 8;
         return err;
     }
@@ -919,7 +952,7 @@ ray_t* ray_ser(ray_t* obj) {
     hdr->prefix  = RAY_SERDE_PREFIX;
     hdr->version = RAY_SERDE_WIRE_VERSION;
     hdr->flags   = 0;
-    hdr->endian  = 0;
+    hdr->endian  = RAY_SERDE_ENDIAN;
     hdr->msgtype = 0;
     hdr->size    = payload;
 
@@ -955,6 +988,9 @@ ray_t* ray_de(ray_t* bytes) {
         return ray_error("domain", "deserialize: bad ipc header magic prefix");
     if (hdr->version != RAY_SERDE_WIRE_VERSION)
         return ray_error("version", "serde wire version mismatch");
+    if (hdr->endian != RAY_SERDE_ENDIAN)
+        return ray_error("domain", "deserialize: byte-order mismatch (frame endian %d, host %d)",
+                         (int)hdr->endian, (int)RAY_SERDE_ENDIAN);
     if (hdr->size < 0 || hdr->size > 1000000000)
         return ray_error("domain", "deserialize: ipc header payload size %lld out of range", (long long)hdr->size);
     if (hdr->size + (int64_t)sizeof(ray_ipc_header_t) != total)

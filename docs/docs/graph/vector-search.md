@@ -72,8 +72,8 @@ Defaults: `metric='cosine`, `M=16`, `ef_construction=200`. The returned handle i
 ; │ _rowid │ _dist │
 ; ├────────┼───────┤
 ; │ 0      │ 0.0   │
-; │ 4      │ 0.29  │
 ; │ 3      │ 0.29  │
+; │ 4      │ 0.29  │
 ; └────────┴───────┘
 ```
 

@@ -1,0 +1,68 @@
+# Rayfall token dictionary for the parse/eval fuzz targets.
+# Keywords, verbs, and syntax fragments give the mutator meaningful
+# building blocks so it spends its budget on structure, not on
+# rediscovering that "select" is a word.
+# NOTE: loop/recursion constructs are deliberately OMITTED for fuzz_eval
+# (they turn benign inputs into timeouts); keep them out of this file.
+
+# --- literals ---
+"0"
+"1"
+"-1"
+"1.5"
+"0x1f"
+"0b101"
+"1e10"
+"`sym"
+"\"str\""
+"0N"
+"0n"
+"()"
+"[]"
+"{}"
+
+# --- structural punctuation ---
+";"
+":"
+"::"
+","
+"."
+".."
+"|"
+
+# --- core verbs ---
+"select"
+"from"
+"where"
+"by"
+"update"
+"insert"
+"upsert"
+"delete"
+"exec"
+"count"
+"sum"
+"avg"
+"min"
+"max"
+"first"
+"last"
+"distinct"
+"asc"
+"desc"
+"reverse"
+"group"
+"pivot"
+"join"
+"window"
+
+# --- adverbs / combinators ---
+"each"
+"over"
+"scan"
+"prior"
+
+# --- namespaces ---
+".sys."
+".log."
+".ipc."

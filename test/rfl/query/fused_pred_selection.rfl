@@ -1,0 +1,178 @@
+;; Equivalence battery for the fused predicate→selection path
+;; (src/ops/expr.c: exec_pred_to_selection / fused_sel_supported,
+;;  routed at src/ops/exec.c OP_FILTER and src/ops/query.c count-select).
+;;
+;; The fused path streams each morsel's WHERE bools straight into a
+;; rowsel builder, skipping the full BOOL vec + the BOOL→rowsel scan.
+;; Every query below is asserted against a hand-computed oracle, so the
+;; SAME assertions must hold whether the binary runs the fused path
+;; Oracles are hand-computed: each assertion is the exact right answer.
+;; Run both ways — results are identical by construction.
+;;
+;; Shapes covered: !=, <, AND, OR, all-pass (>=0), all-none (<0), a
+;; >1-morsel-segment table (200k rows via til, exercises the per-task
+;; builder merge), and a predicate over a NULLABLE column (null rows
+;; must NOT be selected, matching the bool path's expr kernel).
+
+;; ====================================================================
+;; Part A — small table, every shape, both the count-select path
+;; (query.c) and the filter→aggregate path (exec.c OP_FILTER).
+;;
+;;   a = [0 1 0 2 3 0 1]      b = [10 20 30 40 50 60 70]
+;; ====================================================================
+(set T (table [a b] (list [0 1 0 2 3 0 1] [10 20 30 40 50 60 70])))
+(count T) -- 7
+
+;; != 0  -> a!=0 at rows {1,3,4,6} -> count 4, sum b = 20+40+50+70 = 180
+(count (select {from: T where: (!= a 0)})) -- 4
+(sum (at (select {from: T where: (!= a 0)}) 'b)) -- 180
+
+;; < 2   -> a in {0,1} -> rows {0,1,2,5,6} -> count 5, sum b = 10+20+30+60+70 = 190
+(count (select {from: T where: (< a 2)})) -- 5
+(sum (at (select {from: T where: (< a 2)}) 'b)) -- 190
+
+;; AND   -> (!= a 0) AND (< b 65) -> {1,3,4} (b=70 at row6 excluded) -> 3
+(count (select {from: T where: (and (!= a 0) (< b 65))})) -- 3
+(sum (at (select {from: T where: (and (!= a 0) (< b 65))}) 'b)) -- 110
+
+;; OR    -> (== a 3) OR (== a 2) -> rows {4,3} -> 2, sum b = 40+50 = 90
+(count (select {from: T where: (or (== a 3) (== a 2))})) -- 2
+(sum (at (select {from: T where: (or (== a 3) (== a 2))}) 'b)) -- 90
+
+;; all-pass (>= a 0) -> 7 (exercises the all-pass→NULL convention)
+(count (select {from: T where: (>= a 0)})) -- 7
+(sum (at (select {from: T where: (>= a 0)}) 'b)) -- 280
+
+;; all-none (< a 0) -> 0 (exercises the none-pass selection)
+(count (select {from: T where: (< a 0)})) -- 0
+(sum (at (select {from: T where: (< a 0)}) 'b)) -- 0
+
+;; ====================================================================
+;; Part B — >1-morsel-segment table (200k rows) so the per-task builder
+;; merge in rowsel_builder_finish is exercised (TASK_GRAIN = 8 morsels;
+;; 200k rows crosses the parallel threshold = 64 morsels).
+;;
+;;   v = til 200000  (v == row index)
+;; ====================================================================
+(set N 200000)
+(set BigT (table [v] (list (til N))))
+(count BigT) -- 200000
+
+;; != 0 -> all but v==0 -> 199999
+(count (select {from: BigT where: (!= v 0)})) -- 199999
+
+;; < 100000 -> v in {0..99999} -> 100000
+(count (select {from: BigT where: (< v 100000)})) -- 100000
+
+;; sum over a small head slice -> 0+1+..+9 = 45 (filter→aggregate path)
+(sum (at (select {from: BigT where: (< v 10)}) 'v)) -- 45
+
+;; all-pass / all-none at scale
+(count (select {from: BigT where: (>= v 0)})) -- 200000
+(count (select {from: BigT where: (< v 0)})) -- 0
+
+;; ====================================================================
+;; Part C — NULLABLE column.  Null rows must NOT be selected (the fused
+;; path reuses the same expr comparison kernel as the bool path, which
+;; yields false for null operands).
+;;
+;;   a = [1 0N 3 0N 5]   (0N = null int64)
+;; ====================================================================
+(set Tn (table [a] (list [1 0N 3 0N 5])))
+(count Tn) -- 5
+
+;; > 0  -> {1,3,5} pass, nulls excluded -> 3, sum = 9
+(count (select {from: Tn where: (> a 0)})) -- 3
+(sum (at (select {from: Tn where: (> a 0)}) 'a)) -- 9
+
+;; >= 3 -> {3,5} pass, nulls excluded -> 2, sum = 8
+(count (select {from: Tn where: (>= a 3)})) -- 2
+(sum (at (select {from: Tn where: (>= a 3)}) 'a)) -- 8
+
+;; ====================================================================
+;; Part D — standalone `in` / `not-in` kernel, fused via
+;; exec_in_to_selection (src/ops/exec.c).  Root OP_IN/OP_NOT_IN over a
+;; flat column + literal set streams membership bools straight into the
+;; rowsel; null rows resolve to NOT-selected, matching the bool kernel.
+;; (The bool-fallback path is exercised naturally by unsupported shapes.)
+;; ====================================================================
+
+;; SYM in: k = [a b c a d]
+(set S (table [k] (list ['a 'b 'c 'a 'd])))
+(count S) -- 5
+;; in ['a 'c] -> a,c,a -> 3
+(count (select {x: k from: S where: (in k ['a 'c])})) -- 3
+;; not-in ['a 'c] -> b,d -> 2
+(count (select {x: k from: S where: (not-in k ['a 'c])})) -- 2
+
+;; Integer in over the Part-A table T (a = [0 1 0 2 3 0 1], b = [10..70]).
+;; in {1,2} -> rows {1,3,6} -> 3, sum b = 20+40+70 = 130
+(count (select {from: T where: (in a [1 2])})) -- 3
+(sum (at (select {from: T where: (in a [1 2])}) 'b)) -- 130
+;; not-in {1,2} -> the other 4 rows -> 4, sum b = 10+30+50+60 = 150
+(count (select {from: T where: (not-in a [1 2])})) -- 4
+(sum (at (select {from: T where: (not-in a [1 2])}) 'b)) -- 150
+
+;; Float-promoted in: f = [1.0 2.0 3.0 4.0 5.0], in {2.0,4.0} -> 2
+(set Tf (table [f] (list [1.0 2.0 3.0 4.0 5.0])))
+(count (select {from: Tf where: (in f [2.0 4.0])})) -- 2
+
+;; Nullable column in (reuse Tn, a = [1 0N 3 0N 5]).  Null rows never
+;; pass `in` nor `not-in` (SQL UNKNOWN semantics).
+(count (select {from: Tn where: (in a [1 3 5])})) -- 3
+(count (select {from: Tn where: (in a [1])})) -- 1
+;; not-in [1] -> {3,5} pass, the two nulls excluded -> 2
+(count (select {from: Tn where: (not-in a [1])})) -- 2
+
+;; Multi-morsel in over BigT (v = til 200000, crosses the parallel
+;; threshold so the per-task builder merge is exercised).
+(count (select {from: BigT where: (in v [0 1 2 3 4 5 6 7 8 9])})) -- 10
+(count (select {from: BigT where: (in v [100000])})) -- 1
+
+;; Mixed expr + kernel: root OP_AND (not OP_IN), so rides the FALLBACK path, not fused-in.
+;; Not expr-compilable (in is not an expr op) so this rides the bool
+;; fallback both ways — the equivalence still holds.
+;;   (in k ['a 'b]) -> {0,1,3};  (!= k 'b) drops row 1  -> {0,3} -> 2
+(count (select {from: S where: (and (in k ['a 'b]) (!= k 'b))})) -- 2
+
+;; ====================================================================
+;; Part E — kernels that ride the FALLBACK (still correct, just unfused).
+;;
+;;  - `like` glob stays on the bool path (its 4 input-shape paths +
+;;    dict-LUT pipeline don't reduce to a clean per-morsel fill).
+;;  - `between` is not a select-layer kernel; expressed as >=/<= AND it
+;;    already rides the expr-tree fusion (Part A style).
+;; Both shapes must yield identical results with and without the fused
+;; path, which is the whole point of keeping them in this battery.
+;; ====================================================================
+
+;; like glob (STR prefix): s = ["foo" "bar" "foobar" "baz"], "foo*" -> 2
+(set L (table [s] (list ["foo" "bar" "foobar" "baz"])))
+(count (select {from: L where: (like s "foo*")})) -- 2
+;; "*bar" suffix -> bar, foobar -> 2
+(count (select {from: L where: (like s "*bar")})) -- 2
+
+;; between-as-range over T: (>= a 1) AND (<= a 2) -> a in {1,2} -> 3
+(count (select {from: T where: (and (>= a 1) (<= a 2))})) -- 3
+(sum (at (select {from: T where: (and (>= a 1) (<= a 2))}) 'b)) -- 130
+
+;; ====================================================================
+;; Part F — Nullable column with in predicate (extends Part D coverage).
+;; Verifies NULL rows are correctly NOT selected by `in`. Part D already
+;; exercises multi-morsel dispatch via BigT (200k rows). This part extends
+;; the nullable + in coverage with a larger nullable table.
+;;
+;;   a = [1 0N 2 0N 3 0N 4 0N 5 0N] repeated (10 elements per cycle:
+;;   5 non-null {1..5}, 5 null).  20 rows total.
+;; ====================================================================
+(set TnLarge (table [a] (list [1 0N 2 0N 3 0N 4 0N 5 0N 1 0N 2 0N 3 0N 4 0N 5 0N])))
+(count TnLarge) -- 20
+
+;; in [1 3 5] -> selects {1,3,5} per cycle -> 2 cycles * 3 = 6, nulls excluded
+(count (select {from: TnLarge where: (in a [1 3 5])})) -- 6
+
+;; in [2 4] -> selects {2,4} per cycle -> 2 cycles * 2 = 4
+(count (select {from: TnLarge where: (in a [2 4])})) -- 4
+
+;; not-in [1 3 5] -> {2,4} per cycle -> 2 cycles * 2 = 4
+(count (select {from: TnLarge where: (not-in a [1 3 5])})) -- 4

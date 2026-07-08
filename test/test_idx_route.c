@@ -1058,8 +1058,8 @@ static test_result_t test_range_sorted_all_segments(void) {
     ray_t* kv_b = ray_vec_new(RAY_I64, N);
     TEST_ASSERT_FALSE(RAY_IS_ERR(kv_b));
     kv_b->len = N;
-    int64_t* kdb = (int64_t*)ray_data(kv_b);
-    for (int64_t i = 0; i < N; i++) kdb[i] = i;
+    int64_t* kdata = (int64_t*)ray_data(kv_b);
+    for (int64_t i = 0; i < N; i++) kdata[i] = i;
     ray_t* vv_b = ray_vec_new(RAY_I64, N);
     TEST_ASSERT_FALSE(RAY_IS_ERR(vv_b));
     vv_b->len = N;
@@ -1125,7 +1125,11 @@ static test_result_t test_hash_eq_dense_dups(void) {
     ray_t* r = run_filter(tbl, pred_eq_7_dups);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     TEST_ASSERT_EQ_I(ray_table_nrows(r), 4096);
-    TEST_ASSERT_EQ_I((int64_t)(ray_idx_hits[IDX_SITE_FILTER_HASH] - hits_before), 1);
+    /* Every row matches → the probe's dense-key budget aborts and the
+     * filter falls back to the scan path (the SIMD scan beats the
+     * scattered chain walk at this density).  Consulted, NOT a hit;
+     * the result must be identical either way. */
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_hits[IDX_SITE_FILTER_HASH] - hits_before), 0);
 
     /* All rows pass in order → v must be exactly 0..4095. */
     int64_t v_sym = ray_sym_intern("v", 1);

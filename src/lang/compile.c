@@ -48,7 +48,6 @@ typedef struct {
     ray_t   *lambda;     /* the lambda being compiled (for 'self' resolution) */
 
     ray_t    *dbg_obj;   /* I64 vector: pairs of [offset, span.id] */
-    int32_t   dbg_len;
     int32_t  trap_depth;  /* open OP_TRAP frames in current lambda */
 } compiler_t;
 
@@ -188,7 +187,7 @@ static void patch_jump(compiler_t *c, int32_t pos) {
     int32_t raw = c->code_len - pos - 2;
     if (raw > 32767 || raw < -32768) { c->error = true; return; }
     int16_t offset = (int16_t)raw;
-    c->code[pos]     = (uint8_t)(offset >> 8);
+    c->code[pos]     = (uint8_t)((uint16_t)offset >> 8);
     c->code[pos + 1] = (uint8_t)(offset & 0xFF);
 }
 

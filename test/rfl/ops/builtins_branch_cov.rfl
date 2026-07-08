@@ -36,8 +36,8 @@
 ;; TIMESTAMP null (line 72)
 (format "%" 0Np) -- "0Np"
 
-;; SYM null (line 73) — 0Ns
-(format "%" 0Ns) -- "0Ns"
+;; SYM null (line 73) — '
+(format "%" ') -- "'"
 
 ;; I16 null (line 65) — 0Nh
 (format "%" 0Nh) -- "0Nh"
@@ -96,7 +96,7 @@
 (format "n=%" 0Nd) -- "n=0Nd"
 (format "n=%" 0Nt) -- "n=0Nt"
 (format "n=%" 0Np) -- "n=0Np"
-(format "n=%" 0Ns) -- "n=0Ns"
+(format "n=%" ') -- "n='"
 (format "n=%" 0Nh) -- "n=0Nh"
 (format "n=%" 0Ni) -- "n=0Ni"
 
@@ -150,8 +150,8 @@
 ;; null → BOOL — produces null BOOL sentinel
 (nil? (as 'BOOL 0Nl)) -- true
 
-;; null → SYMBOL
-(nil? (as 'SYMBOL 0Ns)) -- true
+;; empty sym → SYMBOL (SYM has no null; ' is a value)
+(nil? (as 'SYMBOL ')) -- false
 
 ;; null → DATE
 (nil? (as 'DATE 0Nd)) -- true
@@ -218,7 +218,7 @@
 (as 'BOOL 1.0)   -- true    ;; F64 → BOOL
 (as 'BOOL 0.0)   -- false   ;; F64 → BOOL (zero)
 (as 'BOOL "hi")  -- true    ;; STR → BOOL (non-empty)
-(nil? (as 'BOOL ""))  -- true   ;; STR → BOOL (empty → null bool)
+(nil? (as 'BOOL ""))  -- false
 
 ;; --- Cast to STR ---
 (as 'STR "hi")   -- "hi"    ;; already STR
@@ -1109,7 +1109,7 @@
 (nil? (println 0Nd)) -- true
 (nil? (println 0Nt)) -- true
 (nil? (println 0Np)) -- true
-(nil? (println 0Ns)) -- true
+(nil? (println ')) -- true
 (nil? (println 0Nh)) -- true
 (nil? (println 0Ni)) -- true
 

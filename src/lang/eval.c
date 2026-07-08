@@ -37,9 +37,14 @@
 #include "table/sym.h"
 #include "vec/vec.h"            /* ray_check_null_invariant (DEBUG null-model gate) */
 #include "core/profile.h"
+#include "core/qstats.h"   /* per-worker parallelism counters for eval-path spans */
+#include "core/qlog.h"     /* ray_qlog_enabled — arm capture for query logging */
+#include "store/serde.h"   /* ray_serde_size — result footprint for spans */
 #include "table/sym.h"
 #include "mem/heap.h"
+#include "core/pool.h"
 #include "mem/sys.h"
+#include "lang/env.h"      /* ray_fn_name — stable builtin label for spans */
 /* store/serde.h, store/splay.h, store/part.h moved to system.c */
 /* ray_lang_print, ray_cast_fn, etc. moved to ops/builtins.c */
 /* ray_error() is declared in <rayforce.h> (included via eval.h) */
@@ -83,8 +88,15 @@ static void affine_sum_cache_clear(void) {
 /* Interrupt flag — set by REPL signal handler, checked by eval/VM loops */
 static volatile sig_atomic_t g_eval_interrupted = 0;
 
-void ray_request_interrupt(void)      { g_eval_interrupted = 1; }
-void ray_clear_interrupt(void)        { g_eval_interrupted = 0; }
+/* A cancel request must reach BOTH the main-thread eval/VM loops (this flag)
+ * and any in-flight parallel workers (the pool's cancel flag, via ray_cancel).
+ * Unifying them here means every trigger — the SIGINT handler today, an IPC
+ * cancel message later — stops the whole query, not just the serial half.
+ * ray_cancel/ray_cancel_reset are async-signal-safe, so this stays callable
+ * from the signal handler.  Zero hot-path cost: only runs when a cancel is
+ * actually requested. */
+void ray_request_interrupt(void)      { g_eval_interrupted = 1; ray_cancel(); }
+void ray_clear_interrupt(void)        { g_eval_interrupted = 0; ray_cancel_reset(); }
 bool ray_interrupted(void)            { return g_eval_interrupted != 0; }
 
 /* Legacy internal names — thin wrappers kept for existing callers. */
@@ -446,6 +458,221 @@ static ray_t* atomic_map_binary_parted(ray_binary_fn fn, uint16_t dag_opcode,
     return out;
 }
 
+/* Map a comparison opcode and a three-way compare result to the BOOL the
+ * scalar cmp fns produce. */
+static inline bool cmp_apply(uint16_t opc, int c) {
+    switch (opc) {
+    case OP_EQ: return c == 0;
+    case OP_NE: return c != 0;
+    case OP_LT: return c < 0;
+    case OP_LE: return c <= 0;
+    case OP_GT: return c > 0;
+    default:    return c >= 0;   /* OP_GE */
+    }
+}
+
+/* Union-rank LUTs for SYM ordering compares: sort the domain vocabularies
+ * (one or two) with the canonical string comparator (memcmp over the
+ * common prefix, then length — build_enum_rank / char_str_cmp order) and
+ * assign EQUAL strings EQUAL ranks, so per-element ordering reduces to an
+ * integer rank compare that pool workers can run without touching the
+ * domains.  Returns 0 on success; fills rankL (size dl) and, when rdom
+ * differs, rankR (size dr). */
+typedef struct { const char* p; uint32_t l; int64_t id; int from_r; } symrank_ent_t;
+
+static int sym_union_ranks(struct ray_sym_domain_s* ldom, int64_t dl,
+                           struct ray_sym_domain_s* rdom, int64_t dr,
+                           int64_t* rankL, int64_t* rankR) {
+    int64_t total = dl + ((rdom && rankR) ? dr : 0);
+    if (total <= 0) return 0;
+    ray_t* ents_hdr = ray_alloc(total * (int64_t)sizeof(symrank_ent_t));
+    ray_t* tmp_hdr  = ray_alloc(total * (int64_t)sizeof(symrank_ent_t));
+    if (!ents_hdr || !tmp_hdr) {
+        if (ents_hdr) ray_release(ents_hdr);
+        if (tmp_hdr)  ray_release(tmp_hdr);
+        return -1;
+    }
+    symrank_ent_t* e   = (symrank_ent_t*)ray_data(ents_hdr);
+    symrank_ent_t* tmp = (symrank_ent_t*)ray_data(tmp_hdr);
+    int64_t n = 0;
+    for (int64_t i = 0; i < dl; i++) {
+        ray_t* str = ray_sym_domain_str(ldom, i);
+        e[n].p = str ? ray_str_ptr(str) : NULL;
+        e[n].l = str ? (uint32_t)ray_str_len(str) : 0;
+        e[n].id = i; e[n].from_r = 0; n++;
+    }
+    if (rdom && rankR) {
+        for (int64_t i = 0; i < dr; i++) {
+            ray_t* str = ray_sym_domain_str(rdom, i);
+            e[n].p = str ? ray_str_ptr(str) : NULL;
+            e[n].l = str ? (uint32_t)ray_str_len(str) : 0;
+            e[n].id = i; e[n].from_r = 1; n++;
+        }
+    }
+    /* Bottom-up merge sort by (string) — no comparator context needed. */
+    for (int64_t width = 1; width < n; width *= 2) {
+        for (int64_t lo = 0; lo < n; lo += 2 * width) {
+            int64_t mid = lo + width;    if (mid > n) mid = n;
+            int64_t hi  = lo + 2 * width; if (hi > n) hi = n;
+            int64_t a = lo, b = mid, t = lo;
+            while (a < mid && b < hi) {
+                uint32_t ml = e[a].l < e[b].l ? e[a].l : e[b].l;
+                int c = ml ? memcmp(e[a].p, e[b].p, ml) : 0;
+                if (c == 0) c = (e[a].l > e[b].l) - (e[a].l < e[b].l);
+                tmp[t++] = (c <= 0) ? e[a++] : e[b++];
+            }
+            while (a < mid) tmp[t++] = e[a++];
+            while (b < hi)  tmp[t++] = e[b++];
+            for (int64_t cpy = lo; cpy < hi; cpy++) e[cpy] = tmp[cpy];
+        }
+    }
+    /* Equal strings share a rank so cross-domain equality holds. */
+    int64_t rank = 0;
+    for (int64_t i = 0; i < n; i++) {
+        if (i > 0) {
+            uint32_t ml = e[i].l < e[i-1].l ? e[i].l : e[i-1].l;
+            int c = ml ? memcmp(e[i].p, e[i-1].p, ml) : 0;
+            if (c == 0) c = (e[i].l > e[i-1].l) - (e[i].l < e[i-1].l);
+            if (c != 0) rank++;
+        }
+        if (e[i].from_r) rankR[e[i].id] = rank;
+        else             rankL[e[i].id] = rank;
+    }
+    ray_release(ents_hdr);
+    ray_release(tmp_hdr);
+    return 0;
+}
+
+/* Pool worker: SYM ordering compare via rank LUTs (vec-vec) or a verdict
+ * LUT (vec-vs-atom: verdict[id] = three-way cmp of the id's string against
+ * the atom, orientation already folded in).  Pure integer reads — no
+ * domain access from workers. */
+typedef struct {
+    const void* ld; uint8_t lattrs;
+    const void* rd; uint8_t rattrs;      /* NULL for vec-vs-atom */
+    const int64_t* rankL;
+    const int64_t* rankR;
+    const int8_t*  verdict;              /* vec-vs-atom path */
+    bool*    obuf;
+    uint16_t opc;
+} symord_ctx_t;
+
+static void symord_cmp_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    symord_ctx_t* c = (symord_ctx_t*)raw;
+    if (!c->rd) {
+        for (int64_t i = start; i < end; i++) {
+            int64_t lid = ray_read_sym(c->ld, i, RAY_SYM, c->lattrs);
+            c->obuf[i] = cmp_apply(c->opc, (int)c->verdict[lid]);
+        }
+        return;
+    }
+    for (int64_t i = start; i < end; i++) {
+        int64_t la = c->rankL[ray_read_sym(c->ld, i, RAY_SYM, c->lattrs)];
+        int64_t rb = c->rankR[ray_read_sym(c->rd, i, RAY_SYM, c->rattrs)];
+        c->obuf[i] = cmp_apply(c->opc, (la > rb) - (la < rb));
+    }
+}
+
+/* Pool worker: STR compare — vec-vec or vec-vs-atom, canonical bytes
+ * comparator, no boxing.  ray_str_vec_get is a read-only view. */
+typedef struct {
+    ray_t*      lv;                       /* NULL when left is the atom */
+    ray_t*      rv;                       /* NULL when right is the atom */
+    const char* ap; size_t al;            /* the atom side, when present */
+    bool*       obuf;
+    uint16_t    opc;
+} strcmp_ctx_t;
+
+static void strvec_cmp_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    strcmp_ctx_t* c = (strcmp_ctx_t*)raw;
+    for (int64_t i = start; i < end; i++) {
+        const char *lp, *rp; size_t ll, rl;
+        if (c->lv) { lp = ray_str_vec_get(c->lv, i, &ll); }
+        else       { lp = c->ap; ll = c->al; }
+        if (c->rv) { rp = ray_str_vec_get(c->rv, i, &rl); }
+        else       { rp = c->ap; rl = c->al; }
+        size_t ml = ll < rl ? ll : rl;
+        int cv = ml ? memcmp(lp, rp, ml) : 0;
+        if (cv == 0) cv = (ll > rl) - (ll < rl);
+        c->obuf[i] = cmp_apply(c->opc, cv);
+    }
+}
+
+/* Pool worker for the R7/R8 SYM compare fast paths.  rd == NULL means the
+ * right side is a scalar target id (R7); otherwise element-wise vec-vec
+ * (R8), optionally translating left ids through a vocabulary LUT when the
+ * domains differ.  SYM has no null: pure value compares. */
+typedef struct {
+    const void* ld;
+    const void* rd;         /* NULL for the vec-vs-atom shape */
+    uint8_t     lattrs;
+    uint8_t     rattrs;
+    int64_t     target;     /* vec-vs-atom: right id in the LEFT domain */
+    const int64_t* lut;     /* vec-vec cross-domain: left pos -> right pos */
+    int64_t     lcount;
+    bool*       obuf;
+    bool        invert;
+} symcmp_ctx_t;
+
+static void symcmp_eq_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    symcmp_ctx_t* c = (symcmp_ctx_t*)raw;
+    const void* ld = c->ld;
+    uint8_t la = c->lattrs;
+    bool inv = c->invert;
+    bool* obuf = c->obuf;
+    if (!c->rd) {
+        /* vec vs scalar: width-specialized loops (R7). */
+        uint8_t w = (uint8_t)(la & RAY_SYM_W_MASK);
+        int64_t target = c->target;
+        if (w == RAY_SYM_W8) {
+            const uint8_t* d = (const uint8_t*)ld;
+            uint8_t t8 = (uint8_t)target;
+            for (int64_t i = start; i < end; i++) obuf[i] = (d[i] == t8) ^ inv;
+        } else if (w == RAY_SYM_W16) {
+            const uint16_t* d = (const uint16_t*)ld;
+            uint16_t t16 = (uint16_t)target;
+            for (int64_t i = start; i < end; i++) obuf[i] = (d[i] == t16) ^ inv;
+        } else if (w == RAY_SYM_W32) {
+            const uint32_t* d = (const uint32_t*)ld;
+            uint32_t t32 = (uint32_t)target;
+            for (int64_t i = start; i < end; i++) obuf[i] = (d[i] == t32) ^ inv;
+        } else {
+            const int64_t* d = (const int64_t*)ld;
+            for (int64_t i = start; i < end; i++) obuf[i] = (d[i] == c->target) ^ inv;
+        }
+        return;
+    }
+    const void* rd = c->rd;
+    uint8_t ra = c->rattrs;
+    if (!c->lut) {
+        for (int64_t i = start; i < end; i++)
+            obuf[i] = (ray_read_sym(ld, i, RAY_SYM, la) ==
+                       ray_read_sym(rd, i, RAY_SYM, ra)) ^ inv;
+    } else {
+        const int64_t* lut = c->lut;
+        int64_t lcount = c->lcount;
+        for (int64_t i = start; i < end; i++) {
+            int64_t lid = ray_read_sym(ld, i, RAY_SYM, la);
+            int64_t tl = (lid >= 0 && lid < lcount) ? lut[lid] : -1;
+            int64_t rid = ray_read_sym(rd, i, RAY_SYM, ra);
+            obuf[i] = (tl >= 0 && tl == rid) ^ inv;
+        }
+    }
+}
+
+/* Run the SYM compare worker over [0,n): pool-parallel above the shared
+ * morsel threshold, serial otherwise. */
+static void symcmp_eq_run(symcmp_ctx_t* ctx, int64_t n) {
+    ray_pool_t* pool = ray_pool_get();
+    if (pool && n >= RAY_PARALLEL_THRESHOLD)
+        ray_pool_dispatch(pool, symcmp_eq_fn, ctx, n);
+    else
+        symcmp_eq_fn(ctx, 0, 0, n);
+}
+
 ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, ray_t* right) {
     if ((left && !RAY_IS_ERR(left) && RAY_IS_PARTED(left->type)) ||
         (right && !RAY_IS_ERR(right) && RAY_IS_PARTED(right->type)))
@@ -573,149 +800,6 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
         out_type = RAY_I64;
     }
 
-    /* ══════════════════════════════════════════════════════════════
-     * FAST PATH: opcode-driven vectorized execution.
-     * I64 ops use direct array loops (lowest overhead).
-     * F64/comparison ops route through DAG executor.
-     * ══════════════════════════════════════════════════════════════ */
-
-    /* Direct array loops — only for cross-temporal and mixed-width cases
-     * that the DAG can't handle. All same-type ops go through DAG. */
-    if (0 && !force_boxed && (dag_opcode == OP_DIV || dag_opcode == OP_MOD)) {
-        int8_t ltype = left_coll ? left->type : -(left->type);
-        int8_t rtype = right_coll ? right->type : -(right->type);
-        int esz_l = (ltype == RAY_I64 || ltype == RAY_TIMESTAMP) ? 8 :
-                    (ltype == RAY_I32 || ltype == RAY_DATE || ltype == RAY_TIME) ? 4 :
-                    (ltype == RAY_I16) ? 2 : (ltype == RAY_U8) ? 1 : 0;
-        int esz_r = (rtype == RAY_I64 || rtype == RAY_TIMESTAMP) ? 8 :
-                    (rtype == RAY_I32 || rtype == RAY_DATE || rtype == RAY_TIME) ? 4 :
-                    (rtype == RAY_I16) ? 2 : (rtype == RAY_U8) ? 1 : 0;
-        int lv = left_coll && ray_is_vec(left) && esz_l > 0;
-        int rv = right_coll && ray_is_vec(right) && esz_r > 0;
-        int ls = !left_coll && esz_l > 0;
-        int rs = !right_coll && esz_r > 0;
-
-        /* Cross-type temporal arithmetic (DATE+TIME→TIMESTAMP) needs eval-level
-         * conversion — only use fast path when types are compatible for raw arithmetic */
-        int8_t ltype2 = lv ? left->type : -(left->type);
-        int8_t rtype2 = rv ? right->type : -(right->type);
-        int same_class = (esz_l == esz_r) || /* same storage width */
-                         (ltype2 == RAY_I64 && rtype2 == RAY_I64) || /* both i64 */
-                         (ltype2 == RAY_TIMESTAMP && rtype2 == RAY_TIMESTAMP) ||
-                         /* scalar int + any integer vec is fine (just adds raw values) */
-                         (ls && (rtype2 == ltype2 || ltype2 == RAY_I64)) ||
-                         (rs && (ltype2 == rtype2 || rtype2 == RAY_I64));
-        /* Reject cross-temporal: DATE+TIME, TIMESTAMP+DATE, etc. */
-        int l_temporal = (ltype2==RAY_DATE||ltype2==RAY_TIME||ltype2==RAY_TIMESTAMP);
-        int r_temporal = (rtype2==RAY_DATE||rtype2==RAY_TIME||rtype2==RAY_TIMESTAMP);
-        if (l_temporal && r_temporal && ltype2 != rtype2) same_class = 0;
-
-        if (same_class && ((ls && rv) || (lv && rs) || (lv && rv))) {
-            /* Read elements as i64 regardless of storage width */
-            #define READ_INT(ptr, esz, i) \
-                ((esz)==8 ? ((int64_t*)(ptr))[(i)] : \
-                 (esz)==4 ? (int64_t)((int32_t*)(ptr))[(i)] : \
-                 (esz)==2 ? (int64_t)((int16_t*)(ptr))[(i)] : \
-                            (int64_t)((uint8_t*)(ptr))[(i)])
-            #define SCALAR_INT(obj) \
-                (((obj)->type==-RAY_I64||(obj)->type==-RAY_TIMESTAMP) ? (obj)->i64 : \
-                 ((obj)->type==-RAY_I32||(obj)->type==-RAY_DATE||(obj)->type==-RAY_TIME) ? (int64_t)(obj)->i32 : \
-                 ((obj)->type==-RAY_I16) ? (int64_t)(obj)->i16 : (int64_t)(obj)->u8)
-
-            /* Reuse input buffer when rc==1 and type matches (avoids allocation).
-             * Retain so the caller's ray_release(left/right) doesn't free our output. */
-            ray_t* vec;
-            if (lv && left->rc == 1 && left->type == out_type) {
-                vec = left;
-                ray_retain(vec);  /* caller will release left; we keep ownership */
-            } else if (rv && right->rc == 1 && right->type == out_type) {
-                vec = right;
-                ray_retain(vec);
-            } else {
-                vec = ray_vec_new(out_type, len);
-            }
-            if (!vec || RAY_IS_ERR(vec)) { ray_release(e0); return vec; }
-            vec->len = len;
-
-            void* ldata = lv ? ray_data(left) : NULL;
-            void* rdata = rv ? ray_data(right) : NULL;
-            int64_t lsv = ls ? SCALAR_INT(left) : 0;
-            int64_t rsv = rs ? SCALAR_INT(right) : 0;
-            int out_esz = ray_elem_size(out_type);
-            int l_atom_null = ls && RAY_ATOM_IS_NULL(left);
-            int r_atom_null = rs && RAY_ATOM_IS_NULL(right);
-
-            #define LA(i) (ldata ? READ_INT(ldata, esz_l, i) : lsv)
-            #define RA(i) (rdata ? READ_INT(rdata, esz_r, i) : rsv)
-
-            /* Hoist null check: skip per-element null testing when no nulls */
-            bool l_has_nulls = l_atom_null || (lv && (left->attrs & RAY_ATTR_HAS_NULLS));
-            bool r_has_nulls = r_atom_null || (rv && (right->attrs & RAY_ATTR_HAS_NULLS));
-            bool any_nulls = l_has_nulls || r_has_nulls;
-            void* out_data = ray_data(vec);  /* hoist out of loop */
-
-            if (!any_nulls) {
-                /* Fast path: no nulls — tight loop, no per-element checks */
-                for (int64_t i = 0; i < len; i++) {
-                    int64_t a = LA(i), b = RA(i);
-                    int64_t r;
-                    switch (dag_opcode) {
-                    case OP_ADD: r = (int64_t)((uint64_t)a + (uint64_t)b); break;
-                    case OP_SUB: r = (int64_t)((uint64_t)a - (uint64_t)b); break;
-                    case OP_MUL: r = (int64_t)((uint64_t)a * (uint64_t)b); break;
-                    case OP_DIV: if (b==0) { if (out_esz==8) ((int64_t*)out_data)[i]=0; else if (out_esz==4) ((int32_t*)out_data)[i]=0; else if (out_esz==2) ((int16_t*)out_data)[i]=0; else ((uint8_t*)out_data)[i]=0; ray_vec_set_null(vec,i,true); continue; }
-                                r=a/b; if ((a^b)<0 && r*b!=a) r--; break;
-                    case OP_MOD: if (b==0) { if (out_esz==8) ((int64_t*)out_data)[i]=0; else if (out_esz==4) ((int32_t*)out_data)[i]=0; else if (out_esz==2) ((int16_t*)out_data)[i]=0; else ((uint8_t*)out_data)[i]=0; ray_vec_set_null(vec,i,true); continue; }
-                                r=a%b; if (r && (r^b)<0) r+=b; break;
-                    default: r = 0; break;
-                    }
-                    if (out_esz == 8)      ((int64_t*)out_data)[i] = r;
-                    else if (out_esz == 4)  ((int32_t*)out_data)[i] = (int32_t)r;
-                    else if (out_esz == 2)  ((int16_t*)out_data)[i] = (int16_t)r;
-                    else                    ((uint8_t*)out_data)[i] = (uint8_t)r;
-                }
-            } else {
-                /* Slow path: check nulls per element */
-                #define ISNULL_L(i) (l_atom_null || (lv && ray_vec_is_null(left, i)))
-                #define ISNULL_R(i) (r_atom_null || (rv && ray_vec_is_null(right, i)))
-                for (int64_t i = 0; i < len; i++) {
-                    int64_t a = LA(i), b = RA(i);
-                    int64_t r;
-                    if (ISNULL_L(i) || ISNULL_R(i)) {
-                        if (out_esz == 8)      ((int64_t*)out_data)[i] = 0;
-                        else if (out_esz == 4)  ((int32_t*)out_data)[i] = 0;
-                        else if (out_esz == 2)  ((int16_t*)out_data)[i] = 0;
-                        else                    ((uint8_t*)out_data)[i] = 0;
-                        ray_vec_set_null(vec, i, true);
-                        continue;
-                    }
-                    switch (dag_opcode) {
-                    case OP_ADD: r = (int64_t)((uint64_t)a + (uint64_t)b); break;
-                    case OP_SUB: r = (int64_t)((uint64_t)a - (uint64_t)b); break;
-                    case OP_MUL: r = (int64_t)((uint64_t)a * (uint64_t)b); break;
-                    case OP_DIV: if (b==0) { ((int64_t*)out_data)[i]=0; ray_vec_set_null(vec,i,true); continue; }
-                                r=a/b; if ((a^b)<0 && r*b!=a) r--; break;
-                    case OP_MOD: if (b==0) { ((int64_t*)out_data)[i]=0; ray_vec_set_null(vec,i,true); continue; }
-                                r=a%b; if (r && (r^b)<0) r+=b; break;
-                    default: r = 0; break;
-                    }
-                    if (out_esz == 8)      ((int64_t*)out_data)[i] = r;
-                    else if (out_esz == 4)  ((int32_t*)out_data)[i] = (int32_t)r;
-                    else if (out_esz == 2)  ((int16_t*)out_data)[i] = (int16_t)r;
-                    else                    ((uint8_t*)out_data)[i] = (uint8_t)r;
-                }
-                #undef ISNULL_L
-                #undef ISNULL_R
-            }
-            #undef LA
-            #undef RA
-            #undef READ_INT
-            #undef SCALAR_INT
-            ray_release(e0);
-            return vec;
-        }
-    }
-
     /* DAG executor — for F64 and comparisons */
     if (!force_boxed && dag_opcode > 0) {
         int is_idiv = (dag_opcode == OP_MOD);
@@ -737,10 +821,11 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
         /* Null scalar atoms lose their null bit in DAG constants — use slow path */
         if (l_num_scalar && RAY_ATOM_IS_NULL(left)) can_dag = 0;
         if (r_num_scalar && RAY_ATOM_IS_NULL(right)) can_dag = 0;
-        /* TODO: migrate expr.c to bitmap nulls and remove this bail-out.
-         * DAG executor (expr.c) still uses sentinel-based null checks. */
-        if (l_num_vec && (left->attrs & RAY_ATTR_HAS_NULLS)) can_dag = 0;
-        if (r_num_vec && (right->attrs & RAY_ATTR_HAS_NULLS)) can_dag = 0;
+        /* Null-bearing vectors route through the DAG too: the null model is
+         * sentinel-based end to end (bitmap decommissioned), and expr.c's
+         * kernels are sentinel-aware (null-fusion) — the old bail predated
+         * that and silently degraded every nullable-vector op to the boxed
+         * per-element loop. */
 
         /* Div/mod: only I64×I64 (executor has floor-div semantics for I64) */
         if (is_idiv && !(lt == RAY_I64 && rt == RAY_I64)) can_dag = 0;
@@ -807,9 +892,9 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
      * thrash dominates: `(!= URL nu)` standalone takes 113 ms when the
      * raw work is one i64 lookup + N width-truncated cmpneq.
      *
-     * Handles either operand order; output is RAY_BOOL.  Nulls go
-     * through the atom-vs-atom rules already in cmp.c (null≠value
-     * is true for NE) by applying the same logic per element. */
+     * Handles either operand order; output is RAY_BOOL.  SYM has no
+     * null (ray_vec_is_null / RAY_ATOM_IS_NULL are both false for SYM),
+     * so this is a pure value compare — no per-element null rules. */
     if (!force_boxed && (dag_opcode == OP_EQ || dag_opcode == OP_NE) &&
         out_type == RAY_BOOL) {
         int l_is_sym_vec = left_coll  && ray_is_vec(left)  && left->type  == RAY_SYM;
@@ -826,11 +911,8 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
                 out->len = n;
                 bool*    obuf = (bool*)ray_data(out);
                 const void* src = ray_data(vv);
-                int8_t  vt = vv->type;
                 uint8_t va = vv->attrs;
-                int     atom_null = RAY_ATOM_IS_NULL(atom);
-                int64_t target = atom_null ? 0 : atom->i64;
-                int     vec_has_nulls = (va & RAY_ATTR_HAS_NULLS) ? 1 : 0;
+                int64_t target = atom->i64;
                 bool    invert = (dag_opcode == OP_NE);
 
                 /* sym-domain Phase 2: the loops below compare RAW cell
@@ -838,76 +920,251 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
                  * atom carries a runtime id — re-express it in the
                  * column's domain once before the loops.  Runtime-domain
                  * columns keep the raw id (byte-identical fast path).
-                 * Literal absent from the domain ⇒ equals no cell and,
-                 * with a non-null atom, no null row either: == all-false,
-                 * != all-true — same as the per-element atom rules. */
+                 * Literal absent from the domain ⇒ equals no cell (SYM has
+                 * no null, so there is no null row either): == all-false,
+                 * != all-true. */
                 int target_absent = 0;
-                if (!atom_null) {
-                    struct ray_sym_domain_s* dom = ray_sym_vec_domain(vv);
-                    if (dom != ray_sym_runtime_domain()) {
-                        ray_t* ts = ray_sym_str(atom->i64);
-                        int64_t pos = ts ? ray_sym_domain_find(dom,
-                                              ray_str_ptr(ts),
-                                              ray_str_len(ts))
-                                         : -1;
-                        if (pos >= 0) target = pos;
-                        else          target_absent = 1;
-                    }
+                struct ray_sym_domain_s* dom = ray_sym_vec_domain(vv);
+                if (dom != ray_sym_runtime_domain()) {
+                    ray_t* ts = ray_sym_str(atom->i64);
+                    int64_t pos = ts ? ray_sym_domain_find(dom,
+                                          ray_str_ptr(ts),
+                                          ray_str_len(ts))
+                                     : -1;
+                    if (pos >= 0) target = pos;
+                    else          target_absent = 1;
                 }
 
                 if (target_absent) {
                     bool fill = invert; /* != absent → true; == absent → false */
                     for (int64_t i = 0; i < n; i++) obuf[i] = fill;
-                } else if (atom_null && !vec_has_nulls) {
-                    /* Atom is null, vec has no nulls — every row is
-                     * "not equal" to the null atom (== false, != true). */
-                    bool fill = invert; /* != null → true; == null → false */
-                    for (int64_t i = 0; i < n; i++) obuf[i] = fill;
-                } else if (!atom_null && !vec_has_nulls) {
-                    /* Hot path: tight per-width loop, no per-element
-                     * null checks. */
-                    uint8_t w = (uint8_t)(va & RAY_SYM_W_MASK);
-                    if (w == RAY_SYM_W8) {
-                        const uint8_t* d = (const uint8_t*)src;
-                        uint8_t t8 = (uint8_t)target;
-                        for (int64_t i = 0; i < n; i++)
-                            obuf[i] = (d[i] == t8) ^ invert;
-                    } else if (w == RAY_SYM_W16) {
-                        const uint16_t* d = (const uint16_t*)src;
-                        uint16_t t16 = (uint16_t)target;
-                        for (int64_t i = 0; i < n; i++)
-                            obuf[i] = (d[i] == t16) ^ invert;
-                    } else if (w == RAY_SYM_W32) {
-                        const uint32_t* d = (const uint32_t*)src;
-                        uint32_t t32 = (uint32_t)target;
-                        for (int64_t i = 0; i < n; i++)
-                            obuf[i] = (d[i] == t32) ^ invert;
-                    } else { /* RAY_SYM_W64 */
-                        const int64_t* d = (const int64_t*)src;
-                        for (int64_t i = 0; i < n; i++)
-                            obuf[i] = (d[i] == target) ^ invert;
-                    }
                 } else {
-                    /* General path: vec may have nulls, atom may be null.
-                     * Apply atom-rules per element so semantics match
-                     * the slow path exactly. */
-                    for (int64_t i = 0; i < n; i++) {
-                        int row_null = ray_vec_is_null(vv, i);
-                        int eq;
-                        if (row_null && atom_null)      eq = 1;
-                        else if (row_null || atom_null) eq = 0;
-                        else {
-                            int64_t row_id = ray_read_sym(src, i, vt, va);
-                            eq = (row_id == target);
-                        }
-                        obuf[i] = invert ? !eq : eq;
-                    }
+                    /* SYM has no null: the compare reduces to a tight
+                     * per-width raw-id loop, pool-parallel above the
+                     * shared morsel threshold (symcmp_eq_fn). */
+                    symcmp_ctx_t sctx = {
+                        .ld = src, .rd = NULL, .lattrs = va, .rattrs = 0,
+                        .target = target, .lut = NULL, .lcount = 0,
+                        .obuf = obuf, .invert = invert,
+                    };
+                    symcmp_eq_run(&sctx, n);
                 }
                 ray_release(e0);
                 return out;
             }
             if (out) ray_release(out);
             /* Fall through to slow path on allocation failure. */
+        }
+    }
+
+    /* R8 fast path: (== or !=) of SYM-vec against SYM-vec.
+     *
+     * Same rationale as R7 — the DAG path excludes SYM, so without this a
+     * vector-vector symbol compare fans out to one boxed compare per row
+     * (measured 53 ms for 596k rows when the raw work is an id compare).
+     * Same-domain vectors (including both-runtime, the common case)
+     * compare raw cell ids width-aware.  Cross-domain pairs translate the
+     * LEFT vocabulary into the RIGHT domain once — positions, not rows —
+     * then compare in the right id space; an untranslatable left id
+     * matches nothing.  SYM has no null: pure value compare. */
+    if (!force_boxed && (dag_opcode == OP_EQ || dag_opcode == OP_NE) &&
+        out_type == RAY_BOOL &&
+        left_coll && right_coll && ray_is_vec(left) && ray_is_vec(right) &&
+        left->type == RAY_SYM && right->type == RAY_SYM) {
+        int64_t n = left->len;  /* lengths verified equal above */
+        struct ray_sym_domain_s* ldom = ray_sym_vec_domain(left);
+        struct ray_sym_domain_s* rdom = ray_sym_vec_domain(right);
+        int64_t lcount = (ldom == rdom) ? 0 : ray_sym_domain_count(ldom);
+        if (ldom == rdom || (lcount >= 0 && lcount <= (int64_t)1 << 22)) {
+            ray_t* out = ray_vec_new(RAY_BOOL, n);
+            ray_t* lut_hdr = NULL;
+            int64_t* lut = NULL;
+            if (ldom != rdom && lcount > 0 && out && !RAY_IS_ERR(out)) {
+                lut_hdr = ray_alloc(lcount * (int64_t)sizeof(int64_t));
+                if (lut_hdr) {
+                    lut = (int64_t*)ray_data(lut_hdr);
+                    for (int64_t p = 0; p < lcount; p++) {
+                        ray_t* sstr = ray_sym_domain_str(ldom, p);
+                        lut[p] = sstr ? ray_sym_domain_find(rdom,
+                                                            ray_str_ptr(sstr),
+                                                            ray_str_len(sstr))
+                                      : -1;
+                    }
+                }
+            }
+            if (out && !RAY_IS_ERR(out) && (ldom == rdom || lcount == 0 || lut)) {
+                out->len = n;
+                bool* obuf = (bool*)ray_data(out);
+                const void* ld = ray_data(left);
+                const void* rd = ray_data(right);
+                uint8_t lattrs = left->attrs, rattrs = right->attrs;
+                bool invert = (dag_opcode == OP_NE);
+                symcmp_ctx_t sctx = {
+                    .ld = ld, .rd = rd, .lattrs = lattrs, .rattrs = rattrs,
+                    .target = 0,
+                    .lut = (ldom == rdom) ? NULL : lut,
+                    .lcount = lcount,
+                    .obuf = obuf, .invert = invert,
+                };
+                symcmp_eq_run(&sctx, n);
+                if (lut_hdr) ray_release(lut_hdr);
+                ray_release(e0);
+                return out;
+            }
+            if (lut_hdr) ray_release(lut_hdr);
+            if (out && !RAY_IS_ERR(out)) ray_release(out);
+            /* Fall through to slow path on allocation failure. */
+        }
+    }
+
+    /* R9 fast path: SYM ordering compares (< <= > >=), vec-vec and
+     * vec-vs-atom.  Lexicographic order (the char_str_cmp / build_enum_rank
+     * comparator) is precomputed once over the domain VOCABULARY — a rank
+     * LUT for vec-vec (union-ranked across two domains so equal strings
+     * rank equal), a three-way verdict LUT for vec-vs-atom — then the row
+     * loop is pure integer reads, pool-parallel.  SYM has no null. */
+    if (!force_boxed && out_type == RAY_BOOL &&
+        (dag_opcode == OP_LT || dag_opcode == OP_LE ||
+         dag_opcode == OP_GT || dag_opcode == OP_GE)) {
+        int l_sym_vec = left_coll  && ray_is_vec(left)  && left->type  == RAY_SYM;
+        int r_sym_vec = right_coll && ray_is_vec(right) && right->type == RAY_SYM;
+        int l_sym_atom = !left_coll  && left  && left->type  == -RAY_SYM;
+        int r_sym_atom = !right_coll && right && right->type == -RAY_SYM;
+
+        if (l_sym_vec && r_sym_vec) {
+            struct ray_sym_domain_s* ldom = ray_sym_vec_domain(left);
+            struct ray_sym_domain_s* rdom = ray_sym_vec_domain(right);
+            int64_t dl = ray_sym_domain_count(ldom);
+            int64_t dr = (rdom == ldom) ? 0 : ray_sym_domain_count(rdom);
+            if (dl >= 0 && dl + dr <= (int64_t)1 << 22) {
+                int64_t n = left->len;
+                ray_t* out = ray_vec_new(RAY_BOOL, n);
+                ray_t* rl_hdr = (dl > 0)
+                    ? ray_alloc(dl * (int64_t)sizeof(int64_t)) : NULL;
+                ray_t* rr_hdr = (rdom != ldom && dr > 0)
+                    ? ray_alloc(dr * (int64_t)sizeof(int64_t)) : NULL;
+                int64_t* rankL = rl_hdr ? (int64_t*)ray_data(rl_hdr) : NULL;
+                int64_t* rankR = rr_hdr ? (int64_t*)ray_data(rr_hdr) : NULL;
+                bool built = out && !RAY_IS_ERR(out) && (dl == 0 || rankL) &&
+                             (rdom == ldom || dr == 0 || rankR) &&
+                    sym_union_ranks(ldom, dl,
+                                    (rdom == ldom) ? NULL : rdom, dr,
+                                    rankL, rankR) == 0;
+                if (built) {
+                    out->len = n;
+                    symord_ctx_t sctx = {
+                        .ld = ray_data(left),  .lattrs = left->attrs,
+                        .rd = ray_data(right), .rattrs = right->attrs,
+                        .rankL = rankL,
+                        .rankR = (rdom == ldom) ? rankL : rankR,
+                        .verdict = NULL,
+                        .obuf = (bool*)ray_data(out), .opc = dag_opcode,
+                    };
+                    ray_pool_t* pool = ray_pool_get();
+                    if (pool && n >= RAY_PARALLEL_THRESHOLD)
+                        ray_pool_dispatch(pool, symord_cmp_fn, &sctx, n);
+                    else
+                        symord_cmp_fn(&sctx, 0, 0, n);
+                    if (rl_hdr) ray_release(rl_hdr);
+                    if (rr_hdr) ray_release(rr_hdr);
+                    ray_release(e0);
+                    return out;
+                }
+                if (rl_hdr) ray_release(rl_hdr);
+                if (rr_hdr) ray_release(rr_hdr);
+                if (out && !RAY_IS_ERR(out)) ray_release(out);
+                /* fall through on OOM */
+            }
+        } else if ((l_sym_vec && r_sym_atom) || (r_sym_vec && l_sym_atom)) {
+            ray_t* vv   = l_sym_vec ? left  : right;
+            ray_t* atom = l_sym_vec ? right : left;
+            struct ray_sym_domain_s* dom = ray_sym_vec_domain(vv);
+            int64_t d = ray_sym_domain_count(dom);
+            ray_t* as = ray_sym_str(atom->i64);
+            if (as && d > 0 && d <= (int64_t)1 << 22) {
+                const char* ap = ray_str_ptr(as);
+                uint32_t    al = (uint32_t)ray_str_len(as);
+                int64_t n = vv->len;
+                ray_t* out = ray_vec_new(RAY_BOOL, n);
+                ray_t* vd_hdr = ray_alloc(d);
+                if (out && !RAY_IS_ERR(out) && vd_hdr) {
+                    int8_t* verdict = (int8_t*)ray_data(vd_hdr);
+                    for (int64_t idp = 0; idp < d; idp++) {
+                        ray_t* es = ray_sym_domain_str(dom, idp);
+                        const char* ep = es ? ray_str_ptr(es) : NULL;
+                        uint32_t    el = es ? (uint32_t)ray_str_len(es) : 0;
+                        uint32_t ml = el < al ? el : al;
+                        int cv = ml ? memcmp(ep, ap, ml) : 0;
+                        if (cv == 0) cv = (el > al) - (el < al);
+                        /* fold orientation: verdict is cmp(LEFT, RIGHT) */
+                        if (!l_sym_vec) cv = -cv;
+                        verdict[idp] = (int8_t)((cv > 0) - (cv < 0));
+                    }
+                    out->len = n;
+                    symord_ctx_t sctx = {
+                        .ld = ray_data(vv), .lattrs = vv->attrs,
+                        .rd = NULL, .rattrs = 0,
+                        .rankL = NULL, .rankR = NULL,
+                        .verdict = verdict,
+                        .obuf = (bool*)ray_data(out), .opc = dag_opcode,
+                    };
+                    ray_pool_t* pool = ray_pool_get();
+                    if (pool && n >= RAY_PARALLEL_THRESHOLD)
+                        ray_pool_dispatch(pool, symord_cmp_fn, &sctx, n);
+                    else
+                        symord_cmp_fn(&sctx, 0, 0, n);
+                    ray_release(vd_hdr);
+                    ray_release(e0);
+                    return out;
+                }
+                if (vd_hdr) ray_release(vd_hdr);
+                if (out && !RAY_IS_ERR(out)) ray_release(out);
+            }
+        }
+    }
+
+    /* R10 fast path: STR compares (== != < <= > >=), vec-vec and
+     * vec-vs-atom — canonical bytes comparator per element, pool-parallel,
+     * no boxing.  Gated off null-bearing operands: null compare semantics
+     * (null matches nothing, null==null is true) belong to the scalar fns. */
+    if (!force_boxed && out_type == RAY_BOOL &&
+        (dag_opcode == OP_EQ || dag_opcode == OP_NE ||
+         dag_opcode == OP_LT || dag_opcode == OP_LE ||
+         dag_opcode == OP_GT || dag_opcode == OP_GE)) {
+        int l_str_vec = left_coll  && ray_is_vec(left)  && left->type  == RAY_STR &&
+                        !(left->attrs & RAY_ATTR_HAS_NULLS);
+        int r_str_vec = right_coll && ray_is_vec(right) && right->type == RAY_STR &&
+                        !(right->attrs & RAY_ATTR_HAS_NULLS);
+        int l_str_atom = !left_coll  && left  && left->type  == -RAY_STR &&
+                         !RAY_ATOM_IS_NULL(left);
+        int r_str_atom = !right_coll && right && right->type == -RAY_STR &&
+                         !RAY_ATOM_IS_NULL(right);
+        int vv_shape = l_str_vec && r_str_vec;
+        int va_shape = (l_str_vec && r_str_atom) || (r_str_vec && l_str_atom);
+        if (vv_shape || va_shape) {
+            int64_t n = l_str_vec ? left->len : right->len;
+            ray_t* out = ray_vec_new(RAY_BOOL, n);
+            if (out && !RAY_IS_ERR(out)) {
+                out->len = n;
+                ray_t* atom = vv_shape ? NULL : (l_str_vec ? right : left);
+                strcmp_ctx_t sctx = {
+                    .lv = (vv_shape || l_str_vec) ? left  : NULL,
+                    .rv = (vv_shape || r_str_vec) ? right : NULL,
+                    .ap = atom ? ray_str_ptr(atom) : NULL,
+                    .al = atom ? ray_str_len(atom) : 0,
+                    .obuf = (bool*)ray_data(out), .opc = dag_opcode,
+                };
+                if (sctx.lv && !ray_is_vec(sctx.lv)) sctx.lv = NULL;
+                if (sctx.rv && !ray_is_vec(sctx.rv)) sctx.rv = NULL;
+                ray_pool_t* pool = ray_pool_get();
+                if (pool && n >= RAY_PARALLEL_THRESHOLD)
+                    ray_pool_dispatch(pool, strvec_cmp_fn, &sctx, n);
+                else
+                    strvec_cmp_fn(&sctx, 0, 0, n);
+                ray_release(e0);
+                return out;
+            }
+            if (out && !RAY_IS_ERR(out)) ray_release(out);
         }
     }
 
@@ -2017,7 +2274,7 @@ op_jmp: {
     int16_t offset = (int16_t)((code[ip] << 8) | code[ip + 1]);
     ip += 2;
     ip += offset;
-    if (offset < 0 && g_eval_interrupted) goto vm_error_limit;
+    if (offset < 0 && g_eval_interrupted) goto vm_error_cancel;
     DISPATCH();
 }
 
@@ -2180,7 +2437,7 @@ op_callf: {
                 ray_release(fn_args[i]);  /* excess args */
 
             /* Check for Ctrl-C interrupt on each compiled call */
-            if (g_eval_interrupted) goto vm_error_limit;
+            if (g_eval_interrupted) goto vm_error_cancel;
 
             /* Switch to callee bytecode */
             code = (uint8_t *)ray_data(LAMBDA_BC(fn_obj));
@@ -2434,6 +2691,11 @@ op_scope_end: {
 vm_error_limit:
     vm_err_str = "limit";
     vm_err_detail = "stack overflow";
+    goto vm_error_cleanup;
+
+vm_error_cancel:
+    vm_err_str = "cancel";
+    vm_err_detail = "interrupted";
     goto vm_error_cleanup;
 
 vm_error_name:
@@ -2771,6 +3033,7 @@ static void ray_register_builtins(void) {
     register_vary("pmap",   RAY_FN_NONE, ray_pmap_fn);
     register_vary("fold",   RAY_FN_NONE, ray_fold_fn);
     register_vary("scan",   RAY_FN_NONE, ray_scan_fn);
+    register_vary("prior",  RAY_FN_NONE, ray_prior_fn);
     register_binary("filter", RAY_FN_NONE, ray_filter_fn);
     register_vary("apply",  RAY_FN_NONE, ray_apply_fn);
 
@@ -2805,6 +3068,7 @@ static void ray_register_builtins(void) {
 
     /* Query operations */
     register_vary("select",    RAY_FN_SPECIAL_FORM, ray_select);
+    register_vary("window",    RAY_FN_SPECIAL_FORM, ray_window_fn);
     register_vary("update",    RAY_FN_SPECIAL_FORM | RAY_FN_RESTRICTED, ray_update);
     register_vary("insert",    RAY_FN_SPECIAL_FORM | RAY_FN_RESTRICTED, ray_insert);
     register_vary("upsert",    RAY_FN_SPECIAL_FORM | RAY_FN_RESTRICTED, ray_upsert);
@@ -3006,6 +3270,9 @@ static void ray_register_builtins(void) {
     register_vary("del",          RAY_FN_SPECIAL_FORM | RAY_FN_RESTRICTED, ray_del_fn);
     register_vary(".sys.build", RAY_FN_NONE, ray_internals_fn);
     register_vary(".sys.mem",   RAY_FN_NONE, ray_memstat_fn);
+    register_vary(".sys.prof",  RAY_FN_NONE, ray_prof_fn);
+    register_vary(".sys.querylog",        RAY_FN_NONE,       ray_qlog_fn);
+    register_vary(".sys.querylog.enable", RAY_FN_RESTRICTED, ray_qlog_enable_fn);
     register_vary("modify",     RAY_FN_RESTRICTED, ray_modify_fn);
     register_vary("pivot",      RAY_FN_NONE, ray_pivot_fn);
     register_vary(".sys.info",  RAY_FN_NONE, ray_sysinfo_fn);
@@ -3121,6 +3388,30 @@ void ray_lang_destroy(void) {
  * Tree-walking evaluator
  * ══════════════════════════════════════════ */
 
+/* Fill a profiler span's payload — memory (sys_cur) and parallelism (qstats)
+ * — from the live counters.  Mirrors exec_node's capture so direct-builtin
+ * ops (arithmetic, aggregation, generators that run OUTSIDE the DAG) report
+ * the same columns as DAG operators.  `result` is NULL at span START (no
+ * row count to size yet). */
+static inline void eval_span_payload(ray_prof_span_t* s, ray_t* result) {
+    if (!s) return;
+    int64_t cur = 0; ray_sys_get_stat(&cur, NULL);
+    s->sys_cur = cur;
+    s->qs_rows = ray_qstats_sum_rows();
+    uint64_t sum = 0, mx = 0; uint32_t used = 0;
+    ray_qstats_agg(&used, &sum, &mx);
+    s->qs_busy_ns = sum;
+    s->qs_workers = used;
+    if (result && !RAY_IS_ERR(result) && !RAY_IS_NULL(result)) {
+        /* ray_len on a scalar atom returns the stored VALUE (the len field
+         * aliases i64), not an element count — so a `(sum …)` result would
+         * masquerade as a billion-row output.  A scalar is one row. */
+        s->rows_out  = (result->type == RAY_TABLE) ? ray_table_nrows(result)
+                     : ray_is_atom(result)         ? 1
+                     :                                (int64_t)ray_len(result);
+    }
+}
+
 ray_t* ray_eval(ray_t* obj) {
     if (!obj || RAY_IS_ERR(obj)) return obj;
 
@@ -3129,11 +3420,25 @@ ray_t* ray_eval(ray_t* obj) {
     if (RAY_UNLIKELY(!__VM))
         return ray_error("state", "no VM bound to this thread");
 
-    if (__VM->eval_depth == 0)
+    if (__VM->eval_depth == 0) {
         affine_sum_cache_clear();
+        /* Scope the parallelism counters to THIS top-level query.  The
+         * slots are process-cumulative otherwise, so a serial op would
+         * inherit the worker count of whatever ran before it (e.g. table
+         * construction), reading as "28 workers, 0 busy".  Resetting at the
+         * query boundary — and setting PROF mode here rather than only in
+         * ray_execute — also means non-DAG paths (the select special form,
+         * direct builtins) get their pool dispatches measured, and keeps
+         * capture strictly off (mode 0) when the profiler is disabled. */
+        bool capture  = g_ray_profile.active || ray_qlog_enabled();
+        bool progress = ray_progress_active();
+        uint32_t qsmode = (capture ? RAY_QS_PROF : 0) | (progress ? RAY_QS_PROGRESS : 0);
+        ray_qstats_set_mode(qsmode);
+        if (qsmode) ray_qstats_reset(0);
+    }
 
     /* Check for external interrupt (e.g. Ctrl-C from REPL) */
-    if (g_eval_interrupted) return ray_error("limit", "interrupted");
+    if (g_eval_interrupted) return ray_error("cancel", "interrupted");
 
     if (++__VM->eval_depth > RAY_EVAL_MAX_DEPTH) {
         __VM->eval_depth--;
@@ -3141,6 +3446,16 @@ ray_t* ray_eval(ray_t* obj) {
     }
 
     ray_t* ret;
+
+    /* Direct-builtin profiling span: opened just before the head-dispatch
+     * switch below (for UNARY/BINARY/VARY builtins), closed at `out:`.
+     * Extends the profiler's coverage to ops that run outside the DAG —
+     * generators (`til`), arithmetic (`+`), aggregation (`count`/`sum`) —
+     * which otherwise leave the whole query opaque in a single `eval` tick.
+     * NULL/-1 on every path that never reaches the switch (atoms, errors). */
+    ray_prof_span_t* ev_span = NULL;
+    const char*      ev_name = NULL;
+    int64_t          ev_idx  = -1;
 
     /* Atoms: return themselves (retain) */
     if (ray_is_atom(obj)) {
@@ -3233,6 +3548,31 @@ ray_t* ray_eval(ray_t* obj) {
     }
 
     int64_t n = ray_len(obj);
+
+    /* Open a profiling span around the builtin invocation.  Gated on the
+     * profiler flag FIRST so the disabled path is a single predicted branch
+     * per call — nothing else runs (pillar-4 zero-cost-off).  ray_fn_name
+     * reads the label inline from the fn object's aux bytes — stable for
+     * as long as `head` lives, but NOT beyond: a builtin's env slot can be
+     * rebound (e.g. `(set + ...)`), dropping the object's refcount to zero
+     * and freeing those bytes.  The span outlives this call (read later by
+     * `.sys.prof`, possibly after such a rebind), so the raw aux pointer
+     * must not be stored directly.  Intern it instead: the sym table's
+     * arena never frees or relocates an interned string once allocated, so
+     * ray_str_ptr(ray_sym_str(...)) is valid for the rest of the process,
+     * independent of `head`'s lifetime. */
+    if (g_ray_profile.active &&
+        (head->type == RAY_UNARY || head->type == RAY_BINARY ||
+         head->type == RAY_VARY)) {
+        const char* raw_name = ray_fn_name(head);
+        ray_t* name_atom = ray_sym_str(ray_sym_intern(raw_name, strlen(raw_name)));
+        ev_name = name_atom ? ray_str_ptr(name_atom) : raw_name;
+        ev_span = ray_profile_span_start(ev_name);
+        if (ev_span) {
+            ev_idx = (int64_t)g_ray_profile.n - 1;   /* index of this START */
+            eval_span_payload(ev_span, NULL);
+        }
+    }
 
     switch (head->type) {
         case RAY_UNARY: {
@@ -3402,6 +3742,27 @@ ray_t* ray_eval(ray_t* obj) {
     }
 
 out:
+    /* Close the direct-builtin span opened before the dispatch switch.
+     * ev_span is non-NULL only when profiling is active and we opened one,
+     * so error/atom paths (which never reach the switch) skip this. */
+    if (ev_span) {
+        ray_prof_span_t* ep = ray_profile_span_end(ev_name);
+        if (ep) {
+            eval_span_payload(ep, ret);
+            /* Noise gate: retract a trivial LEAF span so scalar ops
+             * (`(+ 1 2)`, `(count 'x)`) don't flood the log.  A leaf has
+             * its START and END adjacent (no child spans appended between);
+             * keep it only if it moved bulk data (>1 row) or took real time
+             * (≥50µs).  Ops with nested children are always kept — they
+             * carry the tree structure. */
+            if (ev_idx >= 0 && (int64_t)g_ray_profile.n == ev_idx + 2) {
+                ray_prof_span_t* sp = &g_ray_profile.spans[ev_idx];
+                int64_t dur_ns = ep->ts - sp->ts;
+                if (ep->rows_out <= 1 && dur_ns < 50000)
+                    g_ray_profile.n = (uint32_t)ev_idx;   /* drop START+END */
+            }
+        }
+    }
     __VM->eval_depth--;
     /* End-of-top-level-expression cleanup hook. Every path that
      * entered ray_eval — REPL, IPC, ray_eval_str, file mode — exits

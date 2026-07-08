@@ -62,6 +62,7 @@ typedef enum {
     RAY_JREPLAY_OOM     = 3, /* allocation failed mid-replay — transient, retryable             */
     RAY_JREPLAY_DESER   = 4, /* header valid but ray_de_raw rejected the payload                */
     RAY_JREPLAY_DECOMP  = 5, /* compressed payload, but decompression failed                    */
+    RAY_JREPLAY_CANCEL  = 6, /* interrupted mid-replay — clean abort, log intact, DO NOT truncate */
 } ray_jreplay_status_t;
 
 /* Open the journal: load <base>.qdb, replay <base>.log, open log for append.

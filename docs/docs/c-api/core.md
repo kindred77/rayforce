@@ -1,7 +1,7 @@
 # Core C API Reference
 
-!!! note "Single header"
-    Include `<rayforce.h>` to access the entire public API. Link against `librayforce.a` (static) or `librayforce.so` (shared). No external dependencies.
+!!! note "Headers"
+    Include `<rayforce.h>` for the bulk of the public API. A few internal helpers documented here live in their own headers — in particular `ray_cow` and the `ray_heap_init` / `ray_heap_destroy` lifecycle calls are declared in `"mem/heap.h"`, not in `<rayforce.h>`. Link against `librayforce.a` (static) or `librayforce.so` (shared). No external dependencies.
 
 ## Lifecycle
 
@@ -513,3 +513,5 @@ if (RAY_IS_ERR(result)) {
 | `RAY_ERR_PARSE` | 12 | Parse error |
 | `RAY_ERR_NAME` | 13 | Name not found |
 | `RAY_ERR_LIMIT` | 14 | Limit exceeded |
+| `RAY_ERR_RESERVED` | 15 | Reserved name |
+| `RAY_ERR_VERSION` | 16 | Version mismatch |

@@ -31,7 +31,7 @@
 '\032' -- '\032'
 ;; SUB (Substitute);
 ;; Test empty quoted symbol (single quote)
-' -- 0Ns
+' -- '
 ;; Empty quoted symbol should be parsed as a null symbol
 ;; Test basic string literals
 "Hello, World!" -- "Hello, World!"

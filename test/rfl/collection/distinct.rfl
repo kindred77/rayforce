@@ -167,7 +167,7 @@
 (at (at rk2s 'p) 99) -- 3.0
 (at (at rk2s 's) 99) -- 2
 ;; The original test here ran a SYM null-rank-collapse regression
-;; using [0Ns 0Ns aa] over 99 rows.  SYM columns are now no-null by
+;; using [' ' aa] over 99 rows.  SYM columns are now no-null by
 ;; design (sym 0 = empty string is the canonical "missing" value),
 ;; so the null-collapse case it covered no longer exists.  Other
 ;; non-SYM null tests above and below still exercise the rank

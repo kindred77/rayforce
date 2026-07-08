@@ -60,7 +60,7 @@ All clients must authenticate. The username field is transmitted but not validat
 ./rayforce -p 5000 -U secret123
 ```
 
-In restricted mode, specific builtins that write files, mutate state, or control the server process are blocked for IPC connections. Queries, aggregations, and read-only operations are allowed. The following builtins are blocked:
+In restricted mode, specific builtins that write files, mutate state, or control the server process are blocked for IPC connections. Queries, aggregations, and read-only operations are allowed. The blocked set is the full `RAY_FN_RESTRICTED` builtin list; it includes (but is not limited to):
 
 | Category | Blocked Builtins |
 |---|---|
@@ -71,7 +71,7 @@ In restricted mode, specific builtins that write files, mutate state, or control
 | IPC chaining | `.ipc.open`, `.ipc.close`, `.ipc.send`, `.ipc.post` |
 
 !!! note "Scope"
-    Restricted mode blocks the builtins listed above. It does not provide full sandboxing — `select`, `.db.splayed.get`, `.db.parted.get`, and other read operations on already-loaded data or splayed tables remain available.
+    Restricted mode blocks every builtin registered with `RAY_FN_RESTRICTED` (the table above is a representative subset). It does not provide full sandboxing — `select`, `.db.splayed.get`, `.db.parted.get`, and other read operations on already-loaded data or splayed tables remain available.
 
 Attempting a restricted operation returns an `"access"` error:
 
@@ -186,7 +186,7 @@ The `ser` builtin converts any value to a binary buffer (a `U8` vector). Pass it
 ```lisp
 ;; Serialize an integer
 (ser 42)
-;; => [0xfa 0xde 0xfa 0xce 0x02 0x00 0x00 0x00 ..]
+;; => [0xfa 0xde 0xfa 0xce 0x03 0x00 0x00 0x00 ..]
 
 ;; Serialize a vector
 (ser (til 10))
@@ -244,7 +244,7 @@ Every serialized payload begins with a 16-byte `ray_ipc_header_t` header, follow
 |---|---|---|---|
 | 0 | 4 bytes | `prefix` | Magic bytes `0xcefadefa` — identifies Rayforce binary data |
 | 4 | 1 byte | `version` | Wire-format version (`RAY_SERDE_WIRE_VERSION`, currently `3`). Decoupled from `RAY_VERSION_MAJOR`. A receiver that sees a different byte here rejects the payload with a `version` error instead of attempting to parse it. |
-| 5 | 1 byte | `flags` | Bit 0: compressed (0 = no, 1 = yes) |
+| 5 | 1 byte | `flags` | Bit 0 (`0x01`): compressed (0 = no, 1 = yes). Bit 1 (`0x02`, `RAY_IPC_FLAG_RESTRICTED`): journal-only — records that a persisted frame arrived on a `-U` restricted connection so replay re-imposes the restriction; ignored on the live wire. Bit 2 (`0x04`, `RAY_IPC_FLAG_VERBOSE`): request that the server capture the eval's stdout/stderr and return `[captured_str, result]` (used by the remote-REPL wrapper). |
 | 6 | 1 byte | `endian` | Endianness: `0` = little-endian |
 | 7 | 1 byte | `msgtype` | Message type: `0` = async, `1` = sync, `2` = response |
 | 8 | 8 bytes | `size` | Payload size in bytes (`int64`) |
@@ -255,7 +255,7 @@ The corresponding C struct:
 typedef struct ray_ipc_header_t {
     uint32_t prefix;     /* RAY_SERDE_PREFIX (0xcefadefa) */
     uint8_t  version;    /* RAY_SERDE_WIRE_VERSION (currently 3) */
-    uint8_t  flags;      /* 0 */
+    uint8_t  flags;      /* bit0 compressed, bit1 restricted (journal), bit2 verbose */
     uint8_t  endian;     /* 0 = little-endian */
     uint8_t  msgtype;    /* 0 = async, 1 = sync, 2 = response */
     int64_t  size;       /* payload size in bytes */

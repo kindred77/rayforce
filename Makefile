@@ -1,4 +1,13 @@
 CC      ?= clang
+# Some targets need clang specifically regardless of $(CC): the fuzzing
+# runtime (-fsanitize=fuzzer) and -MJ compilation-database fragments are
+# clang-only.  Same precedent as `make coverage`, which pins CC=clang.
+CLANG   ?= clang
+# The fuzzing runtime (-fsanitize=fuzzer) is implemented in C++, so the
+# final link must pull in the C++ standard library.  Using the C++ driver
+# for that one link step is the portable way to get its path right; the
+# translation units themselves stay C.
+CLANGXX ?= clang++
 STD     = c17
 AR      = ar
 TARGET  = rayforce
@@ -73,6 +82,38 @@ endif
 
 DEBUG_LDFLAGS   = -fsanitize=address,undefined
 
+# Extra build flavours (fuzz / tsan / hardened).  Each gets its OWN object
+# suffix (%.fuzz.o, %.tsan.o, %.hard.o) because the primary flavours compile
+# objects in place — mixing, say, thread-sanitized and address-sanitized
+# objects in one link is undefined at best.  The debug/release pair keeps
+# its historical in-place behaviour.
+#
+# fuzz: coverage-guided fuzzing drivers under fuzz/ link against these
+#   objects.  -O1 (not -O0): ~5-10x more executions/sec with still-usable
+#   stack traces.  RAY_FUZZING compiles out shell/network escape hatches
+#   (see src/lang/syscmd.c) so eval-based fuzzing stays sandboxed.
+#   Linux-only: the system toolchain on macOS does not bundle the fuzzer
+#   runtime.
+FUZZ_CFLAGS = -fPIC $(WARNS) -std=$(STD) -g -O1 -march=$(RAY_MARCH) -DDEBUG -DRAY_FUZZING \
+  -fsanitize=fuzzer-no-link,address,undefined -fno-omit-frame-pointer
+
+# tsan: data-race detection for the lock-free pool/heap paths.  Mutually
+# exclusive with address sanitizing, hence its own flavour.  DEBUG is kept
+# so the invariant checks run under it too.
+TSAN_CFLAGS  = -fPIC $(WARNS) -std=$(STD) -g -O1 -march=$(RAY_MARCH) -DDEBUG \
+  -fsanitize=thread -fno-omit-frame-pointer
+TSAN_LDFLAGS = -fsanitize=thread
+
+# hardened: the cloud-deployment tier.  Release optimization levels, but
+# keeps symbols and frame pointers (reliable crash backtraces, ~1% cost)
+# and RAY_HARDENED promotes the cheap invariant checks that DEBUG-only
+# builds would strip.  Same FP-reassociation flags as release — the two
+# flavours must not diverge numerically.
+HARDENED_CFLAGS = -fPIC $(WARNS) -std=$(STD) -O3 -march=$(RAY_MARCH) -g \
+  -fno-omit-frame-pointer -DRAY_HARDENED \
+  -funroll-loops -fno-math-errno -fassociative-math -ffp-contract=fast \
+  -fno-signed-zeros -fno-trapping-math
+
 CFLAGS  = $(DEBUG_CFLAGS)
 LDFLAGS = $(DEBUG_LDFLAGS)
 
@@ -90,11 +131,22 @@ MAIN_OBJ = $(MAIN_SRC:.c=.o)
 TEST_SRC = $(wildcard test/*.c)
 TEST_OBJ = $(TEST_SRC:.c=.o)
 
+# Per-flavour object lists (see the flavour CFLAGS block above).
+FUZZ_LIB_OBJ  = $(LIB_SRC:.c=.fuzz.o)
+TSAN_LIB_OBJ  = $(LIB_SRC:.c=.tsan.o)
+TSAN_MAIN_OBJ = $(MAIN_SRC:.c=.tsan.o)
+TSAN_TEST_OBJ = $(TEST_SRC:.c=.tsan.o)
+HARD_LIB_OBJ  = $(LIB_SRC:.c=.hard.o)
+HARD_MAIN_OBJ = $(MAIN_SRC:.c=.hard.o)
+
 # Auto-generated header dependencies (one .d per .o, see DEPFLAGS).
 # The fragments are -included at the very END of this file — including
 # them here would let a .d's first rule (e.g. `foo.o: ...`) become the
 # default goal, so bare `make` would build one object instead of `debug`.
-DEPS = $(LIB_OBJ:.o=.d) $(MAIN_OBJ:.o=.d) $(TEST_OBJ:.o=.d)
+DEPS = $(LIB_OBJ:.o=.d) $(MAIN_OBJ:.o=.d) $(TEST_OBJ:.o=.d) \
+       $(FUZZ_LIB_OBJ:.o=.d) \
+       $(TSAN_LIB_OBJ:.o=.d) $(TSAN_MAIN_OBJ:.o=.d) $(TSAN_TEST_OBJ:.o=.d) \
+       $(HARD_LIB_OBJ:.o=.d) $(HARD_MAIN_OBJ:.o=.d)
 
 # Default target (pinned so an -included .d fragment can't steal it).
 .DEFAULT_GOAL := default
@@ -102,6 +154,17 @@ default: debug
 
 %.o: %.c
 	$(CC) -c $(CFLAGS) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
+
+%.fuzz.o: %.c
+	$(CLANG) -c $(FUZZ_CFLAGS) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
+
+# TSan objects build with clang: gcc's -Werror=tsan rejects standalone
+# atomic_thread_fence (src/core/platform.h), which clang instruments fine.
+%.tsan.o: %.c
+	$(CLANG) -c $(TSAN_CFLAGS) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
+
+%.hard.o: %.c
+	$(CC) -c $(HARDENED_CFLAGS) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
 
 # Main binary — shared by debug/release/test (test/rfl/system/ipc_diff.rfl
 # spawns ./$(TARGET) as a server, so test depends on it too).
@@ -138,53 +201,6 @@ dist: release
 	 ( cd dist && { command -v sha256sum >/dev/null 2>&1 && sha256sum $$name.tar.gz || shasum -a 256 $$name.tar.gz; } > $$name.tar.gz.sha256 ); \
 	 echo "built dist/$$name.tar.gz"
 
-# Allocator micro-benchmark (release-optimized, linked against lib objects).
-# Compile all sources fresh with RELEASE_CFLAGS so the benchmark measures
-# the release allocator, not a sanitizer-instrumented debug build.
-bench-alloc:
-	$(CC) $(RELEASE_CFLAGS) $(DEFS) $(INCLUDES) -o bench-alloc \
-		bench/alloc/main.c $(LIB_SRC) $(LIBS) $(RELEASE_LDFLAGS) -lpthread
-	./bench-alloc
-
-# Group predicate pushdown perf gate (release-optimized, no sanitizers).
-# Measures FILTER(GROUP) with predicate pushed below GROUP vs unpushed.
-bench-group-pushdown:
-	$(CC) $(RELEASE_CFLAGS) $(DEFS) $(INCLUDES) -o bench-group-pushdown \
-		bench/group_pushdown/main.c $(LIB_SRC) $(LIBS) $(RELEASE_LDFLAGS)
-	./bench-group-pushdown
-
-# Aggregation-engine A/B perf microbench (release-optimized, no sanitizers).
-# H2O-style group-by shapes; v2 engine (this branch) vs rowforms (master).
-bench-agg-v2:
-	$(CC) $(RELEASE_CFLAGS) $(DEFS) $(INCLUDES) -o bench-agg-v2 \
-		bench/agg_v2/main.c $(LIB_SRC) $(LIBS) $(RELEASE_LDFLAGS) -lm
-	./bench-agg-v2
-
-# Index routing per-point perf gate (release-optimized, no sanitizers).
-# Measures indexed vs plain side for each of the 9 routing consumption points.
-bench-idx-route:
-	$(CC) $(RELEASE_CFLAGS) $(DEFS) $(INCLUDES) -o bench-idx-route \
-		bench/idx_route/main.c $(LIB_SRC) $(LIBS) $(RELEASE_LDFLAGS)
-	./bench-idx-route
-
-# Join build-side selection perf gate.
-# Measures swap (build hash on smaller left) vs legacy (build on right) for
-# three cases: WIN (10K left vs 10M right), CONTROL (10M==10M, no swap),
-# MANY-TO-MANY (100K left vs 10M right, ~10M output).  Sanitizer-free.
-bench-join-buildside:
-	$(CC) $(RELEASE_CFLAGS) $(DEFS) $(INCLUDES) -o bench-join-buildside \
-		bench/join_buildside/main.c $(LIB_SRC) $(LIBS) $(RELEASE_LDFLAGS)
-	./bench-join-buildside
-
-# Join dup-fallback perf gate.
-# Measures post-fix (auto dup-fallback to chained build) vs pre-fix (O(dup²)
-# build via the ray_join_no_dup_fallback bypass knob) on catastrophic,
-# zero-regression, and moderate-dup cases.  Sanitizer-free.
-bench-join-dup:
-	$(CC) $(RELEASE_CFLAGS) $(DEFS) $(INCLUDES) -o bench-join-dup \
-		bench/join_dup/main.c $(LIB_SRC) $(LIBS) $(RELEASE_LDFLAGS)
-	./bench-join-dup
-
 # Worker threads per process during tests. Without this the runtime
 # auto-sizes to ncpu-1, so on a many-core box the in-process harness AND
 # every server it spawns via .sys.exec each create ~ncpu-1 threads — a lot of
@@ -201,6 +217,43 @@ test: LDFLAGS = $(DEBUG_LDFLAGS)
 test: $(TARGET) $(LIB_OBJ) $(TEST_OBJ)
 	$(CC) $(CFLAGS) -o $(TARGET).test $(LIB_OBJ) $(TEST_OBJ) $(LIBS) $(LDFLAGS) -Itest
 	RAYFORCE_CORES=$(TEST_CORES) ./$(TARGET).test
+
+# ─── ThreadSanitizer ────────────────────────────────────────────────
+# Data-race detection for the lock-free pool/heap paths, which the
+# default ASan build cannot see (ASan and TSan are mutually exclusive,
+# hence the separate .tsan.o object flavour).  TSAN_CORES defaults to 4:
+# the harness default of 2 under-exercises the SPMC work-stealing ring,
+# and TSan wants real contention to observe races.
+#
+# tsan-test runs the IN-PROCESS concurrency suites by default (pool /
+# heap / parallel / stress); the IPC-diff tests spawn ./$(TARGET) as a
+# server and would mix build flavours, so they are out of scope here.
+# Narrow or widen with TSAN_FILTER, e.g. `make tsan-test TSAN_FILTER=pool`.
+TSAN_CORES  ?= 4
+TSAN_FILTER ?= stress
+TSAN_ENV     = TSAN_OPTIONS="suppressions=$(PWD)/.tsan-suppressions history_size=7 second_deadlock_stack=1 halt_on_error=0"
+
+tsan: $(TSAN_LIB_OBJ) $(TSAN_MAIN_OBJ)
+	$(CLANG) $(TSAN_CFLAGS) -o $(TARGET).tsan $(TSAN_LIB_OBJ) $(TSAN_MAIN_OBJ) $(LIBS) $(TSAN_LDFLAGS)
+
+tsan-test: $(TSAN_LIB_OBJ) $(TSAN_TEST_OBJ)
+	$(CLANG) $(TSAN_CFLAGS) -o $(TARGET).test.tsan $(TSAN_LIB_OBJ) $(TSAN_TEST_OBJ) $(LIBS) $(TSAN_LDFLAGS) -Itest
+	RAYFORCE_CORES=$(TSAN_CORES) $(TSAN_ENV) ./$(TARGET).test.tsan $(if $(TSAN_FILTER),-f $(TSAN_FILTER),)
+
+# ─── Hardened cloud tier ────────────────────────────────────────────
+# The build flavour shipped to the cloud: release optimisation and the
+# same FP-reassociation flags as `release` (so the two never diverge
+# numerically), but keeps debug symbols and frame pointers for reliable
+# crash backtraces (~1% cost) and defines RAY_HARDENED, which promotes
+# the cheap invariant checks that a plain release strips.  The fatal-
+# signal handler (src/core/crash.c) is compiled into every flavour and
+# installed unconditionally from main().
+# -rdynamic exports the dynamic symbol table so backtrace_symbols_fd in the
+# crash handler resolves function NAMES (not just module+offset) in a
+# production trace.  Worth the slightly larger symbol table for a cloud
+# binary whose crashes must be diagnosable from logs alone.
+hardened: $(HARD_LIB_OBJ) $(HARD_MAIN_OBJ)
+	$(CC) $(HARDENED_CFLAGS) -o $(TARGET) $(HARD_LIB_OBJ) $(HARD_MAIN_OBJ) $(LIBS) $(RELEASE_LDFLAGS) -rdynamic
 
 # Coverage report.  Builds both binaries with clang source-based
 # instrumentation, runs the test suite (writing one .profraw per
@@ -235,18 +288,119 @@ coverage:
 	@echo
 	@echo "→ coverage_html/index.html"
 
+# Compilation database for editors and standalone analyzers.  Flags are
+# uniform across every translation unit, so no build-interception tool is
+# needed: a syntax-only pass with -MJ emits one JSON fragment per file and
+# the fragments concatenate into compile_commands.json.
+compdb:
+	@rm -rf build_compdb && mkdir -p build_compdb
+	@i=0; for f in $(LIB_SRC) $(MAIN_SRC); do \
+	  i=$$((i+1)); \
+	  $(CLANG) -c -o /dev/null -std=$(STD) -DDEBUG $(DEFS) $(INCLUDES) \
+	    -MJ build_compdb/$$i.json $$f || exit 1; \
+	done
+	@{ echo '['; cat build_compdb/*.json | sed '$$s/,$$//'; echo ']'; } > compile_commands.json
+	@rm -rf build_compdb
+	@echo "compile_commands.json: $$(grep -c '"file"' compile_commands.json) entries"
+
+# ─── Fuzzing (coverage-guided; clang + Linux only) ──────────────────
+# Drivers live under fuzz/ and link against the address-sanitized
+# .fuzz.o library objects.  Grown corpora live in fuzz/corpus/<t>/
+# (gitignored); committed starter inputs live in fuzz/seeds/<t>/.
+#
+#   make fuzz-parse                 # 60s (default) run of one target
+#   make fuzz-parse FUZZ_RUNTIME=0  # run until a crash / Ctrl-C
+#   make fuzz-smoke                 # short CI pass over the fast targets
+#
+# The system toolchain on macOS does not ship the fuzzer runtime, so
+# these targets are Linux-only by design; CI gates them to ubuntu.
+FUZZ_RUNTIME ?= 60
+FUZZ_OPTS     = -rss_limit_mb=4096 -timeout=10 -max_len=65536 -print_final_stats=1
+FUZZ_TARGETS  = parse numparse de eval csv journal
+# Escape hatch for hosts where clang auto-selects a gcc toolchain dir that
+# lacks libstdc++ (e.g. a partially-installed newer gcc shadowing the real
+# one).  Normally empty; set on such a box, e.g.
+#   make fuzz-smoke FUZZ_LDEXTRA=--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/11
+FUZZ_LDEXTRA ?=
+
+# Per-target dictionary (defaults to the rayfall token dict; override in
+# the map below).  numparse needs no dictionary.
+DICT_parse    = rayfall
+DICT_eval     = rayfall
+DICT_de       = frame
+DICT_journal  = frame
+DICT_csv      = csv
+
+# The driver .c is compiled with fuzzer instrumentation; the link goes
+# through the C++ driver so the fuzzer runtime's C++ dependency resolves.
+build_fuzz/fuzz_%: fuzz/fuzz_%.c $(FUZZ_LIB_OBJ)
+	@mkdir -p build_fuzz
+	$(CLANG) -c $(FUZZ_CFLAGS) -fsanitize=fuzzer $(DEFS) $(INCLUDES) -Ifuzz \
+	  -o build_fuzz/$*.o $<
+	$(CLANGXX) -fsanitize=fuzzer,address,undefined $(FUZZ_LDEXTRA) \
+	  -o $@ build_fuzz/$*.o $(FUZZ_LIB_OBJ) $(LIBS)
+
+fuzz-%: build_fuzz/fuzz_%
+	@mkdir -p fuzz/corpus/$*
+	@dict=$(DICT_$*); \
+	 dictopt=$${dict:+-dict=fuzz/dict/$$dict.dict}; \
+	 seeds=$$( [ -d fuzz/seeds/$* ] && echo fuzz/seeds/$* ); \
+	 set -x; \
+	 ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 \
+	   ./build_fuzz/fuzz_$* fuzz/corpus/$* $$seeds \
+	   $$dictopt $(FUZZ_OPTS) -max_total_time=$(FUZZ_RUNTIME)
+
+# Short smoke pass for PR CI — a healthy corpus finds nothing new in a
+# minute, and any crash it surfaces is a genuine regression.
+fuzz-smoke:
+	$(MAKE) fuzz-parse fuzz-numparse fuzz-de FUZZ_RUNTIME=60
+
+.PHONY: fuzz-smoke
+
+# ─── Static analysis ────────────────────────────────────────────────
+# clang-tidy runs OUTSIDE the build: it never touches the real compiler
+# warnings or -Werror.  Flags are uniform across every translation unit,
+# so we pass them after `--` and skip the compilation database entirely
+# (the `.clang-tidy` file selects the correctness-only check set).
+# `make tidy FILES="src/ops/foo.c"` narrows to specific files.
+TIDY_FLAGS = -std=$(STD) -DDEBUG $(DEFS) $(INCLUDES)
+FILES     ?= $(LIB_SRC) $(MAIN_SRC)
+
+tidy:
+	@command -v clang-tidy >/dev/null || { echo "tidy: clang-tidy not found"; exit 1; }
+	clang-tidy --quiet $(FILES) -- $(TIDY_FLAGS)
+
+# cppcheck is a second-opinion linter — advisory only, never a gate.
+cppcheck:
+	@command -v cppcheck >/dev/null || { echo "cppcheck: not found"; exit 1; }
+	cppcheck --enable=warning,portability --inline-suppr --error-exitcode=1 \
+	  -j $(shell nproc 2>/dev/null || echo 4) \
+	  --suppress=missingIncludeSystem \
+	  --suppress=assignBoolToPointer \
+	  --suppress=nullPointerRedundantCheck \
+	  --std=c17 -q $(INCLUDES) src/
+# assignBoolToPointer: cppcheck misparses the GNU computed-goto label
+#   address `&&label` (a void*) as a logical-AND yielding a bool.
+# nullPointerRedundantCheck: a heuristic that fires on the codebase's
+#   deliberate defensive "check then use" ordering; reviewed as benign.
+
+.PHONY: tidy cppcheck
+
 clean:
 	-rm -f $(LIB_OBJ) $(MAIN_OBJ) $(TEST_OBJ)
+	-rm -f $(FUZZ_LIB_OBJ) $(TSAN_LIB_OBJ) $(TSAN_MAIN_OBJ) $(TSAN_TEST_OBJ) \
+	       $(HARD_LIB_OBJ) $(HARD_MAIN_OBJ)
 	-rm -f $(DEPS)
 	-rm -f $(TARGET) $(TARGET).test lib$(TARGET).a
-	-rm -rf build build_release dist
+	-rm -f $(TARGET).tsan $(TARGET).test.tsan
+	-rm -rf build build_release build_fuzz build_compdb dist
 	# Test-generated fixtures (see test/rfl/system/*.rfl) — should not linger after a run.
 	-rm -f rf_test_*.csv
 	# Coverage artefacts (see `make coverage`).
 	-rm -f cov-*.profraw default.profraw coverage.profdata
 	-rm -rf coverage_html
 
-.PHONY: default debug release lib dist bench-alloc bench-join-buildside bench-join-dup test coverage clean
+.PHONY: default debug release lib dist test coverage compdb tsan tsan-test hardened fuzz-smoke tidy cppcheck clean
 
 # Header dependencies last: .d fragments only add prerequisites to the
 # object targets above, and being last they can't hijack the default goal.

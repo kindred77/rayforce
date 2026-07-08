@@ -8,7 +8,7 @@ Persist and reload tables. Rayforce stores tables in two on-disk shapes:
 The `get` builtins memory-map every column file — load is constant-time regardless of dataset size. `set` writes a table's columns to a splayed directory.
 
 !!! note "Restricted under `-U`"
-    `.db.splayed.set` is `RAY_FN_RESTRICTED` (writes to disk). The `get` builtins are read-only and unrestricted.
+    `.db.splayed.set` and `.db.parted.fill` are `RAY_FN_RESTRICTED` (they write to disk). The `get`/`tables` builtins are read-only and unrestricted.
 
 ## Reference
 

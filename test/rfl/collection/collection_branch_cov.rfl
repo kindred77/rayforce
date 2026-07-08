@@ -492,8 +492,8 @@
 ;; Vector val find (lines 1762-1783)
 (find [10 20 30] [20 30 40]) -- (list 1 2 0Nl)
 
-;; Empty vec find with vector val (lines 1764-1765)
-(count (find (as 'I64 (list)) [1 2])) -- 0
+;; Empty vec find with vector val → length-preserving all-0Nl (not empty)
+(count (find (as 'I64 (list)) [1 2])) -- 2
 
 ;; Typed vec find with nulls — null val (lines 1790-1793)
 (find (concat [0Nl 1 2] []) 0Nl) -- 0
@@ -752,13 +752,13 @@
 ;; reverse on STR vec with nulls (lines 1860-1871)
 (set _rsn (reverse _scn))
 (count _rsn) -- 4
-(nil? (at _rsn 2)) -- true
+(nil? (at _rsn 2)) -- false
 (at _rsn 0) -- "hello"
 (at _rsn 3) -- "hello"
 
 ;; filter on STR vec (typed vec path with null bitmap, lines 554-562)
 (set _fsn (filter _scn [true true false true]))
-(nil? (at _fsn 1)) -- true
+(nil? (at _fsn 1)) -- false
 (at _fsn 0) -- "hello"
 (at _fsn 2) -- "hello"
 

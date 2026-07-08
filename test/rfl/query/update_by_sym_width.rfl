@@ -1,0 +1,36 @@
+;; Regression: `update ... by: <sym>` on a narrow-width SYM key column.
+;;
+;; SYM columns use an adaptive dictionary-index width (W8/W16/W32/W64 in attrs,
+;; chosen by distinct count). A `.csv.splayed` column with few distinct values
+;; gets W8 (1 byte/elem). Two spots on the update-by path read it at a hardcoded
+;; 8-byte stride, mis-grouping the values and, at scale, reading off the end of
+;; the buffer (SIGSEGV):
+;;   - src/ops/builtins.c ray_group_fn scalar path (must use ray_read_sym)
+;;   - src/ops/query.c update-by per-group gather (must use ray_sym_elem_size
+;;     and create sub_col at the source width)
+;; `select ... by:` was unaffected (different, width-aware grouping path), so the
+;; bug only surfaced through `update ... by:`.
+;;
+;; This 7-row case is enough to expose the correctness half: the buggy build
+;; sums mx to 320 instead of 430.
+
+(.sys.exec "rm -rf rf_test_ubw_sym rf_test_ubw_sym.csv") -- 0
+(.sys.exec "printf 'ex,size\naa,10\nbb,50\naa,30\ncc,20\nbb,40\naa,70\ncc,60\n' > rf_test_ubw_sym.csv") -- 0
+
+;; few distinct exchanges => narrow (W8) sym dictionary index
+(set Tubw (.csv.splayed [SYMBOL I64] "rf_test_ubw_sym.csv" "rf_test_ubw_sym/"))
+(set Uubw (update {mx: (max size) by: ex from: Tubw}))
+
+;; per-group max broadcast to each row: aa=70 (x3), bb=50 (x2), cc=60 (x2)
+(sum (at Uubw 'mx)) -- 430
+(count Uubw) -- 7
+(count (select {m: (first mx) by: {ex: ex} from: Uubw})) -- 3
+
+;; filter shape: rows where size == its group max -> one per group
+(count (select {from: Uubw where: (== size mx)})) -- 3
+
+;; update-by broadcast must agree with the width-aware select ... by: path
+(sum (at (select {m: (first mx) by: {ex: ex} from: Uubw}) 'm)) -- 180
+(sum (at (select {a: (max size) by: {ex: ex} from: Tubw}) 'a)) -- 180
+
+(.sys.exec "rm -rf rf_test_ubw_sym rf_test_ubw_sym.csv") -- 0

@@ -1,0 +1,165 @@
+name: Rayforce audit
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: rayforce-audit-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  rayforce-audit:
+    name: rayforce-audit
+    if: github.event.pull_request.draft == false
+    runs-on: [self-hosted, rayforce-audit, claude-code]
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Fetch base branch
+        run: |
+          git fetch --no-tags --prune origin \
+            +refs/heads/${{ github.event.pull_request.base.ref }}:refs/remotes/origin/${{ github.event.pull_request.base.ref }}
+
+      - name: Run Claude rayforce-audit skill
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_REF: origin/${{ github.event.pull_request.base.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RAYFORCE_AUDIT_PLUGIN_DIR: /home/hetoku/.claude/plugins/rayforce-audit-current
+        run: |
+          set -euo pipefail
+          mkdir -p audit-output
+
+          cat > audit-output/rayforce-audit-prompt.md <<EOF
+          Use the rayforce-audit:rayforce-audit skill.
+
+          Audit this RayforceDB/rayforce pull request as a required merge gate.
+
+          Context:
+          - PR number: ${PR_NUMBER}
+          - Base ref: ${BASE_REF}
+          - Head SHA: ${HEAD_SHA}
+          - Diff command: git diff ${BASE_REF}...HEAD
+
+          CI mode constraints:
+          - This is the fast required gate, not a full deep-audit/remediation run.
+          - Do not fan out to subagents or run independent multi-pass reviewers.
+          - Do not reproduce findings with builds/tests or execute PR code.
+          - Spend the review on the diff and directly adjacent code needed to validate blocking issues.
+          - Target completion in under 8 minutes. If more time would be needed, report the best grounded blocking findings or an explicit inconclusive FAIL.
+
+          CI safety rules:
+          - This is running on a self-hosted runner.
+          - Do not modify files.
+          - Do not run build scripts, tests, generated binaries, package managers, network fetches, or project code from the PR.
+          - You may inspect repository files and run read-only git commands only.
+
+          Review focus:
+          - correctness and query execution semantics
+          - optimizer behavior and rule rewrites
+          - memory ownership/refcount/lifetime issues
+          - C portability and undefined behavior risks
+          - benchmark-specific hacks or vendor/product-specific assumptions
+          - missing or misleading tests
+          - performance-regression risk visible from the diff
+
+          Output:
+          - Write a concise Markdown audit report to stdout.
+          - Include blocking findings first, each with file/path and concrete reasoning.
+          - If there are no merge-blocking findings, say so clearly.
+          - End with exactly one final verdict line:
+            RAYFORCE_AUDIT_VERDICT: PASS
+            or
+            RAYFORCE_AUDIT_VERDICT: FAIL
+          - Use FAIL only for issues that should block merge, including an inconclusive timeout.
+          EOF
+
+          set +e
+          timeout 12m claude -p "$(cat audit-output/rayforce-audit-prompt.md)" \
+            --plugin-dir "${RAYFORCE_AUDIT_PLUGIN_DIR}" \
+            --permission-mode dontAsk \
+            --allowedTools "Read,Glob,Grep,LS,Bash(git *)" \
+            --effort medium \
+            --no-session-persistence \
+            | tee audit-output/rayforce-audit.md
+          claude_status=${PIPESTATUS[0]}
+          set -e
+
+          if [ "${claude_status}" -eq 124 ]; then
+            cat > audit-output/rayforce-audit.md <<'EOF_TIMEOUT'
+          ## Rayforce targeted audit timed out
+
+          The required Rayforce audit gate exceeded its 12 minute CI budget before producing a final verdict. This is a gate infrastructure failure, not a PASS.
+
+          RAYFORCE_AUDIT_VERDICT: FAIL
+          EOF_TIMEOUT
+          elif [ "${claude_status}" -ne 0 ]; then
+            if [ ! -s audit-output/rayforce-audit.md ]; then
+              cat > audit-output/rayforce-audit.md <<'EOF_ERROR'
+          ## Rayforce targeted audit failed before producing a report
+
+          The Claude audit command exited non-zero before producing a final verdict. Open the check logs for details.
+
+          RAYFORCE_AUDIT_VERDICT: FAIL
+          EOF_ERROR
+            fi
+          fi
+
+          tail -n 1 audit-output/rayforce-audit.md | grep -q '^RAYFORCE_AUDIT_VERDICT: PASS$'
+
+      - name: Comment audit failure on PR
+        if: failure() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          report="audit-output/rayforce-audit.md"
+          body="audit-output/rayforce-audit-comment.md"
+          marker="<!-- rayforce-audit-failure-comment -->"
+
+          {
+            echo "$marker"
+            echo "## Rayforce targeted audit failed"
+            echo
+            echo "This PR did not pass the required Rayforce audit gate. Fix the blocking findings below and push an update; the audit will rerun automatically."
+            echo
+            if [ -s "$report" ]; then
+              sed -n '1,220p' "$report"
+            else
+              echo "The audit failed before producing a report. Open the required check logs for details."
+            fi
+          } > "$body"
+
+          comment_id=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            --jq ".[] | select(.body | contains(\"${marker}\")) | .id" \
+            | tail -n 1)
+
+          if [ -n "$comment_id" ]; then
+            gh api -X PATCH "repos/${REPO}/issues/comments/${comment_id}" \
+              -f body="$(cat "$body")" >/dev/null
+          else
+            gh api -X POST "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+              -f body="$(cat "$body")" >/dev/null
+          fi
+
+      - name: Upload audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rayforce-audit-report
+          path: audit-output/rayforce-audit.md

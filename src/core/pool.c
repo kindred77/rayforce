@@ -22,6 +22,8 @@
  */
 
 #include "core/pool.h"
+#include "core/platform.h"   /* RAY_CPU_RELAX */
+#include "core/qstats.h"     /* per-worker query-stats slab */
 #include "mem/cow.h"
 #include "mem/heap.h"
 #include "mem/sys.h"
@@ -29,11 +31,15 @@
 #include <stdlib.h>
 #include <sched.h>
 
+/* Per-worker query-statistics slab (see core/qstats.h).  Zero-initialised;
+ * disabled (mode == 0) until a profiling/progress consumer turns it on. */
+ray_qstats_t g_qstats;
+
 /* Task granularity: RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS elements per task */
 #define TASK_GRAIN  ((int64_t)RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS)
 
-/* Maximum ring capacity (power of 2) */
-#define MAX_RING_CAP  (1u << 16)
+/* Maximum ring capacity (power of 2) — mirrors RAY_POOL_MAX_TASKS in pool.h */
+#define MAX_RING_CAP  RAY_POOL_MAX_TASKS
 
 /* --------------------------------------------------------------------------
  * Worker thread entry
@@ -94,7 +100,9 @@ static void worker_loop(void* arg) {
             }
 
             ray_pool_task_t* t = &pool->tasks[idx & (pool->task_cap - 1)];
+            int64_t _qs_t0; uint32_t _qs_m = ray_qstats_task_begin(&_qs_t0);
             t->fn(t->ctx, wctx.worker_id, t->start, t->end);
+            ray_qstats_task_end(_qs_m, wctx.worker_id, t->end - t->start, _qs_t0);
 
             atomic_fetch_sub_explicit(&pool->pending, 1,
                                       memory_order_acq_rel);
@@ -310,6 +318,12 @@ void ray_pool_dispatch(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
     /* Main thread enters atomic refcount mode during parallel dispatch */
     ray_rc_sync = true;
 
+    /* Progress: when a callback is listening (PROGRESS bit armed), baseline the
+     * row counter for this dispatch so the main thread can pump a 0→100% bar
+     * from its claim/spin path.  One relaxed load; skipped entirely otherwise. */
+    const bool prog = ray_qstats_mode() & RAY_QS_PROGRESS;
+    if (prog) ray_progress_dispatch_begin((uint64_t)total_elems);
+
     /* Wake worker threads */
     for (uint32_t i = 0; i < pool->n_workers; i++) {
         ray_sem_signal(&pool->work_ready);
@@ -326,9 +340,12 @@ void ray_pool_dispatch(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
             }
 
             ray_pool_task_t* t = &pool->tasks[idx & (pool->task_cap - 1)];
+            int64_t _qs_t0; uint32_t _qs_m = ray_qstats_task_begin(&_qs_t0);
             t->fn(t->ctx, 0, t->start, t->end);
+            ray_qstats_task_end(_qs_m, 0, t->end - t->start, _qs_t0);
 
             atomic_fetch_sub_explicit(&pool->pending, 1, memory_order_acq_rel);
+            if (prog) ray_progress_pump();
         }
     }
 
@@ -337,12 +354,8 @@ void ray_pool_dispatch(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
     {
         unsigned spin_count = 0;
         while (atomic_load_explicit(&pool->pending, memory_order_acquire) > 0) {
-#if defined(__x86_64__) || defined(__i386__)
-            __builtin_ia32_pause();
-#elif defined(__aarch64__)
-            __asm__ volatile("yield" ::: "memory");
-#endif
-            if (++spin_count % 1024 == 0) sched_yield();
+            RAY_CPU_RELAX();
+            if (++spin_count % 1024 == 0) { sched_yield(); if (prog) ray_progress_pump(); }
         }
     }
 
@@ -401,6 +414,10 @@ void ray_pool_dispatch_n(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
     atomic_store_explicit(&ray_parallel_flag, 1, memory_order_release);
     ray_rc_sync = true;
 
+    /* Progress: baseline this dispatch (one unit per task/partition). */
+    const bool prog = ray_qstats_mode() & RAY_QS_PROGRESS;
+    if (prog) ray_progress_dispatch_begin((uint64_t)n_tasks);
+
     /* Wake worker threads */
     for (uint32_t i = 0; i < pool->n_workers; i++) {
         ray_sem_signal(&pool->work_ready);
@@ -417,9 +434,12 @@ void ray_pool_dispatch_n(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
             }
 
             ray_pool_task_t* t = &pool->tasks[idx & (pool->task_cap - 1)];
+            int64_t _qs_t0; uint32_t _qs_m = ray_qstats_task_begin(&_qs_t0);
             t->fn(t->ctx, 0, t->start, t->end);
+            ray_qstats_task_end(_qs_m, 0, t->end - t->start, _qs_t0);
 
             atomic_fetch_sub_explicit(&pool->pending, 1, memory_order_acq_rel);
+            if (prog) ray_progress_pump();
         }
     }
 
@@ -427,12 +447,8 @@ void ray_pool_dispatch_n(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
     {
         unsigned spin_count = 0;
         while (atomic_load_explicit(&pool->pending, memory_order_acquire) > 0) {
-#if defined(__x86_64__) || defined(__i386__)
-            __builtin_ia32_pause();
-#elif defined(__aarch64__)
-            __asm__ volatile("yield" ::: "memory");
-#endif
-            if (++spin_count % 1024 == 0) sched_yield();
+            RAY_CPU_RELAX();
+            if (++spin_count % 1024 == 0) { sched_yield(); if (prog) ray_progress_pump(); }
         }
     }
 
@@ -480,11 +496,7 @@ ray_pool_t* ray_pool_get(void) {
             if (s == 2) return &g_pool;
             if (s == 0) return NULL;  /* init failed, not started, or destroy completed */
             /* s == 1: still initializing, s == 3: destroying — spin */
-#if defined(__x86_64__) || defined(__i386__)
-            __builtin_ia32_pause();
-#elif defined(__aarch64__)
-            __asm__ volatile("yield" ::: "memory");
-#endif
+            RAY_CPU_RELAX();
             if (++spin_count % 1024 == 0) sched_yield();
         }
     }
@@ -534,8 +546,20 @@ void ray_pool_destroy(void) {
     atomic_store_explicit(&g_pool_init_state, 0, memory_order_release);
 }
 
+/* Async-signal-safe: set the running query's worker-cancel flag.  Touches the
+ * pool only when it is already live (state 2) — it must NOT run ray_pool_get's
+ * lazy-init path (malloc/thread create) from a signal handler, and if no pool
+ * exists there are no workers to stop.  Reached from ray_request_interrupt(),
+ * including the SIGINT handler. */
 void ray_cancel(void) {
-    ray_pool_t* pool = ray_pool_get();
-    if (pool)
-        atomic_store_explicit(&pool->cancelled, 1, memory_order_release);
+    if (atomic_load_explicit(&g_pool_init_state, memory_order_acquire) == 2)
+        atomic_store_explicit(&g_pool.cancelled, 1, memory_order_release);
+}
+
+/* Clear the worker-cancel flag at a query boundary — mirror of ray_cancel,
+ * equally signal-safe.  ray_execute also resets it before each parallel
+ * dispatch; this keeps the flag in sync when a query never dispatches. */
+void ray_cancel_reset(void) {
+    if (atomic_load_explicit(&g_pool_init_state, memory_order_acquire) == 2)
+        atomic_store_explicit(&g_pool.cancelled, 0, memory_order_release);
 }

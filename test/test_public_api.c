@@ -375,20 +375,16 @@ static test_result_t test_public_vec_get_sym_id_w16(void) {
 }
 
 static test_result_t test_public_vec_get_sym_id_w8(void) {
-    /* W8 indices only address up to 255 distinct entries.  By the time
-     * the runtime is up the symbol table holds the builtin set; user
-     * intern IDs are appended after.  Provided the cumulative count
-     * stays under 256 (well within the fresh-runtime budget), the W8
-     * append path will succeed. */
-    int64_t a = ray_sym_intern("pub_w8_a", 8);
-    int64_t b = ray_sym_intern("pub_w8_b", 8);
-
-    /* Skip when the runtime's existing builtins have already pushed past
-     * the W8 ceiling — the public API doesn't expose narrowing semantics
-     * here and we want a deterministic happy path. */
-    if (a > 0xFF || b > 0xFF) {
-        SKIP("sym ID exceeds W8 range — happy-path narrowing unreachable");
-    }
+    /* W8 sym vectors store IDs 0-255 in a single byte.  We can't source
+     * those IDs from ray_sym_intern: once the runtime is up the builtin
+     * symbol set already occupies more than 256 IDs, so fresh interns land
+     * above the W8 ceiling and would TRUNCATE on append (a different,
+     * narrowing case).  This test targets the W8 storage round-trip, so use
+     * in-range IDs directly — ray_vec_get_sym_id is a width-decoded read of
+     * the stored byte (ray_read_sym), independent of whether the ID names a
+     * live symbol. */
+    int64_t a = 8;
+    int64_t b = 200;
 
     ray_t* v = ray_sym_vec_new(RAY_SYM_W8, 2);
     v = ray_vec_append(v, &a);

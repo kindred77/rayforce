@@ -411,7 +411,6 @@ ray_t* gather_by_idx(ray_t* vec, int64_t* idx, int64_t n);
 ray_t* ray_sort(ray_t** cols, uint8_t* descs, uint8_t* nulls_first,
                 uint8_t n_cols, int64_t nrows);
 int    char_str_cmp(ray_t* a, ray_t* b, int *out);
-int    is_comparable(ray_t* x);
 
 /* Arithmetic builtins (formerly static in eval.c, now in arith.c) */
 ray_t* ray_round_fn(ray_t* x);
@@ -444,6 +443,7 @@ ray_t* ray_map_fn(ray_t** args, int64_t n);
 ray_t* ray_pmap_fn(ray_t** args, int64_t n);
 ray_t* ray_fold_fn(ray_t** args, int64_t n);
 ray_t* ray_scan_fn(ray_t** args, int64_t n);
+ray_t* ray_prior_fn(ray_t** args, int64_t n);
 ray_t* ray_filter_fn(ray_t* vec, ray_t* mask);
 ray_t* ray_apply_fn(ray_t** args, int64_t n);
 ray_t* ray_distinct_fn(ray_t* x);
@@ -554,6 +554,9 @@ ray_t* ray_time_timer_del_fn (ray_t*  id);
 ray_t* ray_env_fn(ray_t* x);
 ray_t* ray_internals_fn(ray_t** args, int64_t n);
 ray_t* ray_memstat_fn(ray_t** args, int64_t n);
+ray_t* ray_prof_fn(ray_t** args, int64_t n);
+ray_t* ray_qlog_fn(ray_t** args, int64_t n);
+ray_t* ray_qlog_enable_fn(ray_t** args, int64_t n);
 ray_t* ray_sysinfo_fn(ray_t** args, int64_t n);
 ray_t* ray_sys_args_fn(ray_t** args, int64_t n);
 ray_t* ray_ser_fn(ray_t* val);
@@ -613,6 +616,7 @@ ray_t* ray_within_fn(ray_t* vals, ray_t* range);
 
 /* Query bridge builtins (formerly in eval.c, now in ops/query.c) */
 ray_t* ray_select_fn(ray_t** args, int64_t n);
+ray_t* ray_window_fn(ray_t** args, int64_t n);
 ray_t* ray_try_count_select_expr(ray_t* expr, int* handled);
 ray_t* ray_update_fn(ray_t** args, int64_t n);
 ray_t* ray_insert_fn(ray_t** args, int64_t n);

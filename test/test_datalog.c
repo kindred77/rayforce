@@ -202,7 +202,7 @@ static test_result_t test_source_prov_requires_flag(void) {
  *
  * dl_build_source_prov matches each derived row against the body relation,
  * and for a constant body position it compares the source cell against
- * body->const_vals[c] (datalog.c:2566).  The plain-variable provenance test
+ * body->const_vals[c] (datalog.c:2634).  The plain-variable provenance test
  * above never exercises that comparison.
  *
  * Program:
@@ -278,7 +278,7 @@ static test_result_t test_source_prov_const_body_slot(void) {
 /* Source provenance whose packed-ref buffer must GROW past its initial cap.
  *
  * dl_build_source_prov sizes the scratch buffer at nrows*4 (min 64) and
- * doubles it on overflow (datalog.c:2574-2583).  A cross-product rule whose
+ * doubles it on overflow (datalog.c:2642-2651).  A cross-product rule whose
  * second body atom shares no variables ("always matches") attaches every row
  * of that relation to each derived row, so the ref count is nrows*(1+M) which
  * blows past nrows*4 once M is large enough.
@@ -2435,6 +2435,47 @@ static test_result_t test_rule_add_interval_overflow(void) {
     PASS();
 }
 
+/* Regression test for over-arity domain guard: tables with ncols > DL_MAX_ARITY
+ * (16) trigger admission rejection at dl_add_edb to prevent
+ * uninitialized keys[16..] in table_distinct/table_antijoin and wrong-answer
+ * bugs from silent truncation. The guard is defended in depth with secondary
+ * checks in table_distinct/table_antijoin.
+ *
+ * Expected: dl_add_edb rejects arity=17 and returns -1. */
+static test_result_t test_edb_over_arity_domain_guard(void) {
+    /* Build a 17-column table */
+    ray_t* cols[17];
+    for (int i = 0; i < 17; i++) {
+        int64_t vals[] = {42};
+        cols[i] = ray_vec_from_raw(RAY_I64, vals, 1);
+        TEST_ASSERT_NOT_NULL(cols[i]);
+    }
+
+    ray_t* wide_tbl = ray_table_new(17);
+    TEST_ASSERT_NOT_NULL(wide_tbl);
+    for (int i = 0; i < 17; i++) {
+        char name[16];
+        snprintf(name, sizeof(name), "col%d", i);
+        wide_tbl = ray_table_add_col(wide_tbl, ray_sym_intern(name, strlen(name)), cols[i]);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(wide_tbl));
+    }
+
+    dl_program_t* prog = dl_program_new();
+    TEST_ASSERT_NOT_NULL(prog);
+
+    /* Attempt to add the 17-column table as an EDB. This should be rejected
+     * because arity > DL_MAX_ARITY (16). */
+    int wide_idx = dl_add_edb(prog, "wide_rel", wide_tbl, 17);
+    TEST_ASSERT_EQ_I(wide_idx, -1);
+
+    dl_program_free(prog);
+    ray_release(wide_tbl);
+    for (int i = 0; i < 17; i++) {
+        ray_release(cols[i]);
+    }
+    PASS();
+}
+
 const test_entry_t datalog_entries[] = {
     { "datalog/source_provenance", test_source_provenance, datalog_setup, datalog_teardown },
     { "datalog/source_prov_requires_flag", test_source_prov_requires_flag, datalog_setup, datalog_teardown },
@@ -2498,6 +2539,7 @@ const test_entry_t datalog_entries[] = {
     { "datalog/rule_add_builtin_overflow", test_rule_add_builtin_overflow, datalog_setup, datalog_teardown },
     { "datalog/rule_add_interval", test_rule_add_interval, datalog_setup, datalog_teardown },
     { "datalog/rule_add_interval_overflow", test_rule_add_interval_overflow, datalog_setup, datalog_teardown },
+    { "datalog/edb_over_arity_domain_guard", test_edb_over_arity_domain_guard, datalog_setup, datalog_teardown },
     { NULL, NULL, NULL, NULL },
 };
 

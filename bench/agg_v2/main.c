@@ -1,7 +1,5 @@
 /* Aggregation-engine A/B perf microbench (H2O-style group-by shapes).
  *
- * Build: make bench-agg-v2 ; run: ./bench-agg-v2
- *
  * Generates ONE H2O-like table with a fixed-seed PRNG (identical data on
  * every run / every branch) and times the group-by shapes that the old
  * hand-tuned "rowform" group operators targeted.  On THIS branch (feat/

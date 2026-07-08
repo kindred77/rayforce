@@ -158,10 +158,6 @@ ray_t* ray_lte_fn(ray_t* a, ray_t* b) {
     return make_bool(as_f64(a) <= as_f64(b) ? 1 : 0);
 }
 
-/* Check if comparable (numeric or temporal) */
-int is_comparable(ray_t* x) {
-    return is_numeric(x) || is_temporal(x);
-}
 
 ray_t* ray_eq_fn(ray_t* a, ray_t* b) {
     /* Handle null forms (RAY_NULL_OBJ, typed null atoms) */
@@ -208,14 +204,18 @@ ray_t* ray_neq_fn(ray_t* a, ray_t* b) {
 }
 
 /* Bool vector element-wise helpers to reduce duplication in and/or/not. */
+/* op must be a BITWISE operator (& / |): the short-circuit forms compile
+ * to a branch per element, which mispredicts on mixed masks (~10x).  The
+ * != 0 normalization keeps non-canonical bytes truthy and vectorizes. */
 #define BOOL_VEC_BINOP(a, b, op) do {                       \
     int64_t n = a->len < b->len ? a->len : b->len;        \
     ray_t* r = ray_vec_new(RAY_BOOL, n);                   \
     if (RAY_IS_ERR(r)) return r;                           \
-    bool* da = (bool*)ray_data(a);                         \
-    bool* db = (bool*)ray_data(b);                         \
-    bool* dr = (bool*)ray_data(r);                         \
-    for (int64_t i = 0; i < n; i++) dr[i] = da[i] op db[i]; \
+    const uint8_t* restrict da = (const uint8_t*)ray_data(a); \
+    const uint8_t* restrict db = (const uint8_t*)ray_data(b); \
+    uint8_t* restrict dr = (uint8_t*)ray_data(r);          \
+    for (int64_t i = 0; i < n; i++)                        \
+        dr[i] = (uint8_t)((da[i] != 0) op (db[i] != 0));   \
     r->len = n;                                            \
     return r;                                              \
 } while(0)
@@ -234,7 +234,7 @@ ray_t* ray_neq_fn(ray_t* a, ray_t* b) {
 ray_t* ray_and_fn(ray_t* a, ray_t* b) {
     /* Element-wise for bool vectors */
     if (ray_is_vec(a) && a->type == RAY_BOOL && ray_is_vec(b) && b->type == RAY_BOOL)
-        BOOL_VEC_BINOP(a, b, &&);
+        BOOL_VEC_BINOP(a, b, &);
     /* Scalar broadcast: vec and scalar */
     if (ray_is_vec(a) && a->type == RAY_BOOL && ray_is_atom(b))
         BOOL_VEC_SCALAR_L(a, is_truthy(b), &&);
@@ -246,7 +246,7 @@ ray_t* ray_and_fn(ray_t* a, ray_t* b) {
 ray_t* ray_or_fn(ray_t* a, ray_t* b) {
     /* Element-wise for bool vectors */
     if (ray_is_vec(a) && a->type == RAY_BOOL && ray_is_vec(b) && b->type == RAY_BOOL)
-        BOOL_VEC_BINOP(a, b, ||);
+        BOOL_VEC_BINOP(a, b, |);
     /* Scalar broadcast */
     if (ray_is_vec(a) && a->type == RAY_BOOL && ray_is_atom(b))
         BOOL_VEC_SCALAR_L(a, is_truthy(b), ||);

@@ -77,6 +77,7 @@ static inline int32_t ymd_to_date(int year, int month, int day) {
     int32_t ydays = date_years_by_days(yy);
     int leap = date_leap_year(year);
     int mm = (month > 0) ? month - 1 : 0;
+    if (mm > 12) mm = 12;  /* defensive: never index past the 13-wide table */
     int32_t mdays = (int32_t)MONTHDAYS[leap][mm];
     return ydays - date_years_by_days(RAY_DATE_EPOCH - 1) + mdays + day - 1;
 }

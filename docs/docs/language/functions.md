@@ -14,13 +14,14 @@ All arithmetic operators are **atomic** — they auto-map over vectors and broad
 | `+` | binary | Addition | `(+ 3 4)` → `7` |
 | `-` | binary | Subtraction | `(- 10 3)` → `7` |
 | `*` | binary | Multiplication | `(* 3 4)` → `12` |
-| `/` | binary | Integer division (floor) | `(/ 7 2)` → `3` |
+| `/` | binary | Float division (always f64) | `(/ 7 2)` → `3.5` |
 | `%` | binary | Modulo | `(% 7 3)` → `1` |
-| `div` | binary | Float division (always f64) | `(div 7 2)` → `3.5` |
+| `div` | binary | Integer division (floor) | `(div 7 2)` → `3` |
 | `neg` | unary | Negate | `(neg 5)` → `-5` |
 | `round` | unary | Round to nearest integer | `(round 3.7)` → `4.0` |
 | `floor` | unary | Floor (round down) | `(floor 3.7)` → `3.0` |
 | `ceil` | unary | Ceiling (round up) | `(ceil 3.2)` → `4.0` |
+| `pow` | binary | Power (x^y, returns f64) | `(pow 2 10)` → `1024.0` |
 | `xbar` | binary | Round down to nearest multiple (bucketing) | `(xbar [3 7 12] 5)` → `[0 5 10]` |
 
 Vector examples:
@@ -65,8 +66,8 @@ Aggregation functions are marked **aggr** and reduce vectors to scalar values. U
 | `avg` | unary, aggr | Arithmetic mean | `(avg [1 2 3])` → `2.0` |
 | `min` | unary, aggr | Minimum value | `(min [3 1 2])` → `1` |
 | `max` | unary, aggr | Maximum value | `(max [3 1 2])` → `3` |
-| `med` | unary, aggr | Median value | `(med [1 3 2])` → `2` |
-| `dev` | unary, aggr | Standard deviation | `(dev [1 2 3])` → `0.816...` |
+| `med` | unary, aggr | Median value (returns f64) | `(med [1 3 2])` → `2.0` |
+| `dev` | unary, aggr | Population standard deviation | `(dev [1 2 3])` → `0.816...` |
 | `first` | unary | First element of vector | `(first [10 20 30])` → `10` |
 | `last` | unary | Last element of vector | `(last [10 20 30])` → `30` |
 
@@ -74,7 +75,7 @@ Aggregation functions are marked **aggr** and reduce vectors to scalar values. U
 ; Group-by aggregation example
 (select {from: trades
          by:   {sym: sym}
-         cols: {hi: (max price) lo: (min price) n: (count price)}})
+         hi: (max price) lo: (min price) n: (count price)})
 ```
 
 ## Higher-Order Functions
@@ -83,16 +84,16 @@ Functions that take other functions as arguments.
 
 | Function | Type | Description | Example |
 |---|---|---|---|
-| `map` | variadic | Apply function to each element | `(map (fn [x] (* x 2)) [1 2 3])` → `[2 4 6]` |
-| `pmap` | variadic | Parallel map (multi-threaded) | `(pmap (fn [x] (* x x)) [1 2 3])` → `[1 4 9]` |
+| `map` | variadic | Apply function to each element (returns a list) | `(map (fn [x] (* x 2)) [1 2 3])` → `(2 4 6)` |
+| `pmap` | variadic | Parallel map (multi-threaded, returns a list) | `(pmap (fn [x] (* x x)) [1 2 3])` → `(1 4 9)` |
 | `filter` | binary | Keep elements where boolean mask is true | `(filter [1 2 3 4] (> [1 2 3 4] 2))` → `[3 4]` |
 | `fold` | variadic | Reduce with function and initial value | `(fold + 0 [1 2 3])` → `6` |
 | `fold-left` | variadic | Left-associative fold | `(fold-left - 10 [1 2 3])` → `4` |
 | `fold-right` | variadic | Right-associative fold | `(fold-right - 10 [1 2 3])` → `-8` |
 | `scan` | variadic | Running fold (returns all intermediate results) | `(scan + (enlist 1 2 3))` → `[1 3 6]` |
 | `scan-left` | variadic | Left-to-right running fold | `(scan-left + (enlist 1 2 3))` → `[1 3 6]` |
-| `scan-right` | variadic | Right-to-left running fold | `(scan-right + (enlist 1 2 3))` → `[6 5 3]` |
-| `apply` | variadic | Zip-apply function pairwise over two lists | `(apply + (enlist 1 2) (enlist 3 4))` → `[4 6]` |
+| `scan-right` | variadic | Right-to-left running fold (returns a list) | `(scan-right + (enlist 1 2 3))` → `(6 5 3)` |
+| `apply` | variadic | Zip-apply function pairwise over two lists | `(apply + (enlist 1 2) (enlist 3 4))` → `(4 6)` |
 | `map-left` | variadic | Map each element of the left over the whole right | `(map-left + 10 [1 2 3])` → `[11 12 13]` |
 | `map-right` | variadic | Map the whole left over each element of the right | `(map-right - [10 20 30] 5)` → `[5 15 25]` |
 
@@ -168,17 +169,17 @@ These are **special forms** that bridge to the Rayforce DAG executor.
 ; Select with filter and projection
 (select {from: trades
          where: (> price 100)
-         cols: {sym: sym notional: (* price size)}})
+         sym: sym notional: (* price size)})
 
 ; Group-by with multiple aggregates
 (select {from: trades
          by:   {sym: sym}
-         cols: {vwap: (/ (sum (* price size)) (sum size))
-                count: (count price)}})
+         vwap: (/ (sum (* price size)) (sum size))
+                count: (count price)})
 
 ; Update: add a column
 (update {from: trades
-          cols: {notional: (* price size)}})
+          notional: (* price size)})
 ```
 
 `insert` overloads on arity. With two arguments it appends; with three arguments it inserts at a position (or positions) given by the second argument. The first argument is a quoted symbol for in-place mutation, e.g. `'v`, or any expression that evaluates to a table/vector/list.
@@ -188,7 +189,7 @@ These are **special forms** that bridge to the Rayforce DAG executor.
 (insert 'trades (list 'AAPL 150.0 100))
 
 ; Vector / list operations
-(def v (til 5))               ; [0 1 2 3 4]
+(set v (til 5))               ; [0 1 2 3 4]
 (insert 'v 99)                  ; append:    [0 1 2 3 4 99]
 (insert 'v 0 -1)                ; head:      [-1 0 1 2 3 4 99]
 (insert 'v 3 [100 200])         ; splice:    [-1 0 1 100 200 2 3 4 99]
@@ -210,26 +211,29 @@ Rayforce supports four join types, all with time-series-aware semantics.
 | `asof-join` | variadic | As-of join — match the most recent preceding value. |
 
 ```lisp
-; Left join two tables on the sym column
-(left-join trades quotes 'sym)
+; Left join two tables on the sym column (join keys are a symbol list)
+(left-join trades quotes [sym])
 
 ; Inner join
-(inner-join orders products 'product_id)
+(inner-join orders products [product_id])
 
-; Window join: match trades to quotes within 1-second window
-(window-join {left: trades  right: quotes
-              on: [sym]  window: [-1000 0]
-              cols: {avg_bid: (avg bid)}})
+; Window join: keys are [equality-keys... time-key]; intervals is
+; (list lo-vec hi-vec) with one [lo hi] window bound per left row.
+; For each left row, aggregate the right rows whose time key falls in the window.
+(window-join [sym time]
+             (list [8 18] [12 22])
+             trades quotes
+             {avg_bid: (avg bid)})
 
-; As-of join: find most recent quote for each trade
-(asof-join trades quotes 'sym)
+; As-of join: keys come first, the last key is the time key
+(asof-join [sym time] trades quotes)
 ```
 
 ## Pivot & Window
 
 | Function | Type | Description | Example |
 |---|---|---|---|
-| `pivot` | variadic | Pivot table — reshape long to wide format | `(pivot trades 'sym 'date 'price)` |
+| `pivot` | variadic | Pivot table — reshape long to wide. Args: table, index col, pivot col, value col, agg fn | `(pivot trades 'sym 'date 'price sum)` |
 | `xbar` | binary, atomic | Bucket values (time bucketing for OHLC bars) | `(xbar [3 7 12] 5)` → `[0 5 10]` |
 | `xrank` | binary | Assign N rank buckets (quantile ranking) | `(xrank 4 [10 20 30 40])` |
 
@@ -237,24 +241,25 @@ Rayforce supports four join types, all with time-series-aware semantics.
 ; OHLC bars: bucket trades by 5-minute intervals
 (select {from: trades
          by:   {sym: sym  bucket: (xbar time 300000)}
-         cols: {open: (first price)
+         open: (first price)
                 high: (max price)
                 low:  (min price)
                 close: (last price)
-                vol:  (sum size)}})
+                vol:  (sum size)})
 ```
 
 ## String Operations
 
 | Function | Type | Description | Example |
 |---|---|---|---|
-| `split` | binary | Split string by delimiter | `(split "a,b,c" ",")` → `["a" "b" "c"]` |
+| `split` | binary | Split string by delimiter (returns a list) | `(split "a,b,c" ",")` → `("a" "b" "c")` |
+| `strlen` | unary | Length of each string | `(strlen "hello")` → `5` |
 | `like` | binary | Glob pattern match: `*` any, `?` one, `[abc]`/`[a-z]`/`[!abc]` char class | `(like "hello" "hel*")` → `true` |
 | `concat` | binary | Concatenate two strings or vectors | `(concat "hello" " world")` → `"hello world"` |
 | `format` | variadic | Format values as string (% is placeholder) | `(format "x=%" 42)` → `"x=42"` |
 
 !!! note "Note"
-    The executor supports additional string opcodes (STRLEN, UPPER, LOWER, TRIM, SUBSTR, REPLACE, CONCAT) at the DAG level. All string transformations propagate nulls: null input rows produce null output rows.
+    The executor supports additional string opcodes (UPPER, LOWER, TRIM, SUBSTR, REPLACE, CONCAT) at the DAG level. All string transformations propagate nulls: null input rows produce null output rows.
 
 ## Date & Time
 
@@ -291,7 +296,7 @@ Cross-temporal comparisons are supported: dates, times, and timestamps are all c
 | `as` | binary | Cast value to another type | `(as 'i64 "42")` → `42` |
 | `nil?` | unary | Test if value is null | `(nil? x)` |
 | `rc` | unary | Reference count of an object | `(rc x)` → `1` |
-| `guid` | unary | Generate N GUIDs (0 for one) | `(guid 0)` |
+| `guid` | unary | Generate a vector of N GUIDs (`(guid 0)` → `[]`) | `(guid 1)` |
 
 ## I/O & File Operations
 
@@ -382,16 +387,16 @@ Built-in support for triple stores. The EAV table has three columns: `e` (entity
 | Function | Type | Description | Example |
 |---|---|---|---|
 | `union-all` | binary | Concatenate two tables (all rows) | `(union-all t1 t2)` |
-| `table-distinct` | unary | Remove duplicate rows from table | `(table-distinct t)` |
-| `antijoin` | variadic | Anti-semi-join: rows in left not in right | `(antijoin t1 t2 [x])` |
+| `distinct` | unary | Remove duplicate rows from a table | `(distinct t)` |
+| `anti-join` | variadic | Anti-semi-join: rows in left not in right | `(anti-join t1 t2 [x])` |
 
 ```lisp
 ; Table concatenation and deduplication
 (set t1 (table [x] (list [1 2])))
 (set t2 (table [x] (list [2 3])))
 (union-all t1 t2)          ; 4 rows: 1 2 2 3
-(table-distinct (union-all t1 t2))  ; 3 rows: 1 2 3
-(antijoin t1 t2 [x])     ; 1 row: 1
+(distinct (union-all t1 t2))  ; 3 rows: 1 2 3
+(anti-join t1 t2 [x])     ; 1 row: 1
 ```
 
 ## Datalog

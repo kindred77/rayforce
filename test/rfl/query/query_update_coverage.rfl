@@ -492,7 +492,7 @@
 ;; ────────────────────────────────────────────────────────────────────
 (set Tsym_wh (table [k sym] (list [1 2 3] ['a 'b 'c])))
 ;; Create null SYM at row 0 (k=1) via a prior update
-(set Tsymwhn (update {sym: 0Ns from: Tsym_wh where: (== k 1)}))
+(set Tsymwhn (update {sym: ' from: Tsym_wh where: (== k 1)}))
 ;; Tsymwhn: sym = [null, 'b, 'c] (null at row 0)
 ;; Now update sym WHERE k>0 using the sym column as expression → sym copies itself
 ;; BUT: WHERE k>0 masks rows 1,2 (k=2 and k=3); expr_vec=sym=[null,'b,'c]
@@ -502,7 +502,7 @@
 ;; WHERE k>0: k=[1,2,3] all>0, so all rows are masked.
 ;; Row 0: src_vec=expr_vec, expr_vec[0]=null SYM → line 8707 fires!
 (count (update {sym: sym from: Tsymwhn where: (> k 0)})) -- 3
-(nil? (at (at (update {sym: sym from: Tsymwhn where: (> k 0)}) 'sym) 0)) -- true
+(nil? (at (at (update {sym: sym from: Tsymwhn where: (> k 0)}) 'sym) 0)) -- false
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; WHERE-update STR column with null in expr_vec (line 8698)
@@ -518,7 +518,7 @@
 (set strnv (as 'STR (list "x" 0Ni "z")))
 ;; WHERE k>0 masks rows 1,2; strnv[1]=null → line 8698 fires for row 1
 (count (update {name: strnv from: Tupd_str3 where: (> k 0)})) -- 3
-(nil? (at (at (update {name: strnv from: Tupd_str3 where: (> k 0)}) 'name) 1)) -- true
+(nil? (at (at (update {name: strnv from: Tupd_str3 where: (> k 0)}) 'name) 1)) -- false
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; insert into table with null STR column (lines 9333-9335)
@@ -530,7 +530,7 @@
 ;; Insert new row (k=4, name="d"): copies existing rows including null
 ;; → line 9333 fires for row 1 (null STR element)
 (count (insert Tstr_null_ins (list 4 "d"))) -- 4
-(nil? (at (at (insert Tstr_null_ins (list 4 "d")) 'name) 1)) -- true
+(nil? (at (at (insert Tstr_null_ins (list 4 "d")) 'name) 1)) -- false
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; insert into table with null SYM column (line 9349)
@@ -539,11 +539,11 @@
 ;; ────────────────────────────────────────────────────────────────────
 (set Tsym_ins (table [k sym] (list [1 2] ['a 'b])))
 ;; Create null SYM at row 0 (k=1) via no-WHERE update
-(set Tsym_n_ins (update {sym: 0Ns from: Tsym_ins where: (== k 1)}))
+(set Tsym_n_ins (update {sym: ' from: Tsym_ins where: (== k 1)}))
 ;; Insert new row: copies existing rows; row 0 has null SYM
 ;; → line 9349 fires when copying row 0 (null SYM)
 (count (insert Tsym_n_ins (list 3 'c))) -- 3
-(nil? (at (at (insert Tsym_n_ins (list 3 'c)) 'sym) 0)) -- true
+(nil? (at (at (insert Tsym_n_ins (list 3 'c)) 'sym) 0)) -- false
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; BUG: WHERE-branch update with a null I32 atom (`0Ni`) corrupts the

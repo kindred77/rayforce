@@ -251,6 +251,7 @@ ray_t* ray_map_fn(ray_t** args, int64_t n);
 ray_t* ray_pmap_fn(ray_t** args, int64_t n);
 ray_t* ray_fold_fn(ray_t** args, int64_t n);
 ray_t* ray_scan_fn(ray_t** args, int64_t n);
+ray_t* ray_prior_fn(ray_t** args, int64_t n);
 ray_t* ray_filter_fn(ray_t* vec, ray_t* mask);
 ray_t* ray_apply_fn(ray_t** args, int64_t n);
 
@@ -274,6 +275,7 @@ ray_t* ray_value_fn(ray_t* x);
 
 /* Query */
 ray_t* ray_select_fn(ray_t** args, int64_t n);
+ray_t* ray_window_fn(ray_t** args, int64_t n);
 ray_t* ray_update_fn(ray_t** args, int64_t n);
 ray_t* ray_insert_fn(ray_t** args, int64_t n);
 ray_t* ray_upsert_fn(ray_t** args, int64_t n);

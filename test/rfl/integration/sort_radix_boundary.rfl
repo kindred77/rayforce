@@ -99,3 +99,18 @@
 (asc (rank (take [5 3 1 4 2] N))) -- (til N)
 ;; sum of ranks 0..N-1 = N*(N-1)/2 = 4097*4096/2 = 8390656.
 (sum (rank (take [5 3 1 4 2] N))) -- 8390656
+
+;; ── xasc/xdesc already-in-order detection ───────────────────────────────────
+;; A table already in the requested order returns unchanged (bail-early
+;; verified with the sort's exact ordering — SYM lexicographic, ints raw);
+;; re-sorting an xasc/xdesc output must therefore be idempotent, and the
+;; detection must NOT fire for the opposite direction or a different key.
+(set XT (table [s t v] (list ['b 'a 'a 'b] [2 1 3 1] [1 2 3 4])))
+(at (xasc (xasc XT ['s 't]) ['s 't]) 'v) -- (at (xasc XT ['s 't]) 'v)
+(at (xasc XT ['s 't]) 'v) -- [2 3 4 1]
+(at (xdesc (xdesc XT 't) 't) 'v) -- (at (xdesc XT 't) 'v)
+(at (xdesc XT 't) 'v) -- [3 1 2 4]
+;; opposite direction on sorted input must re-sort, not early-return
+(at (xdesc (xasc XT 't) 't) 'v) -- [3 1 2 4]
+;; sorted-by-s is not sorted-by-t: detection must not fire
+(at (xasc (xasc XT 's) 't) 'v) -- (at (xasc XT 't) 'v)

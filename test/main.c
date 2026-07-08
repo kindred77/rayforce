@@ -103,6 +103,7 @@ static int g_color = 0;
  * new file is added.  Sentinel-terminated (final entry has NULL name). */
 
 extern const test_entry_t err_entries[];
+extern const test_entry_t aof_entries[];
 extern const test_entry_t arena_entries[];
 extern const test_entry_t atom_entries[];
 extern const test_entry_t audit_entries[];
@@ -173,7 +174,7 @@ extern const test_entry_t vec_entries[];
 extern const test_entry_t window_entries[];
 
 static const test_entry_t* const compiled_groups[] = {
-    err_entries,      arena_entries,    atom_entries,     audit_entries,
+    err_entries,      aof_entries,      arena_entries,    atom_entries,     audit_entries,
     block_entries,    buddy_entries,    compile_entries,  cow_entries,      csr_entries,
     csv_entries,      datalog_entries,  dict_entries,     domain_entries,
     dump_entries,
@@ -217,7 +218,7 @@ static const test_entry_t* const compiled_groups[] = {
  * evaluates it under a fresh runtime (via rfl_setup/rfl_teardown).
  */
 
-#define RFL_THUNK_CAPACITY 384
+#define RFL_THUNK_CAPACITY 512
 
 static char  g_rfl_paths[RFL_THUNK_CAPACITY][512];
 static char  g_rfl_names[RFL_THUNK_CAPACITY][256];
@@ -304,6 +305,30 @@ static char* find_top_sep(char* s, const char* marker) {
     return NULL;
 }
 
+/* RFL_UPDATE=1 regen: rewrite a .rfl's ` -- RHS` goldens with actual values. */
+static void rfl_rewrite_goldens(const char* path, const int* lns, char (*vals)[512], int nu) {
+    FILE* f = fopen(path, "rb"); if (!f) return;
+    fseek(f, 0, SEEK_END); long n = ftell(f); rewind(f);
+    char* s = (char*)malloc((size_t)n + 1); if (!s) { fclose(f); return; }
+    size_t rd = fread(s, 1, (size_t)n, f); s[rd] = '\0'; fclose(f);
+    FILE* o = fopen(path, "wb"); if (!o) { free(s); return; }
+    char* q = s; int ln = 0;
+    while (*q) {
+        char* nl = strchr(q, '\n'); size_t L = nl ? (size_t)(nl - q) : strlen(q);
+        ln++;
+        int ui = -1; for (int i = 0; i < nu; i++) if (lns[i] == ln) { ui = i; break; }
+        if (ui >= 0) {
+            char line[2048]; size_t cl = L < 2047 ? L : 2047; memcpy(line, q, cl); line[cl] = '\0';
+            char* sep = find_top_sep(line, " -- ");
+            if (sep) { *(sep + 4) = '\0'; fprintf(o, "%s%s", line, vals[ui]); }
+            else fwrite(q, 1, L, o);
+        } else fwrite(q, 1, L, o);
+        if (nl) fputc('\n', o);
+        q = nl ? nl + 1 : q + L;
+    }
+    free(s); fclose(o);
+}
+
 static test_result_t run_rfl_file(const char* path) {
     FILE* f = fopen(path, "rb");
     if (!f) FAILF("cannot open %s", path);
@@ -321,6 +346,10 @@ static test_result_t run_rfl_file(const char* path) {
     int   assert_count  = 0;  /* tallies LHS -- RHS and EXPR !- SUBSTR lines */
     char* p             = src;
     test_result_t res   = { TEST_PASS, NULL };
+    int   upd    = getenv("RFL_UPDATE") != NULL;
+    static int  upd_ln[4096];
+    static char upd_v[4096][512];
+    int   nu     = 0;
 
     while (*p) {
         char* nl_ptr = strchr(p, '\n');
@@ -375,6 +404,12 @@ static test_result_t run_rfl_file(const char* path) {
                 char lbuf[512], rbuf[512];
                 fmt_into(le, lbuf, sizeof lbuf);
                 fmt_into(re, rbuf, sizeof rbuf);
+                if (upd) {
+                    if (nu < 4096) { upd_ln[nu] = line_no;
+                        snprintf(upd_v[nu], sizeof upd_v[nu], "%s", lbuf); nu++; }
+                    ray_release(le); ray_release(re);
+                    goto next;
+                }
                 snprintf(ray_test_fail_buf, sizeof ray_test_fail_buf,
                          "%s:%d: expected \"%s\", got \"%s\"  -- src: %s",
                          path, line_no, rbuf, lbuf, lhs);
@@ -444,6 +479,7 @@ done:
                  path);
         res = (test_result_t){ TEST_FAIL, ray_test_fail_buf };
     }
+    if (upd && nu) rfl_rewrite_goldens(path, upd_ln, upd_v, nu);
     free(src);
     return res;
 }
@@ -519,7 +555,23 @@ static void rfl_teardown(void) {
     X(352) X(353) X(354) X(355) X(356) X(357) X(358) X(359) \
     X(360) X(361) X(362) X(363) X(364) X(365) X(366) X(367) \
     X(368) X(369) X(370) X(371) X(372) X(373) X(374) X(375) \
-    X(376) X(377) X(378) X(379) X(380) X(381) X(382) X(383)
+    X(376) X(377) X(378) X(379) X(380) X(381) X(382) X(383) \
+    X(384) X(385) X(386) X(387) X(388) X(389) X(390) X(391) \
+    X(392) X(393) X(394) X(395) X(396) X(397) X(398) X(399) \
+    X(400) X(401) X(402) X(403) X(404) X(405) X(406) X(407) \
+    X(408) X(409) X(410) X(411) X(412) X(413) X(414) X(415) \
+    X(416) X(417) X(418) X(419) X(420) X(421) X(422) X(423) \
+    X(424) X(425) X(426) X(427) X(428) X(429) X(430) X(431) \
+    X(432) X(433) X(434) X(435) X(436) X(437) X(438) X(439) \
+    X(440) X(441) X(442) X(443) X(444) X(445) X(446) X(447) \
+    X(448) X(449) X(450) X(451) X(452) X(453) X(454) X(455) \
+    X(456) X(457) X(458) X(459) X(460) X(461) X(462) X(463) \
+    X(464) X(465) X(466) X(467) X(468) X(469) X(470) X(471) \
+    X(472) X(473) X(474) X(475) X(476) X(477) X(478) X(479) \
+    X(480) X(481) X(482) X(483) X(484) X(485) X(486) X(487) \
+    X(488) X(489) X(490) X(491) X(492) X(493) X(494) X(495) \
+    X(496) X(497) X(498) X(499) X(500) X(501) X(502) X(503) \
+    X(504) X(505) X(506) X(507) X(508) X(509) X(510) X(511)
 
 #define X(N) static test_result_t rfl_thunk_##N(void) { return run_rfl_at(N); }
 RFL_THUNKS(X)

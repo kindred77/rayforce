@@ -202,43 +202,37 @@ static test_result_t test_create_with_sym_load_preserves_user_ids(void) {
     PASS();
 }
 
-/* Sym file whose stat st_size exceeds mem_budget/2 must trigger the
+/* Sym file whose stat st_size exceeds half of physical RAM must trigger the
  * pre-flight OOM guard and surface RAY_ERR_OOM through out_sym_err.
- * We use ftruncate to create a sparse file without actually allocating
- * the backing bytes.  Budget auto-detects ~80% of RAM, so a sparse
- * file ~10 EB guarantees tripping the half-budget ceiling on any
- * realistic dev/CI host. */
+ * We use ftruncate to create a SPARSE file (no backing bytes), sized from
+ * the same total physical RAM the runtime detects so it lands just over the
+ * half-RAM ceiling on any host — and stays ~RAM-sized (~tens of GB), well
+ * under every real filesystem's max-file limit.  The earlier fixed 4 EB
+ * (1<<62) size exceeded ext4's 16 TB cap → EFBIG → the test silently skipped
+ * on every Linux dev/CI host. */
 static test_result_t test_create_with_sym_oversized_file(void) {
     char* dir = make_tmpdir();
     TEST_ASSERT_NOT_NULL(dir);
 
-    /* Skip on platforms with 32-bit off_t — the sparse size we want
-     * (>> 4 GB) isn't representable and the shift in that case would
-     * be undefined. */
-    if (sizeof(off_t) < 8) {
-        free(dir);
-        SKIP("explicit MUNIT_SKIP");
-    }
+    /* Mirror runtime.c's guard: total physical RAM.  half + 1 MB just trips
+     * the > total_ram/2 guard.  Sparse, so those bytes are never backed and
+     * the pre-flight stat check short-circuits before any read. */
+    long pages = sysconf(_SC_PHYS_PAGES);
+    long psize = sysconf(_SC_PAGE_SIZE);
+    TEST_ASSERT((pages) > (0), "sysconf(_SC_PHYS_PAGES)");
+    TEST_ASSERT((psize) > (0), "sysconf(_SC_PAGE_SIZE)");
+    int64_t total_ram = (int64_t)((double)pages * (double)psize);
+    off_t huge = (off_t)(total_ram / 2 + (1 << 20));
 
     char path[256];
     snprintf(path, sizeof(path), "%s/huge.sym", dir);
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     TEST_ASSERT((fd) >= (0), "fd >= 0");
-    /* 4 EB sparse — bigger than any plausible mem_budget/2 (<1 ZB of
-     * RAM).  Build via int64_t to keep the shift well-defined, then
-     * cast to off_t after the width guard above has passed. */
-    int64_t huge64 = (int64_t)1 << 62;
-    off_t huge = (off_t)huge64;
     int rc = ftruncate(fd, huge);
     close(fd);
-    if (rc != 0) {
-        /* Some filesystems (tmpfs on limited hosts) reject the giant
-         * ftruncate — skip rather than fail spuriously. */
-        unlink(path);
-        rmdir(dir);
-        free(dir);
-        SKIP("explicit MUNIT_SKIP");
-    }
+    /* A ~RAM-sized sparse ftruncate succeeds on every mainstream FS; a
+     * failure here is a genuine, hard error, not a reason to skip. */
+    TEST_ASSERT_EQ_I(rc, 0);
 
     ray_err_t err = RAY_OK;
     ray_runtime_t* rt = ray_runtime_create_with_sym_err(path, &err);

@@ -73,6 +73,31 @@ typedef struct {
     /* ── warm: per-dispatch context (core/ipc.c saves/restores) */
     int64_t          ipc_handle; /* connection handle of the hook/eval on this stack; -1 = none */
     void            *ipc_poll;   /* opaque ray_poll_t* that dispatched it; NULL = none */
+    /* ── projection-pushdown hint (query eval): a consuming select publishes the
+     * column syms it references before evaluating its `from:`; the first nested
+     * `select {by:}` distinct consumes them and drops the rest.  Consume-once;
+     * NULL/0/false defaults (memset) mean inactive. */
+    const int64_t   *proj_keep;
+    int              proj_keep_n;
+    int32_t          proj_depth;  /* eval_depth at publish; consumed only at +1 */
+    bool             proj_active;
+    /* ── filter-compaction keep-set: a select about to execute its WHERE-filter
+     * DAG publishes the column syms its (provably keys-only distinct) downstream
+     * will read, so the top-level filter finalization (ray_execute_inner) gathers
+     * only those columns instead of the whole table.  Scoped to one ray_execute
+     * call via save/restore; consumed only at the publishing eval_depth.
+     * NULL/0 (memset) = carry all columns (unchanged behaviour). */
+    const int64_t   *filt_keep;
+    int              filt_keep_n;
+    int32_t          filt_depth;  /* eval_depth at publish; consumed only at == */
+    /* ── group-by DA-eligibility hint: exec_group publishes each group key's
+     * KNOWN cardinality (dict n_distinct today; extensible to other key types
+     * with a cheaply-known TIGHT slot-span bound) so exec_group_v2's direct-
+     * array check can reject an infeasible composite without a min/max prescan.
+     * Consume-once per group; cleared at exec_group entry. memset-zero = none. */
+    int64_t          grp_card_sym[8];
+    int64_t          grp_card_val[8];
+    uint8_t          grp_card_n;
     /* ── cold: error paths only */
     ray_t           *trace;      /* error trace list (owned) */
     ray_t           *raise_val;  /* pending (raise x) value (owned) */
@@ -89,7 +114,7 @@ void ray_vm_init(ray_vm_t* vm, int32_t id);
 typedef struct ray_runtime_s {
     ray_vm_t       **vms;
     int32_t          n_vms;
-    int64_t          mem_budget;   /* 80% of physical RAM, bytes */
+    int64_t          total_ram;    /* total physical RAM, bytes */
     void            *poll;         /* opaque ray_poll_t* — see ray_runtime_(set|get)_poll */
     void            *sys_args;     /* opaque ray_t* dict — see ray_runtime_(set|get)_sys_args */
 } ray_runtime_t;

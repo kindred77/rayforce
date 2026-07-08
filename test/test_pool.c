@@ -334,6 +334,33 @@ static test_result_t test_cancel(void) {
     PASS();
 }
 
+/* A cancel request must reach BOTH the eval/VM interrupt flag and the pool's
+ * worker-cancel flag through the single ray_request_interrupt() entry point,
+ * and the clear path must reset both.  Before unification ray_cancel() had no
+ * caller, so Ctrl-C set only the eval flag and never stopped parallel workers. */
+static test_result_t test_interrupt_sets_both_flags(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+    ray_pool_t* pool = ray_pool_get();     /* ensure the pool is live (state 2) */
+    TEST_ASSERT_NOT_NULL(pool);
+
+    ray_clear_interrupt();
+    TEST_ASSERT_FALSE(ray_interrupted());
+    TEST_ASSERT_EQ_I((int)atomic_load_explicit(&pool->cancelled, memory_order_relaxed), 0);
+
+    ray_request_interrupt();               /* the unified trigger */
+    TEST_ASSERT_TRUE(ray_interrupted());   /* main-thread eval/VM flag */
+    TEST_ASSERT_EQ_I((int)atomic_load_explicit(&pool->cancelled, memory_order_relaxed), 1); /* worker flag too */
+
+    ray_clear_interrupt();                  /* the unified reset */
+    TEST_ASSERT_FALSE(ray_interrupted());
+    TEST_ASSERT_EQ_I((int)atomic_load_explicit(&pool->cancelled, memory_order_relaxed), 0);
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 /* --------------------------------------------------------------------------
  * Direct ray_pool_dispatch / ray_pool_dispatch_n coverage
  *
@@ -1120,6 +1147,22 @@ static test_result_t test_epoll_hup_no_errfn(void) {
     int64_t id = ray_poll_register(poll, &reg);
     TEST_ASSERT_FMT(id >= 0, "ray_poll_register failed (id=%lld)", (long long)id);
 
+    /* Register the wake self-pipe BEFORE starting the poll thread.  The poll
+     * selector array is single-owner by design — production only ever
+     * registers/deregisters from the poll-loop thread — so registering here
+     * (while no poll thread is running) keeps this test faithful to that
+     * contract.  Later we only WRITE to wake_pipe[1], never touching the
+     * selector array from the main thread. */
+    int wake_pipe[2];
+    bool have_wake = (pipe(wake_pipe) == 0);
+    if (have_wake) {
+        ray_poll_reg_t wake_reg;
+        memset(&wake_reg, 0, sizeof(wake_reg));
+        wake_reg.fd   = wake_pipe[0];
+        wake_reg.type = RAY_SEL_SOCKET;
+        ray_poll_register(poll, &wake_reg);
+    }
+
     epoll_hup_noerrfn_ctx_t ctx = { .poll = poll, .hup_fired = 0 };
     ray_thread_t tid;
     ray_thread_create(&tid, epoll_hup_noerrfn_poll_thread, &ctx);
@@ -1133,15 +1176,9 @@ static test_result_t test_epoll_hup_no_errfn(void) {
     epoll_sleep_ms(50);
     ray_poll_exit(poll, 0);
 
-    /* Wake epoll_wait by registering a self-pipe and writing a byte */
-    int wake_pipe[2];
-    if (pipe(wake_pipe) == 0) {
-        ray_poll_reg_t wake_reg;
-        memset(&wake_reg, 0, sizeof(wake_reg));
-        wake_reg.fd   = wake_pipe[0];
-        wake_reg.type = RAY_SEL_SOCKET;
-        ray_poll_register(poll, &wake_reg);
-        /* Writing to the pipe wakes epoll_wait so poll->code >= 0 is checked */
+    /* Wake epoll_wait so the loop re-checks poll->code (>= 0) and exits.
+     * Only a write to the pipe — no selector-array mutation from here. */
+    if (have_wake) {
         char b = 'x';
         (void)write(wake_pipe[1], &b, 1);
         epoll_sleep_ms(30);
@@ -1170,6 +1207,7 @@ const test_entry_t pool_entries[] = {
     { "pool/parallel_group_sum", test_parallel_group_sum, NULL, NULL },
     { "pool/parallel_min_max", test_parallel_min_max, NULL, NULL },
     { "pool/cancel", test_cancel, NULL, NULL },
+    { "pool/interrupt_sets_both_flags", test_interrupt_sets_both_flags, NULL, NULL },
     { "pool/dispatch_zero_elems",   test_dispatch_zero_elems,   NULL, NULL },
     { "pool/dispatch_small",        test_dispatch_small,        NULL, NULL },
     { "pool/dispatch_n_small",      test_dispatch_n_small,      NULL, NULL },

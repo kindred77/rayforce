@@ -138,8 +138,10 @@ typedef struct {
     size_t slab_hits;        /* slab cache hits */
     size_t direct_count;     /* active direct mmaps */
     size_t direct_bytes;     /* bytes in direct mmaps */
-    size_t sys_current;      /* sys allocator: current mmap'd bytes */
-    size_t sys_peak;         /* sys allocator: peak mmap'd bytes */
+    size_t sys_current;      /* committed RAM: buddy pools + sys allocs (bytes) */
+    size_t sys_peak;         /* committed RAM high-water mark */
+    size_t sys_mapped;       /* file-backed bytes mapped (columns, sym, CSV) */
+    size_t sys_mapped_peak;  /* file-backed mapping high-water mark */
 } ray_mem_stats_t;
 
 /* ===== Forward Declarations (internal types) ===== */
@@ -154,10 +156,6 @@ typedef struct ray_dispatch  ray_dispatch_t;
 
 void     ray_heap_init(void);
 void     ray_heap_destroy(void);
-/* Id of the calling thread's current heap, or 0xFFFF if none is bound.
- * Used to tag heap-backed allocations (e.g. sym-domain atoms) so their
- * owner can be invalidated when this heap is torn down. */
-uint16_t ray_heap_current_id(void);
 void     ray_heap_merge(ray_heap_t* src);
 void     ray_heap_flush_foreign(void);
 void     ray_heap_push_pending(ray_heap_t* heap);
@@ -180,6 +178,57 @@ void ray_heap_release_pages(void);
  * Block size helper
  * -------------------------------------------------------------------------- */
 #define BSIZEOF(o)    ((size_t)1 << (o))
+
+/* --------------------------------------------------------------------------
+ * Direct large allocation
+ *
+ * An allocation that would otherwise need a dedicated OVERSIZED buddy pool
+ * (order >= RAY_HEAP_POOL_ORDER) is instead mmap'd at its EXACT page-rounded
+ * size — no power-of-2 block rounding, no order+1 pool doubling.  Layout:
+ * [ray_direct_hdr_t (32B) | ray_t header (32B) | data], page-rounded.  The
+ * ray_t is marked with an order ABOVE the max real order, so every buddy path
+ * (freelist indexing, coalescing, pool masking, capacity) skips it, and it is
+ * freed by a standalone munmap from any thread (address space is
+ * process-wide); its bytes live in a single global atomic.
+ * -------------------------------------------------------------------------- */
+#define RAY_ORDER_DIRECT   (RAY_HEAP_MAX_ORDER + 1)   /* sentinel order */
+#define RAY_DIRECT_HDR     32                          /* prefix before ray_t */
+
+typedef struct {
+    size_t map_size;      /* total mmap'd bytes */
+    int    swap_fd;       /* -1 = anonymous (ray_vm_free); >=0 = file-backed spill */
+    int    _pad0;
+    char*  swap_path;     /* spill file to unlink+free on release; NULL if anon */
+    char   _pad1[RAY_DIRECT_HDR - sizeof(size_t) - 2 * sizeof(int) - sizeof(char*)];
+} ray_direct_hdr_t;
+_Static_assert(sizeof(ray_direct_hdr_t) == RAY_DIRECT_HDR, "direct hdr must be 32B");
+
+static inline bool ray_is_direct(const ray_t* v) {
+    return v->order > RAY_HEAP_MAX_ORDER;
+}
+static inline size_t ray_direct_map_size(const ray_t* v) {
+    return ((const ray_direct_hdr_t*)((const char*)v - RAY_DIRECT_HDR))->map_size;
+}
+/* Usable data bytes (block minus the 32-byte ray_t header).  Handles both
+ * buddy blocks and direct blocks, so capacity math is uniform. */
+static inline size_t ray_block_data_bytes(const ray_t* v) {
+    return ray_is_direct(v)
+        ? ray_direct_map_size(v) - RAY_DIRECT_HDR - 32
+        : ((size_t)1 << v->order) - 32;
+}
+/* True if a direct block is backed by a disk spill file (vs anonymous RAM). */
+static inline bool ray_direct_file_backed(const ray_t* v) {
+    return ((const ray_direct_hdr_t*)((const char*)v - RAY_DIRECT_HDR))->swap_fd >= 0;
+}
+
+/* Anonymous (RAM-resident, OOM-killable) pool + direct bytes currently
+ * committed by the heap.  Allocations that would push this past the anon
+ * watermark (default: total physical RAM) are backed by a disk spill file
+ * instead — file-backed pages are always reclaimable, so they cannot trigger
+ * the OOM killer.  ray_heap_set_anon_watermark overrides the threshold (0
+ * restores the default); intended for diagnostics and tests. */
+int64_t ray_heap_anon_committed(void);
+void    ray_heap_set_anon_watermark(int64_t bytes);
 
 /* --------------------------------------------------------------------------
  * Pool header: first min-block (64B) of each self-aligned pool.
@@ -268,41 +317,60 @@ typedef struct {
  * blocks always have order > RAY_ORDER_MIN.
  * -------------------------------------------------------------------------- */
 
+/* A pool header is the leftmost min-block of a self-aligned pool: it always
+ * carries order==RAY_ORDER_MIN, mmod==0 and the sentinel rc==1 (it is never
+ * freed, so it never coalesces — see the pool-init at heap.c).  These three
+ * together uniquely identify a header: every cascade/split block has
+ * order>RAY_ORDER_MIN, and live/free blocks never hold rc==1+order==MIN+mmod==0
+ * at a 32 MB boundary.  ray_pool_of MUST gate EVERY header it returns on this
+ * signature — pool_order alone is not enough. */
+static inline bool ray_is_pool_hdr(ray_t* b) {
+    return b->order == RAY_ORDER_MIN && b->mmod == 0 &&
+           ray_atomic_load(&b->rc) == 1;
+}
+
 static inline ray_pool_hdr_t* ray_pool_of(ray_t* v) {
     /* Standard pools (32 MB, self-aligned): one AND gives the base.
      * Oversized pools need a downward walk but are rare. */
     uintptr_t stride = BSIZEOF(RAY_HEAP_POOL_ORDER);  /* 32 MB */
     uintptr_t base = (uintptr_t)v & ~(stride - 1);
+    ray_t* hb = (ray_t*)base;
     ray_pool_hdr_t* hdr = (ray_pool_hdr_t*)base;
 
-    /* Fast path: standard pool header at 32 MB boundary (99%+ of calls) */
-    if (RAY_LIKELY(hdr->pool_order == RAY_HEAP_POOL_ORDER))
-        return hdr;
+    /* Fast path: a real pool header sits at this 32 MB boundary (99%+ of
+     * calls).  Gate on the header signature, NOT pool_order alone: a
+     * 32 MB-aligned block in the INTERIOR of an oversized pool lands here
+     * too, and trusting its overlaid pool_order byte would resolve it to
+     * itself — after which heap_coalesce's buddy walk runs past the real
+     * mapping and faults at pool_base+0x14 (the rc field). */
+    if (RAY_LIKELY(ray_is_pool_hdr(hb))) {
+        if (hdr->pool_order == RAY_HEAP_POOL_ORDER)
+            return hdr;                          /* standard pool */
+        if (hdr->pool_order > RAY_HEAP_POOL_ORDER &&
+            hdr->pool_order <= RAY_HEAP_MAX_ORDER &&
+            (uintptr_t)v < base + BSIZEOF(hdr->pool_order))
+            return hdr;                          /* oversized header at boundary */
+    }
 
-    /* Slow path: oversized pool — walk downward at 32 MB stride */
-    if (hdr->pool_order > RAY_HEAP_POOL_ORDER &&
-        hdr->pool_order <= RAY_HEAP_MAX_ORDER &&
-        (uintptr_t)v < base + BSIZEOF(hdr->pool_order))
-        return hdr;
-
+    /* Oversized pool: the header is one or more 32 MB strides below v. */
     for (;;) {
         if (base < stride) break;
         base -= stride;
         hdr = (ray_pool_hdr_t*)base;
         ray_t* hdr_blk = (ray_t*)base;
-        if (hdr_blk->order == RAY_ORDER_MIN &&
-            hdr_blk->mmod == 0 &&
-            ray_atomic_load(&hdr_blk->rc) == 1) {
-            if (hdr->pool_order >= RAY_HEAP_POOL_ORDER &&
-                hdr->pool_order <= RAY_HEAP_MAX_ORDER &&
-                (uintptr_t)v < base + BSIZEOF(hdr->pool_order))
-                return hdr;
-        }
+        if (ray_is_pool_hdr(hdr_blk) &&
+            hdr->pool_order >= RAY_HEAP_POOL_ORDER &&
+            hdr->pool_order <= RAY_HEAP_MAX_ORDER &&
+            (uintptr_t)v < base + BSIZEOF(hdr->pool_order))
+            return hdr;
     }
-    ray_pool_hdr_t* fallback = (ray_pool_hdr_t*)((uintptr_t)v & ~(stride - 1));
-    if (fallback->pool_order >= RAY_HEAP_POOL_ORDER &&
-        fallback->pool_order <= RAY_HEAP_MAX_ORDER)
-        return fallback;
+
+    /* No signature-valid header covers v.  Pool headers are always at a
+     * 32 MB boundary, so the walk above sees every candidate; reaching here
+     * means v is not inside any live pool.  Returning a pool_order-only
+     * guess (the old fallback) reintroduces the very mis-resolution this
+     * function now guards against — report NULL instead and let callers
+     * (heap_flush_foreign etc.) drop the block. */
     return NULL;
 }
 

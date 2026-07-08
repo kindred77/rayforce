@@ -53,7 +53,6 @@ extern "C" {
 #endif
 
 size_t ray_parse_i64(const char *src, size_t len, int64_t  *dst);
-size_t ray_parse_i32(const char *src, size_t len, int32_t  *dst);
 size_t ray_parse_f64(const char *src, size_t len, double   *dst);
 size_t ray_parse_u64_hex(const char *src, size_t len, uint64_t *dst);
 
@@ -62,7 +61,8 @@ size_t ray_parse_u64_hex(const char *src, size_t len, uint64_t *dst);
  *
  * Caller must guarantee 8 readable bytes at `p` for the 8-digit forms,
  * 4 for the 4-digit forms.  All loads are unaligned via memcpy.
- * Little-endian assumed (x86_64 / aarch64 in normal mode).
+ * Byte-order independent: the accumulation forms normalise the loaded
+ * word to little-endian, so they are correct on big-endian hosts too.
  * ---------------------------------------------------------------------------- */
 
 bool     ray_is_8_digits   (const void *p);

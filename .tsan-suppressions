@@ -1,0 +1,12 @@
+# ThreadSanitizer suppressions.
+#
+# Every entry here MUST carry a comment explaining WHY the reported race
+# is benign (or why it is a known false positive of TSan against the
+# custom pool allocator), plus a reference to the investigation.  An
+# unexplained suppression hides real races — prefer fixing the code or
+# converting an intentional relaxed access to an explicit
+# atomic_*_explicit over adding a blanket entry.
+#
+# Format: `race:<function_or_file>` (see the TSan suppressions docs).
+#
+# (none yet — populate during the Phase 2 burn-down)

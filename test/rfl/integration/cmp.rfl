@@ -174,3 +174,59 @@
 (set t1 (enlist (as 'guid "d49f18a4-1969-49e8-9b8a-6bb9a4832eea"))) (set t2 (enlist (as 'guid "d49f18a4-196a-49e8-9b8a-6bb9a4832eea"))) (<= t1 t2) -- [true]
 (set t1 (enlist (as 'guid "d49f18a4-1969-49e9-9b8a-6bb9a4832eea"))) (set t2 (as 'guid "d49f18a4-1969-49e8-9b8a-6bb9a4832eea")) (>= t1 t2) -- [true]
 (set t1 (enlist (as 'guid "d49f18a4-1969-49e9-9b8a-6bb9a4832eea"))) (set t2 (enlist (as 'guid "d49f18a4-1969-49e9-9b8a-6bb9a4832eea"))) (>= t1 t2) -- [true]
+
+;; ── SYM vec-vec == / != (R8 vectorized kernel) ──────────────────────────────
+;; Same-domain id compare; must equal the per-element semantics exactly.
+(== ['a 'b 'c 'a] ['a 'x 'c 'b]) -- [true false true false]
+(!= ['a 'b 'c 'a] ['a 'x 'c 'b]) -- [false true false true]
+;; shifted-vector fby shape (q37): self-compare against a rotated copy
+(set SV ['a 'a 'b 'b 'a])
+(== SV (concat (take SV 1) (take SV 4))) -- [true true false true false]
+;; cross-domain: a splayed-reloaded column (file-local domain) compared to a
+;; runtime-domain literal vec — per-element translation through the LUT.
+(.sys.exec "rm -rf /tmp/rfl_symveceq")
+(.db.splayed.set "/tmp/rfl_symveceq/" (table [s v] (list ['a 'b 'a 'c] [1 2 3 4])))
+(set FD (.db.splayed.get "/tmp/rfl_symveceq/"))
+(== (at FD 's) ['a 'b 'x 'c]) -- [true true false true]
+(!= (at FD 's) ['a 'b 'x 'c]) -- [false false true false]
+(== (at FD 's) (at FD 's)) -- [true true true true]
+
+;; ── SYM ordering compares (R9: rank/verdict LUT kernels) ────────────────────
+(< ['a 'c 'b] ['b 'b 'b]) -- [true false false]
+(>= ['a 'c 'b] ['b 'b 'b]) -- [false true true]
+(< ['a 'c 'b] 'b) -- [true false false]
+(> 'b ['a 'c 'b]) -- [true false false]
+;; prefix + length tiebreak (the char_str_cmp order)
+(< ['ab 'abc 'b] ['abc 'ab 'b]) -- [true false false]
+;; cross-domain ordering: splayed-reloaded (file-domain) vs runtime literals
+(<= (at FD 's) ['a 'a 'b 'z]) -- [true false true true]
+
+;; ── STR compares (R10: parallel bytes kernel, vec-vec and vec-atom) ─────────
+(== ["x" "yy" "z"] ["x" "y" "w"]) -- [true false false]
+(!= ["x" "yy" "z"] ["x" "y" "w"]) -- [false true true]
+(< ["x" "yy" "z"] ["x" "y" "w"]) -- [false false false]
+(<= ["x" "yy" "z"] ["x" "y" "w"]) -- [true false false]
+(> ["ab" "b"] "abc") -- [false true]
+(< "abc" ["ab" "b"]) -- [false true]
+
+;; ── nullable numeric vectors through the DAG (bail removed) ─────────────────
+;; Sentinel semantics end to end: 0N == 0N is true, 0N sorts below any value,
+;; arithmetic propagates null.  These pin the DAG path to the scalar truths.
+(set NV [1 0N 3 0N 5])
+(== NV 3) -- [false false true false false]
+(< NV 3) -- [true true false true false]
+(> NV 3) -- [false false false false true]
+(+ NV 1) -- [2 0N 4 0N 6]
+(* NV 2) -- [2 0N 6 0N 10]
+(== NV [1 0N 3 4 0N]) -- [true true true false false]
+(+ NV [10 10 10 10 10]) -- [11 0N 13 0N 15]
+(< [1.0 0N 3.0] 2.0) -- [true true false]
+(+ [1.0 0N 3.0] 1.0) -- [2.0 0N 4.0]
+
+;; ── typed membership kernel at eval level (verdict-LUT for SYM) ─────────────
+;; >8-element sets exercise the domain-verdict LUT; same and cross domain.
+(in ['a 'b 'c 'a] ['b 'c 'x 'y 'z 'q 'w 'e 'r 't]) -- [false true true false]
+(in (at FD 's) ['a 'x 'y 'z 'q 'w 'e 'r 't 'u]) -- [true false true false]
+(in (at FD 's) ['b 'c]) -- [false true false true]
+;; int vec through the same kernel (SIMD small-set path)
+(in [1 5 3 9] [3 9 100]) -- [false false true true]

@@ -1,0 +1,30 @@
+# Static analysis for correctness only — NO style churn.
+#
+# We enable the bug-finding families (bugprone-*, clang-analyzer-*,
+# concurrency-*) and disable the individual checks that generate noise in
+# a columnar C engine full of intentional (ptr,len) APIs, deliberate
+# narrowing, and union-based type punning.  readability-*, modernize-*,
+# cert naming, and the like are OFF on purpose: they would produce
+# thousands of diffs without finding a single bug.
+Checks: >
+  -*,
+  bugprone-*,
+  clang-analyzer-*,
+  concurrency-*,
+  misc-redundant-expression,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  -bugprone-assignment-in-if-condition,
+  -bugprone-branch-clone,
+  -bugprone-implicit-widening-of-multiplication-result,
+  -bugprone-reserved-identifier,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+  -clang-analyzer-valist.Uninitialized
+
+# Advisory to start; flip to the enabled set once the baseline is clean.
+WarningsAsErrors: ''
+
+# Only diagnose our own headers/sources, never system or third-party.
+HeaderFilterRegex: '(src|include)/.*'
+
+FormatStyle: none

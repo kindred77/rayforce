@@ -380,8 +380,7 @@ static test_result_t test_group_keys_i_first_occurrence(void) {
         TEST_ASSERT_EQ_I(((int)expect[i]), ((int)out.gids[i]));
     }
 
-    free(out.gids);
-    free(out.first_row);
+    agg_groups_free(&out);
     ray_release(col);
     ray_sym_destroy();
     ray_heap_destroy();
@@ -414,8 +413,7 @@ static test_result_t test_group_keys_i_i32(void) {
         TEST_ASSERT_EQ_I(((int)expect[i]), ((int)out.gids[i]));
     }
 
-    free(out.gids);
-    free(out.first_row);
+    agg_groups_free(&out);
     ray_release(col);
     ray_sym_destroy();
     ray_heap_destroy();
@@ -465,8 +463,7 @@ static test_result_t test_agg_run_one_i64(void) {
         ray_release(out);
     }
 
-    free(gr.gids);
-    free(gr.first_row);
+    agg_groups_free(&gr);
     ray_release(kcol);
     ray_release(vcol);
     ray_sym_destroy();
@@ -505,8 +502,7 @@ static test_result_t test_group_keys_multi(void) {
     TEST_ASSERT_EQ_I((2), (out.first_row[1]));
     TEST_ASSERT_EQ_I((3), (out.first_row[2]));
 
-    free(out.gids);
-    free(out.first_row);
+    agg_groups_free(&out);
     ray_release(ka);
     ray_release(kb);
     ray_sym_destroy();

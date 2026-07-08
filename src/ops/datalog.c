@@ -98,6 +98,10 @@ static int64_t dl_col_sym(const char* rel_name, int col_idx) {
 int dl_add_edb(dl_program_t* prog, const char* name, ray_t* table, int arity) {
     if (!prog || !name || !table || prog->n_rels >= DL_MAX_RELS)
         return -1;
+    /* col_names[] is fixed at DL_MAX_ARITY; reject over-arity EDBs at
+     * admission to prevent truncation or out-of-bounds access. */
+    if (arity > DL_MAX_ARITY)
+        return -1;
 
     int idx = prog->n_rels++;
     dl_rel_t* rel = &prog->rels[idx];
@@ -938,7 +942,7 @@ static ray_t* dl_join_tables(ray_t* left, ray_t* right,
         rkeys[k] = ray_scan_table(g, r_tid, rname);
     }
 
-    ray_op_t* join = ray_join(g, l_op, lkeys, r_op, rkeys, (uint8_t)n_keys, 0);
+    ray_op_t* join = ray_join(g, l_op, lkeys, r_op, rkeys, (uint32_t)n_keys, 0);
     ray_t* result = ray_execute(g, join);
     ray_graph_free(g);
     ray_release(ltbl);
@@ -989,7 +993,7 @@ static ray_t* dl_antijoin_tables(ray_t* left, ray_t* right,
         rkeys[k] = ray_scan_table(g, r_tid, rname);
     }
 
-    ray_op_t* aj = ray_antijoin(g, l_op, lkeys, r_op, rkeys, (uint8_t)n_keys);
+    ray_op_t* aj = ray_antijoin(g, l_op, lkeys, r_op, rkeys, (uint32_t)n_keys);
     ray_t* result = ray_execute(g, aj);
     ray_graph_free(g);
     ray_release(ltbl);
@@ -1705,7 +1709,7 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
                 }
 
                 ray_op_t* ag_ins[1] = { agg_in };
-                ray_op_t* root = ray_group(gg, keys_ops, (uint8_t)nk, &op_code, ag_ins, 1);
+                ray_op_t* root = ray_group(gg, keys_ops, (uint32_t)nk, &op_code, ag_ins, 1);
                 if (!root) {
                     ray_graph_free(gg);
                     ray_release(accum);
@@ -2384,6 +2388,13 @@ static ray_t* table_distinct(ray_t* tbl) {
 
     int64_t ncols = ray_table_ncols(tbl);
     if (ncols <= 0) { ray_retain(tbl); return tbl; }
+    /* keys[] is fixed at DL_MAX_ARITY; the primary gate is dl_add_edb's
+     * admission rejection, but we defend in depth: if a table somehow
+     * exceeds that bound, reject here rather than silently deduping on
+     * a truncated key prefix. */
+    if (ncols > DL_MAX_ARITY)
+        return ray_error("domain", "table_distinct: table has %lld cols, exceeds DL_MAX_ARITY=%d",
+                          (long long)ncols, DL_MAX_ARITY);
 
     ray_t* canonical = canonicalize(tbl);
     if (!canonical || RAY_IS_ERR(canonical))
@@ -2396,13 +2407,13 @@ static ray_t* table_distinct(ray_t* tbl) {
     }
 
     ray_op_t* keys[DL_MAX_ARITY];
-    for (int64_t c = 0; c < ncols && c < DL_MAX_ARITY; c++) {
+    for (int64_t c = 0; c < ncols; c++) {
         char buf[16];
         snprintf(buf, sizeof(buf), "c%d", (int)c);
         keys[c] = ray_scan(g, buf);
     }
 
-    ray_op_t* dist = ray_distinct(g, keys, (uint8_t)ncols);
+    ray_op_t* dist = ray_distinct(g, keys, (uint32_t)ncols);
     dist = ray_optimize(g, dist);
     ray_t* deduped = ray_execute(g, dist);
     ray_graph_free(g);
@@ -2426,6 +2437,13 @@ static ray_t* table_antijoin(ray_t* left, ray_t* right) {
 
     int64_t ncols = ray_table_ncols(left);
     if (ncols <= 0) { ray_retain(left); return left; }
+    /* lkeys/rkeys are fixed at DL_MAX_ARITY; the primary gate is
+     * dl_add_edb's admission rejection, but we defend in
+     * depth: if a table somehow exceeds that bound, reject here rather than
+     * silently anti-joining on a truncated key prefix. */
+    if (ncols > DL_MAX_ARITY)
+        return ray_error("domain", "table_antijoin: table has %lld cols, exceeds DL_MAX_ARITY=%d",
+                          (long long)ncols, DL_MAX_ARITY);
 
     ray_t* cl = canonicalize(left);
     if (!cl || RAY_IS_ERR(cl))
@@ -2451,14 +2469,14 @@ static ray_t* table_antijoin(ray_t* left, ray_t* right) {
 
     ray_op_t* lkeys[DL_MAX_ARITY];
     ray_op_t* rkeys[DL_MAX_ARITY];
-    for (int64_t c = 0; c < ncols && c < DL_MAX_ARITY; c++) {
+    for (int64_t c = 0; c < ncols; c++) {
         char buf[16];
         snprintf(buf, sizeof(buf), "c%d", (int)c);
         lkeys[c] = ray_scan_table(g, l_tid, buf);
         rkeys[c] = ray_scan_table(g, r_tid, buf);
     }
 
-    ray_op_t* aj = ray_antijoin(g, l, lkeys, r, rkeys, (uint8_t)ncols);
+    ray_op_t* aj = ray_antijoin(g, l, lkeys, r, rkeys, (uint32_t)ncols);
     ray_t* raw = ray_execute(g, aj);
     ray_graph_free(g);
     ray_release(cl);
@@ -2760,6 +2778,10 @@ int dl_eval(dl_program_t* prog) {
 
     /* Process each stratum */
     for (int s = 0; s < prog->n_strata; s++) {
+        /* Cancellation checkpoint (per stratum — no per-stratum temporaries
+         * live yet, so a bare return leaks nothing). */
+        if (RAY_UNLIKELY(ray_interrupted())) { prog->eval_err = true; return -1; }
+
         /* Collect rules in this stratum */
         dl_rule_t* stratum_rules[DL_MAX_RULES];
         int stratum_rule_idx[DL_MAX_RULES];  /* original index in prog->rules */
@@ -2854,6 +2876,21 @@ int dl_eval(dl_program_t* prog) {
         int max_iter = 1000;
         bool converged = false;
         for (int iter = 0; iter < max_iter; iter++) {
+            /* Cancellation checkpoint (per fixpoint iteration).  prev_tables /
+             * delta_tables are live here, so mirror the stratum cleanup below
+             * before returning to avoid a leak. */
+            if (RAY_UNLIKELY(ray_interrupted())) {
+                for (int p = 0; p < prog->strata_sizes[s]; p++) {
+                    int rel_idx = prog->strata[s][p];
+                    if (prev_tables[rel_idx] && !RAY_IS_ERR(prev_tables[rel_idx]))
+                        ray_release(prev_tables[rel_idx]);
+                    if (delta_tables[rel_idx] && !RAY_IS_ERR(delta_tables[rel_idx]))
+                        ray_release(delta_tables[rel_idx]);
+                }
+                prog->eval_err = true;
+                return -1;
+            }
+
             /* Check convergence: all deltas empty */
             bool any_new = false;
             for (int p = 0; p < prog->strata_sizes[s]; p++) {
@@ -4324,6 +4361,8 @@ ray_t* ray_query_fn(ray_t** args, int64_t n) {
         }
         dl_program_free(prog);
         ray_release(db);
+        if (ray_interrupted())
+            return ray_error("cancel", "interrupted");
         if (prev[0]) {
             return ray_error("domain", "query: evaluation failed: %s", prev);
         }
@@ -4431,7 +4470,9 @@ ray_t* ray_dl_eval_fn(ray_t* x) {
     dl_program_t* prog = dl_unwrap_program(x);
     if (!prog) return ray_error("type", "dl-eval: arg must be a dl-program");
     int rc = dl_eval(prog);
-    return (rc == 0) ? ray_bool(true) : ray_error("domain", "dl-eval: evaluation failed");
+    if (rc == 0) return ray_bool(true);
+    if (ray_interrupted()) return ray_error("cancel", "interrupted");
+    return ray_error("domain", "dl-eval: evaluation failed");
 }
 
 /* (dl-query prog "pred") — get result table */

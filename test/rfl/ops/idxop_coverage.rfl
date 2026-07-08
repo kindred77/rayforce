@@ -254,9 +254,11 @@
 ;; ERROR PATHS (prepare_attach / drop_fn) -- idxop.c:353-374
 ;; ════════════════════════════════════════════════════════════════════════════
 
-;; ── non-numeric vec: sym vector hits numeric_elem_size==0 -> "nyi" ──
+;; ── non-numeric vec: sym vector hits numeric_elem_size==0 -> "nyi" for
+;;    zone/sort/bloom; hash now accepts SYM (RAY_IDX_HASH over domain ids). ──
 (.idx.zone ['AAPL 'GOOG 'MSFT]) !- nyi
-(.idx.hash ['a 'b 'c]) !- nyi
+(.idx.hash ['a 'b 'c])              ;; SYM hash now supported — succeeds
+(.idx.has? (.idx.hash ['a 'b 'c])) -- true
 (.idx.sort ['x 'y]) !- nyi
 (.idx.bloom ['p 'q]) !- nyi
 

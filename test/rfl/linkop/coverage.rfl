@@ -197,13 +197,13 @@ linked_i32.age                  -- [42 18 25 42]
 (.col.link? linked_sd)          -- true
 linked_sd.name                  -- (list 'carol 'alice 'bob 'alice)
 
-;; sym_dict propagation: null in link -> null SYM in result
+;; sym_dict propagation: empty row in link -> empty SYM ' in result (no null)
 (set rids_sdn [2 0 1 0])
 (alter 'rids_sdn set 1 0Nl)
 (set linked_sdn (.col.link 'dim_sd rids_sdn))
 (set res_sdn linked_sdn.name)
 (.col.link? linked_sdn)         -- true
-(nil? (at res_sdn 1))           -- true
+(nil? (at res_sdn 1))           -- false
 (at res_sdn 0)                  -- 'carol
 (at res_sdn 2)                  -- 'bob
 

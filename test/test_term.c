@@ -45,7 +45,7 @@
  * Skipped (genuinely interactive / TTY-dependent and not worth a fragile
  * harness):
  *   - ray_term_create / _destroy (calls tcgetattr/tcsetattr on stdin)
- *   - ray_term_getc, ray_term_read, ray_term_feed, ray_term_begin
+ *   - ray_term_getc, ray_term_feed, ray_term_begin
  *   - ray_term_prompt, ray_term_redraw, search-mode redraw
  *   - signal handlers, atexit handler, eval_begin/end (termios mutation)
  *

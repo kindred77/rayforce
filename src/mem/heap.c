@@ -337,6 +337,41 @@ RAY_TLS ray_heap_t*     ray_tl_heap  = NULL;
 static _Atomic(uint64_t) g_heap_id_bitmap[RAY_HEAP_ID_WORDS] = { [0] = 1ULL };
 static _Atomic(uint64_t) g_heap_id_cursor = 0;
 
+/* Direct large-allocation counters (process-wide, exact).  Direct blocks are
+ * standalone mmaps not owned by any per-thread heap, so their bytes live here
+ * rather than in a per-thread stats slot; ray_mem_stats surfaces them. */
+static _Atomic(int64_t) g_direct_bytes = 0;
+static _Atomic(int64_t) g_direct_count = 0;
+
+/* Anonymous (RAM-resident) pool + direct bytes we have committed.  File-backed
+ * spill mappings are NOT counted (they can be evicted to disk, never OOM-kill).
+ * When a new anon mapping would push this past the watermark, it is routed to a
+ * spill file instead — this never rejects work, it just picks disk over RAM. */
+static _Atomic(int64_t) g_anon_committed = 0;
+static _Atomic(int64_t) g_anon_watermark = 0;   /* 0 = default to physical RAM */
+
+/* Threshold above which anon allocations spill to disk.  Default keeps our
+ * anon footprint within physical RAM (swap + page cache stay as headroom). */
+static int64_t heap_anon_watermark(void) {
+    int64_t wm = atomic_load_explicit(&g_anon_watermark, memory_order_relaxed);
+    return wm > 0 ? wm : ray_sys_total_ram();
+}
+/* True if committing `bytes` more anonymous RAM would cross the watermark. */
+static bool heap_anon_would_exceed(size_t bytes) {
+    int64_t wm = heap_anon_watermark();
+    if (wm <= 0) return false;   /* unknown RAM → keep the fast anon path */
+    int64_t cur = atomic_load_explicit(&g_anon_committed, memory_order_relaxed);
+    return cur + (int64_t)bytes > wm;
+}
+
+int64_t ray_heap_anon_committed(void) {
+    return atomic_load_explicit(&g_anon_committed, memory_order_relaxed);
+}
+void ray_heap_set_anon_watermark(int64_t bytes) {
+    atomic_store_explicit(&g_anon_watermark, bytes < 0 ? 0 : bytes,
+                          memory_order_relaxed);
+}
+
 ray_heap_t* ray_heap_registry[RAY_HEAP_REGISTRY_SIZE];
 
 /* Serializes the registry slot writes (register/unregister) and the
@@ -440,6 +475,12 @@ RAY_INLINE void heap_insert_block(ray_heap_t* h, ray_t* blk, uint8_t order) {
     head->fl_next = blk;
     ray_atomic_store(&blk->rc, 0);  /* free marker */
     blk->order = order;
+    /* Free-block AGE (page-release aging, see GC pass 5).  `attrs` is dead
+     * state while a block is free — splits already leave garbage here and
+     * every allocation rewrites the header — so it carries the number of
+     * GC passes this block has survived on a freelist.  Reset on every
+     * insert (fresh free, coalesce, split). */
+    blk->attrs = 0;
     h->avail |= (1ULL << order);
 }
 
@@ -524,9 +565,16 @@ static bool heap_add_pool(ray_heap_t* h, uint8_t order) {
     if (pool_order > RAY_HEAP_MAX_ORDER) return false;
     size_t pool_size = BSIZEOF(pool_order);
 
-    void* mem = ray_vm_alloc_aligned(pool_size, pool_size);
+    void* mem = NULL;
     int   swap_fd  = -1;
     char* swap_path = NULL;
+
+    /* Proactively back this pool with a disk spill file if an anon mapping
+     * would push our RAM footprint past the watermark — a file-backed pool
+     * can't be OOM-killed.  Otherwise take the fast anon path (and still fall
+     * back to a spill file below if the kernel refuses the mapping). */
+    if (!heap_anon_would_exceed(pool_size))
+        mem = ray_vm_alloc_aligned(pool_size, pool_size);
 
     if (!mem) {
         /* Anonymous mmap refused — usually means RAM+swap can't satisfy
@@ -605,6 +653,11 @@ static bool heap_add_pool(ray_heap_t* h, uint8_t order) {
             return false;
         }
 
+        /* Count the swap-backed pool as committed working set — it is a RAM
+         * substitute with preallocated blocks, not an evictable file cache.
+         * The PROT_NONE reserve + slack trims above are transient and stay
+         * uncounted.  Freed via ray_vm_free (which subtracts) at pool teardown. */
+        ray_sys_track_add((int64_t)pool_size);
         mem = (void*)aligned;
     }
 
@@ -649,6 +702,10 @@ static bool heap_add_pool(ray_heap_t* h, uint8_t order) {
     h->pools[h->pool_count].swap_fd    = swap_fd;
     h->pools[h->pool_count].swap_path  = swap_path;  /* NULL when not backed */
     h->pool_count++;
+
+    if (swap_fd < 0)   /* anonymous pool: counts toward the RAM watermark */
+        atomic_fetch_add_explicit(&g_anon_committed, (int64_t)pool_size,
+                                  memory_order_relaxed);
 
     return true;
 }
@@ -829,7 +886,11 @@ static void ray_release_owned_refs(ray_t* v) {
      * so we must NOT also try to release those off the parent — they
      * aren't there anymore.  Skip the STR_pool branch. */
     if (v->attrs & RAY_ATTR_HAS_INDEX) {
-        if (v->index && !RAY_IS_ERR(v->index))
+        /* A mmap-resident index (mmod==1) is a PASSENGER in this column's file
+         * mapping — the column's single munmap frees it.  Releasing it here
+         * would ray_free it and munmap a sub-region of the mapping.  Only a
+         * heap-built index (mmod==0) is released by pointer. */
+        if (v->index && !RAY_IS_ERR(v->index) && v->index->mmod != 1)
             ray_release(v->index);
         return;
     }
@@ -941,7 +1002,9 @@ bool ray_retain_owned_refs(ray_t* v) {
     }
 
     if (v->attrs & RAY_ATTR_HAS_INDEX) {
-        if (v->index && !RAY_IS_ERR(v->index))
+        /* Mirror ray_release_owned_refs: a mmap-resident passenger index
+         * (mmod==1) is owned by the column's mapping, not refcounted here. */
+        if (v->index && !RAY_IS_ERR(v->index) && v->index->mmod != 1)
             ray_retain(v->index);
         return true;
     }
@@ -1034,7 +1097,10 @@ static void ray_detach_owned_refs(ray_t* v) {
     if (v->type == RAY_INDEX) {
         ray_index_t* ix = ray_index_payload(v);
         switch ((ray_idx_kind_t)ix->kind) {
-        case RAY_IDX_HASH:  ix->u.hash.table = ix->u.hash.chain = NULL; break;
+        case RAY_IDX_HASH:
+            ix->u.hash.table = ix->u.hash.gkeys = NULL;
+            ix->u.hash.offs  = ix->u.hash.rows  = NULL;
+            break;
         case RAY_IDX_SORT:  ix->u.sort.perm = NULL; break;
         case RAY_IDX_BLOOM: ix->u.bloom.bits = NULL; break;
         default: break;
@@ -1096,6 +1162,94 @@ static void ray_detach_owned_refs(ray_t* v) {
  * ray_alloc
  * -------------------------------------------------------------------------- */
 
+/* File-backed direct mapping: a disk-spilled standalone allocation, used when
+ * an allocation cannot be RAM-resident (larger than physical RAM) or when the
+ * anonymous mmap was refused.  Mirrors heap_add_pool's swap fallback but at the
+ * exact size — a direct block needs no pool alignment (it is located by its
+ * stored map_size, not by pool-base masking), so a plain mmap suffices.
+ * Returns the mapped base and the fd/path to close+unlink at free; NULL on
+ * failure. */
+static void* heap_direct_map_file(ray_heap_t* h, size_t map_size,
+                                  int* out_fd, char** out_path) {
+    static _Atomic uint64_t direct_swap_counter = 0;
+    uint64_t cnt = atomic_fetch_add_explicit(&direct_swap_counter, 1,
+                                             memory_order_relaxed);
+    size_t plen = strlen(h->swap_path);
+    size_t need = plen + 64;  /* room for "raydirect_<pid>_<heap>_<cnt>.dat" */
+    char*  path = (char*)ray_sys_alloc(need);
+    if (!path) return NULL;
+    snprintf(path, need, "%sraydirect_%d_%u_%llu.dat", h->swap_path,
+             (int)getpid(), (unsigned)h->id, (unsigned long long)cnt);
+
+    int fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) { ray_sys_free(path); return NULL; }
+
+    /* Reserve real disk blocks up front so later stores can't SIGBUS on a
+     * disk-full condition.  ENOSPC here surfaces as a clean NULL -> "oom". */
+    if (heap_preallocate(fd, 0, (off_t)map_size) != 0) {
+        close(fd); unlink(path); ray_sys_free(path); return NULL;
+    }
+    void* mapped = mmap(NULL, map_size, PROT_READ | PROT_WRITE,
+                        MAP_SHARED, fd, 0);
+    if (mapped == MAP_FAILED) {
+        close(fd); unlink(path); ray_sys_free(path); return NULL;
+    }
+    /* Count as committed working set — a RAM substitute with preallocated
+     * blocks (matches heap_add_pool's swap-pool accounting). */
+    ray_sys_track_add((int64_t)map_size);
+    *out_fd   = fd;
+    *out_path = path;
+    return mapped;
+}
+
+/* Direct large allocation: mmap the exact page-rounded size instead of a
+ * power-of-2 oversized buddy pool.  Returns a marked ray_t or NULL on failure. */
+static ray_t* heap_alloc_direct(ray_heap_t* h, size_t data_size) {
+    if (data_size > SIZE_MAX - RAY_DIRECT_HDR - 32 - 4095) return NULL;
+    size_t map_size = (RAY_DIRECT_HDR + 32 + data_size + 4095) & ~(size_t)4095;
+
+    void* base      = NULL;
+    int   swap_fd   = -1;
+    char* swap_path = NULL;
+
+    /* If keeping this in anonymous RAM would push our footprint past the
+     * watermark (default: physical RAM), back it with a disk file from the
+     * start so it spills instead of being OOM-killed as its pages fault in.
+     * (Under lenient overcommit an anon mmap the kernel can't actually back
+     * SUCCEEDS, then kills us at fault time — so a fallback-on-failure alone
+     * would not catch it.)  Otherwise use anonymous RAM, and fall back to a
+     * spill file only if the kernel refuses the mapping. */
+    bool force_file = heap_anon_would_exceed(map_size);
+    if (!force_file)
+        base = ray_vm_alloc(map_size);   /* anon RW, page-aligned, counted */
+    if (!base) {
+        base = heap_direct_map_file(h, map_size, &swap_fd, &swap_path);
+        if (!base) return NULL;
+    }
+    if (swap_fd < 0)   /* anonymous: counts toward the RAM watermark */
+        atomic_fetch_add_explicit(&g_anon_committed, (int64_t)map_size,
+                                  memory_order_relaxed);
+
+    ray_direct_hdr_t* hdr = (ray_direct_hdr_t*)base;
+    hdr->map_size  = map_size;
+    hdr->swap_fd   = swap_fd;
+    hdr->swap_path = swap_path;
+
+    ray_t* v = (ray_t*)((char*)base + RAY_DIRECT_HDR);
+    memset(v, 0, 32);
+    v->mmod  = 0;
+    v->order = RAY_ORDER_DIRECT;
+    if (RAY_UNLIKELY(ray_rc_sync))
+        ray_atomic_store(&v->rc, 1);
+    else
+        v->rc = 1;
+
+    atomic_fetch_add_explicit(&g_direct_bytes, (int64_t)map_size, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_direct_count, 1, memory_order_relaxed);
+    RAY_STAT(h->stats.alloc_count++);
+    return v;
+}
+
 ray_t* ray_alloc(size_t data_size) {
     ray_heap_t* h = ray_tl_heap;
     if (RAY_UNLIKELY(!h)) {
@@ -1106,6 +1260,14 @@ ray_t* ray_alloc(size_t data_size) {
 
     uint8_t order = ray_order_for_size(data_size);
     if (order > RAY_HEAP_MAX_ORDER) return NULL;
+
+    /* Anything that would need a dedicated oversized pool goes direct — exact
+     * size, no power-of-2 rounding, no order+1 pool.  On mmap failure fall
+     * through to the buddy pool (its swap fallback handles RAM exhaustion). */
+    if (RAY_UNLIKELY(order >= RAY_HEAP_POOL_ORDER)) {
+        ray_t* v = heap_alloc_direct(h, data_size);
+        if (v) return v;
+    }
 
     /* Slab fast path */
     if (RAY_LIKELY(IS_SLAB_ORDER(order))) {
@@ -1223,6 +1385,20 @@ void ray_free(ray_t* v) {
                     pool_len = (size_t)v->str_pool->len;
                 data_size += 32 + pool_len;
             }
+            /* Inline index region: a mmap-resident (passenger) index extends the
+             * mapping past the payload by its 32-aligned inline region.  Derive
+             * that size from the index itself (ray_index_inline_size) rather than
+             * stashing it in aux — str_pool occupies _idx_pad on STR columns, and
+             * the payload size above already accounts for descriptors + pool.
+             * Heap-resident indexes (RAY_MARK_MMAP clear) keep the payload-only
+             * formula. */
+            if ((v->attrs & RAY_ATTR_HAS_INDEX) && v->index && !RAY_IS_ERR(v->index)) {
+                ray_index_t* ix = ray_index_payload(v->index);
+                if (ix->markers & RAY_MARK_MMAP) {
+                    int64_t region_off = ((int64_t)data_size + 31) & ~(int64_t)31;
+                    data_size = (size_t)(region_off + ray_index_inline_size(ix));
+                }
+            }
             size_t mapped_size = (data_size + 4095) & ~(size_t)4095;
             ray_vm_unmap_file(v, mapped_size);
         } else {
@@ -1234,6 +1410,33 @@ void ray_free(ray_t* v) {
 
     /* Legacy mmod==2 guard */
     if (v->mmod == 2) return;
+
+    /* Direct large allocation: standalone mmap, freed by munmap.  Checked
+     * BEFORE any pool masking (a direct block is not a pool member).  Any
+     * thread may free it; the counter is a global atomic. */
+    if (RAY_UNLIKELY(v->order > RAY_HEAP_MAX_ORDER)) {
+        char*             base = (char*)v - RAY_DIRECT_HDR;
+        ray_direct_hdr_t* hdr  = (ray_direct_hdr_t*)base;
+        size_t map_size  = hdr->map_size;
+        int    swap_fd   = hdr->swap_fd;
+        char*  swap_path = hdr->swap_path;
+        if (h) RAY_STAT(h->stats.free_count++);
+        atomic_fetch_sub_explicit(&g_direct_bytes, (int64_t)map_size, memory_order_relaxed);
+        atomic_fetch_sub_explicit(&g_direct_count, 1, memory_order_relaxed);
+        if (swap_fd >= 0) {
+            /* File-backed spill: mapped directly (not via ray_vm_alloc), so
+             * unmap + uncount by hand, then close and unlink the spill file. */
+            munmap(base, map_size);
+            ray_sys_track_sub((int64_t)map_size);
+            close(swap_fd);
+            if (swap_path) { unlink(swap_path); ray_sys_free(swap_path); }
+        } else {
+            atomic_fetch_sub_explicit(&g_anon_committed, (int64_t)map_size,
+                                      memory_order_relaxed);
+            ray_vm_free(base, map_size);   /* munmap + committed-RAM counter -= */
+        }
+        return;
+    }
 
     if (!h) return;
 
@@ -1293,6 +1496,45 @@ void ray_free(ray_t* v) {
     v->fl_next = h->foreign;
     h->foreign = v;
     RAY_STAT(h->stats.free_count++);
+}
+
+/* --------------------------------------------------------------------------
+ * Raw buffer allocator: malloc/calloc/realloc/free for plain byte buffers that
+ * are NOT ray_t values, backed by the buddy heap (no libc malloc).  The block
+ * is a real ray_t header + data; we stamp type=RAY_U8 (no owned children) so
+ * ray_free reclaims it without walking elements, and hand back ray_data().  The
+ * header sits 32 bytes before the returned pointer; ray_free_raw recovers it.
+ * -------------------------------------------------------------------------- */
+
+void* ray_alloc_raw(size_t n) {
+    ray_t* v = ray_alloc(n);
+    if (!v || RAY_IS_ERR(v)) return NULL;
+    v->type = RAY_U8;          /* plain byte vec: ray_free reclaims, no child walk */
+    v->len  = (int64_t)n;
+    return ray_data(v);
+}
+
+void* ray_calloc_raw(size_t n) {
+    void* p = ray_alloc_raw(n);
+    if (p && n) memset(p, 0, n);
+    return p;
+}
+
+void ray_free_raw(void* p) {
+    if (!p) return;
+    ray_free((ray_t*)((char*)p - 32));   /* 32 = ray_t header before the data */
+}
+
+void* ray_realloc_raw(void* p, size_t n) {
+    if (!p) return ray_alloc_raw(n);
+    ray_t* v = (ray_t*)((char*)p - 32);
+    size_t cur = ray_block_data_bytes(v);   /* data capacity (buddy or direct) */
+    if (n <= cur) { v->len = (int64_t)n; return p; }
+    void* np = ray_alloc_raw(n);
+    if (!np) return NULL;
+    memcpy(np, p, cur);                     /* copy the whole old block (>= valid bytes) */
+    ray_free_raw(p);
+    return np;
 }
 
 /* --------------------------------------------------------------------------
@@ -1392,7 +1634,7 @@ ray_t* ray_scratch_realloc(ray_t* v, size_t new_data_size) {
         }
         /* Clamp old_data to actual allocation size */
         if (v->mmod == 0 && v->order >= RAY_ORDER_MIN) {
-            size_t alloc_data = BSIZEOF(v->order) - 32;
+            size_t alloc_data = ray_block_data_bytes(v);  /* buddy or direct */
             if (old_data > alloc_data) old_data = alloc_data;
         }
         size_t copy_data = old_data < new_data_size ? old_data : new_data_size;
@@ -1428,15 +1670,21 @@ void ray_mem_stats(ray_mem_stats_t* out) {
     ray_sys_get_stat(&sc, &sp);
     out->sys_current = (size_t)sc;
     out->sys_peak    = (size_t)sp;
+    int64_t mc = 0, mp = 0;
+    ray_sys_get_mapped(&mc, &mp);
+    out->sys_mapped      = (size_t)mc;
+    out->sys_mapped_peak = (size_t)mp;
+    /* Direct large allocations are process-wide (not per-thread) — overlay the
+     * global counters so bytes_allocated + direct_bytes is the true live
+     * object footprint (buddy blocks + exact direct mmaps). */
+    out->direct_bytes = (size_t)atomic_load_explicit(&g_direct_bytes, memory_order_relaxed);
+    out->direct_count = (size_t)atomic_load_explicit(&g_direct_count, memory_order_relaxed);
 }
 
 /* --------------------------------------------------------------------------
  * Heap lifecycle
  * -------------------------------------------------------------------------- */
 
-uint16_t ray_heap_current_id(void) {
-    return ray_tl_heap ? ray_tl_heap->id : (uint16_t)0xFFFF;
-}
 
 void ray_heap_init(void) {
     if (ray_tl_heap) return;
@@ -1495,13 +1743,17 @@ void ray_heap_init(void) {
         }
     }
 
-    /* Resolve swap directory for file-backed pool fallback.  RAY_HEAP_SWAP
-     * env var overrides the default ("./"); we always ensure a trailing
-     * slash so heap_add_pool can concatenate `<swap_path><filename>`
-     * unconditionally.  An empty / over-long env value is rejected and the
-     * default kicks in. */
+    /* Resolve swap directory for the file-backed pool fallback.  Order:
+     * RAY_HEAP_SWAP override → TMPDIR → /tmp.  /tmp is the default rather
+     * than the working directory, which may be read-only or shared (the old
+     * "./" default littered CWD with large sparse files or failed outright);
+     * swap files carry the pid so they never collide.  A trailing slash is
+     * always ensured so heap_add_pool can concatenate `<swap_path><filename>`
+     * unconditionally.  An empty / over-long value is rejected in favour of
+     * the next option. */
     const char* env = getenv("RAY_HEAP_SWAP");
-    const char* sp = (env && *env && strlen(env) < sizeof(h->swap_path) - 16) ? env : "./";
+    if (!(env && *env)) env = getenv("TMPDIR");
+    const char* sp = (env && *env && strlen(env) < sizeof(h->swap_path) - 16) ? env : "/tmp";
     size_t sp_len = strlen(sp);
     memcpy(h->swap_path, sp, sp_len);
     h->swap_path[sp_len] = '\0';
@@ -1519,11 +1771,6 @@ void ray_heap_init(void) {
  * heap takes over.  Lives in src/lang/eval.c. */
 extern void ray_clear_error_trace(void);
 
-/* Drop sym-domain cache entries whose atoms live on a heap being torn
- * down (src/table/domain.c).  Extern-declared to keep heap.c free of the
- * table-layer header, mirroring ray_clear_error_trace above. */
-extern void ray_sym_domain_drop_heap(uint16_t heap_id);
-
 void ray_heap_destroy(void) {
     ray_heap_t* h = ray_tl_heap;
     if (!h) return;
@@ -1534,11 +1781,11 @@ void ray_heap_destroy(void) {
      * pools, dereferencing g_error_trace becomes UB. */
     ray_clear_error_trace();
 
-    /* Same ordering rationale: the process-global sym-domain cache holds
-     * FILE domains whose string atoms are ray_str objects on THIS heap.
-     * Drop them now, while the atoms are still mapped, so the cache never
-     * hands out a domain backed by freed memory after this heap dies. */
-    ray_sym_domain_drop_heap(h->id);
+    /* FILE sym-domain string atoms used to live on the per-thread buddy
+     * heap, requiring a drop here so the process-global cache never handed
+     * out a domain backed by this heap's freed memory.  They now live in a
+     * per-domain malloc arena (RAY_ATTR_ARENA, thread-independent), so the
+     * cache safely outlives any heap teardown — no drop needed. */
 
     uint16_t saved_id = h->id;
 
@@ -1602,6 +1849,9 @@ void ray_heap_destroy(void) {
                 unlink(h->pools[i].swap_path);
                 ray_sys_free(h->pools[i].swap_path);
             }
+        } else {
+            atomic_fetch_sub_explicit(&g_anon_committed,
+                (int64_t)BSIZEOF(h->pools[i].pool_order), memory_order_relaxed);
         }
     }
 
@@ -1878,6 +2128,9 @@ void ray_heap_gc(void) {
                         unlink(gh->pools[p].swap_path);
                         ray_sys_free(gh->pools[p].swap_path);
                     }
+                } else {
+                    atomic_fetch_sub_explicit(&g_anon_committed,
+                        (int64_t)BSIZEOF(po), memory_order_relaxed);
                 }
                 gh->pools[p] = gh->pools[--gh->pool_count];
                 /* Don't increment p — check swapped entry */
@@ -1894,22 +2147,63 @@ void ray_heap_gc(void) {
          * free block.  Tiny-query workloads — where the per-statement
          * GC fires before any large allocation has been freed —
          * complete pass 5 without entering the body. */
+        /* Aging: pages are released only after a block SURVIVES several
+         * pass-5 VISITS on a freelist.  This routine runs per statement
+         * and per parallel_end, so the per-query temporaries of a
+         * repeated query used to be MADV_DONTNEEDed between every two
+         * executions and refaulted from scratch — kernel page-fault
+         * frames dominated repeated-query profiles while the freed block
+         * was reused within milliseconds.  A block re-allocated before
+         * reaching RAY_FREE_AGE_RELEASE keeps its pages; genuinely idle
+         * memory still returns to the OS after a few maintenance points.
+         * The released marker also stops re-madvising the same idle
+         * block on every subsequent pass.
+         *
+         * INCREMENTAL CURSOR — bounded work at every maintenance point
+         * (the design contract: heap maintenance must never turn into an
+         * unpredictable pause).  The walk resumes at the (heap, order)
+         * slot where the previous pass stopped and is capped by BOTH a
+         * block-visit budget and a release budget: each madvise batch
+         * costs cross-core TLB-shootdown IPIs, so releases are the
+         * expensive unit, not visits.  The cursor advances BEFORE a slot
+         * is processed, so a list interrupted mid-walk simply waits one
+         * full cycle instead of being double-aged; the cursor never
+         * stores a block pointer — blocks may be reallocated, split or
+         * coalesced between passes, only (heap, order) is stable. */
+        #define RAY_FREE_AGE_RELEASE   3
+        #define RAY_P5_VISIT_BUDGET    2048
+        #define RAY_P5_RELEASE_BUDGET  64
+        static int s_p5_hid = 0;
+        static int s_p5_ord = 13;
         uint64_t large_orders_mask = ~((1ULL << 13) - 1);
-        for (int hid = 0; hid < RAY_HEAP_REGISTRY_SIZE; hid++) {
+        int64_t p5_visited = 0, p5_released = 0;
+        int p5_slots = RAY_HEAP_REGISTRY_SIZE * (RAY_HEAP_FL_SIZE - 13);
+        for (int step = 0; step < p5_slots; step++) {
+            if (p5_visited >= RAY_P5_VISIT_BUDGET ||
+                p5_released >= RAY_P5_RELEASE_BUDGET) break;
+            int hid = s_p5_hid;
+            int ord = s_p5_ord;
+            if (++s_p5_ord >= RAY_HEAP_FL_SIZE) {
+                s_p5_ord = 13;
+                s_p5_hid = (s_p5_hid + 1) % RAY_HEAP_REGISTRY_SIZE;
+            }
             ray_heap_t* gh = ray_heap_registry[hid];
             if (!gh) continue;
-            uint64_t avail = gh->avail & large_orders_mask;
-            if (!avail) continue;
-            for (int i = 13; i < RAY_HEAP_FL_SIZE; i++) {
-                if (!(avail & (1ULL << i))) continue;
-                ray_fl_head_t* head = &gh->freelist[i];
-                ray_t* blk = head->fl_next;
-                while (blk != (ray_t*)head) {
-                    size_t bsize = BSIZEOF(i);
+            if (!((gh->avail & large_orders_mask) & (1ULL << ord))) continue;
+            ray_fl_head_t* head = &gh->freelist[ord];
+            for (ray_t* blk = head->fl_next; blk != (ray_t*)head;
+                 blk = blk->fl_next) {
+                if (p5_visited++ >= RAY_P5_VISIT_BUDGET) break;
+                if (blk->attrs < RAY_FREE_AGE_RELEASE) {
+                    blk->attrs++;
+                } else if (blk->attrs == RAY_FREE_AGE_RELEASE) {
+                    size_t bsize = BSIZEOF(ord);
                     int rpidx = heap_find_pool(gh, blk);
-                    bool hp = (rpidx >= 0) ? (gh->pools[rpidx].hugepage != 0) : false;
+                    bool hp = (rpidx >= 0) ? (gh->pools[rpidx].hugepage != 0)
+                                           : false;
                     ray_vm_release_block(blk, bsize, hp);
-                    blk = blk->fl_next;
+                    blk->attrs = RAY_FREE_AGE_RELEASE + 1;  /* released */
+                    if (++p5_released >= RAY_P5_RELEASE_BUDGET) break;
                 }
             }
         }
@@ -1918,16 +2212,21 @@ void ray_heap_gc(void) {
 }
 
 void ray_heap_release_pages(void) {
+    /* Explicit release: callers asking for pages back get them NOW —
+     * no aging — but still skip blocks already released. */
     ray_heap_t* h = ray_tl_heap;
     if (!h) return;
     for (int i = 13; i < RAY_HEAP_FL_SIZE; i++) {
         ray_fl_head_t* head = &h->freelist[i];
         ray_t* blk = head->fl_next;
         while (blk != (ray_t*)head) {
-            size_t bsize = BSIZEOF(i);
-            int rpidx = heap_find_pool(h, blk);
-            bool hp = (rpidx >= 0) ? (h->pools[rpidx].hugepage != 0) : false;
-            ray_vm_release_block(blk, bsize, hp);
+            if (blk->attrs <= RAY_FREE_AGE_RELEASE) {
+                size_t bsize = BSIZEOF(i);
+                int rpidx = heap_find_pool(h, blk);
+                bool hp = (rpidx >= 0) ? (h->pools[rpidx].hugepage != 0) : false;
+                ray_vm_release_block(blk, bsize, hp);
+                blk->attrs = RAY_FREE_AGE_RELEASE + 1;
+            }
             blk = blk->fl_next;
         }
     }

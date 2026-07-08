@@ -158,12 +158,16 @@ typedef union ray_t {
              * pointer (see src/table/domain.h) — every non-slice SYM vec
              * carries a non-NULL domain; runtime-created vecs point at
              * the immortal singleton wrapping the global intern table.
-             * Layout audit (2026-06-10): bytes 8-15 are free for SYM —
+             * Layout audit (updated 2026-07): bytes 8-15 hold the domain;
+             * bytes 0-7 are free for a SYM vec to carry an index —
              *   - str_pool uses 8-15 but only for RAY_STR;
-             *   - HAS_INDEX's index/_idx_pad (0-7/8-15) can never be set
-             *     on a SYM vec: prepare_attach (ops/idxop.c) rejects all
-             *     non-numeric types, and SYM/STR/GUID indexing is
-             *     explicitly deferred (ops/idxop.h);
+             *   - HAS_INDEX CAN be set on a SYM vec (as of the SYM hash
+             *     index): the index pointer occupies bytes 0-7 while
+             *     sym_domain stays at bytes 8-15.  attach_finalize
+             *     (ops/idxop.c) preserves _idx_pad (8-15) for RAY_SYM,
+             *     exactly as it does for RAY_STR's str_pool.  That guard is
+             *     the MANDATORY backstop — do NOT restore the _idx_pad
+             *     clearing for SYM or it nulls the domain pointer;
              *   - HAS_LINK's link_target (8-15) is RAY_I32/RAY_I64 only;
              *   - slices use both 0-7 and 8-15, but slice headers do not
              *     store a domain — ray_sym_vec_domain follows
@@ -173,8 +177,9 @@ typedef union ray_t {
             struct { uint8_t _aux_sym_lo[8];     struct ray_sym_domain_s* sym_domain; };
             /* RAY_ATTR_HAS_INDEX (vectors): ray_t* of type RAY_INDEX
              * carrying the accelerator payload and the saved aux
-             * bytes.  _idx_pad is reserved (must be NULL).  See
-             * ops/idxop.h. */
+             * bytes.  _idx_pad (8-15) is NULL for numeric columns, but
+             * holds str_pool for RAY_STR and sym_domain for RAY_SYM
+             * (attach_finalize preserves it there).  See ops/idxop.h. */
             struct { union ray_t* index;         union ray_t* _idx_pad; };
             /* RAY_ATTR_HAS_LINK (vectors, RAY_I32/RAY_I64 only): bytes
              * 8-15 hold an int64 sym ID naming the target table.
@@ -216,7 +221,11 @@ extern ray_t __ray_null;
  * value-null is always RAY_NULL_OBJ. Assert that invariant in debug/ASan builds;
  * compile to nothing in release. Placed BEFORE any null test that may deref,
  * because RAY_ATOM_IS_NULL/ray_atom_is_null_fn deref x->type on non-singleton input. */
-#ifdef DEBUG
+/* Kept live in the hardened cloud tier too (not just DEBUG): the check is a
+ * single pointer compare, and a stray C NULL in a value position is exactly
+ * the class of corruption that must fail fast — routed through the crash
+ * handler's SIGABRT backtrace — rather than segfault deep in a kernel. */
+#if defined(DEBUG) || defined(RAY_HARDENED)
 #define RAY_ASSERT_VALUE(x) assert((x) != NULL && "value-null must be RAY_NULL_OBJ, not C NULL")
 #else
 #define RAY_ASSERT_VALUE(x) ((void)0)
@@ -326,10 +335,20 @@ ray_t*    ray_alloc(size_t data_size);
  * when the owning heap flushes foreign blocks. */
 void     ray_free(ray_t* v);
 
-/* ===== Memory Budget API ===== */
+/* ===== Raw buffer allocator (buddy-backed, no libc malloc) =====
+ * malloc/calloc/realloc/free replacements for plain byte/scalar buffers that
+ * are NOT ray_t values — backed by the tuned slab/buddy heap (fast for the many
+ * small per-partition allocations the agg engine makes), thread-safe, with
+ * cross-thread free.  ray_alloc_raw returns uninitialised memory; ray_calloc_raw
+ * zeroes it.  Free with ray_free_raw, grow with ray_realloc_raw. */
+void*    ray_alloc_raw(size_t n);
+void*    ray_calloc_raw(size_t n);
+void*    ray_realloc_raw(void* p, size_t n);
+void     ray_free_raw(void* p);
 
-int64_t  ray_mem_budget(void);      /* returns memory budget in bytes */
-bool     ray_mem_pressure(void);    /* true if calling thread's usage exceeds budget */
+/* ===== System memory ===== */
+
+int64_t  ray_sys_total_ram(void);   /* total physical RAM in bytes (informational) */
 
 /* ===== Interrupt API =====
  * Long-running queries poll ray_interrupted() at morsel granularity
@@ -356,8 +375,8 @@ typedef struct {
     uint64_t    rows_done;
     uint64_t    rows_total;   /* 0 = indeterminate */
     double      elapsed_sec;
-    int64_t     mem_used;     /* bytes: buddy + direct mmap */
-    int64_t     mem_budget;   /* bytes: auto-detected memory budget */
+    int64_t     mem_used;     /* bytes: live object footprint (buddy + direct mmap) */
+    int64_t     mem_total;    /* bytes: total physical RAM (the disk-spill threshold) */
     bool        final;        /* true on the last tick of a query — renderers
                                  use this to clear the line */
 } ray_progress_t;
@@ -387,6 +406,19 @@ void ray_progress_label(const char* op_name, const char* phase);
  * "100%" tick if the query ran long enough to have shown the bar. */
 void ray_progress_end(void);
 
+/* True iff a progress callback is registered. The executor gates arming the
+ * qstats PROGRESS bit on this, so all progress plumbing stays zero-cost when
+ * nothing is listening. */
+bool ray_progress_active(void);
+
+/* Pool-dispatch pump (main-thread only). ray_progress_dispatch_begin records a
+ * parallel dispatch's element total and baselines the shared qstats row
+ * counter; ray_progress_pump samples it and fires the throttled callback. The
+ * pool calls these from its claim-loop / spin-wait so every morsel-parallel op
+ * reports progress with no per-kernel changes. Both are no-ops with no callback. */
+void ray_progress_dispatch_begin(uint64_t phase_rows_total);
+void ray_progress_pump(void);
+
 /* ===== COW / Ref Counting API ===== */
 
 void     ray_retain(ray_t* v);
@@ -406,6 +438,10 @@ ray_t* ray_sym(int64_t id);
 ray_t* ray_date(int64_t val);
 ray_t* ray_time(int64_t val);
 ray_t* ray_timestamp(int64_t val);
+/* Current UTC wall-clock time as a RAY_TIMESTAMP value (ns since 2000-01-01).
+ * Shared "now as a timestamp" primitive — the single owner of the epoch
+ * conversion; callers must not re-derive it. */
+int64_t ray_timestamp_now_ns(void);
 ray_t* ray_guid(const uint8_t* bytes);
 ray_t* ray_typed_null(int8_t type);
 
@@ -442,15 +478,15 @@ static inline bool ray_atom_is_null_fn(const union ray_t* x) {
         case RAY_DATE:
         case RAY_TIME:      return x->i32 == NULL_I32;
         case RAY_I16:       return x->i16 == NULL_I16;
-        case RAY_SYM:       return x->i64 == 0;
+        case RAY_SYM:
+            /* SYM has no null — sym 0 is the empty symbol ' (a value), mirroring
+             * STR's empty "" below.  A SYM atom is never null. */
+            return false;
         case RAY_STR:
-            /* STR atom null = empty string.  Atoms use SSO (slen + sdata)
-             * for len<=7 and a pool pointer (obj) for longer strings; the
-             * union overlap means a non-zero obj pointer has a low byte
-             * that ALSO reads as slen via the SSO arm.  Only when slen==0
-             * AND obj==NULL is the atom genuinely the empty string (see
-             * is_sso in src/vec/str.c). */
-            return x->slen == 0 && x->obj == NULL;
+            /* STR has no null distinct from "" (char lists have no null, only
+             * symbols do).  A STR atom is never null — the empty
+             * string is a value. */
+            return false;
         case RAY_GUID: {
             /* GUID null = 16 all-zero bytes in obj's U8 buffer.
              * obj is always populated by ray_guid / ray_typed_null —
@@ -497,6 +533,7 @@ bool     ray_vec_is_null(ray_t* vec, int64_t idx);
 /* ===== String Vector API ===== */
 
 ray_t* ray_str_vec_append(ray_t* vec, const char* s, size_t len);
+ray_t* ray_str_vec_from_parts(const char* const* ptrs, const uint32_t* lens, const uint8_t* nulls, int64_t n);
 const char* ray_str_vec_get(ray_t* vec, int64_t idx, size_t* out_len);
 ray_t* ray_str_vec_set(ray_t* vec, int64_t idx, const char* s, size_t len);
 ray_t* ray_str_vec_insert_at(ray_t* vec, int64_t idx, const char* s, size_t len);
@@ -665,6 +702,78 @@ void      ray_ipc_close(int64_t handle);
 ray_t*    ray_ipc_send(int64_t handle, ray_t* msg);
 ray_err_t ray_ipc_send_async(int64_t handle, ray_t* msg);
 ray_t*    ray_ipc_send_verbose(int64_t handle, ray_t* msg);
+
+/* ===== Append-Only Log (AOF) API =====
+ *
+ * Embeddable durable event log for host applications: opaque payloads,
+ * monotonic contiguous LSNs, explicit commit barriers, segment rotation,
+ * crash recovery.  Independent of the ray_runtime_t lifecycle — usable
+ * before ray_runtime_create and after ray_runtime_destroy.
+ *
+ * Durability model: ray_aof_append() buffers and returns the reserved
+ * LSN; ray_aof_commit() writes a commit frame into the stream and
+ * fsyncs — every append issued before it is durable and becomes
+ * observable once it returns RAY_OK.  Scans deliver only records that
+ * precede the last commit frame, so uncommitted appends are invisible
+ * BY CONSTRUCTION (not as an accident of buffering), no matter how
+ * large the append or what reached the page cache.  A crash discards
+ * only the un-committed suffix: on the next open, bytes after the last
+ * commit frame are truncated and the LSN sequence continues from the
+ * last committed record — LSNs of truncated records are reused, but
+ * only ever for records no scan could have observed.  A CRC failure
+ * BEFORE the last commit frame is damage to acknowledged data and
+ * fails ray_aof_open with RAY_ERR_CORRUPT rather than truncating.
+ * (The torn-tail tolerance is deliberate and differs from the
+ * transaction journal, where a torn tail is fatal: AOF payloads are
+ * opaque data the writer was never acknowledged for, not replayable
+ * commands.)
+ *
+ * Threading: one writer handle per directory, no internal locking.
+ * Concurrent ray_aof_scan() calls are safe, including against a live
+ * writer — a scan observes the committed prefix and stops cleanly at
+ * the first incomplete tail record.
+ *
+ * Errors: RAY_ERR_DOMAIN on bad arguments, RAY_ERR_IO on filesystem
+ * failure, RAY_ERR_LIMIT on payload >= 2^32-1 bytes, RAY_ERR_CORRUPT
+ * from open or scan when acknowledged (committed) data fails its CRC.
+ */
+
+typedef struct ray_aof_s ray_aof_t;
+
+#define RAY_AOF_DEFAULT_SEGMENT_LIMIT ((int64_t)256 * 1024 * 1024)
+
+/* Open (creating the directory if needed) and recover the log at `dir`.
+ * `segment_limit` <= 0 selects RAY_AOF_DEFAULT_SEGMENT_LIMIT.  On
+ * failure returns NULL and sets *out_err (out_err may be NULL). */
+ray_aof_t* ray_aof_open(const char* dir, int64_t segment_limit,
+                        ray_err_t* out_err);
+
+/* Buffered append of `len` bytes; returns the reserved LSN (>= 0), or
+ * -1 with *out_err set.  Durable only after ray_aof_commit(). */
+int64_t    ray_aof_append(ray_aof_t* log, const void* payload,
+                          int64_t len, ray_err_t* out_err);
+
+/* Durability barrier: flush + fsync the active segment. */
+ray_err_t  ray_aof_commit(ray_aof_t* log);
+
+/* The LSN the next append will receive. */
+int64_t    ray_aof_next_lsn(const ray_aof_t* log);
+
+/* Scan callback: return true to continue, false to stop the scan. */
+typedef bool (*ray_aof_scan_cb_t)(int64_t lsn, const void* payload,
+                                  int64_t len, void* ctx);
+
+/* Scan committed records with lsn >= from_lsn in LSN order, invoking
+ * `cb` per record.  Needs no ray_aof_t handle — reads directly from
+ * `dir`, concurrently with a live writer.  Returns the number of
+ * records delivered, or -1 with *out_err set. */
+int64_t    ray_aof_scan(const char* dir, int64_t from_lsn,
+                        ray_aof_scan_cb_t cb, void* ctx,
+                        ray_err_t* out_err);
+
+/* Flush, fsync and close; frees the handle.  Returns the commit error
+ * if the final flush fails (the handle is freed either way). */
+ray_err_t  ray_aof_close(ray_aof_t* log);
 
 #ifdef __cplusplus
 }
