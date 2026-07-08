@@ -91,6 +91,7 @@ static inline ray_t* make_bool(uint8_t v) {
 /* Helpers to extract numeric value as double */
 static inline int is_numeric(ray_t* x) {
     return x->type == -RAY_I64 || x->type == -RAY_F64 ||
+           x->type == -RAY_F32 ||
            x->type == -RAY_I16 || x->type == -RAY_I32 ||
            x->type == -RAY_U8  || x->type == -RAY_BOOL;
 }
@@ -120,6 +121,7 @@ static inline int64_t as_i64(ray_t* x) {
 
 static inline double as_f64(ray_t* x) {
     if (x->type == -RAY_F64) return x->f64;
+    if (x->type == -RAY_F32) return (double)((float)x->f64);
     if (x->type == -RAY_I64) return (double)x->i64;
     if (x->type == -RAY_I32) return (double)x->i32;
     if (x->type == -RAY_I16) return (double)x->i16;
@@ -132,7 +134,8 @@ static inline double as_f64(ray_t* x) {
 }
 
 static inline int is_float_op(ray_t* a, ray_t* b) {
-    return a->type == -RAY_F64 || b->type == -RAY_F64;
+    return a->type == -RAY_F64 || b->type == -RAY_F64 ||
+           a->type == -RAY_F32 || b->type == -RAY_F32;
 }
 
 /* ══════════════════════════════════════════
@@ -288,6 +291,7 @@ static inline ray_t* collection_elem(ray_t* coll, int64_t i, int *allocated) {
     void* d = ray_data(coll);
     switch (coll->type) {
         case RAY_I64:       return ray_i64(((int64_t*)d)[i]);
+        case RAY_F32:       return ray_f32(((float*)d)[i]);
         case RAY_F64:       return ray_f64(((double*)d)[i]);
         case RAY_I32:       return ray_i32(((int32_t*)d)[i]);
         case RAY_I16:       return ray_i16(((int16_t*)d)[i]);
@@ -323,6 +327,7 @@ static inline int64_t elem_as_i64(ray_t* elem) {
     if (elem->type == -RAY_I16)  return (int64_t)elem->i16;
     if (elem->type == -RAY_U8)   return (int64_t)elem->u8;
     if (elem->type == -RAY_F64)  return (int64_t)elem->f64;
+    if (elem->type == -RAY_F32)  return (int64_t)((float)elem->f64);
     return elem->i64;
 }
 
@@ -334,6 +339,8 @@ static inline int store_typed_elem(ray_t* vec, int64_t i, ray_t* elem) {
         switch (vec->type) {
             case RAY_F64:
                 ((double*)ray_data(vec))[i] = NULL_F64; break;
+            case RAY_F32:
+                ((float*)ray_data(vec))[i] = NULL_F32; break;
             case RAY_I64: case RAY_TIMESTAMP:
                 ((int64_t*)ray_data(vec))[i] = NULL_I64; break;
             case RAY_I32: case RAY_DATE: case RAY_TIME:
@@ -352,6 +359,7 @@ static inline int store_typed_elem(ray_t* vec, int64_t i, ray_t* elem) {
     switch (vec->type) {
         case RAY_I64:       ((int64_t*)ray_data(vec))[i]  = elem_as_i64(elem); return 0;
         case RAY_F64:       ((double*)ray_data(vec))[i]    = (elem->type == -RAY_F64) ? elem->f64 : (double)elem_as_i64(elem); return 0;
+        case RAY_F32:       ((float*)ray_data(vec))[i]     = (elem->type == -RAY_F32) ? (float)elem->f64 : (float)((elem->type == -RAY_F64) ? elem->f64 : (double)elem_as_i64(elem)); return 0;
         case RAY_I32:       ((int32_t*)ray_data(vec))[i]   = (int32_t)elem_as_i64(elem); return 0;
         case RAY_I16:       ((int16_t*)ray_data(vec))[i]   = (int16_t)elem_as_i64(elem); return 0;
         case RAY_BOOL:      ((bool*)ray_data(vec))[i]      = elem->b8;  return 0;
@@ -445,6 +453,18 @@ ray_t* ray_wavg_fn(ray_t* x, ray_t* y);
  * elements.  Returns NaN if n <= 0.  Used by aggr_med_per_group_buf in
  * query.c for the fast per-group median path. */
 double ray_median_dbl_inplace(double* a, int64_t n);
+double ray_quantile_dbl_inplace(double* a, int64_t n, double q);
+ray_t* ray_mode_per_group_buf(ray_t* src,
+                              const int64_t* idx_buf,
+                              const int64_t* offsets,
+                              const int64_t* grp_cnt,
+                              int64_t n_groups);
+ray_t* ray_quantile_per_group_buf(ray_t* src,
+                                  const int64_t* idx_buf,
+                                  const int64_t* offsets,
+                                  const int64_t* grp_cnt,
+                                  int64_t n_groups,
+                                  double q);
 
 /* Collection helpers (formerly static in eval.c, now in collection.c) */
 int    atom_eq(ray_t* a, ray_t* b);
@@ -671,6 +691,7 @@ ray_t* ray_upsert_fn(ray_t** args, int64_t n);
 ray_t* ray_xbar_fn(ray_t* col, ray_t* bucket);
 ray_t* ray_left_join_fn(ray_t** args, int64_t n);
 ray_t* ray_inner_join_fn(ray_t** args, int64_t n);
+ray_t* ray_full_join_fn(ray_t** args, int64_t n);
 ray_t* ray_anti_join_fn(ray_t** args, int64_t n);
 ray_t* ray_window_join_fn(ray_t** args, int64_t n);
 ray_t* ray_window_join1_fn(ray_t** args, int64_t n);

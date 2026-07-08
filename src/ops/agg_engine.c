@@ -247,6 +247,8 @@ static const char* agg_name_suffix(uint16_t agg_op, size_t* slen_out) {
         case OP_VAR:        sfx = "_var";        slen = 4; break;
         case OP_VAR_POP:    sfx = "_var_pop";    slen = 8; break;
         case OP_MEDIAN:     sfx = "_median";     slen = 7; break;
+        case OP_QUANTILE:   sfx = "_quantile";   slen = 9; break;
+        case OP_MODE:       sfx = "_mode";       slen = 5; break;
         case OP_COV:        sfx = "_cov";        slen = 4; break;
         case OP_SCOV:       sfx = "_scov";       slen = 5; break;
         case OP_WSUM:       sfx = "_wsum";       slen = 5; break;

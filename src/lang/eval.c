@@ -3013,6 +3013,8 @@ static void ray_register_builtins(void) {
     register_binary("scov", RAY_FN_AGGR, ray_scov_fn);
     register_binary("wsum", RAY_FN_AGGR, ray_wsum_fn);
     register_binary("wavg", RAY_FN_AGGR, ray_wavg_fn);
+    register_binary("quantile",   RAY_FN_AGGR, ray_quantile_fn);
+    register_binary("percentile", RAY_FN_AGGR, ray_percentile_fn);
 
     /* Special forms */
     register_binary("set", RAY_FN_SPECIAL_FORM | RAY_FN_RESTRICTED, ray_set_fn);
@@ -3036,6 +3038,7 @@ static void ray_register_builtins(void) {
     register_unary("last",  RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_last_fn);
     /* med/dev/stddev/var materialise inline (no ray_lazy_append shell) — not LAZY_AWARE */
     register_unary("med",   RAY_FN_AGGR, ray_med_fn);
+    register_unary("mode",  RAY_FN_AGGR, ray_mode_fn);
     register_unary("dev",        RAY_FN_AGGR, ray_dev_fn);
     register_unary("stddev",     RAY_FN_AGGR, ray_stddev_fn);
     register_unary("stddev_pop", RAY_FN_AGGR, ray_stddev_pop_fn);
@@ -3129,6 +3132,7 @@ static void ray_register_builtins(void) {
     /* Join operations */
     register_vary("left-join",   RAY_FN_NONE, ray_left_join_fn);
     register_vary("inner-join",  RAY_FN_NONE, ray_inner_join_fn);
+    register_vary("full-join",   RAY_FN_NONE, ray_full_join_fn);
     register_vary("anti-join",   RAY_FN_NONE, ray_anti_join_fn);
     register_vary("window-join", RAY_FN_SPECIAL_FORM, ray_window_join_fn);
     register_vary("window-join1", RAY_FN_SPECIAL_FORM, ray_window_join1_fn);

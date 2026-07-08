@@ -42,6 +42,33 @@ bool ray_join_no_dup_fallback = false;
 /* Diagnostic: radix joins that fell back due to pathological key duplication. */
 uint64_t ray_join_dup_fallbacks = 0;
 
+static int join_store_key_cell(ray_t* dst, int64_t dst_row,
+                               ray_t* src, int64_t src_row) {
+    if (!dst || !src || dst_row < 0 || src_row < 0) return -1;
+
+    if ((src->attrs & RAY_ATTR_HAS_NULLS) && ray_vec_is_null(src, src_row)) {
+        ray_vec_set_null(dst, dst_row, true);
+        return 0;
+    }
+
+    if (dst->type == RAY_STR && src->type == RAY_STR) {
+        size_t len = 0;
+        const char* s = ray_str_vec_get(src, src_row, &len);
+        ray_t* r = ray_str_vec_set(dst, dst_row, s ? s : "", s ? len : 0);
+        return (r && !RAY_IS_ERR(r)) ? 0 : -1;
+    }
+
+    int allocated = 0;
+    ray_t* elem = collection_elem(src, src_row, &allocated);
+    if (!elem || RAY_IS_ERR(elem)) {
+        if (allocated && elem) ray_release(elem);
+        return -1;
+    }
+    int rc = store_typed_elem(dst, dst_row, elem);
+    if (allocated) ray_release(elem);
+    return rc;
+}
+
 /* ── Hash helper (shared by radix and chained HT join paths) ──────────── */
 
 static uint64_t hash_row_keys(ray_t** key_vecs, uint32_t n_keys, int64_t row) {
@@ -916,6 +943,7 @@ ray_t* exec_join(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ray_t* right_t
     int64_t* l_idx = NULL;
     int64_t* r_idx = NULL;
     int64_t pair_count = 0;
+    int64_t full_right_only_start = -1;
     _Atomic(uint8_t)* matched_right = NULL;
 
     /* ── Radix-partitioned path (large joins) ──────────────────────── */
@@ -1132,6 +1160,7 @@ ray_t* exec_join(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ray_t* right_t
 
             /* FULL OUTER: append unmatched right rows */
             if (unmatched_right > 0) {
+                full_right_only_start = pair_count;
                 for (int64_t r = 0; r < right_rows; r++) {
                     if (!matched_right[r]) {
                         l_idx[off] = -1;
@@ -1355,6 +1384,7 @@ chained_ht_fallback:;
             }
             scratch_free(l_idx_hdr);
             scratch_free(r_idx_hdr);
+            full_right_only_start = pair_count;
             int64_t off = pair_count;
             for (int64_t r = 0; r < right_rows; r++) {
                 if (!matched_right[r]) {
@@ -1511,6 +1541,33 @@ join_gather:;
             if (l_out_cols[si]->type == RAY_SYM)
                 ray_sym_vec_adopt_domain(l_out_cols[si], col);
             si++;
+        }
+    }
+    if (join_type == 2 && full_right_only_start >= 0) {
+        for (int64_t si = 0; si < l_out_count; si++) {
+            int64_t name_id = l_out_names[si];
+            ray_t* r_key_col = NULL;
+            for (uint32_t k = 0; k < n_keys; k++) {
+                ray_op_ext_t* lk = find_ext(g, ext->join.left_keys[k]);
+                if (!lk || lk->base.opcode != OP_SCAN || lk->sym != name_id)
+                    continue;
+                r_key_col = r_key_vecs[k];
+                break;
+            }
+            if (!r_key_col) continue;
+            for (int64_t row = full_right_only_start; row < pair_count; row++) {
+                if (join_store_key_cell(l_out_cols[si], row, r_key_col,
+                                        r_idx[row]) != 0) {
+                    ray_t* err = ray_error("domain", "full-join: key value cannot be represented in output column");
+                    for (int64_t j = 0; j < l_out_count; j++)
+                        if (l_out_cols[j]) ray_release(l_out_cols[j]);
+                    for (int64_t j = 0; j < r_out_count; j++)
+                        if (r_out_cols[j]) ray_release(r_out_cols[j]);
+                    ray_release(result);
+                    result = err;
+                    goto join_cleanup;
+                }
+            }
         }
     }
     for (int64_t i = 0; i < r_out_count; i++) {

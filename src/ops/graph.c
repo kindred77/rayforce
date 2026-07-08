@@ -771,7 +771,7 @@ ray_op_t* ray_sort_op(ray_graph_t* g, ray_op_t* table_node,
 /* Shared impl for ray_group / ray_group2 / ray_group3.  agg_ins2 NULL →
  * no binary aggs; otherwise must be the same length as agg_ins (NULL
  * slots for unary aggs, non-NULL for OP_PEARSON_CORR slots).  agg_k NULL
- * → no scalar params; otherwise length n_aggs (0 in slots without). */
+ * → no scalar params; otherwise length n_aggs. */
 static ray_op_t* ray_group_impl(ray_graph_t* g, ray_op_t** keys, uint32_t n_keys,
                                 uint16_t* agg_ops, ray_op_t** agg_ins,
                                 ray_op_t** agg_ins2, const int64_t* agg_k,
@@ -787,7 +787,7 @@ static ray_op_t* ray_group_impl(ray_graph_t* g, ray_op_t** keys, uint32_t n_keys
     uint32_t* agg_ids  = ids_buf + n_keys;
     uint32_t* agg_ids2 = ids_buf + n_keys + n_aggs;  /* parallel to agg_ids; 0 when no second input */
     bool has_ins2 = false;
-    bool has_k = false;
+    bool has_k = agg_k != NULL;
     for (uint32_t i = 0; i < n_keys; i++) key_ids[i] = keys[i]->id;
     for (uint32_t i = 0; i < n_aggs; i++) {
         agg_ids[i]  = agg_ins[i]->id;
@@ -796,7 +796,6 @@ static ray_op_t* ray_group_impl(ray_graph_t* g, ray_op_t** keys, uint32_t n_keys
             agg_ids2[i] = agg_ins2[i]->id;
             has_ins2 = true;
         }
-        if (agg_k && agg_k[i] != 0) has_k = true;
     }
 
     size_t keys_sz = (size_t)n_keys * sizeof(ray_op_t*);

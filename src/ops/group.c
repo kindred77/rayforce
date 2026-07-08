@@ -33,6 +33,8 @@
 #include "ops/idxop.h"      /* RAY_IDX_DICT: group on persisted string codes */
 #include "core/runtime.h"   /* __VM — per-thread group-key cardinality hint */
 
+#include <stdlib.h>
+
 /* Monotonic count of exec_group_per_partition entries (the streaming parted
  * GROUP kernel).  Bumped ONCE at the kernel entry — O(1) per query, never
  * per-row, so it does not violate the "instrumentation never costs O(data)"
@@ -1621,6 +1623,8 @@ typedef struct {
     const void*    base;        /* ray_data(src) */
     int8_t         src_type;
     bool           has_nulls;
+    bool           use_quantile;
+    double         q;
     const int64_t* idx_buf;
     const int64_t* offsets;
     const int64_t* grp_cnt;
@@ -1629,11 +1633,40 @@ typedef struct {
     ray_t*         out;          /* for set_null */
 } med_par_ctx_t;
 
+typedef struct {
+    uint64_t key;
+    int64_t  count;
+    int64_t  first_row;
+    int64_t  first_pos;
+    uint8_t  used;
+} mode_scalar_entry_t;
+
+typedef struct {
+    uint64_t hash;
+    int64_t  count;
+    int64_t  first_row;
+    int64_t  first_pos;
+    uint8_t  used;
+} mode_wide_entry_t;
+
+typedef struct {
+    ray_t*         src;
+    ray_t*         out;
+    const int64_t* idx_buf;
+    const int64_t* offsets;
+    const int64_t* grp_cnt;
+    _Atomic(int)   oom;
+    _Atomic(int)   cancel;
+} mode_par_ctx_t;
+
 static inline double med_read_as_f64(const void* base, int8_t t, int64_t row) {
     switch (t) {
         case RAY_F64: { double v; memcpy(&v, (const char*)base + (size_t)row * 8, 8); return v; }
         case RAY_I64: { int64_t v; memcpy(&v, (const char*)base + (size_t)row * 8, 8); return (double)v; }
         case RAY_I32: { int32_t v; memcpy(&v, (const char*)base + (size_t)row * 4, 4); return (double)v; }
+        case RAY_DATE:
+        case RAY_TIME: { int32_t v; memcpy(&v, (const char*)base + (size_t)row * 4, 4); return (double)v; }
+        case RAY_TIMESTAMP: { int64_t v; memcpy(&v, (const char*)base + (size_t)row * 8, 8); return (double)v; }
         case RAY_I16: { int16_t v; memcpy(&v, (const char*)base + (size_t)row * 2, 2); return (double)v; }
         case RAY_U8:  return (double)((const uint8_t*)base)[row];
         default:      return 0.0;
@@ -1648,6 +1681,9 @@ static inline bool med_is_null(const void* base, int8_t t, int64_t row) {
         case RAY_F64: { double v; memcpy(&v, (const char*)base + (size_t)row * 8, 8); return v != v; }
         case RAY_I64: return ((const int64_t*)base)[row] == NULL_I64;
         case RAY_I32: return ((const int32_t*)base)[row] == NULL_I32;
+        case RAY_DATE:
+        case RAY_TIME: return ((const int32_t*)base)[row] == NULL_I32;
+        case RAY_TIMESTAMP: return ((const int64_t*)base)[row] == NULL_I64;
         case RAY_I16: return ((const int16_t*)base)[row] == NULL_I16;
         case RAY_U8:  return false;  /* non-nullable */
         default:      return false;
@@ -1679,20 +1715,33 @@ static void med_per_group_fn(void* ctx_v, uint32_t worker_id,
             c->out_data[g] = NULL_F64;
             ray_vec_set_null(c->out, g, true);
         } else {
-            c->out_data[g] = ray_median_dbl_inplace(slice, actual);
+            c->out_data[g] = c->use_quantile
+                ? ray_quantile_dbl_inplace(slice, actual, c->q)
+                : ray_median_dbl_inplace(slice, actual);
         }
     }
 }
 
-ray_t* ray_median_per_group_buf(ray_t* src,
-                                const int64_t* idx_buf,
-                                const int64_t* offsets,
-                                const int64_t* grp_cnt,
-                                int64_t n_groups) {
+static double decode_agg_f64_param(int64_t bits) {
+    double v = 0.0;
+    memcpy(&v, &bits, sizeof(v));
+    return v;
+}
+
+static ray_t* rank_per_group_buf(ray_t* src,
+                                 const int64_t* idx_buf,
+                                 const int64_t* offsets,
+                                 const int64_t* grp_cnt,
+                                 int64_t n_groups,
+                                 double q,
+                                 bool use_quantile) {
     if (!src || RAY_IS_ERR(src) || n_groups < 0) return NULL;
     int8_t t = src->type;
     if (t != RAY_F64 && t != RAY_I64 && t != RAY_I32 &&
-        t != RAY_I16 && t != RAY_U8) return NULL;
+        t != RAY_I16 && t != RAY_U8 && t != RAY_DATE &&
+        t != RAY_TIME && t != RAY_TIMESTAMP) return NULL;
+    if (use_quantile && (!__builtin_isfinite(q) || q < 0.0 || q > 1.0))
+        return ray_error("domain", "quantile: probability out of range");
 
     int64_t total = 0;
     for (int64_t g = 0; g < n_groups; g++) total += grp_cnt[g];
@@ -1713,6 +1762,8 @@ ray_t* ray_median_per_group_buf(ray_t* src,
         .base = ray_data(src),
         .src_type = t,
         .has_nulls = (src->attrs & RAY_ATTR_HAS_NULLS) != 0,
+        .use_quantile = use_quantile,
+        .q = q,
         .idx_buf = idx_buf,
         .offsets = offsets,
         .grp_cnt = grp_cnt,
@@ -1738,6 +1789,414 @@ ray_t* ray_median_per_group_buf(ray_t* src,
     }
 
     if (buf_hdr) scratch_free(buf_hdr);
+    return out;
+}
+
+ray_t* ray_median_per_group_buf(ray_t* src,
+                                const int64_t* idx_buf,
+                                const int64_t* offsets,
+                                const int64_t* grp_cnt,
+                                int64_t n_groups) {
+    return rank_per_group_buf(src, idx_buf, offsets, grp_cnt, n_groups, 0.0, false);
+}
+
+ray_t* ray_quantile_per_group_buf(ray_t* src,
+                                  const int64_t* idx_buf,
+                                  const int64_t* offsets,
+                                  const int64_t* grp_cnt,
+                                  int64_t n_groups,
+                                  double q) {
+    return rank_per_group_buf(src, idx_buf, offsets, grp_cnt, n_groups, q, true);
+}
+
+static uint64_t mode_hash_cap(int64_t n) {
+    uint64_t cap = 16;
+    uint64_t need = n > 0 ? (uint64_t)n * 2u : 16u;
+    if (need < 16) need = 16;
+    while (cap < need && cap <= (UINT64_MAX >> 1)) cap <<= 1;
+    return cap >= need ? cap : 0;
+}
+
+static inline uint64_t mode_scalar_key(ray_t* src, int64_t row) {
+    const void* base = ray_data(src);
+    switch (src->type) {
+        case RAY_F64: {
+            double v;
+            memcpy(&v, (const char*)base + (size_t)row * 8, 8);
+            if (v == 0.0) v = 0.0;
+            uint64_t k;
+            memcpy(&k, &v, 8);
+            return k;
+        }
+        case RAY_F32: {
+            float v;
+            memcpy(&v, (const char*)base + (size_t)row * 4, 4);
+            if (v == 0.0f) v = 0.0f;
+            uint32_t k32;
+            memcpy(&k32, &v, 4);
+            return (uint64_t)k32;
+        }
+        case RAY_SYM:
+            return (uint64_t)ray_read_sym(base, row, src->type, src->attrs);
+        case RAY_I64:
+        case RAY_TIMESTAMP: {
+            int64_t v;
+            memcpy(&v, (const char*)base + (size_t)row * 8, 8);
+            return (uint64_t)v;
+        }
+        case RAY_I32:
+        case RAY_DATE:
+        case RAY_TIME: {
+            int32_t v;
+            memcpy(&v, (const char*)base + (size_t)row * 4, 4);
+            return (uint64_t)(int64_t)v;
+        }
+        case RAY_I16: {
+            int16_t v;
+            memcpy(&v, (const char*)base + (size_t)row * 2, 2);
+            return (uint64_t)(int64_t)v;
+        }
+        case RAY_BOOL:
+        case RAY_U8:
+            return (uint64_t)((const uint8_t*)base)[row];
+        default:
+            return 0;
+    }
+}
+
+static inline void mode_copy_fixed_cell(ray_t* out, int64_t dst,
+                                        ray_t* src, int64_t row) {
+    uint8_t esz = col_esz(src);
+    memcpy((char*)ray_data(out) + (size_t)dst * esz,
+           (const char*)ray_data(src) + (size_t)row * esz,
+           esz);
+}
+
+static inline void mode_set_null_cell(ray_t* out, int64_t dst) {
+    switch (out->type) {
+        case RAY_F64:
+        case RAY_F32:
+        case RAY_I64:
+        case RAY_TIMESTAMP:
+        case RAY_I32:
+        case RAY_DATE:
+        case RAY_TIME:
+        case RAY_I16:
+            par_set_null(out, dst);
+            return;
+        case RAY_GUID:
+            memset((uint8_t*)ray_data(out) + (size_t)dst * 16, 0, 16);
+            __atomic_fetch_or(&out->attrs, (uint8_t)RAY_ATTR_HAS_NULLS,
+                              __ATOMIC_RELAXED);
+            return;
+        case RAY_STR:
+            memset((ray_str_t*)ray_data(out) + dst, 0, sizeof(ray_str_t));
+            return;
+        case RAY_SYM:
+            ray_write_sym(ray_data(out), dst, 0, out->type, out->attrs);
+            return;
+        case RAY_BOOL:
+        case RAY_U8:
+            ((uint8_t*)ray_data(out))[dst] = 0;
+            return;
+        default:
+            return;
+    }
+}
+
+static int64_t mode_scalar_group(ray_t* src, const int64_t* rows,
+                                 int64_t cnt, int* cancelled) {
+    uint64_t cap = mode_hash_cap(cnt);
+    if (!cap || cap > SIZE_MAX / sizeof(mode_scalar_entry_t)) return -2;
+    ray_t* hdr = NULL;
+    mode_scalar_entry_t* ht = (mode_scalar_entry_t*)scratch_calloc(
+        &hdr, (size_t)cap * sizeof(mode_scalar_entry_t));
+    if (!ht) return -2;
+    uint64_t mask = cap - 1;
+    bool has_nulls = (src->attrs & RAY_ATTR_HAS_NULLS) != 0;
+    int64_t best_count = 0, best_row = -1, best_pos = INT64_MAX;
+    for (int64_t i = 0; i < cnt; i++) {
+        if ((i & 65535) == 0 && ray_interrupted()) {
+            *cancelled = 1;
+            scratch_free(hdr);
+            return -3;
+        }
+        int64_t row = rows[i];
+        if (has_nulls && ray_vec_is_null(src, row)) continue;
+        uint64_t key = mode_scalar_key(src, row);
+        uint64_t slot = ray_hash_i64((int64_t)key) & mask;
+        for (;;) {
+            mode_scalar_entry_t* e = &ht[slot];
+            if (!e->used) {
+                e->used = 1;
+                e->key = key;
+                e->count = 1;
+                e->first_row = row;
+                e->first_pos = i;
+                if (best_count == 0 || e->first_pos < best_pos) {
+                    best_count = 1;
+                    best_row = row;
+                    best_pos = i;
+                }
+                break;
+            }
+            if (e->key == key) {
+                e->count++;
+                if (e->count > best_count ||
+                    (e->count == best_count && e->first_pos < best_pos)) {
+                    best_count = e->count;
+                    best_row = e->first_row;
+                    best_pos = e->first_pos;
+                }
+                break;
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+    scratch_free(hdr);
+    return best_row;
+}
+
+static int64_t mode_guid_group(ray_t* src, const int64_t* rows,
+                               int64_t cnt, int* cancelled) {
+    uint64_t cap = mode_hash_cap(cnt);
+    if (!cap || cap > SIZE_MAX / sizeof(mode_wide_entry_t)) return -2;
+    ray_t* hdr = NULL;
+    mode_wide_entry_t* ht = (mode_wide_entry_t*)scratch_calloc(
+        &hdr, (size_t)cap * sizeof(mode_wide_entry_t));
+    if (!ht) return -2;
+    uint64_t mask = cap - 1;
+    const uint8_t* base = (const uint8_t*)ray_data(src);
+    bool has_nulls = (src->attrs & RAY_ATTR_HAS_NULLS) != 0;
+    int64_t best_count = 0, best_row = -1, best_pos = INT64_MAX;
+    for (int64_t i = 0; i < cnt; i++) {
+        if ((i & 65535) == 0 && ray_interrupted()) {
+            *cancelled = 1;
+            scratch_free(hdr);
+            return -3;
+        }
+        int64_t row = rows[i];
+        if (has_nulls && ray_vec_is_null(src, row)) continue;
+        const uint8_t* key = base + (size_t)row * 16;
+        uint64_t h = ray_hash_bytes(key, 16);
+        uint64_t slot = h & mask;
+        for (;;) {
+            mode_wide_entry_t* e = &ht[slot];
+            if (!e->used) {
+                e->used = 1;
+                e->hash = h;
+                e->count = 1;
+                e->first_row = row;
+                e->first_pos = i;
+                if (best_count == 0 || e->first_pos < best_pos) {
+                    best_count = 1;
+                    best_row = row;
+                    best_pos = i;
+                }
+                break;
+            }
+            if (e->hash == h &&
+                memcmp(key, base + (size_t)e->first_row * 16, 16) == 0) {
+                e->count++;
+                if (e->count > best_count ||
+                    (e->count == best_count && e->first_pos < best_pos)) {
+                    best_count = e->count;
+                    best_row = e->first_row;
+                    best_pos = e->first_pos;
+                }
+                break;
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+    scratch_free(hdr);
+    return best_row;
+}
+
+static void mode_fixed_per_group_fn(void* ctx_v, uint32_t worker_id,
+                                    int64_t start, int64_t end) {
+    (void)worker_id;
+    mode_par_ctx_t* c = (mode_par_ctx_t*)ctx_v;
+    for (int64_t g = start; g < end; g++) {
+        if (atomic_load_explicit(&c->oom, memory_order_relaxed) ||
+            atomic_load_explicit(&c->cancel, memory_order_relaxed))
+            return;
+        int64_t off = c->offsets[g];
+        int64_t cnt = c->grp_cnt[g];
+        int cancelled = 0;
+        int64_t best = (c->src->type == RAY_GUID)
+            ? mode_guid_group(c->src, &c->idx_buf[off], cnt, &cancelled)
+            : mode_scalar_group(c->src, &c->idx_buf[off], cnt, &cancelled);
+        if (cancelled || best == -3) {
+            atomic_store_explicit(&c->cancel, 1, memory_order_relaxed);
+            return;
+        }
+        if (best == -2) {
+            atomic_store_explicit(&c->oom, 1, memory_order_relaxed);
+            return;
+        }
+        if (best < 0) mode_set_null_cell(c->out, g);
+        else mode_copy_fixed_cell(c->out, g, c->src, best);
+    }
+}
+
+static ray_t* mode_str_per_group_buf(ray_t* src,
+                                     const int64_t* idx_buf,
+                                     const int64_t* offsets,
+                                     const int64_t* grp_cnt,
+                                     int64_t n_groups) {
+    ray_t* out = col_vec_new(src, n_groups);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    out->len = n_groups;
+
+    for (int64_t g = 0; g < n_groups; g++) {
+        int64_t cnt = grp_cnt[g];
+        int64_t off = offsets[g];
+        uint64_t cap = mode_hash_cap(cnt);
+        if (!cap || cap > SIZE_MAX / sizeof(mode_wide_entry_t)) {
+            ray_release(out);
+            return ray_error("oom", NULL);
+        }
+        ray_t* hdr = NULL;
+        mode_wide_entry_t* ht = (mode_wide_entry_t*)scratch_calloc(
+            &hdr, (size_t)cap * sizeof(mode_wide_entry_t));
+        if (!ht) {
+            ray_release(out);
+            return ray_error("oom", NULL);
+        }
+        uint64_t mask = cap - 1;
+        int64_t best_count = 0, best_row = -1, best_pos = INT64_MAX;
+        for (int64_t i = 0; i < cnt; i++) {
+            if ((i & 65535) == 0 && ray_interrupted()) {
+                scratch_free(hdr);
+                ray_release(out);
+                return ray_error("cancel", "interrupted");
+            }
+            int64_t row = idx_buf[off + i];
+            size_t len = 0;
+            const char* key = ray_str_vec_get(src, row, &len);
+            if (!key) { key = ""; len = 0; }
+            uint64_t h = ray_hash_bytes(key, len);
+            uint64_t slot = h & mask;
+            for (;;) {
+                mode_wide_entry_t* e = &ht[slot];
+                if (!e->used) {
+                    e->used = 1;
+                    e->hash = h;
+                    e->count = 1;
+                    e->first_row = row;
+                    e->first_pos = i;
+                    if (best_count == 0 || e->first_pos < best_pos) {
+                        best_count = 1;
+                        best_row = row;
+                        best_pos = i;
+                    }
+                    break;
+                }
+                size_t olen = 0;
+                const char* old = ray_str_vec_get(src, e->first_row, &olen);
+                if (!old) { old = ""; olen = 0; }
+                if (e->hash == h && olen == len &&
+                    (len == 0 || memcmp(old, key, len) == 0)) {
+                    e->count++;
+                    if (e->count > best_count ||
+                        (e->count == best_count && e->first_pos < best_pos)) {
+                        best_count = e->count;
+                        best_row = e->first_row;
+                        best_pos = e->first_pos;
+                    }
+                    break;
+                }
+                slot = (slot + 1) & mask;
+            }
+        }
+        scratch_free(hdr);
+        if (best_row < 0) {
+            mode_set_null_cell(out, g);
+        } else {
+            size_t len = 0;
+            const char* s = ray_str_vec_get(src, best_row, &len);
+            ray_t* nv = ray_str_vec_set(out, g, s ? s : "", s ? len : 0);
+            if (!nv || RAY_IS_ERR(nv)) {
+                ray_release(out);
+                return nv ? nv : ray_error("oom", NULL);
+            }
+            out = nv;
+        }
+    }
+    return out;
+}
+
+ray_t* ray_mode_per_group_buf(ray_t* src,
+                              const int64_t* idx_buf,
+                              const int64_t* offsets,
+                              const int64_t* grp_cnt,
+                              int64_t n_groups) {
+    if (!src || RAY_IS_ERR(src) || n_groups < 0) return NULL;
+    switch (src->type) {
+        case RAY_BOOL:
+        case RAY_U8:
+        case RAY_I16:
+        case RAY_I32:
+        case RAY_I64:
+        case RAY_F32:
+        case RAY_F64:
+        case RAY_DATE:
+        case RAY_TIME:
+        case RAY_TIMESTAMP:
+        case RAY_GUID:
+        case RAY_SYM:
+        case RAY_STR:
+            break;
+        default:
+            return NULL;
+    }
+    if (src->type == RAY_STR)
+        return mode_str_per_group_buf(src, idx_buf, offsets, grp_cnt, n_groups);
+
+    int64_t total = 0;
+    for (int64_t g = 0; g < n_groups; g++) total += grp_cnt[g];
+
+    ray_t* out = col_vec_new(src, n_groups);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    if (out->type == RAY_SYM)
+        ray_sym_vec_adopt_domain(out, sym_domain_rep(src));
+    out->len = n_groups;
+
+    mode_par_ctx_t ctx = {
+        .src = src,
+        .out = out,
+        .idx_buf = idx_buf,
+        .offsets = offsets,
+        .grp_cnt = grp_cnt,
+        .oom = 0,
+        .cancel = 0,
+    };
+
+    ray_pool_t* pool = ray_pool_get();
+    bool par = pool && n_groups >= 8 && total >= 4096;
+    if (par) {
+        if (n_groups < (1 << 16))
+            ray_pool_dispatch_n(pool, mode_fixed_per_group_fn, &ctx,
+                                (uint32_t)n_groups);
+        else
+            ray_pool_dispatch(pool, mode_fixed_per_group_fn, &ctx, n_groups);
+    } else {
+        mode_fixed_per_group_fn(&ctx, 0, 0, n_groups);
+    }
+
+    if (atomic_load_explicit(&ctx.cancel, memory_order_relaxed) ||
+        ray_interrupted()) {
+        ray_release(out);
+        return ray_error("cancel", "interrupted");
+    }
+    if (atomic_load_explicit(&ctx.oom, memory_order_relaxed)) {
+        ray_release(out);
+        return ray_error("oom", NULL);
+    }
+    if (out->type != RAY_STR && out->type != RAY_BOOL &&
+        out->type != RAY_U8 && out->type != RAY_SYM)
+        par_finalize_nulls(out);
     return out;
 }
 
@@ -2462,12 +2921,11 @@ bool ght_compute_layout(ght_layout_t* out, uint32_t n_keys, uint32_t n_aggs,
     uint16_t nv = 0;
     uint8_t agg_any = 0;
     for (uint32_t a = 0; a < n_aggs; a++) {
-        /* OP_MEDIAN / OP_TOP_N / OP_BOT_N reserve no row-layout slot —
+        /* OP_MEDIAN / OP_TOP_N / OP_BOT_N / OP_MODE reserve no row-layout slot —
          * the column is materialized in agg_vecs[a] but values are not
          * packed into entries or HT rows.  A post-radix pass over
-         * row_gid+grp_cnt gathers per-group slices and runs quickselect
-         * (median) or a bounded heap (top/bot); see
-         * ray_median_per_group_buf / ray_topk_per_group_buf. */
+         * row_gid+grp_cnt gathers per-group slices and runs the matching
+         * per-group kernel. */
         /* Wide-element (STR/GUID) min/max/first/last also reserve no
          * row-layout slot: the 8-byte accumulators can't hold a 16-byte
          * GUID or a pooled string, so they are resolved by the same
@@ -2477,6 +2935,8 @@ bool ght_compute_layout(ght_layout_t* out, uint32_t n_keys, uint32_t n_aggs,
                        (agg_ops[a] == OP_MIN  || agg_ops[a] == OP_MAX ||
                         agg_ops[a] == OP_FIRST || agg_ops[a] == OP_LAST);
         bool holistic = agg_ops && (agg_ops[a] == OP_MEDIAN ||
+                                    agg_ops[a] == OP_QUANTILE ||
+                                    agg_ops[a] == OP_MODE ||
                                     agg_ops[a] == OP_TOP_N ||
                                     agg_ops[a] == OP_BOT_N || wide_mm);
         uint8_t af = 0;
@@ -4722,6 +5182,8 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
                 case OP_VAR:        nsfx = "_var";        nslen = 4; break;
                 case OP_VAR_POP:    nsfx = "_var_pop";    nslen = 8; break;
                 case OP_MEDIAN:     nsfx = "_median";     nslen = 7; break;
+                case OP_QUANTILE:   nsfx = "_quantile";   nslen = 9; break;
+                case OP_MODE:       nsfx = "_mode";       nslen = 5; break;
                 case OP_COV:        nsfx = "_cov";        nslen = 4; break;
                 case OP_SCOV:       nsfx = "_scov";       nslen = 5; break;
                 case OP_WSUM:       nsfx = "_wsum";       nslen = 5; break;
@@ -6253,11 +6715,12 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
     }
     for (uint32_t a = 0; a < n_aggs && can_partition; a++) {
         uint16_t aop = ext->agg_ops[a];
-        /* Holistic aggs (OP_MEDIAN / OP_TOP_N / OP_BOT_N) can't be
+        /* Holistic aggs can't be
          * merged across partitions without re-scanning underlying
          * values — decline per-partition exec.  Falls through to the
          * concat path which sees the full vector. */
-        if (aop == OP_MEDIAN || aop == OP_TOP_N || aop == OP_BOT_N) {
+        if (aop == OP_MEDIAN || aop == OP_QUANTILE || aop == OP_MODE ||
+            aop == OP_TOP_N || aop == OP_BOT_N) {
             can_partition = 0; break;
         }
         if (aop != OP_SUM && aop != OP_COUNT && aop != OP_MIN &&
@@ -8543,17 +9006,19 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             ray_release(atom);
         }
 
-        /* Whole-table median has no n_keys==0 accumulator, so emit_agg_columns
+        /* Whole-table holistic aggregates have no n_keys==0 accumulator, so emit_agg_columns
          * left its column at the integer default (0).  Recompute it over the
          * whole (optionally selected) column as a single group via the same
-         * per-group kernel the by-group path uses, matching the scalar `med`
-         * builtin.  (top/bot are not handled here: the no-by planner does not
-         * carry the K argument, so they keep their scalar-builtin form.) */
+         * per-group kernel the by-group path uses.  (top/bot are not handled
+         * here: the no-by planner does not carry the K argument, so they keep
+         * their scalar-builtin form.) */
         {
-            bool any_med = false;
+            bool any_rank = false;
             for (uint32_t a = 0; a < n_aggs; a++)
-                if (ext->agg_ops[a] == OP_MEDIAN) { any_med = true; break; }
-            if (any_med) {
+                if (ext->agg_ops[a] == OP_MEDIAN ||
+                    ext->agg_ops[a] == OP_QUANTILE ||
+                    ext->agg_ops[a] == OP_MODE) { any_rank = true; break; }
+            if (any_rank) {
                 ray_t* hsel_blk = NULL; const int64_t* hsel = NULL; int64_t hscan = nrows;
                 if (g->selection) {
                     ray_rowsel_t* sm = ray_rowsel_meta(g->selection);
@@ -8573,8 +9038,20 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                     int64_t offs[1] = {0};
                     int64_t cnts[1] = {hscan};
                     for (uint32_t a = 0; a < n_aggs; a++) {
-                        if (ext->agg_ops[a] != OP_MEDIAN || !agg_vecs[a]) continue;
-                        ray_t* hv = ray_median_per_group_buf(agg_vecs[a], idxb, offs, cnts, 1);
+                        if (!agg_vecs[a]) continue;
+                        uint16_t aop = ext->agg_ops[a];
+                        ray_t* hv = NULL;
+                        if (aop == OP_MEDIAN) {
+                            hv = ray_median_per_group_buf(agg_vecs[a], idxb, offs, cnts, 1);
+                        } else if (aop == OP_QUANTILE) {
+                            double q = ext->agg_k
+                                ? decode_agg_f64_param(ext->agg_k[a]) : 0.5;
+                            hv = ray_quantile_per_group_buf(agg_vecs[a], idxb, offs, cnts, 1, q);
+                        } else if (aop == OP_MODE) {
+                            hv = ray_mode_per_group_buf(agg_vecs[a], idxb, offs, cnts, 1);
+                        } else {
+                            continue;
+                        }
                         if (hv && !RAY_IS_ERR(hv)) ray_table_set_col_idx(result, a, hv);
                         if (hv) ray_release(hv);
                     }
@@ -8615,13 +9092,15 @@ da_path:;
         /* Binary aggregators (OP_PEARSON_CORR) are not wired into the
          * dense-array accumulator's per-worker da_accum_t struct — force
          * the HT path which has the row-layout offsets allocated.
-         * Holistic aggregators (OP_MEDIAN / OP_TOP_N / OP_BOT_N) have
+         * Holistic aggregators have
          * no per-row accumulator at all — they need the post-radix
          * row_gid+grp_cnt pass which only the HT path provides. */
         for (uint32_t a = 0; a < n_aggs && da_eligible; a++) {
             uint16_t aop = ext->agg_ops[a];
             if (agg_is_binary_agg(aop)) da_eligible = false;
             if (aop == OP_MEDIAN)       da_eligible = false;
+            if (aop == OP_QUANTILE)     da_eligible = false;
+            if (aop == OP_MODE)         da_eligible = false;
             if (aop == OP_TOP_N)        da_eligible = false;
             if (aop == OP_BOT_N)        da_eligible = false;
             /* Wide-element (STR/GUID) min/max/first/last need the holistic
@@ -10450,6 +10929,7 @@ v2_emit:;
                 case OP_COV: case OP_SCOV:
                 case OP_WSUM: case OP_WAVG:
                 case OP_MEDIAN:
+                case OP_QUANTILE:
                     out_type = RAY_F64; break;
                 case OP_ALL:
                 case OP_ANY:
@@ -10633,6 +11113,16 @@ v2_emit:;
                     if (aop == OP_MEDIAN) {
                         hol_vec = ray_median_per_group_buf(
                             agg_vecs[a], idx_buf, offsets, grp_cnt, n_groups);
+                    } else if (aop == OP_QUANTILE) {
+                        double q = ext->agg_k
+                            ? decode_agg_f64_param(ext->agg_k[a]) : 0.5;
+                        hol_vec = ray_quantile_per_group_buf(
+                            agg_vecs[a], idx_buf, offsets, grp_cnt, n_groups, q);
+                        err_tag = "quantile: type";
+                    } else if (aop == OP_MODE) {
+                        hol_vec = ray_mode_per_group_buf(
+                            agg_vecs[a], idx_buf, offsets, grp_cnt, n_groups);
+                        err_tag = "mode: type";
                     } else if (aop == OP_TOP_N || aop == OP_BOT_N) {
                         int64_t k_val = (ext->agg_k && ext->agg_k[a] > 0)
                                         ? ext->agg_k[a] : 1;
@@ -10748,6 +11238,8 @@ v2_emit:;
                     case OP_VAR:        sfx = "_var";        slen = 4; break;
                     case OP_VAR_POP:    sfx = "_var_pop";    slen = 8; break;
                     case OP_MEDIAN:     sfx = "_median";     slen = 7; break;
+                    case OP_QUANTILE:   sfx = "_quantile";   slen = 9; break;
+                    case OP_MODE:       sfx = "_mode";       slen = 5; break;
                     case OP_COV:        sfx = "_cov";        slen = 4; break;
                     case OP_SCOV:       sfx = "_scov";       slen = 5; break;
                     case OP_WSUM:       sfx = "_wsum";       slen = 5; break;
@@ -11004,6 +11496,16 @@ sequential_fallback:;
                             hol_vec = ray_median_per_group_buf(
                                 agg_vecs[a], idx_buf_s, offsets_s, grp_cnt_s,
                                 (int64_t)grp_count);
+                        } else if (aop == OP_QUANTILE) {
+                            double q = ext->agg_k
+                                ? decode_agg_f64_param(ext->agg_k[a]) : 0.5;
+                            hol_vec = ray_quantile_per_group_buf(
+                                agg_vecs[a], idx_buf_s, offsets_s, grp_cnt_s,
+                                (int64_t)grp_count, q);
+                        } else if (aop == OP_MODE) {
+                            hol_vec = ray_mode_per_group_buf(
+                                agg_vecs[a], idx_buf_s, offsets_s, grp_cnt_s,
+                                (int64_t)grp_count);
                         } else if (aop == OP_TOP_N || aop == OP_BOT_N) {
                             int64_t k_val = (ext->agg_k && ext->agg_k[a] > 0)
                                             ? ext->agg_k[a] : 1;
@@ -11045,6 +11547,7 @@ sequential_fallback:;
             case OP_COV: case OP_SCOV:
             case OP_WSUM: case OP_WAVG:
             case OP_MEDIAN:
+            case OP_QUANTILE:
                 out_type = RAY_F64; break;
             case OP_ALL:
             case OP_ANY:
@@ -11253,6 +11756,8 @@ sequential_fallback:;
                 case OP_VAR:        nsfx = "_var";        nslen = 4; break;
                 case OP_VAR_POP:    nsfx = "_var_pop";    nslen = 8; break;
                 case OP_MEDIAN:     nsfx = "_median";     nslen = 7; break;
+                case OP_QUANTILE:   nsfx = "_quantile";   nslen = 9; break;
+                case OP_MODE:       nsfx = "_mode";       nslen = 5; break;
                 case OP_COV:        nsfx = "_cov";        nslen = 4; break;
                 case OP_SCOV:       nsfx = "_scov";       nslen = 5; break;
                 case OP_WSUM:       nsfx = "_wsum";       nslen = 5; break;

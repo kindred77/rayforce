@@ -476,7 +476,36 @@ static uint16_t resolve_agg_opcode(int64_t sym_id) {
      * bounded-heap kernel. */
     if (len == 3 && memcmp(name, "top",    3) == 0) return OP_TOP_N;
     if (len == 3 && memcmp(name, "bot",    3) == 0) return OP_BOT_N;
+    if (len == 4 && memcmp(name, "mode",   4) == 0) return OP_MODE;
+    if (len == 8 && memcmp(name, "quantile", 8) == 0) return OP_QUANTILE;
+    if (len == 10 && memcmp(name, "percentile", 10) == 0) return OP_QUANTILE;
     return 0;
+}
+
+static bool agg_name_is_percentile(int64_t sym_id) {
+    ray_t* s = ray_sym_str(sym_id);
+    return s && ray_str_len(s) == 10 &&
+           memcmp(ray_str_ptr(s), "percentile", 10) == 0;
+}
+
+static int64_t encode_agg_f64_param(double v) {
+    int64_t bits = 0;
+    memcpy(&bits, &v, sizeof(bits));
+    return bits;
+}
+
+static bool quantile_literal_prob(ray_t* prob_expr, bool percentile,
+                                  double* out_q) {
+    if (!prob_expr || !ray_is_atom(prob_expr) ||
+        (prob_expr->type == -RAY_SYM && !(prob_expr->attrs & ATTR_QUOTED)) ||
+        !is_numeric(prob_expr) || RAY_ATOM_IS_NULL(prob_expr))
+        return false;
+    double raw = as_f64(prob_expr);
+    double scale = percentile ? 100.0 : 1.0;
+    if (!__builtin_isfinite(raw) || raw < 0.0 || raw > scale)
+        return false;
+    if (out_q) *out_q = raw / scale;
+    return true;
 }
 
 /* Apply sort (asc/desc) and take clauses to a materialized result table.
@@ -1980,6 +2009,14 @@ static int is_whole_column_projection(ray_t* expr) {
 static int is_group_dag_agg_expr(ray_t* expr) {
     if (!is_agg_expr(expr)) return 0;
     ray_t** elems = (ray_t**)ray_data(expr);
+    uint16_t op = resolve_agg_opcode(elems[0]->i64);
+    if (op == OP_QUANTILE) {
+        if (ray_len(expr) < 3) return 0;
+        if (!quantile_literal_prob(elems[2],
+                                   agg_name_is_percentile(elems[0]->i64),
+                                   NULL))
+            return 0;
+    }
     return !expr_contains_call_named(elems[1], "distinct", 8);
 }
 
@@ -8372,7 +8409,8 @@ by_dict_done:
          * non-NULL for binary aggs (currently OP_PEARSON_CORR).  The
          * has_binary_agg flag selects ray_group2 below.  agg_k[] carries
          * a scalar literal alongside the column for holistic aggs that
-         * take K (top/bot); zero in unrelated slots.  agg_ops/agg_ins/
+         * need one (top/bot K, quantile probability bits); zero in
+         * unrelated slots.  agg_ops/agg_ins/
          * agg_ins2/agg_k are carved with the top-level collectors. */
         int64_t n_aggs = 0;
         int has_binary_agg = 0;
@@ -8433,6 +8471,17 @@ by_dict_done:
                     if (k_val > 1024) { ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("range", "top/bot K capped at 1024"); }
                     agg_k[n_aggs] = k_val;
                     has_agg_k = 1;
+                } else if (op == OP_QUANTILE) {
+                    if (ray_len(val_expr) < 3) { ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("arity", "select by: quantile requires a probability argument"); }
+                    double q_val = 0.0;
+                    if (!quantile_literal_prob(agg_elems[2],
+                                               agg_name_is_percentile(agg_elems[0]->i64),
+                                               &q_val)) {
+                        ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv);
+                        return ray_error("domain", "select by: quantile probability must be a non-null numeric literal in range");
+                    }
+                    agg_k[n_aggs] = encode_agg_f64_param(q_val);
+                    has_agg_k = 1;
                 }
                 n_aggs++;
             } else {
@@ -8478,16 +8527,59 @@ by_dict_done:
             }
             agg_ins2[n_aggs] = NULL;
             agg_k[n_aggs] = 0;
+            if (hop == OP_TOP_N || hop == OP_BOT_N) {
+                if (ray_len(hidden_agg_exprs[hi]) < 3) {
+                    for (int ci = 0; ci < n_compound; ci++)
+                        ray_release(compound_rw[ci]);
+                    ray_graph_free(g); ray_release(tbl);
+                    scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("arity", "select by: top/bot aggregation requires a K argument");
+                }
+                int64_t k_val = 0;
+                ray_t* k_expr = he[2];
+                if (k_expr->type == -RAY_I64)       k_val = k_expr->i64;
+                else if (k_expr->type == -RAY_I32)  k_val = (int64_t)(int32_t)k_expr->i64;
+                else {
+                    for (int ci = 0; ci < n_compound; ci++)
+                        ray_release(compound_rw[ci]);
+                    ray_graph_free(g); ray_release(tbl);
+                    scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("type", "top/bot K must be integer literal");
+                }
+                if (k_val < 1 || k_val > 1024) {
+                    for (int ci = 0; ci < n_compound; ci++)
+                        ray_release(compound_rw[ci]);
+                    ray_graph_free(g); ray_release(tbl);
+                    scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("range", "top/bot K must be between 1 and 1024");
+                }
+                agg_k[n_aggs] = k_val;
+                has_agg_k = 1;
+            } else if (hop == OP_QUANTILE) {
+                if (ray_len(hidden_agg_exprs[hi]) < 3) {
+                    for (int ci = 0; ci < n_compound; ci++)
+                        ray_release(compound_rw[ci]);
+                    ray_graph_free(g); ray_release(tbl);
+                    scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("arity", "select by: quantile requires a probability argument");
+                }
+                double q_val = 0.0;
+                if (!quantile_literal_prob(he[2],
+                                           agg_name_is_percentile(he[0]->i64),
+                                           &q_val)) {
+                    for (int ci = 0; ci < n_compound; ci++)
+                        ray_release(compound_rw[ci]);
+                    ray_graph_free(g); ray_release(tbl);
+                    scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain", "select by: quantile probability must be a non-null numeric literal in range");
+                }
+                agg_k[n_aggs] = encode_agg_f64_param(q_val);
+                has_agg_k = 1;
+            }
             n_aggs++;
         }
 
         if (n_aggs > 0 || n_nonaggs > 0) {
             if (n_aggs > 0) {
                 if (has_agg_k) {
-                    /* top/bot carry an integer K param per agg.  v2 admits
-                     * these and produces LIST output (differential-validated
-                     * to match the old OP_TOP_N LIST shape).  Build a plain
-                     * OP_GROUP node via ray_group3 so agg_k is preserved. */
+                    /* Some holistic aggs carry a scalar param per agg.
+                     * Build a plain OP_GROUP node via ray_group3 so agg_k
+                     * is preserved. */
                     root = ray_group3(g, key_ops, n_keys, agg_ops,
                                        agg_ins, has_binary_agg ? agg_ins2 : NULL,
                                        agg_k, n_aggs);
@@ -12759,6 +12851,7 @@ static ray_t* join_impl(ray_t** args, int64_t n, uint8_t join_type) {
 
 ray_t* ray_left_join_fn(ray_t** args, int64_t n)  { return join_impl(args, n, 1); }
 ray_t* ray_inner_join_fn(ray_t** args, int64_t n) { return join_impl(args, n, 0); }
+ray_t* ray_full_join_fn(ray_t** args, int64_t n)  { return join_impl(args, n, 2); }
 
 /* (antijoin left right [keys])
  * Anti-semi-join: keep rows from left that have NO match in right on keys. */
@@ -13467,7 +13560,8 @@ static ray_t* window_join_impl(ray_t** args, int64_t n, int mode) {
             case OP_AVG:
             case OP_VAR: case OP_VAR_POP:
             case OP_STDDEV: case OP_STDDEV_POP:
-            case OP_MEDIAN: rt = RAY_F64; break;
+            case OP_MEDIAN:
+            case OP_QUANTILE: rt = RAY_F64; break;
             case OP_SUM: case OP_PROD:
                 rt = agg_is_float[a] ? RAY_F64 : RAY_I64; break;
             default: /* MIN/MAX/FIRST/LAST */ rt = t; break;

@@ -86,6 +86,7 @@ Aggregation functions are marked **aggr** and reduce vectors to scalar values. U
 | `min` | unary, aggr | Minimum value | `(min [3 1 2])` → `1` |
 | `max` | unary, aggr | Maximum value | `(max [3 1 2])` → `3` |
 | `med` | unary, aggr | Median value (returns f64) | `(med [1 3 2])` → `2.0` |
+| `mode` | unary, aggr | Most frequent non-null value; ties keep the first encountered value | `(mode [1 2 2 3])` → `2` |
 | `dev` | unary, aggr | Population standard deviation | `(dev [1 2 3])` → `0.816...` |
 | `stddev` | unary, aggr | Sample standard deviation | `(stddev [1 2 3])` → `1.0` |
 | `stddev_pop` | unary, aggr | Population standard deviation | `(stddev_pop [1 2 3])` |
@@ -97,10 +98,12 @@ Aggregation functions are marked **aggr** and reduce vectors to scalar values. U
 | `scov` | binary, aggr | Sample covariance over paired non-null numeric inputs | `(scov [1 3] [2 6])` → `4.0` |
 | `wsum` | binary, aggr | Weighted sum, `sum(weights * values)`, skipping null pairs | `(wsum [1 3] [10 20])` → `70.0` |
 | `wavg` | binary, aggr | Weighted average, `wsum / sum(weights)`; null for zero total weight | `(wavg [1 3] [10 20])` → `17.5` |
+| `quantile` | binary, aggr | Exact linear-interpolated quantile; probability is `0.0..1.0` | `(quantile [1 2 3 4] 0.5)` → `2.5` |
+| `percentile` | binary, aggr | Exact linear-interpolated percentile; probability is `0..100` | `(percentile [1 2 3 4] 50)` → `2.5` |
 | `first` | unary | First element of vector | `(first [10 20 30])` → `10` |
 | `last` | unary | Last element of vector | `(last [10 20 30])` → `30` |
 
-Unary numeric reducers skip nulls where applicable. Binary reducers skip a row when either input is null. Inside `select`/`by:`, aggregate reducers lower to morsel-based DAG paths that can run in parallel and poll for cancellation.
+Numeric reducers skip nulls where applicable. Pairwise binary reducers skip a row when either vector input is null. Inside `select`/`by:`, aggregate reducers lower to morsel-based DAG paths that can run in parallel and poll for cancellation.
 
 The examples below use this small in-memory table:
 
@@ -274,12 +277,14 @@ Indices are *pre-insertion* positions in `[0, count]`; `idx == count` is equival
 
 ## Joins
 
-Rayforce supports four join types, all with time-series-aware semantics.
+Rayforce supports equi-joins, outer joins, anti-joins, and time-series-aware joins.
 
 | Function | Type | Description |
 |---|---|---|
 | `left-join` | variadic | Left join on matching columns. Unmatched rows filled with nulls. |
 | `inner-join` | variadic | Inner join — only matching rows. |
+| `full-join` | variadic | Full outer join. All left and right rows are preserved; unmatched columns are null. |
+| `anti-join` | variadic | Anti-semi-join. Keep left rows with no right match. |
 | `window-join` | variadic, special | Join with time window constraint. Match rows within a time range. |
 | `asof-join` | variadic | As-of join — match the most recent preceding value. |
 
@@ -302,6 +307,9 @@ Rayforce supports four join types, all with time-series-aware semantics.
 
 ; Inner join
 (inner-join orders products [product_id])
+
+; Full outer join keeps rows from both sides
+(full-join [sym] trades_j quotes)
 
 ; Window join: keys are [equality-keys... time-key]; intervals is
 ; a two-vector list with one [lo hi] window bound per left row.

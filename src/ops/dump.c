@@ -115,6 +115,8 @@ const char* ray_opcode_name(uint16_t op) {
         case OP_WSUM:          return "WSUM";
         case OP_WAVG:          return "WAVG";
         case OP_MEDIAN:        return "MEDIAN";
+        case OP_QUANTILE:      return "QUANTILE";
+        case OP_MODE:          return "MODE";
         case OP_FILTER:        return "FILTER";
         case OP_SORT:          return "SORT";
         case OP_GROUP:         return "GROUP";

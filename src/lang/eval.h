@@ -243,6 +243,9 @@ ray_t* ray_max_fn(ray_t* x);
 ray_t* ray_first_fn(ray_t* x);
 ray_t* ray_last_fn(ray_t* x);
 ray_t* ray_med_fn(ray_t* x);
+ray_t* ray_mode_fn(ray_t* x);
+ray_t* ray_quantile_fn(ray_t* x, ray_t* q);
+ray_t* ray_percentile_fn(ray_t* x, ray_t* p);
 ray_t* ray_dev_fn(ray_t* x);
 ray_t* ray_stddev_fn(ray_t* x);
 ray_t* ray_stddev_pop_fn(ray_t* x);
@@ -313,6 +316,7 @@ ray_t* ray_xbar_fn(ray_t* col, ray_t* bucket);
 /* Joins */
 ray_t* ray_left_join_fn(ray_t** args, int64_t n);
 ray_t* ray_inner_join_fn(ray_t** args, int64_t n);
+ray_t* ray_full_join_fn(ray_t** args, int64_t n);
 ray_t* ray_window_join_fn(ray_t** args, int64_t n);
 ray_t* ray_window_join1_fn(ray_t** args, int64_t n);
 

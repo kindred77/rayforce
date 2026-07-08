@@ -80,6 +80,7 @@ static uint64_t hs_hash_row(ray_t* src, int64_t i, int8_t t, void* data) {
         case RAY_U8:        return ray_hash_i64((int64_t)((const uint8_t*)data)[i]);
         case RAY_BOOL:      return ray_hash_i64((int64_t)((const bool*)data)[i]);
         case RAY_F64:       return ray_hash_f64(((const double*)data)[i]);
+        case RAY_F32:       return ray_hash_f64((double)((const float*)data)[i]);
         case RAY_DATE:      return ray_hash_i64((int64_t)((const int32_t*)data)[i]);
         case RAY_TIME:      return ray_hash_i64((int64_t)((const int32_t*)data)[i]);
         case RAY_TIMESTAMP: return ray_hash_i64(((const int64_t*)data)[i]);
@@ -139,6 +140,7 @@ static int hs_eq_rows(ray_t* a_src, int64_t ai, int8_t at, void* a_data,
             case RAY_U8:        return ((const uint8_t*)a_data)[ai] == ((const uint8_t*)b_data)[bi];
             case RAY_BOOL:      return ((const bool*)a_data)[ai] == ((const bool*)b_data)[bi];
             case RAY_F64:       return ((const double*)a_data)[ai] == ((const double*)b_data)[bi];
+            case RAY_F32:       return ((const float*)a_data)[ai] == ((const float*)b_data)[bi];
             case RAY_DATE:
             case RAY_TIME:      return ((const int32_t*)a_data)[ai] == ((const int32_t*)b_data)[bi];
             case RAY_TIMESTAMP: return ((const int64_t*)a_data)[ai] == ((const int64_t*)b_data)[bi];
@@ -322,6 +324,11 @@ static int distinct_sort_cmp(const void* a, const void* b) {
         case RAY_F64: {
             double va = ((const double*)g_dsort_data)[ia];
             double vb = ((const double*)g_dsort_data)[ib];
+            return (va > vb) - (va < vb);
+        }
+        case RAY_F32: {
+            float va = ((const float*)g_dsort_data)[ia];
+            float vb = ((const float*)g_dsort_data)[ib];
             return (va > vb) - (va < vb);
         }
         default: {
@@ -913,6 +920,7 @@ int atom_eq(ray_t* a, ray_t* b) {
     case -RAY_I16:  return a->i16 == b->i16;
     case -RAY_U8:   return a->u8 == b->u8;
     case -RAY_F64:  return a->f64 == b->f64;
+    case -RAY_F32:  return (float)a->f64 == (float)b->f64;
     case -RAY_BOOL: return a->b8 == b->b8;
     case -RAY_SYM:  return a->i64 == b->i64;
     case -RAY_DATE: case -RAY_TIME:

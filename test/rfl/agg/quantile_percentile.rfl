@@ -1,0 +1,45 @@
+;; Exact quantile / percentile reducers.
+
+;; Standalone interpolation over numeric inputs.
+(quantile [1 2 3 4] 0.0) -- 1.0
+(quantile [1 2 3 4] 1.0) -- 4.0
+(quantile [1 2 3 4] 0.5) -- 2.5
+(quantile [5 1 3 2 4] 0.5) -- 3.0
+(quantile [1 2 3 4 5] 0.25) -- 2.0
+(percentile [1 2 3 4] 50) -- 2.5
+(percentile [1 2 3 4] 25) -- 1.75
+
+;; Nulls are skipped; all-null and empty inputs return F64 null.
+(quantile (list 1 0Ni 5) 0.5) -- 3.0
+(nil? (quantile (list 0Ni 0Ni) 0.5)) -- true
+(nil? (quantile (as 'I64 (list)) 0.5)) -- true
+(nil? (percentile (as 'F64 (list)) 50)) -- true
+
+;; Scalar numeric inputs reduce to themselves as F64.
+(quantile 42 0.25) -- 42.0
+(percentile 3.5 90) -- 3.5
+(type (quantile [1 2 3] 0.5)) -- 'f64
+
+;; Argument validation.
+(quantile [1 2] -0.1) !- domain
+(quantile [1 2] 1.1) !- domain
+(percentile [1 2] -1) !- domain
+(percentile [1 2] 101) !- domain
+(quantile [1 2] 'p) !- type
+(quantile ["a" "b"] 0.5) !- type
+
+;; Grouped path: literal probability lowers into the parallel holistic
+;; group kernel and must preserve exact interpolation.
+(set Tqnt (table [g v] (list [A A A A B B B B] (as 'F64 [1.0 3.0 5.0 7.0 10.0 20.0 30.0 40.0]))))
+(asc (at (select {q: (quantile v 0.5) by: g from: Tqnt}) 'q)) -- [4.0 25.0]
+(asc (at (select {q: (quantile v 0.0) by: g from: Tqnt}) 'q)) -- [1.0 10.0]
+(asc (at (select {q: (quantile v 1.0) by: g from: Tqnt}) 'q)) -- [7.0 40.0]
+(sum (at (select {p: (percentile v 25) by: g from: Tqnt}) 'p)) -- 20.0
+(type (at (select {q: (quantile v 0.5) by: g from: Tqnt}) 'q)) -- 'F64
+
+;; Whole-table and selection-aware grouped DAG variants.
+(at (select {q: (quantile v 0.5) from: Tqnt}) 'q) -- [8.5]
+(at (select {q: (percentile v 50) from: Tqnt where: (< v 10.0)}) 'q) -- [4.0]
+
+;; Hidden aggregate parameter inside a compound grouped expression.
+(asc (at (select {q: (+ (quantile v 0.5) 1.0) by: g from: Tqnt}) 'q)) -- [5.0 26.0]

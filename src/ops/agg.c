@@ -858,6 +858,171 @@ ray_t* ray_med_fn(ray_t* x) {
     return make_f64(median);
 }
 
+ray_t* ray_mode_fn(ray_t* x) {
+    if (RAY_IS_ERR(x)) return x;
+    if (ray_is_atom(x)) {
+        ray_retain(x);
+        return x;
+    }
+    if (!ray_is_vec(x) && !is_list(x))
+        return ray_error("type", "mode expects an atom, vector, or list, got %s", ray_type_name(x->type));
+    if (ray_len(x) == 0) {
+        int8_t nt = ray_is_vec(x) ? (int8_t)(-x->type) : (int8_t)(-RAY_I64);
+        return ray_typed_null(nt);
+    }
+
+    ray_t* groups = ray_group_fn(x);
+    if (!groups || RAY_IS_ERR(groups))
+        return groups ? groups : ray_error("oom", NULL);
+
+    ray_t* keys = ray_dict_keys(groups);
+    ray_t* vals = ray_dict_vals(groups);
+    if (!keys || !vals || vals->type != RAY_LIST) {
+        ray_release(groups);
+        return ray_error("type", "mode: failed to group input");
+    }
+
+    int64_t best = -1;
+    int64_t best_count = -1;
+    ray_t** idx_vecs = (ray_t**)ray_data(vals);
+    for (int64_t i = 0; i < ray_len(vals); i++) {
+        bool is_null_key = false;
+        if (keys->type == RAY_LIST) {
+            ray_t* k = ((ray_t**)ray_data(keys))[i];
+            is_null_key = ray_is_atom(k) && RAY_ATOM_IS_NULL(k);
+        } else {
+            is_null_key = ray_vec_is_null(keys, i);
+        }
+        if (is_null_key) continue;
+        int64_t cnt = idx_vecs[i] ? ray_len(idx_vecs[i]) : 0;
+        if (cnt > best_count) {
+            best = i;
+            best_count = cnt;
+        }
+    }
+
+    if (best < 0) {
+        ray_release(groups);
+        int8_t nt = ray_is_vec(x) ? (int8_t)(-x->type) : (int8_t)(-RAY_I64);
+        return ray_typed_null(nt);
+    }
+
+    int alloc = 0;
+    ray_t* out = collection_elem(keys, best, &alloc);
+    if (!out || RAY_IS_ERR(out)) {
+        ray_release(groups);
+        return out ? out : ray_error("oom", NULL);
+    }
+    if (!alloc) ray_retain(out);
+    ray_release(groups);
+    return out;
+}
+
+static ray_t* quantile_prob_arg(ray_t* q_obj, double scale, const char* name,
+                                double* out_q) {
+    if (!q_obj || !ray_is_atom(q_obj) || !is_numeric(q_obj))
+        return ray_error("type", "%s: probability must be a numeric atom", name);
+    if (RAY_ATOM_IS_NULL(q_obj))
+        return ray_error("domain", "%s: probability must be non-null", name);
+    double raw = as_f64(q_obj);
+    if (!__builtin_isfinite(raw))
+        return ray_error("domain", "%s: probability must be finite", name);
+    if (raw < 0.0 || raw > scale)
+        return ray_error("domain", "%s: probability out of range", name);
+    *out_q = raw / scale;
+    return NULL;
+}
+
+double ray_quantile_dbl_inplace(double* a, int64_t n, double q) {
+    if (n <= 0) return 0.0;
+    if (n == 1) return a[0];
+    if (q <= 0.0) {
+        nth_element_dbl(a, 0, n - 1, 0);
+        return a[0];
+    }
+    if (q >= 1.0) {
+        nth_element_dbl(a, 0, n - 1, n - 1);
+        return a[n - 1];
+    }
+    double pos = q * (double)(n - 1);
+    int64_t lo = (int64_t)pos;
+    double frac = pos - (double)lo;
+    if (frac <= 0.0) {
+        nth_element_dbl(a, 0, n - 1, lo);
+        return a[lo];
+    }
+    int64_t hi = lo + 1;
+    nth_element_dbl(a, 0, n - 1, lo);
+    double lower = a[lo];
+    nth_element_dbl(a, hi, n - 1, hi);
+    double upper = a[hi];
+    return lower + frac * (upper - lower);
+}
+
+static ray_t* quantile_core(ray_t* x, double q, const char* name) {
+    if (RAY_IS_ERR(x)) return x;
+    if (ray_is_atom(x)) {
+        if (RAY_ATOM_IS_NULL(x)) return ray_typed_null(-RAY_F64);
+        if (is_numeric(x)) return make_f64(as_f64(x));
+        return ray_error("type", "%s expects a numeric atom, got %s", name, ray_type_name(x->type));
+    }
+
+    int64_t len;
+    ray_t* scratch = NULL;
+    double* vals = NULL;
+
+    if (ray_is_vec(x)) {
+        len = ray_len(x);
+        if (len == 0) return ray_typed_null(-RAY_F64);
+        scratch = vec_to_f64_scratch(x, &vals);
+        if (RAY_IS_ERR(scratch)) return scratch;
+    } else if (is_list(x)) {
+        len = ray_len(x);
+        if (len == 0) return ray_typed_null(-RAY_F64);
+        ray_t** elems = (ray_t**)ray_data(x);
+        scratch = ray_alloc(len * sizeof(double));
+        if (!scratch) return ray_error("oom", NULL);
+        scratch->type = RAY_F64;
+        scratch->len = 0;
+        vals = (double*)ray_data(scratch);
+        int64_t cnt_l = 0;
+        for (int64_t i = 0; i < len; i++) {
+            if (ray_is_atom(elems[i]) && RAY_ATOM_IS_NULL(elems[i])) continue;
+            if (!is_numeric(elems[i])) {
+                ray_release(scratch);
+                return ray_error("type", "%s: list elements must be numeric, got %s", name, ray_type_name(elems[i]->type));
+            }
+            vals[cnt_l++] = as_f64(elems[i]);
+        }
+        scratch->len = cnt_l;
+    } else {
+        return ray_error("type", "%s expects a numeric atom, vector, or list, got %s", name, ray_type_name(x->type));
+    }
+
+    int64_t cnt = scratch->len;
+    if (cnt == 0) {
+        ray_release(scratch);
+        return ray_typed_null(-RAY_F64);
+    }
+    double v = ray_quantile_dbl_inplace(vals, cnt, q);
+    ray_release(scratch);
+    return make_f64(v);
+}
+
+ray_t* ray_quantile_fn(ray_t* x, ray_t* q_obj) {
+    double q = 0.0;
+    ray_t* err = quantile_prob_arg(q_obj, 1.0, "quantile", &q);
+    if (err) return err;
+    return quantile_core(x, q, "quantile");
+}
+
+ray_t* ray_percentile_fn(ray_t* x, ray_t* p_obj) {
+    double q = 0.0;
+    ray_t* err = quantile_prob_arg(p_obj, 100.0, "percentile", &q);
+    if (err) return err;
+    return quantile_core(x, q, "percentile");
+}
+
 static ray_t* var_stddev_core(ray_t* x, int sample, int take_sqrt);
 
 

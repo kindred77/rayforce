@@ -11,9 +11,9 @@
 | | | |
 |---|---|---|
 | [Arithmetic](#arithmetic) (24) | [Comparison](#comparison) (7) | [Logic](#logic) (3) |
-| [Aggregation](#aggregation) (22) | [Higher-Order](#higher-order) (13) | [Collection](#collection) (41) |
+| [Aggregation](#aggregation) (25) | [Higher-Order](#higher-order) (13) | [Collection](#collection) (41) |
 | [Sorting & Ordering](#sorting) (10) | [Control Flow & Special Forms](#control) (11) | [Table Operations](#table-ops) (20) |
-| [Query](#query) (4) | [Joins](#joins) (6) | [Pivot](#pivot) (1) |
+| [Query](#query) (4) | [Joins](#joins) (7) | [Pivot](#pivot) (1) |
 | [String](#string-ops) (11) | [Temporal](#temporal) (3) | [Type & Introspection](#type-ops) (5) |
 | [I/O & Output](#io) (12) | [System & Utility](#system) (15) | [Serialization](#serialization) (2) |
 | [Storage](#storage) (5) | [IPC](#ipc) (9) | [EAV Triple Store](#eav) (5) |
@@ -42,7 +42,7 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 
 `not`, `neg`, `round`, `floor`, `ceil`, `abs`, `sqrt`, `log`, `exp`, `sin`, `asin`, `cos`, `acos`, `tan`, `atan`, `reciprocal`,
 `signum`, `sum`, `prod`, `all`, `any`, `count`, `avg`, `min`, `max`,
-`first`, `last`, `med`, `dev`, `stddev`, `stddev_pop`, `dev_pop`, `var`, `var_pop`, `raise`, `distinct`,
+`first`, `last`, `med`, `mode`, `dev`, `stddev`, `stddev_pop`, `dev_pop`, `var`, `var_pop`, `raise`, `distinct`,
 `reverse`, `til`, `lag`, `lead`, `deltas`, `ratios`, `fills`, `sums`, `avgs`, `mins`, `maxs`, `prds`,
 `differ`, `asc`, `desc`, `iasc`, `idesc`, `rank`, `key`, `cols`, `value`, `type`, `read`, `load`, `exit`,
 `nil?`, `where`, `group`, `raze`, `ungroup`, `ser`, `de`, `guid`, `date`, `time`, `timestamp`, `ss`, `hh`,
@@ -55,7 +55,7 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 
 ### Binary
 
-`+`, `-`, `*`, `/`, `%`, `>`, `<`, `>=`, `<=`, `==`, `!=`, `pow`, `top`, `bot`, `pearson_corr`, `cov`, `scov`, `wsum`, `wavg`, `set`, `let`,
+`+`, `-`, `*`, `/`, `%`, `>`, `<`, `>=`, `<=`, `==`, `!=`, `pow`, `top`, `bot`, `pearson_corr`, `cov`, `scov`, `wsum`, `wavg`, `quantile`, `percentile`, `set`, `let`,
 `try`, `filter`, `in`, `except`, `union`, `sect`, `take`, `drop`, `rotate`, `cut`, `cross`, `at`, `find`, `msum`, `mavg`, `mmin`, `mmax`,
 `mcount`, `mvar`, `mdev`, `xasc`, `xdesc`, `table`, `union-all`, `xbar`, `as`, `write`, `dict`, `concat`, `within`, `div`,
 `rand`, `bin`, `binr`, `split`, `str-find`, `str-join`, `like`, `.os.setenv`, `.ipc.send`, `.ipc.post`, `get`, `remove`, `row`,
@@ -65,7 +65,7 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 ### Variadic / Special
 
 `and`, `or`, `if`, `do`, `fn`, `map`, `pmap`, `fold`, `scan`, `prior`, `apply`, `list`, `select`, `window`,
-`update`, `insert`, `upsert`, `left-join`, `inner-join`, `anti-join`, `window-join`, `window-join1`,
+`update`, `insert`, `upsert`, `left-join`, `inner-join`, `full-join`, `anti-join`, `window-join`, `window-join1`,
 `asof-join`, `println`, `show`, `format`, `read-csv`, `write-csv`, `.csv.read`, `.csv.splayed`, `.csv.parted`,
 `.csv.write`, `resolve`, `timeit`, `enlist`, `map-left`, `map-right`, `.db.splayed.set`, `.db.splayed.get`,
 `.db.parted.get`, `.db.parted.tables`, `.db.parted.fill`, `alter`, `print`, `.sys.gc`, `.sys.timeit`,
@@ -180,6 +180,7 @@ Aggregation functions reduce vectors to scalar values. Functions marked **aggr**
 | `first` | unary | — | First element of a vector | `(first [10 20 30])` → `10` |
 | `last` | unary | — | Last element of a vector | `(last [10 20 30])` → `30` |
 | `med` | unary | aggr | Median value (returns f64) | `(med [1 3 2])` → `2.0` |
+| `mode` | unary | aggr | Most frequent non-null value; ties keep the first encountered value | `(mode [1 2 2 3])` → `2` |
 | `dev` | unary | aggr | Population standard deviation | `(dev [2 4 4 4 5 5 7 9])` → `2.0` |
 | `stddev` | unary | aggr | Sample standard deviation (Bessel-corrected; not an alias of `dev`) | `(stddev [1 2 3])` → `1.0` |
 | `stddev_pop` | unary | aggr | Population standard deviation | `(stddev_pop [1 2 3])` |
@@ -191,14 +192,18 @@ Aggregation functions reduce vectors to scalar values. Functions marked **aggr**
 | `scov` | binary | aggr | Sample covariance over paired non-null numeric inputs | `(scov [1 3] [2 6])` → `4.0` |
 | `wsum` | binary | aggr | Weighted sum, `sum(weights * values)`, skipping null pairs | `(wsum [1 3] [10 20])` → `70.0` |
 | `wavg` | binary | aggr | Weighted average, `wsum / sum(weights)`; null for zero total weight | `(wavg [1 3] [10 20])` → `17.5` |
+| `quantile` | binary | aggr | Exact linear-interpolated quantile; probability is `0.0..1.0` | `(quantile [1 2 3 4] 0.5)` → `2.5` |
+| `percentile` | binary | aggr | Exact linear-interpolated percentile; probability is `0..100` | `(percentile [1 2 3 4] 50)` → `2.5` |
 
-Unary numeric reducers skip nulls where applicable. Binary reducers skip a row when either input is null. Inside `select`/`by:`, these reducers lower to morsel-based DAG aggregation paths that can run in parallel and poll for cancellation.
+Numeric reducers skip nulls where applicable. Pairwise binary reducers skip a row when either vector input is null. Inside `select`/`by:`, these reducers lower to morsel-based DAG aggregation paths that can run in parallel and poll for cancellation.
 
 ```lisp
 ; Basic aggregation
 (sum [10 20 30])           ; 60
 (avg [10 20 30])           ; 20.0
 (med [1 100 5])            ; 5
+(mode [1 2 2 3])           ; 2
+(quantile [1 2 3 4] 0.5)   ; 2.5
 
 ; Group-by aggregation in select
 (select {from: trades
@@ -460,12 +465,13 @@ Special forms that bridge to the Rayforce DAG executor for high-performance colu
 
 ## Joins
 
-Rayforce supports six join types, including time-series-aware as-of and window joins.
+Rayforce supports seven join types, including time-series-aware as-of and window joins.
 
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
 | `left-join` | variadic | — | Left join — all left rows, unmatched filled with null. Keys are a symbol list. | `(left-join trades quotes [sym])` |
 | `inner-join` | variadic | — | Inner join — only matching rows from both sides | `(inner-join orders products [product_id])` |
+| `full-join` | variadic | — | Full outer join — all rows from both sides, unmatched columns filled with null | `(full-join [sym] trades quotes)` |
 | `anti-join` | variadic | — | Anti-semi-join — left rows with no right match | `(anti-join t1 t2 [key])` |
 | `window-join` | variadic | special | Window join — `[eq-keys... time-key]`, intervals, left, right, agg dict | `(window-join [sym time] iv t1 t2 {avg_bid: (avg bid)})` |
 | `window-join1` | variadic | special | Window join variant (strict window, no prevailing quote) | `(window-join1 [sym time] iv t1 t2 {avg_bid: (avg bid)})` |

@@ -229,6 +229,8 @@ void     ray_cancel_reset(void);
 #define OP_MEDIAN       88   /* exact median per group (bucket-scatter + quickselect) */
 #define OP_TOP_N        89   /* per-group largest K values (bounded max-heap) */
 #define OP_BOT_N        90   /* per-group smallest K values (bounded min-heap) */
+#define OP_QUANTILE     91   /* exact quantile per group (literal probability) */
+#define OP_MODE        145   /* most frequent non-null value per group */
 #define OP_ALL          131  /* truthy-all reduction (nulls skipped) */
 #define OP_ANY          132  /* truthy-any reduction (nulls skipped) */
 #define OP_COV          133  /* population covariance per group (binary input) */
@@ -246,7 +248,8 @@ void     ray_cancel_reset(void);
  *   prod : numeric only
  *   all / any : numeric only, result BOOL
  *   cov / scov / wsum / wavg / pearson_corr : numeric only, result F64
- *   avg / var / var_pop / stddev / stddev_pop : numeric + temporal (result F64)
+ *   avg / var / var_pop / stddev / stddev_pop / med / quantile
+ *        : numeric + temporal (result F64)
  *   min / max / first / last / count and everything else : any type
  * `t` is the positive element/column type.  DATE/TIMESTAMP are absolute points
  * (summing them is meaningless → rejected); SYM/STR/GUID are non-numeric. */
@@ -271,8 +274,9 @@ static inline bool agg_type_admitted(uint16_t op, int8_t t) {
         case OP_WSUM: case OP_WAVG:
         case OP_PEARSON_CORR:
             return !(nonnum || temporal);
-        /* avg / var / stddev: numeric + temporal → F64; reject SYM/STR/GUID. */
+        /* avg / var / stddev / holistic ranks: numeric + temporal → F64. */
         case OP_AVG:
+        case OP_MEDIAN: case OP_QUANTILE:
         case OP_VAR: case OP_VAR_POP:
         case OP_STDDEV: case OP_STDDEV_POP:
             return !nonnum;
@@ -413,10 +417,11 @@ typedef struct ray_op_ext {
              * unary aggs and for the whole pointer when no binary agg
              * is present in this group. */
             uint32_t*  agg_ins2;    /* node ids */
-            /* Optional integer parameter per agg — used by holistic
+            /* Optional scalar parameter per agg — used by holistic
              * aggregators that take a scalar literal alongside the
-             * column (currently OP_TOP_N / OP_BOT_N: K).  NULL for
-             * groups whose aggs all take no scalar param. */
+             * column.  TOP/BOT store integer K; QUANTILE stores the
+             * probability bits in this int64 slot.  NULL for groups
+             * whose aggs all take no scalar param. */
             int64_t*    agg_k;
         };
         struct {               /* OP_SORT: multi-column sort */
@@ -756,9 +761,9 @@ ray_op_t* ray_group(ray_graph_t* g, ray_op_t** keys, uint32_t n_keys,
 ray_op_t* ray_group2(ray_graph_t* g, ray_op_t** keys, uint32_t n_keys,
                      uint16_t* agg_ops, ray_op_t** agg_ins,
                      ray_op_t** agg_ins2, uint32_t n_aggs);
-/* Variant accepting an optional integer scalar per agg (e.g. top/bot K).
- * agg_k is parallel to agg_ins (length n_aggs); slots are 0 for aggs
- * that take no scalar param.  Pass NULL for agg_ins2 / agg_k if not used. */
+/* Variant accepting an optional scalar per agg.  TOP/BOT store integer K;
+ * QUANTILE stores probability bits.  agg_k is parallel to agg_ins
+ * (length n_aggs).  Pass NULL for agg_ins2 / agg_k if not used. */
 ray_op_t* ray_group3(ray_graph_t* g, ray_op_t** keys, uint32_t n_keys,
                      uint16_t* agg_ops, ray_op_t** agg_ins,
                      ray_op_t** agg_ins2, const int64_t* agg_k,

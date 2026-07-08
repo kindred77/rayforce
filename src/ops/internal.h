@@ -1066,7 +1066,7 @@ ray_t* desc_vec_eager(ray_t* x);
 #define GHT_AF_LAST     8u
 #define GHT_AF_PROD     16u
 #define GHT_AF_BINARY   32u  /* two inputs (OP_PEARSON_CORR): packs (x,y) */
-#define GHT_AF_HOLISTIC 64u  /* OP_MEDIAN/TOP/BOT/wide-mm: no accum slot */
+#define GHT_AF_HOLISTIC 64u  /* MEDIAN/QUANTILE/TOP/BOT/wide-mm: no accum slot */
 #define GHT_AF_WIDE     128u /* subset of HOLISTIC: wide-element min/max/first/last */
 /* agg_flags2 bits (agg_flags is full — 8 bits used) */
 #define GHT_AF2_NULLABLE 1u  /* agg input column advertises HAS_NULLS: the row-layout
