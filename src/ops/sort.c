@@ -2984,14 +2984,27 @@ str_msd_done:;
     return result;
 }
 
+/* Total-order compare for the comparator top-k: sort_cmp first, then the
+ * original row index ascending as the tie-break.  Row indices are unique, so
+ * this is a strict total order — the bounded heap evicts, and the final sort
+ * orders, equal-key rows by LOWER original position.  That makes topk_indices_cmp
+ * a STABLE top-k identical to the full-sort path (key_lt), rather than leaving
+ * equal-key ties in arbitrary heap order (which both selected the wrong tied
+ * rows at the k boundary and ordered survivors nondeterministically). */
+static inline int topk_cmp_pos(const sort_cmp_ctx_t* ctx, int64_t a, int64_t b) {
+    int c = sort_cmp(ctx, a, b);
+    if (c != 0) return c;
+    return (a > b) - (a < b);
+}
+
 static void topk_cmp_sift_down(const sort_cmp_ctx_t* ctx, int64_t* heap,
                                int64_t n, int64_t root) {
     for (;;) {
         int64_t worst = root;
         int64_t l = 2 * root + 1;
         int64_t r = 2 * root + 2;
-        if (l < n && sort_cmp(ctx, heap[l], heap[worst]) > 0) worst = l;
-        if (r < n && sort_cmp(ctx, heap[r], heap[worst]) > 0) worst = r;
+        if (l < n && topk_cmp_pos(ctx, heap[l], heap[worst]) > 0) worst = l;
+        if (r < n && topk_cmp_pos(ctx, heap[r], heap[worst]) > 0) worst = r;
         if (worst == root) break;
         int64_t tmp = heap[root];
         heap[root] = heap[worst];
@@ -3033,7 +3046,7 @@ static ray_t* topk_indices_cmp(ray_t** cols, uint8_t* descs, uint8_t* nfs,
     for (int64_t i = 1; i < k; i++) {
         int64_t v = heap[i];
         int64_t j = i - 1;
-        while (j >= 0 && sort_cmp(&ctx, v, heap[j]) < 0) {
+        while (j >= 0 && topk_cmp_pos(&ctx, v, heap[j]) < 0) {
             heap[j + 1] = heap[j];
             j--;
         }
@@ -3075,6 +3088,17 @@ static ray_t* topk_indices_cmp_single(ray_t* col, uint8_t desc, uint8_t nf,
  * on any unsupported configuration so the caller's fallback path
  * handles it.
  * -------------------------------------------------------------------------- */
+/* Max-heap ordering for the radix bounded top-k: the "greater" (worse)
+ * candidate has the larger encoded key, or an equal key with the LARGER
+ * original row index.  Carrying the row index as the tie-break makes the heap
+ * root the (key, position)-worst element, so evicting it keeps the (key,
+ * position)-smallest k — a STABLE top-k that retains the lower original
+ * position on ties, matching the full-sort path (key_lt) and key_heapsort's
+ * final ordering.  Without the index tie-break the root among equal keys was
+ * arbitrary and eviction could drop the row that should have been kept. */
+#define TOPK_PAIR_GT(ka, ia, kb, ib) \
+    ((ka) > (kb) || ((ka) == (kb) && (ia) > (ib)))
+
 static ray_t* topk_indices_single(ray_t* col, uint8_t desc, uint8_t nf,
                                   int64_t nrows, int64_t k) {
     if (!col || k <= 0 || nrows <= 0) return NULL;
@@ -3130,14 +3154,14 @@ static ray_t* topk_indices_single(ray_t* col, uint8_t desc, uint8_t nf,
     /* Seed with the first K rows. */
     for (int64_t i = 0; i < k; i++) { hk[i] = keys[i]; hi[i] = i; }
 
-    /* Heapify (build max-heap on hk[]). */
+    /* Heapify (build max-heap on (hk,hi) pairs). */
     for (int64_t i = k / 2 - 1; i >= 0; i--) {
         int64_t idx = i;
         for (;;) {
             int64_t largest = idx;
             int64_t l = 2 * idx + 1, r = 2 * idx + 2;
-            if (l < k && hk[l] > hk[largest]) largest = l;
-            if (r < k && hk[r] > hk[largest]) largest = r;
+            if (l < k && TOPK_PAIR_GT(hk[l], hi[l], hk[largest], hi[largest])) largest = l;
+            if (r < k && TOPK_PAIR_GT(hk[r], hi[r], hk[largest], hi[largest])) largest = r;
             if (largest == idx) break;
             uint64_t tk = hk[idx]; hk[idx] = hk[largest]; hk[largest] = tk;
             int64_t  ti = hi[idx]; hi[idx] = hi[largest]; hi[largest] = ti;
@@ -3145,8 +3169,11 @@ static ray_t* topk_indices_single(ray_t* col, uint8_t desc, uint8_t nf,
         }
     }
 
-    /* Scan remaining rows, push when the new key is strictly smaller
-     * than heap-top.  Sift the new root down to restore the max-heap. */
+    /* Scan remaining rows, push when the new key is strictly smaller than the
+     * heap-top key.  Scan indices increase monotonically and every heap slot
+     * holds an index below the current one, so an equal-key row is always the
+     * higher position and correctly skipped; only a strictly-smaller key
+     * displaces the (key,position)-worst root.  Sift the new root down. */
     for (int64_t i = k; i < nrows; i++) {
         if (keys[i] >= hk[0]) continue;
         hk[0] = keys[i];
@@ -3155,8 +3182,8 @@ static ray_t* topk_indices_single(ray_t* col, uint8_t desc, uint8_t nf,
         for (;;) {
             int64_t largest = idx;
             int64_t l = 2 * idx + 1, r = 2 * idx + 2;
-            if (l < k && hk[l] > hk[largest]) largest = l;
-            if (r < k && hk[r] > hk[largest]) largest = r;
+            if (l < k && TOPK_PAIR_GT(hk[l], hi[l], hk[largest], hi[largest])) largest = l;
+            if (r < k && TOPK_PAIR_GT(hk[r], hi[r], hk[largest], hi[largest])) largest = r;
             if (largest == idx) break;
             uint64_t tk = hk[idx]; hk[idx] = hk[largest]; hk[largest] = tk;
             int64_t  ti = hi[idx]; hi[idx] = hi[largest]; hi[largest] = ti;
@@ -3181,6 +3208,28 @@ static ray_t* topk_indices_single(ray_t* col, uint8_t desc, uint8_t nf,
     scratch_free(hk_hdr); scratch_free(hi_hdr);
     scratch_free(keys_hdr);
     return result;
+}
+#undef TOPK_PAIR_GT
+
+/* True when any column of `tbl` is a raw parted wrapper (RAY_IS_PARTED)
+ * or the virtual partition column (RAY_MAPCOMMON).  The raw sort/top-k
+ * builtins drive their whole-table gather off row indices in [0, nrows)
+ * (nrows = the true parted row count, tens of millions), but a parted
+ * wrapper's storage is an array of segment pointers sized to the SEGMENT
+ * count (tens/hundreds) — a shape the gather is not built for and which,
+ * once any path indexes ray_data(col) at a row position, reads out of
+ * bounds.  Reject such tables up front with a clean, intentional error
+ * instead of letting them fall through to an incidental type error deep in
+ * the gather (or a future OOB).  The select-clause path sorts a
+ * materialized result table, so it never trips this guard. */
+static bool table_has_parted_col(ray_t* tbl) {
+    int64_t ncols = ray_table_ncols(tbl);
+    for (int64_t c = 0; c < ncols; c++) {
+        ray_t* col = ray_table_get_col_idx(tbl, c);
+        if (col && (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON))
+            return true;
+    }
+    return false;
 }
 
 /* Gather K rows of `tbl` at the given indices and return a new table.
@@ -3231,6 +3280,8 @@ static ray_t* topk_gather_rows(ray_t* tbl, ray_t* idx, int64_t k) {
 ray_t* ray_topk_table(ray_t* tbl, ray_t* col, uint8_t desc, uint8_t nf,
                       int64_t k) {
     if (!tbl || tbl->type != RAY_TABLE || !col) return NULL;
+    if (table_has_parted_col(tbl))
+        return ray_error("nyi", "top/bot: parted table input not supported");
     int64_t nrows = ray_table_nrows(tbl);
     if (k <= 0 || nrows <= 0) return NULL;
     if (k >= nrows) return NULL;
@@ -3257,6 +3308,8 @@ ray_t* ray_topk_table(ray_t* tbl, ray_t* col, uint8_t desc, uint8_t nf,
 ray_t* ray_topk_table_multi(ray_t* tbl, ray_t** key_cols, uint8_t* descs,
                             uint8_t* nfs, uint8_t n_keys, int64_t k) {
     if (!tbl || tbl->type != RAY_TABLE || !key_cols || n_keys == 0) return NULL;
+    if (table_has_parted_col(tbl))
+        return ray_error("nyi", "top/bot: parted table input not supported");
     int64_t nrows = ray_table_nrows(tbl);
     if (k <= 0 || nrows <= 0 || k >= nrows) return NULL;
     int64_t ncols = ray_table_ncols(tbl);
@@ -3909,10 +3962,50 @@ static void sorted_check_fn(void* raw, uint32_t wid, int64_t start, int64_t end)
     }
 }
 
+/* Public: are these key columns already in sorted order under the sort's
+ * lexicographic ordering (single uniform direction across all keys)?  Only
+ * null-free integer-family / SYM keys are decidable — anything else (float,
+ * STR/LIST, or a HAS_NULLS column) returns false so the caller must NOT
+ * assume sortedness (float NaN / null placement belong to the real sort).
+ * O(nrows) with early bail on the first violation; a 0/1-row column is
+ * trivially sorted.  Used by the parted ORDER BY streaming path in query.c
+ * to verify each partition is internally sorted at O(partition), never a
+ * full sort. */
+bool ray_key_cols_sorted(ray_t** key_cols, int64_t n_keys, uint8_t descending,
+                         int64_t nrows) {
+    if (n_keys < 1) return true;
+    /* Decidability gate runs UNCONDITIONALLY — a 0/1-row segment is trivially
+     * "sorted", but an undecidable key type (float / STR / GUID) or a
+     * null-bearing key must still return false so the caller declines rather
+     * than silently treating an unorderable column as ordered. */
+    for (int64_t k = 0; k < n_keys; k++) {
+        int8_t t = key_cols[k]->type;
+        if (key_cols[k]->attrs & RAY_ATTR_HAS_NULLS) return false;
+        if (t != RAY_BOOL && t != RAY_U8 && t != RAY_I16 && t != RAY_I32 &&
+            t != RAY_I64 && t != RAY_DATE && t != RAY_TIME &&
+            t != RAY_TIMESTAMP && t != RAY_SYM)
+            return false;
+    }
+    if (nrows < 2) return true;
+    volatile int ordered = 1;
+    sorted_check_ctx_t sctx = {
+        .key_cols = key_cols, .n_keys = n_keys,
+        .descending = descending, .ordered = &ordered,
+    };
+    ray_pool_t* pool = ray_pool_get();
+    if (pool && nrows >= RAY_PARALLEL_THRESHOLD)
+        ray_pool_dispatch(pool, sorted_check_fn, &sctx, nrows);
+    else
+        sorted_check_fn(&sctx, 0, 1, nrows);
+    return ordered != 0;
+}
+
 /* Helper: resolve key symbols to table columns for xasc/xdesc */
 ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
     if (!tbl || tbl->type != RAY_TABLE)
         return ray_error("type", "xasc/xdesc expects a table as first argument");
+    if (table_has_parted_col(tbl))
+        return ray_error("nyi", "xasc/xdesc: parted table input not supported");
 
     /* keys can be a SYM atom, a SYM vector, or a list of SYM atoms */
     int64_t n_keys;
