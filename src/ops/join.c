@@ -1990,12 +1990,11 @@ static ray_t* exec_antijoin_flat(ray_graph_t* g, ray_op_t* op,
         }
 
         col_propagate_str_pool(new_col, col);
-        /* Null-model invariant 16.4: the gather copies sentinel cells
-         * verbatim (e.g. an anti-join preserves a null-key left row) but
-         * gather_fn does not flag HAS_NULLS — propagate it from the
-         * source, mirroring the inner/outer join gather path. */
+        /* Gather copies sentinel cells verbatim, but the gather worker
+         * does not flag HAS_NULLS. Preserve source null metadata to
+         * mirror the inner/outer join gather path. */
         col_propagate_nulls_gather(new_col, col, out_idx, out_count);
-        /* SYM output gathers raw cell ids from `col` — resolve over
+        /* SYM output gathers raw cell ids from `col`; resolve over
          * the same dictionary (sym-domain Phase 2). */
         if (new_col->type == RAY_SYM)
             ray_sym_vec_adopt_domain(new_col, col);
@@ -2078,8 +2077,6 @@ static bool asof_time_sorted_within_parts(const ray_t* keycol, const int64_t* tv
  * with NO sorting of either side and no work on unprobed right keys — the
  * sort-merge below pays O((L+R)·log(L+R)) per query, which for a small
  * probe against a large right table is almost entirely wasted work.
- * (Rayforce v1's asof/window joins used this hash-group + binary-search
- * structure; the v2 sort-merge rewrite is what regressed them.)
  *
  * Precondition — VERIFIED, not assumed: right time must be non-descending
  * within each key group over its non-null rows.  True whenever the right
@@ -2099,6 +2096,111 @@ static int asof_lslot_cmp(const void* a, const void* b) {
     int64_t x = ((const asof_lslot_t*)a)->t;
     int64_t y = ((const asof_lslot_t*)b)->t;
     return (x > y) - (x < y);
+}
+
+typedef struct {
+    const int64_t* rows;
+    int64_t start;
+    int64_t n;
+    uint8_t contig;
+} asof_idx_slice_t;
+
+static inline int64_t asof_slice_row(const asof_idx_slice_t* s, int64_t p) {
+    return s->contig ? s->start + p : s->rows[p];
+}
+
+static int asof_part_group(ray_t* col, int64_t key, asof_idx_slice_t* out) {
+    out->rows = NULL;
+    out->start = 0;
+    out->n = 0;
+    out->contig = 1;
+    if (!col || RAY_IS_ERR(col) || ray_index_kind(col) != RAY_IDX_PART)
+        return -1;
+    ray_index_t* ix = ray_index_payload(col->index);
+    if (!ix || ix->built_for_len != col->len ||
+        !ix->u.part.keys || !ix->u.part.starts || !ix->u.part.lens)
+        return -1;
+    if (col->type != RAY_SYM &&
+        col->type != RAY_BOOL && col->type != RAY_U8  &&
+        col->type != RAY_I16 && col->type != RAY_I32 &&
+        col->type != RAY_I64 && col->type != RAY_DATE &&
+        col->type != RAY_TIME && col->type != RAY_TIMESTAMP)
+        return -1;
+
+    const int64_t* st = (const int64_t*)ray_data(ix->u.part.starts);
+    const int64_t* ln = (const int64_t*)ray_data(ix->u.part.lens);
+    const void* kd = ray_data(ix->u.part.keys);
+    int64_t n = ix->u.part.n_parts;
+
+    if (col->type == RAY_SYM) {
+        if (key < 0) return 0;
+        for (int64_t p = 0; p < n; p++) {
+            int64_t kv = read_col_i64(kd, p, ix->u.part.keys->type,
+                                      ix->u.part.keys->attrs);
+            if (kv == key) {
+                out->start = st[p];
+                out->n = ln[p];
+                return 1;
+            }
+        }
+        return 0;
+    }
+
+    int64_t lo = 0, hi = n;
+    while (lo < hi) {
+        int64_t m = lo + (hi - lo) / 2;
+        int64_t kv = read_col_i64(kd, m, ix->u.part.keys->type,
+                                  ix->u.part.keys->attrs);
+        if (kv < key) lo = m + 1;
+        else hi = m;
+    }
+    if (lo >= n) return 0;
+    int64_t kv = read_col_i64(kd, lo, ix->u.part.keys->type,
+                              ix->u.part.keys->attrs);
+    if (kv != key) return 0;
+    out->start = st[lo];
+    out->n = ln[lo];
+    return 1;
+}
+
+static int asof_index_group(ray_t* col, int64_t key, asof_idx_slice_t* out) {
+    out->rows = NULL;
+    out->start = 0;
+    out->n = 0;
+    out->contig = 0;
+    if (ray_index_kind(col) == RAY_IDX_HASH) {
+        int hit = ray_index_hash_group(col, key, &out->rows, &out->n);
+        out->contig = 0;
+        return hit;
+    }
+    if (ray_index_kind(col) == RAY_IDX_PART)
+        return asof_part_group(col, key, out);
+    return -1;
+}
+
+static bool asof_index_ordered_by(ray_t* col, int64_t sym) {
+    if (!col || RAY_IS_ERR(col) || sym < 0 || !ray_index_has(col))
+        return false;
+    ray_index_t* ix = ray_index_payload(col->index);
+    if (!ix || ix->built_for_len != col->len)
+        return false;
+    if (ix->kind == RAY_IDX_HASH)
+        return ix->u.hash.order_sym == sym;
+    if (ix->kind == RAY_IDX_PART)
+        return ix->u.part.order_sym == sym;
+    return false;
+}
+
+static bool asof_verify_idx_slices(const asof_idx_slice_t* sl, int32_t n_groups,
+                                   const int64_t* rt_time) {
+    for (int32_t g = 0; g < n_groups; g++) {
+        for (int64_t p = 1; p < sl[g].n; p++) {
+            int64_t cur = asof_slice_row(&sl[g], p);
+            int64_t prv = asof_slice_row(&sl[g], p - 1);
+            if (rt_time[cur] < rt_time[prv]) return false;
+        }
+    }
+    return true;
 }
 
 /* Per-slice ascending-time verify over a collected probe set (see the
@@ -2201,6 +2303,43 @@ static bool asof_verify_slices(const int64_t* gsl, int32_t n_groups,
     return vok != 0;
 }
 
+typedef struct {
+    const asof_idx_slice_t* slices;
+    const int32_t* left_gid;
+    const int64_t* lt_time;
+    const int64_t* rt_time;
+    int64_t* match_orig;
+} asof_idx_match_ctx_t;
+
+static void asof_idx_match_fn(void* raw, uint32_t wid,
+                              int64_t start, int64_t end) {
+    (void)wid;
+    asof_idx_match_ctx_t* c = (asof_idx_match_ctx_t*)raw;
+    const int32_t* restrict lg = c->left_gid;
+    const int64_t* restrict lt = c->lt_time;
+    const int64_t* restrict rt = c->rt_time;
+    int64_t* restrict mo = c->match_orig;
+    const asof_idx_slice_t* slices = c->slices;
+
+    for (int64_t li = start; li < end; li++) {
+        int32_t g = lg[li];
+        if (g < 0) {
+            mo[li] = -1;
+            continue;
+        }
+        const asof_idx_slice_t* s = &slices[g];
+        int64_t lo = 0, hi = s->n, best = -1;
+        int64_t t = lt[li];
+        while (lo < hi) {
+            int64_t mid = lo + (hi - lo) / 2;
+            int64_t rr = asof_slice_row(s, mid);
+            if (rt[rr] <= t) { best = mid; lo = mid + 1; }
+            else             { hi = mid; }
+        }
+        mo[li] = (best >= 0) ? asof_slice_row(s, best) : -1;
+    }
+}
+
 static bool asof_hash_group_match(uint32_t n_eq,
                                   ray_t* const* lt_eq, ray_t* const* rt_eq,
                                   const int64_t* const* eq_xlut,
@@ -2211,6 +2350,7 @@ static bool asof_hash_group_match(uint32_t n_eq,
                                   const uint8_t* rt_null,
                                   int64_t left_n, int64_t right_n,
                                   bool rt_time_sorted, bool rt_no_nulls,
+                                  int64_t rt_time_sym,
                                   int64_t* match_orig) {
     if (left_n <= 0) return true;
     if (right_n >= INT32_MAX - 1 || left_n >= INT32_MAX - 1) return false;
@@ -2321,67 +2461,73 @@ static bool asof_hash_group_match(uint32_t n_eq,
             if (rt_time[i] < rt_time[i - 1]) { rt_time_sorted = false; break; }
     }
 
-    /* Index variant — single eq key carrying a fresh CSR grouped index,
+    /* Index variant — single eq key carrying a fresh grouped index,
      * no null-marked right rows: every group is answered straight from its
      * index slice (ascending row ids).  Ascending TIME along the slice is
      * either implied by globally sorted right time, or verified per probed
      * slice with a bail-early scan — on a (sym,time)-sorted (parted)
      * layout the slice is one contiguous range, so the verify reads
      * sequential memory and costs a fraction of the binary searches it
-     * unlocks.  NO pass over the right table at all — this is the
-     * parted-layout-parity path: cost is per-probed-key, not per-row. */
+     * unlocks.  No pass over the right table is needed: cost is
+     * per-probed-key, not per-row. */
     if (ok && n_eq == 1 && rt_no_nulls &&
-        ray_index_kind(rt_eq[0]) == RAY_IDX_HASH) {
+        (ray_index_kind(rt_eq[0]) == RAY_IDX_HASH ||
+         ray_index_kind(rt_eq[0]) == RAY_IDX_PART)) {
         ray_idx_consults[IDX_SITE_ASOF]++;
         bool served = true;
         ray_t* gsl_hdr = NULL;
-        int64_t* gsl = (int64_t*)scratch_alloc(&gsl_hdr,
-                           (size_t)(n_groups > 0 ? n_groups : 1) * 2 *
-                           sizeof(int64_t));
+        asof_idx_slice_t* gsl = (asof_idx_slice_t*)scratch_alloc(&gsl_hdr,
+                           (size_t)(n_groups > 0 ? n_groups : 1) *
+                           sizeof(asof_idx_slice_t));
         if (gsl) {
             /* Resolve every probed group's slice first; the per-slice
              * time-order verify runs over the collected set afterwards
-             * so it can go wide.  The verify IS the honest-engine cost
-             * that trusting a sorted-attribute stamp would skip — when a
-             * query probes the
-             * liquid names it walks millions of rows, so it must run at
-             * memory speed: contiguous slices (the parted layout) are
+             * so it can go wide.  When a query probes large groups, the
+             * verify must run at memory speed: contiguous slices are
              * checked with a sequential compare instead of a gathered
              * one, and the whole probe set is chunked across the pool
-             * with a shared bail flag (chunks re-check their boundary
-             * pair, so every adjacent pair is covered exactly once). */
+             * with a shared bail flag. */
             int64_t verify_rows = 0;
+            bool idx_ordered = asof_index_ordered_by(rt_eq[0], rt_time_sym);
             for (int32_t g = 0; g < n_groups && served; g++) {
-                const int64_t* grows = NULL;
-                int64_t gn = 0;
-                int hit = ray_index_hash_group(rt_eq[0], gkeys[g],
-                                               &grows, &gn);
+                int hit = asof_index_group(rt_eq[0], gkeys[g], &gsl[g]);
                 if (hit < 0) { served = false; break; }  /* ineligible */
-                gsl[2 * g]     = (int64_t)(intptr_t)grows;
-                gsl[2 * g + 1] = gn;
-                verify_rows += gn;
+                verify_rows += gsl[g].n;
             }
-            if (served && !rt_time_sorted && verify_rows > 0) {
-                served = asof_verify_slices(gsl, n_groups, rt_time,
-                                            verify_rows);
+            if (served && !rt_time_sorted && !idx_ordered && verify_rows > 0) {
+                if (ray_index_kind(rt_eq[0]) == RAY_IDX_HASH) {
+                    ray_t* hv_hdr = NULL;
+                    int64_t* hv = (int64_t*)scratch_alloc(&hv_hdr,
+                        (size_t)(n_groups > 0 ? n_groups : 1) * 2 *
+                        sizeof(int64_t));
+                    if (hv) {
+                        for (int32_t g = 0; g < n_groups; g++) {
+                            hv[2 * g] = (int64_t)(intptr_t)gsl[g].rows;
+                            hv[2 * g + 1] = gsl[g].n;
+                        }
+                        served = asof_verify_slices(hv, n_groups, rt_time,
+                                                    verify_rows);
+                        scratch_free(hv_hdr);
+                    } else {
+                        served = asof_verify_idx_slices(gsl, n_groups, rt_time);
+                    }
+                } else {
+                    served = asof_verify_idx_slices(gsl, n_groups, rt_time);
+                }
             }
             if (served) {
                 ray_idx_hits[IDX_SITE_ASOF]++;
-                for (int64_t li = 0; li < left_n; li++) {
-                    int32_t g = left_gid[li];
-                    if (g < 0) { match_orig[li] = -1; continue; }
-                    const int64_t* grows =
-                        (const int64_t*)(intptr_t)gsl[2 * g];
-                    int64_t gn = gsl[2 * g + 1];
-                    int64_t t = lt_time[li];
-                    int64_t lo = 0, hi = gn, best = -1;
-                    while (lo < hi) {
-                        int64_t mid = lo + (hi - lo) / 2;
-                        if (rt_time[grows[mid]] <= t) { best = mid; lo = mid + 1; }
-                        else                          { hi = mid; }
-                    }
-                    match_orig[li] = (best >= 0) ? grows[best] : -1;
-                }
+                asof_idx_match_ctx_t mctx = {
+                    .slices = gsl, .left_gid = left_gid,
+                    .lt_time = lt_time, .rt_time = rt_time,
+                    .match_orig = match_orig,
+                };
+                ray_pool_t* pool = ray_pool_get();
+                if (pool && left_n >= RAY_PARALLEL_THRESHOLD &&
+                    ray_pool_total_workers(pool) > 1)
+                    ray_pool_dispatch(pool, asof_idx_match_fn, &mctx, left_n);
+                else
+                    asof_idx_match_fn(&mctx, 0, 0, left_n);
                 scratch_free(gsl_hdr);
                 goto done;
             }
@@ -2401,7 +2547,8 @@ static bool asof_hash_group_match(uint32_t n_eq,
      * table anyway, the sequential full pass is cheaper per row, so bail
      * upfront on the (known!) slice-length sum. */
     if (ok && n_eq >= 2 && rt_no_nulls && n_groups > 0 &&
-        ray_index_kind(rt_eq[0]) == RAY_IDX_HASH) {
+        (ray_index_kind(rt_eq[0]) == RAY_IDX_HASH ||
+         ray_index_kind(rt_eq[0]) == RAY_IDX_PART)) {
         ray_idx_consults[IDX_SITE_ASOF]++;
         bool served = true;
 
@@ -2412,7 +2559,7 @@ static bool asof_hash_group_match(uint32_t n_eq,
         while (fcap < (uint64_t)n_groups * 2u) fcap <<= 1;
         uint64_t fmask = fcap - 1;
         ray_t *ftab_hdr = NULL, *fhead_hdr = NULL, *fnext_hdr = NULL,
-              *fsl_hdr = NULL;
+              *fgid_hdr = NULL, *fsl_hdr = NULL;
         ray_t *lcnt_hdr = NULL, *ls_hdr = NULL, *cur_hdr = NULL,
               *prev_hdr = NULL;
         int32_t* ftab    = (int32_t*)scratch_alloc(&ftab_hdr, fcap * 4);
@@ -2420,9 +2567,11 @@ static bool asof_hash_group_match(uint32_t n_eq,
                                                    (size_t)n_groups * 4);
         int32_t* fkg_next = (int32_t*)scratch_alloc(&fnext_hdr,
                                                     (size_t)n_groups * 4);
-        int64_t* fsl = (int64_t*)scratch_alloc(&fsl_hdr,
-                                               (size_t)n_groups * 2 *
-                                               sizeof(int64_t));
+        int32_t* gid_fid = (int32_t*)scratch_alloc(&fgid_hdr,
+                                                   (size_t)n_groups * 4);
+        asof_idx_slice_t* fsl = (asof_idx_slice_t*)scratch_alloc(&fsl_hdr,
+                                               (size_t)n_groups *
+                                               sizeof(asof_idx_slice_t));
         int32_t* lcnt = (int32_t*)scratch_alloc(&lcnt_hdr,
                                                 ((size_t)n_groups + 1) * 4);
         int32_t* cur  = (int32_t*)scratch_alloc(&cur_hdr,
@@ -2432,7 +2581,7 @@ static bool asof_hash_group_match(uint32_t n_eq,
         asof_lslot_t* ls = (asof_lslot_t*)scratch_alloc(&ls_hdr,
                               (size_t)left_n * sizeof(asof_lslot_t));
         int32_t n_fk = 0;
-        if (ftab && fk_head && fkg_next && fsl &&
+        if (ftab && fk_head && fkg_next && gid_fid && fsl &&
             lcnt && cur && prev && ls) {
             memset(ftab, 0, fcap * 4);
             for (int32_t g = 0; g < n_groups; g++) {
@@ -2458,34 +2607,78 @@ static bool asof_hash_group_match(uint32_t n_eq,
                     slot = (slot + 1) & fmask;
                 }
                 fkg_next[g] = fk_head[fid];
+                gid_fid[g] = fid;
                 fk_head[fid] = g;
             }
 
             /* Probe each distinct first key once; sum the slice lengths
              * for the density bail. */
             int64_t total_slice = 0;
+            bool idx_ordered = asof_index_ordered_by(rt_eq[0], rt_time_sym);
             for (int32_t f = 0; f < n_fk && served; f++) {
                 int32_t rep = fk_head[f];
-                const int64_t* grows = NULL;
-                int64_t gn = 0;
-                int hit = ray_index_hash_group(rt_eq[0],
-                                               gkeys[(int64_t)rep * n_eq],
-                                               &grows, &gn);
+                int hit = asof_index_group(rt_eq[0],
+                                           gkeys[(int64_t)rep * n_eq],
+                                           &fsl[f]);
                 if (hit < 0) { served = false; break; }   /* ineligible */
                 /* The cursor merge needs ascending time along the walk;
                  * globally sorted right time implies it, otherwise verify
                  * this slice (sequential reads on a parted layout). */
-                if (!rt_time_sorted)
-                    for (int64_t p = 1; p < gn; p++)
-                        if (rt_time[grows[p]] < rt_time[grows[p - 1]]) {
+                if (!rt_time_sorted && !idx_ordered)
+                    for (int64_t p = 1; p < fsl[f].n; p++) {
+                        int64_t cur = asof_slice_row(&fsl[f], p);
+                        int64_t prv = asof_slice_row(&fsl[f], p - 1);
+                        if (rt_time[cur] < rt_time[prv]) {
                             served = false;
                             break;
                         }
+                    }
                 if (!served) break;
-                fsl[2 * f]     = (int64_t)(intptr_t)grows;
-                fsl[2 * f + 1] = gn;
-                total_slice += gn;
+                total_slice += fsl[f].n;
             }
+            if (served && idx_ordered) {
+                bool sparse = true;
+                int64_t steps = 0;
+                int64_t budget = total_slice > 0 ? total_slice : 1;
+                for (int64_t li = 0; li < left_n && sparse; li++) {
+                    int32_t gid = left_gid[li];
+                    if (gid < 0) { match_orig[li] = -1; continue; }
+                    const asof_idx_slice_t* s = &fsl[gid_fid[gid]];
+                    int64_t t = lt_time[li];
+                    int64_t lo = 0, hi = s->n, best = -1;
+                    while (lo < hi) {
+                        int64_t mid = lo + (hi - lo) / 2;
+                        int64_t rr = asof_slice_row(s, mid);
+                        if (rt_time[rr] <= t) { best = mid; lo = mid + 1; }
+                        else                  { hi = mid; }
+                    }
+                    int64_t found = -1;
+                    for (int64_t p = best; p >= 0; p--) {
+                        if (++steps > budget) { sparse = false; break; }
+                        int64_t i = asof_slice_row(s, p);
+                        const int64_t* gk = gkeys + (int64_t)gid * n_eq;
+                        int eq = 1;
+                        for (uint32_t k = 1; k < n_eq; k++) {
+                            int64_t rv = read_col_i64(ray_data(rt_eq[k]), i,
+                                                      rt_eq[k]->type,
+                                                      rt_eq[k]->attrs);
+                            if (gk[k] != rv) { eq = 0; break; }
+                        }
+                        if (eq) { found = i; break; }
+                    }
+                    if (sparse) match_orig[li] = found;
+                }
+                if (sparse) {
+                    ray_idx_hits[IDX_SITE_ASOF]++;
+                    scratch_free(ftab_hdr);  scratch_free(fhead_hdr);
+                    scratch_free(fnext_hdr); scratch_free(fgid_hdr);
+                    scratch_free(fsl_hdr);
+                    scratch_free(lcnt_hdr);  scratch_free(cur_hdr);
+                    scratch_free(prev_hdr);  scratch_free(ls_hdr);
+                    goto done;
+                }
+            }
+
             /* Density bail: the sequential full pass reads every row once
              * with better locality than slice-driven scattered reads. */
             if (served && total_slice > right_n / 2) served = false;
@@ -2526,12 +2719,11 @@ static bool asof_hash_group_match(uint32_t n_eq,
                 /* One ordered walk per probed first key; resolve each
                  * slice row to its full group by the remaining keys. */
                 for (int32_t f = 0; f < n_fk; f++) {
-                    const int64_t* grows =
-                        (const int64_t*)(intptr_t)fsl[2 * f];
-                    int64_t gn = fsl[2 * f + 1];
+                    const asof_idx_slice_t* s = &fsl[f];
+                    int64_t gn = s->n;
                     int32_t head = fk_head[f];
                     for (int64_t p = 0; p < gn; p++) {
-                        int64_t i = grows[p];
+                        int64_t i = asof_slice_row(s, p);
                         int32_t gid = head;
                         while (gid >= 0) {
                             const int64_t* gk =
@@ -2561,14 +2753,16 @@ static bool asof_hash_group_match(uint32_t n_eq,
                         match_orig[ls[cur[g]++].li] = prev[g];
 
                 scratch_free(ftab_hdr);  scratch_free(fhead_hdr);
-                scratch_free(fnext_hdr); scratch_free(fsl_hdr);
+                scratch_free(fnext_hdr); scratch_free(fgid_hdr);
+                scratch_free(fsl_hdr);
                 scratch_free(lcnt_hdr);  scratch_free(cur_hdr);
                 scratch_free(prev_hdr);  scratch_free(ls_hdr);
                 goto done;
             }
         }
         scratch_free(ftab_hdr);  scratch_free(fhead_hdr);
-        scratch_free(fnext_hdr); scratch_free(fsl_hdr);
+        scratch_free(fnext_hdr); scratch_free(fgid_hdr);
+        scratch_free(fsl_hdr);
         scratch_free(lcnt_hdr);  scratch_free(cur_hdr);
         scratch_free(prev_hdr);  scratch_free(ls_hdr);
         /* ineligible / dense / OOM — fall through to the scan variants */
@@ -3113,6 +3307,7 @@ static ray_t* exec_window_join_flat(ray_graph_t* g, ray_op_t* op,
                               lt_time, rt_time, lt_null, rt_null,
                               left_n, right_n,
                               ray_attr_is_sorted(rt_time_vec), rt_no_nulls,
+                              time_sym,
                               match_orig))
         goto build_output;
 

@@ -530,6 +530,9 @@ ray_op_t* ray_upper(ray_graph_t* g, ray_op_t* a)   { return make_unary(g, OP_UPP
 ray_op_t* ray_lower(ray_graph_t* g, ray_op_t* a)   { return make_unary(g, OP_LOWER, a, a->out_type == RAY_STR ? RAY_STR : RAY_SYM); }
 ray_op_t* ray_strlen(ray_graph_t* g, ray_op_t* a)  { return make_unary(g, OP_STRLEN, a, RAY_I64); }
 ray_op_t* ray_trim_op(ray_graph_t* g, ray_op_t* a) { return make_unary(g, OP_TRIM, a, a->out_type == RAY_STR ? RAY_STR : RAY_SYM); }
+ray_op_t* ray_str_find_op(ray_graph_t* g, ray_op_t* input, ray_op_t* pattern) {
+    return make_binary(g, OP_STR_FIND, input, pattern, RAY_I64);
+}
 
 ray_op_t* ray_substr(ray_graph_t* g, ray_op_t* str, ray_op_t* start, ray_op_t* len) {
     /* 3-input: str=inputs[0], start=inputs[1], len stored via literal field */
@@ -768,14 +771,13 @@ ray_op_t* ray_sort_op(ray_graph_t* g, ray_op_t* table_node,
     return &g->nodes[ext->base.id];
 }
 
-/* Shared impl for ray_group / ray_group2 / ray_group3.  agg_ins2 NULL →
- * no binary aggs; otherwise must be the same length as agg_ins (NULL
- * slots for unary aggs, non-NULL for OP_PEARSON_CORR slots).  agg_k NULL
- * → no scalar params; otherwise length n_aggs. */
-static ray_op_t* ray_group_impl(ray_graph_t* g, ray_op_t** keys, uint32_t n_keys,
-                                uint16_t* agg_ops, ray_op_t** agg_ins,
-                                ray_op_t** agg_ins2, const int64_t* agg_k,
-                                uint32_t n_aggs) {
+/* Build an OP_GROUP node.  agg_ins2 is parallel to agg_ins and is NULL
+ * when no aggregate needs a second input.  agg_k is parallel to agg_ins
+ * and is NULL when no aggregate needs a scalar parameter. */
+ray_op_t* ray_group_build(ray_graph_t* g, ray_op_t** keys, uint32_t n_keys,
+                          uint16_t* agg_ops, ray_op_t** agg_ins,
+                          ray_op_t** agg_ins2, const int64_t* agg_k,
+                          uint32_t n_aggs) {
     /* One carve for all three id arrays (key_ids/agg_ids/agg_ids2 are all
      * uint32_t, so a single flat buffer sliced by offset suffices). */
     ray_t* ids_hdr = NULL;
@@ -856,20 +858,7 @@ static ray_op_t* ray_group_impl(ray_graph_t* g, ray_op_t** keys, uint32_t n_keys
 
 ray_op_t* ray_group(ray_graph_t* g, ray_op_t** keys, uint32_t n_keys,
                    uint16_t* agg_ops, ray_op_t** agg_ins, uint32_t n_aggs) {
-    return ray_group_impl(g, keys, n_keys, agg_ops, agg_ins, NULL, NULL, n_aggs);
-}
-
-ray_op_t* ray_group2(ray_graph_t* g, ray_op_t** keys, uint32_t n_keys,
-                     uint16_t* agg_ops, ray_op_t** agg_ins,
-                     ray_op_t** agg_ins2, uint32_t n_aggs) {
-    return ray_group_impl(g, keys, n_keys, agg_ops, agg_ins, agg_ins2, NULL, n_aggs);
-}
-
-ray_op_t* ray_group3(ray_graph_t* g, ray_op_t** keys, uint32_t n_keys,
-                     uint16_t* agg_ops, ray_op_t** agg_ins,
-                     ray_op_t** agg_ins2, const int64_t* agg_k,
-                     uint32_t n_aggs) {
-    return ray_group_impl(g, keys, n_keys, agg_ops, agg_ins, agg_ins2, agg_k, n_aggs);
+    return ray_group_build(g, keys, n_keys, agg_ops, agg_ins, NULL, NULL, n_aggs);
 }
 
 ray_op_t* ray_distinct(ray_graph_t* g, ray_op_t** keys, uint32_t n_keys) {

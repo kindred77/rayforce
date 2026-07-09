@@ -1173,7 +1173,7 @@ static ray_t* diff_make_2i64_small(int64_t n, int64_t nk) {
 
 /* ── pearson (binary-agg) table builders ────────────────────────────────
  * Pearson needs TWO F64 value columns x,y.  The OP_GROUP node is built via
- * ray_group2 (the public builder that populates ext->agg_ins2[a] = y).  Both
+ * the extended builder that populates ext->agg_ins2[a] = y.  Both
  * engines read ext->agg_ins2 for the y-side, so the SAME built node executes
  * pearson under flag-off (old engine) and flag-on (v2).  Data: x,y vary at
  * different rates so per-group correlation is well-defined and varied; each
@@ -1396,7 +1396,7 @@ static ray_op_t* gb_sum_median_count(ray_graph_t* g) {
 }
 
 /* ── top_n / bot_n group builders (LIST-cell, ACC_BUFFERED) ──────────────
- * Built via ray_group3 so the OP_GROUP node carries ext->agg_k[a]=K.  The OLD
+ * Built via the extended builder so the OP_GROUP node carries ext->agg_k[a]=K.  The OLD
  * engine (flag-off) executes OP_TOP_N/OP_BOT_N on this OP_GROUP node via the
  * LIST-cell path (ray_topk_per_group_buf); v2 (flag-on, gate admits agg_k) via
  * the ACC_BUFFERED top/bot accumulators.  Both emit one LIST-typed output
@@ -1405,27 +1405,27 @@ static ray_op_t* gb_top2(ray_graph_t* g) {
     ray_op_t* k = ray_scan(g, "k"); ray_op_t* v = ray_scan(g, "v");
     uint16_t ops[] = { OP_TOP_N }; ray_op_t* ins[] = { v };
     int64_t  kk[]  = { 2 };        ray_op_t* keys[] = { k };
-    return ray_group3(g, keys, 1, ops, ins, NULL, kk, 1);
+    return ray_group_build(g, keys, 1, ops, ins, NULL, kk, 1);
 }
 static ray_op_t* gb_bot3(ray_graph_t* g) {
     ray_op_t* k = ray_scan(g, "k"); ray_op_t* v = ray_scan(g, "v");
     uint16_t ops[] = { OP_BOT_N }; ray_op_t* ins[] = { v };
     int64_t  kk[]  = { 3 };        ray_op_t* keys[] = { k };
-    return ray_group3(g, keys, 1, ops, ins, NULL, kk, 1);
+    return ray_group_build(g, keys, 1, ops, ins, NULL, kk, 1);
 }
 static ray_op_t* gb_2k_top2(ray_graph_t* g) {
     ray_op_t* k1 = ray_scan(g, "k1"); ray_op_t* k2 = ray_scan(g, "k2");
     ray_op_t* v = ray_scan(g, "v");
     uint16_t ops[] = { OP_TOP_N }; ray_op_t* ins[] = { v };
     int64_t  kk[]  = { 2 };        ray_op_t* keys[] = { k1, k2 };
-    return ray_group3(g, keys, 2, ops, ins, NULL, kk, 1);
+    return ray_group_build(g, keys, 2, ops, ins, NULL, kk, 1);
 }
 /* K=100 > every group → each cell = the full sorted group (no padding). */
 static ray_op_t* gb_top100(ray_graph_t* g) {
     ray_op_t* k = ray_scan(g, "k"); ray_op_t* v = ray_scan(g, "v");
     uint16_t ops[] = { OP_TOP_N }; ray_op_t* ins[] = { v };
     int64_t  kk[]  = { 100 };      ray_op_t* keys[] = { k };
-    return ray_group3(g, keys, 1, ops, ins, NULL, kk, 1);
+    return ray_group_build(g, keys, 1, ops, ins, NULL, kk, 1);
 }
 /* heterogeneous: sum + top2 (LIST col) + count, single I64 key. */
 static ray_op_t* gb_sum_top2_count(ray_graph_t* g) {
@@ -1434,7 +1434,7 @@ static ray_op_t* gb_sum_top2_count(ray_graph_t* g) {
     ray_op_t* ins[] = { v, v, v };
     int64_t   kk[]  = { 0, 2, 0 };
     ray_op_t* keys[] = { k };
-    return ray_group3(g, keys, 1, ops, ins, NULL, kk, 3);
+    return ray_group_build(g, keys, 1, ops, ins, NULL, kk, 3);
 }
 
 /* ── multi-key group builders ───────────────────────────────────────── */
@@ -1477,7 +1477,7 @@ static ray_op_t* gb_2k_avg(ray_graph_t* g) {
     return ray_group(g, keys, 2, ops, ins, 1);
 }
 
-/* ── pearson (binary-agg) group builders: use ray_group2 to set agg_ins2 ── */
+/* ── pearson (binary-agg) group builders: use the extended builder to set agg_ins2 ── */
 static ray_op_t* gb_pearson_1k(ray_graph_t* g) {
     ray_op_t* k = ray_scan(g, "k");
     ray_op_t* x = ray_scan(g, "x"); ray_op_t* y = ray_scan(g, "y");
@@ -1485,7 +1485,7 @@ static ray_op_t* gb_pearson_1k(ray_graph_t* g) {
     ray_op_t* ins[]  = { x };
     ray_op_t* ins2[] = { y };
     ray_op_t* keys[] = { k };
-    return ray_group2(g, keys, 1, ops, ins, ins2, 1);
+    return ray_group_build(g, keys, 1, ops, ins, ins2, NULL, 1);
 }
 static ray_op_t* gb_pearson_2k(ray_graph_t* g) {
     ray_op_t* k1 = ray_scan(g, "k1"); ray_op_t* k2 = ray_scan(g, "k2");
@@ -1494,7 +1494,7 @@ static ray_op_t* gb_pearson_2k(ray_graph_t* g) {
     ray_op_t* ins[]  = { x };
     ray_op_t* ins2[] = { y };
     ray_op_t* keys[] = { k1, k2 };
-    return ray_group2(g, keys, 2, ops, ins, ins2, 1);
+    return ray_group_build(g, keys, 2, ops, ins, ins2, NULL, 1);
 }
 /* heterogeneous: sum(x) + pearson(x,y) + count over single I64 key. */
 static ray_op_t* gb_sum_pearson_count(ray_graph_t* g) {
@@ -1504,7 +1504,7 @@ static ray_op_t* gb_sum_pearson_count(ray_graph_t* g) {
     ray_op_t* ins[]  = { x, x, x };
     ray_op_t* ins2[] = { NULL, y, NULL };
     ray_op_t* keys[] = { k };
-    return ray_group2(g, keys, 1, ops, ins, ins2, 3);
+    return ray_group_build(g, keys, 1, ops, ins, ins2, NULL, 3);
 }
 
 /* ── runner: each shape over a small AND a large (N=70000) table ────── */

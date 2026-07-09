@@ -1906,6 +1906,7 @@ static void enum_max_fn(void* arg, uint32_t wid,
 }
 
 uint32_t* build_enum_rank(ray_t* col, int64_t nrows, ray_t** hdr_out) {
+    *hdr_out = NULL;
     const void* data = ray_data(col);
     int8_t type = col->type;
     uint8_t attrs = col->attrs;
@@ -1930,6 +1931,12 @@ uint32_t* build_enum_rank(ray_t* col, int64_t nrows, ray_t** hdr_out) {
 
     if (max_id >= UINT32_MAX - 1) { *hdr_out = NULL; return NULL; }
     uint32_t n_ids = max_id + 1;
+    uint64_t row_count = nrows > 0 ? (uint64_t)nrows : 0;
+    uint64_t dense_budget = row_count > UINT64_MAX / 8u
+                          ? UINT64_MAX
+                          : row_count * 8u;
+    if ((uint64_t)n_ids > 65536u && (uint64_t)n_ids > dense_budget)
+        return NULL;
 
     /* Arena for temporaries (ids, ptrs, lens, tmp) — single reset at end */
     ray_scratch_arena_t arena;
@@ -3013,9 +3020,9 @@ static void topk_cmp_sift_down(const sort_cmp_ctx_t* ctx, int64_t* heap,
     }
 }
 
-/* Comparator-based top-K: works for any sort key types and any number of
- * keys (1..n).  Used as the fallback when radix-encoded fast-path is not
- * applicable (e.g. SYM, STR, multi-key).  O(n log K + K log K). */
+/* Comparator-based top-K: works for any comparable sort key types and any
+ * number of keys (1..n).  Used when the radix-encoded fast path is not
+ * applicable.  O(n log K + K log K). */
 static ray_t* topk_indices_cmp(ray_t** cols, uint8_t* descs, uint8_t* nfs,
                                uint8_t n_cols, int64_t nrows, int64_t k) {
     if (!cols || n_cols == 0 || k <= 0 || nrows <= 0 || k >= nrows) return NULL;
@@ -3083,9 +3090,8 @@ static ray_t* topk_indices_cmp_single(ray_t* col, uint8_t desc, uint8_t nf,
  * indices in the user's requested order.
  *
  * Supported types: I64, I32, I16, U8, BOOL, F64, DATE, TIME,
- * TIMESTAMP, plus SYM via a comparator heap.  STR/GUID fall through
- * to the caller (return NULL → caller uses full sort).  Returns NULL
- * on any unsupported configuration so the caller's fallback path
+ * TIMESTAMP, plus SYM, STR, and GUID via a comparator heap.  Returns
+ * NULL on any unsupported configuration so the caller's fallback path
  * handles it.
  * -------------------------------------------------------------------------- */
 /* Max-heap ordering for the radix bounded top-k: the "greater" (worse)
@@ -3109,11 +3115,11 @@ static ray_t* topk_indices_single(ray_t* col, uint8_t desc, uint8_t nf,
      * uint64 — exactly the cases topk can handle without a comparator. */
     bool ok = (type == RAY_I64 || type == RAY_TIMESTAMP || type == RAY_F64 ||
                type == RAY_I32 || type == RAY_DATE || type == RAY_TIME ||
-               type == RAY_SYM || type == RAY_I16 ||
-               type == RAY_BOOL || type == RAY_U8);
+               type == RAY_SYM || type == RAY_STR || type == RAY_GUID ||
+               type == RAY_I16 || type == RAY_BOOL || type == RAY_U8);
     if (!ok) return NULL;
 
-    if (type == RAY_SYM)
+    if (type == RAY_SYM || type == RAY_STR || type == RAY_GUID)
         return topk_indices_cmp_single(col, desc, nf, nrows, k);
 
     /* Encode all rows to a single uint64 key array. */
@@ -3360,8 +3366,7 @@ ray_t* topk_take_vec(ray_t* v, int64_t k, uint8_t desc) {
         return idx;
     }
 
-    /* Fallback: full sort then take.  STR / GUID / LIST / SYM-with-
-     * STR-compare reach this — still O(N log N) but correct. */
+    /* Fallback: full sort then take for unsupported inputs. */
     ray_t* sorted = desc ? ray_desc_fn(v) : ray_asc_fn(v);
     if (!sorted || RAY_IS_ERR(sorted)) return sorted;
     /* asc/desc on a concrete vector returns a LAZY handle, and
@@ -4000,6 +4005,71 @@ bool ray_key_cols_sorted(ray_t** key_cols, int64_t n_keys, uint8_t descending,
     return ordered != 0;
 }
 
+static bool sort_part_key_type(int8_t t) {
+    return t == RAY_SYM ||
+           t == RAY_BOOL || t == RAY_U8  || t == RAY_I16 ||
+           t == RAY_I32  || t == RAY_I64 || t == RAY_DATE ||
+           t == RAY_TIME || t == RAY_TIMESTAMP;
+}
+
+static void sort_note_part_order(ray_t* col, int64_t order_sym) {
+    if (!col || RAY_IS_ERR(col) || ray_index_kind(col) != RAY_IDX_PART)
+        return;
+    ray_index_payload(col->index)->u.part.order_sym = order_sym;
+}
+
+static ray_t* sort_stamp_part_col_owned(ray_t* col, int64_t order_sym) {
+    if (!col || RAY_IS_ERR(col) || (col->attrs & RAY_ATTR_HAS_NULLS) ||
+        !sort_part_key_type(col->type))
+        return NULL;
+    ray_t* w = col;
+    ray_t* r = ray_index_attach_part(&w);
+    if (!r || RAY_IS_ERR(r)) {
+        if (r && RAY_IS_ERR(r)) ray_release(r);
+        return NULL;
+    }
+    sort_note_part_order(w, order_sym);
+    return w;
+}
+
+static ray_t* sort_stamp_ordered_table(ray_t* tbl, int64_t key_id,
+                                       ray_t* key_col, int64_t order_sym) {
+    if (!key_col || (key_col->attrs & RAY_ATTR_HAS_NULLS) ||
+        !sort_part_key_type(key_col->type)) {
+        ray_retain(tbl);
+        return tbl;
+    }
+
+    ray_t* stamped = key_col;
+    ray_retain(stamped);
+    ray_t* r = ray_index_attach_part(&stamped);
+    if (!r || RAY_IS_ERR(r)) {
+        if (r && RAY_IS_ERR(r)) ray_release(r);
+        ray_release(stamped);
+        ray_retain(tbl);
+        return tbl;
+    }
+    sort_note_part_order(stamped, order_sym);
+
+    int64_t ncols = ray_table_ncols(tbl);
+    ray_t* out = ray_table_new(ncols);
+    if (!out || RAY_IS_ERR(out)) {
+        ray_release(stamped);
+        return out ? out : ray_error("oom", NULL);
+    }
+    for (int64_t c = 0; c < ncols; c++) {
+        int64_t cn = ray_table_col_name(tbl, c);
+        ray_t* col = (cn == key_id) ? stamped : ray_table_get_col_idx(tbl, c);
+        out = ray_table_add_col(out, cn, col);
+        if (!out || RAY_IS_ERR(out)) {
+            ray_release(stamped);
+            return out ? out : ray_error("oom", NULL);
+        }
+    }
+    ray_release(stamped);
+    return out;
+}
+
 /* Helper: resolve key symbols to table columns for xasc/xdesc */
 ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
     if (!tbl || tbl->type != RAY_TABLE)
@@ -4098,7 +4168,15 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
                 ray_pool_dispatch(pool, sorted_check_fn, &sctx, nrows);
             else
                 sorted_check_fn(&sctx, 0, 1, nrows);
-            if (ordered) { scratch_free(k_hdr); ray_retain(tbl); return tbl; }
+            if (ordered) {
+                ray_t* out = (descending || n_keys <= 1) ? NULL
+                    : sort_stamp_ordered_table(tbl, key_ids[0], key_cols[0],
+                                               n_keys > 1 ? key_ids[1] : -1);
+                scratch_free(k_hdr);
+                if (out) return out;
+                ray_retain(tbl);
+                return tbl;
+            }
         }
     }
 
@@ -4275,6 +4353,16 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
             if (col_names[c] == key_ids[0] && new_cols[c] &&
                 !(new_cols[c]->attrs & RAY_ATTR_HAS_NULLS)) {
                 new_cols[c]->attrs |= RAY_ATTR_SORTED;
+                break;
+            }
+        }
+    }
+    if (!descending && n_keys > 1 && sort_part_key_type(k0_type)) {
+        for (int64_t c = 0; c < ncols; c++) {
+            if (col_names[c] == key_ids[0] && new_cols[c]) {
+                ray_t* stamped = sort_stamp_part_col_owned(
+                    new_cols[c], n_keys > 1 ? key_ids[1] : -1);
+                if (stamped) new_cols[c] = stamped;
                 break;
             }
         }

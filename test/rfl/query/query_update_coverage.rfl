@@ -456,7 +456,7 @@
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; groups_to_pair_list: I32/BOOL/F64 key types (lines 131-137)
-;; via update {agg by: key}: ray_group_fn called on I32/BOOL/F64 column
+;; via update {agg by: key}: ray_group_indices_fn called on I32/BOOL/F64 column
 ;; returns dict with keys_vec of that type → groups_to_pair_list hits
 ;; the corresponding switch case at lines 131-133 (I32), 135-136 (BOOL),
 ;; 137 (F64).

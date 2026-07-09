@@ -1046,6 +1046,7 @@ ray_t* ray_index_attach_hash(ray_t** vp) {
     ix->u.hash.mask     = mask;
     ix->u.hash.n_keys   = n_keys;
     ix->u.hash.n_groups = n_groups;
+    ix->u.hash.order_sym = -1;
 
     return attach_finalize(v, idx);
 }
@@ -1882,31 +1883,37 @@ ray_t* ray_index_attach_bloom(ray_t** vp) {
 }
 
 /* --------------------------------------------------------------------------
- * Part index — contiguous ascending value-blocks
+ * Part index — contiguous value-blocks
  *
- * Build a RAY_IDX_PART index, verifying the column is laid out as contiguous,
- * ascending value-blocks.  Non-descending order is necessary AND sufficient:
- * it guarantees each distinct value occupies exactly one contiguous run.
- * v1: numeric vectors only (enforced by prepare_attach).
+ * Build a RAY_IDX_PART index. Numeric columns must be laid out as ascending
+ * value-blocks. SYM columns must be laid out as contiguous value-blocks in the
+ * column's domain id space; the block order itself is allowed to follow another
+ * comparator such as a string lexical sort.
  * -------------------------------------------------------------------------- */
 
-static ray_t* ray_index_attach_part(ray_t** vp) {
-    ray_t* v = prepare_attach(vp, "part");
+ray_t* ray_index_attach_part(ray_t** vp) {
+    ray_t* v = prepare_attach_ex(vp, "part", false, true);
     if (RAY_IS_ERR(v)) return v;
     int64_t n = v->len;
 
-    if (!vec_is_ascending(v))
+    if (v->type != RAY_SYM && !vec_is_ascending(v))
         return ray_error("domain", "parted: column is not laid out as ascending value-blocks");
+    if (v->type == RAY_SYM && (v->attrs & RAY_ATTR_HAS_NULLS)) {
+        for (int64_t i = 0; i < n; i++)
+            if (ray_vec_is_null(v, i))
+                return ray_error("domain", "parted: column contains nulls");
+    }
 
     const uint8_t* base = (const uint8_t*)ray_data(v);
     int es = numeric_elem_size(v->type);
 
-    /* Row i starts a new value-block iff it differs from i-1.  vec_is_ascending
-     * above already rejected any null/NaN, so numeric_key_word's NaN branch is
-     * unreachable here and its equality is exact for every accepted type.  Used
-     * by both the count and the fill loop so they cannot drift out of sync. */
+    /* Row i starts a new value-block iff it differs from i-1. */
     #define PART_NEW_BLOCK(i) \
-        (numeric_key_word(base, v->type, (i)) != numeric_key_word(base, v->type, (i)-1))
+        ((v->type == RAY_SYM) \
+            ? (ray_read_sym(base, (i), RAY_SYM, v->attrs) != \
+               ray_read_sym(base, (i)-1, RAY_SYM, v->attrs)) \
+            : (numeric_key_word(base, v->type, (i)) != \
+               numeric_key_word(base, v->type, (i)-1)))
 
     /* Count runs of equal values. */
     int64_t nparts = (n > 0) ? 1 : 0;
@@ -1914,16 +1921,31 @@ static ray_t* ray_index_attach_part(ray_t** vp) {
         if (PART_NEW_BLOCK(i))
             nparts++;
 
+    ray_t* seen_hdr = NULL;
+    int64_t* seen = NULL;
+    uint64_t seen_mask = 0;
+    if (v->type == RAY_SYM && nparts > 1) {
+        uint64_t cap = next_pow2((uint64_t)nparts * 2u);
+        if (cap < 8) cap = 8;
+        seen = (int64_t*)scratch_alloc(&seen_hdr, (size_t)cap * sizeof(int64_t));
+        if (!seen) return ray_error("oom", NULL);
+        for (uint64_t i = 0; i < cap; i++) seen[i] = -1;
+        seen_mask = cap - 1;
+    }
+
     int64_t cap = nparts > 0 ? nparts : 1;
     ray_t* starts = ray_vec_new(RAY_I64, cap);
     ray_t* lens   = ray_vec_new(RAY_I64, cap);
     ray_t* keys   = ray_vec_new(v->type, cap);
     if (RAY_IS_ERR(starts) || RAY_IS_ERR(lens) || RAY_IS_ERR(keys)) {
+        scratch_free(seen_hdr);
         if (!RAY_IS_ERR(starts)) ray_release(starts);
         if (!RAY_IS_ERR(lens))   ray_release(lens);
         if (!RAY_IS_ERR(keys))   ray_release(keys);
         return ray_error("oom", NULL);
     }
+    if (v->type == RAY_SYM)
+        ray_sym_vec_adopt_domain(keys, v);
     starts->len = lens->len = keys->len = nparts;
     int64_t* st = (int64_t*)ray_data(starts);
     int64_t* ln = (int64_t*)ray_data(lens);
@@ -1933,14 +1955,33 @@ static ray_t* ray_index_attach_part(ray_t** vp) {
     for (int64_t i = 1; i <= n; i++) {
         bool boundary = (i == n) || PART_NEW_BLOCK(i);
         if (boundary && n > 0) {
+            if (v->type == RAY_SYM && seen) {
+                int64_t kv = ray_read_sym(base, run_start, RAY_SYM, v->attrs);
+                uint64_t slot = mix64((uint64_t)kv) & seen_mask;
+                for (;;) {
+                    if (seen[slot] == -1) { seen[slot] = kv; break; }
+                    if (seen[slot] == kv) {
+                        scratch_free(seen_hdr);
+                        ray_release(starts); ray_release(lens); ray_release(keys);
+                        return ray_error("domain", "parted: column has repeated non-contiguous blocks");
+                    }
+                    slot = (slot + 1) & seen_mask;
+                }
+            }
             st[p] = run_start;
             ln[p] = i - run_start;
-            memcpy(kb + (size_t)p*es, base + (size_t)run_start*es, (size_t)es);
+            if (v->type == RAY_SYM) {
+                int64_t kv = ray_read_sym(base, run_start, RAY_SYM, v->attrs);
+                write_col_i64(kb, p, kv, RAY_SYM, keys->attrs);
+            } else {
+                memcpy(kb + (size_t)p*es, base + (size_t)run_start*es, (size_t)es);
+            }
             p++;
             run_start = i;
         }
     }
     #undef PART_NEW_BLOCK
+    scratch_free(seen_hdr);
 
     ray_t* idx = ray_index_alloc(RAY_IDX_PART, v->type, n);
     if (!idx || RAY_IS_ERR(idx)) {
@@ -1952,6 +1993,7 @@ static ray_t* ray_index_attach_part(ray_t** vp) {
     ix->u.part.starts  = starts;
     ix->u.part.lens    = lens;
     ix->u.part.n_parts = nparts;
+    ix->u.part.order_sym = -1;
     return attach_finalize(v, idx);
 }
 
@@ -2215,17 +2257,43 @@ static ray_t* attr_set_unique(ray_t* v) {
 }
 
 /* Build a backing index via `fn` (drop-and-rebuild through prepare_attach),
- * carrying any block-resident markers across the rebuild.  Used by grouped and
- * parted, which replace the backing index but must preserve markers such as
- * unique.  Only RAY_MARK_UNIQUE exists today; revisit the blanket carry if a
- * marker is ever added that should NOT survive replacing the backing index.
+ * carrying block-resident metadata that remains true for the unchanged row
+ * order.  Used by grouped and parted, which replace the backing index but must
+ * preserve markers such as unique and the optional within-group order marker.
  * The sorted marker lives in attrs (not the block) and survives attach. */
+static int64_t index_order_sym(ray_t* v) {
+    if (!v || RAY_IS_ERR(v) || !ray_index_has(v))
+        return -1;
+    ray_index_t* ix = ray_index_payload(v->index);
+    if (!ix || ix->built_for_len != v->len)
+        return -1;
+    if (ix->kind == RAY_IDX_HASH)
+        return ix->u.hash.order_sym;
+    if (ix->kind == RAY_IDX_PART)
+        return ix->u.part.order_sym;
+    return -1;
+}
+
+static void index_set_order_sym(ray_t* v, int64_t order_sym) {
+    if (!v || RAY_IS_ERR(v) || order_sym < 0 || !ray_index_has(v))
+        return;
+    ray_index_t* ix = ray_index_payload(v->index);
+    if (!ix || ix->built_for_len != v->len)
+        return;
+    if (ix->kind == RAY_IDX_HASH)
+        ix->u.hash.order_sym = order_sym;
+    else if (ix->kind == RAY_IDX_PART)
+        ix->u.part.order_sym = order_sym;
+}
+
 static ray_t* attach_backing_index_carry_markers(ray_t* v, ray_t* (*fn)(ray_t**)) {
     uint8_t carry = (v && !RAY_IS_ERR(v) && ray_index_has(v))
                     ? ray_index_payload(v->index)->markers : 0;
+    int64_t order_sym = index_order_sym(v);
     ray_t* w = attach_via(v, fn);
     if (w && !RAY_IS_ERR(w) && carry && (w->attrs & RAY_ATTR_HAS_INDEX))
         ray_index_payload(w->index)->markers |= carry;
+    index_set_order_sym(w, order_sym);
     return w;
 }
 

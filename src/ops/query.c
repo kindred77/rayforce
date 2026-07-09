@@ -355,6 +355,8 @@ static dag_binary_ctor resolve_binary_dag(int64_t sym_id) {
         if (memcmp(name, "ilike", 5) == 0) return ray_ilike;
     } else if (len == 6) {
         if (memcmp(name, "not-in", 6) == 0) return ray_not_in;
+    } else if (len == 8) {
+        if (memcmp(name, "str-find", 8) == 0) return ray_str_find_op;
     }
     return NULL;
 }
@@ -567,8 +569,7 @@ static ray_t* apply_sort_take(ray_t* result, ray_t** dict_elems, int64_t dict_n,
             /* No explicit GC here — every top-level statement (run_piped
              * / repl) finishes with a ray_heap_gc() that catches the
              * freed intermediates anyway.  The inner call was double-
-             * counting on benchmark loops where the same query runs
-             * back-to-back. */
+             * counting on repeated query execution. */
             ray_release(rng);
             return sliced;
         }
@@ -590,7 +591,7 @@ static ray_t* apply_sort_take(ray_t* result, ray_t** dict_elems, int64_t dict_n,
      *  - take is an atom in [1, K_MAX], where K_MAX is well under nrows.
      *  - result has no LIST columns (the topk gather handles LIST too,
      *    but skip to keep the surface area small until we have LIST
-     *    test fixtures).  Most benchmark workloads are LIST-free.
+     *    coverage shapes).  Most large grouped scans are LIST-free.
      *
      * Anything else falls through to the full-sort DAG path below. */
     if (has_sort && take_val_expr && result->type == RAY_TABLE) {
@@ -2416,7 +2417,7 @@ static int is_plain_count_expr(ray_t* expr) {
  * is_streaming_aggr_binary_call) are not needed at the planner-call
  * sites for the canonical fast path — `(pearson_corr x y)` flows
  * through is_agg_expr → is_group_dag_agg_expr → the OP_GROUP planning
- * block that emits ray_group2.  Eval-fallback (aggr_unary_per_group_buf
+ * block that emits ray_group_build.  Eval-fallback (aggr_unary_per_group_buf
  * twin for two-input shapes, LIST keys, etc.) will need them; add
  * alongside that path when it's wired. */
 
@@ -3386,7 +3387,7 @@ static ray_t* query_materialize_parted_col(ray_t* col) {
         seg_nulls |= seg->attrs & RAY_ATTR_HAS_NULLS;
         off += seg->len;
     }
-    /* Null-model invariant 16.4: parted_copy_cells copies the sentinel
+    /* Null propagation: parted_copy_cells copies the sentinel
      * bit-patterns but not the HAS_NULLS flag — OR it across segments so the
      * flat result carries it whenever any segment did. */
     flat->attrs |= seg_nulls;
@@ -3815,7 +3816,7 @@ static ray_t* count_distinct_per_group_buf(ray_t* inner_expr, ray_t* tbl,
 }
 
 /* Variant for the LIST-`groups` layout used by the eval-fallback
- * (ray_group_fn output is a 2-list of {key, idx_list} pairs).  Slices
+ * (ray_group_indices_fn output is a 2-list of {key, idx_list} pairs).  Slices
  * via ray_at_fn the same way and dispatches to exec_count_distinct. */
 static ray_t* count_distinct_per_group_groups(ray_t* inner_expr, ray_t* tbl,
                                               ray_t* groups, int64_t n_groups) {
@@ -3903,7 +3904,7 @@ static ray_t* count_distinct_per_group_groups(ray_t* inner_expr, ray_t* tbl,
         int64_t cnt = ray_len(idx_list);
         if (cnt == 0) { odata[gi] = 0; continue; }
 
-        /* idx_list from ray_group_fn is an I64 vector — gather_by_idx
+        /* idx_list from ray_group_indices_fn is an I64 vector — gather_by_idx
          * needs a raw int64_t* + count, so resolve the pointer either
          * directly (typed I64 vec) or by walking the LIST cells. */
         ray_t* subset = NULL;
@@ -3912,7 +3913,7 @@ static ray_t* count_distinct_per_group_groups(ray_t* inner_expr, ray_t* tbl,
             subset = gather_by_idx(src, (int64_t*)ray_data(idx_list), cnt);
         } else {
             /* Fallback: copy indices into a scratch buffer.  Rare path —
-             * shouldn't trigger for well-formed ray_group_fn output. */
+             * shouldn't trigger for well-formed ray_group_indices_fn output. */
             int64_t* tmp = (int64_t*)scratch_alloc(&tmp_hdr,
                 (size_t)cnt * sizeof(int64_t));
             if (!tmp) {
@@ -5847,8 +5848,8 @@ ray_t* ray_select(ray_t** args, int64_t n) {
          * column (SUM / MIN / MAX / AVG on something other than a
          * by-key).  mk_par_v2's wide composite path then reads those
          * extra inputs from the *original* wide table at the sparse
-         * positions left by the WHERE filter; for ClickBench-class
-         * 100-col tables with selective WHEREs (q30/q31 ~14%) the
+         * positions left by the WHERE filter; for very wide tables with
+         * selective WHEREs the
          * gather wastes a cache line per touched column per passing
          * row.  Count-only shapes (q14: SearchEngineID/SearchPhrase
          * keys, count of SearchPhrase) don't carry the extra agg col
@@ -5881,10 +5882,10 @@ ray_t* ray_select(ray_t** args, int64_t n) {
          * downstream group/sort/take then sees a fully-filtered table
          * — fewer rows, fewer columns, no per-row redundant work.
          *
-         * Narrowing matters: for wide tables (ClickBench's `hits` has
-         * ~100 cols) materialising the full filtered table dominates
-         * what was meant to be a cheap prefilter (single-col filter
-         * is O(passing × esz), full filter is ~50× that). */
+         * Narrowing matters: for wide tables, materialising the full
+         * filtered table dominates what was meant to be a cheap prefilter
+         * (single-col filter is O(passing × esz), full filter scales with
+         * every projected column). */
         if (where_expr && (prefilter_computed_by || prefilter_multi_key_where)) {
             /* Exact-size carve: collect_col_refs_set dedups against real
              * table columns, so ray_table_ncols(tbl) is a hard upper bound —
@@ -6068,6 +6069,8 @@ ray_t* ray_select(ray_t** args, int64_t n) {
                 break;
             }
             ray_t* col_vec = ray_eval(v);
+            if (ray_is_lazy(col_vec))
+                col_vec = ray_lazy_materialize(col_vec);
             for (int ri = 0; ri < n_refs; ri++) {
                 if (materialized_refs[ri]) {
                     ray_t* ref_col = ray_table_get_col(tbl, ref_syms[ri]);
@@ -6651,11 +6654,13 @@ by_dict_done:
          * decide whether GUID keys go to the DAG HT path or fall back
          * to eval-level. */
         int any_nonagg = 0;
-        /* Like any_nonagg but EXCLUDING count(distinct) — which is not a simple
-         * inline DAG agg yet IS served by the DAG per-group count-distinct
-         * kernel (ray_count_distinct_per_group via row_gid).  STR keys can
-         * therefore take the wide-key DAG path for pure count-distinct queries;
-         * only a genuine non-agg projection forces them to eval-level. */
+        /* Like any_nonagg but EXCLUDING literal broadcasts and count(distinct).
+         * count(distinct) is not a simple inline DAG agg yet IS served by the
+         * DAG per-group count-distinct kernel (ray_count_distinct_per_group via
+         * row_gid).  Literal broadcasts are added after grouping without row
+         * mapping.  STR keys can therefore take the wide-key DAG path for these
+         * shapes; only a genuine row-dependent non-agg projection forces them
+         * to eval-level. */
         int any_true_nonagg = 0;
         if (n_out > 0) {
             for (int64_t i = 0; i + 1 < dict_n; i += 2) {
@@ -6666,6 +6671,7 @@ by_dict_done:
                     continue;
                 if (is_group_dag_agg_expr(dict_elems[i + 1])) continue;
                 any_nonagg = 1;
+                if (can_atom_broadcast(dict_elems[i + 1])) continue;
                 if (!match_count_distinct(dict_elems[i + 1])) { any_true_nonagg = 1; break; }
                 /* count(distinct): DAG-capable, keep scanning for true non-aggs */
             }
@@ -6687,7 +6693,7 @@ by_dict_done:
                 if (kct == RAY_LIST)
                     use_eval_group = 1;
                 else if (kct == RAY_GUID && (any_nonagg || n_out == 0))
-                    /* RAY_GUID routes to eval-level ray_group_fn only
+                    /* RAY_GUID routes to eval-level ray_group_indices_fn only
                      * for (a) non-agg expression queries (existing
                      * behavior) and (b) the "no output columns" form
                      * `(select {from: t by: guid})` which otherwise
@@ -7178,7 +7184,7 @@ by_dict_done:
                     }
                 }
 
-                ray_t* groups_dict = ray_group_fn(composite_keys);
+                ray_t* groups_dict = ray_group_indices_fn(composite_keys);
                 ray_release(composite_keys);
                 if (!groups_dict || RAY_IS_ERR(groups_dict)) {
                     scratch_free(keycols_hdr);
@@ -7515,7 +7521,7 @@ by_dict_done:
              * lists. Scan the key column once, record the first
              * row index of each distinct key in a hash table, then
              * gather that index list from every other column. This
-             * avoids ray_group_fn's per-group ray_vec_append churn
+             * avoids ray_group_indices_fn's per-group ray_vec_append churn
              * which dominated the cost on 10M-row / 1M-group
              * workloads. */
             if (n_out == 0 && key_col && key_col->type == RAY_GUID) {
@@ -7693,7 +7699,7 @@ by_dict_done:
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return res;
             }
 
-            ray_t* groups_dict = ray_group_fn(key_col);
+            ray_t* groups_dict = ray_group_indices_fn(key_col);
             if (RAY_IS_ERR(groups_dict)) { if (eval_tbl != tbl) ray_release(eval_tbl); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return groups_dict; }
             /* Flatten the dict into the legacy [k0,v0,…] interleaved LIST
              * representation that the rest of this branch was written for. */
@@ -8407,7 +8413,7 @@ by_dict_done:
          * Non-agg expressions are tracked separately for post-DAG scatter.
          * agg_ins2[] is parallel to agg_ins[] — NULL for unary aggs,
          * non-NULL for binary aggs (currently OP_PEARSON_CORR).  The
-         * has_binary_agg flag selects ray_group2 below.  agg_k[] carries
+         * has_binary_agg flag selects the extended group builder below.  agg_k[] carries
          * a scalar literal alongside the column for holistic aggs that
          * need one (top/bot K, quantile probability bits); zero in
          * unrelated slots.  agg_ops/agg_ins/
@@ -8576,19 +8582,15 @@ by_dict_done:
 
         if (n_aggs > 0 || n_nonaggs > 0) {
             if (n_aggs > 0) {
-                if (has_agg_k) {
-                    /* Some holistic aggs carry a scalar param per agg.
-                     * Build a plain OP_GROUP node via ray_group3 so agg_k
-                     * is preserved. */
-                    root = ray_group3(g, key_ops, n_keys, agg_ops,
-                                       agg_ins, has_binary_agg ? agg_ins2 : NULL,
-                                       agg_k, n_aggs);
-                } else if (has_binary_agg) {
-                    /* pearson carries a 2nd input column (y) per agg.  v2
-                     * admits these and computes signed r.  Build a plain
-                     * OP_GROUP node via ray_group2 so agg_ins2 is preserved. */
-                    root = ray_group2(g, key_ops, n_keys, agg_ops,
-                                       agg_ins, agg_ins2, n_aggs);
+                if (has_agg_k || has_binary_agg) {
+                    /* Extended aggregate metadata: scalar parameters for
+                     * top/bot/quantile and optional second inputs for binary
+                     * aggregators. */
+                    root = ray_group_build(g, key_ops, n_keys, agg_ops,
+                                           agg_ins,
+                                           has_binary_agg ? agg_ins2 : NULL,
+                                           has_agg_k ? agg_k : NULL,
+                                           n_aggs);
                 } else {
                     /* Plain unary aggs (incl. max+min, median+stddev,
                      * sum+count) — v2 handles all of these.  Build a plain
@@ -8775,7 +8777,7 @@ by_dict_done:
                     ray_release(tbl);
                     scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return computed_key ? computed_key : ray_error("domain", "select by: failed to evaluate group key expression");
                 }
-                ray_t* groups2_dict = ray_group_fn(computed_key);
+                ray_t* groups2_dict = ray_group_indices_fn(computed_key);
                 if (!groups2_dict || RAY_IS_ERR(groups2_dict)) {
                     ray_release(computed_key);
                     if (filtered_tbl != tbl) ray_release(filtered_tbl);
@@ -9308,8 +9310,8 @@ by_dict_done:
                 s_n_aggs++;
             }
             if (s_has_binary)
-                root = ray_group2(g, NULL, 0, s_agg_ops, s_agg_ins,
-                                   s_agg_ins2, s_n_aggs);
+                root = ray_group_build(g, NULL, 0, s_agg_ops, s_agg_ins,
+                                       s_agg_ins2, NULL, s_n_aggs);
             else
                 root = ray_group(g, NULL, 0, s_agg_ops, s_agg_ins, s_n_aggs);
             scratch_free(sagg_hdr);
@@ -11088,12 +11090,12 @@ ray_t* ray_update(ray_t** args, int64_t n) {
         if (!grp_col) { ray_release(tbl); DICT_VIEW_CLOSE(updv); return ray_error("domain", "update by: group key column not found"); }
         int64_t nrows2 = ray_table_nrows(tbl);
 
-        /* Use ray_group_fn to get group indices: {key: [indices]}.
+        /* Use ray_group_indices_fn to get group indices: {key: [indices]}.
          * Flatten the resulting RAY_DICT into the legacy interleaved
          * [k0,v0,…] LIST shape this branch was written against. */
         ray_t* groups = NULL;
         {
-            ray_t* gd = ray_group_fn(grp_col);
+            ray_t* gd = ray_group_indices_fn(grp_col);
             if (!gd || RAY_IS_ERR(gd)) { ray_release(tbl); DICT_VIEW_CLOSE(updv); return gd ? gd : ray_error("oom", NULL); }
             groups = groups_to_pair_list(gd);
             ray_release(gd);

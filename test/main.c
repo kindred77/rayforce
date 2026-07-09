@@ -144,7 +144,6 @@ extern const test_entry_t lftj_entries[];
 extern const test_entry_t list_entries[];
 extern const test_entry_t meta_entries[];
 extern const test_entry_t morsel_entries[];
-extern const test_entry_t null_invariant_entries[];
 extern const test_entry_t numparse_entries[];
 extern const test_entry_t opt_entries[];
 extern const test_entry_t partition_exec_entries[];
@@ -195,7 +194,6 @@ static const test_entry_t* const compiled_groups[] = {
     journal_entries,
     lang_entries,     link_entries,
     lftj_entries,     list_entries,     meta_entries,     morsel_entries,
-    null_invariant_entries,
     numparse_entries, opt_entries,      partition_exec_entries,
     pipe_entries,     platform_entries,
     pool_entries,     progress_entries,

@@ -934,7 +934,319 @@ ray_t* exec_strlen(ray_graph_t* g, ray_op_t* op) {
     return result;
 }
 
+typedef struct {
+    const ray_str_t* elems;
+    const char* pool_data;
+    const ray_strpat_t* pattern;
+    int64_t* dst;
+    ray_pool_t* pool;
+    _Atomic(int) any_null;
+} str_find_parts_ctx_t;
+
+static void str_find_parts_task(void* vctx, uint32_t worker_id,
+                                int64_t lo, int64_t hi) {
+    (void)worker_id;
+    str_find_parts_ctx_t* c = (str_find_parts_ctx_t*)vctx;
+    bool any_null = false;
+    for (int64_t i = lo; i < hi; i++) {
+        if (((i - lo) & (RAY_MORSEL_ELEMS - 1)) == 0 &&
+            pool_cancelled(c->pool))
+            return;
+        const char* sp = ray_str_t_ptr(&c->elems[i], c->pool_data);
+        size_t sl = c->elems[i].len;
+        size_t pos = 0;
+        bool found = ray_strpat_find(c->pattern, sp, sl, &pos);
+        c->dst[i] = found ? (int64_t)pos : NULL_I64;
+        if (!found) any_null = true;
+    }
+    if (any_null)
+        atomic_store_explicit(&c->any_null, 1, memory_order_relaxed);
+}
+
+static bool exec_string_atom_arg(ray_t* x, const char** out, size_t* out_len) {
+    if (x->type == -RAY_STR) {
+        *out = ray_str_ptr(x);
+        *out_len = ray_str_len(x);
+        return true;
+    }
+    if (x->type == -RAY_SYM) {
+        ray_t* s = ray_sym_str(x->i64);
+        *out = s ? ray_str_ptr(s) : "";
+        *out_len = s ? ray_str_len(s) : 0;
+        return true;
+    }
+    return false;
+}
+
+ray_t* exec_str_find(ray_graph_t* g, ray_op_t* op) {
+    ray_t* input = exec_node(g, op_child(g, op, 0));
+    ray_t* pat_v = exec_node(g, op_child(g, op, 1));
+    if (!input || RAY_IS_ERR(input)) { if (pat_v && !RAY_IS_ERR(pat_v)) ray_release(pat_v); return input; }
+    if (!pat_v || RAY_IS_ERR(pat_v)) { ray_release(input); return pat_v; }
+
+    const char* pattern = NULL;
+    size_t pattern_len = 0;
+    if (!exec_string_atom_arg(pat_v, &pattern, &pattern_len)) {
+        ray_release(input);
+        ray_release(pat_v);
+        return ray_error("type", "str-find: pattern must be string or symbol atom");
+    }
+    ray_strpat_t search;
+    if (!ray_strpat_compile(pattern, pattern_len, &search)) {
+        ray_release(input);
+        ray_release(pat_v);
+        return ray_error("domain", "str-find: '*' is not supported in search patterns");
+    }
+
+    if (input->type != RAY_STR && input->type != RAY_SYM) {
+        ray_release(input);
+        ray_release(pat_v);
+        return ray_error("type", "str-find: expected string or symbol vector");
+    }
+
+    int64_t nrows = input->len;
+    ray_t* result = ray_vec_new(RAY_I64, nrows);
+    if (!result || RAY_IS_ERR(result)) {
+        ray_release(input);
+        ray_release(pat_v);
+        return result ? result : ray_error("oom", NULL);
+    }
+    result->len = nrows;
+    int64_t* dst = (int64_t*)ray_data(result);
+
+    if (input->type == RAY_STR) {
+        const ray_str_t* elems = NULL;
+        const char* pool_data = NULL;
+        str_resolve(input, &elems, &pool_data);
+        ray_pool_t* pool = nrows >= RAY_PARALLEL_THRESHOLD ? ray_pool_get() : NULL;
+        str_find_parts_ctx_t ctx = {
+            .elems = elems,
+            .pool_data = pool_data,
+            .pattern = &search,
+            .dst = dst,
+            .pool = pool
+        };
+        atomic_init(&ctx.any_null, 0);
+
+        if (pool && ray_pool_total_workers(pool) >= 2)
+            ray_pool_dispatch(pool, str_find_parts_task, &ctx, nrows);
+        else
+            str_find_parts_task(&ctx, 0, 0, nrows);
+
+        if (pool_cancelled(pool)) {
+            ray_release(result);
+            ray_release(input);
+            ray_release(pat_v);
+            return ray_error("cancel", NULL);
+        }
+        if (atomic_load_explicit(&ctx.any_null, memory_order_relaxed))
+            result->attrs |= RAY_ATTR_HAS_NULLS;
+        ray_release(input);
+        ray_release(pat_v);
+        return result;
+    }
+
+    bool any_null = false;
+    for (int64_t i = 0; i < nrows; i++) {
+        if ((i & (RAY_MORSEL_ELEMS - 1)) == 0 && pool_cancelled(NULL)) {
+            ray_release(result);
+            ray_release(input);
+            ray_release(pat_v);
+            return ray_error("cancel", NULL);
+        }
+        const char* sp = NULL;
+        size_t sl = 0;
+        sym_elem(input, i, &sp, &sl);
+        size_t pos = 0;
+        bool found = ray_strpat_find(&search, sp, sl, &pos);
+        dst[i] = found ? (int64_t)pos : NULL_I64;
+        if (!found) any_null = true;
+    }
+    if (any_null) result->attrs |= RAY_ATTR_HAS_NULLS;
+    ray_release(input);
+    ray_release(pat_v);
+    return result;
+}
+
 /* SUBSTR(str, start, len) — 1-based start */
+static bool substr_scalar_arg(ray_t* v, int64_t* out) {
+    if (!v || RAY_IS_ERR(v)) return false;
+    if (ray_is_atom(v)) {
+        if (RAY_ATOM_IS_NULL(v)) return false;
+        switch (v->type) {
+        case -RAY_I64:  *out = v->i64; return true;
+        case -RAY_I32:  *out = (int64_t)v->i32; return true;
+        case -RAY_I16:  *out = (int64_t)v->i16; return true;
+        case -RAY_U8:
+        case -RAY_BOOL: *out = (int64_t)v->u8; return true;
+        case -RAY_F64:  *out = (int64_t)v->f64; return true;
+        default: return false;
+        }
+    }
+    if (!ray_is_vec(v) || v->len != 1 || (v->attrs & RAY_ATTR_HAS_NULLS))
+        return false;
+    switch (v->type) {
+    case RAY_I64:  *out = ((int64_t*)ray_data(v))[0]; return true;
+    case RAY_I32:  *out = (int64_t)((int32_t*)ray_data(v))[0]; return true;
+    case RAY_I16:  *out = (int64_t)((int16_t*)ray_data(v))[0]; return true;
+    case RAY_U8:
+    case RAY_BOOL: *out = (int64_t)((uint8_t*)ray_data(v))[0]; return true;
+    case RAY_F64:  *out = (int64_t)((double*)ray_data(v))[0]; return true;
+    default: return false;
+    }
+}
+
+static ray_t* substr_str_scalar_view(ray_t* input, int64_t start, int64_t length) {
+    if (!input || input->type != RAY_STR || (input->attrs & RAY_ATTR_HAS_NULLS))
+        return NULL;
+
+    int64_t nrows = input->len;
+    ray_t* result = ray_vec_new(RAY_STR, nrows);
+    if (!result || RAY_IS_ERR(result)) return result ? result : ray_error("oom", NULL);
+    result->len = nrows;
+
+    const ray_str_t* src = NULL;
+    const char* pool = NULL;
+    str_resolve(input, &src, &pool);
+    ray_t* owner = (input->attrs & RAY_ATTR_SLICE) ? input->slice_parent : input;
+    ray_t* pool_obj = owner ? owner->str_pool : NULL;
+    if (pool_obj && !RAY_IS_ERR(pool_obj)) {
+        ray_retain(pool_obj);
+        result->str_pool = pool_obj;
+    }
+
+    ray_str_t* dst = (ray_str_t*)ray_data(result);
+    for (int64_t i = 0; i < nrows; i++) {
+        const ray_str_t* s = &src[i];
+        ray_str_t* d = &dst[i];
+        memset(d, 0, sizeof(*d));
+
+        int64_t st = start - 1;
+        int64_t sl = (int64_t)s->len;
+        if (st < 0) st = 0;
+        if (st >= sl) continue;
+
+        int64_t ln = length;
+        if (ln < 0 || ln > sl - st) ln = sl - st;
+        if (ln <= 0) continue;
+
+        d->len = (uint32_t)ln;
+        if (!ray_str_is_inline(s) && !pool) {
+            ray_release(result);
+            return NULL;
+        }
+        const char* sp = ray_str_t_ptr(s, pool) + st;
+        if (ln <= RAY_STR_INLINE_MAX) {
+            memcpy(d->data, sp, (size_t)ln);
+        } else if (!ray_str_is_inline(s) && pool_obj) {
+            if ((uint64_t)s->pool_off + (uint64_t)st > UINT32_MAX) {
+                ray_release(result);
+                return ray_error("range", "substr: pool offset exceeds %lld bytes", (long long)UINT32_MAX);
+            }
+            memcpy(d->prefix, sp, 4);
+            d->pool_off = s->pool_off + (uint32_t)st;
+        } else {
+            ray_release(result);
+            return NULL;
+        }
+    }
+
+    return result;
+}
+
+static bool substr_len_at(ray_t* len_v, int64_t row, int64_t* out) {
+    if (!len_v || !out) return false;
+    if (len_v->attrs & RAY_ATTR_HAS_NULLS) {
+        if (ray_vec_is_null(len_v, row)) return false;
+    }
+    switch (len_v->type) {
+    case RAY_I64: {
+        int64_t v = ((const int64_t*)ray_data(len_v))[row];
+        if (v == NULL_I64) return false;
+        *out = v;
+        return true;
+    }
+    case RAY_I32: {
+        int32_t v = ((const int32_t*)ray_data(len_v))[row];
+        if (v == NULL_I32) return false;
+        *out = (int64_t)v;
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+static ray_t* substr_str_scalar_start_len_view(ray_t* input,
+                                               int64_t start,
+                                               ray_t* len_v) {
+    if (!input || input->type != RAY_STR || !len_v ||
+        (input->attrs & RAY_ATTR_HAS_NULLS))
+        return NULL;
+    if (len_v->type != RAY_I64 && len_v->type != RAY_I32)
+        return NULL;
+    int64_t nrows = input->len;
+    if (len_v->len != nrows)
+        return NULL;
+
+    ray_t* result = ray_vec_new(RAY_STR, nrows);
+    if (!result || RAY_IS_ERR(result)) return result ? result : ray_error("oom", NULL);
+    result->len = nrows;
+
+    const ray_str_t* src = NULL;
+    const char* pool = NULL;
+    str_resolve(input, &src, &pool);
+    ray_t* owner = (input->attrs & RAY_ATTR_SLICE) ? input->slice_parent : input;
+    ray_t* pool_obj = owner ? owner->str_pool : NULL;
+    if (pool_obj && !RAY_IS_ERR(pool_obj)) {
+        ray_retain(pool_obj);
+        result->str_pool = pool_obj;
+    }
+
+    ray_str_t* dst = (ray_str_t*)ray_data(result);
+    int64_t st0 = start - 1;
+    if (st0 < 0) st0 = 0;
+    for (int64_t i = 0; i < nrows; i++) {
+        ray_str_t* d = &dst[i];
+        memset(d, 0, sizeof(*d));
+
+        int64_t ln = 0;
+        if (!substr_len_at(len_v, i, &ln)) {
+            ray_vec_set_null(result, i, true);
+            continue;
+        }
+
+        const ray_str_t* s = &src[i];
+        int64_t sl = (int64_t)s->len;
+        if (st0 >= sl) continue;
+
+        if (ln < 0 || ln > sl - st0) ln = sl - st0;
+        if (ln <= 0) continue;
+
+        d->len = (uint32_t)ln;
+        if (!ray_str_is_inline(s) && !pool) {
+            ray_release(result);
+            return NULL;
+        }
+        const char* sp = ray_str_t_ptr(s, pool) + st0;
+        if (ln <= RAY_STR_INLINE_MAX) {
+            memcpy(d->data, sp, (size_t)ln);
+        } else if (!ray_str_is_inline(s) && pool_obj) {
+            if ((uint64_t)s->pool_off + (uint64_t)st0 > UINT32_MAX) {
+                ray_release(result);
+                return ray_error("range", "substr: pool offset exceeds %lld bytes", (long long)UINT32_MAX);
+            }
+            memcpy(d->prefix, sp, 4);
+            d->pool_off = s->pool_off + (uint32_t)st0;
+        } else {
+            ray_release(result);
+            return NULL;
+        }
+    }
+
+    return result;
+}
+
 ray_t* exec_substr(ray_graph_t* g, ray_op_t* op) {
     ray_t* input = exec_node(g, op_child(g, op, 0));
     ray_t* start_v = exec_node(g, op_child(g, op, 1));
@@ -948,6 +1260,30 @@ ray_t* exec_substr(ray_graph_t* g, ray_op_t* op) {
 
     int64_t nrows = input->len;
     bool is_str = (input->type == RAY_STR);
+
+    if (is_str) {
+        int64_t s_const = 0, l_const = 0;
+        if (substr_scalar_arg(start_v, &s_const) &&
+            substr_scalar_arg(len_v, &l_const)) {
+            ray_t* view = substr_str_scalar_view(input, s_const, l_const);
+            if (view) {
+                ray_release(input);
+                ray_release(start_v);
+                ray_release(len_v);
+                return view;
+            }
+        }
+        if (substr_scalar_arg(start_v, &s_const) &&
+            !ray_is_atom(len_v) && len_v->len == nrows) {
+            ray_t* view = substr_str_scalar_start_len_view(input, s_const, len_v);
+            if (view) {
+                ray_release(input);
+                ray_release(start_v);
+                ray_release(len_v);
+                return view;
+            }
+        }
+    }
 
     ray_t* result;
     if (is_str) {

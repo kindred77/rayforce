@@ -1330,7 +1330,7 @@ static void expr_exec_unary(uint8_t opcode, uint8_t null_aware, int8_t dt, void*
                         d[j] = (a[j] > 0.0) - (a[j] < 0.0);
                 return;
             }
-            /* Null-model invariant 16.4: INT64_MIN == NULL_I64 is the reserved
+            /* Null propagation: INT64_MIN == NULL_I64 is the reserved
              * null sentinel and must NOT be produced as a real clamp value
              * (it would read back as null).  Clamp the negative-overflow
              * floor to INT64_MIN+1 — the most-negative *representable*
@@ -1537,7 +1537,7 @@ static void* expr_eval_morsel(const ray_expr_t* expr, void** scratch,
  * the per-chunk [min,max] extrema alone — without reading a single column
  * value.  This recovers the block-skip the deleted OP_FILTERED_GROUP operator
  * provided, but as a general property of the fused evaluator (every BOOL
- * expression benefits; nothing is benchmark-shaped).
+ * expression benefits; nothing is tied to one workload shape).
  *
  * The decision is tri-state per register during a walk of the compiled
  * instruction list:  1 = all-pass, 0 = all-fail, mixed/none = undecided.
@@ -1796,7 +1796,7 @@ static bool expr_last_op_overflows_i64(const ray_expr_t* expr) {
 
 /* The fused binary path writes NULL_I64 for an i64 DIV/IDIV/MOD whose
  * divisor is zero (or the INT64_MIN/-1 overflow case) — null-model
- * invariant 16.4 requires HAS_NULLS set when that sentinel lands.  When the
+ * null handling requires HAS_NULLS set when that sentinel lands.  When the
  * output register is already marked `nullable` the conservative flag below
  * covers it; this detector handles the case where it is not, reusing the
  * mark_i64_overflow_as_null scan (which flips HAS_NULLS for any NULL_I64

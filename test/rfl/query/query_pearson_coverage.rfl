@@ -3,7 +3,7 @@
 ;;   Non-by scalar reduction with pearson_corr (lines ~6854-6916):
 ;;     `(select {r: (pearson_corr x y) from: T})`
 ;;     Lines 6878-6909: iterate dict, op=OP_PEARSON_CORR → compile second input,
-;;     set s_has_binary, lines 6912-6914: call ray_group2 with s_has_binary.
+;;     set s_has_binary and route through the extended group builder.
 ;;
 ;;   By-group pearson_corr (lines ~5904-5929):
 ;;     Lines 5925-5929: op==OP_PEARSON_CORR in agg compilation loop.
@@ -12,7 +12,7 @@
 ;; ────────────────────────────────────────────────────────────────────
 ;; Non-by scalar reduction: pearson_corr
 ;; Lines 6896-6909: op==OP_PEARSON_CORR → compile second input + s_has_binary=1
-;; Lines 6912-6914: ray_group2 called (s_has_binary branch)
+;; Binary aggregate branch routes through the extended group builder.
 ;; ────────────────────────────────────────────────────────────────────
 (set Tp1 (table [x y] (list [1 2 3 4 5] [2 4 6 8 10])))
 ;; Non-by select with pearson_corr → returns 1-row table

@@ -654,7 +654,7 @@ ray_t* ray_log_close_fn(ray_t** args, int64_t n);
 ray_t* ray_log_purge_fn(ray_t** args, int64_t n);
 
 /* Group (formerly static in eval.c, now extern for query.c) */
-ray_t* ray_group_fn(ray_t* x);
+ray_t* ray_group_indices_fn(ray_t* x);
 
 /* I/O and formatting builtins (formerly in eval.c, now in ops/builtins.c) */
 ray_t* ray_println_fn(ray_t** args, int64_t n);

@@ -56,8 +56,7 @@ typedef struct {
     double sum_f, min_f, max_f, prod_f, first_f, last_f, sum_sq_f;
     int64_t sum_i, min_i, max_i, prod_i, first_i, last_i, sum_sq_i;
     /* Parallel f64 sum of the integer stream — used by AVG so the
-     * mean of an i64 column whose sum exceeds 2^63 (e.g. ClickBench
-     * UserID, signed values around ±9e18 × 10^7 rows) stays accurate
+     * mean of an i64 column whose sum exceeds 2^63 stays accurate
      * instead of being whatever (uint64) wrap left in sum_i. */
     double sum_d;
     int64_t cnt;
@@ -3406,6 +3405,23 @@ static void group_ht_rehash(group_ht_t* ht, const int8_t* key_types) {
     }
 }
 
+static void group_ht_rebuild_slots(group_ht_t* ht, const int8_t* key_types) {
+    if (!ht->slots || ht->ht_cap == 0) return;
+    memset(ht->slots, 0xFF, (size_t)ht->ht_cap * sizeof(uint32_t));
+    uint32_t mask = ht->ht_cap - 1;
+    uint16_t rs = ht->layout.row_stride;
+    uint16_t nk = ht->layout.n_keys;
+    for (uint32_t gi = 0; gi < ht->grp_count; gi++) {
+        const int64_t* row_keys = (const int64_t*)(ht->rows + (size_t)gi * rs + 8);
+        uint64_t h = hash_keys_inline(row_keys, key_types, nk, ht->key_data,
+                                      &ht->layout, ht->key_pool);
+        uint32_t slot = (uint32_t)(h & mask);
+        while (ht->slots[slot] != HT_EMPTY)
+            slot = (slot + 1) & mask;
+        ht->slots[slot] = HT_PACK(HT_SALT(h), gi);
+    }
+}
+
 /* Null-aware accumulator variants (defined below).  Reached only when the
  * layout carries a nullable agg (ly->any_agg_null) — a single hoisted,
  * perfectly-predicted branch, so the null-free hot path is byte-for-byte
@@ -5617,6 +5633,40 @@ static ray_t* materialize_broadcast_input(ray_t* src, int64_t nrows) {
     }
 }
 
+static bool sum_atom_value(ray_t* x, bool* is_f64, double* out_f64, int64_t* out_i64) {
+    if (!x || RAY_IS_ERR(x) || !ray_is_atom(x) || RAY_ATOM_IS_NULL(x))
+        return false;
+    switch (x->type) {
+        case -RAY_F64:
+            *is_f64 = true;
+            *out_f64 = x->f64;
+            return true;
+        case -RAY_I64:
+        case -RAY_DATE:
+        case -RAY_TIME:
+        case -RAY_TIMESTAMP:
+        case -RAY_SYM:
+            *is_f64 = false;
+            *out_i64 = x->i64;
+            return true;
+        case -RAY_I32:
+            *is_f64 = false;
+            *out_i64 = x->i32;
+            return true;
+        case -RAY_I16:
+            *is_f64 = false;
+            *out_i64 = x->i16;
+            return true;
+        case -RAY_U8:
+        case -RAY_BOOL:
+            *is_f64 = false;
+            *out_i64 = x->u8;
+            return true;
+        default:
+            return false;
+    }
+}
+
 /* agg_int_null_sentinel_for moved to internal.h (shared with pivot.c). */
 
 /* Fused SUM/AVG(a*b) per-row product — both sides promoted to double,
@@ -6397,7 +6447,7 @@ static void reprobe_rows_fn(void* vctx, uint32_t worker_id,
         uint32_t part = RADIX_PART(h);
         uint32_t local = group_ht_lookup_gid(&c->part_hts[part], h,
                                               lookup_keys, key_types);
-        if (local == UINT32_MAX) {
+        if (local == UINT32_MAX || local >= c->part_hts[part].grp_count) {
             c->row_gid[row] = -1;
         } else {
             c->row_gid[row] = (int64_t)c->part_offsets[part] + (int64_t)local;
@@ -6439,7 +6489,7 @@ static void med_idx_hist_fn(void* vctx, uint32_t worker_id,
     const int64_t* row_gid = c->row_gid;
     for (int64_t r = r_lo; r < r_hi; r++) {
         int64_t gi = row_gid[r];
-        if (gi >= 0) hist[gi]++;
+        if (gi >= 0 && gi < c->n_groups) hist[gi]++;
     }
 }
 
@@ -6456,7 +6506,7 @@ static void med_idx_scat_fn(void* vctx, uint32_t worker_id,
     int64_t* idx_buf = c->idx_buf;
     for (int64_t r = r_lo; r < r_hi; r++) {
         int64_t gi = row_gid[r];
-        if (gi >= 0) idx_buf[cur[gi]++] = r;
+        if (gi >= 0 && gi < c->n_groups) idx_buf[cur[gi]++] = r;
     }
 }
 
@@ -7026,7 +7076,7 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
                     seg_nulls |= seg->attrs & RAY_ATTR_HAS_NULLS;
                     offset += seg->len;
                 }
-                /* Invariant 16.4: propagate HAS_NULLS across segments. */
+                /* Null propagation: propagate HAS_NULLS across segments. */
                 flat->attrs |= seg_nulls;
             }
             if (!flat || RAY_IS_ERR(flat)) {
@@ -7821,12 +7871,11 @@ static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                 ins2[a] = (ext->agg_ins2 && ext->agg_ins2[a] != RAY_OP_NONE)
                     ? op_node(g, ext->agg_ins2[a]) : NULL;
             }
-            if (hask)
-                op2 = ray_group3(g, keys, ext->n_keys, ext->agg_ops, ins,
-                                 has2 ? ins2 : NULL, ext->agg_k, ext->n_aggs);
-            else if (has2)
-                op2 = ray_group2(g, keys, ext->n_keys, ext->agg_ops, ins,
-                                 ins2, ext->n_aggs);
+            if (hask || has2)
+                op2 = ray_group_build(g, keys, ext->n_keys, ext->agg_ops, ins,
+                                      has2 ? ins2 : NULL,
+                                      hask ? ext->agg_k : NULL,
+                                      ext->n_aggs);
             else
                 op2 = ray_group(g, keys, ext->n_keys, ext->agg_ops, ins,
                                 ext->n_aggs);
@@ -8182,9 +8231,9 @@ dyn_dense_done:
 /* Pin the DA-prescan dense-group finalize alignment.  This function owns the
  * dict/dense-array (DA) group path whose finalize loop (the total_groups /
  * keep_min / range_count compaction region below, ~line 8395-8475, family
- * da_count_emit_keep_min_u32) is the sole hot symbol for ClickBench q34
- * (group-by-URL + count + desc-sort + take 10), 66% of self cycles.  Task 1
- * of the unbounded-slots cut added ~230 net lines ELSEWHERE in group.c
+ * da_count_emit_keep_min_u32) is the dominant symbol for high-cardinality
+ * group-by + count + desc-sort + take shapes.  The unbounded-slots work
+ * added lines elsewhere in group.c
  * (the legacy ght_layout_t hash path — unrelated, byte-identical to baseline
  * at the hot lines), shifting this loop's absolute address/alignment and
  * dropping IPC 2.07→1.96 (+7.2% cycles, +1.6% instructions — a placement
@@ -8748,6 +8797,150 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 agg_types[a] = 0;
                 sc_int_null_sentinel[a] = 0;
                 sc_int_null_has[a] = false;
+            }
+        }
+
+        if (!match_idx && !rowsel && !sc_any_nullable && n_aggs > 1) {
+            ray_t* base_col = NULL;
+            const void* base_ptr = NULL;
+            int8_t base_type = 0;
+            int64_t base_len = 0;
+            bool one_base_input = true;
+            for (uint32_t a = 0; a < n_aggs; a++) {
+                uint16_t aop = ext->agg_ops[a];
+                if (aop != OP_SUM && aop != OP_AVG) { one_base_input = false; break; }
+                if (agg_prod[a].enabled || agg_strlen[a]) {
+                    one_base_input = false;
+                    break;
+                }
+
+                const void* slot_ptr = NULL;
+                int8_t slot_type = 0;
+                int64_t slot_len = nrows;
+                if (agg_vecs[a] && agg_ptrs[a]) {
+                    if (!agg_type_admitted(OP_SUM, agg_vecs[a]->type)) {
+                        one_base_input = false;
+                        break;
+                    }
+                    slot_ptr = agg_ptrs[a];
+                    slot_type = agg_vecs[a]->type;
+                    slot_len = agg_vecs[a]->len;
+                    if (!base_col) base_col = agg_vecs[a];
+                } else if (agg_linear[a].enabled &&
+                           agg_linear[a].n_terms == 1 &&
+                           agg_linear[a].coeff_i64[0] == 1 &&
+                           agg_linear[a].bias_i64 == 0 &&
+                           agg_linear[a].term_ptrs[0]) {
+                    if (!agg_type_admitted(OP_SUM, agg_linear[a].term_types[0])) {
+                        one_base_input = false;
+                        break;
+                    }
+                    slot_ptr = agg_linear[a].term_ptrs[0];
+                    slot_type = agg_linear[a].term_types[0];
+                } else {
+                    one_base_input = false;
+                    break;
+                }
+
+                if (!base_ptr) {
+                    base_ptr = slot_ptr;
+                    base_type = slot_type;
+                    base_len = slot_len;
+                } else if (slot_ptr != base_ptr || slot_type != base_type ||
+                           slot_len != base_len) {
+                    one_base_input = false;
+                    break;
+                }
+            }
+
+            if (one_base_input && base_col) {
+                ray_t* base_sum_obj = ray_sum_fn(base_col);
+                if (!base_sum_obj || RAY_IS_ERR(base_sum_obj)) {
+                    scratch_free(sc_vla_hdr);
+                    for (uint32_t a = 0; a < n_aggs; a++)
+                        { if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]); if (agg_owned2[a] && agg_vecs2[a]) ray_release(agg_vecs2[a]); }
+                    for (uint32_t k = 0; k < n_keys; k++)
+                        if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+                    if (match_idx_block) ray_release(match_idx_block);
+                    scratch_free(vla_hdr);
+                    return base_sum_obj ? base_sum_obj : ray_error("oom", NULL);
+                }
+                if (ray_is_lazy(base_sum_obj))
+                    base_sum_obj = ray_lazy_materialize(base_sum_obj);
+                if (!base_sum_obj || RAY_IS_ERR(base_sum_obj)) {
+                    scratch_free(sc_vla_hdr);
+                    for (uint32_t a = 0; a < n_aggs; a++)
+                        { if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]); if (agg_owned2[a] && agg_vecs2[a]) ray_release(agg_vecs2[a]); }
+                    for (uint32_t k = 0; k < n_keys; k++)
+                        if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+                    if (match_idx_block) ray_release(match_idx_block);
+                    scratch_free(vla_hdr);
+                    return base_sum_obj ? base_sum_obj : ray_error("oom", NULL);
+                }
+
+                bool base_is_f64 = false;
+                double base_sum_f64 = 0.0;
+                int64_t base_sum_i64 = 0;
+                if (sum_atom_value(base_sum_obj, &base_is_f64,
+                                   &base_sum_f64, &base_sum_i64)) {
+                    ray_t *sum_hdr = NULL, *cnt_hdr = NULL;
+                    double* sums_f64 = NULL;
+                    int64_t* sums_i64 = NULL;
+                    if (base_is_f64)
+                        sums_f64 = (double*)scratch_alloc(&sum_hdr,
+                            (size_t)n_aggs * sizeof(double));
+                    else
+                        sums_i64 = (int64_t*)scratch_alloc(&sum_hdr,
+                            (size_t)n_aggs * sizeof(int64_t));
+                    int64_t* counts = (int64_t*)scratch_alloc(&cnt_hdr,
+                        sizeof(int64_t));
+                    if ((base_is_f64 ? (sums_f64 != NULL) : (sums_i64 != NULL)) &&
+                        counts) {
+                        if (base_is_f64) {
+                            for (uint32_t a = 0; a < n_aggs; a++)
+                                sums_f64[a] = base_sum_f64;
+                        } else {
+                            for (uint32_t a = 0; a < n_aggs; a++)
+                                sums_i64[a] = base_sum_i64;
+                        }
+                        counts[0] = nrows;
+
+                        ray_t* result = ray_table_new(n_aggs);
+                        if (!result || RAY_IS_ERR(result)) {
+                            scratch_free(sum_hdr);
+                            scratch_free(cnt_hdr);
+                            ray_release(base_sum_obj);
+                            scratch_free(sc_vla_hdr);
+                            for (uint32_t a = 0; a < n_aggs; a++)
+                                { if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]); if (agg_owned2[a] && agg_vecs2[a]) ray_release(agg_vecs2[a]); }
+                            for (uint32_t k = 0; k < n_keys; k++)
+                                if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+                            if (match_idx_block) ray_release(match_idx_block);
+                            scratch_free(vla_hdr);
+                            return result ? result : ray_error("oom", NULL);
+                        }
+
+                        emit_agg_columns(&result, g, ext, agg_vecs, 1, n_aggs,
+                                         sums_f64, sums_i64,
+                                         NULL, NULL, NULL, NULL,
+                                         counts, agg_affine, agg_prod,
+                                         NULL, NULL);
+                        scratch_free(sum_hdr);
+                        scratch_free(cnt_hdr);
+                        ray_release(base_sum_obj);
+                        scratch_free(sc_vla_hdr);
+                        for (uint32_t a = 0; a < n_aggs; a++)
+                            { if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]); if (agg_owned2[a] && agg_vecs2[a]) ray_release(agg_vecs2[a]); }
+                        for (uint32_t k = 0; k < n_keys; k++)
+                            if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+                        if (match_idx_block) ray_release(match_idx_block);
+                        scratch_free(vla_hdr);
+                        return result;
+                    }
+                    scratch_free(sum_hdr);
+                    scratch_free(cnt_hdr);
+                }
+                ray_release(base_sum_obj);
             }
         }
 
@@ -10836,11 +11029,13 @@ v2_emit:;
                         keep_n[p] = (uint16_t)(kn + 1);
                     }
                     /* In-place compact each partition. */
+                    bool rebuilt_slots = false;
                     for (uint32_t p = 0; p < RADIX_P; p++) {
                         group_ht_t* ph = &part_hts[p];
                         uint16_t rs = ph->layout.row_stride;
                         uint16_t kn = keep_n[p];
                         if (kn == ph->grp_count) continue;  /* all kept */
+                        rebuilt_slots = true;
                         if (kn == 0) { ph->grp_count = 0; continue; }
                         for (uint16_t i = 0; i < kn; i++) {
                             uint32_t src = kgid[p][i];
@@ -10849,6 +11044,10 @@ v2_emit:;
                                     ph->rows + (size_t)src * rs, rs);
                         }
                         ph->grp_count = kn;
+                    }
+                    if (rebuilt_slots) {
+                        for (uint32_t p = 0; p < RADIX_P; p++)
+                            group_ht_rebuild_slots(&part_hts[p], key_types);
                     }
                 }
             }
@@ -11002,6 +11201,7 @@ v2_emit:;
             int64_t* row_gid = (int64_t*)scratch_alloc(&rg_hdr,
                 (size_t)nrows * sizeof(int64_t));
             if (!row_gid) { result = ray_error("oom", NULL); goto cleanup; }
+            memset(row_gid, 0xff, (size_t)nrows * sizeof(int64_t));
 
             uint8_t reprobe_nullable = 0;   /* 0/1: any key may be null */
             for (uint32_t k = 0; k < n_keys; k++)
@@ -12386,7 +12586,7 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                 }
             }
 
-            /* Invariant 16.4: propagate HAS_NULLS from copied sources. */
+            /* Null propagation: propagate HAS_NULLS from copied sources. */
             flat->attrs |= src_nulls;
             merge_tbl = ray_table_add_col(merge_tbl, key_syms[k], flat);
             ray_release(flat);
@@ -12452,7 +12652,7 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                 }
             }
 
-            /* Invariant 16.4: propagate HAS_NULLS from copied sources. */
+            /* Null propagation: propagate HAS_NULLS from copied sources. */
             flat->attrs |= src_nulls;
             merge_tbl = ray_table_add_col(merge_tbl, agg_name_ids[a], flat);
             ray_release(flat);

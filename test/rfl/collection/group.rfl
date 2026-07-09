@@ -151,7 +151,7 @@
 ;; historically capped unique groups at the initial 1024-slot kblock
 ;; with no resizing — once `ngroups >= max_groups` it returned
 ;; `error: limit`.  Multi-key non-agg `select-by` builds a composite
-;; LIST of LISTs and routes through this path; on H2O K=100 datasets
+;; LIST of LISTs and routes through this path; on wide grouped datasets
 ;; the cartesian product of two 100-cardinality keys reaches up to
 ;; 10k groups, so the cap fires on real workloads.  Verify that
 ;; >1024 unique LIST keys group correctly.

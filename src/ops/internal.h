@@ -1391,6 +1391,7 @@ ray_t* exec_strlen(ray_graph_t* g, ray_op_t* op);
 ray_t* exec_substr(ray_graph_t* g, ray_op_t* op);
 ray_t* exec_replace(ray_graph_t* g, ray_op_t* op);
 ray_t* exec_concat(ray_graph_t* g, ray_op_t* op);
+ray_t* exec_str_find(ray_graph_t* g, ray_op_t* op);
 
 /* ── exec.c ── */
 ray_t* materialize_mapcommon(ray_t* mc);

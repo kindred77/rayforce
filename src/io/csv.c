@@ -72,7 +72,8 @@
  * -------------------------------------------------------------------------- */
 
 #define CSV_MAX_COLS      256
-#define CSV_SAMPLE_ROWS   100
+#define CSV_SAMPLE_ROWS   4096
+#define CSV_STR_DISTINCT_MIN 256
 #define CSV_PART_ROWS_DEFAULT 1000000
 
 /* --------------------------------------------------------------------------
@@ -106,6 +107,12 @@ static inline void* scratch_realloc(ray_t** hdr_out, size_t old_bytes, size_t ne
     return new_p;
 }
 
+static inline void* scratch_calloc(ray_t** hdr_out, size_t nbytes) {
+    void* p = scratch_alloc(hdr_out, nbytes);
+    if (p) memset(p, 0, nbytes);
+    return p;
+}
+
 static inline void scratch_free(ray_t* hdr) {
     if (hdr) ray_free(hdr);
 }
@@ -119,6 +126,11 @@ typedef struct {
     const char* ptr;
     uint32_t    len;
 } csv_strref_t;
+
+RAY_INLINE const char* scan_field(const char* p, const char* buf_end,
+                                  char delimiter,
+                                  const char** out, size_t* out_len,
+                                  char* esc_buf, char** dyn_esc);
 
 /* --------------------------------------------------------------------------
  * Type inference
@@ -247,22 +259,22 @@ static csv_type_t promote_csv_type(csv_type_t cur, csv_type_t obs) {
     return CSV_TYPE_STR;
 }
 
-static void csv_cardinality_note(uint32_t hashes[CSV_MAX_COLS][CSV_SAMPLE_ROWS],
-                                 uint16_t lens[CSV_MAX_COLS][CSV_SAMPLE_ROWS],
+static void csv_cardinality_note(uint32_t* hashes, uint16_t* lens,
                                  uint16_t* distinct, uint16_t* non_null,
                                  int col, const char* fld, size_t flen) {
     if (flen == 0) return;
+    size_t base = (size_t)col * CSV_SAMPLE_ROWS;
     uint32_t h = (uint32_t)ray_hash_bytes(fld, flen);
     uint16_t l = flen > UINT16_MAX ? UINT16_MAX : (uint16_t)flen;
     for (uint16_t i = 0; i < distinct[col]; i++) {
-        if (hashes[col][i] == h && lens[col][i] == l) {
+        if (hashes[base + i] == h && lens[base + i] == l) {
             non_null[col]++;
             return;
         }
     }
     if (distinct[col] < CSV_SAMPLE_ROWS) {
-        hashes[col][distinct[col]] = h;
-        lens[col][distinct[col]] = l;
+        hashes[base + distinct[col]] = h;
+        lens[base + distinct[col]] = l;
         distinct[col]++;
     }
     non_null[col]++;
@@ -280,12 +292,65 @@ static int8_t csv_resolve_inferred_type(csv_type_t t,
         case CSV_TYPE_TIMESTAMP: return RAY_TIMESTAMP;
         case CSV_TYPE_GUID:      return RAY_GUID;
         case CSV_TYPE_STR:
-            return (non_null >= 64 &&
-                    (uint32_t)distinct * 100u >= (uint32_t)non_null * 80u)
+            return (distinct >= CSV_STR_DISTINCT_MIN ||
+                    (non_null >= 64 &&
+                     (uint32_t)distinct * 100u >= (uint32_t)non_null * 80u))
                 ? RAY_STR : RAY_SYM;
         default:
             return RAY_SYM;
     }
+}
+
+static bool csv_infer_types_from_offsets(const char* buf, const char* buf_end,
+                                         const int64_t* row_offsets,
+                                         int64_t n_rows, int ncols,
+                                         char delimiter, char* esc_buf,
+                                         int8_t* resolved_types) {
+    csv_type_t col_types[CSV_MAX_COLS];
+    memset(col_types, 0, (size_t)ncols * sizeof(csv_type_t));
+
+    ray_t *hash_hdr = NULL, *lens_hdr = NULL;
+    uint32_t* text_hashes = (uint32_t*)scratch_calloc(&hash_hdr,
+        (size_t)ncols * CSV_SAMPLE_ROWS * sizeof(uint32_t));
+    uint16_t* text_lens = (uint16_t*)scratch_calloc(&lens_hdr,
+        (size_t)ncols * CSV_SAMPLE_ROWS * sizeof(uint16_t));
+    uint16_t text_distinct[CSV_MAX_COLS] = {0};
+    uint16_t text_non_null[CSV_MAX_COLS] = {0};
+
+    if (!text_hashes || !text_lens) {
+        scratch_free(hash_hdr);
+        scratch_free(lens_hdr);
+        return false;
+    }
+
+    int64_t sample_n = n_rows < CSV_SAMPLE_ROWS ? n_rows : CSV_SAMPLE_ROWS;
+    for (int64_t si = 0; si < sample_n; si++) {
+        int64_t r = si;
+        if (sample_n > 1 && sample_n < n_rows)
+            r = (si * (n_rows - 1)) / (sample_n - 1);
+        const char* rp = buf + row_offsets[r];
+        for (int c = 0; c < ncols; c++) {
+            const char* fld;
+            size_t flen;
+            char* dyn_esc = NULL;
+            rp = scan_field(rp, buf_end, delimiter, &fld, &flen, esc_buf, &dyn_esc);
+            csv_type_t t = detect_type(fld, flen);
+            if (t == CSV_TYPE_STR)
+                csv_cardinality_note(text_hashes, text_lens,
+                                     text_distinct, text_non_null,
+                                     c, fld, flen);
+            if (dyn_esc) ray_sys_free(dyn_esc);
+            col_types[c] = promote_csv_type(col_types[c], t);
+        }
+    }
+
+    for (int c = 0; c < ncols; c++)
+        resolved_types[c] = csv_resolve_inferred_type(
+            col_types[c], text_distinct[c], text_non_null[c]);
+
+    scratch_free(hash_hdr);
+    scratch_free(lens_hdr);
+    return true;
 }
 
 /* --------------------------------------------------------------------------
@@ -1764,8 +1829,8 @@ static ray_t* csv_materialize_rows(const char* buf, size_t file_size,
 }
 
 /* When explicit column names are supplied the caller declares "no header", but
- * the file may still carry one (e.g. ClickBench schema + headered CSV).  Parsing
- * that header row as data is a silent +1-row corruption.  Guard against it: if
+ * the file may still carry a matching header row.  Parsing that header row as
+ * data is a silent +1-row corruption.  Guard against it: if
  * the first line's fields all equal the supplied names, it IS a header — return
  * the offset of the data that follows it.  Returns NULL when the first line is
  * genuine data (no field-vs-name mismatch is possible for a real data row that
@@ -1925,37 +1990,10 @@ ray_t* ray_read_csv_named_opts(const char* path, char delimiter, bool header,
             resolved_types[c] = t;
         }
     } else if (!col_types_in) {
-        /* Auto-infer from sample rows */
-        csv_type_t col_types[CSV_MAX_COLS];
-        memset(col_types, 0, (size_t)ncols * sizeof(csv_type_t));
-        uint32_t text_hashes[CSV_MAX_COLS][CSV_SAMPLE_ROWS] = {{0}};
-        uint16_t text_lens[CSV_MAX_COLS][CSV_SAMPLE_ROWS] = {{0}};
-        uint16_t text_distinct[CSV_MAX_COLS] = {0};
-        uint16_t text_non_null[CSV_MAX_COLS] = {0};
-        /* Type inference from first 100 rows. Heterogeneous CSVs with type
-         * changes after row 100 will be mistyped. Use explicit schema
-         * (col_types_in) for such files. */
-        int64_t sample_n = (n_rows < CSV_SAMPLE_ROWS) ? n_rows : CSV_SAMPLE_ROWS;
-        for (int64_t r = 0; r < sample_n; r++) {
-            const char* rp = buf + row_offsets[r];
-            for (int c = 0; c < ncols; c++) {
-                const char* fld;
-                size_t flen;
-                char* dyn_esc = NULL;
-                rp = scan_field(rp, buf_end, delimiter, &fld, &flen, esc_buf, &dyn_esc);
-                csv_type_t t = detect_type(fld, flen);
-                if (t == CSV_TYPE_STR)
-                    csv_cardinality_note(text_hashes, text_lens,
-                                         text_distinct, text_non_null,
-                                         c, fld, flen);
-                if (dyn_esc) ray_sys_free(dyn_esc);
-                col_types[c] = promote_csv_type(col_types[c], t);
-            }
-        }
-        for (int c = 0; c < ncols; c++) {
-            resolved_types[c] = csv_resolve_inferred_type(
-                col_types[c], text_distinct[c], text_non_null[c]);
-        }
+        if (!csv_infer_types_from_offsets(buf, buf_end, row_offsets, n_rows,
+                                          ncols, delimiter, esc_buf,
+                                          resolved_types))
+            goto fail_offsets;
     } else {
         /* col_types_in provided but too short — error */
         goto fail_offsets;
@@ -2453,32 +2491,13 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
                                                      &sample_offsets,
                                                      &sample_offsets_hdr,
                                                      NULL);
-        csv_type_t col_types[CSV_MAX_COLS];
-        memset(col_types, 0, (size_t)ncols * sizeof(csv_type_t));
-        uint32_t text_hashes[CSV_MAX_COLS][CSV_SAMPLE_ROWS] = {{0}};
-        uint16_t text_lens[CSV_MAX_COLS][CSV_SAMPLE_ROWS] = {{0}};
-        uint16_t text_distinct[CSV_MAX_COLS] = {0};
-        uint16_t text_non_null[CSV_MAX_COLS] = {0};
-        for (int64_t r = 0; r < sample_n; r++) {
-            const char* rp = buf + sample_offsets[r];
-            for (int c = 0; c < ncols; c++) {
-                const char* fld;
-                size_t flen;
-                char* dyn_esc = NULL;
-                rp = scan_field(rp, buf_end, delimiter, &fld, &flen, esc_buf, &dyn_esc);
-                csv_type_t t = detect_type(fld, flen);
-                if (t == CSV_TYPE_STR)
-                    csv_cardinality_note(text_hashes, text_lens,
-                                         text_distinct, text_non_null,
-                                         c, fld, flen);
-                if (dyn_esc) ray_sys_free(dyn_esc);
-                col_types[c] = promote_csv_type(col_types[c], t);
-            }
-        }
+        bool infer_ok = csv_infer_types_from_offsets(
+            buf, buf_end, sample_offsets, sample_n, ncols, delimiter,
+            esc_buf, resolved_types);
         scratch_free(sample_offsets_hdr);
-        for (int c = 0; c < ncols; c++) {
-            resolved_types[c] = csv_resolve_inferred_type(
-                col_types[c], text_distinct[c], text_non_null[c]);
+        if (!infer_ok) {
+            ray_vm_unmap_file(buf, file_size);
+            return RAY_ERR_OOM;
         }
     } else {
         ray_vm_unmap_file(buf, file_size);
@@ -2783,32 +2802,13 @@ ray_err_t ray_csv_save_parted_named_opts(const char* path, char delimiter, bool 
                                                      &sample_offsets,
                                                      &sample_offsets_hdr,
                                                      NULL);
-        csv_type_t col_types[CSV_MAX_COLS];
-        memset(col_types, 0, (size_t)ncols * sizeof(csv_type_t));
-        uint32_t text_hashes[CSV_MAX_COLS][CSV_SAMPLE_ROWS] = {{0}};
-        uint16_t text_lens[CSV_MAX_COLS][CSV_SAMPLE_ROWS] = {{0}};
-        uint16_t text_distinct[CSV_MAX_COLS] = {0};
-        uint16_t text_non_null[CSV_MAX_COLS] = {0};
-        for (int64_t r = 0; r < sample_n; r++) {
-            const char* rp = buf + sample_offsets[r];
-            for (int c = 0; c < ncols; c++) {
-                const char* fld;
-                size_t flen;
-                char* dyn_esc = NULL;
-                rp = scan_field(rp, buf_end, delimiter, &fld, &flen, esc_buf, &dyn_esc);
-                csv_type_t t = detect_type(fld, flen);
-                if (t == CSV_TYPE_STR)
-                    csv_cardinality_note(text_hashes, text_lens,
-                                         text_distinct, text_non_null,
-                                         c, fld, flen);
-                if (dyn_esc) ray_sys_free(dyn_esc);
-                col_types[c] = promote_csv_type(col_types[c], t);
-            }
-        }
+        bool infer_ok = csv_infer_types_from_offsets(
+            buf, buf_end, sample_offsets, sample_n, ncols, delimiter,
+            esc_buf, resolved_types);
         scratch_free(sample_offsets_hdr);
-        for (int c = 0; c < ncols; c++) {
-            resolved_types[c] = csv_resolve_inferred_type(
-                col_types[c], text_distinct[c], text_non_null[c]);
+        if (!infer_ok) {
+            ray_vm_unmap_file(buf, file_size);
+            return RAY_ERR_OOM;
         }
     } else {
         ray_vm_unmap_file(buf, file_size);

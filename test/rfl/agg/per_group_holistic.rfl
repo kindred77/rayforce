@@ -63,7 +63,7 @@
 ;; ─── median per group: multi-key SYM ────────────────────────────────
 ;;
 ;; Multi-key by-clause forces the eval-level group path (DAG fast
-;; scatter is single-key).  Mirrors canonical_h2o q6:
+;; scatter is single-key).  Mirrors the canonical multi-key median shape:
 ;;   (A,X) → [10]      → 10
 ;;   (A,Y) → [20, 60]  → 40
 ;;   (B,X) → [30, 50]  → 40

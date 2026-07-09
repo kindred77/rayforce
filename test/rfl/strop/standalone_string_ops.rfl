@@ -20,6 +20,7 @@
 (substr "abcdef" 5 -1) -- "ef"
 (substr 'abcdef 2 3) -- 'bcd
 (substr ["abcdef" "xyz"] 2 2) -- ["bc" "yz"]
+(substr (as 'STR (list "abcdefghijklmnopqrstuvwxyz" "short")) 5 -1) -- ["efghijklmnopqrstuvwxyz" "t"]
 (substr ["abcdef" "xyz"] [1 2] [3 9]) -- ["abc" "yz"]
 
 (replace "banana" "a" "A") -- "bAnAnA"
@@ -27,6 +28,8 @@
 (replace 'banana "a" "A") -- 'bAnAnA
 (replace ["a-b" "c-d"] "-" "_") -- ["a_b" "c_d"]
 (replace (upper ["a-b" "c-d"]) "-" "_") -- ["A_B" "C_D"]
+(concat ["a" "b"] "/") -- ["a/" "b/"]
+(concat "/" ["a" "b"]) -- ["/a" "/b"]
 
 (substr [1 2 3] 1 1) !- type
 (replace ["a"] 1 "x") !- type

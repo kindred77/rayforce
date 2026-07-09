@@ -1850,7 +1850,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     seg_nulls |= segs[s]->attrs & RAY_ATTR_HAS_NULLS;
                     off += segs[s]->len;
                 }
-                /* Invariant 16.4: propagate HAS_NULLS across segments. */
+                /* Null propagation: propagate HAS_NULLS across segments. */
                 flat->attrs |= seg_nulls;
                 /* Raw-copied SYM cell ids resolve over the partitions'
                  * shared domain (first SYM segment is the rep). */
@@ -2807,6 +2807,14 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 input = exec_node(g, op_child(g, op, 0));
             }
             if (!input || RAY_IS_ERR(input)) return input;
+            if (g->selection && input->type == RAY_TABLE) {
+                ray_t* compacted = sel_compact(g, input, g->selection, NULL, 0);
+                ray_release(input);
+                ray_release(g->selection);
+                g->selection = NULL;
+                input = compacted;
+                if (!input || RAY_IS_ERR(input)) return input;
+            }
             if (input->type == RAY_TABLE) {
                 int64_t ncols = ray_table_ncols(input);
                 int64_t nrows = ray_table_nrows(input);
@@ -2852,7 +2860,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                                     dst_off += take;
                                     remaining -= take;
                                 }
-                                /* Invariant 16.4: conservatively propagate
+                                /* Null propagation: conservatively propagate
                                  * HAS_NULLS from the touched segments. */
                                 head_vec->attrs |= seg_nulls;
                                 /* raw SYM cell-id copy from the segments —
@@ -2905,6 +2913,14 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
             ray_t* input = exec_node(g, op_child(g, op, 0));
             if (!input || RAY_IS_ERR(input)) return input;
             int64_t n = ext ? ext->sym : 10;
+            if (g->selection && input->type == RAY_TABLE) {
+                ray_t* compacted = sel_compact(g, input, g->selection, NULL, 0);
+                ray_release(input);
+                ray_release(g->selection);
+                g->selection = NULL;
+                input = compacted;
+                if (!input || RAY_IS_ERR(input)) return input;
+            }
             if (input->type == RAY_TABLE) {
                 int64_t ncols = ray_table_ncols(input);
                 int64_t nrows = ray_table_nrows(input);
@@ -2975,7 +2991,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                                     seg_nulls |= segs[s]->attrs & RAY_ATTR_HAS_NULLS;
                                     remaining -= take;
                                 }
-                                /* Invariant 16.4: conservatively propagate
+                                /* Null propagation: conservatively propagate
                                  * HAS_NULLS from the touched segments. */
                                 tail_vec->attrs |= seg_nulls;
                                 /* raw SYM cell-id copy from the segments —
@@ -3051,6 +3067,9 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
         }
         case OP_CONCAT: {
             return exec_concat(g, op);
+        }
+        case OP_STR_FIND: {
+            return exec_str_find(g, op);
         }
 
         case OP_EXTRACT: {
@@ -3478,7 +3497,7 @@ static bool op_streamable(uint16_t opc) {
         /* String element-wise */
         case OP_LIKE: case OP_ILIKE: case OP_UPPER: case OP_LOWER:
         case OP_STRLEN: case OP_SUBSTR: case OP_REPLACE: case OP_TRIM:
-        case OP_CONCAT:
+        case OP_CONCAT: case OP_STR_FIND:
         /* Temporal element-wise */
         case OP_EXTRACT: case OP_DATE_TRUNC:
         /* Structure */
@@ -3633,7 +3652,7 @@ static ray_t* flatten_parted_col(ray_t* col) {
         seg_nulls |= segs[s]->attrs & RAY_ATTR_HAS_NULLS;
         off += segs[s]->len;
     }
-    /* Null-model invariant 16.4: parted_copy_cells copies sentinel
+    /* Null propagation: parted_copy_cells copies sentinel
      * bit-patterns but not HAS_NULLS — OR it across segments. */
     flat->attrs |= seg_nulls;
     /* Raw-copied SYM cell ids resolve over the partitions' shared

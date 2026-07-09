@@ -1,6 +1,6 @@
-/* Aggregation-engine A/B perf microbench (H2O-style group-by shapes).
+/* Aggregation-engine A/B perf microbench (wide group-by shapes).
  *
- * Generates ONE H2O-like table with a fixed-seed PRNG (identical data on
+ * Generates one grouped table with a fixed-seed PRNG (identical data on
  * every run / every branch) and times the group-by shapes that the old
  * hand-tuned "rowform" group operators targeted.  On THIS branch (feat/
  * agg-engine-phase0) OP_GROUP routes through the v2 composable aggregation

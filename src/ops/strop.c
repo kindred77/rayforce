@@ -447,44 +447,17 @@ ray_t* ray_replace_fn(ray_t** args, int64_t n) {
     return ray_lazy_wrap(g, op);
 }
 
-static const char* str_bytes_find(const char* hay, size_t hay_len,
-                                  const char* needle, size_t needle_len,
-                                  ray_pool_t* pool, bool* cancelled) {
-    if (cancelled) *cancelled = false;
-    if (needle_len == 0) return hay;
-    if (needle_len > hay_len) return NULL;
-
-    const unsigned char first = (unsigned char)needle[0];
-    const size_t chunk = (size_t)1 << 20;
-    size_t base = 0;
-    while (base + needle_len <= hay_len) {
-        if (pool_cancelled(pool)) {
-            if (cancelled) *cancelled = true;
-            return NULL;
-        }
-        size_t starts = hay_len - base - needle_len + 1;
-        size_t scan = starts < chunk ? starts : chunk;
-        const void* hit = memchr(hay + base, first, scan);
-        if (!hit) {
-            base += scan;
-            continue;
-        }
-        const char* p = (const char*)hit;
-        size_t pos = (size_t)(p - hay);
-        if (memcmp(p, needle, needle_len) == 0)
-            return p;
-        base = pos + 1;
-    }
-    return NULL;
-}
-
 static int64_t str_find_index(const char* hay, size_t hay_len,
-                              const char* needle, size_t needle_len,
+                              const ray_strpat_t* pattern,
                               ray_pool_t* pool, bool* cancelled) {
-    const char* p = str_bytes_find(hay, hay_len, needle, needle_len,
-                                   pool, cancelled);
-    if (cancelled && *cancelled) return NULL_I64;
-    return p ? (int64_t)(p - hay) : NULL_I64;
+    if (cancelled) *cancelled = false;
+    if (pool_cancelled(pool)) {
+        if (cancelled) *cancelled = true;
+        return NULL_I64;
+    }
+    size_t pos = 0;
+    return ray_strpat_find(pattern, hay, hay_len, &pos) ? (int64_t)pos
+                                                       : NULL_I64;
 }
 
 static bool str_vec_cell_bytes(ray_t* x, int64_t row,
@@ -510,8 +483,7 @@ static bool str_vec_cell_bytes(ray_t* x, int64_t row,
 
 typedef struct {
     ray_t* hay;
-    const char* needle;
-    size_t needle_len;
+    const ray_strpat_t* pattern;
     int64_t* out;
     ray_pool_t* pool;
     _Atomic(int) any_null;
@@ -530,8 +502,7 @@ static void str_find_vec_task(void* vctx, uint32_t worker_id,
         size_t hl = 0;
         str_vec_cell_bytes(c->hay, i, &hp, &hl);
         bool cancelled = false;
-        int64_t idx = str_find_index(hp, hl, c->needle, c->needle_len,
-                                     c->pool, &cancelled);
+        int64_t idx = str_find_index(hp, hl, c->pattern, c->pool, &cancelled);
         if (cancelled) return;
         c->out[i] = idx;
         if (idx == NULL_I64) any_null = true;
@@ -540,7 +511,7 @@ static void str_find_vec_task(void* vctx, uint32_t worker_id,
         atomic_store_explicit(&c->any_null, 1, memory_order_relaxed);
 }
 
-static ray_t* str_find_vec(ray_t* hay, const char* needle, size_t needle_len) {
+static ray_t* str_find_vec(ray_t* hay, const ray_strpat_t* pattern) {
     int64_t n = hay->len;
     ray_t* out = ray_vec_new(RAY_I64, n);
     if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
@@ -550,8 +521,7 @@ static ray_t* str_find_vec(ray_t* hay, const char* needle, size_t needle_len) {
     int64_t* dst = (int64_t*)ray_data(out);
     str_find_vec_ctx_t ctx = {
         .hay = hay,
-        .needle = needle,
-        .needle_len = needle_len,
+        .pattern = pattern,
         .out = dst,
         .pool = pool
     };
@@ -572,28 +542,43 @@ static ray_t* str_find_vec(ray_t* hay, const char* needle, size_t needle_len) {
     return out;
 }
 
-ray_t* ray_str_find_fn(ray_t* hay, ray_t* needle) {
-    if (ray_is_lazy(hay)) hay = ray_lazy_materialize(hay);
-    if (ray_is_lazy(needle)) needle = ray_lazy_materialize(needle);
+ray_t* ray_str_find_fn(ray_t* hay, ray_t* pattern) {
+    if (ray_is_lazy(pattern)) pattern = ray_lazy_materialize(pattern);
     if (!hay || RAY_IS_ERR(hay)) return hay;
-    if (!needle || RAY_IS_ERR(needle)) return needle;
+    if (!pattern || RAY_IS_ERR(pattern)) return pattern;
 
     const char* np = NULL;
     size_t nl = 0;
-    if (!str_atom_arg(needle, &np, &nl))
-        return ray_error("type", "str-find: needle must be string or symbol atom");
+    if (!str_atom_arg(pattern, &np, &nl))
+        return ray_error("type", "str-find: pattern must be string or symbol atom");
+    ray_strpat_t search;
+    if (!ray_strpat_compile(np, nl, &search))
+        return ray_error("domain", "str-find: '*' is not supported in search patterns");
+
+    if (ray_is_lazy(hay)) {
+        ray_graph_t* g = RAY_LAZY_GRAPH(hay);
+        ray_op_t* prev = RAY_LAZY_OP(hay);
+        if (!prev || (prev->out_type != RAY_STR && prev->out_type != RAY_SYM))
+            return ray_error("type", "str-find: expected string or symbol vector");
+        ray_op_t* p = const_node_from_obj(g, pattern);
+        ray_op_t* op = p ? ray_str_find_op(g, prev, p) : NULL;
+        if (!op) return ray_error("oom", NULL);
+        RAY_LAZY_OP(hay) = op;
+        ray_retain(hay);
+        return hay;
+    }
 
     const char* hp = NULL;
     size_t hl = 0;
     if (str_atom_bytes(hay, &hp, &hl, NULL)) {
         bool cancelled = false;
-        int64_t idx = str_find_index(hp, hl, np, nl, NULL, &cancelled);
+        int64_t idx = str_find_index(hp, hl, &search, NULL, &cancelled);
         if (cancelled) return ray_error("cancel", NULL);
         return idx == NULL_I64 ? ray_typed_null(-RAY_I64) : ray_i64(idx);
     }
 
     if (ray_is_vec(hay) && (hay->type == RAY_STR || hay->type == RAY_SYM))
-        return str_find_vec(hay, np, nl);
+        return str_find_vec(hay, &search);
 
     if (hay->type == RAY_LIST) {
         int64_t n = hay->len;
@@ -613,7 +598,7 @@ ray_t* ray_str_find_fn(ray_t* hay, ray_t* needle) {
                 return ray_error("type", "str-find: list items must be string or symbol atoms");
             }
             bool cancelled = false;
-            int64_t idx = str_find_index(hp, hl, np, nl, NULL, &cancelled);
+            int64_t idx = str_find_index(hp, hl, &search, NULL, &cancelled);
             if (cancelled) {
                 ray_release(out);
                 return ray_error("cancel", NULL);
@@ -899,7 +884,7 @@ ray_t* ray_like_fn(ray_t* x, ray_t* pattern) {
     const char* pat = ray_str_ptr(pattern);
     size_t pat_len = ray_str_len(pattern);
 
-    /* Pre-compile the pattern once.  Most benchmark LIKE shapes are
+    /* Pre-compile the pattern once.  Most selective LIKE shapes are
      * `*literal*` (substring) which collapses to a memmem call — the
      * libc-provided implementation is SIMD on glibc/Apple/BSD.  When the
      * shape is RAY_GLOB_SHAPE_NONE we keep the iterative matcher. */

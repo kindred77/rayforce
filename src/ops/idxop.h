@@ -123,7 +123,7 @@ typedef struct {
             uint64_t mask;      /* capacity - 1 (capacity is power of two) */
             int64_t  n_keys;    /* number of non-null rows indexed */
             int64_t  n_groups;  /* number of distinct keys */
-            int64_t  _pad;      /* keep ray_index_t a 32-byte multiple */
+            int64_t  order_sym; /* optional column symbol ordered within each group */
         } hash;
         struct {                /* RAY_IDX_SORT */
             ray_t* perm;        /* RAY_I64 vec, perm[i] = row id at sorted pos i */
@@ -160,6 +160,7 @@ typedef struct {
             ray_t*  starts;     /* RAY_I64, row offset where each part begins */
             ray_t*  lens;       /* RAY_I64, row count of each part */
             int64_t n_parts;
+            int64_t order_sym;  /* optional column symbol ordered within each part */
         } part;
         struct {                /* RAY_IDX_DICT */
             /* Both children are RAY_I32 (numeric — the inline persistence stores
@@ -200,15 +201,15 @@ void ray_idx_stats_init(void);   /* atexit dump when RAY_IDX_STATS set */
 
 /* ===== Attach / Detach ===== */
 
-/* Build an accelerator and attach.  Numeric types only for v1
- * (BOOL/U8/I16/I32/I64/F32/F64/DATE/TIME/TIMESTAMP — RAY_STR/RAY_SYM/RAY_GUID
- * deferred until the str_pool displacement sweep is complete).
+/* Build an accelerator and attach.  Numeric types are supported by every
+ * index kind below; hash and part also support SYM domain ids.
  * On success, *vp is the (possibly new) parent vector with HAS_INDEX set.
  * On failure, *vp is unchanged and a RAY_ERROR is returned. */
 ray_t* ray_index_attach_zone (ray_t** vp);
 ray_t* ray_index_attach_hash (ray_t** vp);
 ray_t* ray_index_attach_sort (ray_t** vp);
 ray_t* ray_index_attach_bloom(ray_t** vp);
+ray_t* ray_index_attach_part (ray_t** vp);
 /* Build per-chunk min/max + null bit at chunk_size = 1 << chunk_log2.
  * Passing 0 picks the default (16 → 64 K rows / chunk).  Only valid on
  * numeric and temporal vectors; SYM/STR/GUID return RAY_ERR_NYI. */

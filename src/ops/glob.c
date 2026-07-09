@@ -196,3 +196,166 @@ bool ray_glob_match_compiled(const ray_glob_compiled_t* c,
         return false;
     }
 }
+
+static const char* strpat_memmem(const char* s, size_t sn,
+                                 const char* needle, size_t needle_len) {
+    if (needle_len == 0) return s;
+    if (needle_len > sn) return NULL;
+    if (needle_len == 1) return (const char*)memchr(s, needle[0], sn);
+#if defined(__GLIBC__) || defined(__APPLE__) || defined(__FreeBSD__)
+    return (const char*)memmem(s, sn, needle, needle_len);
+#else
+    const char first = needle[0];
+    const char* hay = s;
+    size_t remaining = sn;
+    while (remaining >= needle_len) {
+        const char* hit = (const char*)memchr(hay, first,
+                                              remaining - needle_len + 1);
+        if (!hit) return NULL;
+        if (memcmp(hit, needle, needle_len) == 0) return hit;
+        size_t adv = (size_t)(hit - hay) + 1;
+        hay = hit + 1;
+        remaining -= adv;
+    }
+    return NULL;
+#endif
+}
+
+bool ray_strpat_compile(const char* p, size_t pn, ray_strpat_t* out) {
+    if (!out) return false;
+    *out = (ray_strpat_t){ .pat = p, .pat_len = pn, .literal = true };
+
+    size_t tokens = 0;
+    size_t run_start = 0, run_len = 0, run_token = 0;
+    size_t best_len = 0, best_start = 0, best_token = 0;
+
+#define SEARCH_FLUSH_RUN() do {                         \
+    if (run_len > best_len) {                            \
+        best_len = run_len;                              \
+        best_start = run_start;                          \
+        best_token = run_token;                          \
+    }                                                    \
+    run_len = 0;                                         \
+} while (0)
+
+    for (size_t i = 0; i < pn; ) {
+        if (p[i] == '*') return false;
+        if (p[i] == '?' || p[i] == '[') {
+            out->literal = false;
+            SEARCH_FLUSH_RUN();
+            if (p[i] == '[') {
+                size_t j = i + 1;
+                bool first = true;
+                if (j < pn && p[j] == '!') j++;
+                while (j < pn && (first || p[j] != ']')) {
+                    if (j + 2 < pn && p[j + 1] == '-' && p[j + 2] != ']')
+                        j += 3;
+                    else
+                        j++;
+                    first = false;
+                }
+                if (j < pn && p[j] == ']') j++;
+                i = j;
+            } else {
+                i++;
+            }
+            tokens++;
+            continue;
+        }
+
+        if (run_len == 0) {
+            run_start = i;
+            run_token = tokens;
+        }
+        run_len++;
+        i++;
+        tokens++;
+    }
+    SEARCH_FLUSH_RUN();
+#undef SEARCH_FLUSH_RUN
+
+    out->tokens = tokens;
+    out->anchor = p + best_start;
+    out->anchor_len = best_len;
+    out->anchor_token = best_token;
+    return true;
+}
+
+static bool strpat_match_at(const ray_strpat_t* c,
+                            const char* s, size_t sn,
+                            size_t pos) {
+    const char* p = c->pat;
+    size_t pn = c->pat_len;
+    size_t si = pos;
+    for (size_t pi = 0; pi < pn; ) {
+        if (si >= sn) return false;
+        if (p[pi] == '?') {
+            pi++;
+            si++;
+            continue;
+        }
+        if (p[pi] == '[') {
+            size_t cls_pi = pi + 1;
+            if (!match_class(p, pn, &cls_pi, s[si], false))
+                return false;
+            pi = cls_pi;
+            si++;
+            continue;
+        }
+        if (s[si] != p[pi]) return false;
+        pi++;
+        si++;
+    }
+    return true;
+}
+
+bool ray_strpat_find(const ray_strpat_t* c, const char* s, size_t sn,
+                     size_t* out_pos) {
+    if (out_pos) *out_pos = 0;
+    if (!c) return false;
+    if (c->tokens == 0) return true;
+    if (c->tokens > sn) return false;
+
+    if (c->literal) {
+        const char* hit = strpat_memmem(s, sn, c->pat, c->pat_len);
+        if (!hit) return false;
+        if (out_pos) *out_pos = (size_t)(hit - s);
+        return true;
+    }
+
+    if (c->anchor_len > 0) {
+        size_t tail = c->tokens - c->anchor_token - c->anchor_len;
+        size_t scan_from = c->anchor_token;
+        while (scan_from + c->anchor_len + tail <= sn) {
+            size_t hay_len = sn - tail - scan_from;
+            const char* hit = strpat_memmem(s + scan_from, hay_len,
+                                            c->anchor, c->anchor_len);
+            if (!hit) return false;
+            size_t anchor_pos = (size_t)(hit - s);
+            size_t start = anchor_pos - c->anchor_token;
+            if (start + c->tokens <= sn &&
+                strpat_match_at(c, s, sn, start)) {
+                if (out_pos) *out_pos = start;
+                return true;
+            }
+            scan_from = anchor_pos + 1;
+        }
+        return false;
+    }
+
+    size_t last = sn - c->tokens;
+    for (size_t pos = 0; pos <= last; pos++) {
+        if (strpat_match_at(c, s, sn, pos)) {
+            if (out_pos) *out_pos = pos;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ray_strpat_find_raw(const char* s, size_t sn, const char* p, size_t pn,
+                         size_t* out_pos) {
+    ray_strpat_t c;
+    if (!ray_strpat_compile(p, pn, &c)) return false;
+    return ray_strpat_find(&c, s, sn, out_pos);
+}

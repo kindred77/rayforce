@@ -2842,10 +2842,9 @@ static int run_pty_ctrl_c_during_lazy_materialize(void) {
         return -11;
     }
 
-    /* Let eval finish building the lazy result so Ctrl-C lands in the
-     * materialization window, where raw input mode used to swallow it. */
-    usleep(50 * 1000);
-
+    /* The marker is emitted immediately before constructing the lazy result.
+     * Send Ctrl-C as soon as it is observed: fixed sleeps race with faster
+     * materialization and can miss the interruptible window entirely. */
     const char ctrl_c = '\003';
     (void)write(master_fd, &ctrl_c, 1);
 

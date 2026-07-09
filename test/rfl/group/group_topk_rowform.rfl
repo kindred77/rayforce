@@ -4,7 +4,7 @@
 ;;   (select {t: (top v K) by: k from: T})  — single I64/I32/I16/F64 key, single top/bot agg
 ;;   (select {t: (bot v K) by: k from: T})  — bot (desc=0) variant
 ;;
-;; NOT triggered by 2-key shapes (those go through ray_group3 → LIST path).
+;; NOT triggered by 2-key shapes (those go through the generic grouped LIST path).
 ;;
 ;; Functions covered:
 ;;   - exec_group_topk_rowform (lines 9441+): main entry point
@@ -141,7 +141,7 @@
 (sum (raze (at Rtrk_g 't))) -- 1249975000
 
 ;; ─── SYM key path (dispatch check — SYM key NOT supported by rowform) ──
-;; SYM keys go through ray_group3 (the planner restricts to numeric types).
+;; SYM keys go through the generic grouped LIST path (the planner restricts to numeric types).
 ;; This exercises the fallback path to ensure we don't accidentally route.
 ;; We skip this test to avoid asserting implementation details; the dispatch
 ;; check is in query.c not group.c.

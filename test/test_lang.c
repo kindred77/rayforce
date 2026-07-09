@@ -2360,7 +2360,7 @@ static test_result_t test_eval_select_by_vec_bool_order(void) {
  * Regression: the use_eval_group check only looked at scalar
  * -RAY_SYM by_expr, so `by: [s]` slipped through to the DAG path;
  * the eval_group path then used by_expr->i64 (garbage for vector
- * form) and crashed inside ray_group_fn. */
+ * form) and crashed inside ray_group_indices_fn. */
 static test_result_t test_eval_select_by_vec_str_key(void) {
     ray_t* result = ray_eval_str(
         "(do (set t (table ['s 'p] "
@@ -3600,12 +3600,12 @@ static test_result_t test_select_by_nullable_f64_key(void) {
 
 static test_result_t test_select_by_computed_key_nullable_nonkey(void) {
     /* Computed key (by: (expr)) takes a third result-build path (lines
-     * around query.c:2120 — ray_group_fn on the computed vector + scatter
+     * around query.c:2120 — ray_group_indices_fn on the computed vector + scatter
      * non-key columns).  Same hazard as the other sites: dc->len wasn't
      * set before store_typed_elem, so nullable non-key columns silently
      * dropped their null bit.
      *
-     * Use an I64 computed key (`(mod Qty 2)`) so ray_group_fn's scalar
+     * Use an I64 computed key (`(mod Qty 2)`) so ray_group_indices_fn's scalar
      * hash path actually merges duplicate buckets — F64 output would fall
      * back to "every row is its own group" which masks every grouping
      * bug and lets a broken test pass trivially.  Setup forces:
@@ -3626,7 +3626,7 @@ static test_result_t test_select_by_computed_key_nullable_nonkey(void) {
 
 static test_result_t test_select_by_str_nullable_nonkey(void) {
     /* STR-keyed by-grouping routes through the eval_group fallback
-     * (ray_group_fn → gather first-of-group), which is a separate result-
+     * (ray_group_indices_fn -> gather first-of-group), which is a separate result-
      * build site from the scalar-key DAG path.  Same hazard though: the
      * non-key column's destination vec was filled via store_typed_elem
      * before its len was set, so nullable non-key columns lost their
@@ -5994,7 +5994,7 @@ static test_result_t test_builtin_write_file_fn(void) {
 }
 
 /* ── builtins.c coverage: group_ht_grow + ght_i64_hash_gi ───────────────────
- * ray_group_fn on an I64 vector with 40 distinct values.
+ * ray_group_indices_fn on an I64 vector with 40 distinct values.
  * seed_cap = 64 (n<64 path), so the HT starts at capacity 64.
  * After 33 distinct entries, count*2 = 66 > 64 → group_ht_grow fires. */
 static test_result_t test_builtin_group_ht_grow_i64(void) {
@@ -6010,7 +6010,7 @@ static test_result_t test_builtin_group_ht_grow_i64(void) {
         TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
     }
 
-    ray_t* grp = ray_group_fn(vec);
+    ray_t* grp = ray_group_indices_fn(vec);
     TEST_ASSERT_NOT_NULL(grp);
     TEST_ASSERT_FALSE(RAY_IS_ERR(grp));
     /* Result is a dict — 40 distinct keys */
@@ -6021,7 +6021,7 @@ static test_result_t test_builtin_group_ht_grow_i64(void) {
 }
 
 /* ── builtins.c coverage: group_ht_grow + ght_guid_hash_gi ─────────────────
- * ray_group_fn on a GUID vector with 40 distinct GUIDs.
+ * ray_group_indices_fn on a GUID vector with 40 distinct GUIDs.
  * seed_cap = 64 (n<64), HT starts at 64; grows after 33 distinct GUIDs. */
 static test_result_t test_builtin_group_ht_grow_guid(void) {
     ray_t* vec = ray_vec_new(RAY_GUID, 40);
@@ -6037,7 +6037,7 @@ static test_result_t test_builtin_group_ht_grow_guid(void) {
         TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
     }
 
-    ray_t* grp = ray_group_fn(vec);
+    ray_t* grp = ray_group_indices_fn(vec);
     TEST_ASSERT_NOT_NULL(grp);
     TEST_ASSERT_FALSE(RAY_IS_ERR(grp));
     TEST_ASSERT_EQ_I(grp->type, RAY_DICT);
@@ -6047,7 +6047,7 @@ static test_result_t test_builtin_group_ht_grow_guid(void) {
 }
 
 /* ── builtins.c coverage: group_grow (I64 path) ─────────────────────────────
- * ray_group_fn on an I64 vector with 1100 distinct values.
+ * ray_group_indices_fn on an I64 vector with 1100 distinct values.
  * max_groups starts at 1024 (capped); after processing 1025 distinct
  * values group_grow fires to double the bookkeeping arrays. */
 static test_result_t test_builtin_group_grow_i64(void) {
@@ -6061,7 +6061,7 @@ static test_result_t test_builtin_group_grow_i64(void) {
         TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
     }
 
-    ray_t* grp = ray_group_fn(vec);
+    ray_t* grp = ray_group_indices_fn(vec);
     TEST_ASSERT_NOT_NULL(grp);
     TEST_ASSERT_FALSE(RAY_IS_ERR(grp));
     TEST_ASSERT_EQ_I(grp->type, RAY_DICT);
@@ -6684,7 +6684,7 @@ static test_result_t test_builtin_idiv_rfl(void) {
     PASS();
 }
 
-/* ── builtins.c coverage: ray_group_fn with GUID via rfl ────────────────────
+/* ── builtins.c coverage: ray_group_indices_fn with GUID via rfl ────────────
  * Covers the GUID grouping path. */
 static test_result_t test_builtin_group_guid_rfl(void) {
     /* Create 40 distinct GUIDs, group them, verify result is a dict */
@@ -6692,8 +6692,8 @@ static test_result_t test_builtin_group_guid_rfl(void) {
     PASS();
 }
 
-/* ── builtins.c coverage: ray_group_fn empty and list ───────────────────────
- * Covers empty vector and RAY_LIST paths in ray_group_fn. */
+/* ── builtins.c coverage: ray_group_indices_fn empty and list ───────────────
+ * Covers empty vector and RAY_LIST paths in ray_group_indices_fn. */
 static test_result_t test_builtin_group_empty_and_list(void) {
     /* Empty group */
     ASSERT_EQ("(count (key (group [])))", "0");

@@ -871,7 +871,7 @@ ray_t* ray_mode_fn(ray_t* x) {
         return ray_typed_null(nt);
     }
 
-    ray_t* groups = ray_group_fn(x);
+    ray_t* groups = ray_group_indices_fn(x);
     if (!groups || RAY_IS_ERR(groups))
         return groups ? groups : ray_error("oom", NULL);
 

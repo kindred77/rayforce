@@ -1,5 +1,5 @@
 ;; Per-group count(distinct) coverage for src/ops/group.c — focused on
-;; the kernels added by the recent ClickBench perf commits:
+;; the dedicated grouped distinct kernels:
 ;;
 ;;   ray_count_distinct_per_group   (single global hash, serial)
 ;;   count_distinct_per_group_parallel (cdpg_hist_fn / cdpg_scat_fn /

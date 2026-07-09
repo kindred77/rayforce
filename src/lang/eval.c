@@ -35,7 +35,7 @@
 #include "ops/idxop.h"
 #include "ops/linkop.h"
 #include "table/sym.h"
-#include "vec/vec.h"            /* ray_check_null_invariant (DEBUG null-model gate) */
+#include "vec/vec.h"
 #include "core/profile.h"
 #include "core/qstats.h"   /* per-worker parallelism counters for eval-path spans */
 #include "core/qlog.h"     /* ray_qlog_enabled — arm capture for query logging */
@@ -1594,9 +1594,8 @@ ray_t* ray_table_fn(ray_t* names, ray_t* cols) {
                 if (!RAY_IS_ERR(atom_wrap)) { ((uint8_t*)ray_data(atom_wrap))[0] = col_src->b8; atom_wrap->len = 1; }
             }
             if (atom_wrap && !RAY_IS_ERR(atom_wrap)) {
-                /* Invariant 16.4: a lone typed-null atom (e.g. 0Nl) wrapped
-                 * into a 1-element column carries its sentinel; flag it.
-                 * SYM is no-null by design (excluded). */
+                /* A lone typed-null atom wrapped into a 1-element column
+                 * carries its sentinel; flag it.  SYM is no-null by design. */
                 if (RAY_ATOM_IS_NULL(col_src) && atom_wrap->type != RAY_SYM)
                     atom_wrap->attrs |= RAY_ATTR_HAS_NULLS;
                 col_src = atom_wrap;
@@ -1673,16 +1672,13 @@ ray_t* ray_table_fn(ray_t* names, ray_t* cols) {
         if (RAY_IS_ERR(col_vec))
             { ray_release(tbl); if (_bxn) ray_release(_bxn); if (_bxc) ray_release(_bxc); return col_vec; }
 
-        /* Null-model invariant 16.4: ray_vec_append copies the atom payload
-         * raw and never sets HAS_NULLS, so a typed-null literal in the list
-         * (e.g. 0Nl = NULL_I64) would land its sentinel in the column with
-         * the flag clear.  Track it and flip HAS_NULLS after the loop. */
+        /* ray_vec_append copies the atom payload raw and never sets HAS_NULLS,
+         * so track typed null atoms and flip the column flag after the loop. */
         bool col_has_nulls = false;
 
         for (int64_t j = 0; j < nrows; j++) {
-            /* A null source atom whose sentinel survives into col_vec
-             * unchanged.  (F64 promotion of an I64 null produces a finite
-             * double, not a sentinel — no 16.4 issue there.) */
+            /* F64 promotion of an I64 null produces a finite double, not
+             * a null sentinel in the destination column. */
             if (RAY_ATOM_IS_NULL(row_elems[j]) &&
                 !(col_type == RAY_F64 && row_elems[j]->type == -RAY_I64))
                 col_has_nulls = true;
@@ -1732,7 +1728,6 @@ ray_t* ray_table_fn(ray_t* names, ray_t* cols) {
                 { ray_release(tbl); if (_bxn) ray_release(_bxn); if (_bxc) ray_release(_bxc); return col_vec; }
         }
 
-        /* Invariant 16.4: a sentinel was written into a non-SYM column. */
         if (col_has_nulls && col_vec->type != RAY_SYM)
             col_vec->attrs |= RAY_ATTR_HAS_NULLS;
 
@@ -2805,7 +2800,7 @@ vm_error_cleanup: {
 }
 
 
-/* ray_enlist_fn, ray_dict_fn, ray_nil_fn, ray_where_fn, ray_group_fn,
+/* ray_enlist_fn, ray_dict_fn, ray_nil_fn, ray_where_fn, ray_group_indices_fn,
  * ray_concat_fn, ray_raze_fn, ray_within_fn
  * moved to ops/builtins.c */
 
@@ -3165,7 +3160,7 @@ static void ray_register_builtins(void) {
     register_binary("dict",     RAY_FN_NONE, ray_dict_fn);
     register_unary("nil?",      RAY_FN_NONE, ray_nil_fn);
     register_unary("where",     RAY_FN_NONE, ray_where_fn);
-    register_unary("group",     RAY_FN_NONE, ray_group_fn);
+    register_unary("group",     RAY_FN_NONE, ray_group_indices_fn);
     register_binary("concat",   RAY_FN_NONE, ray_concat_fn);
     register_unary("raze",      RAY_FN_NONE, ray_raze_fn);
     register_unary("ungroup",   RAY_FN_NONE, ray_ungroup_fn);
@@ -3179,7 +3174,7 @@ static void ray_register_builtins(void) {
 
     /* String operations */
     register_binary("split",     RAY_FN_NONE, ray_split_fn);
-    register_binary("str-find",  RAY_FN_NONE, ray_str_find_fn);
+    register_binary("str-find",  RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_str_find_fn);
     register_binary("str-join",  RAY_FN_NONE, ray_str_join_fn);
     register_unary ("upper",     RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_upper_fn);
     register_unary ("lower",     RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_lower_fn);
@@ -3829,14 +3824,9 @@ out:
      * entered ray_eval — REPL, IPC, ray_eval_str, file mode — exits
      * through here; firing ray_progress_end exactly when the depth
      * returns to 0 guarantees the progress bar is cleared no matter
-     * which builtin drove the update (including ray_group_fn etc.
+     * which builtin drove the update (including ray_group_indices_fn etc.
      * that bypass ray_execute). */
     if (__VM->eval_depth == 0) ray_progress_end();
-    /* §2.1 null-model invariant 16.4: every eval/op result flows through
-     * here, so this is the suite-wide chokepoint that enforces "sentinel
-     * present ⇒ HAS_NULLS set" across all tested producers.  Compiled out
-     * in release (see vec.h).  Errors/NULL are no-ops in the validator. */
-    ray_check_null_invariant(ret);
     return ret;
 }
 

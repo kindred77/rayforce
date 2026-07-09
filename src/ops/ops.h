@@ -176,6 +176,7 @@ void     ray_cancel_reset(void);
 #define OP_ATAN         142  /* unary: arctangent -> F64 */
 #define OP_RECIPROCAL   143  /* unary: reciprocal -> F64 */
 #define OP_SIGNUM       144  /* unary: signum -> I64 */
+#define OP_STR_FIND     146  /* binary: string search pattern -> I64 */
 
 /* EXTRACT / DATE_TRUNC field identifiers */
 #define RAY_EXTRACT_YEAR    0
@@ -206,7 +207,7 @@ void     ray_cancel_reset(void);
 #define OP_GROUP        62
 #define OP_JOIN         63
 #define OP_WINDOW_JOIN  64
-/* Opcode 65 (formerly OP_FILTERED_GROUP) is RETIRED.  The benchmark-tuned
+/* Opcode 65 (formerly OP_FILTERED_GROUP) is RETIRED.  The shape-specific
  * fused filter+group operator was removed once the general FILTER + OP_GROUP
  * (v2) path became competitive-or-better on every shape it handled; the
  * planner now routes `(select … where … by …)` through that general path.
@@ -703,6 +704,7 @@ ray_op_t* ray_substr(ray_graph_t* g, ray_op_t* str, ray_op_t* start, ray_op_t* l
 ray_op_t* ray_replace(ray_graph_t* g, ray_op_t* str, ray_op_t* from, ray_op_t* to);
 ray_op_t* ray_trim_op(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_concat(ray_graph_t* g, ray_op_t** args, int n);
+ray_op_t* ray_str_find_op(ray_graph_t* g, ray_op_t* input, ray_op_t* pattern);
 
 /* Date/time extraction and truncation */
 ray_op_t* ray_extract(ray_graph_t* g, ray_op_t* col, int64_t field);
@@ -755,19 +757,13 @@ ray_op_t* ray_sort_op(ray_graph_t* g, ray_op_t* table_node,
                      uint32_t n_cols);
 ray_op_t* ray_group(ray_graph_t* g, ray_op_t** keys, uint32_t n_keys,
                    uint16_t* agg_ops, ray_op_t** agg_ins, uint32_t n_aggs);
-/* Variant accepting an optional second-input column per agg.  agg_ins2
- * is parallel to agg_ins (length n_aggs); slots are NULL for unary aggs
- * and non-NULL only for binary aggregators (pearson/cov/scov/wsum/wavg). */
-ray_op_t* ray_group2(ray_graph_t* g, ray_op_t** keys, uint32_t n_keys,
-                     uint16_t* agg_ops, ray_op_t** agg_ins,
-                     ray_op_t** agg_ins2, uint32_t n_aggs);
-/* Variant accepting an optional scalar per agg.  TOP/BOT store integer K;
- * QUANTILE stores probability bits.  agg_k is parallel to agg_ins
- * (length n_aggs).  Pass NULL for agg_ins2 / agg_k if not used. */
-ray_op_t* ray_group3(ray_graph_t* g, ray_op_t** keys, uint32_t n_keys,
-                     uint16_t* agg_ops, ray_op_t** agg_ins,
-                     ray_op_t** agg_ins2, const int64_t* agg_k,
-                     uint32_t n_aggs);
+/* Full OP_GROUP builder.  agg_ins2 is parallel to agg_ins and supplies
+ * the second input for binary aggregators.  agg_k is parallel to agg_ins
+ * and supplies scalar parameters for top/bot/quantile-style aggregators. */
+ray_op_t* ray_group_build(ray_graph_t* g, ray_op_t** keys, uint32_t n_keys,
+                          uint16_t* agg_ops, ray_op_t** agg_ins,
+                          ray_op_t** agg_ins2, const int64_t* agg_k,
+                          uint32_t n_aggs);
 ray_op_t* ray_distinct(ray_graph_t* g, ray_op_t** keys, uint32_t n_keys);
 ray_op_t* ray_pivot_op(ray_graph_t* g,
                        ray_op_t** index_cols, uint32_t n_index,

@@ -5,7 +5,7 @@
 ;; gets W8 (1 byte/elem). Two spots on the update-by path read it at a hardcoded
 ;; 8-byte stride, mis-grouping the values and, at scale, reading off the end of
 ;; the buffer (SIGSEGV):
-;;   - src/ops/builtins.c ray_group_fn scalar path (must use ray_read_sym)
+;;   - src/ops/builtins.c ray_group_indices_fn scalar path (must use ray_read_sym)
 ;;   - src/ops/query.c update-by per-group gather (must use ray_sym_elem_size
 ;;     and create sub_col at the source width)
 ;; `select ... by:` was unaffected (different, width-aware grouping path), so the
