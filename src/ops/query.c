@@ -3070,6 +3070,8 @@ static ray_t* aggr_unary_per_group_buf(ray_t* expr, ray_t* tbl,
         if (!subset || RAY_IS_ERR(subset)) continue;
         ray_t* agg_val = uf(subset);
         ray_release(subset);
+        if (agg_val && !RAY_IS_ERR(agg_val) && ray_is_lazy(agg_val))
+            agg_val = ray_lazy_materialize(agg_val);
         if (!agg_val || RAY_IS_ERR(agg_val)) continue;
 
         if (!agg_vec) {
@@ -7329,6 +7331,8 @@ by_dict_done:
                                     agg_val = uf(subset);
                                 }
                                 ray_release(subset);
+                                if (agg_val && !RAY_IS_ERR(agg_val) && ray_is_lazy(agg_val))
+                                    agg_val = ray_lazy_materialize(agg_val);
                                 if (!agg_val || RAY_IS_ERR(agg_val)) continue;
                                 if (!agg_vec) {
                                     int8_t vt = -(agg_val->type);
@@ -7869,6 +7873,8 @@ by_dict_done:
                             agg_val = uf(subset);
                         }
                         ray_release(subset);
+                        if (agg_val && !RAY_IS_ERR(agg_val) && ray_is_lazy(agg_val))
+                            agg_val = ray_lazy_materialize(agg_val);
                         if (!agg_val || RAY_IS_ERR(agg_val)) continue;
 
                         if (!agg_vec) {

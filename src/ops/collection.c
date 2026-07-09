@@ -2268,6 +2268,25 @@ ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
         return ray_str(&s[i], 1);
     }
 
+    /* Typed vector index: keep the result typed when every row id is valid.
+     * The generic path below remains responsible for out-of-range/null row ids,
+     * because it preserves the scalar `at` rule of producing typed null atoms. */
+    if (ray_is_vec(vec) && idx->type == RAY_I64 && ray_is_vec(idx)) {
+        int64_t idxlen = ray_len(idx);
+        int64_t vlen = ray_len(vec);
+        int64_t* ids = (int64_t*)ray_data(idx);
+        bool idx_has_nulls = (idx->attrs & RAY_ATTR_HAS_NULLS) != 0;
+        bool valid = true;
+        for (int64_t j = 0; j < idxlen; j++) {
+            if ((idx_has_nulls && ray_vec_is_null(idx, j)) ||
+                ids[j] < 0 || ids[j] >= vlen) {
+                valid = false;
+                break;
+            }
+        }
+        if (valid) return gather_by_idx(vec, ids, idxlen);
+    }
+
     /* Vector index: (at vec [i j k]) → vector of values */
     if (is_collection(idx) && idx->type != -RAY_SYM) {
         int64_t idxlen = ray_len(idx);
