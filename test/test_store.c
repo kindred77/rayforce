@@ -40,6 +40,7 @@
 #include "core/sock.h"
 #include "core/platform.h"
 #include "core/runtime.h"
+#include "lang/eval.h"
 #include "mem/sys.h"
 #include "table/sym.h"
 
@@ -2665,7 +2666,8 @@ static test_result_t test_serde_f32_atom_and_edge_cases(void) {
 /* ---- serde coverage: LAMBDA object roundtrip ----------------------------- */
 
 /* Builds a LAMBDA object by hand (same layout as serde.c deserializer) and
- * round-trips it.  This covers lines 224-226, 460-466, 820-850. */
+ * round-trips it.  This covers lambda serde and verifies compiled metadata
+ * never crosses the wire without the bytecode slots it describes. */
 static test_result_t test_serde_lambda_roundtrip(void) {
     /* Build a lambda: params = sym vec ["x"], body = i64(42) atom */
     int64_t x_id = ray_sym_intern("x", 1);
@@ -2681,7 +2683,7 @@ static test_result_t test_serde_lambda_roundtrip(void) {
     ray_t* lambda = ray_alloc(7 * sizeof(ray_t*));
     TEST_ASSERT_NOT_NULL(lambda); TEST_ASSERT_FALSE(RAY_IS_ERR(lambda));
     lambda->type  = RAY_LAMBDA;
-    lambda->attrs = 0;
+    lambda->attrs = RAY_FN_COMPILED;
     lambda->len   = 0;
     memset(ray_data(lambda), 0, 7 * sizeof(ray_t*));
     ((ray_t**)ray_data(lambda))[0] = params;
@@ -2694,11 +2696,21 @@ static test_result_t test_serde_lambda_roundtrip(void) {
     /* Serialize */
     ray_t* w = ray_ser(lambda);
     TEST_ASSERT_NOT_NULL(w); TEST_ASSERT_FALSE(RAY_IS_ERR(w));
+    uint8_t* raw = (uint8_t*)ray_data(w);
+    size_t off = sizeof(ray_ipc_header_t);
+    TEST_ASSERT_EQ_I((int)raw[off], RAY_LAMBDA);
+    TEST_ASSERT_EQ_I((int)raw[off + 1], 0);
+
+    /* Simulate an older/crafted wire frame that carries bit 0x40.  For
+     * vectors that means HAS_NULLS; for lambdas it is RAY_FN_COMPILED and
+     * would make the receiver jump into absent bytecode. */
+    raw[off + 1] = RAY_FN_COMPILED;
 
     /* Deserialize */
     ray_t* b = ray_de(w);
     TEST_ASSERT_NOT_NULL(b); TEST_ASSERT_FALSE(RAY_IS_ERR(b));
     TEST_ASSERT_EQ_I(b->type, RAY_LAMBDA);
+    TEST_ASSERT_EQ_I((int)(b->attrs & RAY_FN_COMPILED), 0);
     /* params slot should be a SYM vector */
     ray_t** bslots = (ray_t**)ray_data(b);
     TEST_ASSERT_NOT_NULL(bslots[0]);
@@ -2708,6 +2720,8 @@ static test_result_t test_serde_lambda_roundtrip(void) {
     TEST_ASSERT_NOT_NULL(bslots[1]);
     TEST_ASSERT_EQ_I(bslots[1]->type, -RAY_I64);
     TEST_ASSERT_EQ_I(bslots[1]->i64, 42);
+    TEST_ASSERT_NULL(bslots[2]);
+    TEST_ASSERT_NULL(bslots[3]);
 
     ray_release(b); ray_release(w); ray_release(lambda);
     PASS();
