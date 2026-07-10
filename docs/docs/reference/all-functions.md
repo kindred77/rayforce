@@ -68,7 +68,7 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 `update`, `insert`, `upsert`, `left-join`, `inner-join`, `full-join`, `anti-join`, `window-join`, `window-join1`,
 `asof-join`, `println`, `show`, `format`, `read-csv`, `write-csv`, `.csv.read`, `.csv.splayed`, `.csv.parted`,
 `.csv.write`, `resolve`, `timeit`, `enlist`, `map-left`, `map-right`, `.db.splayed.set`, `.db.splayed.get`,
-`.db.parted.get`, `.db.parted.tables`, `.db.parted.fill`, `alter`, `print`, `.sys.gc`, `.sys.timeit`,
+`.db.parted.get`, `.db.parted.tables`, `.db.parted.fill`, `alter`, `print`, `.sys.gc`, `.mem.objsize`, `.mem.ts`, `.sys.timeit`,
 `.sys.env`, `.sys.args`, `.ipc.open`, `.ipc.handle`, `.repl.disconnect`, `.log.open`, `.log.roll`,
 `.log.snapshot`, `.log.sync`, `.log.close`, `.log.purge`, `quote`, `return`, `.time.now`, `.time.timer.set`,
 `fold-left`, `fold-right`, `scan-left`, `scan-right`, `del`, `.sys.build`, `.sys.mem`, `.sys.prof`,
@@ -266,7 +266,7 @@ Operations on vectors and lists as collections — set operations, indexing, sea
 | `lead` | unary | lazy/DAG | Shift values one row forward; last row is null/sentinel | `(lead [10 20 30])` → `[20 30 0Nl]` |
 | `deltas` | unary | lazy/DAG | Adjacent differences; first row is null | `(deltas [10 15 13])` → `[0Nl 5 -2]` |
 | `ratios` | unary | lazy/DAG | Adjacent ratios as f64; first row is null | `(ratios [2 4 8])` → `[0Nf 2.0 2.0]` |
-| `fills` | unary | lazy/DAG | Forward-fill nullable vectors | `(fills (as 'I64 (list 0N 2 0N)))` → `[0Nl 2 2]` |
+| `fills` | unary | lazy/DAG | Forward-fill nullable vectors, or every column of a table | `(fills (as 'I64 (list 0N 2 0N)))` → `[0Nl 2 2]` |
 | `sums` | unary | lazy/DAG | Running sum; nulls are skipped | `(sums [1 2 3])` → `[1 3 6]` |
 | `avgs` | unary | lazy/DAG | Running average over non-null values | `(avgs [2 4 6])` → `[2.0 3.0 4.0]` |
 | `mins` | unary | lazy/DAG | Running minimum | `(mins [3 1 2])` → `[3 1 1]` |
@@ -442,6 +442,7 @@ Special forms that bridge to the Rayforce DAG executor for high-performance colu
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
 | `select` | variadic | special | Query table with optional filter, projection, grouping, and aggregation | `(select {from: t a: a})` |
+| `window` | variadic | special | Partitioned window query. `frame:` is `'whole`, `'running`, or a positive trailing row count | `(window {from: t part: [sym] order: [time] frame: 5 funcs: {avg5: (avg price)}})` |
 | `update` | variadic | special, restricted | Add or modify columns in a table (mutates in-place) | `(update {from: t b: (* a 2)})` |
 | `insert` | variadic | special, restricted | Insert rows into a table | `(insert t {x: 10 y: 20})` |
 | `upsert` | variadic | special, restricted | Insert or update rows by key match (target, key, row) | `(upsert t 'x {x: 10 y: 20})` |
@@ -634,6 +635,8 @@ System interaction, metaprogramming, diagnostics, and runtime inspection.
 | `eval` | unary | — | Evaluate a parsed Rayfall expression | `(eval (parse "(+ 1 2)"))` → `3` |
 | `parse` | unary | — | Parse a string into a Rayfall expression tree | `(parse "(+ 1 2)")` |
 | `.sys.gc` | variadic | — | Trigger GC / heap flush, returns `0` | `(.sys.gc)` |
+| `.mem.objsize` | unary | — | Logical bytes retained by an object graph; shared children count once | `(.mem.objsize value)` |
+| `.mem.ts` | special form | — | Evaluate once and return result, time, allocation, peak-memory, result-size, and worker statistics as a dict | `(.mem.ts (select {from: trades}))` |
 | `.sys.exec` | unary | restricted | Execute a shell command, return exit code | `(.sys.exec "ls -la")` |
 | `.os.getenv` | unary | restricted | Get environment variable value | `(.os.getenv "HOME")` |
 | `.os.setenv` | binary | restricted | Set environment variable | `(.os.setenv "KEY" "value")` |
