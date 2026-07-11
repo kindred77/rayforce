@@ -63,6 +63,7 @@ static void cw_int(int v) {
     cw(&buf[i]);
 }
 
+#if !defined(_WIN32)
 static const char* sig_name(int sig) {
     switch (sig) {
         case SIGSEGV: return "SIGSEGV";
@@ -104,9 +105,17 @@ static void crash_handler(int sig, siginfo_t* info, void* ucontext) {
     signal(sig, SIG_DFL);
     raise(sig);
 }
+#endif
+
+#if defined(_WIN32)
+void ray_crash_install(void) {
+    /* Signal handlers not supported on Windows; no-op. */
+}
+#endif
 
 /* ── installation ─────────────────────────────────────────────────── */
 
+#if !defined(_WIN32)
 /* Alternate signal stack, so a SIGSEGV caused by stack overflow (when the
  * normal stack is exhausted) still has room to run the handler.  Fixed
  * 64 KiB: SIGSTKSZ is a runtime sysconf() value on modern glibc (not a
@@ -116,7 +125,6 @@ static void crash_handler(int sig, siginfo_t* info, void* ucontext) {
 static char g_altstack[RAY_CRASH_ALTSTACK_SZ];
 
 void ray_crash_install(void) {
-#if !defined(_WIN32)
     /* Precompute the version banner once (async-signal-safe reuse). */
     {
         const char* v =
@@ -157,5 +165,5 @@ void ray_crash_install(void) {
     static const int sigs[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT };
     for (size_t i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++)
         (void)sigaction(sigs[i], &sa, NULL);
-#endif
 }
+#endif

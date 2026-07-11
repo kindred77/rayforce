@@ -301,6 +301,7 @@ void ray_sem_signal(ray_sem_t* s) {
   #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include "mem/sys.h"
 
 /* --------------------------------------------------------------------------
  * Virtual memory
@@ -359,8 +360,10 @@ void* ray_vm_map_fd_ro(int fd, size_t size) { (void)fd; (void)size; return NULL;
 
 /* MinGW-w64 may not define WIN32_MEMORY_RANGE_ENTRY even when targeting
  * modern Windows.  We load PrefetchVirtualMemory at runtime, so only the
- * struct layout is needed at compile time. */
-#ifndef WIN32_MEMORY_RANGE_ENTRY
+ * struct layout is needed at compile time.
+ * Use _WIN32_WINNT to match the SDK guard (the system defines it only
+ * for _WIN32_WINNT >= 0x0602 / Windows 8). */
+#if !defined(_WIN32_WINNT) || _WIN32_WINNT < 0x0602
 typedef struct WIN32_MEMORY_RANGE_ENTRY {
     PVOID VirtualAddress;
     SIZE_T NumberOfBytes;

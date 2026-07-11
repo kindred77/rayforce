@@ -10016,7 +10016,7 @@ by_dict_done:
                  * STR keys resolve via descriptors+pool below, not gk[]. */
                 if (okt != RAY_STR)
                     for (int64_t gi = 0; gi < n_groups; gi++)
-                        KEY_READ(gk[gi], grp_key, gkt, gi);
+                        RAYFORCE_KEY_READ(gk[gi], grp_key, gkt, gi);
 
                 /* Build row→group_id map.  Rows whose key isn't in the
                  * surviving group set get row_gid = -1 and are skipped.
