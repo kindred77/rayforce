@@ -30,6 +30,7 @@
 #include "table/sym.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 /* ---- Setup / Teardown -------------------------------------------------- */
 
@@ -245,6 +246,42 @@ static test_result_t test_str_vec_append_pooled(void) {
     TEST_ASSERT_MEM_EQ(13, pool_data + 0, long_str);
 
     ray_release(v);
+    PASS();
+}
+
+static test_result_t test_str_vec_append_direct_pool_growth(void) {
+    enum { CHUNK = 8192 };
+    char* chunk = (char*)malloc(CHUNK);
+    TEST_ASSERT_NOT_NULL(chunk);
+    memset(chunk, 'r', CHUNK);
+
+    ray_t* v = ray_vec_new(RAY_STR, 0);
+    TEST_ASSERT_NOT_NULL(v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+
+    bool crossed = false;
+    for (int i = 0; i < 10000; i++) {
+        if (v->str_pool && ray_is_direct(v->str_pool)) {
+            size_t cap = ray_block_data_bytes(v->str_pool);
+            int64_t used = v->str_pool->len;
+            if (used >= 0 && (size_t)used + CHUNK > cap)
+                crossed = true;
+        }
+        v = ray_str_vec_append(v, chunk, CHUNK);
+        TEST_ASSERT_NOT_NULL(v);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+        if (crossed) break;
+    }
+
+    TEST_ASSERT_TRUE(crossed);
+    size_t len = 0;
+    const char* got = ray_str_vec_get(v, v->len - 1, &len);
+    TEST_ASSERT_NOT_NULL(got);
+    TEST_ASSERT_EQ_U(len, CHUNK);
+    TEST_ASSERT_MEM_EQ(16, got, chunk);
+
+    ray_release(v);
+    free(chunk);
     PASS();
 }
 
@@ -1864,6 +1901,7 @@ const test_entry_t str_entries[] = {
     { "str/vec_append_inline_12", test_str_vec_append_inline_12, str_setup, str_teardown },
     { "str/vec_append_empty", test_str_vec_append_empty, str_setup, str_teardown },
     { "str/vec_append_pooled", test_str_vec_append_pooled, str_setup, str_teardown },
+    { "str/vec_append_direct_pool_growth", test_str_vec_append_direct_pool_growth, str_setup, str_teardown },
     { "str/vec_append_mixed", test_str_vec_append_mixed, str_setup, str_teardown },
     { "str/vec_get_inline", test_str_vec_get_inline, str_setup, str_teardown },
     { "str/vec_get_pooled", test_str_vec_get_pooled, str_setup, str_teardown },
@@ -1924,5 +1962,4 @@ const test_entry_t str_entries[] = {
     { "str/ne_nonempty", test_str_ne_nonempty, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
-
 

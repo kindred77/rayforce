@@ -322,7 +322,18 @@
 (at (at Ttz 'ts) 5) -- 2001.01.01D11:01:01.000000000
 (at (at Ttz 'ts) 6) -- 2001.01.01D00:01:01.500000000
 
+(.sys.exec "awk 'BEGIN{print \"k\"; for(i=0;i<300;i++) printf(\"s%d\\n\",i)}' > rf_csv_card_hi.csv") -- 0
+(set Tcardhi (.csv.read "rf_csv_card_hi.csv"))
+(type (at Tcardhi 'k)) -- 'STR
+(set Tcardhisym (.csv.read [SYMBOL] "rf_csv_card_hi.csv"))
+(type (at Tcardhisym 'k)) -- 'SYM
+(.sys.exec "printf 'k\na\na\nb\na\n' > rf_csv_card_lo.csv") -- 0
+(set Tcardlo (.csv.read "rf_csv_card_lo.csv"))
+(type (at Tcardlo 'k)) -- 'SYM
+(set Tcardlostr (.csv.read [STR] "rf_csv_card_lo.csv"))
+(type (at Tcardlostr 'k)) -- 'STR
+
 ;; ── cleanup ─────────────────────────────────────────────────────────────────
+(.sys.exec "rm -f rf_csv_card_*.csv") -- 0
 (.sys.exec "rm -f rf_test_csv_types_*.csv") -- 0
 (.sys.exec "rm -rf rf_test_csv_types_parted rf_test_csv_types_parted_q rf_test_csv_types_parted2") -- 0
-

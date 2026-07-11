@@ -4,7 +4,7 @@ Columnar file I/O, splayed tables, date-partitioned storage, symbol table persis
 
 ## Columnar Files
 
-Rayforce's native binary format stores a single vector per file. Each file contains a 32-byte header followed by the raw element data and an optional null bitmap. The format is designed for direct memory mapping — no deserialization needed.
+Rayforce's native binary format stores a single vector per file. Each file contains the 32-byte `ray_t` header followed by raw element data. Null state is stored in the payload as type-correct sentinels; there is no separate null bitmap region. The format is designed for direct memory mapping — no deserialization needed.
 
 The header carries a single-byte format generation. The current generation is `0`, and data written by any prior engine that produced the same layout (also generation `0`) loads unchanged — no migration required. A file whose generation the reader does not recognize is refused with a `version` error rather than mis-read; a future breaking layout change bumps the generation so old files are rejected for migration instead of silently misinterpreted.
 
@@ -16,8 +16,7 @@ The header carries a single-byte format generation. The current generation is `0
  *
  * Bytes  0-31:   ray_t header (type, attrs, len, etc.)
  * Bytes 32-N:    element data (len * elem_size bytes)
- * Bytes N-M:     null bitmap (if RAY_ATTR_HAS_NULLS + RAY_ATTR_NULLMAP_EXT)
- *                  — (len + 7) / 8 bytes
+ *                nulls use type-correct sentinels in this payload
  */
 ```
 
@@ -25,7 +24,7 @@ The header carries a single-byte format generation. The current generation is `0
 
 | Function | Description |
 |---|---|
-| `ray_col_save(vec, path)` | Write a vector to a column file. Handles slices, external null bitmaps, and string pools transparently. |
+| `ray_col_save(vec, path)` | Write a vector to a column file. Handles slices, sentinel nulls, and string pools transparently. |
 | `ray_col_load(path)` | Read a column file into a heap-allocated vector. The file is read entirely into memory. |
 | `ray_col_mmap(path)` | Memory-map a column file for zero-copy access. The returned vector points directly into the mapped file pages. Ideal for large datasets that exceed available RAM. |
 
@@ -170,7 +169,7 @@ Rayforce includes a high-performance CSV loader with parallel parsing, automatic
 
 ### Reading CSV Files
 
-```lisp
+```text
 ; Basic CSV load — auto-detect types, comma delimiter, header row
 ray> (set data (.csv.read "trades.csv"))
 sym  price   qty  date
@@ -217,7 +216,7 @@ The CSV file is memory-mapped and split into chunks. Multiple threads parse chun
 
 ### Null Handling
 
-Empty fields and fields matching the null string (default: `""`) are recognized as null values. The loader sets the appropriate null bitmap bits on the resulting vectors and marks them with `RAY_ATTR_HAS_NULLS`.
+Empty fields and fields matching the null string (default: `""`) are recognized as null values. The loader writes the appropriate type-correct null sentinels into the resulting vectors and marks them with `RAY_ATTR_HAS_NULLS`.
 
 ### Symbol Merge
 
@@ -284,7 +283,13 @@ Loads a date-partitioned table. The first argument is the database root director
 
 ```lisp
 ; Load the "trades" partitioned table from db/
-(.db.parted.get "db" 'trades)
+(set dbroot "/tmp/rayforce-storage-db")
+(set symfile (format "%/.sym" dbroot))
+(set jan15 (table [sym price qty] (list [AAPL GOOG] [150.5 2800.0] [100 50])))
+(set jan16 (table [sym price qty] (list [MSFT] [410.0] [75])))
+(.db.splayed.set (format "%/2024.01.15/trades" dbroot) jan15 symfile)
+(.db.splayed.set (format "%/2024.01.16/trades" dbroot) jan16 symfile)
+(.db.parted.get dbroot 'trades)
 ```
 
 This scans all date-named subdirectories under `db/` (loading `db/<date>/trades/` from each), memory-maps every column, and returns a single table with a virtual date column. Partition pruning applies to subsequent queries.
@@ -295,15 +300,15 @@ Returns a sorted `sym` vector of the table names available under a partitioned d
 
 ```lisp
 ; Discover which tables live under db/, then load each one
-(.db.parted.tables "db")                ; => [`quotes `trades]
-(map (fn [t] (.db.parted.get "db" t)) (.db.parted.tables "db"))
+(.db.parted.tables dbroot)                ; => [`trades]
+(map (fn [t] (.db.parted.get dbroot t)) (.db.parted.tables dbroot))
 ```
 
 ### `.db.parted.fill` — Backfill Missing Tables Across Partitions
 
 For every table present in **any** partition, ensures **every** partition has it: a partition missing the table gets an **empty** copy whose schema is taken from the most recent partition that has it. This keeps queries that span partitions from failing on a partition where a table is absent — typically a table added partway through the database's life. Returns a sorted `sym` vector of the partition names it filled (empty when nothing needed fixing, so a repeat call is a no-op). Requires write permission on the root.
 
-```lisp
+```text
 ; `news` was only added from 2024.01.10 onward; backfill the earlier days.
 (.db.parted.fill "db")                  ; => [`2024.01.01 … `2024.01.09]
 ; now every partition has every table — the empty copies add no rows.

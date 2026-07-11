@@ -438,6 +438,55 @@ static test_result_t test_ipc_send_list_select_msg(void) {
     PASS();
 }
 
+static test_result_t test_ipc_send_compiled_lambda_msg(void) {
+    ray_ipc_server_t srv;
+    ray_err_t err = ray_ipc_server_init(&srv, 0);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    uint16_t port = get_listen_port(srv.listen_fd);
+    TEST_ASSERT((port) > (0), "port > 0");
+
+    ray_vm_t* srv_vm = make_server_vm();
+    TEST_ASSERT_NOT_NULL(srv_vm);
+
+    ipc_thread_ctx_t ctx = { .srv = &srv, .vm = srv_vm };
+    ray_thread_t tid;
+    ray_thread_create(&tid, server_thread_fn, &ctx);
+
+    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 0);
+    TEST_ASSERT((h) >= (0), "h >= 0");
+
+    ray_t* setup = ray_eval_str(
+        "(set _ipc_v1 (til 10))"
+        "(set _ipc_fn1 (fn [x1] (sum x1)))"
+        "(_ipc_fn1 _ipc_v1)");
+    TEST_ASSERT_NOT_NULL(setup);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+    TEST_ASSERT_EQ_I(setup->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(setup->i64, 45);
+    ray_release(setup);
+
+    ray_t* msg = ray_eval_str("(list _ipc_fn1 _ipc_v1)");
+    TEST_ASSERT_NOT_NULL(msg);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(msg));
+
+    ray_t* result = ray_ipc_send(h, msg);
+    ray_release(msg);
+
+    TEST_ASSERT_NOT_NULL(result);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(result->i64, 45);
+    ray_release(result);
+
+    ray_ipc_close(h);
+    srv.running = false;
+    ray_thread_join(tid);
+    ray_ipc_server_destroy(&srv);
+    ray_sys_free(srv_vm);
+    PASS();
+}
+
 /* ---- test_ipc_connect_fail_no_server ------------------------------------ */
 /*
  * ray_ipc_connect to a port with nothing listening must return -1.
@@ -1897,6 +1946,7 @@ const test_entry_t ipc_entries[] = {
     { "ipc/send_verbose_captures",      test_ipc_send_verbose_captures_output,   ipc_setup, ipc_teardown },
     { "ipc/eval_non_string_msg",        test_ipc_eval_non_string_msg,            ipc_setup, ipc_teardown },
     { "ipc/send_list_select_msg",       test_ipc_send_list_select_msg,           ipc_setup, ipc_teardown },
+    { "ipc/send_compiled_lambda_msg",   test_ipc_send_compiled_lambda_msg,       ipc_setup, ipc_teardown },
     { "ipc/connect_fail_no_server",      test_ipc_connect_fail_no_server,         ipc_setup, ipc_teardown },
     { "ipc/connect_auth_no_user",       test_ipc_connect_auth_no_user,           ipc_setup, ipc_teardown },
     { "ipc/close_invalid_handle",       test_ipc_close_invalid_handle,           ipc_setup, ipc_teardown },

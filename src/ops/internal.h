@@ -804,7 +804,7 @@ static inline uint8_t radix_key_bytes(int8_t type) {
     switch (type) {
     case RAY_BOOL: case RAY_U8:   return 1;
     case RAY_I16:                return 2;
-    case RAY_I32: case RAY_DATE: case RAY_TIME: return 4;
+    case RAY_I32: case RAY_F32: case RAY_DATE: case RAY_TIME: return 4;
     default:                    return 8;  /* I64, F64, TIMESTAMP, SYM */
     }
 }
@@ -957,6 +957,49 @@ ray_t* ray_wide_minmax_per_group_buf(ray_t* src, uint16_t op,
 
 ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit);
 
+/* Monotonic count of streaming parted-GROUP kernel (exec_group_per_partition)
+ * entries.  O(1) per query; surfaced via (.sys.mem)'s "group-perpart-runs". */
+int64_t ray_group_perpart_runs(void);
+
+/* Monotonic count of streaming parted asof-join per-partition (day) runs
+ * bumped once per partition processed by the streaming asof path in query.c.
+ * O(1) per partition; surfaced via (.sys.mem)'s "asof-perpart-runs". */
+int64_t ray_asof_perpart_runs(void);
+
+/* Monotonic count of per-partition runs taken by either parted ORDER BY
+ * streaming path (concat of pre-sorted partitions, or per-partition top-k).
+ * Bumped once per partition; surfaced via (.sys.mem)'s "sort-perpart-runs". */
+int64_t ray_sort_perpart_runs(void);
+
+/* Monotonic count of per-segment runs taken by the case-a streaming parted
+ * window fast-path (PARTITION BY includes the physical/date key).  Bumped
+ * once per segment; surfaced via (.sys.mem)'s "window-perpart-runs". */
+int64_t ray_window_perpart_runs(void);
+
+/* Monotonic count of per-segment runs taken by the join broadcast-streaming
+ * fast-path (exactly one side parted, streamed against the whole other
+ * side).  Bumped once per segment; surfaced via (.sys.mem)'s
+ * "join-perpart-runs". */
+int64_t ray_join_perpart_runs(void);
+
+/* Are these key columns already sorted (single uniform direction) under the
+ * sort's lexicographic ordering?  Null-free integer-family / SYM keys only;
+ * everything else returns false.  O(nrows) with early bail.  Defined in
+ * sort.c; used by the parted ORDER BY streaming path. */
+bool ray_key_cols_sorted(ray_t** key_cols, int64_t n_keys, uint8_t descending,
+                         int64_t nrows);
+
+/* Build a flat table holding one segment (seg_idx) of a parted table:
+ * parted columns yield segs[seg_idx], MAPCOMMON columns are broadcast.
+ * Returns an owned flat RAY_TABLE (rc=1), or a RAY_IS_ERR value.  Defined
+ * in exec.c; consumed by the streaming parted asof path in query.c. */
+ray_t* build_segment_table(ray_t* parted_tbl, int32_t seg_idx);
+
+/* Ordered concat-merge of two partial partition-streamed results (tables:
+ * per-column concat; vectors: direct concat).  Returns an OWNED result.
+ * Defined in exec.c; consumed by the streaming parted asof path in query.c. */
+ray_t* ray_result_merge(ray_t* accum, ray_t* partial);
+
 /* Slice-group fusion probe (exec.c): arm g's slice-group hint instead of
  * executing the WHERE filter when its predicate is exactly in/eq on the
  * single bare group-key column with a fresh CSR hash index.  See the
@@ -987,6 +1030,14 @@ void ray_dict_cd_clear(void);
 /* ── collection.c ── */
 ray_t* distinct_vec_eager(ray_t* x);
 ray_t* reverse_vec_eager(ray_t* x);
+ray_t* lag_vec_eager(ray_t* x);
+ray_t* lead_vec_eager(ray_t* x);
+ray_t* deltas_vec_eager(ray_t* x);
+ray_t* ratios_vec_eager(ray_t* x);
+ray_t* fills_vec_eager(ray_t* x);
+ray_t* running_vec_eager(ray_t* x, uint16_t opcode);
+ray_t* differ_vec_eager(ray_t* x);
+ray_t* moving_vec_eager(ray_t* x, uint16_t opcode, int64_t window);
 
 /* ── sort.c ── */
 ray_t* asc_vec_eager(ray_t* x);
@@ -1026,13 +1077,14 @@ ray_t* desc_vec_eager(ray_t* x);
 #define GHT_AF_LAST     8u
 #define GHT_AF_PROD     16u
 #define GHT_AF_BINARY   32u  /* two inputs (OP_PEARSON_CORR): packs (x,y) */
-#define GHT_AF_HOLISTIC 64u  /* OP_MEDIAN/TOP/BOT/wide-mm: no accum slot */
+#define GHT_AF_HOLISTIC 64u  /* MEDIAN/QUANTILE/TOP/BOT/wide-mm: no accum slot */
 #define GHT_AF_WIDE     128u /* subset of HOLISTIC: wide-element min/max/first/last */
 /* agg_flags2 bits (agg_flags is full — 8 bits used) */
 #define GHT_AF2_NULLABLE 1u  /* agg input column advertises HAS_NULLS: the row-layout
                               * accumulators skip F64 NaN / NULL_I* sentinels and track
                               * a per-slot non-null count (off_nn) for the divisor and
                               * all-null → typed-null finalization. */
+#define GHT_AF2_TRUTHY   2u  /* OP_ALL/OP_ANY: off_sum stores truthy count */
 /* key_flags bits */
 #define GHT_KEYF_WIDE       1u  /* key does not fit in 8 B (RAY_GUID / RAY_STR) */
 #define GHT_KEYF_INLINE_STR 2u  /* key stores a 16 B ray_str_t descriptor inline */
@@ -1064,6 +1116,10 @@ typedef struct {
     uint16_t off_sum_y;
     uint16_t off_sumsq_y;
     uint16_t off_sumxy;
+    /* Earliest contributing source row for this group.  Every packed entry
+     * carries its source row in the tail slot; partition merges retain the
+     * minimum so output order is independent of radix partition count. */
+    uint16_t off_group_first;
     /* Per-slot non-null count block (n_agg_vals int64 slots), allocated only
      * when any_agg_null (any agg input column HAS_NULLS).  Zero otherwise —
      * finalize then divides by the group row count exactly as before, so
@@ -1195,7 +1251,8 @@ static inline int64_t agg_int_null_sentinel_for(int8_t t) {
 }
 
 bool ght_compute_layout(ght_layout_t* out, uint32_t n_keys, uint32_t n_aggs,
-                        ray_t** agg_vecs, uint8_t need_flags,
+                        ray_t** agg_vecs, ray_t** agg_vecs2,
+                        uint8_t need_flags,
                         const uint16_t* agg_ops,
                         const int8_t* key_types);
 /* By-value copy that fixes the base pointers.  Dispatches on STORAGE, not
@@ -1268,7 +1325,7 @@ void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
 typedef struct {
     group_ht_t* part_hts;       /* n_parts entries */
     uint32_t*   part_offsets;   /* n_parts+1 entries (prefix sums of grp_counts) */
-    uint32_t    n_parts;        /* 1 when sequential, RADIX_P when parallel */
+    uint32_t    n_parts;        /* 1 sequential; execution-derived when parallel */
     uint32_t    total_grps;
     uint16_t    row_stride;
 
@@ -1339,6 +1396,7 @@ ray_t* exec_strlen(ray_graph_t* g, ray_op_t* op);
 ray_t* exec_substr(ray_graph_t* g, ray_op_t* op);
 ray_t* exec_replace(ray_graph_t* g, ray_op_t* op);
 ray_t* exec_concat(ray_graph_t* g, ray_op_t* op);
+ray_t* exec_str_find(ray_graph_t* g, ray_op_t* op);
 
 /* ── exec.c ── */
 ray_t* materialize_mapcommon(ray_t* mc);

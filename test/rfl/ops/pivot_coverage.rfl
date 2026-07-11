@@ -432,13 +432,8 @@
 (set T1Bool (table [cond a b] (list [true] [true] [false])))
 (at (at (select {v: (if cond a b) from: T1Bool}) 'v) 0) -- true
 
-;; Note: with a 1-row BOOL table, both then_v and else_v have len=1.
-;; then_scalar=true via len==1; then_v->b8 reads the first byte of the
-;; len field (=1), so the scalar value is always 1 (true) regardless of
-;; the actual column data.  The purpose of the test is to exercise the
-;; len==1 scalar code path (lines 181-188), not to verify semantics.
 (set T1Boolb (table [cond a b] (list [false] [true] [false])))
-(at (at (select {v: (if cond a b) from: T1Boolb}) 'v) 0) -- true
+(at (at (select {v: (if cond a b) from: T1Boolb}) 'v) 0) -- false
 
 ;; ====================================================================
 ;; Section 18: exec_if — 1-row table; then_scalar via len==1 for I16
@@ -446,14 +441,11 @@
 ;;             (lines 210-218) with then_scalar=true.
 ;; ====================================================================
 
-;; Note: I16 scalar path reads then_v->i32 directly (no ray_is_atom check).
-;; For a 1-element I16 vector, then_v->i32 = first 4 bytes of len field = 1.
-;; So t_scalar = (int16_t)1 = 1, not 100.  Goal: exercise the len==1 code path.
 (set T1I16 (table [cond a b] (list [true] (as 'I16 [100]) (as 'I16 [200]))))
-(at (at (select {v: (if cond a b) from: T1I16}) 'v) 0) -- 1
+(at (at (select {v: (if cond a b) from: T1I16}) 'v) 0) -- 100
 
 (set T1I16b (table [cond a b] (list [false] (as 'I16 [100]) (as 'I16 [200]))))
-(at (at (select {v: (if cond a b) from: T1I16b}) 'v) 0) -- 1
+(at (at (select {v: (if cond a b) from: T1I16b}) 'v) 0) -- 200
 
 ;; ====================================================================
 ;; Section 19: exec_if — 1-row table; I64 scalar path (lines 80-87)
@@ -498,18 +490,13 @@
 ;;             non-STR, non-SYM type (e.g. I64) in a STR-output if.
 ;; ====================================================================
 
-;; (if cond n1 s2): promote(RAY_I64, RAY_STR)=RAY_STR.
-;; With 1-row table: then_scalar=true (I64 len=1), then_v->type=RAY_I64.
-;; Not -RAY_STR, not RAY_STR, not RAY_SYM → line 116 fallback: sp="",sl=0.
 (set T1I64StrA (table [cond n1 s2] (list [true] [0] (list "worldv"))))
 (count (at (select {s: (if cond n1 s2) from: T1I64StrA}) 's)) -- 1
-(at (at (select {s: (if cond n1 s2) from: T1I64StrA}) 's) 0) -- ""
+(at (at (select {s: (if cond n1 s2) from: T1I64StrA}) 's) 0) -- 0
 
-;; (if cond s2 n1): promote(RAY_STR, RAY_I64)=RAY_STR.
-;; cond=false: else_scalar=true (I64 len=1), else_v->type=RAY_I64 → line 139 fallback.
 (set T1I64StrB (table [cond s1 n2] (list [false] (list "hellov") [0])))
 (count (at (select {s: (if cond s1 n2) from: T1I64StrB}) 's)) -- 1
-(at (at (select {s: (if cond s1 n2) from: T1I64StrB}) 's) 0) -- ""
+(at (at (select {s: (if cond s1 n2) from: T1I64StrB}) 's) 0) -- 0
 
 ;; ====================================================================
 ;; Section 23: exec_if — STR output, SYM *atom* then-branch

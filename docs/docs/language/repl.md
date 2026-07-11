@@ -63,7 +63,7 @@ For one-off measurement, use the `timeit` builtin which returns elapsed time in 
 
 The REPL auto-detects incomplete expressions by tracking unmatched brackets `( [ {`. When the current input has unmatched openers, pressing Enter starts a continuation line instead of evaluating:
 
-```lisp
+```text
 ‣ (set double
     (fn [x]
       (* x 2)))
@@ -78,14 +78,21 @@ The parser is aware of string literals and `;` comments, so brackets inside stri
 |---|---|
 | **Up** / **Ctrl-P** | Previous history entry |
 | **Down** / **Ctrl-N** | Next history entry |
-| **Left** / **Right** | Move cursor (Right at end of line accepts ghost text) |
+| **Left** / **Ctrl-B** | Move cursor left |
+| **Right** / **Ctrl-F** | Move cursor right (at end of line accepts ghost text) |
+| **Alt-B** / **Ctrl-Left** / **Alt-Left** | Move one word left |
+| **Alt-F** / **Ctrl-Right** / **Alt-Right** | Move one word right |
 | **Home** / **Ctrl-A** | Move to start of line |
 | **End** / **Ctrl-E** | Move to end of line |
 | **Tab** | Autocomplete (cycles through candidates) |
 | **Ctrl-R** | Reverse incremental history search |
 | **Ctrl-K** | Kill from cursor to end of line |
+| **Ctrl-L** | Clear and redraw the screen |
+| **Ctrl-T** | Transpose characters around the cursor |
 | **Ctrl-U** | Kill entire line |
 | **Ctrl-W** | Delete word backward |
+| **Alt-D** | Delete word forward |
+| **Alt-Backspace** | Delete word backward |
 | **Delete** | Delete character at cursor |
 | **Backspace** | Delete character before cursor |
 | **Ctrl-C** | Cancel current input (interrupts running evaluation) |
@@ -98,9 +105,9 @@ The REPL highlights input in real time as you type:
 
 - **Keywords** and special forms (`set`, `fn`, `select`, `if`, ...)
 - **Strings** in double quotes
-- **Numbers** (integers and floats)
+- **Standalone operators** (`+`, `-`, `*`, `/`, comparisons, ...)
 - **Comments** starting with `;`
-- **Bracket matching** — the bracket under the cursor and its partner are highlighted. Unmatched brackets are visually distinct.
+- **Bracket matching** — the bracket under the cursor and its partner are highlighted; unmatched delimiters are marked in red.
 
 Highlighting is stripped from the final submitted text so it does not interfere with parsing.
 
@@ -110,10 +117,10 @@ Press **Tab** to complete the current token. Candidates are drawn from four sour
 
 - Built-in function names
 - Global environment bindings (variables you have defined)
-- The global symbol table
+- Table column names when the current query references a table via `from:` or `from: 'table`
 - Words from history entries
 
-Press **Tab** repeatedly to cycle through matches. Press **Esc** to cancel.
+Press **Tab** repeatedly to cycle through matches. While cycling, the REPL shows a compact candidate strip with source labels such as `[env]`, `[col]`, and `[hist]`. Press **Esc** to cancel.
 
 ## Script Mode
 

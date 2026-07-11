@@ -2756,6 +2756,155 @@ static test_result_t test_repl_pty_sigint_during_eval(void) {
     PASS();
 }
 
+#ifndef RAY_OS_WINDOWS
+static char* find_bytes(char* hay, size_t hlen, const char* needle, size_t nlen) {
+    if (!hay || !needle || nlen == 0 || hlen < nlen) return NULL;
+    for (size_t i = 0; i + nlen <= hlen; i++) {
+        if (memcmp(hay + i, needle, nlen) == 0) return hay + i;
+    }
+    return NULL;
+}
+
+static bool pty_read_until(int fd, const char* needle, int timeout_ms,
+                           char* accum, size_t cap, size_t* pos) {
+    size_t nlen = strlen(needle);
+    for (int waited = 0; waited < timeout_ms; waited += 10) {
+        char buf[4096];
+        ssize_t n = read(fd, buf, sizeof(buf));
+        if (n > 0) {
+            if (*pos + (size_t)n > cap) {
+                size_t keep = cap / 2;
+                memmove(accum, accum + *pos - keep, keep);
+                *pos = keep;
+            }
+            memcpy(accum + *pos, buf, (size_t)n);
+            *pos += (size_t)n;
+            if (find_bytes(accum, *pos, needle, nlen)) return true;
+        } else if (n < 0 && errno != EAGAIN && errno != EINTR) {
+            return false;
+        }
+        usleep(10 * 1000);
+    }
+    return false;
+}
+
+/* A literal Ctrl-C keypress must interrupt lazy/DAG materialization, not sit
+ * in raw input until after the result prints. */
+static int run_pty_ctrl_c_during_lazy_materialize(void) {
+    enum { N = 20000000 };
+    const char* marker = "__RF_LAZY_SIGINT__";
+    const char* marker_line = "\r\n__RF_LAZY_SIGINT__\r\n";
+    const char* expected_result = "[0Nl";
+
+    int master_fd = -1;
+    pid_t pid = forkpty(&master_fd, NULL, NULL, NULL);
+    if (pid < 0) return -1;
+
+    if (pid == 0) {
+        setenv("RAYFORCE_CORES", "2", 1);
+        execl("./rayforce", "./rayforce", "-i", (char*)NULL);
+        _exit(127);
+    }
+
+    int flags = fcntl(master_fd, F_GETFL, 0);
+    if (flags >= 0) fcntl(master_fd, F_SETFL, flags | O_NONBLOCK);
+
+    char accum[16384];
+    size_t pos = 0;
+    if (!pty_read_until(master_fd, "Github:", 10000, accum, sizeof(accum), &pos)) {
+        kill(pid, SIGKILL);
+        int s; waitpid(pid, &s, 0);
+        close(master_fd);
+        return -9;
+    }
+
+    pos = 0;
+    const char* preload_fmt = "(do (set l (til %d)) 0)\n";
+    char preload[96];
+    snprintf(preload, sizeof(preload), preload_fmt, N);
+    (void)write(master_fd, preload, strlen(preload));
+    if (!pty_read_until(master_fd, "\r\n0\r\n", 30000, accum, sizeof(accum), &pos)) {
+        kill(pid, SIGKILL);
+        int s; waitpid(pid, &s, 0);
+        close(master_fd);
+        return -10;
+    }
+
+    pos = 0;
+    char expr[256];
+    snprintf(expr, sizeof(expr),
+             "(do (println \"%s\") (deltas (+ l 1)))\n", marker);
+    (void)write(master_fd, expr, strlen(expr));
+    if (!pty_read_until(master_fd, marker_line, 10000, accum, sizeof(accum), &pos)) {
+        kill(pid, SIGKILL);
+        int s; waitpid(pid, &s, 0);
+        close(master_fd);
+        return -11;
+    }
+
+    /* The marker is emitted immediately before constructing the lazy result.
+     * Send Ctrl-C as soon as it is observed: fixed sleeps race with faster
+     * materialization and can miss the interruptible window entirely. */
+    const char ctrl_c = '\003';
+    (void)write(master_fd, &ctrl_c, 1);
+
+    bool saw_ctrl_c = false;
+    bool result_before_ctrl_c = false;
+    size_t ctrl_len = strlen("^C");
+    size_t res_len = strlen(expected_result);
+    for (int waited = 0; waited < 5000; waited += 10) {
+        char buf[4096];
+        ssize_t n = read(master_fd, buf, sizeof(buf));
+        if (n > 0) {
+            if (pos + (size_t)n > sizeof(accum)) {
+                size_t keep = sizeof(accum) / 2;
+                memmove(accum, accum + pos - keep, keep);
+                pos = keep;
+            }
+            memcpy(accum + pos, buf, (size_t)n);
+            pos += (size_t)n;
+            char* cpos = find_bytes(accum, pos, "^C", ctrl_len);
+            char* rpos = find_bytes(accum, pos, expected_result, res_len);
+            if (rpos && (!cpos || rpos < cpos)) {
+                result_before_ctrl_c = true;
+                break;
+            }
+            if (cpos) {
+                saw_ctrl_c = true;
+                break;
+            }
+        } else if (n < 0 && errno != EAGAIN && errno != EINTR) {
+            break;
+        }
+        usleep(10 * 1000);
+    }
+
+    (void)write(master_fd, ":q\n", 3);
+    int status = 0;
+    for (int i = 0; i < 30; i++) {
+        pid_t r = waitpid(pid, &status, WNOHANG);
+        if (r == pid) break;
+        usleep(100 * 1000);
+    }
+    if (waitpid(pid, &status, WNOHANG) == 0) {
+        kill(pid, SIGKILL);
+        waitpid(pid, &status, 0);
+    }
+    close(master_fd);
+
+    if (result_before_ctrl_c) return -3;
+    return saw_ctrl_c ? 0 : -2;
+}
+#endif
+
+static test_result_t test_repl_pty_ctrl_c_during_lazy_materialize(void) {
+#ifndef RAY_OS_WINDOWS
+    int rc = run_pty_ctrl_c_during_lazy_materialize();
+    TEST_ASSERT_FMT(rc == 0, "lazy materialize Ctrl-C failed: %d", rc);
+#endif
+    PASS();
+}
+
 /* ─── Suite definition ───────────────────────────────────────────── */
 
 const test_entry_t repl_entries[] = {
@@ -2874,6 +3023,7 @@ const test_entry_t repl_entries[] = {
     { "repl/pty/remote_master_close",       test_repl_pty_remote_master_close,       repl_setup, repl_teardown },
     { "repl/pty/nopoll_master_close",       test_repl_pty_nopoll_master_close,       repl_setup, repl_teardown },
     { "repl/pty/sigint_during_eval",        test_repl_pty_sigint_during_eval,        repl_setup, repl_teardown },
+    { "repl/pty/ctrl_c_during_lazy_materialize", test_repl_pty_ctrl_c_during_lazy_materialize, repl_setup, repl_teardown },
     { "repl/run/piped/with_poll_listen",    test_repl_run_piped_with_poll_listen,    repl_setup, repl_teardown },
 
     { NULL, NULL, NULL, NULL },

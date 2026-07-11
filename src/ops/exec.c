@@ -30,6 +30,7 @@
 #include "mem/heap.h"
 #include "mem/sys.h"
 #include "core/qstats.h"   /* per-worker parallelism stats for profile spans */
+#include "core/qmeasure.h" /* shared worker aggregate */
 #include "core/runtime.h"  /* __VM — filter-compaction projection keep-set */
 
 /* Global profiler instance (zero-initialized = inactive) */
@@ -1191,8 +1192,8 @@ static int idx_filter_decode(ray_graph_t* g, ray_op_t* pred_op,
  * WHERE filter, after ray_optimize.  When the compiled filter's predicate
  * is exactly membership on the single bare group-key column — (in c SET)
  * or (== c K), no other conjuncts, no chained filter — and that column
- * carries a fresh CSR hash index, the surviving groups are exactly the
- * key set and each group's rows are its full CSR slice: resolve the
+ * carries a fresh hash or part index, the surviving groups are exactly the
+ * key set and each group's rows are its full index slice: resolve the
  * slices NOW (freshness verified inside the resolver) and arm the hint
  * on g.  exec_group consumes it — aggregating the slices directly, or
  * folding them into the selection the skipped filter would have
@@ -1206,7 +1207,8 @@ bool ray_slice_group_probe(ray_graph_t* g, ray_op_t* root, ray_t* by_col) {
     if (!in0 || in0->opcode == OP_FILTER) return false;
     if (by_col->type != RAY_SYM || ray_is_atom(by_col)) return false;
     if (by_col->attrs & RAY_ATTR_HAS_NULLS) return false;
-    if (ray_index_kind(by_col) != RAY_IDX_HASH) return false;
+    ray_idx_kind_t kind = ray_index_kind(by_col);
+    if (kind != RAY_IDX_HASH && kind != RAY_IDX_PART) return false;
     ray_op_t* pred = op_child(g, root, 1);
     if (!pred) return false;
 
@@ -1235,7 +1237,7 @@ bool ray_slice_group_probe(ray_graph_t* g, ray_op_t* root, ray_t* by_col) {
     ray_idx_consults[IDX_SITE_GROUP_SLICE]++;
     ray_idx_slice_t* sl = NULL;
     ray_t* shdr = NULL;
-    int64_t k = ray_index_hash_sym_slices(by_col, keys, &sl, &shdr);
+    int64_t k = ray_index_sym_slices(by_col, keys, &sl, &shdr);
     if (eq_atom) ray_release(eq_atom);
     if (k < 0) return false;
     ray_idx_hits[IDX_SITE_GROUP_SLICE]++;
@@ -1429,6 +1431,15 @@ static ray_t* exec_pushed_group_filter(ray_graph_t* g, ray_op_t* filter_op) {
  * element-wise range OP_ROUND..OP_IDIV) are admitted in the walk; any other
  * opcode, an oversized graph, or overflow returns -1 — callers must treat
  * that as "unknown" and skip the optimisation. */
+/* Opcodes handled by the elementwise case of exec_node_inner — must
+ * match its case labels (ROUND sits at 9, outside NEG..CAST; IDIV at
+ * 49, outside ADD..MAX2; extra unary math starts at 137). */
+static inline bool op_is_elementwise(uint16_t o) {
+    return o == OP_ROUND || (o >= OP_NEG && o <= OP_CAST)
+        || (o >= OP_ADD && o <= OP_MAX2) || o == OP_POW || o == OP_IDIV
+        || (o >= OP_SIN && o <= OP_SIGNUM);
+}
+
 static int collect_scan_syms(ray_graph_t* g, const uint32_t* roots, int nroots,
                              int64_t* syms, int max, bool* has_expr) {
     *has_expr = false;
@@ -1469,7 +1480,7 @@ static int collect_scan_syms(ray_graph_t* g, const uint32_t* roots, int nroots,
         }
         if (node->opcode == OP_CONST) continue;
         /* Admit only scalar element-wise expression nodes. */
-        if (node->opcode < OP_ROUND || node->opcode > OP_IDIV) return -1;
+        if (!op_is_elementwise(node->opcode)) return -1;
 
         for (int i = 0; i < node->arity && i < 2; i++) {
             if (node->in_id[i] == RAY_OP_NONE) continue;
@@ -1512,8 +1523,9 @@ static int group_input_scan_syms(ray_graph_t* g, ray_op_ext_t* gx,
  * space-separated pass labels (predicate pushdown, …).  Cached per opcode so
  * the returned pointer stays valid for the life of a span. */
 static const char* prof_op_label(uint16_t opc) {
-    if (opc > OP_KNN_RERANK) return ray_opcode_name(opc);
-    static char lc[OP_KNN_RERANK + 1][28];
+#define PROF_OP_LABEL_MAX OP_WAVG
+    if (opc > PROF_OP_LABEL_MAX) return ray_opcode_name(opc);
+    static char lc[PROF_OP_LABEL_MAX + 1][28];
     if (!lc[opc][0]) {
         const char* up = ray_opcode_name(opc);
         if (!up) return NULL;
@@ -1527,6 +1539,7 @@ static const char* prof_op_label(uint16_t opc) {
         lc[opc][i] = '\0';
     }
     return lc[opc];
+#undef PROF_OP_LABEL_MAX
 }
 
 /* Is this opcode a "heavy" pipeline breaker worth profiling? */
@@ -1535,6 +1548,13 @@ static inline bool op_is_heavy(uint16_t opc) {
            opc == OP_JOIN   || opc == OP_WINDOW_JOIN || opc == OP_SELECT ||
            opc == OP_HEAD   || opc == OP_TAIL || opc == OP_WINDOW ||
            opc == OP_PIVOT  ||
+           opc == OP_LAG    || opc == OP_LEAD || opc == OP_DELTAS ||
+           opc == OP_RATIOS || opc == OP_FILLS || opc == OP_SUMS ||
+           opc == OP_AVGS   || opc == OP_MINS  || opc == OP_MAXS ||
+           opc == OP_PRDS   || opc == OP_DIFFER ||
+           opc == OP_MSUM   || opc == OP_MAVG || opc == OP_MMIN ||
+           opc == OP_MMAX   || opc == OP_MCOUNT || opc == OP_MVAR ||
+           opc == OP_MDEV   ||
            (opc >= OP_EXPAND && opc <= OP_KNN_RERANK);
 }
 
@@ -1555,14 +1575,6 @@ static inline bool op_is_heavy(uint16_t opc) {
  *     ~2.5 MB even at ASan frame sizes. */
 #define RAY_EXEC_MAX_DEPTH 64
 static _Thread_local int32_t tl_exec_depth = 0;
-
-/* Opcodes handled by the elementwise case of exec_node_inner — must
- * match its case labels (ROUND sits at 9, outside NEG..CAST; IDIV at
- * 49, outside ADD..MAX2). */
-static inline bool op_is_elementwise(uint16_t o) {
-    return o == OP_ROUND || (o >= OP_NEG && o <= OP_CAST)
-        || (o >= OP_ADD && o <= OP_MAX2) || o == OP_IDIV;
-}
 
 /* Iterative post-order evaluation of an elementwise subtree.
  *
@@ -1759,8 +1771,8 @@ ray_t* exec_node(ray_graph_t* g, ray_op_t* op) {
                 int64_t cur = 0; ray_sys_get_stat(&cur, NULL);
                 sp->sys_cur    = cur;
                 sp->qs_rows    = ray_qstats_sum_rows();
-                uint64_t sum = 0, mx = 0; uint32_t used = 0;
-                ray_qstats_agg(&used, &sum, &mx);
+                uint64_t sum = 0; uint32_t used = 0;
+                ray_query_workers_snapshot(&used, &sum);
                 sp->qs_busy_ns = sum;
             }
         }
@@ -1775,8 +1787,8 @@ ray_t* exec_node(ray_graph_t* g, ray_op_t* op) {
             int64_t cur = 0; ray_sys_get_stat(&cur, NULL);
             ep->sys_cur = cur;
             ep->qs_rows = ray_qstats_sum_rows();
-            uint64_t sum = 0, mx = 0; uint32_t used = 0;
-            ray_qstats_agg(&used, &sum, &mx);
+            uint64_t sum = 0; uint32_t used = 0;
+            ray_query_workers_snapshot(&used, &sum);
             ep->qs_busy_ns = sum;
             ep->qs_workers = used;
             /* Result footprint — rows this operator produced. */
@@ -1840,7 +1852,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     seg_nulls |= segs[s]->attrs & RAY_ATTR_HAS_NULLS;
                     off += segs[s]->len;
                 }
-                /* Invariant 16.4: propagate HAS_NULLS across segments. */
+                /* Null propagation: propagate HAS_NULLS across segments. */
                 flat->attrs |= seg_nulls;
                 /* Raw-copied SYM cell ids resolve over the partitions'
                  * shared domain (first SYM segment is the rep). */
@@ -1874,9 +1886,12 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
         /* Unary element-wise */
         case OP_NEG: case OP_ABS: case OP_NOT: case OP_SQRT:
         case OP_LOG: case OP_EXP: case OP_CEIL: case OP_FLOOR: case OP_ROUND:
+        case OP_SIN: case OP_ASIN: case OP_COS: case OP_ACOS:
+        case OP_TAN: case OP_ATAN: case OP_RECIPROCAL: case OP_SIGNUM:
         case OP_ISNULL: case OP_CAST:
         /* Binary element-wise */
         case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_IDIV: case OP_MOD:
+        case OP_POW:
         case OP_EQ: case OP_NE: case OP_LT: case OP_LE:
         case OP_GT: case OP_GE: case OP_AND: case OP_OR:
         case OP_MIN2: case OP_MAX2: {
@@ -1899,7 +1914,8 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
         }
 
         /* Reductions */
-        case OP_SUM: case OP_PROD: case OP_MIN: case OP_MAX:
+        case OP_SUM: case OP_PROD: case OP_ALL: case OP_ANY:
+        case OP_MIN: case OP_MAX:
         case OP_COUNT: case OP_AVG: case OP_FIRST: case OP_LAST:
         case OP_STDDEV: case OP_STDDEV_POP: case OP_VAR: case OP_VAR_POP: {
             ray_t* input = exec_node(g, op_child(g, op, 0));
@@ -1988,6 +2004,41 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
             return result;
         }
 
+        case OP_LAG: case OP_LEAD: case OP_DELTAS: case OP_RATIOS:
+        case OP_FILLS: case OP_SUMS: case OP_AVGS: case OP_MINS:
+        case OP_MAXS: case OP_PRDS: case OP_DIFFER:
+        case OP_MSUM: case OP_MAVG: case OP_MMIN: case OP_MMAX:
+        case OP_MCOUNT: case OP_MVAR: case OP_MDEV: {
+            ray_t* input = exec_node(g, op_child(g, op, 0));
+            if (!input || RAY_IS_ERR(input)) return input;
+            if (!ray_is_vec(input)) {
+                ray_release(input);
+                return ray_error("type", "%s expects a vector input", ray_opcode_name(op->opcode));
+            }
+            ray_t* result = NULL;
+            switch (op->opcode) {
+                case OP_LAG:    result = lag_vec_eager(input); break;
+                case OP_LEAD:   result = lead_vec_eager(input); break;
+                case OP_DELTAS: result = deltas_vec_eager(input); break;
+                case OP_RATIOS: result = ratios_vec_eager(input); break;
+                case OP_FILLS:  result = fills_vec_eager(input); break;
+                case OP_SUMS:   result = running_vec_eager(input, OP_SUMS); break;
+                case OP_AVGS:   result = running_vec_eager(input, OP_AVGS); break;
+                case OP_MINS:   result = running_vec_eager(input, OP_MINS); break;
+                case OP_MAXS:   result = running_vec_eager(input, OP_MAXS); break;
+                case OP_PRDS:   result = running_vec_eager(input, OP_PRDS); break;
+                case OP_DIFFER: result = differ_vec_eager(input); break;
+                default: {
+                    ray_op_ext_t* ext = find_ext(g, op->id);
+                    int64_t window = ext ? ext->param : 0;
+                    result = moving_vec_eager(input, op->opcode, window);
+                    break;
+                }
+            }
+            ray_release(input);
+            return result;
+        }
+
         case OP_FILTER: {
             /* HAVING fusion: FILTER(GROUP) — evaluate the predicate against
              * the GROUP result rather than the original input table.
@@ -2022,6 +2073,41 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
 
             ray_t* input = exec_node(g, op_child(g, op, 0));
             if (!input || RAY_IS_ERR(input)) return input;
+            /* A verified physically-sorted column remains routable even when
+             * this is the outer half of a split AND predicate.  Intersect the
+             * new contiguous range rowsel with the existing selection instead
+             * of evaluating the second bound over surviving rows. */
+            if (input->type == RAY_TABLE) {
+                ray_t* scol = NULL;
+                uint16_t sop = 0;
+                int64_t ski = 0;
+                double skf = 0.0;
+                int sisf = 0;
+                if (idx_filter_decode(g, op_child(g, op, 1), &scol, &sop,
+                                      &ski, &skf, &sisf) &&
+                    sop != OP_NE && ray_attr_is_sorted(scol)) {
+                    ray_idx_consults[IDX_SITE_FILTER_RANGE]++;
+                    ray_t* ssel = ray_sorted_range_rowsel(scol, sop, ski, skf,
+                                                          (bool)sisf);
+                    if (ssel) {
+                        if (g->selection) {
+                            ray_t* merged = ray_rowsel_intersect(g->selection,
+                                                                 ssel);
+                            ray_rowsel_release(ssel);
+                            if (merged) {
+                                ray_rowsel_release(g->selection);
+                                g->selection = merged;
+                                ray_idx_hits[IDX_SITE_FILTER_RANGE]++;
+                                return input;
+                            }
+                        } else {
+                            g->selection = ssel;
+                            ray_idx_hits[IDX_SITE_FILTER_RANGE]++;
+                            return input;
+                        }
+                    }
+                }
+            }
             /* Hash-index point-lookup fast path: when the predicate is
              * `col == K` on a column with RAY_IDX_HASH attached and
              * built for the column's current length, install the
@@ -2074,7 +2160,9 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                         }
                     }
 
-                    /* 3. Hash-eq: integer or SYM EQ; re-check HAS_NULLS. */
+                    /* 3. Hash/part EQ: integer or SYM; re-check HAS_NULLS.
+                     * A part hit is already one contiguous physical span, so
+                     * it stays eligible at any density. */
                     if (cmp_op == OP_EQ && !is_float &&
                         !(col->attrs & RAY_ATTR_HAS_NULLS)) {
                         /* SYM equality: idx_filter_decode passes the global intern id;
@@ -2103,21 +2191,33 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                             }
                         }
                         if (!sym_probe_skip) {
-                            if (ray_index_kind(col) == RAY_IDX_HASH)
-                                ray_idx_consults[IDX_SITE_FILTER_HASH]++;
-                            ray_t* sel = ray_index_hash_eq_rowsel(col, key_i);
-                            if (sel) {
-                                ray_idx_hits[IDX_SITE_FILTER_HASH]++;
-                                g->selection = sel;
-                                return input;
+                            ray_idx_kind_t eq_kind = ray_index_kind(col);
+                            if (eq_kind == RAY_IDX_HASH ||
+                                eq_kind == RAY_IDX_PART) {
+                                idx_site_t site = eq_kind == RAY_IDX_HASH
+                                    ? IDX_SITE_FILTER_HASH
+                                    : IDX_SITE_FILTER_PART;
+                                ray_idx_consults[site]++;
+                                ray_t* sel = eq_kind == RAY_IDX_HASH
+                                    ? ray_index_hash_eq_rowsel(col, key_i)
+                                    : ray_index_part_eq_rowsel(col, key_i);
+                                if (sel) {
+                                    ray_idx_hits[site]++;
+                                    g->selection = sel;
+                                    return input;
+                                }
                             }
                             /* sel == NULL: ineligible (wrong/stale index kind,
                              * key out of range) or OOM — fall through to scan. */
                         }
                     }
 
-                    /* 4. Sort-index range: EQ/LT/LE/GT/GE (NE returns NULL). */
+                    /* 4. Sort-index range: EQ/LT/LE/GT/GE (NE returns NULL).
+                     * The physical-sorted route runs before this block so it
+                     * can also intersect an existing chained selection. */
                     if (cmp_op != OP_NE) {
+                        /* Shuffled physical rows need the
+                         * permutation probe and its sparse-span guard. */
                         if (ray_index_kind(col) == RAY_IDX_SORT) {
                             ray_idx_consults[IDX_SITE_FILTER_RANGE]++;
                             ray_t* sel = ray_index_range_rowsel(col, cmp_op,
@@ -2240,17 +2340,18 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     }
                 }
 
-                /* 5. Hash-index IN probe: FILTER(IN(SCAN col, CONST set_vec))
-                 * on an integer-family column with a hash index.  Probes the
-                 * hash chain for each unique set element; builds one rowsel
-                 * over the union of matches. */
+                /* 5. Hash/part-index IN probe:
+                 * FILTER(IN(SCAN col, CONST set_vec)).  Hash indexes probe
+                 * each unique set element; part indexes select their
+                 * contiguous physical spans directly. */
                 {
                     ray_t* in_col     = NULL;
                     ray_t* in_set_lit = NULL;
                     if (idx_filter_in_decode(g, op_child(g, op, 1), &in_col, &in_set_lit)) {
                         bool in_col_is_float = (in_col->type == RAY_F32 ||
                                                in_col->type == RAY_F64);
-                        if (ray_index_kind(in_col) == RAY_IDX_HASH &&
+                        ray_idx_kind_t in_kind = ray_index_kind(in_col);
+                        if ((in_kind == RAY_IDX_HASH || in_kind == RAY_IDX_PART) &&
                             !in_col_is_float) {
                             ray_idx_consults[IDX_SITE_IN]++;
                             ray_t* sel = ray_index_in_rowsel(in_col, in_set_lit);
@@ -2758,6 +2859,14 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 input = exec_node(g, op_child(g, op, 0));
             }
             if (!input || RAY_IS_ERR(input)) return input;
+            if (g->selection && input->type == RAY_TABLE) {
+                ray_t* compacted = sel_compact(g, input, g->selection, NULL, 0);
+                ray_release(input);
+                ray_release(g->selection);
+                g->selection = NULL;
+                input = compacted;
+                if (!input || RAY_IS_ERR(input)) return input;
+            }
             if (input->type == RAY_TABLE) {
                 int64_t ncols = ray_table_ncols(input);
                 int64_t nrows = ray_table_nrows(input);
@@ -2803,7 +2912,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                                     dst_off += take;
                                     remaining -= take;
                                 }
-                                /* Invariant 16.4: conservatively propagate
+                                /* Null propagation: conservatively propagate
                                  * HAS_NULLS from the touched segments. */
                                 head_vec->attrs |= seg_nulls;
                                 /* raw SYM cell-id copy from the segments —
@@ -2856,6 +2965,14 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
             ray_t* input = exec_node(g, op_child(g, op, 0));
             if (!input || RAY_IS_ERR(input)) return input;
             int64_t n = ext ? ext->sym : 10;
+            if (g->selection && input->type == RAY_TABLE) {
+                ray_t* compacted = sel_compact(g, input, g->selection, NULL, 0);
+                ray_release(input);
+                ray_release(g->selection);
+                g->selection = NULL;
+                input = compacted;
+                if (!input || RAY_IS_ERR(input)) return input;
+            }
             if (input->type == RAY_TABLE) {
                 int64_t ncols = ray_table_ncols(input);
                 int64_t nrows = ray_table_nrows(input);
@@ -2926,7 +3043,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                                     seg_nulls |= segs[s]->attrs & RAY_ATTR_HAS_NULLS;
                                     remaining -= take;
                                 }
-                                /* Invariant 16.4: conservatively propagate
+                                /* Null propagation: conservatively propagate
                                  * HAS_NULLS from the touched segments. */
                                 tail_vec->attrs |= seg_nulls;
                                 /* raw SYM cell-id copy from the segments —
@@ -3002,6 +3119,9 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
         }
         case OP_CONCAT: {
             return exec_concat(g, op);
+        }
+        case OP_STR_FIND: {
+            return exec_str_find(g, op);
         }
 
         case OP_EXTRACT: {
@@ -3271,7 +3391,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
 
 /* Merge two partial results from partition-streamed execution.
  * Concatenates table columns or vectors across segments. */
-static ray_t* ray_result_merge(ray_t* accum, ray_t* partial) {
+ray_t* ray_result_merge(ray_t* accum, ray_t* partial) {
     if (!accum || RAY_IS_ERR(accum)) {
         if (partial && !RAY_IS_ERR(partial)) ray_retain(partial);
         return partial;
@@ -3318,7 +3438,7 @@ static ray_t* ray_result_merge(ray_t* accum, ray_t* partial) {
  * MAPCOMMON columns are materialized for segment seg_idx: the partition key
  * value is broadcast to fill seg_rows elements.
  * Non-parted columns are retained as-is. */
-static ray_t* build_segment_table(ray_t* parted_tbl, int32_t seg_idx) {
+ray_t* build_segment_table(ray_t* parted_tbl, int32_t seg_idx) {
     int64_t ncols = ray_table_ncols(parted_tbl);
     ray_t* seg_tbl = ray_table_new(ncols);
     if (!seg_tbl || RAY_IS_ERR(seg_tbl)) return seg_tbl;
@@ -3417,16 +3537,19 @@ static bool op_streamable(uint16_t opc) {
         /* Element-wise unary */
         case OP_NEG: case OP_ABS: case OP_NOT: case OP_SQRT:
         case OP_LOG: case OP_EXP: case OP_CEIL: case OP_FLOOR: case OP_ROUND:
+        case OP_SIN: case OP_ASIN: case OP_COS: case OP_ACOS:
+        case OP_TAN: case OP_ATAN: case OP_RECIPROCAL: case OP_SIGNUM:
         case OP_ISNULL: case OP_CAST:
         /* Element-wise binary */
         case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_IDIV: case OP_MOD:
+        case OP_POW:
         case OP_EQ: case OP_NE: case OP_LT: case OP_LE:
         case OP_GT: case OP_GE: case OP_AND: case OP_OR:
         case OP_MIN2: case OP_MAX2: case OP_IF: case OP_IN: case OP_NOT_IN:
         /* String element-wise */
         case OP_LIKE: case OP_ILIKE: case OP_UPPER: case OP_LOWER:
         case OP_STRLEN: case OP_SUBSTR: case OP_REPLACE: case OP_TRIM:
-        case OP_CONCAT:
+        case OP_CONCAT: case OP_STR_FIND:
         /* Temporal element-wise */
         case OP_EXTRACT: case OP_DATE_TRUNC:
         /* Structure */
@@ -3581,7 +3704,7 @@ static ray_t* flatten_parted_col(ray_t* col) {
         seg_nulls |= segs[s]->attrs & RAY_ATTR_HAS_NULLS;
         off += segs[s]->len;
     }
-    /* Null-model invariant 16.4: parted_copy_cells copies sentinel
+    /* Null propagation: parted_copy_cells copies sentinel
      * bit-patterns but not HAS_NULLS — OR it across segments. */
     flat->attrs |= seg_nulls;
     /* Raw-copied SYM cell ids resolve over the partitions' shared

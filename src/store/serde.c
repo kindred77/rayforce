@@ -86,6 +86,10 @@
  * self-describing marker and is safe to carry.  Applied on BOTH ends so
  * we never emit a dangerous bit and never trust one on input. */
 #define RAY_SERDE_ATTR_WIRE_MASK ((uint8_t)(RAY_ATTR_HAS_NULLS | RAY_ATTR_SORTED))
+/* Lambdas reuse the attr byte for function-internal flags: 0x40 is
+ * RAY_FN_COMPILED, not "has nulls".  Only params/body cross the wire, so
+ * compiled metadata must be stripped and rebuilt by the receiving runtime. */
+#define RAY_SERDE_LAMBDA_ATTR_WIRE_MASK ((uint8_t)0)
 
 /* Helper: strlen with bounds */
 static size_t safe_strlen(const uint8_t* buf, int64_t max) {
@@ -467,7 +471,7 @@ int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
     }
 
     case RAY_LAMBDA: {
-        buf[0] = obj->attrs & RAY_SERDE_ATTR_WIRE_MASK;
+        buf[0] = obj->attrs & RAY_SERDE_LAMBDA_ATTR_WIRE_MASK;
         buf++;
         ray_t** slots = (ray_t**)ray_data(obj);
         c = ray_ser_raw(buf, slots[0]);     /* params */
@@ -876,7 +880,7 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len) {
             return lambda;
         }
         lambda->type = RAY_LAMBDA;
-        lambda->attrs = lam_attrs & RAY_SERDE_ATTR_WIRE_MASK;
+        lambda->attrs = lam_attrs & RAY_SERDE_LAMBDA_ATTR_WIRE_MASK;
         lambda->len = 0;
         memset(ray_data(lambda), 0, 7 * sizeof(ray_t*));
         ((ray_t**)ray_data(lambda))[0] = params;

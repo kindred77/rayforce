@@ -8,7 +8,7 @@ The `try` special form evaluates an expression and, if it produces an error, cal
 
 ### Basic Syntax
 
-```lisp
+```text
 (try expr handler)
 ```
 
@@ -86,7 +86,7 @@ Rayfall produces several categories of runtime errors. Understanding these helps
 
 Occur when an operation receives the wrong argument type:
 
-```lisp
+```text
 (+ 1 "hello")
 ; error: type
 ```
@@ -97,7 +97,7 @@ Arithmetic, comparison, and most builtins check argument types and produce type 
 
 Occur when a function receives the wrong number of arguments:
 
-```lisp
+```text
 (+ 1)
 ; error: arity — + expects 2 arguments
 ```
@@ -106,7 +106,7 @@ Occur when a function receives the wrong number of arguments:
 
 Occur when arguments have valid types but invalid values:
 
-```lisp
+```text
 (as 'i64 "not-a-number")
 ; error: domain — cannot parse str as i64
 ```
@@ -131,7 +131,7 @@ Over-taking **cycles** the list rather than truncating:
 
 Any error you create with `raise`:
 
-```lisp
+```text
 (raise "custom error message")
 ; error: domain
 ```
@@ -142,9 +142,9 @@ Internally, `raise` stores your value and triggers a domain error. The `try` han
 
 In restricted evaluation mode (used for IPC), certain functions are blocked:
 
-```lisp
+```text
 ; on a restricted server connection:
-(.sys.exec "rm -rf /")
+(.sys.exec "rm -rf /some/path")
 ; error: access — restricted
 ```
 
@@ -172,7 +172,7 @@ Missing data is a first-class concept in Rayforce. There are three distinct null
 
     - **RAY_NULL_OBJ** — the void return value (from `println`, `show`)
     - **Typed nulls** — `0Ni` (int), `0Nf` (float), `0Nd` (date) — missing values in data
-    - **Null bitmaps** — per-element null flags on vectors
+    - **Vector null sentinels** — type-correct sentinel values in vector payloads
 
 ### Typed Null Literals
 
@@ -206,7 +206,7 @@ This is the standard SQL/database behavior: null in, null out. It prevents silen
 
 Some operations like `println` and `show` return a void null. This is different from typed nulls — using it in arithmetic produces a type error, not propagation:
 
-```lisp
+```text
 (set x (println "hello"))
 ; hello
 (+ x 1)
@@ -215,7 +215,7 @@ Some operations like `println` and `show` return a void null. This is different 
 
 ### Nulls in Vectors
 
-Vectors track null elements via a compact bitmap. Null elements propagate through vectorized operations:
+Vectors track null elements with type-correct sentinels plus the `RAY_ATTR_HAS_NULLS` hint. Null elements propagate through vectorized operations:
 
 ```lisp
 ; The null literal must match the vector's element type (0Nl for i64).
@@ -365,7 +365,7 @@ If a computed column expression fails inside `select`, the entire select produce
 
 ### Processing Rows with Error Tolerance
 
-```lisp
+```text
 ;; process each row, collecting errors separately
 (set results
   (map (fn [row]

@@ -233,6 +233,9 @@ ray_t* ray_neg_fn(ray_t* x);
 
 /* Aggregation */
 ray_t* ray_sum_fn(ray_t* x);
+ray_t* ray_prod_fn(ray_t* x);
+ray_t* ray_all_fn(ray_t* x);
+ray_t* ray_any_fn(ray_t* x);
 ray_t* ray_count_fn(ray_t* x);
 ray_t* ray_avg_fn(ray_t* x);
 ray_t* ray_min_fn(ray_t* x);
@@ -240,11 +243,18 @@ ray_t* ray_max_fn(ray_t* x);
 ray_t* ray_first_fn(ray_t* x);
 ray_t* ray_last_fn(ray_t* x);
 ray_t* ray_med_fn(ray_t* x);
+ray_t* ray_mode_fn(ray_t* x);
+ray_t* ray_quantile_fn(ray_t* x, ray_t* q);
+ray_t* ray_percentile_fn(ray_t* x, ray_t* p);
 ray_t* ray_dev_fn(ray_t* x);
 ray_t* ray_stddev_fn(ray_t* x);
 ray_t* ray_stddev_pop_fn(ray_t* x);
 ray_t* ray_var_fn(ray_t* x);
 ray_t* ray_var_pop_fn(ray_t* x);
+ray_t* ray_cov_fn(ray_t* x, ray_t* y);
+ray_t* ray_scov_fn(ray_t* x, ray_t* y);
+ray_t* ray_wsum_fn(ray_t* x, ray_t* y);
+ray_t* ray_wavg_fn(ray_t* x, ray_t* y);
 
 /* Higher-order */
 ray_t* ray_map_fn(ray_t** args, int64_t n);
@@ -262,10 +272,32 @@ ray_t* ray_except_fn(ray_t* vec1, ray_t* vec2);
 ray_t* ray_union_fn(ray_t* vec1, ray_t* vec2);
 ray_t* ray_sect_fn(ray_t* vec1, ray_t* vec2);
 ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj);
+ray_t* ray_drop_fn(ray_t* vec, ray_t* n_obj);
+ray_t* ray_rotate_fn(ray_t* vec, ray_t* n_obj);
+ray_t* ray_cut_fn(ray_t* vec, ray_t* idxs);
+ray_t* ray_cross_fn(ray_t* a, ray_t* b);
 ray_t* ray_at_fn(ray_t* vec, ray_t* idx);
 ray_t* ray_find_fn(ray_t* vec, ray_t* val);
 ray_t* ray_til_fn(ray_t* x);
 ray_t* ray_reverse_fn(ray_t* x);
+ray_t* ray_lag_fn(ray_t* x);
+ray_t* ray_lead_fn(ray_t* x);
+ray_t* ray_deltas_fn(ray_t* x);
+ray_t* ray_ratios_fn(ray_t* x);
+ray_t* ray_fills_fn(ray_t* x);
+ray_t* ray_sums_fn(ray_t* x);
+ray_t* ray_avgs_fn(ray_t* x);
+ray_t* ray_mins_fn(ray_t* x);
+ray_t* ray_maxs_fn(ray_t* x);
+ray_t* ray_prds_fn(ray_t* x);
+ray_t* ray_differ_fn(ray_t* x);
+ray_t* ray_msum_fn(ray_t* n, ray_t* x);
+ray_t* ray_mavg_fn(ray_t* n, ray_t* x);
+ray_t* ray_mmin_fn(ray_t* n, ray_t* x);
+ray_t* ray_mmax_fn(ray_t* n, ray_t* x);
+ray_t* ray_mcount_fn(ray_t* n, ray_t* x);
+ray_t* ray_mvar_fn(ray_t* n, ray_t* x);
+ray_t* ray_mdev_fn(ray_t* n, ray_t* x);
 
 /* Table construction */
 ray_t* ray_list_fn(ray_t** args, int64_t n);
@@ -284,6 +316,7 @@ ray_t* ray_xbar_fn(ray_t* col, ray_t* bucket);
 /* Joins */
 ray_t* ray_left_join_fn(ray_t** args, int64_t n);
 ray_t* ray_inner_join_fn(ray_t** args, int64_t n);
+ray_t* ray_full_join_fn(ray_t** args, int64_t n);
 ray_t* ray_window_join_fn(ray_t** args, int64_t n);
 ray_t* ray_window_join1_fn(ray_t** args, int64_t n);
 

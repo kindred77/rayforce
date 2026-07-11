@@ -91,6 +91,7 @@ static inline ray_t* make_bool(uint8_t v) {
 /* Helpers to extract numeric value as double */
 static inline int is_numeric(ray_t* x) {
     return x->type == -RAY_I64 || x->type == -RAY_F64 ||
+           x->type == -RAY_F32 ||
            x->type == -RAY_I16 || x->type == -RAY_I32 ||
            x->type == -RAY_U8  || x->type == -RAY_BOOL;
 }
@@ -120,6 +121,7 @@ static inline int64_t as_i64(ray_t* x) {
 
 static inline double as_f64(ray_t* x) {
     if (x->type == -RAY_F64) return x->f64;
+    if (x->type == -RAY_F32) return (double)((float)x->f64);
     if (x->type == -RAY_I64) return (double)x->i64;
     if (x->type == -RAY_I32) return (double)x->i32;
     if (x->type == -RAY_I16) return (double)x->i16;
@@ -132,7 +134,12 @@ static inline double as_f64(ray_t* x) {
 }
 
 static inline int is_float_op(ray_t* a, ray_t* b) {
-    return a->type == -RAY_F64 || b->type == -RAY_F64;
+    return a->type == -RAY_F64 || b->type == -RAY_F64 ||
+           a->type == -RAY_F32 || b->type == -RAY_F32;
+}
+
+static inline int both_f32_atoms(ray_t* a, ray_t* b) {
+    return a->type == -RAY_F32 && b->type == -RAY_F32;
 }
 
 /* ══════════════════════════════════════════
@@ -145,6 +152,8 @@ static inline int is_float_op(ray_t* a, ray_t* b) {
 static inline ray_t* null_for_promoted(ray_t* a, ray_t* b) {
     if (a->type == -RAY_F64 || b->type == -RAY_F64)
         return ray_typed_null(-RAY_F64);
+    if (a->type == -RAY_F32 || b->type == -RAY_F32)
+        return ray_typed_null(both_f32_atoms(a, b) ? -RAY_F32 : -RAY_F64);
     if (a->type == -RAY_I64 || b->type == -RAY_I64)
         return ray_typed_null(-RAY_I64);
     if (a->type == -RAY_I32 || b->type == -RAY_I32)
@@ -288,6 +297,7 @@ static inline ray_t* collection_elem(ray_t* coll, int64_t i, int *allocated) {
     void* d = ray_data(coll);
     switch (coll->type) {
         case RAY_I64:       return ray_i64(((int64_t*)d)[i]);
+        case RAY_F32:       return ray_f32(((float*)d)[i]);
         case RAY_F64:       return ray_f64(((double*)d)[i]);
         case RAY_I32:       return ray_i32(((int32_t*)d)[i]);
         case RAY_I16:       return ray_i16(((int16_t*)d)[i]);
@@ -323,6 +333,7 @@ static inline int64_t elem_as_i64(ray_t* elem) {
     if (elem->type == -RAY_I16)  return (int64_t)elem->i16;
     if (elem->type == -RAY_U8)   return (int64_t)elem->u8;
     if (elem->type == -RAY_F64)  return (int64_t)elem->f64;
+    if (elem->type == -RAY_F32)  return (int64_t)((float)elem->f64);
     return elem->i64;
 }
 
@@ -334,6 +345,8 @@ static inline int store_typed_elem(ray_t* vec, int64_t i, ray_t* elem) {
         switch (vec->type) {
             case RAY_F64:
                 ((double*)ray_data(vec))[i] = NULL_F64; break;
+            case RAY_F32:
+                ((float*)ray_data(vec))[i] = NULL_F32; break;
             case RAY_I64: case RAY_TIMESTAMP:
                 ((int64_t*)ray_data(vec))[i] = NULL_I64; break;
             case RAY_I32: case RAY_DATE: case RAY_TIME:
@@ -352,6 +365,7 @@ static inline int store_typed_elem(ray_t* vec, int64_t i, ray_t* elem) {
     switch (vec->type) {
         case RAY_I64:       ((int64_t*)ray_data(vec))[i]  = elem_as_i64(elem); return 0;
         case RAY_F64:       ((double*)ray_data(vec))[i]    = (elem->type == -RAY_F64) ? elem->f64 : (double)elem_as_i64(elem); return 0;
+        case RAY_F32:       ((float*)ray_data(vec))[i]     = (elem->type == -RAY_F32) ? (float)elem->f64 : (float)((elem->type == -RAY_F64) ? elem->f64 : (double)elem_as_i64(elem)); return 0;
         case RAY_I32:       ((int32_t*)ray_data(vec))[i]   = (int32_t)elem_as_i64(elem); return 0;
         case RAY_I16:       ((int16_t*)ray_data(vec))[i]   = (int16_t)elem_as_i64(elem); return 0;
         case RAY_BOOL:      ((bool*)ray_data(vec))[i]      = elem->b8;  return 0;
@@ -420,6 +434,14 @@ ray_t* ray_abs_fn(ray_t* x);
 ray_t* ray_sqrt_fn(ray_t* x);
 ray_t* ray_log_fn(ray_t* x);
 ray_t* ray_exp_fn(ray_t* x);
+ray_t* ray_sin_fn(ray_t* x);
+ray_t* ray_asin_fn(ray_t* x);
+ray_t* ray_cos_fn(ray_t* x);
+ray_t* ray_acos_fn(ray_t* x);
+ray_t* ray_tan_fn(ray_t* x);
+ray_t* ray_atan_fn(ray_t* x);
+ray_t* ray_reciprocal_fn(ray_t* x);
+ray_t* ray_signum_fn(ray_t* x);
 ray_t* ray_pow_fn(ray_t* x, ray_t* y);
 ray_t* ray_top_fn(ray_t* v, ray_t* n_obj);
 ray_t* ray_bot_fn(ray_t* v, ray_t* n_obj);
@@ -428,11 +450,27 @@ ray_t* ray_bot_fn(ray_t* v, ray_t* n_obj);
  * ordered. Defined in src/ops/sort.c; reused by top_n/bot_n accumulators. */
 ray_t* topk_take_vec(ray_t* v, int64_t k, uint8_t desc);
 ray_t* ray_pearson_corr_fn(ray_t* x, ray_t* y);
+ray_t* ray_cov_fn(ray_t* x, ray_t* y);
+ray_t* ray_scov_fn(ray_t* x, ray_t* y);
+ray_t* ray_wsum_fn(ray_t* x, ray_t* y);
+ray_t* ray_wavg_fn(ray_t* x, ray_t* y);
 
 /* In-place median (quickselect).  Caller owns the buffer; we permute
  * elements.  Returns NaN if n <= 0.  Used by aggr_med_per_group_buf in
  * query.c for the fast per-group median path. */
 double ray_median_dbl_inplace(double* a, int64_t n);
+double ray_quantile_dbl_inplace(double* a, int64_t n, double q);
+ray_t* ray_mode_per_group_buf(ray_t* src,
+                              const int64_t* idx_buf,
+                              const int64_t* offsets,
+                              const int64_t* grp_cnt,
+                              int64_t n_groups);
+ray_t* ray_quantile_per_group_buf(ray_t* src,
+                                  const int64_t* idx_buf,
+                                  const int64_t* offsets,
+                                  const int64_t* grp_cnt,
+                                  int64_t n_groups,
+                                  double q);
 
 /* Collection helpers (formerly static in eval.c, now in collection.c) */
 int    atom_eq(ray_t* a, ray_t* b);
@@ -452,10 +490,32 @@ ray_t* ray_except_fn(ray_t* vec1, ray_t* vec2);
 ray_t* ray_union_fn(ray_t* vec1, ray_t* vec2);
 ray_t* ray_sect_fn(ray_t* vec1, ray_t* vec2);
 ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj);
+ray_t* ray_drop_fn(ray_t* vec, ray_t* n_obj);
+ray_t* ray_rotate_fn(ray_t* vec, ray_t* n_obj);
+ray_t* ray_cut_fn(ray_t* vec, ray_t* idxs);
+ray_t* ray_cross_fn(ray_t* a, ray_t* b);
 ray_t* ray_at_fn(ray_t* vec, ray_t* idx);
 ray_t* ray_find_fn(ray_t* vec, ray_t* val);
 ray_t* ray_til_fn(ray_t* x);
 ray_t* ray_reverse_fn(ray_t* x);
+ray_t* ray_lag_fn(ray_t* x);
+ray_t* ray_lead_fn(ray_t* x);
+ray_t* ray_deltas_fn(ray_t* x);
+ray_t* ray_ratios_fn(ray_t* x);
+ray_t* ray_fills_fn(ray_t* x);
+ray_t* ray_sums_fn(ray_t* x);
+ray_t* ray_avgs_fn(ray_t* x);
+ray_t* ray_mins_fn(ray_t* x);
+ray_t* ray_maxs_fn(ray_t* x);
+ray_t* ray_prds_fn(ray_t* x);
+ray_t* ray_differ_fn(ray_t* x);
+ray_t* ray_msum_fn(ray_t* n, ray_t* x);
+ray_t* ray_mavg_fn(ray_t* n, ray_t* x);
+ray_t* ray_mmin_fn(ray_t* n, ray_t* x);
+ray_t* ray_mmax_fn(ray_t* n, ray_t* x);
+ray_t* ray_mcount_fn(ray_t* n, ray_t* x);
+ray_t* ray_mvar_fn(ray_t* n, ray_t* x);
+ray_t* ray_mdev_fn(ray_t* n, ray_t* x);
 ray_t* ray_rand_fn(ray_t* a, ray_t* b);
 ray_t* ray_bin_fn(ray_t* sorted, ray_t* val);
 ray_t* ray_binr_fn(ray_t* sorted, ray_t* val);
@@ -471,6 +531,13 @@ ray_t* ray_enlist_fn(ray_t** args, int64_t n);
 ray_t* ray_split_fn(ray_t* str, ray_t* delim);
 ray_t* ray_strlen_fn(ray_t* x);
 ray_t* ray_like_fn(ray_t* x, ray_t* pattern);
+ray_t* ray_str_find_fn(ray_t* hay, ray_t* needle);
+ray_t* ray_str_join_fn(ray_t* items, ray_t* delim);
+ray_t* ray_upper_fn(ray_t* x);
+ray_t* ray_lower_fn(ray_t* x);
+ray_t* ray_trim_fn(ray_t* x);
+ray_t* ray_substr_fn(ray_t** args, int64_t n);
+ray_t* ray_replace_fn(ray_t** args, int64_t n);
 ray_t* ray_sym_name_fn(ray_t* x);
 
 /* Table builtins (formerly static in eval.c, now in table_builtin.c) */
@@ -482,6 +549,12 @@ ray_t* ray_del_fn(ray_t** args, int64_t n);
 ray_t* ray_row_fn(ray_t* tbl, ray_t* idx);
 ray_t* ray_union_all_fn(ray_t* t1, ray_t* t2);
 ray_t* ray_table_distinct_fn(ray_t* tbl);
+ray_t* ray_cols_fn(ray_t* tbl);
+ray_t* ray_xcol_fn(ray_t* tbl, ray_t* names);
+ray_t* ray_xcols_fn(ray_t* tbl, ray_t* cols);
+ray_t* ray_xkey_fn(ray_t* tbl, ray_t* keys);
+ray_t* ray_xgroup_fn(ray_t* tbl, ray_t* keys);
+ray_t* ray_fkeys_fn(ray_t* tbl);
 ray_t* ray_unify_fn(ray_t* a, ray_t* b);
 
 /* Concat (formerly static in eval.c, now extern for table_builtin.c) */
@@ -525,6 +598,8 @@ ray_t* ray_eval_builtin_fn(ray_t* x);
 ray_t* ray_parse_builtin_fn(ray_t* x);
 ray_t* ray_print_fn(ray_t** args, int64_t n);
 ray_t* ray_meta_fn(ray_t* x);
+ray_t* ray_mem_objsize_fn(ray_t* x);
+ray_t* ray_mem_ts_fn(ray_t** args, int64_t n);
 ray_t* ray_gc_fn(ray_t** args, int64_t n);
 ray_t* ray_system_fn(ray_t* x);
 /* `.sys.cmd "name args"` — registry-dispatched system commands with
@@ -587,7 +662,7 @@ ray_t* ray_log_close_fn(ray_t** args, int64_t n);
 ray_t* ray_log_purge_fn(ray_t** args, int64_t n);
 
 /* Group (formerly static in eval.c, now extern for query.c) */
-ray_t* ray_group_fn(ray_t* x);
+ray_t* ray_group_indices_fn(ray_t* x);
 
 /* I/O and formatting builtins (formerly in eval.c, now in ops/builtins.c) */
 ray_t* ray_println_fn(ray_t** args, int64_t n);
@@ -624,6 +699,7 @@ ray_t* ray_upsert_fn(ray_t** args, int64_t n);
 ray_t* ray_xbar_fn(ray_t* col, ray_t* bucket);
 ray_t* ray_left_join_fn(ray_t** args, int64_t n);
 ray_t* ray_inner_join_fn(ray_t** args, int64_t n);
+ray_t* ray_full_join_fn(ray_t** args, int64_t n);
 ray_t* ray_anti_join_fn(ray_t** args, int64_t n);
 ray_t* ray_window_join_fn(ray_t** args, int64_t n);
 ray_t* ray_window_join1_fn(ray_t** args, int64_t n);

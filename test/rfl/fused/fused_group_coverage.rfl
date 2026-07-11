@@ -1459,8 +1459,7 @@
 ;; The actual thread-local set is still deferred to immediately before
 ;; ray_execute so state leakage on error paths is unchanged.
 ;;
-;; Shape: i32 single key + COUNT + `take N desc n` -- the canonical
-;; ClickBench q32 / q33 pattern.
+;; Shape: i32 single key + COUNT + `take N desc n`.
 ;; ====================================================================
 (set T53 (table [k v] (list (as 'I32 [1 2 3 4 5 1 2 3 4 5 1 2 1 1]) [10 20 30 40 50 60 70 80 90 100 110 120 130 140])))
 (set R53 (select {n: (count v) from: T53 by: k take: 3 desc: n}))

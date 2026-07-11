@@ -276,4 +276,4 @@
 ;;
 ;; sym_lazy_materialize_to_locked / sym_lazy_unmap_locked — gated by
 ;; SYM_LAZY_LOAD_MIN_BYTES = 64 MiB.  Out of reach for a regression
-;; test; covered by larger benchmarks.
+;; coverage run; exercised by larger perf workloads.

@@ -146,7 +146,7 @@
 (at (at (select {mx: (max x) mn: (min y) by: k where: (== k 9) from: Tbig}) 'mx) 0) -- 19999
 (at (at (select {mx: (max x) mn: (min y) by: k where: (== k 9) from: Tbig}) 'mn) 0) -- 20001
 
-;; ─── parallel with SYM key (high-cardinality H2O id3 shape) ─────────
+;; ─── parallel with high-cardinality SYM key ─────────────────────────
 (set Tsbig (table [k x y] (list (as 'SYMBOL (% (til N) 100)) (til N) (- (* 2 N) (til N)))))
 ;; 100 groups. Group of key idj contains rows i where i % 100 = j.
 ;; x values: {j, j+100, ..., j+19900}; max x = j+19900.

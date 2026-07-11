@@ -45,6 +45,12 @@ static inline bool win_keys_differ(ray_t* const* vecs, uint32_t n_keys,
             if (a != b) return true;
             break;
         }
+        case RAY_F32: {
+            float a = ((const float*)ray_data(col))[ra];
+            float b = ((const float*)ray_data(col))[rb];
+            if (a != b) return true;
+            break;
+        }
         case RAY_I32: case RAY_DATE: case RAY_TIME:
             if (((const int32_t*)ray_data(col))[ra] !=
                 ((const int32_t*)ray_data(col))[rb]) return true;
@@ -89,6 +95,7 @@ static inline bool win_keys_differ(ray_t* const* vecs, uint32_t n_keys,
 static inline double win_read_f64(ray_t* col, int64_t row) {
     switch (col->type) {
     case RAY_F64: return ((const double*)ray_data(col))[row];
+    case RAY_F32: return (double)((const float*)ray_data(col))[row];
     case RAY_I64: case RAY_TIMESTAMP:
         return (double)((const int64_t*)ray_data(col))[row];
     case RAY_I32: case RAY_DATE: case RAY_TIME:
@@ -110,6 +117,7 @@ static inline int64_t win_read_i64(ray_t* col, int64_t row) {
     case RAY_SYM:
         return sym_cell_runtime_id(col, row);
     case RAY_F64: return (int64_t)((const double*)ray_data(col))[row];
+    case RAY_F32: return (int64_t)((const float*)ray_data(col))[row];
     case RAY_I16: return (int64_t)((const int16_t*)ray_data(col))[row];
     case RAY_BOOL: case RAY_U8: return (int64_t)((const uint8_t*)ray_data(col))[row];
     default: return 0;
@@ -141,7 +149,7 @@ static void win_compute_partition(
     ray_t* const* order_vecs, uint32_t n_order,
     ray_t* const* func_vecs, const uint8_t* func_kinds, const int64_t* func_params,
     uint32_t n_funcs,
-    uint8_t frame_start, uint8_t frame_end,
+    uint8_t frame_start, uint8_t frame_end, int64_t frame_start_n,
     const int64_t* sorted_idx, int64_t ps, int64_t pe,
     ray_t* const* result_vecs, const bool* is_f64)
 {
@@ -154,6 +162,8 @@ static void win_compute_partition(
         ray_t* rvec = result_vecs[f];
         bool whole = (frame_start == RAY_BOUND_UNBOUNDED_PRECEDING &&
                       frame_end == RAY_BOUND_UNBOUNDED_FOLLOWING);
+        bool trailing = (frame_start == RAY_BOUND_N_PRECEDING &&
+                         frame_end == RAY_BOUND_CURRENT_ROW);
 
         switch (kind) {
         case RAY_WIN_ROW_NUMBER: {
@@ -199,6 +209,12 @@ static void win_compute_partition(
             if (whole) {
                 for (int64_t i = ps; i < pe; i++)
                     out[sorted_idx[i]] = part_len;
+            } else if (trailing) {
+                int64_t width = frame_start_n + 1;
+                for (int64_t i = ps; i < pe; i++) {
+                    int64_t seen = i - ps + 1;
+                    out[sorted_idx[i]] = seen < width ? seen : width;
+                }
             } else {
                 for (int64_t i = ps; i < pe; i++)
                     out[sorted_idx[i]] = i - ps + 1;
@@ -210,38 +226,44 @@ static void win_compute_partition(
             if (is_f64[f]) {
                 double* out = (double*)ray_data(rvec);
                 if (whole) {
-                    double t = 0.0;
+                    double total = 0.0;
                     for (int64_t i = ps; i < pe; i++)
                         if (!ray_vec_is_null(fvec, sorted_idx[i]))
-                            t += win_read_f64(fvec, sorted_idx[i]);
-                    /* Single-null float model: window SUM can overflow → ±Inf;
-                     * canonicalize to NULL_F64 (HAS_NULLS via win_finalize_nulls). */
-                    t = ray_f64_fin(t);
-                    for (int64_t i = ps; i < pe; i++)
-                        out[sorted_idx[i]] = t;
+                            total += win_read_f64(fvec, sorted_idx[i]);
+                    total = ray_f64_fin(total);
+                    for (int64_t i = ps; i < pe; i++) out[sorted_idx[i]] = total;
                 } else {
                     double acc = 0.0;
                     for (int64_t i = ps; i < pe; i++) {
-                        if (!ray_vec_is_null(fvec, sorted_idx[i]))
-                            acc += win_read_f64(fvec, sorted_idx[i]);
-                        out[sorted_idx[i]] = ray_f64_fin(acc);
+                        int64_t row = sorted_idx[i];
+                        if (!ray_vec_is_null(fvec, row)) acc += win_read_f64(fvec, row);
+                        if (trailing) {
+                            int64_t drop = i - frame_start_n - 1;
+                            if (drop >= ps && !ray_vec_is_null(fvec, sorted_idx[drop]))
+                                acc -= win_read_f64(fvec, sorted_idx[drop]);
+                        }
+                        out[row] = ray_f64_fin(acc);
                     }
                 }
             } else {
                 int64_t* out = (int64_t*)ray_data(rvec);
                 if (whole) {
-                    int64_t t = 0;
+                    int64_t total = 0;
                     for (int64_t i = ps; i < pe; i++)
                         if (!ray_vec_is_null(fvec, sorted_idx[i]))
-                            t += win_read_i64(fvec, sorted_idx[i]);
-                    for (int64_t i = ps; i < pe; i++)
-                        out[sorted_idx[i]] = t;
+                            total += win_read_i64(fvec, sorted_idx[i]);
+                    for (int64_t i = ps; i < pe; i++) out[sorted_idx[i]] = total;
                 } else {
                     int64_t acc = 0;
                     for (int64_t i = ps; i < pe; i++) {
-                        if (!ray_vec_is_null(fvec, sorted_idx[i]))
-                            acc += win_read_i64(fvec, sorted_idx[i]);
-                        out[sorted_idx[i]] = acc;
+                        int64_t row = sorted_idx[i];
+                        if (!ray_vec_is_null(fvec, row)) acc += win_read_i64(fvec, row);
+                        if (trailing) {
+                            int64_t drop = i - frame_start_n - 1;
+                            if (drop >= ps && !ray_vec_is_null(fvec, sorted_idx[drop]))
+                                acc -= win_read_i64(fvec, sorted_idx[drop]);
+                        }
+                        out[row] = acc;
                     }
                 }
             }
@@ -251,156 +273,135 @@ static void win_compute_partition(
             if (!fvec) break;
             double* out = (double*)ray_data(rvec);
             if (whole) {
-                double t = 0.0;
-                int64_t cnt = 0;
-                for (int64_t i = ps; i < pe; i++)
-                    if (!ray_vec_is_null(fvec, sorted_idx[i])) {
-                        t += win_read_f64(fvec, sorted_idx[i]); cnt++;
+                double total = 0.0;
+                int64_t count = 0;
+                for (int64_t i = ps; i < pe; i++) {
+                    int64_t row = sorted_idx[i];
+                    if (!ray_vec_is_null(fvec, row)) {
+                        total += win_read_f64(fvec, row);
+                        count++;
                     }
-                if (cnt > 0) {
-                    double avg = ray_f64_fin(t / (double)cnt);
-                    for (int64_t i = ps; i < pe; i++)
-                        out[sorted_idx[i]] = avg;
+                }
+                if (count > 0) {
+                    double avg = ray_f64_fin(total / (double)count);
+                    for (int64_t i = ps; i < pe; i++) out[sorted_idx[i]] = avg;
                 } else {
-                    for (int64_t i = ps; i < pe; i++)
-                        win_set_null(rvec, sorted_idx[i]);
+                    for (int64_t i = ps; i < pe; i++) win_set_null(rvec, sorted_idx[i]);
                 }
             } else {
                 double acc = 0.0;
-                int64_t cnt = 0;
+                int64_t count = 0;
                 for (int64_t i = ps; i < pe; i++) {
-                    if (!ray_vec_is_null(fvec, sorted_idx[i])) {
-                        acc += win_read_f64(fvec, sorted_idx[i]); cnt++;
+                    int64_t row = sorted_idx[i];
+                    if (!ray_vec_is_null(fvec, row)) {
+                        acc += win_read_f64(fvec, row);
+                        count++;
                     }
-                    if (cnt > 0)
-                        out[sorted_idx[i]] = ray_f64_fin(acc / (double)cnt);
-                    else
-                        win_set_null(rvec, sorted_idx[i]);
+                    if (trailing) {
+                        int64_t drop = i - frame_start_n - 1;
+                        if (drop >= ps && !ray_vec_is_null(fvec, sorted_idx[drop])) {
+                            acc -= win_read_f64(fvec, sorted_idx[drop]);
+                            count--;
+                        }
+                    }
+                    if (count > 0) out[row] = ray_f64_fin(acc / (double)count);
+                    else win_set_null(rvec, row);
                 }
             }
             break;
         }
-        case RAY_WIN_MIN: {
-            if (!fvec) break;
-            if (is_f64[f]) {
-                double* out = (double*)ray_data(rvec);
-                if (whole) {
-                    double mn = DBL_MAX; int found = 0;
-                    for (int64_t i = ps; i < pe; i++) {
-                        if (ray_vec_is_null(fvec, sorted_idx[i])) continue;
-                        double v = win_read_f64(fvec, sorted_idx[i]);
-                        if (!found || v < mn) { mn = v; found = 1; }
-                    }
-                    if (found) {
-                        for (int64_t i = ps; i < pe; i++)
-                            out[sorted_idx[i]] = mn;
-                    } else {
-                        for (int64_t i = ps; i < pe; i++)
-                            win_set_null(rvec, sorted_idx[i]);
-                    }
-                } else {
-                    double mn = DBL_MAX; int found = 0;
-                    for (int64_t i = ps; i < pe; i++) {
-                        if (!ray_vec_is_null(fvec, sorted_idx[i])) {
-                            double v = win_read_f64(fvec, sorted_idx[i]);
-                            if (!found || v < mn) { mn = v; found = 1; }
-                        }
-                        if (found)
-                            out[sorted_idx[i]] = mn;
-                        else
-                            win_set_null(rvec, sorted_idx[i]);
-                    }
-                }
-            } else {
-                int64_t* out = (int64_t*)ray_data(rvec);
-                if (whole) {
-                    int64_t mn = INT64_MAX; int found = 0;
-                    for (int64_t i = ps; i < pe; i++) {
-                        if (ray_vec_is_null(fvec, sorted_idx[i])) continue;
-                        int64_t v = win_read_i64(fvec, sorted_idx[i]);
-                        if (!found || v < mn) { mn = v; found = 1; }
-                    }
-                    if (found) {
-                        for (int64_t i = ps; i < pe; i++)
-                            out[sorted_idx[i]] = mn;
-                    } else {
-                        for (int64_t i = ps; i < pe; i++)
-                            win_set_null(rvec, sorted_idx[i]);
-                    }
-                } else {
-                    int64_t mn = INT64_MAX; int found = 0;
-                    for (int64_t i = ps; i < pe; i++) {
-                        if (!ray_vec_is_null(fvec, sorted_idx[i])) {
-                            int64_t v = win_read_i64(fvec, sorted_idx[i]);
-                            if (!found || v < mn) { mn = v; found = 1; }
-                        }
-                        if (found)
-                            out[sorted_idx[i]] = mn;
-                        else
-                            win_set_null(rvec, sorted_idx[i]);
-                    }
-                }
-            }
-            break;
-        }
+        case RAY_WIN_MIN:
         case RAY_WIN_MAX: {
             if (!fvec) break;
+            bool want_max = kind == RAY_WIN_MAX;
             if (is_f64[f]) {
                 double* out = (double*)ray_data(rvec);
                 if (whole) {
-                    double mx = -DBL_MAX; int found = 0;
+                    double best = want_max ? -DBL_MAX : DBL_MAX;
+                    int found = 0;
                     for (int64_t i = ps; i < pe; i++) {
-                        if (ray_vec_is_null(fvec, sorted_idx[i])) continue;
-                        double v = win_read_f64(fvec, sorted_idx[i]);
-                        if (!found || v > mx) { mx = v; found = 1; }
+                        int64_t row = sorted_idx[i];
+                        if (ray_vec_is_null(fvec, row)) continue;
+                        double v = win_read_f64(fvec, row);
+                        if (!found || (want_max ? v > best : v < best)) { best = v; found = 1; }
                     }
-                    if (found) {
-                        for (int64_t i = ps; i < pe; i++)
-                            out[sorted_idx[i]] = mx;
-                    } else {
-                        for (int64_t i = ps; i < pe; i++)
-                            win_set_null(rvec, sorted_idx[i]);
+                    for (int64_t i = ps; i < pe; i++) {
+                        if (found) out[sorted_idx[i]] = best;
+                        else win_set_null(rvec, sorted_idx[i]);
                     }
                 } else {
-                    double mx = -DBL_MAX; int found = 0;
-                    for (int64_t i = ps; i < pe; i++) {
-                        if (!ray_vec_is_null(fvec, sorted_idx[i])) {
-                            double v = win_read_f64(fvec, sorted_idx[i]);
-                            if (!found || v > mx) { mx = v; found = 1; }
+                    if (!trailing) {
+                        double best = want_max ? -DBL_MAX : DBL_MAX;
+                        int found = 0;
+                        for (int64_t i = ps; i < pe; i++) {
+                            int64_t row = sorted_idx[i];
+                            if (!ray_vec_is_null(fvec, row)) {
+                                double v = win_read_f64(fvec, row);
+                                if (!found || (want_max ? v > best : v < best)) { best = v; found = 1; }
+                            }
+                            if (found) out[row] = best;
+                            else win_set_null(rvec, row);
                         }
-                        if (found)
-                            out[sorted_idx[i]] = mx;
-                        else
-                            win_set_null(rvec, sorted_idx[i]);
+                    } else {
+                        for (int64_t i = ps; i < pe; i++) {
+                            int64_t lo = i - frame_start_n;
+                            if (lo < ps) lo = ps;
+                            double best = want_max ? -DBL_MAX : DBL_MAX;
+                            int found = 0;
+                            for (int64_t j = lo; j <= i; j++) {
+                                int64_t row = sorted_idx[j];
+                                if (ray_vec_is_null(fvec, row)) continue;
+                                double v = win_read_f64(fvec, row);
+                                if (!found || (want_max ? v > best : v < best)) { best = v; found = 1; }
+                            }
+                            if (found) out[sorted_idx[i]] = best;
+                            else win_set_null(rvec, sorted_idx[i]);
+                        }
                     }
                 }
             } else {
                 int64_t* out = (int64_t*)ray_data(rvec);
                 if (whole) {
-                    int64_t mx = INT64_MIN; int found = 0;
+                    int64_t best = want_max ? INT64_MIN : INT64_MAX;
+                    int found = 0;
                     for (int64_t i = ps; i < pe; i++) {
-                        if (ray_vec_is_null(fvec, sorted_idx[i])) continue;
-                        int64_t v = win_read_i64(fvec, sorted_idx[i]);
-                        if (!found || v > mx) { mx = v; found = 1; }
+                        int64_t row = sorted_idx[i];
+                        if (ray_vec_is_null(fvec, row)) continue;
+                        int64_t v = win_read_i64(fvec, row);
+                        if (!found || (want_max ? v > best : v < best)) { best = v; found = 1; }
                     }
-                    if (found) {
-                        for (int64_t i = ps; i < pe; i++)
-                            out[sorted_idx[i]] = mx;
-                    } else {
-                        for (int64_t i = ps; i < pe; i++)
-                            win_set_null(rvec, sorted_idx[i]);
+                    for (int64_t i = ps; i < pe; i++) {
+                        if (found) out[sorted_idx[i]] = best;
+                        else win_set_null(rvec, sorted_idx[i]);
                     }
                 } else {
-                    int64_t mx = INT64_MIN; int found = 0;
-                    for (int64_t i = ps; i < pe; i++) {
-                        if (!ray_vec_is_null(fvec, sorted_idx[i])) {
-                            int64_t v = win_read_i64(fvec, sorted_idx[i]);
-                            if (!found || v > mx) { mx = v; found = 1; }
+                    if (!trailing) {
+                        int64_t best = want_max ? INT64_MIN : INT64_MAX;
+                        int found = 0;
+                        for (int64_t i = ps; i < pe; i++) {
+                            int64_t row = sorted_idx[i];
+                            if (!ray_vec_is_null(fvec, row)) {
+                                int64_t v = win_read_i64(fvec, row);
+                                if (!found || (want_max ? v > best : v < best)) { best = v; found = 1; }
+                            }
+                            if (found) out[row] = best;
+                            else win_set_null(rvec, row);
                         }
-                        if (found)
-                            out[sorted_idx[i]] = mx;
-                        else
-                            win_set_null(rvec, sorted_idx[i]);
+                    } else {
+                        for (int64_t i = ps; i < pe; i++) {
+                            int64_t lo = i - frame_start_n;
+                            if (lo < ps) lo = ps;
+                            int64_t best = want_max ? INT64_MIN : INT64_MAX;
+                            int found = 0;
+                            for (int64_t j = lo; j <= i; j++) {
+                                int64_t row = sorted_idx[j];
+                                if (ray_vec_is_null(fvec, row)) continue;
+                                int64_t v = win_read_i64(fvec, row);
+                                if (!found || (want_max ? v > best : v < best)) { best = v; found = 1; }
+                            }
+                            if (found) out[sorted_idx[i]] = best;
+                            else win_set_null(rvec, sorted_idx[i]);
+                        }
                     }
                 }
             }
@@ -474,20 +475,23 @@ static void win_compute_partition(
         }
         case RAY_WIN_FIRST_VALUE: {
             if (!fvec) break;
-            bool first_null = ray_vec_is_null(fvec, sorted_idx[ps]);
             if (is_f64[f]) {
                 double* out = (double*)ray_data(rvec);
-                double first = first_null ? 0.0 : win_read_f64(fvec, sorted_idx[ps]);
                 for (int64_t i = ps; i < pe; i++) {
-                    out[sorted_idx[i]] = first;
-                    if (first_null) win_set_null(rvec, sorted_idx[i]);
+                    int64_t src = trailing ? i - frame_start_n : ps;
+                    if (src < ps) src = ps;
+                    bool is_null = ray_vec_is_null(fvec, sorted_idx[src]);
+                    out[sorted_idx[i]] = is_null ? 0.0 : win_read_f64(fvec, sorted_idx[src]);
+                    if (is_null) win_set_null(rvec, sorted_idx[i]);
                 }
             } else {
                 int64_t* out = (int64_t*)ray_data(rvec);
-                int64_t first = first_null ? 0 : win_read_i64(fvec, sorted_idx[ps]);
                 for (int64_t i = ps; i < pe; i++) {
-                    out[sorted_idx[i]] = first;
-                    if (first_null) win_set_null(rvec, sorted_idx[i]);
+                    int64_t src = trailing ? i - frame_start_n : ps;
+                    if (src < ps) src = ps;
+                    bool is_null = ray_vec_is_null(fvec, sorted_idx[src]);
+                    out[sorted_idx[i]] = is_null ? 0 : win_read_i64(fvec, sorted_idx[src]);
+                    if (is_null) win_set_null(rvec, sorted_idx[i]);
                 }
             }
             break;
@@ -533,21 +537,27 @@ static void win_compute_partition(
             if (!fvec) break;
             int64_t nth = func_params[f];
             if (nth < 1) nth = 1;
-            bool nth_null = (nth > part_len) ||
-                            ray_vec_is_null(fvec, sorted_idx[ps + nth - 1]);
             if (is_f64[f]) {
                 double* out = (double*)ray_data(rvec);
-                double val = nth_null ? 0.0 : win_read_f64(fvec, sorted_idx[ps + nth - 1]);
                 for (int64_t i = ps; i < pe; i++) {
-                    out[sorted_idx[i]] = val;
-                    if (nth_null) win_set_null(rvec, sorted_idx[i]);
+                    int64_t lo = trailing ? i - frame_start_n : ps;
+                    if (lo < ps) lo = ps;
+                    int64_t src = lo + nth - 1;
+                    bool is_null = src > (whole ? pe - 1 : i) ||
+                                   ray_vec_is_null(fvec, sorted_idx[src]);
+                    out[sorted_idx[i]] = is_null ? 0.0 : win_read_f64(fvec, sorted_idx[src]);
+                    if (is_null) win_set_null(rvec, sorted_idx[i]);
                 }
             } else {
                 int64_t* out = (int64_t*)ray_data(rvec);
-                int64_t val = nth_null ? 0 : win_read_i64(fvec, sorted_idx[ps + nth - 1]);
                 for (int64_t i = ps; i < pe; i++) {
-                    out[sorted_idx[i]] = val;
-                    if (nth_null) win_set_null(rvec, sorted_idx[i]);
+                    int64_t lo = trailing ? i - frame_start_n : ps;
+                    if (lo < ps) lo = ps;
+                    int64_t src = lo + nth - 1;
+                    bool is_null = src > (whole ? pe - 1 : i) ||
+                                   ray_vec_is_null(fvec, sorted_idx[src]);
+                    out[sorted_idx[i]] = is_null ? 0 : win_read_i64(fvec, sorted_idx[src]);
+                    if (is_null) win_set_null(rvec, sorted_idx[i]);
                 }
             }
             break;
@@ -566,6 +576,7 @@ typedef struct {
     uint32_t n_funcs;
     uint8_t frame_start;
     uint8_t frame_end;
+    int64_t frame_start_n;
     int64_t* sorted_idx;
     int64_t* part_offsets;
     ray_t** result_vecs;
@@ -580,7 +591,7 @@ static void win_par_fn(void* arg, uint32_t worker_id,
         win_compute_partition(
             ctx->order_vecs, ctx->n_order,
             ctx->func_vecs, ctx->func_kinds, ctx->func_params,
-            ctx->n_funcs, ctx->frame_start, ctx->frame_end,
+            ctx->n_funcs, ctx->frame_start, ctx->frame_end, ctx->frame_start_n,
             ctx->sorted_idx, ctx->part_offsets[p], ctx->part_offsets[p + 1],
             ctx->result_vecs, ctx->is_f64);
     }
@@ -641,21 +652,42 @@ static void pkey_gather_fn(void* arg, uint32_t wid,
     }
 }
 
+/* Segment count of a parted table = length of any parted column's segs
+ * array (mirrors build_segment_table's own read, exec.c:3377-3384). */
+static int64_t window_parted_seg_count(ray_t* tbl) {
+    int64_t nc = ray_table_ncols(tbl);
+    for (int64_t c = 0; c < nc; c++) {
+        ray_t* col = ray_table_get_col_idx(tbl, c);
+        if (col && RAY_IS_PARTED(col->type)) return col->len;
+    }
+    return 0;  /* not parted (a table of only MAPCOMMON keys can't occur) */
+}
+
+/* ── streaming case-a parted window (partition-key-aligned) ────────────────
+ * Monotonic count of per-segment runs taken by the case-a concat fast-path
+ * (PARTITION BY includes the physical/date key).  Bumped once per segment;
+ * surfaced via (.sys.mem)'s "window-perpart-runs" (mirrors
+ * ray_sort_perpart_runs, query.c). */
+static _Atomic(int64_t) ray_window_perpart_runs_ctr = 0;
+
+int64_t ray_window_perpart_runs(void) {
+    return atomic_load_explicit(&ray_window_perpart_runs_ctr,
+                                 memory_order_relaxed);
+}
+
 ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     if (!tbl || RAY_IS_ERR(tbl)) return tbl;
 
     ray_op_ext_t* ext = find_ext(g, op->id);
     if (!ext) return ray_error("nyi", NULL);
 
-    /* Frame-spec validation (review 2.10): the compute path honors EXACTLY two
-     * frames — the whole partition (UNBOUNDED PRECEDING .. UNBOUNDED FOLLOWING)
-     * and the running frame (UNBOUNDED PRECEDING .. CURRENT ROW, ROWS mode).
-     * Numeric N_PRECEDING/N_FOLLOWING bounds and RANGE-mode CURRENT ROW were
-     * accepted but SILENTLY degraded to the running frame, yielding the wrong
-     * window.  Reject any unsupported frame LOUDLY instead.
-     *   - whole:   end == UNBOUNDED_FOLLOWING (ROWS == RANGE here, mode moot)
-     *   - running: end == CURRENT_ROW and ROWS mode
-     * Both require start == UNBOUNDED_PRECEDING. */
+    /* Frame-spec validation: the compute path honors the whole partition,
+     * the running frame, and fixed trailing ROWS frames.  Other numeric
+     * bounds and RANGE-mode CURRENT ROW must be rejected loudly rather than
+     * silently degrading to a different frame.
+     *   - whole:    UNBOUNDED PRECEDING .. UNBOUNDED FOLLOWING
+     *   - running:  UNBOUNDED PRECEDING .. CURRENT ROW in ROWS mode
+     *   - trailing: N PRECEDING .. CURRENT ROW in ROWS mode */
     {
         uint8_t fs = ext->window.frame_start;
         uint8_t fe = ext->window.frame_end;
@@ -664,10 +696,108 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         bool running_frame = (fs == RAY_BOUND_UNBOUNDED_PRECEDING &&
                               fe == RAY_BOUND_CURRENT_ROW &&
                               ext->window.frame_type == RAY_FRAME_ROWS);
-        if (!whole_frame && !running_frame)
+        bool trailing_frame = (fs == RAY_BOUND_N_PRECEDING &&
+                               fe == RAY_BOUND_CURRENT_ROW &&
+                               ext->window.frame_type == RAY_FRAME_ROWS &&
+                               ext->window.frame_start_n >= 0);
+        if (!whole_frame && !running_frame && !trailing_frame)
             return ray_error("nyi", "unsupported window frame: only "
-                "ROWS BETWEEN UNBOUNDED PRECEDING AND {CURRENT ROW | "
-                "UNBOUNDED FOLLOWING} are honored");
+                "whole, running, and fixed trailing ROWS frames are honored");
+    }
+
+    /* Case-a streaming fast-path: if PARTITION BY includes the physical/date
+     * partition key (a RAY_MAPCOMMON column — one constant value per day
+     * segment), every logical window partition lives wholly inside one day
+     * segment.  Running exec_window per-segment and concatenating in
+     * segment order is byte-identical to the flat result (no cross-partition
+     * carry, no whole-table sort) — the flat path scatters results to
+     * original row positions and passes columns through unpermuted, and
+     * flattening a parted table IS the segment concat, so
+     * per-segment-compute-then-concat == flat.  Must run BEFORE the Task-1
+     * flatten guard below, which is the correct-but-unstreamed fallback for
+     * every shape this fast-path declines (no PARTITION BY, or a
+     * PARTITION BY that excludes the date key and can span segments). */
+    {
+        int64_t nseg = window_parted_seg_count(tbl);
+        if (nseg >= 1) {
+            bool eligible = false;
+            for (uint32_t k = 0; k < ext->window.n_part_keys && !eligible; k++) {
+                ray_op_ext_t* key_ext = find_ext(g, ext->window.part_keys[k]);
+                if (key_ext && key_ext->base.opcode == OP_SCAN) {
+                    ray_t* col = ray_table_get_col(tbl, key_ext->sym);
+                    if (col && col->type == RAY_MAPCOMMON) eligible = true;
+                }
+            }
+            if (eligible) {
+                ray_t* merged = NULL;
+                for (int64_t s = 0; s < nseg; s++) {
+                    ray_t* seg = build_segment_table(tbl, (int32_t)s);
+                    if (!seg || RAY_IS_ERR(seg)) {
+                        ray_release(merged);
+                        return seg ? seg : ray_error("oom", NULL);
+                    }
+                    /* seg is flat (no PARTED/MAPCOMMON column) so this
+                     * recursion re-checks eligibility as false and falls
+                     * through to the ordinary flat compute — terminates. */
+                    ray_t* rseg = exec_window(g, op, seg);
+                    if (!rseg || RAY_IS_ERR(rseg)) {
+                        ray_release(seg);
+                        ray_release(merged);
+                        return rseg ? rseg : ray_error("oom", NULL);
+                    }
+                    ray_release(seg);
+                    atomic_fetch_add_explicit(&ray_window_perpart_runs_ctr, 1,
+                                               memory_order_relaxed);
+                    if (!merged) {
+                        merged = rseg;
+                    } else {
+                        ray_t* m = ray_result_merge(merged, rseg);
+                        ray_release(merged);
+                        ray_release(rseg);
+                        if (!m || RAY_IS_ERR(m)) return m ? m : ray_error("oom", NULL);
+                        merged = m;
+                    }
+                }
+                return merged;
+            }
+        }
+    }
+
+    /* Parted-input correctness guard: win_resolve_vec's OP_SCAN shortcut
+     * (above) returns raw parted/MAPCOMMON columns, which every compute
+     * loop below silently no-ops on (degenerate 0/NULL window values).
+     * Flatten (concat all segments) before compute — correct for every
+     * window shape, since the flat path scatters results to original
+     * row positions and passes through unpermuted columns. */
+    {
+        int64_t nc = ray_table_ncols(tbl);
+        for (int64_t c = 0; c < nc; c++) {
+            ray_t* col = ray_table_get_col_idx(tbl, c);
+            if (col && (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON)) {
+                int64_t nseg = window_parted_seg_count(tbl);
+                ray_t* flat = NULL;
+                for (int64_t s = 0; s < nseg; s++) {
+                    ray_t* seg = build_segment_table(tbl, (int32_t)s);
+                    if (!seg || RAY_IS_ERR(seg)) {
+                        ray_release(flat);
+                        return seg ? seg : ray_error("oom", NULL);
+                    }
+                    if (!flat) {
+                        flat = seg;
+                    } else {
+                        ray_t* m = ray_result_merge(flat, seg);
+                        ray_release(flat);
+                        ray_release(seg);
+                        if (!m || RAY_IS_ERR(m)) return m ? m : ray_error("oom", NULL);
+                        flat = m;
+                    }
+                }
+                /* flat has no parted columns: recurses exactly once. */
+                ray_t* r = exec_window(g, op, flat);
+                ray_release(flat);
+                return r;
+            }
+        }
     }
 
     int64_t nrows = ray_table_nrows(tbl);
@@ -1224,7 +1354,7 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                    kind == RAY_WIN_MAX || kind == RAY_WIN_LAG ||
                    kind == RAY_WIN_LEAD || kind == RAY_WIN_FIRST_VALUE ||
                    kind == RAY_WIN_LAST_VALUE || kind == RAY_WIN_NTH_VALUE) {
-            out_f64 = fvec && fvec->type == RAY_F64;
+            out_f64 = fvec && (fvec->type == RAY_F64 || fvec->type == RAY_F32);
         }
 
         is_f64[f] = out_f64;
@@ -1265,6 +1395,7 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                 .func_params = ext->window.func_params, .n_funcs = n_funcs,
                 .frame_start = ext->window.frame_start,
                 .frame_end = ext->window.frame_end,
+                .frame_start_n = ext->window.frame_start_n,
                 .sorted_idx = sorted_idx, .part_offsets = part_offsets,
                 .result_vecs = result_vecs, .is_f64 = is_f64,
             };
@@ -1275,6 +1406,7 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                     order_vecs, n_order,
                     func_vecs, ext->window.func_kinds, ext->window.func_params,
                     n_funcs, ext->window.frame_start, ext->window.frame_end,
+                    ext->window.frame_start_n,
                     sorted_idx, part_offsets[p], part_offsets[p + 1],
                     result_vecs, is_f64);
             }

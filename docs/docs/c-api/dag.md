@@ -65,6 +65,14 @@ Element-wise unary operations. These are fuseable — the optimizer merges chain
 | `ray_sqrt_op(g, a)` | `OP_SQRT` | Square root |
 | `ray_log_op(g, a)` | `OP_LOG` | Natural logarithm |
 | `ray_exp_op(g, a)` | `OP_EXP` | Exponential (e^x) |
+| `ray_sin_op(g, a)` | `OP_SIN` | Sine, radians; returns F64 |
+| `ray_asin_op(g, a)` | `OP_ASIN` | Arcsine, radians; out-of-domain values become null |
+| `ray_cos_op(g, a)` | `OP_COS` | Cosine, radians; returns F64 |
+| `ray_acos_op(g, a)` | `OP_ACOS` | Arccosine, radians; out-of-domain values become null |
+| `ray_tan_op(g, a)` | `OP_TAN` | Tangent, radians; returns F64 |
+| `ray_atan_op(g, a)` | `OP_ATAN` | Arctangent, radians; returns F64 |
+| `ray_reciprocal_op(g, a)` | `OP_RECIPROCAL` | Reciprocal `1/x`; zero becomes null |
+| `ray_signum_op(g, a)` | `OP_SIGNUM` | Sign as I64: -1, 0, or 1 |
 | `ray_ceil_op(g, a)` | `OP_CEIL` | Ceiling |
 | `ray_floor_op(g, a)` | `OP_FLOOR` | Floor |
 | `ray_isnull(g, a)` | `OP_ISNULL` | Returns BOOL: true if null |
@@ -95,6 +103,7 @@ Element-wise binary operations. All are fuseable into morsel passes.
 | `ray_mul(g, a, b)` | `OP_MUL` | Multiplication |
 | `ray_div(g, a, b)` | `OP_DIV` | Division |
 | `ray_mod(g, a, b)` | `OP_MOD` | Modulo |
+| `ray_pow_op(g, a, b)` | `OP_POW` | Power, numeric operands only, returns F64 |
 | `ray_eq(g, a, b)` | `OP_EQ` | Equal |
 | `ray_ne(g, a, b)` | `OP_NE` | Not equal |
 | `ray_lt(g, a, b)` | `OP_LT` | Less than |
@@ -137,6 +146,8 @@ Reduction operations that collapse a column to a single value (or per-group valu
 |---|---|---|
 | `ray_sum(g, a)` | `OP_SUM` | Sum of values |
 | `ray_prod(g, a)` | `OP_PROD` | Product of values |
+| `ray_all(g, a)` | `OP_ALL` | True when every non-null numeric value is truthy |
+| `ray_any(g, a)` | `OP_ANY` | True when any non-null numeric value is truthy |
 | `ray_count(g, a)` | `OP_COUNT` | Count of non-null values |
 | `ray_avg(g, a)` | `OP_AVG` | Average (mean) |
 | `ray_min_op(g, a)` | `OP_MIN` | Minimum value |
@@ -148,6 +159,35 @@ Reduction operations that collapse a column to a single value (or per-group valu
 | `ray_stddev_pop(g, a)` | `OP_STDDEV_POP` | Population standard deviation |
 | `ray_var(g, a)` | `OP_VAR` | Sample variance |
 | `ray_var_pop(g, a)` | `OP_VAR_POP` | Population variance |
+
+Binary aggregate opcodes are used through `ray_group2`/`ray_group3`: `OP_PEARSON_CORR`, `OP_COV`, `OP_SCOV`, `OP_WSUM`, and `OP_WAVG`. They consume `agg_ins[a]` plus `agg_ins2[a]`, skip rows where either input is null, and produce `RAY_F64`.
+
+## Time-Series Vector Operations
+
+Unary vector operations that preserve row count. These are lazy DAG nodes in Rayfall and materialize through morsel-based kernels.
+
+| Function | Opcode | Description |
+|---|---|---|
+| `ray_lag_op(g, a)` | `OP_LAG` | Previous row value; first row is null/sentinel |
+| `ray_lead_op(g, a)` | `OP_LEAD` | Next row value; last row is null/sentinel |
+| `ray_deltas_op(g, a)` | `OP_DELTAS` | Adjacent differences; first row is null |
+| `ray_ratios_op(g, a)` | `OP_RATIOS` | Adjacent ratios as `F64`; first row is null |
+| `ray_fills_op(g, a)` | `OP_FILLS` | Forward-fill nullable vectors |
+| `ray_sums_op(g, a)` | `OP_SUMS` | Running sum |
+| `ray_avgs_op(g, a)` | `OP_AVGS` | Running average over non-null values |
+| `ray_mins_op(g, a)` | `OP_MINS` | Running minimum |
+| `ray_maxs_op(g, a)` | `OP_MAXS` | Running maximum |
+| `ray_prds_op(g, a)` | `OP_PRDS` | Running product |
+| `ray_differ_op(g, a)` | `OP_DIFFER` | Boolean change flag versus previous row |
+| `ray_msum_op(g, a, window)` | `OP_MSUM` | Moving sum over trailing `window` rows |
+| `ray_mavg_op(g, a, window)` | `OP_MAVG` | Moving average over trailing `window` rows and non-null values |
+| `ray_mmin_op(g, a, window)` | `OP_MMIN` | Moving minimum over trailing `window` rows |
+| `ray_mmax_op(g, a, window)` | `OP_MMAX` | Moving maximum over trailing `window` rows |
+| `ray_mcount_op(g, a, window)` | `OP_MCOUNT` | Moving non-null count over trailing `window` rows |
+| `ray_mvar_op(g, a, window)` | `OP_MVAR` | Moving population variance over trailing `window` rows |
+| `ray_mdev_op(g, a, window)` | `OP_MDEV` | Moving population standard deviation over trailing `window` rows |
+
+Moving-window constructors require a positive `int64_t` window. Rayfall syntax uses the same order, for example `(msum 20 price)`. In query projections, constant windows lower into DAG nodes; non-constant windows use the normal evaluator path.
 
 ## Structural Operations
 
@@ -181,6 +221,15 @@ ray_op_t* ray_group(ray_graph_t* g,
                    ray_op_t** keys, uint32_t n_keys,
                    uint16_t* agg_ops, ray_op_t** agg_ins,
                    uint32_t n_aggs);
+```
+
+Use `ray_group2` or `ray_group3` when an aggregate needs a second input column. `agg_ins2` is parallel to `agg_ins`; slots are `NULL` for unary reducers and non-`NULL` for binary reducers such as `OP_PEARSON_CORR`, `OP_COV`, `OP_SCOV`, `OP_WSUM`, and `OP_WAVG`.
+
+```c
+ray_op_t* ray_group2(ray_graph_t* g,
+                    ray_op_t** keys, uint32_t n_keys,
+                    uint16_t* agg_ops, ray_op_t** agg_ins,
+                    ray_op_t** agg_ins2, uint32_t n_aggs);
 ```
 
 ### ray_distinct
@@ -375,7 +424,7 @@ Columnar file I/O for vectors, splayed tables, and CSV.
 
 ### Column I/O
 
-`ray_col_save` / `ray_col_load` / `ray_col_mmap`. Save a vector to a column file, load it back, or memory-map it for zero-copy reads. The file format includes type, length, null bitmap, and element data.
+`ray_col_save` / `ray_col_load` / `ray_col_mmap`. Save a vector to a column file, load it back, or memory-map it for zero-copy reads. The file format includes type, length, attributes, and element data; null state is represented with type-correct sentinel payloads plus the `RAY_ATTR_HAS_NULLS` hint.
 
 ```c
 ray_err_t ray_col_save(ray_t* vec, const char* path);

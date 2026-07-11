@@ -39,7 +39,7 @@
 (top [10 9 8 7 6 5 4 3 2 1] 3) -- [10 9 8]
 (bot [10 9 8 7 6 5 4 3 2 1] 3) -- [1 2 3]
 
-;; ─── filter + top-N fusion (the "fused topk" benchmark shape) ──────
+;; ─── filter + top-N fusion ─────────────────────────────────────────
 ;; (top (where v > 100 v) k) — filter then partial-sort.  This is
 ;; the Q25-Q27 shape from be3b5364.
 (set Vf [50 120 80 200 30 150 90 175 60 110])
@@ -71,6 +71,11 @@
 (set T (as 'TIME [12:00:00.000 09:30:00.000 15:45:00.000 06:15:00.000 23:59:59.999]))
 (top T 2) -- (as 'TIME [23:59:59.999 15:45:00.000])
 (bot T 2) -- (as 'TIME [06:15:00.000 09:30:00.000])
+
+;; ─── variable-width comparator path: STR ───────────────────────────
+(set STop (as 'STR (list "delta" "alpha" "charlie" "bravo" "echo" "bravo")))
+(top STop 3) -- (as 'STR (list "echo" "delta" "charlie"))
+(bot STop 3) -- (as 'STR (list "alpha" "bravo" "bravo"))
 
 ;; ─── larger N to exercise the multi-morsel scan ────────────────────
 ;; (top of a larger random-ish vector) must agree with (take (desc v) k).

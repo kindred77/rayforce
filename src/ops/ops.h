@@ -55,6 +55,7 @@ static inline bool ray_is_lazy(ray_t* x) {
 }
 
 ray_t*    ray_lazy_materialize(ray_t* val);
+ray_t*    ray_lazy_append_param(ray_t* lazy, uint16_t opcode, int64_t param);
 
 /* ===== Cancel API ===== */
 
@@ -161,11 +162,21 @@ void     ray_cancel_reset(void);
 #define OP_REPLACE      41
 #define OP_TRIM         42
 #define OP_CONCAT       43
+#define OP_POW          44   /* binary: numeric power -> F64 */
 #define OP_EXTRACT      45
 #define OP_DATE_TRUNC   46
 #define OP_IN           47   /* binary: col in set_vec -> BOOL */
 #define OP_NOT_IN       48   /* binary: col not in set_vec -> BOOL */
 #define OP_IDIV         49   /* binary: integer floor division -> I64 */
+#define OP_SIN          137  /* unary: sine -> F64 */
+#define OP_ASIN         138  /* unary: arcsine -> F64 */
+#define OP_COS          139  /* unary: cosine -> F64 */
+#define OP_ACOS         140  /* unary: arccosine -> F64 */
+#define OP_TAN          141  /* unary: tangent -> F64 */
+#define OP_ATAN         142  /* unary: arctangent -> F64 */
+#define OP_RECIPROCAL   143  /* unary: reciprocal -> F64 */
+#define OP_SIGNUM       144  /* unary: signum -> I64 */
+#define OP_STR_FIND     146  /* binary: string search pattern -> I64 */
 
 /* EXTRACT / DATE_TRUNC field identifiers */
 #define RAY_EXTRACT_YEAR    0
@@ -196,7 +207,7 @@ void     ray_cancel_reset(void);
 #define OP_GROUP        62
 #define OP_JOIN         63
 #define OP_WINDOW_JOIN  64
-/* Opcode 65 (formerly OP_FILTERED_GROUP) is RETIRED.  The benchmark-tuned
+/* Opcode 65 (formerly OP_FILTERED_GROUP) is RETIRED.  The shape-specific
  * fused filter+group operator was removed once the general FILTER + OP_GROUP
  * (v2) path became competitive-or-better on every shape it handled; the
  * planner now routes `(select … where … by …)` through that general path.
@@ -219,7 +230,15 @@ void     ray_cancel_reset(void);
 #define OP_MEDIAN       88   /* exact median per group (bucket-scatter + quickselect) */
 #define OP_TOP_N        89   /* per-group largest K values (bounded max-heap) */
 #define OP_BOT_N        90   /* per-group smallest K values (bounded min-heap) */
-/* Opcodes 91 and 110-114 are retired (formerly OP_GROUP_*_ROWFORM); the
+#define OP_QUANTILE     91   /* exact quantile per group (literal probability) */
+#define OP_MODE        145   /* most frequent non-null value per group */
+#define OP_ALL          131  /* truthy-all reduction (nulls skipped) */
+#define OP_ANY          132  /* truthy-any reduction (nulls skipped) */
+#define OP_COV          133  /* population covariance per group (binary input) */
+#define OP_SCOV         134  /* sample covariance per group (binary input) */
+#define OP_WSUM         135  /* weighted sum: sum(weight * value) */
+#define OP_WAVG         136  /* weighted average: sum(weight * value) / sum(weight) */
+/* Opcodes 110-114 are retired (formerly OP_GROUP_*_ROWFORM); the
  * dedicated row-form group operators were subsumed by the v2 group engine.
  * Numbers left unreused to avoid renumbering churn. */
 
@@ -228,7 +247,10 @@ void     ray_cancel_reset(void);
  * BOTH paths accept exactly the same element types for each aggregate:
  *   sum  : numeric (BOOL/U8/I16/I32/I64/F64) + TIME (a duration-like ms count)
  *   prod : numeric only
- *   avg / var / var_pop / stddev / stddev_pop : numeric + temporal (result F64)
+ *   all / any : numeric only, result BOOL
+ *   cov / scov / wsum / wavg / pearson_corr : numeric only, result F64
+ *   avg / var / var_pop / stddev / stddev_pop / med / quantile
+ *        : numeric + temporal (result F64)
  *   min / max / first / last / count and everything else : any type
  * `t` is the positive element/column type.  DATE/TIMESTAMP are absolute points
  * (summing them is meaningless → rejected); SYM/STR/GUID are non-numeric. */
@@ -247,13 +269,29 @@ static inline bool agg_type_admitted(uint16_t op, int8_t t) {
         case OP_SUM:  return !(nonnum || t == RAY_DATE || t == RAY_TIMESTAMP);
         /* prod: numeric only — reject non-numeric and every temporal. */
         case OP_PROD: return !(nonnum || temporal);
-        /* avg / var / stddev: numeric + temporal → F64; reject SYM/STR/GUID. */
+        /* truth and pairwise stats operate on numeric values only. */
+        case OP_ALL: case OP_ANY:
+        case OP_COV: case OP_SCOV:
+        case OP_WSUM: case OP_WAVG:
+        case OP_PEARSON_CORR:
+            return !(nonnum || temporal);
+        /* avg / var / stddev / holistic ranks: numeric + temporal → F64. */
         case OP_AVG:
+        case OP_MEDIAN: case OP_QUANTILE:
         case OP_VAR: case OP_VAR_POP:
         case OP_STDDEV: case OP_STDDEV_POP:
             return !nonnum;
         default: return true;
     }
+}
+
+static inline bool agg_is_binary_agg(uint16_t op) {
+    return op == OP_PEARSON_CORR || op == OP_COV || op == OP_SCOV ||
+           op == OP_WSUM || op == OP_WAVG;
+}
+
+static inline bool agg_is_truth_agg(uint16_t op) {
+    return op == OP_ALL || op == OP_ANY;
 }
 
 /* Opcodes — Graph */
@@ -287,6 +325,25 @@ static inline bool agg_type_admitted(uint16_t op, int8_t t) {
 #define OP_ASC            105   /* sort vector ascending                        */
 #define OP_DESC           106   /* sort vector descending                       */
 #define OP_REVERSE        107   /* reverse vector order                         */
+#define OP_LAG            108   /* previous row value, first row null/sentinel  */
+#define OP_LEAD           109   /* next row value, last row null/sentinel       */
+/* Opcodes 110-114 are retired (formerly OP_GROUP_*_ROWFORM). */
+#define OP_DELTAS         115   /* adjacent differences, first row null         */
+#define OP_RATIOS         116   /* adjacent ratios as F64, first row null       */
+#define OP_FILLS          117   /* forward-fill nullable values                 */
+#define OP_SUMS           118   /* running sum                                  */
+#define OP_AVGS           119   /* running average                              */
+#define OP_MINS           120   /* running minimum                              */
+#define OP_MAXS           121   /* running maximum                              */
+#define OP_PRDS           122   /* running product                              */
+#define OP_DIFFER         123   /* change flag vs previous row                  */
+#define OP_MSUM           124   /* moving sum over trailing N rows              */
+#define OP_MAVG           125   /* moving average over trailing N rows          */
+#define OP_MMIN           126   /* moving minimum over trailing N rows          */
+#define OP_MMAX           127   /* moving maximum over trailing N rows          */
+#define OP_MCOUNT         128   /* moving non-null count over trailing N rows   */
+#define OP_MVAR           129   /* moving population variance over trailing N   */
+#define OP_MDEV           130   /* moving population stddev over trailing N     */
 
 /* Opcodes — Misc */
 #define OP_ALIAS        70
@@ -349,6 +406,7 @@ typedef struct ray_op_ext {
     union {
         ray_t*   literal;       /* OP_CONST: inline literal value */
         int64_t sym;           /* OP_SCAN: column name symbol ID */
+        int64_t param;         /* scalar op parameter (e.g. moving-window N) */
         struct {               /* OP_GROUP: group-by specification */
             uint32_t*  keys;        /* node ids */
             uint32_t   n_keys;
@@ -356,14 +414,15 @@ typedef struct ray_op_ext {
             uint16_t*  agg_ops;
             uint32_t*  agg_ins;     /* node ids */
             /* Optional second input per agg — non-NULL only for binary
-             * aggregators (currently: OP_PEARSON_CORR). NULL for all
+             * aggregators (pearson/cov/scov/wsum/wavg). NULL for all
              * unary aggs and for the whole pointer when no binary agg
              * is present in this group. */
             uint32_t*  agg_ins2;    /* node ids */
-            /* Optional integer parameter per agg — used by holistic
+            /* Optional scalar parameter per agg — used by holistic
              * aggregators that take a scalar literal alongside the
-             * column (currently OP_TOP_N / OP_BOT_N: K).  NULL for
-             * groups whose aggs all take no scalar param. */
+             * column.  TOP/BOT store integer K; QUANTILE stores the
+             * probability bits in this int64 slot.  NULL for groups
+             * whose aggs all take no scalar param. */
             int64_t*    agg_k;
         };
         struct {               /* OP_SORT: multi-column sort */
@@ -460,9 +519,9 @@ typedef struct ray_graph {
     /* Slice-group hint (FILTER(in/eq on c) + GROUP(by c) fusion).
      * Armed by ray_slice_group_probe (exec.c) INSTEAD of executing the
      * WHERE filter when the predicate is exactly membership on the
-     * single bare group-key column and that column carries a fresh CSR
-     * hash index: surviving groups are then exactly the key set and
-     * each group's rows are its full CSR slice.  sg_col is the retained
+     * single bare group-key column and that column carries a fresh hash
+     * or part index: surviving groups are then exactly the key set and
+     * each group's rows are its full index slice.  sg_col is the retained
      * key column; sg_slices_hdr is an alloc block of ray_idx_slice_t
      * (idxop.h) resolved at probe time, ascending by column-domain id.
      * exec_group consumes the hint — aggregating the slices directly or
@@ -598,6 +657,14 @@ ray_op_t* ray_not(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_sqrt_op(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_log_op(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_exp_op(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_sin_op(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_asin_op(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_cos_op(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_acos_op(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_tan_op(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_atan_op(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_reciprocal_op(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_signum_op(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_ceil_op(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_floor_op(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_round_op(ray_graph_t* g, ray_op_t* a);
@@ -614,6 +681,7 @@ ray_op_t* ray_mul(ray_graph_t* g, ray_op_t* a, ray_op_t* b);
 ray_op_t* ray_div(ray_graph_t* g, ray_op_t* a, ray_op_t* b);
 ray_op_t* ray_idiv(ray_graph_t* g, ray_op_t* a, ray_op_t* b);
 ray_op_t* ray_mod(ray_graph_t* g, ray_op_t* a, ray_op_t* b);
+ray_op_t* ray_pow_op(ray_graph_t* g, ray_op_t* a, ray_op_t* b);
 ray_op_t* ray_eq(ray_graph_t* g, ray_op_t* a, ray_op_t* b);
 ray_op_t* ray_ne(ray_graph_t* g, ray_op_t* a, ray_op_t* b);
 ray_op_t* ray_lt(ray_graph_t* g, ray_op_t* a, ray_op_t* b);
@@ -636,6 +704,7 @@ ray_op_t* ray_substr(ray_graph_t* g, ray_op_t* str, ray_op_t* start, ray_op_t* l
 ray_op_t* ray_replace(ray_graph_t* g, ray_op_t* str, ray_op_t* from, ray_op_t* to);
 ray_op_t* ray_trim_op(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_concat(ray_graph_t* g, ray_op_t** args, int n);
+ray_op_t* ray_str_find_op(ray_graph_t* g, ray_op_t* input, ray_op_t* pattern);
 
 /* Date/time extraction and truncation */
 ray_op_t* ray_extract(ray_graph_t* g, ray_op_t* col, int64_t field);
@@ -644,6 +713,8 @@ ray_op_t* ray_date_trunc(ray_graph_t* g, ray_op_t* col, int64_t field);
 /* Reduction ops */
 ray_op_t* ray_sum(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_prod(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_all(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_any(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_min_op(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_max_op(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_count(ray_graph_t* g, ray_op_t* a);
@@ -655,6 +726,24 @@ ray_op_t* ray_distinct_op(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_asc_op(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_desc_op(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_reverse_op(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_lag_op(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_lead_op(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_deltas_op(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_ratios_op(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_fills_op(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_sums_op(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_avgs_op(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_mins_op(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_maxs_op(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_prds_op(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_differ_op(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_msum_op(ray_graph_t* g, ray_op_t* a, int64_t window);
+ray_op_t* ray_mavg_op(ray_graph_t* g, ray_op_t* a, int64_t window);
+ray_op_t* ray_mmin_op(ray_graph_t* g, ray_op_t* a, int64_t window);
+ray_op_t* ray_mmax_op(ray_graph_t* g, ray_op_t* a, int64_t window);
+ray_op_t* ray_mcount_op(ray_graph_t* g, ray_op_t* a, int64_t window);
+ray_op_t* ray_mvar_op(ray_graph_t* g, ray_op_t* a, int64_t window);
+ray_op_t* ray_mdev_op(ray_graph_t* g, ray_op_t* a, int64_t window);
 ray_op_t* ray_stddev(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_stddev_pop(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_var(ray_graph_t* g, ray_op_t* a);
@@ -668,19 +757,13 @@ ray_op_t* ray_sort_op(ray_graph_t* g, ray_op_t* table_node,
                      uint32_t n_cols);
 ray_op_t* ray_group(ray_graph_t* g, ray_op_t** keys, uint32_t n_keys,
                    uint16_t* agg_ops, ray_op_t** agg_ins, uint32_t n_aggs);
-/* Variant accepting an optional second-input column per agg.  agg_ins2
- * is parallel to agg_ins (length n_aggs); slots are NULL for unary aggs
- * and non-NULL only for binary aggregators (currently OP_PEARSON_CORR). */
-ray_op_t* ray_group2(ray_graph_t* g, ray_op_t** keys, uint32_t n_keys,
-                     uint16_t* agg_ops, ray_op_t** agg_ins,
-                     ray_op_t** agg_ins2, uint32_t n_aggs);
-/* Variant accepting an optional integer scalar per agg (e.g. top/bot K).
- * agg_k is parallel to agg_ins (length n_aggs); slots are 0 for aggs
- * that take no scalar param.  Pass NULL for agg_ins2 / agg_k if not used. */
-ray_op_t* ray_group3(ray_graph_t* g, ray_op_t** keys, uint32_t n_keys,
-                     uint16_t* agg_ops, ray_op_t** agg_ins,
-                     ray_op_t** agg_ins2, const int64_t* agg_k,
-                     uint32_t n_aggs);
+/* Full OP_GROUP builder.  agg_ins2 is parallel to agg_ins and supplies
+ * the second input for binary aggregators.  agg_k is parallel to agg_ins
+ * and supplies scalar parameters for top/bot/quantile-style aggregators. */
+ray_op_t* ray_group_build(ray_graph_t* g, ray_op_t** keys, uint32_t n_keys,
+                          uint16_t* agg_ops, ray_op_t** agg_ins,
+                          ray_op_t** agg_ins2, const int64_t* agg_k,
+                          uint32_t n_aggs);
 ray_op_t* ray_distinct(ray_graph_t* g, ray_op_t** keys, uint32_t n_keys);
 ray_op_t* ray_pivot_op(ray_graph_t* g,
                        ray_op_t** index_cols, uint32_t n_index,

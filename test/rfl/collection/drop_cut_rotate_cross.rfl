@@ -1,0 +1,41 @@
+;; Standalone collection utilities: drop, rotate, cut, cross.
+
+(drop [1 2 3 4 5] 2) -- [3 4 5]
+(drop [1 2 3 4 5] -2) -- [1 2 3]
+(drop [1 2 3] 10) -- []
+(drop [1 2 3] -10) -- []
+(drop "abcdef" 2) -- "cdef"
+(drop "abcdef" -2) -- "abcd"
+(drop ['a 'b 'c] 1) -- ['b 'c]
+
+(set TD (drop (table [a b] (list [1 2 3] ['x 'y 'z])) 1))
+(count TD) -- 2
+(at (at TD 'a) 0) -- 2
+(at (at TD 'b) 1) -- 'z
+(drop (dict ['a 'b 'c] [1 2 3]) 1) -- (dict ['b 'c] [2 3])
+
+(rotate [1 2 3 4] 1) -- [2 3 4 1]
+(rotate [1 2 3 4] -1) -- [4 1 2 3]
+(rotate [1 2 3 4] 5) -- [2 3 4 1]
+(rotate "abcd" 2) -- "cdab"
+(rotate ['a 'b 'c] 4) -- ['b 'c 'a]
+(set RT (rotate (table [a b] (list [1 2 3] ['x 'y 'z])) 1))
+(at (at RT 'a) 0) -- 2
+(at (at RT 'b) 2) -- 'x
+
+(cut [1 2 3 4 5] [2 4]) -- (list [1 2] [3 4] [5])
+(cut [1 2 3] [0 2]) -- (list [1 2] [3])
+(cut "abcdef" [2 4]) -- (list "ab" "cd" "ef")
+(cut ['a 'b 'c 'd] [1 3]) -- (list ['a] ['b 'c] ['d])
+(set CT (cut (table [a b] (list [1 2 3] ['x 'y 'z])) [1 2]))
+(count CT) -- 3
+(count (at CT 0)) -- 1
+(at (at (at CT 1) 'a) 0) -- 2
+(cut [1 2 3] [2 1]) !- domain
+(cut [1 2 3] ['a]) !- type
+
+(cross [1 2] ['a 'b]) -- (list (list 1 'a) (list 1 'b) (list 2 'a) (list 2 'b))
+(count (cross (til 3) ["x" "y"])) -- 6
+(at (at (cross [1 2] ['z]) 1) 0) -- 2
+(at (at (cross [1 2] ['z]) 1) 1) -- 'z
+(cross (table [a] (list [1])) [1 2]) !- type

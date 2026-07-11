@@ -34,7 +34,7 @@ The optional timeout bounds **both** the TCP connect and the handshake I/O. A bl
 
 The handshake exchanges a 2-byte `{wire_version, auth_flag}` greeting. A wire-version mismatch closes the connection before any payload is exchanged.
 
-```lisp
+```text
 ;; Unauthenticated
 (set h (.ipc.open "127.0.0.1:5000"))
 
@@ -60,7 +60,7 @@ Errors: `type` (`h` not an `i64`/`i32`, or `msg` not serialisable), `io` (handle
 
 While waiting for its response, `.ipc.send` keeps servicing the connection: an async message pushed by the peer in the meantime is dispatched (evaluated, or routed through `.ipc.on.async`) before the round-trip returns, and a sync request arriving from the peer is answered. Frames are never silently swallowed by the wait.
 
-```lisp
+```text
 ;; String-form query
 (.ipc.send h "(select {from: trades where: (> price 100) take: 10})")
 
@@ -82,7 +82,7 @@ Because no response is returned, the only failures the caller can observe are **
 
 Returns the null object on a successful local send. Errors: `type` (`h` not an `i64`/`i32`, or `msg` not serialisable), `io` (handle invalid / connection closed / socket write failed).
 
-```lisp
+```text
 ;; Client → server: push a state update and move on — no round-trip.
 ;; The string payload is parsed and evaluated remotely, just like `.ipc.send`.
 (.ipc.post h "(set last-update 42)")
@@ -97,7 +97,7 @@ Returns the null object on a successful local send. Errors: `type` (`h` not an `
 
 Signature: `(.ipc.close h)`. Closes the connection for the handle — either an outbound handle from `.ipc.open` or an inbound one a server-side hook received (a server can kick a client). Closing an inbound connection fires `.ipc.on.close` as usual. Returns the null object.
 
-```lisp
+```text
 (.ipc.close h)
 ```
 

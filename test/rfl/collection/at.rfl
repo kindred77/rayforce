@@ -5,6 +5,12 @@
 
 ;; vector of indices returns vector of elements
 (at [10 20 30 40 50] [0 2 4]) -- [10 30 50]
+(type (at (as 'I64 [10 20 30 40 50]) [0 2 4])) -- 'I64
+(+ 1 (at (as 'I64 [10 20 30 40 50]) [0 2 4])) -- [11 31 51]
+(type (at (as 'F64 [1.5 2.5 3.5]) [2 0])) -- 'F64
+(type (at (as 'I64 [10 20 30]) [0 99])) -- 'LIST
+(nil? (at (at (as 'I64 [10 20 30]) [0 99]) 1)) -- true
+(type (at (as 'I64 [10 20 30]) (as 'I64 [0 0N 2]))) -- 'LIST
 
 ;; table row indices return a table, not a boxed list of row dicts
 (type (at (table [a b] (list [1 2 3] [4 5 6])) [0 2])) -- 'TABLE

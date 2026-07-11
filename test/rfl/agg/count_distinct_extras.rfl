@@ -110,7 +110,7 @@
 ;;     group 0 = {0Nl, 0}; were the null counted this would be 2, but the
 ;;     kernel returns 1 (the lone non-null 0).  This differs from the
 ;;     scalar `(count (distinct [1 0N ...]))` which keeps one null
-;;     (null/distinct.rfl:3) — a k/q per-group-vs-scalar quirk.
+;;     (null/distinct.rfl:3) — a per-group-vs-scalar behavior difference.
 ;;
 ;;     Layout: Vnull[i] = (i-5)%7 for i>=5, prefix [null 1 null 2 null].
 ;;     Group k<9000 = rows {k, k+51000}; partner value = k%7 (because
@@ -148,7 +148,7 @@
 
 ;; ────────── count_distinct_per_group_groups (eval-fallback) ──────────
 ;; STR or LIST by-key flips use_eval_group=1 at query.c:4498, which
-;; routes through ray_group_fn → groups list, then the per-group
+;; routes through ray_group_indices_fn -> groups list, then the per-group
 ;; count(distinct) helper at L2648.
 
 ;; 13) STR by-key + I64 distinct column.  Column ref → src is bound

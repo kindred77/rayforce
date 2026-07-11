@@ -355,7 +355,7 @@ static const agg_vtable_t STDDEV_POP_F64 = {
     .merge = var_f64_merge, .finalize = fin_stddev_pop_f64,
 };
 
-/* ---- pearson correlation, F64 (first BINARY aggregate: x,y) ----------- */
+/* ---- pairwise numeric aggregates, F64 output (binary input: x,y) ------- */
 typedef struct { double sx, sy, sxx, syy, sxy; int64_t n; } pearson_state;
 static void pearson_init(void* s) {
     pearson_state* st = s; st->sx = st->sy = st->sxx = st->syy = st->sxy = 0; st->n = 0;
@@ -401,10 +401,101 @@ static ray_t* pearson_final(const void* s, acc_arena_t* a, int64_t param) {
      * sees the NaN sentinel and sets HAS_NULLS. */
     return ray_f64(ray_f64_fin(num / sqrt(dx*dy)));
 }
+static ray_t* cov_final(const void* s, acc_arena_t* a, int64_t param) {
+    (void)a; (void)param; const pearson_state* st = s;
+    if (st->n <= 0) return ray_typed_null(-RAY_F64);
+    double dn = (double)st->n;
+    double v = (st->sxy - (st->sx * st->sy) / dn) / dn;
+    return ray_f64(ray_f64_fin(v));
+}
+static ray_t* scov_final(const void* s, acc_arena_t* a, int64_t param) {
+    (void)a; (void)param; const pearson_state* st = s;
+    if (st->n <= 1) return ray_typed_null(-RAY_F64);
+    double dn = (double)st->n;
+    double v = (st->sxy - (st->sx * st->sy) / dn) / (dn - 1.0);
+    return ray_f64(ray_f64_fin(v));
+}
+static ray_t* wsum_final(const void* s, acc_arena_t* a, int64_t param) {
+    (void)a; (void)param; const pearson_state* st = s;
+    return ray_f64(ray_f64_fin(st->sxy));
+}
+static ray_t* wavg_final(const void* s, acc_arena_t* a, int64_t param) {
+    (void)a; (void)param; const pearson_state* st = s;
+    if (st->n <= 0 || st->sx == 0.0) return ray_typed_null(-RAY_F64);
+    return ray_f64(ray_f64_fin(st->sxy / st->sx));
+}
 static const agg_vtable_t PEARSON_F64 = {
     .state_size = sizeof(pearson_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
     .init = pearson_init, .update_batch2 = pearson_update2,
     .merge = pearson_merge, .finalize = pearson_final,
+};
+static const agg_vtable_t COV_F64 = {
+    .state_size = sizeof(pearson_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = pearson_init, .update_batch2 = pearson_update2,
+    .merge = pearson_merge, .finalize = cov_final,
+};
+static const agg_vtable_t SCOV_F64 = {
+    .state_size = sizeof(pearson_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = pearson_init, .update_batch2 = pearson_update2,
+    .merge = pearson_merge, .finalize = scov_final,
+};
+static const agg_vtable_t WSUM_F64 = {
+    .state_size = sizeof(pearson_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = pearson_init, .update_batch2 = pearson_update2,
+    .merge = pearson_merge, .finalize = wsum_final,
+};
+static const agg_vtable_t WAVG_F64 = {
+    .state_size = sizeof(pearson_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
+    .init = pearson_init, .update_batch2 = pearson_update2,
+    .merge = pearson_merge, .finalize = wavg_final,
+};
+
+/* ---- all / any truth reductions, BOOL output -------------------------- */
+typedef struct { int64_t n; int64_t truthy; } truth_state;
+static void truth_init(void* s) { truth_state* st = s; st->n = 0; st->truthy = 0; }
+static inline int truth_read(const ray_valid_t* v, int64_t i) {
+    switch (v->type) {
+        case RAY_F64:                       return ((const double*)v->base)[i] != 0.0;
+        case RAY_I64: case RAY_TIMESTAMP:   return ((const int64_t*)v->base)[i] != 0;
+        case RAY_I32: case RAY_DATE: case RAY_TIME:
+                                            return ((const int32_t*)v->base)[i] != 0;
+        case RAY_I16:                       return ((const int16_t*)v->base)[i] != 0;
+        case RAY_U8:  case RAY_BOOL:        return ((const uint8_t*)v->base)[i] != 0;
+        default:                            return 0;
+    }
+}
+static void truth_update(void* base, size_t stride, const uint32_t* gids,
+                         const void* vals, const ray_valid_t* valid,
+                         int64_t n, acc_arena_t* arena) {
+    (void)arena; (void)vals;
+    for (int64_t i = 0; i < n; i++) {
+        if (!ray_valid_at(valid, i)) continue;
+        truth_state* st = (truth_state*)((char*)base + (size_t)gids[i]*stride);
+        st->n++;
+        st->truthy += truth_read(valid, i) ? 1 : 0;
+    }
+}
+static void truth_merge(void* dd, const void* ss, acc_arena_t* a) {
+    (void)a; truth_state* d = dd; const truth_state* s = ss;
+    d->n += s->n; d->truthy += s->truthy;
+}
+static ray_t* all_final(const void* s, acc_arena_t* a, int64_t param) {
+    (void)a; (void)param; const truth_state* st = s;
+    return ray_bool(st->truthy == st->n);
+}
+static ray_t* any_final(const void* s, acc_arena_t* a, int64_t param) {
+    (void)a; (void)param; const truth_state* st = s;
+    return ray_bool(st->truthy > 0);
+}
+static const agg_vtable_t ALL_BOOL = {
+    .state_size = sizeof(truth_state), .kind = ACC_STREAMING, .out_type = RAY_BOOL,
+    .init = truth_init, .update_batch = truth_update,
+    .merge = truth_merge, .finalize = all_final,
+};
+static const agg_vtable_t ANY_BOOL = {
+    .state_size = sizeof(truth_state), .kind = ACC_STREAMING, .out_type = RAY_BOOL,
+    .init = truth_init, .update_batch = truth_update,
+    .merge = truth_merge, .finalize = any_final,
 };
 
 /* ---- median, F64 output (first ACC_BUFFERED: growable per-group buffer) ---- */
@@ -511,13 +602,16 @@ const agg_vtable_t* agg_resolve(uint16_t agg_kind, int8_t in_type) {
     if (agg_kind == OP_BOT_N && in_type == RAY_F64) return &BOTK_F64;
     if (agg_kind == OP_MEDIAN && in_type == RAY_I64) return &MEDIAN_I64;
     if (agg_kind == OP_MEDIAN && in_type == RAY_F64) return &MEDIAN_F64;
-    /* pearson reads x/y per their declared type (pearson_read_f64), so it
-     * accepts any numeric/temporal input column, not just F64. */
-    if (agg_kind == OP_PEARSON_CORR &&
-        (in_type == RAY_F64 || in_type == RAY_I64 || in_type == RAY_I32 ||
-         in_type == RAY_I16 || in_type == RAY_U8  || in_type == RAY_BOOL ||
-         in_type == RAY_DATE || in_type == RAY_TIME || in_type == RAY_TIMESTAMP))
-        return &PEARSON_F64;
+    if (in_type == RAY_F64 || in_type == RAY_I64 || in_type == RAY_I32 ||
+        in_type == RAY_I16 || in_type == RAY_U8  || in_type == RAY_BOOL) {
+        if (agg_kind == OP_ALL) return &ALL_BOOL;
+        if (agg_kind == OP_ANY) return &ANY_BOOL;
+        if (agg_kind == OP_PEARSON_CORR) return &PEARSON_F64;
+        if (agg_kind == OP_COV)  return &COV_F64;
+        if (agg_kind == OP_SCOV) return &SCOV_F64;
+        if (agg_kind == OP_WSUM) return &WSUM_F64;
+        if (agg_kind == OP_WAVG) return &WAVG_F64;
+    }
     if (agg_kind == OP_SUM && in_type == RAY_I64) return &SUM_I64;
     if (agg_kind == OP_COUNT)                     return &COUNT_ANY;
     if (agg_kind == OP_MIN && in_type == RAY_I64) return &MIN_I64;

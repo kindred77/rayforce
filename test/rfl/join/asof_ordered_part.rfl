@@ -1,0 +1,10 @@
+;; asof over a right side ordered by (symbol,time) can use the leading
+;; contiguous symbol slices while secondary equality keys interleave.
+
+(set L (xasc (table [s ex t] (list [aa aa aa bb] [Q P Q Q] [25 25 35 20])) ['s 't]))
+(set R0 (xasc (table [s ex t q] (list [aa aa aa bb] [Q P Q Q] [10 20 30 15] [1 2 3 4])) ['s 't]))
+(set R (table [s ex t q] (list (.attr.set 'grouped (at R0 's)) (at R0 'ex) (at R0 't) (at R0 'q))))
+
+(.attr.get (at R0 's)) -- ['parted]
+(.attr.get (at R 's)) -- ['grouped]
+(at (asof-join ['s 'ex 't] L R) 'q) -- [1 2 3 4]

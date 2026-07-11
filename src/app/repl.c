@@ -782,10 +782,8 @@ static void eval_and_print(ray_term_t* term, const char* input,
     }
     ray_release(nfo);
 
-    if (term) ray_term_eval_end(term);
-
     /* Clear any pull-based progress state left over from this
-     * top-level eval. Some paths (e.g. ray_group_fn invoked from
+     * top-level eval. Some paths (e.g. ray_group_indices_fn invoked from
      * the select builtin) emit progress updates without going
      * through ray_execute, so the ray_execute wrapper's cleanup
      * never runs and the bar would otherwise stay on screen. This
@@ -796,6 +794,8 @@ static void eval_and_print(ray_term_t* term, const char* input,
         result = ray_lazy_materialize(result);
         if (profiling) ray_profile_tick("materialize");
     }
+
+    if (term) ray_term_eval_end(term);
 
     if (profiling) {
         ray_profile_span_end("top-level");

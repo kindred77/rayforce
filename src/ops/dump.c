@@ -53,6 +53,14 @@ const char* ray_opcode_name(uint16_t op) {
         case OP_SQRT:          return "SQRT";
         case OP_LOG:           return "LOG";
         case OP_EXP:           return "EXP";
+        case OP_SIN:           return "SIN";
+        case OP_ASIN:          return "ASIN";
+        case OP_COS:           return "COS";
+        case OP_ACOS:          return "ACOS";
+        case OP_TAN:           return "TAN";
+        case OP_ATAN:          return "ATAN";
+        case OP_RECIPROCAL:    return "RECIPROCAL";
+        case OP_SIGNUM:        return "SIGNUM";
         case OP_CEIL:          return "CEIL";
         case OP_FLOOR:         return "FLOOR";
         case OP_ISNULL:        return "ISNULL";
@@ -63,6 +71,7 @@ const char* ray_opcode_name(uint16_t op) {
         case OP_DIV:           return "DIV";
         case OP_IDIV:          return "IDIV";
         case OP_MOD:           return "MOD";
+        case OP_POW:           return "POW";
         case OP_EQ:            return "EQ";
         case OP_NE:            return "NE";
         case OP_LT:            return "LT";
@@ -83,10 +92,13 @@ const char* ray_opcode_name(uint16_t op) {
         case OP_REPLACE:       return "REPLACE";
         case OP_TRIM:          return "TRIM";
         case OP_CONCAT:        return "CONCAT";
+        case OP_STR_FIND:      return "STR_FIND";
         case OP_EXTRACT:       return "EXTRACT";
         case OP_DATE_TRUNC:    return "DATE_TRUNC";
         case OP_SUM:           return "SUM";
         case OP_PROD:          return "PROD";
+        case OP_ALL:           return "ALL";
+        case OP_ANY:           return "ANY";
         case OP_MIN:           return "MIN";
         case OP_MAX:           return "MAX";
         case OP_COUNT:         return "COUNT";
@@ -99,7 +111,13 @@ const char* ray_opcode_name(uint16_t op) {
         case OP_VAR:           return "VAR";
         case OP_VAR_POP:       return "VAR_POP";
         case OP_PEARSON_CORR:  return "PEARSON_CORR";
+        case OP_COV:           return "COV";
+        case OP_SCOV:          return "SCOV";
+        case OP_WSUM:          return "WSUM";
+        case OP_WAVG:          return "WAVG";
         case OP_MEDIAN:        return "MEDIAN";
+        case OP_QUANTILE:      return "QUANTILE";
+        case OP_MODE:          return "MODE";
         case OP_FILTER:        return "FILTER";
         case OP_SORT:          return "SORT";
         case OP_GROUP:         return "GROUP";
@@ -134,6 +152,24 @@ const char* ray_opcode_name(uint16_t op) {
         case OP_ASC:           return "ASC";
         case OP_DESC:          return "DESC";
         case OP_REVERSE:       return "REVERSE";
+        case OP_LAG:           return "LAG";
+        case OP_LEAD:          return "LEAD";
+        case OP_DELTAS:        return "DELTAS";
+        case OP_RATIOS:        return "RATIOS";
+        case OP_FILLS:         return "FILLS";
+        case OP_SUMS:          return "SUMS";
+        case OP_AVGS:          return "AVGS";
+        case OP_MINS:          return "MINS";
+        case OP_MAXS:          return "MAXS";
+        case OP_PRDS:          return "PRDS";
+        case OP_DIFFER:        return "DIFFER";
+        case OP_MSUM:          return "MSUM";
+        case OP_MAVG:          return "MAVG";
+        case OP_MMIN:          return "MMIN";
+        case OP_MMAX:          return "MMAX";
+        case OP_MCOUNT:        return "MCOUNT";
+        case OP_MVAR:          return "MVAR";
+        case OP_MDEV:          return "MDEV";
         default:               return "UNKNOWN";
     }
 }
@@ -216,6 +252,16 @@ static void dump_node(FILE* f, ray_graph_t* g, ray_op_t* node, int depth) {
         case OP_TAIL:
             if (ext)
                 fprintf(f, "(N=%lld)", (long long)ext->sym);
+            break;
+        case OP_MSUM:
+        case OP_MAVG:
+        case OP_MMIN:
+        case OP_MMAX:
+        case OP_MCOUNT:
+        case OP_MVAR:
+        case OP_MDEV:
+            if (ext)
+                fprintf(f, "(N=%lld)", (long long)ext->param);
             break;
         default:
             break;

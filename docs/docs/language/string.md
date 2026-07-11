@@ -17,9 +17,10 @@ Rayforce provides two distinct string column representations, each optimized for
 - **Global intern table** — symbols are shared across all columns and tables
 
 ```lisp
-; Create a table with a SYM column (default for short repeated strings in CSV)
-ray> (set t (.csv.read "trades.csv"))
-; region column is automatically SYM — only 4 unique values across 1M rows
+; Create a table with a SYM column
+(set t (table [region name]
+  (list [US EU US APAC] ["Alice" "Bob" "Ada" "Chen"])))
+(type (at t 'region))
 ```
 
 ### RAY_STR — Variable-Length Strings
@@ -33,9 +34,8 @@ ray> (set t (.csv.read "trades.csv"))
 
 ```lisp
 ; STR columns are used for unique/high-cardinality text
-ray> (set names (vec-str ["Alice" "Bob" "Charlie"]))
-; "Alice" (5 bytes) → stored inline (SSO)
-; "A longer description here" (26 bytes) → stored in pool with 4-byte prefix
+(set names ["Alice" "Bob" "Charlie"])
+(type names)
 ```
 
 !!! note "When to use which?"
@@ -48,14 +48,13 @@ All string operations in Rayforce follow strict null propagation semantics:
 - **Null input produces null output** — if any required input row is null, the output row is null
 - **CONCAT is null if any argument is null**
 - Null propagation applies uniformly to both RAY_SYM and RAY_STR columns
-- Null bitmaps are carried through the execution pipeline per morsel (1024 elements)
+- Null state is carried through the execution pipeline per morsel (1024 elements)
 
 In the C API DAG, null propagation is handled automatically per morsel. String transformation opcodes (STRLEN, UPPER/LOWER/TRIM, SUBSTR, REPLACE, CONCAT) propagate nulls: null input rows produce null output rows. CONCAT is null if any argument is null.
 
 ## String Functions
 
-!!! note "DAG-only operations"
-    The following string operations are available in the C API DAG but are **not** currently exposed as Rayfall builtins: `upper`, `lower`, `trim`, `substr`, `replace`, `ilike`. They can be used through the C API's DAG opcodes (see table below). (`strlen` *is* a Rayfall builtin — `(strlen "hello")` → `5`.)
+Rayfall exposes the common string transforms as direct builtins. On vector inputs, `upper`, `lower`, `trim`, `substr`, and `replace` are lazy-aware and use the same morsel-based DAG opcodes that query expressions use. `str-find` uses the thread pool for large direct vector searches. `ilike` remains a C API DAG opcode.
 
 ### concat
 
@@ -64,8 +63,7 @@ In the C API DAG, null propagation is handled automatically per morsel. String t
 Concatenates two string arguments. Works on string atoms and vectors element-wise.
 
 ```lisp
-ray> (concat "hello" " world")
-"hello world"
+(concat "hello" " world")
 ```
 
 ### like
@@ -75,14 +73,52 @@ ray> (concat "hello" " world")
 Case-sensitive glob pattern matching. Returns a boolean (or boolean vector for vector input). Supports `*` (match any sequence of characters) and `?` (match any single character). Works on both RAY_SYM and RAY_STR columns.
 
 ```lisp
-ray> (like "hello world" "*world")
-true
+(like "hello world" "*world")
 
-ray> (like "hello world" "hello*")
-true
+(like "hello world" "hello*")
 
-ray> (select {from:t where: (like name "A*")})
+(select {from: t where: (like name "A*")})
 ; Returns all rows where name starts with "A"
+```
+
+### upper / lower / trim
+
+**`(upper x)`**, **`(lower x)`**, **`(trim x)`** — unary · atom/vector · lazy-aware
+
+Transforms string or symbol atoms and vectors. `trim` removes leading and trailing whitespace.
+
+```lisp
+(upper "Abc42")
+(lower 'AbC)
+(trim [" a " "\tb\t" ""])
+```
+
+### substr
+
+**`(substr str start len)`** — variadic · atom/vector · lazy-aware
+
+Extracts a substring using a 1-based start position and a length. Start values below 1 clamp to the first byte. Negative lengths consume through the end. `start` and `len` may be integer atoms or `I64`/`I32` vectors for vector inputs.
+
+```lisp
+(substr "abcdef" 2 3)
+; "bcd"
+
+(substr ["abcdef" "xyz"] [1 2] [3 9])
+; ["abc" "yz"]
+```
+
+### replace
+
+**`(replace str from to)`** — variadic · atom/vector · lazy-aware
+
+Replaces all occurrences of `from` with `to`. The `from` and `to` arguments must be string or symbol atoms.
+
+```lisp
+(replace "banana" "na" "NA")
+; "baNANA"
+
+(replace (upper ["a-b" "c-d"]) "-" "_")
+; ["A_B" "C_D"]
 ```
 
 ### split
@@ -92,11 +128,37 @@ ray> (select {from:t where: (like name "A*")})
 Splits each string element by the given delimiter and returns a list of string vectors. Each element in the result is a vector of the split parts. Null input produces null output.
 
 ```lisp
-ray> (split "a,b,c" ",")
-["a" "b" "c"]
+(split "a,b,c" ",")
 
-ray> (split "hello world" " ")
-["hello" "world"]
+(split "hello world" " ")
+```
+
+### str-find
+
+**`(str-find str needle)`** — binary · atom/vector/list
+
+Returns the first 0-based byte index of `needle` in each string or symbol value. A missing substring returns `0Nl`, matching the collection `find` convention for "not found". Empty `needle` returns `0`. Large string/symbol vectors run through the thread pool and poll cancellation between morsels.
+
+```lisp
+(str-find "banana" "na")
+; 2
+
+(str-find ["banana" "cab" ""] "a")
+; [1 1 0Nl]
+```
+
+### str-join
+
+**`(str-join items delimiter)`** — binary
+
+Joins string or symbol atoms, vectors, or lists using a string/symbol delimiter. The result is a string atom. Empty inputs produce `""`; a single item is returned without adding the delimiter.
+
+```lisp
+(str-join ["2026" "04" "16"] "-")
+; "2026-04-16"
+
+(str-join (list "a" 'b "c") "/")
+; "a/b/c"
 ```
 
 ### format

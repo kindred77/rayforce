@@ -16,8 +16,11 @@ The executor consults indexes at five sites.  Each site has a specific consumpti
 | `.idx.zone` | `filter` — comparison predicates (EQ/NE/LT/LE/GT/GE) | O(1) all/none short-circuit: if the constant falls outside the column's [min, max] range the filter returns 0 rows without scanning; if every row must pass the whole table is returned.  Integer and float families both supported. |
 | `.idx.bloom` | `filter` — EQ on integer-family columns | Definite-absent proof: if all k probe bits are clear the key is absent and the filter returns 0 rows without scanning.  False positives fall through to the scan; there are no false absences. |
 | `.idx.hash` | `filter` — EQ on integer-family columns | Direct rowsel from hash-chain probe: matching rows are collected in O(matches) without a full column scan.  Null-free columns only (HAS_NULLS → scan). |
+| `part` backing (`.attr.set 'parted`) | `filter` — EQ predicates | Locate the value block and build the rowsel directly from its contiguous `[start, len)` span, including dense blocks. |
 | `.idx.sort` | `filter` — range predicates (EQ/LT/LE/GT/GE) | Binary search over the row-id permutation to identify the matching span, then a rowsel is built from that span.  NE (two disjoint spans) falls back.  A selectivity guard fires when the span exceeds n/128 (~0.78%) — see [Performance Characteristics](#performance-characteristics) for the measured rationale. |
 | `.idx.hash` | `filter` — IN predicates on integer-family columns | Hash-chain probe for each set element; result is the union rowsel over all matches. |
+| `part` backing (`.attr.set 'parted`) | `filter` — IN predicates | Match partition keys once and build the rowsel from their contiguous physical spans. |
+| `.idx.hash` / `part` backing | `where key IN …` + `group by key` | Resolve only the requested key slices and aggregate them directly, skipping filter scan and group discovery. Part slices stream as contiguous ranges. |
 | `.idx.sort` | ORDER BY — single ascending key | The pre-built permutation is reused directly rather than re-sorting.  Descending ORDER BY falls back to recompute (reversing the perm would swap tie-group positions relative to stable DESC sort). |
 | `.idx.sort` | `distinct` | Walk the sort permutation once to collect first-occurrence row ids per distinct value — O(n) with no hash table.  SYM/GUID/STR columns fall back. |
 | `.idx.hash` | `find` | Hash-chain probe returns the minimum row id matching the needle, or a provably-absent signal.  Integer-family needles only; float and cross-family needles fall through to the scan. |
@@ -48,13 +51,13 @@ Match the shape of your *query*, not the shape of the data.
 | Query shape | Kind | Active now |
 |---|---|---|
 | Constant predicate may fall outside the column's value range | `.idx.zone` | Yes — O(1) all/none short-circuit at the filter site |
-| Repeated `=` / `in` / `find` | `.idx.hash` | Yes — O(matches) hash probe at filter EQ, filter IN, and find sites |
+| Repeated `==` / `in` / `find` | `.idx.hash` | Yes — O(matches) hash probe at filter EQ, filter IN, and find sites |
 | Range queries, sorted output | `.idx.sort` | Yes — binary search at filter range site; permutation reuse at ORDER BY and distinct |
 | Cheap probabilistic membership rejection | `.idx.bloom` | Yes — definite-absent proof at filter EQ site (integer-family only) |
 
 ## Why Per-Column Indexes
 
-Rayforce's hot path is morsel-driven columnar execution — every operator scans 1024-element chunks of contiguous values.  That's already fast for full-column work, but it's still O(n) for needle-in-haystack queries: `filter (= col 42)` visits every row even when only one matches, `(in col big-set)` builds a rowsel from a full scan, `(find col k)` linear-scans.
+Rayforce's hot path is morsel-driven columnar execution — every operator scans 1024-element chunks of contiguous values.  That's already fast for full-column work, but it's still O(n) for needle-in-haystack queries: `filter (== col 42)` visits every row even when only one matches, `(in col big-set)` builds a rowsel from a full scan, `(find col k)` linear-scans.
 
 An **accelerator index** is a precomputed data structure attached to the column itself.  The user pays the build cost once; subsequent queries against that column consult the index instead of the raw values at the applicable routing sites.
 
@@ -71,8 +74,10 @@ Set `RAY_IDX_STATS=1` before running a process.  At exit, per-site consult and h
 idx_route filter_zone   consults=3 hits=2
 idx_route filter_bloom  consults=1 hits=1
 idx_route filter_hash   consults=5 hits=5
+idx_route filter_part   consults=3 hits=3
 idx_route filter_range  consults=4 hits=3
 idx_route in            consults=2 hits=2
+idx_route group-slice   consults=2 hits=2
 idx_route find          consults=8 hits=7
 idx_route sort          consults=6 hits=6
 idx_route distinct      consults=2 hits=2
@@ -175,7 +180,7 @@ The original column is unchanged; the sort lives in a row-id permutation alongsi
 ; ⇒ {kind:zone length:5 parent_type:5 saved_attrs:0 min:21 max:42 n_nulls:0}
 ```
 
-A predicate like `(= ages 17)` falls outside `[21, 42]`; the executor short-circuits to 0 rows without scanning.  A predicate like `(>= ages 1)` sees every row must pass and returns the full table without scanning.
+A predicate like `(== ages 17)` falls outside `[21, 42]`; the executor short-circuits to 0 rows without scanning.  A predicate like `(>= ages 1)` sees every row must pass and returns the full table without scanning.
 
 ## Performance Characteristics
 

@@ -290,18 +290,7 @@
 (select {r: (+ (pearson_corr x) 0) from: Tpcorr}) !- arity
 
 ;; ────────────────────────────────────────────────────────────────────
-;; Scalar reduction with compile_expr_dag NULL for agg input (lines 6889-6895):
-;; In the scalar reduction path (n_out>0, no by:, all outputs are aggs),
-;; compile_expr_dag is called for each agg's argument at line 6886.
-;; If the argument cannot be compiled (e.g. pow not in resolve_binary_dag),
-;; compile_expr_dag returns NULL and lines 6889-6895 execute.
-;;
-;; (select {r: (sum (pow v 2)) from: T}):
-;;   is_agg_expr((sum (pow v 2))) = true (resolve_agg_opcode(sum) != 0)
-;;   → has_agg=1, has_nonagg_out=0 → scalar reduction path (6854)
-;;   → agg_elems[1] = (pow v 2), compile_expr_dag((pow v 2)) = NULL
-;;     (pow not in resolve_binary_dag at 238-271)
-;;   → lines 6889-6895: releases selection if set, returns domain error
+;; Scalar reduction over a compiled element-wise agg input.
 ;; ────────────────────────────────────────────────────────────────────
 (set Tscalar (table [v] (list [1 2 3 4])))
-(select {r: (sum (pow v 2)) from: Tscalar}) !- domain
+(select {r: (sum (pow v 2)) from: Tscalar}) -- (table [r] (list [30.0]))

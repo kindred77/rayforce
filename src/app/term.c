@@ -635,6 +635,8 @@ static int32_t find_next_utf8(const char* buf, int32_t pos, int32_t len) {
 #define CLR_GRAY       "\033[1;38;5;8m"
 #define CLR_LIGHT_BLUE "\033[1;38;5;39m"
 #define CLR_SALAD      "\033[1;38;5;118m"
+#define CLR_RED        "\033[1;31m"
+#define CLR_REVERSE    "\033[7m"
 #define CLR_RESET      "\033[0m"
 #define CLR_BACK_CYAN  "\033[46m"
 
@@ -648,6 +650,113 @@ static int is_alphanum(char c) {
 static int is_op_char(char c) {
     return c == '+' || c == '-' || c == '*' || c == '/' || c == '%' ||
            c == '<' || c == '>' || c == '=' || c == '!' || c == '&' || c == '|';
+}
+
+static int32_t term_word_left_pos(ray_term_t* term, int32_t pos) {
+    while (pos > 0) {
+        int32_t prev = find_prev_utf8(term->buf, pos);
+        if (is_alphanum(term->buf[prev])) break;
+        pos = prev;
+    }
+    while (pos > 0) {
+        int32_t prev = find_prev_utf8(term->buf, pos);
+        if (!is_alphanum(term->buf[prev])) break;
+        pos = prev;
+    }
+    return pos;
+}
+
+static int32_t term_word_right_pos(ray_term_t* term, int32_t pos) {
+    while (pos < term->buf_len && !is_alphanum(term->buf[pos]))
+        pos = find_next_utf8(term->buf, pos, term->buf_len);
+    while (pos < term->buf_len && is_alphanum(term->buf[pos]))
+        pos = find_next_utf8(term->buf, pos, term->buf_len);
+    return pos;
+}
+
+static void term_delete_range(ray_term_t* term, int32_t start, int32_t end) {
+    if (start < 0) start = 0;
+    if (end > term->buf_len) end = term->buf_len;
+    if (start >= end) return;
+    memmove(term->buf + start, term->buf + end, (size_t)(term->buf_len - end));
+    term->buf_len -= end - start;
+    if (term->buf_pos > end)
+        term->buf_pos -= end - start;
+    else if (term->buf_pos > start)
+        term->buf_pos = start;
+    term->buf[term->buf_len] = '\0';
+}
+
+static void term_move_word_left(ray_term_t* term) {
+    int32_t next = term_word_left_pos(term, term->buf_pos);
+    if (next != term->buf_pos) {
+        term->buf_pos = next;
+        term->comp_cycling = 0;
+        ray_term_redraw(term);
+    }
+}
+
+static void term_move_word_right(ray_term_t* term) {
+    int32_t next = term_word_right_pos(term, term->buf_pos);
+    if (next != term->buf_pos) {
+        term->buf_pos = next;
+        term->comp_cycling = 0;
+        ray_term_redraw(term);
+    }
+}
+
+static void term_delete_word_left(ray_term_t* term) {
+    if (term->buf_pos <= 0) return;
+    int32_t start = term_word_left_pos(term, term->buf_pos);
+    term_delete_range(term, start, term->buf_pos);
+    term->buf_pos = start;
+    term->comp_cycling = 0;
+    ray_term_redraw(term);
+}
+
+static void term_delete_word_right(ray_term_t* term) {
+    if (term->buf_pos >= term->buf_len) return;
+    int32_t end = term_word_right_pos(term, term->buf_pos);
+    term_delete_range(term, term->buf_pos, end);
+    term->comp_cycling = 0;
+    ray_term_redraw(term);
+}
+
+static void term_transpose_chars(ray_term_t* term) {
+    if (term->buf_len < 2 || term->buf_pos <= 0) return;
+
+    int32_t left_start;
+    int32_t right_start;
+    int32_t right_end;
+
+    if (term->buf_pos >= term->buf_len) {
+        right_end = term->buf_len;
+        right_start = find_prev_utf8(term->buf, right_end);
+        left_start = find_prev_utf8(term->buf, right_start);
+    } else {
+        right_start = term->buf_pos;
+        right_end = find_next_utf8(term->buf, right_start, term->buf_len);
+        left_start = find_prev_utf8(term->buf, right_start);
+    }
+
+    int32_t left_len = right_start - left_start;
+    int32_t right_len = right_end - right_start;
+    if (left_len <= 0 || right_len <= 0 || left_len > 8 || right_len > 8)
+        return;
+
+    char left[8];
+    memcpy(left, term->buf + left_start, (size_t)left_len);
+    memmove(term->buf + left_start, term->buf + right_start, (size_t)right_len);
+    memcpy(term->buf + left_start + right_len, left, (size_t)left_len);
+    term->buf_pos = left_start + right_len + left_len;
+    term->comp_cycling = 0;
+    ray_term_redraw(term);
+}
+
+static void term_clear_screen(ray_term_t* term) {
+    printf("\033[2J\033[H");
+    term->last_total_rows = 1;
+    ray_term_redraw(term);
 }
 
 /* ===== Bracket matching ===== */
@@ -676,6 +785,37 @@ static int is_escaped(const char* buf, int32_t pos) {
     int bs = 0;
     while (pos - 1 - bs >= 0 && buf[pos - 1 - bs] == '\\') bs++;
     return bs % 2 != 0;
+}
+
+static int32_t term_find_unmatched_bracket(const char* buf, int32_t buf_len) {
+    int32_t stack[TERM_BUF_SIZE];
+    int32_t top = 0;
+    int in_str = 0;
+
+    for (int32_t i = 0; i < buf_len; i++) {
+        char c = buf[i];
+        if (in_str) {
+            if (c == '\\' && i + 1 < buf_len) { i++; continue; }
+            if (c == '"') in_str = 0;
+            continue;
+        }
+        if (c == '"') { in_str = 1; continue; }
+        if (c == ';') break;
+
+        if (is_open_bracket(c)) {
+            if (top < TERM_BUF_SIZE)
+                stack[top++] = i;
+        } else if (is_close_bracket(c)) {
+            if (top <= 0)
+                return i;
+            char open = buf[stack[top - 1]];
+            if (opposite_bracket(open) != c)
+                return i;
+            top--;
+        }
+    }
+
+    return top > 0 ? stack[top - 1] : -1;
 }
 
 static int in_string_at(const char* buf, int32_t pos) {
@@ -743,7 +883,8 @@ int32_t ray_term_find_matching_paren(const char* buf, int32_t buf_len,
 /* Write highlighted buffer content into dst. Returns bytes written. */
 static int32_t term_highlight_into(char* dst, int32_t dst_cap,
                                    const char* buf, int32_t buf_len,
-                                   int32_t match_pos1, int32_t match_pos2) {
+                                   int32_t match_pos1, int32_t match_pos2,
+                                   int32_t bad_pos) {
     int32_t n = 0;
 
 #define HL_APPEND(s, slen) do { \
@@ -757,7 +898,9 @@ static int32_t term_highlight_into(char* dst, int32_t dst_cap,
 
         switch (c) {
         case '(': case ')': case '[': case ']': case '{': case '}':
-            if (i == match_pos1 || i == match_pos2) {
+            if (i == bad_pos) {
+                HL_LIT(CLR_RED);
+            } else if (i == match_pos1 || i == match_pos2) {
                 HL_LIT(CLR_BACK_CYAN);
             } else {
                 HL_LIT(CLR_GRAY);
@@ -981,9 +1124,23 @@ static void ray_term_accept_ghost(ray_term_t* term) {
 
 /* Max completion candidates stored in ray_term_t::comp_items */
 #define COMP_MAX 256
+#define COMP_SRC_ENV  1
+#define COMP_SRC_COL  2
+#define COMP_SRC_HIST 3
 
-static int comp_cmp_str(const void* a, const void* b) {
-    return strcmp(*(const char**)a, *(const char**)b);
+static void comp_sort_candidates(ray_term_t* term) {
+    for (int32_t i = 1; i < term->comp_count; i++) {
+        const char* item = term->comp_items[i];
+        int32_t src = term->comp_sources[i];
+        int32_t j = i - 1;
+        while (j >= 0 && strcmp(term->comp_items[j], item) > 0) {
+            term->comp_items[j + 1] = term->comp_items[j];
+            term->comp_sources[j + 1] = term->comp_sources[j];
+            j--;
+        }
+        term->comp_items[j + 1] = item;
+        term->comp_sources[j + 1] = src;
+    }
 }
 
 /* Check if name is already in results[0..count) */
@@ -994,26 +1151,134 @@ static int comp_has(const char** results, int32_t count, const char* name) {
     return 0;
 }
 
-/* Try to extract a table variable name from a `(select {from: NAME ...` pattern
- * in the current buffer.  Returns the env value (a table) or NULL. */
-static ray_t* comp_find_from_table(const char* buf, int32_t buf_len) {
-    /* Scan for "from:" followed by a name */
-    for (int32_t i = 0; i + 5 <= buf_len; i++) {
+static int comp_name_char(char c) {
+    return is_alphanum(c) || c == '.';
+}
+
+static int comp_table_from_at(const char* buf, int32_t buf_len,
+                              int32_t pos, int32_t* name_start,
+                              int32_t* name_len) {
+    int32_t j = pos + 5;
+    while (j < buf_len && (buf[j] == ' ' || buf[j] == '\t')) j++;
+    if (j < buf_len && buf[j] == '\'') j++;
+    if (j >= buf_len || !comp_name_char(buf[j])) return 0;
+    *name_start = j;
+    while (j < buf_len && comp_name_char(buf[j])) j++;
+    *name_len = j - *name_start;
+    return *name_len > 0;
+}
+
+static ray_t* comp_find_from_table_range(const char* buf, int32_t buf_len,
+                                         int32_t start, int32_t end,
+                                         int32_t cursor_pos) {
+    ray_t* best = NULL;
+    int32_t best_dist = INT32_MAX;
+    int in_str = 0;
+
+    if (start < 0) start = 0;
+    if (end > buf_len) end = buf_len;
+    if (cursor_pos < start) cursor_pos = start;
+    if (cursor_pos > end) cursor_pos = end;
+
+    for (int32_t i = start; i + 5 <= end; i++) {
+        char c = buf[i];
+        if (in_str) {
+            if (c == '\\' && i + 1 < end) { i++; continue; }
+            if (c == '"') in_str = 0;
+            continue;
+        }
+        if (c == '"') { in_str = 1; continue; }
+        if (c == ';') break;
         if (memcmp(buf + i, "from:", 5) != 0) continue;
-        int32_t j = i + 5;
-        /* skip whitespace */
-        while (j < buf_len && (buf[j] == ' ' || buf[j] == '\t')) j++;
-        if (j >= buf_len || !is_alphanum(buf[j])) continue;
-        int32_t start = j;
-        while (j < buf_len && is_alphanum(buf[j])) j++;
-        int32_t nlen = j - start;
+
+        int32_t nstart = 0;
+        int32_t nlen = 0;
+        if (!comp_table_from_at(buf, end, i, &nstart, &nlen)) continue;
         /* Look up the name (read-only) and check env */
-        int64_t sym = ray_sym_find(buf + start, (size_t)nlen);
+        int64_t sym = ray_sym_find(buf + nstart, (size_t)nlen);
         if (sym < 0) continue;
         ray_t* val = ray_env_get(sym);
-        if (val && val->type == RAY_TABLE) return val;
+        if (val && val->type == RAY_TABLE) {
+            int32_t dist = cursor_pos >= i ? cursor_pos - i : i - cursor_pos;
+            if (!best || dist < best_dist) {
+                best = val;
+                best_dist = dist;
+            }
+        }
     }
-    return NULL;
+
+    return best;
+}
+
+static int comp_find_query_scope(const char* buf, int32_t buf_len,
+                                 int32_t cursor_pos,
+                                 int32_t* start, int32_t* end) {
+    int32_t stack[64];
+    int32_t top = 0;
+    int in_str = 0;
+
+    if (cursor_pos < 0) cursor_pos = 0;
+    if (cursor_pos > buf_len) cursor_pos = buf_len;
+
+    for (int32_t i = 0; i < cursor_pos; i++) {
+        char c = buf[i];
+        if (in_str) {
+            if (c == '\\' && i + 1 < cursor_pos) { i++; continue; }
+            if (c == '"') in_str = 0;
+            continue;
+        }
+        if (c == '"') { in_str = 1; continue; }
+        if (c == ';') break;
+        if (c == '{') {
+            if (top < (int32_t)(sizeof(stack) / sizeof(stack[0])))
+                stack[top++] = i;
+        } else if (c == '}' && top > 0) {
+            top--;
+        }
+    }
+
+    if (top <= 0)
+        return 0;
+
+    *start = stack[0];
+    int32_t depth = 0;
+    in_str = 0;
+    for (int32_t i = *start; i < buf_len; i++) {
+        char c = buf[i];
+        if (in_str) {
+            if (c == '\\' && i + 1 < buf_len) { i++; continue; }
+            if (c == '"') in_str = 0;
+            continue;
+        }
+        if (c == '"') { in_str = 1; continue; }
+        if (c == ';') break;
+        if (c == '{') depth++;
+        else if (c == '}') {
+            depth--;
+            if (depth == 0) {
+                *end = i + 1;
+                return 1;
+            }
+        }
+    }
+    *end = buf_len;
+    return 1;
+}
+
+/* Try to extract the active query table from the current buffer.
+ * Returns the env value (a table) or NULL. */
+static ray_t* comp_find_from_table(ray_term_t* term) {
+    int32_t start = 0;
+    int32_t end = term->buf_len;
+    if (comp_find_query_scope(term->buf, term->buf_len, term->buf_pos,
+                              &start, &end)) {
+        ray_t* scoped = comp_find_from_table_range(term->buf, term->buf_len,
+                                                   start, end,
+                                                   term->buf_pos);
+        if (scoped) return scoped;
+    }
+    return comp_find_from_table_range(term->buf, term->buf_len, 0,
+                                      term->buf_len, term->buf_pos);
 }
 
 void ray_term_collect_completions(ray_term_t* term, const char* prefix,
@@ -1023,6 +1288,7 @@ void ray_term_collect_completions(ray_term_t* term, const char* prefix,
     if (prefix_len <= 0) return;
 
     const char** out = term->comp_items;
+    int32_t* srcs = term->comp_sources;
     int32_t cap = COMP_MAX;
     int32_t n = 0;
 
@@ -1032,7 +1298,8 @@ void ray_term_collect_completions(ray_term_t* term, const char* prefix,
         int64_t ec = ray_env_lookup_prefix(prefix, (int64_t)prefix_len,
                                            env_results, 128);
         for (int64_t i = 0; i < ec && n < cap; i++) {
-            out[n++] = env_results[i];
+            out[n] = env_results[i];
+            srcs[n++] = COMP_SRC_ENV;
         }
     }
 
@@ -1043,7 +1310,7 @@ void ray_term_collect_completions(ray_term_t* term, const char* prefix,
 
     /* Source 3: column names from a table referenced in the buffer */
     {
-        ray_t* tbl = comp_find_from_table(term->buf, term->buf_len);
+        ray_t* tbl = comp_find_from_table(term);
         if (tbl) {
             int64_t ncols = ray_table_ncols(tbl);
             for (int64_t ci = 0; ci < ncols && n < cap; ci++) {
@@ -1057,7 +1324,8 @@ void ray_term_collect_completions(ray_term_t* term, const char* prefix,
                 if (clen >= prefix_len &&
                     strncmp(cname, prefix, (size_t)prefix_len) == 0 &&
                     !comp_has(out, n, cname)) {
-                    out[n++] = cname;
+                    out[n] = cname;
+                    srcs[n++] = COMP_SRC_COL;
                 }
             }
         }
@@ -1100,7 +1368,8 @@ void ray_term_collect_completions(ray_term_t* term, const char* prefix,
                             memcpy(term->comp_scratch + term->comp_scratch_len,
                                    entry + ws, (size_t)wlen);
                             term->comp_scratch[term->comp_scratch_len + wlen] = '\0';
-                            out[n++] = term->comp_scratch + term->comp_scratch_len;
+                            out[n] = term->comp_scratch + term->comp_scratch_len;
+                            srcs[n++] = COMP_SRC_HIST;
                             term->comp_scratch_len += wlen + 1;
                         }
                     }
@@ -1109,12 +1378,9 @@ void ray_term_collect_completions(ray_term_t* term, const char* prefix,
         }
     }
 
-    /* Sort the merged results alphabetically */
-    if (n > 1) {
-        qsort((void*)out, (size_t)n, sizeof(const char*), comp_cmp_str);
-    }
-
     term->comp_count = n;
+    if (term->comp_count > 1)
+        comp_sort_candidates(term);
 }
 
 /* ===== Inline tab-cycle completion ===== */
@@ -1140,6 +1406,79 @@ static void comp_cycle_insert(ray_term_t* term, int32_t idx) {
     term->buf_pos = ws + ilen;
     term->comp_cycle_len = ilen;
     term->comp_cycle_idx = idx;
+}
+
+/* ===== Completion menu ===== */
+
+static const char* comp_source_label(int32_t src) {
+    switch (src) {
+    case COMP_SRC_COL:  return "col";
+    case COMP_SRC_HIST: return "hist";
+    case COMP_SRC_ENV:
+    default:            return "env";
+    }
+}
+
+static void menu_append(char* dst, int32_t cap, int32_t* n,
+                        int32_t* vis, const char* s) {
+    int32_t len = (int32_t)strlen(s);
+    if (*n + len >= cap) return;
+    memcpy(dst + *n, s, (size_t)len);
+    *n += len;
+    *vis += ray_term_visual_width(s, len);
+}
+
+static int32_t completion_menu_into(ray_term_t* term, char* dst,
+                                    int32_t dst_cap) {
+    if (!term->comp_cycling || term->comp_count < 2 || term->term_width <= 10)
+        return 0;
+
+    int32_t selected = term->comp_cycle_idx;
+    if (selected < 0 || selected >= term->comp_count)
+        selected = 0;
+
+    int32_t max_items = 5;
+    int32_t start = selected - 2;
+    if (start < 0) start = 0;
+    if (start + max_items > term->comp_count) {
+        start = term->comp_count - max_items;
+        if (start < 0) start = 0;
+    }
+
+    int32_t n = 0;
+    int32_t vis = 0;
+    int32_t limit = term->term_width - 1;
+    menu_append(dst, dst_cap, &n, &vis, CLR_GRAY);
+    menu_append(dst, dst_cap, &n, &vis, "  ");
+
+    for (int32_t i = start, shown = 0; i < term->comp_count && shown < max_items; i++, shown++) {
+        const char* item = term->comp_items[i];
+        const char* label = comp_source_label(term->comp_sources[i]);
+        int32_t item_vis = ray_term_visual_width(item, (int32_t)strlen(item));
+        int32_t label_vis = (int32_t)strlen(label) + 2; /* [] */
+        int32_t need = item_vis + label_vis + 3;
+        if (vis + need > limit)
+            break;
+
+        if (i == selected)
+            menu_append(dst, dst_cap, &n, &vis, CLR_REVERSE);
+        menu_append(dst, dst_cap, &n, &vis, "[");
+        menu_append(dst, dst_cap, &n, &vis, label);
+        menu_append(dst, dst_cap, &n, &vis, "] ");
+        menu_append(dst, dst_cap, &n, &vis, item);
+        if (i == selected)
+            menu_append(dst, dst_cap, &n, &vis, CLR_RESET CLR_GRAY);
+        menu_append(dst, dst_cap, &n, &vis, "  ");
+    }
+
+    if (start + max_items < term->comp_count && vis + 6 < limit) {
+        char more[24];
+        snprintf(more, sizeof(more), "+%d", term->comp_count - (start + max_items));
+        menu_append(dst, dst_cap, &n, &vis, more);
+    }
+
+    menu_append(dst, dst_cap, &n, &vis, CLR_RESET);
+    return n;
 }
 
 /* ===== Multi-line input ===== */
@@ -1239,12 +1578,16 @@ void ray_term_set_prompt_prefix(ray_term_t* term, const char* prefix) {
 
 void ray_term_redraw(ray_term_t* term) {
     int32_t total_width;
+    int32_t ghost_vis = 0;
+    int32_t menu_len = 0;
+    char menu[1024];
 
     /* Recompute ghost text on every redraw */
     ray_term_update_ghost(term);
+    ray_term_get_size(term);
+    menu_len = completion_menu_into(term, menu, (int32_t)sizeof(menu));
 
     ray_cursor_hide();
-    ray_term_get_size(term);
 
     /* Move to start of first line */
     printf("\r");
@@ -1286,6 +1629,7 @@ void ray_term_redraw(ray_term_t* term) {
         if (term->buf_len > 0) {
             /* Find bracket match at cursor */
             int32_t match_pos1 = -1, match_pos2 = -1;
+            int32_t bad_pos = -1;
             int32_t cursor = term->buf_pos;
             /* Check char at cursor, or char before cursor */
             if (cursor < term->buf_len) {
@@ -1296,10 +1640,12 @@ void ray_term_redraw(ray_term_t* term) {
                 int32_t m = ray_term_find_matching_paren(term->buf, term->buf_len, cursor - 1);
                 if (m >= 0) { match_pos1 = cursor - 1; match_pos2 = m; }
             }
+            if (match_pos1 < 0)
+                bad_pos = term_find_unmatched_bracket(term->buf, term->buf_len);
             hlen += term_highlight_into(hlbuf + hlen,
                                         (int32_t)sizeof(hlbuf) - hlen,
                                         term->buf, term->buf_len,
-                                        match_pos1, match_pos2);
+                                        match_pos1, match_pos2, bad_pos);
         }
         /* Append ghost text in gray after buffer content */
         if (term->ghost_len > 0 && term->buf_pos == term->buf_len) {
@@ -1320,9 +1666,14 @@ void ray_term_redraw(ray_term_t* term) {
         term_write(hlbuf, (size_t)hlen);
     }
 
+    if (menu_len > 0) {
+        term_write("\n", 1);
+        term_write(menu, (size_t)menu_len);
+    }
+
     /* Track rows used — include ghost text width for row calculation */
-    int32_t ghost_vis = (term->ghost_len > 0 && term->buf_pos == term->buf_len)
-                        ? ray_term_visual_width(term->ghost, term->ghost_len) : 0;
+    ghost_vis = (term->ghost_len > 0 && term->buf_pos == term->buf_len)
+                ? ray_term_visual_width(term->ghost, term->ghost_len) : 0;
     total_width = term->prompt_len + ray_term_visual_width(term->buf, term->buf_len) + ghost_vis;
     if (term->term_width > 0) {
         term->last_total_rows = (total_width + term->term_width - 1) / term->term_width;
@@ -1330,12 +1681,22 @@ void ray_term_redraw(ray_term_t* term) {
             term->last_total_rows = 1;
     }
 
-    /* Position cursor at buf_pos.
-     * After writing hlbuf the physical cursor sits at prompt + buf + ghost.
-     * ray_term_goto_position assumes cursor is at prompt + visual_width(buf, from_pos),
-     * so we must first move back past any ghost text. */
-    if (ghost_vis > 0)
+    /* Position cursor at buf_pos.  The menu, when visible, is drawn on
+     * the line below input; otherwise the physical cursor sits after any
+     * ghost text.  Move back to the end of the real buffer before using
+     * the normal prompt-relative cursor math. */
+    if (menu_len > 0) {
+        int32_t input_vis = term->prompt_len +
+            ray_term_visual_width(term->buf, term->buf_len);
+        ray_cursor_move_up(1);
+        printf("\r");
+        if (term->term_width > 0)
+            ray_cursor_move_right(input_vis % term->term_width);
+        else
+            ray_cursor_move_right(input_vis);
+    } else if (ghost_vis > 0) {
         ray_cursor_move_left(ghost_vis);
+    }
     ray_term_goto_position(term, term->buf_len, term->buf_pos);
 
 
@@ -1434,10 +1795,105 @@ void ray_term_begin(ray_term_t* term) {
     term->last_total_rows = 1;
     term->esc_state = 0;
     term->esc_buf_len = 0;
+    term->esc_buf[0] = '\0';
 }
 
 /* Forward declaration — feed_normal handles all normal-mode keys. */
 static ray_t* feed_normal(ray_term_t* term, int key);
+
+static void csi_buf_reset(ray_term_t* term, int byte) {
+    term->esc_buf_len = 0;
+    if (byte >= 0 && term->esc_buf_len < (int32_t)sizeof(term->esc_buf) - 1) {
+        term->esc_buf[term->esc_buf_len++] = (char)byte;
+        term->esc_buf[term->esc_buf_len] = '\0';
+    }
+}
+
+static void csi_buf_append(ray_term_t* term, int byte) {
+    if (term->esc_buf_len < (int32_t)sizeof(term->esc_buf) - 1) {
+        term->esc_buf[term->esc_buf_len++] = (char)byte;
+        term->esc_buf[term->esc_buf_len] = '\0';
+    } else {
+        term->esc_state = 0;
+        term->esc_buf_len = 0;
+        term->esc_buf[0] = '\0';
+    }
+}
+
+static int csi_first_param(ray_term_t* term) {
+    int v = 0;
+    int seen = 0;
+    for (int32_t i = 0; i < term->esc_buf_len; i++) {
+        char c = term->esc_buf[i];
+        if (c < '0' || c > '9') break;
+        seen = 1;
+        v = v * 10 + (c - '0');
+    }
+    return seen ? v : 0;
+}
+
+static int csi_last_param(ray_term_t* term) {
+    int32_t start = 0;
+    for (int32_t i = 0; i < term->esc_buf_len; i++) {
+        if (term->esc_buf[i] == ';')
+            start = i + 1;
+    }
+    int v = 0;
+    int seen = 0;
+    for (int32_t i = start; i < term->esc_buf_len; i++) {
+        char c = term->esc_buf[i];
+        if (c < '0' || c > '9') break;
+        seen = 1;
+        v = v * 10 + (c - '0');
+    }
+    return seen ? v : 0;
+}
+
+static int csi_word_modifier(ray_term_t* term) {
+    int mod = csi_last_param(term);
+    return mod >= 3 && (((mod - 1) & 0x06) != 0);
+}
+
+static void term_forward_delete(ray_term_t* term) {
+    if (term->buf_pos < term->buf_len) {
+        int32_t next = find_next_utf8(term->buf, term->buf_pos, term->buf_len);
+        term_delete_range(term, term->buf_pos, next);
+        ray_term_redraw(term);
+    }
+}
+
+static ray_t* feed_csi_final(ray_term_t* term, int final) {
+    int first = csi_first_param(term);
+    int word = csi_word_modifier(term);
+    term->esc_state = 0;
+
+    switch (final) {
+    case 'A': return feed_normal(term, -KEYCODE_UP);
+    case 'B': return feed_normal(term, -KEYCODE_DOWN);
+    case 'C':
+        if (word) { term_move_word_right(term); return NULL; }
+        return feed_normal(term, -KEYCODE_RIGHT);
+    case 'D':
+        if (word) { term_move_word_left(term); return NULL; }
+        return feed_normal(term, -KEYCODE_LEFT);
+    case 'H': return feed_normal(term, -KEYCODE_HOME);
+    case 'F': return feed_normal(term, -KEYCODE_END);
+    case '~':
+        if (first == 1 || first == 7)
+            return feed_normal(term, -KEYCODE_HOME);
+        if (first == 4 || first == 8)
+            return feed_normal(term, -KEYCODE_END);
+        if (first == 3) {
+            if (word) term_delete_word_right(term);
+            else term_forward_delete(term);
+        }
+        /* Bracketed-paste boundaries are intentionally ignored here:
+         * pasted bytes still flow through the normal feed path. */
+        return NULL;
+    default:
+        return NULL;
+    }
+}
 
 /* Process one byte while in escape-sequence state.
  * Returns a line (via feed_normal) or NULL. */
@@ -1446,6 +1902,26 @@ static ray_t* feed_escape(ray_term_t* term, int byte) {
     case 1: /* Got ESC, waiting for [ or O */
         if (byte == '[') { term->esc_state = 2; return NULL; }
         if (byte == 'O') { term->esc_state = 3; return NULL; }
+        if (byte == 'b' || byte == 'B') {
+            term->esc_state = 0;
+            term_move_word_left(term);
+            return NULL;
+        }
+        if (byte == 'f' || byte == 'F') {
+            term->esc_state = 0;
+            term_move_word_right(term);
+            return NULL;
+        }
+        if (byte == 'd' || byte == 'D') {
+            term->esc_state = 0;
+            term_delete_word_right(term);
+            return NULL;
+        }
+        if (byte == KEYCODE_BACKSPACE || byte == KEYCODE_DELETE) {
+            term->esc_state = 0;
+            term_delete_word_left(term);
+            return NULL;
+        }
         /* Bare ESC — cancel tab cycling if active */
         term->esc_state = 0;
         if (term->comp_cycling) {
@@ -1463,13 +1939,16 @@ static ray_t* feed_escape(ray_term_t* term, int byte) {
         case 'D': return feed_normal(term, -KEYCODE_LEFT);
         case 'H': return feed_normal(term, -KEYCODE_HOME);
         case 'F': return feed_normal(term, -KEYCODE_END);
-        case '3': term->esc_state = 4; return NULL; /* waiting for ~ */
+        case '3':
+            term->esc_state = 4;
+            csi_buf_reset(term, byte);
+            return NULL; /* waiting for ~ or a modifier suffix */
         default:
             /* Unknown CSI — if this is a final byte we are done */
             if (byte >= 0x40 && byte <= 0x7E) return NULL;
             /* Otherwise consume until final byte */
             term->esc_state = 5;
-            term->esc_buf_len = 0;
+            csi_buf_reset(term, byte);
             return NULL;
         }
 
@@ -1480,25 +1959,21 @@ static ray_t* feed_escape(ray_term_t* term, int byte) {
         return NULL;
 
     case 4: /* Got ESC [ 3, waiting for ~ (Delete key) */
-        term->esc_state = 0;
         if (byte == '~') {
-            if (term->buf_pos < term->buf_len) {
-                int32_t next = find_next_utf8(term->buf, term->buf_pos, term->buf_len);
-                int32_t bytes = next - term->buf_pos;
-                memmove(term->buf + term->buf_pos,
-                        term->buf + term->buf_pos + bytes,
-                        (size_t)(term->buf_len - term->buf_pos - bytes));
-                term->buf_len -= bytes;
-                ray_term_redraw(term);
-            }
+            term->esc_state = 0;
+            term_forward_delete(term);
+        } else if (byte == ';') {
+            term->esc_state = 5;
+            csi_buf_append(term, byte);
+        } else {
+            term->esc_state = 0;
         }
         return NULL;
 
     case 5: /* Consuming unknown CSI until final byte */
         if (byte >= 0x40 && byte <= 0x7E)
-            term->esc_state = 0;
-        else if (++term->esc_buf_len > 8)
-            term->esc_state = 0;
+            return feed_csi_final(term, byte);
+        csi_buf_append(term, byte);
         return NULL;
     }
     term->esc_state = 0;
@@ -1614,7 +2089,7 @@ static ray_t* feed_normal(ray_term_t* term, int key) {
         return NULL;
     }
 
-    if (key == -KEYCODE_LEFT) {
+    if (key == -KEYCODE_LEFT || key == KEYCODE_CTRL_B) {
         if (term->buf_pos > 0) {
             int32_t prev = find_prev_utf8(term->buf, term->buf_pos);
             term->buf_pos = prev;
@@ -1623,7 +2098,7 @@ static ray_t* feed_normal(ray_term_t* term, int key) {
         return NULL;
     }
 
-    if (key == -KEYCODE_RIGHT) {
+    if (key == -KEYCODE_RIGHT || key == KEYCODE_CTRL_F) {
         if (term->buf_pos < term->buf_len) {
             int32_t next = find_next_utf8(term->buf, term->buf_pos, term->buf_len);
             term->buf_pos = next;
@@ -1706,7 +2181,7 @@ static ray_t* feed_normal(ray_term_t* term, int key) {
             if (term->buf_len > 0)
                 hlen += term_highlight_into(hlbuf + hlen,
                             (int32_t)sizeof(hlbuf) - hlen,
-                            term->buf, term->buf_len, -1, -1);
+                            term->buf, term->buf_len, -1, -1, -1);
             fflush(stdout);
             term_write(hlbuf, (size_t)hlen);
             ray_cursor_show();
@@ -1793,18 +2268,17 @@ static ray_t* feed_normal(ray_term_t* term, int key) {
     }
 
     case KEYCODE_CTRL_W: {
-        if (term->buf_pos > 0) {
-            int32_t end = term->buf_pos;
-            while (term->buf_pos > 0 && !is_alphanum(term->buf[term->buf_pos - 1]))
-                term->buf_pos--;
-            while (term->buf_pos > 0 && is_alphanum(term->buf[term->buf_pos - 1]))
-                term->buf_pos--;
-            memmove(term->buf + term->buf_pos,
-                    term->buf + end,
-                    (size_t)(term->buf_len - end));
-            term->buf_len -= (end - term->buf_pos);
-            ray_term_redraw(term);
-        }
+        term_delete_word_left(term);
+        return NULL;
+    }
+
+    case KEYCODE_CTRL_L: {
+        term_clear_screen(term);
+        return NULL;
+    }
+
+    case KEYCODE_CTRL_T: {
+        term_transpose_chars(term);
         return NULL;
     }
 
@@ -1893,4 +2367,3 @@ ray_t* ray_term_feed(ray_term_t* term) {
 
     return feed_normal(term, key);
 }
-

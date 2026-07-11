@@ -179,7 +179,7 @@ int64_t ray_dict_find_idx(ray_t* d, ray_t* key_atom) {
     /* Null-aware probe: a null key atom matches only null slots; a non-null
      * key atom must match a non-null slot of equal value.  Without this, a
      * group dict containing both `0Nl` and `0` keys (now produced as
-     * distinct buckets by ray_group_fn) would still resolve `(at d 0Nl)`
+     * distinct buckets by ray_group_indices_fn) would still resolve `(at d 0Nl)`
      * to the first non-null zero — re-introducing the conflation we just
      * fixed in grouping. */
     bool key_is_null = RAY_ATOM_IS_NULL(key_atom);

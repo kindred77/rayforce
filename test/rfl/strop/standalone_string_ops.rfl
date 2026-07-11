@@ -1,0 +1,35 @@
+;; Standalone string transforms. The same operations already lower inside
+;; select/update; these assertions pin the direct builtin surface.
+
+(upper "Abc42!") -- "ABC42!"
+(lower "AbC42!") -- "abc42!"
+(trim "  abc  ") -- "abc"
+(trim "\tabc\n") -- "abc"
+
+(upper 'abc) -- 'ABC
+(lower 'AbC) -- 'abc
+
+(upper ["ab" "Cd" "EF"]) -- ["AB" "CD" "EF"]
+(lower ["AB" "cD" "ef"]) -- ["ab" "cd" "ef"]
+(trim [" a " "\tb\t" ""]) -- ["a" "b" ""]
+(upper ['ab 'Cd 'EF]) -- ['AB 'CD 'EF]
+(lower ['AB 'cD 'EF]) -- ['ab 'cd 'ef]
+
+(substr "abcdef" 2 3) -- "bcd"
+(substr "abcdef" 0 2) -- "ab"
+(substr "abcdef" 5 -1) -- "ef"
+(substr 'abcdef 2 3) -- 'bcd
+(substr ["abcdef" "xyz"] 2 2) -- ["bc" "yz"]
+(substr (as 'STR (list "abcdefghijklmnopqrstuvwxyz" "short")) 5 -1) -- ["efghijklmnopqrstuvwxyz" "t"]
+(substr ["abcdef" "xyz"] [1 2] [3 9]) -- ["abc" "yz"]
+
+(replace "banana" "a" "A") -- "bAnAnA"
+(replace "banana" "na" "NA") -- "baNANA"
+(replace 'banana "a" "A") -- 'bAnAnA
+(replace ["a-b" "c-d"] "-" "_") -- ["a_b" "c_d"]
+(replace (upper ["a-b" "c-d"]) "-" "_") -- ["A_B" "C_D"]
+(concat ["a" "b"] "/") -- ["a/" "b/"]
+(concat "/" ["a" "b"]) -- ["/a" "/b"]
+
+(substr [1 2 3] 1 1) !- type
+(replace ["a"] 1 "x") !- type

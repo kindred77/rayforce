@@ -1,6 +1,6 @@
 # Joins
 
-Equi-joins, left outer joins, as-of joins for time-series alignment, and window joins with aggregation. All join types compile to the DAG and execute via radix-partitioned hash join.
+Equi-joins, outer joins, anti-joins, as-of joins for time-series alignment, and window joins with aggregation. Join operations compile to the DAG and use parallel hash or sorted-merge execution paths.
 
 ## Inner Join
 
@@ -75,6 +75,52 @@ Left join on multiple keys:
 
 ```lisp
 (left-join [a b] x y)
+```
+
+## Full Join
+
+The `full-join` function keeps every row from both tables. Matched rows combine columns from both sides. Left-only and right-only rows fill the missing side's columns with nulls, and shared key columns appear once.
+
+### Signature
+
+`(full-join [keys] left right)`
+
+Full outer join. All left and right rows are preserved; unmatched columns are null.
+
+### Examples
+
+```lisp
+(set left (table [id qty] (list [1 2 3] [10 20 30])))
+(set right (table [id px] (list [2 3 4] [200 300 400])))
+
+(full-join [id] left right)
+; id qty px
+; -- --- ---
+;  1  10 0Nl
+;  2  20 200
+;  3  30 300
+;  4 0Nl 400
+```
+
+## Anti Join
+
+The `anti-join` function keeps rows from the left table whose key does not appear in the right table. The result has only the left table's columns.
+
+### Signature
+
+`(anti-join [keys] left right)`
+
+### Examples
+
+```lisp
+(set orders (table [id sym] (list [1 2 3] [AAPL GOOG MSFT])))
+(set blocked (table [sym] (list [GOOG])))
+
+(anti-join [sym] orders blocked)
+; id sym
+; -- ----
+;  1 AAPL
+;  3 MSFT
 ```
 
 ## As-of Join
@@ -162,7 +208,7 @@ As-of-join treats **NULL keys as never matching**:
 
 - A left row with a null in any equality key or in the time column is kept in the output (left-outer behaviour) but the right-side columns are explicitly null.
 - A right row with a null in any equality key or time column is skipped entirely during the merge walk — it cannot become the best match for any left row.
-- Right-side columns for unmatched rows are filled with null (null bit set on the destination vector), distinguishable from genuine zero values via `(nil? x)`.
+- Right-side columns for unmatched rows are filled with type-correct null sentinels and marked with the null hint, distinguishable from genuine zero values via `(nil? x)`.
 
 This means a null time in the left table is never silently treated as time zero, and two null sym keys on opposite sides do not merge into a spurious match.
 
@@ -205,16 +251,21 @@ Window join with per-row time intervals. `intervals` is a list of two vectors `[
 
 ```lisp
 (set n 100000)
+(set tsym (take [AAPL MSFT] n))
+(set ttime (+ 09:00:00 (as 'TIME (/ (* (til n) 3) 10))))
+(set bsym (take [AAPL MSFT GOOG] (* 2 n)))
+(set btime (+ 09:00:00 (as 'TIME (/ (* (til (* 2 n)) 2) 10))))
+(set bid (+ 8 (/ (til (* 2 n)) 2)))
+(set ask (+ 12 (/ (til (* 2 n)) 2)))
 (set trades (table [Sym Ts Price]
     (list tsym ttime (+ 10 (til n)))))
 (set quotes (table [Sym Ts Bid Ask]
     (list bsym btime bid ask)))
 
-; Build intervals as two vectors (lo, hi) from the trades timestamp
-(set lo (+ (at trades 'Ts) -1000))
-(set hi (+ (at trades 'Ts)  1000))
+; Build intervals from the trades timestamp
+(set intervals (map-left + [-1000 1000] (at trades 'Ts)))
 
-(window-join [Sym Ts] (list lo hi) trades quotes
+(window-join [Sym Ts] intervals trades quotes
     {bid: (min Bid) ask: (max Ask)})
 ```
 
@@ -222,7 +273,7 @@ Window join with per-row time intervals. `intervals` is a list of two vectors `[
 
 All join operations compile to the Rayforce execution DAG. The optimizer and executor handle the details:
 
-1. **DAG construction** — `inner-join` and `left-join` emit `OP_JOIN` nodes with join type flags. `asof-join` emits `OP_ASOF_JOIN`. `window-join` emits `OP_WINDOW_JOIN`.
+1. **DAG construction** — `inner-join`, `left-join`, and `full-join` emit `OP_JOIN` nodes with join type flags. `asof-join` emits `OP_ASOF_JOIN`. `window-join` emits `OP_WINDOW_JOIN`.
 2. **Optimizer** — Predicate pushdown moves filters closer to data sources (past `SELECT`/`ALIAS`, `GROUP`, and `EXPAND` nodes); filters on join inputs are not currently pushed across join boundaries. Type inference propagates column types through join boundaries. SIP (Sideways Information Passing) can prune the build side using selection bitmaps.
 3. **Execution** — Equi-joins use a radix-partitioned hash join: the build side is partitioned by hash, then each morsel from the probe side looks up matches in the corresponding partition. For inner joins on the radix-parallel path, the executor picks the build side at runtime using actual materialized row counts — whichever input has fewer rows becomes the build side, reducing hash-table memory and improving cache utilisation. This selection is most effective when the larger side has many rows per key (e.g. a fact table joining a small dimension); on near-unique keys the benefit is small. LEFT, FULL, and ANTI joins always build on the right because their semantics require preserving every left row. The small-input (chained) path also always builds on the right. During the per-partition build the executor monitors per-key duplicate counts; if any single key exceeds a threshold it abandons the radix attempt and re-runs the whole join through the chained hash table, which is O(n) regardless of duplication. This ensures that no join — INNER, LEFT, or FULL — degrades to quadratic cost when the build side contains a heavily-duplicated key. It complements build-side selection (which handles INNER joins by choosing the smaller side) by covering LEFT and FULL joins, which cannot swap sides, and any INNER case where the forced-build side happens to be skewed. Output row order for inner joins on the radix-parallel path is partition- and thread-dependent and is not guaranteed to be stable. As-of and window joins use sorted merge with binary search on the temporal column — the as-of executor skips the per-join sort when the inputs carry the `sorted` / `parted` [attributes](attributes.md) described above.
 
@@ -235,5 +286,7 @@ All join operations compile to the Rayforce execution DAG. The optimizer and exe
 |---|---|---|
 | `inner-join` | `(inner-join [keys] left right)` | Equi-join; only matching rows |
 | `left-join` | `(left-join [keys] left right)` | Left outer join; all left rows preserved |
+| `full-join` | `(full-join [keys] left right)` | Full outer join; all rows from both sides preserved |
+| `anti-join` | `(anti-join [keys] left right)` | Keep left rows with no right match |
 | `asof-join` | `(asof-join [keys time-col] left right)` | Time-series alignment; most recent match |
 | `window-join` | `(window-join [keys tc] intervals left right {aggs})` | Window aggregation over time intervals |

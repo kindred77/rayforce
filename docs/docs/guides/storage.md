@@ -9,7 +9,8 @@ The simplest way to persist and exchange data. Available directly from Rayfall.
 ### Reading CSV
 
 ```lisp
-(set data (.csv.read "path/to/data.csv"))
+(write "/tmp/rayforce-data.csv" "sym,price,qty\nAAPL,150.5,100\nGOOG,2800.0,50\n")
+(set data (.csv.read "/tmp/rayforce-data.csv"))
 ```
 
 The reader:
@@ -22,7 +23,9 @@ The reader:
 ### Writing CSV
 
 ```lisp
-(.csv.write table "path/to/output.csv")
+(set data (table [sym price qty]
+  (list [AAPL GOOG] [150.5 2800.0] [100 50])))
+(.csv.write data "/tmp/rayforce-output.csv")
 ```
 
 ### Example: Round-Trip

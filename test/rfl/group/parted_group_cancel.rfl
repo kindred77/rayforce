@@ -1,0 +1,74 @@
+;; parted_group_cancel.rfl — cancellation-poll / sweep-progress smoke test that
+;; genuinely DRIVES the streaming per-partition kernel.
+;;
+;; exec_group_per_partition (src/ops/group.c) streams a parted GROUP BY one
+;; partition at a time.  It polls ray_interrupted() once per partition (in the
+;; pass-2 concat copy loops and the O(groups) MAPCOMMON replicate loop) and
+;; ticks a single ray_progress_update meter across the whole sweep.  Those
+;; polls/progress calls MUST be no-ops on the happy path: an uncancelled run
+;; returns byte-identical results to the flat in-memory kernel.
+;;
+;; To actually reach that kernel the cardinality gate must hold
+;; (est_groups*100 <= rows_per_part): a single key with 3 distinct values over
+;; 400 rows/partition gives est_groups = 3, rows_per_part = 400 >= 300.  This
+;; file asserts (a) group-perpart-runs (from (.sys.mem)) strictly increments —
+;; proving the streaming path is taken — and (b) the result matches the flat
+;; kernel.  Deterministic cancellation cannot be provoked from .rfl, so cancel
+;; LATENCY (abort within ~one morsel, leak-free under ASan) is verified manually
+;; by the orchestrator — this file only proves the added instrumentation is inert.
+
+;; ─── fixture: 3 partitions, 400 rows each, 3 groups spanning all of them ─────
+;;   k = (% (til 400) 3) → single key with 3 distinct values (est_groups = 3)
+;;   v = F64 value column (each partition offset so aggregates differ)
+(set N 400)
+(set K (% (til N) 3))
+(set V1 (as 'F64 (til N)))
+(set V2 (as 'F64 (+ 1000 (til N))))
+(set V3 (as 'F64 (+ 2000 (til N))))
+(set P1 (table [k v] (list K V1)))
+(set P2 (table [k v] (list K V2)))
+(set P3 (table [k v] (list K V3)))
+(.sys.exec "rm -rf /tmp/rfl_pgc")
+(.db.splayed.set "/tmp/rfl_pgc/1/t/" P1)
+(.db.splayed.set "/tmp/rfl_pgc/2/t/" P2)
+(.db.splayed.set "/tmp/rfl_pgc/3/t/" P3)
+(set Pp (.db.parted.get "/tmp/rfl_pgc/" 't))
+
+;; identical-data flat in-memory table (part1 ++ part2 ++ part3, same order)
+(set KA (concat (concat K K) K))
+(set VA (concat (concat V1 V2) V3))
+(set TF (table [k v] (list KA VA)))
+
+;; ─── snapshot the streaming-kernel run counter BEFORE the parted group ───────
+(set B (at (.sys.mem) 'group-perpart-runs))
+
+;; ─── streaming per-partition group vs flat kernel ───────────────────────────
+(set RP (select {sv: (sum v) cv: (count v) mnv: (min v) mxv: (max v) av: (avg v) by: {k: k} from: Pp asc: k}))
+
+;; ─── snapshot AFTER: the streaming per-partition kernel must have run ─────────
+(set A (at (.sys.mem) 'group-perpart-runs))
+;; PROVES exec_group_per_partition executed (else fixture routed via concat).
+(> A B) -- true
+
+(set RF (select {sv: (sum v) cv: (count v) mnv: (min v) mxv: (max v) av: (avg v) by: {k: k} from: TF asc: k}))
+
+;; cardinality: 3 groups
+(count RP) -- 3
+(count RP) -- (count RF)
+
+;; keys + exact aggregates match the flat kernel (no-op instrumentation proof)
+(at RP 'k)   -- (at RF 'k)
+(at RP 'sv)  -- (at RF 'sv)
+(at RP 'cv)  -- (at RF 'cv)
+(at RP 'mnv) -- (at RF 'mnv)
+(at RP 'mxv) -- (at RF 'mxv)
+
+;; independent literal oracle
+(at RP 'k)  -- [0 1 2]
+(sum (at RP 'cv)) -- 1200
+
+;; float avg matches flat within tolerance
+(< (max (abs (- (at RP 'av) (at RF 'av)))) 0.000001) -- true
+
+;; ─── cleanup ────────────────────────────────────────────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_pgc")

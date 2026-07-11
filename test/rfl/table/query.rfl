@@ -45,10 +45,10 @@
 (set gpt2 (table [i p v] (list [1 1 2] (as 'GUID (list "7e42b82b-51c7-4468-a477-375bd5006e60" "d49f18a4-1969-49e8-9b8a-6bb9a4832eea" "d49f18a4-1969-49e8-9b8a-6bb9a4832eea")) [30 10 20])))(set rpt2 (pivot gpt2 ['i] 'p 'v sum))(sum (first (at rpt2 [d49f18a4-1969-49e8-9b8a-6bb9a4832eea]))) -- 30
 ;; Test and with select - this exposes the parallel processing bug
 (set t (table ['a 'b 'c] (list (take [false true] 25001) (take [true false] 25001) (take 1 25001)))) (count (select {c: c from: t where: (and a b)})) -- 0
-;; --- Group-by RAY_GUID. Pre-fix, ray_group_fn returned ray_i64 atoms
+;; --- Group-by RAY_GUID. Pre-fix, ray_group_indices_fn returned ray_i64 atoms
 ;;     for the group keys and select_fn's store_typed_elem interpreted
 ;;     the i64 bits as a ray_t*, SIGSEGV-ing. Now the GUID branch emits
-;;     proper ray_guid atoms. Also exercises ray_group_fn's max_groups
+;;     proper ray_guid atoms. Also exercises ray_group_indices_fn's max_groups
 ;;     growth past the historical 1024 cap. ---
 ;; Small guid count-by: two distinct guids (duplicated), expect two groups.
 (set gs4 (take (guid 2) 4))(set tg (table [g v] (list gs4 [10 20 30 40])))(set cby (select {c: (count v) from: tg by: g}))(count cby) -- 2
@@ -58,7 +58,7 @@
 ;; Sum aggregation by guid: 10 + 30 = 40, 20 + 40 = 60 for the two groups.
 (set grp (select {s: (sum v) from: tg by: g}))(sum (at grp 's)) -- 100
 ;; Growth past 1024: 1500 distinct guids, each appearing once.
-;; Pre-fix ray_group_fn had a hardcoded max_groups=1024 and returned
+;; Pre-fix ray_group_indices_fn had a hardcoded max_groups=1024 and returned
 ;; "limit" for this case.
 (set tbig (table [g v] (list (guid 1500) (til 1500))))(set cbig (select {c: (count v) from: tbig by: g}))(count cbig) -- 1500
 ;; Value-check: 1500 distinct GUIDs each appear once, so every per-group

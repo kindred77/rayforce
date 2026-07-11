@@ -27,7 +27,7 @@
  * This file holds the predicate-shape detector (ray_fused_group_supported),
  * the per-morsel predicate evaluator (fp_eval_cmp / fp_eval_pred) and the
  * predicate compiler (fp_compile_pred / fp_pred_cleanup).  It was split out
- * of fused_group.c when the benchmark-tuned OP_FILTERED_GROUP operator was
+ * of fused_group.c when the shape-specific OP_FILTERED_GROUP operator was
  * retired: the remaining consumer is fused_topk.c (the general fused
  * filter + top-K optimization), which uses both the shape probe and the
  * predicate evaluator/compiler.  Declarations live in fused_pred.h and

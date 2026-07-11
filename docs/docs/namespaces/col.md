@@ -10,6 +10,7 @@ A *linked column* is an integer vector whose values are row IDs into a named tab
 | [`.col.unlink`](#col-unlink) | unary | — | Detach the link metadata, returning a plain int vector. |
 | [`.col.link?`](#col-link-p) | unary | — | Test whether a value carries link metadata. |
 | [`.col.target`](#col-target) | unary | — | Read back the link's target table name (or `null`). |
+| [`fkeys`](#fkeys) | unary | — | Inspect a table's linked columns as `column -> target table`. |
 
 ## `.col.link` { #col-link }
 
@@ -72,7 +73,21 @@ Slice-aware: if `v` is a slice into a linked parent, `.col.target` reads the par
 ```lisp
 (.col.target linked)            ;; => 'custs
 (.col.target rids)              ;; => null
-(.col.target (take 2 linked))   ;; => 'custs  (slice inherits)
+(.col.target (take linked 2))   ;; => 'custs  (slice inherits)
+```
+
+## `fkeys` { #fkeys }
+
+Signature: `(fkeys table)`.
+
+Returns: a dictionary whose keys are linked column names and whose values are the linked target table names. Columns without link metadata are omitted, so a table with no linked columns returns `{}`.
+
+```lisp
+(set orders (table [cust amount]
+  (list (.col.link 'custs [2 0 1])
+        [12.5 30.0 7.0])))
+
+(fkeys orders)   ;; => {cust:'custs}
 ```
 
 ## See also
