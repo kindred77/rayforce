@@ -804,7 +804,7 @@ static inline uint8_t radix_key_bytes(int8_t type) {
     switch (type) {
     case RAY_BOOL: case RAY_U8:   return 1;
     case RAY_I16:                return 2;
-    case RAY_I32: case RAY_DATE: case RAY_TIME: return 4;
+    case RAY_I32: case RAY_F32: case RAY_DATE: case RAY_TIME: return 4;
     default:                    return 8;  /* I64, F64, TIMESTAMP, SYM */
     }
 }
@@ -1116,6 +1116,10 @@ typedef struct {
     uint16_t off_sum_y;
     uint16_t off_sumsq_y;
     uint16_t off_sumxy;
+    /* Earliest contributing source row for this group.  Every packed entry
+     * carries its source row in the tail slot; partition merges retain the
+     * minimum so output order is independent of radix partition count. */
+    uint16_t off_group_first;
     /* Per-slot non-null count block (n_agg_vals int64 slots), allocated only
      * when any_agg_null (any agg input column HAS_NULLS).  Zero otherwise —
      * finalize then divides by the group row count exactly as before, so
@@ -1247,7 +1251,8 @@ static inline int64_t agg_int_null_sentinel_for(int8_t t) {
 }
 
 bool ght_compute_layout(ght_layout_t* out, uint32_t n_keys, uint32_t n_aggs,
-                        ray_t** agg_vecs, uint8_t need_flags,
+                        ray_t** agg_vecs, ray_t** agg_vecs2,
+                        uint8_t need_flags,
                         const uint16_t* agg_ops,
                         const int8_t* key_types);
 /* By-value copy that fixes the base pointers.  Dispatches on STORAGE, not
@@ -1320,7 +1325,7 @@ void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
 typedef struct {
     group_ht_t* part_hts;       /* n_parts entries */
     uint32_t*   part_offsets;   /* n_parts+1 entries (prefix sums of grp_counts) */
-    uint32_t    n_parts;        /* 1 when sequential, RADIX_P when parallel */
+    uint32_t    n_parts;        /* 1 sequential; execution-derived when parallel */
     uint32_t    total_grps;
     uint16_t    row_stride;
 
