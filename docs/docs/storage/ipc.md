@@ -44,7 +44,7 @@ The `-u` and `-U` flags enable password authentication for IPC connections. Clie
 ./rayforce -p 5000 -u secret123
 ```
 
-```lisp
+```text
 ; Client: connect with credentials
 (set h (.ipc.open "127.0.0.1:5000:admin:secret123"))
 (.ipc.send h "(+ 1 2)")
@@ -75,7 +75,7 @@ In restricted mode, specific builtins that write files, mutate state, or control
 
 Attempting a restricted operation returns an `"access"` error:
 
-```lisp
+```text
 ;; On a -U server:
 (.ipc.send h "(set x 42)")
 ;; => error: access — restricted
@@ -93,7 +93,7 @@ Connect to a running server and send queries from Rayfall:
 
 ### .ipc.open
 
-```lisp
+```text
 ;; Connect to a server (no auth)
 (set h (.ipc.open "127.0.0.1:5000"))
 ;; => 0  (connection handle)
@@ -116,7 +116,7 @@ The format is `"host:port"` for unauthenticated connections, or `"host:port:user
 
 #### String queries
 
-```lisp
+```text
 ;; Arithmetic — server parses and evaluates the string
 (.ipc.send h "(+ 1 2)")
 ;; => 3
@@ -138,7 +138,7 @@ The format is `"host:port"` for unauthenticated connections, or `"host:port:user
 
 Non-string values are evaluated directly on the server via `ray_eval`. Construct executable expressions as lists with builtin function objects as heads. Dict literals are self-evaluating, so column references and expressions inside them are preserved unevaluated until the server processes them:
 
-```lisp
+```text
 ;; Arithmetic
 (.ipc.send h (list + 1 2))
 ;; => 3
@@ -157,7 +157,7 @@ Non-string values are evaluated directly on the server via `ray_eval`. Construct
 
 For dynamic queries, substitute values into the dict at construction time:
 
-```lisp
+```text
 (set threshold 200)
 (.ipc.send h (list select {from: trades where: (list > (quote price) threshold)}))
 ;; => trades where price > 200
@@ -167,7 +167,7 @@ The query is assembled as data: while the `(list ...)` is built, `(quote price)`
 
 ### .ipc.close
 
-```lisp
+```text
 ;; Close the connection
 (.ipc.close h)
 ```
@@ -223,8 +223,8 @@ The `de` builtin reconstructs a value from its binary representation. Compose it
 ;; => 3.14
 
 ;; Round-trip a boolean
-(de (ser 1b))
-;; => 1
+(de (ser true))
+;; => true
 
 ;; Round-trip a list of mixed types
 (de (ser (list 1 "two" 3.0)))
@@ -293,7 +293,7 @@ All core Rayforce types serialize and deserialize faithfully:
 | String atoms | `str`, `sym` |
 | Temporal atoms | `date`, `time`, `timestamp` |
 | Other atoms | `guid`, `null` |
-| Vectors | All typed vectors (`I64`, `F64`, `BOOL`, `STR`, `SYM`, `DATE`, `TIME`, `TS`, `GUID`), including null bitmaps |
+| Vectors | All typed vectors (`I64`, `F64`, `BOOL`, `STR`, `SYM`, `DATE`, `TIME`, `TS`, `GUID`), including sentinel null state |
 | Collections | `list` (heterogeneous, nested), `dict` |
 | Tables | `table` (column names + column vectors) |
 

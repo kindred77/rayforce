@@ -23,7 +23,7 @@ Errors: `domain` if called with any arguments.
 
 ```lisp
 (set t0 (.time.now))
-(some-expensive-thing)
+(sum (til 1000))
 (- (.time.now) t0)
 ;; => elapsed ms
 ```

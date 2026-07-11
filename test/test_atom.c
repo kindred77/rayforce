@@ -300,7 +300,7 @@ static test_result_t test_is_atom(void) {
  * memcmp on the element pointer array, comparing pointer identity
  * instead of structural equality.  Two structurally-identical lists
  * with different element pointers (the common case after construction)
- * compared not-equal, breaking ray_group_fn / ray_dict / distinct
+ * compared not-equal, breaking ray_group_indices_fn / ray_dict / distinct
  * fallback for any code that built composite-list keys (e.g. multi-key
  * group-by via the eval-level path).
  * --------------------------------------------------------------------- */
@@ -570,5 +570,4 @@ const test_entry_t atom_entries[] = {
     { "atom/typed_null_timestamp", test_atom_typed_null_timestamp, atom_setup, atom_teardown },
     { NULL, NULL, NULL, NULL },
 };
-
 

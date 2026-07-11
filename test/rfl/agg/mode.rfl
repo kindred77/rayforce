@@ -1,0 +1,25 @@
+;; Exact most-frequent-value reducer.
+
+;; Standalone mode preserves the first value among equal-frequency ties.
+(mode [1 2 2 3]) -- 2
+(mode [1 1 2 2]) -- 1
+(mode [a b a]) -- 'a
+(mode 42) -- 42
+
+;; Nulls are skipped; all-null and empty inputs return a typed null.
+(mode (list 1 0Ni 2 2)) -- 2
+(nil? (mode (list 0Ni 0Ni))) -- true
+(nil? (mode (as 'I64 (list)))) -- true
+
+;; Argument validation.
+(mode (dict [a] [1])) !- type
+
+;; Grouped path uses the holistic group kernel, including nested expressions.
+(set Tmode (table [g v] (list [A A A B B B] [1 2 2 5 5 6])))
+(asc (at (select {m: (mode v) by: g from: Tmode}) 'm)) -- [2 5]
+(at (select {m: (mode v) from: Tmode}) 'm) -- [2]
+(asc (at (select {m: (+ (mode v) 10) by: g from: Tmode}) 'm)) -- [12 15]
+
+;; Symbols use the same exact first-tie behavior.
+(set Tsymmode (table [g s] (list [A A A B B B] [x y x z z y])))
+(asc (at (select {m: (mode s) by: g from: Tsymmode}) 'm)) -- [x z]

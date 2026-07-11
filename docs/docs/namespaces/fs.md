@@ -22,8 +22,8 @@ Errors: `type` (arg not a string), `io` (path missing or names a directory rathe
 (.fs.size "/etc/hosts")
 ;; => 213
 
-(try (.fs.size "/missing"))
-;; => <error: io>
+(try (.fs.size "/missing") 'missing)
+;; => 'missing
 ```
 
 ## `.fs.list` { #fs-list }

@@ -17,7 +17,7 @@
 
 The `as` function performs explicit type conversion. It takes a type symbol and a value, returning the value cast to that type.
 
-```lisp
+```text
 (as 'type-symbol value)
 ```
 
@@ -189,7 +189,7 @@ Strings can be parsed into numeric, temporal, and symbol types with `as`. Conver
 
 Null values propagate through casts. A typed null in one type becomes a typed null in the target type. Invalid string parses raise a domain error.
 
-```lisp
+```text
 ; Casting a typed null produces a typed null
 (as 'f64 0Ni)           ; 0Nf  (null i32 → null f64)
 (as 'i64 0Nf)           ; 0Nl  (null f64 → null i64)
@@ -221,7 +221,7 @@ Null values propagate through casts. A typed null in one type becomes a typed nu
 (+ 0Ni 10)              ; 0Nl  (null propagates; i32 + i64 → i64)
 (* 0Nf 2.0)             ; 0Nf
 
-; Null in vectors — null bitmap elements stay null.
+; Null in vectors — sentinel null elements stay null.
 ; The null literal must match the vector's element type (0Nl for i64).
 (+ [1 0Nl 3] 10)          ; [11 0Nl 13]
 ```
@@ -334,15 +334,16 @@ After loading a CSV, columns often arrive as strings. Cast them to proper types:
 
 ```lisp
 ; Load CSV (all columns as strings by default)
-(set raw (.csv.read "trades.csv"))
+(write "/tmp/rayforce-types-trades.csv"
+  "sym,price,qty,date\nAAPL,150.5,100,2024.03.01\nGOOG,2800.0,50,2024.03.10\n")
+(set raw (.csv.read [STR STR STR STR] "/tmp/rayforce-types-trades.csv"))
 
 ; Cast columns to proper types
-(set trades
-  (update {from: raw
-    price:  (as 'f64 price)
-           qty:    (as 'i64 qty)
-           date:   (as 'date date)
-           sym:    (as 'sym sym)}))
+(set trades (table [price qty date sym]
+  (list (as 'f64 (at raw 'price))
+        (as 'i64 (at raw 'qty))
+        (as 'date (at raw 'date))
+        (as 'sym (at raw 'sym)))))
 ```
 
 ### Date Arithmetic for Analytics

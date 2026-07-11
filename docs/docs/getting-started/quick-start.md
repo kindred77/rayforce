@@ -70,6 +70,9 @@ Create a table with two columns using the `table` function. Column names are sym
 
 ```lisp
 ‣ (set t (table [x y] (list [1 2 3] [A B C])))
+```
+
+```text
 ┌─────┬───────────────────────────────┐
 │  x  │               y               │
 │ I64 │              SYM              │
@@ -88,6 +91,9 @@ Use `select` to query the table. The `where:` clause filters rows, and you can p
 
 ```lisp
 ‣ (select {from:t where: (> x 1)})
+```
+
+```text
 ┌─────┬───────────────────────────────┐
 │  x  │               y               │
 │ I64 │              SYM              │
@@ -104,6 +110,9 @@ Add computed columns and aggregations:
 ```lisp
 ; Select with a computed column
 ‣ (select {from:t x:x x2: (* x x)})
+```
+
+```text
 ┌─────┬───────────────────────────────┐
 │  x  │              x2               │
 │ I64 │              I64              │
@@ -114,9 +123,14 @@ Add computed columns and aggregations:
 ├─────┴───────────────────────────────┤
 │ 3 rows (3 shown) 2 columns (2 shown)│
 └─────────────────────────────────────┘
+```
 
+```lisp
 ; Group by and aggregate
 ‣ (select {from:t by: y total: (sum x)})
+```
+
+```text
 ┌─────┬───────────────────────────────┐
 │  y  │             total             │
 │ SYM │              I64              │
@@ -134,7 +148,8 @@ Add computed columns and aggregations:
 Load data from CSV files with automatic type inference, parallel parsing, and null handling:
 
 ```lisp
-‣ (set data (.csv.read "trades.csv"))
+‣ (write "/tmp/rayforce-trades.csv" "sym,price,qty\nAAPL,150.25,100\nMSFT,420.0,50\n")
+‣ (set data (.csv.read "/tmp/rayforce-trades.csv"))
 ‣ (select {from:data where: (> price 100)})
 ```
 
@@ -180,5 +195,5 @@ The REPL supports several built-in commands:
 ## What's Next
 
 - [**Syntax & Types**](../language/syntax.md) — Learn the full Rayfall language
-- [**Functions Reference**](../language/functions.md) — Browse all 120+ built-in functions
+- [**Functions Reference**](../language/functions.md) — Browse the current built-in function surface
 - [**Joins**](../language/functions.md#joins) — Left joins, inner joins, window joins, and as-of joins

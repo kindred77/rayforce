@@ -41,6 +41,7 @@
 #include "lang/eval.h"
 #include "lang/nfo.h"
 #include "lang/format.h"
+#include "ops/internal.h"
 #include "ops/ops.h"
 #include "ops/temporal.h"
 
@@ -897,6 +898,124 @@ static test_result_t test_eval_reverse(void) {
     TEST_ASSERT_EQ_I(data[1], 2);
     TEST_ASSERT_EQ_I(data[2], 1);
     ray_release(result);
+    PASS();
+}
+
+/* ---- Test: time-series vector primitives ---- */
+static test_result_t test_eval_timeseries_primitives(void) {
+    ray_t* lag = ray_eval_str("(lag [10 20 35])");
+    TEST_ASSERT_NOT_NULL(lag);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(lag));
+    TEST_ASSERT_EQ_I(lag->type, RAY_I64);
+    TEST_ASSERT_EQ_I(ray_len(lag), 3);
+    TEST_ASSERT_TRUE(ray_vec_is_null(lag, 0));
+    int64_t* ld = (int64_t*)ray_data(lag);
+    TEST_ASSERT_EQ_I(ld[1], 10);
+    TEST_ASSERT_EQ_I(ld[2], 20);
+    ray_release(lag);
+
+    ray_t* lead = ray_eval_str("(lead [10 20 35])");
+    TEST_ASSERT_NOT_NULL(lead);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(lead));
+    TEST_ASSERT_EQ_I(lead->type, RAY_I64);
+    TEST_ASSERT_EQ_I(ray_len(lead), 3);
+    int64_t* led = (int64_t*)ray_data(lead);
+    TEST_ASSERT_EQ_I(led[0], 20);
+    TEST_ASSERT_EQ_I(led[1], 35);
+    TEST_ASSERT_TRUE(ray_vec_is_null(lead, 2));
+    ray_release(lead);
+
+    ray_t* deltas = ray_eval_str("(deltas [10 20 35])");
+    TEST_ASSERT_NOT_NULL(deltas);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(deltas));
+    TEST_ASSERT_EQ_I(deltas->type, RAY_I64);
+    TEST_ASSERT_EQ_I(ray_len(deltas), 3);
+    TEST_ASSERT_TRUE(ray_vec_is_null(deltas, 0));
+    int64_t* dd = (int64_t*)ray_data(deltas);
+    TEST_ASSERT_EQ_I(dd[1], 10);
+    TEST_ASSERT_EQ_I(dd[2], 15);
+    ray_release(deltas);
+
+    ray_t* ratios = ray_eval_str("(ratios [10.0 20.0 10.0])");
+    TEST_ASSERT_NOT_NULL(ratios);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ratios));
+    TEST_ASSERT_EQ_I(ratios->type, RAY_F64);
+    TEST_ASSERT_EQ_I(ray_len(ratios), 3);
+    TEST_ASSERT_TRUE(ray_vec_is_null(ratios, 0));
+    double* rd = (double*)ray_data(ratios);
+    TEST_ASSERT_EQ_F(rd[1], 2.0, 1e-12);
+    TEST_ASSERT_EQ_F(rd[2], 0.5, 1e-12);
+    ray_release(ratios);
+
+    ray_t* zero = ray_eval_str("(ratios [0 10])");
+    TEST_ASSERT_NOT_NULL(zero);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(zero));
+    TEST_ASSERT_EQ_I(zero->type, RAY_F64);
+    TEST_ASSERT_EQ_I(ray_len(zero), 2);
+    TEST_ASSERT_TRUE(ray_vec_is_null(zero, 0));
+    TEST_ASSERT_TRUE(ray_vec_is_null(zero, 1));
+    ray_release(zero);
+
+    PASS();
+}
+
+/* ---- Test: time-series primitives lower inside select DAGs ---- */
+static test_result_t test_eval_select_timeseries_primitives(void) {
+    ray_t* result = ray_eval_str(
+        "(do (set t (table ['price] (list [10 20 35]))) "
+        "(select {from: t d: (deltas price) l: (lag price) r: (ratios price)}))");
+    TEST_ASSERT_NOT_NULL(result);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
+    TEST_ASSERT_EQ_I(ray_table_nrows(result), 3);
+
+    ray_t* d_col = ray_table_get_col(result, ray_sym_intern("d", 1));
+    TEST_ASSERT_NOT_NULL(d_col);
+    TEST_ASSERT_EQ_I(d_col->type, RAY_I64);
+    TEST_ASSERT_TRUE(ray_vec_is_null(d_col, 0));
+    int64_t* dd = (int64_t*)ray_data(d_col);
+    TEST_ASSERT_EQ_I(dd[1], 10);
+    TEST_ASSERT_EQ_I(dd[2], 15);
+
+    ray_t* l_col = ray_table_get_col(result, ray_sym_intern("l", 1));
+    TEST_ASSERT_NOT_NULL(l_col);
+    TEST_ASSERT_EQ_I(l_col->type, RAY_I64);
+    TEST_ASSERT_TRUE(ray_vec_is_null(l_col, 0));
+    int64_t* ld = (int64_t*)ray_data(l_col);
+    TEST_ASSERT_EQ_I(ld[1], 10);
+    TEST_ASSERT_EQ_I(ld[2], 20);
+
+    ray_t* r_col = ray_table_get_col(result, ray_sym_intern("r", 1));
+    TEST_ASSERT_NOT_NULL(r_col);
+    TEST_ASSERT_EQ_I(r_col->type, RAY_F64);
+    TEST_ASSERT_TRUE(ray_vec_is_null(r_col, 0));
+    double* rd = (double*)ray_data(r_col);
+    TEST_ASSERT_EQ_F(rd[1], 2.0, 1e-12);
+    TEST_ASSERT_EQ_F(rd[2], 1.75, 1e-12);
+
+    ray_release(result);
+    PASS();
+}
+
+/* ---- Test: time-series kernels surface pool cancellation ---- */
+static test_result_t test_eval_timeseries_interrupt_cancel(void) {
+    int64_t n = RAY_MORSEL_ELEMS * 2;
+    ray_t* v = ray_vec_new(RAY_I64, n);
+    TEST_ASSERT_NOT_NULL(v);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    v->len = n;
+    int64_t* data = (int64_t*)ray_data(v);
+    for (int64_t i = 0; i < n; i++) data[i] = i;
+
+    ray_cancel();
+    ray_t* r = deltas_vec_eager(v);
+    ray_cancel_reset();
+    ray_release(v);
+
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    TEST_ASSERT_STR_EQ(ray_err_code(r), "cancel");
+    ray_error_free(r);
     PASS();
 }
 
@@ -2241,7 +2360,7 @@ static test_result_t test_eval_select_by_vec_bool_order(void) {
  * Regression: the use_eval_group check only looked at scalar
  * -RAY_SYM by_expr, so `by: [s]` slipped through to the DAG path;
  * the eval_group path then used by_expr->i64 (garbage for vector
- * form) and crashed inside ray_group_fn. */
+ * form) and crashed inside ray_group_indices_fn. */
 static test_result_t test_eval_select_by_vec_str_key(void) {
     ray_t* result = ray_eval_str(
         "(do (set t (table ['s 'p] "
@@ -3481,12 +3600,12 @@ static test_result_t test_select_by_nullable_f64_key(void) {
 
 static test_result_t test_select_by_computed_key_nullable_nonkey(void) {
     /* Computed key (by: (expr)) takes a third result-build path (lines
-     * around query.c:2120 — ray_group_fn on the computed vector + scatter
+     * around query.c:2120 — ray_group_indices_fn on the computed vector + scatter
      * non-key columns).  Same hazard as the other sites: dc->len wasn't
      * set before store_typed_elem, so nullable non-key columns silently
      * dropped their null bit.
      *
-     * Use an I64 computed key (`(mod Qty 2)`) so ray_group_fn's scalar
+     * Use an I64 computed key (`(mod Qty 2)`) so ray_group_indices_fn's scalar
      * hash path actually merges duplicate buckets — F64 output would fall
      * back to "every row is its own group" which masks every grouping
      * bug and lets a broken test pass trivially.  Setup forces:
@@ -3507,7 +3626,7 @@ static test_result_t test_select_by_computed_key_nullable_nonkey(void) {
 
 static test_result_t test_select_by_str_nullable_nonkey(void) {
     /* STR-keyed by-grouping routes through the eval_group fallback
-     * (ray_group_fn → gather first-of-group), which is a separate result-
+     * (ray_group_indices_fn -> gather first-of-group), which is a separate result-
      * build site from the scalar-key DAG path.  Same hazard though: the
      * non-key column's destination vec was filled via store_typed_elem
      * before its len was set, so nullable non-key columns lost their
@@ -5875,7 +5994,7 @@ static test_result_t test_builtin_write_file_fn(void) {
 }
 
 /* ── builtins.c coverage: group_ht_grow + ght_i64_hash_gi ───────────────────
- * ray_group_fn on an I64 vector with 40 distinct values.
+ * ray_group_indices_fn on an I64 vector with 40 distinct values.
  * seed_cap = 64 (n<64 path), so the HT starts at capacity 64.
  * After 33 distinct entries, count*2 = 66 > 64 → group_ht_grow fires. */
 static test_result_t test_builtin_group_ht_grow_i64(void) {
@@ -5891,7 +6010,7 @@ static test_result_t test_builtin_group_ht_grow_i64(void) {
         TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
     }
 
-    ray_t* grp = ray_group_fn(vec);
+    ray_t* grp = ray_group_indices_fn(vec);
     TEST_ASSERT_NOT_NULL(grp);
     TEST_ASSERT_FALSE(RAY_IS_ERR(grp));
     /* Result is a dict — 40 distinct keys */
@@ -5902,7 +6021,7 @@ static test_result_t test_builtin_group_ht_grow_i64(void) {
 }
 
 /* ── builtins.c coverage: group_ht_grow + ght_guid_hash_gi ─────────────────
- * ray_group_fn on a GUID vector with 40 distinct GUIDs.
+ * ray_group_indices_fn on a GUID vector with 40 distinct GUIDs.
  * seed_cap = 64 (n<64), HT starts at 64; grows after 33 distinct GUIDs. */
 static test_result_t test_builtin_group_ht_grow_guid(void) {
     ray_t* vec = ray_vec_new(RAY_GUID, 40);
@@ -5918,7 +6037,7 @@ static test_result_t test_builtin_group_ht_grow_guid(void) {
         TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
     }
 
-    ray_t* grp = ray_group_fn(vec);
+    ray_t* grp = ray_group_indices_fn(vec);
     TEST_ASSERT_NOT_NULL(grp);
     TEST_ASSERT_FALSE(RAY_IS_ERR(grp));
     TEST_ASSERT_EQ_I(grp->type, RAY_DICT);
@@ -5928,7 +6047,7 @@ static test_result_t test_builtin_group_ht_grow_guid(void) {
 }
 
 /* ── builtins.c coverage: group_grow (I64 path) ─────────────────────────────
- * ray_group_fn on an I64 vector with 1100 distinct values.
+ * ray_group_indices_fn on an I64 vector with 1100 distinct values.
  * max_groups starts at 1024 (capped); after processing 1025 distinct
  * values group_grow fires to double the bookkeeping arrays. */
 static test_result_t test_builtin_group_grow_i64(void) {
@@ -5942,7 +6061,7 @@ static test_result_t test_builtin_group_grow_i64(void) {
         TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
     }
 
-    ray_t* grp = ray_group_fn(vec);
+    ray_t* grp = ray_group_indices_fn(vec);
     TEST_ASSERT_NOT_NULL(grp);
     TEST_ASSERT_FALSE(RAY_IS_ERR(grp));
     TEST_ASSERT_EQ_I(grp->type, RAY_DICT);
@@ -6565,7 +6684,7 @@ static test_result_t test_builtin_idiv_rfl(void) {
     PASS();
 }
 
-/* ── builtins.c coverage: ray_group_fn with GUID via rfl ────────────────────
+/* ── builtins.c coverage: ray_group_indices_fn with GUID via rfl ────────────
  * Covers the GUID grouping path. */
 static test_result_t test_builtin_group_guid_rfl(void) {
     /* Create 40 distinct GUIDs, group them, verify result is a dict */
@@ -6573,8 +6692,8 @@ static test_result_t test_builtin_group_guid_rfl(void) {
     PASS();
 }
 
-/* ── builtins.c coverage: ray_group_fn empty and list ───────────────────────
- * Covers empty vector and RAY_LIST paths in ray_group_fn. */
+/* ── builtins.c coverage: ray_group_indices_fn empty and list ───────────────
+ * Covers empty vector and RAY_LIST paths in ray_group_indices_fn. */
 static test_result_t test_builtin_group_empty_and_list(void) {
     /* Empty group */
     ASSERT_EQ("(count (key (group [])))", "0");
@@ -6907,6 +7026,9 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/at", test_eval_at, lang_setup, lang_teardown },
     { "lang/eval/find", test_eval_find, lang_setup, lang_teardown },
     { "lang/eval/reverse", test_eval_reverse, lang_setup, lang_teardown },
+    { "lang/eval/timeseries_primitives", test_eval_timeseries_primitives, lang_setup, lang_teardown },
+    { "lang/eval/select_timeseries_primitives", test_eval_select_timeseries_primitives, lang_setup, lang_teardown },
+    { "lang/eval/timeseries_interrupt_cancel", test_eval_timeseries_interrupt_cancel, lang_setup, lang_teardown },
     { "lang/eval/table", test_eval_table, lang_setup, lang_teardown },
     { "lang/eval/at_table", test_eval_at_table, lang_setup, lang_teardown },
     { "lang/eval/key_table", test_eval_key_table, lang_setup, lang_teardown },

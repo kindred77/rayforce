@@ -20,14 +20,14 @@ The server starts, prints a listening message, and waits for connections. It als
 
 In a second terminal, start a regular Rayforce REPL and open a connection:
 
-```lisp
+```text
 ;; Open a handle to the server
 (set h (.ipc.open "127.0.0.1:5000"))
 ```
 
 The `.ipc.open` function returns a connection handle. Use `.ipc.send` to send a query string to the server, which parses, evaluates, and returns the result:
 
-```lisp
+```text
 ;; Send a query, get the result back
 (.ipc.send h "(+ 1 2)")
 ;; => 3
@@ -35,7 +35,7 @@ The `.ipc.open` function returns a connection handle. Use `.ipc.send` to send a 
 
 When you are done, close the connection:
 
-```lisp
+```text
 (.ipc.close h)
 ```
 
@@ -71,7 +71,7 @@ The server executes `init.rfl` before accepting connections. A typical init scri
 
 Once the server has data, clients can query it remotely:
 
-```lisp
+```text
 (set h (.ipc.open "127.0.0.1:5000"))
 
 ;; Query the remote trades table
@@ -79,7 +79,7 @@ Once the server has data, clients can query it remotely:
 ;; => the full trades table is returned
 
 ;; Run a filtered query
-(.ipc.send h "(select {from: trades where: (= sym 'AAPL)})")
+(.ipc.send h "(select {from: trades where: (== sym 'AAPL)})")
 
 (.ipc.close h)
 ```
@@ -90,14 +90,14 @@ The server evaluates any valid Rayfall expression sent as a string. This means y
 
 ### Filtered Queries
 
-```lisp
+```text
 ;; All trades where price exceeds 100
 (.ipc.send h "(select {from: trades where: (> price 100)})")
 ```
 
 ### Aggregations
 
-```lisp
+```text
 ;; Total quantity traded
 (.ipc.send h "(select {from: trades total: (sum qty)})")
 
@@ -107,7 +107,7 @@ The server evaluates any valid Rayfall expression sent as a string. This means y
 
 ### Joins
 
-```lisp
+```text
 ;; Join trades with quotes on sym
 (.ipc.send h "(select {from: (left-join trades quotes 'sym)})")
 ```
@@ -130,7 +130,7 @@ The server evaluates any valid Rayfall expression sent as a string. This means y
 
 Instead of strings, construct the query as a list. Builtins resolve to function objects — use them directly as the list head. Dict literals are self-evaluating, so column references inside them are preserved for server-side resolution:
 
-```lisp
+```text
 ;; Arithmetic
 (.ipc.send h (list + 1 2))
 ;; => 3
@@ -149,7 +149,7 @@ Instead of strings, construct the query as a list. Builtins resolve to function 
 
 For dynamic queries, substitute runtime values into the expression:
 
-```lisp
+```text
 ;; Dynamic filter threshold
 (set threshold 200)
 (.ipc.send h (list select {from: trades where: (list > (quote price) threshold)}))
@@ -169,7 +169,7 @@ For dynamic queries, substitute runtime values into the expression:
 
 `.ipc.send` blocks until the server replies. When you don't need a reply — firing a write, pushing an update, kicking off background work — use `.ipc.post` instead. It sends the message and returns immediately.
 
-```lisp
+```text
 (set h (.ipc.open "127.0.0.1:5000"))
 
 ;; Fire-and-forget: returns the null object as soon as the send completes
@@ -198,7 +198,7 @@ Start the server with `-u` to require a password from all clients:
 
 Clients must supply the password when connecting:
 
-```lisp
+```text
 (set h (.ipc.open "127.0.0.1:5000:user:secretpass"))
 ```
 
@@ -235,7 +235,7 @@ A common pattern is one data server with multiple query clients. Each client con
 
 **Terminal 2 — Analytics client:**
 
-```lisp
+```text
 ./rayforce
 
 ;; Connect to the data server
@@ -250,7 +250,7 @@ A common pattern is one data server with multiple query clients. Each client con
 
 **Terminal 3 — Monitoring client:**
 
-```lisp
+```text
 ./rayforce
 
 (set h (.ipc.open "127.0.0.1:5000"))
@@ -275,7 +275,7 @@ Several categories of errors can occur during IPC operations.
 
 If the server is not running or the port is wrong, `.ipc.open` returns an error:
 
-```lisp
+```text
 (.ipc.open "127.0.0.1:9999")
 ;; => error: connection refused
 ```
@@ -284,7 +284,7 @@ If the server is not running or the port is wrong, `.ipc.open` returns an error:
 
 Connecting without credentials to a password-protected server, or supplying the wrong password:
 
-```lisp
+```text
 ;; No credentials — server requires auth
 (.ipc.open "127.0.0.1:5000")
 ;; => error: authentication required
@@ -298,7 +298,7 @@ Connecting without credentials to a password-protected server, or supplying the 
 
 When connected to a `-U` server, mutating operations are rejected:
 
-```lisp
+```text
 ;; Trying to set a variable on a read-only server
 (.ipc.send h "(set x 42)")
 ;; => error: restricted in read-only mode
@@ -308,7 +308,7 @@ When connected to a `-U` server, mutating operations are rejected:
 
 If the server shuts down or the network drops while a query is in flight, `.ipc.send` returns an error. Use `try` to handle errors gracefully:
 
-```lisp
+```text
 (try
   (println "Trade count:" (.ipc.send h "(count trades)"))
   (fn [e] (println "Query failed:" e)))

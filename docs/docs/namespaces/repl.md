@@ -26,7 +26,7 @@ If a prior remote session was already attached on a different handle, it's close
 - The address (truncated to fit) is stored as the prompt prefix.
 - Subsequent REPL inputs are evaluated remotely until `.repl.disconnect` is called.
 
-```lisp
+```text
 (.repl.connect "127.0.0.1:5000")
 ;; Prompt becomes:   127.0.0.1:5000>
 

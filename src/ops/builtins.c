@@ -1160,7 +1160,7 @@ static ray_t* cast_vec_numeric_fast(ray_t* val, ray_t* vec, int8_t out_type) {
  * Handles I64, I32, I16, U8, F64, BOOL, DATE, TIME, TIMESTAMP, SYM.
  * Fast path for typed numeric input vectors (no per-element atoms);
  * generic path for RAY_LIST and other shapes. */
-/* Null-model invariant 16.4: a cast can land the target type's RESERVED
+/* Null propagation: a cast can land the target type's RESERVED
  * null sentinel in the output without it being a *source* null — e.g.
  * STR→F64 "inf"→0Nf, or an out-of-domain value mapping to NULL_I64.
  * cast_vec_copy_nulls only carries source nulls, so scan the output and
@@ -1169,7 +1169,7 @@ static ray_t* cast_vec_numeric_fast(ray_t* val, ray_t* vec, int8_t out_type) {
  * Scope MATCHES the validator (src/vec/validate.c): only F64/F32/I64/
  * TIMESTAMP sentinels are reserved.  I16/I32 (and I32-backed DATE/TIME) are
  * DELIBERATELY excluded — narrow-int arithmetic/truncation wraps modulo the
- * width (documented k/q rule), so INT16_MIN/INT32_MIN are legitimate
+ * width (documented wrap rule), so INT16_MIN/INT32_MIN are legitimate
  * computed values, not nulls (see test/rfl/expr/narrow_binary.rfl).  Forcing
  * HAS_NULLS for them would make a wrapped result read back as null. */
 static void cast_mark_output_sentinels(ray_t* vec, int8_t out_type, int64_t n) {
@@ -1230,7 +1230,7 @@ static ray_t* cast_vec_numeric(ray_t* type_sym, ray_t* val, int8_t out_type) {
             if (RAY_IS_ERR(result)) return result;
             if (_FP_CANCELLED()) { ray_release(vec); return ray_error("cancel", NULL); }
 #undef _FP_CANCELLED
-            /* Invariant 16.4: a narrowing fast cast may have produced a
+            /* Null propagation: a narrowing fast cast may have produced a
              * reserved sentinel not present in the source. */
             cast_mark_output_sentinels(vec, out_type, n2);
             return vec;
@@ -1282,7 +1282,7 @@ static ray_t* cast_vec_numeric(ray_t* type_sym, ray_t* val, int8_t out_type) {
      * below only propagates *source* nulls, so a 0Nf produced from a
      * non-null source cell would not flip HAS_NULLS.  Scan the F64 output
      * and set HAS_NULLS if any canonical 0Nf was produced. */
-    /* Invariant 16.4: scan the output for any reserved sentinel produced by
+    /* Null propagation: scan the output for any reserved sentinel produced by
      * the cast (narrowing/truncation, or STR→F64 0Nf canonicalization) that
      * is not a *source* null cast_vec_copy_nulls would carry. */
     cast_mark_output_sentinels(vec, out_type, n2);
@@ -2133,7 +2133,7 @@ ray_t* ray_where_fn(ray_t* x) {
 
 /* (group vec) -> dict mapping each unique value to its indices */
 /* ---------------------------------------------------------------------------
- * Open-address hash set for ray_group_fn's scalar / GUID fast paths.
+ * Open-address hash set for ray_group_indices_fn's scalar / GUID fast paths.
  *
  * Each slot holds either GHT_EMPTY or an already-allocated group index.
  * Lookups compare keys by calling back into the caller with the stored
@@ -2224,7 +2224,7 @@ static inline uint64_t hash_i64(int64_t v) {
 }
 
 /* Hash a generic atom or list, mirroring atom_eq's structural compare.
- * Used by the ray_group_fn LIST path to replace the historical O(N²)
+ * Used by the ray_group_indices_fn LIST path to replace the historical O(N²)
  * linear scan with an open-addressed hash table.  Cross-type numeric
  * coercion goes through f64 so an I64 atom and an F64 atom holding the
  * same value collide (matches atom_eq's `is_numeric → as_f64`).
@@ -2298,7 +2298,7 @@ static uint64_t ght_list_hash_gi(uint32_t gi, void* ctx) {
     return atom_hash(c->gkeys[gi]);
 }
 
-/* Grow the per-group bookkeeping arrays used by ray_group_fn.
+/* Grow the per-group bookkeeping arrays used by ray_group_indices_fn.
  * Doubles capacity; copies existing entries; returns false on OOM.
  * Caller is responsible for cleaning up and returning an error if this fails. */
 static bool group_grow(ray_t** val_block, ray_t** ivblock,
@@ -2353,7 +2353,7 @@ static bool group_grow_listkeys(ray_t** val_block, ray_t** ivblock, ray_t** kblo
     return true;
 }
 
-ray_t* ray_group_fn(ray_t* x) {
+ray_t* ray_group_indices_fn(ray_t* x) {
     if (!ray_is_vec(x) && x->type != RAY_LIST)
         return ray_error("type", "group: argument must be a vector or list, got %s", ray_type_name(x->type));
     int64_t n = x->len;
@@ -2386,7 +2386,7 @@ ray_t* ray_group_fn(ray_t* x) {
     /* For LIST type, use atom_eq-based grouping with stored keys.
      * Open-address hash table on atom_hash replaces the historical
      * O(N²) linear scan over gkeys — multi-key non-agg select-by on
-     * H2O-scale tables (10M rows × 10k unique keys) is now linear. */
+     * Large tables with many unique keys now run in linear time. */
     if (x->type == RAY_LIST) {
         ray_t** elems = (ray_t**)ray_data(x);
         ray_t* kblock = ray_alloc((size_t)(max_groups * sizeof(ray_t*)));
@@ -2839,6 +2839,44 @@ gfail:
     return ray_error("oom", NULL);
 }
 
+static ray_t* str_vec_concat_atom(ray_t* vec, ray_t* atom, bool atom_first) {
+    const char* ap = ray_str_ptr(atom);
+    size_t al = ray_str_len(atom);
+    int64_t n = vec->len;
+    ray_t* out = ray_vec_new(RAY_STR, n > 0 ? n : 1);
+    if (!out || RAY_IS_ERR(out)) return out;
+    for (int64_t i = 0; i < n; i++) {
+        size_t sl = 0;
+        const char* sp = ray_str_vec_get(vec, i, &sl);
+        if (!sp) { sp = ""; sl = 0; }
+        size_t total = al + sl;
+        char sbuf[8192];
+        char* buf = sbuf;
+        if (total > sizeof(sbuf)) {
+            buf = ray_sys_alloc(total);
+            if (!buf) {
+                ray_release(out);
+                return ray_error("oom", NULL);
+            }
+        }
+        if (atom_first) {
+            if (al) memcpy(buf, ap, al);
+            if (sl) memcpy(buf + al, sp, sl);
+        } else {
+            if (sl) memcpy(buf, sp, sl);
+            if (al) memcpy(buf + sl, ap, al);
+        }
+        ray_t* prev = out;
+        out = ray_str_vec_append(out, buf, total);
+        if (buf != sbuf) ray_sys_free(buf);
+        if (RAY_IS_ERR(out)) {
+            ray_release(prev);
+            return out;
+        }
+    }
+    return out;
+}
+
 /* (concat a b) -> concatenate vectors/strings/dicts/tables */
 ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
     /* Helper: get string content from atom (STR or CHAR), stripping trailing nulls */
@@ -2860,6 +2898,10 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
             return ray_str(buf, la + lb);
         }
     }
+    if (a->type == RAY_STR && ray_is_atom(b) && (-b->type) == RAY_STR)
+        return str_vec_concat_atom(a, b, false);
+    if (ray_is_atom(a) && (-a->type) == RAY_STR && b->type == RAY_STR)
+        return str_vec_concat_atom(b, a, true);
     /* Vector concat: same type — delegate to ray_vec_concat which handles
      * null bitmap propagation, SYM width promotion, and STR pool merging. */
     if (ray_is_vec(a) && ray_is_vec(b) && a->type == b->type)
@@ -2955,7 +2997,7 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
         }
         default: ray_free(result); return ray_error("type", "concat: unsupported element type %s", ray_type_name(b->type));
         }
-        /* Null-model invariant 16.4: propagate null-ness of the leading atom
+        /* Null propagation: propagate null-ness of the leading atom
          * (a typed-null sentinel written raw at slot 0) and any nulls in the
          * trailing vector b. */
         if (RAY_ATOM_IS_NULL(a) || (b->attrs & RAY_ATTR_HAS_NULLS))
@@ -3007,7 +3049,7 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
         default: ray_free(result); return ray_error("type", "concat: unsupported element type %s", ray_type_name(a->type));
         }
         result->len = na + 1;
-        /* Null-model invariant 16.4: propagate nulls in the leading vector a
+        /* Null propagation: propagate nulls in the leading vector a
          * and null-ness of the trailing atom (sentinel written raw at na). */
         if ((a->attrs & RAY_ATTR_HAS_NULLS) || RAY_ATOM_IS_NULL(b))
             result->attrs |= RAY_ATTR_HAS_NULLS;
@@ -3053,7 +3095,7 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
         }
         default: ray_free(result); return ray_error("type", "concat: unsupported element type %s", ray_type_name(vtype));
         }
-        /* Null-model invariant 16.4: a typed-null atom (e.g. the I64 literal
+        /* Null propagation: a typed-null atom (e.g. the I64 literal
          * INT64_MIN == NULL_I64) writes its sentinel bit-pattern straight
          * into the result column.  Flag HAS_NULLS so null-aware ops don't
          * treat the sentinel as a real value. */

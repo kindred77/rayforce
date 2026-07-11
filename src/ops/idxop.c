@@ -42,9 +42,9 @@ uint64_t ray_idx_hits[IDX_SITE__N];
 
 static void idx_stats_dump(void) {
     static const char* names[IDX_SITE__N] = {
-        "filter-zone", "filter-bloom", "filter-hash", "filter-range",
-        "in", "find", "sort", "distinct", "asof", "filter-eq-range",
-        "group-slice",
+        "filter-zone", "filter-bloom", "filter-hash", "filter-part",
+        "filter-range", "in", "find", "sort", "distinct", "asof",
+        "filter-eq-range", "group-slice",
     };
     for (int i = 0; i < IDX_SITE__N; i++)
         if (ray_idx_consults[i] || ray_idx_hits[i])
@@ -1046,6 +1046,7 @@ ray_t* ray_index_attach_hash(ray_t** vp) {
     ix->u.hash.mask     = mask;
     ix->u.hash.n_keys   = n_keys;
     ix->u.hash.n_groups = n_groups;
+    ix->u.hash.order_sym = -1;
 
     return attach_finalize(v, idx);
 }
@@ -1338,7 +1339,7 @@ ray_t* ray_index_hash_eq_rowsel(ray_t* col, int64_t key) {
 }
 
 /* --------------------------------------------------------------------------
- * Hash-index IN probe
+ * Hash/part-index IN probe
  *
  * For each unique in-range element of set_vec, walk the hash chain and
  * collect matching row ids into a single shared buffer, then build a
@@ -1365,9 +1366,163 @@ static int cmp_i64_plain(const void* a, const void* b) {
     return (x > y) - (x < y);
 }
 
+typedef struct {
+    int64_t start;
+    int64_t len;
+} idx_span_t;
+
+static bool sorted_i64_contains(const int64_t* values, int64_t n,
+                                int64_t needle) {
+    int64_t lo = 0, hi = n;
+    while (lo < hi) {
+        int64_t mid = lo + (hi - lo) / 2;
+        if (values[mid] < needle) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo < n && values[lo] == needle;
+}
+
+/* Build a rowsel from sorted, disjoint physical-row spans.  Part indexes
+ * already describe matches this way, so keep full morsels as ALL and store
+ * row ids only for partial morsels instead of expanding every matching row. */
+static ray_t* rowsel_from_sorted_spans(int64_t n, const idx_span_t* spans,
+                                       int64_t nspans, int64_t total) {
+    if (n < 0 || nspans < 0 || total < 0 || total > n) return NULL;
+    if (nspans == 0)
+        return rowsel_from_sorted_ids(n, NULL, 0);
+
+    uint32_t nsegs = n > 0
+        ? (uint32_t)((n + RAY_MORSEL_ELEMS - 1) / RAY_MORSEL_ELEMS)
+        : 0;
+    ray_t* pop_hdr = ray_alloc((int64_t)nsegs * (int64_t)sizeof(uint32_t));
+    if (!pop_hdr) return NULL;
+    uint32_t* pop = (uint32_t*)ray_data(pop_hdr);
+    memset(pop, 0, (size_t)nsegs * sizeof(uint32_t));
+
+    int64_t counted = 0;
+    int64_t prev_end = 0;
+    for (int64_t i = 0; i < nspans; i++) {
+        int64_t start = spans[i].start;
+        int64_t len = spans[i].len;
+        if (start < prev_end || len <= 0 || start < 0 || start > n - len) {
+            ray_release(pop_hdr);
+            return NULL;
+        }
+        int64_t end = start + len;
+        counted += len;
+        prev_end = end;
+        uint32_t first = (uint32_t)(start / RAY_MORSEL_ELEMS);
+        uint32_t last = (uint32_t)((end - 1) / RAY_MORSEL_ELEMS);
+        for (uint32_t s = first; s <= last; s++) {
+            int64_t ss = (int64_t)s * RAY_MORSEL_ELEMS;
+            int64_t se = ss + RAY_MORSEL_ELEMS;
+            if (se > n) se = n;
+            int64_t a = start > ss ? start : ss;
+            int64_t b = end < se ? end : se;
+            pop[s] += (uint32_t)(b - a);
+        }
+    }
+    if (counted != total) {
+        ray_release(pop_hdr);
+        return NULL;
+    }
+
+    int64_t idx_count = 0;
+    for (uint32_t s = 0; s < nsegs; s++) {
+        int64_t ss = (int64_t)s * RAY_MORSEL_ELEMS;
+        int64_t se = ss + RAY_MORSEL_ELEMS;
+        if (se > n) se = n;
+        if (pop[s] != 0 && pop[s] != (uint32_t)(se - ss))
+            idx_count += pop[s];
+    }
+
+    ray_t* block = ray_rowsel_new(n, total, idx_count);
+    if (!block) {
+        ray_release(pop_hdr);
+        return NULL;
+    }
+    uint8_t* flags = ray_rowsel_flags(block);
+    uint32_t* offsets = ray_rowsel_offsets(block);
+    uint16_t* ids = ray_rowsel_idx(block);
+    uint32_t cum = 0;
+    for (uint32_t s = 0; s < nsegs; s++) {
+        offsets[s] = cum;
+        int64_t ss = (int64_t)s * RAY_MORSEL_ELEMS;
+        int64_t se = ss + RAY_MORSEL_ELEMS;
+        if (se > n) se = n;
+        if (pop[s] == 0) flags[s] = RAY_SEL_NONE;
+        else if (pop[s] == (uint32_t)(se - ss)) flags[s] = RAY_SEL_ALL;
+        else {
+            flags[s] = RAY_SEL_MIX;
+            cum += pop[s];
+        }
+    }
+    offsets[nsegs] = cum;
+
+    memset(pop, 0, (size_t)nsegs * sizeof(uint32_t));
+    for (int64_t i = 0; i < nspans; i++) {
+        int64_t start = spans[i].start;
+        int64_t end = start + spans[i].len;
+        uint32_t first = (uint32_t)(start / RAY_MORSEL_ELEMS);
+        uint32_t last = (uint32_t)((end - 1) / RAY_MORSEL_ELEMS);
+        for (uint32_t s = first; s <= last; s++) {
+            if (flags[s] != RAY_SEL_MIX) continue;
+            int64_t ss = (int64_t)s * RAY_MORSEL_ELEMS;
+            int64_t se = ss + RAY_MORSEL_ELEMS;
+            if (se > n) se = n;
+            int64_t a = start > ss ? start : ss;
+            int64_t b = end < se ? end : se;
+            uint32_t out = offsets[s] + pop[s];
+            for (int64_t r = a; r < b; r++)
+                ids[out++] = (uint16_t)(r - ss);
+            pop[s] += (uint32_t)(b - a);
+        }
+    }
+    ray_release(pop_hdr);
+    return block;
+}
+
+ray_t* ray_index_part_eq_rowsel(ray_t* col, int64_t key) {
+    if (!idx_fresh_nonull(col, RAY_IDX_PART)) return NULL;
+    if (col->type == RAY_F32 || col->type == RAY_F64) return NULL;
+    if (col->type != RAY_SYM && !hash_key_in_range(col->type, key))
+        return rowsel_from_sorted_ids(col->len, NULL, 0);
+
+    ray_index_t* ix = ray_index_payload(col->index);
+    ray_t* keys = ix->u.part.keys;
+    ray_t* starts = ix->u.part.starts;
+    ray_t* lens = ix->u.part.lens;
+    int64_t nparts = ix->u.part.n_parts;
+    if (!keys || !starts || !lens || keys->len != nparts ||
+        starts->len != nparts || lens->len != nparts)
+        return NULL;
+
+    const uint8_t* kb = (const uint8_t*)ray_data(keys);
+    const int64_t* st = (const int64_t*)ray_data(starts);
+    const int64_t* ln = (const int64_t*)ray_data(lens);
+    for (int64_t p = 0; p < nparts; p++) {
+        int64_t pkey = keys->type == RAY_SYM
+            ? ray_read_sym(kb, p, RAY_SYM, keys->attrs)
+            : set_vec_read_i64(kb, keys->type, p);
+        if (pkey != key) continue;
+        /* A direct FILTER rowsel still feeds the generic table compactor.
+         * For a dense partition that O(selected rows × columns) gather is
+         * slower than the normal predicate scan.  Keep dense partitions on
+         * the scan path; the dedicated GROUP BY slice path remains dense-safe
+         * because it streams the range directly into its aggregates. */
+        if (ln[p] > 64 && ln[p] > (col->len >> 1))
+            return NULL;
+        idx_span_t span = { .start = st[p], .len = ln[p] };
+        return rowsel_from_sorted_spans(col->len, &span, 1, ln[p]);
+    }
+    return rowsel_from_sorted_ids(col->len, NULL, 0);
+}
+
 ray_t* ray_index_in_rowsel(ray_t* col, ray_t* set_vec) {
-    /* Gate: integer-family or SYM column with fresh hash index, no nulls. */
-    if (!idx_fresh_nonull(col, RAY_IDX_HASH)) return NULL;
+    /* Gate: integer-family or SYM column with a fresh hash/part index. */
+    ray_idx_kind_t kind = ray_index_kind(col);
+    if ((kind != RAY_IDX_HASH && kind != RAY_IDX_PART) ||
+        !idx_fresh_nonull(col, kind)) return NULL;
     bool col_is_float = (col->type == RAY_F32 || col->type == RAY_F64);
     if (col_is_float) return NULL;
     bool col_is_sym = (col->type == RAY_SYM);
@@ -1430,6 +1585,45 @@ ray_t* ray_index_in_rowsel(ray_t* col, ray_t* set_vec) {
     } else {
         /* Empty set → all-NONE rowsel. */
         return rowsel_from_sorted_ids(n, NULL, 0);
+    }
+
+    if (kind == RAY_IDX_PART) {
+        ray_index_t* ix = ray_index_payload(col->index);
+        ray_t* keys = ix->u.part.keys;
+        ray_t* starts = ix->u.part.starts;
+        ray_t* lens = ix->u.part.lens;
+        int64_t nparts = ix->u.part.n_parts;
+        if (!keys || !starts || !lens || keys->len != nparts ||
+            starts->len != nparts || lens->len != nparts) {
+            ray_release(set_hdr);
+            return NULL;
+        }
+
+        ray_t* spans_hdr = ray_alloc(set_len * (int64_t)sizeof(idx_span_t));
+        if (!spans_hdr) {
+            ray_release(set_hdr);
+            return NULL;
+        }
+        idx_span_t* spans = (idx_span_t*)ray_data(spans_hdr);
+        const int64_t* stv = (const int64_t*)ray_data(starts);
+        const int64_t* lnv = (const int64_t*)ray_data(lens);
+        const uint8_t* kb = (const uint8_t*)ray_data(keys);
+        int64_t nspans = 0;
+        int64_t total = 0;
+        for (int64_t p = 0; p < nparts; p++) {
+            int64_t key = col_is_sym
+                ? ray_read_sym(kb, p, RAY_SYM, keys->attrs)
+                : set_vec_read_i64(kb, keys->type, p);
+            if (!sorted_i64_contains(set_scratch, set_len, key)) continue;
+            spans[nspans].start = stv[p];
+            spans[nspans].len = lnv[p];
+            total += lnv[p];
+            nspans++;
+        }
+        ray_release(set_hdr);
+        ray_t* block = rowsel_from_sorted_spans(n, spans, nspans, total);
+        ray_release(spans_hdr);
+        return block;
     }
 
     /* Resolve every set element to its GROUP up front (i64 compares against
@@ -1544,6 +1738,55 @@ static double sort_read_f64(const uint8_t* base, int8_t t, int64_t rid) {
         float v; memcpy(&v, base + rid * 4, 4); return (double)v;
     }
     double v; memcpy(&v, base + rid * 8, 8); return v;
+}
+
+/* Build a rowsel for the contiguous physical-row interval [lo, hi).  Full
+ * morsels are represented by an ALL flag and consume no idx[] space; only
+ * the two possible boundary morsels contribute local row ids. */
+static ray_t* rowsel_from_contiguous_span(int64_t n, int64_t lo, int64_t hi) {
+    if (n < 0 || lo < 0 || hi < lo || hi > n) return NULL;
+
+    int64_t total = hi - lo;
+    uint32_t n_segs = n > 0
+        ? (uint32_t)((n + RAY_MORSEL_ELEMS - 1) / RAY_MORSEL_ELEMS)
+        : 0;
+    int64_t idx_count = 0;
+    for (uint32_t s = 0; s < n_segs; s++) {
+        int64_t ss = (int64_t)s * RAY_MORSEL_ELEMS;
+        int64_t se = ss + RAY_MORSEL_ELEMS;
+        if (se > n) se = n;
+        int64_t a = lo > ss ? lo : ss;
+        int64_t b = hi < se ? hi : se;
+        int64_t pass = b > a ? b - a : 0;
+        if (pass > 0 && pass != se - ss) idx_count += pass;
+    }
+
+    ray_t* block = ray_rowsel_new(n, total, idx_count);
+    if (!block) return NULL;
+    uint8_t* flags = ray_rowsel_flags(block);
+    uint32_t* offsets = ray_rowsel_offsets(block);
+    uint16_t* ids = ray_rowsel_idx(block);
+    uint32_t cum = 0;
+    for (uint32_t s = 0; s < n_segs; s++) {
+        offsets[s] = cum;
+        int64_t ss = (int64_t)s * RAY_MORSEL_ELEMS;
+        int64_t se = ss + RAY_MORSEL_ELEMS;
+        if (se > n) se = n;
+        int64_t a = lo > ss ? lo : ss;
+        int64_t b = hi < se ? hi : se;
+        int64_t pass = b > a ? b - a : 0;
+        if (pass == 0) {
+            flags[s] = RAY_SEL_NONE;
+        } else if (pass == se - ss) {
+            flags[s] = RAY_SEL_ALL;
+        } else {
+            flags[s] = RAY_SEL_MIX;
+            for (int64_t r = a; r < b; r++)
+                ids[cum++] = (uint16_t)(r - ss);
+        }
+    }
+    offsets[n_segs] = cum;
+    return block;
 }
 
 /* lower_bound_i: first sorted position pos where value_at(perm[pos]) >= key.
@@ -1663,6 +1906,66 @@ ray_t* ray_index_range_rowsel(ray_t* col, uint16_t cmp_op,
     ray_t* block = rowsel_from_sorted_ids(n, ids, span);
     ray_release(scratch);
     return block;
+}
+
+ray_t* ray_sorted_range_rowsel(ray_t* col, uint16_t cmp_op,
+                               int64_t key_i, double key_f, bool is_float) {
+    if (!col || RAY_IS_ERR(col) || cmp_op == OP_NE) return NULL;
+    if (!ray_attr_is_sorted(col) || (col->attrs & RAY_ATTR_HAS_NULLS))
+        return NULL;
+
+    bool col_is_float = (col->type == RAY_F32 || col->type == RAY_F64);
+    bool col_is_int = col->type == RAY_BOOL || col->type == RAY_U8 ||
+                      col->type == RAY_I16 || col->type == RAY_I32 ||
+                      col->type == RAY_I64 || col->type == RAY_DATE ||
+                      col->type == RAY_TIME || col->type == RAY_TIMESTAMP;
+    if (!col_is_float && !col_is_int) return NULL;
+    if ((bool)is_float != col_is_float) return NULL;
+
+    int64_t n = col->len;
+    const uint8_t* base = (const uint8_t*)ray_data(col);
+    int8_t t = col->type;
+    int64_t lower = 0, upper = 0;
+    if (!is_float) {
+        int64_t hi = n;
+        while (lower < hi) {
+            int64_t mid = lower + (hi - lower) / 2;
+            if (sort_read_i64(base, t, mid) < key_i) lower = mid + 1;
+            else hi = mid;
+        }
+        upper = lower;
+        hi = n;
+        while (upper < hi) {
+            int64_t mid = upper + (hi - upper) / 2;
+            if (sort_read_i64(base, t, mid) <= key_i) upper = mid + 1;
+            else hi = mid;
+        }
+    } else {
+        int64_t hi = n;
+        while (lower < hi) {
+            int64_t mid = lower + (hi - lower) / 2;
+            if (sort_read_f64(base, t, mid) < key_f) lower = mid + 1;
+            else hi = mid;
+        }
+        upper = lower;
+        hi = n;
+        while (upper < hi) {
+            int64_t mid = upper + (hi - upper) / 2;
+            if (sort_read_f64(base, t, mid) <= key_f) upper = mid + 1;
+            else hi = mid;
+        }
+    }
+
+    int64_t lo, hi;
+    switch (cmp_op) {
+    case OP_LT: lo = 0;     hi = lower; break;
+    case OP_LE: lo = 0;     hi = upper; break;
+    case OP_GT: lo = upper; hi = n;     break;
+    case OP_GE: lo = lower; hi = n;     break;
+    case OP_EQ: lo = lower; hi = upper; break;
+    default: return NULL;
+    }
+    return rowsel_from_contiguous_span(n, lo, hi);
 }
 
 /* --------------------------------------------------------------------------
@@ -1882,31 +2185,37 @@ ray_t* ray_index_attach_bloom(ray_t** vp) {
 }
 
 /* --------------------------------------------------------------------------
- * Part index — contiguous ascending value-blocks
+ * Part index — contiguous value-blocks
  *
- * Build a RAY_IDX_PART index, verifying the column is laid out as contiguous,
- * ascending value-blocks.  Non-descending order is necessary AND sufficient:
- * it guarantees each distinct value occupies exactly one contiguous run.
- * v1: numeric vectors only (enforced by prepare_attach).
+ * Build a RAY_IDX_PART index. Numeric columns must be laid out as ascending
+ * value-blocks. SYM columns must be laid out as contiguous value-blocks in the
+ * column's domain id space; the block order itself is allowed to follow another
+ * comparator such as a string lexical sort.
  * -------------------------------------------------------------------------- */
 
-static ray_t* ray_index_attach_part(ray_t** vp) {
-    ray_t* v = prepare_attach(vp, "part");
+ray_t* ray_index_attach_part(ray_t** vp) {
+    ray_t* v = prepare_attach_ex(vp, "part", false, true);
     if (RAY_IS_ERR(v)) return v;
     int64_t n = v->len;
 
-    if (!vec_is_ascending(v))
+    if (v->type != RAY_SYM && !vec_is_ascending(v))
         return ray_error("domain", "parted: column is not laid out as ascending value-blocks");
+    if (v->type == RAY_SYM && (v->attrs & RAY_ATTR_HAS_NULLS)) {
+        for (int64_t i = 0; i < n; i++)
+            if (ray_vec_is_null(v, i))
+                return ray_error("domain", "parted: column contains nulls");
+    }
 
     const uint8_t* base = (const uint8_t*)ray_data(v);
     int es = numeric_elem_size(v->type);
 
-    /* Row i starts a new value-block iff it differs from i-1.  vec_is_ascending
-     * above already rejected any null/NaN, so numeric_key_word's NaN branch is
-     * unreachable here and its equality is exact for every accepted type.  Used
-     * by both the count and the fill loop so they cannot drift out of sync. */
+    /* Row i starts a new value-block iff it differs from i-1. */
     #define PART_NEW_BLOCK(i) \
-        (numeric_key_word(base, v->type, (i)) != numeric_key_word(base, v->type, (i)-1))
+        ((v->type == RAY_SYM) \
+            ? (ray_read_sym(base, (i), RAY_SYM, v->attrs) != \
+               ray_read_sym(base, (i)-1, RAY_SYM, v->attrs)) \
+            : (numeric_key_word(base, v->type, (i)) != \
+               numeric_key_word(base, v->type, (i)-1)))
 
     /* Count runs of equal values. */
     int64_t nparts = (n > 0) ? 1 : 0;
@@ -1914,16 +2223,31 @@ static ray_t* ray_index_attach_part(ray_t** vp) {
         if (PART_NEW_BLOCK(i))
             nparts++;
 
+    ray_t* seen_hdr = NULL;
+    int64_t* seen = NULL;
+    uint64_t seen_mask = 0;
+    if (v->type == RAY_SYM && nparts > 1) {
+        uint64_t cap = next_pow2((uint64_t)nparts * 2u);
+        if (cap < 8) cap = 8;
+        seen = (int64_t*)scratch_alloc(&seen_hdr, (size_t)cap * sizeof(int64_t));
+        if (!seen) return ray_error("oom", NULL);
+        for (uint64_t i = 0; i < cap; i++) seen[i] = -1;
+        seen_mask = cap - 1;
+    }
+
     int64_t cap = nparts > 0 ? nparts : 1;
     ray_t* starts = ray_vec_new(RAY_I64, cap);
     ray_t* lens   = ray_vec_new(RAY_I64, cap);
     ray_t* keys   = ray_vec_new(v->type, cap);
     if (RAY_IS_ERR(starts) || RAY_IS_ERR(lens) || RAY_IS_ERR(keys)) {
+        scratch_free(seen_hdr);
         if (!RAY_IS_ERR(starts)) ray_release(starts);
         if (!RAY_IS_ERR(lens))   ray_release(lens);
         if (!RAY_IS_ERR(keys))   ray_release(keys);
         return ray_error("oom", NULL);
     }
+    if (v->type == RAY_SYM)
+        ray_sym_vec_adopt_domain(keys, v);
     starts->len = lens->len = keys->len = nparts;
     int64_t* st = (int64_t*)ray_data(starts);
     int64_t* ln = (int64_t*)ray_data(lens);
@@ -1933,14 +2257,33 @@ static ray_t* ray_index_attach_part(ray_t** vp) {
     for (int64_t i = 1; i <= n; i++) {
         bool boundary = (i == n) || PART_NEW_BLOCK(i);
         if (boundary && n > 0) {
+            if (v->type == RAY_SYM && seen) {
+                int64_t kv = ray_read_sym(base, run_start, RAY_SYM, v->attrs);
+                uint64_t slot = mix64((uint64_t)kv) & seen_mask;
+                for (;;) {
+                    if (seen[slot] == -1) { seen[slot] = kv; break; }
+                    if (seen[slot] == kv) {
+                        scratch_free(seen_hdr);
+                        ray_release(starts); ray_release(lens); ray_release(keys);
+                        return ray_error("domain", "parted: column has repeated non-contiguous blocks");
+                    }
+                    slot = (slot + 1) & seen_mask;
+                }
+            }
             st[p] = run_start;
             ln[p] = i - run_start;
-            memcpy(kb + (size_t)p*es, base + (size_t)run_start*es, (size_t)es);
+            if (v->type == RAY_SYM) {
+                int64_t kv = ray_read_sym(base, run_start, RAY_SYM, v->attrs);
+                write_col_i64(kb, p, kv, RAY_SYM, keys->attrs);
+            } else {
+                memcpy(kb + (size_t)p*es, base + (size_t)run_start*es, (size_t)es);
+            }
             p++;
             run_start = i;
         }
     }
     #undef PART_NEW_BLOCK
+    scratch_free(seen_hdr);
 
     ray_t* idx = ray_index_alloc(RAY_IDX_PART, v->type, n);
     if (!idx || RAY_IS_ERR(idx)) {
@@ -1952,6 +2295,7 @@ static ray_t* ray_index_attach_part(ray_t** vp) {
     ix->u.part.starts  = starts;
     ix->u.part.lens    = lens;
     ix->u.part.n_parts = nparts;
+    ix->u.part.order_sym = -1;
     return attach_finalize(v, idx);
 }
 
@@ -2215,17 +2559,43 @@ static ray_t* attr_set_unique(ray_t* v) {
 }
 
 /* Build a backing index via `fn` (drop-and-rebuild through prepare_attach),
- * carrying any block-resident markers across the rebuild.  Used by grouped and
- * parted, which replace the backing index but must preserve markers such as
- * unique.  Only RAY_MARK_UNIQUE exists today; revisit the blanket carry if a
- * marker is ever added that should NOT survive replacing the backing index.
+ * carrying block-resident metadata that remains true for the unchanged row
+ * order.  Used by grouped and parted, which replace the backing index but must
+ * preserve markers such as unique and the optional within-group order marker.
  * The sorted marker lives in attrs (not the block) and survives attach. */
+static int64_t index_order_sym(ray_t* v) {
+    if (!v || RAY_IS_ERR(v) || !ray_index_has(v))
+        return -1;
+    ray_index_t* ix = ray_index_payload(v->index);
+    if (!ix || ix->built_for_len != v->len)
+        return -1;
+    if (ix->kind == RAY_IDX_HASH)
+        return ix->u.hash.order_sym;
+    if (ix->kind == RAY_IDX_PART)
+        return ix->u.part.order_sym;
+    return -1;
+}
+
+static void index_set_order_sym(ray_t* v, int64_t order_sym) {
+    if (!v || RAY_IS_ERR(v) || order_sym < 0 || !ray_index_has(v))
+        return;
+    ray_index_t* ix = ray_index_payload(v->index);
+    if (!ix || ix->built_for_len != v->len)
+        return;
+    if (ix->kind == RAY_IDX_HASH)
+        ix->u.hash.order_sym = order_sym;
+    else if (ix->kind == RAY_IDX_PART)
+        ix->u.part.order_sym = order_sym;
+}
+
 static ray_t* attach_backing_index_carry_markers(ray_t* v, ray_t* (*fn)(ray_t**)) {
     uint8_t carry = (v && !RAY_IS_ERR(v) && ray_index_has(v))
                     ? ray_index_payload(v->index)->markers : 0;
+    int64_t order_sym = index_order_sym(v);
     ray_t* w = attach_via(v, fn);
     if (w && !RAY_IS_ERR(w) && carry && (w->attrs & RAY_ATTR_HAS_INDEX))
         ray_index_payload(w->index)->markers |= carry;
+    index_set_order_sym(w, order_sym);
     return w;
 }
 
@@ -2341,12 +2711,14 @@ int64_t ray_index_find_row(ray_t* col, int64_t key) {
  * sites outside this file (the eq+range conjunction in exec.c) construct
  * selections from index slices. */
 
-int64_t ray_index_hash_sym_slices(ray_t* col, ray_t* keys,
-                                  ray_idx_slice_t** out, ray_t** hdr_out) {
+int64_t ray_index_sym_slices(ray_t* col, ray_t* keys,
+                             ray_idx_slice_t** out, ray_t** hdr_out) {
     *out = NULL; *hdr_out = NULL;
     if (!col || !keys) return -1;
     if (col->type != RAY_SYM) return -1;
-    if (!idx_fresh_nonull(col, RAY_IDX_HASH)) return -1;
+    ray_idx_kind_t kind = ray_index_kind(col);
+    if ((kind != RAY_IDX_HASH && kind != RAY_IDX_PART) ||
+        !idx_fresh_nonull(col, kind)) return -1;
 
     bool atom = (keys->type == -RAY_SYM);
     int64_t nkeys;
@@ -2378,13 +2750,40 @@ int64_t ray_index_hash_sym_slices(ray_t* col, ray_t* keys,
     if (!shdr) { ray_free(dhdr); return -1; }
     ray_idx_slice_t* sl = (ray_idx_slice_t*)ray_data(shdr);
     int64_t k = 0;
-    for (int64_t i = 0; i < nd; i++) {
-        const int64_t* rows = NULL;
-        int64_t n = 0;
-        int hit = ray_index_hash_group(col, doms[i], &rows, &n);
-        if (hit < 0) { ray_free(dhdr); ray_free(shdr); return -1; }
-        if (hit == 0 || n == 0) continue;  /* in domain, no rows */
-        sl[k].dom = doms[i]; sl[k].rows = rows; sl[k].n = n; k++;
+    if (kind == RAY_IDX_HASH) {
+        for (int64_t i = 0; i < nd; i++) {
+            const int64_t* rows = NULL;
+            int64_t n = 0;
+            int hit = ray_index_hash_group(col, doms[i], &rows, &n);
+            if (hit < 0) { ray_free(dhdr); ray_free(shdr); return -1; }
+            if (hit == 0 || n == 0) continue;
+            sl[k].dom = doms[i]; sl[k].rows = rows;
+            sl[k].first = 0; sl[k].n = n; k++;
+        }
+    } else {
+        ray_index_t* ix = ray_index_payload(col->index);
+        ray_t* pkeys = ix->u.part.keys;
+        ray_t* starts = ix->u.part.starts;
+        ray_t* lens = ix->u.part.lens;
+        int64_t np = ix->u.part.n_parts;
+        if (!pkeys || !starts || !lens || pkeys->len != np ||
+            starts->len != np || lens->len != np) {
+            ray_free(dhdr); ray_free(shdr); return -1;
+        }
+        const uint8_t* pk = (const uint8_t*)ray_data(pkeys);
+        const int64_t* ps = (const int64_t*)ray_data(starts);
+        const int64_t* pl = (const int64_t*)ray_data(lens);
+        for (int64_t i = 0; i < nd; i++) {
+            for (int64_t p = 0; p < np; p++) {
+                int64_t pdom = ray_read_sym(pk, p, RAY_SYM, pkeys->attrs);
+                if (pdom != doms[i]) continue;
+                if (pl[p] > 0) {
+                    sl[k].dom = doms[i]; sl[k].rows = NULL;
+                    sl[k].first = ps[p]; sl[k].n = pl[p]; k++;
+                }
+                break;
+            }
+        }
     }
     ray_free(dhdr);
     if (k == 0) { ray_free(shdr); return 0; }

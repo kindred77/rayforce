@@ -8,22 +8,22 @@ All scalar types, their internal constants, storage sizes, and Rayfall literal s
 
 | Name | Constant | Value | Size | Null Literal | Rayfall Literal |
 |---|---|---|---|---|---|
-| **Boolean** | `RAY_BOOL` | 1 | 1 byte | Null bitmap | `true` / `false` |
-| **Unsigned byte** | `RAY_U8` | 2 | 1 byte | Null bitmap | `0x42` |
-| **Short integer** | `RAY_I16` | 3 | 2 bytes | Null bitmap | Small integers |
+| **Boolean** | `RAY_BOOL` | 1 | 1 byte | none | `true` / `false` |
+| **Unsigned byte** | `RAY_U8` | 2 | 1 byte | none | `0x42` |
+| **Short integer** | `RAY_I16` | 3 | 2 bytes | `0Nh` | Small integers |
 | **Integer** | `RAY_I32` | 4 | 4 bytes | `0Ni` | `42i` |
 | **Long integer** | `RAY_I64` | 5 | 8 bytes | `0Nl` | `42` |
-| **Single float** | `RAY_F32` | 6 | 4 bytes | Null bitmap | — |
+| **Single float** | `RAY_F32` | 6 | 4 bytes | sentinel | — |
 | **Double float** | `RAY_F64` | 7 | 8 bytes | `0Nf` | `3.14` |
 | **Date** | `RAY_DATE` | 8 | 4 bytes | `0Nd` | `2024.01.15` |
 | **Time** | `RAY_TIME` | 9 | 4 bytes | `0Nt` | `09:30:00.000` |
 | **Timestamp** | `RAY_TIMESTAMP` | 10 | 8 bytes | `0Np` | `2024.01.15D09:30:00.000000000` |
-| **GUID** | `RAY_GUID` | 11 | 16 bytes | Null bitmap | UUID format |
-| **Symbol** | `RAY_SYM` | 12 | Adaptive (8/16/32/64-bit) | sym id 0 | `'AAPL`, `[AAPL GOOG]` |
-| **String** | `RAY_STR` | 13 | 16 bytes per element | Null flag in bitmap | `"hello"` |
+| **GUID** | `RAY_GUID` | 11 | 16 bytes | all-zero GUID | UUID format |
+| **Symbol** | `RAY_SYM` | 12 | Adaptive (8/16/32/64-bit) | none | `'AAPL`, `[AAPL GOOG]` |
+| **String** | `RAY_STR` | 13 | 16 bytes per element | none | `"hello"` |
 
 !!! note "Null handling"
-    Nulls are sentinel-encoded directly in the data array (`INT64_MIN` for `i64`, `NaN` for `f64`, the type-correct reserved value otherwise), not a separate bitmap; the `HAS_NULLS` attribute is a fast "may contain nulls" hint. Parseable null literals are `0Nh` (i16), `0Ni` (i32), `0Nl` (i64), `0Nf` (f64), `0Nd` (date), `0Nt` (time), and `0Np` (timestamp). Symbols have no null (a `SYM` null is sym id 0, by design — there is no `0Ns` literal). Use `nil?` to test for null.
+    Nulls are sentinel-encoded directly in the data array (`INT64_MIN` for `i64`, `NaN` for `f64`, the type-correct reserved value otherwise), not a separate bitmap; the `HAS_NULLS` attribute is a fast "may contain nulls" hint. Parseable null literals are `0Nh` (i16), `0Ni` (i32), `0Nl` (i64), `0Nf` (f64), `0Nd` (date), `0Nt` (time), and `0Np` (timestamp). `RAY_BOOL`, `RAY_U8`, `RAY_SYM`, and `RAY_STR` have no distinct null value. Use `nil?` to test for null.
 
 !!! note "Note"
     RAY_SYM and RAY_STR are both string types but serve different purposes. Symbols are dictionary-encoded (interned integers) — ideal for categorical data with repeated values like stock tickers or country codes. Strings are variable-length and stored inline or in a pool — ideal for free-form text.
@@ -63,7 +63,7 @@ Every Rayforce object begins with a 32-byte `ray_t` header. This is the fundamen
  * ray_t — 32-byte block header (union)
  *
  * Bytes  0-15:  Overlay zone (usage depends on type)
- *   Vectors:    nullmap[16]  — inline null bitmap (up to 128 elements)
+ *   Vectors:    aux[16]      — type-specific auxiliary bytes
  *   Slices:     slice_parent + slice_offset
  *   SYM vecs:   ext_nullmap  + sym_dict
  *   STR vecs:   str_ext_null + str_pool
@@ -166,7 +166,7 @@ ray> (+ 09:30:00.000 60000)
 
 ### RAY_TIMESTAMP
 
-Stored as a 64-bit signed integer counting **nanoseconds since 2000-01-01** (the Rayforce epoch — matches the CSV loader.s parser and the runtime.s arithmetic lifts). Nanosecond precision covers roughly the range 1707 – 2292.
+Stored as a 64-bit signed integer counting **nanoseconds since 2000-01-01** (the Rayforce epoch — matches the CSV loader's parser and the runtime's arithmetic lifts). Nanosecond precision covers roughly the range 1708 through 2292.
 
 ```lisp
 ray> 2024.01.15D09:30:00.000000000

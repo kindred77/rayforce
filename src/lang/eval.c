@@ -35,9 +35,10 @@
 #include "ops/idxop.h"
 #include "ops/linkop.h"
 #include "table/sym.h"
-#include "vec/vec.h"            /* ray_check_null_invariant (DEBUG null-model gate) */
+#include "vec/vec.h"
 #include "core/profile.h"
 #include "core/qstats.h"   /* per-worker parallelism counters for eval-path spans */
+#include "core/qmeasure.h" /* shared per-query worker lifecycle */
 #include "core/qlog.h"     /* ray_qlog_enabled — arm capture for query logging */
 #include "store/serde.h"   /* ray_serde_size — result footprint for spans */
 #include "table/sym.h"
@@ -804,16 +805,20 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
     if (!force_boxed && dag_opcode > 0) {
         int is_idiv = (dag_opcode == OP_MOD);
         int is_cmp  = (dag_opcode >= OP_EQ && dag_opcode <= OP_GE);
+        int is_pow  = (dag_opcode == OP_POW);
 
         /* Classify operands: numeric/temporal vectors or scalars */
         int8_t lt = left_coll ? left->type : -(left->type);
         int8_t rt = right_coll ? right->type : -(right->type);
         #define IS_NUM_TYPE(t) ((t)==RAY_I64||(t)==RAY_F64||(t)==RAY_I32||(t)==RAY_I16|| \
                                 (t)==RAY_U8||(t)==RAY_DATE||(t)==RAY_TIME||(t)==RAY_TIMESTAMP)
-        int l_num_vec = left_coll && ray_is_vec(left) && IS_NUM_TYPE(lt);
-        int r_num_vec = right_coll && ray_is_vec(right) && IS_NUM_TYPE(rt);
-        int l_num_scalar = !left_coll && IS_NUM_TYPE(lt);
-        int r_num_scalar = !right_coll && IS_NUM_TYPE(rt);
+        #define IS_POW_TYPE(t) ((t)==RAY_BOOL||(t)==RAY_U8||(t)==RAY_I16||(t)==RAY_I32|| \
+                                (t)==RAY_I64||(t)==RAY_F64)
+        int l_num_vec = left_coll && ray_is_vec(left) && (is_pow ? IS_POW_TYPE(lt) : IS_NUM_TYPE(lt));
+        int r_num_vec = right_coll && ray_is_vec(right) && (is_pow ? IS_POW_TYPE(rt) : IS_NUM_TYPE(rt));
+        int l_num_scalar = !left_coll && (is_pow ? IS_POW_TYPE(lt) : IS_NUM_TYPE(lt));
+        int r_num_scalar = !right_coll && (is_pow ? IS_POW_TYPE(rt) : IS_NUM_TYPE(rt));
+        #undef IS_POW_TYPE
         #undef IS_NUM_TYPE
 
         int can_dag = (l_num_vec || r_num_vec) &&
@@ -831,10 +836,13 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
         if (is_idiv && !(lt == RAY_I64 && rt == RAY_I64)) can_dag = 0;
         /* Comparisons: same-type only (cross-type promotion loses type info) */
         if (is_cmp && lt != rt) can_dag = 0;
-        /* Cross-type temporal: DAG promote() loses type tag (int+TIMESTAMP→I64 not TIMESTAMP) */
+        /* Cross-type temporal: DAG promote() loses type tag (int+TIMESTAMP→I64 not TIMESTAMP).
+         * POW rejects temporals entirely; its scalar builtin treats power as
+         * a numeric-only operation and returns F64. */
         {   int lt_temp = (lt==RAY_DATE||lt==RAY_TIME||lt==RAY_TIMESTAMP);
             int rt_temp = (rt==RAY_DATE||rt==RAY_TIME||rt==RAY_TIMESTAMP);
-            if ((lt_temp || rt_temp) && lt != rt) can_dag = 0;
+            if (is_pow && (lt_temp || rt_temp)) can_dag = 0;
+            else if ((lt_temp || rt_temp) && lt != rt) can_dag = 0;
         }
 
         if (can_dag) {
@@ -1587,9 +1595,8 @@ ray_t* ray_table_fn(ray_t* names, ray_t* cols) {
                 if (!RAY_IS_ERR(atom_wrap)) { ((uint8_t*)ray_data(atom_wrap))[0] = col_src->b8; atom_wrap->len = 1; }
             }
             if (atom_wrap && !RAY_IS_ERR(atom_wrap)) {
-                /* Invariant 16.4: a lone typed-null atom (e.g. 0Nl) wrapped
-                 * into a 1-element column carries its sentinel; flag it.
-                 * SYM is no-null by design (excluded). */
+                /* A lone typed-null atom wrapped into a 1-element column
+                 * carries its sentinel; flag it.  SYM is no-null by design. */
                 if (RAY_ATOM_IS_NULL(col_src) && atom_wrap->type != RAY_SYM)
                     atom_wrap->attrs |= RAY_ATTR_HAS_NULLS;
                 col_src = atom_wrap;
@@ -1666,16 +1673,13 @@ ray_t* ray_table_fn(ray_t* names, ray_t* cols) {
         if (RAY_IS_ERR(col_vec))
             { ray_release(tbl); if (_bxn) ray_release(_bxn); if (_bxc) ray_release(_bxc); return col_vec; }
 
-        /* Null-model invariant 16.4: ray_vec_append copies the atom payload
-         * raw and never sets HAS_NULLS, so a typed-null literal in the list
-         * (e.g. 0Nl = NULL_I64) would land its sentinel in the column with
-         * the flag clear.  Track it and flip HAS_NULLS after the loop. */
+        /* ray_vec_append copies the atom payload raw and never sets HAS_NULLS,
+         * so track typed null atoms and flip the column flag after the loop. */
         bool col_has_nulls = false;
 
         for (int64_t j = 0; j < nrows; j++) {
-            /* A null source atom whose sentinel survives into col_vec
-             * unchanged.  (F64 promotion of an I64 null produces a finite
-             * double, not a sentinel — no 16.4 issue there.) */
+            /* F64 promotion of an I64 null produces a finite double, not
+             * a null sentinel in the destination column. */
             if (RAY_ATOM_IS_NULL(row_elems[j]) &&
                 !(col_type == RAY_F64 && row_elems[j]->type == -RAY_I64))
                 col_has_nulls = true;
@@ -1725,7 +1729,6 @@ ray_t* ray_table_fn(ray_t* names, ray_t* cols) {
                 { ray_release(tbl); if (_bxn) ray_release(_bxn); if (_bxc) ray_release(_bxc); return col_vec; }
         }
 
-        /* Invariant 16.4: a sentinel was written into a non-SYM column. */
         if (col_has_nulls && col_vec->type != RAY_SYM)
             col_vec->attrs |= RAY_ATTR_HAS_NULLS;
 
@@ -2798,7 +2801,7 @@ vm_error_cleanup: {
 }
 
 
-/* ray_enlist_fn, ray_dict_fn, ray_nil_fn, ray_where_fn, ray_group_fn,
+/* ray_enlist_fn, ray_dict_fn, ray_nil_fn, ray_where_fn, ray_group_indices_fn,
  * ray_concat_fn, ray_raze_fn, ray_within_fn
  * moved to ops/builtins.c */
 
@@ -2977,10 +2980,15 @@ static void ray_register_builtins(void) {
     register_unary_op("sqrt",  RAY_FN_ATOMIC, ray_sqrt_fn, OP_SQRT);
     register_unary_op("log",   RAY_FN_ATOMIC, ray_log_fn,  OP_LOG);
     register_unary_op("exp",   RAY_FN_ATOMIC, ray_exp_fn,  OP_EXP);
-    /* No DAG opcode yet — registered as plain binary atomic.  Vector
-     * broadcasting goes through the ray_eval atomic dispatch.  Adding
-     * OP_POW + libm-vectorised expr.c arms is a perf follow-up. */
-    register_binary("pow", RAY_FN_ATOMIC, ray_pow_fn);
+    register_unary_op("sin",        RAY_FN_NONE, ray_sin_fn,        OP_SIN);
+    register_unary_op("asin",       RAY_FN_NONE, ray_asin_fn,       OP_ASIN);
+    register_unary_op("cos",        RAY_FN_NONE, ray_cos_fn,        OP_COS);
+    register_unary_op("acos",       RAY_FN_NONE, ray_acos_fn,       OP_ACOS);
+    register_unary_op("tan",        RAY_FN_NONE, ray_tan_fn,        OP_TAN);
+    register_unary_op("atan",       RAY_FN_NONE, ray_atan_fn,       OP_ATAN);
+    register_unary_op("reciprocal", RAY_FN_NONE, ray_reciprocal_fn, OP_RECIPROCAL);
+    register_unary_op("signum",     RAY_FN_NONE, ray_signum_fn,     OP_SIGNUM);
+    register_binary_op("pow", RAY_FN_ATOMIC, ray_pow_fn, OP_POW);
     /* Partial-sort top/bottom-N: O(N log K) bounded-heap fast path
      * via topk_indices_single, falls back to full sort for unsupported
      * types.  Per-group usage works through the eval-level scatter. */
@@ -2997,6 +3005,12 @@ static void ray_register_builtins(void) {
      * that it rejected with a bogus "expects two vectors" type error.
      * Without the flag eval materializes lazy args before the call. */
     register_binary("pearson_corr", RAY_FN_AGGR, ray_pearson_corr_fn);
+    register_binary("cov",  RAY_FN_AGGR, ray_cov_fn);
+    register_binary("scov", RAY_FN_AGGR, ray_scov_fn);
+    register_binary("wsum", RAY_FN_AGGR, ray_wsum_fn);
+    register_binary("wavg", RAY_FN_AGGR, ray_wavg_fn);
+    register_binary("quantile",   RAY_FN_AGGR, ray_quantile_fn);
+    register_binary("percentile", RAY_FN_AGGR, ray_percentile_fn);
 
     /* Special forms */
     register_binary("set", RAY_FN_SPECIAL_FORM | RAY_FN_RESTRICTED, ray_set_fn);
@@ -3009,6 +3023,9 @@ static void ray_register_builtins(void) {
     /* RAY_FN_LAZY_AWARE: these fns have 'if (ray_is_lazy(x)) return ray_lazy_append(...)' shells
      * and must NOT have their args materialised by the dispatcher. */
     register_unary("sum",   RAY_FN_AGGR | RAY_FN_LAZY_AWARE, ray_sum_fn);
+    register_unary("prod",  RAY_FN_AGGR | RAY_FN_LAZY_AWARE, ray_prod_fn);
+    register_unary("all",   RAY_FN_AGGR | RAY_FN_LAZY_AWARE, ray_all_fn);
+    register_unary("any",   RAY_FN_AGGR | RAY_FN_LAZY_AWARE, ray_any_fn);
     register_unary("count", RAY_FN_AGGR | RAY_FN_LAZY_AWARE, ray_count_fn);
     register_unary("avg",   RAY_FN_AGGR | RAY_FN_LAZY_AWARE, ray_avg_fn);
     register_unary("min",   RAY_FN_AGGR | RAY_FN_LAZY_AWARE, ray_min_fn);
@@ -3017,6 +3034,7 @@ static void ray_register_builtins(void) {
     register_unary("last",  RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_last_fn);
     /* med/dev/stddev/var materialise inline (no ray_lazy_append shell) — not LAZY_AWARE */
     register_unary("med",   RAY_FN_AGGR, ray_med_fn);
+    register_unary("mode",  RAY_FN_AGGR, ray_mode_fn);
     register_unary("dev",        RAY_FN_AGGR, ray_dev_fn);
     register_unary("stddev",     RAY_FN_AGGR, ray_stddev_fn);
     register_unary("stddev_pop", RAY_FN_AGGR, ray_stddev_pop_fn);
@@ -3044,10 +3062,32 @@ static void ray_register_builtins(void) {
     register_binary("union",   RAY_FN_NONE, ray_union_fn);
     register_binary("sect",    RAY_FN_NONE, ray_sect_fn);
     register_binary("take",    RAY_FN_NONE, ray_take_fn);
+    register_binary("drop",    RAY_FN_NONE, ray_drop_fn);
+    register_binary("rotate",  RAY_FN_NONE, ray_rotate_fn);
+    register_binary("cut",     RAY_FN_NONE, ray_cut_fn);
+    register_binary("cross",   RAY_FN_NONE, ray_cross_fn);
     register_binary("at",      RAY_FN_NONE, ray_at_fn);
     register_binary("find",    RAY_FN_NONE, ray_find_fn);
     register_unary("reverse",  RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_reverse_fn);
     register_unary("til",      RAY_FN_NONE, ray_til_fn);
+    register_unary_op("lag",    RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_lag_fn,    OP_LAG);
+    register_unary_op("lead",   RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_lead_fn,   OP_LEAD);
+    register_unary_op("deltas", RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_deltas_fn, OP_DELTAS);
+    register_unary_op("ratios", RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_ratios_fn, OP_RATIOS);
+    register_unary_op("fills",  RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_fills_fn,  OP_FILLS);
+    register_unary_op("sums",   RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_sums_fn,   OP_SUMS);
+    register_unary_op("avgs",   RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_avgs_fn,   OP_AVGS);
+    register_unary_op("mins",   RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_mins_fn,   OP_MINS);
+    register_unary_op("maxs",   RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_maxs_fn,   OP_MAXS);
+    register_unary_op("prds",   RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_prds_fn,   OP_PRDS);
+    register_unary_op("differ", RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_differ_fn, OP_DIFFER);
+    register_binary("msum",   RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_msum_fn);
+    register_binary("mavg",   RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_mavg_fn);
+    register_binary("mmin",   RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_mmin_fn);
+    register_binary("mmax",   RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_mmax_fn);
+    register_binary("mcount", RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_mcount_fn);
+    register_binary("mvar",   RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_mvar_fn);
+    register_binary("mdev",   RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_mdev_fn);
 
     /* Sorting operations */
     register_unary("asc",      RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_asc_fn);
@@ -3063,6 +3103,12 @@ static void ray_register_builtins(void) {
     register_binary("table",   RAY_FN_NONE, ray_table_fn);
     register_unary("key",      RAY_FN_NONE, ray_key_fn);
     register_unary("value",    RAY_FN_NONE, ray_value_fn);
+    register_unary("cols",     RAY_FN_NONE, ray_cols_fn);
+    register_binary("xcol",    RAY_FN_NONE, ray_xcol_fn);
+    register_binary("xcols",   RAY_FN_NONE, ray_xcols_fn);
+    register_binary("xkey",    RAY_FN_NONE, ray_xkey_fn);
+    register_binary("xgroup",  RAY_FN_NONE, ray_xgroup_fn);
+    register_unary("fkeys",    RAY_FN_NONE, ray_fkeys_fn);
     register_binary("union-all",      RAY_FN_NONE, ray_union_all_fn);
     /* table-distinct removed — distinct dispatches on type */
 
@@ -3082,10 +3128,14 @@ static void ray_register_builtins(void) {
     /* Join operations */
     register_vary("left-join",   RAY_FN_NONE, ray_left_join_fn);
     register_vary("inner-join",  RAY_FN_NONE, ray_inner_join_fn);
+    register_vary("full-join",   RAY_FN_NONE, ray_full_join_fn);
     register_vary("anti-join",   RAY_FN_NONE, ray_anti_join_fn);
     register_vary("window-join", RAY_FN_SPECIAL_FORM, ray_window_join_fn);
     register_vary("window-join1", RAY_FN_SPECIAL_FORM, ray_window_join1_fn);
-    register_vary("asof-join",   RAY_FN_NONE, ray_asof_join_fn);
+    /* Special form: asof-join inspects its operand ASTs (parted-select
+     * detection) before evaluating them so a parted (select … from:PARTED)
+     * pair can stream per-partition instead of flattening both histories. */
+    register_vary("asof-join",   RAY_FN_SPECIAL_FORM, ray_asof_join_fn);
 
     /* I/O builtins */
     register_vary("println",    RAY_FN_NONE, ray_println_fn);
@@ -3111,7 +3161,7 @@ static void ray_register_builtins(void) {
     register_binary("dict",     RAY_FN_NONE, ray_dict_fn);
     register_unary("nil?",      RAY_FN_NONE, ray_nil_fn);
     register_unary("where",     RAY_FN_NONE, ray_where_fn);
-    register_unary("group",     RAY_FN_NONE, ray_group_fn);
+    register_unary("group",     RAY_FN_NONE, ray_group_indices_fn);
     register_binary("concat",   RAY_FN_NONE, ray_concat_fn);
     register_unary("raze",      RAY_FN_NONE, ray_raze_fn);
     register_unary("ungroup",   RAY_FN_NONE, ray_ungroup_fn);
@@ -3125,6 +3175,13 @@ static void ray_register_builtins(void) {
 
     /* String operations */
     register_binary("split",     RAY_FN_NONE, ray_split_fn);
+    register_binary("str-find",  RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_str_find_fn);
+    register_binary("str-join",  RAY_FN_NONE, ray_str_join_fn);
+    register_unary ("upper",     RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_upper_fn);
+    register_unary ("lower",     RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_lower_fn);
+    register_unary ("trim",      RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_trim_fn);
+    register_vary  ("substr",    RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_substr_fn);
+    register_vary  ("replace",   RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_replace_fn);
 
     /* Serialization */
     register_unary("ser",        RAY_FN_NONE, ray_ser_fn);
@@ -3180,6 +3237,8 @@ static void ray_register_builtins(void) {
      * the category. */
     register_vary (".sys.gc",   RAY_FN_NONE,        ray_gc_fn);
     register_unary(".sys.exec", RAY_FN_RESTRICTED,  ray_system_fn);
+    register_unary(".mem.objsize", RAY_FN_NONE,      ray_mem_objsize_fn);
+    register_vary (".mem.ts",      RAY_FN_SPECIAL_FORM, ray_mem_ts_fn);
     /* Registry-dispatched system commands.  `.sys.cmd "name args"` is
      * the colon-command entry point; the per-command direct builtins below
      * skip the string parse for callers that already have a typed arg
@@ -3398,8 +3457,8 @@ static inline void eval_span_payload(ray_prof_span_t* s, ray_t* result) {
     int64_t cur = 0; ray_sys_get_stat(&cur, NULL);
     s->sys_cur = cur;
     s->qs_rows = ray_qstats_sum_rows();
-    uint64_t sum = 0, mx = 0; uint32_t used = 0;
-    ray_qstats_agg(&used, &sum, &mx);
+    uint64_t sum = 0; uint32_t used = 0;
+    ray_query_workers_snapshot(&used, &sum);
     s->qs_busy_ns = sum;
     s->qs_workers = used;
     if (result && !RAY_IS_ERR(result) && !RAY_IS_NULL(result)) {
@@ -3432,9 +3491,7 @@ ray_t* ray_eval(ray_t* obj) {
          * capture strictly off (mode 0) when the profiler is disabled. */
         bool capture  = g_ray_profile.active || ray_qlog_enabled();
         bool progress = ray_progress_active();
-        uint32_t qsmode = (capture ? RAY_QS_PROF : 0) | (progress ? RAY_QS_PROGRESS : 0);
-        ray_qstats_set_mode(qsmode);
-        if (qsmode) ray_qstats_reset(0);
+        ray_query_workers_begin(capture, progress);
     }
 
     /* Check for external interrupt (e.g. Ctrl-C from REPL) */
@@ -3768,14 +3825,9 @@ out:
      * entered ray_eval — REPL, IPC, ray_eval_str, file mode — exits
      * through here; firing ray_progress_end exactly when the depth
      * returns to 0 guarantees the progress bar is cleared no matter
-     * which builtin drove the update (including ray_group_fn etc.
+     * which builtin drove the update (including ray_group_indices_fn etc.
      * that bypass ray_execute). */
     if (__VM->eval_depth == 0) ray_progress_end();
-    /* §2.1 null-model invariant 16.4: every eval/op result flows through
-     * here, so this is the suite-wide chokepoint that enforces "sentinel
-     * present ⇒ HAS_NULLS set" across all tested producers.  Compiled out
-     * in release (see vec.h).  Errors/NULL are no-ops in the validator. */
-    ray_check_null_invariant(ret);
     return ret;
 }
 

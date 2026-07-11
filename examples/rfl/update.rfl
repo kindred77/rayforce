@@ -32,6 +32,8 @@
 (update {volume: (+ 1 volume) from: 'tab})
 (update {price: ((fn [x] (+ x 11)) price) from: 'tab where: (== volume 79)})
 (update {price: 0 from: 'tab where: (== volume 79)})
-(update {price: 0 from: 'tab by: sym where: (> volume 400)})
+;; Grouped mutation with `by:` + `where:` is not implemented; use `select`
+;; for grouped analytics.
+(select {from: tab where: (> volume 400) by: sym total_volume: (sum volume)})
 
 (set d (dict [a b c] (list 'a 'b (dict [d e] [1 2]))))

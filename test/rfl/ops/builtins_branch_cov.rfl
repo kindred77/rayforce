@@ -14,7 +14,7 @@
 ;; 1945-1976 ray_dict_fn      — dict creation from keys/vals
 ;; 1979-1983 ray_nil_fn       — null checks
 ;; 1986-2001 ray_where_fn     — bool vec filter
-;; 2222-2697 ray_group_fn     — LIST/GUID/STR/scalar paths
+;; 2222-2697 ray_group_indices_fn     — LIST/GUID/STR/scalar paths
 ;; 2700-3008 ray_concat_fn    — str/vec/list/dict/table/atom concat
 ;; 3012-3068 ray_raze_fn      — flat/slow paths
 ;; 3071-3100 ray_within_fn    — I64/F64/I32 within checks
@@ -738,7 +738,7 @@
 (type (dict [a] (list 1))) -- 'DICT
 
 ;; ═════════════════════════════════════════════════════════════════════
-;; 22. ray_group_fn — grouping paths (lines 2222-2697)
+;; 22. ray_group_indices_fn — grouping paths (lines 2222-2697)
 ;; ═════════════════════════════════════════════════════════════════════
 
 ;; Empty vec (lines 2226-2232)

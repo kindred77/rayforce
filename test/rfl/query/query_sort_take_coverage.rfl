@@ -92,6 +92,13 @@
 (count (select {from: Tsortake asc: [a b] take: 4})) -- 4
 (sum (at (select {from: Tsortake asc: [a b] take: 4}) 'a)) -- 9
 
+;; Single STR key with take uses the same bounded table path as numeric keys.
+(set Tstrtake (table [s v] (list (as 'STR (list "delta" "alpha" "charlie" "bravo" "echo" "bravo")) [4 1 3 2 5 6])))
+(count (select {from: Tstrtake asc: s take: 3})) -- 3
+(sum (at (select {from: Tstrtake asc: s take: 3}) 'v)) -- 9
+(count (select {from: Tstrtake desc: s take: 3})) -- 3
+(sum (at (select {from: Tstrtake desc: s take: 3}) 'v)) -- 12
+
 ;; ────────────────────────────────────────────────────────────────────
 ;; BOOL group-by result reorder with NULL column (lines 7117-7121)
 ;; When group-by on BOOL key produces result where first BOOL group
@@ -186,3 +193,29 @@
 ;; (first (asc (+ v 1))): inner col_expr = (+ v 1) is LIST → line 1858
 ;; simplify_agg_idiom returns false → compilation fails → domain error
 (select {m: (first (asc (+ v 1))) by: k from: T1858}) !- domain
+
+(set TLimLazy (table [s v] (list (take ['a 'b 'c] 120) (til 120))))
+(count (select {s: s from: TLimLazy where: (!= s 'c) take: 20})) -- 20
+(count (where (== (at (select {s: s from: TLimLazy where: (!= s 'c) take: 20}) 's) 'a))) -- 10
+(count (select {s: s from: TLimLazy where: (!= s 'c) take: -20})) -- 20
+(count (where (== (at (select {s: s from: TLimLazy where: (!= s 'c) take: -20}) 's) 'a))) -- 10
+
+(set TByStrKey (table [r] (list (list "aa/x" "bb/y" "aa/z" ""))))
+(count (select {c: (count r) from: TByStrKey where: (!= r "") by: {k: (substr r 1 (str-find (concat r "/") "/"))}})) -- 2
+(at (at (select {c: (count r) from: TByStrKey where: (!= r "") by: {k: (substr r 1 (str-find (concat r "/") "/"))} desc: c take: 1}) 'k) 0) -- "aa"
+(at (at (select {c: (count r) from: TByStrKey where: (!= r "") by: {k: (substr r 1 (str-find (concat r "/") "/"))} desc: c take: 1}) 'c) 0) -- 2
+
+(set TStrConst (table [k v] (list (list "a" "b" "a") [1 2 3])))
+(type (at (select {one: 1 c: (count v) from: TStrConst by: k desc: c take: 1}) 'one)) -- 'I64
+(at (at (select {one: 1 c: (count v) from: TStrConst by: k desc: c take: 1}) 'one) 0) -- 1
+
+(set NHol 200000)
+(set THol (table [k s v] (list (as 'STR (% (til NHol) 1000)) (as 'STR (til NHol)) (til NHol))))
+(count (select {m: (min s) c: (count s) from: THol by: k})) -- 1000
+(set RHolF (select {m: (min s) c: (count s) from: THol where: (>= v 100000) by: k}))
+(count RHolF) -- 1000
+(sum (at RHolF 'c)) -- 100000
+(at (at (select {m: m from: RHolF where: (== k "0")}) 'm) 0) -- "100000"
+(set RHolF2 (select {m: (min s) c: (count s) from: THol where: (>= v 100000) by: k}))
+(sum (at RHolF2 'c)) -- 100000
+(at (at (select {m: m from: RHolF2 where: (== k "0")}) 'm) 0) -- "100000"

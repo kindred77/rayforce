@@ -22,7 +22,7 @@
 ;; column).  We use `tot` and `cnt` throughout.
 ;;
 ;; Parallel threshold: nrows >= 16384 (src/ops/group.c:11656).
-;; Closes canonical H2O q10.
+;; Closes the canonical sum/count grouped shape.
 ;; ════════════════════════════════════════════════════════════════════
 
 ;; ─── basic 3-key shape: I64 keys, I64 v ─────────────────────────────
@@ -180,7 +180,7 @@
 (first (at (at Ruv 'tot) (where (and (== 1 (at Ruv 'k1)) (== 0 (at Ruv 'k2)))))) -- 3
 (first (at (at Ruv 'tot) (where (and (== 1 (at Ruv 'k1)) (== 1 (at Ruv 'k2)))))) -- 4
 
-;; ─── SYM keys (canonical H2O q10 shape) ─────────────────────────────
+;; ─── SYM keys with sum/count rowform ────────────────────────────────
 (set Ts (table [k1 k2 k3 v] (list [A A B B] [X Y X Y] [P P P P] (as 'I64 [10 20 30 40]))))
 (count (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Ts})) -- 4
 (sum (at (select {tot: (sum v) cnt: (count v) by: [k1 k2 k3] from: Ts}) 'tot)) -- 100

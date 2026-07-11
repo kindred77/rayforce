@@ -844,15 +844,14 @@ static test_result_t test_mem_stats_no_heap(void) {
     PASS();
 }
 
-/* ---- ray_alloc with order overflow ------------------------------------- *
+/* ---- ray_alloc with arithmetic overflow -------------------------------- *
  *
- * Asking for more bytes than RAY_HEAP_MAX_ORDER (256 GB) returns NULL
- * cleanly — exercises the overflow guard branch. */
+ * Requests that cannot fit the direct mmap prefix/header/page rounding still
+ * return NULL cleanly.  Merely exceeding RAY_HEAP_MAX_ORDER is not an overflow:
+ * those sizes belong to the exact-size direct mmap path. */
 
 static test_result_t test_alloc_too_large(void) {
-    /* SIZE_MAX/2 will trigger ray_order_for_size > MAX_ORDER. */
-    size_t huge = (size_t)1 << 40;  /* 1 TB */
-    ray_t* v = ray_alloc(huge);
+    ray_t* v = ray_alloc(SIZE_MAX);
     TEST_ASSERT_NULL(v);
     PASS();
 }
@@ -1550,8 +1549,8 @@ static test_result_t test_merge_foreign_pool_fallback(void) {
  *   - ray_free: mmod==1 vector / TABLE / STR arms and the h==NULL guard
  *     (L921-944)
  *   - ray_pool_of oversized downward-walk slow path (heap.h L275-288)
- *   - ray_order_for_size SIZE_MAX overflow + heap_add_pool pool_order
- *     overflow at the max order boundary (L162, L271)
+ *   - ray_order_for_size SIZE_MAX overflow and the max-order/direct boundary
+ *     (L162, L271)
  * =========================================================================== */
 
 #include "store/hnsw.h"   /* ray_hnsw_build / ray_hnsw_free */
@@ -2171,13 +2170,12 @@ static test_result_t test_pool_of_oversized_walk(void) {
     PASS();
 }
 
-/* ---- ray_order_for_size SIZE_MAX overflow + max-order pool overflow -------
+/* ---- ray_order_for_size SIZE_MAX overflow + max-order direct boundary ------
  *
  * ray_order_for_size(SIZE_MAX) returns RAY_HEAP_MAX_ORDER+1 via the
- * data_size > SIZE_MAX-32 guard (L162).  An allocation whose order maps
- * to exactly RAY_HEAP_MAX_ORDER (38) passes ray_alloc's order check but
- * makes heap_add_pool compute pool_order = 39 > MAX_ORDER and return false
- * at L271 — no mmap is attempted. */
+ * data_size > SIZE_MAX-32 guard.  Valid sizes at or above the largest buddy
+ * order must route through exact-size direct mmap, not the buddy max-order
+ * rejection. */
 
 static test_result_t test_order_overflow_guards(void) {
     /* L162: SIZE_MAX overflows the +32 header math. */
@@ -2193,9 +2191,14 @@ static test_result_t test_order_overflow_guards(void) {
     size_t sz = ((size_t)1 << 38) - 64;
     TEST_ASSERT_EQ_U(ray_order_for_size(sz), RAY_HEAP_MAX_ORDER);
 
-    /* The clean-NULL guard is the arithmetic-overflow case: an order ABOVE
-     * RAY_HEAP_MAX_ORDER is rejected up front (before any mapping or spill). */
-    ray_t* v = ray_alloc(SIZE_MAX);   /* order MAX+1 → rejected at the guard */
+    /* A valid size just above the largest buddy order is still representable
+     * by the direct mmap path.  Do not allocate it here: that would reserve a
+     * huge spill file on machines where it exceeds the RAM watermark. */
+    size_t direct_sz = ((size_t)1 << 38);
+    TEST_ASSERT_EQ_U(ray_order_for_size(direct_sz), RAY_HEAP_MAX_ORDER + 1);
+
+    /* The clean-NULL guard is true arithmetic overflow, not "order > max". */
+    ray_t* v = ray_alloc(SIZE_MAX);
     TEST_ASSERT_NULL(v);
     PASS();
 }

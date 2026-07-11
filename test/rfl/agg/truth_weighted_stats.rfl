@@ -1,0 +1,54 @@
+;; Truth reducers and binary numeric aggregate coverage.
+;;
+;; all/any are unary DAG reducers with BOOL output and null-skipping
+;; semantics. cov/scov/wsum/wavg are binary reducers that lower through
+;; the same pairwise aggregate machinery as pearson_corr.
+
+;; Standalone truth reducers
+(all [true true true]) -- true
+(all [true false true]) -- false
+(any [false false true]) -- true
+(any [false false false]) -- false
+(all (as 'I64 [1 0N 2])) -- true
+(any (as 'I64 [0 0N 0])) -- false
+(all (as 'F64 [1.0 2.0 3.0])) -- true
+(any (as 'F64 [0.0 0.0 3.0])) -- true
+
+;; Standalone binary reducers
+(cov [1 3] [2 6]) -- 2.0
+(scov [1 3] [2 6]) -- 4.0
+(wsum [1 3] [10 20]) -- 70.0
+(wavg [1 3] [10 20]) -- 17.5
+(wsum (as 'I64 [1 0N 3]) (as 'I64 [10 20 0N])) -- 10.0
+(wavg (as 'I64 [1 0N 3]) (as 'I64 [10 20 0N])) -- 10.0
+(nil? (wavg [0 0] [10 20])) -- true
+
+;; Keyless select: exercises OP_GROUP n_keys=0 and the HT binary fallback.
+(set Ttw (table [g x y w b] (list ['A 'A 'B 'B] [1 3 2 4] [2 6 4 8] [1 3 2 2] [1 1 0 1])))
+(set Rtw0 (select {c: (cov x y) s: (scov x y) ws: (wsum w y) wa: (wavg w y) al: (all b) an: (any b) from: Ttw}))
+(count Rtw0) -- 1
+(< (abs (- (at (at Rtw0 'c) 0) 2.5)) 1e-9) -- true
+(< (abs (- (at (at Rtw0 's) 0) 3.3333333333333335)) 1e-9) -- true
+(at (at Rtw0 'ws) 0) -- 44.0
+(< (abs (- (at (at Rtw0 'wa) 0) 5.5)) 1e-9) -- true
+(at (at Rtw0 'al) 0) -- false
+(at (at Rtw0 'an) 0) -- true
+
+;; Grouped select: v2 for plain scan inputs; filtered checks avoid relying on
+;; hash-table output order.
+(count (select {c: (cov x y) s: (scov x y) ws: (wsum w y) wa: (wavg w y) al: (all b) an: (any b) by: g from: Ttw})) -- 2
+(set RA (select {c: (cov x y) s: (scov x y) ws: (wsum w y) wa: (wavg w y) al: (all b) an: (any b) by: g from: Ttw where: (== g 'A)}))
+(at (at RA 'c) 0) -- 2.0
+(at (at RA 's) 0) -- 4.0
+(at (at RA 'ws) 0) -- 20.0
+(at (at RA 'wa) 0) -- 5.0
+(at (at RA 'al) 0) -- true
+(at (at RA 'an) 0) -- true
+
+(set RB (select {c: (cov x y) s: (scov x y) ws: (wsum w y) wa: (wavg w y) al: (all b) an: (any b) by: g from: Ttw where: (== g 'B)}))
+(at (at RB 'c) 0) -- 2.0
+(at (at RB 's) 0) -- 4.0
+(at (at RB 'ws) 0) -- 24.0
+(at (at RB 'wa) 0) -- 6.0
+(at (at RB 'al) 0) -- false
+(at (at RB 'an) 0) -- true

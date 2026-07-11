@@ -32,6 +32,18 @@
 (at ljt 'val1) -- [100 200 300]
 (sum (at ljt 'val2)) -- 4000
 (nil? (at (at ljt 'val2) 1)) -- true
+;; full-join keeps left-only and right-only rows, with shared keys coalesced.
+(set FL (table [id lv] (list [1 2 3] [10 20 30])))
+(set FR (table [id rv] (list [2 3 4] [200 300 400])))
+(set FJ (full-join [id] FL FR))
+(count FJ) -- 4
+(at FJ 'id) -- [1 2 3 4]
+(sum (at FJ 'id)) -- 10
+(sum (at FJ 'lv)) -- 60
+(sum (at FJ 'rv)) -- 900
+(count (select {from: FJ where: (nil? lv)})) -- 1
+(count (select {from: FJ where: (nil? rv)})) -- 1
+(count (select {from: FJ where: (== id 4)})) -- 1
 ;; inner-join basic
 (set t1 (table [id val1] (list [1 2 3 4 5] [100 200 300 400 500])))(set t2 (table [id val2] (list [1 3 5 6 7] [1000 3000 5000 6000 7000])))(count (inner-join [id] t1 t2)) -- 3
 ;; inner-join returns correct right values
@@ -440,4 +452,3 @@
 (count IJ256) -- 1
 (at IJ256 'val) -- [10]
 (at IJ256 'rval) -- [100]
-

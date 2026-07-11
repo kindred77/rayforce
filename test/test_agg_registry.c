@@ -226,6 +226,102 @@ static test_result_t test_pearson_signed_r(void) {
     PASS();
 }
 
+static test_result_t test_truth_reducers_v2(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    const agg_vtable_t* all_vt = agg_resolve(OP_ALL, RAY_I64);
+    const agg_vtable_t* any_vt = agg_resolve(OP_ANY, RAY_I64);
+    TEST_ASSERT_NOT_NULL(all_vt);
+    TEST_ASSERT_NOT_NULL(any_vt);
+
+    {
+        int64_t xs[] = { 1, NULL_I64, 2 };
+        ray_t* col = vec_i64(xs, 3);
+        TEST_ASSERT_NOT_NULL(col);
+        col->attrs |= RAY_ATTR_HAS_NULLS;
+        ray_t* got = run_single_group(all_vt, col);
+        TEST_ASSERT_NOT_NULL(got);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(got));
+        TEST_ASSERT_EQ_I(got->type, -RAY_BOOL);
+        TEST_ASSERT_EQ_I(got->b8, 1);
+        ray_release(got); ray_release(col);
+    }
+    {
+        int64_t xs[] = { 1, 0, 2 };
+        ray_t* col = vec_i64(xs, 3);
+        TEST_ASSERT_NOT_NULL(col);
+        ray_t* got = run_single_group(all_vt, col);
+        TEST_ASSERT_NOT_NULL(got);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(got));
+        TEST_ASSERT_EQ_I(got->type, -RAY_BOOL);
+        TEST_ASSERT_EQ_I(got->b8, 0);
+        ray_release(got); ray_release(col);
+    }
+    {
+        int64_t xs[] = { 0, NULL_I64, 0 };
+        ray_t* col = vec_i64(xs, 3);
+        TEST_ASSERT_NOT_NULL(col);
+        col->attrs |= RAY_ATTR_HAS_NULLS;
+        ray_t* got = run_single_group(any_vt, col);
+        TEST_ASSERT_NOT_NULL(got);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(got));
+        TEST_ASSERT_EQ_I(got->type, -RAY_BOOL);
+        TEST_ASSERT_EQ_I(got->b8, 0);
+        ray_release(got); ray_release(col);
+    }
+    {
+        int64_t xs[] = { 0, NULL_I64, 2 };
+        ray_t* col = vec_i64(xs, 3);
+        TEST_ASSERT_NOT_NULL(col);
+        col->attrs |= RAY_ATTR_HAS_NULLS;
+        ray_t* got = run_single_group(any_vt, col);
+        TEST_ASSERT_NOT_NULL(got);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(got));
+        TEST_ASSERT_EQ_I(got->type, -RAY_BOOL);
+        TEST_ASSERT_EQ_I(got->b8, 1);
+        ray_release(got); ray_release(col);
+    }
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+static test_result_t test_pairwise_stats_v2(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    double xs[] = { 1, 3, 2, 4 };
+    double ys[] = { 2, 6, 4, 8 };
+    ray_t* x = vec_f64(xs, 4);
+    ray_t* y = vec_f64(ys, 4);
+    TEST_ASSERT_NOT_NULL(x);
+    TEST_ASSERT_NOT_NULL(y);
+
+    struct { uint16_t op; double want; } cases[] = {
+        { OP_COV, 2.5 },
+        { OP_SCOV, 10.0 / 3.0 },
+        { OP_WSUM, 60.0 },
+        { OP_WAVG, 6.0 },
+    };
+    for (size_t c = 0; c < 4; c++) {
+        const agg_vtable_t* vt = agg_resolve(cases[c].op, RAY_F64);
+        TEST_ASSERT_NOT_NULL(vt);
+        ray_t* got = run_single_group_bin(vt, x, y);
+        TEST_ASSERT_NOT_NULL(got);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(got));
+        TEST_ASSERT_EQ_I(got->type, -RAY_F64);
+        TEST_ASSERT_EQ_F(got->f64, cases[c].want, 1e-9);
+        ray_release(got);
+    }
+
+    ray_release(x); ray_release(y);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 static test_result_t test_variance_matches_oracle(void) {
     ray_heap_init();
     (void)ray_sym_init();
@@ -435,6 +531,8 @@ const test_entry_t agg_registry_entries[] = {
     { "agg_registry/nulls_match_reduction", test_nulls_match_reduction, NULL, NULL },
     { "agg_registry/variance_matches_oracle", test_variance_matches_oracle, NULL, NULL },
     { "agg_registry/pearson_signed_r", test_pearson_signed_r, NULL, NULL },
+    { "agg_registry/truth_reducers_v2", test_truth_reducers_v2, NULL, NULL },
+    { "agg_registry/pairwise_stats_v2", test_pairwise_stats_v2, NULL, NULL },
     { "agg_registry/median", test_median, NULL, NULL },
     { "agg_registry/topn_botn_i64", test_topn_botn_i64, NULL, NULL },
     { "agg_registry/topn_botn_f64", test_topn_botn_f64, NULL, NULL },

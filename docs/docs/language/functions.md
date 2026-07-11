@@ -7,7 +7,7 @@ Complete reference for all Rayfall built-in functions. Each entry shows the func
 
 ## Arithmetic
 
-All arithmetic operators are **atomic** — they auto-map over vectors and broadcast scalars.
+Arithmetic operators auto-map over vectors and broadcast scalars. Numeric typed-vector calls and query expressions lower to morsel-based DAG kernels where available.
 
 | Function | Type | Description | Example |
 |---|---|---|---|
@@ -21,7 +21,19 @@ All arithmetic operators are **atomic** — they auto-map over vectors and broad
 | `round` | unary | Round to nearest integer | `(round 3.7)` → `4.0` |
 | `floor` | unary | Floor (round down) | `(floor 3.7)` → `3.0` |
 | `ceil` | unary | Ceiling (round up) | `(ceil 3.2)` → `4.0` |
-| `pow` | binary | Power (x^y, returns f64) | `(pow 2 10)` → `1024.0` |
+| `abs` | unary | Absolute value | `(abs -7)` → `7` |
+| `sqrt` | unary | Square root (returns f64) | `(sqrt 9)` → `3.0` |
+| `log` | unary | Natural logarithm | `(log 2.718)` → `~1.0` |
+| `exp` | unary | Exponential (e^x) | `(exp 1)` → `2.718...` |
+| `sin` | unary | Sine, radians; returns f64 | `(sin 0.0)` → `0.0` |
+| `asin` | unary | Arcsine, radians; out-of-domain values return `0Nf` | `(asin 1.0)` → `1.570...` |
+| `cos` | unary | Cosine, radians; returns f64 | `(cos 0.0)` → `1.0` |
+| `acos` | unary | Arccosine, radians; out-of-domain values return `0Nf` | `(acos 1.0)` → `0.0` |
+| `tan` | unary | Tangent, radians; returns f64 | `(tan 0.0)` → `0.0` |
+| `atan` | unary | Arctangent, radians; returns f64 | `(atan 1.0)` → `0.785...` |
+| `reciprocal` | unary | Reciprocal `1/x`; zero returns `0Nf` | `(reciprocal 4)` → `0.25` |
+| `signum` | unary | Sign as i64: `-1`, `0`, or `1`; null stays null | `(signum -3.5)` → `-1` |
+| `pow` | binary | Power (x^y, returns f64; DAG-lowered in queries) | `(pow 2 10)` → `1024.0` |
 | `xbar` | binary | Round down to nearest multiple (bucketing) | `(xbar [3 7 12] 5)` → `[0 5 10]` |
 
 Vector examples:
@@ -30,6 +42,10 @@ Vector examples:
 (+ [1 2 3] [10 20 30])   ; [11 22 33]
 (* [1 2 3] 10)            ; [10 20 30]  scalar broadcast
 (neg [1 -2 3])             ; [-1 2 -3]
+(sqrt [4 9 16])             ; [2.0 3.0 4.0]
+(sin [0.0 1.57079632679])   ; [0.0 1.0]
+(reciprocal [2 0 4])        ; [0.5 0Nf 0.25]
+(signum [-2.5 0.0 4.0])     ; [-1 0 1]
 (xbar [3 15 27] 10)      ; [0 10 20]
 ```
 
@@ -62,14 +78,42 @@ Aggregation functions are marked **aggr** and reduce vectors to scalar values. U
 | Function | Type | Description | Example |
 |---|---|---|---|
 | `sum` | unary, aggr | Sum of all elements | `(sum [1 2 3])` → `6` |
+| `prod` | unary, aggr | Product of all non-null numeric elements | `(prod [2 3 4])` → `24` |
+| `all` | unary, aggr | True if every non-null numeric element is truthy; empty/all-null returns `true` | `(all [1 2 3])` → `true` |
+| `any` | unary, aggr | True if any non-null numeric element is truthy; empty/all-null returns `false` | `(any [0 0 3])` → `true` |
 | `count` | unary, aggr | Count of elements | `(count [1 2 3])` → `3` |
 | `avg` | unary, aggr | Arithmetic mean | `(avg [1 2 3])` → `2.0` |
 | `min` | unary, aggr | Minimum value | `(min [3 1 2])` → `1` |
 | `max` | unary, aggr | Maximum value | `(max [3 1 2])` → `3` |
 | `med` | unary, aggr | Median value (returns f64) | `(med [1 3 2])` → `2.0` |
+| `mode` | unary, aggr | Most frequent non-null value; ties keep the first encountered value | `(mode [1 2 2 3])` → `2` |
 | `dev` | unary, aggr | Population standard deviation | `(dev [1 2 3])` → `0.816...` |
+| `stddev` | unary, aggr | Sample standard deviation | `(stddev [1 2 3])` → `1.0` |
+| `stddev_pop` | unary, aggr | Population standard deviation | `(stddev_pop [1 2 3])` |
+| `dev_pop` | unary, aggr | Population standard deviation alias | `(dev_pop [1 2 3])` |
+| `var` | unary, aggr | Sample variance | `(var [1 2 3])` → `1.0` |
+| `var_pop` | unary, aggr | Population variance | `(var_pop [1 2 3])` |
+| `pearson_corr` | binary, aggr | Pearson correlation over paired non-null numeric inputs | `(pearson_corr [1 2 3] [2 4 6])` → `1.0` |
+| `cov` | binary, aggr | Population covariance over paired non-null numeric inputs | `(cov [1 3] [2 6])` → `2.0` |
+| `scov` | binary, aggr | Sample covariance over paired non-null numeric inputs | `(scov [1 3] [2 6])` → `4.0` |
+| `wsum` | binary, aggr | Weighted sum, `sum(weights * values)`, skipping null pairs | `(wsum [1 3] [10 20])` → `70.0` |
+| `wavg` | binary, aggr | Weighted average, `wsum / sum(weights)`; null for zero total weight | `(wavg [1 3] [10 20])` → `17.5` |
+| `quantile` | binary, aggr | Exact linear-interpolated quantile; probability is `0.0..1.0` | `(quantile [1 2 3 4] 0.5)` → `2.5` |
+| `percentile` | binary, aggr | Exact linear-interpolated percentile; probability is `0..100` | `(percentile [1 2 3 4] 50)` → `2.5` |
 | `first` | unary | First element of vector | `(first [10 20 30])` → `10` |
 | `last` | unary | Last element of vector | `(last [10 20 30])` → `30` |
+
+Numeric reducers skip nulls where applicable. Pairwise binary reducers skip a row when either vector input is null. Inside `select`/`by:`, aggregate reducers lower to morsel-based DAG paths that can run in parallel and poll for cancellation.
+
+The examples below use this small in-memory table:
+
+```lisp
+(set trades (table [sym price size time]
+  (list [AAPL GOOG AAPL]
+        [150.0 280.0 151.0]
+        [100 50 200]
+        [10 20 15])))
+```
 
 ```lisp
 ; Group-by aggregation example
@@ -109,10 +153,32 @@ Operations on vectors as collections.
 | `union` | binary | Set union | `(union [1 2] [2 3])` → `[1 2 3]` |
 | `sect` | binary | Set intersection | `(sect [1 2 3] [2 3 4])` → `[2 3]` |
 | `take` | binary | Take first/last N elements | `(take [10 20 30] 2)` → `[10 20]` |
+| `drop` | binary | Drop first/last N elements | `(drop [10 20 30] 1)` → `[20 30]` |
+| `rotate` | binary | Rotate left by N positions; negative rotates right | `(rotate [1 2 3 4] 1)` → `[2 3 4 1]` |
+| `cut` | binary | Split at sorted 0-based indices | `(cut [1 2 3 4] [2])` → `([1 2] [3 4])` |
+| `cross` | binary | Cartesian product as pairs | `(cross [1 2] ['a 'b])` → `((1 'a) (1 'b) (2 'a) (2 'b))` |
 | `at` | binary | Index into vector | `(at [10 20 30] 1)` → `20` |
 | `find` | binary | Find index of value | `(find [10 20 30] 20)` → `1` |
 | `reverse` | unary | Reverse order | `(reverse [1 2 3])` → `[3 2 1]` |
 | `til` | unary | Range [0..n) | `(til 5)` → `[0 1 2 3 4]` |
+| `lag` | unary | Shift values one row back; first row is null/sentinel | `(lag [10 20 30])` → `[0Nl 10 20]` |
+| `lead` | unary | Shift values one row forward; last row is null/sentinel | `(lead [10 20 30])` → `[20 30 0Nl]` |
+| `deltas` | unary | Adjacent differences; first row is null | `(deltas [10 15 13])` → `[0Nl 5 -2]` |
+| `ratios` | unary | Adjacent ratios as f64; first row is null | `(ratios [2 4 8])` → `[0Nf 2.0 2.0]` |
+| `fills` | unary | Forward-fill nullable vectors, or every column of a table | `(fills (as 'I64 (list 0N 2 0N)))` → `[0Nl 2 2]` |
+| `sums` | unary | Running sum; nulls are skipped | `(sums [1 2 3])` → `[1 3 6]` |
+| `avgs` | unary | Running average over non-null values | `(avgs [2 4 6])` → `[2.0 3.0 4.0]` |
+| `mins` | unary | Running minimum | `(mins [3 1 2])` → `[3 1 1]` |
+| `maxs` | unary | Running maximum | `(maxs [3 1 2])` → `[3 3 3]` |
+| `prds` | unary | Running product; nulls are skipped | `(prds [2 3 4])` → `[2 6 24]` |
+| `differ` | unary | Boolean change flag versus previous row; first row is true | `(differ [1 1 2])` → `[true false true]` |
+| `msum` | binary | Moving sum over trailing N rows; nulls are skipped | `(msum 3 [1 2 3 4])` → `[1 3 6 9]` |
+| `mavg` | binary | Moving average over trailing N rows and non-null values | `(mavg 3 [1 2 3 4])` → `[1.0 1.5 2.0 3.0]` |
+| `mmin` | binary | Moving minimum over trailing N rows | `(mmin 3 [3 2 4 1])` → `[3 2 2 1]` |
+| `mmax` | binary | Moving maximum over trailing N rows | `(mmax 3 [3 2 4 1])` → `[3 3 4 4]` |
+| `mcount` | binary | Moving non-null count over trailing N rows | `(mcount 3 [1 2 3 4])` → `[1 2 3 3]` |
+| `mvar` | binary | Moving population variance over trailing N rows and non-null values | `(mvar 2 [1 3 5])` → `[0.0 1.0 1.0]` |
+| `mdev` | binary | Moving population standard deviation over trailing N rows and non-null values | `(mdev 2 [1 3 5])` → `[0.0 1.0 1.0]` |
 | `enlist` | variadic | Wrap value(s) in a vector | `(enlist 1 2 3)` → `[1 2 3]` |
 | `concat` | binary | Concatenate two vectors | `(concat [1 2] [3 4])` → `[1 2 3 4]` |
 | `raze` | unary | Flatten a list of vectors into one | `(raze (list [1 2] [3 4]))` → `[1 2 3 4]` |
@@ -124,6 +190,8 @@ Operations on vectors as collections.
 | `binr` | binary | Binary search (right boundary) | `(binr [10 20 30] 25)` → `2` |
 | `unify` | binary | Merge two tables/dicts, second takes precedence | `(unify d1 d2)` |
 
+The time-series vector functions above are lazy-aware DAG operations for vector inputs. Moving-window helpers take a positive integer window first, then the vector. Constant windows inside `select` lower into DAG nodes; dynamic windows evaluate through the normal function path. These functions materialize through morsel-based kernels, can run in parallel, and poll the query cancellation flag during execution.
+
 ## Sorting & Ordering
 
 | Function | Type | Description | Example |
@@ -133,8 +201,8 @@ Operations on vectors as collections.
 | `iasc` | unary | Indices that would sort ascending | `(iasc [30 10 20])` → `[1 2 0]` |
 | `idesc` | unary | Indices that would sort descending | `(idesc [30 10 20])` → `[0 2 1]` |
 | `rank` | unary | Rank of each element | `(rank [30 10 20])` → `[2 0 1]` |
-| `xasc` | binary | Sort table ascending by column(s) | `(xasc 'price trades)` |
-| `xdesc` | binary | Sort table descending by column(s) | `(xdesc 'price trades)` |
+| `xasc` | binary | Sort table ascending by column(s) | `(xasc trades 'price)` |
+| `xdesc` | binary | Sort table descending by column(s) | `(xdesc trades 'price)` |
 | `xrank` | binary | Assign rank buckets (quantiles) | `(xrank 4 [10 20 30 40])` → `[0 1 2 3]` |
 
 ## Table Operations
@@ -144,15 +212,23 @@ Operations on vectors as collections.
 | `list` | variadic | Create a list from vectors | `(list [1 2] [A B])` |
 | `table` | binary | Create table from column names + list of vectors | `(table [x y] (list [1 2] [A B]))` |
 | `key` | unary | Get column names (table) or keys (dict) | `(key trades)` → `[sym price size]` |
+| `cols` | unary | Get table column names | `(cols trades)` → `[sym price size]` |
 | `value` | unary | Get column data (table) or values (dict) | `(value trades)` |
 | `dict` | binary | Create dictionary from keys and values | `(dict [a b] [1 2])` |
 | `get` | binary | Lookup key in dict/table | `(get d 'a)` → `1` |
 | `remove` | binary | Remove key from dict | `(remove d 'a)` |
 | `row` | binary | Extract single row from table as dict | `(row trades 0)` |
 | `meta` | unary | Get metadata (column types, lengths) | `(meta trades)` |
+| `xcol` | binary | Rename all table columns | `(xcol trades [ticker px sz])` |
+| `xcols` | binary | Project/reorder named columns | `(xcols trades [size sym])` |
+| `xkey` | binary | Build a dict keyed by unique column value(s), with row dict values for remaining columns | `(xkey trades 'time)` |
+| `xgroup` | binary | Group rows by column value(s), returning dict key -> table slice | `(xgroup trades 'sym)` |
+| `fkeys` | unary | Inspect linked-column metadata as `column -> target table` | `(fkeys fact)` |
 | `alter` | variadic, special | In-place mutation of table column | `(alter trades 'price (* price 1.1))` |
 | `del` | variadic, special | Delete columns or rows from table | `(del trades 'temp_col)` |
 | `modify` | variadic | Functional table update (returns new table) | `(modify trades 'price (fn [p] (* p 1.1)))` |
+
+`xkey` returns a dictionary keyed by unique key column value(s). Duplicate keys are a domain error; use `xgroup` to get a dictionary whose values are grouped table slices.
 
 ## Query Operations
 
@@ -186,7 +262,7 @@ These are **special forms** that bridge to the Rayforce DAG executor.
 
 ```lisp
 ; Append a row to a table
-(insert 'trades (list 'AAPL 150.0 100))
+(insert 'trades (list 'AAPL 150.0 100 12))
 
 ; Vector / list operations
 (set v (til 5))               ; [0 1 2 3 4]
@@ -201,32 +277,51 @@ Indices are *pre-insertion* positions in `[0, count]`; `idx == count` is equival
 
 ## Joins
 
-Rayforce supports four join types, all with time-series-aware semantics.
+Rayforce supports equi-joins, outer joins, anti-joins, and time-series-aware joins.
 
 | Function | Type | Description |
 |---|---|---|
 | `left-join` | variadic | Left join on matching columns. Unmatched rows filled with nulls. |
 | `inner-join` | variadic | Inner join — only matching rows. |
+| `full-join` | variadic | Full outer join. All left and right rows are preserved; unmatched columns are null. |
+| `anti-join` | variadic | Anti-semi-join. Keep left rows with no right match. |
 | `window-join` | variadic, special | Join with time window constraint. Match rows within a time range. |
 | `asof-join` | variadic | As-of join — match the most recent preceding value. |
 
 ```lisp
+; Fixtures for join examples
+(set trades_j (table [sym price size time]
+  (list [AAPL GOOG AAPL]
+        [150.0 280.0 151.0]
+        [100 50 200]
+        [10 20 15])))
+(set quotes (table [sym time bid]
+  (list [AAPL GOOG AAPL]
+        [9 19 16]
+        [149.5 279.5 150.5])))
+(set orders (table [product_id qty] (list [10 20 10] [2 1 5])))
+(set products (table [product_id name] (list [10 20] [widget gadget])))
+
 ; Left join two tables on the sym column (join keys are a symbol list)
-(left-join trades quotes [sym])
+(left-join trades_j quotes [sym])
 
 ; Inner join
 (inner-join orders products [product_id])
 
+; Full outer join keeps rows from both sides
+(full-join [sym] trades_j quotes)
+
 ; Window join: keys are [equality-keys... time-key]; intervals is
-; (list lo-vec hi-vec) with one [lo hi] window bound per left row.
+; a two-vector list with one [lo hi] window bound per left row.
 ; For each left row, aggregate the right rows whose time key falls in the window.
+(set intervals (map-left + [-2 2] (at trades_j 'time)))
 (window-join [sym time]
-             (list [8 18] [12 22])
-             trades quotes
+             intervals
+             trades_j quotes
              {avg_bid: (avg bid)})
 
 ; As-of join: keys come first, the last key is the time key
-(asof-join [sym time] trades quotes)
+(asof-join [sym time] trades_j quotes)
 ```
 
 ## Pivot & Window
@@ -253,13 +348,20 @@ Rayforce supports four join types, all with time-series-aware semantics.
 | Function | Type | Description | Example |
 |---|---|---|---|
 | `split` | binary | Split string by delimiter (returns a list) | `(split "a,b,c" ",")` → `("a" "b" "c")` |
+| `str-find` | binary | First byte index of a substring; returns `0Nl` when absent | `(str-find "banana" "na")` → `2` |
+| `str-join` | binary | Join strings or symbols with a delimiter | `(str-join ["a" "b"] ",")` → `"a,b"` |
 | `strlen` | unary | Length of each string | `(strlen "hello")` → `5` |
+| `upper` | unary | Uppercase string or symbol atoms/vectors; lazy/DAG for vectors | `(upper ["ab" "Cd"])` → `["AB" "CD"]` |
+| `lower` | unary | Lowercase string or symbol atoms/vectors; lazy/DAG for vectors | `(lower 'AbC)` → `'abc` |
+| `trim` | unary | Strip leading/trailing whitespace; lazy/DAG for vectors | `(trim "  abc  ")` → `"abc"` |
+| `substr` | variadic | Substring by 1-based start and length; lazy/DAG for vectors | `(substr "abcdef" 2 3)` → `"bcd"` |
+| `replace` | variadic | Replace all occurrences; lazy/DAG for vectors | `(replace "a-b" "-" "_")` → `"a_b"` |
 | `like` | binary | Glob pattern match: `*` any, `?` one, `[abc]`/`[a-z]`/`[!abc]` char class | `(like "hello" "hel*")` → `true` |
 | `concat` | binary | Concatenate two strings or vectors | `(concat "hello" " world")` → `"hello world"` |
 | `format` | variadic | Format values as string (% is placeholder) | `(format "x=%" 42)` → `"x=42"` |
 
 !!! note "Note"
-    The executor supports additional string opcodes (UPPER, LOWER, TRIM, SUBSTR, REPLACE, CONCAT) at the DAG level. All string transformations propagate nulls: null input rows produce null output rows.
+    String transforms are available as direct builtins and use the same DAG opcodes inside `select`/`update`. All string transformations propagate nulls: null input rows produce null output rows.
 
 ## Date & Time
 
@@ -294,7 +396,7 @@ Cross-temporal comparisons are supported: dates, times, and timestamps are all c
 |---|---|---|---|
 | `type` | unary | Get type name of a value | `(type 42)` → `i64` |
 | `as` | binary | Cast value to another type | `(as 'i64 "42")` → `42` |
-| `nil?` | unary | Test if value is null | `(nil? x)` |
+| `nil?` | unary | Test if value is null; element-wise inside query expressions | `(nil? x)` |
 | `rc` | unary | Reference count of an object | `(rc x)` → `1` |
 | `guid` | unary | Generate a vector of N GUIDs (`(guid 0)` → `[]`) | `(guid 1)` |
 
@@ -432,7 +534,7 @@ Low-level API for building and evaluating Datalog programs directly, bypassing t
 | `dl-stratify` | unary | Compute strata for the program | `(dl-stratify prog)` |
 | `dl-eval` | unary | Evaluate program to fixpoint | `(dl-eval prog)` |
 | `dl-query` | binary | Query a derived or base relation | `(dl-query prog 'edge)` |
-| `dl-provenance` | binary | Get derivation tracking (if available) | `(dl-provenance prog 'rel)` |
+| `dl-provenance` | binary | Reserved provenance hook; currently returns `domain: not available` | `(dl-provenance prog 'rel)` |
 
 ```lisp
 ; Low-level Datalog program

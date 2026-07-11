@@ -1003,7 +1003,7 @@
 ;;   wm5_va (I32, no nulls): row0 is 2147483647i + 1i, which WRAPS to
 ;;     -2147483648 (INT32_MIN) — a real, non-null data value per the
 ;;     documented I16/I32 wraparound exception (src/vec/validate.c
-;;     invariant 16.4: narrow-int sentinels are NOT reserved because
+;;     null handling: narrow-int sentinels are NOT reserved because
 ;;     modulo arithmetic legitimately produces them; see also
 ;;     test/rfl/expr/narrow_binary.rfl's `(+ [2147483647i] [1i]) --
 ;;     [-2147483648]`).  It is chosen because it exactly equals
@@ -1120,4 +1120,3 @@
 (at (meta wm_e0_r9) 'len) -- 9
 (count (at wm_e0_r9 'a01)) -- 0
 (count (at wm_e0_r9 'a09)) -- 0
-

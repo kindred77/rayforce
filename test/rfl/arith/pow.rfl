@@ -36,7 +36,10 @@
 (nil? (pow 0Nl 2)) -- true
 (nil? (pow 2 0Nl)) -- true
 (nil? (pow 0Nf 2.0)) -- true
+(nil? (pow 0Nf 0)) -- true
 (type (pow 0Nl 2)) -- 'f64
+(nil? (at (pow (as 'F64 [0Nf 2.0]) [0 0]) 0)) -- true
+(at (pow (as 'F64 [0Nf 2.0]) [0 0]) 1) -- 1.0
 
 ;; ─── atomic broadcast over a vector — left ─────────────────────────
 ;; (pow [1 2 3 4] 2) → [1.0 4.0 9.0 16.0]
@@ -63,11 +66,18 @@
 (count A) -- (sum (< (abs (- (pow (pow A 2) 0.5) A)) 0.001))
 
 ;; ─── usage with column expressions inside select ──────────────────
-;; Per-row pow inside a select projection (covers DAG vec atomic
-;; broadcast through the eval-level path).
+;; Per-row pow inside select projection/WHERE (covers DAG lowering).
 (set Tp (table [v] (list [1.0 2.0 3.0 4.0])))
 (at (at (select {sq: (pow v 2) from: Tp}) 'sq) 0) -- 1.0
 (at (at (select {sq: (pow v 2) from: Tp}) 'sq) 3) -- 16.0
+(count (select {from: Tp where: (> (pow v 2) 8.0)})) -- 2
+(sum (at (select {sq: (pow v 2) from: Tp where: (> (pow v 2) 3.0)}) 'sq)) -- 29.0
+(nil? (at (at (select {p: (pow 0Nf 0) from: Tp}) 'p) 0)) -- true
+
+;; Fused query path must propagate null even when exponent is zero.
+(set Tpn (table [v e] (list (as 'F64 [0Nf 2.0]) [0 0])))
+(nil? (at (at (select {p: (pow v e) from: Tpn}) 'p) 0)) -- true
+(at (at (select {p: (pow v e) from: Tpn}) 'p) 1) -- 1.0
 
 ;; ─── type errors ───────────────────────────────────────────────────
 ;; non-numeric base

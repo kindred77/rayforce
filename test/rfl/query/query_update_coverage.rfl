@@ -20,9 +20,8 @@
 ;;     RAY_LIST is a container type not supported by ray_vec_new.
 
 ;; ────────────────────────────────────────────────────────────────────
-;; WHERE-branch update: eval fallback when DAG compilation fails (lines 8500-8509)
-;; (pow val 2) is NOT in resolve_binary_dag → compile_expr_dag returns NULL
-;; → fallback at 8499: push table cols to scope, ray_eval((pow val 2))
+;; WHERE-branch update: DAG expression update with cross-type writeback
+;; (pow val 2) lowers to OP_POW and returns F64.
 ;; Result is F64 (pow returns float) → cross-type I64←F64 update at 8517
 ;; ────────────────────────────────────────────────────────────────────
 (set Tu_pow (table [id val] (list [1 2 3 4] [2 3 4 5])))
@@ -194,11 +193,11 @@
 (at (at Tf64atom_u 'val) 1) -- 42.0
 
 ;; ────────────────────────────────────────────────────────────────────
-;; No-WHERE update: fallback eval when DAG compilation fails (lines 8787-8796)
-;; (pow val 2) NOT in resolve_binary_dag → expr_vec=NULL → fallback eval
+;; No-WHERE update: DAG expression update (lines 8787-8796)
+;; (pow val 2) lowers to OP_POW and returns F64.
 ;; ────────────────────────────────────────────────────────────────────
 (set Tpow_nw (table [id val] (list [1 2 3] [2.0 3.0 4.0])))
-;; Update val (F64) with pow(val,2) — forces eval fallback in no-WHERE path
+;; Update val (F64) with pow(val,2)
 (set Tpow_nw_u (update {val: (pow val 2) from: Tpow_nw}))
 (count Tpow_nw_u) -- 3
 (at (at Tpow_nw_u 'val) 0) -- 4.0
@@ -457,7 +456,7 @@
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; groups_to_pair_list: I32/BOOL/F64 key types (lines 131-137)
-;; via update {agg by: key}: ray_group_fn called on I32/BOOL/F64 column
+;; via update {agg by: key}: ray_group_indices_fn called on I32/BOOL/F64 column
 ;; returns dict with keys_vec of that type → groups_to_pair_list hits
 ;; the corresponding switch case at lines 131-133 (I32), 135-136 (BOOL),
 ;; 137 (F64).

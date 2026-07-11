@@ -101,8 +101,8 @@ The pattern is: sort descending with `xdesc`, then filter with a threshold. For 
 **Problem:** Compute a cumulative sum over a vector of values.
 
 ```lisp
-; scan applies a function cumulatively
-(scan + [3 1 4 1 5 9 2 6])
+; sums is the DAG-backed running sum
+(sums [3 1 4 1 5 9 2 6])
 ```
 
 ```text
@@ -111,14 +111,27 @@ The pattern is: sort descending with `xdesc`, then filter with a threshold. For 
 
 ```lisp
 ; Running product
-(scan * [1 2 3 4 5])
+(prds [1 2 3 4 5])
 ```
 
 ```text
 [1 2 6 24 120]
 ```
 
-The `scan` function takes a binary function and a vector, returning a vector of the same length where each element is the cumulative application of the function. The related `fold` function returns only the final accumulated value.
+```lisp
+; Fixed trailing window: current row plus the previous two rows
+(msum 3 [3 1 4 1 5 9])
+(mavg 3 [3 1 4 1 5 9])
+(mdev 3 [3 1 4 1 5 9])
+```
+
+```text
+[3 4 8 6 10 15]
+[3.0 2.0 2.6666666667 2.0 3.3333333333 5.0]
+[0.0 1.0 1.2472191289 1.4142135624 1.6996731712 3.2659863237]
+```
+
+Use the specialized running verbs (`sums`, `prds`, `avgs`, `mins`, `maxs`) and moving-window verbs (`msum`, `mavg`, `mmin`, `mmax`, `mcount`, `mvar`, `mdev`) for common analytics paths. Constant-window calls lower to DAG vector kernels, run with morsel-based execution, and poll cancellation during execution. The generic `scan` function is still available when the accumulator is a custom function. The related `fold` function returns only the final accumulated value.
 
 ## 4. Pivoting (Cross-Tabulation) { #pivot }
 

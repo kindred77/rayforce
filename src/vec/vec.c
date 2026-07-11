@@ -103,6 +103,9 @@ static inline bool vec_any_nulls(const ray_t* v) {
  * reads them.  Detect rc>1 and copy the saved pointers via
  * ray_index_retain_saved instead of moving them out. */
 static inline void vec_drop_index_inplace(ray_t* v) {
+    /* Any payload/length mutation invalidates the physical-order promise,
+     * even when no accelerator index is attached. */
+    v->attrs &= (uint8_t)~RAY_ATTR_SORTED;
     if (!(v->attrs & RAY_ATTR_HAS_INDEX)) return;
     ray_t* idx = v->index;
     ray_index_t* ix = ray_index_payload(idx);
@@ -1008,7 +1011,7 @@ static ray_t* str_pool_cow(ray_t* vec) {
     if (pool_rc <= 1 && vec->str_pool->mmod == 0) return vec;
 
     size_t pool_data_size = vec->str_pool->mmod == 0
-        ? ((size_t)1 << vec->str_pool->order) - 32
+        ? ray_block_data_bytes(vec->str_pool)
         : (vec->str_pool->len > 64 ? (size_t)vec->str_pool->len : 64);
     ray_t* new_pool = ray_alloc(pool_data_size);
     if (!new_pool || RAY_IS_ERR(new_pool)) return NULL;
@@ -1079,9 +1082,12 @@ ray_t* ray_str_vec_append(ray_t* vec, const char* s, size_t len) {
         }
 
         int64_t pool_used = vec->str_pool->len;
-        size_t pool_cap = ((size_t)1 << vec->str_pool->order) - 32;
-        if ((size_t)pool_used + len > pool_cap) {
-            size_t need = (size_t)pool_used + len;
+        if (pool_used < 0 || (uint64_t)pool_used > UINT32_MAX ||
+            (uint64_t)len > UINT32_MAX - (uint64_t)pool_used)
+            goto fail_range;
+        size_t pool_cap = ray_block_data_bytes(vec->str_pool);
+        size_t need = (size_t)pool_used + len;
+        if (need > pool_cap) {
             size_t new_cap = pool_cap;
             if (new_cap == 0) new_cap = 256;
             while (new_cap < need) {
@@ -1093,7 +1099,6 @@ ray_t* ray_str_vec_append(ray_t* vec, const char* s, size_t len) {
             vec->str_pool = np;
         }
 
-        if ((uint64_t)pool_used > UINT32_MAX) goto fail_range;
         pool_off = pool_used;
     }
 
@@ -1163,6 +1168,10 @@ ray_t* ray_str_vec_from_parts(const char* const* ptrs, const uint32_t* lens,
     size_t total = 0;
     for (int64_t i = 0; i < n; i++) {
         if ((!nulls || !nulls[i]) && lens[i] > RAY_STR_INLINE_MAX) {
+            if (total > UINT32_MAX - lens[i]) {
+                ray_release(v);
+                return ray_error("range", "str_vec_from_parts: pool offset exceeds %lld bytes", (long long)UINT32_MAX);
+            }
             total += lens[i];
         }
     }
@@ -1193,7 +1202,8 @@ ray_t* ray_str_vec_from_parts(const char* const* ptrs, const uint32_t* lens,
             d->len = lens[i];
             if (lens[i] > 0) memcpy(d->data, ptrs[i], lens[i]);
         } else {
-            if ((uint64_t)pool_used > UINT32_MAX) {
+            if ((uint64_t)pool_used > UINT32_MAX ||
+                (uint64_t)lens[i] > UINT32_MAX - (uint64_t)pool_used) {
                 ray_release(v);
                 return ray_error("range", "str_vec_from_parts: pool offset exceeds %lld bytes", (long long)UINT32_MAX);
             }
@@ -1284,9 +1294,12 @@ ray_t* ray_str_vec_set(ray_t* vec, int64_t idx, const char* s, size_t len) {
 
         /* Grow pool if needed */
         int64_t pool_used = vec->str_pool->len;
-        size_t pool_cap = ((size_t)1 << vec->str_pool->order) - 32;
-        if ((size_t)pool_used + len > pool_cap) {
-            size_t need = (size_t)pool_used + len;
+        if (pool_used < 0 || (uint64_t)pool_used > UINT32_MAX ||
+            (uint64_t)len > UINT32_MAX - (uint64_t)pool_used)
+            goto fail_range;
+        size_t pool_cap = ray_block_data_bytes(vec->str_pool);
+        size_t need = (size_t)pool_used + len;
+        if (need > pool_cap) {
             size_t new_cap = pool_cap;
             if (new_cap == 0) new_cap = 256;
             while (new_cap < need) {
@@ -1297,8 +1310,6 @@ ray_t* ray_str_vec_set(ray_t* vec, int64_t idx, const char* s, size_t len) {
             if (!np || RAY_IS_ERR(np)) goto fail_oom;
             vec->str_pool = np;
         }
-
-        if ((uint64_t)pool_used > UINT32_MAX) goto fail_range;
 
         /* Pool alloc succeeded — now safe to modify the element */
         if (!ray_str_is_inline(elem) && elem->len > 0 && vec->str_pool) {

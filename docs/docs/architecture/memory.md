@@ -45,7 +45,7 @@ typedef union ray_t {
 
 | Bytes | Field | Purpose |
 |---|---|---|
-| 0-15 | `nullmap[16]` | Inline null bitmap for vectors with up to 128 elements. For longer vectors, `ext_nullmap` points to a separate bitmap vector. For `RAY_SYM` columns, `sym_dict` points to the dictionary. For `RAY_STR` columns, `str_pool` points to the string pool. For slices, stores parent pointer and offset. |
+| 0-15 | `aux[16]` | Type-specific auxiliary union. For `RAY_SYM` columns this can point to the symbol domain, for `RAY_STR` columns to the string pool, for slices to parent/offset metadata, and for allocator free blocks to free-list pointers. Vector null state lives in type-correct sentinel values plus the `RAY_ATTR_HAS_NULLS` hint, not in a separate bitmap. |
 | 16 | `mmod` | Memory mode: 0 = heap-allocated, 1 = file memory-mapped |
 | 17 | `order` | Buddy allocator block order. Block size = 2^order bytes. Range: 6..38 (64 bytes to 256 GB). |
 | 18 | `type` | Signed byte: negative = atom, 0 = LIST, 1-13 = vector types (BOOL through STR), 98 = TABLE, 99 = DICT, 100-103 = function types, 127 = ERROR |

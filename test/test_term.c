@@ -848,6 +848,44 @@ static test_result_t test_term_redraw_close_bracket(void) {
     PASS();
 }
 
+/* Redraw marks an unmatched delimiter in red when no cursor-local pair is
+ * available. */
+static test_result_t test_term_redraw_unmatched_bracket(void) {
+    ray_t* block = ray_alloc(sizeof(ray_term_t));
+    if (!block) FAIL("ray_alloc failed");
+    ray_term_t* t = (ray_term_t*)ray_data(block);
+    memset(t, 0, sizeof(*t));
+    t->_block = block;
+    t->term_width = 80;
+    t->term_height = 24;
+    t->prompt_len = 2;
+    t->last_total_rows = 1;
+    ray_hist_create(&t->hist);
+
+    const char* src = "(abc";
+    int32_t slen = (int32_t)strlen(src);
+    memcpy(t->buf, src, (size_t)slen);
+    t->buf_len = slen;
+    t->buf_pos = slen;
+
+    char path[256], buf[4096];
+    int saved = capture_begin(path, sizeof path);
+    if (saved < 0) {
+        ray_hist_destroy(&t->hist);
+        ray_free(block);
+        FAIL("capture setup failed");
+    }
+    ray_term_redraw(t);
+    int32_t n = capture_end(saved, path, buf, sizeof buf);
+    int saw_red = strstr(buf, "\033[1;31m") != NULL;
+
+    ray_hist_destroy(&t->hist);
+    ray_free(block);
+    TEST_ASSERT_FMT(n > 0, "no redraw output");
+    TEST_ASSERT_FMT(saw_red, "missing red unmatched bracket highlight");
+    PASS();
+}
+
 /* Redraw with a multiline buffer chooses the continuation prompt branch. */
 static test_result_t test_term_redraw_multiline_prompt(void) {
     ray_t* block = ray_alloc(sizeof(ray_term_t));
@@ -926,6 +964,16 @@ static test_result_t test_term_collect_completions_env(void) {
     PASS();
 }
 
+static void bind_test_i64_table(const char* table_name, const char* col_name) {
+    int64_t n_col = ray_sym_intern(col_name, strlen(col_name));
+    int64_t v[] = { 1 };
+    ray_t* col = ray_vec_from_raw(RAY_I64, v, 1);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, n_col, col);
+    ray_release(col);
+    ray_env_bind(ray_sym_intern(table_name, strlen(table_name)), tbl);
+}
+
 /* Verify the column-name source: when buf contains "from: NAME", and NAME
  * is bound to a table in the env, completions include matching column
  * names.  Exercises comp_find_from_table + the column iteration path. */
@@ -958,6 +1006,7 @@ static test_result_t test_term_collect_completions_table_columns(void) {
     int32_t slen = (int32_t)strlen(sql);
     memcpy(t->buf, sql, (size_t)slen);
     t->buf_len = slen;
+    t->buf_pos = slen;
 
     ray_term_collect_completions(t, "ucol_a", 6);
     int seen_alpha = 0;
@@ -973,6 +1022,73 @@ static test_result_t test_term_collect_completions_table_columns(void) {
 
     ray_hist_destroy(&t->hist);
     ray_free(block);
+    PASS();
+}
+
+static test_result_t test_term_collect_completions_quoted_from(void) {
+    ray_t* block = ray_alloc(sizeof(ray_term_t));
+    if (!block) FAIL("ray_alloc failed");
+    ray_term_t* t = (ray_term_t*)ray_data(block);
+    memset(t, 0, sizeof(*t));
+    t->_block = block;
+    ray_hist_create(&t->hist);
+
+    bind_test_i64_table("qcol_table", "qcol_alpha");
+
+    const char* sql = "(update {from: 'qcol_table where: (> qcol_a 0)})";
+    int32_t slen = (int32_t)strlen(sql);
+    memcpy(t->buf, sql, (size_t)slen);
+    t->buf_len = slen;
+    const char* prefix = strstr(sql, "qcol_a");
+    t->buf_pos = (int32_t)(prefix - sql) + 6;
+
+    ray_term_collect_completions(t, "qcol_a", 6);
+    int seen_alpha = 0;
+    for (int32_t i = 0; i < t->comp_count; i++) {
+        if (strcmp(t->comp_items[i], "qcol_alpha") == 0) seen_alpha = 1;
+    }
+
+    ray_hist_destroy(&t->hist);
+    ray_free(block);
+    TEST_ASSERT_FMT(seen_alpha,
+                    "expected quoted from: table column completion; got %d",
+                    t->comp_count);
+    PASS();
+}
+
+static test_result_t test_term_collect_completions_query_scope(void) {
+    ray_t* block = ray_alloc(sizeof(ray_term_t));
+    if (!block) FAIL("ray_alloc failed");
+    ray_term_t* t = (ray_term_t*)ray_data(block);
+    memset(t, 0, sizeof(*t));
+    t->_block = block;
+    ray_hist_create(&t->hist);
+
+    bind_test_i64_table("scope_old", "same_old");
+    bind_test_i64_table("scope_new", "same_new");
+
+    const char* sql =
+        "(select {from: scope_old where: (> same_ 0)}) "
+        "(select {from: scope_new where: (> same_ 0)})";
+    int32_t slen = (int32_t)strlen(sql);
+    memcpy(t->buf, sql, (size_t)slen);
+    t->buf_len = slen;
+    const char* second = strstr(sql, "scope_new");
+    const char* prefix = strstr(second, "same_");
+    t->buf_pos = (int32_t)(prefix - sql) + 5;
+
+    ray_term_collect_completions(t, "same_", 5);
+    int seen_old = 0;
+    int seen_new = 0;
+    for (int32_t i = 0; i < t->comp_count; i++) {
+        if (strcmp(t->comp_items[i], "same_old") == 0) seen_old = 1;
+        if (strcmp(t->comp_items[i], "same_new") == 0) seen_new = 1;
+    }
+
+    ray_hist_destroy(&t->hist);
+    ray_free(block);
+    TEST_ASSERT_FMT(seen_new, "expected scoped table column completion");
+    TEST_ASSERT_FMT(!seen_old, "completion used the earlier query's table");
     PASS();
 }
 
@@ -1360,6 +1476,38 @@ static test_result_t test_term_feed_ctrl_a_e(void) {
     PASS();
 }
 
+/* Ctrl-B/Ctrl-F mirror left/right; Ctrl-L redraws without losing input;
+ * Ctrl-T transposes the surrounding characters. */
+static test_result_t test_term_feed_ctrl_b_f_l_t(void) {
+    ray_term_t* t;
+    ray_t* block = term_block_new(&t);
+    if (!block) FAIL("term_block_new failed");
+
+    feed_str(t, "abcd");
+    TEST_ASSERT_EQ_I(t->buf_pos, 4);
+
+    feed_byte(t, KEYCODE_CTRL_B);
+    TEST_ASSERT_EQ_I(t->buf_pos, 3);
+    feed_byte(t, KEYCODE_CTRL_F);
+    TEST_ASSERT_EQ_I(t->buf_pos, 4);
+
+    feed_byte(t, KEYCODE_CTRL_T);
+    TEST_ASSERT_EQ_I(t->buf_len, 4);
+    TEST_ASSERT_EQ_I(t->buf_pos, 4);
+    TEST_ASSERT_FMT(memcmp(t->buf, "abdc", 4) == 0,
+                    "Ctrl-T expected abdc, got '%.*s'", t->buf_len, t->buf);
+
+    feed_byte(t, KEYCODE_CTRL_L);
+    TEST_ASSERT_EQ_I(t->buf_len, 4);
+    TEST_ASSERT_EQ_I(t->buf_pos, 4);
+    TEST_ASSERT_FMT(memcmp(t->buf, "abdc", 4) == 0,
+                    "Ctrl-L should preserve input, got '%.*s'",
+                    t->buf_len, t->buf);
+
+    term_block_free(block, t);
+    PASS();
+}
+
 /* Ctrl-K kills from cursor to end of line. */
 static test_result_t test_term_feed_ctrl_k(void) {
     ray_term_t* t;
@@ -1418,6 +1566,38 @@ static test_result_t test_term_feed_ctrl_w(void) {
     /* No-op at empty buf */
     feed_byte(t, KEYCODE_CTRL_W);
     TEST_ASSERT_EQ_I(t->buf_len, 0);
+
+    term_block_free(block, t);
+    PASS();
+}
+
+/* Alt/Meta word operations: ESC-b/f move by word, ESC-d deletes the
+ * next word, and ESC-Backspace deletes the previous word. */
+static test_result_t test_term_feed_alt_word_ops(void) {
+    ray_term_t* t;
+    ray_t* block = term_block_new(&t);
+    if (!block) FAIL("term_block_new failed");
+
+    feed_str(t, "one two three");
+    feed_byte(t, KEYCODE_ESCAPE); feed_byte(t, 'b');
+    TEST_ASSERT_EQ_I(t->buf_pos, 8);
+    feed_byte(t, KEYCODE_ESCAPE); feed_byte(t, 'b');
+    TEST_ASSERT_EQ_I(t->buf_pos, 4);
+    feed_byte(t, KEYCODE_ESCAPE); feed_byte(t, 'f');
+    TEST_ASSERT_EQ_I(t->buf_pos, 7);
+
+    feed_byte(t, KEYCODE_ESCAPE); feed_byte(t, 'd');
+    TEST_ASSERT_EQ_I(t->buf_len, 7);
+    TEST_ASSERT_FMT(memcmp(t->buf, "one two", 7) == 0,
+                    "Alt-D expected 'one two', got '%.*s'",
+                    t->buf_len, t->buf);
+
+    t->buf_pos = t->buf_len;
+    feed_byte(t, KEYCODE_ESCAPE); feed_byte(t, KEYCODE_BACKSPACE);
+    TEST_ASSERT_EQ_I(t->buf_len, 4);
+    TEST_ASSERT_FMT(memcmp(t->buf, "one ", 4) == 0,
+                    "Alt-Backspace expected 'one ', got '%.*s'",
+                    t->buf_len, t->buf);
 
     term_block_free(block, t);
     PASS();
@@ -1617,6 +1797,43 @@ static test_result_t test_term_feed_csi_delete(void) {
     PASS();
 }
 
+/* Modern xterm-style modified CSI sequences: Ctrl/Alt-arrow word motion,
+ * Home/End numbered variants, and modified Delete word deletion. */
+static test_result_t test_term_feed_modified_csi_keys(void) {
+    ray_term_t* t;
+    ray_t* block = term_block_new(&t);
+    if (!block) FAIL("term_block_new failed");
+
+    feed_str(t, "alpha beta gamma");
+    feed_byte(t, 0x1b); feed_byte(t, '['); feed_byte(t, '1');
+    feed_byte(t, ';'); feed_byte(t, '3'); feed_byte(t, 'D');
+    TEST_ASSERT_EQ_I(t->buf_pos, 11);
+
+    feed_byte(t, 0x1b); feed_byte(t, '['); feed_byte(t, '1');
+    feed_byte(t, ';'); feed_byte(t, '5'); feed_byte(t, 'D');
+    TEST_ASSERT_EQ_I(t->buf_pos, 6);
+
+    feed_byte(t, 0x1b); feed_byte(t, '['); feed_byte(t, '1');
+    feed_byte(t, ';'); feed_byte(t, '3'); feed_byte(t, 'C');
+    TEST_ASSERT_EQ_I(t->buf_pos, 10);
+
+    feed_byte(t, 0x1b); feed_byte(t, '['); feed_byte(t, '1'); feed_byte(t, '~');
+    TEST_ASSERT_EQ_I(t->buf_pos, 0);
+    feed_byte(t, 0x1b); feed_byte(t, '['); feed_byte(t, '4'); feed_byte(t, '~');
+    TEST_ASSERT_EQ_I(t->buf_pos, 16);
+
+    t->buf_pos = 6;
+    feed_byte(t, 0x1b); feed_byte(t, '['); feed_byte(t, '3');
+    feed_byte(t, ';'); feed_byte(t, '3'); feed_byte(t, '~');
+    TEST_ASSERT_EQ_I(t->buf_len, 12);
+    TEST_ASSERT_FMT(memcmp(t->buf, "alpha  gamma", 12) == 0,
+                    "modified Delete expected 'alpha  gamma', got '%.*s'",
+                    t->buf_len, t->buf);
+
+    term_block_free(block, t);
+    PASS();
+}
+
 /* Bare ESC followed by an unrecognised byte returns to normal state.  No
  * crash, no change to buf. */
 static test_result_t test_term_feed_bare_escape(void) {
@@ -1653,11 +1870,12 @@ static test_result_t test_term_feed_unknown_csi(void) {
     TEST_ASSERT_EQ_I(t->esc_state, 0);
     TEST_ASSERT_EQ_I(t->buf_len, 1);  /* original 'x' untouched */
 
-    /* Long unknown CSI — overflow guard kicks in after >8 bytes */
+    /* Long unknown CSI — overflow guard kicks in when the CSI parameter
+     * scratch buffer fills. */
     feed_byte(t, 0x1b); feed_byte(t, '[');
     feed_byte(t, '?'); /* enters state 5 */
     TEST_ASSERT_EQ_I(t->esc_state, 5);
-    for (int i = 0; i < 12; i++) feed_byte(t, '0');
+    for (int i = 0; i < (int)sizeof(t->esc_buf); i++) feed_byte(t, '0');
     TEST_ASSERT_EQ_I(t->esc_state, 0);
 
     term_block_free(block, t);
@@ -1727,6 +1945,47 @@ static test_result_t test_term_feed_tab_cycling(void) {
     TEST_ASSERT_EQ_I(t->comp_cycling, 0);
 
     term_block_free(block, t);
+    PASS();
+}
+
+/* First Tab in a multi-candidate set redraws a compact labelled candidate
+ * strip and highlights the selected item. */
+static test_result_t test_term_feed_tab_completion_menu(void) {
+    ray_term_t* t;
+    ray_t* block = term_block_new(&t);
+    if (!block) FAIL("term_block_new failed");
+
+    ray_hist_add(&t->hist, "uniqaa one", 10);
+    ray_hist_add(&t->hist, "uniqbb two", 10);
+    feed_str(t, "uniq");
+    TEST_ASSERT_FMT(t->comp_count >= 2,
+                    "expected >=2 completions before Tab, got %d",
+                    t->comp_count);
+
+    char path[256], cap[8192];
+    int saved = capture_begin(path, sizeof path);
+    if (saved < 0) {
+        term_block_free(block, t);
+        FAIL("capture setup failed");
+    }
+    t->input[0] = KEYCODE_TAB;
+    ray_t* r = ray_term_feed(t);
+    fflush(stdout);
+    int32_t n = capture_end(saved, path, cap, sizeof cap);
+
+    int saw_reverse = strstr(cap, "\033[7m") != NULL;
+    int saw_hist = strstr(cap, "[hist]") != NULL;
+    int saw_candidate = strstr(cap, "uniqaa") != NULL ||
+                        strstr(cap, "uniqbb") != NULL;
+    int cycling = t->comp_cycling;
+
+    term_block_free(block, t);
+    TEST_ASSERT_NULL(r);
+    TEST_ASSERT_FMT(n > 0, "no redraw output for completion menu");
+    TEST_ASSERT_EQ_I(cycling, 1);
+    TEST_ASSERT_FMT(saw_reverse, "completion menu missing selected highlight");
+    TEST_ASSERT_FMT(saw_hist, "completion menu missing history source label");
+    TEST_ASSERT_FMT(saw_candidate, "completion menu missing candidate text");
     PASS();
 }
 
@@ -2167,6 +2426,8 @@ const test_entry_t term_entries[] = {
       runtime_setup, runtime_teardown },
     { "term/redraw_close_bracket",      test_term_redraw_close_bracket,
       runtime_setup, runtime_teardown },
+    { "term/redraw_unmatched_bracket",  test_term_redraw_unmatched_bracket,
+      runtime_setup, runtime_teardown },
     { "term/redraw_multiline_prompt",   test_term_redraw_multiline_prompt,
       runtime_setup, runtime_teardown },
 
@@ -2174,6 +2435,10 @@ const test_entry_t term_entries[] = {
     { "term/completions_env",           test_term_collect_completions_env,
       runtime_setup, runtime_teardown },
     { "term/completions_table_cols",    test_term_collect_completions_table_columns,
+      runtime_setup, runtime_teardown },
+    { "term/completions_quoted_from",   test_term_collect_completions_quoted_from,
+      runtime_setup, runtime_teardown },
+    { "term/completions_query_scope",   test_term_collect_completions_query_scope,
       runtime_setup, runtime_teardown },
     { "term/completions_history",       test_term_collect_completions_history,
       runtime_setup, runtime_teardown },
@@ -2208,11 +2473,15 @@ const test_entry_t term_entries[] = {
       runtime_setup, runtime_teardown },
     { "term/feed_ctrl_a_e",             test_term_feed_ctrl_a_e,
       runtime_setup, runtime_teardown },
+    { "term/feed_ctrl_b_f_l_t",         test_term_feed_ctrl_b_f_l_t,
+      runtime_setup, runtime_teardown },
     { "term/feed_ctrl_k",               test_term_feed_ctrl_k,
       runtime_setup, runtime_teardown },
     { "term/feed_ctrl_u",               test_term_feed_ctrl_u,
       runtime_setup, runtime_teardown },
     { "term/feed_ctrl_w",               test_term_feed_ctrl_w,
+      runtime_setup, runtime_teardown },
+    { "term/feed_alt_word_ops",         test_term_feed_alt_word_ops,
       runtime_setup, runtime_teardown },
     { "term/feed_ctrl_d",               test_term_feed_ctrl_d,
       runtime_setup, runtime_teardown },
@@ -2229,6 +2498,8 @@ const test_entry_t term_entries[] = {
       runtime_setup, runtime_teardown },
     { "term/feed_csi_delete",           test_term_feed_csi_delete,
       runtime_setup, runtime_teardown },
+    { "term/feed_modified_csi",         test_term_feed_modified_csi_keys,
+      runtime_setup, runtime_teardown },
     { "term/feed_bare_escape",          test_term_feed_bare_escape,
       runtime_setup, runtime_teardown },
     { "term/feed_unknown_csi",          test_term_feed_unknown_csi,
@@ -2237,6 +2508,8 @@ const test_entry_t term_entries[] = {
       runtime_setup, runtime_teardown },
 
     { "term/feed_tab_cycle",            test_term_feed_tab_cycling,
+      runtime_setup, runtime_teardown },
+    { "term/feed_tab_menu",             test_term_feed_tab_completion_menu,
       runtime_setup, runtime_teardown },
     { "term/feed_tab_single",           test_term_feed_tab_single_ghost,
       runtime_setup, runtime_teardown },

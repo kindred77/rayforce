@@ -16,7 +16,7 @@ Process-level introspection (build, memory, host info) and command-style operati
 | [`.sys.prof`](#sys-prof) | variadic | — | Last profiled query's per-step statistics as a table. |
 | [`.sys.querylog`](#sys-querylog) | variadic | — | Ambient per-query statistics ring as a table. |
 | [`.sys.querylog.enable`](#sys-querylog-enable) | variadic | restricted | Toggle query-statistics logging. |
-| [`.sys.gc`](#sys-gc) | variadic | — | Garbage-collect hint (no-op; returns 0). |
+| [`.sys.gc`](#sys-gc) | variadic | — | Run allocator maintenance and return `0`. |
 | [`.sys.env`](#sys-env) | variadic | — | Count or list of globally bound names. |
 | [`.sys.exec`](#sys-exec) | unary | restricted | Run a shell command; return its exit code. |
 | [`.sys.cmd`](#sys-cmd) | unary | restricted | Dispatch a colon-command string. |
@@ -209,7 +209,11 @@ The `-Q` startup flag is the equivalent for enabling logging from launch.
 
 ## `.sys.gc` { #sys-gc }
 
-Signature: `(.sys.gc)`. No-op stub — Rayforce uses reference counting, so there's no global collector to kick. Kept as a registered builtin so existing scripts that call it don't error. Returns `0`.
+Signature: `(.sys.gc)`. Runs allocator maintenance: drains cross-thread frees,
+flushes slab caches, coalesces free buddy blocks, reclaims empty oversized
+pools, and incrementally returns aged free pages to the operating system.
+Rayforce values remain deterministically reference-counted—this is allocator
+GC, not a tracing object collector. Returns `0`.
 
 ## `.sys.env` { #sys-env }
 
@@ -237,7 +241,7 @@ Signature: `(.sys.cmd "name args")`. Parses a colon-style command name (without 
 
 `clear`, `help`, and `q` are REPL-only — invoking them from a script returns a `domain` error rather than silently no-op'ing.
 
-```lisp
+```text
 (.sys.cmd "listen 5000")   ;; => listener id
 (.sys.cmd "env")           ;; => binding count
 (.sys.cmd "timeit 1")      ;; => 1   (profiler enabled)
@@ -249,7 +253,7 @@ Signature: `(.sys.listen port)`. Binds an IPC listener on `port` using the runti
 
 Errors: `type` (port not an int / not parseable from string), `domain` (port outside `[1, 65535]`), `nyi` (no main loop — embedded library without a poll), `io` (`bind` failure, e.g. port already in use).
 
-```lisp
+```text
 (.sys.listen 5000)
 ;; => 12  (listener id)
 ```
@@ -260,7 +264,7 @@ Signature: `(.sys.timeit [flag])`. Toggles the per-expression profiler. Calling 
 
 ```lisp
 (.sys.timeit 1)   ;; enable profiling
-(select {from: trades by: sym total: (sum qty)})
+(sum (til 1000))
 ;; (timings printed for each subexpression)
 (.sys.timeit 0)   ;; disable
 ```

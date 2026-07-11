@@ -3,7 +3,7 @@
 Persist and reload tables. Rayforce stores tables in two on-disk shapes:
 
 - **Splayed**: one directory per table, one file per column, plus a `.d` schema file and a `.sym` symbol-table file. The standard layout for a single-table dataset.
-- **Partitioned (parted)**: a database root containing one subdirectory per partition (date or other numeric/dotted name); each partition contains splayed-style table directories. A single shared `.sym` file sits at the root. The query optimizer prunes partitions when predicates select on the virtual `MAPCOMMON` partition column.
+- **Partitioned (parted)**: a database root containing one subdirectory per partition (date or other numeric/dotted name); each partition contains splayed-style table directories. A single shared `.sym` file sits at the root. The query optimizer can prune partitions when predicates select on the virtual `MAPCOMMON` partition column.
 
 The `get` builtins memory-map every column file — load is constant-time regardless of dataset size. `set` writes a table's columns to a splayed directory.
 
@@ -59,10 +59,16 @@ Signature: `(.db.parted.get "db_root" 'tbl_name)`. The table name **must** be a 
 Returns a single logical table assembled from every partition directory under `db_root/tbl_name/`. The result carries a virtual `MAPCOMMON` partition column derived from directory names, and every data column is a `RAY_PARTED_*` view over the segment files. Partition pruning kicks in automatically for `select` predicates on the virtual column.
 
 ```lisp
-(set trades (.db.parted.get "/data/db" 'trades))
+(set dbroot "/tmp/rayforce-parted-db")
+(set symfile (format "%/.sym" dbroot))
+(set jan15 (table [sym price qty] (list [AAPL GOOG] [150.5 2800.0] [100 50])))
+(set jan16 (table [sym price qty] (list [MSFT] [410.0] [75])))
+(.db.splayed.set (format "%/2024.01.15/trades" dbroot) jan15 symfile)
+(.db.splayed.set (format "%/2024.01.16/trades" dbroot) jan16 symfile)
+(set trades (.db.parted.get dbroot 'trades))
 
 ;; Partition prune — only the matching day's files are touched.
-(select {from: trades where: (= date 2024.01.15)})
+(select {from: trades where: (== date 2024.01.15)})
 ```
 
 Errors: `domain` (arity != 2 or `tbl_name` invalid), `type` (root not a string or name not a sym), `name` (sym ID unknown).
@@ -74,11 +80,11 @@ Signature: `(.db.parted.tables "db_root")`.
 Returns a sorted `sym` vector of the table names available under a parted `db_root` — the splayed-table subdirectories (those with a `.d` schema) of the **most recent** (last, sorted) partition, which reflects the current table set. Each name can be passed straight to `.db.parted.get`; nothing is loaded or bound by this call.
 
 ```lisp
-(.db.parted.tables "/data/db")
-;; => [`quotes `trades]
+(.db.parted.tables dbroot)
+;; => [`trades]
 
 ;; load each discovered table by name
-(map (fn [t] (.db.parted.get "/data/db" t)) (.db.parted.tables "/data/db"))
+(map (fn [t] (.db.parted.get dbroot t)) (.db.parted.tables dbroot))
 ```
 
 An existing root with no partition directories (a freshly-created or non-parted directory) lists **no tables** — the call returns an empty `sym` vector rather than failing.
@@ -93,7 +99,7 @@ For every table that appears in **any** partition, ensures **every** partition h
 
 Returns a sorted `sym` vector of the partition names that were filled (an **empty** vector when nothing needed fixing, so a repeat call is a no-op). Requires write permission on the db root.
 
-```lisp
+```text
 ;; trades exists in every day, but `news` was only added from 2024.01.10 on.
 (.db.parted.fill "/data/db")
 ;; => [`2024.01.01 `2024.01.02 … `2024.01.09]   ; days that gained an empty `news`

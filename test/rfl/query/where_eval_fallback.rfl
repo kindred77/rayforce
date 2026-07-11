@@ -1,0 +1,30 @@
+;; WHERE fallback for valid Rayfall expressions the DAG compiler cannot lower.
+;; The DAG is an optimization boundary only: if a predicate evaluates as a
+;; standalone expression with query columns bound, select/count should use it.
+
+(set Twef (table [v] (list [10 20 30 40])))
+
+;; `til` is a normal builtin but not a DAG op.  This used to fail with
+;; "WHERE predicate not supported by DAG compiler".
+(count (select {from: Twef where: (> 0 (til 4))})) -- 0
+(count (select {from: Twef where: (< 0 (til 4))})) -- 3
+(at (select {from: Twef where: (< (til 4) 2)}) 'v) -- [10 20]
+
+;; The fallback mask must feed the normal projection path.
+(at (select {x: (* v 2) from: Twef where: (< (til 4) 2)}) 'x) -- [20 40]
+
+;; Other non-DAG builtins are evaluated the same way.
+(count (select {from: Twef where: (take [true false] 4)})) -- 2
+
+;; Count shortcut should use the same fallback semantics.
+(count (select {from: Twef where: ((fn [x] (< x 2)) (til 4))})) -- 2
+
+;; Grouped selects consume the fallback mask through the existing filter/group
+;; pipeline.
+(set Tweg (table [k v] (list ['a 'b 'a 'b] [1 2 3 4])))
+(count (select {s: (sum v) by: k from: Tweg where: (< (til 4) 3)})) -- 2
+(sum (at (select {s: (sum v) by: k from: Tweg where: (< (til 4) 3)}) 's)) -- 6
+
+;; Fallback still validates WHERE shape.
+(select {from: Twef where: (< (til 3) 2)}) !- length
+(select {from: Twef where: (+ (til 4) 0)}) !- type

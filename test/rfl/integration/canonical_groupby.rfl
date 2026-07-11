@@ -1,7 +1,6 @@
-;; Canonical H2O groupby query coverage.
+;; Canonical groupby query coverage.
 ;;
-;; H2O canonical (h2oai/db-benchmark) groupby suite covers q1..q10.
-;; This file pins regression tests for the engine-level shapes that
+;; This file pins coverage for the engine-level shapes that
 ;; previously failed:
 ;;
 ;;   q6: median + multi-key by         — was nyi error
@@ -135,7 +134,7 @@
 ;; ─── Composite-key correctness regression for the atom_eq fix ─────
 ;;
 ;; The exact shape that exposed the atom_eq RAY_LIST bug — confirms
-;; that ray_group_fn now collapses structurally-equal LIST keys.
+;; that ray_group_indices_fn now collapses structurally-equal LIST keys.
 (count (group (list (list 1 2) (list 1 2) (list 3 4)))) -- 2
 ;; Three distinct compositions when truly distinct:
 (count (group (list (list 1 2) (list 2 1) (list 1 2)))) -- 2

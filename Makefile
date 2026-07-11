@@ -82,11 +82,10 @@ endif
 
 DEBUG_LDFLAGS   = -fsanitize=address,undefined
 
-# Extra build flavours (fuzz / tsan / hardened).  Each gets its OWN object
-# suffix (%.fuzz.o, %.tsan.o, %.hard.o) because the primary flavours compile
-# objects in place — mixing, say, thread-sanitized and address-sanitized
-# objects in one link is undefined at best.  The debug/release pair keeps
-# its historical in-place behaviour.
+# Extra build flavours.  Each non-debug flavour gets its OWN object suffix
+# because mixing optimized, address-sanitized, thread-sanitized, or hardened
+# objects in one link is undefined at best.  The default .o files are the
+# debug/test flavour because the harness also spawns ./$(TARGET).
 #
 # fuzz: coverage-guided fuzzing drivers under fuzz/ link against these
 #   objects.  -O1 (not -O0): ~5-10x more executions/sec with still-usable
@@ -127,6 +126,8 @@ TEST_SRC = $(wildcard test/*.c)
 TEST_OBJ = $(TEST_SRC:.c=.o)
 
 # Per-flavour object lists (see the flavour CFLAGS block above).
+REL_LIB_OBJ   = $(LIB_SRC:.c=.rel.o)
+REL_MAIN_OBJ  = $(MAIN_SRC:.c=.rel.o)
 FUZZ_LIB_OBJ  = $(LIB_SRC:.c=.fuzz.o)
 TSAN_LIB_OBJ  = $(LIB_SRC:.c=.tsan.o)
 TSAN_MAIN_OBJ = $(MAIN_SRC:.c=.tsan.o)
@@ -139,6 +140,7 @@ HARD_MAIN_OBJ = $(MAIN_SRC:.c=.hard.o)
 # them here would let a .d's first rule (e.g. `foo.o: ...`) become the
 # default goal, so bare `make` would build one object instead of `debug`.
 DEPS = $(LIB_OBJ:.o=.d) $(MAIN_OBJ:.o=.d) $(TEST_OBJ:.o=.d) \
+       $(REL_LIB_OBJ:.o=.d) $(REL_MAIN_OBJ:.o=.d) \
        $(FUZZ_LIB_OBJ:.o=.d) \
        $(TSAN_LIB_OBJ:.o=.d) $(TSAN_MAIN_OBJ:.o=.d) $(TSAN_TEST_OBJ:.o=.d) \
        $(HARD_LIB_OBJ:.o=.d) $(HARD_MAIN_OBJ:.o=.d)
@@ -149,6 +151,9 @@ default: debug
 
 %.o: %.c
 	$(CC) -c $(CFLAGS) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
+
+%.rel.o: %.c
+	$(CC) -c $(RELEASE_CFLAGS) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
 
 %.fuzz.o: %.c
 	$(CLANG) -c $(FUZZ_CFLAGS) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
@@ -161,25 +166,23 @@ default: debug
 %.hard.o: %.c
 	$(CC) -c $(HARDENED_CFLAGS) $(DEPFLAGS) $(DEFS) $(INCLUDES) -o $@ $<
 
-# Main binary — shared by debug/release/test (test/rfl/system/ipc_diff.rfl
-# spawns ./$(TARGET) as a server, so test depends on it too).
+# Main binary for debug/test (some tests spawn ./$(TARGET) as a server).
 $(TARGET): $(LIB_OBJ) $(MAIN_OBJ)
 	$(CC) $(CFLAGS) -o $(TARGET) $(LIB_OBJ) $(MAIN_OBJ) $(LIBS) $(LDFLAGS)
 
 # Debug build
 debug: CFLAGS = $(DEBUG_CFLAGS)
 debug: LDFLAGS = $(DEBUG_LDFLAGS)
-debug: $(TARGET)
+debug: $(LIB_OBJ) $(MAIN_OBJ)
+	$(CC) $(CFLAGS) -o $(TARGET) $(LIB_OBJ) $(MAIN_OBJ) $(LIBS) $(LDFLAGS)
 
 # Release build
-release: CFLAGS = $(RELEASE_CFLAGS)
-release: LDFLAGS = $(RELEASE_LDFLAGS)
-release: $(TARGET)
+release: $(REL_LIB_OBJ) $(REL_MAIN_OBJ)
+	$(CC) $(RELEASE_CFLAGS) -o $(TARGET) $(REL_LIB_OBJ) $(REL_MAIN_OBJ) $(LIBS) $(RELEASE_LDFLAGS)
 
 # Static library
-lib: CFLAGS = $(RELEASE_CFLAGS)
-lib: $(LIB_OBJ)
-	$(AR) rc lib$(TARGET).a $(LIB_OBJ)
+lib: $(REL_LIB_OBJ)
+	$(AR) rc lib$(TARGET).a $(REL_LIB_OBJ)
 
 # Release tarball: build the optimized binary and package it as
 # dist/rayforce-<version>-<os>-<arch>.tar.gz plus a SHA-256 checksum.
@@ -209,7 +212,8 @@ TEST_CORES ?= 2
 # must exist on disk and share the build flavour (sanitizers, coverage).
 test: CFLAGS = $(DEBUG_CFLAGS)
 test: LDFLAGS = $(DEBUG_LDFLAGS)
-test: $(TARGET) $(LIB_OBJ) $(TEST_OBJ)
+test: $(LIB_OBJ) $(MAIN_OBJ) $(TEST_OBJ)
+	$(CC) $(CFLAGS) -o $(TARGET) $(LIB_OBJ) $(MAIN_OBJ) $(LIBS) $(LDFLAGS)
 	$(CC) $(CFLAGS) -o $(TARGET).test $(LIB_OBJ) $(TEST_OBJ) $(LIBS) $(LDFLAGS) -Itest
 	RAYFORCE_CORES=$(TEST_CORES) ./$(TARGET).test
 
@@ -382,7 +386,7 @@ cppcheck:
 .PHONY: tidy cppcheck
 
 clean:
-	-rm -f $(LIB_OBJ) $(MAIN_OBJ) $(TEST_OBJ)
+	-rm -f $(LIB_OBJ) $(MAIN_OBJ) $(TEST_OBJ) $(REL_LIB_OBJ) $(REL_MAIN_OBJ)
 	-rm -f $(FUZZ_LIB_OBJ) $(TSAN_LIB_OBJ) $(TSAN_MAIN_OBJ) $(TSAN_TEST_OBJ) \
 	       $(HARD_LIB_OBJ) $(HARD_MAIN_OBJ)
 	-rm -f $(DEPS)
