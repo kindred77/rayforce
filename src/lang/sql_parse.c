@@ -89,7 +89,7 @@ static int kw_to_tok(const char* s, int64_t len) {
         if (strncasecmp(s,"UPDATE",6)==0) return TOK_UPDATE;
         if (strncasecmp(s,"VALUES",6)==0) return TOK_VALUES;
     }
-    if (len == 7) {
+    if (len == 4) {
         if (strncasecmp(s,"INTO",4)==0) return TOK_INTO;
     }
     if (len == 8) {
@@ -349,7 +349,7 @@ static ray_t* parse_primary(sql_parser_t* P) {
                     if (!lex_accept(P, TOK_COMMA)) { P->err_msg = "expected , or )"; return NULL; }
                 }
             }
-            return make_prefix2(id, args, NULL); /* returns (id args) via prefix */
+            return make_prefix1(id, args); /* returns (id args) via prefix */
         }
         /* Column ref */
         lex_peek(P);
@@ -360,7 +360,8 @@ static ray_t* parse_primary(sql_parser_t* P) {
             token_t* t2 = &P->curr;
             char col[256]; int64_t clen = t2->len > 255 ? 255 : t2->len;
             memcpy(col, t2->start, (size_t)clen); col[clen] = '\0';
-            return make_sym_c(col);
+            /* Build qualified reference: (getattr tbl col) */
+            return make_prefix2("getattr", make_sym_c(id), make_sym_c(col));
         }
         return make_sym_c(id);
     }
@@ -493,7 +494,7 @@ static ray_t* parse_select_stmt(sql_parser_t* P) {
     for (;;) {
         if (lex_accept(P, TOK_STAR)) {
             /* SELECT * -> pass through all columns. Mark with "*" key. */
-            out_keys[n_out] = strdup("*");
+            out_keys[n_out] = sdup("*", 1);
             out_vals[n_out] = make_sym_c("*");
             n_out++;
         } else {
@@ -543,8 +544,6 @@ static ray_t* parse_select_stmt(sql_parser_t* P) {
     token_t tbl_tok = P->curr;
         char tname[256]; int tnl = tbl_tok.len; if (tnl > 255) tnl = 255;
     memcpy(tname, tbl_tok.start, tnl); tname[tnl] = 0;
-    ray_t* table_ref = make_sym_c(tname);
-
     /* Skip table alias */
     lex_peek(P);
     if (P->peek.type == TOK_AS) {
@@ -564,6 +563,9 @@ static ray_t* parse_select_stmt(sql_parser_t* P) {
     int n_order = 0;
     const char* order_names[256];
     int order_descs[256];
+ray_t* order_cols[256];
+const char** dk = NULL;
+ray_t** dv = NULL;
 
     for (;;) {
         lex_peek(P);
@@ -589,7 +591,7 @@ static ray_t* parse_select_stmt(sql_parser_t* P) {
                 else lex_accept(P, TOK_ASC);
                 order_names[n_order] = desc ? "desc" : "asc";
                 order_descs[n_order] = desc;
-                group_cols[n_order] = oc;
+                order_cols[n_order] = oc;
                 n_order++;
                 if (!lex_accept(P, TOK_COMMA)) break;
             }
@@ -608,13 +610,12 @@ static ray_t* parse_select_stmt(sql_parser_t* P) {
         }
     }
 
-    /* ========== Build Lisp AST: (select {from: TBL ...}) ==========/* ========== Build Lisp AST: (select {from: TBL ...}) ========== */
+    /* ========== Build Lisp AST: (select {from: TBL ...}) ========== */
     /* Count pairs: from(2) + n_out*2 + where(2) + by(2) + having(2) + order(n_order*2) + head(2) + offset(2) + distinct(2) */
     int np = 0;
     /* Allocate key-value pair arrays */
-    const char** dk = (const char**)calloc((size_t)(n_out*2 + 32), sizeof(char*));
-    ray_t** dv = (ray_t**)calloc((size_t)(n_out*2 + 32), sizeof(ray_t*));
-    int dk_cap = n_out*2 + 32;
+    dk = (const char**)calloc((size_t)(n_out*2 + 32), sizeof(char*));
+    dv = (ray_t**)calloc((size_t)(n_out*2 + 32), sizeof(ray_t*));
     int di = 0;
 
 #define ADD_KV(k,v) do { dk[di] = (k); dv[di] = (v); di++; } while(0)
@@ -656,8 +657,8 @@ static ray_t* parse_select_stmt(sql_parser_t* P) {
 
     /* ORDER BY -> asc/desc keys */
     for (int i = 0; i < n_order; i++) {
-        ADD_KV(strdup(order_names[i]), group_cols[i]); /* we stored order cols in group_cols */
-        group_cols[i] = NULL;
+        ADD_KV(sdup(order_names[i], strlen(order_names[i])), order_cols[i]);
+        order_cols[i] = NULL;
     }
 
     /* LIMIT -> head:N */
@@ -666,10 +667,8 @@ static ray_t* parse_select_stmt(sql_parser_t* P) {
     if (distinct) { ADD_KV(sdup("distinct",8), make_i64_val(1)); }
 
     /* Build dict */
-    ray_t* dict = make_dict_kv((const char**)dk, dv, di);
-
     /* Build (select dict) */
-        /* Build (select dict) */
+    ray_t* dict = make_dict_kv((const char**)dk, dv, di);
     ray_t* result = ray_list_new(2);
     ray_t* sel_sym = make_sym_c("select");
     result = ray_list_append(result, sel_sym);
@@ -685,6 +684,7 @@ static ray_t* parse_select_stmt(sql_parser_t* P) {
     }
     free(out_keys); free(out_vals);
     for (int i = 0; i < n_group; i++) if (group_cols[i]) ray_release(group_cols[i]);
+    for (int i = 0; i < n_order; i++) if (order_cols[i]) ray_release(order_cols[i]);
     if (where_expr) ray_release(where_expr);
     if (having) ray_release(having);
     /* cleanup handled by for loop below */
@@ -698,10 +698,12 @@ fail:
     }
     free(out_keys); free(out_vals);
     for (int i = 0; i < n_group; i++) if (group_cols[i]) ray_release(group_cols[i]);
+    for (int i = 0; i < n_order; i++) if (order_cols[i]) ray_release(order_cols[i]);
     if (where_expr) ray_release(where_expr);
     if (having) ray_release(having);
     return NULL;
-}/* ===== Public API ===== */
+}
+/* ===== Public API ===== */
 bool ray_is_sql(const char* input) {
     if (!input || !*input) return false;
     while (*input && isspace((unsigned char)*input)) input++;
@@ -726,18 +728,25 @@ ray_t* ray_sql_parse(const char* sql, ray_t* nfo) {
     P.sql = sql;
     P.len = (int64_t)strlen(sql);
     P.line = 1;
-    (void)nfo;
 
     lex_next_raw(&P);
     if (P.err) return ray_error("parse", P.err_msg ? P.err_msg : "tokenization error");
 
-    if (P.curr.type == TOK_SELECT)
-        return parse_select_stmt(&P);
+    if (P.curr.type == TOK_SELECT) {
+        /* parse_select_stmt sets P.err_msg on failure and returns NULL */
+        /* Ensure NULL with err_msg is converted to a proper error object */
+        ray_t* result = parse_select_stmt(&P);
+        if (!result) {
+            if (P.err || P.err_msg)
+                return ray_error("parse", P.err_msg ? P.err_msg : "SQL parse error");
+            return NULL;
+        }
+        return result;
+    }
 
     if (P.err || P.err_msg)
         return ray_error("parse", P.err_msg ? P.err_msg : "unsupported SQL");
     return ray_error("nyi", "SQL statement type not implemented");
-    return ray_error("parse", "unsupported SQL statement");
 }
 
 ray_t* ray_sql_eval(const char* sql) {
