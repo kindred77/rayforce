@@ -34,6 +34,7 @@
 #include "core/pool.h"
 #include "core/types.h"
 #include "io/csv.h"
+#include "lang/sql_parse.h"
 #include "ops/ops.h"
 
 static inline double clear_neg_zero(double v) {
@@ -3434,4 +3435,16 @@ ray_t* ray_within_fn(ray_t* vals, ray_t* range) {
     }
     result->len = n;
     return result;
+}
+/* ── SQL eval ------------------------------------------------------------ */
+
+ray_t* ray_sql_eval_fn(ray_t** args, int64_t n) {
+    if (n < 1) return ray_error("arity", "sql.eval: expected a SQL string argument");
+    if (args[0]->type != -RAY_STR)
+        return ray_error("type", "sql.eval: expected a string, got %s",
+                         ray_type_name(args[0]->type));
+    const char* sql = ray_str_ptr(args[0]);
+    if (!sql || sql[0] == '\0')
+        return ray_error("domain", "sql.eval: empty SQL string");
+    return ray_sql_eval(sql);
 }

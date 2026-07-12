@@ -759,12 +759,6 @@ static void eval_and_print(ray_term_t* term, const char* input,
     if (term) ray_term_eval_begin(term);
 
     ray_t* result;
-    if (ray_is_sql(input)) {
-        /* SQL: ray_sql_eval handles parse + eval via ray_select directly,
-         * bypassing ray_eval's special-form dispatch (which stack-overflows). */
-        result = ray_sql_eval(input);
-        if (profiling) { ray_profile_tick("parse"); ray_profile_tick("eval"); }
-    } else {
         ray_t* nfo = ray_nfo_create("repl", 4, input, strlen(input));
         ray_clear_error_trace();
         ray_t* parsed = ray_parse_with_nfo(input, nfo);
@@ -780,7 +774,6 @@ static void eval_and_print(ray_term_t* term, const char* input,
             ray_release(parsed);
         }
         ray_release(nfo);
-    }
 
     /* Clear any pull-based progress state left over from this
      * top-level eval. Some paths (e.g. ray_group_indices_fn invoked from
@@ -1288,11 +1281,6 @@ int ray_repl_run_file(const char* path) {
     }
 
     ray_t* result;
-    if (ray_is_sql(buf)) {
-        /* SQL file: ray_sql_eval handles parse + eval directly. */
-        result = ray_sql_eval(buf);
-        if (profiling) { ray_profile_tick("parse"); ray_profile_tick("eval"); }
-    } else {
         ray_t* nfo = ray_nfo_create(path, strlen(path), buf, nread);
         ray_clear_error_trace();
         ray_t* parsed = ray_parse_with_nfo(buf, nfo);
@@ -1308,7 +1296,6 @@ int ray_repl_run_file(const char* path) {
             ray_release(parsed);
         }
         ray_release(nfo);
-    }
     ray_release(block);
 
     ray_progress_end();

@@ -675,6 +675,7 @@ ray_t* ray_read_csv_fn(ray_t** args, int64_t n);
 ray_t* ray_read_csv_splayed_fn(ray_t** args, int64_t n);
 ray_t* ray_read_csv_parted_fn(ray_t** args, int64_t n);
 ray_t* ray_write_csv_fn(ray_t** args, int64_t n);
+ray_t* ray_sql_eval_fn(ray_t** args, int64_t n);
 ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val);
 ray_t* ray_type_fn(ray_t* val);
 ray_t* ray_read_file_fn(ray_t* path_obj);

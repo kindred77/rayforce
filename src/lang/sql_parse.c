@@ -1,4 +1,4 @@
-/* SQL to Lisp-AST parser for Rayforce */
+﻿/* SQL to Lisp-AST parser for Rayforce */
 #include "lang/sql_parse.h"
 #include "lang/eval.h"
 #include "table/sym.h"
@@ -405,8 +405,8 @@ static ray_t* parse_cmp(sql_parser_t* P) {
     if (P->err) return NULL;
     ray_t* left = parse_add(P); if (!left) return NULL;
     const char* cmp = NULL;
-    if (lex_accept(P, TOK_EQ)) cmp = "=";
-    else if (lex_accept(P, TOK_NE)) cmp = "<>";
+    if (lex_accept(P, TOK_EQ)) cmp = "==";
+    else if (lex_accept(P, TOK_NE)) cmp = "!=";
     else if (lex_accept(P, TOK_LT)) cmp = "<";
     else if (lex_accept(P, TOK_GT)) cmp = ">";
     else if (lex_accept(P, TOK_LE)) cmp = "<=";
