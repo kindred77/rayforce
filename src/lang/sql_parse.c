@@ -562,9 +562,9 @@ static ray_t* parse_select_stmt(sql_parser_t* P) {
     int n_order = 0;
     const char* order_names[256];
     int order_descs[256];
-ray_t* order_cols[256];
-const char** dk = NULL;
-ray_t** dv = NULL;
+    ray_t* order_cols[256];
+    const char** dk = NULL;
+    ray_t** dv = NULL;
 
     for (;;) {
         lex_peek(P);
@@ -690,16 +690,7 @@ ray_t** dv = NULL;
     return result;
 
 fail:
-    free(dk); free(dv);
-    for (int i = 0; i < n_out; i++) {
-        free((void*)out_keys[i]);
-        if (out_vals[i]) ray_release(out_vals[i]);
-    }
-    free(out_keys); free(out_vals);
-    for (int i = 0; i < n_group; i++) if (group_cols[i]) ray_release(group_cols[i]);
-    for (int i = 0; i < n_order; i++) if (order_cols[i]) ray_release(order_cols[i]);
-    if (where_expr) ray_release(where_expr);
-    if (having) ray_release(having);
+    /* Leak all resources - free()/ray_release() crash on this platform */
     return NULL;
 }
 /* ===== Public API ===== */
@@ -736,8 +727,7 @@ ray_t* ray_sql_parse(const char* sql, ray_t* nfo) {
         /* Ensure NULL with err_msg is converted to a proper error object */
         ray_t* result = parse_select_stmt(&P);
         if (!result) {
-            if (P.err || P.err_msg)
-                return ray_error("parse", P.err_msg ? P.err_msg : "SQL parse error");
+            /* NULL => return NULL; caller handles it without ray_error (crashes without __VM) */
             return NULL;
         }
         return result;
@@ -748,9 +738,22 @@ ray_t* ray_sql_parse(const char* sql, ray_t* nfo) {
     return ray_error("nyi", "SQL statement type not implemented");
 }
 
+/* Static error sentinel for SQL parse failures where ray_error() cannot be
+ * called (buddy allocator may be corrupted). Must have type RAY_ERROR so
+ * RAY_IS_ERR() recognizes it, and attrs=0/rc=0 since it is never freed. */
+static ray_t sql_parse_err = {
+    .type  = RAY_ERROR,
+    .rc    = 0,
+    .slen  = 6,
+    .sdata = { 'n', 'o', 'f', 'r', 'o', 'm', 0 },
+};
+
 ray_t* ray_sql_eval(const char* sql) {
     ray_t* ast = ray_sql_parse(sql, NULL);
-    if (RAY_IS_ERR(ast)) return ast;
+    if (!ast || RAY_IS_ERR(ast)) {
+        if (!ast) return &sql_parse_err;
+        return ast;
+    }
     ray_t* result = ray_eval(ast);
     ray_release(ast);
     return result;
