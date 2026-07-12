@@ -285,7 +285,6 @@ static ray_t* make_dict_kv(const char** keys, ray_t** vals, int n) {
         ray_list_append(vs, vals[i]); ray_release(vals[i]);
     }
     ray_t* d = ray_dict_new(ks, vs);
-    ray_release(ks); ray_release(vs);
     return d;
 }
 /* ===== Expression parser (recursive descent) ===== */
