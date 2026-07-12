@@ -301,6 +301,7 @@ void ray_sem_signal(ray_sem_t* s) {
   #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <io.h>
 #include "mem/sys.h"
 
 /* --------------------------------------------------------------------------
@@ -353,10 +354,26 @@ void ray_vm_unmap_file(void* ptr, size_t size) {
     UnmapViewOfFile(ptr);
     ray_sys_track_file_sub((int64_t)size);
 }
+/* Map a read-only (copy-on-write) view of an already-open file descriptor.
+ * Follows the same CreateFileMapping + MapViewOfFile pattern as
+ * ray_vm_map_file above.  The caller still owns the fd and must close it;
+ * the mapped view keeps its own reference to the file object internally. */
+void* ray_vm_map_fd_ro(int fd, size_t size) {
+    if (size == 0) return NULL;
 
-/* Windows never reaches the fd/mmap CSV path (#ifndef RAY_OS_WINDOWS), so this
- * is an unused stub kept only for API completeness. */
-void* ray_vm_map_fd_ro(int fd, size_t size) { (void)fd; (void)size; return NULL; }
+    HANDLE hFile = (HANDLE)_get_osfhandle(fd);
+    if (hFile == INVALID_HANDLE_VALUE) return NULL;
+
+    HANDLE hMap = CreateFileMappingA(hFile, NULL, PAGE_WRITECOPY, 0, 0, NULL);
+    if (!hMap) return NULL;
+
+    void* p = MapViewOfFile(hMap, FILE_MAP_COPY, 0, 0, size);
+    CloseHandle(hMap);
+    if (!p) return NULL;
+
+    ray_sys_track_file_add((int64_t)size);
+    return p;
+}
 
 /* MinGW-w64 may not define WIN32_MEMORY_RANGE_ENTRY even when targeting
  * modern Windows.  We load PrefetchVirtualMemory at runtime, so only the
