@@ -1,4 +1,4 @@
-/*
+﻿/*
  *   Copyright (c) 2025-2026 Anton Kundenko <singaraiona@gmail.com>
  *   All rights reserved.
 

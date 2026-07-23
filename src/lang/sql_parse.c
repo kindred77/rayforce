@@ -223,7 +223,7 @@ static int lex_accept(sql_parser_t* P, tok_type_t t) {
 }
 /* ===== AST helpers ===== */
 static ray_t* make_sym_c(const char* s) {
-    int64_t id = ray_sym_intern(s, strlen(s));
+    int64_t id = ray_sym_intern_runtime(s, strlen(s));
     if (id < 0) return ray_error("oom", NULL);
     return ray_sym(id);
 }
@@ -257,16 +257,16 @@ static ray_t* list_append(ray_t* lst, ray_t* elem) {
 static ray_t* make_prefix1(const char* op, ray_t* arg) {
     ray_t* lst = ray_list_new(2);
     ray_t* op_sym = make_sym_c(op);
-    lst = ray_list_append(lst, op_sym); ray_release(op_sym);
-    lst = ray_list_append(lst, arg); ray_release(arg);
+    lst = ray_list_append(lst, op_sym);
+    lst = ray_list_append(lst, arg);
     return lst;
 }
 static ray_t* make_prefix2(const char* op, ray_t* a, ray_t* b) {
     ray_t* lst = ray_list_new(3);
     ray_t* op_sym = make_sym_c(op);
-    lst = ray_list_append(lst, op_sym); ray_release(op_sym);
-    lst = ray_list_append(lst, a); ray_release(a);
-    lst = ray_list_append(lst, b); ray_release(b);
+    lst = ray_list_append(lst, op_sym);
+    lst = ray_list_append(lst, a);
+    lst = ray_list_append(lst, b);
     return lst;
 }
 /* Build a dict from interleaved key-value pairs.
@@ -279,10 +279,10 @@ static ray_t* make_dict_kv(const char** keys, ray_t** vals, int n) {
     ray_t* vs = ray_list_new(n);
     if (!vs) { ray_release(ks); return ray_error("oom", NULL); }
     for (int i = 0; i < n; i++) {
-        int64_t id = ray_sym_intern(keys[i], strlen(keys[i]));
+        int64_t id = ray_sym_intern_runtime(keys[i], strlen(keys[i]));
         if (id < 0) { ray_release(ks); ray_release(vs); return ray_error("oom", NULL); }
         ray_vec_append(ks, &id);
-        ray_list_append(vs, vals[i]); ray_release(vals[i]);
+        ray_list_append(vs, vals[i]);
     }
     ray_t* d = ray_dict_new(ks, vs);
     return d;
@@ -693,22 +693,7 @@ fail:
     /* Leak all resources - free()/ray_release() crash on this platform */
     return NULL;
 }
-/* ===== Public API ===== */
-bool ray_is_sql(const char* input) {
-    if (!input || !*input) return false;
-    while (*input && isspace((unsigned char)*input)) input++;
-    const char* kws[] = {"SELECT","INSERT","UPDATE","DELETE",
-                         "CREATE","DROP","WITH","EXPLAIN","DESCRIBE",NULL};
-    for (int i = 0; kws[i]; i++) {
-        size_t len = strlen(kws[i]);
-        if (strncasecmp(input, kws[i], len) == 0) {
-            char c = input[len];
-            if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '(' || c == '\0')
-                return true;
-        }
-    }
-    return false;
-}
+
 
 ray_t* ray_sql_parse(const char* sql, ray_t* nfo) {
     (void)nfo;

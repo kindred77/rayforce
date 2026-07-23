@@ -22,7 +22,6 @@
  */
 
 #include "lang/eval.h"
-#include "lang/sql_parse.h"
 #include "core/runtime.h"
 #include "lang/internal.h"
 #include "app/repl.h"

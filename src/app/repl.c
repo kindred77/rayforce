@@ -43,7 +43,6 @@
 #include "ops/ops.h"
 #include "core/profile.h"
 #include "core/qlog.h"
-#include "lang/sql_parse.h"
 #include "table/sym.h"
 #include <inttypes.h>
 #include <stdio.h>
