@@ -2,3 +2,11 @@ building with msys2 mingw-w64-ucrt-x86_64-gcc-16.1.0-2
 
 could download here:
 https://repo.msys2.org/mingw/
+
+SQL:
+(set t (table [Symbol Side Qty]
+    (list [AAPL GOOG MSFT AAPL GOOG]
+          [Buy Sell Buy Sell Buy]
+          [100 200 150 300 250])))
+
+(.sql.eval "SELECT * from t where Qty=100")
