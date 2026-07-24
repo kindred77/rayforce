@@ -10,3 +10,9 @@ SQL:
           [100 200 150 300 250])))
 
 (.sql.eval "SELECT * from t where Qty=100")
+
+
+(set data (.csv.read "/home/kindred/mywork/projects/data/cust_simple.csv"))
+
+(.sql.eval "SELECT * from data where id<10")
+(.sql.eval "SELECT * from data where cust_type in (10,20,30)")
