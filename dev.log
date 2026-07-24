@@ -18,3 +18,7 @@ SQL:
 (.sql.eval "SELECT * from data where cust_type in (10,20,30)")
 
 (.sql.eval "select * from data where addr_str='The 4291, streat 8477008541'")
+
+(.sql.eval "select sum(account_amount) from data")
+
+(.sql.eval "select sum(account_amount) from data group by cust_type")

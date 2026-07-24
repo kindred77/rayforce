@@ -338,17 +338,19 @@ static ray_t* parse_primary(sql_parser_t* P) {
         /* Function call: ident ( ... ) */
         if (P->peek.type == TOK_LPAREN) {
             lex_accept(P, TOK_LPAREN);
-            ray_t* args = ray_list_new(0);
+            ray_t* result = ray_list_new(0);
+            ray_t* op_sym = make_sym_c(id);
+            result = ray_list_append(result, op_sym);
             if (!lex_accept(P, TOK_RPAREN)) {
                 for (;;) {
                     ray_t* arg = parse_or(P);
                     if (P->err) return NULL;
-                    args = list_append(args, arg); ray_release(arg);
+                    result = ray_list_append(result, arg); ray_release(arg);
                     if (lex_accept(P, TOK_RPAREN)) break;
                     if (!lex_accept(P, TOK_COMMA)) { P->err_msg = "expected , or )"; return NULL; }
                 }
             }
-            return make_prefix1(id, args); /* returns (id args) via prefix */
+            return result;
         }
         /* Column ref */
         lex_peek(P);
