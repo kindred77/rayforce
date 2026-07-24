@@ -575,6 +575,59 @@ ray_t* ray_read_csv_fn(ray_t** args, int64_t n) {
     return tbl;
 }
 
+/* ── .csv.open — lazy CSVSRC handle (defers actual read until query) ── */
+
+ray_t* ray_read_csv_open_fn(ray_t** args, int64_t n) {
+    if (n < 1 || n > 3) return ray_error("arity", "csv.open: expects 1 to 3 arguments, got %lld", (long long)n);
+
+    ray_t* path_obj = NULL;
+    ray_t* schema = NULL;
+    ray_t* names = NULL;
+    if (n >= 3 && ray_is_vec(args[0]) && args[0]->type == RAY_SYM &&
+        ray_is_vec(args[1]) && args[1]->type == RAY_SYM) {
+        names = args[0];
+        schema = args[1];
+        path_obj = args[2];
+    } else if (n >= 2 && ray_is_vec(args[0]) && args[0]->type == RAY_SYM) {
+        schema = args[0];
+        path_obj = args[1];
+    } else {
+        path_obj = args[0];
+    }
+
+    const char* path = NULL;
+    if (path_obj->type == -RAY_STR)
+        path = ray_str_ptr(path_obj);
+    else
+        return ray_error("type", "csv.open: path must be str, got %s", ray_type_name(path_obj->type));
+    if (!path) return ray_error("domain", "csv.open: empty path");
+
+    if (schema) {
+        int64_t ncols = schema->len;
+        int8_t col_types[256];
+        if (ncols > 256) return ray_error("limit", NULL);
+        void* sym_data = ray_data(schema);
+        for (int64_t i = 0; i < ncols; i++) {
+            int64_t sid = ray_read_sym(sym_data, i, schema->type, schema->attrs);
+            col_types[i] = resolve_type_name(sid);
+            if (col_types[i] < 0) return ray_error("type", "csv.open: unknown column type name in schema");
+        }
+        int64_t col_names[256];
+        if (names) {
+            if (names->len != ncols) return ray_error("length", "csv.open: names and types must match, got %lld names and %lld types", (long long)names->len, (long long)ncols);
+            void* name_data = ray_data(names);
+            for (int64_t i = 0; i < ncols; i++)
+                col_names[i] = ray_read_sym(name_data, i, names->type, names->attrs);
+        }
+        return ray_open_csv(path, 0,
+                               names ? false : true,
+                               col_types, (int32_t)ncols,
+                               col_names, names ? (int32_t)ncols : 0);
+    }
+
+    return ray_open_csv(path, 0, true, NULL, 0, NULL, 0);
+}
+
 static const char* csv_str_arg(ray_t* s, char* buf, size_t bufsz) {
     if (!s || s->type != -RAY_STR) return NULL;
     const char* p = ray_str_ptr(s);

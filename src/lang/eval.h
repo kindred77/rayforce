@@ -323,6 +323,7 @@ ray_t* ray_window_join1_fn(ray_t** args, int64_t n);
 /* I/O */
 ray_t* ray_println_fn(ray_t** args, int64_t n);
 ray_t* ray_read_csv_fn(ray_t** args, int64_t n);
+ray_t* ray_read_csv_open_fn(ray_t** args, int64_t n);
 ray_t* ray_write_csv_fn(ray_t** args, int64_t n);
 ray_t* ray_read_file_fn(ray_t* path_obj);
 ray_t* ray_write_file_fn(ray_t* path_obj, ray_t* content);

@@ -38,6 +38,9 @@ extern "C" {
 /* Lazy DAG handle (atom-only; stored inline in aux region) */
 #define RAY_LAZY      104
 
+/* Lazy CSV source handle — stores file path and config, defers actual read */
+#define RAY_CSVSRC    105
+
 /* ===== Forward Declarations (internal types) ===== */
 
 typedef struct ray_pool      ray_pool_t;

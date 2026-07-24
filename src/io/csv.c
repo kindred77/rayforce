@@ -46,6 +46,7 @@
 #include "lang/format.h"
 #include "ops/hash.h"
 #include "ops/idxop.h"      /* attach per-chunk zone index after load */
+#include "ops/ops.h"        /* RAY_CSVSRC */
 #include "store/col.h"
 #include "store/fileio.h"
 #include "store/splay.h"
@@ -3279,4 +3280,114 @@ ray_err_t ray_write_csv(ray_t* table, const char* path) {
     if (rn_err != RAY_OK) { remove(tmp_path); return rn_err; }
 
     return RAY_OK;
+}
+
+/* ============================================================================
+ * CSVSRC handle — lazy CSV source reference (defers actual file read)
+ *
+ * Data area layout:
+ *   [path_len : int32]
+ *   [path     : char[path_len]]   (raw bytes, no null terminator)
+ *   [n_types  : int32]
+ *   [types    : int8_t[n_types]]
+ *   [n_names  : int32]
+ *   [names    : int64_t[n_names]]
+ *
+ * aux[0] = delimiter (0 means auto-detect)
+ * aux[1] = header flag (0 = no header, 1 = has header)
+ * ============================================================================ */
+
+ray_t* ray_open_csv(const char* path, char delimiter, bool header,
+                        const int8_t* col_types, int32_t n_types,
+                        const int64_t* col_names, int32_t n_names) {
+    if (!path || path[0] == '\0') return ray_error("domain", "csv.src: empty path");
+    size_t path_len = strlen(path);
+    if (n_types < 0) n_types = 0;
+    if (n_names < 0) n_names = 0;
+
+    /* Compute total data area size */
+    size_t data_size = 4 + path_len + 4 + (size_t)n_types + 4 + (size_t)n_names * 8;
+
+    ray_t* h = ray_alloc(data_size);
+    if (!h) return ray_error("oom", NULL);
+
+    h->type  = RAY_CSVSRC;
+    h->attrs = 0;
+    h->aux[0] = (uint8_t)delimiter;
+    h->aux[1] = header ? 1 : 0;
+    h->len    = (int32_t)path_len;
+
+    uint8_t* dp = (uint8_t*)ray_data(h);
+
+    /* Write path_len */
+    *(int32_t*)dp = (int32_t)path_len;
+    dp += 4;
+    /* Write path bytes */
+    memcpy(dp, path, path_len);
+    dp += path_len;
+    /* Write n_types */
+    *(int32_t*)dp = (int32_t)n_types;
+    dp += 4;
+    /* Write types array */
+    if (n_types > 0 && col_types) {
+        memcpy(dp, col_types, (size_t)n_types);
+        dp += (size_t)n_types;
+    }
+    /* Write n_names */
+    *(int32_t*)dp = n_names;
+    dp += 4;
+    /* Write names array */
+    if (n_names > 0 && col_names) {
+        memcpy(dp, col_names, (size_t)n_names * 8);
+    }
+
+    return h;
+}
+
+ray_t* ray_csv_force(ray_t* v) {
+    if (!v || RAY_IS_ERR(v)) return v;
+    if (v->type != RAY_CSVSRC) return v;  /* not a CSVSRC — pass through */
+
+    /* Extract data from the CSVSRC handle */
+    uint8_t* dp  = (uint8_t*)ray_data(v);
+    int32_t  path_len = *(int32_t*)dp;
+    dp += 4;
+
+    /* Make a null-terminated copy of the path */
+    char* path = (char*)ray_sys_alloc((size_t)path_len + 1);
+    if (!path) { ray_error("oom", NULL); ray_release(v); return v; }
+    memcpy(path, dp, (size_t)path_len);
+    path[path_len] = '\0';
+    dp += path_len;
+
+    int32_t n_types = *(int32_t*)dp;
+    dp += 4;
+    const int8_t* types = n_types > 0 ? (const int8_t*)dp : NULL;
+    dp += (size_t)(n_types > 0 ? n_types : 0);
+
+    int32_t n_names = *(int32_t*)dp;
+    dp += 4;
+    const int64_t* names = n_names > 0 ? (const int64_t*)dp : NULL;
+
+    char  delimiter = (char)v->aux[0];
+    bool  header    = v->aux[1] != 0;
+
+    /* Actually read the CSV file */
+    ray_t* table = NULL;
+    if (n_names > 0 && names && n_types > 0 && types) {
+        table = ray_read_csv_named_opts(path, delimiter, header,
+                                         types, n_types,
+                                         names, n_names);
+    } else if (n_types > 0 && types) {
+        table = ray_read_csv_opts(path, delimiter, header,
+                                   types, n_types);
+    } else {
+        table = ray_read_csv(path);
+    }
+
+    ray_sys_free(path);
+    ray_release(v);  /* release the CSVSRC handle */
+
+    if (!table) return ray_error("io", NULL);
+    return table;
 }

@@ -161,6 +161,7 @@ const char* ray_type_name(int8_t type) {
     case RAY_DICT:      return "DICT";
     case RAY_LIST:      return "LIST";
     case RAY_INDEX:     return "INDEX";
+    case RAY_CSVSRC:    return "csvsrc";
     default:            return "?";
     }
 }
@@ -1086,6 +1087,13 @@ static void fmt_obj(fmt_buf_t* b, ray_t* obj, int mode) {
         ray_t* concrete = ray_lazy_materialize(obj); /* consumes the retain */
         fmt_obj(b, concrete, mode);
         if (concrete) ray_release(concrete);
+        return;
+    } else if (type == RAY_CSVSRC) {
+        /* Show the file path without materializing the CSV */
+        uint8_t* dp = (uint8_t*)ray_data(obj);
+        int32_t path_len = *(int32_t*)dp;
+        fmt_printf(b, "<csvsrc:%.*s>", (int)(path_len > 0 ? path_len : 0),
+                   (const char*)(dp + 4));
         return;
     } else {
         fmt_printf(b, "<%s>", ray_type_name(type));

@@ -85,4 +85,10 @@ ray_err_t ray_csv_save_splayed_named_opts(const char* path, char delimiter, bool
                                           const char* dir, int64_t rows_per_chunk);
 ray_err_t ray_write_csv(ray_t* table, const char* path);
 
+/* For CSVSRC handles */
+ray_t* ray_open_csv(const char* path, char delimiter, bool header,
+                       const int8_t* col_types, int32_t n_types,
+                       const int64_t* col_names, int32_t n_names);
+ray_t* ray_csv_force(ray_t* v);
+
 #endif /* RAY_CSV_H */

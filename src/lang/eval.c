@@ -40,6 +40,7 @@
 #include "core/qstats.h"   /* per-worker parallelism counters for eval-path spans */
 #include "core/qmeasure.h" /* shared per-query worker lifecycle */
 #include "core/qlog.h"     /* ray_qlog_enabled — arm capture for query logging */
+#include "io/csv.h"        /* ray_csv_force — CSVSRC handle materialization */
 #include "store/serde.h"   /* ray_serde_size — result footprint for spans */
 #include "table/sym.h"
 #include "mem/heap.h"
@@ -3144,6 +3145,7 @@ static void ray_register_builtins(void) {
     register_vary("read-csv",   RAY_FN_RESTRICTED, ray_read_csv_fn);
     register_vary("write-csv",  RAY_FN_RESTRICTED, ray_write_csv_fn);
     register_vary(".csv.read",         RAY_FN_RESTRICTED, ray_read_csv_fn);
+    register_vary(".csv.open",         RAY_FN_RESTRICTED, ray_read_csv_open_fn);
     register_vary(".csv.splayed",      RAY_FN_RESTRICTED, ray_read_csv_splayed_fn);
     register_vary(".csv.parted",       RAY_FN_RESTRICTED, ray_read_csv_parted_fn);
     register_vary(".csv.write",        RAY_FN_RESTRICTED, ray_write_csv_fn);
@@ -3548,6 +3550,9 @@ ray_t* ray_eval(ray_t* obj) {
              * parted-target link deref inside the dotted walker) — surface
              * it directly rather than treating it as a found value. */
             if (RAY_IS_ERR(val)) { ret = val; goto out; }
+            /* Auto-force CSVSRC handles when the name is resolved — the
+             * handle is an implementation detail; users see the data. */
+            val = ray_csv_force(val);
             /* env_resolve hands back an owned ref; no extra retain. */
             ret = val; goto out;
         }

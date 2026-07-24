@@ -12,7 +12,9 @@ SQL:
 (.sql.eval "SELECT * from t where Qty=100")
 
 
-(set data (.csv.read "/home/kindred/mywork/projects/data/cust_simple.csv"))
+(set data (.csv.open "/home/kindred/mywork/projects/data/cust.csv"))
 
 (.sql.eval "SELECT * from data where id<10")
 (.sql.eval "SELECT * from data where cust_type in (10,20,30)")
+
+(.sql.eval "select * from data where addr_str='The 4291, streat 8477008541'")

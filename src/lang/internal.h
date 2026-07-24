@@ -672,6 +672,7 @@ ray_t* ray_resolve_fn(ray_t** args, int64_t n);
 ray_t* ray_timeit_fn(ray_t** args, int64_t n);
 ray_t* ray_exit_fn(ray_t* arg);
 ray_t* ray_read_csv_fn(ray_t** args, int64_t n);
+ray_t* ray_read_csv_open_fn(ray_t** args, int64_t n);
 ray_t* ray_read_csv_splayed_fn(ray_t** args, int64_t n);
 ray_t* ray_read_csv_parted_fn(ray_t** args, int64_t n);
 ray_t* ray_write_csv_fn(ray_t** args, int64_t n);
