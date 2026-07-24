@@ -399,12 +399,13 @@ static ray_t* parse_primary(sql_parser_t* P) {
         if (P->peek.type == TOK_DOT) {
             lex_accept(P, TOK_DOT);
             if (!lex_accept(P, TOK_IDENT)) { P->err_msg = "expected column name"; return NULL; }
-            /* Just use the column name part */
+            /* Build dotted symbol: t1.cust_type */
             token_t* t2 = &P->curr;
             char col[256]; int64_t clen = t2->len > 255 ? 255 : t2->len;
-            memcpy(col, t2->start, (size_t)clen); col[clen] = '\0';
-            /* Build qualified reference: (getattr tbl col) */
-            return make_prefix2("getattr", make_sym_c(id), make_sym_c(col));
+            memcpy(col, t2->start, (size_t)clen); col[clen] = ' ';
+            char dotted[512];
+            snprintf(dotted, sizeof(dotted), "%.*s.%s", (int)id_len, id, col);
+            return make_sym_c(dotted);
         }
         return make_sym_c(id);
     }
@@ -605,6 +606,82 @@ static ray_t* parse_select_stmt(sql_parser_t* P) {
         lex_accept(P, TOK_IDENT); /* bare alias */
     }
 
+    /* JOIN clause */
+    int jtype = 0;
+    ray_t* join_from_expr = NULL;
+    lex_peek(P);
+    if (P->peek.type == TOK_INNER) {
+        lex_next(P); jtype = 1;
+        if (!lex_accept(P, TOK_JOIN)) { P->err_msg = "expected JOIN"; goto fail; }
+    } else if (P->peek.type == TOK_LEFT) {
+        lex_next(P); jtype = 2;
+        if (!lex_accept(P, TOK_JOIN)) { P->err_msg = "expected JOIN"; goto fail; }
+    } else if (P->peek.type == TOK_RIGHT) {
+        lex_next(P); jtype = 3;
+        if (!lex_accept(P, TOK_JOIN)) { P->err_msg = "expected JOIN"; goto fail; }
+    } else if (P->peek.type == TOK_JOIN) {
+        lex_next(P); jtype = 1;
+    }
+    if (jtype) {
+        if (!lex_accept(P, TOK_IDENT)) { P->err_msg = "expected table name after JOIN"; goto fail; }
+        token_t r_tok = P->curr;
+        char rname[256]; int rnl = r_tok.len; if (rnl > 255) rnl = 255;
+        memcpy(rname, r_tok.start, rnl); rname[rnl] = 0;
+        lex_peek(P);
+        if (P->peek.type == TOK_AS) { lex_next(P); lex_next(P); }
+        else if (P->peek.type == TOK_IDENT && !is_clause_kw(P->peek.type)) { lex_next(P); }
+        if (!lex_accept(P, TOK_ON)) { P->err_msg = "expected ON"; goto fail; }
+        ray_t* on_expr = parse_expr(P);
+        ray_t* left_key_sym = NULL;
+        ray_t* right_key_sym = NULL;
+        if (on_expr && on_expr->type == RAY_LIST && ray_len(on_expr) == 3) {
+            ray_t** oe = (ray_t**)ray_data(on_expr);
+            if (oe[0]->type == -RAY_SYM && oe[1]->type == -RAY_SYM && oe[2]->type == -RAY_SYM) {
+                ray_t* eq_nm = ray_sym_str(oe[0]->i64);
+                if (eq_nm && ray_str_len(eq_nm) == 2 && memcmp(ray_str_ptr(eq_nm), "==", 2) == 0) {
+                    if (ray_sym_is_dotted(oe[1]->i64) && ray_sym_is_dotted(oe[2]->i64)) {
+                        const int64_t* sg1; int ns1 = ray_sym_segs(oe[1]->i64, &sg1);
+                        const int64_t* sg2; int ns2 = ray_sym_segs(oe[2]->i64, &sg2);
+                        if (ns1 >= 2 && ns2 >= 2) {
+                            { ray_t* _sn = ray_sym_str(sg1[ns1-1]); left_key_sym = make_sym_c(ray_str_ptr(_sn)); ray_release(_sn); }
+                            { ray_t* _sn = ray_sym_str(sg2[ns2-1]); right_key_sym = make_sym_c(ray_str_ptr(_sn)); ray_release(_sn); }
+                        }
+                    }
+                }
+            }
+        }
+        if (!left_key_sym || !right_key_sym) { P->err_msg = "malformed ON condition"; goto fail; }
+        /* Build (quote ((left_keys) (right_keys))) */
+        {
+            const char* jfn = jtype == 1 ? "inner-join" : (jtype == 2 ? "left-join" : "right-join");
+            ray_t* jfn_sym = make_sym_c(jfn);
+            ray_t* lt = make_sym_c(rname);
+            /* left_keys: (key_name) */
+            ray_t* lks = ray_list_new(0);
+            lks = ray_list_append(lks, left_key_sym);
+            /* right_keys: (key_name) */
+            ray_t* rks = ray_list_new(0);
+            rks = ray_list_append(rks, right_key_sym);
+            /* pair_list: ((left_keys) (right_keys)) */
+            ray_t* pl = ray_list_new(0);
+            pl = ray_list_append(pl, lks);
+            pl = ray_list_append(pl, rks);
+            /* quote_sym + pair_list */
+            ray_t* qs = make_sym_c("quote");
+            ray_t* ql = ray_list_new(0);
+            ql = ray_list_append(ql, qs);
+            ql = ray_list_append(ql, pl);
+            /* (inner-join t1 t2 (quote ...)) */
+            join_from_expr = ray_list_new(0);
+            join_from_expr = ray_list_append(join_from_expr, jfn_sym);
+            join_from_expr = ray_list_append(join_from_expr, make_sym_c(tname));
+            join_from_expr = ray_list_append(join_from_expr, lt);
+            join_from_expr = ray_list_append(join_from_expr, ql);
+            ray_release(jfn_sym); ray_release(lt); ray_release(qs);
+            ray_release(lks); ray_release(rks); ray_release(pl); ray_release(ql);
+        }
+    }
+
     /* Clauses */
     ray_t* where_expr = NULL;
     ray_t* having = NULL;
@@ -676,7 +753,10 @@ static ray_t* parse_select_stmt(sql_parser_t* P) {
     /* from: TBL */
     char tbl_name[256];
     snprintf(tbl_name, sizeof(tbl_name), "%.*s", (int)tbl_tok.len, tbl_tok.start);
-    ADD_KV(sdup("from",4), make_sym_c(tbl_name));
+        if (join_from_expr)
+            ADD_KV(sdup("from",4), join_from_expr);
+        else
+            ADD_KV(sdup("from",4), make_sym_c(tbl_name));
 
     /* Output columns: for each select item, key=alias, value=expr */
     for (int i = 0; i < n_out; i++) {

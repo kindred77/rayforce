@@ -22,3 +22,10 @@ SQL:
 (.sql.eval "select sum(account_amount) from data")
 
 (.sql.eval "select sum(account_amount) from data group by cust_type")
+
+
+(set t1 (.csv.open "/home/kindred/mywork/projects/data/cust.csv"))
+(set t2 (.csv.open "/home/kindred/mywork/projects/data/orders.csv"))
+(.sql.eval "select t1.cust_type,sum(t2.pay_amount) from t1 inner join t2 on t1.id=t2.cust_id group by t1.cust_type")
+
+(.sql.eval "SELECT * from data t where t.cust_type in (10,20,30)")

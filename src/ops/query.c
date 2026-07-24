@@ -942,6 +942,26 @@ static ray_op_t* compile_const_str_expr(ray_graph_t* g, ray_t* expr) {
  * all previously-returned pointers).  The ID is stable; only the
  * backing address may change. */
 
+
+/* Resolve a dotted symbol to the column segment index in the current table.
+ * Returns the segment index of the actual column, or -1 if not resolvable.
+ *
+ * Two forms:
+ *   col.field     → col_seg = 0        (segs[0] is the column)
+ *   tbl.column    → col_seg = nsegs-1  (last segment is the column)
+ *
+ * Caller uses col_seg == 0 for column.temporal (process remaining segs as
+ * temporal fields), col_seg > 0 for tbl.column (skip alias, scan column). */
+static int dotted_resolve_col(ray_t* table, const int64_t* segs, int nsegs) {
+    if (!table || table->type != RAY_TABLE || nsegs < 2)
+        return -1;
+    if (ray_table_get_col(table, segs[0]))
+        return 0;
+    if (ray_table_get_col(table, segs[nsegs - 1]))
+        return nsegs - 1;
+    return -1;
+}
+
 /* Compile a Rayfall AST expression into a DAG node */
 ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
     if (!expr) return NULL;
@@ -990,26 +1010,29 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
             const int64_t* segs;
             int nsegs = ray_sym_segs(expr->i64, &segs);
             if (nsegs < 2) return NULL;
-            if (!g->table || g->table->type != RAY_TABLE) return NULL;
-            if (!ray_table_get_col(g->table, segs[0])) return NULL;
-            ray_t* head_name = ray_sym_str(segs[0]);
+            int col_seg = dotted_resolve_col(g->table, segs, nsegs);
+            if (col_seg < 0) return NULL;
+            int is_tbl = (col_seg != 0);
+            ray_t* head_name = ray_sym_str(segs[col_seg]);
             if (!head_name) return NULL;
             ray_op_t* op = ray_scan(g, ray_str_ptr(head_name));
             if (!op) return NULL;
-            for (int i = 1; i < nsegs; i++) {
-                int field = ray_temporal_field_from_sym(segs[i]);
-                if (field >= 0) {
-                    op = ray_extract(g, op, field);
-                    if (!op) return NULL;
-                    continue;
+            if (!is_tbl) {
+                for (int i = 1; i < nsegs; i++) {
+                    int field = ray_temporal_field_from_sym(segs[i]);
+                    if (field >= 0) {
+                        op = ray_extract(g, op, field);
+                        if (!op) return NULL;
+                        continue;
+                    }
+                    int trunc_kind = ray_temporal_trunc_from_sym(segs[i]);
+                    if (trunc_kind >= 0) {
+                        op = ray_date_trunc(g, op, trunc_kind);
+                        if (!op) return NULL;
+                        continue;
+                    }
+                    return NULL;
                 }
-                int trunc_kind = ray_temporal_trunc_from_sym(segs[i]);
-                if (trunc_kind >= 0) {
-                    op = ray_date_trunc(g, op, trunc_kind);
-                    if (!op) return NULL;
-                    continue;
-                }
-                return NULL;
             }
             return op;
         }
@@ -2581,7 +2604,8 @@ static int collect_col_refs(ray_t* expr, ray_t* tbl,
         } else if (ray_sym_is_dotted(expr->i64)) {
             const int64_t* segs;
             int nsegs = ray_sym_segs(expr->i64, &segs);
-            if (nsegs >= 1 && ray_table_get_col(tbl, segs[0])) want = segs[0];
+            int cs = dotted_resolve_col(tbl, segs, nsegs);
+            if (cs >= 0) want = segs[cs];
         }
         if (want >= 0) {
             for (int i = 0; i < n; i++) if (out_syms[i] == want) return n;
@@ -5016,7 +5040,8 @@ static int collect_col_refs_set(ray_t* expr, ray_t* tbl,
         } else if (ray_sym_is_dotted(expr->i64)) {
             const int64_t* segs;
             int nsegs = ray_sym_segs(expr->i64, &segs);
-            if (nsegs >= 1 && ray_table_get_col(tbl, segs[0])) want = segs[0];
+            int cs = dotted_resolve_col(tbl, segs, nsegs);
+            if (cs >= 0) want = segs[cs];
         }
         if (want >= 0) {
             for (int i = 0; i < n; i++) if (out_syms[i] == want) return n;
@@ -13930,6 +13955,17 @@ static ray_t* join_impl(ray_t** args, int64_t n, uint8_t join_type) {
     if (!keyops) { ray_graph_free(g); if (_bxk) ray_release(_bxk); return ray_error("oom", NULL); }
     ray_op_t** lk = keyops;
     ray_op_t** rk = keyops + nk;
+    /* Pair-key format: keys = ((left_keys) (right_keys)).
+     * From SQL ON a.x = b.y with different key names. */
+    ray_t** key_elems_r = NULL;
+    if (nk == 2 && key_elems[0]->type == RAY_LIST && key_elems[1]->type == RAY_LIST) {
+        int64_t pn = ray_len(key_elems[0]);
+        if (pn > 0 && pn == ray_len(key_elems[1])) {
+            key_elems_r = (ray_t**)ray_data(key_elems[1]);
+            key_elems = (ray_t**)ray_data(key_elems[0]);
+            nk = pn;
+        }
+    }
     for (int64_t i = 0; i < nk; i++) {
         if (key_elems[i]->type != -RAY_SYM) {
             int8_t ke_t = key_elems[i]->type;            /* capture BEFORE free */
@@ -13940,7 +13976,14 @@ static ray_t* join_impl(ray_t** args, int64_t n, uint8_t join_type) {
         ray_t* name_str = ray_sym_str(key_elems[i]->i64);
         if (!name_str) { scratch_free(keyops_hdr); ray_graph_free(g); if (_bxk) ray_release(_bxk); return ray_error("domain", "join: unknown key symbol"); }
         lk[i] = ray_scan(g, ray_str_ptr(name_str));
-        rk[i] = ray_scan(g, ray_str_ptr(name_str));
+        if (key_elems_r) {
+            ray_t* rkn = ray_sym_str(key_elems_r[i]->i64);
+            if (!rkn) { scratch_free(keyops_hdr); ray_graph_free(g); if (_bxk) ray_release(_bxk); return ray_error("domain", "join: unknown right key symbol"); }
+            rk[i] = ray_scan(g, ray_str_ptr(rkn));
+            if (!rk[i]) { scratch_free(keyops_hdr); ray_graph_free(g); if (_bxk) ray_release(_bxk); return ray_error("domain", "join: right key column not found"); }
+        } else {
+            rk[i] = ray_scan(g, ray_str_ptr(name_str));
+        }
         if (!lk[i] || !rk[i]) { scratch_free(keyops_hdr); ray_graph_free(g); if (_bxk) ray_release(_bxk); return ray_error("domain", "join: key column not found"); }
     }
 
