@@ -269,6 +269,48 @@ static ray_t* make_prefix2(const char* op, ray_t* a, ray_t* b) {
     lst = ray_list_append(lst, b);
     return lst;
 }
+
+/* Convert a homogeneous list of atoms to a typed vector.
+ * ray_eval treats RAY_LIST as function calls, so literal lists like
+ * (10 20 30) produce "head of list is not callable, got i64" when
+ * passed as data (e.g. second argument to `in`).  Typed vectors pass
+ * through ray_eval as literal data.  Returns NULL if conversion is
+ * not possible (non-atoms, mixed types, empty list); caller keeps
+ * ownership of the original list in that case. */
+static ray_t* list_to_atom_vec(ray_t* list) {
+    int64_t n = ray_len(list);
+    if (n == 0) return NULL;
+    ray_t** data = (ray_t**)ray_data(list);
+    int8_t itype = data[0]->type;
+    int8_t vtype = -1;
+    if (itype == -RAY_I64 || itype == -RAY_SYM) vtype = RAY_I64;
+    else if (itype == -RAY_F64) vtype = RAY_F64;
+    else if (itype == -RAY_STR) vtype = RAY_STR;
+    else return NULL;
+    for (int64_t i = 1; i < n; i++)
+        if (data[i]->type != itype) return NULL;
+    ray_t* vec = ray_vec_new(vtype, n);
+    if (!vec || RAY_IS_ERR(vec)) { if (vec) ray_release(vec); return NULL; }
+    if (vtype == RAY_I64) {
+        for (int64_t i = 0; i < n; i++) {
+            int64_t v = data[i]->i64;
+            vec = ray_vec_append(vec, &v);
+        }
+    } else if (vtype == RAY_F64) {
+        for (int64_t i = 0; i < n; i++) {
+            double v = data[i]->f64;
+            vec = ray_vec_append(vec, &v);
+        }
+    } else if (vtype == RAY_STR) {
+        for (int64_t i = 0; i < n; i++) {
+            const char* s = ray_str_ptr(data[i]);
+            int64_t sl = ray_str_len(data[i]);
+            vec = ray_str_vec_append(vec, s, sl);
+        }
+    }
+    return vec;
+}
+
 /* Build a dict from interleaved key-value pairs.
    keys are strings (converted to sym), values are ray_t* already retained.
    Caller owns the result; pairs array is consumed (values freed on error). */
@@ -434,6 +476,16 @@ static ray_t* parse_cmp(sql_parser_t* P) {
             in_items = list_append(in_items, item); ray_release(item);
             if (lex_accept(P, TOK_RPAREN)) break;
             if (!lex_accept(P, TOK_COMMA)) { P->err_msg = "expected , or )"; return NULL; }
+        }
+        /* Convert IN list to typed vector for literal values.
+         * Subqueries like IN (select ...) produce non-atom items and
+         * fall through to the list path unchanged. */
+        {
+            ray_t* vec = list_to_atom_vec(in_items);
+            if (vec) {
+                ray_release(in_items);
+                return make_prefix2("in", left, vec);
+            }
         }
         return make_prefix2("in", left, in_items);
     }
